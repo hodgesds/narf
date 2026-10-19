@@ -26,7 +26,7 @@ use alloc::vec::Vec;
 use super::mac_frame::Band;
 use super::wmi::{
     phy_mode, ChannelParam, HalRegCapExt, RegInfo, RegRule, ATH11K_MIN_6G_FREQ,
-    WMI_HOST_WLAN_2G_CAP, WMI_HOST_WLAN_5G_CAP, WMI_REG_INDOOR_AP,
+    WMI_HOST_WLAN_2G_CAP, WMI_HOST_WLAN_5G_CAP, WMI_REG_DEFAULT_CLIENT, WMI_REG_INDOOR_AP,
 };
 
 // ── Flags ───────────────────────────────────────────────────────────
@@ -288,12 +288,17 @@ pub fn build_regd(info: &RegInfo, vdev: VdevKind) -> Option<Regd> {
         match vdev {
             VdevKind::Sta { ap_type } => {
                 let mut ap = ap_type.min(2);
-                if info.rules_6ghz_client[ap][0].is_empty() {
+                // `ath11k_reg_build_regd` always builds the wiphy's active
+                // station domain from the default-client rules. Firmware's
+                // `client_type` is instead consumed by `mac` to choose a
+                // subordinate versus default AP TPE category.
+                let client = WMI_REG_DEFAULT_CLIENT;
+                if info.rules_6ghz_client[ap][client].is_empty() {
                     ap = WMI_REG_INDOOR_AP;
                 }
                 (
-                    &info.rules_6ghz_client[ap][0],
-                    info.max_bw_6ghz_client[ap][0],
+                    &info.rules_6ghz_client[ap][client],
+                    info.max_bw_6ghz_client[ap][client],
                 )
             }
             VdevKind::NotSta => (
@@ -438,6 +443,22 @@ pub fn world_regd() -> Regd {
 // ── Wiphy channels ──────────────────────────────────────────────────
 
 /// One `struct ieee80211_channel` of the wiphy.
+///
+/// DFS state is separate from regulatory flags: a RADAR channel remains a
+/// legal channel while it is `Usable` (CAC required) or `Available`; only an
+/// `Unavailable` channel is inside the regulatory non-occupancy period.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DfsState {
+    /// Not a DFS channel, or no dynamic DFS restriction applies.
+    #[default]
+    Available,
+    /// CAC is required before AP / GO operation.
+    Usable,
+    /// Radar was detected; NOP prevents operation until its expiry.
+    Unavailable,
+}
+
+/// One `struct ieee80211_channel` of the wiphy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Channel {
     pub band: Band,
@@ -449,6 +470,15 @@ pub struct Channel {
     pub max_antenna_gain: i32,
     pub max_power: i32,
     pub max_reg_power: i32,
+    /// `ieee80211_channel::dfs_state` for RADAR channels.
+    pub dfs_state: DfsState,
+    /// `ieee80211_channel::dfs_cac_ms`, 60 seconds by default and longer
+    /// only for regulatory rules such as ETSI weather radar.
+    pub dfs_cac_ms: u32,
+    /// `ieee80211_channel::psd`, in dBm/MHz. Meaningful only with
+    /// [`chan_flag::PSD`]; retained so the 6 GHz WCN6855 TPC command can
+    /// combine regulatory PSD with an AP's Transmit Power Envelope.
+    pub psd: i8,
 }
 
 const fn ch(band: Band, hw: u16, freq: u32) -> Channel {
@@ -461,6 +491,9 @@ const fn ch(band: Band, hw: u16, freq: u32) -> Channel {
         max_antenna_gain: 0,
         max_power: 30,
         max_reg_power: 0,
+        dfs_state: DfsState::Available,
+        dfs_cac_ms: 0,
+        psd: 0,
     }
 }
 
@@ -590,6 +623,38 @@ impl Wiphy {
     /// `ieee80211_get_channel(wiphy, freq)`.
     pub fn get(&self, freq: u32) -> Option<&Channel> {
         self.iter().find(|c| c.center_freq == freq)
+    }
+
+    /// Set the dynamic DFS state of every 20-MHz subchannel in `def`.
+    /// The caller supplies the affected vdev's channel definition.
+    pub fn set_dfs_state(&mut self, def: &super::mac_peer::ChanDef, state: DfsState) {
+        let mut set = |center: u32, span: u32| {
+            let Some(mut freq) = center.checked_sub(span) else {
+                return;
+            };
+            let end = center.saturating_add(span);
+            while freq <= end {
+                if let Some(channel) = self.iter_mut().find(|channel| channel.center_freq == freq) {
+                    if channel.flags & chan_flag::RADAR != 0 {
+                        channel.dfs_state = state;
+                    }
+                }
+                freq = freq.saturating_add(20);
+                if freq == 0 {
+                    break;
+                }
+            }
+        };
+        match def.width {
+            super::mac_peer::Width::W20NoHt | super::mac_peer::Width::W20 => set(def.freq, 0),
+            super::mac_peer::Width::W40 => set(def.center_freq1, 10),
+            super::mac_peer::Width::W80 => set(def.center_freq1, 30),
+            super::mac_peer::Width::W160 => set(def.center_freq1, 70),
+            super::mac_peer::Width::W80P80 => {
+                set(def.center_freq1, 30);
+                set(def.center_freq2, 30);
+            }
+        }
     }
 
     /// `reg_process_self_managed_hint`: `handle_band_custom` on every
@@ -754,10 +819,26 @@ pub fn handle_channel_custom(c: &mut Channel, regd: &Regd) {
         return;
     };
     let bw = chan_bw_flags(regd, idx, c.center_freq);
+    let was_radar = c.flags & chan_flag::RADAR != 0;
     c.flags = c.orig_flags | bw | map_regdom_flags(r.flags);
     c.max_antenna_gain = r.max_antenna_gain as i32;
     c.max_reg_power = r.max_eirp as i32;
     c.max_power = c.max_reg_power;
+    c.dfs_state = if c.flags & chan_flag::RADAR != 0 {
+        if was_radar {
+            c.dfs_state
+        } else {
+            DfsState::Usable
+        }
+    } else {
+        DfsState::Available
+    };
+    c.dfs_cac_ms = if c.flags & chan_flag::RADAR != 0 {
+        r.dfs_cac_ms.max(60_000)
+    } else {
+        0
+    };
+    c.psd = if r.flags & rrf::PSD != 0 { r.psd } else { 0 };
 }
 
 /// `is_ht40_allowed`.

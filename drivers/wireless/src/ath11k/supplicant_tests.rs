@@ -340,14 +340,26 @@ fn caps_ok(s: &Session) -> R {
     );
     let suites = find(wiphy, 57).ok_or("cipher suites")?;
     ensure!(
-        suites == [0x000f_ac04u32.to_ne_bytes(), 0x000f_ac06u32.to_ne_bytes()].concat(),
-        "CCMP + AES-CMAC"
+        suites
+            == [
+                0x000f_ac02u32.to_ne_bytes(),
+                0x000f_ac04u32.to_ne_bytes(),
+                0x000f_ac06u32.to_ne_bytes(),
+                0x000f_ac0du32.to_ne_bytes(),
+                0x000f_ac0bu32.to_ne_bytes(),
+                0x000f_ac0cu32.to_ne_bytes(),
+                0x000f_ac08u32.to_ne_bytes(),
+                0x000f_ac09u32.to_ne_bytes(),
+                0x000f_ac0au32.to_ne_bytes(),
+            ]
+            .concat(),
+        "Linux ath11k cipher suite set"
     );
     let ext = find(wiphy, 217).ok_or("ext features")?;
     let bit = |b: usize| ext.get(b / 8).is_some_and(|o| o & (1 << (b % 8)) != 0);
     ensure!(
-        bit(26) && bit(42) && !bit(15) && !bit(38),
-        "CONTROL_PORT_OVER_NL80211 + NO_PREAUTH, no handshake offloads"
+        bit(26) && bit(42) && bit(48) && !bit(15) && !bit(38),
+        "CONTROL_PORT_OVER_NL80211 + TX status + NO_PREAUTH, no handshake offloads"
     );
     ensure!(
         find(wiphy, 143).is_some_and(|f| u32::from_ne_bytes(f.try_into().unwrap()) & (1 << 5) != 0),
@@ -448,7 +460,10 @@ fn smoke_ath11k_int_wpas_sme_wpa2_control_port() -> TestResult {
             "RSNE in the Association Request"
         );
         ensure!(u.netdev.link_up(), "carrier on at association");
-        ensure!(!run(u.shared.lock()).link.authorized, "port closed");
+        ensure!(
+            !run(u.shared.lock()).vdev(0).unwrap().link.authorized,
+            "port closed"
+        );
         // Only the owner may tear it down.
         let mut deauth = s.ifidx();
         push(&mut deauth, 6, &BSSID);
@@ -563,7 +578,8 @@ fn smoke_ath11k_int_wpas_sme_wpa2_control_port() -> TestResult {
         );
         {
             let g = run(u.shared.lock());
-            ensure!(g.link.authorized && g.link.ptk, "authorized, PTK in");
+            let vdev = g.vdev(0).unwrap();
+            ensure!(vdev.link.authorized && vdev.link.ptk, "authorized, PTK in");
         }
         ensure!(
             u.dev
@@ -729,7 +745,10 @@ fn smoke_ath11k_int_wpas_connect_pf_packet() -> TestResult {
             "EAPOL unprotected before the PTK"
         );
         ensure!(install_keys(&u).len() == 2, "PTK + GTK installed");
-        ensure!(run(u.shared.lock()).link.authorized, "port open");
+        ensure!(
+            run(u.shared.lock()).vdev(0).unwrap().link.authorized,
+            "port open"
+        );
         sock.release();
         Ok(())
     })

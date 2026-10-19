@@ -11,9 +11,9 @@
 //! | `Mac::mfp_tx` | `ieee80211_tx_h_select_key` + `ccmp_encrypt_skb` with `IEEE80211_KEY_FLAG_GENERATE_IV_MGMT` + `ath11k_mac_mgmt_tx_wmi` MIC tailroom |
 //! | `Mac::sa_query_*` | mac80211 `ieee80211_process_sa_query_req`; wpa_supplicant `sme_event_unprot_disconnect` / `sme_sa_query_timer` / `sme_process_sa_query_response` |
 //!
-//! ath11k hands BIP to mac80211 (`ath11k_mac_op_set_key` returns 1 for
-//! `WLAN_CIPHER_SUITE_AES_CMAC` — "BIP needs to be done in software",
-//! WCN6855 included): the IGTK never reaches the firmware; group-addressed
+//! ath11k hands every BIP suite to mac80211 (`ath11k_mac_op_set_key` returns
+//! 1 — "BIP needs to be done in software", WCN6855 included): the IGTK
+//! never reaches the firmware; group-addressed
 //! robust management frames are verified here. The firmware decrypts
 //! unicast protected management frames and delivers them with the
 //! Protected bit, the CCMP header and the MIC still in place
@@ -24,9 +24,14 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+use narf_crypto::bip::{self, Cipher as BipCipher};
 use narf_wireless::eapol::KeyMgmt;
 use narf_wireless::rsn::{self, RsnIe, Suite};
-use narf_wireless::SecurityConfig;
+use narf_wireless::{
+    SecurityConfig, CIPHER_SUITE_AES_CMAC, CIPHER_SUITE_BIP_CMAC_256, CIPHER_SUITE_BIP_GMAC_128,
+    CIPHER_SUITE_BIP_GMAC_256, CIPHER_SUITE_CCMP, CIPHER_SUITE_CCMP_256, CIPHER_SUITE_GCMP,
+    CIPHER_SUITE_GCMP_256,
+};
 
 use super::super::mac_frame::{self as frame, capab, eid, ParsedIes};
 
@@ -51,8 +56,33 @@ pub const SA_QUERY_MAX_TU: u64 = 1000;
 /// `IEEE80211_CCMP_HDR_LEN` / `IEEE80211_CCMP_MIC_LEN`.
 pub const CCMP_HDR_LEN: usize = 8;
 pub const CCMP_MIC_LEN: usize = 8;
-/// `sizeof(struct ieee80211_mmie)` (BIP-CMAC-128).
-pub const MMIE_LEN: usize = 18;
+/// `IEEE80211_CCMP_256_MIC_LEN` and `IEEE80211_GCMP_MIC_LEN`.
+pub const EXTENDED_MGMT_MIC_LEN: usize = 16;
+
+/// Translate cfg80211's management-group selector into its host BIP engine.
+/// ath11k returns `1` from `set_key` for all of these, so none may be handed
+/// to WMI as a data cipher.
+pub const fn bip_cipher(suite: u32) -> Option<BipCipher> {
+    match suite {
+        CIPHER_SUITE_AES_CMAC => Some(BipCipher::Cmac128),
+        CIPHER_SUITE_BIP_CMAC_256 => Some(BipCipher::Cmac256),
+        CIPHER_SUITE_BIP_GMAC_128 => Some(BipCipher::Gmac128),
+        CIPHER_SUITE_BIP_GMAC_256 => Some(BipCipher::Gmac256),
+        _ => None,
+    }
+}
+
+/// The hardware MIC tailroom for a protected robust management frame under
+/// an installed pairwise data cipher. TKIP cannot protect an MFP frame.
+pub const fn protected_mgmt_mic_len(suite: u32) -> Option<usize> {
+    match suite {
+        CIPHER_SUITE_CCMP => Some(CCMP_MIC_LEN),
+        CIPHER_SUITE_CCMP_256 | CIPHER_SUITE_GCMP | CIPHER_SUITE_GCMP_256 => {
+            Some(EXTENDED_MGMT_MIC_LEN)
+        }
+        _ => None,
+    }
+}
 
 /// What the SME negotiated for an RSN association.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,7 +92,7 @@ pub struct RsnPlan {
     /// MFPR): SAE (WPA3-Personal); PSK is optional (MFPC only).
     pub pmf_required: bool,
     /// MFP in use (`assoc_data->use_mfp` → `sta->mfp`): the AP is MFP
-    /// capable and BIP-CMAC-128 is its group management cipher.
+    /// capable and has a usable BIP group-management cipher.
     pub mfp: bool,
     /// The AP's group cipher (ours = the AP's, `wpa_gen_wpa_ie_rsn`).
     pub group_cipher: Suite,
@@ -92,9 +122,9 @@ pub mod refuse {
     /// SAE requested of a BSS without AKM 8.
     pub const NO_SAE: u32 = 3;
     /// PMF required (by the AP or by SAE) but not possible: the AP is
-    /// not MFP capable, or its group management cipher is not
-    /// BIP-CMAC-128 ("Management frame protection required but the
-    /// selected AP does not enable it").
+    /// not MFP capable, or its group management cipher is unsupported
+    /// ("Management frame protection required but the selected AP does
+    /// not enable it").
     pub const PMF: u32 = 4;
 }
 
@@ -250,16 +280,15 @@ pub fn is_robust_mgmt(f: &[u8]) -> bool {
     }
 }
 
-/// `ieee80211_get_mmie_keyidx`: the Key ID of a BIP-CMAC-128 MMIE ending
-/// a group-addressed robust frame, `None` otherwise (the 16-octet-MIC
-/// MMIE is a BIP-CMAC-256 / GMAC-256 key, which we do not negotiate).
+/// `ieee80211_get_mmie_keyidx`: the Key ID of any valid-length BIP MMIE
+/// ending a group-addressed robust frame.
 pub fn mmie_keyidx(f: &[u8]) -> Option<u16> {
-    if f.len() < frame::MGMT_HDR_LEN + MMIE_LEN || f[4] & 1 == 0 || !is_robust_mgmt(f) {
+    if f.len() < frame::MGMT_HDR_LEN || f[4] & 1 == 0 || !is_robust_mgmt(f) {
         return None;
     }
-    let m = &f[f.len() - MMIE_LEN..];
-    (m[0] == narf_crypto::bip_cmac::ELEMENT_ID_MMIE && m[1] as usize == MMIE_LEN - 2)
-        .then(|| u16::from_le_bytes([m[2], m[3]]))
+    bip::parse_mmie(&f[frame::MGMT_HDR_LEN..])
+        .ok()
+        .map(|mmie| mmie.key_id)
 }
 
 /// The 48-bit PN of a CCMP header (`ccmp_hdr2pn`).
@@ -279,12 +308,19 @@ pub fn ccmp_hdr(pn: u64, key_id: u8) -> [u8; CCMP_HDR_LEN] {
 /// `IEEE80211_CCMP_MIC_LEN` tail `ath11k_mac_mgmt_tx_wmi` reserves — the
 /// firmware encrypts in place.
 pub fn protect_mgmt(f: &[u8], pn: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(f.len() + CCMP_HDR_LEN + CCMP_MIC_LEN);
+    protect_mgmt_with_mic_len(f, pn, CCMP_MIC_LEN)
+}
+
+/// The same management-IV construction for CCMP-256 and GCMP. Those ciphers
+/// share the eight-octet ExtIV but carry a 128-bit MIC rather than CCMP-128's
+/// 64-bit MIC.
+pub fn protect_mgmt_with_mic_len(f: &[u8], pn: u64, mic_len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(f.len() + CCMP_HDR_LEN + mic_len);
     out.extend_from_slice(&f[..frame::MGMT_HDR_LEN]);
     out[1] |= (frame::FCTL_PROTECTED >> 8) as u8;
     out.extend_from_slice(&ccmp_hdr(pn, 0));
     out.extend_from_slice(&f[frame::MGMT_HDR_LEN..]);
-    out.extend_from_slice(&[0u8; CCMP_MIC_LEN]);
+    out.extend(core::iter::repeat_n(0u8, mic_len));
     out
 }
 
@@ -299,14 +335,37 @@ pub fn build_sa_query(own: &[u8; 6], ap: &[u8; 6], action: u8, trans_id: [u8; 2]
 
 /// Host-side 802.11w state of an association (mac80211 key structures +
 /// wpa_supplicant SA Query state).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, PartialEq, Eq)]
+pub struct MfpIgtk {
+    cipher: BipCipher,
+    key: Vec<u8>,
+    rx_pn: u64,
+}
+
+impl core::fmt::Debug for MfpIgtk {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MfpIgtk")
+            .field("cipher", &self.cipher)
+            .field("rx_pn", &self.rx_pn)
+            .finish()
+    }
+}
+
+/// Host-side 802.11w state of an association (mac80211 key structures +
+/// wpa_supplicant SA Query state).
+#[derive(Clone, Debug)]
 pub struct MfpState {
-    /// The IGTKs by key index 4 / 5 (`link->gtk[4..6]`): key, receive IPN.
-    pub igtk: [Option<([u8; 16], u64)>; 2],
+    /// The IGTKs by key index 4 / 5 (`link->gtk[4..6]`), including their
+    /// BIP suite and receive replay number.
+    pub igtk: [Option<MfpIgtk>; 2],
     /// The PTK's management receive PN (`u.ccmp.rx_pn[IEEE80211_NUM_TIDS]`).
     pub mgmt_rx_pn: u64,
     /// The PTK's transmit PN for host-built CCMP headers (`conf.tx_pn`).
     pub mgmt_tx_pn: u64,
+    /// MIC tailroom for the active pairwise management protection cipher.
+    /// CCMP-128 is the in-kernel-supplicant default; external supplicants set
+    /// this on each successful pairwise key install.
+    pub mgmt_mic_len: usize,
     /// SA Query in progress: start (ms), transaction ids sent, next timer (µs).
     pub sa_query: Option<SaQuery>,
     /// `sme.last_unprot_disconnect` (ms).
@@ -316,6 +375,21 @@ pub struct MfpState {
     pub unprot_pending: bool,
     /// SA Query Requests from the AP to answer (transaction ids).
     pub sa_query_req: Vec<[u8; 2]>,
+}
+
+impl Default for MfpState {
+    fn default() -> Self {
+        Self {
+            igtk: [None, None],
+            mgmt_rx_pn: 0,
+            mgmt_tx_pn: 0,
+            mgmt_mic_len: CCMP_MIC_LEN,
+            sa_query: None,
+            last_unprot_ms: None,
+            unprot_pending: false,
+            sa_query_req: Vec::new(),
+        }
+    }
 }
 
 /// wpa_supplicant `sme.sa_query_*`.
@@ -338,16 +412,26 @@ pub enum MfpRx {
 }
 
 impl MfpState {
-    /// Install an IGTK (`ieee80211_key_alloc` copies the IPN into
-    /// `aes_cmac.rx_pn`). `false` for a key index other than 4 / 5.
-    pub fn install_igtk(&mut self, key_id: u16, key: &[u8], ipn: [u8; 6]) -> bool {
+    /// Install an IGTK (`ieee80211_key_alloc` copies the IPN into either the
+    /// CMAC or GMAC replay state). `false` for an invalid key shape or index.
+    pub fn install_igtk(
+        &mut self,
+        cipher: BipCipher,
+        key_id: u16,
+        key: &[u8],
+        ipn: [u8; 6],
+    ) -> bool {
         let Some(slot) = key_id.checked_sub(4).filter(|&s| s < 2) else {
             return false;
         };
-        let Ok(k) = <[u8; 16]>::try_from(key) else {
+        if key.len() != cipher.key_len() {
             return false;
-        };
-        self.igtk[slot as usize] = Some((k, narf_crypto::bip_cmac::decode_ipn(&ipn)));
+        }
+        self.igtk[slot as usize] = Some(MfpIgtk {
+            cipher,
+            key: key.to_vec(),
+            rx_pn: narf_crypto::bip_cmac::decode_ipn(&ipn),
+        });
         true
     }
 
@@ -363,42 +447,41 @@ impl MfpState {
         let deauth = st == frame::stype::DEAUTH || st == frame::stype::DISASSOC;
         if f[4] & 1 != 0 {
             // Group addressed: BIP (ieee80211_crypto_aes_cmac_decrypt).
-            let Some(keyidx) = mmie_keyidx(f) else {
+            let Ok(mmie) = bip::parse_mmie(&f[frame::MGMT_HDR_LEN..]) else {
                 return MfpRx::Drop { unprot: deauth };
             };
-            let Some((key, rx_pn)) = keyidx
+            let Some(key) = mmie
+                .key_id
                 .checked_sub(4)
                 .filter(|&s| s < 2)
-                .and_then(|s| self.igtk[s as usize])
+                .and_then(|s| self.igtk[s as usize].as_ref())
+                .cloned()
             else {
                 return MfpRx::Drop { unprot: false };
             };
-            let mmie = &f[f.len() - MMIE_LEN..];
-            let ipn = narf_crypto::bip_cmac::decode_ipn(&mmie[4..10]);
-            if ipn <= rx_pn {
+            if mmie.ipn <= key.rx_pn {
                 return MfpRx::Drop { unprot: false }; // RX_DROP_U_REPLAY
             }
-            let Ok(igtk) = narf_crypto::bip_cmac::Igtk::install(key, keyidx) else {
-                return MfpRx::Drop { unprot: false };
-            };
-            let Ok(aad) = narf_crypto::bip_cmac::build_bip_aad(&f[..frame::MGMT_HDR_LEN]) else {
-                return MfpRx::Drop { unprot: false };
-            };
-            let mut body = f[frame::MGMT_HDR_LEN..].to_vec();
-            let n = body.len();
-            let mut mic = [0u8; narf_crypto::bip_cmac::BIP_MIC_LEN];
-            mic.copy_from_slice(&body[n - 8..]);
-            body[n - 8..].fill(0);
-            if narf_crypto::bip_cmac::verify_mic(&igtk, &aad, &body, &mic).is_err() {
+            if bip::verify_mmie(
+                key.cipher,
+                &key.key,
+                &f[..frame::MGMT_HDR_LEN],
+                &f[frame::MGMT_HDR_LEN..],
+            )
+            .is_err()
+            {
                 return MfpRx::Drop { unprot: false }; // RX_DROP_U_MIC_FAIL
             }
-            self.igtk[(keyidx - 4) as usize] = Some((key, ipn));
+            self.igtk[(mmie.key_id - 4) as usize]
+                .as_mut()
+                .unwrap()
+                .rx_pn = mmie.ipn;
             // skb_trim(skb, skb->len - sizeof(*mmie))
-            return MfpRx::Pass(Some(f[..f.len() - MMIE_LEN].to_vec()));
+            return MfpRx::Pass(Some(f[..f.len() - key.cipher.mmie_len()].to_vec()));
         }
         if fc & frame::FCTL_PROTECTED != 0 {
             // Decrypted by the firmware; CCMP header + MIC still there.
-            if !ptk || f.len() < frame::MGMT_HDR_LEN + CCMP_HDR_LEN + CCMP_MIC_LEN {
+            if !ptk || f.len() < frame::MGMT_HDR_LEN + CCMP_HDR_LEN + self.mgmt_mic_len {
                 return MfpRx::Drop { unprot: false };
             }
             let h = &f[frame::MGMT_HDR_LEN..frame::MGMT_HDR_LEN + CCMP_HDR_LEN];
@@ -412,7 +495,9 @@ impl MfpState {
             self.mgmt_rx_pn = pn;
             let mut out = f[..frame::MGMT_HDR_LEN].to_vec();
             out[1] &= !((frame::FCTL_PROTECTED >> 8) as u8);
-            out.extend_from_slice(&f[frame::MGMT_HDR_LEN + CCMP_HDR_LEN..f.len() - CCMP_MIC_LEN]);
+            out.extend_from_slice(
+                &f[frame::MGMT_HDR_LEN + CCMP_HDR_LEN..f.len() - self.mgmt_mic_len],
+            );
             return MfpRx::Pass(Some(out));
         }
         // Unprotected unicast robust frame.
@@ -475,7 +560,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
     /// `wpa_sm_rx_eapol`; 10 s `wpa_supplicant_req_auth_timeout`), then
     /// the installs `wpa_supplicant_process_3_of_4` does after message
     /// 4/4: PTK (`ath11k_mac_op_set_key` pairwise), GTK (group), IGTK
-    /// (software BIP: ath11k returns 1 for AES-CMAC, no WMI command).
+    /// (software BIP: ath11k returns 1 for every BIP suite, no WMI command).
     pub(super) async fn rsna_4way(
         &mut self,
         bss: &ScanBss,
@@ -561,7 +646,10 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                         sup.group_keys_installed(Some(&g.key), None);
                     }
                     if let Some(i) = m3.igtk.as_ref() {
-                        if !self.mfp.install_igtk(i.key_id, &i.key, i.ipn) {
+                        if !self
+                            .mfp
+                            .install_igtk(BipCipher::Cmac128, i.key_id, &i.key, i.ipn)
+                        {
                             // "Failed to configure IGTK": cfg80211 allows
                             // only key index 4 / 5 for AES-CMAC.
                             self.link.as_mut().unwrap().deauth_reason =
@@ -691,7 +779,10 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             if let Some(Ok(Some(i))) = m1.igtk.as_ref() {
                 // ieee80211w_set_keys: a failure is "Failed to configure
                 // IGTK", not fatal.
-                if self.mfp.install_igtk(i.key_id, &i.key, i.ipn) {
+                if self
+                    .mfp
+                    .install_igtk(BipCipher::Cmac128, i.key_id, &i.key, i.ipn)
+                {
                     if let Some(s) = self.sup.as_mut() {
                         s.group_keys_installed(None, Some(&i.key));
                     }
@@ -763,7 +854,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             }
             let _ = self
                 .dp
-                .rx_pn_replay_config(vdev_id, aa, super::cipher::AES_CCM, true, false)
+                .rx_pn_replay_config(vdev_id, aa, super::cipher::AES_CCM, 16, 0, true, false)
                 .await;
             if self.install_key(aa, 0, tk, true).await.is_err() {
                 return Err(4);
@@ -786,7 +877,10 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             }
         }
         if let Some(i) = m3.igtk.as_ref() {
-            if !self.mfp.install_igtk(i.key_id, &i.key, i.ipn) {
+            if !self
+                .mfp
+                .install_igtk(BipCipher::Cmac128, i.key_id, &i.key, i.ipn)
+            {
                 return Err(6);
             }
             if let Some(s) = self.sup.as_mut() {
@@ -797,19 +891,79 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
     }
 
     /// mac80211's MFP receive path for a robust frame from our AP while
-    /// `sta->mfp` (see [`MfpState::rx`]); `None` = the rules do not apply
-    /// (no association, not from the AP's station entry, no MFP).
+    /// `sta->mfp` (see [`MfpState::rx`]), or from one of our MFP AP clients.
+    /// `None` = the rules do not apply (no matching peer or no MFP).
     pub(super) fn mfp_rx_filter(&mut self, f: &[u8]) -> Option<MfpRx> {
-        let l = self.link.as_ref()?;
-        if !l.assoc || !l.sta.mfp || f.len() < frame::MGMT_HDR_LEN || f[10..16] != l.bss.bssid {
+        if let Some(l) = self.link.as_ref() {
+            if l.assoc && l.sta.mfp && f.len() >= frame::MGMT_HDR_LEN && f[10..16] == l.bss.bssid {
+                let (ptk, gtk) = (l.ptk_installed, l.gtk_idx.is_some());
+                let r = self.mfp.rx(f, ptk, gtk);
+                if r == (MfpRx::Drop { unprot: true }) {
+                    self.unprot_disconnect(f);
+                }
+                return Some(r);
+            }
+        }
+        self.ap_mfp_rx_filter(f)
+    }
+
+    /// The AP arm of mac80211's MFP receive filter. Robust management frames
+    /// from a PMF client are unicast and firmware-decrypted; ath11k leaves
+    /// the CCMP header and MIC in place, so retain the host replay window and
+    /// pass hostapd the stripped frame. Clients never originate a protected
+    /// group robust frame, so such a frame is rejected rather than treating
+    /// the AP's transmit IGTK as a receive key.
+    fn ap_mfp_rx_filter(&mut self, f: &[u8]) -> Option<MfpRx> {
+        if f.len() < frame::MGMT_HDR_LEN {
             return None;
         }
-        let (ptk, gtk) = (l.ptk_installed, l.gtk_idx.is_some());
-        let r = self.mfp.rx(f, ptk, gtk);
-        if r == (MfpRx::Drop { unprot: true }) {
-            self.unprot_disconnect(f);
+        let source: [u8; 6] = f[10..16].try_into().unwrap();
+        let ap = self.ap.as_mut()?;
+        let have_gtk = !ap.group_keys.is_empty();
+        let station = ap
+            .stations
+            .iter_mut()
+            .find(|station| station.mac == source)?;
+        if !station.mfp || !is_robust_mgmt(f) {
+            return None;
         }
-        Some(r)
+        let fc = u16::from_le_bytes([f[0], f[1]]);
+        let st = fc & frame::FCTL_TYPE_STYPE;
+        let deauth = st == frame::stype::DEAUTH || st == frame::stype::DISASSOC;
+        if f[4] & 1 != 0 {
+            return Some(MfpRx::Drop { unprot: false });
+        }
+        if fc & frame::FCTL_PROTECTED != 0 {
+            let Some(mic_len) = station
+                .pairwise_key
+                .as_ref()
+                .and_then(|(_, cipher, _)| protected_mgmt_mic_len(*cipher))
+            else {
+                return Some(MfpRx::Drop { unprot: false });
+            };
+            if f.len() < frame::MGMT_HDR_LEN + CCMP_HDR_LEN + mic_len {
+                return Some(MfpRx::Drop { unprot: false });
+            }
+            let h = &f[frame::MGMT_HDR_LEN..frame::MGMT_HDR_LEN + CCMP_HDR_LEN];
+            if h[3] & 0x20 == 0 || h[3] >> 6 != 0 {
+                return Some(MfpRx::Drop { unprot: false });
+            }
+            let pn = ccmp_pn(h);
+            if pn <= station.mgmt_rx_pn {
+                return Some(MfpRx::Drop { unprot: false });
+            }
+            station.mgmt_rx_pn = pn;
+            let mut out = f[..frame::MGMT_HDR_LEN].to_vec();
+            out[1] &= !((frame::FCTL_PROTECTED >> 8) as u8);
+            out.extend_from_slice(&f[frame::MGMT_HDR_LEN + CCMP_HDR_LEN..f.len() - mic_len]);
+            return Some(MfpRx::Pass(Some(out)));
+        }
+        if deauth && !have_gtk {
+            // During the 4-way handshake the peer has not received the GTK
+            // yet, so an otherwise-valid unprotected teardown remains legal.
+            return Some(MfpRx::Pass(None));
+        }
+        Some(MfpRx::Drop { unprot: deauth })
     }
 
     /// wpa_supplicant `sme_event_unprot_disconnect`: an unprotected
@@ -936,8 +1090,10 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
     }
 
     /// mac80211 `ieee80211_tx_h_select_key` for a management frame: a
-    /// unicast robust frame to an MFP station with the PTK installed is
-    /// CCMP-protected (host header, firmware encryption).
+    /// unicast robust frame to an MFP station/client with a PTK is
+    /// CCMP-family-protected (host header, firmware encryption); robust group
+    /// frames from an AP receive a host-generated MMIE for the installed BIP
+    /// suite.
     pub(super) fn mfp_tx(&mut self, f: &[u8]) -> Vec<u8> {
         let use_mfp = self
             .link
@@ -945,8 +1101,57 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             .is_some_and(|l| l.sta.mfp && l.ptk_installed);
         if use_mfp && f.len() >= frame::MGMT_HDR_LEN && f[4] & 1 == 0 && is_robust_mgmt(f) {
             self.mfp.mgmt_tx_pn += 1;
-            return protect_mgmt(f, self.mfp.mgmt_tx_pn);
+            return protect_mgmt_with_mic_len(f, self.mfp.mgmt_tx_pn, self.mfp.mgmt_mic_len);
         }
-        f.to_vec()
+        if f.len() < frame::MGMT_HDR_LEN || !is_robust_mgmt(f) {
+            return f.to_vec();
+        }
+        if f[4] & 1 == 0 {
+            let dest: [u8; 6] = f[4..10].try_into().unwrap();
+            if let Some(station) =
+                self.ap
+                    .as_mut()
+                    .and_then(|ap| ap.stations.iter_mut().find(|station| station.mac == dest))
+                    .filter(|station| {
+                        station.mfp
+                            && station.pairwise_key.as_ref().is_some_and(|(_, cipher, _)| {
+                                protected_mgmt_mic_len(*cipher).is_some()
+                            })
+                    })
+            {
+                station.mgmt_tx_pn += 1;
+                let mic_len =
+                    protected_mgmt_mic_len(station.pairwise_key.as_ref().unwrap().1).unwrap();
+                return protect_mgmt_with_mic_len(f, station.mgmt_tx_pn, mic_len);
+            }
+            return f.to_vec();
+        }
+        let Some(igtk) = self.ap.as_mut().and_then(|ap| {
+            let selected = ap.default_igtk;
+            let position = selected
+                .and_then(|idx| ap.igtks.iter().position(|key| key.idx == idx))
+                .or_else(|| ap.igtks.len().checked_sub(1));
+            position.and_then(|position| ap.igtks.get_mut(position))
+        }) else {
+            return f.to_vec();
+        };
+        let mut body = f[frame::MGMT_HDR_LEN..].to_vec();
+        let Some(cipher) = bip_cipher(igtk.cipher) else {
+            return f.to_vec();
+        };
+        let Ok(ipn) = bip::protect_mmie(
+            cipher,
+            &igtk.key,
+            igtk.idx as u16,
+            &mut igtk.tx_ipn,
+            &f[..frame::MGMT_HDR_LEN],
+            &mut body,
+        ) else {
+            return f.to_vec();
+        };
+        debug_assert_eq!(igtk.tx_ipn, ipn);
+        let mut out = f[..frame::MGMT_HDR_LEN].to_vec();
+        out.extend_from_slice(&body);
+        out
     }
 }

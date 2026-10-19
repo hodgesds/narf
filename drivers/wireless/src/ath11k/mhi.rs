@@ -118,6 +118,9 @@ pub const BHIE_TXVECSTATUS_STATUS_RESET: u32 = 0x00;
 pub const BHIE_TXVECSTATUS_STATUS_XFER_COMPL: u32 = 0x02;
 pub const BHIE_TXVECSTATUS_STATUS_ERROR: u32 = 0x03;
 pub const BHIE_RXVECSTATUS_STATUS_BMSK: u32 = genmask(31, 30);
+pub const BHIE_RXVECSTATUS_STATUS_RESET: u32 = 0x00;
+pub const BHIE_RXVECSTATUS_STATUS_XFER_COMPL: u32 = 0x02;
+pub const BHIE_RXVECSTATUS_STATUS_ERROR: u32 = 0x03;
 
 // ── MHI register bits ─────────────────────────────────────────────
 

@@ -22,7 +22,7 @@
 //! | [`Dp::rx_process_wbm_err`] | `ath11k_dp_rx_process_wbm_err` (+ `h_null_q_desc`) |
 //! | [`Dp::process_rxdma_err`] | `ath11k_dp_process_rxdma_err` |
 //! | [`Dp::process_reo_status`] | `ath11k_dp_process_reo_status` |
-//! | [`Dp::reap_mon_status`] | `ath11k_dp_rx_reap_mon_status_ring` (status buffers recycled, not parsed) |
+//! | [`Dp::reap_mon_status`] | `ath11k_dp_rx_reap_mon_status_ring` (RX PPDU signal/duration TLVs + status-buffer recycle) |
 //! | [`Dp::service_srng`] | `ath11k_dp_service_srng` |
 //! | [`Dp::service_shadow_timers`] | `ath11k_dp_shadow_timer_handler` |
 //!
@@ -43,9 +43,14 @@
 //! `REO_DEST_RING_ERROR_CODE_DESC_ADDR_ZERO`, which Linux and NARF both
 //! deliver.
 //!
-//! Not ported: the WBM idle-list scatter setup (needs > 2 MiB of idle
-//! entries; WCN6855 needs 256 KiB), monitor rings, PPDU / peer stats, TX
-//! rate statistics, ring teardown (`ath11k_dp_free`).
+//! The generic ath11k monitor / full-monitor rings are deliberately absent:
+//! WCN6855's Linux `hw_params` has `supports_monitor = false`, so mac80211
+//! removes monitor iftype after registration.  Remaining omissions are the
+//! WBM idle-list scatter setup (it needs > 2 MiB of idle entries; WCN6855
+//! needs only 256 KiB). The non-monitor status rings decode the peer RSSI,
+//! per-chain RSSI, and RX duration statistics mac80211 normally receives;
+//! only full-monitor frame delivery is absent. Ring teardown (`ath11k_dp_free`)
+//! is implemented.
 
 #![allow(dead_code)]
 
@@ -65,7 +70,7 @@ use super::hal::{
     HAL_SRNG_INT_TIMER_THRESHOLD_OTHER, HAL_SRNG_INT_TIMER_THRESHOLD_RX,
     HAL_SRNG_INT_TIMER_THRESHOLD_TX,
 };
-use super::htt::{self, HttT2h, HttTarget, RxRingTlvFilter};
+use super::htt::{self, HttPpduStats, HttT2h, HttTarget, RxRingTlvFilter};
 use super::hw::{rbm, HwHalParams, HwParams, HwRev, RingMask, HW_HAL_PARAMS_QCA6390};
 use super::power::ChipIo;
 
@@ -188,6 +193,7 @@ pub const HTT_TCL_META_DATA_TYPE: u32 = 1 << 0;
 pub const HTT_TCL_META_DATA_VALID_HTT: u32 = 1 << 1;
 pub const HTT_TCL_META_DATA_VDEV_ID: u32 = genmask(9, 2);
 pub const HTT_TCL_META_DATA_PDEV_ID: u32 = genmask(11, 10);
+pub const HTT_TCL_META_DATA_PEER_ID: u32 = genmask(15, 2);
 pub const HTT_TX_WBM_COMP_INFO0_STATUS: u32 = genmask(12, 9);
 pub const HTT_TX_WBM_COMP_INFO1_ACK_RSSI: u32 = genmask(31, 24);
 pub const HTT_TX_WBM_COMP_INFO2_SW_PEER_ID: u32 = genmask(15, 0);
@@ -302,6 +308,15 @@ pub const HAL_WBM_REL_DESC_TYPE_MSDU_LINK: u32 = 1;
 /// `enum hal_tlv_tag` values of the REO status ring and the monitor
 /// status buffer.
 pub mod status_tag {
+    /// `HAL_PHYRX_RSSI_LEGACY`.
+    pub const PHYRX_RSSI_LEGACY: u32 = 0x04c;
+    /// `HAL_DUMMY`: monitor-status DMA buffer end marker.
+    pub const DUMMY: u32 = 0x06d;
+    /// `HAL_RX_PPDU_END`; its advertised length covers following PHY TLVs,
+    /// so only its four-byte classification overview is skipped.
+    pub const RX_PPDU_END: u32 = 0x0ce;
+    /// `HAL_RX_MPDU_START` (WCN6855 peer id is at data byte 32).
+    pub const RX_MPDU_START: u32 = 0x0cf;
     pub const REO_UPDATE_RX_REO_QUEUE_STATUS: u32 = 0x99;
     pub const REO_GET_QUEUE_STATS_STATUS: u32 = 0x137;
     pub const REO_FLUSH_QUEUE_STATUS: u32 = 0x138;
@@ -309,7 +324,28 @@ pub mod status_tag {
     pub const REO_UNBLOCK_CACHE_STATUS: u32 = 0x13a;
     pub const REO_FLUSH_TIMEOUT_LIST_STATUS: u32 = 0x156;
     pub const REO_DESCRIPTOR_THRESHOLD_REACHED_STATUS: u32 = 0x159;
+    /// `HAL_RX_PPDU_END_STATUS_DONE`: the PPDU-complete marker.
+    pub const RX_PPDU_END_STATUS_DONE: u32 = 0x13f;
     pub const RX_STATUS_BUFFER_DONE: u32 = 0x140;
+    /// `HAL_RXPCU_PPDU_END_INFO`.
+    pub const RXPCU_PPDU_END_INFO: u32 = 0x16a;
+}
+
+/// The number of per-chain RSSI values carried by `HAL_PHYRX_RSSI_LEGACY`.
+/// This is `HAL_RX_MAX_NSS`; it also matches mac80211's
+/// `IEEE80211_MAX_CHAINS` station-information array.
+pub const RX_PPDU_MAX_CHAINS: usize = 8;
+
+/// Completed non-monitor RX PPDU telemetry, corresponding to the peer-facing
+/// fields of Linux `struct hal_rx_mon_ppdu_info`. RSSI values are kept in
+/// their firmware representation here: the runtime applies the negotiated
+/// `HW_DB2DBM_CONVERSION_SUPPORT` rule before publishing station information.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RxPpduStats {
+    pub peer_id: u16,
+    pub rssi_comb: Option<u8>,
+    pub rssi_chain_pri20: [Option<u8>; RX_PPDU_MAX_CHAINS],
+    pub rx_duration_us: Option<u32>,
 }
 
 /// 802.11 bits the DP inspects.
@@ -712,6 +748,23 @@ pub struct DpPeer {
     /// key-install path, `OPEN` until then).
     pub sec_type: u32,
     pub sec_type_grp: u32,
+    /// Installed mac80211 key slots. WCN6855 can strip the IV before a TKIP
+    /// Michael-failure report, so retain the slot selected by the key path
+    /// for cfg80211's later `NL80211_ATTR_KEY_IDX` notification.
+    pub ucast_key_idx: Option<u8>,
+    pub mcast_key_idx: Option<u8>,
+}
+
+/// A locally detected TKIP Michael MIC failure for cfg80211. Linux's
+/// ath11k path gives the failed MPDU to mac80211, which emits this after
+/// `ieee80211_rx_h_michael_mic_verify`; NARF decapsulates before mac80211, so
+/// the DP retains the equivalent event until the owning netdev publishes it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MichaelMicFailure {
+    pub vdev_id: u8,
+    pub source: [u8; 6],
+    pub group: bool,
+    pub key_idx: Option<u8>,
 }
 
 /// Counters Linux keeps in `soc_stats` (plus NARF's drop reasons).
@@ -941,6 +994,9 @@ pub struct RxMsdu {
     pub csum_ok: bool,
     /// `rx_desc_get_msdu_freq` (phy meta data).
     pub freq: u32,
+    /// `rx_msdu_start.info3`: PHY packet type, MCS, GI, received bandwidth
+    /// and MIMO stream bitmap (`ath11k_dp_rx_h_rate`).
+    pub rate_info: u32,
     /// Delivered from the WBM error ring (`DESC_ADDR_ZERO`).
     pub from_err_path: bool,
 }
@@ -991,6 +1047,19 @@ pub struct Dp {
     pub pdev: Option<PdevDp>,
     pub htt: HttTarget,
     pub peers: Vec<DpPeer>,
+    /// Linux's `ppdu_stats_info` list: firmware may split the TLVs for one
+    /// PPDU across indications, so hold the bounded in-flight window before
+    /// applying its per-peer rate/duration snapshot.
+    ppdu_stats_pending: VecDeque<HttPpduStats>,
+    /// PPDUs evicted from the 16-entry assembly window and ready for the
+    /// runtime to resolve through the current peer table.
+    ppdu_stats_completed: VecDeque<HttPpduStats>,
+    /// Completed monitor-status PPDUs awaiting the runtime's peer/vdev
+    /// lookup. This is separate from HTT TX PPDU assembly: RX status TLVs
+    /// are complete within one DMA status buffer.
+    rx_ppdu_stats: VecDeque<RxPpduStats>,
+    /// Michael MIC failures awaiting route to a vdev's cfg80211 notifier.
+    mic_failures: VecDeque<MichaelMicFailure>,
     /// `ATH11K_FLAG_CRASH_FLUSH`.
     pub crash_flush: bool,
     pub stats: DpStats,
@@ -1678,6 +1747,10 @@ impl Dp {
             pdev: None,
             htt: HttTarget::default(),
             peers: Vec::new(),
+            ppdu_stats_pending: VecDeque::new(),
+            ppdu_stats_completed: VecDeque::new(),
+            rx_ppdu_stats: VecDeque::new(),
+            mic_failures: VecDeque::new(),
             crash_flush: false,
             stats: DpStats::default(),
             peer_rx: super::dp_peer::DpPeerRx::default(),
@@ -2034,15 +2107,96 @@ impl Dp {
 
     // ── HTT T2H ───────────────────────────────────────────────────
 
+    /// Merge a PPDU fragment the same way Linux retains
+    /// `struct htt_ppdu_stats_info`: a matching id fills in more users/TLVs,
+    /// and only the oldest element beyond the 16-PDU window becomes visible
+    /// to station statistics.  This avoids publishing a rate without its
+    /// associated completion/common TLV when firmware split an indication.
+    fn merge_ppdu_stats(&mut self, incoming: &HttPpduStats) {
+        let assembled = match self
+            .ppdu_stats_pending
+            .iter_mut()
+            .find(|known| known.ppdu_id == incoming.ppdu_id)
+        {
+            Some(known) => known,
+            None => {
+                self.ppdu_stats_pending.push_back(HttPpduStats {
+                    pdev_id: incoming.pdev_id,
+                    ppdu_id: incoming.ppdu_id,
+                    ..HttPpduStats::default()
+                });
+                self.ppdu_stats_pending
+                    .back_mut()
+                    .expect("just pushed a PPDU assembly entry")
+            }
+        };
+        if let Some(duration) = incoming.tx_duration_us {
+            assembled.tx_duration_us = Some(duration);
+        }
+        for source in &incoming.users {
+            let target = match assembled
+                .users
+                .iter_mut()
+                .find(|known| known.peer_id == source.peer_id)
+            {
+                Some(known) => known,
+                None => {
+                    // Each decoded indication is capped at firmware's
+                    // `HTT_PPDU_STATS_MAX_USERS` (7). Preserve that bound
+                    // while merging fragments too: a malformed stream must
+                    // not turn a one-PPDU assembly entry into unbounded
+                    // storage.
+                    if assembled.users.len() == 7 {
+                        continue;
+                    }
+                    assembled.users.push(source.clone());
+                    continue;
+                }
+            };
+            if source.rate.is_some() {
+                target.rate = source.rate;
+            }
+            if source.completion.is_some() {
+                target.completion = source.completion;
+            }
+            if source.ack_ba.is_some() {
+                target.ack_ba = source.ack_ba;
+            }
+        }
+        // `ath11k_dp_htt_get_ppdu_desc` evicts once list depth is greater
+        // than `HTT_PPDU_DESC_MAX_DEPTH` (16), not at 16.
+        if self.ppdu_stats_pending.len() > 16 {
+            if let Some(done) = self.ppdu_stats_pending.pop_front() {
+                self.ppdu_stats_completed.push_back(done);
+            }
+        }
+    }
+
+    /// The next fully assembled PPDU evicted from Linux's bounded assembly
+    /// window.  The runtime resolves its peer ids without holding a separate
+    /// HTT lock, just as Linux looks up each id at update time.
+    pub fn take_ppdu_stats(&mut self) -> Option<HttPpduStats> {
+        self.ppdu_stats_completed.pop_front()
+    }
+
+    /// The next completed RX monitor-status PPDU. Linux passes each DMA
+    /// status buffer straight to `ath11k_dp_rx_update_peer_stats`; NARF
+    /// queues the compact decoded form until the runtime can resolve the
+    /// current `DpPeer` without borrowing the DMA ring.
+    pub fn take_rx_ppdu_stats(&mut self) -> Option<RxPpduStats> {
+        self.rx_ppdu_stats.pop_front()
+    }
+
     /// Linux `ath11k_dp_htt_htc_t2h_msg_handler`: decode, record the
     /// target version (`htt_tgt_version_received`), maintain the peer
-    /// table (`ath11k_peer_map_event` / `ath11k_peer_unmap_event`).
+    /// table (`ath11k_peer_map_event` / `ath11k_peer_unmap_event`) and
+    /// retain PPDU statistics fragments.
     pub fn htt_t2h_msg_handler(&mut self, msg: &[u8]) -> Result<HttT2h, TransportError> {
         let ev = htt::decode_t2h(msg)?;
-        match ev {
+        match &ev {
             HttT2h::VersionConf { major, minor } => {
-                self.htt.ver_major = major;
-                self.htt.ver_minor = minor;
+                self.htt.ver_major = *major;
+                self.htt.ver_minor = *minor;
                 self.htt.version_received = true;
             }
             HttT2h::PeerMap {
@@ -2056,28 +2210,31 @@ impl Dp {
                 if !self
                     .peers
                     .iter()
-                    .any(|p| p.vdev_id == vdev_id && p.addr == mac)
+                    .any(|p| p.vdev_id == *vdev_id && p.addr == *mac)
                 {
                     self.peers.push(DpPeer {
-                        vdev_id,
-                        peer_id,
-                        addr: mac,
-                        ast_hash,
-                        hw_peer_id,
+                        vdev_id: *vdev_id,
+                        peer_id: *peer_id,
+                        addr: *mac,
+                        ast_hash: *ast_hash,
+                        hw_peer_id: *hw_peer_id,
                         sec_type: enc::OPEN,
                         sec_type_grp: enc::OPEN,
+                        ucast_key_idx: None,
+                        mcast_key_idx: None,
                     });
                 }
             }
             HttT2h::PeerUnmap { peer_id, .. } => {
-                match self.peers.iter().position(|p| p.peer_id == peer_id) {
+                match self.peers.iter().position(|p| p.peer_id == *peer_id) {
                     Some(i) => {
                         self.peers.remove(i);
-                        self.peer_rx.peer_unmapped(peer_id);
+                        self.peer_rx.peer_unmapped(*peer_id);
                     }
                     None => self.stats.htt_peer_unmap_unknown += 1,
                 }
             }
+            HttT2h::PpduStats(stats) => self.merge_ppdu_stats(stats),
             HttT2h::Skipped(_) => {}
             HttT2h::Unhandled(_) => self.stats.htt_unhandled += 1,
         }
@@ -2099,6 +2256,66 @@ impl Dp {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Record or clear the installed mac80211 key slot alongside the cipher
+    /// state. Hardware error reports can have already stripped the TKIP IV,
+    /// so this is the authoritative key ID for a Michael failure event.
+    pub fn set_peer_key_index(
+        &mut self,
+        peer_id: u16,
+        pairwise: bool,
+        key_idx: Option<u8>,
+    ) -> bool {
+        let Some(peer) = self.peers.iter_mut().find(|peer| peer.peer_id == peer_id) else {
+            return false;
+        };
+        if pairwise {
+            peer.ucast_key_idx = key_idx;
+        } else {
+            peer.mcast_key_idx = key_idx;
+        }
+        true
+    }
+
+    /// Drain locally detected TKIP Michael MIC failures after the service
+    /// pass. The runtime routes each event by firmware vdev before the
+    /// netdev publishes cfg80211's MLME multicast notification.
+    pub fn take_mic_failures(&mut self) -> Vec<MichaelMicFailure> {
+        self.mic_failures.drain(..).collect()
+    }
+
+    fn record_mic_failure(&mut self, peer: DpPeer, group: bool) {
+        const MAX_PENDING_MIC_FAILURES: usize = 32;
+        if self.mic_failures.len() == MAX_PENDING_MIC_FAILURES {
+            self.mic_failures.pop_front();
+        }
+        self.mic_failures.push_back(MichaelMicFailure {
+            vdev_id: peer.vdev_id,
+            source: peer.addr,
+            group,
+            key_idx: if group {
+                peer.mcast_key_idx
+            } else {
+                peer.ucast_key_idx
+            },
+        });
+    }
+
+    /// Reconstruct the vdev and peer identity from a WBM RXDMA error
+    /// buffer. These reports arrive before normal RX processing, unlike an
+    /// attention-bit failure in [`Self::h_mpdu`].
+    fn record_mic_failure_from_skb(&mut self, skb: &RxSkb) {
+        let rxd = rx_desc(&skb.data);
+        let group = rxd.first_msdu() && rxd.attention.info1 & RX_ATTENTION_INFO1_MCAST_BCAST != 0;
+        let peer = self.peer_by_id(rxd.mpdu_peer_id()).copied().or_else(|| {
+            (rxd.mpdu_start.info1 & RX_MPDU_START_INFO1_MAC_ADDR2_VALID != 0)
+                .then_some(rxd.mpdu_start.addr2)
+                .and_then(|addr| self.peers.iter().find(|peer| peer.addr == addr).copied())
+        });
+        if let Some(peer) = peer {
+            self.record_mic_failure(peer, group);
         }
     }
 
@@ -2282,6 +2499,26 @@ impl Dp {
                 dscp_tid_tbl_idx: 0,
                 ..HalTxInfo::default()
             };
+            // `ath11k_dp_tx`: four-address multicast traffic needs the BSS
+            // peer's TCL metadata and `TO_FW` so firmware performs WDS
+            // offload. Only the managed-station builder emits a four-address
+            // frame here, after `WMI_PEER_USE_4ADDR` was requested.
+            if meta.encap == TxEncap::NativeWifi
+                && fc & (IEEE80211_FCTL_TODS | IEEE80211_FCTL_FROMDS)
+                    == (IEEE80211_FCTL_TODS | IEEE80211_FCTL_FROMDS)
+                && data.len() >= 30
+                && data[16] & 1 != 0
+            {
+                if let Some(peer) = self
+                    .peers
+                    .iter()
+                    .find(|peer| peer.vdev_id == vif.vdev_id && peer.addr == data[4..10])
+                {
+                    ti.meta_data_flags =
+                        field_prep(HTT_TCL_META_DATA_PEER_ID, peer.peer_id as u32) as u16;
+                    ti.flags0 |= HAL_TCL_DATA_CMD_INFO1_TO_FW;
+                }
+            }
             if meta.csum_partial {
                 ti.flags0 |= HAL_TCL_DATA_CMD_INFO1_IP4_CKSUM_EN
                     | HAL_TCL_DATA_CMD_INFO1_UDP4_CKSUM_EN
@@ -2714,7 +2951,7 @@ impl Dp {
         &mut self,
         skb: RxSkb,
         rxd: &HalRxDescWcn6855,
-        payload: Vec<u8>,
+        mut payload: Vec<u8>,
         from_err_path: bool,
     ) -> Result<Option<RxMsdu>, RxDrop> {
         let mut peer_id = skb.peer_id;
@@ -2767,6 +3004,9 @@ impl Dp {
             return Err(RxDrop::Fcs);
         }
         if err_bitmap & DP_RX_MPDU_ERR_TKIP_MIC != 0 {
+            if let Some(peer) = peer {
+                self.record_mic_failure(peer, is_mcbc);
+            }
             return Err(RxDrop::Mic);
         }
         if err_bitmap & DP_RX_MPDU_ERR_DECRYPT != 0 {
@@ -2779,6 +3019,32 @@ impl Dp {
             == 0;
 
         let decap_ty = rxd.decap_type();
+        // ath11k leaves a raw, hardware-decrypted TKIP MPDU's Michael MIC
+        // for mac80211. NARF decapsulates straight to Ethernet, so it must
+        // verify and remove it here. Fragmented raw MPDUs take the matching
+        // check in `dp_frag` before REO reinjection.
+        if enctype == enc::TKIP_MIC
+            && decrypted
+            && !is_mcbc
+            && decap_ty == decap::RAW
+            && skb.is_first_msdu
+            && skb.is_last_msdu
+            && !skb.is_frag
+        {
+            let Some(key) = self.tkip_rx_mic_key(peer_id) else {
+                if let Some(peer) = peer {
+                    self.record_mic_failure(peer, is_mcbc);
+                }
+                return Err(RxDrop::Mic);
+            };
+            let Some(mic_start) = super::dp_frag::verify_tkip_mic_frame(&payload, key) else {
+                if let Some(peer) = peer {
+                    self.record_mic_failure(peer, is_mcbc);
+                }
+                return Err(RxDrop::Mic);
+            };
+            payload.drain(mic_start..mic_start + super::dp_frag::TKIP_MIC_LEN);
+        }
         let frame = match decap_ty {
             // ath11k_dp_rx_h_undecap_raw (a single-MSDU MPDU only), then
             // mac80211's 802.11 → 802.3.
@@ -2811,6 +3077,7 @@ impl Dp {
             decap: decap_ty,
             csum_ok,
             freq: rxd.msdu_freq(),
+            rate_info: rxd.msdu_start.info3,
             from_err_path,
         }))
     }
@@ -2953,8 +3220,9 @@ impl Dp {
     /// Linux `ath11k_dp_rx_process_wbm_err` (+ `ath11k_dp_rx_wbm_err`,
     /// `h_reo_err` / `h_null_q_desc`, `h_rxdma_err`). `DESC_ADDR_ZERO`
     /// (no REO queue for the TID) MSDUs are delivered; everything else
-    /// is counted and dropped. TKIP MIC failures are dropped (Linux hands
-    /// them to mac80211's countermeasures; NARF has none).
+    /// is counted and dropped. TKIP MIC failures retain their peer/key
+    /// identity for the vdev's later cfg80211 MLME notification, like
+    /// mac80211's `ieee80211_rx_h_michael_mic_verify`.
     pub fn rx_process_wbm_err(
         &mut self,
         hal: &mut Hal,
@@ -3040,6 +3308,7 @@ impl Dp {
                         *c += 1;
                     }
                     if skb.err_code == rxdma_ecode::TKIP_MIC_ERR {
+                        self.record_mic_failure_from_skb(&skb);
                         Err(RxDrop::Mic)
                     } else {
                         Ok(None)
@@ -3205,9 +3474,10 @@ impl Dp {
     }
 
     /// Linux `ath11k_dp_rx_reap_mon_status_ring` for RXDMA `mac_id`
-    /// (non-full-monitor): recycle every status buffer the hardware has
-    /// finished. NARF does not parse the PPDU status TLVs (Linux uses them
-    /// for RSSI / rate statistics only). Returns buffers reaped.
+    /// (non-full-monitor): decode each completed status buffer's peer RSSI,
+    /// per-chain RSSI, and RX duration, then recycle it. The parser has the
+    /// same per-buffer scope as `ath11k_hal_rx_parse_mon_status`; it never
+    /// treats an arbitrary raw DMA word as a completed PPDU.
     pub fn reap_mon_status(
         &mut self,
         hal: &mut Hal,
@@ -3232,6 +3502,8 @@ impl Dp {
                     buf_addr_get(hal.desc_rd(id, off, 0), hal.desc_rd(id, off, 1));
                 if paddr != 0 {
                     let buf_id = field_get(DP_RXDMA_BUF_COOKIE_BUF_ID, cookie);
+                    let mut parsed = None;
+                    let mut remove = false;
                     match ring.bufs.find(buf_id) {
                         None => {
                             self.stats.rx_invalid_cookie += 1;
@@ -3247,8 +3519,23 @@ impl Dp {
                             } else {
                                 self.stats.mon_status_reaped += 1;
                             }
-                            ring.bufs.remove(buf_id);
+                            parsed = Self::parse_mon_status(&b.mem);
+                            remove = true;
                         }
+                    }
+                    if remove {
+                        ring.bufs.remove(buf_id);
+                    }
+                    if let Some(stats) = parsed {
+                        // Status traffic is normally drained in the same
+                        // service pass. Bound it nevertheless so a malformed
+                        // interrupt path cannot turn statistics into an
+                        // unbounded allocation.
+                        const RX_PPDU_QUEUE_MAX: usize = 128;
+                        if self.rx_ppdu_stats.len() == RX_PPDU_QUEUE_MAX {
+                            self.rx_ppdu_stats.pop_front();
+                        }
+                        self.rx_ppdu_stats.push_back(stats);
                     }
                 }
                 // move_next: a fresh buffer in the same slot.
@@ -3289,6 +3576,90 @@ impl Dp {
         }
         self.pdev = Some(pdev);
         reaped
+    }
+
+    /// The small station-statistics subset of
+    /// `ath11k_hal_rx_parse_mon_status`. `HAL_RX_PPDU_END` deliberately
+    /// ignores its advertised composite length, just as Linux does. All
+    /// other TLVs are bounds-checked before their documented WCN6855 fields
+    /// are read; malformed/incomplete buffers produce no station update.
+    fn parse_mon_status(mem: &DmaMem) -> Option<RxPpduStats> {
+        const TLV_HEADER_BYTES: usize = 4;
+        const RSSI_LEGACY_BYTES: usize = 144;
+        const RSSI_LEGACY_INFO0: usize = 140;
+        const RSSI_LEGACY_PREAMBLE: usize = 76;
+        const MPDU_INFO_WCN6855_BYTES: usize = 36;
+        const MPDU_INFO_WCN6855_INFO0: usize = 32;
+        const PPDU_END_DURATION_BYTES: usize = 40;
+        const PPDU_END_DURATION_INFO0: usize = 36;
+
+        let mut stats = RxPpduStats::default();
+        let mut have_peer = false;
+        let mut off = 0usize;
+        while off + TLV_HEADER_BYTES <= mem.len() {
+            let header = mem.rd32(off / 4);
+            let tag = field_get(HAL_TLV_HDR_TAG, header);
+            let declared_len = field_get(HAL_TLV_HDR_LEN, header) as usize;
+            let value_off = off + TLV_HEADER_BYTES;
+            // `HAL_RX_PPDU_END` reports a length covering subsequent PHY
+            // TLVs. The classification overview immediately after it is one
+            // word, which is the only payload to skip here.
+            let tlv_len = if tag == status_tag::RX_PPDU_END {
+                4
+            } else {
+                declared_len
+            };
+            let Some(next) = value_off.checked_add(tlv_len) else {
+                break;
+            };
+            if next > mem.len() {
+                break;
+            }
+
+            match tag {
+                status_tag::PHYRX_RSSI_LEGACY if tlv_len >= RSSI_LEGACY_BYTES => {
+                    let info0 = mem.rd32((value_off + RSSI_LEGACY_INFO0) / 4);
+                    stats.rssi_comb = Some(((info0 >> 8) & 0xff) as u8);
+                    for chain in 0..RX_PPDU_MAX_CHAINS {
+                        let chain_off = value_off + RSSI_LEGACY_PREAMBLE + chain * 8;
+                        let rssi_2040 = mem.rd32(chain_off / 4);
+                        stats.rssi_chain_pri20[chain] = Some((rssi_2040 & 0xff) as u8);
+                    }
+                }
+                status_tag::RX_MPDU_START if tlv_len >= MPDU_INFO_WCN6855_BYTES => {
+                    let info0 = mem.rd32((value_off + MPDU_INFO_WCN6855_INFO0) / 4);
+                    let peer_id = (info0 & 0xffff) as u16;
+                    // Linux initializes the parser's peer id to
+                    // `HAL_INVALID_PEERID` and only overwrites it for a
+                    // non-zero WCN6855 field.  Both reserved values must
+                    // remain un-attributed.
+                    if peer_id != 0 && peer_id != HTT_INVALID_PEER_ID {
+                        stats.peer_id = peer_id;
+                        have_peer = true;
+                    }
+                }
+                status_tag::RXPCU_PPDU_END_INFO if tlv_len >= PPDU_END_DURATION_BYTES => {
+                    let info0 = mem.rd32((value_off + PPDU_END_DURATION_INFO0) / 4);
+                    stats.rx_duration_us = Some(info0 & 0x00ff_ffff);
+                }
+                status_tag::RX_PPDU_END_STATUS_DONE | 0 => {
+                    // `hal_rx_mon_ppdu_info` is zero-initialized for each
+                    // status buffer.  Therefore an absent legacy-RSSI TLV
+                    // is a real zero RSSI sample, not a reason to preserve
+                    // a prior PPDU's value in the peer statistics.
+                    if have_peer {
+                        stats.rssi_comb.get_or_insert(0);
+                        return Some(stats);
+                    }
+                    return None;
+                }
+                status_tag::DUMMY => return None,
+                _ => {}
+            }
+
+            off = (next + (HAL_TLV_ALIGN - 1)) & !(HAL_TLV_ALIGN - 1);
+        }
+        None
     }
 
     /// `ath11k_dp_rx_mon_buf_done`: the HP + 1 entry's buffer is DONE.
@@ -3390,5 +3761,14 @@ impl Dp {
         if self.reo_cmd_timer.expire(now_ms) {
             hal.shadow_update_hp_tp(io, self.reo_cmd_timer.ring_id);
         }
+    }
+
+    /// `ath11k_dp_stop_shadow_timers`: a WoW transition retains the rings
+    /// but must not re-publish their head pointers while firmware is in M3.
+    pub fn stop_shadow_timers(&mut self) {
+        for timer in &mut self.tx_ring_timer {
+            timer.started = false;
+        }
+        self.reo_cmd_timer.started = false;
     }
 }

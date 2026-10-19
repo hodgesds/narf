@@ -198,6 +198,7 @@ impl WirelessNetIface for Mt76Iface {
                 .map(|bss| BssInfo {
                     bssid: bss.bssid,
                     ssid: bss.ssid.clone(),
+                    frequency_mhz: 2407 + 5 * u32::from(bss.channel),
                     channel: u32::from(bss.channel),
                     rssi: bss.signal_dbm.unwrap_or(-128),
                     security: scan_security(bss),
@@ -327,11 +328,22 @@ fn passive_channels(req: &ScanRequest) -> Result<Vec<u8>, WirelessError> {
     if req.active || !req.ssids.is_empty() {
         return Err(WirelessError::NotSupported);
     }
-    if req.channels.is_empty() {
+    let requested = if req.frequencies_mhz.is_empty() {
+        req.channels.clone()
+    } else {
+        req.frequencies_mhz
+            .iter()
+            .map(|&freq| match freq {
+                2412..=2462 if (freq - 2407) % 5 == 0 => Ok((freq - 2407) / 5),
+                _ => Err(WirelessError::NotSupported),
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    if requested.is_empty() {
         return Ok((1..=11).collect());
     }
     let mut channels = Vec::new();
-    for channel in &req.channels {
+    for channel in &requested {
         if !(1..=11).contains(channel) || channels.contains(&(*channel as u8)) {
             return Err(WirelessError::InvalidArgs);
         }
@@ -461,8 +473,14 @@ mod tests {
     fn mt76_passive_scan_policy_rejects_active_and_non_world_channels() -> TestResult {
         let mut req = ScanRequest {
             ssids: Vec::new(),
+            frequencies_mhz: Vec::new(),
             channels: vec![1, 6, 11],
             active: false,
+            random_mac: None,
+            colocated_6ghz: false,
+            duration_tu: None,
+            duration_mandatory: false,
+            extra_ies: Vec::new(),
         };
         if passive_channels(&req) != Ok(vec![1, 6, 11]) {
             return TestResult::Fail("valid passive request");
@@ -503,6 +521,7 @@ mod tests {
         let bad_req = AssociateRequest {
             bssid: [0; 6],
             ssid: Vec::new(),
+            frequency_mhz: 2437,
             channel: 6,
             security: narf_wireless::SecurityConfig::Open,
             ie: Vec::new(),
@@ -514,6 +533,7 @@ mod tests {
         let req = AssociateRequest {
             bssid: [2, 0, 0, 0, 0, 2],
             ssid: b"narf".to_vec(),
+            frequency_mhz: 2437,
             channel: 6,
             security: narf_wireless::SecurityConfig::Open,
             ie: Vec::new(),

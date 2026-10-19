@@ -168,14 +168,23 @@ impl SaeSession {
         peer_mac: [u8; 6],
     ) -> Self {
         let pt = pt_h2e_bytes(ssid, password, None);
-        Self::with_source(PweSource::H2e(pt), own_mac, peer_mac)
+        let mut s = Self::with_source(PweSource::H2e(pt), own_mac, peer_mac);
+        // Netlink and scan paths retain SSIDs/passwords as raw octets, so
+        // drivers use this constructor rather than `new(&str, &str, ...)`.
+        // SAE-PK passwords are ASCII by definition; recognize them here too
+        // or the session would derive the ordinary SAE key schedule and lose
+        // the KEK needed to authenticate the AP's KeyAuth Confirm element.
+        s.sae_pk = core::str::from_utf8(password).is_ok_and(super::pk::is_sae_pk_password);
+        s
     }
 
     /// A hunting-and-pecking session (hostap `sae_prepare_commit`, the
     /// Commit sent with status 0): the PWE comes from
     /// [`pwe_hunt_and_peck`] over `(password, own, peer)`.
     pub fn new_hunt_and_peck(password: &[u8], own_mac: [u8; 6], peer_mac: [u8; 6]) -> Self {
-        Self::with_source(PweSource::HuntAndPeck(password.to_vec()), own_mac, peer_mac)
+        let mut s = Self::with_source(PweSource::HuntAndPeck(password.to_vec()), own_mac, peer_mac);
+        s.sae_pk = core::str::from_utf8(password).is_ok_and(super::pk::is_sae_pk_password);
+        s
     }
 
     fn with_source(pwe_src: PweSource, own_mac: [u8; 6], peer_mac: [u8; 6]) -> Self {

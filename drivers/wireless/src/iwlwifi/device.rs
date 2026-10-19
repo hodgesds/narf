@@ -612,6 +612,11 @@ impl WirelessNetIface for Device {
                     let bss = BssInfo {
                         bssid,
                         ssid: beacon.ssid,
+                        frequency_mhz: match mpdu.channel as u32 {
+                            14 => 2484,
+                            1..=13 => 2407 + 5 * u32::from(mpdu.channel),
+                            ch => 5000 + 5 * ch,
+                        },
                         channel: mpdu.channel as u32,
                         rssi: mpdu.rssi,
                         security,

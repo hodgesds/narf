@@ -85,7 +85,28 @@ impl From<CapError> for SuspendError {
 /// from a signal handler / interrupt without grabbing a lock.
 static PHASE: AtomicU8 = AtomicU8::new(SuspendPhase::Idle as u8);
 
-/// Request a system-wide suspend. Walks the phase progression
+/// Claim the one global suspend transition before either the asynchronous
+/// firmware phase or synchronous device-PM phase begins.
+fn claim_suspend_transition() -> Result<(), SuspendError> {
+    PHASE
+        .compare_exchange(
+            SuspendPhase::Idle as u8,
+            SuspendPhase::FreezingUserspace as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map(|_| ())
+        .map_err(|_| SuspendError::AlreadySuspending)
+}
+
+/// Request a system-wide suspend through the synchronous device-PM surface.
+///
+/// Drivers with firmware exchanges that require interrupts (for example
+/// ath11k WoWLAN) must use [`suspend_async`] instead.  This compatibility
+/// entry point deliberately retains the original no-await contract for
+/// callers that only own [`crate::device_pm::DevicePmOps`] callbacks.
+///
+/// Walks the phase progression
 /// through to `PlatformOff`; on platforms where S3 is supported
 /// (`s3_supported() == true`) and the resume trampoline has been
 /// armed (`__test_arm_real_sleep` or future production gate),
@@ -99,16 +120,51 @@ static PHASE: AtomicU8 = AtomicU8::new(SuspendPhase::Idle as u8);
 /// platforms with armed S3.
 pub fn suspend(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), SuspendError> {
     cap.invoke(NoopOp)?;
-    if PHASE
-        .compare_exchange(
-            SuspendPhase::Idle as u8,
-            SuspendPhase::FreezingUserspace as u8,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_err()
-    {
-        return Err(SuspendError::AlreadySuspending);
+    claim_suspend_transition()?;
+    suspend_after_claim(cap)
+}
+
+/// Request system suspend with the asynchronous pre/post phase required by
+/// interrupt-driven device firmware.  Preparation runs while device IRQs
+/// are still usable; the existing synchronous device-PM fan-out then handles
+/// PCI/platform state; paired asynchronous resume runs only after that
+/// fan-out has restored the transport.
+pub async fn suspend_async(
+    cap: &Cap<Power, narf_capabilities::Invoke>,
+) -> Result<(), SuspendError> {
+    cap.invoke(NoopOp)?;
+    claim_suspend_transition()?;
+
+    let transition = crate::system_pm::prepare_async_system_pm().await;
+    if !transition.succeeded() {
+        // The failing hook owns its own rollback; unwind every preceding
+        // successful hook in forward-registration order before allowing a
+        // retry.  No synchronous driver has been quiesced at this point.
+        let _ = transition.resume().await;
+        PHASE.store(SuspendPhase::ResumingDrivers as u8, Ordering::Release);
+        PHASE.store(SuspendPhase::ThawingUserspace as u8, Ordering::Release);
+        PHASE.store(SuspendPhase::Idle as u8, Ordering::Release);
+        return Err(SuspendError::Aborted);
+    }
+
+    // Re-check the epoch after the asynchronous wait.  `suspend_after_claim`
+    // always returns the phase to Idle on every error edge.
+    let result = suspend_after_claim(cap);
+    let _ = transition.resume().await;
+    result
+}
+
+/// The original interrupt-gated platform/device phase after the caller has
+/// claimed [`PHASE`].  Both public entry points reach this function; keeping
+/// the claim outside it prevents another synchronous caller from racing an
+/// asynchronous firmware prepare.
+fn suspend_after_claim(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), SuspendError> {
+    if let Err(error) = cap.invoke(NoopOp) {
+        // `suspend_async` may have awaited long enough for a revocation after
+        // it claimed the transition.  This is still before any device-PM
+        // callback, so release the phase directly.
+        PHASE.store(SuspendPhase::Idle as u8, Ordering::Release);
+        return Err(error.into());
     }
     PHASE.store(SuspendPhase::QuiescingDrivers as u8, Ordering::Release);
     // Finish the fan-out so every driver gets a chance to quiesce, but never

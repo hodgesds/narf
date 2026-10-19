@@ -14,7 +14,7 @@ states following the May 2026 relicensing to GPL-2.0:
 | Driver | Generation | Status | Mechanism |
 | :--- | :--- | :--- | :--- |
 | **iwlwifi** | AX210+ transport; Sc/BE211 MLD station profile | RX/TX and station implementation; silicon validation pending | Firmware self-load, RFH, command/data queues, Open/WPA2-PSK |
-| **ath11k** | Wi-Fi 6E | **Stage 0** (identify) | PCI match + hw_rev; MHI/QMI/WMI/DP not yet — see `ath11k.md` §5 |
+| **ath11k** | Wi-Fi 6E | **Stage 5** (silicon qualification) | Offline-tested PCIe WCN6855 three-vdev STA/AP/P2P path: MHI/QMI/WMI/DP, scan/ROC, external supplicant, DFS, WoW/cold PM and RDDM recovery/device dump; first hardware boot pending — see `ath11k.md` §8 |
 | **rtw88** | Wi-Fi 5 | **Stage 2** (FW Load) | RTL8822C IDDMA, MCU handshake |
 
 ## 1. Purpose & scope
@@ -66,7 +66,13 @@ pub trait WirelessDriver: Driver {
 | **AC_BE** | Best Effort | Normal |
 | **AC_BK** | Background | Low |
 
-Drivers receive traffic via four distinct Narf-Rings (one per AC) from the stack daemon.
+The stack delivers Ethernet traffic through the netdev frame ring. The ath11k
+adapter classifies each frame to its 802.1D TID and WMM access category, then
+keeps one TXQ per TID. A shared 4096-flow fq table gives each TID DRR++ flow
+fairness; CoDel uses a 20 ms target, 100 ms interval, and ECN marking before
+drop. Hardware-queue stop reasons still gate the four ACs (VO, VI, BE, BK).
+The ring boundary stays deliberately metadata-minimal, so the driver derives
+a stable L2/L3/L4 flow hash rather than carrying Linux's private `skb->hash`.
 
 ### MT76 PCI discovery and register access
 
@@ -273,7 +279,8 @@ used. The Sc/BE211 profile implements `WirelessNetIface` as follows:
 - `associate()` configures a negotiated PHY/link/peer, allocates management
   and data queues, authenticates, and associates. Supported/basic rates are
   intersected with the AP; mandatory unsupported PHY/rate selectors are
-  rejected. HT supports 20/40 MHz and VHT supports 20/40/80 MHz, with
+  rejected. HT supports 20/40 MHz and VHT supports 20/40/80 plus contiguous
+  160 MHz, with
   common MCS masks, short guard intervals, peer LDPC reception, SMPS and
   HT protection programmed into TLC v6, peer and link commands. VHT MCS9
   is excluded at 20 MHz for the supported one/two-stream profile.
@@ -285,6 +292,19 @@ used. The Sc/BE211 profile implements `WirelessNetIface` as follows:
   the response's final span is revalidated. TLC v6 adapts data rates within
   that intersection. WMM negotiation
   enables BK/BE/VI/VO hardware queues with AP EDCA parameters and QoS headers.
+  For an HE AP, the association response's complete extension-38 MU-EDCA
+  Parameter Set is parsed in the same BE/BK/VI/VO order and each AC's legacy
+  WMM update is immediately followed by its incremental
+  `WMI_WMM_PARAM_TYPE_11AX_MU_EDCA` update (ECW exponents remain unexpanded),
+  before that AC's U-APSD policy write. Associated-station beacon handling
+  tracks the WMM and MU-EDCA four-bit parameter-set counters as one
+  generation: a changed generation reuses that same per-AC sequence, while a
+  repeated generation does nothing. The counters are latched before malformed
+  WMM-record rejection, preventing a broken AP from retriggering the same bad
+  update on every beacon. If the association response does not provide a
+  complete valid WMM parameter set, the station retains QoS with mac80211's
+  defaults and disables subsequent WMM beacon tracking rather than switching
+  back and forth between invalid and valid layouts.
   DSCP classifies kernel traffic; explicit AC rings preserve daemon priorities.
   Categories requiring admission control downgrade to an admitted category.
   Association supports Open, WPA2-PSK, and WPA3-Personal (SAE) with
@@ -396,6 +416,124 @@ These results validate software contracts, not target-radio operation.
 The implemented high-level control trait is `narf_wireless::WirelessNetIface`.
 The `nl80211` family bridges explicitly delegated scan/connect/disconnect
 requests to this trait and publishes asynchronous completion events.
+`ScanRequest` carries the cfg80211 random-MAC address/mask pair and the
+colocated-6-GHz scan intent. A driver advertises
+`supports_scan_random_mac()` only when firmware implements it; nl80211 then
+sets `NL80211_FEATURE_SCAN_RANDOM_MAC_ADDR`, rejects random scans while
+associated, applies Linux's default locally-administered/unicast mask when
+userspace omitted one, and preserves only masked address bits. The driver
+receives the resulting WMI-facing value rather than trusting raw netlink
+attributes. Colocated 6-GHz is retained separately because it is valid
+without an nl80211 feature flag but only has an effect on firmware with
+per-channel scan configuration.
+ath11k supplies Linux WCN6855's 512-station `hw_params.num_peers` value as
+`max_ap_assoc_sta` to the generic wiphy encoder. This registration limit is
+intentionally distinct from the 16-peer startup resource request sent by
+`ath11k_init_wmi_config_qca6390`; it communicates cfg80211's physical-radio
+contract without pretending to reserve firmware peer slots against concurrent
+use.
+For Linux-equivalent wiphy discovery, ath11k also supplies the three static
+`ath11k_iftypes_ext_capa` records: a default record plus station and AP
+records. Their exact `EXT_CAPA`/mask bytes advertise extended channel
+switching, MBSSID, operating-mode notification, role-appropriate TWT, and AP
+EMA support only where the existing MAC paths implement it.
+Its top-level mac80211 Extended Capabilities remain distinct because WCN6855
+is `SUPPORTS_ONLY_HE_MULTI_BSSID`. The physical wiphy also exposes the three
+addresses generated by `ath11k_mac_setup_vdev_params`, permits management TX
+on an active ROC, and advertises two CSA countdown counter locations, all of
+which the existing vdev/ROC/CSA paths enforce.
+The trait also carries physical-wiphy identity and an optional virtual-vdev
+lifecycle: drivers that implement `wiphy_id`,
+`supports_virtual_interfaces`, `new_virtual_interface`, and
+`delete_virtual_interface` are exposed as one `GET_WIPHY` radio with several
+`GET_INTERFACE` netdevs. Allocation is invoked by `NEW_INTERFACE` against
+the physical wiphy; deletion hides the target interface before the driver's
+asynchronous firmware teardown completes. A driver must not expose a freed
+firmware slot until that teardown has completed, and must refuse deletion of
+its physical root netdev.
+Drivers with multiple vdevs also return `interface_combinations()`. nl80211
+serializes it as `NL80211_ATTR_INTERFACE_COMBINATIONS` (per-type limits,
+total interface cap, channel cap, beacon-interval rule, and DFS radar
+widths), so a userspace network manager can validate concurrency before it
+creates a netdev rather than discovering a firmware-slot failure afterward.
+The driver must enforce every advertised total and operating-channel limit
+against the physical radio, not independently per virtual netdev; a pending
+association, AP start, or channel switch reserves its requested exact MHz
+context until it succeeds or rolls back.
+WoW-capable drivers may additionally expose `WowlanSupport::net_detect_*`.
+This admits cfg80211's nested `NET_DETECT` scheduled-scan-shaped policy only
+for low-power wake network-list offload: SSID/RSSI match sets, probe SSIDs and
+frequencies, one or two plans, delay, retained probe IEs, and an optional
+random-MAC pair. nl80211 serializes the matching wiphy limits and
+`NL80211_FEATURE_ND_RANDOM_MAC_ADDR`; drivers must reject this policy unless
+their firmware NLO service can consume it during the later WoW transition.
+Drivers may expose `sar_capability()` for a physical radio BIOS SAR table.
+nl80211 emits its fixed ranges as nested `NL80211_ATTR_SAR_SPEC` metadata and
+advertises `SET_SAR_SPECS` only when the driver supplies that capability. The
+set operation accepts the power type and a non-duplicate subset of range
+indices; it is radio-wide, retains the full desired firmware table, and must
+be replayed after firmware recovery or a cold system-resume before traffic is
+allowed to resume.
+An AP driver with firmware support for multiple BSSID advertisements returns
+`mbssid_support()` at physical-wiphy scope. nl80211 then emits the nested
+`NL80211_ATTR_MBSSID_CONFIG` capability (maximum interfaces and EMA profile
+periodicity) and admits `START_AP`'s MBSSID configuration, complete element
+lists and EMA RNR lists. The driver resolves `TX_IFINDEX` only to an AP vdev
+on the same physical radio; it must send the target's transmitting /
+non-transmitting / EMA flags during vdev start, then send the transmitter
+BSSID and `index` / `1 << bssid_indicator` at vdev-up for a non-transmitting
+profile. The transmitter owns one complete ordinary template or all EMA
+templates. A non-transmitting vdev is deferred until those templates exist;
+once it is up the driver must not send it a replacement beacon template when
+the target forbids that sequence. Deleting a transmitting virtual netdev
+also schedules deletion of all of its registered non-transmitting children.
+An AP driver with a six-GHz band advertises the FILS-discovery and unsolicited
+broadcast-Probe-Response extended feature bits. It parses Linux's nested
+template/interval attributes on `START_AP` and `SET_BEACON`; an empty nested
+attribute explicitly deletes the selected family. Firmware receives FILS
+first when both values are nonzero, otherwise unsolicited Probe Response, or
+a zero-interval disable. `CHANNEL_SWITCH` retains an unsolicited-response
+change and sends it only after the new channel's vdev restart.
+When the WCN RTT service is available, the AP wiphy also exposes
+`NL80211_EXT_FEATURE_ENABLE_FTM_RESPONDER`. Its enabled nested FTM responder
+request, including optional LCI/Civic Measurement Report bodies, is retained
+at AP scope and results in the responder-role vdev parameter after AP start,
+SET_BEACON or a CSA restart.
+With `WMI_TLV_SERVICE_AP_TWT`, START_AP also accepts the empty
+`NL80211_ATTR_TWT_RESPONDER` flag. After vdev-up ath11k sends the same
+default `WMI_TWT_ENABLE_CMDID` parameter block used by its station requester;
+AP stop sends `WMI_TWT_DISABLE_CMDID`. The pdev operation is best effort and
+never reverses an otherwise completed AP transition.
+`START_AP` also accepts the Linux `NL80211_ATTR_HE_OBSS_PD` nested spatial-
+reuse policy: mandatory SR control, optional 1..=20 offsets and exact
+eight-byte SRG color/partial-BSSID bitmaps. After the AP vdev is up, ath11k
+programs the pdev's threshold, per-AC and SR-prohibit parameters; firmware
+with `WMI_TLV_SERVICE_SRG_SRP_SPATIAL_REUSE_SUPPORT` additionally receives the
+six exact SRG/non-SRG bitmap commands. A WMI failure is reported without
+undoing the AP transition.
+When `WMI_TLV_SERVICE_BSS_COLOR_OFFLOAD` is available, the wiphy exposes
+`NL80211_EXT_FEATURE_BSS_COLOR`. The AP path retains the mandatory 1..=63
+HE BSS color and disabled/partial flags from START_AP, SET_BEACON or a
+post-CSA beacon. After the vdev is up it sends both the 5-second AP OBSS-color
+collision configuration and `WMI_VDEV_PARAM_BSS_COLOR` (color at bit 24, or
+the disabled bit); either WMI failure is reported without undoing the AP
+transition. `WMI_OBSS_COLOR_COLLISION_DETECTION_EVENTID` detection events are
+coalesced for 500 ms before their MLME `NL80211_CMD_OBSS_COLOR_COLLISION`
+notification; disable/free-slot events are intentionally not published.
+For an MBSSID transmitter, each ordinary BSS-color update and every accepted
+color-transition start/final/abort state is queued onto the live
+non-transmitting profiles as well. Their independent vdev workers apply the
+same color/enabled state, matching mac80211's propagation from a transmitting
+BSS configuration without cross-vdev WMI locking.
+The same feature enables AP-only `NL80211_CMD_COLOR_CHANGE_REQUEST`: the
+driver validates its one temporary beacon counter offset and optional Probe
+Response offset, uploads each countdown template through the ordinary beacon
+WMI path, temporarily disables the BSS color, then restores the retained
+post-change template and requested color. It emits MLME
+COLOR_CHANGE_STARTED/COMPLETED or restores the prior template/color and emits
+COLOR_CHANGE_ABORTED on an asynchronous failure. Color changes reject a
+non-transmitting MBSSID profile or active CSA; an incoming CSA aborts an
+active color transition as mac80211 does.
 Probe can load a signed `wireless-regulatory.bin` deployment policy via the
 firmware registry (wire format in `wireless/` §3.5). A trusted service launcher
 uses `net::stack::control_registered` with its interface/daemon capabilities,
@@ -444,10 +582,24 @@ rather than `CONNECT`. `Connection::protect_group_mgmt` provides the
 BIP-CMAC-128 MMIE *emission* counterpart to inbound verification (the
 transmit hook an AP/mesh send path would use); station mode never emits
 group-addressed robust management frames, so it is exercised by a
-protect/verify round-trip test. A full AP-mode send path (`START_AP`,
-beaconing, client management) and SAE-PK public-key validation remain
-follow-up work; as with the rest of this profile, these paths are validated
-by software contract tests, not against target silicon.
+protect/verify round-trip test. The ath11k WCN6855 profile implements an
+AP/GO vdev control and Ethernet data path (`SET_INTERFACE` while down,
+`START_AP` / `STOP_AP`, exact 20/40/80/160 or 80+80 channel definitions,
+beacon-template replacement, per-client native-Wi-Fi FromDS TX/RX, and
+explicit peer create/associate/delete). AP station records retain WMM, U-APSD,
+PMF, and legacy/HT/VHT/HE capability inputs and are intersected with the radio
+before WMI peer association; target AP-PS programming owns client buffering
+and beacon TIM maintenance. AP IGTKs are software BIP-CMAC-128/256 or
+BIP-GMAC-128/256 keys (never WMI keys); default-management-key selection
+controls group robust-management MMIE TX, while per-client PMF uses
+CCMP-family management PNs. The in-kernel WPA3
+station path recognizes SAE-PK fingerprint passwords even when their SSID and
+password arrive as raw netlink octets, derives the SAE-PK KEK, and refuses the
+association unless the AP Confirm's encrypted Modifier, fingerprint and ECDSA
+KeyAuth transcript proof all validate. Management-frame authentication and
+association for an external SAE supplicant remain owned by hostapd through
+registered management frames. These paths have not been run on target silicon
+in this implementation pass.
 
 ## 5. Buffer Management
 

@@ -21,6 +21,7 @@ enum Call {
     Authorize(bool),
     Tx([u8; 6], u16, Vec<u8>, bool),
     Ps(bool),
+    Rekey([u8; 8], Option<u32>),
     Disassociate,
 }
 
@@ -59,6 +60,19 @@ impl crate::WirelessNetIface for ExtStub {
     }
     fn supports_external_supplicant(&self) -> bool {
         true
+    }
+    fn supports_control_port_tx_status(&self) -> bool {
+        true
+    }
+    fn supports_gtk_rekey_offload(&self) -> bool {
+        true
+    }
+    fn set_gtk_rekey_data(&self, data: crate::GtkRekeyData) -> Result<(), i32> {
+        // Test only the non-secret values retained by the driver boundary.
+        self.calls
+            .lock()
+            .push(Call::Rekey(data.replay_counter, data.akm));
+        Ok(())
     }
     fn get_wireless_info(&self) -> crate::WirelessIfaceInfo {
         crate::WirelessIfaceInfo {
@@ -152,6 +166,7 @@ impl crate::WirelessNetIface for ExtStub {
     fn station_info(&self) -> Option<crate::StationInfo> {
         Some(crate::StationInfo {
             signal_dbm: Some(-42),
+            chain_signal_dbm: [Some(-42), Some(-47), None, None, None, None, None, None],
             tx_bitrate: Some(crate::RateInfo {
                 bitrate_100kbps: 1300,
                 ht_mcs: Some(15),
@@ -159,6 +174,21 @@ impl crate::WirelessNetIface for ExtStub {
                 short_gi: true,
                 ..Default::default()
             }),
+            rx_bitrate: Some(crate::RateInfo {
+                bitrate_100kbps: 153,
+                he_mcs: Some((4, 1, 1)),
+                he_dcm: true,
+                // A 106-tone RU is not a 20/40 MHz channel-width report.
+                he_ru_alloc: Some(2),
+                width_mhz: 20,
+                ..Default::default()
+            }),
+            rx_packets: Some(17),
+            tx_packets: Some(23),
+            tx_retries: Some(5),
+            tx_failed: Some(2),
+            tx_duration_us: Some(0x1_0000_0001),
+            rx_duration_us: Some(0x2_0000_0002),
             ..Default::default()
         })
     }
@@ -228,6 +258,52 @@ fn with_key(r: &Rig, fields: &[(u16, &[u8])], mac: Option<&[u8]>) -> Vec<u8> {
 const CCMP: [u8; 4] = 0x000f_ac04u32.to_ne_bytes();
 const CMAC: [u8; 4] = 0x000f_ac06u32.to_ne_bytes();
 const TKIP: [u8; 4] = 0x000f_ac02u32.to_ne_bytes();
+
+/// `NL80211_CMD_SET_REKEY_OFFLOAD`: exact required nested material, the
+/// association/up gates, and pass-through to the driver without exposing the
+/// KEK/KCK in the test recorder.
+fn smoke_nl80211_gtk_rekey_offload() -> TestResult {
+    let Ok(r) = rig() else {
+        return TestResult::Fail("rig");
+    };
+    let kek = [0x11; 16];
+    let kck = [0x22; 16];
+    let replay = [0, 1, 2, 3, 4, 5, 6, 7];
+    let akm = 0x000f_ac02u32;
+    let request = |include_kck: bool, counter: &[u8]| {
+        let mut nested = Vec::new();
+        push_attr(&mut nested, 1, &kek); // KEK
+        if include_kck {
+            push_attr(&mut nested, 2, &kck); // KCK
+        }
+        push_attr(&mut nested, 3, counter); // REPLAY_CTR
+        push_attr(&mut nested, 4, &akm.to_ne_bytes());
+        let mut outer = base(&r);
+        push_attr(&mut outer, 122 | NLA_F_NESTED, &nested);
+        outer
+    };
+    let run = |attrs: &[u8]| handle(station::SET_REKEY_OFFLOAD, attrs, false, ctx(0)).map(|_| ());
+    if run(&request(true, &replay)) != Err(station::ENETDOWN) {
+        return TestResult::Fail("SET_REKEY_OFFLOAD down is ENETDOWN");
+    }
+    narf_net::iface::set_link_state(NAME, true);
+    if run(&request(true, &replay)) != Err(station::ENOTCONN) {
+        return TestResult::Fail("SET_REKEY_OFFLOAD disconnected is ENOTCONN");
+    }
+    r.stub.connected.store(true, Ordering::SeqCst);
+    if run(&request(true, &replay)).is_err()
+        || *r.stub.calls.lock() != [Call::Rekey(replay, Some(akm))]
+    {
+        return TestResult::Fail("SET_REKEY_OFFLOAD did not retain rekey state");
+    }
+    if run(&request(false, &replay)) != Err(EINVAL)
+        || run(&request(true, &[0; 7])) != Err(station::ERANGE)
+    {
+        return TestResult::Fail("SET_REKEY_OFFLOAD nested validation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("wireless/nl80211", smoke_nl80211_gtk_rekey_offload);
 
 fn smoke_nl80211_ext_keys() -> TestResult {
     let Ok(r) = rig() else {
@@ -601,6 +677,87 @@ kernel_test_in!(
     smoke_nl80211_ext_station_pmksa_control_port
 );
 
+static CONTROL_PORT_STATUS_EVENTS: IrqSafeSpinLock<Vec<(u64, u32, Vec<u8>)>> =
+    IrqSafeSpinLock::new(Vec::new());
+
+fn control_port_status_event(namespace: u64, group: u32, message: &[u8]) {
+    CONTROL_PORT_STATUS_EVENTS
+        .lock()
+        .push((namespace, group, message.to_vec()));
+}
+
+/// A requested control-port transmission reports the exact cookie and full
+/// Ethernet data frame on the MLME multicast group, exactly like
+/// `cfg80211_control_port_tx_status`.
+fn smoke_nl80211_control_port_tx_status() -> TestResult {
+    use narf_net::netlink_generic::install_event_sink;
+    let Ok(r) = rig() else {
+        return TestResult::Fail("rig");
+    };
+    let previous = install_event_sink(control_port_status_event);
+    CONTROL_PORT_STATUS_EVENTS.lock().clear();
+    let frame = [
+        AP[0], AP[1], AP[2], AP[3], AP[4], AP[5], MAC[0], MAC[1], MAC[2], MAC[3], MAC[4], MAC[5],
+        0x88, 0x8e, 1, 3, 0, 95,
+    ];
+    crate::nl80211::notify_control_port_tx_status(NAME, 0xfeed_babe, &frame, true);
+    let events = CONTROL_PORT_STATUS_EVENTS.lock().clone();
+    let _ = install_event_sink(previous.unwrap_or(control_port_status_event));
+    let good = events.len() == 1 && {
+        let (namespace, group, message) = &events[0];
+        let attrs = &message[20..];
+        *namespace == 0
+            && *group == 19
+            && message[16] == station::CONTROL_PORT_FRAME_TX_STATUS
+            && find_attr(attrs, 1).is_some()
+            && find_attr(attrs, 3) == Some(&r.ifindex.to_ne_bytes()[..])
+            && find_attr(attrs, 153).is_some()
+            && find_attr(attrs, 51) == Some(&frame[..])
+            && find_attr(attrs, 88) == Some(&0xfeed_babeu64.to_ne_bytes()[..])
+            && find_attr(attrs, 92) == Some(&[][..])
+    };
+    if good {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("CONTROL_PORT_FRAME_TX_STATUS event layout")
+    }
+}
+kernel_test_in!("wireless/nl80211", smoke_nl80211_control_port_tx_status);
+
+/// A locally detected TKIP Michael failure follows cfg80211's MLME event
+/// layout. The target may have stripped the IV, so this form has the saved
+/// key index but intentionally no KEY_SEQ/TSC.
+fn smoke_nl80211_michael_mic_failure() -> TestResult {
+    use narf_net::netlink_generic::install_event_sink;
+    let Ok(r) = rig() else {
+        return TestResult::Fail("rig");
+    };
+    let previous = install_event_sink(control_port_status_event);
+    CONTROL_PORT_STATUS_EVENTS.lock().clear();
+    crate::nl80211::notify_michael_mic_failure(NAME, AP, true, Some(2));
+    let events = CONTROL_PORT_STATUS_EVENTS.lock().clone();
+    let _ = install_event_sink(previous.unwrap_or(control_port_status_event));
+    let good = events.len() == 1 && {
+        let (namespace, group, message) = &events[0];
+        let attrs = &message[20..];
+        *namespace == 0
+            && *group == 19
+            && message[16] == station::MICHAEL_MIC_FAILURE
+            && find_attr(attrs, 1).is_some()
+            && find_attr(attrs, 3) == Some(&r.ifindex.to_ne_bytes()[..])
+            && find_attr(attrs, 6) == Some(&AP[..])
+            && find_attr(attrs, 55) == Some(&0u32.to_ne_bytes()[..])
+            && find_attr(attrs, 8) == Some(&[2][..])
+            && find_attr(attrs, 10).is_none()
+    };
+    if good {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("MICHAEL_MIC_FAILURE event layout")
+    }
+}
+kernel_test_in!("wireless/nl80211", smoke_nl80211_michael_mic_failure);
+
 fn smoke_nl80211_ext_power_reg_interface_station() -> TestResult {
     let Ok(r) = rig() else {
         return TestResult::Fail("rig");
@@ -680,7 +837,7 @@ fn smoke_nl80211_ext_power_reg_interface_station() -> TestResult {
     }) {
         return TestResult::Fail("GET_INTERFACE lacks NL80211_ATTR_WDEV");
     }
-    // GET_STATION: the driver's signal and TX rate.
+    // GET_STATION: the driver's signal, TX rate and completion counters.
     r.stub.connected.store(true, Ordering::SeqCst);
     let mut st = base(&r);
     push_attr(&mut st, 6, &AP);
@@ -693,15 +850,37 @@ fn smoke_nl80211_ext_power_reg_interface_station() -> TestResult {
         return TestResult::Fail("GET_STATION reply");
     };
     let rate = find_attr(&info, 8 | NLA_F_NESTED);
+    let rx_rate = find_attr(&info, 14 | NLA_F_NESTED);
+    let chain_signal = find_attr(&info, 25 | NLA_F_NESTED);
     if find_attr(&info, 7) != Some(&[(-42i8) as u8][..])
+        || find_attr(&info, 9) != Some(&17u32.to_ne_bytes()[..])
+        || find_attr(&info, 10) != Some(&23u32.to_ne_bytes()[..])
+        || find_attr(&info, 11) != Some(&5u32.to_ne_bytes()[..])
+        || find_attr(&info, 12) != Some(&2u32.to_ne_bytes()[..])
+        || find_attr(&info, 39) != Some(&0x1_0000_0001u64.to_ne_bytes()[..])
+        || find_attr(&info, 32) != Some(&0x2_0000_0002u64.to_ne_bytes()[..])
+        || !chain_signal.is_some_and(|chains| {
+            find_attr(chains, 0) == Some(&[(-42i8) as u8][..])
+                && find_attr(chains, 1) == Some(&[(-47i8) as u8][..])
+                && find_attr(chains, 2).is_none()
+        })
         || !rate.is_some_and(|r| {
             find_attr(r, 1) == Some(&1300u16.to_ne_bytes()[..])
                 && find_attr(r, 2) == Some(&[15][..])
                 && find_attr(r, 3).is_some()
                 && find_attr(r, 4).is_some()
         })
+        || !rx_rate.is_some_and(|r| {
+            find_attr(r, 5) == Some(&153u32.to_ne_bytes()[..])
+                && find_attr(r, 13) == Some(&[4][..])
+                && find_attr(r, 14) == Some(&[1][..])
+                && find_attr(r, 15) == Some(&[1][..])
+                && find_attr(r, 16) == Some(&[1][..])
+                && find_attr(r, 17) == Some(&[2][..])
+                && find_attr(r, 3).is_none()
+        })
     {
-        return TestResult::Fail("STA_INFO signal / TX bitrate");
+        return TestResult::Fail("STA_INFO signal / TX/RX bitrate / counters");
     }
     TestResult::Pass
 }
@@ -755,6 +934,9 @@ fn smoke_nl80211_ext_connect_owner_release() -> TestResult {
         psk_offload: false,
         sae_offload: false,
         external: true,
+        cipher_suites: &[],
+        scan_random_mac: false,
+        connected: false,
     };
     let parse = |a: &[u8]| parse_operation_caps(CONNECT, &attributes(a).unwrap(), caps, OWNER);
     let ok = matches!(

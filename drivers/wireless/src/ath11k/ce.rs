@@ -1271,6 +1271,16 @@ impl Ce {
         }
     }
 
+    /// `ath11k_ce_stop_shadow_timers`: cancel every software retry / shadow
+    /// refresh before a WoW MHI-M3 transition.  The transport may no longer
+    /// accept register writes once the firmware acknowledged low power.
+    pub fn stop_shadow_timers(&mut self) {
+        for pipe in &mut self.pipes {
+            pipe.hp_timer.started = false;
+        }
+        self.rx_retry_at = None;
+    }
+
     /// Wait up to `ms` for a CE interrupt, then [`Self::service`].
     pub async fn wait_and_service(&mut self, io: &impl ChipIo, irq: &impl CeIrq, ms: u32) -> u32 {
         irq.wait(ms).await;

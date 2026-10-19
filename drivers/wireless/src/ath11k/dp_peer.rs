@@ -41,8 +41,8 @@
 //!
 //! Fragment reassembly lives in [`super::dp_frag`]; its per-TID state is
 //! in [`RxTid`]. `ath11k_peer_rx_frag_setup` is its peer lookup and
-//! `dp_setup_done` (no Michael MIC transform: TKIP fragments are
-//! dropped).
+//! `dp_setup_done`; [`TkipRxMicKey`] is the host-only receive direction
+//! needed to verify a reassembled TKIP Michael MIC.
 
 #![allow(dead_code)]
 
@@ -738,6 +738,26 @@ impl RxTid {
     }
 }
 
+/// The host-held RX Michael direction for an encrypted TKIP peer.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub struct TkipRxMicKey([u8; 8]);
+
+impl TkipRxMicKey {
+    pub const fn new(bytes: [u8; 8]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn bytes(&self) -> &[u8; 8] {
+        &self.0
+    }
+}
+
+impl core::fmt::Debug for TkipRxMicKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("TkipRxMicKey(<redacted>)")
+    }
+}
+
 /// The RX part of `struct ath11k_peer` for one HTT-mapped peer.
 #[derive(Debug)]
 pub struct PeerRx {
@@ -745,6 +765,10 @@ pub struct PeerRx {
     pub addr: [u8; 6],
     pub peer_id: u16,
     pub rx_tid: [RxTid; NUM_RX_TIDS],
+    /// `key[NL80211_TKIP_DATA_OFFSET_RX_MIC_KEY..][..8]`, retained only
+    /// while a pairwise TKIP key is installed. The firmware owns the
+    /// temporal key and transmit Michael direction.
+    pub tkip_rx_mic: Option<TkipRxMicKey>,
     pub dp_setup_done: bool,
 }
 
@@ -886,9 +910,37 @@ impl Dp {
             addr: *addr,
             peer_id,
             rx_tid: Default::default(),
+            tkip_rx_mic: None,
             dp_setup_done: false,
         });
         Some(rx.peers.len() - 1)
+    }
+
+    /// Install or clear the host-only receive Michael direction for a
+    /// pairwise TKIP key. Linux keeps a Michael shash per peer and receives
+    /// this key from mac80211; the WCN6855 firmware owns the remaining TKIP
+    /// material, so DP deliberately retains only these eight octets.
+    pub fn tkip_rx_mic_config(
+        &mut self,
+        vdev_id: u8,
+        addr: &[u8; 6],
+        key: Option<[u8; 8]>,
+    ) -> Result<(), i32> {
+        let pi = self
+            .peer_rx_idx(vdev_id, addr)
+            .ok_or(perr(step::PEER_NOT_FOUND, vdev_id as u32, ENOENT).errno)?;
+        self.peer_rx.peers[pi].tkip_rx_mic = key.map(TkipRxMicKey::new);
+        Ok(())
+    }
+
+    /// The stored host-only receive Michael direction for one HTT peer.
+    pub(super) fn tkip_rx_mic_key(&self, peer_id: u16) -> Option<&[u8; 8]> {
+        self.peer_rx
+            .peers
+            .iter()
+            .find(|peer| peer.peer_id == peer_id)
+            .and_then(|peer| peer.tkip_rx_mic.as_ref())
+            .map(TkipRxMicKey::bytes)
     }
 
     // ── REO command ring ────────────────────────────────────────

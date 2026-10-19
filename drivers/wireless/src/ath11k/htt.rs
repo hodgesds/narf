@@ -19,9 +19,10 @@
 //! - [`ppdu_stats_cfg_msgs`] = `ath11k_dp_tx_htt_h2t_ppdu_stats_req`.
 //! - [`decode_t2h`] = the decode half of
 //!   `ath11k_dp_htt_htc_t2h_msg_handler`: VERSION_CONF, PEER_MAP,
-//!   PEER_MAP2, PEER_UNMAP / PEER_UNMAP2; PPDU_STATS_IND, EXT_STATS_CONF,
-//!   PKTLOG and BKPRESSURE_EVENT_IND are recognised and skipped (Linux
-//!   feeds them to stats / debugfs / pktlog only); anything else is
+//!   PEER_MAP2, PEER_UNMAP / PEER_UNMAP2 and the bounded PPDU_STATS_IND
+//!   TLV payload needed for per-peer rate and airtime accounting.
+//!   EXT_STATS_CONF, PKTLOG and BKPRESSURE_EVENT_IND are recognised and
+//!   skipped (Linux feeds them to debugfs / pktlog only); anything else is
 //!   [`HttT2h::Unhandled`] (Linux: "htt event %d not handled").
 //!
 //! Every message is the little-endian `__packed` struct Linux builds in
@@ -63,6 +64,13 @@ pub mod step {
     pub const VERSION: u32 = 224;
     /// No VERSION_CONF within `HTT_TARGET_VERSION_TIMEOUT_MS`.
     pub const VERSION_TIMEOUT: u32 = 225;
+    /// PPDU_STATS_IND has a malformed outer header or TLV (detail = byte
+    /// offset << 16 | tag). Linux logs and drops it; NARF rejects it before
+    /// it can update a peer's station statistics.
+    pub const PPDU_TLV: u32 = 226;
+    /// PPDU_STATS_IND supplied more firmware users than ath11k supports
+    /// (detail = PPDU id's low 16 bits).
+    pub const PPDU_USERS: u32 = 227;
 }
 
 /// Linux `-ETIMEDOUT`, `-EOPNOTSUPP`.
@@ -150,6 +158,37 @@ pub const HTT_PPDU_STATS_CFG_MSG_TYPE: u32 = genmask(7, 0);
 pub const HTT_PPDU_STATS_CFG_SOC_STATS: u32 = 1 << 8;
 pub const HTT_PPDU_STATS_CFG_PDEV_ID: u32 = genmask(15, 9);
 pub const HTT_PPDU_STATS_CFG_TLV_TYPE_BITMASK: u32 = genmask(31, 16);
+
+/// `struct ath11k_htt_ppdu_stats_msg` has four fixed little-endian words
+/// before its TLV payload.
+const HTT_PPDU_STATS_MSG_HDR_LEN: usize = 16;
+const HTT_T2H_PPDU_STATS_INFO_PDEV_ID: u32 = genmask(11, 10);
+const HTT_T2H_PPDU_STATS_INFO_PAYLOAD_SIZE: u32 = genmask(31, 16);
+const HTT_TLV_TAG: u32 = genmask(11, 0);
+const HTT_TLV_LEN: u32 = genmask(23, 12);
+
+const HTT_PPDU_STATS_TAG_COMMON: u16 = 0;
+const HTT_PPDU_STATS_TAG_USR_RATE: u16 = 2;
+const HTT_PPDU_STATS_TAG_USR_COMPLTN_COMMON: u16 = 6;
+const HTT_PPDU_STATS_TAG_USR_COMPLTN_ACK_BA_STATUS: u16 = 9;
+
+const HTT_PPDU_STATS_MAX_USERS: usize = 7;
+const HTT_PPDU_STATS_USER_RATE_LEN: usize = 28;
+const HTT_PPDU_STATS_USR_CMPLTN_COMMON_LEN: usize = 16;
+const HTT_PPDU_STATS_USR_CMPLTN_ACK_BA_STATUS_LEN: usize = 20;
+const HTT_PPDU_STATS_COMMON_LEN: usize = 36;
+
+const HTT_PPDU_STATS_USER_RATE_FLAGS_BW: u32 = genmask(11, 8);
+const HTT_PPDU_STATS_USER_RATE_FLAGS_NSS: u32 = genmask(15, 12);
+const HTT_PPDU_STATS_USER_RATE_FLAGS_MCS: u32 = genmask(19, 16);
+const HTT_PPDU_STATS_USER_RATE_FLAGS_PREAMBLE: u32 = genmask(23, 20);
+const HTT_PPDU_STATS_USER_RATE_FLAGS_GI: u32 = genmask(27, 24);
+const HTT_PPDU_STATS_USER_RATE_FLAGS_DCM: u32 = 1 << 28;
+const HTT_PPDU_STATS_USR_CMPLTN_CMN_FLAGS_LONG_RETRY: u32 = genmask(3, 0);
+const HTT_PPDU_STATS_USR_CMPLTN_CMN_FLAGS_SHORT_RETRY: u32 = genmask(7, 4);
+const HTT_PPDU_STATS_USR_CMPLTN_CMN_FLAGS_IS_AMPDU: u32 = 1 << 8;
+const HTT_PPDU_STATS_ACK_BA_INFO_NUM_MSDU: u32 = genmask(24, 9);
+const HTT_PPDU_STATS_ACK_BA_INFO_TID: u32 = genmask(31, 25);
 
 /// `enum htt_ppdu_stats_tag_type` bits of `HTT_PPDU_STATS_TAG_DEFAULT`.
 pub const HTT_PPDU_STATS_TAG_DEFAULT: u32 = (1 << 0) // COMMON
@@ -483,8 +522,69 @@ pub fn ppdu_stats_cfg_msgs(pdev_idx: u32, num_rxdma_per_pdev: u32, mask: u32) ->
 
 // ── T2H ───────────────────────────────────────────────────────────
 
-/// A decoded target → host message.
+/// One decoded `HTT_PPDU_STATS_TAG_USR_RATE`.  The fields deliberately keep
+/// their firmware encodings; the runtime converts them to `RateInfo` with
+/// the same legacy/HT/VHT/HE rules as `ath11k_update_per_peer_tx_stats`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HttPpduRate {
+    pub preamble: u8,
+    /// `enum HTT_PPDU_STATS_BW` (5/10/20/40/80/160/DYN).
+    pub bandwidth: u8,
+    /// On-air NSS, not the firmware's zero-based field.
+    pub nss: u8,
+    pub mcs: u8,
+    /// `enum htt_ppdu_stats_gi`.
+    pub gi: u8,
+    pub dcm: bool,
+    pub ru_start: u16,
+    pub ru_end: u16,
+}
+
+/// Completion information shared by the per-peer PPDU accounting and the
+/// debug/statistics path.  `ack_rssi` is left in firmware dB-above-noise
+/// units, exactly as the HTT ABI supplies it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HttPpduCompletion {
+    pub ack_rssi: u32,
+    pub mpdu_tried: u16,
+    pub mpdu_success: u16,
+    pub long_retries: u8,
+    pub short_retries: u8,
+    pub ampdu: bool,
+}
+
+/// `HTT_PPDU_STATS_TAG_USR_COMPLTN_ACK_BA_STATUS`'s station-accounting
+/// subset.  The completion status has no meaningful bytes for management
+/// frames (TID 16), as in Linux.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HttPpduAckBa {
+    pub successful_msdu: u16,
+    pub tid: u8,
+    pub success_bytes: u32,
+}
+
+/// Accumulated TLVs for one firmware peer in one PPDU.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HttPpduUserStats {
+    pub peer_id: u16,
+    pub rate: Option<HttPpduRate>,
+    pub completion: Option<HttPpduCompletion>,
+    pub ack_ba: Option<HttPpduAckBa>,
+}
+
+/// One (possibly fragmentary) `HTT_T2H_MSG_TYPE_PPDU_STATS_IND`.  The DP
+/// layer merges matching PPDU ids and retains the same 16-entry window Linux
+/// uses before applying these values to a peer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HttPpduStats {
+    pub pdev_id: u8,
+    pub ppdu_id: u32,
+    pub tx_duration_us: Option<u32>,
+    pub users: Vec<HttPpduUserStats>,
+}
+
+/// A decoded target → host message.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HttT2h {
     VersionConf {
         major: u8,
@@ -504,8 +604,11 @@ pub enum HttT2h {
         v2: bool,
         peer_id: u16,
     },
-    /// PPDU_STATS_IND / EXT_STATS_CONF / PKTLOG / BKPRESSURE_EVENT_IND:
-    /// statistics only, skipped.
+    /// A validated PPDU statistics fragment.  The data-path layer merges
+    /// fragments with this PPDU id before exposing its users.
+    PpduStats(HttPpduStats),
+    /// EXT_STATS_CONF / PKTLOG / BKPRESSURE_EVENT_IND: debug / packet-log
+    /// information not part of normal WCN6855 operation.
     Skipped(u8),
     /// Any other type (Linux: "htt event %d not handled").
     Unhandled(u8),
@@ -513,6 +616,148 @@ pub enum HttT2h {
 
 fn rd_word(b: &[u8], i: usize) -> u32 {
     u32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]])
+}
+
+fn rd_u16(b: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes([b[off], b[off + 1]])
+}
+
+fn rd_u32(b: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+}
+
+fn ppdu_user_mut(
+    stats: &mut HttPpduStats,
+    peer_id: u16,
+) -> Result<&mut HttPpduUserStats, TransportError> {
+    if let Some(index) = stats.users.iter().position(|user| user.peer_id == peer_id) {
+        return Ok(&mut stats.users[index]);
+    }
+    if stats.users.len() == HTT_PPDU_STATS_MAX_USERS {
+        return Err(TransportError::new(
+            step::PPDU_USERS,
+            stats.ppdu_id & 0xffff,
+            errno::EINVAL,
+        ));
+    }
+    stats.users.push(HttPpduUserStats {
+        peer_id,
+        ..HttPpduUserStats::default()
+    });
+    Ok(stats.users.last_mut().expect("just pushed a PPDU user"))
+}
+
+/// Decode the four PPDU TLVs Linux keeps for `GET_STATION` and per-peer TX
+/// accounting.  Unknown default-mask TLVs are structurally validated and
+/// intentionally ignored; they are debug/pktlog-only data in Linux too.
+fn decode_ppdu_stats(msg: &[u8], info: u32) -> Result<HttPpduStats, TransportError> {
+    let payload_len = field_get(HTT_T2H_PPDU_STATS_INFO_PAYLOAD_SIZE, info) as usize;
+    if msg.len() < HTT_PPDU_STATS_MSG_HDR_LEN
+        || payload_len > msg.len().saturating_sub(HTT_PPDU_STATS_MSG_HDR_LEN)
+    {
+        return Err(TransportError::new(
+            step::PPDU_TLV,
+            ((msg.len() as u32 & 0xffff) << 16) | ((payload_len as u32) & 0xffff),
+            errno::EINVAL,
+        ));
+    }
+    let mut stats = HttPpduStats {
+        pdev_id: field_get(HTT_T2H_PPDU_STATS_INFO_PDEV_ID, info) as u8,
+        ppdu_id: rd_word(msg, 1),
+        ..HttPpduStats::default()
+    };
+    let payload = &msg[HTT_PPDU_STATS_MSG_HDR_LEN..HTT_PPDU_STATS_MSG_HDR_LEN + payload_len];
+    let mut off = 0usize;
+    while off < payload.len() {
+        if payload.len() - off < 4 {
+            return Err(TransportError::new(
+                step::PPDU_TLV,
+                (off as u32) << 16,
+                errno::EINVAL,
+            ));
+        }
+        let header = rd_u32(payload, off);
+        let tag = field_get(HTT_TLV_TAG, header) as u16;
+        let len = field_get(HTT_TLV_LEN, header) as usize;
+        let value_off = off + 4;
+        let Some(end) = value_off.checked_add(len) else {
+            return Err(TransportError::new(
+                step::PPDU_TLV,
+                (off as u32) << 16 | tag as u32,
+                errno::EINVAL,
+            ));
+        };
+        if end > payload.len() {
+            return Err(TransportError::new(
+                step::PPDU_TLV,
+                (off as u32) << 16 | tag as u32,
+                errno::EINVAL,
+            ));
+        }
+        let value = &payload[value_off..end];
+        let expect = |minimum: usize| {
+            (value.len() >= minimum)
+                .then_some(())
+                .ok_or(TransportError::new(
+                    step::PPDU_TLV,
+                    (off as u32) << 16 | tag as u32,
+                    errno::EINVAL,
+                ))
+        };
+        match tag {
+            HTT_PPDU_STATS_TAG_COMMON => {
+                expect(HTT_PPDU_STATS_COMMON_LEN)?;
+                // `fes_duration_us` is the PPDU's aggregate on-air TX time.
+                stats.tx_duration_us = Some(rd_u32(value, 16));
+            }
+            HTT_PPDU_STATS_TAG_USR_RATE => {
+                expect(HTT_PPDU_STATS_USER_RATE_LEN)?;
+                let peer_id = rd_u16(value, 2);
+                let flags = rd_u32(value, 20);
+                let user = ppdu_user_mut(&mut stats, peer_id)?;
+                user.rate = Some(HttPpduRate {
+                    preamble: field_get(HTT_PPDU_STATS_USER_RATE_FLAGS_PREAMBLE, flags) as u8,
+                    bandwidth: field_get(HTT_PPDU_STATS_USER_RATE_FLAGS_BW, flags) as u8,
+                    nss: field_get(HTT_PPDU_STATS_USER_RATE_FLAGS_NSS, flags) as u8 + 1,
+                    mcs: field_get(HTT_PPDU_STATS_USER_RATE_FLAGS_MCS, flags) as u8,
+                    gi: field_get(HTT_PPDU_STATS_USER_RATE_FLAGS_GI, flags) as u8,
+                    dcm: flags & HTT_PPDU_STATS_USER_RATE_FLAGS_DCM != 0,
+                    ru_end: rd_u16(value, 8),
+                    ru_start: rd_u16(value, 10),
+                });
+            }
+            HTT_PPDU_STATS_TAG_USR_COMPLTN_COMMON => {
+                expect(HTT_PPDU_STATS_USR_CMPLTN_COMMON_LEN)?;
+                let peer_id = rd_u16(value, 2);
+                let flags = rd_u32(value, 12);
+                let user = ppdu_user_mut(&mut stats, peer_id)?;
+                user.completion = Some(HttPpduCompletion {
+                    ack_rssi: rd_u32(value, 4),
+                    mpdu_tried: rd_u16(value, 8),
+                    mpdu_success: rd_u16(value, 10),
+                    long_retries: field_get(HTT_PPDU_STATS_USR_CMPLTN_CMN_FLAGS_LONG_RETRY, flags)
+                        as u8,
+                    short_retries: field_get(HTT_PPDU_STATS_USR_CMPLTN_CMN_FLAGS_SHORT_RETRY, flags)
+                        as u8,
+                    ampdu: flags & HTT_PPDU_STATS_USR_CMPLTN_CMN_FLAGS_IS_AMPDU != 0,
+                });
+            }
+            HTT_PPDU_STATS_TAG_USR_COMPLTN_ACK_BA_STATUS => {
+                expect(HTT_PPDU_STATS_USR_CMPLTN_ACK_BA_STATUS_LEN)?;
+                let peer_id = rd_u16(value, 4);
+                let info = rd_u32(value, 8);
+                let user = ppdu_user_mut(&mut stats, peer_id)?;
+                user.ack_ba = Some(HttPpduAckBa {
+                    successful_msdu: field_get(HTT_PPDU_STATS_ACK_BA_INFO_NUM_MSDU, info) as u16,
+                    tid: field_get(HTT_PPDU_STATS_ACK_BA_INFO_TID, info) as u8,
+                    success_bytes: rd_u32(value, 16),
+                });
+            }
+            _ => {}
+        }
+        off = end;
+    }
+    Ok(stats)
 }
 
 /// `ath11k_dp_get_mac_addr` (little-endian host).
@@ -582,9 +827,11 @@ pub fn decode_t2h(msg: &[u8]) -> Result<HttT2h, TransportError> {
             v2: ty == t2h::PEER_UNMAP2,
             peer_id: field_get(HTT_T2H_PEER_UNMAP_INFO_PEER_ID, w0) as u16,
         },
-        t2h::PPDU_STATS_IND | t2h::EXT_STATS_CONF | t2h::PKTLOG | t2h::BKPRESSURE_EVENT_IND => {
-            HttT2h::Skipped(ty)
+        t2h::PPDU_STATS_IND => {
+            need(4)?;
+            HttT2h::PpduStats(decode_ppdu_stats(msg, w0)?)
         }
+        t2h::EXT_STATS_CONF | t2h::PKTLOG | t2h::BKPRESSURE_EVENT_IND => HttT2h::Skipped(ty),
         other => HttT2h::Unhandled(other),
     })
 }

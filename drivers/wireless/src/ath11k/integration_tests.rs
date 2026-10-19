@@ -46,7 +46,9 @@ use super::ce_tests::{phys_rd32, phys_read, phys_wr32, phys_write, FakeChip};
 use super::core::{Ath11kCore, CeHif, CoreHooks, CoreState, FwNotice, QmiFw};
 use super::core_tests::{self, Fw, Script, CTRL_DL, FW_MAC, HTT_EID, WMI_DL, WMI_EID};
 use super::dp_ring::{self, buf_addr_get, DpHwParams, DpRingSizes};
-use super::dp_tests::{good_rxd, reo_dest, rx_desc_bytes, wbm_htt, wbm_tqm, FIRST, LAST, SMALL};
+use super::dp_tests::{
+    good_rxd, reo_dest, rx_desc_bytes, wbm_htt, wbm_tqm_rate, FIRST, LAST, SMALL,
+};
 use super::hal::TransportError;
 use super::hal_tests::wcn6855;
 use super::htc::{self, HtcHdr};
@@ -366,6 +368,7 @@ enum TxRel {
     Tqm {
         reason: u32,
         peer: u32,
+        tries: u32,
     },
     Htt {
         status: u32,
@@ -379,6 +382,7 @@ impl Default for TxRel {
         TxRel::Tqm {
             reason: 0,
             peer: AP_PEER_ID as u32,
+            tries: 1,
         }
     }
 }
@@ -402,8 +406,12 @@ struct DevState {
     mute_dp_irq: bool,
     /// `rx_attention.info1` of every RX descriptor (checksum-fail bits).
     rx_attn1: u32,
+    /// `rx_msdu_start.info3` of every modelled AP MSDU.
+    rx_rate_info: u32,
     /// How the device releases transmitted MSDUs on WBM2SW0.
     tx_rel: TxRel,
+    /// WBM `hal_tx_rate_stats.info0` written for each TQM completion.
+    tx_rate_stats: u32,
     peers: Vec<(u32, [u8; 6], u16)>,
     /// Power cycles since the rig was built.
     boots: u32,
@@ -441,7 +449,9 @@ impl Dev {
                 dp_pending: 0,
                 mute_dp_irq: false,
                 rx_attn1: 0,
+                rx_rate_info: 2 << 8 | 1 << 24,
                 tx_rel: TxRel::default(),
+                tx_rate_stats: 0x1234_5671,
                 peers: Vec::new(),
                 boots: 0,
             }),
@@ -572,7 +582,11 @@ impl Dev {
                 }
             }
             let rel = match st.tx_rel {
-                TxRel::Tqm { reason, peer } => wbm_tqm(desc_id, reason, 1, 1, 40, peer, 0),
+                TxRel::Tqm {
+                    reason,
+                    peer,
+                    tries,
+                } => wbm_tqm_rate(desc_id, reason, 1, tries, 40, peer, 0, st.tx_rate_stats),
                 TxRel::Htt { status, rssi, peer } => wbm_htt(desc_id, status, rssi, peer),
             };
             if wbm.produce(c, &rel) {
@@ -635,6 +649,7 @@ impl Dev {
             msdu.extend_from_slice(&eth[12..]);
             let mut d = good_rxd(msdu.len(), 1);
             d.attn1 = st.rx_attn1;
+            d.rate_info = st.rx_rate_info;
             let mut buf = rx_desc_bytes(&d);
             buf.extend_from_slice(&msdu);
             phys_write(pa, &buf);
@@ -961,8 +976,8 @@ fn up_down_caps(
     let reg = rt.core.reg_info.clone();
     let shared = Shared::new(rt, test_rng);
     let mac = Mac::new(
-        Port(shared.clone()),
-        Port(shared.clone()),
+        Port(shared.clone(), 0),
+        Port(shared.clone(), 0),
         caps.clone(),
         MacConfig::wcn6855(),
         reg.as_deref(),
@@ -1011,6 +1026,7 @@ fn wpa2_req() -> AssociateRequest {
     AssociateRequest {
         bssid: BSSID,
         ssid: SSID.to_vec(),
+        frequency_mhz: 2437,
         channel: 6,
         security: SecurityConfig::Wpa2 { psk: PMK },
         ie: Vec::new(),
@@ -1020,8 +1036,14 @@ fn wpa2_req() -> AssociateRequest {
 fn scan6(u: &Up) -> Result<Vec<narf_wireless::BssInfo>, &'static str> {
     run(u.netdev.scan(ScanRequest {
         ssids: Vec::new(),
+        frequencies_mhz: Vec::new(),
         channels: vec![6],
         active: false,
+        random_mac: None,
+        colocated_6ghz: false,
+        duration_tu: None,
+        duration_mandatory: false,
+        extra_ies: Vec::new(),
     }))
     .map_err(|_| "scan")
 }
@@ -1192,7 +1214,7 @@ fn smoke_ath11k_int_bring_up_to_netdev() -> TestResult {
              (ath11k_mac_copy_he_cap sets has_he unconditionally)"
         );
         let g = run(u.shared.lock());
-        ensure!(g.link.vif.is_some(), "DP vdev TX attach");
+        ensure!(g.vdev(0).unwrap().link.vif.is_some(), "DP vdev TX attach");
         ensure!(
             g.mon_reap_at.is_some(),
             "monitor reap timer armed by mac start"
@@ -1278,7 +1300,9 @@ fn smoke_ath11k_int_wpa2_connect() -> TestResult {
         drop(st);
         let g = run(u.shared.lock());
         ensure!(
-            g.link.authorized && g.link.ptk && g.link.wme,
+            g.vdev(0).unwrap().link.authorized
+                && g.vdev(0).unwrap().link.ptk
+                && g.vdev(0).unwrap().link.wme,
             "port open, PTK, WMM"
         );
         let p =
@@ -1501,7 +1525,10 @@ fn smoke_ath11k_int_unauthorized_and_disconnect() -> TestResult {
         drop(st);
         let g = run(u.shared.lock());
         ensure!(
-            g.dp.peers.is_empty() && g.link.bss.is_none() && !g.link.authorized && !g.link.ptk,
+            g.dp.peers.is_empty()
+                && g.vdev(0).unwrap().link.bss.is_none()
+                && !g.vdev(0).unwrap().link.authorized
+                && !g.vdev(0).unwrap().link.ptk,
             "HTT unmap cleared the data-path peer state"
         );
         drop(g);
@@ -1551,7 +1578,7 @@ fn smoke_ath11k_int_eapol_filter() -> TestResult {
                 "group EAPOL dropped, foreign unicast not ours"
             );
             ensure!(
-                g.link.eapol_rx.is_empty() && g.stats.rx_eapol == 0,
+                g.vdev(0).unwrap().link.eapol_rx.is_empty() && g.stats.rx_eapol == 0,
                 "nothing queued for the supplicant"
             );
         }
@@ -1559,11 +1586,11 @@ fn smoke_ath11k_int_eapol_filter() -> TestResult {
         feed(&OWN);
         let g = run(u.shared.lock());
         ensure!(
-            g.stats.rx_eapol == 2 && g.link.eapol_rx.len() == 2,
+            g.stats.rx_eapol == 2 && g.vdev(0).unwrap().link.eapol_rx.len() == 2,
             "PAE group and unicast EAPOL queued"
         );
         ensure!(
-            g.link.eapol_rx[0].0[..6] == super::runtime::PAE_GROUP_ADDR,
+            g.vdev(0).unwrap().link.eapol_rx[0].0[..6] == super::runtime::PAE_GROUP_ADDR,
             "PAE group frame delivered as received"
         );
         ensure!(RX_SEEN.lock().is_empty(), "EAPOL never reaches the stack");
@@ -2335,6 +2362,7 @@ fn sta(wme: bool, authorized: bool, protected: bool) -> StaTx {
         own: OWN,
         bssid: BSSID,
         wme,
+        four_addr: false,
         authorized,
         protected,
     }
@@ -2382,6 +2410,34 @@ fn smoke_ath11k_int_tx_hdr_golden() -> TestResult {
         ensure!(
             seq.tid[6] == 0x10 && seq.global == 0,
             "TID 6 counter advanced"
+        );
+
+        // ieee80211_nullfunc_get: connection monitoring uses QoS Null
+        // only when the associated AP negotiated WMM. It is protected
+        // after the pairwise key is installed, uses TID 7 / AC VO and
+        // deliberately has sequence control zero.
+        let qn = tx_hdr::build_sta_nullfunc(&sta(true, true, true));
+        ensure!(
+            qn.frame[0..2] == [0xc8, 0x41]
+                && qn.frame[4..10] == BSSID
+                && qn.frame[10..16] == OWN
+                && qn.frame[16..22] == BSSID
+                && qn.frame[22..26] == [0, 0, 7, 0]
+                && qn.tid == 7
+                && qn.ac == tx_hdr::ac::VO,
+            "protected QoS Null probe"
+        );
+        let n = tx_hdr::build_sta_nullfunc(&sta(false, true, true));
+        ensure!(
+            n.frame.as_slice()
+                == [
+                    0x48, 0x41, 0, 0, BSSID[0], BSSID[1], BSSID[2], BSSID[3], BSSID[4], BSSID[5],
+                    OWN[0], OWN[1], OWN[2], OWN[3], OWN[4], OWN[5], BSSID[0], BSSID[1], BSSID[2],
+                    BSSID[3], BSSID[4], BSSID[5], 0, 0,
+                ]
+                && n.tid == 0
+                && n.ac == tx_hdr::ac::BE,
+            "protected non-QoS Null probe"
         );
 
         // cfg80211_classify8021d (RFC 8325 §2.3 / §4).
@@ -2559,7 +2615,7 @@ fn smoke_ath11k_int_mgmt_seq_shared() -> TestResult {
         );
         drop(st);
         ensure!(
-            run(u.shared.lock()).link.seq.global == 0x30,
+            run(u.shared.lock()).vdev(0).unwrap().link.seq.global == 0x30,
             "vif counter survives the AP's sta_info"
         );
         Ok(())
@@ -2664,6 +2720,7 @@ fn smoke_ath11k_int_autoconnect_attempt() -> TestResult {
         let mk = |b: u8, rssi: i8, security| narf_wireless::BssInfo {
             bssid: [2, 0, 0, 0, 0, b],
             ssid: SSID.to_vec(),
+            frequency_mhz: 2437,
             channel: 6,
             rssi,
             security,
@@ -2952,18 +3009,19 @@ fn smoke_ath11k_int_tx_csum_offload() -> TestResult {
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_tx_csum_offload);
 
-// ── per-AC TX queues ──────────────────────────────────────────────
+// ── mac80211 TXQs / fq_codel ─────────────────────────────────────
 
 /// mac80211's TXQ rules on the pure queues: `vif->hw_queue[ac] = ac % 3`
-/// (`ath11k_mac_op_add_interface`), VO → BK service order, per-queue
-/// stop reasons (a queue runs only with none left), `fq` overlimit
-/// drops from the fattest queue's head, purge.
+/// (`ath11k_mac_op_add_interface`), VO → BK service order, TID round robin
+/// within one AC, per-queue stop reasons, `fq` fattest-flow overlimit drops,
+/// ECN-enabled CoDel, and purge.
 fn smoke_ath11k_txq_queues() -> TestResult {
     use super::tx_hdr::ac;
     use super::txq::{hw_queue, reason, Queued, TxQueues};
     let q = |b: u8| Queued {
         eth: vec![b; 6],
         csum_partial: false,
+        no_encrypt: false,
         ack_id: None,
     };
     check(|| {
@@ -2978,16 +3036,16 @@ fn smoke_ath11k_txq_queues() -> TestResult {
         );
         ensure!(TxQueues::vif_queues() == 0b111, "vif queues 0..2");
         let mut t = TxQueues::default();
-        for (a, b) in [
-            (ac::BK, 1),
-            (ac::BE, 2),
-            (ac::VI, 3),
-            (ac::VO, 4),
-            (ac::BE, 5),
+        for (tid, b) in [
+            (1, 1), // BK
+            (0, 2), // BE
+            (4, 3), // VI
+            (6, 4), // VO
+            (0, 5), // BE
         ] {
-            ensure!(t.enqueue(a, q(b)).is_empty(), "under the fq limits");
+            ensure!(t.enqueue(tid, 0, q(b)).is_empty(), "under the fq limits");
         }
-        let order: Vec<u8> = core::iter::from_fn(|| t.dequeue())
+        let order: Vec<u8> = core::iter::from_fn(|| t.dequeue(0))
             .map(|(_, f)| f.eth[0])
             .collect();
         ensure!(
@@ -2996,9 +3054,9 @@ fn smoke_ath11k_txq_queues() -> TestResult {
         );
 
         // Hardware queue 0 (VO + BK) stopped by two reasons.
-        t.enqueue(ac::VO, q(1));
-        t.enqueue(ac::BK, q(2));
-        t.enqueue(ac::BE, q(3));
+        t.enqueue(6, 0, q(1));
+        t.enqueue(1, 0, q(2));
+        t.enqueue(0, 0, q(3));
         t.stop(1 << 0, reason::DRIVER);
         t.stop(1 << 0, reason::FLUSH);
         ensure!(
@@ -3006,31 +3064,44 @@ fn smoke_ath11k_txq_queues() -> TestResult {
             "two stop reasons on queue 0"
         );
         ensure!(
-            t.dequeue().map(|(a, f)| (a, f.eth[0])) == Some((ac::BE, 3)) && t.dequeue().is_none(),
+            t.dequeue(0).map(|(a, f)| (a, f.eth[0])) == Some((ac::BE, 3)) && t.dequeue(0).is_none(),
             "VO / BK held, BE flows"
         );
         t.wake(1 << 0, reason::FLUSH);
-        ensure!(t.dequeue().is_none(), "one reason left: still stopped");
+        ensure!(t.dequeue(0).is_none(), "one reason left: still stopped");
         t.wake(1 << 0, reason::DRIVER);
         ensure!(
-            t.dequeue().map(|(a, _)| a) == Some(ac::VO)
-                && t.dequeue().map(|(a, _)| a) == Some(ac::BK),
+            t.dequeue(0).map(|(a, _)| a) == Some(ac::VO)
+                && t.dequeue(0).map(|(a, _)| a) == Some(ac::BK),
             "woken: VO then BK"
         );
 
+        // ieee80211_next_txq: active TXQs of the same AC round-robin by
+        // TID, rather than allowing one voice TID to starve the other.
+        let mut t = TxQueues::default();
+        t.enqueue(6, 0, q(6));
+        t.enqueue(7, 0, q(7));
+        t.enqueue(6, 0, q(8));
+        let tids: Vec<u8> = core::iter::from_fn(|| t.dequeue(0))
+            .map(|(_, f)| f.eth[0])
+            .collect();
+        ensure!(tids == [6, 7, 8], "same-AC TID round robin");
+
         // fq_tin_enqueue overlimit (packets, then bytes).
         let mut t = TxQueues::with_limits(3, 1 << 20);
-        t.enqueue(ac::BE, q(1));
-        t.enqueue(ac::BE, q(2));
-        t.enqueue(ac::VO, q(3));
-        let d = t.enqueue(ac::VI, q(4));
+        t.enqueue(0, 0, q(1));
+        t.enqueue(0, 0, q(2));
+        t.enqueue(6, 0, q(3));
+        let d = t.enqueue(4, 0, q(4));
         ensure!(
-            d.len() == 1 && d[0].eth[0] == 1 && t.backlog() == 3 && t.stats.overlimit == 1,
-            "over fq->limit: the fattest queue's head dropped"
+            d.len() == 1 && t.backlog() == 3 && t.stats.overlimit == 1,
+            "over fq->limit: a fattest flow head dropped"
         );
-        let mut t = TxQueues::with_limits(100, 10);
-        t.enqueue(ac::BK, q(1));
-        let d = t.enqueue(ac::VO, q(2));
+        let mut t = TxQueues::with_limits(100, 180);
+        let mut large = q(1);
+        large.eth = vec![1; 100];
+        t.enqueue(1, 0, large);
+        let d = t.enqueue(6, 0, q(2));
         ensure!(
             d.len() == 1 && t.backlog() == 1 && t.len(ac::VO) == 1,
             "over memory_limit: dropped until it fits"
@@ -3038,6 +3109,40 @@ fn smoke_ath11k_txq_queues() -> TestResult {
         ensure!(
             t.purge() == 1 && t.is_empty() && t.stats.purged == 1,
             "purge"
+        );
+
+        // codel_dequeue: an over-target, ECN-capable IPv4 flow is marked CE
+        // after its 100 ms interval instead of being dropped.
+        let ect = |tag: u8| {
+            let mut eth = vec![0; 14 + 20 + 8 + 1_600];
+            eth[0..6].copy_from_slice(&[0, 1, 2, 3, 4, 5]);
+            eth[6..12].copy_from_slice(&[6, 7, 8, 9, 10, 11]);
+            eth[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+            eth[14] = 0x45;
+            eth[15] = 0x01; // ECT(1)
+            eth[23] = 17; // UDP
+            eth[26..30].copy_from_slice(&[192, 0, 2, 1]);
+            eth[30..34].copy_from_slice(&[198, 51, 100, 1]);
+            eth[34..38].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+            eth[42] = tag; // payload: same five-tuple / flow
+            Queued {
+                eth,
+                csum_partial: false,
+                no_encrypt: false,
+                ack_id: None,
+            }
+        };
+        let mut t = TxQueues::default();
+        t.enqueue(0, 0, ect(1));
+        t.enqueue(0, 0, ect(2));
+        let first = t.dequeue(21).ok_or("first CoDel frame")?.1;
+        let second = t.dequeue(122).ok_or("second CoDel frame")?.1;
+        ensure!(
+            first.eth[15] & 3 == 1
+                && second.eth[15] & 3 == 3
+                && t.stats.codel_ecn_marked == 1
+                && t.stats.codel_dropped == 0,
+            "CoDel marks ECT traffic rather than dropping it"
         );
         Ok(())
     })
@@ -3081,7 +3186,7 @@ fn smoke_ath11k_int_tx_ac_priority() -> TestResult {
         pump(&u, 2);
         ensure!(tcl(&u) == base, "stopped: nothing reaches TCL");
         ensure!(
-            run(u.shared.lock()).txq.backlog() == 4,
+            run(u.shared.lock()).vdev(0).unwrap().txq.backlog() == 4,
             "four frames queued"
         );
         let sent = run(u.shared.lock()).wake_queues(TxQueues::vif_queues(), reason::DRIVER);
@@ -3120,14 +3225,14 @@ fn smoke_ath11k_int_tx_ac_priority() -> TestResult {
         let after = tcl(&u);
         let g = run(u.shared.lock());
         ensure!(
-            after == base && g.txq.is_empty() && g.stats.tx_queue_dropped == 2,
+            after == base && g.vdev(0).unwrap().txq.is_empty() && g.stats.tx_queue_dropped == 2,
             "flush(drop): both purged, nothing sent"
         );
         drop(g);
         // Non-dropping flush with nothing pending returns at once.
         run(u.shared.flush_queues(false));
         ensure!(
-            run(u.shared.lock()).txq.stop_reasons(0) == 0,
+            run(u.shared.lock()).vdev(0).unwrap().txq.stop_reasons(0) == 0,
             "flush leaves the queues running"
         );
 
@@ -3166,8 +3271,14 @@ fn smoke_ath11k_int_open_stop() -> TestResult {
         ensure!(
             run(u.netdev.scan(ScanRequest {
                 ssids: Vec::new(),
+                frequencies_mhz: Vec::new(),
                 channels: vec![6],
                 active: false,
+                random_mac: None,
+                colocated_6ghz: false,
+                duration_tu: None,
+                duration_mandatory: false,
+                extra_ies: Vec::new(),
             }))
             .err()
                 == Some(narf_wireless::WirelessError::HardwareError),
@@ -3195,7 +3306,7 @@ fn smoke_ath11k_int_open_stop() -> TestResult {
             "op_start then add_interface"
         );
         ensure!(
-            run(u.shared.lock()).link.vif.is_some(),
+            run(u.shared.lock()).vdev(0).unwrap().link.vif.is_some(),
             "ath11k_dp_vdev_tx_attach"
         );
         let n1 = wmi_len(&u);
@@ -3240,7 +3351,9 @@ fn smoke_ath11k_int_open_stop() -> TestResult {
         );
         let g = run(u.shared.lock());
         ensure!(
-            g.link.vif.is_none() && g.mgmt.pending == 0 && g.txq.is_empty(),
+            g.vdev(0).unwrap().link.vif.is_none()
+                && g.mgmt.pending == 0
+                && g.vdev(0).unwrap().txq.is_empty(),
             "DP vif state, mgmt IDR and TXQs cleared"
         );
         drop(g);
@@ -3356,12 +3469,14 @@ fn smoke_ath11k_int_tx_status() -> TestResult {
             ack_signal: None,
         };
         let peer = AP_PEER_ID as u32;
+        let before_status = run(u.shared.lock()).stats;
         let cases: [(&str, TxRel, Result<TxStatus, i32>); 8] = [
             (
                 "TQM acked",
                 TxRel::Tqm {
                     reason: tqm::FRAME_ACKED,
                     peer,
+                    tries: 3,
                 },
                 Ok(ack(-55)),
             ),
@@ -3370,6 +3485,7 @@ fn smoke_ath11k_int_tx_status() -> TestResult {
                 TxRel::Tqm {
                     reason: tqm::CMD_REMOVE_TX,
                     peer,
+                    tries: 2,
                 },
                 Ok(noack),
             ),
@@ -3414,6 +3530,7 @@ fn smoke_ath11k_int_tx_status() -> TestResult {
                 TxRel::Tqm {
                     reason: tqm::FRAME_ACKED,
                     peer: 99,
+                    tries: 4,
                 },
                 Ok(TxStatus::DROPPED),
             ),
@@ -3437,15 +3554,24 @@ fn smoke_ath11k_int_tx_status() -> TestResult {
         {
             let g = run(u.shared.lock());
             ensure!(
-                g.ack_frames.is_empty() && g.ack_status.is_empty(),
+                g.vdev(0).unwrap().ack_frames.is_empty()
+                    && g.vdev(0).unwrap().ack_status.is_empty(),
                 "every ack id resolved or freed"
             );
             ensure!(
-                g.link.last_ack_signal == Some(-65) && g.link.last_ack_ms.is_some(),
+                g.vdev(0).unwrap().link.last_ack_signal == Some(-65)
+                    && g.vdev(0).unwrap().link.last_ack_ms.is_some(),
                 "last_ack_signal from the last ACK"
             );
+            ensure!(
+                g.stats.tx_status_acked == before_status.tx_status_acked + 2
+                    && g.stats.tx_status_noack == before_status.tx_status_noack + 3
+                    && g.stats.tx_status_dropped == before_status.tx_status_dropped + 2
+                    && g.stats.tx_retries == before_status.tx_retries + 3,
+                "station completions count ACKs, failures and valid-peer retries"
+            );
         }
-        let before = run(u.shared.lock()).stats;
+        let before_plain = run(u.shared.lock()).stats;
         ensure!(narf_net::iface::send_on(u.name, &eth).is_ok(), "plain send");
         let mut u = u;
         let f = u.tx_cons.try_recv().ok().flatten().ok_or("TX ring")?;
@@ -3453,7 +3579,8 @@ fn smoke_ath11k_int_tx_status() -> TestResult {
         pump(&u, 3);
         let g = run(u.shared.lock());
         ensure!(
-            g.stats.tx_status_acked == before.tx_status_acked + 1 && g.ack_status.is_empty(),
+            g.stats.tx_status_acked == before_plain.tx_status_acked + 1
+                && g.vdev(0).unwrap().ack_status.is_empty(),
             "a plain frame's status only counts"
         );
         drop(g);
@@ -3467,11 +3594,12 @@ fn smoke_ath11k_int_tx_status() -> TestResult {
             g.wake_queues(TxQueues::vif_queues(), reason::DRIVER);
             id
         };
+        let purged_status = {
+            let mut g = run(u.shared.lock());
+            g.vdev_mut(0).unwrap().ack_status.pop_front()
+        };
         ensure!(
-            run(u.shared.lock())
-                .ack_status
-                .pop_front()
-                .is_some_and(|(i, s)| i == id && s == TxStatus::DROPPED),
+            purged_status.is_some_and(|(i, s)| i == id && s == TxStatus::DROPPED),
             "purged: dropped"
         );
         // Interface down with a frame waiting → dropped.
@@ -3484,20 +3612,207 @@ fn smoke_ath11k_int_tx_status() -> TestResult {
         pump(&u, 1);
         let mut g = run(u.shared.lock());
         ensure!(
-            g.ack_status
+            g.vdev_mut(0)
+                .unwrap()
+                .ack_status
                 .pop_front()
                 .is_some_and(|(i, s)| i == id && s == TxStatus::DROPPED)
-                && g.ack_frames.is_empty(),
+                && g.vdev(0).unwrap().ack_frames.is_empty(),
             "interface down: dropped"
         );
         ensure!(
-            g.tx_enqueue_status(eth.clone()) == Err(runtime::ENOTCONN) && g.ack_frames.is_empty(),
+            g.tx_enqueue_status(eth.clone()) == Err(runtime::ENOTCONN)
+                && g.vdev(0).unwrap().ack_frames.is_empty(),
             "no station: refused, ack id freed"
         );
         Ok(())
     })
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_tx_status);
+
+/// The runtime's connection-monitor probe uses the same requested-status
+/// map as control-port frames. The composed device observes exactly the
+/// frame ath11k hands to firmware after native-wifi QoS decapsulation.
+fn smoke_ath11k_int_nullfunc_probe() -> TestResult {
+    use super::txq::TxStatus;
+    check(|| {
+        let u = up(wpa2_cfg())?;
+        connect(&u)?;
+        let before = run(u.shared.lock()).stats;
+        ensure!(
+            run(u.shared.probe_ap(200))
+                == Ok(TxStatus {
+                    acked: true,
+                    dropped: false,
+                    ack_signal: Some(-55),
+                }),
+            "requested nullfunc status is ACKed"
+        );
+        let sent = &u.dev.st.borrow().tcl_tx;
+        let f = &sent.last().ok_or("no nullfunc sent")?.frame;
+        // ath11k_dp_tx_encap_nwifi removes QoS control and clears the
+        // QoS subtype, so firmware gets the standard protected Null.
+        ensure!(
+            f.len() == 24
+                && f[0..2] == [0x48, 0x41]
+                && f[4..10] == BSSID
+                && f[10..16] == OWN
+                && f[16..22] == BSSID
+                && f[22..24] == [0, 0],
+            "native-wifi QoS Null decapsulation"
+        );
+        let g = run(u.shared.lock());
+        ensure!(
+            g.stats.tx_nullfunc == before.tx_nullfunc + 1
+                && g.stats.tx_status_acked == before.tx_status_acked + 1
+                && g.vdev(0).unwrap().ack_frames.is_empty()
+                && g.vdev(0).unwrap().ack_status.is_empty(),
+            "probe status consumed without leaking an ACK id"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_nullfunc_probe);
+
+/// WBM TX completion rate records use exactly Linux ath11k's compact PHY
+/// encoding. Verify all five reported families, including the HE OFDMA RU
+/// case where nl80211 must not misreport an RU as a channel width.
+fn smoke_ath11k_int_tx_rate_report() -> TestResult {
+    fn raw(bw: u32, pkt: u32, sgi: u32, mcs: u32, ofdma: bool, tones: u32) -> u32 {
+        1 | (bw << 1)
+            | (pkt << 3)
+            | (sgi << 9)
+            | (mcs << 11)
+            | ((ofdma as u32) << 15)
+            | (tones << 16)
+    }
+    fn rx_raw(bw: u32, pkt: u32, sgi: u32, mcs: u32, nss_bitmap: u32) -> u32 {
+        (pkt << 8) | (sgi << 13) | (mcs << 15) | (bw << 19) | (nss_bitmap << 24)
+    }
+    check(|| {
+        use narf_wireless::RateInfo;
+
+        ensure!(
+            runtime::tx_rate_info(raw(0, 1, 0, 4, false, 0), 1)
+                == Some(RateInfo {
+                    bitrate_100kbps: 110,
+                    width_mhz: 20,
+                    ..Default::default()
+                }),
+            "11b short-preamble rate code"
+        );
+        ensure!(
+            runtime::tx_rate_info(raw(1, 2, 1, 7, false, 0), 2)
+                == Some(RateInfo {
+                    bitrate_100kbps: 3000,
+                    ht_mcs: Some(15),
+                    width_mhz: 40,
+                    short_gi: true,
+                    ..Default::default()
+                }),
+            "HT MCS, NSS and short GI"
+        );
+        ensure!(
+            runtime::tx_rate_info(raw(2, 3, 1, 9, false, 0), 2)
+                == Some(RateInfo {
+                    bitrate_100kbps: 8667,
+                    vht_mcs: Some((9, 2)),
+                    width_mhz: 80,
+                    short_gi: true,
+                    ..Default::default()
+                }),
+            "VHT MCS, NSS and short GI"
+        );
+        ensure!(
+            runtime::tx_rate_info(raw(2, 4, 0, 11, false, 0), 2)
+                == Some(RateInfo {
+                    bitrate_100kbps: 12_009,
+                    he_mcs: Some((11, 2, 0)),
+                    width_mhz: 80,
+                    ..Default::default()
+                }),
+            "HE MCS and 0.8 us GI"
+        );
+        let ofdma = runtime::tx_rate_info(raw(0, 4, 2, 4, true, 106), 1).ok_or("HE OFDMA rate")?;
+        ensure!(
+            ofdma.he_mcs == Some((4, 1, 1))
+                && ofdma.he_ru_alloc == Some(2)
+                && ofdma.bitrate_100kbps > 0,
+            "HE 106-tone RU and 1.6 us GI"
+        );
+        ensure!(
+            runtime::rx_rate_info(rx_raw(1, 2, 1, 7, 0b11))
+                == Some(RateInfo {
+                    bitrate_100kbps: 3000,
+                    ht_mcs: Some(15),
+                    width_mhz: 40,
+                    short_gi: true,
+                    ..Default::default()
+                }),
+            "RX descriptor HT MCS and stream bitmap"
+        );
+        ensure!(
+            runtime::rx_rate_info(rx_raw(2, 3, 1, 9, 0b11))
+                == Some(RateInfo {
+                    bitrate_100kbps: 8667,
+                    vht_mcs: Some((9, 2)),
+                    width_mhz: 80,
+                    short_gi: true,
+                    ..Default::default()
+                }),
+            "RX descriptor VHT MCS and stream bitmap"
+        );
+        ensure!(
+            runtime::rx_rate_info(rx_raw(2, 4, 3, 11, 1))
+                == Some(RateInfo {
+                    bitrate_100kbps: 5104,
+                    he_mcs: Some((11, 1, 2)),
+                    width_mhz: 80,
+                    ..Default::default()
+                }),
+            "RX descriptor HE MCS and guard interval"
+        );
+
+        // The decoded rate reaches GET_STATION only from the first MSDU WBM
+        // release, and uses the real association's negotiated NSS.
+        let u = up(wpa2_cfg())?;
+        connect(&u)?;
+        let raw = raw(2, 3, 1, 9, false, 0);
+        u.dev.st.borrow_mut().tx_rate_stats = raw;
+        let nss = {
+            let m = run(u.netdev.mac.lock());
+            m.link().ok_or("associated station")?.sta.rx_nss
+        };
+        let expected = runtime::tx_rate_info(raw, nss).ok_or("decoded station rate")?;
+        let eth = ipv4_frame(&GW, &OWN, 0, &[9]);
+        ensure!(
+            run(u.shared.send_eth_tx_status(&eth, 200)).is_ok(),
+            "TX completion for station rate"
+        );
+        ensure!(
+            u.netdev
+                .station_info()
+                .is_some_and(|s| s.tx_bitrate == Some(expected)),
+            "GET_STATION snapshots WBM bitrate"
+        );
+        let rx_raw = rx_raw(2, 4, 3, 11, 1);
+        u.dev.st.borrow_mut().rx_rate_info = rx_raw;
+        u.dev
+            .st
+            .borrow_mut()
+            .rx_queue
+            .push_back(ipv4_frame(&OWN, &GW, 0, &[7]));
+        pump(&u, 3);
+        ensure!(
+            u.netdev
+                .station_info()
+                .is_some_and(|s| s.rx_bitrate == runtime::rx_rate_info(rx_raw)),
+            "GET_STATION snapshots fast-RX bitrate"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_tx_rate_report);
 
 /// After bring-up the transport is serviced from the runtime: on its
 /// interrupt at once, else every `QMI_SERVICE_MS`; what it reports (a
@@ -3598,7 +3913,11 @@ fn smoke_ath11k_int_crash_recover_reconnect() -> TestResult {
                 g.core.hif.ce.hal.srng_ids() == rings,
                 "the same rings set up again"
             );
-            ensure!(g.link.authorized && g.link.ptk, "station authorized again");
+            let vdev = g.vdev(0).unwrap();
+            ensure!(
+                vdev.link.authorized && vdev.link.ptk,
+                "station authorized again"
+            );
         }
         ensure!(u.dev.st.borrow().boots == 1, "device power-cycled once");
         // The new firmware saw the bring-up HTT sequence again.
@@ -3675,7 +3994,9 @@ fn smoke_ath11k_int_crash_flush_and_server_exit() -> TestResult {
             );
             ensure!(g.crash_flush, "CRASH_FLUSH set");
             ensure!(
-                (0..3).all(|q| g.txq.stop_reasons(q) & (1 << super::txq::reason::DRIVER) != 0),
+                (0..3).all(|q| {
+                    g.vdev(0).unwrap().txq.stop_reasons(q) & (1 << super::txq::reason::DRIVER) != 0
+                }),
                 "ieee80211_stop_queues (DRIVER)"
             );
             ensure!(
@@ -3687,7 +4008,7 @@ fn smoke_ath11k_int_crash_flush_and_server_exit() -> TestResult {
                 "mgmt TX freed"
             );
             ensure!(
-                g.link.bss.is_none() && !g.link.authorized,
+                g.vdev(0).unwrap().link.bss.is_none() && !g.vdev(0).unwrap().link.authorized,
                 "station data state dropped"
             );
             ensure!(
@@ -3726,7 +4047,7 @@ fn smoke_ath11k_int_crash_flush_and_server_exit() -> TestResult {
         let g = run(u.shared.lock());
         ensure!(g.core.qmi.recovers == [false], "no power cycle");
         ensure!(
-            (0..3).all(|q| g.txq.stop_reasons(q) == 0),
+            (0..3).all(|q| g.vdev(0).unwrap().txq.stop_reasons(q) == 0),
             "queues woken by the reconfig"
         );
         ensure!(u.netdev.connected_bssid() == Some(BSSID), "link back");
@@ -3764,8 +4085,14 @@ fn smoke_ath11k_int_recovery_failures() -> TestResult {
         ensure!(
             run(u.netdev.scan(ScanRequest {
                 ssids: Vec::new(),
+                frequencies_mhz: Vec::new(),
                 channels: vec![6],
                 active: false,
+                random_mac: None,
+                colocated_6ghz: false,
+                duration_tu: None,
+                duration_mandatory: false,
+                extra_ies: Vec::new(),
             }))
             .is_err(),
             "control operations fail"
@@ -4195,6 +4522,7 @@ fn sae_req() -> AssociateRequest {
     AssociateRequest {
         bssid: BSSID,
         ssid: SSID.to_vec(),
+        frequency_mhz: 2437,
         channel: 6,
         security: SecurityConfig::Wpa3 {
             password: SAE_PW.to_vec(),
@@ -4614,17 +4942,20 @@ fn smoke_ath11k_he_caps_and_peer_assoc() -> TestResult {
         let aphe = peer::ApHe {
             cap: with_ppe,
             oper_params: op.params,
+            six_ghz_cap: None,
         };
         let a = peer::peer_assoc_prepare(&peer::PeerAssocInput {
             vdev_id: 0,
             aid: 1,
             assoc_capability: 0x0431,
             listen_interval: 5,
+            nss_ratio_info: 2,
             def: peer::ChanDef {
                 freq: 2437,
                 band: super::mac_frame::Band::Ghz2,
                 width: Width::W40,
                 center_freq1: 2447,
+                center_freq2: 0,
             },
             sta: &sta,
             he: Some(&aphe),
@@ -4697,6 +5028,7 @@ fn smoke_ath11k_int_he_connect() -> TestResult {
         let req = AssociateRequest {
             bssid: BSSID,
             ssid: SSID.to_vec(),
+            frequency_mhz: 2437,
             channel: 6,
             security: SecurityConfig::Open,
             ie: Vec::new(),

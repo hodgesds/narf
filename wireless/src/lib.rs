@@ -3,6 +3,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use async_trait::async_trait;
 use narf_net::Interface;
@@ -20,7 +21,162 @@ pub mod sae;
 pub mod scan;
 
 pub use iface::{AccessCategory, WirelessError, WirelessIface, WirelessIfaceInfo};
-pub use scan::{BssInfo, ScanRequest, ScanResult};
+pub use scan::{BssInfo, ScanRandomMac, ScanRequest, ScanResult};
+
+/// One `struct ieee80211_iface_limit` exposed through nl80211.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InterfaceTypeLimit {
+    /// Maximum number of live interfaces selected from `iftypes`.
+    pub max: u32,
+    /// `enum nl80211_iftype` values covered by this limit.
+    pub iftypes: Vec<u32>,
+}
+
+/// One `struct ieee80211_iface_combination` exposed through
+/// `NL80211_ATTR_INTERFACE_COMBINATIONS`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InterfaceCombination {
+    pub limits: Vec<InterfaceTypeLimit>,
+    pub max_interfaces: u32,
+    pub max_channels: u32,
+    pub sta_ap_beacon_interval_match: bool,
+    pub beacon_interval_min_gcd: Option<u32>,
+    /// `NL80211_IFACE_COMB_RADAR_DETECT_WIDTHS`, when radar detection is
+    /// meaningful for this physical radio.
+    pub radar_detect_widths: Option<u32>,
+}
+
+/// Interface-type-specific Extended Capabilities advertised in
+/// `NL80211_ATTR_IFTYPE_EXT_CAPA`.
+///
+/// `iftype` is an `enum nl80211_iftype` value; zero is the cfg80211 default
+/// entry which applies to every interface type not named by another record.
+/// The capability and mask byte strings must have the same length.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IftypeExtendedCapability {
+    pub iftype: u32,
+    pub capabilities: Vec<u8>,
+    pub mask: Vec<u8>,
+}
+
+/// Wiphy-wide Extended Capabilities (`NL80211_ATTR_EXT_CAPA` and its mask).
+/// These are the capabilities cfg80211 exposes independently of the more
+/// specific [`IftypeExtendedCapability`] records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WiphyExtendedCapabilities {
+    pub capabilities: Vec<u8>,
+    pub mask: Vec<u8>,
+}
+
+/// `wiphy->mbssid_max_interfaces` and, when nonzero,
+/// `wiphy->ema_max_profile_periodicity`.  The capability belongs to the
+/// physical radio: a transmitting AP and every non-transmitting profile must
+/// be vdevs of the same wiphy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MbssidSupport {
+    /// Maximum simultaneous AP interfaces in one multiple-BSSID set.
+    pub max_interfaces: u8,
+    /// Maximum Enhanced Multiple-BSSID Advertisement template period.
+    /// Zero means that regular MBSSID, but not EMA, is available.
+    pub ema_max_profile_periodicity: u8,
+}
+
+/// One WCN6855 BIOS SAR frequency range as cfg80211 exposes it through
+/// `NL80211_ATTR_SAR_SPEC`.  The ath11k hardware table uses the same raw
+/// values Linux advertises (for example `2402..=2482` for 2.4 GHz).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SarFrequencyRange {
+    pub start_freq: u32,
+    pub end_freq: u32,
+}
+
+/// `struct cfg80211_sar_capa`, currently limited to the power type that
+/// ath11k's WCN6855 BIOS table implements.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SarCapability {
+    /// `NL80211_SAR_TYPE_POWER` (zero).
+    pub sar_type: u32,
+    pub frequency_ranges: Vec<SarFrequencyRange>,
+}
+
+/// One `cfg80211_sar_sub_specs` supplied by `NL80211_CMD_SET_SAR_SPECS`.
+/// `power_quarter_dbm` is an s32 in units of 0.25 dBm; ath11k's firmware
+/// consumes its low byte for both RF chains, matching Linux ath11k.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SarPowerLimit {
+    pub range_index: u32,
+    pub power_quarter_dbm: i32,
+}
+
+/// One `struct survey_info` record exposed by `NL80211_CMD_GET_SURVEY`.
+///
+/// The `Option` fields mirror cfg80211's `filled` bitmap: a frequency-only
+/// record is a valid channel for which firmware has not supplied counters
+/// yet. Times are milliseconds, as required by `enum nl80211_survey_info`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SurveyInfo {
+    pub frequency_mhz: u32,
+    pub noise_dbm: Option<i8>,
+    pub in_use: bool,
+    pub time_ms: Option<u64>,
+    pub time_busy_ms: Option<u64>,
+    pub time_rx_ms: Option<u64>,
+    pub time_tx_ms: Option<u64>,
+}
+
+/// Current and available antenna masks for one physical wiphy.
+///
+/// The masks use nl80211's antenna numbering: bit zero is antenna one.  A
+/// driver reports this only when it implements both `get_antenna` and
+/// `set_antenna`; `u32::MAX` in a SET_WIPHY request means "all available".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AntennaInfo {
+    pub tx: u32,
+    pub rx: u32,
+    pub available_tx: u32,
+    pub available_rx: u32,
+}
+
+/// One band entry of `NL80211_ATTR_TX_RATES`.
+///
+/// `band` is the `nl80211_band` ordinal (0 = 2.4 GHz, 1 = 5 GHz, 3 =
+/// 6 GHz). `None` means that the nested attribute was omitted and cfg80211
+/// should retain the negotiated/default rate set for that PHY family. The
+/// legacy bytes are 500-kbit/s rate values in their nl80211 wire form; their
+/// basic-rate marker is ignored for the TX mask just as cfg80211 ignores it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TxBitrateBand {
+    pub band: u8,
+    pub legacy: Option<Vec<u8>>,
+    /// `IEEE80211_HT_MCS_MASK_LEN` bytes; bit n permits HT MCS n.
+    pub ht_mcs: Option<Vec<u8>>,
+    /// Eight `nl80211_txrate_vht::mcs` native-endian u16 bitmaps.
+    pub vht_mcs: Option<[u16; 8]>,
+    /// `NL80211_TXRATE_{DEFAULT,FORCE_SGI,FORCE_LGI}`.
+    pub gi: Option<u8>,
+    /// Eight `nl80211_txrate_he::mcs` native-endian u16 bitmaps.
+    pub he_mcs: Option<[u16; 8]>,
+    /// `NL80211_RATE_INFO_HE_GI_*`.
+    pub he_gi: Option<u8>,
+    /// `NL80211_RATE_INFO_HE_*LTF`.
+    pub he_ltf: Option<u8>,
+}
+
+/// Complete `NL80211_CMD_SET_TX_BITRATE_MASK` request.
+///
+/// Missing bands retain cfg80211's all-negotiated-rates default; an empty
+/// outer list therefore resets every band to automatic rate control.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TxBitrateMask {
+    pub bands: Vec<TxBitrateBand>,
+}
+
+impl TxBitrateMask {
+    /// The optional entry for one `nl80211_band` ordinal.
+    pub fn band(&self, band: u8) -> Option<&TxBitrateBand> {
+        self.bands.iter().find(|entry| entry.band == band)
+    }
+}
 
 /// Capability for wireless-specific operations.
 pub enum WirelessRight {
@@ -39,7 +195,263 @@ pub enum WirelessRight {
 /// A specialized network interface supporting 802.11 operations.
 #[async_trait]
 pub trait WirelessNetIface: Interface {
-    /// Actual supported HT/VHT capabilities for a band (2400 or 5000 MHz).
+    /// Stable identity of the physical radio (`struct wiphy`) backing this
+    /// netdev.  The default deliberately keeps pre-virtual-interface
+    /// drivers one-wiphy-per-netdev; a multi-vdev driver overrides it so
+    /// nl80211 groups all of its interfaces under one wiphy.
+    fn wiphy_id(&self) -> u64 {
+        // FNV-1a: stable for the lifetime of a registered name, dependency
+        // free, and sufficient only for the legacy one-netdev default.
+        self.name()
+            .bytes()
+            .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+                (hash ^ byte as u64).wrapping_mul(0x0000_0100_0000_01b3)
+            })
+    }
+
+    /// Whether this physical radio can create additional nl80211 virtual
+    /// interfaces (`NL80211_CMD_NEW_INTERFACE`).
+    fn supports_virtual_interfaces(&self) -> bool {
+        false
+    }
+
+    /// Valid simultaneous virtual-interface sets for this physical wiphy.
+    /// Returning an empty list leaves the implicit one-interface-per-iftype
+    /// cfg80211 combinations only; a driver with virtual vdevs must return
+    /// the combinations it actually enforces.
+    fn interface_combinations(&self) -> Vec<InterfaceCombination> {
+        Vec::new()
+    }
+
+    /// Preallocated MAC addresses for this physical wiphy. A multi-vdev
+    /// driver returns the hardware's address pool, including its base
+    /// address; nl80211 emits the pool only when it has more than one entry.
+    fn wiphy_mac_addresses(&self) -> Vec<[u8; 6]> {
+        Vec::new()
+    }
+
+    /// Wiphy-wide Extended Capabilities. The two byte strings must have the
+    /// same length; an invalid value is left out of the nl80211 response.
+    fn wiphy_extended_capabilities(&self) -> Option<WiphyExtendedCapabilities> {
+        None
+    }
+
+    /// Per-interface-type Extended Capabilities for
+    /// `NL80211_ATTR_IFTYPE_EXT_CAPA`. Returning no records leaves this
+    /// optional wiphy metadata absent.
+    fn iftype_extended_capabilities(&self) -> Vec<IftypeExtendedCapability> {
+        Vec::new()
+    }
+
+    /// `wiphy->sar_capa`. `None` leaves `NL80211_CMD_SET_SAR_SPECS`
+    /// unadvertised and makes the command return `-EOPNOTSUPP`.
+    fn sar_capability(&self) -> Option<SarCapability> {
+        None
+    }
+
+    /// `wiphy->mbssid_max_interfaces`. `None` leaves
+    /// `NL80211_ATTR_MBSSID_CONFIG` absent and rejects START_AP MBSSID
+    /// attributes. Drivers must expose this only when their AP start path
+    /// supplies the target's transmitting/non-transmitting-vdev contract.
+    fn mbssid_support(&self) -> Option<MbssidSupport> {
+        None
+    }
+
+    /// `NL80211_EXT_FEATURE_FILS_DISCOVERY`: this AP wiphy can transmit the
+    /// configured 6 GHz FILS discovery action-frame template.
+    fn supports_fils_discovery(&self) -> bool {
+        false
+    }
+
+    /// `NL80211_EXT_FEATURE_UNSOL_BCAST_PROBE_RESP`: this AP wiphy can
+    /// transmit a configured unsolicited broadcast probe response on 6 GHz.
+    fn supports_unsol_bcast_probe_resp(&self) -> bool {
+        false
+    }
+
+    /// `NL80211_EXT_FEATURE_ENABLE_FTM_RESPONDER`: this AP vdev can enable
+    /// firmware fine-timing-measurement responder operation.
+    fn supports_ftm_responder(&self) -> bool {
+        false
+    }
+
+    /// `NL80211_EXT_FEATURE_BSS_COLOR`: firmware can offload HE BSS-color
+    /// collision detection for an AP vdev.
+    fn supports_bss_color(&self) -> bool {
+        false
+    }
+
+    /// This AP wiphy can enable the HE Target Wake Time responder role from
+    /// `NL80211_ATTR_TWT_RESPONDER` on START_AP. The target engine is pdev
+    /// scoped, but the request is owned by the beaconing AP configuration.
+    fn supports_twt_responder(&self) -> bool {
+        false
+    }
+
+    /// This station/P2P-client interface implements mac80211's software
+    /// `set_cqm_rssi_config` path for a single RSSI threshold.
+    fn supports_cqm_rssi(&self) -> bool {
+        false
+    }
+
+    /// This interface also implements cfg80211's range-based CQM RSSI-list
+    /// contract. When true, [`Self::set_cqm_rssi`] accepts more than one
+    /// ordered threshold and maintains the adjacent low/high range after
+    /// every notification.
+    fn supports_cqm_rssi_list(&self) -> bool {
+        false
+    }
+
+    /// `NL80211_CMD_SET_CQM`'s ordered RSSI threshold configuration. `None`
+    /// disables CQM RSSI notifications. The control layer has already
+    /// validated the nl80211 nesting, threshold order/sign and interface
+    /// type.
+    fn set_cqm_rssi(&self, _config: Option<CqmRssiConfig>) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+
+    /// Whether this wiphy implements `NL80211_CMD_GET_SURVEY`. A supporting
+    /// driver returns one record for every enabled channel, then refreshes the
+    /// active channel's firmware counters on its ordered runtime worker.
+    fn supports_survey(&self) -> bool {
+        false
+    }
+
+    /// Current `NL80211_CMD_GET_SURVEY` snapshot. This is intentionally a
+    /// synchronous snapshot: a generic-netlink dump can run in an executor
+    /// poll and must not block waiting for the driver's WMI completion.
+    fn survey_info(&self) -> Vec<SurveyInfo> {
+        Vec::new()
+    }
+
+    /// `get_antenna`: current and available physical-radio antenna masks.
+    /// `None` leaves the `SET_WIPHY` antenna attributes unadvertised.
+    fn antenna_info(&self) -> Option<AntennaInfo> {
+        None
+    }
+
+    /// `set_antenna`: replace both physical-radio chain masks.  The nl80211
+    /// layer has normalized an all-ones request to the available masks and
+    /// rejected bits that name unavailable antennas.
+    fn set_antenna(&self, _tx: u32, _rx: u32) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+
+    /// Current `WIPHY_FRAG_THRESHOLD`, or `None` when the driver does not
+    /// publish a fragmentation-threshold setting.
+    fn fragmentation_threshold(&self) -> Option<u32> {
+        None
+    }
+
+    /// Current `WIPHY_RTS_THRESHOLD`, or `None` if this wiphy has no
+    /// `set_rts_threshold` implementation.
+    fn rts_threshold(&self) -> Option<u32> {
+        None
+    }
+
+    /// `set_rts_threshold`: apply a physical-radio setting to every live
+    /// vdev and retain it for vdev creation and recovery replay.
+    fn set_rts_threshold(&self, _threshold: u32) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+
+    /// Whether this interface implements `NL80211_CMD_SET_TX_BITRATE_MASK`.
+    fn supports_tx_bitrate_mask(&self) -> bool {
+        false
+    }
+
+    /// Retain and apply cfg80211's allowed TX rates for the active band.
+    /// The generic layer has validated nl80211 nesting and field sizes;
+    /// drivers additionally intersect the mask with their negotiated peer
+    /// and physical capabilities.
+    fn set_tx_bitrate_mask(&self, _mask: TxBitrateMask) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+
+    /// Whether this wiphy implements `NL80211_EXT_FEATURE_STA_TX_PWR`.
+    /// The setting applies to one associated peer, rather than the
+    /// per-interface regulatory limit returned by [`Self::tx_power_dbm`].
+    fn supports_station_tx_power(&self) -> bool {
+        false
+    }
+
+    /// Apply `NL80211_ATTR_STA_TX_POWER_SETTING` to an associated peer.
+    /// The generic layer has checked the nl80211 setting form and peer
+    /// identity; drivers validate their supported dBm range and retain a
+    /// managed-station setting for recovery or a later reassociation.
+    fn set_station_tx_power(&self, _peer: [u8; 6], _setting: StationTxPower) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+
+    /// Whether this wiphy implements `NL80211_EXT_FEATURE_ACK_SIGNAL_SUPPORT`
+    /// and therefore exposes the associated peer's ACK RSSI through
+    /// `NL80211_STA_INFO_ACK_SIGNAL`.
+    fn supports_ack_signal(&self) -> bool {
+        false
+    }
+
+    /// Current effective transmit-power limit in integral dBm for this
+    /// netdev. `None` means the driver has no active-vdev snapshot to report.
+    /// nl80211 serializes a reported value as
+    /// `NL80211_ATTR_WIPHY_TX_POWER_LEVEL` in mBm on `GET_INTERFACE`.
+    fn tx_power_dbm(&self) -> Option<i32> {
+        None
+    }
+
+    /// `set_sar_specs`: replace the physical radio's complete BIOS SAR
+    /// limitation table. The generic nl80211 layer has already checked the
+    /// type, range indices and duplicate entries before this is called.
+    fn set_sar_power_limits(&self, _limits: &[SarPowerLimit]) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+
+    /// Whether an unassociated `NL80211_CMD_TRIGGER_SCAN` may use a random
+    /// source address (`NL80211_FEATURE_SCAN_RANDOM_MAC_ADDR`).  The default
+    /// is deliberately conservative: a request carrying RANDOM_ADDR is
+    /// rejected unless its physical driver explicitly exposes the firmware
+    /// capability.
+    fn supports_scan_random_mac(&self) -> bool {
+        false
+    }
+
+    /// Whether this wiphy exposes `NL80211_EXT_FEATURE_SET_SCAN_DWELL` and
+    /// honours `NL80211_ATTR_MEASUREMENT_DURATION` on a triggered scan.
+    fn supports_scan_dwell(&self) -> bool {
+        false
+    }
+
+    /// Driver-specific `NL80211_ATTR_FEATURE_FLAGS` bits.  These describe
+    /// link-layer behaviour which is already implemented by a netdev but is
+    /// not inferred from one of the generic nl80211 operations above.
+    /// Implementations must return only defined `NL80211_FEATURE_*` bits.
+    fn nl80211_feature_flags(&self) -> u32 {
+        0
+    }
+
+    /// Create one additional netdev/vdev under this interface's physical
+    /// wiphy.  The implementation registers the new interface before
+    /// returning it, so callers can immediately emit `NEW_INTERFACE`.
+    fn new_virtual_interface(
+        &self,
+        _name: &str,
+        _iftype: u32,
+        _mac: Option<[u8; 6]>,
+    ) -> Result<Arc<dyn WirelessNetIface>, WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    /// Begin removal of this virtual netdev (`NL80211_CMD_DEL_INTERFACE`).
+    /// The physical/root interface returns `NotSupported`. Implementations
+    /// that need WMI/firmware waits make the netdev undiscoverable before
+    /// returning, then release its firmware vdev asynchronously; they must
+    /// not reuse that slot until the ordered teardown has completed.
+    fn delete_virtual_interface(&self) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    /// Actual supported HT/VHT capabilities for a band (2400, 5000, or
+    /// 6000 MHz). Six-GHz devices expose HE through their driver-specific
+    /// capability path until this generic interface gains an HE body.
     /// Missing capabilities are never inferred from another band's flags.
     fn phy_capabilities(&self, _band_mhz: u32) -> Option<iface::PhyCapabilities> {
         None
@@ -172,6 +584,36 @@ pub trait WirelessNetIface: Interface {
         Err(WirelessError::NotSupported)
     }
 
+    /// Maximum `NL80211_CMD_REMAIN_ON_CHANNEL` duration in milliseconds.
+    /// Zero means this wiphy has no scan-backed off-channel facility.
+    fn max_remain_on_channel_duration_ms(&self) -> u32 {
+        0
+    }
+
+    /// `WIPHY_FLAG_OFFCHAN_TX`: management TX may use a live
+    /// remain-on-channel context rather than the interface's operating
+    /// channel (`NL80211_ATTR_OFFCHANNEL_TX_OK`).
+    fn supports_offchannel_mgmt_tx(&self) -> bool {
+        false
+    }
+
+    /// Queue a remain-on-channel request. The driver publishes its actual
+    /// start and eventual expiry as nl80211 events keyed by `cookie`.
+    fn remain_on_channel(
+        &self,
+        _cookie: u64,
+        _frequency_mhz: u32,
+        _duration_ms: u32,
+    ) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    /// Cancel the matching remain-on-channel request. A successful cancel
+    /// still produces the normal expiry notification.
+    fn cancel_remain_on_channel(&self, _cookie: u64) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
     /// Report a userspace SAE (external-auth) result to the driver, for
     /// NL80211_CMD_EXTERNAL_AUTH.
     async fn external_auth_status(
@@ -184,9 +626,11 @@ pub trait WirelessNetIface: Interface {
 
     // ── Access-Point mode (NL80211_CMD_START_AP etc.) ─────────────────
     //
-    // Beacon generation and the station table are configured synchronously:
-    // the netlink reply is the result hostapd waits on, so these return a
-    // Result directly rather than deferring to an event. All default to
+    // These methods perform synchronous argument / state validation. A
+    // driver whose firmware completion path runs on its runtime task may
+    // enqueue the actual WMI operation after accepting the request: a
+    // generic-netlink handler can itself execute in an executor poll and
+    // must never re-enter that executor with `block_on`. All default to
     // unsupported; an AP-capable driver overrides them and advertises AP in
     // its [`WirelessIfaceInfo::modes`].
 
@@ -195,10 +639,70 @@ pub trait WirelessNetIface: Interface {
         false
     }
 
+    /// The AP firmware provides per-client U-APSD buffering and beacon TIM
+    /// maintenance (`NL80211_ATTR_SUPPORT_AP_UAPSD`).
+    fn supports_ap_uapsd(&self) -> bool {
+        false
+    }
+
+    /// Maximum associated stations for an AP/P2P-GO vdev
+    /// (`NL80211_ATTR_MAX_AP_ASSOC_STA`).  Zero leaves the implementation's
+    /// limit unspecified to userspace.
+    fn max_ap_assoc_sta(&self) -> u32 {
+        0
+    }
+
+    /// The driver can perform an AP / P2P-GO channel switch
+    /// (`NL80211_CMD_CHANNEL_SWITCH`).  The temporary CSA beacon and the
+    /// post-switch beacon are distinct: the former carries mutable countdown
+    /// bytes while the latter becomes the normal beacon on the new channel.
+    fn supports_channel_switch(&self) -> bool {
+        false
+    }
+
+    /// `wiphy->max_num_csa_counters`, advertised with
+    /// `NL80211_ATTR_MAX_CSA_COUNTERS` whenever channel switching is
+    /// supported. Zero leaves the metadata absent.
+    fn max_csa_counters(&self) -> u8 {
+        0
+    }
+
     /// The interface's current operating type as an `NL80211_IFTYPE_*` value
     /// (default `NL80211_IFTYPE_STATION` = 2), reported by GET_INTERFACE.
     fn current_iftype(&self) -> u32 {
         2
+    }
+
+    /// Change the nl80211 interface type while it is down
+    /// (`NL80211_CMD_SET_INTERFACE`). Drivers that expose more than one
+    /// role must reject an in-place active-vdev change rather than silently
+    /// retagging station state as AP state.
+    fn set_iftype(&self, _iftype: u32) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    /// Whether this station interface supports `NL80211_ATTR_4ADDR`.
+    /// cfg80211's `WIPHY_FLAG_4ADDR_STATION` is an internal driver
+    /// capability; nl80211 exposes the selected state in each interface
+    /// reply rather than serializing that wiphy flag itself.
+    fn supports_four_addr_station(&self) -> bool {
+        false
+    }
+
+    /// Current managed-station four-address/WDS state. `GET_INTERFACE`,
+    /// `NEW_INTERFACE`, and `SET_INTERFACE` replies serialize this as
+    /// `NL80211_ATTR_4ADDR`.
+    fn four_addr_enabled(&self) -> bool {
+        false
+    }
+
+    /// Select managed-station four-address/WDS operation. The generic
+    /// nl80211 layer restricts an enabled request to station mode and checks
+    /// [`Self::supports_four_addr_station`] first; a driver retains the
+    /// state for future association and recovery and updates a live BSS peer
+    /// through its ordered control path.
+    fn set_four_addr(&self, _enabled: bool) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
     }
 
     /// Begin AP operation: upload the beacon template and start beaconing.
@@ -211,8 +715,57 @@ pub trait WirelessNetIface: Interface {
         Err(WirelessError::NotSupported)
     }
 
-    /// Replace the beacon head/tail of a running AP (NL80211_CMD_SET_BEACON).
-    fn set_beacon(&self, _head: Vec<u8>, _tail: Vec<u8>) -> Result<(), WirelessError> {
+    /// Replace supplied pieces of a running AP beacon
+    /// (NL80211_CMD_SET_BEACON). `None` means the attribute was absent;
+    /// `Some(Vec::new())` deliberately clears that piece. `probe_resp` is a
+    /// complete `NL80211_ATTR_PROBE_RESP` template rather than an IE suffix.
+    fn set_beacon(
+        &self,
+        _head: Option<Vec<u8>>,
+        _tail: Option<Vec<u8>>,
+        _probe_resp: Option<Vec<u8>>,
+    ) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    /// Update AP FILS-discovery and/or unsolicited-broadcast-probe-response
+    /// policy. The outer `Option` preserves nl80211 attribute presence;
+    /// `Some(None)` disables and deletes that template, while `None` leaves
+    /// that side unchanged.
+    fn set_ap_discovery(
+        &self,
+        _fils: Option<Option<FilsDiscoveryConfig>>,
+        _unsol_bcast_probe_resp: Option<Option<UnsolBcastProbeRespConfig>>,
+    ) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    /// Enable AP fine-timing-measurement responder operation. The optional
+    /// location payloads are retained for the AP's measurement responses.
+    fn set_ap_ftm_responder(&self, _config: FtmResponderConfig) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    /// Update AP HE BSS-color collision detection. `disabled` is the
+    /// on-air HE Operation setting; the color remains present in the nested
+    /// nl80211 form even when collision detection is disabled.
+    fn set_ap_he_bss_color(&self, _config: HeBssColorConfig) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    /// Begin an AP-only HE BSS-color transition
+    /// (`NL80211_CMD_COLOR_CHANGE_REQUEST`).  The driver owns the temporary
+    /// countdown template and reports its started/completed/aborted state on
+    /// the nl80211 MLME multicast group.  Acceptance only queues firmware
+    /// work; it does not claim the countdown has reached its final TBTT.
+    fn color_change(&self, _config: ColorChangeConfig) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    /// Announce and execute an AP / P2P-GO channel switch.  Like the other
+    /// AP operations, this may enqueue firmware work; acceptance does not
+    /// claim that the target vdev restart has completed.
+    fn channel_switch(&self, _cfg: ChannelSwitchConfig) -> Result<(), WirelessError> {
         Err(WirelessError::NotSupported)
     }
 
@@ -257,11 +810,79 @@ pub trait WirelessNetIface: Interface {
         false
     }
 
+    /// The control-port TX path retains `IEEE80211_TX_CTL_REQ_TX_STATUS`
+    /// through its asynchronous completion path and therefore exposes
+    /// `NL80211_EXT_FEATURE_CONTROL_PORT_OVER_NL80211_TX_STATUS`.
+    ///
+    /// This is deliberately separate from [`Self::supports_external_supplicant`]:
+    /// a driver may route EAPOL through nl80211 yet be unable to correlate a
+    /// later hardware completion with the original control-port cookie.
+    fn supports_control_port_tx_status(&self) -> bool {
+        false
+    }
+
+    /// Cipher suites exposed by this physical wiphy.  The default keeps the
+    /// historic minimal external-supplicant profile; a hardware driver must
+    /// override it before advertising a suite that its key-install and data
+    /// paths can actually honour.
+    fn cipher_suites(&self) -> &'static [u32] {
+        if self.supports_external_supplicant() {
+            &[CIPHER_SUITE_CCMP, CIPHER_SUITE_AES_CMAC]
+        } else if self.supports_handshake_offload() || self.supports_sae_offload() {
+            &[CIPHER_SUITE_CCMP]
+        } else {
+            &[]
+        }
+    }
+
+    /// The driver can retain GTK rekey material across a low-power sleep
+    /// and refresh the group key without waking the host
+    /// (`NL80211_CMD_SET_REKEY_OFFLOAD`).  This is distinct from the normal
+    /// EAPOL Group Key Handshake, which still belongs to the userspace
+    /// supplicant while the host is awake.
+    fn supports_gtk_rekey_offload(&self) -> bool {
+        false
+    }
+
+    /// Store the KEK, KCK and replay counter that a later low-power/WoW
+    /// transition will hand to the device.  The caller supplies the replay
+    /// counter in network (big-endian) order, exactly as nl80211 does.
+    /// Implementations must neither print nor expose this secret material.
+    fn set_gtk_rekey_data(&self, _data: GtkRekeyData) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+
+    /// `wiphy->wowlan`: capabilities the driver advertises for WoWLAN.
+    /// Absence means `GET/SET_WOWLAN` must return `-EOPNOTSUPP`.
+    fn wowlan_support(&self) -> Option<WowlanSupport> {
+        None
+    }
+
+    /// `nl80211_set_wowlan`: retain a validated wake configuration until a
+    /// later system low-power transition programs the hardware.  `None`
+    /// clears the configuration, mirroring a SET_WOWLAN request without
+    /// `NL80211_ATTR_WOWLAN_TRIGGERS`.
+    fn set_wowlan(&self, _config: Option<WowlanConfig>) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+
+    /// `nl80211_get_wowlan`: current retained wake configuration, if any.
+    fn wowlan_config(&self) -> Option<WowlanConfig> {
+        None
+    }
+
     /// Install a key (`ieee80211_add_key` → `drv_set_key(SET_KEY)`).
     /// -ENOENT when `peer` is not an associated station
     /// (`sta_info_get_bss` + `WLAN_STA_ASSOC`).
     fn add_key(&self, _key: KeyParams) -> Result<(), i32> {
         Err(EOPNOTSUPP)
+    }
+
+    /// `set_default_mgmt_key`: select the IGTK used to protect outbound AP
+    /// group robust management frames. Station interfaces only consume IGTKs
+    /// on RX and can leave this as a successful no-op.
+    fn set_default_mgmt_key(&self, _idx: u8) -> Result<(), i32> {
+        Ok(())
     }
 
     /// Remove a key (`ieee80211_del_key`: -ENOENT when there is none).
@@ -290,6 +911,25 @@ pub trait WirelessNetIface: Interface {
         Err(EOPNOTSUPP)
     }
 
+    /// As [`Self::tx_control_port`], retaining a caller-provided nl80211
+    /// cookie for a later `CONTROL_PORT_FRAME_TX_STATUS` multicast event.
+    /// `None` is the DONT_WAIT_FOR_ACK form and must not request a status.
+    ///
+    /// The compatibility default preserves a driver's existing control-port
+    /// path. Only implementations that return true from
+    /// [`Self::supports_control_port_tx_status`] override it and retain the
+    /// cookie until their TX completion arrives.
+    fn tx_control_port_with_status(
+        &self,
+        dest: [u8; 6],
+        proto: u16,
+        frame: Vec<u8>,
+        no_encrypt: bool,
+        _cookie: Option<u64>,
+    ) -> Result<(), i32> {
+        self.tx_control_port(dest, proto, frame, no_encrypt)
+    }
+
     // ── Power save, regulatory, station info ──────────────────────────
 
     /// The driver has `set_power_mgmt` (`SUPPORTS_PS`): the current
@@ -309,8 +949,21 @@ pub trait WirelessNetIface: Interface {
         None
     }
 
-    /// What the driver tracks about the AP (`ieee80211_sta_set_sinfo`).
+    /// What the driver tracks about its associated AP
+    /// (`ieee80211_sta_set_sinfo`).
     fn station_info(&self) -> Option<StationInfo> {
+        None
+    }
+
+    /// Associated client MACs for an AP / P2P GO, used by the dump form of
+    /// `NL80211_CMD_GET_STATION`.
+    fn ap_station_macs(&self) -> Vec<[u8; 6]> {
+        Vec::new()
+    }
+
+    /// What the driver tracks about one associated AP client. `None` means
+    /// the client is not currently present (`-ENOENT` for a non-dump query).
+    fn ap_station_info(&self, _peer: [u8; 6]) -> Option<StationInfo> {
         None
     }
 }
@@ -321,6 +974,8 @@ pub const EOPNOTSUPP: i32 = 95;
 pub struct AssociateRequest {
     pub bssid: [u8; 6],
     pub ssid: Vec<u8>,
+    /// Centre frequency in MHz of the selected scan result.
+    pub frequency_mhz: u32,
     pub channel: u32,
     pub security: SecurityConfig,
     /// The SME's elements for the (Re)Association Request
@@ -415,6 +1070,121 @@ pub struct KeyParams {
     /// Receive sequence counter (RSC / IPN), 6 octets little-endian, or
     /// empty.
     pub seq: Vec<u8>,
+    /// `NL80211_ATTR_KEY_DEFAULT_MGMT`: this IGTK is the AP's selected
+    /// transmit management key. Meaningful only for a non-pairwise IGTK.
+    pub default_mgmt: bool,
+}
+
+/// GTK rekey material from `NL80211_CMD_SET_REKEY_OFFLOAD` /
+/// `cfg80211_gtk_rekey_data`.  These are the 16-byte CCMP-128 keys
+/// WCN6855 firmware supports; the replay counter remains in the big-endian
+/// nl80211 representation until the driver serializes its firmware command.
+///
+/// Deliberately no `Debug` implementation prints the key material.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct GtkRekeyData {
+    pub kek: [u8; 16],
+    pub kck: [u8; 16],
+    pub replay_counter: [u8; 8],
+    /// The negotiated AKM (`00-0f-ac:n`) when userspace supplied it.  The
+    /// ath11k GTK-offload wire command does not carry it, but preserving it
+    /// retains the nl80211 contract for drivers with AKM-specific engines.
+    pub akm: Option<u32>,
+}
+
+/// One SSID/RSSI match condition for WoWLAN network detection.  The RSSI
+/// threshold is in dBm; `None` leaves firmware's normal candidate policy in
+/// effect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetDetectMatch {
+    pub ssid: Vec<u8>,
+    pub rssi_threshold_dbm: Option<i32>,
+}
+
+/// One `NL80211_SCHED_SCAN_PLAN`: after `iterations` scans at `interval`,
+/// firmware advances to the next plan.  The final plan has no iteration
+/// count and repeats until the host wakes or cancels it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetDetectScanPlan {
+    pub interval_secs: u32,
+    pub iterations: Option<u32>,
+}
+
+/// cfg80211's WoWLAN `NET_DETECT` request, carried over the existing
+/// sched-scan attribute vocabulary.  It is deliberately a low-power
+/// network-list offload configuration, not a general scheduled scan API.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetDetectConfig {
+    /// Directed probe SSIDs; an empty list makes the NLO scan passive.
+    pub probe_ssids: Vec<Vec<u8>>,
+    /// Optional channel allow-list in MHz.
+    pub frequencies_mhz: Vec<u32>,
+    /// Optional probe-request IEs. WCN6855's PNO WMI command has no payload
+    /// slot for them; this is retained because Linux ath11k advertises and
+    /// accepts the cfg80211 512-byte limit while its NLO encoder likewise
+    /// cannot place the bytes on the wire.
+    pub probe_ies: Vec<u8>,
+    /// Match sets that wake the host when a candidate network is found.
+    pub matches: Vec<NetDetectMatch>,
+    /// One or two periodic scan plans, in seconds.
+    pub plans: Vec<NetDetectScanPlan>,
+    /// Delay before the first scan, in seconds.
+    pub delay_secs: u32,
+    /// Optional randomized probe source address.
+    pub random_mac: Option<ScanRandomMac>,
+}
+
+/// `struct wiphy_wowlan_support` for the subset ath11k exposes.  The
+/// capability bit for GTK rekeying is distinct from the GTK-failure wake
+/// trigger, exactly as `WIPHY_WOWLAN_SUPPORTS_GTK_REKEY` is in cfg80211.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WowlanSupport {
+    pub disconnect: bool,
+    pub magic_packet: bool,
+    pub gtk_rekey: bool,
+    pub gtk_rekey_failure: bool,
+    pub max_patterns: u8,
+    pub min_pattern_len: u8,
+    pub max_pattern_len: u16,
+    pub max_packet_offset: u16,
+    /// `WIPHY_WOWLAN_NET_DETECT`: maximum simultaneous NLO match sets.
+    /// Zero means the firmware cannot perform network-list offload.
+    pub net_detect_max_match_sets: u8,
+    /// `NL80211_FEATURE_ND_RANDOM_MAC_ADDR`.
+    pub net_detect_random_mac: bool,
+}
+
+/// One cfg80211 packet pattern: `mask` is one bit per pattern byte, ordered
+/// least-significant bit first as the nl80211 ABI specifies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WowlanPattern {
+    pub mask: Vec<u8>,
+    pub pattern: Vec<u8>,
+    pub offset: u32,
+}
+
+/// `struct cfg80211_wowlan`, deliberately limited to the wake features
+/// advertised by current NARF drivers.  GTK rekey support is capability-only
+/// and is activated by `SET_REKEY_OFFLOAD` plus the low-power transition.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WowlanConfig {
+    pub disconnect: bool,
+    pub magic_packet: bool,
+    pub gtk_rekey_failure: bool,
+    pub patterns: Vec<WowlanPattern>,
+    /// Firmware network-list offload armed during system WoW suspend.
+    pub net_detect: Option<NetDetectConfig>,
+}
+
+impl core::fmt::Debug for GtkRekeyData {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("GtkRekeyData")
+            .field("kek", &"[redacted; 16 bytes]")
+            .field("kck", &"[redacted; 16 bytes]")
+            .field("replay_counter", &self.replay_counter)
+            .field("akm", &self.akm)
+            .finish()
+    }
 }
 
 impl core::fmt::Debug for KeyParams {
@@ -425,14 +1195,29 @@ impl core::fmt::Debug for KeyParams {
             .field("pairwise", &self.pairwise)
             .field("peer", &self.peer)
             .field("cipher", &self.cipher)
+            .field("default_mgmt", &self.default_mgmt)
             .finish()
     }
 }
 
+/// `WLAN_CIPHER_SUITE_TKIP`.
+pub const CIPHER_SUITE_TKIP: u32 = 0x000f_ac02;
 /// `WLAN_CIPHER_SUITE_CCMP`.
 pub const CIPHER_SUITE_CCMP: u32 = 0x000f_ac04;
 /// `WLAN_CIPHER_SUITE_AES_CMAC` (BIP-CMAC-128).
 pub const CIPHER_SUITE_AES_CMAC: u32 = 0x000f_ac06;
+/// `WLAN_CIPHER_SUITE_GCMP` (GCMP-128).
+pub const CIPHER_SUITE_GCMP: u32 = 0x000f_ac08;
+/// `WLAN_CIPHER_SUITE_GCMP_256`.
+pub const CIPHER_SUITE_GCMP_256: u32 = 0x000f_ac09;
+/// `WLAN_CIPHER_SUITE_CCMP_256`.
+pub const CIPHER_SUITE_CCMP_256: u32 = 0x000f_ac0a;
+/// `WLAN_CIPHER_SUITE_BIP_GMAC_128`.
+pub const CIPHER_SUITE_BIP_GMAC_128: u32 = 0x000f_ac0b;
+/// `WLAN_CIPHER_SUITE_BIP_GMAC_256`.
+pub const CIPHER_SUITE_BIP_GMAC_256: u32 = 0x000f_ac0c;
+/// `WLAN_CIPHER_SUITE_BIP_CMAC_256`.
+pub const CIPHER_SUITE_BIP_CMAC_256: u32 = 0x000f_ac0d;
 
 /// A regulatory domain as nl80211 reports it (`struct ieee80211_regdomain`:
 /// kHz, mBi, mBm, `NL80211_RRF_*`).
@@ -470,6 +1255,14 @@ pub struct RateInfo {
     pub vht_mcs: Option<(u8, u8)>,
     /// HE MCS / NSS / GI (`RATE_INFO_FLAGS_HE_MCS`).
     pub he_mcs: Option<(u8, u8, u8)>,
+    /// HE dual-carrier modulation (`NL80211_RATE_INFO_HE_DCM`).  It is
+    /// meaningful only when `he_mcs` is present; nl80211 still emits its
+    /// explicit zero value for ordinary HE rates.
+    pub he_dcm: bool,
+    /// HE OFDMA resource-unit allocation (`NL80211_RATE_INFO_HE_RU_ALLOC`):
+    /// 0 = 26 tones, through 6 = 2×996 tones. `None` means non-OFDMA.
+    /// When present this supersedes `width_mhz` on the nl80211 wire.
+    pub he_ru_alloc: Option<u8>,
     /// Channel width in MHz (20, 40, 80, 160).
     pub width_mhz: u16,
     pub short_gi: bool,
@@ -482,13 +1275,25 @@ pub struct StationInfo {
     pub signal_dbm: Option<i8>,
     /// `NL80211_STA_INFO_SIGNAL_AVG` (dBm).
     pub signal_avg_dbm: Option<i8>,
+    /// `NL80211_STA_INFO_CHAIN_SIGNAL` (dBm), indexed by receive chain.
+    /// `None` means that chain had no valid firmware sample.
+    pub chain_signal_dbm: [Option<i8>; 8],
     /// `NL80211_STA_INFO_ACK_SIGNAL` (dBm).
     pub ack_signal_dbm: Option<i8>,
     pub tx_bitrate: Option<RateInfo>,
     pub rx_bitrate: Option<RateInfo>,
     pub rx_packets: Option<u32>,
     pub tx_packets: Option<u32>,
+    /// `NL80211_STA_INFO_TX_RETRIES`: aggregate retransmissions reported
+    /// by the device's TX-completion descriptors.
+    pub tx_retries: Option<u32>,
     pub tx_failed: Option<u32>,
+    /// `NL80211_STA_INFO_TX_DURATION`: aggregate firmware PPDU airtime sent
+    /// to this station, in microseconds.
+    pub tx_duration_us: Option<u64>,
+    /// `NL80211_STA_INFO_RX_DURATION`: aggregate received PPDU airtime, in
+    /// microseconds.
+    pub rx_duration_us: Option<u64>,
 }
 
 pub struct WirelessConfig {
@@ -527,36 +1332,307 @@ pub struct MlmeAssocRequest {
     pub privacy: bool,
 }
 
-/// A management frame to transmit (NL80211_CMD_FRAME). `channel` 0 means the
-/// current operating channel; `offchannel_ok` permits off-channel transmission
-/// for the given `duration` (milliseconds).
+/// A management frame to transmit (NL80211_CMD_FRAME). `frequency_mhz` 0
+/// means the current operating channel; otherwise it preserves the exact
+/// `NL80211_ATTR_WIPHY_FREQ` identity. `offchannel_ok` permits off-channel
+/// transmission for the given `duration` (milliseconds).
 pub struct MgmtTxRequest {
-    pub channel: u32,
+    pub frequency_mhz: u32,
     pub frame: Vec<u8>,
     pub offchannel_ok: bool,
     pub duration: u32,
 }
 
 /// Access-Point configuration for NL80211_CMD_START_AP. `beacon_head` is the
-/// beacon frame up to (and including) the TIM, `beacon_tail` the remainder;
+/// beacon frame before the TIM; mac80211 inserts the mutable TIM and
+/// `beacon_tail` follows it. `frequency_mhz` preserves the exact nl80211
+/// operating frequency (6 GHz channel numbers overlap 2.4 GHz, so a channel
+/// number alone is lossy), and
 /// `hidden_ssid` is an `NL80211_HIDDEN_SSID_*` value.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ApConfig {
     pub ssid: Vec<u8>,
     pub beacon_head: Vec<u8>,
     pub beacon_tail: Vec<u8>,
+    /// Optional complete `NL80211_ATTR_PROBE_RESP` template.  The MAC owns
+    /// its destination address and inserts CSA countdown bytes while a
+    /// channel switch is active.
+    pub probe_resp: Option<Vec<u8>>,
     pub beacon_interval: u32,
     pub dtim_period: u32,
-    pub channel: u32,
+    pub frequency_mhz: u32,
+    /// `enum nl80211_chan_width` from `NL80211_ATTR_CHANNEL_WIDTH`.
+    pub channel_width: u32,
+    /// `NL80211_ATTR_CENTER_FREQ1`; required above 20 MHz.
+    pub center_freq1_mhz: Option<u32>,
+    /// `NL80211_ATTR_CENTER_FREQ2`; required for 80+80 MHz.
+    pub center_freq2_mhz: Option<u32>,
     pub hidden_ssid: u32,
     pub privacy: bool,
+    /// Per-vdev `NL80211_ATTR_MBSSID_CONFIG`, if this AP participates in a
+    /// multiple-BSSID group. The element lists belong only to a transmitting
+    /// vdev and are appended by the driver to the firmware beacon template.
+    pub mbssid: Option<MbssidConfig>,
+    /// Complete `NL80211_ATTR_MBSSID_ELEMS` IEs, one per EMA beacon profile.
+    /// Regular MBSSID transmits the complete list in its one beacon.
+    pub mbssid_elems: Vec<Vec<u8>>,
+    /// Complete `NL80211_ATTR_EMA_RNR_ELEMS` IEs. In EMA mode element `i`
+    /// accompanies MBSSID element `i`; additional RNR elements accompany
+    /// every generated beacon, as mac80211 does.
+    pub ema_rnr_elems: Vec<Vec<u8>>,
+    /// Initial FILS-discovery configuration. `None` leaves discovery
+    /// disabled when the AP starts.
+    pub fils_discovery: Option<FilsDiscoveryConfig>,
+    /// Initial six-GHz unsolicited broadcast Probe Response configuration.
+    /// When both it and FILS are configured, firmware follows Linux ath11k's
+    /// FILS-first selection.
+    pub unsol_bcast_probe_resp: Option<UnsolBcastProbeRespConfig>,
+    /// Enabled `NL80211_ATTR_FTM_RESPONDER` state, if requested.
+    pub ftm_responder: Option<FtmResponderConfig>,
+    /// `NL80211_ATTR_TWT_RESPONDER` on START_AP. This is a flag rather than
+    /// a nested configuration; the firmware uses its Linux default pdev TWT
+    /// policy block for the responder engine.
+    pub twt_responder: bool,
+    /// Optional `NL80211_ATTR_HE_OBSS_PD` spatial-reuse configuration for an
+    /// HE AP. This is a pdev-wide firmware policy, but cfg80211 supplies it
+    /// with the AP start parameters.
+    pub he_obss_pd: Option<HeObssPdConfig>,
+    /// Optional `NL80211_ATTR_HE_BSS_COLOR` state for an HE AP.
+    pub he_bss_color: Option<HeBssColorConfig>,
+}
+
+/// Request-side `NL80211_ATTR_MBSSID_CONFIG`. `index == 0` is the
+/// transmitting BSSID; higher indices are non-transmitting BSS profiles and
+/// name their transmitting AP by `tx_ifindex`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MbssidConfig {
+    pub index: u8,
+    pub tx_ifindex: Option<u32>,
+    pub ema: bool,
+}
+
+/// Nested `NL80211_ATTR_FILS_DISCOVERY` configuration. Intervals are in
+/// 802.11 TUs. A supplied zero `max_interval_tu` is retained and disables
+/// transmission; `Some(None)` in a discovery update is the distinct explicit
+/// delete-template form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilsDiscoveryConfig {
+    pub min_interval_tu: u32,
+    pub max_interval_tu: u32,
+    /// Complete action-frame template, including management header.
+    pub template: Vec<u8>,
+}
+
+/// Nested `NL80211_ATTR_UNSOL_BCAST_PROBE_RESP` configuration. Applicable to
+/// six-GHz AP operation; a supplied zero interval disables transmission,
+/// while `Some(None)` in an update deletes the template.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnsolBcastProbeRespConfig {
+    pub interval_tu: u32,
+    /// Complete broadcast Probe Response template, including management
+    /// header and fixed fields.
+    pub template: Vec<u8>,
+}
+
+/// Enabled `NL80211_ATTR_FTM_RESPONDER` configuration. LCI and civic-location
+/// payloads are Measurement Report element bodies beginning at their token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FtmResponderConfig {
+    pub lci: Vec<u8>,
+    pub civicloc: Vec<u8>,
+}
+
+/// `NL80211_ATTR_CQM` RSSI configuration. The thresholds are strictly
+/// increasing, non-positive dBm values. A singleton config uses mac80211's
+/// one-threshold path; a longer list uses cfg80211's moving low/high range
+/// around the current RSSI. `hysteresis_db` is unsigned just as cfg80211
+/// stores it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CqmRssiConfig {
+    pub thresholds_dbm: Vec<i32>,
+    pub hysteresis_db: u32,
+}
+
+/// Nested `NL80211_ATTR_HE_OBSS_PD` configuration. The offset fields are in
+/// the Linux UAPI's 1..=20 range when supplied; omitted fields retain the
+/// zero values cfg80211 gives the driver. The two bitmaps are host-native
+/// `u32[2]` words, matching cfg80211's direct copy into
+/// `ieee80211_he_obss_pd` and the ath11k WMI command representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeObssPdConfig {
+    pub min_offset: u8,
+    pub max_offset: u8,
+    pub non_srg_max_offset: u8,
+    pub bss_color_bitmap: [u32; 2],
+    pub partial_bssid_bitmap: [u32; 2],
+    pub sr_ctrl: u8,
+}
+
+/// Nested `NL80211_ATTR_HE_BSS_COLOR`. `color` is in the Linux-required
+/// range 1..=63; `partial` is retained even though ath11k's collision WMI
+/// command needs only the color and enabled state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeBssColorConfig {
+    pub color: u8,
+    pub disabled: bool,
+    pub partial: bool,
+}
+
+/// AP HE BSS-color transition requested with
+/// `NL80211_CMD_COLOR_CHANGE_REQUEST`.
+///
+/// The `*_next` template pieces replace the normal beacon after the final
+/// countdown TBTT; absent pieces preserve the currently configured template.
+/// `beacon_color_tail` is the mandatory temporary countdown beacon tail, and
+/// its single native-endian `u16` offset identifies the countdown byte.  A
+/// temporary beacon head may be omitted only to reuse the active one.  The
+/// optional probe-response offset instead addresses the complete temporary
+/// Probe Response frame, matching nl80211's `CNTDWN_OFFS_PRESP` convention.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ColorChangeConfig {
+    /// `NL80211_ATTR_COLOR_CHANGE_COUNT`.
+    pub count: u8,
+    /// `NL80211_ATTR_COLOR_CHANGE_COLOR` (an HE BSS color, 1..=63).
+    pub color: u8,
+    /// Top-level `NL80211_ATTR_BEACON_HEAD` for the normal post-change AP.
+    pub beacon_next_head: Option<Vec<u8>>,
+    /// Top-level `NL80211_ATTR_BEACON_TAIL` for the normal post-change AP.
+    pub beacon_next_tail: Option<Vec<u8>>,
+    /// Top-level `NL80211_ATTR_PROBE_RESP` for the normal post-change AP.
+    pub probe_resp_next: Option<Vec<u8>>,
+    /// Nested `NL80211_ATTR_BEACON_HEAD` for the countdown template.
+    pub beacon_color_head: Option<Vec<u8>>,
+    /// Nested `NL80211_ATTR_BEACON_TAIL` for the countdown template.
+    pub beacon_color_tail: Vec<u8>,
+    /// The one `NL80211_ATTR_CNTDWN_OFFS_BEACON` offset into
+    /// `beacon_color_tail`.
+    pub counter_offset_beacon: u16,
+    /// Nested `NL80211_ATTR_PROBE_RESP`, if countdown Probe Responses are
+    /// requested.
+    pub probe_resp_color: Option<Vec<u8>>,
+    /// Optional one `NL80211_ATTR_CNTDWN_OFFS_PRESP` offset into
+    /// `probe_resp_color`.
+    pub counter_offset_presp: Option<u16>,
+    /// `NL80211_ATTR_UNSOL_BCAST_PROBE_RESP`, if present. The outer option
+    /// preserves attribute presence; `Some(None)` explicitly disables it.
+    pub unsol_bcast_probe_resp: Option<Option<UnsolBcastProbeRespConfig>>,
+}
+
+/// Access-Point channel-switch request for `NL80211_CMD_CHANNEL_SWITCH`.
+///
+/// `beacon_csa_head` / `beacon_csa_tail` are the temporary beacon while the
+/// countdown is active.  Every `counter_offsets_beacon` element is a native
+/// endian `u16` offset into the CSA *tail*, exactly as
+/// `NL80211_ATTR_CNTDWN_OFFS_BEACON` specifies.  The optional `beacon_after_*`
+/// pieces replace the retained normal beacon after the vdev reaches the new
+/// channel; an absent piece keeps the currently configured one.  The optional
+/// probe-response templates follow the same ownership rule, but their counter
+/// offsets address the complete probe-response frame rather than a beacon
+/// tail, as nl80211 specifies.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ChannelSwitchConfig {
+    /// `NL80211_ATTR_WIPHY_FREQ`.
+    pub frequency_mhz: u32,
+    /// `NL80211_ATTR_CHANNEL_WIDTH`.
+    pub channel_width: u32,
+    /// `NL80211_ATTR_CENTER_FREQ1`.
+    pub center_freq1_mhz: Option<u32>,
+    /// `NL80211_ATTR_CENTER_FREQ2`.
+    pub center_freq2_mhz: Option<u32>,
+    /// `NL80211_ATTR_CH_SWITCH_COUNT` (the on-air u8 TBTT count).
+    pub count: u8,
+    /// `NL80211_ATTR_CH_SWITCH_BLOCK_TX`.
+    pub block_tx: bool,
+    /// Nested `NL80211_ATTR_CSA_IES` beacon head.
+    pub beacon_csa_head: Vec<u8>,
+    /// Nested `NL80211_ATTR_CSA_IES` beacon tail.
+    pub beacon_csa_tail: Vec<u8>,
+    /// `NL80211_ATTR_CNTDWN_OFFS_BEACON`, decoded from native-endian u16s.
+    pub counter_offsets_beacon: Vec<u16>,
+    /// Nested `NL80211_ATTR_PROBE_RESP`, if mac80211 should answer probe
+    /// requests with CSA countdown IEs during the transition.
+    pub probe_resp_csa: Option<Vec<u8>>,
+    /// `NL80211_ATTR_CNTDWN_OFFS_PRESP`, decoded from native-endian u16s.
+    pub counter_offsets_presp: Vec<u16>,
+    /// Optional top-level `NL80211_ATTR_BEACON_HEAD` for the new channel.
+    pub beacon_after_head: Option<Vec<u8>>,
+    /// Optional top-level `NL80211_ATTR_BEACON_TAIL` for the new channel.
+    pub beacon_after_tail: Option<Vec<u8>>,
+    /// Optional top-level `NL80211_ATTR_PROBE_RESP` for the new channel.
+    pub probe_resp_after: Option<Vec<u8>>,
+    /// Enabled `NL80211_ATTR_FTM_RESPONDER` supplied with the post-switch
+    /// beacon. It becomes active only after the target-channel restart.
+    pub ftm_responder: Option<FtmResponderConfig>,
+    /// `NL80211_ATTR_HE_BSS_COLOR` supplied with the post-switch beacon.
+    pub he_bss_color: Option<HeBssColorConfig>,
+    /// Request-side `NL80211_ATTR_UNSOL_BCAST_PROBE_RESP`. The outer option
+    /// preserves whether the channel-switch request included the nested
+    /// attribute; `Some(None)` is its explicit disable/delete form.  mac80211
+    /// applies this state only after the AP vdev reaches the target channel.
+    pub unsol_bcast_probe_resp: Option<Option<UnsolBcastProbeRespConfig>>,
+}
+
+/// `NL80211_ATTR_STA_TX_POWER_SETTING` values accepted for an associated
+/// peer. `Fixed` is represented explicitly because nl80211 accepts its enum
+/// ordinal even though ath11k rejects it: the Linux parser supplies no dBm
+/// value for that form and ath11k consequently returns `-EINVAL`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StationTxPower {
+    /// `NL80211_TX_POWER_AUTOMATIC`: return to the per-interface limit.
+    Automatic,
+    /// `NL80211_TX_POWER_LIMITED`: cap the peer at this integral dBm level.
+    Limited(i16),
+    /// `NL80211_TX_POWER_FIXED`: preserved for the driver's Linux-shaped
+    /// validation path.
+    Fixed,
 }
 
 /// A station-table entry for NL80211_CMD_NEW_STATION / SET_STATION.
+#[derive(Clone, PartialEq, Eq)]
 pub struct StationConfig {
     pub mac: [u8; 6],
     pub aid: u16,
     pub listen_interval: u16,
     pub supported_rates: Vec<u8>,
+    /// WMM is present for this client. `None` keeps the existing value when
+    /// used with SET_STATION.
+    pub wme: Option<bool>,
+    /// `NL80211_STA_WME_UAPSD_QUEUES`: the client's requested delivery /
+    /// trigger AC bitmap. `None` preserves the current request on
+    /// SET_STATION.
+    pub uapsd_queues: Option<u8>,
+    /// `NL80211_STA_WME_MAX_SP`: the U-APSD maximum service-period code
+    /// (0 = unlimited, 1/2/3 = 2/4/6 frames). `None` preserves it on
+    /// SET_STATION.
+    pub uapsd_max_sp: Option<u8>,
+    /// `NL80211_STA_FLAG_MFP` from `NL80211_ATTR_STA_FLAGS2`. `None` keeps
+    /// the current PMF state when used with SET_STATION.
+    pub mfp: Option<bool>,
+    /// `NL80211_ATTR_STA_CAPABILITY`, as supplied by hostapd from the
+    /// association request. `None` preserves the current value on
+    /// SET_STATION.
+    pub capability: Option<u16>,
+    /// `NL80211_ATTR_STA_EXT_CAPABILITY`.
+    pub ext_capability: Option<Vec<u8>>,
+    /// Exact `struct ieee80211_ht_cap` bytes from
+    /// `NL80211_ATTR_HT_CAPABILITY`.
+    pub ht_capability: Option<Vec<u8>>,
+    /// Exact `struct ieee80211_vht_cap` bytes from
+    /// `NL80211_ATTR_VHT_CAPABILITY`.
+    pub vht_capability: Option<Vec<u8>>,
+    /// `struct ieee80211_sta_he_cap` bytes from
+    /// `NL80211_ATTR_HE_CAPABILITY`.
+    pub he_capability: Option<Vec<u8>>,
+    /// `struct ieee80211_he_6ghz_capa` from
+    /// `NL80211_ATTR_HE_6GHZ_CAPABILITY`.
+    pub he_6ghz_capability: Option<u16>,
+    /// `NL80211_STA_FLAG_AUTHORIZED` when `NL80211_ATTR_STA_FLAGS2` (or
+    /// its legacy nested equivalent) explicitly changed it. `None` leaves
+    /// the current authorization state unchanged.
+    pub authorized: Option<bool>,
+    /// Per-peer `NL80211_ATTR_STA_TX_POWER_SETTING`. `None` means that this
+    /// request did not change the peer's existing transmit-power policy.
+    pub station_tx_power: Option<StationTxPower>,
 }
 
 pub mod registry {
@@ -574,6 +1650,30 @@ pub mod registry {
 
     pub fn list() -> Vec<Arc<dyn WirelessNetIface>> {
         REGISTRY.lock().clone()
+    }
+
+    /// One representative per physical radio, in the stable order nl80211
+    /// exposes as `phyN`.  Multiple virtual interfaces with the same
+    /// [`WirelessNetIface::wiphy_id`] must never produce duplicate wiphys.
+    pub fn wiphys() -> Vec<Arc<dyn WirelessNetIface>> {
+        let mut ids = Vec::new();
+        let mut out = Vec::new();
+        for iface in REGISTRY.lock().iter() {
+            let id = iface.wiphy_id();
+            if !ids.contains(&id) {
+                ids.push(id);
+                out.push(iface.clone());
+            }
+        }
+        out
+    }
+
+    /// Current `phyN` index of a physical radio identity.
+    pub fn wiphy_index(id: u64) -> Option<u32> {
+        wiphys()
+            .iter()
+            .position(|iface| iface.wiphy_id() == id)
+            .map(|index| index as u32)
     }
 
     /// Remove the interface named `name` (its netdev went away).
@@ -664,6 +1764,7 @@ mod tests {
             Ok(alloc::vec![BssInfo {
                 bssid: [0x12; 6],
                 ssid: alloc::vec![b'T', b'e', b's', b't'],
+                frequency_mhz: 2412,
                 channel: 1,
                 rssi: -50,
                 security: scan::BssSecurity::Wpa2,
@@ -696,8 +1797,14 @@ mod tests {
             let res = m1
                 .scan(ScanRequest {
                     ssids: Vec::new(),
+                    frequencies_mhz: Vec::new(),
                     channels: Vec::new(),
                     active: true,
+                    random_mac: None,
+                    colocated_6ghz: false,
+                    duration_tu: None,
+                    duration_mandatory: false,
+                    extra_ies: Vec::new(),
                 })
                 .await;
             if res.is_ok() && res.unwrap().len() == 1 {
@@ -727,6 +1834,7 @@ mod tests {
             let req = AssociateRequest {
                 bssid: [0x12; 6],
                 ssid: alloc::vec![b'T', b'e', b's', b't'],
+                frequency_mhz: 2412,
                 channel: 1,
                 security: SecurityConfig::Open,
                 ie: Vec::new(),

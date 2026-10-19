@@ -172,6 +172,10 @@ pub trait CoherentMem {
     fn size(&self) -> usize;
     /// `memcpy(vaddr + off, data, len)`.
     fn write(&mut self, off: usize, data: &[u8]);
+    /// CPU view of the coherent allocation. Crash collection uses this only
+    /// after firmware has entered RDDM and before the reset can recycle the
+    /// target-memory buffer.
+    fn bytes(&self) -> &[u8];
 }
 
 /// `dma_alloc_coherent` on the device (coherent mask 32 bits).
@@ -1191,6 +1195,9 @@ impl CoherentMem for narf_io::DmaBuffer {
     }
     fn write(&mut self, off: usize, data: &[u8]) {
         self.as_mut_slice()[off..off + data.len()].copy_from_slice(data);
+    }
+    fn bytes(&self) -> &[u8] {
+        self.as_slice()
     }
 }
 

@@ -22,11 +22,9 @@
 //! first fragment's link descriptor. It comes back on a REO destination
 //! ring as a raw MPDU ([`super::dp_ring`] undecaps it).
 //!
-//! Deliberate deviations: the reinjected buffer's id is allocated from 1
+//! Deliberate deviation: the reinjected buffer's id is allocated from 1
 //! like every refill buffer (Linux `idr_alloc(.., 0, ..)` hands out id 0,
-//! which `ath11k_dp_process_rx` then skips as invalid, losing the frame);
-//! TKIP fragments are dropped after reassembly (no Michael MIC check,
-//! `ath11k_dp_rx_h_verify_tkip_mic`; NARF negotiates CCMP only).
+//! which `ath11k_dp_process_rx` then skips as invalid, losing the frame).
 
 extern crate alloc;
 
@@ -35,12 +33,15 @@ use alloc::vec::Vec;
 use super::dp::*;
 use super::dp_peer::IEEE80211_NUM_TIDS;
 use super::dp_ring::{
-    buf_addr_get, buf_addr_words, enc, ieee80211_hdrlen, Dp, RxBuf, DP_RXDMA_BUF_COOKIE_BUF_ID,
-    DP_RXDMA_BUF_COOKIE_PDEV_ID, HAL_WBM_REL_BM_ACT_PUT_IN_IDLE, RX_DESC_DECRYPT_STATUS_CODE_OK,
+    buf_addr_get, buf_addr_words, enc, ieee80211_da_sa, ieee80211_hdrlen, Dp, RxBuf,
+    DP_RXDMA_BUF_COOKIE_BUF_ID, DP_RXDMA_BUF_COOKIE_PDEV_ID, HAL_WBM_REL_BM_ACT_PUT_IN_IDLE,
+    IEEE80211_FCTL_ORDER, IEEE80211_QOS_CTL_LEN, IEEE80211_QOS_CTL_TID_MASK,
+    IEEE80211_STYPE_QOS_DATA, RX_DESC_DECRYPT_STATUS_CODE_OK,
 };
 use super::hal::{field_get, field_prep, genmask, DmaMem, Hal};
 use super::hw::rbm;
 use super::power::ChipIo;
+use narf_crypto::michael_mic::michael_mic;
 
 /// `ATH11K_DP_RX_FRAGMENT_TIMEOUT_MS` — `2 * HZ` jiffies, i.e. 2 s.
 pub const ATH11K_DP_RX_FRAGMENT_TIMEOUT_MS: u64 = 2000;
@@ -50,6 +51,10 @@ pub const IEEE80211_SCTL_FRAG: u16 = 0x000f;
 pub const IEEE80211_FCTL_MOREFRAGS: u16 = 0x0400;
 /// `FCS_LEN`.
 pub const FCS_LEN: usize = 4;
+/// `IEEE80211_CCMP_MIC_LEN`, reused as `MICHAEL_MIC_LEN` by TKIP.
+pub const TKIP_MIC_LEN: usize = narf_crypto::michael_mic::MIC_LEN;
+/// `IEEE80211_TKIP_ICV_LEN`.
+pub const TKIP_ICV_LEN: usize = 4;
 
 pub const EINVAL: i32 = 22;
 pub const ENOENT: i32 = 2;
@@ -84,7 +89,7 @@ pub fn crypto_param_len(enctype: u32) -> usize {
 /// `ath11k_dp_rx_crypto_icv_len`.
 pub fn crypto_icv_len(enctype: u32) -> usize {
     match enctype {
-        enc::TKIP_NO_MIC | enc::TKIP_MIC => 4,
+        enc::TKIP_NO_MIC | enc::TKIP_MIC => TKIP_ICV_LEN,
         _ => 0,
     }
 }
@@ -134,6 +139,50 @@ fn get_pn(msdu: &[u8], desc_sz: usize) -> Option<u64> {
             | (e[6] as u64) << 32
             | (e[7] as u64) << 40,
     )
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&l, &r) in left.iter().zip(right) {
+        diff |= l ^ r;
+    }
+    diff == 0
+}
+
+/// Verify the retained Michael MIC in a decrypted raw TKIP MPDU.
+///
+/// `frame` starts at the 802.11 header and retains the firmware layout
+/// `header || TKIP IV || data || Michael || ICV || FCS`. The returned offset
+/// names the eight-byte Michael MIC, which the caller removes after a
+/// successful check. This is also used for ordinary (non-fragmented) raw
+/// MPDUs because NARF has no mac80211 layer after ath11k DP.
+pub fn verify_tkip_mic_frame(frame: &[u8], key: &[u8; 8]) -> Option<usize> {
+    if frame.len() < 24 {
+        return None;
+    }
+    let fc = fc_at(frame, 0);
+    let hdr_len = ieee80211_hdrlen(fc);
+    let head_len = hdr_len.checked_add(crypto_param_len(enc::TKIP_MIC))?;
+    let tail_len = TKIP_MIC_LEN
+        .checked_add(TKIP_ICV_LEN)?
+        .checked_add(FCS_LEN)?;
+    let mic_start = frame.len().checked_sub(tail_len)?;
+    if mic_start < head_len || frame.len() < hdr_len {
+        return None;
+    }
+    let (da, sa) = ieee80211_da_sa(frame)?;
+    let tid = if fc & IEEE80211_STYPE_QOS_DATA != 0 {
+        let ht_control_len = if fc & IEEE80211_FCTL_ORDER != 0 { 4 } else { 0 };
+        let qos = hdr_len.checked_sub(IEEE80211_QOS_CTL_LEN + ht_control_len)?;
+        *frame.get(qos)? & IEEE80211_QOS_CTL_TID_MASK as u8
+    } else {
+        0
+    };
+    let expected = michael_mic(key, &da, &sa, tid, &frame[head_len..mic_start]);
+    constant_time_eq(&expected, &frame[mic_start..mic_start + TKIP_MIC_LEN]).then_some(mic_start)
 }
 
 impl Dp {
@@ -388,6 +437,23 @@ impl Dp {
         true
     }
 
+    /// Linux `ath11k_dp_rx_h_verify_tkip_mic`.  The first fragment retains
+    /// its descriptor, 802.11 header and TKIP IV; `_undecap_frag` removes
+    /// those fields only from later fragments.  After joining, this is the
+    /// exact `header || IV || data || Michael || ICV || FCS` layout Linux
+    /// verifies before it reinjects the MPDU.
+    ///
+    /// Returns the Michael-MIC offset when the host-held receive direction
+    /// verifies.  The caller removes the MIC before the reinjected packet
+    /// reaches raw undecapsulation, mirroring mac80211's MMIC-stripped path.
+    fn verify_tkip_mic(&self, pi: usize, msdu: &[u8]) -> Option<usize> {
+        let desc_sz = self.cfg.hal_desc_sz;
+        let frame = msdu.get(desc_sz..)?;
+        let key_holder = self.peer_rx.peers.get(pi)?.tkip_rx_mic?;
+        let key = key_holder.bytes();
+        verify_tkip_mic_frame(frame, key).map(|mic_start| desc_sz + mic_start)
+    }
+
     /// Linux `ath11k_dp_rx_h_defrag` (+ `ath11k_dp_rx_h_undecap_frag`):
     /// the reassembled MPDU behind the first fragment's descriptor, or
     /// `None` when it cannot be delivered.
@@ -442,9 +508,12 @@ impl Dp {
         }
         let fc = fc_at(&first, desc_sz) & !IEEE80211_FCTL_MOREFRAGS;
         first[desc_sz..desc_sz + 2].copy_from_slice(&fc.to_le_bytes());
-        // ath11k_dp_rx_h_verify_tkip_mic: NARF has no Michael MIC.
+        // Linux has firmware decrypt the fragments but verifies their one
+        // software Michael MIC before reinjection.  It belongs before the
+        // final ICV/FCS, so leave those two fields for raw undecapsulation.
         if first_enc == enc::TKIP_MIC {
-            return None;
+            let mic_start = self.verify_tkip_mic(pi, &first)?;
+            first.drain(mic_start..mic_start + TKIP_MIC_LEN);
         }
         Some(first)
     }

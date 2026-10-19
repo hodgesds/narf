@@ -145,6 +145,22 @@ pub fn build_bip_aad(hdr: &[u8]) -> Result<[u8; 20], BipError> {
     Ok(aad)
 }
 
+/// Construct the BIP authenticated bytes, including the Beacon timestamp
+/// masking required by IEEE 802.11 §12.5.4.  `body` includes a trailing MMIE
+/// when one is present; callers zero its MIC before invoking their MAC.
+pub fn authenticated_bytes(aad: &[u8; 20], body: &[u8]) -> Vec<u8> {
+    let mut authenticated = Vec::with_capacity(aad.len() + body.len());
+    authenticated.extend_from_slice(aad);
+    authenticated.extend_from_slice(body);
+    // Beacon timestamps are generated at transmit time and therefore cannot
+    // participate in the BIP MIC. `aad` holds the masked little-endian FC.
+    let fc = u16::from_le_bytes([aad[0], aad[1]]);
+    if fc & 0x00fc == 0x0080 && body.len() >= 8 {
+        authenticated[20..28].fill(0);
+    }
+    authenticated
+}
+
 /// Encode IPN as 6 little-endian bytes (the wire order in MMIE).
 pub fn encode_ipn(ipn: u64) -> [u8; BIP_IPN_LEN] {
     let mut out = [0u8; BIP_IPN_LEN];
@@ -195,9 +211,7 @@ pub fn parse_mmie_body(buf: &[u8]) -> Result<(u16, u64, [u8; BIP_MIC_LEN]), BipE
 /// computation). Callers that need to MIC an outbound frame should
 /// pass a body buffer where the MIC bytes inside the MMIE are zeros.
 pub fn compute_mic(igtk: &Igtk, aad: &[u8; 20], body: &[u8]) -> [u8; BIP_MIC_LEN] {
-    let mut buf = Vec::with_capacity(aad.len() + body.len());
-    buf.extend_from_slice(aad);
-    buf.extend_from_slice(body);
+    let buf = authenticated_bytes(aad, body);
     // MIC = L(AES-128-CMAC(AAD || Frame Body), 0, 64) — hostap
     // `bip_protect`, mac80211 `bip_aad` + `ieee80211_aes_cmac`.
     let full = cmac_aes128::cmac_aes128(&igtk.key, &buf);

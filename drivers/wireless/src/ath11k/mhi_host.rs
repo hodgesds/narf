@@ -46,14 +46,14 @@
 //! `ath11k_mhi_op_status_cb` policy ([`MhiController::take_reset_request`])
 //! turns a crash into a request for `ath11k_core_reset`.
 //!
-//! Deliberately not ported (station bring-up does not need them):
-//! the RDDM ramdump (`rddm_image`, `mhi_rddm_prepare`,
-//! `mhi_download_rddm_image`; the RDDM *event* is handled as Linux does
-//! with an image allocated), SYS_ERR *recovery* by the MHI core
-//! (`mhi_pm_sys_error_transition`: during bring-up a SYS_ERR is reported
-//! and ends bring-up; after it, the SYS_ERR is handed to ath11k's reset
-//! instead, see [`MhiController::take_reset_request`]), suspend / resume
-//! (M3 entry), bandwidth scaling (BW_REQ is logged), RSC / coalesced
+//! The controller allocates and programs ath11k's 4.125 MiB RDDM image on
+//! every power-up.  A mission-mode crash first reaches RDDM; the runtime
+//! copies that host-DMA image before invoking ath11k's normal radio reset.
+//! The generic no-RDDM MHI-core SYS_ERR recovery
+//! (`mhi_pm_sys_error_transition`) remains outside this driver: WCN6855
+//! always supplies RDDM and Linux takes the ath11k reset path for it.
+//!
+//! Deliberately not ported: bandwidth scaling (BW_REQ is logged), RSC / coalesced
 //! channels, bounce buffers, offload and client-managed event rings, EDL
 //! images, `mhi_soc_reset`.
 //!
@@ -141,6 +141,14 @@ pub mod step {
     pub const BAD_CONFIG: u32 = 34;
     /// Device registers not accessible in the PM state (detail = pm).
     pub const REG_ACCESS: u32 = 35;
+    /// `mhi_pm_suspend` did not observe M3 before the controller timeout.
+    pub const M3_TIMEOUT: u32 = 36;
+    /// `mhi_pm_resume_force` did not observe M0/M2 before timeout.
+    pub const M0_RESUME_TIMEOUT: u32 = 37;
+    /// `mhi_download_rddm_image` observed a terminal BHIe RX error.
+    pub const RDDM_ERROR: u32 = 38;
+    /// `mhi_download_rddm_image` did not observe BHIe RX completion.
+    pub const RDDM_TIMEOUT: u32 = 39;
 }
 
 /// A bring-up failure, with the diag step + detail it latches.
@@ -158,6 +166,7 @@ pub mod errno {
     pub const EIO: i32 = 5;
     pub const EAGAIN: i32 = 11;
     pub const ENOMEM: i32 = 12;
+    pub const EBUSY: i32 = 16;
     pub const ENODEV: i32 = 19;
     pub const EINVAL: i32 = 22;
     pub const ERANGE: i32 = 34;
@@ -304,6 +313,27 @@ pub struct MhiStats {
     pub m0_entries: u32,
     pub ul_completed: u32,
     pub dl_completed: u32,
+    /// RDDM images copied out of the device-owned DMA buffers.
+    pub rddm_captures: u32,
+    /// Bytes retained in the most recent RDDM image.
+    pub rddm_bytes: u32,
+    /// RDDM transfers that did not reach BHIe RX completion before reset.
+    pub rddm_failures: u32,
+}
+
+/// The most recent firmware crash image collected through BHIe RX.
+///
+/// The raw payload remains in ordinary host memory after the radio reset,
+/// rather than in DMA memory that the next firmware boot will reuse.  A
+/// diagnostic consumer may obtain it from
+/// [`MhiController::rddm_snapshot`].
+#[derive(Debug)]
+pub struct RddmSnapshot {
+    /// Controller monotonic time when BHIe reported transfer completion.
+    pub captured_at_ms: u64,
+    /// The concatenated 512 KiB RDDM segments, exactly
+    /// `ATH11K_RDDM_DUMP_SIZE` bytes for ath11k PCI parts.
+    pub bytes: Vec<u8>,
 }
 
 /// Linux's poll interval for `mhi_poll_reg_field` callers (25 ms), also
@@ -563,6 +593,13 @@ pub struct MhiController<B: MhiBus> {
     transitions: VecDeque<DevStTransition>,
     fw_image: Option<Vec<u8>>,
     fbc_image: Option<Vec<Dma>>,
+    /// `mhi_cntrl->rddm_image`: device-written segments followed by their
+    /// BHIe vector table. It survives ordinary power cycles and is
+    /// re-programmed before every firmware boot.
+    rddm_image: Option<Vec<Dma>>,
+    /// A CPU-owned copy of the latest completed RDDM image. Unlike
+    /// `rddm_image`, this remains valid after the next firmware start.
+    rddm_snapshot: Option<RddmSnapshot>,
     /// First failure (Linux logs and leaves the PM state; we keep the
     /// reason so the panel can show it).
     pub failure: Option<MhiError>,
@@ -744,6 +781,8 @@ impl<B: MhiBus> MhiController<B> {
             transitions: VecDeque::new(),
             fw_image: None,
             fbc_image: None,
+            rddm_image: None,
+            rddm_snapshot: None,
             failure: None,
             stats: MhiStats::default(),
             rx: VecDeque::new(),
@@ -775,15 +814,11 @@ impl<B: MhiBus> MhiController<B> {
     }
 
     /// `mhi_cntrl->status_cb(mhi_cntrl, cb)` = ath11k's
-    /// `ath11k_mhi_op_status_cb`: SYS_ERROR and EE_RDDM are firmware
-    /// crashes; EE_RDDM queues `reset_work` unless the previous reason
-    /// was EE_RDDM too ("do not queue again for consecutive RDDM event").
-    ///
-    /// NARF deviation (no RDDM image, no MHI-core SYS_ERR recovery): a
-    /// SYS_ERROR queues the reset as well — with Linux's RDDM image the
-    /// device's RDDM entry that follows would — once per run of
-    /// consecutive SYS_ERRORs (the intvec handler sees every MSI while
-    /// the device sits in SYS_ERR).
+    /// `ath11k_mhi_op_status_cb`: EE_RDDM is the crash notification for
+    /// ath11k's RDDM-capable PCI controller and queues `reset_work` unless
+    /// the previous reason was EE_RDDM too ("do not queue again for
+    /// consecutive RDDM event"). SYS_ERROR is retained for the generic
+    /// no-RDDM controller fallback.
     fn status_cb(&mut self, cb: MhiNotify) {
         self.bus.notify(cb);
         match cb {
@@ -1002,8 +1037,10 @@ impl<B: MhiBus> MhiController<B> {
 
     // ── mhi_prepare_for_power_up ─────────────────────────────────
 
-    /// `mhi_prepare_for_power_up` (RDDM table omitted; the BHIe RX
-    /// registers are still cleared because `rddm_size` is set).
+    /// `mhi_prepare_for_power_up`: context/ring setup plus ath11k's RDDM
+    /// BHIe RX vector table. The data buffers remain allocated across a
+    /// later reset, but this register programming must be repeated after
+    /// every PCI/MHI power cycle.
     pub fn prepare_for_power_up(&mut self) -> Result<(), MhiError> {
         if let Err(e) = self.init_dev_ctxt() {
             self.deinit_dev_ctxt();
@@ -1049,6 +1086,7 @@ impl<B: MhiBus> MhiController<B> {
             self.write_reg(self.bhie, off, 0);
             off += 4;
         }
+        self.prepare_rddm()?;
         Ok(())
     }
 
@@ -1060,6 +1098,140 @@ impl<B: MhiBus> MhiController<B> {
         self.chan_ctxt = None;
         self.er_ctxt = None;
         self.cmd_ctxt = None;
+    }
+
+    /// `mhi_alloc_bhie_table(..., rddm_size)`: device-written data buffers
+    /// followed by the BHIe vector table which describes them.
+    fn build_rddm_table(&self) -> Result<Vec<Dma>, MhiError> {
+        let seg_len = self.params.seg_len;
+        if seg_len == 0 {
+            return Err(MhiError::new(
+                step::BAD_CONFIG,
+                ATH11K_RDDM_DUMP_SIZE,
+                errno::EINVAL,
+            ));
+        }
+        let data_segments = (ATH11K_RDDM_DUMP_SIZE as usize).div_ceil(seg_len);
+        let mut table = Vec::with_capacity(data_segments + 1);
+        let mut remaining = ATH11K_RDDM_DUMP_SIZE as usize;
+        for _ in 0..data_segments {
+            let len = remaining.min(seg_len);
+            table.push(Dma::alloc(len, self.mask())?);
+            remaining -= len;
+        }
+        let vector_len = data_segments * core::mem::size_of::<BhiVecEntry>();
+        table.push(Dma::alloc(vector_len, self.mask())?);
+        let vector = table.last().expect("RDDM vector follows data segments");
+        for (index, segment) in table[..data_segments].iter().enumerate() {
+            vector.wr64(index * 16, segment.dma());
+            vector.wr64(index * 16 + 8, segment.len() as u64);
+        }
+        Ok(table)
+    }
+
+    /// `mhi_rddm_prepare`: publish the RDDM vector table through BHIe RX.
+    fn prepare_rddm(&mut self) -> Result<(), MhiError> {
+        if self.rddm_image.is_none() {
+            self.rddm_image = Some(self.build_rddm_table()?);
+        }
+        let (vector_addr, vector_len, data_segments) = {
+            let table = self
+                .rddm_image
+                .as_ref()
+                .expect("RDDM table was just allocated");
+            let vector = table.last().expect("RDDM vector follows data segments");
+            (vector.dma(), vector.len(), table.len() - 1)
+        };
+        let sequence_id = self.bus.random_nonzero(BHIE_TXVECSTATUS_SEQNUM_BMSK);
+        self.write_reg(
+            self.bhie,
+            BHIE_RXVECADDR_HIGH_OFFS,
+            (vector_addr >> 32) as u32,
+        );
+        self.write_reg(self.bhie, BHIE_RXVECADDR_LOW_OFFS, vector_addr as u32);
+        self.write_reg(self.bhie, BHIE_RXVECSIZE_OFFS, vector_len as u32);
+        self.write_reg_field(
+            self.bhie,
+            BHIE_RXVECDB_OFFS,
+            BHIE_TXVECDB_SEQNUM_BMSK,
+            sequence_id,
+        );
+        mlog!(
+            self,
+            "mhi: RDDM {} bytes in {} segments, sequence ID {}",
+            ATH11K_RDDM_DUMP_SIZE,
+            data_segments,
+            sequence_id
+        );
+        Ok(())
+    }
+
+    /// `mhi_download_rddm_image`: wait for BHIe RX completion, then retain
+    /// a CPU-owned copy before the ensuing radio reset reuses the DMA memory.
+    pub async fn collect_rddm(&mut self) -> Result<(), MhiError> {
+        if self.ee != MhiEe::RDDM || self.rddm_image.is_none() {
+            return Ok(());
+        }
+        let base = self.bhie;
+        let mut rx_status = BHIE_RXVECSTATUS_STATUS_RESET;
+        let timeout = self.params.timeout_ms;
+        let done = self
+            .wait_event(timeout, |s| {
+                rx_status =
+                    s.read_reg_field(base, BHIE_RXVECSTATUS_OFFS, BHIE_RXVECSTATUS_STATUS_BMSK);
+                rx_status != BHIE_RXVECSTATUS_STATUS_RESET
+            })
+            .await;
+        let raw = self.read_reg(base, BHIE_RXVECSTATUS_OFFS);
+        if !done {
+            self.stats.rddm_failures = self.stats.rddm_failures.saturating_add(1);
+            return Err(MhiError::new(step::RDDM_TIMEOUT, raw, errno::ETIMEDOUT));
+        }
+        if rx_status != BHIE_RXVECSTATUS_STATUS_XFER_COMPL {
+            self.stats.rddm_failures = self.stats.rddm_failures.saturating_add(1);
+            return Err(MhiError::new(step::RDDM_ERROR, raw, errno::EIO));
+        }
+        let table = self
+            .rddm_image
+            .as_ref()
+            .expect("RDDM table was checked above");
+        let data_segments = table.len() - 1;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(ATH11K_RDDM_DUMP_SIZE as usize)
+            .map_err(|_| {
+                MhiError::new(step::NO_DMA_MEMORY, ATH11K_RDDM_DUMP_SIZE, errno::ENOMEM)
+            })?;
+        for segment in &table[..data_segments] {
+            bytes.extend_from_slice(segment.bytes());
+        }
+        self.stats.rddm_captures = self.stats.rddm_captures.saturating_add(1);
+        self.stats.rddm_bytes = bytes.len().min(u32::MAX as usize) as u32;
+        self.rddm_snapshot = Some(RddmSnapshot {
+            captured_at_ms: self.bus.now_ms(),
+            bytes,
+        });
+        mlog!(
+            self,
+            "mhi: captured {}-byte RDDM image",
+            ATH11K_RDDM_DUMP_SIZE
+        );
+        Ok(())
+    }
+
+    /// The latest completed RDDM payload, retained until this controller is
+    /// destroyed. This borrow avoids copying a multi-MiB crash dump merely to
+    /// inspect it.
+    pub fn rddm_snapshot(&self) -> Option<&RddmSnapshot> {
+        self.rddm_snapshot.as_ref()
+    }
+
+    /// Transfer the completed RDDM payload to ath11k's device-coredump
+    /// publication path.  Ownership moves rather than copying another
+    /// multi-MiB image; that publication retains it until a diagnostic
+    /// consumer takes the dump.
+    pub fn take_rddm_snapshot(&mut self) -> Option<RddmSnapshot> {
+        self.rddm_snapshot.take()
     }
 
     // ── mhi_init_mmio ────────────────────────────────────────────
@@ -1281,6 +1453,18 @@ impl<B: MhiBus> MhiController<B> {
         }
         let state = self.get_mhi_state();
         let ee = self.get_exec_env();
+        // A first SYS_ERR interrupt can race the firmware's EE transition
+        // to RDDM. Once the PM state is SYS_ERR_DETECT, Linux's generic
+        // transition table will not re-enter that state; recognise the
+        // subsequent RDDM interrupt directly so it still owns the single
+        // ath11k dump-and-reset request.
+        if state == MhiState::SYS_ERR && ee == MhiEe::RDDM && self.rddm_image.is_some() {
+            if self.is_active() {
+                self.status_cb(MhiNotify::EeRddm);
+                self.ee = ee;
+            }
+            return;
+        }
         let mut pm_state = 0;
         if state == MhiState::SYS_ERR {
             mlog!(self, "mhi: system error detected (EE {})", ee.name());
@@ -1311,6 +1495,14 @@ impl<B: MhiBus> MhiController<B> {
     /// `DEV_ST_TRANSITION_SYS_ERR` (recovery); bring-up instead stops
     /// here and reports.
     fn sys_err_handler(&mut self, ee: MhiEe) {
+        if self.rddm_image.is_some() {
+            // This is Linux's `mhi_pm_sys_err_handler` fast path for an
+            // RDDM-capable controller: do not reset the radio on the first
+            // SYS_ERR MSI. Firmware enters RDDM shortly afterwards and the
+            // EE_RDDM notification owns the one dump-and-reset sequence.
+            mlog!(self, "mhi: SYS_ERR waiting for RDDM (EE {})", ee.name());
+            return;
+        }
         self.status_cb(MhiNotify::SysError);
         let st = self.read_reg(0, MHISTATUS);
         mlog!(
@@ -2215,7 +2407,11 @@ impl<B: MhiBus> MhiController<B> {
                     self.fail(e);
                 }
             }
-            // Recovery / shutdown are not ported (see the module doc).
+            // The generic MHI-core SYS_ERR worker and the asynchronous
+            // DISABLE work item are not used for WCN6855: a RDDM/SYS_ERR
+            // notification is handed to ath11k recovery, which invokes the
+            // complete `power_cycle` path below.  Explicit shutdown calls
+            // `power_down` directly.
             DevStTransition::SysErr | DevStTransition::Disable => {}
         }
     }
@@ -2430,8 +2626,10 @@ impl<B: MhiBus> MhiController<B> {
             .position(|c| c.configured && c.name == name && c.dir == DmaDir::FromDevice);
         for ci in [ul, dl].into_iter().flatten() {
             if let Err(e) = self.prepare_channel(ci).await {
-                // error_open_chan: unprepare what was started (channel
-                // RESET is not ported; drop host state).
+                // error_open_chan: unprepare what was started. The generic
+                // per-channel RESET command is unnecessary here because
+                // WCN6855 recovery tears down the controller through
+                // `power_down` / `power_cycle`.
                 if ci != ul.unwrap_or(usize::MAX) {
                     if let Some(u) = ul {
                         self.chans[u].ch_state = ch_state::DISABLED;
@@ -2630,6 +2828,123 @@ impl<B: MhiBus> MhiController<B> {
 
     // ── power down / power cycle (pm.c, init.c) ──────────────────
 
+    /// `mhi_pm_suspend`, called by ath11k's `ath11k_mhi_suspend` after
+    /// WoW has received its HTC suspend ACK and CE/DP interrupts are inert.
+    /// MHI's own MSI vectors remain live while the controller moves from
+    /// M0/M1 to M3, so every wait services the control event ring exactly as
+    /// Linux's `wait_event_timeout(state_event, ...)` does.
+    ///
+    /// The configured WCN6855 IPCR channels do not opt into
+    /// `MHI_CB_LPM_ENTER`, so there is no client callback fan-out here.
+    pub async fn system_suspend(&mut self) -> Result<(), MhiError> {
+        if self.pm_state == pm::DISABLE {
+            return Err(MhiError::new(
+                step::PM_TRANSITION,
+                pm::DISABLE,
+                errno::EINVAL,
+            ));
+        }
+        if pm::in_error_state(self.pm_state) {
+            return Err(MhiError::new(
+                step::PM_TRANSITION,
+                self.pm_state,
+                errno::EIO,
+            ));
+        }
+        if self.dev_wake != 0 || self.pending_pkts != 0 {
+            return Err(MhiError::new(
+                step::PM_TRANSITION,
+                ((self.dev_wake << 16) | self.pending_pkts) as u32,
+                errno::EBUSY,
+            ));
+        }
+
+        // Linux takes a temporary wake vote to ensure M2 has unwound before
+        // it permits M3.  The matching put happens before it checks for new
+        // work, reproducing `mhi_pm_suspend`'s ordering.
+        self.wake_get(false);
+        let timeout = self.params.timeout_ms;
+        let awake = self
+            .wait_event(timeout, |s| {
+                matches!(s.dev_state, MhiState::M0 | MhiState::M1) || pm::in_error_state(s.pm_state)
+            })
+            .await;
+        self.wake_put(false);
+        if !awake || pm::in_error_state(self.pm_state) {
+            return Err(MhiError::new(step::M0_TIMEOUT, self.pm_state, errno::EIO));
+        }
+        if self.dev_wake != 0 || self.pending_pkts != 0 {
+            return Err(MhiError::new(
+                step::PM_TRANSITION,
+                ((self.dev_wake << 16) | self.pending_pkts) as u32,
+                errno::EBUSY,
+            ));
+        }
+
+        let from = self.pm_state;
+        if self.tryset_pm_state(pm::M3_ENTER) != pm::M3_ENTER {
+            return Err(MhiError::new(
+                step::PM_TRANSITION,
+                (from << 16) | pm::M3_ENTER,
+                errno::EIO,
+            ));
+        }
+        self.set_mhi_state(MhiState::M3);
+        let asleep = self
+            .wait_event(timeout, |s| {
+                s.dev_state == MhiState::M3 || pm::in_error_state(s.pm_state)
+            })
+            .await;
+        if !asleep || pm::in_error_state(self.pm_state) {
+            return Err(MhiError::new(step::M3_TIMEOUT, self.pm_state, errno::EIO));
+        }
+        Ok(())
+    }
+
+    /// `mhi_pm_resume_force`, used by ath11k on WCN6855/QCA6390.  Firmware
+    /// can be functional without reporting M3, so the state observation is
+    /// intentionally advisory; the PM state-machine transition is still
+    /// mandatory before sending the M0 request.
+    ///
+    /// As with [`Self::system_suspend`], WCN6855's IPCR channels have no
+    /// low-power notification callback, leaving the MHI state transition as
+    /// the complete host-side operation.
+    pub async fn system_resume_force(&mut self) -> Result<(), MhiError> {
+        if self.pm_state == pm::DISABLE {
+            return Ok(());
+        }
+        if pm::in_error_state(self.pm_state) {
+            return Err(MhiError::new(
+                step::PM_TRANSITION,
+                self.pm_state,
+                errno::EIO,
+            ));
+        }
+        let timeout = self.params.timeout_ms;
+        let from = self.pm_state;
+        if self.tryset_pm_state(pm::M3_EXIT) != pm::M3_EXIT {
+            return Err(MhiError::new(
+                step::PM_TRANSITION,
+                (from << 16) | pm::M3_EXIT,
+                errno::EIO,
+            ));
+        }
+        self.set_mhi_state(MhiState::M0);
+        let awake = self
+            .wait_event(timeout, |s| {
+                matches!(s.dev_state, MhiState::M0 | MhiState::M2) || pm::in_error_state(s.pm_state)
+            })
+            .await;
+        if !awake || pm::in_error_state(self.pm_state) {
+            return Err(MhiError::new(
+                step::M0_RESUME_TIMEOUT,
+                self.pm_state,
+                errno::EIO,
+            ));
+        }
+        Ok(())
+    }
+
     /// `mhi_power_down(mhi_cntrl, true)` (`__mhi_power_down` + the
     /// DISABLE_DESTROY_DEVICE transition, `mhi_pm_disable_transition`)
     /// followed by `mhi_unprepare_after_power_down` — ath11k's
@@ -2656,6 +2971,24 @@ impl<B: MhiBus> MhiController<B> {
         self.unprepare_after_power_down();
     }
 
+    /// The power-off half of `ath11k_hif_power_down(ab, true)` used by
+    /// ordinary system suspend. Linux calls
+    /// `mhi_power_down_keep_dev(..., true)` here, then
+    /// `mhi_unprepare_after_power_down()`: its MHI client device survives
+    /// because the resume path recreates the same IPCR endpoint. NARF has no
+    /// separately registered MHI child device, so [`Self::power_down`] has
+    /// the same observable channel and endpoint result before the PCI reset.
+    ///
+    /// The matching power-up and firmware/core rebuild run through
+    /// `ath11k_core_resume_early` / `restart_work` semantics in
+    /// `Shared::resume_after_system_suspend`, after the platform returns
+    /// from sleep.
+    pub async fn power_down_for_system_suspend(&mut self) {
+        self.bus.hif_power(HifPower::Down);
+        self.power_down().await;
+        self.bus.hif_power(HifPower::Reset);
+    }
+
     /// `mhi_pm_disable_transition(mhi_cntrl, destroy_device = true)`.
     async fn disable_transition(&mut self) {
         mlog!(
@@ -2664,7 +2997,8 @@ impl<B: MhiBus> MhiController<B> {
             pm::name(self.pm_state)
         );
         // "Trigger MHI RESET so that the device will not access host
-        // memory" (never skipped: NARF has no RDDM image).
+        // memory". The RDDM image was collected by ath11k before this
+        // recovery/power-down path reaches MHI RESET.
         if !pm::in_fatal_state(self.pm_state) {
             self.set_mhi_state(MhiState::RESET);
             let t = self.params.timeout_ms;
@@ -2734,10 +3068,12 @@ impl<B: MhiBus> MhiController<B> {
         }
     }
 
-    /// `mhi_unprepare_after_power_down`: the BHIe table goes, the context
-    /// arrays and rings are freed. NARF also forgets the controller's
-    /// per-boot state (wake vote, latched failure, queued transitions, a
-    /// pending reset request) so the next power-up starts clean.
+    /// `mhi_unprepare_after_power_down`: the firmware-download BHIe table
+    /// goes and the context arrays/rings are freed. The RDDM receive table
+    /// and its completed CPU snapshot intentionally survive: the next boot
+    /// re-programs the table, while diagnostics retain the previous crash.
+    /// Per-boot state (wake vote, latched failure, queued transitions, a
+    /// pending reset request) starts clean.
     fn unprepare_after_power_down(&mut self) {
         self.fbc_image = None;
         self.bhi = 0;
@@ -2822,5 +3158,19 @@ impl<B: MhiBus> MhiController<B> {
                 t.len() - 1,
             )
         })
+    }
+
+    /// Copy the FBC BHIe data segments exactly as Linux puts them in the
+    /// `FW_CRASH_DUMP_PAGING_DATA` TLV. The final table entry is metadata,
+    /// not firmware data, and is intentionally omitted.
+    pub fn firmware_paging_snapshot(&self) -> Vec<u8> {
+        let Some(table) = self.fbc_image.as_ref() else {
+            return Vec::new();
+        };
+        let mut bytes = Vec::new();
+        for segment in &table[..table.len().saturating_sub(1)] {
+            bytes.extend_from_slice(segment.bytes());
+        }
+        bytes
     }
 }

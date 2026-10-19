@@ -443,6 +443,9 @@ impl CoherentMem for FakeMem {
     fn write(&mut self, off: usize, data: &[u8]) {
         self.data[off..off + data.len()].copy_from_slice(data);
     }
+    fn bytes(&self) -> &[u8] {
+        &self.data
+    }
 }
 
 /// Buddy-like: power-of-two pages, aligned to their size, below 4 GiB.

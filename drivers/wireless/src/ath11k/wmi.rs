@@ -54,6 +54,10 @@ pub const WMI_PDEV_ID_SOC: u32 = 0;
 pub const WMI_HOST_MAX_PDEV: usize = 3;
 /// `MAX_RADIOS` (core.h).
 pub const MAX_RADIOS: usize = 3;
+/// `WMI_BSS_COLOR_COLLISION_DETECTION` in `enum wmi_bss_color_collision`.
+/// The generated identifier table contains wire IDs and tags, while this
+/// small event-kind enum is local to the WMI payload definition.
+pub const WMI_BSS_COLOR_COLLISION_DETECTION: u32 = 1;
 
 /// `FIELD_PREP(WMI_TLV_TAG, tag) | FIELD_PREP(WMI_TLV_LEN, len)`.
 pub const fn tlv_hdr(tag: u16, len: usize) -> u32 {
@@ -163,10 +167,33 @@ pub const WMI_VDEV_START_REQUEST_CMD_SIZE: usize = 108;
 pub const WMI_VDEV_CREATE_CMD_SIZE: usize = 40;
 /// `sizeof(struct wmi_vdev_txrx_streams)`.
 pub const WMI_VDEV_TXRX_STREAMS_SIZE: usize = 16;
+/// `sizeof(struct wmi_vdev_set_tpc_power_cmd)`.
+pub const WMI_VDEV_SET_TPC_POWER_CMD_SIZE: usize = 20;
+/// `sizeof(struct wmi_vdev_ch_power_info)`.
+pub const WMI_VDEV_CH_POWER_INFO_SIZE: usize = 12;
+/// `sizeof(struct wmi_twt_enable_params_cmd)`.
+pub const WMI_TWT_ENABLE_PARAMS_CMD_SIZE: usize = 72;
+/// `sizeof(struct wmi_twt_disable_params_cmd)`.
+pub const WMI_TWT_DISABLE_PARAMS_CMD_SIZE: usize = 8;
+/// `ATH11K_NUM_PWR_LEVELS`: WCN6855 supports eight 20 MHz chunks, i.e.
+/// the contiguous 160 MHz maximum supported by this driver.
+pub const WMI_TPC_MAX_POWER_LEVELS: usize = 8;
 /// `sizeof(struct wmi_vdev_up_cmd)`.
 pub const WMI_VDEV_UP_CMD_SIZE: usize = 36;
+/// `sizeof(struct wmi_bcn_tmpl_cmd)`.
+pub const WMI_BCN_TMPL_CMD_SIZE: usize = 56;
+/// `sizeof(struct wmi_bcn_prb_info)`.
+pub const WMI_BCN_PRB_INFO_SIZE: usize = 12;
+/// `sizeof(struct wmi_fils_discovery_tmpl_cmd)`.
+pub const WMI_FILS_DISCOVERY_TMPL_CMD_SIZE: usize = 12;
+/// `sizeof(struct wmi_probe_tmpl_cmd)`.
+pub const WMI_PROBE_TMPL_CMD_SIZE: usize = 12;
+/// `sizeof(struct wmi_fils_discovery_cmd)`.
+pub const WMI_FILS_DISCOVERY_CMD_SIZE: usize = 16;
 /// `sizeof(struct wmi_peer_assoc_complete_cmd)`.
 pub const WMI_PEER_ASSOC_COMPLETE_CMD_SIZE: usize = 164;
+/// `sizeof(struct wmi_ap_ps_peer_cmd)`.
+pub const WMI_AP_PS_PEER_CMD_SIZE: usize = 24;
 /// `sizeof(struct wmi_vht_rate_set)`.
 pub const WMI_VHT_RATE_SET_SIZE: usize = 24;
 /// `sizeof(struct wmi_he_rate_set)`.
@@ -189,6 +216,41 @@ pub const WMI_SCAN_CHAN_LIST_CMD_SIZE: usize = 16;
 pub const WMI_MGMT_SEND_CMD_SIZE: usize = 36;
 /// `sizeof(struct wmi_mgmt_send_params)`.
 pub const WMI_MGMT_SEND_PARAMS_SIZE: usize = 12;
+/// `sizeof(struct wmi_gtk_rekey_offload_cmd)`.
+pub const WMI_GTK_REKEY_OFFLOAD_CMD_SIZE: usize = 52;
+/// `sizeof(struct wmi_wow_enable_cmd)`.
+pub const WMI_WOW_ENABLE_CMD_SIZE: usize = 16;
+/// `sizeof(struct wmi_wow_host_wakeup_ind)`.
+pub const WMI_WOW_HOST_WAKEUP_CMD_SIZE: usize = 8;
+/// `sizeof(struct wmi_wow_add_del_event_cmd)`.
+pub const WMI_WOW_ADD_DEL_EVENT_CMD_SIZE: usize = 16;
+/// `sizeof(struct wmi_wow_del_pattern_cmd)`.
+pub const WMI_WOW_DEL_PATTERN_CMD_SIZE: usize = 16;
+/// `sizeof(struct wmi_hw_data_filter_cmd)`.
+pub const WMI_HW_DATA_FILTER_CMD_SIZE: usize = 16;
+/// `sizeof(struct wmi_sta_keepalive_cmd)`.
+pub const WMI_STA_KEEPALIVE_CMD_SIZE: usize = 20;
+/// `sizeof(struct wmi_sta_keepalive_arp_resp)`.
+pub const WMI_STA_KEEPALIVE_ARP_RESPONSE_SIZE: usize = 20;
+/// `sizeof(struct wmi_wow_bitmap_pattern)`.
+pub const WMI_WOW_BITMAP_PATTERN_SIZE: usize = 316;
+/// Maximum pattern payload of `struct wmi_wow_bitmap_pattern`.
+pub const WMI_WOW_MAX_PATTERN_SIZE: usize = 148;
+/// `WMI_MAX_NS_OFFLOADS` — fixed entries in the first NS array.
+pub const WMI_MAX_NS_OFFLOADS: usize = 2;
+/// `WMI_MAX_ARP_OFFLOADS` — fixed entries in the ARP array.
+pub const WMI_MAX_ARP_OFFLOADS: usize = 2;
+/// `ATH11K_IPV6_MAX_COUNT` — address records the ath11k host retains.
+pub const WMI_MAX_IPV6_OFFLOADS: usize = 16;
+/// `sizeof(struct wmi_ns_offload_tuple)`.
+pub const WMI_NS_OFFLOAD_TUPLE_SIZE: usize = 80;
+/// `sizeof(struct wmi_arp_offload_tuple)`.
+pub const WMI_ARP_OFFLOAD_TUPLE_SIZE: usize = 24;
+/// The prefix of `struct wmi_gtk_offload_status_event` through its replay
+/// counter.  Linux has no `wmi_tlv_policies[]` entry for this tag, but it
+/// reads these five words immediately; NARF rejects a shorter TLV rather
+/// than risking an out-of-bounds firmware read.
+pub const WMI_GTK_OFFLOAD_STATUS_EVENT_PREFIX_SIZE: usize = 20;
 
 // ── Misc wmi.h / hw.h / core.h constants ────────────────────────────
 
@@ -321,6 +383,26 @@ pub mod peer_flags {
     pub const IS_P2P_CAPABLE: u32 = 0x2000_0000;
     pub const BW_160MHZ: u32 = 0x4000_0000;
     pub const SAFEMODE_EN: u32 = 0x8000_0000;
+}
+
+/// `enum wmi_ap_ps_peer_param` and `enum wmi_ap_ps_param_uapsd`.
+pub mod ap_ps_peer_param {
+    pub const UAPSD: u32 = 0;
+    pub const MAX_SP: u32 = 1;
+    pub const SIFS_RESP_FRMTYPE: u32 = 3;
+    pub const SIFS_RESP_UAPSD: u32 = 4;
+
+    pub const AC0_DELIVERY_EN: u32 = 1 << 0;
+    pub const AC0_TRIGGER_EN: u32 = 1 << 1;
+    pub const AC1_DELIVERY_EN: u32 = 1 << 2;
+    pub const AC1_TRIGGER_EN: u32 = 1 << 3;
+    pub const AC2_DELIVERY_EN: u32 = 1 << 4;
+    pub const AC2_TRIGGER_EN: u32 = 1 << 5;
+    pub const AC3_DELIVERY_EN: u32 = 1 << 6;
+    pub const AC3_TRIGGER_EN: u32 = 1 << 7;
+
+    /// `DISABLE_SIFS_RESPONSE_TRIGGER`.
+    pub const DISABLE_SIFS_RESPONSE_TRIGGER: u32 = 0;
 }
 
 /// `enum wmi_phy_mode`.
@@ -576,6 +658,16 @@ pub const ATH11K_MIN_6G_FREQ: u32 = 5925;
 pub const ATH11K_MAX_6G_FREQ: u32 = 7115;
 /// `ATH11K_MAX_5G_CHAN`.
 pub const ATH11K_MAX_5G_CHAN: u32 = 177;
+/// `ath11k_init_wmi_config_qca6390()`: the startup resource request sends
+/// 16 peer slots to WCN6855 firmware. This is intentionally distinct from
+/// the larger `hw_params.num_peers` value exposed through cfg80211.
+pub const WCN6855_WMI_NUM_PEERS: u32 = 16;
+
+/// `hw_params.num_peers` / `TARGET_NUM_STATIONS(ab)` for WCN6855.
+/// Linux registers this as the physical wiphy's
+/// `NL80211_ATTR_MAX_AP_ASSOC_STA`, even though its WMI startup resource
+/// configuration uses a smaller peer budget.
+pub const WCN6855_MAX_AP_ASSOC_STA: u32 = 512;
 
 // ── Command encoders ────────────────────────────────────────────────
 
@@ -654,7 +746,7 @@ impl TargetResourceConfig {
         let chain_mask = (1u32 << num_rf_chains).wrapping_sub(1);
         TargetResourceConfig {
             num_vdevs,
-            num_peers: 16,
+            num_peers: WCN6855_WMI_NUM_PEERS,
             num_tids: 32,
             num_offload_peers: 3,
             num_offload_reorder_buffs: 3,
@@ -989,6 +1081,53 @@ pub fn pdev_set_regdomain_cmd(p: &PdevSetRegdomainParams) -> WmiCmd {
     )
 }
 
+/// `BIOS_SAR_TABLE_LEN` (`wmi.h`). The first eleven bytes select the
+/// WCN6855's fixed frequency ranges and the second eleven repeat those
+/// limits for RF chain one.
+pub const BIOS_SAR_TABLE_LEN: usize = 22;
+const BIOS_SAR_RSVD1_LEN: usize = 6;
+const BIOS_SAR_RSVD2_LEN: usize = 18;
+
+/// `ath11k_wmi_pdev_set_bios_sar_table_param` →
+/// `WMI_PDEV_SET_BIOS_SAR_TABLE_CMDID`.
+///
+/// The two byte-array TLVs include their four-byte-aligned length, just as
+/// Linux's `roundup(..., sizeof(u32))` allocation does. Both reserved bytes
+/// areas remain zero from the freshly constructed WMI buffer.
+pub fn pdev_set_bios_sar_table_cmd(pdev_id: u32, table: &[u8; BIOS_SAR_TABLE_LEN]) -> WmiCmd {
+    let table_len = roundup4(BIOS_SAR_TABLE_LEN);
+    let reserved_len = roundup4(BIOS_SAR_RSVD1_LEN);
+    // wmi_pdev_set_sar_table_cmd + ARRAY_BYTE table + ARRAY_BYTE reserved.
+    let len = 16 + TLV_HDR_SIZE + table_len + TLV_HDR_SIZE + reserved_len;
+    let mut w = W::new(len);
+    w.tlv(WMI_TAG_PDEV_SET_BIOS_SAR_TABLE_CMD, 16 - TLV_HDR_SIZE);
+    w.u32(pdev_id);
+    w.u32(BIOS_SAR_TABLE_LEN as u32);
+    w.u32(BIOS_SAR_RSVD1_LEN as u32);
+    w.tlv(WMI_TAG_ARRAY_BYTE, table_len);
+    w.bytes(table);
+    w.zeros(table_len - BIOS_SAR_TABLE_LEN);
+    w.tlv(WMI_TAG_ARRAY_BYTE, reserved_len);
+    w.zeros(reserved_len);
+    w.finish(WMI_PDEV_SET_BIOS_SAR_TABLE_CMDID, len)
+}
+
+/// `ath11k_wmi_pdev_set_bios_geo_table_param` →
+/// `WMI_PDEV_SET_BIOS_GEO_TABLE_CMDID`. Linux sends this all-zero reserved
+/// geo table immediately before every BIOS SAR update.
+pub fn pdev_set_bios_geo_table_cmd(pdev_id: u32) -> WmiCmd {
+    let reserved_len = roundup4(BIOS_SAR_RSVD2_LEN);
+    // wmi_pdev_set_geo_table_cmd + one ARRAY_BYTE payload.
+    let len = 12 + TLV_HDR_SIZE + reserved_len;
+    let mut w = W::new(len);
+    w.tlv(WMI_TAG_PDEV_SET_BIOS_GEO_TABLE_CMD, 12 - TLV_HDR_SIZE);
+    w.u32(pdev_id);
+    w.u32(BIOS_SAR_RSVD2_LEN as u32);
+    w.tlv(WMI_TAG_ARRAY_BYTE, reserved_len);
+    w.zeros(reserved_len);
+    w.finish(WMI_PDEV_SET_BIOS_GEO_TABLE_CMDID, len)
+}
+
 /// `ath11k_wmi_send_set_current_country_cmd` →
 /// `WMI_SET_CURRENT_COUNTRY_CMDID`. WCN6855 has
 /// `hw_params.current_cc_support`, so regulatory hints go through this
@@ -1072,6 +1211,77 @@ pub struct VdevCreateParams {
     pub mbssid_tx_vdev_id: u32,
 }
 
+/// `WMI_HOST_VDEV_FLAGS_*` carried by either VDEV_CREATE or VDEV_START,
+/// depending on `WMI_TLV_SERVICE_MBSS_PARAM_IN_VDEV_START_SUPPORT`.
+pub const WMI_HOST_VDEV_FLAGS_NON_MBSSID_AP: u32 = 0x0000_0001;
+pub const WMI_HOST_VDEV_FLAGS_TRANSMIT_AP: u32 = 0x0000_0002;
+pub const WMI_HOST_VDEV_FLAGS_NON_TRANSMIT_AP: u32 = 0x0000_0004;
+pub const WMI_HOST_VDEV_FLAGS_EMA_MODE: u32 = 0x0000_0008;
+
+/// Per-AP-vdev multiple-BSSID state. The firmware needs the role and the
+/// transmitting vdev at start time; `vdev_up` additionally needs the
+/// transmitter's BSSID and the non-transmitting BSSID profile geometry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MbssidParams {
+    pub flags: u32,
+    pub tx_vdev_id: u32,
+    pub tx_bssid: [u8; 6],
+    pub profile_index: u32,
+    pub profile_count: u32,
+}
+
+impl MbssidParams {
+    pub const fn standalone() -> Self {
+        Self {
+            flags: WMI_HOST_VDEV_FLAGS_NON_MBSSID_AP,
+            tx_vdev_id: 0,
+            tx_bssid: [0; 6],
+            profile_index: 0,
+            profile_count: 0,
+        }
+    }
+
+    pub const fn transmitting(ema: bool) -> Self {
+        Self {
+            flags: WMI_HOST_VDEV_FLAGS_TRANSMIT_AP
+                | if ema { WMI_HOST_VDEV_FLAGS_EMA_MODE } else { 0 },
+            tx_vdev_id: 0,
+            tx_bssid: [0; 6],
+            profile_index: 0,
+            profile_count: 0,
+        }
+    }
+
+    pub const fn non_transmitting(
+        tx_vdev_id: u32,
+        tx_bssid: [u8; 6],
+        profile_index: u32,
+        profile_count: u32,
+        ema: bool,
+    ) -> Self {
+        Self {
+            flags: WMI_HOST_VDEV_FLAGS_NON_TRANSMIT_AP
+                | if ema { WMI_HOST_VDEV_FLAGS_EMA_MODE } else { 0 },
+            tx_vdev_id,
+            tx_bssid,
+            profile_index,
+            profile_count,
+        }
+    }
+
+    pub const fn is_transmitting(self) -> bool {
+        self.flags & WMI_HOST_VDEV_FLAGS_TRANSMIT_AP != 0
+    }
+
+    pub const fn is_non_transmitting(self) -> bool {
+        self.flags & WMI_HOST_VDEV_FLAGS_NON_TRANSMIT_AP != 0
+    }
+
+    pub const fn ema(self) -> bool {
+        self.flags & WMI_HOST_VDEV_FLAGS_EMA_MODE != 0
+    }
+}
+
 /// `ath11k_wmi_vdev_create` → `WMI_VDEV_CREATE_CMDID`: the create
 /// struct, then an `ARRAY_STRUCT` with one `VDEV_TXRX_STREAMS` per band
 /// (2 GHz, 5 GHz — always both, `num_cfg_txrx_streams = 2`).
@@ -1143,6 +1353,147 @@ pub fn vdev_set_param_cmd(vdev_id: u32, param_id: u32, param_value: u32) -> WmiC
     )
 }
 
+/// One `wmi_vdev_ch_power_info` entry for a station's six-GHz transmit
+/// power control command. `tx_power` is integral dBm; WMI represents the
+/// signed value in its `u32` slot with the normal two's-complement cast.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TpcChannelPower {
+    pub center_freq: u32,
+    pub tx_power: i8,
+}
+
+/// `ath11k_reg_tpc_power_info`, reduced to the fields WMI serializes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TpcPowerInfo {
+    /// `is_psd_power`: power entries are PSD rather than EIRP bandwidth
+    /// levels. `eirp_power` is then the companion maximum EIRP limit.
+    pub is_psd_power: bool,
+    pub eirp_power: u8,
+    /// `enum wmi_reg_6ghz_ap_type` used by firmware's HALPHY CTL lookup.
+    pub ap_power_type: u32,
+    pub channels: Vec<TpcChannelPower>,
+}
+
+/// `ath11k_wmi_send_vdev_set_tpc_power` → `WMI_VDEV_SET_TPC_POWER_CMDID`.
+///
+/// The WCN6855 wire format is a 20-byte fixed TLV followed by an
+/// `ARRAY_STRUCT` of 12-byte `VDEV_CH_POWER_INFO` TLVs. The C driver assigns
+/// signed per-channel dBm values to WMI's `u32` slot, so the explicit
+/// `i32 → u32` cast below preserves both positive and negative values
+/// byte-for-byte; the fixed EIRP member is an unsigned byte in Linux.
+pub fn vdev_set_tpc_power_cmd(vdev_id: u32, p: &TpcPowerInfo) -> Result<WmiCmd, WmiError> {
+    if p.channels.is_empty() || p.channels.len() > WMI_TPC_MAX_POWER_LEVELS {
+        return Err(WmiError::Invalid("tpc: invalid power-level count"));
+    }
+    let array_len = WMI_VDEV_CH_POWER_INFO_SIZE * p.channels.len();
+    let len = WMI_VDEV_SET_TPC_POWER_CMD_SIZE + TLV_HDR_SIZE + array_len;
+    let mut w = W::new(len);
+    w.tlv(
+        WMI_TAG_VDEV_SET_TPC_POWER_CMD,
+        WMI_VDEV_SET_TPC_POWER_CMD_SIZE - TLV_HDR_SIZE,
+    );
+    w.u32(vdev_id);
+    w.u32(p.is_psd_power as u32);
+    w.u32(p.eirp_power as u32);
+    w.u32(p.ap_power_type);
+    w.tlv(WMI_TAG_ARRAY_STRUCT, array_len);
+    for ch in &p.channels {
+        w.tlv(
+            WMI_TAG_VDEV_CH_POWER_INFO,
+            WMI_VDEV_CH_POWER_INFO_SIZE - TLV_HDR_SIZE,
+        );
+        w.u32(ch.center_freq);
+        w.u32(ch.tx_power as i32 as u32);
+    }
+    Ok(w.finish(WMI_VDEV_SET_TPC_POWER_CMDID, len))
+}
+
+/// `struct wmi_twt_enable_params`, with the policy values filled by
+/// `ath11k_wmi_fill_default_twt_params`. This enables the pdev TWT engine
+/// for either a station requester or an AP responder; individual agreements
+/// remain separate from this configuration command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TwtEnableParams {
+    pub sta_cong_timer_ms: u32,
+    pub mbss_support: u32,
+    pub default_slot_size: u32,
+    pub congestion_thresh_setup: u32,
+    pub congestion_thresh_teardown: u32,
+    pub congestion_thresh_critical: u32,
+    pub interference_thresh_teardown: u32,
+    pub interference_thresh_setup: u32,
+    pub min_no_sta_setup: u32,
+    pub min_no_sta_teardown: u32,
+    pub no_of_bcast_mcast_slots: u32,
+    pub min_no_twt_slots: u32,
+    pub max_no_sta_twt: u32,
+    pub mode_check_interval: u32,
+    pub add_sta_slot_interval: u32,
+    pub remove_sta_slot_interval: u32,
+}
+
+impl Default for TwtEnableParams {
+    fn default() -> Self {
+        Self {
+            sta_cong_timer_ms: 5_000,
+            // ath11k has no MBSSID TWT support.
+            mbss_support: 0,
+            default_slot_size: 10,
+            congestion_thresh_setup: 50,
+            congestion_thresh_teardown: 20,
+            congestion_thresh_critical: 100,
+            interference_thresh_teardown: 80,
+            interference_thresh_setup: 50,
+            min_no_sta_setup: 10,
+            min_no_sta_teardown: 2,
+            no_of_bcast_mcast_slots: 2,
+            min_no_twt_slots: 2,
+            max_no_sta_twt: 500,
+            mode_check_interval: 10_000,
+            add_sta_slot_interval: 1_000,
+            remove_sta_slot_interval: 5_000,
+        }
+    }
+}
+
+/// `ath11k_wmi_send_twt_enable_cmd` → `WMI_TWT_ENABLE_CMDID`.
+pub fn twt_enable_cmd(pdev_id: u32, p: &TwtEnableParams) -> WmiCmd {
+    let mut w = W::new(WMI_TWT_ENABLE_PARAMS_CMD_SIZE);
+    w.tlv(
+        WMI_TAG_TWT_ENABLE_CMD,
+        WMI_TWT_ENABLE_PARAMS_CMD_SIZE - TLV_HDR_SIZE,
+    );
+    w.u32(pdev_id);
+    w.u32(p.sta_cong_timer_ms);
+    w.u32(p.mbss_support);
+    w.u32(p.default_slot_size);
+    w.u32(p.congestion_thresh_setup);
+    w.u32(p.congestion_thresh_teardown);
+    w.u32(p.congestion_thresh_critical);
+    w.u32(p.interference_thresh_teardown);
+    w.u32(p.interference_thresh_setup);
+    w.u32(p.min_no_sta_setup);
+    w.u32(p.min_no_sta_teardown);
+    w.u32(p.no_of_bcast_mcast_slots);
+    w.u32(p.min_no_twt_slots);
+    w.u32(p.max_no_sta_twt);
+    w.u32(p.mode_check_interval);
+    w.u32(p.add_sta_slot_interval);
+    w.u32(p.remove_sta_slot_interval);
+    w.finish(WMI_TWT_ENABLE_CMDID, WMI_TWT_ENABLE_PARAMS_CMD_SIZE)
+}
+
+/// `ath11k_wmi_send_twt_disable_cmd` → `WMI_TWT_DISABLE_CMDID`.
+pub fn twt_disable_cmd(pdev_id: u32) -> WmiCmd {
+    let mut w = W::new(WMI_TWT_DISABLE_PARAMS_CMD_SIZE);
+    w.tlv(
+        WMI_TAG_TWT_DISABLE_CMD,
+        WMI_TWT_DISABLE_PARAMS_CMD_SIZE - TLV_HDR_SIZE,
+    );
+    w.u32(pdev_id);
+    w.finish(WMI_TWT_DISABLE_CMDID, WMI_TWT_DISABLE_PARAMS_CMD_SIZE)
+}
+
 /// `struct wmi_channel_arg` — the channel half of
 /// `wmi_vdev_start_req_arg`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1156,6 +1507,8 @@ pub struct ChannelArg {
     pub allow_ht: bool,
     pub allow_vht: bool,
     pub allow_he: bool,
+    /// `WMI_CHAN_INFO_CHAN_CHANGE_CAUSE_CSA` for a station CSA restart.
+    pub chan_change_cause_csa: bool,
     pub ht40plus: bool,
     pub chan_radar: bool,
     pub freq2_radar: bool,
@@ -1187,6 +1540,7 @@ pub fn put_wmi_channel(c: &ChannelArg) -> [u8; WMI_CHANNEL_SIZE] {
         (c.allow_ht, chan_info::ALLOW_HT),
         (c.allow_vht, chan_info::ALLOW_VHT),
         (c.allow_he, chan_info::ALLOW_HE),
+        (c.chan_change_cause_csa, chan_info::CHAN_CHANGE_CAUSE_CSA),
         (c.ht40plus, chan_info::HT40_PLUS),
         (c.chan_radar, chan_info::DFS),
         (c.freq2_radar, chan_info::DFS_FREQ2),
@@ -1348,6 +1702,134 @@ pub fn vdev_up_cmd(
     w.finish(WMI_VDEV_UP_CMDID, WMI_VDEV_UP_CMD_SIZE)
 }
 
+/// `ath11k_wmi_bcn_tmpl` → `WMI_BCN_TMPL_CMDID`.
+///
+/// The template is the complete native 802.11 beacon (management header,
+/// fixed beacon fields, and information elements). `tim_ie_offset` is its
+/// byte offset from the first 802.11 header byte. Ordinary AP callers use
+/// [`bcn_tmpl_cmd`]; MBSSID/EMA callers supply their first MBSSID element
+/// offset and Linux's packed `ema_params` through
+/// [`bcn_tmpl_cmd_with_mbssid`].
+pub fn bcn_tmpl_cmd(vdev_id: u32, tim_ie_offset: u32, beacon: &[u8]) -> WmiCmd {
+    bcn_tmpl_cmd_with_mbssid(vdev_id, tim_ie_offset, beacon, None, 0)
+}
+
+/// `ath11k_wmi_bcn_tmpl` with the MBSSID and EMA mutable fields populated.
+/// `mbssid_ie_offset` is zero only when the template has no MBSSID element;
+/// firmware interprets a nonzero value relative to the first beacon byte.
+pub fn bcn_tmpl_cmd_with_mbssid(
+    vdev_id: u32,
+    tim_ie_offset: u32,
+    beacon: &[u8],
+    mbssid_ie_offset: Option<u32>,
+    ema_params: u32,
+) -> WmiCmd {
+    let aligned = roundup4(beacon.len());
+    let len = WMI_BCN_TMPL_CMD_SIZE + WMI_BCN_PRB_INFO_SIZE + TLV_HDR_SIZE + aligned;
+    let mut w = W::new(len);
+    w.tlv(WMI_TAG_BCN_TMPL_CMD, WMI_BCN_TMPL_CMD_SIZE - TLV_HDR_SIZE);
+    w.u32(vdev_id);
+    w.u32(tim_ie_offset);
+    w.u32(beacon.len() as u32);
+    // csa_switch_count_offset, ext_csa_switch_count_offset,
+    // csa_event_bitmap, mbssid_ie_offset, esp_ie_offset,
+    // csc_switch_count_offset, csc_event_bitmap, mu_edca_ie_offset,
+    // feature_enable_bitmap, ema_params.
+    w.u32(0);
+    w.u32(0);
+    w.u32(0);
+    w.u32(mbssid_ie_offset.unwrap_or(0));
+    w.u32(0);
+    w.u32(0);
+    w.u32(0);
+    w.u32(0);
+    w.u32(0);
+    w.u32(ema_params);
+    w.tlv(WMI_TAG_BCN_PRB_INFO, WMI_BCN_PRB_INFO_SIZE - TLV_HDR_SIZE);
+    w.u32(0); // caps
+    w.u32(0); // erp
+    w.tlv(WMI_TAG_ARRAY_BYTE, aligned);
+    w.bytes(beacon);
+    w.finish(WMI_BCN_TMPL_CMDID, len)
+}
+
+/// `ath11k_wmi_fils_discovery_tmpl` →
+/// `WMI_FILS_DISCOVERY_TMPL_CMDID`. The payload is a complete FILS action
+/// frame template including its management header.
+pub fn fils_discovery_tmpl_cmd(vdev_id: u32, template: &[u8]) -> WmiCmd {
+    let aligned = roundup4(template.len());
+    let len = WMI_FILS_DISCOVERY_TMPL_CMD_SIZE + TLV_HDR_SIZE + aligned;
+    let mut w = W::new(len);
+    w.tlv(
+        WMI_TAG_FILS_DISCOVERY_TMPL_CMD,
+        WMI_FILS_DISCOVERY_TMPL_CMD_SIZE - TLV_HDR_SIZE,
+    );
+    w.u32(vdev_id);
+    w.u32(template.len() as u32);
+    w.tlv(WMI_TAG_ARRAY_BYTE, aligned);
+    w.bytes(template);
+    w.finish(WMI_FILS_DISCOVERY_TMPL_CMDID, len)
+}
+
+/// `ath11k_wmi_probe_resp_tmpl` → `WMI_PRB_TMPL_CMDID`, used only for an
+/// unsolicited broadcast Probe Response (ordinary AP probe responses use the
+/// management-frame path). Like Linux, the BCN/PRB-info capability words are
+/// currently zero.
+pub fn probe_resp_tmpl_cmd(vdev_id: u32, template: &[u8]) -> WmiCmd {
+    let aligned = roundup4(template.len());
+    let len = WMI_PROBE_TMPL_CMD_SIZE + WMI_BCN_PRB_INFO_SIZE + TLV_HDR_SIZE + aligned;
+    let mut w = W::new(len);
+    w.tlv(WMI_TAG_PRB_TMPL_CMD, WMI_PROBE_TMPL_CMD_SIZE - TLV_HDR_SIZE);
+    w.u32(vdev_id);
+    w.u32(template.len() as u32);
+    w.tlv(WMI_TAG_BCN_PRB_INFO, WMI_BCN_PRB_INFO_SIZE - TLV_HDR_SIZE);
+    w.u32(0); // caps
+    w.u32(0); // erp
+    w.tlv(WMI_TAG_ARRAY_BYTE, aligned);
+    w.bytes(template);
+    w.finish(WMI_PRB_TMPL_CMDID, len)
+}
+
+/// `ath11k_wmi_fils_discovery` → `WMI_ENABLE_FILS_CMDID`. `interval == 0`
+/// disables either discovery family and lets firmware discard its template;
+/// `unsol_bcast_probe_resp` selects the WMI unsolicited-probe mode.
+pub fn fils_discovery_cmd(vdev_id: u32, interval: u32, unsol_bcast_probe_resp: bool) -> WmiCmd {
+    let mut w = W::new(WMI_FILS_DISCOVERY_CMD_SIZE);
+    w.tlv(
+        WMI_TAG_ENABLE_FILS_CMD,
+        WMI_FILS_DISCOVERY_CMD_SIZE - TLV_HDR_SIZE,
+    );
+    w.u32(vdev_id);
+    w.u32(interval);
+    w.u32(u32::from(unsol_bcast_probe_resp));
+    w.finish(WMI_ENABLE_FILS_CMDID, WMI_FILS_DISCOVERY_CMD_SIZE)
+}
+
+/// `ath11k_wmi_p2p_go_bcn_ie` → `WMI_P2P_GO_SET_BEACON_IE`. Firmware
+/// inserts this complete WFA P2P vendor element into every GO beacon, so the
+/// caller must remove it from the ordinary beacon-template payload.
+pub fn p2p_go_bcn_ie_cmd(vdev_id: u32, p2p_ie: &[u8]) -> Option<WmiCmd> {
+    if p2p_ie.len() < 6
+        || p2p_ie[0] != 221 // WLAN_EID_VENDOR_SPECIFIC
+        || p2p_ie.len() != p2p_ie[1] as usize + 2
+        || p2p_ie[2..6] != [0x50, 0x6f, 0x9a, 9]
+    // WFA / P2P
+    {
+        return None;
+    }
+    let aligned = roundup4(p2p_ie.len());
+    let len = 12 + TLV_HDR_SIZE + aligned; // fixed cmd + ARRAY_BYTE
+    let mut w = W::new(len);
+    w.tlv(WMI_TAG_P2P_GO_SET_BEACON_IE, 8);
+    w.u32(vdev_id);
+    w.u32(p2p_ie.len() as u32);
+    w.tlv(WMI_TAG_ARRAY_BYTE, aligned);
+    let start = w.b.len();
+    w.bytes(p2p_ie);
+    w.pad_to(start + aligned);
+    Some(w.finish(WMI_P2P_GO_SET_BEACON_IE, len))
+}
+
 /// `ath11k_wmi_send_peer_create_cmd` → `WMI_PEER_CREATE_CMDID`.
 pub fn peer_create_cmd(vdev_id: u32, peer_addr: &[u8; 6], peer_type: u32) -> WmiCmd {
     let size = 20;
@@ -1384,6 +1866,24 @@ pub fn peer_set_param_cmd(
     w.u32(param_id);
     w.u32(param_val);
     w.finish(WMI_PEER_SET_PARAM_CMDID, size)
+}
+
+/// `ath11k_wmi_send_set_ap_ps_param_cmd` →
+/// `WMI_AP_PS_PEER_PARAM_CMDID` (`struct wmi_ap_ps_peer_cmd`).
+pub fn ap_ps_peer_param_cmd(
+    vdev_id: u32,
+    peer_addr: &[u8; 6],
+    param_id: u32,
+    param_val: u32,
+) -> WmiCmd {
+    let size = WMI_AP_PS_PEER_CMD_SIZE;
+    let mut w = W::new(size);
+    w.tlv(WMI_TAG_AP_PS_PEER_CMD, size - TLV_HDR_SIZE);
+    w.u32(vdev_id);
+    w.mac(peer_addr);
+    w.u32(param_id);
+    w.u32(param_val);
+    w.finish(WMI_AP_PS_PEER_PARAM_CMDID, size)
 }
 
 /// `ath11k_wmi_peer_rx_reorder_queue_setup` →
@@ -2177,6 +2677,540 @@ pub fn pdev_get_temperature_cmd(pdev_id: u32) -> WmiCmd {
         WMI_TAG_PDEV_GET_TEMPERATURE_CMD,
         &[0, pdev_id],
     )
+}
+
+/// `ath11k_wmi_pdev_bss_chan_info_request` with
+/// `WMI_BSS_SURVEY_REQ_TYPE_READ` → `WMI_PDEV_BSS_CHAN_INFO_REQUEST_CMDID`.
+/// The target returns the pdev-wide 64-bit channel counters in
+/// `WMI_PDEV_BSS_CHAN_INFO_EVENTID`.
+pub fn pdev_bss_chan_info_request_cmd(pdev_id: u32) -> WmiCmd {
+    simple_cmd(
+        WMI_PDEV_BSS_CHAN_INFO_REQUEST_CMDID,
+        WMI_TAG_PDEV_BSS_CHAN_INFO_REQUEST,
+        &[1, pdev_id], // WMI_BSS_SURVEY_REQ_TYPE_READ
+    )
+}
+
+/// `GTK_OFFLOAD_{ENABLE,DISABLE,REQUEST_STATUS}_OPCODE`.
+pub mod gtk_offload_opcode {
+    pub const ENABLE: u32 = 0x0100_0000;
+    pub const DISABLE: u32 = 0x0200_0000;
+    pub const REQUEST_STATUS: u32 = 0x0400_0000;
+}
+
+/// Parameters for `ath11k_wmi_gtk_rekey_offload`.  `replay_counter` is the
+/// host-order integer ath11k stores after converting the big-endian nl80211
+/// input with `get_unaligned_be64`; the WMI command carries its little-endian
+/// byte representation on WCN6855's little-endian host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GtkRekeyOffloadParams {
+    pub vdev_id: u32,
+    pub kek: [u8; 16],
+    pub kck: [u8; 16],
+    pub replay_counter: u64,
+}
+
+/// `ath11k_wmi_gtk_rekey_offload` / `ath11k_wmi_gtk_rekey_getinfo`.
+///
+/// `enable` writes KEK, KCK and the LE WMI replay counter.  Disable and
+/// status requests leave those fields zero, matching Linux's zeroed skb.
+/// `ath11k_ce_byte_swap` is a no-op for the WCN6855 little-endian host.
+pub fn gtk_rekey_offload_cmd(
+    vdev_id: u32,
+    opcode: u32,
+    params: Option<&GtkRekeyOffloadParams>,
+) -> WmiCmd {
+    let mut w = W::new(WMI_GTK_REKEY_OFFLOAD_CMD_SIZE);
+    w.tlv(
+        WMI_TAG_GTK_OFFLOAD_CMD,
+        WMI_GTK_REKEY_OFFLOAD_CMD_SIZE - TLV_HDR_SIZE,
+    );
+    w.u32(vdev_id);
+    w.u32(opcode);
+    if let Some(p) = params {
+        debug_assert_eq!(p.vdev_id, vdev_id);
+        w.bytes(&p.kek);
+        w.bytes(&p.kck);
+        w.bytes(&p.replay_counter.to_le_bytes());
+    }
+    w.finish(WMI_GTK_OFFLOAD_CMDID, WMI_GTK_REKEY_OFFLOAD_CMD_SIZE)
+}
+
+// ── WoWLAN command encoders (wow.c) ─────────────────────────────────
+
+/// WCN6855's network-list-offload limits (`wmi.h`).  They intentionally
+/// match the advertised WoW NET_DETECT bounds rather than the larger generic
+/// cfg80211 scheduled-scan limits.
+pub const WMI_NLO_MAX_SSIDS: usize = 16;
+pub const WMI_NLO_MAX_CHANNELS: usize = 60;
+pub const WMI_NLO_MAX_SCAN_PLANS: usize = 2;
+pub const WMI_NLO_MAX_PLAN_INTERVAL_SECS: u32 = 7200;
+pub const WMI_NLO_MAX_PLAN_ITERATIONS: u32 = 100;
+
+const WMI_NLO_CONFIG_STOP: u32 = 1 << 0;
+const WMI_NLO_CONFIG_START: u32 = 1 << 1;
+const WMI_NLO_CONFIG_SSID_HIDE_EN: u32 = 1 << 6;
+const WMI_NLO_CONFIG_SCAN_PASSIVE: u32 = 1 << 8;
+const WMI_NLO_CONFIG_SPOOFED_MAC_IN_PROBE_REQ: u32 = 1 << 10;
+const WMI_NLO_CONFIG_RANDOM_SEQ_NO_IN_PROBE_REQ: u32 = 1 << 11;
+const WMI_NLO_ACTIVE_DWELL_MS: u32 = 40;
+const WMI_NLO_PASSIVE_DWELL_MS: u32 = 110;
+const WMI_NLO_FIXED_LEN: usize = 116;
+const WMI_NLO_NETWORK_LEN: usize = 76;
+
+/// A network match encoded in one `nlo_configured_parameters` record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NloNetwork {
+    pub ssid: Vec<u8>,
+    pub rssi_threshold_dbm: Option<i32>,
+    /// The network is probed as hidden because it is also in the directed
+    /// scan SSID list; ordinary matches use firmware's value zero.
+    pub hidden: bool,
+}
+
+/// The firmware-facing portion of cfg80211 WoWLAN NET_DETECT.  All periods
+/// are seconds at this interface; the WMI layout carries milliseconds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NloConfig {
+    pub probe_ssids: Vec<Vec<u8>>,
+    pub channels_mhz: Vec<u32>,
+    /// Retained cfg80211 probe IEs. Linux advertises 512 bytes for NLO even
+    /// though `wmi_wow_nlo_config_cmd` has no variable IE-byte array, so the
+    /// target command intentionally leaves its IE bitmap zero as Linux does.
+    pub probe_ies: Vec<u8>,
+    pub networks: Vec<NloNetwork>,
+    pub plans: Vec<(u32, Option<u32>)>,
+    pub delay_secs: u32,
+    pub random_mac: Option<narf_wireless::ScanRandomMac>,
+}
+
+fn nlo_plan_params(config: &NloConfig) -> Result<(u32, u32, u32), WmiError> {
+    if config.plans.is_empty() || config.plans.len() > WMI_NLO_MAX_SCAN_PLANS {
+        return Err(WmiError::Invalid("NLO scan plans"));
+    }
+    for (index, (interval, iterations)) in config.plans.iter().enumerate() {
+        if *interval == 0 || *interval > WMI_NLO_MAX_PLAN_INTERVAL_SECS {
+            return Err(WmiError::Invalid("NLO scan plan interval"));
+        }
+        if index + 1 == config.plans.len() {
+            if iterations.is_some() {
+                return Err(WmiError::Invalid("NLO final scan plan iterations"));
+            }
+        } else if !matches!(iterations, Some(1..=WMI_NLO_MAX_PLAN_ITERATIONS)) {
+            return Err(WmiError::Invalid("NLO scan plan iterations"));
+        }
+    }
+    let millis = |seconds: u32| seconds * 1000;
+    if config.plans.len() == 1 {
+        Ok((millis(config.plans[0].0), millis(config.plans[0].0), 1))
+    } else {
+        Ok((
+            millis(config.plans[0].0),
+            millis(config.plans[1].0),
+            config.plans[0].1.expect("validated finite first NLO plan"),
+        ))
+    }
+}
+
+/// `ath11k_wmi_wow_config_pno`'s start encoder.  The two variable arrays
+/// reproduce Linux's unusual wire layout exactly: an ARRAY_STRUCT containing
+/// ARRAY_BYTE-tagged 76-byte NLO records, followed by ARRAY_UINT32 channels.
+pub fn nlo_config_start_cmd(vdev_id: u32, config: &NloConfig) -> Result<WmiCmd, WmiError> {
+    if config.networks.is_empty() || config.networks.len() > WMI_NLO_MAX_SSIDS {
+        return Err(WmiError::Invalid("NLO networks"));
+    }
+    if config.probe_ssids.len() > WMI_NLO_MAX_SSIDS
+        || config.probe_ssids.iter().any(|ssid| ssid.len() > 32)
+        || config.channels_mhz.len() > WMI_NLO_MAX_CHANNELS
+        || config.probe_ies.len() > 512
+        || config
+            .networks
+            .iter()
+            .any(|network| network.ssid.is_empty() || network.ssid.len() > 32)
+    {
+        return Err(WmiError::Invalid("NLO configuration"));
+    }
+    let (fast_period, slow_period, fast_cycles) = nlo_plan_params(config)?;
+    let variable_len = TLV_HDR_SIZE
+        + config.networks.len() * WMI_NLO_NETWORK_LEN
+        + TLV_HDR_SIZE
+        + config.channels_mhz.len() * core::mem::size_of::<u32>();
+    let len = WMI_NLO_FIXED_LEN + variable_len;
+    let mut w = W::new(len);
+    w.tlv(WMI_TAG_NLO_CONFIG_CMD, WMI_NLO_FIXED_LEN - TLV_HDR_SIZE);
+    let mut flags = WMI_NLO_CONFIG_START | WMI_NLO_CONFIG_SSID_HIDE_EN;
+    if config.probe_ssids.is_empty() {
+        flags |= WMI_NLO_CONFIG_SCAN_PASSIVE;
+    }
+    if config.random_mac.is_some() {
+        flags |=
+            WMI_NLO_CONFIG_SPOOFED_MAC_IN_PROBE_REQ | WMI_NLO_CONFIG_RANDOM_SEQ_NO_IN_PROBE_REQ;
+    }
+    w.u32(flags);
+    w.u32(vdev_id);
+    w.u32(fast_cycles);
+    w.u32(WMI_NLO_ACTIVE_DWELL_MS);
+    w.u32(WMI_NLO_PASSIVE_DWELL_MS);
+    w.u32(0); // probe_bundle_size
+    w.u32(0); // rest_time
+    w.u32(0); // max_rest_time
+    w.u32(0); // scan_backoff_multiplier
+    w.u32(fast_period);
+    w.u32(slow_period);
+    w.u32(config.networks.len() as u32);
+    w.u32(config.channels_mhz.len() as u32);
+    w.u32(config.delay_secs);
+    match config.random_mac {
+        Some(random_mac) => {
+            w.mac(&random_mac.addr);
+            w.mac(&random_mac.mask);
+        }
+        None => {
+            w.zeros(16); // mac_addr + mac_mask
+        }
+    }
+    w.zeros(8 * core::mem::size_of::<u32>()); // IE bitmap
+    w.u32(0); // vendor OUIs
+    w.u32(0); // connected-NLO band preferences
+    debug_assert_eq!(w.b.len(), WMI_NLO_FIXED_LEN);
+
+    w.tlv(
+        WMI_TAG_ARRAY_STRUCT,
+        config.networks.len() * WMI_NLO_NETWORK_LEN,
+    );
+    for network in &config.networks {
+        w.tlv(WMI_TAG_ARRAY_BYTE, WMI_NLO_NETWORK_LEN - TLV_HDR_SIZE);
+        w.u32(1); // wmi_nlo_ssid_param.valid
+        w.u32(network.ssid.len() as u32);
+        w.bytes(&network.ssid);
+        w.zeros(32 - network.ssid.len());
+        w.u32(0); // enc_type.valid
+        w.u32(0); // enc_type
+        w.u32(0); // auth_type.valid
+        w.u32(0); // auth_type
+        if let Some(rssi) = network
+            .rssi_threshold_dbm
+            .filter(|rssi| *rssi != 0 && *rssi > -300)
+        {
+            w.u32(1); // rssi_cond.valid
+            w.u32(rssi as u32);
+        } else {
+            w.u32(0);
+            w.u32(0);
+        }
+        w.u32(1); // bcast_nw_type.valid
+        w.u32(if network.hidden { 2 } else { 0 });
+    }
+    w.tlv(
+        WMI_TAG_ARRAY_UINT32,
+        config.channels_mhz.len() * core::mem::size_of::<u32>(),
+    );
+    for channel in &config.channels_mhz {
+        w.u32(*channel);
+    }
+    Ok(w.finish(WMI_NETWORK_LIST_OFFLOAD_CONFIG_CMDID, len))
+}
+
+/// `ath11k_wmi_wow_config_pno`'s stop form.  Firmware requires the complete
+/// fixed NLO header even though only the STOP bit and vdev id are meaningful.
+pub fn nlo_config_stop_cmd(vdev_id: u32) -> WmiCmd {
+    let mut w = W::new(WMI_NLO_FIXED_LEN);
+    w.tlv(WMI_TAG_NLO_CONFIG_CMD, WMI_NLO_FIXED_LEN - TLV_HDR_SIZE);
+    w.u32(WMI_NLO_CONFIG_STOP);
+    w.u32(vdev_id);
+    w.finish(WMI_NETWORK_LIST_OFFLOAD_CONFIG_CMDID, WMI_NLO_FIXED_LEN)
+}
+
+/// `enum wmi_wow_wakeup_event`, used as the bit position in
+/// `wmi_wow_add_del_event_cmd.event_bitmap`.
+pub mod wow_event {
+    pub const BMISS: u32 = 0;
+    pub const DEAUTH: u32 = 2;
+    pub const MAGIC_PACKET: u32 = 3;
+    pub const GTK_REKEY_FAILURE: u32 = 4;
+    pub const FOUR_WAY_HANDSHAKE: u32 = 5;
+    pub const EAP_IDENTITY_REQUEST: u32 = 6;
+    pub const NLO_DETECTED: u32 = 7;
+    pub const DISASSOC: u32 = 8;
+    pub const PATTERN_MATCH: u32 = 9;
+    pub const CSA: u32 = 10;
+    pub const MAX: u32 = 24;
+}
+
+/// Hardware receive-filter bits used during a WoWLAN transition.
+pub mod hw_data_filter {
+    pub const DROP_NON_ARP_BROADCAST: u32 = 1 << 0;
+    pub const DROP_NON_ICMPV6_MULTICAST: u32 = 1 << 1;
+}
+
+/// `enum wmi_sta_keepalive_method` values used by ath11k's WoW path.
+pub mod sta_keepalive_method {
+    pub const NULL_FRAME: u32 = 1;
+    pub const UNSOLICITED_ARP_RESPONSE: u32 = 2;
+    pub const ETHERNET_LOOPBACK: u32 = 3;
+    pub const GRATUITOUS_ARP_REQUEST: u32 = 4;
+    pub const MGMT_VENDOR_ACTION: u32 = 5;
+}
+
+/// The default interval that `ath11k_wow_op_suspend` gives firmware for
+/// null-data keepalives (seconds).
+pub const WMI_STA_KEEPALIVE_INTERVAL_DEFAULT: u32 = 30;
+/// A disabled `wmi_sta_keepalive_cmd` interval.
+pub const WMI_STA_KEEPALIVE_INTERVAL_DISABLE: u32 = 0;
+
+/// Address snapshot used by `ath11k_wmi_arp_ns_offload`.  Firmware supports
+/// two IPv4 entries and up to sixteen IPv6 entries; the encoder enforces
+/// those limits before it allocates a WMI command.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ArpNsOffload {
+    pub ipv4: Vec<[u8; 4]>,
+    pub ipv6: Vec<[u8; 16]>,
+    pub mac_addr: [u8; 6],
+}
+
+/// Build the solicited-node multicast address for an IPv6 neighbour
+/// solicitation.  This is `ath11k_generate_ns_mc_addr`'s exact address
+/// construction, expressed without mutable host shadow state.
+pub fn solicited_node_multicast(addr: [u8; 16]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out[0] = 0xff;
+    out[1] = 0x02;
+    out[11] = 0x01;
+    out[12] = 0xff;
+    out[13..].copy_from_slice(&addr[13..]);
+    out
+}
+
+/// `ath11k_wmi_arp_ns_offload`.  The first NS and ARP arrays always contain
+/// their fixed two tuples (including disabled, zero-filled slots); remaining
+/// IPv6 addresses occupy the trailing variable-length NS array exactly as in
+/// Linux.  WCN6855 uses the ordinary little-endian WMI byte stream, so no
+/// extra host-side swapping is applied here.
+pub fn arp_ns_offload_cmd(
+    vdev_id: u32,
+    offload: &ArpNsOffload,
+    enable: bool,
+) -> Result<WmiCmd, WmiError> {
+    if offload.ipv4.len() > WMI_MAX_ARP_OFFLOADS || offload.ipv6.len() > WMI_MAX_IPV6_OFFLOADS {
+        return Err(WmiError::Invalid("ARP/NS offload address count"));
+    }
+    let ns_extra = offload.ipv6.len().saturating_sub(WMI_MAX_NS_OFFLOADS);
+    let len = 16
+        + TLV_HDR_SIZE
+        + WMI_MAX_NS_OFFLOADS * WMI_NS_OFFLOAD_TUPLE_SIZE
+        + TLV_HDR_SIZE
+        + WMI_MAX_ARP_OFFLOADS * WMI_ARP_OFFLOAD_TUPLE_SIZE
+        + if ns_extra == 0 {
+            0
+        } else {
+            TLV_HDR_SIZE + ns_extra * WMI_NS_OFFLOAD_TUPLE_SIZE
+        };
+    let mut w = W::new(len);
+    w.tlv(WMI_TAG_SET_ARP_NS_OFFLOAD_CMD, 12);
+    w.u32(0); // flags
+    w.u32(vdev_id);
+    w.u32(ns_extra as u32);
+
+    let put_ns = |first: usize, count: usize, w: &mut W| {
+        w.tlv(WMI_TAG_ARRAY_STRUCT, count * WMI_NS_OFFLOAD_TUPLE_SIZE);
+        for index in first..first + count {
+            w.tlv(
+                WMI_TAG_NS_OFFLOAD_TUPLE,
+                WMI_NS_OFFLOAD_TUPLE_SIZE - TLV_HDR_SIZE,
+            );
+            let target = offload.ipv6.get(index).copied();
+            let valid = enable && target.is_some();
+            let mac_valid = enable && offload.mac_addr != [0; 6];
+            w.u32((valid as u32) | ((mac_valid as u32) << 1));
+            if let Some(target) = target.filter(|_| enable) {
+                w.bytes(&target);
+                w.zeros(16); // `target_ipaddr[1]`, not used by ath11k.
+                w.bytes(&solicited_node_multicast(target));
+                w.zeros(16); // remote IPv6
+                w.mac(&offload.mac_addr);
+            } else {
+                w.zeros(WMI_NS_OFFLOAD_TUPLE_SIZE - 8);
+            }
+        }
+    };
+    put_ns(0, WMI_MAX_NS_OFFLOADS, &mut w);
+
+    w.tlv(
+        WMI_TAG_ARRAY_STRUCT,
+        WMI_MAX_ARP_OFFLOADS * WMI_ARP_OFFLOAD_TUPLE_SIZE,
+    );
+    for index in 0..WMI_MAX_ARP_OFFLOADS {
+        w.tlv(
+            WMI_TAG_ARP_OFFLOAD_TUPLE,
+            WMI_ARP_OFFLOAD_TUPLE_SIZE - TLV_HDR_SIZE,
+        );
+        if let Some(target) = offload.ipv4.get(index).filter(|_| enable) {
+            w.u32(1); // WMI_ARPOL_FLAGS_VALID
+            w.bytes(target);
+            w.zeros(4); // remote IPv4
+            w.zeros(8); // target MAC
+        } else {
+            w.zeros(WMI_ARP_OFFLOAD_TUPLE_SIZE - TLV_HDR_SIZE);
+        }
+    }
+    if ns_extra != 0 {
+        put_ns(WMI_MAX_NS_OFFLOADS, ns_extra, &mut w);
+    }
+    Ok(w.finish(WMI_SET_ARP_NS_OFFLOAD_CMDID, len))
+}
+
+/// `ath11k_wmi_wow_enable`: begin firmware WoW operation and pause normal
+/// interface configuration.  The remaining `flags` word is zeroed by
+/// `ath11k_wmi_alloc_skb` in Linux.
+pub fn wow_enable_cmd() -> WmiCmd {
+    simple_cmd(
+        WMI_WOW_ENABLE_CMDID,
+        WMI_TAG_WOW_ENABLE_CMD,
+        &[1, 0, 0], // enable, WOW_IFACE_PAUSE_ENABLED, flags
+    )
+}
+
+/// `ath11k_wmi_wow_host_wakeup_ind`: ask firmware to leave WoW.  The
+/// reserved word is deliberately retained as zero in the fixed-size struct.
+pub fn wow_host_wakeup_cmd() -> WmiCmd {
+    simple_cmd(
+        WMI_WOW_HOSTWAKEUP_FROM_SLEEP_CMDID,
+        WMI_TAG_WOW_HOSTWAKEUP_FROM_SLEEP_CMD,
+        &[0],
+    )
+}
+
+/// `ath11k_wmi_wow_add_wakeup_event`.  A wake-event number outside the
+/// firmware enum cannot be represented safely as a 32-bit bitmap.
+pub fn wow_wakeup_event_cmd(vdev_id: u32, event: u32, enable: bool) -> Result<WmiCmd, WmiError> {
+    if event >= wow_event::MAX {
+        return Err(WmiError::Invalid("WoW wake event"));
+    }
+    Ok(simple_cmd(
+        WMI_WOW_ENABLE_DISABLE_WAKE_EVENT_CMDID,
+        WMI_TAG_WOW_ADD_DEL_EVT_CMD,
+        &[vdev_id, enable as u32, 1u32 << event],
+    ))
+}
+
+/// `ath11k_wmi_wow_del_pattern`: remove a bitmap wake pattern by its
+/// vdev-local firmware slot.
+pub fn wow_del_pattern_cmd(vdev_id: u32, pattern_id: u32) -> WmiCmd {
+    simple_cmd(
+        WMI_WOW_DEL_WAKE_PATTERN_CMDID,
+        WMI_TAG_WOW_DEL_PATTERN_CMD,
+        &[vdev_id, pattern_id, 0], // WOW_BITMAP_PATTERN
+    )
+}
+
+/// `ath11k_wmi_wow_add_pattern` for a byte-mask bitmap pattern.  Linux
+/// always sends the full fixed-size 148-byte pattern/mask arrays, with the
+/// unused tails zeroed, followed by its four empty optional arrays and a
+/// zero rate-limit interval.  WCN6855 is little-endian, so the CE byte-swap
+/// helpers are no-ops and the supplied byte order is preserved.
+pub fn wow_add_pattern_cmd(
+    vdev_id: u32,
+    pattern_id: u32,
+    pattern: &[u8],
+    mask: &[u8],
+    pattern_offset: u32,
+) -> Result<WmiCmd, WmiError> {
+    if pattern.is_empty() || pattern.len() > WMI_WOW_MAX_PATTERN_SIZE || mask.len() != pattern.len()
+    {
+        return Err(WmiError::Invalid("WoW bitmap pattern"));
+    }
+    let len = 16 + 4 + WMI_WOW_BITMAP_PATTERN_SIZE + 4 + 4 + 4 + 4 + 8;
+    let mut w = W::new(len);
+    w.tlv(WMI_TAG_WOW_ADD_PATTERN_CMD, 12);
+    w.u32(vdev_id);
+    w.u32(pattern_id);
+    w.u32(0); // WOW_BITMAP_PATTERN
+
+    // Array of exactly one `wmi_wow_bitmap_pattern`.
+    w.tlv(WMI_TAG_ARRAY_STRUCT, WMI_WOW_BITMAP_PATTERN_SIZE);
+    w.tlv(
+        WMI_TAG_WOW_BITMAP_PATTERN_T,
+        WMI_WOW_BITMAP_PATTERN_SIZE - TLV_HDR_SIZE,
+    );
+    w.bytes(pattern);
+    w.zeros(WMI_WOW_MAX_PATTERN_SIZE - pattern.len());
+    w.bytes(mask);
+    w.zeros(WMI_WOW_MAX_PATTERN_SIZE - mask.len());
+    w.u32(pattern_offset);
+    w.u32(pattern.len() as u32);
+    w.u32(mask.len() as u32);
+    w.u32(pattern_id);
+
+    // IPv4 sync, IPv6 sync, and magic-pattern arrays are empty.  So is the
+    // pattern-info timeout u32 array; the final array is one zero rate-limit
+    // interval, exactly as `ath11k_wmi_wow_add_pattern` leaves its calloc'd
+    // skb.
+    w.tlv(WMI_TAG_ARRAY_STRUCT, 0);
+    w.tlv(WMI_TAG_ARRAY_STRUCT, 0);
+    w.tlv(WMI_TAG_ARRAY_STRUCT, 0);
+    w.tlv(WMI_TAG_ARRAY_UINT32, 0);
+    w.tlv(WMI_TAG_ARRAY_UINT32, 4);
+    w.u32(0);
+    Ok(w.finish(WMI_WOW_ADD_WAKE_PATTERN_CMDID, len))
+}
+
+/// `ath11k_wmi_hw_data_filter_cmd`.  Disable deliberately programs all
+/// filter modes (`~0U`) rather than the caller's bitmap, which is the Linux
+/// firmware contract.
+pub fn hw_data_filter_cmd(vdev_id: u32, filter_bitmap: u32, enable: bool) -> WmiCmd {
+    simple_cmd(
+        WMI_HW_DATA_FILTER_CMDID,
+        WMI_TAG_HW_DATA_FILTER_CMD,
+        &[
+            vdev_id,
+            enable as u32,
+            if enable { filter_bitmap } else { u32::MAX },
+        ],
+    )
+}
+
+/// Arguments for `ath11k_wmi_sta_keepalive`.  `dest_mac` is only emitted for
+/// ARP-response/request methods; Linux leaves that nested TLV's payload zero
+/// for the null-data keepalive used by WoWLAN.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StaKeepaliveParams {
+    pub vdev_id: u32,
+    pub enabled: bool,
+    pub method: u32,
+    pub interval_secs: u32,
+    pub src_ipv4: u32,
+    pub dst_ipv4: u32,
+    pub dest_mac: [u8; 6],
+}
+
+/// `ath11k_wmi_sta_keepalive`, including the always-present ARP response TLV.
+pub fn sta_keepalive_cmd(p: &StaKeepaliveParams) -> WmiCmd {
+    let len = WMI_STA_KEEPALIVE_CMD_SIZE + WMI_STA_KEEPALIVE_ARP_RESPONSE_SIZE;
+    let mut w = W::new(len);
+    w.tlv(
+        WMI_TAG_STA_KEEPALIVE_CMD,
+        WMI_STA_KEEPALIVE_CMD_SIZE - TLV_HDR_SIZE,
+    );
+    w.u32(p.vdev_id);
+    w.u32(p.enabled as u32);
+    w.u32(p.method);
+    w.u32(p.interval_secs);
+    w.tlv(
+        WMI_TAG_STA_KEEPALIVE_ARP_RESPONSE,
+        WMI_STA_KEEPALIVE_ARP_RESPONSE_SIZE - TLV_HDR_SIZE,
+    );
+    if matches!(
+        p.method,
+        sta_keepalive_method::UNSOLICITED_ARP_RESPONSE
+            | sta_keepalive_method::GRATUITOUS_ARP_REQUEST
+    ) {
+        w.u32(p.src_ipv4);
+        w.u32(p.dst_ipv4);
+        w.mac(&p.dest_mac);
+    } else {
+        w.zeros(16);
+    }
+    w.finish(WMI_STA_KEEPALIVE_CMDID, len)
 }
 
 // ── Decoder: errors + TLV walk ──────────────────────────────────────
@@ -3267,6 +4301,10 @@ pub const MAX_6GHZ_REG_RULES: u32 = 5;
 pub const WMI_REG_CURRENT_MAX_AP_TYPE: usize = 3;
 /// `WMI_REG_MAX_CLIENT_TYPE` (default, subordinate).
 pub const WMI_REG_MAX_CLIENT_TYPE: usize = 2;
+/// `WMI_REG_DEFAULT_CLIENT`.
+pub const WMI_REG_DEFAULT_CLIENT: usize = 0;
+/// `WMI_REG_SUBORDINATE_CLIENT`.
+pub const WMI_REG_SUBORDINATE_CLIENT: usize = 1;
 /// `WMI_REG_CLIENT_MAX` — array size in the ext event struct.
 pub const WMI_REG_CLIENT_MAX: usize = 4;
 /// `enum wmi_reg_6ghz_ap_type` indices.
@@ -3609,6 +4647,35 @@ pub struct InstallKeyCompl {
     pub status: u32,
 }
 
+/// The parts of `struct wmi_gtk_offload_status_event` ath11k consumes when
+/// it exits low-power mode.  The remaining GTK / IGTK key fields are not
+/// imported by Linux ath11k; firmware has already installed them and the
+/// host only needs the replay counter for the userspace supplicant.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GtkOffloadStatus {
+    pub vdev_id: u32,
+    pub flags: u32,
+    pub refresh_count: u32,
+    /// `wmi_replayc_cnt.word0`, little-endian low 32 bits.
+    pub replay_counter_lo: u32,
+    /// `wmi_replayc_cnt.word1`, little-endian high 32 bits.
+    pub replay_counter_hi: u32,
+}
+
+impl GtkOffloadStatus {
+    /// Linux reconstructs this as `(word1 << 32) | word0`, then publishes
+    /// `cpu_to_be64(replay_ctr)` through `ieee80211_gtk_rekey_notify`.
+    pub const fn replay_counter(&self) -> u64 {
+        ((self.replay_counter_hi as u64) << 32) | self.replay_counter_lo as u64
+    }
+
+    /// The big-endian replay-counter bytes cfg80211/nl80211 sends to the
+    /// userspace supplicant on resume.
+    pub const fn replay_counter_be(&self) -> [u8; 8] {
+        self.replay_counter().to_be_bytes()
+    }
+}
+
 /// `ath11k_pull_vdev_install_key_compl_ev`.
 pub fn decode_install_key_compl(payload: &[u8]) -> Result<InstallKeyCompl, WmiError> {
     let tb = TlvTable::parse(payload)?;
@@ -3619,6 +4686,52 @@ pub fn decode_install_key_compl(payload: &[u8]) -> Result<InstallKeyCompl, WmiEr
         key_idx: rd32(v, 12),
         key_flags: rd32(v, 16),
         status: rd32(v, 20),
+    })
+}
+
+/// `struct wmi_tlv_wow_event_info`, carried by
+/// `WMI_WOW_WAKEUP_HOST_EVENTID`.  ath11k uses the event as the completion
+/// for `WMI_WOW_HOSTWAKEUP_FROM_SLEEP_CMDID`; it logs the reason but does not
+/// synthesize a mac80211 wake report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WowWakeup {
+    pub vdev_id: u32,
+    pub flags: u32,
+    /// `enum wmi_wow_wake_reason`, retained verbatim for diagnostics.
+    pub reason: u32,
+    pub data_len: u32,
+}
+
+/// Decode `ath11k_wmi_event_wow_wakeup_host`.  The event's optional byte
+/// array (page-fault data on some targets) is intentionally not retained:
+/// WCN6855's ath11k path only logs it and completes the wake transition.
+pub fn decode_wow_wakeup(payload: &[u8]) -> Result<WowWakeup, WmiError> {
+    let tb = TlvTable::parse(payload)?;
+    let v = tb.need(WMI_TAG_WOW_EVENT_INFO)?.value;
+    need_len(v, 16, "WoW wakeup: short event info")?;
+    Ok(WowWakeup {
+        vdev_id: rd32(v, 0),
+        flags: rd32(v, 4),
+        reason: rd32(v, 8),
+        data_len: rd32(v, 12),
+    })
+}
+
+/// `ath11k_wmi_gtk_offload_status_event`.
+pub fn decode_gtk_offload_status(payload: &[u8]) -> Result<GtkOffloadStatus, WmiError> {
+    let tb = TlvTable::parse(payload)?;
+    let v = tb.need(WMI_TAG_GTK_OFFLOAD_STATUS_EVENT)?.value;
+    need_len(
+        v,
+        WMI_GTK_OFFLOAD_STATUS_EVENT_PREFIX_SIZE,
+        "GTK offload status",
+    )?;
+    Ok(GtkOffloadStatus {
+        vdev_id: rd32(v, 0),
+        flags: rd32(v, 4),
+        refresh_count: rd32(v, 8),
+        replay_counter_lo: rd32(v, 12),
+        replay_counter_hi: rd32(v, 16),
     })
 }
 
@@ -3717,6 +4830,101 @@ pub fn decode_pdev_temperature(payload: &[u8]) -> Result<PdevTemperature, WmiErr
     Ok(PdevTemperature {
         temp: rd32(v, 0) as i32,
         pdev_id: rd32(v, 4),
+    })
+}
+
+/// `struct wmi_pdev_bss_chan_info_event`, whose 64-bit counters are in
+/// firmware clock ticks. The MAC layer converts them to cfg80211 milliseconds
+/// using ath11k's WCN6855 counter frequency.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PdevBssChanInfo {
+    pub frequency_mhz: u32,
+    pub noise_floor: i32,
+    pub busy_ticks: u64,
+    pub total_ticks: u64,
+    pub tx_ticks: u64,
+    pub rx_ticks: u64,
+    pub rx_bss_ticks: u64,
+    pub pdev_id: u32,
+}
+
+/// `ath11k_pull_pdev_bss_chan_info_ev`. `tlv_policy_min_len` already
+/// requires the complete 52-byte fixed event before any word is read.
+pub fn decode_pdev_bss_chan_info(payload: &[u8]) -> Result<PdevBssChanInfo, WmiError> {
+    let tb = TlvTable::parse(payload)?;
+    let v = tb.need(WMI_TAG_PDEV_BSS_CHAN_INFO_EVENT)?.value;
+    let ticks = |low: usize| u64::from(rd32(v, low)) | (u64::from(rd32(v, low + 4)) << 32);
+    Ok(PdevBssChanInfo {
+        frequency_mhz: rd32(v, 0),
+        noise_floor: rd32(v, 4) as i32,
+        busy_ticks: ticks(8),
+        total_ticks: ticks(16),
+        tx_ticks: ticks(24),
+        rx_ticks: ticks(32),
+        rx_bss_ticks: ticks(40),
+        pdev_id: rd32(v, 48),
+    })
+}
+
+/// `struct wmi_pdev_radar_ev`.  ath11k passes the event to mac80211 as a
+/// radar indication for the active channel context; the MAC layer retains
+/// the frequency/width for diagnostics but owns the DFS state transition.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DfsRadarDetected {
+    pub pdev_id: u32,
+    pub detection_mode: u32,
+    pub chan_freq: u32,
+    pub chan_width: u32,
+    pub detector_id: u32,
+    pub segment_id: u32,
+    pub timestamp: u32,
+    pub is_chirp: bool,
+    pub freq_offset: i32,
+    pub sidx: i32,
+}
+
+/// `struct wmi_obss_color_collision_event`.  The target reports the vdev,
+/// event kind, and a 64-bit set of colliding BSS colors.  It is deliberately
+/// separate from the configuration command: only the `DETECTION` event is
+/// forwarded to mac80211/cfg80211.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ObssColorCollisionEvent {
+    pub vdev_id: u32,
+    /// `enum wmi_obss_color_collision_evt_type`.
+    pub event_type: u32,
+    pub color_bitmap: u64,
+}
+
+/// `ath11k_wmi_obss_color_collision_event`'s fixed event payload.
+pub fn decode_obss_color_collision_event(
+    payload: &[u8],
+) -> Result<ObssColorCollisionEvent, WmiError> {
+    let tb = TlvTable::parse(payload)?;
+    let v = tb.need(WMI_TAG_OBSS_COLOR_COLLISION_EVT)?.value;
+    need_len(v, 16, "OBSS color collision: short TLV")?;
+    Ok(ObssColorCollisionEvent {
+        vdev_id: rd32(v, 0),
+        event_type: rd32(v, 4),
+        color_bitmap: u64::from_le_bytes(v[8..16].try_into().unwrap()),
+    })
+}
+
+/// `ath11k_wmi_pdev_dfs_radar_detected_event`.
+pub fn decode_dfs_radar_detected(payload: &[u8]) -> Result<DfsRadarDetected, WmiError> {
+    let tb = TlvTable::parse(payload)?;
+    let v = tb.need(WMI_TAG_PDEV_DFS_RADAR_DETECTION_EVENT)?.value;
+    need_len(v, 40, "DFS radar: short TLV")?;
+    Ok(DfsRadarDetected {
+        pdev_id: rd32(v, 0),
+        detection_mode: rd32(v, 4),
+        chan_freq: rd32(v, 8),
+        chan_width: rd32(v, 12),
+        detector_id: rd32(v, 16),
+        segment_id: rd32(v, 20),
+        timestamp: rd32(v, 24),
+        is_chirp: rd32(v, 28) != 0,
+        freq_offset: rd32(v, 32) as i32,
+        sidx: rd32(v, 36) as i32,
     })
 }
 
@@ -3858,12 +5066,17 @@ pub enum WmiEvent<'a> {
     PeerDeleteResp(VdevPeer),
     PeerAssocConf(VdevPeer),
     InstallKeyCompl(InstallKeyCompl),
+    GtkOffloadStatus(GtkOffloadStatus),
+    WowWakeup(WowWakeup),
     PeerStaKickout([u8; 6]),
     Scan(ScanEvent),
     MgmtRx(MgmtRx<'a>),
     MgmtTxCompl(MgmtTxCompl),
     Roam(RoamEvent),
     PdevTemperature(PdevTemperature),
+    PdevBssChanInfo(PdevBssChanInfo),
+    DfsRadarDetected(DfsRadarDetected),
+    ObssColorCollision(ObssColorCollisionEvent),
     /// Any other id — Linux logs and drops.
     Unhandled(u32),
 }
@@ -3889,12 +5102,21 @@ pub fn decode_event(frame: &[u8]) -> Result<WmiEvent<'_>, WmiError> {
         WMI_VDEV_INSTALL_KEY_COMPLETE_EVENTID => {
             WmiEvent::InstallKeyCompl(decode_install_key_compl(p)?)
         }
+        WMI_GTK_OFFLOAD_STATUS_EVENTID => WmiEvent::GtkOffloadStatus(decode_gtk_offload_status(p)?),
+        WMI_WOW_WAKEUP_HOST_EVENTID => WmiEvent::WowWakeup(decode_wow_wakeup(p)?),
         WMI_PEER_STA_KICKOUT_EVENTID => WmiEvent::PeerStaKickout(decode_peer_sta_kickout(p)?),
         WMI_SCAN_EVENTID => WmiEvent::Scan(decode_scan_event(p)?),
         WMI_MGMT_RX_EVENTID => WmiEvent::MgmtRx(decode_mgmt_rx(p)?),
         WMI_MGMT_TX_COMPLETION_EVENTID => WmiEvent::MgmtTxCompl(decode_mgmt_tx_compl(p)?),
         WMI_ROAM_EVENTID => WmiEvent::Roam(decode_roam(p)?),
         WMI_PDEV_TEMPERATURE_EVENTID => WmiEvent::PdevTemperature(decode_pdev_temperature(p)?),
+        WMI_PDEV_BSS_CHAN_INFO_EVENTID => WmiEvent::PdevBssChanInfo(decode_pdev_bss_chan_info(p)?),
+        WMI_PDEV_DFS_RADAR_DETECTION_EVENTID => {
+            WmiEvent::DfsRadarDetected(decode_dfs_radar_detected(p)?)
+        }
+        WMI_OBSS_COLOR_COLLISION_DETECTION_EVENTID => {
+            WmiEvent::ObssColorCollision(decode_obss_color_collision_event(p)?)
+        }
         other => WmiEvent::Unhandled(other),
     })
 }
@@ -3957,6 +5179,9 @@ pub struct WmmParamsArg {
 
 /// `WMI_WMM_PARAM_TYPE_LEGACY`.
 pub const WMI_WMM_PARAM_TYPE_LEGACY: u32 = 0;
+/// `WMI_WMM_PARAM_TYPE_11AX_MU_EDCA`: CW fields are HE MU-EDCA exponents,
+/// not the expanded legacy contention-window values.
+pub const WMI_WMM_PARAM_TYPE_11AX_MU_EDCA: u32 = 1;
 /// `sizeof(struct wmi_vdev_set_wmm_params_cmd)`.
 pub const WMI_VDEV_SET_WMM_PARAMS_CMD_SIZE: usize = 124;
 
@@ -3990,6 +5215,68 @@ pub fn obss_spr_cmd(vdev_id: u32, enable: u32, min_offset: i32, max_offset: i32)
         WMI_PDEV_OBSS_PD_SPATIAL_REUSE_CMDID,
         WMI_TAG_OBSS_SPATIAL_REUSE_SET_CMD,
         &[0, enable, min_offset as u32, max_offset as u32, vdev_id],
+    )
+}
+
+/// `struct wmi_pdev_obss_pd_bitmap_cmd`, shared by ath11k's six SRG/non-SRG
+/// bitmap commands. `bitmap` is deliberately two host words: Linux copies
+/// cfg80211's opaque eight-byte NLA directly into the same layout before WMI
+/// serializes its little-endian fields.
+fn obss_pd_bitmap_cmd(cmd_id: u32, tag: u16, pdev_id: u32, bitmap: [u32; 2]) -> WmiCmd {
+    simple_cmd(cmd_id, tag, &[pdev_id, bitmap[0], bitmap[1]])
+}
+
+pub fn pdev_set_srg_bss_color_bitmap_cmd(pdev_id: u32, bitmap: [u32; 2]) -> WmiCmd {
+    obss_pd_bitmap_cmd(
+        WMI_PDEV_SET_SRG_BSS_COLOR_BITMAP_CMDID,
+        WMI_TAG_PDEV_SRG_BSS_COLOR_BITMAP_CMD,
+        pdev_id,
+        bitmap,
+    )
+}
+
+pub fn pdev_set_srg_partial_bssid_bitmap_cmd(pdev_id: u32, bitmap: [u32; 2]) -> WmiCmd {
+    obss_pd_bitmap_cmd(
+        WMI_PDEV_SET_SRG_PARTIAL_BSSID_BITMAP_CMDID,
+        WMI_TAG_PDEV_SRG_PARTIAL_BSSID_BITMAP_CMD,
+        pdev_id,
+        bitmap,
+    )
+}
+
+pub fn pdev_set_srg_obss_color_enable_bitmap_cmd(pdev_id: u32, bitmap: [u32; 2]) -> WmiCmd {
+    obss_pd_bitmap_cmd(
+        WMI_PDEV_SET_SRG_OBSS_COLOR_ENABLE_BITMAP_CMDID,
+        WMI_TAG_PDEV_SRG_OBSS_COLOR_ENABLE_BITMAP_CMD,
+        pdev_id,
+        bitmap,
+    )
+}
+
+pub fn pdev_set_srg_obss_bssid_enable_bitmap_cmd(pdev_id: u32, bitmap: [u32; 2]) -> WmiCmd {
+    obss_pd_bitmap_cmd(
+        WMI_PDEV_SET_SRG_OBSS_BSSID_ENABLE_BITMAP_CMDID,
+        WMI_TAG_PDEV_SRG_OBSS_BSSID_ENABLE_BITMAP_CMD,
+        pdev_id,
+        bitmap,
+    )
+}
+
+pub fn pdev_set_non_srg_obss_color_enable_bitmap_cmd(pdev_id: u32, bitmap: [u32; 2]) -> WmiCmd {
+    obss_pd_bitmap_cmd(
+        WMI_PDEV_SET_NON_SRG_OBSS_COLOR_ENABLE_BITMAP_CMDID,
+        WMI_TAG_PDEV_NON_SRG_OBSS_COLOR_ENABLE_BITMAP_CMD,
+        pdev_id,
+        bitmap,
+    )
+}
+
+pub fn pdev_set_non_srg_obss_bssid_enable_bitmap_cmd(pdev_id: u32, bitmap: [u32; 2]) -> WmiCmd {
+    obss_pd_bitmap_cmd(
+        WMI_PDEV_SET_NON_SRG_OBSS_BSSID_ENABLE_BITMAP_CMDID,
+        WMI_TAG_PDEV_NON_SRG_OBSS_BSSID_ENABLE_BITMAP_CMD,
+        pdev_id,
+        bitmap,
     )
 }
 

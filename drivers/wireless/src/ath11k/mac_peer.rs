@@ -15,15 +15,16 @@
 //! - `ath11k_peer_assoc_prepare` and its `ath11k_peer_assoc_h_*`
 //!   helpers.
 //!
-//! NARF advertises HT and (5 GHz) VHT only — no HE — so mac80211's HE
-//! paths, 6 GHz association and channel widths above 80 MHz are not
-//! reachable (see the spec's open questions).
+//! NARF advertises HT, VHT and HE on 2.4 / 5 / 6 GHz. It carries both
+//! contiguous 160 MHz and non-contiguous 80+80 MHz channel definitions
+//! through Linux's VHT/HE and WMI representation.
 
 #![allow(dead_code)]
 
 extern crate alloc;
 
 use alloc::vec::Vec;
+use narf_wireless::TxBitrateBand;
 
 use super::mac_frame::{
     channel_to_freq, Band, HtCapIe, HtOperIe, VhtCapIe, VhtOperIe, HT_PARAM_CHA_SEC_ABOVE,
@@ -132,6 +133,43 @@ pub mod rc {
     pub const TX_STBC_FLAG: u32 = 0x20;
     pub const RX_STBC_FLAG_S: u32 = 6;
     pub const TS_FLAG: u32 = 0x200;
+    pub const UAPSD_FLAG: u32 = 0x400;
+}
+
+/// `ATH11K_BW_NSS_MAP_ENABLE`, `ATH11K_PEER_RX_NSS_160MHZ`, and
+/// `ATH11K_PEER_RX_NSS_80_80MHZ` in ath11k's peer-association argument.
+/// Each field holds NSS - 1.
+const BW_NSS_MAP_ENABLE: u32 = 1 << 31;
+const PEER_RX_NSS_160MHZ_MASK: u32 = 0x7;
+const PEER_RX_NSS_80_80MHZ_MASK: u32 = 0x38;
+
+/// `enum wmi_nss_ratio`, as Linux's `ath11k_get_nss_160mhz` accepts it.
+/// Firmware values for unsupported ratios intentionally produce no override,
+/// matching ath11k's warning-and-return behavior.
+mod nss_ratio {
+    pub const ONE_HALF: u32 = 0;
+    pub const ONE: u32 = 2;
+}
+
+fn nss_wide_override(nss: u32, is_80p80: bool) -> Option<u32> {
+    nss.checked_sub(1)
+        .filter(|&nss_m1| nss_m1 <= PEER_RX_NSS_160MHZ_MASK)
+        .map(|nss_m1| {
+            let field = if is_80p80 {
+                (nss_m1 << 3) & PEER_RX_NSS_80_80MHZ_MASK
+            } else {
+                nss_m1
+            };
+            BW_NSS_MAP_ENABLE | field
+        })
+}
+
+fn nss_160_limit(nss_ratio_info: u32, max_nss: u32) -> Option<u32> {
+    match nss_ratio_info {
+        nss_ratio::ONE_HALF => Some(max_nss >> 1),
+        nss_ratio::ONE => Some(max_nss),
+        _ => None,
+    }
 }
 
 /// `enum wmi_peer_smps_state` via `ath11k_smps_map[]`.
@@ -359,6 +397,10 @@ pub enum Width {
     W20,
     W40,
     W80,
+    /// Two non-contiguous 80 MHz segments (`center_freq1`, `center_freq2`).
+    W80P80,
+    /// A contiguous 160 MHz channel.
+    W160,
 }
 
 /// `struct cfg80211_chan_def`.
@@ -368,6 +410,8 @@ pub struct ChanDef {
     pub band: Band,
     pub width: Width,
     pub center_freq1: u32,
+    /// Zero except [`Width::W80P80`].
+    pub center_freq2: u32,
 }
 
 /// `enum ieee80211_conn_mode` subset.
@@ -381,13 +425,32 @@ pub enum ConnMode {
 
 /// `cfg80211_chandef_usable` for the flags NARF tracks: every 20 MHz
 /// sub-channel enabled, `NO_HT40±` on the primary for 40 MHz, `NO_80MHZ`
-/// for 80 MHz.
+/// for 80 MHz, and `NO_160MHZ` for 160 MHz.
 pub fn chandef_usable(w: &Wiphy, c: &ChanDef) -> bool {
     let Some(prim) = w.get(c.freq) else {
         return false;
     };
     if prim.flags & chan_flag::DISABLED != 0 {
         return false;
+    }
+    if c.width == Width::W80P80 {
+        if prim.flags & chan_flag::NO_80MHZ != 0
+            || c.center_freq2 == 0
+            || c.center_freq1.abs_diff(c.center_freq2) <= 80
+        {
+            return false;
+        }
+        for center in [c.center_freq1, c.center_freq2] {
+            let mut f = center - 30;
+            while f <= center + 30 {
+                match w.get(f) {
+                    Some(x) if x.flags & (chan_flag::DISABLED | chan_flag::NO_80MHZ) == 0 => {}
+                    _ => return false,
+                }
+                f += 20;
+            }
+        }
+        return true;
     }
     let (lo, hi) = match c.width {
         Width::W20NoHt | Width::W20 => return true,
@@ -408,11 +471,24 @@ pub fn chandef_usable(w: &Wiphy, c: &ChanDef) -> bool {
             }
             (c.center_freq1 - 30, c.center_freq1 + 30)
         }
+        Width::W160 => {
+            if prim.flags & (chan_flag::NO_80MHZ | chan_flag::NO_160MHZ) != 0 {
+                return false;
+            }
+            (c.center_freq1 - 70, c.center_freq1 + 70)
+        }
+        Width::W80P80 => unreachable!("handled above"),
+    };
+    let width_flags = match c.width {
+        Width::W80 => chan_flag::NO_80MHZ,
+        Width::W160 => chan_flag::NO_80MHZ | chan_flag::NO_160MHZ,
+        Width::W80P80 => unreachable!("handled above"),
+        _ => 0,
     };
     let mut f = lo;
     while f <= hi {
         match w.get(f) {
-            Some(x) if x.flags & chan_flag::DISABLED == 0 => {}
+            Some(x) if x.flags & (chan_flag::DISABLED | width_flags) == 0 => {}
             _ => return false,
         }
         f += 20;
@@ -438,6 +514,7 @@ pub fn determine_chan(
         band,
         width: Width::W20NoHt,
         center_freq1: freq,
+        center_freq2: 0,
     };
     let own_ht = own.ht(band);
     let (Some(_), Some(op)) = (ht_cap, ht_oper) else {
@@ -455,6 +532,7 @@ pub fn determine_chan(
         band,
         width: Width::W20,
         center_freq1: freq,
+        center_freq2: 0,
     };
     if own_ht.cap & ht::SUP_WIDTH_20_40 != 0 {
         match op.ht_param & HT_PARAM_CHA_SEC_OFFSET {
@@ -470,20 +548,40 @@ pub fn determine_chan(
         }
     }
     let mut mode = ConnMode::Ht;
-    if let (Some(_), Some(vop), Some(_)) = (vht_cap, vht_oper, own.vht(band)) {
+    if let (Some(ap), Some(vop), Some(own_vht)) = (vht_cap, vht_oper, own.vht(band)) {
         mode = ConnMode::Vht;
         let seg0 = channel_to_freq(vop.center_freq_seg0_idx as u32, band);
-        let c80 = match (vop.chan_width, seg0) {
-            (1 | 3, Some(c)) => Some(c),
-            // Old-style 160 MHz: seg0 is the 160 MHz centre.
-            (2, Some(c160)) => Some(if freq < c160 { c160 - 40 } else { c160 + 40 }),
-            _ => None,
-        };
-        if let Some(c) = c80 {
-            if freq + 30 >= c && freq <= c + 30 {
+        let seg1 = channel_to_freq(vop.center_freq_seg1_idx as u32, band);
+        match (vop.chan_width, seg0, seg1) {
+            (1, Some(c), _) if freq + 30 >= c && freq <= c + 30 => {
                 def.width = Width::W80;
                 def.center_freq1 = c;
             }
+            // VHT Operation: segment 0 is the primary 80 MHz segment and
+            // segment 1 identifies the non-contiguous second segment.
+            (3, Some(c0), Some(c1))
+                if own_vht.cap & vht::SUPP_CHAN_WIDTH_160_80PLUS80MHZ != 0
+                    && ap.vht_cap_info & vht::SUPP_CHAN_WIDTH_160_80PLUS80MHZ != 0
+                    && c0.abs_diff(c1) > 80
+                    && freq + 30 >= c0
+                    && freq <= c0 + 30 =>
+            {
+                def.width = Width::W80P80;
+                def.center_freq1 = c0;
+                def.center_freq2 = c1;
+            }
+            (2, Some(c160), _) => {
+                // The VHT Operation IE's segment 0 is the 160 MHz centre.
+                if own_vht.cap & vht::SUPP_CHAN_WIDTH_MASK != 0
+                    && ap.vht_cap_info & vht::SUPP_CHAN_WIDTH_MASK != 0
+                    && freq + 70 >= c160
+                    && freq <= c160 + 70
+                {
+                    def.width = Width::W160;
+                    def.center_freq1 = c160;
+                }
+            }
+            _ => {}
         }
     }
     // ieee80211_chandef_downgrade until usable.
@@ -492,6 +590,21 @@ pub fn determine_chan(
             return (mode, def);
         }
         match def.width {
+            Width::W80P80 => {
+                // A failed second segment reduces to the primary 80 MHz.
+                def.width = Width::W80;
+                def.center_freq2 = 0;
+            }
+            Width::W160 => {
+                // Downgrade to the 80 MHz segment containing the primary.
+                def.width = Width::W80;
+                def.center_freq1 = if freq < def.center_freq1 {
+                    def.center_freq1 - 40
+                } else {
+                    def.center_freq1 + 40
+                };
+                def.center_freq2 = 0;
+            }
             Width::W80 => {
                 // Keep the HT operation's 40 MHz half if any.
                 def.width = Width::W40;
@@ -507,9 +620,182 @@ pub fn determine_chan(
             Width::W40 => {
                 def.width = Width::W20;
                 def.center_freq1 = freq;
+                def.center_freq2 = 0;
             }
             Width::W20 | Width::W20NoHt => return (mode, def),
         }
+    }
+}
+
+/// A six-GHz HE channel may only be used when every constituent 20 MHz
+/// channel is enabled for HE. `cfg80211_chandef_usable` supplies the common
+/// regulatory checks; this adds its `NO_HE` constraint.
+fn he_chandef_usable(w: &Wiphy, c: &ChanDef) -> bool {
+    if !chandef_usable(w, c) {
+        return false;
+    }
+    if c.width == Width::W80P80 {
+        for center in [c.center_freq1, c.center_freq2] {
+            let mut freq = center - 30;
+            while freq <= center + 30 {
+                if !matches!(w.get(freq), Some(ch) if ch.flags & chan_flag::NO_HE == 0) {
+                    return false;
+                }
+                freq += 20;
+            }
+        }
+        return true;
+    }
+    let (lo, hi) = match c.width {
+        Width::W20NoHt | Width::W20 => (c.freq, c.freq),
+        Width::W40 => (c.center_freq1 - 10, c.center_freq1 + 10),
+        Width::W80 => (c.center_freq1 - 30, c.center_freq1 + 30),
+        Width::W160 => (c.center_freq1 - 70, c.center_freq1 + 70),
+        Width::W80P80 => unreachable!("handled above"),
+    };
+    let mut freq = lo;
+    while freq <= hi {
+        if !matches!(w.get(freq), Some(ch) if ch.flags & chan_flag::NO_HE == 0) {
+            return false;
+        }
+        freq += 20;
+    }
+    true
+}
+
+/// Downgrade a HE 6 GHz definition while retaining the 80 MHz segment that
+/// contains the primary channel. The HE Operation field has no explicit
+/// 40 MHz centre, so derive it from the primary's position in that 80 MHz
+/// segment, exactly as cfg80211's channel-definition downgrade does.
+fn downgrade_he_6ghz(def: &mut ChanDef, primary_80: u32) {
+    match def.width {
+        Width::W80P80 => {
+            def.width = Width::W80;
+            def.center_freq1 = primary_80;
+            def.center_freq2 = 0;
+        }
+        Width::W160 => {
+            def.width = Width::W80;
+            def.center_freq1 = primary_80;
+            def.center_freq2 = 0;
+        }
+        Width::W80 => {
+            let base = def.center_freq1.saturating_sub(30);
+            let offset = def.freq.saturating_sub(base);
+            if offset > 60 || offset % 20 != 0 {
+                def.width = Width::W20;
+                def.center_freq1 = def.freq;
+            } else {
+                def.width = Width::W40;
+                def.center_freq1 = if offset % 40 == 0 {
+                    def.freq + 10
+                } else {
+                    def.freq - 10
+                };
+            }
+        }
+        Width::W40 => {
+            def.width = Width::W20;
+            def.center_freq1 = def.freq;
+            def.center_freq2 = 0;
+        }
+        Width::W20 | Width::W20NoHt => {}
+    }
+}
+
+/// The raw channel definition encoded by a 6 GHz HE Operation.
+/// `ieee80211_chandef_he_6ghz_oper` uses the same information before the
+/// station later restricts it to local regulatory and capability limits.
+pub fn he_6ghz_oper_chandef(freq: u32, oper: &super::mac::he::HeOper) -> Option<ChanDef> {
+    let op = oper.six_ghz?;
+    if channel_to_freq(op.primary as u32, Band::Ghz6) != Some(freq) {
+        return None;
+    }
+    let center0 = channel_to_freq(op.ccfs0 as u32, Band::Ghz6)?;
+    let width = op.control & super::mac::he::He6GhzOper::WIDTH_MASK;
+    let mut def = ChanDef {
+        freq,
+        band: Band::Ghz6,
+        width: Width::W20,
+        center_freq1: center0,
+        center_freq2: 0,
+    };
+    match width {
+        super::mac::he::He6GhzOper::WIDTH_20 if center0 == freq => {}
+        super::mac::he::He6GhzOper::WIDTH_40 if freq.abs_diff(center0) == 10 => {
+            def.width = Width::W40;
+        }
+        super::mac::he::He6GhzOper::WIDTH_80 if matches!(freq.abs_diff(center0), 10 | 30) => {
+            def.width = Width::W80;
+        }
+        super::mac::he::He6GhzOper::WIDTH_160 => {
+            let Some(center1) = channel_to_freq(op.ccfs1 as u32, Band::Ghz6) else {
+                // Linux falls back to the primary 80 MHz when ccfs1 is zero.
+                if !matches!(freq.abs_diff(center0), 10 | 30) {
+                    return None;
+                }
+                def.width = Width::W80;
+                return Some(def);
+            };
+            if op.ccfs1.abs_diff(op.ccfs0) == 8 {
+                if !matches!(freq.abs_diff(center1), 10 | 30 | 50 | 70) {
+                    return None;
+                }
+                def.width = Width::W160;
+                def.center_freq1 = center1;
+            } else {
+                if !matches!(freq.abs_diff(center0), 10 | 30) {
+                    return None;
+                }
+                if center0.abs_diff(center1) <= 80 {
+                    return None;
+                }
+                def.width = Width::W80P80;
+                def.center_freq2 = center1;
+            }
+        }
+        _ => return None,
+    }
+    Some(def)
+}
+
+/// `ieee80211_chandef_he_6ghz_oper` plus local capability and regulatory
+/// downgrade.
+///
+/// Six GHz has no HT or VHT Operation IEs. The optional HE Operation tail
+/// supplies the primary, width and centres. A 160 MHz operation whose
+/// centres do not differ by eight channels represents 80+80 and requires
+/// both ends to advertise the separate HE 80+80 capability bit.
+pub fn determine_he_6ghz_chan(
+    w: &Wiphy,
+    freq: u32,
+    oper: &super::mac::he::HeOper,
+    max_width: Width,
+    allow_80p80: bool,
+) -> Option<ChanDef> {
+    let op = oper.six_ghz?;
+    let center0 = channel_to_freq(op.ccfs0 as u32, Band::Ghz6)?;
+    let mut def = he_6ghz_oper_chandef(freq, oper)?;
+    if def.width == Width::W80P80 && !allow_80p80 {
+        downgrade_he_6ghz(&mut def, center0);
+    }
+    he_6ghz_downgrade_until_usable(w, def, center0, max_width)
+}
+
+fn he_6ghz_downgrade_until_usable(
+    w: &Wiphy,
+    mut def: ChanDef,
+    primary_80: u32,
+    max_width: Width,
+) -> Option<ChanDef> {
+    loop {
+        if def.width <= max_width && he_chandef_usable(w, &def) {
+            return Some(def);
+        }
+        if def.width <= Width::W20 {
+            return None;
+        }
+        downgrade_he_6ghz(&mut def, primary_80);
     }
 }
 
@@ -520,9 +806,13 @@ pub fn vdev_phymode(def: &ChanDef) -> u32 {
         (Band::Ghz2, Width::W20NoHt | Width::W20) => MODE_11AX_HE20_2G,
         (Band::Ghz2, Width::W40) => MODE_11AX_HE40_2G,
         (Band::Ghz2, Width::W80) => MODE_11AX_HE80_2G,
+        (Band::Ghz2, Width::W80P80) => MODE_UNKNOWN,
+        (Band::Ghz2, Width::W160) => MODE_UNKNOWN,
         (_, Width::W20NoHt | Width::W20) => MODE_11AX_HE20,
         (_, Width::W40) => MODE_11AX_HE40,
         (_, Width::W80) => MODE_11AX_HE80,
+        (_, Width::W80P80) => MODE_11AX_HE80_80,
+        (_, Width::W160) => MODE_11AX_HE160,
     }
 }
 
@@ -558,11 +848,19 @@ pub fn assoc_ht_cap(own: &StaHtCap, def: &ChanDef, smps: SmpsMode) -> HtCapIe {
     }
 }
 
-/// `ieee80211_add_vht_ie` (single interface, so we own MU-MIMO).
-pub fn assoc_vht_cap(own: &StaVhtCap, ap: &VhtCapIe) -> VhtCapIe {
+/// `ieee80211_add_vht_ie` (single interface, so we own MU-MIMO). The
+/// capability is limited to the negotiated channel width.
+pub fn assoc_vht_cap(own: &StaVhtCap, ap: &VhtCapIe, width: Width) -> VhtCapIe {
     let mut cap = own.cap;
-    // conn->bw_limit is at most 80 MHz in NARF.
-    cap &= !(vht::SHORT_GI_160 | vht::SUPP_CHAN_WIDTH_MASK);
+    if !matches!(width, Width::W160 | Width::W80P80) {
+        cap &= !(vht::SHORT_GI_160 | vht::SUPP_CHAN_WIDTH_MASK);
+    } else if width == Width::W160 {
+        cap &= !vht::SUPP_CHAN_WIDTH_160_80PLUS80MHZ;
+        cap |= vht::SUPP_CHAN_WIDTH_160MHZ;
+    } else {
+        cap &= !vht::SUPP_CHAN_WIDTH_160MHZ;
+        cap |= vht::SUPP_CHAN_WIDTH_160_80PLUS80MHZ;
+    }
     if ap.vht_cap_info & vht::SU_BEAMFORMER_CAPABLE == 0 {
         cap &= !(vht::SU_BEAMFORMEE_CAPABLE | vht::MU_BEAMFORMEE_CAPABLE);
     } else if ap.vht_cap_info & vht::MU_BEAMFORMER_CAPABLE == 0 {
@@ -604,6 +902,10 @@ pub struct ApSta {
     pub bandwidth: Option<StaBw>,
     pub rx_nss: u8,
     pub wme: bool,
+    /// `ieee80211_sta::uapsd_queues`, in WMM QoS-info AC bit order.
+    pub uapsd_queues: u8,
+    /// `ieee80211_sta::max_sp` (0 = unlimited; 1/2/3 = 2/4/6 frames).
+    pub max_sp: u8,
     pub mfp: bool,
 }
 
@@ -613,6 +915,8 @@ pub struct ApSta {
 pub struct ApHe {
     pub cap: super::mac::he::StaHeCap,
     pub oper_params: u32,
+    /// `ieee80211_sta_he_cap::he_6ghz_capa`, when this is a 6 GHz AP.
+    pub six_ghz_cap: Option<u16>,
 }
 
 /// `ieee80211_ht_cap_ie_to_sta_ht_cap`.
@@ -766,6 +1070,8 @@ pub fn sta_bandwidth(ht: &StaHtCap, v: &StaVhtCap, def: &ChanDef) -> StaBw {
         Width::W20NoHt | Width::W20 => StaBw::Bw20,
         Width::W40 => StaBw::Bw40,
         Width::W80 => StaBw::Bw80,
+        Width::W80P80 => StaBw::Bw160,
+        Width::W160 => StaBw::Bw160,
     };
     cap.min(chan)
 }
@@ -904,6 +1210,190 @@ pub fn vht_limit(mut set: u16, limit: &[u16; 8]) -> u16 {
     set
 }
 
+/// `ath11k_peer_assoc_h_he_limit`: intersect an HE MCS/NSS capability map
+/// with nl80211's per-NSS allowed-MCS bitmaps.  The two-bit map carries the
+/// greatest contiguous supported MCS range, so a sparse mask is represented
+/// only when it selects one rate (the fixed-rate path handles that case).
+pub fn he_limit(mut set: u16, limit: &[u16; 8]) -> u16 {
+    const HE_MCS_0_7: u16 = 0;
+    const HE_MCS_0_9: u16 = 1;
+    const HE_MCS_0_11: u16 = 2;
+    const HE_MCS_NOT_SUPPORTED: u16 = 3;
+    for nss in 0..8u32 {
+        let supported = match (set >> (nss * 2)) & 3 {
+            HE_MCS_0_7 => 0x00ff,
+            HE_MCS_0_9 => 0x03ff,
+            HE_MCS_0_11 => 0x0fff,
+            _ => 0,
+        };
+        let limited = supported & limit[nss as usize];
+        let value = match limited {
+            0 => HE_MCS_NOT_SUPPORTED,
+            1..=0x00ff => HE_MCS_0_7,
+            0x0100..=0x03ff => HE_MCS_0_9,
+            _ => HE_MCS_0_11,
+        };
+        set &= !(0x3 << (nss * 2));
+        set |= value << (nss * 2);
+    }
+    set
+}
+
+/// Reject cfg80211 masks that ath11k cannot represent faithfully.  The
+/// target's peer-association format can carry VHT/HE contiguous ranges; a
+/// sparse multi-rate VHT/HE selection needs the unimplemented RATEMASK WMI
+/// command and therefore has the same `-EINVAL` result as Linux ath11k.
+pub fn validate_tx_bitrate_band(mask: &TxBitrateBand) -> Result<(), ()> {
+    if mask.gi == Some(2) {
+        // `NL80211_TXRATE_FORCE_LGI` is explicitly refused by ath11k.
+        return Err(());
+    }
+    let contiguous = |value: u16, maximum: u16| {
+        value == 0
+            || value == 0x00ff
+            || value == 0x01ff
+            || (maximum == 0x0fff && value == 0x03ff)
+            || (maximum == 0x0fff && value == 0x07ff)
+            || value == maximum
+    };
+    if let Some(vht) = mask.vht_mcs {
+        if vht.iter().any(|value| *value & !0x03ff != 0)
+            || vht.iter().map(|value| value.count_ones()).sum::<u32>() > 1
+                && vht.iter().any(|value| !contiguous(*value, 0x03ff))
+        {
+            return Err(());
+        }
+    }
+    if let Some(he) = mask.he_mcs {
+        if he.iter().any(|value| *value & !0x0fff != 0)
+            || he.iter().map(|value| value.count_ones()).sum::<u32>() > 1
+                && he.iter().any(|value| !contiguous(*value, 0x0fff))
+        {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+/// Apply one band's cfg80211 rate restriction to an already constructed WMI
+/// peer-association record.  This is deliberately after capability parsing:
+/// the restriction can only remove rates the peer and local radio negotiated.
+pub fn apply_tx_bitrate_band(a: &mut PeerAssocParams, mask: Option<&TxBitrateBand>) {
+    let Some(mask) = mask else { return };
+    if let Some(legacy) = mask.legacy.as_ref() {
+        a.peer_legacy_rates.retain(|rate| {
+            legacy
+                .iter()
+                .any(|allowed| (allowed & 0x7f) == (rate & 0x7f))
+        });
+    }
+    if let Some(ht) = mask.ht_mcs.as_ref() {
+        a.peer_ht_rates.retain(|mcs| {
+            let byte = (*mcs / 8) as usize;
+            byte < ht.len() && ht[byte] & (1 << (*mcs % 8)) != 0
+        });
+    }
+    if let Some(vht) = mask.vht_mcs.as_ref() {
+        a.rx_mcs_set = vht_limit(a.rx_mcs_set as u16, vht) as u32;
+        a.tx_mcs_set = vht_limit(a.tx_mcs_set as u16, vht) as u32;
+    }
+    if let Some(he) = mask.he_mcs.as_ref() {
+        for (rx, tx) in &mut a.peer_he_mcs {
+            *rx = he_limit(*rx as u16, he) as u32;
+            *tx = he_limit(*tx as u16, he) as u32;
+        }
+    }
+}
+
+/// Maximum requested NSS in a rate mask, corresponding to
+/// `ath11k_mac_max_nss`.  `None` means all negotiated MCS masks remain
+/// available, so it places no additional NSS limit.
+pub fn tx_bitrate_max_nss(mask: Option<&TxBitrateBand>) -> Option<u32> {
+    let mask = mask?;
+    let mut maximum = 0u32;
+    if let Some(ht) = mask.ht_mcs.as_ref() {
+        maximum = maximum.max(
+            ht.iter()
+                .rposition(|entry| *entry != 0)
+                .map_or(0, |index| index as u32 + 1),
+        );
+    }
+    if let Some(vht) = mask.vht_mcs.as_ref() {
+        maximum = maximum.max(
+            vht.iter()
+                .rposition(|entry| *entry != 0)
+                .map_or(0, |index| index as u32 + 1),
+        );
+    }
+    if let Some(he) = mask.he_mcs.as_ref() {
+        maximum = maximum.max(
+            he.iter()
+                .rposition(|entry| *entry != 0)
+                .map_or(0, |index| index as u32 + 1),
+        );
+    }
+    (maximum != 0).then_some(maximum)
+}
+
+/// One of the target's peer fixed-rate codes, or `None` when normal rate
+/// control must remain enabled.  This follows ath11k's VHT → HE → HT
+/// precedence and validates that the selected NSS exists on the peer.
+pub fn tx_bitrate_fixed_rate(
+    mask: Option<&TxBitrateBand>,
+    vht: bool,
+    he: bool,
+    ht: bool,
+    peer_nss: u32,
+) -> Result<Option<u32>, ()> {
+    let Some(mask) = mask else { return Ok(None) };
+    let one = |maps: &[u16; 8], preamble: u32| {
+        let mut selected = None;
+        for (index, mcs) in maps.iter().enumerate() {
+            if mcs.count_ones() == 1 {
+                selected = Some((index as u32 + 1, mcs.trailing_zeros()));
+            }
+        }
+        let total: u32 = maps.iter().map(|entry| entry.count_ones()).sum();
+        (total == 1)
+            .then_some(selected)
+            .flatten()
+            .map(|(nss, rate)| (nss, rate, preamble))
+    };
+    let ht_one = || {
+        let ht = mask.ht_mcs.as_ref()?;
+        let mut selected = None;
+        for (index, mcs) in ht.iter().enumerate() {
+            if mcs.count_ones() == 1 {
+                selected = Some((index as u32 + 1, mcs.trailing_zeros()));
+            }
+        }
+        let total: u32 = ht.iter().map(|entry| entry.count_ones()).sum();
+        (total == 1)
+            .then_some(selected)
+            .flatten()
+            .map(|(nss, rate)| (nss, rate, 2))
+    };
+    let mut selected = if vht {
+        mask.vht_mcs.as_ref().and_then(|mcs| one(mcs, 3))
+    } else {
+        None
+    };
+    if selected.is_none() && he {
+        selected = mask.he_mcs.as_ref().and_then(|mcs| one(mcs, 4));
+    }
+    if selected.is_none() && ht {
+        selected = ht_one();
+    }
+    let Some((nss, rate, preamble)) = selected else {
+        return Ok(None);
+    };
+    if nss > peer_nss {
+        return Err(());
+    }
+    // ATH11K_HW_RATE_CODE(rate, nss - 1, preamble).
+    Ok(Some((1 << 28) | ((nss - 1) << 5) | (preamble << 8) | rate))
+}
+
 // ── ath11k_peer_assoc_prepare ───────────────────────────────────────
 
 /// Inputs of `ath11k_peer_assoc_prepare` for the BSS peer of a STA vdev.
@@ -915,6 +1405,9 @@ pub struct PeerAssocInput<'a> {
     pub assoc_capability: u16,
     /// `hw->conf.listen_interval`.
     pub listen_interval: u32,
+    /// SERVICE_READY_EXT's `nss_ratio_info`: the device's maximum 160 MHz
+    /// NSS relative to the map advertised at 80 MHz.
+    pub nss_ratio_info: u32,
     pub def: ChanDef,
     pub sta: &'a ApSta,
     /// HE (`sta->deflink.he_cap.has_he`).
@@ -968,17 +1461,11 @@ pub fn peer_assoc_prepare(p: &PeerAssocInput<'_>) -> PeerAssocParams {
             StaBw::Bw40 => phy_mode::MODE_11AX_HE40_2G,
             _ => phy_mode::MODE_11AX_HE20_2G,
         },
-        // ath11k_mac_get_phymode_he
-        (_, Some(h)) => match bw {
-            StaBw::Bw160 => {
-                if h.cap.phy[0] & super::mac::he::cap::PHY0_80PLUS80_MHZ_IN_5G != 0
-                    && h.cap.phy[0] & super::mac::he::cap::PHY0_160MHZ_IN_5G == 0
-                {
-                    phy_mode::MODE_11AX_HE80_80
-                } else {
-                    phy_mode::MODE_11AX_HE160
-                }
-            }
+        // ath11k_mac_get_phymode_he. `StaBw::Bw160` covers both contiguous
+        // 160 MHz and 80+80; the ChanDef selects their distinct WMI modes.
+        (_, Some(_)) => match bw {
+            StaBw::Bw160 if p.def.width == Width::W80P80 => phy_mode::MODE_11AX_HE80_80,
+            StaBw::Bw160 => phy_mode::MODE_11AX_HE160,
             StaBw::Bw80 => phy_mode::MODE_11AX_HE80,
             StaBw::Bw40 => phy_mode::MODE_11AX_HE40,
             StaBw::Bw20 => phy_mode::MODE_11AX_HE20,
@@ -1006,15 +1493,10 @@ pub fn peer_assoc_prepare(p: &PeerAssocInput<'_>) -> PeerAssocParams {
             _ => {
                 if sta.vht_cap.vht_supported {
                     match bw {
-                        StaBw::Bw160 => {
-                            if sta.vht_cap.cap & vht::SUPP_CHAN_WIDTH_MASK
-                                == vht::SUPP_CHAN_WIDTH_160_80PLUS80MHZ
-                            {
-                                phy_mode::MODE_11AC_VHT80_80
-                            } else {
-                                phy_mode::MODE_11AC_VHT160
-                            }
+                        StaBw::Bw160 if p.def.width == Width::W80P80 => {
+                            phy_mode::MODE_11AC_VHT80_80
                         }
+                        StaBw::Bw160 => phy_mode::MODE_11AC_VHT160,
                         StaBw::Bw80 => phy_mode::MODE_11AC_VHT80,
                         StaBw::Bw40 => phy_mode::MODE_11AC_VHT40,
                         StaBw::Bw20 => phy_mode::MODE_11AC_VHT20,
@@ -1103,6 +1585,18 @@ pub fn peer_assoc_prepare(p: &PeerAssocInput<'_>) -> PeerAssocParams {
             }
         }
         a.peer_nss = (sta.rx_nss as u32).min(max_nss);
+        // Linux's `ath11k_peer_assoc_h_vht` computes this only after the
+        // VHT RX MCS map has constrained peer_nss.  Sending the pre-VHT
+        // value would silently cap a two-stream 160 MHz peer at one stream.
+        if bw == StaBw::Bw160 {
+            let nss_160 =
+                nss_160_limit(p.nss_ratio_info, max_nss).map(|limit| a.peer_nss.min(limit));
+            if let Some(override_) =
+                nss_160.and_then(|nss| nss_wide_override(nss, p.def.width == Width::W80P80))
+            {
+                a.peer_bw_rxnss_override = override_;
+            }
+        }
         a.rx_max_rate = v.rx_highest as u32;
         a.rx_mcs_set = vht_limit(v.rx_mcs_map, &mask) as u32;
         a.tx_max_rate = v.tx_highest as u32;
@@ -1115,12 +1609,18 @@ pub fn peer_assoc_prepare(p: &PeerAssocInput<'_>) -> PeerAssocParams {
     }
     // h_he (default bitrate mask: every HE MCS allowed)
     if let Some(h) = he {
-        peer_assoc_h_he(&mut a, sta, &h.cap, h.oper_params, bw);
+        peer_assoc_h_he(&mut a, p, sta, &h.cap, h.oper_params, h.six_ghz_cap, bw);
     }
-    // h_qos (STA vdev)
+    // ath11k_peer_assoc_h_qos. AP clients with a non-zero U-APSD AC
+    // bitmap need both WMI_PEER_APSD and WMI_HOST_RC_UAPSD_FLAG; the
+    // follow-up AP-PS peer commands carry the exact queues and max SP.
     if sta.wme {
         a.is_wme_set = true;
         a.qos_flag = true;
+        if sta.uapsd_queues != 0 {
+            a.apsd_flag = true;
+            a.peer_rate_caps |= rc::UAPSD_FLAG;
+        }
     }
     // h_smps
     if h.ht_supported {
@@ -1130,24 +1630,35 @@ pub fn peer_assoc_prepare(p: &PeerAssocInput<'_>) -> PeerAssocParams {
             sm_ps::DISABLED => a.spatial_mux_flag = true,
             _ => {}
         }
+    } else if p.def.band == Band::Ghz6 {
+        if let Some(cap) = he.and_then(|h| h.six_ghz_cap) {
+            match (cap & super::mac::he::cap_6ghz::SM_PS_MASK) >> 9 {
+                sm_ps::STATIC => a.static_mimops_flag = true,
+                sm_ps::DYNAMIC => a.dynamic_mimops_flag = true,
+                sm_ps::DISABLED => a.spatial_mux_flag = true,
+                _ => {}
+            }
+        }
     }
     a.is_assoc = true;
     a
 }
 
 /// `ath11k_peer_assoc_h_he` with the default bitrate mask (`he_mcs` all
-/// ones: `ath11k_peer_assoc_h_he_limit` leaves the maps as they are) and
-/// no 160 MHz (no `peer_bw_rxnss_override`).
+/// ones: `ath11k_peer_assoc_h_he_limit` leaves the maps as they are).
 fn peer_assoc_h_he(
     a: &mut PeerAssocParams,
+    p: &PeerAssocInput<'_>,
     sta: &ApSta,
     h: &super::mac::he::StaHeCap,
     oper: u32,
+    six_ghz_cap: Option<u16>,
     bw: StaBw,
 ) {
     use super::mac::he::{cap, HE_MCS_NOT_SUPPORTED};
     a.he_flag = true;
     let support_160 = h.phy[0] & cap::PHY0_160MHZ_IN_5G != 0;
+    let support_80p80 = h.phy[0] & cap::PHY0_80PLUS80_MHZ_IN_5G != 0;
     let top = |m: u16| {
         (0..8u32)
             .rev()
@@ -1155,9 +1666,15 @@ fn peer_assoc_h_he(
             .map_or(9, |i| i + 1)
     };
     let rx_mcs_80 = top(h.mcs[0]);
-    let rx_mcs_160 = if support_160 { top(h.mcs[2]) } else { 9 };
-    let max_nss = if support_160 {
-        rx_mcs_80.min(rx_mcs_160)
+    let wide_rx_mcs = if p.def.width == Width::W80P80 && support_80p80 {
+        top(h.mcs[4])
+    } else if support_160 {
+        top(h.mcs[2])
+    } else {
+        9
+    };
+    let max_nss = if bw == StaBw::Bw160 {
+        rx_mcs_80.min(wide_rx_mcs)
     } else {
         rx_mcs_80
     };
@@ -1209,14 +1726,51 @@ fn peer_assoc_h_he(
     if h.mac[0] & cap::MAC0_TWT_REQ != 0 {
         a.twt_requester = true;
     }
-    // WMI_HECAP_TXRX_MCS_NSS_IDX_80 only: 160 / 80+80 sets need
-    // IEEE80211_STA_RX_BW_160, which NARF's 80 MHz channel layer never sets.
-    let _ = bw;
+    // WMI rate-set indices are 80 MHz, contiguous 160 MHz, then 80+80.
+    // An 80+80 peer therefore carries the unused contiguous-160 slot as
+    // a placeholder so its 80+80 map reaches index two, as ath11k does.
     a.peer_he_mcs.clear();
     a.peer_he_mcs.push((h.mcs[0] as u32, h.mcs[1] as u32));
-    // The NSS loop over he_tx_mcs: he_mcs_mask[i] is set for every i with
-    // the default mask, so max_nss = NL80211_HE_NSS_MAX (8).
-    a.peer_nss = (sta.rx_nss as u32).min(8);
+    let tx_mcs = if bw == StaBw::Bw160 && p.def.width == Width::W80P80 && support_80p80 {
+        a.peer_he_mcs.push((h.mcs[2] as u32, h.mcs[3] as u32));
+        a.peer_he_mcs.push((h.mcs[4] as u32, h.mcs[5] as u32));
+        a.bw_160 = true;
+        h.mcs[5]
+    } else if bw == StaBw::Bw160 && support_160 {
+        a.peer_he_mcs.push((h.mcs[2] as u32, h.mcs[3] as u32));
+        a.bw_160 = true;
+        h.mcs[3]
+    } else {
+        h.mcs[1]
+    };
+    let tx_nss = top(tx_mcs);
+    a.peer_nss = (sta.rx_nss as u32).min(tx_nss);
+    if bw == StaBw::Bw160 {
+        let nss_160 = nss_160_limit(p.nss_ratio_info, tx_nss).map(|limit| a.peer_nss.min(limit));
+        if let Some(override_) =
+            nss_160.and_then(|nss| nss_wide_override(nss, p.def.width == Width::W80P80))
+        {
+            a.peer_bw_rxnss_override = override_;
+        }
+    }
+    // `ath11k_peer_assoc_h_he_6ghz`: no HT/VHT peer capability exists in
+    // this band, so carry the HE 6 GHz Capabilities in the WMI peer command
+    // and derive the aggregate MPDU/SMPS constraints from it.
+    if p.def.band == Band::Ghz6 {
+        let Some(cap6) = six_ghz_cap else { return };
+        match bw {
+            StaBw::Bw40 => a.bw_40 = true,
+            StaBw::Bw80 => a.bw_80 = true,
+            StaBw::Bw160 => a.bw_160 = true,
+            StaBw::Bw20 => {}
+        }
+        a.peer_he_caps_6ghz = cap6 as u32;
+        a.peer_mpdu_density =
+            parse_mpdudensity((cap6 & super::mac::he::cap_6ghz::MIN_MPDU_START_MASK) as u8);
+        let ampdu = ((h.mac[3] & cap::MAC3_MAX_AMPDU_LEN_EXP_MASK) >> 3) as u32
+            + ((cap6 & super::mac::he::cap_6ghz::MAX_AMPDU_LEN_EXP_MASK) >> 3) as u32;
+        a.peer_max_mpdu = (1u32 << (13 + ampdu)) - 1;
+    }
 }
 
 /// `ath11k_mac_set_txbf_conf` value (`None` ⇔ no command).

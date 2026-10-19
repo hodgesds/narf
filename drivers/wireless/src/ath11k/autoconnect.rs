@@ -162,6 +162,7 @@ pub fn pick(bss: &[BssInfo], ssid: &[u8], wpa2: bool) -> Option<BssInfo> {
         .map(|b| BssInfo {
             bssid: b.bssid,
             ssid: b.ssid.clone(),
+            frequency_mhz: b.frequency_mhz,
             channel: b.channel,
             rssi: b.rssi,
             security: b.security,
@@ -189,13 +190,25 @@ pub fn scan_request(cfg: &AutoCfg) -> ScanRequest {
     match &cfg.ssid {
         Some(s) => ScanRequest {
             ssids: alloc::vec![s.clone()],
+            frequencies_mhz: Vec::new(),
             channels: Vec::new(),
             active: true,
+            random_mac: None,
+            colocated_6ghz: false,
+            duration_tu: None,
+            duration_mandatory: false,
+            extra_ies: Vec::new(),
         },
         None => ScanRequest {
             ssids: Vec::new(),
+            frequencies_mhz: Vec::new(),
             channels: Vec::new(),
             active: false,
+            random_mac: None,
+            colocated_6ghz: false,
+            duration_tu: None,
+            duration_mandatory: false,
+            extra_ies: Vec::new(),
         },
     }
 }
@@ -215,6 +228,7 @@ pub fn pick_for(bss: &[BssInfo], ssid: &[u8], cfg: &AutoCfg) -> Option<BssInfo> 
         (Some(a), _) => Some(BssInfo {
             bssid: a.bssid,
             ssid: a.ssid.clone(),
+            frequency_mhz: a.frequency_mhz,
             channel: a.channel,
             rssi: a.rssi,
             security: a.security,
@@ -247,6 +261,7 @@ pub fn associate_request(cfg: &AutoCfg, bss: &BssInfo, ies: Option<&[u8]>) -> As
     AssociateRequest {
         bssid: bss.bssid,
         ssid: bss.ssid.clone(),
+        frequency_mhz: bss.frequency_mhz,
         channel: bss.channel,
         security,
         ie: Vec::new(),

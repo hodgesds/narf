@@ -45,6 +45,7 @@ pub mod suspend;
 pub mod syscall;
 pub mod sysfs_bridge;
 pub mod system;
+pub mod system_pm;
 pub mod thermal;
 pub mod watchdog;
 pub mod watchdog_bridge;

@@ -172,6 +172,8 @@ pub const QMI_WLANFW_MEM_BDF_V01: i32 = 2;
 pub const QMI_WLANFW_MEM_M3_V01: i32 = 3;
 pub const QMI_WLANFW_MEM_CAL_V01: i32 = 4;
 pub const QMI_WLANFW_MEM_DPD_V01: i32 = 5;
+/// `PAGEABLE_MEM_REGION_TYPE`, included in Linux's ath11k device coredump.
+pub const QMI_WLANFW_MEM_PAGEABLE_V01: i32 = 9;
 
 /// Region types ath11k switches on in `assign_target_mem_chunk`.
 pub const HOST_DDR_REGION_TYPE: u32 = 0x1;

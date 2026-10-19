@@ -21,13 +21,17 @@
 
 ## 1. Purpose & scope
 
-**Owns:** station-mode bring-up of PCIe ath11k parts, first target
-the WCN6855 HW2.1 in Lenovo's QCNFA765 module (`17cb:1103`,
-subsystem `17aa:9309`).
+**Owns:** station-mode bring-up plus up to three concurrent station, AP/GO or
+P2P-role vdevs of PCIe ath11k parts, first target the WCN6855 HW2.1 in Lenovo's QCNFA765
+module (`17cb:1103`, subsystem `17aa:9309`). AP/GO includes hostapd-facing
+management-frame transport, client-peer programming and an Ethernet data
+path; P2P includes the Device/Client/GO WMI roles and remain-on-channel.
 
-**Does NOT own:** AHB/SoC-integrated parts (IPQ*, WCN6750), AP /
-mesh / monitor modes, ath12k parts (WCN7850 `17cb:1107`, QCN9274
-`17cb:1109`).
+**Does NOT own:** AHB/SoC-integrated parts (IPQ*, WCN6750), mesh or monitor
+mode (Linux disables monitor for WCN6855), an in-kernel AP authentication /
+association state machine (hostapd owns it through registered management
+frames), or ath12k parts (WCN7850
+`17cb:1107`, QCN9274 `17cb:1109`).
 
 ## 2. Hardware interface
 
@@ -62,7 +66,8 @@ MSI bits, sleep, time, randomness): context arrays + rings in DMA32
 memory, `mhi_init_mmio`, `mhi_async_power_up` / `mhi_sync_power_up`,
 FBC download (BHI of the first `sbl_size` bytes, then a BHIe vector
 table for the image, skipping the SBL if a second ELF header
-follows it), READY → M0 → SBL → AMSS, event-ring processing, the
+follows it), and ath11k's `RDDM_DUMP_SIZE` BHIe RX table (4.125 MiB in
+512 KiB DMA32 segments), READY → M0 → SBL → AMSS, event-ring processing, the
 command ring and `mhi_prepare_for_transfer` with QRTR's buffer policy
 (63 pre-posted 8 KiB DL buffers, recycled on completion). Timeouts are
 `MHI_TIMEOUT_DEFAULT_MS` = 20 s (`ath11k_mhi_start` overrides the
@@ -77,23 +82,34 @@ the control ring (M0, M1 → M2 + MHI_CB_IDLE, M3, EE events, command
 completions) and IPCR. `status_cb` is ath11k's
 `ath11k_mhi_op_status_cb`: EE_RDDM (intvec with the EE already RDDM
 while `mhi_is_active`, or the RDDM EE event) queues `reset_work` unless
-the previous reason was EE_RDDM; SYS_ERROR queues it too, once per run
-of consecutive SYS_ERRORs (§8);
-`take_reset_request` hands it to the core once (`FwNotice::Reset`).
+the previous reason was EE_RDDM. An RDDM-capable controller does not
+reset on the earlier SYS_ERROR indication: it waits for the RDDM event,
+including a second interrupt that races the PM-state transition. Before
+the reset, `MhiController::collect_rddm` waits for `BHIE_RXVECSTATUS`,
+copies the device-written segments into `RddmSnapshot`, then moves it to
+the physical radio's `FirmwareCrashDump` retrieval slot before recovery;
+`take_reset_request` hands the one EE_RDDM request to the core
+(`FwNotice::Reset`).
 `mhi_pm_st_worker` items queued after mission mode are logged and
 dropped. `power_down()` = `mhi_power_down(graceful)` (SHUTDOWN_PROCESS,
 EE DISABLE, `mhi_pm_disable_transition`: MHI RESET + INTVEC re-program +
 READY wait — failures only logged, as Linux —, IPCR channels dropped
 without the RESET command, event / command rings reset, DISABLE) +
-`mhi_unprepare_after_power_down` (BHIe table, contexts, per-boot state
-freed); `power_cycle()` = `ath11k_hif_power_down` + `ath11k_hif_power_up`:
+`mhi_unprepare_after_power_down` (FBC BHIe table, contexts, per-boot state
+freed; the RDDM receive table is retained and any completed CPU snapshot has
+already moved to the radio dump slot);
+`power_cycle()` = `ath11k_hif_power_down` + `ath11k_hif_power_up`:
 `MhiBus::hif_power(Down)` (ASPM restore, force wake, MSI off),
 `power_down`, `hif_power(Reset)` (`ath11k_pci_sw_reset(false)`),
 `hif_power(Up)` (window 0, `sw_reset(true)`, ASPM off, MSI on), then
 `prepare_for_power_up` + `sync_power_up` (the kept image downloaded
-again) + IPCR (`QrtrPipe::power_cycle`). Not ported: the RDDM ramdump
-image, MHI-core SYS_ERR recovery (`mhi_pm_sys_error_transition`), M3
-suspend/resume, BW scaling, RSC/offload/client-managed rings, EDL.
+again) + IPCR (`QrtrPipe::power_cycle`). `system_suspend`/`system_resume_force`
+implement the WCN6855 M3 WoW transport transition; ordinary system suspend
+uses `power_down_for_system_suspend` then the existing QMI/DP reconstruction
+after resume. The generic no-RDDM MHI-core SYS_ERR recovery
+(`mhi_pm_sys_error_transition`) is not used for WCN6855, whose allocated
+RDDM image takes the ath11k reset path. Still not ported: BW scaling,
+RSC/offload/client-managed rings, EDL.
 
 ## 3. Public interface
 
@@ -108,6 +124,24 @@ suspend/resume, BW scaling, RSC/offload/client-managed rings, EDL.
   `ath11k_pci_start` ASPM step.
 - `mhi_host::MhiController::{queue_ul, take_dl, poll, wait_and_poll}`
   — IPCR UL send (`mhi_queue_skb(…, MHI_EOT)`) / DL receive.
+- `mhi_host::MhiController::{collect_rddm, rddm_snapshot,
+  take_rddm_snapshot}` — wait for a completed BHIe RX ramdump, inspect it
+  without copying, then move it to ath11k's device-dump owner before reset.
+- `runtime::Shared::take_firmware_crash_dump() -> Option<FirmwareCrashDump>`
+  — transfer the latest physical-radio dump to diagnostics;
+  `FirmwareCrashDump::into_linux_v2()` emits Linux-compatible
+  `ATH11K-FW-DUMP` v2 paging/RDDM/remote/pageable/M3 TLVs.
+- `mhi_host::MhiController::{system_suspend, system_resume_force,
+  power_down_for_system_suspend}` — Linux MHI M3 WoW transport handoff and
+  the separate normal-suspend power-off half.
+- `iface::Ath11kNetdev` registers `power::system_pm::AsyncSystemPm` at PCI
+  probe. `SET_WOWLAN` selects firmware WoW (`WMI_WOW_*`, ARP/NS, GTK and
+  keepalive state, HTC suspend ACK); no WoW configuration selects cfg80211's
+  disconnect/stop plus cold MHI/QMI/CE/DP/WMI reconstruction path. Both
+  routes coordinate every live vdev on the physical radio: configured WoW
+  vdevs are armed before the one MHI M3 transition, while cold suspend stops
+  every open vdev and resume recreates each one that was administratively
+  open. Only WoW preserves association state.
 - `narf_io::alloc_coherent_masked` (32-bit coherent mask) backs every
   MHI buffer.
 
@@ -165,7 +199,9 @@ tables.
   flow control) + `qmi_txn_wait` (match by `txn_id` only, decode with
   the transaction's decoder), `wait_inbound`, `take_inbound`
   (`ServerArrive` / `ServerExit` / indication bytes).
-- `wlfw` — `Wlfw<P, F: FirmwareLoader, A: DmaAllocator>`, the
+- `wlfw` — `Wlfw<P, F: FirmwareLoader, A: DmaAllocator>`, whose
+  `A::Mem: CoherentMem` supplies DMA address, length, write and immutable
+  CPU bytes (the latter for pre-reset device-coredump collection), the
   `ath11k_qmi_driver_event_work` machine: `run_to_fw_ready()` (lookup
   0x45 v1 ins `qmi_service_ins_id`; SERVER_ARRIVE → ind_register +
   host_cap; REQUEST_MEM callback → `alloc_target_mem_chunk` (reuse,
@@ -260,7 +296,8 @@ credits, frame }` out.
 - Encoders return `WmiCmd { cmd_id, buf }` byte-identical to the
   Linux builder's `skb->data`; `WmiCmd::frame()` adds `wmi_cmd_hdr`.
   INIT (`TargetResourceConfig::qca6390`, host mem chunks, hw mode),
-  SET_HW_MODE, PDEV_SET_PARAM / SET_REGDOMAIN / GET_TEMPERATURE,
+  SET_HW_MODE, PDEV_SET_PARAM / SET_REGDOMAIN / GET_TEMPERATURE /
+  BSS_CHAN_INFO_REQUEST,
   SET_CURRENT_COUNTRY, SET_INIT_COUNTRY, 11D_SCAN_START/STOP,
   VDEV_CREATE/DELETE/START/RESTART/UP/STOP/DOWN/SET_PARAM/INSTALL_KEY,
   PEER_CREATE/DELETE/SET_PARAM/ASSOC, START_SCAN (+
@@ -272,7 +309,8 @@ credits, frame }` out.
   (device MAC), REG_CHAN_LIST_CC[_EXT], VDEV_START_RESP,
   VDEV_STOPPED, VDEV/PEER_DELETE_RESP, PEER_ASSOC_CONF,
   INSTALL_KEY_COMPLETE, PEER_STA_KICKOUT, SCAN, MGMT_RX (+
-  `rx_status()`), MGMT_TX_COMPLETION, ROAM, PDEV_TEMPERATURE. Where
+  `rx_status()`), MGMT_TX_COMPLETION, ROAM, PDEV_TEMPERATURE,
+  PDEV_BSS_CHAN_INFO. Where
   Linux reads past a TLV unchecked, NARF rejects ("NARF-stricter" in
   the source).
 
@@ -432,9 +470,16 @@ HE caps for the mac layer, HAL reg caps), `dma_ring_caps`, `ready` +
   runtime calls it on the transport's interrupt or every 100 ms.
   `FwNotice`: `Reset(MhiNotify)` (`reset_work`), `ServerExit`
   (`ATH11K_QMI_EVENT_SERVER_EXIT`), `Restart` (FW_INIT_DONE with
-  REGISTERED → `restart_work`). `QmiFw::recover(power_cycle)` (default
-  unsupported; `Wlfw`: `QrtrPipe::power_cycle` + `endpoint_reset` when
-  asked, then `run_to_fw_restart`). `Ath11kCore::into_parts()` gives the
+  REGISTERED → `restart_work`). `QmiFw::collect_crash_dump()` is a default
+  no-op; `Wlfw` invokes `QrtrPipe::collect_crash_dump` for the RDDM image
+  before a reset, then moves the completed image, BHIe FBC paging data and
+  Linux-dump-eligible QMI target memory into
+  `Shared::take_firmware_crash_dump()` as a `FirmwareCrashDump`. Its
+  `into_linux_v2()` produces the `ATH11K-FW-DUMP` v2 header and paging,
+  RDDM, remote-memory, pageable and M3 TLVs (the device-coredump retrieval
+  surface). `QmiFw::recover(power_cycle)` (default unsupported;
+  `Wlfw`: `QrtrPipe::power_cycle` + `endpoint_reset` when asked, then
+  `run_to_fw_restart`). `Ath11kCore::into_parts()` gives the
   HIF, QMI session and config back for a restart (`ath11k_wmi_detach`;
   HTC / WMI state dropped, rebuilt by `Ath11kCore::new`).
 - Steps (`core::step`, 120–139): UNSUPPORTED 120, NO_DEVICE 121,
@@ -592,12 +637,18 @@ mac layer sees the MGMT_TX_COMPLETION), `now_ms()`, `max_msg_len()`
 **`DataPort`** (DP side): `ppdu_stats_req()`, `mon_status_default(on)`,
 `vdev_tx_attach(vdev, addr)`, `wait_peer_mapped(vdev, addr, mapped,
 timeout)` (HTT PEER_MAP / UNMAP), `peer_setup` / `peer_cleanup`,
-`rx_pn_replay_config(vdev, addr, cipher, pairwise, install)`,
+`rx_pn_replay_config(vdev, addr, cipher, key_len, pairwise, install)`,
+`tkip_rx_mic_config(vdev, addr, Option<[u8; 8]>)` (the host-held receive
+Michael direction for a hardware-decrypted, fragmented pairwise TKIP MPDU),
 `send_eth(frame)` / `recv_eapol(timeout)` (EAPOL as 802.3,
-`ETH_P_PAE`, with whether the MPDU was decrypted), `flush_tx()`
-(`ieee80211_flush_queues(.., false)`), `set_authorized(addr, on)` (port control for data),
+`ETH_P_PAE`, with whether the MPDU was decrypted),
+`probe_ap(timeout)` (a requested-status directed Null / QoS Null
+connection probe), `flush_tx()` (`ieee80211_flush_queues(.., false)`),
+  `set_authorized(addr, on)` (port control for data),
 `set_sta_wme(addr, wme)` (`sta->sta.wme` from the association
-response: the TX path builds QoS Data only for a WMM AP).
+response: the TX path builds QoS Data only for a WMM AP), and
+`dfs_nop_active(chandef)` / `record_dfs_nop(chandef, deadline)` for the
+physical-radio DFS non-occupancy table.
 
 **`Mac<P, D>`**: `new(wmi, dp, DeviceCaps, MacConfig, initial_reg)`
 (`ath11k_mac_register`: wiphy bands from `hal_reg_cap`, the default
@@ -605,12 +656,80 @@ regdomain from the start-up REG_CHAN_LIST_CC, world regd otherwise),
 `start()` (`ath11k_mac_op_start`), `add_interface()`
 (`ieee80211_do_open` → `ath11k_mac_op_add_interface`, ERP reset,
 `ieee80211_set_wmm_default` → `conf_tx` ×4), `scan(&ScanRequest) ->
-Vec<BssInfo>` / `hw_scan(ssids, freqs)` (`ath11k_mac_op_hw_scan`,
+Vec<BssInfo>` / `hw_scan(ssids, freqs, random_mac, colocated_6ghz)`
+(`ath11k_mac_op_hw_scan`,
 `ath11k_start_scan`, scan event state machine, timeout work, cfg80211
 BSS table), `associate(&AssociateRequest)` / `connect`, `disassociate()`,
 `poll() -> Option<LinkLoss>` (dispatch events: kickout, beacon miss →
-3 s connection loss, deauth / disassoc RX, 11d new country, regulatory
-updates), `handle_event(frame)`, `connected_bssid()`.
+3 s deadline → up to two 500 ms requested-status Null / QoS Null probes;
+an ACK cancels the deadline, two no-ACK results cause connection loss;
+deauth / disassoc RX, 11d new country, regulatory updates),
+`handle_event(frame)`, `connected_bssid()`.
+`set_cqm_rssi(Option<CqmRssiConfig>)` retains mac80211's software CQM policy:
+no ath11k WMI command is required because this profile does not filter
+associated AP beacons. It exposes CQM_RSSI_LIST and uses their four-sample
+1/16-dBm EWMA for either singleton hysteresis crossings or cfg80211's moving
+adjacent low/high RSSI range, producing deferred cfg80211 notifications.
+`supports_bss_survey` gates the WMI BSS-channel-info service.  A requested
+survey while a vdev has an operating chanctx and no scan is active serializes
+`WMI_PDEV_BSS_CHAN_INFO_REQUEST_CMDID` (READ) for this pdev; its 64-bit
+firmware counters are divided by the target's 320,000 ticks/ms exactly as
+`ath11k_mac_update_bss_chan_survey`, retaining total, busy, BSS-RX and TX
+times plus the noise floor.  The ordered runtime worker owns that request;
+the public dump path exposes the most recent complete sample rather than
+blocking a generic-netlink syscall for Linux's three-second WMI wait.
+`configure_antenna` / `set_antenna` preserve Linux ath11k's
+`cfg_{tx,rx}_chainmask`: an accepted `SET_WIPHY` pair rebuilds local
+HT/VHT/HE stream maps, programs `WMI_PDEV_PARAM_{TX,RX}_CHAIN_MASK` once on
+the live physical pdev, and is replayed before every later vdev creation or
+recovery start. `configure_rts_threshold` / `set_rts_threshold` retain
+`WMI_VDEV_PARAM_RTS_THRESHOLD`, apply it to a live vdev, and make every
+sibling vdev worker converge to the new value. The native fragmentation
+threshold operation remains intentionally unsupported, matching Linux
+ath11k: target firmware cannot transmit More-Fragments frames.
+`NL80211_CMD_SET_TX_BITRATE_MASK` is retained per WCN6855 vdev, not per
+physical radio. The generic nl80211 layer preserves each active-band legacy,
+HT, VHT and HE MCS mask plus GI/LTF choices. ath11k rejects FORCE_LGI and
+the same non-contiguous multi-MCS VHT/HE masks Linux rejects until a
+RATEMASK WMI implementation exists. It limits every WMI peer-association
+rate set by the requested mask, programs VDEV NSS/LDPC/SGI and HE fixed or
+autorate GI/LTF parameters, then sends a peer-association update with
+`is_assoc = false` for every already-associated station or AP client. A
+single compatible VHT, HE or HT MCS becomes `WMI_PEER_PARAM_FIXED_RATE`; an
+unrestricted/multi-rate policy clears that override. The policy is retained
+by `Ath11kNetdev` across `Mac::new` during reset and is installed before
+future STA/AP peer association, matching `ath11k_vif::bitrate_mask`.
+`Ath11kNetdev::tx_power_dbm` is the read-only `get_txpower` fallback: its
+try-lock snapshot returns the active vdev's retained `bss_conf.txpower`
+equivalent, which `GET_INTERFACE` publishes as the signed-mBm
+`NL80211_ATTR_WIPHY_TX_POWER_LEVEL`. It deliberately does not issue a
+firmware stats request from the netlink read path; if no vdev has established
+a channel, the attribute is absent, as an unavailable driver measurement.
+Before a management frame enters WMI, ath11k mirrors
+`ath11k_mac_mgmt_action_frame_fill_elem_data`: for Radio Measurement Link
+Measurement Request it fills the current and regulatory/hardware-maximum
+power bytes; for Link Measurement Report it fills the TPC Report's transmit
+power byte and leaves the unavailable link margin intact. The fill precedes
+PMF protection and malformed or unrelated actions still transmit unchanged.
+Linux ath11k's `NL80211_EXT_FEATURE_STA_TX_PWR` is also exposed. Its
+`NL80211_ATTR_STA_TX_POWER_SETTING` path programs the mapped AP or AP-client
+peer with `WMI_PEER_USE_FIXED_PWR`: automatic sends zero, while limited power
+accepts only 1 through 70 dBm. The nl80211 fixed enum is deliberately parsed
+but rejected with `-EINVAL`, matching `ath11k_mac_op_sta_set_txpwr`'s missing
+power-value behavior. AP client policies are retained in the AP peer record
+and replayed after peer association; a managed-station policy is retained by
+`Ath11kNetdev` across `Mac::new` and replayed after its BSS peer returns.
+`NL80211_ATTR_4ADDR` is supported for station vdevs. `Ath11kNetdev` retains
+the cfg80211 managed-station state across `Mac::new` and reports it in every
+interface reply. When a BSS peer is live, its ordered worker mirrors
+`ath11k_mac_op_sta_set_4addr` by sending `WMI_PEER_USE_4ADDR = 1` on enable
+(Linux leaves the target peer setting uncleared on disable). The runtime then
+uses ToDS|FromDS native-wifi headers with address two = the station, address
+three = the original Ethernet destination and address four = the original
+Ethernet source. Enabling also queues mac80211's 30-byte unencrypted,
+minimum-rate four-address Null notification. Four-address multicast frames
+select the mapped BSS peer's TCL metadata and `TO_FW`, matching
+`ath11k_dp_tx`'s WDS-offload path.
 `DeviceCaps::from_events(service_ready, ext, ready, svc_map)`,
 `MacConfig::wcn6855()`.
 
@@ -623,8 +742,9 @@ updates), `handle_event(frame)`, `connected_bssid()`.
 - `mac_peer`: own HT/VHT caps (`ath11k_create_{ht,vht}_cap`), what the
   Association Request advertises (`ieee80211_add_{ht,vht}_ie`), AP
   station caps (`ieee80211_{ht,vht}_cap_ie_to_sta_*`, bandwidth, NSS),
-  `determine_chan` (HT/VHT operation → 20/40/80 MHz, downgraded until
-  usable), `vdev_phymode` (`ath11k_phymodes`), `peer_assoc_prepare`
+  `determine_chan` (HT/VHT operation → 20/40/80/160 MHz and non-contiguous
+  80+80 MHz,
+  downgraded until usable), `vdev_phymode` (`ath11k_phymodes`), `peer_assoc_prepare`
   (`ath11k_peer_assoc_h_*`), `txbf_conf`.
 - `mac_frame`: element walk, beacon / probe response / auth / assoc
   response / deauth parsers, Open-System auth, (re)association request
@@ -658,7 +778,8 @@ updates), `handle_event(frame)`, `connected_bssid()`.
   (`ieee80211_send_delba`, `frame::build_delba`) is sent only for a
   locally stopped session (`initiator == RECIPIENT && tx`): the PTK rekey's
   `ieee80211_sta_tear_down_BA_sessions(AGG_STOP_LOCAL_REQUEST)` (reason 36;
-  suspend teardown is not ported).
+  the normal no-WoW system-suspend route reaches the same disassociate/stop
+  teardown before the cold HIF/MHI cycle).
 - PTK rekey (`Mac::ptk_rekey`): a pairwise message 1/4 after the 4-way
   (`Supplicant::rx_eapol`: new TPTK, M2 with Secure, the renewed SNonce;
   an unencrypted M1 with PMF and a TK set is dropped) and its 3/4 (MIC
@@ -724,12 +845,14 @@ updates), `handle_event(frame)`, `connected_bssid()`.
   (detail = status), 273 `SAE_COMMIT`, 274 `SAE_CONFIRM`, 275
   `SAE_TIMEOUT`. A firmware recovery reconnects with the kept
   `AssociateRequest`, so the SAE password / PMF / HE state are rebuilt
-  from it. Not done: SAE-PK, password identifiers, groups 20 / 21, FT-SAE
-  (needs FT authentication: MDE / FTE, R0KH / R1KH). nl80211: ath11k does
-  not advertise `NL80211_EXT_FEATURE_SAE_OFFLOAD` (upstream mac80211
-  drivers never do; wpa_supplicant runs SAE through
-  `NL80211_CMD_AUTHENTICATE` there, which NARF's ath11k has no path for
-  yet), so SAE is reached from the in-kernel `associate` (autoconnect).
+  from it. SAE-PK validates the AP Confirm proof (Modifier AES-SIV recovery,
+  password fingerprint and ECDSA KeyAuth) before accepting the PMK. Not done:
+  password identifiers, groups 20 / 21 and FT-SAE (needs FT authentication:
+  MDE / FTE, R0KH / R1KH). ath11k does not advertise
+  `NL80211_EXT_FEATURE_SAE_OFFLOAD` (upstream mac80211 drivers never do), but
+  its userspace-SME path implements SAE over `NL80211_CMD_AUTHENTICATE` as
+  wpa_supplicant expects; the in-kernel `associate` path remains available for
+  autoconnect.
 - HE (`mac/he.rs`): own HE capabilities per band = `ath11k_mac_copy_he_cap`
   for a STA (SERVICE_READY_EXT `he_cap_info` / `he_cap_phy_info` / PPET:
   MAC1 masked to TF MAC padding, sounding dimensions = tx chains - 1,
@@ -740,43 +863,214 @@ updates), `handle_event(frame)`, `connected_bssid()`.
   (`ConnMode::He`) when the AP has HE Capabilities + Operation (and VHT on
   5 GHz) and `ieee80211_verify_{peer,sta}_he_mcs_support` pass; the
   Association Request carries `ieee80211_put_he_cap` (adjusted to the
-  connection width: DCM max RU, 40 / 160 bits, sounding / STBC above 80
+  connection width: DCM max RU, 40 / 160 / 80+80 bits, sounding / STBC above 80
   MHz) after VHT (`before_he[]` split). At association success
-  `ieee80211_he_cap_ie_to_sta_he_cap` (MCS intersection, 160 / 80+80
-  disabled) from the response, HE bandwidth / NSS; `ath11k_bss_assoc`
+  `ieee80211_he_cap_ie_to_sta_he_cap` (MCS intersection with the negotiated
+  contiguous-160 or 80+80 capability) from the response, HE bandwidth / NSS; `ath11k_bss_assoc`
   sends `WMI_VDEV_PARAM_SET_HEMU_MODE` (`ath11k_mac_vif_recalc_sta_he_txbf`)
   before PEER_ASSOC, whose HE fields follow `ath11k_peer_assoc_h_he`
   (`WMI_PEER_HE`, TWT flags, MAC / PHY words, `he_oper.params & 0xffffff`,
-  PPET, the 80 MHz MCS set) and `ath11k_mac_get_phymode_he` /
+  PPET, 80 MHz plus contiguous-160 or indexed 80+80 MHz MCS sets when
+  negotiated, and the NSS-ratio-constrained wide-channel peer override) and `ath11k_mac_get_phymode_he` /
   `MODE_11AX_HE*_2G`; OBSS spatial reuse from the AP's SR element
   (`ieee80211_he_spr_ie_to_bss_conf`); then `BSS_CHANGED_HE_BSS_COLOR`'s
   STA arm (BSS color change enable, collision detection 10 s / 200 ms
-  scan). Step 276 `HE_PARAM` (console; Linux warns). Not done: 6 GHz
-  association (HE 6 GHz capability, regulatory connectivity element,
-  power rules), 160 / 80+80 MHz, TWT (`BSS_CHANGED_TWT` →
-  `WMI_TWT_ENABLE`), HE operation's VHT info as a 5 GHz width source;
-  `ath11k_mac_config_obss_pd` is AP-only (mac80211 never signals
-  `BSS_CHANGED_HE_OBSS_PD` for a station).
+  scan). An HE association response's extension-38 MU-EDCA Parameter Set is
+  parsed as its four BE/BK/VI/VO records. For each mac80211 AC callback the
+  local legacy WMM update is followed immediately by the matching incremental
+  `WMI_WMM_PARAM_TYPE_11AX_MU_EDCA` update, retaining the ECW exponent nibbles
+  and MU-EDCA timer exactly as ath11k does, then by the AC's U-APSD write.
+  Subsequent associated beacons compare WMM and MU-EDCA parameter-set counts
+  as one generation and replay that identical ordered AC programming only on
+  change; the counts are retained before malformed WMM records are rejected,
+  matching mac80211's no-retry behavior for a broken AP. A missing or invalid
+  association-response WMM parameter set leaves QoS enabled with defaults and
+  disables later WMM beacon tracking, avoiding mac80211's known invalid/valid
+  layout oscillation.
+  `NL80211_CMD_SET_CQM` supports mac80211's singleton and CQM_RSSI_LIST RSSI
+  monitors for a station/P2P-client vdev. The target does not need a separate
+  CQM command: WCN6855 leaves beacon filtering to the host, so four
+  associated-AP beacon samples feed Linux's 1/16-dBm EWMA, which is also
+  returned as `NL80211_STA_INFO_SIGNAL_AVG`, and drive either
+singleton hysteresis or the moving low/high range before
+`NL80211_CMD_NOTIFY_CQM` is multicast.
+  When firmware exposes `WMI_TLV_SERVICE_TX_DATA_MGMT_ACK_RSSI`, ath11k also
+  advertises ACK_SIGNAL_SUPPORT and exposes WBM's latest successful ACK RSSI
+  as `NL80211_STA_INFO_ACK_SIGNAL` in `GET_STATION`.
+  It always advertises SET_SCAN_DWELL: a `TRIGGER_SCAN` measurement duration
+  is copied to all WMI active/passive dwell fields and its burst duration;
+  the timeout uses Linux ath11k's capped channel-rest plus per-channel event
+  overhead computation.
+  The wiphy's 512-byte scan-IE limit is enforced before a caller's Probe
+  Request IEs are appended after mac80211-style capability IEs in the WMI
+  start-scan extra-IE array.
+  An infrastructure MBSSID transmitter mirrors each stable AP BSS-color
+  update onto its live non-transmitting profile vdevs through their separate
+  WMI workers, as mac80211's transmitting-BSS propagation does.
+  Six GHz requires HE + WMM and a valid HE 6 GHz Operation; the
+  station derives a 20/40/80/160 MHz or non-contiguous 80+80 MHz ChanDef,
+  sends HE 6 GHz Band
+  Capabilities, and applies the operation's LPI / standard-power / very-low-
+  power AP type to the default-client regulatory rules. Firmware's client
+  type selects the default or subordinate TPE category. It parses Power
+  Constraint and all valid local / regulatory-client Transmit Power
+  Envelopes, selects the Linux-precedence envelope, and sends the
+  resulting post-vdev-start `WMI_VDEV_SET_TPC_POWER_CMDID` power levels.
+  TWT requires the AP HE responder bit *and* Extended Capabilities responder
+  bit; a requester-capable firmware then receives ath11k's default
+  `WMI_TWT_ENABLE_CMDID` policy after association and
+  `WMI_TWT_DISABLE_CMDID` during teardown. The two 80+80 centre frequencies
+  flow through `ChanDef`, vdev-start WMI, separate VHT/HE phymodes, HE MCS
+  set index 2, and the distinct 80+80 NSS override field. Trusted beacon and
+  Spectrum-Management CSA/ECSA elements are parsed with the cfg80211 operating
+  class / Wide-Bandwidth CSA rules, restricted to the current band and local
+  HT/VHT/HE/regulatory capability, then scheduled at the advertised TBTT.
+  Mode-1 CSA closes the data port, sends a CSA-cause `WMI_VDEV_RESTART`, re-ups
+  the station vdev, and reopens only after a beacon confirms the new channel;
+  an unsupported or failed switch becomes a local connection loss. Step 276
+  `HE_PARAM` (console; Linux warns). `ath11k_mac_config_obss_pd` is AP-only
+  (mac80211 never signals `BSS_CHANGED_HE_OBSS_PD` for a station): START_AP's
+  mandatory SR control plus optional 1..=20 offsets and two eight-byte SRG
+  bitmaps drive pdev threshold, per-AC and SR-prohibit settings after the AP
+  vdev comes up. Firmware with `WMI_TLV_SERVICE_SRG_SRP_SPATIAL_REUSE_SUPPORT`
+  additionally receives the six `wmi_pdev_obss_pd_bitmap_cmd` SRG/non-SRG
+  updates. Without that service, Linux's SNR-form non-SRG threshold is used.
+- GTK low-power rekey, network detection and WoW system suspend:
+  `NL80211_CMD_SET_REKEY_OFFLOAD`
+  retains the userspace
+  KEK, KCK, optional AKM and big-endian replay counter in `Mac` without
+  logging secret bytes (`ath11k_mac_op_set_rekey_data`). The later WoW/power
+  boundary invokes `set_gtk_rekey_offload`: enable emits the exact 52-byte
+  `WMI_GTK_OFFLOAD_CMDID` layout; resume requests firmware status before
+  disabling the engine. `WMI_GTK_OFFLOAD_STATUS_EVENTID` reconstructs the
+  firmware's low/high counter words, updates saved state and multicasts
+  `NL80211_CMD_SET_REKEY_OFFLOAD` with the refreshed big-endian counter, as
+  `ieee80211_gtk_rekey_notify` does. Awake GTK rekeys remain normal EAPOL
+  Group Key Handshakes. `SET_WOWLAN` retains validated disconnect, magic,
+  GTK-rekey, masked-pattern and `NET_DETECT` policy. When
+  `WMI_TLV_SERVICE_NLO` is present, `NET_DETECT` accepts Linux's nested
+  scheduled-scan match/plan/SSID/channel/delay/random-MAC attributes (up to
+  16 match sets, 60 channels and two plans), advertises the corresponding
+  wiphy limits plus `NL80211_FEATURE_ND_RANDOM_MAC_ADDR`, and translates the
+  retained configuration into the WMI network-list-offload TLVs at WoW
+  entry. The stop form is sent before wake-event cleanup on failure and
+  resume. Linux also accepts up to 512 probe-request IE bytes for this
+  command although its NLO WMI layout cannot emit them; NARF retains and
+  returns those bytes through `GET_WOWLAN` while preserving Linux's zero IE
+  bitmap on the wire. The async system-PM hook flushes TX, clears stale WMI
+  state, programs triggers, ARP/NS offload, optional GTK offload, filter and
+  keepalive, enables WoW and waits for the HTC EP0
+  suspend completion before stopping shadow timers, disabling CE/DP service
+  and moving MHI to M3. Resume forces M0, enables CE/DP, waits for
+  `WMI_WOW_WAKEUP_HOST_EVENTID`, and removes temporary state. Without a WoW
+  policy the station is disconnected/stopped, MHI powers down, and resume
+  reconstructs firmware/CE/DP/WMI and the prior administrative vdev without
+  silently reconnecting.
+- BIOS SAR policy: when `WMI_TLV_SERVICE_BIOS_SAR_SUPPORT` is present, the
+  physical WCN6855 wiphy publishes Linux ath11k's eleven fixed frequency
+  ranges and `NL80211_CMD_SET_SAR_SPECS`. A valid replacement builds the
+  exact 22-byte BIOS table (one limit per range duplicated for RF chain one),
+  sends the zeroed geo-table command followed by the SAR-table command, and
+  retains the desired table at radio scope. The first MAC opener replays it
+  after a cold resume or firmware recovery before recreating vdev traffic.
+- Physical `SET_WIPHY`: GET_WIPHY exposes current and available TX/RX chain
+  masks plus the retained RTS threshold. A full TX/RX chain-mask pair is
+  normalized by nl80211 (all ones means all available chains); the runtime
+  shares it between the three WCN6855 vdevs so the first active worker sends
+  the pdev WMI update while every MAC rebuilds its host capability maps. RTS
+  updates are sent to each live vdev and retained for the initial
+  `VDEV_CREATE` sequence and recovery. Fragment-threshold input below 256 is
+  invalid, otherwise it reports Linux ath11k's `-EOPNOTSUPP`.
+- Multiple BSSID / EMA AP: when
+  `WMI_TLV_SERVICE_MBSS_PARAM_IN_VDEV_START_SUPPORT` is present, WCN6855
+  advertises three MBSSID interfaces and an EMA profile periodicity of eight
+  through nested `NL80211_ATTR_MBSSID_CONFIG`. `START_AP` translates the
+  transmitting or non-transmitting role into `WMI_HOST_VDEV_FLAGS_*` in
+  `WMI_VDEV_START_REQUEST_CMDID`; a non-transmitting VDEV_UP additionally
+  carries the transmitter BSSID, profile index and `1 << bssid_indicator`.
+  The transmitter's raw MBSSID elements become one ordinary template or a
+  WMI EMA template family (template count/index and first/last bits in
+  `ema_params`); matching RNR elements and common extra RNRs follow Linux
+  mac80211's per-profile layout. A child START_AP waits until its transmitter
+  has published that family, and an already-up non-transmitting profile is
+  never sent a replacement template because firmware crashes on that command.
+  `DEL_INTERFACE` of the transmitter cascades to registered non-transmitting
+  profiles on the same physical radio.
+- Six-GHz discovery: WCN6855 exposes `NL80211_EXT_FEATURE_FILS_DISCOVERY` and
+  `NL80211_EXT_FEATURE_UNSOL_BCAST_PROBE_RESP`. The FILS nested form requires
+  min/max interval and a 42..=2304-byte action-frame template (each interval
+  at most 10,000 TU); unsolicited Probe Response requires its 0..=20-TU
+  interval and a template up to 2304 bytes. An empty nested form deletes that
+  family. `WMI_FILS_DISCOVERY_TMPL_CMDID` sends FILS templates,
+  `WMI_PRB_TMPL_CMDID` sends unsolicited Probe Response templates with a zero
+  `WMI_BCN_PRB_INFO`, and `WMI_ENABLE_FILS_CMDID` selects the interval/mode.
+  As Linux ath11k does, a nonzero FILS maximum takes precedence over a nonzero
+  unsolicited interval; neither sends the zero-interval disable. A CSA's
+  unsolicited update is committed only after its target-channel vdev restart;
+  an unsuccessful discovery WMI update is reported but does not undo that
+  completed CSA.
+- FTM responder: when `WMI_TLV_SERVICE_RTT` is set, WCN6855 advertises
+  `NL80211_EXT_FEATURE_ENABLE_FTM_RESPONDER`. `START_AP`, `SET_BEACON`, and
+  the post-CSA beacon accept the enabled nested responder form and retain its
+  optional LCI/Civic Measurement Report bodies. As Linux ath11k does,
+  `WMI_VDEV_PARAM_ENABLE_DISABLE_RTT_RESPONDER_ROLE` is the only firmware
+  operation: it is sent after the relevant AP vdev start/restart, and a WMI
+  failure is reported without undoing the otherwise completed AP transition.
+- HE OBSS Packet Detection: `START_AP` accepts
+  `NL80211_ATTR_HE_OBSS_PD`'s mandatory spatial-reuse control, optional
+  1..=20 offsets and exact 8-byte SRG color/partial-BSSID bitmaps. After AP
+  vdev-up, Linux ath11k's pdev threshold, per-AC and SR-prohibit sequence is
+  sent. The SRG service bit additionally triggers all six pdev bitmap command
+  forms; lacking it selects Linux's legacy non-SRG SNR threshold. Failure is
+  best effort and leaves the beaconing vdev intact.
+- HE BSS color: with `WMI_TLV_SERVICE_BSS_COLOR_OFFLOAD`, WCN6855 advertises
+  `NL80211_EXT_FEATURE_BSS_COLOR`. The 1..=63 nested color plus disabled and
+  partial flags are retained from START_AP, SET_BEACON, or the post-CSA beacon.
+  After AP vdev start/restart ath11k sends both the 5-second AP
+  `WMI_OBSS_COLOR_COLLISION_DET_CONFIG_CMDID` and
+  `WMI_VDEV_PARAM_BSS_COLOR` (enabled color shifted to bit 24, or
+  `0x8000_0000` disabled). The partial bit has no ath11k WMI field. Each
+  command is best effort: an error is reported but never rolls the AP vdev
+  back down. Firmware `WMI_OBSS_COLOR_COLLISION_DETECTION_EVENTID` detection
+  events retain the first 64-bit color bitmap for mac80211's 500-ms
+  coalescing window, then notify hostapd through MLME
+  `NL80211_CMD_OBSS_COLOR_COLLISION`; disable and free-slot events are not
+  surfaced.
+  `NL80211_CMD_COLOR_CHANGE_REQUEST` is infrastructure-AP-only: its nested
+  temporary countdown beacon (and optional Probe Response) is re-uploaded at
+  each TBTT, color is disabled during that interval, then the retained normal
+  template and selected color are restored. The runtime emits MLME
+  COLOR_CHANGE_STARTED/COMPLETED, or restores the original state and emits
+  COLOR_CHANGE_ABORTED when a queued WMI operation fails. The request rejects
+  a non-transmitting MBSSID BSS or active CSA; an arriving CSA aborts the
+  color change first.
 - PMF / 802.11w (`MfpState`): ath11k returns 1 from `ath11k_mac_op_set_key`
-  for AES-CMAC, so BIP is mac80211 software on WCN6855 too: the IGTK (M3 /
-  Group 1/2, IPN as `rx_pn`) never reaches the firmware. Receive (from the
+  for every BIP suite, so BIP stays in host software on WCN6855: the IGTK
+  (M3 / Group 1/2, IPN as `rx_pn`) never reaches firmware. Receive (from the
   AP while `sta->mfp`, `ieee80211_rx_h_decrypt` + `ieee80211_drop_unencrypted_mgmt`):
-  group-addressed robust frames need a BIP-CMAC-128 MMIE (key 4 / 5, IPN >
-  rx_pn, 64-bit MIC) and lose it; unicast protected ones come decrypted by
-  the firmware with CCMP header + MIC (`ath11k_mgmt_rx_event`) and are
-  replay-checked on the PTK's management PN, then stripped; unprotected
+  group-addressed robust frames need the matching BIP-CMAC-128 64-bit or
+  BIP-CMAC-256 / BIP-GMAC 128-bit MMIE (key 4 / 5, IPN > `rx_pn`) and lose it;
+  unicast protected ones come decrypted by firmware with a CCMP-family header
+  plus the suite's 8- or 16-byte MIC (`ath11k_mgmt_rx_event`), are replay
+  checked on the PTK's management PN, then stripped; unprotected
   unicast robust frames are dropped, except deauth / disassoc before a GTK
   exists ("Permit unprotected deauth/disassoc frames during 4-way-HS").
   Transmit: unicast robust frames (deauth, BACK, SA Query) get the host
-  CCMP header (`GENERATE_IV_MGMT`, PN = ++tx_pn, key 0), the Protected bit
-  and the 8-byte MIC tail `ath11k_mac_mgmt_tx_wmi` reserves. SA Query: AP
+  CCMP-family header (`GENERATE_IV_MGMT`, PN = ++tx_pn, key 0), the Protected
+  bit, and the selected suite's 8- or 16-byte MIC tail that
+  `ath11k_mac_mgmt_tx_wmi` reserves. SA Query: AP
   Requests answered (`ieee80211_process_sa_query_req`); an unprotected
   deauth / disassoc with reason 6 / 7 while authorized starts
   wpa_supplicant's SA Query (`sme_event_unprot_disconnect`, ≤ 1 per 10 s,
   a Request every 201 TU, > 1000 TU unanswered → deauth reason 2,
   `step::SA_QUERY_TIMEOUT` detail = Requests). A group-addressed
   deauth / disassoc from the AP is accepted like a unicast one
-  (`ieee80211_accept_frame`).
+  (`ieee80211_accept_frame`). AP/GO uses the same primitives: an MFP
+  `NEW_STATION` sets `WMI_PEER_PMF`; its unicast robust TX uses that client's
+  installed PTK and management PN, received protected frames are replay
+  checked and stripped before hostapd sees them, and a default IGTK 4/5
+  appends the selected BIP MMIE with monotonically increasing IPN to group
+  robust-management TX. The IGTK never reaches firmware.
 - Diagnostics: `mac::step` 150–199 and 270–299, one console line per failure;
   stage `scan` on a scan / link loss, `connected` after authorization.
 - `wmi.rs` additions: `scan_prob_req_oui_cmd`,
@@ -846,7 +1140,9 @@ mac layer interleaves in Linux's order:
    install, now)` = `ath11k_dp_peer_rx_pn_replay_config` (pairwise
    only: REO UPDATE_RX_QUEUE with PN / PN_SIZE / PN_VALID / PN_CHECK /
    SVLD on every active TID, PN check + 48-bit PN on `SET_KEY`; one
-   `cmd` carried across TIDs as Linux), then `set_peer_sec_type`.
+   `cmd` carried across TIDs as Linux), then `set_peer_sec_type`. A
+   pairwise TKIP install retains just the eight-byte RX Michael direction in
+   `PeerRx`; any pairwise key disable clears it.
 
 Encoders: `hal_reo_qdesc_size`, `hal_reo_qdesc_setup` (words),
 `hal_reo_cmd_desc` (TLV + 9-word body of GET_QUEUE_STATS / FLUSH_CACHE /
@@ -921,7 +1217,7 @@ step starts with `Rt::service()`:
    interrupt or every 100 ms; a reported crash is kept in
    `Rt::fw_notice` (first one wins).
 
-`Port` (`Arc<Shared>`) implements `mac::WmiPort` (`send` =
+`Port` (`Arc<Shared>, vdev_id`) implements `mac::WmiPort` (`send` =
 `ath11k_wmi_cmd_send` with credit / CE-full retry for 3 s;
 `next_event`; `mgmt_tx` = IDR id (≤ 512 pending) + DMA32 copy +
 `wmi::mgmt_send_cmd(vdev, id, frame, paddr, 0, false)`, freed on
@@ -933,10 +1229,33 @@ timer armed; `vdev_tx_attach` = `VifTx::attach`; `wait_peer_mapped`
 (mapped: BSS peer recorded, AST from the peer as `ath11k_peer_create`;
 unmapped: station data state cleared); `peer_setup` per §3.10 step 1;
 `peer_cleanup` per step 2; `rx_pn_replay_config` per step 6 + PTK flag;
-`send_eth` / `recv_eapol`; `set_authorized`; `set_sta_wme`). Linux's
+`send_eth` / `recv_eapol`; `probe_ap` = `Shared::probe_ap` (builds a
+requested-status Null / QoS Null and waits at most 500 ms); `set_authorized`;
+`set_sta_wme`; `dfs_nop_active` / `record_dfs_nop` maintain one physical-radio
+DFS non-occupancy table across the otherwise per-vdev wiphy snapshots). Every
+port receives only its vdev's WMI events, data RX,
+management-TX completion state and TX queues; PDEV-wide regulatory, radar and
+firmware-recovery events are deliberately broadcast by `Shared` to all live
+vdev workers. Linux's
 synchronous calls (`vdev_tx_attach`, `peer_cleanup`, `set_authorized`,
 `set_sta_wme`, `mgmt_tx_done`) are queued (`SyncOp`) and applied in order
 at the next locked step.
+
+For an AP/GO vdev, `Port` retains separate `ApTxState`: the self peer exists
+before group keys, each WMI-associated client records authorization, PTK and
+WMM state, group traffic is held until a protected AP has a GTK, and Ethernet
+TX builds a FromDS native-Wi-Fi header for the selected client or group
+receiver. RX accepts only HTT-mapped AP clients, admits EAPOL before the
+client's port opens, and otherwise requires that client's authorization. The
+client's `NEW_STATION` / `SET_STATION` capability record supplies its legacy,
+HT, VHT, HE and 6-GHz capability bodies to `WMI_PEER_ASSOC_CMDID`, intersected
+with the local radio. Per-client PMF enters `WMI_PEER_ASSOC_CMDID`; CCMP PTK
+management PNs are host-tracked per client, while IGTKs 4/5 are software
+BIP-CMAC keys selected by `SET_KEY` default-management state and used for
+outbound group robust-management MMIEs. Nested AP U-APSD requests become the
+peer APSD/rate flags and the target's AP-PS UAPSD, maximum-service-period and
+disabled-SIFS settings; target firmware then owns client buffering and TIM
+maintenance.
 
 **TX conversion** (`tx_hdr.rs`, the vdev TX encap / RX decap are
 NATIVE_WIFI): `select_queue` = `ieee80211_select_queue` (no WMM →
@@ -949,6 +1268,11 @@ BSSID, addr2 the Ethernet SA, addr3 the DA; seq from `tid_seq[tid]`
 (QoS) or the vif counter (`ieee80211_xmit_fast_finish`); RFC 1042 SNAP,
 bridge-tunnel for IPX / AARP, no encapsulation for 802.3 length frames;
 `-EPERM` for unicast before authorization unless our own EAPOL).
+`build_sta_nullfunc` is `ieee80211_nullfunc_get(.., qos_ok = true)`: addr1
+and addr3 are BSSID, addr2 is the own address, sequence control is zero;
+a WMM AP gets protected QoS Null with QoS control `[7, 0]` on AC VO and a
+non-WMM AP gets regular Null on AC BE. `Dp::tx` removes its QoS control and
+clears the subtype as `ath11k_dp_tx_encap_nwifi` does before firmware sees it.
 Management frames get their sequence number on the way to WMI
 (`Rt::mgmt_tx_prepare` → `tx_hdr::tx_h_sequence` =
 `ieee80211_tx_h_sequence`): management, non-QoS data and group QoS data
@@ -986,11 +1310,17 @@ len`.
 single queue, `alloc_netdev_mqs(.., 1, 1)`, and queues per TXQ): the TX
 pump takes up to 64 frames off the stack's TX ring per runtime step;
 `Rt::tx_enqueue` drops a frame with no station (`ENOTCONN`, as
-`ieee80211_build_hdr`) and queues the rest on their AC
-(`ieee80211_select_queue` with the current `sta->sta.wme`; `fq` limits
-8192 packets / 16 MiB, overlimit drops the fattest queue's head);
-`Rt::tx_push` (`ieee80211_handle_wake_tx_queue`) hands frames to
-`Dp::tx` VO → VI → BE → BK, skipping ACs whose hardware queue
+`ieee80211_build_hdr`) and queues the rest on the selected TID
+(`ieee80211_select_queue` with the current `sta->sta.wme`). Each vdev has
+16 TID TXQs (`fq_tin`); their shared 4096-bucket flow table is selected by a
+stable L2/L3/L4 hash (the frame-ring ABI intentionally has no private
+`skb_get_hash`). New and old flow lists use Linux's 300-byte deficit round
+robin. The global `fq` limits are 8192 packets / 16 MiB; overlimit removes up
+to 32 packets from the fattest flow's head. ECN-enabled CoDel uses mac80211's
+20-ms target and 100-ms interval: ECT IPv4/IPv6 frames are CE-marked, then
+non-ECT frames are reported as terminal TX drops. `Rt::tx_push`
+(`ieee80211_handle_wake_tx_queue`) schedules active TIDs round robin within
+their AC and hands frames to `Dp::tx` VO → VI → BE → BK, skipping ACs whose hardware queue
 (`vif->hw_queue[ac] = ac % 3`: VO / BK 0, VI 1, BE 2) has a stop reason
 (`enum queue_stop_reason` bits; `stop_queues` / `wake_queues` =
 `ieee80211_{stop,wake}_queues_by_reason`, a wake drains in AC order as
@@ -1023,17 +1353,86 @@ status (`ath11k_dp_tx_free_txbuf`). mac80211's side (`__ieee80211_tx_status`):
 `idr_alloc(.., 1, 0x2000)` as `ieee80211_store_ack_skb`) has its status
 queued for its sender (`ieee80211_report_ack_skb`; refused, overlimit,
 purged or interface-down frames report dropped).
-`Shared::send_eth_tx_status(eth, timeout)` is the consumer entry point
-(control-port TX with a cookie / the mlme probe's TX status).
+`Shared::send_eth_tx_status(eth, timeout)` is the control-port consumer
+entry point; `Shared::probe_ap(timeout)` builds the connection monitor's
+Null / QoS Null directly, correlates it through the same ACK ID map and
+removes the ID on timeout.
+
+For the associated peer, the first MSDU of a TQM PPDU also retains its valid
+`hal_tx_rate_stats.info0`. `runtime::tx_rate_info` mirrors
+`ath11k_dp_tx_update_txcompl`: BW / packet type / SGI / MCS and OFDMA
+tone-count fields decode as legacy, HT, VHT, or HE; short CCK preamble is
+removed from the 11b hardware code; the link's negotiated `sta.rx_nss` is the
+fallback NSS; and HE 1.6/3.2 µs GI plus 26/52/106/242/484/996/2×996-tone RU
+are reported through `RateInfo`. Its bitrate uses the same integer formulas
+as `cfg80211_calculate_bitrate_*`. `Ath11kNetdev::station_info` exposes this
+as `NL80211_STA_INFO_TX_BITRATE`; an OFDMA rate sends
+`NL80211_RATE_INFO_HE_RU_ALLOC`, never a misleading channel-width attribute.
+Firmware HTT completions lack a rate record. Fast RX MSDU descriptors do not:
+their `info3` packet type / MCS / SGI / receive-BW / MIMO-SS bitmap is carried
+in `RxMsdu` and `runtime::rx_rate_info` mirrors `ath11k_dp_rx_h_rate` for
+legacy / HT / VHT / HE (the bitmap's popcount is NSS). It becomes
+`NL80211_STA_INFO_RX_BITRATE` only after local-address checks identify the BSS
+peer. The descriptor does not provide HE RU allocation, so HE RX rates use the
+full receive width, as Linux does.
 
 **Netdev** (`iface::Ath11kNetdev`): `narf_net::Interface` (name from
 `reserve_name("wlan%d")`, MAC from WMI READY, MTU 1500, `link_up` =
-associated + authorized, RX / TX frame rings) and
+associated + authorized for a station or beaconing for an AP/GO, RX / TX frame
+rings) and
 `narf_wireless::WirelessNetIface` (`get_wireless_info` from the wiphy
-channels (2.4 / 5 GHz, enabled only) + own HT / VHT / HE caps;
+channels (2.4 / 5 / 6 GHz, enabled only) + own HT / VHT / HE caps;
 `scan`, `associate`, `disassociate` lock the mac layer (async mutex
 across the operation); `set_config` accepts only the current channel;
-`supports_handshake_offload`, `reports_disconnect_events`).
+`supports_scan_random_mac` exposes `WMI_TLV_SERVICE_SPOOF_MAC_SUPPORT`,
+`supports_handshake_offload`, `reports_disconnect_events`). A random scan
+sets the exact WMI spoof-MAC flag/address/mask pair; with per-channel scan
+configuration, `NL80211_SCAN_FLAG_COLOCATED_6GHZ` marks only non-PSC 6 GHz
+channels `SCAN_ONLY_IF_RNR_FOUND`, matching `ath11k_mac_op_hw_scan`.
+When firmware exposes `WMI_TLV_SERVICE_BSS_CHANNEL_INFO_64`, it also exposes
+dump-only `GET_SURVEY`: every enabled 2.4/5/6-GHz channel has a record,
+current chanctxs carry `IN_USE`, and completed pdev BSS-channel-info samples
+overlay noise / total / busy / BSS-RX / TX time.  A dump queues one coalesced
+refresh for the runtime worker and returns its cached snapshot, because a
+generic-netlink handler must not re-enter WMI completion processing.
+It advertises
+station, AP, P2P Device, P2P Client, and P2P GO iftypes. A down-only
+`SET_INTERFACE` selects the matching STA/AP WMI vdev subtype; AP/GO nl80211
+requests are serialized onto the runtime queue so their WMI completion waits
+never re-enter a generic-netlink syscall. One physical `wiphy_id` groups the
+root `wlan%d` netdev and up to two `NL80211_CMD_NEW_INTERFACE` children;
+WCN6855's firmware slots 0, 1 and 2 are claimed atomically and each child has
+its own MAC address, `Mac` instance, WMI event queue, RX/TX rings, link/AP
+state and unique `WDEV` id. PDEV-wide `ath11k_mac_op_start`/`stop` runs only
+at the shared open-vdev refcount's zero-to-one/one-to-zero transitions.
+The physical wiphy also reports and enforces WCN6855's three-vdev interface
+combination through `NL80211_ATTR_INTERFACE_COMBINATIONS`: at most two STA,
+at most three AP/P2P client/GO vdevs, one P2P Device, a total cap of three,
+up to two operating channels for the target's dual-station profile, matching
+infrastructure/AP beacon intervals (minimum GCD 100) and radar detection
+across every ath11k-supported channel width.
+The pdev has one hardware-scan engine and fixed firmware scan id, so the
+shared runtime atomically grants it to exactly one vdev for a normal scan or
+P2P remain-on-channel operation; a normal scan owns a cancellation-safe lease:
+dropping its generic-netlink future queues WMI scan-stop on the vdev worker,
+which releases the claim only after firmware is no longer using the fixed scan
+id. Terminal scan, ROC expiry/cancel, teardown, and firmware reconstruction
+also release their long-lived grants. Radar records its 30-minute NOP in the physical-radio table
+as well as the receiving MAC's wiphy state, so siblings and newly-created
+vdevs cannot select an overlapping DFS chandef even if the reporting vdev is
+deleted before expiry.
+`DEL_INTERFACE` may remove an up child: it is removed from nl80211 and the
+net registry synchronously, then its worker completes `ndo_stop`, vdev-local
+DP/mgmt cleanup and `WMI_VDEV_DELETE` before the slot is made available.
+Before a reused slot binds its new MAC it clears the old vdev's pending WMI
+events and DP-local link/TX/ACK state, so a late teardown or scan completion
+cannot be consumed by the new interface.
+The physical root cannot be deleted through this command.
+`station_info` snapshots completion-backed packet / retry / failure counters,
+ACK signal, HTT PPDU TX rate/duration, and monitor-status PPDU combined/chain
+RSSI plus RX duration without blocking the runtime; it uses the MAC lock only
+to read the negotiated AP NSS. The RX rate comes from the accepted AP MSDU's
+own PHY descriptor (never from an association-width guess).
 `register_pci`: `narf_net::iface::register(name, mac, send)` +
 `set_driver_info("ath11k_pci")` + carrier off + `install_rx_drain`, the
 capability registry (`step::NET_REGISTER` printed if refused, not
@@ -1048,7 +1447,8 @@ the stack's. When the carrier drops, the reason cfg80211 would report
 (`__cfg80211_disconnected`) goes to `nl80211::notify_disconnect(name,
 reason, from_ap)` (`Sinks::disconnected`, from `Mac::take_disconnect`): a
 Deauthentication / Disassociation from the AP → its reason code +
-`NL80211_ATTR_DISCONNECTED_BY_AP`; beacon / connection loss (and kickout,
+  `NL80211_ATTR_DISCONNECTED_BY_AP`; beacon / connection loss, rejected CSA
+  (and kickout,
 see §8) → 4 (`WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY`,
 `__ieee80211_disconnect`), locally generated; `disassociate` and the
 stop path → 3 (`DEAUTH_LEAVING`), locally generated. The reason
@@ -1127,7 +1527,10 @@ restart; detail 1, 3 caps).
    once, `wmi_send` and `tx_eth` fail with `-ESHUTDOWN`: every control
    operation in flight ends.
 2. The runtime loop takes the notice (`Shared::take_fw_notice`) and runs
-   `Ath11kNetdev::recover`: carrier off, the mac-layer mutex taken,
+   `Ath11kNetdev::recover`: a replay-safe associated station (external SME,
+   Open, or completed in-kernel RSN) or beaconing AP/GO retains carrier while
+   its mac80211 state is captured; other station links go carrier off. The
+   mac-layer mutex is taken,
    `Shared::recover_device(notice)`: the `Rt` leaves the slot (`lock`
    callers wait; nothing is held across the awaits), DP + CE interrupts
    off, `QmiFw::recover(power_cycle = Reset)` (§2.3 power cycle, QMI to
@@ -1140,12 +1543,18 @@ restart; detail 1, 3 caps).
    `Rt` back in the slot.
 3. `post_reconfigure_recovery` / `ieee80211_restart_hw`: a new mac layer
    from the new capabilities (`Mac::config()` kept); if the interface was
-   open, the open path again (`ath11k_mac_op_start` + `add_interface`);
-   `reconfig_complete` (`fail_cont_count` = 0, queues woken,
-   `diag::note_wifi_recovered`); then a directed scan + `associate` with
-   the last association's parameters (mac80211 would restore the
-   association instead, §8); if that fails the command-line autoconnect
-   keeps retrying.
+   open, the open path again (`ath11k_mac_op_start` + `add_interface`). An
+   replay-safe station then recreates its channel/vdev/peer, EDCA/MU-EDCA,
+   BSS and MFP state, replays PTK then GTKs, and only then re-authorizes;
+   no authentication or association frame is sent. A beaconing AP/GO
+   similarly restarts its beacon/MBSSID role, group keys, retained BIP keys,
+   client peers, PTKs and authorization; a non-transmitting MBSSID profile
+   consumes its transmitter's retained template set. Its old BA sessions are
+   discarded, as in mac80211 restart. A shared PCI radio waits until every
+   live vdev has finished this pass before `reconfig_complete`
+   (`fail_cont_count` = 0, queues woken, `diag::note_wifi_recovered`) then
+   follows. Only a pre-key in-kernel handshake lacks retained key state and
+   performs the existing directed scan + `associate` retry.
 4. A failure latches its step, parks what the firmware was given and
    marks the device dead: control operations fail with `HardwareError`,
    `lock` callers park forever, the runtime loop ends.
@@ -1206,9 +1615,12 @@ operations refused) and the reset gate.
 - The driver never reports a wireless capability it does not have:
   `wlan%d` is registered only after the core, the data path and the mac
   layer (`ath11k_mac_register`) are up, and opens (pdev start + station
-  vif) only on `IFF_UP`; 6 GHz association and SAE offload are not
-  advertised (bands 2.4 / 5 GHz; `supports_sae_offload` false, as for every
-  mac80211 driver); HE is (and is used on 2.4 / 5 GHz).
+  vif) only on `IFF_UP`; the reported bands include 2.4 / 5 / 6 GHz when
+  firmware exposes their capability tables, while a selected BSS is always
+  identified by its exact MHz frequency. HE is used on every supported band;
+  station TWT requester support is advertised only when firmware exposes
+  `WMI_TLV_SERVICE_STA_TWT`. `supports_sae_offload` remains false, as for
+  every mac80211 driver.
 - No lock is held across an `.await`: `Shared::rt` is taken for
   synchronous steps only (a recovery moves the runtime out of the slot
   instead of holding it); the mac-layer mutex is held across a control
@@ -1237,7 +1649,7 @@ card (QEMU emulates none) is exercised once, after phase 8.
 | 6 | Control: pdev/vdev, regulatory, scan → `BssInfo` list, over the runtime ports (**done, offline**) | `mac.c`, `wmi.c`, `reg.c` |
 | 7 | Connect: peer, auth/assoc via mgmt TX, EAPOL via `narf-wireless` supplicant over the DP rings, key install + PN config (**done, offline** for Open + WPA2-PSK/CCMP; SAE open) | `mac.c`, `wmi.c`, `dp_rx.c` |
 | 8 | Data path: TX (Ethernet → native-wifi 802.11 → TCL → WBM completion), RX (REO dst → Ethernet II → stack / RX ring); `wlan%d` registered with `narf_net` + `narf_wireless` (**done, offline**; first hardware run pending) | `mac80211/tx.c`, `dp_tx.c`, `dp_rx.c` |
-| 9 | Power: PS, suspend/resume; firmware crash recovery (**done, offline**: MHI RDDM / SYS_ERR + QMI late events → reset / restart, power cycle, reconfigure, mac restart, reconnect) | `core.c`, `mac.c`, `mhi.c`, `qmi.c` |
+| 9 | Power: PS, WoW M3 suspend/resume or no-WoW cold HIF/MHI cycle, and firmware crash recovery (**implemented, validation deferred**: MHI RDDM / SYS_ERR + QMI late events → reset / restart, power cycle, reconfigure; WoW ACK/wakeup and normal cfg80211 disconnect/reconfigure policy) | `core.c`, `mac.c`, `mhi.c`, `qmi.c`, `wow.c` |
 
 ## 6. Dependencies
 
@@ -1261,7 +1673,7 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   `recovery` and `fw-crash=N recovered=M` on that line
   (`diag::note_wifi_crash` / `note_wifi_recovered`,
   `fb::status::wifi_line`).
-- MHI diag steps: `mhi_host::step` (10–35) latch through
+- MHI diag steps: `mhi_host::step` (10–39) latch through
   `diag::latch_wifi_error`; the stage moves to `transport` at the
   first M0 and `fw-boot` at mission mode. QMI steps are `wlfw::step`
   (40–63), stage `control` from the start of the handshake.
@@ -1332,40 +1744,40 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   failing with EXT2 still arriving — goes on without the ext caps);
   `wmi_cmd_wait` / event queues are NARF API, Linux uses per-event
   completions.
-- MHI crash policy (deliberate): NARF allocates no RDDM image (4 MiB of
-  DMA32 with no dump consumer) and does not port the MHI core's own
-  SYS_ERR recovery, so a SYS_ERR after mission mode — which Linux, with
-  ath11k's RDDM image, leaves to the RDDM entry that follows — queues
-  `ath11k_core_reset` like EE_RDDM. During bring-up a SYS_ERR still fails
-  the bring-up (Linux's `reset_work` ignores an unregistered device).
+- MHI crash policy: NARF allocates ath11k's 4.125 MiB RDDM BHIe RX table
+  and builds a CPU-owned `RddmSnapshot` after a completed firmware dump.
+  As in Linux's RDDM-capable path, a mission-mode SYS_ERR waits for the
+following RDDM entry, which owns the single `ath11k_core_reset` request;
+the generic no-RDDM MHI-core recovery remains out of scope for WCN6855.
+After collection, the snapshot moves from the MHI controller to the physical
+radio's `Shared::take_firmware_crash_dump()` retrieval slot, so reset cannot
+invalidate a diagnostic consumer's owned payload.
+A SYS_ERR during bring-up still fails the bring-up (Linux's `reset_work`
+  ignores an unregistered device).
 - Core after bring-up: `ATH11K_FLAG_*` crypto / raw mode are not modelled (HW
   crypto, native-wifi encap / decap as in the INIT resource config).
-- Recovery deviations from Linux (deliberate): no coredump
-  (`ath11k_coredump_collect`, no RDDM image); `reset_count` /
+- Recovery deviations from Linux (deliberate): `reset_count` /
   `reset_complete` (a second reset work racing the first) and the
   `recovery_start` wait are not modelled — one runtime task runs one
   recovery at a time and later notices are dropped while one is pending;
   WMI / HTC timeouts do not trigger recovery (Linux's do not either:
-  CRASH_FLUSH only shortens them); the mac layer is rebuilt and, for a
-  connection the kernel itself made (the command-line autoconnect,
-  `Ath11kNetdev::associate_kernel`, `ConnectOrigin::Kernel`), NARF
-  associates again over the air with the last parameters. A connection
-  userspace asked for (nl80211 CONNECT, ASSOCIATE, any external-supplicant
-  association: `ConnectOrigin::Nl80211`) is not restored: cfg80211 hears
-  the loss (DEAUTHENTICATE + DISCONNECT, reason 1) and wpa_supplicant
-  reconnects, as when mac80211's `ieee80211_reconfig` cannot restore it.
-  Linux's reconfig restores the station, keys and BSS
-  state in the restarted firmware without new frames — so the old mac
-  layer (its supplicant / rekey state, RX BA sessions, scan table) is
-  dropped whole rather than torn down session by session: no DELBA is
-  sent (Linux's `ieee80211_reconfig` tears the BA sessions down with
-  AGG_STOP_LOCAL_REQUEST and a DELBA; NARF's reassociation resets the
-  AP's BA state instead), the per-TID REO / fragment state and frag
-  timers go with `Dp::free`, and cfg80211 sees a disconnect (reason 1,
-  as `ieee80211_sta_connection_lost`) then a new connection; a failed
-  recovery leaves the device dead until the next boot (Linux waits for
-  another crash event); the `fail_cont_count` gate counts failed
-  recoveries (Linux counts resets that did not complete within 20 s).
+  CRASH_FLUSH only shortens them). A replay-safe associated station
+  (nl80211/userspace SME, Open, or completed in-kernel RSN) now follows
+  `ieee80211_reconfig`: NARF rebuilds its vdev/peer/BSS and retained
+  PTK/GTK/IGTK, GTK-rekey, EDCA, MFP and power-save state without air
+  frames; it clears RX BA tokens because the new REO has no matching
+  session. A beaconing AP/GO also restores its templates, MBSSID role,
+  group/BIP keys, clients, client PTKs and authorization; CSA/color
+  countdowns restart from their stable template after the firmware clock
+  reset. A failed station replay reports the normal reason-1 disconnect.
+  Only a pre-key in-kernel command-line handshake
+  (`Ath11kNetdev::associate_kernel`, `ConnectOrigin::Kernel`) remains a
+  directed scan plus over-the-air association because it has no complete
+  supplicant key state to replay. Per-TID REO / fragment state and fragment
+  timers go with `Dp::free`; a failed recovery leaves the device dead until
+  the next boot (Linux waits for another crash event); the `fail_cont_count`
+  gate counts failed recoveries (Linux counts resets that did not complete
+  within 20 s).
 - DP deviations from Linux (deliberate): RX buffers, TX bounce buffers
   and ring memory are DMA32 coherent `DmaMem`s (Linux streams skbs);
   rings are allocated with no 7-byte slack (the page-aligned allocator
@@ -1375,17 +1787,21 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   802.3 + SNAP → Ethernet II; raw → `ath11k_dp_rx_h_undecap_raw` then
   802.11 → 802.3 for unicast, a decrypted group raw MPDU (Linux keeps its
   IV for mac80211) dropped); MPDUs with FCS,
-  TKIP-MIC or decrypt errors are dropped in the DP (mac80211 drops or
-  reports them; NARF has no TKIP countermeasures); multicast PN is not
+  TKIP-MIC or decrypt errors are dropped in the DP; each locally detected
+  TKIP-MIC error retains its peer/key identity and is multicast as
+  NL80211_CMD_MICHAEL_MIC_FAILURE, as mac80211 reports it to userspace
+  (KEY_SEQ is absent when WCN6855 stripped the IV). Multicast PN is not
   checked by the host (Linux leaves it to mac80211); the defrag
   reinjection allocates its buffer id from 1 (Linux `idr_alloc(.., 0,
   ..)` returns id 0, which `ath11k_dp_process_rx` skips as invalid: the
-  first reassembled MPDU would be lost); TKIP fragment sets are dropped
-  after reassembly (no Michael MIC, `ath11k_dp_rx_h_verify_tkip_mic`);
-  the pairwise-key fragment flush (`ath11k_peer_frags_flush`) is a
+  first reassembled MPDU would be lost); a pairwise TKIP fragment set is
+  verified with its retained RX Michael direction before reinjection, and an
+  invalid or unkeyed set is dropped; the pairwise-key fragment flush
+  (`ath11k_peer_frags_flush`) is a
   queued sync op applied at the install command's runtime lock;
-  monitor-status buffers are recycled unparsed (no RSSI /
-  rate stats); `Dp` keeps the peer table HTT maps
+  monitor-status buffers are recycled unparsed (no RSSI or full-PPDU
+  statistics; the fast RX descriptor's per-MSDU PHY rate is retained for
+  STA_INFO); `Dp` keeps the peer table HTT maps
   (`ath11k_peer_map_event`) itself. NARF-stricter: truncated HTT T2H
   messages, link descriptors outside every bank, an L3 pad that runs
   past the RX buffer, TX frames shorter than their header.
@@ -1400,12 +1816,16 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   dropped exception entry the later fragments of that pass are freed
   without returning their link descriptors; the defrag keeps
   `is_decrypted` across fragments.
-- DP not ported: WBM idle scatter list (dead for WBM_IDLE_LINK: > 2 MiB
-  of 8-byte entries needs > 8 banks, which `ath11k_dp_link_desc_setup`
-  rejects first), monitor / full-monitor rings, PPDU / peer TX-RX
-  statistics. (Ring teardown is ported, §3.7 step 9; NARF-stricter: a
-  failed `ath11k_link_desc_setup` also releases the WBM idle ring, which
-  Linux's `ath11k_dp_alloc` leaks on that path.)
+- DP omission: WBM idle scatter list (dead for WBM_IDLE_LINK: > 2 MiB of
+  8-byte entries needs > 8 banks, which `ath11k_dp_link_desc_setup` rejects
+  first). HTT TX PPDU and default monitor-status RX PPDU statistics now route
+  through `GET_STATION`, including rate/RU/DCM, combined/chain RSSI, raw-RSSI
+  EWMA and PPDU durations. Monitor and full-monitor rings are **not** a
+  WCN6855 omission: the Linux WCN6855 `hw_params` explicitly has
+  `supports_monitor = false` and `full_monitor_mode = false`, so mac80211
+  removes monitor iftype after registration. Ring teardown is ported (§3.7
+  step 9); NARF-stricter: a failed `ath11k_link_desc_setup` also releases the
+  WBM idle ring, which Linux's `ath11k_dp_alloc` leaks on that path.
 - Integration (decided, §3.11): HTT T2H from the HTC HTT endpoint (and
   CE5) → `htt_t2h_msg_handler` in every service pass; HTT H2T via
   `Ath11kCore::htt_send`; the DP ext groups on vectors `(grp % 18) + 14`
@@ -1423,31 +1843,50 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   RX checksum verdict reaches frame-ring consumers only. Whether the TCL
   engine uses the seed or recomputes the pseudo-header on native-wifi
   frames is hardware-only (Linux passes the same seed).
-- TX status, left open: NARF has no consumer that waits for an ACK yet.
-  The in-kernel 4-way handshake sends M2 / M4 without asking (Linux
-  installs the PTK without waiting too); mac80211's connection monitor
-  (`ieee80211_mgd_probe_ap` nullfunc probing after `ieee80211_beacon_loss`,
-  completed by `ieee80211_sta_tx_notify`) is not ported — beacon loss is
-  ath11k's own 3 s `connection_loss_work` (mac.rs); nl80211 has no
-  `CONTROL_PORT_FRAME` / `cfg80211_control_port_tx_status`, and no station
-  dump to show the status statistics. Each would call
-  `send_eth_tx_status`. Rate / retry statistics (`ath11k_dp_tx_update_txcompl`,
-  `ieee80211_rate_status`) are not reported; low-ACK kickout stays the
-  firmware's (`REPORTS_LOW_ACK`).
+- TX status: `Shared::send_eth_tx_status` can wait for a requested Ethernet
+  frame's ACK, and the connection monitor ports mac80211's
+  `ieee80211_mgd_probe_ap`: after ath11k's 3 s beacon-loss work expires it
+  transmits up to two directed Null / QoS Null frames, completed through the
+  same requested-status map; an ACK preserves the association and two no-ACK
+  completions disconnect. CONTROL_PORT_OVER_NL80211_TX_STATUS is advertised:
+  requested control-port frames keep their extended-ACK cookie beside the
+  private requested-status id and WBM completion multicasts
+  CONTROL_PORT_FRAME_TX_STATUS. The in-kernel 4-way handshake sends M2 / M4
+  without asking (Linux installs the PTK without waiting too).
+  `GET_STATION` reports completion-backed TX / RX packet, failed and retry
+  counters, last ACK signal, monitor-status PPDU combined/chain RSSI and RX
+  duration, HTT PPDU TX bitrate/duration (legacy / HT / VHT / HE including HE
+  OFDMA RU/DCM), plus the accepted BSS MSDU's RX-descriptor-derived RX bitrate
+  (legacy / HT / VHT / HE; HE RU is not encoded by that descriptor). Both
+  mappings are implemented from Linux's descriptor definitions but await
+  WCN6855 on-card qualification. Low-ACK
+  kickout stays the firmware's (`REPORTS_LOW_ACK`).
 - Integration deviations from Linux (deliberate): `ndo_open` is
   asynchronous (`set_link_state` sets `IFF_UP` and returns; a failed open
   takes the interface down again, where Linux's `dev_open` fails without
   setting it), because the hook runs in the caller's syscall and the WMI
-  bring-up waits on the device; the TX
-  queues are one FIFO per AC, not one TXQ per TID with mac80211's airtime
-  round robin and fq_codel (one station; the AC order and stop reasons are
-  Linux's), no A-MSDU / fast-xmit header cache; a PTK rekey runs inside
+  bring-up waits on the device; TX queues match mac80211's per-TID shape:
+  a shared 4096-flow table, `fq_tin` new/old deficit round robin, global
+  8192-packet / 16-MiB limits and ECN-enabled fq_codel (20-ms target,
+  100-ms interval). The netdev ABI carries no private `skb_get_hash`, so
+  the driver derives a stable L2/L3/L4 hash. NARF's one per-vdev TXQ owner
+  replaces mac80211's separate `txq_info` allocations; AP-client flows
+  therefore share the AP vdev's per-TID fq instance. This does not remove a
+  WCN6855 nl80211 feature: ath11k does not advertise AQL or airtime-fairness.
+  There is no TX A-MSDU aggregation (ath11k advertises
+  `SUPPORTS_AMSDU_IN_AMPDU`, which NARF implements on receive; it does not
+  advertise mac80211's distinct `TX_AMSDU` capability). `tx_hdr` constructs
+  the same final native-Wi-Fi header and sequence state that Linux's
+  fast-xmit finish path does directly, rather than retaining mac80211's
+  skb-header cache; a PTK
+  rekey runs inside
   one runtime step, so mac80211's `WLAN_STA_BLOCK_BA` window (ADDBA refused
   between teardown and the new key) has nothing to block; EAPOL frames carry 802.1X version 1
   (wpa_supplicant's `DEFAULT_EAPOL_VERSION`); PMF policy is optional for
   PSK (NetworkManager / iwd; standalone wpa_supplicant defaults to
-  `pmf=0`); only BIP-CMAC-128 (no BIP-GMAC / CMAC-256), no beacon
-  protection (BIGTK), no OCV; a group-addressed robust frame naming an
+  `pmf=0`); the complete ath11k BIP set (CMAC-128/256 and GMAC-128/256) is
+  host-implemented; beacon protection (BIGTK) and OCV are not advertised by
+  Linux ath11k/WCN6855 either; a group-addressed robust frame naming an
   IGTK index we do not hold is dropped.
 - Control path: userspace drives the station over nl80211 with Linux's
   permission model (`wireless/` spec §3.4), as mac80211 offers ath11k on
@@ -1457,17 +1896,33 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   with AUTH_DATA = transaction | status | body, `mac/ext.rs`
   `Mac::sme_authenticate` = `ieee80211_mgd_auth`) / ASSOCIATE
   (`Mac::sme_associate` = `ieee80211_mgd_assoc`: userspace's elements as
-  given, `ieee80211_send_assoc` ordering, the port closed while
+  given, `ieee80211_send_assoc` ordering; `NL80211_ATTR_PREV_BSSID` must name
+  the association displaced by this SME authentication, emits a Reassociation
+  Request and requires a Reassociation Response; its rejection retries a
+  normal Association Request once as cfg80211 does; the port closed while
   NL80211_ATTR_CONTROL_PORT is set) / DEAUTHENTICATE / DISASSOCIATE each
   report the peer's or our frame as cfg80211 does; CONNECT without a PMK
   (`SecurityConfig::External`) runs the same through the driver's SME.
   EAPOL (`Mac::take_control_port_rx`) goes to the connection owner as
   CONTROL_PORT_FRAME, or up the netdev with DA = our address
-  (PF_PACKET / l2_packet); TX goes through CONTROL_PORT_FRAME or the
-  netdev, protected only once a PTK is in. Keys come from NEW_KEY
+  (PF_PACKET / l2_packet); requested CONTROL_PORT_FRAME TX carries its
+  extended-ACK cookie through the ath11k WBM completion and multicasts
+  CONTROL_PORT_FRAME_TX_STATUS (full Ethernet frame and ACK flag only on
+  acknowledgement) on the MLME group. CONTROL_PORT_NO_ENCRYPT reaches native
+  Wi-Fi header construction and suppresses the Protected bit even after PTK
+  installation: the direct control-port attribute applies to that frame, and
+  the CONNECT/ASSOCIATE policy applies to netdev frames whose EtherType equals
+  the configured control protocol. TX goes through CONTROL_PORT_FRAME or the
+  netdev, protected only once a PTK is in unless that policy bypasses it.
+  A local TKIP Michael MIC failure also reaches the MLME group as
+  MICHAEL_MIC_FAILURE with its source, pairwise/group type and, when the
+  stripped report can be attributed to the active key, its installed key
+  index, allowing wpa_supplicant to initiate its normal countermeasures.
+  Keys come from NEW_KEY
   (`Mac::ext_add_key` → the same `install_key` / PTK replacement path
-  the in-kernel supplicant and PTK rekey use, AES-CMAC kept in software
-  BIP, KRACK re-installs ignored), DEL_KEY, and the port opens on
+  the in-kernel supplicant and PTK rekey use, all BIP suites kept in host
+  software while WMI installs data ciphers TKIP, CCMP-128/256, and
+  GCMP-128/256, KRACK re-installs ignored), DEL_KEY, and the port opens on
   SET_STATION AUTHORIZED (`Mac::ext_set_authorized`); the in-kernel
   supplicant and its group / PTK rekey never run for such an
   association. These calls arrive in the netlink syscall, which cannot
@@ -1479,19 +1934,23 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   (`Mac::set_power_save`: `wdev->ps` on by default, WMI PS mode
   disabled / inactivity time + enabled once authorized with a beacon);
   GET_REG reports the self-managed wiphy's `Regd`; STA_INFO carries the
-  AP's last management-frame signal (no rate statistics: ath11k's PPDU
-  stats are not parsed). Unverified until hardware / real binaries:
-  wpa_supplicant, NetworkManager and eapol_test against a real AP, SAE
-  anti-clogging / group 20-21 over the userspace SME, EAP-TLS / PEAP
-  timing, and the firmware's handling of the userspace-built
-  Authentication frames.
+  AP's last management-frame signal, WBM TX rate and accepted fast-RX
+  descriptor rate (full PPDU statistics are not parsed). Unverified until
+  hardware / real binaries:
+  wpa_supplicant, NetworkManager and eapol_test against a real AP, SAE-PK
+  public-key authentication and anti-clogging / group 20-21 over the
+  userspace SME, EAP-TLS / PEAP timing, and the firmware's handling of the
+  userspace-built Authentication frames. The in-kernel SAE path verifies
+  SAE-PK's AP Confirm proof (Modifier AES-SIV recovery, password fingerprint
+  and ECDSA KeyAuth) before it accepts the PMK; the external-SME path leaves
+  that exchange to userspace.
 - Unverified until hardware (recovery): that the WCN6855 firmware enters
   RDDM (or reports SYS_ERR) on a crash and comes back after the
   `sw_reset` power cycle with a fresh QRTR HELLO; that it sends
   FW_INIT_DONE (not only FW_READY) after the restart; that the target
   re-initialises its LMAC ring pointer words (Linux's srng setup does not
   clear them; the fake firmware does); MSI / ASPM behaviour across the
-  cycle; the reconnect timing.
+  cycle; external-SME/AP in-place reconfiguration and reconnect timing.
 - Unverified until hardware (the first bare-metal run answers these):
   the real firmware's HTC credit size vs `max_msg_len` (one WMI credit
   with shadow registers — a command larger than one credit would stall
@@ -1530,7 +1989,8 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   a new sequence flushes, fragment 0's ring entry kept, the others' link
   descriptors returned, 2 s `frag_timer` from the service pass), on a
   complete set `defrag_validate_incr_pn` (CCMP / GCMP consecutive PNs),
-  `ath11k_dp_rx_h_defrag` + `_undecap_frag` and
+  `ath11k_dp_rx_h_defrag` + `_undecap_frag` +
+  `ath11k_dp_rx_h_verify_tkip_mic` for TKIP and
   `ath11k_dp_rx_h_defrag_reo_reinject` (fragment 0's MSDU link rewritten,
   the MPDU on SW2REO with its REO queue); the REO returns it raw on a
   destination ring (`rxcb->is_frag`). `ath11k_peer_frags_flush` runs
@@ -1554,21 +2014,46 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   `regdb.bin`) load once the MHI image proved the store is up. An ISO /
   initramfs-only image
   needs `--initramfs-firmware "ath11k/WCN6855/hw2.1/*"`.
-- Mac layer scope (decided): HT, 5 GHz VHT and HE on 2.4 / 5 GHz up to
-  80 MHz (phymodes 11NG / 11NA / 11AC / 11AX HE20-80); 6 GHz association
-  and > 80 MHz stay unreachable. Scan covers 2.4/5/6 GHz; `BssInfo` lists 2.4/5
-  GHz only (`narf_wireless` uses bare channel numbers).
+- Mac layer scope (decided): HT, 5 GHz VHT and HE on 2.4 / 5 / 6 GHz through
+  contiguous 160 MHz and non-contiguous 80+80 MHz (phymodes 11NG / 11NA /
+  11AC / 11AX HE20-160 plus VHT80_80 / HE80_80). Six-GHz
+  association uses HE 6 GHz Band Capabilities and Operation, WMM, AP power
+  type-aware default-client regulatory rules, Transmit Power Envelope / Power
+  Constraint parsing and WMI TPC programming after vdev start. Firmware's
+  client type selects the matching TPE category. Scan preserves
+  each BSS's centre frequency in MHz so a 6 GHz channel is no longer lost to
+  a bare-channel-number collision. An 80+80 definition records both centre
+  frequencies and is accepted only when the regulatory channel set and both
+  peers' distinct wide-channel capability bits permit it.
 - Mac layer, open vs Linux (each is a deliberate simplification or an
   unverified detail, see `mac.rs` comments): probe-request elements
   approximate `ieee80211_build_preq_ies`; the offloading SME builds its own
   RSN element (and RSNXE for SAE) and forwards userspace's other
   elements (Extended Capabilities, vendor elements) in their order, with
-  `WLAN_EXT_CAPA3_MULTI_BSSID_SUPPORT` set for an HE association
-  (`SUPPORTS_ONLY_HE_MULTI_BSSID`); no Country /
-  Power Constraint handling (`ap_power_level`), no TPC / 6 GHz power
-  envelope, no TWT; association comeback
-  (status 30) is a reject; roaming,
-  GTK rekey offload and CSA are not implemented; kickout is treated as
+  `WLAN_EXT_CAPA3_MULTI_BSSID_SUPPORT` and, when firmware supports it,
+  `WLAN_EXT_CAPA10_TWT_REQUESTER_SUPPORT` set for an HE association.
+  Six-GHz Power Constraint and Transmit Power Envelope handling follows
+  Linux's PSD/EIRP and local/regulatory-client precedence, including the
+  firmware TX ceiling; it does not invent Country IEs. TWT enables the
+  firmware requester service only for an AP that advertises both required
+  responder capabilities; individual TWT-dialog management is firmware / AP
+  driven rather than a separate NARF control API. A CONNECT to a different
+  cached BSSID uses
+  `WirelessNetIface::roam`: it releases the old peer/channel locally,
+  reauthenticates, sends a Reassociation Request carrying the previous BSSID,
+  retries once as a plain Association Request when the AP rejects reassociation,
+  and then completes a fresh 4-way handshake. The in-kernel CONNECT path
+  handles an Association Comeback (status 30 plus Timeout Interval type 3)
+  by waiting the announced TU interval and retrying within the normal three
+  association attempts. The userspace-SME path returns that raw response and
+  emits `NL80211_CMD_ASSOC_COMEBACK` with the BSSID and unconverted Timeout
+  Interval value in TUs, allowing the supplicant to schedule its next
+  `ASSOCIATE`. GTK rekey data, WMI control, replay-counter notification and
+  the power-owned system WoW/cold-suspend policy are implemented; CSA/ECSA is
+  implemented for trusted beacons and robust
+  Spectrum-Management actions, while public unprotected extended CSA only
+  takes effect after its matching beacon.
+  Kickout is treated as
   link loss (Linux reports low-ack to userspace); deauth reason after a
   4-way timeout is 3, after a failed message 3/4 1 (17 for an RSNE / RSNXE
   mismatch); the 11d "fin" path and the

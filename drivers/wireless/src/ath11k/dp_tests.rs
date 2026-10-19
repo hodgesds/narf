@@ -297,6 +297,8 @@ pub(super) struct Rxd {
     pub(super) msdu_len: u32,
     pub(super) decap: u32,
     pub(super) freq: u32,
+    /// `rx_msdu_start.info3`: packet type / MCS / GI / bandwidth / NSS.
+    pub(super) rate_info: u32,
     pub(super) enc_valid: bool,
     pub(super) enc_type: u32,
     pub(super) tid: u32,
@@ -326,9 +328,10 @@ pub(super) fn rx_desc_bytes(d: &Rxd) -> Vec<u8> {
         ((!d.not_done) as u32) << 31 | (d.decrypt_status & 7) << 10,
     );
     // msdu_start.info1 @ 100 + 4 (len 13:0), info2 @ 100 + 8 (decap 9:8),
-    // phy_meta_data @ 100 + 28
+    // info3 @ 100 + 20 (PHY rate), phy_meta_data @ 100 + 28
     put32(&mut b, 104, d.msdu_len & 0x3fff);
     put32(&mut b, 108, (d.decap & 3) << 8);
+    put32(&mut b, 120, d.rate_info);
     put32(&mut b, 128, d.freq);
     // mpdu_start @ 144: info2 @ +28 (enc 5:2, tid 18:15), sw_peer_id @ +42,
     // info1 @ +44 (ENCRYPT_INFO_VALID 9, MAC_ADDR2_VALID 3, seq 31:20),
@@ -425,6 +428,9 @@ pub(super) fn good_rxd(len: usize, decap_ty: u32) -> Rxd {
         msdu_len: len as u32,
         decap: decap_ty,
         freq: 5180,
+        // HT MCS0, 20 MHz, one receive chain — the same fields
+        // `ath11k_dp_rx_h_rate` reads on hardware.
+        rate_info: 2 << 8 | 1 << 24,
         ..Rxd::default()
     }
 }
@@ -1900,12 +1906,29 @@ pub(super) fn wbm_tqm(
     peer: u32,
     tid: u32,
 ) -> [u32; 8] {
+    wbm_tqm_rate(desc_id, reason, ppdu, tries, rssi, peer, tid, 0x1234_5671)
+}
+
+/// As [`wbm_tqm`], with an explicit valid `hal_tx_rate_stats.info0` value.
+/// The integration device uses this to model Linux's station-rate update from
+/// a WBM completion rather than synthesising a rate at the MAC layer.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn wbm_tqm_rate(
+    desc_id: u32,
+    reason: u32,
+    ppdu: u32,
+    tries: u32,
+    rssi: u32,
+    peer: u32,
+    tid: u32,
+    rate_stats: u32,
+) -> [u32; 8] {
     let mut w = [0u32; 8];
     w[1] = (3 << 8) | (desc_id << 11);
     w[2] = reason << 13; // REL_SRC TQM (0)
     w[3] = ppdu | (tries << 24);
     w[4] = rssi | (1 << 9); // FIRST_MSDU
-    w[5] = 0x1234_5671; // rate stats, VALID
+    w[5] = rate_stats;
     w[7] = peer | (tid << 16);
     w
 }
@@ -2664,6 +2687,40 @@ fn smoke_ath11k_dp_undecap_raw() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_dp_undecap_raw);
+
+/// TKIP's one Michael MIC covers the complete MSDU, not its individual
+/// fragments. This validates the raw MPDU helper shared by ordinary RX and
+/// the fragment reassembly path against the 802.11 DA/SA/TID pseudo-header.
+fn smoke_ath11k_dp_tkip_michael_layout() -> TestResult {
+    use narf_crypto::michael_mic::michael_mic;
+
+    use super::dp_frag::{verify_tkip_mic_frame, TKIP_ICV_LEN, TKIP_MIC_LEN};
+
+    let payload = [1, 2, 3, 4, 5, 6, 7];
+    let key = [0x53; 8];
+    let mut mpdu = raw_frag(FRAG_SEQ, 0, true, 0x10, &payload);
+    let mic_start = mpdu.len() - TKIP_MIC_LEN - 4;
+    let mic = michael_mic(&key, &STA, &SRC, 0, &payload);
+    mpdu[mic_start..mic_start + TKIP_MIC_LEN].copy_from_slice(&mic);
+    mpdu.splice(
+        mic_start + TKIP_MIC_LEN..mic_start + TKIP_MIC_LEN,
+        [0xc3; TKIP_ICV_LEN],
+    );
+    check!(
+        verify_tkip_mic_frame(&mpdu, &key) == Some(mic_start),
+        "raw TKIP MPDU Michael MIC verifies"
+    );
+    mpdu[mic_start] ^= 1;
+    check!(
+        verify_tkip_mic_frame(&mpdu, &key).is_none(),
+        "raw TKIP MPDU rejects modified Michael MIC"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_dp_tkip_michael_layout
+);
 
 /// Occupy one ring of `ty` / `ring_num` / `mac_id` in the HAL (a ring
 /// some other owner already set up).

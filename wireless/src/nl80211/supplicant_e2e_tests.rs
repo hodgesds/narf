@@ -188,6 +188,7 @@ impl crate::WirelessNetIface for PskStub {
         Ok(alloc::vec![crate::BssInfo {
             bssid: AP_BSSID,
             ssid: AP_SSID.to_vec(),
+            frequency_mhz: 2407 + 5 * AP_CHANNEL,
             channel: AP_CHANNEL,
             rssi: -51,
             security: crate::scan::BssSecurity::Wpa2,

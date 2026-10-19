@@ -239,10 +239,15 @@ fn smoke_ath11k_htt_t2h_decode() -> TestResult {
             }),
         "PEER_UNMAP2"
     );
-    for ty in [0x1du32, 0x1c, 0x08, 0x24] {
+    let e = decode_t2h(&words(&[0x1d])).unwrap_err();
+    check!(
+        e.step == step::T2H_TRUNCATED && e.detail == (0x1d << 16) | 4,
+        "PPDU_STATS_IND requires its four-word header"
+    );
+    for ty in [0x1cu32, 0x08, 0x24] {
         check!(
             decode_t2h(&words(&[ty])) == Ok(HttT2h::Skipped(ty as u8)),
-            "stats / pktlog / backpressure skipped"
+            "debug / pktlog / backpressure skipped"
         );
     }
     // RX_ADDBA (5), SEC_IND (0xb) and unknown types: "not handled".
@@ -255,6 +260,93 @@ fn smoke_ath11k_htt_t2h_decode() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_htt_t2h_decode);
+
+fn smoke_ath11k_htt_ppdu_stats_decode() -> TestResult {
+    // HTT PPDU header (type 0x1d, 116-byte TLV payload, pdev 0), then
+    // COMMON(36), USR_RATE(28), USR_COMPLTN_COMMON(16), ACK_BA_STATUS(20).
+    let msg = words(&[
+        0x0074_001d,
+        0x0000_0088,
+        0,
+        0,
+        0x0002_4000,
+        0x0000_0088,
+        0,
+        0,
+        0x0000_0123,
+        0,
+        0,
+        0,
+        0,
+        0x0001_c002,
+        0x0042_0000,
+        0,
+        0x0000_0069,
+        0,
+        0,
+        0x1245_1400,
+        0,
+        0x0001_0006,
+        0x0042_0000,
+        40,
+        0x0007_0008,
+        0x0000_0132,
+        0x0001_4009,
+        0x0000_0088,
+        0x0000_0042,
+        0xa000_0e00,
+        0,
+        1200,
+    ]);
+    let Ok(HttT2h::PpduStats(ppdu)) = decode_t2h(&msg) else {
+        return TestResult::Fail("PPDU statistics indication rejected");
+    };
+    check!(
+        ppdu.pdev_id == 0 && ppdu.ppdu_id == 0x88 && ppdu.tx_duration_us == Some(0x123),
+        "PPDU common header"
+    );
+    let Some(user) = ppdu.users.first() else {
+        return TestResult::Fail("PPDU user missing");
+    };
+    check!(
+        user.peer_id == 0x42
+            && user.rate
+                == Some(HttPpduRate {
+                    preamble: 4,
+                    bandwidth: 4,
+                    nss: 2,
+                    mcs: 5,
+                    gi: 2,
+                    dcm: true,
+                    ru_start: 0,
+                    ru_end: 105,
+                }),
+        "PPDU HE user rate"
+    );
+    check!(
+        user.completion
+            == Some(HttPpduCompletion {
+                ack_rssi: 40,
+                mpdu_tried: 8,
+                mpdu_success: 7,
+                long_retries: 2,
+                short_retries: 3,
+                ampdu: true,
+            })
+            && user.ack_ba
+                == Some(HttPpduAckBa {
+                    successful_msdu: 7,
+                    tid: 5,
+                    success_bytes: 1200,
+                }),
+        "PPDU completion accounting"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_htt_ppdu_stats_decode
+);
 
 fn smoke_ath11k_htt_t2h_truncated() -> TestResult {
     let e = decode_t2h(&[]).unwrap_err();

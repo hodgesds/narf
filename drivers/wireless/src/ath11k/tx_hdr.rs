@@ -8,7 +8,8 @@
 //! |---|---|
 //! | [`classify8021d`] | `net/wireless/util.c::cfg80211_classify8021d` (no QoS map, no VLAN offload) |
 //! | [`select_queue`] | `net/mac80211/wme.c::ieee80211_select_queue` (+ `ieee80211_downgrade_queue` without ACM / TSPEC / reserved TID) |
-//! | [`build_sta_data`] | `net/mac80211/tx.c::ieee80211_build_hdr` (`NL80211_IFTYPE_STATION`, no TDLS / 4-addr), `ieee80211_set_qos_hdr`, the sequence number of `ieee80211_xmit_fast_finish` / `ieee80211_tx_h_sequence`, `ieee80211_tx_set_protected` (CCMP with a hardware key) |
+//! | [`build_sta_data`] | `net/mac80211/tx.c::ieee80211_build_hdr` (`NL80211_IFTYPE_STATION`, no TDLS; ordinary and 4-address WDS headers), `ieee80211_set_qos_hdr`, the sequence number of `ieee80211_xmit_fast_finish` / `ieee80211_tx_h_sequence`, `ieee80211_tx_set_protected` (CCMP with a hardware key) |
+//! | [`build_sta_nullfunc`] | `net/mac80211/tx.c::ieee80211_nullfunc_get` for connection monitoring |
 //! | [`tx_h_sequence`] | `net/mac80211/tx.c::ieee80211_tx_h_sequence` (management frames on the vif's counter) |
 //!
 //! The result is the 802.11 frame mac80211 hands to `ath11k_dp_tx`;
@@ -37,7 +38,9 @@ pub const ETH_P_802_3_MIN: u16 = 0x0600;
 
 pub const IEEE80211_FTYPE_DATA: u16 = 0x0008;
 pub const IEEE80211_STYPE_QOS_DATA: u16 = 0x0080;
+pub const IEEE80211_STYPE_NULLFUNC: u16 = 0x0040;
 pub const IEEE80211_FCTL_TODS: u16 = 0x0100;
+pub const IEEE80211_FCTL_FROMDS: u16 = 0x0200;
 pub const IEEE80211_FCTL_PROTECTED: u16 = 0x4000;
 pub const IEEE80211_QOS_CTL_ACK_POLICY_NOACK: u8 = 0x20;
 /// `IEEE80211_SCTL_SEQ`.
@@ -148,10 +151,30 @@ pub struct StaTx {
     pub bssid: [u8; 6],
     /// `sta->sta.wme` (the AP's association response carried WMM).
     pub wme: bool,
+    /// `sdata->u.mgd.use_4addr`: ToDS|FromDS, with the original Ethernet
+    /// source in address four rather than the transmitter-address slot.
+    pub four_addr: bool,
     /// `WLAN_STA_AUTHORIZED` (802.1X port open).
     pub authorized: bool,
     /// A pairwise key is installed in hardware (`sta->ptk[]`): the frame
     /// is marked Protected.
+    pub protected: bool,
+}
+
+/// What [`build_ap_data`] needs for one AP/GO client transmission.
+///
+/// The Ethernet destination is the 802.11 receiver address.  In contrast to
+/// [`StaTx`], the BSSID/transmitter is the local interface and the Ethernet
+/// source becomes addr3 (the original DS source) in a FromDS frame.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ApTx {
+    /// `sdata->vif.addr`, also the AP BSSID / transmitter address.
+    pub own: [u8; 6],
+    /// `sta->sta.wme` for this associated client.
+    pub wme: bool,
+    /// The client's controlled port is open.
+    pub authorized: bool,
+    /// Key selection found a PTK (unicast) or GTK (group) in hardware.
     pub protected: bool,
 }
 
@@ -244,10 +267,71 @@ pub struct Built {
     pub ac: u16,
 }
 
-/// `ieee80211_build_hdr` for `NL80211_IFTYPE_STATION` (ToDS: addr1 =
-/// BSSID, addr2 = the Ethernet SA, addr3 = the Ethernet DA), then the
-/// QoS control (`ieee80211_set_qos_hdr`: TID, NoAck for a group
-/// receiver), the sequence number and the Protected bit.
+/// `ieee80211_nullfunc_get(.., qos_ok = true)` for a station vif.  It
+/// is the directed AP-liveness probe used by
+/// `ieee80211_mgd_probe_ap`: a WMM AP gets QoS Null at TID 7 / AC VO,
+/// otherwise this is a regular Null frame.  QoS Null deliberately keeps
+/// its zero sequence control (`tx_h_sequence` has the same exception).
+///
+/// Like normal data after a PTK is installed, mac80211's key-selection path
+/// marks the liveness probe Protected and ath11k encrypts it in firmware. The
+/// four-address enable notification below is the intentional unencrypted
+/// exception (`IEEE80211_TX_INTFL_DONT_ENCRYPT`).
+pub fn build_sta_nullfunc(sta: &StaTx) -> Built {
+    if sta.four_addr {
+        // `ieee80211_send_4addr_nullfunc`: a distinct, unencrypted,
+        // minimum-rate 30-byte notification sent when WDS is enabled.
+        let fc = IEEE80211_FTYPE_DATA
+            | IEEE80211_STYPE_NULLFUNC
+            | IEEE80211_FCTL_TODS
+            | IEEE80211_FCTL_FROMDS;
+        let mut frame = Vec::with_capacity(30);
+        frame.extend_from_slice(&fc.to_le_bytes());
+        frame.extend_from_slice(&[0, 0]); // duration_id
+        frame.extend_from_slice(&sta.bssid); // RA / BSSID
+        frame.extend_from_slice(&sta.own); // TA
+        frame.extend_from_slice(&sta.bssid); // DA / BSSID
+        frame.extend_from_slice(&[0, 0]); // nullfunc sequence control
+        frame.extend_from_slice(&sta.own); // SA / address four
+        return Built {
+            frame,
+            tid: 0,
+            ac: ac::BE,
+        };
+    }
+    let qos = sta.wme;
+    let mut fc = IEEE80211_FTYPE_DATA | IEEE80211_STYPE_NULLFUNC | IEEE80211_FCTL_TODS;
+    if qos {
+        // STYPE_QOS_NULLFUNC is NULLFUNC | QOS_DATA.
+        fc |= IEEE80211_STYPE_QOS_DATA;
+    }
+    if sta.protected {
+        fc |= IEEE80211_FCTL_PROTECTED;
+    }
+    let mut frame = Vec::with_capacity(if qos { 26 } else { 24 });
+    frame.extend_from_slice(&fc.to_le_bytes());
+    frame.extend_from_slice(&[0, 0]); // duration_id
+    frame.extend_from_slice(&sta.bssid); // RA / BSSID
+    frame.extend_from_slice(&sta.own); // TA
+    frame.extend_from_slice(&sta.bssid); // DA / BSSID
+    frame.extend_from_slice(&[0, 0]); // nullfunc sequence control
+    if qos {
+        // ieee80211_nullfunc_get: QoS control is `cpu_to_le16(7)`.
+        frame.extend_from_slice(&[7, 0]);
+    }
+    Built {
+        frame,
+        tid: if qos { 7 } else { 0 },
+        ac: if qos { ac::VO } else { ac::BE },
+    }
+}
+
+/// `ieee80211_build_hdr` for `NL80211_IFTYPE_STATION`: ordinary ToDS uses
+/// addr1 = BSSID, addr2 = Ethernet SA, addr3 = Ethernet DA. Four-address
+/// WDS uses ToDS|FromDS with the station address in addr2 and the original
+/// Ethernet source in addr4. It then appends QoS control
+/// (`ieee80211_set_qos_hdr`: TID, NoAck for a group receiver), sequence
+/// number, and the Protected bit.
 ///
 /// `Err(EPERM)` = "dropped frame to %pM (unauthorized port)": unicast
 /// before authorization unless it is our own EAPOL. `Err(EINVAL)` = not
@@ -265,6 +349,10 @@ pub fn build_sta_data(eth: &[u8], sta: &StaTx, seq: &mut SeqState) -> Result<Bui
     }
     let mut fc = IEEE80211_FTYPE_DATA | IEEE80211_FCTL_TODS;
     let mut hdrlen = 24;
+    if sta.four_addr {
+        fc |= IEEE80211_FCTL_FROMDS;
+        hdrlen += 6;
+    }
     if sta.wme {
         fc |= IEEE80211_STYPE_QOS_DATA;
         hdrlen += 2;
@@ -292,8 +380,74 @@ pub fn build_sta_data(eth: &[u8], sta: &StaTx, seq: &mut SeqState) -> Result<Bui
     f.extend_from_slice(&fc.to_le_bytes());
     f.extend_from_slice(&[0, 0]); // duration_id
     f.extend_from_slice(&addr1);
-    f.extend_from_slice(&eth[6..12]);
+    f.extend_from_slice(if sta.four_addr { &sta.own } else { &eth[6..12] });
     f.extend_from_slice(&eth[0..6]);
+    f.extend_from_slice(&seq_ctrl.to_le_bytes());
+    if sta.four_addr {
+        f.extend_from_slice(&eth[6..12]);
+    }
+    if sta.wme {
+        let mut q0 = tid & 0x0f;
+        if multicast {
+            q0 |= IEEE80211_QOS_CTL_ACK_POLICY_NOACK;
+        }
+        f.extend_from_slice(&[q0, 0]);
+    }
+    f.extend_from_slice(encaps);
+    f.extend_from_slice(&eth[skip..]);
+    Ok(Built {
+        frame: f,
+        tid,
+        ac: queue,
+    })
+}
+
+/// `ieee80211_build_hdr` for `NL80211_IFTYPE_AP`: FromDS, with addr1 =
+/// Ethernet destination (the associated receiver or a group address), addr2
+/// = the AP BSSID/transmitter, and addr3 = the original Ethernet source.
+///
+/// A closed client port may receive only EAPOL. Group traffic is selected via
+/// the AP GTK and has no per-client authorization state; the caller rejects
+/// protected group traffic when no GTK has reached firmware.
+pub fn build_ap_data(eth: &[u8], sta: &ApTx, seq: &mut SeqState) -> Result<Built, i32> {
+    if eth.len() < ETH_HLEN {
+        return Err(EINVAL);
+    }
+    let ethertype = be16(eth, 12);
+    let (tid, queue) = select_queue(eth, sta.wme);
+    let multicast = is_multicast(&eth[..6]);
+    if !multicast && !sta.authorized && ethertype != ETH_P_PAE {
+        return Err(EPERM);
+    }
+    let mut fc = IEEE80211_FTYPE_DATA | IEEE80211_FCTL_FROMDS;
+    let mut hdrlen = 24;
+    if sta.wme {
+        fc |= IEEE80211_STYPE_QOS_DATA;
+        hdrlen += 2;
+    }
+    if sta.protected {
+        fc |= IEEE80211_FCTL_PROTECTED;
+    }
+    let seq_ctrl = if sta.wme && !multicast {
+        seq.next_tid(tid)
+    } else {
+        seq.next_global()
+    };
+
+    let (encaps, skip): (&[u8], usize) = if ethertype == ETH_P_AARP || ethertype == ETH_P_IPX {
+        (&BRIDGE_TUNNEL_HEADER, ETH_HLEN - 2)
+    } else if ethertype >= ETH_P_802_3_MIN {
+        (&RFC1042_HEADER, ETH_HLEN - 2)
+    } else {
+        (&[], ETH_HLEN)
+    };
+
+    let mut f = Vec::with_capacity(hdrlen + encaps.len() + eth.len() - skip);
+    f.extend_from_slice(&fc.to_le_bytes());
+    f.extend_from_slice(&[0, 0]); // duration_id
+    f.extend_from_slice(&eth[..6]); // RA / Ethernet DA
+    f.extend_from_slice(&sta.own); // TA / BSSID
+    f.extend_from_slice(&eth[6..12]); // DA in the distribution system
     f.extend_from_slice(&seq_ctrl.to_le_bytes());
     if sta.wme {
         let mut q0 = tid & 0x0f;

@@ -54,7 +54,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::future::Future;
 
-use super::mhi_host::{MhiBus, MhiController, MhiError, MhiNotify, POLL_INTERVAL_MS};
+use super::mhi_host::{MhiBus, MhiController, MhiError, MhiNotify, RddmSnapshot, POLL_INTERVAL_MS};
 use super::qmi::{split_message, QmiError, QmiHeader, QMI_HEADER_SIZE, QMI_RESPONSE};
 use super::qmi_wlfw::{WlfwMessage, WlfwRequest};
 use super::qrtr::{
@@ -91,6 +91,23 @@ pub trait QrtrPipe {
     /// `reset_work`), once.
     fn take_reset_request(&mut self) -> Option<MhiNotify> {
         None
+    }
+    /// Preserve a transport crash dump before the ath11k radio reset. Only
+    /// MHI transports with an RDDM image override this; generic QRTR pipes
+    /// have no device-owned dump buffer to collect.
+    fn collect_crash_dump(&mut self) -> impl Future<Output = Result<(), MhiError>> + Send {
+        core::future::ready(Ok(()))
+    }
+    /// Transfer an already-collected RDDM image to ath11k's device-dump
+    /// owner. A generic QRTR link has no MHI-owned DMA dump and returns
+    /// `None`.
+    fn take_rddm_snapshot(&mut self) -> Option<RddmSnapshot> {
+        None
+    }
+    /// Copy the FBC image Linux emits as `FW_CRASH_DUMP_PAGING_DATA`. Generic
+    /// QRTR transports have no BHIe firmware table.
+    fn firmware_paging_snapshot(&self) -> Vec<u8> {
+        Vec::new()
     }
     /// `ath11k_hif_power_down` + `ath11k_hif_power_up` (the device is
     /// reset and its firmware booted again; the endpoint comes back
@@ -131,6 +148,15 @@ impl<B: MhiBus + Send> QrtrPipe for MhiController<B> {
     }
     fn take_reset_request(&mut self) -> Option<MhiNotify> {
         MhiController::take_reset_request(self)
+    }
+    fn collect_crash_dump(&mut self) -> impl Future<Output = Result<(), MhiError>> + Send {
+        MhiController::collect_rddm(self)
+    }
+    fn take_rddm_snapshot(&mut self) -> Option<RddmSnapshot> {
+        MhiController::take_rddm_snapshot(self)
+    }
+    fn firmware_paging_snapshot(&self) -> Vec<u8> {
+        MhiController::firmware_paging_snapshot(self)
     }
     fn power_cycle(&mut self) -> impl Future<Output = Result<(), MhiError>> + Send {
         MhiController::power_cycle(self)

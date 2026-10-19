@@ -74,6 +74,21 @@ stricter whole-encryption-sector rule before calling these primitives.
 | Disk      | AES-256-XTS, 512-byte data units, `plain64` little-endian sector tweak |
 | Key wrap  | AES Key Wrap, 128-bit KEK (`aes_kw::aes_wrap` / `aes_unwrap`, RFC 3394; IEEE 802.11 EAPOL-Key Key Data) |
 
+`bip::{protect_mmie, verify_mmie}` is the 802.11 management-frame integrity
+surface. It accepts an explicit CMAC-128, CMAC-256, GMAC-128, or GMAC-256
+suite and validates its 16/32-byte IGTK, 48-bit replay IPN, and trailing
+18/26-byte MMIE. CMAC authenticates `BIP AAD || body`; GMAC derives the
+96-bit A2/IPN nonce and authenticates the same bytes with AES-GCM's GMAC
+construction. Every variant masks a beacon timestamp and refuses to wrap the
+48-bit transmit IPN. The helpers do not update a caller's replay window: the
+MAC owner commits an IPN only after successful verification.
+
+`michael_mic::michael_mic` is the TKIP data-frame MIC primitive.  It binds
+the selected 802.11 DA/SA, QoS TID (zero for non-QoS) and payload using the
+eight-byte directional Michael key.  It exists for hardware-decrypted,
+fragmented ath11k RX frames; TKIP RC4 encryption and key mixing remain
+firmware-owned.
+
 Post-quantum: algorithm choice left as an open question (§8).
 
 ### 3.2 RNG / DRBG

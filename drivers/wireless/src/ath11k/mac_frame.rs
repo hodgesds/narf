@@ -30,6 +30,7 @@ pub mod eid {
     pub const PWR_CONSTRAINT: u8 = 32;
     pub const PWR_CAPABILITY: u8 = 33;
     pub const SUPPORTED_CHANNELS: u8 = 36;
+    pub const CHANNEL_SWITCH: u8 = 37;
     pub const ERP_INFO: u8 = 42;
     pub const HT_CAPABILITY: u8 = 45;
     pub const QOS_CAPA: u8 = 46;
@@ -37,9 +38,12 @@ pub mod eid {
     pub const EXT_SUPP_RATES: u8 = 50;
     pub const MOBILITY_DOMAIN: u8 = 54;
     pub const FAST_BSS_TRANSITION: u8 = 55;
+    pub const TIMEOUT_INTERVAL: u8 = 56;
     pub const RIC_DATA: u8 = 57;
     pub const SUPPORTED_REGULATORY_CLASSES: u8 = 59;
+    pub const EXT_CHANSWITCH_ANN: u8 = 60;
     pub const HT_OPERATION: u8 = 61;
+    pub const SECONDARY_CHANNEL_OFFSET: u8 = 62;
     pub const RRM_ENABLED_CAPABILITIES: u8 = 70;
     pub const BSS_COEX_2040: u8 = 72;
     pub const QOS_TRAFFIC_CAPA: u8 = 89;
@@ -48,6 +52,9 @@ pub mod eid {
     pub const EXT_CAPABILITY: u8 = 127;
     pub const VHT_CAPABILITY: u8 = 191;
     pub const VHT_OPERATION: u8 = 192;
+    pub const WIDE_BW_CHANNEL_SWITCH: u8 = 194;
+    /// `WLAN_EID_TX_POWER_ENVELOPE` (§9.4.2.161).
+    pub const TX_POWER_ENVELOPE: u8 = 195;
     pub const OPMODE_NOTIF: u8 = 199;
     pub const VENDOR_SPECIFIC: u8 = 221;
     pub const RSNX: u8 = 244;
@@ -99,6 +106,10 @@ pub const WLAN_AUTH_OPEN: u16 = 0;
 pub const WLAN_REASON_UNSPECIFIED: u16 = 1;
 /// `WLAN_STATUS_SUCCESS`.
 pub const WLAN_STATUS_SUCCESS: u16 = 0;
+/// `WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY`.
+pub const WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY: u16 = 30;
+/// `WLAN_TIMEOUT_ASSOC_COMEBACK` in a Timeout Interval element.
+pub const WLAN_TIMEOUT_ASSOC_COMEBACK: u8 = 3;
 /// `WLAN_REASON_DEAUTH_LEAVING`.
 pub const WLAN_REASON_DEAUTH_LEAVING: u16 = 3;
 /// `WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY`.
@@ -107,6 +118,22 @@ pub const WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY: u16 = 4;
 pub const WLAN_REASON_IE_DIFFERENT: u16 = 17;
 /// `WLAN_REASON_4WAY_HANDSHAKE_TIMEOUT`.
 pub const WLAN_REASON_4WAY_HANDSHAKE_TIMEOUT: u16 = 15;
+/// `WLAN_CATEGORY_SPECTRUM_MGMT`.
+pub const WLAN_CATEGORY_SPECTRUM_MGMT: u8 = 0;
+/// `WLAN_ACTION_SPCT_CHL_SWITCH`.
+pub const WLAN_ACTION_SPCT_CHL_SWITCH: u8 = 4;
+/// `WLAN_CATEGORY_PUBLIC`.
+pub const WLAN_CATEGORY_PUBLIC: u8 = 4;
+/// `WLAN_CATEGORY_RADIO_MEASUREMENT`.
+pub const WLAN_CATEGORY_RADIO_MEASUREMENT: u8 = 5;
+/// `WLAN_RM_ACTION_LINK_MEASUREMENT_REQUEST`.
+pub const WLAN_RM_ACTION_LINK_MEASUREMENT_REQUEST: u8 = 2;
+/// `WLAN_RM_ACTION_LINK_MEASUREMENT_REPORT`.
+pub const WLAN_RM_ACTION_LINK_MEASUREMENT_REPORT: u8 = 3;
+/// `WLAN_CATEGORY_PROTECTED_DUAL_OF_ACTION`.
+pub const WLAN_CATEGORY_PROTECTED_DUAL_OF_ACTION: u8 = 9;
+/// `WLAN_PUB_ACTION_EXT_CHANSW_ANN`.
+pub const WLAN_PUB_ACTION_EXT_CHANSW_ANN: u8 = 4;
 
 /// `IEEE80211_MAX_SSID_LEN`.
 pub const MAX_SSID_LEN: usize = 32;
@@ -325,6 +352,67 @@ impl VhtOperIe {
     }
 }
 
+/// `struct ieee80211_channel_sw_ie` (CSA element payload).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChannelSwitchIe {
+    /// Channel-switch mode: true tells a station to stop data TX before the
+    /// advertised switch count reaches zero.
+    pub mode: bool,
+    pub new_channel: u8,
+    pub count: u8,
+}
+
+impl ChannelSwitchIe {
+    pub fn parse(d: &[u8]) -> Option<Self> {
+        (d.len() == 3 && d[0] <= 1).then_some(Self {
+            mode: d[0] != 0,
+            new_channel: d[1],
+            count: d[2],
+        })
+    }
+}
+
+/// `struct ieee80211_ext_chansw_ie` (Extended CSA element payload).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExtChannelSwitchIe {
+    pub mode: bool,
+    pub operating_class: u8,
+    pub new_channel: u8,
+    pub count: u8,
+}
+
+impl ExtChannelSwitchIe {
+    pub fn parse(d: &[u8]) -> Option<Self> {
+        (d.len() == 4 && d[0] <= 1).then_some(Self {
+            mode: d[0] != 0,
+            operating_class: d[1],
+            new_channel: d[2],
+            count: d[3],
+        })
+    }
+}
+
+/// `struct ieee80211_wide_bw_chansw_ie` (Wide Bandwidth CSA payload).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WideBwChannelSwitchIe {
+    /// `IEEE80211_VHT_CHANWIDTH_*`: 0 = use HT (40), 1 = 80, 2 = 160,
+    /// 3 = 80+80. Unknown values are structurally retained and become the
+    /// cfg80211 fallback width when CSA validation consumes them.
+    pub width: u8,
+    pub center_freq_seg0_idx: u8,
+    pub center_freq_seg1_idx: u8,
+}
+
+impl WideBwChannelSwitchIe {
+    pub fn parse(d: &[u8]) -> Option<Self> {
+        (d.len() == 3).then_some(Self {
+            width: d[0],
+            center_freq_seg0_idx: d[1],
+            center_freq_seg1_idx: d[2],
+        })
+    }
+}
+
 /// One AC record of the WMM Parameter element.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WmmAc {
@@ -369,6 +457,49 @@ impl WmmParam {
     }
 }
 
+/// One HE MU-EDCA AC Parameter Record. `ecw_min_max` retains the two
+/// exponent nibbles rather than expanding them to contention-window values:
+/// ath11k's `WMI_WMM_PARAM_TYPE_11AX_MU_EDCA` expects those exponents.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MuEdcaAc {
+    pub aifsn: u8,
+    pub ecw_min_max: u8,
+    pub timer: u8,
+}
+
+/// The payload following extension id 38 in an HE MU-EDCA Parameter Set
+/// element (`struct ieee80211_mu_edca_param_set`). The records are in WME
+/// order BE, BK, VI, VO, which is also ath11k's WMI array order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MuEdcaParam {
+    pub qos_info: u8,
+    pub ac: [MuEdcaAc; 4],
+}
+
+impl MuEdcaParam {
+    /// `WLAN_EID_EXT_HE_MU_EDCA` body after its extension-id octet. Linux
+    /// accepts an element at least as long as the fixed 13-byte structure;
+    /// retain the first complete record set and ignore future tail bytes.
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() < 13 {
+            return None;
+        }
+        let mut param = MuEdcaParam {
+            qos_info: data[0],
+            ..Default::default()
+        };
+        for (index, ac) in param.ac.iter_mut().enumerate() {
+            let offset = 1 + 3 * index;
+            *ac = MuEdcaAc {
+                aifsn: data[offset],
+                ecw_min_max: data[offset + 1],
+                timer: data[offset + 2],
+            };
+        }
+        Some(param)
+    }
+}
+
 /// True when the vendor element is a WMM Information or Parameter
 /// element (`bss->wmm_used`: `cfg80211_find_vendor_elem(WMM)` with
 /// subtype 0 or 1).
@@ -398,6 +529,138 @@ pub fn put_wmm_info(out: &mut Vec<u8>, qos_info: u8) {
     ]);
 }
 
+// ── Transmit Power Envelope ──────────────────────────────────────────
+
+/// `IEEE80211_TX_PWR_ENV_INFO_*`.
+pub mod tpe {
+    /// Bits 0..=2: one fewer EIRP power entries, or the PSD subchannel
+    /// encoding described by 802.11ax §9.4.2.161.
+    pub const COUNT_MASK: u8 = 0x07;
+    /// Bits 3..=5: [`TxPowerInterpretation`].
+    pub const INTERPRET_MASK: u8 = 0x38;
+    /// Bits 6..=7: default or subordinate 6 GHz client category.
+    pub const CATEGORY_MASK: u8 = 0xc0;
+    /// Low four bits of the PSD extension count byte.
+    pub const EXT_COUNT_MASK: u8 = 0x0f;
+    pub const CATEGORY_DEFAULT: u8 = 0;
+    pub const CATEGORY_SUBORDINATE: u8 = 1;
+    /// `IEEE80211_TPE_MAX_TX_PWR_NO_CONSTRAINT` and
+    /// `IEEE80211_TPE_PSD_NO_LIMIT`, represented in half-dBm units.
+    pub const NO_LIMIT: i8 = 127;
+}
+
+/// `enum ieee80211_tx_power_intrpt_type`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxPowerInterpretation {
+    LocalEirp,
+    LocalPsd,
+    RegulatoryClientEirp,
+    RegulatoryClientPsd,
+}
+
+impl TxPowerInterpretation {
+    pub const fn is_psd(self) -> bool {
+        matches!(self, Self::LocalPsd | Self::RegulatoryClientPsd)
+    }
+
+    pub const fn is_regulatory_client(self) -> bool {
+        matches!(self, Self::RegulatoryClientEirp | Self::RegulatoryClientPsd)
+    }
+}
+
+/// One validated `ieee80211_tx_pwr_env`. `powers` holds signed half-dBm
+/// values, as transmitted; the WCN6855 TPC command uses integral dBm and
+/// converts them when it consumes this structure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TxPowerEnvelope {
+    pub category: u8,
+    pub interpretation: TxPowerInterpretation,
+    /// Valid entries in [`Self::powers`].  PSD entries can have default
+    /// `NO_LIMIT` values after mac80211-style channel-width rearrangement,
+    /// so this count deliberately remains distinct from the vector length.
+    pub count: usize,
+    /// The PSD element's first N group length. `Some(0)` represents the
+    /// all-subchannels default form; `None` means this is an EIRP envelope.
+    pub psd_n: Option<usize>,
+    pub powers: Vec<i8>,
+}
+
+impl TxPowerEnvelope {
+    /// `ieee80211_valid_tpe_element` plus `ieee80211_parse_tpe`.
+    ///
+    /// This preserves every valid value (including the optional PSD K
+    /// extension) instead of trusting the advertised count alone. The
+    /// station's WCN6855 path subsequently limits the result to its eight
+    /// 160 MHz power entries.
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        let (&info, values) = data.split_first()?;
+        let count = info & tpe::COUNT_MASK;
+        let category = (info & tpe::CATEGORY_MASK) >> 6;
+        if !matches!(category, tpe::CATEGORY_DEFAULT | tpe::CATEGORY_SUBORDINATE) {
+            return None;
+        }
+        let interpretation = match (info & tpe::INTERPRET_MASK) >> 3 {
+            0 => TxPowerInterpretation::LocalEirp,
+            1 => TxPowerInterpretation::LocalPsd,
+            2 => TxPowerInterpretation::RegulatoryClientEirp,
+            3 => TxPowerInterpretation::RegulatoryClientPsd,
+            _ => return None,
+        };
+        let mut powers = Vec::new();
+        let mut psd_n = None;
+        if interpretation.is_psd() {
+            if count > 4 {
+                return None;
+            }
+            let n = if count == 0 { 1 } else { 1usize << (count - 1) };
+            if values.len() < n {
+                return None;
+            }
+            // The optional K-count field is present after N for both the
+            // count-zero and nonzero PSD forms. Validate it before the
+            // count-zero expansion, exactly as `ieee80211_valid_tpe_element`
+            // does.
+            if values.len() > n {
+                let k = (values[n] & tpe::EXT_COUNT_MASK) as usize;
+                if values.len() < n + 1 + k {
+                    return None;
+                }
+            }
+            if count == 0 {
+                // A count of zero is one value applying to every 20 MHz
+                // subchannel (`ieee80211_parse_tpe`).
+                powers.resize(16, values[0] as i8);
+                psd_n = Some(0);
+            } else {
+                powers.extend(values[..n].iter().map(|&v| v as i8));
+                psd_n = Some(n);
+                if values.len() > n {
+                    let k = (values[n] & tpe::EXT_COUNT_MASK) as usize;
+                    powers.extend(values[n + 1..n + 1 + k].iter().map(|&v| v as i8));
+                }
+            }
+        } else {
+            if count > 3 || values.len() < count as usize + 1 {
+                return None;
+            }
+            let count = count as usize + 1;
+            powers.extend(values[..count].iter().map(|&v| v as i8));
+            // A fifth value is the optional 320 MHz limit. Preserve it even
+            // though WCN6855 itself stops at contiguous 160 MHz.
+            if count == 4 && values.len() > count {
+                powers.push(values[4] as i8);
+            }
+        }
+        Some(TxPowerEnvelope {
+            category,
+            interpretation,
+            count: powers.len(),
+            psd_n,
+            powers,
+        })
+    }
+}
+
 // ── Parsed BSS elements ─────────────────────────────────────────────
 
 /// The elements of a beacon / probe response / association response
@@ -413,19 +676,40 @@ pub struct ParsedIes {
     /// `(dtim_count, dtim_period)`.
     pub tim: Option<(u8, u8)>,
     pub erp: Option<u8>,
+    /// `WLAN_EID_PWR_CONSTRAINT`, in dB. This applies to the AP's
+    /// regulatory EIRP limit when transmitting on its BSS channel.
+    pub power_constraint: Option<u8>,
     pub ht_cap: Option<HtCapIe>,
     pub ht_oper: Option<HtOperIe>,
     pub vht_cap: Option<VhtCapIe>,
     pub vht_oper: Option<VhtOperIe>,
+    /// CSA / ECSA, secondary-channel offset, and Wide Bandwidth CSA. The
+    /// station combines these as `ieee80211_parse_ch_switch_ie` does.
+    pub channel_switch: Option<ChannelSwitchIe>,
+    pub ext_channel_switch: Option<ExtChannelSwitchIe>,
+    pub secondary_channel_offset: Option<u8>,
+    pub wide_bw_channel_switch: Option<WideBwChannelSwitchIe>,
+    /// `WLAN_EID_TIMEOUT_INTERVAL`: type and value in TUs.
+    pub timeout_interval: Option<(u8, u32)>,
     /// RSN element body.
     pub rsn: Option<Vec<u8>>,
     /// RSNXE (`WLAN_EID_RSNX`, 244) body.
     pub rsnxe: Option<Vec<u8>>,
-    /// HE Capabilities / HE Operation / Spatial Reuse Parameter Set
-    /// extension elements (data after the extension id).
+    /// Extended Capabilities (`WLAN_EID_EXT_CAPABILITY`).  TWT requester
+    /// support requires bit 6 of byte 9 from the AP.
+    pub ext_cap: Option<Vec<u8>>,
+    /// HE Capabilities / HE Operation / Spatial Reuse Parameter Set / HE 6
+    /// GHz Band Capabilities extension elements (data after extension id).
     pub he_cap: Option<Vec<u8>>,
     pub he_oper: Option<Vec<u8>>,
     pub he_spr: Option<Vec<u8>>,
+    pub he_6ghz_cap: Option<Vec<u8>>,
+    /// HE MU-EDCA Parameter Set (extension id 38), if complete.
+    pub mu_edca: Option<MuEdcaParam>,
+    /// All valid Transmit Power Envelope elements. The AP can supply both
+    /// local and regulatory-client, and both EIRP and PSD, envelopes for
+    /// the default and subordinate 6 GHz client categories.
+    pub tpe: Vec<TxPowerEnvelope>,
     /// WPA (Microsoft OUI type 1) vendor element body.
     pub wpa: Option<Vec<u8>>,
     pub wmm_param: Option<WmmParam>,
@@ -464,18 +748,49 @@ impl ParsedIes {
                     p.tim = Some((e.data[0], e.data[1]))
                 }
                 eid::ERP_INFO if p.erp.is_none() && !e.data.is_empty() => p.erp = Some(e.data[0]),
+                eid::PWR_CONSTRAINT if p.power_constraint.is_none() && e.data.len() == 1 => {
+                    p.power_constraint = Some(e.data[0])
+                }
                 eid::HT_CAPABILITY if p.ht_cap.is_none() => p.ht_cap = HtCapIe::parse(e.data),
                 eid::HT_OPERATION if p.ht_oper.is_none() => p.ht_oper = HtOperIe::parse(e.data),
                 eid::VHT_CAPABILITY if p.vht_cap.is_none() => p.vht_cap = VhtCapIe::parse(e.data),
                 eid::VHT_OPERATION if p.vht_oper.is_none() => p.vht_oper = VhtOperIe::parse(e.data),
+                eid::CHANNEL_SWITCH if p.channel_switch.is_none() => {
+                    p.channel_switch = ChannelSwitchIe::parse(e.data)
+                }
+                eid::EXT_CHANSWITCH_ANN if p.ext_channel_switch.is_none() => {
+                    p.ext_channel_switch = ExtChannelSwitchIe::parse(e.data)
+                }
+                eid::SECONDARY_CHANNEL_OFFSET
+                    if p.secondary_channel_offset.is_none() && e.data.len() == 1 =>
+                {
+                    p.secondary_channel_offset = Some(e.data[0])
+                }
+                eid::WIDE_BW_CHANNEL_SWITCH if p.wide_bw_channel_switch.is_none() => {
+                    p.wide_bw_channel_switch = WideBwChannelSwitchIe::parse(e.data)
+                }
+                eid::TX_POWER_ENVELOPE => {
+                    if let Some(tpe) = TxPowerEnvelope::parse(e.data) {
+                        p.tpe.push(tpe);
+                    }
+                }
+                eid::TIMEOUT_INTERVAL if p.timeout_interval.is_none() && e.data.len() == 5 => {
+                    p.timeout_interval = Some((
+                        e.data[0],
+                        u32::from_le_bytes([e.data[1], e.data[2], e.data[3], e.data[4]]),
+                    ))
+                }
                 eid::RSN if p.rsn.is_none() => p.rsn = Some(e.data.to_vec()),
                 eid::RSNX if p.rsnxe.is_none() => p.rsnxe = Some(e.data.to_vec()),
+                eid::EXT_CAPABILITY if p.ext_cap.is_none() => p.ext_cap = Some(e.data.to_vec()),
                 eid::EXTENSION if !e.data.is_empty() => {
                     let d = Some(e.data[1..].to_vec());
                     match e.data[0] {
                         35 if p.he_cap.is_none() => p.he_cap = d,
                         36 if p.he_oper.is_none() => p.he_oper = d,
+                        38 if p.mu_edca.is_none() => p.mu_edca = MuEdcaParam::parse(&e.data[1..]),
                         39 if p.he_spr.is_none() => p.he_spr = d,
+                        59 if p.he_6ghz_cap.is_none() => p.he_6ghz_cap = d,
                         _ => {}
                     }
                 }
@@ -639,6 +954,17 @@ pub fn parse_assoc_resp(f: &[u8]) -> Option<AssocRespFrame<'_>> {
         aid_field: u16::from_le_bytes([b[4], b[5]]),
         ies: &f[MGMT_HDR_LEN + 6..],
     })
+}
+
+/// The Association Comeback Time in TUs from a temporary-rejection response
+/// (`ieee80211_rx_mgmt_assoc_resp`), when the Timeout Interval element is
+/// complete and has the required type.
+pub fn assoc_comeback_tu(f: &[u8]) -> Option<u32> {
+    let a = parse_assoc_resp(f)?;
+    (a.status == WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY)
+        .then(|| ParsedIes::parse(a.ies).timeout_interval)
+        .flatten()
+        .and_then(|(kind, tu)| (kind == WLAN_TIMEOUT_ASSOC_COMEBACK).then_some(tu))
 }
 
 /// A Deauthentication / Disassociation frame: `(hdr, is_deauth, reason)`.
@@ -927,6 +1253,8 @@ pub struct AssocReqParams {
     pub vht_cap: Option<VhtCapIe>,
     /// The HE Capabilities element (`ieee80211_put_he_cap`), whole.
     pub he_cap: Option<Vec<u8>>,
+    /// The HE 6 GHz Band Capabilities extension IE, whole.
+    pub he_6ghz_cap: Option<Vec<u8>>,
     /// `Some(qos_info)` when `assoc_data->wmm`.
     pub wmm_qos_info: Option<u8>,
     /// `assoc_data->ie`: the SME's elements (RSN, ...).
@@ -994,6 +1322,9 @@ pub fn build_assoc_req(p: &AssocReqParams) -> Vec<u8> {
     offset = next;
     if let Some(he) = &p.he_cap {
         f.extend_from_slice(he);
+    }
+    if let Some(he_6ghz) = &p.he_6ghz_cap {
+        f.extend_from_slice(he_6ghz);
     }
     let next = ie_split_vendor(ies, offset);
     f.extend_from_slice(&ies[offset..next]);

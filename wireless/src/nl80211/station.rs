@@ -30,7 +30,12 @@ pub(super) const DEL_PMKSA: u8 = 53;
 pub(super) const FLUSH_PMKSA: u8 = 54;
 pub(super) const SET_POWER_SAVE: u8 = 61;
 pub(super) const GET_POWER_SAVE: u8 = 62;
+pub(super) const SET_REKEY_OFFLOAD: u8 = 79;
 pub(super) const CONTROL_PORT_FRAME: u8 = 129;
+/// `NL80211_CMD_CONTROL_PORT_FRAME_TX_STATUS`.
+pub(super) const CONTROL_PORT_FRAME_TX_STATUS: u8 = 130;
+/// `NL80211_CMD_MICHAEL_MIC_FAILURE`.
+pub(super) const MICHAEL_MIC_FAILURE: u8 = 41;
 
 /// `NL80211_IFTYPE_STATION`.
 const IFTYPE_STATION: u32 = 2;
@@ -117,6 +122,13 @@ pub(super) fn clear_owner(name: &str) {
     }
 }
 
+/// Drop cfg80211's per-wireless_dev bookkeeping when a virtual netdev is
+/// deleted.  Without this, a later interface reusing the same name could
+/// inherit a dead supplicant port owner or power-save preference.
+pub(super) fn unregister_wdev(name: &str) {
+    WDEVS.lock().retain(|wdev| wdev.name != name);
+}
+
 /// Where received EAPOL goes for this association.
 pub(super) fn set_control_port(name: &str, namespace: u64, over_nl80211: bool) {
     with_wdev(name, namespace, |w| {
@@ -194,6 +206,52 @@ fn key_allowed(iface: &dyn crate::WirelessNetIface) -> Result<(), i32> {
         }
         _ => Err(EINVAL),
     }
+}
+
+/// `nl80211_set_rekey_data`: parse the nested
+/// `NL80211_ATTR_REKEY_DATA`, keep the required KCK/KEK/replay-counter
+/// lengths exact, and pass the opaque material to the driver.  The
+/// `SET_REKEY_OFFLOAD` command itself has NEED_NETDEV_UP; that check and
+/// the namespace-admin check happen in `station_handle` before this point.
+pub(super) fn set_rekey_offload(
+    iface: Arc<dyn crate::WirelessNetIface>,
+    attrs: &[(u16, &[u8])],
+) -> Result<Vec<GenlReply>, i32> {
+    // `NL80211_ATTR_REKEY_DATA` = 122; nested enum nl80211_rekey_data:
+    // KEK=1, KCK=2, REPLAY_CTR=3, AKM=4.
+    const ATTR_REKEY_DATA: u16 = 122;
+    const KEK: u16 = 1;
+    const KCK: u16 = 2;
+    const REPLAY_CTR: u16 = 3;
+    const AKM: u16 = 4;
+    let data = attributes(attr(attrs, ATTR_REKEY_DATA).ok_or(EINVAL)?)?;
+    let (Some(kek), Some(kck), Some(replay_counter)) =
+        (attr(&data, KEK), attr(&data, KCK), attr(&data, REPLAY_CTR))
+    else {
+        return Err(EINVAL);
+    };
+    if kek.len() != 16 || kck.len() != 16 || replay_counter.len() != 8 {
+        return Err(ERANGE);
+    }
+    let akm = attr(&data, AKM)
+        .map(|raw| int_le::<4>(raw).map(u32::from_ne_bytes))
+        .transpose()?;
+    // Match `nl80211_set_rekey_data`: validate the nested payload before
+    // examining association or driver support, then prefer ENOTCONN when a
+    // syntactically valid request targets a disconnected station.
+    if iface.connected_bssid().is_none() {
+        return Err(ENOTCONN);
+    }
+    if !iface.supports_gtk_rekey_offload() {
+        return Err(EOPNOTSUPP);
+    }
+    iface.set_gtk_rekey_data(crate::GtkRekeyData {
+        kek: kek.try_into().unwrap(),
+        kck: kck.try_into().unwrap(),
+        replay_counter: replay_counter.try_into().unwrap(),
+        akm,
+    })?;
+    Ok(Vec::new())
 }
 
 /// A fixed-size integer attribute as the policy reads it: shorter than the
@@ -351,8 +409,8 @@ fn parse_key(attrs: &[(u16, &[u8])]) -> Result<KeyParse, i32> {
     Ok(k)
 }
 
-/// `cfg80211_valid_key_idx`: the wiphy advertises AES-CMAC (IGTK) when it
-/// is an external-supplicant driver, no beacon protection.
+/// `cfg80211_valid_key_idx`: an external-supplicant wiphy reserves key
+/// indices 4 and 5 for IGTKs; beacon protection is not advertised.
 fn valid_key_idx(iface: &dyn crate::WirelessNetIface, idx: i32, pairwise: bool) -> bool {
     let max = if pairwise {
         3
@@ -366,13 +424,7 @@ fn valid_key_idx(iface: &dyn crate::WirelessNetIface, idx: i32, pairwise: bool) 
 
 /// The wiphy's `cipher_suites` (`cfg80211_supported_cipher_suite`).
 pub(crate) fn cipher_suites(iface: &dyn crate::WirelessNetIface) -> &'static [u32] {
-    if iface.supports_external_supplicant() {
-        &[crate::CIPHER_SUITE_CCMP, crate::CIPHER_SUITE_AES_CMAC]
-    } else if iface.supports_handshake_offload() || iface.supports_sae_offload() {
-        &[crate::CIPHER_SUITE_CCMP]
-    } else {
-        &[]
-    }
+    iface.cipher_suites()
 }
 
 /// `cfg80211_validate_key_settings` for the ciphers NARF knows.
@@ -392,15 +444,15 @@ fn validate_key_settings(
     if pairwise && mac.is_none() {
         return Err(EINVAL);
     }
-    const TKIP: u32 = 0x000f_ac02;
+    const TKIP: u32 = crate::CIPHER_SUITE_TKIP;
     const WEP40: u32 = 0x000f_ac01;
     const WEP104: u32 = 0x000f_ac05;
-    const CCMP_256: u32 = 0x000f_ac0a;
-    const GCMP: u32 = 0x000f_ac08;
-    const GCMP_256: u32 = 0x000f_ac09;
-    const BIP_GMAC_128: u32 = 0x000f_ac0b;
-    const BIP_GMAC_256: u32 = 0x000f_ac0c;
-    const BIP_CMAC_256: u32 = 0x000f_ac0d;
+    const CCMP_256: u32 = crate::CIPHER_SUITE_CCMP_256;
+    const GCMP: u32 = crate::CIPHER_SUITE_GCMP;
+    const GCMP_256: u32 = crate::CIPHER_SUITE_GCMP_256;
+    const BIP_GMAC_128: u32 = crate::CIPHER_SUITE_BIP_GMAC_128;
+    const BIP_GMAC_256: u32 = crate::CIPHER_SUITE_BIP_GMAC_256;
+    const BIP_CMAC_256: u32 = crate::CIPHER_SUITE_BIP_CMAC_256;
     let key_len = k.key.as_ref().map_or(0, Vec::len);
     match k.cipher {
         TKIP => {
@@ -519,6 +571,7 @@ pub(super) fn new_key(
         cipher: k.cipher,
         key,
         seq: k.seq.unwrap_or_default(),
+        default_mgmt: k.defmgmt,
     };
     iface.add_key(params).map_err(errno_of)?;
     Ok(Vec::new())
@@ -556,6 +609,9 @@ pub(super) fn set_key(
         }
         key_allowed(iface.as_ref())?;
         no_link_id(attrs)?;
+        if k.defmgmt {
+            iface.set_default_mgmt_key(k.idx as u8).map_err(errno_of)?;
+        }
         return Ok(Vec::new());
     }
     // KEY_MODE = SET_TX without NL80211_EXT_FEATURE_EXT_KEY_ID.
@@ -594,6 +650,35 @@ pub(super) fn del_key(
 }
 
 // ── SET_STATION on a station interface ───────────────────────────────
+
+/// Parse the per-peer transmit-power controls shared by `NEW_STATION` and
+/// `SET_STATION`. Linux validates the setting enum only when it is present;
+/// a stray `STA_TX_POWER` attribute is otherwise ignored. In particular its
+/// parser only reads the dBm value for the LIMITED form, leaving FIXED for
+/// the driver to reject or interpret.
+pub(super) fn station_tx_power(
+    attrs: &[(u16, &[u8])],
+    iface: &dyn crate::WirelessNetIface,
+) -> Result<Option<crate::StationTxPower>, i32> {
+    const ATTR_SETTING: u16 = 275;
+    const ATTR_POWER: u16 = 276;
+    let Some(raw) = attr(attrs, ATTR_SETTING) else {
+        return Ok(None);
+    };
+    if !iface.supports_station_tx_power() {
+        return Err(EOPNOTSUPP);
+    }
+    let setting = match raw.first().copied().ok_or(ERANGE)? {
+        0 => crate::StationTxPower::Automatic,
+        1 => {
+            let value = attr(attrs, ATTR_POWER).ok_or(EINVAL)?;
+            crate::StationTxPower::Limited(i16::from_ne_bytes(int_le::<2>(value)?))
+        }
+        2 => crate::StationTxPower::Fixed,
+        _ => return Err(ERANGE),
+    };
+    Ok(Some(setting))
+}
 
 /// `nl80211_set_station` → `ieee80211_change_station` for the AP's entry.
 pub(super) fn set_station(
@@ -668,6 +753,9 @@ pub(super) fn set_station(
         iface
             .set_port_authorized(mac, set & (1 << 1) != 0)
             .map_err(errno_of)?;
+    }
+    if let Some(setting) = station_tx_power(attrs, iface.as_ref())? {
+        iface.set_station_tx_power(mac, setting).map_err(errno_of)?;
     }
     Ok(Vec::new())
 }
@@ -759,12 +847,17 @@ pub(super) fn tx_control_port(
     no_link_id(attrs)?;
     let no_encrypt = attr(attrs, 103).is_some();
     let dont_wait = attr(attrs, 142).is_some();
+    // mac80211 asks its tx_control_port hook for a cookie before queuing the
+    // frame, so the returned extended-ACK cookie names the eventual status
+    // event even when a completion arrives immediately.
+    let cookie = (!dont_wait && iface.supports_control_port_tx_status())
+        .then(|| CONTROL_PORT_COOKIE.fetch_add(1, Ordering::Relaxed));
     iface
-        .tx_control_port(dest, proto, frame.to_vec(), no_encrypt)
+        .tx_control_port_with_status(dest, proto, frame.to_vec(), no_encrypt, cookie)
         .map_err(errno_of)?;
-    if !dont_wait {
+    if let Some(cookie) = cookie {
         if let Some(cell) = context.ack_cookie {
-            cell.set(Some(CONTROL_PORT_COOKIE.fetch_add(1, Ordering::Relaxed)));
+            cell.set(Some(cookie));
         }
     }
     Ok(Vec::new())
@@ -797,12 +890,13 @@ pub fn rx_control_port(
     };
     let wiphy = crate::registry::list()
         .iter()
-        .position(|i| i.name() == name)
-        .unwrap_or(0) as u32;
+        .find(|iface| iface.name() == name)
+        .and_then(|iface| crate::registry::wiphy_index(iface.wiphy_id()))
+        .unwrap_or(0);
     let mut attrs = Vec::new();
     push_attr(&mut attrs, 1, &wiphy.to_ne_bytes());
     push_attr(&mut attrs, 3, &index.to_ne_bytes());
-    push_attr(&mut attrs, 153, &wdev_id(wiphy).to_ne_bytes());
+    push_attr(&mut attrs, 153, &wdev_id(wiphy, index).to_ne_bytes());
     push_attr(&mut attrs, 6, &src);
     push_attr(&mut attrs, 102, &proto.to_ne_bytes());
     if unencrypted {
@@ -821,6 +915,91 @@ pub fn rx_control_port(
     .is_ok()
 }
 
+/// `cfg80211_control_port_tx_status`: multicast the completed requested
+/// control-port transmission on nl80211's MLME group. `frame` is the full
+/// 802.3 data frame (destination, source, EtherType, and PDU), exactly as
+/// mac80211 retains it in its ACK-status IDR.
+pub fn notify_control_port_tx_status(name: &str, cookie: u64, frame: &[u8], acked: bool) {
+    let Some(ifindex) = narf_net::netlink_route::ifindex_for_name(name) else {
+        return;
+    };
+    let Some(net) = narf_net::iface::lookup(name) else {
+        return;
+    };
+    let Some(wiphy) = crate::registry::list()
+        .iter()
+        .find(|iface| iface.name() == name)
+        .and_then(|iface| crate::registry::wiphy_index(iface.wiphy_id()))
+    else {
+        return;
+    };
+    let mut attrs = Vec::new();
+    push_attr(&mut attrs, NL80211_ATTR_WIPHY, &wiphy.to_ne_bytes());
+    push_attr(&mut attrs, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
+    push_attr(
+        &mut attrs,
+        NL80211_ATTR_WDEV,
+        &wdev_id(wiphy, ifindex).to_ne_bytes(),
+    );
+    push_attr(&mut attrs, NL80211_ATTR_FRAME, frame);
+    push_attr(&mut attrs, NL80211_ATTR_COOKIE, &cookie.to_ne_bytes());
+    if acked {
+        push_attr(&mut attrs, NL80211_ATTR_ACK, &[]);
+    }
+    publish_event(
+        NL80211_FAMILY_ID,
+        19,
+        net.net_ns_id,
+        GenlReply {
+            command: CONTROL_PORT_FRAME_TX_STATUS,
+            attrs,
+        },
+    );
+}
+
+/// `cfg80211_michael_mic_failure`: multicast a locally detected TKIP
+/// Michael-MIC failure on nl80211's MLME group. WCN6855 can strip the IV
+/// before reporting the error, so the optional key index is retained by the
+/// ath11k data path while the frame sequence remains unavailable, exactly
+/// like Linux's `NULL` TSC form.
+pub fn notify_michael_mic_failure(name: &str, source: [u8; 6], group: bool, key_idx: Option<u8>) {
+    let Some(ifindex) = narf_net::netlink_route::ifindex_for_name(name) else {
+        return;
+    };
+    let Some(net) = narf_net::iface::lookup(name) else {
+        return;
+    };
+    let Some(wiphy) = crate::registry::list()
+        .iter()
+        .find(|iface| iface.name() == name)
+        .and_then(|iface| crate::registry::wiphy_index(iface.wiphy_id()))
+    else {
+        return;
+    };
+    let mut attrs = Vec::new();
+    push_attr(&mut attrs, NL80211_ATTR_WIPHY, &wiphy.to_ne_bytes());
+    push_attr(&mut attrs, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
+    push_attr(&mut attrs, NL80211_ATTR_MAC, &source);
+    // enum nl80211_key_type: GROUP = 0, PAIRWISE = 1.
+    push_attr(
+        &mut attrs,
+        NL80211_ATTR_KEY_TYPE,
+        &(if group { 0u32 } else { 1u32 }).to_ne_bytes(),
+    );
+    if let Some(key_idx) = key_idx {
+        push_attr(&mut attrs, NL80211_ATTR_KEY_IDX, &[key_idx]);
+    }
+    publish_event(
+        NL80211_FAMILY_ID,
+        19,
+        net.net_ns_id,
+        GenlReply {
+            command: MICHAEL_MIC_FAILURE,
+            attrs,
+        },
+    );
+}
+
 /// Whether received control-port frames of `name` go over nl80211
 /// (`sdata->control_port_over_nl80211`).
 pub fn control_port_over_nl80211(name: &str) -> bool {
@@ -831,10 +1010,11 @@ pub fn control_port_over_nl80211(name: &str) -> bool {
         .is_some_and(|w| w.control_port_over_nl80211 && w.conn_owner != 0)
 }
 
-/// `wdev_id()`: `(wiphy_idx << 32) | identifier`; NARF has one wdev per
-/// wiphy, identifier 1.
-pub(crate) fn wdev_id(wiphy: u32) -> u64 {
-    ((wiphy as u64) << 32) | 1
+/// `wdev_id()`: `(wiphy_idx << 32) | identifier`.  The interface's stable
+/// netdev ifindex is the nonzero identifier, so sibling virtual interfaces
+/// share a wiphy but never a WDEV.
+pub(crate) fn wdev_id(wiphy: u32, ifindex: u32) -> u64 {
+    ((wiphy as u64) << 32) | u64::from(ifindex.max(1))
 }
 
 // ── power save ───────────────────────────────────────────────────────
@@ -1004,7 +1184,7 @@ pub(super) fn get_reg(attrs: &[u8], dump: bool, namespace: u64) -> Result<Vec<Ge
     if find_attr(attrs, 1).is_some() {
         // cfg80211_get_dev_from_info → __cfg80211_rdev_from_attrs.
         let wiphy = super::super::wiphy_from_attrs(&interfaces, attrs, namespace)?;
-        regdom = interfaces[wiphy].regulatory_domain();
+        regdom = interfaces[wiphy as usize].regulatory_domain();
         if regdom.is_some() {
             push_attr(&mut a, 1, &(wiphy as u32).to_ne_bytes());
         }
@@ -1046,10 +1226,13 @@ pub fn notify_mlme_frame(name: &str, frame: &[u8]) {
     let Some(net) = narf_net::iface::lookup(name) else {
         return;
     };
-    let wiphy = crate::registry::list()
+    let Some(wiphy) = crate::registry::list()
         .iter()
-        .position(|i| i.name() == name)
-        .unwrap_or(0) as u32;
+        .find(|iface| iface.name() == name)
+        .and_then(|iface| crate::registry::wiphy_index(iface.wiphy_id()))
+    else {
+        return;
+    };
     let stype = frame[0] & 0xf0;
     let command = if stype == 0xa0 {
         DISASSOCIATE
@@ -1065,5 +1248,45 @@ pub fn notify_mlme_frame(name: &str, frame: &[u8]) {
         19,
         net.net_ns_id,
         GenlReply { command, attrs },
+    );
+}
+
+/// `cfg80211_gtk_rekey_notify`: after a low-power GTK-offload engine was
+/// disabled, multicast the refreshed big-endian replay counter to the
+/// userspace supplicant.  The event deliberately reuses
+/// `NL80211_CMD_SET_REKEY_OFFLOAD`, precisely as Linux does.
+pub fn notify_gtk_rekey(name: &str, bssid: [u8; 6], replay_counter: [u8; 8]) {
+    const SET_REKEY_OFFLOAD: u8 = 79;
+    const ATTR_REKEY_DATA: u16 = 122;
+    const REPLAY_CTR: u16 = 3;
+    const NLA_F_NESTED: u16 = 1 << 15;
+    let Some(ifindex) = narf_net::netlink_route::ifindex_for_name(name) else {
+        return;
+    };
+    let Some(net) = narf_net::iface::lookup(name) else {
+        return;
+    };
+    let Some(wiphy) = crate::registry::list()
+        .iter()
+        .find(|iface| iface.name() == name)
+        .and_then(|iface| crate::registry::wiphy_index(iface.wiphy_id()))
+    else {
+        return;
+    };
+    let mut rekey = Vec::new();
+    push_attr(&mut rekey, REPLAY_CTR, &replay_counter);
+    let mut attrs = Vec::new();
+    push_attr(&mut attrs, 1, &wiphy.to_ne_bytes());
+    push_attr(&mut attrs, 3, &ifindex.to_ne_bytes());
+    push_attr(&mut attrs, 6, &bssid);
+    push_attr(&mut attrs, ATTR_REKEY_DATA | NLA_F_NESTED, &rekey);
+    publish_event(
+        NL80211_FAMILY_ID,
+        19,
+        net.net_ns_id,
+        GenlReply {
+            command: SET_REKEY_OFFLOAD,
+            attrs,
+        },
     );
 }

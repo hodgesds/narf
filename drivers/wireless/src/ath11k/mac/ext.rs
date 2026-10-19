@@ -18,7 +18,9 @@ use alloc::vec::Vec;
 
 use narf_wireless::{
     ControlPort, KeyParams, MlmeAssocRequest, MlmeAuthRequest, CIPHER_SUITE_AES_CMAC,
-    CIPHER_SUITE_CCMP,
+    CIPHER_SUITE_BIP_CMAC_256, CIPHER_SUITE_BIP_GMAC_128, CIPHER_SUITE_BIP_GMAC_256,
+    CIPHER_SUITE_CCMP, CIPHER_SUITE_CCMP_256, CIPHER_SUITE_GCMP, CIPHER_SUITE_GCMP_256,
+    CIPHER_SUITE_TKIP,
 };
 
 use super::super::mac_frame::{self as frame, eid, ParsedIes};
@@ -27,18 +29,28 @@ use super::sae::{
     WLAN_STATUS_SAE_HASH_TO_ELEMENT, WLAN_STATUS_SAE_PK,
 };
 use super::sec::EID_RSNX;
+use super::sec::{bip_cipher, protected_mgmt_mic_len};
 use super::{
-    channel_number_freq, errno, fail, step, timeout, DataPort, Mac, MacError, ScanState,
-    VdevInstallKeyArg, WmiPort, WMI_KEY_PAIRWISE,
+    channel_number_freq, errno, fail, firmware_key_cipher, step, timeout, DataPort, Mac, MacError,
+    ScanState, VdevInstallKeyArg, WmiPort, WMI_KEY_PAIRWISE,
 };
 
 /// The keys an external supplicant installed (mac80211's key table for
 /// the AP station). Not `Debug`-printed: key material.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct ExtKeys {
-    pub ptk: Option<Vec<u8>>,
+    pub ptk: Option<ExtKey>,
     /// GTKs by index 0..=3, IGTKs 4..=5.
-    pub group: [Option<Vec<u8>>; 6],
+    pub group: [Option<ExtKey>; 6],
+}
+
+/// One installed external-supplicant key.  Retaining its suite alongside the
+/// secret bytes prevents an otherwise identical replacement from silently
+/// preserving an obsolete descriptor encryption type.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ExtKey {
+    pub cipher: u32,
+    pub key: Vec<u8>,
 }
 
 impl core::fmt::Debug for ExtKeys {
@@ -170,27 +182,66 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         }
         let aa = l.bss.bssid;
         let had_ptk = l.ptk_installed;
+        if k.pairwise && l.sta.mfp && protected_mgmt_mic_len(k.cipher).is_none() {
+            // MFP's unicast protection follows the installed PTK. TKIP has
+            // no robust-management construction, so mac80211 cannot accept
+            // it for an MFP peer either.
+            return fail(
+                step::KEY_INSTALL,
+                k.cipher,
+                errno::EOPNOTSUPP,
+                "MFP pairwise cipher",
+            );
+        }
         match k.cipher {
             // BIP: ath11k_mac_op_set_key returns 1, mac80211 does it in
-            // software from the IPN (`aes_cmac.rx_pn`).
-            CIPHER_SUITE_AES_CMAC => {
+            // software from the IPN (`aes_cmac` / `aes_gmac.rx_pn`).
+            suite @ (CIPHER_SUITE_AES_CMAC
+            | CIPHER_SUITE_BIP_CMAC_256
+            | CIPHER_SUITE_BIP_GMAC_128
+            | CIPHER_SUITE_BIP_GMAC_256) => {
+                if k.pairwise || k.peer.is_some() || !(4..=5).contains(&k.idx) {
+                    return fail(step::KEY_INSTALL, 0x402, errno::EINVAL, "IGTK shape");
+                }
                 let slot = k.idx as usize;
-                if self.ext_keys.group.get(slot).and_then(Option::as_deref) == Some(&k.key[..]) {
+                if self
+                    .ext_keys
+                    .group
+                    .get(slot)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|known| {
+                        known.cipher == suite && known.key.as_slice() == k.key.as_slice()
+                    })
+                {
                     return Ok(());
                 }
                 let mut ipn = [0u8; 6];
                 if k.seq.len() == 6 {
                     ipn.copy_from_slice(&k.seq);
                 }
-                if !self.mfp.install_igtk(k.idx as u16, &k.key, ipn) {
+                if !self
+                    .mfp
+                    .install_igtk(bip_cipher(suite).unwrap(), k.idx as u16, &k.key, ipn)
+                {
                     return fail(step::KEY_INSTALL, 0x402, errno::EINVAL, "IGTK");
                 }
-                self.ext_keys.group[slot] = Some(k.key.clone());
+                self.ext_keys.group[slot] = Some(ExtKey {
+                    cipher: suite,
+                    key: k.key.clone(),
+                });
                 Ok(())
             }
-            CIPHER_SUITE_CCMP if k.pairwise => {
+            suite @ (CIPHER_SUITE_TKIP
+            | CIPHER_SUITE_CCMP
+            | CIPHER_SUITE_CCMP_256
+            | CIPHER_SUITE_GCMP
+            | CIPHER_SUITE_GCMP_256)
+                if k.pairwise =>
+            {
                 // KRACK protection: the same key again is not re-installed.
-                if self.ext_keys.ptk.as_deref() == Some(&k.key[..]) {
+                if self.ext_keys.ptk.as_ref().is_some_and(|known| {
+                    known.cipher == suite && known.key.as_slice() == k.key.as_slice()
+                }) {
                     return Ok(());
                 }
                 if had_ptk {
@@ -206,27 +257,55 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                         .await;
                     }
                     self.dp.flush_tx().await;
-                    self.disable_ptk(aa).await?;
+                    let previous_suite = self
+                        .ext_keys
+                        .ptk
+                        .as_ref()
+                        .map_or(CIPHER_SUITE_CCMP, |known| known.cipher);
+                    self.disable_ptk(aa, previous_suite).await?;
                 }
-                self.install_key(aa, 0, &k.key, true).await?;
+                self.install_key_with_cipher(aa, 0, &k.key, true, suite)
+                    .await?;
                 if let Some(l) = self.link.as_mut() {
                     l.ptk_installed = true;
                 }
                 self.mfp.mgmt_rx_pn = 0;
                 self.mfp.mgmt_tx_pn = 0;
-                self.ext_keys.ptk = Some(k.key.clone());
+                if let Some(mic_len) = protected_mgmt_mic_len(suite) {
+                    self.mfp.mgmt_mic_len = mic_len;
+                }
+                self.ext_keys.ptk = Some(ExtKey {
+                    cipher: suite,
+                    key: k.key.clone(),
+                });
                 Ok(())
             }
-            CIPHER_SUITE_CCMP => {
+            suite @ (CIPHER_SUITE_TKIP
+            | CIPHER_SUITE_CCMP
+            | CIPHER_SUITE_CCMP_256
+            | CIPHER_SUITE_GCMP
+            | CIPHER_SUITE_GCMP_256) => {
                 let slot = k.idx as usize;
-                if self.ext_keys.group.get(slot).and_then(Option::as_deref) == Some(&k.key[..]) {
+                if self
+                    .ext_keys
+                    .group
+                    .get(slot)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|known| {
+                        known.cipher == suite && known.key.as_slice() == k.key.as_slice()
+                    })
+                {
                     return Ok(());
                 }
-                self.install_key(aa, k.idx, &k.key, false).await?;
+                self.install_key_with_cipher(aa, k.idx, &k.key, false, suite)
+                    .await?;
                 if let Some(l) = self.link.as_mut() {
                     l.gtk_idx = Some(k.idx);
                 }
-                self.ext_keys.group[slot] = Some(k.key.clone());
+                self.ext_keys.group[slot] = Some(ExtKey {
+                    cipher: suite,
+                    key: k.key.clone(),
+                });
                 Ok(())
             }
             // "cipher %d is not supported".
@@ -236,7 +315,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
 
     /// `ath11k_mac_op_set_key(DISABLE_KEY)` of the pairwise key: cipher NONE
     /// + the PN configuration off.
-    async fn disable_ptk(&mut self, aa: [u8; 6]) -> Result<(), MacError> {
+    async fn disable_ptk(&mut self, aa: [u8; 6], suite: u32) -> Result<(), MacError> {
         let vdev_id = self.vif.as_ref().map_or(0, |v| v.vdev_id);
         let old = VdevInstallKeyArg {
             vdev_id,
@@ -247,13 +326,16 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             ..Default::default()
         };
         self.install_key_cmd(&old).await?;
+        let (cipher, _, _) = firmware_key_cipher(suite).unwrap_or((super::cipher::AES_CCM, 0, 0));
         let _ = self
             .dp
-            .rx_pn_replay_config(vdev_id, aa, super::cipher::AES_CCM, true, false)
+            .rx_pn_replay_config(vdev_id, aa, cipher, 16, 0, true, false)
             .await;
+        let _ = self.dp.tkip_rx_mic_config(vdev_id, aa, None).await;
         if let Some(l) = self.link.as_mut() {
             l.ptk_installed = false;
         }
+        self.mfp.mgmt_mic_len = super::sec::CCMP_MIC_LEN;
         Ok(())
     }
 
@@ -265,10 +347,10 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             return fail(step::KEY_INSTALL, 0x410, errno::ENOENT, "del key (no link)");
         };
         if pairwise {
-            if self.ext_keys.ptk.take().is_none() {
+            let Some(key) = self.ext_keys.ptk.take() else {
                 return fail(step::KEY_INSTALL, 0x411, errno::ENOENT, "del key (no PTK)");
-            }
-            return self.disable_ptk(aa).await;
+            };
+            return self.disable_ptk(aa, key.cipher).await;
         }
         let slot = idx as usize;
         if self
@@ -406,6 +488,10 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             .as_ref()
             .is_some_and(|l| l.bss.bssid == req.peer && !l.assoc);
         if !cont {
+            let previous = self
+                .link
+                .as_ref()
+                .and_then(|l| l.assoc.then_some(l.bss.bssid));
             if let Some(l) = self.link.as_ref() {
                 // "disconnect from AP %pM for new auth to %pM".
                 let (assoc, bssid) = (l.assoc, l.bss.bssid);
@@ -419,12 +505,14 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                     });
                 }
             }
+            self.mlme_prev_bssid = previous;
             if self.scan.state != ScanState::Idle {
                 self.scan_abort().await;
             }
             let ies = bss.parsed();
             let external = Some(narf_wireless::ExternalSecurity::default());
             if let Err(e) = self.prep_connection(&bss, &ies, None, external).await {
+                self.mlme_prev_bssid = None;
                 self.teardown(false, 0).await;
                 return Err(e);
             }
@@ -477,6 +565,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         {
             Ok(r) => r,
             Err(e) => {
+                self.mlme_prev_bssid = None;
                 self.teardown(false, 0).await;
                 return Err(e);
             }
@@ -489,6 +578,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                         && (a.status == WLAN_STATUS_SAE_HASH_TO_ELEMENT
                             || a.status == WLAN_STATUS_SAE_PK));
             if !waits {
+                self.mlme_prev_bssid = None;
                 self.teardown(false, 0).await;
             }
             return Ok(resp);
@@ -521,9 +611,16 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                 "assoc (not authenticated)",
             );
         }
-        if req.prev_bssid.is_some() {
-            // NARF does not reassociate through the userspace SME.
-            return fail(step::CONNECT_UNSUPPORTED, 7, errno::EOPNOTSUPP, "reassoc");
+        if req
+            .prev_bssid
+            .is_some_and(|prev| Some(prev) != self.mlme_prev_bssid)
+        {
+            return fail(
+                step::CONNECT_STATE,
+                7,
+                errno::EINVAL,
+                "reassoc (previous BSS)",
+            );
         }
         let bss = self.link.as_ref().unwrap().bss.clone();
         let ies: ParsedIes = bss.parsed();
@@ -534,15 +631,17 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         };
         self.link.as_mut().unwrap().external = Some(ext);
         let resp = match self
-            .associate_exchange(&bss, &ies, &req.ssid, None, &req.ie)
+            .associate_exchange_with_fallback(&bss, &ies, &req.ssid, None, &req.ie, req.prev_bssid)
             .await
         {
             Ok(r) => r,
             Err(e) => {
+                self.mlme_prev_bssid = None;
                 self.teardown(false, 0).await;
                 return Err(e);
             }
         };
+        self.mlme_prev_bssid = None;
         let a = frame::parse_assoc_resp(&resp).unwrap();
         if a.status != frame::WLAN_STATUS_SUCCESS {
             self.teardown(false, 0).await;
@@ -599,6 +698,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             }
         }
         self.teardown(assoc, reason).await;
+        self.mlme_prev_bssid = None;
         let d = super::Disconnect {
             reason,
             from_ap: false,

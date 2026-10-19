@@ -12,15 +12,16 @@
 //! 126), hunting and pecking otherwise (status 0) — wpa_supplicant with
 //! `sae_pwe=2` (both). Group 19 only (wpa_supplicant's default list is
 //! 19, 20, 21; NARF has P-256 only, so a status 77 ends the attempt).
-//! No SAE-PK (status 127), no password identifiers, no FT-SAE (AKM 9
-//! needs FT authentication with MDE / FTE and the R0KH / R1KH key
-//! hierarchy, which NARF does not have).
+//! SAE-PK validates the AP's Confirm-carried public-key proof when the
+//! password is a SAE-PK fingerprint. Password identifiers and FT-SAE (AKM 9)
+//! remain unsupported; the latter needs FT authentication with MDE / FTE and
+//! the R0KH / R1KH key hierarchy.
 
 extern crate alloc;
 
 use alloc::vec::Vec;
 
-use narf_wireless::sae::{SaeError, SaeSession, SaeState};
+use narf_wireless::sae::{pk, SaeError, SaeSession, SaeState};
 
 use super::super::mac_frame::{self as frame, stype};
 use super::sec::RsnPlan;
@@ -217,6 +218,55 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         if sae.on_confirm(data).is_err() || sae.state() != SaeState::Accepted {
             return fail(step::SAE_CONFIRM, 0, errno::EPROTO, "SAE (confirm)");
         }
+        // SAE-PK's Confirm IEs prove that the AP holds the private key whose
+        // fingerprint was configured as the SAE password. Do this before the
+        // PMK reaches the 4-way handshake: accepting a valid SAE exchange
+        // without KeyAuth verification defeats SAE-PK's evil-twin defence.
+        if sae.is_sae_pk() {
+            self.verify_sae_pk(&sae, &ssid, password, bssid)?;
+        }
         Ok(*sae.pmk().unwrap())
+    }
+
+    /// Validate the AP-side portion of WPA3 SAE-PK after the regular SAE
+    /// Confirm MAC has succeeded. The shared `sae::pk` implementation parses
+    /// the Confirm carriage, authenticates the encrypted Modifier with the
+    /// session KEK, checks the configured password fingerprint, and verifies
+    /// KeyAuth's ECDSA signature over the exact SAE transcript.
+    fn verify_sae_pk(
+        &self,
+        sae: &SaeSession,
+        ssid: &[u8],
+        password: &[u8],
+        ap_bssid: [u8; 6],
+    ) -> Result<(), MacError> {
+        let password = core::str::from_utf8(password)
+            .map_err(|_| MacError::new(step::SAE_CONFIRM, 1, errno::EINVAL))?;
+        let kek = sae
+            .kek()
+            .ok_or_else(|| MacError::new(step::SAE_CONFIRM, 2, errno::EPROTO))?;
+        let elements = pk::parse_elements(sae.peer_confirm_ies())
+            .ok_or_else(|| MacError::new(step::SAE_CONFIRM, 3, errno::EPROTO))?;
+        let modifier = pk::recover_modifier(kek, &elements.encrypted_modifier)
+            .ok_or_else(|| MacError::new(step::SAE_CONFIRM, 4, errno::EPROTO))?;
+        let (ele_ap, ele_sta, sca_ap, sca_sta) = sae.sae_pk_transcript();
+        let verification = pk::ApVerification {
+            ssid,
+            password,
+            modifier: &modifier,
+            public_key_der: &elements.public_key_der,
+            key_auth: &elements.key_auth,
+            ele_ap: &ele_ap,
+            ele_sta: &ele_sta,
+            sca_ap: &sca_ap,
+            sca_sta: &sca_sta,
+            ap_bssid: &ap_bssid,
+            sta_mac: &self.caps.mac_addr,
+        };
+        if pk::authenticate_ap(&verification) {
+            Ok(())
+        } else {
+            Err(MacError::new(step::SAE_CONFIRM, 5, errno::EPROTO))
+        }
     }
 }

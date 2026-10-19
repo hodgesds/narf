@@ -66,6 +66,7 @@ impl crate::WirelessNetIface for InterfaceStub {
         Ok(alloc::vec![crate::BssInfo {
             bssid: [2, 1, 2, 3, 4, 5],
             ssid: b"test".to_vec(),
+            frequency_mhz: 5180,
             channel: 36,
             rssi: -47,
             security: crate::scan::BssSecurity::Wpa2
@@ -132,7 +133,7 @@ fn smoke_nl80211_attribute_and_security_validation() -> TestResult {
     if !matches!(
         parse_operation(CONNECT, &attributes(&bytes).unwrap(), true, false),
         Ok(Operation::Connect {
-            channel: Some(36),
+            frequency_mhz: Some(5180),
             cred: Credential::Open,
             ..
         })
@@ -236,8 +237,14 @@ fn smoke_nl80211_authority_and_scan_completion() -> TestResult {
         index,
         Operation::Scan(crate::ScanRequest {
             ssids: Vec::new(),
+            frequencies_mhz: Vec::new(),
             channels: Vec::new(),
             active: false,
+            random_mac: None,
+            colocated_6ghz: false,
+            duration_tu: None,
+            duration_mandatory: false,
+            extra_ies: Vec::new(),
         }),
     ));
     let cached = CACHE
@@ -295,7 +302,7 @@ fn smoke_nl80211_active_scan_and_ssid_connect() -> TestResult {
         parse_operation(CONNECT, &attributes(&request).unwrap(), true, false),
         Ok(Operation::Connect {
             bssid: None,
-            channel: None,
+            frequency_mhz: None,
             ..
         })
     ) {
@@ -304,12 +311,14 @@ fn smoke_nl80211_active_scan_and_ssid_connect() -> TestResult {
     let weak = crate::BssInfo {
         bssid: [2; 6],
         ssid: b"home".to_vec(),
+        frequency_mhz: 2412,
         channel: 1,
         rssi: -80,
         security: crate::scan::BssSecurity::Wpa2,
     };
     let mut strong = weak.clone();
     strong.bssid = [4; 6];
+    strong.frequency_mhz = 5180;
     strong.channel = 36;
     strong.rssi = -40;
     let mut open = strong.clone();
@@ -423,6 +432,7 @@ impl crate::WirelessNetIface for OffloadStub {
             crate::BssInfo {
                 bssid: INTEROP_BSSID,
                 ssid: b"narf-ap".to_vec(),
+                frequency_mhz: 5180,
                 channel: 36,
                 rssi: -42,
                 security: crate::scan::BssSecurity::Wpa2,
@@ -430,6 +440,7 @@ impl crate::WirelessNetIface for OffloadStub {
             crate::BssInfo {
                 bssid: INTEROP_SAE_BSSID,
                 ssid: b"narf-ap3".to_vec(),
+                frequency_mhz: 5200,
                 channel: 40,
                 rssi: -45,
                 security: crate::scan::BssSecurity::Wpa3,
@@ -653,8 +664,14 @@ fn smoke_nl80211_supplicant_interop() -> TestResult {
         ifindex,
         Operation::Scan(crate::ScanRequest {
             ssids: Vec::new(),
+            frequencies_mhz: Vec::new(),
             channels: Vec::new(),
             active: false,
+            random_mac: None,
+            colocated_6ghz: false,
+            duration_tu: None,
+            duration_mandatory: false,
+            extra_ies: Vec::new(),
         }),
     ));
     if !INTEROP_EVENTS
@@ -693,7 +710,7 @@ fn smoke_nl80211_supplicant_interop() -> TestResult {
         Operation::Connect {
             ssid: b"narf-ap".to_vec(),
             bssid: None,
-            channel: None,
+            frequency_mhz: None,
             cred: Credential::Psk(Zeroizing::new([0x42u8; 32])),
             ie: Vec::new(),
             owner: None,
@@ -804,7 +821,7 @@ fn smoke_nl80211_wpa3_sae_connect() -> TestResult {
         Operation::Connect {
             ssid: b"narf-ap3".to_vec(),
             bssid: None,
-            channel: None,
+            frequency_mhz: None,
             cred: Credential::Sae(Zeroizing::new(b"correct horse battery".to_vec())),
             ie: Vec::new(),
             owner: None,
@@ -879,6 +896,7 @@ impl crate::WirelessNetIface for RoamStub {
         Ok(alloc::vec![crate::BssInfo {
             bssid: ROAM_NEW_BSSID,
             ssid: b"roam-net".to_vec(),
+            frequency_mhz: 5180,
             channel: 36,
             rssi: -40,
             security: crate::scan::BssSecurity::Open,
@@ -923,6 +941,7 @@ struct SmeStub {
     tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
     registered: core::sync::atomic::AtomicU32,
     external_status: core::sync::atomic::AtomicU32,
+    assoc_comeback: core::sync::atomic::AtomicBool,
 }
 impl Interface for SmeStub {
     fn name(&self) -> &str {
@@ -991,6 +1010,12 @@ impl crate::WirelessNetIface for SmeStub {
         &self,
         _: crate::MlmeAssocRequest,
     ) -> Result<Vec<u8>, crate::WirelessError> {
+        if self
+            .assoc_comeback
+            .load(core::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(sme_assoc_comeback());
+        }
         Ok(SME_ASSOC_RESP.to_vec())
     }
     async fn mlme_deauthenticate(
@@ -1030,6 +1055,17 @@ impl crate::WirelessNetIface for SmeStub {
     }
 }
 
+/// Status 30 Association Response with Timeout Interval / Association
+/// Comeback (100 TUs).  The test needs a full fixed response header because
+/// the nl80211 path deliberately rejects truncated management frames.
+fn sme_assoc_comeback() -> Vec<u8> {
+    let mut frame = alloc::vec![0; 30];
+    frame[0] = 0x10; // Association Response
+    frame[26..28].copy_from_slice(&30u16.to_le_bytes());
+    frame.extend_from_slice(&[56, 5, 3, 100, 0, 0, 0]);
+    frame
+}
+
 fn smoke_nl80211_userspace_sme_mlme() -> TestResult {
     use core::sync::atomic::Ordering;
     use narf_net::netlink_generic::install_event_sink;
@@ -1040,6 +1076,7 @@ fn smoke_nl80211_userspace_sme_mlme() -> TestResult {
         tx: IrqSafeSpinLock::new(None),
         registered: core::sync::atomic::AtomicU32::new(0),
         external_status: core::sync::atomic::AtomicU32::new(0xffff),
+        assoc_comeback: core::sync::atomic::AtomicBool::new(false),
     });
     let iface: Arc<dyn crate::WirelessNetIface> = stub.clone();
     narf_net::iface::register(SME_NAME, SME_MAC, |_, _| Ok(()));
@@ -1118,6 +1155,7 @@ fn smoke_nl80211_userspace_sme_mlme() -> TestResult {
             crate::BssInfo {
                 bssid: SME_PEER,
                 ssid: b"sme-net".to_vec(),
+                frequency_mhz: 2437,
                 channel: 6,
                 rssi: -40,
                 security: crate::scan::BssSecurity::Wpa3,
@@ -1242,6 +1280,7 @@ fn smoke_nl80211_userspace_sme_mlme() -> TestResult {
     // REGISTER_FRAME records a management subtype; a non-mgmt type is EINVAL.
     let mut reg = Vec::new();
     push_attr(&mut reg, 3, &ifindex.to_ne_bytes());
+    push_attr(&mut reg, 91, &[]); // NL80211_ATTR_FRAME_MATCH (empty = all)
     push_attr(&mut reg, 101, &0x00b0u16.to_ne_bytes()); // mgmt/auth frame type
     if handle(REGISTER_FRAME, &reg, false, ctx).is_err()
         || stub.registered.load(Ordering::SeqCst) != 0xb0
@@ -1332,6 +1371,41 @@ fn smoke_nl80211_userspace_sme_mlme() -> TestResult {
         return TestResult::Fail("ASSOCIATE event missing the response frame");
     }
 
+    // A temporary association rejection reports the standardized deferred
+    // retry event, not a failed CONNECT result or an ownership teardown.
+    stub.assoc_comeback.store(true, Ordering::SeqCst);
+    INTEROP_EVENTS.lock().clear();
+    narf_scheduler::block_on_spin(run_mlme(
+        iface.clone(),
+        0,
+        ifindex,
+        MlmeExec::Associate(crate::MlmeAssocRequest {
+            peer: SME_PEER,
+            ssid: b"sme-net".to_vec(),
+            channel: 0,
+            ie: Vec::new(),
+            prev_bssid: None,
+            use_mfp: true,
+            control_port: crate::ControlPort::default(),
+            privacy: true,
+        }),
+    ));
+    let comeback = INTEROP_EVENTS.lock().iter().any(|(ns, group, msg)| {
+        *ns == 0
+            && *group == 19
+            && msg.get(16) == Some(&ASSOC_COMEBACK)
+            && find_attr(&msg[20..], 6) == Some(&SME_PEER[..])
+            && find_attr(&msg[20..], ATTR_TIMEOUT) == Some(&100u32.to_ne_bytes()[..])
+    });
+    let connect_result = INTEROP_EVENTS
+        .lock()
+        .iter()
+        .any(|(ns, group, msg)| *ns == 0 && *group == 19 && msg.get(16) == Some(&CONNECT));
+    stub.assoc_comeback.store(false, Ordering::SeqCst);
+    if !comeback || connect_result {
+        return TestResult::Fail("ASSOC_COMEBACK event / CONNECT suppression incorrect");
+    }
+
     INTEROP_EVENTS.lock().clear();
     narf_scheduler::block_on_spin(run_mlme(
         iface.clone(),
@@ -1368,7 +1442,7 @@ fn smoke_nl80211_userspace_sme_mlme() -> TestResult {
         MlmeExec::MgmtTx {
             cookie: 0x1234,
             request: crate::MgmtTxRequest {
-                channel: 0,
+                frequency_mhz: 0,
                 frame: mgmt.clone(),
                 offchannel_ok: false,
                 duration: 0,
@@ -1482,7 +1556,7 @@ impl crate::WirelessNetIface for ApStub {
     }
     fn start_ap(&self, cfg: crate::ApConfig) -> Result<(), crate::WirelessError> {
         self.channel
-            .store(cfg.channel, core::sync::atomic::Ordering::SeqCst);
+            .store(cfg.frequency_mhz, core::sync::atomic::Ordering::SeqCst);
         self.started
             .store(true, core::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -1492,7 +1566,12 @@ impl crate::WirelessNetIface for ApStub {
             .store(true, core::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
-    fn set_beacon(&self, _: Vec<u8>, _: Vec<u8>) -> Result<(), crate::WirelessError> {
+    fn set_beacon(
+        &self,
+        _: Option<Vec<u8>>,
+        _: Option<Vec<u8>>,
+        _: Option<Vec<u8>>,
+    ) -> Result<(), crate::WirelessError> {
         Ok(())
     }
     fn add_station(&self, _: crate::StationConfig) -> Result<(), crate::WirelessError> {
@@ -1559,12 +1638,13 @@ fn smoke_nl80211_ap_mode() -> TestResult {
             return TestResult::Fail("AP iface did not advertise an AP command");
         }
     }
-    let iattrs = interface_attrs(0, &info, iface.current_iftype());
+    let iattrs = interface_attrs(0, iface.as_ref(), iface.current_iftype());
     if find_attr(&iattrs, NL80211_ATTR_IFTYPE) != Some(&3u32.to_ne_bytes()[..]) {
         return TestResult::Fail("GET_INTERFACE did not report iftype AP");
     }
 
-    // START_AP: a complete request starts beaconing on channel 1 (2412 MHz).
+    // START_AP: a complete request starts beaconing on 2412 MHz. Keeping the
+    // frequency (rather than a channel number) is necessary for 6 GHz.
     let beacon_head = alloc::vec![0x80u8; 36];
     let mut start = Vec::new();
     push_attr(&mut start, 3, &ifindex.to_ne_bytes());
@@ -1575,9 +1655,9 @@ fn smoke_nl80211_ap_mode() -> TestResult {
     push_attr(&mut start, 38, &2412u32.to_ne_bytes()); // WIPHY_FREQ
     if handle(START_AP, &start, false, ctx).is_err()
         || !stub.started.load(Ordering::SeqCst)
-        || stub.channel.load(Ordering::SeqCst) != 1
+        || stub.channel.load(Ordering::SeqCst) != 2412
     {
-        return TestResult::Fail("valid START_AP did not start the AP on channel 1");
+        return TestResult::Fail("valid START_AP did not retain the AP frequency");
     }
     // Missing beacon head, zero interval, and missing channel are each EINVAL.
     let mut no_head = Vec::new();
@@ -1694,7 +1774,7 @@ fn smoke_nl80211_connect_to_new_bss_roams() -> TestResult {
         Operation::Connect {
             ssid: b"roam-net".to_vec(),
             bssid: None,
-            channel: None,
+            frequency_mhz: None,
             cred: Credential::Open,
             ie: Vec::new(),
             owner: None,

@@ -68,7 +68,7 @@ use super::hw::{HwParams, HwRev};
 use super::mhi_host::MhiNotify;
 use super::power::ChipIo;
 use super::qmi_wlfw::{ATH11K_FIRMWARE_MODE_NORMAL, ATH11K_FIRMWARE_MODE_OFF};
-use super::wlfw::{self, WlfwError};
+use super::wlfw::{self, CoherentMem, WlfwError};
 use super::wmi::{
     self, hw_mode, DmaRingCap, InitCmdParam, Ready, RegInfo, ServiceMap, ServiceReadyExt,
     TargetCaps, TargetResourceConfig, WmiCmd, WmiError,
@@ -191,6 +191,80 @@ pub enum FwNotice {
     Restart,
 }
 
+/// A completed firmware crash dump made available to the driver diagnostic
+/// surface. This is NARF's ownership-safe analogue of Linux's
+/// `dev_coredumpv`: MHI RDDM, FBC paging and dump-eligible QMI target memory
+/// are copied before recovery can recycle their DMA owners, then held until a
+/// diagnostic consumer takes the dump from [`super::runtime::Shared`].
+#[derive(Debug)]
+pub struct FirmwareCrashDump {
+    /// Monotonic capture time supplied by the transport.
+    pub captured_at_ms: u64,
+    /// PCI device id (`ath11k_dump_file_data::chip_id`).
+    pub chip_id: u32,
+    /// Remote WLFW service instance (`ath11k_dump_file_data::qrtr_id`).
+    pub qrtr_instance: u32,
+    /// Contiguous BHIe firmware image: Linux's `FW_CRASH_DUMP_PAGING_DATA`.
+    pub paging: Vec<u8>,
+    /// Contiguous ath11k BHIe RDDM payload: `FW_CRASH_DUMP_RDDM_DATA`.
+    pub rddm: Vec<u8>,
+    /// QMI host-DDR target memory: `FW_CRASH_DUMP_REMOTE_MEM_DATA`.
+    pub remote_mem: Vec<u8>,
+    /// QMI pageable target memory: `FW_CRASH_DUMP_PAGEABLE_DATA`.
+    pub pageable: Vec<u8>,
+    /// QMI M3 dump target memory: `FW_CRASH_DUMP_M3_DUMP`.
+    pub m3: Vec<u8>,
+}
+
+impl FirmwareCrashDump {
+    /// Serialize the compatible `ATH11K-FW-DUMP` v2 header plus its TLVs.
+    /// NARF has a monotonic capture clock rather than Linux's real-time
+    /// `timespec64` and no PCI-domain concept, so those header fields are
+    /// zero. The payload types, ordering and little-endian layout match
+    /// Linux's `ath11k_pci_coredump_download`.
+    pub fn into_linux_v2(self) -> Vec<u8> {
+        const HEADER_LEN: usize = 196;
+        const VERSION: u32 = 2;
+        const PAGING: u32 = 0;
+        const RDDM: u32 = 1;
+        const REMOTE: u32 = 2;
+        const PAGEABLE: u32 = 3;
+        const M3: u32 = 4;
+        let sections = [
+            (PAGING, self.paging),
+            (RDDM, self.rddm),
+            (REMOTE, self.remote_mem),
+            (PAGEABLE, self.pageable),
+            (M3, self.m3),
+        ];
+        let align4 = |len: usize| (len + 3) & !3;
+        let data_len = sections
+            .iter()
+            .filter(|(_, bytes)| !bytes.is_empty())
+            .map(|(_, bytes)| 8 + align4(bytes.len()))
+            .sum::<usize>();
+        let total = HEADER_LEN.saturating_add(data_len);
+        let mut out = Vec::with_capacity(total);
+        out.resize(HEADER_LEN, 0);
+        out[..14].copy_from_slice(b"ATH11K-FW-DUMP");
+        out[16..20].copy_from_slice(&(total as u32).to_le_bytes());
+        out[20..24].copy_from_slice(&VERSION.to_le_bytes());
+        out[24..28].copy_from_slice(&self.chip_id.to_le_bytes());
+        out[28..32].copy_from_slice(&self.qrtr_instance.to_le_bytes());
+        for (kind, bytes) in sections {
+            if bytes.is_empty() {
+                continue;
+            }
+            out.extend_from_slice(&kind.to_le_bytes());
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(&bytes);
+            let padded = align4(out.len() - HEADER_LEN);
+            out.resize(HEADER_LEN + padded, 0);
+        }
+        out
+    }
+}
+
 /// The QMI half of firmware start/stop.
 pub trait QmiFw {
     /// `ath11k_qmi_firmware_start(ab, mode)`.
@@ -213,6 +287,17 @@ pub trait QmiFw {
     /// at the next periodic pass).
     fn irq_pending(&self) -> bool {
         false
+    }
+    /// Preserve a transport-owned firmware crash dump, if one exists, before
+    /// the radio reset destroys the source buffers. The default transport has
+    /// no such dump and is deliberately a no-op.
+    fn collect_crash_dump(&mut self) -> impl Future<Output = ()> {
+        async {}
+    }
+    /// Transfer a completed transport dump to the physical-radio diagnostic
+    /// owner. The default transport owns no such dump.
+    fn take_crash_dump(&mut self) -> Option<FirmwareCrashDump> {
+        None
     }
     /// The firmware half of a recovery, up to the point Linux queues
     /// `restart_work`: with `power_cycle` (`ath11k_core_reset`)
@@ -263,6 +348,48 @@ where
     }
     fn irq_pending(&self) -> bool {
         self.client.pipe.irqs_pending()
+    }
+    async fn collect_crash_dump(&mut self) {
+        if let Err(e) = self.client.pipe.collect_crash_dump().await {
+            log(format_args!(
+                "mhi RDDM collection failed: step {} detail {:#x} (-{})",
+                e.step, e.detail, e.errno
+            ));
+        }
+    }
+    fn take_crash_dump(&mut self) -> Option<FirmwareCrashDump> {
+        let snapshot = self.client.pipe.take_rddm_snapshot()?;
+        let mut remote_mem = Vec::new();
+        let mut pageable = Vec::new();
+        let mut m3 = Vec::new();
+        for chunk in self.target_mem.iter().take(self.mem_seg_count) {
+            let Some(mem) = chunk.mem.as_ref() else {
+                continue;
+            };
+            let bytes = &mem.bytes()[..(chunk.size as usize).min(mem.bytes().len())];
+            match chunk.mem_type {
+                // `ath11k_coredump_get_dump_type`.
+                super::qmi_wlfw::QMI_WLANFW_MEM_TYPE_DDR_V01 => remote_mem.extend_from_slice(bytes),
+                // `M3_DUMP_REGION_TYPE` / `QMI_WLANFW_MEM_M3_V01`.
+                super::qmi_wlfw::QMI_WLANFW_MEM_M3_V01 => m3.extend_from_slice(bytes),
+                super::qmi_wlfw::QMI_WLANFW_MEM_PAGEABLE_V01 => pageable.extend_from_slice(bytes),
+                // BDF / CALDB (and unknown types) never enter Linux's dump.
+                _ => {}
+            }
+        }
+        Some(FirmwareCrashDump {
+            captured_at_ms: snapshot.captured_at_ms,
+            chip_id: self.cfg.board.device as u32,
+            qrtr_instance: self
+                .client
+                .server()
+                .map_or(0, |server| server.qmi_instance()),
+            paging: self.client.pipe.firmware_paging_snapshot(),
+            rddm: snapshot.bytes,
+            remote_mem,
+            pageable,
+            m3,
+        })
     }
     async fn recover(&mut self, power_cycle: bool) -> Result<(), WlfwError> {
         if power_cycle {
@@ -472,6 +599,13 @@ pub struct Ath11kCore<H: Hif, Q: QmiFw> {
     unified_ready_done: bool,
     /// A bring-up event failed to decode (ends the wait it occurs in).
     fatal: Option<TransportError>,
+    /// HTC endpoint-zero `SEND_SUSPEND_COMPLETE` / `NACK_SUSPEND`, consumed
+    /// by the WoWLAN owner after `WMI_WOW_ENABLE_CMDID`.
+    htc_suspend_complete: Option<bool>,
+    /// `WMI_WOW_WAKEUP_HOST_EVENTID`, the completion Linux waits for after
+    /// `WMI_WOW_HOSTWAKEUP_FROM_SLEEP_CMDID`.  HTC's similarly named EP0
+    /// message is diagnostic-only and must not satisfy this wait.
+    wow_wakeup: Option<wmi::WowWakeup>,
     events: VecDeque<WmiRx>,
     htt: VecDeque<Vec<u8>>,
     pub stats: CoreStats,
@@ -551,6 +685,8 @@ impl<H: Hif, Q: QmiFw> Ath11kCore<H, Q> {
             service_ready_done: false,
             unified_ready_done: false,
             fatal: None,
+            htc_suspend_complete: None,
+            wow_wakeup: None,
             events: VecDeque::new(),
             htt: VecDeque::new(),
             stats: CoreStats::default(),
@@ -603,6 +739,16 @@ impl<H: Hif, Q: QmiFw> Ath11kCore<H, Q> {
             self.stats.credit_reports += 1;
         }
         match rx.kind {
+            HtcRxKind::SuspendComplete(ack) => {
+                // `ath11k_htc_suspend_complete`: an ACK is the terminal
+                // WoW-enable response; NACK is retained too so the caller
+                // can perform Linux's bounded retry sequence.
+                self.htc_suspend_complete = Some(ack);
+            }
+            // `ath11k_htc_wakeup_from_suspend` only logs this endpoint-zero
+            // indication.  The WMI WoW wakeup-host event below is the real
+            // `ath11k_wow_wakeup` completion.
+            HtcRxKind::WakeupFromSuspend => {}
             HtcRxKind::Deliver { eid, range } => {
                 if self.wmi_ep.map(|e| e.eid) == Some(eid) {
                     self.wmi_rx(&buf[range]);
@@ -754,6 +900,10 @@ impl<H: Hif, Q: QmiFw> Ath11kCore<H, Q> {
                 }
                 self.push_event(id, frame);
             }
+            wmi::WMI_WOW_WAKEUP_HOST_EVENTID => match wmi::decode_wow_wakeup(p) {
+                Ok(wakeup) => self.wow_wakeup = Some(wakeup),
+                Err(e) => self.fail_decode(wmi_decode_error(id, e)),
+            },
             _ => self.push_event(id, frame),
         }
     }
@@ -988,6 +1138,17 @@ impl<H: Hif, Q: QmiFw> Ath11kCore<H, Q> {
     /// Next queued WMI event, if any.
     pub fn take_event(&mut self) -> Option<WmiRx> {
         self.events.pop_front()
+    }
+
+    /// Take an endpoint-zero WoW suspend response.  This is separate from
+    /// the WMI event queue because HTC control frames are not WMI events.
+    pub fn take_htc_suspend_complete(&mut self) -> Option<bool> {
+        self.htc_suspend_complete.take()
+    }
+
+    /// Take WMI's WoW wakeup-host completion and its firmware reason.
+    pub fn take_wow_wakeup(&mut self) -> Option<wmi::WowWakeup> {
+        self.wow_wakeup.take()
     }
 
     /// Queued WMI events.

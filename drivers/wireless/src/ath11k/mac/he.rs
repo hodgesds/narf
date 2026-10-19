@@ -3,13 +3,14 @@
 //! `ath11k_mac_vif_recalc_sta_he_txbf`, the STA arm of
 //! `BSS_CHANGED_HE_BSS_COLOR`) and mac80211 (`ieee80211_put_he_cap`,
 //! `ieee80211_he_cap_ie_to_sta_he_cap`, `ieee80211_verify_*_he_mcs_support`,
-//! `ieee80211_he_spr_ie_to_bss_conf`) do on 2.4 / 5 GHz.
+//! `ieee80211_he_spr_ie_to_bss_conf`) do on 2.4 / 5 / 6 GHz.
 //!
-//! 6 GHz association stays out (the HE 6 GHz band capability, the
-//! regulatory connectivity element and the 6 GHz power rules are not
-//! ported; NARF's `BssInfo` lists 2.4 / 5 GHz only), as do 160 / 80+80 MHz
-//! (the channel layer stops at 80 MHz) and TWT (`BSS_CHANGED_TWT` →
-//! `WMI_TWT_ENABLE`: not ported).
+//! The 6 GHz association pieces include HE 6 GHz Band Capabilities and the
+//! optional HE Operation field. Regulatory connectivity / power type
+//! enforcement remains in `mac_reg`; non-contiguous 80+80 MHz carries both
+//! centre frequencies through the channel and WMI layers. Station TWT tracks
+//! mac80211's requester-capability gates and maps `BSS_CHANGED_TWT` to the
+//! firmware's enable / disable commands in `mac`.
 
 extern crate alloc;
 
@@ -19,10 +20,12 @@ use super::super::mac_frame::Band;
 use super::super::mac_peer::Width;
 use super::super::wmi::{BandCap, PdevCap, PpeThreshold};
 
-/// `WLAN_EID_EXT_HE_CAPABILITY` / `_HE_OPERATION` / `_HE_SPR`.
+/// `WLAN_EID_EXT_HE_CAPABILITY` / `_HE_OPERATION` / `_HE_SPR` /
+/// `_HE_6GHZ_CAPA`.
 pub const EID_EXT_HE_CAPABILITY: u8 = 35;
 pub const EID_EXT_HE_OPERATION: u8 = 36;
 pub const EID_EXT_HE_SPR: u8 = 39;
+pub const EID_EXT_HE_6GHZ_CAPABILITY: u8 = 59;
 
 /// `IEEE80211_HE_*` bits used here (`include/linux/ieee80211-he.h`).
 pub mod cap {
@@ -46,6 +49,23 @@ pub mod cap {
     pub const PHY8_DCM_MAX_RU_MASK: u8 = 0xc0;
     pub const PHY9_LONGER_THAN_16_SIGB_OFDM_SYM: u8 = 0x01;
     pub const PHY9_TX_1024_QAM_LESS_THAN_242_TONE_RU: u8 = 0x04;
+}
+
+/// `IEEE80211_HE_6GHZ_CAP_*`.
+pub mod cap_6ghz {
+    pub const MIN_MPDU_START_MASK: u16 = 0x0007;
+    pub const MAX_AMPDU_LEN_EXP_MASK: u16 = 0x0038;
+    pub const MAX_MPDU_LEN_MASK: u16 = 0x00c0;
+    pub const SM_PS_MASK: u16 = 0x0600;
+    pub const RX_ANTPAT_CONS: u16 = 0x1000;
+    pub const TX_ANTPAT_CONS: u16 = 0x2000;
+}
+
+/// `IEEE80211_HE_OPERATION_*` flags for optional operation fields.
+pub mod oper {
+    pub const VHT_OPER_INFO: u32 = 1 << 14;
+    pub const CO_HOSTED_BSS: u32 = 1 << 15;
+    pub const SIX_GHZ_OP_INFO: u32 = 1 << 17;
 }
 
 /// `IEEE80211_HE_MCS_SUPPORT_0_11` / `_NOT_SUPPORTED`.
@@ -163,6 +183,41 @@ pub fn own_he_cap(pdev: &PdevCap, band: &BandCap, num_tx: u32, num_rx: u32) -> S
     }
 }
 
+/// `ath11k_mac_setup_he_6ghz_cap`: synthesize the station's HE 6 GHz Band
+/// Capabilities from the firmware's copied 5/6 GHz capability set.
+pub fn own_he_6ghz_cap(pdev: &PdevCap, band: &BandCap) -> u16 {
+    use super::super::mac_peer::{sm_ps, vht, wmi_ht};
+
+    let mut out = 0u16; // IEEE80211_HT_MPDU_DENSITY_NONE
+    out |= if band.ht_cap_info & wmi_ht::DYNAMIC_SMPS != 0 {
+        sm_ps::DYNAMIC << 9
+    } else {
+        sm_ps::DISABLED << 9
+    };
+    out |= ((pdev.vht_cap & vht::MAX_A_MPDU_LENGTH_EXPONENT_MASK) >> 20) as u16;
+    out |= ((pdev.vht_cap & vht::MAX_MPDU_MASK) << 6) as u16;
+    if pdev.vht_cap & vht::RX_ANTENNA_PATTERN != 0 {
+        out |= cap_6ghz::RX_ANTPAT_CONS;
+    }
+    if pdev.vht_cap & vht::TX_ANTENNA_PATTERN != 0 {
+        out |= cap_6ghz::TX_ANTPAT_CONS;
+    }
+    out
+}
+
+/// `ieee80211_ie_build_he_6ghz_cap`: a complete Extension IE.
+pub fn put_he_6ghz_cap(cap: u16) -> Vec<u8> {
+    let mut out = alloc::vec![0xFF, 3, EID_EXT_HE_6GHZ_CAPABILITY];
+    out.extend_from_slice(&cap.to_le_bytes());
+    out
+}
+
+/// Validate and decode the two-byte HE 6 GHz Band Capabilities extension
+/// payload (the bytes after extension id 59).
+pub fn parse_he_6ghz_cap(d: &[u8]) -> Option<u16> {
+    (d.len() == 2).then(|| u16::from_le_bytes([d[0], d[1]]))
+}
+
 /// `ieee80211_get_adjusted_he_cap` + `ieee80211_put_he_cap`: the HE
 /// Capabilities element of the Association Request for the connection
 /// width `width` (`conn->bw_limit`).
@@ -172,6 +227,8 @@ pub fn put_he_cap(own: &StaHeCap, width: Width) -> Vec<u8> {
         Width::W20NoHt | Width::W20 => 0x00,
         Width::W40 => 0x40,
         Width::W80 => 0x80,
+        Width::W80P80 => 0xc0,
+        Width::W160 => 0xc0,
     };
     let max_ru = (phy[8] & cap::PHY8_DCM_MAX_RU_MASK).min(ru_limit);
     phy[8] = (phy[8] & !cap::PHY8_DCM_MAX_RU_MASK) | max_ru;
@@ -179,16 +236,27 @@ pub fn put_he_cap(own: &StaHeCap, width: Width) -> Vec<u8> {
         phy[0] &= !(cap::PHY0_40MHZ_80MHZ_IN_5G | cap::PHY0_40MHZ_IN_2G);
         phy[9] &= !cap::PHY9_LONGER_THAN_16_SIGB_OFDM_SYM;
     }
-    // bw_limit < 160 (NARF stops at 80 MHz).
-    phy[0] &= !(cap::PHY0_160MHZ_IN_5G | cap::PHY0_80PLUS80_MHZ_IN_5G);
-    phy[5] &= !cap::PHY5_BEAMFORMEE_NUM_SND_DIM_ABOVE_80MHZ_MASK;
-    phy[7] &= !(cap::PHY7_STBC_TX_ABOVE_80MHZ | cap::PHY7_STBC_RX_ABOVE_80MHZ);
-    let n = mcs_nss_size(&phy);
+    if !matches!(width, Width::W160 | Width::W80P80) {
+        phy[0] &= !(cap::PHY0_160MHZ_IN_5G | cap::PHY0_80PLUS80_MHZ_IN_5G);
+        phy[5] &= !cap::PHY5_BEAMFORMEE_NUM_SND_DIM_ABOVE_80MHZ_MASK;
+        phy[7] &= !(cap::PHY7_STBC_TX_ABOVE_80MHZ | cap::PHY7_STBC_RX_ABOVE_80MHZ);
+    } else if width == Width::W160 {
+        phy[0] &= !cap::PHY0_80PLUS80_MHZ_IN_5G;
+    } else {
+        phy[0] &= !cap::PHY0_160MHZ_IN_5G;
+    }
     let mut out = alloc::vec![0xFF, 0, EID_EXT_HE_CAPABILITY];
     out.extend_from_slice(&own.mac);
     out.extend_from_slice(&phy);
-    for m in &own.mcs[..n / 2] {
-        out.extend_from_slice(&m.to_le_bytes());
+    for &(rx, tx, required_bit) in &[
+        (0usize, 1usize, 0u8),
+        (2, 3, cap::PHY0_160MHZ_IN_5G),
+        (4, 5, cap::PHY0_80PLUS80_MHZ_IN_5G),
+    ] {
+        if required_bit == 0 || phy[0] & required_bit != 0 {
+            out.extend_from_slice(&own.mcs[rx].to_le_bytes());
+            out.extend_from_slice(&own.mcs[tx].to_le_bytes());
+        }
     }
     // PPE presence and size from the unadjusted capabilities.
     let p = ppe_size(own.ppe.first().copied().unwrap_or(0), &own.phy);
@@ -213,8 +281,17 @@ pub fn parse_he_cap(d: &[u8]) -> Option<StaHeCap> {
         return None;
     }
     let mut mcs = [HE_MCS_NOT_SUPPORTED * 0x5555; 6];
-    for (i, m) in mcs.iter_mut().enumerate().take(n / 2) {
-        *m = u16::from_le_bytes([d[17 + 2 * i], d[18 + 2 * i]]);
+    let mut pos = 17;
+    for &(rx, tx, required_bit) in &[
+        (0usize, 1usize, 0u8),
+        (2, 3, cap::PHY0_160MHZ_IN_5G),
+        (4, 5, cap::PHY0_80PLUS80_MHZ_IN_5G),
+    ] {
+        if required_bit == 0 || phy[0] & required_bit != 0 {
+            mcs[rx] = u16::from_le_bytes([d[pos], d[pos + 1]]);
+            mcs[tx] = u16::from_le_bytes([d[pos + 2], d[pos + 3]]);
+            pos += 4;
+        }
     }
     Some(StaHeCap {
         has_he: true,
@@ -225,21 +302,68 @@ pub fn parse_he_cap(d: &[u8]) -> Option<StaHeCap> {
     })
 }
 
-/// The HE Operation element's fixed fields (`struct ieee80211_he_operation`).
+/// `struct ieee80211_he_6ghz_oper`, the optional tail of HE Operation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct He6GhzOper {
+    pub primary: u8,
+    /// Channel-width bits 0..1, duplicate-beacon bit 2, regulatory-info
+    /// bits 3..6.
+    pub control: u8,
+    pub ccfs0: u8,
+    pub ccfs1: u8,
+    pub minrate: u8,
+}
+
+impl He6GhzOper {
+    pub const WIDTH_MASK: u8 = 0x03;
+    pub const WIDTH_20: u8 = 0;
+    pub const WIDTH_40: u8 = 1;
+    pub const WIDTH_80: u8 = 2;
+    pub const WIDTH_160: u8 = 3;
+}
+
+/// The HE Operation element's fixed fields (`struct ieee80211_he_operation`)
+/// plus its validated optional six-GHz operation field.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HeOper {
     /// `he_oper_params` (params + BSS Color Information in the top byte).
     pub params: u32,
     /// Basic HE-MCS And NSS Set.
     pub mcs_nss_set: u16,
+    pub six_ghz: Option<He6GhzOper>,
 }
 
 impl HeOper {
-    /// `ieee80211_he_oper_size_ok` for the fixed part.
+    /// `ieee80211_he_oper_size_ok`, including optional fields that precede
+    /// `ieee80211_he_6ghz_oper`.
     pub fn parse(d: &[u8]) -> Option<Self> {
-        (d.len() >= 6).then(|| HeOper {
-            params: u32::from_le_bytes([d[0], d[1], d[2], d[3]]),
+        if d.len() < 6 {
+            return None;
+        }
+        let params = u32::from_le_bytes([d[0], d[1], d[2], d[3]]);
+        let mut pos = 6;
+        if params & oper::VHT_OPER_INFO != 0 {
+            pos += 3;
+        }
+        if params & oper::CO_HOSTED_BSS != 0 {
+            pos += 1;
+        }
+        let six_ghz = if params & oper::SIX_GHZ_OP_INFO != 0 {
+            let d = d.get(pos..pos + 5)?;
+            Some(He6GhzOper {
+                primary: d[0],
+                control: d[1],
+                ccfs0: d[2],
+                ccfs1: d[3],
+                minrate: d[4],
+            })
+        } else {
+            None
+        };
+        Some(HeOper {
+            params,
             mcs_nss_set: u16::from_le_bytes([d[4], d[5]]),
+            six_ghz,
         })
     }
     /// `IEEE80211_HE_OPERATION_BSS_COLOR_MASK` / `_DISABLED`.
@@ -334,8 +458,8 @@ fn mcs_intersection(own_rx: u16, peer_rx: &mut u16, own_tx: u16, peer_tx: &mut u
 }
 
 /// `ieee80211_he_cap_ie_to_sta_he_cap`: the AP's HE capabilities with
-/// the MCS maps intersected with ours (160 / 80+80 disabled when we
-/// lack them).
+/// the MCS maps intersected with ours (160 / 80+80 disabled individually
+/// when we lack them).
 pub fn sta_he_cap(own: &StaHeCap, ap: &StaHeCap) -> StaHeCap {
     let mut h = ap.clone();
     let (a, b) = h.mcs.split_at_mut(1);

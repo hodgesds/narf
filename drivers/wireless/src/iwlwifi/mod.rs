@@ -348,8 +348,21 @@ impl WirelessNetIface for IwlDevice {
 
         // 1. Build and send SCAN_REQ_UMAC command.
         // Map narf_wireless::ScanRequest to iwlwifi::mlme::ScanRequest.
+        let requested = if req.frequencies_mhz.is_empty() {
+            req.channels
+        } else {
+            req.frequencies_mhz
+                .into_iter()
+                .map(|freq| match freq {
+                    2484 => Ok(14),
+                    2412..=2472 if (freq - 2407) % 5 == 0 => Ok((freq - 2407) / 5),
+                    5180..=5905 if (freq - 5000) % 5 == 0 => Ok((freq - 5000) / 5),
+                    _ => Err(WirelessError::NotSupported),
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
         let mut channels = Vec::new();
-        for ch in req.channels {
+        for ch in requested {
             channels.push(mlme::ScanChannel {
                 channel_num: ch as u8,
                 flags: mlme::scan_channel_flags::ACTIVE,
@@ -579,6 +592,11 @@ impl rx::RxHandler for IwlRxHandler {
                             list.push(narf_wireless::BssInfo {
                                 bssid: bss.bssid,
                                 ssid: bss.ssid,
+                                frequency_mhz: match bss.channel.unwrap_or(1) as u32 {
+                                    14 => 2484,
+                                    1..=13 => 2407 + 5 * u32::from(bss.channel.unwrap_or(1)),
+                                    ch => 5000 + 5 * ch,
+                                },
                                 channel: bss.channel.unwrap_or(1) as u32,
                                 rssi: bss.rssi_dbm,
                                 security: if bss.rsn_ie_body.is_some() {

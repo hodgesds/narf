@@ -918,9 +918,10 @@ fn smoke_ath11k_wmi_put_channel_center_freqs() -> TestResult {
     c.allow_ibss = true;
     c.chan_radar = true;
     c.freq2_radar = true;
+    c.chan_change_cause_csa = true;
     let b = put_wmi_channel(&c);
     ensure!(
-        b[16..20] == le(&[10 | 0x80 | 0x100 | 0x400 | 0x1_0000])[..],
+        b[16..20] == le(&[10 | 0x80 | 0x100 | 0x400 | 0x2_000 | 0x1_0000])[..],
         "info flag bits"
     );
     TestResult::Pass
@@ -929,6 +930,180 @@ kernel_test_in!(
     "drivers/wireless/ath11k",
     smoke_ath11k_wmi_put_channel_center_freqs
 );
+
+/// GTK WoW rekey offload has a fixed 52-byte command.  Linux
+/// `ath11k_wmi_gtk_rekey_offload` keeps the key bytes unchanged on a
+/// little-endian host and writes the host-order replay counter little-endian;
+/// the status event reports that counter back as `(word1 << 32) | word0`.
+fn smoke_ath11k_wmi_gtk_rekey_offload_golden() -> TestResult {
+    let p = GtkRekeyOffloadParams {
+        vdev_id: 7,
+        kek: [0x11; 16],
+        kck: [0x22; 16],
+        replay_counter: 0x0102_0304_0506_0708,
+    };
+    let c = gtk_rekey_offload_cmd(7, gtk_offload_opcode::ENABLE, Some(&p));
+    ensure!(c.cmd_id == 0x19001, "GTK offload command id");
+    ensure!(c.buf.len() == 52, "GTK offload command size");
+    ensure!(
+        c.buf[..12] == le(&[0x005b_0030, 7, 0x0100_0000])[..],
+        "GTK command header/vdev/opcode"
+    );
+    ensure!(c.buf[12..28] == p.kek, "GTK KEK bytes");
+    ensure!(c.buf[28..44] == p.kck, "GTK KCK bytes");
+    ensure!(
+        c.buf[44..52] == [8, 7, 6, 5, 4, 3, 2, 1],
+        "GTK replay counter is little-endian for WMI"
+    );
+
+    let status = gtk_rekey_offload_cmd(7, gtk_offload_opcode::REQUEST_STATUS, None);
+    ensure!(
+        status.buf[..12] == le(&[0x005b_0030, 7, 0x0400_0000])[..]
+            && status.buf[12..].iter().all(|v| *v == 0),
+        "GTK status request has a zeroed key payload"
+    );
+
+    let mut body = vec![0u8; WMI_GTK_OFFLOAD_STATUS_EVENT_PREFIX_SIZE];
+    body[..20].copy_from_slice(&le(&[7, 0, 3, 0x0506_0708, 0x0102_0304]));
+    let e = decode_gtk_offload_status(&tlv(WMI_TAG_GTK_OFFLOAD_STATUS_EVENT, &body));
+    match e {
+        Ok(s)
+            if s.vdev_id == 7
+                && s.refresh_count == 3
+                && s.replay_counter_be() == [1, 2, 3, 4, 5, 6, 7, 8] => {}
+        _ => return TestResult::Fail("GTK status replay counter decode"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_wmi_gtk_rekey_offload_golden
+);
+
+/// WoWLAN's control commands are fixed ABI structs except the bitmap
+/// pattern, whose full 148-byte pattern/mask arrays Linux always sends.
+/// These vectors are derived from `ath11k_wmi_wow_*`,
+/// `ath11k_wmi_hw_data_filter_cmd`, and `ath11k_wmi_sta_keepalive`.
+fn smoke_ath11k_wmi_wow_golden() -> TestResult {
+    let enable = wow_enable_cmd();
+    ensure!(
+        enable.cmd_id == 0x13004 && enable.buf == le(&[0x0077_000c, 1, 0, 0]),
+        "WoW enable command"
+    );
+    let wake = wow_wakeup_event_cmd(2, wow_event::DEAUTH, true);
+    ensure!(
+        wake == Ok(WmiCmd {
+            cmd_id: 0x13003,
+            buf: le(&[0x0089_000c, 2, 1, 1 << 2]),
+        }),
+        "WoW wake event command"
+    );
+    ensure!(
+        wow_wakeup_event_cmd(0, wow_event::MAX, true).is_err(),
+        "out-of-range WoW wake event"
+    );
+    let filter = hw_data_filter_cmd(
+        2,
+        hw_data_filter::DROP_NON_ARP_BROADCAST | hw_data_filter::DROP_NON_ICMPV6_MULTICAST,
+        false,
+    );
+    ensure!(
+        filter.cmd_id == 0x3b001 && filter.buf == le(&[0x026c_000c, 2, 0, u32::MAX]),
+        "WoW data-filter disable programs all modes"
+    );
+    let keepalive = sta_keepalive_cmd(&StaKeepaliveParams {
+        vdev_id: 2,
+        enabled: true,
+        method: sta_keepalive_method::NULL_FRAME,
+        interval_secs: WMI_STA_KEEPALIVE_INTERVAL_DEFAULT,
+        src_ipv4: 0,
+        dst_ipv4: 0,
+        dest_mac: [0; 6],
+    });
+    ensure!(
+        keepalive.cmd_id == 0x1c005
+            && keepalive.buf == le(&[0x007f_0010, 2, 1, 1, 30, 0x0080_0010, 0, 0, 0, 0]),
+        "WoW null-frame keepalive command"
+    );
+    let pattern = wow_add_pattern_cmd(2, 3, &[0xaa, 0xbb], &[0xff, 0x00], 7);
+    let Ok(pattern) = pattern else {
+        return TestResult::Fail("WoW bitmap pattern rejected");
+    };
+    ensure!(
+        pattern.cmd_id == 0x13001 && pattern.buf.len() == 360,
+        "WoW pattern size"
+    );
+    ensure!(
+        pattern.buf[..24] == le(&[0x00b3_000c, 2, 3, 0, 0x0012_013c, 0x00b4_0138])[..],
+        "WoW pattern fixed headers"
+    );
+    ensure!(
+        pattern.buf[24..26] == [0xaa, 0xbb]
+            && pattern.buf[172..174] == [0xff, 0x00]
+            && pattern.buf[320..336] == le(&[7, 2, 2, 3])[..],
+        "WoW pattern placement"
+    );
+    ensure!(
+        pattern.buf[336..360]
+            == le(&[
+                0x0012_0000,
+                0x0012_0000,
+                0x0012_0000,
+                0x0010_0000,
+                0x0010_0004,
+                0
+            ])[..],
+        "WoW pattern optional arrays"
+    );
+    ensure!(
+        wow_add_pattern_cmd(0, 0, &[], &[], 0).is_err()
+            && wow_add_pattern_cmd(0, 0, &[1], &[1, 2], 0).is_err(),
+        "WoW bitmap pattern bounds"
+    );
+    let arp_ns = ArpNsOffload {
+        ipv4: vec![[192, 0, 2, 7]],
+        ipv6: vec![
+            [0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7],
+            [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8],
+            [0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9],
+        ],
+        mac_addr: [0, 3, 0x7f, 1, 2, 3],
+    };
+    let arp_ns_cmd = arp_ns_offload_cmd(2, &arp_ns, true);
+    let Ok(arp_ns_cmd) = arp_ns_cmd else {
+        return TestResult::Fail("ARP/NS offload rejected a valid snapshot");
+    };
+    ensure!(
+        arp_ns_cmd.cmd_id == 0x17001
+            && arp_ns_cmd.buf.len() == 316
+            && arp_ns_cmd.buf[..20] == le(&[0x007b_000c, 0, 2, 1, 0x0012_00a0])[..],
+        "ARP/NS offload fixed header"
+    );
+    ensure!(
+        arp_ns_cmd.buf[20..28] == le(&[0x007d_004c, 3])[..]
+            && arp_ns_cmd.buf[28..44] == arp_ns.ipv6[0]
+            && arp_ns_cmd.buf[60..76] == [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff, 0, 0, 7]
+            && arp_ns_cmd.buf[92..100] == [0, 3, 0x7f, 1, 2, 3, 0, 0],
+        "ARP/NS offload first NS tuple"
+    );
+    ensure!(
+        arp_ns_cmd.buf[180..196] == le(&[0x0012_0030, 0x007c_0014, 1, 0x0702_00c0])[..]
+            && arp_ns_cmd.buf[232..244] == le(&[0x0012_0050, 0x007d_004c, 3])[..],
+        "ARP/NS offload ARP and extended NS arrays"
+    );
+    let wake = decode_wow_wakeup(&le(&[0x0031_0010, 2, 0, 10, 0]));
+    ensure!(
+        wake == Ok(WowWakeup {
+            vdev_id: 2,
+            flags: 0,
+            reason: 10,
+            data_len: 0,
+        }),
+        "WoW host wakeup decoder"
+    );
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_wmi_wow_golden);
 
 fn smoke_ath11k_wmi_vdev_up_golden() -> TestResult {
     let bssid = [0x00, 0x03, 0x7f, 0x01, 0x02, 0x03];

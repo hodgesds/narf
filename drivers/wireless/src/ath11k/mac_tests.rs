@@ -27,7 +27,10 @@ use core::task::{Context, Poll, Waker};
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_wireless::eapol::{self, HmacPrimitive, KeyFrame};
-use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig};
+use narf_wireless::{
+    AssociateRequest, ControlPort, ExternalSecurity, MlmeAssocRequest, MlmeAuthRequest,
+    ScanRequest, SecurityConfig,
+};
 
 use super::mac::{self, *};
 use super::mac_frame::{self as frame, Band};
@@ -222,9 +225,13 @@ pub(super) struct FwCfg {
     pub(super) install_key_status: Option<u32>,
     pub(super) peer_map: bool,
     pub(super) mgmt_ack: bool,
+    /// Whether the AP ACKs mac80211 connection-monitor Null frames.
+    pub(super) nullfunc_ack: bool,
     /// `None` → the AP never answers.
     pub(super) auth_status: Option<u16>,
     pub(super) assoc_status: Option<u16>,
+    /// A Reassociation Response status, or the regular association status.
+    pub(super) reassoc_status: Option<u16>,
     /// Frames (`(channel, snr, frame)`) delivered as MGMT_RX between
     /// STARTED and COMPLETED.
     pub(super) beacons: Vec<(u32, u32, Vec<u8>)>,
@@ -273,8 +280,10 @@ impl Default for FwCfg {
             install_key_status: Some(0),
             peer_map: true,
             mgmt_ack: true,
+            nullfunc_ack: true,
             auth_status: Some(0),
             assoc_status: Some(0),
+            reassoc_status: None,
             beacons: Vec::new(),
             eapol: false,
             send_m1: true,
@@ -463,7 +472,7 @@ impl World {
                 self.events
                     .push_back(scan_ev(scan_event::COMPLETED, scan_reason::CANCELLED, vdev));
             }
-            WMI_VDEV_START_REQUEST_CMDID => {
+            WMI_VDEV_START_REQUEST_CMDID | WMI_VDEV_RESTART_REQUEST_CMDID => {
                 if let Some(st) = cfg.vdev_start_status {
                     self.events.push_back(event(
                         WMI_VDEV_START_RESP_EVENTID,
@@ -545,27 +554,38 @@ impl World {
             )],
         ));
         let fc = u16::from_le_bytes([f[0], f[1]]);
+        let bssid: [u8; 6] = f[4..10].try_into().unwrap();
         match fc & 0xFC {
             frame::stype::AUTH if f.len() >= 30 && f[24] == 3 && cfg.sae.is_some() => {
                 self.on_sae(f, cfg.sae.clone().unwrap());
             }
             frame::stype::AUTH => {
                 if let Some(st) = cfg.auth_status {
-                    let mut r = frame::mgmt_hdr(frame::stype::AUTH, &OWN, &BSSID, &BSSID);
+                    let mut r = frame::mgmt_hdr(frame::stype::AUTH, &OWN, &bssid, &bssid);
                     r.extend_from_slice(&[0, 0, 2, 0]);
                     r.extend_from_slice(&st.to_le_bytes());
                     self.events.push_back(mgmt_rx_event(6, 60, 2437, 0, &r));
                 }
             }
-            frame::stype::ASSOC_REQ => {
-                if let Some(st) = cfg.assoc_status {
-                    let mut r = assoc_resp(st);
+            frame::stype::ASSOC_REQ | frame::stype::REASSOC_REQ => {
+                let reassoc = fc & 0xFC == frame::stype::REASSOC_REQ;
+                let status = if reassoc {
+                    cfg.reassoc_status.or(cfg.assoc_status)
+                } else {
+                    cfg.assoc_status
+                };
+                if let Some(st) = status {
+                    let mut r = assoc_resp_for(st, &bssid);
+                    if reassoc {
+                        r[0] = frame::stype::REASSOC_RESP as u8;
+                    }
                     r.extend_from_slice(&cfg.assoc_extra);
                     self.events.push_back(mgmt_rx_event(6, 60, 2437, 0, &r));
                     if st == 0 && cfg.eapol && cfg.send_m1 {
                         // hostapd picks the descriptor version of the AKM
                         // in the station's RSNE.
-                        let km = frame::find_elem(&f[28..], frame::eid::RSN)
+                        let fixed = if reassoc { 34 } else { 28 };
+                        let km = frame::find_elem(&f[fixed..], frame::eid::RSN)
                             .filter(|r| r.len() >= 18)
                             .and_then(|r| eapol::KeyMgmt::from_suite_type(r[17]))
                             .unwrap_or(eapol::KeyMgmt::Psk);
@@ -755,7 +775,12 @@ impl WmiPort for FakeWmi {
         }
         core::future::ready(e)
     }
-    fn mgmt_tx(&self, _vdev_id: u32, f: &[u8]) -> impl Future<Output = Result<u32, i32>> + Send {
+    fn mgmt_tx(
+        &self,
+        _vdev_id: u32,
+        f: &[u8],
+        _chanfreq: Option<u32>,
+    ) -> impl Future<Output = Result<u32, i32>> + Send {
         let d = self.0.lock().on_mgmt(f);
         core::future::ready(Ok(d))
     }
@@ -785,8 +810,37 @@ impl DataPort for FakeDp {
             .push(if enable { "mon_on" } else { "mon_off" });
         core::future::ready(Ok(()))
     }
-    fn vdev_tx_attach(&self, _vdev_id: u32, _addr: [u8; 6]) {
+    fn vdev_tx_attach(&self, _vdev_id: u32, _addr: [u8; 6], _ap: bool) {
         self.0.lock().dp_calls.push("vdev_tx_attach");
+    }
+    fn ap_started(&self, _vdev_id: u32, _bssid: [u8; 6], _privacy: bool) {
+        self.0.lock().dp_calls.push("ap_started");
+    }
+    fn ap_stopped(&self, _vdev_id: u32) {
+        self.0.lock().dp_calls.push("ap_stopped");
+    }
+    fn ap_channel_switching(&self, _vdev_id: u32, blocked: bool) {
+        self.0.lock().dp_calls.push(if blocked {
+            "ap_csa_block"
+        } else {
+            "ap_csa_unblock"
+        });
+    }
+    fn ap_dfs_cac(&self, _vdev_id: u32, running: bool) {
+        self.0.lock().dp_calls.push(if running {
+            "ap_cac_start"
+        } else {
+            "ap_cac_stop"
+        });
+    }
+    fn ap_station_added(&self, _vdev_id: u32, _addr: [u8; 6], _wme: bool) {
+        self.0.lock().dp_calls.push("ap_station_add");
+    }
+    fn ap_station_removed(&self, _vdev_id: u32, _addr: [u8; 6]) {
+        self.0.lock().dp_calls.push("ap_station_del");
+    }
+    fn ap_group_key(&self, _vdev_id: u32, _installed: bool) {
+        self.0.lock().dp_calls.push("ap_gtk");
     }
     fn wait_peer_mapped(
         &self,
@@ -820,6 +874,8 @@ impl DataPort for FakeDp {
         _vdev_id: u32,
         _addr: [u8; 6],
         cipher: u32,
+        _key_len: usize,
+        _key_idx: u8,
         pairwise: bool,
         install: bool,
     ) -> impl Future<Output = Result<(), i32>> + Send {
@@ -829,6 +885,19 @@ impl DataPort for FakeDp {
     fn send_eth(&self, f: &[u8]) -> impl Future<Output = Result<(), i32>> + Send {
         self.0.lock().on_eth(f);
         core::future::ready(Ok(()))
+    }
+    fn probe_ap(
+        &self,
+        _timeout_ms: u32,
+    ) -> impl Future<Output = Result<super::txq::TxStatus, i32>> + Send {
+        let mut w = self.0.lock();
+        w.dp_calls.push("nullfunc");
+        let acked = w.cfg().nullfunc_ack;
+        core::future::ready(Ok(super::txq::TxStatus {
+            acked,
+            dropped: false,
+            ack_signal: acked.then_some(-50),
+        }))
     }
     fn recv_eapol(&self, timeout_ms: u32) -> impl Future<Output = Option<(Vec<u8>, bool)>> + Send {
         let mut w = self.0.lock();
@@ -1043,7 +1112,11 @@ fn probe_resp(da: &[u8; 6], bssid: &[u8; 6], ssid: &[u8]) -> Vec<u8> {
 /// Association Response: capab 0x0431, status, AID 1 (|0xc000),
 /// rates, HT cap / op, WMM param.
 fn assoc_resp(status: u16) -> Vec<u8> {
-    let mut f = frame::mgmt_hdr(frame::stype::ASSOC_RESP, &OWN, &BSSID, &BSSID);
+    assoc_resp_for(status, &BSSID)
+}
+
+fn assoc_resp_for(status: u16, bssid: &[u8; 6]) -> Vec<u8> {
+    let mut f = frame::mgmt_hdr(frame::stype::ASSOC_RESP, &OWN, bssid, bssid);
     f.extend_from_slice(&0x0431u16.to_le_bytes());
     f.extend_from_slice(&status.to_le_bytes());
     f.extend_from_slice(&0xC001u16.to_le_bytes());
@@ -1253,7 +1326,12 @@ impl WmiPort for Failing {
         self.0.lock().now += t as u64;
         core::future::ready(None)
     }
-    fn mgmt_tx(&self, _: u32, _: &[u8]) -> impl Future<Output = Result<u32, i32>> + Send {
+    fn mgmt_tx(
+        &self,
+        _: u32,
+        _: &[u8],
+        _: Option<u32>,
+    ) -> impl Future<Output = Result<u32, i32>> + Send {
         core::future::ready(Err(5))
     }
     fn mgmt_tx_done(&self, _: u32) {}
@@ -1813,8 +1891,14 @@ fn smoke_ath11k_mac_scan_collects() -> TestResult {
         let (mut m, w) = started_mac(default_caps(), Some(&reg), cfg);
         let res = block(m.scan(&ScanRequest {
             ssids: Vec::new(),
+            frequencies_mhz: Vec::new(),
             channels: Vec::new(),
             active: false,
+            random_mac: None,
+            colocated_6ghz: false,
+            duration_tu: None,
+            duration_mandatory: false,
+            extra_ies: Vec::new(),
         }));
         let Ok(res) = res else {
             return Err("scan failed");
@@ -1855,8 +1939,14 @@ fn smoke_ath11k_mac_scan_collects() -> TestResult {
         // A second, active scan for SSID: probe IEs, MEDIUM no longer.
         let res2 = block(m.scan(&ScanRequest {
             ssids: vec![SSID.to_vec()],
+            frequencies_mhz: Vec::new(),
             channels: vec![6],
             active: true,
+            random_mac: None,
+            colocated_6ghz: false,
+            duration_tu: None,
+            duration_mandatory: false,
+            extra_ies: Vec::new(),
         }));
         ensure!(res2.is_ok(), "active scan");
         let sent = take_sent(&w);
@@ -1881,8 +1971,14 @@ fn smoke_ath11k_mac_scan_collects() -> TestResult {
         ensure!(
             block(m.scan(&ScanRequest {
                 ssids: vec![],
+                frequencies_mhz: Vec::new(),
                 channels: vec![12],
-                active: false
+                active: false,
+                random_mac: None,
+                colocated_6ghz: false,
+                duration_tu: None,
+                duration_mandatory: false,
+                extra_ies: Vec::new(),
             }))
             .err()
                 == Some(narf_wireless::WirelessError::InvalidArgs),
@@ -1891,8 +1987,14 @@ fn smoke_ath11k_mac_scan_collects() -> TestResult {
         ensure!(
             block(m.scan(&ScanRequest {
                 ssids: vec![vec![0; 33]],
+                frequencies_mhz: Vec::new(),
                 channels: vec![],
-                active: true
+                active: true,
+                random_mac: None,
+                colocated_6ghz: false,
+                duration_tu: None,
+                duration_mandatory: false,
+                extra_ies: Vec::new(),
             }))
             .err()
                 == Some(narf_wireless::WirelessError::InvalidArgs),
@@ -1930,7 +2032,7 @@ fn smoke_ath11k_mac_scan_rx_filtering() -> TestResult {
                 rx_status::ERR_CRC,
                 &beacon(&BSSID2, b"crc", 6, false),
             ));
-            m.hw_scan(&[], &[2437]).await
+            m.hw_scan(&[], &[2437], None, false).await
         });
         ensure!(
             r.as_ref().map_or(0, |v| v.len()) == 1,
@@ -1961,7 +2063,7 @@ fn smoke_ath11k_mac_scan_negatives() -> TestResult {
             },
         );
         let t0 = w.lock().now;
-        let (r, err, detail) = latched(|| block(m.hw_scan(&[], &[2412])));
+        let (r, err, detail) = latched(|| block(m.hw_scan(&[], &[2412], None, false)));
         ensure!(
             r.is_err() && err == step::SCAN_START_TIMEOUT && detail == 5000,
             "start timeout latched (5 s)"
@@ -1979,7 +2081,7 @@ fn smoke_ath11k_mac_scan_negatives() -> TestResult {
             c.scan_started = true;
             c.scan_start_failed = true;
         });
-        let (r, err, _) = latched(|| block(m.hw_scan(&[], &[2412])));
+        let (r, err, _) = latched(|| block(m.hw_scan(&[], &[2412], None, false)));
         ensure!(
             r.map_err(|e| e.errno) == Err(22) && err == step::SCAN_START_FAILED,
             "start failed → -EINVAL"
@@ -1992,7 +2094,7 @@ fn smoke_ath11k_mac_scan_negatives() -> TestResult {
         });
         take_sent(&w);
         let t0 = w.lock().now;
-        let (r, err, _) = latched(|| block(m.hw_scan(&[], &[2412])));
+        let (r, err, _) = latched(|| block(m.hw_scan(&[], &[2412], None, false)));
         ensure!(
             r.is_ok() && err == step::SCAN_TIMEOUT,
             "scan timeout latched, results still returned"
@@ -2006,7 +2108,7 @@ fn smoke_ath11k_mac_scan_negatives() -> TestResult {
         ensure!(m.scan_state() == ScanState::Idle, "aborted scan finished");
         // No vdev → refused.
         let (mut m2, _w2) = new_mac(default_caps(), Some(&reg), FwCfg::default());
-        let (r, err, _) = latched(|| block(m2.hw_scan(&[], &[2412])));
+        let (r, err, _) = latched(|| block(m2.hw_scan(&[], &[2412], None, false)));
         ensure!(r.is_err() && err == step::SCAN_BUSY, "no vdev");
         Ok(())
     })
@@ -2074,7 +2176,7 @@ fn smoke_ath11k_mac_auth_assoc_frames() -> TestResult {
             ..Default::default()
         };
         let (mut m, _w) = started_mac(default_caps(), Some(&reg), cfg);
-        block(m.hw_scan(&[], &[2437])).unwrap();
+        block(m.hw_scan(&[], &[2437], None, false)).unwrap();
         let bss = m.bss_table()[0].clone();
         let ies = bss.parsed();
         // The link's channel (HT40+, centre 2447) decides the HT width.
@@ -2093,7 +2195,8 @@ fn smoke_ath11k_mac_auth_assoc_frames() -> TestResult {
                 freq: 2437,
                 band: Band::Ghz2,
                 width: Width::W40,
-                center_freq1: 2447
+                center_freq1: 2447,
+                center_freq2: 0,
             },
             "HT40+ at 2447"
         );
@@ -2115,6 +2218,143 @@ kernel_test_in!(
     smoke_ath11k_mac_auth_assoc_frames
 );
 
+/// `NL80211_ATTR_PREV_BSSID` must select a Reassociation Request and accept
+/// the matching Reassociation Response.
+fn smoke_ath11k_mac_userspace_reassociation() -> TestResult {
+    run(|| {
+        let (mut m, w) = scanned_mac(FwCfg::default());
+        let bss = m.bss_table()[0].clone();
+        let ies = bss.parsed();
+        block(m.prep_connection(&bss, &ies, None, Some(ExternalSecurity::default())))
+            .map_err(|_| "prepare reassociation")?;
+
+        let previous = [0x02, 0x10, 0x20, 0x30, 0x40, 0x50];
+        let resp =
+            block(m.associate_exchange_with_prev(&bss, &ies, SSID, None, &[], Some(previous)))
+                .map_err(|_| "reassociation exchange")?;
+        ensure!(
+            frame::parse_assoc_resp(&resp).is_some_and(|a| a.reassoc),
+            "reassociation response accepted"
+        );
+        let sent = w.lock().mgmt.last().cloned().ok_or("reassociation frame")?;
+        ensure!(
+            sent[..2] == frame::stype::REASSOC_REQ.to_le_bytes() && sent[28..34] == previous,
+            "reassociation request subtype and current AP"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_mac_userspace_reassociation
+);
+
+/// cfg80211 retries a rejected Reassociation Request once as a plain
+/// Association Request. Keep that compatibility behavior in the
+/// external-supplicant path too.
+fn smoke_ath11k_mac_userspace_reassociation_fallback() -> TestResult {
+    run(|| {
+        let (mut m, w) = scanned_mac(FwCfg {
+            reassoc_status: Some(1),
+            ..FwCfg::default()
+        });
+        let first = MlmeAuthRequest {
+            peer: BSSID,
+            ssid: SSID.to_vec(),
+            channel: 6,
+            auth_type: 0,
+            auth_data: Vec::new(),
+            ie: Vec::new(),
+        };
+        block(m.sme_authenticate(&first)).map_err(|_| "first authentication")?;
+        block(m.sme_associate(&MlmeAssocRequest {
+            peer: BSSID,
+            ssid: SSID.to_vec(),
+            channel: 6,
+            ie: Vec::new(),
+            prev_bssid: None,
+            use_mfp: false,
+            control_port: ControlPort::default(),
+            privacy: true,
+        }))
+        .map_err(|_| "first association")?;
+
+        let next = MlmeAuthRequest {
+            peer: BSSID2,
+            ssid: b"open".to_vec(),
+            channel: 1,
+            auth_type: 0,
+            auth_data: Vec::new(),
+            ie: Vec::new(),
+        };
+        block(m.sme_authenticate(&next)).map_err(|_| "roam authentication")?;
+        w.lock().mgmt.clear();
+        let resp = block(m.sme_associate(&MlmeAssocRequest {
+            peer: BSSID2,
+            ssid: b"open".to_vec(),
+            channel: 1,
+            ie: Vec::new(),
+            prev_bssid: Some(BSSID),
+            use_mfp: false,
+            control_port: ControlPort::default(),
+            privacy: false,
+        }))
+        .map_err(|_| "reassociation fallback")?;
+        ensure!(
+            frame::parse_assoc_resp(&resp).is_some_and(|a| !a.reassoc && a.status == 0),
+            "plain association response after reassociation refusal"
+        );
+        let mgmt = w.lock().mgmt.clone();
+        ensure!(
+            mgmt.len() == 2
+                && mgmt[0][..2] == frame::stype::REASSOC_REQ.to_le_bytes()
+                && mgmt[1][..2] == frame::stype::ASSOC_REQ.to_le_bytes(),
+            "reassociation then single association fallback"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_mac_userspace_reassociation_fallback
+);
+
+/// A high-level CONNECT roam must use the same Reassociation Request as the
+/// userspace-SME path, so nl80211 can publish ROAM rather than falling back
+/// to an unsupported fresh connect.
+fn smoke_ath11k_mac_kernel_roam() -> TestResult {
+    run(|| {
+        let (mut m, w) = scanned_mac(FwCfg {
+            eapol: true,
+            ..FwCfg::default()
+        });
+        block(m.connect(&wpa2_req())).map_err(|_| "initial WPA2 connection")?;
+        take_sent(&w);
+        w.lock().mgmt.clear();
+        let req = AssociateRequest {
+            bssid: BSSID2,
+            ssid: b"open".to_vec(),
+            frequency_mhz: 2412,
+            channel: 1,
+            security: SecurityConfig::Open,
+            ie: Vec::new(),
+        };
+        block(m.roam(&req)).map_err(|_| "kernel roam")?;
+        let mgmt = w.lock().mgmt.clone();
+        ensure!(
+            m.connected_bssid() == Some(BSSID2)
+                && mgmt.len() == 2
+                && mgmt[0][..2] == frame::stype::AUTH.to_le_bytes()
+                && mgmt[1][..2] == frame::stype::REASSOC_REQ.to_le_bytes()
+                && mgmt[1][4..10] == BSSID2
+                && mgmt[1][28..34] == BSSID,
+            "roam authentication then reassociation with previous BSSID"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_mac_kernel_roam);
+
 fn smoke_ath11k_mac_frame_parsers() -> TestResult {
     run(|| {
         // Element walk stops at a truncated element.
@@ -2127,6 +2367,40 @@ fn smoke_ath11k_mac_frame_parsers() -> TestResult {
         ensure!(
             p.ht_cap.is_none() && p.ht_oper.is_none(),
             "short HT elements"
+        );
+        // A temporary Association rejection only becomes a comeback when it
+        // carries the complete Timeout Interval element with type 3.
+        let mut comeback = assoc_resp(frame::WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY);
+        comeback.extend_from_slice(&[
+            frame::eid::TIMEOUT_INTERVAL,
+            5,
+            frame::WLAN_TIMEOUT_ASSOC_COMEBACK,
+            0x64,
+            0,
+            0,
+            0,
+        ]);
+        ensure!(
+            frame::assoc_comeback_tu(&comeback) == Some(100),
+            "temporary association comeback Timeout Interval"
+        );
+        comeback[26..28].copy_from_slice(&0u16.to_le_bytes());
+        ensure!(
+            frame::assoc_comeback_tu(&comeback).is_none(),
+            "success response is never a comeback"
+        );
+        let mut malformed = assoc_resp(frame::WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY);
+        malformed.extend_from_slice(&[
+            frame::eid::TIMEOUT_INTERVAL,
+            4,
+            frame::WLAN_TIMEOUT_ASSOC_COMEBACK,
+            1,
+            0,
+            0,
+        ]);
+        ensure!(
+            frame::assoc_comeback_tu(&malformed).is_none(),
+            "truncated comeback interval ignored"
         );
         // DS params must be exactly 1 byte.
         let p = frame::ParsedIes::parse(&[0x03, 2, 6, 0]);
@@ -2338,6 +2612,7 @@ fn smoke_ath11k_mac_peer_assoc_prepare() -> TestResult {
             band: Band::Ghz2,
             width: Width::W40,
             center_freq1: 2447,
+            center_freq2: 0,
         };
         let mut sta = peer::ApSta {
             addr: BSSID,
@@ -2365,6 +2640,7 @@ fn smoke_ath11k_mac_peer_assoc_prepare() -> TestResult {
             aid: 1,
             assoc_capability: 0x0431,
             listen_interval: 5,
+            nss_ratio_info: 2,
             def,
             sta: &sta,
             rsn: true,
@@ -2400,6 +2676,7 @@ fn smoke_ath11k_mac_peer_assoc_prepare() -> TestResult {
                 aid: 2,
                 assoc_capability: 1,
                 listen_interval: 5,
+                nss_ratio_info: 2,
                 def,
                 sta: &b,
                 rsn: false,
@@ -2426,6 +2703,7 @@ fn smoke_ath11k_mac_peer_assoc_prepare() -> TestResult {
                 aid: 1,
                 assoc_capability: 1,
                 listen_interval: 5,
+                nss_ratio_info: 2,
                 def,
                 sta: &z,
                 rsn: false,
@@ -2444,7 +2722,7 @@ kernel_test_in!(
     smoke_ath11k_mac_peer_assoc_prepare
 );
 
-fn smoke_ath11k_mac_vht80_chandef() -> TestResult {
+fn smoke_ath11k_mac_wide_chandef() -> TestResult {
     run(|| {
         let reg = us_reg(false);
         let (m, _) = new_mac(default_caps(), Some(&reg), FwCfg::default());
@@ -2478,13 +2756,93 @@ fn smoke_ath11k_mac_vht80_chandef() -> TestResult {
                 freq: 5180,
                 band: Band::Ghz5,
                 width: Width::W80,
-                center_freq1: 5210
+                center_freq1: 5210,
+                center_freq2: 0,
             },
             "VHT80 centre 5210"
         );
         ensure!(
             peer::vdev_phymode(&def) == phy_mode::MODE_11AX_HE80,
             "ath11k_phymodes[5G][80] = HE80"
+        );
+        // VHT Operation 160 MHz: segment 0 is the contiguous 160 MHz
+        // centre (channel 50 = 5250 MHz), so primary channel 36 is in its
+        // lower 80 MHz segment. Both local and AP VHT capabilities must
+        // allow a >80 MHz channel.
+        let mut vc160 = vc;
+        vc160.vht_cap_info |= peer::vht::SUPP_CHAN_WIDTH_160MHZ;
+        let vo160 = frame::VhtOperIe {
+            chan_width: 2,
+            center_freq_seg0_idx: 50,
+            ..Default::default()
+        };
+        let (_, d160) = peer::determine_chan(
+            m.wiphy(),
+            own,
+            5180,
+            Some(&htc),
+            Some(&hto),
+            Some(&vc160),
+            Some(&vo160),
+        );
+        ensure!(
+            d160 == ChanDef {
+                freq: 5180,
+                band: Band::Ghz5,
+                width: Width::W160,
+                center_freq1: 5250,
+                center_freq2: 0,
+            } && peer::vdev_phymode(&d160) == phy_mode::MODE_11AX_HE160,
+            "VHT160 centre and ath11k HE160 vdev mode"
+        );
+        let vcap160 = peer::assoc_vht_cap(own.vht(Band::Ghz5).unwrap(), &vc160, Width::W160);
+        ensure!(
+            vcap160.vht_cap_info & peer::vht::SUPP_CHAN_WIDTH_MASK != 0
+                && vcap160.vht_cap_info & peer::vht::SHORT_GI_160 != 0,
+            "association VHT capability retains 160 MHz"
+        );
+        // VHT Operation 80+80: segment zero is the primary 80 MHz block;
+        // segment one names the distinct second block. Both peers must carry
+        // the 80+80 capability bit (not merely contiguous-160 support).
+        let mut own80p80 = *own;
+        own80p80.vht_5g.cap &= !peer::vht::SUPP_CHAN_WIDTH_MASK;
+        own80p80.vht_5g.cap |= peer::vht::SUPP_CHAN_WIDTH_160_80PLUS80MHZ;
+        let mut vc80p80 = vc;
+        vc80p80.vht_cap_info &= !peer::vht::SUPP_CHAN_WIDTH_MASK;
+        vc80p80.vht_cap_info |= peer::vht::SUPP_CHAN_WIDTH_160_80PLUS80MHZ;
+        let vo80p80 = frame::VhtOperIe {
+            chan_width: 3,
+            center_freq_seg0_idx: 42,
+            center_freq_seg1_idx: 106,
+            ..Default::default()
+        };
+        let (_, d80p80) = peer::determine_chan(
+            m.wiphy(),
+            &own80p80,
+            5180,
+            Some(&htc),
+            Some(&hto),
+            Some(&vc80p80),
+            Some(&vo80p80),
+        );
+        ensure!(
+            d80p80
+                == ChanDef {
+                    freq: 5180,
+                    band: Band::Ghz5,
+                    width: Width::W80P80,
+                    center_freq1: 5210,
+                    center_freq2: 5530,
+                }
+                && peer::vdev_phymode(&d80p80) == phy_mode::MODE_11AX_HE80_80,
+            "VHT80+80 centres and ath11k HE80_80 vdev mode"
+        );
+        let vcap80p80 =
+            peer::assoc_vht_cap(own80p80.vht(Band::Ghz5).unwrap(), &vc80p80, Width::W80P80);
+        ensure!(
+            vcap80p80.vht_cap_info & peer::vht::SUPP_CHAN_WIDTH_MASK
+                == peer::vht::SUPP_CHAN_WIDTH_160_80PLUS80MHZ,
+            "association VHT capability retains 80+80, not contiguous 160"
         );
         // ch 165 can't do 80 MHz (ch 169-177 off) → HT40 ABOVE also off → 20.
         let hto165 = frame::HtOperIe::parse(&ap_ht_oper(165, 0x05)[2..]).unwrap();
@@ -2535,6 +2893,7 @@ fn smoke_ath11k_mac_vht80_chandef() -> TestResult {
             aid: 3,
             assoc_capability: 0x0011,
             listen_interval: 5,
+            nss_ratio_info: 2,
             def,
             sta: &sta,
             rsn: true,
@@ -2552,6 +2911,186 @@ fn smoke_ath11k_mac_vht80_chandef() -> TestResult {
             p.peer_nss == 2 && p.peer_legacy_rates.is_empty(),
             "nss 2, no legacy rates listed"
         );
+        // `ath11k_peer_assoc_h_vht`: after it has intersected the VHT
+        // RX-MCS map, WMI must receive both BW_160 and the NSS override.
+        let mut sta160 = sta;
+        sta160.vht_cap = peer::sta_vht_cap(
+            own.vht(Band::Ghz5).unwrap(),
+            &sta160.ht_cap,
+            Some(&vc160),
+            true,
+        );
+        sta160.bandwidth = Some(peer::sta_bandwidth(&sta160.ht_cap, &sta160.vht_cap, &d160));
+        sta160.rx_nss = peer::sta_rx_nss(&sta160.ht_cap, &sta160.vht_cap);
+        let p160 = peer::peer_assoc_prepare(&peer::PeerAssocInput {
+            vdev_id: 0,
+            he: None,
+            aid: 3,
+            assoc_capability: 0x0011,
+            listen_interval: 5,
+            nss_ratio_info: 2,
+            def: d160,
+            sta: &sta160,
+            rsn: true,
+            wpa: false,
+        });
+        ensure!(
+            p160.peer_phymode == phy_mode::MODE_11AC_VHT160
+                && p160.bw_160
+                && p160.peer_nss == 2
+                && p160.peer_bw_rxnss_override == 0x8000_0001,
+            "VHT160 peer flags and negotiated two-stream NSS override"
+        );
+        let mut sta80p80 = sta;
+        sta80p80.vht_cap = peer::sta_vht_cap(
+            own80p80.vht(Band::Ghz5).unwrap(),
+            &sta80p80.ht_cap,
+            Some(&vc80p80),
+            true,
+        );
+        sta80p80.bandwidth = Some(peer::sta_bandwidth(
+            &sta80p80.ht_cap,
+            &sta80p80.vht_cap,
+            &d80p80,
+        ));
+        sta80p80.rx_nss = peer::sta_rx_nss(&sta80p80.ht_cap, &sta80p80.vht_cap);
+        let p80p80 = peer::peer_assoc_prepare(&peer::PeerAssocInput {
+            vdev_id: 0,
+            he: None,
+            aid: 3,
+            assoc_capability: 0x0011,
+            listen_interval: 5,
+            nss_ratio_info: 2,
+            def: d80p80,
+            sta: &sta80p80,
+            rsn: true,
+            wpa: false,
+        });
+        ensure!(
+            p80p80.peer_phymode == phy_mode::MODE_11AC_VHT80_80
+                && p80p80.bw_160
+                && p80p80.peer_nss == 2
+                && p80p80.peer_bw_rxnss_override == 0x8000_0008,
+            "VHT80+80 uses the distinct NSS override field"
+        );
+        // `WMI_NSS_RATIO_1BY2_NSS` halves only the 160 MHz override;
+        // the peer's normal (80 MHz) NSS remains two.
+        let p160_half = peer::peer_assoc_prepare(&peer::PeerAssocInput {
+            nss_ratio_info: 0,
+            ..peer::PeerAssocInput {
+                vdev_id: 0,
+                he: None,
+                aid: 3,
+                assoc_capability: 0x0011,
+                listen_interval: 5,
+                nss_ratio_info: 2,
+                def: d160,
+                sta: &sta160,
+                rsn: true,
+                wpa: false,
+            }
+        });
+        ensure!(
+            p160_half.peer_nss == 2 && p160_half.peer_bw_rxnss_override == 0x8000_0000,
+            "VHT160 one-half NSS ratio"
+        );
+        // `ath11k_peer_assoc_h_he`: WMI's HE rate-set index 0 is 80 MHz
+        // and index 1 is contiguous 160 MHz.  The same negotiated NSS must
+        // be carried in the 160-MHz override.
+        let he160 = mac::he::StaHeCap {
+            has_he: true,
+            phy: [
+                mac::he::cap::PHY0_160MHZ_IN_5G,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+            mcs: [0xFFFA, 0xFFFA, 0xFFFA, 0xFFFA, 0xFFFF, 0xFFFF],
+            ..Default::default()
+        };
+        let he_sta = peer::ApSta {
+            addr: BSSID,
+            bandwidth: Some(StaBw::Bw160),
+            rx_nss: 2,
+            wme: true,
+            ..Default::default()
+        };
+        let ap_he = peer::ApHe {
+            cap: he160,
+            oper_params: 0,
+            six_ghz_cap: None,
+        };
+        let phe160 = peer::peer_assoc_prepare(&peer::PeerAssocInput {
+            vdev_id: 0,
+            he: Some(&ap_he),
+            aid: 3,
+            assoc_capability: 0x0011,
+            listen_interval: 5,
+            nss_ratio_info: 2,
+            def: d160,
+            sta: &he_sta,
+            rsn: true,
+            wpa: false,
+        });
+        ensure!(
+            phe160.peer_phymode == phy_mode::MODE_11AX_HE160
+                && phe160.bw_160
+                && phe160.peer_nss == 2
+                && phe160.peer_bw_rxnss_override == 0x8000_0001
+                && phe160.peer_he_mcs == vec![(0xFFFA, 0xFFFA), (0xFFFA, 0xFFFA)],
+            "HE160 peer maps and negotiated two-stream NSS override"
+        );
+        let he80p80 = mac::he::StaHeCap {
+            has_he: true,
+            phy: [
+                mac::he::cap::PHY0_80PLUS80_MHZ_IN_5G,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+            mcs: [0xFFFA, 0xFFFA, 0xFFFF, 0xFFFF, 0xFFFA, 0xFFFA],
+            ..Default::default()
+        };
+        let ap_he80p80 = peer::ApHe {
+            cap: he80p80,
+            oper_params: 0,
+            six_ghz_cap: None,
+        };
+        let phe80p80 = peer::peer_assoc_prepare(&peer::PeerAssocInput {
+            vdev_id: 0,
+            he: Some(&ap_he80p80),
+            aid: 3,
+            assoc_capability: 0x0011,
+            listen_interval: 5,
+            nss_ratio_info: 2,
+            def: d80p80,
+            sta: &he_sta,
+            rsn: true,
+            wpa: false,
+        });
+        ensure!(
+            phe80p80.peer_phymode == phy_mode::MODE_11AX_HE80_80
+                && phe80p80.bw_160
+                && phe80p80.peer_nss == 2
+                && phe80p80.peer_bw_rxnss_override == 0x8000_0008
+                && phe80p80.peer_he_mcs
+                    == vec![(0xFFFA, 0xFFFA), (0xFFFF, 0xFFFF), (0xFFFA, 0xFFFA)],
+            "HE80+80 retains the indexed placeholder and distinct NSS field"
+        );
         // A VHT peer whose rx map is all 3s is not VHT.
         let bad = frame::VhtCapIe {
             rx_mcs_map: 0xFFFF,
@@ -2565,7 +3104,7 @@ fn smoke_ath11k_mac_vht80_chandef() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_mac_vht80_chandef);
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_mac_wide_chandef);
 
 // ── Connect ─────────────────────────────────────────────────────────
 
@@ -2577,7 +3116,7 @@ fn scanned_mac(cfg: FwCfg) -> (TestMac, Shared) {
         (1, 30, beacon(&BSSID2, b"open", 1, false)),
     ];
     let (mut m, w) = started_mac(default_caps(), Some(&reg), c);
-    block(m.hw_scan(&[], &[2412, 2437])).unwrap();
+    block(m.hw_scan(&[], &[2412, 2437], None, false)).unwrap();
     take_sent(&w);
     w.lock().mgmt.clear();
     (m, w)
@@ -2587,6 +3126,7 @@ fn wpa2_req() -> AssociateRequest {
     AssociateRequest {
         bssid: BSSID,
         ssid: SSID.to_vec(),
+        frequency_mhz: 2437,
         channel: 6,
         security: SecurityConfig::Wpa2 { psk: PMK },
         ie: Vec::new(),
@@ -2600,6 +3140,7 @@ fn exp_prep_connection(m: &TestMac) -> Vec<WmiCmd> {
         band: Band::Ghz2,
         width: Width::W40,
         center_freq1: 2447,
+        center_freq2: 0,
     };
     let ch = *m.wiphy().get(2437).unwrap();
     let mut arg = VdevStartReqArg {
@@ -2793,7 +3334,8 @@ fn smoke_ath11k_mac_connect_open_and_disconnect() -> TestResult {
             r.is_err() && err == step::CONNECT_UNSUPPORTED && take_sent(&w).is_empty(),
             "open to RSN refused"
         );
-        // WPA3 not implemented.
+        // This scanned BSS advertises only WPA2 AKMs, so SAE is refused
+        // before an authentication frame is sent.
         let mut sae = wpa2_req();
         sae.security = SecurityConfig::Wpa3 {
             password: b"x".to_vec(),
@@ -2815,6 +3357,7 @@ fn smoke_ath11k_mac_connect_open_and_disconnect() -> TestResult {
         let req = AssociateRequest {
             bssid: BSSID2,
             ssid: b"open".to_vec(),
+            frequency_mhz: 2412,
             channel: 1,
             security: SecurityConfig::Open,
             ie: Vec::new(),
@@ -2866,7 +3409,7 @@ fn open_ap_mac() -> (TestMac, Shared) {
         ..Default::default()
     };
     let (mut m, w) = started_mac(default_caps(), Some(&reg), c);
-    block(m.hw_scan(&[], &[2437])).unwrap();
+    block(m.hw_scan(&[], &[2437], None, false)).unwrap();
     take_sent(&w);
     (m, w)
 }
@@ -2875,6 +3418,7 @@ fn open_req() -> AssociateRequest {
     AssociateRequest {
         bssid: BSSID,
         ssid: SSID.to_vec(),
+        frequency_mhz: 2437,
         channel: 6,
         security: SecurityConfig::Open,
         ie: Vec::new(),
@@ -3080,7 +3624,7 @@ fn smoke_ath11k_mac_connect_negatives() -> TestResult {
             c.auth_status = Some(0);
             c.assoc_status = None;
         });
-        block(m.hw_scan(&[], &[2437])).unwrap();
+        block(m.hw_scan(&[], &[2437], None, false)).unwrap();
         w.lock().mgmt.clear();
         let (r, err, _) = latched(|| block(m.connect(&open_req())));
         ensure!(r.is_err() && err == step::ASSOC_TIMEOUT, "assoc timeout");
@@ -3264,16 +3808,47 @@ fn smoke_ath11k_mac_link_loss() -> TestResult {
         ));
         w.lock().now += 5000;
         ensure!(block(m.poll()).is_none(), "BETTER_AP ignored");
-        // Beacon miss with silence for 3 s → connection loss.
+        // Beacon miss with silence for 3 s: mac80211 probes with a
+        // directed QoS Null and an ACK proves the AP is still alive.
         w.lock().events.push_back(roam);
         ensure!(block(m.poll()).is_none(), "armed again");
         w.lock().now += 2999;
         ensure!(block(m.poll()).is_none(), "not yet");
         w.lock().now += 1;
+        ensure!(
+            block(m.poll()).is_none() && m.connected_bssid().is_some(),
+            "nullfunc ACK preserves association"
+        );
+        ensure!(
+            w.lock()
+                .dp_calls
+                .iter()
+                .filter(|&&c| c == "nullfunc")
+                .count()
+                == 1,
+            "one successful nullfunc probe"
+        );
+
+        // Two no-ACK probes are the mac80211 `max_nullfunc_tries` limit;
+        // only then does the existing ath11k connection-loss teardown run.
+        set_cfg(&w, |c| c.nullfunc_ack = false);
+        w.lock().events.push_back(event(
+            WMI_ROAM_EVENTID,
+            &[tlv(WMI_TAG_ROAM_EVENT, &le(&[0, 2, 0]))],
+        ));
+        ensure!(block(m.poll()).is_none(), "armed after ACK");
+        w.lock().now += 3000;
         let (l, err, _) = latched(|| block(m.poll()));
         ensure!(
-            l == Some(LinkLoss::BeaconLoss) && err == step::LINK_BEACON_LOSS,
-            "beacon loss after 3 s"
+            l == Some(LinkLoss::BeaconLoss)
+                && err == step::LINK_BEACON_LOSS
+                && w.lock()
+                    .dp_calls
+                    .iter()
+                    .filter(|&&c| c == "nullfunc")
+                    .count()
+                    == 3,
+            "two no-ACK nullfunc probes cause beacon loss"
         );
         ensure!(m.link().is_none(), "disconnected");
 
@@ -3302,6 +3877,73 @@ fn smoke_ath11k_mac_link_loss() -> TestResult {
     })
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_mac_link_loss);
+
+/// `ieee80211_sta_process_chanswitch` through ath11k's live-vdev restart:
+/// a mode-1 beacon CSA closes data immediately, waits `(count - 1)` TBTTs,
+/// sends `WMI_VDEV_RESTART_REQUEST`, and only releases data after a beacon on
+/// the new frequency.
+fn smoke_ath11k_mac_channel_switch() -> TestResult {
+    run(|| {
+        let (mut m, w) = open_ap_mac();
+        block(m.connect(&open_req())).unwrap();
+        take_sent(&w);
+        let mut csa = beacon(&BSSID, SSID, 6, false);
+        // Channel Switch Announcement: mode=1, channel 11, count=2.
+        csa.extend_from_slice(&[frame::eid::CHANNEL_SWITCH, 3, 1, 11, 2]);
+        w.lock()
+            .events
+            .push_back(mgmt_rx_event(6, 50, 2437, 0, &csa));
+        ensure!(block(m.poll()).is_none(), "CSA queued");
+        ensure!(w.lock().authorized == Some(false), "mode-1 blocks data");
+
+        // 100 TU beacon interval gives ceil(100 * 1024 / 1000) = 103 ms.
+        w.lock().now += 102;
+        ensure!(block(m.poll()).is_none(), "CSA not early");
+        ensure!(
+            !w.lock()
+                .sent
+                .iter()
+                .any(|c| c.cmd_id == WMI_VDEV_RESTART_REQUEST_CMDID),
+            "no early vdev restart"
+        );
+        w.lock().now += 1;
+        ensure!(block(m.poll()).is_none(), "CSA restart succeeds");
+        ensure!(
+            w.lock()
+                .sent
+                .iter()
+                .any(|c| c.cmd_id == WMI_VDEV_RESTART_REQUEST_CMDID),
+            "vdev restart command"
+        );
+        ensure!(
+            w.lock().sent.iter().any(|c| c.cmd_id == WMI_VDEV_UP_CMDID),
+            "vdev re-up command"
+        );
+        ensure!(
+            m.link().is_some_and(|l| l.def.freq == 2462),
+            "new channel recorded"
+        );
+        ensure!(
+            w.lock().authorized == Some(false),
+            "await new-channel beacon"
+        );
+
+        w.lock().events.push_back(mgmt_rx_event(
+            11,
+            50,
+            2462,
+            0,
+            &beacon(&BSSID, SSID, 11, false),
+        ));
+        ensure!(block(m.poll()).is_none(), "new-channel beacon received");
+        ensure!(
+            w.lock().authorized == Some(true),
+            "data reopened after beacon"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_mac_channel_switch);
 
 fn smoke_ath11k_mac_11d_new_country() -> TestResult {
     run(|| {
