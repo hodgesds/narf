@@ -1270,3 +1270,49 @@ fn smoke_btrfs_touch_key_must_be_absent() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_touch_key_must_be_absent);
+
+/// A keyed EXTENT_DATA_REF is found wherever its collision run put it, past
+/// holes and past sixteen probes, as Linux's lookup scans every data ref of
+/// the extent from the hash.
+fn smoke_btrfs_keyed_data_ref_scans_past_holes() -> TestResult {
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let Ok(vol) = mount_writable(dev) else {
+        return TestResult::Fail("bgt fixture did not mount");
+    };
+    let (root_tree, _) = vol.root_tree_root();
+    let Some(Ok((ext_root, _))) = poll_once(crate::roots::find_root(
+        &*vol,
+        root_tree,
+        format::EXTENT_TREE_OBJECTID,
+    )) else {
+        return TestResult::Fail("extent tree root");
+    };
+    let body = |root: u64, ino: u64, off: u64| {
+        let mut b = Vec::new();
+        b.extend_from_slice(&root.to_le_bytes());
+        b.extend_from_slice(&ino.to_le_bytes());
+        b.extend_from_slice(&off.to_le_bytes());
+        b.extend_from_slice(&1u32.to_le_bytes());
+        Some(b)
+    };
+    let mut seeded: Vec<(u64, Option<Vec<u8>>)> =
+        (0..20).map(|d| (d, body(5, 300 + d, 0))).collect();
+    seeded[3].1 = None; // a deleted ref leaves a hole in the run
+    seeded.push((24, body(5, 257, 4096)));
+    let bytenr = 0x7fff_0000_0000;
+    match poll_once(crate::backref::RefOverlay::__test_find_data_ref(
+        &*vol,
+        ext_root,
+        bytenr,
+        (5, 257, 4096),
+        &seeded,
+    )) {
+        Some(Ok(Some(24))) => TestResult::Pass,
+        Some(Ok(_)) => TestResult::Fail("a data ref past the probe window was not found"),
+        _ => TestResult::Fail("data ref lookup failed"),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_keyed_data_ref_scans_past_holes
+);

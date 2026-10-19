@@ -423,6 +423,36 @@ impl RefOverlay {
     /// Data refs are keyed by their hash with collisions probed upward
     /// (`insert_extent_data_ref`), so the matching one may sit a few offsets
     /// past the hash.
+    /// Test hook: find the keyed data ref `(root, objectid, offset)` of
+    /// `bytenr` in an overlay seeded with `(offset past the hash, body)`
+    /// items; the matching item's distance past the hash.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) async fn __test_find_data_ref<B: BlockDevice + 'static>(
+        vol: &BtrfsVolume<B>,
+        extent_root: u64,
+        bytenr: u64,
+        (root, objectid, offset): (u64, u64, u64),
+        seeded: &[(u64, Option<Vec<u8>>)],
+    ) -> Result<Option<u64>, FsError> {
+        let kind = RefKind::Data {
+            root,
+            objectid,
+            offset,
+        };
+        let hash = kind.order();
+        let mut overlay = RefOverlay::default();
+        for (delta, body) in seeded {
+            overlay.items.insert(
+                BtrfsKey::new(bytenr, EXTENT_DATA_REF_KEY, hash.wrapping_add(*delta)),
+                body.clone(),
+            );
+        }
+        Ok(overlay
+            .find_keyed(vol, extent_root, bytenr, kind)
+            .await?
+            .map(|(key, _)| key.offset.wrapping_sub(hash)))
+    }
+
     async fn find_keyed<B: BlockDevice + 'static>(
         &self,
         vol: &BtrfsVolume<B>,
@@ -436,18 +466,34 @@ impl RefOverlay {
                 objectid,
                 offset,
             } => {
-                let hash = kind.order();
-                for probe in 0..16u64 {
-                    let key = BtrfsKey::new(bytenr, EXTENT_DATA_REF_KEY, hash.wrapping_add(probe));
-                    if let Some(body) = self.get(vol, extent_root, &key).await? {
-                        if body.len() >= 28
-                            && le64(&body, 0)? == root
-                            && le64(&body, 8)? == objectid
-                            && le64(&body, 16)? == offset
-                        {
-                            return Ok(Some((key, body)));
+                // Linux `lookup_extent_data_ref`: from the hash, scan every
+                // EXTENT_DATA_REF item of the extent (collisions go to the
+                // next free offset, and deletions can leave holes in a run),
+                // the overlay's view of a key overriding the tree's.
+                let matches = |body: &[u8]| -> Result<bool, FsError> {
+                    Ok(body.len() >= 28
+                        && le64(body, 0)? == root
+                        && le64(body, 8)? == objectid
+                        && le64(body, 16)? == offset)
+                };
+                let start = BtrfsKey::new(bytenr, EXTENT_DATA_REF_KEY, kind.order());
+                let end = BtrfsKey::new(bytenr, EXTENT_DATA_REF_KEY, u64::MAX);
+                for (key, body) in self.items.range(start..=end) {
+                    if let Some(body) = body {
+                        if matches(body)? {
+                            return Ok(Some((*key, body.clone())));
                         }
                     }
+                }
+                let mut cursor = btree::Cursor::seek(vol, extent_root, &start).await?;
+                while let Some((key, body)) = cursor.current()? {
+                    if key.objectid != bytenr || key.item_type != EXTENT_DATA_REF_KEY {
+                        break;
+                    }
+                    if !self.items.contains_key(&key) && matches(body)? {
+                        return Ok(Some((key, body.to_vec())));
+                    }
+                    cursor.advance().await?;
                 }
                 Ok(None)
             }
@@ -554,8 +600,10 @@ impl RefOverlay {
                 },
                 None,
             ) => {
+                // Linux `insert_extent_data_ref`: the first free offset from
+                // the hash.
                 let hash = kind.order();
-                for probe in 0..16u64 {
+                for probe in 0..4096u64 {
                     let key = BtrfsKey::new(bytenr, EXTENT_DATA_REF_KEY, hash.wrapping_add(probe));
                     if self.get(vol, extent_root, &key).await?.is_none() {
                         let mut body = Vec::with_capacity(28);
