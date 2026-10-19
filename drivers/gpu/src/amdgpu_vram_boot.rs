@@ -89,6 +89,20 @@ impl Plan {
         // SAFETY: caller supplies the complete exclusive GPU/client contract.
         unsafe { Self::read_discrete(gpu, authority, boot_framebuffer, other_clients) }
     }
+    /// Inventory exact discrete RDNA2 identities, all inherited display
+    /// clients and the compatible GMC10 apertures without device writes.
+    /// # Safety
+    /// Same exclusive GPU/client/mapping contract as `read_navi22`.
+    pub unsafe fn read_rdna2(
+        gpu: &AmdGpu,
+        authority: &Cap<BusDeviceCap, Write>,
+        boot_framebuffer: Option<Range<u64>>,
+        other_clients: &[Range<u64>],
+    ) -> Result<Self, Error> {
+        crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).ok_or(Error::Unsupported)?;
+        // SAFETY: forwarded complete stable client inventory and mappings.
+        unsafe { Self::read_discrete(gpu, authority, boot_framebuffer, other_clients) }
+    }
     /// Inventory Navi48's GMC12 aperture, four DCN4 scanouts/cursors and
     /// inherited DMUB windows. Both VM hubs must have no enabled contexts.
     ///
@@ -117,15 +131,23 @@ impl Plan {
         if gpu.chip.vid != amdgpu::AMD_VENDOR {
             return Err(Error::Unsupported);
         }
-        let navi22 = gpu.chip.did == amdgpu::NAVI22;
+        let rdna2 = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did);
+        let navi22 = rdna2.is_some();
         // GC MC_VM_FB_LOCATION_BASE/TOP and MC_VM_FB_OFFSET, then DCN's copy
         // DCN_VM_FB_LOCATION_BASE/TOP and DCN_VM_FB_OFFSET (BASE_IDX 2):
         // dcn_3_0_0_offset.h places them at 0x493..0x495, while DCN3.1+ and
         // DCN4 (dcn_4_1_0_offset.h) moved them to 0x475..0x477.
         let (gc_version, dcn_versions, fb_regs, dcn_fb): (_, &[_], _, u32) = match gpu.chip.did {
-            // linux-lit: 0x16fc=mmGCMC_VM_FB_LOCATION_BASE@gc; 0x16fd=mmGCMC_VM_FB_LOCATION_TOP@gc
-            // linux-lit: 0x16e7=mmGCMC_VM_FB_OFFSET@gc; 0x493=mmDCN_VM_FB_LOCATION_BASE@dcn
-            amdgpu::NAVI22 => ((10, 3, 2), &[(3, 0, 0)], [0x16fc, 0x16fd, 0x16e7], 0x493),
+            _ if rdna2.is_some() => {
+                let p = rdna2.unwrap();
+                (
+                    p.gc_version,
+                    core::slice::from_ref(&p.dcn_version),
+                    // linux: mmGCMC_VM_FB_LOCATION_BASE@gc; mmGCMC_VM_FB_LOCATION_TOP@gc; mmGCMC_VM_FB_OFFSET@gc
+                    [0x16fc, 0x16fd, 0x16e7],
+                    0x493, // linux-lit: 0x493=mmDCN_VM_FB_LOCATION_BASE@dcn
+                )
+            }
             amdgpu::NAVI48 => (
                 (12, 0, 1),
                 &[(4, 0, 1), (4, 1, 0)],

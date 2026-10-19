@@ -373,14 +373,16 @@ impl Trainer {
         exchange: Training,
     ) -> Result<Self, Error> {
         use crate::{amdgpu_discovery as ip, amdgpu_psp_ring as psp};
-        psp::validate_navi22_layout(gpu).map_err(|_| Error::Unsupported)?;
+        psp::validate_rdna2_layout(gpu).map_err(|_| Error::Unsupported)?;
         validate_exchange(
             gpu.vram.size,
             gpu.fb_bar.len.min(gpu.vram.visible_size),
             exchange,
         )?;
         authority.invoke(Op(|| ())).map_err(|_| Error::Revoked)?;
-        let mp0 = psp::bank(gpu, ip::HW_ID_MP0, &[(11, 0, 11)], 0, SOS)
+        let profile = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did)
+            .ok_or(Error::Unsupported)?;
+        let mp0 = psp::bank(gpu, ip::HW_ID_MP0, &[profile.psp_version], 0, SOS)
             .map_err(|_| Error::Unsupported)?;
         let nbio = psp::bank(
             gpu,

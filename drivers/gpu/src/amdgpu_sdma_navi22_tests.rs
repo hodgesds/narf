@@ -498,3 +498,114 @@ kernel_test_in!(
     "drivers/gpu/sdma-navi22",
     sdma_navi22_fb_end_follows_memsize_not_fb_top
 );
+
+fn rdna2_gpu(profile: &crate::amdgpu_rdna2::Profile, did: u16) -> AmdGpu {
+    let mut gpu = crate::amdgpu_navi22_boot::tests::gpu();
+    gpu.chip = crate::amdgpu::__test_chip_info_for_pci_id(0x1002, did).unwrap();
+    for block in &mut gpu.ip_blocks {
+        match block.hw_id {
+            ip::HW_ID_GC => {
+                (block.major, block.minor, block.revision) = profile.gc_version;
+                block.base_addrs[0] = (GC / 4) as u32;
+            }
+            ip::HW_ID_SDMA0 => {
+                (block.major, block.minor, block.revision) = profile.sdma_version;
+                block.base_addrs[0] = u32::MAX; // never used: SDMA0 is GC-relative
+            }
+            ip::HW_ID_NBIF => block.base_addrs[2] = (NBIO / 4) as u32,
+            ip::HW_ID_HDP => block.base_addrs[0] = (HDP / 4) as u32,
+            _ => {}
+        }
+    }
+    gpu
+}
+
+fn rdna2_sdma_exact_layout_precedes_allocation_and_keeps_native_gate() -> TestResult {
+    for profile in crate::amdgpu_rdna2::PROFILES {
+        for &did in profile.pci_ids {
+            let gpu = rdna2_gpu(profile, did);
+            let layout = Layout::resolve_rdna2(&gpu).unwrap();
+            if layout.gc != GC || layout.nbio != NBIO || layout.hdp != HDP {
+                return TestResult::Fail("RDNA2 SDMA used the wrong bank or standalone SDMA base");
+            }
+            let (pool, engine, _, _) = fixture();
+            drop(engine);
+            let authority = Cap::bootstrap();
+            authority.revoke();
+            // SAFETY: inert mapping; constructor must perform no device I/O.
+            let sdma = unsafe { Sdma::new_rdna2(&gpu, authority, &pool) }.unwrap();
+            if sdma.state() != State::Prepared || sdma.proof().is_some() {
+                return TestResult::Fail("RDNA2 SDMA construction started the engine");
+            }
+            drop(sdma);
+            if pool.available() != BYTES {
+                return TestResult::Fail("unpublished RDNA2 SDMA ring leaked");
+            }
+            if did != crate::amdgpu::NAVI22 && Layout::resolve(&gpu).is_ok() {
+                return TestResult::Fail("shared SDMA widened the native Navi22 gate");
+            }
+        }
+        for id in [ip::HW_ID_GC, ip::HW_ID_SDMA0, ip::HW_ID_NBIF, ip::HW_ID_HDP] {
+            for change in 0..3 {
+                let mut gpu = rdna2_gpu(profile, profile.pci_ids[0]);
+                let index = gpu.ip_blocks.iter().position(|ip| ip.hw_id == id).unwrap();
+                match change {
+                    0 => gpu.ip_blocks[index].major = 0xff,
+                    1 => gpu.ip_blocks.push(gpu.ip_blocks[index]),
+                    _ => {
+                        gpu.ip_blocks.remove(index);
+                    }
+                }
+                let (pool, engine, _, _) = fixture();
+                drop(engine);
+                // SAFETY: invalid metadata must reject before I/O or allocation.
+                if unsafe { Sdma::new_rdna2(&gpu, Cap::bootstrap(), &pool) }.is_ok()
+                    || pool.available() != BYTES
+                {
+                    return TestResult::Fail("invalid RDNA2 SDMA bank allocated backing");
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_sdma_exact_layout_precedes_allocation_and_keeps_native_gate
+);
+
+fn rdna2_sdma_executes_translated_copy_and_fence_with_resolved_layout() -> TestResult {
+    for profile in crate::amdgpu_rdna2::PROFILES {
+        for bytes in [4 << 30, 8 << 30, 12272 << 20, 12 << 30, 16 << 30] {
+            let mut gpu = rdna2_gpu(profile, profile.pci_ids[0]);
+            gpu.vram.size = bytes;
+            let (_pool, mut engine, mut aperture, target) = fixture();
+            engine.layout = Layout::resolve_rdna2(&gpu).unwrap();
+            // Deliberately retain the fake's stale FB_LOCATION_TOP. Physical
+            // VRAM size determines the end; the translated aperture sits after it.
+            aperture.start = (0x8_0000_0000 + bytes).next_multiple_of(2 << 20);
+            aperture.source = aperture.start;
+            aperture.destination = aperture.start + 4096;
+            engine.io.base = aperture.start;
+            let proof = run(engine.initialize(aperture, target)).unwrap();
+            if proof.copied_bytes != 64
+                || proof.fence != SEQUENCE
+                || proof.read_pointer != 128
+                || engine.state != State::Verified
+                || !engine.io.traps.is_empty()
+            {
+                return TestResult::Fail(
+                    "RDNA2 translated SDMA proof failed or enabled interrupts",
+                );
+            }
+            if run(engine.initialize(aperture, target)) != Err(Error::Busy) {
+                return TestResult::Fail("RDNA2 SDMA replayed initialization");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_sdma_executes_translated_copy_and_fence_with_resolved_layout
+);

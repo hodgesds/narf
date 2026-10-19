@@ -569,6 +569,9 @@ pub struct Dmub {
     engine: Engine<Mmio>,
 }
 impl Dmub {
+    fn native_channels(&self) -> u8 {
+        NATIVE_CHANNELS
+    }
     pub(crate) fn matches_display(&self, regs: MmioRegion, base: u64) -> bool {
         let own = self.engine.io.0;
         own.phys == regs.phys

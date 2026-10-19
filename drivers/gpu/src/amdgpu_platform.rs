@@ -128,6 +128,22 @@ const GFXHUB_WINDOWS: &[VmWindow] = &[
         base_idx: 0,
         ctx0_cntl: 0x1688,
     },
+    // Discrete GC10.3 shares gfxhub_v2_1 context windows.
+    VmWindow {
+        version: (10, 3, 0),
+        base_idx: 0,
+        ctx0_cntl: 0x15fc,
+    },
+    VmWindow {
+        version: (10, 3, 4),
+        base_idx: 0,
+        ctx0_cntl: 0x15fc,
+    },
+    VmWindow {
+        version: (10, 3, 5),
+        base_idx: 0,
+        ctx0_cntl: 0x15fc,
+    },
     // Navi22, gc_10_3_0_offset.h: CONTEXT0..15 at 0x15fc..0x160b.
     VmWindow {
         version: (10, 3, 2),
@@ -171,6 +187,16 @@ const MMHUB_WINDOWS: &[VmWindow] = &[
     // `mmhub_3_0_2_offset.h` — 3.0.0's base index, but the register moved.
     VmWindow {
         version: (3, 0, 2),
+        base_idx: 0,
+        ctx0_cntl: 0x06c0,
+    },
+    VmWindow {
+        version: (2, 1, 1),
+        base_idx: 0,
+        ctx0_cntl: 0x06c0,
+    },
+    VmWindow {
+        version: (2, 1, 2),
         base_idx: 0,
         ctx0_cntl: 0x06c0,
     },
@@ -329,7 +355,19 @@ const DCN_4_1_0: SurfaceWindow = SurfaceWindow {
     version: (4, 1, 0),
     ..DCN_4_0_1
 };
-const SURFACE_WINDOWS: &[SurfaceWindow] = &[DCN_3_1_4, DCN_3_5_0, DCN_3_0_0, DCN_4_0_1, DCN_4_1_0];
+const DCN_3_0_2: SurfaceWindow = SurfaceWindow {
+    version: (3, 0, 2),
+    pipes: 5,
+    ..DCN_3_0_0
+};
+const DCN_3_0_3: SurfaceWindow = SurfaceWindow {
+    version: (3, 0, 3),
+    pipes: 2,
+    ..DCN_3_0_0
+};
+const SURFACE_WINDOWS: &[SurfaceWindow] = &[
+    DCN_3_0_2, DCN_3_0_3, DCN_3_1_4, DCN_3_5_0, DCN_3_0_0, DCN_4_0_1, DCN_4_1_0,
+];
 
 // Field masks. `dcn_3_1_4_sh_mask.h` and `dcn_3_5_0_sh_mask.h` agree on every
 // one of these, so they are not part of the per-version window:
@@ -374,7 +412,8 @@ fn inventory(gpu: &AmdGpu, cap: &Cap<BusDeviceCap, Write>) -> Result<Vec<Range<u
     // Firmware/GOP may leave the kernel context VMID0 enabled on a discrete
     // Navi22; no engine runs in it and gmc_v10_0_gart_enable reprograms it,
     // so only user contexts 1..15 mean unknown live page tables there.
-    let first_context = u64::from(gpu.chip.did == crate::amdgpu::NAVI22);
+    let first_context =
+        u64::from(crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).is_some());
     cap.invoke(Op(|| {
         for (base, first) in [(gc, gfxhub.ctx0_cntl), (hub, mmhub.ctx0_cntl)] {
             for index in first_context..u64::from(VM_CONTEXTS) {
@@ -981,6 +1020,21 @@ mod tests {
                 ctx0_cntl: 0x1688,
             },
             VmWindow {
+                version: (10, 3, 0),
+                base_idx: 0,
+                ctx0_cntl: 0x15fc,
+            },
+            VmWindow {
+                version: (10, 3, 4),
+                base_idx: 0,
+                ctx0_cntl: 0x15fc,
+            },
+            VmWindow {
+                version: (10, 3, 5),
+                base_idx: 0,
+                ctx0_cntl: 0x15fc,
+            },
+            VmWindow {
                 version: (10, 3, 2),
                 base_idx: 0,
                 ctx0_cntl: 0x15fc,
@@ -1010,6 +1064,16 @@ mod tests {
             },
             VmWindow {
                 version: (3, 0, 2),
+                base_idx: 0,
+                ctx0_cntl: 0x06c0,
+            },
+            VmWindow {
+                version: (2, 1, 1),
+                base_idx: 0,
+                ctx0_cntl: 0x06c0,
+            },
+            VmWindow {
+                version: (2, 1, 2),
                 base_idx: 0,
                 ctx0_cntl: 0x06c0,
             },
@@ -1097,6 +1161,16 @@ mod tests {
         };
         if SURFACE_WINDOWS
             != [
+                SurfaceWindow {
+                    version: (3, 0, 2),
+                    pipes: 5,
+                    ..dcn300_expected
+                },
+                SurfaceWindow {
+                    version: (3, 0, 3),
+                    pipes: 2,
+                    ..dcn300_expected
+                },
                 dcn314_expected,
                 dcn350_expected,
                 dcn300_expected,

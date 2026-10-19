@@ -41,7 +41,7 @@ use crate::{
     amdgpu_dcn_plane::Opp,
     amdgpu_navi22_bios::{Tables, Transmitter, TransmitterAction, TransmitterMode},
     amdgpu_navi22_display::{Connector, Signal},
-    amdgpu_navi22_modeset::{Error, PIPES, STREAMS},
+    amdgpu_navi22_modeset::Error,
     amdgpu_reg_window::Window,
 };
 use narf_bus::BusDeviceCap;
@@ -56,7 +56,6 @@ const D_VGA_CONTROL: [u64; 6] = [0x000c, 0x000e, 0x0038, 0x0039, 0x003a, 0x003b]
 // linux-ctx: hdr=dcn seg=2
 const DOMAIN0_PG_CONFIG: u64 = 0x0080; // linux: mmDOMAIN0_PG_CONFIG
 /// DOMAIN0..11 (HUBP/DPP) and DOMAIN16..21 (DSC).
-const PLANE_DOMAINS: core::ops::Range<u64> = 0..12;
 const DSC_DOMAIN16_PG_CONFIG: u64 = 0x00a1; // linux: mmDOMAIN16_PG_CONFIG
 /// DSC_TOP0_DSC_TOP_CONTROL (stride 0x5c) and DSCRM0_DSCRM_DSC_FORWARD_CONFIG.
 const DSC_TOP_CONTROL: u64 = 0x3000; // linux: mmDSC_TOP0_DSC_TOP_CONTROL
@@ -229,6 +228,10 @@ pub(crate) struct Takeover<'a> {
     pub(crate) dcn3: u64,
 }
 impl Takeover<'_> {
+    fn profile(&self) -> Result<crate::amdgpu_dcn_profile::Profile, Error> {
+        Ok(crate::amdgpu_dcn_profile::Profile::resolve(self.gpu)?)
+    }
+
     fn d2(&self, reg: u64) -> u64 {
         self.dcn2 + reg * 4
     }
@@ -237,14 +240,17 @@ impl Takeover<'_> {
     }
     /// `dcn20_disable_vga`.
     pub(crate) fn disable_vga(&mut self) -> Result<(), Error> {
-        for reg in D_VGA_CONTROL {
+        for reg in D_VGA_CONTROL
+            .into_iter()
+            .take(self.profile()?.pipes() as usize)
+        {
             self.regs.write(self.dcn1 + reg * 4, 0)?;
         }
         Ok(())
     }
     /// The register half of `enc3_hw_init` for one link encoder.
     pub(crate) fn link_hw_init(&mut self, transmitter: u8) -> Result<(), Error> {
-        if transmitter >= STREAMS {
+        if transmitter >= self.profile()?.streams() {
             return Err(Error::Invalid);
         }
         let reg = self.d2(TMDS_CTL_BITS + u64::from(transmitter) * DIG_STRIDE);
@@ -252,22 +258,29 @@ impl Takeover<'_> {
     }
     /// `dcn20_enable_power_gating_plane(true)`.
     fn enable_power_gating_plane(&mut self) -> Result<(), Error> {
+        if !self.profile()?.has_plane_power_gating() {
+            return Ok(());
+        }
         let request = self.d2(DC_IP_REQUEST_CNTL);
         let original = self.regs.read(request)? & IP_REQUEST_EN;
         if original == 0 {
             self.regs.write(request, IP_REQUEST_EN)?;
         }
         // HUBP 0,2..10 then DPP 1,3..11, then the six DSC domains.
-        for domain in PLANE_DOMAINS
+        for domain in (0..u64::from(self.profile()?.pipes()) * 2)
             .step_by(2)
-            .chain(PLANE_DOMAINS.skip(1).step_by(2))
+            .chain(
+                (0..u64::from(self.profile()?.pipes()) * 2)
+                    .skip(1)
+                    .step_by(2),
+            )
         {
             // linux-lit: 2=mmDOMAIN1_PG_CONFIG - mmDOMAIN0_PG_CONFIG
             let reg = self.d2(DOMAIN0_PG_CONFIG + 2 * domain);
             self.regs.update(reg, DOMAIN_POWER_FORCEON, 0)?;
         }
         // linux: n/a (DOMAIN16..21: dcn20_enable_power_gating_plane's six DSC domains)
-        for dsc in 0..6 {
+        for dsc in 0..u64::from(self.profile()?.pipes()) {
             // linux-lit: 2=mmDOMAIN17_PG_CONFIG - mmDOMAIN16_PG_CONFIG
             let reg = self.d2(DSC_DOMAIN16_PG_CONFIG + 2 * dsc);
             self.regs.update(reg, DOMAIN_POWER_FORCEON, 0)?;
@@ -325,7 +338,9 @@ impl Takeover<'_> {
     }
     async fn init_blank(&mut self, pipe: u8) -> Result<(), Error> {
         let (opp, bottom) = self.optc_source(pipe)?;
-        if opp >= PIPES || bottom.is_some_and(|b| b >= PIPES) {
+        if opp >= self.profile()?.pipes()
+            || bottom.is_some_and(|b| b >= self.profile().map_or(0, |p| p.pipes()))
+        {
             // Linux asserts and leaves this OTG unblanked.
             return Ok(());
         }
@@ -376,7 +391,7 @@ impl Takeover<'_> {
             // linux: n/a (literal 0xf in:mpc1_mpc_init_single_inst)
             self.regs.write(self.d3(reg + base), 0xf)?;
         }
-        if opp < u32::from(PIPES) {
+        if opp < u32::from(self.profile()?.pipes()) {
             let mux = self.d3(MPC_OUT_MUX + u64::from(opp) * MPC_OUT_STRIDE);
             // linux: n/a (literal 0xf in:mpc1_mpc_init_single_inst)
             self.regs.update(mux, MPC_OUT_MUX_SEL, 0xf)?;
@@ -393,7 +408,7 @@ impl Takeover<'_> {
     /// domains are never gated (power gating on pipe 5 is de-featured and
     /// may hard-reset the GPU).
     async fn gate(&mut self, domain: u64) -> Result<(), Error> {
-        if domain >= 10 {
+        if !self.profile()?.has_plane_power_gating() || domain >= 10 {
             return Ok(());
         }
         let config = self.d2(DOMAIN0_PG_CONFIG + 2 * domain);
@@ -428,6 +443,9 @@ impl Takeover<'_> {
         )?;
         self.regs
             .update(self.d2(DPP_CONTROL + p * DPP_STRIDE), DPP_CLOCK_ENABLE, 0)?;
+        if !self.profile()?.has_plane_power_gating() {
+            return Ok(());
+        }
         // dcn10_plane_atomic_power_down.
         let request = self.d2(DC_IP_REQUEST_CNTL);
         self.regs.write(request, IP_REQUEST_EN)?;
@@ -453,6 +471,9 @@ impl Takeover<'_> {
     /// under DC_IP_REQUEST_CNTL and wait 1000 x 1 us for PGFSM (logged
     /// only, as REG_WAIT).
     async fn gate_dsc(&mut self, dsc: u8) -> Result<(), Error> {
+        if !self.profile()?.has_plane_power_gating() {
+            return Ok(());
+        }
         let request = self.d2(DC_IP_REQUEST_CNTL);
         let original = self.regs.read(request)? & IP_REQUEST_EN;
         if original == 0 {
@@ -476,7 +497,7 @@ impl Takeover<'_> {
     /// a running OTG drives (`optc2_get_dsc_status`, `dsc2_read_state`).
     async fn gate_idle_dscs(&mut self) -> Result<(), Error> {
         let mut sources = (None, None);
-        for pipe in 0..PIPES {
+        for pipe in 0..self.profile()?.pipes() {
             if !self.otg_enabled(pipe)? {
                 continue;
             }
@@ -491,7 +512,7 @@ impl Takeover<'_> {
                 break;
             }
         }
-        for dsc in 0..DSCS {
+        for dsc in 0..self.profile()?.pipes() {
             let clock = self
                 .regs
                 .read(self.d2(DSC_TOP_CONTROL + u64::from(dsc) * DSC_TOP_STRIDE))?;
@@ -532,17 +553,17 @@ impl Takeover<'_> {
     /// these owners cache none) and DCN3.0's OPTC has no `init_odm`.
     async fn init_pipes(&mut self) -> Result<u8, Error> {
         let mut enabled = 0u8;
-        for pipe in 0..PIPES {
+        for pipe in 0..self.profile()?.pipes() {
             if self.otg_enabled(pipe)? {
                 enabled |= 1 << pipe;
                 self.init_blank(pipe).await?;
                 self.lock(pipe, true).await?;
             }
         }
-        for mpcc in 0..PIPES {
+        for mpcc in 0..self.profile()?.pipes() {
             self.mpc_init(mpcc)?;
         }
-        for pipe in 0..PIPES {
+        for pipe in 0..self.profile()?.pipes() {
             let running = self.otg_enabled(pipe)?;
             if running {
                 self.lock(pipe, false).await?;
@@ -599,7 +620,7 @@ impl Takeover<'_> {
                 )?;
             }
         }
-        for pipe in 0..PIPES {
+        for pipe in 0..self.profile()?.pipes() {
             // SAFETY: the takeover holds the whole display engine.
             let mut otg = unsafe { Otg::new(self.gpu, self.regs.authority, pipe) }?;
             // optc1_disable_crtc waits OTG_BUSY up to 100 ms; Linux logs.
@@ -620,7 +641,7 @@ impl Takeover<'_> {
         for link in links {
             self.link_hw_init(link.path.transmitter)?;
         }
-        for transmitter in 0..STREAMS {
+        for transmitter in 0..self.profile()?.streams() {
             if self.dig_enabled(transmitter)? {
                 digs |= 1 << transmitter;
             }
@@ -635,7 +656,7 @@ impl Takeover<'_> {
     /// Every DP stream, DIG backend and OTG idle: what the clock owner and
     /// a new stream require.
     pub(crate) fn check_idle(&mut self) -> Result<(), Error> {
-        for i in 0..PIPES {
+        for i in 0..self.profile()?.pipes() {
             if self.otg_enabled(i)? || self.dig_enabled(i)? {
                 return Err(Error::Busy);
             }

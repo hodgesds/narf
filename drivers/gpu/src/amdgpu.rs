@@ -626,6 +626,16 @@ fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
     if vid != AMD_VENDOR {
         return None;
     }
+    if let Some(profile) = crate::amdgpu_rdna2::for_pci_id(vid, did) {
+        return Some(ChipInfo {
+            vid,
+            did,
+            family: Family::Navi2,
+            asic: profile.asic,
+            fw_name: profile.firmware.sos,
+            fw_list: UNAUDITED_FW,
+        });
+    }
     let (family, asic, fw_name, fw_list) = match did {
         // Phoenix1 / Phoenix2 / HawkPoint are RDNA3: GFX 11.0.1 with
         // **DCN 3.1.4**. The comment that used to stand here said all three
@@ -675,12 +685,6 @@ fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
             GREEN_SARDINE_FW,
         ),
         RENOIR => (Family::Renoir, "renoir", "amdgpu/renoir.bin", RENOIR_FW),
-        NAVI22 => (
-            Family::Navi2,
-            "navi22",
-            crate::amdgpu_psp_firmware::NAVI22_SOS,
-            UNAUDITED_FW,
-        ),
         NAVI31 => (Family::Navi3, "navi31", "amdgpu/navi31.bin", UNAUDITED_FW),
         // PSP14 selects its SOS container by the discovered MP0 revision.
         // No single legacy image/load command describes this device.
@@ -1382,7 +1386,9 @@ impl AmdGpu {
         &mut self,
         fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
     ) -> Result<(), AmdgpuError> {
-        if matches!(self.chip.family, Family::Phoenix | Family::Navi4) || self.chip.did == NAVI22 {
+        if matches!(self.chip.family, Family::Phoenix | Family::Navi4)
+            || crate::amdgpu_rdna2::for_pci_id(self.chip.vid, self.chip.did).is_some()
+        {
             // Navi22 SOS uses amdgpu_psp_boot and an owned GPU VRAM staging
             // buffer; this legacy entry point cannot satisfy that contract.
             return Err(AmdgpuError::UnsupportedFirmwareLoad);
@@ -1562,7 +1568,9 @@ impl AmdGpu {
         &mut self,
         fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
     ) -> Result<MultiFwReport, AmdgpuError> {
-        if matches!(self.chip.family, Family::Phoenix | Family::Navi4) || self.chip.did == NAVI22 {
+        if matches!(self.chip.family, Family::Phoenix | Family::Navi4)
+            || crate::amdgpu_rdna2::for_pci_id(self.chip.vid, self.chip.did).is_some()
+        {
             return Err(AmdgpuError::UnsupportedFirmwareLoad);
         }
         if crate::amdgpu_usbc::firmware_busy() {
@@ -2250,7 +2258,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     };
     // SAFETY: probe owns the GPU mappings; boot ACPI tables remain mapped.
     let vbios = unsafe { crate::amdgpu_vbios::discover(&dev, &device, &cap) };
-    if matches!(device.id.device, NAVI22 | NAVI48) {
+    if crate::amdgpu_rdna2::for_pci_id(device.id.vendor, device.id.device).is_some()
+        || device.id.device == NAVI48
+    {
         use core::fmt::Write as _;
         match &vbios {
             Ok(image) => {
@@ -2304,16 +2314,19 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     });
     // APUs and audited discrete probes use their retained, capability-checked image. The legacy
     // ROM-version-only path remains for other discrete GPUs.
-    let vbios_version: Option<alloc::string::String> =
-        if vbios_version.is_some() || is_apu || matches!(device.id.device, NAVI22 | NAVI48) {
-            vbios_version
-        } else {
-            // SAFETY: caller-authority over the device. ROM BAR is read-only
-            // from the CPU side once the phys address is known.
-            // Linux ref: amdgpu_bios.c::amdgpu_read_bios (lines 101-140).
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            unsafe { read_vbios_version_from_rom(&cap, &device) }
-        };
+    let vbios_version: Option<alloc::string::String> = if vbios_version.is_some()
+        || is_apu
+        || (crate::amdgpu_rdna2::for_pci_id(device.id.vendor, device.id.device).is_some()
+            || device.id.device == NAVI48)
+    {
+        vbios_version
+    } else {
+        // SAFETY: caller-authority over the device. ROM BAR is read-only
+        // from the CPU side once the phys address is known.
+        // Linux ref: amdgpu_bios.c::amdgpu_read_bios (lines 101-140).
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        unsafe { read_vbios_version_from_rom(&cap, &device) }
+    };
 
     // Register with the DRM card registry so /sys/class/drm/card<N>/
     // and /dev/dri/card<N> appear after Stage::Late.
@@ -2461,7 +2474,6 @@ pub fn register_pci_driver() {
         ("amdgpu-raphael", AMD_VENDOR, RAPHAEL),
         ("amdgpu-cezanne", AMD_VENDOR, CEZANNE),
         ("amdgpu-renoir", AMD_VENDOR, RENOIR),
-        ("amdgpu-navi22", AMD_VENDOR, NAVI22),
         ("amdgpu-navi31", AMD_VENDOR, NAVI31),
         ("amdgpu-navi48", AMD_VENDOR, NAVI48),
     ];
@@ -2474,6 +2486,18 @@ pub fn register_pci_driver() {
             },
             probe,
         });
+    }
+    for profile in crate::amdgpu_rdna2::PROFILES {
+        for &device in profile.pci_ids {
+            narf_bus::register_pci_driver(narf_bus::PciMatch {
+                name: profile.asic,
+                kind: narf_bus::MatchKind::VendorDevice {
+                    vendor: AMD_VENDOR,
+                    device,
+                },
+                probe,
+            });
+        }
     }
     // Class-match backstop: any PCI VGA controller. The probe
     // body filters non-AMD vendors so virtio-gpu / Bochs / Intel
@@ -2496,7 +2520,7 @@ pub(crate) fn is_navi22() -> bool {
     CONTROLLER
         .lock()
         .as_ref()
-        .is_some_and(|gpu| gpu.chip.did == NAVI22)
+        .is_some_and(|gpu| crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).is_some())
 }
 
 /// Synchronous preparation under the controller lock, followed by permanent
@@ -2504,7 +2528,10 @@ pub(crate) fn is_navi22() -> bool {
 pub(crate) fn claim_navi22<R, E>(
     prepare: impl FnOnce(&AmdGpu) -> Result<R, E>,
 ) -> Option<Result<R, E>> {
-    claim_discrete(NAVI22, prepare)
+    claim_matching(
+        |gpu| crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).is_some(),
+        prepare,
+    )
 }
 
 pub(crate) fn is_navi48() -> bool {
@@ -2522,9 +2549,15 @@ fn claim_discrete<R, E>(
     did: u16,
     prepare: impl FnOnce(&AmdGpu) -> Result<R, E>,
 ) -> Option<Result<R, E>> {
+    claim_matching(|gpu| gpu.chip.did == did, prepare)
+}
+fn claim_matching<R, E>(
+    matches: impl FnOnce(&AmdGpu) -> bool,
+    prepare: impl FnOnce(&AmdGpu) -> Result<R, E>,
+) -> Option<Result<R, E>> {
     let controller = CONTROLLER.lock();
     let gpu = controller.as_ref()?;
-    if gpu.chip.did != did || DISCRETE_OWNED.load(core::sync::atomic::Ordering::Acquire) {
+    if !matches(gpu) || DISCRETE_OWNED.load(core::sync::atomic::Ordering::Acquire) {
         return None;
     }
     let result = prepare(gpu);

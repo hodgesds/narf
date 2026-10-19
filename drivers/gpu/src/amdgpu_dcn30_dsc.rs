@@ -289,10 +289,22 @@ fn optc_mode(r: &DscRegisters) -> u32 {
 pub struct Dsc {
     regs: Regs,
     dcn2: u64,
+    capacity: u8,
+    power_gating: bool,
 }
 impl Dsc {
     pub(crate) fn new(regs: Regs, dcn2: u64) -> Self {
-        Self { regs, dcn2 }
+        Self {
+            regs,
+            dcn2,
+            capacity: 6,
+            power_gating: true,
+        }
+    }
+    pub(crate) fn for_profile(mut self, profile: crate::amdgpu_dcn_profile::Profile) -> Self {
+        self.capacity = profile.pipes();
+        self.power_gating = profile.has_plane_power_gating();
+        self
     }
     fn at(&self, reg: u64) -> u64 {
         self.dcn2 + reg * 4
@@ -309,8 +321,11 @@ impl Dsc {
     /// closed here (a gated engine would never compress), powering down is
     /// left to the caller.
     pub async fn power(&mut self, dsc: u8, on: bool) -> Result<bool, Error> {
-        if dsc >= 6 {
+        if dsc >= self.capacity {
             return Err(Error::Invalid);
+        }
+        if !self.power_gating {
+            return Ok(true);
         }
         let request = self.at(DC_IP_REQUEST_CNTL);
         let original = self.regs.read(request)? & 1;
@@ -341,7 +356,7 @@ impl Dsc {
     /// `opp`. An engine already clocked or forwarding for another OPP is
     /// refused (Linux asserts).
     pub fn start(&mut self, dsc: u8, opp: u8, r: &DscRegisters) -> Result<(), Error> {
-        if dsc >= 6 || opp >= 6 {
+        if dsc >= self.capacity || opp >= self.capacity {
             return Err(Error::Invalid);
         }
         let clocked = self.regs.read(self.engine(dsc, TOP_CONTROL))? & DSC_CLOCK_EN != 0;
@@ -363,7 +378,7 @@ impl Dsc {
     }
     /// `dsc2_disconnect` then `dsc2_disable`.
     pub fn stop(&mut self, dsc: u8) -> Result<(), Error> {
-        if dsc >= 6 {
+        if dsc >= self.capacity {
             return Err(Error::Invalid);
         }
         self.regs
@@ -374,7 +389,7 @@ impl Dsc {
     /// `optc3_set_dsc_config` on OTG `otg`: the OPTC's DSC mode, bytes per
     /// pixel (U3.28) and slice width, then V_SYNC mode 0. `None` disables.
     pub fn optc(&mut self, otg: u8, r: Option<&DscRegisters>) -> Result<(), Error> {
-        if otg >= 6 {
+        if otg >= self.capacity {
             return Err(Error::Invalid);
         }
         let dcn2 = self.dcn2;
@@ -399,7 +414,7 @@ impl Dsc {
     }
     /// `enc3_dp_set_dsc_config` on frontend `fe`. `None` disables.
     pub fn encoder(&mut self, fe: u8, r: Option<&DscRegisters>) -> Result<(), Error> {
-        if fe >= 6 {
+        if fe >= self.capacity {
             return Err(Error::Invalid);
         }
         let (mode, bytes, width) = r.map_or((0, 0, 0), |r| {
@@ -445,7 +460,7 @@ impl Dsc {
     /// 128-byte PPS in four 32-byte SDPs on VPG generic 11..14 (GSP11 in
     /// PPS mode), sent on line 2 of every frame with VBID[6] on line 3.
     pub async fn pps(&mut self, fe: u8, packed: Option<&[u8; 128]>) -> Result<(), Error> {
-        if fe >= 6 {
+        if fe >= self.capacity {
             return Err(Error::Invalid);
         }
         let Some(packed) = packed else {
@@ -504,7 +519,7 @@ impl Dsc {
     }
     /// `enc2_fec_set_ready` on `transmitter`'s link.
     pub fn fec_ready(&mut self, transmitter: u8, ready: bool) -> Result<(), Error> {
-        if transmitter >= 6 {
+        if transmitter >= self.capacity {
             return Err(Error::Invalid);
         }
         self.regs.update(
@@ -515,7 +530,7 @@ impl Dsc {
     }
     /// `enc2_fec_set_enable` on `transmitter`'s link.
     pub fn fec_enable(&mut self, transmitter: u8, enable: bool) -> Result<(), Error> {
-        if transmitter >= 6 {
+        if transmitter >= self.capacity {
             return Err(Error::Invalid);
         }
         self.regs.update(

@@ -146,7 +146,7 @@ impl<I: Io> Engine<I> {
     /// The OTG pixel rate dividers. A DisplayPort 8b/10b stream with one pixel
     /// per container and no ODM combine divides by one then four.
     fn set_pixel_rate_div(&mut self, otg: u8, k1: Divider, k2: Divider) -> Result<(), Error> {
-        if self.profile == Profile::Navi22 {
+        if self.profile.is_dcn30() {
             return Err(Error::Unsupported);
         }
         if otg >= self.profile.pipes() {
@@ -165,7 +165,7 @@ impl<I: Io> Engine<I> {
     /// selects DPREFCLK, so an enable alone routes the wrong clock. Three bits
     /// per OTG, a two-bit select then the enable.
     fn set_dtbclk_p_src(&mut self, otg: u8, source: StreamClock) -> Result<(), Error> {
-        if self.profile == Profile::Navi22 {
+        if self.profile.is_dcn30() {
             return Err(Error::Unsupported);
         }
         if otg >= self.profile.pipes() {
@@ -187,7 +187,7 @@ impl<I: Io> Engine<I> {
     /// every DPIA takes OTG 0, so a stream on any other pipe runs at the wrong
     /// pixel rate. Four bits per DPIA, a three-bit OTG select then the enable.
     fn set_dp_stream_clock(&mut self, dpia: u8, otg: u8, source: StreamClock) -> Result<(), Error> {
-        if self.profile == Profile::Navi22 {
+        if self.profile.is_dcn30() {
             return Err(Error::Unsupported);
         }
         if dpia >= self.profile.pipes() || otg >= self.profile.pipes() {
@@ -217,7 +217,7 @@ impl<I: Io> Engine<I> {
     }
 
     async fn dentist(&mut self, disp: u8, dpp: u8) -> Result<(), Error> {
-        if self.profile != Profile::Navi22 {
+        if !self.profile.is_dcn30() {
             return Err(Error::Unsupported);
         }
         if !(8..=127).contains(&disp) || !(8..=127).contains(&dpp) {

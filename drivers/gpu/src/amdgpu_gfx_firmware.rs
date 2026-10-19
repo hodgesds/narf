@@ -33,16 +33,21 @@ impl Source {
         Self::Dmcub,
     ];
     pub fn name(self) -> &'static str {
+        self.name_for(&crate::amdgpu_rdna2::NAVI22)
+    }
+    /// Container selected by an exact discrete RDNA2 profile.
+    pub fn name_for(self, profile: &crate::amdgpu_rdna2::Profile) -> &'static str {
+        let firmware = profile.firmware;
         match self {
-            Self::Sdma => "amdgpu/navy_flounder_sdma.bin",
-            Self::Ce => "amdgpu/navy_flounder_ce.bin",
-            Self::Pfp => "amdgpu/navy_flounder_pfp.bin",
-            Self::Me => "amdgpu/navy_flounder_me.bin",
-            Self::Mec => "amdgpu/navy_flounder_mec.bin",
-            Self::Mec2 => "amdgpu/navy_flounder_mec2.bin",
-            Self::Rlc => "amdgpu/navy_flounder_rlc.bin",
-            Self::Vcn => "amdgpu/navy_flounder_vcn.bin",
-            Self::Dmcub => "amdgpu/navy_flounder_dmcub.bin",
+            Self::Sdma => firmware.sdma,
+            Self::Ce => firmware.ce,
+            Self::Pfp => firmware.pfp,
+            Self::Me => firmware.me,
+            Self::Mec => firmware.mec,
+            Self::Mec2 => firmware.mec2,
+            Self::Rlc => firmware.rlc,
+            Self::Vcn => firmware.vcn,
+            Self::Dmcub => firmware.dmcub,
         }
     }
 }

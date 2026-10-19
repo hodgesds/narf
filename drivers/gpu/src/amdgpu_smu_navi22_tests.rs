@@ -10,7 +10,16 @@ fn put(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 pub(crate) fn firmware() -> Firmware {
-    Firmware { bytes: container() }
+    Firmware {
+        profile: &crate::amdgpu_rdna2::NAVI22,
+        bytes: container(),
+    }
+}
+pub(crate) fn firmware_for(profile: &'static crate::amdgpu_rdna2::Profile) -> Firmware {
+    Firmware {
+        profile,
+        bytes: container(),
+    }
 }
 fn container() -> Vec<u8> {
     let mut bytes = vec![0; 278];
@@ -1326,4 +1335,130 @@ fn smu_navi22_gating_features_follow_smu_cmn() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/smu-navi22",
     smu_navi22_gating_features_follow_smu_cmn
+);
+
+fn rdna2_smc_preparation_requires_matching_gc_mp1_and_live_authority() -> TestResult {
+    for profile in crate::amdgpu_rdna2::PROFILES {
+        let mut gpu = crate::amdgpu_gfx_navi22::tests::gpu();
+        gpu.chip = crate::amdgpu::__test_chip_info_for_pci_id(0x1002, profile.pci_ids[0]).unwrap();
+        for (index, version) in [(0, profile.gc_version), (1, profile.psp_version)] {
+            let ip = &mut gpu.ip_blocks[index];
+            (ip.major, ip.minor, ip.revision) = version;
+        }
+        let authority = Cap::bootstrap();
+        authority.revoke();
+        if !matches!(Firmware::open_rdna2(&gpu, &authority), Err(Error::Revoked)) {
+            return TestResult::Fail("RDNA2 SMC did not check registry authority");
+        }
+        for block in 0..2 {
+            let original = gpu.ip_blocks.clone();
+            gpu.ip_blocks[block].revision ^= 0x80;
+            if !matches!(
+                Firmware::open_rdna2(&gpu, &authority),
+                Err(Error::Unsupported)
+            ) {
+                return TestResult::Fail("RDNA2 SMC accepted a foreign GC/MP1 identity");
+            }
+            gpu.ip_blocks = original;
+        }
+        let prepared = firmware_for(profile);
+        if prepared.profile() != profile || prepared.image().is_err() {
+            return TestResult::Fail("RDNA2 SMC lost prepared ASIC identity");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_smc_preparation_requires_matching_gc_mp1_and_live_authority
+);
+
+fn rdna2_smc21_selects_exact_board_id_and_rejects_overlaps() -> TestResult {
+    let mut bytes = vec![0; 92];
+    for (at, word) in [
+        (0, 92u32),
+        (4, 44),
+        (8, 0x10002),
+        (12, 11),
+        (16, 1),
+        (20, 16),
+        (24, 44),
+        (36, 2),
+        (40, 60),
+        (60, 2380),
+        (64, 84),
+        (68, 4),
+        (72, 2443),
+        (76, 88),
+        (80, 4),
+    ] {
+        bytes[at..at + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    bytes[44..60].fill(0xa5);
+    bytes[84..88].fill(0x5a);
+    bytes[88..92].fill(0x7b);
+    let image = firmware::Image::parse(&bytes).unwrap();
+    if image.payload() != [0xa5; 16]
+        || image.powerplay().is_some()
+        || image.powerplay_for(2380) != Some(&[0x5a; 4][..])
+        || image.powerplay_for(2443) != Some(&[0x7b; 4][..])
+        || image.powerplay_for(1).is_some()
+        || image.powerplay_ids().collect::<Vec<_>>() != [2380, 2443]
+    {
+        return TestResult::Fail("SMC2.1 board ID fell back or selected firmware bytes");
+    }
+    for (at, value) in [
+        (36, 0),
+        (36, 257),
+        (40, 44),
+        (60, 2443),
+        (64, 40),
+        (64, 44),
+        (64, 60),
+        (68, u32::MAX),
+        (76, 84),
+    ] {
+        let mut bad = bytes.clone();
+        bad[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        if firmware::Image::parse(&bad).is_ok() {
+            return TestResult::Fail("SMC2.1 accepted malformed table directory");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_smc21_selects_exact_board_id_and_rejects_overlaps
+);
+
+fn rdna2_smu_mailbox_constructor_checks_profile_before_io() -> TestResult {
+    for profile in crate::amdgpu_rdna2::PROFILES {
+        let mut gpu = crate::amdgpu_cp_navi22::tests::rdna2_gpu(profile, profile.pci_ids[0]);
+        gpu.ip_blocks
+            .iter_mut()
+            .find(|b| b.hw_id == discovery::HW_ID_MP1)
+            .unwrap()
+            .revision = profile.psp_version.2;
+        let cap = Cap::bootstrap();
+        cap.revoke();
+        // SAFETY: constructor performs no I/O; revoked authority stops verify.
+        let mut smu = unsafe { Smu::after_upload_rdna2(&gpu, cap) }.unwrap();
+        if run(smu.verify()) != Err(Error::Revoked) || smu.state() != State::Failed {
+            return TestResult::Fail("family SMU bypassed live authority");
+        }
+        gpu.ip_blocks
+            .iter_mut()
+            .find(|b| b.hw_id == discovery::HW_ID_MP1)
+            .unwrap()
+            .revision = 0xff;
+        // SAFETY: malformed discovery is rejected without I/O.
+        if unsafe { Smu::after_upload_rdna2(&gpu, cap) }.is_ok() {
+            return TestResult::Fail("foreign SMU accepted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_smu_mailbox_constructor_checks_profile_before_io
 );

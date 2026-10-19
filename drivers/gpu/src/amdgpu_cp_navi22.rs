@@ -45,6 +45,8 @@ pub mod doorbell {
     pub const GFX_RING0: u32 = 0x08b << 1; // linux: AMDGPU_NAVI10_DOORBELL_GFX_RING0 << 1
     pub const SDMA0: u32 = 0x100 << 1; // linux: AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0 << 1
     pub const SDMA1: u32 = 0x10a << 1; // linux: AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE1 << 1
+    pub const SDMA2: u32 = 0x114 << 1; // linux: AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE2 << 1
+    pub const SDMA3: u32 = 0x11e << 1; // linux: AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE3 << 1
     /// `adev->doorbell_index.sdma_doorbell_range` (nv.c).
     pub const SDMA_RANGE: u32 = 20; // linux: n/a (literal in nv.c:nv_init_doorbell_index)
 }
@@ -99,6 +101,18 @@ impl Doorbells {
             map,
         }
     }
+    /// Map a known discrete RDNA2 physical function's BAR2 doorbell page.
+    ///
+    /// # Safety
+    /// Caller owns this PF's configuration/BAR2 exclusively during single-CPU
+    /// boot and retains the mapping for the lifetime of every queue owner.
+    pub unsafe fn map_rdna2(device: &narf_bus::BusDevice) -> Result<Self, Error> {
+        crate::amdgpu_rdna2::for_pci_id(device.id.vendor, device.id.device)
+            .ok_or(Error::Unsupported)?;
+        // SAFETY: all validated discrete RDNA2 profiles use the NBIF BAR2
+        // doorbell page; caller supplies its exclusive permanent mapping contract.
+        unsafe { Self::map_navi22(device) }
+    }
     pub fn bus_address(&self) -> u64 {
         self.bus
     }
@@ -112,7 +126,10 @@ impl Doorbells {
 /// offsets in BAR5.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Layout {
+    pub profile: &'static crate::amdgpu_rdna2::Profile,
     pub gc: [u64; 2],
+    /// GC segment 2 for SDMA2/3, resolved only by the family queue owner.
+    pub sdma_high: Option<u64>,
     pub nbio: u64,
     pub hdp: u64,
     /// OSSSYS 5.0.3 segment 0: the IH VMID LUT a client job's flush writes.
@@ -120,22 +137,35 @@ pub(crate) struct Layout {
 }
 impl Layout {
     pub(crate) fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
-        if gpu.chip.vid != crate::amdgpu::AMD_VENDOR
-            || gpu.chip.did != crate::amdgpu::NAVI22
-            // linux: n/a (NARF bound: MMIO_REG_HOLE_OFFSET 0x7f000 + one dword)
-            || gpu.regs.len < 0x7f004
-        {
+        if gpu.chip.vid != crate::amdgpu::AMD_VENDOR || gpu.chip.did != crate::amdgpu::NAVI22 {
+            return Err(Error::Unsupported);
+        }
+        Self::resolve_for(gpu, &crate::amdgpu_rdna2::NAVI22, &[(5, 0, 3)])
+    }
+    pub(crate) fn resolve_rdna2(gpu: &AmdGpu) -> Result<Self, Error> {
+        let profile = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did)
+            .ok_or(Error::Unsupported)?;
+        Self::resolve_for(gpu, profile, &[(5, 0, 0), (5, 0, 1), (5, 0, 2), (5, 0, 3)])
+    }
+    fn resolve_for(
+        gpu: &AmdGpu,
+        profile: &'static crate::amdgpu_rdna2::Profile,
+        oss_versions: &[(u8, u8, u8)],
+    ) -> Result<Self, Error> {
+        if gpu.regs.len < 0x7f004 {
             return Err(Error::Unsupported);
         }
         let reg = |id, versions: &[(u8, u8, u8)], index, last| {
             bank(gpu, id, versions, index, last).map_err(|_| Error::Unsupported)
         };
-        crate::amdgpu_psp_ring::bank(gpu, ip::HW_ID_SDMA0, &[(5, 2, 2)], 0, 0)
+        crate::amdgpu_psp_ring::bank(gpu, ip::HW_ID_SDMA0, &[profile.sdma_version], 0, 0)
             .map_err(|_| Error::Unsupported)?;
         let layout = Self {
+            profile,
+            sdma_high: None,
             gc: [
-                reg(ip::HW_ID_GC, &[(10, 3, 2)], 0, LAST_GC0)?,
-                reg(ip::HW_ID_GC, &[(10, 3, 2)], 1, LAST_GC1)?,
+                reg(ip::HW_ID_GC, &[profile.gc_version], 0, LAST_GC0)?,
+                reg(ip::HW_ID_GC, &[profile.gc_version], 1, LAST_GC1)?,
             ],
             nbio: reg(
                 ip::HW_ID_NBIF,
@@ -159,11 +189,22 @@ impl Layout {
             )?,
             oss: reg(
                 ip::HW_ID_OSSSYS,
-                &[(5, 0, 3)],
+                oss_versions,
                 0,
                 crate::amdgpu_navi22_submit::IH_VMID_LUT_LAST,
             )?,
         };
+        let golden =
+            crate::amdgpu_rdna2::golden::for_gc(profile.gc_version).ok_or(Error::Unsupported)?;
+        for row in golden {
+            // Bound every row as well as the common queue register windows.
+            reg(
+                ip::HW_ID_GC,
+                &[profile.gc_version],
+                usize::from(row.base_index),
+                row.offset,
+            )?;
+        }
         // SET_UCONFIG_REG and the CSB context index are encoded relative to
         // fixed apertures; reject bases that would alias other registers.
         if layout.dword(SCRATCH_REG0) < 0xc000 // linux-lit: 0xc000=PACKET3_SET_UCONFIG_REG_START
@@ -194,7 +235,15 @@ impl Layout {
     }
     /// `sdma_v5_2_get_reg_offset` for instances 0/1 (non-HYP registers).
     pub(crate) fn sdma(&self, instance: u32, r: Reg) -> u64 {
-        self.reg(r) + u64::from(instance * SDMA1_REG_OFFSET) * 4
+        match instance {
+            0 | 1 => self.reg(r) + u64::from(instance * SDMA1_REG_OFFSET) * 4,
+            2 | 3 => {
+                self.sdma_high
+                    .expect("SDMA2/3 bank validated before allocation")
+                    + u64::from(r.1 + (instance - 2) * SDMA3_REG_OFFSET) * 4
+            }
+            _ => unreachable!("validated SDMA instance"),
+        }
     }
     pub(crate) fn nbio(&self, reg: u32) -> u64 {
         self.nbio + u64::from(reg) * 4
@@ -685,13 +734,21 @@ pub(crate) async fn ib_test<I: Io>(hw: &mut Hw<I>, queue: &mut Queue) -> Result<
 pub struct FenceReader {
     regs: MmioRegion,
     hdp_invalidate: u64,
-    slots: [MmioRegion; 4],
+    slots: [Option<MmioRegion>; 6],
     authority: Cap<BusDeviceCap, Write>,
 }
 impl FenceReader {
+    pub(crate) fn present(&self, ring: usize) -> bool {
+        self.slots.get(ring).is_some_and(Option::is_some)
+    }
     /// The last sequence ring `ring` (0 gfx, 1 compute, 2/3 SDMA) wrote.
     pub fn completed(&self, ring: usize) -> Result<u32, Error> {
-        let slot = *self.slots.get(ring).ok_or(Error::Invalid)?;
+        let slot = self
+            .slots
+            .get(ring)
+            .copied()
+            .flatten()
+            .ok_or(Error::Invalid)?;
         let (regs, hdp) = (self.regs, self.hdp_invalidate);
         self.authority
             .invoke(Op(|| {
@@ -713,7 +770,7 @@ impl Gfx {
         self.engine.queue.map()
     }
     /// A [`FenceReader`] over this owner's registers and `slots`.
-    pub(crate) fn fence_reader(&self, slots: [MmioRegion; 4]) -> FenceReader {
+    pub(crate) fn fence_reader(&self, slots: [Option<MmioRegion>; 6]) -> FenceReader {
         FenceReader {
             regs: self.engine.hw.io.regs,
             hdp_invalidate: self.engine.hw.layout.hdp + 0xd1 * 4,
@@ -778,12 +835,15 @@ pub(crate) struct GfxEngine<I: Io> {
     pub queue: Queue,
     pub state: GfxState,
     pub proof: GfxProof,
-    /// golden_settings_gc_10_3_2 already applied (`golden`), so `configure`
+    /// The ASIC's golden sequence already applied (`golden`), so `configure`
     /// does not rewrite them after other engines started.
     pub golden: bool,
 }
 fn program_golden<I: Io>(io: &mut I, l: Layout) -> Result<(), Error> {
-    for (reg, and, or) in GOLDEN {
+    let rows =
+        crate::amdgpu_rdna2::golden::for_gc(l.profile.gc_version).ok_or(Error::Unsupported)?;
+    for row in rows {
+        let (reg, and, or) = (Reg(row.base_index, row.offset), row.and_mask, row.or_mask);
         // soc15_program_register_sequence
         if and == u32::MAX {
             // linux: n/a (soc15_program_register_sequence full-mask test)
@@ -1078,10 +1138,33 @@ impl Gfx {
         pool: &Pool,
         doorbells: Doorbells,
     ) -> Result<Self, Error> {
+        Self::with_layout(gpu, authority, pool, doorbells, Layout::resolve(gpu)?)
+    }
+    /// Reserve a privileged GFX ring for any validated discrete RDNA2 profile.
+    /// Golden programming selects the exact ASIC table; no queue is started.
+    ///
+    /// # Safety
+    /// Same exclusive physical GPU, GC/RLC/CP/HDP, doorbell and permanent pool
+    /// contract as `new`. No other graphics owner or active client may exist.
+    pub unsafe fn new_rdna2(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        doorbells: Doorbells,
+    ) -> Result<Self, Error> {
+        Self::with_layout(gpu, authority, pool, doorbells, Layout::resolve_rdna2(gpu)?)
+    }
+    fn with_layout(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        doorbells: Doorbells,
+        layout: Layout,
+    ) -> Result<Self, Error> {
         Ok(Self {
             engine: GfxEngine {
                 hw: Hw {
-                    layout: Layout::resolve(gpu)?,
+                    layout,
                     io: Mmio::new(gpu, doorbells),
                     authority,
                 },
@@ -1092,7 +1175,7 @@ impl Gfx {
             },
         })
     }
-    /// Apply golden_settings_gc_10_3_2 ahead of SDMA bring-up, as Linux's
+    /// Apply the ASIC's golden sequence ahead of SDMA bring-up, as Linux's
     /// GFX hw_init precedes SDMA's. No queue is touched.
     ///
     /// # Safety
@@ -1183,6 +1266,24 @@ pub unsafe fn enable_doorbell_apertures(
     hw.access(|io, l| enable_doorbells(io, l, doorbells.bus))
 }
 
+/// Enable the shared RDNA2 NBIF doorbell/self-ring apertures.
+///
+/// # Safety
+/// Caller exclusively owns this physical GPU's NBIF; `doorbells` is its
+/// permanent BAR2 page, and no other aperture writer or queue owner runs.
+pub unsafe fn enable_doorbell_apertures_rdna2(
+    gpu: &AmdGpu,
+    authority: Cap<BusDeviceCap, Write>,
+    doorbells: Doorbells,
+) -> Result<(), Error> {
+    let mut hw = Hw {
+        layout: Layout::resolve_rdna2(gpu)?,
+        io: Mmio::new(gpu, doorbells),
+        authority,
+    };
+    hw.access(|io, l| enable_doorbells(io, l, doorbells.bus))
+}
+
 /// `TIME_STAMP_INT_ENABLE` in CP_INT_CNTL_RING0 / CP_ME1_PIPE0_INT_CNTL.
 const TIME_STAMP_INT_ENABLE: u32 = 1 << 26; // linux: CP_INT_CNTL_RING0__TIME_STAMP_INT_ENABLE_MASK
 /// `SDMA0_CNTL.TRAP_ENABLE`.
@@ -1195,11 +1296,18 @@ const SDMA_TRAP_ENABLE: u32 = 1; // linux: SDMA0_CNTL__TRAP_ENABLE_MASK@gc
 /// `sdma_v5_2_set_trap_irq_state` (both engines). The KIQ's MEC2 pipe is not
 /// armed, as in Linux; its fences stay polled.
 pub(crate) fn enable_fence_irqs<I: Io>(io: &mut I, l: Layout) -> Result<(), Error> {
+    enable_fence_irqs_for(io, l, 2)
+}
+pub(crate) fn enable_fence_irqs_for<I: Io>(
+    io: &mut I,
+    l: Layout,
+    count: usize,
+) -> Result<(), Error> {
     for reg in [CP_INT_CNTL_RING0, CP_ME1_PIPE0_INT_CNTL] {
         update(io, l.reg(reg), TIME_STAMP_INT_ENABLE, TIME_STAMP_INT_ENABLE)?;
     }
     // Re-armed after SdmaQueues' soft reset cleared the IH proof's enable.
-    for instance in 0..2 {
+    for instance in 0..count as u32 {
         update(
             io,
             l.sdma(instance, SDMA0_CNTL),
@@ -1227,6 +1335,25 @@ pub unsafe fn enable_fence_interrupts(
         authority,
     };
     hw.access(enable_fence_irqs)
+}
+
+/// Arm GFX/compute and every discovered RDNA2 SDMA completion source.
+///
+/// # Safety
+/// Caller owns all engines and doorbells exclusively; every kernel ring has
+/// passed its proofs and IH is enabled and routing these sources.
+pub unsafe fn enable_fence_interrupts_rdna2(
+    gpu: &AmdGpu,
+    authority: Cap<BusDeviceCap, Write>,
+    doorbells: Doorbells,
+) -> Result<(), Error> {
+    let (layout, count) = crate::amdgpu_sdma_navi22_queues::resolve_rdna2(gpu)?;
+    let mut hw = Hw {
+        layout,
+        io: Mmio::new(gpu, doorbells),
+        authority,
+    };
+    hw.access(|io, l| enable_fence_irqs_for(io, l, count))
 }
 
 #[cfg(feature = "kernel-test")]

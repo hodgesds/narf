@@ -203,6 +203,7 @@ kernel_test_in!(
 fn navi22_display_admission_reports_only_what_dml30_proved() -> TestResult {
     use crate::amdgpu_dml30 as dml30;
     let soc = dml30::Soc {
+        dcn_revision: 0,
         dcfclk_khz: 1_200_000,
         fabric_khz: 1_200_000,
         socclk_khz: 1_000_000,

@@ -24,8 +24,10 @@ pub enum Engine {
     Vcn0,
     Vcn1,
     Jpeg,
+    Sdma2,
+    Sdma3,
 }
-const ENGINES: usize = 8; // linux: n/a (NARF hook slot count)
+pub(crate) const ENGINES: usize = 10; // linux: n/a (NARF hook slot count)
 /// Interval between memory samples when no interrupt arrives.
 pub const POLL_US: u64 = 1000; // linux: n/a (NARF poll policy)
 
@@ -67,6 +69,8 @@ pub fn notify_all() {
         Engine::Vcn0,
         Engine::Vcn1,
         Engine::Jpeg,
+        Engine::Sdma2,
+        Engine::Sdma3,
     ] {
         notify(engine);
     }

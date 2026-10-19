@@ -87,15 +87,15 @@ impl Resources {
         dsc: bool,
     ) -> Result<Lease, Error> {
         let mut next = *self;
-        let pipe = first_free(next.pipes, PIPES).ok_or(Error::Busy)?;
+        let pipe = first_free(next.pipes, next.capacity).ok_or(Error::Busy)?;
         let preferred = connector.path.transmitter;
-        if preferred >= STREAMS {
+        if preferred >= next.capacity {
             return Err(Error::Invalid);
         }
         let stream = if next.streams & 1 << preferred == 0 {
             preferred
         } else {
-            (0..STREAMS)
+            (0..next.capacity)
                 .rev()
                 .find(|i| next.streams & 1 << i == 0)
                 .ok_or(Error::Busy)?
@@ -103,7 +103,7 @@ impl Resources {
         let clock = match connector.signal {
             Signal::DisplayPort => ClockSource::DpDto,
             Signal::Hdmi => {
-                let shared = (0..PLLS).find(|&p| {
+                let shared = (0..next.capacity).find(|&p| {
                     next.plls & 1 << p != 0
                         && next.pll_timing[usize::from(p)]
                             .is_some_and(|t| synchronizable(&t, timing))
@@ -114,7 +114,7 @@ impl Resources {
                         ClockSource::Pll(p)
                     }
                     None => {
-                        let p = first_free(next.plls, PLLS).ok_or(Error::Busy)?;
+                        let p = first_free(next.plls, next.capacity).ok_or(Error::Busy)?;
                         next.plls |= 1 << p;
                         next.pll_sharers[usize::from(p)] = 0;
                         next.pll_timing[usize::from(p)] = Some(*timing);
@@ -128,7 +128,7 @@ impl Resources {
         let odm_pipe = match odm {
             Odm::None => None,
             Odm::TwoToOne => {
-                let p = (0..PIPES)
+                let p = (0..next.capacity)
                     .rev()
                     .find(|i| next.pipes & 1 << i == 0)
                     .ok_or(Error::Busy)?;
@@ -700,7 +700,7 @@ impl Group {
         }
         // The first stream's route is the same whatever the others need:
         // pipe 0, its preferred frontend, the first PLL or the DP DTO.
-        let route = Resources::new().acquire(&first.connector)?;
+        let route = Resources::for_gpu(gpu)?.acquire(&first.connector)?;
         // SAFETY: forwarded.
         let lead = unsafe { Pipeline::new(gpu, authority, first.connector, route) }?;
         let mut members = Vec::new();
@@ -712,7 +712,7 @@ impl Group {
         copy.try_reserve_exact(requests.len())
             .map_err(|_| Error::Allocation)?;
         copy.extend(requests.iter().cloned());
-        let profile = crate::amdgpu_dcn_profile::Profile::Navi22;
+        let profile = crate::amdgpu_dcn_profile::Profile::resolve(gpu)?;
         let dcn2 = profile.bank(gpu, 2, dsc::LAST_REG.max(mst::LAST_REG))?;
         let regs = Regs {
             window: Window::new(gpu.regs),
@@ -727,8 +727,8 @@ impl Group {
             leases: Vec::new(),
             plans: Vec::new(),
             joint: None,
-            resources: Resources::new(),
-            dsc: Some(dsc::Dsc::new(regs, dcn2)),
+            resources: Resources::for_gpu(gpu)?,
+            dsc: Some(dsc::Dsc::new(regs, dcn2).for_profile(profile)),
             mst_source: Some(mst::Source::new(regs, dcn2)),
             mst: None,
             mst_link: None,
@@ -832,13 +832,14 @@ impl Group {
             .map_err(Error::Hubbub)?;
         let soc =
             dml30::Soc::from_board(&levels, board.channels, board.channel_width_bytes, refclk)
+                .and_then(|soc| soc.for_gpu(&self.gpu))
                 .map_err(Error::Mode)?;
 
         // Every stream's pipeline on its provisional route: the pipe, the
         // frontend and the kind of clock source are what the final lease
         // gives (only a shared HDMI PLL can differ), so detection's DP link
         // half (`discover_dp`) runs on each connector's own blocks.
-        let mut provisional = Resources::new();
+        let mut provisional = Resources::for_gpu(&self.gpu)?;
         provisional.acquire(&self.requests[0].connector)?;
         for k in 1..self.requests.len() {
             let connector = self.requests[k].connector;
@@ -899,7 +900,7 @@ impl Group {
         self.at(Phase::Admitted);
 
         // The pool from empty: every stream's lease.
-        let mut resources = Resources::new();
+        let mut resources = Resources::for_gpu(&self.gpu)?;
         let mut leases = Vec::new();
         leases
             .try_reserve_exact(plans.len())

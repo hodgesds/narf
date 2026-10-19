@@ -320,7 +320,7 @@ impl Flip {
         pipe: u8,
     ) -> Result<Self, Error> {
         let profile = Profile::resolve(gpu)?;
-        if profile != Profile::Navi22 || pipe >= profile.pipes() {
+        if !profile.is_dcn30() || pipe >= profile.pipes() {
             return Err(Error::Unsupported);
         }
         let last = OTG_GLOBAL_SYNC_STATUS + u64::from(profile.pipes() - 1) * OTG_STRIDE;

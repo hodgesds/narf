@@ -12,6 +12,7 @@ use crate::{
     amdgpu_fence_navi22 as fence,
     amdgpu_vram::Pool,
 };
+use alloc::vec::Vec;
 use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, Write};
 
@@ -38,14 +39,14 @@ pub enum State {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Proof {
     /// An earlier idle ring was stopped before reprogramming (per engine).
-    pub stopped: [bool; 2],
-    pub ring: [bool; 2],
-    pub ib_fence: [u32; 2],
+    pub stopped: [bool; 4],
+    pub ring: [bool; 4],
+    pub ib_fence: [u32; 4],
 }
 #[derive(Debug)]
 pub(crate) struct Engine<I: Io> {
     pub hw: Hw<I>,
-    pub queues: [Queue; 2],
+    pub queues: Vec<Queue>,
     pub state: State,
     pub proof: Proof,
 }
@@ -67,16 +68,16 @@ impl<I: Io> Engine<I> {
         result
     }
     async fn start_inner(&mut self) -> Result<(), Error> {
-        let [q0, q1] = &mut self.queues;
+        let count = self.queues.len();
+        let queues = &mut self.queues;
         let stopped = self.hw.access(|io, l| {
             let reset = checked(io.read(l.reg(GRBM_SOFT_RESET)))?;
             // linux-lit: 23=GRBM_SOFT_RESET__SOFT_RESET_SDMA0__SHIFT@gc
-            // linux-lit: 3=(GRBM_SOFT_RESET__SOFT_RESET_SDMA0_MASK@gc | GRBM_SOFT_RESET__SOFT_RESET_SDMA1_MASK@gc) >> 23
-            if reset & (3 << 23) != 0 {
+            if reset & (((1u32 << count) - 1) << 23) != 0 {
                 return Err(Error::Busy);
             }
-            let mut stopped = [false; 2];
-            for i in 0..2 {
+            let mut stopped = [false; 4];
+            for i in 0..count as u32 {
                 let rb = checked(io.read(reg(l, i, SDMA0_GFX_RB_CNTL)))?;
                 if rb & RB_ENABLE != 0 {
                     // Only an idle predecessor ring may be taken over.
@@ -90,8 +91,9 @@ impl<I: Io> Engine<I> {
                     stopped[i as usize] = true;
                 }
             }
-            q0.clear(io);
-            q1.clear(io);
+            for q in queues {
+                q.clear(io);
+            }
             flush(io, l);
             Ok(stopped)
         })?;
@@ -101,7 +103,7 @@ impl<I: Io> Engine<I> {
         }
         self.proof.stopped = stopped;
         self.hw.access(|io, l| {
-            for i in 0..2 {
+            for i in 0..count as u32 {
                 // sdma_v5_2_ctx_switch_enable(false) + sdma_v5_2_enable(false)
                 update(io, reg(l, i, SDMA0_GFX_RB_CNTL), RB_ENABLE, 0)?;
                 // linux-lit: 1=SDMA0_GFX_IB_CNTL__IB_ENABLE_MASK@gc
@@ -113,7 +115,7 @@ impl<I: Io> Engine<I> {
             Ok(())
         })?;
         self.state = State::Resetting;
-        for i in 0..2u32 {
+        for i in 0..self.queues.len() as u32 {
             // sdma_v5_2_soft_reset_engine
             let bit = 1 << (23 + i); // linux-lit: 23=GRBM_SOFT_RESET__SOFT_RESET_SDMA0__SHIFT@gc
             self.hw.access(|io, l| {
@@ -130,11 +132,11 @@ impl<I: Io> Engine<I> {
             delay(50).await; // linux: n/a (literal in sdma_v5_2.c:sdma_v5_2_soft_reset)
         }
         self.hw.access(|io, l| {
-            for i in 0..2 {
+            for i in 0..count as u32 {
                 // linux-lit: 1=SDMA0_F32_CNTL__HALT_MASK@gc
                 update(io, reg(l, i, SDMA0_F32_CNTL), 1, 0)?; // enable(true)
             }
-            for i in 0..2 {
+            for i in 0..count as u32 {
                 // ctx_switch_enable(true) with the default phase quantum
                 for r in [
                     SDMA0_PHASE0_QUANTUM,
@@ -152,7 +154,7 @@ impl<I: Io> Engine<I> {
             }
             Ok(())
         })?;
-        for i in 0..2u32 {
+        for i in 0..self.queues.len() as u32 {
             self.state = State::Programming(i as u8);
             self.resume_instance(i).await?;
             self.proof.ring[i as usize] = true;
@@ -198,7 +200,14 @@ impl<I: Io> Engine<I> {
             // linux-lit: 2=SDMA0_GFX_DOORBELL_OFFSET__OFFSET__SHIFT@gc
             update(io, r(SDMA0_GFX_DOORBELL_OFFSET), 0x0fff_fffc, index << 2)?;
             // nbio_v2_3_sdma_doorbell_range: OFFSET[11:2], SIZE[20:16]
-            let range = l.nbio([NBIO_SDMA0_DOORBELL_RANGE, NBIO_SDMA1_DOORBELL_RANGE][i as usize]);
+            let range = l.nbio(
+                [
+                    NBIO_SDMA0_DOORBELL_RANGE,
+                    NBIO_SDMA1_DOORBELL_RANGE,
+                    NBIO_SDMA2_DOORBELL_RANGE,
+                    NBIO_SDMA3_DOORBELL_RANGE,
+                ][i as usize],
+            );
             update(
                 io,
                 range,
@@ -251,7 +260,7 @@ impl<I: Io> Engine<I> {
         }
         self.state = State::Testing;
         let mut result = Ok(());
-        for i in 0..2 {
+        for i in 0..self.queues.len() {
             result = self.test_ib_instance(i).await;
             if result.is_err() {
                 break;
@@ -301,6 +310,67 @@ impl<I: Io> Engine<I> {
     }
 }
 
+pub(crate) fn resolve_rdna2(gpu: &AmdGpu) -> Result<(Layout, usize), Error> {
+    use crate::amdgpu_discovery as ip;
+    let mut layout = Layout::resolve_rdna2(gpu)?;
+    let mut mask = 0u8;
+    for block in &gpu.ip_blocks {
+        if ![
+            ip::HW_ID_SDMA0,
+            ip::HW_ID_SDMA1,
+            ip::HW_ID_SDMA2,
+            ip::HW_ID_SDMA3,
+        ]
+        .contains(&block.hw_id)
+        {
+            continue;
+        }
+        if block.instance >= 4
+            || (block.major, block.minor, block.revision) != layout.profile.sdma_version
+        {
+            return Err(Error::Unsupported);
+        }
+        let bit = 1 << block.instance;
+        if mask & bit != 0 {
+            return Err(Error::Unsupported);
+        }
+        mask |= bit;
+    }
+    let count = mask.count_ones() as usize;
+    if count == 0 || mask != (1 << count) - 1 {
+        return Err(Error::Unsupported);
+    }
+    if count > 2 {
+        layout.sdma_high = Some(
+            crate::amdgpu_psp_ring::bank(
+                gpu,
+                ip::HW_ID_GC,
+                &[layout.profile.gc_version],
+                2,
+                SDMA0_GFX_MINOR_PTR_UPDATE.1 + SDMA3_REG_OFFSET,
+            )
+            .map_err(|_| Error::Unsupported)?,
+        );
+        crate::amdgpu_psp_ring::bank(
+            gpu,
+            ip::HW_ID_NBIF,
+            &[
+                (2, 3, 0),
+                (2, 3, 1),
+                (2, 3, 2),
+                (3, 3, 0),
+                (3, 3, 1),
+                (3, 3, 2),
+                (3, 3, 3),
+            ],
+            2,
+            NBIO_SDMA3_DOORBELL_RANGE,
+        )
+        .map_err(|_| Error::Unsupported)?;
+    }
+    Ok((layout, count))
+}
+
 /// Owner of the SDMA0 and SDMA1 gfx kernel queues.
 #[derive(Debug)]
 pub struct Sdma {
@@ -319,21 +389,64 @@ impl Sdma {
         pool: &Pool,
         doorbells: Doorbells,
     ) -> Result<Self, Error> {
+        Self::with_layout(gpu, authority, pool, doorbells, Layout::resolve(gpu)?, 2)
+    }
+    /// Reserve every discovered SDMA 5.2 engine (one to four).
+    ///
+    /// # Safety
+    /// Same physical GPU, all SDMA engines/reset/doorbells and permanent pool
+    /// ownership as `new`; no VF, concurrent queue owner or outstanding work.
+    pub unsafe fn new_rdna2(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        doorbells: Doorbells,
+    ) -> Result<Self, Error> {
+        let (layout, count) = resolve_rdna2(gpu)?;
+        Self::with_layout(gpu, authority, pool, doorbells, layout, count)
+    }
+    fn with_layout(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        doorbells: Doorbells,
+        layout: Layout,
+        count: usize,
+    ) -> Result<Self, Error> {
+        let mut queues = Vec::new();
+        queues
+            .try_reserve_exact(count)
+            .map_err(|_| Error::Allocation)?;
+        for i in 0..count {
+            let index = [
+                doorbell::SDMA0,
+                doorbell::SDMA1,
+                doorbell::SDMA2,
+                doorbell::SDMA3,
+            ][i];
+            let engine = [
+                fence::Engine::Sdma0,
+                fence::Engine::Sdma1,
+                fence::Engine::Sdma2,
+                fence::Engine::Sdma3,
+            ][i];
+            queues.push(Queue::new(pool, Kind::Sdma, index, engine)?);
+        }
         Ok(Self {
             engine: Engine {
                 hw: Hw {
-                    layout: Layout::resolve(gpu)?,
+                    layout,
                     io: Mmio::new(gpu, doorbells),
                     authority,
                 },
-                queues: [
-                    Queue::new(pool, Kind::Sdma, doorbell::SDMA0, fence::Engine::Sdma0)?,
-                    Queue::new(pool, Kind::Sdma, doorbell::SDMA1, fence::Engine::Sdma1)?,
-                ],
+                queues,
                 state: State::Prepared,
                 proof: Proof::default(),
             },
         })
+    }
+    pub fn instance_count(&self) -> u8 {
+        self.engine.queues.len() as u8
     }
     /// # Safety
     /// Firmware is loaded, VMID0 is ready, gating is disabled, doorbell
@@ -347,8 +460,8 @@ impl Sdma {
     pub fn state(&self) -> State {
         self.engine.state
     }
-    pub(crate) fn fence_map(&self, instance: usize) -> narf_bus::MmioRegion {
-        self.engine.queues[instance & 1].map()
+    pub(crate) fn fence_map(&self, instance: usize) -> Option<narf_bus::MmioRegion> {
+        self.engine.queues.get(instance).map(Queue::map)
     }
     /// Client IBs on SDMA `instance` (0 or 1); see `Gfx::submit`.
     pub fn submit(
@@ -359,7 +472,8 @@ impl Sdma {
         context: u64,
         ibs: &[crate::amdgpu_navi22_submit::Ib],
     ) -> Result<u32, Error> {
-        if self.engine.state != State::Verified || instance > 1 {
+        if self.engine.state != State::Verified || usize::from(instance) >= self.engine.queues.len()
+        {
             return Err(Error::Busy);
         }
         let e = &mut self.engine;
@@ -386,15 +500,19 @@ impl Sdma {
         self.engine.proof
     }
     /// Fence progress of both engines (hang detection only).
-    pub(crate) fn progress(&mut self) -> Result<[crate::amdgpu_navi22_tdr::Progress; 2], Error> {
+    pub(crate) fn progress(&mut self) -> Result<Vec<crate::amdgpu_navi22_tdr::Progress>, Error> {
         if self.engine.state != State::Verified {
             return Err(Error::Busy);
         }
         let e = &mut self.engine;
-        Ok([
-            crate::amdgpu_cp_navi22::progress(&mut e.hw, &e.queues[0])?,
-            crate::amdgpu_cp_navi22::progress(&mut e.hw, &e.queues[1])?,
-        ])
+        let mut samples = Vec::new();
+        samples
+            .try_reserve_exact(e.queues.len())
+            .map_err(|_| Error::Allocation)?;
+        for q in &e.queues {
+            samples.push(crate::amdgpu_cp_navi22::progress(&mut e.hw, q)?);
+        }
+        Ok(samples)
     }
 }
 

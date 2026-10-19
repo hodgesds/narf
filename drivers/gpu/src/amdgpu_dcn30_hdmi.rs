@@ -834,14 +834,15 @@ impl Hdmi {
         dig: u8,
         transmitter: u8,
     ) -> Result<Self, Error> {
-        if Profile::resolve(gpu).map_err(|_| Error::Unsupported)? != Profile::Navi22 {
+        let profile = Profile::resolve(gpu).map_err(|_| Error::Unsupported)?;
+        if !profile.is_dcn30() {
             return Err(Error::Unsupported);
         }
         // linux: n/a (NARF bound: six DIG frontends/backends)
-        if dig >= 6 || transmitter >= 6 {
+        if dig >= profile.streams() || transmitter >= profile.streams() {
             return Err(Error::Invalid);
         }
-        let base = Profile::Navi22
+        let base = profile
             .bank(gpu, 2, LAST_REG) // linux-lit: 2=mmDIG0_DIG_FE_CNTL_BASE_IDX
             .map_err(|_| Error::Unsupported)?;
         Ok(Self(Engine::new_with(

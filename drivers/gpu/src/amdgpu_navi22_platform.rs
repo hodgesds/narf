@@ -152,7 +152,7 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
             .map_err(|_| Error::Authority)?;
     amdgpu::claim_navi22(|gpu| {
         // Validate/copy every file before inspecting hardware or claiming VRAM.
-        let mut firmware = boot::Firmware::open(gpu, &registry).map_err(Error::Firmware)?;
+        let mut firmware = boot::Firmware::open_rdna2(gpu, &registry).map_err(Error::Firmware)?;
         // amdgpu_discovery_harvest_ip: VCN instances absent from the harvest
         // table get firmware and an owner. An unreadable table disables
         // media only; display and queue bring-up do not depend on it.
@@ -189,7 +189,7 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
         let affected = range.is_some();
         // SAFETY: caller's boot ownership, no active NARF clients. Plan refuses
         // live VM contexts and accounts for firmware, all pipes and cursors.
-        let plan = unsafe { vram::Plan::read_navi22(gpu, &authority, range, &[]) }
+        let plan = unsafe { vram::Plan::read_rdna2(gpu, &authority, range, &[]) }
             .map_err(Error::Memory)?;
         let training = plan.training();
         if training.is_some() {
@@ -211,7 +211,7 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
             None => {
                 // SAFETY: posted VRAM, no firmware two-stage training request;
                 // permanent exclusive GPU/pool ownership as above.
-                unsafe { boot::ColdBoot::new(gpu, authority, &pool, firmware) }
+                unsafe { boot::ColdBoot::new_rdna2(gpu, authority, &pool, firmware) }
             }
         }
         .map_err(Error::Firmware)?;
@@ -235,7 +235,7 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
         // Kernel queues are optional for the firmware/display path: without
         // a usable BAR2 doorbell page the queue stages are skipped, visibly.
         // SAFETY: boot-time exclusive PCI ownership; BAR2 is otherwise unused.
-        match unsafe { crate::amdgpu_cp_navi22::Doorbells::map_navi22(&device) } {
+        match unsafe { crate::amdgpu_cp_navi22::Doorbells::map_rdna2(&device) } {
             Ok(doorbells) => {
                 prepared
                     .prepare_queues(doorbells)
@@ -280,6 +280,13 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
             smc: report.smu.firmware,
             gfx_mhz: report.power_status.map(|p| (p.gfx_min_mhz, p.gfx_max_mhz)),
             queues_verified: report.queues.is_some(),
+            sdma_rings: report.queues.map_or(0, |q| {
+                q.sdma
+                    .ring
+                    .iter()
+                    .enumerate()
+                    .fold(0u8, |mask, (i, ready)| mask | (u8::from(*ready) << i))
+            }),
         });
     }
     start_services(boot).await;

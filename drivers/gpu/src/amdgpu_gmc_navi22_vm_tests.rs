@@ -678,3 +678,69 @@ kernel_test_in!(
     "drivers/gpu/gmc-navi22",
     vm_navi22_client_vmids_are_lent_and_faults_charge_the_pasid
 );
+
+fn rdna2_gart_and_client_gpuvm_use_resolved_hubs_and_isolate_clients() -> TestResult {
+    for profile in crate::amdgpu_rdna2::PROFILES {
+        for &mmhub in crate::amdgpu_rdna2::GMC_MMHUB_VERSIONS {
+            let (_pool, mut engine) = fixture_sized(BYTES + GART_BYTES + (1 << 20));
+            let gpu = super::tests::rdna2_gpu(profile, profile.pci_ids[0], mmhub);
+            engine.layout = super::Layout::resolve_rdna2(&gpu).unwrap();
+            engine.prepare_gart().unwrap();
+            run(engine.initialize()).unwrap();
+            let info = run(engine.enable_gart()).unwrap();
+            if engine.state != State::Ready
+                || engine.runtime != Runtime::Idle
+                || info.size != GART_SIZE
+                || semaphore(&engine) != Some(0)
+            {
+                return TestResult::Fail("RDNA2 GART setup or MMHUB invalidation failed");
+            }
+            let a = run(engine.create_vm()).unwrap();
+            let b = run(engine.create_vm()).unwrap();
+            let va = 0x7f_3fff_f000; // straddle a 1 GiB page-directory boundary
+            let ba = Arc::new(engine.allocate_vram(8192, false).unwrap());
+            let bb = Arc::new(engine.allocate_vram(8192, false).unwrap());
+            let geometry = engine.geometry.unwrap();
+            let pa = ba.device_address(geometry);
+            let pb = bb.device_address(geometry);
+            run(engine.map(&a, request(va, 0, 8192, RW), ba.clone())).unwrap();
+            run(engine.map(&b, request(va, 0, 8192, RW), bb.clone())).unwrap();
+            for offset in [0, 4096] {
+                if pa == pb
+                    || translate(&engine, u32::from(a.vmid()), va + offset)
+                        != Some((pa + offset) | 0x61)
+                    || translate(&engine, u32::from(b.vmid()), va + offset)
+                        != Some((pb + offset) | 0x61)
+                {
+                    return TestResult::Fail(
+                        "RDNA2 clients share translations or have invalid PTEs",
+                    );
+                }
+            }
+            if translate(&engine, u32::from(a.vmid()), va + 8192).is_some()
+                || translate(&engine, u32::from(b.vmid()), va + 8192).is_some()
+            {
+                return TestResult::Fail("RDNA2 GPUVM exposed an unmapped page");
+            }
+            run(engine.unmap(&a, va)).unwrap();
+            if translate(&engine, u32::from(a.vmid()), va).is_some()
+                || translate(&engine, u32::from(b.vmid()), va) != Some(pb | 0x61)
+                || reg(&engine, GFX_BASE, GFX.inv_req) != 0xf8_0000 | (1 << a.vmid())
+                || reg(&engine, MM_BASE, MM.inv_req) != 0xf8_0000 | (1 << a.vmid())
+            {
+                return TestResult::Fail("RDNA2 unmap missed a hub or changed another client's VM");
+            }
+            run(engine.destroy_vm(a)).unwrap();
+            run(engine.unmap(&b, va)).unwrap();
+            run(engine.destroy_vm(b)).unwrap();
+            if engine.runtime != Runtime::Idle {
+                return TestResult::Fail("RDNA2 VM teardown left a pending operation");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_gart_and_client_gpuvm_use_resolved_hubs_and_isolate_clients
+);

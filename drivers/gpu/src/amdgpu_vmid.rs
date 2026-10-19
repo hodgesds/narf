@@ -382,7 +382,7 @@ impl VmidPool {
 
 /// Rings a `VmidManager` tracks jobs on (ticket ring indices, the high
 /// 32 bits of a ticket as `amdgpu_cs` names jobs).
-pub const GRAB_RINGS: usize = 4;
+pub const GRAB_RINGS: usize = 16;
 
 /// One VMID as `amdgpu_vmid` tracks it for job submission.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

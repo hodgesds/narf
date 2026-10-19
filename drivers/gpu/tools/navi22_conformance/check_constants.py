@@ -102,6 +102,8 @@ HEADER_SETS = {
                   AMD + "/include/ivsrcid/gfx/irqsrcs_gfx_10_1.h",
                   AMD + "/include/ivsrcid/sdma0/irqsrcs_sdma0_5_0.h",
                   AMD + "/include/ivsrcid/sdma1/irqsrcs_sdma1_5_0.h",
+                  AMD + "/include/ivsrcid/sdma2/irqsrcs_sdma2_5_0.h",
+                  AMD + "/include/ivsrcid/sdma3/irqsrcs_sdma3_5_0.h",
                   AMD + "/include/ivsrcid/vcn/irqsrcs_vcn_2_0.h",
                   AMD + "/include/ivsrcid/vmc/irqsrcs_vmc_1_0.h",
                   AMD + "/include/ivsrcid/dcn/irqsrcs_dcn_1_0.h",

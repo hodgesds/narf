@@ -9,8 +9,15 @@ pub(crate) fn fixture() -> Firmware {
 /// Complete set for a board exposing the VCN instances in `mask`.
 pub(crate) fn fixture_with_vcn(mask: u8) -> Firmware {
     Firmware {
+        profile: &crate::amdgpu_rdna2::NAVI22,
         bytes: core::array::from_fn(|i| Some(container(Source::ORDER[i]))),
         vcn: mask,
+    }
+}
+pub(crate) fn fixture_for(profile: &'static crate::amdgpu_rdna2::Profile) -> Firmware {
+    Firmware {
+        profile,
+        ..fixture()
     }
 }
 fn navi22_graphics_set_requires_all_images_except_missing_mec2() -> TestResult {
@@ -184,4 +191,90 @@ fn navi22_graphics_set_checks_ip_and_live_registry_authority() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/gfx-firmware",
     navi22_graphics_set_checks_ip_and_live_registry_authority
+);
+
+fn rdna2_graphics_preparation_checks_every_asic_and_discovered_block() -> TestResult {
+    for profile in crate::amdgpu_rdna2::PROFILES {
+        for &did in profile.pci_ids {
+            let mut gpu = self::gpu();
+            gpu.chip = crate::amdgpu::__test_chip_info_for_pci_id(0x1002, did).unwrap();
+            for (ip, version) in gpu.ip_blocks.iter_mut().zip([
+                profile.gc_version,
+                profile.psp_version,
+                profile.sdma_version,
+                profile.vcn_versions[0],
+                profile.dcn_version,
+            ]) {
+                (ip.major, ip.minor, ip.revision) = version;
+            }
+            if check_rdna2_device(&gpu) != Ok(profile) {
+                return TestResult::Fail("RDNA2 graphics preparation refused matching IPs");
+            }
+            let authority = Cap::bootstrap();
+            authority.revoke();
+            if !matches!(Firmware::open_rdna2(&gpu, &authority), Err(Error::Revoked)) {
+                return TestResult::Fail("RDNA2 graphics preparation bypassed registry authority");
+            }
+            if did != crate::amdgpu::NAVI22 && check_device(&gpu).is_ok() {
+                return TestResult::Fail("shared firmware preparation enabled native startup");
+            }
+            for block in 0..gpu.ip_blocks.len() {
+                for change in 0..4 {
+                    let original = gpu.ip_blocks.clone();
+                    match change {
+                        0 => gpu.ip_blocks[block].major = 0xff,
+                        1 => gpu.ip_blocks.push(gpu.ip_blocks[block]),
+                        2 => gpu.ip_blocks[block].num_bases = 0,
+                        _ => {
+                            gpu.ip_blocks.remove(block);
+                        }
+                    }
+                    if check_rdna2_device(&gpu).is_ok()
+                        || !matches!(
+                            Firmware::open_rdna2(&gpu, &authority),
+                            Err(Error::Unsupported)
+                        )
+                    {
+                        return TestResult::Fail("RDNA2 firmware accepted invalid discovery");
+                    }
+                    gpu.ip_blocks = original;
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_graphics_preparation_checks_every_asic_and_discovered_block
+);
+
+fn rdna2_graphics_names_and_prepared_target_remain_chip_specific() -> TestResult {
+    for (profile, prefix) in crate::amdgpu_rdna2::PROFILES.iter().zip([
+        "sienna_cichlid",
+        "navy_flounder",
+        "dimgrey_cavefish",
+        "beige_goby",
+    ]) {
+        for (source, suffix) in Source::ORDER.into_iter().zip([
+            "sdma", "ce", "pfp", "me", "mec", "mec2", "rlc", "vcn", "dmcub",
+        ]) {
+            if source.name_for(profile) != alloc::format!("amdgpu/{prefix}_{suffix}.bin") {
+                return TestResult::Fail("graphics firmware source selected another ASIC");
+            }
+        }
+        let mut prepared = fixture();
+        prepared.profile = profile;
+        if prepared.profile() != profile
+            || prepared.is_navi22() != (profile == &crate::amdgpu_rdna2::NAVI22)
+            || prepared.images().is_err()
+        {
+            return TestResult::Fail("prepared RDNA2 graphics target lost its ASIC identity");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_graphics_names_and_prepared_target_remain_chip_specific
 );

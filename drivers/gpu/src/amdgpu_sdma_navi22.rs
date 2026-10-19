@@ -1,4 +1,4 @@
-//! Navi22 SDMA0 cold-start and translated VRAM write/copy/fence proof.
+//! Discrete RDNA2 SDMA0 cold-start and translated VRAM write/copy/fence proof.
 //! Register/packet sources: Linux sdma_v5_2.c, gc_10_3_0_{offset,sh_mask}.h,
 //! navi10_sdma_pkt_open.h. No host DMA, user submissions, IRQs or recovery.
 use crate::{
@@ -64,11 +64,19 @@ struct Layout {
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
-        if gpu.chip.vid != crate::amdgpu::AMD_VENDOR
-            || gpu.chip.did != crate::amdgpu::NAVI22
-            || gpu.regs.len < 0x7f004
+        if gpu.chip.vid != crate::amdgpu::AMD_VENDOR || gpu.chip.did != crate::amdgpu::NAVI22 {
+            return Err(Error::Unsupported);
+        }
+        Self::resolve_for(gpu, &crate::amdgpu_rdna2::NAVI22)
+    }
+    fn resolve_rdna2(gpu: &AmdGpu) -> Result<Self, Error> {
+        let profile = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did)
+            .ok_or(Error::Unsupported)?;
+        Self::resolve_for(gpu, profile)
+    }
+    fn resolve_for(gpu: &AmdGpu, profile: &crate::amdgpu_rdna2::Profile) -> Result<Self, Error> {
         // linux: n/a (BAR5 bound: MMIO_REG_HOLE_OFFSET + 4)
-        {
+        if gpu.regs.len < 0x7f004 {
             return Err(Error::Unsupported);
         }
         let mut blocks = gpu
@@ -76,8 +84,10 @@ impl Layout {
             .iter()
             .filter(|b| b.hw_id == ip::HW_ID_SDMA0 && b.instance == 0);
         let sdma = blocks.next().ok_or(Error::Unsupported)?;
-        // linux: n/a (discovery IP version check, SDMA0 5.2.2)
-        if blocks.next().is_some() || (sdma.major, sdma.minor, sdma.revision) != (5, 2, 2) {
+        // linux: n/a (exact per-ASIC SDMA5.2 discovery version)
+        if blocks.next().is_some()
+            || (sdma.major, sdma.minor, sdma.revision) != profile.sdma_version
+        {
             return Err(Error::Unsupported);
         }
         let resolve = |id, versions: &[(u8, u8, u8)], index, last| {
@@ -87,7 +97,7 @@ impl Layout {
             // SDMA0 is in GC bank zero, NOT the standalone discovery SDMA bank.
             vram_size: gpu.vram.size,
             // linux-lit: 0=mmGCMC_VM_FB_LOCATION_TOP_BASE_IDX@gc; 0x16fd=mmGCMC_VM_FB_LOCATION_TOP@gc
-            gc: resolve(ip::HW_ID_GC, &[(10, 3, 2)], 0, 0x16fd)?,
+            gc: resolve(ip::HW_ID_GC, &[profile.gc_version], 0, 0x16fd)?,
             nbio: resolve(
                 ip::HW_ID_NBIF,
                 &[
@@ -487,10 +497,31 @@ impl Sdma {
         authority: Cap<BusDeviceCap, Write>,
         pool: &Pool,
     ) -> Result<Self, Error> {
+        Self::with_layout(gpu.regs, authority, pool, Layout::resolve(gpu)?)
+    }
+    /// Reserve an SDMA0 proof ring for a known discrete RDNA2 ASIC.
+    /// No device writes or implicit native startup occur during construction.
+    ///
+    /// # Safety
+    /// Same exclusive physical GPU, SDMA0/GC/HDP/reset/PM and matching permanent
+    /// VRAM pool contract as `new`. Other engines/clients must remain inactive.
+    pub unsafe fn new_rdna2(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+    ) -> Result<Self, Error> {
+        Self::with_layout(gpu.regs, authority, pool, Layout::resolve_rdna2(gpu)?)
+    }
+    fn with_layout(
+        registers: MmioRegion,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        layout: Layout,
+    ) -> Result<Self, Error> {
         Ok(Self {
             engine: Engine {
-                layout: Layout::resolve(gpu)?,
-                io: Mmio(gpu.regs),
+                layout,
+                io: Mmio(registers),
                 authority,
                 memory: pool.reserve(BYTES).map_err(|_| Error::Allocation)?,
                 state: State::Prepared,

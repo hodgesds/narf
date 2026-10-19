@@ -140,10 +140,10 @@ impl<I: Io> Engine<I> {
         // DCN30 inserts a register before CLOCK_CONTROL, moving the clock
         // and global-sync quartet by one dword. Earlier timing ids match.
         reg + self.instance as u64 * OTG_STRIDE
-            + u64::from(self.profile == Profile::Navi22 && reg >= OTG_CLOCK_CONTROL)
+            + u64::from(self.profile.is_dcn30() && reg >= OTG_CLOCK_CONTROL)
     }
     fn segment_shift(&self) -> u32 {
-        if self.profile == Profile::Navi22 {
+        if self.profile.is_dcn30() {
             8 // linux: ODM0_OPTC_DATA_SOURCE_SELECT__OPTC_SEG0_SRC_SEL__SHIFT
         } else {
             16 // linux: n/a (DCN 3.1.4 path)
@@ -279,7 +279,7 @@ impl<I: Io> Engine<I> {
         self.update(self.otg(OTG_CONTROL), 1 << 12 | 1 << 13, 0)
     }
     fn otg_vtg(&self) -> u64 {
-        let base = if self.profile == Profile::Navi22 {
+        let base = if self.profile.is_dcn30() {
             0x0528 // linux: mmVTG0_CONTROL
         } else {
             VTG_CONTROL
@@ -321,7 +321,7 @@ impl<I: Io> Engine<I> {
         )?;
         // linux-lit: 31=VTG0_CONTROL__VTG0_ENABLE__SHIFT
         self.update(self.otg_vtg(), 1 << 31, 1 << 31)?;
-        let disable_point = if self.profile == Profile::Navi22 {
+        let disable_point = if self.profile.is_dcn30() {
             3 // linux: n/a (literal in dcn10_optc.c:optc1_enable_crtc, OTG_DISABLE_POINT_CNTL)
         } else {
             2 // linux: n/a (DCN 3.1.4 path)
@@ -392,7 +392,7 @@ impl Otg {
             return Err(Error::Invalid);
         }
         let last = OTG_VREADY_PARAM
-            + u64::from(profile == Profile::Navi22)
+            + u64::from(profile.is_dcn30())
             + u64::from(profile.pipes() - 1) * OTG_STRIDE;
         let base = profile.bank(gpu, 2, last as u32)?; // linux-lit: 2=mmOTG0_OTG_H_TOTAL_BASE_IDX
                                                        // linux-ctx: reset

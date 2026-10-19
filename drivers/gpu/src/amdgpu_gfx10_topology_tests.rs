@@ -141,6 +141,8 @@ kernel_test_in!(
 /// GC base segments 0x1260 / 0xA000 and NBIO segment 2 at 0xD20, in bytes.
 fn layout() -> Layout {
     Layout {
+        profile: &crate::amdgpu_rdna2::NAVI22,
+        sdma_high: None,
         gc: [0x1260 * 4, 0xa000 * 4],
         nbio: 0xd20 * 4,
         hdp: 0xf20 * 4,
@@ -151,17 +153,20 @@ struct Fake {
     index: u32,
     writes: Vec<u32>,
     dead: bool,
+    disabled_sa: u8,
 }
 impl Io for Fake {
     fn read(&mut self, a: u64) -> u32 {
         let se = (self.index >> 16) & 0xff;
         let sh = (self.index >> 8) & 0xff;
         match a / 4 {
-            0xc200 => self.index,                    // GRBM_GFX_INDEX 0xA000+0x2200
-            0x0d31 => 0x0200_0000,                   // NBIO 0xD20+0x11
-            0x263e => GB_ADDR,                       // the Mesa-visible 0x263e
+            0x2249 => u32::from(self.disabled_sa) << 8,
+            0x224a => 0,
+            0xc200 => self.index,  // GRBM_GFX_INDEX 0xA000+0x2200
+            0x0d31 => 0x0200_0000, // NBIO 0xD20+0x11
+            0x263e => GB_ADDR,     // the Mesa-visible 0x263e
             0x263d => (se * 2 + sh) << 16 & 0x10000, // CC_RB: RB0 off on odd SAs
-            0x26df => 0,                             // GC_USER_RB 0x1260+0x147f
+            0x26df => 0,           // GC_USER_RB 0x1260+0x147f
             0x226f => {
                 if self.dead {
                     u32::MAX
@@ -187,6 +192,7 @@ fn gfx10_topology_register_model_selects_each_array_and_restores_broadcast() -> 
         index: BROADCAST,
         writes: Vec::new(),
         dead: false,
+        disabled_sa: 0,
     };
     let raw = sample(&mut f, &layout(), limits()).unwrap();
     let t = derive(limits(), &raw).unwrap();
@@ -213,6 +219,7 @@ fn gfx10_topology_register_model_selects_each_array_and_restores_broadcast() -> 
         index: BROADCAST,
         writes: Vec::new(),
         dead: true,
+        disabled_sa: 0,
     };
     if sample(&mut dead, &layout(), limits()) != Err(Error::DeviceGone) || dead.index != BROADCAST {
         return TestResult::Fail("device loss left the GRBM selector changed");
@@ -222,4 +229,29 @@ fn gfx10_topology_register_model_selects_each_array_and_restores_broadcast() -> 
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi22",
     gfx10_topology_register_model_selects_each_array_and_restores_broadcast
+);
+
+fn rdna2_navi21_skips_whole_disabled_shader_arrays() -> TestResult {
+    let mut f = Fake {
+        index: BROADCAST,
+        writes: Vec::new(),
+        dead: false,
+        disabled_sa: 2,
+    };
+    let mut layout = layout();
+    layout.profile = &crate::amdgpu_rdna2::NAVI21;
+    let raw = sample(&mut f, &layout, limits()).unwrap();
+    let t = derive(limits(), &raw).unwrap();
+    if f.writes.contains(&0x4000_0100)
+        || f.index != BROADCAST
+        || t.cu_bitmap[0][1] != 0
+        || t.enabled_rb_mask & 0xc != 0
+    {
+        return TestResult::Fail("Navi21 sampled or exposed a disabled shader array");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_navi21_skips_whole_disabled_shader_arrays
 );

@@ -532,6 +532,8 @@ fn navi22_boot_fence_interrupts_map_to_their_engine() -> TestResult {
         (iv(0x14, 181, 0x0c), None),
         (iv(0x08, 224, 0), Some(Engine::Sdma0)),
         (iv(0x09, 224, 0), Some(Engine::Sdma1)),
+        (iv(0x01, 224, 0), Some(Engine::Sdma2)),
+        (iv(0x05, 224, 0), Some(Engine::Sdma3)),
         (iv(0x14, 184, 0), None),
         (iv(0x08, 0, 0), None),
     ] {
@@ -717,4 +719,59 @@ fn navi22_display_tables_always_go_through_dmub() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi22-boot",
     navi22_display_tables_always_go_through_dmub
+);
+
+fn rdna2_coordinator_matches_all_firmware_before_bootstrap() -> TestResult {
+    for profile in crate::amdgpu_rdna2::PROFILES {
+        let make_firmware = || Firmware {
+            sos: sos::tests::firmware_for(profile),
+            smc: smu::tests::firmware_for(profile),
+            graphics: gfx::tests::fixture_for(profile),
+            power: None,
+            dmub: None,
+            display: None,
+        };
+        let mut gpu = crate::amdgpu_cp_navi22::tests::rdna2_gpu(profile, profile.pci_ids[0]);
+        for block in &mut gpu.ip_blocks {
+            if [
+                crate::amdgpu_discovery::HW_ID_MP0,
+                crate::amdgpu_discovery::HW_ID_MP1,
+            ]
+            .contains(&block.hw_id)
+            {
+                (block.major, block.minor, block.revision) = profile.psp_version;
+            }
+        }
+        let pool = pool(16 << 20);
+        let cap = Cap::bootstrap();
+        cap.revoke();
+        // SAFETY: inert mappings; revoked authority prevents device access.
+        let mut boot = unsafe { ColdBoot::new_rdna2(&gpu, cap, &pool, make_firmware()) }.unwrap();
+        if run(boot.run()) != Err(Error::Sos(sos::Error::Revoked)) {
+            return TestResult::Fail(
+                "family coordinator reached hardware without current authority",
+            );
+        }
+        drop(boot);
+        if pool.available() != 16 << 20 {
+            return TestResult::Fail("unpublished bootstrap storage leaked");
+        }
+        if profile != &crate::amdgpu_rdna2::NAVI22 {
+            // SAFETY: the native entry must refuse before device access.
+            if unsafe { ColdBoot::new(&gpu, cap, &pool, make_firmware()) }.is_ok() {
+                return TestResult::Fail("shared coordinator widened legacy native gate");
+            }
+            let mut wrong = make_firmware();
+            wrong.graphics = gfx::tests::fixture();
+            // SAFETY: typed image mismatch is rejected before device access.
+            if unsafe { ColdBoot::new_rdna2(&gpu, cap, &pool, wrong) }.is_ok() {
+                return TestResult::Fail("coordinator accepted firmware from another ASIC");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_coordinator_matches_all_firmware_before_bootstrap
 );

@@ -879,6 +879,33 @@ per HBA and sets GHC.IE only after the IRQ route; host-install xtask media
 default to `narf.disks=boot-only`; DMUB-routed retrain/unplug tables, a non-IRQ
 DMUB route lock, a TABLE_MS cap, same-EDID HPD long pulses keep the stream.
 
+RX 6000 native startup now covers 40 exact Linux PCI IDs across Navi21,
+Navi22, Navi23 and Navi24. Shared profiles select ASIC-specific firmware and
+validate discovered IPs before firmware upload or hardware initialization.
+The coordinator covers PSP/SOS, board power policy, GMC/GPUVM, queues, IH,
+DMUB, display and recovery, preserving upstream's boxed recovery ownership.
+
+Production SDMA supports one through four contiguous discovered engines,
+including distinct doorbells, IH routes, fences and ticket slots for SDMA2/3.
+Graphics selects each ASIC's Linux golden sequence (43/42/36/32 rows).
+OSSSYS 5.0.0–5.0.3 uses revision-specific self-IV programming. SMC 2.1 selects
+power tables by exact VBIOS board ID; power parsing accepts both original and
+current Beige Goby layouts without guessing board offsets.
+
+DCN 3.0/3.0.2/3.0.3 enforce six/five/two display resources and select their DML
+parameters. Navi24 omits the removed plane/DSC power-gating registers and
+encoder rings; its video capabilities contain H.264, HEVC and VP9 decode.
+HDMI and DisplayPort modesets pass register-model tests on all four profiles.
+Linux conformance checks exact PCI IDs, firmware names/IP selections, hub
+registers, golden sequences and 450 common DMUB definitions. Installed firmware
+containers parse for all four ASICs. The GPU suite passed 1712 tests with no
+failures on x86_64; the aarch64 GPU suite passed 1204 tests with no failures.
+The final startup/DSC enablement subset passed 45 tests. Production boot and
+btrfs postflight passed on both architectures; release builds, targeted Clippy,
+formatting and constant checks passed. Physical testing beyond the existing
+Navi22 path remains outstanding. Existing `amdgpu.navi22_*` boot options and module names are retained
+for the shared path; optional Navi22 clock-gating policy remains ASIC-specific.
+
 Current main includes discrete PCIe probe support
 for RX 6750 XT / Navi 22: bounded discovery reads beyond BAR0, separate total
 and CPU-visible VRAM sizes, Resizable BAR-independent APU identity, and the

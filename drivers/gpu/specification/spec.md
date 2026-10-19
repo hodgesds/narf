@@ -44,7 +44,62 @@ infrastructure (Phase B).
 
 ## 3. Public interface
 
+### Shared RDNA2 execution and family limits
+
+`ColdBoot::new_rdna2` validates the exact PCI/GC/PSP identity and matching
+SOS, SMC and graphics bundle before device I/O. Recovery rebuilds through
+that constructor and retains the boxed sequence owner used by native Navi22.
+Native probe eligibility includes all inventoried PCI IDs. Hardware validation
+beyond the existing Navi22 path remains outstanding.
+
+Production SDMA queues use the contiguous discovered engine count (one to
+four); duplicate instances and holes are rejected. Engines 2/3 use GC bank 2
+and distinct doorbells, fences and IH routes. Client ring IDs 8/9 preserve
+existing media IDs; tickets reserve four low bits for the ring ID and VM
+retirement tracks sixteen slots. Absent engines have no fence mapping.
+
+SMC 2.1 containers select a PowerPlay table by its exact VBIOS board ID,
+without falling back to another board. Profile-specific power table layouts
+validate format, revision and size before overlaying board data. Navi24
+accepts both the original 1700-byte and later 1888-byte SMC layouts, whose
+board ranges are checked against the corresponding Linux interface headers.
+
+DCN 3.0/3.0.2/3.0.3 expose six/five/two pipes, streams and native channels.
+Resource allocation and constructors enforce those capacities. DCN 3.0.3
+does not access the removed plane/DSC power-gating registers. DML selects
+the corresponding stutter latencies, round-trip cycles and DPTE capacity.
+VCN 3.0.33 starts decode without programming encoder rings; its video-capability
+reply contains H.264, HEVC and VP9 decode and an empty encode table, matching
+Linux `nv_query_video_codecs`. Other supported VCN revisions retain their
+appropriate Sienna Cichlid codec tables and harvested-instance selection.
+
 ### AMD discrete PCIe probe and VRAM
+
+`amdgpu_rdna2::PROFILES` inventories the discrete Navi21, Navi22, Navi23 and
+Navi24 ASICs using exact PCI IDs from Linux `amdgpu_drv.c::pciidlist`, including
+mobile and professional variants. `for_pci_id` rejects other vendors and holes;
+no range match or marketed SKU determines the ASIC. Each profile supplies its
+own SOS, SMC, SDMA, graphics, VCN and DMCUB container names. This is an inventory,
+not a load order or a claim that every container is required on every board.
+The existing Navi22 loaders consume that same inventory.
+
+PCI registration and native startup eligibility include all inventoried IDs.
+The shared coordinator validates the discovered IP versions, matching firmware
+bundle and board policy; identification alone does not bypass these checks.
+Legacy firmware loading is rejected for every discrete RDNA2 ID; Rembrandt
+retains its separate APU path. Existing `amdgpu.navi22_*` boot options name the
+shared discrete path. Optional Navi22 clock-gating policy remains ASIC-specific.
+Run
+`python3 drivers/gpu/tools/check_rdna2_profiles.py --linux ~/git/linux` to
+compile the profile unit tests and compare the compiled IDs and firmware names
+with Linux, including IP-to-firmware selection. Add
+`--firmware-dir /lib/firmware/amdgpu` to parse complete installed raw or Zstandard
+inventories for all four ASICs through the existing SOS/SMC/graphics/DMUB
+parsers. This checks container structure, not firmware authentication or device
+execution. Kernel tests under `drivers/gpu/amdgpu/rdna2` check integration with
+PCI registration and `ChipInfo`.
+
+
 
 `AmdGpu::bring_up` supports discovery outside the CPU-visible BAR0 aperture.
 The default discovery table is a 10 KiB read beginning 64 KiB below the end
@@ -3015,11 +3070,15 @@ without a spinlock or executor poll on the stack. A preflight error resumes
 writers. A started failure/cancellation on the primary GPU keeps them stopped;
 an unrelated secondary GPU cannot quarantine another device's framebuffer.
 
-### Navi 22 PSP secure-OS bootstrap
+### Discrete RDNA2 PSP secure-OS bootstrap
 
 `amdgpu_psp_boot::Firmware::open(gpu, registry_cap)` selects
-`amdgpu/navy_flounder_sos.bin` only for `1002:73df`, GC 10.3.2 and MP0
-11.0.11. Duplicate/missing IP instances and undersized register banks reject
+the profile's SOS container for exact discrete RDNA2 PCI IDs. The required
+GC/MP0 pairs are Navi21 10.3.0/11.0.7, Navi22 10.3.2/11.0.11,
+Navi23 10.3.4/11.0.12 and Navi24 10.3.5/11.0.13, matching Linux's
+`amdgpu_ucode_legacy_naming` and `psp_v11_0` backend. All use MP0 bank index 0
+and the shared PSP11 bootloader protocol. Duplicate/missing IP instances and
+undersized register banks reject
 the path. The registry and blob are read inside `Cap::invoke`; a bounded,
 validated copy outlives those invocations. `amdgpu_psp_firmware::Image::parse`
 supports PSP 11.0 container headers v1.0–v1.3, validates file/payload sizes
@@ -3216,9 +3275,58 @@ memory-voltage scaling, deep sleep, GFXOFF, BACO and hub/media gating remain
 disabled until their owners supply constraints. This does not install OS
 thermal interrupts or override board frequencies, voltages or fan curves.
 
+### Shared discrete RDNA2 PSP ring, TMR and firmware upload
+
+`unsafe amdgpu_psp_ring::Psp::new_rdna2(gpu, pci_cap, pool)` resolves the
+exact PCI profile and requires matching GC, MP0, MP1 and SDMA identities.
+The transport supports Linux's NBIO2.3 backend revisions and HDP5.0.x only;
+missing/duplicate instance-zero records, absent base indices and out-of-bounds
+register windows fail before allocation or device writes. GMC framebuffer
+base/top/offset use `gc_10_3_0`'s offsets (0x16fc/0x16fd/0x16e7), not the
+similarly named `gc_10_1_0` offsets. CP status uses GC bank index 0 and RLC
+status uses index 1. The compiled shared register table is checked against
+Linux by `check_rdna2_profiles.py`. Construction reads GMC under live PCI
+authority, validates the CPU/GPU pool mappings, and reserves an unpublished
+ring. The caller must exclusively own a physical GPU, with initialized VRAM,
+permanent mappings and no concurrent PSP, reset or power-management users.
+
+After `start().await`, `setup_tmr_rdna2(&sos).await` checks the SOS ASIC before
+parsing or staging, submits its embedded TOC when present, and reserves TMR
+without installing it. All four PSP11 revisions use Linux's centralized
+C-state ordering. `load_smc_rdna2(&smc).await` requires the same ASIC, submits
+only validated SMC microcode, then sends `SETUP_TMR`. SMC containers are
+prepared by `amdgpu_smu_navi22::Firmware::open_rdna2(gpu, registry_cap)` through
+live registry/blob invocations after exact GC/MP1 checks. The prepared
+`profile()` is retained; no raw-byte constructor is exposed to callers.
+This upload does not apply a board PPTable or issue SMU runtime/power commands.
+
+`load_gfx_rdna2(&set).await` requires an ASIC-matching immutable prepared set
+and completed SMC/TMR setup, then uses the shared graphics upload/autoload
+state machine. `wait_gfx_boot_rdna2().await` observes idle CP and RLC boot
+completion without GC writes. Completion does not initialize queues, memory
+hubs, display or power policy, and does not advertise acceleration.
+Sibling SOS/SMC/graphics sets fail before submission or allocation. Existing
+Navi22/Phoenix/Navi48 entry points retain their separate target gates.
+All shared-ring cancellation, bounded waits, capability checks and quarantine
+rules apply. Verified `stop` still requires quiescing every TMR consumer first.
+These explicit low-level APIs do not lift the native PCI probe gate.
+
 ### Navi 22 graphics firmware and PSP autoload
 
-`amdgpu_gfx_navi22::Firmware::open(gpu, registry_cap)` prepares the complete
+`amdgpu_gfx_navi22::Firmware::open_rdna2(gpu, registry_cap)` prepares an
+ASIC-specific immutable set for any inventoried discrete RDNA2 PCI ID.
+`Source::name_for(profile)` selects the containers. GC and MP1 must match the
+profile's GC and PSP11 versions; SDMA0 must be 5.2.0/2/4/5 and DCN must be
+3.0.0/0/2/3 for Navi21/22/23/24 respectively. VCN instance zero must be
+3.0.0/64/192 for Navi21/22, 3.0.16 for Navi23 or 3.0.33 for Navi24. A bounded
+instance mask rejects duplicate, missing-zero and out-of-range instances.
+Preparation performs no device I/O and requires unique instance-zero discovery
+records with valid bank bounds. The prepared set retains its `profile()`;
+`load_gfx_navi22` refuses sets prepared for a sibling ASIC before submission.
+These APIs do not enable native startup for newly inventoried PCI IDs.
+
+`amdgpu_gfx_navi22::Firmware::open(gpu, registry_cap)` preserves the native
+Navi22 gate and prepares the complete
 `navy_flounder_{sdma,ce,pfp,me,mec,mec2,rlc,vcn,dmcub}.bin` set through live registry/blob
 capabilities before any device I/O. Device gating requires PCI `1002:73df`,
 GC 10.3.2, MP1 11.0.11, SDMA0 5.2.2 and DCN 3.0.0, with unique instance-zero
@@ -3293,6 +3401,27 @@ ownership; verified consumer reset remains mandatory for teardown.
 `BootComplete` does not initialize queues, enable SDMA or establish acceleration.
 
 ### Navi 22 VRAM-only memory hubs
+
+`unsafe amdgpu_gmc_navi22::Gmc::new_rdna2(gpu, pci_cap, pool)` shares the
+GMC10 VMID0, GART and per-client GPUVM implementation across inventoried
+Navi21/22/23/24 PCI IDs. It requires the profile's exact discovered GC version,
+a supported MMHUB2.1.0/2.1.1/2.1.2 layout, NBIO2.3 backend registers and HDP5.0.x.
+The MMHUB revision selects a compatible discovered backend rather than being
+inferred from a marketed SKU. Linux `gmc_v10_0` selects `gfxhub_v2_1` for all
+four GC versions and `mmhub_v2_0` for these MMHUB revisions. Both register
+tables, including every base index, are checked from compiled values against
+`gc_10_3_0_offset.h` and `mmhub_2_0_0_offset.h` by the family conformance tool.
+Missing/duplicate instance-zero blocks, absent base indices, unsupported
+backends and truncated windows reject before allocating backing pages.
+
+The constructor performs no I/O, leaves initialization explicit and inherits
+the exclusive physical-device, trained VRAM, disabled gating, permanent pool,
+queue/VM exclusion and memory-retention requirements below. Initialization
+checks live PCI authority before touching device memory. Existing GART/GPUVM
+methods keep the same ownership tokens, PTE/PDE validation, bounded engine-17
+invalidation, fault handling and cancellation quarantine. This low-level API
+does not enable native PCI startup or publish working acceleration for a new
+card. `Gmc::new` retains its existing strict Navi22 gate.
 
 `unsafe amdgpu_gmc_navi22::Gmc::new(gpu, pci_cap, pool)` validates the physical
 Navi22 GC 10.3.2, MMHUB 2.1.0 and NBIO register banks and reserves four VRAM
@@ -3382,6 +3511,26 @@ stay masked until the IH owner calls `set_fault_interrupts(true)`;
 to `ih::source::{VMC_FAULT, UTCL2_FAULT}`.
 `ColdBoot::memory()` exposes this owner after `FirmwareReady`/`Released`.
 
+### Shared discrete RDNA2 SDMA0 execution proof
+
+`unsafe amdgpu_sdma_navi22::Sdma::new_rdna2(gpu, pci_cap, pool)` validates the
+exact per-ASIC GC and SDMA0 versions before allocating a ring. Navi21/22/23/24
+use Linux's SDMA5.2 backend; SDMA0's registers are relative to GC base index 0,
+not the standalone discovery SDMA base. NBIO2.3 and HDP5 register windows must
+also be supported and bounded. Construction performs no device I/O. The
+existing `Sdma::new` entry point keeps the strict Navi22 PCI gate.
+
+The existing `unsafe initialize(&mut gmc).await` can then run the shared
+translated VRAM write/copy/fence proof with a matching retained GMC owner.
+It requires trained VRAM, ready PSP/RLC/SDMA firmware, inactive other engines,
+disabled gating and exclusive reset/PM control over the physical GPU. It
+uses reported physical VRAM size rather than inherited FB_LOCATION_TOP to
+bound its ring and translated test pages. Only SDMA0 is started; this proof
+does not enable user submissions, fault/trap interrupts or additional SDMA
+instances. Every capability, timeout, cancellation and memory-quarantine
+condition below remains in force. Production queues and IH are initialized
+separately by the shared coordinator.
+
 ### Navi 22 SDMA0 execution proof
 
 `unsafe amdgpu_sdma_navi22::Sdma::new(gpu, pci_cap, pool)` validates SDMA 5.2.2,
@@ -3418,7 +3567,42 @@ After verification, crate-internal `trap(context).await` appends one
 `SDMA0_CNTL.TRAP_ENABLE` and waits at most 100 ms for both read pointers to
 reach 192 bytes. It runs once; failure marks the engine `Failed`.
 
+### Shared discrete RDNA2 graphics and compute queue proofs
+
+`unsafe amdgpu_cp_navi22::Gfx::new_rdna2` and
+`unsafe amdgpu_kiq_navi22::Compute::new_rdna2` accept inventoried Navi21/22/23/24
+PCI identities with exact profile GC/SDMA versions and compatible NBIO, HDP
+and OSSSYS 5.0.0–5.0.3 banks. Resolution checks all accessed register ranges
+before allocation. Existing Navi22 constructors retain their narrower gates.
+`Doorbells::map_rdna2` and `enable_doorbell_apertures_rdna2` provide the shared
+BAR2 mapping and aperture setup under the existing unsafe ownership contracts.
+
+`Gfx::golden()` selects the ordered Linux GC 10.3.0/2/4/5 register sequence:
+43/42/36/32 rows respectively. Unknown GC versions have no sequence. The
+conformance tool compares every compiled offset, bank and mask with Linux,
+including local register overrides in `gfx_v10_0.c`. Each profile reuses the
+bounded graphics ring/IB proof and the two-MEC KIQ/compute ring/IB proof.
+Model tests exercise each sequence's masked writes, successful completion,
+revocation and replay rejection. The shared coordinator combines these APIs
+with interrupt, board-power and display initialization for native startup.
+
 ### Navi 22 OSSSYS 5.0.3 interrupt ring and dispatch
+
+`unsafe amdgpu_ih_navi22::Ih::new_rdna2(gpu, pci_cap, pool, bus_device)`
+reserves the same RB0 owner for exact Navi21/22/23/24 PCI and GC identities,
+compatible NBIO/HDP banks and discovered OSSSYS 5.0.0–5.0.3. Layout resolution
+precedes allocation, interrupt routing and device I/O. The caller must own the
+physical function and its matching permanent VRAM pool exclusively. Unknown,
+missing, duplicate or out-of-range banks are rejected. The original `new`
+retains its Navi22/OSSSYS 5.0.3 gate.
+
+The shared backend follows Linux `navi10_ih`: only RB0 is allocated; the
+self-IV timeout/threshold programming on enable and disable is skipped before
+OSSSYS 5.0.3. This is selected from discovery rather than inferred from the PCI
+marketing name. Family models exercise dispatch and shutdown with MSI enabled
+and disabled for every supported OSSSYS revision; conformance checks the
+compiled compatible-version list against Linux's IH backend selection.
+This constructor does not broaden native probing or enable engine IRQ sources.
 
 `unsafe amdgpu_ih_navi22::Ih::new(gpu, pci_cap, pool, bus_device)` validates
 OSSSYS 5.0.3, NBIO and HDP 5.0 banks and reserves a 256 KiB VRAM ring plus a
@@ -4080,6 +4264,10 @@ file within one LSB (two, upward, on deep-sleep DCFCLK).
 `Soc::from_board(levels, channels, width, dchub_refclk)` builds the top
 bounding-box state from the DAL DPM table (DCFCLK doubling as fabric clock,
 `memclk*16`, DENTIST-reachable DISP/DPP ceilings, PHY ceiling, VCO).
+It defaults `Soc::dcn_revision` to 0. `Soc::for_gpu(gpu)` selects revision
+0/2/3 from an exact discrete RDNA2 profile before admission; other values
+are rejected. This selects resource limits and the corresponding latency
+and DPTE parameters for DCN 3.0, 3.0.2 or 3.0.3.
 `Soc::states(memory_mhz) -> Vec<Soc>` lists one state per lower UCLK level
 ascending, then the top one (deviation: every state keeps the top DCFCLK,
 where Linux pairs each UCLK with `dcn_bw_get_optimal_dcfclk_fclk_for_uclk`'s);

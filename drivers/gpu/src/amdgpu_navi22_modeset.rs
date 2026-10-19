@@ -274,6 +274,7 @@ pub struct Route {
 /// The DCN3.0 resource pool's allocation state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Resources {
+    pub(super) capacity: u8,
     pipes: u8,
     streams: u8,
     plls: u8,
@@ -290,6 +291,7 @@ fn first_free(used: u8, count: u8) -> Option<u8> {
 impl Resources {
     pub const fn new() -> Self {
         Self {
+            capacity: PIPES,
             pipes: 0,
             streams: 0,
             plls: 0,
@@ -297,6 +299,16 @@ impl Resources {
             pll_timing: [None; PLLS as usize],
             dscs: 0,
         }
+    }
+    pub fn for_gpu(gpu: &AmdGpu) -> Result<Self, Error> {
+        let profile = crate::amdgpu_dcn_profile::Profile::resolve(gpu)?;
+        if !profile.is_dcn30() {
+            return Err(Error::Unsupported);
+        }
+        Ok(Self {
+            capacity: profile.pipes(),
+            ..Self::new()
+        })
     }
     /// `resource_map_pool_resources` for one SST stream on `connector`:
     /// the first free pipe; the link encoder's `preferred_engine` (DIG FE
@@ -307,21 +319,23 @@ impl Resources {
     /// DTO for DisplayPort (`resource_map_clock_resources`). PLL sharing
     /// between identical TMDS timings is not attempted.
     pub fn acquire(&mut self, connector: &Connector) -> Result<Route, Error> {
-        let pipe = first_free(self.pipes, PIPES).ok_or(Error::Busy)?;
+        let pipe = first_free(self.pipes, self.capacity).ok_or(Error::Busy)?;
         let preferred = connector.path.transmitter;
-        if preferred >= STREAMS {
+        if preferred >= self.capacity {
             return Err(Error::Invalid);
         }
         let stream = if self.streams & 1 << preferred == 0 {
             preferred
         } else {
-            (0..STREAMS)
+            (0..self.capacity)
                 .rev()
                 .find(|i| self.streams & 1 << i == 0)
                 .ok_or(Error::Busy)?
         };
         let clock = match connector.signal {
-            Signal::Hdmi => ClockSource::Pll(first_free(self.plls, PLLS).ok_or(Error::Busy)?),
+            Signal::Hdmi => {
+                ClockSource::Pll(first_free(self.plls, self.capacity).ok_or(Error::Busy)?)
+            }
             Signal::DisplayPort => ClockSource::DpDto,
         };
         self.pipes |= 1 << pipe;
@@ -766,9 +780,13 @@ impl Pipeline {
         connector: Connector,
         route: Route,
     ) -> Result<Self, Error> {
-        if route.pipe >= PIPES
-            || route.stream >= STREAMS
-            || matches!(route.clock, ClockSource::Pll(p) if p >= PLLS)
+        let profile = crate::amdgpu_dcn_profile::Profile::resolve(gpu)?;
+        if !profile.is_dcn30() {
+            return Err(Error::Unsupported);
+        }
+        if route.pipe >= profile.pipes()
+            || route.stream >= profile.streams()
+            || matches!(route.clock, ClockSource::Pll(p) if p >= profile.channels())
             || matches!(
                 (connector.signal, route.clock),
                 (Signal::Hdmi, ClockSource::DpDto) | (Signal::DisplayPort, ClockSource::Pll(_))
@@ -777,7 +795,6 @@ impl Pipeline {
             return Err(Error::Invalid);
         }
         let transmitter = connector.path.transmitter;
-        let profile = crate::amdgpu_dcn_profile::Profile::Navi22;
         let dcn1 = profile.bank(gpu, 1, LAST_DCN1.max(takeover::LAST_DCN1))?;
         let dcn2 = profile.bank(gpu, 2, LAST_DCN2)?;
         let dcn3 = profile.bank(gpu, 3, takeover::LAST_DCN3)?;
@@ -907,7 +924,7 @@ impl Pipeline {
         let mut takeover = self.takeover();
         if scratch & ATOM_S6_ACC_MODE == 0 {
             tables.pipe_power_gating(self.bus(), 0, PipeAction::Init)?;
-            for pipe in 0..PIPES {
+            for pipe in 0..crate::amdgpu_dcn_profile::Profile::resolve(&self.gpu)?.pipes() {
                 tables.pipe_power_gating(self.bus(), pipe, PipeAction::Disable)?;
             }
             takeover.disable_vga()?;
@@ -1019,6 +1036,12 @@ impl Pipeline {
     async fn power_on_plane(&mut self) -> Result<(), Error> {
         let pipe = u64::from(self.route.pipe);
         let request = self.d2(DC_IP_REQUEST_CNTL);
+        if !crate::amdgpu_dcn_profile::Profile::resolve(&self.gpu)?.has_plane_power_gating() {
+            let clock = self.d2(HUBP0_HUBP_CLK_CNTL + pipe * HUBP_STRIDE);
+            return self
+                .regs
+                .update(clock, HUBP_CLOCK_ENABLE, HUBP_CLOCK_ENABLE);
+        }
         self.regs.write(request, 1)?; // linux-lit: 1=DC_IP_REQUEST_CNTL__IP_REQUEST_EN_MASK
         if self.route.pipe != 5 {
             // linux: n/a (pipe 5 power gating de-featured, dcn20_hwseq.c)
@@ -1214,6 +1237,7 @@ impl Pipeline {
             .map_err(Error::Hubbub)?;
         let soc =
             dml30::Soc::from_board(&levels, board.channels, board.channel_width_bytes, refclk)
+                .and_then(|soc| soc.for_gpu(&self.gpu))
                 .map_err(Error::Mode)?;
         // Detection's link half for DP (retrieve_link_cap, then the
         // destructive verify_link_capability): modes are what it verified.

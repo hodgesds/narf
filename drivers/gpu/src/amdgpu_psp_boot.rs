@@ -1,10 +1,10 @@
-//! Navi22/PSP11 and Navi48/PSP14 secure-OS bootstrap. Protocol follows Linux
+//! Discrete RDNA2/PSP11 and Navi48/PSP14 secure-OS bootstrap. Protocol follows Linux
 //! `psp_v11_0.c` and `psp_v14_0.c`: C2PMSG35 command/status, C2PMSG36 GPU address in MiB,
 //! C2PMSG81 SOS heartbeat, all at MP0 base index **0** (not PSP13's index 1).
 //! This requires initialized VRAM; it does not perform memory training,
 //! create a GPCOM ring, allocate a TMR, or load graphics/SMC firmware.
 use crate::{
-    amdgpu::{AmdGpu, AMD_VENDOR, NAVI22, NAVI48},
+    amdgpu::{AmdGpu, AMD_VENDOR, NAVI48},
     amdgpu_discovery as discovery,
     amdgpu_psp_firmware::{self as firmware, Component, Image, STAGING_SIZE},
     amdgpu_vram::{Pool, Reservation},
@@ -53,21 +53,21 @@ pub struct Firmware {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Target {
-    Navi22,
+    Rdna2(&'static crate::amdgpu_rdna2::Profile),
     Psp14_0_2,
     Psp14_0_3,
 }
 impl Target {
     fn name(self) -> &'static str {
         match self {
-            Self::Navi22 => firmware::NAVI22_SOS,
+            Self::Rdna2(chip) => chip.firmware.sos,
             Self::Psp14_0_2 => firmware::PSP14_0_2_SOS,
             Self::Psp14_0_3 => firmware::PSP14_0_3_SOS,
         }
     }
     fn parse(self, bytes: &[u8]) -> Result<Image<'_>, Error> {
         match self {
-            Self::Navi22 => Image::parse(bytes),
+            Self::Rdna2(_) => Image::parse(bytes),
             Self::Psp14_0_2 | Self::Psp14_0_3 => Image::parse_psp14(bytes),
         }
         .map_err(Error::Image)
@@ -118,10 +118,19 @@ fn profile(gpu: &AmdGpu) -> Result<(Target, u64), Error> {
     if gc.next().is_some() {
         return Err(Error::Unsupported);
     }
-    let versions: &[(u8, u8, u8)] = match (gpu.chip.did, ip.major, ip.minor, ip.revision) {
-        (NAVI22, 10, 3, 2) => &[(11, 0, 11)],
-        (NAVI48, 12, 0, 1) => &[(14, 0, 2), (14, 0, 3)],
-        _ => return Err(Error::Unsupported),
+    let rdna2 = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did);
+    let version = (ip.major, ip.minor, ip.revision);
+    let rdna2_psp;
+    let versions: &[(u8, u8, u8)] = if let Some(chip) = rdna2 {
+        if version != chip.gc_version {
+            return Err(Error::Unsupported);
+        }
+        rdna2_psp = [chip.psp_version];
+        &rdna2_psp
+    } else if gpu.chip.did == NAVI48 && version == (12, 0, 1) {
+        &[(14, 0, 2), (14, 0, 3)]
+    } else {
+        return Err(Error::Unsupported);
     };
     // bank rejects duplicate MP0 instances and checks the entire mailbox span.
     let base = crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_MP0, versions, 0, SOS).map_err(
@@ -132,10 +141,10 @@ fn profile(gpu: &AmdGpu) -> Result<(Target, u64), Error> {
     )?;
     let mp0 =
         discovery::find_ip(&gpu.ip_blocks, discovery::HW_ID_MP0, 0).ok_or(Error::Unsupported)?;
-    let target = match (mp0.major, mp0.minor, mp0.revision) {
-        (11, 0, 11) => Target::Navi22,
-        (14, 0, 2) => Target::Psp14_0_2,
-        (14, 0, 3) => Target::Psp14_0_3,
+    let target = match (rdna2, mp0.major, mp0.minor, mp0.revision) {
+        (Some(chip), 11, 0, _) => Target::Rdna2(chip),
+        (None, 14, 0, 2) => Target::Psp14_0_2,
+        (None, 14, 0, 3) => Target::Psp14_0_3,
         _ => return Err(Error::Unsupported),
     };
     Ok((target, base))
@@ -145,6 +154,12 @@ fn mp0_bank(gpu: &AmdGpu) -> Result<u64, Error> {
     profile(gpu).map(|(_, base)| base)
 }
 impl Firmware {
+    pub(crate) fn rdna2_profile(&self) -> Option<&'static crate::amdgpu_rdna2::Profile> {
+        match self.target {
+            Target::Rdna2(profile) => Some(profile),
+            _ => None,
+        }
+    }
     pub(crate) fn is_psp14(&self, revision: u8) -> bool {
         matches!(
             (self.target, revision),
@@ -152,7 +167,7 @@ impl Firmware {
         )
     }
     pub(crate) fn is_navi22(&self) -> bool {
-        self.target == Target::Navi22
+        self.target == Target::Rdna2(&crate::amdgpu_rdna2::NAVI22)
     }
     pub fn open(
         gpu: &AmdGpu,
@@ -412,7 +427,7 @@ impl Bootloader {
                 authority,
                 memory,
                 state: State::Prepared,
-                psp11: target == Target::Navi22,
+                psp11: matches!(target, Target::Rdna2(_)),
             },
         })
     }

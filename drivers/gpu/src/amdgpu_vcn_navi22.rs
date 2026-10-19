@@ -359,7 +359,11 @@ impl Harvest {
             .map_err(|_| Error::Revoked)?
             .map_err(|_| Error::DeviceGone)?;
         let table = ip::parse_vcn_harvest(&blob).map_err(Error::Harvest)?;
-        Ok(Self::navi22(table, revision))
+        Ok(if gpu.chip.did == crate::amdgpu::NAVI22 {
+            Self::navi22(table, revision)
+        } else {
+            Self(table)
+        })
     }
 }
 
@@ -372,12 +376,19 @@ pub(crate) struct Layout {
     pub hdp: u64,
 }
 fn vcn_bases(gpu: &AmdGpu, instance: u8) -> Result<[u64; 2], Error> {
+    let profile =
+        crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).ok_or(Error::Unsupported)?;
     let mut found = gpu
         .ip_blocks
         .iter()
         .filter(|b| b.hw_id == ip::HW_ID_VCN && b.instance == instance);
     let block = found.next().ok_or(Error::Unsupported)?;
-    if found.next().is_some() || block.num_bases < 2 || (block.major, block.minor) != (3, 0) {
+    if found.next().is_some()
+        || block.num_bases < 2
+        || !profile
+            .vcn_versions
+            .contains(&(block.major, block.minor, block.revision))
+    {
         return Err(Error::Unsupported);
     }
     let mut bases = [0; 2];
@@ -396,11 +407,9 @@ fn vcn_bases(gpu: &AmdGpu, instance: u8) -> Result<[u64; 2], Error> {
 impl Layout {
     /// Resolve the instances in `instances` (bit mask) plus GC/NBIO/HDP.
     pub(crate) fn resolve(gpu: &AmdGpu, instances: u8) -> Result<Self, Error> {
-        if gpu.chip.vid != crate::amdgpu::AMD_VENDOR
-            || gpu.chip.did != crate::amdgpu::NAVI22
-            || gpu.regs.len < 0x7f004
-            || instances & !3 != 0
-        {
+        let profile = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did)
+            .ok_or(Error::Unsupported)?;
+        if gpu.regs.len < 0x7f004 || instances & !3 != 0 {
             return Err(Error::Unsupported);
         }
         let bank = |id, versions: &[(u8, u8, u8)], index, last| {
@@ -415,7 +424,7 @@ impl Layout {
         }
         Ok(Self {
             vcn,
-            gc: bank(ip::HW_ID_GC, &[(10, 3, 2)], 0, GB_ADDR_CONFIG)?,
+            gc: bank(ip::HW_ID_GC, &[profile.gc_version], 0, GB_ADDR_CONFIG)?,
             nbio: bank(
                 ip::HW_ID_NBIF,
                 &[
@@ -774,6 +783,7 @@ impl Jpeg {
 
 #[derive(Debug)]
 pub(crate) struct Engine<I: Io> {
+    enc_count: usize,
     pub hw: Hw<I>,
     pub vcn: [Option<Instance>; 2],
     pub jpeg: Option<Jpeg>,
@@ -942,7 +952,7 @@ impl<I: Io> Engine<I> {
             self.start_instance(i, firmware, gb_addr_config).await?;
             self.test_dec_ring(i).await?;
             self.proof.dec_ring[i] = true;
-            for j in [0, 1] {
+            for j in 0..self.enc_count {
                 self.test_enc_ring(i, j).await?;
                 self.proof.enc_ring[i][j] = true;
             }
@@ -1108,6 +1118,7 @@ impl<I: Io> Engine<I> {
     /// Tail of `vcn_v3_0_start`: master interrupt, decode RBC and both
     /// encode rings, each bracketed by the fw_shared FW_QUEUE_RING_RESET.
     fn program_rings(&mut self, i: usize) -> Result<(), Error> {
+        let enc_count = self.enc_count;
         let instance = self.vcn[i].as_mut().ok_or(Error::Invalid)?;
         let map = instance.memory.mapping();
         let dec = instance.address(DEC_RING);
@@ -1132,7 +1143,7 @@ impl<I: Io> Engine<I> {
             io.write(r(RBC_RB_WPTR), wptr);
             io.write_memory(map, SHARED + shared::RB_WPTR, wptr);
             modes(io, 0);
-            for j in [0, 1] {
+            for j in 0..enc_count {
                 modes(io, shared::RING_RESET << shared::ENCODE_SHIFT[j]);
                 io.write(r(RB_RPTR[j]), 0);
                 io.write(r(RB_WPTR[j]), 0);
@@ -1206,7 +1217,7 @@ impl<I: Io> Engine<I> {
         let instances: alloc::vec::Vec<usize> = self.active().collect();
         for i in instances {
             result = self.test_dec_ib(i).await;
-            for j in [0, 1] {
+            for j in 0..self.enc_count {
                 if result.is_ok() {
                     result = self.test_enc_ib(i, j).await;
                 }
@@ -1607,6 +1618,13 @@ impl Media {
         Ok(Self {
             client,
             engine: Engine {
+                enc_count: if crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did)
+                    .is_some_and(|p| p.asic == "navi24")
+                {
+                    0
+                } else {
+                    2
+                },
                 hw: Hw {
                     io: Mmio {
                         regs: gpu.regs,
@@ -1705,14 +1723,19 @@ pub(crate) struct Client {
 impl Client {
     fn new(gpu: &AmdGpu, pool: &Pool, instances: u8, jpeg: bool) -> Option<Self> {
         // linux: n/a (MMHUB 2.1.0 discovery version)
-        let base =
-            crate::amdgpu_psp_ring::bank(gpu, ip::HW_ID_MMHUB, &[(2, 1, 0)], 0, submit::MM_PTB_HI)
-                .ok()?;
+        let base = crate::amdgpu_psp_ring::bank(
+            gpu,
+            ip::HW_ID_MMHUB,
+            crate::amdgpu_rdna2::GMC_MMHUB_VERSIONS,
+            0,
+            submit::MM_PTB_HI,
+        )
+        .ok()?;
         // linux: n/a (OSSSYS 5.0.3 discovery version)
         let oss = crate::amdgpu_psp_ring::bank(
             gpu,
             ip::HW_ID_OSSSYS,
-            &[(5, 0, 3)],
+            crate::amdgpu_rdna2::IH_OSSSYS_VERSIONS,
             0,
             submit::IH_VMID_LUT_LAST,
         )
@@ -1836,7 +1859,7 @@ impl<I: Io> Engine<I> {
         if !fence::signaled(completed, throttle) {
             return Err(Error::Busy);
         }
-        let engine = ring.inv_engine(client.instances);
+        let engine = ring.inv_engine_for(client.instances, self.enc_count as u8);
         let (r, map, base, fence_at) = client_ring(&mut self.vcn[0], &mut self.jpeg, ring)?;
         let (fence_address, ring_base) = (base + fence_at, base + r.base);
         let seq = r.next_seq();

@@ -127,6 +127,8 @@ impl Routing {
     fn hpd_count(self) -> u8 {
         if self == Self::Navi48 {
             4
+        } else if let Self::Legacy(p) = self {
+            p.channels()
         } else {
             6
         }
@@ -147,7 +149,9 @@ impl Routing {
     }
     fn backend(self) -> (u64, u64) {
         match self {
-            Self::Legacy(Profile::Navi22) => (DIG_BE_EN_CNTL - 1, DIG_STRIDE),
+            Self::Legacy(Profile::Navi22 | Profile::Dcn302 | Profile::Dcn303) => {
+                (DIG_BE_EN_CNTL - 1, DIG_STRIDE)
+            }
             Self::Legacy(Profile::Dcn314) => (DIG_BE_EN_CNTL, DIG_STRIDE),
             // dcn_4_1_0_offset.h DIG0..3_DIG_BE_EN_CNTL.
             Self::Navi48 => (0x20bd, 0x124), // linux: n/a (DCN 4.0.1 path)

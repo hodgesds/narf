@@ -123,6 +123,7 @@ pub const CP_HQD_PQ_WPTR_HI: Reg = Reg(0, 0x1fe0); // linux: mmCP_HQD_PQ_WPTR_HI
 
 // SDMA 5.2 instance 0; sdma_v5_2_get_reg_offset adds SDMA1_REG_OFFSET.
 pub const SDMA1_REG_OFFSET: u32 = 0x600; // linux: SDMA1_REG_OFFSET
+pub const SDMA3_REG_OFFSET: u32 = 0x400; // linux: SDMA3_REG_OFFSET
 pub const SDMA0_CNTL: Reg = Reg(0, 0x001c); // linux: mmSDMA0_CNTL@gc
                                             // linux: mmSDMA0_SEM_WAIT_FAIL_TIMER_CNTL@gc
 pub const SDMA0_SEM_WAIT_FAIL_TIMER_CNTL: Reg = Reg(0, 0x0021);
@@ -167,6 +168,8 @@ pub const NBIO_SELFRING_BASE_LOW: u32 = 0x00f4;
 pub const NBIO_SELFRING_CNTL: u32 = 0x00f5; // linux: mmBIF_BX_PF_DOORBELL_SELFRING_GPA_APER_CNTL
 pub const NBIO_SDMA0_DOORBELL_RANGE: u32 = 0x01d0; // linux: mmBIF_SDMA0_DOORBELL_RANGE
 pub const NBIO_SDMA1_DOORBELL_RANGE: u32 = 0x01d1; // linux: mmBIF_SDMA1_DOORBELL_RANGE
+pub const NBIO_SDMA2_DOORBELL_RANGE: u32 = 0x01d6; // linux: mmBIF_SDMA2_DOORBELL_RANGE
+pub const NBIO_SDMA3_DOORBELL_RANGE: u32 = 0x01d7; // linux: mmBIF_SDMA3_DOORBELL_RANGE
 pub const NBIO_REMAP_HDP_MEM_FLUSH_CNTL: u32 = 0x012d; // linux: mmREMAP_HDP_MEM_FLUSH_CNTL
 pub const LAST_NBIO: u32 = 0x01d1; // linux: mmBIF_SDMA1_DOORBELL_RANGE
                                    // linux-ctx: reset
@@ -193,80 +196,16 @@ pub const PWRBRK_THROTTLE: u32 = (1 << 2) | (1 << 5) | (5 << 13);
 pub const PWRBRK_DIDT_SQ: u32 = 1 << 2;
 
 /// golden_settings_gc_10_3_2: (register, and_mask, or_mask).
-pub const GOLDEN: [(Reg, u32, u32); 42] = [
-    // linux: mmCGTT_SPI_CS_CLK_CTRL@gc101; 0xff7f0fff; 0x78000100
-    (Reg(1, 0x507c), 0xff7f0fff, 0x78000100),
-    // linux: mmCGTT_SPI_PS_CLK_CTRL@gc101; 0xff7f0fff; 0x78000100
-    (Reg(1, 0x507d), 0xff7f0fff, 0x78000100),
-    // linux: mmCGTT_SPI_RA0_CLK_CTRL@gc101; 0xff7f0fff; 0x30000100
-    (Reg(1, 0x507a), 0xff7f0fff, 0x30000100),
-    // linux: mmCGTT_SPI_RA1_CLK_CTRL@gc101; 0xff7f0fff; 0x7e000100
-    (Reg(1, 0x507b), 0xff7f0fff, 0x7e000100),
-    (Reg(0, 0x1f53), 0x0007ffff, 0x0000c000), // linux: mmCPF_GCR_CNTL@gc101; 0x0007ffff; 0x0000c000
-    (Reg(0, 0x13ae), 0xffffffff, 0x00000280), // linux: mmDB_DEBUG3@gc101; 0xffffffff; 0x00000280
-    (Reg(0, 0x13af), 0xffffffff, 0x00800000), // linux: mmDB_DEBUG4@gc101; 0xffffffff; 0x00800000
-    // linux: mmDB_EXCEPTION_CONTROL@gc101; 0x7fff0f1f; 0x00b80000
-    (Reg(0, 0x13bf), 0x7fff0f1f, 0x00b80000),
-    // linux: mmGCR_GENERAL_CNTL_Sienna_Cichlid@gc101; 0x1ff1ffff; 0x00000500
-    (Reg(0, 0x1580), 0x1ff1ffff, 0x00000500),
-    // linux: mmGCUTCL2_CGTT_CLK_CTRL_Sienna_Cichlid@gc101; 0xffffffff; 0xff008080
-    (Reg(0, 0x16f3), 0xffffffff, 0xff008080),
-    // linux: mmGCVM_L2_CGTT_CLK_CTRL_Sienna_Cichlid@gc101; 0xffff8fff; 0xff008080
-    (Reg(0, 0x15db), 0xffff8fff, 0xff008080),
-    (Reg(0, 0x0fe5), 0x003fffff, 0x00280400), // linux: mmGE_PC_CNTL@gc101; 0x003fffff; 0x00280400
-    // linux: mmGL2A_ADDR_MATCH_MASK@gc101; 0xffffffff; 0xffffffcf
-    (Reg(1, 0x2e21), 0xffffffff, 0xffffffcf),
-    // linux: mmGL2C_ADDR_MATCH_MASK@gc101; 0xffffffff; 0xffffffcf
-    (Reg(1, 0x2e03), 0xffffffff, 0xffffffcf),
-    // linux: mmGL2C_CM_CTRL1@gc101; 0xff8fff0f; 0x580f1008
-    (Reg(1, 0x2e08), 0xff8fff0f, 0x580f1008),
-    (Reg(1, 0x2e0c), 0xf7ffffff, 0x00f80988), // linux: mmGL2C_CTRL3@gc101; 0xf7ffffff; 0x00f80988
-    // linux: mmPA_CL_ENHANCE@gc101; 0xf17fffff; 0x01200007
-    (Reg(0, 0x1025), 0xf17fffff, 0x01200007),
-    // linux: mmPA_SC_BINNER_TIMEOUT_COUNTER@gc101; 0xffffffff; 0x00000800
-    (Reg(0, 0x1070), 0xffffffff, 0x00000800),
-    // linux: mmPA_SC_ENHANCE_2@gc101; 0xffffffbf; 0x00000820
-    (Reg(0, 0x107c), 0xffffffbf, 0x00000820),
-    // linux: mmSPI_CONFIG_CNTL_1@gc101; 0xffffffff; 0x00070104
-    (Reg(0, 0x11ef), 0xffffffff, 0x00070104),
-    // linux: mmSPI_START_PHASE@gc101; 0x000000ff; 0x00000004
-    (Reg(0, 0x11db), 0x000000ff, 0x00000004),
-    (Reg(0, 0x10a0), 0xe07df47f, 0x00180070), // linux: mmSQ_CONFIG@gc101; 0xe07df47f; 0x00180070
-    // linux: mmSQ_PERFCOUNTER0_SELECT@gc101; 0xf0f001ff; 0
-    (Reg(1, 0x39c0), 0xf0f001ff, 0),
-    // linux: mmSQ_PERFCOUNTER1_SELECT@gc101; 0xf0f001ff; 0
-    (Reg(1, 0x39c1), 0xf0f001ff, 0),
-    // linux: mmSQ_PERFCOUNTER10_SELECT@gc101; 0xf0f001ff; 0
-    (Reg(1, 0x39ca), 0xf0f001ff, 0),
-    // linux: mmSQ_PERFCOUNTER11_SELECT@gc101; 0xf0f001ff; 0
-    (Reg(1, 0x39cb), 0xf0f001ff, 0),
-    // linux: mmSQ_PERFCOUNTER12_SELECT@gc101; 0xf0f001ff; 0
-    (Reg(1, 0x39cc), 0xf0f001ff, 0),
-    // linux: mmSQ_PERFCOUNTER13_SELECT@gc101; 0xf0f001ff; 0
-    (Reg(1, 0x39cd), 0xf0f001ff, 0),
-    // linux: mmSQ_PERFCOUNTER14_SELECT@gc101; 0xf0f001ff; 0
-    (Reg(1, 0x39ce), 0xf0f001ff, 0),
-    // linux: mmSQ_PERFCOUNTER15_SELECT@gc101; 0xf0f001ff; 0
-    (Reg(1, 0x39cf), 0xf0f001ff, 0),
-    // linux: mmSQ_PERFCOUNTER2_SELECT@gc101; 0xf0f001ff; 0
-    (Reg(1, 0x39c2), 0xf0f001ff, 0),
-    // linux: mmSQ_PERFCOUNTER3_SELECT@gc101; 0xf0f001ff; 0
-    (Reg(1, 0x39c3), 0xf0f001ff, 0),
-    // linux: mmSQ_PERFCOUNTER4_SELECT@gc101; 0xf0f001ff; 0
-    (Reg(1, 0x39c4), 0xf0f001ff, 0),
-    // linux: mmSQ_PERFCOUNTER5_SELECT@gc101; 0xf0f001ff; 0
-    (Reg(1, 0x39c5), 0xf0f001ff, 0),
-    // linux: mmSQ_PERFCOUNTER6_SELECT@gc101; 0xf0f001ff; 0
-    (Reg(1, 0x39c6), 0xf0f001ff, 0),
-    // linux: mmSQ_PERFCOUNTER7_SELECT@gc101; 0xf0f001ff; 0
-    (Reg(1, 0x39c7), 0xf0f001ff, 0),
-    // linux: mmSQ_PERFCOUNTER8_SELECT@gc101; 0xf0f001ff; 0
-    (Reg(1, 0x39c8), 0xf0f001ff, 0),
-    // linux: mmSQ_PERFCOUNTER9_SELECT@gc101; 0xf0f001ff; 0
-    (Reg(1, 0x39c9), 0xf0f001ff, 0),
-    (Reg(0, 0x12e2), 0xfff7ffff, 0x01030000), // linux: mmTA_CNTL_AUX@gc101; 0xfff7ffff; 0x01030000
-    (Reg(0, 0x1588), 0xffbfffff, 0x00a00000), // linux: mmUTCL1_CTRL@gc101; 0xffbfffff; 0x00a00000
-    // linux: mmVGT_GS_MAX_WAVE_ID@gc101; 0x00000fff; 0x000003ff
-    (Reg(0, 0x1009), 0x00000fff, 0x000003ff),
-    (Reg(0, 0x10a2), 0x00000020, 0x00000020), // linux: mmLDS_CONFIG@gc101; 0x00000020; 0x00000020
-];
+/// Compatibility view of the shared Navi22 sequence for existing model tests.
+pub const GOLDEN: [(Reg, u32, u32); 42] = {
+    let source = crate::amdgpu_rdna2::golden::NAVI22;
+    assert!(source.len() == 42);
+    let mut rows = [(Reg(0, 0), 0, 0); 42];
+    let mut index = 0;
+    while index < rows.len() {
+        let row = source[index];
+        rows[index] = (Reg(row.base_index, row.offset), row.and_mask, row.or_mask);
+        index += 1;
+    }
+    rows
+};

@@ -15,15 +15,24 @@ struct Fake {
     hw: u32,
     invalidated: bool,
     gone: bool,
+    forbid_self_iv: bool,
 }
 impl Io for Fake {
     fn read(&mut self, address: u64) -> u32 {
+        assert!(
+            !self.forbid_self_iv || ![0x8c, 0x98, 0xc1].iter().any(|r| address == OSS + r * 4),
+            "unsupported self-IV read"
+        );
         if self.gone {
             return u32::MAX;
         }
         *self.regs.get(&address).unwrap_or(&0)
     }
     fn write(&mut self, address: u64, value: u32) {
+        assert!(
+            !self.forbid_self_iv || ![0x8c, 0x98, 0xc1].iter().any(|r| address == OSS + r * 4),
+            "unsupported self-IV write"
+        );
         self.writes.push((address, value));
         self.regs.insert(address, value);
         if address == HDP + 0xd1 * 4 {
@@ -105,12 +114,14 @@ fn fixture() -> (Pool, Arc<Shared<Fake>>, Handle) {
             hw: 0,
             invalidated: false,
             gone: false,
+            forbid_self_iv: false,
         },
         authority: Cap::bootstrap(),
         layout: Layout {
             oss: OSS,
             nbio: NBIO,
             hdp: HDP,
+            self_wptr_update: true,
         },
         memory: pool.reserve(BYTES).unwrap(),
         dummy: DUMMY,
@@ -668,4 +679,119 @@ fn ih_navi22_layout_requires_osssys_5_0_3_and_bounds() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/ih-navi22",
     ih_navi22_layout_requires_osssys_5_0_3_and_bounds
+);
+
+fn rdna2_ih_resolves_exact_asic_and_compatible_oss_before_allocation() -> TestResult {
+    for profile in crate::amdgpu_rdna2::PROFILES {
+        for &did in profile.pci_ids {
+            for revision in 0..4 {
+                let mut gpu = crate::amdgpu_cp_navi22::tests::rdna2_gpu(profile, did);
+                let oss = gpu
+                    .ip_blocks
+                    .iter_mut()
+                    .find(|b| b.hw_id == ip::HW_ID_OSSSYS)
+                    .unwrap();
+                oss.revision = revision;
+                let resolved = Layout::resolve_rdna2(&gpu).unwrap();
+                if resolved.self_wptr_update != (revision >= 3) {
+                    return TestResult::Fail(
+                        "IH self-IV behavior did not follow discovered OSS version",
+                    );
+                }
+                if (did != crate::amdgpu::NAVI22 || revision != 3) && Layout::resolve(&gpu).is_ok()
+                {
+                    return TestResult::Fail("shared IH widened native Navi22 gate");
+                }
+                for id in [
+                    ip::HW_ID_GC,
+                    ip::HW_ID_OSSSYS,
+                    ip::HW_ID_NBIF,
+                    ip::HW_ID_HDP,
+                ] {
+                    for case in 0..5 {
+                        let mut bad = crate::amdgpu_cp_navi22::tests::rdna2_gpu(profile, did);
+                        bad.ip_blocks
+                            .iter_mut()
+                            .find(|b| b.hw_id == ip::HW_ID_OSSSYS)
+                            .unwrap()
+                            .revision = revision;
+                        let index = bad.ip_blocks.iter().position(|b| b.hw_id == id).unwrap();
+                        match case {
+                            0 => bad.ip_blocks[index].major = 0xff,
+                            1 => bad.ip_blocks.push(bad.ip_blocks[index]),
+                            2 => bad.ip_blocks[index].num_bases = 0,
+                            3 => {
+                                bad.ip_blocks.remove(index);
+                            }
+                            _ => bad.ip_blocks[index].base_addrs.fill(u32::MAX),
+                        }
+                        if Layout::resolve_rdna2(&bad).is_ok() {
+                            return TestResult::Fail(
+                                "IH accepted foreign, ambiguous or missing register bank",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_ih_resolves_exact_asic_and_compatible_oss_before_allocation
+);
+
+fn rdna2_ih_programs_dispatches_and_disables_with_versioned_self_iv() -> TestResult {
+    for profile in crate::amdgpu_rdna2::PROFILES {
+        for revision in 0..4 {
+            for msi in [false, true] {
+                let mut gpu =
+                    crate::amdgpu_cp_navi22::tests::rdna2_gpu(profile, profile.pci_ids[0]);
+                gpu.ip_blocks
+                    .iter_mut()
+                    .find(|b| b.hw_id == ip::HW_ID_OSSSYS)
+                    .unwrap()
+                    .revision = revision;
+                let resolved = Layout::resolve_rdna2(&gpu).unwrap();
+                let (_pool, shared, handle) = fixture();
+                with(&shared, |e| {
+                    e.layout.self_wptr_update = resolved.self_wptr_update;
+                    e.io.forbid_self_iv = revision < 3;
+                });
+                enable(&shared, msi).unwrap();
+                let mut subscriber = handle.subscribe(source::GFX_EOP).unwrap();
+                with(&shared, |e| e.io.push(iv(source::GFX_EOP, 0, 0x1234)));
+                if handle.drain() != Ok(1)
+                    || subscriber.try_next().unwrap().map(|iv| iv.src_data[0]) != Some(0x1234)
+                {
+                    return TestResult::Fail("shared IH ring failed to dispatch GFX completion");
+                }
+                with(&shared, |e| e.disable()).unwrap();
+                let bad = with(&shared, |e| {
+                    let self_writes: Vec<_> =
+                        e.io.writes
+                            .iter()
+                            .filter(|(a, _)| [0x8c, 0x98, 0xc1].contains(&((*a - OSS) / 4)))
+                            .collect();
+                    if revision < 3 {
+                        !self_writes.is_empty()
+                    } else {
+                        e.io.regs[&(OSS + IH_CNTL2 as u64 * 4)] & FORCE_ENABLE != 0
+                            || self_writes.len() != 6
+                    }
+                });
+                if bad || enable(&shared, msi) != Err(Error::Busy) {
+                    return TestResult::Fail(
+                        "IH touched unsupported self-IV registers or replayed disabled ring",
+                    );
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_ih_programs_dispatches_and_disables_with_versioned_self_iv
 );

@@ -510,7 +510,7 @@ pub struct Mapping {
 }
 
 /// Rings an address space tracks jobs on (`amdgpu_cs` ticket ring indices).
-const RINGS: usize = 8;
+const RINGS: usize = 16;
 
 /// A recorded mapping and the buffer it maps. The record keeps the buffer
 /// alive (`amdgpu_bo_va` holds its BO in Linux): a client that closes the

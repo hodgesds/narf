@@ -455,6 +455,9 @@ impl Dmub {
     }
     /// Query a native AUX/HPD instance within this generation's channel count.
     pub async fn hpd(&mut self, instance: u8) -> Result<bool, Error> {
+        if instance >= self.native_channels() {
+            return Err(Error::Invalid);
+        }
         self.engine.hpd(instance).await
     }
     /// Native AUX/I2C-over-AUX, at most 16 bytes. No automatic DEFER retry.
@@ -465,6 +468,9 @@ impl Dmub {
         address: u32,
         data: &mut [u8],
     ) -> Result<(), Error> {
+        if instance >= self.native_channels() {
+            return Err(Error::Invalid);
+        }
         self.engine.aux(instance, action, address, data).await
     }
     /// One raw, validated notification slot, including events saved during AUX.

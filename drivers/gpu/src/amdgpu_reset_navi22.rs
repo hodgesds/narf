@@ -992,6 +992,9 @@ impl Reset {
         authority: Cap<BusDeviceCap, Write>,
         device: BusDevice,
     ) -> Result<Self, Error> {
+        let profile = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did)
+            .ok_or(Error::Unsupported)?;
+        crate::amdgpu_psp_ring::validate_rdna2_layout(gpu).map_err(|_| Error::Unsupported)?;
         let map = |error| match error {
             crate::amdgpu_psp_ring::Error::Invalid => Error::Invalid,
             _ => Error::Unsupported,
@@ -1030,8 +1033,8 @@ impl Reset {
                 io: Mmio {
                     regs: gpu.regs,
                     // linux-lit: 0=mmMP0_SMN_C2PMSG_81_BASE_IDX
-                    mp0: bank(discovery::HW_ID_MP0, &[(11, 0, 11)], 0, SOS)?,
-                    mp1: crate::amdgpu_smu_navi22::mp1_bank(gpu).map_err(|_| Error::Unsupported)?,
+                    mp0: bank(discovery::HW_ID_MP0, &[profile.psp_version], 0, SOS)?,
+                    mp1: bank(discovery::HW_ID_MP1, &[profile.psp_version], 0, RESPONSE)?,
                     pcie: (pcie + PCIE_INDEX2, pcie + PCIE_DATA2),
                     // linux-lit: 2=mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE_BASE_IDX
                     memsize: bank(discovery::HW_ID_NBIF, NBIF, 2, MEMSIZE)?,

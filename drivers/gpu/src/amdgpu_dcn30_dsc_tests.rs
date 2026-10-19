@@ -4,6 +4,38 @@
 use super::*;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+fn dcn303_dsc_power_avoids_removed_registers() -> TestResult {
+    use crate::amdgpu_navi22_modeset_model::{d2, Bench};
+    let bench = Bench::new();
+    bench.model.0.lock().forbidden.push(d2(0x80)..=d2(0xb5));
+    let regs = Regs {
+        window: crate::amdgpu_reg_window::Window::new(bench.gpu.regs),
+        authority: narf_capabilities::Cap::bootstrap(),
+    };
+    let mut dsc = Dsc::new(regs, u64::from(d2(0)) * 4)
+        .for_profile(crate::amdgpu_dcn_profile::Profile::Dcn303);
+    for index in 0..2 {
+        for on in [true, false] {
+            if narf_scheduler::block_on_spin(dsc.power(index, on)) != Ok(true) {
+                return TestResult::Fail("DCN303 DSC power operation");
+            }
+        }
+    }
+    if narf_scheduler::block_on_spin(dsc.power(2, true)) != Err(Error::Invalid)
+        || dsc.stop(2) != Err(Error::Invalid)
+        || dsc.optc(2, None) != Err(Error::Invalid)
+        || dsc.encoder(2, None) != Err(Error::Invalid)
+        || !bench.log().is_empty()
+    {
+        return TestResult::Fail("DCN303 DSC capacity or removed power registers");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-dsc",
+    dcn303_dsc_power_avoids_removed_registers
+);
+
 fn uhd() -> Timing {
     Timing {
         pixel_clock_khz: 533_250,

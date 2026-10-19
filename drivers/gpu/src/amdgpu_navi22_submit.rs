@@ -78,8 +78,7 @@ impl Ring {
         match self {
             Ring::Gfx => 0,
             Ring::Compute => 4,
-            Ring::Sdma(0) => 13,
-            Ring::Sdma(_) => 14,
+            Ring::Sdma(i) => 13 + i as u32,
         }
     }
     pub const fn fence_engine(self) -> fence::Engine {
@@ -87,7 +86,9 @@ impl Ring {
             Ring::Gfx => fence::Engine::Gfx,
             Ring::Compute => fence::Engine::Compute,
             Ring::Sdma(0) => fence::Engine::Sdma0,
-            Ring::Sdma(_) => fence::Engine::Sdma1,
+            Ring::Sdma(1) => fence::Engine::Sdma1,
+            Ring::Sdma(2) => fence::Engine::Sdma2,
+            Ring::Sdma(_) => fence::Engine::Sdma3,
         }
     }
 }
@@ -318,6 +319,9 @@ pub(crate) fn encode_sdma(l: Layout, f: &Frame<'_>) -> Vec<u32> {
 
 /// Validate a submission before any ring access.
 pub fn validate(ring: Ring, vm: VmRef, ibs: &[Ib]) -> Result<(), Error> {
+    if matches!(ring, Ring::Sdma(i) if i >= 4) {
+        return Err(Error::Invalid);
+    }
     if !(1..=15).contains(&vm.vmid) || ibs.is_empty() || ibs.len() > MAX_IBS {
         return Err(Error::Invalid);
     }
@@ -512,11 +516,14 @@ impl MediaRing {
     /// JPEG ring (`jpeg_v3_0_sw_init`), each the lowest free bit of
     /// `AMDGPU_VMHUB_INV_ENG_BITMAP` (no MES/UMSCH on GC 10.3.2).
     pub const fn inv_engine(self, vcn_instances: u8) -> u32 {
+        self.inv_engine_for(vcn_instances, 2)
+    }
+    pub const fn inv_engine_for(self, vcn_instances: u8, encoders: u8) -> u32 {
         let before = match self {
             MediaRing::Dec => 0,
             MediaRing::Enc(0) => 1,
             MediaRing::Enc(_) => 2,
-            MediaRing::Jpeg => 3 * (vcn_instances & 3).count_ones(),
+            MediaRing::Jpeg => (1 + encoders as u32) * (vcn_instances & 3).count_ones(),
         };
         let mut free = INV_ENG_BITMAP;
         let mut n = 0;

@@ -279,6 +279,7 @@ pub mod amdgpu_psp;
 pub mod amdgpu_psp_boot;
 pub mod amdgpu_psp_firmware;
 pub mod amdgpu_psp_ring;
+pub mod amdgpu_rdna2;
 mod amdgpu_reg_window;
 pub mod amdgpu_reset;
 pub mod amdgpu_reset_navi22;

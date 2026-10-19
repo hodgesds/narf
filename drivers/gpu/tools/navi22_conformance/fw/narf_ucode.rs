@@ -11,6 +11,8 @@ mod amdgpu_dmub_firmware;
 mod amdgpu_gfx_firmware;
 #[path = "../../../src/amdgpu_psp_firmware.rs"]
 mod amdgpu_psp_firmware;
+#[path = "../../../src/amdgpu_rdna2.rs"]
+mod amdgpu_rdna2;
 #[path = "../../../src/amdgpu_smc_firmware.rs"]
 mod amdgpu_smc_firmware;
 
@@ -73,7 +75,7 @@ fn sos(dir: &Path) {
     }
 }
 
-fn smc(dir: &Path) {
+fn smc(dir: &Path, profile: &amdgpu_rdna2::Profile) {
     let b = load(dir, "smc");
     let major = u16::from_le_bytes([b[8], b[9]]);
     let minor = u16::from_le_bytes([b[10], b[11]]);
@@ -82,10 +84,32 @@ fn smc(dir: &Path) {
         Ok(i) => i,
         Err(e) => return println!("smc parse error {e:?}"),
     };
+    let mut tables: Vec<_> = image
+        .powerplay_ids()
+        .map(|id| image.powerplay_for(id).unwrap())
+        .collect();
+    if let Some(table) = image.powerplay() {
+        tables.push(table);
+    }
+    for t in tables {
+        let layout = profile
+            .power_table_layout(t.len().checked_sub(802).expect("PowerPlay driver header"))
+            .expect("unknown PowerPlay SKU layout");
+        let word = |at: usize| u16::from_le_bytes(t[at..at + 2].try_into().unwrap());
+        assert_eq!(word(0) as usize, t.len());
+        assert_eq!(word(5), 802);
+        assert_eq!(t[2..5], [layout.format_revision, 0, 2]);
+        assert_eq!(word(15), layout.format_id);
+        assert_eq!(layout.board_end - layout.board_start, 292);
+    }
     println!("smc version 0x{:08x}", image.version());
     // amdgpu_psp_ring.rs::load_smc sends the payload as type 18.
     let p = image.payload();
-    println!("smc upload type 18 off 0x{:x} size 0x{:x}", off(&b, p), p.len());
+    println!(
+        "smc upload type 18 off 0x{:x} size 0x{:x}",
+        off(&b, p),
+        p.len()
+    );
     match image.powerplay() {
         Some(t) => println!("smc pptable off 0x{:x} size 0x{:x}", off(&b, t), t.len()),
         None => println!("smc pptable none"),
@@ -129,7 +153,10 @@ fn gfx(dir: &Path, vcn_mask: u8) {
             Source::Rlc => {
                 let major = u16::from_le_bytes([bytes[8], bytes[9]]);
                 let minor = u16::from_le_bytes([bytes[10], bytes[11]]);
-                println!("rlc header {major}.{minor} version 0x{:08x}", image.version());
+                println!(
+                    "rlc header {major}.{minor} version 0x{:08x}",
+                    image.version()
+                );
             }
             Source::Dmcub => {}
             s => println!("{} version 0x{:08x}", file_name(*s), image.version()),
@@ -166,7 +193,11 @@ fn dmcub(dir: &Path) {
         image.version()
     );
     let s = image.signed_instructions();
-    println!("dmcub signed off 0x{:x} size 0x{:x}", image.signed_offset(), s.len());
+    println!(
+        "dmcub signed off 0x{:x} size 0x{:x}",
+        image.signed_offset(),
+        s.len()
+    );
     let i = image.instructions();
     println!("dmcub inst off 0x{:x} size 0x{:x}", off(&b, i), i.len());
     let d = image.bss_data();
@@ -185,7 +216,12 @@ fn main() {
     });
     let dir = Path::new(&dir);
     sos(dir);
-    smc(dir);
+    let asic = std::env::args().nth(2).unwrap_or_else(|| "navi22".into());
+    let profile = amdgpu_rdna2::PROFILES
+        .iter()
+        .find(|p| p.asic == asic)
+        .expect("unknown ASIC");
+    smc(dir, profile);
     gfx(dir, 1);
     gfx(dir, 3);
     dmcub(dir);

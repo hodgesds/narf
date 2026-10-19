@@ -45,6 +45,18 @@ pub struct Firmware {
     display: Option<DisplayPrep>,
 }
 impl Firmware {
+    fn check_device(&self, gpu: &AmdGpu) -> Result<(), Error> {
+        let profile =
+            crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).ok_or(Error::Invalid)?;
+        if self.sos.rdna2_profile() != Some(profile)
+            || self.smc.profile() != profile
+            || self.graphics.profile() != profile
+            || self.power.as_ref().is_some_and(|p| p.profile != profile)
+        {
+            return Err(Error::Invalid);
+        }
+        Ok(())
+    }
     /// The versions `AMDGPU_INFO_FW_VERSION` reports for this validated set
     /// (Linux takes them from the requested files' headers, not the device).
     pub fn uapi_versions(&self) -> Option<crate::amdgpu_info_navi22::Firmware> {
@@ -69,10 +81,18 @@ impl Firmware {
         registry: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self, Error> {
         psp::validate_navi22_layout(gpu).map_err(Error::Psp)?;
+        Self::open_rdna2(gpu, registry)
+    }
+    /// Prepare the exact discrete RDNA2 firmware inventory without device I/O.
+    pub fn open_rdna2(
+        gpu: &AmdGpu,
+        registry: &Cap<narf_firmware::FirmwareRegistry, Read>,
+    ) -> Result<Self, Error> {
+        psp::validate_rdna2_layout(gpu).map_err(Error::Psp)?;
         Ok(Self {
             sos: sos::Firmware::open(gpu, registry).map_err(Error::Sos)?,
-            smc: smu::Firmware::open(gpu, registry).map_err(Error::Smu)?,
-            graphics: gfx::Firmware::open(gpu, registry).map_err(Error::Graphics)?,
+            smc: smu::Firmware::open_rdna2(gpu, registry).map_err(Error::Smu)?,
+            graphics: gfx::Firmware::open_rdna2(gpu, registry).map_err(Error::Graphics)?,
             power: None,
             dmub: None,
             display: None,
@@ -87,7 +107,7 @@ impl Firmware {
     /// the VBIOS before any device write. Optional: firmware bring-up does not
     /// depend on display routing.
     pub fn prepare_display(&mut self, gpu: &AmdGpu) -> Result<(), Error> {
-        psp::validate_navi22_layout(gpu).map_err(Error::Psp)?;
+        crate::amdgpu_dcn_profile::Profile::resolve(gpu).map_err(|_| Error::Invalid)?;
         let vbios = gpu.vbios.as_ref().ok_or(Error::Invalid)?;
         let inventory =
             |error| Error::Display(crate::amdgpu_navi22_display::Error::Inventory(error));
@@ -112,7 +132,7 @@ impl Firmware {
     }
     /// Prepare DCN3.0's nonsecure DMUB storage before starting any hardware.
     pub fn prepare_dmub(&mut self, gpu: &AmdGpu) -> Result<(), Error> {
-        psp::validate_navi22_layout(gpu).map_err(Error::Psp)?;
+        psp::validate_rdna2_layout(gpu).map_err(Error::Psp)?;
         let vbios = gpu.vbios.as_ref().ok_or(Error::Invalid)?;
         self.dmub = Some(
             crate::amdgpu_dmub_navi22::Prepared::new(
@@ -128,7 +148,8 @@ impl Firmware {
     /// platform boot always calls this; explicit firmware-only callers may
     /// omit it, in which case Report::power is None and no table is sent.
     pub fn prepare_power(&mut self, gpu: &AmdGpu, identity: power::Identity) -> Result<(), Error> {
-        psp::validate_navi22_layout(gpu).map_err(Error::Psp)?;
+        self.check_device(gpu)?;
+        psp::validate_rdna2_layout(gpu).map_err(Error::Psp)?;
         let vbios = gpu
             .vbios
             .as_ref()
@@ -393,7 +414,11 @@ impl Queues {
         match stage {
             // SAFETY: see above; the doorbell page belongs to this GPU's BAR2.
             Stage::Doorbells => unsafe {
-                crate::amdgpu_cp_navi22::enable_doorbell_apertures(gpu, authority, self.doorbells)
+                crate::amdgpu_cp_navi22::enable_doorbell_apertures_rdna2(
+                    gpu,
+                    authority,
+                    self.doorbells,
+                )
             },
             // SAFETY: see above.
             Stage::GfxSetup => unsafe { self.gfx.configure().await },
@@ -443,7 +468,13 @@ fn fence_engine(iv: &crate::amdgpu_ih_navi22::Iv) -> Option<crate::amdgpu_fence_
     if from == source::SDMA0_TRAP {
         return Some(Engine::Sdma0);
     }
-    (from == source::SDMA1_TRAP).then_some(Engine::Sdma1)
+    [
+        (source::SDMA1_TRAP, Engine::Sdma1),
+        (source::SDMA2_TRAP, Engine::Sdma2),
+        (source::SDMA3_TRAP, Engine::Sdma3),
+    ]
+    .into_iter()
+    .find_map(|(source, engine)| (from == source).then_some(engine))
 }
 /// One task per source forwards entries to fence waiters. A terminal IH
 /// error wakes every waiter so each re-samples and observes device loss.
@@ -452,7 +483,13 @@ fn route_fences(
 ) -> Result<(), crate::amdgpu_ih_navi22::Error> {
     use crate::amdgpu_ih_navi22::source;
     let mut subscriptions = alloc::vec::Vec::new();
-    for from in [source::GFX_EOP, source::SDMA0_TRAP, source::SDMA1_TRAP] {
+    for from in [
+        source::GFX_EOP,
+        source::SDMA0_TRAP,
+        source::SDMA1_TRAP,
+        source::SDMA2_TRAP,
+        source::SDMA3_TRAP,
+    ] {
         subscriptions.push(ih.subscribe(from)?);
     }
     for mut subscription in subscriptions {
@@ -595,7 +632,7 @@ impl Backend for Hardware {
             Stage::Sos => {
                 // The pool's GPU addresses came from the pre-reset/pre-training
                 // FB location; re-validate before any reaches the bootloader.
-                psp::validate_navi22_pool(&self.gpu, &self.authority, &self.pool).map_err(
+                psp::validate_rdna2_pool(&self.gpu, &self.authority, &self.pool).map_err(
                     |error| {
                         Error::Sos(match error {
                             psp::Error::Revoked => sos::Error::Revoked,
@@ -627,7 +664,7 @@ impl Backend for Hardware {
                 // SAFETY: ColdBoot owns the physical GPU/pool and SOS completed;
                 // the bootstrap owner was dropped. Mappings remain permanent.
                 self.psp = Some(
-                    unsafe { psp::Psp::new_navi22(&self.gpu, self.authority, &self.pool) }
+                    unsafe { psp::Psp::new_rdna2(&self.gpu, self.authority, &self.pool) }
                         .map_err(Error::Psp)?,
                 );
                 self.psp
@@ -641,21 +678,21 @@ impl Backend for Hardware {
                 .psp
                 .as_mut()
                 .ok_or(Error::Invalid)?
-                .setup_tmr_navi22(&self.firmware.sos)
+                .setup_tmr_rdna2(&self.firmware.sos)
                 .await
                 .map_err(Error::Psp)?,
             Stage::Smc => self
                 .psp
                 .as_mut()
                 .ok_or(Error::Invalid)?
-                .load_smc_navi22(&self.firmware.smc)
+                .load_smc_rdna2(&self.firmware.smc)
                 .await
                 .map_err(Error::Psp)?,
             Stage::SmuVersions => {
                 // SAFETY: SMC upload completed for this cold boot. ColdBoot owns
                 // MP1/reset/PM and excludes all other SMU clients.
                 self.smu = Some(
-                    unsafe { smu::Smu::after_upload(&self.gpu, self.authority) }
+                    unsafe { smu::Smu::after_upload_rdna2(&self.gpu, self.authority) }
                         .map_err(Error::Smu)?,
                 );
                 self.versions = Some(
@@ -671,7 +708,7 @@ impl Backend for Hardware {
                 .psp
                 .as_mut()
                 .ok_or(Error::Invalid)?
-                .load_gfx_navi22(&self.firmware.graphics)
+                .load_gfx_rdna2(&self.firmware.graphics)
                 .await
                 .map_err(Error::Psp)?,
             Stage::PowerTable => {
@@ -693,7 +730,7 @@ impl Backend for Hardware {
                     self.psp
                         .as_mut()
                         .ok_or(Error::Invalid)?
-                        .wait_gfx_boot_navi22()
+                        .wait_gfx_boot_rdna2()
                         .await
                         .map_err(Error::Psp)?,
                 );
@@ -789,7 +826,7 @@ impl Backend for Hardware {
                         // SAFETY: every kernel queue is verified, IH is live and
                         // this owner holds the GPU exclusively.
                         unsafe {
-                            crate::amdgpu_cp_navi22::enable_fence_interrupts(
+                            crate::amdgpu_cp_navi22::enable_fence_interrupts_rdna2(
                                 &self.gpu,
                                 self.authority,
                                 queues.doorbells,
@@ -961,6 +998,23 @@ impl ColdBoot {
         firmware: Firmware,
     ) -> Result<Self, Error> {
         psp::validate_navi22_layout(gpu).map_err(Error::Psp)?;
+        // SAFETY: forwarded whole-GPU, trained-VRAM and pool ownership.
+        unsafe { Self::new_rdna2(gpu, authority, pool, firmware) }
+    }
+    /// Coordinate profile-matched discrete RDNA2 firmware and prepared engines.
+    /// Display, reset and training retain their separately validated interfaces.
+    ///
+    /// # Safety
+    /// All `new` ownership, trained-VRAM, pool exclusion, no-active-client and
+    /// failure/quarantine contracts apply to this physical RDNA2 GPU.
+    pub unsafe fn new_rdna2(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        firmware: Firmware,
+    ) -> Result<Self, Error> {
+        psp::validate_rdna2_layout(gpu).map_err(Error::Psp)?;
+        firmware.check_device(gpu)?;
         let gpu = snapshot(gpu)?;
         // SAFETY: forwarded trained-VRAM/exclusive-device/mapping/pool contract.
         let bootstrap =
@@ -1016,6 +1070,7 @@ impl ColdBoot {
         firmware: Firmware,
         exchange: crate::amdgpu_vram_boot::Training,
     ) -> Result<Self, Error> {
+        firmware.check_device(gpu)?;
         let gpu = snapshot(gpu)?;
         // SAFETY: caller owns all mappings/clients and reserves both exchanges.
         let training =
@@ -1098,7 +1153,7 @@ impl ColdBoot {
         // clients. This constructor reserves pages but performs no hardware I/O.
         hardware.gmc = Some(
             unsafe {
-                crate::amdgpu_gmc_navi22::Gmc::new(
+                crate::amdgpu_gmc_navi22::Gmc::new_rdna2(
                     &hardware.gpu,
                     hardware.authority,
                     &hardware.pool,
@@ -1138,7 +1193,7 @@ impl ColdBoot {
         }
         // SAFETY: forwarded whole-GPU/pool ownership; constructor has no I/O.
         h.sdma = Some(
-            unsafe { crate::amdgpu_sdma_navi22::Sdma::new(&h.gpu, h.authority, &h.pool) }
+            unsafe { crate::amdgpu_sdma_navi22::Sdma::new_rdna2(&h.gpu, h.authority, &h.pool) }
                 .map_err(Error::Sdma)?,
         );
         Ok(())
@@ -1161,16 +1216,21 @@ impl ColdBoot {
         let queues = unsafe {
             Queues {
                 doorbells,
-                gfx: crate::amdgpu_cp_navi22::Gfx::new(&h.gpu, h.authority, &h.pool, doorbells)
-                    .map_err(Error::Queues)?,
-                compute: crate::amdgpu_kiq_navi22::Compute::new(
+                gfx: crate::amdgpu_cp_navi22::Gfx::new_rdna2(
                     &h.gpu,
                     h.authority,
                     &h.pool,
                     doorbells,
                 )
                 .map_err(Error::Queues)?,
-                sdma: crate::amdgpu_sdma_navi22_queues::Sdma::new(
+                compute: crate::amdgpu_kiq_navi22::Compute::new_rdna2(
+                    &h.gpu,
+                    h.authority,
+                    &h.pool,
+                    doorbells,
+                )
+                .map_err(Error::Queues)?,
+                sdma: crate::amdgpu_sdma_navi22_queues::Sdma::new_rdna2(
                     &h.gpu,
                     h.authority,
                     &h.pool,
@@ -1229,7 +1289,7 @@ impl ColdBoot {
         }
         // SAFETY: forwarded whole-GPU/pool/PCI ownership; no I/O here.
         h.ih = Some(
-            unsafe { crate::amdgpu_ih_navi22::Ih::new(&h.gpu, h.authority, &h.pool, device) }
+            unsafe { crate::amdgpu_ih_navi22::Ih::new_rdna2(&h.gpu, h.authority, &h.pool, device) }
                 .map_err(Error::Interrupts)?,
         );
         Ok(())
@@ -1256,8 +1316,10 @@ impl ColdBoot {
         let prepared = h.firmware.dmub.take().ok_or(Error::Invalid)?;
         // SAFETY: the whole GPU/pool belongs to this owner; no I/O here.
         h.dmub = Some(
-            unsafe { crate::amdgpu_dmub_navi22::Dmub::new(&h.gpu, h.authority, &h.pool, prepared) }
-                .map_err(Error::Dmub)?,
+            unsafe {
+                crate::amdgpu_dmub_navi22::Dmub::new_rdna2(&h.gpu, h.authority, &h.pool, prepared)
+            }
+            .map_err(Error::Dmub)?,
         );
         Ok(())
     }
@@ -1583,7 +1645,7 @@ impl ColdBoot {
         drop(queues);
         // SAFETY: forwarded exclusive whole-GPU contract; the mode1 reset
         // below runs before any firmware stage touches the device.
-        let mut boot = unsafe { Self::new(&gpu, authority, &pool, firmware) }?;
+        let mut boot = unsafe { Self::new_rdna2(&gpu, authority, &pool, firmware) }?;
         let h = &mut boot.sequence.backend;
         // SAFETY: forwarded recovery contract; construction has no I/O.
         h.reset = Some(
@@ -1651,10 +1713,12 @@ impl ColdBoot {
         }
         let q = self.sequence.backend.queues.as_ref()?;
         Some(q.gfx.fence_reader([
-            q.gfx.fence_map(),
-            q.compute.fence_map(),
+            Some(q.gfx.fence_map()),
+            Some(q.compute.fence_map()),
             q.sdma.fence_map(0),
             q.sdma.fence_map(1),
+            q.sdma.fence_map(2),
+            q.sdma.fence_map(3),
         ]))
     }
     /// A VRAM heap for clients, as Navi48's `publish_client_vram`: half the
@@ -1795,7 +1859,8 @@ impl ColdBoot {
             .ok_or(Error::Invalid)?;
         // One stream: the DCN3.0 pool from empty (the previous pipeline, if
         // any, stopped or failed and was dropped above).
-        let route = modeset::Resources::new()
+        let route = modeset::Resources::for_gpu(&h.gpu)
+            .map_err(Error::Modeset)?
             .acquire(&connector)
             .map_err(Error::Modeset)?;
         // SAFETY: this cold-boot owner holds the whole GPU; the caller's
