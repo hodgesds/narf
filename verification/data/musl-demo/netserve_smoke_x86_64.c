@@ -1361,7 +1361,7 @@ static int r_misc(void) {
     static uint8_t buf[65536];
     uint64_t got = 0;
     long n;
-    int err = 0;
+    int err = 0, asked = 0;
     for (;;) {
         n = read(c, buf, sizeof buf);
         if (n <= 0) {
@@ -1370,7 +1370,9 @@ static int r_misc(void) {
         }
         if (rcheck(buf, (size_t)n, got, cfg.v[0]) >= 0) return failf("rst 4 byte mismatch", got, 0);
         got += (uint64_t)n;
-        if (got == (1u << 20)) {
+        // A read returns any amount, so `got` need not land on 1 MiB exactly.
+        if (!asked && got >= (1u << 20)) {
+            asked = 1;
             if (write(c, "A", 1) != 1) return failf("rst 4 abort request", 0, 0);
         }
     }
