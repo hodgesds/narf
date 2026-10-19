@@ -906,11 +906,16 @@ under stable tickets before all ledgers reopen together. Cancellation or any
 uncertain stage keeps memory pinned; poison, kernel VM faults and unsupported
 owners require explicit device recovery. Hardware acceptance remains pending.
 
-Still open: physical MSI delivery verification and physical reset/replay
-acceptance, GC12 rendering and
-application shader dispatch, production GPU VM and userspace submission,
-VCN5 video queues, native DCN4 clock/bandwidth/link
-and scanout programming, THM/SMU thermal interrupts and software-CTF shutdown,
+Native GC12 and SDMA0 client slots now request an HDP flush on their own
+ring and wait for the engine-specific NBIO acknowledgement before IB
+execution, including submissions that reuse a VMID without a VM flush.
+Linux-header checks pin both supported NBIO layouts and packet fields;
+models cover packet ordering and blocked GC12 acknowledgement.
+
+Still open: physical MSI delivery and reset/replay acceptance, GC12 rendering
+and application shader execution, GPU VM/userspace and DCN4
+clock/bandwidth/link/scanout hardware acceptance, VCN5 video queues,
+THM/SMU thermal interrupts and software-CTF shutdown,
 memory/fabric DPM relaxation (display admission/watermark rework first),
 reset/suspend/resume, and physical RX 9070 XT testing.
 The verified DMA proof covers only two kernel-owned VRAM pages. The driver

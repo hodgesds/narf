@@ -733,7 +733,8 @@ fn sdma_navi48_client_job_frame_matches_linux() -> TestResult {
         &[(0x2_0000_1000, 64), (0x2_0000_2020, 8)],
     )
     .unwrap();
-    let Ok(words) = job_words(&job, gc, oss, fence, 7) else {
+    let nbio = (NBIO / 4) as u32;
+    let Ok(words) = job_words(&job, gc, oss, nbio, fence, 7) else {
         return TestResult::Fail("frame refused");
     };
     let mut want = vec![
@@ -766,49 +767,49 @@ fn sdma_navi48_client_job_frame_matches_linux() -> TestResult {
         (oss + 3) << 2,
         0x42,
     ];
-    // 24 dwords so far: two NOPs end the first INDIRECT at 32.
-    want.extend([0, 0, 4 | 3 << 16, 0x0000_1000, 2, 64, 0, 0]);
-    // The second starts at 32: two NOPs, ending it at 40.
+    // HDP flush: write REQ, wait on DONE, independent of VMID flushing.
+    let hdp = [
+        0x3400_0008,
+        NBIO as u32 + 0x41c,
+        NBIO as u32 + 0x418,
+        0x400,
+        0x400,
+        0x0fff_000a,
+    ];
+    want.extend(hdp);
+    // 30 dwords so far: four NOPs end the first INDIRECT at 40.
+    want.extend([0; 4]);
+    want.extend([4 | 3 << 16, 0x0000_1000, 2, 64, 0, 0]);
+    // The second starts at 40: two NOPs, ending it at 48.
     want.extend([0; 2]);
     want.extend([4 | 3 << 16, 0x0000_2020, 2, 8, 0, 0]);
     want.extend([0x30005, 0x0000_5040, 8, 7]);
     if words[..want.len()] != want[..] || words[want.len()..].iter().any(|&w| w != 0) {
         return TestResult::Fail("client job frame");
     }
-    // A reused VMID: IB and fence only, the IB still 8-dword aligned.
+    // A reused VMID still flushes HDP; its IB is 8-dword aligned.
     let quiet = Job {
         flush: false,
         map_pasid: false,
         ..Job::new(3, 0x42, 0, &[(0x2_0000_1000, 64)]).unwrap()
     };
-    let words = job_words(&quiet, gc, oss, fence, 7).unwrap();
-    if words[..12]
-        != [
-            0,
-            0,
-            4 | 3 << 16,
-            0x1000,
-            2,
-            64,
-            0,
-            0,
-            0x30005,
-            0x5040,
-            8,
-            7,
-        ]
+    let words = job_words(&quiet, gc, oss, nbio, fence, 7).unwrap();
+    if words[..6] != hdp
+        || words[6..10] != [0; 4]
+        || words[10..20] != [4 | 3 << 16, 0x1000, 2, 64, 0, 0, 0x30005, 0x5040, 8, 7]
     {
         return TestResult::Fail("reused VMID frame");
     }
-    // A memory sync: GCR_REQ first, then NOPs aligning the INDIRECT.
+    // A memory sync: GCR_REQ, HDP flush, then NOPs aligning the INDIRECT.
     let synced = Job {
         mem_sync: true,
         ..quiet
     };
-    let words = job_words(&synced, gc, oss, fence, 7).unwrap();
+    let words = job_words(&synced, gc, oss, nbio, fence, 7).unwrap();
     if words[..5] != [17, 0, 0xc3a1_0000, 0, 0]
-        || words[5..10] != [0; 5]
-        || words[10] != 4 | 3 << 16
+        || words[5..11] != hdp
+        || words[11..18] != [0; 7]
+        || words[18] != 4 | 3 << 16
     {
         return TestResult::Fail("memory sync frame");
     }
@@ -818,7 +819,7 @@ fn sdma_navi48_client_job_frame_matches_linux() -> TestResult {
         Job::new(3, 1, 0, &[(0x1000, 0)]).unwrap(),
         Job::new(3, 1, 0, &[(0x1000, 0x10_0000)]).unwrap(),
     ] {
-        if job_words(&bad, gc, oss, fence, 1).is_ok() {
+        if job_words(&bad, gc, oss, nbio, fence, 1).is_ok() {
             return TestResult::Fail("bad job accepted");
         }
     }
@@ -852,6 +853,7 @@ fn sdma_navi48_client_jobs_fill_the_ring() -> TestResult {
         &job,
         (GC / 4) as u32,
         (OSS / 4) as u32,
+        (NBIO / 4) as u32,
         0x8_0000_4000 + JOB_FENCE,
         1,
     )
@@ -889,6 +891,7 @@ fn sdma_navi48_client_jobs_fill_the_ring() -> TestResult {
             &job,
             (GC / 4) as u32,
             (OSS / 4) as u32,
+            (NBIO / 4) as u32,
             0x8_0000_4000 + JOB_FENCE,
             4,
         )

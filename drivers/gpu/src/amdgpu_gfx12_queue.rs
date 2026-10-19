@@ -164,12 +164,15 @@ impl Job {
 /// On the compute pipe, as gfx_v12_0's compute ring functions: register
 /// writes without the PFP engine select, no PFP_SYNC_ME or CONTEXT_CONTROL,
 /// the ring's own invalidation engine, and IBs marked
-/// `INDIRECT_BUFFER_VALID`.
+/// `INDIRECT_BUFFER_VALID`. Every job requests an HDP flush and waits for
+/// its engine's acknowledgement before CONTEXT_CONTROL/IB execution, even
+/// when its VMID is reused without a page-table flush.
 fn job_packets(
     pipe: Pipe,
     job: Job,
     gc: u32,
     oss: u32,
+    nbio: u32,
     fence: u64,
     seq: u32,
 ) -> Result<[u32; 256], Error> {
@@ -218,6 +221,11 @@ fn job_packets(
             // written back and GL2/GLM/GL1/GLV/GLK/GLI invalidated.
             b.acquire_mem_gfx11(0, 0, 0x00ff_ffff_ffff_ffff, 10, 0xc3b1)?;
         }
+        // gfx_v12_0_ring_emit_hdp_flush / amdgpu_gfx_get_hdp_flush_mask:
+        // graphics pipe 0 uses CP0 through PFP; compute pipe 0 uses CP2
+        // through ME. NBIF6.3.1/NBIO7.7 bank 2 has REQ/DONE at 0x106/107.
+        let hdp = if gfx { 1 } else { 4 };
+        b.reg_write_reg_wait(nbio + 0x106, nbio + 0x107, hdp, hdp, gfx)?;
         if gfx {
             // gfx_v12_0_ring_emit_cntxcntl: load_enable, plus the global,
             // per-context and SH register loads on a context switch.
@@ -736,8 +744,9 @@ impl<I: Io> Engine<I> {
     /// passes it.
     fn submit(&mut self, pipe: Pipe, job: Job) -> Result<u32, Error> {
         let (gc, oss) = ((self.layout.gc / 4) as u32, (self.layout.oss / 4) as u32);
+        let nbio = (self.layout.nbio / 4) as u32;
         self.submit_slot(pipe, |fence, seq| {
-            job_packets(pipe, job, gc, oss, fence, seq)
+            job_packets(pipe, job, gc, oss, nbio, fence, seq)
         })
     }
     /// Queue a slot of nothing but the next sequence's fence on `pipe`: the

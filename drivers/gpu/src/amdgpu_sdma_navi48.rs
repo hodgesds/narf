@@ -368,6 +368,8 @@ fn kernel_words(
 /// - when `job.map_pasid`, the PASID mapping (IH_VMID_0_LUT + vmid at
 ///   OSSSYS dword base `oss`);
 /// - when `job.mem_sync`, a GCR_REQ cache flush (sdma_v7_0_ring_emit_mem_sync);
+/// - always an HDP_FLUSH POLL_REGMEM request/ack for SDMA0 before the IBs,
+///   including jobs that reuse a VMID without a page-table flush;
 /// - each IB as sdma_v7_0_ring_emit_ib: NOPs so the 6-dword INDIRECT packet
 ///   ends on an 8-dword boundary (the slot starts on one), the VMID in the
 ///   header, a 32-byte aligned base and no CSA;
@@ -379,6 +381,7 @@ fn job_words(
     job: &crate::amdgpu_gfx12_queue::Job,
     gc: u32,
     oss: u32,
+    nbio: u32,
     fence: u64,
     seq: u32,
 ) -> Result<[u32; JOB_DWORDS as usize], Error> {
@@ -431,6 +434,17 @@ fn job_words(
         const GCR: u32 = 1 << 14 | 1 << 15 | 1 << 5 | 1 << 9 | 1 << 8 | 1 << 7 | 1;
         slot.push(&[17, 0, (GCR & 0xffff) << 16, GCR >> 16, 0])?;
     }
+    // sdma_v7_0_ring_emit_hdp_flush: the HDP-flush poll writes the
+    // reference to REQ then polls DONE (byte register addresses). SDMA0
+    // uses bit 10, with Linux's finite retry count and interval.
+    slot.push(&[
+        8 | 1 << 26 | 3 << 28,
+        (nbio + 0x107) << 2,
+        (nbio + 0x106) << 2,
+        1 << 10,
+        1 << 10,
+        0xfff << 16 | 10,
+    ])?;
     for &(at, dwords) in ibs {
         while (slot.pos + 6) % 8 != 0 {
             slot.push(&[0])?;
@@ -604,7 +618,14 @@ impl<I: Io> Engine<I> {
     fn submit(&mut self, job: crate::amdgpu_gfx12_queue::Job) -> Result<u32, Error> {
         let l = self.layout;
         self.submit_slot(|fence, seq| {
-            job_words(&job, (l.gc / 4) as u32, (l.oss / 4) as u32, fence, seq)
+            job_words(
+                &job,
+                (l.gc / 4) as u32,
+                (l.oss / 4) as u32,
+                (l.nbio / 4) as u32,
+                fence,
+                seq,
+            )
         })
     }
     /// Queue one kernel job (see `kernel_words`) like a client job.

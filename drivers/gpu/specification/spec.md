@@ -5143,7 +5143,8 @@ open's root page directory (`VmState::root_pde`, GMC 12 only), through
 sync (wait for the ring's previous fence) and VM flush (GFX hub, the ring's
 engine, PFP_SYNC_ME) when the grant asks for a flush, the LUT write, an
 ACQUIRE_MEM when the first IB carries `AMDGPU_IB_FLAG_EMIT_MEM_SYNC`
-(`Job::mem_sync`; GCR_REQ on SDMA), CONTEXT_CONTROL on the graphics ring
+(`Job::mem_sync`; GCR_REQ on SDMA), an HDP request/ack handshake,
+CONTEXT_CONTROL on the graphics ring
 (state reloads when `Job::ctx_switch`: the ring's previous job came from
 another `(owner, ctx_id)`, Linux's scheduler entity), IBs and an
 interrupting RELEASE_MEM fence;
@@ -5161,6 +5162,16 @@ useful one; faults for freed PASIDs are dropped), and
 open's PASID. `AMDGPU_INFO` still reports acceleration unavailable, while
 `HW_IP_INFO`'s `available_rings` reports bit 0 for each IP whose ring 0
 the open's card's submitter serves (`amdgpu_info::available_rings`).
+
+Every native GC12 client slot follows `gfx_v12_0_ring_emit_hdp_flush`
+before CONTEXT_CONTROL and IB execution: WAIT_REG_MEM operation 1 writes
+NBIO bank 2's HDP_FLUSH_REQ (0x106) and waits on HDP_FLUSH_DONE (0x107),
+using CP0/PFP for graphics pipe 0 and CP2/ME for compute pipe 0. This is
+independent of the grant's page-table flush and `Job::mem_sync`; neither
+VMID reuse nor skipping ACQUIRE_MEM removes host-data visibility ordering.
+The register banks are the same NBIF6.3.1/NBIO7.7 layouts already bounded
+by queue construction. CPU publication and fence-read HDP flushes remain
+part of their existing visibility contract.
 
 `amdgpu_vmid::VmidManager` grants VMIDs as amdgpu_vmid_grab does with
 concurrent flushes: `grab(GrabRequest { owner, pd_addr, tlb_seq, pasid,
@@ -5181,7 +5192,9 @@ through `amdgpu_sdma_navi48::Sdma::submit(Job)`, after both SDMA proofs
 (busy before). Its frame follows sdma_v7_0's ring functions in 256-dword
 slots of the 1024-dword ring: when flushing, a memory POLL_REGMEM pipeline
 sync and the GFX hub flush on invalidation engine 11 (REGISTER_WRITE /
-POLL_REGMEM); the LUT write; INDIRECT packets NOP-aligned to end on 8
+POLL_REGMEM); the LUT write; an unconditional SDMA0 HDP_FLUSH POLL_REGMEM
+(DONE then REQ byte addresses, bit 10, equal, retry 0xfff and interval 10);
+INDIRECT packets NOP-aligned to end on 8
 dwords, IBs 32-byte aligned with no CSA; and an uncached FENCE (no TRAP;
 completion is polled through `FenceReader`). The ring is started with
 `IB_ENABLE`, as sdma_v7_0_gfx_resume does.

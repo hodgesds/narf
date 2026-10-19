@@ -30,6 +30,8 @@ struct Fake {
     /// reference, mask, info), PFP syncs and IBs (address, control).
     job_writes: Vec<(u32, u32)>,
     job_waits: Vec<(u32, u32, u32, u32, u32)>,
+    job_hdp: Vec<u32>,
+    hdp_complete: bool,
     job_syncs: u32,
     /// Pipeline syncs: (fence address, sequence waited for).
     job_pipeline_syncs: Vec<(u64, u32)>,
@@ -136,6 +138,8 @@ impl Fake {
             let slot = off + (rptr % 1024) as usize;
             let mut cursor = 0;
             let mut shader_job = false;
+            let mut hdp = false;
+            let mut context = false;
             while cursor < 256 {
                 let words = &self.memory[slot + cursor..slot + 256];
                 let header = words[0];
@@ -162,6 +166,27 @@ impl Fake {
                         assert_eq!(self.memory[((address - GPU) / 4) as usize], words[4]);
                         self.job_pipeline_syncs.push((address, words[4]));
                     }
+                    0x3c if words[2] == 0x60000 / 4 + 0x106 => {
+                        assert!(!context, "HDP before context control");
+                        let (mask, engine) = if pipe == 0 { (1, 0x100) } else { (4, 0) };
+                        assert_eq!(
+                            words[..length],
+                            [
+                                0xc0053c00,
+                                0x43 | engine,
+                                0x18106,
+                                0x18107,
+                                mask,
+                                mask,
+                                0x20
+                            ]
+                        );
+                        self.job_hdp.push(mask);
+                        if !self.hdp_complete {
+                            return; // no IB or completion can pass the handshake
+                        }
+                        hdp = true;
+                    }
                     0x3c => {
                         assert_eq!((length, words[6]), (7, 0x20));
                         self.job_waits
@@ -173,6 +198,7 @@ impl Fake {
                     }
                     0x28 => {
                         assert_eq!((pipe, length, words[2]), (0, 3, 0), "graphics only");
+                        context = true;
                         self.job_context_controls.push(words[1]);
                     }
                     0x58 => {
@@ -181,6 +207,9 @@ impl Fake {
                     }
                     0x3f => {
                         assert_eq!(length, 4);
+                        if words[3] & 0x0f00_0000 != 0 {
+                            assert!(hdp, "HDP acknowledgement before client IB");
+                        }
                         let address = u64::from(words[1]) | u64::from(words[2]) << 32;
                         self.job_ibs.push((address, words[3]));
                         if address == VA + crate::amdgpu_gfx12_shader::IB_OFFSET {
@@ -462,6 +491,8 @@ fn fixture() -> (Pool, Engine<Fake>, FakeMes, gmc::Aperture, MmioRegion) {
             ]),
             job_writes: Vec::new(),
             job_waits: Vec::new(),
+            job_hdp: Vec::new(),
+            hdp_complete: true,
             job_syncs: 0,
             job_pipeline_syncs: Vec::new(),
             job_context_controls: Vec::new(),
@@ -883,6 +914,7 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
         || e.io.job_pipeline_syncs != [(GPU + 10496, 0)]
         || e.io.job_context_controls != [0x8101_8003]
         || e.io.job_mem_syncs != 0
+        || e.io.job_hdp != [1]
         || e.io.job_ibs != [(0x2_0000_1000, 64 | 3 << 24)]
         || e.io.memory[2562] != 768
     {
@@ -946,12 +978,14 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
         || e.io.job_ibs.last() != Some(&(0x2_0000_4000, 8 | 1 << 23 | 2 << 24))
         || e.io.memory[3072 + 2562] != 768
         || e.io.job_pipeline_syncs.last() != Some(&(GPU + 12288 + 10496, 0))
+        || e.io.job_hdp.last() != Some(&4)
     {
         return TestResult::Fail("compute job");
     }
     // A reused VMID: no flush and no LUT write, only the IB and fence.
     let (writes, waits) = (e.io.job_writes.len(), e.io.job_waits.len());
     let pipeline_syncs = e.io.job_pipeline_syncs.len();
+    let hdp = e.io.job_hdp.len();
     let reused = Job {
         flush: false,
         map_pasid: false,
@@ -962,6 +996,8 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
         || e.io.job_writes.len() != writes
         || e.io.job_waits.len() != waits
         || e.io.job_pipeline_syncs.len() != pipeline_syncs
+        || e.io.job_hdp.len() != hdp + 1
+        || e.io.job_hdp.last() != Some(&4)
         || e.io.job_ibs.last() != Some(&(0x2_0000_4000, 8 | 1 << 23 | 2 << 24))
     {
         return TestResult::Fail("job on a reused VMID");
@@ -1022,6 +1058,38 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/gfx12",
     gfx12_graphics_queue_runs_client_jobs_with_vm_flushes
+);
+
+/// A missing NBIO acknowledgement must prevent both the IB and its fence,
+/// even when the VMID itself needs no flush and the CP has ring space.
+fn gfx12_hdp_acknowledgement_precedes_execution_on_both_queues() -> TestResult {
+    for pipe in [Pipe::Graphics, Pipe::Compute] {
+        let (_pool, mut e, mut mes, aperture, target) = fixture();
+        run(e.initialize(&mut mes, aperture, target)).unwrap();
+        e.state = State::InterruptVerified;
+        let p = pipe.index();
+        e.io.memory[p * 3072 + 2560] = 512;
+        e.io.hdp_complete = false;
+        let job = Job {
+            flush: false,
+            map_pasid: false,
+            ..Job::new(3, 0x42, 0, &[(0x2_0000_1000, 64)]).unwrap()
+        };
+        assert_eq!(e.submit(pipe, job), Ok(1));
+        assert_eq!(e.completed_job(pipe), Ok(0));
+        assert_eq!(e.io.memory[p * 3072 + 2560], 512);
+        assert!(e.io.job_ibs.is_empty());
+        assert_eq!(e.io.job_hdp, [if p == 0 { 1 } else { 4 }]);
+        e.io.hdp_complete = true;
+        e.io.execute_jobs(p, 768);
+        assert_eq!(e.io.job_ibs.len(), 1);
+        assert_eq!(e.completed_job(pipe), Ok(1));
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_hdp_acknowledgement_precedes_execution_on_both_queues
 );
 
 /// gfx_v12_0_reset_kcq's queue half: a reset dequeue and SPI queue reset
