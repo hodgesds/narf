@@ -64,6 +64,9 @@ use narf_lib::sync::IrqSafeSpinLock;
 use crate::amdgpu_uapi as uapi;
 use crate::drm_ioctl_bridge::{copy_in, copy_out};
 use crate::drm_uapi;
+#[path = "amdgpu_cpu_mapping.rs"]
+pub(crate) mod cpu_mapping;
+pub use cpu_mapping::{release_cpu_frame, retain_cpu_frame};
 
 /// First amdgpu GEM handle. Chosen above any plausible dumb-buffer handle so
 /// the two spaces cannot overlap; see the module header.
@@ -973,6 +976,16 @@ impl Default for GemState {
 }
 
 impl GemState {
+    /// Acquire a revocable CPU mapping and its exact frame snapshot together.
+    pub fn mmap_backing(
+        &self,
+        offset: u64,
+        len: usize,
+    ) -> Result<narf_filesystem::MmapBacking, FsError> {
+        let handle = u32::try_from(offset >> 12).map_err(|_| FsError::InvalidData)?;
+        let object = self.get(handle).ok_or(FsError::InvalidData)?;
+        cpu_mapping::backing(object, 0, len)
+    }
     /// An open with no VRAM heap: every buffer is system memory.
     pub const fn new() -> Self {
         GemState {

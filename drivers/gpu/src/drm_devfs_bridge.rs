@@ -241,6 +241,23 @@ impl Drop for DriCardFile {
 }
 
 impl FileOps for DriCardFile {
+    fn mmap_backing(
+        &self,
+        offset: u64,
+        len: usize,
+    ) -> Result<narf_filesystem::MmapBacking, FsError> {
+        if crate::drm_registry::driver_name(self.index) == Some("amdgpu")
+            && offset >> 12 >= 0x4000_0000
+        {
+            return self.amdgpu_gem.mmap_backing(offset, len);
+        }
+        let lifetime = self.mmap_lifetime(offset, len);
+        let frames = self.mmap_frames(offset, len)?;
+        Ok(narf_filesystem::MmapBacking { frames, lifetime })
+    }
+    fn mmap_published(&self, lifetime: Option<&Arc<dyn MmapLifetime>>) {
+        crate::amdgpu_gem::cpu_mapping::published(lifetime);
+    }
     /// Drain one pending DRM event (`drm_event_vblank`) into `buf`. The
     /// compositor render loop poll/select()s the fd then read()s the
     /// flip-complete event here. An empty queue is `WouldBlock`: `sys_read`
@@ -930,6 +947,16 @@ pub(crate) fn amdgpu_dma_buf_file(
 }
 
 impl FileOps for AmdgpuDmaBufFile {
+    fn mmap_backing(
+        &self,
+        offset: u64,
+        len: usize,
+    ) -> Result<narf_filesystem::MmapBacking, FsError> {
+        crate::amdgpu_gem::cpu_mapping::backing(self.object.clone(), offset, len)
+    }
+    fn mmap_published(&self, lifetime: Option<&Arc<dyn MmapLifetime>>) {
+        crate::amdgpu_gem::cpu_mapping::published(lifetime);
+    }
     fn ino(&self) -> u64 {
         self.inode.ino
     }
@@ -1070,6 +1097,21 @@ impl Drop for DriRenderFile {
 }
 
 impl FileOps for DriRenderFile {
+    fn mmap_backing(
+        &self,
+        offset: u64,
+        len: usize,
+    ) -> Result<narf_filesystem::MmapBacking, FsError> {
+        if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
+            return self.amdgpu_gem.mmap_backing(offset, len);
+        }
+        let lifetime = self.mmap_lifetime(offset, len);
+        let frames = self.mmap_frames(offset, len)?;
+        Ok(narf_filesystem::MmapBacking { frames, lifetime })
+    }
+    fn mmap_published(&self, lifetime: Option<&Arc<dyn MmapLifetime>>) {
+        crate::amdgpu_gem::cpu_mapping::published(lifetime);
+    }
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move { Ok(0) })
     }

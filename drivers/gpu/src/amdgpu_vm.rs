@@ -711,7 +711,7 @@ pub(crate) async fn relocate(
     }
     let result = match staged.as_ref() {
         Some((source, destination)) => object.commit_transfer(source, destination.clone()),
-        None => object.relocate(to_vram),
+        None => crate::amdgpu_gem::cpu_mapping::relocate(object, to_vram),
     };
     drop(rebind);
     drop(staged);

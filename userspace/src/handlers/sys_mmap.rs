@@ -668,6 +668,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             // concurrent handle close may remove the lookup-table entry after
             // this point, but it cannot recycle the backing while this Arc is
             // held and then transferred into the mapping-owner table.
+            narf_filesystem::mmap_relocation::install(crate::mapped_file::relocate_device_frames);
             let backing = match ops.mmap_backing(offset, len as usize) {
                 Ok(backing) => Some(backing),
                 Err(narf_filesystem::FsError::Unsupported) => None,
@@ -743,7 +744,10 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                                     // rollback is receipt-scoped if PTE install
                                     // fails.
                                     match unsafe { as_ref.materialize_mapping_locked(receipt) } {
-                                        Ok(()) => Ok(()),
+                                        Ok(()) => {
+                                            ops.mmap_published(mmap_lifetime.as_ref());
+                                            Ok(())
+                                        },
                                         Err(error) => {
                                             // SAFETY: VMA -> shared transactions
                                             // remain held by the enclosing scopes.
