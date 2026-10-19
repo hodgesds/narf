@@ -1203,3 +1203,36 @@ fn smoke_btrfs_fst_pad_groups() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_fst_pad_groups);
+
+/// A new chunk copies the profile of its type only when every existing chunk
+/// of that type agrees on SINGLE or DUP, and metadata chunks are 1 GiB above
+/// 50 GiB as on Linux.
+fn smoke_btrfs_chunk_profile_and_size() -> TestResult {
+    use crate::write::chunk_alloc::{chunk_want, template_profile};
+    let dup = format::BLOCK_GROUP_DUP;
+    let raid1 = format::BLOCK_GROUP_RAID1;
+    if template_profile(&[dup, dup]) != Some(dup) || template_profile(&[0, 0]) != Some(0) {
+        return TestResult::Fail("a uniform SINGLE/DUP type was refused");
+    }
+    if template_profile(&[0, dup]).is_some()
+        || template_profile(&[dup, 0]).is_some()
+        || template_profile(&[raid1]).is_some()
+        || template_profile(&[]).is_some()
+    {
+        return TestResult::Fail("a mixed, RAID or empty profile set was accepted");
+    }
+    let gib = 1u64 << 30;
+    let meta = format::BLOCK_GROUP_METADATA;
+    let data = format::BLOCK_GROUP_DATA;
+    if chunk_want(meta, 4 * gib) != 256 << 20
+        || chunk_want(data, 4 * gib) != 400 << 20
+        || chunk_want(meta, 40 * gib) != 256 << 20
+        || chunk_want(meta, 1800 * gib) != gib
+        || chunk_want(data, 1800 * gib) != gib
+        || chunk_want(data, 64 << 20) != 8 << 20
+    {
+        return TestResult::Fail("chunk sizing differs from Linux's");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_chunk_profile_and_size);

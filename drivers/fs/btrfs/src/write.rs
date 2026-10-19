@@ -59,7 +59,7 @@ use narf_filesystem::FsError;
 
 use crate::allocator::Allocator;
 
-mod chunk_alloc;
+pub(crate) mod chunk_alloc;
 pub(crate) mod fileops;
 use crate::block_group::{self, BgHome};
 use crate::btree::{

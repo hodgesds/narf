@@ -36,10 +36,14 @@ use crate::volume::BtrfsVolume;
 /// allocated to a chunk.
 const DEVICE_RANGE_RESERVED: u64 = 1 << 20;
 /// Chunk sizing (`calc_chunk_size`): data up to 1 GiB, metadata up to
-/// 256 MiB, never more than a tenth of the filesystem, in 16 MiB steps, and
+/// 256 MiB (1 GiB above 50 GiB, [`chunk_want`]), never more than a tenth of the filesystem, in 16 MiB steps, and
 /// never less than 8 MiB.
 const DATA_CHUNK_MAX: u64 = 1 << 30;
 const METADATA_CHUNK_MAX: u64 = 256 << 20;
+/// Linux `init_alloc_chunk_ctl_policy_regular`: above 50 GiB of writable
+/// space a metadata chunk is 1 GiB, not 256 MiB.
+const METADATA_CHUNK_MAX_LARGE: u64 = 1 << 30;
+const LARGE_FS_BYTES: u64 = 50 << 30;
 const CHUNK_STEP: u64 = 16 << 20;
 const CHUNK_MIN: u64 = 8 << 20;
 /// `sizeof(struct btrfs_chunk)` without stripes, and one `btrfs_stripe`.
@@ -74,6 +78,32 @@ pub(crate) fn device_holes(used: &[(u64, u64)], from: u64, end: u64) -> Vec<(u64
         holes.push((at, end - at));
     }
     holes
+}
+
+/// The size to ask for a new chunk of `kind` on a filesystem of
+/// `total_bytes`: Linux's per-type maximum (DATA 1 GiB; METADATA 256 MiB, or
+/// 1 GiB above 50 GiB), at most a tenth of the filesystem, in 16 MiB steps,
+/// at least 8 MiB.
+pub(crate) fn chunk_want(kind: u64, total_bytes: u64) -> u64 {
+    let cap = if kind == format::BLOCK_GROUP_DATA {
+        DATA_CHUNK_MAX
+    } else if total_bytes > LARGE_FS_BYTES {
+        METADATA_CHUNK_MAX_LARGE
+    } else {
+        METADATA_CHUNK_MAX
+    };
+    (cap.min(total_bytes / 10) / CHUNK_STEP * CHUNK_STEP).max(CHUNK_MIN)
+}
+
+/// The profile a new chunk copies, given the profile bits of every existing
+/// chunk of its type: `Some` only when there is at least one and they all
+/// agree on SINGLE (0) or DUP. Pure.
+pub(crate) fn template_profile(profiles: &[u64]) -> Option<u64> {
+    let first = *profiles.first()?;
+    if first != 0 && first != format::BLOCK_GROUP_DUP {
+        return None;
+    }
+    profiles.iter().all(|&p| p == first).then_some(first)
 }
 
 /// Place `stripes` stripes of `want` bytes (shrinking toward `CHUNK_MIN` in
@@ -146,6 +176,7 @@ pub(crate) async fn alloc_chunk<B: BlockDevice + 'static>(
     // Chunks: the logical end, and a template of the wanted type.
     let mut logical_end = 0u64;
     let mut template: Option<Vec<u8>> = None;
+    let mut profiles: Vec<u64> = Vec::new();
     let mut dev_item_body: Option<Vec<u8>> = None;
     {
         let mut c = Cursor::seek(vol, sb.chunk_root, &BtrfsKey::new(0, 0, 0)).await?;
@@ -161,7 +192,8 @@ pub(crate) async fn alloc_chunk<B: BlockDevice + 'static>(
                             | format::BLOCK_GROUP_METADATA
                             | format::BLOCK_GROUP_SYSTEM)
                         == kind;
-                    if same_type && (profile == 0 || profile == format::BLOCK_GROUP_DUP) {
+                    if same_type {
+                        profiles.push(profile);
                         template = Some(body.to_vec());
                     }
                 }
@@ -172,6 +204,13 @@ pub(crate) async fn alloc_chunk<B: BlockDevice + 'static>(
             }
             c.advance().await?;
         }
+    }
+    // Every chunk of the type must agree on one SINGLE or DUP profile: on a
+    // filesystem caught mid-convert (or any mix), which profile Linux would
+    // pick for the next chunk is its balance/restripe policy, and adding a
+    // SINGLE chunk where it would add DUP silently drops redundancy.
+    if template_profile(&profiles).is_none() {
+        return Err(FsError::NoSpace);
     }
     let template = template.ok_or(FsError::NoSpace)?;
     let mut dev_item_body = dev_item_body.ok_or(FsError::InvalidData)?;
@@ -203,12 +242,7 @@ pub(crate) async fn alloc_chunk<B: BlockDevice + 'static>(
     used.sort_unstable();
     let dev_extent_template = dev_extent_template.ok_or(FsError::InvalidData)?;
     let holes = device_holes(&used, DEVICE_RANGE_RESERVED, dev_total);
-    let cap = if kind == format::BLOCK_GROUP_DATA {
-        DATA_CHUNK_MAX
-    } else {
-        METADATA_CHUNK_MAX
-    };
-    let want = (cap.min(sb.total_bytes / 10) / CHUNK_STEP * CHUNK_STEP).max(CHUNK_MIN);
+    let want = chunk_want(kind, sb.total_bytes);
     let (size, offsets) = place_stripes(&holes, stripes, want).ok_or(FsError::NoSpace)?;
 
     // The new chunk, its device extents and its block group.

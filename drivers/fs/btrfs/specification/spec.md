@@ -89,6 +89,7 @@ a reader walks from it. Under
 space allocates one SINGLE/DUP chunk by path COW instead
 (`write::alloc_chunk`, Linux `btrfs_alloc_chunk`, placed below the device's
 btrfs `total_bytes`) of the type that ran short (`write::root_rw_grow`),
+only when every chunk of that type has the same SINGLE or DUP profile,
 and a device with no hole left is ENOSPC. A batch never stages an operation
 that would leave less free metadata than its own commit may need
 (`write::commit_meta_reserve`: a 256-block floor plus one block per four
