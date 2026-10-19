@@ -5206,6 +5206,44 @@ sdma_v7_0_emit_copy_buffer (COPY_LINEAR with CPV, no DCC; non-overlapping),
 split into 1 GiB packets; a job that overflows its 256-dword slot is
 refused.
 
+`amdgpu_vcn_navi48::Vcn` owns Navi48's VCN5.0.0 instance 0 static-power
+VCPU and unified ring on NBIF6.3.1. Unsafe `new` reserves separate owned
+stack/context/shared/ring/fence backing and requires the matching permanent
+pool, PSP TMR, MMHUB VMID0, BAR2 and exclusive media/NBIF/reset/PM ownership.
+`start(MediaFirmware, PowerStatus).await` refuses active inherited rings,
+a running VCPU, an occupied media doorbell range, and MM_DPM/DS_VCN policy.
+It publishes backing before its first awaited write, powers ONO2..5 on,
+programs PSP firmware, 128 KiB stack, 512 KiB context and a shared page,
+then boots the VCPU with ten bounded reset retries. The shared record enables
+the unified queue and dGPU SMU interface; byte queue-mode updates preserve
+adjacent firmware-owned state. The owned NBIF range and 32-bit doorbell
+follow Linux's SOC24 assignment. VCPU master interrupts remain masked until
+independent media interrupt ownership is implemented.
+
+`prove().await` emits a native unified FENCE/TRAP/END frame, padded to 64
+dwords, and requires both its new fence and complete monotonic RPTR drain.
+It proves queue transport only. `stop().await` sets DPG hold-off, drains the
+ring, checks VCPU and LMI/UMC write-clean, then blocks/resets VCPU and LMI,
+disables its doorbell/ring and proves posted writes completed before marking
+backing reusable. Uncertain completion, revocation or cancellation retains
+the published allocation and refuses replay until device recovery.
+
+`unsafe Smu::set_vcn_power(bool).await` is SMU14's dGPU instance-0
+PowerUpVcn/PowerDownVcn, with a fresh static-media/protection feature check.
+Power-down requires the retained VCPU/LMI retirement proof. As other SMU
+runtime operations, cancellation leaves the mailbox owner busy and terminal
+transport errors forbid reuse. No display/GFX clock policy is changed.
+
+The opt-in `amdgpu.media_proof` boot argument requests a retained native
+power-up/start/fence/stop/power-down cycle after the GC12/SDMA interrupt
+proofs, before publishing clears or allowing any client slot. Its pending
+state is stored before the first await; error/cancellation gates all three
+client submit wrappers and returned failure quarantines the IH service.
+`amdgpu_navi48_platform::Diagnostics::media_transport` exposes the result.
+Explicit whole-device recovery repeats the requested proof with fresh
+owners. This adds no VCN/JPEG client ring or codec capability advertisement;
+IB/codec execution, media MSI, JPEG and physical acceptance remain open.
+
 ### AMD platform VBIOS
 
 `atombios::header::parse_rom_header` and `amdgpu_atombios::Atombios::parse`

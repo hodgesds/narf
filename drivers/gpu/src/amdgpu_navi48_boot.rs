@@ -83,6 +83,7 @@ pub enum Error {
     Firmware(gfx::Error),
     Gmc(gmc::Error),
     Sdma(sdma::Error),
+    Vcn(crate::amdgpu_vcn_navi48::Error),
     Dmub(dmub::Error),
     Topology(topology::Error),
     Display(display::Error),
@@ -203,6 +204,8 @@ struct Hardware {
     sdma: Option<sdma::Sdma>,
     mes: Option<mes::Mes>,
     queues: Option<queues::Queues>,
+    vcn: Option<crate::amdgpu_vcn_navi48::Vcn>,
+    media_test: Option<Result<crate::amdgpu_vcn_navi48::Proof, Error>>,
 }
 impl Backend for Hardware {
     async fn step(&mut self, stage: Stage) -> Result<(), Error> {
@@ -657,6 +660,8 @@ impl ColdBoot {
                     faults: Some(faults),
                     gmc: None,
                     sdma: None,
+                    vcn: None,
+                    media_test: None,
                     mes: None,
                     queues: None,
                 },
@@ -814,6 +819,9 @@ impl ColdBoot {
         pipe: queues::Pipe,
         job: queues::Job,
     ) -> Result<u32, queues::Error> {
+        if !self.media_submission_ready() {
+            return Err(queues::Error::Busy);
+        }
         let queues = self
             .sequence
             .backend
@@ -946,6 +954,9 @@ impl ColdBoot {
         &mut self,
         job: queues::Job,
     ) -> Result<u32, sdma::Error> {
+        if !self.media_submission_ready() {
+            return Err(sdma::Error::Busy);
+        }
         let sdma = self
             .sequence
             .backend
@@ -965,6 +976,9 @@ impl ColdBoot {
         &mut self,
         ops: &[sdma::KernelOp],
     ) -> Result<u32, sdma::Error> {
+        if !self.media_submission_ready() {
+            return Err(sdma::Error::Busy);
+        }
         let sdma = self
             .sequence
             .backend
@@ -3053,6 +3067,9 @@ impl ColdBoot {
         Ok(&mut self.sequence.backend.dmub)
     }
 }
+
+#[path = "amdgpu_navi48_boot_media.rs"]
+mod media_transport;
 
 #[path = "amdgpu_navi48_mst.rs"]
 mod mst;

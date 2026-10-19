@@ -912,9 +912,18 @@ execution, including submissions that reuse a VMID without a VM flush.
 Linux-header checks pin both supported NBIO layouts and packet fields;
 models cover packet ordering and blocked GC12 acknowledgement.
 
+Navi48 now has a retained VCN5.0.0 static-power unified-ring owner and an
+opt-in `amdgpu.media_proof` power/transport/retirement cycle. Owned firmware
+windows, NBIF doorbells, fresh fence/RPTR completion, byte shared-state
+updates and VCPU/LMI shutdown follow the local Linux reference. SMU14 media
+power commands require fresh protection/static-clock checks. Cancellation
+or uncertainty retains memory and blocks clients. Register/queue models
+cover these paths; media client IBs, codecs, CPU IRQ delivery and JPEG remain
+open, with no new media capabilities advertised.
+
 Still open: physical MSI delivery and reset/replay acceptance, GC12 rendering
 and application shader execution, GPU VM/userspace and DCN4
-clock/bandwidth/link/scanout hardware acceptance, VCN5 video queues,
+clock/bandwidth/link/scanout hardware acceptance, VCN5 client/video queues,
 THM/SMU thermal interrupts and software-CTF shutdown,
 memory/fabric DPM relaxation (display admission/watermark rework first),
 reset/suspend/resume, and physical RX 9070 XT testing.

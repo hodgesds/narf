@@ -21,6 +21,11 @@ pub enum Error {
 }
 
 static SHADER_PROOF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static MEDIA_PROOF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Opt-in VCN5 power/transport/retirement evidence before client publication.
+pub fn set_media_proof(enabled: bool) {
+    MEDIA_PROOF.store(enabled, core::sync::atomic::Ordering::Release);
+}
 /// Boot opt-in for shader execution evidence, independent of Mesa readiness.
 pub fn set_shader_proof(enabled: bool) {
     SHADER_PROOF.store(enabled, core::sync::atomic::Ordering::Release);
@@ -67,6 +72,7 @@ pub struct Diagnostics {
         Option<Result<crate::amdgpu_gfx12_queue::InterruptProof, crate::amdgpu_gfx12_queue::Error>>,
     pub shaders:
         Option<Result<crate::amdgpu_gfx12_shader::Proof, crate::amdgpu_gfx12_queue::Error>>,
+    pub media_transport: Option<Result<crate::amdgpu_vcn_navi48::Proof, boot::Error>>,
     pub sdma_state: Option<crate::amdgpu_sdma_navi48::State>,
     pub sdma_interrupts:
         Option<Result<crate::amdgpu_sdma_navi48::InterruptProof, crate::amdgpu_sdma_navi48::Error>>,
@@ -88,6 +94,7 @@ pub fn status() -> Status {
                 queue_state: boot.queue_state(),
                 queue_interrupts: boot.queue_interrupts(),
                 shaders: boot.shader_result(),
+                media_transport: boot.media_result(),
                 sdma_state: boot.sdma_state(),
                 sdma_interrupts: boot.sdma_interrupts(),
                 display_clocks: boot.display_clock_status(),
@@ -394,6 +401,11 @@ pub async unsafe fn recover() -> Result<boot::Report, boot::Error> {
     if SHADER_PROOF.load(Ordering::Acquire) {
         // SAFETY: new queues are drained and all test-page users stay under OWNER.
         unsafe { boot.prove_shaders().await }.map_err(boot::Error::Queues)?;
+    }
+    if MEDIA_PROOF.load(Ordering::Acquire) {
+        // SAFETY: all old clients withdrawn, fresh native proofs drained,
+        // and OWNER retains firmware/GMC and excludes every PM/queue writer.
+        unsafe { boot.prove_media_transport().await }?;
     }
     let mut watches = old_submitter.as_ref().map_or_else(
         || [const { crate::amdgpu_ring_watch::RingWatch::new() }; RINGS],
@@ -881,6 +893,20 @@ async fn prove_queue_interrupts() {
                         "amdgpu: navi48 shader proof {result:?}"
                     );
                     if result.is_err() {
+                        return;
+                    }
+                }
+                if MEDIA_PROOF.load(Ordering::Acquire) {
+                    // SAFETY: OWNER excludes every client/clear/PM user and
+                    // no client slot can publish before this worker returns.
+                    let result = unsafe { boot.prove_media_transport().await };
+                    use core::fmt::Write as _;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: navi48 VCN5 transport {result:?}"
+                    );
+                    if result.is_err() {
+                        crate::amdgpu_navi48_interrupts::quarantine().await;
                         return;
                     }
                 }

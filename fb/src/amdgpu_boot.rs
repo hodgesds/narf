@@ -99,6 +99,7 @@ pub(super) fn start() -> InitResult {
         narf_boot::args().has_flag("amdgpu.navi22_accel"),
     );
     navi48::set_shader_proof(narf_boot::args().has_flag("amdgpu.shader_proof"));
+    navi48::set_media_proof(narf_boot::args().has_flag("amdgpu.media_proof"));
     let ok = if navi48 {
         // SAFETY: the retained prepared owner and paused CPU writers persist.
         let result = narf_scheduler::block_on_spin(unsafe { navi48::run() });
