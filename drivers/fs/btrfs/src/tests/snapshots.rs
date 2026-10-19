@@ -514,3 +514,42 @@ kernel_test_in!(
     "drivers/fs/btrfs",
     smoke_btrfs_qgroups_on_snapshotted_fs_marked_inconsistent
 );
+
+/// A read-only mount skips the gate's sharing walk (every metadata extent
+/// item: slow on a root with many snapshots); the first read-write request
+/// runs it before the core can write.
+fn smoke_btrfs_sharing_walk_deferred_for_read_only() -> TestResult {
+    let dev = writable_sparse(FIXTURE_SNAPSHOTS_SPARSE);
+    let async_dev = narf_block::SyncBlock::new(dev.clone() as Arc<dyn narf_block::BlockDeviceSync>);
+    let vol = match poll_once(BtrfsVolume::mount_devices_read_only(
+        alloc::vec![async_dev],
+        DomainId::DRIVER_0,
+        true,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("read-only mount failed"),
+    };
+    if !vol.is_read_only() || vol.__test_sharing_checked() {
+        return TestResult::Fail("a read-only mount ran the sharing walk");
+    }
+    if !matches!(poll_once(vol.ensure_sharing_checked()), Some(Ok(())))
+        || !vol.__test_sharing_checked()
+    {
+        return TestResult::Fail("the deferred sharing walk did not run");
+    }
+    if vol.remount_read_write().is_err() || !vol.supports_writes() {
+        return TestResult::Fail("remount rw after the walk failed");
+    }
+    let rw = match mount_id(&dev, ROOT_SV) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("read-write mount failed"),
+    };
+    if !rw.__test_sharing_checked() {
+        return TestResult::Fail("a read-write mount skipped the sharing walk");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_sharing_walk_deferred_for_read_only
+);

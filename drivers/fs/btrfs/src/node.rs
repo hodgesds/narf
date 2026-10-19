@@ -1461,6 +1461,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             }
             Some(false) if self.is_read_only() => {
                 let this = self.self_weak.upgrade().ok_or(FsError::NotFound)?;
+                narf_filesystem::fs_registry::mount_wait(this.ensure_sharing_checked())?;
                 this.remount_read_write()?;
             }
             _ => {}

@@ -355,6 +355,12 @@ pub struct VolCore<B: BlockDevice> {
     /// The write-safety gate's verdict, computed once at mount: `Some` means
     /// no mount of this core may ever write (see [`crate::rw_gate`]).
     rw_refusal: IrqSafeSpinLock<Option<crate::rw_gate::Refusal>>,
+    /// The gate's sharing walk ([`crate::rw_gate::check_sharing`]) has run
+    /// for this core. A core mounted read-only skips it (it reads every
+    /// metadata extent item, slow on a root with many snapshots, and a read
+    /// error in it would only matter for writing); the first request to
+    /// write runs it ([`BtrfsVolume::ensure_sharing_checked`]).
+    sharing_checked: core::sync::atomic::AtomicBool,
     /// The commit timer (Linux `transaction_kthread`) runs once per core.
     timer_started: core::sync::atomic::AtomicBool,
     /// A remount to read-only is draining the running transaction: new
@@ -633,6 +639,33 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         };
         self.frozen.store(false, Ordering::Release);
         result
+    }
+
+    /// Run the gate's deferred sharing walk if this core was mounted
+    /// read-only and has not had it yet; a refusal is recorded like one at
+    /// mount (and makes [`Self::make_writable`] fail). Called before any
+    /// read-write request on such a core.
+    pub(crate) async fn ensure_sharing_checked(&self) -> Result<(), FsError> {
+        use core::sync::atomic::Ordering;
+        if self.sharing_checked.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let verdict = crate::rw_gate::check_sharing(self).await;
+        if let Err(why) = verdict {
+            let mut refusal = self.rw_refusal.lock();
+            if refusal.is_none() {
+                *refusal = Some(why);
+            }
+        }
+        self.sharing_checked.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Test accessor: whether the gate's sharing walk has run for this core.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn __test_sharing_checked(&self) -> bool {
+        self.sharing_checked
+            .load(core::sync::atomic::Ordering::Acquire)
     }
 
     /// `mount -o remount,rw` (`btrfs_remount_rw`): make the filesystem
@@ -1692,6 +1725,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             read_only: core::sync::atomic::AtomicBool::new(read_only),
             super_flags,
             rw_refusal: IrqSafeSpinLock::new(None),
+            sharing_checked: core::sync::atomic::AtomicBool::new(false),
             txn_lock: Mutex::new(()),
             op_lock: Mutex::new(()),
             timer_started: core::sync::atomic::AtomicBool::new(false),
@@ -1803,6 +1837,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     ) -> Result<Arc<Self>, FsError> {
         let volume = Self::new_view(core.clone(), read_only);
         if !read_only {
+            volume.ensure_sharing_checked().await?;
             volume.make_writable()?;
         }
         volume.select_default_root().await?;
@@ -1850,7 +1885,13 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         let profile = crate::rw_gate::active_profile();
         let sb = self.superblock();
         let verdict = match crate::rw_gate::check_superblock(&sb, self.super_flags, profile) {
-            Ok(()) => crate::rw_gate::check_trees(self).await,
+            Ok(()) if self.core_read_only() => crate::rw_gate::check_trees_basic(self).await,
+            Ok(()) => {
+                let verdict = crate::rw_gate::check_trees(self).await;
+                self.sharing_checked
+                    .store(true, core::sync::atomic::Ordering::Release);
+                verdict
+            }
             Err(why) => Err(why),
         };
         let Err(why) = verdict else {

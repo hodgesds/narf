@@ -61,7 +61,10 @@ Device ownership remains pinned by the returned filesystem instance.
 
 A volume about to be mounted read-write runs `rw_gate` after the chunk map is
 loaded and before anything can write (log replay, the commit timer, any VFS
-operation), once per shared core (`registry`); a refusal makes the core
+operation), once per shared core (`registry`); a core mounted read-only
+runs it without the sharing walk over every metadata extent item, which
+runs before its first read-write request (`ensure_sharing_checked`); a
+refusal makes the core
 read-only for its lifetime, is logged, and makes later read-write mounts of
 it fail. A read-write `mount -t btrfs` that cannot be honoured returns
 `FsError::ReadOnly` (EROFS). A read-only core with an unreplayed fsync log

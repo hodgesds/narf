@@ -387,6 +387,17 @@ pub fn check_superblock(
 
 /// The tree checks (balance, replace, relocation), which need the chunk map.
 pub async fn check_trees<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Result<(), Refusal> {
+    check_trees_basic(vol).await?;
+    check_sharing(vol).await
+}
+
+/// [`check_trees`] without [`check_sharing`]: the cheap root-tree and
+/// dev-tree checks, which a read-only mount runs at mount time (the sharing
+/// walk reads every metadata extent item, and is deferred until the core is
+/// first asked to write, `BtrfsVolume::ensure_sharing_checked`).
+pub async fn check_trees_basic<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+) -> Result<(), Refusal> {
     let (root_tree, _) = vol.root_tree_root();
     // A read error is a refusal too: the gate fails closed.
     let balance = crate::btree::find_item(
@@ -417,7 +428,7 @@ pub async fn check_trees<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Resu
             Err(_) => return Err(Refusal::ReplaceInProgress),
         }
     }
-    check_sharing(vol).await
+    Ok(())
 }
 
 // ── Shared tree blocks ──────────────────────────────────────────────
