@@ -21,6 +21,11 @@ impl VideoIo {
     }
 }
 impl Io for VideoIo {
+    fn pause_wait(&self) -> bool {
+        // Cancellation waits for the selected missing acknowledgement,
+        // independently of whether a short host-clock timer yields.
+        self.watch.is_some() && self.waited.load(Ordering::SeqCst) != 0
+    }
     fn read(&mut self, at: u64) -> u32 {
         let value = self.inner.read(at);
         if value == u32::MAX {

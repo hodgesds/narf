@@ -205,9 +205,14 @@ fn sync_timeline_gc_and_iterative_release() -> TestResult {
     }
     let pending = SyncObjCore::new(None);
     let gate = fence();
+    // Exercise iterative destruction of a deep pending chain. add_point
+    // walks every older node for GC on each insertion, making this fixture
+    // quadratic; the signalled-point loop above covers that public path.
+    let mut head = None;
     for p in 1..=50_000u64 {
-        pending.add_point(gate.clone(), p);
+        head = Some(so::FenceChain::new(head, gate.clone(), p) as Arc<dyn DmaFence>);
     }
+    pending.replace_fence(head);
     drop(pending);
     TestResult::Pass
 }
