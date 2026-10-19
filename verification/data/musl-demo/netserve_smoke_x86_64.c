@@ -1679,20 +1679,7 @@ static int ns_wrap(void) {
     return 0;
 }
 
-static void *diag_thread(void *arg) {
-    (void)arg;
-    for (int i = 0;; i++) {
-        r_sleep_ms(10000);
-        char m[64];
-        snprintf(m, sizeof m, "DIAG tick %d\n", i);
-        w(m);
-        r_dump_tcp();
-    }
-    return 0;
-}
-
 static int robust_phases(void) {
-    { pthread_t dt; pthread_create(&dt, 0, diag_thread, 0); }
     int ctl = r_dial(NETSERVE_HOST, R_CTRL_PORT);
     if (ctl < 0) return failf("robust control connect", 0, 0);
     struct rcfg cfg;
