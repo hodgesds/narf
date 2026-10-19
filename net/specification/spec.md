@@ -742,10 +742,11 @@ socket lock protects protocol state.
 | `connect`: no answer | `ETIMEDOUT` (or the soft ICMP error) | `tcp_write_err` |
 | RST in ESTABLISHED / FIN-WAIT / CLOSING / LAST-ACK | `ECONNRESET` | `tcp_reset` |
 | RST in CLOSE-WAIT | `EPIPE` | `tcp_reset` |
+| RST in TIME-WAIT | ends TIME-WAIT; no error (unread bytes, then `0`) | `tcp_timewait_state_process` (`tcp_rfc1337` = 0) |
 | retransmit or keepalive give-up | `sk_err_soft` if set, else `ETIMEDOUT` | `tcp_write_err` |
 | ICMP error once established | soft only: `SO_ERROR`, or the errno of a later timeout; never aborts | `tcp_v4_err` (RFC 1122 §4.2.3.9) |
 | ICMP FRAG_NEEDED / REDIRECT / SOURCE_QUENCH; quoted seq outside `[snd_una, snd_nxt]` | ignored | `tcp_v4_err` |
-| `recv`: data queued | the data, whatever the state | `tcp_recvmsg_locked` |
+| `recv`: data queued | the data, whatever the state — also after a reset | `tcp_recvmsg_locked`, `tcp_done` |
 | `recv`: peer FIN received (`SOCK_DONE`) | `0` | `tcp_recvmsg_locked` |
 | `recv`: pending error | that errno, once; then `0` | `sock_error`, `tcp_done` |
 | `recv`: after `SHUT_RD` / connection closed | `0` | `RCV_SHUTDOWN` |
@@ -759,9 +760,11 @@ socket lock protects protocol state.
 | `setsockopt` SO_TYPE / SO_PROTOCOL / SO_DOMAIN / SO_ERROR | `ENOPROTOOPT` | `sk_setsockopt` |
 
 A connection's TCB is freed when it ends, while Linux keeps `struct sock`
-until the fd closes. So the pending error and `SOCK_DONE` of a connection
-that ended in error are kept by TCB id until `close` / `release` (bounded:
-the oldest entry is evicted past 4096).
+until the fd closes. So the pending error, `SOCK_DONE` and the unread
+received bytes (`sk_receive_queue`, which `tcp_done` leaves alone) of a
+connection that was aborted are kept by TCB id until `close` / `release`
+(bounded: the oldest entry is evicted past 4096). `recv` and `SIOCINQ` drain
+those bytes before the error or EOF.
 
 Deviation: `iface::for_dst` falls back to the primary interface when no
 route matches, so `ENETUNREACH` is reported only when no interface exists,

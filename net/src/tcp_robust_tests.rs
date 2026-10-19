@@ -294,7 +294,8 @@ fn smoke_exact_rst_accepted_with_zero_window() -> TestResult {
     if __with_tcb(id, |t| t.recv_buf.window()).unwrap_or(1) != 0 {
         return TestResult::Fail("setup: the receive window did not close");
     }
-    let rcv_nxt = __with_tcb(id, |t| t.rcv_nxt).unwrap_or(0);
+    let (rcv_nxt, queued) =
+        __with_tcb(id, |t| (t.rcv_nxt, t.recv_buf.in_order_len())).unwrap_or((0, 0));
     inject(Seg {
         src: peer,
         dst: local,
@@ -310,7 +311,23 @@ fn smoke_exact_rst_accepted_with_zero_window() -> TestResult {
     if lookup_tcb(id).is_some() {
         return TestResult::Fail("an exact-sequence RST was ignored with a zero window");
     }
-    if recv_errno(id, &mut [0u8; 8]) != Err(narf_lib::errno::ECONNRESET as i32) {
+    // `tcp_done` keeps the receive queue: the full window is read first.
+    let (mut got, mut buf) = (0usize, [0u8; 4096]);
+    let end = loop {
+        match recv_errno(id, &mut buf) {
+            Ok(n) if n > 0 => {
+                if buf[..n].iter().any(|&b| b != 0x11) {
+                    return TestResult::Fail("unread bytes corrupted by the reset");
+                }
+                got += n;
+            }
+            other => break other,
+        }
+    };
+    if queued == 0 || got != queued {
+        return TestResult::Fail("the unread window was not readable after the reset");
+    }
+    if end != Err(narf_lib::errno::ECONNRESET as i32) {
         return TestResult::Fail("the reset was not reported as ECONNRESET");
     }
     core::release(id);

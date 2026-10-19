@@ -1681,7 +1681,10 @@ kernel_test_in!("net/tcp_e2e", smoke_tcp_e2e_zero_window);
 
 use narf_lib::errno;
 
-use crate::tcp::core::{connect_errno_in, recv_errno, send_errno, shutdown_errno, take_sock_error};
+use crate::tcp::core::{
+    connect_errno_in, recv_errno, recv_peek_errno, send_errno, shutdown_errno, take_sock_error,
+    TcpQueueIoctl,
+};
 
 const EAGAIN: i32 = errno::EAGAIN as i32;
 const EPIPE: i32 = errno::EPIPE as i32;
@@ -1886,6 +1889,119 @@ fn smoke_tcp_e2e_errno_reset_established() -> TestResult {
     finish(tcp_e2e_errno_reset_established())
 }
 kernel_test_in!("net/tcp_e2e", smoke_tcp_e2e_errno_reset_established);
+
+// RST with unread data: `tcp_done` keeps `sk_receive_queue`, so the bytes
+// that arrived before the reset are read first (SIOCINQ counts them), then
+// ECONNRESET once, then EOF.
+fn tcp_e2e_errno_reset_keeps_unread_data() -> Result<(), &'static str> {
+    reset();
+    let listener = listen(SERVER_IP, SERVER_PORT, 16).map_err(|_| "listen failed")?;
+    let client = connect(SERVER_IP, SERVER_PORT).map_err(|_| "connect failed")?;
+    let server = accept_one(listener)?;
+    settle();
+    expect(send_errno(server, b"unread"), Ok(6), "server send")?;
+    settle();
+    tcp_core::remove_tcb(server);
+    expect(send_errno(client, b"hello?"), Ok(6), "send before the RST")?;
+    if !run_until(BUDGET_SMALL, || lookup_tcb(client).is_none()) {
+        return Err("client not torn down by the RST");
+    }
+    if tcp_core::queue_ioctl(client, TcpQueueIoctl::Inq) != Ok(6) {
+        return Err("SIOCINQ after the RST must count the unread bytes");
+    }
+    let mut b = [0u8; 4];
+    expect(
+        recv_peek_errno(client, &mut b),
+        Ok(4),
+        "MSG_PEEK the unread bytes",
+    )?;
+    expect(
+        recv_errno(client, &mut b),
+        Ok(4),
+        "unread bytes come before the error",
+    )?;
+    if &b != b"unre" {
+        return Err("wrong bytes read after the RST");
+    }
+    expect(
+        recv_errno(client, &mut b),
+        Ok(2),
+        "the rest of the unread bytes",
+    )?;
+    if &b[..2] != b"ad" {
+        return Err("wrong tail read after the RST");
+    }
+    expect(
+        recv_errno(client, &mut b),
+        Err(ECONNRESET),
+        "drained: then ECONNRESET",
+    )?;
+    expect(recv_errno(client, &mut b), Ok(0), "then EOF")?;
+    tcp_core::release(client);
+    Ok(())
+}
+
+fn smoke_tcp_e2e_errno_reset_keeps_unread_data() -> TestResult {
+    finish(tcp_e2e_errno_reset_keeps_unread_data())
+}
+kernel_test_in!("net/tcp_e2e", smoke_tcp_e2e_errno_reset_keeps_unread_data);
+
+// RST in TIME-WAIT with the peer's last bytes unread — the request/response
+// shape where the client half-closes, the server answers and closes, and a
+// NAT (QEMU's SLIRP) then resets the finished connection. Linux's socket is
+// already done (`tcp_time_wait`); the reset only kills the timewait sock
+// (`tcp_timewait_state_process`), so the answer is still read, then EOF,
+// and no error is ever reported.
+fn tcp_e2e_errno_reset_time_wait_keeps_unread_data() -> Result<(), &'static str> {
+    reset();
+    let c = open()?;
+    shutdown_errno(c.client, Shutdown::Write).map_err(|_| "client SHUT_WR failed")?;
+    settle();
+    expect(send_errno(c.server, b"K"), Ok(1), "server answer")?;
+    settle();
+    // Keep the server in LAST-ACK, so it is still there to send the reset:
+    // drop the client's ACK of its FIN, and run the wire without the clock
+    // (no FIN retransmission).
+    set_fault(Fault::DropControl {
+        dir: Dir::ToServer,
+        flags: FLAG_ACK,
+        count: 1,
+    });
+    shutdown_errno(c.server, Shutdown::Write).map_err(|_| "server SHUT_WR failed")?;
+    while deliver_one() {}
+    if state_of(c.client) != Some(TcpState::TimeWait) {
+        return Err("client not in TIME-WAIT");
+    }
+    set_fault(Fault::None);
+    tcp_core::__send_rst_for_test(c.server).ok_or("server TCB gone before the RST")?;
+    while deliver_one() {}
+    if lookup_tcb(c.client).is_some() {
+        return Err("TIME-WAIT not ended by the RST");
+    }
+    let mut b = [0u8; 4];
+    expect(
+        recv_errno(c.client, &mut b),
+        Ok(1),
+        "the answer survives the RST",
+    )?;
+    if b[0] != b'K' {
+        return Err("wrong byte read after the TIME-WAIT RST");
+    }
+    expect(recv_errno(c.client, &mut b), Ok(0), "then EOF")?;
+    if take_sock_error(c.client) != 0 {
+        return Err("an RST in TIME-WAIT must leave no SO_ERROR");
+    }
+    tcp_core::release(c.client);
+    Ok(())
+}
+
+fn smoke_tcp_e2e_errno_reset_time_wait_keeps_unread_data() -> TestResult {
+    finish(tcp_e2e_errno_reset_time_wait_keeps_unread_data())
+}
+kernel_test_in!(
+    "net/tcp_e2e",
+    smoke_tcp_e2e_errno_reset_time_wait_keeps_unread_data
+);
 
 // RST in CLOSE-WAIT is EPIPE (tcp_reset), and since the peer's FIN was
 // received (SOCK_DONE), recv still reports EOF rather than the error.

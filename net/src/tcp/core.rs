@@ -1047,17 +1047,22 @@ pub(crate) fn remove_namespace(net_ns_id: u64) {
 // Linux keeps `struct sock` — with its `sk_err` and `SOCK_DONE` — alive
 // until the owning fd is closed, so a read or write after a reset or a
 // timeout still reports why the connection died. NARF frees the TCB at
-// teardown, so the two facts the socket API still needs are parked here,
-// keyed by TCB id, until the socket is closed (`close` / `release`).
-// Bounded: a connection nobody ever accepts or closes cannot grow it
-// without limit (the oldest entry is evicted).
+// teardown, so what the socket API still needs is parked here, keyed by TCB
+// id, until the socket is closed (`close` / `release`): the error, the FIN,
+// and the received bytes the application had not read yet — `tcp_done`
+// leaves `sk_receive_queue` alone, and `tcp_recvmsg_locked` drains it before
+// it looks at `SOCK_DONE` or `sk_err`. Bounded: a connection nobody ever
+// accepts or closes cannot grow it without limit (the oldest entry is
+// evicted).
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 struct Tombstone {
     /// Pending `sk_err` (positive errno; 0 once reported).
     err: i32,
     /// Linux `SOCK_DONE`: the peer's FIN had been received.
     done: bool,
+    /// Received bytes still unread when the connection died.
+    unread: RecvBuf,
 }
 
 const MAX_TOMBSTONES: usize = 4096;
@@ -1066,22 +1071,28 @@ static TOMBSTONES: IrqSafeSpinLock<Option<BTreeMap<u32, Tombstone>>> = IrqSafeSp
 
 /// Linux `tcp_done_with_error`: record `err` as the socket error, move to
 /// CLOSED, and free the TCB. `err` is a positive errno from
-/// `narf_lib::errno`.
+/// `narf_lib::errno`; 0 ends the connection without one. Unread received
+/// bytes stay readable until the socket is closed.
 fn abort_tcb(arc: &Arc<IrqSafeSpinLock<Tcb>>, err: i32, cause: DropCause) {
-    let (id, done) = {
+    let (id, done, unread) = {
         let mut t = arc.lock();
         t.sk_err = err;
         t.drop_cause = Some(cause);
         t.state = TcpState::Closed;
-        (t.id, t.fin_received)
+        // A closed (orphaned) socket has no reader left to drain it.
+        let unread = match t.orphan {
+            false => core::mem::take(&mut t.recv_buf),
+            true => RecvBuf::default(),
+        };
+        (t.id, t.fin_received, unread)
     };
-    if err != 0 {
+    if err != 0 || unread.has_data() {
         let mut g = TOMBSTONES.lock();
         let m = g.get_or_insert_with(BTreeMap::new);
         if m.len() >= MAX_TOMBSTONES {
             m.pop_first();
         }
-        m.insert(id, Tombstone { err, done });
+        m.insert(id, Tombstone { err, done, unread });
     }
     remove_tcb(id);
     // A reader or writer parked on this socket must wake to see the error.
@@ -1089,14 +1100,38 @@ fn abort_tcb(arc: &Arc<IrqSafeSpinLock<Tcb>>, err: i32, cause: DropCause) {
 }
 
 /// Take a dead connection's pending error (Linux `sock_error`: report
-/// once, then clear). `None` if the id has no tombstone.
-fn take_tombstone(id: u32) -> Option<Tombstone> {
+/// once, then clear; 0 once reported). `None` if the id has no tombstone.
+fn take_tombstone(id: u32) -> Option<i32> {
     let mut g = TOMBSTONES.lock();
-    let m = g.as_mut()?;
-    let ts = m.get_mut(&id)?;
-    let out = *ts;
-    ts.err = 0;
-    Some(out)
+    let ts = g.as_mut()?.get_mut(&id)?;
+    Some(core::mem::take(&mut ts.err))
+}
+
+/// `tcp_recvmsg_locked` on a connection that is gone: the unread bytes
+/// first, then — with nothing left — 0 after the peer's FIN (`SOCK_DONE`),
+/// else the pending error once, else 0 (`RCV_SHUTDOWN`).
+fn recv_dead(id: u32, buf: &mut [u8], peek: bool) -> Result<usize, i32> {
+    let mut g = TOMBSTONES.lock();
+    let Some(ts) = g.as_mut().and_then(|m| m.get_mut(&id)) else {
+        return Ok(0);
+    };
+    let n = match peek {
+        true => ts.unread.peek(buf),
+        false => ts.unread.read(buf),
+    };
+    if n > 0 || ts.done || ts.err == 0 {
+        return Ok(n);
+    }
+    Err(core::mem::take(&mut ts.err))
+}
+
+/// `tcp_inq` on a connection that is gone: its unread bytes.
+fn inq_dead(id: u32) -> u32 {
+    TOMBSTONES
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&id))
+        .map_or(0, |t| t.unread.in_order_len().min(i32::MAX as usize) as u32)
 }
 
 /// Forget everything about `id`. Called when the owning socket closes.
@@ -1289,10 +1324,13 @@ pub enum TcpQueueIoctl {
 
 /// Linux `tcp_ioctl` for SIOCINQ / SIOCOUTQ / SIOCOUTQNSD: `Err(EINVAL)` on a
 /// listener, 0 during the handshake. A connection already torn down (no
-/// TCB) has nothing queued.
+/// TCB) has nothing left to send, only its unread received bytes.
 pub fn queue_ioctl(id: u32, which: TcpQueueIoctl) -> Result<u32, i32> {
     let Some(arc) = lookup_tcb(id) else {
-        return Ok(0);
+        return Ok(match which {
+            TcpQueueIoctl::Inq => inq_dead(id),
+            TcpQueueIoctl::Outq | TcpQueueIoctl::OutqNsd => 0,
+        });
     };
     let t = arc.lock();
     if t.state == TcpState::Listen {
@@ -1817,10 +1855,7 @@ pub fn send_errno(id: u32, buf: &[u8]) -> Result<usize, i32> {
     let epipe = errno::EPIPE as i32;
     let Some(arc) = lookup_tcb(id) else {
         // TCP_CLOSE: `sk_stream_wait_connect` → `sock_error` ?: -EPIPE.
-        return Err(take_tombstone(id)
-            .map(|t| t.err)
-            .filter(|&e| e != 0)
-            .unwrap_or(epipe));
+        return Err(take_tombstone(id).filter(|&e| e != 0).unwrap_or(epipe));
     };
     let n = {
         let mut t = arc.lock();
@@ -1872,15 +1907,7 @@ fn recv_errno_flags(id: u32, buf: &mut [u8], peek: bool) -> Result<usize, i32> {
     let Some(arc) = lookup_tcb(id) else {
         // `tcp_done` set RCV_SHUTDOWN. SOCK_DONE is checked before
         // `sk_err`, so after a FIN the error stays pending (for a send).
-        let pending = TOMBSTONES
-            .lock()
-            .as_ref()
-            .and_then(|m| m.get(&id).copied())
-            .is_some_and(|t| !t.done && t.err != 0);
-        return match pending {
-            true => Err(take_tombstone(id).map_or(0, |t| t.err)),
-            false => Ok(0),
-        };
+        return recv_dead(id, buf, peek);
     };
     let mut t = arc.lock();
     if t.state == TcpState::Listen {
@@ -1960,7 +1987,7 @@ pub fn take_sock_error(id: u32) -> i32 {
             }
             core::mem::take(&mut t.sk_err_soft)
         }
-        None => take_tombstone(id).map_or(0, |t| t.err),
+        None => take_tombstone(id).unwrap_or(0),
     }
 }
 
@@ -3728,11 +3755,15 @@ fn handle_rst(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader) {
     }
     // Linux `tcp_reset` (net/ipv4/tcp_input.c): "the right error as BSD
     // sees it" — SYN-SENT → ECONNREFUSED, CLOSE-WAIT → EPIPE, CLOSED →
-    // ignore, anything else → ECONNRESET.
+    // ignore, anything else → ECONNRESET. TIME-WAIT is not a socket state
+    // there: `tcp_time_wait` already finished the socket (`tcp_done`) and
+    // the reset only kills the timewait sock (`tcp_timewait_state_process`,
+    // `tcp_rfc1337` = 0), so the application sees no error.
     let err = match t.state {
         TcpState::SynSent => errno::ECONNREFUSED,
         TcpState::CloseWait => errno::EPIPE,
         TcpState::Closed => return,
+        TcpState::TimeWait => 0,
         _ => errno::ECONNRESET,
     } as i32;
     drop(t);
@@ -4598,6 +4629,16 @@ pub fn __install_test_tcb_in(
     tcb.send_buf.unacked_head_seq = iss;
     let (id, _arc) = install_tcb(tcb);
     id
+}
+
+/// Test-only: have TCB `id` send its peer a bare RST at its `snd_nxt` — the
+/// exact reset `tcp_validate_incoming` accepts on the far side.
+#[doc(hidden)]
+pub fn __send_rst_for_test(id: u32) -> Option<()> {
+    let arc = lookup_tcb(id)?;
+    let seq = arc.lock().snd_nxt;
+    send_rst(&arc, seq, 0, false);
+    Some(())
 }
 
 /// Test-only: borrow the TCB lock for assertion.
