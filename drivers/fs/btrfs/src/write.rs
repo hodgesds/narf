@@ -1611,6 +1611,30 @@ async fn batch_stage_refs<B: BlockDevice + 'static>(
     Ok(())
 }
 
+/// Fail closed unless `key` is absent from the committed extent tree at
+/// `ext_root`. The fixed point "touches" a leaf by deleting a METADATA_ITEM
+/// key it believes absent (a block an earlier round allocated from free
+/// space); if the allocator ever handed out an address that still has a
+/// committed extent item, that delete would drop a live block's record, so
+/// the commit fails (and the filesystem aborts read-only) instead.
+pub(crate) async fn touch_key_absent<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    ext_root: u64,
+    key: &BtrfsKey,
+) -> Result<(), FsError> {
+    match btree::find_item(vol, ext_root, key).await? {
+        None => Ok(()),
+        Some(_) => {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "btrfs: commit would delete the live extent record {key:?}; refusing"
+            );
+            Err(FsError::InvalidData)
+        }
+    }
+}
+
 /// Metadata bytes a batch commit with `changes` reference/block changes is
 /// allowed to need, and so must find free: a fixed floor for the trees every
 /// commit path-COWs (root, extent, csum, free-space, block-group: a few
@@ -5517,11 +5541,9 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
         if round >= MONOTONE_AFTER_ROUND {
             for &(addr, level) in &meta_seen {
                 if !current.contains(&addr) {
-                    ext_edits.push(Edit::Delete(BtrfsKey::new(
-                        addr,
-                        format::METADATA_ITEM_KEY,
-                        u64::from(level),
-                    )));
+                    let key = BtrfsKey::new(addr, format::METADATA_ITEM_KEY, u64::from(level));
+                    touch_key_absent(vol, old_ext, &key).await?;
+                    ext_edits.push(Edit::Delete(key));
                 }
             }
         }
