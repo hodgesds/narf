@@ -129,6 +129,28 @@ table, then reports `AMDGPU_FAMILY_GC_12_0_0` (152), eight hardware contexts,
 and GMC12's 48-bit VA geometry. Shader geometry describes discovered maxima;
 the active CU count, CU bitmap and enabled render-backend mask remain zero
 until the cold-boot owner samples harvesting. `ACCEL_WORKING` remains zero.
+What Mesa 26's ac_query_gpu_info cannot start without is answered too:
+`FW_VERSION` reports ME, PFP and MEC `ucode_version` and v2.0
+`ucode_feature_version` (`amdgpu_navi48_ucode::Image::feature`), published
+by `prepare` (other types EINVAL); `READ_MMR_REG` answers soc24's
+allow-list only for `GB_ADDR_CONFIG` (GC segment 0 + 0x13de, from the
+topology sample's `gb_addr_config`), with Linux's SE (< 4) / SH (< 2) /
+count (<= 128) checks and EFAULT for any other offset. `MAX_IBS` on an open
+of a card with a submitter reports `Submitter::max_ibs` for each IP type it
+runs (8 on Navi48, `MAX_JOB_IBS`) and 0 for the rest.
+`DEV_INFO.gpu_counter_freq` is `Snapshot::reference_clock_10khz` times
+ten (kHz), from `amdgpu_info::reference_clock_10khz(vbios, navi)`:
+smu_info v3/v4 `core_refclk_10khz` (byte 16), replaced on Navi and later by
+gfx_info v3.x/v2.2+ timer reference (byte 40), as
+amdgpu_atomfirmware_get_clock_info; 0 without a VBIOS.
+`DEV_INFO.vram_type` / `vram_bit_width` are `Snapshot::{vram_type,
+vram_bit_width}`, from `amdgpu_info::umc_vram(vbios)` on discrete Navi4
+parts only (amdgpu_gmc_get_vram_info's GC 12.0.x arm): umc_info (master
+data table 24) v4.0 `vram_type` (byte 26, mapped to `AMDGPU_VRAM_TYPE_*`)
+and `channel_num << channel_width` (bytes 64, 65); 0 elsewhere. On Navi48,
+`TIMESTAMP` returns SMUIO 14.0.2's GOLDEN_TSC counter
+(`amdgpu_smuio14::ClockReader`, upper-lower-upper with a re-read when the
+upper half moved), published at the topology stage; elsewhere EINVAL.
 
 `unsafe amdgpu_gfx12_topology::read` requires exclusive GRBM selector ownership
 and ready firmware/power. It validates GC12.0.1 banks and discovery dimensions,
@@ -283,7 +305,17 @@ enabled. Voltage scaling, deep sleep, link DPM, DF C-states and GFXOFF stay
 excluded. It requires retired display consumers and idle engines. Success
 publishes the new `PowerStatus`; partial failure/cancellation retains the
 owner and prevents replay. Only the retained DCN4 clock owner initiates this
-transition, after checking every display consumer.
+transition, after checking every display consumer. With UCLK DPM running it
+also reads the UCLK range (GetMin/MaxDpmFreq of PPCLK_UCLK, `2 << 16`) into
+`PowerStatus::uclk_mhz`, which `configure_power` leaves `None`.
+
+Each successful `Smu::configure_power` / `enable_display_power` publishes
+DEV_INFO's clocks (`amdgpu_info::publish_navi48_clocks`, from
+`smu::dev_info_clocks`, kHz): min/max engine clock from the GFXCLK DPM range;
+min/max memory clock from `uclk_mhz`, or, while UCLK DPM is off, both from
+the VBIOS boot UCLK (`amdgpu_info::boot_mclk_10khz`, firmware_info v3 byte
+12, as smu_v14_0_get_vbios_bootup_values; 0 without one). Other parts report
+zero clocks.
 
 `read_board` also decodes optional board `Limits` from the combo, following
 Linux `smu_v14_0_2_get_thermal_temperature_range`: CustomSkuTable
@@ -2684,11 +2716,26 @@ VMID0 live (`State::vmid0_ready`); failure quarantines the owner. The cold
 boot's memory-translation stage runs it right after `initialize`, before any
 queue exists.
 
-After boot, the platform calls `ColdBoot::publish_client_vram`: half the
-CPU-visible VRAM the driver's pool still has free (2 MiB-aligned, at least
-64 MiB) becomes a separate pool, registered as the Navi48 DRM card's
+After boot, the platform calls `ColdBoot::publish_client_vram`: the
+CPU-visible VRAM the driver's pool still has free, less a driver reserve of
+half of it capped at 512 MiB (so a resizable BAR's VRAM goes nearly all to
+clients), 2 MiB-aligned, halved until one free run holds it, at least
+64 MiB, becomes a separate pool, registered as the Navi48 DRM card's
 `VramHeap` with the GMC's framebuffer geometry. The slice never returns to
 the driver's pool, so clients without eviction cannot starve its owners.
+
+The VRAM past a BAR that shows only a prefix of it is clients' whole:
+`prepare` takes `Plan::unmapped_pool` beside `into_pool` (every driver owner
+allocates from the CPU-visible pool) and hands it to `ColdBoot::new`. Once
+SDMA0's interrupt proof passes, the platform calls
+`ColdBoot::publish_unmapped_vram(clear)`, re-registering the clients' heap
+with it as the `UnmappedHeap`. Its `VramClear` queues clears in order; one
+drain task at a time submits the front ones (at most 32 fill packets) as a
+kernel job (`ColdBoot::submit_client_sdma_kernel`) under the platform owner,
+retrying while the ring is full, so clears run and complete in queue
+order. A clear's fence is its job's SDMA ticket, judged by the card's
+submitter; a device that refuses the job for good (or has no owner)
+signals it, as nothing can run there any more.
 
 `unsafe amdgpu_ih7::Rings::new` prepares native OSSSYS7.0.0 rings with exact
 GC12/NBIO discovery banks. It rejects inherited enabled rings, enabled host
@@ -3867,8 +3914,11 @@ cold-boot attempt, not an attach, resume or firmware-reload operation.
 The session owns an immutable copy of its register/identity metadata, so it
 does not borrow `AmdGpu` or require a controller guard across any await. Both
 constructors return a `Send + 'static` owner which may leave `with_controller`
-before `run` is polled. This copies no physical ownership: callers must still
-exclude reset/PM/other clients and retain permanent mappings for the session.
+before `run` is polled. The private sequence is heap-owned so consuming and
+returning `ColdBoot` during recovery does not put its retained hardware state
+or full-size result temporaries on the kernel stack. This copies no physical
+ownership: callers must still exclude reset/PM/other clients and retain
+permanent mappings for the session.
 
 `ColdBoot::run().await` executes optional reset-on-init → optional memory training → SOS bootstrap →
 ring creation → trusted-memory setup → SMC upload → SMU version handshake →
@@ -4579,9 +4629,43 @@ paths; only the tables differ.
   `address - fb_base + fb_offset` and neither SYSTEM nor SNOOPED
   (`base_flags(false)` is VALID only, as `amdgpu_ttm_tt_pte_flags`). GTT
   buffers, VRAM|GTT ones when the heap is full, and every buffer on a card
-  without a heap are buddy pages (SYSTEM|SNOOPED, identity IOMMU); a
-  VRAM-only buffer on a full heap is `NoSpace`. `GemObject::{phys, gpu,
-  system}` give the CPU-mapped address, the entry address and the kind.
+  without a heap are buddy pages (SYSTEM|SNOOPED, identity IOMMU): the
+  binary decomposition of the page count into buddy blocks (a block the
+  allocator lacks is split in two), so a buffer may exceed one 32 MiB
+  block and is never rounded up, charged against `gtt_limit()` (half of
+  RAM, TTM's default; `gtt_used()` is the charge) and refused `NoSpace`
+  past it; a VRAM-only buffer on a full heap is `NoSpace`.
+  `GemObject::{phys, gpu, system}` give the first page's CPU-mapped and
+  entry addresses and the kind; `gpu_at(offset)` and `frames` give any
+  page, and GEM_VA writes each entry through `gpu_at`. `AMDGPU_INFO_MEMORY`
+  and `VRAM_GTT` report that limit as the GTT heap, with its usage.
+  `vram_heap_usage(card)` gives a registered heap's `HeapUsage { visible,
+  unmapped }` as (size, used) bytes (`Pool::size` / `available`). On an
+  open whose card has a heap (Navi 22 still answers its own),
+  `AMDGPU_INFO_MEMORY` reports total VRAM as the hardware's, usable VRAM as
+  the heap (visible + unmapped; the rest is the driver's, Linux's pinned
+  and reserved VRAM), usage as its allocations, CPU-accessible usable as
+  the visible pool with its usage, and each `max_allocation` as 3/4 of
+  usable; `VRAM_GTT` reports the usable sizes. Without one, both report
+  the hardware sizes as before.
+  A heap may also carry an `UnmappedHeap` (an `UnmappedPool` past the BAR
+  and a `VramClear` engine): a `NO_CPU_ACCESS` VRAM buffer goes there
+  first, falling back to the visible heap. It is cleared by
+  `VramClear::clear(fb-aperture address, bytes)` — clears complete in
+  queue order, and a refused clear fails the create — whose fence becomes
+  the buffer's KERNEL reservation fence. Such a buffer has `phys` 0 and
+  `cpu_visible()` false: `frames`, `mmap_frames`, `load_u64`/`store_u64`
+  refuse it. `GEM_MMAP` of any `NO_CPU_ACCESS` buffer is EPERM
+  (`OperationNotPermitted`), as amdgpu_gem_mmap_ioctl. `GEM_VA` MAP adds
+  the buffer's unsignalled KERNEL fences to its space
+  (`VmState::depend_on`), and `AMDGPU_CS` waits for the space's
+  `VmState::kernel_fences()` before queueing.
+- PRT (`GEM_VA` with `AMDGPU_VM_PAGE_PRT`): MAP/REPLACE record a range
+  with no buffer (the handle is not looked up, as amdgpu_gem_va_ioctl maps
+  it through `prt_va`) whose entries carry PRT without VALID; REPLACE with
+  a buffer commits pages into it and REPLACE with PRT decommits them;
+  UNMAP/CLEAR drop it. `VmState::mapped_object` is None there. This is
+  what RADV's sparse binding and radeonsi's sparse buffers use.
 - PRIME (`drm_devfs_bridge::AmdgpuDmaBufFile`): `PRIME_HANDLE_TO_FD` on an
   amdgpu card or render open exports a GEM buffer as a dma-buf that holds
   it (pages outlive every handle while the fd or a mapping of it lives),
@@ -4589,7 +4673,9 @@ paths; only the tables differ.
   the buffer's one shared reservation (`GemObject::dma_buf`).
   `PRIME_FD_TO_HANDLE` on an open of the same card imports it as the handle
   that open already has for the buffer or a new one (`GemState::import`);
-  another card's buffer is EINVAL (no foreign dma-buf attach yet).
+  another card's buffer is EINVAL (no foreign dma-buf attach yet). A
+  `VM_ALWAYS_VALID` buffer is not exported (EPERM, as
+  amdgpu_gem_prime_export): it belongs to its open's address space.
 - Metadata (`amdgpu_gem`, `GEM_METADATA`): each `GemObject` keeps its
   tiling flags and an opaque blob of at most 256 bytes with its flags, so
   every handle to the buffer sees what its exporter set (SET; an empty blob
@@ -4642,7 +4728,8 @@ paths; only the tables differ.
   the ioctl waits for every unsignalled fence on the reservation of each
   listed BO and of the user-fence BO, except fences of the open's own
   address space (`DrmFence::owner` == `VmState::owner`,
-  `AMDGPU_SYNC_NE_OWNER`) and except on `EXPLICIT_SYNC` buffers; the job
+  `AMDGPU_SYNC_NE_OWNER`); on `EXPLICIT_SYNC` buffers only KERNEL fences
+  are waited for; the job
   then becomes each of those BOs' WRITE fence. A BO the job does not list
   gets no fence, as in Linux.
 - `amdgpu_bo_list`: `dispatch(cmd, arg, &BoListTable, &GemState)` is
@@ -4676,6 +4763,71 @@ one-page GEM buffer of the open with the 8 bytes at `offset` inside it
 (EINVAL otherwise, as amdgpu_cs_p1_user_fence); the job's handle is stored
 there by the CPU when a fence read retires the job (`GemObject::store_u64`
 through `defer_until`), never replacing a newer handle of the same ring.
+
+Timeouts (`amdgpu_ring_watch`): `Submitter::submit` takes the submitting
+context's `amdgpu_ctx::Health`. A `RingWatch` per ring follows its jobs;
+the front job's timeout (`JOB_TIMEOUT_NS`, amdgpu's 2 s lockup default)
+counts from when it reached the front, and past it the ring is hung: that
+job's `Submitter::error` is `TimedOut` and its context guilty, each later
+job not yet complete is `Canceled` and its context records that, and the
+ring refuses new jobs (`Canceled`). `Submitter::signalled` then reports
+those jobs ended, so waiters return, but `retire` — what frees their
+memory, page tables and VMIDs — still waits for the hardware fence.
+`AMDGPU_WAIT_CS` of an ended job with an error fails with it
+(amdgpu_cs_wait_ioctl); `AMDGPU_CS` on a context with an error fails with
+it before queueing (amdgpu_ctx_get_entity); `CTX QUERY_STATE2` reports
+RESET, plus GUILTY for `TimedOut`, and `QUERY_STATE` `UNKNOWN_RESET`. The
+Navi48 platform spawns a watchdog that checks its rings every 100 ms while
+its submitter stays registered. A hung graphics ring is recovered as
+gfx_v12_0_reset_kgq: `Mes::reset_kernel_queue(queue, vmid)` sends MES12
+RESET (`amdgpu_mes12::reset_kernel_queue`: `reset_legacy_gfx` with the
+HQD's pipe, queue, VMID, MQD, doorbell and write pointer; other queues by
+doorbell with `reset_queue_only`), then `Queues::submit_fence` queues a
+fence-only slot as the ring test, which needs a free slot and must land
+within 100 ms (`ColdBoot::recover_client_ring`). Only then does
+`RingWatch::recovered` let the ring take jobs again; the hung and canceled
+jobs keep their errors (`RingWatch::error` remembers the last hang), and
+their memory is retired by the test fence, the first proof the CP moved
+past them. A hung compute ring is recovered as gfx_v12_0_reset_kcq
+(amdgpu_gfx_reset_mes_compute; GFX12 resets MEC queues by MMIO):
+`Mes::all_gangs(true)` (MES12 SUSPEND, `amdgpu_mes12::suspend_all`), then
+`Queues::reset_compute_hqd` (RLC safe mode when RLC is enabled, with a
+100 ms acknowledgement deadline; with the compute queue selected in
+GRBM_GFX_CNTL, CP_HQD_DEQUEUE_REQUEST 2 and SPI_COMPUTE_QUEUE_RESET 1, then
+CP_HQD_ACTIVE polled idle for up to 100 ms; the prior selection restored).
+If the HQD stays active, the RS64 path of
+mes_v12_0_reset_compute_pipe_mmio asserts CP_MEC_RS64_CNTL.MEC_PIPE0_RESET,
+clears CP_HQD_ACTIVE and CP_HQD_DEQUEUE_REQUEST on all four MEC1 pipe-0
+HQDs while reset is asserted, reselects queue 0 and deasserts reset. Other
+MEC control bits are preserved. An unexpectedly active sibling or an
+already asserted pipe reset refuses the fallback before writes. Reset
+assertion, HQD clearing and deassertion are read back; an uncertain clear
+leaves the pipe held in reset. No await occurs during the pulse. RLC safe
+mode is exited on returned success/error; cancellation retains it and
+`State::ResettingCompute`, refusing replay, submission and restore. Returned
+failure records `Failed`; success records `ComputeReset`, permitting only
+the subsequent restore once MES has unmapped the queue. Reset alone neither
+advances a fence nor releases memory. The sequence continues with
+`Mes::unmap_reset_queue` (REMOVE_QUEUE with `remove_queue_after_reset` on
+scheduler firmware 0x5a+, `amdgpu_mes12::unmap_reset_kernel_queue`),
+`Queues::restore` (the descriptor as first built, a ring of
+PACKET3(NOP, 0x3fff), read and write pointers 0) and
+`Mes::map_bootstrap_queue`; `Mes::all_gangs(false)` (RESUME,
+`resume_all`) is attempted on every returned path, and the same ring test closes it. A
+failed suspend stops recovery before MMIO writes (Linux's MES hung-queue
+detection is not implemented). A hung SDMA0 ring is recovered as
+sdma_v7_0_reset_queue (`ColdBoot::recover_client_sdma`):
+`Sdma::reset_ring` writes SDMA0_QUEUE_RESET_REQ bit 0 and waits up to 100
+ms for the engine to clear it, then programs the ring as
+sdma_v7_0_gfx_resume_instance(restore) with both pointers and their
+writebacks at the software write pointer, so the engine resumes past every
+queued slot; `Sdma::submit_fence` is the ring test. Before the test,
+`recover_client_sdma`'s `skipped` hook learns the sequence the engine
+completed, and the platform puts every VRAM clear its ring held past it
+back at the front of the clear queue, unsignalled (`ClearState::requeue`),
+so a clear's fence never reads complete off the test's fence. Innocent
+client jobs are not re-emitted. VRAM clear fences follow SDMA0's hardware
+fence only, never a timeout's verdict.
 
 The Navi48 platform registers both kernel queues as its card's submitter
 after boot: up to eight IBs per submission (`Job::new`, in order in one
@@ -4730,6 +4882,13 @@ POLL_REGMEM); the LUT write; INDIRECT packets NOP-aligned to end on 8
 dwords, IBs 32-byte aligned with no CSA; and an uncached FENCE (no TRAP;
 completion is polled through `FenceReader`). The ring is started with
 `IB_ENABLE`, as sdma_v7_0_gfx_resume does.
+`Sdma::submit_kernel(&[KernelOp])` queues kernel jobs on VMID0
+(framebuffer-aperture) addresses in the same ring, sequence and fence:
+`KernelOp::Fill` as sdma_v7_0_emit_fill_buffer (CONSTANT_FILL, COMPRESS,
+dword fill; dword-aligned, a multiple of 4 bytes) and `KernelOp::Copy` as
+sdma_v7_0_emit_copy_buffer (COPY_LINEAR with CPV, no DCC; non-overlapping),
+split into 1 GiB packets; a job that overflows its 256-dword slot is
+refused.
 
 ### AMD platform VBIOS
 
@@ -4815,6 +4974,11 @@ stays available to other allocations.
 permanent aperture-relative exclusions. Ranges are checked, rounded outward
 to pages, sorted and merged; dropping an allocation never removes a protected
 range. The same unsafe ownership contract applies to the remaining memory.
+`amdgpu_vram::UnmappedPool::from_owned(gpu_address, len, protected)` is the
+same allocator for VRAM no CPU mapping reaches: `reserve_aligned` hands out
+`UnmappedReservation`s (GPU address and size only), returned on drop, so
+their holder keeps them until the GPU can no longer reach them and has the
+GPU clear them before a client sees them.
 
 `amdgpu_vram_boot::Plan::read` snapshots the DCN314 FB base/top/offset through
 live PCI authority and builds a read-only VRAM inventory. It requires the
@@ -4830,6 +4994,9 @@ the inverse MC translation; other supported windows use GPU addresses.
 
 The plan preserves full-aperture offsets even when BAR0 is smaller than VRAM.
 `Plan::into_pool` clips exclusions to the visible mapping before allocation.
+`unsafe Plan::unmapped_pool()` (called first) returns the VRAM above the
+visible mapping, less every protected range there, as an `UnmappedPool`, or
+`None` when the BAR shows all of VRAM; the same ownership contract applies.
 It is unsafe: the caller must have included all other scanouts, cursors,
 PSP/GART buffers and existing pools, own the unprotected memory, and serialize
 future GPU reconfiguration. An inventory alone is not ownership authority.

@@ -260,6 +260,12 @@ fn parse_ib(words: &[u32], vm: &VmState) -> Result<Ib, FsError> {
     if flags & uapi::AMDGPU_IB_FLAG_CE != 0 {
         return Err(FsError::InvalidData);
     }
+    // amdgpu_ib_schedule refuses SECURE on a ring without secure
+    // submission; there is no TMZ here, so no ring has it, and DEV_INFO
+    // never offers it.
+    if flags & uapi::AMDGPU_IB_FLAGS_SECURE != 0 {
+        return Err(FsError::InvalidData);
+    }
     // Only the engines that exist. Linux resolves `ip_type` to a ring and
     // fails if there is none; the effect is the same and the list is the
     // honest one for this driver.
@@ -488,17 +494,33 @@ pub fn parse(
 pub trait Submitter: Send + Sync {
     /// Queue `submission` in the address space `vm`; returns its sequence,
     /// which `AMDGPU_CS` hands back as the fence handle.
+    ///
+    /// The job reports a hang or its cancellation to `health`, its
+    /// context's.
     fn submit<'a>(
         &'a self,
         vm: &'a VmState,
         submission: &'a Submission,
+        health: &'a Arc<crate::amdgpu_ctx::Health>,
     ) -> Pin<Box<dyn Future<Output = Result<u64, FsError>> + Send + 'a>>;
-    /// Whether job `ticket` has completed, without waiting or blocking on
-    /// an async owner (job fences in syncobjs ask this).
+    /// Whether job `ticket` has ended — completed, or given up on with an
+    /// [`error`](Self::error) — without waiting or blocking on an async
+    /// owner (job fences in syncobjs ask this). Memory the job may reach is
+    /// released by [`retire`] alone, on true completion.
     fn signalled(&self, ticket: u64) -> bool;
+    /// How job `ticket` ended if not by completing: `TimedOut` when it hung
+    /// its ring, `Canceled` when it was abandoned behind such a job.
+    fn error(&self, _ticket: u64) -> Option<FsError> {
+        None
+    }
     /// The ring index (a ticket's high 32 bits) that runs `ip_type`
     /// instance `ip_instance`, ring `ring`, if this engine has one.
     fn ring_for(&self, ip_type: u32, ip_instance: u32, ring: u32) -> Option<u32>;
+    /// How many IBs one submission on ring `ring` may carry
+    /// (`AMDGPU_INFO_MAX_IBS`); more are refused.
+    fn max_ibs(&self, _ring: u32) -> u32 {
+        1
+    }
     /// Whether sequence `seq` has completed, waiting until monotonic
     /// `deadline_ns` (0: don't wait).
     fn wait(
@@ -880,6 +902,10 @@ pub async fn dispatch_async(
             Some(ticket) => engine.wait(ticket, timeout).await?,
             None => true,
         };
+        // amdgpu_cs_wait_ioctl: a job that ended with an error reports it.
+        if let Some(error) = job.filter(|_| done).and_then(|t| engine.error(t)) {
+            return Err(error);
+        }
         // `drm_amdgpu_wait_cs_out.status`: 0 completed, 1 still busy.
         // SAFETY: as above; the out arm overlays the first 8 bytes.
         unsafe { copy_out(arg, &u64::from(!done).to_le_bytes())? };
@@ -890,6 +916,12 @@ pub async fn dispatch_async(
     }
     let started = narf_time::monotonic_ns();
     let (submission, bo_list_handle) = validated(arg, vm, ctx)?;
+    // amdgpu_ctx_get_entity: a context whose job hung or was canceled
+    // fails every later submission with that error.
+    let health = ctx.health(submission.ctx_id).ok_or(FsError::InvalidData)?;
+    if let Some(error) = health.error() {
+        return Err(error);
+    }
     // amdgpu_cs_parser_bos: a BO list handle, or the BO_HANDLES chunk, not
     // both (EINVAL); an unknown list is ENOENT. Every listed BO is one this
     // open holds (ENOENT). LINUX-GAP: the list sets no residency.
@@ -986,7 +1018,7 @@ pub async fn dispatch_async(
     // reservation — the listed BOs and the user fence BO — skipping fences
     // of this address space's own jobs (AMDGPU_SYNC_NE_OWNER) and every
     // fence on an EXPLICIT_SYNC buffer (AMDGPU_SYNC_EXPLICIT; there are no
-    // move fences here). A buffer the job does not list is not synced and
+    // move fences here) except its KERNEL ones. A buffer the job does not list is not synced and
     // gets no fence, as in Linux; VM_ALWAYS_VALID buffers share the root
     // reservation, which holds only this space's jobs.
     let own = vm.owner();
@@ -995,13 +1027,13 @@ pub async fn dispatch_async(
         .chain(user_fence.as_ref().map(|(o, _)| o))
         .collect();
     for object in &locked {
-        if object.flags & u64::from(uapi::AMDGPU_GEM_CREATE_EXPLICIT_SYNC) != 0 {
-            continue;
-        }
-        let fences = object
-            .dma_buf()
-            .resv
-            .fences(narf_filesystem::dma_buf::DmaResvUsage::Bookkeep);
+        // An EXPLICIT_SYNC buffer still waits for kernel work on it.
+        let usage = if object.flags & u64::from(uapi::AMDGPU_GEM_CREATE_EXPLICIT_SYNC) != 0 {
+            narf_filesystem::dma_buf::DmaResvUsage::Kernel
+        } else {
+            narf_filesystem::dma_buf::DmaResvUsage::Bookkeep
+        };
+        let fences = object.dma_buf().resv.fences(usage);
         for fence in fences {
             if fence.owner() == Some(own) {
                 continue;
@@ -1011,7 +1043,14 @@ pub async fn dispatch_async(
             }
         }
     }
-    let seq = engine.submit(vm, &submission).await?;
+    // Kernel work on buffers mapped in this space (a clear of fresh VRAM)
+    // lands before any job here runs, listed or not.
+    for fence in vm.kernel_fences() {
+        while !fence.is_signalled() {
+            nap().await;
+        }
+    }
+    let seq = engine.submit(vm, &submission, &health).await?;
     note_issued(card, seq);
     // What this space drops from now on waits for this job.
     vm.note_job(seq);

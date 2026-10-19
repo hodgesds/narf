@@ -1,5 +1,7 @@
-//! Read GC12 harvesting under exclusive GRBM index ownership.
-//! Source: Linux gfx_v12_0_get_cu_info, gfx_v12_0_setup_rb and GC12 headers.
+//! Read GC12 harvesting under exclusive GRBM index ownership, and the
+//! address configuration userspace asks for (`GB_ADDR_CONFIG`).
+//! Source: Linux gfx_v12_0_get_cu_info, gfx_v12_0_setup_rb,
+//! gfx_v12_0_gpu_early_init and GC12 headers.
 use crate::{amdgpu::AmdGpu, amdgpu_discovery as ip, amdgpu_psp_ring::bank};
 use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, Write};
@@ -20,6 +22,9 @@ pub struct Topology {
     pub cu_bitmap: [[u32; 4]; 4],
     pub active_arrays: u16,
     pub enabled_rb_mask: u32,
+    /// `GB_ADDR_CONFIG` as gfx_v12_0_gpu_early_init reads it, which
+    /// `AMDGPU_INFO_READ_MMR_REG` hands Mesa.
+    pub gb_addr_config: u32,
 }
 #[derive(Clone, Copy)]
 struct Limits {
@@ -74,6 +79,7 @@ fn sample(io: &mut impl Io, bases: [u64; 2], limits: Limits) -> Result<Topology,
     let [gc, hyp] = bases;
     let index = hyp + 0x2200 * 4;
     let prior = checked(io.read(index))?;
+    let gb_addr_config = checked(io.read(gc + 0x13de * 4))?;
     let result = (|| {
         let disabled =
             (checked(io.read(gc + 0xfe9 * 4))? | checked(io.read(hyp + 0x5b92 * 4))?) >> 8 & 0xffff;
@@ -93,6 +99,7 @@ fn sample(io: &mut impl Io, bases: [u64; 2], limits: Limits) -> Result<Topology,
             cu_bitmap: [[0; 4]; 4],
             active_arrays: arrays as u16,
             enabled_rb_mask,
+            gb_addr_config,
         };
         for se in 0..limits.engines {
             for sa in 0..limits.arrays {
@@ -159,7 +166,7 @@ fn layout(gpu: &AmdGpu) -> Result<(Limits, [u64; 2]), Error> {
     }
     let limits = Limits::from_gc(gpu.gc_info.ok_or(Error::Invalid)?)?;
     let bases = [
-        bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 0, 0x13dd),
+        bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 0, 0x13de),
         bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 1, 0x5b94),
     ]
     .map(|b| b.map_err(|_| Error::Unsupported));
@@ -187,6 +194,7 @@ mod tests {
                 0x13fa4 => self.arrays[0],
                 0x26e48 => self.arrays[1],
                 0x14f74 => self.rbs[0],
+                0x14f78 => 0x2644_2043,
                 0x26e50 => self.rbs[1],
                 0x1403c | 0x26e40 => {
                     if self.fail {
@@ -232,6 +240,7 @@ mod tests {
         )
         .unwrap();
         if t.active_cus != 106
+            || t.gb_addr_config != 0x2644_2043
             || t.active_arrays != 0xfffc
             || t.enabled_rb_mask != 0xfff0
             || t.cu_bitmap[0][0] != 0

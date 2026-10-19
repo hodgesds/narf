@@ -7,7 +7,12 @@ use core::ops::Range;
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
-use crate::{amdgpu::AmdGpu, amdgpu_dmub, amdgpu_vram::Pool, atombios};
+use crate::{
+    amdgpu::AmdGpu,
+    amdgpu_dmub,
+    amdgpu_vram::{Pool, UnmappedPool},
+    atombios,
+};
 
 // linux: DMCUB_REGION3_CW0_TOP_ADDRESS__DMCUB_REGION3_CW0_TOP_ADDRESS_MASK@dcn
 const ADDRESS_MASK: u32 = 0x1fff_ffff;
@@ -327,6 +332,34 @@ impl Plan {
         // SAFETY: caller establishes ownership of the unprotected aperture;
         // the pool retains all merged exclusions while reservations exist.
         unsafe { Pool::from_owned_aperture(self.mapping, self.gpu_base, &exclusions) }
+            .map_err(|_| Error::Allocation)
+    }
+    /// The VRAM beyond the CPU-visible prefix, less every protected range
+    /// there: `None` when the BAR shows all of it. Call before `into_pool`.
+    ///
+    /// # Safety
+    /// As `into_pool`, for the VRAM above `visible_size`: no allocation
+    /// absent from this inventory lies there, and only this pool hands it out.
+    pub unsafe fn unmapped_pool(&self) -> Result<Option<UnmappedPool>, Error> {
+        let start = self.mapping.len;
+        if start >= self.vram_size {
+            return Ok(None);
+        }
+        let mut exclusions = Vec::new();
+        exclusions
+            .try_reserve_exact(self.protected.len())
+            .map_err(|_| Error::Allocation)?;
+        for region in &self.protected {
+            let begin = region.range.start.max(start);
+            if begin < region.range.end {
+                exclusions.push(begin - start..region.range.end - start);
+            }
+        }
+        let address = self.gpu_base.checked_add(start).ok_or(Error::Invalid)?;
+        // SAFETY: the caller's contract covers this range; every inventoried
+        // owner stays excluded.
+        unsafe { UnmappedPool::from_owned(address, self.vram_size - start, &exclusions) }
+            .map(Some)
             .map_err(|_| Error::Allocation)
     }
     fn protect(&mut self, owner: Owner, start: u64, size: u64) -> Result<(), Error> {

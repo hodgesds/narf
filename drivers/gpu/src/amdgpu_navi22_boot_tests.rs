@@ -547,6 +547,14 @@ kernel_test_in!(
 );
 
 fn navi22_recovery_and_tdr_require_a_completed_recoverable_boot() -> TestResult {
+    // The session and its recovery result cross several owning call frames.
+    // Keep each within a small fraction of the 64 KiB aarch64 boot stack;
+    // the old inline hardware made this call chain exceed that stack.
+    if core::mem::size_of::<ColdBoot>() > 1024
+        || core::mem::size_of::<Result<ColdBoot, Error>>() > 1024
+    {
+        return TestResult::Fail("boot owner exceeds the recovery stack budget");
+    }
     let pool = pool(16 << 20);
     let authority = Cap::bootstrap();
     // SAFETY: constructor performs no I/O; every entry below must refuse

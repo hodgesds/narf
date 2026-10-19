@@ -1,7 +1,8 @@
 //! Two retained VMID0 GC12 kernel queues, with a bounded translated-memory
 //! WRITE_DATA and native EOP-interrupt proofs, then client jobs on either
 //! queue: each a VM flush for the client's VMID, its IBs and a fence
-//! (`submit`). No draws, shaders or reset.
+//! (`submit`). A hung compute queue can be reset by MMIO and restored for
+//! MES to map again (`reset_compute_hqd`, `restore`). No draws or shaders.
 use crate::{
     amdgpu::AmdGpu,
     amdgpu_discovery as ip, amdgpu_gmc_navi48 as gmc, amdgpu_mes12 as api, amdgpu_mes12_hw as mes,
@@ -47,6 +48,21 @@ const JOB_DWORDS: u64 = 256;
 /// Ring capacity in dwords (4 KiB).
 const RING_DWORDS: u64 = 1024;
 
+/// `CP_HQD_DEQUEUE_REQUEST`, `SPI_COMPUTE_QUEUE_RESET` and
+/// `CP_HQD_ACTIVE` (GC segment 0).
+const DEQUEUE_REQUEST: u64 = 0x1fc1;
+const COMPUTE_QUEUE_RESET: u64 = 0x1f73;
+const HQD_ACTIVE: u64 = 0x1fab;
+/// GC segment 1: RLC safe-mode handshake and the RS64 MEC pipe control.
+const RLC_CNTL: u64 = 0x4c00;
+const RLC_SAFE_MODE: u64 = 0x980;
+const MEC_RS64_CNTL: u64 = 0x2904;
+const MEC_PIPE0_RESET: u32 = 1 << 16;
+/// GRBM_GFX_CNTL selecting the compute queue: MEC1 (MEID 1, bits 3:2),
+/// pipe 0, queue 0.
+const COMPUTE_SELECT: u32 = 4;
+/// PACKET3(NOP, 0x3fff), what amdgpu_ring_clear_ring fills a ring with.
+const RING_NOP: u32 = 0xffff_1000;
 const FENCES: [u32; 2] = [0x9070cafe, 0x9070beef];
 const PATTERN: [u32; 16] = [
     0x01234567, 0x89abcdef, 0x76543210, 0xfedcba98, 0xaaaaaaaa, 0x55555555, 0xff00ff00, 0x00ff00ff,
@@ -74,6 +90,10 @@ pub enum State {
     Verified,
     InterruptSubmitted(u8),
     InterruptVerified,
+    /// A dropped recovery keeps both queues quarantined.
+    ResettingCompute,
+    /// The HQD reset completed; MES must unmap it before `restore`.
+    ComputeReset,
     Failed(Error),
 }
 /// A client job: IBs in VMID `vmid`'s address space, whose page directory
@@ -218,6 +238,20 @@ fn job_packets(
     built.map_err(|_| Error::Invalid)?;
     Ok(words)
 }
+/// A slot that only writes `seq` to `fence` (the job frame's RELEASE_MEM),
+/// padded with one NOP.
+fn fence_packets(fence: u64, seq: u32) -> Result<[u32; 256], Error> {
+    use crate::amdgpu_pm4::Pm4Builder;
+    let mut words = [0u32; 256];
+    let mut b = Pm4Builder::new(&mut words);
+    let built = (|| {
+        b.release_mem_fence(fence, u64::from(seq), false, true)?;
+        let used = b.words().len();
+        b.nop(256 - used - 1)
+    })();
+    built.map_err(|_| Error::Invalid)?;
+    Ok(words)
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Proof {
     pub graphics_fence: u32,
@@ -265,9 +299,9 @@ impl Layout {
             return Err(Error::Unsupported);
         }
         Ok(Self {
-            gc: bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 0, 0x1fab)
+            gc: bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 0, DEQUEUE_REQUEST as u32)
                 .map_err(|_| Error::Unsupported)?,
-            hyp: bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 1, 0x900)
+            hyp: bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 1, RLC_CNTL as u32)
                 .map_err(|_| Error::Unsupported)?,
             oss: bank(gpu, ip::HW_ID_OSSSYS, &[(7, 0, 0)], 0, 0x1f)
                 .map_err(|_| Error::Unsupported)?,
@@ -410,6 +444,18 @@ fn select(io: &mut impl Io, l: Layout, index: u32) -> Result<(), Error> {
         return Err(Error::Readback);
     }
     Ok(())
+}
+/// Run `f` with the compute queue selected, restoring the prior selection
+/// even when `f` fails.
+fn selected<I: Io, T>(
+    io: &mut I,
+    l: Layout,
+    f: impl FnOnce(&mut I) -> Result<T, Error>,
+) -> Result<T, Error> {
+    let prior = checked(io.read(l.hyp + 0x900 * 4))?;
+    let result = select(io, l, COMPUTE_SELECT).and_then(|()| f(io));
+    select(io, l, prior)?;
+    result
 }
 fn flush(io: &mut impl Io, l: Layout) {
     fence(Ordering::SeqCst);
@@ -683,6 +729,24 @@ impl<I: Io> Engine<I> {
     /// sequence on that ring; `completed_job` reports when its fence
     /// passes it.
     fn submit(&mut self, pipe: Pipe, job: Job) -> Result<u32, Error> {
+        let (gc, oss) = ((self.layout.gc / 4) as u32, (self.layout.oss / 4) as u32);
+        self.submit_slot(pipe, |fence, seq| {
+            job_packets(pipe, job, gc, oss, fence, seq)
+        })
+    }
+    /// Queue a slot of nothing but the next sequence's fence on `pipe`: the
+    /// ring test after a reset (amdgpu_ring_test_ring). Once the fence
+    /// passes it, the CP has moved past every earlier slot.
+    fn submit_fence(&mut self, pipe: Pipe) -> Result<u32, Error> {
+        self.submit_slot(pipe, fence_packets)
+    }
+    /// Write the slot `build` makes for the next sequence and its fence
+    /// address onto `pipe`'s ring, after both proofs, if the slot is free.
+    fn submit_slot(
+        &mut self,
+        pipe: Pipe,
+        build: impl FnOnce(u64, u32) -> Result<[u32; 256], Error>,
+    ) -> Result<u32, Error> {
         if self.state != State::InterruptVerified {
             return Err(Error::Busy);
         }
@@ -690,11 +754,10 @@ impl<I: Io> Engine<I> {
         let map = self.memory.mapping();
         let db = self.doorbells;
         let (i, base) = (pipe.index(), pipe.base());
-        // The proofs left both rings at 512 dwords.
-        let wptr = self.job_wptr[i].max(512);
+        let wptr = self.job_wptr[i];
         let seq = self.job_seq[i].wrapping_add(1);
         let fence = self.memory.address() + base + JOB_FENCE;
-        let words = job_packets(pipe, job, (l.gc / 4) as u32, (l.oss / 4) as u32, fence, seq)?;
+        let words = build(fence, seq)?;
         self.access(|io| {
             flush(io, l);
             let rptr = u64::from(io.memory_read(map, base + RPTR));
@@ -717,6 +780,164 @@ impl<I: Io> Engine<I> {
         self.job_wptr[i] = wptr + JOB_DWORDS;
         self.job_seq[i] = seq;
         Ok(seq)
+    }
+    /// mes_v12_0_reset_queue_mmio for the compute queue: with it selected,
+    /// a reset dequeue (CP_HQD_DEQUEUE_REQUEST 2) and SPI's compute queue
+    /// reset, then up to amdgpu's usec_timeout for the HQD to go inactive.
+    /// On timeout, mes_v12_0_reset_compute_pipe_mmio's RS64 fallback clears
+    /// all four HQDs while pipe 0 is held in reset. RLC safe mode covers
+    /// both paths. Cancellation/failure does not permit submission or replay.
+    async fn reset_compute_hqd(&mut self) -> Result<(), Error> {
+        if self.state != State::InterruptVerified {
+            return Err(Error::Busy);
+        }
+        self.state = State::ResettingCompute;
+        let result = self.reset_compute_inner().await;
+        self.state = match result {
+            Ok(()) => State::ComputeReset,
+            Err(e) => State::Failed(e),
+        };
+        result
+    }
+    async fn reset_compute_inner(&mut self) -> Result<(), Error> {
+        let l = self.layout;
+        // As amdgpu_gfx_rlc_enter_safe_mode: a disabled RLC has no command
+        // consumer. For a running RLC, always protect against clock gating.
+        let rlc = self.access(|io| Ok(checked(io.read(l.hyp + RLC_CNTL * 4))? & 1 != 0))?;
+        let result = async {
+            if rlc {
+                self.access(|io| {
+                    io.write(l.hyp + RLC_SAFE_MODE * 4, 3); // CMD + enter message
+                    Ok(())
+                })?;
+                let deadline = narf_time::Deadline::after_us(100_000);
+                loop {
+                    if self.access(|io| checked(io.read(l.hyp + RLC_SAFE_MODE * 4)))? & 1 == 0 {
+                        break;
+                    }
+                    if deadline.expired() {
+                        return Err(Error::Timeout);
+                    }
+                    self.io.delay().await;
+                }
+            }
+            self.dequeue_compute_hqd().await
+        }
+        .await;
+        if rlc {
+            // gfx_v12_0_unset_safe_mode, including returned-error paths.
+            // A dropped future leaves safe mode and the owners quarantined.
+            self.access(|io| {
+                io.write(l.hyp + RLC_SAFE_MODE * 4, 1);
+                Ok(())
+            })?;
+        }
+        result
+    }
+    async fn dequeue_compute_hqd(&mut self) -> Result<(), Error> {
+        let l = self.layout;
+        self.access(|io| {
+            selected(io, l, |io| {
+                io.write(l.gc + DEQUEUE_REQUEST * 4, 2);
+                io.write(l.gc + COMPUTE_QUEUE_RESET * 4, 1);
+                Ok(())
+            })
+        })?;
+        let deadline = narf_time::Deadline::after_us(100_000);
+        loop {
+            let active = self.access(|io| {
+                selected(io, l, |io| {
+                    Ok(checked(io.read(l.gc + HQD_ACTIVE * 4))? & 1 != 0)
+                })
+            })?;
+            if !active {
+                return Ok(());
+            }
+            if deadline.expired() {
+                return self.reset_compute_pipe();
+            }
+            self.io.delay().await;
+        }
+    }
+    fn reset_compute_pipe(&mut self) -> Result<(), Error> {
+        let l = self.layout;
+        self.access(|io| {
+            selected(io, l, |io| {
+                // This owner maps only queue 0. Do not destroy an unexpected
+                // sibling's work by broadening a queue reset to the whole pipe.
+                for queue in 1..4 {
+                    select(io, l, COMPUTE_SELECT | (queue << 8))?;
+                    if checked(io.read(l.gc + HQD_ACTIVE * 4))? & 1 != 0 {
+                        return Err(Error::Busy);
+                    }
+                }
+                select(io, l, COMPUTE_SELECT)?;
+                let control = l.hyp + MEC_RS64_CNTL * 4;
+                let saved = checked(io.read(control))?;
+                if saved & MEC_PIPE0_RESET != 0 {
+                    return Err(Error::Busy);
+                }
+                io.write(control, saved | MEC_PIPE0_RESET);
+                if checked(io.read(control))? & MEC_PIPE0_RESET == 0 {
+                    return Err(Error::Readback);
+                }
+                // GC12.0.1 has four HQDs per MEC pipe. No await between
+                // assertion, clearing every HQD and deassertion. If any clear
+                // is uncertain, retain reset rather than restart that HQD.
+                for queue in 0..4 {
+                    select(io, l, COMPUTE_SELECT | (queue << 8))?;
+                    io.write(l.gc + HQD_ACTIVE * 4, 0);
+                    io.write(l.gc + DEQUEUE_REQUEST * 4, 0);
+                    if checked(io.read(l.gc + HQD_ACTIVE * 4))? & 1 != 0
+                        || checked(io.read(l.gc + DEQUEUE_REQUEST * 4))? != 0
+                    {
+                        return Err(Error::Readback);
+                    }
+                }
+                select(io, l, COMPUTE_SELECT)?;
+                io.write(control, saved & !MEC_PIPE0_RESET);
+                if checked(io.read(control))? & MEC_PIPE0_RESET != 0 {
+                    return Err(Error::Readback);
+                }
+                // Linux treats the instruction-pointer check as diagnostic;
+                // only the subsequent ring test proves the CP is running.
+                Ok(())
+            })
+        })
+    }
+    /// amdgpu_gfx_mqd_reset_restore, once the reset queue is unmapped: its
+    /// descriptor as first built, a ring of NOPs (amdgpu_ring_clear_ring)
+    /// and its write pointer at 0, for MES to map it again. The read
+    /// pointer report is cleared too, as the remapped queue starts at 0
+    /// and nothing writes it while the HQD is unmapped.
+    fn restore(&mut self, pipe: Pipe) -> Result<(), Error> {
+        let expected = match pipe {
+            Pipe::Compute => State::ComputeReset,
+            Pipe::Graphics => State::InterruptVerified,
+        };
+        if self.state != expected {
+            return Err(Error::Busy);
+        }
+        let l = self.layout;
+        let map = self.memory.mapping();
+        let off = pipe.base();
+        let words = descriptor(self.memory.address(), pipe.index())?;
+        self.access(|io| {
+            for (i, v) in words.into_iter().enumerate() {
+                io.memory_write(map, off + 4096 + i as u64 * 4, v);
+            }
+            for at in (0..RING_DWORDS * 4).step_by(4) {
+                io.memory_write(map, off + at, RING_NOP);
+            }
+            for at in [RPTR, RPTR + 4, WPTR, WPTR + 4] {
+                io.memory_write(map, off + at, 0);
+            }
+            flush(io, l);
+            Ok(())
+        })?;
+        self.job_wptr[pipe.index()] = 0;
+        self.state = State::InterruptVerified;
+        Ok(())
     }
     /// The last job sequence `pipe`'s fence reached.
     fn completed_job(&mut self, pipe: Pipe) -> Result<u32, Error> {
@@ -773,7 +994,8 @@ impl Queues {
             state: State::Prepared,
             proof: None,
             interrupt_result: None,
-            job_wptr: [0; 2],
+            // The proofs leave both rings at 512 dwords.
+            job_wptr: [512; 2],
             job_seq: [0; 2],
         }))
     }
@@ -823,8 +1045,46 @@ impl Queues {
         self.0.submit(pipe, job)
     }
     /// The last client job sequence `pipe`'s ring completed.
+    /// Queue the ring test after a reset (see `Engine::submit_fence`).
+    /// # Safety
+    /// As `submit`.
+    pub unsafe fn submit_fence(&mut self, pipe: Pipe) -> Result<u32, Error> {
+        self.0.submit_fence(pipe)
+    }
+    /// `pipe`'s queue as MES maps (and resets) it.
+    pub fn kernel_queue(&self, pipe: Pipe) -> api::KernelQueue {
+        let m = qmem(self.0.memory.address(), pipe.index());
+        api::KernelQueue {
+            kind: match pipe {
+                Pipe::Graphics => api::QueueType::Graphics,
+                Pipe::Compute => api::QueueType::Compute,
+            },
+            pipe: 0,
+            queue: 0,
+            doorbell: m.doorbell,
+            mqd: m.descriptor,
+            write_pointer: m.write_pointer,
+        }
+    }
     pub fn completed_job(&mut self, pipe: Pipe) -> Result<u32, Error> {
         self.0.completed_job(pipe)
+    }
+    /// Reset the hung compute queue's HQD by MMIO (see
+    /// `Engine::reset_compute_hqd`).
+    /// # Safety
+    /// MES has suspended its gangs, the caller exclusively owns all four
+    /// HQDs on MEC1 pipe 0 and RLC safe mode, nothing else selects GRBM queues
+    /// meanwhile, and every job the queue holds keeps its memory until a
+    /// later fence on it lands.
+    pub async unsafe fn reset_compute_hqd(&mut self) -> Result<(), Error> {
+        self.0.reset_compute_hqd().await
+    }
+    /// Restore `pipe`'s reset, unmapped queue for MES to map again (see
+    /// `Engine::restore`).
+    /// # Safety
+    /// The queue's HQD is reset and MES has unmapped it.
+    pub unsafe fn restore(&mut self, pipe: Pipe) -> Result<(), Error> {
+        self.0.restore(pipe)
     }
     /// A reader of the job fence that needs no access to this owner.
     pub fn fence_reader(&self) -> FenceReader {

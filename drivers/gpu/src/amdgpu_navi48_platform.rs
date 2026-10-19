@@ -2,6 +2,7 @@
 //! Preparation is read-only; the caller stops CPU writers before entering it.
 use crate::amdgpu_navi48_display as display;
 use crate::{amdgpu, amdgpu_navi48_boot as boot, amdgpu_vram_boot as vram};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Range;
 use narf_capabilities::{Cap, Read};
@@ -158,6 +159,25 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
             crate::amdgpu_navi48_firmware::MesMode::Unified,
         )
         .map_err(Error::Firmware)?;
+        // What AMDGPU_INFO_FW_VERSION reports for the CP firmware.
+        {
+            use crate::amdgpu_navi48_firmware::Source;
+            use crate::amdgpu_uapi as u;
+            let images = firmware.images().map_err(Error::Firmware)?;
+            let cp = |source, fw_type| {
+                images
+                    .iter()
+                    .find(|i| i.source() == source)
+                    .map(|i| (fw_type, i.version(), i.feature()))
+            };
+            if let (Some(me), Some(pfp), Some(mec)) = (
+                cp(Source::Me, u::AMDGPU_INFO_FW_GFX_ME),
+                cp(Source::Pfp, u::AMDGPU_INFO_FW_GFX_PFP),
+                cp(Source::Mec, u::AMDGPU_INFO_FW_GFX_MEC),
+            ) {
+                crate::amdgpu_info::publish_navi48_firmware([me, pfp, mec]);
+            }
+        }
         let end = gpu
             .vram
             .base
@@ -175,12 +195,19 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
         }
         // SAFETY: the immutable inventory covers every inherited client, and
         // successful preparation excludes every later legacy MMIO accessor.
-        let pool = unsafe { plan.into_pool() }.map_err(Error::Memory)?;
+        // Nothing the driver allocates lies past the BAR: every owner takes
+        // CPU-visible memory from `pool`, so that range is all clients'.
+        let (unmapped, pool) = unsafe { (plan.unmapped_pool(), plan.into_pool()) };
+        let (unmapped, pool) = (
+            unmapped.map_err(Error::Memory)?,
+            pool.map_err(Error::Memory)?,
+        );
         // SAFETY: inventory covers every inherited client and CPU framebuffer
         // writers are paused. Construction performs bounded reads, never writes.
-        let prepared =
-            unsafe { boot::ColdBoot::new(gpu, pci, authority, &pool, firmware, training) }
-                .map_err(Error::Firmware)?;
+        let prepared = unsafe {
+            boot::ColdBoot::new(gpu, pci, authority, &pool, unmapped, firmware, training)
+        }
+        .map_err(Error::Firmware)?;
         *owner = Some(prepared);
         Ok(Some(affected))
     })
@@ -212,19 +239,21 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     }
     // Clients' command submissions run on the GC12 queues and SDMA0.
     if let (Some(card), Some(fence)) = (boot::ColdBoot::drm_card(), boot.client_fence_reader()) {
-        crate::amdgpu_cs::register_submitter(
+        let submitter = Arc::new(Submitter {
             card,
-            alloc::sync::Arc::new(Submitter {
-                card,
-                fence,
-                sdma_fence: boot.client_sdma_fence_reader(),
-                contexts: narf_lib::sync::IrqSafeSpinLock::new([(0, 0); RINGS]),
-                vmids: narf_lib::sync::IrqSafeSpinLock::new(crate::amdgpu_vmid::VmidManager::new(
-                    CLIENT_VMIDS.0,
-                    CLIENT_VMIDS.1,
-                )),
-            }),
-        );
+            fence,
+            sdma_fence: boot.client_sdma_fence_reader(),
+            contexts: narf_lib::sync::IrqSafeSpinLock::new([(0, 0); RINGS]),
+            vmids: narf_lib::sync::IrqSafeSpinLock::new(crate::amdgpu_vmid::VmidManager::new(
+                CLIENT_VMIDS.0,
+                CLIENT_VMIDS.1,
+            )),
+            watch: narf_lib::sync::IrqSafeSpinLock::new(
+                [const { crate::amdgpu_ring_watch::RingWatch::new() }; RINGS],
+            ),
+        });
+        crate::amdgpu_cs::register_submitter(card, submitter.clone());
+        narf_scheduler::spawn(watchdog(submitter));
     }
     // Clients' VRAM buffers; without it they fall back to system memory.
     {
@@ -261,6 +290,14 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
 /// VMID last mapped another (or that write may not have run yet), so its
 /// faults carry the client's PASID and reach that open's GPUVM_FAULT query.
 ///
+/// A watchdog (`watchdog`) times out a ring's front job after
+/// `amdgpu_ring_watch::JOB_TIMEOUT_NS`: it ends with ETIME, the jobs behind
+/// it with ECANCELED, and the ring takes no more. Their memory still waits
+/// for the hardware fence. The graphics ring is then reset through MES, the
+/// compute ring by MMIO and remapped, SDMA0's ring by MMIO and reprogrammed,
+/// and tested (`ColdBoot::recover_client_ring`, `recover_client_sdma`);
+/// once the test's fence lands it takes jobs again.
+///
 /// AMDGPU_INFO keeps reporting acceleration unavailable, so Mesa does not
 /// submit here.
 struct Submitter {
@@ -275,6 +312,15 @@ struct Submitter {
     /// scheduler entity Linux compares for AMDGPU_HAVE_CTX_SWITCH. Touched
     /// only under OWNER.
     contexts: narf_lib::sync::IrqSafeSpinLock<[(u64, u32); RINGS]>,
+    /// Each ring's jobs in flight and whether it hung.
+    watch: narf_lib::sync::IrqSafeSpinLock<[crate::amdgpu_ring_watch::RingWatch; RINGS]>,
+}
+/// Why a ring's reset failed.
+#[derive(Debug)]
+#[allow(dead_code, reason = "read through Debug in the reset log")]
+enum RingError {
+    Queue(crate::amdgpu_gfx12_queue::Error),
+    Sdma(crate::amdgpu_sdma_navi48::Error),
 }
 /// Client VMIDs on the GFX hub: 1 up to first_kfd_vmid (8) exclusive.
 const CLIENT_VMIDS: (u8, u8) = (1, 7);
@@ -307,6 +353,82 @@ impl Submitter {
         crate::amdgpu_cs::retire(self.card, &|t| job_done(completed, t));
         Some(completed)
     }
+    /// Time out the front job of every ring that has held it too long,
+    /// and recover the rings that can be.
+    async fn watch(&self) {
+        use core::fmt::Write as _;
+        if !self.watch.lock().iter().any(|w| w.busy()) {
+            return;
+        }
+        let Some(completed) = self.progress() else {
+            return;
+        };
+        let now = narf_time::monotonic_ns();
+        for (ring, &done) in completed.iter().enumerate() {
+            let hung = self.watch.lock()[ring].check(done, now);
+            let Some((seq, vmid)) = hung else {
+                continue;
+            };
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi48 ring {ring} timeout, signaled seq={}, job {seq} hung",
+                done
+            );
+            let recovered = {
+                let mut owner = OWNER.lock().await;
+                match (owner.as_mut(), PIPES.get(ring)) {
+                    // SAFETY: OWNER serializes the queues, SDMA0 and MES;
+                    // every job on the ring holds its memory until its
+                    // fence, which only the ring test's proves passed.
+                    (Some(boot), Some(&pipe)) => unsafe { boot.recover_client_ring(pipe, vmid) }
+                        .await
+                        .map_err(RingError::Queue),
+                    // SAFETY: as above.
+                    (Some(boot), None) => unsafe { boot.recover_client_sdma(requeue_clears) }
+                        .await
+                        .map_err(RingError::Sdma),
+                    (None, _) => Err(RingError::Queue(
+                        crate::amdgpu_gfx12_queue::Error::DeviceGone,
+                    )),
+                }
+            };
+            match recovered {
+                Ok(test) => {
+                    self.watch.lock()[ring].recovered();
+                    let _ = self.progress();
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: navi48 ring {ring} reset succeeded (test fence {test})"
+                    );
+                }
+                Err(e) => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: navi48 ring {ring} reset failed ({e:?}); ring stopped"
+                    );
+                }
+            }
+        }
+    }
+    /// How job `ticket` ended if not by completing (see `RingWatch`).
+    fn job_error(&self, ticket: u64) -> Option<narf_filesystem::FsError> {
+        let ring = (ticket >> 32) as usize;
+        self.watch.lock().get(ring)?.error(ticket as u32)
+    }
+}
+
+/// Check the card's rings for timed-out jobs every 100 ms while `submitter`
+/// stays the card's registered one.
+async fn watchdog(submitter: Arc<Submitter>) {
+    loop {
+        narf_time::SleepUntil::new(narf_time::Deadline::after_us(100_000).as_instant()).await;
+        let current = crate::amdgpu_cs::submitter(submitter.card);
+        let ours: Arc<dyn crate::amdgpu_cs::Submitter> = submitter.clone();
+        if !current.is_some_and(|c| Arc::ptr_eq(&c, &ours)) {
+            return;
+        }
+        submitter.watch().await;
+    }
 }
 impl crate::amdgpu_cs::Submitter for Submitter {
     fn ring_for(&self, ip_type: u32, ip_instance: u32, ring: u32) -> Option<u32> {
@@ -319,16 +441,23 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             _ => None,
         }
     }
+    fn max_ibs(&self, _ring: u32) -> u32 {
+        crate::amdgpu_gfx12_queue::MAX_JOB_IBS as u32
+    }
     fn signalled(&self, ticket: u64) -> bool {
         // A revoked or vanished device makes no more progress; report done
         // so waiters cannot wedge.
         self.progress()
-            .is_none_or(|completed| job_done(completed, ticket))
+            .is_none_or(|completed| job_done(completed, ticket) || self.job_error(ticket).is_some())
+    }
+    fn error(&self, ticket: u64) -> Option<narf_filesystem::FsError> {
+        self.job_error(ticket)
     }
     fn submit<'a>(
         &'a self,
         vm: &'a crate::amdgpu_vm::VmState,
         submission: &'a crate::amdgpu_cs::Submission,
+        health: &'a Arc<crate::amdgpu_ctx::Health>,
     ) -> core::pin::Pin<
         alloc::boxed::Box<
             dyn core::future::Future<Output = Result<u64, narf_filesystem::FsError>> + Send + 'a,
@@ -373,6 +502,10 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             let result = loop {
                 let mut owner = OWNER.lock().await;
                 let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
+                // A hung ring takes no more jobs until it is recovered.
+                if let Some(error) = self.watch.lock()[ring as usize].refusing() {
+                    break Err(error);
+                }
                 let completed = self.progress().ok_or(FsError::NoDevice)?;
                 let done = |t| job_done(completed, t);
                 let grant = self.vmids.lock().grab(request, &done);
@@ -414,6 +547,12 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                     let ticket = u64::from(ring) << 32 | u64::from(seq);
                     self.vmids.lock().commit(request, grant, ticket);
                     self.contexts.lock()[ring as usize] = entity;
+                    self.watch.lock()[ring as usize].submitted(
+                        seq,
+                        job.vmid,
+                        health.clone(),
+                        narf_time::monotonic_ns(),
+                    );
                 }
                 break result;
             };
@@ -437,7 +576,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             }
             loop {
                 let completed = self.progress().ok_or(FsError::NoDevice)?;
-                if job_done(completed, ticket) {
+                if job_done(completed, ticket) || self.job_error(ticket).is_some() {
                     return Ok(true);
                 }
                 if narf_time::monotonic_ns() >= deadline_ns {
@@ -478,8 +617,281 @@ async fn prove_queue_interrupts() {
         if unsafe { boot.prove_queue_interrupts().await }.is_ok() {
             // SAFETY: GC12 has drained; the same exclusive owner serializes
             // SDMA against all other users of the retained GMC test pages.
-            let _ = unsafe { boot.prove_sdma_interrupts().await };
+            let proved = unsafe { boot.prove_sdma_interrupts().await };
+            // SDMA0 now runs jobs, so it can clear VRAM past the BAR.
+            if let (Ok(_), Some(reader)) = (proved, boot.client_sdma_fence_reader()) {
+                use core::fmt::Write as _;
+                let progress: SdmaProgress = Arc::new(move || reader.completed().ok());
+                let clearer = VramClearer::new(progress);
+                *CLEARER.lock() = Some(clearer.clone());
+                let _ = match boot.publish_unmapped_vram(Arc::new(clearer)) {
+                    Ok(bytes) => writeln!(
+                        narf_console::Writer,
+                        "amdgpu: navi48 client VRAM past the BAR {} MiB",
+                        bytes >> 20
+                    ),
+                    Err(boot::Error::Busy) => Ok(()),
+                    Err(e) => writeln!(
+                        narf_console::Writer,
+                        "amdgpu: navi48 no client VRAM past the BAR: {e:?}"
+                    ),
+                };
+            }
         }
+    }
+}
+
+/// Clears of client VRAM past the BAR on SDMA0 (`amdgpu_gem::VramClear`).
+/// Requests queue in order; one drain task at a time takes them under OWNER,
+/// batching as many as one kernel job holds, so they run — and complete —
+/// in the order they were queued. Each fence is its job's sequence on
+/// SDMA0's fence — the hardware's word alone, never a timeout's verdict, as
+/// the clear is what keeps stale VRAM from the next owner.
+#[derive(Debug, Clone)]
+struct VramClearer(Arc<ClearQueue>);
+struct ClearQueue {
+    progress: SdmaProgress,
+    state: narf_lib::sync::IrqSafeSpinLock<ClearState>,
+}
+/// The clears waiting for SDMA0 and those on its ring.
+#[derive(Debug, Default)]
+struct ClearState {
+    /// Waiting to go on the ring, oldest first.
+    queued: alloc::collections::VecDeque<Clear>,
+    /// On the ring and not yet seen complete, oldest first.
+    inflight: alloc::collections::VecDeque<Clear>,
+    /// A drain task is running.
+    draining: bool,
+}
+impl ClearState {
+    /// Forget the clears on the ring that SDMA0 completed by `completed`.
+    fn retire(&mut self, completed: u32) {
+        use core::sync::atomic::Ordering;
+        while self.inflight.front().is_some_and(|c| {
+            completed.wrapping_sub(c.fence.seq.load(Ordering::Acquire) as u32) as i32 >= 0
+        }) {
+            self.inflight.pop_front();
+        }
+    }
+    /// SDMA0's ring was reset at `completed`, skipping what it held past
+    /// that: those clears never ran, so they go back to the front of the
+    /// queue, in order and unsignalled, to run on the recovered ring.
+    /// Returns whether a drain task must start.
+    fn requeue(&mut self, completed: u32) -> bool {
+        use core::sync::atomic::Ordering;
+        self.retire(completed);
+        while let Some(c) = self.inflight.pop_back() {
+            c.fence.seq.store(u64::MAX, Ordering::Release);
+            self.queued.push_front(c);
+        }
+        !self.queued.is_empty() && !core::mem::replace(&mut self.draining, true)
+    }
+}
+/// The platform's VRAM clearer, which an SDMA0 reset hands its skipped
+/// clears back to.
+static CLEARER: narf_lib::sync::IrqSafeSpinLock<Option<VramClearer>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+/// After SDMA0's ring was reset at `completed`, run its skipped clears
+/// again (`ClearState::requeue`).
+fn requeue_clears(completed: u32) {
+    let Some(clearer) = CLEARER.lock().clone() else {
+        return;
+    };
+    if clearer.0.state.lock().requeue(completed) {
+        narf_scheduler::spawn(clearer.drain());
+    }
+}
+#[derive(Debug, Clone)]
+struct Clear {
+    address: u64,
+    bytes: u64,
+    fence: Arc<ClearFence>,
+}
+/// Fill packets one clear job carries at most: 5 dwords each, well inside
+/// a 256-dword SDMA job slot with its fence.
+const CLEAR_PACKETS: u64 = 32;
+/// How many of the queued clears of `bytes` each one job takes: the front
+/// ones whose fill packets fit, at least one.
+fn clear_batch(bytes: impl Iterator<Item = u64>) -> usize {
+    let mut packets = 0;
+    bytes
+        .take_while(|b| {
+            packets += b.div_ceil(crate::amdgpu_sdma_navi48::MAX_PACKET_BYTES);
+            packets <= CLEAR_PACKETS
+        })
+        .count()
+        .max(1)
+}
+/// Whether one job can fill `bytes` at `address`: dword aligned, whole
+/// dwords, and no more packets than a job takes.
+fn clear_fits(address: u64, bytes: u64) -> bool {
+    bytes != 0
+        && bytes % 4 == 0
+        && address % 4 == 0
+        && bytes.div_ceil(crate::amdgpu_sdma_navi48::MAX_PACKET_BYTES) <= CLEAR_PACKETS
+}
+/// SDMA0's last completed job sequence, or None once the device stopped
+/// answering.
+type SdmaProgress = Arc<dyn Fn() -> Option<u32> + Send + Sync>;
+/// One queued clear's completion.
+struct ClearFence {
+    progress: SdmaProgress,
+    /// The kernel job's SDMA0 sequence once queued; `u64::MAX` before.
+    seq: core::sync::atomic::AtomicU64,
+    /// The device refused the job for good: nothing runs on it any more.
+    gone: core::sync::atomic::AtomicBool,
+}
+impl core::fmt::Debug for ClearFence {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ClearFence")
+            .field("seq", &self.seq)
+            .field("gone", &self.gone)
+            .finish()
+    }
+}
+impl ClearFence {
+    fn new(progress: SdmaProgress) -> Self {
+        Self {
+            progress,
+            seq: core::sync::atomic::AtomicU64::new(u64::MAX),
+            gone: core::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+impl narf_filesystem::DrmFence for ClearFence {
+    fn is_signalled(&self) -> bool {
+        use core::sync::atomic::Ordering;
+        if self.gone.load(Ordering::Acquire) {
+            return true;
+        }
+        let seq = self.seq.load(Ordering::Acquire);
+        // A device that stopped answering runs nothing any more.
+        seq != u64::MAX
+            && (self.progress)().is_none_or(|done| done.wrapping_sub(seq as u32) as i32 >= 0)
+    }
+    fn wait(&self, timeout_ms: u64) -> bool {
+        let deadline =
+            narf_time::monotonic_ns().saturating_add(timeout_ms.saturating_mul(1_000_000));
+        while !self.is_signalled() {
+            if narf_time::monotonic_ns() >= deadline {
+                return false;
+            }
+            narf_scheduler::block_on_spin(narf_time::SleepUntil::new(
+                narf_time::Deadline::after_us(50).as_instant(),
+            ));
+        }
+        true
+    }
+    fn driver_name(&self) -> &str {
+        "amdgpu"
+    }
+}
+impl core::fmt::Debug for ClearQueue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ClearQueue")
+            .field("queued", &self.state.lock().queued.len())
+            .finish()
+    }
+}
+impl VramClearer {
+    fn new(progress: SdmaProgress) -> Self {
+        Self(Arc::new(ClearQueue {
+            progress,
+            state: narf_lib::sync::IrqSafeSpinLock::new(ClearState::default()),
+        }))
+    }
+    /// Run queued clears until none is left.
+    async fn drain(self) {
+        use crate::amdgpu_sdma_navi48::KernelOp;
+        use core::sync::atomic::Ordering;
+        loop {
+            // The batch is taken and queued under OWNER, as an SDMA0 reset
+            // requeues skipped clears at the queue's front under it too.
+            let mut owner = OWNER.lock().await;
+            // The front clears that fit one job, left queued until they are
+            // in the ring so a later request cannot overtake them.
+            let batch: Vec<Clear> = {
+                let mut state = self.0.state.lock();
+                if state.queued.is_empty() {
+                    state.draining = false;
+                    return;
+                }
+                let n = clear_batch(state.queued.iter().map(|c| c.bytes));
+                state.queued.iter().take(n).cloned().collect()
+            };
+            let ops: Vec<KernelOp> = batch
+                .iter()
+                .map(|c| KernelOp::Fill {
+                    dst: c.address,
+                    bytes: c.bytes,
+                    value: 0,
+                })
+                .collect();
+            let result = match owner.as_mut() {
+                // SAFETY: OWNER serializes SDMA0's ring; each range is a
+                // client reservation the GEM layer holds no job can reach
+                // before this job's fence (its KERNEL fence).
+                Some(boot) => unsafe { boot.submit_client_sdma_kernel(&ops) },
+                None => Err(crate::amdgpu_sdma_navi48::Error::DeviceGone),
+            };
+            match result {
+                // The ring is full: let jobs retire.
+                Err(crate::amdgpu_sdma_navi48::Error::Busy) => {
+                    drop(owner);
+                    narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant())
+                        .await;
+                    continue;
+                }
+                Ok(seq) => {
+                    for c in &batch {
+                        c.fence.seq.store(u64::from(seq), Ordering::Release);
+                    }
+                    let completed = (self.0.progress)();
+                    let mut state = self.0.state.lock();
+                    let ran: Vec<Clear> = state.queued.drain(..batch.len()).collect();
+                    state.inflight.extend(ran);
+                    if let Some(completed) = completed {
+                        state.retire(completed);
+                    }
+                }
+                // `clear` validated every request, so the device is gone.
+                Err(_) => {
+                    for c in &batch {
+                        c.fence.gone.store(true, Ordering::Release);
+                    }
+                    self.0.state.lock().queued.drain(..batch.len());
+                }
+            }
+        }
+    }
+}
+impl crate::amdgpu_gem::VramClear for VramClearer {
+    fn clear(
+        &self,
+        address: u64,
+        bytes: u64,
+    ) -> Result<Arc<dyn narf_filesystem::DrmFence>, narf_filesystem::FsError> {
+        if !clear_fits(address, bytes) {
+            return Err(narf_filesystem::FsError::InvalidData);
+        }
+        let fence = Arc::new(ClearFence::new(self.0.progress.clone()));
+        let start = {
+            let mut state = self.0.state.lock();
+            state
+                .queued
+                .try_reserve(1)
+                .map_err(|_| narf_filesystem::FsError::NoSpace)?;
+            state.queued.push_back(Clear {
+                address,
+                bytes,
+                fence: fence.clone(),
+            });
+            !core::mem::replace(&mut state.draining, true)
+        };
+        if start {
+            narf_scheduler::spawn(self.clone().drain());
+        }
+        Ok(fence)
     }
 }
 
@@ -3216,6 +3628,55 @@ mod tests {
         navi48_monitor_relights_only_for_new_sinks_and_changes
     );
 
+    /// After an SDMA0 reset, the clears the ring held past where it
+    /// stopped go back to the queue's front, in order and unsignalled;
+    /// those it completed are forgotten, and a drain starts only if none
+    /// runs.
+    fn navi48_sdma_reset_requeues_skipped_clears() -> TestResult {
+        use core::sync::atomic::Ordering;
+        let progress: SdmaProgress = Arc::new(|| Some(0));
+        let clear = |address, seq: u64| {
+            let fence = Arc::new(ClearFence::new(progress.clone()));
+            fence.seq.store(seq, Ordering::Release);
+            Clear {
+                address,
+                bytes: 4096,
+                fence,
+            }
+        };
+        let mut state = ClearState::default();
+        state
+            .inflight
+            .extend([clear(0x1000, 4), clear(0x2000, 5), clear(0x3000, 5)]);
+        state.queued.push_back(clear(0x4000, u64::MAX));
+        state.retire(3);
+        if state.inflight.len() != 3 {
+            return TestResult::Fail("retired clears not yet done");
+        }
+        if !state.requeue(4) || state.requeue(4) {
+            return TestResult::Fail("drain start");
+        }
+        let queued: Vec<(u64, u64)> = state
+            .queued
+            .iter()
+            .map(|c| (c.address, c.fence.seq.load(Ordering::Acquire)))
+            .collect();
+        if !state.inflight.is_empty()
+            || queued != [(0x2000, u64::MAX), (0x3000, u64::MAX), (0x4000, u64::MAX)]
+            || state
+                .queued
+                .iter()
+                .any(|c| narf_filesystem::DrmFence::is_signalled(&*c.fence))
+        {
+            return TestResult::Fail("requeued clears");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi48",
+        navi48_sdma_reset_requeues_skipped_clears
+    );
+
     fn navi48_monitor_finishes_retirement_before_reactivation() -> TestResult {
         let mut output = CrtcState::new();
         output.active = false;
@@ -3239,6 +3700,59 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu/navi48",
         navi48_monitor_finishes_retirement_before_reactivation
+    );
+
+    /// Clears batch front-first into jobs of at most 32 fill packets, and
+    /// a clear's fence waits for SDMA0 to reach its job, unless the device
+    /// is gone.
+    fn navi48_vram_clears_batch_in_order() -> TestResult {
+        use narf_filesystem::DrmFence;
+        const GIB: u64 = 1 << 30;
+        if clear_batch([4096u64; 40].into_iter()) != 32
+            || clear_batch([31 * GIB, GIB, 4096].into_iter()) != 2
+            || clear_batch([GIB + 4, 31 * GIB].into_iter()) != 1
+            || clear_batch([4096, 32 * GIB].into_iter()) != 1
+            || clear_batch(core::iter::empty()) != 1
+        {
+            return TestResult::Fail("clear batching");
+        }
+        if !clear_fits(0x10, 32 * GIB)
+            || clear_fits(0x10, 32 * GIB + 4)
+            || clear_fits(0x12, 4)
+            || clear_fits(0x10, 6)
+            || clear_fits(0x10, 0)
+        {
+            return TestResult::Fail("clear validation");
+        }
+        // A fence follows SDMA0's own completed sequence (wrapping), and
+        // a vanished or refusing device signals it.
+        let done = Arc::new(core::sync::atomic::AtomicU64::new(u64::from(u32::MAX - 1)));
+        let seen = done.clone();
+        let fence = ClearFence::new(Arc::new(move || {
+            let d = seen.load(Ordering::Acquire);
+            (d != u64::MAX).then_some(d as u32)
+        }));
+        if fence.is_signalled() {
+            return TestResult::Fail("unqueued clear signalled");
+        }
+        fence.seq.store(1, Ordering::Release);
+        let early = fence.is_signalled();
+        done.store(0, Ordering::Release);
+        let before = fence.is_signalled();
+        done.store(1, Ordering::Release);
+        let reached = fence.is_signalled();
+        done.store(u64::MAX, Ordering::Release);
+        let vanished = fence.is_signalled();
+        let refused = ClearFence::new(Arc::new(|| Some(0)));
+        refused.gone.store(true, Ordering::Release);
+        if early || before || !reached || !vanished || !refused.is_signalled() {
+            return TestResult::Fail("clear fence against SDMA0's sequence");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi48",
+        navi48_vram_clears_batch_in_order
     );
 
     fn navi48_handoff_distinguishes_primary_and_secondary_apertures() -> TestResult {

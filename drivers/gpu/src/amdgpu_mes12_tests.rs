@@ -61,6 +61,91 @@ fn mes12_kernel_packets_obey_eight_byte_c_layout() -> TestResult {
     ) {
         return TestResult::Fail("MES12 REMOVE_QUEUE uses wrong status/tail alignment");
     }
+    // MESAPI__RESET: a graphics queue as a legacy HQD (LP fields from 9,
+    // 8-byte MQD at 12 and write pointer at 16), a compute queue by
+    // doorbell; the status lands at 28 either way.
+    let gfx = KernelQueue {
+        kind: QueueType::Graphics,
+        pipe: 0,
+        queue: 0,
+        doorbell: 0x116,
+        ..queue()
+    };
+    let mut p = reset_kernel_queue(gfx, 5).unwrap();
+    p.bind_completion(0x432100002008, 1).unwrap();
+    if !matches(
+        &p,
+        &[
+            (0, 0x40081),
+            (1, 8),
+            (9, 0),
+            (11, 5),
+            (12, 0x1000),
+            (13, 0x1234),
+            (14, 0x116),
+            (16, 0x4008),
+            (17, 0x1234),
+            (28, 0x2008),
+            (29, 0x4321),
+            (30, 1),
+        ],
+    ) {
+        return TestResult::Fail("MES12 RESET of a legacy graphics queue");
+    }
+    let mut p = reset_kernel_queue(queue(), 5).unwrap();
+    p.bind_completion(0x432100002008, 1).unwrap();
+    if !matches(
+        &p,
+        &[
+            (0, 0x40081),
+            (1, 1),
+            (4, 0x174),
+            (8, 1),
+            (28, 0x2008),
+            (29, 0x4321),
+            (30, 1),
+        ],
+    ) || reset_kernel_queue(gfx, 16).is_ok()
+    {
+        return TestResult::Fail("MES12 RESET of a queue by doorbell");
+    }
+    // REMOVE_QUEUE after an MMIO reset: remove_queue_after_reset only
+    // where the firmware takes it.
+    let mut p = unmap_reset_kernel_queue(queue(), true).unwrap();
+    p.bind_completion(0x432100002008, 1).unwrap();
+    let mut q = unmap_reset_kernel_queue(queue(), false).unwrap();
+    q.bind_completion(0x432100002008, 1).unwrap();
+    let unmap = [
+        (0, 0x40031),
+        (1, 0x174),
+        (6, 0x2008),
+        (7, 0x4321),
+        (8, 1),
+        (10, 1),
+        (11, 3),
+        (15, 1),
+    ];
+    if !matches(&p, &[&unmap[..], &[(4, 0x18)]].concat())
+        || !matches(&q, &[&unmap[..], &[(4, 8)]].concat())
+    {
+        return TestResult::Fail("MES12 REMOVE_QUEUE after reset");
+    }
+    // MESAPI__SUSPEND / __RESUME of all gangs: the flag word at 1, the
+    // status after the 8-byte gang and fence fields (8) or the gang
+    // context alone (4).
+    let mut p = suspend_all();
+    p.bind_completion(0x432100002008, 1).unwrap();
+    let mut r = resume_all();
+    r.bind_completion(0x432100002008, 1).unwrap();
+    if !matches(
+        &p,
+        &[(0, 0x40061), (1, 1), (8, 0x2008), (9, 0x4321), (10, 1)],
+    ) || !matches(
+        &r,
+        &[(0, 0x40071), (1, 1), (4, 0x2008), (5, 0x4321), (6, 1)],
+    ) {
+        return TestResult::Fail("MES12 SUSPEND/RESUME of all gangs");
+    }
     let mut p = resources_1(0x123400005000).unwrap();
     p.bind_completion(0x432100002008, 1).unwrap();
     if !matches(

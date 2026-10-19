@@ -38,6 +38,19 @@ struct Fake {
     /// ACQUIRE_MEM cache flushes.
     job_mem_syncs: u32,
     job_ibs: Vec<(u64, u32)>,
+    /// MMIO queue-reset writes: (GRBM selection, register, value).
+    hqd_resets: Vec<(u32, u64, u32)>,
+    /// The compute HQD ignores its dequeue.
+    hqd_stuck: bool,
+    /// Pipe reset / RLC writes, including the selected HQD.
+    reset_trace: Vec<(u32, u64, u32)>,
+    active: [bool; 4],
+    dequeue: [u32; 4],
+    drop_reset_write: Option<(u64, u32)>,
+    rlc_stuck: bool,
+    rlc_pending: u8,
+    /// A ring restored after a reset runs client slots from 0.
+    restored: bool,
 }
 impl Fake {
     /// A CP running client-job slots of `pipe` from its RPTR to `tail`.
@@ -193,6 +206,21 @@ impl Io for Fake {
             0x15850 => 0x800,
             0x15854 => 0xbff,
             0x604b4 => 0x7f000,
+            0x42600 => {
+                let v = *self.regs.get(&at).unwrap_or(&0);
+                if v & 1 != 0 && !self.rlc_stuck && self.rlc_pending == 0 {
+                    self.regs.insert(at, v & !1);
+                    v & !1
+                } else {
+                    self.rlc_pending = self.rlc_pending.saturating_sub(1);
+                    v
+                }
+            }
+            0x17eac if self.index & 0xff == 4 && !self.hqd_resets.is_empty() => {
+                let q = (self.index >> 8) as usize;
+                u32::from(self.active[q] || (q == 0 && self.hqd_stuck))
+            }
+            0x17f04 if self.index & 0xff == 4 => self.dequeue[(self.index >> 8) as usize],
             0x17a00 | 0x17eac => u32::from(self.busy),
             _ => *self.regs.get(&at).unwrap_or(&0),
         }
@@ -201,6 +229,35 @@ impl Io for Fake {
         match at {
             0x42400 => self.index = v,
             0x7f000 => self.dirty = false,
+            0x42600 | 0x4a410 => {
+                self.reset_trace.push((self.index, at, v));
+                if self.drop_reset_write != Some((at, v)) {
+                    self.regs.insert(at, v);
+                }
+            }
+            // CP_HQD_ACTIVE / DEQUEUE_REQUEST and SPI_COMPUTE_QUEUE_RESET.
+            0x17eac | 0x17f04 | 0x17dcc => {
+                if self.regs[&0x53000] & 1 != 0 {
+                    assert_eq!(self.regs[&0x42600] & 3, 2, "RLC safe before reset");
+                }
+                self.hqd_resets.push((self.index, at, v));
+                self.reset_trace.push((self.index, at, v));
+                if self.drop_reset_write == Some((at, v)) {
+                    return;
+                }
+                let q = (self.index >> 8) as usize;
+                match at {
+                    0x17eac => {
+                        assert_ne!(self.regs[&0x4a410] & (1 << 16), 0, "reset held");
+                        self.active[q] = v & 1 != 0;
+                        if q == 0 {
+                            self.hqd_stuck = v & 1 != 0;
+                        }
+                    }
+                    0x17f04 => self.dequeue[q] = v,
+                    _ => {}
+                }
+            }
             _ => panic!("unexpected CP register write"),
         }
     }
@@ -221,7 +278,7 @@ impl Io for Fake {
         }
     }
     fn doorbell(&mut self, _: MmioRegion, offset: u32, v: u64) {
-        if v > 512 {
+        if v > 512 || self.restored {
             let pipe = match offset {
                 0x116 => 0,
                 6 => 1,
@@ -306,7 +363,13 @@ fn fixture() -> (Pool, Engine<Fake>, FakeMes, gmc::Aperture, MmioRegion) {
             rptr_stuck: false,
             busy: false,
             revoked: None,
-            regs: BTreeMap::from([(0x17828, 0x84000000), (0x17894, 0x84000000)]),
+            regs: BTreeMap::from([
+                (0x17828, 0x84000000),
+                (0x17894, 0x84000000),
+                (0x53000, 1),
+                (0x42600, 0),
+                (0x4a410, 0xbc00000a),
+            ]),
             job_writes: Vec::new(),
             job_waits: Vec::new(),
             job_syncs: 0,
@@ -314,6 +377,15 @@ fn fixture() -> (Pool, Engine<Fake>, FakeMes, gmc::Aperture, MmioRegion) {
             job_context_controls: Vec::new(),
             job_mem_syncs: 0,
             job_ibs: Vec::new(),
+            hqd_resets: Vec::new(),
+            hqd_stuck: false,
+            reset_trace: Vec::new(),
+            active: [false; 4],
+            dequeue: [0; 4],
+            drop_reset_write: None,
+            rlc_stuck: false,
+            rlc_pending: 0,
+            restored: false,
         },
         authority: Cap::bootstrap(),
         layout: Layout {
@@ -327,7 +399,7 @@ fn fixture() -> (Pool, Engine<Fake>, FakeMes, gmc::Aperture, MmioRegion) {
         state: State::Prepared,
         proof: None,
         interrupt_result: None,
-        job_wptr: [0; 2],
+        job_wptr: [512; 2],
         job_seq: [0; 2],
     };
     let mes = FakeMes {
@@ -825,9 +897,266 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
     {
         return TestResult::Fail("full ring");
     }
+    // The ring test after a reset needs a free slot too: the CP must have
+    // let go of the stalled jobs first.
+    if e.submit_fence(Pipe::Graphics) != Err(Error::Busy) {
+        return TestResult::Fail("ring test on a ring the CP never drained");
+    }
+    // A reset that dropped the stalled slots (RPTR caught up): the test is
+    // a fence of the next sequence and nothing else.
+    e.io.memory[2560] = e.job_wptr[0] as u32;
+    e.io.complete = true;
+    let (ibs, writes, waits) = (
+        e.io.job_ibs.len(),
+        e.io.job_writes.len(),
+        e.io.job_waits.len(),
+    );
+    if e.submit_fence(Pipe::Graphics) != Ok(11)
+        || e.completed_job(Pipe::Graphics) != Ok(11)
+        || (
+            e.io.job_ibs.len(),
+            e.io.job_writes.len(),
+            e.io.job_waits.len(),
+        ) != (ibs, writes, waits)
+    {
+        return TestResult::Fail("ring test slot");
+    }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/gfx12",
     gfx12_graphics_queue_runs_client_jobs_with_vm_flushes
+);
+
+/// gfx_v12_0_reset_kcq's queue half: a reset dequeue and SPI queue reset
+/// under the compute selection (the prior one restored), waiting for the
+/// HQD to go idle; then the descriptor as first built, a NOP ring and
+/// pointers at 0, so the ring test runs from the ring's start.
+fn gfx12_compute_queue_resets_by_mmio_and_restores_for_remap() -> TestResult {
+    let (_pool, mut e, mut mes, aperture, target) = fixture();
+    run(e.initialize(&mut mes, aperture, target)).unwrap();
+    if run(e.reset_compute_hqd()) != Err(Error::Busy)
+        || e.restore(Pipe::Compute) != Err(Error::Busy)
+    {
+        return TestResult::Fail("reset before the interrupt proof");
+    }
+    e.state = State::InterruptVerified;
+    e.io.memory[3072 + 2560] = 512;
+    // A compute job the CP never finishes.
+    e.io.complete = false;
+    let job = Job::new(3, 1, 0x1_0000_8001, &[(0x2_0000_1000, 64)]).unwrap();
+    if e.submit(Pipe::Compute, job) != Ok(1) {
+        return TestResult::Fail("hung job");
+    }
+    let graphics = e.io.memory[..3072].to_vec();
+    let reset = [(4, 0x17f04, 2), (4, 0x17dcc, 1)];
+    e.io.rlc_pending = 2;
+    if run(e.reset_compute_hqd()) != Ok(())
+        || e.io.hqd_resets != reset
+        || e.io.index != 0x32
+        || e.io.reset_trace != [(0x32, 0x42600, 3), reset[0], reset[1], (0x32, 0x42600, 1)]
+    {
+        return TestResult::Fail("MMIO compute queue reset");
+    }
+    assert_eq!(e.state, State::ComputeReset);
+    assert_eq!(run(e.reset_compute_hqd()), Err(Error::Busy));
+    assert_eq!(e.submit_fence(Pipe::Compute), Err(Error::Busy));
+    if e.restore(Pipe::Compute) != Ok(()) {
+        return TestResult::Fail("restore");
+    }
+    let m = &e.io.memory[3072..6144];
+    if m[1024..1536] != descriptor(GPU, 1).unwrap()
+        || m[..1024].iter().any(|&w| w != RING_NOP)
+        || m[2560..2562] != [0, 0]
+        || m[2562..2564] != [0, 0]
+        || e.io.memory[..3072] != graphics[..]
+    {
+        return TestResult::Fail("restored compute queue");
+    }
+    // Mapped again from that descriptor, the ring test is the first slot.
+    e.io.restored = true;
+    e.io.complete = true;
+    if e.submit_fence(Pipe::Compute) != Ok(2)
+        || e.completed_job(Pipe::Compute) != Ok(2)
+        || e.io.memory[3072 + 2562] != 256
+    {
+        return TestResult::Fail("ring test after the restore");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_compute_queue_resets_by_mmio_and_restores_for_remap
+);
+
+/// Exercise the timeout-to-pipe-reset path, then remap and run a fence.
+/// Every HQD must be cleared between reset assertion/deassertion, while
+/// unrelated MEC control bits and the graphics ring remain unchanged.
+fn gfx12_compute_timeout_resets_the_pipe_before_restoring() -> TestResult {
+    let (_pool, mut e, mut mes, aperture, target) = fixture();
+    run(e.initialize(&mut mes, aperture, target)).unwrap();
+    e.state = State::InterruptVerified;
+    e.io.memory[3072 + 2560] = 512;
+    e.io.complete = false;
+    let job = Job::new(3, 1, 0x1_0000_8001, &[(0x2_0000_1000, 64)]).unwrap();
+    assert_eq!(e.submit(Pipe::Compute, job), Ok(1));
+    let graphics = e.io.memory[..3072].to_vec();
+    e.io.hqd_stuck = true;
+    assert_eq!(run(e.reset_compute_hqd()), Ok(()));
+    let mut expected = vec![
+        (0x32, 0x42600, 3),
+        (4, 0x17f04, 2),
+        (4, 0x17dcc, 1),
+        (4, 0x4a410, 0xbc01000a),
+    ];
+    for q in 0..4 {
+        expected.extend([(4 | q << 8, 0x17eac, 0), (4 | q << 8, 0x17f04, 0)]);
+    }
+    expected.extend([(4, 0x4a410, 0xbc00000a), (0x32, 0x42600, 1)]);
+    assert_eq!(e.io.reset_trace, expected);
+    assert_eq!(e.io.index, 0x32);
+    assert_eq!(e.state, State::ComputeReset);
+    assert_eq!(
+        e.completed_job(Pipe::Compute),
+        Ok(0),
+        "reset is not completion"
+    );
+    assert_eq!(e.restore(Pipe::Compute), Ok(()));
+    assert_eq!(e.io.memory[..3072], graphics);
+    e.io.restored = true;
+    e.io.complete = true;
+    assert_eq!(e.submit_fence(Pipe::Compute), Ok(2));
+    assert_eq!(e.completed_job(Pipe::Compute), Ok(2));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_compute_timeout_resets_the_pipe_before_restoring
+);
+
+/// Test the synchronous fallback's failure boundaries without spending a
+/// dequeue timeout on every injected fault.
+fn gfx12_compute_pipe_reset_refuses_foreign_hqds_and_lost_writes() -> TestResult {
+    for case in 0..7 {
+        let (_pool, mut e, _mes, _aperture, _target) = fixture();
+        e.io.regs.insert(0x42600, 2);
+        e.io.hqd_resets.push((4, 0x17f04, 2));
+        e.io.hqd_stuck = true;
+        let expected = match case {
+            0 => {
+                e.io.active[2] = true;
+                Error::Busy
+            }
+            1 => {
+                e.io.regs.insert(0x4a410, 0xbc01000a);
+                Error::Busy
+            }
+            2 => {
+                e.io.drop_reset_write = Some((0x4a410, 0xbc01000a));
+                Error::Readback
+            }
+            3 => {
+                e.io.drop_reset_write = Some((0x17eac, 0));
+                Error::Readback
+            }
+            4 => {
+                e.io.drop_reset_write = Some((0x4a410, 0xbc00000a));
+                Error::Readback
+            }
+            5 => {
+                e.io.regs.insert(0x4a410, !0);
+                Error::DeviceGone
+            }
+            _ => {
+                e.authority.revoke();
+                Error::Revoked
+            }
+        };
+        assert_eq!(e.reset_compute_pipe(), Err(expected));
+        assert_eq!(e.io.index, 0x32);
+        if matches!(case, 0 | 1 | 5 | 6) {
+            assert!(e.io.reset_trace.is_empty(), "must refuse before writes");
+        }
+        if matches!(case, 3 | 4) {
+            assert_ne!(
+                e.io.regs[&0x4a410] & (1 << 16),
+                0,
+                "uncertain pipe stays reset"
+            );
+        }
+        assert!(e.io.bells.is_empty());
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_compute_pipe_reset_refuses_foreign_hqds_and_lost_writes
+);
+
+fn gfx12_compute_reset_quarantines_cancellation_and_revocation() -> TestResult {
+    for (safe_wait, revoke) in [(true, false), (false, false), (true, true), (false, true)] {
+        let (pool, mut e, mut mes, aperture, target) = fixture();
+        run(e.initialize(&mut mes, aperture, target)).unwrap();
+        e.state = State::InterruptVerified;
+        e.io.rlc_stuck = safe_wait;
+        e.io.hqd_stuck = true;
+        let cap = e.authority;
+        {
+            let mut future = core::pin::pin!(e.reset_compute_hqd());
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            if revoke {
+                cap.revoke();
+                assert_eq!(run(future), Err(Error::Revoked));
+            }
+        }
+        assert_eq!(
+            e.state,
+            if revoke {
+                State::Failed(Error::Revoked)
+            } else {
+                State::ResettingCompute
+            }
+        );
+        assert_eq!(e.io.index, 0x32);
+        let before = e.io.reset_trace.clone();
+        assert_eq!(run(e.reset_compute_hqd()), Err(Error::Busy));
+        assert_eq!(e.restore(Pipe::Compute), Err(Error::Busy));
+        assert_eq!(e.submit_fence(Pipe::Compute), Err(Error::Busy));
+        assert_eq!(e.submit_fence(Pipe::Graphics), Err(Error::Busy));
+        assert_eq!(e.io.reset_trace, before);
+        if safe_wait {
+            assert!(e.io.hqd_resets.is_empty());
+        }
+        assert!(!before.iter().any(|&(_, at, _)| at == 0x4a410));
+        drop(e);
+        assert_eq!(pool.available(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_compute_reset_quarantines_cancellation_and_revocation
+);
+
+fn gfx12_compute_reset_requires_rlc_acknowledgement() -> TestResult {
+    let (_pool, mut e, _mes, _aperture, _target) = fixture();
+    e.state = State::InterruptVerified;
+    e.io.rlc_stuck = true;
+    assert_eq!(run(e.reset_compute_hqd()), Err(Error::Timeout));
+    assert_eq!(e.state, State::Failed(Error::Timeout));
+    assert!(e.io.hqd_resets.is_empty());
+    assert_eq!(e.io.reset_trace, [(0x32, 0x42600, 3), (0x32, 0x42600, 1)]);
+    assert_eq!(run(e.reset_compute_hqd()), Err(Error::Busy));
+
+    let (_pool, mut e, _mes, _aperture, _target) = fixture();
+    e.state = State::InterruptVerified;
+    e.io.regs.insert(0x53000, 0); // Disabled RLC cannot acknowledge commands.
+    assert_eq!(run(e.reset_compute_hqd()), Ok(()));
+    assert_eq!(e.io.reset_trace, [(4, 0x17f04, 2), (4, 0x17dcc, 1)]);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_compute_reset_requires_rlc_acknowledgement
 );

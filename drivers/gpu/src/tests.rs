@@ -8487,6 +8487,9 @@ fn smoke_amdgpu_discrete_is_not_an_apu() -> TestResult {
         gc: Some(gc),
         ip_blocks: alloc::vec![ip(HW_ID_GC, 10, 3, 2)],
         navi22: Default::default(),
+        reference_clock_10khz: 0,
+        vram_type: 0,
+        vram_bit_width: 0,
     };
 
     // VRAM_GTT reports both, and they differ.
@@ -9387,6 +9390,10 @@ fn smoke_amdgpu_info_reports_the_sourced_device() -> TestResult {
         gc: Some(gc),
         ip_blocks: alloc::vec![ip(HW_ID_GC, 11, 0, 1), ip(HW_ID_SDMA0, 6, 0, 1)],
         navi22: Default::default(),
+        // 100 MHz, the usual SOC reference.
+        reference_clock_10khz: 10_000,
+        vram_type: u::AMDGPU_VRAM_TYPE_GDDR6,
+        vram_bit_width: 256,
     };
 
     let decode = |bytes: &[u8]| -> u::DrmAmdgpuInfoDevice {
@@ -9414,6 +9421,12 @@ fn smoke_amdgpu_info_reports_the_sourced_device() -> TestResult {
     let d = decode(&bytes);
     if d.device_id != 0x15BF {
         return TestResult::Fail("DEV_INFO did not report the PCI device id");
+    }
+    if d.vram_type != u::AMDGPU_VRAM_TYPE_GDDR6 || d.vram_bit_width != 256 {
+        return TestResult::Fail("vram_type / vram_bit_width are the snapshot's");
+    }
+    if d.gpu_counter_freq != 100_000 {
+        return TestResult::Fail("gpu_counter_freq must be the reference clock in kHz");
     }
     // Mesa keys ASIC behaviour off this; GFX 11.0.1 is family 148.
     if d.family != u::AMDGPU_FAMILY_GC_11_0_1 {
@@ -9490,8 +9503,8 @@ fn smoke_amdgpu_info_reports_the_sourced_device() -> TestResult {
     if max_alloc != total / 4 * 3 {
         return TestResult::Fail("max_allocation should be three quarters of the heap");
     }
-    if gtt_total != 0 {
-        return TestResult::Fail("GTT must report zero while no GART manager exists");
+    if gtt_total == 0 || gtt_total != crate::amdgpu_gem::gtt_limit() {
+        return TestResult::Fail("GTT must report the GEM system-memory limit");
     }
 
     // HW_IP_INFO carries the discovered IP version and a ZERO ring mask —
@@ -10310,8 +10323,6 @@ fn smoke_amdgpu_vm_page_tables_are_walkable() -> TestResult {
     let Some(object) = gem.object(handle) else {
         return TestResult::Fail("setup: the created object is not in the table");
     };
-    let phys = object.phys;
-
     let va_cmd = DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_VA;
     let req = |op: u32, flags: u32, va: u64, offset: u64, size: u64| {
         let mut r = [0u8; 40];
@@ -10374,7 +10385,8 @@ fn smoke_amdgpu_vm_page_tables_are_walkable() -> TestResult {
         }
     }
 
-    // The leaves: one per page, each pointing at its own frame.
+    // The leaves: one per page, each pointing at its own frame (three
+    // pages are two buddy chunks, so not necessarily contiguous).
     for page in 0..PAGES {
         let va = BASE_VA + page * GPU_PAGE_SIZE;
         let Some(pte) = state.leaf_entry(va) else {
@@ -10383,7 +10395,7 @@ fn smoke_amdgpu_vm_page_tables_are_walkable() -> TestResult {
         if pte & vm::PTE_VALID == 0 {
             return TestResult::Fail("a mapped page's PTE is not valid");
         }
-        if pte & !0xFFFu64 & vm::GMC_HOLE_MASK != phys + page * GPU_PAGE_SIZE {
+        if Some(pte & !0xFFFu64 & vm::GMC_HOLE_MASK) != object.gpu_at(page * GPU_PAGE_SIZE) {
             return TestResult::Fail("a PTE does not point at the buffer's frame");
         }
         if pte & vm::PTE_READABLE == 0 || pte & vm::PTE_WRITEABLE == 0 {
@@ -11181,6 +11193,7 @@ fn smoke_amdgpu_gem_places_buffers_in_card_vram() -> TestResult {
             pool,
             fb_base,
             fb_offset: 0x1_0000_0000,
+            unmapped: None,
         },
     );
     let gem = GemState::for_card(card);
@@ -11193,6 +11206,15 @@ fn smoke_amdgpu_gem_places_buffers_in_card_vram() -> TestResult {
             .iter()
             .all(|b| *b == 0);
         if o.system || o.phys != phys || o.gpu != 0x1_0000_0000 || !zeroed {
+            return None;
+        }
+        // MEMORY's usage: two of the heap's four pages are taken.
+        if crate::amdgpu_gem::vram_heap_usage(card)
+            != Some(crate::amdgpu_gem::HeapUsage {
+                visible: (4 * P, 2 * P),
+                unmapped: (0, 0),
+            })
+        {
             return None;
         }
         gem_va_on(
@@ -11251,6 +11273,187 @@ fn smoke_amdgpu_gem_places_buffers_in_card_vram() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu_vm",
     smoke_amdgpu_gem_places_buffers_in_card_vram
+);
+
+/// A fake engine clear for `smoke_amdgpu_gem_places_hidden_buffers_past_the_bar`:
+/// records each clear and hands back one shared, CPU-controlled fence.
+#[derive(Debug)]
+struct FakeVramClear {
+    calls: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(u64, u64)>>,
+    done: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
+    refuse: core::sync::atomic::AtomicBool,
+}
+struct FakeClearFence(alloc::sync::Arc<core::sync::atomic::AtomicBool>);
+impl narf_filesystem::DrmFence for FakeClearFence {
+    fn is_signalled(&self) -> bool {
+        self.0.load(core::sync::atomic::Ordering::Acquire)
+    }
+    fn wait(&self, _: u64) -> bool {
+        self.is_signalled()
+    }
+}
+impl crate::amdgpu_gem::VramClear for FakeVramClear {
+    fn clear(
+        &self,
+        address: u64,
+        bytes: u64,
+    ) -> Result<alloc::sync::Arc<dyn narf_filesystem::DrmFence>, narf_filesystem::FsError> {
+        if self.refuse.load(core::sync::atomic::Ordering::Relaxed) {
+            return Err(narf_filesystem::FsError::NoDevice);
+        }
+        self.calls.lock().push((address, bytes));
+        Ok(alloc::sync::Arc::new(FakeClearFence(self.done.clone())))
+    }
+}
+
+/// A `NO_CPU_ACCESS` VRAM buffer on a card with VRAM past its BAR lands
+/// there: no CPU address or mapping, entries carrying its physical VRAM
+/// address, and the engine's clear as its KERNEL fence, which mapping it
+/// makes every job of the space wait for. Other VRAM buffers stay in the
+/// visible heap, and a hidden one falls back there when the rest is full.
+fn smoke_amdgpu_gem_places_hidden_buffers_past_the_bar() -> TestResult {
+    use crate::amdgpu_gem::{
+        register_vram_heap, unregister_vram_heap, GemState, UnmappedHeap, VramHeap,
+    };
+    use crate::amdgpu_uapi as u;
+    use crate::amdgpu_vm::{VmState, GPU_PAGE_SIZE as P, PTE_SYSTEM, PTE_VALID};
+    use core::sync::atomic::Ordering;
+    use narf_filesystem::dma_buf::DmaResvUsage;
+    let create = |gem: &GemState, bytes: u64, flags: u32| {
+        let mut create = [0u8; 32];
+        create[0..8].copy_from_slice(&bytes.to_le_bytes());
+        create[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_VRAM as u64).to_le_bytes());
+        create[24..32].copy_from_slice(&(flags as u64).to_le_bytes());
+        crate::amdgpu_gem::dispatch(
+            crate::drm_uapi::DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+            create.as_mut_ptr() as usize,
+            gem,
+        )
+        .map(|_| u32::from_le_bytes(create[0..4].try_into().unwrap()))
+    };
+    let hidden = u::AMDGPU_GEM_CREATE_NO_CPU_ACCESS;
+    let Ok(frame) = narf_memory::frame::alloc_pages_on(0, 2) else {
+        return TestResult::Fail("setup: frames");
+    };
+    let phys = frame.start_address().raw();
+    let map = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(phys),
+        virt: narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>() as u64,
+        len: 4 * P,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    let fb_base = 0x80_0000_0000u64;
+    let past = fb_base + 0x1000_0000;
+    // SAFETY: the window is owned by this test; the unmapped range is
+    // bookkeeping only, which nothing but the fake engine "touches".
+    let pools = unsafe {
+        (
+            crate::amdgpu_vram::Pool::from_owned_range(map, fb_base),
+            crate::amdgpu_vram::UnmappedPool::from_owned(past, 4 * P, &[]),
+        )
+    };
+    let (Ok(pool), Ok(unmapped)) = pools else {
+        return TestResult::Fail("setup: pools");
+    };
+    let engine = alloc::sync::Arc::new(FakeVramClear {
+        calls: narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+        done: Default::default(),
+        refuse: Default::default(),
+    });
+    let card = 0x7fff_0001;
+    register_vram_heap(
+        card,
+        VramHeap {
+            pool,
+            fb_base,
+            fb_offset: 0x1_0000_0000,
+            unmapped: Some(UnmappedHeap {
+                pool: unmapped.clone(),
+                clear: engine.clone(),
+            }),
+        },
+    );
+    let gem = GemState::for_card(card);
+    let vm = VmState::new();
+    let result = (|| -> Result<(), &'static str> {
+        let h = create(&gem, 2 * P, hidden).map_err(|_| "hidden create")?;
+        let o = gem.object(h).ok_or("hidden object")?;
+        if o.system || o.cpu_visible() || o.phys != 0 || o.gpu != 0x1_1000_0000 {
+            return Err("hidden buffer not past the BAR");
+        }
+        if *engine.calls.lock() != [(past, 2 * P)] || unmapped.available() != 2 * P {
+            return Err("hidden buffer not cleared by the engine");
+        }
+        if o.dma_buf().resv.fences(DmaResvUsage::Kernel).len() != 1 {
+            return Err("clear is not the buffer's kernel fence");
+        }
+        let mut mmap = [0u8; 16];
+        mmap[0..4].copy_from_slice(&h.to_le_bytes());
+        let mapped = crate::amdgpu_gem::dispatch(
+            crate::drm_uapi::DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_MMAP,
+            mmap.as_mut_ptr() as usize,
+            &gem,
+        );
+        if mapped != Err(narf_filesystem::FsError::OperationNotPermitted)
+            || gem.mmap_frames((h as u64) << 12, P as usize).is_ok()
+            || o.frames(0, P as usize).is_ok()
+            || o.load_u64(0).is_some()
+        {
+            return Err("CPU reached a hidden buffer");
+        }
+        gem_va_on(&vm, &gem, u::AMDGPU_VA_OP_MAP, h, 0x3_0000_0000, 0, 2 * P).map_err(|_| "map")?;
+        let e = vm.leaf_entry(0x3_0000_1000).ok_or("entry")?;
+        if e & PTE_VALID == 0 || e & PTE_SYSTEM != 0 || e & 0xffff_ffff_f000 != 0x1_1000_1000 {
+            return Err("hidden entry");
+        }
+        if vm.kernel_fences().len() != 1 {
+            return Err("mapping did not make the space wait for the clear");
+        }
+        engine.done.store(true, Ordering::Release);
+        if !vm.kernel_fences().is_empty()
+            || !o.dma_buf().resv.fences(DmaResvUsage::Kernel).is_empty()
+        {
+            return Err("signalled clear still waited on");
+        }
+        // Without NO_CPU_ACCESS, VRAM stays CPU-visible.
+        let v = create(&gem, P, 0).map_err(|_| "visible create")?;
+        if !gem.object(v).ok_or("visible")?.cpu_visible() || engine.calls.lock().len() != 1 {
+            return Err("CPU-accessible buffer placed past the BAR");
+        }
+        // Too big for what is left past the BAR: the visible heap takes it.
+        let big = create(&gem, 3 * P, hidden).map_err(|_| "fallback create")?;
+        if !gem.object(big).ok_or("fallback")?.cpu_visible() {
+            return Err("hidden buffer did not fall back to the visible heap");
+        }
+        // A clear the engine refuses fails the create and frees the range.
+        engine.refuse.store(true, Ordering::Relaxed);
+        if create(&gem, P, hidden).is_ok() || unmapped.available() != 2 * P {
+            return Err("create survived a refused clear");
+        }
+        engine.refuse.store(false, Ordering::Relaxed);
+        // Unmapped and closed, its range returns.
+        gem_va_on(&vm, &gem, u::AMDGPU_VA_OP_UNMAP, 0, 0x3_0000_0000, 0, 2 * P)
+            .map_err(|_| "unmap")?;
+        drop(o);
+        let mut close = [0u8; 8];
+        close[0..4].copy_from_slice(&h.to_le_bytes());
+        let _ = crate::amdgpu_gem::dispatch(0x09, close.as_mut_ptr() as usize, &gem);
+        if unmapped.available() != 4 * P {
+            return Err("closed hidden buffer kept its range");
+        }
+        Ok(())
+    })();
+    unregister_vram_heap(card);
+    drop(gem);
+    narf_memory::frame::free_pages(frame, 2);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_vm",
+    smoke_amdgpu_gem_places_hidden_buffers_past_the_bar
 );
 
 /// `AMDGPU_CS`'s parser against the input a hostile client would send.
@@ -11433,6 +11636,16 @@ fn smoke_amdgpu_cs_parser_rejects_hostile_input() -> TestResult {
     {
         return TestResult::Fail("a CE submission must be refused");
     }
+    if run(&build(
+        IB_VA,
+        256,
+        u::AMDGPU_HW_IP_GFX,
+        u::AMDGPU_IB_FLAGS_SECURE,
+    ))
+    .is_ok()
+    {
+        return TestResult::Fail("a SECURE submission without TMZ must be refused");
+    }
     if run(&build(IB_VA, 256, u::AMDGPU_HW_IP_GFX, 1 << 20)).is_ok() {
         return TestResult::Fail("an undefined IB flag must be refused");
     }
@@ -11592,19 +11805,28 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
     struct Fake {
         completed: AtomicU64,
         seen: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(u64, u32, Option<u64>)>>,
+        /// The last job's context health, and a job that "hung".
+        health:
+            narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<crate::amdgpu_ctx::Health>>>,
+        hung: AtomicU64,
     }
     impl crate::amdgpu_cs::Submitter for Fake {
         fn submit<'a>(
             &'a self,
             vm: &'a VmState,
             s: &'a crate::amdgpu_cs::Submission,
+            health: &'a alloc::sync::Arc<crate::amdgpu_ctx::Health>,
         ) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<u64, FsError>> + Send + 'a>>
         {
             Box::pin(async move {
+                *self.health.lock() = Some(health.clone());
                 let mut seen = self.seen.lock();
                 seen.push((s.ibs[0].va_start, s.ibs[0].length_dw, vm.root_pde()));
                 Ok(seen.len() as u64)
             })
+        }
+        fn error(&self, seq: u64) -> Option<FsError> {
+            (seq != 0 && self.hung.load(Ordering::SeqCst) == seq).then_some(FsError::TimedOut)
         }
         fn signalled(&self, seq: u64) -> bool {
             self.completed.load(Ordering::SeqCst) >= seq
@@ -11755,9 +11977,33 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
     let fake = alloc::sync::Arc::new(Fake {
         completed: AtomicU64::new(0),
         seen: narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+        health: narf_lib::sync::IrqSafeSpinLock::new(None),
+        hung: AtomicU64::new(0),
     });
     register_submitter(card, fake.clone());
     let result = (|| {
+        // AMDGPU_INFO_MAX_IBS: per IP type, what one CS may carry on the
+        // card's rings (the fake runs only GFX, one IB at a time).
+        let mut max_ibs = [0u32; u::AMDGPU_HW_IP_NUM as usize];
+        let mut info = [0u8; core::mem::size_of::<u::DrmAmdgpuInfo>()];
+        info[0..8].copy_from_slice(&(max_ibs.as_mut_ptr() as u64).to_le_bytes());
+        info[8..12].copy_from_slice(&(core::mem::size_of_val(&max_ibs) as u32).to_le_bytes());
+        info[12..16].copy_from_slice(&u::AMDGPU_INFO_MAX_IBS.to_le_bytes());
+        let info_cmd = DRM_COMMAND_BASE + u::DRM_AMDGPU_INFO;
+        let ok = crate::amdgpu_info::dispatch_for(
+            info_cmd,
+            info.as_mut_ptr() as usize,
+            Some(&VmState::for_card(card)),
+        );
+        let mut want = [0u32; u::AMDGPU_HW_IP_NUM as usize];
+        want[u::AMDGPU_HW_IP_GFX as usize] = 1;
+        if ok.is_err()
+            || max_ibs != want
+            || crate::amdgpu_info::dispatch_for(info_cmd, info.as_mut_ptr() as usize, Some(&state))
+                != Err(FsError::InvalidData)
+        {
+            return Some("MAX_IBS from the card's submitter");
+        }
         if run(cs_cmd, &mut cs).is_err() || u64::from_le_bytes(cs[0..8].try_into().unwrap()) != 1 {
             return Some("CS handle");
         }
@@ -12048,6 +12294,50 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
             ) {
                 return Some("an EXPLICIT_SYNC buffer does not wait");
             }
+        }
+        // The engine gives up on the last job: WAIT_CS reports ETIME, the
+        // context reads as guilty and reset, and refuses further jobs.
+        let last = fake.seen.lock().len() as u64;
+        fake.hung.store(last, Ordering::SeqCst);
+        fake.completed.store(last, Ordering::SeqCst);
+        fake.health.lock().as_ref()?.mark_guilty();
+        let mut w = wait_req(last, ctx_id);
+        if run(wait_cmd, &mut w) != Err(FsError::TimedOut) {
+            return Some("WAIT_CS of a hung job");
+        }
+        for (op, at, want) in [
+            (
+                u::AMDGPU_CTX_OP_QUERY_STATE2,
+                0..8,
+                u64::from(u::AMDGPU_CTX_QUERY2_FLAGS_RESET | u::AMDGPU_CTX_QUERY2_FLAGS_GUILTY),
+            ),
+            (
+                u::AMDGPU_CTX_OP_QUERY_STATE,
+                12..16,
+                u64::from(u::AMDGPU_CTX_UNKNOWN_RESET),
+            ),
+        ] {
+            let mut q = [0u8; core::mem::size_of::<u::DrmAmdgpuCtx>()];
+            q[0..4].copy_from_slice(&op.to_le_bytes());
+            q[8..12].copy_from_slice(&ctx_id.to_le_bytes());
+            ctx_dispatch(
+                DRM_COMMAND_BASE + u::DRM_AMDGPU_CTX,
+                q.as_mut_ptr() as usize,
+                &ctx,
+                false,
+            )
+            .ok()?;
+            let mut got = [0u8; 8];
+            got[..at.len()].copy_from_slice(&q[at]);
+            if u64::from_le_bytes(got) != want {
+                return Some("context state after a hang");
+            }
+        }
+        let mut c = cs_with(&[]);
+        if run(cs_cmd, &mut c.req) != Err(FsError::TimedOut)
+            || fake.seen.lock().len() as u64 != last
+        {
+            return Some("a guilty context submitted again");
         }
         None
     })();
@@ -13203,6 +13493,181 @@ kernel_test_in!(
     smoke_amdgpu_gem_metadata_round_trips
 );
 
+/// Sparse binding as RADV drives it: a PRT range with no buffer (handle 0),
+/// whose entries carry PRT without VALID; REPLACE commits a buffer into
+/// part of it and REPLACE with PRT decommits it again; CLEAR drops it. A
+/// non-PRT map still needs a buffer.
+fn smoke_amdgpu_vm_prt_ranges_back_sparse_binding() -> TestResult {
+    use crate::amdgpu_gem::GemState;
+    use crate::amdgpu_uapi as u;
+    use crate::amdgpu_vm::{self as vm, VmState, GPU_PAGE_SIZE as P, PTE_PRT, PTE_VALID};
+    use crate::drm_uapi::DRM_COMMAND_BASE;
+    let gem = GemState::new();
+    let state = VmState::new();
+    let va_op = |op: u32, flags: u32, handle: u32, va: u64, size: u64| {
+        let mut r = [0u8; 40];
+        r[0..4].copy_from_slice(&handle.to_le_bytes());
+        r[8..12].copy_from_slice(&op.to_le_bytes());
+        r[12..16].copy_from_slice(&flags.to_le_bytes());
+        r[16..24].copy_from_slice(&va.to_le_bytes());
+        r[32..40].copy_from_slice(&size.to_le_bytes());
+        vm::dispatch(
+            DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_VA,
+            r.as_mut_ptr() as usize,
+            &state,
+            &gem,
+        )
+    };
+    const BASE: u64 = 0x5_0000_0000;
+    const RW: u32 = u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_PAGE_WRITEABLE;
+    let prt = |va| {
+        state
+            .leaf_entry(va)
+            .is_some_and(|e| e & PTE_PRT != 0 && e & PTE_VALID == 0)
+    };
+    let result = (|| -> Result<(), &'static str> {
+        if va_op(u::AMDGPU_VA_OP_MAP, RW, 0, BASE, 4 * P).is_ok() {
+            return Err("a non-PRT map without a buffer");
+        }
+        va_op(u::AMDGPU_VA_OP_MAP, u::AMDGPU_VM_PAGE_PRT, 0, BASE, 4 * P).map_err(|_| "PRT map")?;
+        if !(0..4).all(|i| prt(BASE + i * P)) || state.mapped_object(BASE).is_some() {
+            return Err("PRT entries");
+        }
+        let h = gem_create_on(&gem, 2 * P, u::AMDGPU_GEM_DOMAIN_GTT).map_err(|_| "create")?;
+        let o = gem.object(h).ok_or("object")?;
+        va_op(u::AMDGPU_VA_OP_REPLACE, RW, h, BASE + P, 2 * P).map_err(|_| "commit")?;
+        for i in 1..3 {
+            let e = state.leaf_entry(BASE + i * P).ok_or("committed entry")?;
+            if e & PTE_VALID == 0
+                || e & PTE_PRT != 0
+                || Some(e & 0xffff_ffff_f000) != o.gpu_at((i - 1) * P)
+            {
+                return Err("committed pages");
+            }
+        }
+        if !prt(BASE) || !prt(BASE + 3 * P) || state.mapped_object(BASE + P).is_none() {
+            return Err("PRT edges around a commit");
+        }
+        va_op(
+            u::AMDGPU_VA_OP_REPLACE,
+            u::AMDGPU_VM_PAGE_PRT,
+            0,
+            BASE + P,
+            2 * P,
+        )
+        .map_err(|_| "decommit")?;
+        if !(0..4).all(|i| prt(BASE + i * P)) || state.mapped_object(BASE + P).is_some() {
+            return Err("decommitted pages");
+        }
+        va_op(u::AMDGPU_VA_OP_CLEAR, 0, 0, BASE, 4 * P).map_err(|_| "clear")?;
+        if (0..4).any(|i| {
+            state
+                .leaf_entry(BASE + i * P)
+                .is_some_and(|e| e != 0 && e & PTE_PRT != 0)
+        }) || state.lookup(BASE).is_some()
+            || state.table_count() != 0
+        {
+            return Err("cleared range");
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_vm",
+    smoke_amdgpu_vm_prt_ranges_back_sparse_binding
+);
+
+/// GTT buffers are buddy chunks covering exactly their pages: three pages
+/// are two chunks, 33 MiB (past the allocator's 32 MiB blocks) works, and
+/// the frames, the GPU entries and CPU access agree page by page. Usage
+/// is charged against half of RAM and returned on close.
+fn smoke_amdgpu_gem_system_buffers_span_chunks() -> TestResult {
+    use crate::amdgpu_gem::{gtt_limit, gtt_used, GemState};
+    use crate::amdgpu_uapi as u;
+    use crate::amdgpu_vm::{VmState, GPU_PAGE_SIZE as P};
+    let gem = GemState::new();
+    let vm = VmState::new();
+    let close = |h: u32| {
+        let mut req = [0u8; 8];
+        req[0..4].copy_from_slice(&h.to_le_bytes());
+        crate::amdgpu_gem::dispatch(0x09, req.as_mut_ptr() as usize, &gem)
+    };
+    let before = gtt_used();
+    let result = (|| -> Result<(), &'static str> {
+        let h = gem_create_on(&gem, 3 * P - 100, u::AMDGPU_GEM_DOMAIN_GTT).map_err(|_| "create")?;
+        let o = gem.object(h).ok_or("object")?;
+        if o.byte_len != 3 * P || gtt_used() != before + 3 * P {
+            return Err("three pages charged as three pages");
+        }
+        let frames = o.frames(0, 3 * P as usize).map_err(|_| "frames")?;
+        let pages: alloc::vec::Vec<_> = (0..3).map(|i| o.gpu_at(i * P)).collect();
+        if pages
+            != frames
+                .iter()
+                .map(|&f| Some(f))
+                .collect::<alloc::vec::Vec<_>>()
+            || o.gpu_at(3 * P).is_some()
+            || frames[0] != o.phys
+        {
+            return Err("frames and GPU addresses disagree");
+        }
+        // CPU access crosses into the second chunk.
+        o.store_u64(2 * P + 8, 0x1122_3344_5566_7788)
+            .ok_or("store")?;
+        // SAFETY: the third page is this buffer's and kernel-mapped.
+        let raw = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(frames[2] + 8).kernel_ptr::<u64>())
+        };
+        if raw != 0x1122_3344_5566_7788 || o.load_u64(2 * P + 8) != Some(raw) {
+            return Err("CPU access to a later chunk");
+        }
+        gem_va_on(&vm, &gem, u::AMDGPU_VA_OP_MAP, h, 0x4_0000_0000, 0, 3 * P).map_err(|_| "map")?;
+        for i in 0..3 {
+            let e = vm.leaf_entry(0x4_0000_0000 + i * P).ok_or("entry")?;
+            if e & 0xffff_ffff_f000 != frames[i as usize] {
+                return Err("an entry points at the wrong chunk");
+            }
+        }
+        gem_va_on(&vm, &gem, u::AMDGPU_VA_OP_UNMAP, 0, 0x4_0000_0000, 0, 3 * P)
+            .map_err(|_| "unmap")?;
+        drop(o);
+        close(h).map_err(|_| "close")?;
+        // Larger than any single buddy block.
+        let big = 33 << 20;
+        let b = gem_create_on(&gem, big, u::AMDGPU_GEM_DOMAIN_GTT).map_err(|_| "33 MiB buffer")?;
+        let o = gem.object(b).ok_or("big object")?;
+        let frames = o.frames(0, big as usize).map_err(|_| "big frames")?;
+        if frames.len() as u64 != big / P || frames.iter().any(|&f| f == 0 || f % P != 0) {
+            return Err("33 MiB of frames");
+        }
+        drop(o);
+        close(b).map_err(|_| "close big")?;
+        if gtt_used() != before {
+            return Err("closed buffers kept their GTT charge");
+        }
+        // Past the limit: refused, and nothing charged.
+        if gem_create_on(&gem, gtt_limit() + P, u::AMDGPU_GEM_DOMAIN_GTT)
+            != Err(narf_filesystem::FsError::NoSpace)
+            || gtt_used() != before
+        {
+            return Err("GTT limit");
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_vm",
+    smoke_amdgpu_gem_system_buffers_span_chunks
+);
+
 /// A CPU mapping holds its buffer (`GemState::mapping_object`, which the
 /// render and card nodes hand the mapping as its lifetime): GEM_CLOSE drops
 /// the handle, but the pages stay until the mapping goes.
@@ -13284,7 +13749,28 @@ fn smoke_amdgpu_gem_prime_export_import() -> TestResult {
     let Some(object) = exporter.object(handle) else {
         return TestResult::Fail("setup: object");
     };
-    let file = crate::drm_devfs_bridge::amdgpu_dma_buf_file(object.clone());
+    let Ok(file) = crate::drm_devfs_bridge::amdgpu_dma_buf_file(object.clone()) else {
+        return TestResult::Fail("export");
+    };
+    // A VM_ALWAYS_VALID buffer stays in its open (amdgpu_gem_prime_export).
+    let mut local = [0u8; 32];
+    local[0..8].copy_from_slice(&4096u64.to_le_bytes());
+    local[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+    local[24..32].copy_from_slice(&(u::AMDGPU_GEM_CREATE_VM_ALWAYS_VALID as u64).to_le_bytes());
+    let local_object = dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+        local.as_mut_ptr() as usize,
+        &exporter,
+    )
+    .ok()
+    .and_then(|_| exporter.object(u32::from_le_bytes(local[0..4].try_into().unwrap())));
+    if local_object
+        .map(crate::drm_devfs_bridge::amdgpu_dma_buf_file)
+        .map(|r| r.err())
+        != Some(Some(narf_filesystem::FsError::OperationNotPermitted))
+    {
+        return TestResult::Fail("a VM_ALWAYS_VALID buffer was exported");
+    }
     let weak = alloc::sync::Arc::downgrade(&object);
     drop(object);
     let mut close = [0u8; 8];
@@ -13355,6 +13841,7 @@ fn smoke_amdgpu_info_available_rings_follow_the_submitter() -> TestResult {
             &'a self,
             _: &'a crate::amdgpu_vm::VmState,
             _: &'a crate::amdgpu_cs::Submission,
+            _: &'a alloc::sync::Arc<crate::amdgpu_ctx::Health>,
         ) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<u64, FsError>> + Send + 'a>>
         {
             Box::pin(async { Err(FsError::Unsupported) })

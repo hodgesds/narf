@@ -518,7 +518,9 @@ const RINGS: usize = 8;
 #[derive(Clone, Debug)]
 struct Entry {
     mapping: Mapping,
-    object: alloc::sync::Arc<crate::amdgpu_gem::GemObject>,
+    /// The buffer behind it; none for a PRT range (`AMDGPU_VM_PAGE_PRT`),
+    /// which Linux maps through the open's buffer-less `prt_va`.
+    object: Option<alloc::sync::Arc<crate::amdgpu_gem::GemObject>>,
 }
 
 /// Per-open GPU address space.
@@ -550,6 +552,24 @@ pub struct VmState {
     /// A card-wide identity for VMID reuse (`amdgpu_vmid::VmidManager`),
     /// never shared with another space; assigned on first use.
     owner: core::sync::atomic::AtomicU64,
+    /// Kernel work mapped buffers wait on (a clear of fresh VRAM), which
+    /// every job in this space waits for: Linux's VM update syncs to its
+    /// BOs' KERNEL fences, and each job to the VM update.
+    kernel_fences: KernelFences,
+}
+
+/// [`VmState`]'s kernel fences (`dyn DrmFence` has no `Debug`).
+struct KernelFences(IrqSafeSpinLock<Vec<alloc::sync::Arc<dyn narf_filesystem::DrmFence>>>);
+impl core::ops::Deref for KernelFences {
+    type Target = IrqSafeSpinLock<Vec<alloc::sync::Arc<dyn narf_filesystem::DrmFence>>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl core::fmt::Debug for KernelFences {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{} kernel fences", self.0.lock().len())
+    }
 }
 
 impl Drop for VmState {
@@ -617,6 +637,27 @@ impl VmState {
             .unwrap_or_default()
     }
 
+    /// Make every later job in this space wait for `fences` too.
+    pub fn depend_on(&self, fences: Vec<alloc::sync::Arc<dyn narf_filesystem::DrmFence>>) {
+        if !fences.is_empty() {
+            self.kernel_fences.lock().extend(fences);
+        }
+    }
+
+    /// The kernel fences a job here must still wait for, forgetting those
+    /// that have signalled.
+    pub fn kernel_fences(&self) -> Vec<alloc::sync::Arc<dyn narf_filesystem::DrmFence>> {
+        let held = self.kernel_fences.lock().clone();
+        // Sampled unlocked: a driver fence may take its device's locks.
+        let (done, pending): (Vec<_>, Vec<_>) = held.into_iter().partition(|f| f.is_signalled());
+        if !done.is_empty() {
+            self.kernel_fences
+                .lock()
+                .retain(|f| !done.iter().any(|d| alloc::sync::Arc::ptr_eq(d, f)));
+        }
+        pending
+    }
+
     /// The last job submitted in this space on each ring that ran one.
     pub fn last_jobs(&self) -> Vec<u64> {
         self.last_job
@@ -655,6 +696,7 @@ impl VmState {
             pasid: IrqSafeSpinLock::new(None),
             tlb_seq: core::sync::atomic::AtomicU64::new(0),
             owner: core::sync::atomic::AtomicU64::new(0),
+            kernel_fences: KernelFences(IrqSafeSpinLock::new(Vec::new())),
         }
     }
 
@@ -717,7 +759,7 @@ impl VmState {
             .range(..=va)
             .next_back()
             .filter(|(_, e)| va < e.mapping.va.saturating_add(e.mapping.size))
-            .map(|(_, e)| e.object.clone())
+            .and_then(|(_, e)| e.object.clone())
     }
 
     fn overlaps(map: &BTreeMap<u64, Entry>, va: u64, size: u64) -> bool {
@@ -739,7 +781,7 @@ impl VmState {
     fn insert(
         &self,
         mapping: Mapping,
-        object: alloc::sync::Arc<crate::amdgpu_gem::GemObject>,
+        object: Option<alloc::sync::Arc<crate::amdgpu_gem::GemObject>>,
         replace: bool,
     ) -> Result<(), FsError> {
         let removed = {
@@ -784,7 +826,7 @@ impl VmState {
             let Some(Entry { mapping: m, object }) = map.remove(&k) else {
                 continue;
             };
-            removed.push(object.clone());
+            removed.extend(object.clone());
             let m_end = m.va.saturating_add(m.size);
             if m.va < va {
                 let left = Mapping {
@@ -835,7 +877,7 @@ impl VmState {
             Some(_) => return Err(FsError::InvalidData),
             None => return Err(FsError::NotFound),
         };
-        Ok(removed.map(|e| e.object).into_iter().collect())
+        Ok(removed.and_then(|e| e.object).into_iter().collect())
     }
 
     /// `amdgpu_vm_bo_clear_mappings` for `AMDGPU_VA_OP_CLEAR`: as `unmap`,
@@ -954,13 +996,35 @@ pub fn dispatch(
         _ => return Err(FsError::InvalidData),
     }
 
-    // PRT has no backing object and no page-table write to make; refuse it
-    // rather than record a mapping nothing can honour.
-    if flags & uapi::AMDGPU_VM_PAGE_PRT != 0 {
-        return Err(FsError::Unsupported);
-    }
-
     match operation {
+        // amdgpu_gem_va_ioctl: a PRT range names no buffer (the handle is
+        // not looked up) and maps through the open's `prt_va`; its entries
+        // carry PRT without VALID, so the GPU reads zeros and drops writes
+        // there instead of faulting — Vulkan's sparse residency.
+        uapi::AMDGPU_VA_OP_MAP | uapi::AMDGPU_VA_OP_REPLACE
+            if flags & uapi::AMDGPU_VM_PAGE_PRT != 0 =>
+        {
+            if size == 0 || va & (GPU_PAGE_SIZE - 1) != 0 || size & (GPU_PAGE_SIZE - 1) != 0 {
+                return Err(FsError::InvalidData);
+            }
+            let replace = operation == uapi::AMDGPU_VA_OP_REPLACE;
+            if replace {
+                vm.dematerialise(va, size);
+            }
+            let mapping = Mapping {
+                va,
+                size,
+                gem_handle: 0,
+                offset: 0,
+                vm_flags: flags,
+            };
+            vm.insert(mapping, None, replace)?;
+            if let Err(error) = vm.materialise(&mapping, &|_| Some(0), false, 0) {
+                vm.dematerialise(va, size);
+                let _ = vm.unmap(va, size);
+                return Err(error);
+            }
+        }
         uapi::AMDGPU_VA_OP_MAP | uapi::AMDGPU_VA_OP_REPLACE => {
             // A mapping must name a live buffer in THIS open's table, and must
             // fit inside it: `offset + size` past the end would map pages the
@@ -991,11 +1055,12 @@ pub fn dispatch(
                 offset,
                 vm_flags: flags,
             };
-            vm.insert(mapping, object.clone(), replace)?;
+            vm.insert(mapping, Some(object.clone()), replace)?;
             // The buffer's creation flags can force the memory type (and on
             // GMC 12 set DCC), whatever the mapping asked for; its placement
             // decides the entry address and whether it is system memory.
-            if let Err(error) = vm.materialise(&mapping, object.gpu, object.system, object.flags) {
+            let at = |offset| object.gpu_at(offset);
+            if let Err(error) = vm.materialise(&mapping, &at, object.system, object.flags) {
                 // Leave neither half-written tables nor a mapping record
                 // claiming translations that do not exist.
                 if let Ok(removed) = vm.unmap(va, size) {
@@ -1005,6 +1070,13 @@ pub fn dispatch(
                 }
                 return Err(error);
             }
+            // Jobs that can now reach the buffer wait for its kernel work.
+            vm.depend_on(
+                object
+                    .dma_buf()
+                    .resv
+                    .fences(narf_filesystem::dma_buf::DmaResvUsage::Kernel),
+            );
         }
         // The buffer outlives its entries: amdgpu_vm_bo_unmap only moves the
         // mapping to the freed list; amdgpu_vm_clear_freed clears the PTEs
@@ -1169,7 +1241,7 @@ impl VmState {
     fn materialise(
         &self,
         mapping: &Mapping,
-        phys_base: u64,
+        address: &dyn Fn(u64) -> Option<u64>,
         system: bool,
         bo_flags: u64,
     ) -> Result<(), FsError> {
@@ -1192,7 +1264,8 @@ impl VmState {
 
         for page in 0..pages {
             let va = mapping.va + page * GPU_PAGE_SIZE;
-            let phys = phys_base + mapping.offset + page * GPU_PAGE_SIZE;
+            let phys =
+                address(mapping.offset + page * GPU_PAGE_SIZE).ok_or(FsError::InvalidData)?;
             let pte = make_pte(phys, flags)?;
 
             // Descend, creating each missing directory and linking it into its
@@ -1277,7 +1350,12 @@ impl VmState {
         if level == Level::Ptb {
             // SAFETY: `index` is masked to the table's entry count.
             let current = unsafe { node.table.read(index) };
-            if current & PTE_VALID == 0 {
+            // A PRT entry is live without VALID (`materialise` counted it).
+            let prt = match geometry.format {
+                PteFormat::Nv10 => PTE_PRT,
+                PteFormat::Gfx12 => PTE_PRT_GFX12,
+            };
+            if current & (PTE_VALID | prt) == 0 {
                 return;
             }
             // SAFETY: as above.

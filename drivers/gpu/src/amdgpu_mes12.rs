@@ -179,6 +179,58 @@ pub fn unmap_kernel_queue(queue: KernelQueue) -> Result<Packet, Error> {
     p.words[15] = queue.kind as u32;
     Ok(p)
 }
+/// REMOVE_QUEUE of a kernel queue already reset by MMIO
+/// (mes_v12_0_unmap_legacy_queue with RESET_QUEUES): as
+/// `unmap_kernel_queue`, plus `remove_queue_after_reset` (bit 4) when
+/// `drop_state` — scheduler firmware 0x5a and later — so MES drops its
+/// state for the queue rather than asking the CP to unmap it again.
+pub fn unmap_reset_kernel_queue(queue: KernelQueue, drop_state: bool) -> Result<Packet, Error> {
+    let mut p = unmap_kernel_queue(queue)?;
+    if drop_state {
+        p.words[4] |= 1 << 4;
+    }
+    Ok(p)
+}
+/// SUSPEND of every gang (amdgpu_mes_suspend: `suspend_all_gangs`, no
+/// suspend fence); pack(8) puts the status at 8.
+pub fn suspend_all() -> Packet {
+    let mut p = Packet::new(6, 8);
+    p.words[1] = 1;
+    p
+}
+/// RESUME of every gang (amdgpu_mes_resume: `resume_all_gangs`); the
+/// status is at 4.
+pub fn resume_all() -> Packet {
+    let mut p = Packet::new(7, 4);
+    p.words[1] = 1;
+    p
+}
+/// RESET (mes_v12_0_reset_hw_queue without MMIO) of a kernel queue whose
+/// job on VMID `vmid` hung: a graphics queue as a legacy HQD
+/// (`reset_legacy_gfx` with its pipe, queue, VMID, MQD, doorbell and write
+/// pointer), any other by its doorbell alone (`reset_queue_only`).
+pub fn reset_kernel_queue(queue: KernelQueue, vmid: u8) -> Result<Packet, Error> {
+    if !queue.valid() || vmid >= 16 {
+        return Err(Error::Invalid);
+    }
+    // pack(8): flags at 1, gang context 2-3, doorbell 4, doorbell list
+    // 6-7, queue type 8, the LP fields 9-17, HP 18-27, status 28.
+    let mut p = Packet::new(8, 28);
+    p.words[8] = queue.kind as u32;
+    if queue.kind == QueueType::Graphics {
+        p.words[1] = 1 << 3; // reset_legacy_gfx
+        p.words[9] = u32::from(queue.pipe);
+        p.words[10] = u32::from(queue.queue);
+        p.words[11] = u32::from(vmid);
+        put64(&mut p.words, 12, queue.mqd);
+        p.words[14] = queue.doorbell;
+        put64(&mut p.words, 16, queue.write_pointer);
+    } else {
+        p.words[1] = 1; // reset_queue_only
+        p.words[4] = queue.doorbell;
+    }
+    Ok(p)
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rejection {
     pub code: u8,

@@ -162,6 +162,10 @@ impl<I: Io> Engine<I> {
                     before = Some(frame);
                 }
             }
+            #[cfg(feature = "kernel-test")]
+            if self.io.pause_wait() {
+                core::future::pending::<()>().await;
+            }
             if deadline.expired() {
                 return Err(Error::Timeout(blocked.unwrap_or(l.otg(p, FRAME_COUNT))));
             }

@@ -92,7 +92,8 @@ fn navi48_identity_and_memory_follow_discovery_and_bar_bounds() -> TestResult {
             unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<u::DrmAmdgpuMemoryInfo>()) };
         if memory.vram.total_heap_size != 16 << 30
             || memory.cpu_accessible_vram.total_heap_size != aperture.min(16 << 30)
-            || memory.gtt.total_heap_size != 0
+            || memory.gtt.total_heap_size != crate::amdgpu_gem::gtt_limit()
+            || memory.gtt.total_heap_size == 0
         {
             return TestResult::Fail("Navi48 heap query ignored aperture");
         }

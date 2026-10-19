@@ -40,6 +40,7 @@ fn report() -> Report {
             active_arrays: 0xff,
             cu_bitmap: [[0xff, 0xff, 0, 0]; 4],
             enabled_rb_mask: 0xffff,
+            gb_addr_config: 0x2644_2043,
         },
         smu: smu::Versions {
             firmware: 0x684c00,
@@ -54,6 +55,7 @@ fn report() -> Report {
             enabled: 1,
             gfx_min_mhz: 500,
             gfx_max_mhz: 3100,
+            uclk_mhz: None,
         },
         dmub: dmub::Status {
             firmware_version: 0x0a000c00,
@@ -150,4 +152,22 @@ fn navi48_boot_order_failure_and_cancellation() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48_boot",
     navi48_boot_order_failure_and_cancellation
+);
+
+/// The driver keeps half of a small BAR's free VRAM, but never more than
+/// 512 MiB, so a BAR showing all of VRAM gives clients nearly all of it.
+fn navi48_client_vram_keeps_a_bounded_driver_reserve() -> TestResult {
+    const MIB: u64 = 1 << 20;
+    if driver_reserve(150 * MIB) != 75 * MIB
+        || driver_reserve(1024 * MIB) != 512 * MIB
+        || driver_reserve(15 << 30) != 512 * MIB
+        || driver_reserve(0) != 0
+    {
+        return TestResult::Fail("driver VRAM reserve");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48_boot",
+    navi48_client_vram_keeps_a_bounded_driver_reserve
 );

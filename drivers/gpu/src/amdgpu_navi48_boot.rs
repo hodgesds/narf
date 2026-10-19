@@ -123,6 +123,10 @@ pub struct Firmware {
     dmub: Option<dmub::Prepared>,
 }
 impl Firmware {
+    /// The validated IP firmware images (not the SOS or DMCUB preparation).
+    pub(crate) fn images(&self) -> Result<[gfx::Image<'_>; 11], Error> {
+        self.gfx.images().map_err(Error::Firmware)
+    }
     pub fn open(
         gpu: &AmdGpu,
         registry: &Cap<narf_firmware::FirmwareRegistry, Read>,
@@ -326,6 +330,12 @@ impl Backend for Hardware {
                     .map_err(Error::Topology)?;
                 self.topology = Some(topology);
                 crate::amdgpu_info::publish_navi48_topology(topology);
+                // The GPU clock counter runs once firmware and power are up.
+                if let Ok(clock) =
+                    crate::amdgpu_smuio14::ClockReader::new(&self.gpu, self.authority)
+                {
+                    crate::amdgpu_info::publish_navi48_clock(clock);
+                }
             }
             Stage::ConfigureRs64 => {
                 // SAFETY: PSP authenticated this exact retained set and RLC
@@ -469,6 +479,17 @@ pub struct ColdBoot {
     /// The slice of CPU-visible VRAM clients' buffers come from, kept out
     /// of the driver's own pool for good.
     client_vram: Option<crate::amdgpu_vram::Reservation>,
+    /// The heap registered for clients, once published.
+    client_heap: Option<crate::amdgpu_gem::VramHeap>,
+    /// The inventory's VRAM past the BAR, all of it for clients.
+    unmapped_vram: Option<crate::amdgpu_vram::UnmappedPool>,
+}
+/// What the driver keeps of `available` free CPU-visible VRAM for its own
+/// later owners (scanout surfaces, display and queue memory): half of a
+/// small BAR's worth, at most 512 MiB — so a resizable BAR that shows all
+/// of VRAM hands nearly all of it to clients, not half.
+fn driver_reserve(available: u64) -> u64 {
+    (available / 2).min(512 << 20)
 }
 impl ColdBoot {
     /// # Safety
@@ -487,6 +508,7 @@ impl ColdBoot {
         pci: narf_bus::BusDevice,
         authority: Cap<BusDeviceCap, Write>,
         pool: &Pool,
+        unmapped: Option<crate::amdgpu_vram::UnmappedPool>,
         mut firmware: Firmware,
         exchange: Option<Training>,
     ) -> Result<Self, Error> {
@@ -601,6 +623,8 @@ impl ColdBoot {
             verified_links: Vec::new(),
             scanned_sinks: Vec::new(),
             client_vram: None,
+            client_heap: None,
+            unmapped_vram: unmapped,
             sequence: Sequence {
                 backend: Hardware {
                     gpu: saved,
@@ -712,6 +736,122 @@ impl ColdBoot {
         // SAFETY: the caller's obligations.
         unsafe { queues.submit(pipe, job) }
     }
+    /// Recover a ring after its job on VMID `vmid` hung. The graphics ring
+    /// as gfx_v12_0_reset_kgq: MES resets the legacy HQD in place. The
+    /// compute ring as gfx_v12_0_reset_kcq (amdgpu_gfx_reset_mes_compute,
+    /// GFX12 resetting MEC queues by MMIO): MES suspends every gang, the
+    /// HQD is dequeued by MMIO, MES unmaps it, its descriptor and ring are
+    /// restored and MES maps it again, then MES resumes the gangs, whatever
+    /// failed. Either way a fence-only slot then tests the ring
+    /// (amdgpu_ring_test_ring). Once that fence lands the CP has moved past
+    /// every earlier slot, so the hung and abandoned jobs' fences read
+    /// complete through it. Returns that fence's sequence.
+    ///
+    /// LINUX-GAP: the jobs behind the hung one are not re-emitted. A failed
+    /// suspend does not ask MES which other queues hung; it fails recovery
+    /// before any MMIO reset. There are no user or KFD queues yet.
+    /// # Safety
+    /// As `submit_client_job`, and every job on the ring keeps what it
+    /// reaches until this returns Ok.
+    pub(crate) async unsafe fn recover_client_ring(
+        &mut self,
+        pipe: queues::Pipe,
+        vmid: u8,
+    ) -> Result<u32, queues::Error> {
+        let hardware = &mut self.sequence.backend;
+        let queues = hardware.queues.as_mut().ok_or(queues::Error::Invalid)?;
+        let mes = hardware.mes.as_mut().ok_or(queues::Error::Invalid)?;
+        let queue = queues.kernel_queue(pipe);
+        match pipe {
+            // SAFETY: the platform serializes both queues and MES under its
+            // owner; the caller keeps the ring's jobs' memory until Ok.
+            queues::Pipe::Graphics => unsafe { mes.reset_kernel_queue(queue, vmid) }
+                .await
+                .map_err(queues::Error::Mes)?,
+            queues::Pipe::Compute => {
+                // SAFETY: as above; every suspend is followed by a resume.
+                let suspended = unsafe { mes.all_gangs(true) }.await;
+                let reset = async {
+                    suspended.map_err(queues::Error::Mes)?;
+                    // SAFETY: the gangs are suspended and OWNER keeps every
+                    // other GRBM selector user out.
+                    unsafe { queues.reset_compute_hqd() }.await?;
+                    // SAFETY: the HQD was just reset.
+                    unsafe { mes.unmap_reset_queue(queue) }
+                        .await
+                        .map_err(queues::Error::Mes)?;
+                    // SAFETY: reset and unmapped.
+                    unsafe { queues.restore(pipe) }?;
+                    // SAFETY: the queue's restored descriptor and ring stay
+                    // retained with the rest of the queue memory.
+                    unsafe { mes.map_bootstrap_queue(queue) }
+                        .await
+                        .map_err(queues::Error::Mes)
+                }
+                .await;
+                // amdgpu_mes_resume runs on every path; its result is not the
+                // reset's.
+                // SAFETY: resumes the suspend above.
+                let _ = unsafe { mes.all_gangs(false) }.await;
+                reset?;
+            }
+        }
+        // SAFETY: as above; the slot reaches only the queue's own fence.
+        let seq = unsafe { queues.submit_fence(pipe) }?;
+        // amdgpu's usec_timeout for a ring test.
+        let deadline = narf_time::Deadline::after_us(100_000);
+        loop {
+            let done = queues.completed_job(pipe)?;
+            if done.wrapping_sub(seq) as i32 >= 0 {
+                return Ok(seq);
+            }
+            if deadline.expired() {
+                return Err(queues::Error::Timeout);
+            }
+            narf_time::SleepUntil::new(narf_time::Deadline::after_us(50).as_instant()).await;
+        }
+    }
+    /// Recover SDMA0's ring after a job on it hung, as sdma_v7_0_reset_queue:
+    /// the MMIO queue reset and the ring programmed again past its queued
+    /// slots (`sdma::Sdma::reset_ring`), then a fence-only slot tests it,
+    /// landing within 100 ms. Before the test, `skipped` learns the last
+    /// sequence the engine completed: every slot past it was skipped, and
+    /// will read complete through the test's fence. Returns that fence's
+    /// sequence.
+    ///
+    /// LINUX-GAP: Linux re-emits the skipped jobs that did not hang; here
+    /// only the caller's kernel work runs again (`skipped`), and client
+    /// jobs stay canceled.
+    /// # Safety
+    /// As `submit_client_sdma_job`, and every job on the ring keeps what it
+    /// reaches until this returns Ok. Work that must not be skipped is
+    /// queued again by `skipped` before its fence can be trusted.
+    pub(crate) async unsafe fn recover_client_sdma(
+        &mut self,
+        skipped: impl FnOnce(u32),
+    ) -> Result<u32, sdma::Error> {
+        let sdma = self
+            .sequence
+            .backend
+            .sdma
+            .as_mut()
+            .ok_or(sdma::Error::Invalid)?;
+        // SAFETY: the caller's obligations.
+        unsafe { sdma.reset_ring() }.await?;
+        skipped(sdma.completed_job()?);
+        // SAFETY: as above; the slot reaches only the ring's own fence.
+        let seq = unsafe { sdma.submit_fence() }?;
+        let deadline = narf_time::Deadline::after_us(100_000);
+        loop {
+            if sdma.completed_job()?.wrapping_sub(seq) as i32 >= 0 {
+                return Ok(seq);
+            }
+            if deadline.expired() {
+                return Err(sdma::Error::Timeout);
+            }
+            narf_time::SleepUntil::new(narf_time::Deadline::after_us(50).as_instant()).await;
+        }
+    }
     /// Queue a client job on SDMA0 (see `sdma::Sdma::submit`).
     /// # Safety
     /// As `submit_client_job`.
@@ -727,6 +867,25 @@ impl ColdBoot {
             .ok_or(sdma::Error::Invalid)?;
         // SAFETY: the caller's obligations.
         unsafe { sdma.submit(job) }
+    }
+    /// Queue a kernel job of fills and copies on SDMA0 (VMID0 addresses),
+    /// in the client jobs' sequence.
+    /// # Safety
+    /// As `Sdma::submit_kernel`: the platform serializes ring users under
+    /// OWNER, and every range named is client VRAM no one uses until the
+    /// returned sequence completes.
+    pub(crate) unsafe fn submit_client_sdma_kernel(
+        &mut self,
+        ops: &[sdma::KernelOp],
+    ) -> Result<u32, sdma::Error> {
+        let sdma = self
+            .sequence
+            .backend
+            .sdma
+            .as_mut()
+            .ok_or(sdma::Error::Invalid)?;
+        // SAFETY: the caller's obligations.
+        unsafe { sdma.submit_kernel(ops) }
     }
     /// A reader of SDMA0's client-job fence. Jobs are refused (busy)
     /// until both SDMA proofs pass, which the platform runs after boot.
@@ -797,9 +956,10 @@ impl ColdBoot {
         unsafe { sdma.prove_interrupts(gmc).await }
     }
     /// Board power limits and GFX level of the configured SMU, after boot.
-    /// Give clients of this card's DRM node a VRAM heap: half the
-    /// CPU-visible VRAM the driver's pool still has free after boot,
-    /// 2 MiB-aligned and at least 64 MiB, as a pool of its own, so with no
+    /// Give clients of this card's DRM node a VRAM heap: the CPU-visible
+    /// VRAM the driver's pool still has free after boot, less what the
+    /// driver keeps for its own later owners (`driver_reserve`), 2 MiB-
+    /// aligned and at least 64 MiB, as a pool of its own, so with no
     /// eviction they can never take what the driver's owners need. Entries
     /// address it as the GMC's framebuffer geometry translates it.
     /// Returns the heap's size.
@@ -816,31 +976,66 @@ impl ColdBoot {
             .ok_or(Error::Invalid)?
             .display_context(regs)
             .map_err(Error::Gmc)?;
-        let size = (hw.pool.available() / 2) & !(ALIGN - 1);
-        if size < 64 << 20 {
-            return Err(Error::Allocation);
-        }
+        let available = hw.pool.available();
         let card = Self::drm_card().ok_or(Error::Invalid)?;
-        let mut chunk = hw
-            .pool
-            .reserve_aligned(size, ALIGN)
-            .map_err(|_| Error::Allocation)?;
+        let mut size = (available - driver_reserve(available)) & !(ALIGN - 1);
+        // Free space need not be one run; settle for the largest that is.
+        let mut chunk = loop {
+            if size < 64 << 20 {
+                return Err(Error::Allocation);
+            }
+            match hw.pool.reserve_aligned(size, ALIGN) {
+                Ok(chunk) => break chunk,
+                Err(_) => size = (size / 2) & !(ALIGN - 1),
+            }
+        };
         // SAFETY: the reservation is this heap's alone, inside the owned,
         // CPU-mapped VRAM range the boot inventory produced.
         let heap = unsafe { Pool::from_owned_range(chunk.mapping(), chunk.address()) }
             .map_err(|_| Error::Allocation)?;
         // Clients' buffers outlive any one owner here; never recycle it.
         chunk.publish();
-        crate::amdgpu_gem::register_vram_heap(
-            card,
-            crate::amdgpu_gem::VramHeap {
-                pool: heap,
-                fb_base: context.fb_base,
-                fb_offset: context.fb_offset,
-            },
-        );
+        let heap = crate::amdgpu_gem::VramHeap {
+            pool: heap,
+            fb_base: context.fb_base,
+            fb_offset: context.fb_offset,
+            unmapped: None,
+        };
+        crate::amdgpu_gem::register_vram_heap(card, heap.clone());
+        self.client_heap = Some(heap);
         self.client_vram = Some(chunk);
         Ok(size)
+    }
+    /// Add the VRAM past the BAR to the clients' heap, for `NO_CPU_ACCESS`
+    /// buffers, once SDMA0 runs jobs: `clear` zeroes each buffer there
+    /// before use (`submit_client_sdma_kernel`). Returns its size.
+    pub(crate) fn publish_unmapped_vram(
+        &mut self,
+        clear: alloc::sync::Arc<dyn crate::amdgpu_gem::VramClear>,
+    ) -> Result<u64, Error> {
+        let sdma_ready = self
+            .sequence
+            .backend
+            .sdma
+            .as_ref()
+            .is_some_and(|s| s.state() == sdma::State::InterruptVerified);
+        let card = Self::drm_card().ok_or(Error::Invalid)?;
+        let (Some(heap), Some(pool), true) = (
+            self.client_heap.as_mut(),
+            self.unmapped_vram.as_ref(),
+            sdma_ready,
+        ) else {
+            return Err(Error::Busy);
+        };
+        if heap.unmapped.is_some() {
+            return Err(Error::Busy);
+        }
+        heap.unmapped = Some(crate::amdgpu_gem::UnmappedHeap {
+            pool: pool.clone(),
+            clear,
+        });
+        crate::amdgpu_gem::register_vram_heap(card, heap.clone());
+        Ok(pool.size())
     }
     pub(crate) fn power_info(&self) -> Option<(Option<smu::Limits>, smu::GfxLevel)> {
         let smu = self.sequence.backend.smu.as_ref()?;

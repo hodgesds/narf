@@ -2,7 +2,8 @@
 //! Register/packet sources: Linux sdma_v7_0.c, gc_12_0_0_{offset,sh_mask}.h,
 //! sdma_v6_0_0_pkt_open.h. Retained kernel fence/TRAP interrupt proof, then
 //! client jobs (`Sdma::submit`): a VM flush, PASID mapping, IBs and a fence
-//! per 256-dword slot. No host DMA or recovery.
+//! per 256-dword slot, and a hung ring's reset (`Sdma::reset_ring`). No
+//! host DMA.
 use crate::{
     amdgpu::AmdGpu,
     amdgpu_discovery as ip, amdgpu_gmc_navi48 as gmc,
@@ -25,6 +26,8 @@ const MCU_CNTL: u32 = 0x588e; // GC bank one, unlike ring registers
 const RB_CNTL: u32 = 0x80;
 const RB_RPTR: u32 = 0x83;
 const RB_WPTR: u32 = 0x85;
+/// `SDMA0_QUEUE_RESET_REQ` (GC segment 0): one bit per queue.
+const QUEUE_RESET_REQ: u32 = 0x6c;
 /// Client jobs' fence (in the ring allocation, past the pointers).
 const JOB_FENCE: u64 = 4160;
 /// The ring: 4 KiB at the allocation's start (RB_SIZE 10).
@@ -213,6 +216,45 @@ fn interrupt_packets(address: u64) -> [u32; 16] {
     ]);
     words
 }
+/// The ring as sdma_v7_0_gfx_resume_instance programs it, with both
+/// pointers at `pointer` bytes: ring at `address`, its pointer writebacks
+/// past it, MMIO write pointer, watchdog, UTCL1 policy, the engine
+/// unhalted and the ring and IBs enabled.
+fn program_ring<I: Io>(io: &mut I, l: Layout, address: u64, pointer: u64) -> Result<(), Error> {
+    update(io, l.gc, RB_CNTL, 0x0f803f3f, 0x00801814)?;
+    // IB_ENABLE, as sdma_v7_0_gfx_resume sets before enabling the ring:
+    // the proofs use direct packets, client jobs IBs.
+    update(io, l.gc, 0x89, 0x000f0111, 1)?;
+    io.write(l.gc + 0x96 * 4, 0); // no pending preemption
+    io.write(l.gc + 0x9b * 4, 1); // permit pointer rewind
+    for reg in [0x83, 0x85] {
+        io.write(l.gc + reg * 4, pointer as u32);
+        io.write(l.gc + (reg + 1) * 4, (pointer >> 32) as u32);
+    }
+    for (hi, lo, value) in [(0x88, 0x87, address + RPTR), (0x99, 0x98, address + WPTR)] {
+        io.write(l.gc + hi * 4, (value >> 32) as u32);
+        io.write(l.gc + lo * 4, value as u32);
+    }
+    io.write(l.gc + 0x81 * 4, (address >> 8) as u32);
+    io.write(l.gc + 0x82 * 4, (address >> 40) as u32);
+    update(io, l.gc, 0x8f, 1 << 28, 0)?; // MMIO pointer, no BAR2 doorbell
+    io.write(l.gc + 0x9b * 4, 0);
+    update(io, l.gc, 0x2b, 0xff, 1)?; // queue watchdog: 100ms
+    update(io, l.gc, 0x35, 0x61f, (3 << 9) | 9)?;
+    update(io, l.gc, 0x38, !0xff0fff, 0xe000)?; // default read/write policy
+    update(io, l.hyp, MCU_CNTL, 3, 0)?;
+    update(io, l.gc, RB_CNTL, 1, 1)
+}
+/// A slot of nothing but the fence of `seq` (the ring test after a reset,
+/// amdgpu_ring_test_ring).
+fn fence_words(fence: u64, seq: u32) -> Result<[u32; JOB_DWORDS as usize], Error> {
+    let mut slot = Slot {
+        words: [0; JOB_DWORDS as usize],
+        pos: 0,
+    };
+    slot.push(&[0x30005, fence as u32, (fence >> 32) as u32, seq])?;
+    Ok(slot.words)
+}
 async fn delay(us: u64) {
     narf_time::SleepUntil::new(narf_time::Deadline::after_us(us).as_instant()).await;
 }
@@ -241,6 +283,80 @@ impl Slot {
     fn reg_wait(&mut self, reg: u32, reference: u32, mask: u32) -> Result<(), Error> {
         self.push(&[8 | 3 << 28, reg << 2, 0, reference, mask, 0xfff << 16 | 10])
     }
+}
+/// One kernel SDMA operation on VMID0 (framebuffer-aperture) addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelOp {
+    /// Fill `bytes` (a multiple of 4) at dword-aligned `dst` with `value`.
+    Fill { dst: u64, bytes: u64, value: u32 },
+    /// Copy `bytes` from `src` to `dst`, non-overlapping.
+    Copy { src: u64, dst: u64, bytes: u64 },
+}
+/// Bytes one SDMA7 fill or copy packet moves (`fill_max_bytes`,
+/// `copy_max_bytes`).
+pub const MAX_PACKET_BYTES: u64 = 1 << 30;
+/// A kernel job's slot: each op as sdma_v7_0_emit_fill_buffer (CONSTANT_FILL
+/// with COMPRESS, dword fill) or sdma_v7_0_emit_copy_buffer (COPY_LINEAR
+/// with CPV, no DCC) in packets of at most 1 GiB, then the uncached fence.
+/// Refused (`Invalid`) when an op is empty or misaligned or the packets
+/// overflow the slot.
+fn kernel_words(
+    ops: &[KernelOp],
+    fence: u64,
+    seq: u32,
+) -> Result<[u32; JOB_DWORDS as usize], Error> {
+    let mut slot = Slot {
+        words: [0; JOB_DWORDS as usize],
+        pos: 0,
+    };
+    for &op in ops {
+        match op {
+            KernelOp::Fill { dst, bytes, value } => {
+                if bytes == 0 || bytes % 4 != 0 || dst % 4 != 0 {
+                    return Err(Error::Invalid);
+                }
+                let mut done = 0;
+                while done < bytes {
+                    let n = (bytes - done).min(MAX_PACKET_BYTES);
+                    let at = dst + done;
+                    slot.push(&[
+                        11 | 1 << 16,
+                        at as u32,
+                        (at >> 32) as u32,
+                        value,
+                        (n - 1) as u32,
+                    ])?;
+                    done += n;
+                }
+            }
+            KernelOp::Copy { src, dst, bytes } => {
+                if bytes == 0 || src.max(dst) - src.min(dst) < bytes {
+                    return Err(Error::Invalid);
+                }
+                let mut done = 0;
+                while done < bytes {
+                    let n = (bytes - done).min(MAX_PACKET_BYTES);
+                    let (from, to) = (src + done, dst + done);
+                    slot.push(&[
+                        1 | 1 << 19,
+                        (n - 1) as u32,
+                        0,
+                        from as u32,
+                        (from >> 32) as u32,
+                        to as u32,
+                        (to >> 32) as u32,
+                        0,
+                    ])?;
+                    done += n;
+                }
+            }
+        }
+    }
+    if ops.is_empty() {
+        return Err(Error::Invalid);
+    }
+    slot.push(&[0x30005, fence as u32, (fence >> 32) as u32, seq])?;
+    Ok(slot.words)
 }
 /// sdma_v7_0's frame for one client job, as amdgpu_vm_flush and
 /// amdgpu_ib_schedule emit it on the ring:
@@ -436,29 +552,7 @@ impl<I: Io> Engine<I> {
             // Only one privileged direct ring, VMID0. No traps, paging IRQs,
             // preemption, automatic context switches or indirect buffers.
             update(io, l.gc, 0x0d, 0xf0023f79, 0x40)?;
-            update(io, l.gc, RB_CNTL, 0x0f803f3f, 0x00801814)?;
-            // IB_ENABLE, as sdma_v7_0_gfx_resume sets before enabling the
-            // ring: the proofs use direct packets, client jobs IBs.
-            update(io, l.gc, 0x89, 0x000f0111, 1)?;
-            io.write(l.gc + 0x96 * 4, 0); // no pending preemption
-            io.write(l.gc + 0x9b * 4, 1); // permit pointer rewind
-            for reg in [0x83, 0x84, 0x85, 0x86] {
-                io.write(l.gc + reg * 4, 0);
-            }
-            for (hi, lo, value) in [(0x88, 0x87, address + RPTR), (0x99, 0x98, address + WPTR)] {
-                io.write(l.gc + hi * 4, (value >> 32) as u32);
-                io.write(l.gc + lo * 4, value as u32);
-            }
-            io.write(l.gc + 0x81 * 4, (address >> 8) as u32);
-            io.write(l.gc + 0x82 * 4, (address >> 40) as u32);
-            update(io, l.gc, 0x8f, 1 << 28, 0)?; // MMIO pointer, no BAR2 doorbell
-            io.write(l.gc + 0x9b * 4, 0);
-            update(io, l.gc, 0x2b, 0xff, 1)?; // queue watchdog: 100ms
-            update(io, l.gc, 0x35, 0x61f, (3 << 9) | 9)?;
-            update(io, l.gc, 0x38, !0xff0fff, 0xe000)?; // default read/write policy
-            update(io, l.hyp, MCU_CNTL, 3, 0)?;
-            update(io, l.gc, RB_CNTL, 1, 1)?;
-            Ok(())
+            program_ring(io, l, address, 0)
         })?;
         self.state = State::Submitted;
         self.access(|io| {
@@ -508,6 +602,21 @@ impl<I: Io> Engine<I> {
     /// job pads the ring with NOPs up to its slot. Pointers are bytes and
     /// 64 bits wide. Returns the job's sequence.
     fn submit(&mut self, job: crate::amdgpu_gfx12_queue::Job) -> Result<u32, Error> {
+        let l = self.layout;
+        self.submit_slot(|fence, seq| {
+            job_words(&job, (l.gc / 4) as u32, (l.oss / 4) as u32, fence, seq)
+        })
+    }
+    /// Queue one kernel job (see `kernel_words`) like a client job.
+    fn submit_kernel(&mut self, ops: &[KernelOp]) -> Result<u32, Error> {
+        self.submit_slot(|fence, seq| kernel_words(ops, fence, seq))
+    }
+    /// Write the slot `build` makes for the next sequence and its fence
+    /// address into the ring, after both proofs, if the ring has room.
+    fn submit_slot(
+        &mut self,
+        build: impl FnOnce(u64, u32) -> Result<[u32; JOB_DWORDS as usize], Error>,
+    ) -> Result<u32, Error> {
         if self.state != State::InterruptVerified {
             return Err(Error::Busy);
         }
@@ -519,7 +628,7 @@ impl<I: Io> Engine<I> {
         let next = start + JOB_DWORDS;
         let seq = self.job_seq.wrapping_add(1);
         let fence = self.memory.address() + JOB_FENCE;
-        let words = job_words(&job, (l.gc / 4) as u32, (l.oss / 4) as u32, fence, seq)?;
+        let words = build(fence, seq)?;
         self.access(|io| {
             invalidate(io, l);
             let rptr = (u64::from(io.read_memory(map, RPTR))
@@ -546,6 +655,52 @@ impl<I: Io> Engine<I> {
         self.job_wptr = next;
         self.job_seq = seq;
         Ok(seq)
+    }
+    /// sdma_v7_0_reset_queue for the ring: the MMIO queue reset
+    /// (mes_v12_0_reset_queue_mmio: SDMA0_QUEUE_RESET_REQ bit 0, which the
+    /// engine clears within amdgpu's usec_timeout), then the ring
+    /// programmed again as sdma_v7_0_gfx_resume_instance(restore) does,
+    /// both pointers at the software write pointer, so the engine resumes
+    /// past every queued slot. The read pointer writeback is set there too,
+    /// as nothing writes it before the engine runs.
+    async fn reset_ring(&mut self) -> Result<(), Error> {
+        if self.state != State::InterruptVerified {
+            return Err(Error::Busy);
+        }
+        let l = self.layout;
+        self.access(|io| {
+            io.write(l.gc + u64::from(QUEUE_RESET_REQ) * 4, 1);
+            Ok(())
+        })?;
+        let deadline = narf_time::Deadline::after_us(100_000);
+        loop {
+            let pending = self.access(|io| {
+                Ok(checked(io.read(l.gc + u64::from(QUEUE_RESET_REQ) * 4))? & 1 != 0)
+            })?;
+            if !pending {
+                break;
+            }
+            if deadline.expired() {
+                return Err(Error::Timeout);
+            }
+            delay(50).await;
+        }
+        let (address, map) = (self.memory.address(), self.memory.mapping());
+        let pointer = self.job_wptr.max(192 / 4) * 4;
+        self.access(|io| {
+            for at in [RPTR, WPTR] {
+                io.write_memory(map, at, pointer as u32);
+                io.write_memory(map, at + 4, (pointer >> 32) as u32);
+            }
+            flush(io, l);
+            program_ring(io, l, address, pointer)
+        })
+    }
+    /// Queue a fence-only slot of the next sequence: the ring test after
+    /// `reset_ring`. Once it lands the engine has moved past every earlier
+    /// slot.
+    fn submit_fence(&mut self) -> Result<u32, Error> {
+        self.submit_slot(fence_words)
     }
     /// The last client job sequence the fence reached.
     fn completed_job(&mut self) -> Result<u32, Error> {
@@ -743,7 +898,29 @@ impl Sdma {
     pub unsafe fn submit(&mut self, job: crate::amdgpu_gfx12_queue::Job) -> Result<u32, Error> {
         self.engine.submit(job)
     }
+    /// Queue a kernel job of fills and copies on VMID0 addresses, sharing
+    /// the client jobs' sequence and fence.
+    /// # Safety
+    /// Every address the ops name is VRAM (or translated memory) the caller
+    /// owns and no one else uses until `completed_job` passes the returned
+    /// sequence, and no one else writes this ring.
+    pub unsafe fn submit_kernel(&mut self, ops: &[KernelOp]) -> Result<u32, Error> {
+        self.engine.submit_kernel(ops)
+    }
     /// The last client job sequence SDMA0 completed.
+    /// Reset the hung ring (see `Engine::reset_ring`).
+    /// # Safety
+    /// Every job on the ring keeps the memory it reaches until a later
+    /// fence on it lands, and the platform serializes the ring's users.
+    pub async unsafe fn reset_ring(&mut self) -> Result<(), Error> {
+        self.engine.reset_ring().await
+    }
+    /// Queue the ring test after a reset (see `Engine::submit_fence`).
+    /// # Safety
+    /// As `submit`.
+    pub unsafe fn submit_fence(&mut self) -> Result<u32, Error> {
+        self.engine.submit_fence()
+    }
     pub fn completed_job(&mut self) -> Result<u32, Error> {
         self.engine.completed_job()
     }

@@ -63,6 +63,9 @@ pub struct EntryPoints {
 pub struct Image<'a> {
     source: Source,
     version: u32,
+    /// `ucode_feature_version` of a v2.0 CP header (PFP, ME, MEC); 0 for
+    /// every other image.
+    feature: u32,
     entries: Option<EntryPoints>,
     payloads: [Option<Payload<'a>>; 13],
 }
@@ -85,6 +88,7 @@ impl<'a> Image<'a> {
     pub(crate) const EMPTY: Self = Self {
         source: Source::Smc,
         version: 0,
+        feature: 0,
         entries: None,
         payloads: [None; 13],
     };
@@ -195,6 +199,9 @@ impl<'a> Image<'a> {
                     return Err(Error::Invalid);
                 }
                 image.entries = Some(entries);
+                if !mes {
+                    image.feature = word(bytes, 32);
+                }
             }
             Source::Sdma => {
                 if word(bytes, 36) != offset || word(bytes, 40) != size {
@@ -241,6 +248,11 @@ impl<'a> Image<'a> {
     }
     pub fn version(&self) -> u32 {
         self.version
+    }
+    /// The CP firmware's feature version (`AMDGPU_INFO_FW_VERSION`'s
+    /// `feature`), 0 for images without one.
+    pub fn feature(&self) -> u32 {
+        self.feature
     }
     pub fn entry_points(&self) -> Option<EntryPoints> {
         self.entries

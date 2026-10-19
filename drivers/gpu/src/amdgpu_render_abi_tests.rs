@@ -36,6 +36,7 @@ impl Submitter for Instant {
         &'a self,
         _vm: &'a crate::amdgpu_vm::VmState,
         _submission: &'a crate::amdgpu_cs::Submission,
+        _health: &'a alloc::sync::Arc<crate::amdgpu_ctx::Health>,
     ) -> Pin<alloc::boxed::Box<dyn Future<Output = Result<u64, FsError>> + Send + 'a>> {
         alloc::boxed::Box::pin(async { Ok(1 << 32 | 7) })
     }

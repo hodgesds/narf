@@ -18,8 +18,18 @@
 //! `QUERY_STATE` / `QUERY_STATE2` report a GPU recovery completed since the
 //! context was created (`amdgpu_navi22_recovery::recoveries`): QUERY_STATE
 //! answers `UNKNOWN_RESET` once per reset, QUERY_STATE2 sets `RESET` and
-//! `VRAMLOST` (the recovery is a mode1 reset). LINUX-GAP: no hang count, no
-//! `GUILTY` attribution, no `RESET_IN_PROGRESS`, and no RAS CE/UE counters.
+//! `VRAMLOST` (the recovery is a mode1 reset).
+//!
+//! A context's [`Health`] records whether one of its jobs hung on a ring (it
+//! is guilty) or was abandoned behind another's hang. Linux reads that from
+//! its entities' last errors (`drm_sched_entity_error`): `AMDGPU_CS` on such
+//! a context fails with the error, QUERY_STATE answers `UNKNOWN_RESET`, and
+//! QUERY_STATE2 reports RESET, plus GUILTY for a hang of its own. A ring
+//! reset loses no VRAM.
+//!
+//! LINUX-GAP: no hang count, no `RESET_IN_PROGRESS`, and no RAS CE/UE
+//! counters; a ring reset does not count as a device recovery, so a context
+//! with no job on the ring that hung sees no RESET.
 //!
 //! LINUX-GAP: `SET_STABLE_PSTATE` validates and records, but does not reach the
 //! SMU. Pinning the shader clock is what `AMDGPU_CTX_STABLE_PSTATE_PEAK` asks
@@ -28,7 +38,8 @@
 //! but the hardware clock does not change.
 
 use alloc::collections::BTreeMap;
-use core::sync::atomic::{AtomicU32, Ordering};
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 use narf_filesystem::FsError;
 use narf_lib::sync::IrqSafeSpinLock;
@@ -62,10 +73,47 @@ pub fn recoveries() -> u64 {
     crate::amdgpu_navi22_recovery::recoveries()
 }
 
+/// What became of a context's jobs: the engine records a hang here, and
+/// the context's later submissions and queries read it.
+#[derive(Debug, Default)]
+pub struct Health(AtomicU8);
+
+const HEALTHY: u8 = 0;
+const CANCELED: u8 = 1;
+const GUILTY: u8 = 2;
+
+impl Health {
+    /// A job of this context hung (`-ETIME`): it is guilty.
+    pub fn mark_guilty(&self) {
+        self.0.store(GUILTY, Ordering::Release);
+    }
+
+    /// A job of this context was abandoned behind another's hang
+    /// (`-ECANCELED`); guilt, once recorded, stays.
+    pub fn mark_canceled(&self) {
+        let _ = self
+            .0
+            .compare_exchange(HEALTHY, CANCELED, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    /// The error the context's jobs ended with, which its next
+    /// submission fails with.
+    pub fn error(&self) -> Option<FsError> {
+        match self.0.load(Ordering::Acquire) {
+            GUILTY => Some(FsError::TimedOut),
+            CANCELED => Some(FsError::Canceled),
+            _ => None,
+        }
+    }
+}
+
+/// Contexts by id, each with its health.
+type Contexts = BTreeMap<u32, (Context, Arc<Health>)>;
+
 /// Per-open context table (`fpriv->ctx_mgr`).
 #[derive(Debug)]
 pub struct CtxState {
-    contexts: IrqSafeSpinLock<Option<BTreeMap<u32, Context>>>,
+    contexts: IrqSafeSpinLock<Option<Contexts>>,
     next_id: AtomicU32,
 }
 
@@ -91,7 +139,15 @@ impl CtxState {
         self.contexts
             .lock()
             .as_ref()
-            .and_then(|m| m.get(&id).copied())
+            .and_then(|m| m.get(&id).map(|(c, _)| *c))
+    }
+
+    /// Context `id`'s health, which its jobs report to.
+    pub fn health(&self, id: u32) -> Option<Arc<Health>> {
+        self.contexts
+            .lock()
+            .as_ref()
+            .and_then(|m| m.get(&id).map(|(_, h)| h.clone()))
     }
 
     pub fn count(&self) -> usize {
@@ -106,12 +162,15 @@ impl CtxState {
         let mut g = self.contexts.lock();
         g.get_or_insert_with(BTreeMap::new).insert(
             id,
-            Context {
-                priority,
-                stable_pstate: uapi::AMDGPU_CTX_STABLE_PSTATE_NONE,
-                reset_epoch: recoveries(),
-                reset_queried: recoveries(),
-            },
+            (
+                Context {
+                    priority,
+                    stable_pstate: uapi::AMDGPU_CTX_STABLE_PSTATE_NONE,
+                    reset_epoch: recoveries(),
+                    reset_queried: recoveries(),
+                },
+                Arc::new(Health::default()),
+            ),
         );
         Ok(id)
     }
@@ -126,13 +185,17 @@ impl CtxState {
 
     fn query_reset(&self, id: u32) -> Result<u32, FsError> {
         let mut g = self.contexts.lock();
-        let ctx = g
+        let (ctx, health) = g
             .as_mut()
             .and_then(|m| m.get_mut(&id))
             .ok_or(FsError::NotFound)?;
         let now = recoveries();
         if ctx.reset_queried == now {
-            return Ok(uapi::AMDGPU_CTX_NO_RESET);
+            // A context whose job hung or was canceled stays reset.
+            return Ok(match health.error() {
+                Some(_) => uapi::AMDGPU_CTX_UNKNOWN_RESET,
+                None => uapi::AMDGPU_CTX_NO_RESET,
+            });
         }
         ctx.reset_queried = now;
         Ok(uapi::AMDGPU_CTX_UNKNOWN_RESET)
@@ -141,7 +204,7 @@ impl CtxState {
     fn set_pstate(&self, id: u32, pstate: u32) -> Result<(), FsError> {
         let mut g = self.contexts.lock();
         let map = g.as_mut().ok_or(FsError::NotFound)?;
-        let ctx = map.get_mut(&id).ok_or(FsError::NotFound)?;
+        let (ctx, _) = map.get_mut(&id).ok_or(FsError::NotFound)?;
         ctx.stable_pstate = pstate;
         Ok(())
     }
@@ -237,7 +300,8 @@ pub fn dispatch(cmd: u32, arg: usize, state: &CtxState, is_master: bool) -> Resu
             if flags != 0 {
                 return Err(FsError::InvalidData);
             }
-            // amdgpu_ctx_query: UNKNOWN_RESET once per new reset, then NO_RESET.
+            // amdgpu_ctx_query: UNKNOWN_RESET once per new reset, then NO_RESET
+            // unless one of its jobs hung or was canceled.
             let status = state.query_reset(ctx_id)?;
             // `out.state { flags u64, hangs u32, reset_status u32 }`.
             out[12..16].copy_from_slice(&status.to_le_bytes());
@@ -249,13 +313,21 @@ pub fn dispatch(cmd: u32, arg: usize, state: &CtxState, is_master: bool) -> Resu
             // The context must exist — a query naming nothing is ENOENT, not
             // a zeroed answer that reads as "healthy".
             let ctx = state.get(ctx_id).ok_or(FsError::NotFound)?;
+            let error = state.health(ctx_id).and_then(|h| h.error());
             // amdgpu_ctx_query2: a recovery since creation reset the GPU and,
-            // being a mode1 reset, lost VRAM. Guilt is not attributed.
+            // being a mode1 reset, lost VRAM; a hang of the context's own
+            // job on a ring reset that ring, and made it guilty.
             let mut f = 0u64;
             if ctx.reset_epoch != recoveries() {
                 f |= u64::from(
                     uapi::AMDGPU_CTX_QUERY2_FLAGS_RESET | uapi::AMDGPU_CTX_QUERY2_FLAGS_VRAMLOST,
                 );
+            }
+            if error.is_some() {
+                f |= u64::from(uapi::AMDGPU_CTX_QUERY2_FLAGS_RESET);
+            }
+            if error == Some(FsError::TimedOut) {
+                f |= u64::from(uapi::AMDGPU_CTX_QUERY2_FLAGS_GUILTY);
             }
             out[0..8].copy_from_slice(&f.to_le_bytes());
         }

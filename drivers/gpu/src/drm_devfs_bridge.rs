@@ -611,7 +611,7 @@ impl FileOps for DriCardFile {
 
     fn drm_prime_export_file(&self, gem_handle: u32) -> Result<Arc<dyn FileOps>, FsError> {
         if let Some(object) = self.amdgpu_gem.object(gem_handle) {
-            return Ok(amdgpu_dma_buf_file(object));
+            return amdgpu_dma_buf_file(object);
         }
         let Some(resource) = self.virtgpu.export_resource(gem_handle) else {
             return Err(FsError::Unsupported);
@@ -890,12 +890,19 @@ pub(crate) struct AmdgpuDmaBufFile {
     inode: narf_filesystem::inode_id::InodeId,
 }
 
-/// A new dma-buf file exporting `object`.
-pub(crate) fn amdgpu_dma_buf_file(object: Arc<crate::amdgpu_gem::GemObject>) -> Arc<dyn FileOps> {
-    Arc::new(AmdgpuDmaBufFile {
+/// A new dma-buf file exporting `object`. amdgpu_gem_prime_export refuses
+/// (EPERM) a `VM_ALWAYS_VALID` buffer: it lives in its address space's
+/// reservation and cannot be shared.
+pub(crate) fn amdgpu_dma_buf_file(
+    object: Arc<crate::amdgpu_gem::GemObject>,
+) -> Result<Arc<dyn FileOps>, FsError> {
+    if object.flags & u64::from(crate::amdgpu_uapi::AMDGPU_GEM_CREATE_VM_ALWAYS_VALID) != 0 {
+        return Err(FsError::OperationNotPermitted);
+    }
+    Ok(Arc::new(AmdgpuDmaBufFile {
         object,
         inode: dma_buf_inode(),
-    })
+    }))
 }
 
 impl FileOps for AmdgpuDmaBufFile {
@@ -1250,7 +1257,7 @@ impl FileOps for DriRenderFile {
 
     fn drm_prime_export_file(&self, gem_handle: u32) -> Result<Arc<dyn FileOps>, FsError> {
         if let Some(object) = self.amdgpu_gem.object(gem_handle) {
-            return Ok(amdgpu_dma_buf_file(object));
+            return amdgpu_dma_buf_file(object);
         }
         let Some(resource) = self.virtgpu.export_resource(gem_handle) else {
             return Err(FsError::NotFound);
