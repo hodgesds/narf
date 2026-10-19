@@ -4788,18 +4788,31 @@ their memory is retired by the test fence, the first proof the CP moved
 past them. A hung compute ring is recovered as gfx_v12_0_reset_kcq
 (amdgpu_gfx_reset_mes_compute; GFX12 resets MEC queues by MMIO):
 `Mes::all_gangs(true)` (MES12 SUSPEND, `amdgpu_mes12::suspend_all`), then
-`Queues::reset_compute_hqd` (with the compute queue selected in
+`Queues::reset_compute_hqd` (RLC safe mode when RLC is enabled, with a
+100 ms acknowledgement deadline; with the compute queue selected in
 GRBM_GFX_CNTL, CP_HQD_DEQUEUE_REQUEST 2 and SPI_COMPUTE_QUEUE_RESET 1, then
-CP_HQD_ACTIVE polled idle for up to 100 ms; the prior selection restored),
+CP_HQD_ACTIVE polled idle for up to 100 ms; the prior selection restored).
+If the HQD stays active, the RS64 path of
+mes_v12_0_reset_compute_pipe_mmio asserts CP_MEC_RS64_CNTL.MEC_PIPE0_RESET,
+clears CP_HQD_ACTIVE and CP_HQD_DEQUEUE_REQUEST on all four MEC1 pipe-0
+HQDs while reset is asserted, reselects queue 0 and deasserts reset. Other
+MEC control bits are preserved. An unexpectedly active sibling or an
+already asserted pipe reset refuses the fallback before writes. Reset
+assertion, HQD clearing and deassertion are read back; an uncertain clear
+leaves the pipe held in reset. No await occurs during the pulse. RLC safe
+mode is exited on returned success/error; cancellation retains it and
+`State::ResettingCompute`, refusing replay, submission and restore. Returned
+failure records `Failed`; success records `ComputeReset`, permitting only
+the subsequent restore once MES has unmapped the queue. Reset alone neither
+advances a fence nor releases memory. The sequence continues with
 `Mes::unmap_reset_queue` (REMOVE_QUEUE with `remove_queue_after_reset` on
 scheduler firmware 0x5a+, `amdgpu_mes12::unmap_reset_kernel_queue`),
 `Queues::restore` (the descriptor as first built, a ring of
 PACKET3(NOP, 0x3fff), read and write pointers 0) and
 `Mes::map_bootstrap_queue`; `Mes::all_gangs(false)` (RESUME,
-`resume_all`) follows on every path, and the same ring test closes it. A
-failed suspend does not stop the reset (Linux would ask MES for other hung
-queues; there are none), and an HQD that never goes idle fails it without
-Linux's MEC pipe reset. A hung SDMA0 ring is recovered as
+`resume_all`) is attempted on every returned path, and the same ring test closes it. A
+failed suspend stops recovery before MMIO writes (Linux's MES hung-queue
+detection is not implemented). A hung SDMA0 ring is recovered as
 sdma_v7_0_reset_queue (`ColdBoot::recover_client_sdma`):
 `Sdma::reset_ring` writes SDMA0_QUEUE_RESET_REQ bit 0 and waits up to 100
 ms for the engine to clear it, then programs the ring as

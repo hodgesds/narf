@@ -853,7 +853,16 @@ applies queue backpressure. Connection notices drive topology reconciliation
 in the display monitor. Probes have depth/branch limits and retain incomplete
 sessions after cancellation instead of allowing replay.
 
-Still open: physical MSI delivery verification, queue reset and fault-source
+Navi48 compute recovery now falls back from a timed-out HQD dequeue to an
+RS64 MEC pipe reset, clearing all four pipe-0 HQDs while reset is held and
+preserving other MEC controls. RLC safe mode brackets recovery; unexpected
+active sibling queues, failed MES suspension and uncertain register writes
+refuse recovery. Cancellation during the MMIO reset retains the owners and
+prevents replay. The existing remap and fence test must still complete before
+job memory can retire. Register models and Linux-header checks cover this
+path; physical recovery remains unverified.
+
+Still open: physical MSI delivery verification, device reset and fault-source
 re-arming after containment, GC12 rendering and shader
 dispatch, production GPU VM and userspace submission, VCN5 video queues, native DCN4 clock/bandwidth/link
 and scanout programming, THM/SMU thermal interrupts and software-CTF shutdown,

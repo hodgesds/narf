@@ -748,8 +748,8 @@ impl ColdBoot {
     /// complete through it. Returns that fence's sequence.
     ///
     /// LINUX-GAP: the jobs behind the hung one are not re-emitted. A failed
-    /// suspend does not ask MES which other queues hung (there are no user
-    /// or KFD queues to find); the compute reset goes ahead.
+    /// suspend does not ask MES which other queues hung; it fails recovery
+    /// before any MMIO reset. There are no user or KFD queues yet.
     /// # Safety
     /// As `submit_client_job`, and every job on the ring keeps what it
     /// reaches until this returns Ok.
@@ -770,8 +770,9 @@ impl ColdBoot {
                 .map_err(queues::Error::Mes)?,
             queues::Pipe::Compute => {
                 // SAFETY: as above; every suspend is followed by a resume.
-                let _ = unsafe { mes.all_gangs(true) }.await;
+                let suspended = unsafe { mes.all_gangs(true) }.await;
                 let reset = async {
+                    suspended.map_err(queues::Error::Mes)?;
                     // SAFETY: the gangs are suspended and OWNER keeps every
                     // other GRBM selector user out.
                     unsafe { queues.reset_compute_hqd() }.await?;

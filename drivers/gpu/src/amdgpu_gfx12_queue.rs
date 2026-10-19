@@ -53,6 +53,11 @@ const RING_DWORDS: u64 = 1024;
 const DEQUEUE_REQUEST: u64 = 0x1fc1;
 const COMPUTE_QUEUE_RESET: u64 = 0x1f73;
 const HQD_ACTIVE: u64 = 0x1fab;
+/// GC segment 1: RLC safe-mode handshake and the RS64 MEC pipe control.
+const RLC_CNTL: u64 = 0x4c00;
+const RLC_SAFE_MODE: u64 = 0x980;
+const MEC_RS64_CNTL: u64 = 0x2904;
+const MEC_PIPE0_RESET: u32 = 1 << 16;
 /// GRBM_GFX_CNTL selecting the compute queue: MEC1 (MEID 1, bits 3:2),
 /// pipe 0, queue 0.
 const COMPUTE_SELECT: u32 = 4;
@@ -85,6 +90,10 @@ pub enum State {
     Verified,
     InterruptSubmitted(u8),
     InterruptVerified,
+    /// A dropped recovery keeps both queues quarantined.
+    ResettingCompute,
+    /// The HQD reset completed; MES must unmap it before `restore`.
+    ComputeReset,
     Failed(Error),
 }
 /// A client job: IBs in VMID `vmid`'s address space, whose page directory
@@ -290,9 +299,9 @@ impl Layout {
             return Err(Error::Unsupported);
         }
         Ok(Self {
-            gc: bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 0, 0x1fab)
+            gc: bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 0, DEQUEUE_REQUEST as u32)
                 .map_err(|_| Error::Unsupported)?,
-            hyp: bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 1, 0x900)
+            hyp: bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 1, RLC_CNTL as u32)
                 .map_err(|_| Error::Unsupported)?,
             oss: bank(gpu, ip::HW_ID_OSSSYS, &[(7, 0, 0)], 0, 0x1f)
                 .map_err(|_| Error::Unsupported)?,
@@ -444,8 +453,7 @@ fn selected<I: Io, T>(
     f: impl FnOnce(&mut I) -> Result<T, Error>,
 ) -> Result<T, Error> {
     let prior = checked(io.read(l.hyp + 0x900 * 4))?;
-    select(io, l, COMPUTE_SELECT)?;
-    let result = f(io);
+    let result = select(io, l, COMPUTE_SELECT).and_then(|()| f(io));
     select(io, l, prior)?;
     result
 }
@@ -776,12 +784,57 @@ impl<I: Io> Engine<I> {
     /// mes_v12_0_reset_queue_mmio for the compute queue: with it selected,
     /// a reset dequeue (CP_HQD_DEQUEUE_REQUEST 2) and SPI's compute queue
     /// reset, then up to amdgpu's usec_timeout for the HQD to go inactive.
-    /// LINUX-GAP: an HQD that stays active is not followed by Linux's MEC
-    /// pipe reset; the reset fails.
+    /// On timeout, mes_v12_0_reset_compute_pipe_mmio's RS64 fallback clears
+    /// all four HQDs while pipe 0 is held in reset. RLC safe mode covers
+    /// both paths. Cancellation/failure does not permit submission or replay.
     async fn reset_compute_hqd(&mut self) -> Result<(), Error> {
         if self.state != State::InterruptVerified {
             return Err(Error::Busy);
         }
+        self.state = State::ResettingCompute;
+        let result = self.reset_compute_inner().await;
+        self.state = match result {
+            Ok(()) => State::ComputeReset,
+            Err(e) => State::Failed(e),
+        };
+        result
+    }
+    async fn reset_compute_inner(&mut self) -> Result<(), Error> {
+        let l = self.layout;
+        // As amdgpu_gfx_rlc_enter_safe_mode: a disabled RLC has no command
+        // consumer. For a running RLC, always protect against clock gating.
+        let rlc = self.access(|io| Ok(checked(io.read(l.hyp + RLC_CNTL * 4))? & 1 != 0))?;
+        let result = async {
+            if rlc {
+                self.access(|io| {
+                    io.write(l.hyp + RLC_SAFE_MODE * 4, 3); // CMD + enter message
+                    Ok(())
+                })?;
+                let deadline = narf_time::Deadline::after_us(100_000);
+                loop {
+                    if self.access(|io| checked(io.read(l.hyp + RLC_SAFE_MODE * 4)))? & 1 == 0 {
+                        break;
+                    }
+                    if deadline.expired() {
+                        return Err(Error::Timeout);
+                    }
+                    self.io.delay().await;
+                }
+            }
+            self.dequeue_compute_hqd().await
+        }
+        .await;
+        if rlc {
+            // gfx_v12_0_unset_safe_mode, including returned-error paths.
+            // A dropped future leaves safe mode and the owners quarantined.
+            self.access(|io| {
+                io.write(l.hyp + RLC_SAFE_MODE * 4, 1);
+                Ok(())
+            })?;
+        }
+        result
+    }
+    async fn dequeue_compute_hqd(&mut self) -> Result<(), Error> {
         let l = self.layout;
         self.access(|io| {
             selected(io, l, |io| {
@@ -801,10 +854,56 @@ impl<I: Io> Engine<I> {
                 return Ok(());
             }
             if deadline.expired() {
-                return Err(Error::Timeout);
+                return self.reset_compute_pipe();
             }
             self.io.delay().await;
         }
+    }
+    fn reset_compute_pipe(&mut self) -> Result<(), Error> {
+        let l = self.layout;
+        self.access(|io| {
+            selected(io, l, |io| {
+                // This owner maps only queue 0. Do not destroy an unexpected
+                // sibling's work by broadening a queue reset to the whole pipe.
+                for queue in 1..4 {
+                    select(io, l, COMPUTE_SELECT | (queue << 8))?;
+                    if checked(io.read(l.gc + HQD_ACTIVE * 4))? & 1 != 0 {
+                        return Err(Error::Busy);
+                    }
+                }
+                select(io, l, COMPUTE_SELECT)?;
+                let control = l.hyp + MEC_RS64_CNTL * 4;
+                let saved = checked(io.read(control))?;
+                if saved & MEC_PIPE0_RESET != 0 {
+                    return Err(Error::Busy);
+                }
+                io.write(control, saved | MEC_PIPE0_RESET);
+                if checked(io.read(control))? & MEC_PIPE0_RESET == 0 {
+                    return Err(Error::Readback);
+                }
+                // GC12.0.1 has four HQDs per MEC pipe. No await between
+                // assertion, clearing every HQD and deassertion. If any clear
+                // is uncertain, retain reset rather than restart that HQD.
+                for queue in 0..4 {
+                    select(io, l, COMPUTE_SELECT | (queue << 8))?;
+                    io.write(l.gc + HQD_ACTIVE * 4, 0);
+                    io.write(l.gc + DEQUEUE_REQUEST * 4, 0);
+                    if checked(io.read(l.gc + HQD_ACTIVE * 4))? & 1 != 0
+                        || checked(io.read(l.gc + DEQUEUE_REQUEST * 4))? != 0
+                    {
+                        return Err(Error::Readback);
+                    }
+                }
+                select(io, l, COMPUTE_SELECT)?;
+                io.write(control, saved & !MEC_PIPE0_RESET);
+                if checked(io.read(control))? & MEC_PIPE0_RESET != 0 {
+                    return Err(Error::Readback);
+                }
+                // Linux treats the instruction-pointer check as diagnostic;
+                // only the subsequent ring test proves the CP is running.
+                Ok(())
+            })
+        })
     }
     /// amdgpu_gfx_mqd_reset_restore, once the reset queue is unmapped: its
     /// descriptor as first built, a ring of NOPs (amdgpu_ring_clear_ring)
@@ -812,7 +911,11 @@ impl<I: Io> Engine<I> {
     /// pointer report is cleared too, as the remapped queue starts at 0
     /// and nothing writes it while the HQD is unmapped.
     fn restore(&mut self, pipe: Pipe) -> Result<(), Error> {
-        if self.state != State::InterruptVerified {
+        let expected = match pipe {
+            Pipe::Compute => State::ComputeReset,
+            Pipe::Graphics => State::InterruptVerified,
+        };
+        if self.state != expected {
             return Err(Error::Busy);
         }
         let l = self.layout;
@@ -833,6 +936,7 @@ impl<I: Io> Engine<I> {
             Ok(())
         })?;
         self.job_wptr[pipe.index()] = 0;
+        self.state = State::InterruptVerified;
         Ok(())
     }
     /// The last job sequence `pipe`'s fence reached.
@@ -968,7 +1072,8 @@ impl Queues {
     /// Reset the hung compute queue's HQD by MMIO (see
     /// `Engine::reset_compute_hqd`).
     /// # Safety
-    /// MES has suspended its gangs, nothing else selects GRBM queues
+    /// MES has suspended its gangs, the caller exclusively owns all four
+    /// HQDs on MEC1 pipe 0 and RLC safe mode, nothing else selects GRBM queues
     /// meanwhile, and every job the queue holds keeps its memory until a
     /// later fence on it lands.
     pub async unsafe fn reset_compute_hqd(&mut self) -> Result<(), Error> {
