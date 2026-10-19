@@ -1,0 +1,23 @@
+{
+  "source": {
+    "project": "IGT GPU Tools",
+    "version": "2.4",
+    "url": "https://www.x.org/releases/individual/app/igt-gpu-tools-2.4.tar.xz",
+    "archive_sha256": "a44b7d089a27555944d4cd5da372c9339501539e3cd2735bbdb30e0d802f1cbe",
+    "file": "lib/amdgpu/amd_mmd_frame.h",
+    "license": "MIT",
+    "copyright": [
+      "2014 Advanced Micro Devices, Inc.",
+      "2023 Advanced Micro Devices, Inc."
+    ]
+  },
+  "width": 160,
+  "height": 128,
+  "format": "NV12",
+  "arrays": {
+    "frame": {
+      "bytes": 30720,
+      "sha256": "613e1a7c110b94d82006ba42463030c514f0f86c2cab36e999ffb0182ff1b538"
+    }
+  }
+}

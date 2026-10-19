@@ -893,10 +893,119 @@ or failure is terminal. Automatic whole-device recovery remains disabled:
 the caller must exclude CPU VRAM/GOP/mmap access. Boots needing GDDR6 training
 replay refuse this path before hardware changes.
 
-Still open: physical MSI delivery verification and physical reset/replay
-acceptance, fault-source re-arming after containment, GC12 rendering and shader
-dispatch, production GPU VM and userspace submission, VCN5 video queues, native DCN4 clock/bandwidth/link
-and scanout programming, THM/SMU thermal interrupts and software-CTF shutdown,
+The optional `amdgpu.shader_proof` boot diagnostic now dispatches a fixed
+gfx1201 wave32 shader on both retained kernel GC12 queues, after the GC12
+and SDMA interrupt proofs drain. It makes only the owned code PTE executable,
+programs native logical SH resource state, and checks all 32 lane results,
+the output page's poison guards, exact fences, ring drain and fresh matching
+EOP/CPU-delivery evidence. Failure/cancellation blocks further GC12 work and
+retains storage. Whole-device recovery repeats the requested proof before
+publishing its new submitter. Independent LLVM assembly, Linux-header checks
+and execution/failure models cover this path; physical execution is unverified.
+It does not enable Mesa acceleration or exercise draw state or client VMIDs.
+
+Navi48 interrupt handoff now accepts the client VMIDs initialized by its own
+GMC owner. The previous monitor required them disabled, contradicting cold
+boot's client-context setup and preventing native service handoff. Fresh
+same-device checks require every client context to retain the owned empty
+root, VA range and nonretrying control before arming. Fault IRQs now cover
+all sixteen VMIDs on both hubs; containment and partial-write cleanup mask
+the same owned set while preserving translation policy and EOP enables.
+GMC-to-monitor integration and negative register models cover this path;
+physical handoff remains unverified.
+
+Contained Navi48 faults now use coordinated graphics/compute/SDMA0 recovery.
+Client retirement and submissions freeze before all three reset/fence tests;
+late IVs and VM latches remain diagnostic evidence. A generation-bound receipt
+guards source re-arming, unchanged controls are verified, and old interrupt
+handles are invalidated. Guilty contexts are excluded and healthy jobs replay
+under stable tickets before all ledgers reopen together. Cancellation or any
+uncertain stage keeps memory pinned; poison, kernel VM faults and unsupported
+owners require explicit device recovery. Hardware acceptance remains pending.
+
+Native GC12 and SDMA0 client slots now request an HDP flush on their own
+ring and wait for the engine-specific NBIO acknowledgement before IB
+execution, including submissions that reuse a VMID without a VM flush.
+Linux-header checks pin both supported NBIO layouts and packet fields;
+models cover packet ordering and blocked GC12 acknowledgement.
+
+Navi48 now has a retained VCN5.0.0 static-power unified-ring owner and an
+opt-in `amdgpu.media_proof` power/transport/retirement cycle. Owned firmware
+windows, NBIF doorbells, fresh fence/RPTR completion, byte shared-state
+updates and VCPU/LMI shutdown follow the local Linux reference. SMU14 media
+power commands require fresh protection/static-clock checks. Cancellation
+or uncertainty retains memory and blocks clients. Source-119 dispatch now
+wakes a registered VCN owner; a fresh proof requires fence/RPTR/trap and,
+with an MSI route, CPU delivery. Registration stays retained on uncertainty
+and is retired only after proven shutdown/power-down, so shared fault re-arm
+cannot overlook a live media owner. Register/queue models cover these paths;
+codec streams, JPEG and physical IRQ acceptance remain open, with no codec
+capabilities advertised.
+
+The VCN5 backend can now publish owned client IB frames with MMHUB4.1
+flush/semaphore ordering, the MMHUB PASID LUT, HDP visibility and native
+fences. Masked ring pointers and backpressure match Linux; once published,
+a job always returns a sequence so its resources remain retained through
+later errors. Models cover packet fields, ring wrap/full and revocation at
+publication. The opt-in `amdgpu.navi48_media` now retains the proven owner
+and exposes the unified VCN_ENC queue with a separate MMHUB VMID pool and
+generic CS resource retention; user fences are refused. Before publication,
+the native session IB test now runs Linux's fixed encode/decode create/destroy
+messages in separately retained context/IB/message storage, requiring new
+fence/RPTR/trap/CPU evidence and unchanged command-page guards. Its pending
+phase closes clients, and cancellation/failure retains every allocation.
+Rust builders match unchanged Linux constructors in a host capture harness.
+The opt-in `amdgpu.decode_proof` now submits a pinned IGT AVC picture fixture
+in a separately retained guarded arena, requiring new completion evidence and
+the upstream output checksum. Page-wise initialization/readback cooperates
+with the executor. Diagnostics retain the pending/result phase, failures keep
+all backing pinned and requested tests repeat after media recovery. Descriptor
+builders and fixture bytes match unchanged IGT source; device models exercise
+missing/wrong output, guards, partial execution and cancellation. Real picture
+decoding remains pending physical acceptance, with codec profiles unadvertised.
+The opt-in `amdgpu.encode_proof` adds fixed NV12 create/IDR/close tasks in a
+separate retained arena, with the full declared output range backed and guarded.
+Fresh completion, bounded matching SPS/PPS/IDR headers and intact command/input
+storage are required before publication and after recovery. Builders and input
+match pinned IGT source; synthetic model headers verify ownership and parsing,
+while physical encoding, complete bitstream conformance and picture quality
+remain acceptance work. This proof advertises no codec capability.
+The opt-in `amdgpu.jpeg_proof` adds a retained JPEG5 static-power JRBC and IB
+transport/interrupt/retirement cycle. It preserves VCN's shared NBIO range,
+uses separately reserved GPCOM fence dwords and requires DMA-clean evidence
+before memory reuse. A registered exact-source JPEG owner participates in
+fault containment; incomplete recovery cannot omit it. Transport models and
+unchanged Linux constructor checks support this stage. JPEG picture execution,
+native clients and physical acceptance remain open.
+The additional `amdgpu.jpeg_decode_proof` submits pinned IGT JPEG5 picture
+commands in a separate guarded arena and requires a fresh native completion
+plus the active luma/chroma checksum. Input, command and output guards remain
+checked; failure/cancellation retains all backing and requested picture proofs
+repeat after recovery. Models test synthetic pixels, not JPEG decoding;
+physical picture execution and native JPEG clients remain open.
+Fault recovery
+requires all four retirements and renewed owners, followed by a new media
+interrupt and session IB proof before ledger commit. Media restart cancels old codec
+contexts instead of replaying their IBs. Fence readers skip frozen media
+and drain before power changes and reopening retirement. Dispatch follows
+known PASIDs across VMID changes and limits unknown latches to their hub.
+Models cover the fourth owner, exact ring gating, Linux INFO_HW_IP alignment
+and cancelled-session lifetimes. Known-stream codec validation, JPEG and
+physical acceptance remain open.
+
+Recovery attribution now follows the nonzero PASID carried in a client IV,
+so a late fault cannot blame the address space that reused its VMID. Latches
+and PASID-less vectors conservatively cancel work only on their own hub;
+attribution overflow requires device recovery. Logical client tickets skip
+the CS ABI's reserved zero handle when wrapping. GC12, SDMA7 and VCN5 fence
+samples now check presence around the read and revalidate authority. Failed
+current-generation sampling marks device loss before waking waiters and keeps
+allocations pinned; old readers cannot fail a replacement device.
+
+Still open: physical MSI delivery and reset/replay acceptance, GC12 rendering
+and application shader execution, GPU VM/userspace and DCN4
+clock/bandwidth/link/scanout hardware acceptance, VCN5 known-stream video,
+THM/SMU thermal interrupts and software-CTF shutdown,
 memory/fabric DPM relaxation (display admission/watermark rework first),
 reset/suspend/resume, and physical RX 9070 XT testing.
 The verified DMA proof covers only two kernel-owned VRAM pages. The driver

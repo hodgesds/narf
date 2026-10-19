@@ -25,11 +25,16 @@ struct Fake {
     rptr_stuck: bool,
     busy: bool,
     revoked: Option<Cap<BusDeviceCap, Write>>,
+    fence_revoke: Option<Cap<BusDeviceCap, Write>>,
+    fence_gone: bool,
+    fence_reads: u32,
     regs: BTreeMap<u64, u32>,
     /// Client-job packets the CP ran: register writes, waits (reg0, reg1,
     /// reference, mask, info), PFP syncs and IBs (address, control).
     job_writes: Vec<(u32, u32)>,
     job_waits: Vec<(u32, u32, u32, u32, u32)>,
+    job_hdp: Vec<u32>,
+    hdp_complete: bool,
     job_syncs: u32,
     /// Pipeline syncs: (fence address, sequence waited for).
     job_pipeline_syncs: Vec<(u64, u32)>,
@@ -51,8 +56,81 @@ struct Fake {
     rlc_pending: u8,
     /// A ring restored after a reset runs client slots from 0.
     restored: bool,
+    shader_execute: bool,
+    shader_corrupt: bool,
+    shader_overrun: bool,
+    shader_skip_fence: bool,
 }
 impl Fake {
+    /// Independent PM4/ISA model for the small proof kernel. Only the
+    /// shader interpreter stores output: an IB/fence alone cannot pass.
+    fn execute_shader(&mut self) {
+        let mut regs = BTreeMap::new();
+        let mut dispatch = false;
+        let ib = self.target[64..320].to_vec();
+        let mut pos = 0;
+        while pos < ib.len() {
+            let w = &ib[pos..];
+            let length = ((w[0] >> 16) & 0x3fff) as usize + 2;
+            match (w[0] >> 8) & 255 {
+                0x76 => {
+                    assert_eq!(w[0] & 3, 2);
+                    for (i, v) in w[2..length].iter().enumerate() {
+                        regs.insert(w[1] + i as u32, *v);
+                    }
+                }
+                0x15 => {
+                    assert_eq!(&w[..5], &[0xc0031502, 1, 1, 1, 0x8045]);
+                    dispatch = true;
+                }
+                0x10 => {}
+                op => panic!("unexpected shader IB opcode {op:#x}"),
+            }
+            pos += length;
+        }
+        assert!(dispatch);
+        assert_eq!((regs[&0x207], regs[&0x208], regs[&0x209]), (32, 1, 1));
+        assert_eq!(
+            (regs[&0x212], regs[&0x213], regs[&0x228]),
+            (0x60000000, 6, 0)
+        );
+        assert_eq!(
+            u64::from(regs[&0x20c]) << 8 | u64::from(regs[&0x20d]) << 40,
+            VA
+        );
+        let pointer = u64::from(regs[&0x240]) | u64::from(regs[&0x241]) << 32;
+        assert_eq!(pointer, VA + 4160);
+        let salt = regs[&0x242];
+        if !self.shader_execute {
+            return;
+        }
+        for lane in 0..32u32 {
+            let mut v = [lane, 0];
+            let mut pc = 0;
+            let mut stored = false;
+            while pc < 8 {
+                match self.target[pc] {
+                    0x30000082 => v[0] <<= 2,
+                    0xbf870001 => {} // explicit VALU dependency wait
+                    0x3a020002 => v[1] = salt ^ v[0],
+                    0xee068000 => {
+                        assert_eq!(&self.target[pc + 1..pc + 3], &[0x008c0000, 0]);
+                        let at = ((pointer - VA + u64::from(v[0])) / 4) as usize;
+                        self.target[at] = v[1] ^ u32::from(self.shader_corrupt);
+                        stored = true;
+                        pc += 2;
+                    }
+                    0xbfc10000 => assert!(stored),
+                    0xbfb00000 => break,
+                    word => panic!("unexpected gfx1201 proof instruction {word:#x}"),
+                }
+                pc += 1;
+            }
+        }
+        if self.shader_overrun {
+            self.target[1072] = 0;
+        } // just past output
+    }
     /// A CP running client-job slots of `pipe` from its RPTR to `tail`.
     fn execute_jobs(&mut self, pipe: usize, tail: u64) {
         let off = pipe * 3072;
@@ -62,6 +140,9 @@ impl Fake {
         while rptr < tail {
             let slot = off + (rptr % 1024) as usize;
             let mut cursor = 0;
+            let mut shader_job = false;
+            let mut hdp = false;
+            let mut context = false;
             while cursor < 256 {
                 let words = &self.memory[slot + cursor..slot + 256];
                 let header = words[0];
@@ -88,6 +169,27 @@ impl Fake {
                         assert_eq!(self.memory[((address - GPU) / 4) as usize], words[4]);
                         self.job_pipeline_syncs.push((address, words[4]));
                     }
+                    0x3c if words[2] == 0x60000 / 4 + 0x106 => {
+                        assert!(!context, "HDP before context control");
+                        let (mask, engine) = if pipe == 0 { (1, 0x100) } else { (4, 0) };
+                        assert_eq!(
+                            words[..length],
+                            [
+                                0xc0053c00,
+                                0x43 | engine,
+                                0x18106,
+                                0x18107,
+                                mask,
+                                mask,
+                                0x20
+                            ]
+                        );
+                        self.job_hdp.push(mask);
+                        if !self.hdp_complete {
+                            return; // no IB or completion can pass the handshake
+                        }
+                        hdp = true;
+                    }
                     0x3c => {
                         assert_eq!((length, words[6]), (7, 0x20));
                         self.job_waits
@@ -99,6 +201,7 @@ impl Fake {
                     }
                     0x28 => {
                         assert_eq!((pipe, length, words[2]), (0, 3, 0), "graphics only");
+                        context = true;
                         self.job_context_controls.push(words[1]);
                     }
                     0x58 => {
@@ -107,13 +210,30 @@ impl Fake {
                     }
                     0x3f => {
                         assert_eq!(length, 4);
-                        self.job_ibs
-                            .push((u64::from(words[1]) | u64::from(words[2]) << 32, words[3]));
+                        if words[3] & 0x0f00_0000 != 0 {
+                            assert!(hdp, "HDP acknowledgement before client IB");
+                        }
+                        let address = u64::from(words[1]) | u64::from(words[2]) << 32;
+                        self.job_ibs.push((address, words[3]));
+                        if address == VA + crate::amdgpu_gfx12_shader::IB_OFFSET {
+                            shader_job = true;
+                            self.execute_shader();
+                        }
                     }
                     0x49 => {
                         assert_eq!((length, words[1], words[2]), (8, 0x06600514, 0x22000000));
                         let address = u64::from(words[3]) | (u64::from(words[4]) << 32);
-                        self.memory[((address - GPU) / 4) as usize] = words[5];
+                        if !shader_job || !self.shader_skip_fence {
+                            self.memory[((address - GPU) / 4) as usize] = words[5];
+                        }
+                        if shader_job {
+                            if self.emit_eop {
+                                self.eop[pipe].fetch_add(1, Ordering::SeqCst);
+                            }
+                            if self.emit_cpu {
+                                self.eop[2].fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
                     }
                     0x10 => {}
                     op => panic!("unexpected job opcode {op:#x}"),
@@ -123,7 +243,9 @@ impl Fake {
             assert_eq!(cursor, 256, "the job fills its slot exactly");
             rptr += 256;
             // GC12 writes back only the low 32 bits.
-            self.memory[off + 2560] = rptr as u32;
+            if !self.rptr_stuck {
+                self.memory[off + 2560] = rptr as u32;
+            }
         }
     }
     fn execute(&mut self, pipe: usize, tail: u32) {
@@ -264,6 +386,15 @@ impl Io for Fake {
     fn memory_read(&mut self, map: MmioRegion, at: u64) -> u32 {
         assert!(!self.dirty);
         if map.phys.raw() == 0x90004000 {
+            if at == JOB_FENCE || at == PIPE_BYTES + JOB_FENCE {
+                self.fence_reads += 1;
+                if self.fence_gone {
+                    self.regs.insert(0x60000 + 0xc3 * 4, u32::MAX);
+                }
+                if let Some(cap) = self.fence_revoke {
+                    cap.revoke();
+                }
+            }
             self.memory[(at / 4) as usize]
         } else {
             self.target[(at / 4) as usize]
@@ -363,6 +494,9 @@ fn fixture() -> (Pool, Engine<Fake>, FakeMes, gmc::Aperture, MmioRegion) {
             rptr_stuck: false,
             busy: false,
             revoked: None,
+            fence_revoke: None,
+            fence_gone: false,
+            fence_reads: 0,
             regs: BTreeMap::from([
                 (0x17828, 0x84000000),
                 (0x17894, 0x84000000),
@@ -372,6 +506,8 @@ fn fixture() -> (Pool, Engine<Fake>, FakeMes, gmc::Aperture, MmioRegion) {
             ]),
             job_writes: Vec::new(),
             job_waits: Vec::new(),
+            job_hdp: Vec::new(),
+            hdp_complete: true,
             job_syncs: 0,
             job_pipeline_syncs: Vec::new(),
             job_context_controls: Vec::new(),
@@ -386,6 +522,10 @@ fn fixture() -> (Pool, Engine<Fake>, FakeMes, gmc::Aperture, MmioRegion) {
             rlc_stuck: false,
             rlc_pending: 0,
             restored: false,
+            shader_execute: true,
+            shader_corrupt: false,
+            shader_overrun: false,
+            shader_skip_fence: false,
         },
         authority: Cap::bootstrap(),
         layout: Layout {
@@ -401,6 +541,8 @@ fn fixture() -> (Pool, Engine<Fake>, FakeMes, gmc::Aperture, MmioRegion) {
         interrupt_result: None,
         job_wptr: [512; 2],
         job_seq: [0; 2],
+        shader_engines: 4,
+        shader_result: None,
     };
     let mes = FakeMes {
         mapped,
@@ -590,7 +732,7 @@ impl Observer for FakeObserver {
         let pipe = match source {
             Source::Graphics => 0,
             Source::Compute => 1,
-            Source::Sdma0 => panic!("unexpected SDMA sample"),
+            Source::Sdma0 | Source::Vcn0 | Source::Jpeg0 => panic!("unexpected non-CP sample"),
         };
         Ok(interrupts::Sample {
             source,
@@ -607,7 +749,7 @@ impl Observer for FakeObserver {
             self.counters[match sample.source {
                 Source::Graphics => 0,
                 Source::Compute => 1,
-                Source::Sdma0 => panic!("unexpected SDMA sample"),
+                Source::Sdma0 | Source::Vcn0 | Source::Jpeg0 => panic!("unexpected non-CP sample"),
             }]
             .load(Ordering::SeqCst),
         ) == sample.count + 1
@@ -787,6 +929,7 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
         || e.io.job_pipeline_syncs != [(GPU + 10496, 0)]
         || e.io.job_context_controls != [0x8101_8003]
         || e.io.job_mem_syncs != 0
+        || e.io.job_hdp != [1]
         || e.io.job_ibs != [(0x2_0000_1000, 64 | 3 << 24)]
         || e.io.memory[2562] != 768
     {
@@ -850,12 +993,14 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
         || e.io.job_ibs.last() != Some(&(0x2_0000_4000, 8 | 1 << 23 | 2 << 24))
         || e.io.memory[3072 + 2562] != 768
         || e.io.job_pipeline_syncs.last() != Some(&(GPU + 12288 + 10496, 0))
+        || e.io.job_hdp.last() != Some(&4)
     {
         return TestResult::Fail("compute job");
     }
     // A reused VMID: no flush and no LUT write, only the IB and fence.
     let (writes, waits) = (e.io.job_writes.len(), e.io.job_waits.len());
     let pipeline_syncs = e.io.job_pipeline_syncs.len();
+    let hdp = e.io.job_hdp.len();
     let reused = Job {
         flush: false,
         map_pasid: false,
@@ -866,6 +1011,8 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
         || e.io.job_writes.len() != writes
         || e.io.job_waits.len() != waits
         || e.io.job_pipeline_syncs.len() != pipeline_syncs
+        || e.io.job_hdp.len() != hdp + 1
+        || e.io.job_hdp.last() != Some(&4)
         || e.io.job_ibs.last() != Some(&(0x2_0000_4000, 8 | 1 << 23 | 2 << 24))
     {
         return TestResult::Fail("job on a reused VMID");
@@ -926,6 +1073,38 @@ fn gfx12_graphics_queue_runs_client_jobs_with_vm_flushes() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/gfx12",
     gfx12_graphics_queue_runs_client_jobs_with_vm_flushes
+);
+
+/// A missing NBIO acknowledgement must prevent both the IB and its fence,
+/// even when the VMID itself needs no flush and the CP has ring space.
+fn gfx12_hdp_acknowledgement_precedes_execution_on_both_queues() -> TestResult {
+    for pipe in [Pipe::Graphics, Pipe::Compute] {
+        let (_pool, mut e, mut mes, aperture, target) = fixture();
+        run(e.initialize(&mut mes, aperture, target)).unwrap();
+        e.state = State::InterruptVerified;
+        let p = pipe.index();
+        e.io.memory[p * 3072 + 2560] = 512;
+        e.io.hdp_complete = false;
+        let job = Job {
+            flush: false,
+            map_pasid: false,
+            ..Job::new(3, 0x42, 0, &[(0x2_0000_1000, 64)]).unwrap()
+        };
+        assert_eq!(e.submit(pipe, job), Ok(1));
+        assert_eq!(e.completed_job(pipe), Ok(0));
+        assert_eq!(e.io.memory[p * 3072 + 2560], 512);
+        assert!(e.io.job_ibs.is_empty());
+        assert_eq!(e.io.job_hdp, [if p == 0 { 1 } else { 4 }]);
+        e.io.hdp_complete = true;
+        e.io.execute_jobs(p, 768);
+        assert_eq!(e.io.job_ibs.len(), 1);
+        assert_eq!(e.completed_job(pipe), Ok(1));
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_hdp_acknowledgement_precedes_execution_on_both_queues
 );
 
 /// gfx_v12_0_reset_kcq's queue half: a reset dequeue and SPI queue reset
@@ -1159,4 +1338,246 @@ fn gfx12_compute_reset_requires_rlc_acknowledgement() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/gfx12",
     gfx12_compute_reset_requires_rlc_acknowledgement
+);
+
+fn shader_ready() -> (Pool, Engine<Fake>, gmc::Aperture, MmioRegion, FakeObserver) {
+    let (pool, mut e, mut mes, aperture, target) = fixture();
+    run(e.initialize(&mut mes, aperture, target)).unwrap();
+    let mut observer = FakeObserver::new(&e);
+    e.io.regs.insert(0x17828, 0x84100000);
+    e.io.regs.insert(0x17894, 0x84200000);
+    run(e.prove_interrupts(&mut observer, aperture, target)).unwrap();
+    (pool, e, aperture, target, observer)
+}
+fn gfx12_shader_proof_requires_isa_output_and_fresh_completion() -> TestResult {
+    for msi in [true, false] {
+        let (pool, mut e, aperture, target, mut observer) = shader_ready();
+        observer.msi = msi;
+        e.io.emit_cpu = msi;
+        let proof = run(e.prove_shaders(&mut observer, async { Ok((aperture, target)) })).unwrap();
+        assert_eq!(
+            proof,
+            crate::amdgpu_gfx12_shader::Proof {
+                lanes: 32,
+                fences: [1, 1],
+                msi_verified: msi
+            }
+        );
+        assert_eq!(e.shader_result, Some(Ok(proof)));
+        assert_eq!(e.state, State::InterruptVerified);
+        assert_eq!(e.job_wptr, [768, 768]);
+        assert_eq!(e.io.job_ibs.len(), 2);
+        assert_eq!(
+            run(e.prove_shaders(&mut observer, async { Ok((aperture, target)) })),
+            Err(Error::Busy)
+        );
+        // Client fences continue after the diagnostic's physical sequence.
+        // The completed proof must not retire a subsequently stalled IB.
+        let job = Job::new(3, 0x1234, 0x1_0000_8001, &[(0x2_0000_1000, 64)]).unwrap();
+        e.io.complete = false;
+        for pipe in [Pipe::Graphics, Pipe::Compute] {
+            assert_eq!(e.submit(pipe, job), Ok(2));
+            assert_eq!(e.completed_job(pipe), Ok(1));
+            e.io.execute_jobs(pipe.index(), 1024);
+            assert_eq!(e.completed_job(pipe), Ok(2));
+        }
+        drop(e);
+        assert_eq!(pool.available(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_shader_proof_requires_isa_output_and_fresh_completion
+);
+fn gfx12_shader_failures_never_enable_clients_or_release_memory() -> TestResult {
+    for case in 0..8 {
+        let (pool, mut e, aperture, target, mut observer) = shader_ready();
+        let expected = match case {
+            0 => {
+                e.io.shader_execute = false;
+                Error::DataMismatch
+            }
+            1 => {
+                e.io.shader_corrupt = true;
+                Error::DataMismatch
+            }
+            2 => {
+                e.io.shader_overrun = true;
+                Error::DataMismatch
+            }
+            3 => {
+                e.io.shader_skip_fence = true;
+                Error::Timeout
+            }
+            4 => {
+                e.io.emit_eop = false;
+                Error::Timeout
+            }
+            5 => {
+                e.io.emit_cpu = false;
+                Error::Timeout
+            }
+            6 => {
+                e.io.rptr_stuck = true;
+                Error::Timeout
+            }
+            _ => {
+                observer.reject = true;
+                Error::Interrupts(crate::amdgpu_ih7::Error::Protocol)
+            }
+        };
+        let result = run(e.prove_shaders(&mut observer, async { Ok((aperture, target)) }));
+        assert_eq!(result, Err(expected));
+        assert_eq!(e.state, State::Failed(expected));
+        assert_eq!(e.submit_fence(Pipe::Compute), Err(Error::Busy));
+        drop(e);
+        assert_eq!(pool.available(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_shader_failures_never_enable_clients_or_release_memory
+);
+fn gfx12_shader_cancellation_and_late_clients_refuse_replay() -> TestResult {
+    for before_publish in [true, false] {
+        let (pool, mut e, aperture, target, mut observer) = shader_ready();
+        if !before_publish {
+            e.io.complete = false;
+        }
+        {
+            let prepare = async {
+                if before_publish {
+                    core::future::pending::<()>().await;
+                }
+                Ok((aperture, target))
+            };
+            let mut future = core::pin::pin!(e.prove_shaders(&mut observer, prepare));
+            assert!(future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+        }
+        assert!(matches!(e.state, State::ShaderSubmitted(_)));
+        let bells = e.io.bells.len();
+        assert_eq!(
+            run(e.prove_shaders(&mut observer, async { Ok((aperture, target)) })),
+            Err(Error::Busy)
+        );
+        assert_eq!(e.submit_fence(Pipe::Graphics), Err(Error::Busy));
+        assert_eq!(e.io.bells.len(), bells);
+        drop(e);
+        assert_eq!(pool.available(), 0);
+    }
+    let (_, mut e, aperture, target, mut observer) = shader_ready();
+    e.submit_fence(Pipe::Compute).unwrap();
+    let bells = e.io.bells.len();
+    let called = core::sync::atomic::AtomicBool::new(false);
+    assert_eq!(
+        run(e.prove_shaders(&mut observer, async {
+            called.store(true, Ordering::SeqCst);
+            Ok((aperture, target))
+        })),
+        Err(Error::Busy)
+    );
+    assert!(!called.load(Ordering::SeqCst));
+    assert_eq!(e.io.bells.len(), bells);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_shader_cancellation_and_late_clients_refuse_replay
+);
+
+fn gfx12_shader_rejects_unowned_addresses_and_failed_preparation() -> TestResult {
+    use crate::amdgpu_gfx12_shader as shader;
+    for (code, output, engines) in [
+        (VA + 4, VA + 4160, 4),
+        (1 << 48, VA + 4160, 4),
+        (VA, VA + 4161, 4),
+        (VA, (1 << 48) - 124, 4),
+        (VA, u64::MAX - 3, 4),
+        (VA, VA + 4160, 0),
+        (VA, VA + 4160, 9),
+    ] {
+        assert_eq!(shader::ib(code, output, engines, 0), Err(Error::Invalid));
+    }
+    for case in 0..4 {
+        let (pool, mut e, mut aperture, mut target, mut observer) = shader_ready();
+        let bells = e.io.bells.len();
+        let prep = match case {
+            0 => Err(gmc::Error::Revoked),
+            1 => {
+                aperture.destination += 4096;
+                Ok((aperture, target))
+            }
+            2 => {
+                target.len -= 4;
+                Ok((aperture, target))
+            }
+            _ => {
+                e.authority.revoke();
+                Ok((aperture, target))
+            }
+        };
+        let expected = match case {
+            0 => Error::Gmc(gmc::Error::Revoked),
+            3 => Error::Revoked,
+            _ => Error::Invalid,
+        };
+        assert_eq!(
+            run(e.prove_shaders(&mut observer, async { prep })),
+            Err(expected)
+        );
+        assert_eq!(e.io.bells.len(), bells);
+        if case != 3 {
+            assert_eq!(e.state, State::Failed(expected));
+        }
+        drop(e);
+        assert_eq!(pool.available(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_shader_rejects_unowned_addresses_and_failed_preparation
+);
+
+fn gfx12_client_fences_reject_device_loss_and_revocation() -> TestResult {
+    for pipe in [Pipe::Graphics, Pipe::Compute] {
+        for case in 0..5 {
+            let (pool, mut e, mut mes, aperture, target) = fixture();
+            run(e.initialize(&mut mes, aperture, target)).unwrap();
+            let available = pool.available();
+            e.io.memory[((pipe.base() + JOB_FENCE) / 4) as usize] = u32::MAX;
+            e.io.fence_reads = 0;
+            match case {
+                1 => {
+                    e.io.regs.insert(0x60000 + 0xc3 * 4, u32::MAX);
+                }
+                2 => e.io.fence_gone = true,
+                3 => {
+                    e.authority.revoke();
+                }
+                4 => e.io.fence_revoke = Some(e.authority),
+                _ => {}
+            }
+            let expected = match case {
+                0 => Ok(u32::MAX), // valid sequence at physical wrap
+                1 | 2 => Err(Error::DeviceGone),
+                _ => Err(Error::Revoked),
+            };
+            assert_eq!(e.completed_job(pipe), expected);
+            assert_eq!(e.io.fence_reads, u32::from(!matches!(case, 1 | 3)));
+            assert!(!e.memory.reusable_for_test());
+            drop(e);
+            assert_eq!(pool.available(), available);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_client_fences_reject_device_loss_and_revocation
 );

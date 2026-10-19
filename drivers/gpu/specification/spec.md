@@ -2691,11 +2691,45 @@ failure retains `Failed` and its error, and neither permits replay. Success
 records `InterruptVerified`. `interrupt_result` and the original write proof
 remain separate, so the latter cannot imply interrupt delivery.
 
+`unsafe Queues::prove_shaders(gmc).await` optionally follows both GC12 and
+SDMA interrupt proofs, before any client work. It requires both GC12 rings
+drained at 512 dwords and exclusive ownership of the two GMC test pages and
+every queue using them. It promotes only the owned source page's VMID0 PTE
+to executable, flushes HDP and waits for the GFXhub TLB acknowledgement;
+the destination and all unowned PTEs keep their permissions. Cancellation
+during this preparation retains GMC `PreparingShader`, which is not ready
+for VMID0 use; a returned error retains `Failed`.
+
+The generated IB programs GC12 logical SH resource registers and dispatches
+one wave32 threadgroup, first on graphics and then on compute, under VMID0.
+The fixed gfx1201 shader stores a queue-specific salt XOR each lane's byte
+offset to 32 output words. Code and IB occupy the first owned page; output
+and poison guards occupy the second. There are no caller-supplied shader
+bytes, resource addresses, LDS or scratch. Each submission invalidates shader
+caches and uses the real job fence sequence. Success requires all lane values,
+every guard word in the output page, the exact fresh fence, full RPTR drain
+and a fresh matching EOP (plus CPU delivery for configured MSI), within
+2.1 seconds. The two sequences continue into subsequent client jobs.
+`amdgpu_gfx12_shader::Proof` and `shader_result()` retain this evidence
+separately from command-transport and interrupt proofs. Once preparation starts,
+cancellation retains `ShaderSubmitted(pipe)`; failure retains `Failed(error)`.
+Both block further submissions and proof replay and quarantine backing. Successful proof returns
+to `InterruptVerified` and cannot be repeated. Independent LLVM assembly and
+Linux-header checks live in `drivers/gpu/tests/gfx12_shader/check.sh`;
+software execution models cannot establish physical shader correctness.
+
 The platform schedules this second proof as an executor task after boot,
 because framebuffer initialization may run with CPU IRQs masked. The proof
 refuses MSI submission if IRQs are still masked. Diagnostics expose
 `queue_state` and `queue_interrupts` separately from the historical cold-boot
 report; while their owner lock is held, platform status is `Running`.
+The boot flag `amdgpu.shader_proof` opts into shader proof after SDMA's
+interrupt proof, while the same owner lock excludes clients and clear work.
+Diagnostics expose `shaders` separately; failure prevents the subsequent
+clearer publication. Explicit whole-device recovery repeats the requested
+shader proof on fresh owners before publishing its new submitter. This
+diagnostic does not enable Mesa acceleration or prove draw/render state or
+application-context execution.
 
 The read-only `amdgpu_dcn_inventory` routing functions support Navi48 with
 GC12.0.1 and DCN4.0.1 (including raw discovery 4.1.0). ATOM display-object
@@ -2864,15 +2898,24 @@ recycling a possibly in-flight vector.
 `amdgpu_navi48_faults` describes VM and command fault diagnostics. The internal
 retained monitor validates exact GC12.0.1/MMHUB4.1 banks without writes during
 boot preparation. Service handoff retains all three owners before enabling
-sources. It requires active, nonretrying VMID0 in both hubs, inactive user
-contexts and no inherited enables in its source masks. It enables the seven
-VM protection-fault classes only for VMID0, plus bad-opcode/privileged-register
+sources. It requires active, nonretrying VMID0 in both hubs and the matching
+GMC owner in `ClientsReady`. `Gmc::fault_contexts` verifies the exact permanent
+register mapping and freshly reads every client VMID's root, start/end page
+and native nonretrying control in both hubs. All fifteen must still point at
+that owner's empty root, covering the GMC12 client aperture, before any client
+submission. Changed/inherited contexts and inherited interrupt enables are
+refused. Handoff does not disable or adopt an unexpected active context.
+It enables the seven VM protection-fault classes for VMIDs 0..15 on both
+hubs, plus bad-opcode/privileged-register
 faults for the owned graphics and compute pipes and privileged-instruction
 faults for graphics. It also enables the graphics/compute EOP sources and
 SDMA0 traps after the cold-start copy has drained; queue proofs only read
 those controls, so their setup cannot race fault masking.
-Readback is checked after each write. Default-page policy, user contexts and
-unrelated control bits are preserved; containment leaves EOP enables intact.
+Readback is checked after each write. Only the owned fault IRQ fields change
+in client controls; page-table roots, aperture, depth, retry and default-page
+policy stay fixed. Partial-publication tracking covers all 35 source controls,
+so failure/containment masks every published client source as well as VMID0,
+CP faults and SDMA traps. Unrelated bits and EOP enables are preserved.
 
 GC/client 0x0a and VMC/client 0x12 source zero select their respective VM hub.
 The monitor decodes the IV's 48-bit page address, write/retry flags and retains
@@ -2892,8 +2935,63 @@ Already-queued VM faults are still recorded and acknowledged.
 failure. These survive history consumption and eviction. MMIO/revocation errors
 retain the raw vector, stop owned sources where possible, disable CPU delivery,
 and leave uncertain hardware/storage retained. EOP proofs reject any recognized
-fault or a monitor that is not armed. There is no automatic reset, PTE repair,
-fault replay, user-process termination or reuse of failed allocations.
+fault or a monitor that is not armed. The monitor itself performs no reset,
+PTE repair, fault replay, process termination or allocation reuse.
+
+After containment the platform coordinates graphics, compute and SDMA0,
+plus the retained VCN0 unified queue when native media clients are enabled.
+A shared blocked flag immediately gates client
+and kernel-clear submissions and freezes client retirement, including readers
+that do not take the platform owner lock. Under OWNER the watchdog freezes
+every ledger before awaiting a service recovery receipt. The receipt binds
+the current IH generation and fault-monitor recovery mark, and records each
+ring's successful reset and new fence test. A partial or stale receipt cannot
+re-arm sources. Cancellation retains `Recovering` and frozen ledgers.
+
+Before re-arm the independent service drains bounded old IH batches and sweeps
+both protection latches. Late fault evidence joins the recovery scope. VM/shader
+faults in VMID0 or unsupported contexts, foreign queues, poison, terminal
+dispatch state and queue owners outside this recovery set require explicit device recovery.
+Persistent latches, changed controls, revoked authority and uncertain writes
+also refuse re-arm. The source monitor checks every owned control against its
+saved masked value, then re-enables and reads back all owned masks. Default,
+retry, depth and EOP policy remain fixed; current page-table roots may reflect
+client VM flushes. `Status::recovery`, `recoveries`, cumulative count and last
+record expose pending and historical evidence separately.
+
+Successful re-arm advances every owned kernel interrupt-handle generation.
+Old handles cannot complete new work. The final fault scope excludes guilty
+nonzero PASIDs from client IVs, across rings and hubs even if their VMIDs
+changed. Its VMID union is diagnostic only: a late IV must not blame the new
+address space reusing its VMID. A bounded set of 16 distinct PASIDs overflows
+to explicit device recovery rather than losing fault attribution. PASID-less
+IVs and protection latches cancel pending work only at that VMID on that hub;
+the latch has no PASID even when its VMID matches an IV. Queue faults without
+client attribution cancel the queue's pending work without establishing guilt. Healthy
+jobs replay under their original tickets with forced VM/PASID/context setup.
+All ledgers remain frozen until every replay obtains its new physical fence,
+then commit together. A replay failure quarantines reporting and every ledger.
+Reset-test fences never retire replay buffers or VMIDs. Recognized faults that
+arrive during replay contain reporting again and prevent a successful commit.
+This is a software-modeled recovery path; physical reset/re-arm acceptance
+remains pending, and automatic whole-device reset is still disabled.
+
+With native media clients the recovery receipt includes a fourth retirement
+and the exact retained VCN0 registration. VCPU/LMI drain/retirement,
+power-down/up, restart and a new transport proof precede global re-arm; the
+renewed media handle, a fresh source-119/CPU proof and the session IB test
+precede ledger commit.
+Restart clears codec context, so every pending media context is cancelled and
+no old media IB replays. Jobs in other healthy contexts replay normally.
+Uncertain media retirement or interrupt proof quarantines every ledger.
+An isolated media timeout likewise cancels its old contexts before bounded
+retirement/restart/proofs, and failure requires explicit device recovery.
+
+Synchronous progress skips a frozen ring, including its media registers while
+power is off. Reset freezes and reopens ledgers under `READ_GENERATION`,
+draining old readers before changing power and draining skipped samples
+before reopening. A placeholder zero from a skipped read cannot retire a
+new physical sequence at wrap. Old-generation readers never access new BARs.
 
 The monitor also records the remaining GC-client fault sources Linux defines
 for GC12 (irqsrcs_gfx_12_0_0.h): CP reserved-bit, semaphore-wait and general
@@ -2946,15 +3044,18 @@ vertical interrupt 0, HUBP flip, VUPDATE-no-lock and the DMCUB outbox.
 
 `amdgpu_navi48_dispatch` delivers classified vectors to registered owners,
 following amdgpu_fence.c. An owner registers a `Key` (CP slot, SDMA
-instance/queue or non-zero user doorbell) with its VMID and PASID and gets a
+instance/queue, VCN unified instance or non-zero user doorbell) with its VMID and PASID and gets a
 `Handle` carrying the slot generation. A vector only wakes the owner: `wait`
 snapshots the endpoint, calls the owner's own memory-fence check, and parks
 until the endpoint changes or a 100 ms watchdog fires (Linux's fallback timer
 role); every wait also takes a mandatory deadline. Completion vectors match
 the exact slot first and then the doorbell, as gfx_v12_0_eop_irq does, and
 must carry the owner's VMID/PASID. Vectors for unregistered, retired or
-mismatched owners, unknown sources, media, power and SQ messages are only
-counted. Per-endpoint statistics separate signal and watchdog wakes and
+mismatched owners and unknown sources are counted without completing work.
+VCN source 119 wakes its registered unified owner, identified by client
+instance plus VMID/PASID as in `vcn_v5_0_0_process_interrupt`; its ring payload
+has no separate queue selector. Other media, power and SQ messages remain
+diagnostic. Per-endpoint statistics separate signal and watchdog wakes and
 count completions first seen by the watchdog, the lost-interrupt evidence
 Linux warns about. Waiter storage is bounded (eight per endpoint); an
 overflowing waiter still completes through the watchdog and is counted.
@@ -2962,7 +3063,9 @@ overflowing waiter still completes through the watchdog and is counted.
 Faults are delivered to their owners: CP faults by slot and then the
 context-ID doorbell (amdgpu_gfx_handle_priv_fault), SDMA faults by
 instance/queue, and VM and shader faults to every owner of the faulting
-VMID/PASID. The first fault is kept; waiters on a faulted endpoint return
+nonzero PASID even after VMID changes. PASID-less vectors and latches match
+only the faulting VMID on its hub (VCN on MMHUB, CP/SDMA/user doorbells on
+GFXHUB). The first fault is kept; waiters on a faulted endpoint return
 `Faulted` unless their fence already completed. `unsafe recover` is the
 controlled-recovery step: once the owner has reset or unmapped its queue it
 gets a new generation, and every handle of the faulted generation is `Stale`
@@ -2973,10 +3076,11 @@ protocol, revocation, fault-monitor errors) with `fail_all`: every current
 waiter wakes with `Terminal`, new waits return it without reading memory, and
 registration is refused. The service registers the kernel graphics
 (ME/pipe/queue 0/0/0), compute (1/0/0) and SDMA0 queue-0 owners for VMID0, and
-`Status` exposes them with the dispatch summary. There are no application
-queues yet, so no client registers user doorbells; MES-scheduled user queues,
-queue reset and fault-source re-arming after containment remain open, and
-after the first fault other owners see later faults only as timeouts.
+`Status` exposes them with the dispatch summary. The optional VCN proof
+retains a separate registration through source enable, execution, shutdown
+and power-down. Application jobs share the owned kernel queues; MES user
+queues and user doorbells are not published. Coordinated queue recovery and
+fault re-arming are described below; late contained faults remain evidence.
 Everything here is model-tested (fake vectors and a local table driven
 through pending waits); none of it has run on the card.
 
@@ -2986,8 +3090,8 @@ display owner (amdgpu_dm acknowledges in `dc_interrupt_ack`). `wait_display`
 takes an interest mask (hot-plug, flip, VUPDATE, vblank, VLINE0, DMUB outbox)
 and the consumer's last-seen version, so an event between two waits is
 reported at once. Overflows and terminal errors wake every display waiter.
-No DCN interrupt source is enabled yet; the flip and vblank paths are still
-polled by their owners.
+The display monitor arms and acknowledges HPD/HPD-RX sources; flip and
+vblank completion remain polled by their owners.
 
 The worker's `Status::wakes` separates drains after a CPU MSI, MSI wakes
 that found nothing, drains after the 100 ms MSI watchdog, watchdog drains
@@ -4966,6 +5070,15 @@ healthy contexts remain pending for replay; jobs in a guilty/canceled context
 are skipped with `Canceled` after reset. Error completion wakes waiters but
 never alone releases buffers, page tables or VMIDs. `RingWatch` retains each
 job descriptor, context health, logical ticket and its hardware fence.
+Logical tickets skip zero on 32-bit wrap, preserving the CS ABI's zero/no-job
+handle; physical hardware sequences still wrap through zero independently.
+GC12/SDMA7/VCN5 client fence readers check live authority, HDP visibility and
+device presence before and after the fence sample, then revalidate authority.
+A legitimate all-ones physical sequence remains valid; an absent BAR does
+not. A failed sample in the current platform generation synchronously marks
+the device lost and cancels/freezes every ledger before waking waiters. It
+never retires memory. An old-generation reader reports an error without
+touching hardware or poisoning the replacement generation.
 `AMDGPU_WAIT_CS` of an ended job with an error fails with it
 (amdgpu_cs_wait_ioctl); `AMDGPU_CS` on a context with an error fails with
 it before queueing (amdgpu_ctx_get_entity); `CTX QUERY_STATE2` reports
@@ -5069,7 +5182,8 @@ open's root page directory (`VmState::root_pde`, GMC 12 only), through
 sync (wait for the ring's previous fence) and VM flush (GFX hub, the ring's
 engine, PFP_SYNC_ME) when the grant asks for a flush, the LUT write, an
 ACQUIRE_MEM when the first IB carries `AMDGPU_IB_FLAG_EMIT_MEM_SYNC`
-(`Job::mem_sync`; GCR_REQ on SDMA), CONTEXT_CONTROL on the graphics ring
+(`Job::mem_sync`; GCR_REQ on SDMA), an HDP request/ack handshake,
+CONTEXT_CONTROL on the graphics ring
 (state reloads when `Job::ctx_switch`: the ring's previous job came from
 another `(owner, ctx_id)`, Linux's scheduler entity), IBs and an
 interrupting RELEASE_MEM fence;
@@ -5087,6 +5201,16 @@ useful one; faults for freed PASIDs are dropped), and
 open's PASID. `AMDGPU_INFO` still reports acceleration unavailable, while
 `HW_IP_INFO`'s `available_rings` reports bit 0 for each IP whose ring 0
 the open's card's submitter serves (`amdgpu_info::available_rings`).
+
+Every native GC12 client slot follows `gfx_v12_0_ring_emit_hdp_flush`
+before CONTEXT_CONTROL and IB execution: WAIT_REG_MEM operation 1 writes
+NBIO bank 2's HDP_FLUSH_REQ (0x106) and waits on HDP_FLUSH_DONE (0x107),
+using CP0/PFP for graphics pipe 0 and CP2/ME for compute pipe 0. This is
+independent of the grant's page-table flush and `Job::mem_sync`; neither
+VMID reuse nor skipping ACQUIRE_MEM removes host-data visibility ordering.
+The register banks are the same NBIF6.3.1/NBIO7.7 layouts already bounded
+by queue construction. CPU publication and fence-read HDP flushes remain
+part of their existing visibility contract.
 
 `amdgpu_vmid::VmidManager` grants VMIDs as amdgpu_vmid_grab does with
 concurrent flushes: `grab(GrabRequest { owner, pd_addr, tlb_seq, pasid,
@@ -5107,7 +5231,9 @@ through `amdgpu_sdma_navi48::Sdma::submit(Job)`, after both SDMA proofs
 (busy before). Its frame follows sdma_v7_0's ring functions in 256-dword
 slots of the 1024-dword ring: when flushing, a memory POLL_REGMEM pipeline
 sync and the GFX hub flush on invalidation engine 11 (REGISTER_WRITE /
-POLL_REGMEM); the LUT write; INDIRECT packets NOP-aligned to end on 8
+POLL_REGMEM); the LUT write; an unconditional SDMA0 HDP_FLUSH POLL_REGMEM
+(DONE then REQ byte addresses, bit 10, equal, retry 0xfff and interval 10);
+INDIRECT packets NOP-aligned to end on 8
 dwords, IBs 32-byte aligned with no CSA; and an uncached FENCE (no TRAP;
 completion is polled through `FenceReader`). The ring is started with
 `IB_ENABLE`, as sdma_v7_0_gfx_resume does.
@@ -5118,6 +5244,249 @@ dword fill; dword-aligned, a multiple of 4 bytes) and `KernelOp::Copy` as
 sdma_v7_0_emit_copy_buffer (COPY_LINEAR with CPV, no DCC; non-overlapping),
 split into 1 GiB packets; a job that overflows its 256-dword slot is
 refused.
+
+`amdgpu_vcn_navi48::Vcn` owns Navi48's VCN5.0.0 instance 0 static-power
+VCPU and unified ring on NBIF6.3.1. Unsafe `new` reserves separate owned
+stack/context/shared/ring/fence backing and requires the matching permanent
+pool, PSP TMR, MMHUB VMID0, BAR2 and exclusive media/NBIF/reset/PM ownership.
+`start(MediaFirmware, PowerStatus).await` refuses active inherited rings,
+a running VCPU, an occupied media doorbell range, and MM_DPM/DS_VCN policy.
+It publishes backing before its first awaited write, powers ONO2..5 on,
+programs PSP firmware, 128 KiB stack, 512 KiB context and a shared page,
+then boots the VCPU with ten bounded reset retries. The shared record enables
+the unified queue and dGPU SMU interface; byte queue-mode updates preserve
+adjacent firmware-owned state. The owned NBIF range and 32-bit doorbell
+follow Linux's SOC24 assignment. VCPU master interrupts remain masked during
+the first transport proof.
+
+`prove().await` emits a native unified FENCE/TRAP/END frame, padded to 64
+dwords, and requires both its new fence and complete RPTR drain.
+It proves queue transport only. `stop().await` sets DPG hold-off, drains the
+ring, checks VCPU and LMI/UMC write-clean, then blocks/resets VCPU and LMI,
+disables its doorbell/ring and proves posted writes completed before marking
+backing reusable. Uncertain completion, revocation or cancellation retains
+the published allocation and refuses replay until device recovery.
+
+`unsafe Smu::set_vcn_power(bool).await` is SMU14's dGPU instance-0
+PowerUpVcn/PowerDownVcn, with a fresh static-media/protection feature check.
+Power-down requires the retained VCPU/LMI retirement proof. As other SMU
+runtime operations, cancellation leaves the mailbox owner busy and terminal
+transport errors forbid reuse. No display/GFX clock policy is changed.
+
+`Vcn::prove_interrupts().await` requires a retained independent dispatch
+owner (`Key::Vcn { instance: 0 }`, VMID0/PASID0) before enabling the VCPU
+master source. It samples/drains old source-119 evidence, emits another
+new-sequence frame, and requires its fence, full RPTR drain and exactly one
+fresh VCN trap. A routed MSI also requires a fresh CPU interrupt; polling
+routes report `InterruptProof::msi_verified = false`. Failed or cancelled
+proofs retain source ownership and backing, refuse stop/replay and require
+device recovery. VCN/JPEG diagnostics and foreign contexts cannot complete
+the proof; media vectors only wake registered owners, never complete fences.
+Both transport proofs also check the entire fence-page guard and CPU write
+pointer, rejecting wider-than-dword or stray firmware writes.
+
+The low-level `unsafe Vcn::submit(Job)` accepts up to eight owned client
+IBs only after both proofs. Its 256-dword unified frame follows Linux's
+`vcn_v2_0_enc_ring_emit_*` callbacks: MMHUB4.1 engine-0 semaphore/PTB/
+invalidate/ACK/release and final PTB-low wait when flushing, the MMHUB
+PASID LUT when remapping, an unconditional HDP-remap register write, IBs
+under the lent MMHUB VMID, then a 32-bit kernel FENCE/TRAP/END and NOPs.
+VCN has no separate mem-sync/context-control callbacks or user fence.
+The caller retains the job's VMID, mappings and every reachable resource
+until `completed_job`/`FenceReader` passes its returned physical sequence
+or reset proves retirement. Fence readers check live authority/device status
+and HDP visibility before reading the fence.
+
+As `amdgpu_ring` does without `support_64bit_ptrs`, VCN pointers wrap by
+the 1024-dword buffer mask. One gap distinguishes empty/full: at most three
+256-dword client frames are pending. `Busy` changes no sequence or pointer;
+after doorbell publication, submission always returns its sequence so a
+later error cannot discard the resources needed by a published job. Frame,
+ring-wrap/backpressure and publication-revocation models cover this API.
+The opt-in `amdgpu.navi48_media` retains the VCPU after both proofs and
+publishes logical ring 3 as `AMDGPU_HW_IP_VCN_ENC`, instance 0/ring 0.
+VCN5 uses this unified ring for decode and encode; legacy VCN_DEC and JPEG
+remain unavailable. A separate MMHUB VMID manager lends VMIDs 1..7 while
+sharing the client's GMC12 root/PASID and generic CS resource retention.
+Media jobs reject user-fence chunks before publication. Submission returns
+synchronously after publication; CS then defers all BOs/mappings until the
+translated fence or proven reset, with no intervening await. INFO_HW_IP
+reports the VCN5 discovery version and Linux's 256-byte start/4-byte size
+alignment, and derives usable rings from the proven registered submitter.
+INFO_MAX_IBS reports eight for this ring. No codec profile or JPEG capability
+is added by this transport interface; known-stream validation remains open.
+
+Before exposing clients, `unsafe Vcn::prove_ibs().await` also runs the fixed
+Linux `amdgpu_vcn_unified_ring_test_ib` encode/decode session create/destroy
+messages. It requires the interrupt proof's drained ring with no intervening
+client publication. `IbTesting` and a pending `ib_result` are stored before
+the first await. A separate retained reservation owns the 128 KiB encode
+context and six IB/message pages. Kernel VMID0 alone reads those fixed IBs;
+the client VMID checks are unchanged. A new unified frame flushes HDP, emits
+all four session IBs and a new fence/TRAP/END. Completion requires fence,
+RPTR, exact fresh source-119 delivery and routed CPU MSI, plus immutable
+command pages/padding and the existing entire fence-page guards. The wait
+is bounded to one second; failure/cancellation retains all published storage
+and refuses stop/retry, requiring device recovery.
+
+Success is `IbVerified`; the boot client's fence-reader/publication gate
+requires it. The same test runs after media recovery before reopening
+retirement. `Vcn::ib_result` and platform `Diagnostics::media_ibs` preserve
+the phase's proof or failure separately from the overall media cycle.
+Proven VCPU/LMI shutdown also makes the auxiliary reservation reusable.
+Proof sequences skip zero on wrap because startup clears the fence word;
+normal client physical sequences continue wrapping through zero. Model
+coverage includes both firmware engines, application submission after proof,
+partial/failed/cancelled IBs, immutable command guards and wrapped proofs.
+Host reference checks compile the unchanged local Linux constructors and
+compare their output with the Rust builders. Session messages exercise IB
+transport, not video-frame encoding or decoding.
+
+The opt-in `amdgpu.decode_proof` additionally requests
+`unsafe Vcn::prove_decode().await` after the session IB test. It uses IGT
+GPU Tools 2.4's fixed AVC stream, create/decode/destroy messages and scaling
+data (pinned hashes and MIT notices under `drivers/gpu/fixtures/vcn5`).
+An independently reserved arena owns the 128 KiB session context, messages,
+feedback, input, DPB/context, target and commands. Guards bracket the arena
+and both sides of the output. Descriptor addresses are validated within
+48 bits and match the unchanged IGT constructors for those owned addresses.
+There is no intervening client job before this kernel-VMID0 proof.
+
+`DecodeTesting` and pending `decode_result` precede allocation publication's
+first await. Every page, including the target, is initialized; copying the
+reference checksum into the target is never a production operation. One
+new frame runs all three IBs and requires fresh fence/RPTR/trap/CPU evidence.
+The 737280-byte output must sum to IGT's `0x20345d8`, with command pages,
+padding, arena/output guards and the original fence guards unchanged.
+`DecodeChecksum(actual)` distinguishes wrong/missing pixels from transport
+failure. Bulk initialization/readback yields between pages, with no IRQ-safe
+lock across awaits. Failed/cancelled work retains the full reservation and
+refuses stop or replay; successful VCPU/LMI shutdown permits reuse.
+
+`DecodeVerified`, `Vcn::decode_result` and platform `Diagnostics::media_decode`
+preserve completion and output evidence. A requested decode proof is repeated
+after media recovery before retirement reopens. Without native media clients
+the flag runs the proof then completes the existing stop/power-down cycle;
+with clients it retains the proven VCPU. This flag advertises no codec
+profile. Models simulate device output only to test completion, checksum and
+storage rules; actual AVC decoding remains an end-of-bring-up silicon test.
+
+The opt-in `amdgpu.encode_proof` requests `unsafe Vcn::prove_encode().await`
+after the session IB proof (and after decode when both flags are requested).
+It runs IGT 2.4's fixed 160x128 NV12 input through create/IDR/close tasks on
+kernel VMID0. Packet builders match the unchanged VCN5 IGT constructors;
+the input frame has a separate hash manifest and 2014/2023 AMD MIT notices
+under `drivers/gpu/fixtures/vcn5/encode`. A separate retained arena owns
+session/CPB, pitched immutable input, metadata, feedback, output and commands.
+The output has the entire declared `0x1f000` range backed, with guards on
+both sides; the source test's smaller allocation is not copied.
+
+`EncodeTesting` and pending `encode_result` precede the first await and
+publication. Each arena page is initialized, including fresh zero feedback
+and output. Native fence/RPTR/source119/CPU evidence precedes reading a
+nonzero feedback byte count bounded by the declared output range. A bounded
+Annex-B inspector requires matching SPS/PPS references, 160x128 eight-bit
+4:2:0 dimensions and IDR/I-slice headers. This is header evidence, not a
+complete H.264 validator or picture-quality proof. Command pages/padding,
+input/pitch padding, arena/output guards and the original fence guards must
+remain intact. Bulk work yields by page without an IRQ-safe lock.
+
+`EncodeVerified`, `Vcn::encode_result` and `Diagnostics::media_encode` retain
+the completion, encoded byte count and profile. Failure/cancellation retains
+all backing and closes client publication; successful VCPU/LMI shutdown
+permits reuse. The requested proof repeats after media recovery before any
+ledger reopens. Without media clients, the flag finishes the existing
+stop/power-down cycle; with clients, the proven VCPU remains retained. No
+codec profile is advertised by this proof. Synthetic header output in the
+model verifies ownership, parsing and completion contracts; actual encoding
+and picture-quality acceptance remain physical tests at the end of bring-up.
+
+The opt-in `amdgpu.jpeg_proof` adds a retained JPEG5.0.0 static-power
+transport cycle while VCN holds the shared NBIO media doorbell range. Public
+`amdgpu_jpeg_navi48::{Jpeg,State,Proof,Error}` provides unsafe `new`, `start`,
+`prove` and `stop` with state/result snapshots. JPEG accepts exactly one
+VCN5 discovery instance, the matching NBIF6.3.1/GC12.0.1/MMHUB4.1 layout and a validated
+GMC/VRAM pool. Its owned doorbell is `0x311`. It never programs or disables
+NBIO's shared range, and VCN refuses start/teardown under an enabled JPEG
+doorbell. The coordinator excludes shared-register and PM writers.
+
+`unsafe Smu::set_jpeg_power(bool).await` issues SMU14 instance-0
+PowerUpJpeg/PowerDownJpeg after fresh protection/static-media checks, using
+the same retained runtime/cancellation rules as VCN. JPEG's ONO1 fields and
+clock gates are independent; register updates preserve VCN's ONO2..5 fields.
+The dispatch registration exists before startup, so every published JPEG
+owner participates in reset accounting. The allocation is published before
+startup's first await and retained on any
+failure or cancellation. Its two guard pages bracket the ring, fence/shadow
+page and immutable IB page. Both GPCOM fence data dwords are reserved before
+the separate CPU write-pointer shadow; neither aliases the other.
+
+`prove` requires a registered `Key::Jpeg { instance: 0 }` kernel-VMID0/PASID0
+owner and the independent IH service. A new direct pitch write/RPTR witness
+precedes a kernel IB with a different pitch value. MMHUB4.1 start/end and
+HDP ordering, IB/fence/trap words match unchanged local Linux constructors.
+Fresh fence/RPTR, exact client/source153 and routed CPU evidence are required,
+with intact ring/IB words, padding and guards. `jpeg0_traps` records the exact
+kernel context; dispatch separates JPEG from VCN source119 and attributes
+unidentified MMHUB faults to both engines' matching VMIDs. Interrupts wake
+owners but never complete a fence from payload data.
+
+Retirement requires the ring/job drain, all JMI/core read/write-clean bits
+and no pending MC writes, both before and after JMI reset. Only then may the
+JPEG doorbell/clocks/ONO1 shut down and the allocation become reusable.
+The boot cycle stores pending `Diagnostics::media_jpeg` before awaiting,
+retains `jpeg_state`, and retires its extra interrupt owner only after proven
+shutdown and SMU power-down. A requested cycle repeats after recovery before
+any client ledger reopens. A live unretired JPEG owner makes a four-owner
+recovery receipt incomplete, requiring whole-device recovery instead.
+
+`amdgpu.jpeg_proof` proves JRBC/IB/interrupt/retirement transport without a
+picture. It advertises no JPEG client ring or codec capability. Native client
+submission and physical acceptance remain required for complete JPEG bring-up.
+
+`amdgpu.jpeg_decode_proof` implies that transport cycle and additionally calls
+`unsafe Jpeg::prove_decode().await` on a newly drained kernel VMID0 queue.
+`DecodeTesting` and pending `decode_result` precede the first await and arena
+publication. A separate reservation retains IGT 2.4's fixed JPEG input, guarded
+24 KiB pitched NV12 target and immutable IB page. The 406-byte input, source
+archive/hash and 2017/2023 AMD MIT notices live in `fixtures/jpeg5`; the IB
+matches unchanged IGT JPEG5 register-selection and construction functions.
+All pages start at known values, with guards around the arena/input/target.
+
+Fresh fence/RPTR/source153/CPU evidence is required before summing the active
+64x64 luma and 64x32 interleaved chroma bytes at pitch 256. Their combined sum
+must equal 262144; untouched zero output cannot satisfy it. `DecodeChecksum`
+retains the observed sum on mismatch. Input and zero padding, picture/transport
+IBs, historical ring commands, kernel fence/shadow page and all guards must
+remain intact. Bulk initialization/readback yields by page. Only a current,
+drained transport witness may enter this proof; it clears both idle GPCOM
+fence dwords and uses a new nonzero sequence, rejecting stale fence contents.
+
+`DecodeProof { completion, output_sum }`, `DecodeVerified`, `decode_result`
+and platform `Diagnostics::media_jpeg_decode` retain picture evidence separately
+from the original transport result. The overall JPEG cycle returns its latest
+proof and performs normal DMA-clean shutdown/power-down before retirement.
+Failure/cancellation retains both allocations and closes clients; only proven
+JRBC/JMI shutdown makes either allocation reusable. A requested picture proof
+repeats after media recovery before any ledger reopens. This opt-in advertises
+no codec capability. Synthetic model pixels exercise lifetime/checksum rules;
+physical picture execution and codec conformance remain acceptance work.
+
+The opt-in `amdgpu.media_proof` boot argument requests a retained native
+power-up/start/fence/interrupt/stop/power-down cycle after the GC12/SDMA interrupt
+proofs, before publishing clears or allowing any client slot. Its pending
+state is stored before the first await; error/cancellation gates all
+client submit wrappers and returned failure quarantines the IH service.
+`amdgpu_navi48_platform::Diagnostics::media_transport` exposes the result.
+`media_state` preserves the VCPU phase after cancellation or failure.
+The media interrupt handle is retained before source enabling and retired
+only after proven VCPU/LMI stop and power-down. A retained media owner must
+join the fourth retirement before global re-arm; it cannot be omitted from
+a three-queue receipt.
+Explicit whole-device recovery repeats the requested proof with fresh
+owners. `media_proof` alone adds no client ring; `navi48_media` retains and
+exposes the proven unified transport described above. Codec execution,
+JPEG and physical MSI/engine acceptance remain open.
 
 ### AMD platform VBIOS
 

@@ -43,12 +43,154 @@ fn user(doorbell: u32) -> Owner {
         pasid: 5,
     }
 }
+fn navi48_jpeg_dispatch_separates_unified_traps_and_keeps_mmhub_fault_scope() -> TestResult {
+    let table = IrqSafeSpinLock::new(Table::new());
+    let jpeg = table
+        .lock()
+        .register(kernel(Key::Jpeg { instance: 0 }))
+        .unwrap();
+    let vcn = table
+        .lock()
+        .register(kernel(Key::Vcn { instance: 0 }))
+        .unwrap();
+    let gfx = table.lock().register(kernel(Key::Cp(GFX))).unwrap();
+    assert_eq!(
+        table.lock().register(kernel(Key::Jpeg { instance: 2 })),
+        Err(RegisterError::Invalid)
+    );
+    let done = Cell::new(false);
+    let mut wait = core::pin::pin!(wait_in(&table, jpeg, far(), || done.get().then_some(7)));
+    assert!(poll(wait.as_mut()).is_pending());
+    for (client, source, vmid, pasid, expected) in [
+        (0x10, 154, 0, 0, Delivery::Ignored),
+        (0x0e, 153, 0, 0, Delivery::Unowned),
+        (0x10, 153, 1, 0, Delivery::Unowned),
+        (0x10, 153, 0, 1, Delivery::Unowned),
+        (0x10, 119, 0, 0, Delivery::Signaled),
+    ] {
+        assert_eq!(
+            route(&table, iv(client, source, 0, vmid, pasid, 0)),
+            expected
+        );
+    }
+    assert_eq!(table.lock().endpoint(jpeg).unwrap().stats.signals, 0);
+    assert_eq!(
+        route(&table, iv(0x10, 153, 0xff, 0, 0, 0)),
+        Delivery::Signaled
+    );
+    assert_eq!(table.lock().endpoint(vcn).unwrap().stats.signals, 1);
+    assert!(poll(wait.as_mut()).is_pending());
+    done.set(true);
+    assert_eq!(route(&table, iv(0x10, 153, 0, 0, 0, 0)), Delivery::Signaled);
+    assert_eq!(poll(wait.as_mut()), Poll::Ready(Ok(7)));
+    assert_eq!(table.lock().latched(0, true), Delivery::Faulted(2));
+    assert!(table.lock().endpoint(jpeg).unwrap().fault.is_some());
+    assert!(table.lock().endpoint(vcn).unwrap().fault.is_some());
+    assert_eq!(table.lock().endpoint(gfx).unwrap().fault, None);
+    assert_eq!(
+        table.lock().recovery_owners(&[vcn, gfx]),
+        Err(WaitError::Stale)
+    );
+    table.lock().retire(jpeg).unwrap();
+    assert_eq!(route(&table, iv(0x10, 153, 0, 0, 0, 0)), Delivery::Unowned);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-interrupts",
+    navi48_jpeg_dispatch_separates_unified_traps_and_keeps_mmhub_fault_scope
+);
 fn poll<F: Future>(f: Pin<&mut F>) -> Poll<F::Output> {
     f.poll(&mut Context::from_waker(Waker::noop()))
 }
 fn far() -> Deadline {
     Deadline::after_ms(10_000)
 }
+
+fn navi48_vcn_dispatch_requires_registered_unified_source_and_owned_context() -> TestResult {
+    let table = IrqSafeSpinLock::new(Table::new());
+    let h = table
+        .lock()
+        .register(kernel(Key::Vcn { instance: 0 }))
+        .unwrap();
+    assert_eq!(
+        table.lock().register(kernel(Key::Vcn { instance: 2 })),
+        Err(RegisterError::Invalid)
+    );
+    let done = Cell::new(false);
+    let mut wait = core::pin::pin!(wait_in(&table, h, far(), || done.get().then_some(1)));
+    assert!(poll(wait.as_mut()).is_pending());
+    for (client, source, vmid, pasid, expected) in [
+        (0x0e, 119, 0, 0, Delivery::Unowned),
+        (0x10, 119, 1, 0, Delivery::Unowned),
+        (0x10, 119, 0, 1, Delivery::Unowned),
+        (0x10, 114, 0, 0, Delivery::Ignored),
+        (0x10, 120, 0, 0, Delivery::Ignored),
+        (0x10, 153, 0, 0, Delivery::Unowned),
+    ] {
+        assert_eq!(
+            route(&table, iv(client, source, 0, vmid, pasid, 0)),
+            expected
+        );
+    }
+    assert_eq!(table.lock().endpoint(h).unwrap().stats.signals, 0);
+    // Linux identifies the unified ring by client/source, not ring payload.
+    assert_eq!(
+        route(&table, iv(0x10, 119, 0xff, 0, 0, 0)),
+        Delivery::Signaled
+    );
+    assert!(poll(wait.as_mut()).is_pending()); // a trap never completes a fence
+    done.set(true);
+    assert_eq!(route(&table, iv(0x10, 119, 0, 0, 0, 0)), Delivery::Signaled);
+    assert_eq!(poll(wait.as_mut()), Poll::Ready(Ok(1)));
+    table.lock().retire(h).unwrap();
+    assert_eq!(table.lock().endpoint(h), Err(WaitError::Stale));
+    assert_eq!(route(&table, iv(0x10, 119, 0, 0, 0, 0)), Delivery::Unowned);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-interrupts",
+    navi48_vcn_dispatch_requires_registered_unified_source_and_owned_context
+);
+
+fn navi48_dispatch_coordinated_reset_invalidates_every_old_owner() -> TestResult {
+    let mut table = Table::new();
+    let keys = [
+        Key::Cp(GFX),
+        Key::Cp(src::Queue { me: 1, ..GFX }),
+        Key::Sdma {
+            instance: 0,
+            queue: 0,
+        },
+    ];
+    let handles = keys.map(|key| table.register(kernel(key)).unwrap());
+    assert_eq!(table.recovery_owners(&handles), Ok(()));
+    let extra = table.register(user(0x20)).unwrap();
+    assert_eq!(table.reset_owners(handles), Err(WaitError::Stale));
+    for h in handles {
+        assert!(table.endpoint(h).is_ok());
+    }
+    table.retire(extra).unwrap();
+    assert_eq!(table.reset_owners([handles[0]; 3]), Err(WaitError::Stale));
+    let fault = iv(CLIENT_GFX, 183, 0, 3, 5, 0);
+    assert_eq!(table.route(&fault, classify(&fault)), Delivery::Faulted(1));
+    let next = table.reset_owners(handles).unwrap();
+    for (i, old) in handles.into_iter().enumerate() {
+        assert_eq!(table.endpoint(old), Err(WaitError::Stale));
+        let endpoint = table.endpoint(next[i]).unwrap();
+        assert_eq!(endpoint.owner, kernel(keys[i]));
+        assert_eq!(endpoint.fault, None);
+    }
+    table.fail_all(Terminal::DeviceGone);
+    assert_eq!(
+        table.reset_owners(next),
+        Err(WaitError::Terminal(Terminal::DeviceGone))
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-interrupts",
+    navi48_dispatch_coordinated_reset_invalidates_every_old_owner
+);
 
 fn navi48_dispatch_routes_completions_only_to_exact_live_owners() -> TestResult {
     let t = IrqSafeSpinLock::new(Table::new());
@@ -105,7 +247,6 @@ fn navi48_dispatch_routes_completions_only_to_exact_live_owners() -> TestResult 
     for e in [
         iv(CLIENT_GFX, 239, 0, 0, 0, 0),
         iv(CLIENT_GFX, 177, 0, 0, 0, 0),
-        iv(0x10, 119, 0, 0, 0, 0),
         iv(0x0f, 0, 0, 0, 0, 0),
         iv(0x1b, 0, 0, 0, 0, 0),
     ] {
@@ -113,7 +254,9 @@ fn navi48_dispatch_routes_completions_only_to_exact_live_owners() -> TestResult 
     }
     let s = t.lock().summary();
     assert_eq!(s.live, 3);
-    assert_eq!(s.counters.unowned, 6);
+    assert_eq!(route(&t, iv(0x10, 119, 0, 0, 0, 0)), Delivery::Unowned);
+    let s = t.lock().summary();
+    assert_eq!(s.counters.unowned, 7);
     assert_eq!(
         (s.counters.unknown, s.counters.media, s.counters.power),
         (2, 1, 1)
@@ -346,11 +489,12 @@ fn navi48_dispatch_overflow_rechecks_all_waiters_and_display_consumers() -> Test
     assert_eq!(t.lock().endpoint(h).unwrap().stats.watchdog_completions, 0);
     // A latch found by the post-overflow sweep faults its VMID's owners.
     let uq = t.lock().register(user(0x20)).unwrap();
-    assert_eq!(t.lock().latched(3, true), Delivery::Faulted(1));
+    assert_eq!(t.lock().latched(3, true), Delivery::Unattributed);
+    assert_eq!(t.lock().latched(3, false), Delivery::Faulted(1));
     assert_eq!(t.lock().latched(9, false), Delivery::Unattributed);
     assert_eq!(
         t.lock().endpoint(uq).unwrap().fault,
-        Some(src::Fault::Vm { mm_hub: true })
+        Some(src::Fault::Vm { mm_hub: false })
     );
     assert_eq!(t.lock().endpoint(h).unwrap().fault, None);
     TestResult::Pass
@@ -509,4 +653,93 @@ fn navi48_dispatch_reset_invalidates_every_old_handle() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48_dispatch",
     navi48_dispatch_reset_invalidates_every_old_handle
+);
+
+fn navi48_dispatch_four_owner_reset_requires_media_retirement_set() -> TestResult {
+    let mut table = Table::new();
+    let keys = [
+        Key::Cp(GFX),
+        Key::Cp(src::Queue { me: 1, ..GFX }),
+        Key::Sdma {
+            instance: 0,
+            queue: 0,
+        },
+        Key::Vcn { instance: 0 },
+    ];
+    let handles = keys.map(|key| table.register(kernel(key)).unwrap());
+    assert_eq!(table.recovery_owners(&handles[..3]), Err(WaitError::Stale));
+    assert_eq!(table.recovery_owners(&[]), Err(WaitError::Stale));
+    assert_eq!(table.recovery_owners(&handles), Ok(()));
+    let extra = table.register(kernel(Key::Jpeg { instance: 0 })).unwrap();
+    assert_eq!(table.recovery_owners(&handles), Err(WaitError::Stale));
+    assert_eq!(table.reset_owners(handles), Err(WaitError::Stale));
+    for h in handles {
+        assert!(table.endpoint(h).is_ok());
+    }
+    table.retire(extra).unwrap();
+    let next = table.reset_owners(handles.to_vec()).unwrap();
+    for i in 0..4 {
+        assert_eq!(table.endpoint(handles[i]), Err(WaitError::Stale));
+        assert_eq!(table.endpoint(next[i]).unwrap().owner, kernel(keys[i]));
+    }
+    let event = iv(0x10, 119, 0, 0, 0, 0);
+    assert_eq!(table.route(&event, classify(&event)), Delivery::Signaled);
+    assert_eq!(table.endpoint(next[3]).unwrap().stats.signals, 1);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-interrupts",
+    navi48_dispatch_four_owner_reset_requires_media_retirement_set
+);
+
+fn navi48_dispatch_pasid_survives_vmid_reuse_and_latches_stay_on_their_hub() -> TestResult {
+    for known in [false, true] {
+        let mut table = Table::new();
+        let gfx = table
+            .register(Owner {
+                key: Key::Cp(GFX),
+                vmid: 2,
+                pasid: 11,
+            })
+            .unwrap();
+        let mm = table
+            .register(Owner {
+                key: Key::Vcn { instance: 0 },
+                vmid: 5,
+                pasid: 11,
+            })
+            .unwrap();
+        let reused = table
+            .register(Owner {
+                key: Key::Doorbell(0x20),
+                vmid: 5,
+                pasid: 22,
+            })
+            .unwrap();
+        if known {
+            let event = iv(CLIENT_GFX, 0, 0, 5, 11, 0);
+            assert_eq!(table.route(&event, classify(&event)), Delivery::Faulted(2));
+            assert!(table.endpoint(gfx).unwrap().fault.is_some());
+            assert!(table.endpoint(mm).unwrap().fault.is_some());
+            assert_eq!(table.endpoint(reused).unwrap().fault, None);
+        } else {
+            assert_eq!(table.latched(5, true), Delivery::Faulted(1));
+            assert_eq!(table.endpoint(gfx).unwrap().fault, None);
+            assert_eq!(table.endpoint(reused).unwrap().fault, None);
+            assert_eq!(
+                table.endpoint(mm).unwrap().fault,
+                Some(src::Fault::Vm { mm_hub: true })
+            );
+            assert_eq!(table.latched(5, false), Delivery::Faulted(1));
+            assert_eq!(
+                table.endpoint(reused).unwrap().fault,
+                Some(src::Fault::Vm { mm_hub: false })
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-interrupts",
+    navi48_dispatch_pasid_survives_vmid_reuse_and_latches_stay_on_their_hub
 );

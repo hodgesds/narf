@@ -49,4 +49,6 @@ EQ(PPSMC_MSG_EnableSmuFeaturesLow, 8); EQ(PPSMC_MSG_EnableSmuFeaturesHigh, 9);
 EQ(PPSMC_MSG_TransferTableSmu2Dram, 0x12);
 EQ(PPSMC_MSG_SetSoftMinByFreq, 0x19); EQ(PPSMC_MSG_SetSoftMaxByFreq, 0x1a);
 EQ(PPSMC_MSG_GetPptLimit, 0x33);
+EQ(PPSMC_MSG_PowerUpVcn, 0x2a); EQ(PPSMC_MSG_PowerDownVcn, 0x2b);
+EQ(FEATURE_MM_DPM_BIT, 20); EQ(FEATURE_DS_VCN_BIT, 44);
 int main(void) { return 0; }

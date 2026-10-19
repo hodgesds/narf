@@ -11,7 +11,21 @@ use narf_lib::mutex::Mutex;
 
 static SERVICE: Mutex<Option<Service>> = Mutex::new(None);
 static HALTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static BLOCKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static FAILED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub(crate) fn failed() -> bool {
+    FAILED.load(core::sync::atomic::Ordering::Acquire)
+}
+/// Synchronous fence readers freeze retirement as soon as containment is seen.
+pub(crate) fn blocked() -> bool {
+    BLOCKED.load(core::sync::atomic::Ordering::Acquire)
+}
+#[path = "amdgpu_navi48_interrupts_recovery.rs"]
+mod recovery;
+pub(crate) use recovery::{begin_recovery, finish_recovery, quarantine, recovery_needed};
 pub(crate) fn lose() {
+    FAILED.store(true, core::sync::atomic::Ordering::Release);
+    BLOCKED.store(true, core::sync::atomic::Ordering::Release);
     HALTED.store(true, core::sync::atomic::Ordering::Release);
     dispatch::TABLE
         .lock()
@@ -41,6 +55,8 @@ pub struct Status {
     pub last_fault: Option<ih::Event>,
     pub kernel_eop: [u64; 2],
     pub sdma0_traps: u64,
+    pub vcn0_traps: u64,
+    pub jpeg0_traps: u64,
     pub faults: faults::Status,
     /// Kernel graphics, compute and SDMA0 owners registered by the service.
     pub kernel: [Option<dispatch::Endpoint>; 3],
@@ -123,6 +139,8 @@ struct History {
     last_fault: Option<ih::Event>,
     kernel_eop: [u64; 2],
     sdma0_traps: u64,
+    vcn0_traps: u64,
+    jpeg0_traps: u64,
 }
 impl History {
     fn new() -> Self {
@@ -136,6 +154,8 @@ impl History {
             last_fault: None,
             kernel_eop: [0; 2],
             sdma0_traps: 0,
+            vcn0_traps: 0,
+            jpeg0_traps: 0,
         }
     }
     fn push(&mut self, event: ih::Event) {
@@ -167,6 +187,22 @@ impl History {
         {
             self.sdma0_traps = self.sdma0_traps.saturating_add(1);
         }
+        // vcn_v5_0_0_process_interrupt: the client instance and source
+        // identify the unified queue; the ring field has no queue selector.
+        if event.vector.client == src::CLIENT_VCN
+            && event.vector.source == 119
+            && event.vector.vmid == 0
+            && event.vector.pasid == 0
+        {
+            self.vcn0_traps = self.vcn0_traps.saturating_add(1);
+        }
+        if event.vector.client == src::CLIENT_VCN
+            && event.vector.source == 153
+            && event.vector.vmid == 0
+            && event.vector.pasid == 0
+        {
+            self.jpeg0_traps = self.jpeg0_traps.saturating_add(1);
+        }
         if matches!(event.vector.client, 0x0a | 0x12) && event.vector.source == 0 {
             self.vm_faults = self.vm_faults.saturating_add(1);
             self.last_fault = Some(event);
@@ -184,6 +220,8 @@ impl History {
             Source::Graphics => self.kernel_eop[0],
             Source::Compute => self.kernel_eop[1],
             Source::Sdma0 => self.sdma0_traps,
+            Source::Vcn0 => self.vcn0_traps,
+            Source::Jpeg0 => self.jpeg0_traps,
         }
     }
     fn pop(&mut self) -> ih::Batch {
@@ -219,6 +257,8 @@ impl Service {
             last_fault: self.history.last_fault,
             kernel_eop: self.history.kernel_eop,
             sdma0_traps: self.history.sdma0_traps,
+            vcn0_traps: self.history.vcn0_traps,
+            jpeg0_traps: self.history.jpeg0_traps,
             faults: self.faults.status(),
             kernel: self
                 .kernel
@@ -247,6 +287,9 @@ impl Service {
                         failed.get_or_insert(e);
                     }
                 }
+                if self.faults.status().state != faults::State::Armed {
+                    BLOCKED.store(true, core::sync::atomic::Ordering::Release);
+                }
                 // Deliver after the monitor captured and acknowledged its
                 // evidence, so a woken owner never races the latch.
                 {
@@ -262,6 +305,9 @@ impl Service {
                     dispatch::TABLE.lock().lost();
                     match self.faults.sweep() {
                         Ok(found) => {
+                            if self.faults.status().state != faults::State::Armed {
+                                BLOCKED.store(true, core::sync::atomic::Ordering::Release);
+                            }
                             let mut table = dispatch::TABLE.lock();
                             for (mm_hub, vmid) in [false, true].into_iter().zip(found) {
                                 if let Some(vmid) = vmid {
@@ -292,6 +338,8 @@ impl Service {
     /// Stop draining for good: mask sources and CPU delivery where authority
     /// permits, then release every waiter with the terminal cause.
     fn stop(&mut self, cause: dispatch::Terminal) {
+        FAILED.store(true, core::sync::atomic::Ordering::Release);
+        BLOCKED.store(true, core::sync::atomic::Ordering::Release);
         self.faults.stop();
         if let Some(route) = &mut self.route {
             self.routing = route.disable().map(|()| None);
@@ -314,6 +362,7 @@ pub(crate) unsafe fn install(
     rings: &mut Option<ih::Rings>,
     route: &mut Option<Result<msi::Route, msi::Error>>,
     faults: &mut Option<faults::Monitor>,
+    gmc: &mut crate::amdgpu_gmc_navi48::Gmc,
 ) -> Result<(), ih::Error> {
     let mut slot = SERVICE.try_lock().ok_or(ih::Error::Busy)?;
     if slot.is_some()
@@ -353,13 +402,17 @@ pub(crate) unsafe fn install(
     }
     // SAFETY: matching initialized hubs/queues/IH; the permanent service now
     // retains the monitor before the first source enable or CPU MSI delivery.
-    if unsafe { service.faults.enable() }.is_err() {
+    if unsafe { service.faults.enable(gmc) }.is_err() {
+        FAILED.store(true, core::sync::atomic::Ordering::Release);
+        BLOCKED.store(true, core::sync::atomic::Ordering::Release);
         // No consumer will run: release the owners registered above.
         dispatch::TABLE
             .lock()
             .fail_all(dispatch::Terminal::Interrupts(ih::Error::Protocol));
         return Err(ih::Error::Protocol);
     }
+    BLOCKED.store(false, core::sync::atomic::Ordering::Release);
+    FAILED.store(false, core::sync::atomic::Ordering::Release);
     if let Some(route) = &mut service.route {
         // SAFETY: service slot already retains both owners and the consumer is
         // spawned below. It drains first, so an early IRQ is not lost.
@@ -449,6 +502,8 @@ pub(crate) enum Source {
     Graphics,
     Compute,
     Sdma0,
+    Vcn0,
+    Jpeg0,
 }
 pub(crate) trait Observer {
     async fn sample(&mut self, source: Source) -> Result<Sample, ih::Error>;

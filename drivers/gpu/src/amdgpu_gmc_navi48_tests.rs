@@ -74,6 +74,7 @@ fn fixture() -> (Pool, Engine<Fake>) {
         state: State::Prepared,
         aperture: None,
         geometry: None,
+        shader_executable: false,
     };
     (pool, engine)
 }
@@ -403,7 +404,7 @@ fn gmc_navi48_constructor_checks_exact_banks_and_pool_before_allocation() -> Tes
     // SAFETY: initialization is not called; only metadata/backing ownership.
     let mapped = unsafe { Pool::from_owned_range(map, 0x8_0000_4000) }.unwrap();
     let cap = Cap::bootstrap();
-    for case in 0..8 {
+    for case in 0..10 {
         let old_blocks = gpu.ip_blocks.clone();
         let old_bar = gpu.fb_bar;
         let old_regs = gpu.regs;
@@ -416,7 +417,10 @@ fn gmc_navi48_constructor_checks_exact_banks_and_pool_before_allocation() -> Tes
             4 => gpu.ip_blocks[2].num_bases = 2,
             5 => gpu.ip_blocks[0].base_addrs[0] = 0x20000 - 0x16d0,
             6 => gpu.fb_bar.phys = narf_memory::PhysAddr::new(0x80000000),
-            _ => gpu.ip_blocks.push(gpu.ip_blocks[0]),
+            7 => gpu.ip_blocks.push(gpu.ip_blocks[0]),
+            // VMID0 fits, but VMID15's final register lies outside BAR5.
+            8 => gpu.ip_blocks[0].base_addrs[0] = 0x20000 - 0x16ee,
+            _ => gpu.ip_blocks[1].base_addrs[0] = 0x20000 - 0x62e,
         }
         // SAFETY: owned register fixture; all unsupported paths reject.
         if unsafe { Gmc::new(&gpu, cap, &mapped) }.is_ok() || mapped.available() != BYTES {
@@ -552,4 +556,193 @@ fn gmc_navi48_client_context_timeout_releases_the_semaphore() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/gmc-navi48",
     gmc_navi48_client_context_timeout_releases_the_semaphore
+);
+
+fn gmc_navi48_shader_code_is_executable_only_after_tlb_ack() -> TestResult {
+    for clients in [false, true] {
+        let (_, mut e) = fixture();
+        run(e.initialize()).unwrap();
+        if clients {
+            e.io.registers.insert(0x10000 + 0x166a * 4, 0xffff);
+            e.io.registers.insert(0x20000 + 0x5aa * 4, 0xffff);
+            e.io.registers.insert(0x20000 + 0x586 * 4, 1);
+            run(e.prepare_clients()).unwrap();
+        }
+        let prior = e.state;
+        let before = e.io.memory.clone();
+        run(e.prepare_shader_test()).unwrap();
+        assert_eq!(e.state, prior);
+        assert!(e.shader_executable);
+        assert_eq!(e.io.memory[0], before[0] | 0x10);
+        assert_eq!(&e.io.memory[1..], &before[1..]);
+        assert_eq!(run(e.prepare_shader_test()), Err(Error::Busy));
+    }
+    let (pool, mut e) = fixture();
+    run(e.initialize()).unwrap();
+    e.io.stall = Some(e.layout.bases[0] + u64::from(GFX.inv_ack) * 4);
+    {
+        let mut future = core::pin::pin!(e.prepare_shader_test());
+        assert!(future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+    }
+    assert_eq!(e.state, State::PreparingShader);
+    assert!(!e.state.vmid0_ready());
+    assert!(!e.shader_executable);
+    assert_eq!(run(e.prepare_shader_test()), Err(Error::Busy));
+    drop(e);
+    assert_eq!(pool.available(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gmc-navi48",
+    gmc_navi48_shader_code_is_executable_only_after_tlb_ack
+);
+
+fn gmc_navi48_shader_tlb_failure_quarantines_the_owner() -> TestResult {
+    for revoke in [false, true] {
+        let (pool, mut e) = fixture();
+        run(e.initialize()).unwrap();
+        let base = e.layout.bases[0];
+        if revoke {
+            e.io.revoke_on = Some((base + u64::from(GFX.inv_req) * 4, e.authority));
+        } else {
+            e.io.stall = Some(base + u64::from(GFX.inv_ack) * 4);
+        }
+        assert_eq!(
+            run(e.prepare_shader_test()),
+            Err(if revoke {
+                Error::Revoked
+            } else {
+                Error::Timeout
+            })
+        );
+        assert_eq!(e.state, State::Failed);
+        assert!(!e.shader_executable);
+        assert!(!e.state.vmid0_ready());
+        assert_eq!(run(e.prepare_shader_test()), Err(Error::Busy));
+        drop(e);
+        assert_eq!(pool.available(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gmc-navi48",
+    gmc_navi48_shader_tlb_failure_quarantines_the_owner
+);
+
+fn clients_ready() -> (Pool, Engine<Fake>) {
+    let (pool, mut e) = fixture();
+    run(e.initialize()).unwrap();
+    for (base, ack, sem) in [(0x10000, 0x166a, 0x1646), (0x20000, 0x5aa, 0x586)] {
+        e.io.registers.insert(base + ack * 4, 0xffff);
+        e.io.registers.insert(base + sem * 4, 1);
+    }
+    run(e.prepare_clients()).unwrap();
+    (pool, e)
+}
+fn gmc_navi48_irq_handoff_requires_every_owned_empty_context() -> TestResult {
+    let (_, mut unprepared) = fixture();
+    run(unprepared.initialize()).unwrap();
+    assert_eq!(unprepared.fault_contexts(), Err(Error::Busy));
+    let (_, mut e) = clients_ready();
+    let writes = e.io.writes.len();
+    assert_eq!(e.fault_contexts(), Ok([0xaaa807; 2]));
+    for (bank, ctrl, root, start, end) in [
+        (0x10000, 0x1624, 0x168f, 0x16af, 0x16cf),
+        (0x20000, 0x564, 0x5cf, 0x5ef, 0x60f),
+    ] {
+        for vmid in 1..16 {
+            let registers = [
+                ctrl + vmid,
+                root + 2 * vmid,
+                root + 2 * vmid + 1,
+                start + 2 * vmid,
+                start + 2 * vmid + 1,
+                end + 2 * vmid,
+                end + 2 * vmid + 1,
+            ];
+            for (i, reg) in registers.into_iter().enumerate() {
+                let at = bank + reg * 4;
+                let saved = e.io.registers[&at];
+                e.io.registers.insert(at, saved ^ 1);
+                assert_eq!(e.fault_contexts(), Err(Error::Invalid));
+                if i != 5 {
+                    e.io.registers.insert(at, u32::MAX);
+                    assert_eq!(e.fault_contexts(), Err(Error::DeviceGone));
+                }
+                e.io.registers.insert(at, saved);
+            }
+        }
+    }
+    assert_eq!(e.fault_contexts(), Ok([0xaaa807; 2]));
+    assert_eq!(e.io.writes.len(), writes);
+    e.authority.revoke();
+    assert_eq!(e.fault_contexts(), Err(Error::Revoked));
+    assert_eq!(e.io.writes.len(), writes);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gmc-navi48",
+    gmc_navi48_irq_handoff_requires_every_owned_empty_context
+);
+
+// Feed real GMC programming into the real monitor's mapped-register path.
+// This boot handoff regressed when GMC started enabling client VMIDs but the
+// monitor continued rejecting every active client, even the owner's empty VMs.
+fn gmc_navi48_client_setup_hands_off_to_the_native_fault_monitor() -> TestResult {
+    use crate::amdgpu_navi48_faults::{Monitor, State as FaultState};
+    let (_pool, e) = clients_ready();
+    let mut words = vec![0; 0x80000 / 4];
+    let gpu = descriptor(&mut words);
+    for (&at, &v) in &e.io.registers {
+        words[at as usize / 4] = v;
+    }
+    words[0x10034 / 4] = 0x40; // SDMA0 traps not yet enabled.
+    let mut gmc = Gmc {
+        engine: Engine {
+            io: Mmio(gpu.regs),
+            authority: e.authority,
+            layout: e.layout,
+            memory: e.memory,
+            vram_size: e.vram_size,
+            state: e.state,
+            aperture: e.aperture,
+            geometry: e.geometry,
+            shader_executable: e.shader_executable,
+        },
+    };
+    let mut wrong = gpu.regs;
+    wrong.len -= 4;
+    assert_eq!(gmc.fault_contexts(wrong), Err(Error::Invalid));
+    // SAFETY: owned register fixture, exclusively held matching GMC and monitor;
+    // no GPU queues or IRQ consumer execute in this model.
+    let mut monitor = unsafe { Monitor::new(&gpu, e.authority) }.unwrap();
+    // SAFETY: same retained owners, no client submission or concurrent access.
+    unsafe { monitor.enable(&mut gmc) }.unwrap();
+    assert_eq!(monitor.status().state, FaultState::Armed);
+    for (bank, ctrl) in [(0x10000, 0x1624), (0x20000, 0x564)] {
+        for vmid in 0..16 {
+            assert_eq!(
+                words[(bank + (ctrl + vmid) * 4) / 4],
+                if vmid == 0 { 0xfffc01 } else { 0xfffc07 }
+            );
+        }
+    }
+    monitor.stop();
+    assert_eq!(monitor.status().state, FaultState::Contained);
+    for (bank, ctrl) in [(0x10000, 0x1624), (0x20000, 0x564)] {
+        for vmid in 0..16 {
+            assert_eq!(
+                words[(bank + (ctrl + vmid) * 4) / 4],
+                if vmid == 0 { 0xaaa801 } else { 0xaaa807 }
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gmc-navi48",
+    gmc_navi48_client_setup_hands_off_to_the_native_fault_monitor
 );

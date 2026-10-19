@@ -550,6 +550,42 @@ impl<I: Io> Engine<I> {
         self.end_runtime(resume, &result);
         result
     }
+    /// Linux smu_v14_0_set_vcn_enable, dGPU instance 0. Static media keeps
+    /// MM_DPM/DS_VCN disabled and every autonomous protection running.
+    async fn set_vcn_power(&mut self, enabled: bool) -> Result<PowerStatus, Error> {
+        self.set_media_power(enabled, false).await
+    }
+    async fn set_jpeg_power(&mut self, enabled: bool) -> Result<PowerStatus, Error> {
+        self.set_media_power(enabled, true).await
+    }
+    async fn set_media_power(&mut self, enabled: bool, jpeg: bool) -> Result<PowerStatus, Error> {
+        let power = self.power.ok_or(Error::Invalid)?;
+        let resume = self.begin_runtime()?;
+        let result = async {
+            let running = self.running().await?;
+            if !self.protected(running) || running & ((1 << 20) | (1 << 44)) != 0 {
+                return Err(Error::Features(running));
+            }
+            let command = match (jpeg, enabled) {
+                (false, true) => 0x2a,
+                (false, false) => 0x2b,
+                (true, true) => 0x2c,
+                (true, false) => 0x2d,
+            };
+            self.command(command, 0).await?;
+            self.access(|_| ())?;
+            Ok(PowerStatus {
+                enabled: running,
+                ..power
+            })
+        }
+        .await;
+        self.end_runtime(resume, &result);
+        if let Ok(power) = result {
+            self.power = Some(power);
+        }
+        result
+    }
     /// SetSoftMaxByFreq then SetSoftMinByFreq on GFXCLK, with Linux's
     /// `SMU_V14_SOFT_FREQ_ROUND` on manual maxima.
     async fn set_gfx_level(&mut self, level: GfxLevel) -> Result<(), Error> {
@@ -767,6 +803,21 @@ impl Smu {
     /// protection are untouched; a clean rejection leaves the owner usable.
     pub async fn set_gfx_level(&mut self, level: GfxLevel) -> Result<(), Error> {
         self.engine.set_gfx_level(level).await
+    }
+    /// SMU14 dGPU PowerUpVcn/PowerDownVcn for instance 0, with a fresh
+    /// protection/static-clock policy check. No display or GFX clocks move.
+    /// # Safety
+    /// Own VCN and its power lifecycle exclusively. Before power-down, its
+    /// retained owner has proved VCPU/LMI retirement and excluded submissions.
+    pub async unsafe fn set_vcn_power(&mut self, enabled: bool) -> Result<PowerStatus, Error> {
+        self.engine.set_vcn_power(enabled).await
+    }
+    /// SMU14 PowerUpJpeg/PowerDownJpeg with a fresh static-media policy check.
+    /// # Safety
+    /// Own JPEG's power lifecycle exclusively. Before power-down, its retained
+    /// owner has proved JRBC/JMI retirement and excluded every submission.
+    pub async unsafe fn set_jpeg_power(&mut self, enabled: bool) -> Result<PowerStatus, Error> {
+        self.engine.set_jpeg_power(enabled).await
     }
     /// Let PMFW enter one deep-sleep group. Disabled policy: nothing in narf
     /// calls this yet. Every failure is terminal.

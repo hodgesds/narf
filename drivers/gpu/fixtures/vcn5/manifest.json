@@ -1,0 +1,47 @@
+{
+  "source": {
+    "project": "IGT GPU Tools",
+    "version": "2.4",
+    "url": "https://www.x.org/releases/individual/app/igt-gpu-tools-2.4.tar.xz",
+    "archive_sha256": "a44b7d089a27555944d4cd5da372c9339501539e3cd2735bbdb30e0d802f1cbe",
+    "file": "lib/amdgpu/amd_mmd_decode_messages.h",
+    "license": "MIT",
+    "copyright": [
+      "2017 Advanced Micro Devices, Inc.",
+      "2023 Advanced Micro Devices, Inc."
+    ]
+  },
+  "target_bytes": 737280,
+  "target_sum": 33768920,
+  "dpb_bytes": 15923584,
+  "arrays": {
+    "vcn_dec_create_msg": {
+      "bytes": 56,
+      "sha256": "4f2062e44ff6a27dc0c2bbdfa813766689087dbcd3e5441c799d5dadfdc24aa5"
+    },
+    "vcn_dec_decode_msg": {
+      "bytes": 236,
+      "sha256": "81da2801051a7368ffa11527a725a51741c809d36f0c27b7d69b93da54ffd407"
+    },
+    "vcn_dec_destroy_msg": {
+      "bytes": 24,
+      "sha256": "5c9634824996deb87e4941fa60a28a26f0d12b76fe40319d4ca333fc78053888"
+    },
+    "avc_decode_msg": {
+      "bytes": 3344,
+      "sha256": "585b2450745bc9a0eae4b51734d132cb68b88d2e1c21351d5712006c181911ec"
+    },
+    "feedback_msg": {
+      "bytes": 44,
+      "sha256": "a7b196ba3c692510970dfe04f1692c8f2c497d481be22b85b72a219fdfbb040a"
+    },
+    "uvd_it_scaling_table": {
+      "bytes": 224,
+      "sha256": "9f2c9cf7fa480e731d5de40d43a133e5d95650338373c047b63a32f94e2cb65c"
+    },
+    "uvd_bitstream": {
+      "bytes": 1408,
+      "sha256": "00e5e28eeecb74c4ba6252b298391d19de3626c8ea0e8610892a61b0a9f10f22"
+    }
+  }
+}

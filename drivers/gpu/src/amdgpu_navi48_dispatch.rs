@@ -28,6 +28,10 @@ pub enum Key {
     Cp(src::Queue),
     /// An SDMA instance/queue.
     Sdma { instance: u8, queue: u8 },
+    /// VCN5's unified queue, source 119 on its VCN client instance.
+    Vcn { instance: u8 },
+    /// JPEG5 decoder, source 153 on its VCN client instance.
+    Jpeg { instance: u8 },
     /// A user queue named by its non-zero doorbell offset, as the CP EOP
     /// and SDMA fence payloads carry it (amdgpu_userq_process_fence_irq).
     Doorbell(u32),
@@ -296,7 +300,10 @@ impl Table {
         if let Some(t) = self.terminal {
             return Err(RegisterError::Terminal(t));
         }
-        if owner.key == Key::Doorbell(0) || owner.vmid > 15 {
+        if owner.key == Key::Doorbell(0)
+            || owner.vmid > 15
+            || matches!(owner.key, Key::Vcn { instance } | Key::Jpeg { instance } if instance > 1)
+        {
             return Err(RegisterError::Invalid);
         }
         if self
@@ -350,6 +357,40 @@ impl Table {
             generation: slot.generation,
         })
     }
+    /// Validate the exclusive owned recovery set before changing any
+    /// hardware source. Additional owners need a broader quiescence protocol.
+    pub(crate) fn recovery_owners(&self, handles: &[Handle]) -> Result<(), WaitError> {
+        if let Some(t) = self.terminal {
+            return Err(WaitError::Terminal(t));
+        }
+        if handles.is_empty()
+            || self.slots.iter().filter(|s| s.owner.is_some()).count() != handles.len()
+        {
+            return Err(WaitError::Stale);
+        }
+        for (i, h) in handles.iter().enumerate() {
+            let owner = self.slot(*h)?.owner.unwrap();
+            if handles[..i].contains(h) || owner.vmid != 0 || owner.pasid != 0 {
+                return Err(WaitError::Stale);
+            }
+        }
+        Ok(())
+    }
+    /// All owned rings have reset and drained their test fences. Invalidate
+    /// even healthy registrations so pre-reset waiters cannot complete later.
+    pub(crate) fn reset_owners<T: AsRef<[Handle]> + AsMut<[Handle]>>(
+        &mut self,
+        mut handles: T,
+    ) -> Result<T, WaitError> {
+        self.recovery_owners(handles.as_ref())?;
+        for h in handles.as_mut() {
+            let slot = &mut self.slots[h.slot as usize];
+            slot.fault = None;
+            Self::next_generation(slot);
+            h.generation = slot.generation;
+        }
+        Ok(handles)
+    }
     pub fn endpoint(&self, h: Handle) -> Result<Endpoint, WaitError> {
         let slot = self.slot(h)?;
         Ok(Endpoint {
@@ -396,10 +437,17 @@ impl Table {
             let Some(owner) = slot.owner else {
                 continue;
             };
-            // Queue faults name a slot or doorbell. VM and shader faults name
-            // a context and are attributed to every owner sharing it.
+            // A nonzero PASID names the address space even if a late vector's
+            // VMID has since been reused. Without it only the hub's VMID is
+            // known. Queue faults instead name a hardware slot or doorbell.
             let attributed = if keys.is_empty() {
-                owner.vmid == v.vmid && owner.pasid == v.pasid
+                if v.pasid != 0 {
+                    owner.pasid == v.pasid
+                } else {
+                    let mm = matches!(fault, src::Fault::Vm { mm_hub: true });
+                    owner.vmid == v.vmid
+                        && matches!(owner.key, Key::Vcn { .. } | Key::Jpeg { .. }) == mm
+                }
             } else {
                 keys.contains(&owner.key)
             };
@@ -478,9 +526,19 @@ impl Table {
                 Delivery::Terminal(Terminal::Poison(p))
             }
             src::Class::Display(d) => self.display(d),
-            src::Class::Media(_) => {
+            src::Class::Media(media) => {
                 self.counters.media = self.counters.media.saturating_add(1);
-                Delivery::Ignored
+                match media {
+                    src::Media::Vcn {
+                        instance,
+                        source: 119,
+                    } => self.signal(&[Key::Vcn { instance }], v),
+                    src::Media::Jpeg {
+                        instance,
+                        source: 153,
+                    } => self.signal(&[Key::Jpeg { instance }], v),
+                    _ => Delivery::Ignored,
+                }
             }
             src::Class::Power => {
                 self.counters.power = self.counters.power.saturating_add(1);
@@ -498,12 +556,14 @@ impl Table {
         }
     }
     /// A VM protection latch found after lost vectors. Only its VMID is
-    /// known, so every owner in that VMID is faulted.
+    /// known, so every owner in that VMID on that hub is faulted.
     pub fn latched(&mut self, vmid: u8, mm_hub: bool) -> Delivery {
         let fault = src::Fault::Vm { mm_hub };
         let mut hit = 0;
         for slot in self.slots.iter_mut() {
-            if slot.owner.is_some_and(|o| o.vmid == vmid) {
+            if slot.owner.is_some_and(|o| {
+                o.vmid == vmid && matches!(o.key, Key::Vcn { .. } | Key::Jpeg { .. }) == mm_hub
+            }) {
                 slot.fault.get_or_insert(fault);
                 slot.bump();
                 hit += 1;

@@ -169,15 +169,16 @@ fn update<I: Io>(io: &mut I, gc: u64, reg: u32, mask: u32, value: u32) -> Result
     io.write(address, (old & !mask) | value);
     Ok(())
 }
-fn flush<I: Io>(io: &mut I, l: Layout) {
+fn flush<I: Io>(io: &mut I, l: Layout) -> Result<(), Error> {
     fence(Ordering::SeqCst);
     io.write(0x7f000, 0);
-    io.read(l.nbio + 0xc3 * 4);
+    checked(io.read(l.nbio + 0xc3 * 4))?;
     fence(Ordering::SeqCst);
+    Ok(())
 }
-fn invalidate<I: Io>(io: &mut I, l: Layout) {
+fn invalidate<I: Io>(io: &mut I, l: Layout) -> Result<(), Error> {
     // HDP6 has no invalidate callback; flush posted BAR writes and fence reads.
-    flush(io, l);
+    flush(io, l)
 }
 fn packets(aperture: gmc::Aperture) -> [u32; 32] {
     let mut words = [0; 32];
@@ -368,6 +369,8 @@ fn kernel_words(
 /// - when `job.map_pasid`, the PASID mapping (IH_VMID_0_LUT + vmid at
 ///   OSSSYS dword base `oss`);
 /// - when `job.mem_sync`, a GCR_REQ cache flush (sdma_v7_0_ring_emit_mem_sync);
+/// - always an HDP_FLUSH POLL_REGMEM request/ack for SDMA0 before the IBs,
+///   including jobs that reuse a VMID without a page-table flush;
 /// - each IB as sdma_v7_0_ring_emit_ib: NOPs so the 6-dword INDIRECT packet
 ///   ends on an 8-dword boundary (the slot starts on one), the VMID in the
 ///   header, a 32-byte aligned base and no CSA;
@@ -379,6 +382,7 @@ fn job_words(
     job: &crate::amdgpu_gfx12_queue::Job,
     gc: u32,
     oss: u32,
+    nbio: u32,
     fence: u64,
     seq: u32,
 ) -> Result<[u32; JOB_DWORDS as usize], Error> {
@@ -431,6 +435,17 @@ fn job_words(
         const GCR: u32 = 1 << 14 | 1 << 15 | 1 << 5 | 1 << 9 | 1 << 8 | 1 << 7 | 1;
         slot.push(&[17, 0, (GCR & 0xffff) << 16, GCR >> 16, 0])?;
     }
+    // sdma_v7_0_ring_emit_hdp_flush: the HDP-flush poll writes the
+    // reference to REQ then polls DONE (byte register addresses). SDMA0
+    // uses bit 10, with Linux's finite retry count and interval.
+    slot.push(&[
+        8 | 1 << 26 | 3 << 28,
+        (nbio + 0x107) << 2,
+        (nbio + 0x106) << 2,
+        1 << 10,
+        1 << 10,
+        0xfff << 16 | 10,
+    ])?;
     for &(at, dwords) in ibs {
         while (slot.pos + 6) % 8 != 0 {
             slot.push(&[0])?;
@@ -548,7 +563,7 @@ impl<I: Io> Engine<I> {
             for offset in (0..8192).step_by(4) {
                 io.write_memory(target, offset, 0);
             }
-            flush(io, l);
+            flush(io, l)?;
             // Only one privileged direct ring, VMID0. No traps, paging IRQs,
             // preemption, automatic context switches or indirect buffers.
             update(io, l.gc, 0x0d, 0xf0023f79, 0x40)?;
@@ -557,7 +572,7 @@ impl<I: Io> Engine<I> {
         self.state = State::Submitted;
         self.access(|io| {
             io.write_memory(map, WPTR, 128); // pointers are bytes, not dwords
-            flush(io, l);
+            flush(io, l)?;
             io.write(l.gc + u64::from(RB_WPTR) * 4, 128);
             io.write(l.gc + u64::from(RB_WPTR + 1) * 4, 0);
             Ok(())
@@ -565,7 +580,7 @@ impl<I: Io> Engine<I> {
         let deadline = narf_time::Deadline::after_ms(1000);
         loop {
             let proof = self.access(|io| {
-                invalidate(io, l);
+                invalidate(io, l)?;
                 let fence = io.read_memory(target, FENCE);
                 let lo = checked(io.read(l.gc + u64::from(RB_RPTR) * 4))?;
                 let hi = checked(io.read(l.gc + u64::from(RB_RPTR + 1) * 4))?;
@@ -604,7 +619,14 @@ impl<I: Io> Engine<I> {
     fn submit(&mut self, job: crate::amdgpu_gfx12_queue::Job) -> Result<u32, Error> {
         let l = self.layout;
         self.submit_slot(|fence, seq| {
-            job_words(&job, (l.gc / 4) as u32, (l.oss / 4) as u32, fence, seq)
+            job_words(
+                &job,
+                (l.gc / 4) as u32,
+                (l.oss / 4) as u32,
+                (l.nbio / 4) as u32,
+                fence,
+                seq,
+            )
         })
     }
     /// Queue one kernel job (see `kernel_words`) like a client job.
@@ -630,7 +652,7 @@ impl<I: Io> Engine<I> {
         let fence = self.memory.address() + JOB_FENCE;
         let words = build(fence, seq)?;
         self.access(|io| {
-            invalidate(io, l);
+            invalidate(io, l)?;
             let rptr = (u64::from(io.read_memory(map, RPTR))
                 | u64::from(io.read_memory(map, RPTR + 4)) << 32)
                 / 4;
@@ -647,7 +669,7 @@ impl<I: Io> Engine<I> {
             let bytes = next * 4;
             io.write_memory(map, WPTR, bytes as u32);
             io.write_memory(map, WPTR + 4, (bytes >> 32) as u32);
-            flush(io, l);
+            flush(io, l)?;
             io.write(l.gc + u64::from(RB_WPTR) * 4, bytes as u32);
             io.write(l.gc + u64::from(RB_WPTR + 1) * 4, (bytes >> 32) as u32);
             Ok(())
@@ -692,7 +714,7 @@ impl<I: Io> Engine<I> {
                 io.write_memory(map, at, pointer as u32);
                 io.write_memory(map, at + 4, (pointer >> 32) as u32);
             }
-            flush(io, l);
+            flush(io, l)?;
             program_ring(io, l, address, pointer)
         })
     }
@@ -704,12 +726,12 @@ impl<I: Io> Engine<I> {
     }
     /// The last client job sequence the fence reached.
     fn completed_job(&mut self) -> Result<u32, Error> {
-        let l = self.layout;
-        let map = self.memory.mapping();
-        self.access(|io| {
-            invalidate(io, l);
-            Ok(io.read_memory(map, JOB_FENCE))
-        })
+        client_fence(
+            &mut self.io,
+            self.authority,
+            self.layout,
+            self.memory.mapping(),
+        )
     }
     async fn prove_interrupts(
         &mut self,
@@ -753,7 +775,7 @@ impl<I: Io> Engine<I> {
             .await
             .map_err(Error::Interrupts)?;
         self.access(|io| {
-            invalidate(io, l);
+            invalidate(io, l)?;
             let end = (u64::from(checked(io.read(l.gc + 0x1615 * 4))? & 0xffffff) + 1) << 24;
             if end != aperture.start {
                 return Err(Error::Invalid);
@@ -784,7 +806,7 @@ impl<I: Io> Engine<I> {
                 io.write_memory(map, 128 + i as u64 * 4, word);
             }
             io.write_memory(map, WPTR, 192);
-            flush(io, l);
+            flush(io, l)?;
             io.write(l.gc + u64::from(RB_WPTR) * 4, 192);
             io.write(l.gc + u64::from(RB_WPTR + 1) * 4, 0);
             Ok(())
@@ -792,7 +814,7 @@ impl<I: Io> Engine<I> {
         let deadline = narf_time::Deadline::after_ms(1000);
         loop {
             let memory_done = self.access(|io| {
-                invalidate(io, l);
+                invalidate(io, l)?;
                 let lo = checked(io.read(l.gc + u64::from(RB_RPTR) * 4))?;
                 let hi = checked(io.read(l.gc + u64::from(RB_RPTR + 1) * 4))?;
                 let rptr = u64::from(lo) | (u64::from(hi) << 32);
@@ -943,17 +965,29 @@ pub struct FenceReader {
     layout: Layout,
     map: MmioRegion,
 }
+fn client_fence(
+    io: &mut impl Io,
+    authority: Cap<BusDeviceCap, Write>,
+    l: Layout,
+    map: MmioRegion,
+) -> Result<u32, Error> {
+    let value = authority
+        .invoke(Op(|| {
+            invalidate(io, l)?;
+            let value = io.read_memory(map, JOB_FENCE);
+            checked(io.read(l.nbio + 0xc3 * 4))?;
+            Ok(value)
+        }))
+        .map_err(|_| Error::Revoked)??;
+    authority.invoke(Op(|| ())).map_err(|_| Error::Revoked)?;
+    Ok(value)
+}
 impl FenceReader {
     /// The last client job sequence SDMA0 completed.
     pub fn completed(&self) -> Result<u32, Error> {
         let mut io = Mmio(self.regs);
         let (l, map) = (self.layout, self.map);
-        self.authority
-            .invoke(Op(|| {
-                invalidate(&mut io, l);
-                io.read_memory(map, JOB_FENCE)
-            }))
-            .map_err(|_| Error::Revoked)
+        client_fence(&mut io, self.authority, l, map)
     }
 }
 #[cfg(feature = "kernel-test")]

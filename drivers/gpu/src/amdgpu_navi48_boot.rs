@@ -83,6 +83,8 @@ pub enum Error {
     Firmware(gfx::Error),
     Gmc(gmc::Error),
     Sdma(sdma::Error),
+    Vcn(crate::amdgpu_vcn_navi48::Error),
+    Jpeg(crate::amdgpu_jpeg_navi48::Error),
     Dmub(dmub::Error),
     Topology(topology::Error),
     Display(display::Error),
@@ -203,6 +205,16 @@ struct Hardware {
     sdma: Option<sdma::Sdma>,
     mes: Option<mes::Mes>,
     queues: Option<queues::Queues>,
+    vcn: Option<crate::amdgpu_vcn_navi48::Vcn>,
+    jpeg: Option<crate::amdgpu_jpeg_navi48::Jpeg>,
+    jpeg_test: Option<Result<crate::amdgpu_jpeg_navi48::Proof, Error>>,
+    jpeg_owner: Option<crate::amdgpu_navi48_dispatch::Handle>,
+    media_test: Option<Result<crate::amdgpu_vcn_navi48::InterruptProof, Error>>,
+    media_decode_required: bool,
+    media_encode_required: bool,
+    media_jpeg_required: bool,
+    media_jpeg_decode_required: bool,
+    vcn_owner: Option<crate::amdgpu_navi48_dispatch::Handle>,
 }
 impl Backend for Hardware {
     async fn step(&mut self, stage: Stage) -> Result<(), Error> {
@@ -657,6 +669,16 @@ impl ColdBoot {
                     faults: Some(faults),
                     gmc: None,
                     sdma: None,
+                    vcn: None,
+                    jpeg: None,
+                    jpeg_test: None,
+                    jpeg_owner: None,
+                    media_test: None,
+                    media_decode_required: false,
+                    media_encode_required: false,
+                    media_jpeg_required: false,
+                    media_jpeg_decode_required: false,
+                    vcn_owner: None,
                     mes: None,
                     queues: None,
                 },
@@ -778,6 +800,7 @@ impl ColdBoot {
                 &mut hardware.ih,
                 &mut hardware.interrupt_route,
                 &mut hardware.faults,
+                hardware.gmc.as_mut().ok_or(Error::Invalid)?,
             )
         }
         .map_err(|e| {
@@ -813,6 +836,9 @@ impl ColdBoot {
         pipe: queues::Pipe,
         job: queues::Job,
     ) -> Result<u32, queues::Error> {
+        if !self.media_submission_ready() {
+            return Err(queues::Error::Busy);
+        }
         let queues = self
             .sequence
             .backend
@@ -945,6 +971,9 @@ impl ColdBoot {
         &mut self,
         job: queues::Job,
     ) -> Result<u32, sdma::Error> {
+        if !self.media_submission_ready() {
+            return Err(sdma::Error::Busy);
+        }
         let sdma = self
             .sequence
             .backend
@@ -964,6 +993,9 @@ impl ColdBoot {
         &mut self,
         ops: &[sdma::KernelOp],
     ) -> Result<u32, sdma::Error> {
+        if !self.media_submission_ready() {
+            return Err(sdma::Error::Busy);
+        }
         let sdma = self
             .sequence
             .backend
@@ -1011,6 +1043,39 @@ impl ColdBoot {
         // SAFETY: matching retained owners and independent interrupt service;
         // the platform serializes all other accesses while this is pending.
         unsafe { queues.prove_interrupts(gmc).await }
+    }
+    /// Deterministic shader proof, after GC12/SDMA interrupt proofs and
+    /// before any client work; the caller excludes all test-page users.
+    /// # Safety
+    /// Continue the exclusive queue/GMC/reset ownership and enabled CPU IRQ
+    /// contract of prove_queue_interrupts. Failed/canceled proof stays retained.
+    pub(crate) async unsafe fn prove_shaders(
+        &mut self,
+    ) -> Result<crate::amdgpu_gfx12_shader::Proof, queues::Error> {
+        if self.state() != State::MemoryReady {
+            return Err(queues::Error::Busy);
+        }
+        let hw = &mut self.sequence.backend;
+        if hw
+            .sdma
+            .as_ref()
+            .is_none_or(|s| s.state() != sdma::State::InterruptVerified)
+        {
+            return Err(queues::Error::Busy);
+        }
+        let queues = hw.queues.as_mut().ok_or(queues::Error::Invalid)?;
+        let gmc = hw.gmc.as_mut().ok_or(queues::Error::Invalid)?;
+        // SAFETY: same retained GPU; caller excludes every queue/test-page user.
+        unsafe { queues.prove_shaders(gmc).await }
+    }
+    pub(crate) fn shader_result(
+        &self,
+    ) -> Option<Result<crate::amdgpu_gfx12_shader::Proof, queues::Error>> {
+        self.sequence
+            .backend
+            .queues
+            .as_ref()
+            .and_then(queues::Queues::shader_result)
     }
     pub fn sdma_state(&self) -> Option<sdma::State> {
         self.sequence.backend.sdma.as_ref().map(sdma::Sdma::state)
@@ -3019,6 +3084,11 @@ impl ColdBoot {
         Ok(&mut self.sequence.backend.dmub)
     }
 }
+
+#[path = "amdgpu_navi48_boot_media_clients.rs"]
+mod media_clients;
+#[path = "amdgpu_navi48_boot_media.rs"]
+mod media_transport;
 
 #[path = "amdgpu_navi48_mst.rs"]
 mod mst;
