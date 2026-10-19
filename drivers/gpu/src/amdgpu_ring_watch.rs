@@ -69,6 +69,32 @@ impl RingWatch {
     pub fn busy(&self) -> bool {
         !self.pending.is_empty()
     }
+    /// Freeze even an idle ring before a coordinated reset. A dropped
+    /// recovery keeps every ring closed and every pending allocation pinned.
+    pub(crate) fn freeze(&mut self) {
+        self.hung = true;
+    }
+    pub(crate) fn reset_vmid(&self) -> u8 {
+        self.pending.front().map_or(0, |p| p.job.vmid)
+    }
+    /// Late vectors/latches can identify more contexts while reset is in
+    /// progress. Apply the complete scope before choosing any replay jobs.
+    pub(crate) fn faulted(
+        &mut self,
+        scope: crate::amdgpu_navi48_faults::RecoveryScope,
+        ring: usize,
+    ) {
+        assert!(self.hung);
+        for p in &self.pending {
+            if scope.vmids & (1 << p.job.vmid) != 0 {
+                p.health.mark_guilty();
+            } else if scope.queues & (1 << ring) != 0 {
+                // A queue fault without a trustworthy client VMID cannot
+                // prove which pending context was guilty.
+                p.health.mark_canceled();
+            }
+        }
+    }
     /// Translate only proven hardware completions, never a reset test fence.
     pub fn progress(&mut self, physical: u32, now: u64) -> u32 {
         if !self.hung {
@@ -275,5 +301,58 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu_cs",
         ring_watch_front_timeout_rearms_on_completion
+    );
+    fn ring_watch_coordinated_fault_recovery_pins_every_ring_until_replay() -> TestResult {
+        let guilty = Arc::new(Health::default());
+        let healthy = Arc::new(Health::default());
+        let mut rings = [const { RingWatch::new() }; 3];
+        for w in &mut rings {
+            w.submitted(10, job(1), guilty.clone(), 0);
+            w.submitted(11, job(2), healthy.clone(), 0);
+            w.freeze();
+        }
+        let refs = Arc::strong_count(&healthy);
+        for w in &mut rings {
+            assert_eq!(w.progress(99, 1), 0); // reset fence passed all old work
+            assert!(w.refusing().is_some());
+        }
+        let scope = crate::amdgpu_navi48_faults::RecoveryScope {
+            vmids: 1 << 1,
+            ..Default::default()
+        };
+        for (ring, w) in rings.iter_mut().enumerate() {
+            w.faulted(scope, ring);
+        }
+        assert_eq!(guilty.error(), Some(FsError::TimedOut));
+        assert_eq!(healthy.error(), None);
+        for (ring, w) in rings.iter_mut().enumerate() {
+            let jobs = w.replay();
+            assert_eq!(jobs.len(), 1);
+            let (ticket, job) = jobs[0];
+            assert_eq!(ticket, 2);
+            assert!(job.flush && job.map_pasid && job.ctx_switch);
+            w.replayed(ticket, 100 + ring as u32);
+        }
+        // Cancellation or a later ring's error before the collective commit
+        // must retain every allocation, including already-replayed jobs.
+        for w in &mut rings {
+            assert_eq!(w.progress(200, 2), 0);
+        }
+        assert_eq!(Arc::strong_count(&healthy), refs);
+        for w in &mut rings {
+            w.recovered(3);
+        }
+        for (ring, w) in rings.iter_mut().enumerate() {
+            assert_eq!(w.progress(99, 4), 1);
+            assert_eq!(w.error(1), Some(FsError::Canceled));
+            assert_eq!(w.progress(100 + ring as u32, 5), 2);
+            assert!(w.error(2).is_none());
+        }
+        assert_eq!(Arc::strong_count(&healthy), 1);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu_cs",
+        ring_watch_coordinated_fault_recovery_pins_every_ring_until_replay
     );
 }

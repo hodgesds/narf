@@ -12,6 +12,9 @@ use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 const VM_MASK: u32 = 0x555400;
 const CP_MASKS: [u32; 2] = [0x01c00000, 0x01800000];
+#[path = "amdgpu_navi48_faults_recovery.rs"]
+mod recovery;
+pub use recovery::Scope as RecoveryScope;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -21,6 +24,7 @@ pub enum Error {
     DeviceGone,
     Readback,
     Gmc(crate::amdgpu_gmc_navi48::Error),
+    DeviceResetRequired,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -29,6 +33,8 @@ pub enum State {
     Armed,
     /// Fault sources are masked; this does not mean engines are quiescent.
     Contained,
+    /// All client retirement stays frozen until every owned ring is reset.
+    Recovering,
     Failed(Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,6 +144,8 @@ pub struct Status {
     pub last: Option<Record>,
     /// A failed mask attempt means hardware sources may still be enabled.
     pub mask_error: Option<Error>,
+    pub recovery: RecoveryScope,
+    pub recoveries: u64,
 }
 #[derive(Clone, Copy, Debug)]
 struct Layout {
@@ -221,6 +229,8 @@ struct Engine<I: Io> {
     status: Status,
     published: u64,
     owned_clients: bool,
+    controls: [u32; 35],
+    recovery_mark: u64,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> Result<T, Error>) -> Result<T, Error> {
@@ -286,6 +296,7 @@ impl<I: Io> Engine<I> {
                 }
                 Ok(())
             })?;
+            self.controls[i] = values[i] | if (2..4).contains(&i) { 0x84000000 } else { 0 };
         }
         // A revocation during the final write batch must not publish Armed.
         self.access(|_| Ok(()))
@@ -316,16 +327,15 @@ impl<I: Io> Engine<I> {
         let Some(kind) = classify(event) else {
             return Ok(());
         };
-        self.status.count = self.status.count.saturating_add(1);
         // Preserve the IV even if the capability was revoked before MMIO.
-        self.status.last = Some(Record {
+        self.record(Record {
             event: Some(event),
             kind,
             protection: None,
             acknowledged: false,
         });
         match self.status.state {
-            State::Armed | State::Contained => {}
+            State::Armed | State::Contained | State::Recovering => {}
             State::Failed(e) => return Err(e),
             _ => return Err(Error::Busy),
         }
@@ -348,6 +358,7 @@ impl<I: Io> Engine<I> {
                 checked(io.read(status))
             })?;
             self.status.last.as_mut().unwrap().protection = Some(Protection::decode(raw));
+            self.status.recovery.latch(Protection::decode(raw));
             // amdgpu_vm_update_fault_cache: the IV's PASID names the client
             // (each job maps its VMID to it in the IH LUT).
             if let Kind::Vm { hub, page, .. } = kind {
@@ -392,7 +403,7 @@ impl<I: Io> Engine<I> {
     /// latched VMID per hub, `[gfx, mm]`.
     fn sweep(&mut self) -> Result<[Option<u8>; 2], Error> {
         match self.status.state {
-            State::Armed | State::Contained => {}
+            State::Armed | State::Contained | State::Recovering => {}
             State::Failed(e) => return Err(e),
             _ => return Err(Error::Busy),
         }
@@ -417,8 +428,7 @@ impl<I: Io> Engine<I> {
                 continue;
             }
             let protection = Protection::decode(raw);
-            self.status.count = self.status.count.saturating_add(1);
-            self.status.last = Some(Record {
+            self.record(Record {
                 event: None,
                 kind: Kind::Latched { hub },
                 protection: Some(protection),
@@ -461,9 +471,13 @@ impl Monitor {
                 count: 0,
                 last: None,
                 mask_error: None,
+                recovery: RecoveryScope::default(),
+                recoveries: 0,
             },
             published: 0,
             owned_clients: false,
+            controls: [0; 35],
+            recovery_mark: 0,
         }))
     }
     /// # Safety
@@ -495,6 +509,16 @@ impl Monitor {
     }
     pub(crate) fn status(&self) -> Status {
         self.0.status
+    }
+    pub(crate) fn begin_recovery(&mut self) -> Result<u64, Error> {
+        self.0.begin_recovery()
+    }
+    /// # Safety
+    /// Every owned graphics, compute and SDMA0 ring has reset and passed its
+    /// fence test since begin_recovery; no new submission is possible. The IH
+    /// service has drained old vectors and swept both fault latches.
+    pub(crate) unsafe fn rearm(&mut self, mark: u64) -> Result<RecoveryScope, Error> {
+        self.0.rearm(mark)
     }
 }
 

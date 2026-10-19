@@ -350,6 +350,38 @@ impl Table {
             generation: slot.generation,
         })
     }
+    /// Validate the exclusive three-ring recovery set before changing any
+    /// hardware source. Additional owners need a broader quiescence protocol.
+    pub(crate) fn recovery_owners(&self, handles: &[Handle; 3]) -> Result<(), WaitError> {
+        if let Some(t) = self.terminal {
+            return Err(WaitError::Terminal(t));
+        }
+        if self.slots.iter().filter(|s| s.owner.is_some()).count() != 3 {
+            return Err(WaitError::Stale);
+        }
+        for (i, h) in handles.iter().enumerate() {
+            let owner = self.slot(*h)?.owner.unwrap();
+            if handles[..i].contains(h) || owner.vmid != 0 || owner.pasid != 0 {
+                return Err(WaitError::Stale);
+            }
+        }
+        Ok(())
+    }
+    /// All owned rings have reset and drained their test fences. Invalidate
+    /// even healthy registrations so pre-reset waiters cannot complete later.
+    pub(crate) fn reset_owners(
+        &mut self,
+        mut handles: [Handle; 3],
+    ) -> Result<[Handle; 3], WaitError> {
+        self.recovery_owners(&handles)?;
+        for h in &mut handles {
+            let slot = &mut self.slots[h.slot as usize];
+            slot.fault = None;
+            Self::next_generation(slot);
+            h.generation = slot.generation;
+        }
+        Ok(handles)
+    }
     pub fn endpoint(&self, h: Handle) -> Result<Endpoint, WaitError> {
         let slot = self.slot(h)?;
         Ok(Endpoint {

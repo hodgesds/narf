@@ -2935,8 +2935,39 @@ Already-queued VM faults are still recorded and acknowledged.
 failure. These survive history consumption and eviction. MMIO/revocation errors
 retain the raw vector, stop owned sources where possible, disable CPU delivery,
 and leave uncertain hardware/storage retained. EOP proofs reject any recognized
-fault or a monitor that is not armed. There is no automatic reset, PTE repair,
-fault replay, user-process termination or reuse of failed allocations.
+fault or a monitor that is not armed. The monitor itself performs no reset,
+PTE repair, fault replay, process termination or allocation reuse.
+
+After containment the platform coordinates all three owned kernel queues:
+graphics, compute and SDMA0. A shared blocked flag immediately gates client
+and kernel-clear submissions and freezes client retirement, including readers
+that do not take the platform owner lock. Under OWNER the watchdog freezes
+every ledger before awaiting a service recovery receipt. The receipt binds
+the current IH generation and fault-monitor recovery mark, and records each
+ring's successful reset and new fence test. A partial or stale receipt cannot
+re-arm sources. Cancellation retains `Recovering` and frozen ledgers.
+
+Before re-arm the independent service drains bounded old IH batches and sweeps
+both protection latches. Late fault evidence joins the recovery scope. VM/shader
+faults in VMID0 or unsupported contexts, foreign queues, poison, terminal
+dispatch state and additional queue owners require explicit device recovery.
+Persistent latches, changed controls, revoked authority and uncertain writes
+also refuse re-arm. The source monitor checks every owned control against its
+saved masked value, then re-enables and reads back all owned masks. Default,
+retry, depth and EOP policy remain fixed; current page-table roots may reflect
+client VM flushes. `Status::recovery`, `recoveries`, cumulative count and last
+record expose pending and historical evidence separately.
+
+Successful re-arm advances all three kernel interrupt-handle generations.
+Old handles cannot complete new work. The final fault scope excludes guilty
+client VMIDs and cancels queue work without reliable client attribution; healthy
+jobs replay under their original tickets with forced VM/PASID/context setup.
+All ledgers remain frozen until every replay obtains its new physical fence,
+then commit together. A replay failure quarantines reporting and every ledger.
+Reset-test fences never retire replay buffers or VMIDs. Recognized faults that
+arrive during replay contain reporting again and prevent a successful commit.
+This is a software-modeled recovery path; physical reset/re-arm acceptance
+remains pending, and automatic whole-device reset is still disabled.
 
 The monitor also records the remaining GC-client fault sources Linux defines
 for GC12 (irqsrcs_gfx_12_0_0.h): CP reserved-bit, semaphore-wait and general

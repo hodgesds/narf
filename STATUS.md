@@ -897,8 +897,17 @@ the same owned set while preserving translation policy and EOP enables.
 GMC-to-monitor integration and negative register models cover this path;
 physical handoff remains unverified.
 
+Contained Navi48 faults now use coordinated graphics/compute/SDMA0 recovery.
+Client retirement and submissions freeze before all three reset/fence tests;
+late IVs and VM latches remain diagnostic evidence. A generation-bound receipt
+guards source re-arming, unchanged controls are verified, and old interrupt
+handles are invalidated. Guilty contexts are excluded and healthy jobs replay
+under stable tickets before all ledgers reopen together. Cancellation or any
+uncertain stage keeps memory pinned; poison, kernel VM faults and unsupported
+owners require explicit device recovery. Hardware acceptance remains pending.
+
 Still open: physical MSI delivery verification and physical reset/replay
-acceptance, fault-source re-arming after containment, GC12 rendering and
+acceptance, GC12 rendering and
 application shader dispatch, production GPU VM and userspace submission,
 VCN5 video queues, native DCN4 clock/bandwidth/link
 and scanout programming, THM/SMU thermal interrupts and software-CTF shutdown,

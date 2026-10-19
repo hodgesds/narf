@@ -18,6 +18,7 @@ struct Fake {
     stale_gfx: bool,
     ignored: Option<u64>,
     revoke: Option<(u64, Cap<BusDeviceCap, Write>)>,
+    clear_latches: bool,
 }
 impl Io for Fake {
     fn read(&mut self, at: u64) -> u32 {
@@ -37,6 +38,14 @@ impl Io for Fake {
         if let Some((when, cap)) = self.revoke {
             if at == when {
                 cap.revoke();
+            }
+        }
+        if self.clear_latches && v & 1 != 0 {
+            if at == GCTL {
+                self.regs.insert(GST, 0);
+            }
+            if at == MCTL {
+                self.regs.insert(MST, 0);
             }
         }
     }
@@ -64,6 +73,7 @@ fn fixture() -> Engine<Fake> {
             stale_gfx: false,
             ignored: None,
             revoke: None,
+            clear_latches: false,
         },
         authority: Cap::bootstrap(),
         layout: Layout {
@@ -75,9 +85,13 @@ fn fixture() -> Engine<Fake> {
             count: 0,
             last: None,
             mask_error: None,
+            recovery: RecoveryScope::default(),
+            recoveries: 0,
         },
         published: 0,
         owned_clients: false,
+        controls: [0; 35],
+        recovery_mark: 0,
     }
 }
 fn event(client: u8, source: u8, ring: u8) -> ih::Event {
@@ -591,4 +605,122 @@ fn navi48_client_fault_partial_writes_mask_every_published_source() -> TestResul
 kernel_test_in!(
     "drivers/gpu/navi48-faults",
     navi48_client_fault_partial_writes_mask_every_published_source
+);
+
+fn recoverable() -> Engine<Fake> {
+    let mut e = client_fixture();
+    e.io.regs.insert(GST, 0);
+    e.io.regs.insert(MST, 0);
+    e.io.clear_latches = true;
+    e.enable(Some([0xaaa807; 2])).unwrap();
+    e.handle(event(0x0a, 183, 0)).unwrap();
+    assert_eq!(e.status.state, State::Contained);
+    e
+}
+fn navi48_rearm_retains_evidence_and_accumulates_late_faults() -> TestResult {
+    let mut e = recoverable();
+    assert_eq!(e.rearm(1), Err(Error::Busy));
+    let mark = e.begin_recovery().unwrap();
+    assert_eq!(e.status.state, State::Recovering);
+    assert_eq!(e.begin_recovery(), Err(Error::Busy));
+    let writes = e.io.writes.len();
+    assert_eq!(e.rearm(mark + 1), Err(Error::Busy));
+    assert_eq!(e.io.writes.len(), writes);
+    let mut late = event(0x12, 0, 0);
+    late.vector.vmid = 3;
+    // The IV and latch can name different simultaneous client faults.
+    e.io.regs.insert(MST, (4 << 20) | 0x10);
+    e.handle(late).unwrap();
+    assert_eq!(e.status.state, State::Recovering);
+    let last = e.status.last;
+    let scope = e.rearm(mark).unwrap();
+    assert_eq!(scope.vmids, 1 << 7 | 1 << 3 | 1 << 4);
+    assert!(!scope.device_reset);
+    assert_eq!(e.status.last, last);
+    assert_eq!(e.status.count, 2);
+    assert_eq!(e.status.recoveries, 1);
+    assert_eq!(e.status.recovery, RecoveryScope::default());
+    assert_eq!(e.status.state, State::Armed);
+    assert_eq!(e.rearm(mark), Err(Error::Busy));
+    for base in [GCTX, MCTX] {
+        for vmid in 0..16 {
+            assert_ne!(e.io.regs[&(base + vmid * 4)] & 0x555400, 0);
+        }
+    }
+    e.handle(event(0x0a, 183, 0)).unwrap();
+    assert_eq!(e.status.state, State::Contained);
+    let next = e.begin_recovery().unwrap();
+    assert_ne!(mark, next);
+    assert_eq!(e.rearm(mark), Err(Error::Busy));
+    assert!(e.rearm(next).is_ok());
+    assert_eq!(e.status.recoveries, 2);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-faults",
+    navi48_rearm_retains_evidence_and_accumulates_late_faults
+);
+
+fn navi48_rearm_refuses_unsafe_faults_and_uncertain_controls() -> TestResult {
+    for case in 0..6 {
+        let mut e = recoverable();
+        let mark = e.begin_recovery().unwrap();
+        e.io.writes.clear();
+        let expected = match case {
+            0 => {
+                e.io.regs.insert(GST, 1);
+                Error::DeviceResetRequired
+            }
+            1 => {
+                e.io.regs.insert(MCTX + 15 * 4, 0xaaa805);
+                Error::Readback
+            }
+            2 => {
+                e.io.ignored = Some(MCTX + 15 * 4);
+                Error::Readback
+            }
+            3 => {
+                e.authority.revoke();
+                Error::Revoked
+            }
+            4 => {
+                e.io.revoke = Some((MCTX + 15 * 4, e.authority));
+                Error::Revoked
+            }
+            _ => {
+                e.io.regs.insert(GCP, u32::MAX);
+                Error::DeviceGone
+            }
+        };
+        assert_eq!(e.rearm(mark), Err(expected));
+        assert_eq!(e.status.state, State::Failed(expected));
+        assert_eq!(e.status.recoveries, 0);
+        assert_eq!(e.begin_recovery(), Err(Error::Busy));
+        if case < 3 {
+            for base in [GCTX, MCTX] {
+                for vmid in 0..16 {
+                    assert_eq!(e.io.regs[&(base + vmid * 4)] & 0x555400, 0);
+                }
+            }
+        }
+    }
+    for (client, source, ring, vmid) in [
+        (0x0a, 0, 0, 0),      // kernel VM fault
+        (0x0a, 0, 0, 8),      // unsupported delegated context
+        (0x0a, 183, 0x10, 3), // foreign CP queue
+        (0x0a, 183, 1, 3),    // foreign CP pipe
+    ] {
+        let mut e = recoverable();
+        let mut v = event(client, source, ring);
+        v.vector.vmid = vmid;
+        e.handle(v).unwrap();
+        assert!(e.status.recovery.device_reset);
+        assert_eq!(e.begin_recovery(), Err(Error::DeviceResetRequired));
+        assert_eq!(e.status.state, State::Contained);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-faults",
+    navi48_rearm_refuses_unsafe_faults_and_uncertain_controls
 );

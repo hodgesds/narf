@@ -50,6 +50,46 @@ fn far() -> Deadline {
     Deadline::after_ms(10_000)
 }
 
+fn navi48_dispatch_coordinated_reset_invalidates_every_old_owner() -> TestResult {
+    let mut table = Table::new();
+    let keys = [
+        Key::Cp(GFX),
+        Key::Cp(src::Queue { me: 1, ..GFX }),
+        Key::Sdma {
+            instance: 0,
+            queue: 0,
+        },
+    ];
+    let handles = keys.map(|key| table.register(kernel(key)).unwrap());
+    assert_eq!(table.recovery_owners(&handles), Ok(()));
+    let extra = table.register(user(0x20)).unwrap();
+    assert_eq!(table.reset_owners(handles), Err(WaitError::Stale));
+    for h in handles {
+        assert!(table.endpoint(h).is_ok());
+    }
+    table.retire(extra).unwrap();
+    assert_eq!(table.reset_owners([handles[0]; 3]), Err(WaitError::Stale));
+    let fault = iv(CLIENT_GFX, 183, 0, 3, 5, 0);
+    assert_eq!(table.route(&fault, classify(&fault)), Delivery::Faulted(1));
+    let next = table.reset_owners(handles).unwrap();
+    for (i, old) in handles.into_iter().enumerate() {
+        assert_eq!(table.endpoint(old), Err(WaitError::Stale));
+        let endpoint = table.endpoint(next[i]).unwrap();
+        assert_eq!(endpoint.owner, kernel(keys[i]));
+        assert_eq!(endpoint.fault, None);
+    }
+    table.fail_all(Terminal::DeviceGone);
+    assert_eq!(
+        table.reset_owners(next),
+        Err(WaitError::Terminal(Terminal::DeviceGone))
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-interrupts",
+    navi48_dispatch_coordinated_reset_invalidates_every_old_owner
+);
+
 fn navi48_dispatch_routes_completions_only_to_exact_live_owners() -> TestResult {
     let t = IrqSafeSpinLock::new(Table::new());
     let gfx = t.lock().register(kernel(Key::Cp(GFX))).unwrap();

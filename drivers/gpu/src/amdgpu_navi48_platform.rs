@@ -8,6 +8,8 @@ use core::ops::Range;
 use narf_capabilities::{Cap, Read};
 use narf_graphics_driver::generic::GenericFb;
 use narf_lib::mutex::Mutex;
+#[path = "amdgpu_navi48_platform_recovery.rs"]
+mod fault_recovery;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -479,6 +481,7 @@ struct Submitter {
 enum RingError {
     Queue(crate::amdgpu_gfx12_queue::Error),
     Sdma(crate::amdgpu_sdma_navi48::Error),
+    Interrupts(crate::amdgpu_ih7::Error),
 }
 /// Client VMIDs on the GFX hub: 1 up to first_kfd_vmid (8) exclusive.
 const CLIENT_VMIDS: (u8, u8) = (1, 7);
@@ -518,6 +521,11 @@ impl Submitter {
         let now = narf_time::monotonic_ns();
         {
             let mut watches = self.watch.lock();
+            if crate::amdgpu_navi48_interrupts::blocked() {
+                for watch in watches.iter_mut() {
+                    watch.freeze();
+                }
+            }
             for (watch, done) in watches.iter_mut().zip(&mut completed) {
                 *done = watch.progress(*done, now);
             }
@@ -530,6 +538,16 @@ impl Submitter {
     /// and recover the rings that can be.
     async fn watch(&self) {
         use core::fmt::Write as _;
+        if crate::amdgpu_navi48_interrupts::recovery_needed().await {
+            self.recover_faults().await;
+            return;
+        }
+        if crate::amdgpu_navi48_interrupts::blocked() {
+            for watch in self.watch.lock().iter_mut() {
+                watch.stop();
+            }
+            return;
+        }
         if !self.watch.lock().iter().any(|w| w.busy()) {
             return;
         }
@@ -550,6 +568,11 @@ impl Submitter {
             let recovered = {
                 let mut owner = OWNER.lock().await;
                 if *READ_GENERATION.lock() != self.generation {
+                    return;
+                }
+                if crate::amdgpu_navi48_interrupts::blocked() {
+                    drop(owner);
+                    self.recover_faults().await;
                     return;
                 }
                 let reset = match (owner.as_mut(), PIPES.get(ring)) {
@@ -663,7 +686,9 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             .is_none_or(|completed| job_done(completed, ticket) || self.job_error(ticket).is_some())
     }
     fn error(&self, ticket: u64) -> Option<narf_filesystem::FsError> {
-        self.job_error(ticket)
+        self.job_error(ticket).or_else(|| {
+            crate::amdgpu_navi48_interrupts::failed().then_some(narf_filesystem::FsError::NoDevice)
+        })
     }
     fn submit<'a>(
         &'a self,
@@ -720,6 +745,13 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                 }
                 if let Some(error) = health.error() {
                     break Err(error);
+                }
+                if crate::amdgpu_navi48_interrupts::blocked() {
+                    break Err(if crate::amdgpu_navi48_interrupts::failed() {
+                        FsError::NoDevice
+                    } else {
+                        FsError::Busy
+                    });
                 }
                 // A hung ring takes no more jobs until it is recovered.
                 if let Some(error) = self.watch.lock()[ring as usize].refusing() {
@@ -1008,6 +1040,11 @@ impl narf_filesystem::DrmFence for ClearFence {
         if self.gone.load(Ordering::Acquire) {
             return true;
         }
+        // A physical reset/test fence cannot prove a skipped clear ran.
+        // Quarantined published requests stay pinned until device recovery.
+        if crate::amdgpu_navi48_interrupts::blocked() {
+            return false;
+        }
         let seq = self.seq.load(Ordering::Acquire);
         // A device that stopped answering runs nothing any more.
         seq != u64::MAX
@@ -1052,6 +1089,27 @@ impl VramClearer {
             // The batch is taken and queued under OWNER, as an SDMA0 reset
             // requeues skipped clears at the queue's front under it too.
             let mut owner = OWNER.lock().await;
+            if crate::amdgpu_navi48_interrupts::failed() {
+                // These requests have no live SDMA slot (including skipped
+                // clears requeued only after a proven reset). Published
+                // inflight requests remain retained and unsignalled.
+                let mut state = self.0.state.lock();
+                for c in state.queued.drain(..) {
+                    c.fence.gone.store(true, Ordering::Release);
+                }
+                state.draining = false;
+                return;
+            }
+            if crate::amdgpu_navi48_interrupts::blocked()
+                || SUBMITTER
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|s| s.watch.lock()[SDMA_RING as usize].refusing().is_some())
+            {
+                drop(owner);
+                narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
+                continue;
+            }
             // The front clears that fit one job, left queued until they are
             // in the ring so a later request cannot overtake them.
             let batch: Vec<Clear> = {
@@ -1120,7 +1178,7 @@ impl crate::amdgpu_gem::VramClear for VramClearer {
         if !clear_fits(address, bytes) {
             return Err(narf_filesystem::FsError::InvalidData);
         }
-        if (self.0.progress)().is_none() {
+        if crate::amdgpu_navi48_interrupts::failed() || (self.0.progress)().is_none() {
             return Err(narf_filesystem::FsError::NoDevice);
         }
         let fence = Arc::new(ClearFence::new(self.0.progress.clone()));

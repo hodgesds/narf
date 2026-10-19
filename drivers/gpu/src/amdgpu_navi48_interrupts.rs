@@ -11,7 +11,21 @@ use narf_lib::mutex::Mutex;
 
 static SERVICE: Mutex<Option<Service>> = Mutex::new(None);
 static HALTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static BLOCKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static FAILED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub(crate) fn failed() -> bool {
+    FAILED.load(core::sync::atomic::Ordering::Acquire)
+}
+/// Synchronous fence readers freeze retirement as soon as containment is seen.
+pub(crate) fn blocked() -> bool {
+    BLOCKED.load(core::sync::atomic::Ordering::Acquire)
+}
+#[path = "amdgpu_navi48_interrupts_recovery.rs"]
+mod recovery;
+pub(crate) use recovery::{begin_recovery, finish_recovery, quarantine, recovery_needed};
 pub(crate) fn lose() {
+    FAILED.store(true, core::sync::atomic::Ordering::Release);
+    BLOCKED.store(true, core::sync::atomic::Ordering::Release);
     HALTED.store(true, core::sync::atomic::Ordering::Release);
     dispatch::TABLE
         .lock()
@@ -247,6 +261,9 @@ impl Service {
                         failed.get_or_insert(e);
                     }
                 }
+                if self.faults.status().state != faults::State::Armed {
+                    BLOCKED.store(true, core::sync::atomic::Ordering::Release);
+                }
                 // Deliver after the monitor captured and acknowledged its
                 // evidence, so a woken owner never races the latch.
                 {
@@ -262,6 +279,9 @@ impl Service {
                     dispatch::TABLE.lock().lost();
                     match self.faults.sweep() {
                         Ok(found) => {
+                            if self.faults.status().state != faults::State::Armed {
+                                BLOCKED.store(true, core::sync::atomic::Ordering::Release);
+                            }
                             let mut table = dispatch::TABLE.lock();
                             for (mm_hub, vmid) in [false, true].into_iter().zip(found) {
                                 if let Some(vmid) = vmid {
@@ -292,6 +312,8 @@ impl Service {
     /// Stop draining for good: mask sources and CPU delivery where authority
     /// permits, then release every waiter with the terminal cause.
     fn stop(&mut self, cause: dispatch::Terminal) {
+        FAILED.store(true, core::sync::atomic::Ordering::Release);
+        BLOCKED.store(true, core::sync::atomic::Ordering::Release);
         self.faults.stop();
         if let Some(route) = &mut self.route {
             self.routing = route.disable().map(|()| None);
@@ -355,12 +377,16 @@ pub(crate) unsafe fn install(
     // SAFETY: matching initialized hubs/queues/IH; the permanent service now
     // retains the monitor before the first source enable or CPU MSI delivery.
     if unsafe { service.faults.enable(gmc) }.is_err() {
+        FAILED.store(true, core::sync::atomic::Ordering::Release);
+        BLOCKED.store(true, core::sync::atomic::Ordering::Release);
         // No consumer will run: release the owners registered above.
         dispatch::TABLE
             .lock()
             .fail_all(dispatch::Terminal::Interrupts(ih::Error::Protocol));
         return Err(ih::Error::Protocol);
     }
+    BLOCKED.store(false, core::sync::atomic::Ordering::Release);
+    FAILED.store(false, core::sync::atomic::Ordering::Release);
     if let Some(route) = &mut service.route {
         // SAFETY: service slot already retains both owners and the consumer is
         // spawned below. It drains first, so an early IRQ is not lost.
