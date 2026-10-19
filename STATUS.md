@@ -953,6 +953,13 @@ storage are required before publication and after recovery. Builders and input
 match pinned IGT source; synthetic model headers verify ownership and parsing,
 while physical encoding, complete bitstream conformance and picture quality
 remain acceptance work. This proof advertises no codec capability.
+The opt-in `amdgpu.jpeg_proof` adds a retained JPEG5 static-power JRBC and IB
+transport/interrupt/retirement cycle. It preserves VCN's shared NBIO range,
+uses separately reserved GPCOM fence dwords and requires DMA-clean evidence
+before memory reuse. A registered exact-source JPEG owner participates in
+fault containment; incomplete recovery cannot omit it. Transport models and
+unchanged Linux constructor checks support this stage. JPEG picture execution,
+native clients and physical acceptance remain open.
 Fault recovery
 requires all four retirements and renewed owners, followed by a new media
 interrupt and session IB proof before ledger commit. Media restart cancels old codec

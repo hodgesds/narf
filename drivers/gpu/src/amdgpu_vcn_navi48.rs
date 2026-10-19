@@ -123,6 +123,7 @@ const BYTES: u64 = FENCE + 4096;
 const DOORBELL_BASE: u32 = 0x310; // soc24: AMDGPU_NAVI10_DOORBELL64_VCN0_1 << 1
 const DOORBELL: u32 = DOORBELL_BASE + 2; // vcn_v5_0_0_sw_init
 const NBIO_RANGE: u32 = 0x1cf; // NBIF6.3.1 bank 2: GDC_S2A0_S2A_DOORBELL_ENTRY_4_CTRL
+const JPEG_DB_CTRL: u32 = 0x68;
 const VCPU_RESET: u32 = 1 << 28;
 const VCPU_CLOCK: u32 = 1 << 9;
 const RB1: u32 = 1 << 2;
@@ -164,7 +165,7 @@ impl Layout {
         })
     }
 }
-trait Io {
+pub(crate) trait Io {
     fn read(&mut self, at: u64) -> u32;
     fn write(&mut self, at: u64, value: u32);
     fn memory_read(&mut self, map: MmioRegion, at: u64) -> u32;
@@ -177,9 +178,9 @@ trait Io {
     }
 }
 #[derive(Clone, Copy, Debug)]
-struct Mmio {
-    regs: MmioRegion,
-    doorbells: MmioRegion,
+pub(crate) struct Mmio {
+    pub(crate) regs: MmioRegion,
+    pub(crate) doorbells: MmioRegion,
 }
 impl Io for Mmio {
     fn read(&mut self, at: u64) -> u32 {
@@ -308,6 +309,9 @@ impl<I: Io> Engine<I> {
             return Err(Error::PowerPolicy(power.enabled));
         }
         if self.reg(RB_ENABLE)? & ALL_RBS != 0 || self.reg(VCPU)? & VCPU_RESET == 0 {
+            return Err(Error::Busy);
+        }
+        if self.reg(JPEG_DB_CTRL)? & (1 << 30) != 0 {
             return Err(Error::Busy);
         }
         if self.access(|io, l| checked(io.read(l.nbio + u64::from(NBIO_RANGE) * 4)))?
@@ -590,6 +594,10 @@ impl<I: Io> Engine<I> {
         result
     }
     async fn stop_inner(&mut self) -> Result<(), Error> {
+        // JPEG shares the NBIO media range; never disable it under a live JRBC.
+        if self.reg(JPEG_DB_CTRL)? & (1 << 30) != 0 {
+            return Err(Error::Busy);
+        }
         self.shared_mode(2, 2)?;
         self.wait(RPTR, 1023, self.wptr).await?;
         self.wait(STATUS, 7, 2).await?;

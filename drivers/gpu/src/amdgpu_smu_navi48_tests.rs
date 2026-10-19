@@ -108,7 +108,7 @@ impl Io for Fake {
             0x1e if p >> 16 == 2 => 1258,
             0x1d => 500,
             0x1e => 3100,
-            0x36 | 6 | 0x19 | 0x1a | 0x2a | 0x2b => 0,
+            0x36 | 6 | 0x19 | 0x1a | 0x2a..=0x2d => 0,
             8 => {
                 self.enabled |= p as u64;
                 0
@@ -894,6 +894,43 @@ fn smu14_vcn_power_requires_current_static_policy_and_protection() -> TestResult
 kernel_test_in!(
     "drivers/gpu/smu-navi48",
     smu14_vcn_power_requires_current_static_policy_and_protection
+);
+
+fn smu14_jpeg_power_requires_current_static_policy_and_protection() -> TestResult {
+    let (_, mut e) = powered();
+    for (enabled, command) in [(true, 0x2c), (false, 0x2d)] {
+        e.io.commands.clear();
+        assert_eq!(run(e.set_jpeg_power(enabled)).unwrap().enabled, ALLOWED);
+        assert_eq!(e.io.commands, [(0xc, 0), (0xd, 0), (command, 0)]);
+        assert_eq!(e.state, State::PowerReady);
+    }
+    for running in [ALLOWED | 1 << 20, ALLOWED | 1 << 44, ALLOWED & !(1 << 28)] {
+        let (_, mut e) = powered();
+        e.io.reported = Some(running);
+        assert_eq!(run(e.set_jpeg_power(true)), Err(Error::Features(running)));
+        assert_eq!(e.io.commands, [(0xc, 0), (0xd, 0)]);
+        assert_eq!(e.state, State::Failed);
+    }
+    let (_, mut e) = powered();
+    e.io.reject = Some(0x2c);
+    assert_eq!(run(e.set_jpeg_power(true)), Err(Error::Rejected(0xfd)));
+    assert_eq!(e.state, State::PowerReady);
+    let (_, mut e) = powered();
+    e.io.stall = Some(0x2c);
+    {
+        let mut future = core::pin::pin!(e.set_jpeg_power(true));
+        assert!(future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+    }
+    assert_eq!(e.state, State::Runtime);
+    assert_eq!(run(e.set_jpeg_power(false)), Err(Error::Busy));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi48",
+    smu14_jpeg_power_requires_current_static_policy_and_protection
 );
 
 fn smu14_deep_sleep_is_gated_and_keeps_protection() -> TestResult {

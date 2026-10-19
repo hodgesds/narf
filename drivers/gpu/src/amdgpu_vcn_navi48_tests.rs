@@ -1045,6 +1045,25 @@ fn verified_client() -> (Pool, Engine<Fake>) {
     run(e.prove_interrupts(&mut observer)).unwrap();
     (pool, e)
 }
+fn vcn5_refuses_shared_range_teardown_under_a_live_jpeg_owner() -> TestResult {
+    let (_pool, mut e) = verified_client();
+    let range = e.io.regs[&(NBIO + u64::from(NBIO_RANGE) * 4)];
+    e.io.regs
+        .insert(VCN + u64::from(JPEG_DB_CTRL) * 4, 1 << 30 | 0x311 << 2);
+    assert_eq!(run(e.stop()), Err(Error::Busy));
+    assert!(!e.memory.reusable_for_test());
+    assert_eq!(e.io.regs[&(NBIO + u64::from(NBIO_RANGE) * 4)], range);
+    let (_pool, mut e) = fixture();
+    e.io.regs.insert(VCN + u64::from(JPEG_DB_CTRL) * 4, 1 << 30);
+    assert_eq!(run(e.start(IMAGE, power())), Err(Error::Busy));
+    assert_eq!(e.state, State::Prepared);
+    assert!(e.memory.reusable_for_test());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi48",
+    vcn5_refuses_shared_range_teardown_under_a_live_jpeg_owner
+);
 fn vcn5_client_jobs_wrap_backpressure_and_record_published_sequences() -> TestResult {
     use crate::amdgpu_gfx12_queue::Job;
     let job = Job::new(3, 0x42, 0x1_0000_8001, &[(0x2_0000_1000, 64)]).unwrap();

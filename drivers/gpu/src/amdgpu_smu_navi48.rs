@@ -553,6 +553,12 @@ impl<I: Io> Engine<I> {
     /// Linux smu_v14_0_set_vcn_enable, dGPU instance 0. Static media keeps
     /// MM_DPM/DS_VCN disabled and every autonomous protection running.
     async fn set_vcn_power(&mut self, enabled: bool) -> Result<PowerStatus, Error> {
+        self.set_media_power(enabled, false).await
+    }
+    async fn set_jpeg_power(&mut self, enabled: bool) -> Result<PowerStatus, Error> {
+        self.set_media_power(enabled, true).await
+    }
+    async fn set_media_power(&mut self, enabled: bool, jpeg: bool) -> Result<PowerStatus, Error> {
         let power = self.power.ok_or(Error::Invalid)?;
         let resume = self.begin_runtime()?;
         let result = async {
@@ -560,7 +566,13 @@ impl<I: Io> Engine<I> {
             if !self.protected(running) || running & ((1 << 20) | (1 << 44)) != 0 {
                 return Err(Error::Features(running));
             }
-            self.command(if enabled { 0x2a } else { 0x2b }, 0).await?;
+            let command = match (jpeg, enabled) {
+                (false, true) => 0x2a,
+                (false, false) => 0x2b,
+                (true, true) => 0x2c,
+                (true, false) => 0x2d,
+            };
+            self.command(command, 0).await?;
             self.access(|_| ())?;
             Ok(PowerStatus {
                 enabled: running,
@@ -799,6 +811,13 @@ impl Smu {
     /// retained owner has proved VCPU/LMI retirement and excluded submissions.
     pub async unsafe fn set_vcn_power(&mut self, enabled: bool) -> Result<PowerStatus, Error> {
         self.engine.set_vcn_power(enabled).await
+    }
+    /// SMU14 PowerUpJpeg/PowerDownJpeg with a fresh static-media policy check.
+    /// # Safety
+    /// Own JPEG's power lifecycle exclusively. Before power-down, its retained
+    /// owner has proved JRBC/JMI retirement and excluded every submission.
+    pub async unsafe fn set_jpeg_power(&mut self, enabled: bool) -> Result<PowerStatus, Error> {
+        self.engine.set_jpeg_power(enabled).await
     }
     /// Let PMFW enter one deep-sleep group. Disabled policy: nothing in narf
     /// calls this yet. Every failure is terminal.

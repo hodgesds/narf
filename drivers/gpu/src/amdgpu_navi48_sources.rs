@@ -140,8 +140,8 @@ pub enum Display {
     /// DMCUB outbox low-priority ready.
     DmubOutbox,
 }
-/// VCN5 unified-queue and JPEG traps. VCN source 119 can wake its owner;
-/// other media messages remain diagnostic until their engine is supported.
+/// VCN5 unified-queue and JPEG traps. Sources 119 and 153 wake their exact
+/// registered owners; other media messages remain diagnostic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Media {
     Vcn { instance: u8, source: u8 },

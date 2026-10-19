@@ -27,6 +27,11 @@ static MEDIA_PROOF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicB
 static MEDIA_CLIENTS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static DECODE_PROOF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static ENCODE_PROOF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static JPEG_PROOF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Opt-in native JPEG5 direct/IB/interrupt/retirement cycle before clients.
+pub fn set_jpeg_proof(enabled: bool) {
+    JPEG_PROOF.store(enabled, core::sync::atomic::Ordering::Release);
+}
 /// Opt-in fixed IDR encode/header proof before publication and after recovery.
 pub fn set_encode_proof(enabled: bool) {
     ENCODE_PROOF.store(enabled, core::sync::atomic::Ordering::Release);
@@ -98,6 +103,8 @@ pub struct Diagnostics {
         Option<Result<crate::amdgpu_vcn_navi48::DecodeProof, crate::amdgpu_vcn_navi48::Error>>,
     pub media_encode:
         Option<Result<crate::amdgpu_vcn_navi48::EncodeProof, crate::amdgpu_vcn_navi48::Error>>,
+    pub media_jpeg: Option<Result<crate::amdgpu_jpeg_navi48::Proof, boot::Error>>,
+    pub jpeg_state: Option<crate::amdgpu_jpeg_navi48::State>,
     pub sdma_state: Option<crate::amdgpu_sdma_navi48::State>,
     pub sdma_interrupts:
         Option<Result<crate::amdgpu_sdma_navi48::InterruptProof, crate::amdgpu_sdma_navi48::Error>>,
@@ -124,6 +131,8 @@ pub fn status() -> Status {
                 media_ibs: boot.media_ib_result(),
                 media_decode: boot.media_decode_result(),
                 media_encode: boot.media_encode_result(),
+                media_jpeg: boot.media_jpeg_result(),
+                jpeg_state: boot.media_jpeg_state(),
                 sdma_state: boot.sdma_state(),
                 sdma_interrupts: boot.sdma_interrupts(),
                 display_clocks: boot.display_clock_status(),
@@ -440,6 +449,7 @@ pub async unsafe fn recover() -> Result<boot::Report, boot::Error> {
         || MEDIA_CLIENTS.load(Ordering::Acquire)
         || DECODE_PROOF.load(Ordering::Acquire)
         || ENCODE_PROOF.load(Ordering::Acquire)
+        || JPEG_PROOF.load(Ordering::Acquire)
     {
         // SAFETY: all old clients withdrawn, fresh native proofs drained,
         // and OWNER retains firmware/GMC and excludes every PM/queue writer.
@@ -448,6 +458,7 @@ pub async unsafe fn recover() -> Result<boot::Report, boot::Error> {
                 MEDIA_CLIENTS.load(Ordering::Acquire),
                 DECODE_PROOF.load(Ordering::Acquire),
                 ENCODE_PROOF.load(Ordering::Acquire),
+                JPEG_PROOF.load(Ordering::Acquire),
             )
             .await
         }?;
@@ -987,6 +998,7 @@ async fn prove_queue_interrupts() {
                     || MEDIA_CLIENTS.load(Ordering::Acquire)
                     || DECODE_PROOF.load(Ordering::Acquire)
                     || ENCODE_PROOF.load(Ordering::Acquire)
+                    || JPEG_PROOF.load(Ordering::Acquire)
                 {
                     // SAFETY: OWNER excludes every client/clear/PM user and
                     // no client slot can publish before this worker returns.
@@ -995,6 +1007,7 @@ async fn prove_queue_interrupts() {
                             MEDIA_CLIENTS.load(Ordering::Acquire),
                             DECODE_PROOF.load(Ordering::Acquire),
                             ENCODE_PROOF.load(Ordering::Acquire),
+                            JPEG_PROOF.load(Ordering::Acquire),
                         )
                         .await
                     };

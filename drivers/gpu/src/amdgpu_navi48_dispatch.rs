@@ -30,6 +30,8 @@ pub enum Key {
     Sdma { instance: u8, queue: u8 },
     /// VCN5's unified queue, source 119 on its VCN client instance.
     Vcn { instance: u8 },
+    /// JPEG5 decoder, source 153 on its VCN client instance.
+    Jpeg { instance: u8 },
     /// A user queue named by its non-zero doorbell offset, as the CP EOP
     /// and SDMA fence payloads carry it (amdgpu_userq_process_fence_irq).
     Doorbell(u32),
@@ -300,7 +302,7 @@ impl Table {
         }
         if owner.key == Key::Doorbell(0)
             || owner.vmid > 15
-            || matches!(owner.key, Key::Vcn { instance } if instance > 1)
+            || matches!(owner.key, Key::Vcn { instance } | Key::Jpeg { instance } if instance > 1)
         {
             return Err(RegisterError::Invalid);
         }
@@ -443,7 +445,8 @@ impl Table {
                     owner.pasid == v.pasid
                 } else {
                     let mm = matches!(fault, src::Fault::Vm { mm_hub: true });
-                    owner.vmid == v.vmid && matches!(owner.key, Key::Vcn { .. }) == mm
+                    owner.vmid == v.vmid
+                        && matches!(owner.key, Key::Vcn { .. } | Key::Jpeg { .. }) == mm
                 }
             } else {
                 keys.contains(&owner.key)
@@ -530,6 +533,10 @@ impl Table {
                         instance,
                         source: 119,
                     } => self.signal(&[Key::Vcn { instance }], v),
+                    src::Media::Jpeg {
+                        instance,
+                        source: 153,
+                    } => self.signal(&[Key::Jpeg { instance }], v),
                     _ => Delivery::Ignored,
                 }
             }
@@ -554,10 +561,9 @@ impl Table {
         let fault = src::Fault::Vm { mm_hub };
         let mut hit = 0;
         for slot in self.slots.iter_mut() {
-            if slot
-                .owner
-                .is_some_and(|o| o.vmid == vmid && matches!(o.key, Key::Vcn { .. }) == mm_hub)
-            {
+            if slot.owner.is_some_and(|o| {
+                o.vmid == vmid && matches!(o.key, Key::Vcn { .. } | Key::Jpeg { .. }) == mm_hub
+            }) {
                 slot.fault.get_or_insert(fault);
                 slot.bump();
                 hit += 1;

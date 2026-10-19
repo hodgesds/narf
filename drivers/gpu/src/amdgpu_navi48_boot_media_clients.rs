@@ -98,10 +98,11 @@ impl ColdBoot {
         hw.media_test = Some(Err(Error::Busy));
         let decode = hw.media_decode_required;
         let encode = hw.media_encode_required;
-        let vcn = hw.vcn.as_mut().ok_or(Error::Invalid)?;
+        let jpeg = hw.media_jpeg_required;
         // SAFETY: coordinated re-arm completed, media registration retained,
         // native transport drained and independent IH service remains active.
         let result = async {
+            let vcn = hw.vcn.as_mut().ok_or(Error::Invalid)?;
             // SAFETY: same renewed owner and exclusively retained transport.
             unsafe { vcn.prove_interrupts().await }.map_err(Error::Vcn)?;
             // SAFETY: ring drained, no client replay and kernel VMID0 retained.
@@ -119,6 +120,14 @@ impl ColdBoot {
                 proof = unsafe { vcn.prove_encode().await }
                     .map_err(Error::Vcn)?
                     .completion;
+            }
+            if jpeg {
+                // SAFETY: same owned PCI function and BAR2, all client
+                // ledgers frozen; VCN retains the shared range until JPEG stops.
+                let doorbells =
+                    unsafe { mes::map_doorbells(&hw.pci, &hw.authority) }.map_err(Error::Mes)?;
+                // SAFETY: registered media, retained GMC and active IH route.
+                unsafe { hw.prove_jpeg(doorbells).await }?;
             }
             Ok(proof)
         }

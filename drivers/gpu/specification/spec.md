@@ -5401,6 +5401,50 @@ codec profile is advertised by this proof. Synthetic header output in the
 model verifies ownership, parsing and completion contracts; actual encoding
 and picture-quality acceptance remain physical tests at the end of bring-up.
 
+The opt-in `amdgpu.jpeg_proof` adds a retained JPEG5.0.0 static-power
+transport cycle while VCN holds the shared NBIO media doorbell range. Public
+`amdgpu_jpeg_navi48::{Jpeg,State,Proof,Error}` provides unsafe `new`, `start`,
+`prove` and `stop` with state/result snapshots. JPEG accepts exactly one
+VCN5 discovery instance, the matching NBIF6.3.1/GC12.0.1/MMHUB4.1 layout and a validated
+GMC/VRAM pool. Its owned doorbell is `0x311`. It never programs or disables
+NBIO's shared range, and VCN refuses start/teardown under an enabled JPEG
+doorbell. The coordinator excludes shared-register and PM writers.
+
+`unsafe Smu::set_jpeg_power(bool).await` issues SMU14 instance-0
+PowerUpJpeg/PowerDownJpeg after fresh protection/static-media checks, using
+the same retained runtime/cancellation rules as VCN. JPEG's ONO1 fields and
+clock gates are independent; register updates preserve VCN's ONO2..5 fields.
+The dispatch registration exists before startup, so every published JPEG
+owner participates in reset accounting. The allocation is published before
+startup's first await and retained on any
+failure or cancellation. Its two guard pages bracket the ring, fence/shadow
+page and immutable IB page. Both GPCOM fence data dwords are reserved before
+the separate CPU write-pointer shadow; neither aliases the other.
+
+`prove` requires a registered `Key::Jpeg { instance: 0 }` kernel-VMID0/PASID0
+owner and the independent IH service. A new direct pitch write/RPTR witness
+precedes a kernel IB with a different pitch value. MMHUB4.1 start/end and
+HDP ordering, IB/fence/trap words match unchanged local Linux constructors.
+Fresh fence/RPTR, exact client/source153 and routed CPU evidence are required,
+with intact ring/IB words, padding and guards. `jpeg0_traps` records the exact
+kernel context; dispatch separates JPEG from VCN source119 and attributes
+unidentified MMHUB faults to both engines' matching VMIDs. Interrupts wake
+owners but never complete a fence from payload data.
+
+Retirement requires the ring/job drain, all JMI/core read/write-clean bits
+and no pending MC writes, both before and after JMI reset. Only then may the
+JPEG doorbell/clocks/ONO1 shut down and the allocation become reusable.
+The boot cycle stores pending `Diagnostics::media_jpeg` before awaiting,
+retains `jpeg_state`, and retires its extra interrupt owner only after proven
+shutdown and SMU power-down. A requested cycle repeats after recovery before
+any client ledger reopens. A live unretired JPEG owner makes a four-owner
+recovery receipt incomplete, requiring whole-device recovery instead.
+
+This stage proves native JRBC/IB/interrupt/retirement transport. It does not
+advertise a JPEG client ring or codec capability and does not decode a JPEG
+picture. Known-stream execution, native client submission and physical
+acceptance remain required before complete JPEG bring-up.
+
 The opt-in `amdgpu.media_proof` boot argument requests a retained native
 power-up/start/fence/interrupt/stop/power-down cycle after the GC12/SDMA interrupt
 proofs, before publishing clears or allowing any client slot. Its pending

@@ -43,6 +43,62 @@ fn user(doorbell: u32) -> Owner {
         pasid: 5,
     }
 }
+fn navi48_jpeg_dispatch_separates_unified_traps_and_keeps_mmhub_fault_scope() -> TestResult {
+    let table = IrqSafeSpinLock::new(Table::new());
+    let jpeg = table
+        .lock()
+        .register(kernel(Key::Jpeg { instance: 0 }))
+        .unwrap();
+    let vcn = table
+        .lock()
+        .register(kernel(Key::Vcn { instance: 0 }))
+        .unwrap();
+    let gfx = table.lock().register(kernel(Key::Cp(GFX))).unwrap();
+    assert_eq!(
+        table.lock().register(kernel(Key::Jpeg { instance: 2 })),
+        Err(RegisterError::Invalid)
+    );
+    let done = Cell::new(false);
+    let mut wait = core::pin::pin!(wait_in(&table, jpeg, far(), || done.get().then_some(7)));
+    assert!(poll(wait.as_mut()).is_pending());
+    for (client, source, vmid, pasid, expected) in [
+        (0x10, 154, 0, 0, Delivery::Ignored),
+        (0x0e, 153, 0, 0, Delivery::Unowned),
+        (0x10, 153, 1, 0, Delivery::Unowned),
+        (0x10, 153, 0, 1, Delivery::Unowned),
+        (0x10, 119, 0, 0, Delivery::Signaled),
+    ] {
+        assert_eq!(
+            route(&table, iv(client, source, 0, vmid, pasid, 0)),
+            expected
+        );
+    }
+    assert_eq!(table.lock().endpoint(jpeg).unwrap().stats.signals, 0);
+    assert_eq!(
+        route(&table, iv(0x10, 153, 0xff, 0, 0, 0)),
+        Delivery::Signaled
+    );
+    assert_eq!(table.lock().endpoint(vcn).unwrap().stats.signals, 1);
+    assert!(poll(wait.as_mut()).is_pending());
+    done.set(true);
+    assert_eq!(route(&table, iv(0x10, 153, 0, 0, 0, 0)), Delivery::Signaled);
+    assert_eq!(poll(wait.as_mut()), Poll::Ready(Ok(7)));
+    assert_eq!(table.lock().latched(0, true), Delivery::Faulted(2));
+    assert!(table.lock().endpoint(jpeg).unwrap().fault.is_some());
+    assert!(table.lock().endpoint(vcn).unwrap().fault.is_some());
+    assert_eq!(table.lock().endpoint(gfx).unwrap().fault, None);
+    assert_eq!(
+        table.lock().recovery_owners(&[vcn, gfx]),
+        Err(WaitError::Stale)
+    );
+    table.lock().retire(jpeg).unwrap();
+    assert_eq!(route(&table, iv(0x10, 153, 0, 0, 0, 0)), Delivery::Unowned);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-interrupts",
+    navi48_jpeg_dispatch_separates_unified_traps_and_keeps_mmhub_fault_scope
+);
 fn poll<F: Future>(f: Pin<&mut F>) -> Poll<F::Output> {
     f.poll(&mut Context::from_waker(Waker::noop()))
 }
@@ -69,7 +125,7 @@ fn navi48_vcn_dispatch_requires_registered_unified_source_and_owned_context() ->
         (0x10, 119, 0, 1, Delivery::Unowned),
         (0x10, 114, 0, 0, Delivery::Ignored),
         (0x10, 120, 0, 0, Delivery::Ignored),
-        (0x10, 153, 0, 0, Delivery::Ignored),
+        (0x10, 153, 0, 0, Delivery::Unowned),
     ] {
         assert_eq!(
             route(&table, iv(client, source, 0, vmid, pasid, 0)),
@@ -614,7 +670,8 @@ fn navi48_dispatch_four_owner_reset_requires_media_retirement_set() -> TestResul
     assert_eq!(table.recovery_owners(&handles[..3]), Err(WaitError::Stale));
     assert_eq!(table.recovery_owners(&[]), Err(WaitError::Stale));
     assert_eq!(table.recovery_owners(&handles), Ok(()));
-    let extra = table.register(user(0x20)).unwrap();
+    let extra = table.register(kernel(Key::Jpeg { instance: 0 })).unwrap();
+    assert_eq!(table.recovery_owners(&handles), Err(WaitError::Stale));
     assert_eq!(table.reset_owners(handles), Err(WaitError::Stale));
     for h in handles {
         assert!(table.endpoint(h).is_ok());

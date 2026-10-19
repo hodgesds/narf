@@ -227,6 +227,7 @@ pub mod amdgpu_ih7;
 pub mod amdgpu_ih_navi22;
 pub mod amdgpu_info;
 pub mod amdgpu_info_navi22;
+pub mod amdgpu_jpeg_navi48;
 pub mod amdgpu_kiq_navi22;
 pub mod amdgpu_mes;
 pub mod amdgpu_mes12;
