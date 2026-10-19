@@ -3347,8 +3347,20 @@ pub fn handle_segment_in(net_ns_id: u64, src: [u8; 4], dst: [u8; 4], segment: &[
     };
     // Find a connected-TCB match first (O(1) sharded 4-tuple index, no
     // global lock); on miss, fall back to a matching LISTEN TCB.
+    let listener = || {
+        listen_index_group(net_ns_id, dst, hdr.dst_port)
+            .into_iter()
+            .next()
+    };
     if let Some(arc) = conn_index_lookup(conn_key(net_ns_id, src, hdr.src_port, dst, hdr.dst_port))
     {
+        if time_wait_accepts_syn(&arc, &hdr, segment) {
+            if let Some(listen_arc) = listener() {
+                abort_tcb(&arc, 0, DropCause::Graceful);
+                accept_into_listen(&listen_arc, src, dst, &hdr, segment);
+                return;
+            }
+        }
         process_in_state(&arc, src, dst, &hdr, segment);
         return;
     }
@@ -3373,7 +3385,19 @@ pub fn handle_segment6_in(net_ns_id: u64, src: [u8; 16], dst: [u8; 16], segment:
         Err(_) => return,
     };
     let key = (net_ns_id, src, hdr.src_port, dst, hdr.dst_port);
+    let listener = || {
+        listen_index6_group(net_ns_id, dst, hdr.dst_port)
+            .into_iter()
+            .next()
+    };
     if let Some(arc) = conn_index6_lookup(key) {
+        if time_wait_accepts_syn(&arc, &hdr, segment) {
+            if let Some(listen_arc) = listener() {
+                abort_tcb(&arc, 0, DropCause::Graceful);
+                accept_into_listen6(&listen_arc, src, dst, &hdr, segment);
+                return;
+            }
+        }
         process_in_state(&arc, [0; 4], [0; 4], &hdr, segment);
         return;
     }
@@ -3631,6 +3655,39 @@ fn accept_into_listen6(
     child.cong.set_mss(child.opts.peer_mss as u32);
     let (_, child) = install_tcb(child);
     send_syn(&child, true);
+}
+
+/// Linux `tcp_timewait_state_process` → `TCP_TW_SYN`: a new SYN (no ACK, no
+/// RST) for a 4-tuple in TIME-WAIT reopens it when it is not an old
+/// duplicate — its sequence number is past RCV.NXT, or its timestamp is newer
+/// than the last one seen — and PAWS does not reject it. `tcp_v4_rcv` then
+/// kills the timewait sock and hands the SYN to the listener. Peers reuse a
+/// port quickly under connection churn (a NAT forwarding many short
+/// connections from one host); dropping such a SYN left the connection hung.
+fn time_wait_accepts_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, segment: &[u8]) -> bool {
+    if hdr.flags & (FLAG_SYN | FLAG_ACK | FLAG_RST) != FLAG_SYN {
+        return false;
+    }
+    let t = arc.lock();
+    if t.state != TcpState::TimeWait {
+        return false;
+    }
+    let opts_end = (hdr.header_len as usize).min(segment.len());
+    let tsval = match opts_end > TCP_HDR_MIN {
+        true => ParsedOptions::parse(&segment[TCP_HDR_MIN..opts_end])
+            .timestamps
+            .map(|(tsv, _)| tsv),
+        false => None,
+    };
+    let now = narf_scheduler::narf_time::now_cycles();
+    // `tcp_paws_reject(&tmp_opt, th->rst)`: `tcp_paws_check(rx_opt, 0)`.
+    if tsval.is_some_and(|tsv| t.opts.paws_reject(tsv, now, 0)) {
+        return false;
+    }
+    seq_gt(hdr.sequence, t.rcv_nxt)
+        || tsval.is_some_and(|tsv| {
+            t.opts.timestamps_active && (t.opts.ts_recent.wrapping_sub(tsv) as i32) < 0
+        })
 }
 
 /// State-aware processing of an arrived segment.

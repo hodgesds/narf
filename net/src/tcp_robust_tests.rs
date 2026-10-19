@@ -21,11 +21,11 @@ use narf_lib::sync::IrqSafeSpinLock;
 use crate::arp_cache;
 use crate::iface;
 use crate::pkt::{ETH_HDR_LEN, IPV4_HDR_LEN};
-use crate::pkt_tcp::{ipv4_pseudo_checksum, TcpHeader, FLAG_ACK, FLAG_FIN, FLAG_RST};
+use crate::pkt_tcp::{ipv4_pseudo_checksum, TcpHeader, FLAG_ACK, FLAG_FIN, FLAG_RST, FLAG_SYN};
 use crate::route;
 use crate::tcp::core::{
-    self, __install_test_tcb, __with_tcb, __with_tcb_mut, close, handle_segment, lookup_tcb,
-    queue_ioctl, recv_errno, recv_peek_errno, send, tick_retransmit, TcpQueueIoctl,
+    self, __install_test_tcb, __with_tcb, __with_tcb_mut, close, handle_segment, listen,
+    lookup_tcb, queue_ioctl, recv_errno, recv_peek_errno, send, tick_retransmit, TcpQueueIoctl,
 };
 use crate::tcp::options::{encode_data_options, OptionsState, MAX_TCP_OPTION_SPACE};
 use crate::tcp::sack::SackBlock;
@@ -255,6 +255,101 @@ fn smoke_sack_blocks_fit_beside_timestamps() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/tcp/robust", smoke_sack_blocks_fit_beside_timestamps);
+
+// ── TIME-WAIT reuse ─────────────────────────────────────────────────────
+
+/// A bare SYN from `peer:pport` to `local:lport` at `seq`.
+fn syn(local: [u8; 4], lport: u16, peer: [u8; 4], pport: u16, seq: u32) -> Seg<'static> {
+    Seg {
+        src: peer,
+        dst: local,
+        sport: pport,
+        dport: lport,
+        seq,
+        ack: 0,
+        flags: FLAG_SYN,
+        window: 65535,
+        options: Vec::new(),
+        payload: &[],
+    }
+}
+
+fn syn_acks(frames: &[Vec<u8>]) -> usize {
+    frames
+        .iter()
+        .filter(|f| frame_flags(f) & (FLAG_SYN | FLAG_ACK) == FLAG_SYN | FLAG_ACK)
+        .count()
+}
+
+/// A new SYN for a 4-tuple in TIME-WAIT reopens it when its sequence number
+/// is past RCV.NXT (Linux `tcp_timewait_state_process` → `TCP_TW_SYN`, then
+/// `tcp_v4_rcv` hands it to the listener). Under connection churn through a
+/// NAT the peer reuses a port while our side still holds it in TIME-WAIT;
+/// dropping that SYN hung the new connection.
+fn smoke_time_wait_new_syn_reopens() -> TestResult {
+    let local = [10, 0, 96, 1];
+    let peer = reset("tcp-rob-twsyn", local);
+    if listen(local, 7_795, 16).is_err() {
+        return TestResult::Fail("setup: listen failed");
+    }
+    let tw = __install_test_tcb(local, 7_795, peer, 40_100, TcpState::TimeWait);
+    let rcv_nxt = __with_tcb(tw, |t| t.rcv_nxt).unwrap_or(0);
+    let _ = drain();
+    inject(syn(
+        local,
+        7_795,
+        peer,
+        40_100,
+        rcv_nxt.wrapping_add(100_000),
+    ));
+    if lookup_tcb(tw).is_some() {
+        return TestResult::Fail("a new SYN did not end TIME-WAIT");
+    }
+    if syn_acks(&drain()) != 1 {
+        return TestResult::Fail("the listener did not answer the new SYN with a SYN-ACK");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp/robust", smoke_time_wait_new_syn_reopens);
+
+/// An old duplicate SYN (sequence at or before RCV.NXT, no newer timestamp)
+/// leaves TIME-WAIT alone and is only ACKed; so is any SYN when nothing
+/// listens on the port.
+fn smoke_time_wait_old_syn_ignored() -> TestResult {
+    let local = [10, 0, 97, 1];
+    let peer = reset("tcp-rob-twold", local);
+    if listen(local, 7_796, 16).is_err() {
+        return TestResult::Fail("setup: listen failed");
+    }
+    let tw = __install_test_tcb(local, 7_796, peer, 40_101, TcpState::TimeWait);
+    let rcv_nxt = __with_tcb(tw, |t| t.rcv_nxt).unwrap_or(0);
+    let _ = drain();
+    inject(syn(local, 7_796, peer, 40_101, rcv_nxt.wrapping_sub(1_000)));
+    if __with_tcb(tw, |t| t.state) != Some(TcpState::TimeWait) {
+        return TestResult::Fail("an old duplicate SYN ended TIME-WAIT");
+    }
+    if syn_acks(&drain()) != 0 {
+        return TestResult::Fail("an old duplicate SYN opened a connection");
+    }
+    // No listener: the TIME-WAIT connection stays, whatever the sequence.
+    let tw2 = __install_test_tcb(local, 7_797, peer, 40_102, TcpState::TimeWait);
+    let rcv_nxt = __with_tcb(tw2, |t| t.rcv_nxt).unwrap_or(0);
+    inject(syn(
+        local,
+        7_797,
+        peer,
+        40_102,
+        rcv_nxt.wrapping_add(100_000),
+    ));
+    if __with_tcb(tw2, |t| t.state) != Some(TcpState::TimeWait) {
+        return TestResult::Fail("a SYN with no listener ended TIME-WAIT");
+    }
+    if syn_acks(&drain()) != 0 {
+        return TestResult::Fail("a SYN with no listener opened a connection");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp/robust", smoke_time_wait_old_syn_ignored);
 
 // ── Resets (RFC 5961) ───────────────────────────────────────────────────
 
