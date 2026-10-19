@@ -11,6 +11,10 @@ use crate::{
 use core::sync::atomic::{fence, Ordering};
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
+#[path = "amdgpu_vcn_navi48_ib.rs"]
+mod ib_proof;
+#[path = "amdgpu_vcn_navi48_ib_words.rs"]
+mod ib_words;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -35,6 +39,8 @@ pub enum State {
     Verified,
     InterruptTesting,
     InterruptVerified,
+    IbTesting,
+    IbVerified,
     Stopping,
     Stopped,
     Failed(Error),
@@ -214,10 +220,13 @@ struct Engine<I: Io> {
     authority: Cap<BusDeviceCap, Write>,
     layout: Layout,
     memory: Reservation,
+    ib_pool: Pool,
+    ib_memory: Option<Reservation>,
     firmware_bytes: u32,
     state: State,
     proof: Option<Proof>,
     interrupt_result: Option<Result<InterruptProof, Error>>,
+    ib_result: Option<Result<InterruptProof, Error>>,
     wptr: u32,
     seq: u32,
 }
@@ -279,6 +288,7 @@ impl<I: Io> Engine<I> {
         self.state = State::Starting;
         self.proof = None;
         self.interrupt_result = None;
+        self.ib_result = None;
         self.memory.publish();
         let result = self
             .start_inner(image)
@@ -408,6 +418,8 @@ impl<I: Io> Engine<I> {
                 | State::Verified
                 | State::InterruptTesting
                 | State::InterruptVerified
+                | State::IbTesting
+                | State::IbVerified
         ) {
             return Err(Error::Busy);
         }
@@ -460,7 +472,8 @@ impl<I: Io> Engine<I> {
     }
     async fn prove_inner(&mut self) -> Result<Proof, Error> {
         let map = self.memory.mapping();
-        self.seq = self.seq.checked_add(1).ok_or(Error::Invalid)?;
+        // Start clears the fence word; proof zero could match unwritten data.
+        self.seq = self.seq.wrapping_add(1).max(1);
         let seq = self.seq;
         let at = self.memory.address() + FENCE;
         let next = self.emit(&[3, at as u32, (at >> 32) as u32, seq, 4, 1])?;
@@ -503,7 +516,7 @@ impl<I: Io> Engine<I> {
     async fn stop(&mut self) -> Result<(), Error> {
         if !matches!(
             self.state,
-            State::Ready | State::Verified | State::InterruptVerified
+            State::Ready | State::Verified | State::InterruptVerified | State::IbVerified
         ) {
             return Err(Error::Busy);
         }
@@ -521,6 +534,9 @@ impl<I: Io> Engine<I> {
             // VCPU/UMC write-clean checks; every address user is retired.
             unsafe {
                 self.memory.stopped();
+                if let Some(memory) = self.ib_memory.as_mut() {
+                    memory.stopped();
+                }
             }
         }
         result
@@ -592,10 +608,13 @@ impl Vcn {
                 authority,
                 layout,
                 memory: pool.reserve(BYTES).map_err(|_| Error::Allocation)?,
+                ib_pool: pool.clone(),
+                ib_memory: None,
                 firmware_bytes: firmware_bytes as u32,
                 state: State::Prepared,
                 proof: None,
                 interrupt_result: None,
+                ib_result: None,
                 wptr: 0,
                 seq: 0,
             },
@@ -646,6 +665,18 @@ impl Vcn {
     pub fn interrupt_result(&self) -> Option<Result<InterruptProof, Error>> {
         self.engine.interrupt_result
     }
+    /// Fixed Linux encode/decode session IBs with fresh interrupt evidence.
+    /// # Safety
+    /// Own the retained VCPU, firmware/GMC, kernel VMID0 and interrupt source;
+    /// exclude clients/PM/reset and retain all storage after cancellation.
+    pub async unsafe fn prove_ibs(&mut self) -> Result<InterruptProof, Error> {
+        self.engine
+            .prove_ibs(&mut crate::amdgpu_navi48_interrupts::NativeObserver)
+            .await
+    }
+    pub fn ib_result(&self) -> Option<Result<InterruptProof, Error>> {
+        self.engine.ib_result
+    }
     /// Queue a client frame on the verified unified ring.
     /// # Safety
     /// Own the client's MMHUB VMID/PASID/root and every IB/resource it reaches.
@@ -661,7 +692,11 @@ impl Vcn {
     }
     /// Retain this owner/backing and exclude reset/PM while using the reader.
     pub fn fence_reader(&self) -> Option<FenceReader> {
-        (self.engine.state == State::InterruptVerified).then_some(FenceReader {
+        matches!(
+            self.engine.state,
+            State::InterruptVerified | State::IbVerified
+        )
+        .then_some(FenceReader {
             io: self.engine.io,
             authority: self.engine.authority,
             layout: self.engine.layout,

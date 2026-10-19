@@ -17,6 +17,9 @@ impl ColdBoot {
     pub(crate) fn media_state(&self) -> Option<vcn::State> {
         self.sequence.backend.vcn.as_ref().map(vcn::Vcn::state)
     }
+    pub(crate) fn media_ib_result(&self) -> Option<Result<vcn::InterruptProof, vcn::Error>> {
+        self.sequence.backend.vcn.as_ref()?.ib_result()
+    }
     /// # Safety
     /// OWNER excludes every engine/PM/firmware user, no client job or clear
     /// has been published, and this is the retained post-interrupt-proof GPU.
@@ -79,7 +82,9 @@ impl ColdBoot {
             // drained kernel transport, exclusive OWNER and enabled CPU IRQs.
             let proof = unsafe { vcn.prove_interrupts().await }.map_err(Error::Vcn)?;
             if keep_running {
-                return Ok(proof);
+                // SAFETY: no client publication yet; matching kernel VMID0,
+                // retained firmware and live registered source owner.
+                return unsafe { vcn.prove_ibs().await }.map_err(Error::Vcn);
             }
             // SAFETY: no client publication; the proof drained its whole ring.
             unsafe { vcn.stop().await }.map_err(Error::Vcn)?;

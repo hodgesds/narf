@@ -96,7 +96,7 @@ pub(super) fn job_words(
 
 impl<I: Io> Engine<I> {
     pub(super) fn submit(&mut self, job: Job) -> Result<u32, Error> {
-        if self.state != State::InterruptVerified {
+        if !matches!(self.state, State::InterruptVerified | State::IbVerified) {
             return Err(Error::Busy);
         }
         let seq = self.seq.wrapping_add(1);

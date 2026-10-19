@@ -8,7 +8,9 @@ impl ColdBoot {
         if !self.media_submission_ready() || hw.vcn_owner.is_none() {
             return None;
         }
-        hw.vcn.as_ref()?.fence_reader()
+        let vcn = hw.vcn.as_ref()?;
+        vcn.ib_result()?.ok()?;
+        vcn.fence_reader()
     }
     pub(crate) fn client_media_owner(&self) -> Option<dispatch::Handle> {
         self.sequence.backend.vcn_owner
@@ -37,6 +39,9 @@ impl ColdBoot {
             return Err(vcn::Error::Busy);
         }
         let vcn = self.sequence.backend.vcn.as_mut().ok_or(vcn::Error::Busy)?;
+        if vcn.state() != vcn::State::IbVerified {
+            return Err(vcn::Error::Busy);
+        }
         // SAFETY: the caller supplies the owned MMHUB binding and resources.
         unsafe { vcn.submit(job) }
     }
@@ -85,7 +90,13 @@ impl ColdBoot {
         let vcn = hw.vcn.as_mut().ok_or(Error::Invalid)?;
         // SAFETY: coordinated re-arm completed, media registration retained,
         // native transport drained and independent IH service remains active.
-        let result = unsafe { vcn.prove_interrupts().await }.map_err(Error::Vcn);
+        let result = async {
+            // SAFETY: same renewed owner and exclusively retained transport.
+            unsafe { vcn.prove_interrupts().await }.map_err(Error::Vcn)?;
+            // SAFETY: ring drained, no client replay and kernel VMID0 retained.
+            unsafe { vcn.prove_ibs().await }.map_err(Error::Vcn)
+        }
+        .await;
         hw.media_test = Some(result);
         result
     }

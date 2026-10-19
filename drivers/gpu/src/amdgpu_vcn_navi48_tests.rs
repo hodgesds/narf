@@ -18,6 +18,12 @@ struct Fake {
     regs: BTreeMap<u64, u32>,
     writes: Vec<(u64, u32)>,
     memory: Vec<u8>,
+    ib_memory: Vec<u8>,
+    kernel_ibs: u8,
+    kernel_sessions: [bool; 2],
+    kernel_corrupt: bool,
+    kernel_guard: bool,
+    kernel_stall_at: Option<u8>,
     dirty: bool,
     boot: bool,
     advance: bool,
@@ -40,6 +46,78 @@ struct Fake {
     fence_reads: u32,
 }
 impl Fake {
+    fn kernel_ib(&mut self, address: u64, length: u32) -> bool {
+        assert!(!self.dirty);
+        if self.kernel_corrupt || self.kernel_stall_at == Some(self.kernel_ibs) {
+            return false;
+        }
+        let base = GPU + BYTES;
+        let offset = (address - base) as usize;
+        let data: Vec<u32> = self.ib_memory[offset..offset + length as usize * 4]
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+            .collect();
+        assert_eq!(&data[..2], &[0x10, 0x3000_0002]);
+        assert_eq!(data[3], length - 4);
+        assert_eq!(&data[4..6], &[0x10, 0x3000_0001]);
+        assert_eq!(data[7], (length - 4) * 4);
+        assert_eq!(
+            data[2],
+            data[4..].iter().fold(0u32, |s, w| s.wrapping_add(*w))
+        );
+        match data[6] {
+            2 => {
+                assert_eq!(length, 21);
+                assert_eq!(&data[8..11], &[0x18, 1, 1]);
+                assert_eq!((u64::from(data[11]) << 32) | u64::from(data[12]), base);
+                assert_eq!(&data[13..20], &[0, 0x14, 2, 0x1c, 0, 0, 8]);
+                match data[20] {
+                    0x0800_0001 => {
+                        assert!(!self.kernel_sessions[0]);
+                        self.kernel_sessions[0] = true;
+                    }
+                    0x0800_0002 => {
+                        assert!(self.kernel_sessions[0]);
+                        self.kernel_sessions[0] = false;
+                    }
+                    _ => panic!("unknown encode session operation"),
+                }
+                self.ib_memory[..4].copy_from_slice(&0x51a7e001u32.to_le_bytes());
+            }
+            3 => {
+                assert_eq!(length, 43);
+                assert_eq!(&data[8..11], &[140, 1, 1]);
+                assert!(data[13..].iter().all(|w| *w == 0));
+                let at = (((u64::from(data[11]) << 32) | u64::from(data[12])) - base) as usize;
+                let message: Vec<u32> = self.ib_memory[at..at + 56]
+                    .chunks_exact(4)
+                    .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+                    .collect();
+                assert_eq!(message[0], 0x28);
+                assert_eq!(message[4], 1);
+                match message[3] {
+                    0 => {
+                        assert_eq!(message[1], 0x38);
+                        assert_eq!(&message[10..14], &[7, 0, 0x780, 0x440]);
+                        assert!(!self.kernel_sessions[1]);
+                        self.kernel_sessions[1] = true;
+                    }
+                    2 => {
+                        assert_eq!(message[1], 0x18);
+                        assert!(self.kernel_sessions[1]);
+                        self.kernel_sessions[1] = false;
+                    }
+                    _ => panic!("unknown decode session operation"),
+                }
+            }
+            _ => panic!("unknown unified engine selector"),
+        }
+        self.kernel_ibs += 1;
+        if self.kernel_guard {
+            self.ib_memory[(ib_words::ENCODE_CREATE + 4092) as usize] = 1;
+        }
+        true
+    }
     fn word(&self, at: u64) -> u32 {
         u32::from_le_bytes(
             self.memory[at as usize..at as usize + 4]
@@ -75,7 +153,14 @@ impl Io for Fake {
             self.memory[SHARED as usize + 18] = 0xa5;
         }
     }
-    fn memory_read(&mut self, _: MmioRegion, at: u64) -> u32 {
+    fn memory_read(&mut self, map: MmioRegion, at: u64) -> u32 {
+        if map.phys.raw() == 0x90004000 + BYTES {
+            return u32::from_le_bytes(
+                self.ib_memory[at as usize..at as usize + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+        }
         if at == FENCE {
             self.fence_reads += 1;
             if self.fence_gone {
@@ -87,7 +172,12 @@ impl Io for Fake {
         }
         self.word(at)
     }
-    fn memory_write(&mut self, _: MmioRegion, at: u64, value: u32) {
+    fn memory_write(&mut self, map: MmioRegion, at: u64, value: u32) {
+        if map.phys.raw() == 0x90004000 + BYTES {
+            self.ib_memory[at as usize..at as usize + 4].copy_from_slice(&value.to_le_bytes());
+            self.dirty = true;
+            return;
+        }
         assert!(at < BYTES && at % 4 == 0);
         self.store(at, value);
         self.dirty = true;
@@ -152,6 +242,9 @@ impl Io for Fake {
                     let address =
                         u64::from(self.word(at + 8)) | u64::from(self.word(at + 12)) << 32;
                     self.client_ibs.push((vmid, address, self.word(at + 16)));
+                    if vmid == 0 && !self.kernel_ib(address, self.word(at + 16)) {
+                        return;
+                    }
                     5
                 }
                 3 => {
@@ -215,6 +308,12 @@ fn fixture() -> (Pool, Engine<Fake>) {
             regs,
             writes: Vec::new(),
             memory: vec![0x5a; BYTES as usize],
+            ib_memory: vec![0x5a; ib_words::IB_BYTES as usize],
+            kernel_ibs: 0,
+            kernel_sessions: [false; 2],
+            kernel_corrupt: false,
+            kernel_guard: false,
+            kernel_stall_at: None,
             dirty: false,
             boot: true,
             advance: true,
@@ -245,10 +344,13 @@ fn fixture() -> (Pool, Engine<Fake>) {
             oss: OSS,
         },
         memory: pool.reserve(BYTES).unwrap(),
+        ib_pool: pool.clone(),
+        ib_memory: None,
         firmware_bytes: 0x11000,
         state: State::Prepared,
         proof: None,
         interrupt_result: None,
+        ib_result: None,
         wptr: 0,
         seq: 0,
     };
@@ -866,4 +968,154 @@ fn vcn5_client_fences_reject_device_loss_and_revocation() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/vcn-navi48",
     vcn5_client_fences_reject_device_loss_and_revocation
+);
+
+fn ib_ready() -> (Pool, Engine<Fake>, Irqs) {
+    let (pool, mut e) = fixture();
+    run(e.start(IMAGE, power())).unwrap();
+    run(e.prove()).unwrap();
+    let mut observer = irqs(&e, Some(64));
+    run(e.prove_interrupts(&mut observer)).unwrap();
+    (pool, e, observer)
+}
+fn vcn5_kernel_session_ibs_prove_both_engines_and_restart_at_sequence_wrap() -> TestResult {
+    let (pool, mut e, mut observer) = ib_ready();
+    for restart in [false, true] {
+        if restart {
+            e.seq = u32::MAX;
+            run(e.start(IMAGE, power())).unwrap();
+            assert_eq!(run(e.prove()).unwrap().sequence, 1);
+            assert_eq!(
+                run(e.prove_interrupts(&mut observer))
+                    .unwrap()
+                    .fence
+                    .sequence,
+                2
+            );
+        }
+        let proof = run(e.prove_ibs(&mut observer)).unwrap();
+        assert_eq!(
+            proof.fence,
+            Proof {
+                sequence: 3,
+                read_pointer: 192
+            }
+        );
+        assert!(proof.msi_verified);
+        assert_eq!(e.state, State::IbVerified);
+        assert_eq!(e.ib_result, Some(Ok(proof)));
+        assert_eq!(e.io.kernel_ibs, if restart { 8 } else { 4 });
+        assert_eq!(e.io.kernel_sessions, [false; 2]);
+        assert!(!e.ib_memory.as_ref().unwrap().reusable_for_test());
+        assert_eq!(run(e.prove_ibs(&mut observer)), Err(Error::Busy));
+        let job = crate::amdgpu_gfx12_queue::Job::new(3, 11, 0x1000, &[(0x2000, 4)]).unwrap();
+        assert_eq!(e.submit(job), Ok(4));
+        assert_eq!(e.completed_job(), Ok(4));
+        run(e.stop()).unwrap();
+        assert!(e.memory.reusable_for_test());
+        assert!(e.ib_memory.as_ref().unwrap().reusable_for_test());
+    }
+    drop(e);
+    assert_eq!(pool.available(), BYTES * 2);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi48",
+    vcn5_kernel_session_ibs_prove_both_engines_and_restart_at_sequence_wrap
+);
+
+fn vcn5_kernel_session_ib_failures_retain_context_commands_and_ring() -> TestResult {
+    for case in 0..6 {
+        let (pool, mut e, mut observer) = ib_ready();
+        match case {
+            0 => e.io.kernel_corrupt = true,
+            1 => e.io.kernel_stall_at = Some(2),
+            2 => e.io.kernel_guard = true,
+            3 => e.io.fence = false,
+            4 => e.io.emit_iv = false,
+            5 => e.io.emit_cpu = false,
+            _ => unreachable!(),
+        }
+        let expected = if case == 2 {
+            Error::Readback
+        } else {
+            Error::Timeout
+        };
+        assert_eq!(run(e.prove_ibs(&mut observer)), Err(expected));
+        assert_eq!(e.state, State::Failed(expected));
+        assert_eq!(e.ib_result, Some(Err(expected)));
+        assert!(!e.memory.reusable_for_test());
+        assert!(!e.ib_memory.as_ref().unwrap().reusable_for_test());
+        if case == 1 {
+            assert_eq!(e.io.kernel_ibs, 2);
+        }
+        assert_eq!(run(e.stop()), Err(Error::Busy));
+        let available = pool.available();
+        drop(e);
+        assert_eq!(pool.available(), available);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi48",
+    vcn5_kernel_session_ib_failures_retain_context_commands_and_ring
+);
+
+fn vcn5_kernel_session_ib_cancellation_closes_clients_and_retains_backing() -> TestResult {
+    for published in [false, true] {
+        let (pool, mut e, mut observer) = ib_ready();
+        observer.stall_sample = !published;
+        observer.stall_observed = published;
+        {
+            let mut future = core::pin::pin!(e.prove_ibs(&mut observer));
+            for _ in 0..=ib_words::IB_BYTES / 4096 {
+                assert!(future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending());
+            }
+        }
+        assert_eq!(e.io.kernel_ibs, if published { 4 } else { 0 });
+        assert_eq!(e.state, State::IbTesting);
+        assert_eq!(e.ib_result, Some(Err(Error::Busy)));
+        assert_eq!(run(e.stop()), Err(Error::Busy));
+        assert_eq!(
+            e.submit(crate::amdgpu_gfx12_queue::Job::new(3, 11, 0x1000, &[(0x2000, 4)]).unwrap()),
+            Err(Error::Busy)
+        );
+        let available = pool.available();
+        drop(e);
+        assert_eq!(pool.available(), available);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi48",
+    vcn5_kernel_session_ib_cancellation_closes_clients_and_retains_backing
+);
+
+fn vcn5_wrapped_transport_and_interrupt_proofs_cannot_match_cleared_zero() -> TestResult {
+    for irq in [false, true] {
+        let (_pool, mut e) = fixture();
+        run(e.start(IMAGE, power())).unwrap();
+        if irq {
+            run(e.prove()).unwrap();
+        }
+        e.seq = u32::MAX;
+        e.io.store(FENCE, 0);
+        e.io.fence = false;
+        let mut observer = irqs(&e, Some(64));
+        let result = if irq {
+            run(e.prove_interrupts(&mut observer)).map(|p| p.fence)
+        } else {
+            run(e.prove())
+        };
+        assert_eq!(result, Err(Error::Timeout));
+        assert_eq!(e.seq, 1);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi48",
+    vcn5_wrapped_transport_and_interrupt_proofs_cannot_match_cleared_zero
 );

@@ -34,7 +34,7 @@ impl<I: Io> Engine<I> {
             .await
             .map_err(Error::Interrupts)?;
         self.set(MASTINT, 2, 2)?;
-        self.seq = self.seq.checked_add(1).ok_or(Error::Invalid)?;
+        self.seq = self.seq.wrapping_add(1).max(1);
         let seq = self.seq;
         let at = self.memory.address() + FENCE;
         let next = self.emit(&[3, at as u32, (at >> 32) as u32, seq, 4, 1])?;

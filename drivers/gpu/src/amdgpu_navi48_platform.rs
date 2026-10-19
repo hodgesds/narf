@@ -82,6 +82,8 @@ pub struct Diagnostics {
         Option<Result<crate::amdgpu_gfx12_shader::Proof, crate::amdgpu_gfx12_queue::Error>>,
     pub media_transport: Option<Result<crate::amdgpu_vcn_navi48::InterruptProof, boot::Error>>,
     pub media_state: Option<crate::amdgpu_vcn_navi48::State>,
+    pub media_ibs:
+        Option<Result<crate::amdgpu_vcn_navi48::InterruptProof, crate::amdgpu_vcn_navi48::Error>>,
     pub sdma_state: Option<crate::amdgpu_sdma_navi48::State>,
     pub sdma_interrupts:
         Option<Result<crate::amdgpu_sdma_navi48::InterruptProof, crate::amdgpu_sdma_navi48::Error>>,
@@ -105,6 +107,7 @@ pub fn status() -> Status {
                 shaders: boot.shader_result(),
                 media_transport: boot.media_result(),
                 media_state: boot.media_state(),
+                media_ibs: boot.media_ib_result(),
                 sdma_state: boot.sdma_state(),
                 sdma_interrupts: boot.sdma_interrupts(),
                 display_clocks: boot.display_clock_status(),

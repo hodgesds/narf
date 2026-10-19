@@ -932,9 +932,15 @@ a job always returns a sequence so its resources remain retained through
 later errors. Models cover packet fields, ring wrap/full and revocation at
 publication. The opt-in `amdgpu.navi48_media` now retains the proven owner
 and exposes the unified VCN_ENC queue with a separate MMHUB VMID pool and
-generic CS resource retention; user fences are refused. Fault recovery
+generic CS resource retention; user fences are refused. Before publication,
+the native session IB test now runs Linux's fixed encode/decode create/destroy
+messages in separately retained context/IB/message storage, requiring new
+fence/RPTR/trap/CPU evidence and unchanged command-page guards. Its pending
+phase closes clients, and cancellation/failure retains every allocation.
+Rust builders match unchanged Linux constructors in a host capture harness.
+Fault recovery
 requires all four retirements and renewed owners, followed by a new media
-interrupt proof before ledger commit. Media restart cancels old codec
+interrupt and session IB proof before ledger commit. Media restart cancels old codec
 contexts instead of replaying their IBs. Fence readers skip frozen media
 and drain before power changes and reopening retirement. Dispatch follows
 known PASIDs across VMID changes and limits unknown latches to their hub.

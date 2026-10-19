@@ -2979,7 +2979,8 @@ remains pending, and automatic whole-device reset is still disabled.
 With native media clients the recovery receipt includes a fourth retirement
 and the exact retained VCN0 registration. VCPU/LMI drain/retirement,
 power-down/up, restart and a new transport proof precede global re-arm; the
-renewed media handle and a fresh source-119/CPU proof precede ledger commit.
+renewed media handle, a fresh source-119/CPU proof and the session IB test
+precede ledger commit.
 Restart clears codec context, so every pending media context is cancelled and
 no old media IB replays. Jobs in other healthy contexts replay normally.
 Uncertain media retirement or interrupt proof quarantines every ledger.
@@ -5314,6 +5315,32 @@ reports the VCN5 discovery version and Linux's 256-byte start/4-byte size
 alignment, and derives usable rings from the proven registered submitter.
 INFO_MAX_IBS reports eight for this ring. No codec profile or JPEG capability
 is added by this transport interface; known-stream validation remains open.
+
+Before exposing clients, `unsafe Vcn::prove_ibs().await` also runs the fixed
+Linux `amdgpu_vcn_unified_ring_test_ib` encode/decode session create/destroy
+messages. It requires the interrupt proof's drained ring with no intervening
+client publication. `IbTesting` and a pending `ib_result` are stored before
+the first await. A separate retained reservation owns the 128 KiB encode
+context and six IB/message pages. Kernel VMID0 alone reads those fixed IBs;
+the client VMID checks are unchanged. A new unified frame flushes HDP, emits
+all four session IBs and a new fence/TRAP/END. Completion requires fence,
+RPTR, exact fresh source-119 delivery and routed CPU MSI, plus immutable
+command pages/padding and the existing entire fence-page guards. The wait
+is bounded to one second; failure/cancellation retains all published storage
+and refuses stop/retry, requiring device recovery.
+
+Success is `IbVerified`; the boot client's fence-reader/publication gate
+requires it. The same test runs after media recovery before reopening
+retirement. `Vcn::ib_result` and platform `Diagnostics::media_ibs` preserve
+the phase's proof or failure separately from the overall media cycle.
+Proven VCPU/LMI shutdown also makes the auxiliary reservation reusable.
+Proof sequences skip zero on wrap because startup clears the fence word;
+normal client physical sequences continue wrapping through zero. Model
+coverage includes both firmware engines, application submission after proof,
+partial/failed/cancelled IBs, immutable command guards and wrapped proofs.
+Host reference checks compile the unchanged local Linux constructors and
+compare their output with the Rust builders. Session messages exercise IB
+transport, not video-frame encoding or decoding.
 
 The opt-in `amdgpu.media_proof` boot argument requests a retained native
 power-up/start/fence/interrupt/stop/power-down cycle after the GC12/SDMA interrupt
