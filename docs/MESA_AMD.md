@@ -72,7 +72,7 @@ sh verification/data/musl-demo/REGEN_mesa_amd.sh
     driver (`/usr/lib/dri/radeonsi_drv_video.so`, against Alpine's libva)
     and RADV's Vulkan video (`VK_KHR_video_decode/encode_*`) over the VCN
     3.0 decode/encode and JPEG 3.0 rings the kernel exposes behind
-    `amdgpu.navi22_accel` (`amdgpu_vcn_navi22_cs`).
+    `amdgpu.rdna2_accel` (`amdgpu_vcn_navi22_cs`).
   - Not built: rusticl, zink, VDPAU, other vendors' drivers.
 - **Also built:** `mesa_amd_probe` and `narf_ioctl_trace.so`, against the
   just-installed libraries.
@@ -274,7 +274,7 @@ Run from the image (`chroot_run /bin/busybox sh …`), capturing serial:
 8. Repeat 3–5 with `LD_PRELOAD=/usr/lib/narf/narf_ioctl_trace.so` and diff
    against the Linux reference trace for the same Mesa build.
 
-9. Video (needs `amdgpu.navi22_accel`; the boot log shows
+9. Video (needs `amdgpu.rdna2_accel`; the boot log shows
    `amdgpu: navi22 media rings for clients 0xf`): `LIBVA_DRIVER_NAME=radeonsi
    mesa_amd_probe va` — one node with `vendor="Mesa Gallium driver … for AMD
    Radeon RX 6750 XT"` and H264High/HEVCMain/HEVCMain10/VP9Profile0/
@@ -291,6 +291,14 @@ Run from the image (`chroot_run /bin/busybox sh …`), capturing serial:
 Failure handling to verify on hardware: kill a client mid-submission
 (context teardown), `AMD_DEBUG=` off/`RADV_DEBUG=hang` on a hang, and that a
 rejected CS returns an error to Mesa rather than wedging the ring.
+
+## RX 6000 boot options
+
+RX 6000 family options use `amdgpu.rdna2_accel`, `amdgpu.rdna2_multi`,
+`amdgpu.rdna2_hw_cursor` and `amdgpu.rdna2_pg=...`. The old `amdgpu.navi22_*`
+spellings remain supported. An explicit `rdna2_pg` value takes precedence over
+`navi22_pg`, including an empty or invalid value; invalid lists enable nothing.
+Power-saving prerequisites and default-off behavior are unchanged.
 
 ## Open items
 

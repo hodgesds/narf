@@ -1,5 +1,4 @@
-//! Navi22 PMFW telemetry decoding: SMU11 (sienna_cichlid family, MP1 11.0.11
-//! navy_flounder) `SmuMetricsExternal_t` and the thermal/fan/power limits of
+//! Discrete RDNA2 PMFW telemetry decoding: SMU11 (sienna_cichlid family) `SmuMetricsExternal_t` and the thermal/fan/power limits of
 //! the uploaded `PPTable_t`. Layouts come from Linux
 //! smu11_driver_if_sienna_cichlid.h (checked by tests/smu11_metrics.c); the
 //! decoding follows sienna_cichlid_ppt.c (`get_smu_metrics_data`,
@@ -15,7 +14,7 @@ pub(crate) const METRICS_BYTES: usize = 200; // linux: sizeof(SmuMetricsExternal
 // linux: n/a (literal 0x412D00 in sienna_cichlid_ppt.c:sienna_cichlid_get_smu_metrics_data)
 pub(crate) const METRICS_V2_VERSION: u32 = 0x0041_2d00;
 // offsetof(SmuMetrics_t / SmuMetrics_V2_t, ...): identical through
-// TemperaturePlx; the V2 table replaces ThrottlerStatus with AccCnt plus
+// TemperaturePlx; the V2/V3 tables replace ThrottlerStatus with AccCnt plus
 // ThrottlingPercentage[THROTTLER_COUNT], which moves the fan fields.
 // u32 CurrClock[PPCLK_COUNT]
 // linux: offsetof(SmuMetrics_t, CurrClock)
@@ -56,6 +55,8 @@ const V2_THROTTLING: usize = 100;
 const V2_FAN_SPEED: usize = 122;
 // linux: offsetof(SmuMetrics_V2_t, PcieRate)
 const V2_PCIE_RATE: usize = 150;
+// linux: offsetof(SmuMetrics_V3_t, PcieRate)
+const V3_PCIE_RATE: usize = 152;
 // linux: THROTTLER_COUNT
 pub const THROTTLER_COUNT: usize = 20;
 // PPCLK_e indices.
@@ -128,11 +129,24 @@ fn u32_at(b: &[u8], at: usize) -> u32 {
 pub enum Layout {
     V1,
     V2,
+    V3,
 }
 impl Layout {
-    /// The MP1 11.0.11 selection in `sienna_cichlid_get_smu_metrics_data`.
+    /// Compatibility selector for Navy Flounder.
     pub fn for_firmware(smc_version: u32) -> Self {
-        if smc_version >= METRICS_V2_VERSION {
+        Self::for_profile(&crate::amdgpu_rdna2::NAVI22, smc_version)
+    }
+    /// `sienna_cichlid_get_smu_metrics_data`'s ASIC/firmware thresholds.
+    pub fn for_profile(profile: &crate::amdgpu_rdna2::Profile, version: u32) -> Self {
+        let v2 = match profile.psp_version {
+            (11, 0, 7) if version >= 0x3a4900 => return Self::V3,
+            (11, 0, 7) => 0x3a4300,
+            (11, 0, 11) => METRICS_V2_VERSION,
+            (11, 0, 12) => 0x3b2300,
+            (11, 0, 13) => 0x491100,
+            _ => return Self::V1,
+        };
+        if version >= v2 {
             Self::V2
         } else {
             Self::V1
@@ -180,13 +194,17 @@ impl Metrics {
         let gfx_activity = u16_at(b, GFX_ACTIVITY);
         let (throttlers, fan, pcie) = match layout {
             Layout::V1 => (u32_at(b, V1_THROTTLER_STATUS), V1_FAN_SPEED, V1_PCIE_RATE),
-            Layout::V2 => (
+            Layout::V2 | Layout::V3 => (
                 b[V2_THROTTLING..V2_THROTTLING + THROTTLER_COUNT]
                     .iter()
                     .enumerate()
                     .fold(0, |m, (i, &p)| if p != 0 { m | 1 << i } else { m }),
                 V2_FAN_SPEED,
-                V2_PCIE_RATE,
+                if layout == Layout::V3 {
+                    V3_PCIE_RATE
+                } else {
+                    V2_PCIE_RATE
+                },
             ),
         };
         Self {

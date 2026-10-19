@@ -16,6 +16,8 @@
 #define EQ(a,b) _Static_assert((unsigned)(a) == (unsigned)(b), #a)
 #define M1(f) offsetof(SmuMetrics_t, f)
 #define M2(f) offsetof(SmuMetrics_V2_t, f)
+#define M3(f) offsetof(SmuMetrics_V3_t, f)
+#define PB(f) offsetof(PPTable_beige_goby_t, f)
 #define P(f) offsetof(PPTable_t, f)
 EQ(TABLE_SMU_METRICS, 5); EQ(TABLE_PPTABLE, 0);
 EQ(sizeof(SmuMetricsExternal_t), 200); EQ(sizeof(PPTable_t), 1668);
@@ -39,12 +41,21 @@ EQ(M1(TemperatureVrSoc), 86); EQ(M2(TemperatureVrSoc), 86);
 EQ(M1(ThrottlerStatus), 96); EQ(M1(CurrFanSpeed), 102); EQ(M1(PcieRate), 130);
 EQ(M1(PcieWidth), 131);
 EQ(M2(ThrottlingPercentage), 100); EQ(THROTTLER_COUNT, 20);
+EQ(M3(CurrClock), 0); EQ(M3(AverageGfxclkFrequencyPreDs), 52);
+EQ(M3(AverageGfxclkFrequencyPostDs), 54); EQ(M3(AverageFclkFrequencyPostDs), 58);
+EQ(M3(AverageUclkFrequencyPostDs), 62); EQ(M3(AverageGfxActivity), 64);
+EQ(M3(AverageUclkActivity), 66); EQ(M3(AverageSocketPower), 72);
+EQ(M3(TemperatureEdge), 74); EQ(M3(TemperatureHotspot), 76); EQ(M3(TemperatureMem), 78);
+EQ(M3(TemperatureVrGfx), 80); EQ(M3(TemperatureVrSoc), 86);
+EQ(M3(ThrottlingPercentage), 100); EQ(M3(CurrFanSpeed), 122); EQ(M3(PcieRate), 152);
 EQ(M2(CurrFanSpeed), 122); EQ(M2(PcieRate), 150); EQ(M2(PcieWidth), 151);
 EQ(THROTTLER_TEMP_EDGE_BIT, 1); EQ(THROTTLER_PPT0_BIT, 13); EQ(THROTTLER_APCC_BIT, 19);
 /* Board limits. */
 EQ(P(FeaturesToRun), 4); EQ(P(SocketPowerLimitAc), 12); EQ(PPT_THROTTLER_PPT0, 0);
 EQ(P(TemperatureLimit), 52); EQ(TEMP_EDGE, 0); EQ(TEMP_HOTSPOT, 1); EQ(TEMP_MEM, 2);
 EQ(P(FanMaximumRpm), 1018);
+EQ(PB(FanMaximumRpm), 1018); EQ(PB(TemperatureLimit), 52);
+EQ(PB(SocketPowerLimitAc), 12); EQ(PB(FeaturesToRun), 4);
 EQ(FEATURE_PPT_BIT, 24); EQ(FEATURE_ACDC_BIT, 28); EQ(FEATURE_FAN_CONTROL_BIT, 32);
 EQ(FEATURE_GFXOFF_BIT, 20); EQ(FEATURE_BACO_BIT, 21);
 EQ(FEATURE_DPM_UCLK_BIT, 3); EQ(FEATURE_DPM_FCLK_BIT, 4);

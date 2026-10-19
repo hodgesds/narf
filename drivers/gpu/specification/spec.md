@@ -46,6 +46,35 @@ infrastructure (Phase B).
 
 ### Shared RDNA2 execution and family limits
 
+The shared public modules use `amdgpu_rdna2_{boot,platform,gating,power,
+power_policy,power_saving,gfxoff,thermal,tdr,recovery,cs,kms,modeset,display,
+scanout,submit,bios}` names, with matching canonical names for shared firmware,
+queue and hardware backends. `amdgpu_rdna2_board_power` is the board-table
+parser; `amdgpu_rdna2_power` publishes runtime power samples. Existing Navi22
+paths re-export the same modules, preserving type identity and source
+compatibility.
+
+`amdgpu_rdna2::options::BootOptions::parse(cmdline)` accepts bare flags
+`amdgpu.rdna2_accel`, `amdgpu.rdna2_multi`, `amdgpu.rdna2_hw_cursor` and the
+value `amdgpu.rdna2_pg=...`. The corresponding `amdgpu.navi22_*` spellings
+remain aliases. The first canonical power value takes precedence over the
+first legacy value, including an empty or invalid canonical value; invalid
+power lists enable nothing. Defaults remain disabled.
+
+Clock/power capability flags come from each profile's Linux
+`nv_common_early_init` selection. Navi21/22/23 share the existing capability
+set; Navi24 omits JPEG CG/PG. Gating resolves exact PCI/GC/MP1/SDMA identity,
+compatible hub/controller banks and one through four discovered engines;
+absent SDMA engines are never accessed. ROM handling selects the discovered
+SMUIO backend: the older backend skips disabled ROM gating, while the newer
+backend explicitly forces ROM clocks on.
+
+SMU telemetry selects `SmuMetrics_t`, `_V2_t` or `_V3_t` using exact per-ASIC
+firmware thresholds from `sienna_cichlid_get_smu_metrics_data`. SMU11's shared
+THM11.0/SMUIO11.0 register layouts are resolved through discovered banks;
+missing, duplicate, truncated or other-generation banks remain unavailable.
+Firmware interface diagnostics use the ASIC-specific driver interface version.
+
 `ColdBoot::new_rdna2` validates the exact PCI/GC/PSP identity and matching
 SOS, SMC and graphics bundle before device I/O. Recovery rebuilds through
 that constructor and retains the boxed sequence owner used by native Navi22.
@@ -88,7 +117,7 @@ The shared coordinator validates the discovered IP versions, matching firmware
 bundle and board policy; identification alone does not bypass these checks.
 Legacy firmware loading is rejected for every discrete RDNA2 ID; Rembrandt
 retains its separate APU path. Existing `amdgpu.navi22_*` boot options name the
-shared discrete path. Optional Navi22 clock-gating policy remains ASIC-specific.
+shared discrete path as compatibility aliases for the canonical RDNA2 options.
 Run
 `python3 drivers/gpu/tools/check_rdna2_profiles.py --linux ~/git/linux` to
 compile the profile unit tests and compare the compiled IDs and firmware names

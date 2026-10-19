@@ -1,5 +1,5 @@
-//! The explicit `amdgpu.navi22_pg=` opt-in path: Linux's late-init power
-//! saving for sienna_cichlid, applied to a completed Navi22 boot only for
+//! The explicit `amdgpu.rdna2_pg=` opt-in path (`navi22_pg` alias): Linux's late-init power
+//! saving for sienna_cichlid, applied to a completed discrete RDNA2 boot only for
 //! the features the operator named and the policy admitted.
 //!
 //! Order, as Linux reaches the same state (`dcn30_init_hw` →

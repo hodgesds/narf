@@ -278,6 +278,7 @@ impl Io for Fake {
 }
 fn engine() -> Engine<Fake> {
     Engine {
+        profile: &crate::amdgpu_rdna2::NAVI22,
         io: Fake {
             response: 0,
             argument: 0xdeadbeef,
@@ -1461,4 +1462,56 @@ fn rdna2_smu_mailbox_constructor_checks_profile_before_io() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     rdna2_smu_mailbox_constructor_checks_profile_before_io
+);
+
+fn rdna2_runtime_banks_metrics_and_thermal_alerts() -> TestResult {
+    for (profile, version, layout) in [
+        (&crate::amdgpu_rdna2::NAVI21, 0x3a4900, Layout::V3),
+        (&crate::amdgpu_rdna2::NAVI22, 0x412d00, Layout::V2),
+        (&crate::amdgpu_rdna2::NAVI23, 0x3b2300, Layout::V2),
+        (&crate::amdgpu_rdna2::NAVI24, 0x491100, Layout::V2),
+    ] {
+        let (mut e, _pool) = powered_engine(version);
+        e.profile = profile;
+        let pcie = if layout == Layout::V3 { 152 } else { 150 };
+        e.io.metrics[pcie] = 3;
+        e.io.metrics[pcie + 1] = 8;
+        let t = run(e.read_telemetry()).unwrap();
+        if t.layout != layout
+            || t.metrics.fan_rpm != 1350
+            || t.metrics.pcie_rate != 3
+            || t.metrics.pcie_width != 8
+            || !run(e.enable_thermal_alert()).unwrap().armed
+        {
+            return TestResult::Fail("family telemetry/thermal alert");
+        }
+        let mut gpu = gpu();
+        let template = gpu.ip_blocks[0];
+        for id in [discovery::HW_ID_THM, discovery::HW_ID_SMUIO] {
+            for revision in [0, 2, 4, 5, 6, 7, 10, 11] {
+                gpu.ip_blocks.retain(|b| b.hw_id != id);
+                let mut b = template;
+                b.hw_id = id;
+                (b.major, b.minor, b.revision) = (11, 0, revision);
+                gpu.ip_blocks.push(b);
+                if runtime_bank(&gpu, id, 0x6c).is_err() {
+                    return TestResult::Fail("SMU11 compatible runtime bank");
+                }
+                gpu.ip_blocks.push(b);
+                if runtime_bank(&gpu, id, 0x6c).is_ok() {
+                    return TestResult::Fail("duplicate runtime bank");
+                }
+                gpu.ip_blocks.pop();
+                gpu.ip_blocks.last_mut().unwrap().major = 13;
+                if runtime_bank(&gpu, id, 0x6c).is_ok() {
+                    return TestResult::Fail("foreign runtime backend");
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_runtime_banks_metrics_and_thermal_alerts
 );

@@ -1,4 +1,4 @@
-//! Navi22 SMC preparation and a cold-start SMU11 version handshake. Linux
+//! Discrete RDNA2 SMC preparation and a cold-start SMU11 version handshake. Linux
 //! `smu_v11_0.c`, `sienna_cichlid_ppt.c`, `smu_v11_0_7_ppsmc.h` and
 //! `mp_11_0_offset.h`: MP1 index 0, message=66, argument=82, response=90.
 //! Board tables use a retained VRAM transfer buffer. Cold-boot power setup
@@ -168,6 +168,25 @@ pub(crate) fn mp1_bank(gpu: &AmdGpu) -> Result<u64, Error> {
         },
     )
 }
+/// SMU11's shared THM11/SMUIO11 register backend, after exact GPU/MP1
+/// validation. Linux smu_v11_0.c uses thm_11_0_2 and smuio_11_0_0 on
+/// every Sienna Cichlid-family MP1. Other generations are refused.
+pub(crate) fn runtime_bank(gpu: &AmdGpu, id: u16, last: u32) -> Result<u64, Error> {
+    let ip = gpu
+        .ip_blocks
+        .iter()
+        .find(|b| b.hw_id == id && b.instance == 0)
+        .ok_or(Error::Unsupported)?;
+    if ip.major != 11
+        || ip.minor != 0
+        || !matches!(id, discovery::HW_ID_THM | discovery::HW_ID_SMUIO)
+    {
+        return Err(Error::Unsupported);
+    }
+    crate::amdgpu_psp_ring::bank(gpu, id, &[(ip.major, ip.minor, ip.revision)], 0, last)
+        .map_err(|_| Error::Unsupported)
+}
+
 /// Immutable image read through registry/blob capabilities. No raw-byte
 /// constructor is exposed to callers of the hardware loader.
 #[derive(Debug)]
@@ -217,7 +236,7 @@ impl Firmware {
         Self::open_rdna2(gpu, authority)
     }
     /// Prepare this discrete RDNA2 ASIC's SMC container without device I/O.
-    /// Runtime power/table policy remains specific to the native chip backend.
+    /// Runtime policy retains this profile through metrics and thermal setup.
     pub fn open_rdna2(
         gpu: &AmdGpu,
         authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
@@ -496,6 +515,7 @@ fn power_policy(
 }
 #[derive(Debug)]
 struct Engine<I: Io> {
+    profile: &'static crate::amdgpu_rdna2::Profile,
     io: I,
     authority: Cap<BusDeviceCap, Write>,
     state: State,
@@ -593,11 +613,12 @@ impl<I: Io> Engine<I> {
         // smu_cmn_check_fw_version (sienna_cichlid .check_fw_version) only
         // logs the driver/firmware interface pair: shipping Navi22 PMFW
         // 0x413f00 reports interface 0x12 against the driver's 0xe.
-        if interface != DRIVER_INTERFACE {
+        let driver = self.profile.smu_driver_interface();
+        if interface != driver {
             use core::fmt::Write;
             let _ = writeln!(
                 narf_console::Writer,
-                "amdgpu: navi22 smu driver if version = {DRIVER_INTERFACE:#010x}, smu fw if version = {interface:#010x}, smu fw version = {firmware:#010x}"
+                "amdgpu: {} smu driver if version = {driver:#010x}, smu fw if version = {interface:#010x}, smu fw version = {firmware:#010x}", self.profile.asic
             );
         }
         Ok(Versions {
@@ -741,7 +762,8 @@ impl<I: Io> Engine<I> {
     /// `sienna_cichlid_get_power_limit` (AC, PPT0) and the register sensors
     /// `smu_v11_0_get_gfx_vdd` / `smu_v11_0_get_fan_speed_pwm`.
     async fn read_telemetry(&mut self) -> Result<Telemetry, Error> {
-        let layout = Layout::for_firmware(self.versions.ok_or(Error::Invalid)?.firmware);
+        let layout =
+            Layout::for_profile(self.profile, self.versions.ok_or(Error::Invalid)?.firmware);
         let limits = self.limits.ok_or(Error::Invalid)?;
         let resume = self.begin_runtime()?;
         let result = async {
@@ -1059,6 +1081,7 @@ impl Smu {
         Ok(Self {
             profile,
             engine: Engine {
+                profile,
                 io: Mmio {
                     regs: gpu.regs,
                     base,
@@ -1067,8 +1090,8 @@ impl Smu {
                         &[(5, 0, 0), (5, 0, 1), (5, 0, 2), (5, 0, 3), (5, 0, 4)],
                         0xd1, // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
                     ),
-                    thm: optional(discovery::HW_ID_THM, &[(11, 0, 5)], CG_THERMAL_STATUS),
-                    smuio: optional(discovery::HW_ID_SMUIO, &[(11, 0, 6)], SVI0_TEL_PLANE0),
+                    thm: runtime_bank(gpu, discovery::HW_ID_THM, CG_THERMAL_STATUS).ok(),
+                    smuio: runtime_bank(gpu, discovery::HW_ID_SMUIO, SVI0_TEL_PLANE0).ok(),
                     pcie: optional(discovery::HW_ID_NBIF, &nbio_versions, PCIE_DATA2),
                     vram: gpu.fb_bar,
                     vram_size: gpu.vram.size,

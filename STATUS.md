@@ -1019,6 +1019,25 @@ per HBA and sets GHC.IE only after the IRQ route; host-install xtask media
 default to `narf.disks=boot-only`; DMUB-routed retrain/unplug tables, a non-IRQ
 DMUB route lock, a TABLE_MS cap, same-EDID HPD long pulses keep the stream.
 
+RX 6000 follow-ups now share clock-gating policy across Navi21/22/23/24,
+with per-ASIC Linux CG/PG flags, discovered one-to-four-engine SDMA traversal,
+and revision-selected SMUIO ROM behavior. Telemetry selects metrics V1/V2/V3
+using each ASIC's firmware thresholds and resolves compatible SMU11 THM/SMUIO
+banks for sensors and thermal alerts. Driver-interface diagnostics now use the
+profile's interface version. Native modules have canonical `amdgpu_rdna2_*`
+paths with the previous Navi22 paths retained as aliases. Boot options use
+`amdgpu.rdna2_{accel,multi,hw_cursor,pg}`, retaining legacy names; explicit
+canonical power values take precedence, and invalid lists enable nothing.
+Conformance now checks Linux CG/PG flags, interface versions, 48 metrics
+selections and SMUIO ROM backend selection, plus V3 and Beige Goby C layouts.
+Family models cover gating, every discovered SDMA engine, metrics transfers,
+thermal alerts, malformed banks and boot-option compatibility. Physical
+validation and the existing default-off/admission prerequisites remain unchanged.
+Validation: 1757 x86_64 and 1249 aarch64 GPU/framebuffer tests passed, with
+production boot and btrfs postflight clean on both architectures. Targeted
+Clippy passed on both architectures; formatting, constant checks, four host
+profile/option tests and the Linux C metrics-layout probe passed.
+
 RX 6000 native startup now covers 40 exact Linux PCI IDs across Navi21,
 Navi22, Navi23 and Navi24. Shared profiles select ASIC-specific firmware and
 validate discovered IPs before firmware upload or hardware initialization.
@@ -1044,7 +1063,7 @@ The final startup/DSC enablement subset passed 45 tests. Production boot and
 btrfs postflight passed on both architectures; release builds, targeted Clippy,
 formatting and constant checks passed. Physical testing beyond the existing
 Navi22 path remains outstanding. Existing `amdgpu.navi22_*` boot options and module names are retained
-for the shared path; optional Navi22 clock-gating policy remains ASIC-specific.
+for the shared path as compatibility aliases.
 
 Current main includes discrete PCIe probe support
 for RX 6750 XT / Navi 22: bounded discovery reads beyond BAR0, separate total
