@@ -381,6 +381,11 @@ static NAVI48_CLOCK: narf_lib::sync::IrqSafeSpinLock<Option<crate::amdgpu_smuio1
 pub(crate) fn publish_navi48_clock(clock: crate::amdgpu_smuio14::ClockReader) {
     *NAVI48_CLOCK.lock() = Some(clock);
 }
+/// Withdrawing under the same lock used by timestamp reads also drains
+/// in-flight accesses before a mode1 reset removes BAR decoding.
+pub(crate) fn withdraw_navi48_clock() {
+    *NAVI48_CLOCK.lock() = None;
+}
 /// DEV_INFO's `[min_engine, max_engine, min_memory, max_memory]` clocks in
 /// kHz, published by the Navi48 SMU owner whenever its DPM state changes.
 static NAVI48_CLOCKS: narf_lib::sync::IrqSafeSpinLock<Option<[u32; 4]>> =

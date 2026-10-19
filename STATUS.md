@@ -856,14 +856,28 @@ sessions after cancellation instead of allowing replay.
 Navi48 compute recovery now falls back from a timed-out HQD dequeue to an
 RS64 MEC pipe reset, clearing all four pipe-0 HQDs while reset is held and
 preserving other MEC controls. RLC safe mode brackets recovery; unexpected
-active sibling queues, failed MES suspension and uncertain register writes
-refuse recovery. Cancellation during the MMIO reset retains the owners and
+active sibling queues and uncertain register writes refuse recovery.
+A drained MES suspension rejection now runs detect-only hung-queue reporting;
+only owned HQDs permit MMIO, while malformed or undrained results quarantine
+MES. Cancellation during the MMIO reset retains the owners and
 prevents replay. The existing remap and fence test must still complete before
 job memory can retire. Register models and Linux-header checks cover this
 path; physical recovery remains unverified.
 
-Still open: physical MSI delivery verification, device reset and fault-source
-re-arming after containment, GC12 rendering and shader
+Navi48 ring recovery now replays healthy contexts' pending jobs under their
+original client tickets. Reset test fences cannot release replay buffers or
+VMIDs; forced VM/PASID/context setup precedes replay. Explicit whole-device
+recovery uses SMU14 mode1, PCI/ReBAR/MSI restoration and ATOM ASIC_Init v2.1,
+then fresh firmware, IH, queues and interrupt proofs. Old owners remain
+quarantined; contexts report lost VRAM, old readers/interrupt handles are
+invalidated, and power/display monitors restart with fresh generations and
+modesets. Cancellation
+or failure is terminal. Automatic whole-device recovery remains disabled:
+the caller must exclude CPU VRAM/GOP/mmap access. Boots needing GDDR6 training
+replay refuse this path before hardware changes.
+
+Still open: physical MSI delivery verification and physical reset/replay
+acceptance, fault-source re-arming after containment, GC12 rendering and shader
 dispatch, production GPU VM and userspace submission, VCN5 video queues, native DCN4 clock/bandwidth/link
 and scanout programming, THM/SMU thermal interrupts and software-CTF shutdown,
 memory/fabric DPM relaxation (display admission/watermark rework first),

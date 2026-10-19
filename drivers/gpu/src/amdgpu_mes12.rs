@@ -205,6 +205,72 @@ pub fn resume_all() -> Packet {
     p.words[1] = 1;
     p
 }
+/// MES12 returns four doorbells followed by their four packed HQD IDs.
+pub const HUNG_QUEUES: usize = 4;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HungQueue {
+    pub doorbell: u32,
+    pub kind: QueueType,
+    pub pipe: u8,
+    pub queue: u8,
+}
+/// Linux's detect-only RESET, after SUSPEND reports hung gangs. The output
+/// must be retained, initialized to all ones and coherent before submission.
+pub fn detect_hung_queues(kind: QueueType, output: u64) -> Result<Packet, Error> {
+    if kind == QueueType::Scheduler || !address(output, 8) {
+        return Err(Error::Invalid);
+    }
+    let mut p = Packet::new(8, 28);
+    p.words[1] = 1 << 2;
+    put64(&mut p.words, 6, output);
+    p.words[8] = kind as u32;
+    Ok(p)
+}
+/// Decode only after both the API and trailing query completed. Preserve
+/// slot pairing even if firmware leaves a hole in the doorbell array.
+pub fn hung_queues(
+    kind: QueueType,
+    words: [u32; HUNG_QUEUES * 2],
+) -> Result<[Option<HungQueue>; HUNG_QUEUES], Error> {
+    if kind == QueueType::Scheduler {
+        return Err(Error::Invalid);
+    }
+    let mut queues = [None; HUNG_QUEUES];
+    for i in 0..HUNG_QUEUES {
+        let doorbell = words[i];
+        if doorbell == u32::MAX {
+            continue;
+        }
+        let id = words[HUNG_QUEUES + i];
+        let pipe = ((id >> 3) & 15) as u8;
+        let queue = ((id >> 7) & 255) as u8;
+        let valid_slot = match kind {
+            QueueType::Graphics => pipe == 0 && queue < 8,
+            QueueType::Compute => pipe < 2 && queue < 4,
+            QueueType::Sdma => pipe < 2 && queue < 8,
+            QueueType::Scheduler => false,
+        };
+        if doorbell % 2 != 0
+            || doorbell >= 1 << 26
+            || id >> 15 != 0
+            || id & 7 != kind as u32
+            || !valid_slot
+            || queues[..i]
+                .iter()
+                .flatten()
+                .any(|q: &HungQueue| q.doorbell == doorbell || (q.pipe == pipe && q.queue == queue))
+        {
+            return Err(Error::MalformedCompletion);
+        }
+        queues[i] = Some(HungQueue {
+            doorbell,
+            kind,
+            pipe,
+            queue,
+        });
+    }
+    Ok(queues)
+}
 /// RESET (mes_v12_0_reset_hw_queue without MMIO) of a kernel queue whose
 /// job on VMID `vmid` hung: a graphics queue as a legacy HQD
 /// (`reset_legacy_gfx` with its pipe, queue, VMID, MQD, doorbell and write

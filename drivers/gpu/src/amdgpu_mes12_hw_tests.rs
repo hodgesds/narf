@@ -23,6 +23,9 @@ struct Fake {
     active: [bool; 2],
     complete: bool,
     reject: bool,
+    reject_opcode: Option<u8>,
+    hold_opcode: Option<u8>,
+    hung: [u32; 8],
     drain_only: bool,
     rptr_stuck: bool,
     bad_version: bool,
@@ -99,7 +102,13 @@ impl Fake {
                 // RESET: a legacy graphics HQD by its fields, any other
                 // kernel queue by doorbell.
                 8 => {
-                    if words[8] == 0 {
+                    if words[1] == 4 {
+                        assert_eq!(words[8], 1);
+                        assert_eq!(ptr(6), GPU + HUNG);
+                        let at = (HUNG / 4) as usize;
+                        assert_eq!(&self.memory[at..at + 8], &[u32::MAX; 8]);
+                        self.memory[at..at + 8].copy_from_slice(&self.hung);
+                    } else if words[8] == 0 {
                         assert_eq!(&words[1..2], &[8]);
                         assert_eq!(&words[9..11], &[0, 0]);
                         assert!(words[11] < 16);
@@ -140,10 +149,15 @@ impl Fake {
                 if !self.drain_only {
                     self.put(
                         ptr(status),
-                        if self.reject { 0x800b020300000000 } else { 1 },
+                        if self.reject || self.reject_opcode == Some(op) {
+                            0x800b020300000000
+                        } else {
+                            1
+                        },
                     );
                 }
             } else {
+                assert!(ptr(status + 2) > self.get(off + (DRAIN / 4) as usize));
                 self.put(ptr(status), ptr(status + 2));
             }
         }
@@ -219,8 +233,11 @@ impl Io for Fake {
     fn doorbell(&mut self, _: MmioRegion, dword: u32, value: u64) {
         assert!(dword == 22 || dword == 24);
         self.progress.store(2, Ordering::SeqCst);
-        if self.complete {
-            self.execute(((dword - 22) / 2) as usize, value);
+        let pipe = ((dword - 22) / 2) as usize;
+        let at = pipe * 5120 + self.tails[pipe] as usize % 1024;
+        let opcode = ((self.memory[at] >> 4) & 255) as u8;
+        if self.complete && self.hold_opcode != Some(opcode) {
+            self.execute(pipe, value);
         }
         if let Some(cap) = self.revoke {
             cap.revoke();
@@ -254,6 +271,9 @@ fn fixture() -> (Pool, Engine<Fake>) {
         active: [false; 2],
         complete: true,
         reject: false,
+        reject_opcode: None,
+        hold_opcode: None,
+        hung: [u32::MAX; 8],
         drain_only: false,
         rptr_stuck: false,
         bad_version: false,
@@ -589,4 +609,90 @@ fn mes12_hw_remaps_a_reset_compute_queue_around_suspended_gangs() -> TestResult 
 kernel_test_in!(
     "drivers/gpu/mes12",
     mes12_hw_remaps_a_reset_compute_queue_around_suspended_gangs
+);
+
+fn compute_queue() -> api::KernelQueue {
+    api::KernelQueue {
+        kind: api::QueueType::Compute,
+        pipe: 0,
+        queue: 0,
+        doorbell: 6,
+        mqd: GPU + 4096,
+        write_pointer: GPU + 12296,
+    }
+}
+
+fn mes12_hw_detects_owned_hangs_after_drained_suspend_rejection() -> TestResult {
+    let (_, mut e) = fixture();
+    run(e.start()).unwrap();
+    e.io.reject_opcode = Some(6);
+    e.io.hung[2] = 6; // Pair a noncontiguous doorbell with its HQD, not slot 0.
+    e.io.hung[6] = 1;
+    let before = e.io.frames.len();
+    let sequence = e.completed[0];
+    assert_eq!(run(e.prepare_compute_reset(compute_queue())), Ok(()));
+    assert_eq!(e.io.frames[before..], [(0, 6), (0, 8)]);
+    assert_eq!(e.completed[0], sequence + 2);
+    assert_eq!(run(e.all_gangs(false)), Ok(()));
+    // A second detection must initialize the output and use fresh fences.
+    e.io.hung = [u32::MAX; 8];
+    assert_eq!(run(e.prepare_compute_reset(compute_queue())), Ok(()));
+    assert_eq!(e.state, State::Ready);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/mes12",
+    mes12_hw_detects_owned_hangs_after_drained_suspend_rejection
+);
+
+fn mes12_hw_detection_refuses_foreign_malformed_and_undrained_hangs() -> TestResult {
+    for malformed in [false, true] {
+        let (_, mut e) = fixture();
+        run(e.start()).unwrap();
+        e.io.reject_opcode = Some(6);
+        e.io.hung[0] = 8;
+        e.io.hung[4] = if malformed { 1 << 15 } else { 1 | (1 << 7) };
+        assert_eq!(
+            run(e.prepare_compute_reset(compute_queue())),
+            Err(if malformed {
+                Error::Protocol
+            } else {
+                Error::Unsupported
+            })
+        );
+        assert_eq!(
+            e.state,
+            if malformed {
+                State::Failed(Error::Protocol)
+            } else {
+                State::Ready
+            }
+        );
+    }
+    for opcode in [6, 8] {
+        let (pool, mut e) = fixture();
+        run(e.start()).unwrap();
+        e.io.reject_opcode = Some(6);
+        e.io.hold_opcode = Some(opcode);
+        {
+            let mut future = core::pin::pin!(e.prepare_compute_reset(compute_queue()));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(e.state, State::Submitting { pipe: 0, opcode });
+        let before = e.io.frames.len();
+        assert_eq!(
+            run(e.prepare_compute_reset(compute_queue())),
+            Err(Error::Busy)
+        );
+        assert_eq!(run(e.all_gangs(false)), Err(Error::Busy));
+        assert_eq!(e.io.frames.len(), before);
+        drop(e);
+        assert_eq!(pool.available(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/mes12",
+    mes12_hw_detection_refuses_foreign_malformed_and_undrained_hangs
 );

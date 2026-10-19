@@ -8,7 +8,9 @@
 use crate::amdgpu_smu_navi48 as smu;
 use crate::amdgpu_smu_navi48_telemetry::{Limits, Telemetry, CRIT_HYST_MILLI, THROTTLERS};
 use alloc::{string::String, vec::Vec};
+use core::sync::atomic::{AtomicU64, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Refresh period; also hwmon's natural update granularity.
 pub const POLL_MS: u64 = 1000;
@@ -143,8 +145,11 @@ fn report(snapshot: &Snapshot, events: Events) {
 
 /// Poll until a terminal SMU failure. Each refresh holds the platform owner
 /// only for its mailbox commands.
-pub(crate) async fn monitor() {
+async fn monitor(generation: u64) {
     loop {
+        if GENERATION.load(Ordering::Acquire) != generation {
+            return;
+        }
         let sample = match crate::amdgpu_navi48_platform::power_sample().await {
             Ok(sample) => sample,
             Err(_) => return, // owner absent or boot not complete
@@ -155,6 +160,9 @@ pub(crate) async fn monitor() {
         );
         let (snapshot, events) = {
             let mut published = SNAPSHOT.lock();
+            if GENERATION.load(Ordering::Acquire) != generation {
+                return;
+            }
             let (snapshot, events) = update(*published, sample);
             *published = Some(snapshot);
             (snapshot, events)
@@ -239,7 +247,30 @@ pub(crate) fn start(limits: Option<Limits>, gfx_level: smu::GfxLevel) {
         });
     }
     publish(limits);
-    narf_scheduler::spawn(monitor());
+    narf_scheduler::spawn(monitor(GENERATION.load(Ordering::Acquire)));
+}
+
+/// Stop the old telemetry producer before reset, including one that already
+/// sampled and is waiting to publish. Recovery creates exactly one successor.
+pub(crate) fn stop() {
+    GENERATION.fetch_add(1, Ordering::AcqRel);
+    if let Some(snapshot) = SNAPSHOT.lock().as_mut() {
+        snapshot.protected = false;
+        snapshot.error = Some(smu::Error::DeviceGone);
+    }
+}
+pub(crate) fn restart(limits: Option<Limits>, gfx_level: smu::GfxLevel) {
+    let generation = GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    *SNAPSHOT.lock() = Some(Snapshot {
+        telemetry: None,
+        limits,
+        protected: false,
+        gfx_level,
+        error: None,
+        samples: 0,
+    });
+    // The original boot already published hwmon; do not register a second node.
+    narf_scheduler::spawn(monitor(generation));
 }
 
 #[cfg(feature = "kernel-test")]
