@@ -3665,6 +3665,56 @@ fn smoke_wave61_pidfd_zombie_immediate() -> TestResult {
 }
 kernel_test_in!("userspace/process", smoke_wave61_pidfd_zombie_immediate);
 
+/// `pidfd_open` after a fast child already exited (systemd's
+/// `pidref_safe_fork` forks first, then opens the pidfd): the exit was
+/// published while no pidfd existed, and the late pidfd must still be born
+/// readable. It used to be minted `exited = false` for the zombie, so a udev
+/// worker's EPOLLIN|EPOLLONESHOT watch on its RUN program never fired and the
+/// device stayed `ID_PROCESSING=1` until the 180 s spawn timeout.
+fn smoke_pidfd_open_after_published_exit_is_readable() -> TestResult {
+    use narf_filesystem::POLL_IN;
+
+    crate::pidfd::__test_reset();
+    const LEADER: u64 = 0x5150_1001;
+    const PID: u64 = 0x5150_1002;
+    const OTHER_LEADER: u64 = 0x5150_1003;
+    let result = (|| {
+        // The exit is published before anyone opened a pidfd.
+        if crate::pidfd::notify_process_exit(PID, LEADER) {
+            return Err("no pidfd existed, yet the exit reported one");
+        }
+        // The late `pidfd_open` on that zombie: the same leader TaskId.
+        let late = crate::pidfd::PidFdFile::new(crate::pidfd::mint_for(PID, LEADER, true));
+        if narf_filesystem::FileOps::poll_readiness(&late) & POLL_IN == 0 {
+            return Err("a pidfd opened after the exit was published is not readable");
+        }
+        // A different process that reuses the number (a path that skipped
+        // `forget_pid`) must not inherit that exit.
+        let recycled =
+            crate::pidfd::PidFdFile::new(crate::pidfd::mint_for(PID, OTHER_LEADER, true));
+        if narf_filesystem::FileOps::poll_readiness(&recycled) & POLL_IN != 0 {
+            return Err("a recycled pid inherited the previous process's exit");
+        }
+        // A clone3 CLONE_PIDFD mint (leader not known yet) is a new process.
+        crate::pidfd::forget_pid(PID);
+        let _ = crate::pidfd::notify_process_exit(PID, LEADER);
+        let fresh = crate::pidfd::PidFdFile::new(crate::pidfd::mint_for(PID, 0, true));
+        if narf_filesystem::FileOps::poll_readiness(&fresh) & POLL_IN != 0 {
+            return Err("a CLONE_PIDFD mint inherited a stale exit");
+        }
+        Ok(())
+    })();
+    crate::pidfd::__test_reset();
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(msg) => TestResult::Fail(msg),
+    }
+}
+kernel_test_in!(
+    "userspace/process",
+    smoke_pidfd_open_after_published_exit_is_readable
+);
+
 /// Regression: a pidfd must become readable only once the exit has been
 /// PUBLISHED — never merely because the task reached zombie state.
 ///
