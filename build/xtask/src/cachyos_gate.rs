@@ -1378,12 +1378,20 @@ impl Gate {
         // retries.
         const PREKERNEL_ATTEMPTS: usize = 4;
         for attempt in 0..PREKERNEL_ATTEMPTS {
+            // OVMF does not always print its `BdsDxe:` line (some boots go
+            // straight to GRUB's), so GRUB's line also ends the firmware
+            // stage, and is then not waited for a second time.
             let stage = vm
-                .wait_for(&["BdsDxe: loading"], Duration::from_secs(60))
+                .wait_for(
+                    &["BdsDxe: loading", "Booting `NARF'"],
+                    Duration::from_secs(60),
+                )
                 .map_err(|_| "OVMF never reached its boot manager (60 s)")
-                .and_then(|_| {
-                    vm.wait_for(&["Booting `NARF'"], Duration::from_secs(120))
-                        .map_err(|_| "GRUB never ran the bundle stanza (120 s)")
+                .and_then(|seen| match seen {
+                    0 => vm
+                        .wait_for(&["Booting `NARF'"], Duration::from_secs(120))
+                        .map_err(|_| "GRUB never ran the bundle stanza (120 s)"),
+                    _ => Ok(seen),
                 })
                 .and_then(|_| {
                     vm.wait_for(&[KERNEL_HELLO], Duration::from_secs(180))
