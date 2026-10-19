@@ -23,6 +23,9 @@ impl ColdBoot {
     pub(crate) fn media_decode_result(&self) -> Option<Result<vcn::DecodeProof, vcn::Error>> {
         self.sequence.backend.vcn.as_ref()?.decode_result()
     }
+    pub(crate) fn media_encode_result(&self) -> Option<Result<vcn::EncodeProof, vcn::Error>> {
+        self.sequence.backend.vcn.as_ref()?.encode_result()
+    }
     /// # Safety
     /// OWNER excludes every engine/PM/firmware user, no client job or clear
     /// has been published, and this is the retained post-interrupt-proof GPU.
@@ -31,6 +34,7 @@ impl ColdBoot {
         &mut self,
         keep_running: bool,
         decode: bool,
+        encode: bool,
     ) -> Result<vcn::InterruptProof, Error> {
         if self.state() != State::MemoryReady || self.sequence.backend.media_test.is_some() {
             return Err(Error::Busy);
@@ -40,6 +44,7 @@ impl ColdBoot {
         // client submit wrappers closed even if the VCPU never started.
         hw.media_test = Some(Err(Error::Busy));
         hw.media_decode_required = decode;
+        hw.media_encode_required = encode;
         let result = async {
             let image = hw
                 .firmware
@@ -86,7 +91,7 @@ impl ColdBoot {
             // SAFETY: matching retained registration, independent IH service,
             // drained kernel transport, exclusive OWNER and enabled CPU IRQs.
             let mut proof = unsafe { vcn.prove_interrupts().await }.map_err(Error::Vcn)?;
-            if keep_running || decode {
+            if keep_running || decode || encode {
                 // SAFETY: no client publication yet; matching kernel VMID0,
                 // retained firmware and live registered source owner.
                 proof = unsafe { vcn.prove_ibs().await }.map_err(Error::Vcn)?;
@@ -95,6 +100,13 @@ impl ColdBoot {
                 // SAFETY: same retained kernel VMID0/firmware/source owner,
                 // no intervening client publication and a drained IB proof.
                 proof = unsafe { vcn.prove_decode().await }
+                    .map_err(Error::Vcn)?
+                    .completion;
+            }
+            if encode {
+                // SAFETY: same exclusive retained transport and kernel VMID0;
+                // no client can publish before this requested proof finishes.
+                proof = unsafe { vcn.prove_encode().await }
                     .map_err(Error::Vcn)?
                     .completion;
             }

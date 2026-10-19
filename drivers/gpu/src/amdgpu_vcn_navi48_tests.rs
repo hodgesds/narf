@@ -13,8 +13,11 @@ const MM: u64 = 0x70000;
 const OSS: u64 = 0x90000;
 const GPU: u64 = 0x8_0000_4000;
 const IMAGE: u64 = 0x8_1000_0000;
+#[path = "amdgpu_vcn_navi48_encode_tests.rs"]
+mod encode_tests;
 
 struct Fake {
+    encoding: encode_tests::Model,
     regs: BTreeMap<u64, u32>,
     writes: Vec<(u64, u32)>,
     memory: Vec<u8>,
@@ -153,6 +156,9 @@ impl Fake {
         true
     }
     fn kernel_ib(&mut self, address: u64, length: u32) -> bool {
+        if self.encoding.contains(address) {
+            return self.encoding.ib(address, length);
+        }
         let codec_base = GPU + BYTES + ib_words::IB_BYTES;
         if (codec_base..codec_base + decode_words::BYTES).contains(&address) {
             return self.codec_ib(address, length);
@@ -264,6 +270,9 @@ impl Io for Fake {
         }
     }
     fn memory_read(&mut self, map: MmioRegion, at: u64) -> u32 {
+        if let Some(word) = self.encoding.read(map, at) {
+            return word;
+        }
         if map.phys.raw() == 0x90004000 + BYTES + ib_words::IB_BYTES {
             return self.codec_word(at);
         }
@@ -286,6 +295,10 @@ impl Io for Fake {
         self.word(at)
     }
     fn memory_write(&mut self, map: MmioRegion, at: u64, value: u32) {
+        if self.encoding.write(map, at, value) {
+            self.dirty = true;
+            return;
+        }
         if map.phys.raw() == 0x90004000 + BYTES + ib_words::IB_BYTES {
             if self.decode_memory.is_empty() {
                 self.decode_memory.resize(
@@ -438,6 +451,7 @@ fn fixture_capacity(capacity: u64) -> (Pool, Engine<Fake>) {
     ]);
     let e = Engine {
         io: Fake {
+            encoding: encode_tests::Model::default(),
             regs,
             writes: Vec::new(),
             memory: vec![0x5a; BYTES as usize],
@@ -487,12 +501,14 @@ fn fixture_capacity(capacity: u64) -> (Pool, Engine<Fake>) {
         ib_pool: pool.clone(),
         ib_memory: None,
         decode_memory: None,
+        encode_memory: None,
         firmware_bytes: 0x11000,
         state: State::Prepared,
         proof: None,
         interrupt_result: None,
         ib_result: None,
         decode_result: None,
+        encode_result: None,
         wptr: 0,
         seq: 0,
     };

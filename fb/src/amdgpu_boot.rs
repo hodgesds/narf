@@ -102,6 +102,7 @@ pub(super) fn start() -> InitResult {
     navi48::set_media_proof(narf_boot::args().has_flag("amdgpu.media_proof"));
     navi48::set_media_clients(narf_boot::args().has_flag("amdgpu.navi48_media"));
     navi48::set_decode_proof(narf_boot::args().has_flag("amdgpu.decode_proof"));
+    navi48::set_encode_proof(narf_boot::args().has_flag("amdgpu.encode_proof"));
     let ok = if navi48 {
         // SAFETY: the retained prepared owner and paused CPU writers persist.
         let result = narf_scheduler::block_on_spin(unsafe { navi48::run() });

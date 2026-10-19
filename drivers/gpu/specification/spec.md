@@ -5371,6 +5371,36 @@ with clients it retains the proven VCPU. This flag advertises no codec
 profile. Models simulate device output only to test completion, checksum and
 storage rules; actual AVC decoding remains an end-of-bring-up silicon test.
 
+The opt-in `amdgpu.encode_proof` requests `unsafe Vcn::prove_encode().await`
+after the session IB proof (and after decode when both flags are requested).
+It runs IGT 2.4's fixed 160x128 NV12 input through create/IDR/close tasks on
+kernel VMID0. Packet builders match the unchanged VCN5 IGT constructors;
+the input frame has a separate hash manifest and 2014/2023 AMD MIT notices
+under `drivers/gpu/fixtures/vcn5/encode`. A separate retained arena owns
+session/CPB, pitched immutable input, metadata, feedback, output and commands.
+The output has the entire declared `0x1f000` range backed, with guards on
+both sides; the source test's smaller allocation is not copied.
+
+`EncodeTesting` and pending `encode_result` precede the first await and
+publication. Each arena page is initialized, including fresh zero feedback
+and output. Native fence/RPTR/source119/CPU evidence precedes reading a
+nonzero feedback byte count bounded by the declared output range. A bounded
+Annex-B inspector requires matching SPS/PPS references, 160x128 eight-bit
+4:2:0 dimensions and IDR/I-slice headers. This is header evidence, not a
+complete H.264 validator or picture-quality proof. Command pages/padding,
+input/pitch padding, arena/output guards and the original fence guards must
+remain intact. Bulk work yields by page without an IRQ-safe lock.
+
+`EncodeVerified`, `Vcn::encode_result` and `Diagnostics::media_encode` retain
+the completion, encoded byte count and profile. Failure/cancellation retains
+all backing and closes client publication; successful VCPU/LMI shutdown
+permits reuse. The requested proof repeats after media recovery before any
+ledger reopens. Without media clients, the flag finishes the existing
+stop/power-down cycle; with clients, the proven VCPU remains retained. No
+codec profile is advertised by this proof. Synthetic header output in the
+model verifies ownership, parsing and completion contracts; actual encoding
+and picture-quality acceptance remain physical tests at the end of bring-up.
+
 The opt-in `amdgpu.media_proof` boot argument requests a retained native
 power-up/start/fence/interrupt/stop/power-down cycle after the GC12/SDMA interrupt
 proofs, before publishing clears or allowing any client slot. Its pending

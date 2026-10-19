@@ -946,6 +946,13 @@ all backing pinned and requested tests repeat after media recovery. Descriptor
 builders and fixture bytes match unchanged IGT source; device models exercise
 missing/wrong output, guards, partial execution and cancellation. Real picture
 decoding remains pending physical acceptance, with codec profiles unadvertised.
+The opt-in `amdgpu.encode_proof` adds fixed NV12 create/IDR/close tasks in a
+separate retained arena, with the full declared output range backed and guarded.
+Fresh completion, bounded matching SPS/PPS/IDR headers and intact command/input
+storage are required before publication and after recovery. Builders and input
+match pinned IGT source; synthetic model headers verify ownership and parsing,
+while physical encoding, complete bitstream conformance and picture quality
+remain acceptance work. This proof advertises no codec capability.
 Fault recovery
 requires all four retirements and renewed owners, followed by a new media
 interrupt and session IB proof before ledger commit. Media restart cancels old codec

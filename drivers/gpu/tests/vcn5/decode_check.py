@@ -13,6 +13,9 @@ gpu = Path(__file__).resolve().parents[2]
 fixtures = gpu / 'fixtures/vcn5'
 manifest = json.loads((fixtures / 'manifest.json').read_text())
 messages = (igt / manifest['source']['file']).read_text()
+assert 'SPDX-License-Identifier: '+manifest['source']['license'] in messages
+for notice in manifest['source']['copyright']:
+    assert 'Copyright '+notice in messages, 'Fixture copyright differs from source'
 for name, expected in manifest['arrays'].items():
     match = re.search(r'static\s+const\s+uint8_t\s+'+name+r'\s*\[\s*\]\s*=\s*\{(.*?)\};', messages, re.S)
     if not match:

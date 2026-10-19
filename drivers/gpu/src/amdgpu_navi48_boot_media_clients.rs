@@ -13,6 +13,9 @@ impl ColdBoot {
         if hw.media_decode_required {
             vcn.decode_result()?.ok()?;
         }
+        if hw.media_encode_required {
+            vcn.encode_result()?.ok()?;
+        }
         vcn.fence_reader()
     }
     pub(crate) fn client_media_owner(&self) -> Option<dispatch::Handle> {
@@ -44,7 +47,7 @@ impl ColdBoot {
         let vcn = self.sequence.backend.vcn.as_mut().ok_or(vcn::Error::Busy)?;
         if !matches!(
             vcn.state(),
-            vcn::State::IbVerified | vcn::State::DecodeVerified
+            vcn::State::IbVerified | vcn::State::DecodeVerified | vcn::State::EncodeVerified
         ) {
             return Err(vcn::Error::Busy);
         }
@@ -94,6 +97,7 @@ impl ColdBoot {
         }
         hw.media_test = Some(Err(Error::Busy));
         let decode = hw.media_decode_required;
+        let encode = hw.media_encode_required;
         let vcn = hw.vcn.as_mut().ok_or(Error::Invalid)?;
         // SAFETY: coordinated re-arm completed, media registration retained,
         // native transport drained and independent IH service remains active.
@@ -106,6 +110,13 @@ impl ColdBoot {
                 // SAFETY: same retained kernel VMID0 and no replay until the
                 // requested picture proof and all other rings finish.
                 proof = unsafe { vcn.prove_decode().await }
+                    .map_err(Error::Vcn)?
+                    .completion;
+            }
+            if encode {
+                // SAFETY: all ledgers remain frozen, including media, until
+                // the new requested proof and every healthy replay finish.
+                proof = unsafe { vcn.prove_encode().await }
                     .map_err(Error::Vcn)?
                     .completion;
             }

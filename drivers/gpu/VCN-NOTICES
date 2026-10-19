@@ -17,7 +17,14 @@ lib/amdgpu/amd_vcn_shared.c and lib/amdgpu/amd_vcn_shared.h:
   Copyright 2025 Advanced Micro Devices, Inc.
 
 tests/amdgpu/amd_vcn.c:
-  Header-inspection reference for amdgpu_vcn_navi48_h264.rs.
+  Encode packet sequence adapted in amdgpu_vcn_navi48_encode_words.rs and
+  header-inspection reference for amdgpu_vcn_navi48_h264.rs.
+  Copyright 2023 Advanced Micro Devices, Inc.
+  Copyright 2014 Advanced Micro Devices, Inc.
+
+lib/amdgpu/amd_mmd_frame.h:
+  The NV12 input frame in fixtures/vcn5/encode/, with its own manifest and
+  permission notice in that directory.
   Copyright 2023 Advanced Micro Devices, Inc.
   Copyright 2014 Advanced Micro Devices, Inc.
 

@@ -98,7 +98,10 @@ impl<I: Io> Engine<I> {
     pub(super) fn submit(&mut self, job: Job) -> Result<u32, Error> {
         if !matches!(
             self.state,
-            State::InterruptVerified | State::IbVerified | State::DecodeVerified
+            State::InterruptVerified
+                | State::IbVerified
+                | State::DecodeVerified
+                | State::EncodeVerified
         ) {
             return Err(Error::Busy);
         }

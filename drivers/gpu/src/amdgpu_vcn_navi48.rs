@@ -15,6 +15,12 @@ use narf_capabilities::{Cap, CapError, CapOp, Write};
 mod decode_proof;
 #[path = "amdgpu_vcn_navi48_decode_words.rs"]
 mod decode_words;
+#[path = "amdgpu_vcn_navi48_encode.rs"]
+mod encode_proof;
+#[path = "amdgpu_vcn_navi48_encode_words.rs"]
+mod encode_words;
+#[path = "amdgpu_vcn_navi48_h264.rs"]
+mod h264;
 #[path = "amdgpu_vcn_navi48_ib.rs"]
 mod ib_proof;
 #[path = "amdgpu_vcn_navi48_ib_words.rs"]
@@ -33,6 +39,7 @@ pub enum Error {
     BootFailed,
     PowerPolicy(u64),
     DecodeChecksum(u64),
+    EncodeOutput,
     Interrupts(crate::amdgpu_ih7::Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,6 +55,8 @@ pub enum State {
     IbVerified,
     DecodeTesting,
     DecodeVerified,
+    EncodeTesting,
+    EncodeVerified,
     Stopping,
     Stopped,
     Failed(Error),
@@ -67,6 +76,12 @@ pub struct InterruptProof {
 pub struct DecodeProof {
     pub completion: InterruptProof,
     pub output_sum: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncodeProof {
+    pub completion: InterruptProof,
+    pub output_bytes: u32,
+    pub profile: u8,
 }
 
 // vcn_5_0_0_offset.h: all registers below are in VCN instance 0, bank 1.
@@ -235,12 +250,14 @@ struct Engine<I: Io> {
     ib_pool: Pool,
     ib_memory: Option<Reservation>,
     decode_memory: Option<Reservation>,
+    encode_memory: Option<Reservation>,
     firmware_bytes: u32,
     state: State,
     proof: Option<Proof>,
     interrupt_result: Option<Result<InterruptProof, Error>>,
     ib_result: Option<Result<InterruptProof, Error>>,
     decode_result: Option<Result<DecodeProof, Error>>,
+    encode_result: Option<Result<EncodeProof, Error>>,
     wptr: u32,
     seq: u32,
 }
@@ -304,6 +321,7 @@ impl<I: Io> Engine<I> {
         self.interrupt_result = None;
         self.ib_result = None;
         self.decode_result = None;
+        self.encode_result = None;
         self.memory.publish();
         let result = self
             .start_inner(image)
@@ -437,6 +455,8 @@ impl<I: Io> Engine<I> {
                 | State::IbVerified
                 | State::DecodeTesting
                 | State::DecodeVerified
+                | State::EncodeTesting
+                | State::EncodeVerified
         ) {
             return Err(Error::Busy);
         }
@@ -538,6 +558,7 @@ impl<I: Io> Engine<I> {
                 | State::InterruptVerified
                 | State::IbVerified
                 | State::DecodeVerified
+                | State::EncodeVerified
         ) {
             return Err(Error::Busy);
         }
@@ -559,6 +580,9 @@ impl<I: Io> Engine<I> {
                     memory.stopped();
                 }
                 if let Some(memory) = self.decode_memory.as_mut() {
+                    memory.stopped();
+                }
+                if let Some(memory) = self.encode_memory.as_mut() {
                     memory.stopped();
                 }
             }
@@ -635,12 +659,14 @@ impl Vcn {
                 ib_pool: pool.clone(),
                 ib_memory: None,
                 decode_memory: None,
+                encode_memory: None,
                 firmware_bytes: firmware_bytes as u32,
                 state: State::Prepared,
                 proof: None,
                 interrupt_result: None,
                 ib_result: None,
                 decode_result: None,
+                encode_result: None,
                 wptr: 0,
                 seq: 0,
             },
@@ -715,6 +741,19 @@ impl Vcn {
     pub fn decode_result(&self) -> Option<Result<DecodeProof, Error>> {
         self.engine.decode_result
     }
+    /// Encode the fixed NV12 frame and inspect bounded SPS/PPS/IDR headers.
+    /// This does not prove visual quality or complete bitstream conformance.
+    /// # Safety
+    /// Retain the exclusive VCPU/GMC/kernel-VMID0/IRQ owner with no clients,
+    /// PM or reset, keeping all published memory after failure/cancellation.
+    pub async unsafe fn prove_encode(&mut self) -> Result<EncodeProof, Error> {
+        self.engine
+            .prove_encode(&mut crate::amdgpu_navi48_interrupts::NativeObserver)
+            .await
+    }
+    pub fn encode_result(&self) -> Option<Result<EncodeProof, Error>> {
+        self.engine.encode_result
+    }
     /// Queue a client frame on the verified unified ring.
     /// # Safety
     /// Own the client's MMHUB VMID/PASID/root and every IB/resource it reaches.
@@ -732,7 +771,10 @@ impl Vcn {
     pub fn fence_reader(&self) -> Option<FenceReader> {
         matches!(
             self.engine.state,
-            State::InterruptVerified | State::IbVerified | State::DecodeVerified
+            State::InterruptVerified
+                | State::IbVerified
+                | State::DecodeVerified
+                | State::EncodeVerified
         )
         .then_some(FenceReader {
             io: self.engine.io,
