@@ -77,7 +77,7 @@ extern crate alloc;
 fn dump(n:&str,words:&[u32]) {print!("{n}");for v in words {print!(" {v:08x}");}println!();}
 fn main() {
     dump("direct",&w::direct());dump("ib",&w::kernel_ib());
-    dump("frame",&w::ib_frame(0x810001000,0x810003000,0x810002000,9));
+    dump("frame",&w::ib_frame(0x810001000,0x810003000,0x810002000,9,16));
 }
 '''.replace('WORDS',str(gpu/'src/amdgpu_jpeg_navi48_words.rs'))
     (out/'harness.rs').write_text(harness)

@@ -40,6 +40,12 @@ impl ColdBoot {
             .as_ref()
             .map(crate::amdgpu_jpeg_navi48::Jpeg::state)
     }
+    pub(crate) fn media_jpeg_decode_result(
+        &self,
+    ) -> Option<Result<crate::amdgpu_jpeg_navi48::DecodeProof, crate::amdgpu_jpeg_navi48::Error>>
+    {
+        self.sequence.backend.jpeg.as_ref()?.decode_result()
+    }
     /// # Safety
     /// OWNER excludes every engine/PM/firmware user, no client job or clear
     /// has been published, and this is the retained post-interrupt-proof GPU.
@@ -50,6 +56,7 @@ impl ColdBoot {
         decode: bool,
         encode: bool,
         jpeg: bool,
+        jpeg_decode: bool,
     ) -> Result<vcn::InterruptProof, Error> {
         if self.state() != State::MemoryReady || self.sequence.backend.media_test.is_some() {
             return Err(Error::Busy);
@@ -60,7 +67,9 @@ impl ColdBoot {
         hw.media_test = Some(Err(Error::Busy));
         hw.media_decode_required = decode;
         hw.media_encode_required = encode;
+        let jpeg = jpeg || jpeg_decode;
         hw.media_jpeg_required = jpeg;
+        hw.media_jpeg_decode_required = jpeg_decode;
         let result = async {
             let image = hw
                 .firmware
@@ -135,7 +144,7 @@ impl ColdBoot {
             if jpeg {
                 // SAFETY: VCN retains the shared media range and GMC, no
                 // clients can publish, and IH/CPU delivery remains active.
-                unsafe { hw.prove_jpeg(doorbells).await }?;
+                unsafe { hw.prove_jpeg(doorbells, jpeg_decode).await }?;
             }
             if keep_running {
                 return Ok(proof);

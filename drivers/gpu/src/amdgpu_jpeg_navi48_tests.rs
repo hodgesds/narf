@@ -11,6 +11,8 @@ const VCN: u64 = 0x10000;
 const NBIO: u64 = 0x30000;
 const GC: u64 = 0x50000;
 const GPU: u64 = 0x8_0000_4000;
+#[path = "amdgpu_jpeg_navi48_decode_tests.rs"]
+mod decode_tests;
 fn jpeg5_layout_rejects_wrong_mmhub_or_truncated_jpeg_banks() -> TestResult {
     let descriptor = || {
         let mut backing = vec![0; 0x80000 / 4];
@@ -46,6 +48,7 @@ kernel_test_in!(
     jpeg5_layout_rejects_wrong_mmhub_or_truncated_jpeg_banks
 );
 struct Fake {
+    picture: decode_tests::Model,
     regs: BTreeMap<u64, u32>,
     memory: Vec<u8>,
     writes: Vec<(u64, u32)>,
@@ -112,9 +115,19 @@ impl Fake {
                     }
                     let address =
                         (u64::from(self.packets[&0x40b7]) << 32) | u64::from(self.packets[&0x40b6]);
-                    assert_eq!(address, GPU + IB);
-                    assert_eq!(self.packets[&0x4082], 16);
-                    assert!(self.execute(IB, 16));
+                    let dwords = self.packets[&0x4082];
+                    if self.picture.contains(address) {
+                        if !self.picture.execute(address, dwords) {
+                            return false;
+                        }
+                        if self.picture.fault == 11 {
+                            self.store(RING, 0);
+                        }
+                    } else {
+                        assert_eq!(address, GPU + IB);
+                        assert_eq!(dwords, 16);
+                        assert!(self.execute(IB, 16));
+                    }
                 }
                 3 => {
                     assert_eq!((header, value), (0x33004089, 2));
@@ -160,11 +173,18 @@ impl Io for Fake {
             }
         }
     }
-    fn memory_read(&mut self, _: MmioRegion, at: u64) -> u32 {
+    fn memory_read(&mut self, map: MmioRegion, at: u64) -> u32 {
         assert!(!self.dirty);
+        if let Some(value) = self.picture.read(map, at) {
+            return value;
+        }
         self.word(at)
     }
-    fn memory_write(&mut self, _: MmioRegion, at: u64, value: u32) {
+    fn memory_write(&mut self, map: MmioRegion, at: u64, value: u32) {
+        if self.picture.write(map, at, value) {
+            self.dirty = true;
+            return;
+        }
         self.store(at, value);
         self.dirty = true;
     }
@@ -229,16 +249,20 @@ impl Observer for Irqs {
     }
 }
 fn fixture() -> (Pool, Engine<Fake>, Irqs) {
+    fixture_capacity(BYTES * 2)
+}
+fn fixture_capacity(capacity: u64) -> (Pool, Engine<Fake>, Irqs) {
     let map = MmioRegion {
         phys: narf_memory::PhysAddr::new(0x90004000),
         virt: 0,
-        len: BYTES * 2,
+        len: capacity,
         kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
     };
     // SAFETY: Fake intercepts every access; the mapping is bookkeeping only.
     let pool = unsafe { Pool::from_owned_range(map, GPU) }.unwrap();
     let signals = Arc::new([AtomicU32::new(7), AtomicU32::new(9)]);
     let io = Fake {
+        picture: decode_tests::Model::default(),
         regs: BTreeMap::from([
             (NBIO + u64::from(RANGE) * 4, RANGE_VALUE),
             (VCN + u64::from(DLDO_CONFIG) * 4, 0x15500),
@@ -279,8 +303,11 @@ fn fixture() -> (Pool, Engine<Fake>, Irqs) {
             gc: GC,
         },
         memory: pool.reserve(BYTES).unwrap(),
+        pool: pool.clone(),
+        decode_memory: None,
         state: State::Prepared,
         result: None,
+        decode_result: None,
         seq: 0,
         wptr: 0,
     };

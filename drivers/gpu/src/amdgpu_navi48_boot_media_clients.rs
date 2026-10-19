@@ -99,6 +99,7 @@ impl ColdBoot {
         let decode = hw.media_decode_required;
         let encode = hw.media_encode_required;
         let jpeg = hw.media_jpeg_required;
+        let jpeg_decode = hw.media_jpeg_decode_required;
         // SAFETY: coordinated re-arm completed, media registration retained,
         // native transport drained and independent IH service remains active.
         let result = async {
@@ -127,7 +128,7 @@ impl ColdBoot {
                 let doorbells =
                     unsafe { mes::map_doorbells(&hw.pci, &hw.authority) }.map_err(Error::Mes)?;
                 // SAFETY: registered media, retained GMC and active IH route.
-                unsafe { hw.prove_jpeg(doorbells).await }?;
+                unsafe { hw.prove_jpeg(doorbells, jpeg_decode).await }?;
             }
             Ok(proof)
         }

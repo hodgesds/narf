@@ -10,6 +10,7 @@ impl Hardware {
     pub(crate) async unsafe fn prove_jpeg(
         &mut self,
         doorbells: narf_bus::MmioRegion,
+        decode: bool,
     ) -> Result<jpeg::Proof, Error> {
         if self.jpeg_owner.is_some() {
             return Err(Error::Busy);
@@ -45,7 +46,14 @@ impl Hardware {
             // SAFETY: matching power/GMC/range and retained IRQ registration.
             unsafe { jpeg.start(power).await }.map_err(Error::Jpeg)?;
             // SAFETY: registered kernel context, exclusive transport and CPU IRQs.
-            let proof = unsafe { jpeg.prove().await }.map_err(Error::Jpeg)?;
+            let mut proof = unsafe { jpeg.prove().await }.map_err(Error::Jpeg)?;
+            if decode {
+                // SAFETY: same registered exclusive kernel-VMID0 owner and
+                // drained transport; retain the picture arena on cancellation.
+                proof = unsafe { jpeg.prove_decode().await }
+                    .map_err(Error::Jpeg)?
+                    .completion;
+            }
             // SAFETY: proof drained its commands; all clients remain excluded.
             unsafe { jpeg.stop().await }.map_err(Error::Jpeg)?;
             // SAFETY: JRBC/JMI writes retired before static domain power-down.

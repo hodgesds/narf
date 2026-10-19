@@ -13,6 +13,10 @@ use crate::{
 use core::sync::atomic::{fence, Ordering};
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
+#[path = "amdgpu_jpeg_navi48_decode.rs"]
+mod decode_proof;
+#[path = "amdgpu_jpeg_navi48_decode_words.rs"]
+mod decode_words;
 #[path = "amdgpu_jpeg_navi48_proof.rs"]
 mod proof;
 #[path = "amdgpu_jpeg_navi48_words.rs"]
@@ -29,6 +33,7 @@ pub enum Error {
     Readback,
     Timeout,
     PowerPolicy(u64),
+    DecodeChecksum(u64),
     Interrupts(crate::amdgpu_ih7::Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +43,8 @@ pub enum State {
     Ready,
     Testing,
     Verified,
+    DecodeTesting,
+    DecodeVerified,
     Stopping,
     Stopped,
     Failed(Error),
@@ -47,6 +54,11 @@ pub struct Proof {
     pub sequence: u32,
     pub read_pointer: u32,
     pub msi_verified: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodeProof {
+    pub completion: Proof,
+    pub output_sum: u64,
 }
 const RING: u64 = 4096;
 const FENCE: u64 = 8192;
@@ -144,8 +156,11 @@ struct Engine<I: Io> {
     authority: Cap<BusDeviceCap, Write>,
     layout: Layout,
     memory: Reservation,
+    pool: Pool,
+    decode_memory: Option<Reservation>,
     state: State,
     result: Option<Result<Proof, Error>>,
+    decode_result: Option<Result<DecodeProof, Error>>,
     seq: u32,
     wptr: u32,
 }
@@ -204,6 +219,7 @@ impl<I: Io> Engine<I> {
         }
         self.state = State::Starting;
         self.result = None;
+        self.decode_result = None;
         self.memory.publish();
         let result = self
             .start_inner()
@@ -255,7 +271,10 @@ impl<I: Io> Engine<I> {
         self.shared_range()
     }
     fn emit(&mut self, words: &[u32]) -> Result<u32, Error> {
-        if !matches!(self.state, State::Testing) || words.is_empty() || words.len() % 2 != 0 {
+        if !matches!(self.state, State::Testing | State::DecodeTesting)
+            || words.is_empty()
+            || words.len() % 2 != 0
+        {
             return Err(Error::Invalid);
         }
         let count = (words.len() as u32 + 15) & !15;
@@ -285,7 +304,10 @@ impl<I: Io> Engine<I> {
         Ok(next)
     }
     async fn stop(&mut self) -> Result<(), Error> {
-        if !matches!(self.state, State::Ready | State::Verified) {
+        if !matches!(
+            self.state,
+            State::Ready | State::Verified | State::DecodeVerified
+        ) {
             return Err(Error::Busy);
         }
         self.state = State::Stopping;
@@ -302,6 +324,9 @@ impl<I: Io> Engine<I> {
             // writes pending, then JMI reset and the JPEG doorbell were shut.
             unsafe {
                 self.memory.stopped();
+                if let Some(memory) = self.decode_memory.as_mut() {
+                    memory.stopped();
+                }
             }
         }
         result
@@ -374,8 +399,11 @@ impl Jpeg {
                 authority,
                 layout,
                 memory,
+                pool: pool.clone(),
+                decode_memory: None,
                 state: State::Prepared,
                 result: None,
+                decode_result: None,
                 seq: 0,
                 wptr: 0,
             },
@@ -398,6 +426,18 @@ impl Jpeg {
         self.engine
             .prove(&mut crate::amdgpu_navi48_interrupts::NativeObserver)
             .await
+    }
+    /// Decode IGT's fixed JPEG and check both active output planes.
+    /// # Safety
+    /// Keep the exclusive registered owner, shared range/GMC and CPU IRQs
+    /// live, excluding clients/PM/reset. Retain all backing after cancellation.
+    pub async unsafe fn prove_decode(&mut self) -> Result<DecodeProof, Error> {
+        self.engine
+            .prove_decode(&mut crate::amdgpu_navi48_interrupts::NativeObserver)
+            .await
+    }
+    pub fn decode_result(&self) -> Option<Result<DecodeProof, Error>> {
+        self.engine.decode_result
     }
     /// # Safety
     /// Exclude every publisher/PM/reset writer and retain VCN's shared range.

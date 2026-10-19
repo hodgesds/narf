@@ -960,6 +960,12 @@ before memory reuse. A registered exact-source JPEG owner participates in
 fault containment; incomplete recovery cannot omit it. Transport models and
 unchanged Linux constructor checks support this stage. JPEG picture execution,
 native clients and physical acceptance remain open.
+The additional `amdgpu.jpeg_decode_proof` submits pinned IGT JPEG5 picture
+commands in a separate guarded arena and requires a fresh native completion
+plus the active luma/chroma checksum. Input, command and output guards remain
+checked; failure/cancellation retains all backing and requested picture proofs
+repeat after recovery. Models test synthetic pixels, not JPEG decoding;
+physical picture execution and native JPEG clients remain open.
 Fault recovery
 requires all four retirements and renewed owners, followed by a new media
 interrupt and session IB proof before ledger commit. Media restart cancels old codec

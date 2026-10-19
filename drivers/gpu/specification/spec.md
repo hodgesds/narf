@@ -5440,10 +5440,37 @@ shutdown and SMU power-down. A requested cycle repeats after recovery before
 any client ledger reopens. A live unretired JPEG owner makes a four-owner
 recovery receipt incomplete, requiring whole-device recovery instead.
 
-This stage proves native JRBC/IB/interrupt/retirement transport. It does not
-advertise a JPEG client ring or codec capability and does not decode a JPEG
-picture. Known-stream execution, native client submission and physical
-acceptance remain required before complete JPEG bring-up.
+`amdgpu.jpeg_proof` proves JRBC/IB/interrupt/retirement transport without a
+picture. It advertises no JPEG client ring or codec capability. Native client
+submission and physical acceptance remain required for complete JPEG bring-up.
+
+`amdgpu.jpeg_decode_proof` implies that transport cycle and additionally calls
+`unsafe Jpeg::prove_decode().await` on a newly drained kernel VMID0 queue.
+`DecodeTesting` and pending `decode_result` precede the first await and arena
+publication. A separate reservation retains IGT 2.4's fixed JPEG input, guarded
+24 KiB pitched NV12 target and immutable IB page. The 406-byte input, source
+archive/hash and 2017/2023 AMD MIT notices live in `fixtures/jpeg5`; the IB
+matches unchanged IGT JPEG5 register-selection and construction functions.
+All pages start at known values, with guards around the arena/input/target.
+
+Fresh fence/RPTR/source153/CPU evidence is required before summing the active
+64x64 luma and 64x32 interleaved chroma bytes at pitch 256. Their combined sum
+must equal 262144; untouched zero output cannot satisfy it. `DecodeChecksum`
+retains the observed sum on mismatch. Input and zero padding, picture/transport
+IBs, historical ring commands, kernel fence/shadow page and all guards must
+remain intact. Bulk initialization/readback yields by page. Only a current,
+drained transport witness may enter this proof; it clears both idle GPCOM
+fence dwords and uses a new nonzero sequence, rejecting stale fence contents.
+
+`DecodeProof { completion, output_sum }`, `DecodeVerified`, `decode_result`
+and platform `Diagnostics::media_jpeg_decode` retain picture evidence separately
+from the original transport result. The overall JPEG cycle returns its latest
+proof and performs normal DMA-clean shutdown/power-down before retirement.
+Failure/cancellation retains both allocations and closes clients; only proven
+JRBC/JMI shutdown makes either allocation reusable. A requested picture proof
+repeats after media recovery before any ledger reopens. This opt-in advertises
+no codec capability. Synthetic model pixels exercise lifetime/checksum rules;
+physical picture execution and codec conformance remain acceptance work.
 
 The opt-in `amdgpu.media_proof` boot argument requests a retained native
 power-up/start/fence/interrupt/stop/power-down cycle after the GC12/SDMA interrupt

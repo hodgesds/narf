@@ -55,7 +55,7 @@ impl<I: Io> Engine<I> {
         self.seq = self.seq.wrapping_add(1).max(1);
         let sequence = self.seq;
         let base = self.memory.address();
-        let frame = words::ib_frame(base + RING, base + IB, base + FENCE, sequence);
+        let frame = words::ib_frame(base + RING, base + IB, base + FENCE, sequence, 16);
         let next = self.emit(&frame)?;
         let mut complete = false;
         for _ in 0..2000 {

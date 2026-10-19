@@ -21,7 +21,7 @@ pub(super) fn direct() -> Vec<u32> {
     words.extend_from_slice(&[0x1bfff, 0x69004, 0x18000, 0x10000]);
     words
 }
-pub(super) fn ib_frame(ring: u64, ib: u64, fence: u64, seq: u32) -> Vec<u32> {
+pub(super) fn ib_frame(ring: u64, ib: u64, fence: u64, seq: u32, dwords: u32) -> Vec<u32> {
     let mut words = vec![0x1bfff, 0x69004, 0x18000, 0x80010000];
     // jpeg_v4_0_3_dec_ring_emit_wreg: ordered HDP flush before the IB.
     words.extend_from_slice(&[0x1bfff, 0x7f000, 0x18000, 0]);
@@ -35,7 +35,7 @@ pub(super) fn ib_frame(ring: u64, ib: u64, fence: u64, seq: u32) -> Vec<u32> {
         0x40b7,
         (ib >> 32) as u32,
         0x4082,
-        16,
+        dwords,
         0x42d4,
         ring as u32,
         0x42d5,

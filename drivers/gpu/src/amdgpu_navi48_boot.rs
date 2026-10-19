@@ -213,6 +213,7 @@ struct Hardware {
     media_decode_required: bool,
     media_encode_required: bool,
     media_jpeg_required: bool,
+    media_jpeg_decode_required: bool,
     vcn_owner: Option<crate::amdgpu_navi48_dispatch::Handle>,
 }
 impl Backend for Hardware {
@@ -676,6 +677,7 @@ impl ColdBoot {
                     media_decode_required: false,
                     media_encode_required: false,
                     media_jpeg_required: false,
+                    media_jpeg_decode_required: false,
                     vcn_owner: None,
                     mes: None,
                     queues: None,
