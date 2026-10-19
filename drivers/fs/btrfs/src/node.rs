@@ -176,15 +176,26 @@ macro_rules! admin_op {
 /// against an unchanged root is real corruption and is returned.
 macro_rules! with_root_retry {
     ($node:expr, $vol:expr, |$root:ident| $body:expr) => {{
-        let mut $root = $node.root(&$vol);
+        // The sampled root stays pinned against reallocation while the body
+        // walks from it (`BtrfsVolume::pin_live_root`).
+        let mut _pin = $node.pin_root(&$vol);
+        let mut $root = match &_pin {
+            Some(pin) => pin.root(),
+            None => $node.root(&$vol),
+        };
         let mut tries = 0u32;
         loop {
             match $body {
                 Err(FsError::InvalidData) if tries < 4 => {
-                    let fresh = $node.fresh_root(&$vol).await?;
+                    let next = $node.pin_root(&$vol);
+                    let fresh = match &next {
+                        Some(pin) => pin.root(),
+                        None => $node.fresh_root(&$vol).await?,
+                    };
                     if fresh == $root {
                         break Err(FsError::InvalidData);
                     }
+                    _pin = next;
                     $root = fresh;
                     tries += 1;
                 }
@@ -653,6 +664,16 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
     /// live default fs-tree root.
     fn root(&self, vol: &BtrfsVolume<B>) -> u64 {
         self.tree_root.unwrap_or_else(|| vol.fs_tree_root().0)
+    }
+
+    /// The live root this node reads from, pinned against reallocation
+    /// while the pin lives; `None` for a fixed (`tree_root`) root or a
+    /// subvolume no mount tracks, which are read unpinned.
+    fn pin_root(&self, vol: &BtrfsVolume<B>) -> Option<crate::volume::RootPin<B>> {
+        if self.tree_root.is_some() {
+            return None;
+        }
+        vol.pin_live_root(self.tree_id)
     }
 
     /// The tree's root as of now, for a read that found a block which no

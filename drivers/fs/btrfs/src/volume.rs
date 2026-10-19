@@ -197,6 +197,31 @@ struct LiveSubvol {
     mounts: usize,
 }
 
+/// A live tree root pinned against reallocation while a lock-free reader
+/// walks from it ([`BtrfsVolume::pin_live_root`]).
+pub(crate) struct RootPin<B: BlockDevice> {
+    core: Arc<VolCore<B>>,
+    root: u64,
+}
+
+impl<B: BlockDevice> RootPin<B> {
+    pub(crate) fn root(&self) -> u64 {
+        self.root
+    }
+}
+
+impl<B: BlockDevice> Drop for RootPin<B> {
+    fn drop(&mut self) {
+        let mut pins = self.core.reader_roots.lock();
+        if let Some(count) = pins.get_mut(&self.root) {
+            *count -= 1;
+            if *count == 0 {
+                pins.remove(&self.root);
+            }
+        }
+    }
+}
+
 /// Per-mount state: which subvolume this mount exposes.
 #[derive(Debug)]
 struct ViewState {
@@ -378,6 +403,17 @@ pub struct VolCore<B: BlockDevice> {
     /// transaction; it sits here until NARF has a transaction object, which is
     /// sound only while at most one commit is in flight.
     pinned: IrqSafeSpinLock<alloc::vec::Vec<(u64, u64)>>,
+    /// Tree roots a lock-free reader is walking from, with a count per
+    /// address ([`BtrfsVolume::pin_live_root`]). A reader verifies every
+    /// child it reads against its parent's pointer (generation, level, first
+    /// key), so a block freed and reused under it is caught — except the
+    /// root, which has no parent. A root the reader sampled can be retired
+    /// by the next operation, committed, unpinned and handed out again while
+    /// the reader is still on its way to it; the reader would then walk
+    /// whatever was written there as if it were the tree (seen as ENOENT and
+    /// as wrong file contents in the SMP racing-writers test). The allocator
+    /// withholds these addresses ([`crate::allocator::Allocator::build`]).
+    reader_roots: IrqSafeSpinLock<BTreeMap<u64, u32>>,
     /// Metadata node cache, keyed by logical address.
     ///
     /// A commit path-COWs the extent tree once per fixed-point round, and a
@@ -1666,6 +1702,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             #[cfg(feature = "kernel-test")]
             crash_before_super: core::sync::atomic::AtomicBool::new(false),
             pinned: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+            reader_roots: IrqSafeSpinLock::new(BTreeMap::new()),
             nodes: IrqSafeSpinLock::new(NodeCache::default()),
             aborted: core::sync::atomic::AtomicBool::new(false),
             quota_override: core::sync::atomic::AtomicBool::new(false),
@@ -2267,6 +2304,13 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.pinned.lock().clone()
     }
 
+    /// The roots lock-free readers are walking from, as `(addr, nodesize)`
+    /// ranges the allocator must not hand out.
+    pub(crate) fn reader_root_ranges(&self) -> alloc::vec::Vec<(u64, u64)> {
+        let n = self.nodesize() as u64;
+        self.reader_roots.lock().keys().map(|&a| (a, n)).collect()
+    }
+
     /// Release every pinned extent. The caller must have made a superblock
     /// durable that no longer references any of them — that ordering is the
     /// entire point of pinning, so calling this earlier reintroduces exactly
@@ -2638,6 +2682,23 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// The live root of subvolume `id` when some mount tracks it.
     pub(crate) fn live_subvol_root(&self, id: u64) -> Option<u64> {
         self.state.lock().subvols.get(&id).map(|live| live.root)
+    }
+
+    /// Sample the live root of subvolume `id` (this mount's when `None`) and
+    /// pin it against reuse until the returned [`RootPin`] drops, atomically:
+    /// the root is read and pinned under the same lock every root update
+    /// takes, so it cannot be retired, committed and reallocated in between.
+    /// `None` when no mount tracks `id`.
+    pub(crate) fn pin_live_root(&self, id: Option<u64>) -> Option<RootPin<B>> {
+        let id = id.unwrap_or_else(|| self.fs_tree_id());
+        let g = self.state.lock();
+        let root = g.subvols.get(&id)?.root;
+        *self.core.reader_roots.lock().entry(root).or_insert(0) += 1;
+        drop(g);
+        Some(RootPin {
+            core: self.core.clone(),
+            root,
+        })
     }
 
     /// Publish a committed root for a tree other than this mount's (a

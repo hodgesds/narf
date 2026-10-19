@@ -79,7 +79,10 @@ FULL_BACKREF or relocation flag) before writing anything, and aborts
 read-only otherwise. A ROOT_ITEM's generation changes only when its root
 block moves. A superblock copy and every tree node reach the device as one
 request. Lock-free readers verify each child against its parent pointer
-(generation, level, first key) and retry from the live root. Under
+(generation, level, first key) and retry from the live root; the root they
+sampled has no parent to check against, so it is pinned
+(`BtrfsVolume::pin_live_root`) and the allocator never hands it out while
+a reader walks from it. Under
 `narf.disks=root-rw` the whole-tree growth/balance path never runs; a full
 space allocates one SINGLE/DUP chunk by path COW instead
 (`write::alloc_chunk`, Linux `btrfs_alloc_chunk`, placed below the device's

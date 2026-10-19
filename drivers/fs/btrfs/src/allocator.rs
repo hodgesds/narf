@@ -195,6 +195,8 @@ impl Allocator {
             // instead of discarding a whole free extent.
             // Superblock copies under a chunk are never allocatable.
             let ranges = subtract_pinned(ranges, &vol.super_stripe_exclusions());
+            // Nor a root a lock-free reader is still walking from.
+            let ranges = subtract_pinned(ranges, &vol.reader_root_ranges());
             let ranges = subtract_pinned(ranges, &vol.pinned_ranges())
                 .into_iter()
                 .filter_map(|(start, len)| {
