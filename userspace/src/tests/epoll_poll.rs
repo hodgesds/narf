@@ -3796,8 +3796,8 @@ impl narf_filesystem::FileOps for AckClearsReadyFile {
         self.0.load(AtomicOrd::Relaxed)
     }
 
-    fn acknowledge_poll_readiness(&self, readiness: u32) {
-        self.0.fetch_and(!readiness, AtomicOrd::Relaxed);
+    fn acknowledge_poll_readiness(&self, readiness: u32) -> u32 {
+        self.0.fetch_and(!readiness, AtomicOrd::Relaxed) & readiness
     }
 }
 
@@ -3886,6 +3886,146 @@ fn smoke_epoll_maxevents_does_not_ack_undisclosed_source() -> TestResult {
 kernel_test_in!(
     "userspace",
     smoke_epoll_maxevents_does_not_ack_undisclosed_source
+);
+
+/// A `/proc/self/mountinfo`-style source: always readable, plus a
+/// PRI|ERR change edge per generation bump that delivery consumes.
+#[derive(Debug)]
+struct ChangeEdgeFile {
+    generation: AtomicU32,
+    seen: AtomicU32,
+}
+
+impl narf_filesystem::FileOps for ChangeEdgeFile {
+    fn read<'a>(&'a self, _off: u64, _buf: &'a mut [u8]) -> narf_filesystem::FsFuture<'a, usize> {
+        alloc::boxed::Box::pin(async move { Ok(0) })
+    }
+
+    fn write<'a>(&'a self, _off: u64, buf: &'a [u8]) -> narf_filesystem::FsFuture<'a, usize> {
+        let len = buf.len();
+        alloc::boxed::Box::pin(async move { Ok(len) })
+    }
+
+    fn stat(&self) -> narf_filesystem::Stat {
+        narf_filesystem::Stat {
+            size: 0,
+            blocks: 0,
+            mode: narf_filesystem::Mode::FILE_RW,
+            mtime_cycles: 0,
+        }
+    }
+
+    fn poll_readiness(&self) -> u32 {
+        let edge = self.generation.load(AtomicOrd::Acquire) != self.seen.load(AtomicOrd::Acquire);
+        narf_filesystem::POLL_IN
+            | if edge {
+                narf_filesystem::POLL_PRI | narf_filesystem::POLL_ERR
+            } else {
+                0
+            }
+    }
+
+    fn acknowledge_poll_readiness(&self, readiness: u32) -> u32 {
+        let edge = narf_filesystem::POLL_PRI | narf_filesystem::POLL_ERR;
+        if readiness & edge == 0 {
+            return 0;
+        }
+        self.seen
+            .store(self.generation.load(AtomicOrd::Acquire), AtomicOrd::Release);
+        edge
+    }
+}
+
+/// libmount watches `/proc/self/mountinfo` with `EPOLLIN | EPOLLET` and
+/// drains it with zero-timeout `epoll_wait`s. Two mount changes in a row
+/// (concurrent mount units) can land with no undelivered scan between them:
+/// the second change must still be a fresh edge. Recording the pre-delivery
+/// mask (PRI|ERR included) made the rising-bit test fail forever after, so
+/// systemd stopped seeing mounts and failed each later mount unit with
+/// "Mount process finished, but there is no mount."
+fn smoke_epoll_epollet_change_edge_survives_back_to_back_changes() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let task = setup_poll_test();
+    let result = (|| {
+        let epfd = call(Syscall::EpollCreate, SyscallArgs::default()).value as u32;
+        let source = Arc::new(ChangeEdgeFile {
+            generation: AtomicU32::new(0),
+            seen: AtomicU32::new(0),
+        });
+        let fd = crate::fd::install(
+            task,
+            crate::fd::FdEntry {
+                ops: source.clone(),
+                offset: 0,
+                flags: 0,
+                status_flags: 0,
+            },
+        )
+        .ok_or("fd table unavailable")?;
+        let mut event = [0u8; 12];
+        let events = crate::epoll::EPOLLIN | crate::epoll::EPOLLET;
+        event[..4].copy_from_slice(&events.to_ne_bytes());
+        event[4..12].copy_from_slice(&0x77u64.to_ne_bytes());
+        if call(
+            Syscall::EpollCtl,
+            SyscallArgs {
+                arg0: epfd as u64,
+                arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+                arg2: fd as u64,
+                arg3: event.as_ptr() as u64,
+                ..SyscallArgs::default()
+            },
+        )
+        .value
+            != 0
+        {
+            return Err("epoll_ctl add of the change-edge source failed");
+        }
+        let wait = || {
+            let mut out = [0u8; 12];
+            call(
+                Syscall::EpollWait,
+                SyscallArgs {
+                    arg0: epfd as u64,
+                    arg1: out.as_mut_ptr() as u64,
+                    arg2: 1,
+                    arg3: 0,
+                    ..SyscallArgs::default()
+                },
+            )
+            .value
+        };
+        // libmount drains the initial EPOLLIN edge after EPOLL_CTL_ADD.
+        while wait() > 0 {}
+        // First change: delivered once.
+        source.generation.fetch_add(1, AtomicOrd::AcqRel);
+        if wait() != 1 {
+            return Err("first mount change was not delivered");
+        }
+        // Second change before any undelivered rescan: a fresh edge.
+        source.generation.fetch_add(1, AtomicOrd::AcqRel);
+        if wait() != 1 {
+            return Err("a back-to-back mount change was lost under EPOLLET");
+        }
+        if wait() != 0 {
+            return Err("a consumed change edge was re-reported");
+        }
+        // And the monitor keeps working afterwards.
+        source.generation.fetch_add(1, AtomicOrd::AcqRel);
+        if wait() != 1 {
+            return Err("a later mount change was lost under EPOLLET");
+        }
+        Ok(())
+    })();
+    crate::syscall::__test_clear_global();
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(msg) => TestResult::Fail(msg),
+    }
+}
+kernel_test_in!(
+    "userspace",
+    smoke_epoll_epollet_change_edge_survives_back_to_back_changes
 );
 
 /// EPOLLET must observe an eventfd drain/refill transition even when no epoll

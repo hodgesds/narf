@@ -728,7 +728,22 @@ impl EpollInstance {
             // passive query for nested epolls and therefore never performs
             // this acknowledgement; otherwise systemd's manager epoll can
             // steal libmount's mountinfo event before libmount drains it.
-            file.acknowledge_poll_readiness(cur_mask);
+            //
+            // The edge bits the acknowledgement retired are no longer part of
+            // the level this item has seen: record the post-delivery mask
+            // (Linux's `mounts_poll` likewise consumes the namespace event as
+            // it reports it). Otherwise a second change landing before any
+            // undelivered rescan finds PRI|ERR already in `last_mask`, the
+            // EPOLLET rising-bit test never fires again, and libmount's
+            // mountinfo monitor (EPOLLIN|EPOLLET) goes deaf for the rest of
+            // the boot — systemd then fails every later mount unit with
+            // "Mount process finished, but there is no mount."
+            let consumed = file.acknowledge_poll_readiness(cur_mask);
+            if consumed != 0 {
+                if let Some(entry) = observed.last_mut() {
+                    entry.1 &= !consumed;
+                }
+            }
             results.push((ready, item.data));
             delivered_fds.push(*fd);
         }
