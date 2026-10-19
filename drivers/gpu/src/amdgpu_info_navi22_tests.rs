@@ -536,3 +536,32 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/navi22",
     navi22_media_hw_ip_and_video_caps_follow_linux
 );
+
+/// amdgpu_kms.c reports xclk * 10, even before queues are advertised.
+fn rdna2_dev_info_reports_vbios_counter_frequency() -> TestResult {
+    for profile in crate::amdgpu_rdna2::PROFILES {
+        let mut s = snap(Published::default());
+        s.did = u32::from(profile.pci_ids[0]);
+        let gc = s
+            .ip_blocks
+            .iter_mut()
+            .find(|b| b.hw_id == HW_ID_GC)
+            .unwrap();
+        (gc.major, gc.minor, gc.revision) = profile.gc_version;
+        for (reference, expected) in [(0, 0), (2500, 25_000), (10_000, 100_000)] {
+            s.reference_clock_10khz = reference;
+            for submission in [Submission::NotWired, Submission::Wired] {
+                let d: uapi::DrmAmdgpuInfoDevice =
+                    decode(&ask(&s, submission, uapi::AMDGPU_INFO_DEV_INFO, [0; 4]).unwrap());
+                if d.gpu_counter_freq != expected {
+                    return TestResult::Fail("RDNA2 timestamp frequency lost or in wrong units");
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_dev_info_reports_vbios_counter_frequency
+);

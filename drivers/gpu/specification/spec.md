@@ -226,7 +226,9 @@ runs (8 on Navi48, `MAX_JOB_IBS`) and 0 for the rest.
 ten (kHz), from `amdgpu_info::reference_clock_10khz(vbios, navi)`:
 smu_info v3/v4 `core_refclk_10khz` (byte 16), replaced on Navi and later by
 gfx_info v3.x/v2.2+ timer reference (byte 40), as
-amdgpu_atomfirmware_get_clock_info; 0 without a VBIOS.
+amdgpu_atomfirmware_get_clock_info; 0 without a VBIOS. This also applies to
+the shared discrete RX 6000 reply on Navi21/22/23/24, independently of
+acceleration opt-in or cold-boot publication.
 `DEV_INFO.vram_type` / `vram_bit_width` are `Snapshot::{vram_type,
 vram_bit_width}`, from `amdgpu_info::umc_vram(vbios)` on discrete Navi4
 parts only (amdgpu_gmc_get_vram_info's GC 12.0.x arm): umc_info (master

@@ -25,7 +25,9 @@
 //! the DRM version minor and whether `amdgpu_navi22_cs` registers the card's
 //! submitter.
 //!
-//! LINUX-GAP: `gpu_counter_freq` (VBIOS gfx_info refclk), `vram_type` /
+//! `gpu_counter_freq` uses the VBIOS reference clock sampled at probe.
+//!
+//! LINUX-GAP: `vram_type` /
 //! `vram_bit_width` (VBIOS vram_info), memory clocks (SMU UCLK range),
 //! `pcie_gen` / `pcie_num_lanes`, and `mall_size` (discovery MALL table) are
 //! zero; Mesa uses them for heuristics only on GFX10.3. Pinned-VRAM
@@ -328,6 +330,7 @@ fn dev_info(snap: &Snapshot, submission: Submission) -> Result<Vec<u8>, FsError>
         num_shader_arrays_per_engine: table.num_sa_per_se,
         max_engine_clock: max_sclk,
         min_engine_clock: min_sclk,
+        gpu_counter_freq: snap.reference_clock_10khz.saturating_mul(10),
         cu_active_number: topology.map_or(0, |t| t.active_cus),
         cu_ao_mask: topology.map_or(0, |t| t.ao_cu_mask),
         cu_bitmap: topology.map_or([[0; 4]; 4], |t| t.cu_bitmap),
