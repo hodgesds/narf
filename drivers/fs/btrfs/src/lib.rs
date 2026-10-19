@@ -24,6 +24,7 @@ use narf_block::{BlockDeviceSync, SyncBlock};
 use narf_filesystem::{FsError, FsInstance};
 
 pub mod allocator;
+pub(crate) mod backref;
 pub(crate) mod block_group;
 pub mod btree;
 pub mod checksum;
@@ -34,6 +35,7 @@ pub mod decompress_cache;
 pub mod dir;
 pub mod extent;
 pub mod format;
+pub mod harness;
 pub mod inode;
 pub mod interop;
 pub mod lzo;

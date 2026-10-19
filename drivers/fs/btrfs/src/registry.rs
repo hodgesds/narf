@@ -87,6 +87,25 @@ pub async fn mount(
     subvol: Option<Subvol>,
     read_only: bool,
 ) -> Result<Arc<BtrfsVolume<SyncBlock>>, FsError> {
+    let what = alloc::format!("{subvol:?}");
+    let result = mount_inner(source, devices, subvol, read_only).await;
+    if let Err(error) = &result {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "btrfs: mount ({what}, {}) failed: {error:?}",
+            if read_only { "ro" } else { "rw" }
+        );
+    }
+    result
+}
+
+async fn mount_inner(
+    source: &Arc<dyn BlockDeviceSync>,
+    devices: Vec<Arc<SyncBlock>>,
+    subvol: Option<Subvol>,
+    read_only: bool,
+) -> Result<Arc<BtrfsVolume<SyncBlock>>, FsError> {
     let _serial = MOUNT_LOCK.lock().await;
     if let Some((fsid, devid)) = peek_identity(&**source) {
         if let Some(core) = lookup(&fsid) {

@@ -485,7 +485,11 @@ async fn truncate_once<B: BlockDevice + 'static>(
                 }
             }
         }
-        let mut carved = carve(&items, cut, u64::MAX, root, ino, |_| true)?;
+        // The inline item was handled above; `carve` refuses inline items
+        // (a Linux-written small file is one), so keep it out.
+        let mut carved = carve(&items, cut, u64::MAX, root, ino, |item| {
+            item.kind != Kind::Inline
+        })?;
         carved.removed_nbytes += inline_removed;
         if new_size == old_size && carved.edits.is_empty() && extra.is_empty() {
             return Ok(());

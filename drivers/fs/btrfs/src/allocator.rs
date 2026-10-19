@@ -195,6 +195,8 @@ impl Allocator {
             // instead of discarding a whole free extent.
             // Superblock copies under a chunk are never allocatable.
             let ranges = subtract_pinned(ranges, &vol.super_stripe_exclusions());
+            // Nor a root a lock-free reader is still walking from.
+            let ranges = subtract_pinned(ranges, &vol.reader_root_ranges());
             let ranges = subtract_pinned(ranges, &vol.pinned_ranges())
                 .into_iter()
                 .filter_map(|(start, len)| {
@@ -215,6 +217,45 @@ impl Allocator {
             next: hw,
             excluded: vol.super_stripe_exclusions(),
         })
+    }
+
+    /// An allocator over the SYSTEM block groups only, for the chunk tree's
+    /// own blocks (which must stay reachable through `sys_chunk_array`).
+    /// Requires a free-space tree.
+    pub async fn build_system<B: BlockDevice + 'static>(
+        vol: &BtrfsVolume<B>,
+    ) -> Result<Self, FsError> {
+        let (root_tree, _) = vol.root_tree_root();
+        let ext = roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
+            .await?
+            .0;
+        let (fst_root, _) =
+            roots::find_root(vol, root_tree, format::FREE_SPACE_TREE_OBJECTID).await?;
+        let bg_tree = block_group::bg_home(vol, root_tree).await?.scan_root(ext);
+        let groups = read_block_group_types(vol, bg_tree).await?;
+        let mut ranges: Vec<(u64, u64)> = read_free_extents(vol, fst_root).await?;
+        ranges.sort_unstable();
+        let ranges = subtract_pinned(ranges, &vol.super_stripe_exclusions());
+        let ranges = subtract_pinned(ranges, &vol.pinned_ranges())
+            .into_iter()
+            .filter_map(|(start, len)| {
+                groups
+                    .iter()
+                    .find(|&&(s, l, _)| start >= s && start < s.saturating_add(l))
+                    .map(|&(_, _, flags)| (start, len, flags))
+            })
+            .filter(|&(_, _, flags)| flags & format::BLOCK_GROUP_SYSTEM != 0)
+            .collect();
+        Ok(Allocator::Reclaim { ranges })
+    }
+
+    /// Allocate one chunk-tree node from a SYSTEM group ([`Self::build_system`]).
+    pub fn alloc_system_node<B: BlockDevice + 'static>(
+        &mut self,
+        vol: &BtrfsVolume<B>,
+    ) -> Result<u64, FsError> {
+        let n = vol.nodesize() as u64;
+        self.alloc(vol, n, n, format::BLOCK_GROUP_SYSTEM)
     }
 
     /// Allocate `len` bytes aligned to `align` from a block group whose flags
@@ -295,6 +336,20 @@ impl Allocator {
     ) -> Result<u64, FsError> {
         let s = u64::from(vol.sectorsize());
         self.alloc(vol, len, s, format::BLOCK_GROUP_DATA)
+    }
+
+    /// Bytes still free in block groups of `kind`; `u64::MAX` for the bump
+    /// allocator, which does not know (it is never used under `root-rw`,
+    /// which requires a free-space tree).
+    pub fn free_bytes(&self, kind: u64) -> u64 {
+        match self {
+            Allocator::Reclaim { ranges } => ranges
+                .iter()
+                .filter(|&&(_, _, flags)| flags & kind != 0)
+                .map(|&(_, len, _)| len)
+                .sum(),
+            Allocator::Bump { .. } => u64::MAX,
+        }
     }
 
     /// Snapshot the allocator's free state so the commit's metadata fixed point

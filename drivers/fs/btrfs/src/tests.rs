@@ -17,6 +17,9 @@ use crate::chunk::ChunkMap;
 use crate::format::{self, BtrfsKey, Superblock};
 use crate::volume::BtrfsVolume;
 
+mod safety;
+mod snapshots;
+
 // ── Shared test harness ────────────────────────────────────────────
 
 /// Primary fixture in the compact `NARFBTR1` sparse encoding produced by
@@ -10518,9 +10521,10 @@ kernel_test_in!(
     smoke_btrfs_read_only_device_mount_never_writes
 );
 
-/// A pending fsync log tree is never replayed onto a read-only device: the
-/// mount is refused (Linux's `ro` would replay; NARF must not write), and the
-/// log is still there for a later writable mount.
+/// A pending fsync log tree is never replayed onto a read-only device. The
+/// mount succeeds without replay (Linux `nologreplay`): the committed state is
+/// read, nothing is written, the log is still there, writes are refused, and
+/// a later writable mount replays it.
 fn smoke_btrfs_read_only_device_refuses_log_replay() -> TestResult {
     use narf_filesystem::FsInstance;
     let device = writable_sparse(FIXTURE_FST_SPARSE);
@@ -10541,7 +10545,9 @@ fn smoke_btrfs_read_only_device_refuses_log_replay() -> TestResult {
         Some(Ok(Some(b))) => b,
         _ => return TestResult::Fail("could not read inode item"),
     };
+    let committed = body.clone();
     body[136..144].copy_from_slice(&0x0055_6677u64.to_le_bytes());
+    let logged = body.clone();
     if !matches!(
         poll_once(crate::write::write_log(&vol, &[(key, body)])),
         Some(Ok(()))
@@ -10554,19 +10560,41 @@ fn smoke_btrfs_read_only_device_refuses_log_replay() -> TestResult {
         return TestResult::Fail("super.log_root not set after write_log");
     }
     let before = device.overlay.lock().clone();
-    if !matches!(
-        mount_through_boot_only_guard(&device),
-        Err(FsError::Unsupported)
-    ) {
-        return TestResult::Fail("read-only mount with a pending log was not refused");
+    let ro = match mount_through_boot_only_guard(&device) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("read-only mount with a pending log failed"),
+    };
+    if !ro.is_read_only() {
+        return TestResult::Fail("mount with an unreplayed log is not read-only");
     }
+    let (ro_root, _) = ro.fs_tree_root();
+    match poll_once(btree::find_item(&ro, ro_root, &key)) {
+        Some(Ok(Some(b))) if b == committed => {}
+        Some(Ok(Some(_))) => return TestResult::Fail("read-only mount replayed the log"),
+        _ => return TestResult::Fail("logged inode unreadable read-only"),
+    }
+    if !matches!(
+        poll_once(ro.root().create("new.txt")),
+        Some(Err(FsError::ReadOnly))
+    ) {
+        return TestResult::Fail("create allowed with an unreplayed log");
+    }
+    drop(ro);
     if *device.overlay.lock() != before {
-        return TestResult::Fail("refused read-only mount wrote to the device");
+        return TestResult::Fail("read-only mount with a pending log wrote to the device");
     }
     if format::le64(&read_super_at(&device, format::SUPERBLOCK_OFFSET), 96).unwrap_or(0) == 0 {
-        return TestResult::Fail("log pointer lost on a refused read-only mount");
+        return TestResult::Fail("log pointer lost on a read-only mount");
     }
-    TestResult::Pass
+    let rw = match mount_writable(device.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("writable mount after the ro one failed"),
+    };
+    let (rw_root, _) = rw.fs_tree_root();
+    match poll_once(btree::find_item(&rw, rw_root, &key)) {
+        Some(Ok(Some(b))) if b[136..144] == logged[136..144] => TestResult::Pass,
+        _ => TestResult::Fail("writable mount did not replay the log"),
+    }
 }
 kernel_test_in!(
     "drivers/fs/btrfs",
