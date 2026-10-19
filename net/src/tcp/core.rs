@@ -4295,6 +4295,15 @@ fn handle_ack(
     // Preserve that ordering: an out-of-range ACK must not gain authority
     // over SND.WND simply because it carries a fresh segment sequence.
     let ack_in_range = seq_geq(ack, t.snd_una) && seq_leq(ack, snd_max);
+    // `tcp_ack`: any acceptable ACK — the bare one answering a keepalive
+    // probe included — clears `icsk_probes_out` and stamps `rcv_tstamp`, the
+    // idle clock `tcp_keepalive_timer` measures. Counting only ACKs that
+    // advanced SND.UNA killed every idle connection after `keepcnt` probes
+    // however promptly the peer answered them.
+    if ack_in_range {
+        t.keepalive_probes_sent = 0;
+        t.last_progress_cycles = narf_scheduler::narf_time::now_cycles();
+    }
     // Window update.  Follow Linux `tcp_may_update_window`: a newly
     // cumulative ACK is authoritative even if reverse-direction data made
     // SEG.SEQ older than SND.WL1; with the same SEG.SEQ, only a larger window

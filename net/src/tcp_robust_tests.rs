@@ -351,6 +351,84 @@ fn smoke_time_wait_old_syn_ignored() -> TestResult {
 }
 kernel_test_in!("net/tcp/robust", smoke_time_wait_old_syn_ignored);
 
+// ── Keepalive ───────────────────────────────────────────────────────────
+
+/// Arm keepalive (1 s idle / 1 s interval / 3 probes) on `id` and make it
+/// look idle for the full window, so the next tick is due.
+fn keepalive_idle(id: u32) {
+    let _ = __with_tcb_mut(id, |t| {
+        t.keepalive_enabled = true;
+        t.keepalive_idle_ns = 1_000_000_000;
+        t.keepalive_intvl_ns = 1_000_000_000;
+        t.keepalive_cnt = 3;
+        let window = narf_scheduler::narf_time::ns_to_cycles(10_000_000_000);
+        t.last_progress_cycles = narf_scheduler::narf_time::now_cycles().saturating_sub(window);
+    });
+}
+
+fn tick(id: u32) {
+    if let Some(arc) = lookup_tcb(id) {
+        tick_retransmit(&arc);
+    }
+}
+
+/// A keepalive probe the peer answers keeps the connection alive: the bare
+/// ACK at SND.UNA clears the probe count and restarts the idle clock (Linux
+/// `tcp_ack`: `icsk_probes_out = 0`, `rcv_tstamp`). Only ACKs that advanced
+/// SND.UNA used to count, so an idle connection died after `keepcnt`
+/// answered probes. Unanswered, it still dies with ETIMEDOUT.
+fn smoke_keepalive_answered_probe_keeps_connection() -> TestResult {
+    let local = [10, 0, 98, 1];
+    let peer = reset("tcp-rob-ka", local);
+    let id = established(local, 40_200, peer, 80);
+    let (snd_una, rcv_nxt) = __with_tcb(id, |t| (t.snd_una, t.rcv_nxt)).unwrap_or((0, 0));
+    for _ in 0..6 {
+        keepalive_idle(id);
+        let _ = drain();
+        tick(id);
+        if drain().is_empty() {
+            return TestResult::Fail("an idle connection sent no keepalive probe");
+        }
+        inject(Seg {
+            src: peer,
+            dst: local,
+            sport: 80,
+            dport: 40_200,
+            seq: rcv_nxt,
+            ack: snd_una,
+            flags: FLAG_ACK,
+            window: 65535,
+            options: Vec::new(),
+            payload: &[],
+        });
+        if __with_tcb(id, |t| t.keepalive_probes_sent) != Some(0) {
+            return TestResult::Fail(
+                "the answer to a keepalive probe did not reset the probe count",
+            );
+        }
+    }
+    // Unanswered: three probes, then the connection is dropped.
+    for _ in 0..4 {
+        let _ = __with_tcb_mut(id, |t| {
+            let window = narf_scheduler::narf_time::ns_to_cycles(10_000_000_000);
+            t.last_progress_cycles = narf_scheduler::narf_time::now_cycles().saturating_sub(window);
+        });
+        tick(id);
+    }
+    if lookup_tcb(id).is_some() {
+        return TestResult::Fail("unanswered keepalive probes never dropped the connection");
+    }
+    if recv_errno(id, &mut [0u8; 4]) != Err(narf_lib::errno::ETIMEDOUT as i32) {
+        return TestResult::Fail("a keepalive timeout must report ETIMEDOUT");
+    }
+    core::release(id);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_keepalive_answered_probe_keeps_connection
+);
+
 // ── Resets (RFC 5961) ───────────────────────────────────────────────────
 
 /// Fill the receive buffer so the advertised window is 0.
