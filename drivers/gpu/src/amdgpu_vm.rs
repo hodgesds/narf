@@ -661,6 +661,44 @@ pub(crate) async fn relocate(
             narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant()).await;
         }
     }
+    // Above-BAR sources and NO_CPU_ACCESS System sources have no CPU
+    // mappings. Copy with GPU leases intact; cancellation preserves all PTEs.
+    let mut leases: Vec<_> = bindings
+        .iter()
+        .map(|(_, _, entry)| alloc::sync::Arc::as_ptr(entry) as usize)
+        .collect();
+    leases.sort_unstable();
+    leases.dedup();
+    let staged = if !to_vram {
+        let source = object.placement();
+        if source.hidden_address().is_some() {
+            object.check_transfer_source(&source, leases.len())?;
+            if !object.allows_system() {
+                return Err(FsError::Busy);
+            }
+            let mut destination = crate::amdgpu_gem::GemPlacement::new_system(object.byte_len)?;
+            crate::amdgpu_gem::readback(gate, object, &source, &mut destination).await?;
+            Some((source, alloc::sync::Arc::new(destination)))
+        } else {
+            None
+        }
+    } else {
+        let source = object.placement();
+        if source.system {
+            match crate::amdgpu_gem::hidden_destination(card, object) {
+                Ok(destination) => {
+                    object.check_transfer_source(&source, leases.len())?;
+                    let destination = alloc::sync::Arc::new(destination);
+                    crate::amdgpu_gem::upload(gate, object, &source, &destination).await?;
+                    Some((source, destination))
+                }
+                Err(FsError::Unsupported | FsError::NoSpace) => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        }
+    };
     // No await after this point. The gate keeps all registered PTE users
     // idle; another CPU acquiring a CPU lease makes relocate refuse Busy.
     let rebind = Rebind {
@@ -671,8 +709,12 @@ pub(crate) async fn relocate(
         entry.placement.lock().take();
         vm.tlb_seq.fetch_add(1, Ordering::AcqRel);
     }
-    let result = object.relocate(to_vram);
+    let result = match staged.as_ref() {
+        Some((source, destination)) => object.commit_transfer(source, destination.clone()),
+        None => object.relocate(to_vram),
+    };
     drop(rebind);
+    drop(staged);
     result
 }
 
@@ -780,7 +822,34 @@ impl VmInner {
     /// The kernel fences a job here must still wait for, forgetting those
     /// that have signalled.
     pub fn kernel_fences(&self) -> Vec<alloc::sync::Arc<dyn narf_filesystem::DrmFence>> {
-        let held = self.kernel_fences.lock().clone();
+        let mut held = self.kernel_fences.lock().clone();
+        // Move fences can be attached after GEM_VA established a mapping.
+        // Snapshot BO identities first; never query driver fences under the
+        // mappings lock, since progress can retire resources from this VM.
+        let mut objects: Vec<_> = self
+            .mappings
+            .lock()
+            .as_ref()
+            .into_iter()
+            .flat_map(|mappings| mappings.values())
+            .filter_map(|entry| entry.object.as_ref().map(|object| object.object.clone()))
+            .collect();
+        objects.sort_unstable_by_key(|object| alloc::sync::Arc::as_ptr(object) as usize);
+        objects.dedup_by(|a, b| alloc::sync::Arc::ptr_eq(a, b));
+        for object in objects {
+            for fence in object
+                .dma_buf()
+                .resv
+                .fences(narf_filesystem::dma_buf::DmaResvUsage::Kernel)
+            {
+                if !held
+                    .iter()
+                    .any(|other| alloc::sync::Arc::ptr_eq(other, &fence))
+                {
+                    held.push(fence);
+                }
+            }
+        }
         // Sampled unlocked: a driver fence may take its device's locks.
         let (done, pending): (Vec<_>, Vec<_>) = held.into_iter().partition(|f| f.is_signalled());
         if !done.is_empty() {

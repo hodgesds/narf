@@ -94,6 +94,97 @@ pub struct VramHeap {
 pub struct UnmappedHeap {
     pub pool: crate::amdgpu_vram::UnmappedPool,
     pub clear: Arc<dyn VramClear>,
+    pub transfer: Option<Arc<dyn VramTransfer>>,
+}
+
+/// Copy an idle allocation between invisible VRAM and private System backing.
+/// Success means every byte has landed. The caller retains card admission and
+/// all source mappings until the copy finishes. Queued work must independently
+/// retain its allocations and attach a KERNEL fence to `object` before yielding;
+/// cancellation cannot release memory or permit writers still reached by DMA.
+pub trait VramTransfer: Send + Sync + core::fmt::Debug {
+    fn read<'a>(
+        &'a self,
+        object: Arc<GemObject>,
+        source: Arc<GemPlacement>,
+        destination: &'a mut GemPlacement,
+    ) -> core::pin::Pin<
+        alloc::boxed::Box<dyn core::future::Future<Output = Result<(), FsError>> + Send + 'a>,
+    >;
+    fn write<'a>(
+        &'a self,
+        _object: Arc<GemObject>,
+        _source: Arc<GemPlacement>,
+        _destination: Arc<GemPlacement>,
+    ) -> core::pin::Pin<
+        alloc::boxed::Box<dyn core::future::Future<Output = Result<(), FsError>> + Send + 'a>,
+    > {
+        alloc::boxed::Box::pin(async { Err(FsError::Unsupported) })
+    }
+}
+
+pub(crate) async fn readback(
+    gate: &PlacementGuard,
+    object: &Arc<GemObject>,
+    source: &Arc<GemPlacement>,
+    destination: &mut GemPlacement,
+) -> Result<(), FsError> {
+    let reader = vram_heap(gate.card())
+        .and_then(|heap| heap.unmapped)
+        .and_then(|heap| heap.transfer)
+        .ok_or(FsError::Unsupported)?;
+    reader
+        .read(object.clone(), source.clone(), destination)
+        .await
+}
+
+pub(crate) async fn upload(
+    gate: &PlacementGuard,
+    object: &Arc<GemObject>,
+    source: &Arc<GemPlacement>,
+    destination: &Arc<GemPlacement>,
+) -> Result<(), FsError> {
+    let writer = vram_heap(gate.card())
+        .and_then(|heap| heap.unmapped)
+        .and_then(|heap| heap.transfer)
+        .ok_or(FsError::Unsupported)?;
+    writer
+        .write(object.clone(), source.clone(), destination.clone())
+        .await
+}
+
+pub(crate) fn hidden_destination(card: u32, object: &GemObject) -> Result<GemPlacement, FsError> {
+    if object.flags & u64::from(uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS) == 0 {
+        return Err(FsError::Unsupported);
+    }
+    let heap = vram_heap(card).ok_or(FsError::NoDevice)?;
+    let hidden = heap.unmapped.ok_or(FsError::Unsupported)?;
+    if hidden.transfer.is_none() {
+        return Err(FsError::Unsupported);
+    }
+    let align = object
+        .alignment
+        .max(PAGE_SIZE)
+        .checked_next_power_of_two()
+        .ok_or(FsError::InvalidData)?;
+    let held = hidden
+        .pool
+        .reserve_aligned(object.byte_len, align)
+        .map_err(|_| FsError::NoSpace)?;
+    let gpu = held
+        .address()
+        .checked_sub(heap.fb_base)
+        .and_then(|a| a.checked_add(heap.fb_offset))
+        .ok_or(FsError::InvalidData)?;
+    crate::amdgpu_vm::make_pte(gpu, 0)?;
+    crate::amdgpu_vm::make_pte(gpu + object.byte_len - PAGE_SIZE, 0)?;
+    Ok(GemPlacement {
+        phys: 0,
+        gpu,
+        system: false,
+        byte_len: object.byte_len,
+        backing: Backing::Unmapped { _held: held },
+    })
 }
 
 /// Clears VRAM the CPU cannot reach.
@@ -296,6 +387,64 @@ struct Metadata {
 }
 
 impl GemObject {
+    /// Refuse CPU/deferred/unregistered leases before asynchronous copying,
+    /// not only at commit: a deferred CPU writer could race staging reads.
+    pub(crate) fn check_transfer_source(
+        &self,
+        source: &Arc<GemPlacement>,
+        gpu_leases: usize,
+    ) -> Result<(), FsError> {
+        let placement = self.placement.lock();
+        if !Arc::ptr_eq(&placement, source)
+            || Arc::strong_count(&placement) != gpu_leases.saturating_add(2)
+            || Arc::weak_count(&placement) != 0
+        {
+            return Err(FsError::Busy);
+        }
+        Ok(())
+    }
+    pub(crate) fn allows_system(&self) -> bool {
+        self.allowed_domains.load(Ordering::Acquire)
+            & u64::from(uapi::AMDGPU_GEM_DOMAIN_CPU | uapi::AMDGPU_GEM_DOMAIN_GTT)
+            != 0
+    }
+    pub(crate) fn commit_transfer(
+        &self,
+        source: &Arc<GemPlacement>,
+        destination: Arc<GemPlacement>,
+    ) -> Result<(), FsError> {
+        let mut placement = self.placement.lock();
+        let allowed = if destination.system {
+            self.allows_system()
+        } else {
+            self.allowed_domains.load(Ordering::Acquire) & u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM)
+                != 0
+        };
+        if !allowed
+            || !Arc::ptr_eq(&placement, source)
+            || Arc::strong_count(&placement) != 2
+            || Arc::weak_count(&placement) != 0
+        {
+            return Err(FsError::Busy);
+        }
+        let readback = source.hidden_address().is_some() && destination.system;
+        let upload = source.system
+            && destination.hidden_address().is_some()
+            && self.flags & u64::from(uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0;
+        if (!readback && !upload) || destination.byte_len != self.byte_len {
+            return Err(FsError::InvalidData);
+        }
+        if !self
+            .dma_buf
+            .resv
+            .fences(narf_filesystem::dma_buf::DmaResvUsage::Bookkeep)
+            .is_empty()
+        {
+            return Err(FsError::Busy);
+        }
+        *placement = destination;
+        Ok(())
+    }
     pub fn preferred_domains(&self) -> u64 {
         self.preferred_domains.load(Ordering::Acquire)
     }
@@ -373,6 +522,103 @@ impl GemObject {
 }
 
 impl GemPlacement {
+    pub(crate) fn hidden_address(&self) -> Option<u64> {
+        match &self.backing {
+            Backing::Unmapped { _held } => Some(_held.address()),
+            _ => None,
+        }
+    }
+    pub(crate) fn new_system(byte_len: u64) -> Result<Self, FsError> {
+        if byte_len == 0 || byte_len % PAGE_SIZE != 0 {
+            return Err(FsError::InvalidData);
+        }
+        let chunks = alloc_system(byte_len / PAGE_SIZE)?;
+        let phys = chunks[0].0;
+        let placement = Self {
+            phys,
+            gpu: phys,
+            system: true,
+            byte_len,
+            backing: Backing::System(chunks),
+        };
+        if let Backing::System(chunks) = &placement.backing {
+            for &(at, order) in chunks {
+                crate::amdgpu_vm::make_pte(at + (PAGE_SIZE << order) - PAGE_SIZE, 0)?;
+            }
+        }
+        Ok(placement)
+    }
+    /// # Safety
+    /// `source` names `bytes` CPU-readable bytes in a live, exclusively held
+    /// staging allocation. This newly allocated System backing is private.
+    pub(crate) unsafe fn read_staging(
+        &mut self,
+        offset: u64,
+        source: *const u8,
+        bytes: usize,
+    ) -> Result<(), FsError> {
+        if !matches!(self.backing, Backing::System(_))
+            || offset
+                .checked_add(bytes as u64)
+                .is_none_or(|end| end > self.byte_len)
+        {
+            return Err(FsError::InvalidData);
+        }
+        let mut copied = 0;
+        while copied < bytes {
+            let (phys, run) = self
+                .locate(offset + copied as u64)
+                .ok_or(FsError::InvalidData)?;
+            let count = (run as usize).min(bytes - copied);
+            // SAFETY: caller retains and bounds the source; locate bounds
+            // each disjoint destination inside this private buddy backing.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    source.add(copied),
+                    narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>(),
+                    count,
+                );
+            }
+            copied += count;
+        }
+        Ok(())
+    }
+    /// # Safety
+    /// The caller excludes CPU/GPU writers of this System source and owns
+    /// `bytes` writable destination bytes in a private staging allocation.
+    pub(crate) unsafe fn write_staging(
+        &self,
+        offset: u64,
+        destination: *mut u8,
+        bytes: usize,
+    ) -> Result<(), FsError> {
+        if !matches!(self.backing, Backing::System(_))
+            || offset
+                .checked_add(bytes as u64)
+                .is_none_or(|end| end > self.byte_len)
+        {
+            return Err(FsError::InvalidData);
+        }
+        let mut copied = 0;
+        while copied < bytes {
+            let (phys, run) = self
+                .locate(offset + copied as u64)
+                .ok_or(FsError::InvalidData)?;
+            let count = (run as usize).min(bytes - copied);
+            // SAFETY: source ranges are retained buddy chunks and locate
+            // bounds them; the caller bounds and exclusively owns staging.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>(),
+                    destination.add(copied),
+                    count,
+                );
+            }
+            copied += count;
+        }
+        core::sync::atomic::fence(Ordering::SeqCst);
+        Ok(())
+    }
     /// Copy a uniquely leased backing; publish only after the copy succeeds.
     fn relocate(
         &mut self,
@@ -690,11 +936,20 @@ pub async fn dispatch_async(
     for table in tables {
         let objects: Vec<_> = table.lock().values().cloned().collect();
         for object in objects {
-            if object.system() || !object.cpu_visible() {
+            if object.system() {
                 continue;
             }
             let _ = crate::amdgpu_vm::relocate(&gate, &object, false).await;
-            if heap.pool.reserve_aligned(size, align).is_ok() {
+            let no_cpu = u64::from_le_bytes(bytes[24..32].try_into().unwrap())
+                & u64::from(uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS)
+                != 0;
+            if heap.pool.reserve_aligned(size, align).is_ok()
+                || (no_cpu
+                    && heap
+                        .unmapped
+                        .as_ref()
+                        .is_some_and(|u| u.pool.reserve_aligned(size, align).is_ok()))
+            {
                 return Some(create(state, arg));
             }
         }
@@ -827,6 +1082,9 @@ impl GemState {
     /// Linux's VMA holds its GEM object.
     pub fn mapping_object(&self, offset: u64, len: usize) -> Option<Arc<GemMapping>> {
         let handle = u32::try_from(offset >> 12).ok()?;
+        if self.get(handle)?.flags & u64::from(uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0 {
+            return None;
+        }
         self.validated(handle)
             .filter(|o| len as u64 <= o.byte_len)
             .map(|o| o.mapping())
@@ -840,6 +1098,9 @@ impl GemState {
     pub fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
         let handle = u32::try_from(offset >> 12).map_err(|_| FsError::InvalidData)?;
         let object = self.get(handle).ok_or(FsError::InvalidData)?;
+        if object.flags & u64::from(uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0 {
+            return Err(FsError::OperationNotPermitted);
+        }
         if len as u64 > object.byte_len {
             return Err(FsError::InvalidData);
         }

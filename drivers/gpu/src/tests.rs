@@ -11382,6 +11382,7 @@ fn smoke_amdgpu_gem_places_hidden_buffers_past_the_bar() -> TestResult {
             fb_base,
             fb_offset: 0x1_0000_0000,
             unmapped: Some(UnmappedHeap {
+                transfer: None,
                 pool: unmapped.clone(),
                 clear: engine.clone(),
             }),

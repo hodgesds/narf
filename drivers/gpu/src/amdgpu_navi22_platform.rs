@@ -198,6 +198,9 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
         }
         // SAFETY: the immutable inventory covers every inherited client, and
         // successful preparation excludes every later legacy MMIO accessor.
+        let unmapped = unsafe { plan.unmapped_pool() }.map_err(Error::Memory)?;
+        // SAFETY: same complete inventory/exclusive ownership; the visible
+        // prefix is disjoint from the above-BAR pool just retained.
         let pool = unsafe { plan.into_pool() }.map_err(Error::Memory)?;
         // Constructors allocate host state/reservations only. The framebuffer
         // handoff has already stopped CPU writers before entering prepare().
@@ -216,6 +219,7 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
             }
         }
         .map_err(Error::Firmware)?;
+        prepared.set_unmapped(unmapped);
         // Linux resets every posted discrete Navi before loading firmware.
         // SAFETY: probe's PCI function for this GPU; its config space is
         // claimed along with the exclusive MMIO ownership transferred below.

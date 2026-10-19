@@ -396,6 +396,8 @@ pub async fn register(boot: &mut crate::amdgpu_navi22_boot::ColdBoot) {
     let Some(reader) = boot.client_fence_reader() else {
         return;
     };
+    let hidden_ready =
+        boot.unmapped_pool().is_some() && crate::amdgpu_rdna2_vram::publish(card, boot).is_ok();
     let lent = match boot.reserve_client_vmids() {
         Ok(lent) => lent,
         Err(error) => {
@@ -422,7 +424,16 @@ pub async fn register(boot: &mut crate::amdgpu_navi22_boot::ColdBoot) {
                 }
             }
         }
-        if let Some((chunk, heap)) = client.as_ref() {
+        if let Some((chunk, heap)) = client.as_mut() {
+            if hidden_ready && heap.unmapped.is_none() {
+                heap.unmapped = boot
+                    .unmapped_pool()
+                    .map(|pool| crate::amdgpu_gem::UnmappedHeap {
+                        pool,
+                        clear: crate::amdgpu_rdna2_vram::clearer(),
+                        transfer: Some(crate::amdgpu_rdna2_vram::reader(card)),
+                    });
+            }
             crate::amdgpu_gem::register_vram_heap(card, heap.clone());
             let _ = writeln!(
                 narf_console::Writer,
@@ -445,12 +456,16 @@ pub async fn register(boot: &mut crate::amdgpu_navi22_boot::ColdBoot) {
             admission: [const { crate::amdgpu_admission::Queue::new() }; RING_IDS],
         }),
     );
+    // A recovery also replays the still-unsignalled front clear. The queue's
+    // pulse closes the race with a drain noticing the old fence generation.
+    crate::amdgpu_rdna2_vram::engine().kick();
 }
 
 /// Stop accepting client work (recovery is about to rebuild the owner). The
 /// lent VMIDs belonged to the old memory owner and are dropped with it; the
 /// next `register` starts a fresh manager (every VMID flushes again).
 pub fn unregister() {
+    crate::amdgpu_rdna2_vram::suspend();
     if let Some(card) = drm_card() {
         crate::amdgpu_cs::unregister_submitter(card);
         crate::amdgpu_gem::unregister_vram_heap(card);

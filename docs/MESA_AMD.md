@@ -326,7 +326,12 @@ applies listed buffers' placement preferences when possible. Cancellation
 while waiting leaves mappings unchanged.
 CPU mappings and deferred CPU user-fence writes retain address leases; shared
 handles, exported fds and BO lists retain identity without pinning placement.
-CPU mapping revocation and invisible-VRAM migration remain unimplemented.
+RX6000 invisible VRAM now supports ordered SDMA clearing, eviction to GTT and
+NO_CPU_ACCESS promotion back through a reserved BAR staging window. Transfers
+retain their allocations across cancellation and replay after recovery; only
+real completion permits reuse or user access. Failed copies preserve existing
+PTEs and backing. NO_CPU_ACCESS remains enforced for GEM/PRIME CPU mmap even
+after moving to GTT. CPU mapping revocation remains unimplemented.
 
 ## Open items
 

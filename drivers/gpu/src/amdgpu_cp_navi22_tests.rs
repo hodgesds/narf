@@ -373,6 +373,29 @@ impl Model {
             let h = words[i];
             i += match h & 0xff {
                 0 => 1 + ((h >> 16) & 0x3fff) as usize,
+                1 => {
+                    assert_eq!(h, 1, "SDMA5 COPY_LINEAR header");
+                    let count = u64::from(words[i + 1]) + 1;
+                    assert_eq!(count % 4, 0);
+                    assert_eq!(words[i + 2], 0);
+                    let from = u64::from(words[i + 3]) | (u64::from(words[i + 4]) << 32);
+                    let to = u64::from(words[i + 5]) | (u64::from(words[i + 6]) << 32);
+                    for offset in (0..count).step_by(4) {
+                        let value = self.word(self.gpu(vmid, from + offset));
+                        self.put(self.gpu(vmid, to + offset), value);
+                    }
+                    7
+                }
+                11 => {
+                    assert_eq!(h, 11, "SDMA5 CONST_FILL header");
+                    let at = u64::from(words[i + 1]) | (u64::from(words[i + 2]) << 32);
+                    let bytes = u64::from(words[i + 4]) + 1;
+                    assert_eq!(bytes % 4, 0);
+                    for offset in (0..bytes).step_by(4) {
+                        self.put(self.gpu(vmid, at + offset), words[i + 3]);
+                    }
+                    5
+                }
                 2 => {
                     assert_eq!(h, 2);
                     let count = words[i + 3] as usize + 1;

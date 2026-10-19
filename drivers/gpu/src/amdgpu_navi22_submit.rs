@@ -100,6 +100,95 @@ pub struct Ib {
     pub dwords: u32,
 }
 
+/// Owned framebuffer-aperture ranges, addressed through kernel VMID0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelOp {
+    Fill { dst: u64, bytes: u64, value: u32 },
+    Copy { src: u64, dst: u64, bytes: u64 },
+}
+/// sdma_v5_2_buffer_funcs: both packet byte counts support 1 GiB.
+pub const MAX_PACKET_BYTES: u64 = 1 << 30;
+/// Keep kernel frames below the existing two-outstanding-frames ring budget.
+const KERNEL_DWORDS: usize = 128;
+
+fn kernel_words(ops: &[KernelOp], address: u64, seq: u32) -> Result<Vec<u32>, Error> {
+    if ops.is_empty() {
+        return Err(Error::Invalid);
+    }
+    let mut words = Vec::new();
+    for &op in ops {
+        let (src, dst, bytes, value) = match op {
+            KernelOp::Fill { dst, bytes, value } => (None, dst, bytes, value),
+            KernelOp::Copy { src, dst, bytes } => (Some(src), dst, bytes, 0),
+        };
+        let valid = |at: u64| at.checked_add(bytes).is_some_and(|end| end <= 1 << 48);
+        if bytes == 0
+            || !valid(dst)
+            || src.is_some_and(|at| !valid(at))
+            || (src.is_none() && (dst % 4 != 0 || bytes % 4 != 0))
+            || src.is_some_and(|at| at.abs_diff(dst) < bytes)
+        {
+            return Err(Error::Invalid);
+        }
+        let packet_dw = if src.is_some() { 7 } else { 5 };
+        if bytes.div_ceil(MAX_PACKET_BYTES) > ((KERNEL_DWORDS - 6 - words.len()) / packet_dw) as u64
+        {
+            return Err(Error::Invalid);
+        }
+        let mut offset = 0;
+        while offset < bytes {
+            let count = (bytes - offset).min(MAX_PACKET_BYTES);
+            let to = dst + offset;
+            if let Some(src) = src {
+                let from = src + offset;
+                // sdma_v5_2_emit_copy_buffer: COPY_LINEAR, no TMZ or endian swap.
+                words.extend([
+                    1,
+                    (count - 1) as u32,
+                    0,
+                    from as u32,
+                    (from >> 32) as u32,
+                    to as u32,
+                    (to >> 32) as u32,
+                ]);
+            } else {
+                // sdma_v5_2_emit_fill_buffer: CONST_FILL (no SDMA7 COMPRESS).
+                words.extend([11, to as u32, (to >> 32) as u32, value, (count - 1) as u32]);
+            }
+            offset += count;
+        }
+    }
+    words.extend(pm4::sdma_fence(address, seq));
+    Ok(words)
+}
+
+/// Publish a bounded kernel frame on an already verified SDMA queue. The
+/// caller owns every source/destination range until its fence completes.
+pub(crate) fn submit_kernel<I: Io>(
+    hw: &mut Hw<I>,
+    queue: &mut Queue,
+    ops: &[KernelOp],
+) -> Result<u32, Error> {
+    if queue.kind != Kind::Sdma {
+        return Err(Error::Invalid);
+    }
+    let previous = queue.seq;
+    let seq = previous.wrapping_add(1).max(1);
+    // Validate the complete frame before any MMIO or sequence mutation.
+    let words = kernel_words(ops, queue.address(FENCE), seq)?;
+    if !fence::signaled(completed(hw, queue)?, throttle_seq(queue)) {
+        return Err(Error::Busy);
+    }
+    let result = hw.access(|io, layout| {
+        queue.emit(io, &words)?;
+        queue.commit(io, layout);
+        Ok(())
+    });
+    result?;
+    queue.seq = seq;
+    Ok(seq)
+}
+
 /// The VM a submission runs in, as its `amdgpu_vmid_grab` grant decided
 /// (`amdgpu_job::vmid`, `vm_pd_addr`, `pasid`, `vm_needs_flush`, and
 /// `amdgpu_vm_flush`'s `pasid_mapping_needed`).

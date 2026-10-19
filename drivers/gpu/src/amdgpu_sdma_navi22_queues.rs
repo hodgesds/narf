@@ -488,6 +488,18 @@ impl Sdma {
         )
     }
     /// See `Gfx::fences`.
+    pub(crate) fn submit_kernel(
+        &mut self,
+        ops: &[crate::amdgpu_navi22_submit::KernelOp],
+    ) -> Result<u32, Error> {
+        if self.engine.state != State::Verified {
+            return Err(Error::Busy);
+        }
+        let e = &mut self.engine;
+        let queue = e.queues.first_mut().ok_or(Error::Invalid)?;
+        crate::amdgpu_navi22_submit::submit_kernel(&mut e.hw, queue, ops)
+    }
+
     pub fn fences(&mut self, instance: u8) -> Result<(u32, u32), Error> {
         let e = &mut self.engine;
         let q = e.queues.get(usize::from(instance)).ok_or(Error::Invalid)?;

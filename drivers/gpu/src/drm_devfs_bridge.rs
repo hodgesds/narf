@@ -959,10 +959,16 @@ impl FileOps for AmdgpuDmaBufFile {
     }
 
     fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
+        if self.object.flags & u64::from(crate::amdgpu_uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0 {
+            return Err(FsError::OperationNotPermitted);
+        }
         self.object.frames(offset, len)
     }
 
     fn mmap_lifetime(&self, _offset: u64, _len: usize) -> Option<Arc<dyn MmapLifetime>> {
+        if self.object.flags & u64::from(crate::amdgpu_uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0 {
+            return None;
+        }
         Some(self.object.mapping() as Arc<dyn MmapLifetime>)
     }
 

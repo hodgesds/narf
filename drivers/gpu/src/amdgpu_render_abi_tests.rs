@@ -639,3 +639,301 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     rdna2_retirement_allows_reentrant_completion_queries
 );
+
+fn rdna2_hidden_readback_preserves_vm_and_rolls_back_failure() -> TestResult {
+    const CARD: u32 = 0xfee4;
+    const P: u64 = 4096;
+    #[derive(Debug)]
+    struct Done;
+    impl narf_filesystem::DrmFence for Done {
+        fn is_signalled(&self) -> bool {
+            true
+        }
+        fn wait(&self, _: u64) -> bool {
+            true
+        }
+    }
+    impl VramClear for Done {
+        fn clear(&self, _: u64, _: u64) -> Result<Arc<dyn narf_filesystem::DrmFence>, FsError> {
+            Ok(Arc::new(Done))
+        }
+    }
+    #[derive(Debug)]
+    struct Reader {
+        pattern: alloc::vec::Vec<u8>,
+        fail: core::sync::atomic::AtomicBool,
+        stall: core::sync::atomic::AtomicBool,
+    }
+    impl VramTransfer for Reader {
+        fn write<'a>(
+            &'a self,
+            _object: Arc<GemObject>,
+            source: Arc<GemPlacement>,
+            destination: Arc<GemPlacement>,
+        ) -> Pin<alloc::boxed::Box<dyn Future<Output = Result<(), FsError>> + Send + 'a>> {
+            alloc::boxed::Box::pin(async move {
+                if destination.hidden_address() != Some(0x8_0000_1000) {
+                    return Err(FsError::InvalidData);
+                }
+                if self.stall.load(Ordering::Acquire) {
+                    core::future::pending::<()>().await;
+                }
+                let mut bytes = alloc::vec![0; self.pattern.len()];
+                // SAFETY: the model owns the destination and retains the idle
+                // System source for this complete bounded copy.
+                unsafe {
+                    source.write_staging(0, bytes.as_mut_ptr(), bytes.len())?;
+                }
+                if bytes != self.pattern {
+                    return Err(FsError::InvalidData);
+                }
+                if self.fail.load(Ordering::Acquire) {
+                    Err(FsError::TimedOut)
+                } else {
+                    Ok(())
+                }
+            })
+        }
+        fn read<'a>(
+            &'a self,
+            _object: Arc<GemObject>,
+            source: Arc<GemPlacement>,
+            destination: &'a mut GemPlacement,
+        ) -> Pin<alloc::boxed::Box<dyn Future<Output = Result<(), FsError>> + Send + 'a>> {
+            alloc::boxed::Box::pin(async move {
+                if source.hidden_address() != Some(0x8_0000_1000) {
+                    return Err(FsError::InvalidData);
+                }
+                if self.stall.load(Ordering::Acquire) {
+                    core::future::pending::<()>().await;
+                }
+                // SAFETY: this model owns all pattern bytes; destination is
+                // the coordinator's private, newly allocated System backing.
+                unsafe {
+                    destination.read_staging(0, self.pattern.as_ptr(), self.pattern.len())?;
+                }
+                if self.fail.load(Ordering::Acquire) {
+                    Err(FsError::TimedOut)
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+    struct Registered;
+    impl Drop for Registered {
+        fn drop(&mut self) {
+            unregister_vram_heap(CARD);
+        }
+    }
+    let before = gtt_used();
+    let mut visible = alloc::vec![0u8; P as usize];
+    let map = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(0xc000_0000),
+        virt: visible.as_mut_ptr() as u64,
+        len: P,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    // SAFETY: exclusively owned fake ranges; the model performs no device IO.
+    let pool = unsafe { crate::amdgpu_vram::Pool::from_owned_range(map, 0x8_0000_0000) }.unwrap();
+    // SAFETY: disjoint fake above-BAR allocation, owned solely by this test.
+    let hidden =
+        unsafe { crate::amdgpu_vram::UnmappedPool::from_owned(0x8_0000_1000, 3 * P, &[]) }.unwrap();
+    let reader = Arc::new(Reader {
+        pattern: (0..3 * P).map(|i| (i % 251) as u8).collect(),
+        fail: core::sync::atomic::AtomicBool::new(true),
+        stall: core::sync::atomic::AtomicBool::new(false),
+    });
+    register_vram_heap(
+        CARD,
+        VramHeap {
+            pool,
+            fb_base: 0x8_0000_0000,
+            fb_offset: 0x9_0000_0000,
+            unmapped: Some(UnmappedHeap {
+                pool: hidden.clone(),
+                clear: Arc::new(Done),
+                transfer: Some(reader.clone()),
+            }),
+        },
+    );
+    let _registered = Registered;
+    let state = GemState::for_card(CARD);
+    let mut create = [
+        3 * P,
+        P,
+        u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM),
+        u64::from(uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS),
+    ];
+    super::create(&state, create.as_mut_ptr() as usize).unwrap();
+    let handle = create[0] as u32;
+    let object = state.object(handle).unwrap();
+    let exported = crate::drm_devfs_bridge::amdgpu_dma_buf_file(object.clone()).unwrap();
+    let vm = crate::amdgpu_vm::VmState::for_card(CARD);
+    let mut va = [0u8; 40];
+    va[..4].copy_from_slice(&handle.to_le_bytes());
+    va[8..12].copy_from_slice(&uapi::AMDGPU_VA_OP_MAP.to_le_bytes());
+    va[12..16].copy_from_slice(&uapi::AMDGPU_VM_PAGE_READABLE.to_le_bytes());
+    va[16..24].copy_from_slice(&0x2_0000_0000u64.to_le_bytes());
+    va[32..40].copy_from_slice(&(3 * P).to_le_bytes());
+    crate::amdgpu_vm::dispatch(
+        crate::drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_GEM_VA,
+        va.as_ptr() as usize,
+        &vm,
+        &state,
+    )
+    .unwrap();
+    let pte = vm.leaf_entry(0x2_0000_2000);
+    let tables = vm.table_count();
+    #[derive(Debug)]
+    struct Moving(core::sync::atomic::AtomicBool);
+    impl narf_filesystem::DrmFence for Moving {
+        fn is_signalled(&self) -> bool {
+            self.0.load(Ordering::Acquire)
+        }
+        fn wait(&self, _: u64) -> bool {
+            self.is_signalled()
+        }
+    }
+    let moving = Arc::new(Moving(core::sync::atomic::AtomicBool::new(false)));
+    let fence: Arc<dyn narf_filesystem::DrmFence> = moving.clone();
+    object.dma_buf().resv.add_fence(
+        fence.clone(),
+        narf_filesystem::dma_buf::DmaResvUsage::Kernel,
+    );
+    if !vm
+        .kernel_fences()
+        .iter()
+        .any(|pending| Arc::ptr_eq(pending, &fence))
+    {
+        return TestResult::Fail("VM missed a move fence attached after GEM_VA");
+    }
+    moving.0.store(true, Ordering::Release);
+    if !vm.kernel_fences().is_empty() {
+        return TestResult::Fail("VM retained completed move fence");
+    }
+    let failed = narf_scheduler::block_on_spin(async {
+        let gate = lock_placement(CARD).await;
+        crate::amdgpu_vm::relocate(&gate, &object, false).await
+    });
+    if failed != Err(FsError::TimedOut)
+        || object.cpu_visible()
+        || vm.leaf_entry(0x2_0000_2000) != pte
+        || gtt_used() != before
+        || hidden.available() != 0
+    {
+        return TestResult::Fail("failed invisible copy changed backing, PTEs or accounting");
+    }
+    reader.fail.store(false, Ordering::Release);
+    reader.stall.store(true, Ordering::Release);
+    {
+        let mut future = core::pin::pin!(async {
+            let gate = lock_placement(CARD).await;
+            crate::amdgpu_vm::relocate(&gate, &object, false).await
+        });
+        let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+        if future.as_mut().poll(&mut cx).is_ready() {
+            return TestResult::Fail("stalled copy did not park");
+        }
+    }
+    if gtt_used() != before || vm.leaf_entry(0x2_0000_2000) != pte || try_placement(CARD).is_none()
+    {
+        return TestResult::Fail("cancelled invisible copy leaked backing or admission");
+    }
+    reader.stall.store(false, Ordering::Release);
+    let moved = narf_scheduler::block_on_spin(async {
+        let gate = lock_placement(CARD).await;
+        crate::amdgpu_vm::relocate(&gate, &object, false).await
+    });
+    if moved.is_err()
+        || !object.system()
+        || hidden.available() != 3 * P
+        || gtt_used() != before + 3 * P
+        || vm.table_count() != tables
+        || vm.leaf_entry(0x2_0000_2000).is_none_or(|e| {
+            e & crate::amdgpu_vm::PTE_SYSTEM == 0
+                || Some(e & crate::amdgpu_vm::GMC_HOLE_MASK & !4095) != object.gpu_at(2 * P)
+        })
+        || object.load_u64(3 * P - 8)
+            != Some(u64::from_le_bytes(
+                reader.pattern[reader.pattern.len() - 8..]
+                    .try_into()
+                    .unwrap(),
+            ))
+    {
+        return TestResult::Fail("invisible readback lost data, ownership or VM rebinding");
+    }
+    let offset = u64::from(handle) << 12;
+    if state.mapping_object(offset, P as usize).is_some()
+        || state.mmap_frames(offset, P as usize) != Err(FsError::OperationNotPermitted)
+        || exported.mmap_frames(0, P as usize) != Err(FsError::OperationNotPermitted)
+    {
+        return TestResult::Fail("NO_CPU_ACCESS bypassed with forged GEM/PRIME mmap offset");
+    }
+    let system_pte = vm.leaf_entry(0x2_0000_2000);
+    reader.fail.store(true, Ordering::Release);
+    let cpu_writer = object.mapping();
+    let pinned = narf_scheduler::block_on_spin(async {
+        let gate = lock_placement(CARD).await;
+        crate::amdgpu_vm::relocate(&gate, &object, true).await
+    });
+    if pinned != Err(FsError::Busy) || hidden.available() != 3 * P {
+        return TestResult::Fail("staging read started with a retained CPU writer");
+    }
+    drop(cpu_writer);
+    let failed = narf_scheduler::block_on_spin(async {
+        let gate = lock_placement(CARD).await;
+        crate::amdgpu_vm::relocate(&gate, &object, true).await
+    });
+    if failed != Err(FsError::TimedOut)
+        || !object.system()
+        || vm.leaf_entry(0x2_0000_2000) != system_pte
+        || hidden.available() != 3 * P
+    {
+        return TestResult::Fail("failed hidden upload changed source or leaked destination");
+    }
+    reader.fail.store(false, Ordering::Release);
+    reader.stall.store(true, Ordering::Release);
+    {
+        let mut future = core::pin::pin!(async {
+            let gate = lock_placement(CARD).await;
+            crate::amdgpu_vm::relocate(&gate, &object, true).await
+        });
+        let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+        if future.as_mut().poll(&mut cx).is_ready() {
+            return TestResult::Fail("stalled upload did not park");
+        }
+    }
+    if hidden.available() != 3 * P
+        || vm.leaf_entry(0x2_0000_2000) != system_pte
+        || try_placement(CARD).is_none()
+    {
+        return TestResult::Fail("cancelled upload leaked destination or changed PTEs");
+    }
+    reader.stall.store(false, Ordering::Release);
+    let moved = narf_scheduler::block_on_spin(async {
+        let gate = lock_placement(CARD).await;
+        crate::amdgpu_vm::relocate(&gate, &object, true).await
+    });
+    if moved.is_err()
+        || object.cpu_visible()
+        || hidden.available() != 0
+        || gtt_used() != before
+        || vm.table_count() != tables
+        || vm.leaf_entry(0x2_0000_2000) != pte
+    {
+        return TestResult::Fail("hidden roundtrip lost placement, VM or GTT accounting");
+    }
+    drop(vm);
+    drop(exported);
+    drop(object);
+    drop(state);
+    if gtt_used() != before {
+        return TestResult::Fail("readback leaked GTT after last reference");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_hidden_readback_preserves_vm_and_rolls_back_failure
+);

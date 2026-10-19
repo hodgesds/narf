@@ -1046,7 +1046,23 @@ Completion retirement now samples callbacks outside its lock, allowing native
 progress queries to re-enter retirement safely. Migration regressions cover
 shared PRIME identity, CPU leases, multiple VMs and offsets, split mappings,
 busy-job/reservation cancellation and re-entrant retirement.
-Invisible VRAM remains outside this migration policy. GEM mmap now resolves
+RX6000 invisible VRAM now has ordered kernel SDMA clears and bidirectional
+staged migration to/from GTT (promotion requires NO_CPU_ACCESS). Failed and
+cancelled copies preserve old PTEs; queued copies retain both allocations and
+source KERNEL fences until actual DMA completion. Recovery replays requests,
+refreshing upload staging, and never mistakes reset/loss for completion. CPU
+BAR access requires current PCI authority, power and reset exclusion. CS
+rechecks kernel fences after admission and promotion; GEM/PRIME mmap cannot
+bypass NO_CPU_ACCESS after a move to GTT. CPU mapping revocation remains open.
+Invisible-VRAM validation passed 1771 x86_64 and 1263 aarch64 GPU/framebuffer
+tests (zero failures; five and one environment skips), with clean production
+boots and btrfs postflight. Final RDNA2 reruns passed 42 and 40 tests after
+adding the pre-copy CPU-writer lease check. Debug builds, all three targeted
+Clippy contexts on both architectures, formatting and Linux constants/parser
+checks passed. The full firmware identity check still reports three imported
+payloads differing from the installed distribution copies (SDMA, TA and VCN);
+those local firmware files were not changed by this work.
+GEM mmap now resolves
 scattered GTT backing page by page. This is a bounded driver placement policy,
 not full Linux TTM parity. Linux conformance covers VRAM module C layouts,
 cache sizes and the compiled GC MMR allow-list as well as the existing family

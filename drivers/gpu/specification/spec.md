@@ -107,8 +107,8 @@ handles, PRIME exports and BO lists do not pin placement by themselves.
 its constructors now allocate shared state at runtime. `amdgpu_vm::relocate`
 requires the card's placement guard: it waits for every affected VM's last job
 on each ring and for reservation fences before releasing GPU address leases.
-Wait failure or cancellation leaves mappings untouched. Copying and PTE
-rewriting then run synchronously under admission exclusion; errors restore
+Wait failure or cancellation leaves mappings untouched. CPU-visible copying and PTE
+rewriting run synchronously under admission exclusion; errors restore
 leases to unchanged backing. Existing table allocations and virtual addresses
 stay fixed; TLB sequences advance before another submission can run.
 The card gate spans native queue publication, `note_job`, and reservation-fence
@@ -117,7 +117,24 @@ for this gate through `dispatch_async`; synchronous dispatch reports Busy on
 contention. `amdgpu_gem::dispatch_async` retries a strict VRAM create after
 reclaiming GPU-mapped buffers; ordinary allocations retain GTT fallback.
 CPU mappings, unregistered VM mappings, and deferred CPU user-fence writes
-still pin backing. Invisible VRAM still does not migrate. Completed deferred
+still pin backing. RX6000 invisible VRAM supports asynchronous staged copying
+to GTT and promotion of NO_CPU_ACCESS GTT buffers back into invisible VRAM.
+`UnmappedHeap::transfer` optionally supplies `VramTransfer::read/write`; the
+coordinator retains old GPU leases until the entire private copy completes,
+then commits backing and rebinds PTEs without awaiting. Errors or cancellation
+preserve the original placement. The native SDMA5.2 worker uses a reserved
+1 MiB BAR window, ordered clears/copies and real current-generation fences.
+Each queued copy retains its allocations independently of its waiting task
+and attaches a KERNEL reservation fence to the source BO. Stage reuse waits
+for the previous copy even after cancellation. Upload staging is refreshed
+from the retained GTT source on every recovery replay. Reset exclusion,
+current PCI capability invocation and a GC power reference protect CPU BAR
+accesses; an epoch change invalidates an unconsumed readback. A reset, timeout
+or device loss never signals unfinished kernel work as complete. Recovery
+publication restarts queued work. CS re-samples live mapped/listed BO KERNEL
+fences under placement admission and after attempted promotion, with bounded
+waits before publishing user work. NO_CPU_ACCESS also rejects forged GEM and
+PRIME CPU mappings after a move into GTT. Completed deferred
 holds can be retired while checking progress; `amdgpu_cs::retire` samples
 completion callbacks outside its resource lock, then revalidates tickets.
 `GemObject::preferred_domains()` reads the atomic
@@ -6292,10 +6309,19 @@ and primary-plane binding; the boot resource is never exposed as a GEM object.
   retention of raw backing addresses. CPU mappings, GPU PTEs (including
   removed entries awaiting jobs), and deferred CPU user-fence writes retain
   the exact backing lease until their last access. A coordinated GPU move
-  excludes new jobs/VA edits, waits all affected VM jobs, releases their
-  leases, copies, rewrites the existing PTEs and restores leases before
+  excludes new jobs/VA edits, waits all affected VM jobs, copies into private
+  backing, rewrites the existing PTEs and replaces their backing leases before
   releasing admission. CPU leases cannot be revoked by this path. A copy
-  requires exclusive backing ownership and no unsignalled reservation fence.
+  requires exclusive backing ownership and no unsignalled reservation fence
+  when committing. Asynchronous invisible-VRAM copying retains old GPU leases
+  and keeps the destination private until then. Before starting it, an address
+  lease census permits only registered idle GPU mappings and the coordinator:
+  a deferred CPU writer or unregistered lease refuses the copy before staging
+  can read its source. Kernel DMA owns both source
+  and destination until actual completion, independently of waiter lifetime;
+  cancelled move fences block subsequent user jobs, including jobs that omit
+  the object from their BO list. Scratch reuse and recovery replay cannot
+  overwrite a predecessor's still-live transfer.
   Same-card PRIME sharing preserves identity, metadata and reservation across
   relocation.
 

@@ -952,6 +952,7 @@ impl Backend for Hardware {
 #[derive(Debug)]
 pub struct ColdBoot {
     boot_mclk_khz: u64,
+    unmapped: Option<crate::amdgpu_vram::UnmappedPool>,
     // Recovery consumes and returns this owner. Keep the retained hardware
     // off-stack: moving the inline sequence and its Result temporaries used
     // to overflow the 64 KiB aarch64 boot stack, even when recovery refused.
@@ -979,6 +980,42 @@ fn snapshot(gpu: &AmdGpu) -> Result<AmdGpu, Error> {
     })
 }
 impl ColdBoot {
+    /// Execute a bounded BAR access under the current device grant.
+    pub(crate) fn access_vram<T>(
+        &self,
+        f: impl FnOnce() -> Result<T, narf_filesystem::FsError>,
+    ) -> Result<T, narf_filesystem::FsError> {
+        use narf_capabilities::{CapError, CapOp};
+        struct Op<F>(F);
+        impl<F: FnOnce() -> T, T> CapOp<BusDeviceCap, Write> for Op<F> {
+            type Output = T;
+            fn execute(self, _: &Cap<BusDeviceCap, Write>) -> Result<T, CapError> {
+                Ok((self.0)())
+            }
+        }
+        self.sequence
+            .backend
+            .authority
+            .invoke(Op(f))
+            .map_err(|_| narf_filesystem::FsError::NoDevice)?
+    }
+    /// Transfer the above-BAR allocator from the complete boot inventory.
+    pub(crate) fn set_unmapped(&mut self, pool: Option<crate::amdgpu_vram::UnmappedPool>) {
+        self.unmapped = pool;
+    }
+    pub(crate) fn unmapped_pool(&self) -> Option<crate::amdgpu_vram::UnmappedPool> {
+        self.unmapped.clone()
+    }
+    pub(crate) fn reserve_transfer_stage(&self) -> Result<crate::amdgpu_vram::Reservation, Error> {
+        if !self.queues_verified() {
+            return Err(Error::Busy);
+        }
+        self.sequence
+            .backend
+            .pool
+            .reserve(1 << 20)
+            .map_err(|_| Error::Allocation)
+    }
     pub(crate) fn read_mmr(
         &self,
         payload: [u32; 4],
@@ -1038,6 +1075,7 @@ impl ColdBoot {
             unsafe { sos::Bootloader::new(&gpu, authority, pool) }.map_err(Error::Sos)?;
         Ok(Self {
             boot_mclk_khz,
+            unmapped: None,
             sequence: Box::new(Sequence {
                 backend: Hardware {
                     gpu,
@@ -1100,6 +1138,7 @@ impl ColdBoot {
             unsafe { gddr6::Trainer::new(&gpu, authority, exchange) }.map_err(Error::Training)?;
         Ok(Self {
             boot_mclk_khz,
+            unmapped: None,
             sequence: Box::new(Sequence {
                 backend: Hardware {
                     gpu,
@@ -1662,6 +1701,7 @@ impl ColdBoot {
             return Err(Error::Busy);
         }
         let boot_mclk_khz = self.boot_mclk_khz;
+        let unmapped = self.unmapped;
         let Hardware {
             gpu,
             authority,
@@ -1687,6 +1727,7 @@ impl ColdBoot {
         // below runs before any firmware stage touches the device.
         let mut boot = unsafe { Self::new_rdna2(&gpu, authority, &pool, firmware) }?;
         boot.boot_mclk_khz = boot_mclk_khz;
+        boot.unmapped = unmapped;
         let h = &mut boot.sequence.backend;
         // SAFETY: forwarded recovery contract; construction has no I/O.
         h.reset = Some(
@@ -1761,6 +1802,27 @@ impl ColdBoot {
             q.sdma.fence_map(2),
             q.sdma.fence_map(3),
         ]))
+    }
+    /// # Safety
+    /// Every range belongs to this GPU's exclusive framebuffer allocator and
+    /// cannot reach an observable new owner until SDMA0 completes the fence
+    /// (ordered clearing may reserve it for a later queued clear). Copy
+    /// sources are retained and idle; destinations cannot be observed early.
+    pub(crate) unsafe fn submit_vram(
+        &mut self,
+        ops: &[crate::amdgpu_navi22_submit::KernelOp],
+    ) -> Result<u32, Error> {
+        if !self.queues_verified() {
+            return Err(Error::Busy);
+        }
+        self.sequence
+            .backend
+            .queues
+            .as_mut()
+            .ok_or(Error::Invalid)?
+            .sdma
+            .submit_kernel(ops)
+            .map_err(Error::Queues)
     }
     /// A VRAM heap for clients, as Navi48's `publish_client_vram`: half the
     /// pool's free VRAM, 2 MiB-aligned and at least 64 MiB, as a pool of its

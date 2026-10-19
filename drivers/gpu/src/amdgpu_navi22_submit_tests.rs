@@ -970,3 +970,105 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     rdna2_sequences_wrap_without_zero_or_false_device_loss
 );
+
+fn rdna2_kernel_sdma_fill_copy_and_validation() -> TestResult {
+    let vram = pool(1 << 20);
+    let mut engine = crate::amdgpu_sdma_navi22_queues::Engine {
+        hw: hw(enabled()),
+        queues: alloc::vec![
+            Queue::new(&vram, Kind::Sdma, doorbell::SDMA0, fence::Engine::Sdma0).unwrap()
+        ],
+        state: crate::amdgpu_sdma_navi22_queues::State::Prepared,
+        proof: Default::default(),
+    };
+    if run(engine.start()).is_err() || run(engine.test_ib()).is_err() {
+        return TestResult::Fail("kernel SDMA setup");
+    }
+    let ops = [
+        KernelOp::Fill {
+            dst: IB_MC,
+            bytes: 32,
+            value: 0x1234_abcd,
+        },
+        KernelOp::Copy {
+            src: IB_MC,
+            dst: DST_MC,
+            bytes: 32,
+        },
+    ];
+    let seq = submit_kernel(&mut engine.hw, &mut engine.queues[0], &ops).unwrap();
+    if run(wait_fence(&mut engine.hw, &engine.queues[0], seq)).is_err()
+        || (0..8).any(|i| engine.hw.io.word(DST_MC + i * 4) != 0x1234_abcd)
+    {
+        return TestResult::Fail("kernel SDMA fill/copy/fence execution");
+    }
+    let before = (
+        engine.queues[0].wptr,
+        engine.queues[0].seq,
+        engine.hw.io.writes.len(),
+    );
+    for ops in [
+        alloc::vec![],
+        alloc::vec![KernelOp::Fill {
+            dst: 3,
+            bytes: 4,
+            value: 0
+        }],
+        alloc::vec![KernelOp::Copy {
+            src: 0x1000,
+            dst: 0x1004,
+            bytes: 16
+        }],
+        alloc::vec![KernelOp::Copy {
+            src: u64::MAX,
+            dst: DST_MC,
+            bytes: 4
+        }],
+        alloc::vec![KernelOp::Fill {
+            dst: 0,
+            bytes: 1 << 40,
+            value: 0
+        }],
+    ] {
+        if submit_kernel(&mut engine.hw, &mut engine.queues[0], &ops) != Err(Error::Invalid)
+            || (
+                engine.queues[0].wptr,
+                engine.queues[0].seq,
+                engine.hw.io.writes.len(),
+            ) != before
+        {
+            return TestResult::Fail("invalid kernel job mutated ring or MMIO");
+        }
+    }
+    let words = kernel_words(
+        &[KernelOp::Fill {
+            dst: IB_MC,
+            bytes: MAX_PACKET_BYTES + 4,
+            value: 7,
+        }],
+        DST_MC,
+        9,
+    )
+    .unwrap();
+    if words[..10]
+        != [
+            11,
+            IB_MC as u32,
+            (IB_MC >> 32) as u32,
+            7,
+            (MAX_PACKET_BYTES - 1) as u32,
+            11,
+            (IB_MC + MAX_PACKET_BYTES) as u32,
+            ((IB_MC + MAX_PACKET_BYTES) >> 32) as u32,
+            7,
+            3,
+        ]
+    {
+        return TestResult::Fail("SDMA5 multi-packet count/address encoding");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_kernel_sdma_fill_copy_and_validation
+);

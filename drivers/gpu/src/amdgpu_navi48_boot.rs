@@ -1182,6 +1182,7 @@ impl ColdBoot {
             return Err(Error::Busy);
         }
         heap.unmapped = Some(crate::amdgpu_gem::UnmappedHeap {
+            transfer: None,
             pool: pool.clone(),
             clear,
         });

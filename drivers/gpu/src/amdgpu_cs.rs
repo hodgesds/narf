@@ -838,6 +838,21 @@ async fn nap() {
     narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant()).await;
 }
 
+async fn wait_kernel(
+    fences: Vec<Arc<dyn narf_filesystem::DrmFence>>,
+    started: u64,
+) -> Result<(), FsError> {
+    for fence in fences {
+        while !fence.is_signalled() {
+            if narf_time::monotonic_ns() >= started.saturating_add(5_000_000_000) {
+                return Err(FsError::TimedOut);
+            }
+            nap().await;
+        }
+    }
+    Ok(())
+}
+
 /// `AMDGPU_CS`, `AMDGPU_WAIT_CS`, `AMDGPU_GEM_WAIT_IDLE`,
 /// `AMDGPU_WAIT_FENCES` and `AMDGPU_FENCE_TO_HANDLE` on DRM card `card`.
 /// CS, WAIT_CS and WAIT_IDLE need a registered submitter (`Unsupported`
@@ -1044,6 +1059,20 @@ pub async fn dispatch_async(
         .chain(user_fence.as_ref().map(|(o, _, _)| o))
         .collect();
     for object in &locked {
+        // Kernel initialization must finish before user work can observe a
+        // fresh allocation. A stopped clear queue is not a successful fence.
+        for fence in object
+            .dma_buf()
+            .resv
+            .fences(narf_filesystem::dma_buf::DmaResvUsage::Kernel)
+        {
+            while !fence.is_signalled() {
+                if narf_time::monotonic_ns() >= started.saturating_add(5_000_000_000) {
+                    return Err(FsError::TimedOut);
+                }
+                nap().await;
+            }
+        }
         // An EXPLICIT_SYNC buffer still waits for kernel work on it.
         let usage = if object.flags & u64::from(uapi::AMDGPU_GEM_CREATE_EXPLICIT_SYNC) != 0 {
             narf_filesystem::dma_buf::DmaResvUsage::Kernel
@@ -1064,6 +1093,9 @@ pub async fn dispatch_async(
     // lands before any job here runs, listed or not.
     for fence in vm.kernel_fences() {
         while !fence.is_signalled() {
+            if narf_time::monotonic_ns() >= started.saturating_add(5_000_000_000) {
+                return Err(FsError::TimedOut);
+            }
             nap().await;
         }
     }
@@ -1071,12 +1103,35 @@ pub async fn dispatch_async(
     // a relocator must never miss a job between those operations. Dependencies
     // are awaited first so other submissions can satisfy them.
     let _placement = crate::amdgpu_gem::lock_placement(card).await;
+    // A cancelled relocation can leave kernel DMA alive after releasing the
+    // card gate. Re-sample move fences after admission, including BOs omitted
+    // from the list, before a new job can write their old backing.
+    let mut kernel = vm.kernel_fences();
+    for object in &locked {
+        kernel.extend(
+            object
+                .dma_buf()
+                .resv
+                .fences(narf_filesystem::dma_buf::DmaResvUsage::Kernel),
+        );
+    }
+    wait_kernel(kernel, started).await?;
     for object in &listed {
         let to_vram = object.preferred_domains() & u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM) != 0;
         if object.system() == to_vram && object.cpu_visible() {
             // Failed promotion preserves the current valid placement. A
             // successful move rewrites every affected VM before this job.
             let _ = crate::amdgpu_vm::relocate(&_placement, object, to_vram).await;
+            // A failed copy can still own queued DMA. Falling back to the
+            // old placement is safe only after that move fence settles.
+            wait_kernel(
+                object
+                    .dma_buf()
+                    .resv
+                    .fences(narf_filesystem::dma_buf::DmaResvUsage::Kernel),
+                started,
+            )
+            .await?;
         }
     }
     let seq = engine.submit(vm, &submission, &health).await?;
