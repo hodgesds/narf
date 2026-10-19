@@ -130,6 +130,13 @@ unitless 0..=255 hints, not frequencies.
 ```rust
 pub async fn suspend(target: SuspendTarget, cap: &Cap<Power, Suspend>) -> SuspendOutcome;
 
+pub trait AsyncSystemPm: Send + Sync {
+    fn prepare_suspend(&self) -> SystemPmFuture<'_>;
+    fn resume_from_suspend(&self) -> SystemPmFuture<'_>;
+}
+pub fn register_async_system_pm(name: &str, ops: Arc<dyn AsyncSystemPm>);
+pub async fn suspend_async(cap: &Cap<Power, Invoke>) -> Result<(), SuspendError>;
+
 pub enum SuspendTarget { Freeze, StandbyS1, SuspendToRamS3, SuspendToDiskS4 }
 pub enum SuspendOutcome { WokeUp(Cause), Aborted(Reason) }
 ```
@@ -143,12 +150,22 @@ Flow:
    hand `time/` the suspend duration so it can jump forward the
    wall clock without violating monotonic.
 
-The current synchronous `suspend::suspend(&Cap<Power, Invoke>)` aborts with
-`SuspendError::Aborted` when any device PM callback fails, including `Busy`
-from a driver with an outstanding asynchronous transaction. It runs resume
-callbacks to undo partial quiescing and returns the phase to `Idle` before
-returning. No framebuffer blanking or platform sleep occurs on this path.
-`arm_s3_resume` uses this same orchestration; it does not suspend devices twice.
+`system_pm::AsyncSystemPm` is the interrupt-live bracket around the existing
+synchronous `device_pm::DevicePmOps` fan-out. Registration is parent → child;
+`prepare_suspend` runs child → parent, and the matching resume runs parent →
+child after the synchronous fan-out has restored PCI/platform delivery. The
+registry snapshots its entries and releases its lock before every await. A
+failed prepare must leave its own device usable; the coordinator resumes every
+earlier successful hook before it returns `SuspendError::Aborted`.
+
+`suspend::suspend_async(&Cap<Power, Invoke>)` is the required entry point for
+drivers whose suspend protocol waits on firmware interrupts. `suspend` remains
+the no-await compatibility path for ordinary `DevicePmOps` implementations.
+Both paths abort with `SuspendError::Aborted` when a device callback fails,
+including `Busy` from outstanding work, run the applicable resume callbacks to
+undo partial quiescing, and return the phase to `Idle` without blanking the
+framebuffer or entering platform sleep. `arm_s3_resume` uses the synchronous
+compatibility path and does not suspend devices twice.
 
 ### 3.4 Thermal
 
@@ -260,6 +277,10 @@ driver implementation.
 - Per-driver `suspend` must be callable from the runtime or
   system-wide paths; must tolerate concurrent invocation being
   serialised by `power/`.
+- An `AsyncSystemPm` implementation must never retain an IRQ-safe lock across
+  an await. Every hook whose prepare completed receives exactly one paired
+  resume attempt, including when a later prepare or the synchronous fan-out
+  aborts the transition.
 
 ## 5. Architecture notes
 

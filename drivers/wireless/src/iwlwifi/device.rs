@@ -195,7 +195,7 @@ impl Device {
             self.bssid.store(0, Ordering::Release);
         }
         if was_up && !up {
-            narf_wireless::nl80211::notify_disconnect(self.name(), 1);
+            narf_wireless::nl80211::notify_disconnect(self.name(), 1, false);
         }
     }
 
@@ -612,6 +612,11 @@ impl WirelessNetIface for Device {
                     let bss = BssInfo {
                         bssid,
                         ssid: beacon.ssid,
+                        frequency_mhz: match mpdu.channel as u32 {
+                            14 => 2484,
+                            1..=13 => 2407 + 5 * u32::from(mpdu.channel),
+                            ch => 5000 + 5 * ch,
+                        },
                         channel: mpdu.channel as u32,
                         rssi: mpdu.rssi,
                         security,
@@ -647,6 +652,9 @@ impl WirelessNetIface for Device {
             narf_wireless::SecurityConfig::Open => AuthMethod::Open,
             narf_wireless::SecurityConfig::Wpa2 { psk } => AuthMethod::Wpa2Psk(psk),
             narf_wireless::SecurityConfig::Wpa3 { password } => AuthMethod::Wpa3Sae { password },
+            // No external-supplicant mode (the MLD firmware path runs the
+            // handshake itself; nl80211 never builds this for it).
+            narf_wireless::SecurityConfig::External(_) => return Err(WirelessError::NotSupported),
         };
         if request.ssid.len() > 32 || request.bssid[0] & 1 != 0 {
             return Err(WirelessError::InvalidArgs);
@@ -736,6 +744,9 @@ impl WirelessNetIface for Device {
             narf_wireless::SecurityConfig::Open => AuthMethod::Open,
             narf_wireless::SecurityConfig::Wpa2 { psk } => AuthMethod::Wpa2Psk(psk),
             narf_wireless::SecurityConfig::Wpa3 { password } => AuthMethod::Wpa3Sae { password },
+            // No external-supplicant mode (the MLD firmware path runs the
+            // handshake itself; nl80211 never builds this for it).
+            narf_wireless::SecurityConfig::External(_) => return Err(WirelessError::NotSupported),
         };
         let mut state = self.state.lock().await;
         // Roaming requires an existing association to reassociate away from.

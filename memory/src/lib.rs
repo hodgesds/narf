@@ -122,10 +122,10 @@ pub const KERNEL_PHYS_OFFSET: u64 = 0xFFFF_FF80_0000_0000;
 pub const KERNEL_PHYS_OFFSET: u64 = 0;
 pub use frame::alloc_frame_on_strict;
 pub use frame::{
-    alloc_frame, alloc_frame_anywhere, alloc_frame_on, alloc_pages_on, current_cpu_node,
-    current_frame_alloc_name, free_frame, free_pages, hotplug_node_for_phys, init_from_map,
-    install_frame_alloc, install_memory_hotplug_hook, is_numa_aware, memory_blocks, node_for_phys,
-    node_free, node_free_blocks, node_total, numa_node_stats, offline_memory_range,
+    alloc_frame, alloc_frame_anywhere, alloc_frame_on, alloc_pages_below, alloc_pages_on,
+    current_cpu_node, current_frame_alloc_name, free_frame, free_pages, hotplug_node_for_phys,
+    init_from_map, install_frame_alloc, install_memory_hotplug_hook, is_numa_aware, memory_blocks,
+    node_for_phys, node_free, node_free_blocks, node_total, numa_node_stats, offline_memory_range,
     online_memory_range, online_node_count, online_node_mask, phys_alloc_ceiling,
     rebalance_to_topology, release_early_ceiling, reserve_for_slab_promotion, stats as frame_stats,
     validate_no_overlap as frame_validate_no_overlap, BuddyFrameAlloc, BumpFrameAlloc, FrameAlloc,

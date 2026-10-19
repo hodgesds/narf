@@ -14,6 +14,23 @@ current test results.
 | 4 · Compatibility | In-tree shell gate met; compatibility continues | Interactive `echo hello world` follows serial IRQ → input ring → shell → UART. Linux-compatible musl programs, storage, networking, and graphics have additional QEMU proofs. The original relibc-specific criterion is not the closure proof. |
 | 5 · Silicon | In progress | Driver and diagnostic foundations exist; the selected AMD laptop end-to-end gate has not been demonstrated. |
 
+## WCN6855 source alignment
+
+The ath11k WCN6855 source path now includes Linux-shaped per-TID TXQs with
+the 4096-flow fq/CoDel scheduler, ECN handling and requested-TX-status drops,
+cfg80211's TKIP `MICHAEL_MIC_FAILURE` notification, and Linux-style managed
+station recovery: external-SME, Open and completed in-kernel RSN vdev/peer/
+BSS/EDCA/key replay without new auth or assoc frames (BA sessions reset).
+Beaconing AP/GO recovery likewise replays beacon and MBSSID state, group
+keys, clients, PTKs and authorization; shared-radio reconfiguration wakes
+queues only after every live vdev is rebuilt. `GET_STATION` now reports
+monitor-status PPDU combined/chain RSSI, Linux-style raw-RSSI EWMA,
+RX/TX duration and detailed HTT TX rate telemetry. Monitor mode, TX A-MSDU,
+AQL and airtime-fairness are not listed as open WCN6855 work because Linux
+ath11k does not expose those capabilities for this hardware. This is
+source-level implementation progress only: no build, emulation, or hardware
+validation was run while the equivalence work remained in progress.
+
 ## MT7921/MT7922 firmware bringup
 
 The x86_64 MT76 late init path now owns coherent WM/FWDL/MCU DMA rings and

@@ -1,6 +1,6 @@
 [package]
 name         = "narf-firmware-smbios"
-description  = "SMBIOS / DMI table parser. Locates the entry point, walks fixed-size structures, decodes BIOS / System / Baseboard / Processor / Memory-Device records. Spec: firmware/smbios/specification/spec.md."
+description  = "SMBIOS / DMI table parser. Locates the entry point at boot (EFI config table, multiboot2 SMBIOS tag, 0xF0000 scan), walks fixed-size structures, decodes BIOS / System / Baseboard / Processor / Memory-Device records and retains the raw table. Spec: firmware/smbios/specification/spec.md."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
@@ -14,6 +14,9 @@ path = "src/lib.rs"
 [dependencies]
 narf-lib          = { path = "../../lib" }
 narf-memory       = { path = "../../memory" }
+narf-boot         = { path = "../../boot" }
+narf-console      = { path = "../../console" }
+narf-init         = { path = "../../init" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 
 [lints]

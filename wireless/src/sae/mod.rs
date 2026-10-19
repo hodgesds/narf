@@ -2,27 +2,27 @@
 //!
 //! ## Module layout
 //!
-//! - [`dragonfly`] — the legacy hunting-and-pecking PWE loop, the
-//!   Commit/Confirm state machine, and the real P-256 `EccGroup` /
-//!   `MacPrimitive` backends. Implements IEEE 802.11-2020 §12.4
-//!   end-to-end with the §12.4.4.2.2 PWE derivation.
-//! - [`pt`] — IEEE 802.11-2020 §12.4.4.2.3 Hash-to-Element ("H2E").
-//!   Derives the Password Token (PT) from `(ssid, password)` once,
-//!   then the Password Element (PWE) per `(mac_a, mac_b)` via cheap
-//!   scalar arithmetic. Uses RFC 9380 hash-to-curve under the hood
-//!   (`narf_crypto::p256::hash_to_curve`).
+//! - [`dragonfly`] — the generic `EccGroup` / `MacPrimitive` state
+//!   machine and the P-256 hunting-and-pecking backend (whose PWE is
+//!   [`pt::pwe_hunt_and_peck`]). Its own key derivation is a
+//!   structural model, not 802.11's: drivers use [`session`].
+//! - [`pt`] — the PWE derivations of hostap `sae.c`: IEEE 802.11-2020
+//!   §12.4.4.2.3 Hash-to-Element (PT from `(ssid, password)`, PWE per
+//!   MAC pair; SSWU from `narf_crypto::p256::hash_to_curve`) and the
+//!   §12.4.4.2.2 hunting-and-pecking loop.
 //! - [`groups`] — the IANA "Transform Type 4 - DH Group" IDs SAE
 //!   selects between (P-256 / P-384 / P-521 …).
-//! - [`session`] — the simple [`SaeSession`] handshake driver that
-//!   wraps the H2E flow into the `build_commit` / `on_commit` /
-//!   `build_confirm` / `on_confirm` API used by drivers.
+//! - [`session`] — the [`SaeSession`] handshake driver (H2E or
+//!   hunting-and-pecking PWE) with the `build_commit` / `on_commit` /
+//!   `build_confirm` / `on_confirm` API used by drivers, pinned to the
+//!   IEEE 802.11-2020 Annex J.10 vectors hostap's `sae_tests` checks.
 //!
 //! ## Which PWE path to use
 //!
 //! The original SAE PWE derivation (§12.4.4.2.2) is a side-channel
 //! liability — its iteration count depends (statistically) on the
 //! password. IEEE 802.11-2020 §12.4.4.2.3 introduces H2E as the
-//! replacement, which RFC 9380 hash-to-curve makes constant-time. New
+//! replacement (the SSWU map is constant-time). New
 //! deployments **must** prefer H2E; the legacy loop in [`dragonfly`]
 //! is kept for compatibility with the existing smokes and for routers
 //! that haven't shipped H2E yet.
@@ -55,5 +55,5 @@ pub use dragonfly::{
 };
 
 pub use groups::SaeGroup;
-pub use pt::{pt_h2e, pwe_from_pt, sae_h2e_dst};
+pub use pt::{pt_h2e, pt_h2e_bytes, pwe_from_pt, pwe_hunt_and_peck};
 pub use session::SaeSession;

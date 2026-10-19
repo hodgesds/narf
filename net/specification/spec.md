@@ -196,7 +196,15 @@ queue length, group/link mode, protocol/dormant/testing state, alias, physical
 carrier, driver-reported speed/duplex, carrier transition counts, and the
 complete `rtnl_link_stats64` counter set. `set_link_state` changes only
 administrative `IFF_UP`; a driver publishes an authoritative PHY sample with
-`set_link_metadata(name, carrier, speed_mbps, duplex)`. Common ingress and
+`set_link_metadata(name, carrier, speed_mbps, duplex)`. A driver whose
+hardware must be started on `IFF_UP` (`ndo_open` / `ndo_stop`) installs
+`iface::set_open_stop(name, hook: fn(&str, bool)) -> bool` after `register`
+(registration clears it); `set_link_state` calls the hook on every real
+transition, with the registry lock released and before NETDEV_UP / NETDEV_DOWN.
+The hook runs in the caller's context and must not block, so an asynchronous
+open completes in the driver's own task, which brings the interface back down
+with `set_link_state(name, false)` if it fails (Linux `dev_open` fails
+synchronously and never sets `IFF_UP`). Common ingress and
 egress paths update packet/byte/multicast/drop counters once, and procfs,
 sysfs, and rtnetlink consume the same snapshots rather than constructing
 compatibility-only values.
@@ -384,13 +392,33 @@ and sequence/sender fields.
 Generic control errors honor `NETLINK_CAP_ACK` and `NETLINK_EXT_ACK` with the
 same capped echo and diagnostic-TLV rules as rtnetlink.
 
+Operation flags carry Linux's permission bits verbatim (`GENL_ADMIN_PERM`
+0x01, `GENL_UNS_ADMIN_PERM` 0x10, reported in `CTRL_ATTR_OP_FLAGS`). After the
+op lookup and before the family callback, `genl_family_rcv_msg`'s check runs:
+`GENL_ADMIN_PERM` needs `RequestContext::init_net_admin`
+(`netlink_capable(skb, CAP_NET_ADMIN)`), `GENL_UNS_ADMIN_PERM` needs
+`RequestContext::net_admin` (`netlink_ns_capable(skb, net->user_ns,
+CAP_NET_ADMIN)`), else `EPERM` — unless the request carries a delegated
+`admin` handle, in which case the callback runs with
+`RequestContext::capable == false` and must confirm the handle covers the
+object it changes. The socket bridge computes both verdicts per message as
+rtnetlink does: CAP_NET_ADMIN of the socket's opener (recorded at `socket()`)
+and of the sender, in the initial user namespace and over the socket's
+network namespace respectively.
+
 Families may additionally register a `ContextHandler` receiving
-`RequestContext { net_ns_id, admin }`. `admin` is an optional, kernel-held
-interface-bound `AdminHandle`; the default reply builder supplies none.
-The socket bridge passes only explicitly delegated authority. Family
-mutations check its current validity, interface name and namespace before
-queueing work, and again when asynchronous work starts. Generic-netlink
-attributes cannot mint or substitute capabilities.
+`RequestContext { net_ns_id, admin, init_net_admin, net_admin, capable,
+portid, ack_cookie }`. `portid` is the sender's port (`info->snd_portid`;
+the socket bridge assigns it before dispatch, `netlink_autobind`);
+`ack_cookie` is where a doit leaves `nl_set_extack_cookie_u64`'s value,
+which the layer appends to the success ACK as `NLMSGERR_ATTR_COOKIE` (with
+`NLM_F_ACK_TLVS`) only when the socket enabled `NETLINK_EXT_ACK`.
+`admin` is an optional, kernel-held interface-bound `AdminHandle`; the
+default reply builder supplies none and no capabilities. The socket bridge
+passes only explicitly delegated authority. Family mutations check its
+current validity, interface name and namespace before queueing work, and
+again when asynchronous work starts. Generic-netlink attributes cannot mint
+or substitute capabilities.
 `AdminHandle::authorize_interface(name, namespace)` performs this boundary
 check through `Cap::invoke`, including the current revocation epoch.
 
@@ -399,6 +427,16 @@ Its installed socket sink filters by `NETLINK_GENERIC`, namespace and
 membership, queues at most 256 notifications per socket, and wakes readiness
 after releasing the queue lock. This is a bounded, best-effort multicast
 path; callers recover lost scan notifications by querying cached results.
+
+`unicast_event(family, net_ns_id, portid, reply)` is `genlmsg_unicast`: the
+installed unicast sink queues the message (`nlmsg_pid` 0, no group) on the
+`NETLINK_GENERIC` socket of that namespace bound to `portid`; an unknown
+family is -ENOENT, no such socket (or a full queue) -ECONNREFUSED.
+`register_release_notifier` / `notify_release(net_ns_id, portid)` model the
+`NETLINK_URELEASE` notifier chain: the socket layer calls `notify_release`
+when a `NETLINK_GENERIC` socket that holds a port id is released, and every
+registered notifier runs outside the registry lock (nl80211 tears down the
+connection that socket owned).
 
 `NETLINK_SOCK_DIAG` accepts Linux `SOCK_DIAG_BY_FAMILY` /
 `inet_diag_req_v2` dumps for IPv4 and IPv6 TCP and UDP. It filters by the requested

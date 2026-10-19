@@ -2420,6 +2420,7 @@ name = "narf-drivers-wireless"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "narf-boot",
  "narf-bus",
  "narf-capabilities",
  "narf-console",
@@ -2430,6 +2431,7 @@ dependencies = [
  "narf-drivers-usb",
  "narf-drivers-wireless-mt76",
  "narf-firmware",
+ "narf-firmware-smbios",
  "narf-init",
  "narf-interrupts",
  "narf-io",
@@ -2438,6 +2440,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-net",
+ "narf-power",
  "narf-scheduler",
  "narf-time",
  "narf-wireless",
@@ -2595,6 +2598,9 @@ dependencies = [
 name = "narf-firmware-smbios"
 version = "0.0.0"
 dependencies = [
+ "narf-boot",
+ "narf-console",
+ "narf-init",
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",

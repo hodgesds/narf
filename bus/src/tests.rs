@@ -1347,6 +1347,26 @@ fn smoke_pci_express_cap_link_status() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("bus", smoke_pci_express_cap_link_status);
 
+fn smoke_pci_express_link_control_update() -> TestResult {
+    // Linux pcie_capability_clear_and_set_word semantics: clear first,
+    // then set; bits outside both masks are preserved.
+    use crate::pci_express::{link_control_update, LNKCTL_ASPMC};
+    // ASPM disable: L0s|L1 (0b11) cleared, RCB (bit 3) + CCC (bit 6) kept.
+    if link_control_update(0x004B, LNKCTL_ASPMC, 0) != 0x0048 {
+        return TestResult::Fail("ASPM disable did not clear only bits[1:0]");
+    }
+    // ASPM restore of the saved L1-only setting.
+    if link_control_update(0x0048, LNKCTL_ASPMC, 0x004A & LNKCTL_ASPMC) != 0x004A {
+        return TestResult::Fail("ASPM restore did not re-set the saved L1 bit");
+    }
+    // A bit in both masks ends up set (set wins over clear).
+    if link_control_update(0x0000, 0x0001, 0x0001) != 0x0001 {
+        return TestResult::Fail("set must apply after clear");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus", smoke_pci_express_link_control_update);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_msix_program_block() -> TestResult {
     // Validate block reservation + entry encoding without rewriting a live

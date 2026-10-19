@@ -1741,6 +1741,66 @@ fn alloc_pages_on_inner(
     Err(FrameAllocError::Exhausted)
 }
 
+/// Allocate a contiguous kernel (UNMOVABLE) block of `1 << order`
+/// frames lying entirely at or below physical address `limit_phys`
+/// (inclusive: every byte of the block is `<= limit_phys`), searching
+/// every online node's zone. This is the frame-level half of Linux's
+/// `dma_set_coherent_mask` + `dma_alloc_coherent` contract for a
+/// device whose coherent DMA mask is `limit_phys` (e.g. 32-bit masks:
+/// `limit_phys = 0xffff_ffff`).
+///
+/// Returns `Exhausted` — never a frame above the limit — when no block
+/// fits, including when `limit_phys` lies below all managed RAM. The
+/// early boot ceiling, if still in force, is honoured too. Free with
+/// [`free_pages`].
+pub fn alloc_pages_below(order: u8, limit_phys: u64) -> Result<PhysFrame, FrameAllocError> {
+    if order > MAX_ORDER {
+        return Err(FrameAllocError::Exhausted);
+    }
+    if !ALLOC.initialised.load(Ordering::Acquire) {
+        return Err(FrameAllocError::Uninitialised);
+    }
+    // One past the last frame number whose final byte is <= limit_phys.
+    let mut ceil = (limit_phys >> PAGE_SHIFT).saturating_add(1);
+    if limit_phys & (PAGE_SIZE - 1) != PAGE_SIZE - 1 {
+        // A partial last page cannot hold a whole frame.
+        ceil -= 1;
+    }
+    ceil = ceil.min(buddy::early_ceiling_frame());
+    if ceil == 0 {
+        return Err(FrameAllocError::Exhausted);
+    }
+    #[cfg(feature = "cgroup")]
+    let charge_bytes = PAGE_SIZE << order;
+    #[cfg(feature = "cgroup")]
+    if !crate::cgroup_charge::try_charge(charge_bytes) {
+        return Err(FrameAllocError::Exhausted);
+    }
+    let preferred = current_cpu_node().min(MAX_NUMA_NODES - 1);
+    let mt = AllocContext::Kernel.migrate_type();
+    let try_alloc = |z: &mut BuddyZone| z.alloc_below_mt(order, ceil, mt);
+    // Zone 0 holds everything until `rebalance_to_topology` runs.
+    let mut nodes = online_node_mask() | 1;
+    while nodes != 0 {
+        let node = nodes.trailing_zeros() as usize;
+        nodes &= nodes - 1;
+        if node >= MAX_NUMA_NODES {
+            break;
+        }
+        let first_try = try_alloc(&mut ZONES[node].0.lock());
+        if let Some(no) =
+            first_try.or_else(|| with_node_frame_caches_drained(node, |zone| try_alloc(zone)))
+        {
+            account_allocated_frames(node, 1usize << order);
+            account_numa_allocation(preferred, node, 1u64 << order);
+            return Ok(buddy::frame_from_no(no));
+        }
+    }
+    #[cfg(feature = "cgroup")]
+    crate::cgroup_charge::uncharge(charge_bytes);
+    Err(FrameAllocError::Exhausted)
+}
+
 /// Free a contiguous block of `1 << order` frames previously returned
 /// from `alloc_pages_on` (the kernel/UNMOVABLE default).
 pub fn free_pages(frame: PhysFrame, order: u8) {
@@ -3573,6 +3633,60 @@ fn smoke_buddy_zone_locks_are_independent() -> narf_kernel_test::TestResult {
     TestResult::Pass
 }
 narf_kernel_test::kernel_test_in!("memory/frame", smoke_buddy_zone_locks_are_independent);
+
+/// `alloc_pages_below` (Linux `dma_set_coherent_mask` semantics): every
+/// byte of the block is <= the limit, and a limit no RAM satisfies is an
+/// error rather than a high frame.
+fn smoke_alloc_pages_below_honours_mask() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+
+    if !ALLOC.initialised.load(Ordering::Acquire) {
+        return TestResult::Skip("buddy allocator not initialised");
+    }
+    const DMA32: u64 = 0xffff_ffff;
+    for order in [0u8, 1, 4, 7] {
+        let frame = match alloc_pages_below(order, DMA32) {
+            Ok(f) => f,
+            Err(_) => return TestResult::Fail("no DMA32 block although RAM starts below 4 GiB"),
+        };
+        let start = frame.start_address().raw();
+        let last = start + (PAGE_SIZE << order) - 1;
+        free_pages(frame, order);
+        if last > DMA32 {
+            return TestResult::Fail("alloc_pages_below returned bytes above the mask");
+        }
+        if start & ((PAGE_SIZE << order) - 1) != 0 {
+            return TestResult::Fail("alloc_pages_below block not naturally aligned");
+        }
+    }
+    // A limit inside the 1 MiB the buddy never manages: no frame can
+    // satisfy it, so the call must fail instead of handing out RAM
+    // above the mask.
+    for limit in [0u64, 0xfff, 0x1000, LOW_RESERVED_BYTES - 1] {
+        if alloc_pages_below(0, limit).is_ok() {
+            return TestResult::Fail("alloc_pages_below satisfied a mask below managed RAM");
+        }
+    }
+    // A mask ending mid-page cannot hold that page.
+    let lowest = match alloc_pages_below(0, DMA32) {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("DMA32 order-0 allocation failed"),
+    };
+    let lo = lowest.start_address().raw();
+    free_pages(lowest, 0);
+    if let Ok(f) = alloc_pages_below(0, lo + 0x7ff) {
+        let end = f.start_address().raw() + PAGE_SIZE - 1;
+        free_pages(f, 0);
+        if end > lo + 0x7ff {
+            return TestResult::Fail("partial last page counted as allocatable");
+        }
+    }
+    if alloc_pages_below(MAX_ORDER + 1, DMA32).is_ok() {
+        return TestResult::Fail("order above MAX_ORDER accepted");
+    }
+    TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!("memory/frame", smoke_alloc_pages_below_honours_mask);
 
 #[cfg(feature = "kernel-test")]
 fn smoke_order0_frame_cache_round_trip() -> narf_kernel_test::TestResult {

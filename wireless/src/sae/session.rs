@@ -50,7 +50,21 @@ use narf_crypto::p256::point::{scalar_mul, AffinePoint};
 use narf_crypto::p256::scalar::Scalar;
 
 use super::dragonfly::{CommitFrame, ConfirmFrame, HmacSha256, MacPrimitive, SaeError, SaeState};
-use super::pt::{pt_h2e, pwe_from_pt, pwe_valid};
+use super::pt::{pt_h2e_bytes, pwe_from_pt, pwe_hunt_and_peck, pwe_valid};
+
+/// `WLAN_EID_EXT_REJECTED_GROUPS`.
+pub const EID_EXT_REJECTED_GROUPS: u8 = 92;
+/// `WLAN_EID_EXT_ANTI_CLOGGING_TOKEN`.
+pub const EID_EXT_ANTI_CLOGGING_TOKEN: u8 = 93;
+
+/// How the session derives its PWE (hostap `sae->h2e`).
+#[derive(Debug, Clone)]
+enum PweSource {
+    /// Hash-to-Element from the cached PT (`sae_prepare_commit_pt`).
+    H2e(AffinePoint),
+    /// Hunting and pecking over the password (`sae_prepare_commit`).
+    HuntAndPeck(Vec<u8>),
+}
 
 /// SAE sync-retry limit (§12.4.8.6.4: `dot11RSNASAESync`, default 5).
 const MAX_SYNC_RETRIES: u8 = 5;
@@ -61,9 +75,9 @@ const MAX_SYNC_RETRIES: u8 = 5;
 #[derive(Debug)]
 pub struct SaeSession {
     state: SaeState,
-    /// Password Token — derived once per (ssid, password). Cached so
-    /// repeated handshakes against the same network are cheap.
-    pt: AffinePoint,
+    /// The PWE source: the Password Token (H2E, derived once per
+    /// (ssid, password)) or the password (hunting and pecking).
+    pwe_src: PweSource,
     /// Password Element — derived per (PT, mac_a, mac_b). `None`
     /// until `build_commit` first runs.
     pwe: Option<AffinePoint>,
@@ -110,6 +124,13 @@ pub struct SaeSession {
     /// Test RNG seed override. Used by deterministic smokes; the
     /// production constructor leaves it None.
     test_seed: Option<[u8; 64]>,
+    /// Test override of `(rand, mask)` (the IEEE 802.11 Annex J.10
+    /// vectors fix both).
+    test_rand_mask: Option<(Scalar, Scalar)>,
+    /// PMKID = L((commit-scalar + peer-commit-scalar) mod r, 0, 128).
+    pmkid: Option<[u8; 16]>,
+    /// The peer's Rejected Groups element payload (H2E), the keyseed salt.
+    peer_rejected_groups: Vec<u8>,
 }
 
 impl SaeSession {
@@ -129,10 +150,47 @@ impl SaeSession {
         own_mac: [u8; 6],
         peer_mac: [u8; 6],
     ) -> Self {
-        let pt = pt_h2e(ssid, password, identifier);
+        let pt = pt_h2e_bytes(
+            ssid.as_bytes(),
+            password.as_bytes(),
+            identifier.map(str::as_bytes),
+        );
+        let mut s = Self::with_source(PweSource::H2e(pt), own_mac, peer_mac);
+        s.sae_pk = super::pk::is_sae_pk_password(password);
+        s
+    }
+
+    /// An H2E session over raw SSID / password octets.
+    pub fn new_h2e_bytes(
+        ssid: &[u8],
+        password: &[u8],
+        own_mac: [u8; 6],
+        peer_mac: [u8; 6],
+    ) -> Self {
+        let pt = pt_h2e_bytes(ssid, password, None);
+        let mut s = Self::with_source(PweSource::H2e(pt), own_mac, peer_mac);
+        // Netlink and scan paths retain SSIDs/passwords as raw octets, so
+        // drivers use this constructor rather than `new(&str, &str, ...)`.
+        // SAE-PK passwords are ASCII by definition; recognize them here too
+        // or the session would derive the ordinary SAE key schedule and lose
+        // the KEK needed to authenticate the AP's KeyAuth Confirm element.
+        s.sae_pk = core::str::from_utf8(password).is_ok_and(super::pk::is_sae_pk_password);
+        s
+    }
+
+    /// A hunting-and-pecking session (hostap `sae_prepare_commit`, the
+    /// Commit sent with status 0): the PWE comes from
+    /// [`pwe_hunt_and_peck`] over `(password, own, peer)`.
+    pub fn new_hunt_and_peck(password: &[u8], own_mac: [u8; 6], peer_mac: [u8; 6]) -> Self {
+        let mut s = Self::with_source(PweSource::HuntAndPeck(password.to_vec()), own_mac, peer_mac);
+        s.sae_pk = core::str::from_utf8(password).is_ok_and(super::pk::is_sae_pk_password);
+        s
+    }
+
+    fn with_source(pwe_src: PweSource, own_mac: [u8; 6], peer_mac: [u8; 6]) -> Self {
         Self {
             state: SaeState::Nothing,
-            pt,
+            pwe_src,
             pwe: None,
             rand: Scalar::ZERO,
             private: Scalar::ZERO,
@@ -143,14 +201,63 @@ impl SaeSession {
             kck: None,
             pmk: None,
             kek: None,
-            sae_pk: super::pk::is_sae_pk_password(password),
+            sae_pk: false,
             peer_confirm_ies: Vec::new(),
             own_mac,
             peer_mac,
             send_confirm_counter: 0,
             sync_retries: 0,
             test_seed: None,
+            test_rand_mask: None,
+            pmkid: None,
+            peer_rejected_groups: Vec::new(),
         }
+    }
+
+    /// Whether the PWE is Hash-to-Element (hostap `sae->h2e`): the Commit
+    /// carries status 126 and the token goes in a container element.
+    pub fn is_h2e(&self) -> bool {
+        matches!(self.pwe_src, PweSource::H2e(_))
+    }
+
+    /// Test hook: fix `rand` and `mask` (big-endian, each in `[1, r)`)
+    /// the way hostap's `sae_tests` overrides `sae->tmp->sae_rand`.
+    pub fn with_test_rand_mask(mut self, rand: [u8; 32], mask: [u8; 32]) -> Self {
+        if let (Some(r), Some(m)) = (Scalar::from_bytes_be(&rand), Scalar::from_bytes_be(&mask)) {
+            self.test_rand_mask = Some((r, m));
+        }
+        self
+    }
+
+    /// The PMKID (`sae->pmkid`) once the peer's Commit was processed.
+    pub fn pmkid(&self) -> Option<&[u8; 16]> {
+        self.pmkid.as_ref()
+    }
+
+    /// The Commit body for the current scalar / element (hostap
+    /// `sae_write_commit`): group (LE) || [legacy token] || scalar ||
+    /// element || [H2E Anti-Clogging Token Container]. An anti-clogging
+    /// retry resends the same scalar and element with the AP's token
+    /// (`sme_auth_build_sae_commit(.., reuse = 1)`). Empty before
+    /// [`Self::build_commit`].
+    pub fn commit_body(&self, token: Option<&[u8]>) -> Vec<u8> {
+        if self.state == SaeState::Nothing {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(2 + 32 + 64 + token.map_or(0, |t| t.len() + 3));
+        out.extend_from_slice(&19u16.to_le_bytes()); // Group 19 = P-256
+        if let (false, Some(t)) = (self.is_h2e(), token) {
+            out.extend_from_slice(t);
+        }
+        out.extend_from_slice(&self.commit_scalar.to_bytes_be());
+        out.extend_from_slice(&self.commit_element.to_encoded().unwrap_or([0u8; 64]));
+        if let (true, Some(t)) = (self.is_h2e(), token) {
+            out.push(0xFF); // WLAN_EID_EXTENSION
+            out.push((1 + t.len()) as u8);
+            out.push(EID_EXT_ANTI_CLOGGING_TOKEN);
+            out.extend_from_slice(t);
+        }
+        out
     }
 
     /// Test hook: seed the per-handshake RNG with a deterministic
@@ -222,20 +329,40 @@ impl SaeSession {
     /// a re-Commit (sync retry); the local rand / private are kept so
     /// the peer's prior Commit (if any) still matches our K.
     pub fn build_commit(&mut self) -> Vec<u8> {
-        // PWE is fresh — derived from (PT, own_mac, peer_mac).
-        let pwe = pwe_from_pt(self.pt, &self.own_mac, &self.peer_mac);
+        // sae_prepare_commit / sae_prepare_commit_pt → PWE.
+        let pwe = match &self.pwe_src {
+            PweSource::H2e(pt) => pwe_from_pt(*pt, &self.own_mac, &self.peer_mac),
+            PweSource::HuntAndPeck(pw) => {
+                match pwe_hunt_and_peck(pw, &self.own_mac, &self.peer_mac) {
+                    Some((p, _)) => p,
+                    // "SAE: Could not pick PWE"
+                    None => return Vec::new(),
+                }
+            }
+        };
         self.pwe = Some(pwe);
 
-        // Sample rand + private (a.k.a. "mask" in the spec).
-        let (rand, mask) = sample_two_scalars(self.test_seed.as_ref());
+        // sae_derive_commit: rand, mask; commit-scalar = (rand + mask)
+        // mod r must be > 1 (dragonfly_generate_scalar retries).
+        let (rand, mask, commit_scalar) = match self.test_rand_mask {
+            Some((r, m)) => (r, m, r.add(&m)),
+            None => {
+                let mut tries = 0u8;
+                loop {
+                    let (r, m) = sample_two_scalars(self.test_seed.as_ref(), tries);
+                    let c = r.add(&m);
+                    tries = tries.wrapping_add(1);
+                    if !c.is_zero() && c != Scalar::ONE {
+                        break (r, m, c);
+                    }
+                }
+            }
+        };
         self.rand = rand;
         self.private = mask;
-
-        // commit_scalar = (rand + mask) mod n
-        let commit_scalar = rand.add(&mask);
         self.commit_scalar = commit_scalar;
 
-        // commit_element = inverse(mask · PWE) = -(mask · PWE)
+        // COMMIT-ELEMENT = inverse(scalar-op(mask, PWE))
         let mp = scalar_mul(&mask, &pwe);
         self.commit_element = AffinePoint {
             x: mp.x,
@@ -244,44 +371,79 @@ impl SaeSession {
         };
 
         self.state = SaeState::Committed;
-
-        // Serialise: group (LE) || scalar (BE) || element (BE X||Y).
-        let mut out = Vec::with_capacity(2 + 32 + 64);
-        out.extend_from_slice(&19u16.to_le_bytes()); // Group 19 = P-256
-        out.extend_from_slice(&commit_scalar.to_bytes_be());
-        let enc = self.commit_element.to_encoded().unwrap_or([0u8; 64]);
-        out.extend_from_slice(&enc);
-        out
+        self.commit_body(None)
     }
 
-    /// Consume peer's Commit. Decodes the body, derives the shared
-    /// secret K, and runs the KCK/PMK KDF.
+    /// Consume the peer's Commit body (after the Authentication frame's
+    /// algorithm / transaction / status), as hostap `sae_parse_commit` +
+    /// `sae_process_commit`: group 19 (`sae_group_allowed`), commit-scalar
+    /// in `(1, r)` (`sae_parse_commit_scalar`), COMMIT-ELEMENT on the
+    /// curve (`sae_parse_commit_element`); for H2E the trailing Rejected
+    /// Groups element (which must not name group 19,
+    /// `sme_check_sae_rejected_groups`) feeds the keyseed salt; a Commit
+    /// equal to ours is a reflection (`SAE_SILENTLY_DISCARD` →
+    /// [`SaeError::Reflection`]). Then `K = rand · (peer-scalar · PWE +
+    /// PEER-ELEMENT)`, keyseed, KCK || PMK, PMKID (`sae_derive_keys`).
     pub fn on_commit(&mut self, peer_commit: &[u8]) -> Result<(), SaeError> {
         if self.state != SaeState::Committed {
             return Err(SaeError::Protocol);
         }
-        // Decode the SAE Commit variable body.
         let frame = CommitFrame::decode(peer_commit, 32, 64).ok_or(SaeError::InvalidParameters)?;
         if frame.group != 19 {
-            // §12.4.7.4 + §9.4.1.9: rejection signalled at the SAE
-            // status layer (status 77). At this API surface we just
-            // surface InvalidParameters; the driver formats the wire
-            // response.
-            return Err(SaeError::InvalidParameters);
-        }
-        if frame.scalar.len() != 32 || frame.element.len() != 64 {
+            // WLAN_STATUS_FINITE_CYCLIC_GROUP_NOT_SUPPORTED at the
+            // frame layer; the driver formats the response.
             return Err(SaeError::InvalidParameters);
         }
         let mut s_buf = [0u8; 32];
         s_buf.copy_from_slice(&frame.scalar);
         let peer_scalar = Scalar::from_bytes_be(&s_buf).ok_or(SaeError::InvalidParameters)?;
+        // "Invalid peer scalar": scalar <= 1 or >= r.
+        if peer_scalar.is_zero() || peer_scalar == Scalar::ONE {
+            return Err(SaeError::InvalidParameters);
+        }
         let peer_element =
             AffinePoint::from_encoded(&frame.element).ok_or(SaeError::InvalidParameters)?;
-        if peer_element.infinity {
+        if peer_element.infinity || !peer_element.is_on_curve() {
             return Err(SaeError::InvalidParameters);
+        }
+        // H2E elements after the element (Rejected Groups; the
+        // Anti-Clogging Token Container is skipped).
+        let mut rejected = Vec::new();
+        if self.is_h2e() {
+            let mut rest = &peer_commit[2 + 32 + 64..];
+            while rest.len() >= 3 && rest[0] == 0xFF {
+                let len = rest[1] as usize;
+                if len == 0 || rest.len() < 2 + len {
+                    break;
+                }
+                if rest[2] == EID_EXT_REJECTED_GROUPS {
+                    let groups = &rest[3..2 + len];
+                    // sae_parse_rejected_groups: a list of 16-bit groups.
+                    if groups.len() % 2 != 0 {
+                        return Err(SaeError::InvalidParameters);
+                    }
+                    // sme_check_sae_rejected_groups: the AP claims it
+                    // rejected a group we would have used.
+                    if groups
+                        .chunks(2)
+                        .any(|g| u16::from_le_bytes([g[0], g[1]]) == 19)
+                    {
+                        return Err(SaeError::InvalidParameters);
+                    }
+                    rejected = groups.to_vec();
+                }
+                rest = &rest[2 + len..];
+            }
+        }
+        // Reflection check: the peer sent our own scalar and element.
+        if peer_scalar == self.commit_scalar
+            && peer_element.to_encoded() == self.commit_element.to_encoded()
+        {
+            return Err(SaeError::Reflection);
         }
         self.peer_scalar = peer_scalar;
         self.peer_element = peer_element;
+        self.peer_rejected_groups = rejected;
 
         // K = rand · (peer_scalar · PWE + peer_element).
         let pwe = self.pwe.ok_or(SaeError::Protocol)?;
@@ -299,20 +461,27 @@ impl SaeSession {
         }
         let k_x = k.x.to_bytes_be();
 
-        // Derive KCK || PMK via HKDF per §12.4.5.4. The KDF input is
-        // K.x; the salt is the bit-wise sum (as canonical sorted pair)
-        // of the two scalars; the label is "SAE KCK and PMK". For an
-        // SAE-PK session the label becomes "SAE-PK keys" and the output is
-        // extended to KCK || PMK || KEK (hostap sae_derive_keys).
+        // sae_derive_keys: keyseed = H(salt, k); salt = the rejected
+        // groups (H2E, the peer's list: we never reject one) or 32 zeros.
+        let keyseed = sae_keyseed(&k_x, &self.peer_rejected_groups);
+        let context = sae_key_context(&self.commit_scalar, &peer_scalar);
+        let mut pmkid = [0u8; 16];
+        pmkid.copy_from_slice(&context[..16]);
+        self.pmkid = Some(pmkid);
+        let take = |b: &[u8]| -> [u8; 32] {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(b);
+            k
+        };
         if self.sae_pk {
-            let (kck, pmk, kek) = derive_sae_pk_keys(&k_x, &self.commit_scalar, &peer_scalar);
-            self.kck = Some(kck);
-            self.pmk = Some(pmk);
-            self.kek = Some(kek);
+            let keys = kdf_sha256(&keyseed, b"SAE-PK keys", &context, 96);
+            self.kck = Some(take(&keys[..32]));
+            self.pmk = Some(take(&keys[32..64]));
+            self.kek = Some(take(&keys[64..96]));
         } else {
-            let (kck, pmk) = derive_kck_pmk(&k_x, &self.commit_scalar, &peer_scalar);
-            self.kck = Some(kck);
-            self.pmk = Some(pmk);
+            let keys = kdf_sha256(&keyseed, b"SAE KCK and PMK", &context, 64);
+            self.kck = Some(take(&keys[..32]));
+            self.pmk = Some(take(&keys[32..64]));
         }
         Ok(())
     }
@@ -428,7 +597,7 @@ impl SaeSession {
 /// Pull two random scalars from either the test seed or the per-task
 /// RNG. Mirrors `dragonfly::group_random_scalar` so the H2E session
 /// uses the same entropy source as the legacy path.
-fn sample_two_scalars(test_seed: Option<&[u8; 64]>) -> (Scalar, Scalar) {
+fn sample_two_scalars(test_seed: Option<&[u8; 64]>, retry: u8) -> (Scalar, Scalar) {
     fn from_seed(seed: &[u8; 64], info: &[u8]) -> Scalar {
         let prk = narf_crypto::hkdf::hkdf_extract(None, seed);
         let okm = narf_crypto::hkdf::hkdf_expand(&prk, info, 48);
@@ -441,7 +610,11 @@ fn sample_two_scalars(test_seed: Option<&[u8; 64]>) -> (Scalar, Scalar) {
         s
     }
     let seed = match test_seed {
-        Some(s) => *s,
+        Some(s) => {
+            let mut s = *s;
+            s[0] ^= retry;
+            s
+        }
         None => {
             let mut buf = [0u8; 64];
             narf_crypto::fill_random_bytes(&mut buf);
@@ -453,28 +626,30 @@ fn sample_two_scalars(test_seed: Option<&[u8; 64]>) -> (Scalar, Scalar) {
     (rand, mask)
 }
 
-/// SAE keyseed per IEEE 802.11-2020 §12.4.5.4:
-/// `keyseed = H(salt, k)` = HKDF-Extract(HMAC-SHA256) with a salt of
-/// `hash_len` (32) zero octets — the H2E case without rejected groups, which
-/// is the only case NARF produces (group 19 only, no group negotiation). `k`
-/// is the shared secret `K.x`.
-fn sae_keyseed(k_x: &[u8; 32]) -> [u8; 32] {
-    narf_crypto::hkdf::hkdf_extract(Some(&[0u8; 32]), k_x)
+/// SAE keyseed (IEEE 802.11-2020 §12.4.5.4, hostap `sae_derive_keys`):
+/// `keyseed = HKDF-Extract(salt, K.x)` with the H2E rejected-groups list
+/// as the salt when one was exchanged, else 32 zero octets.
+fn sae_keyseed(k_x: &[u8; 32], rejected_groups: &[u8]) -> [u8; 32] {
+    if rejected_groups.is_empty() {
+        narf_crypto::hkdf::hkdf_extract(Some(&[0u8; 32]), k_x)
+    } else {
+        narf_crypto::hkdf::hkdf_extract(Some(rejected_groups), k_x)
+    }
 }
 
 /// SAE key context: `(commit-scalar + peer-commit-scalar) mod r`, encoded
-/// big-endian to the order length (32 for P-256). The modular sum is
-/// inherently symmetric, so both peers derive the same context.
+/// big-endian to the order length (32 for P-256).
 fn sae_key_context(s_self: &Scalar, s_peer: &Scalar) -> [u8; 32] {
     s_self.add(s_peer).to_bytes_be()
 }
 
-/// IEEE 802.11-2020 §12.7.1.6.2 KDF-Length over HMAC-SHA256
-/// (`sha256_prf_bits`): the concatenation of
-/// `HMAC-SHA256(key, LE16(i) || label || context || LE16(out_len*8))` for
-/// `i = 1, 2, …`, truncated to `out_len` bytes. `out_len` is a whole number of
-/// octets here, so no final-octet bit masking is needed.
-fn sae_kdf(keyseed: &[u8; 32], label: &[u8], context: &[u8], out_len: usize) -> Vec<u8> {
+/// IEEE 802.11-2020 §12.7.1.6.2 KDF-Hash-Length over HMAC-SHA256 (hostap
+/// `sha256_prf` / `sha256_prf_bits` for whole octets): the concatenation
+/// of `HMAC-SHA256(key, LE16(i) || label || context || LE16(out_len·8))`
+/// for `i = 1, 2, …`, truncated to `out_len` octets. Shared by SAE
+/// (`sae_kdf_hash`, hunting and pecking) and the SHA-256 AKMs' PTK
+/// (`wpa_pmk_to_ptk` → `sha256_prf`), so the Annex J.10 vector pins both.
+pub fn kdf_sha256(key: &[u8], label: &[u8], context: &[u8], out_len: usize) -> Vec<u8> {
     let len_bits = (out_len * 8) as u16;
     let mut out = Vec::with_capacity(out_len);
     let mut counter: u16 = 1;
@@ -484,46 +659,12 @@ fn sae_kdf(keyseed: &[u8; 32], label: &[u8], context: &[u8], out_len: usize) -> 
         msg.extend_from_slice(label);
         msg.extend_from_slice(context);
         msg.extend_from_slice(&len_bits.to_le_bytes());
-        let block = narf_crypto::hkdf::hmac_sha256(keyseed, &msg);
+        let block = narf_crypto::hkdf::hmac_sha256(key, &msg);
         let take = core::cmp::min(32, out_len - out.len());
         out.extend_from_slice(&block[..take]);
         counter = counter.wrapping_add(1);
     }
     out
-}
-
-/// Derive (KCK, PMK) per IEEE 802.11-2020 §12.4.5.4:
-/// `KCK || PMK = KDF-Hash-Length(keyseed, "SAE KCK and PMK",
-/// (commit-scalar + peer-commit-scalar) mod r)`.
-fn derive_kck_pmk(k_x: &[u8; 32], s_self: &Scalar, s_peer: &Scalar) -> ([u8; 32], [u8; 32]) {
-    let keyseed = sae_keyseed(k_x);
-    let context = sae_key_context(s_self, s_peer);
-    let keys = sae_kdf(&keyseed, b"SAE KCK and PMK", &context, 64);
-    let mut kck = [0u8; 32];
-    let mut pmk = [0u8; 32];
-    kck.copy_from_slice(&keys[..32]);
-    pmk.copy_from_slice(&keys[32..64]);
-    (kck, pmk)
-}
-
-/// SAE-PK key derivation: as [`derive_kck_pmk`] but with the "SAE-PK keys"
-/// label and output extended to `KCK || PMK || KEK` (hostap `sae_derive_keys`
-/// with `CONFIG_SAE_PK`). Returns `(kck, pmk, kek)`.
-fn derive_sae_pk_keys(
-    k_x: &[u8; 32],
-    s_self: &Scalar,
-    s_peer: &Scalar,
-) -> ([u8; 32], [u8; 32], [u8; 32]) {
-    let keyseed = sae_keyseed(k_x);
-    let context = sae_key_context(s_self, s_peer);
-    let keys = sae_kdf(&keyseed, b"SAE-PK keys", &context, 96);
-    let mut kck = [0u8; 32];
-    let mut pmk = [0u8; 32];
-    let mut kek = [0u8; 32];
-    kck.copy_from_slice(&keys[..32]);
-    pmk.copy_from_slice(&keys[32..64]);
-    kek.copy_from_slice(&keys[64..96]);
-    (kck, pmk, kek)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -745,7 +886,7 @@ mod session_tests {
         let keyseed = [0x5au8; 32];
         let label: &[u8] = b"SAE KCK and PMK";
         let context = [0x11u8; 32];
-        let out = sae_kdf(&keyseed, label, &context, 64);
+        let out = kdf_sha256(&keyseed, label, &context, 64);
         if out.len() != 64 {
             return TestResult::Fail("KDF output length wrong");
         }
@@ -765,10 +906,179 @@ mod session_tests {
         }
         // keyseed = HMAC-SHA256(zero-salt, K.x); context = (s_a + s_b) mod n.
         let k_x = [0x42u8; 32];
-        if sae_keyseed(&k_x) != narf_crypto::hkdf::hkdf_extract(Some(&[0u8; 32]), &k_x) {
+        if sae_keyseed(&k_x, &[]) != narf_crypto::hkdf::hkdf_extract(Some(&[0u8; 32]), &k_x) {
             return TestResult::Fail("keyseed is not HKDF-Extract(zero-salt, K.x)");
         }
         TestResult::Pass
     }
     kernel_test_in!("wireless/sae", smoke_sae_kdf_ieee_construction);
+    // ── IEEE Std 802.11-2020 Annex J.10 (hostap `sae_tests`) ─────────
+
+    const J10_ADDR1: [u8; 6] = [0x4d, 0x3f, 0x2f, 0xff, 0xe3, 0x87];
+    const J10_ADDR2: [u8; 6] = [0xa5, 0xd8, 0xaa, 0x95, 0x8e, 0x3c];
+    const J10_RAND: [u8; 32] = [
+        0x99, 0x24, 0x65, 0xfd, 0x3d, 0xaa, 0x3c, 0x60, 0xaa, 0x65, 0x65, 0xb7, 0xf6, 0x2a, 0x2a,
+        0x7f, 0x2e, 0x12, 0xdd, 0x12, 0xf1, 0x98, 0xfa, 0xf4, 0xfb, 0xed, 0x89, 0xd7, 0xff, 0x1a,
+        0xce, 0x94,
+    ];
+    const J10_MASK: [u8; 32] = [
+        0x95, 0x07, 0xa9, 0x0f, 0x77, 0x7a, 0x04, 0x4d, 0x6a, 0x08, 0x30, 0xb9, 0x1e, 0xa3, 0xd5,
+        0xdd, 0x70, 0xbe, 0xce, 0x44, 0xe1, 0xac, 0xff, 0xb8, 0x69, 0x83, 0xb5, 0xe1, 0xbf, 0x9f,
+        0xb3, 0x22,
+    ];
+    pub(crate) const J10_LOCAL_COMMIT: [u8; 98] = [
+        0x13, 0x00, 0x2e, 0x2c, 0x0f, 0x0d, 0xb5, 0x24, 0x40, 0xad, 0x14, 0x6d, 0x96, 0x71, 0x14,
+        0xce, 0x00, 0x5c, 0xe1, 0xea, 0xb0, 0xaa, 0x2c, 0x2e, 0x5c, 0x28, 0x71, 0xb7, 0x74, 0xf6,
+        0xc2, 0x57, 0x5c, 0x65, 0xd5, 0xad, 0x9e, 0x00, 0x82, 0x97, 0x07, 0xaa, 0x36, 0xba, 0x8b,
+        0x85, 0x97, 0x38, 0xfc, 0x96, 0x1d, 0x08, 0x24, 0x35, 0x05, 0xf4, 0x7c, 0x03, 0x53, 0x76,
+        0xd7, 0xac, 0x4b, 0xc8, 0xd7, 0xb9, 0x50, 0x83, 0xbf, 0x43, 0x82, 0x7d, 0x0f, 0xc3, 0x1e,
+        0xd7, 0x78, 0xdd, 0x36, 0x71, 0xfd, 0x21, 0xa4, 0x6d, 0x10, 0x91, 0xd6, 0x4b, 0x6f, 0x9a,
+        0x1e, 0x12, 0x72, 0x62, 0x13, 0x25, 0xdb, 0xe1,
+    ];
+    pub(crate) const J10_PEER_COMMIT: [u8; 98] = [
+        0x13, 0x00, 0x59, 0x1b, 0x96, 0xf3, 0x39, 0x7f, 0xb9, 0x45, 0x10, 0x08, 0x48, 0xe7, 0xb5,
+        0x50, 0x54, 0x3b, 0x67, 0x20, 0xd8, 0x83, 0x37, 0xee, 0x93, 0xfc, 0x49, 0xfd, 0x6d, 0xf7,
+        0xe0, 0x8b, 0x52, 0x23, 0xe7, 0x1b, 0x9b, 0xb0, 0x48, 0xd3, 0x87, 0x3f, 0x20, 0x55, 0x69,
+        0x53, 0xa9, 0x6c, 0x91, 0x53, 0x6f, 0xd8, 0xee, 0x6c, 0xa9, 0xb4, 0xa6, 0x8a, 0x14, 0x8b,
+        0x05, 0x6a, 0x90, 0x9b, 0xe0, 0x3e, 0x83, 0xae, 0x20, 0x8f, 0x60, 0xf8, 0xef, 0x55, 0x37,
+        0x85, 0x80, 0x74, 0xdb, 0x06, 0x68, 0x70, 0x32, 0x39, 0x98, 0x62, 0x99, 0x9b, 0x51, 0x1e,
+        0x0a, 0x15, 0x52, 0xa5, 0xfe, 0xa3, 0x17, 0xc2,
+    ];
+    const J10_KCK: [u8; 32] = [
+        0x1e, 0x73, 0x3f, 0x6d, 0x9b, 0xd5, 0x32, 0x56, 0x28, 0x73, 0x04, 0x33, 0x88, 0x31, 0xb0,
+        0x9a, 0x39, 0x40, 0x6d, 0x12, 0x10, 0x17, 0x07, 0x3a, 0x5c, 0x30, 0xdb, 0x36, 0xf3, 0x6c,
+        0xb8, 0x1a,
+    ];
+    const J10_PMK: [u8; 32] = [
+        0x4e, 0x4d, 0xfa, 0xb1, 0xa2, 0xdd, 0x8a, 0xc1, 0xa9, 0x17, 0x90, 0xf9, 0x53, 0xfa, 0xaa,
+        0x45, 0x2a, 0xe5, 0xc6, 0x87, 0x3a, 0xb7, 0x5b, 0x63, 0x60, 0x5b, 0xa6, 0x63, 0xf8, 0xa7,
+        0xfe, 0x59,
+    ];
+    const J10_PMKID: [u8; 16] = [
+        0x87, 0x47, 0xa6, 0x00, 0xee, 0xa3, 0xf9, 0xf2, 0x24, 0x75, 0xdf, 0x58, 0xca, 0x1e, 0x54,
+        0x98,
+    ];
+
+    /// Hunting-and-pecking PWE, the Commit from fixed rand / mask, and
+    /// KCK / PMK / PMKID after the peer's Commit: hostap
+    /// `common_module_tests.c::sae_tests` (IEEE 802.11-2020 Annex J.10,
+    /// password "mekmitasdigoat").
+    fn smoke_sae_hunt_and_peck_ieee_j10_vector() -> TestResult {
+        let mut s = SaeSession::new_hunt_and_peck(b"mekmitasdigoat", J10_ADDR1, J10_ADDR2)
+            .with_test_rand_mask(J10_RAND, J10_MASK);
+        if s.is_h2e() {
+            return TestResult::Fail("hunting-and-pecking session reports H2E");
+        }
+        let commit = s.build_commit();
+        if commit[..] != J10_LOCAL_COMMIT[..] {
+            return TestResult::Fail("J.10 local commit");
+        }
+        if s.on_commit(&J10_PEER_COMMIT).is_err() {
+            return TestResult::Fail("J.10 peer commit rejected");
+        }
+        if s.kck() != Some(&J10_KCK) {
+            return TestResult::Fail("J.10 KCK");
+        }
+        if s.pmk() != Some(&J10_PMK) {
+            return TestResult::Fail("J.10 PMK");
+        }
+        if s.pmkid() != Some(&J10_PMKID) {
+            return TestResult::Fail("J.10 PMKID");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/sae", smoke_sae_hunt_and_peck_ieee_j10_vector);
+
+    /// H2E: PT from (SSID "byteme", "mekmitasdigoat", identifier
+    /// "psk4internet") and PWE for 00:09:5b:66:ec:1e / 00:0b:6b:d9:02:46 —
+    /// the group 19 `pwe_19_x` / `pwe_19_y` of hostap `sae_tests`
+    /// (IEEE 802.11-2020 Annex J.10).
+    fn smoke_sae_h2e_pwe_ieee_j10_vector() -> TestResult {
+        let pt =
+            super::super::pt::pt_h2e_bytes(b"byteme", b"mekmitasdigoat", Some(b"psk4internet"));
+        let pwe = pwe_from_pt(
+            pt,
+            &[0x00, 0x09, 0x5b, 0x66, 0xec, 0x1e],
+            &[0x00, 0x0b, 0x6b, 0xd9, 0x02, 0x46],
+        );
+        let want: [u8; 64] = [
+            0xc9, 0x30, 0x49, 0xb9, 0xe6, 0x40, 0x00, 0xf8, 0x48, 0x20, 0x16, 0x49, 0xe9, 0x99,
+            0xf2, 0xb5, 0xc2, 0x2d, 0xea, 0x69, 0xb5, 0x63, 0x2c, 0x9d, 0xf4, 0xd6, 0x33, 0xb8,
+            0xaa, 0x1f, 0x6c, 0x1e, 0x73, 0x63, 0x4e, 0x94, 0xb5, 0x3d, 0x82, 0xe7, 0x38, 0x3a,
+            0x8d, 0x25, 0x81, 0x99, 0xd9, 0xdc, 0x1a, 0x5e, 0xe8, 0x26, 0x9d, 0x06, 0x03, 0x82,
+            0xcc, 0xbf, 0x33, 0xe6, 0x14, 0xff, 0x59, 0xa0,
+        ];
+        if pwe.to_encoded() != Some(want) {
+            return TestResult::Fail("J.10 H2E PWE");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/sae", smoke_sae_h2e_pwe_ieee_j10_vector);
+
+    /// Negative: a reflected Commit, a scalar of 1, an off-curve element,
+    /// another group, and an H2E Rejected Groups element naming 19 are
+    /// all refused; the anti-clogging token is placed per hostap
+    /// `sae_write_commit` (inline for hunting and pecking, a container
+    /// element for H2E) around the unchanged scalar / element.
+    fn smoke_sae_commit_parse_rejects_and_token_placement() -> TestResult {
+        let mk = || {
+            SaeSession::new_hunt_and_peck(b"mekmitasdigoat", J10_ADDR1, J10_ADDR2)
+                .with_test_rand_mask(J10_RAND, J10_MASK)
+        };
+        let mut s = mk();
+        let own = s.build_commit();
+        if s.on_commit(&own) != Err(SaeError::Reflection) {
+            return TestResult::Fail("reflected commit accepted");
+        }
+        let mut one = J10_PEER_COMMIT;
+        one[2..34].fill(0);
+        one[33] = 1;
+        if mk().commit_then(&one) != Err(SaeError::InvalidParameters) {
+            return TestResult::Fail("scalar 1 accepted");
+        }
+        let mut off = J10_PEER_COMMIT;
+        off[97] ^= 1;
+        if mk().commit_then(&off) != Err(SaeError::InvalidParameters) {
+            return TestResult::Fail("off-curve element accepted");
+        }
+        let mut g20 = J10_PEER_COMMIT;
+        g20[0] = 20;
+        if mk().commit_then(&g20) != Err(SaeError::InvalidParameters) {
+            return TestResult::Fail("group 20 accepted");
+        }
+        // Legacy token: group || token || scalar || element.
+        let tok = [0xAB, 0xCD, 0xEF];
+        let b = s.commit_body(Some(&tok));
+        if b[..2] != own[..2] || b[2..5] != tok || b[5..] != own[2..] {
+            return TestResult::Fail("legacy token placement");
+        }
+        // H2E: container element after the element; rejected group 19.
+        let mut h = SaeSession::new_h2e_bytes(b"byteme", b"pw", J10_ADDR1, J10_ADDR2)
+            .with_test_rand_mask(J10_RAND, J10_MASK);
+        let hc = h.build_commit();
+        let hb = h.commit_body(Some(&tok));
+        if hb[..98] != hc[..]
+            || hb[98..] != [0xFF, 4, EID_EXT_ANTI_CLOGGING_TOKEN, 0xAB, 0xCD, 0xEF]
+        {
+            return TestResult::Fail("H2E token container");
+        }
+        let mut peer = SaeSession::new_h2e_bytes(b"byteme", b"pw", J10_ADDR2, J10_ADDR1);
+        let mut pc = peer.build_commit();
+        pc.extend_from_slice(&[0xFF, 3, EID_EXT_REJECTED_GROUPS, 19, 0]);
+        if h.on_commit(&pc) != Err(SaeError::InvalidParameters) {
+            return TestResult::Fail("rejected group 19 accepted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "wireless/sae",
+        smoke_sae_commit_parse_rejects_and_token_placement
+    );
+
+    impl SaeSession {
+        fn commit_then(mut self, peer: &[u8]) -> Result<(), SaeError> {
+            self.build_commit();
+            self.on_commit(peer)
+        }
+    }
 }

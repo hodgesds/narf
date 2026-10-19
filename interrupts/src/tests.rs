@@ -549,6 +549,53 @@ fn smoke_vector_alloc_block_contiguous() -> TestResult {
 }
 kernel_test_in!("interrupts", smoke_vector_alloc_block_contiguous);
 
+fn smoke_vector_alloc_block_aligned() -> TestResult {
+    // Multi-message MSI: a 32-vector block must start on a multiple
+    // of 32, even when an unaligned run is free first.
+    use crate::vector::{alloc, alloc_block_aligned, free, is_allocated, VectorError};
+    // Occupy one vector so the lowest free run is likely unaligned.
+    let pin = match alloc() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("alloc() failed"),
+    };
+    let base = match alloc_block_aligned(32, 32) {
+        Ok(b) => b,
+        Err(_) => {
+            let _ = free(pin);
+            return TestResult::Fail("alloc_block_aligned(32, 32) failed");
+        }
+    };
+    let mut verdict = TestResult::Pass;
+    if base % 32 != 0 {
+        verdict = TestResult::Fail("alloc_block_aligned base not 32-aligned");
+    }
+    for i in 0..32 {
+        if !is_allocated(base + i) {
+            verdict = TestResult::Fail("alloc_block_aligned bit not set");
+        }
+    }
+    for i in 0..32 {
+        let _ = free(base + i);
+    }
+    let _ = free(pin);
+    if !matches!(verdict, TestResult::Pass) {
+        return verdict;
+    }
+    // Negative: zero length and non-power-of-two alignment.
+    if alloc_block_aligned(0, 1) != Err(VectorError::OutOfRange) {
+        return TestResult::Fail("alloc_block_aligned(0, _) must be OutOfRange");
+    }
+    if alloc_block_aligned(4, 3) != Err(VectorError::OutOfRange) {
+        return TestResult::Fail("alloc_block_aligned(_, 3) must be OutOfRange");
+    }
+    // Larger than the allocatable range can ever hold.
+    if alloc_block_aligned(255, 1) != Err(VectorError::Exhausted) {
+        return TestResult::Fail("alloc_block_aligned(255, 1) must be Exhausted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("interrupts", smoke_vector_alloc_block_aligned);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_dispatch_in_irq_observed_inside_handler() -> TestResult {
     // End-to-end: install a synchronous handler on an unused

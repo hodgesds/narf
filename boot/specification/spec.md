@@ -44,7 +44,22 @@ pub struct BootInfo {         // post-validation, trusted
 pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError>;
 pub fn validate_memory_map(map: &[MemRegion]) -> Result<(), BootError>;
 #[no_mangle] pub extern "C" fn _start() -> !; // per-arch entry
+
+// Firmware-table pointers copied out of the (transient) handoff by
+// parse_raw, for the later SMBIOS scan (`firmware/smbios/`).
+pub struct SmbiosEntryCopy { pub bytes: [u8; 32], pub len: u8 } // zero-padded
+pub struct FirmwareHandoff {
+    pub efi_system_table: Option<u64>,          // multiboot2 tag 12 (EFI64 ST)
+    pub smbios3_entry: Option<SmbiosEntryCopy>, // first tag 13 starting "_SM3_"
+    pub smbios_entry: Option<SmbiosEntryCopy>,  // first tag 13 starting "_SM_"
+}
+pub fn firmware_handoff() -> FirmwareHandoff;   // EMPTY on PVH / aarch64 / before parse_raw
 ```
+
+Multiboot2 tag 13's payload is `u8 major, u8 minor, u8 reserved[6]`
+followed by the loader's copy of the entry-point structure (Limine:
+`tag->size = 16 + entry->length`, one tag per entry point found); at
+most 32 bytes are kept. A zero tag-12 pointer is treated as absent.
 
 `KernelCmdline::console_loglevel()` evaluates `quiet` (4), `debug` (10), and
 `loglevel=N` (clamped to 1..15) in command-line order and returns the final

@@ -9384,3 +9384,47 @@ fn smoke_cbpf_nlattr_lookup() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/cbpf", smoke_cbpf_nlattr_lookup);
+
+static OPEN_STOP_SEEN: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(bool, bool)>> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+/// Records `(requested state, IFF_UP the registry reports to the hook)`;
+/// the lookup proves the hook runs with the registry lock released.
+fn open_stop_recorder(name: &str, up: bool) {
+    let seen = crate::iface::lookup(name).map(|s| s.link_up);
+    OPEN_STOP_SEEN.lock().push((up, seen == Some(up)));
+}
+
+/// `ndo_open` / `ndo_stop` (`iface::set_open_stop`): called once per real
+/// IFF_UP transition, never for a no-op request, outside the registry lock;
+/// unknown interfaces refuse the hook; a re-registration clears it.
+fn smoke_iface_open_stop_hook() -> TestResult {
+    OPEN_STOP_SEEN.lock().clear();
+    if crate::iface::set_open_stop("nrfo-none", open_stop_recorder) {
+        return TestResult::Fail("hook installed on an unregistered interface");
+    }
+    let name = crate::iface::register("nrfo%d", [0x02, 0, 0, 0, 0x0e, 1], |_, _| Ok(()));
+    if !crate::iface::set_open_stop(&name, open_stop_recorder) {
+        crate::iface::unregister(&name);
+        return TestResult::Fail("hook refused on a registered interface");
+    }
+    for up in [true, true, false, false, true] {
+        crate::iface::set_link_state(&name, up);
+    }
+    let seen = core::mem::take(&mut *OPEN_STOP_SEEN.lock());
+    crate::iface::set_link_state(&name, false);
+    OPEN_STOP_SEEN.lock().clear();
+    let again = crate::iface::register(&name, [0x02, 0, 0, 0, 0x0e, 1], |_, _| Ok(()));
+    crate::iface::set_link_state(&again, true);
+    let after = core::mem::take(&mut *OPEN_STOP_SEEN.lock());
+    crate::iface::set_link_state(&again, false);
+    crate::iface::unregister(&again);
+    if seen != [(true, true), (false, true), (true, true)] {
+        return TestResult::Fail("one call per transition, after the registry update");
+    }
+    if !after.is_empty() {
+        return TestResult::Fail("re-registration keeps a stale hook");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net", smoke_iface_open_stop_hook);

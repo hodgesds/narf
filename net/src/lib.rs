@@ -588,6 +588,17 @@ impl Registry {
         Ok(handle)
     }
 
+    /// Remove a driver-owned interface after its netdev and firmware vdev
+    /// have been detached.  Registration is capability-gated; removal is
+    /// intentionally owned by the in-kernel driver teardown path, where the
+    /// interface has already been selected by its authoritative netdev name.
+    pub fn unregister(&self, name: &str) -> bool {
+        let mut q = self.inner.lock();
+        let before = q.len();
+        q.retain(|entry| entry.iface.name() != name);
+        q.len() != before
+    }
+
     /// Number of registered interfaces.
     pub fn len(&self) -> usize {
         self.inner.lock().len()

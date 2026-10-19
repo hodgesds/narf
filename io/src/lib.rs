@@ -24,7 +24,9 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use narf_capabilities::{Cap, CapError, CapKind, CapOp, CapType};
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
-use narf_memory::{alloc_pages_on, free_pages, FrameAllocError, PhysAddr, PhysFrame, PAGE_SIZE};
+use narf_memory::{
+    alloc_pages_below, alloc_pages_on, free_pages, FrameAllocError, PhysAddr, PhysFrame, PAGE_SIZE,
+};
 
 // ── Operations ──────────────────────────────────────────────────────
 
@@ -446,7 +448,28 @@ fn cache_clean_invalidate(start: usize, end: usize) {
 }
 
 pub fn alloc_coherent(len: usize, domain: DomainId) -> Result<DmaBuffer, IoError> {
-    alloc_with(len, domain, Coherency::Coherent)
+    alloc_with(len, domain, Coherency::Coherent, None)
+}
+
+/// `alloc_coherent` for a device whose coherent DMA mask is `dma_mask`
+/// (Linux `dma_set_coherent_mask(dev, dma_mask)` + `dma_alloc_coherent`):
+/// every byte of the returned buffer lies at a bus address `<= dma_mask`.
+/// A mask no free RAM satisfies is `Err(NoMemory)`, never a buffer above
+/// the mask. `dma_mask = u64::MAX` is exactly [`alloc_coherent`].
+///
+/// NARF hands devices physical addresses (no IOMMU remap on this path),
+/// so the bus address is the physical address.
+pub fn alloc_coherent_masked(
+    len: usize,
+    domain: DomainId,
+    dma_mask: u64,
+) -> Result<DmaBuffer, IoError> {
+    let mask = if dma_mask == u64::MAX {
+        None
+    } else {
+        Some(dma_mask)
+    };
+    alloc_with(len, domain, Coherency::Coherent, mask)
 }
 
 pub fn free_coherent(mut buf: DmaBuffer) {
@@ -466,7 +489,12 @@ pub fn free_coherent(mut buf: DmaBuffer) {
 /// buddy allocation ceiling again.
 const MAX_DMA_ORDER: u8 = 10;
 
-fn alloc_with(len: usize, domain: DomainId, coherency: Coherency) -> Result<DmaBuffer, IoError> {
+fn alloc_with(
+    len: usize,
+    domain: DomainId,
+    coherency: Coherency,
+    dma_mask: Option<u64>,
+) -> Result<DmaBuffer, IoError> {
     let page = PAGE_SIZE as usize;
     if len == 0 {
         return Err(IoError::NoMemory);
@@ -482,8 +510,19 @@ fn alloc_with(len: usize, domain: DomainId, coherency: Coherency) -> Result<DmaB
     }
     let alloc_bytes = page << order;
 
-    let frame = alloc_pages_on(0, order)?;
+    let frame = match dma_mask {
+        None => alloc_pages_on(0, order)?,
+        Some(mask) => alloc_pages_below(order, mask)?,
+    };
     let phys = frame.start_address();
+    if let Some(mask) = dma_mask {
+        // Defence in depth: the allocator contract says this cannot
+        // happen; a device given such a buffer would DMA elsewhere.
+        if phys.raw() + (alloc_bytes as u64 - 1) > mask {
+            free_pages(frame, order);
+            return Err(IoError::NoMemory);
+        }
+    }
     // Zero-fill the buffer. `alloc_pages_on` returns recycled frames
     // un-zeroed; drivers that build descriptor rings, completion
     // queues, or any phase-tagged structure on top of the buffer

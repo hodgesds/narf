@@ -1065,7 +1065,7 @@ fn find_attr(request: &[u8], fixed_len: usize, kind: u16) -> Option<&[u8]> {
     None
 }
 
-fn iface_name_for_index(ifindex: u32) -> Option<alloc::string::String> {
+pub fn iface_name_for_index(ifindex: u32) -> Option<alloc::string::String> {
     enumerate()
         .0
         .into_iter()

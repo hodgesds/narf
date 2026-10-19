@@ -5,7 +5,8 @@
 //! certain management frames once Robust Management Frames are in
 //! play. The CMAC-128 variant — the only mandatory one — uses
 //! AES-128-CMAC keyed by the IGTK (Integrity Group Temporal Key)
-//! and produces a 16-byte MIC.
+//! and produces a 64-bit MIC: `L(AES-128-CMAC(IGTK, AAD || body), 0, 64)`
+//! (IEEE 802.11-2020 §12.5.4.4; the 16-octet MIC is BIP-CMAC-256's).
 //!
 //! Frame-level wiring lives in `narf_wireless::mfp`; this module
 //! is the pure-crypto surface: install an IGTK, compute or verify
@@ -40,7 +41,7 @@
 //!     Length     (1)
 //!     KeyID      (2 LE)
 //!     IPN        (6, LE wire / BE in PN comparisons)
-//!     MIC        (16 for CMAC-128, 8 for CMAC-64 deprecated)
+//!     MIC        (8 for BIP-CMAC-128, 16 for BIP-CMAC-256 / GMAC-256)
 //! ```
 //!
 //! ## Replay handling
@@ -65,11 +66,14 @@ use crate::cmac_aes128;
 /// 802.11 Element ID for the Management MIC Element (§9.4.2.55).
 pub const ELEMENT_ID_MMIE: u8 = 0x4C;
 
-/// MMIE length when MIC is 16 bytes (CMAC-128): 2 (KeyID) + 6 (IPN) + 16.
-pub const MMIE_LEN_CMAC_128: usize = 2 + 6 + 16;
+/// MMIE Length field for BIP-CMAC-128: 2 (KeyID) + 6 (IPN) + 8 (MIC) —
+/// `sizeof(struct ieee80211_mmie) - 2` in Linux `ieee80211.h`, the 16
+/// hostap's `bip_protect` writes for a 16-octet IGTK.
+pub const MMIE_LEN_CMAC_128: usize = 2 + 6 + 8;
 
-/// BIP-CMAC-128 MIC length.
-pub const BIP_MIC_LEN: usize = 16;
+/// BIP-CMAC-128 MIC length (64 bits, `ieee80211_crypto_aes_cmac_encrypt`
+/// copies `mmie->mic` = 8 octets of `aes_cmac`).
+pub const BIP_MIC_LEN: usize = 8;
 
 /// IPN (IGTK Packet Number) length on the wire.
 pub const BIP_IPN_LEN: usize = 6;
@@ -141,6 +145,22 @@ pub fn build_bip_aad(hdr: &[u8]) -> Result<[u8; 20], BipError> {
     Ok(aad)
 }
 
+/// Construct the BIP authenticated bytes, including the Beacon timestamp
+/// masking required by IEEE 802.11 §12.5.4.  `body` includes a trailing MMIE
+/// when one is present; callers zero its MIC before invoking their MAC.
+pub fn authenticated_bytes(aad: &[u8; 20], body: &[u8]) -> Vec<u8> {
+    let mut authenticated = Vec::with_capacity(aad.len() + body.len());
+    authenticated.extend_from_slice(aad);
+    authenticated.extend_from_slice(body);
+    // Beacon timestamps are generated at transmit time and therefore cannot
+    // participate in the BIP MIC. `aad` holds the masked little-endian FC.
+    let fc = u16::from_le_bytes([aad[0], aad[1]]);
+    if fc & 0x00fc == 0x0080 && body.len() >= 8 {
+        authenticated[20..28].fill(0);
+    }
+    authenticated
+}
+
 /// Encode IPN as 6 little-endian bytes (the wire order in MMIE).
 pub fn encode_ipn(ipn: u64) -> [u8; BIP_IPN_LEN] {
     let mut out = [0u8; BIP_IPN_LEN];
@@ -166,7 +186,7 @@ pub fn build_mmie_body(key_id: u16, ipn: u64, mic: &[u8; BIP_MIC_LEN]) -> [u8; M
     let mut out = [0u8; MMIE_LEN_CMAC_128];
     out[0..2].copy_from_slice(&key_id.to_le_bytes());
     out[2..8].copy_from_slice(&encode_ipn(ipn));
-    out[8..24].copy_from_slice(mic);
+    out[8..8 + BIP_MIC_LEN].copy_from_slice(mic);
     out
 }
 
@@ -179,7 +199,7 @@ pub fn parse_mmie_body(buf: &[u8]) -> Result<(u16, u64, [u8; BIP_MIC_LEN]), BipE
     let key_id = u16::from_le_bytes([buf[0], buf[1]]);
     let ipn = decode_ipn(&buf[2..8]);
     let mut mic = [0u8; BIP_MIC_LEN];
-    mic.copy_from_slice(&buf[8..24]);
+    mic.copy_from_slice(&buf[8..8 + BIP_MIC_LEN]);
     Ok((key_id, ipn, mic))
 }
 
@@ -191,10 +211,13 @@ pub fn parse_mmie_body(buf: &[u8]) -> Result<(u16, u64, [u8; BIP_MIC_LEN]), BipE
 /// computation). Callers that need to MIC an outbound frame should
 /// pass a body buffer where the MIC bytes inside the MMIE are zeros.
 pub fn compute_mic(igtk: &Igtk, aad: &[u8; 20], body: &[u8]) -> [u8; BIP_MIC_LEN] {
-    let mut buf = Vec::with_capacity(aad.len() + body.len());
-    buf.extend_from_slice(aad);
-    buf.extend_from_slice(body);
-    cmac_aes128::cmac_aes128(&igtk.key, &buf)
+    let buf = authenticated_bytes(aad, body);
+    // MIC = L(AES-128-CMAC(AAD || Frame Body), 0, 64) — hostap
+    // `bip_protect`, mac80211 `bip_aad` + `ieee80211_aes_cmac`.
+    let full = cmac_aes128::cmac_aes128(&igtk.key, &buf);
+    let mut mic = [0u8; BIP_MIC_LEN];
+    mic.copy_from_slice(&full[..BIP_MIC_LEN]);
+    mic
 }
 
 /// Verify a BIP-CMAC-128 MIC. On success the caller is responsible for
@@ -296,7 +319,7 @@ pub mod tests {
         }
         // Tamper with MIC.
         let mut bad_mic = mic;
-        bad_mic[15] ^= 0x80;
+        bad_mic[7] ^= 0x80;
         match verify_mic(&igtk, &aad, &body, &bad_mic) {
             Err(BipError::MicFailed) => {}
             _ => return TestResult::Fail("tampered MIC must reject"),
@@ -332,7 +355,7 @@ pub mod tests {
     );
 
     fn smoke_bip_mmie_body_round_trip() -> TestResult {
-        let mic = [0xDEu8; 16];
+        let mic = [0xDEu8; BIP_MIC_LEN];
         let body = build_mmie_body(4, 0x010203040506, &mic);
         if body.len() != MMIE_LEN_CMAC_128 {
             return TestResult::Fail("MMIE body length wrong");
@@ -350,4 +373,44 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("crypto/bip", smoke_bip_mmie_body_round_trip);
+
+    /// IEEE Std 802.11-2012 Annex M.9.1 ("BIP with broadcast
+    /// Deauthentication frame"; IEEE 802.11-2020 J.9.1), the inputs hostap
+    /// `wlantest/test_vectors.c::test_vector_bip` feeds `bip_protect`:
+    /// IGTK 4ea9543e…, IPN 4, Key ID 4, broadcast Deauthentication reason 2.
+    /// The expected MIC `48df bfa7 b827 8872` was computed outside NARF
+    /// (`openssl mac -cipher AES-128-CBC … CMAC` over hostap's AAD || masked
+    /// body), so it pins the 64-bit truncation and the MMIE layout, not
+    /// this module against itself.
+    fn smoke_bip_cmac128_ieee_m91_vector() -> TestResult {
+        let igtk_key = [
+            0x4e, 0xa9, 0x54, 0x3e, 0x09, 0xcf, 0x2b, 0x1e, 0xca, 0x66, 0xff, 0xc5, 0x8b, 0xde,
+            0xcb, 0xcf,
+        ];
+        let frame: [u8; 26] = [
+            0xc0, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0x00, 0x02, 0x00,
+        ];
+        let igtk = Igtk::install(igtk_key, 4).expect("install");
+        let aad = build_bip_aad(&frame[..24]).expect("aad");
+        let want_aad = [
+            0xc0, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        if aad != want_aad {
+            return TestResult::Fail("M.9.1 AAD");
+        }
+        // Body = reason || MMIE with the MIC zeroed.
+        let mut body = alloc::vec![0x02, 0x00, ELEMENT_ID_MMIE, MMIE_LEN_CMAC_128 as u8];
+        body.extend_from_slice(&build_mmie_body(4, 4, &[0; BIP_MIC_LEN]));
+        let mic = compute_mic(&igtk, &aad, &body);
+        if mic != [0x48, 0xdf, 0xbf, 0xa7, 0xb8, 0x27, 0x88, 0x72] {
+            return TestResult::Fail("M.9.1 MIC");
+        }
+        if verify_mic(&igtk, &aad, &body, &mic).is_err() {
+            return TestResult::Fail("M.9.1 verify");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("crypto/bip", smoke_bip_cmac128_ieee_m91_vector);
 }

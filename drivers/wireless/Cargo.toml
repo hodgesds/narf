@@ -28,8 +28,11 @@ narf-kernel-test  = { path = "../../verification/kernel-test" }
 narf-scheduler    = { path = "../../scheduler" }
 narf-console      = { path = "../../console" }
 narf-firmware     = { path = "../../firmware" }
-narf-crypto       = { path = "../../crypto" }
+narf-firmware-smbios = { path = "../../firmware/smbios" }
+narf-crypto      = { path = "../../crypto" }
+narf-boot         = { path = "../../boot" }
 narf-init         = { path = "../../init" }
+narf-power        = { path = "../../power" }
 narf-drivers-sdio = { path = "../sdio" }
 narf-drivers-usb  = { path = "../usb" }
 # Per-driver crate (promoted from the former src/mt7921/ module). Built-in

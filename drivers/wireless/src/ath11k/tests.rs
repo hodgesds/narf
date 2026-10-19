@@ -1,7 +1,9 @@
 //! ath11k smoke tests — co-located per project convention.
 //!
-//! Pure-data only: PCI match presence, hw_rev decode, MHI ring
-//! arithmetic, WMI TLV round-trip, DP ring sizing. Live silicon
+//! Pure-data only: PCI match presence, hw_rev decode, and power-up sequence.
+//! MHI tests live in `mhi_tests.rs`; HAL / DP / CE tests in `hal_tests.rs` /
+//! `ce_tests.rs`; QMI / QRTR tests in `qmi_tests.rs`; WMI / HTC tests in
+//! `wmi_tests.rs`. Live silicon
 //! is exercised by the probe-bound-or-skip smoke at the bottom —
 //! that one Skips cleanly on QEMU.
 
@@ -12,11 +14,10 @@ extern crate alloc;
 use alloc::vec::Vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-use super::dp::*;
+// DP descriptor layouts are tested in `hal_tests.rs`.
 use super::hw::*;
 use super::mhi::*;
 use super::pci::{is_probed, with_controller};
-use super::wmi::*;
 
 // ── PCI match table ────────────────────────────────────────────────
 
@@ -55,9 +56,6 @@ fn smoke_ath11k_name_for_known_ids() -> TestResult {
     if name_for(ATH11K_DEV_WCN6855) != "ath11k-wcn6855" {
         return TestResult::Fail("wcn6855 name mismatch");
     }
-    if name_for(ATH11K_DEV_WCN7850) != "ath11k-wcn7850" {
-        return TestResult::Fail("wcn7850 name mismatch");
-    }
     if name_for(0xFFFF) != "ath11k" {
         return TestResult::Fail("default name mismatch");
     }
@@ -68,20 +66,29 @@ kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_name_for_known_ids);
 // ── ChipInfo decode ────────────────────────────────────────────────
 
 fn smoke_ath11k_chip_for_pci_id_known_pairs() -> TestResult {
-    let qca = chip_for_pci_id(QCOM_VENDOR, ATH11K_DEV_QCA6390).expect("qca6390");
-    if qca.default_hw_rev != HwRev::Qca6390Hw20 {
-        return TestResult::Fail("QCA6390 default hw_rev mismatch");
+    // Positive: every Linux `ath11k_pci_id_table` entry resolves.
+    for &(did, rev) in &[
+        (ATH11K_DEV_QCA6390, HwRev::Qca6390Hw20),
+        (ATH11K_DEV_WCN6855, HwRev::Wcn6855Hw20),
+        (ATH11K_DEV_QCN9074, HwRev::Qcn9074Hw10),
+    ] {
+        match chip_for_pci_id(QCOM_VENDOR, did) {
+            Some(c) if c.did == did && c.default_hw_rev == rev => {}
+            _ => return TestResult::Fail("ath11k PCI id did not resolve to its ChipInfo"),
+        }
     }
-    if qca.display_name != "QCA6390" {
-        return TestResult::Fail("QCA6390 display_name mismatch");
+    // Negative: ath12k parts (WCN7850 1107, QCN9274 1109) and the
+    // never-assigned 1105 are not ath11k; nor is a non-Qualcomm vid.
+    for &did in &[0x1105u16, 0x1107, 0x1109] {
+        if chip_for_pci_id(QCOM_VENDOR, did).is_some() {
+            return TestResult::Fail("ath11k claimed a non-ath11k Qualcomm PCI id");
+        }
     }
-    let none = chip_for_pci_id(0x8086, 0x2723);
-    if none.is_some() {
-        return TestResult::Fail("Intel PCI id should not match ath11k");
+    if chip_for_pci_id(0x8086, ATH11K_DEV_WCN6855).is_some() {
+        return TestResult::Fail("ath11k claimed a non-Qualcomm vendor id");
     }
-    let none2 = chip_for_pci_id(QCOM_VENDOR, 0x0000);
-    if none2.is_some() {
-        return TestResult::Fail("unknown Qualcomm device id should not match");
+    if ALL_DEV_IDS.len() != 3 {
+        return TestResult::Fail("ath11k match table is not exactly Linux's three ids");
     }
     TestResult::Pass
 }
@@ -91,21 +98,58 @@ kernel_test_in!(
 );
 
 fn smoke_ath11k_refine_hw_rev_wcn6855_subversions() -> TestResult {
-    // WCN6855 2.0 stays WCN6855 2.0.
-    if refine_hw_rev(ATH11K_DEV_WCN6855, 2, 0) != HwRev::Wcn6855Hw20 {
-        return TestResult::Fail("WCN6855 major=2 minor=0 not classified as HW2.0");
+    // Linux `ath11k_pci_probe`: WCN6855 major 2, minor 0x00/0x01 → HW2.0.
+    for minor in [0x00, 0x01] {
+        if refine_hw_rev(ATH11K_DEV_WCN6855, 2, minor, 0) != HwRev::Wcn6855Hw20 {
+            return TestResult::Fail("WCN6855 2.0x not classified as HW2.0");
+        }
+        if needs_sub_version(ATH11K_DEV_WCN6855, 2, minor) {
+            return TestResult::Fail("WCN6855 HW2.0 should not read TCSR_SOC_HW_SUB_VER");
+        }
     }
-    // 2.1 → WCN6855 2.1.
-    if refine_hw_rev(ATH11K_DEV_WCN6855, 2, 1) != HwRev::Wcn6855Hw21 {
-        return TestResult::Fail("WCN6855 major=2 minor=1 not classified as HW2.1");
+    // minor 0x10/0x11 → classify by TCSR_SOC_HW_SUB_VER.
+    for minor in [0x10, 0x11] {
+        if !needs_sub_version(ATH11K_DEV_WCN6855, 2, minor) {
+            return TestResult::Fail("WCN6855 2.1x must read TCSR_SOC_HW_SUB_VER");
+        }
+        for sub in [0x1019_A0E1, 0x1019_B0E1, 0x1019_C0E1, 0x1019_D0E1] {
+            if refine_hw_rev(ATH11K_DEV_WCN6855, 2, minor, sub) != HwRev::Qca2066Hw21 {
+                return TestResult::Fail("QCA2066 sub-version not classified as QCA2066");
+            }
+        }
+        if refine_hw_rev(ATH11K_DEV_WCN6855, 2, minor, 0x001E_60E1) != HwRev::Qca6698aqHw21 {
+            return TestResult::Fail("QCA6698AQ sub-version not classified as QCA6698AQ");
+        }
+        if refine_hw_rev(ATH11K_DEV_WCN6855, 2, minor, 0x1234_5678) != HwRev::Wcn6855Hw21 {
+            return TestResult::Fail("other sub-version not classified as WCN6855 HW2.1");
+        }
     }
-    // 2.16+ → QCA2066 (the rebadged WCN6855 variant).
-    if refine_hw_rev(ATH11K_DEV_WCN6855, 2, 0x12) != HwRev::Qca2066Hw21 {
-        return TestResult::Fail("WCN6855 major=2 minor>=0x10 not classified as QCA2066");
+    // Steppings Linux rejects (`unsupported_wcn6855_soc`).
+    if refine_hw_rev(ATH11K_DEV_WCN6855, 2, 0x12, 0x1019_A0E1) != HwRev::Unknown {
+        return TestResult::Fail("WCN6855 minor 0x12 must be unsupported, as in Linux");
     }
-    // Unrelated PCI ID always falls through.
-    if refine_hw_rev(0x9999, 0, 0) != HwRev::Unknown {
+    if refine_hw_rev(ATH11K_DEV_WCN6855, 1, 0, 0) != HwRev::Unknown {
+        return TestResult::Fail("WCN6855 major 1 must be unsupported, as in Linux");
+    }
+    if refine_hw_rev(ATH11K_DEV_QCA6390, 3, 0, 0) != HwRev::Unknown {
+        return TestResult::Fail("QCA6390 major != 2 must be unsupported, as in Linux");
+    }
+    if refine_hw_rev(0x9999, 0, 0, 0) != HwRev::Unknown {
         return TestResult::Fail("unknown PCI id should produce HwRev::Unknown");
+    }
+    // Firmware dirs = Linux `hw_params.fw.dir`.
+    for (rev, dir) in [
+        (HwRev::Wcn6855Hw20, "WCN6855/hw2.0"),
+        (HwRev::Wcn6855Hw21, "WCN6855/hw2.1"),
+        (HwRev::Qca2066Hw21, "QCA2066/hw2.1"),
+        (HwRev::Qca6698aqHw21, "QCA6698AQ/hw2.1"),
+    ] {
+        if rev.fw_dir() != Some(dir) {
+            return TestResult::Fail("hw_rev firmware dir differs from Linux hw_params");
+        }
+    }
+    if HwRev::Unknown.fw_dir().is_some() {
+        return TestResult::Fail("HwRev::Unknown must have no firmware dir");
     }
     TestResult::Pass
 }
@@ -129,6 +173,19 @@ fn smoke_ath11k_window_constants_consistent() -> TestResult {
     if ATH11K_PCI_WINDOW_ENABLE_BIT != 1u32 << 30 {
         return TestResult::Fail("window enable bit not at bit 30");
     }
+    // Linux `ath11k_pci_select_window` writes the window *number*
+    // (FIELD_GET of bits[24:19]), not the shifted field. 0x1910010
+    // (TCSR_SOC_HW_SUB_VER) lives in window 0x32.
+    use super::pci::{window_of, window_select_value, windowed_bar_offset};
+    if window_of(TCSR_SOC_HW_SUB_VER) != 0x32 {
+        return TestResult::Fail("window_of(0x1910010) != 0x32");
+    }
+    if window_select_value(TCSR_SOC_HW_SUB_VER) != (1 << 30) | 0x32 {
+        return TestResult::Fail("window select must write ENABLE | window number");
+    }
+    if windowed_bar_offset(TCSR_SOC_HW_SUB_VER) != 0x80000 + 0x10010 {
+        return TestResult::Fail("windowed BAR offset wrong for 0x1910010");
+    }
     TestResult::Pass
 }
 kernel_test_in!(
@@ -136,303 +193,7 @@ kernel_test_in!(
     smoke_ath11k_window_constants_consistent
 );
 
-// ── MHI ring arithmetic ────────────────────────────────────────────
-
-fn smoke_ath11k_mhi_ring_push_pop_modular() -> TestResult {
-    let mut r = MhiRing::new(8);
-    if !r.is_empty() {
-        return TestResult::Fail("freshly-allocated ring should be empty");
-    }
-    if r.is_full() {
-        return TestResult::Fail("freshly-allocated ring should not be full");
-    }
-    // Push 7 (capacity - 1 since MHI reserves a slot).
-    for i in 0..7 {
-        if r.push(MhiTre::pack_data(0x1000 + i, 64, true, false, false, false))
-            .is_none()
-        {
-            return TestResult::Fail("push under capacity rejected");
-        }
-    }
-    if !r.is_full() {
-        return TestResult::Fail("ring at capacity-1 not classified as full");
-    }
-    // One more push refused.
-    if r.push(MhiTre::default()).is_some() {
-        return TestResult::Fail("push past capacity should fail");
-    }
-    // Pop one + push one — verifies modular wrap behaviour.
-    if r.pop().is_none() {
-        return TestResult::Fail("pop on full ring should succeed");
-    }
-    if r.is_full() {
-        return TestResult::Fail("ring shouldn't be full after one pop");
-    }
-    if r.push(MhiTre::default()).is_none() {
-        return TestResult::Fail("push after pop should succeed");
-    }
-    if !r.is_full() {
-        return TestResult::Fail("ring should be full again after push");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/wireless/ath11k",
-    smoke_ath11k_mhi_ring_push_pop_modular
-);
-
-fn smoke_ath11k_mhi_tre_pack_and_unpack() -> TestResult {
-    let dma = 0x1234_5678_9ABC_DEF0u64;
-    let tre = MhiTre::pack_data(dma, 0x0040, true, true, false, false);
-    if tre.dma() != dma {
-        return TestResult::Fail("dma round-trip wrong");
-    }
-    if tre.len() != 0x0040 {
-        return TestResult::Fail("payload length wrong");
-    }
-    if tre.tre_type() != 0x02 {
-        return TestResult::Fail("TRE type for data should be 0x02");
-    }
-    if !tre.ieot() || !tre.ieob() {
-        return TestResult::Fail("IEOT/IEOB bits not honoured");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/wireless/ath11k",
-    smoke_ath11k_mhi_tre_pack_and_unpack
-);
-
-fn smoke_ath11k_mhi_channel_tables() -> TestResult {
-    // QCA6390 channel set: ch20/ch21 IPCR, 64 elements.
-    let qca = channels_for_did(ATH11K_DEV_QCA6390);
-    if qca.len() != 2 {
-        return TestResult::Fail("QCA6390 channel count should be 2");
-    }
-    if qca[0].num != 20 || qca[1].num != 21 {
-        return TestResult::Fail("QCA6390 channels should be 20/21");
-    }
-    if qca[0].num_elements != 64 {
-        return TestResult::Fail("QCA6390 ch20 should have 64 elements");
-    }
-    // QCN9074 — same pair, 32 elements.
-    let qcn = channels_for_did(ATH11K_DEV_QCN9074);
-    if qcn[0].num_elements != 32 {
-        return TestResult::Fail("QCN9074 ch20 should have 32 elements");
-    }
-    // WCN6855 falls back to QCA6390 layout.
-    let wcn = channels_for_did(ATH11K_DEV_WCN6855);
-    if wcn[0].num_elements != 64 {
-        return TestResult::Fail("WCN6855 should share QCA6390 channel layout");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_mhi_channel_tables);
-
-fn smoke_ath11k_mhi_doorbell_offsets() -> TestResult {
-    if ch_doorbell_offset(0) != MHI_CHDB_BASE {
-        return TestResult::Fail("ch0 doorbell should be at MHI_CHDB_BASE");
-    }
-    if ch_doorbell_offset(20) != MHI_CHDB_BASE + 20 * 8 {
-        return TestResult::Fail("ch20 doorbell offset wrong");
-    }
-    if er_doorbell_offset(1) != MHI_ERDB_BASE + 8 {
-        return TestResult::Fail("er1 doorbell offset wrong");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_mhi_doorbell_offsets);
-
-fn smoke_ath11k_mhi_exec_env_decode() -> TestResult {
-    if MhiExecEnv::from_raw(0) != MhiExecEnv::Pbl {
-        return TestResult::Fail("raw 0 should decode to Pbl");
-    }
-    if MhiExecEnv::from_raw(2) != MhiExecEnv::Amss {
-        return TestResult::Fail("raw 2 should decode to Amss");
-    }
-    if MhiExecEnv::from_raw(0xff) != MhiExecEnv::Disabled {
-        return TestResult::Fail("raw 0xff should decode to Disabled");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_mhi_exec_env_decode);
-
-// ── WMI TLV encoder ────────────────────────────────────────────────
-
-fn smoke_ath11k_wmi_cmd_id_encode() -> TestResult {
-    // WMI_TLV_CMD(GRP_SCAN) = ((4<<12) | 0x1) = 0x4001.
-    if build_cmd_id(WMI_GRP_SCAN, 0) != 0x4001 {
-        return TestResult::Fail("WMI_START_SCAN_CMDID encoding wrong");
-    }
-    // PEER group: ((7<<12) | 1) = 0x7001.
-    if build_cmd_id(WMI_GRP_PEER, 0) != 0x7001 {
-        return TestResult::Fail("PEER_CREATE_CMDID encoding wrong");
-    }
-    // sub_id increments correctly.
-    if build_cmd_id(WMI_GRP_SCAN, 1) != 0x4002 {
-        return TestResult::Fail("WMI_STOP_SCAN_CMDID encoding wrong");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_wmi_cmd_id_encode);
-
-fn smoke_ath11k_wmi_tlv_round_trip() -> TestResult {
-    let mut b = WmiCmdBuilder::new(WMI_INIT_CMDID);
-    b.push_u32_tlv(WMI_TAG_RESOURCE_CONFIG, 0xDEAD_BEEF);
-    b.push_tlv(WMI_TAG_HOST_MEM_CHUNK, &[0xAA, 0xBB, 0xCC]);
-    let bytes = b.finish();
-    // Frame should start with the cmd_hdr.
-    let cmd_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-    if cmd_id != WMI_INIT_CMDID {
-        return TestResult::Fail("encoded cmd id wrong");
-    }
-    // Walk should yield two TLVs.
-    let (evt_id, tlvs) = walk_event(&bytes).expect("walk_event ok");
-    if evt_id != WMI_INIT_CMDID {
-        return TestResult::Fail("walked cmd id wrong");
-    }
-    if tlvs.len() != 2 {
-        return TestResult::Fail("expected 2 TLVs");
-    }
-    if tlvs[0].tag != WMI_TAG_RESOURCE_CONFIG {
-        return TestResult::Fail("first TLV tag wrong");
-    }
-    if tlvs[0].payload.len() != 4 {
-        return TestResult::Fail("first TLV payload size wrong");
-    }
-    let first_val = u32::from_le_bytes(tlvs[0].payload.try_into().unwrap());
-    if first_val != 0xDEAD_BEEF {
-        return TestResult::Fail("first TLV payload value wrong");
-    }
-    // Second TLV is 3-byte payload + 1-byte pad in the stream.
-    if tlvs[1].tag != WMI_TAG_HOST_MEM_CHUNK {
-        return TestResult::Fail("second TLV tag wrong");
-    }
-    if tlvs[1].payload != [0xAA, 0xBB, 0xCC] {
-        return TestResult::Fail("second TLV payload wrong");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_wmi_tlv_round_trip);
-
-fn smoke_ath11k_wmi_build_init_cmd() -> TestResult {
-    let rc = ResourceConfig {
-        num_vdevs: 3,
-        num_peers: 16,
-        num_tids: 256,
-        tx_chain_mask: 0x3,
-        rx_chain_mask: 0x3,
-        ..Default::default()
-    };
-    let bytes = build_init_cmd(&rc);
-    let (evt_id, tlvs) = walk_event(&bytes).expect("walk_event ok");
-    if evt_id != WMI_INIT_CMDID {
-        return TestResult::Fail("init cmd id wrong");
-    }
-    if tlvs.len() != 2 {
-        return TestResult::Fail("INIT should have 2 TLVs (init_cmd + resource_config)");
-    }
-    if tlvs[0].tag != WMI_TAG_INIT_CMD {
-        return TestResult::Fail("first TLV not WMI_TAG_INIT_CMD");
-    }
-    if tlvs[1].tag != WMI_TAG_RESOURCE_CONFIG {
-        return TestResult::Fail("second TLV not WMI_TAG_RESOURCE_CONFIG");
-    }
-    if tlvs[1].payload.len() != 40 {
-        return TestResult::Fail("resource_config payload should be 40 bytes");
-    }
-    // Spot-check encoded num_vdevs == 3.
-    let num_vdevs = u32::from_le_bytes(tlvs[1].payload[0..4].try_into().unwrap());
-    if num_vdevs != 3 {
-        return TestResult::Fail("num_vdevs not round-tripped");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_wmi_build_init_cmd);
-
-fn smoke_ath11k_wmi_truncated_tlv_detected() -> TestResult {
-    // Build a frame, lop off the last byte, expect Truncated.
-    let mut b = WmiCmdBuilder::new(WMI_INIT_CMDID);
-    b.push_u32_tlv(WMI_TAG_RESOURCE_CONFIG, 0xCAFE_F00D);
-    let mut bytes = b.finish();
-    bytes.pop();
-    match walk_event(&bytes) {
-        Err(WmiDecodeError::Truncated { .. }) => TestResult::Pass,
-        // The 4-byte payload becomes 3 bytes; with padding the
-        // stream might end exactly at a TLV boundary, in which
-        // case the decoder reports the truncation via remaining-
-        // byte mismatch. Either Truncated or a *shorter* tlv list
-        // is acceptable. We test the obvious failure mode here.
-        other => {
-            let _ = other; // hush unused
-            TestResult::Fail("expected Truncated on truncated input")
-        }
-    }
-}
-kernel_test_in!(
-    "drivers/wireless/ath11k",
-    smoke_ath11k_wmi_truncated_tlv_detected
-);
-
-// ── DP descriptor sizing ───────────────────────────────────────────
-
-fn smoke_ath11k_dp_ring_default_sizes() -> TestResult {
-    if default_ring_size(HalRingType::TclData) != DP_TCL_DATA_RING_SIZE {
-        return TestResult::Fail("TCL_DATA default size mismatch");
-    }
-    if default_ring_size(HalRingType::ReoDst) != DP_REO_DST_RING_SIZE {
-        return TestResult::Fail("REO_DST default size mismatch");
-    }
-    if default_ring_size(HalRingType::WbmIdleListEnd) != 0 {
-        return TestResult::Fail("WBM_IDLE_LIST_END should have zero default size");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/wireless/ath11k",
-    smoke_ath11k_dp_ring_default_sizes
-);
-
-fn smoke_ath11k_dp_descriptor_sizes() -> TestResult {
-    if HalTclDataCmd::SIZE != 32 {
-        return TestResult::Fail("HAL_TCL_DATA_CMD size should be 32 bytes");
-    }
-    if HalReoDstDesc::SIZE != 32 {
-        return TestResult::Fail("HAL_REO_DST_DESC size should be 32 bytes");
-    }
-    // Round-trip TCL data cmd.
-    let mut tcl = HalTclDataCmd::default();
-    tcl.set_buf_dma(0x1_0000_2000);
-    tcl.set_data_len(0x0400);
-    if tcl.buf_addr_lo != 0x0000_2000 {
-        return TestResult::Fail("TCL_DATA buf_addr_lo wrong");
-    }
-    if tcl.info0 & 0xFF != 1 {
-        return TestResult::Fail("TCL_DATA buf_addr_hi wrong");
-    }
-    if tcl.info1 & 0xFFFF != 0x0400 {
-        return TestResult::Fail("TCL_DATA data length wrong");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_dp_descriptor_sizes);
-
-fn smoke_ath11k_dp_ring_dir_classification() -> TestResult {
-    if HalRingType::TclData.default_dir() != HalRingDir::SrcRing {
-        return TestResult::Fail("TCL_DATA should be a source ring");
-    }
-    if HalRingType::ReoDst.default_dir() != HalRingDir::DstRing {
-        return TestResult::Fail("REO_DST should be a destination ring");
-    }
-    if HalRingType::TclStatus.default_dir() != HalRingDir::DstRing {
-        return TestResult::Fail("TCL_STATUS should be a destination ring");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/wireless/ath11k",
-    smoke_ath11k_dp_ring_dir_classification
-);
+// MHI protocol + host tests live in `mhi_tests.rs`.
 
 // ── Live-silicon smoke ─────────────────────────────────────────────
 //
@@ -454,74 +215,571 @@ fn smoke_ath11k_probe_bound_or_skip() -> TestResult {
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_probe_bound_or_skip);
 
-// ── Stage 3: WMI VDEV commands ─────────────────────────────────────
+// ── Phase 1: power-up sequence (Linux ath11k_pci_sw_reset) ─────────
 
-fn smoke_ath11k_wmi_vdev_create_encode() -> TestResult {
-    let mac: [u8; 6] = [0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
-    let frame = build_vdev_create(0, vdev_type::STA, mac, 0);
-    // cmd_hdr(4) + VDEV_CREATE_CMD TLV hdr(4) + payload(36)
-    //           + ARRAY_STRUCT TLV hdr(4) + streams(24) = 72 bytes.
-    if frame.len() < 16 {
-        return TestResult::Fail("vdev_create frame too short");
+mod fake_io {
+    use alloc::collections::BTreeMap;
+    use alloc::vec::Vec;
+    use core::cell::RefCell;
+
+    use super::super::power::ChipIo;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Op {
+        R(u32),
+        W(u32, u32),
+        Delay(u32),
+        RestoreWindow,
     }
-    let cmd_id = u32::from_le_bytes(frame[0..4].try_into().unwrap()) & 0x00FF_FFFF;
-    if cmd_id != WMI_VDEV_CREATE_CMDID {
-        return TestResult::Fail("cmd_id != WMI_VDEV_CREATE_CMDID");
+
+    /// Register file: writes stick unless the offset is `stuck`, in
+    /// which case reads always return the stuck value.
+    #[derive(Default)]
+    pub struct FakeIo {
+        pub regs: RefCell<BTreeMap<u32, u32>>,
+        pub stuck: BTreeMap<u32, u32>,
+        pub ops: RefCell<Vec<Op>>,
     }
-    // walk_event parses from the cmd_hdr (offset 0), treating it as the event id.
-    let (evt_id, tlvs) = match walk_event(&frame) {
-        Ok(r) => r,
-        Err(_) => return TestResult::Fail("walk_event failed on vdev_create frame"),
-    };
-    if evt_id != WMI_VDEV_CREATE_CMDID {
-        return TestResult::Fail("walk_event evt_id != WMI_VDEV_CREATE_CMDID");
+
+    impl ChipIo for FakeIo {
+        fn read32(&self, offset: u32) -> u32 {
+            self.ops.borrow_mut().push(Op::R(offset));
+            if let Some(&v) = self.stuck.get(&offset) {
+                return v;
+            }
+            *self.regs.borrow().get(&offset).unwrap_or(&0)
+        }
+        fn write32(&self, offset: u32, value: u32) {
+            self.ops.borrow_mut().push(Op::W(offset, value));
+            self.regs.borrow_mut().insert(offset, value);
+        }
+        fn delay_ms(&self, ms: u32) {
+            self.ops.borrow_mut().push(Op::Delay(ms));
+        }
+        fn restore_window(&self) {
+            self.ops.borrow_mut().push(Op::RestoreWindow);
+        }
     }
-    if tlvs.is_empty() {
-        return TestResult::Fail("no TLVs in vdev_create frame");
+}
+
+fn smoke_ath11k_sw_reset_matches_linux_sequence() -> TestResult {
+    use super::power::*;
+    use fake_io::{FakeIo, Op::*};
+    let io = FakeIo::default();
+    io.regs.borrow_mut().insert(WLAON_QFPROM_PWR_CTRL_REG, 0xF);
+    io.regs.borrow_mut().insert(PCIE_SOC_GLOBAL_RESET, 0x10);
+    io.regs.borrow_mut().insert(WLAON_SOC_RESET_CAUSE_REG, 0x5);
+    io.regs.borrow_mut().insert(MHISTATUS, 0x4); // SYSERR latched
+                                                 // WCN6855: fix_l1ss = false.
+    let report = sw_reset(&io, true, None);
+    let expected = [
+        Delay(100),
+        // ath11k_pci_enable_ltssm
+        R(PCIE_PCIE_PARF_LTSSM),
+        W(PCIE_PCIE_PARF_LTSSM, PARM_LTSSM_VALUE),
+        R(PCIE_PCIE_PARF_LTSSM),
+        R(GCC_GCC_PCIE_HOT_RST),
+        W(GCC_GCC_PCIE_HOT_RST, GCC_GCC_PCIE_HOT_RST_VAL),
+        R(GCC_GCC_PCIE_HOT_RST),
+        Delay(5),
+        // ath11k_pci_clear_all_intrs
+        W(PCIE_PCIE_INT_ALL_CLEAR, PCIE_INT_CLEAR_ALL),
+        // ath11k_pci_set_wlaon_pwr_ctrl: clear VDD4BLOW (bit 2)
+        R(WLAON_QFPROM_PWR_CTRL_REG),
+        W(WLAON_QFPROM_PWR_CTRL_REG, 0xB),
+        // ath11k_mhi_clear_vector
+        W(0x360, 0),
+        W(0x368, 0),
+        W(0x394, 0),
+        W(0x39C, 0),
+        // ath11k_pci_clear_dbg_registers
+        R(PCIE_Q6_COOKIE_ADDR),
+        R(WLAON_WARM_SW_ENTRY),
+        Delay(10),
+        W(WLAON_WARM_SW_ENTRY, 0),
+        Delay(10),
+        R(WLAON_WARM_SW_ENTRY),
+        R(WLAON_SOC_RESET_CAUSE_REG),
+        // ath11k_pci_soc_global_reset: set V, then toggle it back
+        R(PCIE_SOC_GLOBAL_RESET),
+        W(PCIE_SOC_GLOBAL_RESET, 0x11),
+        Delay(10),
+        W(PCIE_SOC_GLOBAL_RESET, 0x10),
+        Delay(10),
+        R(PCIE_SOC_GLOBAL_RESET),
+        RestoreWindow,
+        // ath11k_mhi_set_mhictrl_reset
+        R(0x48),
+        W(0x38, 0x2),
+        Delay(10),
+    ];
+    if io.ops.borrow().as_slice() != expected {
+        return TestResult::Fail("sw_reset(power_on) op sequence differs from Linux");
     }
-    // First TLV is VDEV_CREATE_CMD; payload[0..4] = vdev_id.
-    if tlvs[0].payload.len() < 4 {
-        return TestResult::Fail("first TLV payload too short");
+    if report.ltssm != PARM_LTSSM_VALUE
+        || report.reset_cause != 0x5
+        || report.mhistatus != 0x4
+        || report.link_down_after_reset
+        || report.l1ss_failed_reg.is_some()
+    {
+        return TestResult::Fail("sw_reset report fields wrong on a healthy chip");
     }
-    let vdev_id = u32::from_le_bytes(tlvs[0].payload[0..4].try_into().unwrap());
-    if vdev_id != 0 {
-        return TestResult::Fail("vdev_id != 0 in first TLV");
+    // power_on = false skips LTSSM / interrupt clear / WLAON / L1SS.
+    let io = FakeIo::default();
+    let _ = sw_reset(&io, false, None);
+    if io.ops.borrow().contains(&R(PCIE_PCIE_PARF_LTSSM)) {
+        return TestResult::Fail("sw_reset(power_on=false) touched LTSSM");
     }
     TestResult::Pass
 }
 kernel_test_in!(
-    "drivers/wireless/ath11k/wmi",
-    smoke_ath11k_wmi_vdev_create_encode
+    "drivers/wireless/ath11k",
+    smoke_ath11k_sw_reset_matches_linux_sequence
 );
 
-fn smoke_ath11k_wmi_vdev_set_param_channel_encode() -> TestResult {
-    let frame = build_vdev_set_param(0, vdev_param::CHANNEL, 5180);
-    // cmd_hdr(4) + VDEV_SET_PARAM_CMD TLV hdr(4) + payload(12) = 20 bytes.
-    if frame.len() != 20 {
-        return TestResult::Fail("vdev_set_param frame size wrong (expected 20)");
+fn smoke_ath11k_power_up_failure_paths() -> TestResult {
+    use super::power::*;
+    use fake_io::{FakeIo, Op};
+    // LTSSM never settles and reads all-ones: 5 retries, 5 ms apart.
+    let mut io = FakeIo::default();
+    io.stuck.insert(PCIE_PCIE_PARF_LTSSM, 0xffff_ffff);
+    let mut report = PowerUpReport::default();
+    enable_ltssm(&io, &mut report);
+    let writes = io
+        .ops
+        .borrow()
+        .iter()
+        .filter(|o| matches!(o, Op::W(PCIE_PCIE_PARF_LTSSM, _)))
+        .count();
+    if writes != 5 || report.ltssm != 0xffff_ffff {
+        return TestResult::Fail("stuck LTSSM must be retried exactly 5 times");
     }
-    let cmd_id = u32::from_le_bytes(frame[0..4].try_into().unwrap()) & 0x00FF_FFFF;
-    if cmd_id != WMI_VDEV_SET_PARAM_CMDID {
-        return TestResult::Fail("cmd_id != WMI_VDEV_SET_PARAM_CMDID");
+    // Link down after global reset is reported, not fatal.
+    io = FakeIo::default();
+    io.stuck.insert(PCIE_SOC_GLOBAL_RESET, 0xffff_ffff);
+    let report = sw_reset(&io, true, None);
+    if !report.link_down_after_reset {
+        return TestResult::Fail("all-ones after global reset not reported as link down");
     }
-    // cmd_id must differ from ath10k's 0x5003.
-    if cmd_id == 0x5003 {
-        return TestResult::Fail("ath11k set_param cmd_id wrongly matches ath10k 0x5003");
+    if !io.ops.borrow().contains(&Op::W(0x38, 0x2)) {
+        return TestResult::Fail("MHICTRL reset must still run after a link-down warning");
     }
-    // TLV payload at offset 8: vdev_id(4) + param_id(4) + param_value(4).
-    let param_id = u32::from_le_bytes(frame[12..16].try_into().unwrap());
-    let param_val = u32::from_le_bytes(frame[16..20].try_into().unwrap());
-    if param_id != vdev_param::CHANNEL {
-        return TestResult::Fail("param_id != CHANNEL");
+    // set_link_reg: a register that never takes the value fails after
+    // 10 attempts, 2 ms apart, naming the register.
+    io = FakeIo::default();
+    io.stuck.insert(0x1000, 0x0);
+    if set_link_reg(&io, 0x1000, 0x52, 0xff) != Err(0x1000) {
+        return TestResult::Fail("set_link_reg must fail with the stuck register offset");
     }
-    if param_val != 5180 {
-        return TestResult::Fail("param_value != 5180");
+    let attempts = io
+        .ops
+        .borrow()
+        .iter()
+        .filter(|o| matches!(o, Op::W(0x1000, _)))
+        .count();
+    if attempts != 10 {
+        return TestResult::Fail("set_link_reg must make exactly 10 write attempts");
+    }
+    // Already-correct register: no write at all.
+    io = FakeIo::default();
+    io.regs.borrow_mut().insert(0x2000, 0x1252);
+    if set_link_reg(&io, 0x2000, 0x52, 0xff) != Ok(())
+        || io.ops.borrow().iter().any(|o| matches!(o, Op::W(..)))
+    {
+        return TestResult::Fail("set_link_reg wrote a register already holding the value");
     }
     TestResult::Pass
 }
 kernel_test_in!(
-    "drivers/wireless/ath11k/wmi",
-    smoke_ath11k_wmi_vdev_set_param_channel_encode
+    "drivers/wireless/ath11k",
+    smoke_ath11k_power_up_failure_paths
+);
+
+fn smoke_ath11k_fix_l1ss_programs_qca6390_phy() -> TestResult {
+    use super::power::*;
+    use fake_io::FakeIo;
+    let regs = match HwRev::Qca6390Hw20.params().and_then(|p| p.fix_l1ss) {
+        Some(r) => r,
+        None => return TestResult::Fail("QCA6390 must have fix_l1ss (Linux true)"),
+    };
+    let io = FakeIo::default();
+    if fix_l1ss(&io, &regs).is_err() {
+        return TestResult::Fail("fix_l1ss failed on a writable register file");
+    }
+    let r = io.regs.borrow();
+    let get = |o: u32| *r.get(&o).unwrap_or(&0);
+    if get(0x01e0_c0ac) != 0x10
+        || get(0x01e0_c628) != 0x02
+        || get(0x01e0_c62c) != 0x52
+        || get(0x01e0_c634) != 0xff
+    {
+        return TestResult::Fail("fix_l1ss did not program Linux's qca6390 PHY values");
+    }
+    // WCN6855 family: fix_l1ss = false in every Linux hw_params entry.
+    for rev in [
+        HwRev::Wcn6855Hw20,
+        HwRev::Wcn6855Hw21,
+        HwRev::Qca2066Hw21,
+        HwRev::Qca6698aqHw21,
+    ] {
+        match rev.params() {
+            Some(p) if p.fix_l1ss.is_none() && !p.static_window_map => {}
+            _ => return TestResult::Fail("WCN6855-family hw_params differ from Linux"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_fix_l1ss_programs_qca6390_phy
+);
+
+fn smoke_ath11k_msi_user_assignment() -> TestResult {
+    // Linux ath11k_pcic_get_user_msi_assignment for WCN6855 HW2.1
+    // with ep_base_data 64: user_base_data = base_vector + 64.
+    let p = match HwRev::Wcn6855Hw21.params() {
+        Some(p) => p,
+        None => return TestResult::Fail("WCN6855 HW2.1 has no hw_params"),
+    };
+    if p.msi.total_vectors != 32 {
+        return TestResult::Fail("WCN6855 must request 32 MSI vectors");
+    }
+    for (name, want) in [
+        ("MHI", (3, 64, 0)),
+        ("CE", (10, 67, 3)),
+        ("WAKE", (1, 77, 13)),
+        ("DP", (18, 78, 14)),
+    ] {
+        if p.msi.user_assignment(name, 64) != Some(want) {
+            return TestResult::Fail("WCN6855 MSI user layout differs from Linux");
+        }
+    }
+    if p.msi.user_assignment("BOGUS", 64).is_some() {
+        return TestResult::Fail("unknown MSI user must not resolve");
+    }
+    // Single-vector fallback: every user on vector 0, MHI still 3.
+    if MSI_CONFIG_ONE.user_assignment("CE", 50) != Some((1, 50, 0))
+        || MSI_CONFIG_ONE.user_assignment("MHI", 50) != Some((3, 50, 0))
+    {
+        return TestResult::Fail("one-MSI fallback layout differs from Linux");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_msi_user_assignment);
+
+// ── Failure-step codes: one namespace across every layer ───────────
+
+fn smoke_ath11k_step_codes_unique_and_in_range() -> TestResult {
+    // The framebuffer panel shows only `wifi: <stage> FAILED step=N`,
+    // so a code shared by two layers makes a bare-metal failure
+    // ambiguous. Each layer owns a disjoint range; every constant must
+    // be unique and inside its range.
+    // Add new `step` constants here.
+    let layers: &[(&str, u32, u32, &[u32])] = &[
+        (
+            "pci",
+            1,
+            9,
+            &[
+                super::pci::step::BAR0_MAP,
+                super::pci::step::LINK_DOWN,
+                super::pci::step::UNSUPPORTED_SOC,
+                super::pci::step::NO_HW_PARAMS,
+                super::pci::step::MSI_UNAVAILABLE,
+            ],
+        ),
+        (
+            "mhi_host",
+            10,
+            39,
+            &[
+                super::mhi_host::step::NO_DMA_MEMORY,
+                super::mhi_host::step::BHI_OFFSET_RANGE,
+                super::mhi_host::step::BHIE_OFFSET_RANGE,
+                super::mhi_host::step::POWER_UP_BAD_EE,
+                super::mhi_host::step::SYSERR_RESET_TIMEOUT,
+                super::mhi_host::step::NO_FIRMWARE_IMAGE,
+                super::mhi_host::step::BHI_ERROR,
+                super::mhi_host::step::BHI_TIMEOUT,
+                super::mhi_host::step::BHIE_ERROR,
+                super::mhi_host::step::BHIE_TIMEOUT,
+                super::mhi_host::step::MHI_RESET_TIMEOUT,
+                super::mhi_host::step::READY_TIMEOUT,
+                super::mhi_host::step::CHDB_RANGE,
+                super::mhi_host::step::ERDB_RANGE,
+                super::mhi_host::step::SYS_ERR,
+                super::mhi_host::step::MISSION_BAD_EE,
+                super::mhi_host::step::M0_TIMEOUT,
+                super::mhi_host::step::POWER_UP_TIMEOUT,
+                super::mhi_host::step::CHAN_START,
+                super::mhi_host::step::CHAN_WRONG_EE,
+                super::mhi_host::step::FW_NOT_FOUND,
+                super::mhi_host::step::PM_TRANSITION,
+                super::mhi_host::step::EVENT_RING_RP,
+                super::mhi_host::step::DL_QUEUE,
+                super::mhi_host::step::BAD_CONFIG,
+                super::mhi_host::step::REG_ACCESS,
+            ],
+        ),
+        (
+            "wlfw",
+            40,
+            79,
+            &[
+                super::wlfw::step::NO_FW_AUTHORITY,
+                super::wlfw::step::SERVER_TIMEOUT,
+                super::wlfw::step::SERVER_EXIT,
+                super::wlfw::step::IND_REGISTER,
+                super::wlfw::step::HOST_CAP,
+                super::wlfw::step::MEM_REQUEST_TIMEOUT,
+                super::wlfw::step::TARGET_MEM_ALLOC,
+                super::wlfw::step::RESPOND_MEM,
+                super::wlfw::step::MEM_READY_TIMEOUT,
+                super::wlfw::step::TARGET_CAP,
+                super::wlfw::step::BDF_FETCH,
+                super::wlfw::step::BDF_DOWNLOAD,
+                super::wlfw::step::CALDATA_FETCH,
+                super::wlfw::step::CALDATA_DOWNLOAD,
+                super::wlfw::step::M3_LOAD,
+                super::wlfw::step::M3_ALLOC,
+                super::wlfw::step::M3_INFO,
+                super::wlfw::step::FW_READY_TIMEOUT,
+                super::wlfw::step::WLAN_INI,
+                super::wlfw::step::WLAN_CFG,
+                super::wlfw::step::WLAN_MODE,
+                super::wlfw::step::COLDBOOT_MODE,
+                super::wlfw::step::FW_RESTART,
+                super::wlfw::step::UNSUPPORTED,
+            ],
+        ),
+        (
+            "hal",
+            80,
+            89,
+            &[
+                super::hal::step::NO_DMA_MEMORY,
+                super::hal::step::BAD_RING_NUM,
+                super::hal::step::RING_ID_RANGE,
+                super::hal::step::SHADOW_FULL,
+                super::hal::step::NO_SHADOW_REG,
+                super::hal::step::BAD_RING_SIZE,
+                super::hal::step::NO_REGS,
+                super::hal::step::RING_MEM_SIZE,
+                super::hal::step::RING_IN_USE,
+            ],
+        ),
+        (
+            "ce",
+            90,
+            119,
+            &[
+                super::ce::step::ALLOC_SRC_RING,
+                super::ce::step::ALLOC_DST_RING,
+                super::ce::step::ALLOC_STATUS_RING,
+                super::ce::step::ALLOC_TX_BUF,
+                super::ce::step::ALLOC_RX_BUF,
+                super::ce::step::INIT_RING,
+                super::ce::step::BAD_PIPE,
+                super::ce::step::OVERSIZE,
+                super::ce::step::RING_FULL,
+                super::ce::step::SHUTDOWN,
+                super::ce::step::RX_BAD_LEN,
+                super::ce::step::RX_POST,
+            ],
+        ),
+        (
+            "core",
+            120,
+            149,
+            &[
+                super::core::step::UNSUPPORTED,
+                super::core::step::NO_DEVICE,
+                super::core::step::HTC_INIT,
+                super::core::step::HTC_READY_TIMEOUT,
+                super::core::step::HTC_BAD_READY,
+                super::core::step::HTT_CONNECT,
+                super::core::step::HTT_CONNECT_TIMEOUT,
+                super::core::step::WMI_CONNECT,
+                super::core::step::WMI_CONNECT_TIMEOUT,
+                super::core::step::HTC_START,
+                super::core::step::SERVICE_READY_TIMEOUT,
+                super::core::step::SERVICE_READY_DECODE,
+                super::core::step::WMI_INIT,
+                super::core::step::WMI_SEND_CREDITS,
+                super::core::step::WMI_SEND,
+                super::core::step::READY_TIMEOUT,
+                super::core::step::READY_DECODE,
+                super::core::step::NO_WMI_EP,
+                super::core::step::EVENT_TIMEOUT,
+                super::core::step::HTT_SEND,
+            ],
+        ),
+        (
+            "mac",
+            150,
+            199,
+            &[
+                super::mac::step::START_PDEV_PARAM,
+                super::mac::step::START_PROBE_OUI,
+                super::mac::step::START_DFS_OFFLOAD,
+                super::mac::step::START_CHAN_LIST,
+                super::mac::step::START_LRO,
+                super::mac::step::START_DP,
+                super::mac::step::VDEV_CREATE,
+                super::mac::step::VDEV_PARAM,
+                super::mac::step::STA_PS,
+                super::mac::step::REG_EVENT,
+                super::mac::step::SCAN_BUSY,
+                super::mac::step::SCAN_START_CMD,
+                super::mac::step::SCAN_START_TIMEOUT,
+                super::mac::step::SCAN_START_FAILED,
+                super::mac::step::SCAN_TIMEOUT,
+                super::mac::step::SCAN_STOP_TIMEOUT,
+                super::mac::step::SCAN_11D,
+                super::mac::step::CONNECT_NO_BSS,
+                super::mac::step::CONNECT_UNSUPPORTED,
+                super::mac::step::CONNECT_STATE,
+                super::mac::step::TXPOWER,
+                super::mac::step::WMM_PARAMS,
+                super::mac::step::PEER_CREATE,
+                super::mac::step::PEER_MAP_TIMEOUT,
+                super::mac::step::VDEV_START,
+                super::mac::step::VDEV_START_TIMEOUT,
+                super::mac::step::VDEV_START_STATUS,
+                super::mac::step::AUTH_TX,
+                super::mac::step::AUTH_TIMEOUT,
+                super::mac::step::AUTH_REJECTED,
+                super::mac::step::ASSOC_TX,
+                super::mac::step::ASSOC_TIMEOUT,
+                super::mac::step::ASSOC_REJECTED,
+                super::mac::step::PEER_ASSOC,
+                super::mac::step::PEER_ASSOC_TIMEOUT,
+                super::mac::step::VDEV_UP,
+                super::mac::step::EAPOL_TIMEOUT,
+                super::mac::step::EAPOL_MIC,
+                super::mac::step::EAPOL_PROTO,
+                super::mac::step::KEY_INSTALL,
+                super::mac::step::KEY_INSTALL_TIMEOUT,
+                super::mac::step::KEY_INSTALL_STATUS,
+                super::mac::step::PEER_AUTHORIZE,
+                super::mac::step::LINK_KICKOUT,
+                super::mac::step::LINK_BEACON_LOSS,
+                super::mac::step::LINK_DEAUTH_RX,
+                super::mac::step::VDEV_STOP_TIMEOUT,
+                super::mac::step::PEER_DELETE_TIMEOUT,
+                super::mac::step::WMI_SEND,
+                super::mac::step::EAPOL_GTK,
+            ],
+        ),
+        (
+            "mac (security / HE)",
+            270,
+            299,
+            &[
+                super::mac::step::SA_QUERY_TIMEOUT,
+                super::mac::step::SAE_PWE,
+                super::mac::step::SAE_REJECTED,
+                super::mac::step::SAE_COMMIT,
+                super::mac::step::SAE_CONFIRM,
+                super::mac::step::SAE_TIMEOUT,
+                super::mac::step::HE_PARAM,
+                super::mac::step::PTK_REKEY,
+            ],
+        ),
+        (
+            "dp_ring",
+            200,
+            219,
+            &[
+                super::dp_ring::step::SRNG_SETUP,
+                super::dp_ring::step::RING_ALLOC,
+                super::dp_ring::step::LINK_DESC_BANKS,
+                super::dp_ring::step::LINK_DESC_ALLOC,
+                super::dp_ring::step::SCATTER_UNSUPPORTED,
+                super::dp_ring::step::BAD_RING_TYPE,
+                super::dp_ring::step::ALREADY_SET_UP,
+                super::dp_ring::step::NOT_SET_UP,
+                super::dp_ring::step::TX_IDR_FULL,
+                super::dp_ring::step::TX_RING_FULL,
+                super::dp_ring::step::TX_NOT_DATA,
+                super::dp_ring::step::TX_BAD_ENCAP,
+                super::dp_ring::step::TX_SHUTDOWN,
+                super::dp_ring::step::TX_DMA,
+                super::dp_ring::step::TX_FRAME_LEN,
+                super::dp_ring::step::LINK_DESC_LOOKUP,
+                super::dp_ring::step::LINK_DESC_RETURN,
+            ],
+        ),
+        (
+            "htt",
+            220,
+            229,
+            &[
+                super::htt::step::RING_TYPE,
+                super::htt::step::RING_ID,
+                super::htt::step::NO_RING,
+                super::htt::step::T2H_TRUNCATED,
+                super::htt::step::VERSION,
+                super::htt::step::VERSION_TIMEOUT,
+            ],
+        ),
+        (
+            "dp_peer",
+            230,
+            249,
+            &[
+                super::dp_peer::step::PEER_NOT_FOUND,
+                super::dp_peer::step::QDESC_ALLOC,
+                super::dp_peer::step::REO_CMD_RING_FULL,
+                super::dp_peer::step::REO_CMD_SHUTDOWN,
+                super::dp_peer::step::REO_CMD_UNSUPPORTED,
+                super::dp_peer::step::REO_CMD_UNKNOWN,
+                super::dp_peer::step::REO_CMD_NUM_ZERO,
+                super::dp_peer::step::REO_CMD_NO_BLOCK_RES,
+                super::dp_peer::step::BAD_TID,
+                super::dp_peer::step::WMI_SEND,
+            ],
+        ),
+        (
+            "runtime",
+            250,
+            269,
+            &[
+                super::runtime::step::DP_UNSUPPORTED,
+                super::runtime::step::DP_MISSING,
+                super::runtime::step::HTT_VER_SEND,
+                super::runtime::step::SRING_SETUP_SEND,
+                super::runtime::step::DP_IRQ_CONFIG,
+                super::runtime::step::MAC_CAPS,
+                super::runtime::step::NET_REGISTER,
+                super::runtime::step::IF_DOWN_VDEV_DELETE,
+                super::runtime::step::RECOVERY_LIMIT,
+                super::runtime::step::RECOVERY_FW,
+                super::runtime::step::RECOVERY_CORE,
+                super::runtime::step::RECOVERY_MAC,
+            ],
+        ),
+    ];
+    let mut seen: Vec<u32> = Vec::new();
+    for &(_name, lo, hi, codes) in layers {
+        for &c in codes {
+            if c < lo || c > hi {
+                return TestResult::Fail("ath11k step code outside its layer's range");
+            }
+            if seen.contains(&c) {
+                return TestResult::Fail("ath11k step code used by two constants");
+            }
+            seen.push(c);
+        }
+    }
+    if seen.contains(&0) {
+        return TestResult::Fail("step 0 means no failure and must not be a code");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_step_codes_unique_and_in_range
 );
 
 // Suppress the unused-import warning when the `Vec` import isn't

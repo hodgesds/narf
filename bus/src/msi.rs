@@ -196,6 +196,22 @@ pub unsafe fn enable(cfg: &MsiConfig) -> Result<(), MsiError> {
     Ok(())
 }
 
+/// Clear the MSI Enable bit, leaving the programmed message and
+/// Multi-Message Enable in place. Linux `ath11k_pci_msi_disable`
+/// does this after allocating vectors and re-enables at power-up.
+///
+/// # Safety
+/// Caller owns the device's cfg-space exclusively.
+pub unsafe fn disable(cfg: &MsiConfig) -> Result<(), MsiError> {
+    // SAFETY: cap window.
+    let mc = unsafe { cfg_read16(cfg.cfg_phys, cfg.cap_offset + 2) };
+    // SAFETY: same.
+    unsafe {
+        cfg_write16(cfg.cfg_phys, cfg.cap_offset + 2, mc & !1);
+    }
+    Ok(())
+}
+
 /// Compute (msi_addr, msg_data) for the configured arch. Mirrors the
 /// helper in `msix.rs` so MSI / MSI-X share the same MSI message
 /// math; the only divergence is whether the message lives in

@@ -45,6 +45,15 @@ entries and handlers are programmed. `unsafe MsixTable::disable()` masks
 the function and clears MSI-X enable; the owner must stop device causes
 and synchronize handlers before releasing their state or vector numbers.
 
+`unsafe msi::disable(&MsiConfig)` clears MSI Enable without touching the
+programmed message or Multi-Message Enable, so a later `msi::enable`
+resumes the same vectors.
+
+`pci_express::clear_and_set_link_control(cap, dev, clear, set) -> u16`
+read-modify-writes PCIe Link Control and returns the prior value (Linux
+`pcie_capability_clear_and_set_word(PCI_EXP_LNKCTL)`); `LNKCTL_ASPMC` names
+the ASPM L0s/L1 field.
+
 ### 3.1 Device descriptor
 
 ```rust

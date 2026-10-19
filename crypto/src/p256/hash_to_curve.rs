@@ -142,7 +142,7 @@ fn hash_to_field_p256(msg: &[u8], dst: &[u8], count: usize) -> Vec<Fp> {
 /// field representation by `2^256 mod p` via repeated doubling; the
 /// 16-byte upper portion has at most 128 bits of magnitude so this is
 /// cheap and avoids hand-coding a Solinas-style hi-limb reduction here.
-fn os2ip_mod_p(bytes: &[u8]) -> Fp {
+pub fn os2ip_mod_p(bytes: &[u8]) -> Fp {
     debug_assert_eq!(bytes.len(), L_P256);
     // Build hi (16 bytes) and lo (32 bytes) as Fp by zero-extending each
     // to 32 BE bytes.
@@ -240,7 +240,7 @@ fn curve_eqn(x: &Fp) -> Fp {
 ///   gx2 = x2³ + a·x2 + b
 ///   (x, y) = (x1, sqrt(gx1)) if gx1 is a square, else (x2, sqrt(gx2))
 ///   if sgn0(u) != sgn0(y): y = -y
-fn map_to_curve_sswu(u: &Fp) -> AffinePoint {
+pub fn map_to_curve_sswu(u: &Fp) -> AffinePoint {
     let z = sswu_z();
     let a = curve_a();
     let b = Fp::from_limbs(super::CURVE_B);

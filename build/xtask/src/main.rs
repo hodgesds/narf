@@ -10849,17 +10849,21 @@ fn import_firmware_cmd(args: &ImportFirmwareArgs) -> Result<()> {
                 Err(_) => continue,
             };
             if ft.is_symlink() {
-                // Skip symlinks — most firmware symlinks are alias
-                // names (vendor/foo.bin -> vendor/foo-v2.bin). Each
-                // alias becomes its own entry below, and following
-                // would risk infinite loops on circular aliases.
-                continue;
-            }
-            if ft.is_dir() {
+                // Firmware symlinks are alias names drivers request by
+                // the alias (linux-firmware ships every
+                // `ath11k/WCN6855/hw2.1/*` as a link to `../hw2.0/*`,
+                // and ath11k loads `WCN6855/hw2.1/amss.bin`), so a link
+                // to a regular file is imported under the link's own
+                // path. Links to directories are never followed: that
+                // would risk loops on circular aliases.
+                match std::fs::metadata(&path) {
+                    Ok(m) if m.is_file() => {}
+                    _ => continue,
+                }
+            } else if ft.is_dir() {
                 stack.push(path);
                 continue;
-            }
-            if !ft.is_file() {
+            } else if !ft.is_file() {
                 continue;
             }
 

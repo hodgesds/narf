@@ -41,6 +41,16 @@ impl SendDispatch {
     }
 }
 
+/// `ndo_open` / `ndo_stop`: called with the interface name and its new
+/// administrative state on every `IFF_UP` transition [`set_link_state`]
+/// makes (`dev_open` / `dev_close`), with the registry lock released and
+/// before the NETDEV_UP / NETDEV_DOWN notification. It runs in the caller's
+/// context (an `RTM_NEWLINK` / `SIOCSIFFLAGS` syscall, an initcall) and must
+/// not block: a driver whose open is asynchronous records the request,
+/// completes it from its own task, and brings the interface back down with
+/// [`set_link_state`] when the open fails.
+pub type OpenStopFn = fn(&str, bool);
+
 /// Zero-copy transmit hook (P-F). A driver that opts in via
 /// [`enable_zero_copy_tx`] supplies this: it takes ownership of a
 /// [`crate::Frame`] the stack built directly into a DMA buffer drawn from the
@@ -123,6 +133,9 @@ pub struct NetIfaceEntry {
     pub mtu: u32,
     /// Administratively up (IFF_UP). Physical carrier is tracked separately.
     pub link_up: bool,
+    /// The driver's `ndo_open` / `ndo_stop` ([`set_open_stop`]); `None` for
+    /// a device that is always running.
+    pub open_stop: Option<OpenStopFn>,
     /// Owning network namespace. Zero is the initial namespace.
     pub net_ns_id: u64,
     /// Linux ifindex, fixed at registration (`dev_new_index`): `lo` is 1, the
@@ -239,6 +252,21 @@ pub fn set_offloads(name: &str, offloads: crate::OffloadCapabilities) {
     {
         entry.offloads = offloads;
     }
+}
+
+/// Install interface `name`'s `ndo_open` / `ndo_stop` ([`OpenStopFn`]).
+/// A driver calls this right after [`register`]; registration starts with
+/// none. Returns `false` when `name` is not registered.
+pub fn set_open_stop(name: &str, hook: OpenStopFn) -> bool {
+    let mut g = IFACES.lock();
+    let Some(entry) = g
+        .as_mut()
+        .and_then(|ifaces| ifaces.iter_mut().find(|entry| entry.name == name))
+    else {
+        return false;
+    };
+    entry.open_stop = Some(hook);
+    true
 }
 
 /// Enable or disable software GRO for one registered interface.
@@ -632,6 +660,8 @@ fn register_inner(
         gateway,
         mtu,
         link_up,
+        // Installed by the driver after every (re-)registration.
+        open_stop: None,
         net_ns_id,
         ifindex,
         driver: "",
@@ -1415,11 +1445,15 @@ pub fn set_link_state(name: &str, up: bool) -> bool {
     };
     let changed = entry.link_up != up;
     entry.link_up = up;
-    let (net_ns_id, ifindex) = (entry.net_ns_id, entry.ifindex);
+    let (net_ns_id, ifindex, open_stop) = (entry.net_ns_id, entry.ifindex, entry.open_stop);
     drop(g);
     // `dev_open` / `dev_close` raise NETDEV_UP / NETDEV_DOWN only on a real
     // transition. Delivered with IFACES released: the notifier reads it.
     if changed {
+        // `__dev_open` → `ndo_open`, `__dev_close_many` → `ndo_stop`.
+        if let Some(hook) = open_stop {
+            hook(name, up);
+        }
         crate::raw_sock::netdev_event(
             net_ns_id,
             ifindex,

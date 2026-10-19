@@ -153,11 +153,13 @@ fn smoke_e2e_mt7921_mcu_init_sequence_layout() -> TestResult {
     if seq[0] != 0 {
         return TestResult::Fail("PM_STATE_CTRL pm_state should be ACTIVE");
     }
-    // UNI DEV_INFO_UPDATE: own MAC starts at PM + RA + UNI hdr (4) +
-    // ACTIVE TLV hdr (4) + active(1) + link_idx(1) = +10 inside the UNI body.
+    // UNI DEV_INFO_UPDATE (Linux mt76_connac_mcu_uni_add_dev dev_req):
+    // hdr { omac_idx, band_idx, pad[2] } then the DEV_INFO_ACTIVE TLV
+    // { tag: u16, len: u16, active, link_idx, omac_addr[6] } — own MAC
+    // at +10 inside the UNI body.
     let uni_off = PM_STATE_CTRL_SIZE + INIT_RA_CFG_SIZE;
-    let mac_off = uni_off + 10;
-    if seq[mac_off..mac_off + 6] != cfg.own_mac {
+    let mac_off = uni_off + 4 /*hdr*/ + 4 /*TLV tag+len*/ + 2 /*active, link_idx*/;
+    if seq.get(mac_off..mac_off + 6) != Some(&cfg.own_mac[..]) {
         return TestResult::Fail("UNI DEV_INFO_UPDATE didn't carry own_mac");
     }
     TestResult::Pass
@@ -559,7 +561,7 @@ kernel_test_in!(
 // ── Smoke 13 — ath11k probe + WMI VDEV_CREATE encode ────────────────
 
 fn smoke_e2e_ath11k_probe_and_vdev_create_encode() -> TestResult {
-    use crate::ath11k::wmi::build_vdev_create;
+    use crate::ath11k::wmi::{vdev_create_cmd, vdev_type, VdevCreateParams};
     use crate::ath11k::{register_pci_driver, ATH11K_DEV_QCA6390, QCOM_VENDOR};
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::{registered_pci_drivers, MatchKind};
@@ -581,9 +583,15 @@ fn smoke_e2e_ath11k_probe_and_vdev_create_encode() -> TestResult {
     // Build a WMI_VDEV_CREATE_CMDID frame and verify the MAC + vdev_id
     // round-trip into the TLV body.
     let vdev_mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
-    let frame = build_vdev_create(
-        0, /* vdev_type = STA */ 1, vdev_mac, /* pdev = 1 */ 1,
-    );
+    let frame = vdev_create_cmd(
+        &vdev_mac,
+        &VdevCreateParams {
+            vdev_type: vdev_type::STA,
+            pdev_id: 1,
+            ..Default::default()
+        },
+    )
+    .frame();
     if frame.is_empty() {
         return TestResult::Fail("VDEV_CREATE frame empty");
     }

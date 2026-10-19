@@ -13,6 +13,8 @@
 //! |   3  | `module`          | `(start, size, cmdline)` per module    |
 //! |   6  | `mmap`            | `[entry]` of `(addr, len, type)`       |
 //! |   8  | `framebuffer`     | `(addr, pitch, w, h, bpp, type)`       |
+//! |  12  | `efi64`           | EFI system table physical address      |
+//! |  13  | `smbios`          | copy of an SMBIOS entry-point struct   |
 //! |  14  | `acpi_old_rsdp`   | 20-byte RSDP v1 copy                   |
 //! |  15  | `acpi_new_rsdp`   | XSDP (v2+); preferred over tag 14      |
 //!
@@ -35,6 +37,8 @@ const TAG_CMDLINE: u32 = 1;
 const TAG_MODULE: u32 = 3;
 const TAG_MMAP: u32 = 6;
 const TAG_FRAMEBUFFER: u32 = 8;
+const TAG_EFI64: u32 = 12;
+const TAG_SMBIOS: u32 = 13;
 const TAG_ACPI_OLD_RSDP: u32 = 14;
 const TAG_ACPI_NEW_RSDP: u32 = 15;
 
@@ -202,6 +206,48 @@ pub unsafe fn rsdp_phys(info_ptr: usize) -> Option<u64> {
     v1
 }
 
+/// Firmware-table pointers: the EFI system table (tag 12) and the
+/// SMBIOS entry-point copies (tag 13).
+///
+/// Tag 12 payload: `u64 pointer`. Tag 13 payload: `u8 major, u8 minor,
+/// u8 reserved[6]` then the entry-point structure the loader copied
+/// (`tag->size = 16 + entry->length` in Limine). The entry point is
+/// classified by its anchor; the first tag of each kind wins.
+///
+/// # Safety
+/// `info_ptr` must point at a valid multiboot2 info struct.
+pub unsafe fn firmware_handoff(info_ptr: usize) -> crate::firmware::FirmwareHandoff {
+    use crate::firmware::{FirmwareHandoff, SmbiosEntryCopy};
+    let mut h = FirmwareHandoff::EMPTY;
+    // SAFETY: caller contract.
+    for (ty, size, payload) in unsafe { TagIter::new(info_ptr) } {
+        match ty {
+            TAG_EFI64 if size >= 16 && h.efi_system_table.is_none() => {
+                // SAFETY: the tag holds 8 payload bytes (size >= 16).
+                let p = unsafe { (payload as *const u64).read_unaligned() };
+                if p != 0 {
+                    h.efi_system_table = Some(p);
+                }
+            }
+            TAG_SMBIOS if size > 16 => {
+                let n = (size as usize - 16).min(32);
+                // SAFETY: `n` bytes past the 8-byte payload prefix lie
+                // inside the tag (`size` covers header + prefix + n).
+                let ep = unsafe { core::slice::from_raw_parts((payload + 8) as *const u8, n) };
+                if ep.starts_with(b"_SM3_") {
+                    if h.smbios3_entry.is_none() {
+                        h.smbios3_entry = Some(SmbiosEntryCopy::new(ep));
+                    }
+                } else if ep.starts_with(b"_SM_") && h.smbios_entry.is_none() {
+                    h.smbios_entry = Some(SmbiosEntryCopy::new(ep));
+                }
+            }
+            _ => {}
+        }
+    }
+    h
+}
+
 /// Walk the module list and return the first module whose cmdline is
 /// `"initramfs"` (case-insensitive). Returns `(start, size)` in bytes.
 ///
@@ -310,4 +356,100 @@ unsafe fn read_cstr<'a>(phys: usize, max: usize) -> &'a [u8] {
     }
     // SAFETY: same readability contract; len ≤ max.
     unsafe { core::slice::from_raw_parts(phys as *const u8, len) }
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// Append one tag (8-byte aligned) to a byte image of an mbi.
+    fn tag(img: &mut [u8], at: &mut usize, ty: u32, payload: &[u8]) {
+        let size = 8 + payload.len();
+        img[*at..*at + 4].copy_from_slice(&ty.to_le_bytes());
+        img[*at + 4..*at + 8].copy_from_slice(&(size as u32).to_le_bytes());
+        img[*at + 8..*at + size].copy_from_slice(payload);
+        *at += (size + 7) & !7;
+    }
+
+    fn smbios_tag_payload(ep: &[u8]) -> [u8; 40] {
+        // u8 major, u8 minor, u8 reserved[6], then the entry point.
+        let mut p = [0u8; 40];
+        p[0] = 3;
+        p[8..8 + ep.len()].copy_from_slice(ep);
+        p
+    }
+
+    /// Tags 12 (EFI64) and 13 (SMBIOS, `_SM3_` + `_SM_`) are copied out
+    /// of the mbi; a second `_SM3_` tag does not replace the first.
+    fn smoke_mb2_firmware_handoff() -> TestResult {
+        let mut buf = [0u64; 64];
+        // SAFETY: a u64 array viewed as bytes, same lifetime.
+        let img = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<u8>(), 512) };
+        let mut at = 8;
+        tag(img, &mut at, TAG_EFI64, &0x7FE8_1018u64.to_le_bytes());
+        let mut sm3 = [0u8; 24];
+        sm3[..5].copy_from_slice(b"_SM3_");
+        sm3[6] = 24;
+        tag(
+            img,
+            &mut at,
+            TAG_SMBIOS,
+            &smbios_tag_payload(&sm3)[..8 + 24],
+        );
+        let mut other = sm3;
+        other[7] = 9;
+        tag(
+            img,
+            &mut at,
+            TAG_SMBIOS,
+            &smbios_tag_payload(&other)[..8 + 24],
+        );
+        let mut sm = [0u8; 31];
+        sm[..4].copy_from_slice(b"_SM_");
+        sm[5] = 31;
+        tag(img, &mut at, TAG_SMBIOS, &smbios_tag_payload(&sm)[..8 + 31]);
+        tag(img, &mut at, TAG_END, &[]);
+        img[0..4].copy_from_slice(&(at as u32).to_le_bytes());
+
+        // SAFETY: `img` is a well-formed mbi built above.
+        let h = unsafe { firmware_handoff(img.as_ptr() as usize) };
+        if h.efi_system_table != Some(0x7FE8_1018) {
+            return TestResult::Fail("EFI64 system table pointer");
+        }
+        let Some(e3) = h.smbios3_entry else {
+            return TestResult::Fail("_SM3_ copy missing");
+        };
+        if e3.len != 24 || e3.bytes[..24] != sm3 || e3.bytes[24..] != [0; 8] {
+            return TestResult::Fail("_SM3_ copy: first tag, zero padded");
+        }
+        let Some(e) = h.smbios_entry else {
+            return TestResult::Fail("_SM_ copy missing");
+        };
+        if e.len != 31 || e.bytes[..31] != sm {
+            return TestResult::Fail("_SM_ copy");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("boot/firmware", smoke_mb2_firmware_handoff);
+
+    /// No usable tags: nothing handed over (a zero EFI pointer and an
+    /// SMBIOS tag without entry bytes are ignored).
+    fn smoke_mb2_firmware_handoff_absent() -> TestResult {
+        let mut buf = [0u64; 16];
+        // SAFETY: a u64 array viewed as bytes, same lifetime.
+        let img = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<u8>(), 128) };
+        let mut at = 8;
+        tag(img, &mut at, TAG_EFI64, &0u64.to_le_bytes());
+        tag(img, &mut at, TAG_SMBIOS, &[0u8; 8]);
+        tag(img, &mut at, TAG_END, &[]);
+        img[0..4].copy_from_slice(&(at as u32).to_le_bytes());
+        // SAFETY: `img` is a well-formed mbi built above.
+        let h = unsafe { firmware_handoff(img.as_ptr() as usize) };
+        if h != crate::firmware::FirmwareHandoff::EMPTY {
+            return TestResult::Fail("expected an empty handoff");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("boot/firmware", smoke_mb2_firmware_handoff_absent);
 }

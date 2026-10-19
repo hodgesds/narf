@@ -9842,6 +9842,159 @@ fn smoke_abi_netlink_generic_socket_open() -> TestResult {
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_generic_socket_open);
 
+/// nl80211 commands follow Linux `genl_family_rcv_msg`: the op lookup
+/// (-EOPNOTSUPP), then the op's permission flag — `GENL_ADMIN_PERM` is
+/// `netlink_capable` (CAP_NET_ADMIN in the initial user namespace),
+/// `GENL_UNS_ADMIN_PERM` is `netlink_ns_capable(net->user_ns)` — each -EPERM,
+/// and only then `nl80211_pre_doit`'s device lookup (-ENODEV). Both the
+/// socket's opener and the sender must be capable. Commands without a flag
+/// (GET_INTERFACE, GET_SCAN …) need nothing. NARF used to refuse every
+/// mutating command without a delegated per-interface handle, so iw,
+/// wpa_supplicant and NetworkManager (root, CAP_NET_ADMIN) all got EPERM.
+fn smoke_abi_nl80211_command_permissions() -> TestResult {
+    with_setup(|| {
+        const NL80211: u16 = 0x13;
+        const GET_INTERFACE: u8 = 5;
+        const TRIGGER_SCAN: u8 = 33; // GENL_UNS_ADMIN_PERM
+        const EXTERNAL_AUTH: u8 = 127; // GENL_ADMIN_PERM
+        const CAP_NET_ADMIN_BIT: u64 = 1 << 12;
+        const FULL: u64 = crate::handlers::CAP_FULL_SET;
+        const MISSING_IFINDEX: u32 = 0x7fff_0000;
+        // One nl80211 request naming a device that does not exist, so a
+        // request that clears the permission check stops at -ENODEV.
+        let request = |command: u8, flags: u16, seq: u32| {
+            let mut m = [0u8; 28];
+            m[0..4].copy_from_slice(&28u32.to_ne_bytes());
+            m[4..6].copy_from_slice(&NL80211.to_ne_bytes());
+            m[6..8].copy_from_slice(&flags.to_ne_bytes());
+            m[8..12].copy_from_slice(&seq.to_ne_bytes());
+            m[16] = command;
+            m[17] = 1;
+            m[20..22].copy_from_slice(&8u16.to_ne_bytes());
+            m[22..24].copy_from_slice(&3u16.to_ne_bytes()); // NL80211_ATTR_IFINDEX
+            m[24..28].copy_from_slice(&MISSING_IFINDEX.to_ne_bytes());
+            m
+        };
+        let ack_errno = |fd: u64, command: u8, seq: u32| -> Result<i64, &'static str> {
+            let req = request(command, NLM_F_REQUEST | NLM_F_ACK, seq);
+            if netlink_send(fd, &req).ok_or("send")? != req.len() as i64 {
+                return Err("nl80211 send failed");
+            }
+            let mut ack = [0u8; 256];
+            let n = netlink_recv(fd, &mut ack).ok_or("recv")?;
+            if n < (NLMSG_HDRLEN + 4) as i64 || nlmsg_type_of(&ack) != NLMSG_ERROR {
+                return Err("nl80211 command did not get an NLMSG_ERROR ack");
+            }
+            Ok(i64::from(i32::from_ne_bytes(
+                ack[NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap(),
+            )))
+        };
+        let caps = |effective: u64| crate::handlers::__test_set_caps(FAKE_TASK, effective, FULL);
+        let restore = crate::handlers::__test_caps_reset;
+
+        let result = (|| {
+            caps(FULL);
+            let fd = open_netlink(NETLINK_GENERIC)?;
+            // CAP_NET_ADMIN: both flag classes clear the permission check
+            // and reach the device lookup.
+            if ack_errno(fd, TRIGGER_SCAN, 401)? != ENODEV {
+                return Err("CAP_NET_ADMIN TRIGGER_SCAN did not reach the device lookup");
+            }
+            if ack_errno(fd, EXTERNAL_AUTH, 402)? != ENODEV {
+                return Err("CAP_NET_ADMIN EXTERNAL_AUTH did not reach the device lookup");
+            }
+            // The sender drops CAP_NET_ADMIN: -EPERM, before the lookup.
+            caps(FULL & !CAP_NET_ADMIN_BIT);
+            if ack_errno(fd, TRIGGER_SCAN, 403)? != EPERM {
+                return Err("TRIGGER_SCAN without CAP_NET_ADMIN must be EPERM before ENODEV");
+            }
+            if ack_errno(fd, EXTERNAL_AUTH, 404)? != EPERM {
+                return Err("EXTERNAL_AUTH without CAP_NET_ADMIN must be EPERM");
+            }
+            // An unknown command is -EOPNOTSUPP even unprivileged: the op
+            // lookup precedes the permission check.
+            if ack_errno(fd, 0xfe, 405)? != EOPNOTSUPP {
+                return Err("unknown nl80211 command must be EOPNOTSUPP before EPERM");
+            }
+            // A flagless op needs no capability: the dump completes.
+            let mut dump = [0u8; 20];
+            dump[..20].copy_from_slice(&request(GET_INTERFACE, NLM_F_REQUEST_DUMP, 406)[..20]);
+            dump[0..4].copy_from_slice(&20u32.to_ne_bytes());
+            if netlink_send(fd, &dump).ok_or("dump send")? != 20 {
+                return Err("GET_INTERFACE dump send failed");
+            }
+            let mut reply = [0u8; 512];
+            let mut done = false;
+            for _ in 0..MAX_DUMP_MESSAGES {
+                let n = netlink_recv(fd, &mut reply).ok_or("dump recv")?;
+                if n < NLMSG_HDRLEN as i64 {
+                    return Err("GET_INTERFACE dump ended without NLMSG_DONE");
+                }
+                match nlmsg_type_of(&reply) {
+                    NLMSG_DONE => {
+                        done = true;
+                        break;
+                    }
+                    NLMSG_ERROR => return Err("unprivileged GET_INTERFACE dump was refused"),
+                    _ => {}
+                }
+            }
+            if !done {
+                return Err("GET_INTERFACE dump did not terminate");
+            }
+            // Joining nl80211's event groups needs no capability (no group
+            // carries GENL_MCAST_CAP_*): `genl_bind` admits anyone.
+            for group in [17u32, 18, 19] {
+                netlink_set_u32(fd, NETLINK_ADD_MEMBERSHIP, group)?;
+            }
+            let _ = call(Syscall::Close.raw(), a0(fd));
+
+            // Opened without CAP_NET_ADMIN, sent with it: the opener's
+            // credential is half of `netlink_capable` — still -EPERM.
+            let fd = open_netlink(NETLINK_GENERIC)?;
+            caps(FULL);
+            if ack_errno(fd, TRIGGER_SCAN, 407)? != EPERM {
+                return Err("a socket opened without CAP_NET_ADMIN triggered a scan");
+            }
+            let _ = call(Syscall::Close.raw(), a0(fd));
+
+            // Namespace scoping exists only in `--features container` builds.
+            #[cfg(feature = "container")]
+            {
+                const CLONE_NEWUSER: u64 = 0x1000_0000;
+                const CLONE_NEWNET: u64 = 0x4000_0000;
+                if call(Syscall::Unshare.raw(), a0(CLONE_NEWUSER)) != Some(0) {
+                    return Err("unshare(CLONE_NEWUSER)");
+                }
+                // CAP_NET_ADMIN in a child user namespace does not govern the
+                // initial network namespace.
+                let fd = open_netlink(NETLINK_GENERIC)?;
+                if ack_errno(fd, TRIGGER_SCAN, 408)? != EPERM {
+                    return Err("child-userns CAP_NET_ADMIN scanned the initial netns");
+                }
+                let _ = call(Syscall::Close.raw(), a0(fd));
+                // In a network namespace that child user namespace owns:
+                // GENL_UNS_ADMIN_PERM passes, GENL_ADMIN_PERM never does.
+                if call(Syscall::Unshare.raw(), a0(CLONE_NEWNET)) != Some(0) {
+                    return Err("unshare(CLONE_NEWNET)");
+                }
+                let fd = open_netlink(NETLINK_GENERIC)?;
+                if ack_errno(fd, TRIGGER_SCAN, 409)? != ENODEV {
+                    return Err("UNS_ADMIN_PERM refused the namespace owner");
+                }
+                if ack_errno(fd, EXTERNAL_AUTH, 410)? != EPERM {
+                    return Err("ADMIN_PERM accepted a child-userns capability");
+                }
+                let _ = call(Syscall::Close.raw(), a0(fd));
+            }
+            Ok(())
+        })();
+        restore();
+        result
+    })
+}
+kernel_test_in!("syscall_abi/socket", smoke_abi_nl80211_command_permissions);
+
 fn smoke_abi_netlink_generic_batched_requests() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_GENERIC)?;
@@ -12133,4 +12286,210 @@ fn smoke_abi_inet6_dgram_recvmsg_tclass_cmsg() -> TestResult {
 kernel_test_in!(
     "syscall_abi/socket",
     smoke_abi_inet6_dgram_recvmsg_tclass_cmsg
+);
+
+// ── Generic netlink: unicast to a port, NETLINK_URELEASE, nl80211 ───
+
+/// `getsockname` of a netlink socket: its `nl_pid`.
+fn netlink_portid(fd: u64) -> Result<u32, &'static str> {
+    let mut out = [0u8; 12];
+    let mut len = (out.len() as u32).to_ne_bytes();
+    if call(
+        Syscall::SocketGetSockName.raw(),
+        a2(fd, out.as_mut_ptr() as u64, len.as_mut_ptr() as u64),
+    ) != Some(0)
+    {
+        return Err("getsockname(AF_NETLINK) failed");
+    }
+    Ok(u32::from_ne_bytes(out[4..8].try_into().unwrap()))
+}
+
+/// One generic-netlink request (`CTRL_CMD_GETFAMILY` for "nl80211"):
+/// assigns the socket's port id (`netlink_autobind`) and installs the
+/// kernel's generic sinks.
+fn genl_ping(fd: u64) -> Result<(), &'static str> {
+    let mut req = [0u8; 32];
+    req[0..4].copy_from_slice(&32u32.to_ne_bytes());
+    req[4..6].copy_from_slice(&16u16.to_ne_bytes());
+    req[6..8].copy_from_slice(&1u16.to_ne_bytes());
+    req[16] = 3;
+    req[17] = 2;
+    req[20..22].copy_from_slice(&12u16.to_ne_bytes());
+    req[22..24].copy_from_slice(&2u16.to_ne_bytes());
+    req[24..32].copy_from_slice(b"nl80211\0");
+    if netlink_send(fd, &req) != Some(32) {
+        return Err("GETFAMILY send");
+    }
+    let mut buf = [0u8; 2048];
+    while netlink_recv(fd, &mut buf).is_some_and(|n| n > 0) {}
+    Ok(())
+}
+
+/// `genlmsg_unicast` (nl80211's CONTROL_PORT_FRAME to the connection
+/// owner) reaches exactly the socket bound to the port: `nlmsg_pid` 0
+/// (kernel origin), `nl_groups` 0 in the source address; another socket
+/// gets nothing, and a port no socket holds is -ECONNREFUSED.
+fn smoke_abi_netlink_generic_unicast_to_port() -> TestResult {
+    use narf_net::netlink_generic::{unicast_event, GenlReply};
+    with_setup(|| {
+        let a = open_netlink(NETLINK_GENERIC)?;
+        let b = open_netlink(NETLINK_GENERIC)?;
+        genl_ping(a)?;
+        genl_ping(b)?;
+        let port_a = netlink_portid(a)?;
+        let port_b = netlink_portid(b)?;
+        if port_a == 0 || port_b == 0 || port_a == port_b {
+            return Err("autobound port ids");
+        }
+        if unicast_event(
+            0x13,
+            0,
+            port_a,
+            GenlReply {
+                command: 129,
+                attrs: alloc::vec![8, 0, 51, 0, 1, 3, 0, 0],
+            },
+        )
+        .is_err()
+        {
+            return Err("unicast to a bound port failed");
+        }
+        let mut buf = [0u8; 256];
+        let mut from = [0u8; 12];
+        let mut from_len = (from.len() as u32).to_ne_bytes();
+        let mut args = a3(a, buf.as_mut_ptr() as u64, buf.len() as u64, MSG_DONTWAIT);
+        args.arg4 = from.as_mut_ptr() as u64;
+        args.arg5 = from_len.as_mut_ptr() as u64;
+        let n = call(Syscall::SocketRecv.raw(), args).ok_or("recv status")?;
+        if n != 28
+            || nlmsg_type_of(&buf) != 0x13
+            || buf[12..16] != [0; 4]
+            || buf[16] != 129
+            || buf[20..28] != [8, 0, 51, 0, 1, 3, 0, 0]
+        {
+            return Err("unicast message layout");
+        }
+        if u32::from_ne_bytes(from[4..8].try_into().unwrap()) != 0
+            || u32::from_ne_bytes(from[8..12].try_into().unwrap()) != 0
+        {
+            return Err("unicast source is not the kernel, no group");
+        }
+        if netlink_recv(b, &mut buf) != Some(-11) {
+            return Err("the other socket received the unicast");
+        }
+        let gone = port_a.wrapping_add(port_b).wrapping_add(0x10_0000);
+        if unicast_event(
+            0x13,
+            0,
+            gone,
+            GenlReply {
+                command: 129,
+                attrs: alloc::vec::Vec::new(),
+            },
+        ) != Err(111)
+        {
+            return Err("unicast to a missing port not ECONNREFUSED");
+        }
+        let _ = call(Syscall::Close.raw(), a0(a));
+        let _ = call(Syscall::Close.raw(), a0(b));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_generic_unicast_to_port
+);
+
+static RELEASED_PORTS: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<u32>> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+fn record_release(_ns: u64, portid: u32) {
+    RELEASED_PORTS.lock().push(portid);
+}
+
+/// close(2) of a bound NETLINK_GENERIC socket runs the NETLINK_URELEASE
+/// notifiers with its port (what nl80211 disconnects the connection owner
+/// on); a socket that never got a port id notifies nothing.
+fn smoke_abi_netlink_generic_close_notifies_release() -> TestResult {
+    with_setup(|| {
+        narf_net::netlink_generic::register_release_notifier(record_release);
+        RELEASED_PORTS.lock().clear();
+        let unbound = open_netlink(NETLINK_GENERIC)?;
+        let _ = call(Syscall::Close.raw(), a0(unbound));
+        if !RELEASED_PORTS.lock().is_empty() {
+            return Err("an unbound socket's close notified");
+        }
+        let fd = open_netlink(NETLINK_GENERIC)?;
+        genl_ping(fd)?;
+        let port = netlink_portid(fd)?;
+        if call(Syscall::Close.raw(), a0(fd)) != Some(0) {
+            return Err("close");
+        }
+        if *RELEASED_PORTS.lock() != [port] {
+            return Err("close did not notify NETLINK_URELEASE with the port");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_generic_close_notifies_release
+);
+
+/// nl80211 through the socket: GET_REG (no permission needed) returns the
+/// global regulatory domain; NEW_KEY from an unprivileged task is the
+/// generic layer's -EPERM; an unknown interface is -ENODEV once allowed.
+fn smoke_abi_nl80211_get_reg_and_key_errnos() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_GENERIC)?;
+        let req = |cmd: u8, attrs: &[u8], seq: u32| {
+            let mut m = alloc::vec::Vec::new();
+            m.extend_from_slice(&((20 + attrs.len()) as u32).to_ne_bytes());
+            m.extend_from_slice(&0x13u16.to_ne_bytes());
+            m.extend_from_slice(&5u16.to_ne_bytes());
+            m.extend_from_slice(&seq.to_ne_bytes());
+            m.extend_from_slice(&0u32.to_ne_bytes());
+            m.extend_from_slice(&[cmd, 1, 0, 0]);
+            m.extend_from_slice(attrs);
+            m
+        };
+        let m = req(31, &[], 7);
+        if netlink_send(fd, &m) != Some(m.len() as i64) {
+            return Err("GET_REG send");
+        }
+        let mut buf = [0u8; 1024];
+        let n = netlink_recv(fd, &mut buf).ok_or("GET_REG recv")?;
+        if n < 24 || nlmsg_type_of(&buf) != 0x13 || buf[16] != 31 {
+            return Err("GET_REG reply");
+        }
+        if !window_contains(&buf[..n as usize], &[7, 0, 33, 0, b'0', b'0', 0]) {
+            return Err("GET_REG lacks REG_ALPHA2 \"00\"");
+        }
+        while netlink_recv(fd, &mut buf).is_some_and(|n| n > 0) {}
+        // NEW_KEY with IFINDEX 0x7fff: the permission check comes first.
+        let mut attrs = alloc::vec::Vec::new();
+        attrs.extend_from_slice(&8u16.to_ne_bytes());
+        attrs.extend_from_slice(&3u16.to_ne_bytes());
+        attrs.extend_from_slice(&0x7fffu32.to_ne_bytes());
+        let m = req(11, &attrs, 8);
+        const CAP_NET_ADMIN_BIT: u64 = 1 << 12;
+        const FULL: u64 = crate::handlers::CAP_FULL_SET;
+        crate::handlers::__test_set_caps(FAKE_TASK, FULL & !CAP_NET_ADMIN_BIT, FULL);
+        let sent = netlink_send(fd, &m);
+        let n = netlink_recv(fd, &mut buf).ok_or("NEW_KEY recv")?;
+        crate::handlers::__test_caps_reset();
+        if sent != Some(m.len() as i64)
+            || n < 20
+            || nlmsg_type_of(&buf) != 2
+            || i32::from_ne_bytes(buf[16..20].try_into().unwrap()) != -1
+        {
+            return Err("unprivileged NEW_KEY not EPERM");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_nl80211_get_reg_and_key_errnos
 );

@@ -32,6 +32,13 @@ pub struct DmaBuffer<T> { pa: PhysAddr, va: VirtAddr, size: usize, _m: PhantomDa
 
 pub fn alloc_dma<T>(n: usize, dev: &BusDevice) -> DmaBuffer<T>;
 
+/// Coherent buffer for a device with a limited coherent DMA mask (Linux
+/// `dma_set_coherent_mask` + `dma_alloc_coherent`): every byte lies at a
+/// bus address `<= dma_mask`; unsatisfiable mask → `Err(NoMemory)`, never
+/// an above-mask buffer. `u64::MAX` = `alloc_coherent`.
+pub fn alloc_coherent_masked(len: usize, domain: DomainId, dma_mask: u64)
+    -> Result<DmaBuffer, IoError>;
+
 /// Bounded recycler for one hardware RX or TX queue. Construct, `prepare`,
 /// and `prefill` it before the queue is made live. `try_acquire` and
 /// `release` are the packet/completion-path API: neither may allocate.
