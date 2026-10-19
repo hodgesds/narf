@@ -145,6 +145,8 @@ const MAX_VRATIO_PREFETCH: i64 = 4;
 /// reference clock from the clock owner and HUBBUB timer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Soc {
+    /// DCN3.0, 3.0.2 or 3.0.3 bounding-box parameters.
+    pub dcn_revision: u8,
     pub dcfclk_khz: u32,
     /// `fabricclk_mhz`: DCN30's bounding box copies DCFCLK into it.
     pub fabric_khz: u32,
@@ -165,8 +167,56 @@ pub struct Soc {
 const MIN_DCFCLK_KHZ: u32 = 500_000;
 
 impl Soc {
+    fn pipes(&self) -> usize {
+        match self.dcn_revision {
+            2 => 5,
+            3 => 2,
+            _ => 6,
+        }
+    }
+    fn sr_exit(&self) -> Fx {
+        Fx::ratio(
+            match self.dcn_revision {
+                2 => 265,
+                3 => 355,
+                _ => SR_EXIT_US_TENTHS,
+            },
+            10,
+        )
+    }
+    fn sr_enter_exit(&self) -> Fx {
+        Fx::int(match self.dcn_revision {
+            2 => 31,
+            3 => 40,
+            _ => SR_ENTER_PLUS_EXIT_US,
+        })
+    }
+    fn ping_cycles(&self) -> i64 {
+        if self.dcn_revision == 0 {
+            ROUND_TRIP_PING_LATENCY_DCFCLK_CYCLES
+        } else {
+            156
+        }
+    }
+    fn dpte_buffer(&self) -> u64 {
+        if self.dcn_revision == 0 {
+            DPTE_BUFFER_IN_PTE_REQS
+        } else {
+            64
+        }
+    }
+    pub fn for_gpu(mut self, gpu: &crate::amdgpu::AmdGpu) -> Result<Self, Error> {
+        let profile = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did)
+            .ok_or(Error::Unsupported)?;
+        self.dcn_revision = profile.dcn_version.2;
+        if !self.valid() {
+            return Err(Error::Invalid);
+        }
+        Ok(self)
+    }
     fn valid(&self) -> bool {
-        self.dcfclk_khz >= MIN_DCFCLK_KHZ
+        matches!(self.dcn_revision, 0 | 2 | 3)
+            && self.dcfclk_khz >= MIN_DCFCLK_KHZ
             && self.fabric_khz > 0
             && self.socclk_khz > 0
             && self.dram_speed_mts > 0
@@ -194,6 +244,7 @@ impl Soc {
         use crate::amdgpu_dcn30_clk::Clock;
         let dcfclk = levels.range(Clock::Dcf).max_khz();
         let soc = Self {
+            dcn_revision: 0,
             dcfclk_khz: dcfclk,
             fabric_khz: dcfclk,
             socclk_khz: levels.range(Clock::Soc).max_khz(),
@@ -586,9 +637,8 @@ struct PlaneCalc {
 }
 
 /// `CalculateTWait`.
-fn t_wait(mode: u8, urgent: Fx) -> Fx {
+fn t_wait(mode: u8, urgent: Fx, sr: Fx) -> Fx {
     let pstate = Fx::int(DRAM_CLOCK_CHANGE_LATENCY_US);
-    let sr = Fx::int(SR_ENTER_PLUS_EXIT_US);
     match mode {
         0 => pstate.plus(urgent).max(sr.max(urgent)),
         1 => sr.max(urgent),
@@ -775,7 +825,7 @@ pub fn plan_joint_lowest(streams: &[Stream], states: &[Soc]) -> Result<(usize, J
 /// search across every plane, one urgent/stutter/p-state watermark set, and
 /// each pipe's DLG/TTU registers. Fails before any hardware is touched.
 pub fn plan_joint(streams: &[Stream], soc: &Soc) -> Result<JointPlan, Error> {
-    if streams.is_empty() || streams.len() > MAX_PIPES {
+    if streams.is_empty() || streams.len() > soc.pipes() {
         return Err(Error::Unsupported);
     }
     let vco_khz = streams[0].config.dentist_vco_khz;
@@ -842,7 +892,7 @@ pub fn plan_joint(streams: &[Stream], soc: &Soc) -> Result<JointPlan, Error> {
     }
     let odm = &odm[..streams.len()];
     let total_dpp: u32 = odm.iter().map(|o| o.pipes()).sum();
-    if total_dpp as usize > MAX_PIPES {
+    if total_dpp as usize > soc.pipes() {
         return Err(Error::Unsupported);
     }
 
@@ -864,7 +914,7 @@ pub fn plan_joint(streams: &[Stream], soc: &Soc) -> Result<JointPlan, Error> {
     let reorder = Fx::int(soc.channels as i64 * URGENT_OUT_OF_ORDER_BYTES_PER_CHANNEL);
     // ROBSupport: the reorder buffer outlasts the round trip.
     if Fx::int((ROB_BUFFER_KBYTES - PIXEL_CHUNK_KBYTES) * 1024).over(return_bw)
-        <= Fx::int(ROUND_TRIP_PING_LATENCY_DCFCLK_CYCLES + 32)
+        <= Fx::int(soc.ping_cycles() + 32)
             .over(dcfclk)
             .plus(reorder.over(return_bw))
     {
@@ -984,13 +1034,11 @@ pub fn plan_joint(streams: &[Stream], soc: &Soc) -> Result<JointPlan, Error> {
 
     // CalculateExtraLatency (every active DPP's pixel chunk) and
     // CalculateUrgentLatency.
-    let extra_latency = Fx::int(ROUND_TRIP_PING_LATENCY_DCFCLK_CYCLES + 32)
-        .over(dcfclk)
-        .plus(
-            reorder
-                .plus(Fx::int(total_dpp as i64 * PIXEL_CHUNK_KBYTES * 1024))
-                .over(return_bw),
-        );
+    let extra_latency = Fx::int(soc.ping_cycles() + 32).over(dcfclk).plus(
+        reorder
+            .plus(Fx::int(total_dpp as i64 * PIXEL_CHUNK_KBYTES * 1024))
+            .over(return_bw),
+    );
     let urgent_latency = Fx::int(URGENT_LATENCY_US).plus(
         Fx::int(URGENT_ADJUST_COMPONENT_US)
             .times(Fx::int(URGENT_ADJUST_REFERENCE_MHZ).over(fabric))
@@ -1105,7 +1153,7 @@ pub fn plan_joint(streams: &[Stream], soc: &Soc) -> Result<JointPlan, Error> {
         .try_reserve_exact(planes.len())
         .map_err(|_| Error::Unsupported)?;
     for mode in 0..=1u8 {
-        let wait = t_wait(mode, urgent_latency);
+        let wait = t_wait(mode, urgent_latency, soc.sr_enter_exit());
         let mut lines = FIRST_VSTARTUP_LINES;
         loop {
             schedules.clear();
@@ -1180,8 +1228,8 @@ fn finish(
     let n = planes.len();
     // CalculateWatermarksAndDRAMSpeedChangeSupport.
     let pstate_latency = Fx::int(DRAM_CLOCK_CHANGE_LATENCY_US);
-    let sr_exit = Fx::ratio(SR_EXIT_US_TENTHS, 10);
-    let sr_enter_plus_exit = Fx::int(SR_ENTER_PLUS_EXIT_US);
+    let sr_exit = soc.sr_exit();
+    let sr_enter_plus_exit = soc.sr_enter_exit();
     let urgent_wm = g.urgent_latency.plus(g.extra_latency);
     let pstate_wm = pstate_latency.plus(urgent_wm);
     let wake = Fx::int(10).over(g.deep_sleep);
@@ -1300,7 +1348,7 @@ fn finish(
             v_ready_offset_pix: p.v_ready_offset.floor().max(0) as u32,
             t_setup_us: p.t_setup,
             t_calc_us: g.t_calc,
-            t_wait_us: t_wait(mode, g.urgent_latency),
+            t_wait_us: t_wait(mode, g.urgent_latency, soc.sr_enter_exit()),
             prefetch_source_lines: p.source_lines,
             v_init_pre_fill: p.v_init_pre_fill,
             max_num_swath: p.max_num_swath,
@@ -1322,6 +1370,7 @@ fn finish(
                 min_ttu_vblank,
                 soc.dchub_refclk_khz,
                 index as u32,
+                soc.dpte_buffer(),
             )?;
             *pipe = Some(PipePlan {
                 viewport_x: slice * index as u32,
@@ -1454,6 +1503,7 @@ fn registers(
     min_ttu_vblank: Fx,
     dchub_refclk_khz: u32,
     slice: u32,
+    dpte_buffer: u64,
 ) -> Result<Registers, Error> {
     let config = &p.config;
     let geometry = &p.geometry;
@@ -1481,7 +1531,7 @@ fn registers(
     // Linear dpte: 8 PTEs per 64-byte request, row height from the pitch.
     let log2_vmpg_width = log2_floor(GPUVM_MIN_PAGE_BYTES) - log2_floor(bytes_per_pixel);
     let dpte_req_width = 1u64 << (log2_vmpg_width + 3);
-    let log2_row = log2_floor(DPTE_BUFFER_IN_PTE_REQS * dpte_req_width / pitch.max(1));
+    let log2_row = log2_floor(dpte_buffer * dpte_req_width / pitch.max(1));
     if log2_row < 3 {
         return Err(Error::Unsupported);
     }

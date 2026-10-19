@@ -206,6 +206,15 @@ fn smoke_amdgpu_pci_matches_registered() -> TestResult {
             return TestResult::Fail("missing amdgpu VID/DID match");
         }
     }
+    for profile in crate::amdgpu_rdna2::PROFILES {
+        for &did in profile.pci_ids {
+            if !regs.iter().any(|m| {
+                matches!(m.kind, MatchKind::VendorDevice { vendor: 0x1002, device } if device == did)
+            }) {
+                return TestResult::Fail("missing discrete RDNA2 PCI match");
+            }
+        }
+    }
     let class_match = regs.iter().any(|m| {
         matches!(
             m.kind,
@@ -220,7 +229,10 @@ fn smoke_amdgpu_pci_matches_registered() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu", smoke_amdgpu_pci_matches_registered);
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    smoke_amdgpu_pci_matches_registered
+);
 
 fn smoke_amdgpu_family_table_documented_offsets() -> TestResult {
     // Family::mp0_base() is documented for Vega + Navi1; the
@@ -13883,4 +13895,79 @@ fn smoke_amdgpu_info_available_rings_follow_the_submitter() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu_info",
     smoke_amdgpu_info_available_rings_follow_the_submitter
+);
+
+fn smoke_rdna2_chip_identity_and_startup_gate() -> TestResult {
+    use crate::{amdgpu, amdgpu_rdna2};
+    for profile in amdgpu_rdna2::PROFILES {
+        for &did in profile.pci_ids {
+            let Some(chip) = amdgpu::__test_chip_info_for_pci_id(0x1002, did) else {
+                return TestResult::Fail("missing RDNA2 identity");
+            };
+            if chip.asic != profile.asic
+                || chip.family != amdgpu::Family::Navi2
+                || chip.fw_name != profile.firmware.sos
+                || chip.is_apu()
+                || !chip.fw_list.is_empty()
+            {
+                return TestResult::Fail("incorrect RDNA2 identity or legacy firmware list");
+            }
+            if amdgpu_rdna2::native_start_available(0x1002, did) != (did == amdgpu::NAVI22) {
+                return TestResult::Fail("unaudited PCI ID entered the native startup path");
+            }
+        }
+    }
+    for did in [0x73a4, 0x73c2, 0x73ee, 0x743e] {
+        if amdgpu::__test_chip_info_for_pci_id(0x1002, did).is_some() {
+            return TestResult::Fail("PCI-ID hole accepted as RDNA2");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    smoke_rdna2_chip_identity_and_startup_gate
+);
+
+fn smoke_rdna2_unimplemented_probe_rejected_before_ecam() -> TestResult {
+    use crate::{amdgpu, amdgpu_rdna2};
+    use narf_bus::{BusAddr, BusDevice, BusDeviceCap, BusKind, DeviceId, PcieAddr};
+    use narf_capabilities::{Cap, Write};
+    use narf_memory::PhysAddr;
+    let addr = PcieAddr::new(0, 0, 0, 0);
+    for profile in amdgpu_rdna2::PROFILES {
+        for &did in profile.pci_ids {
+            if amdgpu_rdna2::native_start_available(0x1002, did) {
+                continue;
+            }
+            // No valid config window or BARs: reaching PCI/MMIO would fault.
+            let device = BusDevice {
+                addr: BusAddr::Pcie(addr),
+                id: DeviceId {
+                    vendor: 0x1002,
+                    device: did,
+                    class: 0x030000,
+                    subsystem_vendor: 0,
+                    subsystem_id: 0,
+                },
+                kind: BusKind::Pcie {
+                    addr,
+                    cfg_phys: PhysAddr::new(0),
+                },
+            };
+            let cap = Cap::<BusDeviceCap, Write>::bootstrap();
+            if amdgpu::probe(device, cap)
+                != Err(narf_bus::ProbeError::Other(
+                    "RDNA2 ASIC identified; native startup is not implemented for this PCI ID",
+                ))
+            {
+                return TestResult::Fail("unimplemented RDNA2 probe reached hardware setup");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    smoke_rdna2_unimplemented_probe_rejected_before_ecam
 );

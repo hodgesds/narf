@@ -118,6 +118,7 @@ fn booted(queues_verified: bool) -> Published {
             smc: 0x003a_5a00,
             gfx_mhz: Some((500, 2600)),
             queues_verified,
+            sdma_rings: 3,
         }),
         vcn_harvest: Some(2),
         media_rings: 0,

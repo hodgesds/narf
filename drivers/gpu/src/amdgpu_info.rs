@@ -77,9 +77,18 @@ fn family_id(snap: &Snapshot) -> Option<u32> {
         Family::Renoir => Some(uapi::AMDGPU_FAMILY_RV),
         // The Navi2 bucket also contains Rembrandt, whose UAPI family is
         // different. Admit Navi 22 only with the matching discovery version.
-        Family::Navi2 if snap.did == u32::from(crate::amdgpu::NAVI22) => {
-            let gc = amdgpu_discovery::find_ip(&snap.ip_blocks, amdgpu_discovery::HW_ID_GC, 0)?;
-            ((gc.major, gc.minor, gc.revision) == (10, 3, 2)).then_some(uapi::AMDGPU_FAMILY_NV)
+        Family::Navi2 => {
+            let profile = crate::amdgpu_rdna2::for_pci_id(
+                crate::amdgpu::AMD_VENDOR,
+                snap.did.try_into().ok()?,
+            )?;
+            let mut blocks = snap
+                .ip_blocks
+                .iter()
+                .filter(|b| b.hw_id == amdgpu_discovery::HW_ID_GC && b.instance == 0);
+            let gc = blocks.next()?;
+            (blocks.next().is_none() && (gc.major, gc.minor, gc.revision) == profile.gc_version)
+                .then_some(uapi::AMDGPU_FAMILY_NV)
         }
         Family::Navi4 if snap.did == u32::from(crate::amdgpu::NAVI48) => {
             let mut blocks = snap
@@ -250,7 +259,7 @@ impl Snapshot {
             is_apu: gpu.is_apu(),
             gc: gpu.gc_info,
             ip_blocks: gpu.ip_blocks.clone(),
-            navi22: if gpu.chip.did == crate::amdgpu::NAVI22 {
+            navi22: if crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).is_some() {
                 *NAVI22.lock()
             } else {
                 Default::default()
@@ -619,9 +628,7 @@ pub fn query(query: u32, payload: [u32; 4]) -> Result<Vec<u8>, FsError> {
 
 /// Whether `snap` is a Navi 22, whose queries `amdgpu_info_navi22` answers.
 fn answers_navi22(snap: &Snapshot) -> bool {
-    snap.family == Family::Navi2
-        && snap.did == u32::from(crate::amdgpu::NAVI22)
-        && family_id(snap).is_some()
+    snap.family == Family::Navi2 && family_id(snap).is_some()
 }
 
 /// The client VRAM heap of `vm`'s card, unless Navi 22 answers for it.

@@ -1,4 +1,5 @@
 use super::*;
+use crate::amdgpu::NAVI22;
 use alloc::{vec, vec::Vec};
 use core::{
     future::Future,
@@ -12,7 +13,13 @@ fn put(bytes: &mut [u8], offset: usize, value: u32) {
 pub(crate) fn firmware() -> Firmware {
     Firmware {
         bytes: container(3),
-        target: Target::Navi22,
+        target: Target::Rdna2(&crate::amdgpu_rdna2::NAVI22),
+    }
+}
+pub(crate) fn firmware_for(profile: &'static crate::amdgpu_rdna2::Profile) -> Firmware {
+    Firmware {
+        target: Target::Rdna2(profile),
+        bytes: container(3),
     }
 }
 fn container(minor: u16) -> Vec<u8> {
@@ -275,7 +282,10 @@ fn psp14_profile_pins_firmware_revision_and_refuses_cross_target_loads() -> Test
     cap.revoke();
     // SAFETY: permanent inert maps; revoked cap prevents device accesses.
     let mut boot = unsafe { Bootloader::new(&gpu, cap, &pool) }.unwrap();
-    for target in [Target::Navi22, Target::Psp14_0_2] {
+    for target in [
+        Target::Rdna2(&crate::amdgpu_rdna2::NAVI22),
+        Target::Psp14_0_2,
+    ] {
         let other = Firmware {
             target,
             bytes: container14(),
@@ -797,3 +807,112 @@ fn psp_boot_exact_ip_and_aperture_gates() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/psp-boot", psp_boot_exact_ip_and_aperture_gates);
+
+fn rdna2_psp_boot_profiles_require_matching_pci_gc_and_mp0() -> TestResult {
+    for chip in crate::amdgpu_rdna2::PROFILES {
+        for &did in chip.pci_ids {
+            let mut gpu = self::gpu();
+            gpu.chip = crate::amdgpu::__test_chip_info_for_pci_id(AMD_VENDOR, did).unwrap();
+            let gc = &mut gpu.ip_blocks[0];
+            (gc.major, gc.minor, gc.revision) = chip.gc_version;
+            let mp0 = &mut gpu.ip_blocks[1];
+            (mp0.major, mp0.minor, mp0.revision) = chip.psp_version;
+            let Ok((target, base)) = profile(&gpu) else {
+                return TestResult::Fail("RDNA2 PSP profile refused matching discovery");
+            };
+            if target != Target::Rdna2(chip) || target.name() != chip.firmware.sos || base != 0x400
+            {
+                return TestResult::Fail("RDNA2 PSP chose another chip or mailbox segment");
+            }
+            let (_, authority) = narf_firmware::bootstrap_authority();
+            authority.revoke();
+            if Firmware::open(&gpu, &authority).err() != Some(Error::Revoked) {
+                return TestResult::Fail("matching RDNA2 profile did not check registry authority");
+            }
+            for other in crate::amdgpu_rdna2::PROFILES {
+                if other == chip {
+                    continue;
+                }
+                for block in 0..2 {
+                    let mut bad = self::gpu();
+                    bad.chip = gpu.chip;
+                    bad.ip_blocks = gpu.ip_blocks.clone();
+                    let v = if block == 0 {
+                        other.gc_version
+                    } else {
+                        other.psp_version
+                    };
+                    let ip = &mut bad.ip_blocks[block];
+                    (ip.major, ip.minor, ip.revision) = v;
+                    // A revoked registry would return Revoked if lookup got that far.
+                    if profile(&bad).is_ok()
+                        || Firmware::open(&bad, &authority).err() != Some(Error::Unsupported)
+                    {
+                        return TestResult::Fail("RDNA2 accepted another chip's GC/PSP revision");
+                    }
+                }
+            }
+            for block in 0..2 {
+                let mut bad = self::gpu();
+                bad.chip = gpu.chip;
+                bad.ip_blocks = gpu.ip_blocks.clone();
+                bad.ip_blocks.push(bad.ip_blocks[block]);
+                if profile(&bad).is_ok() {
+                    return TestResult::Fail("RDNA2 accepted duplicate GC/MP0 discovery");
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_psp_boot_profiles_require_matching_pci_gc_and_mp0
+);
+
+fn rdna2_psp_boot_rejects_cross_chip_firmware_before_loading() -> TestResult {
+    for chip in crate::amdgpu_rdna2::PROFILES {
+        let mut gpu = self::gpu();
+        gpu.chip = crate::amdgpu::__test_chip_info_for_pci_id(AMD_VENDOR, chip.pci_ids[0]).unwrap();
+        let gc = &mut gpu.ip_blocks[0];
+        (gc.major, gc.minor, gc.revision) = chip.gc_version;
+        let mp0 = &mut gpu.ip_blocks[1];
+        (mp0.major, mp0.minor, mp0.revision) = chip.psp_version;
+        let (pool, engine) = fixture();
+        drop(engine);
+        let authority = Cap::bootstrap();
+        authority.revoke();
+        // SAFETY: constructor only validates inert permanent maps and reserves
+        // pool memory. Revocation prevents all load-time MMIO.
+        let mut boot = unsafe { Bootloader::new(&gpu, authority, &pool) }.unwrap();
+        if !boot.engine.psp11 || boot.target != Target::Rdna2(chip) {
+            return TestResult::Fail("RDNA2 selected the PSP14 command protocol");
+        }
+        for other in crate::amdgpu_rdna2::PROFILES {
+            if other == chip {
+                continue;
+            }
+            // Even malformed bytes must be rejected by target before parsing.
+            let wrong = Firmware {
+                target: Target::Rdna2(other),
+                bytes: Vec::new(),
+            };
+            if run(boot.load(&wrong)) != Err(Error::Unsupported) || boot.state() != State::Prepared
+            {
+                return TestResult::Fail("cross-chip firmware advanced the bootloader");
+            }
+        }
+        let correct = Firmware {
+            target: Target::Rdna2(chip),
+            bytes: container(3),
+        };
+        if run(boot.load(&correct)) != Err(Error::Revoked) || boot.state() != State::Failed {
+            return TestResult::Fail("RDNA2 load did not enforce device authority");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_psp_boot_rejects_cross_chip_firmware_before_loading
+);

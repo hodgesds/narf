@@ -126,11 +126,21 @@ impl Layout {
         {
             return Err(Error::Unsupported);
         }
+        Self::resolve_rdna2(gpu)
+    }
+    fn resolve_rdna2(gpu: &AmdGpu) -> Result<Self, Error> {
+        let profile = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did)
+            .ok_or(Error::Unsupported)?;
+        if gpu.regs.len < 0x7f004 {
+            return Err(Error::Unsupported);
+        }
+        bank(gpu, ip::HW_ID_GC, &[profile.gc_version], 0, 0).map_err(|_| Error::Unsupported)?;
         Ok(Self {
             // Highest DCN register used: MMHUBBUB_SOFT_RESET (0x341).
             // linux-ctx: hdr=dcn,dmub,nbio,hdp
             // linux-lit: 2=mmDMCUB_CNTL_BASE_IDX
-            dcn: bank(gpu, ip::HW_ID_DCN, &[(3, 0, 0)], 2, HUB).map_err(|_| Error::Unsupported)?,
+            dcn: bank(gpu, ip::HW_ID_DCN, &[profile.dcn_version], 2, HUB)
+                .map_err(|_| Error::Unsupported)?,
             nbio: bank(
                 gpu,
                 ip::HW_ID_NBIF,
@@ -614,11 +624,15 @@ impl<I: Io> Engine<I> {
 }
 #[derive(Debug)]
 pub struct Dmub {
+    channels: u8,
     engine: Engine<Mmio>,
     /// RCC_CONFIG_MEMSIZE: the aperture end is fb_start + mc_vram_size.
     vram_size: u64,
 }
 impl Dmub {
+    fn native_channels(&self) -> u8 {
+        self.channels
+    }
     /// Reserve all nonsecure DMUB storage without I/O.
     /// # Safety
     /// Caller exclusively owns this physical Navi22 GPU, DCN/PSP/PM/reset,
@@ -631,10 +645,44 @@ impl Dmub {
         prepared: Prepared,
     ) -> Result<Self, Error> {
         let layout = Layout::resolve(gpu)?;
+        Self::with_layout(gpu, authority, pool, prepared, layout, 6)
+    }
+    /// Reserve the common DCN3.0/3.0.2/3.0.3 DMUB backend without device I/O.
+    /// # Safety
+    /// All `new` whole-GPU/firmware/pool ownership contracts apply to this
+    /// physical discrete RDNA2 GPU. Prepared images must belong to this board.
+    pub unsafe fn new_rdna2(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        prepared: Prepared,
+    ) -> Result<Self, Error> {
+        let layout = Layout::resolve_rdna2(gpu)?;
+        let channels = match crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did)
+            .ok_or(Error::Unsupported)?
+            .dcn_version
+            .2
+        {
+            0 => 6,
+            2 => 5,
+            3 => 2,
+            _ => return Err(Error::Unsupported),
+        };
+        Self::with_layout(gpu, authority, pool, prepared, layout, channels)
+    }
+    fn with_layout(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        prepared: Prepared,
+        layout: Layout,
+        channels: u8,
+    ) -> Result<Self, Error> {
         let memory = pool
             .reserve(u64::from(prepared.layout.size()))
             .map_err(|_| Error::Allocation)?;
         Ok(Self {
+            channels,
             engine: Engine {
                 io: Mmio(gpu.regs),
                 authority,

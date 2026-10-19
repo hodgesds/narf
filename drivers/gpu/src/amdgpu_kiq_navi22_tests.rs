@@ -216,3 +216,23 @@ kernel_test_in!(
     "drivers/gpu/kiq-navi22",
     kiq_navi22_failures_and_cancellation_are_terminal
 );
+
+fn rdna2_kiq_maps_compute_and_runs_ring_and_ib_proofs() -> TestResult {
+    for profile in crate::amdgpu_rdna2::PROFILES {
+        let gpu = crate::amdgpu_cp_navi22::tests::rdna2_gpu(profile, profile.pci_ids[0]);
+        let resolved = Layout::resolve_rdna2(&gpu).unwrap();
+        let (_pool, mut engine) = engine(enabled());
+        engine.hw.layout = resolved;
+        run(engine.init_kiq()).unwrap();
+        run(engine.map_compute()).unwrap();
+        run(engine.test_ib()).unwrap();
+        if engine.state != State::Verified || run(engine.map_compute()) != Err(Error::Busy) {
+            return TestResult::Fail("RDNA2 compute proof failed or queue mapping replayed");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_kiq_maps_compute_and_runs_ring_and_ib_proofs
+);

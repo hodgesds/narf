@@ -47,6 +47,8 @@ const GC_USER_SHADER_ARRAY_CONFIG: Reg = Reg(0, 0x1010);
 const CGTS_TCC_DISABLE: Reg = Reg(1, 0x5006);
 const CGTS_USER_TCC_DISABLE: Reg = Reg(1, 0x5007);
 /// `mmRCC_DEV0_EPF0_STRAP0` (NBIO BASE_IDX 2).
+const CC_GC_SA_UNIT_DISABLE: Reg = Reg(0, 0x0fe9);
+const GC_USER_SA_UNIT_DISABLE: Reg = Reg(0, 0x0fea);
 const RCC_DEV0_EPF0_STRAP0: u32 = 0x0011;
 /// SE/SA/instance broadcast, the selector every GRBM user leaves behind.
 const BROADCAST: u32 = 0xe000_0000;
@@ -79,6 +81,7 @@ pub struct Topology {
 /// The raw registers, OR-combined exactly where Linux ORs them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Sample {
+    pub disabled_sa: u8,
     pub strap0: u32,
     pub gb_addr_config: u32,
     /// `CC_RB_BACKEND_DISABLE | GC_USER_RB_BACKEND_DISABLE` per [se][sh].
@@ -147,6 +150,9 @@ pub fn derive(limits: Limits, sample: &Sample) -> Result<Topology, Error> {
     for se in 0..limits.engines {
         for sh in 0..limits.arrays {
             let (i, j) = (se as usize, sh as usize);
+            if sample.disabled_sa & (1 << (se * limits.arrays + sh)) != 0 {
+                continue;
+            }
             // gfx_v10_0_get_rb_active_bitmap
             let rbs = !((sample.rb_disable[i][j] & 0x00ff_0000) >> 16) & bitmask(rb_width);
             topology.enabled_rb_mask |= rbs << ((se * limits.arrays + sh) * rb_width);
@@ -216,9 +222,18 @@ fn sample(io: &mut impl Io, layout: &Layout, limits: Limits) -> Result<Sample, E
         gb_addr_config: checked(io.read(layout.reg(GB_ADDR_CONFIG)))?,
         ..Sample::default()
     };
+    if layout.profile.gc_version == (10, 3, 0) {
+        raw.disabled_sa = (((checked(io.read(layout.reg(CC_GC_SA_UNIT_DISABLE)))?
+            | checked(io.read(layout.reg(GC_USER_SA_UNIT_DISABLE)))?)
+            >> 8)
+            & 0xff) as u8;
+    }
     let result = (|| {
         for se in 0..limits.engines {
             for sh in 0..limits.arrays {
+                if raw.disabled_sa & (1 << (se * limits.arrays + sh)) != 0 {
+                    continue;
+                }
                 // gfx_v10_0_select_se_sh(se, sh, 0xffffffff)
                 let selector = (1 << 30) | (se << 16) | (sh << 8);
                 io.write(index, selector);
@@ -262,7 +277,7 @@ impl<F: FnOnce() -> T, T> CapOp<BusDeviceCap, Write> for Op<F> {
 /// Reads fused and inherited user-disable masks; never changes them.
 pub unsafe fn read(gpu: &AmdGpu, authority: &Cap<BusDeviceCap, Write>) -> Result<Topology, Error> {
     let limits = Limits::from_gc(gpu.gc_info.as_ref().ok_or(Error::Invalid)?)?;
-    let layout = Layout::resolve(gpu).map_err(|_| Error::Unsupported)?;
+    let layout = Layout::resolve_rdna2(gpu).map_err(|_| Error::Unsupported)?;
     let raw = authority
         .invoke(Op(|| sample(&mut Mmio(gpu.regs), &layout, limits)))
         .map_err(|_| Error::Revoked)??;

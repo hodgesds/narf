@@ -3,7 +3,7 @@
 //! Parsing checks structure only; the firmware registry and PSP authenticate
 //! the image. No untrusted descriptor becomes an MMIO address.
 
-pub const NAVI22_SOS: &str = "amdgpu/navy_flounder_sos.bin";
+pub const NAVI22_SOS: &str = crate::amdgpu_rdna2::NAVI22.firmware.sos;
 pub const PSP14_0_2_SOS: &str = "amdgpu/psp_14_0_2_sos.bin";
 pub const PSP14_0_3_SOS: &str = "amdgpu/psp_14_0_3_sos.bin";
 pub const STAGING_SIZE: usize = 1024 * 1024; // linux: PSP_1_MEG

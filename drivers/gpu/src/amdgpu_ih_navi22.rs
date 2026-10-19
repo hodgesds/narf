@@ -107,6 +107,8 @@ pub mod source {
         pub const VCN: u8 = 0x10; // linux: SOC15_IH_CLIENTID_VCN
         pub const SDMA0: u8 = 0x08; // linux: SOC15_IH_CLIENTID_SDMA0
         pub const SDMA1: u8 = 0x09; // linux: SOC15_IH_CLIENTID_SDMA1
+        pub const SDMA2: u8 = 0x01; // linux: SOC15_IH_CLIENTID_SDMA2
+        pub const SDMA3: u8 = 0x05; // linux: SOC15_IH_CLIENTID_SDMA3_Sienna_Cichlid
         pub const THM: u8 = 0x0f; // linux: SOC15_IH_CLIENTID_THM
         pub const VMC: u8 = 0x12; // linux: SOC15_IH_CLIENTID_VMC
         pub const GRBM_CP: u8 = 0x14; // linux: SOC15_IH_CLIENTID_GRBM_CP
@@ -133,6 +135,10 @@ pub mod source {
     pub const SDMA0_TRAP: Source = s(client::SDMA0, 224);
     // linux-lit: 224=SDMA1_5_0__SRCID__SDMA_TRAP
     pub const SDMA1_TRAP: Source = s(client::SDMA1, 224);
+    // linux-lit: 224=SDMA2_5_0__SRCID__SDMA_TRAP
+    pub const SDMA2_TRAP: Source = s(client::SDMA2, 224);
+    // linux-lit: 224=SDMA3_5_0__SRCID__SDMA_TRAP
+    pub const SDMA3_TRAP: Source = s(client::SDMA3, 224);
     /// vcn_v3_0_sw_init: VCN_2_0__SRCID__UVD_SYSTEM_MESSAGE_INTERRUPT (decode)
     /// and UVD_ENC_GENERAL_PURPOSE + j (encode ring j) per instance client;
     /// jpeg_v3_0_sw_init: VCN_2_0__SRCID__JPEG_DECODE on the VCN client.
@@ -367,6 +373,7 @@ struct Layout {
     oss: u64,
     nbio: u64,
     hdp: u64,
+    self_wptr_update: bool,
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
@@ -376,11 +383,29 @@ impl Layout {
         {
             return Err(Error::Unsupported);
         }
+        Self::resolve_for(gpu, &[(5, 0, 3)])
+    }
+    fn resolve_rdna2(gpu: &AmdGpu) -> Result<Self, Error> {
+        let profile = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did)
+            .ok_or(Error::Unsupported)?;
+        bank(gpu, ip::HW_ID_GC, &[profile.gc_version], 0, 0).map_err(|_| Error::Unsupported)?;
+        Self::resolve_for(gpu, crate::amdgpu_rdna2::IH_OSSSYS_VERSIONS)
+    }
+    fn resolve_for(gpu: &AmdGpu, oss_versions: &[(u8, u8, u8)]) -> Result<Self, Error> {
+        if gpu.regs.len < 0x7f004 {
+            return Err(Error::Unsupported);
+        }
         let resolve = |id, versions: &[(u8, u8, u8)], index, last| {
             bank(gpu, id, versions, index, last).map_err(|_| Error::Unsupported)
         };
         Ok(Self {
-            oss: resolve(ip::HW_ID_OSSSYS, &[(5, 0, 3)], 0, IH_CNTL2)?,
+            oss: resolve(ip::HW_ID_OSSSYS, oss_versions, 0, IH_CNTL2)?,
+            // Linux force_update_wptr_for_self_int is a no-op before 5.0.3.
+            self_wptr_update: gpu.ip_blocks.iter().any(|b| {
+                b.hw_id == ip::HW_ID_OSSSYS
+                    && b.instance == 0
+                    && (b.major, b.minor, b.revision) >= (5, 0, 3)
+            }),
             nbio: resolve(
                 ip::HW_ID_NBIF,
                 &[
@@ -525,6 +550,9 @@ impl<I: Io> Engine<I> {
     }
     /// force_update_wptr_for_self_int(adev, 0, 8, enable), OSSSYS >= 5.0.3.
     fn self_int(io: &mut I, l: Layout, enable: bool) -> Result<(), Error> {
+        if !l.self_wptr_update {
+            return Ok(());
+        }
         let cntl2 = checked(io.read(Self::reg(l, IH_CNTL2)))?;
         let cntl2 =
             // linux: n/a (timeout 8, navi10_ih.c:navi10_ih_irq_init)
@@ -1156,6 +1184,31 @@ impl Ih {
         device: BusDevice,
     ) -> Result<Self, Error> {
         let layout = Layout::resolve(gpu)?;
+        Self::with_layout(gpu, authority, pool, device, layout)
+    }
+    /// Reserve an RB0 ring for a known discrete Navi21/22/23/24 profile.
+    /// No device I/O or interrupt routing occurs during construction.
+    ///
+    /// # Safety
+    /// Caller exclusively owns this physical GPU's OSSSYS/NBIO/HDP, PCI
+    /// interrupt capabilities and matching permanent VRAM pool; no VF or
+    /// concurrent IH owner is permitted.
+    pub unsafe fn new_rdna2(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        device: BusDevice,
+    ) -> Result<Self, Error> {
+        let layout = Layout::resolve_rdna2(gpu)?;
+        Self::with_layout(gpu, authority, pool, device, layout)
+    }
+    fn with_layout(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        device: BusDevice,
+        layout: Layout,
+    ) -> Result<Self, Error> {
         let memory = pool.reserve(BYTES).map_err(|_| Error::Allocation)?;
         let dummy = narf_io::alloc_coherent(4096, narf_lib::id::DomainId::DRIVER_0)
             .map_err(|_| Error::Allocation)?;

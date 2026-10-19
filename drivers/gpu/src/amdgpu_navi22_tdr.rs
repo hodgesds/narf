@@ -18,7 +18,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 pub const TIMEOUT_MS: u64 = 2000;
 /// Sampling period; the detection latency is at most TIMEOUT + PERIOD.
 pub const PERIOD_MS: u64 = 250; // linux: n/a (NARF sampling period)
-const ENGINES: usize = 5; // linux: n/a (NARF Engine count)
+const ENGINES: usize = crate::amdgpu_fence_navi22::ENGINES;
 
 /// One queue's software (emitted) and hardware (signalled) fence sequence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

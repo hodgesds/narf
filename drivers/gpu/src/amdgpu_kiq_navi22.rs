@@ -370,12 +370,35 @@ impl Compute {
         pool: &Pool,
         doorbells: Doorbells,
     ) -> Result<Self, Error> {
+        Self::with_layout(gpu, authority, pool, doorbells, Layout::resolve(gpu)?)
+    }
+    /// Reserve KIQ and kernel-compute rings for a known discrete RDNA2 ASIC.
+    /// No engine is started; the Linux GC10.3 MEC queue geometry is shared.
+    ///
+    /// # Safety
+    /// Same exclusive physical GPU, MEC/RLC/GRBM/HDP, doorbell and permanent
+    /// pool ownership as `new`, with no active KIQ, MES or compute owner.
+    pub unsafe fn new_rdna2(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        doorbells: Doorbells,
+    ) -> Result<Self, Error> {
+        Self::with_layout(gpu, authority, pool, doorbells, Layout::resolve_rdna2(gpu)?)
+    }
+    fn with_layout(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        doorbells: Doorbells,
+        layout: Layout,
+    ) -> Result<Self, Error> {
         const { assert!(RING_BYTES == 8192) }; // linux: n/a (NARF ring size)
                                                // linux-ctx: reset
         Ok(Self {
             engine: Engine {
                 hw: Hw {
-                    layout: Layout::resolve(gpu)?,
+                    layout,
                     io: Mmio::new(gpu, doorbells),
                     authority,
                 },

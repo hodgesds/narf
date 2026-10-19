@@ -1,4 +1,4 @@
-//! Immutable capability-backed Navi22 graphics firmware set. Preparing the
+//! Immutable capability-backed discrete RDNA2 graphics firmware set. Preparing the
 //! complete set performs no device I/O; malformed/missing mandatory images
 //! fail before PSP can receive any part of the set.
 use crate::{
@@ -20,29 +20,48 @@ pub enum Error {
 }
 #[derive(Debug)]
 pub struct Firmware {
+    profile: &'static crate::amdgpu_rdna2::Profile,
     bytes: [Option<Vec<u8>>; Source::ORDER.len()],
     /// Unharvested VCN instances whose PSP upload is part of this set.
     vcn: u8,
 }
 pub(crate) fn check_device(gpu: &AmdGpu) -> Result<(), Error> {
+    // Preserve the native Navi22 caller's strict hardware gate.
     crate::amdgpu_smu_navi22::mp1_bank(gpu).map_err(|_| Error::Unsupported)?;
-    // linux: n/a (IP_VERSION(5, 2, 2) = navy_flounder_sdma, amdgpu_ucode.c)
-    crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_SDMA0, &[(5, 2, 2)], 0, 0)
-        .map_err(|_| Error::Unsupported)?;
-    // amdgpu_ucode_ip_version_decode: 3.0.16 is Dimgrey Cavefish, not Navy.
-    crate::amdgpu_psp_ring::bank(
-        gpu,
-        discovery::HW_ID_VCN,
-        &[(3, 0, 0), (3, 0, 64), (3, 0, 192)], // linux: n/a (amdgpu_ucode.c: navy_flounder_vcn)
-        0,
-        0,
-    )
-    .map_err(|_| Error::Unsupported)?;
+    check_rdna2_device(gpu).map(|_| ())
+}
+/// Firmware preparation only: exact discovered IPs must select this ASIC's
+/// files. This does not authorize any of the Navi22 hardware startup paths.
+fn check_rdna2_device(gpu: &AmdGpu) -> Result<&'static crate::amdgpu_rdna2::Profile, Error> {
+    let profile =
+        crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).ok_or(Error::Unsupported)?;
+    for (id, versions, last) in [
+        (
+            discovery::HW_ID_GC,
+            core::slice::from_ref(&profile.gc_version),
+            0,
+        ),
+        (
+            discovery::HW_ID_MP1,
+            core::slice::from_ref(&profile.psp_version),
+            0x29a,
+        ),
+        (
+            discovery::HW_ID_SDMA0,
+            core::slice::from_ref(&profile.sdma_version),
+            0,
+        ),
+        (discovery::HW_ID_VCN, profile.vcn_versions, 0),
+        (
+            discovery::HW_ID_DCN,
+            core::slice::from_ref(&profile.dcn_version),
+            0,
+        ),
+    ] {
+        crate::amdgpu_psp_ring::bank(gpu, id, versions, 0, last).map_err(|_| Error::Unsupported)?;
+    }
     vcn_instances(gpu)?;
-    // linux: n/a (DCN 3.0.0 discovery version)
-    crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_DCN, &[(3, 0, 0)], 0, 0)
-        .map_err(|_| Error::Unsupported)?;
-    Ok(())
+    Ok(profile)
 }
 /// Discovered VCN instances as a mask (bit i = instance i). Navy Flounder
 /// publishes VCN 3.0.0 (instance 0) and usually 3.0.1 (instance 1); Linux
@@ -56,26 +75,26 @@ pub(crate) fn vcn_instances(gpu: &AmdGpu) -> Result<u8, Error> {
         .filter(|ip| ip.hw_id == discovery::HW_ID_VCN)
     {
         let bit = 1u8.checked_shl(u32::from(ip.instance)).unwrap_or(0);
-        // linux: n/a (VCN 3.0.x, at most two instances on Navy Flounder)
+        // linux: n/a (bounded VCN3 firmware preparation supports instances 0/1)
         if ip.instance > 1 || mask & bit != 0 || (ip.major, ip.minor) != (3, 0) {
             return Err(Error::Unsupported);
         }
         mask |= bit;
     }
-    // Instance 0's version was checked above against the Navy Flounder set.
+    // Instance 0's version is checked against the selected ASIC profile.
     if mask & 1 == 0 {
         return Err(Error::Unsupported);
     }
     Ok(mask)
 }
-struct Open(Source);
+struct Open(Source, &'static crate::amdgpu_rdna2::Profile);
 impl CapOp<narf_firmware::FirmwareRegistry, Read> for Open {
     type Output = Result<Vec<u8>, Error>;
     fn execute(
         self,
         cap: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self::Output, CapError> {
-        let blob = match narf_firmware::open(self.0.name(), cap) {
+        let blob = match narf_firmware::open(self.0.name_for(self.1), cap) {
             Ok(blob) => blob,
             Err(error) => return Ok(Err(Error::Registry(self.0, error))),
         };
@@ -113,6 +132,14 @@ fn optional(source: Source, result: Result<Vec<u8>, Error>) -> Result<Option<Vec
     }
 }
 impl Firmware {
+    pub(crate) fn is_navi22(&self) -> bool {
+        self.profile == &crate::amdgpu_rdna2::NAVI22
+    }
+    /// The selected ASIC, retained with the prepared bytes to prevent a
+    /// sibling chip's containers from entering a native upload path.
+    pub fn profile(&self) -> &'static crate::amdgpu_rdna2::Profile {
+        self.profile
+    }
     /// The validated bytes of one image; `None` only for an absent MEC2.
     pub(crate) fn source_bytes(&self, source: Source) -> Option<&[u8]> {
         self.bytes
@@ -134,15 +161,30 @@ impl Firmware {
         authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self, Error> {
         check_device(gpu)?;
+        Self::open_rdna2(gpu, authority)
+    }
+    /// Prepare chip-specific containers without touching hardware. Uploading a
+    /// prepared sibling ASIC through the Navi22 PSP path remains unsupported.
+    pub fn open_rdna2(
+        gpu: &AmdGpu,
+        authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
+    ) -> Result<Self, Error> {
+        let profile = check_rdna2_device(gpu)?;
         let vcn = vcn_instances(gpu)?;
         let mut bytes = core::array::from_fn(|_| None);
         for (slot, source) in bytes.iter_mut().zip(Source::ORDER) {
             *slot = optional(
                 source,
-                authority.invoke(Open(source)).map_err(|_| Error::Revoked)?,
+                authority
+                    .invoke(Open(source, profile))
+                    .map_err(|_| Error::Revoked)?,
             )?;
         }
-        Ok(Self { bytes, vcn })
+        Ok(Self {
+            profile,
+            bytes,
+            vcn,
+        })
     }
     /// Drop harvested VCN instances (`adev->vcn.harvest_config`) before any
     /// device I/O. With both harvested Linux disables the VCN block, so no

@@ -1,4 +1,4 @@
-//! Phoenix PSP13, Navi22 PSP11 and Navi48 PSP14 GPCOM rings. Wire layouts and
+//! Phoenix PSP13, discrete RDNA2 PSP11 and Navi48 PSP14 GPCOM rings. Wire layouts and
 //! sequencing follow Linux psp_gfx_if.h, psp_v{11_0,13_0_4,14_0}.c, amdgpu_psp.c,
 //! nbio_v2_3.c, gfxhub_v2_1.c and hdp_v5_0.c.
 //! All addresses on the ring are GPU addresses, not host physical addresses.
@@ -394,7 +394,17 @@ pub struct MediaFirmware {
 enum Kind {
     Phoenix,
     Navi22,
+    Rdna2(&'static crate::amdgpu_rdna2::Profile),
     Navi48(u8),
+}
+impl Kind {
+    fn rdna2_profile(self) -> Option<&'static crate::amdgpu_rdna2::Profile> {
+        match self {
+            Self::Navi22 => Some(&crate::amdgpu_rdna2::NAVI22),
+            Self::Rdna2(profile) => Some(profile),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SmcState {
@@ -548,18 +558,19 @@ impl Layout {
                 let dcn = bank(gpu, discovery::HW_ID_DCN, &[(3, 1, 4)], 2, 0x477)?;
                 (mp0, nbio, dcn + 0x475 * 4, dcn + 0x476 * 4, dcn + 0x477 * 4)
             }
-            Kind::Navi22 => {
-                if gpu.chip.vid != crate::amdgpu::AMD_VENDOR
-                    || gpu.chip.did != crate::amdgpu::NAVI22
+            Kind::Navi22 | Kind::Rdna2(_) => {
+                let profile = kind.rdna2_profile().ok_or(Error::Unsupported)?;
+                if crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did) != Some(profile)
+                    || (kind == Kind::Navi22 && gpu.chip.did != crate::amdgpu::NAVI22)
                 {
                     return Err(Error::Unsupported);
                 }
                 // linux-lit: 0=mmMP0_SMN_C2PMSG_81_BASE_IDX
-                let mp0 = bank(gpu, discovery::HW_ID_MP0, &[(11, 0, 11)], 0, SOS)?;
-                // Navi22's cold-boot SMC path requires this exact MP1 mailbox.
+                let mp0 = bank(gpu, discovery::HW_ID_MP0, &[profile.psp_version], 0, SOS)?;
+                // RDNA2 cold-boot SMC uses MP1 with the same per-ASIC version as MP0.
                 // linux-lit: 0=mmMP1_SMN_C2PMSG_90_BASE_IDX; 0x29a=mmMP1_SMN_C2PMSG_90
-                bank(gpu, discovery::HW_ID_MP1, &[(11, 0, 11)], 0, 0x29a)?;
-                bank(gpu, discovery::HW_ID_SDMA0, &[(5, 2, 2)], 0, 0)?;
+                bank(gpu, discovery::HW_ID_MP1, &[profile.psp_version], 0, 0x29a)?;
+                bank(gpu, discovery::HW_ID_SDMA0, &[profile.sdma_version], 0, 0)?;
                 // Linux nv.c uses nbio_v2_3 for these revisions; MEMSIZE and
                 // REMAP_HDP_MEM_FLUSH_CNTL are at index 2, 0xc3 and 0x12d.
                 let nbio = bank(
@@ -577,12 +588,24 @@ impl Layout {
                     2,     // linux-lit: 2=mmREMAP_HDP_MEM_FLUSH_CNTL_BASE_IDX
                     0x12d, // linux-lit: 0x12d=mmREMAP_HDP_MEM_FLUSH_CNTL
                 )?;
-                // GMC10 location/offset, not DCN314's similarly named registers.
-                // This also pins the GC and works without an active display.
-                // linux-lit: 0=mmGCMC_VM_FB_LOCATION_TOP_BASE_IDX; 0x16fd=mmGCMC_VM_FB_LOCATION_TOP
-                let gc = bank(gpu, discovery::HW_ID_GC, &[(10, 3, 2)], 0, 0x16fd)?;
-                // linux-lit: 0x16fc=mmGCMC_VM_FB_LOCATION_BASE; 0x16fd=mmGCMC_VM_FB_LOCATION_TOP; 0x16e7=mmGCMC_VM_FB_OFFSET
-                (mp0, nbio, gc + 0x16fc * 4, gc + 0x16fd * 4, gc + 0x16e7 * 4)
+                // Linux gfxhub_v2_1 selects gc_10_3_0 for every discrete RDNA2
+                // part. These FB offsets differ from gc_10_1_0's despite the
+                // identical register names; the compiled table is checked.
+                let r = crate::amdgpu_rdna2::PSP_GC_REGISTERS;
+                let gc = bank(
+                    gpu,
+                    discovery::HW_ID_GC,
+                    &[profile.gc_version],
+                    r.gc_base_index,
+                    r.fb_top,
+                )?;
+                (
+                    mp0,
+                    nbio,
+                    gc + u64::from(r.fb_base) * 4,
+                    gc + u64::from(r.fb_top) * 4,
+                    gc + u64::from(r.fb_offset) * 4,
+                )
             }
         };
         let hdp = bank(
@@ -602,17 +625,29 @@ impl Layout {
         )?;
         let ip = discovery::find_ip(&gpu.ip_blocks, discovery::HW_ID_HDP, 0)
             .ok_or(Error::Unsupported)?;
-        if kind == Kind::Navi22 && (ip.major, ip.minor) != (5, 0) {
+        if kind.rdna2_profile().is_some() && (ip.major, ip.minor) != (5, 0) {
             return Err(Error::Unsupported);
         }
-        let gfx_status_regs = if kind == Kind::Navi22 {
-            // Linux gc_10_1_0_offset.h: CP_STAT index 0, RLC status index 1.
-            // linux-lit: 0=mmCP_STAT_BASE_IDX; 0xf40=mmCP_STAT
-            let cp = bank(gpu, discovery::HW_ID_GC, &[(10, 3, 2)], 0, 0xf40)?;
-            // linux-lit: 1=mmRLC_RLCS_BOOTLOAD_STATUS_BASE_IDX; 0x4e8d=mmRLC_RLCS_BOOTLOAD_STATUS
-            let rlc = bank(gpu, discovery::HW_ID_GC, &[(10, 3, 2)], 1, 0x4e8d)?;
-            // linux-lit: 0xf40=mmCP_STAT; 0x4e8d=mmRLC_RLCS_BOOTLOAD_STATUS
-            Some((cp + 0xf40 * 4, rlc + 0x4e8d * 4))
+        let gfx_status_regs = if let Some(profile) = kind.rdna2_profile() {
+            let r = crate::amdgpu_rdna2::PSP_GC_REGISTERS;
+            let cp = bank(
+                gpu,
+                discovery::HW_ID_GC,
+                &[profile.gc_version],
+                r.gc_base_index,
+                r.cp_status,
+            )?;
+            let rlc = bank(
+                gpu,
+                discovery::HW_ID_GC,
+                &[profile.gc_version],
+                r.rlc_base_index,
+                r.rlc_status,
+            )?;
+            Some((
+                cp + u64::from(r.cp_status) * 4,
+                rlc + u64::from(r.rlc_status) * 4,
+            ))
         } else {
             None
         };
@@ -633,15 +668,19 @@ impl Layout {
 pub(crate) fn validate_navi22_layout(gpu: &AmdGpu) -> Result<(), Error> {
     Layout::resolve(gpu, Kind::Navi22).map(|_| ())
 }
-/// Re-read GMC10's live FB location and check the pool still lies inside it
-/// (the same check `Psp::new_navi22` makes), e.g. after a reset-on-init and
-/// before the bootloader is handed any pool GPU address.
-pub(crate) fn validate_navi22_pool(
+pub(crate) fn validate_rdna2_layout(gpu: &AmdGpu) -> Result<(), Error> {
+    let profile =
+        crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).ok_or(Error::Unsupported)?;
+    Layout::resolve(gpu, Kind::Rdna2(profile)).map(|_| ())
+}
+pub(crate) fn validate_rdna2_pool(
     gpu: &AmdGpu,
     authority: &Cap<BusDeviceCap, Write>,
     pool: &Pool,
 ) -> Result<(), Error> {
-    Layout::resolve(gpu, Kind::Navi22)?
+    let profile =
+        crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).ok_or(Error::Unsupported)?;
+    Layout::resolve(gpu, Kind::Rdna2(profile))?
         .validate_pool(gpu, authority, pool)
         .map(|_| ())
 }
@@ -755,6 +794,23 @@ impl Psp {
         // SAFETY: same exclusive ownership and initialized VRAM contract.
         unsafe { Self::with_kind(gpu, authority, pool, Kind::Navi22) }
     }
+    /// Claim a discrete RDNA2 PSP11 ring after SOS bootstrap. Selection requires
+    /// exact PCI/GC/MP0/MP1/SDMA identities plus NBIO2.3 and HDP5 register layouts.
+    /// This does not enable the board's native startup or power policy.
+    ///
+    /// # Safety
+    /// Same exclusive physical GPU, PSP/HDP/reset/PM ownership, trained VRAM,
+    /// permanent mapping and excluded pool contract as `new_navi22`.
+    pub unsafe fn new_rdna2(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+    ) -> Result<Self, Error> {
+        let profile = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did)
+            .ok_or(Error::Unsupported)?;
+        // SAFETY: caller supplies the complete exclusive ownership contract.
+        unsafe { Self::with_kind(gpu, authority, pool, Kind::Rdna2(profile)) }
+    }
     /// Claim Navi48's PSP14 ring using discovered MP0 and GMC12 addresses.
     ///
     /// # Safety
@@ -802,7 +858,7 @@ impl Psp {
                     memory,
                     state: State::Prepared,
                     sequence: 0,
-                    lenient: kind == Kind::Navi22,
+                    lenient: kind.rdna2_profile().is_some(),
                 },
                 pool: pool.clone(),
                 payload: None,
@@ -849,6 +905,33 @@ impl Psp {
         let image = firmware.image().map_err(|_| Error::Invalid)?;
         self.session.init_tmr(image.toc()).await
     }
+    /// Reserve this RDNA2 ASIC's TMR from its authenticated SOS TOC, falling
+    /// back to PSP11's 4 MiB default when absent. SETUP_TMR remains deferred
+    /// until PMFW upload, as required by centralized C-state management.
+    pub async fn setup_tmr_rdna2(
+        &mut self,
+        firmware: &crate::amdgpu_psp_boot::Firmware,
+    ) -> Result<(), Error> {
+        if self.kind.rdna2_profile().is_none()
+            || self.kind.rdna2_profile() != firmware.rdna2_profile()
+        {
+            return Err(Error::Unsupported);
+        }
+        let image = firmware.image().map_err(|_| Error::Invalid)?;
+        self.session.init_tmr(image.toc()).await
+    }
+    /// Upload this ASIC's validated SMC payload, then install the reserved
+    /// TMR. No board table, clock policy or SMU runtime command is applied.
+    pub async fn load_smc_rdna2(
+        &mut self,
+        firmware: &crate::amdgpu_smu_navi22::Firmware,
+    ) -> Result<(), Error> {
+        if self.kind.rdna2_profile() != Some(firmware.profile()) {
+            return Err(Error::Unsupported);
+        }
+        let image = firmware.image().map_err(|_| Error::Invalid)?;
+        self.session.load_smc_centralized(image.payload()).await
+    }
     /// Install the trusted region described by this PSP14 target's embedded
     /// TOC. A missing TOC is rejected; no size from another GPU is substituted.
     pub async fn setup_tmr_navi48(
@@ -886,7 +969,7 @@ impl Psp {
         &mut self,
         firmware: &crate::amdgpu_smu_navi22::Firmware,
     ) -> Result<(), Error> {
-        if self.kind != Kind::Navi22 {
+        if self.kind != Kind::Navi22 || firmware.profile() != &crate::amdgpu_rdna2::NAVI22 {
             return Err(Error::Unsupported);
         }
         let image = firmware.image().map_err(|_| Error::Invalid)?;
@@ -899,7 +982,19 @@ impl Psp {
         &mut self,
         firmware: &crate::amdgpu_gfx_navi22::Firmware,
     ) -> Result<(), Error> {
-        if self.kind != Kind::Navi22 {
+        if self.kind != Kind::Navi22 || !firmware.is_navi22() {
+            return Err(Error::Unsupported);
+        }
+        let images = firmware.images().map_err(|_| Error::Invalid)?;
+        self.session.load_gfx(&images).await
+    }
+    /// Submit this RDNA2 ASIC's prepared graphics set after SMC/TMR setup.
+    /// Acceptance is not proof of working engines or initialized queues.
+    pub async fn load_gfx_rdna2(
+        &mut self,
+        firmware: &crate::amdgpu_gfx_navi22::Firmware,
+    ) -> Result<(), Error> {
+        if self.kind.rdna2_profile() != Some(firmware.profile()) {
             return Err(Error::Unsupported);
         }
         let images = firmware.images().map_err(|_| Error::Invalid)?;
@@ -958,7 +1053,7 @@ impl Psp {
         (self.session.fb_base, self.session.fb_offset)
     }
     pub(crate) fn dmub_tmr(&self) -> Result<core::ops::Range<u64>, Error> {
-        if self.kind != Kind::Navi22
+        if self.kind.rdna2_profile().is_none()
             || !self.session.tmr_ready
             || self.session.media_firmware.dmcub.is_none()
         {
@@ -971,6 +1066,14 @@ impl Psp {
     /// autoload. No GC writes, queue initialization or fw_loaded publication.
     pub async fn wait_gfx_boot_navi22(&mut self) -> Result<GfxBootStatus, Error> {
         if self.kind != Kind::Navi22 {
+            return Err(Error::Unsupported);
+        }
+        self.session.wait_gfx_boot().await
+    }
+    /// Observe CP idle and RLC boot completion for the accepted RDNA2 autoload.
+    /// Performs no GC writes and does not advertise acceleration.
+    pub async fn wait_gfx_boot_rdna2(&mut self) -> Result<GfxBootStatus, Error> {
+        if self.kind.rdna2_profile().is_none() {
             return Err(Error::Unsupported);
         }
         self.session.wait_gfx_boot().await

@@ -427,6 +427,7 @@ fn engine(model: Model, instances: u8) -> (Pool, Engine<Model>) {
     (
         pool,
         Engine {
+            enc_count: 2,
             hw: Hw {
                 io: model,
                 authority: Cap::bootstrap(),

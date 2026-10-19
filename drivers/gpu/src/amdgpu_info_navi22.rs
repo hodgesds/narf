@@ -97,7 +97,6 @@ const CE_RAM_SIZE: u32 = 65536; // linux: F32_CE_PROGRAM_RAM_SIZE
 /// `gfx_v10_0_gpu_early_init`.
 const MAX_HW_CONTEXTS: u32 = 8; // linux: n/a (literal in gfx_v10_0.c:gfx_v10_0_gpu_early_init)
 /// `nv_common_early_init`, GC 10.3.2: `external_rev_id = rev_id + 0x32`.
-const EXTERNAL_REV_OFFSET: u32 = 0x32; // linux: n/a (literal in nv.c:nv_common_early_init)
 /// `amdgpu_info_ioctl`: `AMDGPU_GFX_MAX_SE` / `AMDGPU_GFX_MAX_SH_PER_SE`.
 const MMR_MAX_SE: u32 = 4; // linux: AMDGPU_GFX_MAX_SE
 const MMR_MAX_SH: u32 = 2; // linux: AMDGPU_GFX_MAX_SH_PER_SE
@@ -232,6 +231,7 @@ pub struct Boot {
     pub gfx_mhz: Option<(u16, u16)>,
     /// The kernel GFX, compute and SDMA ring/IB tests passed.
     pub queues_verified: bool,
+    pub sdma_rings: u8,
 }
 
 /// Everything published for the bound Navi 22.
@@ -266,6 +266,9 @@ fn available_rings(published: &Published, submission: Submission, ip: u32) -> u3
     }
     if let Some(mask) = media_available_rings(published, ip) {
         return mask;
+    }
+    if ip == uapi::AMDGPU_HW_IP_DMA {
+        return published.boot.map_or(0, |b| u32::from(b.sdma_rings));
     }
     LINUX_RINGS
         .iter()
@@ -308,7 +311,17 @@ fn dev_info(snap: &Snapshot, submission: Submission) -> Result<Vec<u8>, FsError>
     let info = uapi::DrmAmdgpuInfoDevice {
         device_id: snap.did,
         chip_rev: topology.map_or(0, |t| t.rev_id),
-        external_rev: topology.map_or(0, |t| t.rev_id + EXTERNAL_REV_OFFSET),
+        external_rev: topology.map_or(0, |t| {
+            t.rev_id
+                + crate::amdgpu_rdna2::for_pci_id(crate::amdgpu::AMD_VENDOR, snap.did as u16)
+                    .map_or(0, |p| match p.gc_version.2 {
+                        0 => 0x28,
+                        2 => 0x32,
+                        4 => 0x3c,
+                        5 => 0x46,
+                        _ => 0,
+                    })
+        }),
         pci_rev: snap.navi22.pci_revision.map_or(0, u32::from),
         family: uapi::AMDGPU_FAMILY_NV,
         num_shader_engines: table.num_se,
@@ -421,7 +434,15 @@ fn hw_ip_count(snap: &Snapshot, submission: Submission, ip: u32) -> Result<Vec<u
             uapi::AMDGPU_HW_IP_DMA => snap
                 .ip_blocks
                 .iter()
-                .filter(|b| matches!(b.hw_id, discovery::HW_ID_SDMA0 | discovery::HW_ID_SDMA1))
+                .filter(|b| {
+                    matches!(
+                        b.hw_id,
+                        discovery::HW_ID_SDMA0
+                            | discovery::HW_ID_SDMA1
+                            | discovery::HW_ID_SDMA2
+                            | discovery::HW_ID_SDMA3
+                    )
+                })
                 .count() as u32,
             // `adev->vcn.num_vcn_inst`: every discovered instance, harvested
             // ones included; JPEG is `num_jpeg_inst * num_jpeg_rings` = 1.

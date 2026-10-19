@@ -183,6 +183,7 @@ struct Mmio {
     regs: crate::amdgpu_reg_window::Window,
     mp1: u64,
     dcn: u64,
+    pipes: u8,
 }
 impl Io for Mmio {
     fn read(&mut self, reg: u32) -> u32 {
@@ -199,7 +200,7 @@ impl Io for Mmio {
         unsafe { self.regs.write32(self.mp1 + u64::from(reg) * 4, value) };
     }
     fn idle(&mut self) -> Result<(), Error> {
-        for i in 0..6 {
+        for i in 0..u64::from(self.pipes) {
             // linux: n/a (six OTG/DIG instances)
             for (reg, mask) in [
                 // linux-lit: 0x1b41=mmOTG0_OTG_CONTROL
@@ -446,15 +447,25 @@ impl ClockManager {
     /// The SMU passed to `start` must own this same physical GPU, with its board
     /// power policy running. No other owner may enable a stream concurrently.
     pub unsafe fn new(gpu: &AmdGpu, authority: Cap<BusDeviceCap, Write>) -> Result<Self, Error> {
-        if Profile::resolve(gpu)? != Profile::Navi22 {
+        let profile = Profile::resolve(gpu)?;
+        if !profile.is_dcn30() {
             return Err(Error::Unsupported);
         }
-        let mp1 = crate::amdgpu_smu_navi22::mp1_bank(gpu).map_err(|_| Error::Unsupported)?;
+        let asic = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did)
+            .ok_or(Error::Unsupported)?;
+        let mp1 = crate::amdgpu_psp_ring::bank(
+            gpu,
+            crate::amdgpu_discovery::HW_ID_MP1,
+            &[asic.psp_version],
+            0,
+            RESPONSE,
+        )
+        .map_err(|_| Error::Unsupported)?;
         if gpu.regs.len < u64::from(PLL + 1) * 4 {
             return Err(Error::Invalid);
         }
         // linux-lit: 0x260c=mmDP5_DP_VID_STREAM_CNTL
-        let dcn = Profile::Navi22.bank(gpu, 2, 0x260c)?;
+        let dcn = profile.bank(gpu, 2, 0x260c)?;
         // SAFETY: DCCG is retained here; no second divider owner is exposed.
         let dccg = unsafe { Dccg::new(gpu, authority)? };
         Ok(Self {
@@ -463,6 +474,7 @@ impl ClockManager {
                     regs: crate::amdgpu_reg_window::Window::new(gpu.regs),
                     mp1,
                     dcn,
+                    pipes: profile.pipes(),
                 },
                 authority,
                 state: State::Dormant,

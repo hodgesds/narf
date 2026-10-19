@@ -13,6 +13,7 @@ use core::{
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 pub(crate) const GC0: u64 = 0x1260 * 4;
+pub(crate) const GC2: u64 = 0x18000 * 4;
 pub(crate) const GC1: u64 = 0xa000 * 4;
 pub(crate) const NBIO: u64 = 0xd20 * 4;
 pub(crate) const HDP: u64 = 0xf20 * 4;
@@ -23,6 +24,8 @@ pub(crate) const BAR2: u64 = 0xf000_0000;
 
 pub(crate) fn layout() -> Layout {
     Layout {
+        profile: &crate::amdgpu_rdna2::NAVI22,
+        sdma_high: None,
         gc: [GC0, GC1],
         nbio: NBIO,
         hdp: HDP,
@@ -54,7 +57,11 @@ pub(crate) fn r(reg: Reg) -> u64 {
     layout().reg(reg)
 }
 pub(crate) fn sdma(i: u32, reg: Reg) -> u64 {
-    layout().sdma(i, reg)
+    if i < 2 {
+        layout().sdma(i, reg)
+    } else {
+        GC2 + u64::from(reg.1 + (i - 2) * 0x400) * 4
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -78,7 +85,7 @@ pub(crate) struct Model {
     pub cam_remapped: bool,
     pub cam: Vec<u32>,
     /// Engines that ignore doorbells: 0 gfx, 1 KIQ, 2 compute, 3/4 SDMA.
-    pub stalled: [bool; 5],
+    pub stalled: [bool; 7],
     pub drop_ib_writes: bool,
     pub drop_fences: bool,
     /// An active HQD that never acknowledges DEQUEUE_REQUEST.
@@ -88,7 +95,8 @@ pub(crate) struct Model {
     pub resources: Vec<u64>,
     pub mapped: Vec<Mapped>,
     pub traps: u32,
-    rptr: [u64; 5],
+    pub sdma_count: u32,
+    rptr: [u64; 7],
     pub progress: Arc<AtomicU32>,
     pub revoke: Option<(u64, u32, Cap<BusDeviceCap, Write>)>,
     /// User VMIDs: 4 KiB VA page -> MC page (the GMC10 walk is modelled in
@@ -126,7 +134,7 @@ impl Model {
             stale: false,
             cam_remapped: false,
             cam: Vec::new(),
-            stalled: [false; 5],
+            stalled: [false; 7],
             drop_ib_writes: false,
             drop_fences: false,
             stuck_hqd: false,
@@ -135,7 +143,8 @@ impl Model {
             resources: Vec::new(),
             mapped: Vec::new(),
             traps: 0,
-            rptr: [0; 5],
+            sdma_count: 2,
+            rptr: [0; 7],
             progress: Arc::new(AtomicU32::new(0)),
             revoke: None,
             vms: BTreeMap::new(),
@@ -527,9 +536,9 @@ impl Model {
             self.put(q.rptr, value as u32);
             return;
         }
-        for i in 0..2u32 {
+        for i in 0..self.sdma_count {
             let x = |m: &Self, reg| m.reg(sdma(i, reg));
-            let range = self.reg(NBIO + u64::from(0x1d0 + i) * 4);
+            let range = self.reg(NBIO + u64::from([0x1d0u32, 0x1d1, 0x1d6, 0x1d7][i as usize]) * 4);
             let offset = (range & 0xffc) >> 2;
             if x(self, SDMA0_GFX_DOORBELL) & (1 << 28) == 0
                 || (x(self, SDMA0_GFX_DOORBELL_OFFSET) & 0x0fff_fffc) >> 2 != index
@@ -1105,4 +1114,132 @@ fn cp_navi22_fence_interrupts_arm_eop_and_both_sdma_traps() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi22",
     cp_navi22_fence_interrupts_arm_eop_and_both_sdma_traps
+);
+
+pub(crate) fn rdna2_gpu(profile: &crate::amdgpu_rdna2::Profile, did: u16) -> AmdGpu {
+    let mut gpu = navi22_gpu();
+    gpu.chip = crate::amdgpu::__test_chip_info_for_pci_id(0x1002, did).unwrap();
+    for block in &mut gpu.ip_blocks {
+        if block.hw_id == ip::HW_ID_GC {
+            (block.major, block.minor, block.revision) = profile.gc_version;
+        } else if block.hw_id == ip::HW_ID_SDMA0 {
+            (block.major, block.minor, block.revision) = profile.sdma_version;
+        }
+    }
+    gpu
+}
+
+fn rdna2_cp_layout_and_constructors_require_exact_asic_before_allocation() -> TestResult {
+    for profile in crate::amdgpu_rdna2::PROFILES {
+        for &did in profile.pci_ids {
+            let gpu = rdna2_gpu(profile, did);
+            let resolved = Layout::resolve_rdna2(&gpu).unwrap();
+            if resolved
+                != (Layout {
+                    profile,
+                    ..layout()
+                })
+            {
+                return TestResult::Fail("RDNA2 CP resolved wrong profile or register banks");
+            }
+            if did != crate::amdgpu::NAVI22 && Layout::resolve(&gpu).is_ok() {
+                return TestResult::Fail("shared CP widened native Navi22 startup");
+            }
+            let pool = pool(1 << 20);
+            let authority = Cap::bootstrap();
+            authority.revoke();
+            // SAFETY: inert mappings; constructors perform no I/O and revoked
+            // authority prevents the attempted golden programming from touching MMIO.
+            let mut owner = unsafe { Gfx::new_rdna2(&gpu, authority, &pool, doorbells()) }.unwrap();
+            // SAFETY: revoked authority guarantees no device access.
+            if unsafe { owner.golden() } != Err(Error::Revoked) || owner.state() != GfxState::Failed
+            {
+                return TestResult::Fail("RDNA2 GFX golden setup bypassed live authority");
+            }
+            drop(owner);
+            if pool.available() != 1 << 20 {
+                return TestResult::Fail("unpublished RDNA2 GFX storage leaked");
+            }
+        }
+        for id in [
+            ip::HW_ID_GC,
+            ip::HW_ID_SDMA0,
+            ip::HW_ID_NBIF,
+            ip::HW_ID_HDP,
+            ip::HW_ID_OSSSYS,
+        ] {
+            for change in 0..4 {
+                let mut bad = rdna2_gpu(profile, profile.pci_ids[0]);
+                let index = bad.ip_blocks.iter().position(|b| b.hw_id == id).unwrap();
+                match change {
+                    0 => bad.ip_blocks[index].major = 0xff,
+                    1 => bad.ip_blocks.push(bad.ip_blocks[index]),
+                    2 => bad.ip_blocks[index].num_bases = 0,
+                    _ => {
+                        bad.ip_blocks.remove(index);
+                    }
+                }
+                if Layout::resolve_rdna2(&bad).is_ok() {
+                    return TestResult::Fail("RDNA2 CP accepted foreign/missing/duplicate banks");
+                }
+            }
+        }
+        for revision in 0..4 {
+            let mut gpu = rdna2_gpu(profile, profile.pci_ids[0]);
+            gpu.ip_blocks
+                .iter_mut()
+                .find(|b| b.hw_id == ip::HW_ID_OSSSYS)
+                .unwrap()
+                .revision = revision;
+            if Layout::resolve_rdna2(&gpu).is_err() {
+                return TestResult::Fail("compatible OSSSYS5.0 revision refused");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_cp_layout_and_constructors_require_exact_asic_before_allocation
+);
+
+fn rdna2_gfx_golden_sequences_preserve_masks_and_run_ring_ib_proofs() -> TestResult {
+    for profile in crate::amdgpu_rdna2::PROFILES {
+        let gpu = rdna2_gpu(profile, profile.pci_ids[0]);
+        let resolved = Layout::resolve_rdna2(&gpu).unwrap();
+        let mut model = enabled();
+        let mut values = BTreeMap::new();
+        let mut expected = Vec::new();
+        for row in crate::amdgpu_rdna2::golden::for_gc(profile.gc_version).unwrap() {
+            let address = resolved.reg(Reg(row.base_index, row.offset));
+            let initial = *model.regs.entry(address).or_insert(0xa5a5_5a5a);
+            let old = *values.entry(address).or_insert(initial);
+            // soc15_program_register_sequence masks the OR operand as well.
+            let new = (old & !row.and_mask) | (row.or_mask & row.and_mask);
+            values.insert(address, new);
+            expected.push((address, new));
+        }
+        let (_pool, mut engine) = gfx(model);
+        engine.hw.layout = resolved;
+        engine.golden().unwrap();
+        if engine.hw.io.writes != expected || engine.golden() != Err(Error::Busy) {
+            return TestResult::Fail("RDNA2 golden order/masks differ or sequence replayed");
+        }
+        run(engine.configure()).unwrap();
+        run(engine.start()).unwrap();
+        run(engine.test_ib()).unwrap();
+        if engine.state != GfxState::Verified || engine.hw.io.clear_states != 1 {
+            return TestResult::Fail("RDNA2 GFX clear-state/ring/IB proof failed");
+        }
+    }
+    for version in [(10, 3, 1), (10, 3, 3), (10, 3, 6), (11, 0, 1), (12, 0, 1)] {
+        if crate::amdgpu_rdna2::golden::for_gc(version).is_some() {
+            return TestResult::Fail("golden sequence guessed for another architecture/APU");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_gfx_golden_sequences_preserve_masks_and_run_ring_ib_proofs
 );

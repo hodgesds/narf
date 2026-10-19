@@ -5,6 +5,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn soc() -> dml30::Soc {
     dml30::Soc {
+        dcn_revision: 0,
         dcfclk_khz: 1_200_000,
         fabric_khz: 1_200_000,
         socclk_khz: 1_000_000,

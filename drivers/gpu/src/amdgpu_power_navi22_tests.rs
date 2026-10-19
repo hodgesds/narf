@@ -264,3 +264,40 @@ kernel_test_in!(
     "drivers/gpu/power-navi22",
     navi22_display_dpm_respects_board_features_and_excludes_sleep
 );
+
+fn rdna2_power_tables_preserve_profile_and_board_overlay() -> TestResult {
+    for (profile, revision, format, version, size, start, end) in [
+        (&crate::amdgpu_rdna2::NAVI21, 15, 0x80, 1, 1668, 1344, 1636),
+        (&crate::amdgpu_rdna2::NAVI22, 16, 0x81, 1, 1668, 1344, 1636),
+        (&crate::amdgpu_rdna2::NAVI23, 18, 0x83, 6, 1668, 1344, 1636),
+        (&crate::amdgpu_rdna2::NAVI24, 19, 0x84, 3, 1700, 1376, 1668),
+        (&crate::amdgpu_rdna2::NAVI24, 19, 0x84, 3, 1888, 1564, 1856),
+    ] {
+        let mut data = bios(0);
+        data.resize(0x400 + DRIVER_BYTES + size, 0xa5);
+        put16(&mut data, 0x400, (DRIVER_BYTES + size) as u16);
+        data[0x402] = revision;
+        put16(&mut data, 0x40f, format);
+        put32(&mut data, 0x400 + DRIVER_BYTES, version);
+        let image = prepare_for(&data, |_| None, identity(), profile).unwrap();
+        if image.profile != profile
+            || image.bytes().len() != size
+            || image.bytes()[start..end] != data[0x204..0x328]
+            || image.bytes()[end..] != data[0x400 + DRIVER_BYTES + end..]
+        {
+            return TestResult::Fail(
+                "PowerPlay family layout/overlay corrupted SKU or private bytes",
+            );
+        }
+        for other in crate::amdgpu_rdna2::PROFILES {
+            if other != profile && prepare_for(&data, |_| None, identity(), other).is_ok() {
+                return TestResult::Fail("PowerPlay accepted another ASIC's wire layout");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_power_tables_preserve_profile_and_board_overlay
+);

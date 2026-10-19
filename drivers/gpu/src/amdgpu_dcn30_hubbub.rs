@@ -213,10 +213,11 @@ impl Hubbub {
     /// Caller exclusively owns the DCHUBBUB arbiter for the object's lifetime
     /// and holds matching PCI authority with a permanent register mapping.
     pub unsafe fn new(gpu: &AmdGpu, authority: Cap<BusDeviceCap, Write>) -> Result<Self, Error> {
-        if Profile::resolve(gpu).map_err(|_| Error::Unsupported)? != Profile::Navi22 {
+        let profile = Profile::resolve(gpu).map_err(|_| Error::Unsupported)?;
+        if !profile.is_dcn30() {
             return Err(Error::Unsupported);
         }
-        let base = Profile::Navi22
+        let base = profile
             .bank(gpu, 2, LAST_REG)
             .map_err(|_| Error::Unsupported)?;
         Ok(Self(Engine::new_with(

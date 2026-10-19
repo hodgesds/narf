@@ -437,6 +437,7 @@ pub(crate) struct Engine<I: Io> {
     /// `pool->audio_count`: endpoints up to the first one with no physical
     /// connection, known after `dce_aud_hw_init`.
     endpoints: Option<u8>,
+    capacity: u8,
     records: [Option<Record>; STREAMS],
 }
 impl<I: Io> Engine<I> {
@@ -445,6 +446,7 @@ impl<I: Io> Engine<I> {
             io,
             authority,
             endpoints: None,
+            capacity: ENDPOINTS,
             records: [None; STREAMS],
         }
     }
@@ -518,7 +520,7 @@ impl<I: Io> Engine<I> {
         self.update(POWER_STATES, CLKSTOP_EPSS, CLKSTOP_EPSS)?;
         self.az_update(0, AZ_HOT_PLUG, CLOCK_GATING_DISABLE, 0)?;
         let mut count = 0;
-        while count < ENDPOINTS {
+        while count < self.capacity {
             // linux: n/a (PORT_CONNECTIVITY == 1, literal in dce_audio.c:dce_aud_endpoint_valid)
             if self.az_read(count, AZ_CONFIG_DEFAULT)? >> PORT_CONNECTIVITY_SHIFT == 1 {
                 break;
@@ -805,7 +807,7 @@ impl<I: Io> Engine<I> {
         info: AudioInfo,
         wake: &mut impl AzaliaWake,
     ) -> Result<DisplayAudio, Error> {
-        if usize::from(s.dig) >= STREAMS || usize::from(s.otg) >= STREAMS {
+        if s.dig >= self.capacity || s.otg >= self.capacity {
             return Err(Error::Invalid);
         }
         if self.record(s.dig).is_some() {
@@ -959,22 +961,25 @@ impl Audio {
     /// matching PCI authority and a permanent register mapping. The HD-Audio
     /// controller and codec are separate owners.
     pub unsafe fn new(gpu: &AmdGpu, authority: Cap<BusDeviceCap, Write>) -> Result<Self, Error> {
-        if Profile::resolve(gpu).map_err(|_| Error::Unsupported)? != Profile::Navi22 {
+        let profile = Profile::resolve(gpu).map_err(|_| Error::Unsupported)?;
+        if !profile.is_dcn30() {
             return Err(Error::Unsupported);
         }
         let bank = |index, last| {
-            Profile::Navi22
+            profile
                 .bank(gpu, index, last)
                 .map_err(|_| Error::Unsupported)
         };
-        Ok(Self(Engine::new_with(
+        let mut engine = Engine::new_with(
             Mmio {
                 regs: crate::amdgpu_reg_window::Window::new(gpu.regs),
                 bank1: bank(1, LAST_BANK1)?, // linux-lit: 1=mmDCCG_AUDIO_DTO_SOURCE_BASE_IDX
                 bank2: bank(2, LAST_BANK2)?, // linux-lit: 2=mmDIG0_DIG_FE_CNTL_BASE_IDX
             },
             authority,
-        )))
+        );
+        engine.capacity = profile.streams();
+        Ok(Self(engine))
     }
     pub fn record(&self, dig: u8) -> Option<Record> {
         self.0.record(dig)

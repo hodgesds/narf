@@ -416,3 +416,119 @@ kernel_test_in!(
     "drivers/gpu/gmc-navi22",
     gmc_navi22_constructor_checks_exact_banks_before_allocation
 );
+
+pub(super) fn rdna2_gpu(
+    profile: &crate::amdgpu_rdna2::Profile,
+    did: u16,
+    mmhub: (u8, u8, u8),
+) -> AmdGpu {
+    let mut gpu = crate::amdgpu_navi22_boot::tests::gpu();
+    gpu.chip = crate::amdgpu::__test_chip_info_for_pci_id(0x1002, did).unwrap();
+    gpu.regs.len = 0x80000;
+    for block in &mut gpu.ip_blocks {
+        match block.hw_id {
+            ip::HW_ID_GC => {
+                (block.major, block.minor, block.revision) = profile.gc_version;
+                block.base_addrs[0] = 0x10000 / 4;
+            }
+            ip::HW_ID_NBIF => {
+                block.base_addrs[0] = 0x40000 / 4;
+                block.base_addrs[2] = 0x30000 / 4;
+            }
+            ip::HW_ID_HDP => block.base_addrs[0] = 0x50000 / 4,
+            _ => {}
+        }
+    }
+    let mut block = gpu
+        .ip_blocks
+        .iter()
+        .find(|b| b.hw_id == ip::HW_ID_GC)
+        .copied()
+        .unwrap();
+    block.hw_id = ip::HW_ID_MMHUB;
+    (block.major, block.minor, block.revision) = mmhub;
+    block.base_addrs[0] = 0x20000 / 4;
+    gpu.ip_blocks.push(block);
+    gpu
+}
+
+fn rdna2_gmc_exact_gc_and_supported_hubs_precede_allocation() -> TestResult {
+    for profile in crate::amdgpu_rdna2::PROFILES {
+        for &did in profile.pci_ids {
+            for &mm in crate::amdgpu_rdna2::GMC_MMHUB_VERSIONS {
+                let gpu = rdna2_gpu(profile, did, mm);
+                let layout = Layout::resolve_rdna2(&gpu).unwrap();
+                if layout.bases != [0x10000, 0x20000]
+                    || layout.nbio != 0x30000
+                    || layout.pcie != 0x40000
+                    || layout.hdp != 0x50000
+                {
+                    return TestResult::Fail("RDNA2 GMC resolved another IP base index");
+                }
+                let (pool, engine) = fixture();
+                drop(engine);
+                let authority = Cap::bootstrap();
+                authority.revoke();
+                // SAFETY: inert mapping; construction performs no I/O. Revoked
+                // authority guarantees the attempted initialize cannot touch MMIO.
+                let mut owner = unsafe { Gmc::new_rdna2(&gpu, authority, &pool) }.unwrap();
+                let prepared = owner.state() == State::Prepared && owner.aperture().is_none();
+                // SAFETY: inert mapping with revoked authority; no MMIO can execute.
+                let initialized = unsafe { run(owner.initialize()) };
+                if !prepared || initialized != Err(Error::Revoked) {
+                    return TestResult::Fail("RDNA2 GMC initialized without live authority");
+                }
+                drop(owner);
+                if pool.available() != BYTES {
+                    return TestResult::Fail("unpublished RDNA2 GMC backing was retained");
+                }
+                if (did != crate::amdgpu::NAVI22 || mm != (2, 1, 0))
+                    && Layout::resolve(&gpu).is_ok()
+                {
+                    return TestResult::Fail("shared GMC widened the native Navi22 gate");
+                }
+            }
+        }
+        let gpu = rdna2_gpu(profile, profile.pci_ids[0], (2, 1, 0));
+        for id in [ip::HW_ID_GC, ip::HW_ID_MMHUB, ip::HW_ID_NBIF, ip::HW_ID_HDP] {
+            for change in 0..4 {
+                let mut bad = rdna2_gpu(profile, profile.pci_ids[0], (2, 1, 0));
+                let index = bad.ip_blocks.iter().position(|b| b.hw_id == id).unwrap();
+                match change {
+                    0 => bad.ip_blocks[index].major = 0xff,
+                    1 => bad.ip_blocks.push(bad.ip_blocks[index]),
+                    2 => bad.ip_blocks[index].num_bases = 0,
+                    _ => {
+                        bad.ip_blocks.remove(index);
+                    }
+                }
+                let (pool, engine) = fixture();
+                drop(engine);
+                // SAFETY: malformed discovery must reject before any I/O/allocation.
+                if unsafe { Gmc::new_rdna2(&bad, Cap::bootstrap(), &pool) }.is_ok()
+                    || pool.available() != BYTES
+                {
+                    return TestResult::Fail(
+                        "RDNA2 GMC accepted invalid IP layout or allocated early",
+                    );
+                }
+            }
+        }
+        for mmhub in [(2, 0, 0), (2, 3, 0), (2, 4, 0), (2, 1, 3)] {
+            let bad = rdna2_gpu(profile, profile.pci_ids[0], mmhub);
+            if Layout::resolve_rdna2(&bad).is_ok() {
+                return TestResult::Fail("RDNA2 GMC accepted a different MMHUB backend");
+            }
+        }
+        let mut bad = gpu;
+        bad.chip.vid = 0x10de;
+        if Layout::resolve_rdna2(&bad).is_ok() {
+            return TestResult::Fail("non-AMD device entered shared GMC");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_gmc_exact_gc_and_supported_hubs_precede_allocation
+);

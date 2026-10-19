@@ -15,7 +15,7 @@ fn engine(model: Model) -> (Pool, Engine<Model>) {
         pool,
         Engine {
             hw: hw(model),
-            queues,
+            queues: queues.into(),
             state: State::Prepared,
             proof: Proof::default(),
         },
@@ -89,9 +89,9 @@ fn sdma_queues_navi22_start_both_engines_with_doorbells_and_fences() -> TestResu
         || m.traps != 2
         || e.proof
             != (Proof {
-                stopped: [true, false],
-                ring: [true, true],
-                ib_fence: [1, 1],
+                stopped: [true, false, false, false],
+                ring: [true, true, false, false],
+                ib_fence: [1, 1, 0, 0],
             })
     {
         return TestResult::Fail("SDMA reset/doorbell/IB sequence");
@@ -181,7 +181,9 @@ fn sdma_queues_navi22_failures_and_cancellation_are_terminal() -> TestResult {
         if result != Err(expected) || e.state != State::Failed {
             return TestResult::Fail("SDMA failure not terminal");
         }
-        if case == 0 && (e.proof.ring != [true, false] || e.hw.io.doorbells.len() != 2) {
+        if case == 0
+            && (e.proof.ring != [true, false, false, false] || e.hw.io.doorbells.len() != 2)
+        {
             return TestResult::Fail("SDMA1 stall misattributed");
         }
     }
@@ -208,4 +210,96 @@ fn sdma_queues_navi22_failures_and_cancellation_are_terminal() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/sdma-navi22-queues",
     sdma_queues_navi22_failures_and_cancellation_are_terminal
+);
+
+fn rdna2_sdma_queues_discover_banks_and_prove_every_engine() -> TestResult {
+    use crate::amdgpu_cp_navi22::tests::{rdna2_gpu, GC2};
+    use crate::amdgpu_discovery as ip;
+    for profile in crate::amdgpu_rdna2::PROFILES {
+        for count in 1..=4usize {
+            let mut gpu = rdna2_gpu(profile, profile.pci_ids[0]);
+            let gc = gpu
+                .ip_blocks
+                .iter_mut()
+                .find(|b| b.hw_id == ip::HW_ID_GC)
+                .unwrap();
+            gc.num_bases = 3;
+            gc.base_addrs[2] = (GC2 / 4) as u32;
+            let sdma0 = *gpu
+                .ip_blocks
+                .iter()
+                .find(|b| b.hw_id == ip::HW_ID_SDMA0)
+                .unwrap();
+            for i in 1..count {
+                let mut block = sdma0;
+                block.instance = i as u8;
+                gpu.ip_blocks.push(block);
+            }
+            let (layout, discovered) = resolve_rdna2(&gpu).unwrap();
+            if discovered != count || (count > 2 && layout.sdma_high != Some(GC2)) {
+                return TestResult::Fail("SDMA topology or GC2 bank was guessed");
+            }
+            let mut model = enabled();
+            model.sdma_count = count as u32;
+            let (pool, mut e) = engine(model);
+            e.hw.layout = layout;
+            e.queues.truncate(count.min(2));
+            for i in 2..count {
+                let index = [doorbell::SDMA2, doorbell::SDMA3][i - 2];
+                let slot = [fence::Engine::Sdma2, fence::Engine::Sdma3][i - 2];
+                e.queues
+                    .push(Queue::new(&pool, Kind::Sdma, index, slot).unwrap());
+            }
+            if run(e.start()).is_err() || run(e.test_ib()).is_err() {
+                return TestResult::Fail("discovered SDMA engine ring/IB proof failed");
+            }
+            for i in 0..4 {
+                if e.proof.ring[i] != (i < count) || e.proof.ib_fence[i] != u32::from(i < count) {
+                    return TestResult::Fail(
+                        "SDMA proof included absent engine or missed active engine",
+                    );
+                }
+            }
+            let resets: alloc::vec::Vec<_> =
+                e.hw.io
+                    .writes
+                    .iter()
+                    .filter(|(a, _)| *a == r(GRBM_SOFT_RESET))
+                    .map(|(_, v)| *v)
+                    .collect();
+            let expected: alloc::vec::Vec<_> =
+                (0..count).flat_map(|i| [1 << (23 + i), 0]).collect();
+            if resets != expected
+                || e.hw.io.traps != count as u32
+                || run(e.start()) != Err(Error::Busy)
+            {
+                return TestResult::Fail("SDMA reset coverage or replay guard failed");
+            }
+            crate::amdgpu_cp_navi22::enable_fence_irqs_for(&mut e.hw.io, layout, count).unwrap();
+            for i in 0..count {
+                if e.hw.io.reg(sdma(i as u32, SDMA0_CNTL)) & 1 == 0 {
+                    return TestResult::Fail("SDMA completion source not armed");
+                }
+            }
+            // Duplicate instance numbers and gaps must fail before allocation.
+            gpu.ip_blocks.push(sdma0);
+            if resolve_rdna2(&gpu).is_ok() {
+                return TestResult::Fail("duplicate SDMA accepted");
+            }
+            gpu.ip_blocks.pop();
+            gpu.ip_blocks
+                .iter_mut()
+                .find(|b| b.hw_id == ip::HW_ID_SDMA0)
+                .unwrap()
+                .instance = 4;
+            if resolve_rdna2(&gpu).is_ok() {
+                return TestResult::Fail("invalid SDMA topology accepted");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_sdma_queues_discover_banks_and_prove_every_engine
 );

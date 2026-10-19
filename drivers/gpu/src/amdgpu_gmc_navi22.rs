@@ -1,4 +1,4 @@
-//! Navi22 memory hubs: VMID0 bring-up for an owned VRAM test aperture, then
+//! Discrete RDNA2 memory hubs: VMID0 bring-up for an owned VRAM test aperture, then
 //! the GART (`gart` child) and per-client GPUVM contexts (`vm` child).
 //! Linux gfxhub_v2_1.c / mmhub_v2_0.c / gmc_v10_0.c. No clock gating, KIQ/MES
 //! invalidation, retry-fault recovery or implicit reset.
@@ -116,10 +116,26 @@ const HDP_MISC_CNTL: u64 = 0xd3; // linux: mmHDP_MISC_CNTL
 const HDP_FLUSH_INVALIDATE_CACHE: u32 = 1; // linux: HDP_MISC_CNTL__FLUSH_INVALIDATE_CACHE_MASK
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
-        if gpu.chip.vid != crate::amdgpu::AMD_VENDOR
-            || gpu.chip.did != crate::amdgpu::NAVI22
-            || gpu.regs.len < 0x7f004
-        {
+        if gpu.chip.vid != crate::amdgpu::AMD_VENDOR || gpu.chip.did != crate::amdgpu::NAVI22 {
+            return Err(Error::Unsupported);
+        }
+        Self::resolve_for(gpu, (10, 3, 2), &[(2, 1, 0)])
+    }
+    fn resolve_rdna2(gpu: &AmdGpu) -> Result<Self, Error> {
+        let profile = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did)
+            .ok_or(Error::Unsupported)?;
+        Self::resolve_for(
+            gpu,
+            profile.gc_version,
+            crate::amdgpu_rdna2::GMC_MMHUB_VERSIONS,
+        )
+    }
+    fn resolve_for(
+        gpu: &AmdGpu,
+        gc_version: (u8, u8, u8),
+        mmhub_versions: &[(u8, u8, u8)],
+    ) -> Result<Self, Error> {
+        if gpu.regs.len < 0x7f004 {
             return Err(Error::Unsupported);
         }
         let reg = |id, versions: &[(u8, u8, u8)], index, last| {
@@ -137,9 +153,9 @@ impl Layout {
         Ok(Self {
             bases: [
                 // linux-lit: 0x1703=mmGCMC_VM_MX_L1_TLB_CNTL@gc
-                reg(ip::HW_ID_GC, &[(10, 3, 2)], 0, 0x1703)?,
+                reg(ip::HW_ID_GC, &[gc_version], 0, 0x1703)?,
                 // linux-lit: 0x873=mmMMMC_VM_MX_L1_TLB_CNTL
-                reg(ip::HW_ID_MMHUB, &[(2, 1, 0)], 0, 0x873)?,
+                reg(ip::HW_ID_MMHUB, mmhub_versions, 0, 0x873)?,
             ],
             // linux-lit: 0x12d=mmREMAP_HDP_MEM_FLUSH_CNTL
             nbio: reg(ip::HW_ID_NBIF, &nbif, 2, 0x12d)?,
@@ -610,6 +626,24 @@ impl Gmc {
         pool: &Pool,
     ) -> Result<Self, Error> {
         let layout = Layout::resolve(gpu)?;
+        Ok(Self {
+            engine: Engine::new(Mmio(gpu.regs), authority, layout, pool, gpu.vram.size)?,
+        })
+    }
+    /// Reserve backing for shared discrete RDNA2 VMID0/GART/GPUVM support.
+    /// Exact PCI/GC identity and discovered MMHUB2.1.x, NBIO2.3 and HDP5
+    /// layouts are validated before allocation. Construction performs no I/O.
+    ///
+    /// # Safety
+    /// Same exclusive physical GPU, both hubs, HDP, VRAM and permanent pool
+    /// contract as `new`. Queues/VMs, GFXOFF, hub gating, reset and PM must
+    /// remain inactive. Keep this owner alive while translations can be used.
+    pub unsafe fn new_rdna2(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+    ) -> Result<Self, Error> {
+        let layout = Layout::resolve_rdna2(gpu)?;
         Ok(Self {
             engine: Engine::new(Mmio(gpu.regs), authority, layout, pool, gpu.vram.size)?,
         })

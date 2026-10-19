@@ -11,6 +11,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn soc() -> Soc {
     Soc {
+        dcn_revision: 0,
         dcfclk_khz: 1_200_000,
         fabric_khz: 1_200_000,
         socclk_khz: 1_000_000,
@@ -71,6 +72,7 @@ const VECTORS: &str = include_str!("../tests/navi22_dml30/vectors.txt");
 fn vector_inputs(fields: &[u32]) -> Option<(Soc, Vec<Stream>)> {
     let s = fields.get(..10)?;
     let soc = Soc {
+        dcn_revision: 0,
         dcfclk_khz: s[0],
         fabric_khz: s[0],
         socclk_khz: 1_000_000,

@@ -13,11 +13,14 @@ use narf_capabilities::{Cap, CapError, CapOp, Write};
 // linux: n/a (smu_11_0_7_powerplay_table.smc_pptable at byte 802, probe-verified; header not in checker sets)
 const DRIVER_BYTES: usize = 802;
 pub(crate) const SMC_BYTES: usize = 1668; // linux: sizeof(PPTable_t)
+#[cfg(feature = "kernel-test")]
 const TABLE_BYTES: usize = DRIVER_BYTES + SMC_BYTES;
 // linux: offsetof(PPTable_t, I2cControllers)
+#[cfg(feature = "kernel-test")]
 const BOARD_START: usize = 1344;
 // after BoardReserved[11], before MmHubPadding
 // linux: offsetof(PPTable_t, MmHubPadding)
+#[cfg(feature = "kernel-test")]
 const BOARD_END: usize = 1636;
 // linux: offsetof(PPTable_t, FreqTableGfx)
 const GFX_CLOCKS: usize = 524; // FreqTableGfx[16]
@@ -133,7 +136,8 @@ impl CapOp<BusDeviceCap, Write> for ReadIdentity<'_> {
                 narf_bus::pci::read_config32(cap, self.0, offset).map_err(|_| Error::Authority)
             };
             // linux: n/a (PCI id 1002:73df, pdev->device check in sienna_cichlid_patch_pptable_quirk)
-            if read(0)? != 0x73df_1002 {
+            let pci = read(0)?;
+            if crate::amdgpu_rdna2::for_pci_id(pci as u16, (pci >> 16) as u16).is_none() {
                 return Err(Error::Unsupported);
             }
             let revision = read(8)?;
@@ -173,15 +177,19 @@ pub struct Info {
 /// only this module constructs the image accepted by the SMU upload path.
 #[derive(Debug)]
 pub struct Prepared {
+    pub(crate) profile: &'static crate::amdgpu_rdna2::Profile,
     bytes: Vec<u8>,
     info: Info,
 }
 impl Prepared {
     pub fn new(vbios: &Vbios, firmware: &smu::Firmware, identity: Identity) -> Result<Self, Error> {
-        prepare(
+        let profile = firmware.profile();
+        let image = firmware.image().map_err(Error::Firmware)?;
+        prepare_for(
             vbios.bytes(),
-            firmware.image().map_err(Error::Firmware)?.powerplay(),
+            |id| image.powerplay_for(id),
             identity,
+            profile,
         )
     }
     pub fn bytes(&self) -> &[u8] {
@@ -207,13 +215,35 @@ fn u16_at(bytes: &[u8], offset: usize) -> u16 {
 fn u32_at(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
+#[cfg(feature = "kernel-test")]
 fn validate_table(table: &[u8]) -> Result<(), Error> {
+    validate_table_for(table, &crate::amdgpu_rdna2::NAVI22)
+}
+fn validate_table_for(table: &[u8], profile: &crate::amdgpu_rdna2::Profile) -> Result<(), Error> {
+    let layout = profile
+        .power_table_layout(
+            table
+                .len()
+                .checked_sub(DRIVER_BYTES)
+                .ok_or(Error::Invalid)?,
+        )
+        .ok_or(Error::Unsupported)?;
+    let (revision, format, bytes) = (layout.format_revision, layout.format_id, layout.smc_bytes);
     // linux-lit: 0=offsetof(struct atom_common_table_header, structuresize)
-    if table.len() != TABLE_BYTES || usize::from(u16_at(table, 0)) != TABLE_BYTES {
+    if table.len() != DRIVER_BYTES + bytes || usize::from(u16_at(table, 0)) != DRIVER_BYTES + bytes
+    {
         return Err(Error::Invalid);
     }
+    let smc_version = u32_at(table, DRIVER_BYTES);
+    let known_version = match profile.asic {
+        "navi21" => matches!(smc_version, 1 | 7),
+        "navi22" => smc_version == 1,
+        "navi23" => smc_version == 6,
+        "navi24" => smc_version == 3,
+        _ => false,
+    };
     // linux: n/a (smu_11_0_7_powerplay_table: format_revision @2, table_size @5, format_id @15, probe-verified)
-    if table[2..5] != [16, 0, 2] || u16_at(table, 15) != 0x81 || u32_at(table, DRIVER_BYTES) != 1 {
+    if table[2..5] != [revision, 0, 2] || u16_at(table, 15) != format || !known_version {
         return Err(Error::Unsupported);
     }
     // linux: n/a (smu_11_0_7_powerplay_table.table_size at byte 5, probe-verified; header not in checker sets)
@@ -222,10 +252,24 @@ fn validate_table(table: &[u8]) -> Result<(), Error> {
     }
     Ok(())
 }
+#[cfg(feature = "kernel-test")]
 fn prepare(
     vbios: &[u8],
     firmware_table: Option<&[u8]>,
     identity: Identity,
+) -> Result<Prepared, Error> {
+    prepare_for(
+        vbios,
+        |_| firmware_table,
+        identity,
+        &crate::amdgpu_rdna2::NAVI22,
+    )
+}
+fn prepare_for<'a>(
+    vbios: &[u8],
+    firmware_table: impl FnOnce(u32) -> Option<&'a [u8]>,
+    identity: Identity,
+    profile: &'static crate::amdgpu_rdna2::Profile,
 ) -> Result<Prepared, Error> {
     let header = atombios::header::parse_rom_header(vbios).map_err(|_| Error::Invalid)?;
     let tables =
@@ -255,10 +299,10 @@ fn prepare(
     } else {
         (
             Source::SmcFirmware,
-            firmware_table.ok_or(Error::MissingTable)?,
+            firmware_table(table_id).ok_or(Error::MissingTable)?,
         )
     };
-    validate_table(table)?;
+    validate_table_for(table, profile)?;
     // linux-lit: 2=offsetof(struct atom_master_list_of_data_tables_v2_1, smc_dpm_info) / 2
     let board = tables.table_slice(2).ok_or(Error::MissingTable)?;
     // linux-lit: 296=sizeof(struct atom_smc_dpm_info_v4_9)
@@ -270,16 +314,21 @@ fn prepare(
     }
     let mut bytes = Vec::new();
     bytes
-        .try_reserve_exact(SMC_BYTES)
+        .try_reserve_exact(table.len() - DRIVER_BYTES)
         .map_err(|_| Error::Allocation)?;
     bytes.extend_from_slice(&table[DRIVER_BYTES..]);
     // Linux smu_memcpy_trailing: all 292 board bytes, including the repurposed
     // tail for UMC flags / UCLK spread percentages. Keep GamingClk and the
     // final 32 bytes of SMU-private MmHubPadding from the selected SKU table.
+    let layout = profile
+        .power_table_layout(bytes.len())
+        .ok_or(Error::Unsupported)?;
+    let (board_start, board_end) = (layout.board_start, layout.board_end);
     // linux-lit: 4=offsetof(struct atom_smc_dpm_info_v4_9, I2cControllers)
-    bytes[BOARD_START..BOARD_END].copy_from_slice(&board[4..]);
+    bytes[board_start..board_end].copy_from_slice(&board[4..]);
     // linux: n/a (literal revision 0xC3 / vendor 0x1043 in sienna_cichlid_ppt.c:sienna_cichlid_patch_pptable_quirk)
-    let oem_quirk = identity.revision == 0xc3
+    let oem_quirk = profile == &crate::amdgpu_rdna2::NAVI22
+        && identity.revision == 0xc3
         && identity.subsystem_vendor == 0x1043
         && matches!(identity.subsystem_device, 0x16c2 | 0x133c);
     if oem_quirk {
@@ -295,6 +344,7 @@ fn prepare(
         }
     }
     Ok(Prepared {
+        profile,
         bytes,
         info: Info {
             source,

@@ -384,6 +384,7 @@ fn navi22_dal_checks_all_six_streams_and_constructor_bounds() -> TestResult {
         }),
         mp1: 0,
         dcn: 0,
+        pipes: 6,
     };
     for pipe in 0..6 {
         for (reg, bit) in [

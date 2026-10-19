@@ -879,6 +879,53 @@ per HBA and sets GHC.IE only after the IRQ route; host-install xtask media
 default to `narf.disks=boot-only`; DMUB-routed retrain/unplug tables, a non-IRQ
 DMUB route lock, a TABLE_MS cap, same-EDID HPD long pulses keep the stream.
 
+RX 6000 family expansion has begun: shared Navi21/22/23/24 profiles inventory
+40 exact Linux PCI IDs and chip-specific firmware names. The Navi22 loaders
+share this inventory. Additional IDs are identified and registered, but native
+probe is deliberately refused before device writes; their boot, display,
+rendering, media and power paths still require implementation and hardware
+validation. The existing `1002:73df` startup gate is unchanged.
+PSP11 secure-OS bootstrap now accepts each profile's exact PCI/GC/MP0 tuple
+and retains chip identity to refuse cross-ASIC containers before loading.
+Shared graphics firmware preparation validates GC/MP1/SDMA/VCN/DCN versions
+and selects each ASIC's files without device I/O; the native Navi22 uploader
+refuses sibling sets. Linux conformance includes IP selections, and installed
+Navi21/22/23/24 SOS/SMC/graphics/VCN/DMUB containers pass the structural parsers.
+Shared RDNA2 GPCOM/TMR APIs now resolve each profile's exact IP banks and
+retain ASIC identity through SOS, SMC and graphics upload. SMC preparation is
+shared; upload follows TOC reservation → PMFW → SETUP_TMR → graphics/autoload.
+The GMC/CP/RLC register layout is checked from compiled values against Linux.
+Runtime board power policy, queue initialization and display remain
+separate; full native startup for the additional cards remains gated and
+unvalidated.
+Shared RDNA2 GMC initialization now accepts exact per-ASIC GC identities with
+compatible discovered MMHUB2.1.x/NBIO2.3/HDP5 layouts. It reuses the VMID0,
+GART and per-client GPUVM state machines while preserving the native Navi22
+gate. Family conformance checks every compiled GFXHUB/MMHUB register field
+and base index against Linux. Models exercise per-client translation and
+unmapping through each supported resolved layout; silicon validation remains
+outstanding.
+SDMA0 now has a shared RDNA2 constructor with exact GC/SDMA identity checks
+and the same bounded translated write/copy/fence proof. Its register bank
+stays GC-relative, and its native Navi22 gate is unchanged. Models cover
+4/8/12/16 GiB and 12272 MiB physical VRAM sizes with stale FB_LOCATION_TOP;
+user queues and additional SDMA instances are not enabled by this proof.
+Graphics and KIQ/compute constructors now resolve all four discrete RDNA2
+profiles. Graphics startup selects the exact per-ASIC golden register sequence
+(43/42/36/32 rows for Navi21/22/23/24), checked against Linux as compiled data.
+Per-profile models cover masked writes, graphics and compute ring/IB proofs,
+revocation and replay rejection. Native probing for additional devices remains
+gated pending interrupt, power, display and silicon validation.
+The shared interrupt-ring constructor now validates each discrete RDNA2
+PCI/GC identity and discovered OSSSYS 5.0.0–5.0.3 backend before allocation.
+Self-IV timeout programming follows Linux's 5.0.3 threshold; earlier revisions
+skip those registers. RB0 dispatch and disable models cover all four ASICs,
+all compatible controller revisions and MSI/polling register modes. Engine
+IRQ arming and native orchestration remain separate work.
+
+
+
+
 Current main includes discrete PCIe probe support
 for RX 6750 XT / Navi 22: bounded discovery reads beyond BAR0, separate total
 and CPU-visible VRAM sizes, Resizable BAR-independent APU identity, and the

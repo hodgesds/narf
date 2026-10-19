@@ -220,7 +220,7 @@ impl<I: Io> Engine<I> {
         let ttu = &registers.ttu;
         self.update(
             HUBPRET_CONTROL,
-            (if self.profile == Profile::Navi22 {
+            (if self.profile.is_dcn30() {
                 // linux-lit: 0xfff=HUBPRET0_HUBPRET_CONTROL__DET_BUF_PLANE1_BASE_ADDRESS_MASK
                 0x00000fff
             } else {

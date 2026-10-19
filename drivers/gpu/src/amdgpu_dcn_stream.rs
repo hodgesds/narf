@@ -302,7 +302,7 @@ impl<I: Io> Engine<I> {
             }
             delay_us(1000).await;
         }
-        if self.profile == Profile::Navi22 {
+        if self.profile.is_dcn30() {
             // enc2_stream_encoder_dp_unblank also resets the DIG frontend.
             // linux-lit: 0x208b=mmDIG0_DIG_FE_CNTL; 10=DIG0_DIG_FE_CNTL__DIG_START__SHIFT
             self.update(0x208b, 1 << 10, 1 << 10)?; // DIG_FE_CNTL.DIG_START

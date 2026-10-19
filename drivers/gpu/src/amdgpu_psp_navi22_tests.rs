@@ -846,3 +846,169 @@ kernel_test_in!(
     "drivers/gpu/gddr6",
     gddr6_navi48_constructor_keeps_vram_unmodified
 );
+
+fn rdna2_gpu(regs: &mut [u32], profile: &crate::amdgpu_rdna2::Profile, did: u16) -> AmdGpu {
+    let mut gpu = self::gpu(regs);
+    gpu.chip = crate::amdgpu::__test_chip_info_for_pci_id(0x1002, did).unwrap();
+    for (index, version) in [
+        (0, profile.psp_version),
+        (3, profile.gc_version),
+        (4, profile.psp_version),
+        (5, profile.sdma_version),
+    ] {
+        let ip = &mut gpu.ip_blocks[index];
+        (ip.major, ip.minor, ip.revision) = version;
+    }
+    regs[0x2000 + 0x16fc] = 0x800;
+    regs[0x2000 + 0x16fd] = 0xaff;
+    regs[0x2000 + 0x16e7] = 0x100;
+    gpu
+}
+
+fn rdna2_psp_constructor_resolves_every_asic_without_writes() -> TestResult {
+    for profile in crate::amdgpu_rdna2::PROFILES {
+        let mut regs = vec![0; 0x80000 / 4];
+        for &did in profile.pci_ids {
+            let gpu = rdna2_gpu(&mut regs, profile, did);
+            let (pool, s) = session();
+            drop(s);
+            let before = regs.clone();
+            // SAFETY: register reads are backed by regs; no device memory is published.
+            let psp = unsafe { Psp::new_rdna2(&gpu, Cap::bootstrap(), &pool) }.unwrap();
+            let io = &psp.session.engine.io;
+            if psp.kind.rdna2_profile() != Some(profile)
+                || io.mp0 != 0x40000
+                || io.nbio != 0x3480
+                || io.invalidate_reg != Some(0x2f44)
+                || io.gfx_status_regs != Some(((0x2000 + 0xf40) * 4, (0x4000 + 0x4e8d) * 4))
+                || psp.fb_location() != (0x8_0000_0000, 0x1_0000_0000)
+                || !psp.session.engine.lenient
+                || regs != before
+            {
+                return TestResult::Fail(
+                    "RDNA2 PSP resolved wrong registers or wrote during construction",
+                );
+            }
+            drop(psp);
+            let authority = Cap::bootstrap();
+            authority.revoke();
+            // SAFETY: revoked authority prevents even construction-time register reads.
+            if unsafe { Psp::new_rdna2(&gpu, authority, &pool) }.err() != Some(Error::Revoked) {
+                return TestResult::Fail(
+                    "RDNA2 PSP pool validation bypassed capability revocation",
+                );
+            }
+        }
+        let gpu = rdna2_gpu(&mut regs, profile, profile.pci_ids[0]);
+        for block in 0..gpu.ip_blocks.len() {
+            for change in 0..4 {
+                let mut bad = rdna2_gpu(&mut regs, profile, profile.pci_ids[0]);
+                match change {
+                    0 => bad.ip_blocks[block].major = 0xff,
+                    1 => bad.ip_blocks.push(bad.ip_blocks[block]),
+                    2 => bad.ip_blocks[block].num_bases = 0,
+                    _ => {
+                        bad.ip_blocks.remove(block);
+                    }
+                }
+                if Layout::resolve(&bad, Kind::Rdna2(profile)).is_ok() {
+                    return TestResult::Fail("RDNA2 PSP accepted missing/duplicate/foreign bank");
+                }
+            }
+        }
+        for other in crate::amdgpu_rdna2::PROFILES {
+            if other != profile && Layout::resolve(&gpu, Kind::Rdna2(other)).is_ok() {
+                return TestResult::Fail("RDNA2 ring accepted another ASIC's layout");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_psp_constructor_resolves_every_asic_without_writes
+);
+
+fn rdna2_psp_rejects_cross_chip_sos_smc_and_graphics_before_submission() -> TestResult {
+    for profile in crate::amdgpu_rdna2::PROFILES {
+        let mut regs = vec![0; 0x80000 / 4];
+        let gpu = rdna2_gpu(&mut regs, profile, profile.pci_ids[0]);
+        let (pool, s) = session();
+        drop(s);
+        // SAFETY: inert register storage; tested entry points reject before device writes.
+        let mut psp = unsafe { Psp::new_rdna2(&gpu, Cap::bootstrap(), &pool) }.unwrap();
+        let before = regs.clone();
+        let free = pool.available();
+        for other in crate::amdgpu_rdna2::PROFILES {
+            let sos = crate::amdgpu_psp_boot::tests::firmware_for(other);
+            let smc = crate::amdgpu_smu_navi22::tests::firmware_for(other);
+            let gfx = crate::amdgpu_gfx_navi22::tests::fixture_for(other);
+            // A matching target reaches the still-unstarted session and gets Busy;
+            // a sibling must be refused before that state machine or any allocation.
+            let expected = if profile == other {
+                Error::Busy
+            } else {
+                Error::Unsupported
+            };
+            if run(psp.setup_tmr_rdna2(&sos)) != Err(expected)
+                || run(psp.load_smc_rdna2(&smc)) != Err(expected)
+                || run(psp.load_gfx_rdna2(&gfx)) != Err(expected)
+                || regs != before
+                || pool.available() != free
+                || psp.state() != State::Prepared
+            {
+                return TestResult::Fail(
+                    "RDNA2 firmware crossed targets or mutated unstarted session",
+                );
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_psp_rejects_cross_chip_sos_smc_and_graphics_before_submission
+);
+
+fn rdna2_psp_tmr_smc_graphics_lifecycle_follows_linux_order() -> TestResult {
+    for profile in crate::amdgpu_rdna2::PROFILES {
+        let (pool, mut s) = session();
+        s.engine.lenient = Kind::Rdna2(profile).rdna2_profile().is_some();
+        run(s.engine.start()).unwrap();
+        let sos = crate::amdgpu_psp_boot::tests::firmware_for(profile);
+        let smc = crate::amdgpu_smu_navi22::tests::firmware_for(profile);
+        let gfx = crate::amdgpu_gfx_navi22::tests::fixture_for(profile);
+        run(s.init_tmr(sos.image().unwrap().toc())).unwrap();
+        if s.tmr_ready || s.tmr.is_none() {
+            return TestResult::Fail("RDNA2 installed TMR before PMFW upload");
+        }
+        run(s.load_smc_centralized(smc.image().unwrap().payload())).unwrap();
+        if !s.tmr_ready || s.smc_state != SmcState::Loaded {
+            return TestResult::Fail("RDNA2 PMFW upload did not install TMR");
+        }
+        run(s.load_gfx(&gfx.images().unwrap())).unwrap();
+        let cmds = &s.engine.io.submissions;
+        if cmds.len() < 4
+            || cmds[0][2] != 0x20
+            || cmds[1][2] != 6
+            || cmds[1][10] != 18
+            || cmds[2][2] != 5
+            || !cmds[3..].iter().any(|c| c[2] == 0x21)
+            || s.gfx_state != GfxLoadState::Accepted
+            || s.engine.io.violation
+        {
+            return TestResult::Fail("RDNA2 violated TOC/PMFW/TMR/autoload or coherency order");
+        }
+        // SAFETY: model engines have no real firmware consumers.
+        unsafe { run(s.stop()) }.unwrap();
+        drop(s);
+        if pool.available() != 16 << 20 {
+            return TestResult::Fail("RDNA2 verified shutdown retained pool memory");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_psp_tmr_smc_graphics_lifecycle_follows_linux_order
+);

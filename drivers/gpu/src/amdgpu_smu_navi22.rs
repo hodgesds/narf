@@ -172,16 +172,17 @@ pub(crate) fn mp1_bank(gpu: &AmdGpu) -> Result<u64, Error> {
 /// constructor is exposed to callers of the hardware loader.
 #[derive(Debug)]
 pub struct Firmware {
+    profile: &'static crate::amdgpu_rdna2::Profile,
     bytes: Vec<u8>,
 }
-struct Open;
+struct Open(&'static crate::amdgpu_rdna2::Profile);
 impl CapOp<narf_firmware::FirmwareRegistry, Read> for Open {
     type Output = Result<Vec<u8>, Error>;
     fn execute(
         self,
         cap: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self::Output, CapError> {
-        let blob = match narf_firmware::open(firmware::NAVI22_SMC, cap) {
+        let blob = match narf_firmware::open(self.0.firmware.smc, cap) {
             Ok(blob) => blob,
             Err(error) => return Ok(Err(Error::Registry(error))),
         };
@@ -213,9 +214,32 @@ impl Firmware {
         authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self, Error> {
         mp1_bank(gpu)?;
+        Self::open_rdna2(gpu, authority)
+    }
+    /// Prepare this discrete RDNA2 ASIC's SMC container without device I/O.
+    /// Runtime power/table policy remains specific to the native chip backend.
+    pub fn open_rdna2(
+        gpu: &AmdGpu,
+        authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
+    ) -> Result<Self, Error> {
+        let profile = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did)
+            .ok_or(Error::Unsupported)?;
+        for (id, version, last) in [
+            (discovery::HW_ID_GC, profile.gc_version, 0),
+            (discovery::HW_ID_MP1, profile.psp_version, RESPONSE),
+        ] {
+            crate::amdgpu_psp_ring::bank(gpu, id, &[version], 0, last)
+                .map_err(|_| Error::Unsupported)?;
+        }
         Ok(Self {
-            bytes: authority.invoke(Open).map_err(|_| Error::Revoked)??,
+            profile,
+            bytes: authority
+                .invoke(Open(profile))
+                .map_err(|_| Error::Revoked)??,
         })
+    }
+    pub fn profile(&self) -> &'static crate::amdgpu_rdna2::Profile {
+        self.profile
     }
     pub fn image(&self) -> Result<firmware::Image<'_>, Error> {
         firmware::Image::parse(&self.bytes).map_err(Error::Image)
@@ -599,7 +623,7 @@ impl<I: Io> Engine<I> {
         if self.state != State::Ready {
             return Err(Error::Busy);
         }
-        if bytes.len() != crate::amdgpu_power_navi22::SMC_BYTES {
+        if ![crate::amdgpu_power_navi22::SMC_BYTES, 1700, 1888].contains(&bytes.len()) {
             return Err(Error::Invalid);
         }
         let mut memory = pool
@@ -967,6 +991,7 @@ impl InterruptAck {
 }
 #[derive(Debug)]
 pub struct Smu {
+    profile: &'static crate::amdgpu_rdna2::Profile,
     engine: Engine<Mmio>,
 }
 impl Smu {
@@ -986,12 +1011,35 @@ impl Smu {
         gpu: &AmdGpu,
         authority: Cap<BusDeviceCap, Write>,
     ) -> Result<Self, Error> {
-        let base = mp1_bank(gpu)?;
+        mp1_bank(gpu)?;
+        // SAFETY: forwarded exclusive post-upload GPU ownership contract.
+        unsafe { Self::after_upload_rdna2(gpu, authority) }
+    }
+    /// Claim the common Sienna Cichlid SMU mailbox after profile-matched upload.
+    /// # Safety
+    /// Same exclusive physical GPU/MP1/reset contract as `after_upload`; this
+    /// cold boot must have loaded this profile's PMFW and matching board table.
+    pub unsafe fn after_upload_rdna2(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+    ) -> Result<Self, Error> {
+        let profile = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did)
+            .ok_or(Error::Unsupported)?;
+        crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_GC, &[profile.gc_version], 0, 0)
+            .map_err(|_| Error::Unsupported)?;
+        let base = crate::amdgpu_psp_ring::bank(
+            gpu,
+            discovery::HW_ID_MP1,
+            &[profile.psp_version],
+            0,
+            RESPONSE,
+        )
+        .map_err(|_| Error::Unsupported)?;
         // The alert registers extend the same MP1 window past RESPONSE.
         crate::amdgpu_psp_ring::bank(
             gpu,
             discovery::HW_ID_MP1,
-            &[(11, 0, 11)],
+            &[profile.psp_version],
             0,
             MP1_SW_INT_CTRL,
         )
@@ -1009,6 +1057,7 @@ impl Smu {
             (3, 3, 3),
         ];
         Ok(Self {
+            profile,
             engine: Engine {
                 io: Mmio {
                     regs: gpu.regs,
@@ -1076,6 +1125,9 @@ impl Smu {
         table: &crate::amdgpu_power_navi22::Prepared,
         pool: &crate::amdgpu_vram::Pool,
     ) -> Result<(), Error> {
+        if table.profile != self.profile {
+            return Err(Error::Unsupported);
+        }
         let policy = table.boot_policy().map_err(|_| Error::Unsupported)?;
         let info = table.info();
         self.engine.upload(table.bytes(), pool).await?;

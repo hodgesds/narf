@@ -186,7 +186,8 @@ fn navi22_submit_compute_and_sdma_user_vmid_ibs_execute() -> TestResult {
         queues: [
             Queue::new(&vram2, Kind::Sdma, doorbell::SDMA0, fence::Engine::Sdma0).unwrap(),
             Queue::new(&vram2, Kind::Sdma, doorbell::SDMA1, fence::Engine::Sdma1).unwrap(),
-        ],
+        ]
+        .into(),
         state: crate::amdgpu_sdma_navi22_queues::State::Prepared,
         proof: Default::default(),
     };
@@ -705,7 +706,8 @@ fn navi22_vmid_clients_on_two_rings_keep_their_own_translations() -> TestResult 
         queues: [
             Queue::new(&vram, Kind::Sdma, doorbell::SDMA0, fence::Engine::Sdma0).unwrap(),
             Queue::new(&vram, Kind::Sdma, doorbell::SDMA1, fence::Engine::Sdma1).unwrap(),
-        ],
+        ]
+        .into(),
         state: crate::amdgpu_sdma_navi22_queues::State::Prepared,
         proof: Default::default(),
     };

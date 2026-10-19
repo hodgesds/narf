@@ -484,6 +484,7 @@ pub(crate) struct Engine<I: Io> {
     base: u64,
     base1: u64,
     state: State,
+    lines: u8,
     /// Per-line `polling_timeout_period`, in microseconds.
     poll_us: [u32; LINES as usize],
     /// I2C transaction bookkeeping (`dce_i2c_hw`).
@@ -507,6 +508,7 @@ impl<I: Io> Engine<I> {
             base,
             base1,
             state: State::Ready,
+            lines: LINES,
             poll_us: [DEFAULT_POLL_US; LINES as usize],
             transactions: 0,
             used_bytes: 0,
@@ -519,7 +521,7 @@ impl<I: Io> Engine<I> {
             return Err(Error::Busy);
         }
         // linux: n/a (NARF bound: six DDC lines)
-        if line >= LINES {
+        if line >= self.lines {
             return Err(Error::Invalid);
         }
         Ok(())
@@ -1538,13 +1540,14 @@ impl Ddc {
         authority: Cap<BusDeviceCap, Write>,
         crystal_khz: u32,
     ) -> Result<Self, Error> {
-        if Profile::resolve(gpu).map_err(|_| Error::Unsupported)? != Profile::Navi22 {
+        let profile = Profile::resolve(gpu).map_err(|_| Error::Unsupported)?;
+        if !profile.is_dcn30() {
             return Err(Error::Unsupported);
         }
-        let base = Profile::Navi22
+        let base = profile
             .bank(gpu, 2, LAST_REG) // linux-lit: 2=mmDC_I2C_CONTROL_BASE_IDX
             .map_err(|_| Error::Unsupported)?;
-        let base1 = Profile::Navi22
+        let base1 = profile
             // linux-lit: 1=mmMICROSECOND_TIME_BASE_DIV_BASE_IDX
             .bank(gpu, 1, MICROSECOND_TIME_BASE_DIV as u32)
             .map_err(|_| Error::Unsupported)?;
@@ -1557,6 +1560,7 @@ impl Ddc {
             base1 / 4,
         );
         engine.crystal_khz = crystal_khz;
+        engine.lines = profile.channels();
         Ok(Self(engine))
     }
     pub fn state(&self) -> State {
@@ -1631,7 +1635,7 @@ pub(crate) fn bind<I: Io>(
     signal: Signal,
 ) -> Result<bool, Error> {
     engine.check(line)?;
-    if hpd.is_some_and(|h| h >= LINES) {
+    if hpd.is_some_and(|h| h >= engine.lines) {
         return Err(Error::Invalid);
     }
     // HPD_SOURCEID_UNKNOWN would leave AUX_HPD_SEL pointing at another pin.
