@@ -2,7 +2,8 @@
 //! WRITE_DATA and native EOP-interrupt proofs, then client jobs on either
 //! queue: each a VM flush for the client's VMID, its IBs and a fence
 //! (`submit`). A hung compute queue can be reset by MMIO and restored for
-//! MES to map again (`reset_compute_hqd`, `restore`). No draws or shaders.
+//! MES to map again (`reset_compute_hqd`, `restore`). An explicit wave32 shader
+//! proof runs on the same owned aperture before client submissions.
 use crate::{
     amdgpu::AmdGpu,
     amdgpu_discovery as ip, amdgpu_gmc_navi48 as gmc, amdgpu_mes12 as api, amdgpu_mes12_hw as mes,
@@ -81,6 +82,7 @@ pub enum Error {
     DataMismatch,
     Mes(mes::Error),
     Interrupts(crate::amdgpu_ih7::Error),
+    Gmc(gmc::Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -90,6 +92,8 @@ pub enum State {
     Verified,
     InterruptSubmitted(u8),
     InterruptVerified,
+    /// Code publication or shader dispatch; cancellation keeps both queues shut.
+    ShaderSubmitted(u8),
     /// A dropped recovery keeps both queues quarantined.
     ResettingCompute,
     /// The HQD reset completed; MES must unmap it before `restore`.
@@ -477,6 +481,8 @@ struct Engine<I: Io> {
     job_wptr: [u64; 2],
     /// The last job sequence submitted on each pipe's ring.
     job_seq: [u32; 2],
+    shader_engines: u8,
+    shader_result: Option<Result<crate::amdgpu_gfx12_shader::Proof, Error>>,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> Result<T, Error>) -> Result<T, Error> {
@@ -750,6 +756,13 @@ impl<I: Io> Engine<I> {
         if self.state != State::InterruptVerified {
             return Err(Error::Busy);
         }
+        self.publish_slot(pipe, build)
+    }
+    fn publish_slot(
+        &mut self,
+        pipe: Pipe,
+        build: impl FnOnce(u64, u32) -> Result<[u32; 256], Error>,
+    ) -> Result<u32, Error> {
         let l = self.layout;
         let map = self.memory.mapping();
         let db = self.doorbells;
@@ -780,6 +793,147 @@ impl<I: Io> Engine<I> {
         self.job_wptr[i] = wptr + JOB_DWORDS;
         self.job_seq[i] = seq;
         Ok(seq)
+    }
+    async fn prove_shaders(
+        &mut self,
+        observer: &mut impl Observer,
+        prepare: impl core::future::Future<Output = Result<(gmc::Aperture, MmioRegion), gmc::Error>>,
+    ) -> Result<crate::amdgpu_gfx12_shader::Proof, Error> {
+        if self.state != State::InterruptVerified
+            || self.shader_result.is_some()
+            || self.job_seq != [0; 2]
+            || self.job_wptr != [512; 2]
+        {
+            return Err(Error::Busy);
+        }
+        let l = self.layout;
+        let map = self.memory.mapping();
+        // Reject outstanding/foreign ring progress before changing any PTE.
+        self.access(|io| {
+            flush(io, l);
+            for pipe in 0..2 {
+                if io.memory_read(map, pipe * PIPE_BYTES + RPTR) != 512 {
+                    return Err(Error::Busy);
+                }
+            }
+            Ok(())
+        })?;
+        self.state = State::ShaderSubmitted(0);
+        let result = async {
+            let (aperture, target) = prepare.await.map_err(Error::Gmc)?;
+            self.shader_inner(observer, aperture, target).await
+        }
+        .await;
+        self.shader_result = Some(result);
+        self.state = match result {
+            Ok(_) => State::InterruptVerified,
+            Err(e) => State::Failed(e),
+        };
+        result
+    }
+    async fn shader_inner(
+        &mut self,
+        observer: &mut impl Observer,
+        aperture: gmc::Aperture,
+        target: MmioRegion,
+    ) -> Result<crate::amdgpu_gfx12_shader::Proof, Error> {
+        use crate::amdgpu_gfx12_shader as shader;
+        if aperture.start >= (1 << 48) - (2 << 20)
+            || aperture.start % (2 << 20) != 0
+            || aperture.source != aperture.start
+            || aperture.destination != aperture.start + 4096
+            || aperture.size != 2 << 20
+            || target.len != 8192
+        {
+            return Err(Error::Invalid);
+        }
+        let l = self.layout;
+        let ring_map = self.memory.mapping();
+        let mut proof = shader::Proof {
+            lanes: shader::LANES,
+            fences: [0; 2],
+            msi_verified: true,
+        };
+        for (pipe, kind) in [Pipe::Graphics, Pipe::Compute].into_iter().enumerate() {
+            self.state = State::ShaderSubmitted(pipe as u8);
+            let sample = observer
+                .sample(if pipe == 0 {
+                    Source::Graphics
+                } else {
+                    Source::Compute
+                })
+                .await
+                .map_err(Error::Interrupts)?;
+            proof.msi_verified &= sample.vector.is_some();
+            let ib = shader::ib(
+                aperture.source,
+                aperture.source + shader::OUTPUT_OFFSET,
+                self.shader_engines,
+                shader::SALTS[pipe],
+            )?;
+            self.access(|io| {
+                for at in (0..8192).step_by(4) {
+                    let fill = if at < shader::IB_OFFSET {
+                        0xbfb0_0000
+                    } else {
+                        shader::POISON
+                    };
+                    io.memory_write(target, at, fill);
+                }
+                for (i, word) in shader::PROGRAM.into_iter().enumerate() {
+                    io.memory_write(target, i as u64 * 4, word);
+                }
+                for (i, word) in ib.into_iter().enumerate() {
+                    io.memory_write(target, shader::IB_OFFSET + i as u64 * 4, word);
+                }
+                flush(io, l);
+                Ok(())
+            })?;
+            let seq = self.publish_slot(kind, |fence, seq| {
+                shader::ring(aperture.source + shader::IB_OFFSET, fence, seq, pipe == 0)
+            })?;
+            proof.fences[pipe] = seq;
+            let deadline = narf_time::Deadline::after_us(2_100_000);
+            let tail = self.job_wptr[pipe];
+            loop {
+                let done = self.access(|io| {
+                    flush(io, l);
+                    let base = pipe as u64 * PIPE_BYTES;
+                    let rptr = io.memory_read(ring_map, base + RPTR);
+                    if u64::from(rptr) > tail {
+                        return Err(Error::DataMismatch);
+                    }
+                    if u64::from(rptr) != tail || io.memory_read(ring_map, base + JOB_FENCE) != seq
+                    {
+                        return Ok(false);
+                    }
+                    for i in 0..1024u64 {
+                        let at = 4096 + i * 4;
+                        let expected = if (shader::OUTPUT_OFFSET
+                            ..shader::OUTPUT_OFFSET + u64::from(shader::LANES) * 4)
+                            .contains(&at)
+                        {
+                            shader::expected(((at - shader::OUTPUT_OFFSET) / 4) as u32, pipe)
+                        } else {
+                            shader::POISON
+                        };
+                        if io.memory_read(target, at) != expected {
+                            return Err(Error::DataMismatch);
+                        }
+                    }
+                    Ok(true)
+                })?;
+                let event = observer.observed(sample).await.map_err(Error::Interrupts)?;
+                if done && event {
+                    break;
+                }
+                if deadline.expired() {
+                    return Err(Error::Timeout);
+                }
+                self.io.delay().await;
+            }
+        }
+        Ok(proof)
     }
     /// mes_v12_0_reset_queue_mmio for the compute queue: with it selected,
     /// a reset dequeue (CP_HQD_DEQUEUE_REQUEST 2) and SPI's compute queue
@@ -997,6 +1151,13 @@ impl Queues {
             // The proofs leave both rings at 512 dwords.
             job_wptr: [512; 2],
             job_seq: [0; 2],
+            shader_engines: gpu
+                .gc_info
+                .ok_or(Error::Unsupported)?
+                .num_se
+                .try_into()
+                .map_err(|_| Error::Invalid)?,
+            shader_result: None,
         }))
     }
     /// # Safety
@@ -1028,6 +1189,30 @@ impl Queues {
         self.0
             .prove_interrupts(&mut NativeObserver, aperture, map)
             .await
+    }
+    /// Run the wave32 shader on each idle kernel queue, only before client
+    /// work. A fresh EOP, drained ring, fence, all lane values and guard words
+    /// must agree. This is execution evidence only, not acceleration readiness.
+    /// # Safety
+    /// Own both queues, SDMA and GMC test pages exclusively; CPU IRQs and the
+    /// independent IH service must run. Retain owners after failure/cancellation.
+    pub async unsafe fn prove_shaders(
+        &mut self,
+        gmc: &mut gmc::Gmc,
+    ) -> Result<crate::amdgpu_gfx12_shader::Proof, Error> {
+        self.0
+            .prove_shaders(&mut NativeObserver, async {
+                // SAFETY: caller holds every test-page/queue user and reset/PM owner.
+                unsafe { gmc.prepare_shader_test().await }?;
+                Ok((
+                    gmc.aperture().ok_or(gmc::Error::Invalid)?,
+                    gmc.test_mapping().ok_or(gmc::Error::Invalid)?,
+                ))
+            })
+            .await
+    }
+    pub fn shader_result(&self) -> Option<Result<crate::amdgpu_gfx12_shader::Proof, Error>> {
+        self.0.shader_result
     }
     pub fn interrupt_result(&self) -> Option<Result<InterruptProof, Error>> {
         self.0.interrupt_result

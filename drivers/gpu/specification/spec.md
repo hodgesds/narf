@@ -2691,11 +2691,45 @@ failure retains `Failed` and its error, and neither permits replay. Success
 records `InterruptVerified`. `interrupt_result` and the original write proof
 remain separate, so the latter cannot imply interrupt delivery.
 
+`unsafe Queues::prove_shaders(gmc).await` optionally follows both GC12 and
+SDMA interrupt proofs, before any client work. It requires both GC12 rings
+drained at 512 dwords and exclusive ownership of the two GMC test pages and
+every queue using them. It promotes only the owned source page's VMID0 PTE
+to executable, flushes HDP and waits for the GFXhub TLB acknowledgement;
+the destination and all unowned PTEs keep their permissions. Cancellation
+during this preparation retains GMC `PreparingShader`, which is not ready
+for VMID0 use; a returned error retains `Failed`.
+
+The generated IB programs GC12 logical SH resource registers and dispatches
+one wave32 threadgroup, first on graphics and then on compute, under VMID0.
+The fixed gfx1201 shader stores a queue-specific salt XOR each lane's byte
+offset to 32 output words. Code and IB occupy the first owned page; output
+and poison guards occupy the second. There are no caller-supplied shader
+bytes, resource addresses, LDS or scratch. Each submission invalidates shader
+caches and uses the real job fence sequence. Success requires all lane values,
+every guard word in the output page, the exact fresh fence, full RPTR drain
+and a fresh matching EOP (plus CPU delivery for configured MSI), within
+2.1 seconds. The two sequences continue into subsequent client jobs.
+`amdgpu_gfx12_shader::Proof` and `shader_result()` retain this evidence
+separately from command-transport and interrupt proofs. Once preparation starts,
+cancellation retains `ShaderSubmitted(pipe)`; failure retains `Failed(error)`.
+Both block further submissions and proof replay and quarantine backing. Successful proof returns
+to `InterruptVerified` and cannot be repeated. Independent LLVM assembly and
+Linux-header checks live in `drivers/gpu/tests/gfx12_shader/check.sh`;
+software execution models cannot establish physical shader correctness.
+
 The platform schedules this second proof as an executor task after boot,
 because framebuffer initialization may run with CPU IRQs masked. The proof
 refuses MSI submission if IRQs are still masked. Diagnostics expose
 `queue_state` and `queue_interrupts` separately from the historical cold-boot
 report; while their owner lock is held, platform status is `Running`.
+The boot flag `amdgpu.shader_proof` opts into shader proof after SDMA's
+interrupt proof, while the same owner lock excludes clients and clear work.
+Diagnostics expose `shaders` separately; failure prevents the subsequent
+clearer publication. Explicit whole-device recovery repeats the requested
+shader proof on fresh owners before publishing its new submitter. This
+diagnostic does not enable Mesa acceleration or prove draw/render state or
+application-context execution.
 
 The read-only `amdgpu_dcn_inventory` routing functions support Navi48 with
 GC12.0.1 and DCN4.0.1 (including raw discovery 4.1.0). ATOM display-object

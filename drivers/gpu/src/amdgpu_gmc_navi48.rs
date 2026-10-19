@@ -46,6 +46,8 @@ pub enum State {
     /// VMIDs 1..15 enabled on both hubs, each at the empty root until a
     /// submission's VM flush gives it a client's page tables.
     PreparingClients,
+    /// Executable test-code PTE publication and GFX VMID0 TLB invalidation.
+    PreparingShader,
     ClientsReady,
     Failed,
 }
@@ -245,6 +247,7 @@ struct Engine<I: Io> {
     state: State,
     aperture: Option<Aperture>,
     geometry: Option<Geometry>,
+    shader_executable: bool,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> Result<T, Error>) -> Result<T, Error> {
@@ -276,6 +279,32 @@ impl<I: Io> Engine<I> {
         } else {
             State::Failed
         };
+        result
+    }
+    async fn prepare_shader_test(&mut self) -> Result<(), Error> {
+        if !self.state.vmid0_ready() || self.shader_executable {
+            return Err(Error::Busy);
+        }
+        let prior = self.state;
+        self.state = State::PreparingShader;
+        let result = async {
+            let g = self.geometry.ok_or(Error::Invalid)?;
+            let map = self.memory.mapping();
+            let pte = g.physical(self.memory.address() + 8192) | 0x71; // V/R/W/X, NC
+            let layout = self.layout;
+            self.access(|io| {
+                io.memory(map, 0, pte as u32);
+                io.memory(map, 4, (pte >> 32) as u32);
+                flush(io, layout.nbio)?;
+                io.write(layout.bases[0] + u64::from(GFX.inv_req) * 4, 0xf80001);
+                Ok(())
+            })?;
+            self.wait(layout.bases[0] + u64::from(GFX.inv_ack) * 4, 1)
+                .await
+        }
+        .await;
+        self.state = if result.is_ok() { prior } else { State::Failed };
+        self.shader_executable = result.is_ok();
         result
     }
     async fn initialize_inner(&mut self) -> Result<Aperture, Error> {
@@ -535,6 +564,7 @@ impl Gmc {
                 state: State::Prepared,
                 aperture: None,
                 geometry: None,
+                shader_executable: false,
             },
         })
     }
@@ -553,6 +583,15 @@ impl Gmc {
     /// VMID until this returns.
     pub async unsafe fn prepare_client_contexts(&mut self) -> Result<(), Error> {
         self.engine.prepare_clients().await
+    }
+    /// Make only the owned source page executable, then invalidate GFX
+    /// VMID0's translations. Destination and every unowned PTE stay unchanged.
+    /// # Safety
+    /// Both GC12 queues and SDMA must be drained and exclusively held. No
+    /// other test-page user, reset or page-table writer may run. Retain on
+    /// failure/cancellation; do not submit on the queues until success.
+    pub(crate) async unsafe fn prepare_shader_test(&mut self) -> Result<(), Error> {
+        self.engine.prepare_shader_test().await
     }
     pub fn state(&self) -> State {
         self.engine.state

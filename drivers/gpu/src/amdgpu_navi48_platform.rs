@@ -18,6 +18,12 @@ pub enum Error {
     Memory(vram::Error),
 }
 
+static SHADER_PROOF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Boot opt-in for shader execution evidence, independent of Mesa readiness.
+pub fn set_shader_proof(enabled: bool) {
+    SHADER_PROOF.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
 static OWNER: Mutex<Option<alloc::boxed::Box<boot::ColdBoot>>> = Mutex::new(None);
 // The lock spans each synchronous hardware-fence read. Advancing generation
 // drains old readers before reset; their retained readers never touch BARs again.
@@ -57,6 +63,8 @@ pub struct Diagnostics {
     pub queue_state: Option<crate::amdgpu_gfx12_queue::State>,
     pub queue_interrupts:
         Option<Result<crate::amdgpu_gfx12_queue::InterruptProof, crate::amdgpu_gfx12_queue::Error>>,
+    pub shaders:
+        Option<Result<crate::amdgpu_gfx12_shader::Proof, crate::amdgpu_gfx12_queue::Error>>,
     pub sdma_state: Option<crate::amdgpu_sdma_navi48::State>,
     pub sdma_interrupts:
         Option<Result<crate::amdgpu_sdma_navi48::InterruptProof, crate::amdgpu_sdma_navi48::Error>>,
@@ -77,6 +85,7 @@ pub fn status() -> Status {
                 interrupts: crate::amdgpu_navi48_interrupts::status(),
                 queue_state: boot.queue_state(),
                 queue_interrupts: boot.queue_interrupts(),
+                shaders: boot.shader_result(),
                 sdma_state: boot.sdma_state(),
                 sdma_interrupts: boot.sdma_interrupts(),
                 display_clocks: boot.display_clock_status(),
@@ -380,6 +389,10 @@ pub async unsafe fn recover() -> Result<boot::Report, boot::Error> {
     unsafe { boot.prove_queue_interrupts().await }.map_err(boot::Error::Queues)?;
     // SAFETY: GC12 proof drained; SDMA exclusively owns the same GMC test pages.
     unsafe { boot.prove_sdma_interrupts().await }.map_err(boot::Error::Sdma)?;
+    if SHADER_PROOF.load(Ordering::Acquire) {
+        // SAFETY: new queues are drained and all test-page users stay under OWNER.
+        unsafe { boot.prove_shaders().await }.map_err(boot::Error::Queues)?;
+    }
     let mut watches = old_submitter.as_ref().map_or_else(
         || [const { crate::amdgpu_ring_watch::RingWatch::new() }; RINGS],
         |s| {
@@ -826,6 +839,19 @@ async fn prove_queue_interrupts() {
             let proved = unsafe { boot.prove_sdma_interrupts().await };
             // SDMA0 now runs jobs, so it can clear VRAM past the BAR.
             if proved.is_ok() {
+                if SHADER_PROOF.load(Ordering::Acquire) {
+                    // SAFETY: both interrupt proofs drained; OWNER retains every
+                    // queue and test page before client/clear work can acquire it.
+                    let result = unsafe { boot.prove_shaders().await };
+                    use core::fmt::Write;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: navi48 shader proof {result:?}"
+                    );
+                    if result.is_err() {
+                        return;
+                    }
+                }
                 publish_clearer(boot);
             }
         }

@@ -876,9 +876,21 @@ or failure is terminal. Automatic whole-device recovery remains disabled:
 the caller must exclude CPU VRAM/GOP/mmap access. Boots needing GDDR6 training
 replay refuse this path before hardware changes.
 
+The optional `amdgpu.shader_proof` boot diagnostic now dispatches a fixed
+gfx1201 wave32 shader on both retained kernel GC12 queues, after the GC12
+and SDMA interrupt proofs drain. It makes only the owned code PTE executable,
+programs native logical SH resource state, and checks all 32 lane results,
+the output page's poison guards, exact fences, ring drain and fresh matching
+EOP/CPU-delivery evidence. Failure/cancellation blocks further GC12 work and
+retains storage. Whole-device recovery repeats the requested proof before
+publishing its new submitter. Independent LLVM assembly, Linux-header checks
+and execution/failure models cover this path; physical execution is unverified.
+It does not enable Mesa acceleration or exercise draw state or client VMIDs.
+
 Still open: physical MSI delivery verification and physical reset/replay
-acceptance, fault-source re-arming after containment, GC12 rendering and shader
-dispatch, production GPU VM and userspace submission, VCN5 video queues, native DCN4 clock/bandwidth/link
+acceptance, fault-source re-arming after containment, GC12 rendering and
+application shader dispatch, production GPU VM and userspace submission,
+VCN5 video queues, native DCN4 clock/bandwidth/link
 and scanout programming, THM/SMU thermal interrupts and software-CTF shutdown,
 memory/fabric DPM relaxation (display admission/watermark rework first),
 reset/suspend/resume, and physical RX 9070 XT testing.

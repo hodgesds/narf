@@ -1012,6 +1012,39 @@ impl ColdBoot {
         // the platform serializes all other accesses while this is pending.
         unsafe { queues.prove_interrupts(gmc).await }
     }
+    /// Deterministic shader proof, after GC12/SDMA interrupt proofs and
+    /// before any client work; the caller excludes all test-page users.
+    /// # Safety
+    /// Continue the exclusive queue/GMC/reset ownership and enabled CPU IRQ
+    /// contract of prove_queue_interrupts. Failed/canceled proof stays retained.
+    pub(crate) async unsafe fn prove_shaders(
+        &mut self,
+    ) -> Result<crate::amdgpu_gfx12_shader::Proof, queues::Error> {
+        if self.state() != State::MemoryReady {
+            return Err(queues::Error::Busy);
+        }
+        let hw = &mut self.sequence.backend;
+        if hw
+            .sdma
+            .as_ref()
+            .is_none_or(|s| s.state() != sdma::State::InterruptVerified)
+        {
+            return Err(queues::Error::Busy);
+        }
+        let queues = hw.queues.as_mut().ok_or(queues::Error::Invalid)?;
+        let gmc = hw.gmc.as_mut().ok_or(queues::Error::Invalid)?;
+        // SAFETY: same retained GPU; caller excludes every queue/test-page user.
+        unsafe { queues.prove_shaders(gmc).await }
+    }
+    pub(crate) fn shader_result(
+        &self,
+    ) -> Option<Result<crate::amdgpu_gfx12_shader::Proof, queues::Error>> {
+        self.sequence
+            .backend
+            .queues
+            .as_ref()
+            .and_then(queues::Queues::shader_result)
+    }
     pub fn sdma_state(&self) -> Option<sdma::State> {
         self.sequence.backend.sdma.as_ref().map(sdma::Sdma::state)
     }

@@ -51,8 +51,81 @@ struct Fake {
     rlc_pending: u8,
     /// A ring restored after a reset runs client slots from 0.
     restored: bool,
+    shader_execute: bool,
+    shader_corrupt: bool,
+    shader_overrun: bool,
+    shader_skip_fence: bool,
 }
 impl Fake {
+    /// Independent PM4/ISA model for the small proof kernel. Only the
+    /// shader interpreter stores output: an IB/fence alone cannot pass.
+    fn execute_shader(&mut self) {
+        let mut regs = BTreeMap::new();
+        let mut dispatch = false;
+        let ib = self.target[64..320].to_vec();
+        let mut pos = 0;
+        while pos < ib.len() {
+            let w = &ib[pos..];
+            let length = ((w[0] >> 16) & 0x3fff) as usize + 2;
+            match (w[0] >> 8) & 255 {
+                0x76 => {
+                    assert_eq!(w[0] & 3, 2);
+                    for (i, v) in w[2..length].iter().enumerate() {
+                        regs.insert(w[1] + i as u32, *v);
+                    }
+                }
+                0x15 => {
+                    assert_eq!(&w[..5], &[0xc0031502, 1, 1, 1, 0x8045]);
+                    dispatch = true;
+                }
+                0x10 => {}
+                op => panic!("unexpected shader IB opcode {op:#x}"),
+            }
+            pos += length;
+        }
+        assert!(dispatch);
+        assert_eq!((regs[&0x207], regs[&0x208], regs[&0x209]), (32, 1, 1));
+        assert_eq!(
+            (regs[&0x212], regs[&0x213], regs[&0x228]),
+            (0x60000000, 6, 0)
+        );
+        assert_eq!(
+            u64::from(regs[&0x20c]) << 8 | u64::from(regs[&0x20d]) << 40,
+            VA
+        );
+        let pointer = u64::from(regs[&0x240]) | u64::from(regs[&0x241]) << 32;
+        assert_eq!(pointer, VA + 4160);
+        let salt = regs[&0x242];
+        if !self.shader_execute {
+            return;
+        }
+        for lane in 0..32u32 {
+            let mut v = [lane, 0];
+            let mut pc = 0;
+            let mut stored = false;
+            while pc < 8 {
+                match self.target[pc] {
+                    0x30000082 => v[0] <<= 2,
+                    0xbf870001 => {} // explicit VALU dependency wait
+                    0x3a020002 => v[1] = salt ^ v[0],
+                    0xee068000 => {
+                        assert_eq!(&self.target[pc + 1..pc + 3], &[0x008c0000, 0]);
+                        let at = ((pointer - VA + u64::from(v[0])) / 4) as usize;
+                        self.target[at] = v[1] ^ u32::from(self.shader_corrupt);
+                        stored = true;
+                        pc += 2;
+                    }
+                    0xbfc10000 => assert!(stored),
+                    0xbfb00000 => break,
+                    word => panic!("unexpected gfx1201 proof instruction {word:#x}"),
+                }
+                pc += 1;
+            }
+        }
+        if self.shader_overrun {
+            self.target[1072] = 0;
+        } // just past output
+    }
     /// A CP running client-job slots of `pipe` from its RPTR to `tail`.
     fn execute_jobs(&mut self, pipe: usize, tail: u64) {
         let off = pipe * 3072;
@@ -62,6 +135,7 @@ impl Fake {
         while rptr < tail {
             let slot = off + (rptr % 1024) as usize;
             let mut cursor = 0;
+            let mut shader_job = false;
             while cursor < 256 {
                 let words = &self.memory[slot + cursor..slot + 256];
                 let header = words[0];
@@ -107,13 +181,27 @@ impl Fake {
                     }
                     0x3f => {
                         assert_eq!(length, 4);
-                        self.job_ibs
-                            .push((u64::from(words[1]) | u64::from(words[2]) << 32, words[3]));
+                        let address = u64::from(words[1]) | u64::from(words[2]) << 32;
+                        self.job_ibs.push((address, words[3]));
+                        if address == VA + crate::amdgpu_gfx12_shader::IB_OFFSET {
+                            shader_job = true;
+                            self.execute_shader();
+                        }
                     }
                     0x49 => {
                         assert_eq!((length, words[1], words[2]), (8, 0x06600514, 0x22000000));
                         let address = u64::from(words[3]) | (u64::from(words[4]) << 32);
-                        self.memory[((address - GPU) / 4) as usize] = words[5];
+                        if !shader_job || !self.shader_skip_fence {
+                            self.memory[((address - GPU) / 4) as usize] = words[5];
+                        }
+                        if shader_job {
+                            if self.emit_eop {
+                                self.eop[pipe].fetch_add(1, Ordering::SeqCst);
+                            }
+                            if self.emit_cpu {
+                                self.eop[2].fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
                     }
                     0x10 => {}
                     op => panic!("unexpected job opcode {op:#x}"),
@@ -123,7 +211,9 @@ impl Fake {
             assert_eq!(cursor, 256, "the job fills its slot exactly");
             rptr += 256;
             // GC12 writes back only the low 32 bits.
-            self.memory[off + 2560] = rptr as u32;
+            if !self.rptr_stuck {
+                self.memory[off + 2560] = rptr as u32;
+            }
         }
     }
     fn execute(&mut self, pipe: usize, tail: u32) {
@@ -386,6 +476,10 @@ fn fixture() -> (Pool, Engine<Fake>, FakeMes, gmc::Aperture, MmioRegion) {
             rlc_stuck: false,
             rlc_pending: 0,
             restored: false,
+            shader_execute: true,
+            shader_corrupt: false,
+            shader_overrun: false,
+            shader_skip_fence: false,
         },
         authority: Cap::bootstrap(),
         layout: Layout {
@@ -401,6 +495,8 @@ fn fixture() -> (Pool, Engine<Fake>, FakeMes, gmc::Aperture, MmioRegion) {
         interrupt_result: None,
         job_wptr: [512; 2],
         job_seq: [0; 2],
+        shader_engines: 4,
+        shader_result: None,
     };
     let mes = FakeMes {
         mapped,
@@ -1159,4 +1255,208 @@ fn gfx12_compute_reset_requires_rlc_acknowledgement() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/gfx12",
     gfx12_compute_reset_requires_rlc_acknowledgement
+);
+
+fn shader_ready() -> (Pool, Engine<Fake>, gmc::Aperture, MmioRegion, FakeObserver) {
+    let (pool, mut e, mut mes, aperture, target) = fixture();
+    run(e.initialize(&mut mes, aperture, target)).unwrap();
+    let mut observer = FakeObserver::new(&e);
+    e.io.regs.insert(0x17828, 0x84100000);
+    e.io.regs.insert(0x17894, 0x84200000);
+    run(e.prove_interrupts(&mut observer, aperture, target)).unwrap();
+    (pool, e, aperture, target, observer)
+}
+fn gfx12_shader_proof_requires_isa_output_and_fresh_completion() -> TestResult {
+    for msi in [true, false] {
+        let (pool, mut e, aperture, target, mut observer) = shader_ready();
+        observer.msi = msi;
+        e.io.emit_cpu = msi;
+        let proof = run(e.prove_shaders(&mut observer, async { Ok((aperture, target)) })).unwrap();
+        assert_eq!(
+            proof,
+            crate::amdgpu_gfx12_shader::Proof {
+                lanes: 32,
+                fences: [1, 1],
+                msi_verified: msi
+            }
+        );
+        assert_eq!(e.shader_result, Some(Ok(proof)));
+        assert_eq!(e.state, State::InterruptVerified);
+        assert_eq!(e.job_wptr, [768, 768]);
+        assert_eq!(e.io.job_ibs.len(), 2);
+        assert_eq!(
+            run(e.prove_shaders(&mut observer, async { Ok((aperture, target)) })),
+            Err(Error::Busy)
+        );
+        // Client fences continue after the diagnostic's physical sequence.
+        // The completed proof must not retire a subsequently stalled IB.
+        let job = Job::new(3, 0x1234, 0x1_0000_8001, &[(0x2_0000_1000, 64)]).unwrap();
+        e.io.complete = false;
+        for pipe in [Pipe::Graphics, Pipe::Compute] {
+            assert_eq!(e.submit(pipe, job), Ok(2));
+            assert_eq!(e.completed_job(pipe), Ok(1));
+            e.io.execute_jobs(pipe.index(), 1024);
+            assert_eq!(e.completed_job(pipe), Ok(2));
+        }
+        drop(e);
+        assert_eq!(pool.available(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_shader_proof_requires_isa_output_and_fresh_completion
+);
+fn gfx12_shader_failures_never_enable_clients_or_release_memory() -> TestResult {
+    for case in 0..8 {
+        let (pool, mut e, aperture, target, mut observer) = shader_ready();
+        let expected = match case {
+            0 => {
+                e.io.shader_execute = false;
+                Error::DataMismatch
+            }
+            1 => {
+                e.io.shader_corrupt = true;
+                Error::DataMismatch
+            }
+            2 => {
+                e.io.shader_overrun = true;
+                Error::DataMismatch
+            }
+            3 => {
+                e.io.shader_skip_fence = true;
+                Error::Timeout
+            }
+            4 => {
+                e.io.emit_eop = false;
+                Error::Timeout
+            }
+            5 => {
+                e.io.emit_cpu = false;
+                Error::Timeout
+            }
+            6 => {
+                e.io.rptr_stuck = true;
+                Error::Timeout
+            }
+            _ => {
+                observer.reject = true;
+                Error::Interrupts(crate::amdgpu_ih7::Error::Protocol)
+            }
+        };
+        let result = run(e.prove_shaders(&mut observer, async { Ok((aperture, target)) }));
+        assert_eq!(result, Err(expected));
+        assert_eq!(e.state, State::Failed(expected));
+        assert_eq!(e.submit_fence(Pipe::Compute), Err(Error::Busy));
+        drop(e);
+        assert_eq!(pool.available(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_shader_failures_never_enable_clients_or_release_memory
+);
+fn gfx12_shader_cancellation_and_late_clients_refuse_replay() -> TestResult {
+    for before_publish in [true, false] {
+        let (pool, mut e, aperture, target, mut observer) = shader_ready();
+        if !before_publish {
+            e.io.complete = false;
+        }
+        {
+            let prepare = async {
+                if before_publish {
+                    core::future::pending::<()>().await;
+                }
+                Ok((aperture, target))
+            };
+            let mut future = core::pin::pin!(e.prove_shaders(&mut observer, prepare));
+            assert!(future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+        }
+        assert!(matches!(e.state, State::ShaderSubmitted(_)));
+        let bells = e.io.bells.len();
+        assert_eq!(
+            run(e.prove_shaders(&mut observer, async { Ok((aperture, target)) })),
+            Err(Error::Busy)
+        );
+        assert_eq!(e.submit_fence(Pipe::Graphics), Err(Error::Busy));
+        assert_eq!(e.io.bells.len(), bells);
+        drop(e);
+        assert_eq!(pool.available(), 0);
+    }
+    let (_, mut e, aperture, target, mut observer) = shader_ready();
+    e.submit_fence(Pipe::Compute).unwrap();
+    let bells = e.io.bells.len();
+    let called = core::sync::atomic::AtomicBool::new(false);
+    assert_eq!(
+        run(e.prove_shaders(&mut observer, async {
+            called.store(true, Ordering::SeqCst);
+            Ok((aperture, target))
+        })),
+        Err(Error::Busy)
+    );
+    assert!(!called.load(Ordering::SeqCst));
+    assert_eq!(e.io.bells.len(), bells);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_shader_cancellation_and_late_clients_refuse_replay
+);
+
+fn gfx12_shader_rejects_unowned_addresses_and_failed_preparation() -> TestResult {
+    use crate::amdgpu_gfx12_shader as shader;
+    for (code, output, engines) in [
+        (VA + 4, VA + 4160, 4),
+        (1 << 48, VA + 4160, 4),
+        (VA, VA + 4161, 4),
+        (VA, (1 << 48) - 124, 4),
+        (VA, u64::MAX - 3, 4),
+        (VA, VA + 4160, 0),
+        (VA, VA + 4160, 9),
+    ] {
+        assert_eq!(shader::ib(code, output, engines, 0), Err(Error::Invalid));
+    }
+    for case in 0..4 {
+        let (pool, mut e, mut aperture, mut target, mut observer) = shader_ready();
+        let bells = e.io.bells.len();
+        let prep = match case {
+            0 => Err(gmc::Error::Revoked),
+            1 => {
+                aperture.destination += 4096;
+                Ok((aperture, target))
+            }
+            2 => {
+                target.len -= 4;
+                Ok((aperture, target))
+            }
+            _ => {
+                e.authority.revoke();
+                Ok((aperture, target))
+            }
+        };
+        let expected = match case {
+            0 => Error::Gmc(gmc::Error::Revoked),
+            3 => Error::Revoked,
+            _ => Error::Invalid,
+        };
+        assert_eq!(
+            run(e.prove_shaders(&mut observer, async { prep })),
+            Err(expected)
+        );
+        assert_eq!(e.io.bells.len(), bells);
+        if case != 3 {
+            assert_eq!(e.state, State::Failed(expected));
+        }
+        drop(e);
+        assert_eq!(pool.available(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_shader_rejects_unowned_addresses_and_failed_preparation
 );

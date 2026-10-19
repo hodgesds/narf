@@ -212,6 +212,7 @@ pub mod amdgpu_gfx10_topology;
 pub mod amdgpu_gfx12_queue;
 pub mod amdgpu_gfx12_rs64;
 pub mod amdgpu_gfx12_setup;
+pub mod amdgpu_gfx12_shader;
 pub mod amdgpu_gfx12_topology;
 pub mod amdgpu_gfx_firmware;
 pub mod amdgpu_gfx_navi22;
