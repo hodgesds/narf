@@ -212,3 +212,32 @@ kernel_test_in!(
     "drivers/gpu/navi48-interrupts",
     navi48_sdma_traps_require_exact_instance_queue_vmid_pasid_and_source
 );
+
+fn navi48_vcn_trap_history_requires_unified_source_and_kernel_context() -> TestResult {
+    let mut h = History::new();
+    for (client, source, vmid, pasid) in [
+        (0x10, 114, 0, 0),
+        (0x10, 120, 0, 0),
+        (0x10, 153, 0, 0),
+        (0x0e, 119, 0, 0),
+        (0x10, 119, 1, 0),
+        (0x10, 119, 0, 1),
+        (0x10, 119, 0, 0),
+    ] {
+        let mut e = event(0);
+        e.vector.client = client;
+        e.vector.source = source;
+        e.vector.vmid = vmid;
+        e.vector.pasid = pasid;
+        h.push(e);
+    }
+    while !h.pop().is_empty() {}
+    assert_eq!(h.count(Source::Vcn0), 1);
+    assert_eq!(h.count(Source::Sdma0), 0);
+    assert_eq!(h.kernel_eop, [0; 2]);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-interrupts",
+    navi48_vcn_trap_history_requires_unified_source_and_kernel_context
+);

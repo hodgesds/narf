@@ -6,6 +6,8 @@
 #include "asic_reg/vcn/vcn_5_0_0_sh_mask.h"
 #include "asic_reg/nbif/nbif_6_3_1_offset.h"
 #include "asic_reg/nbif/nbif_6_3_1_sh_mask.h"
+#include "soc15_ih_clientid.h"
+#include "ivsrcid/vcn/irqsrcs_vcn_5_0.h"
 #define EQ(a, b) _Static_assert((unsigned)(a) == (unsigned)(b), #a)
 #define REG(n, v) EQ(reg##n, v); EQ(reg##n##_BASE_IDX, 1)
 REG(UVD_IPX_DLDO_CONFIG, 0x000);
@@ -41,6 +43,9 @@ REG(UVD_LMI_STATUS, 0x331);
 EQ(UVD_VCPU_CNTL__BLK_RST_MASK, 1u << 28);
 EQ(UVD_VCPU_CNTL__CLK_EN_MASK, 1u << 9);
 EQ(UVD_MASTINT_EN__VCPU_EN_MASK, 2);
+EQ(SOC21_IH_CLIENTID_VCN, 0x10); EQ(SOC15_IH_CLIENTID_VCN, 0x10);
+EQ(SOC21_IH_CLIENTID_VCN1, 0x0e); EQ(SOC15_IH_CLIENTID_VCN1, 0x0e);
+EQ(VCN_5_0__SRCID__UVD_ENC_GENERAL_PURPOSE, 119);
 EQ(UVD_RB_ARB_CTRL__VCPU_DIS_MASK, 8);
 EQ(UVD_SOFT_RESET__LMI_SOFT_RESET_MASK | UVD_SOFT_RESET__LMI_UMC_SOFT_RESET_MASK, 0x2004);
 EQ(UVD_LMI_CTRL2__STALL_ARB_UMC_MASK, 0x100);

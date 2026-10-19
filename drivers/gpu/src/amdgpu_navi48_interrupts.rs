@@ -55,6 +55,7 @@ pub struct Status {
     pub last_fault: Option<ih::Event>,
     pub kernel_eop: [u64; 2],
     pub sdma0_traps: u64,
+    pub vcn0_traps: u64,
     pub faults: faults::Status,
     /// Kernel graphics, compute and SDMA0 owners registered by the service.
     pub kernel: [Option<dispatch::Endpoint>; 3],
@@ -137,6 +138,7 @@ struct History {
     last_fault: Option<ih::Event>,
     kernel_eop: [u64; 2],
     sdma0_traps: u64,
+    vcn0_traps: u64,
 }
 impl History {
     fn new() -> Self {
@@ -150,6 +152,7 @@ impl History {
             last_fault: None,
             kernel_eop: [0; 2],
             sdma0_traps: 0,
+            vcn0_traps: 0,
         }
     }
     fn push(&mut self, event: ih::Event) {
@@ -181,6 +184,15 @@ impl History {
         {
             self.sdma0_traps = self.sdma0_traps.saturating_add(1);
         }
+        // vcn_v5_0_0_process_interrupt: the client instance and source
+        // identify the unified queue; the ring field has no queue selector.
+        if event.vector.client == src::CLIENT_VCN
+            && event.vector.source == 119
+            && event.vector.vmid == 0
+            && event.vector.pasid == 0
+        {
+            self.vcn0_traps = self.vcn0_traps.saturating_add(1);
+        }
         if matches!(event.vector.client, 0x0a | 0x12) && event.vector.source == 0 {
             self.vm_faults = self.vm_faults.saturating_add(1);
             self.last_fault = Some(event);
@@ -198,6 +210,7 @@ impl History {
             Source::Graphics => self.kernel_eop[0],
             Source::Compute => self.kernel_eop[1],
             Source::Sdma0 => self.sdma0_traps,
+            Source::Vcn0 => self.vcn0_traps,
         }
     }
     fn pop(&mut self) -> ih::Batch {
@@ -233,6 +246,7 @@ impl Service {
             last_fault: self.history.last_fault,
             kernel_eop: self.history.kernel_eop,
             sdma0_traps: self.history.sdma0_traps,
+            vcn0_traps: self.history.vcn0_traps,
             faults: self.faults.status(),
             kernel: self
                 .kernel
@@ -476,6 +490,7 @@ pub(crate) enum Source {
     Graphics,
     Compute,
     Sdma0,
+    Vcn0,
 }
 pub(crate) trait Observer {
     async fn sample(&mut self, source: Source) -> Result<Sample, ih::Error>;

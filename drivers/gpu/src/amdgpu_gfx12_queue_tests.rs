@@ -717,7 +717,7 @@ impl Observer for FakeObserver {
         let pipe = match source {
             Source::Graphics => 0,
             Source::Compute => 1,
-            Source::Sdma0 => panic!("unexpected SDMA sample"),
+            Source::Sdma0 | Source::Vcn0 => panic!("unexpected non-CP sample"),
         };
         Ok(interrupts::Sample {
             source,
@@ -734,7 +734,7 @@ impl Observer for FakeObserver {
             self.counters[match sample.source {
                 Source::Graphics => 0,
                 Source::Compute => 1,
-                Source::Sdma0 => panic!("unexpected SDMA sample"),
+                Source::Sdma0 | Source::Vcn0 => panic!("unexpected non-CP sample"),
             }]
             .load(Ordering::SeqCst),
         ) == sample.count + 1

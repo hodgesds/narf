@@ -205,7 +205,8 @@ struct Hardware {
     mes: Option<mes::Mes>,
     queues: Option<queues::Queues>,
     vcn: Option<crate::amdgpu_vcn_navi48::Vcn>,
-    media_test: Option<Result<crate::amdgpu_vcn_navi48::Proof, Error>>,
+    media_test: Option<Result<crate::amdgpu_vcn_navi48::InterruptProof, Error>>,
+    vcn_owner: Option<crate::amdgpu_navi48_dispatch::Handle>,
 }
 impl Backend for Hardware {
     async fn step(&mut self, stage: Stage) -> Result<(), Error> {
@@ -662,6 +663,7 @@ impl ColdBoot {
                     sdma: None,
                     vcn: None,
                     media_test: None,
+                    vcn_owner: None,
                     mes: None,
                     queues: None,
                 },

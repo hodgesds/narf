@@ -24,6 +24,12 @@ struct Fake {
     revoked: Option<(u64, Cap<BusDeviceCap, Write>)>,
     delays: Arc<AtomicU32>,
     traps: u32,
+    signals: Arc<[AtomicU32; 2]>,
+    emit_iv: bool,
+    emit_cpu: bool,
+    duplicate: bool,
+    corrupt_guard: bool,
+    wide_fence: bool,
 }
 impl Fake {
     fn word(&self, at: u64) -> u32 {
@@ -93,11 +99,26 @@ impl Io for Fake {
                     assert_eq!(address, GPU + FENCE);
                     if self.fence {
                         self.store(FENCE, self.word(at + 12));
+                        if self.wide_fence {
+                            self.store(WRITEBACK, 0);
+                        }
+                        if self.corrupt_guard {
+                            self.store(FENCE + 8, 0xdeadbeef);
+                        }
                     }
                     4
                 }
                 4 => {
                     self.traps += 1;
+                    if self.regs[&(VCN + 0x121 * 4)] & 2 != 0 {
+                        if self.emit_iv {
+                            self.signals[0]
+                                .fetch_add(if self.duplicate { 2 } else { 1 }, Ordering::SeqCst);
+                        }
+                        if self.emit_cpu {
+                            self.signals[1].fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
                     1
                 }
                 op => panic!("unexpected VCN5 transport opcode {op}"),
@@ -141,6 +162,12 @@ fn fixture() -> (Pool, Engine<Fake>) {
             revoked: None,
             delays: Arc::new(AtomicU32::new(0)),
             traps: 0,
+            signals: Arc::new([AtomicU32::new(0), AtomicU32::new(0)]),
+            emit_iv: true,
+            emit_cpu: true,
+            duplicate: false,
+            corrupt_guard: false,
+            wide_fence: false,
         },
         authority: Cap::bootstrap(),
         layout: Layout {
@@ -152,6 +179,7 @@ fn fixture() -> (Pool, Engine<Fake>) {
         firmware_bytes: 0x11000,
         state: State::Prepared,
         proof: None,
+        interrupt_result: None,
         wptr: 0,
         seq: 0,
     };
@@ -418,4 +446,140 @@ fn vcn5_layout_rejects_foreign_ip_and_truncated_register_banks() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/vcn-navi48",
     vcn5_layout_rejects_foreign_ip_and_truncated_register_banks
+);
+
+struct Irqs {
+    signals: Arc<[AtomicU32; 2]>,
+    vector: Option<u8>,
+    stall_sample: bool,
+    stall_observed: bool,
+}
+impl crate::amdgpu_navi48_interrupts::Observer for Irqs {
+    async fn sample(
+        &mut self,
+        source: crate::amdgpu_navi48_interrupts::Source,
+    ) -> Result<crate::amdgpu_navi48_interrupts::Sample, crate::amdgpu_ih7::Error> {
+        use crate::amdgpu_navi48_interrupts::{Sample, Source};
+        assert_eq!(source, Source::Vcn0);
+        if self.stall_sample {
+            core::future::pending::<()>().await;
+        }
+        Ok(Sample {
+            source,
+            count: u64::from(self.signals[0].load(Ordering::Acquire)),
+            cpu: u64::from(self.signals[1].load(Ordering::Acquire)),
+            vector: self.vector,
+        })
+    }
+    async fn observed(
+        &mut self,
+        sample: crate::amdgpu_navi48_interrupts::Sample,
+    ) -> Result<bool, crate::amdgpu_ih7::Error> {
+        if self.stall_observed {
+            core::future::pending::<()>().await;
+        }
+        let count = u64::from(self.signals[0].load(Ordering::Acquire));
+        if count > sample.count + 1 {
+            return Err(crate::amdgpu_ih7::Error::Protocol);
+        }
+        Ok(count == sample.count + 1
+            && (sample.vector.is_none()
+                || u64::from(self.signals[1].load(Ordering::Acquire)) != sample.cpu))
+    }
+}
+fn irqs(e: &Engine<Fake>, vector: Option<u8>) -> Irqs {
+    Irqs {
+        signals: e.io.signals.clone(),
+        vector,
+        stall_sample: false,
+        stall_observed: false,
+    }
+}
+fn vcn5_irq_proof_requires_fresh_fence_drain_trap_and_cpu() -> TestResult {
+    for case in 0..9 {
+        let (_pool, mut e) = fixture();
+        run(e.start(IMAGE, power())).unwrap();
+        run(e.prove()).unwrap();
+        // Old trap/MSI evidence cannot satisfy the next command frame.
+        e.io.signals[0].store(7, Ordering::Release);
+        e.io.signals[1].store(9, Ordering::Release);
+        let mut observer = irqs(&e, if case == 6 { None } else { Some(64) });
+        match case {
+            1 => e.io.fence = false,
+            2 => e.io.advance = false,
+            3 => e.io.emit_iv = false,
+            4 => e.io.emit_cpu = false,
+            5 => e.io.duplicate = true,
+            7 => e.io.corrupt_guard = true,
+            8 => e.io.wide_fence = true,
+            _ => {}
+        }
+        let result = run(e.prove_interrupts(&mut observer));
+        match case {
+            0 | 6 => {
+                assert_eq!(
+                    result,
+                    Ok(InterruptProof {
+                        fence: Proof {
+                            sequence: 2,
+                            read_pointer: 128
+                        },
+                        msi_verified: case == 0
+                    })
+                );
+                assert_eq!(e.state, State::InterruptVerified);
+                assert_eq!(e.interrupt_result, Some(result));
+                run(e.stop()).unwrap();
+                assert!(e.memory.reusable_for_test());
+            }
+            _ => {
+                let error = if case >= 7 {
+                    Error::Readback
+                } else if case == 5 {
+                    Error::Interrupts(crate::amdgpu_ih7::Error::Protocol)
+                } else {
+                    Error::Timeout
+                };
+                assert_eq!(result, Err(error));
+                assert_eq!(e.state, State::Failed(error));
+                assert!(!e.memory.reusable_for_test());
+                assert_eq!(run(e.stop()), Err(Error::Busy));
+            }
+        }
+        assert_eq!(run(e.prove_interrupts(&mut observer)), Err(Error::Busy));
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi48",
+    vcn5_irq_proof_requires_fresh_fence_drain_trap_and_cpu
+);
+
+fn vcn5_irq_cancellation_retains_owner_before_and_after_publication() -> TestResult {
+    for published in [false, true] {
+        let (_pool, mut e) = fixture();
+        run(e.start(IMAGE, power())).unwrap();
+        run(e.prove()).unwrap();
+        let mut observer = irqs(&e, Some(64));
+        observer.stall_sample = !published;
+        observer.stall_observed = published;
+        {
+            let mut future = core::pin::pin!(e.prove_interrupts(&mut observer));
+            assert!(future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+        }
+        assert_eq!(e.state, State::InterruptTesting);
+        assert_eq!(e.interrupt_result, Some(Err(Error::Busy)));
+        assert_eq!(e.wptr, if published { 128 } else { 64 });
+        assert!(!e.memory.reusable_for_test());
+        assert_eq!(run(e.stop()), Err(Error::Busy));
+        assert_eq!(run(e.prove_interrupts(&mut observer)), Err(Error::Busy));
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi48",
+    vcn5_irq_cancellation_retains_owner_before_and_after_publication
 );

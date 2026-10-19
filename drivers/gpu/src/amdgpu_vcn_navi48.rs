@@ -24,6 +24,7 @@ pub enum Error {
     Timeout,
     BootFailed,
     PowerPolicy(u64),
+    Interrupts(crate::amdgpu_ih7::Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -32,6 +33,8 @@ pub enum State {
     Ready,
     Testing,
     Verified,
+    InterruptTesting,
+    InterruptVerified,
     Stopping,
     Stopped,
     Failed(Error),
@@ -41,6 +44,11 @@ pub struct Proof {
     pub sequence: u32,
     /// Monotonic dword pointers, not masked ring offsets.
     pub read_pointer: u32,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InterruptProof {
+    pub fence: Proof,
+    pub msi_verified: bool,
 }
 
 // vcn_5_0_0_offset.h: all registers below are in VCN instance 0, bank 1.
@@ -203,6 +211,7 @@ struct Engine<I: Io> {
     firmware_bytes: u32,
     state: State,
     proof: Option<Proof>,
+    interrupt_result: Option<Result<InterruptProof, Error>>,
     wptr: u32,
     seq: u32,
 }
@@ -263,6 +272,7 @@ impl<I: Io> Engine<I> {
         }
         self.state = State::Starting;
         self.proof = None;
+        self.interrupt_result = None;
         self.memory.publish();
         let result = self
             .start_inner(image)
@@ -385,7 +395,14 @@ impl<I: Io> Engine<I> {
         })
     }
     fn emit(&mut self, words: &[u32]) -> Result<u32, Error> {
-        if !matches!(self.state, State::Ready | State::Testing | State::Verified) {
+        if !matches!(
+            self.state,
+            State::Ready
+                | State::Testing
+                | State::Verified
+                | State::InterruptTesting
+                | State::InterruptVerified
+        ) {
             return Err(Error::Busy);
         }
         if words.is_empty() || words.len() > 1023 {
@@ -446,6 +463,7 @@ impl<I: Io> Engine<I> {
                 Ok(io.memory_read(map, FENCE) == seq)
             })?;
             if rptr == next && complete {
+                self.fence_guards(next)?;
                 return Ok(Proof {
                     sequence: seq,
                     read_pointer: rptr,
@@ -455,8 +473,27 @@ impl<I: Io> Engine<I> {
         }
         Err(Error::Timeout)
     }
+    /// The fence is exactly one dword. A wider/stray firmware write must
+    /// neither overwrite the CPU write-pointer word nor its page's guards.
+    fn fence_guards(&mut self, next: u32) -> Result<(), Error> {
+        let map = self.memory.mapping();
+        self.access(|io, l| {
+            flush(io, l)?;
+            if io.memory_read(map, WRITEBACK) != next
+                || (FENCE + 8..FENCE + 4096)
+                    .step_by(4)
+                    .any(|at| io.memory_read(map, at) != 0)
+            {
+                return Err(Error::Readback);
+            }
+            Ok(())
+        })
+    }
     async fn stop(&mut self) -> Result<(), Error> {
-        if !matches!(self.state, State::Ready | State::Verified) {
+        if !matches!(
+            self.state,
+            State::Ready | State::Verified | State::InterruptVerified
+        ) {
             return Err(Error::Busy);
         }
         self.state = State::Stopping;
@@ -547,6 +584,7 @@ impl Vcn {
                 firmware_bytes: firmware_bytes as u32,
                 state: State::Prepared,
                 proof: None,
+                interrupt_result: None,
                 wptr: 0,
                 seq: 0,
             },
@@ -573,6 +611,16 @@ impl Vcn {
         self.engine.prove().await
     }
     /// # Safety
+    /// The independent IH service has a retained VCN0 VMID0/PASID0 owner
+    /// registered before master IRQs are enabled. Run from an executor task
+    /// with CPU IRQs enabled when MSI is routed, retaining all start owners.
+    /// Keep the registration and backing after cancellation/failure.
+    pub async unsafe fn prove_interrupts(&mut self) -> Result<InterruptProof, Error> {
+        self.engine
+            .prove_interrupts(&mut crate::amdgpu_navi48_interrupts::NativeObserver)
+            .await
+    }
+    /// # Safety
     /// Exclude all submissions and memory/firmware/PM writers. Only success
     /// permits PowerDownVcn or release of the retained allocation.
     pub async unsafe fn stop(&mut self) -> Result<(), Error> {
@@ -584,7 +632,13 @@ impl Vcn {
     pub fn proof(&self) -> Option<Proof> {
         self.engine.proof
     }
+    pub fn interrupt_result(&self) -> Option<Result<InterruptProof, Error>> {
+        self.engine.interrupt_result
+    }
 }
+
+#[path = "amdgpu_vcn_navi48_irq.rs"]
+mod irq;
 
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_vcn_navi48_tests.rs"]

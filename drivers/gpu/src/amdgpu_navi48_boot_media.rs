@@ -1,5 +1,6 @@
 //! Optional retained VCN5 transport/power cycle before publishing client work.
 use super::*;
+use crate::amdgpu_navi48_dispatch as dispatch;
 use crate::amdgpu_vcn_navi48 as vcn;
 
 impl ColdBoot {
@@ -10,14 +11,19 @@ impl ColdBoot {
             .as_ref()
             .is_none_or(Result::is_ok)
     }
-    pub(crate) fn media_result(&self) -> Option<Result<vcn::Proof, Error>> {
+    pub(crate) fn media_result(&self) -> Option<Result<vcn::InterruptProof, Error>> {
         self.sequence.backend.media_test
+    }
+    pub(crate) fn media_state(&self) -> Option<vcn::State> {
+        self.sequence.backend.vcn.as_ref().map(vcn::Vcn::state)
     }
     /// # Safety
     /// OWNER excludes every engine/PM/firmware user, no client job or clear
     /// has been published, and this is the retained post-interrupt-proof GPU.
     /// Any cancellation/failure requires explicit whole-device recovery.
-    pub(crate) async unsafe fn prove_media_transport(&mut self) -> Result<vcn::Proof, Error> {
+    pub(crate) async unsafe fn prove_media_transport(
+        &mut self,
+    ) -> Result<vcn::InterruptProof, Error> {
         if self.state() != State::MemoryReady || self.sequence.backend.media_test.is_some() {
             return Err(Error::Busy);
         }
@@ -56,11 +62,28 @@ impl ColdBoot {
             // alive and no client can access the ring or its backing memory.
             unsafe { vcn.start(firmware, power).await }.map_err(Error::Vcn)?;
             // SAFETY: same retained prerequisites and exclusive transport.
-            let proof = unsafe { vcn.prove().await }.map_err(Error::Vcn)?;
+            unsafe { vcn.prove().await }.map_err(Error::Vcn)?;
+            // Retain the registration before enabling the VCPU master IRQ.
+            // Failure/cancellation leaves the extra owner live, so the
+            // three-queue fault re-arm path cannot assume media quiescence.
+            hw.vcn_owner = Some(
+                dispatch::register(dispatch::Owner {
+                    key: dispatch::Key::Vcn { instance: 0 },
+                    vmid: 0,
+                    pasid: 0,
+                })
+                .map_err(|_| Error::Interrupts(ih::Error::Busy))?,
+            );
+            // SAFETY: matching retained registration, independent IH service,
+            // drained kernel transport, exclusive OWNER and enabled CPU IRQs.
+            let proof = unsafe { vcn.prove_interrupts().await }.map_err(Error::Vcn)?;
             // SAFETY: no client publication; the proof drained its whole ring.
             unsafe { vcn.stop().await }.map_err(Error::Vcn)?;
             // SAFETY: stop proved VCPU/LMI retirement before domain power-down.
             hw.power = Some(unsafe { smu.set_vcn_power(false).await }.map_err(Error::Smu)?);
+            let handle = hw.vcn_owner.ok_or(Error::Invalid)?;
+            dispatch::retire(handle).map_err(|_| Error::Interrupts(ih::Error::Protocol))?;
+            hw.vcn_owner = None;
             Ok(proof)
         }
         .await;

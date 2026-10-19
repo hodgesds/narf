@@ -50,6 +50,52 @@ fn far() -> Deadline {
     Deadline::after_ms(10_000)
 }
 
+fn navi48_vcn_dispatch_requires_registered_unified_source_and_owned_context() -> TestResult {
+    let table = IrqSafeSpinLock::new(Table::new());
+    let h = table
+        .lock()
+        .register(kernel(Key::Vcn { instance: 0 }))
+        .unwrap();
+    assert_eq!(
+        table.lock().register(kernel(Key::Vcn { instance: 2 })),
+        Err(RegisterError::Invalid)
+    );
+    let done = Cell::new(false);
+    let mut wait = core::pin::pin!(wait_in(&table, h, far(), || done.get().then_some(1)));
+    assert!(poll(wait.as_mut()).is_pending());
+    for (client, source, vmid, pasid, expected) in [
+        (0x0e, 119, 0, 0, Delivery::Unowned),
+        (0x10, 119, 1, 0, Delivery::Unowned),
+        (0x10, 119, 0, 1, Delivery::Unowned),
+        (0x10, 114, 0, 0, Delivery::Ignored),
+        (0x10, 120, 0, 0, Delivery::Ignored),
+        (0x10, 153, 0, 0, Delivery::Ignored),
+    ] {
+        assert_eq!(
+            route(&table, iv(client, source, 0, vmid, pasid, 0)),
+            expected
+        );
+    }
+    assert_eq!(table.lock().endpoint(h).unwrap().stats.signals, 0);
+    // Linux identifies the unified ring by client/source, not ring payload.
+    assert_eq!(
+        route(&table, iv(0x10, 119, 0xff, 0, 0, 0)),
+        Delivery::Signaled
+    );
+    assert!(poll(wait.as_mut()).is_pending()); // a trap never completes a fence
+    done.set(true);
+    assert_eq!(route(&table, iv(0x10, 119, 0, 0, 0, 0)), Delivery::Signaled);
+    assert_eq!(poll(wait.as_mut()), Poll::Ready(Ok(1)));
+    table.lock().retire(h).unwrap();
+    assert_eq!(table.lock().endpoint(h), Err(WaitError::Stale));
+    assert_eq!(route(&table, iv(0x10, 119, 0, 0, 0, 0)), Delivery::Unowned);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-interrupts",
+    navi48_vcn_dispatch_requires_registered_unified_source_and_owned_context
+);
+
 fn navi48_dispatch_coordinated_reset_invalidates_every_old_owner() -> TestResult {
     let mut table = Table::new();
     let keys = [
@@ -145,7 +191,6 @@ fn navi48_dispatch_routes_completions_only_to_exact_live_owners() -> TestResult 
     for e in [
         iv(CLIENT_GFX, 239, 0, 0, 0, 0),
         iv(CLIENT_GFX, 177, 0, 0, 0, 0),
-        iv(0x10, 119, 0, 0, 0, 0),
         iv(0x0f, 0, 0, 0, 0, 0),
         iv(0x1b, 0, 0, 0, 0, 0),
     ] {
@@ -153,7 +198,9 @@ fn navi48_dispatch_routes_completions_only_to_exact_live_owners() -> TestResult 
     }
     let s = t.lock().summary();
     assert_eq!(s.live, 3);
-    assert_eq!(s.counters.unowned, 6);
+    assert_eq!(route(&t, iv(0x10, 119, 0, 0, 0, 0)), Delivery::Unowned);
+    let s = t.lock().summary();
+    assert_eq!(s.counters.unowned, 7);
     assert_eq!(
         (s.counters.unknown, s.counters.media, s.counters.power),
         (2, 1, 1)

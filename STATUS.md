@@ -917,9 +917,13 @@ opt-in `amdgpu.media_proof` power/transport/retirement cycle. Owned firmware
 windows, NBIF doorbells, fresh fence/RPTR completion, byte shared-state
 updates and VCPU/LMI shutdown follow the local Linux reference. SMU14 media
 power commands require fresh protection/static-clock checks. Cancellation
-or uncertainty retains memory and blocks clients. Register/queue models
-cover these paths; media client IBs, codecs, CPU IRQ delivery and JPEG remain
-open, with no new media capabilities advertised.
+or uncertainty retains memory and blocks clients. Source-119 dispatch now
+wakes a registered VCN owner; a fresh proof requires fence/RPTR/trap and,
+with an MSI route, CPU delivery. Registration stays retained on uncertainty
+and is retired only after proven shutdown/power-down, so shared fault re-arm
+cannot overlook a live media owner. Register/queue models cover these paths;
+media client IBs, codecs, JPEG and physical IRQ acceptance remain open, with
+no new media capabilities advertised.
 
 Still open: physical MSI delivery and reset/replay acceptance, GC12 rendering
 and application shader execution, GPU VM/userspace and DCN4

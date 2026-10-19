@@ -28,6 +28,8 @@ pub enum Key {
     Cp(src::Queue),
     /// An SDMA instance/queue.
     Sdma { instance: u8, queue: u8 },
+    /// VCN5's unified queue, source 119 on its VCN client instance.
+    Vcn { instance: u8 },
     /// A user queue named by its non-zero doorbell offset, as the CP EOP
     /// and SDMA fence payloads carry it (amdgpu_userq_process_fence_irq).
     Doorbell(u32),
@@ -296,7 +298,10 @@ impl Table {
         if let Some(t) = self.terminal {
             return Err(RegisterError::Terminal(t));
         }
-        if owner.key == Key::Doorbell(0) || owner.vmid > 15 {
+        if owner.key == Key::Doorbell(0)
+            || owner.vmid > 15
+            || matches!(owner.key, Key::Vcn { instance } if instance > 1)
+        {
             return Err(RegisterError::Invalid);
         }
         if self
@@ -510,9 +515,15 @@ impl Table {
                 Delivery::Terminal(Terminal::Poison(p))
             }
             src::Class::Display(d) => self.display(d),
-            src::Class::Media(_) => {
+            src::Class::Media(media) => {
                 self.counters.media = self.counters.media.saturating_add(1);
-                Delivery::Ignored
+                match media {
+                    src::Media::Vcn {
+                        instance,
+                        source: 119,
+                    } => self.signal(&[Key::Vcn { instance }], v),
+                    _ => Delivery::Ignored,
+                }
             }
             src::Class::Power => {
                 self.counters.power = self.counters.power.saturating_add(1);

@@ -3020,15 +3020,18 @@ vertical interrupt 0, HUBP flip, VUPDATE-no-lock and the DMCUB outbox.
 
 `amdgpu_navi48_dispatch` delivers classified vectors to registered owners,
 following amdgpu_fence.c. An owner registers a `Key` (CP slot, SDMA
-instance/queue or non-zero user doorbell) with its VMID and PASID and gets a
+instance/queue, VCN unified instance or non-zero user doorbell) with its VMID and PASID and gets a
 `Handle` carrying the slot generation. A vector only wakes the owner: `wait`
 snapshots the endpoint, calls the owner's own memory-fence check, and parks
 until the endpoint changes or a 100 ms watchdog fires (Linux's fallback timer
 role); every wait also takes a mandatory deadline. Completion vectors match
 the exact slot first and then the doorbell, as gfx_v12_0_eop_irq does, and
 must carry the owner's VMID/PASID. Vectors for unregistered, retired or
-mismatched owners, unknown sources, media, power and SQ messages are only
-counted. Per-endpoint statistics separate signal and watchdog wakes and
+mismatched owners and unknown sources are counted without completing work.
+VCN source 119 wakes its registered unified owner, identified by client
+instance plus VMID/PASID as in `vcn_v5_0_0_process_interrupt`; its ring payload
+has no separate queue selector. Other media, power and SQ messages remain
+diagnostic. Per-endpoint statistics separate signal and watchdog wakes and
 count completions first seen by the watchdog, the lost-interrupt evidence
 Linux warns about. Waiter storage is bounded (eight per endpoint); an
 overflowing waiter still completes through the watchdog and is counted.
@@ -3047,10 +3050,11 @@ protocol, revocation, fault-monitor errors) with `fail_all`: every current
 waiter wakes with `Terminal`, new waits return it without reading memory, and
 registration is refused. The service registers the kernel graphics
 (ME/pipe/queue 0/0/0), compute (1/0/0) and SDMA0 queue-0 owners for VMID0, and
-`Status` exposes them with the dispatch summary. There are no application
-queues yet, so no client registers user doorbells; MES-scheduled user queues,
-queue reset and fault-source re-arming after containment remain open, and
-after the first fault other owners see later faults only as timeouts.
+`Status` exposes them with the dispatch summary. The optional VCN proof
+retains a separate registration through source enable, execution, shutdown
+and power-down. Application jobs share the owned kernel queues; MES user
+queues and user doorbells are not published. Coordinated queue recovery and
+fault re-arming are described below; late contained faults remain evidence.
 Everything here is model-tested (fake vectors and a local table driven
 through pending waits); none of it has run on the card.
 
@@ -3060,8 +3064,8 @@ display owner (amdgpu_dm acknowledges in `dc_interrupt_ack`). `wait_display`
 takes an interest mask (hot-plug, flip, VUPDATE, vblank, VLINE0, DMUB outbox)
 and the consumer's last-seen version, so an event between two waits is
 reported at once. Overflows and terminal errors wake every display waiter.
-No DCN interrupt source is enabled yet; the flip and vblank paths are still
-polled by their owners.
+The display monitor arms and acknowledges HPD/HPD-RX sources; flip and
+vblank completion remain polled by their owners.
 
 The worker's `Status::wakes` separates drains after a CPU MSI, MSI wakes
 that found nothing, drains after the 100 ms MSI watchdog, watchdog drains
@@ -5217,8 +5221,8 @@ programs PSP firmware, 128 KiB stack, 512 KiB context and a shared page,
 then boots the VCPU with ten bounded reset retries. The shared record enables
 the unified queue and dGPU SMU interface; byte queue-mode updates preserve
 adjacent firmware-owned state. The owned NBIF range and 32-bit doorbell
-follow Linux's SOC24 assignment. VCPU master interrupts remain masked until
-independent media interrupt ownership is implemented.
+follow Linux's SOC24 assignment. VCPU master interrupts remain masked during
+the first transport proof.
 
 `prove().await` emits a native unified FENCE/TRAP/END frame, padded to 64
 dwords, and requires both its new fence and complete monotonic RPTR drain.
@@ -5234,15 +5238,31 @@ Power-down requires the retained VCPU/LMI retirement proof. As other SMU
 runtime operations, cancellation leaves the mailbox owner busy and terminal
 transport errors forbid reuse. No display/GFX clock policy is changed.
 
+`Vcn::prove_interrupts().await` requires a retained independent dispatch
+owner (`Key::Vcn { instance: 0 }`, VMID0/PASID0) before enabling the VCPU
+master source. It samples/drains old source-119 evidence, emits another
+new-sequence frame, and requires its fence, full RPTR drain and exactly one
+fresh VCN trap. A routed MSI also requires a fresh CPU interrupt; polling
+routes report `InterruptProof::msi_verified = false`. Failed or cancelled
+proofs retain source ownership and backing, refuse stop/replay and require
+device recovery. VCN/JPEG diagnostics and foreign contexts cannot complete
+the proof; media vectors only wake registered owners, never complete fences.
+Both transport proofs also check the entire fence-page guard and CPU write
+pointer, rejecting wider-than-dword or stray firmware writes.
+
 The opt-in `amdgpu.media_proof` boot argument requests a retained native
-power-up/start/fence/stop/power-down cycle after the GC12/SDMA interrupt
+power-up/start/fence/interrupt/stop/power-down cycle after the GC12/SDMA interrupt
 proofs, before publishing clears or allowing any client slot. Its pending
 state is stored before the first await; error/cancellation gates all three
 client submit wrappers and returned failure quarantines the IH service.
 `amdgpu_navi48_platform::Diagnostics::media_transport` exposes the result.
+`media_state` preserves the VCPU phase after cancellation or failure.
+The media interrupt handle is retained before source enabling and retired
+only after proven VCPU/LMI stop and power-down. A retained extra owner blocks
+the three-queue global re-arm protocol from assuming media quiescence.
 Explicit whole-device recovery repeats the requested proof with fresh
 owners. This adds no VCN/JPEG client ring or codec capability advertisement;
-IB/codec execution, media MSI, JPEG and physical acceptance remain open.
+IB/codec execution, JPEG and physical MSI/engine acceptance remain open.
 
 ### AMD platform VBIOS
 
