@@ -64,7 +64,9 @@ loaded and before anything can write (log replay, the commit timer, any VFS
 operation), once per shared core (`registry`); a refusal makes the core
 read-only for its lifetime, is logged, and makes later read-write mounts of
 it fail. A read-write `mount -t btrfs` that cannot be honoured returns
-`FsError::ReadOnly` (EROFS). Data extents are allocated only from DATA block
+`FsError::ReadOnly` (EROFS). A read-only core with an unreplayed fsync log
+mounts the committed trees without replaying it (Linux `nologreplay`),
+logs a warning, and leaves the log for the next writable mount. Data extents are allocated only from DATA block
 groups and tree blocks only from METADATA ones. A write through an open file
 uses the inode item from the tree, never the node's cached copy.
 

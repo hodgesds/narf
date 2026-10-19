@@ -1984,9 +1984,24 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         //     reads the fs tree. The replay commits into the fs tree and publishes
         //     the recovered roots via `commit_roots`, so later steps see them.
         if self.superblock().log_root != 0 && !self.supports_writes() {
-            // Replay mutates the fs tree and superblock, so it is permitted only
-            // when the selected tree is writable.
-            return Err(FsError::Unsupported);
+            // Replay mutates the fs tree and superblock, so it is permitted
+            // only when the core is writable. A read-only core mounts the
+            // committed trees and leaves the log alone (Linux `nologreplay`):
+            // the state as of the last full commit, consistent but without
+            // the fsyncs made since, and the log still there for the next
+            // writable mount (Linux's or NARF's) to replay. Refusing instead
+            // would leave a root that went down uncleanly unbootable
+            // read-only, the mode meant to be safe on it. `make_writable`
+            // and the rw gate keep refusing writes while the log exists.
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "btrfs: WARNING: unreplayed fsync log (log_root {:#x}); read-only mount \
+                 without replay: files fsynced after the last commit show their \
+                 committed state until a read-write mount replays the log",
+                self.superblock().log_root
+            );
+            return self.select_default_root().await;
         }
         crate::write::replay_log(self).await?;
         self.select_default_root().await
