@@ -699,13 +699,17 @@ pub(crate) fn publish_current_punch(
 
 /// Physical file-cache pages for generic `MAP_SHARED` fallbacks. A filesystem
 /// which cannot directly expose its own page-cache frames still needs one
-/// backing page per `(open file description, file offset)`: otherwise two
-/// overlapping mappings diverge and the last writeback can overwrite a newer
-/// change through the other mapping.
+/// backing page per `(file, file offset)`: otherwise two overlapping mappings
+/// diverge and the last writeback can overwrite a newer change through the
+/// other mapping. The file is `FileOps::mmap_backing_identity`, so a
+/// filesystem whose opens are separate `FileOps` objects (btrfs) shares the
+/// pages of one inode across every open and process.
 struct SharedFilePage {
     /// Weak to avoid making the global cache keep an unlinked inode alive.
     /// Every active mapping independently owns a strong FileOps reference.
     ops: Weak<dyn FileOps>,
+    /// `mmap_backing_identity` of the file this page caches.
+    identity: usize,
     offset: u64,
     phys: PhysAddr,
     mappings: usize,
@@ -742,8 +746,8 @@ impl SharedFilePages {
         }
     }
 
-    fn key(ops: &Arc<dyn FileOps>, offset: u64) -> SharedFileKey {
-        Self::key_from_ptr(Arc::as_ptr(ops) as *const () as usize, offset)
+    fn key(identity: usize, offset: u64) -> SharedFileKey {
+        Self::key_from_ptr(identity, offset)
     }
 
     fn key_from_ptr(file: usize, offset: u64) -> SharedFileKey {
@@ -752,7 +756,7 @@ impl SharedFilePages {
 
     fn remove_phys(&mut self, phys: u64) -> Option<SharedFilePage> {
         let page = self.by_phys.remove(&phys)?;
-        let key = Self::key_from_ptr(Weak::as_ptr(&page.ops) as *const () as usize, page.offset);
+        let key = Self::key_from_ptr(page.identity, page.offset);
         assert_eq!(
             self.by_file.remove(&key),
             Some(phys),
@@ -770,10 +774,17 @@ static SHARED_FILE_PAGES: IrqSafeSpinLock<SharedFilePages> =
 /// lose MAP_SHARED writes. Linux makes the same distinction in its page cache.
 const MAX_RETAINED_SHARED_FILE_PAGES: usize = 1024;
 
-fn shared_page_matches_ops(page: &SharedFilePage, ops: &Arc<dyn FileOps>) -> bool {
-    page.ops
-        .upgrade()
-        .is_some_and(|owner| Arc::ptr_eq(&owner, ops))
+/// `page` caches `ops`'s file. A page with live mappings or pending holds is
+/// pinned by those mappers' strong `FileOps` references, so its identity
+/// cannot have been reused; an idle page additionally needs its recording
+/// open to be alive, so a recycled default identity (an object address)
+/// never adopts another file's stale page.
+///
+/// `identity` is the caller's `ops.mmap_backing_identity()`, computed before
+/// taking the cache lock (a filesystem may lock or allocate to answer it).
+fn shared_page_matches_ops(page: &SharedFilePage, identity: usize) -> bool {
+    page.identity == identity
+        && (page.mappings != 0 || page.pending != 0 || page.ops.upgrade().is_some())
 }
 
 fn retain_pending_shared_page(page: &mut SharedFilePage) {
@@ -813,16 +824,17 @@ pub(crate) fn reserve_cached_shared_file_pages(
     count: usize,
 ) -> Option<(Vec<PhysAddr>, SharedFilePublication)> {
     let generation = ops.mmap_cache_generation()?;
+    let identity = ops.mmap_backing_identity();
     let mut canonical = Vec::new();
     canonical.try_reserve_exact(count).ok()?;
     {
         let mut pages = SHARED_FILE_PAGES.lock();
         for index in 0..count {
             let page_offset = offset.checked_add(index as u64 * 4096)?;
-            let key = SharedFilePages::key(ops, page_offset);
+            let key = SharedFilePages::key(identity, page_offset);
             let phys = *pages.by_file.get(&key)?;
             let page = pages.by_phys.get(&phys)?;
-            if !shared_page_matches_ops(page, ops)
+            if !shared_page_matches_ops(page, identity)
                 || (page.mappings == 0
                     && page.pending == 0
                     && page.cache_generation != Some(generation))
@@ -1083,16 +1095,17 @@ pub(crate) fn publish_shared_file_pages(
     let mut canonical = Vec::with_capacity(prepared.len());
     let cache_generation =
         expected_generation.filter(|generation| ops.mmap_cache_generation() == Some(*generation));
+    let identity = ops.mmap_backing_identity();
     {
         let mut pages = SHARED_FILE_PAGES.lock();
         for (index, (candidate, clean)) in prepared.into_iter().enumerate() {
             let page_offset = offset
                 .checked_add(index as u64 * 4096)
                 .expect("validated mmap file offset overflowed");
-            let key = SharedFilePages::key(ops, page_offset);
+            let key = SharedFilePages::key(identity, page_offset);
             let existing = pages.by_file.get(&key).copied().filter(|phys| {
                 pages.by_phys.get(phys).is_some_and(|page| {
-                    shared_page_matches_ops(page, ops)
+                    shared_page_matches_ops(page, identity)
                         && (page.mappings != 0
                             || page.pending != 0
                             || (cache_generation.is_some()
@@ -1124,6 +1137,7 @@ pub(crate) fn publish_shared_file_pages(
                             phys,
                             SharedFilePage {
                                 ops: Arc::downgrade(ops),
+                                identity,
                                 offset: page_offset,
                                 phys: candidate,
                                 mappings: 0,
@@ -1895,9 +1909,10 @@ fn snapshot_dirty_page(
     phys: PhysAddr,
     len: usize,
 ) -> Option<Vec<u8>> {
+    let identity = ops.mmap_backing_identity();
     let pages = SHARED_FILE_PAGES.lock();
     let page = pages.by_phys.get(&phys.raw())?;
-    if page.offset != offset || !shared_page_matches_ops(page, ops) {
+    if page.offset != offset || !shared_page_matches_ops(page, identity) {
         return None;
     }
     // SAFETY: the cache entry owns `phys`; the cache lock prevents its last
@@ -1915,11 +1930,12 @@ fn snapshot_dirty_page(
 /// describes what reached the file, so the next fsync observes it as dirty.
 fn mark_page_clean(ops: &Arc<dyn FileOps>, offset: u64, phys: PhysAddr, bytes: &[u8]) {
     let cache_generation = ops.mmap_cache_generation();
+    let identity = ops.mmap_backing_identity();
     let mut pages = SHARED_FILE_PAGES.lock();
     if let Some(page) = pages
         .by_phys
         .get_mut(&phys.raw())
-        .filter(|page| page.offset == offset && shared_page_matches_ops(page, ops))
+        .filter(|page| page.offset == offset && shared_page_matches_ops(page, identity))
     {
         page.clean[..bytes.len()].copy_from_slice(bytes);
         page.cache_generation = cache_generation;
