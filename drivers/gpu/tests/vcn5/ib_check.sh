@@ -17,7 +17,7 @@ names = [
     'amdgpu_vcn_dec_get_create_msg', 'amdgpu_vcn_dec_get_destroy_msg',
     'amdgpu_vcn_dec_sw_send_msg',
 ]
-pieces = []
+pieces = [source[:source.index('#include')], header[:header.index('#ifndef')]]
 for name in names:
     start = re.search(r'^static[^\n]*\b'+name+r'\s*\(', source, re.M)
     if not start:

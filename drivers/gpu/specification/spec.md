@@ -5342,6 +5342,35 @@ Host reference checks compile the unchanged local Linux constructors and
 compare their output with the Rust builders. Session messages exercise IB
 transport, not video-frame encoding or decoding.
 
+The opt-in `amdgpu.decode_proof` additionally requests
+`unsafe Vcn::prove_decode().await` after the session IB test. It uses IGT
+GPU Tools 2.4's fixed AVC stream, create/decode/destroy messages and scaling
+data (pinned hashes and MIT notices under `drivers/gpu/fixtures/vcn5`).
+An independently reserved arena owns the 128 KiB session context, messages,
+feedback, input, DPB/context, target and commands. Guards bracket the arena
+and both sides of the output. Descriptor addresses are validated within
+48 bits and match the unchanged IGT constructors for those owned addresses.
+There is no intervening client job before this kernel-VMID0 proof.
+
+`DecodeTesting` and pending `decode_result` precede allocation publication's
+first await. Every page, including the target, is initialized; copying the
+reference checksum into the target is never a production operation. One
+new frame runs all three IBs and requires fresh fence/RPTR/trap/CPU evidence.
+The 737280-byte output must sum to IGT's `0x20345d8`, with command pages,
+padding, arena/output guards and the original fence guards unchanged.
+`DecodeChecksum(actual)` distinguishes wrong/missing pixels from transport
+failure. Bulk initialization/readback yields between pages, with no IRQ-safe
+lock across awaits. Failed/cancelled work retains the full reservation and
+refuses stop or replay; successful VCPU/LMI shutdown permits reuse.
+
+`DecodeVerified`, `Vcn::decode_result` and platform `Diagnostics::media_decode`
+preserve completion and output evidence. A requested decode proof is repeated
+after media recovery before retirement reopens. Without native media clients
+the flag runs the proof then completes the existing stop/power-down cycle;
+with clients it retains the proven VCPU. This flag advertises no codec
+profile. Models simulate device output only to test completion, checksum and
+storage rules; actual AVC decoding remains an end-of-bring-up silicon test.
+
 The opt-in `amdgpu.media_proof` boot argument requests a retained native
 power-up/start/fence/interrupt/stop/power-down cycle after the GC12/SDMA interrupt
 proofs, before publishing clears or allowing any client slot. Its pending

@@ -1,0 +1,109 @@
+Upstream material used by the Navi48 VCN implementation
+=====================================================
+
+These attributions identify upstream material, rather than assigning
+ownership of independently written NARF Rust code to AMD. The repository's
+license is in /LICENSE; the notices below preserve the upstream terms.
+
+IGT GPU Tools 2.4 (MIT)
+-----------------------
+
+Source archive:
+https://www.x.org/releases/individual/app/igt-gpu-tools-2.4.tar.xz
+SHA-256: a44b7d089a27555944d4cd5da372c9339501539e3cd2735bbdb30e0d802f1cbe
+
+lib/amdgpu/amd_vcn_shared.c and lib/amdgpu/amd_vcn_shared.h:
+  Unified decode-buffer ABI reference for amdgpu_vcn_navi48_decode_words.rs.
+  Copyright 2025 Advanced Micro Devices, Inc.
+
+tests/amdgpu/amd_vcn.c:
+  Header-inspection reference for amdgpu_vcn_navi48_h264.rs.
+  Copyright 2023 Advanced Micro Devices, Inc.
+  Copyright 2014 Advanced Micro Devices, Inc.
+
+lib/amdgpu/amd_mmd_shared.h:
+  Decoder error enum extracted by the reference harness.
+  Copyright 2023 Advanced Micro Devices, Inc.
+  Copyright 2014 Advanced Micro Devices, Inc.
+
+lib/amdgpu/amd_mmd_decode_messages.h:
+  Binary fixture arrays in fixtures/vcn5/; hashes and individual array names
+  are recorded in fixtures/vcn5/manifest.json. Their permission notice is
+  also retained in fixtures/vcn5/LICENSE.
+  Copyright 2023 Advanced Micro Devices, Inc.
+  Copyright 2017 Advanced Micro Devices, Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+Linux amdgpu_vcn.c
+------------------
+
+Source: /usr/src/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
+Used for the fixed session messages and protocol builders adapted in
+src/amdgpu_vcn_navi48_ib_words.rs. Original file notice:
+
+Copyright 2016-2024 Advanced Micro Devices, Inc.
+All Rights Reserved.
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sub license, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL
+THE COPYRIGHT HOLDERS, AUTHORS AND/OR ITS SUPPLIERS BE LIABLE FOR ANY CLAIM,
+DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+The above copyright notice and this permission notice (including the
+next paragraph) shall be included in all copies or substantial portions
+of the Software.
+
+Linux amdgpu_vcn.h
+------------------
+
+The session reference harness also extracts the decode-buffer structure
+and constants from /usr/src/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h.
+Original file notice:
+
+Copyright 2016-2024 Advanced Micro Devices, Inc. All rights reserved.
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the "Software"),
+to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.

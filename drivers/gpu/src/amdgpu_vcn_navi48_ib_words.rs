@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Fixed session data and protocol builders adapted from Linux amdgpu_vcn.c:
+// Copyright 2016-2024 Advanced Micro Devices, Inc.
+// Original permissive notices are retained in ../VCN-NOTICES.
 //! Fixed unified session IBs from Linux amdgpu_vcn_unified_ring_test_ib.
 //! These test firmware IB transport; they do not encode/decode video frames.
 use super::Error;

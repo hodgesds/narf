@@ -10,6 +10,9 @@ impl ColdBoot {
         }
         let vcn = hw.vcn.as_ref()?;
         vcn.ib_result()?.ok()?;
+        if hw.media_decode_required {
+            vcn.decode_result()?.ok()?;
+        }
         vcn.fence_reader()
     }
     pub(crate) fn client_media_owner(&self) -> Option<dispatch::Handle> {
@@ -39,7 +42,10 @@ impl ColdBoot {
             return Err(vcn::Error::Busy);
         }
         let vcn = self.sequence.backend.vcn.as_mut().ok_or(vcn::Error::Busy)?;
-        if vcn.state() != vcn::State::IbVerified {
+        if !matches!(
+            vcn.state(),
+            vcn::State::IbVerified | vcn::State::DecodeVerified
+        ) {
             return Err(vcn::Error::Busy);
         }
         // SAFETY: the caller supplies the owned MMHUB binding and resources.
@@ -87,6 +93,7 @@ impl ColdBoot {
             return Err(Error::Busy);
         }
         hw.media_test = Some(Err(Error::Busy));
+        let decode = hw.media_decode_required;
         let vcn = hw.vcn.as_mut().ok_or(Error::Invalid)?;
         // SAFETY: coordinated re-arm completed, media registration retained,
         // native transport drained and independent IH service remains active.
@@ -94,7 +101,15 @@ impl ColdBoot {
             // SAFETY: same renewed owner and exclusively retained transport.
             unsafe { vcn.prove_interrupts().await }.map_err(Error::Vcn)?;
             // SAFETY: ring drained, no client replay and kernel VMID0 retained.
-            unsafe { vcn.prove_ibs().await }.map_err(Error::Vcn)
+            let mut proof = unsafe { vcn.prove_ibs().await }.map_err(Error::Vcn)?;
+            if decode {
+                // SAFETY: same retained kernel VMID0 and no replay until the
+                // requested picture proof and all other rings finish.
+                proof = unsafe { vcn.prove_decode().await }
+                    .map_err(Error::Vcn)?
+                    .completion;
+            }
+            Ok(proof)
         }
         .await;
         hw.media_test = Some(result);

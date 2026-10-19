@@ -19,6 +19,13 @@ struct Fake {
     writes: Vec<(u64, u32)>,
     memory: Vec<u8>,
     ib_memory: Vec<u8>,
+    decode_memory: Vec<u8>,
+    decode_stages: u8,
+    decode_dpb_zeroes: u64,
+    decode_no_output: bool,
+    decode_bad_output: bool,
+    decode_guard: bool,
+    decode_stall: bool,
     kernel_ibs: u8,
     kernel_sessions: [bool; 2],
     kernel_corrupt: bool,
@@ -46,7 +53,110 @@ struct Fake {
     fence_reads: u32,
 }
 impl Fake {
+    // Keep the opaque, zeroed 16 MiB DPB sparse in the software model.
+    // Physical descriptor addresses and the reservation still span it fully.
+    fn codec_index(at: u64) -> Option<usize> {
+        use decode_words as d;
+        assert!(at < d::BYTES);
+        if at < d::DPB {
+            Some(at as usize)
+        } else if at >= d::TARGET_GUARD {
+            Some((at - (d::TARGET_GUARD - d::DPB)) as usize)
+        } else {
+            None
+        }
+    }
+    fn codec_word(&self, at: u64) -> u32 {
+        Self::codec_index(at).map_or(0, |i| {
+            u32::from_le_bytes(self.decode_memory[i..i + 4].try_into().unwrap())
+        })
+    }
+    fn codec_ib(&mut self, address: u64, length: u32) -> bool {
+        use decode_words as d;
+        let base = GPU + BYTES + ib_words::IB_BYTES;
+        assert_eq!(length, 43);
+        let data: Vec<u32> = (0..length)
+            .map(|i| self.codec_word(address - base + u64::from(i) * 4))
+            .collect();
+        assert_eq!(&data[..2], &[0x10, 0x30000002]);
+        assert_eq!(&data[3..10], &[39, 0x10, 0x30000001, 3, 156, 140, 1]);
+        assert_eq!(
+            data[2],
+            data[4..].iter().fold(0u32, |s, w| s.wrapping_add(*w))
+        );
+        let ptr = |at: usize| ((u64::from(data[at]) << 32) | u64::from(data[at + 1])) - base;
+        assert_eq!(ptr(17), d::SESSION);
+        let msg_word = |index: u64| self.codec_word(ptr(11) + index * 4);
+        assert_eq!(msg_word(0), 0x28);
+        assert_eq!(msg_word(4), 0x40440003);
+        match self.decode_stages % 3 {
+            0 => {
+                assert_eq!(data[10], 0x100001);
+                assert_eq!(msg_word(3), 0);
+            }
+            1 => {
+                assert_eq!(msg_word(3), 1);
+                assert_eq!(data[10], 0x100a1f);
+                for (at, expected) in [
+                    (13, d::DPB),
+                    (15, d::TARGET),
+                    (19, d::BITSTREAM),
+                    (21, d::CONTEXT),
+                    (23, d::FEEDBACK),
+                    (31, d::SCALING),
+                ] {
+                    assert_eq!(ptr(at), expected);
+                }
+                assert_eq!(
+                    &self.decode_memory
+                        [d::BITSTREAM as usize..d::BITSTREAM as usize + d::STREAM.len()],
+                    d::STREAM
+                );
+                assert_eq!(
+                    self.decode_dpb_zeroes,
+                    (d::TARGET_GUARD - d::DPB) / 4 * (u64::from(self.decode_stages / 3) + 1)
+                );
+                if self.decode_stall {
+                    return false;
+                }
+                let target = Self::codec_index(d::TARGET).unwrap();
+                assert!(
+                    self.decode_memory[target..target + d::TARGET_BYTES as usize]
+                        .iter()
+                        .all(|b| *b == 0)
+                );
+                // Synthetic hardware output tests the witness/checksum contract;
+                // this model is not an H.264 decoder or silicon acceptance.
+                if !self.decode_no_output {
+                    let mut remaining = d::EXPECTED_SUM;
+                    for byte in &mut self.decode_memory[target..target + d::TARGET_BYTES as usize] {
+                        let value = remaining.min(255) as u8;
+                        *byte = value;
+                        remaining -= u64::from(value);
+                    }
+                    assert_eq!(remaining, 0);
+                    if self.decode_bad_output {
+                        self.decode_memory[target] -= 1;
+                    }
+                }
+                if self.decode_guard {
+                    self.decode_memory[Self::codec_index(d::TARGET_END_GUARD).unwrap()] ^= 1;
+                }
+            }
+            2 => {
+                assert_eq!(data[10], 0x100001);
+                assert_eq!(msg_word(3), 2);
+            }
+            _ => unreachable!(),
+        }
+        self.decode_stages += 1;
+        true
+    }
     fn kernel_ib(&mut self, address: u64, length: u32) -> bool {
+        let codec_base = GPU + BYTES + ib_words::IB_BYTES;
+        if (codec_base..codec_base + decode_words::BYTES).contains(&address) {
+            return self.codec_ib(address, length);
+        }
         assert!(!self.dirty);
         if self.kernel_corrupt || self.kernel_stall_at == Some(self.kernel_ibs) {
             return false;
@@ -154,6 +264,9 @@ impl Io for Fake {
         }
     }
     fn memory_read(&mut self, map: MmioRegion, at: u64) -> u32 {
+        if map.phys.raw() == 0x90004000 + BYTES + ib_words::IB_BYTES {
+            return self.codec_word(at);
+        }
         if map.phys.raw() == 0x90004000 + BYTES {
             return u32::from_le_bytes(
                 self.ib_memory[at as usize..at as usize + 4]
@@ -173,6 +286,23 @@ impl Io for Fake {
         self.word(at)
     }
     fn memory_write(&mut self, map: MmioRegion, at: u64, value: u32) {
+        if map.phys.raw() == 0x90004000 + BYTES + ib_words::IB_BYTES {
+            if self.decode_memory.is_empty() {
+                self.decode_memory.resize(
+                    (decode_words::BYTES - (decode_words::TARGET_GUARD - decode_words::DPB))
+                        as usize,
+                    0x5a,
+                );
+            }
+            if let Some(i) = Self::codec_index(at) {
+                self.decode_memory[i..i + 4].copy_from_slice(&value.to_le_bytes());
+            } else {
+                assert_eq!(value, 0);
+                self.decode_dpb_zeroes += 1;
+            }
+            self.dirty = true;
+            return;
+        }
         if map.phys.raw() == 0x90004000 + BYTES {
             self.ib_memory[at as usize..at as usize + 4].copy_from_slice(&value.to_le_bytes());
             self.dirty = true;
@@ -289,10 +419,13 @@ impl Io for Fake {
     }
 }
 fn fixture() -> (Pool, Engine<Fake>) {
+    fixture_capacity(BYTES * 2)
+}
+fn fixture_capacity(capacity: u64) -> (Pool, Engine<Fake>) {
     let map = MmioRegion {
         phys: narf_memory::PhysAddr::new(0x9000_4000),
         virt: 0,
-        len: BYTES * 2,
+        len: capacity,
         kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
     };
     // SAFETY: model intercepts memory I/O; mapping is bookkeeping only.
@@ -309,6 +442,13 @@ fn fixture() -> (Pool, Engine<Fake>) {
             writes: Vec::new(),
             memory: vec![0x5a; BYTES as usize],
             ib_memory: vec![0x5a; ib_words::IB_BYTES as usize],
+            decode_memory: Vec::new(),
+            decode_stages: 0,
+            decode_dpb_zeroes: 0,
+            decode_no_output: false,
+            decode_bad_output: false,
+            decode_guard: false,
+            decode_stall: false,
             kernel_ibs: 0,
             kernel_sessions: [false; 2],
             kernel_corrupt: false,
@@ -346,11 +486,13 @@ fn fixture() -> (Pool, Engine<Fake>) {
         memory: pool.reserve(BYTES).unwrap(),
         ib_pool: pool.clone(),
         ib_memory: None,
+        decode_memory: None,
         firmware_bytes: 0x11000,
         state: State::Prepared,
         proof: None,
         interrupt_result: None,
         ib_result: None,
+        decode_result: None,
         wptr: 0,
         seq: 0,
     };
@@ -1118,4 +1260,139 @@ fn vcn5_wrapped_transport_and_interrupt_proofs_cannot_match_cleared_zero() -> Te
 kernel_test_in!(
     "drivers/gpu/vcn-navi48",
     vcn5_wrapped_transport_and_interrupt_proofs_cannot_match_cleared_zero
+);
+
+fn decode_ready() -> (Pool, Engine<Fake>, Irqs) {
+    let (pool, mut e) = fixture_capacity(BYTES * 2 + decode_words::BYTES);
+    run(e.start(IMAGE, power())).unwrap();
+    run(e.prove()).unwrap();
+    let mut observer = irqs(&e, Some(64));
+    run(e.prove_interrupts(&mut observer)).unwrap();
+    run(e.prove_ibs(&mut observer)).unwrap();
+    (pool, e, observer)
+}
+fn vcn5_avc_picture_proof_requires_new_output_and_preserves_owned_guards() -> TestResult {
+    let (pool, mut e, mut observer) = decode_ready();
+    let proof = run(e.prove_decode(&mut observer)).unwrap();
+    assert_eq!(proof.output_sum, decode_words::EXPECTED_SUM);
+    assert_eq!(
+        proof.completion.fence,
+        Proof {
+            sequence: 4,
+            read_pointer: 256
+        }
+    );
+    assert!(proof.completion.msi_verified);
+    assert_eq!(e.decode_result, Some(Ok(proof)));
+    assert_eq!(e.state, State::DecodeVerified);
+    assert_eq!(e.io.decode_stages, 3);
+    assert!(!e.decode_memory.as_ref().unwrap().reusable_for_test());
+    assert_eq!(run(e.prove_decode(&mut observer)), Err(Error::Busy));
+    let job = crate::amdgpu_gfx12_queue::Job::new(3, 11, 0x1000, &[(0x2000, 4)]).unwrap();
+    assert_eq!(e.submit(job), Ok(5));
+    assert_eq!(e.completed_job(), Ok(5));
+    run(e.stop()).unwrap();
+    assert!(e.decode_memory.as_ref().unwrap().reusable_for_test());
+    drop(e);
+    assert_eq!(pool.available(), BYTES * 2 + decode_words::BYTES);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi48",
+    vcn5_avc_picture_proof_requires_new_output_and_preserves_owned_guards
+);
+
+fn vcn5_avc_picture_failures_quarantine_every_published_buffer() -> TestResult {
+    for case in 0..6 {
+        let (pool, mut e, mut observer) = decode_ready();
+        let expected = match case {
+            0 => {
+                e.io.decode_no_output = true;
+                Error::DecodeChecksum(0)
+            }
+            1 => {
+                e.io.decode_bad_output = true;
+                Error::DecodeChecksum(decode_words::EXPECTED_SUM - 1)
+            }
+            2 => {
+                e.io.decode_guard = true;
+                Error::Readback
+            }
+            3 => {
+                e.io.decode_stall = true;
+                Error::Timeout
+            }
+            4 => {
+                e.io.fence = false;
+                Error::Timeout
+            }
+            _ => {
+                e.io.emit_cpu = false;
+                Error::Timeout
+            }
+        };
+        assert_eq!(run(e.prove_decode(&mut observer)), Err(expected));
+        assert_eq!(e.state, State::Failed(expected));
+        assert_eq!(e.decode_result, Some(Err(expected)));
+        assert_eq!(run(e.stop()), Err(Error::Busy));
+        assert!(!e.decode_memory.as_ref().unwrap().reusable_for_test());
+        let available = pool.available();
+        drop(e);
+        assert_eq!(pool.available(), available);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi48",
+    vcn5_avc_picture_failures_quarantine_every_published_buffer
+);
+
+fn vcn5_avc_picture_cancel_retains_storage_before_and_after_publication() -> TestResult {
+    for published in [false, true] {
+        let (pool, mut e, mut observer) = decode_ready();
+        observer.stall_observed = published;
+        {
+            let mut future = core::pin::pin!(e.prove_decode(&mut observer));
+            let polls = if published {
+                decode_words::BYTES / 4096 + 1
+            } else {
+                1
+            };
+            for _ in 0..polls {
+                assert!(future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending());
+            }
+        }
+        assert_eq!(e.io.decode_stages, if published { 3 } else { 0 });
+        assert_eq!(e.state, State::DecodeTesting);
+        assert_eq!(e.decode_result, Some(Err(Error::Busy)));
+        assert_eq!(run(e.stop()), Err(Error::Busy));
+        assert!(!e.decode_memory.as_ref().unwrap().reusable_for_test());
+        let available = pool.available();
+        drop(e);
+        assert_eq!(pool.available(), available);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi48",
+    vcn5_avc_picture_cancel_retains_storage_before_and_after_publication
+);
+
+fn vcn5_avc_picture_allocation_refusal_does_not_publish_an_empty_proof() -> TestResult {
+    let (pool, mut e, mut observer) = ib_ready();
+    run(e.prove_ibs(&mut observer)).unwrap();
+    let available = pool.available();
+    assert_eq!(run(e.prove_decode(&mut observer)), Err(Error::Allocation));
+    assert_eq!(e.state, State::IbVerified);
+    assert!(e.decode_result.is_none() && e.decode_memory.is_none());
+    assert_eq!((e.seq, e.wptr), (3, 192));
+    assert_eq!(pool.available(), available);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi48",
+    vcn5_avc_picture_allocation_refusal_does_not_publish_an_empty_proof
 );

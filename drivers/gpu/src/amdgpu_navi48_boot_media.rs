@@ -20,6 +20,9 @@ impl ColdBoot {
     pub(crate) fn media_ib_result(&self) -> Option<Result<vcn::InterruptProof, vcn::Error>> {
         self.sequence.backend.vcn.as_ref()?.ib_result()
     }
+    pub(crate) fn media_decode_result(&self) -> Option<Result<vcn::DecodeProof, vcn::Error>> {
+        self.sequence.backend.vcn.as_ref()?.decode_result()
+    }
     /// # Safety
     /// OWNER excludes every engine/PM/firmware user, no client job or clear
     /// has been published, and this is the retained post-interrupt-proof GPU.
@@ -27,6 +30,7 @@ impl ColdBoot {
     pub(crate) async unsafe fn prove_media_transport(
         &mut self,
         keep_running: bool,
+        decode: bool,
     ) -> Result<vcn::InterruptProof, Error> {
         if self.state() != State::MemoryReady || self.sequence.backend.media_test.is_some() {
             return Err(Error::Busy);
@@ -35,6 +39,7 @@ impl ColdBoot {
         // Written before the first await, so cancellation keeps all three
         // client submit wrappers closed even if the VCPU never started.
         hw.media_test = Some(Err(Error::Busy));
+        hw.media_decode_required = decode;
         let result = async {
             let image = hw
                 .firmware
@@ -80,11 +85,21 @@ impl ColdBoot {
             );
             // SAFETY: matching retained registration, independent IH service,
             // drained kernel transport, exclusive OWNER and enabled CPU IRQs.
-            let proof = unsafe { vcn.prove_interrupts().await }.map_err(Error::Vcn)?;
-            if keep_running {
+            let mut proof = unsafe { vcn.prove_interrupts().await }.map_err(Error::Vcn)?;
+            if keep_running || decode {
                 // SAFETY: no client publication yet; matching kernel VMID0,
                 // retained firmware and live registered source owner.
-                return unsafe { vcn.prove_ibs().await }.map_err(Error::Vcn);
+                proof = unsafe { vcn.prove_ibs().await }.map_err(Error::Vcn)?;
+            }
+            if decode {
+                // SAFETY: same retained kernel VMID0/firmware/source owner,
+                // no intervening client publication and a drained IB proof.
+                proof = unsafe { vcn.prove_decode().await }
+                    .map_err(Error::Vcn)?
+                    .completion;
+            }
+            if keep_running {
+                return Ok(proof);
             }
             // SAFETY: no client publication; the proof drained its whole ring.
             unsafe { vcn.stop().await }.map_err(Error::Vcn)?;

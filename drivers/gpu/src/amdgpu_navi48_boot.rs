@@ -206,6 +206,7 @@ struct Hardware {
     queues: Option<queues::Queues>,
     vcn: Option<crate::amdgpu_vcn_navi48::Vcn>,
     media_test: Option<Result<crate::amdgpu_vcn_navi48::InterruptProof, Error>>,
+    media_decode_required: bool,
     vcn_owner: Option<crate::amdgpu_navi48_dispatch::Handle>,
 }
 impl Backend for Hardware {
@@ -663,6 +664,7 @@ impl ColdBoot {
                     sdma: None,
                     vcn: None,
                     media_test: None,
+                    media_decode_required: false,
                     vcn_owner: None,
                     mes: None,
                     queues: None,

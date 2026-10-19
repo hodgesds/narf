@@ -938,6 +938,14 @@ messages in separately retained context/IB/message storage, requiring new
 fence/RPTR/trap/CPU evidence and unchanged command-page guards. Its pending
 phase closes clients, and cancellation/failure retains every allocation.
 Rust builders match unchanged Linux constructors in a host capture harness.
+The opt-in `amdgpu.decode_proof` now submits a pinned IGT AVC picture fixture
+in a separately retained guarded arena, requiring new completion evidence and
+the upstream output checksum. Page-wise initialization/readback cooperates
+with the executor. Diagnostics retain the pending/result phase, failures keep
+all backing pinned and requested tests repeat after media recovery. Descriptor
+builders and fixture bytes match unchanged IGT source; device models exercise
+missing/wrong output, guards, partial execution and cancellation. Real picture
+decoding remains pending physical acceptance, with codec profiles unadvertised.
 Fault recovery
 requires all four retirements and renewed owners, followed by a new media
 interrupt and session IB proof before ledger commit. Media restart cancels old codec
