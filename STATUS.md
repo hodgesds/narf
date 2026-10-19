@@ -887,6 +887,16 @@ publishing its new submitter. Independent LLVM assembly, Linux-header checks
 and execution/failure models cover this path; physical execution is unverified.
 It does not enable Mesa acceleration or exercise draw state or client VMIDs.
 
+Navi48 interrupt handoff now accepts the client VMIDs initialized by its own
+GMC owner. The previous monitor required them disabled, contradicting cold
+boot's client-context setup and preventing native service handoff. Fresh
+same-device checks require every client context to retain the owned empty
+root, VA range and nonretrying control before arming. Fault IRQs now cover
+all sixteen VMIDs on both hubs; containment and partial-write cleanup mask
+the same owned set while preserving translation policy and EOP enables.
+GMC-to-monitor integration and negative register models cover this path;
+physical handoff remains unverified.
+
 Still open: physical MSI delivery verification and physical reset/replay
 acceptance, fault-source re-arming after containment, GC12 rendering and
 application shader dispatch, production GPU VM and userspace submission,

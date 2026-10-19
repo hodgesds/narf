@@ -77,6 +77,7 @@ fn fixture() -> Engine<Fake> {
             mask_error: None,
         },
         published: 0,
+        owned_clients: false,
     }
 }
 fn event(client: u8, source: u8, ring: u8) -> ih::Event {
@@ -98,7 +99,7 @@ fn navi48_fault_arming_preserves_defaults_eops_and_inactive_user_contexts() -> T
     let mut e = fixture();
     e.io.regs.insert(GCP, 0);
     e.io.regs.insert(CCP, 0);
-    e.enable().unwrap();
+    e.enable(None).unwrap();
     assert_eq!(e.status.state, State::Armed);
     assert_eq!(
         e.io.writes,
@@ -112,7 +113,7 @@ fn navi48_fault_arming_preserves_defaults_eops_and_inactive_user_contexts() -> T
     );
     assert_eq!(e.io.regs[&GCTL], 0x1ffc);
     assert_eq!(e.io.regs[&MCTL], 0x1ffc);
-    assert_eq!(e.enable(), Err(Error::Busy));
+    assert_eq!(e.enable(None), Err(Error::Busy));
     e.stop();
     assert_eq!(e.status.state, State::Contained);
     for (at, value) in [
@@ -124,7 +125,7 @@ fn navi48_fault_arming_preserves_defaults_eops_and_inactive_user_contexts() -> T
     ] {
         assert_eq!(e.io.regs[&at], value);
     }
-    assert_eq!(e.enable(), Err(Error::Busy));
+    assert_eq!(e.enable(None), Err(Error::Busy));
     TestResult::Pass
 }
 kernel_test_in!(
@@ -135,7 +136,7 @@ kernel_test_in!(
 fn navi48_vm_faults_decode_48bit_addresses_capture_then_ack_and_contain() -> TestResult {
     for client in [0x0a, 0x12] {
         let mut e = fixture();
-        e.enable().unwrap();
+        e.enable(None).unwrap();
         e.io.reads.clear();
         e.io.writes.clear();
         e.io.stale_gfx = true;
@@ -173,7 +174,7 @@ fn navi48_vm_faults_decode_48bit_addresses_capture_then_ack_and_contain() -> Tes
         e.handle(v).unwrap();
         assert_eq!(e.status.count, 2);
         assert_eq!(e.io.writes.len(), 7);
-        assert_eq!(e.enable(), Err(Error::Busy));
+        assert_eq!(e.enable(None), Err(Error::Busy));
     }
     let p = Protection::decode(0x785753);
     assert_eq!(
@@ -200,7 +201,7 @@ fn navi48_command_faults_use_exact_client_source_and_preserve_queue_identity() -
         (185, CommandFault::PrivilegedInstruction),
     ] {
         let mut e = fixture();
-        e.enable().unwrap();
+        e.enable(None).unwrap();
         e.io.writes.clear();
         e.io.reads.clear();
         let v = event(0x0a, source, 0xda);
@@ -222,7 +223,7 @@ fn navi48_command_faults_use_exact_client_source_and_preserve_queue_identity() -
         assert!(!e.io.reads.contains(&GST) && !e.io.reads.contains(&MST));
     }
     let mut e = fixture();
-    e.enable().unwrap();
+    e.enable(None).unwrap();
     e.io.writes.clear();
     e.io.reads.clear();
     for (client, source) in [(0x0a, 181), (0x0a, 49), (0x04, 0), (0x12, 183), (0x12, 185)] {
@@ -289,7 +290,7 @@ fn navi48_sdma_shader_and_poison_faults_keep_iv_evidence_without_latch_io() -> T
         ),
     ] {
         let mut e = fixture();
-        e.enable().unwrap();
+        e.enable(None).unwrap();
         e.io.writes.clear();
         e.io.reads.clear();
         e.handle(v).unwrap();
@@ -302,7 +303,7 @@ fn navi48_sdma_shader_and_poison_faults_keep_iv_evidence_without_latch_io() -> T
     }
     // Shader wave messages and media traps are not faults.
     let mut e = fixture();
-    e.enable().unwrap();
+    e.enable(None).unwrap();
     let mut wave = event(0x0a, 239, 0);
     wave.vector.data = [1 << 21, 1 << 6, 0, 0];
     e.handle(wave).unwrap();
@@ -318,7 +319,7 @@ kernel_test_in!(
 fn navi48_fault_sweep_after_lost_vectors_captures_then_acks_set_latches() -> TestResult {
     let mut e = fixture();
     assert_eq!(e.sweep(), Err(Error::Busy));
-    e.enable().unwrap();
+    e.enable(None).unwrap();
     e.io.writes.clear();
     e.io.reads.clear();
     // Nothing latched: reads only, no acknowledgement or containment.
@@ -387,14 +388,14 @@ fn navi48_fault_preflight_and_partial_programming_fail_without_reuse() -> TestRe
                 Error::Busy
             }
         };
-        assert_eq!(e.enable(), Err(expected));
+        assert_eq!(e.enable(None), Err(expected));
         assert_eq!(e.status.state, State::Failed(expected));
         assert!(e.io.writes.is_empty());
-        assert_eq!(e.enable(), Err(Error::Busy));
+        assert_eq!(e.enable(None), Err(Error::Busy));
     }
     let mut e = fixture();
     e.io.ignored = Some(MCTX);
-    assert_eq!(e.enable(), Err(Error::Readback));
+    assert_eq!(e.enable(None), Err(Error::Readback));
     assert_eq!(e.status.mask_error, None);
     assert_eq!(
         e.io.writes,
@@ -407,7 +408,7 @@ fn navi48_fault_preflight_and_partial_programming_fail_without_reuse() -> TestRe
     );
     let mut e = fixture();
     e.io.revoke = Some((GCTX, e.authority));
-    assert_eq!(e.enable(), Err(Error::Revoked));
+    assert_eq!(e.enable(None), Err(Error::Revoked));
     assert_eq!(e.status.mask_error, Some(Error::Revoked));
     assert_eq!(e.io.writes, [(GCTX, 0xfffc01)]);
     TestResult::Pass
@@ -420,7 +421,7 @@ kernel_test_in!(
 fn navi48_fault_mmio_failures_preserve_raw_evidence_and_uncertain_masks() -> TestResult {
     for case in 0..3 {
         let mut e = fixture();
-        e.enable().unwrap();
+        e.enable(None).unwrap();
         e.io.writes.clear();
         let v = event(0x0a, 0, 4);
         let expected = match case {
@@ -452,7 +453,7 @@ fn navi48_fault_mmio_failures_preserve_raw_evidence_and_uncertain_masks() -> Tes
             }
         );
         assert_eq!(e.io.writes.len(), [0, 5, 1][case]);
-        assert_eq!(e.enable(), Err(Error::Busy));
+        assert_eq!(e.enable(None), Err(Error::Busy));
     }
     TestResult::Pass
 }
@@ -491,4 +492,103 @@ fn navi48_fault_monitor_constructor_checks_discovery_and_live_authority() -> Tes
 kernel_test_in!(
     "drivers/gpu/navi48-faults",
     navi48_fault_monitor_constructor_checks_discovery_and_live_authority
+);
+
+fn client_fixture() -> Engine<Fake> {
+    let mut e = fixture();
+    for base in [GCTX, MCTX] {
+        for vmid in 1..16 {
+            e.io.regs.insert(base + vmid * 4, 0xaaa807);
+        }
+    }
+    e
+}
+fn navi48_owned_client_faults_arm_and_contain_without_changing_translation() -> TestResult {
+    let mut e = client_fixture();
+    let before = e.io.regs.clone();
+    e.enable(Some([0xaaa807; 2])).unwrap();
+    assert_eq!(e.status.state, State::Armed);
+    assert_eq!(e.io.writes.len(), 35);
+    assert_eq!(e.published, (1 << 35) - 1);
+    for base in [GCTX, MCTX] {
+        for vmid in 0..16 {
+            let at = base + vmid * 4;
+            assert_eq!(e.io.regs[&at], before[&at] | 0x555400);
+        }
+    }
+    e.io.writes.clear();
+    e.handle(event(0x0a, 183, 0x14)).unwrap();
+    assert_eq!(e.status.state, State::Contained);
+    assert_eq!(e.io.writes.len(), 35);
+    assert_eq!(e.status.mask_error, None);
+    for base in [GCTX, MCTX] {
+        for vmid in 0..16 {
+            let at = base + vmid * 4;
+            assert_eq!(e.io.regs[&at], before[&at]);
+        }
+    }
+    for at in [GCP, CCP, SDMA, GCTL, MCTL] {
+        assert_eq!(e.io.regs[&at], before[&at]);
+    }
+    assert_eq!(e.enable(Some([0xaaa807; 2])), Err(Error::Busy));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-faults",
+    navi48_owned_client_faults_arm_and_contain_without_changing_translation
+);
+
+fn navi48_client_fault_arming_rejects_changed_controls_before_publication() -> TestResult {
+    for base in [GCTX, MCTX] {
+        for vmid in 1..16 {
+            for change in [1, 2, 0x100, 0x400, 0x800000] {
+                let mut e = client_fixture();
+                e.io.regs.insert(base + vmid * 4, 0xaaa807 ^ change);
+                assert_eq!(e.enable(Some([0xaaa807; 2])), Err(Error::Busy));
+                assert_eq!(e.status.state, State::Failed(Error::Busy));
+                assert_eq!(e.published, 0);
+                assert!(e.io.writes.is_empty());
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-faults",
+    navi48_client_fault_arming_rejects_changed_controls_before_publication
+);
+
+fn navi48_client_fault_partial_writes_mask_every_published_source() -> TestResult {
+    for base in [GCTX, MCTX] {
+        for vmid in 1..16 {
+            let mut e = client_fixture();
+            e.io.ignored = Some(base + vmid * 4);
+            assert_eq!(e.enable(Some([0xaaa807; 2])), Err(Error::Readback));
+            assert_eq!(e.status.state, State::Failed(Error::Readback));
+            assert_eq!(e.status.mask_error, None);
+            for base in [GCTX, MCTX] {
+                for id in 0..16 {
+                    let want = if id == 0 { 0xaaa801 } else { 0xaaa807 };
+                    assert_eq!(e.io.regs[&(base + id * 4)], want);
+                }
+            }
+            assert_eq!(e.io.regs[&GCP], 0x84000000);
+            assert_eq!(e.io.regs[&CCP], 0x84000000);
+            assert_eq!(e.io.regs[&SDMA], 0x40);
+        }
+    }
+    let mut e = client_fixture();
+    let last = MCTX + 15 * 4;
+    e.io.revoke = Some((last, e.authority));
+    assert_eq!(e.enable(Some([0xaaa807; 2])), Err(Error::Revoked));
+    assert_eq!(e.status.mask_error, Some(Error::Revoked));
+    assert_eq!(e.io.writes.last(), Some(&(last, 0xfffc07)));
+    let writes = e.io.writes.len();
+    e.stop();
+    assert_eq!(e.io.writes.len(), writes);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-faults",
+    navi48_client_fault_partial_writes_mask_every_published_source
 );

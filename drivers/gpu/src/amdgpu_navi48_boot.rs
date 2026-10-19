@@ -778,6 +778,7 @@ impl ColdBoot {
                 &mut hardware.ih,
                 &mut hardware.interrupt_route,
                 &mut hardware.faults,
+                hardware.gmc.as_mut().ok_or(Error::Invalid)?,
             )
         }
         .map_err(|e| {

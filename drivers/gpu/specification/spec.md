@@ -2898,15 +2898,24 @@ recycling a possibly in-flight vector.
 `amdgpu_navi48_faults` describes VM and command fault diagnostics. The internal
 retained monitor validates exact GC12.0.1/MMHUB4.1 banks without writes during
 boot preparation. Service handoff retains all three owners before enabling
-sources. It requires active, nonretrying VMID0 in both hubs, inactive user
-contexts and no inherited enables in its source masks. It enables the seven
-VM protection-fault classes only for VMID0, plus bad-opcode/privileged-register
+sources. It requires active, nonretrying VMID0 in both hubs and the matching
+GMC owner in `ClientsReady`. `Gmc::fault_contexts` verifies the exact permanent
+register mapping and freshly reads every client VMID's root, start/end page
+and native nonretrying control in both hubs. All fifteen must still point at
+that owner's empty root, covering the GMC12 client aperture, before any client
+submission. Changed/inherited contexts and inherited interrupt enables are
+refused. Handoff does not disable or adopt an unexpected active context.
+It enables the seven VM protection-fault classes for VMIDs 0..15 on both
+hubs, plus bad-opcode/privileged-register
 faults for the owned graphics and compute pipes and privileged-instruction
 faults for graphics. It also enables the graphics/compute EOP sources and
 SDMA0 traps after the cold-start copy has drained; queue proofs only read
 those controls, so their setup cannot race fault masking.
-Readback is checked after each write. Default-page policy, user contexts and
-unrelated control bits are preserved; containment leaves EOP enables intact.
+Readback is checked after each write. Only the owned fault IRQ fields change
+in client controls; page-table roots, aperture, depth, retry and default-page
+policy stay fixed. Partial-publication tracking covers all 35 source controls,
+so failure/containment masks every published client source as well as VMID0,
+CP faults and SDMA traps. Unrelated bits and EOP enables are preserved.
 
 GC/client 0x0a and VMC/client 0x12 source zero select their respective VM hub.
 The monitor decodes the IV's 48-bit page address, write/retry flags and retains

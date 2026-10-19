@@ -14,6 +14,8 @@ mod regs;
 use regs::{HubRegs, GFX, MM};
 #[path = "amdgpu_gmc_navi48_display.rs"]
 mod display;
+#[path = "amdgpu_gmc_navi48_handoff.rs"]
+mod handoff;
 pub(crate) use display::DisplayContext;
 // PT, default page, source page, destination page, then the empty root
 // directory every idle client context points at.
@@ -83,8 +85,9 @@ impl Layout {
         };
         Ok(Self {
             bases: [
-                reg(ip::HW_ID_GC, &[(12, 0, 1)], 0, 0x16d0)?,
-                reg(ip::HW_ID_MMHUB, &[(4, 1, 0)], 0, 0x610)?,
+                // Include the final client VMID's page-table end high word.
+                reg(ip::HW_ID_GC, &[(12, 0, 1)], 0, 0x16ee)?,
+                reg(ip::HW_ID_MMHUB, &[(4, 1, 0)], 0, 0x62e)?,
             ],
             nbio: reg(ip::HW_ID_NBIF, &[(7, 7, 0), (7, 7, 1), (6, 3, 1)], 2, 0x12d)?,
         })

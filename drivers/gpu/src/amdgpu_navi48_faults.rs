@@ -20,6 +20,7 @@ pub enum Error {
     Revoked,
     DeviceGone,
     Readback,
+    Gmc(crate::amdgpu_gmc_navi48::Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -155,15 +156,24 @@ impl Layout {
                 .map_err(|_| Error::Unsupported)?,
         })
     }
-    fn controls(self) -> [(u64, u32); 5] {
-        [
+    fn controls(self, clients: bool) -> impl ExactSizeIterator<Item = (u64, u32)> {
+        let kernel = [
             (self.gfx + 0x1624 * 4, VM_MASK),
             (self.mm + 0x564 * 4, VM_MASK),
             (self.gfx + 0x1e0a * 4, CP_MASKS[0]),
             (self.gfx + 0x1e25 * 4, CP_MASKS[1]),
             // SDMA0_CNTL.TRAP_ENABLE; exclusively owned after cold start.
             (self.gfx + 0x0d * 4, 1),
-        ]
+        ];
+        (0..if clients { 35 } else { 5 }).map(move |i| {
+            if i < 5 {
+                kernel[i]
+            } else {
+                let n = i - 5;
+                let base = [kernel[0].0, kernel[1].0][n / 15];
+                (base + (n % 15 + 1) as u64 * 4, VM_MASK)
+            }
+        })
     }
     fn latch(self, hub: Hub) -> (u64, u64) {
         match hub {
@@ -209,7 +219,8 @@ struct Engine<I: Io> {
     authority: Cap<BusDeviceCap, Write>,
     layout: Layout,
     status: Status,
-    published: u8,
+    published: u64,
+    owned_clients: bool,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> Result<T, Error>) -> Result<T, Error> {
@@ -218,12 +229,13 @@ impl<I: Io> Engine<I> {
             .invoke(Op(|| f(io)))
             .map_err(|_| Error::Revoked)?
     }
-    fn enable(&mut self) -> Result<(), Error> {
+    fn enable(&mut self, clients: Option<[u32; 2]>) -> Result<(), Error> {
         if self.status.state != State::Prepared {
             return Err(Error::Busy);
         }
         self.status.state = State::Arming;
-        let result = self.enable_inner();
+        self.owned_clients = clients.is_some();
+        let result = self.enable_inner(clients);
         match result {
             Ok(()) => self.status.state = State::Armed,
             Err(e) => {
@@ -233,30 +245,35 @@ impl<I: Io> Engine<I> {
         }
         result
     }
-    fn enable_inner(&mut self) -> Result<(), Error> {
-        let controls = self.layout.controls();
+    fn enable_inner(&mut self, clients: Option<[u32; 2]>) -> Result<(), Error> {
+        let layout = self.layout;
+        let owned_clients = self.owned_clients;
         let values = self.access(|io| {
-            let mut values = [0; 5];
-            for (i, (at, mask)) in controls.into_iter().enumerate() {
+            let mut values = [0; 35];
+            for (i, (at, mask)) in layout.controls(owned_clients).enumerate() {
                 values[i] = checked(io.read(at))?;
                 if values[i] & mask != 0 {
                     return Err(Error::Busy);
                 }
                 if i < 2 {
-                    // Owned flat VMID0 only, retry disabled; no active user VMs.
+                    // Owned flat VMID0, retry disabled.
                     if values[i] & 0x101 != 1 {
                         return Err(Error::Busy);
                     }
-                    for vmid in 1..16 {
-                        if checked(io.read(at + vmid * 4))? & 1 != 0 {
-                            return Err(Error::Busy);
+                    if clients.is_none() {
+                        for vmid in 1..16 {
+                            if checked(io.read(at + vmid * 4))? & 1 != 0 {
+                                return Err(Error::Busy);
+                            }
                         }
                     }
+                } else if i >= 5 && Some(values[i]) != clients.map(|v| v[(i - 5) / 15]) {
+                    return Err(Error::Busy);
                 }
             }
             Ok(values)
         })?;
-        for (i, (at, mask)) in controls.into_iter().enumerate() {
+        for (i, (at, mask)) in layout.controls(owned_clients).enumerate() {
             self.published |= 1 << i;
             self.access(|io| {
                 // The service exclusively owns CP interrupt-control writes.
@@ -270,14 +287,15 @@ impl<I: Io> Engine<I> {
                 Ok(())
             })?;
         }
-        Ok(())
+        // A revocation during the final write batch must not publish Armed.
+        self.access(|_| Ok(()))
     }
-    // Try every owned mask even if one fails; never alter user VM contexts,
+    // Try every owned mask even if one fails; never alter VM translation policy,
     // default-page policy, CP EOP enables or other interrupt classes. Also
     // disable the owned SDMA trap source after a fault or service failure.
     fn mask(&mut self) -> Result<(), Error> {
         let mut error = None;
-        for (i, (at, mask)) in self.layout.controls().into_iter().enumerate() {
+        for (i, (at, mask)) in self.layout.controls(self.owned_clients).enumerate() {
             if self.published & (1 << i) == 0 {
                 continue;
             }
@@ -445,13 +463,26 @@ impl Monitor {
                 mask_error: None,
             },
             published: 0,
+            owned_clients: false,
         }))
     }
     /// # Safety
-    /// Matching GMC and kernel queues are ready. Initialized IH rings and this
-    /// monitor are retained together, with a consumer independent of boot locks.
-    pub(crate) unsafe fn enable(&mut self) -> Result<(), Error> {
-        self.0.enable()
+    /// Matching GMC and kernel queues are ready; no client has submitted work.
+    /// Initialized IH rings and this monitor are retained together, with a
+    /// consumer independent of boot locks. Exclude all context/IRQ writers.
+    pub(crate) unsafe fn enable(
+        &mut self,
+        gmc: &mut crate::amdgpu_gmc_navi48::Gmc,
+    ) -> Result<(), Error> {
+        if self.0.status.state != State::Prepared {
+            return Err(Error::Busy);
+        }
+        let clients = gmc.fault_contexts(self.0.io.0).map_err(|e| {
+            let error = Error::Gmc(e);
+            self.0.status.state = State::Failed(error);
+            error
+        })?;
+        self.0.enable(Some(clients))
     }
     pub(crate) fn handle(&mut self, event: ih::Event) -> Result<(), Error> {
         self.0.handle(event)

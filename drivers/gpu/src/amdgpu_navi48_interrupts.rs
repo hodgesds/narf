@@ -314,6 +314,7 @@ pub(crate) unsafe fn install(
     rings: &mut Option<ih::Rings>,
     route: &mut Option<Result<msi::Route, msi::Error>>,
     faults: &mut Option<faults::Monitor>,
+    gmc: &mut crate::amdgpu_gmc_navi48::Gmc,
 ) -> Result<(), ih::Error> {
     let mut slot = SERVICE.try_lock().ok_or(ih::Error::Busy)?;
     if slot.is_some()
@@ -353,7 +354,7 @@ pub(crate) unsafe fn install(
     }
     // SAFETY: matching initialized hubs/queues/IH; the permanent service now
     // retains the monitor before the first source enable or CPU MSI delivery.
-    if unsafe { service.faults.enable() }.is_err() {
+    if unsafe { service.faults.enable(gmc) }.is_err() {
         // No consumer will run: release the owners registered above.
         dispatch::TABLE
             .lock()
