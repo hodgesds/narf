@@ -30,7 +30,7 @@
 //! is no SPM/debugger user.
 //!
 //! Tickets are `ring << 32 | sequence`; the ring index carries the GPU
-//! recovery epoch above its three ring-id bits, so a ticket from before a
+//! recovery epoch above its four ring-id bits, so a ticket from before a
 //! recovery names a ring no current queue has and reads as complete
 //! (abandoned) instead of being compared with the new queues' sequences.
 //!
@@ -92,7 +92,7 @@ pub fn ring_id(ip_type: u32, ip_instance: u32, ring: u32) -> Option<usize> {
         _ => crate::amdgpu_vcn_navi22_cs::ring_id(ip_type, ip_instance, ring),
     }
 }
-/// Ticket ring ids: the four kernel queues, then the four media rings.
+/// Ticket ring ids: four original kernel queues, four media rings, SDMA2/3.
 pub const RING_IDS: usize = 10; // linux: n/a (NARF ticket ring ids)
 /// The ticket ring index of ring `id` in recovery epoch `epoch`.
 pub const fn ring_index(epoch: u64, id: usize) -> u32 {
@@ -432,6 +432,9 @@ mod tests {
             (ring_id(uapi::AMDGPU_HW_IP_COMPUTE, 0, 3), Some(1)),
             (ring_id(uapi::AMDGPU_HW_IP_COMPUTE, 0, 4), None),
             (ring_id(uapi::AMDGPU_HW_IP_DMA, 0, 1), Some(3)),
+            (ring_id(uapi::AMDGPU_HW_IP_DMA, 0, 2), Some(8)),
+            (ring_id(uapi::AMDGPU_HW_IP_DMA, 0, 3), Some(9)),
+            (ring_id(uapi::AMDGPU_HW_IP_DMA, 0, 4), None),
             (ring_id(uapi::AMDGPU_HW_IP_DMA, 1, 0), None),
             (ring_id(uapi::AMDGPU_HW_IP_VCN_DEC, 0, 0), None),
         ];
@@ -455,6 +458,20 @@ mod tests {
         // The generic VmState's ring slot (`ticket >> 32 % 16`) is the ring id.
         if (ring_index(5, 3) % 16) != 3 || (ring_index(5, 7) % 16) != 7 {
             return TestResult::Fail("epoch tag leaked into the ring slot");
+        }
+        for epoch in [0, 1, 5, 255] {
+            let mut completed = [0; RING_IDS];
+            completed[8] = 12;
+            completed[9] = 3;
+            if ring_index(epoch, 8) % 16 != 8
+                || ring_index(epoch, 9) % 16 != 9
+                || !job_done(epoch, completed, ticket(epoch, 8, 12))
+                || job_done(epoch, completed, ticket(epoch, 9, 4))
+                || job_done(epoch, completed, ticket(epoch, 0, 12))
+                || !job_done(epoch + 1, completed, ticket(epoch, 9, 4))
+            {
+                return TestResult::Fail("SDMA2/3 ticket aliases another ring or epoch");
+            }
         }
         TestResult::Pass
     }

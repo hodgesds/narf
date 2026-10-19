@@ -728,7 +728,7 @@ impl Group {
             plans: Vec::new(),
             joint: None,
             resources: Resources::for_gpu(gpu)?,
-            dsc: Some(dsc::Dsc::new(regs, dcn2)),
+            dsc: Some(dsc::Dsc::new(regs, dcn2).for_profile(profile)),
             mst_source: Some(mst::Source::new(regs, dcn2)),
             mst: None,
             mst_link: None,

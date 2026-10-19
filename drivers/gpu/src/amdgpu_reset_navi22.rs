@@ -992,7 +992,8 @@ impl Reset {
         authority: Cap<BusDeviceCap, Write>,
         device: BusDevice,
     ) -> Result<Self, Error> {
-        let profile = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).ok_or(Error::Unsupported)?;
+        let profile = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did)
+            .ok_or(Error::Unsupported)?;
         crate::amdgpu_psp_ring::validate_rdna2_layout(gpu).map_err(|_| Error::Unsupported)?;
         let map = |error| match error {
             crate::amdgpu_psp_ring::Error::Invalid => Error::Invalid,

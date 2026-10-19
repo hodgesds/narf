@@ -73,8 +73,6 @@ const MPC_OUT_CSC_C11_C12_A: u64 = 0x059a;
 // linux: mmMPC_OUT1_CSC_MODE - mmMPC_OUT0_CSC_MODE
 const MPC_OUT_STRIDE: u64 = 0xd;
 // linux-ctx: reset
-// linux: n/a (NARF bound: DCN30 has six OTGs/OPPs/MPCCs)
-const PIPES: u8 = 6;
 // linux: mmOTG5_OTG_H_TIMING_CNTL
 const LAST_2: u32 = (OTG_H_TIMING_CNTL + 5 * OTG_STRIDE) as u32;
 // linux: mmMPC_OUT5_CSC_C33_C34_A
@@ -428,14 +426,15 @@ impl Formatter {
         authority: Cap<BusDeviceCap, Write>,
         pipe: u8,
     ) -> Result<Self, Error> {
-        if Profile::resolve(gpu).map_err(|_| Error::Unsupported)? != Profile::Navi22 {
+        let profile = Profile::resolve(gpu).map_err(|_| Error::Unsupported)?;
+        if !profile.is_dcn30() {
             return Err(Error::Unsupported);
         }
-        if pipe >= PIPES {
+        if pipe >= profile.pipes() {
             return Err(Error::Invalid);
         }
         let bank = |index, last| {
-            Profile::Navi22
+            profile
                 .bank(gpu, index, last)
                 .map_err(|_| Error::Unsupported)
         };

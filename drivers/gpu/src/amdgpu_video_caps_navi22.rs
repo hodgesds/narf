@@ -78,8 +78,26 @@ pub fn codecs(kind: u32, harvested: u8) -> Option<&'static [Codec]> {
 /// The `drm_amdgpu_info_video_caps` reply `amdgpu_info_ioctl` builds:
 /// indexed by codec, `max_pixels_per_frame = width * height`.
 pub fn caps(kind: u32, harvested: u8) -> Option<DrmAmdgpuInfoVideoCaps> {
+    caps_for(kind, harvested, (3, 0, 0))
+}
+
+/// Bare-metal `nv_query_video_codecs`, selected by the discovered VCN IP.
+pub fn caps_for(kind: u32, harvested: u8, version: (u8, u8, u8)) -> Option<DrmAmdgpuInfoVideoCaps> {
+    if harvested & 3 == 3 {
+        return None;
+    }
+    let codecs = match version {
+        (3, 0, 0 | 64 | 192) => codecs(kind, harvested)?,
+        (3, 0, 2 | 16) => codecs(kind, harvested & 2)?,
+        (3, 0, 33) if harvested & 3 != 3 => match kind {
+            AMDGPU_INFO_VIDEO_CAPS_ENCODE => &[][..],
+            AMDGPU_INFO_VIDEO_CAPS_DECODE => &[DECODE_VCN0[2], DECODE_VCN0[4], DECODE_VCN0[6]][..],
+            _ => return None,
+        },
+        _ => return None,
+    };
     let mut caps = DrmAmdgpuInfoVideoCaps::default();
-    for c in codecs(kind, harvested)? {
+    for c in codecs {
         let slot = caps.codec_info.get_mut(c.codec as usize)?;
         *slot = DrmAmdgpuInfoVideoCodecInfo {
             valid: 1,
@@ -97,6 +115,30 @@ pub fn caps(kind: u32, harvested: u8) -> Option<DrmAmdgpuInfoVideoCaps> {
 mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn navi24_video_caps_exclude_absent_codecs() -> TestResult {
+        let decode = caps_for(AMDGPU_INFO_VIDEO_CAPS_DECODE, 2, (3, 0, 33)).unwrap();
+        let encode = caps_for(AMDGPU_INFO_VIDEO_CAPS_ENCODE, 2, (3, 0, 33)).unwrap();
+        for (index, codec) in decode.codec_info.iter().enumerate() {
+            let expected = [
+                AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_MPEG4_AVC,
+                AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_HEVC,
+                AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_VP9,
+            ]
+            .contains(&(index as u32));
+            if (codec.valid != 0) != expected || encode.codec_info[index].valid != 0 {
+                return TestResult::Fail("Navi24 codec capability mask");
+            }
+        }
+        if caps_for(AMDGPU_INFO_VIDEO_CAPS_DECODE, 3, (3, 0, 33)).is_some() {
+            return TestResult::Fail("harvested Navi24 decoder advertised");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/video-caps-navi22",
+        navi24_video_caps_exclude_absent_codecs
+    );
 
     fn navi22_video_caps_match_sienna_cichlid_tables() -> TestResult {
         let decode = caps(AMDGPU_INFO_VIDEO_CAPS_DECODE, 0).unwrap();

@@ -115,7 +115,7 @@ fn navi22_power_bounds_and_revisions_fail_closed() -> TestResult {
     for (offset, value) in [
         (0xc2, 1),
         (0x102, 2),
-        (0x103, 3),
+        (0x103, 2),
         (0x200, 39),
         (0x202, 3),
         (0x203, 10),
@@ -280,6 +280,12 @@ fn rdna2_power_tables_preserve_profile_and_board_overlay() -> TestResult {
         put16(&mut data, 0x40f, format);
         put32(&mut data, 0x400 + DRIVER_BYTES, version);
         let image = prepare_for(&data, |_| None, identity(), profile).unwrap();
+        for firmware_revision in [3, 4, 5] {
+            data[0x103] = firmware_revision;
+            if prepare_for(&data, |_| None, identity(), profile).is_err() {
+                return TestResult::Fail("RDNA2 FirmwareInfo v3.3/v3.4/v3.5 selection");
+            }
+        }
         if image.profile != profile
             || image.bytes().len() != size
             || image.bytes()[start..end] != data[0x204..0x328]

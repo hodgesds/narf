@@ -8,6 +8,29 @@ import tempfile
 from functools import lru_cache
 
 
+def check_dmub_layouts(amd):
+    """The shared DMUB implementation requires identical offsets and masks."""
+    definitions = {}
+    for revision in [0, 2, 3]:
+        values = {}
+        for suffix in ["offset", "sh_mask"]:
+            header = amd / f"include/asic_reg/dcn/dcn_3_0_{revision}_{suffix}.h"
+            for name, value in re.findall(r"^#define\s+(\w+)\s+(0x[0-9a-fA-F]+|[0-9]+)\b", header.read_text(), re.MULTILINE):
+                if "DMCUB" in name or "MMHUBBUB_SOFT_RESET" in name:
+                    values[name] = int(value, 0)
+        definitions[revision] = values
+    common = set.intersection(*(set(values) for values in definitions.values()))
+    if not common:
+        raise SystemExit("No shared DMCUB definitions found")
+    # RBBMIF timeout fields differ but are not used by the shared owner.
+    used = {name for name in definitions[0] if "RBBMIF_TIMEOUT" not in name}
+    for revision in [2, 3]:
+        for name in used:
+            if definitions[revision].get(name) != definitions[0][name]:
+                raise SystemExit(f"DCN 3.0.{revision} DMUB definition differs: {name}")
+    print(f"PASS: {len(used)} DMCUB offset/base/mask definitions agree across DCN 3.0/3.0.2/3.0.3")
+
+
 @lru_cache(maxsize=1)
 def power_layouts(linux):
     header = linux / "drivers/gpu/drm/amd/pm/swsmu/inc/pmfw_if/smu11_driver_if_sienna_cichlid.h"
@@ -33,6 +56,7 @@ def main():
     args = parser.parse_args()
     source = Path(__file__).resolve().parents[1] / "src/amdgpu_rdna2.rs"
     amd = args.linux / "drivers/gpu/drm/amd"
+    check_dmub_layouts(amd)
     pci_table = (amd / "amdgpu/amdgpu_drv.c").read_text()
     ucode = (amd / "amdgpu/amdgpu_ucode.c").read_text()
     dm = (amd / "display/amdgpu_dm/amdgpu_dm.c").read_text().split("static int dm_init_microcode", 1)[1]

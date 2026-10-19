@@ -587,7 +587,10 @@ fn video_caps(snap: &Snapshot, kind: u32) -> Result<Vec<u8>, FsError> {
             harvested |= 1 << inst;
         }
     }
-    crate::amdgpu_video_caps_navi22::caps(kind, harvested)
+    let vcn = discovery::find_ip(&snap.ip_blocks, discovery::HW_ID_VCN, 0)
+        .or_else(|| discovery::find_ip(&snap.ip_blocks, discovery::HW_ID_VCN, 1))
+        .ok_or(FsError::InvalidData)?;
+    crate::amdgpu_video_caps_navi22::caps_for(kind, harvested, (vcn.major, vcn.minor, vcn.revision))
         .map(|caps| as_bytes(&caps))
         .ok_or(FsError::InvalidData)
 }

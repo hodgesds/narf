@@ -15,12 +15,12 @@ const DRIVER_BYTES: usize = 802;
 pub(crate) const SMC_BYTES: usize = 1668; // linux: sizeof(PPTable_t)
 #[cfg(feature = "kernel-test")]
 const TABLE_BYTES: usize = DRIVER_BYTES + SMC_BYTES;
-// linux: offsetof(PPTable_t, I2cControllers)
 #[cfg(feature = "kernel-test")]
+// linux: offsetof(PPTable_t, I2cControllers)
 const BOARD_START: usize = 1344;
 // after BoardReserved[11], before MmHubPadding
-// linux: offsetof(PPTable_t, MmHubPadding)
 #[cfg(feature = "kernel-test")]
+// linux: offsetof(PPTable_t, MmHubPadding)
 const BOARD_END: usize = 1636;
 // linux: offsetof(PPTable_t, FreqTableGfx)
 const GFX_CLOCKS: usize = 524; // FreqTableGfx[16]
@@ -283,12 +283,12 @@ fn prepare_for<'a>(
         return Err(Error::Invalid);
     }
     // linux-lit: 2=offsetof(struct atom_common_table_header, format_revision); 3=offsetof(struct atom_common_table_header, content_revision)
-    if !matches!((fw_info[2], fw_info[3]), (3, 4) | (3, 5)) {
+    if !matches!((fw_info[2], fw_info[3]), (3, 3) | (3, 4) | (3, 5)) {
         return Err(Error::Unsupported);
     }
     // linux-lit: 60=offsetof(struct atom_firmware_info_v3_4, pplib_pptable_id)
     let table_id = u32_at(fw_info, 60);
-    // SMC v2.0 contains one table; its table ID only chooses firmware vs VBIOS.
+    // SMC v2.0 contains one table; v2.1 selects the matching directory ID.
     // No fallback to the other source is allowed after the board selected one.
     let (source, table) = if table_id == 0 {
         (

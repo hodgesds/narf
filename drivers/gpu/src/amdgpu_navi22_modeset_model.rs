@@ -57,6 +57,7 @@ pub(crate) struct Write {
 
 #[derive(Default)]
 pub(crate) struct State {
+    pub forbidden: Vec<core::ops::RangeInclusive<u32>>,
     pub mem: BTreeMap<u32, u32>,
     pub log: Vec<Write>,
     /// After this many logged writes every read returns all ones.
@@ -101,6 +102,10 @@ fn instance(dword: u32, base: u32, stride: u32, count: u32) -> Option<u32> {
 impl Device for Model {
     fn read(&self, offset: u64) -> u32 {
         let dword = (offset / 4) as u32;
+        assert!(
+            !self.0.lock().forbidden.iter().any(|r| r.contains(&dword)),
+            "read absent display register {dword:#x}"
+        );
         let value = self.acknowledge(dword);
         let s = self.0.lock();
         match s.stall {
@@ -111,6 +116,11 @@ impl Device for Model {
         }
     }
     fn write(&self, offset: u64, value: u32) {
+        let dword = (offset / 4) as u32;
+        assert!(
+            !self.0.lock().forbidden.iter().any(|r| r.contains(&dword)),
+            "write absent display register {dword:#x}"
+        );
         self.store((offset / 4) as u32, value);
     }
 }

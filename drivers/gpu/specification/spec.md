@@ -44,6 +44,35 @@ infrastructure (Phase B).
 
 ## 3. Public interface
 
+### Shared RDNA2 execution and family limits
+
+`ColdBoot::new_rdna2` validates the exact PCI/GC/PSP identity and matching
+SOS, SMC and graphics bundle before device I/O. Recovery rebuilds through
+that constructor and retains the boxed sequence owner used by native Navi22.
+Native probe eligibility includes all inventoried PCI IDs. Hardware validation
+beyond the existing Navi22 path remains outstanding.
+
+Production SDMA queues use the contiguous discovered engine count (one to
+four); duplicate instances and holes are rejected. Engines 2/3 use GC bank 2
+and distinct doorbells, fences and IH routes. Client ring IDs 8/9 preserve
+existing media IDs; tickets reserve four low bits for the ring ID and VM
+retirement tracks sixteen slots. Absent engines have no fence mapping.
+
+SMC 2.1 containers select a PowerPlay table by its exact VBIOS board ID,
+without falling back to another board. Profile-specific power table layouts
+validate format, revision and size before overlaying board data. Navi24
+accepts both the original 1700-byte and later 1888-byte SMC layouts, whose
+board ranges are checked against the corresponding Linux interface headers.
+
+DCN 3.0/3.0.2/3.0.3 expose six/five/two pipes, streams and native channels.
+Resource allocation and constructors enforce those capacities. DCN 3.0.3
+does not access the removed plane/DSC power-gating registers. DML selects
+the corresponding stutter latencies, round-trip cycles and DPTE capacity.
+VCN 3.0.33 starts decode without programming encoder rings; its video-capability
+reply contains H.264, HEVC and VP9 decode and an empty encode table, matching
+Linux `nv_query_video_codecs`. Other supported VCN revisions retain their
+appropriate Sienna Cichlid codec tables and harvested-instance selection.
+
 ### AMD discrete PCIe probe and VRAM
 
 `amdgpu_rdna2::PROFILES` inventories the discrete Navi21, Navi22, Navi23 and
@@ -54,14 +83,13 @@ own SOS, SMC, SDMA, graphics, VCN and DMCUB container names. This is an inventor
 not a load order or a claim that every container is required on every board.
 The existing Navi22 loaders consume that same inventory.
 
-PCI registration includes all inventoried IDs. Native startup remains limited
-to the existing `1002:73df` path: other inventoried IDs return a diagnostic
-`ProbeError::Other` before PCI command writes or BAR mappings, leaving the boot
-framebuffer intact. Identification does not enable a sibling board's native
-firmware, power, modeset, media or rendering paths. Legacy firmware loading is
-rejected for every discrete RDNA2 ID; Rembrandt retains its separate APU path.
-Extending startup requires chip-specific IP/register validation, firmware
-loading, harvested topology, display resources and power-policy support. Run
+PCI registration and native startup eligibility include all inventoried IDs.
+The shared coordinator validates the discovered IP versions, matching firmware
+bundle and board policy; identification alone does not bypass these checks.
+Legacy firmware loading is rejected for every discrete RDNA2 ID; Rembrandt
+retains its separate APU path. Existing `amdgpu.navi22_*` boot options name the
+shared discrete path. Optional Navi22 clock-gating policy remains ASIC-specific.
+Run
 `python3 drivers/gpu/tools/check_rdna2_profiles.py --linux ~/git/linux` to
 compile the profile unit tests and compare the compiled IDs and firmware names
 with Linux, including IP-to-firmware selection. Add
@@ -3500,7 +3528,8 @@ uses reported physical VRAM size rather than inherited FB_LOCATION_TOP to
 bound its ring and translated test pages. Only SDMA0 is started; this proof
 does not enable user submissions, fault/trap interrupts or additional SDMA
 instances. Every capability, timeout, cancellation and memory-quarantine
-condition below remains in force. Native PCI startup remains gated.
+condition below remains in force. Production queues and IH are initialized
+separately by the shared coordinator.
 
 ### Navi 22 SDMA0 execution proof
 
@@ -3554,9 +3583,8 @@ conformance tool compares every compiled offset, bank and mask with Linux,
 including local register overrides in `gfx_v10_0.c`. Each profile reuses the
 bounded graphics ring/IB proof and the two-MEC KIQ/compute ring/IB proof.
 Model tests exercise each sequence's masked writes, successful completion,
-revocation and replay rejection. These APIs do not enable native PCI probing
-for additional devices; interrupts, runtime power and display integration
-remain separately gated.
+revocation and replay rejection. The shared coordinator combines these APIs
+with interrupt, board-power and display initialization for native startup.
 
 ### Navi 22 OSSSYS 5.0.3 interrupt ring and dispatch
 
@@ -4236,6 +4264,10 @@ file within one LSB (two, upward, on deep-sleep DCFCLK).
 `Soc::from_board(levels, channels, width, dchub_refclk)` builds the top
 bounding-box state from the DAL DPM table (DCFCLK doubling as fabric clock,
 `memclk*16`, DENTIST-reachable DISP/DPP ceilings, PHY ceiling, VCO).
+It defaults `Soc::dcn_revision` to 0. `Soc::for_gpu(gpu)` selects revision
+0/2/3 from an exact discrete RDNA2 profile before admission; other values
+are rejected. This selects resource limits and the corresponding latency
+and DPTE parameters for DCN 3.0, 3.0.2 or 3.0.3.
 `Soc::states(memory_mhz) -> Vec<Soc>` lists one state per lower UCLK level
 ascending, then the top one (deviation: every state keeps the top DCFCLK,
 where Linux pairs each UCLK with `dcn_bw_get_optimal_dcfclk_fclk_for_uclk`'s);

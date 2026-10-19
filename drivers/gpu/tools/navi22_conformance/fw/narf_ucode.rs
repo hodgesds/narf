@@ -84,11 +84,18 @@ fn smc(dir: &Path, profile: &amdgpu_rdna2::Profile) {
         Ok(i) => i,
         Err(e) => return println!("smc parse error {e:?}"),
     };
-    let mut tables: Vec<_> = image.powerplay_ids().map(|id| image.powerplay_for(id).unwrap()).collect();
-    if let Some(table) = image.powerplay() { tables.push(table); }
+    let mut tables: Vec<_> = image
+        .powerplay_ids()
+        .map(|id| image.powerplay_for(id).unwrap())
+        .collect();
+    if let Some(table) = image.powerplay() {
+        tables.push(table);
+    }
     for t in tables {
-        let layout = profile.power_table_layout(t.len().checked_sub(802).expect("PowerPlay driver header")).expect("unknown PowerPlay SKU layout");
-        let word = |at: usize| u16::from_le_bytes(t[at..at+2].try_into().unwrap());
+        let layout = profile
+            .power_table_layout(t.len().checked_sub(802).expect("PowerPlay driver header"))
+            .expect("unknown PowerPlay SKU layout");
+        let word = |at: usize| u16::from_le_bytes(t[at..at + 2].try_into().unwrap());
         assert_eq!(word(0) as usize, t.len());
         assert_eq!(word(5), 802);
         assert_eq!(t[2..5], [layout.format_revision, 0, 2]);
@@ -210,7 +217,10 @@ fn main() {
     let dir = Path::new(&dir);
     sos(dir);
     let asic = std::env::args().nth(2).unwrap_or_else(|| "navi22".into());
-    let profile = amdgpu_rdna2::PROFILES.iter().find(|p| p.asic == asic).expect("unknown ASIC");
+    let profile = amdgpu_rdna2::PROFILES
+        .iter()
+        .find(|p| p.asic == asic)
+        .expect("unknown ASIC");
     smc(dir, profile);
     gfx(dir, 1);
     gfx(dir, 3);

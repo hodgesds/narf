@@ -13,7 +13,7 @@ use core::{
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-/// Host IP discovery: UVD/VCN 3.0.0 0x7800 0x7E00, 3.0.1 0x7B00 0x12000.
+/// Host IP discovery: UVD/VCN 3.0.0 0x7800 0x7E00, 3.0.64 0x7B00 0x12000.
 const VCN: [[u64; 2]; 2] = [[0x7800 * 4, 0x7e00 * 4], [0x7b00 * 4, 0x12000 * 4]];
 const GC: u64 = 0x1260 * 4;
 const NBIO: u64 = 0xd20 * 4;
@@ -454,6 +454,40 @@ fn owned(instances: u8) -> u64 {
     let jpeg = if instances & 1 != 0 { JPEG_BYTES } else { 0 };
     u64::from(instances.count_ones()) * ((INSTANCE_BYTES + 4095) & !4095) + jpeg
 }
+
+fn vcn_navi24_decode_only() -> TestResult {
+    let (_pool, mut e) = engine(Model::new(), 1);
+    e.enc_count = 0;
+    if run(e.start(firmware(1), None)).is_err()
+        || run(e.start_jpeg()).is_err()
+        || run(e.test_ib()).is_err()
+        || e.proof.dec_ring != [true, false]
+        || e.proof.dec_ib != [2, 0]
+        || e.proof.enc_ring != [[false; 2]; 2]
+        || e.proof.enc_ib != [[0; 2]; 2]
+        || !e.proof.jpeg_ring
+    {
+        return TestResult::Fail("decode-only VCN/JPEG proofs");
+    }
+    for regs in [RB_BASE_LO, RB_BASE_HI, RB_SIZE, RB_RPTR, RB_WPTR] {
+        if regs
+            .iter()
+            .any(|r| e.hw.io.writes.iter().any(|(addr, _)| *addr == v(0, *r)))
+        {
+            return TestResult::Fail("Navi24 touched absent encoder registers");
+        }
+    }
+    if e.hw
+        .io
+        .doorbells
+        .iter()
+        .any(|(index, _)| *index == doorbell::enc(0, 0) || *index == doorbell::enc(0, 1))
+    {
+        return TestResult::Fail("Navi24 rang absent encoder doorbell");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/vcn-navi22", vcn_navi24_decode_only);
 fn cancel_at<F: Future>(future: F, progress: &AtomicU32, goal: u32) -> bool {
     let mut future = core::pin::pin!(future);
     let deadline = narf_time::Deadline::after_ms(1000);
@@ -509,7 +543,7 @@ fn vcn_navi22_resolves_both_discovered_instances() -> TestResult {
         ),
         base(ip::HW_ID_HDP, (5, 0, 3), 0, &[0xf20, 0x240a400]),
         base(ip::HW_ID_VCN, (3, 0, 0), 0, &[0x7800, 0x7e00, 0x2403000]),
-        base(ip::HW_ID_VCN, (3, 0, 1), 1, &[0x7b00, 0x12000, 0x2445000]),
+        base(ip::HW_ID_VCN, (3, 0, 64), 1, &[0x7b00, 0x12000, 0x2445000]),
     ]);
     if Layout::resolve(&gpu, 3) != Ok(layout(3))
         || Layout::resolve(&gpu, 2).map(|l| l.vcn) != Ok([None, Some(VCN[1])])

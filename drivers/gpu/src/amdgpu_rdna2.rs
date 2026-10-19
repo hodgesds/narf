@@ -182,10 +182,10 @@ pub fn for_pci_id(vendor: u16, device: u16) -> Option<&'static Profile> {
     PROFILES.iter().find(|p| p.pci_ids.contains(&device))
 }
 
-/// Native startup remains limited to the existing Navi22 device. Other IDs
-/// need their own IP, firmware, topology and board-policy validation first.
+/// Exact PCI identities with a native RDNA2 startup implementation. Runtime
+/// constructors additionally validate discovered IPs and board firmware.
 pub fn native_start_available(vendor: u16, device: u16) -> bool {
-    vendor == 0x1002 && device == 0x73df
+    for_pci_id(vendor, device).is_some()
 }
 
 #[cfg(test)]
@@ -203,7 +203,7 @@ mod tests {
                 assert!(seen.insert(did), "duplicate {did:04x}");
                 assert_eq!(for_pci_id(0x1002, did), Some(profile));
                 assert_eq!(for_pci_id(0x10de, did), None);
-                assert_eq!(native_start_available(0x1002, did), did == 0x73df);
+                assert!(native_start_available(0x1002, did));
             }
         }
         assert_eq!(seen.len(), 40);

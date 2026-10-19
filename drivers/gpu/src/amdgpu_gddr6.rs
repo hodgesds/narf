@@ -380,7 +380,8 @@ impl Trainer {
             exchange,
         )?;
         authority.invoke(Op(|| ())).map_err(|_| Error::Revoked)?;
-        let profile = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).ok_or(Error::Unsupported)?;
+        let profile = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did)
+            .ok_or(Error::Unsupported)?;
         let mp0 = psp::bank(gpu, ip::HW_ID_MP0, &[profile.psp_version], 0, SOS)
             .map_err(|_| Error::Unsupported)?;
         let nbio = psp::bank(

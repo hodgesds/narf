@@ -13912,8 +13912,8 @@ fn smoke_rdna2_chip_identity_and_startup_gate() -> TestResult {
             {
                 return TestResult::Fail("incorrect RDNA2 identity or legacy firmware list");
             }
-            if amdgpu_rdna2::native_start_available(0x1002, did) != (did == amdgpu::NAVI22) {
-                return TestResult::Fail("unaudited PCI ID entered the native startup path");
+            if !amdgpu_rdna2::native_start_available(0x1002, did) {
+                return TestResult::Fail("implemented RDNA2 identity lacks native startup");
             }
         }
     }
@@ -13927,47 +13927,4 @@ fn smoke_rdna2_chip_identity_and_startup_gate() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     smoke_rdna2_chip_identity_and_startup_gate
-);
-
-fn smoke_rdna2_unimplemented_probe_rejected_before_ecam() -> TestResult {
-    use crate::{amdgpu, amdgpu_rdna2};
-    use narf_bus::{BusAddr, BusDevice, BusDeviceCap, BusKind, DeviceId, PcieAddr};
-    use narf_capabilities::{Cap, Write};
-    use narf_memory::PhysAddr;
-    let addr = PcieAddr::new(0, 0, 0, 0);
-    for profile in amdgpu_rdna2::PROFILES {
-        for &did in profile.pci_ids {
-            if amdgpu_rdna2::native_start_available(0x1002, did) {
-                continue;
-            }
-            // No valid config window or BARs: reaching PCI/MMIO would fault.
-            let device = BusDevice {
-                addr: BusAddr::Pcie(addr),
-                id: DeviceId {
-                    vendor: 0x1002,
-                    device: did,
-                    class: 0x030000,
-                    subsystem_vendor: 0,
-                    subsystem_id: 0,
-                },
-                kind: BusKind::Pcie {
-                    addr,
-                    cfg_phys: PhysAddr::new(0),
-                },
-            };
-            let cap = Cap::<BusDeviceCap, Write>::bootstrap();
-            if amdgpu::probe(device, cap)
-                != Err(narf_bus::ProbeError::Other(
-                    "RDNA2 ASIC identified; native startup is not implemented for this PCI ID",
-                ))
-            {
-                return TestResult::Fail("unimplemented RDNA2 probe reached hardware setup");
-            }
-        }
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/gpu/amdgpu/rdna2",
-    smoke_rdna2_unimplemented_probe_rejected_before_ecam
 );

@@ -2234,16 +2234,6 @@ pub(crate) fn pci_authority() -> Option<Cap<BusDeviceCap, Write>> {
 }
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    // Identification alone must not opt a new ASIC/board into the Navi22
-    // startup path. Refuse before PCI command writes or BAR mapping, keeping
-    // the firmware scanout available to the boot framebuffer driver.
-    if crate::amdgpu_rdna2::for_pci_id(device.id.vendor, device.id.device).is_some()
-        && !crate::amdgpu_rdna2::native_start_available(device.id.vendor, device.id.device)
-    {
-        return Err(narf_bus::ProbeError::Other(
-            "RDNA2 ASIC identified; native startup is not implemented for this PCI ID",
-        ));
-    }
     if CONTROLLER.lock().is_some() {
         return Ok(());
     }
@@ -2268,7 +2258,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     };
     // SAFETY: probe owns the GPU mappings; boot ACPI tables remain mapped.
     let vbios = unsafe { crate::amdgpu_vbios::discover(&dev, &device, &cap) };
-    if crate::amdgpu_rdna2::for_pci_id(device.id.vendor, device.id.device).is_some() || device.id.device == NAVI48 {
+    if crate::amdgpu_rdna2::for_pci_id(device.id.vendor, device.id.device).is_some()
+        || device.id.device == NAVI48
+    {
         use core::fmt::Write as _;
         match &vbios {
             Ok(image) => {
@@ -2322,16 +2314,19 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     });
     // APUs and audited discrete probes use their retained, capability-checked image. The legacy
     // ROM-version-only path remains for other discrete GPUs.
-    let vbios_version: Option<alloc::string::String> =
-        if vbios_version.is_some() || is_apu || (crate::amdgpu_rdna2::for_pci_id(device.id.vendor, device.id.device).is_some() || device.id.device == NAVI48) {
-            vbios_version
-        } else {
-            // SAFETY: caller-authority over the device. ROM BAR is read-only
-            // from the CPU side once the phys address is known.
-            // Linux ref: amdgpu_bios.c::amdgpu_read_bios (lines 101-140).
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            unsafe { read_vbios_version_from_rom(&cap, &device) }
-        };
+    let vbios_version: Option<alloc::string::String> = if vbios_version.is_some()
+        || is_apu
+        || (crate::amdgpu_rdna2::for_pci_id(device.id.vendor, device.id.device).is_some()
+            || device.id.device == NAVI48)
+    {
+        vbios_version
+    } else {
+        // SAFETY: caller-authority over the device. ROM BAR is read-only
+        // from the CPU side once the phys address is known.
+        // Linux ref: amdgpu_bios.c::amdgpu_read_bios (lines 101-140).
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        unsafe { read_vbios_version_from_rom(&cap, &device) }
+    };
 
     // Register with the DRM card registry so /sys/class/drm/card<N>/
     // and /dev/dri/card<N> appear after Stage::Late.
@@ -2533,7 +2528,10 @@ pub(crate) fn is_navi22() -> bool {
 pub(crate) fn claim_navi22<R, E>(
     prepare: impl FnOnce(&AmdGpu) -> Result<R, E>,
 ) -> Option<Result<R, E>> {
-    claim_matching(|gpu| crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).is_some(), prepare)
+    claim_matching(
+        |gpu| crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).is_some(),
+        prepare,
+    )
 }
 
 pub(crate) fn is_navi48() -> bool {
@@ -2553,7 +2551,10 @@ fn claim_discrete<R, E>(
 ) -> Option<Result<R, E>> {
     claim_matching(|gpu| gpu.chip.did == did, prepare)
 }
-fn claim_matching<R, E>(matches: impl FnOnce(&AmdGpu) -> bool, prepare: impl FnOnce(&AmdGpu) -> Result<R, E>) -> Option<Result<R, E>> {
+fn claim_matching<R, E>(
+    matches: impl FnOnce(&AmdGpu) -> bool,
+    prepare: impl FnOnce(&AmdGpu) -> Result<R, E>,
+) -> Option<Result<R, E>> {
     let controller = CONTROLLER.lock();
     let gpu = controller.as_ref()?;
     if !matches(gpu) || DISCRETE_OWNED.load(core::sync::atomic::Ordering::Acquire) {

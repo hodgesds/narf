@@ -93,7 +93,12 @@ impl Plan {
     /// clients and the compatible GMC10 apertures without device writes.
     /// # Safety
     /// Same exclusive GPU/client/mapping contract as `read_navi22`.
-    pub unsafe fn read_rdna2(gpu: &AmdGpu, authority: &Cap<BusDeviceCap, Write>, boot_framebuffer: Option<Range<u64>>, other_clients: &[Range<u64>]) -> Result<Self, Error> {
+    pub unsafe fn read_rdna2(
+        gpu: &AmdGpu,
+        authority: &Cap<BusDeviceCap, Write>,
+        boot_framebuffer: Option<Range<u64>>,
+        other_clients: &[Range<u64>],
+    ) -> Result<Self, Error> {
         crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).ok_or(Error::Unsupported)?;
         // SAFETY: forwarded complete stable client inventory and mappings.
         unsafe { Self::read_discrete(gpu, authority, boot_framebuffer, other_clients) }
@@ -133,9 +138,16 @@ impl Plan {
         // dcn_3_0_0_offset.h places them at 0x493..0x495, while DCN3.1+ and
         // DCN4 (dcn_4_1_0_offset.h) moved them to 0x475..0x477.
         let (gc_version, dcn_versions, fb_regs, dcn_fb): (_, &[_], _, u32) = match gpu.chip.did {
-            // linux-lit: 0x16fc=mmGCMC_VM_FB_LOCATION_BASE@gc; 0x16fd=mmGCMC_VM_FB_LOCATION_TOP@gc
-            // linux-lit: 0x16e7=mmGCMC_VM_FB_OFFSET@gc; 0x493=mmDCN_VM_FB_LOCATION_BASE@dcn
-            _ if rdna2.is_some() => { let p = rdna2.unwrap(); (p.gc_version, core::slice::from_ref(&p.dcn_version), [0x16fc, 0x16fd, 0x16e7], 0x493) },
+            _ if rdna2.is_some() => {
+                let p = rdna2.unwrap();
+                (
+                    p.gc_version,
+                    core::slice::from_ref(&p.dcn_version),
+                    // linux: mmGCMC_VM_FB_LOCATION_BASE@gc; mmGCMC_VM_FB_LOCATION_TOP@gc; mmGCMC_VM_FB_OFFSET@gc
+                    [0x16fc, 0x16fd, 0x16e7],
+                    0x493, // linux-lit: 0x493=mmDCN_VM_FB_LOCATION_BASE@dcn
+                )
+            }
             amdgpu::NAVI48 => (
                 (12, 0, 1),
                 &[(4, 0, 1), (4, 1, 0)],

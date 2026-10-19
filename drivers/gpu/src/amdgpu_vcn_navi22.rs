@@ -359,7 +359,11 @@ impl Harvest {
             .map_err(|_| Error::Revoked)?
             .map_err(|_| Error::DeviceGone)?;
         let table = ip::parse_vcn_harvest(&blob).map_err(Error::Harvest)?;
-        Ok(if gpu.chip.did == crate::amdgpu::NAVI22 { Self::navi22(table, revision) } else { Self(table) })
+        Ok(if gpu.chip.did == crate::amdgpu::NAVI22 {
+            Self::navi22(table, revision)
+        } else {
+            Self(table)
+        })
     }
 }
 
@@ -372,13 +376,19 @@ pub(crate) struct Layout {
     pub hdp: u64,
 }
 fn vcn_bases(gpu: &AmdGpu, instance: u8) -> Result<[u64; 2], Error> {
-    let profile = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).ok_or(Error::Unsupported)?;
+    let profile =
+        crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).ok_or(Error::Unsupported)?;
     let mut found = gpu
         .ip_blocks
         .iter()
         .filter(|b| b.hw_id == ip::HW_ID_VCN && b.instance == instance);
     let block = found.next().ok_or(Error::Unsupported)?;
-    if found.next().is_some() || block.num_bases < 2 || !profile.vcn_versions.contains(&(block.major, block.minor, block.revision)) {
+    if found.next().is_some()
+        || block.num_bases < 2
+        || !profile
+            .vcn_versions
+            .contains(&(block.major, block.minor, block.revision))
+    {
         return Err(Error::Unsupported);
     }
     let mut bases = [0; 2];
@@ -397,8 +407,11 @@ fn vcn_bases(gpu: &AmdGpu, instance: u8) -> Result<[u64; 2], Error> {
 impl Layout {
     /// Resolve the instances in `instances` (bit mask) plus GC/NBIO/HDP.
     pub(crate) fn resolve(gpu: &AmdGpu, instances: u8) -> Result<Self, Error> {
-        let profile = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).ok_or(Error::Unsupported)?;
-        if gpu.regs.len < 0x7f004 || instances & !3 != 0 { return Err(Error::Unsupported); }
+        let profile = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did)
+            .ok_or(Error::Unsupported)?;
+        if gpu.regs.len < 0x7f004 || instances & !3 != 0 {
+            return Err(Error::Unsupported);
+        }
         let bank = |id, versions: &[(u8, u8, u8)], index, last| {
             crate::amdgpu_psp_ring::bank(gpu, id, versions, index, last)
                 .map_err(|_| Error::Unsupported)
@@ -1605,7 +1618,13 @@ impl Media {
         Ok(Self {
             client,
             engine: Engine {
-                enc_count: if crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).is_some_and(|p| p.asic == "navi24") { 0 } else { 2 },
+                enc_count: if crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did)
+                    .is_some_and(|p| p.asic == "navi24")
+                {
+                    0
+                } else {
+                    2
+                },
                 hw: Hw {
                     io: Mmio {
                         regs: gpu.regs,
@@ -1704,9 +1723,14 @@ pub(crate) struct Client {
 impl Client {
     fn new(gpu: &AmdGpu, pool: &Pool, instances: u8, jpeg: bool) -> Option<Self> {
         // linux: n/a (MMHUB 2.1.0 discovery version)
-        let base =
-            crate::amdgpu_psp_ring::bank(gpu, ip::HW_ID_MMHUB, crate::amdgpu_rdna2::GMC_MMHUB_VERSIONS, 0, submit::MM_PTB_HI)
-                .ok()?;
+        let base = crate::amdgpu_psp_ring::bank(
+            gpu,
+            ip::HW_ID_MMHUB,
+            crate::amdgpu_rdna2::GMC_MMHUB_VERSIONS,
+            0,
+            submit::MM_PTB_HI,
+        )
+        .ok()?;
         // linux: n/a (OSSSYS 5.0.3 discovery version)
         let oss = crate::amdgpu_psp_ring::bank(
             gpu,

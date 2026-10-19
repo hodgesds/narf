@@ -1645,7 +1645,7 @@ impl ColdBoot {
         drop(queues);
         // SAFETY: forwarded exclusive whole-GPU contract; the mode1 reset
         // below runs before any firmware stage touches the device.
-        let mut boot = unsafe { Self::new(&gpu, authority, &pool, firmware) }?;
+        let mut boot = unsafe { Self::new_rdna2(&gpu, authority, &pool, firmware) }?;
         let h = &mut boot.sequence.backend;
         // SAFETY: forwarded recovery contract; construction has no I/O.
         h.reset = Some(

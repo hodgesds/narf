@@ -362,6 +362,84 @@ kernel_test_in!(
     navi22_modeset_resources_follow_the_dcn30_pool
 );
 
+fn rdna2_modeset_hdmi_family_profiles() -> TestResult {
+    for profile in crate::amdgpu_rdna2::PROFILES {
+        let mut bench = Bench::new();
+        bench.gpu.chip.did = profile.pci_ids[0];
+        for block in &mut bench.gpu.ip_blocks {
+            let version = match block.hw_id {
+                crate::amdgpu_discovery::HW_ID_GC => profile.gc_version,
+                crate::amdgpu_discovery::HW_ID_DCN => profile.dcn_version,
+                crate::amdgpu_discovery::HW_ID_MP1 => profile.psp_version,
+                _ => continue,
+            };
+            (block.major, block.minor, block.revision) = version;
+        }
+        if profile.asic == "navi24" {
+            bench.model.0.lock().forbidden.push(d2(0x80)..=d2(0xb5));
+        }
+        bench.set(m::MP1 + 0x274, 1);
+        let vram = Vram::new(VRAM_BYTES);
+        let image = m::vbios(6);
+        let tables = Tables::new(&image).unwrap();
+        let connector = m::connector(Signal::Hdmi, 0, 0);
+        let mut resources = Resources::for_gpu(&bench.gpu).unwrap();
+        let route = resources.acquire(&connector).unwrap();
+        let mut p = pipeline(&bench, connector, route);
+        let sink = m::sink(Signal::Hdmi, None);
+        match run(enable_with(&mut p, &vram, &tables, &sink, &mut NoAux)) {
+            Ok(output)
+                if output.timing.h_active == 640 && p.state() == State::At(Step::Running) => {}
+            _ => return TestResult::Fail("RDNA2 family HDMI modeset"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    rdna2_modeset_hdmi_family_profiles
+);
+
+fn rdna2_modeset_displayport_family_profiles() -> TestResult {
+    for profile in crate::amdgpu_rdna2::PROFILES {
+        let mut bench = Bench::new();
+        bench.gpu.chip.did = profile.pci_ids[0];
+        for block in &mut bench.gpu.ip_blocks {
+            let version = match block.hw_id {
+                crate::amdgpu_discovery::HW_ID_GC => profile.gc_version,
+                crate::amdgpu_discovery::HW_ID_DCN => profile.dcn_version,
+                crate::amdgpu_discovery::HW_ID_MP1 => profile.psp_version,
+                _ => continue,
+            };
+            (block.major, block.minor, block.revision) = version;
+        }
+        if profile.asic == "navi24" {
+            bench.model.0.lock().forbidden.push(d2(0x80)..=d2(0xb5));
+        }
+        bench.set(m::MP1 + 0x274, 1);
+        let vram = Vram::new(VRAM_BYTES);
+        let image = m::vbios(6);
+        let tables = Tables::new(&image).unwrap();
+        let connector = m::connector(Signal::DisplayPort, 0, 0);
+        let mut resources = Resources::for_gpu(&bench.gpu).unwrap();
+        let route = resources.acquire(&connector).unwrap();
+        let mut p = pipeline(&bench, connector, route);
+        let sink = m::sink(Signal::DisplayPort, Some(m::dpcd(0x12)));
+        let mut aux = DpSink::new(bench.model.clone());
+        aux.caps = m::dpcd(0x12);
+        match run(enable_with(&mut p, &vram, &tables, &sink, &mut aux)) {
+            Ok(output)
+                if output.timing.h_active == 640 && p.state() == State::At(Step::Running) => {}
+            _ => return TestResult::Fail("RDNA2 family DisplayPort modeset"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    rdna2_modeset_displayport_family_profiles
+);
+
 fn navi22_modeset_hdmi_end_to_end_follows_linux_order() -> TestResult {
     for revision in [6, 7] {
         let bench = Bench::new();

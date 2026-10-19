@@ -71,6 +71,49 @@ mod tests {
         "drivers/gpu/dcn-profile",
         dcn_navi22_constructors_bound_all_six_instances
     );
+
+    fn dcn_rdna2_constructors_follow_physical_capacity() -> TestResult {
+        for (did, revision, capacity) in [
+            (0x73bf, 0, 6),
+            (0x73df, 0, 6),
+            (0x73ff, 2, 5),
+            (0x743f, 3, 2),
+        ] {
+            let mut gpu = crate::amdgpu_navi22_boot::tests::gpu();
+            gpu.chip.did = did;
+            let mut dcn = gpu.ip_blocks[0];
+            dcn.hw_id = ip::HW_ID_DCN;
+            dcn.instance = 0;
+            dcn.major = 3;
+            dcn.minor = 0;
+            dcn.revision = revision;
+            dcn.num_bases = 4;
+            dcn.base_addrs[..4].copy_from_slice(&[0, 0x1000, 0x4000, 0x9000]);
+            gpu.ip_blocks.push(dcn);
+            let cap = Cap::bootstrap();
+            for index in 0..=capacity {
+                // SAFETY: construction only validates inert mappings.
+                let accepted = unsafe {
+                    [
+                        Otg::new(&gpu, cap, index).is_ok(),
+                        Hubp::new(&gpu, cap, index).is_ok(),
+                        Dpp::new(&gpu, cap, index).is_ok(),
+                        Opp::new(&gpu, cap, index).is_ok(),
+                        Mpc::new(&gpu, cap, index).is_ok(),
+                        Stream::new(&gpu, cap, index).is_ok(),
+                    ]
+                };
+                if accepted.iter().any(|ok| *ok != (index < capacity)) {
+                    return TestResult::Fail("RDNA2 display constructor capacity");
+                }
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/dcn-profile",
+        dcn_rdna2_constructors_follow_physical_capacity
+    );
 }
 impl Profile {
     pub fn is_dcn30(self) -> bool {

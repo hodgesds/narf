@@ -443,6 +443,9 @@ impl Takeover<'_> {
         )?;
         self.regs
             .update(self.d2(DPP_CONTROL + p * DPP_STRIDE), DPP_CLOCK_ENABLE, 0)?;
+        if !self.profile()?.has_plane_power_gating() {
+            return Ok(());
+        }
         // dcn10_plane_atomic_power_down.
         let request = self.d2(DC_IP_REQUEST_CNTL);
         self.regs.write(request, IP_REQUEST_EN)?;
