@@ -2148,6 +2148,7 @@ fn stage_bundle(
         root_uuid: Some(uuid.to_string()),
         rootflags: "subvol=/@".to_string(),
         bootlog_token: Some(token.to_string()),
+        cmdline_extra: Vec::new(),
     };
     super::grub_image_cmd(&grub)?;
     let bundle = root.join("target/grub-x86_64");
