@@ -5348,6 +5348,8 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
     const MONOTONE_AFTER_ROUND: usize = 8;
     // Block groups whose BLOCK_GROUP_ITEM any round has rewritten.
     let mut bg_touched: BTreeSet<u64> = BTreeSet::new();
+    // Every new metadata block any round recorded, `(addr, level)`.
+    let mut meta_seen: BTreeSet<(u64, u8)> = BTreeSet::new();
     for round in 0..MAX_FIXED_POINT_ROUNDS {
         COMMIT_ROUND.store(round as u32, core::sync::atomic::Ordering::Relaxed);
         commit_phase(2);
@@ -5500,6 +5502,29 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
         // rounds every group any round touched is rewritten (unchanged ones
         // with their committed item, a no-op on content), so the edited set
         // only grows and the fixed point settles.
+        // The extent tree has the same feedback through its own items: each
+        // round records the previous round's new blocks, whose keys decide
+        // which leaves it COWs, whose new blocks the next round records (seen
+        // as a crash/round-trip commit unsettled in the extent tree, 0x7).
+        // After a few rounds every block any round recorded and this one did
+        // not is "touched" with a delete of its METADATA_ITEM key: the block
+        // was free when the commit began (rounds allocate only from free
+        // space), so the key is absent and the delete changes nothing but
+        // COWs the leaf it would live in. The touched leaf set then only
+        // grows, as the block-group set below does.
+        let current: BTreeSet<u64> = new_meta.iter().map(|&(a, _, _)| a).collect();
+        meta_seen.extend(new_meta.iter().map(|&(a, _, l)| (a, l)));
+        if round >= MONOTONE_AFTER_ROUND {
+            for &(addr, level) in &meta_seen {
+                if !current.contains(&addr) {
+                    ext_edits.push(Edit::Delete(BtrfsKey::new(
+                        addr,
+                        format::METADATA_ITEM_KEY,
+                        u64::from(level),
+                    )));
+                }
+            }
+        }
         let edited: BTreeSet<u64> = ext_edits
             .iter()
             .filter(|e| e.key().item_type == format::BLOCK_GROUP_ITEM_KEY)
@@ -5571,6 +5596,13 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
             // collision here would be two trees on one block: refuse it.
             if collided {
                 return Err(FsError::InvalidData);
+            }
+            if round >= MONOTONE_AFTER_ROUND {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "btrfs: commit of generation {gen} settled in round {round}"
+                );
             }
             let csum_root = csum_out
                 .as_ref()
