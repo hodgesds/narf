@@ -3120,6 +3120,65 @@ kernel_test_in!(
     smoke_cgroup_events_emits_inotify_modify
 );
 
+/// inotify watches are keyed by the watcher's host-view path. A distro PID 1
+/// chrooted at /mnt watches `/mnt/sys/fs/cgroup/<unit>/cgroup.events`, so the
+/// populated edge must also be published under every other mount point of the
+/// hierarchy. Published only under `/sys/fs/cgroup`, systemd never saw a
+/// session scope empty and every power-off waited out the scope's stop
+/// timeout.
+fn smoke_cgroup_events_inotify_reaches_every_mount_point() -> TestResult {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static SAW_ALT: AtomicUsize = AtomicUsize::new(0);
+    const ALT: &str = "/t-cgroup-chroot/sys/fs/cgroup";
+
+    fn record(path: &str) {
+        if path == "/t-cgroup-chroot/sys/fs/cgroup/t_evt_alt/cgroup.events" {
+            SAW_ALT.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    SAW_ALT.store(0, Ordering::Release);
+    let auth = crate::bootstrap_mount_authority();
+    let handle = match crate::registry().mount(&auth, ALT, CgroupFs::new()) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("mounting cgroup2 at the alternate path failed"),
+    };
+    crate::set_modify_notifier(record);
+
+    let root = root_dir();
+    let _ = poll_once(root.rmdir("t_evt_alt"));
+    let result = (|| {
+        let child = match poll_once(root.mkdir("t_evt_alt")) {
+            Some(Ok(d)) => d,
+            _ => return Err("mkdir t_evt_alt failed"),
+        };
+        const PID: u64 = 909_211;
+        if attach_pid(&child, PID).is_err() {
+            return Err("attaching a pid to t_evt_alt failed");
+        }
+        let after_attach = SAW_ALT.load(Ordering::Acquire);
+        task_exited(PID);
+        let after_exit = SAW_ALT.load(Ordering::Acquire);
+        if after_attach == 0 {
+            return Err("populated 0->1 was not published under the second mount point");
+        }
+        if after_exit <= after_attach {
+            return Err("populated 1->0 was not published under the second mount point");
+        }
+        Ok(())
+    })();
+    let _ = poll_once(root.rmdir("t_evt_alt"));
+    let _ = crate::registry().unmount(&handle, ALT);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(msg) => TestResult::Fail(msg),
+    }
+}
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_events_inotify_reaches_every_mount_point
+);
+
 fn smoke_clone_thread_cgroup_domain_rules() -> TestResult {
     let root = root_dir();
     let threaded_name = "t_clone_threaded";
