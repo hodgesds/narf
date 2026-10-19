@@ -171,6 +171,8 @@ pub(crate) struct Frame<'a> {
     pub flush: Option<VmRef>,
     /// IH LUT write: (absolute `IH_VMID_<vmid>_LUT` dword, PASID).
     pub pasid_map: Option<(u32, u16)>,
+    /// Dedicated writeback after the flush and LUT write, before client IBs.
+    pub vm_fence: Option<(u64, u32)>,
     pub vmid: u8,
     pub context_switch: bool,
     pub ibs: &'a [Ib],
@@ -230,6 +232,9 @@ pub(crate) fn encode_cp(l: Layout, f: &Frame<'_>) -> Vec<u32> {
     if let Some((lut, pasid)) = f.pasid_map {
         // gmc_v10_0_emit_pasid_mapping via gfx_v10_0_ring_emit_wreg.
         w.extend(cp_wreg(gfx, lut, u32::from(pasid)));
+    }
+    if let Some((address, sequence)) = f.vm_fence {
+        w.extend(pm4::release_mem(address, sequence));
     }
     if gfx {
         // gfx_v10_0_ring_emit_cntxcntl: load_enable, plus the context-switch
@@ -299,6 +304,9 @@ pub(crate) fn encode_sdma(l: Layout, f: &Frame<'_>) -> Vec<u32> {
         // gmc_v10_0_emit_pasid_mapping via sdma_v5_2_ring_emit_wreg.
         w.extend(sdma_wreg(lut, u32::from(pasid)));
     }
+    if let Some((address, sequence)) = f.vm_fence {
+        w.extend(pm4::sdma_fence(address, sequence));
+    }
     for ib in f.ibs {
         // sdma_v5_2_ring_emit_ib: NOP so the 6-dword packet ends on 8.
         let at = f.wptr + w.len() as u64;
@@ -357,6 +365,7 @@ pub(crate) fn submit<I: Io>(
     let context_switch = state.context != context;
     let sync = (vm.flush || context_switch).then_some((fence_address, queue.seq));
     let flush = vm.flush.then_some(vm);
+    let previous_seq = queue.seq;
     let seq = queue.next_seq();
     let lut = hw.layout.oss(IH_VMID_0_LUT) + u32::from(vm.vmid);
     let frame = Frame {
@@ -365,6 +374,8 @@ pub(crate) fn submit<I: Io>(
         sync,
         flush,
         pasid_map: vm.map_pasid.then_some((lut, vm.pasid)),
+        vm_fence: (vm.flush || vm.map_pasid)
+            .then_some((queue.address(crate::amdgpu_cp_navi22::VM_FENCE), seq)),
         vmid: vm.vmid,
         context_switch,
         ibs,
@@ -384,7 +395,7 @@ pub(crate) fn submit<I: Io>(
     if result.is_err() {
         // Nothing was emitted: give the sequence back so the throttle never
         // waits for a fence no ring will write.
-        queue.seq = seq.wrapping_sub(1);
+        queue.seq = previous_seq;
     }
     result?;
     state.context = context;
@@ -398,7 +409,7 @@ pub(crate) fn throttle_seq(queue: &Queue) -> u32 {
 
 /// The ring's current fence value (after an HDP read invalidate).
 pub(crate) fn completed<I: Io>(hw: &mut Hw<I>, queue: &Queue) -> Result<u32, Error> {
-    hw.access(|io, l| crate::amdgpu_cp_navi22::checked(queue.read(io, l, FENCE)))
+    crate::amdgpu_cp_navi22::progress(hw, queue).map(|p| p.signaled)
 }
 
 // ── Media rings: VCN 3.0 decode/encode and JPEG 3.0 (append-only) ──────

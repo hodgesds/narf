@@ -21,22 +21,12 @@
 //! which resolves, for every GMC 11 part, to a 256 TiB address space over four
 //! levels of 512 entries — see [`Geometry::GMC11`] for the arithmetic.
 //!
-//! ## What this module does not do yet
+//! ## Submission integration and remaining limits
 //!
-//! LINUX-GAP: nothing **binds** an address space to a submission. The tables
-//! themselves are real: `VmState::materialise` allocates a root directory
-//! and the hierarchy beneath it, writes PDEs and PTEs, and [`activate`]
-//! programs both hubs' page-table base, aperture and context-control
-//! registers and then invalidates the TLB. What is missing is above that —
-//! `AMDGPU_CTX` does not own a `VmState`, so no VMID is bound on behalf of a
-//! client and no submission runs under one. `AMDGPU_GEM_VA`'s requests are
-//! accepted, checked, recorded, and written into tables the hardware could be
-//! pointed at; nothing points it at them for a client's work.
-//!
-//! LINUX-GAP: an unmap tears down the entries but does not invalidate the
-//! TLB, because invalidation needs the MMIO handles [`activate`] is given and
-//! `dematerialise` is not. Stale translations after an unmap are only safe
-//! while nothing submits.
+//! Native submitters bind each client's materialised root to a per-job VMID
+//! and emit ring-side invalidations when tlb_seq changes. Removed mappings
+//! retain their BOs until the jobs that could still use them have completed;
+//! the next grant flushes stale translations before executing another IB.
 //!
 //! LINUX-GAP: `AMDGPU_VM_PAGE_PRT` (partially-resident textures) is validated
 //! but refused. PRT maps a range with no backing at all and relies on the

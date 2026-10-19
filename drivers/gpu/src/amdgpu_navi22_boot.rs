@@ -951,6 +951,7 @@ impl Backend for Hardware {
 }
 #[derive(Debug)]
 pub struct ColdBoot {
+    boot_mclk_khz: u64,
     // Recovery consumes and returns this owner. Keep the retained hardware
     // off-stack: moving the inline sequence and its Result temporaries used
     // to overflow the 64 KiB aarch64 boot stack, even when recovery refused.
@@ -978,6 +979,17 @@ fn snapshot(gpu: &AmdGpu) -> Result<AmdGpu, Error> {
     })
 }
 impl ColdBoot {
+    pub(crate) fn read_mmr(
+        &self,
+        payload: [u32; 4],
+        cached_gb: Option<u32>,
+    ) -> Result<alloc::vec::Vec<u8>, narf_filesystem::FsError> {
+        if !matches!(self.sequence.state, State::FirmwareReady(_)) {
+            return Err(narf_filesystem::FsError::NoDevice);
+        }
+        let h = &self.sequence.backend;
+        crate::amdgpu_rdna2_mmr::read(&h.gpu, &h.authority, payload, cached_gb)
+    }
     /// # Safety
     /// Caller exclusively owns this physical Navi22 GPU (not an SR-IOV VF), its
     /// PSP/MP1/GC/HDP mailboxes and reset/power controls. Mappings are permanent,
@@ -1015,11 +1027,17 @@ impl ColdBoot {
     ) -> Result<Self, Error> {
         psp::validate_rdna2_layout(gpu).map_err(Error::Psp)?;
         firmware.check_device(gpu)?;
+        let boot_mclk_khz = gpu
+            .vbios
+            .as_ref()
+            .and_then(|v| crate::amdgpu_info::boot_mclk_10khz(v.bytes()))
+            .map_or(0, |v| u64::from(v) * 10);
         let gpu = snapshot(gpu)?;
         // SAFETY: forwarded trained-VRAM/exclusive-device/mapping/pool contract.
         let bootstrap =
             unsafe { sos::Bootloader::new(&gpu, authority, pool) }.map_err(Error::Sos)?;
         Ok(Self {
+            boot_mclk_khz,
             sequence: Box::new(Sequence {
                 backend: Hardware {
                     gpu,
@@ -1071,11 +1089,17 @@ impl ColdBoot {
         exchange: crate::amdgpu_vram_boot::Training,
     ) -> Result<Self, Error> {
         firmware.check_device(gpu)?;
+        let boot_mclk_khz = gpu
+            .vbios
+            .as_ref()
+            .and_then(|v| crate::amdgpu_info::boot_mclk_10khz(v.bytes()))
+            .map_or(0, |v| u64::from(v) * 10);
         let gpu = snapshot(gpu)?;
         // SAFETY: caller owns all mappings/clients and reserves both exchanges.
         let training =
             unsafe { gddr6::Trainer::new(&gpu, authority, exchange) }.map_err(Error::Training)?;
         Ok(Self {
+            boot_mclk_khz,
             sequence: Box::new(Sequence {
                 backend: Hardware {
                     gpu,
@@ -1502,6 +1526,21 @@ impl ColdBoot {
         let h = &self.sequence.backend;
         h.power_status.and(h.smu.as_ref()?.limits())
     }
+    /// Read the current UCLK limits under the retained MP1 owner.
+    pub(crate) async fn memory_clock_range(&mut self) -> Result<(u64, u64), Error> {
+        if !matches!(self.sequence.state, State::FirmwareReady(_)) {
+            return Err(Error::Busy);
+        }
+        let hardware = &mut self.sequence.backend;
+        let boot_khz = self.boot_mclk_khz;
+        hardware
+            .smu
+            .as_mut()
+            .ok_or(Error::Invalid)?
+            .memory_range(boot_khz)
+            .await
+            .map_err(Error::Smu)
+    }
     /// One PMFW telemetry refresh through the retained SMU owner after a
     /// completed boot. It shares only the PPSMC mailbox and the retained
     /// transfer buffer, both serialized by the caller's owner lock.
@@ -1622,6 +1661,7 @@ impl ColdBoot {
         if !self.recoverable() {
             return Err(Error::Busy);
         }
+        let boot_mclk_khz = self.boot_mclk_khz;
         let Hardware {
             gpu,
             authority,
@@ -1646,6 +1686,7 @@ impl ColdBoot {
         // SAFETY: forwarded exclusive whole-GPU contract; the mode1 reset
         // below runs before any firmware stage touches the device.
         let mut boot = unsafe { Self::new_rdna2(&gpu, authority, &pool, firmware) }?;
+        boot.boot_mclk_khz = boot_mclk_khz;
         let h = &mut boot.sequence.backend;
         // SAFETY: forwarded recovery contract; construction has no I/O.
         h.reset = Some(

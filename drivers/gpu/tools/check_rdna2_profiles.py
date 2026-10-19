@@ -61,6 +61,12 @@ def main():
     source = Path(__file__).resolve().parents[1] / "src/amdgpu_rdna2.rs"
     amd = args.linux / "drivers/gpu/drm/amd"
     check_dmub_layouts(amd)
+    with tempfile.TemporaryDirectory(prefix="narf-rdna2-metadata-") as temporary:
+        executable = str(Path(temporary) / "metadata")
+        subprocess.run(["cc", "-Wall", "-Wextra", "-Werror", "-D__counted_by(x)=",
+                        "-I" + str(amd / "include"), str(source.parents[1] / "tests/rdna2_metadata.c"),
+                        "-o", executable], check=True)
+        subprocess.run([executable], check=True)
     pci_table = (amd / "amdgpu/amdgpu_drv.c").read_text()
     ucode = (amd / "amdgpu/amdgpu_ucode.c").read_text()
     dm = (amd / "display/amdgpu_dm/amdgpu_dm.c").read_text().split("static int dm_init_microcode", 1)[1]
@@ -163,6 +169,7 @@ def main():
             "for p in rdna2::PROFILES {\n"
             'for version in [0, 0x3a42ff, 0x3a4300, 0x3a48ff, 0x3a4900, 0x412cff, 0x412d00, 0x3b22ff, 0x3b2300, 0x4910ff, 0x491100, u32::MAX] {'
             'println!("metrics {} {}.{}.{},{},{:?}", p.asic, p.psp_version.0, p.psp_version.1, p.psp_version.2, version, telemetry::Layout::for_profile(p, version)); }\n'
+            'println!("mall {} {}", p.asic, p.mall_bytes());\n'
             'println!("cg {} {}", p.asic, p.clock_gating_flags());\n'
             'println!("pg {} {}", p.asic, p.power_gating_flags());\n'
             'println!("driver-if {} {}", p.asic, p.smu_driver_interface());\n'
@@ -186,6 +193,7 @@ def main():
             'let index = if name == "RLC_RLCS_BOOTLOAD_STATUS" {r.rlc_base_index} '
             'else {r.gc_base_index}; '
             'println!("reg {} {}", name, offset); println!("reg {}_BASE_IDX {}", name, index); }\n'
+            'for offset in rdna2::READ_MMR_GC { println!("mmr gc {}", offset); }\n'
             'for v in rdna2::GMC_MMHUB_VERSIONS { println!("mmhub common {}.{}.{}", v.0, v.1, v.2); }\n'
             'for v in rdna2::IH_OSSSYS_VERSIONS { println!("ih common {}.{}.{}", v.0, v.1, v.2); }\n'
             + hub_output + "}\n"
@@ -197,6 +205,7 @@ def main():
         output = subprocess.check_output([str(work / "inventory")], text=True)
     actual = {name: set() for name in chips}
     golden_actual = {name: [] for name in chips}
+    mmr_actual = []
     firmware_count = 0
     version_count = 0
     register_count = 0
@@ -220,6 +229,14 @@ def main():
                     break
             if layout != expected:
                 raise SystemExit(f"{asic} firmware {version} metrics layout {layout} != Linux {expected}")
+        elif kind == "mmr":
+            mmr_actual.append(int(value))
+        elif kind == "mall":
+            revision = {"navi21": 0, "navi22": 2, "navi23": 4, "navi24": 5}[asic]
+            body = case_body(gmc[gmc.index("case IP_VERSION(10, 3, 0):", gmc.index("amdgpu_gmc_get_vram_info")):], f"10.3.{revision}")
+            expected = int(re.search(r"adev->gmc.mall_size\s*=\s*(\d+)\s*\*\s*1024\s*\*\s*1024", body).group(1)) * 1024 * 1024
+            if int(value) != expected:
+                raise SystemExit(f"{asic} MALL size differs from Linux")
         elif kind in ("cg", "pg"):
             revision = {"navi21": 0, "navi22": 2, "navi23": 4, "navi24": 5}[asic]
             body = case_body(nv_source, f"10.3.{revision}")
@@ -311,6 +328,10 @@ def main():
                 f"{asic}: missing={sorted(expected - actual[asic])}, "
                 f"extra={sorted(actual[asic] - expected)}"
             )
+    names = re.findall(r"SOC15_REG_ENTRY\(GC, 0, (mm\w+)\)", nv_source.split("nv_allowed_read_registers[]", 1)[1].split("};", 1)[0])
+    if mmr_actual != [gc_macros[name] for name in names]:
+        raise SystemExit("Compiled GC MMR allow-list differs from Linux")
+    print("PASS: atomfirmware VRAM module layouts, RX 6000 MALL sizes and GC MMR allow-list match Linux")
     print(f"PASS: {sum(map(len, actual.values()))} exact PCI IDs and "
           f"{firmware_count} firmware names, {version_count} IP selections and "
           f"{register_count} GPU register fields and {sum(map(len, golden_actual.values()))} "

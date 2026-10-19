@@ -113,6 +113,7 @@ struct Fake {
     revoke_on: Option<(u32, Cap<BusDeviceCap, Write>)>,
     running: u64,
     gfx_limits: (u32, u32),
+    uclk_limits: (u32, u32),
     /// Retained transfer buffer contents and the PMFW metrics it receives.
     buffer: Vec<u8>,
     metrics: Vec<u8>,
@@ -222,6 +223,8 @@ impl Io for Fake {
                     assert_eq!(self.flushes, 1, "staging not flushed before transfer");
                     let metrics = self.metrics.clone();
                     self.buffer[..metrics.len()].copy_from_slice(&metrics);
+                } else if matches!(value, MIN_DPM_FREQ | MAX_DPM_FREQ) {
+                    assert!(matches!(self.argument, 0 | 0x20000));
                 } else if !matches!(
                     value,
                     ALLOWED_HIGH
@@ -250,6 +253,8 @@ impl Io for Fake {
                         RUN_DC_BTC | ALLOWED_HIGH | ALLOWED_LOW | ENABLE_FEATURES => 0,
                         RUNNING_LOW => self.running as u32,
                         RUNNING_HIGH => (self.running >> 32) as u32,
+                        MIN_DPM_FREQ if self.argument == 2 << 16 => self.uclk_limits.0,
+                        MAX_DPM_FREQ if self.argument == 2 << 16 => self.uclk_limits.1,
                         MIN_DPM_FREQ => self.gfx_limits.0,
                         MAX_DPM_FREQ => self.gfx_limits.1,
                         TRANSFER_TO_DRIVER | REENABLE_ACDC_INTERRUPT => 0,
@@ -298,6 +303,7 @@ fn engine() -> Engine<Fake> {
                 .unwrap()
                 .allowed(),
             gfx_limits: (500, 2600),
+            uclk_limits: (96, 1000),
             buffer: vec![0x5a; 4096],
             metrics: Vec::new(),
             flushes: 0,
@@ -1514,4 +1520,47 @@ fn rdna2_runtime_banks_metrics_and_thermal_alerts() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     rdna2_runtime_banks_metrics_and_thermal_alerts
+);
+
+fn rdna2_uclk_limits_follow_dpm_state() -> TestResult {
+    for profile in crate::amdgpu_rdna2::PROFILES {
+        let (mut engine, _pool) = uploaded_engine();
+        engine.profile = crate::amdgpu_rdna2::for_pci_id(0x1002, profile.pci_ids[0]).unwrap();
+        run(engine.configure_power()).unwrap();
+        engine.io.writes.clear();
+        if run(engine.memory_range(0)) != Err(Error::Invalid) || engine.state != State::PowerReady {
+            return TestResult::Fail("missing boot clock poisoned read-only SMU metadata query");
+        }
+        if run(engine.memory_range(1_000_000)) != Ok((1_000_000, 1_000_000))
+            || commands(&engine.io.writes)
+                .iter()
+                .any(|c| matches!(c.0, MIN_DPM_FREQ | MAX_DPM_FREQ))
+        {
+            return TestResult::Fail("disabled UCLK DPM did not use boot MCLK");
+        }
+        engine.io.running |= crate::amdgpu_navi22_power_policy::SMU_DPM_UCLK;
+        engine.io.writes.clear();
+        if run(engine.memory_range(1_000_000)) != Ok((96_000, 1_000_000))
+            || !commands(&engine.io.writes).contains(&(MIN_DPM_FREQ, 2 << 16))
+            || !commands(&engine.io.writes).contains(&(MAX_DPM_FREQ, 2 << 16))
+        {
+            return TestResult::Fail("UCLK range queried wrong clock or units");
+        }
+        engine.io.reject = Some((MIN_DPM_FREQ, 0xfd));
+        if run(engine.memory_range(1_000_000)) != Err(Error::Rejected(0xfd))
+            || engine.state != State::PowerReady
+        {
+            return TestResult::Fail("unsupported UCLK query poisoned mailbox");
+        }
+        engine.io.reject = None;
+        engine.io.uclk_limits = (1200, 1000);
+        if run(engine.memory_range(1_000_000)) != Err(Error::Invalid) {
+            return TestResult::Fail("inverted UCLK limits accepted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_uclk_limits_follow_dpm_state
 );

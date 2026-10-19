@@ -1783,9 +1783,9 @@ impl MediaFenceReader {
                 // reservation whose fence dword is in bounds.
                 unsafe {
                     regs.write32(hdp, 1);
-                    regs.read32(hdp);
+                    checked(regs.read32(hdp))?;
                     barrier(Ordering::SeqCst);
-                    checked(slot.read32(offset)).map(Some)
+                    Ok(Some(slot.read32(offset)))
                 }
             }))
             .map_err(|_| Error::Revoked)?
@@ -1817,7 +1817,8 @@ impl<I: Io> Engine<I> {
         let throttle = r.seq.wrapping_sub(submit::HW_SUBMISSIONS - 1);
         let completed = self.hw.access(|io, l| {
             invalidate(io, l);
-            checked(io.read_memory(map, fence_at))
+            checked(io.read(l.hdp + 0xd1 * 4))?;
+            Ok(io.read_memory(map, fence_at))
         })?;
         Ok((completed, throttle))
     }

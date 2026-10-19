@@ -311,6 +311,7 @@ fn navi22_submit_encodes_linux_vm_flush() -> TestResult {
             sync: Some((0x1000, 5)),
             flush: Some(vm()),
             pasid_map: Some((0x10a0 + u32::from(VMID), PASID)),
+            vm_fence: None,
             vmid: VMID,
             context_switch: true,
             ibs: &[],
@@ -372,6 +373,7 @@ fn navi22_submit_encodes_linux_vm_flush() -> TestResult {
             sync: None,
             flush: Some(vm()),
             pasid_map: Some((0x10a0 + u32::from(VMID), PASID)),
+            vm_fence: None,
             vmid: VMID,
             context_switch: false,
             ibs: &[],
@@ -804,4 +806,167 @@ fn navi22_vmid_clients_on_two_rings_keep_their_own_translations() -> TestResult 
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi22",
     navi22_vmid_clients_on_two_rings_keep_their_own_translations
+);
+
+fn rdna2_vm_writeback_precedes_client_ib_and_job_fence() -> TestResult {
+    use crate::amdgpu_pm4_defs::PACKET3_RELEASE_MEM;
+    let l = crate::amdgpu_cp_navi22::tests::layout();
+    let ibs = [Ib {
+        va: IB_VA,
+        dwords: 4,
+    }];
+    let frame = Frame {
+        gfx: true,
+        engine: 0,
+        sync: None,
+        flush: Some(vm()),
+        pasid_map: Some((0x10a0 + u32::from(VMID), PASID)),
+        vm_fence: Some((0x3000, 7)),
+        vmid: VMID,
+        context_switch: true,
+        ibs: &ibs,
+        fence: 0x4000,
+        seq: 7,
+        wptr: 0,
+    };
+    let cp = encode_cp(l, &frame);
+    let releases: Vec<_> = cp
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| **w == packet3(PACKET3_RELEASE_MEM, 6))
+        .map(|(i, _)| i)
+        .collect();
+    let indirect = cp
+        .iter()
+        .position(|&w| w == packet3(PACKET3_INDIRECT_BUFFER, 2))
+        .unwrap();
+    if releases.len() != 2
+        || releases[0] >= indirect
+        || releases[1] <= indirect
+        || cp[releases[0] + 3] != 0x3000
+        || cp[releases[1] + 3] != 0x4000
+    {
+        return TestResult::Fail("CP VM and job completion use wrong address/order");
+    }
+    let sdma = encode_sdma(l, &frame);
+    let releases: Vec<_> = sdma
+        .windows(4)
+        .enumerate()
+        .filter(|(_, w)| w[0] == 5 | 3 << 16)
+        .map(|(i, _)| i)
+        .collect();
+    let indirect = sdma
+        .iter()
+        .position(|&w| w == 4 | u32::from(VMID) << 16)
+        .unwrap();
+    if releases.len() != 2
+        || releases[0] >= indirect
+        || releases[1] <= indirect
+        || sdma[releases[0] + 1] != 0x3000
+        || sdma[releases[1] + 1] != 0x4000
+    {
+        return TestResult::Fail("SDMA VM and job completion use wrong address/order");
+    }
+    use crate::amdgpu_vmid::{GrabRequest, VmidManager};
+    let mut manager = VmidManager::new(1, 2);
+    let request = GrabRequest {
+        owner: 123,
+        pd_addr: 0x1000,
+        tlb_seq: 0,
+        pasid: 1,
+        ring: 0,
+    };
+    let grant = manager.grab(request, &|_| false).unwrap();
+    manager.commit_with_flush(request, grant, 7, 7 | 1 << 63);
+    let cross_ring = GrabRequest { ring: 1, ..request };
+    let grant2 = manager
+        .grab(cross_ring, &|ticket| ticket & (1 << 63) != 0)
+        .unwrap();
+    if grant2.vmid != grant.vmid || grant2.needs_flush || grant2.map_pasid {
+        return TestResult::Fail("completed VM programming waited for unrelated job completion");
+    }
+    let foreign = manager
+        .grab(
+            GrabRequest {
+                owner: 456,
+                ..cross_ring
+            },
+            &|ticket| ticket & (1 << 63) != 0,
+        )
+        .unwrap();
+    if foreign.vmid == grant.vmid {
+        return TestResult::Fail("VM fence completion freed a VMID with a running job");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_vm_writeback_precedes_client_ib_and_job_fence
+);
+
+fn rdna2_sequences_wrap_without_zero_or_false_device_loss() -> TestResult {
+    let (_pool, mut e) = gfx_engine();
+    let ib = install(&mut e.hw.io, false, 0x1234_5678);
+    let mut state = RingState::default();
+    e.queue.seq = u32::MAX - 1;
+    e.hw.io.mem.insert(e.queue.address(FENCE), u32::MAX - 1);
+    if submit(
+        &mut e.hw,
+        &mut e.queue,
+        &mut state,
+        Ring::Gfx,
+        vm(),
+        1,
+        &[ib],
+    ) != Ok(u32::MAX)
+        || completed(&mut e.hw, &e.queue) != Ok(u32::MAX)
+        || e.hw
+            .io
+            .word(e.queue.address(crate::amdgpu_cp_navi22::VM_FENCE))
+            != u32::MAX
+    {
+        return TestResult::Fail("all-ones fence value mistaken for a removed GPU");
+    }
+    if submit(
+        &mut e.hw,
+        &mut e.queue,
+        &mut state,
+        Ring::Gfx,
+        reused(),
+        1,
+        &[ib],
+    ) != Ok(1)
+        || completed(&mut e.hw, &e.queue) != Ok(1)
+    {
+        return TestResult::Fail("wrapped queue emitted reserved zero sequence");
+    }
+    // Revoke between the progress sample and frame publication: rollback
+    // must restore MAX, not zero (the predecessor of the skipped sequence).
+    e.queue.seq = u32::MAX;
+    e.hw.io.mem.insert(e.queue.address(FENCE), u32::MAX);
+    e.hw.io.revoke = Some((
+        crate::amdgpu_cp_navi22::tests::layout().hdp + 0xd1 * 4,
+        1,
+        e.hw.authority,
+    ));
+    let before = e.queue.wptr;
+    if submit(
+        &mut e.hw,
+        &mut e.queue,
+        &mut state,
+        Ring::Gfx,
+        reused(),
+        1,
+        &[ib],
+    ) != Err(Error::Revoked)
+        || e.queue.seq != u32::MAX
+        || e.queue.wptr != before
+    {
+        return TestResult::Fail("failed wrapped submission changed sequence or ring");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_sequences_wrap_without_zero_or_false_device_loss
 );

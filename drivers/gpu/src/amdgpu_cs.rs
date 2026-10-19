@@ -877,7 +877,7 @@ pub async fn dispatch_async(
         }
         let mut out = [0u8; 8];
         out[0..4].copy_from_slice(&u32::from(!idle).to_le_bytes());
-        out[4..8].copy_from_slice(&(object.preferred_domains as u32).to_le_bytes());
+        out[4..8].copy_from_slice(&(object.preferred_domains() as u32).to_le_bytes());
         // SAFETY: as above.
         unsafe { copy_out(arg, &out)? };
         return Ok(0);

@@ -9,8 +9,16 @@
 
 #[path = "amdgpu_rdna2_golden.rs"]
 pub mod golden;
+#[path = "amdgpu_rdna2_metadata.rs"]
+pub mod metadata;
 #[path = "amdgpu_rdna2_options.rs"]
 pub mod options;
+
+// gc_10_1_0_offset.h; BASE_IDX 0 for every entry.
+pub const READ_MMR_GC: &[u32] = &[
+    0x0da4, 0x0da2, 0x0da5, 0x0da6, 0x0dae, 0x0daf, 0x0f40, 0x0f3d, 0x0f3e, 0x0f3c, 0x0e28, 0x0e29,
+    0x0e27, 0x0e25, 0x0e26, 0x0e24, 0x13de,
+];
 
 /// Serialized PowerPlay SKU and board boundaries. Beige Goby's original
 /// fbe8115c6ab7 interface remains in shipping firmware alongside the newer ABI.
@@ -23,6 +31,17 @@ pub struct PowerTableLayout {
     pub board_end: usize,
 }
 impl Profile {
+    /// gmc_v10_0_sw_init: MALL size for the discrete GC 10.3 revisions.
+    pub const fn mall_bytes(&self) -> u64 {
+        let mib = match self.gc_version {
+            (10, 3, 0) => 128,
+            (10, 3, 2) => 96,
+            (10, 3, 4) => 32,
+            (10, 3, 5) => 16,
+            _ => 0,
+        };
+        mib * 1024 * 1024
+    }
     /// Bare-metal `nv_common_early_init` clock-gating flags. Media applies
     /// its own flags; Navi24 has no JPEG clock-gating capability flag.
     pub const fn clock_gating_flags(&self) -> u64 {

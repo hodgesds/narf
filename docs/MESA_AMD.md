@@ -300,6 +300,30 @@ spellings remain supported. An explicit `rdna2_pg` value takes precedence over
 `navi22_pg`, including an empty or invalid value; invalid lists enable nothing.
 Power-saving prerequisites and default-off behavior are unchanged.
 
+## RX 6000 software behavior
+
+Device-info replies report VBIOS memory type/bus width and timestamp frequency,
+common GPU/slot PCIe capabilities, Linux's per-ASIC Infinity Cache sizes, and
+SMU memory-clock limits (boot MCLK while UCLK DPM is disabled). Missing board
+metadata stays unknown. Live register queries use Linux's allow-list and wait
+for the retained GPU owner with GC powered.
+
+Native submissions use FIFO ring admission and IRQ-driven fence/VMID waits.
+VM programming has a separate completion writeback before the client IB;
+its completion cannot release a VMID whose job is still running. Reset
+invalidates old submitters using the fence generation established before
+restart.
+
+Ordinary VRAM-preferred allocations can fall back to GTT when VRAM is full,
+while retaining their requested preference; discardable VRAM-only allocations
+keep stricter placement requirements.
+GEM can evict idle, exclusively owned visible-VRAM buffers to GTT and promote
+them back when space is available, preserving data. Placement preferences
+are recorded by GEM_SET_PLACEMENT and applied when the buffer is unpinned.
+CPU/GPU mappings, PRIME/shared handles, active jobs and reservation fences pin
+placement. Invisible VRAM does not migrate under this policy; complete Linux
+TTM behavior remains broader than this driver policy.
+
 ## Open items
 
 - The Fedora image runs Fedora's Mesa (glibc), not this build; the musl

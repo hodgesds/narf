@@ -44,6 +44,66 @@ infrastructure (Phase B).
 
 ## 3. Public interface
 
+### RX 6000 device queries, scheduling and memory pressure
+
+`amdgpu_rdna2::metadata::vram(table, module)` bounds atomfirmware
+VRAM_INFO 2.3/2.4/2.5/2.6 variable-length modules. Platform preparation reads
+the module selector from BIOS_SCRATCH_4 under PCI authority and publishes it
+through `amdgpu_rdna2_info::Published::vram_module`. Invalid straps fall back
+to module zero; malformed tables remain unknown. `Snapshot` carries the
+resulting VRAM type and bus width. `Published::pcie` holds the maximum common
+endpoint/physical-partner generation and width, skipping AMD internal
+switches; negotiated idle Link Status is not a maximum-capability source.
+Unavailable or ambiguous partner discovery leaves the fields zero.
+`Profile::mall_bytes()` mirrors gmc_v10_0_sw_init's 128/96/32/16 MiB for
+Navi21/22/23/24. `Published::memory_khz` reports boot MCLK while UCLK DPM is
+disabled, or GetMin/MaxDpmFreq(PPCLK_UCLK) when enabled. Publication refreshes
+after boot/recovery and power-policy changes, clearing unavailable values.
+The cold-boot owner retains the immutable boot clock independently of its
+reduced GPU layout snapshot, which intentionally omits the VBIOS.
+
+Real device `READ_MMR_REG` ioctls on both primary and render nodes acquire a
+GFXOFF reference before awaiting the platform owner. The whole register range
+is checked against nv.c's unindexed GC/SDMA0/SDMA1 allow-list and BAR bounds
+before one live PCI capability invocation reads it. GB_ADDR_CONFIG uses the
+published topology cache. Pure `query_with` calls retain their cached-only
+behavior; they never access live MMIO. Count, SE/SH indices, copy bounds and
+short replies retain the existing AMDGPU_INFO ABI.
+
+Each native ring has FIFO admission with per-waiter wakers and cancellation
+cleanup. VMID exhaustion and ring throttling wait for any fence IRQ or a hard
+deadline; an interrupt sequence sampled before inspecting completion closes
+the registration race. Every client owns its waiter entry. CP and SDMA emit a
+dedicated VM writeback after invalidation/PASID mapping and before client IBs.
+`VmidManager::commit_with_flush` tracks this separately from each job's final
+fence: early VM completion cannot release an active VMID. Bit 63 tags these
+internal VM tickets; native job tickets use four ring bits and 27 generation
+bits. Generation advances during quiesce before submitter registration, and
+old submitters refuse further progress/submissions after that transition.
+All-ones writeback sequences remain valid; device loss is detected through
+HDP liveness, not the fence value. CP/SDMA skip reserved zero at sequence wrap
+and failed submissions restore the previous sequence exactly. Media retains
+zero at wrap because its nonzero ring tag distinguishes the ticket and JPEG's
+two kernel IB slots must continue alternating by sequence parity.
+
+Ordinary VRAM-preferred GEM creation also permits GTT fallback when VRAM is
+unavailable, as amdgpu_bo_create sets allowed_domains, without rewriting the
+reported preference. Discardable VRAM-only creation keeps its stricter domain
+set; GEM_SET_PLACEMENT updates preferred and allowed normal domains with the
+Linux sole-VRAM-to-GTT fallback rule.
+GEM visible-VRAM pressure can evict idle, exclusively owned buffers to GTT.
+Eligible GTT buffers return to VRAM on lookup if space is available. Allocation
+and copying complete before swapping backing and releasing the source; errors
+preserve data, source placement and accounting. CPU mappings, GPU VA mappings,
+PRIME exports, shared handles and outstanding jobs retain strong references
+and pin placement. Unsignalled reservation fences and invisible VRAM also
+prevent migration. This driver pins these mappings rather than invalidating
+live process or GPU PTEs. `GemObject::preferred_domains()` reads the atomic
+preference; GEM_SET_PLACEMENT records normal-domain bits without moving a
+pinned object. GEM mmap resolves scattered GTT pages through `frames`, never
+by assuming consecutive physical addresses. This is a bounded placement and
+eviction policy, not the complete Linux TTM feature set.
+
 ### Shared RDNA2 execution and family limits
 
 The shared public modules use `amdgpu_rdna2_{boot,platform,gating,power,
@@ -6204,6 +6264,15 @@ and primary-plane binding; the boot resource is never exposed as a GEM object.
 
 - GPU DMA targets are validated against its IOMMU context.
 - A hung GPU causes no kernel hang — the driver domain takes the hit.
+- GEM backing addresses remain stable for every retained mapping, shared
+  handle, export and job reference. Migration requires exclusive Arc ownership,
+  permitted destination domains and settled reservation fences; the source
+  allocation survives until the complete destination copy succeeds.
+- VM programming completion never substitutes for a job's lifetime fence.
+  Reset generations invalidate retained submitters before queues are reused.
+- Live userspace register queries validate the complete allow-listed range
+  before accessing MMIO, under current PCI authority, the retained hardware
+  owner and a GC power reference.
 
 ## 5. Architecture notes
 

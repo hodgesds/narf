@@ -1019,6 +1019,34 @@ per HBA and sets GHC.IE only after the IRQ route; host-install xtask media
 default to `narf.disks=boot-only`; DMUB-routed retrain/unplug tables, a non-IRQ
 DMUB route lock, a TABLE_MS cap, same-EDID HPD long pulses keep the stream.
 
+RX 6000 software follow-ups now publish the strapped atomfirmware VRAM
+module's type/width, common GPU/slot PCIe capabilities, SMU UCLK limits (or
+fixed boot MCLK), and Linux's per-GC MALL sizes. Live allowed-register reads
+serialize through the retained owner with GFXOFF held. Native ring admission
+is FIFO and cancellation-safe; fence IRQs wake per-client waiters. Separate
+pre-IB VM writebacks avoid treating whole-job completion as flush completion,
+while active job fences still prevent premature VMID reuse. Submitters use
+the pre-restart fence generation and reject stale owners after reset.
+
+Ordinary VRAM-preferred creation now permits Linux's GTT fallback when VRAM
+is unavailable, preserving reported preferences and discardable-domain rules.
+Visible client VRAM now supports pressure eviction to GTT and promotion back
+to VRAM with data preserved. GEM_SET_PLACEMENT records atomic preferences;
+validation applies them when exclusive ownership permits migration. Mappings,
+PRIME/shared handles, outstanding jobs and reservation fences pin placement.
+Invisible VRAM remains outside this migration policy. GEM mmap now resolves
+scattered GTT backing page by page. This is a bounded driver placement policy,
+not full Linux TTM parity. Linux conformance covers VRAM module C layouts,
+cache sizes and the compiled GC MMR allow-list as well as the existing family
+inventory. Broad GPU/framebuffer suites passed 1766 x86_64 and 1258 aarch64
+tests, with production boots and btrfs postflight clean on both architectures.
+Debug kernels and targeted GPU/fb Clippy passed on both architectures. Six
+host profile/metadata tests, Linux C metadata/SMU layouts, formatting and
+constant conformance checks passed. Fence regressions cover valid all-ones
+writebacks, reserved-zero avoidance for CP/SDMA, exact rollback and JPEG IB
+slot parity across sequence wrap. A final 130-test aarch64 RDNA2/media rerun
+passed after the media wrap fix.
+
 RX 6000 follow-ups now share clock-gating policy across Navi21/22/23/24,
 with per-ASIC Linux CG/PG flags, discovered one-to-four-engine SDMA traversal,
 and revision-selected SMUIO ROM behavior. Telemetry selects metrics V1/V2/V3

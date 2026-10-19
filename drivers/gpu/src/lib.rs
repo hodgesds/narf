@@ -355,11 +355,13 @@ pub mod amdgpu_pm4_defs;
 pub mod amdgpu_rdna2_board_power;
 /// Compatibility alias for the original Navi22 API.
 pub use amdgpu_rdna2_board_power as amdgpu_power_navi22;
+mod amdgpu_admission;
 pub mod amdgpu_psp;
 pub mod amdgpu_psp_boot;
 pub mod amdgpu_psp_firmware;
 pub mod amdgpu_psp_ring;
 pub mod amdgpu_rdna2;
+mod amdgpu_rdna2_mmr;
 #[path = "amdgpu_reset_navi22.rs"]
 pub mod amdgpu_rdna2_reset;
 mod amdgpu_reg_window;

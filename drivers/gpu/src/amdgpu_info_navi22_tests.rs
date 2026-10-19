@@ -111,6 +111,9 @@ fn booted(queues_verified: bool) -> Published {
     )
     .unwrap();
     Published {
+        vram_module: Some(0),
+        pcie: Some((4, 16)),
+        memory_khz: Some((100_000, 1_000_000)),
         topology: Some(topology),
         pci_revision: Some(0xc0),
         boot: Some(Boot {
@@ -564,4 +567,50 @@ fn rdna2_dev_info_reports_vbios_counter_frequency() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     rdna2_dev_info_reports_vbios_counter_frequency
+);
+
+fn rdna2_dev_info_memory_link_and_cache() -> TestResult {
+    for (profile, mib) in crate::amdgpu_rdna2::PROFILES.iter().zip([128, 96, 32, 16]) {
+        let mut s = snap(booted(false));
+        s.did = u32::from(profile.pci_ids[0]);
+        let gc = s
+            .ip_blocks
+            .iter_mut()
+            .find(|b| b.hw_id == HW_ID_GC)
+            .unwrap();
+        (gc.major, gc.minor, gc.revision) = profile.gc_version;
+        s.vram_type = uapi::AMDGPU_VRAM_TYPE_GDDR6;
+        s.vram_bit_width = 192;
+        let d: uapi::DrmAmdgpuInfoDevice =
+            decode(&ask(&s, Submission::NotWired, uapi::AMDGPU_INFO_DEV_INFO, [0; 4]).unwrap());
+        if d.vram_type != uapi::AMDGPU_VRAM_TYPE_GDDR6
+            || d.vram_bit_width != 192
+            || d.pcie_gen != 4
+            || d.pcie_num_lanes != 16
+            || d.min_memory_clock != 100_000
+            || d.max_memory_clock != 1_000_000
+            || d.mall_size != mib * 1024 * 1024
+        {
+            return TestResult::Fail("RDNA2 memory/link/cache reply disagrees with sources");
+        }
+        s.navi22 = Published::default();
+        s.vram_type = 0;
+        s.vram_bit_width = 0;
+        let early: uapi::DrmAmdgpuInfoDevice =
+            decode(&ask(&s, Submission::NotWired, uapi::AMDGPU_INFO_DEV_INFO, [0; 4]).unwrap());
+        if early.pcie_gen != 0
+            || early.pcie_num_lanes != 0
+            || early.min_memory_clock != 0
+            || early.max_memory_clock != 0
+            || early.vram_type != 0
+            || early.vram_bit_width != 0
+        {
+            return TestResult::Fail("unpublished RDNA2 board metadata guessed");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_dev_info_memory_link_and_cache
 );

@@ -9693,8 +9693,8 @@ fn smoke_amdgpu_gem_lifecycle_and_handle_isolation() -> TestResult {
         return TestResult::Fail("GEM_OP must report the domain the client asked for");
     }
 
-    // SET_PLACEMENT needs a migration path there isn't one of, and must be
-    // refused rather than accepted-and-ignored.
+    // SET_PLACEMENT records a preference, as Linux does; pinned mappings
+    // keep their backing until the final mapping/reference is released.
     let mut setp = [0u8; 24];
     setp[0..4].copy_from_slice(&handle.to_le_bytes());
     setp[4..8].copy_from_slice(&u::AMDGPU_GEM_OP_SET_PLACEMENT.to_le_bytes());
@@ -9703,9 +9703,9 @@ fn smoke_amdgpu_gem_lifecycle_and_handle_isolation() -> TestResult {
         setp.as_mut_ptr() as usize,
         &state,
     )
-    .is_ok()
+    .is_err()
     {
-        return TestResult::Fail("SET_PLACEMENT should be refused while nothing can migrate");
+        return TestResult::Fail("SET_PLACEMENT should record a valid preference");
     }
 
     // ── isolation: a second open's table does not see this handle ──
@@ -11174,7 +11174,8 @@ kernel_test_in!(
 /// zeroed pool reservation: the CPU maps its BAR window, and its entries
 /// carry the physical VRAM address (`address - fb_base + fb_offset`)
 /// without SYSTEM or SNOOPED. GTT-only buffers, and VRAM|GTT ones once the
-/// heap is full, are system pages; a VRAM-only buffer then fails.
+/// heap is full, are system pages; ordinary VRAM-preferred buffers also
+/// allow GTT fallback, as amdgpu_bo_create sets allowed_domains.
 fn smoke_amdgpu_gem_places_buffers_in_card_vram() -> TestResult {
     use crate::amdgpu_gem::{register_vram_heap, unregister_vram_heap, GemState, VramHeap};
     use crate::amdgpu_uapi as u;
@@ -11251,17 +11252,18 @@ fn smoke_amdgpu_gem_places_buffers_in_card_vram() -> TestResult {
         if !gem.object(gtt)?.system {
             return None;
         }
-        // Two pages left: a three-page VRAM|GTT buffer falls back to GTT,
-        // a three-page VRAM-only one fails.
+        // Two pages left: both VRAM|GTT and ordinary VRAM-only requests
+        // permit GTT fallback, without rewriting the preferred domains.
         let both = gem_create_on(
             &gem,
             3 * P,
             u::AMDGPU_GEM_DOMAIN_VRAM | u::AMDGPU_GEM_DOMAIN_GTT,
         )
         .ok()?;
+        let preferred = gem_create_on(&gem, 3 * P, u::AMDGPU_GEM_DOMAIN_VRAM).ok()?;
         if !gem.object(both)?.system
-            || gem_create_on(&gem, 3 * P, u::AMDGPU_GEM_DOMAIN_VRAM)
-                != Err(narf_filesystem::FsError::NoSpace)
+            || !gem.object(preferred)?.system
+            || gem.object(preferred)?.preferred_domains() != u64::from(u::AMDGPU_GEM_DOMAIN_VRAM)
         {
             return None;
         }

@@ -275,3 +275,131 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/render-abi",
     render_abi_get_client_matches_drm_getclient
 );
+
+fn rdna2_visible_vram_eviction_roundtrip_and_pins() -> TestResult {
+    const CARD: u32 = 0xfee2;
+    struct Busy(core::sync::atomic::AtomicBool);
+    impl narf_filesystem::DrmFence for Busy {
+        fn is_signalled(&self) -> bool {
+            self.0.load(Ordering::Acquire)
+        }
+        fn wait(&self, _: u64) -> bool {
+            self.is_signalled()
+        }
+    }
+    struct Registered;
+    impl Drop for Registered {
+        fn drop(&mut self) {
+            unregister_vram_heap(CARD);
+        }
+    }
+    let mut memory = alloc::vec![0u8; 5 * 4096];
+    let map = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(0xb000_0000),
+        virt: memory.as_mut_ptr() as u64,
+        len: memory.len() as u64,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    // SAFETY: this test exclusively owns memory until the registered heap and
+    // every object have been dropped; no hardware accesses these mappings.
+    let pool = unsafe { crate::amdgpu_vram::Pool::from_owned_range(map, 0x8_0000_0000) }.unwrap();
+    register_vram_heap(
+        CARD,
+        VramHeap {
+            pool: pool.clone(),
+            fb_base: 0x8_0000_0000,
+            fb_offset: 0x9_0000_0000,
+            unmapped: None,
+        },
+    );
+    let _registered = Registered;
+    let before = gtt_used();
+    let state = GemState::for_card(CARD);
+    let a = create(&state, 4096, u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM));
+    // Preserve the requested (non-power-of-two) alignment in GET_INFO,
+    // but normalize it identically during creation and later promotion.
+    let mut aligned = [
+        3 * 4096u64,
+        5000,
+        u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM),
+        0,
+    ];
+    super::create(&state, aligned.as_mut_ptr() as usize).unwrap();
+    let b = aligned[0] as u32;
+    let pin_a = state.mapping_object(u64::from(a) << 12, 4096).unwrap();
+    let fence = Arc::new(Busy(core::sync::atomic::AtomicBool::new(false)));
+    {
+        let b = state.object(b).unwrap();
+        b.store_u64(16, 0x1234_5678);
+        b.store_u64(8192 + 16, 0x8765_4321);
+        b.dma_buf()
+            .resv
+            .add_fence(fence.clone(), narf_filesystem::dma_buf::DmaResvUsage::Write);
+    }
+    let mut blocked = [0u64; 4];
+    blocked[0] = 3 * 4096;
+    blocked[2] = u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM);
+    blocked[3] = u64::from(uapi::AMDGPU_GEM_CREATE_DISCARDABLE);
+    if super::create(&state, blocked.as_mut_ptr() as usize) != Err(FsError::NoSpace) {
+        return TestResult::Fail("eviction moved backing before its reservation fence");
+    }
+    fence.0.store(true, Ordering::Release);
+    let c = create(&state, 3 * 4096, u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM));
+    {
+        let evicted = state.object(b).unwrap();
+        if !evicted.system
+            || evicted.load_u64(16) != Some(0x1234_5678)
+            || evicted.load_u64(8192 + 16) != Some(0x8765_4321)
+            || pin_a.system
+            || gtt_used() < before + 3 * 4096
+        {
+            return TestResult::Fail("VRAM pressure failed to preserve data or pinned mapping");
+        }
+        let frames = state.mmap_frames(u64::from(b) << 12, 3 * 4096).unwrap();
+        if frames != evicted.frames(0, 3 * 4096).unwrap() {
+            return TestResult::Fail("evicted scattered GTT mapping used a contiguous assumption");
+        }
+    }
+    state.remove(c);
+    let pin_b = state.object(b).unwrap();
+    if pin_b.system
+        || pin_b.gpu != 0x9_0000_2000
+        || pin_b.load_u64(16) != Some(0x1234_5678)
+        || pin_b.load_u64(8192 + 16) != Some(0x8765_4321)
+    {
+        return TestResult::Fail("GTT to VRAM promotion lost data or framebuffer translation");
+    }
+    let mut request = [0u64; 4];
+    request[0] = 2 * 4096;
+    request[2] = u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM);
+    request[3] = u64::from(uapi::AMDGPU_GEM_CREATE_DISCARDABLE);
+    if super::create(&state, request.as_mut_ptr() as usize) != Err(FsError::NoSpace) {
+        return TestResult::Fail("eviction moved CPU/GPU referenced backing");
+    }
+    let mut placement = [0u8; 16];
+    placement[..4].copy_from_slice(&b.to_le_bytes());
+    placement[4..8].copy_from_slice(&uapi::AMDGPU_GEM_OP_SET_PLACEMENT.to_le_bytes());
+    placement[8..16].copy_from_slice(&u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT).to_le_bytes());
+    if op(&state, placement.as_ptr() as usize) != Ok(0) || pin_b.system {
+        return TestResult::Fail("placement preference moved pinned BO or refused valid request");
+    }
+    drop(pin_b);
+    let moved = state.object(b).unwrap();
+    if !moved.system
+        || moved.preferred_domains() != u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT)
+        || moved.load_u64(8192 + 16) != Some(0x8765_4321)
+    {
+        return TestResult::Fail("GEM_SET_PLACEMENT not honored after unpinning");
+    }
+    drop(moved);
+    drop(pin_a);
+    drop(state);
+    if gtt_used() != before || pool.available() != pool.size() {
+        return TestResult::Fail("migration leaked GTT accounting or VRAM reservations");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_visible_vram_eviction_roundtrip_and_pins
+);

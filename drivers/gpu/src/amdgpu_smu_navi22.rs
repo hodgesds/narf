@@ -757,6 +757,36 @@ impl<I: Io> Engine<I> {
         let low = u64::from(self.command(RUNNING_LOW, 0).await?);
         Ok(low | u64::from(self.command(RUNNING_HIGH, 0).await?) << 32)
     }
+    /// smu_v11_0_get_dpm_ultimate_freq: fixed boot MCLK when UCLK DPM
+    /// is disabled, otherwise the PMFW UCLK range (PPCLK_UCLK == 2).
+    async fn memory_range(&mut self, boot_khz: u64) -> Result<(u64, u64), Error> {
+        let resume = self.begin_runtime()?;
+        let result = async {
+            let enabled = self.running().await?;
+            if enabled & crate::amdgpu_navi22_power_policy::SMU_DPM_UCLK == 0 {
+                return if boot_khz == 0 {
+                    Err(Error::Invalid)
+                } else {
+                    Ok((boot_khz, boot_khz))
+                };
+            }
+            let min = self.command(MIN_DPM_FREQ, 2 << 16).await?;
+            let max = self.command(MAX_DPM_FREQ, 2 << 16).await?;
+            if min == 0 || min > max || max > u32::from(u16::MAX) {
+                return Err(Error::Invalid);
+            }
+            Ok((u64::from(min) * 1000, u64::from(max) * 1000))
+        }
+        .await;
+        if result == Err(Error::Invalid) {
+            // An absent boot clock or malformed read-only range is unknown
+            // metadata. The acknowledged mailbox remains reusable.
+            self.state = resume;
+        } else {
+            self.end_runtime(resume, &result);
+        }
+        result
+    }
     /// Linux `smu_cmn_get_metrics_table` (SMU -> DRAM of TABLE_SMU_METRICS
     /// into the retained driver table), the running features,
     /// `sienna_cichlid_get_power_limit` (AC, PPT0) and the register sensors
@@ -1017,6 +1047,9 @@ pub struct Smu {
     engine: Engine<Mmio>,
 }
 impl Smu {
+    pub(crate) async fn memory_range(&mut self, boot_khz: u64) -> Result<(u64, u64), Error> {
+        self.engine.memory_range(boot_khz).await
+    }
     /// # Safety
     /// Every display pipe and stream on this physical GPU must be retired.
     /// The exclusive DCN owner must install memory/fabric/display floors before

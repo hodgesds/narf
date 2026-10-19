@@ -153,6 +153,7 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
     amdgpu::claim_navi22(|gpu| {
         // Validate/copy every file before inspecting hardware or claiming VRAM.
         let mut firmware = boot::Firmware::open_rdna2(gpu, &registry).map_err(Error::Firmware)?;
+        crate::amdgpu_info::sample_rdna2_board(gpu, &authority, &device);
         // amdgpu_discovery_harvest_ip: VCN instances absent from the harvest
         // table get firmware and an owner. An unreadable table disables
         // media only; display and queue bring-up do not depend on it.
@@ -304,6 +305,7 @@ pub(crate) async fn owner() -> narf_lib::mutex::MutexGuard<'static, Option<boot:
 /// take the owner lock per refresh. Failures are reported, never fatal.
 async fn start_services(boot: &mut boot::ColdBoot) {
     use core::fmt::Write;
+    crate::amdgpu_info::publish_rdna2_memory_clocks(boot.memory_clock_range().await.ok());
     // Clients' command submissions and VRAM buffers (generic CS/GEM path).
     if boot.queues_verified()
         && crate::amdgpu_info_navi22::submission() == crate::amdgpu_info_navi22::Submission::Wired
@@ -1692,7 +1694,9 @@ pub async unsafe fn power_saving(
         let mut owner = OWNER.lock().await;
         let boot = owner.as_mut().ok_or(boot::Error::Invalid)?;
         // SAFETY: owner lock held, GFXOFF not started (it starts below).
-        unsafe { boot.apply_power_saving(optin) }.await
+        let result = unsafe { boot.apply_power_saving(optin) }.await;
+        crate::amdgpu_info::publish_rdna2_memory_clocks(boot.memory_clock_range().await.ok());
+        result
     };
     let applied = match result {
         Ok(applied) => applied,
@@ -1752,7 +1756,9 @@ pub async unsafe fn remove_power_saving() -> Result<(), boot::Error> {
         boot::Error::PowerSaving(crate::amdgpu_navi22_power_saving::Error::GfxOff(e))
     })?;
     // SAFETY: owner lock held, GFXOFF stopped above.
-    unsafe { boot.remove_power_saving() }.await
+    let result = unsafe { boot.remove_power_saving() }.await;
+    crate::amdgpu_info::publish_rdna2_memory_clocks(boot.memory_clock_range().await.ok());
+    result
 }
 
 /// The GFXOFF controller's PMFW transport (`smu_v11_0_gfx_off_control`).
