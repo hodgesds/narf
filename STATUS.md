@@ -922,15 +922,25 @@ wakes a registered VCN owner; a fresh proof requires fence/RPTR/trap and,
 with an MSI route, CPU delivery. Registration stays retained on uncertainty
 and is retired only after proven shutdown/power-down, so shared fault re-arm
 cannot overlook a live media owner. Register/queue models cover these paths;
-media client IBs, codecs, JPEG and physical IRQ acceptance remain open, with
-no new media capabilities advertised.
+codec streams, JPEG and physical IRQ acceptance remain open, with no codec
+capabilities advertised.
 
 The VCN5 backend can now publish owned client IB frames with MMHUB4.1
 flush/semaphore ordering, the MMHUB PASID LUT, HDP visibility and native
 fences. Masked ring pointers and backpressure match Linux; once published,
 a job always returns a sequence so its resources remain retained through
 later errors. Models cover packet fields, ring wrap/full and revocation at
-publication. DRM media integration, recovery and codec validation remain open.
+publication. The opt-in `amdgpu.navi48_media` now retains the proven owner
+and exposes the unified VCN_ENC queue with a separate MMHUB VMID pool and
+generic CS resource retention; user fences are refused. Fault recovery
+requires all four retirements and renewed owners, followed by a new media
+interrupt proof before ledger commit. Media restart cancels old codec
+contexts instead of replaying their IBs. Fence readers skip frozen media
+and drain before power changes and reopening retirement. Dispatch follows
+known PASIDs across VMID changes and limits unknown latches to their hub.
+Models cover the fourth owner, exact ring gating, Linux INFO_HW_IP alignment
+and cancelled-session lifetimes. Known-stream codec validation, JPEG and
+physical acceptance remain open.
 
 Recovery attribution now follows the nonzero PASID carried in a client IV,
 so a late fault cannot blame the address space that reused its VMID. Latches
@@ -943,7 +953,7 @@ allocations pinned; old readers cannot fail a replacement device.
 
 Still open: physical MSI delivery and reset/replay acceptance, GC12 rendering
 and application shader execution, GPU VM/userspace and DCN4
-clock/bandwidth/link/scanout hardware acceptance, VCN5 client/video queues,
+clock/bandwidth/link/scanout hardware acceptance, VCN5 known-stream video,
 THM/SMU thermal interrupts and software-CTF shutdown,
 memory/fabric DPM relaxation (display admission/watermark rework first),
 reset/suspend/resume, and physical RX 9070 XT testing.

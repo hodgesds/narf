@@ -2938,8 +2938,9 @@ and leave uncertain hardware/storage retained. EOP proofs reject any recognized
 fault or a monitor that is not armed. The monitor itself performs no reset,
 PTE repair, fault replay, process termination or allocation reuse.
 
-After containment the platform coordinates all three owned kernel queues:
-graphics, compute and SDMA0. A shared blocked flag immediately gates client
+After containment the platform coordinates graphics, compute and SDMA0,
+plus the retained VCN0 unified queue when native media clients are enabled.
+A shared blocked flag immediately gates client
 and kernel-clear submissions and freezes client retirement, including readers
 that do not take the platform owner lock. Under OWNER the watchdog freezes
 every ledger before awaiting a service recovery receipt. The receipt binds
@@ -2950,7 +2951,7 @@ re-arm sources. Cancellation retains `Recovering` and frozen ledgers.
 Before re-arm the independent service drains bounded old IH batches and sweeps
 both protection latches. Late fault evidence joins the recovery scope. VM/shader
 faults in VMID0 or unsupported contexts, foreign queues, poison, terminal
-dispatch state and additional queue owners require explicit device recovery.
+dispatch state and queue owners outside this recovery set require explicit device recovery.
 Persistent latches, changed controls, revoked authority and uncertain writes
 also refuse re-arm. The source monitor checks every owned control against its
 saved masked value, then re-enables and reads back all owned masks. Default,
@@ -2958,7 +2959,7 @@ retry, depth and EOP policy remain fixed; current page-table roots may reflect
 client VM flushes. `Status::recovery`, `recoveries`, cumulative count and last
 record expose pending and historical evidence separately.
 
-Successful re-arm advances all three kernel interrupt-handle generations.
+Successful re-arm advances every owned kernel interrupt-handle generation.
 Old handles cannot complete new work. The final fault scope excludes guilty
 nonzero PASIDs from client IVs, across rings and hubs even if their VMIDs
 changed. Its VMID union is diagnostic only: a late IV must not blame the new
@@ -2974,6 +2975,22 @@ Reset-test fences never retire replay buffers or VMIDs. Recognized faults that
 arrive during replay contain reporting again and prevent a successful commit.
 This is a software-modeled recovery path; physical reset/re-arm acceptance
 remains pending, and automatic whole-device reset is still disabled.
+
+With native media clients the recovery receipt includes a fourth retirement
+and the exact retained VCN0 registration. VCPU/LMI drain/retirement,
+power-down/up, restart and a new transport proof precede global re-arm; the
+renewed media handle and a fresh source-119/CPU proof precede ledger commit.
+Restart clears codec context, so every pending media context is cancelled and
+no old media IB replays. Jobs in other healthy contexts replay normally.
+Uncertain media retirement or interrupt proof quarantines every ledger.
+An isolated media timeout likewise cancels its old contexts before bounded
+retirement/restart/proofs, and failure requires explicit device recovery.
+
+Synchronous progress skips a frozen ring, including its media registers while
+power is off. Reset freezes and reopens ledgers under `READ_GENERATION`,
+draining old readers before changing power and draining skipped samples
+before reopening. A placeholder zero from a skipped read cannot retire a
+new physical sequence at wrap. Old-generation readers never access new BARs.
 
 The monitor also records the remaining GC-client fault sources Linux defines
 for GC12 (irqsrcs_gfx_12_0_0.h): CP reserved-bit, semaphore-wait and general
@@ -3045,7 +3062,9 @@ overflowing waiter still completes through the watchdog and is counted.
 Faults are delivered to their owners: CP faults by slot and then the
 context-ID doorbell (amdgpu_gfx_handle_priv_fault), SDMA faults by
 instance/queue, and VM and shader faults to every owner of the faulting
-VMID/PASID. The first fault is kept; waiters on a faulted endpoint return
+nonzero PASID even after VMID changes. PASID-less vectors and latches match
+only the faulting VMID on its hub (VCN on MMHUB, CP/SDMA/user doorbells on
+GFXHUB). The first fault is kept; waiters on a faulted endpoint return
 `Faulted` unless their fence already completed. `unsafe recover` is the
 controlled-recovery step: once the owner has reset or unmapped its queue it
 gets a new generation, and every handle of the faulted generation is `Stale`
@@ -5283,21 +5302,34 @@ the 1024-dword buffer mask. One gap distinguishes empty/full: at most three
 after doorbell publication, submission always returns its sequence so a
 later error cannot discard the resources needed by a published job. Frame,
 ring-wrap/backpressure and publication-revocation models cover this API.
-This backend alone does not register a DRM media client submitter.
+The opt-in `amdgpu.navi48_media` retains the VCPU after both proofs and
+publishes logical ring 3 as `AMDGPU_HW_IP_VCN_ENC`, instance 0/ring 0.
+VCN5 uses this unified ring for decode and encode; legacy VCN_DEC and JPEG
+remain unavailable. A separate MMHUB VMID manager lends VMIDs 1..7 while
+sharing the client's GMC12 root/PASID and generic CS resource retention.
+Media jobs reject user-fence chunks before publication. Submission returns
+synchronously after publication; CS then defers all BOs/mappings until the
+translated fence or proven reset, with no intervening await. INFO_HW_IP
+reports the VCN5 discovery version and Linux's 256-byte start/4-byte size
+alignment, and derives usable rings from the proven registered submitter.
+INFO_MAX_IBS reports eight for this ring. No codec profile or JPEG capability
+is added by this transport interface; known-stream validation remains open.
 
 The opt-in `amdgpu.media_proof` boot argument requests a retained native
 power-up/start/fence/interrupt/stop/power-down cycle after the GC12/SDMA interrupt
 proofs, before publishing clears or allowing any client slot. Its pending
-state is stored before the first await; error/cancellation gates all three
+state is stored before the first await; error/cancellation gates all
 client submit wrappers and returned failure quarantines the IH service.
 `amdgpu_navi48_platform::Diagnostics::media_transport` exposes the result.
 `media_state` preserves the VCPU phase after cancellation or failure.
 The media interrupt handle is retained before source enabling and retired
-only after proven VCPU/LMI stop and power-down. A retained extra owner blocks
-the three-queue global re-arm protocol from assuming media quiescence.
+only after proven VCPU/LMI stop and power-down. A retained media owner must
+join the fourth retirement before global re-arm; it cannot be omitted from
+a three-queue receipt.
 Explicit whole-device recovery repeats the requested proof with fresh
-owners. This adds no VCN/JPEG client ring or codec capability advertisement;
-IB/codec execution, JPEG and physical MSI/engine acceptance remain open.
+owners. `media_proof` alone adds no client ring; `navi48_media` retains and
+exposes the proven unified transport described above. Codec execution,
+JPEG and physical MSI/engine acceptance remain open.
 
 ### AMD platform VBIOS
 

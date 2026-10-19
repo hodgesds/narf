@@ -3070,6 +3070,8 @@ impl ColdBoot {
     }
 }
 
+#[path = "amdgpu_navi48_boot_media_clients.rs"]
+mod media_clients;
 #[path = "amdgpu_navi48_boot_media.rs"]
 mod media_transport;
 

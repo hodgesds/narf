@@ -10,6 +10,8 @@ use narf_graphics_driver::generic::GenericFb;
 use narf_lib::mutex::Mutex;
 #[path = "amdgpu_navi48_platform_recovery.rs"]
 mod fault_recovery;
+#[path = "amdgpu_navi48_platform_media.rs"]
+mod media_clients;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -22,6 +24,11 @@ pub enum Error {
 
 static SHADER_PROOF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static MEDIA_PROOF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static MEDIA_CLIENTS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Opt-in unified VCN client queue; implies both retained media proofs.
+pub fn set_media_clients(enabled: bool) {
+    MEDIA_CLIENTS.store(enabled, core::sync::atomic::Ordering::Release);
+}
 /// Opt-in VCN5 power/transport/retirement evidence before client publication.
 pub fn set_media_proof(enabled: bool) {
     MEDIA_PROOF.store(enabled, core::sync::atomic::Ordering::Release);
@@ -32,8 +39,9 @@ pub fn set_shader_proof(enabled: bool) {
 }
 
 static OWNER: Mutex<Option<alloc::boxed::Box<boot::ColdBoot>>> = Mutex::new(None);
-// The lock spans each synchronous hardware-fence read. Advancing generation
-// drains old readers before reset; their retained readers never touch BARs again.
+// Spans each synchronous fence read. Reset freezes/unfreezes ledgers under
+// this lock, draining older samples before changing power or retiring replay.
+// Advancing generation excludes old readers from replacement hardware.
 static READ_GENERATION: narf_lib::sync::IrqSafeSpinLock<u64> =
     narf_lib::sync::IrqSafeSpinLock::new(0);
 static SUBMITTER: narf_lib::sync::IrqSafeSpinLock<Option<Arc<Submitter>>> =
@@ -306,8 +314,13 @@ fn register_submitter(
             generation: *READ_GENERATION.lock(),
             fence,
             sdma_fence: boot.client_sdma_fence_reader(),
+            media_fence: narf_lib::sync::IrqSafeSpinLock::new(boot.client_media_fence_reader()),
             contexts: narf_lib::sync::IrqSafeSpinLock::new([(0, 0); RINGS]),
             vmids: narf_lib::sync::IrqSafeSpinLock::new(crate::amdgpu_vmid::VmidManager::new(
+                CLIENT_VMIDS.0,
+                CLIENT_VMIDS.1,
+            )),
+            mm_vmids: narf_lib::sync::IrqSafeSpinLock::new(crate::amdgpu_vmid::VmidManager::new(
                 CLIENT_VMIDS.0,
                 CLIENT_VMIDS.1,
             )),
@@ -404,10 +417,13 @@ pub async unsafe fn recover() -> Result<boot::Report, boot::Error> {
         // SAFETY: new queues are drained and all test-page users stay under OWNER.
         unsafe { boot.prove_shaders().await }.map_err(boot::Error::Queues)?;
     }
-    if MEDIA_PROOF.load(Ordering::Acquire) {
+    if MEDIA_PROOF.load(Ordering::Acquire) || MEDIA_CLIENTS.load(Ordering::Acquire) {
         // SAFETY: all old clients withdrawn, fresh native proofs drained,
         // and OWNER retains firmware/GMC and excludes every PM/queue writer.
-        unsafe { boot.prove_media_transport().await }?;
+        unsafe {
+            boot.prove_media_transport(MEDIA_CLIENTS.load(Ordering::Acquire))
+                .await
+        }?;
     }
     let mut watches = old_submitter.as_ref().map_or_else(
         || [const { crate::amdgpu_ring_watch::RingWatch::new() }; RINGS],
@@ -480,8 +496,11 @@ struct Submitter {
     /// SDMA0's job fence (no DMA ring without SDMA0). Its jobs are refused
     /// as busy until both SDMA proofs pass, as the GC12 queues' are.
     sdma_fence: Option<crate::amdgpu_sdma_navi48::FenceReader>,
+    media_fence: narf_lib::sync::IrqSafeSpinLock<Option<crate::amdgpu_vcn_navi48::FenceReader>>,
     /// Touched only under OWNER, beside the submission it grants.
     vmids: narf_lib::sync::IrqSafeSpinLock<crate::amdgpu_vmid::VmidManager>,
+    /// MMHUB VMIDs are independent of the graphics/compute/SDMA namespace.
+    mm_vmids: narf_lib::sync::IrqSafeSpinLock<crate::amdgpu_vmid::VmidManager>,
     /// Each ring's last job's context, `(VmState::owner, ctx_id)`: the
     /// scheduler entity Linux compares for AMDGPU_HAVE_CTX_SWITCH. Touched
     /// only under OWNER.
@@ -496,16 +515,19 @@ enum RingError {
     Queue(crate::amdgpu_gfx12_queue::Error),
     Sdma(crate::amdgpu_sdma_navi48::Error),
     Interrupts(crate::amdgpu_ih7::Error),
+    Media(boot::Error),
+    Client(narf_filesystem::FsError),
 }
-/// Client VMIDs on the GFX hub: 1 up to first_kfd_vmid (8) exclusive.
+/// Client VMIDs on each independent hub: 1 up to first_kfd_vmid (8) exclusive.
 const CLIENT_VMIDS: (u8, u8) = (1, 7);
-/// The rings by ticket index: the two GC12 queues, then SDMA0 (index 2).
+/// GC12 tickets occupy indices 0/1, SDMA0 index 2, unified VCN0 index 3.
 const PIPES: [crate::amdgpu_gfx12_queue::Pipe; 2] = [
     crate::amdgpu_gfx12_queue::Pipe::Graphics,
     crate::amdgpu_gfx12_queue::Pipe::Compute,
 ];
 const SDMA_RING: u32 = 2;
-const RINGS: usize = 3;
+const MEDIA_RING: u32 = 3;
+const RINGS: usize = 4;
 /// Whether `ticket` is complete, given each ring's completed sequence
 /// (32-bit sequences wrap).
 fn job_done(completed: [u32; RINGS], ticket: u64) -> bool {
@@ -522,13 +544,33 @@ impl Submitter {
         if *generation != self.generation {
             return None;
         }
+        let frozen = {
+            let mut watches = self.watch.lock();
+            if crate::amdgpu_navi48_interrupts::blocked() {
+                for watch in watches.iter_mut() {
+                    watch.freeze();
+                }
+            }
+            core::array::from_fn::<_, RINGS, _>(|i| watches[i].refusing().is_some())
+        };
         let mut completed = [0; RINGS];
         let live = (|| {
-            for (c, pipe) in completed.iter_mut().zip(PIPES) {
-                *c = self.fence.completed(pipe).ok()?;
+            for (ring, (c, pipe)) in completed.iter_mut().zip(PIPES).enumerate() {
+                if !frozen[ring] {
+                    *c = self.fence.completed(pipe).ok()?;
+                }
             }
-            if let Some(sdma) = &self.sdma_fence {
-                completed[SDMA_RING as usize] = sdma.completed().ok()?;
+            match &self.sdma_fence {
+                Some(sdma) if !frozen[SDMA_RING as usize] => {
+                    completed[SDMA_RING as usize] = sdma.completed().ok()?;
+                }
+                _ => {}
+            }
+            match *self.media_fence.lock() {
+                Some(media) if !frozen[MEDIA_RING as usize] => {
+                    completed[MEDIA_RING as usize] = media.completed().ok()?;
+                }
+                _ => {}
             }
             Some(())
         })();
@@ -601,7 +643,22 @@ impl Submitter {
                     self.recover_faults().await;
                     return;
                 }
+                {
+                    // Drain old synchronous samples before the first reset
+                    // write. New readers see the frozen ledger under this
+                    // same lock and never read a powered-down media block.
+                    let _generation = READ_GENERATION.lock();
+                    self.watch.lock()[ring].freeze();
+                }
                 let reset = match (owner.as_mut(), PIPES.get(ring)) {
+                    (Some(boot), _) if ring == MEDIA_RING as usize => {
+                        // VCN restart clears codec context. Keep every old
+                        // media allocation until retirement and both proofs.
+                        self.watch.lock()[ring].stop();
+                        // SAFETY: OWNER excludes all writers, this media
+                        // ledger stays frozen and its contexts are cancelled.
+                        unsafe { boot.recover_client_media().await }.map_err(RingError::Media)
+                    }
                     // SAFETY: OWNER serializes the queues, SDMA0 and MES;
                     // every job on the ring holds its memory until its
                     // fence, which only the ring test's proves passed.
@@ -623,14 +680,9 @@ impl Submitter {
                         for (ticket, job) in jobs {
                             // SAFETY: OWNER stays held across reset and replay;
                             // the frozen ledger retains all buffers and VMIDs.
-                            let submitted = match PIPES.get(ring) {
-                                // SAFETY: frozen ledger and OWNER retain the job's VMID and memory.
-                                Some(&pipe) => unsafe { boot.submit_client_job(pipe, job) }
-                                    .map_err(RingError::Queue),
-                                // SAFETY: same retained memory and exclusive SDMA owner.
-                                None => unsafe { boot.submit_client_sdma_job(job) }
-                                    .map_err(RingError::Sdma),
-                            };
+                            let submitted =
+                                unsafe { media_clients::publish_client(boot, ring as u32, job) }
+                                    .map_err(RingError::Client);
                             match submitted {
                                 Ok(seq) => self.watch.lock()[ring].replayed(ticket, seq),
                                 Err(e) => {
@@ -640,6 +692,10 @@ impl Submitter {
                             }
                         }
                         if result.is_ok() {
+                            // Drain samples that skipped this frozen ring;
+                            // their placeholder zero must not become a fence
+                            // sample after reopening at physical sequence wrap.
+                            let _generation = READ_GENERATION.lock();
                             // Next normal submission must establish its context.
                             self.contexts.lock()[ring] = (0, 0);
                             self.watch.lock()[ring].recovered(narf_time::monotonic_ns());
@@ -659,6 +715,12 @@ impl Submitter {
                     );
                 }
                 Err(e) => {
+                    if ring == MEDIA_RING as usize {
+                        crate::amdgpu_navi48_interrupts::quarantine().await;
+                        for watch in self.watch.lock().iter_mut() {
+                            watch.stop();
+                        }
+                    }
                     let _ = writeln!(
                         narf_console::Writer,
                         "amdgpu: navi48 ring {ring} reset failed ({e:?}); ring stopped"
@@ -693,14 +755,13 @@ async fn watchdog(submitter: Arc<Submitter>) {
 }
 impl crate::amdgpu_cs::Submitter for Submitter {
     fn ring_for(&self, ip_type: u32, ip_instance: u32, ring: u32) -> Option<u32> {
-        match (ip_type, ip_instance, ring) {
-            (crate::amdgpu_uapi::AMDGPU_HW_IP_GFX, 0, 0) => Some(0),
-            (crate::amdgpu_uapi::AMDGPU_HW_IP_COMPUTE, 0, 0) => Some(1),
-            (crate::amdgpu_uapi::AMDGPU_HW_IP_DMA, 0, 0) if self.sdma_fence.is_some() => {
-                Some(SDMA_RING)
-            }
-            _ => None,
-        }
+        media_clients::native_ring(
+            ip_type,
+            ip_instance,
+            ring,
+            self.sdma_fence.is_some(),
+            self.media_fence.lock().is_some(),
+        )
     }
     fn max_ibs(&self, _ring: u32) -> u32 {
         crate::amdgpu_gfx12_queue::MAX_JOB_IBS as u32
@@ -734,6 +795,9 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             let ring = self
                 .ring_for(first.ip_type, first.ip_instance, first.ring)
                 .ok_or(FsError::Unsupported)?;
+            if ring == MEDIA_RING && submission.user_fence.is_some() {
+                return Err(FsError::InvalidData); // VCN5 no_user_fence
+            }
             if submission.ibs.len() > crate::amdgpu_gfx12_queue::MAX_JOB_IBS
                 || submission
                     .ibs
@@ -787,7 +851,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                 }
                 let completed = self.progress().ok_or(FsError::NoDevice)?;
                 let done = |t| job_done(completed, t);
-                let grant = self.vmids.lock().grab(request, &done);
+                let grant = self.vmids_for(ring).lock().grab(request, &done);
                 let Some(grant) = grant else {
                     // amdgpu_vmid_grab_idle: wait for a VMID to go idle.
                     drop(owner);
@@ -799,29 +863,9 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                 job.flush = grant.needs_flush;
                 job.map_pasid = grant.map_pasid;
                 job.ctx_switch = self.contexts.lock()[ring as usize] != entity;
-                let result = match PIPES.get(ring as usize) {
-                    // SAFETY: the platform serializes every queue user under
-                    // OWNER; `amdgpu_cs` holds the job's memory until its
-                    // fence, and the grant keeps another space off this VMID
-                    // until then.
-                    Some(&pipe) => unsafe { boot.submit_client_job(pipe, job) }.map_err(|e| {
-                        use crate::amdgpu_gfx12_queue::Error;
-                        match e {
-                            Error::Busy => FsError::Busy,
-                            Error::Invalid => FsError::InvalidData,
-                            _ => FsError::NoDevice,
-                        }
-                    }),
-                    // SAFETY: as above.
-                    None => unsafe { boot.submit_client_sdma_job(job) }.map_err(|e| {
-                        use crate::amdgpu_sdma_navi48::Error;
-                        match e {
-                            Error::Busy => FsError::Busy,
-                            Error::Invalid => FsError::InvalidData,
-                            _ => FsError::NoDevice,
-                        }
-                    }),
-                };
+                // SAFETY: OWNER, the granted hub VMID and generic CS's
+                // retained resource list cover synchronous publication.
+                let result = unsafe { media_clients::publish_client(boot, ring, job) };
                 break result.map(|physical| {
                     let seq = self.watch.lock()[ring as usize].submitted(
                         physical,
@@ -830,7 +874,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                         narf_time::monotonic_ns(),
                     );
                     let ticket = u64::from(ring) << 32 | u64::from(seq);
-                    self.vmids.lock().commit(request, grant, ticket);
+                    self.vmids_for(ring).lock().commit(request, grant, ticket);
                     self.contexts.lock()[ring as usize] = entity;
                     seq
                 });
@@ -912,10 +956,13 @@ async fn prove_queue_interrupts() {
                         return;
                     }
                 }
-                if MEDIA_PROOF.load(Ordering::Acquire) {
+                if MEDIA_PROOF.load(Ordering::Acquire) || MEDIA_CLIENTS.load(Ordering::Acquire) {
                     // SAFETY: OWNER excludes every client/clear/PM user and
                     // no client slot can publish before this worker returns.
-                    let result = unsafe { boot.prove_media_transport().await };
+                    let result = unsafe {
+                        boot.prove_media_transport(MEDIA_CLIENTS.load(Ordering::Acquire))
+                            .await
+                    };
                     use core::fmt::Write as _;
                     let _ = writeln!(
                         narf_console::Writer,
@@ -925,6 +972,7 @@ async fn prove_queue_interrupts() {
                         crate::amdgpu_navi48_interrupts::quarantine().await;
                         return;
                     }
+                    media_clients::activate_media(boot);
                 }
                 publish_clearer(boot);
             }

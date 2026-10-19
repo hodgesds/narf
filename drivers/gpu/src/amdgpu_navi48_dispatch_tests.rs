@@ -433,11 +433,12 @@ fn navi48_dispatch_overflow_rechecks_all_waiters_and_display_consumers() -> Test
     assert_eq!(t.lock().endpoint(h).unwrap().stats.watchdog_completions, 0);
     // A latch found by the post-overflow sweep faults its VMID's owners.
     let uq = t.lock().register(user(0x20)).unwrap();
-    assert_eq!(t.lock().latched(3, true), Delivery::Faulted(1));
+    assert_eq!(t.lock().latched(3, true), Delivery::Unattributed);
+    assert_eq!(t.lock().latched(3, false), Delivery::Faulted(1));
     assert_eq!(t.lock().latched(9, false), Delivery::Unattributed);
     assert_eq!(
         t.lock().endpoint(uq).unwrap().fault,
-        Some(src::Fault::Vm { mm_hub: true })
+        Some(src::Fault::Vm { mm_hub: false })
     );
     assert_eq!(t.lock().endpoint(h).unwrap().fault, None);
     TestResult::Pass
@@ -596,4 +597,92 @@ fn navi48_dispatch_reset_invalidates_every_old_handle() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48_dispatch",
     navi48_dispatch_reset_invalidates_every_old_handle
+);
+
+fn navi48_dispatch_four_owner_reset_requires_media_retirement_set() -> TestResult {
+    let mut table = Table::new();
+    let keys = [
+        Key::Cp(GFX),
+        Key::Cp(src::Queue { me: 1, ..GFX }),
+        Key::Sdma {
+            instance: 0,
+            queue: 0,
+        },
+        Key::Vcn { instance: 0 },
+    ];
+    let handles = keys.map(|key| table.register(kernel(key)).unwrap());
+    assert_eq!(table.recovery_owners(&handles[..3]), Err(WaitError::Stale));
+    assert_eq!(table.recovery_owners(&[]), Err(WaitError::Stale));
+    assert_eq!(table.recovery_owners(&handles), Ok(()));
+    let extra = table.register(user(0x20)).unwrap();
+    assert_eq!(table.reset_owners(handles), Err(WaitError::Stale));
+    for h in handles {
+        assert!(table.endpoint(h).is_ok());
+    }
+    table.retire(extra).unwrap();
+    let next = table.reset_owners(handles.to_vec()).unwrap();
+    for i in 0..4 {
+        assert_eq!(table.endpoint(handles[i]), Err(WaitError::Stale));
+        assert_eq!(table.endpoint(next[i]).unwrap().owner, kernel(keys[i]));
+    }
+    let event = iv(0x10, 119, 0, 0, 0, 0);
+    assert_eq!(table.route(&event, classify(&event)), Delivery::Signaled);
+    assert_eq!(table.endpoint(next[3]).unwrap().stats.signals, 1);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-interrupts",
+    navi48_dispatch_four_owner_reset_requires_media_retirement_set
+);
+
+fn navi48_dispatch_pasid_survives_vmid_reuse_and_latches_stay_on_their_hub() -> TestResult {
+    for known in [false, true] {
+        let mut table = Table::new();
+        let gfx = table
+            .register(Owner {
+                key: Key::Cp(GFX),
+                vmid: 2,
+                pasid: 11,
+            })
+            .unwrap();
+        let mm = table
+            .register(Owner {
+                key: Key::Vcn { instance: 0 },
+                vmid: 5,
+                pasid: 11,
+            })
+            .unwrap();
+        let reused = table
+            .register(Owner {
+                key: Key::Doorbell(0x20),
+                vmid: 5,
+                pasid: 22,
+            })
+            .unwrap();
+        if known {
+            let event = iv(CLIENT_GFX, 0, 0, 5, 11, 0);
+            assert_eq!(table.route(&event, classify(&event)), Delivery::Faulted(2));
+            assert!(table.endpoint(gfx).unwrap().fault.is_some());
+            assert!(table.endpoint(mm).unwrap().fault.is_some());
+            assert_eq!(table.endpoint(reused).unwrap().fault, None);
+        } else {
+            assert_eq!(table.latched(5, true), Delivery::Faulted(1));
+            assert_eq!(table.endpoint(gfx).unwrap().fault, None);
+            assert_eq!(table.endpoint(reused).unwrap().fault, None);
+            assert_eq!(
+                table.endpoint(mm).unwrap().fault,
+                Some(src::Fault::Vm { mm_hub: true })
+            );
+            assert_eq!(table.latched(5, false), Delivery::Faulted(1));
+            assert_eq!(
+                table.endpoint(reused).unwrap().fault,
+                Some(src::Fault::Vm { mm_hub: false })
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-interrupts",
+    navi48_dispatch_pasid_survives_vmid_reuse_and_latches_stay_on_their_hub
 );

@@ -11,21 +11,25 @@ impl Submitter {
         }
         // Freeze every ledger before the first await/reset. Synchronous
         // readers also freeze on BLOCKED; reset-test fences retire nothing.
-        for watch in self.watch.lock().iter_mut() {
-            watch.freeze();
+        {
+            let _generation = READ_GENERATION.lock();
+            for watch in self.watch.lock().iter_mut() {
+                watch.freeze();
+            }
         }
         let result = async {
             let boot = owner
                 .as_mut()
                 .ok_or(RingError::Interrupts(crate::amdgpu_ih7::Error::Busy))?;
+            let media = boot.client_media_owner();
             // SAFETY: OWNER excludes every queue/clear/reset/PM user; all
             // ledgers are frozen and remain so on error or cancellation.
             let mut receipt =
-                unsafe { irq::begin_recovery().await }.map_err(RingError::Interrupts)?;
+                unsafe { irq::begin_recovery(media).await }.map_err(RingError::Interrupts)?;
             for (ring, pipe) in PIPES.into_iter().enumerate() {
                 let vmid = self.watch.lock()[ring].reset_vmid();
                 // SAFETY: all pending allocations/VMIDs stay pinned by the
-                // frozen ledgers; only these three kernel queues exist.
+                // frozen ledgers; these GC12 queues are exclusively owned.
                 unsafe { boot.recover_client_ring(pipe, vmid).await }.map_err(RingError::Queue)?;
                 // SAFETY: the ring's reset and fresh fence test just completed.
                 unsafe {
@@ -39,14 +43,36 @@ impl Submitter {
             unsafe {
                 receipt.retired(SDMA_RING as usize);
             }
-            // SAFETY: all three retirements proved; OWNER still excludes all
+            if media.is_some() {
+                // Restart clears codec context. Cancel every old media
+                // context before awaiting; no media IB may be replayed.
+                self.watch.lock()[MEDIA_RING as usize].stop();
+                // SAFETY: all ledgers frozen, retained resources and OWNER
+                // cover media drain, VCPU/LMI retirement and fresh transport.
+                unsafe { boot.retire_client_media().await }.map_err(RingError::Media)?;
+                // SAFETY: old media work retired and new transport drained.
+                unsafe { receipt.retired(MEDIA_RING as usize) };
+            }
+            // SAFETY: all owned retirements proved; OWNER still excludes all
             // submissions and every ledger remains frozen until replay ends.
-            let scope =
+            let (scope, renewed_media) =
                 unsafe { irq::finish_recovery(receipt).await }.map_err(RingError::Interrupts)?;
+            if let Some(handle) = renewed_media {
+                // SAFETY: the receipt renewed this exact retired media owner.
+                unsafe { boot.media_rearmed(handle) };
+                // SAFETY: all rings remain frozen; re-arm restored reporting
+                // and OWNER retains the restarted VCN and renewed handle.
+                unsafe { boot.reprove_client_media().await }.map_err(RingError::Media)?;
+            }
             {
                 let mut watches = self.watch.lock();
                 for (ring, watch) in watches.iter_mut().enumerate() {
-                    watch.faulted(scope, ring, crate::amdgpu_navi48_faults::Hub::Gfx);
+                    let hub = if ring == MEDIA_RING as usize {
+                        crate::amdgpu_navi48_faults::Hub::Mm
+                    } else {
+                        crate::amdgpu_navi48_faults::Hub::Gfx
+                    };
+                    watch.faulted(scope, ring, hub);
                 }
             }
             // Mark all contexts first: a guilty context may have queued work
@@ -54,17 +80,11 @@ impl Submitter {
             for ring in 0..RINGS {
                 let jobs = self.watch.lock()[ring].replay();
                 for (ticket, job) in jobs {
-                    let seq = match PIPES.get(ring) {
-                        // SAFETY: frozen ledger retains the complete job and
-                        // its VMID, and OWNER excludes competing publication.
-                        Some(&pipe) => unsafe { boot.submit_client_job(pipe, job) }
-                            .map_err(RingError::Queue)?,
-                        // SAFETY: same retained memory and exclusive SDMA owner.
-                        None => {
-                            // SAFETY: same retained memory and exclusive SDMA owner.
-                            unsafe { boot.submit_client_sdma_job(job) }.map_err(RingError::Sdma)?
-                        }
-                    };
+                    // SAFETY: OWNER and the frozen ledger retain all
+                    // mappings, BOs and the correct hub's VMID. Restarted
+                    // media contexts were cancelled and have no replay jobs.
+                    let seq = unsafe { media_clients::publish_client(boot, ring as u32, job) }
+                        .map_err(RingError::Client)?;
                     self.watch.lock()[ring].replayed(ticket, seq);
                 }
             }
@@ -74,6 +94,7 @@ impl Submitter {
             // Commit all ledgers together; an earlier successful replay must
             // not retire memory when a later ring's replay fails.
             {
+                let _generation = READ_GENERATION.lock();
                 let mut watches = self.watch.lock();
                 for watch in watches.iter_mut() {
                     watch.recovered(narf_time::monotonic_ns());

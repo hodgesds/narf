@@ -586,10 +586,14 @@ fn hw_ip_info(snap: &Snapshot, ip_type: u32) -> Result<Vec<u8>, FsError> {
     if let Some(block) = amdgpu_discovery::find_ip(&snap.ip_blocks, hw_id, 0) {
         info.hw_ip_version_major = u32::from(block.major);
         info.hw_ip_version_minor = u32::from(block.minor);
-        // 32 bytes is the GFX11 minimum and what Linux reports for the gfx
-        // and compute rings.
-        info.ib_start_alignment = 32;
-        info.ib_size_alignment = 32;
+        // amdgpu_hw_ip_info: unified VCN encode and SDMA use 256/4;
+        // graphics/compute use 32/32.
+        (info.ib_start_alignment, info.ib_size_alignment) =
+            if matches!(ip_type, uapi::AMDGPU_HW_IP_DMA | uapi::AMDGPU_HW_IP_VCN_ENC) {
+                (256, 4)
+            } else {
+                (32, 32)
+            };
         // `available_rings` is the open's card's (`dispatch_for`).
         info.ip_discovery_version =
             u32::from(block.major) << 16 | u32::from(block.minor) << 8 | u32::from(block.revision);
@@ -611,6 +615,7 @@ fn hw_id_for_ip_type(ip_type: u32) -> Option<u16> {
     match ip_type {
         uapi::AMDGPU_HW_IP_GFX | uapi::AMDGPU_HW_IP_COMPUTE => Some(amdgpu_discovery::HW_ID_GC),
         uapi::AMDGPU_HW_IP_DMA => Some(amdgpu_discovery::HW_ID_SDMA0),
+        uapi::AMDGPU_HW_IP_VCN_ENC => Some(amdgpu_discovery::HW_ID_VCN),
         _ => None,
     }
 }
@@ -802,6 +807,26 @@ mod topology_tests {
         // SAFETY: exact-sized POD reply; byte vectors need not be aligned.
         unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast()) }
     }
+    fn gfx12_unified_media_ip_reports_linux_alignment_without_codec_claims() -> TestResult {
+        let gpu = crate::amdgpu_navi48_firmware::tests::gpu();
+        let snap = Snapshot::from_gpu(&gpu);
+        let info = hw_ip_info(&snap, uapi::AMDGPU_HW_IP_VCN_ENC).unwrap();
+        let word = |at| u32::from_le_bytes(info[at..at + 4].try_into().unwrap());
+        assert_eq!(word(0), 5);
+        assert_eq!(word(4), 0);
+        assert_eq!(word(16), 256);
+        assert_eq!(word(20), 4);
+        assert_eq!(word(24), 0); // readiness comes from the registered owner
+        assert_eq!(
+            hw_ip_count(&snap, uapi::AMDGPU_HW_IP_VCN_ENC).unwrap(),
+            1u32.to_le_bytes()
+        );
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu_info",
+        gfx12_unified_media_ip_reports_linux_alignment_without_codec_claims
+    );
     fn gfx12_dev_info_uses_harvesting_without_claiming_acceleration() -> TestResult {
         let mut gpu = crate::amdgpu_navi48_firmware::tests::gpu();
         gpu.gc_info = Some(GcInfo {

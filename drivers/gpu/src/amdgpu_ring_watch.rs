@@ -431,4 +431,50 @@ mod tests {
         "drivers/gpu/amdgpu_cs",
         ring_watch_coordinated_fault_recovery_pins_every_ring_until_replay
     );
+    fn ring_watch_media_restart_cancels_sessions_and_commits_all_ledgers() -> TestResult {
+        let media_context = Arc::new(Health::default());
+        let healthy = Arc::new(Health::default());
+        let mut rings = [const { RingWatch::new() }; 4];
+        rings[0].submitted(10, job(1), media_context.clone(), 0);
+        for w in &mut rings[..3] {
+            w.submitted(11, job(2), healthy.clone(), 0);
+        }
+        rings[3].submitted(10, job(1), media_context.clone(), 0);
+        for w in &mut rings {
+            w.freeze();
+        }
+        let retained = Arc::strong_count(&healthy);
+        rings[3].stop(); // restarting VCN clears codec context
+        assert_eq!(media_context.error(), Some(FsError::Canceled));
+        for (ring, w) in rings.iter_mut().enumerate() {
+            let jobs = w.replay();
+            assert_eq!(jobs.len(), usize::from(ring != 3));
+            for (ticket, _) in jobs {
+                w.replayed(ticket, u32::MAX);
+            }
+            // Frozen readers may skip hardware with a placeholder zero,
+            // which would otherwise pass sequence MAX at wrap.
+            assert_eq!(w.progress(0, 1), 0);
+        }
+        assert_eq!(Arc::strong_count(&healthy), retained);
+        // Platform drains all readers under READ_GENERATION before this
+        // collective commit. Afterward it accepts only fresh hardware samples.
+        for w in &mut rings {
+            w.recovered(2);
+        }
+        assert_eq!(rings[3].progress(0, 3), 1);
+        assert!(rings[3].error(1).is_some());
+        for w in &mut rings[..3] {
+            let before = w.progress(u32::MAX - 1, 3);
+            assert!(w.busy());
+            assert!(w.progress(u32::MAX, 4) != before);
+            assert!(!w.busy());
+        }
+        assert_eq!(Arc::strong_count(&healthy), 1);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu_cs",
+        ring_watch_media_restart_cancels_sessions_and_commits_all_ledgers
+    );
 }

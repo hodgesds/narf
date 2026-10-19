@@ -355,13 +355,15 @@ impl Table {
             generation: slot.generation,
         })
     }
-    /// Validate the exclusive three-ring recovery set before changing any
+    /// Validate the exclusive owned recovery set before changing any
     /// hardware source. Additional owners need a broader quiescence protocol.
-    pub(crate) fn recovery_owners(&self, handles: &[Handle; 3]) -> Result<(), WaitError> {
+    pub(crate) fn recovery_owners(&self, handles: &[Handle]) -> Result<(), WaitError> {
         if let Some(t) = self.terminal {
             return Err(WaitError::Terminal(t));
         }
-        if self.slots.iter().filter(|s| s.owner.is_some()).count() != 3 {
+        if handles.is_empty()
+            || self.slots.iter().filter(|s| s.owner.is_some()).count() != handles.len()
+        {
             return Err(WaitError::Stale);
         }
         for (i, h) in handles.iter().enumerate() {
@@ -374,12 +376,12 @@ impl Table {
     }
     /// All owned rings have reset and drained their test fences. Invalidate
     /// even healthy registrations so pre-reset waiters cannot complete later.
-    pub(crate) fn reset_owners(
+    pub(crate) fn reset_owners<T: AsRef<[Handle]> + AsMut<[Handle]>>(
         &mut self,
-        mut handles: [Handle; 3],
-    ) -> Result<[Handle; 3], WaitError> {
-        self.recovery_owners(&handles)?;
-        for h in &mut handles {
+        mut handles: T,
+    ) -> Result<T, WaitError> {
+        self.recovery_owners(handles.as_ref())?;
+        for h in handles.as_mut() {
             let slot = &mut self.slots[h.slot as usize];
             slot.fault = None;
             Self::next_generation(slot);
@@ -433,10 +435,16 @@ impl Table {
             let Some(owner) = slot.owner else {
                 continue;
             };
-            // Queue faults name a slot or doorbell. VM and shader faults name
-            // a context and are attributed to every owner sharing it.
+            // A nonzero PASID names the address space even if a late vector's
+            // VMID has since been reused. Without it only the hub's VMID is
+            // known. Queue faults instead name a hardware slot or doorbell.
             let attributed = if keys.is_empty() {
-                owner.vmid == v.vmid && owner.pasid == v.pasid
+                if v.pasid != 0 {
+                    owner.pasid == v.pasid
+                } else {
+                    let mm = matches!(fault, src::Fault::Vm { mm_hub: true });
+                    owner.vmid == v.vmid && matches!(owner.key, Key::Vcn { .. }) == mm
+                }
             } else {
                 keys.contains(&owner.key)
             };
@@ -541,12 +549,15 @@ impl Table {
         }
     }
     /// A VM protection latch found after lost vectors. Only its VMID is
-    /// known, so every owner in that VMID is faulted.
+    /// known, so every owner in that VMID on that hub is faulted.
     pub fn latched(&mut self, vmid: u8, mm_hub: bool) -> Delivery {
         let fault = src::Fault::Vm { mm_hub };
         let mut hit = 0;
         for slot in self.slots.iter_mut() {
-            if slot.owner.is_some_and(|o| o.vmid == vmid) {
+            if slot
+                .owner
+                .is_some_and(|o| o.vmid == vmid && matches!(o.key, Key::Vcn { .. }) == mm_hub)
+            {
                 slot.fault.get_or_insert(fault);
                 slot.bump();
                 hit += 1;

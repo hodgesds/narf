@@ -23,6 +23,7 @@ impl ColdBoot {
     /// Any cancellation/failure requires explicit whole-device recovery.
     pub(crate) async unsafe fn prove_media_transport(
         &mut self,
+        keep_running: bool,
     ) -> Result<vcn::InterruptProof, Error> {
         if self.state() != State::MemoryReady || self.sequence.backend.media_test.is_some() {
             return Err(Error::Busy);
@@ -77,6 +78,9 @@ impl ColdBoot {
             // SAFETY: matching retained registration, independent IH service,
             // drained kernel transport, exclusive OWNER and enabled CPU IRQs.
             let proof = unsafe { vcn.prove_interrupts().await }.map_err(Error::Vcn)?;
+            if keep_running {
+                return Ok(proof);
+            }
             // SAFETY: no client publication; the proof drained its whole ring.
             unsafe { vcn.stop().await }.map_err(Error::Vcn)?;
             // SAFETY: stop proved VCPU/LMI retirement before domain power-down.
