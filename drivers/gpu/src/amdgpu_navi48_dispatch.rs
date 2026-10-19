@@ -537,6 +537,18 @@ impl Table {
         }
         wake(&self.display_waiters, u32::MAX);
     }
+    /// Reset has stopped the old IH producer. Invalidate every queue handle
+    /// and wake old waiters before accepting registrations for the new rings.
+    pub(crate) fn restart(&mut self) {
+        for slot in &mut self.slots {
+            slot.owner = None;
+            slot.fault = None;
+            Self::next_generation(slot);
+        }
+        self.display.lost = self.display.lost.wrapping_add(1);
+        wake(&self.display_waiters, u32::MAX);
+        self.terminal = None;
+    }
     fn version(&self, target: Target) -> u64 {
         match target {
             Target::Slot(i) => self.slots[i as usize].seq,

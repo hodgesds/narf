@@ -199,6 +199,10 @@ impl Io for Fake {
         if register == MESSAGE {
             self.pending = Some(value);
         }
+        if register == 0x76 {
+            self.decoding = false;
+            self.reset = true;
+        }
     }
     fn reg(&mut self, dword: u32) -> u32 {
         if !self.decode() {
@@ -260,6 +264,7 @@ fn engine(io: Fake) -> Engine<Fake> {
         authority: Cap::bootstrap(),
         state: State::Prepared,
         mode: Mode::OnInit,
+        navi48: false,
         vbios: Some(vbios(None)),
         scratch: SCRATCH,
         post: None,
@@ -701,4 +706,77 @@ fn reset_navi22_post_cancellation_and_revocation() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi22",
     reset_navi22_post_cancellation_and_revocation
+);
+
+fn navi48_mode1_uses_debug_mailbox_then_pci_restore_and_atom_post() -> TestResult {
+    let mut e = engine(Fake::posted());
+    e.navi48 = true;
+    e.mode = Mode::Recovery;
+    let result = narf_scheduler::block_on_spin(e.run());
+    if !matches!(
+        result,
+        Ok(Some(Report {
+            method: Method::Smu,
+            smu_version: None,
+            post: Post { ran: true, .. },
+            ..
+        }))
+    ) {
+        return TestResult::Fail("Navi48 mode1 reset/post failed");
+    }
+    let messages: Vec<_> =
+        e.io.events
+            .iter()
+            .filter(|e| matches!(e, Event::Mp1(..)))
+            .copied()
+            .collect();
+    if messages
+        != [
+            Event::Mp1(0x75, 0),
+            Event::Mp1(0x8b, 2),
+            Event::Mp1(0x76, 0),
+        ]
+        || e.io.stray != 0
+    {
+        return TestResult::Fail("SMU14 mailbox order or MMIO before PCI restore");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/reset_navi22",
+    navi48_mode1_uses_debug_mailbox_then_pci_restore_and_atom_post
+);
+
+fn navi48_mode1_cancellation_and_restore_failure_are_terminal() -> TestResult {
+    for restore_error in [false, true] {
+        let mut e = engine(Fake::posted());
+        e.navi48 = true;
+        e.mode = Mode::Recovery;
+        e.io.restore_error = restore_error;
+        if restore_error {
+            if run(e.run()) != Err(Error::Pci) || e.state != State::Failed {
+                return TestResult::Fail("reset continued after PCI restore failed");
+            }
+        } else {
+            let mut future = core::pin::pin!(e.run());
+            if future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+            {
+                return TestResult::Fail("SMU14 reset omitted its settling wait");
+            }
+        }
+        let writes = e.io.events.len();
+        if e.io.stray != 0 || run(e.run()) != Err(Error::Busy) || e.io.events.len() != writes {
+            return TestResult::Fail(
+                "canceled/failed SMU14 reset retried or accessed missing BARs",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/reset_navi22",
+    navi48_mode1_cancellation_and_restore_failure_are_terminal
 );

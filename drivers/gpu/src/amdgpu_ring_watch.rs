@@ -1,132 +1,172 @@
-//! Job timeouts on an in-order ring — drm_sched's timeout handler and
-//! `amdgpu_job_timedout`.
+//! In-order client tickets, hardware fence translation and timeout recovery.
 //!
-//! A [`RingWatch`] follows one ring's submitted jobs. The job at the front
-//! has its timeout counted from the moment it got there (drm_sched re-arms
-//! its timer whenever the oldest job completes), and once it has been there
-//! longer than [`JOB_TIMEOUT_NS`] the ring is hung: that job ends with
-//! `TimedOut` (`-ETIME`) and its context becomes guilty; every job queued
-//! behind it ends with `Canceled` (`-ECANCELED`) and its context records
-//! that. A hung ring takes no new jobs until it is [`recovered`]
-//! (`RingWatch::recovered`), and those jobs keep their errors after it.
-//!
-//! An error ends a job for its waiters only. What the job may still touch
-//! — its buffers, page tables and VMID — is released by the hardware fence
-//! alone, so memory never returns while a hung engine could reach it; a
-//! recovery proves the engine let go by a later fence on the same ring.
-//!
-//! LINUX-GAP: Linux re-runs the innocent jobs after a ring reset; here
-//! they stay canceled.
+//! Tickets survive ring resets. A reset test fence must never complete an
+//! innocent job: retirement freezes before reset, then each retained job is
+//! assigned its replay's hardware sequence. Buffers and VMIDs remain pinned
+//! until the translated fence passes. The guilty context is never replayed.
 
-use alloc::collections::VecDeque;
-use alloc::sync::Arc;
-
+use crate::{amdgpu_ctx::Health, amdgpu_gfx12_queue::Job};
+use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 use narf_filesystem::FsError;
 
-use crate::amdgpu_ctx::Health;
-
-/// amdgpu's default lockup timeout (`amdgpu_lockup_timeout`), the same for
-/// graphics, compute and SDMA rings.
 pub const JOB_TIMEOUT_NS: u64 = 2_000_000_000;
-
-/// Whether sequence `seq` is at or before `completed` (32-bit sequences
-/// wrap).
 fn reached(completed: u32, seq: u32) -> bool {
     completed.wrapping_sub(seq) as i32 >= 0
 }
 
-/// One ring's jobs in flight and whether it hung.
-#[derive(Debug, Default)]
-pub struct RingWatch {
-    /// Submitted, not yet seen complete, oldest first: sequence, VMID and
-    /// context health.
-    pending: VecDeque<(u32, u8, Arc<Health>)>,
-    /// When the front job became the front, in monotonic ns.
-    front_since: u64,
-    /// The ring hung and has not been recovered.
-    hung: bool,
-    /// The last hang's jobs: the one that timed out and the last one
-    /// canceled behind it.
-    failed: Option<(u32, u32)>,
+#[derive(Debug)]
+struct Pending {
+    ticket: u32,
+    physical: Option<u32>,
+    skipped: bool,
+    job: Job,
+    health: Arc<Health>,
 }
 
+/// Serialized with queue submission by the platform owner. Synchronous fence
+/// readers may call `progress`; a hung ring stays frozen through reset/replay.
+#[derive(Debug, Default)]
+pub struct RingWatch {
+    pending: VecDeque<Pending>,
+    issued: u32,
+    completed: u32,
+    front_since: u64,
+    hung: bool,
+    /// Errors must survive subsequent recoveries and old dma-fence readers.
+    failed: Vec<(u32, FsError)>,
+}
 impl RingWatch {
     pub const fn new() -> Self {
         Self {
             pending: VecDeque::new(),
+            issued: 0,
+            completed: 0,
             front_since: 0,
             hung: false,
-            failed: None,
+            failed: Vec::new(),
         }
     }
-
-    /// Whether new jobs must be refused (`Canceled`), as the ring hung.
     pub fn refusing(&self) -> Option<FsError> {
         self.hung.then_some(FsError::Canceled)
     }
-
-    /// Job `seq` on VMID `vmid` of a context with `health` went onto the
-    /// ring at `now`.
-    pub fn submitted(&mut self, seq: u32, vmid: u8, health: Arc<Health>, now: u64) {
+    /// Publish a submitted descriptor and return its stable client ticket.
+    pub fn submitted(&mut self, physical: u32, job: Job, health: Arc<Health>, now: u64) -> u32 {
         if self.pending.is_empty() {
             self.front_since = now;
         }
-        self.pending.push_back((seq, vmid, health));
+        self.issued = self.issued.wrapping_add(1);
+        // A ticket's prior incarnation has aged out after a full 32-bit wrap.
+        self.failed.retain(|(t, _)| *t != self.issued);
+        self.pending.push_back(Pending {
+            ticket: self.issued,
+            physical: Some(physical),
+            skipped: false,
+            job,
+            health,
+        });
+        self.issued
     }
-
-    /// Whether any job is still in flight.
     pub fn busy(&self) -> bool {
         !self.pending.is_empty()
     }
-
-    /// Forget the jobs up to `completed`; if the front job has now been
-    /// there past the timeout, hang the ring and return that job's
-    /// sequence and VMID.
-    pub fn check(&mut self, completed: u32, now: u64) -> Option<(u32, u8)> {
-        let front = self.pending.front().map(|(seq, ..)| *seq);
-        while self
-            .pending
-            .front()
-            .is_some_and(|(seq, ..)| reached(completed, *seq))
-        {
-            self.pending.pop_front();
+    /// Translate only proven hardware completions, never a reset test fence.
+    pub fn progress(&mut self, physical: u32, now: u64) -> u32 {
+        if !self.hung {
+            let mut advanced = false;
+            while self
+                .pending
+                .front()
+                .is_some_and(|p| p.skipped || p.physical.is_some_and(|s| reached(physical, s)))
+            {
+                self.completed = self.pending.pop_front().unwrap().ticket;
+                advanced = true;
+            }
+            if advanced {
+                self.front_since = now;
+            }
         }
-        let &(seq, vmid, ref health) = self.pending.front()?;
-        if front != Some(seq) {
-            self.front_since = now;
-            return None;
-        }
+        self.completed
+    }
+    /// The caller already translated physical progress. Freeze retirement
+    /// before the first reset write and identify the front job's VMID.
+    pub fn check(&mut self, now: u64) -> Option<(u32, u8)> {
+        let p = self.pending.front()?;
         if self.hung || now.saturating_sub(self.front_since) <= JOB_TIMEOUT_NS {
             return None;
         }
-        health.mark_guilty();
-        for (_, _, behind) in self.pending.iter().skip(1) {
-            behind.mark_canceled();
-        }
-        let last = self.pending.back().map_or(seq, |(s, ..)| *s);
+        p.health.mark_guilty();
+        self.failed.push((p.ticket, FsError::TimedOut));
         self.hung = true;
-        self.failed = Some((seq, last));
-        Some((seq, vmid))
+        Some((p.ticket, p.job.vmid))
     }
-
-    /// The ring was reset and a later fence on it proved the engine moved
-    /// past every job it held: take jobs again.
-    pub fn recovered(&mut self) {
-        self.hung = false;
-        self.pending.clear();
-    }
-
-    /// How job `seq` ended, if the last hang ended it: the job that hung
-    /// the ring timed out, and those queued behind it were canceled.
-    pub fn error(&self, seq: u32) -> Option<FsError> {
-        let (hung, last) = self.failed?;
-        if seq == hung {
-            Some(FsError::TimedOut)
-        } else if seq.wrapping_sub(hung) as i32 > 0 && last.wrapping_sub(seq) as i32 >= 0 {
-            Some(FsError::Canceled)
-        } else {
-            None
+    /// A successful reset test proved old slots no longer execute. Keep
+    /// retirement frozen while replay descriptors are published. Other jobs
+    /// in any guilty/canceled context are abandoned; healthy jobs keep tickets.
+    pub fn replay(&mut self) -> Vec<(u32, Job)> {
+        assert!(self.hung);
+        let mut replay = Vec::new();
+        for p in &mut self.pending {
+            p.physical = None;
+            p.skipped = p.health.error().is_some();
+            if p.skipped {
+                if !self.failed.iter().any(|(t, _)| *t == p.ticket) {
+                    self.failed.push((p.ticket, FsError::Canceled));
+                }
+            } else {
+                let mut job = p.job;
+                job.flush = true;
+                job.map_pasid = true;
+                job.ctx_switch = true;
+                replay.push((p.ticket, job));
+            }
         }
+        replay
+    }
+    pub fn replayed(&mut self, ticket: u32, physical: u32) {
+        assert!(self.hung);
+        let p = self
+            .pending
+            .iter_mut()
+            .find(|p| p.ticket == ticket)
+            .unwrap();
+        assert!(!p.skipped && p.physical.is_none());
+        p.physical = Some(physical);
+    }
+    /// Every innocent job has its new fence. Cancellation/failure before
+    /// this point leaves all memory retained and new submissions refused.
+    pub fn recovered(&mut self, now: u64) {
+        assert!(self
+            .pending
+            .iter()
+            .all(|p| p.skipped || p.physical.is_some()));
+        self.front_since = now;
+        self.hung = false;
+    }
+    /// Terminal to old waiters, without granting permission to retire memory.
+    pub(crate) fn stop(&mut self) {
+        self.hung = true;
+        for p in &self.pending {
+            p.health.mark_canceled();
+            if !self.failed.iter().any(|(t, _)| *t == p.ticket) {
+                self.failed.push((p.ticket, FsError::Canceled));
+            }
+        }
+    }
+    /// Only after full reset proved old jobs cannot execute. Preserve ticket
+    /// numbering and errors across the new hardware's fence sequence zero.
+    pub(crate) fn successor(&self) -> Self {
+        Self {
+            issued: self.issued,
+            completed: self.issued,
+            failed: self.failed.clone(),
+            ..Self::new()
+        }
+    }
+    pub fn error(&self, ticket: u32) -> Option<FsError> {
+        self.failed
+            .iter()
+            .find(|(t, _)| *t == ticket)
+            .map(|(_, e)| *e)
     }
 }
 
@@ -134,81 +174,106 @@ impl RingWatch {
 mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
-
-    const S: u64 = 1_000_000_000;
-
-    /// The front job times out counted from when it reached the front; it
-    /// is guilty, the jobs behind it canceled, and the ring refuses more
-    /// until it is recovered; the errors outlive the recovery.
-    fn ring_watch_times_out_the_front_job() -> TestResult {
-        let (a, b, c) = (
-            Arc::new(Health::default()),
-            Arc::new(Health::default()),
-            Arc::new(Health::default()),
-        );
+    fn job(vmid: u8) -> Job {
+        Job::new(vmid, 1, 0x1000, &[(0x2000, 4)]).unwrap()
+    }
+    fn ring_watch_replay_preserves_tickets_and_memory() -> TestResult {
+        let a = Arc::new(Health::default());
+        let b = Arc::new(Health::default());
         let mut w = RingWatch::new();
-        if w.check(0, 0).is_some() || w.busy() {
-            return TestResult::Fail("idle ring hung");
-        }
-        // Sequences straddle the 32-bit wrap.
-        w.submitted(u32::MAX, 1, a.clone(), 0);
-        w.submitted(0, 2, b.clone(), S);
-        w.submitted(1, 3, c.clone(), S);
-        if w.check(u32::MAX - 1, JOB_TIMEOUT_NS).is_some() {
-            return TestResult::Fail("hung at exactly the timeout");
-        }
-        // The first job completes late; the second's clock starts now.
-        if w.check(u32::MAX, 3 * S).is_some()
-            || w.check(u32::MAX, 3 * S + JOB_TIMEOUT_NS).is_some()
-            || w.error(0).is_some()
+        w.issued = u32::MAX - 1;
+        w.completed = u32::MAX - 1;
+        let guilty = w.submitted(u32::MAX, job(1), a.clone(), 0);
+        let innocent = w.submitted(0, job(2), b.clone(), 0);
+        let same_context = w.submitted(1, job(1), a.clone(), 0);
+        if w.progress(u32::MAX - 1, 0) != u32::MAX - 1
+            || w.check(JOB_TIMEOUT_NS).is_some()
+            || w.check(JOB_TIMEOUT_NS + 1) != Some((guilty, 1))
+            || w.error(guilty) != Some(FsError::TimedOut)
+            || b.error().is_some()
         {
-            return TestResult::Fail("timeout not counted from reaching the front");
+            return TestResult::Fail("timeout blamed an innocent context");
         }
-        if w.check(u32::MAX, 3 * S + JOB_TIMEOUT_NS + 1) != Some((0, 2)) {
-            return TestResult::Fail("front job past its timeout did not hang");
+        // Reset test fence 2 passed every old slot. It must release nothing.
+        if w.progress(2, JOB_TIMEOUT_NS + 2) != u32::MAX - 1 {
+            return TestResult::Fail("test fence retired replay memory");
         }
-        if a.error().is_some()
-            || b.error() != Some(FsError::TimedOut)
-            || c.error() != Some(FsError::Canceled)
+        let replay = w.replay();
+        if replay.len() != 1
+            || replay[0].0 != innocent
+            || !replay[0].1.flush
+            || !replay[0].1.map_pasid
+            || !replay[0].1.ctx_switch
+            || w.error(same_context) != Some(FsError::Canceled)
         {
-            return TestResult::Fail("context health after a hang");
+            return TestResult::Fail("replay did not exclude guilty context or restore VM state");
         }
-        if w.error(u32::MAX).is_some()
-            || w.error(0) != Some(FsError::TimedOut)
-            || w.error(1) != Some(FsError::Canceled)
-            || w.error(2).is_some()
-            || w.refusing() != Some(FsError::Canceled)
-        {
-            return TestResult::Fail("job errors after a hang");
+        w.replayed(innocent, 3);
+        if w.progress(3, JOB_TIMEOUT_NS + 3) != u32::MAX - 1 || w.refusing().is_none() {
+            return TestResult::Fail("incomplete recovery released jobs");
         }
-        // A hang is reported once.
-        if w.check(u32::MAX, 20 * S).is_some() || !w.busy() {
-            return TestResult::Fail("hang reported twice");
-        }
-        // Recovery takes jobs again and keeps the errors; a later job
-        // times out afresh.
-        w.recovered();
-        if w.refusing().is_some()
+        w.recovered(JOB_TIMEOUT_NS + 4);
+        if w.progress(2, JOB_TIMEOUT_NS + 5) != guilty
+            || w.error(innocent).is_some()
+            || w.progress(3, JOB_TIMEOUT_NS + 6) != same_context
             || w.busy()
-            || w.error(0) != Some(FsError::TimedOut)
-            || w.error(1) != Some(FsError::Canceled)
         {
-            return TestResult::Fail("errors after recovery");
+            return TestResult::Fail("logical completion did not follow replay fence");
         }
-        let d = Arc::new(Health::default());
-        w.submitted(3, 4, d.clone(), 30 * S);
-        if w.check(2, 30 * S + JOB_TIMEOUT_NS + 1) != Some((3, 4))
-            || d.error() != Some(FsError::TimedOut)
-            || w.error(1).is_some()
+        let c = Arc::new(Health::default());
+        let next = w.submitted(4, job(3), c, 10 * JOB_TIMEOUT_NS);
+        if w.check(11 * JOB_TIMEOUT_NS + 1) != Some((next, 3))
+            || w.error(guilty) != Some(FsError::TimedOut)
+            || b.error().is_some()
         {
-            return TestResult::Fail("hang after recovery");
-        }
-        // Guilt is not downgraded by a later cancellation.
-        b.mark_canceled();
-        if b.error() != Some(FsError::TimedOut) {
-            return TestResult::Fail("guilt downgraded");
+            return TestResult::Fail("second hang lost old errors or blamed innocent context");
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/gpu/amdgpu_cs", ring_watch_times_out_the_front_job);
+    kernel_test_in!(
+        "drivers/gpu/amdgpu_cs",
+        ring_watch_replay_preserves_tickets_and_memory
+    );
+    fn ring_watch_full_reset_preserves_ticket_namespace() -> TestResult {
+        let health = Arc::new(Health::default());
+        let mut old = RingWatch::new();
+        let ticket = old.submitted(97, job(1), health.clone(), 0);
+        old.stop();
+        if old.progress(100, 1) != 0
+            || old.error(ticket) != Some(FsError::Canceled)
+            || health.error() != Some(FsError::Canceled)
+        {
+            return TestResult::Fail("reset cancellation retired memory or lost errors");
+        }
+        let mut new = old.successor();
+        let next = new.submitted(1, job(2), Arc::new(Health::default()), 0);
+        if next != ticket + 1
+            || new.progress(0, 1) != ticket
+            || new.error(ticket) != Some(FsError::Canceled)
+            || new.progress(1, 2) != next
+        {
+            return TestResult::Fail("new hardware fences collided with old tickets");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu_cs",
+        ring_watch_full_reset_preserves_ticket_namespace
+    );
+    fn ring_watch_front_timeout_rearms_on_completion() -> TestResult {
+        let mut w = RingWatch::new();
+        w.submitted(10, job(1), Arc::new(Health::default()), 0);
+        let second = w.submitted(11, job(2), Arc::new(Health::default()), 1);
+        if w.progress(10, JOB_TIMEOUT_NS + 1) != 1
+            || w.check(2 * JOB_TIMEOUT_NS).is_some()
+            || w.check(2 * JOB_TIMEOUT_NS + 2) != Some((second, 2))
+        {
+            return TestResult::Fail("front job did not receive its own timeout");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu_cs",
+        ring_watch_front_timeout_rearms_on_completion
+    );
 }

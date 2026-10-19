@@ -18,7 +18,24 @@ pub enum Error {
     Memory(vram::Error),
 }
 
-static OWNER: Mutex<Option<boot::ColdBoot>> = Mutex::new(None);
+static OWNER: Mutex<Option<alloc::boxed::Box<boot::ColdBoot>>> = Mutex::new(None);
+// The lock spans each synchronous hardware-fence read. Advancing generation
+// drains old readers before reset; their retained readers never touch BARs again.
+static READ_GENERATION: narf_lib::sync::IrqSafeSpinLock<u64> =
+    narf_lib::sync::IrqSafeSpinLock::new(0);
+static SUBMITTER: narf_lib::sync::IrqSafeSpinLock<Option<Arc<Submitter>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+#[allow(
+    clippy::vec_box,
+    reason = "retain large owners without moving them onto the kernel stack"
+)]
+static QUARANTINED: narf_lib::sync::IrqSafeSpinLock<Vec<alloc::boxed::Box<boot::ColdBoot>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+static RECOVERY_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static RECOVERIES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub fn recoveries() -> u64 {
+    RECOVERIES.load(core::sync::atomic::Ordering::Acquire)
+}
 
 /// Firmware progress only, never an acceleration-ready indication.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -208,7 +225,7 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
             boot::ColdBoot::new(gpu, pci, authority, &pool, unmapped, firmware, training)
         }
         .map_err(Error::Firmware)?;
-        *owner = Some(prepared);
+        *owner = Some(alloc::boxed::Box::new(prepared));
         Ok(Some(affected))
     })
     .ok_or(Error::Busy)?
@@ -237,24 +254,10 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     if let Some((limits, level)) = boot.power_info() {
         crate::amdgpu_navi48_power::start(limits, level);
     }
-    // Clients' command submissions run on the GC12 queues and SDMA0.
-    if let (Some(card), Some(fence)) = (boot::ColdBoot::drm_card(), boot.client_fence_reader()) {
-        let submitter = Arc::new(Submitter {
-            card,
-            fence,
-            sdma_fence: boot.client_sdma_fence_reader(),
-            contexts: narf_lib::sync::IrqSafeSpinLock::new([(0, 0); RINGS]),
-            vmids: narf_lib::sync::IrqSafeSpinLock::new(crate::amdgpu_vmid::VmidManager::new(
-                CLIENT_VMIDS.0,
-                CLIENT_VMIDS.1,
-            )),
-            watch: narf_lib::sync::IrqSafeSpinLock::new(
-                [const { crate::amdgpu_ring_watch::RingWatch::new() }; RINGS],
-            ),
-        });
-        crate::amdgpu_cs::register_submitter(card, submitter.clone());
-        narf_scheduler::spawn(watchdog(submitter));
-    }
+    register_submitter(
+        boot,
+        [const { crate::amdgpu_ring_watch::RingWatch::new() }; RINGS],
+    );
     // Clients' VRAM buffers; without it they fall back to system memory.
     {
         use core::fmt::Write as _;
@@ -268,6 +271,146 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
                 narf_console::Writer,
                 "amdgpu: navi48 no client VRAM heap: {e:?}"
             ),
+        };
+    }
+    Ok(report)
+}
+
+fn register_submitter(
+    boot: &boot::ColdBoot,
+    watches: [crate::amdgpu_ring_watch::RingWatch; RINGS],
+) {
+    if let (Some(card), Some(fence)) = (boot::ColdBoot::drm_card(), boot.client_fence_reader()) {
+        let submitter = Arc::new(Submitter {
+            card,
+            generation: *READ_GENERATION.lock(),
+            fence,
+            sdma_fence: boot.client_sdma_fence_reader(),
+            contexts: narf_lib::sync::IrqSafeSpinLock::new([(0, 0); RINGS]),
+            vmids: narf_lib::sync::IrqSafeSpinLock::new(crate::amdgpu_vmid::VmidManager::new(
+                CLIENT_VMIDS.0,
+                CLIENT_VMIDS.1,
+            )),
+            watch: narf_lib::sync::IrqSafeSpinLock::new(watches),
+        });
+        *SUBMITTER.lock() = Some(submitter.clone());
+        crate::amdgpu_cs::register_submitter(card, submitter.clone());
+        narf_scheduler::spawn(watchdog(submitter));
+    }
+}
+
+/// Retains whichever owner recovery reached if its future is canceled.
+struct RecoveryOwner {
+    boot: Option<alloc::boxed::Box<boot::ColdBoot>>,
+    armed: bool,
+}
+impl Drop for RecoveryOwner {
+    fn drop(&mut self) {
+        if self.armed {
+            RECOVERY_STATE.store(3, Ordering::Release);
+            crate::amdgpu_info::withdraw_navi48_clock();
+            crate::amdgpu_navi48_interrupts::lose();
+        }
+        if let Some(boot) = self.boot.take() {
+            QUARANTINED.lock().push(boot);
+        }
+    }
+}
+/// Explicit whole-device recovery after a failed ring reset. SMU14 mode1
+/// loses VRAM contents. Old firmware/display allocations remain quarantined;
+/// client allocations keep their addresses but their contexts report reset.
+/// Restarts firmware, IH, queues and their interrupt proofs before publishing
+/// a new submitter. The display monitor relights the fresh display owner.
+/// Failure or cancellation is terminal and cannot be retried.
+///
+/// # Safety
+/// Stop ALL CPU access to this GPU's VRAM, including userspace mmap and GOP
+/// writers, and exclude other PCI/config/firmware owners until successful
+/// return. Keep these exclusions after failure or cancellation. Clients
+/// must handle lost VRAM contents. This cannot safely run from the watchdog
+/// without an external mechanism providing those exclusions. Hardware unvalidated.
+pub async unsafe fn recover() -> Result<boot::Report, boot::Error> {
+    let mut owner = OWNER.lock().await;
+    if RECOVERY_STATE.load(Ordering::Acquire) & 1 != 0 {
+        return Err(boot::Error::Busy);
+    }
+    owner.as_mut().ok_or(boot::Error::Busy)?.prepare_reset()?;
+    RECOVERY_STATE.store(1, Ordering::Release);
+    let mut retained = RecoveryOwner {
+        boot: owner.take(),
+        armed: true,
+    };
+    let old_submitter = SUBMITTER.lock().take();
+    if let Some(s) = &old_submitter {
+        for w in s.watch.lock().iter_mut() {
+            w.stop();
+        }
+    }
+    if let Some(card) = boot::ColdBoot::drm_card() {
+        crate::amdgpu_cs::unregister_submitter(card);
+        crate::amdgpu_gem::unregister_vram_heap(card);
+    }
+    *READ_GENERATION.lock() += 1;
+    let restart_display = DISPLAY_GENERATION.load(Ordering::Acquire) != 0;
+    if restart_display {
+        DISPLAY_GENERATION.fetch_add(1, Ordering::AcqRel);
+    }
+    crate::amdgpu_navi48_power::stop();
+    *CLEARER.lock() = None;
+    crate::amdgpu_info::withdraw_navi48_clock();
+    for pipe in 0..4 {
+        present_slot(pipe).native.store(false, Ordering::Release);
+    }
+    crate::amdgpu_dcn_display::publish_external(None, None);
+    crate::scanout_access::wait_retired().await;
+    crate::amdgpu_navi48_interrupts::stop_for_reset().await;
+    let old = retained.boot.as_mut().unwrap();
+    // SAFETY: OWNER excludes async access; readers, IH and publication were
+    // withdrawn. The caller excludes all external CPU mappings and PCI users.
+    unsafe { old.run_reset().await }?;
+    // SAFETY: full reset and ASIC_Init proved old hardware no longer executes.
+    let new = alloc::boxed::Box::new(unsafe { old.after_reset() }?);
+    QUARANTINED.lock().push(retained.boot.replace(new).unwrap());
+    let boot = retained.boot.as_mut().unwrap();
+    let report = boot.run().await?;
+    crate::amdgpu_navi48_dispatch::TABLE.lock().restart();
+    // SAFETY: new retained IH/queues on the same exclusively owned GPU.
+    unsafe { boot.start_interrupt_service() }?;
+    // SAFETY: OWNER retains the new queues/GMC and the independent IH service.
+    unsafe { boot.prove_queue_interrupts().await }.map_err(boot::Error::Queues)?;
+    // SAFETY: GC12 proof drained; SDMA exclusively owns the same GMC test pages.
+    unsafe { boot.prove_sdma_interrupts().await }.map_err(boot::Error::Sdma)?;
+    let mut watches = old_submitter.as_ref().map_or_else(
+        || [const { crate::amdgpu_ring_watch::RingWatch::new() }; RINGS],
+        |s| {
+            let old = s.watch.lock();
+            core::array::from_fn(|i| old[i].successor())
+        },
+    );
+    let done = core::array::from_fn(|i| watches[i].progress(0, 0));
+    RECOVERIES.fetch_add(1, Ordering::AcqRel);
+    boot.republish_client_vram();
+    publish_clearer(boot);
+    register_submitter(boot, watches);
+    if let Some(card) = boot::ColdBoot::drm_card() {
+        // Reset stopped every old job. Late deferred registrations are also
+        // covered by the successor ledger's completed logical sequences.
+        crate::amdgpu_cs::retire(card, &|t| job_done(done, t));
+    }
+    *owner = retained.boot.take();
+    retained.armed = false;
+    RECOVERY_STATE.store(2, Ordering::Release);
+    if let Some((limits, level)) = owner.as_ref().and_then(|b| b.power_info()) {
+        crate::amdgpu_navi48_power::restart(limits, level);
+    }
+    if restart_display {
+        // SAFETY: caller's external writer exclusions and the existing native
+        // display monitor contract persist. Only fresh modeset witnesses run.
+        unsafe {
+            spawn_display_monitor(boot::Configuration {
+                displays: Vec::new(),
+                failed: None,
+            })
         };
     }
     Ok(report)
@@ -291,17 +434,19 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
 /// faults carry the client's PASID and reach that open's GPUVM_FAULT query.
 ///
 /// A watchdog (`watchdog`) times out a ring's front job after
-/// `amdgpu_ring_watch::JOB_TIMEOUT_NS`: it ends with ETIME, the jobs behind
-/// it with ECANCELED, and the ring takes no more. Their memory still waits
-/// for the hardware fence. The graphics ring is then reset through MES, the
+/// `amdgpu_ring_watch::JOB_TIMEOUT_NS`: it ends with ETIME and retirement
+/// freezes. Healthy contexts' queued jobs replay under their original tickets;
+/// other jobs from the guilty context end with ECANCELED. The graphics ring is then reset through MES, the
 /// compute ring by MMIO and remapped, SDMA0's ring by MMIO and reprogrammed,
 /// and tested (`ColdBoot::recover_client_ring`, `recover_client_sdma`);
-/// once the test's fence lands it takes jobs again.
+/// after replay is published it takes jobs again. A test fence never retires
+/// an innocent job's memory.
 ///
 /// AMDGPU_INFO keeps reporting acceleration unavailable, so Mesa does not
 /// submit here.
 struct Submitter {
     card: u32,
+    generation: u64,
     fence: crate::amdgpu_gfx12_queue::FenceReader,
     /// SDMA0's job fence (no DMA ring without SDMA0). Its jobs are refused
     /// as busy until both SDMA proofs pass, as the GC12 queues' are.
@@ -343,6 +488,10 @@ impl Submitter {
     /// Every ring's completed sequence, retiring what completed jobs held.
     /// None when the device stopped answering.
     fn progress(&self) -> Option<[u32; RINGS]> {
+        let generation = READ_GENERATION.lock();
+        if *generation != self.generation {
+            return None;
+        }
         let mut completed = [0; RINGS];
         for (c, pipe) in completed.iter_mut().zip(PIPES) {
             *c = self.fence.completed(pipe).ok()?;
@@ -350,6 +499,17 @@ impl Submitter {
         if let Some(sdma) = &self.sdma_fence {
             completed[SDMA_RING as usize] = sdma.completed().ok()?;
         }
+        // Lock after reading hardware: reset keeps each affected ledger frozen
+        // until every replay fence is assigned. Old samples cannot complete a
+        // new replay whose hardware sequence is strictly later.
+        let now = narf_time::monotonic_ns();
+        {
+            let mut watches = self.watch.lock();
+            for (watch, done) in watches.iter_mut().zip(&mut completed) {
+                *done = watch.progress(*done, now);
+            }
+        }
+        drop(generation);
         crate::amdgpu_cs::retire(self.card, &|t| job_done(completed, t));
         Some(completed)
     }
@@ -365,7 +525,7 @@ impl Submitter {
         };
         let now = narf_time::monotonic_ns();
         for (ring, &done) in completed.iter().enumerate() {
-            let hung = self.watch.lock()[ring].check(done, now);
+            let hung = self.watch.lock()[ring].check(now);
             let Some((seq, vmid)) = hung else {
                 continue;
             };
@@ -376,7 +536,10 @@ impl Submitter {
             );
             let recovered = {
                 let mut owner = OWNER.lock().await;
-                match (owner.as_mut(), PIPES.get(ring)) {
+                if *READ_GENERATION.lock() != self.generation {
+                    return;
+                }
+                let reset = match (owner.as_mut(), PIPES.get(ring)) {
                     // SAFETY: OWNER serializes the queues, SDMA0 and MES;
                     // every job on the ring holds its memory until its
                     // fence, which only the ring test's proves passed.
@@ -390,11 +553,43 @@ impl Submitter {
                     (None, _) => Err(RingError::Queue(
                         crate::amdgpu_gfx12_queue::Error::DeviceGone,
                     )),
+                };
+                match (reset, owner.as_mut()) {
+                    (Ok(test), Some(boot)) => {
+                        let jobs = self.watch.lock()[ring].replay();
+                        let mut result = Ok(test);
+                        for (ticket, job) in jobs {
+                            // SAFETY: OWNER stays held across reset and replay;
+                            // the frozen ledger retains all buffers and VMIDs.
+                            let submitted = match PIPES.get(ring) {
+                                // SAFETY: frozen ledger and OWNER retain the job's VMID and memory.
+                                Some(&pipe) => unsafe { boot.submit_client_job(pipe, job) }
+                                    .map_err(RingError::Queue),
+                                // SAFETY: same retained memory and exclusive SDMA owner.
+                                None => unsafe { boot.submit_client_sdma_job(job) }
+                                    .map_err(RingError::Sdma),
+                            };
+                            match submitted {
+                                Ok(seq) => self.watch.lock()[ring].replayed(ticket, seq),
+                                Err(e) => {
+                                    result = Err(e);
+                                    break;
+                                }
+                            }
+                        }
+                        if result.is_ok() {
+                            // Next normal submission must establish its context.
+                            self.contexts.lock()[ring] = (0, 0);
+                            self.watch.lock()[ring].recovered(narf_time::monotonic_ns());
+                        }
+                        result
+                    }
+                    (Err(e), _) => Err(e),
+                    (Ok(_), None) => unreachable!(),
                 }
             };
             match recovered {
                 Ok(test) => {
-                    self.watch.lock()[ring].recovered();
                     let _ = self.progress();
                     let _ = writeln!(
                         narf_console::Writer,
@@ -413,7 +608,11 @@ impl Submitter {
     /// How job `ticket` ended if not by completing (see `RingWatch`).
     fn job_error(&self, ticket: u64) -> Option<narf_filesystem::FsError> {
         let ring = (ticket >> 32) as usize;
-        self.watch.lock().get(ring)?.error(ticket as u32)
+        let error = self.watch.lock().get(ring)?.error(ticket as u32);
+        error.or_else(|| {
+            (*READ_GENERATION.lock() != self.generation)
+                .then_some(narf_filesystem::FsError::NoDevice)
+        })
     }
 }
 
@@ -502,6 +701,13 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             let result = loop {
                 let mut owner = OWNER.lock().await;
                 let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
+                if health.reset_epoch() != crate::amdgpu_ctx::recoveries() {
+                    health.mark_canceled();
+                    break Err(FsError::Canceled);
+                }
+                if let Some(error) = health.error() {
+                    break Err(error);
+                }
                 // A hung ring takes no more jobs until it is recovered.
                 if let Some(error) = self.watch.lock()[ring as usize].refusing() {
                     break Err(error);
@@ -543,18 +749,18 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                         }
                     }),
                 };
-                if let Ok(seq) = result {
-                    let ticket = u64::from(ring) << 32 | u64::from(seq);
-                    self.vmids.lock().commit(request, grant, ticket);
-                    self.contexts.lock()[ring as usize] = entity;
-                    self.watch.lock()[ring as usize].submitted(
-                        seq,
-                        job.vmid,
+                break result.map(|physical| {
+                    let seq = self.watch.lock()[ring as usize].submitted(
+                        physical,
+                        job,
                         health.clone(),
                         narf_time::monotonic_ns(),
                     );
-                }
-                break result;
+                    let ticket = u64::from(ring) << 32 | u64::from(seq);
+                    self.vmids.lock().commit(request, grant, ticket);
+                    self.contexts.lock()[ring as usize] = entity;
+                    seq
+                });
             };
             let _ = self.progress();
             result.map(|seq| u64::from(ring) << 32 | u64::from(seq))
@@ -619,25 +825,37 @@ async fn prove_queue_interrupts() {
             // SDMA against all other users of the retained GMC test pages.
             let proved = unsafe { boot.prove_sdma_interrupts().await };
             // SDMA0 now runs jobs, so it can clear VRAM past the BAR.
-            if let (Ok(_), Some(reader)) = (proved, boot.client_sdma_fence_reader()) {
-                use core::fmt::Write as _;
-                let progress: SdmaProgress = Arc::new(move || reader.completed().ok());
-                let clearer = VramClearer::new(progress);
-                *CLEARER.lock() = Some(clearer.clone());
-                let _ = match boot.publish_unmapped_vram(Arc::new(clearer)) {
-                    Ok(bytes) => writeln!(
-                        narf_console::Writer,
-                        "amdgpu: navi48 client VRAM past the BAR {} MiB",
-                        bytes >> 20
-                    ),
-                    Err(boot::Error::Busy) => Ok(()),
-                    Err(e) => writeln!(
-                        narf_console::Writer,
-                        "amdgpu: navi48 no client VRAM past the BAR: {e:?}"
-                    ),
-                };
+            if proved.is_ok() {
+                publish_clearer(boot);
             }
         }
+    }
+}
+fn publish_clearer(boot: &mut boot::ColdBoot) {
+    if let Some(reader) = boot.client_sdma_fence_reader() {
+        use core::fmt::Write as _;
+        let generation = *READ_GENERATION.lock();
+        let progress: SdmaProgress = Arc::new(move || {
+            let current = READ_GENERATION.lock();
+            if *current != generation {
+                return None;
+            }
+            reader.completed().ok()
+        });
+        let clearer = VramClearer::new(progress);
+        *CLEARER.lock() = Some(clearer.clone());
+        let _ = match boot.publish_unmapped_vram(Arc::new(clearer)) {
+            Ok(bytes) => writeln!(
+                narf_console::Writer,
+                "amdgpu: navi48 client VRAM past the BAR {} MiB",
+                bytes >> 20
+            ),
+            Err(boot::Error::Busy) => Ok(()),
+            Err(e) => writeln!(
+                narf_console::Writer,
+                "amdgpu: navi48 no client VRAM past the BAR: {e:?}"
+            ),
+        };
     }
 }
 
@@ -831,8 +1049,10 @@ impl VramClearer {
                 // SAFETY: OWNER serializes SDMA0's ring; each range is a
                 // client reservation the GEM layer holds no job can reach
                 // before this job's fence (its KERNEL fence).
-                Some(boot) => unsafe { boot.submit_client_sdma_kernel(&ops) },
-                None => Err(crate::amdgpu_sdma_navi48::Error::DeviceGone),
+                Some(boot) if (self.0.progress)().is_some() => unsafe {
+                    boot.submit_client_sdma_kernel(&ops)
+                },
+                _ => Err(crate::amdgpu_sdma_navi48::Error::DeviceGone),
             };
             match result {
                 // The ring is full: let jobs retire.
@@ -873,6 +1093,9 @@ impl crate::amdgpu_gem::VramClear for VramClearer {
     ) -> Result<Arc<dyn narf_filesystem::DrmFence>, narf_filesystem::FsError> {
         if !clear_fits(address, bytes) {
             return Err(narf_filesystem::FsError::InvalidData);
+        }
+        if (self.0.progress)().is_none() {
+            return Err(narf_filesystem::FsError::NoDevice);
         }
         let fence = Arc::new(ClearFence::new(self.0.progress.clone()));
         let start = {
@@ -1245,6 +1468,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// Pipe of the console's display, for the cursor hook.
 static CURSOR_PIPE: AtomicU8 = AtomicU8::new(0);
+static DISPLAY_GENERATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// The pipe (display) the console runs on.
 pub fn console_pipe() -> u8 {
@@ -2458,6 +2682,8 @@ pub fn restore_displays() {
 /// (lit or left dark), so only a new sink or a returned CRTC relights.
 #[derive(Debug)]
 pub struct Displays {
+    generation: u64,
+    epoch: u64,
     lit: [Option<Modeset>; 4],
     considered: u8,
 }
@@ -2581,6 +2807,18 @@ pub async unsafe fn monitor_displays(
     let mut steps = Vec::new();
     let mut owner = OWNER.lock().await;
     let boot = owner.as_mut().ok_or(ModesetError::Boot(BootError::Busy))?;
+    if displays.generation != DISPLAY_GENERATION.load(Ordering::Acquire) {
+        return Ok(steps);
+    }
+    if displays.epoch != recoveries() {
+        displays.epoch = recoveries();
+        displays.lit = [None; 4];
+        displays.considered = 0;
+        for c in &mut OUTPUTS.lock().crtcs {
+            c.shown = None;
+            c.retiring = false;
+        }
+    }
     // Cancellation may have lost the caller's configuration during a later
     // pipe startup or asynchronous adoption. Restore actual completed witnesses
     // and retire them through the usual CPU withdrawal and native journal.
@@ -2840,9 +3078,14 @@ pub async unsafe fn monitor_displays(
 /// # Safety
 /// As for `modeset_displays`, for the lifetime of the spawned task.
 pub unsafe fn spawn_display_monitor(config: crate::amdgpu_navi48_boot::Configuration) {
+    let generation = DISPLAY_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
     narf_scheduler::spawn(async move {
         use core::fmt::Write;
         let mut displays = Displays {
+            generation,
+            // Empty configuration after reset must relight even if the old
+            // connector inventory still reports every sink present.
+            epoch: recoveries().wrapping_sub(u64::from(config.displays.is_empty())),
             lit: [None; 4],
             considered: 0,
         };
@@ -2854,6 +3097,9 @@ pub unsafe fn spawn_display_monitor(config: crate::amdgpu_navi48_boot::Configura
         }
         {
             let mut owner = OWNER.lock().await;
+            if generation != DISPLAY_GENERATION.load(Ordering::Acquire) {
+                return;
+            }
             if let Some(boot) = owner.as_mut() {
                 // Every board port, whatever the connectors are now.
                 let ports = board_ports(boot);
@@ -2871,6 +3117,9 @@ pub unsafe fn spawn_display_monitor(config: crate::amdgpu_navi48_boot::Configura
         }
         let mut hotplug = None;
         loop {
+            if generation != DISPLAY_GENERATION.load(Ordering::Acquire) {
+                return;
+            }
             let interval = if displays
                 .lit
                 .iter()
@@ -2885,6 +3134,9 @@ pub unsafe fn spawn_display_monitor(config: crate::amdgpu_navi48_boot::Configura
                 // Acknowledge (and re-arm the opposite edge of) every port's
                 // raised HPD/HPD-RX before the pass reads the sense.
                 let mut owner = OWNER.lock().await;
+                if generation != DISPLAY_GENERATION.load(Ordering::Acquire) {
+                    return;
+                }
                 if let Some(boot) = owner.as_mut() {
                     let ports = boot.display_paths().map_or(0, <[_]>::len);
                     for port in 0..ports {

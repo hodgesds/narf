@@ -1072,7 +1072,8 @@ impl Queues {
     /// Reset the hung compute queue's HQD by MMIO (see
     /// `Engine::reset_compute_hqd`).
     /// # Safety
-    /// MES has suspended its gangs, the caller exclusively owns all four
+    /// MES suspended its gangs or completed hung-queue detection identifying
+    /// only this owned HQD after a suspend rejection. The caller owns all four
     /// HQDs on MEC1 pipe 0 and RLC safe mode, nothing else selects GRBM queues
     /// meanwhile, and every job the queue holds keeps its memory until a
     /// later fence on it lands.

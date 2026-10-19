@@ -267,6 +267,57 @@ fn memory() -> QueueMemory {
         doorbell: 0x174,
     }
 }
+
+fn mes12_hung_queue_detection_preserves_slot_identity_and_validates_reports() -> TestResult {
+    let p = detect_hung_queues(QueueType::Compute, 0x123400001040).unwrap();
+    assert!(matches(
+        &p,
+        &[(0, 0x40081), (1, 4), (6, 0x1040), (7, 0x1234), (8, 1)]
+    ));
+    assert!(detect_hung_queues(QueueType::Scheduler, 0x1000).is_err());
+    assert!(detect_hung_queues(QueueType::Compute, 0x1004).is_err());
+    let mut words = [u32::MAX; 8];
+    words[2] = 6;
+    words[6] = 1 | (1 << 3) | (3 << 7);
+    let got = hung_queues(QueueType::Compute, words).unwrap();
+    assert_eq!(
+        got,
+        [
+            None,
+            None,
+            Some(HungQueue {
+                doorbell: 6,
+                kind: QueueType::Compute,
+                pipe: 1,
+                queue: 3
+            }),
+            None
+        ]
+    );
+    for (at, value) in [
+        (2, 7),
+        (2, 1 << 26),
+        (6, 0),
+        (6, 1 << 15),
+        (6, 1 | (2 << 3)),
+        (6, 1 | (4 << 7)),
+    ] {
+        let mut bad = words;
+        bad[at] = value;
+        assert!(hung_queues(QueueType::Compute, bad).is_err());
+    }
+    words[0] = 6;
+    words[4] = 1;
+    assert!(hung_queues(QueueType::Compute, words).is_err());
+    words[0] = 8;
+    words[4] = words[6];
+    assert!(hung_queues(QueueType::Compute, words).is_err());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/mes12",
+    mes12_hung_queue_detection_preserves_slot_identity_and_validates_reports
+);
 fn mes12_mqd_carries_native_fields_and_rejects_aliasing() -> TestResult {
     let words = mqd(memory()).unwrap();
     let expected = [

@@ -10,6 +10,26 @@ use crate::{
 use narf_lib::mutex::Mutex;
 
 static SERVICE: Mutex<Option<Service>> = Mutex::new(None);
+static HALTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub(crate) fn lose() {
+    HALTED.store(true, core::sync::atomic::Ordering::Release);
+    dispatch::TABLE
+        .lock()
+        .fail_all(dispatch::Terminal::DeviceGone);
+}
+static GENERATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Stop and detach the old service before mode1. Its published IH storage
+/// remains quarantined; the old worker's generation can never drain a new IH.
+pub(crate) async fn stop_for_reset() {
+    let mut slot = SERVICE.lock().await;
+    GENERATION.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    if let Some(mut service) = slot.take() {
+        service.stop(dispatch::Terminal::DeviceGone);
+        // Drop quarantines published ring storage; no hardware teardown.
+        drop(service);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Status {
     pub state: ih::State,
@@ -209,6 +229,9 @@ impl Service {
         }
     }
     fn drain(&mut self) -> Result<bool, ih::Error> {
+        if HALTED.load(core::sync::atomic::Ordering::Acquire) {
+            return Err(ih::Error::DeviceGone);
+        }
         self.drained = 0;
         match self.rings.drain() {
             Ok(batch) => {
@@ -306,6 +329,7 @@ pub(crate) unsafe fn install(
         Ok(r) => (Some(r), Ok(None)),
         Err(e) => (None, Err(e)),
     };
+    HALTED.store(false, core::sync::atomic::Ordering::Release);
     *slot = Some(Service {
         rings: rings.take().unwrap(),
         route,
@@ -351,14 +375,18 @@ pub(crate) unsafe fn install(
         return Err(e);
     }
     drop(slot);
-    narf_scheduler::spawn(worker());
+    let generation = GENERATION.load(core::sync::atomic::Ordering::Acquire);
+    narf_scheduler::spawn(worker(generation));
     Ok(())
 }
-async fn worker() {
+async fn worker(generation: u64) {
     let mut cause = Cause::Start;
     loop {
         let vector = {
             let slot = SERVICE.lock().await;
+            if GENERATION.load(core::sync::atomic::Ordering::Acquire) != generation {
+                return;
+            }
             let Some(service) = slot.as_ref() else {
                 return;
             };
@@ -369,6 +397,9 @@ async fn worker() {
         let wait = vector.map(narf_interrupts::wait_for_irq);
         let pending = {
             let mut slot = SERVICE.lock().await;
+            if GENERATION.load(core::sync::atomic::Ordering::Acquire) != generation {
+                return;
+            }
             let Some(service) = slot.as_mut() else {
                 return;
             };

@@ -42,6 +42,18 @@ pub struct Vbios {
     source: Source,
 }
 impl Vbios {
+    /// Retain immutable board metadata for a later reset without rereading ROM.
+    pub(crate) fn try_clone(&self) -> Result<Self, Error> {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(self.bytes.len())
+            .map_err(|_| Error::Allocation)?;
+        bytes.extend_from_slice(&self.bytes);
+        Ok(Self {
+            bytes,
+            source: self.source,
+        })
+    }
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }

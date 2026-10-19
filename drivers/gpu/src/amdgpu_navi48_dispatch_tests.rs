@@ -489,3 +489,24 @@ kernel_test_in!(
     "drivers/gpu/navi48-interrupts",
     navi48_dispatch_registration_is_unique_bounded_and_generation_checked
 );
+
+fn navi48_dispatch_reset_invalidates_every_old_handle() -> TestResult {
+    let mut table = Table::new();
+    let old = table.register(kernel(Key::Cp(GFX))).unwrap();
+    table.fail_all(Terminal::DeviceGone);
+    table.restart();
+    let new = table.register(kernel(Key::Cp(GFX))).unwrap();
+    if old == new || table.slot(old).err() != Some(WaitError::Stale) || table.slot(new).is_err() {
+        return TestResult::Fail("old IH handle names a new queue after reset");
+    }
+    table.fail_all(Terminal::DeviceGone);
+    table.restart();
+    if table.slot(new).err() != Some(WaitError::Stale) {
+        return TestResult::Fail("second reset reused a generation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48_dispatch",
+    navi48_dispatch_reset_invalidates_every_old_handle
+);

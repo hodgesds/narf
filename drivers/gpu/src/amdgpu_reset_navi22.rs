@@ -1,4 +1,4 @@
-//! Navi22 reset on init. A GOP-posted discrete card already runs the
+//! Navi22 reset on init and shared Navi48 mode1 recovery. A GOP-posted discrete card already runs the
 //! VBIOS-started SOS and PMFW; Linux never loads driver firmware over them.
 //! `nv_need_reset_on_init` detects the SOS sign of life (MP0 C2PMSG_81) and
 //! `amdgpu_device_mode1_reset` resets the ASIC before any IP block starts:
@@ -530,6 +530,8 @@ struct Engine<I: Io> {
     authority: Cap<BusDeviceCap, Write>,
     state: State,
     mode: Mode,
+    /// SMU14 debug-mailbox reset and ATOM firmware ASIC_Init v2.1.
+    navi48: bool,
     /// The VBIOS image copied at construction, for ASIC_Init.
     vbios: Option<Vec<u8>>,
     /// `adev->bios_scratch_reg_offset`, a dword index.
@@ -732,7 +734,12 @@ impl<I: Io> Engine<I> {
         let began = self.io.now_ms();
         loop {
             let value = self.access(|io| io.mp0(register))?;
-            if value != u32::MAX && value & READY_MASK == READY {
+            let mask = if self.navi48 && register == BOOTLOADER {
+                READY
+            } else {
+                READY_MASK
+            };
+            if value != u32::MAX && value & mask == READY {
                 return Ok(Ok(value));
             }
             if self.expired(began, ms) {
@@ -761,26 +768,32 @@ impl<I: Io> Engine<I> {
         self.engine_hung(true)?;
         let authority = self.authority;
         self.io.save_and_quiesce(&authority)?;
-        // A version the PMFW cannot report selects the PSP path, as Linux's
-        // is_mode1_reset_supported returns false on a failed query.
-        let smu_version = self.command(GET_SMU_VERSION, 0, true).await.ok();
-        let method = match smu_version {
-            Some(version) if version >= SMU_MODE1_MIN_VERSION => Method::Smu,
-            _ => Method::Psp,
-        };
-        match method {
-            Method::Smu => {
+        let (smu_version, method) = if self.navi48 {
+            // smu_v14_0_2_mode1_reset / smu_msg_v1_send_debug_msg:
+            // parameter, command, response clear. There is NO response poll.
+            self.access(|io| {
+                io.set_mp1(0x75, 0); // regMP1_SMN_C2PMSG_53, base 1
+                io.set_mp1(0x8b, 2); // regMP1_SMN_C2PMSG_75, DEBUGSMC_MSG_Mode1Reset
+                io.set_mp1(0x76, 0); // regMP1_SMN_C2PMSG_54
+            })?;
+            (None, Method::Smu)
+        } else {
+            let version = self.command(GET_SMU_VERSION, 0, true).await.ok();
+            let method = if version.is_some_and(|v| v >= SMU_MODE1_MIN_VERSION) {
                 self.command(MODE1_RESET, 0, false).await?;
-            }
-            Method::Psp => {
+                Method::Smu
+            } else {
                 self.wait_mp0(TOS, REGISTER_MS)
                     .await?
                     .map_err(Error::PspNotReady)?;
                 self.access(|io| io.set_mp0(TOS, GFX_CTRL_CMD_ID_MODE1_RST))?;
-            }
-        }
-        // Config space (BAR decode) is gone until restored: no MMIO here.
-        sleep_ms(SETTLE_MS).await;
+                Method::Psp
+            };
+            (version, method)
+        };
+        // Config space is gone until restored: no MMIO, including liveness
+        // reads, during the Linux-mandated one-second SMU14 settling interval.
+        sleep_ms(if self.navi48 { 1000 } else { SETTLE_MS }).await;
         self.authority.check_live().map_err(|_| Error::Revoked)?;
         self.io.restore(&authority)?;
         self.wait_mp0(BOOTLOADER, BOOTLOADER_MS)
@@ -833,6 +846,7 @@ impl<I: Io> Engine<I> {
             return Ok(post);
         }
         let failed = |error| Error::Post(error);
+        let navi48 = self.navi48;
         let Self {
             io,
             authority,
@@ -850,14 +864,24 @@ impl<I: Io> Engine<I> {
         if image.command(ASIC_INIT) == 0 {
             return Err(failed(PostError::NoAsicInit));
         }
+        if navi48 {
+            let header = image
+                .atom
+                .cmd_table(u16::from(ASIC_INIT))
+                .map_err(|_| failed(PostError::Image))?;
+            if header.get(2) != Some(&2) || header.get(3).is_none_or(|v| *v < 1) {
+                return Err(failed(PostError::Image));
+            }
+        }
         let fb_words = image.fb_scratch_bytes() / 4;
         let mut fb = Vec::new();
         fb.try_reserve_exact(fb_words)
             .map_err(|_| failed(PostError::Allocation))?;
         fb.resize(fb_words, 0);
-        let mut ps = [0u32; 16]; // linux: n/a (uint32_t ps[16] in atom.c:amdgpu_atom_asic_init)
-        ps[0] = sclk;
-        ps[1] = mclk;
+        // ASIC_Init v2.1 has two parameters and sixteen reserved dwords.
+        let mut ps = [0u32; 18];
+        ps[0] = if navi48 { sclk & 0x00ff_ffff } else { sclk };
+        ps[1] = if navi48 { mclk & 0x00ff_ffff } else { mclk };
         post.sclk = sclk;
         post.mclk = mclk;
         post.ran = true;
@@ -878,8 +902,11 @@ impl<I: Io> Engine<I> {
         state.data_table = image.data_table;
         state.fb_scratch = fb;
         let atom = |error, site| failed(PostError::Atom { error, site });
+        // Preserve Navi22's sixteen-dword parameter bound; only the
+        // atomfirmware v2.1 path supplies the larger reserved workspace.
+        let params = if navi48 { &mut ps[..] } else { &mut ps[..16] };
         let mut machine =
-            vm::Machine::start(&mut state, ASIC_INIT, &mut ps).map_err(|e| atom(e, None))?;
+            vm::Machine::start(&mut state, ASIC_INIT, params).map_err(|e| atom(e, None))?;
         loop {
             let step = machine.step(&mut state);
             if state.hooks.revoked {
@@ -923,7 +950,7 @@ impl<I: Io> Engine<I> {
             use core::fmt::Write as _;
             let _ = writeln!(
                 narf_console::Writer,
-                "amdgpu: navi22 post: ASIC_Init ran but scratch7 {after:#x} lacks ASIC_INIT_COMPLETE"
+                "amdgpu: post: ASIC_Init ran but scratch7 {after:#x} lacks ASIC_INIT_COMPLETE"
             );
         }
         Ok(post)
@@ -1044,6 +1071,7 @@ impl Reset {
                 authority,
                 state: State::Prepared,
                 mode: Mode::OnInit,
+                navi48: false,
                 vbios,
                 scratch,
                 post: None,
@@ -1067,6 +1095,66 @@ impl Reset {
         let mut reset = unsafe { Self::new(gpu, authority, device) }?;
         reset.engine.mode = Mode::Recovery;
         Ok(reset)
+    }
+    /// Navi48's unconditional mode1 reset, PCI restore and ASIC_Init v2.1.
+    /// Shares the bounded ATOM interpreter and PCI/MSI/ReBAR preservation
+    /// with Navi22; SMU14 uses a different mailbox and settling interval.
+    /// # Safety
+    /// Exclusively own this physical GPU, PCI configuration and VRAM. Stop
+    /// all software MMIO/VRAM readers and writers, including IH and timestamps.
+    /// Keep every old allocation quarantined. Cancellation is terminal.
+    pub unsafe fn new_navi48_recovery(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        device: BusDevice,
+    ) -> Result<Self, Error> {
+        crate::amdgpu_navi48_firmware::Target::resolve(gpu).map_err(|_| Error::Unsupported)?;
+        if device.id.vendor != gpu.chip.vid || device.id.device != gpu.chip.did {
+            return Err(Error::Invalid);
+        }
+        let bank = |id, versions: &[(u8, u8, u8)], index, last| {
+            crate::amdgpu_psp_ring::bank(gpu, id, versions, index, last)
+                .map_err(|_| Error::Unsupported)
+        };
+        let bytes = gpu
+            .vbios
+            .as_ref()
+            .ok_or(Error::Post(PostError::NoVbios))?
+            .bytes();
+        let mut vbios = Vec::new();
+        vbios
+            .try_reserve_exact(bytes.len())
+            .map_err(|_| Error::Post(PostError::Allocation))?;
+        vbios.extend_from_slice(bytes);
+        let scratch = Image::parse(bytes)
+            .and_then(|i| i.scratch_base())
+            .ok_or(Error::Post(PostError::Image))?;
+        if (u64::from(scratch) + 8) * 4 > gpu.regs.len {
+            return Err(Error::Invalid);
+        }
+        let nbif = &[(7, 7, 0), (7, 7, 1), (6, 3, 1)];
+        let pcie = u32::try_from(bank(discovery::HW_ID_NBIF, nbif, 0, PCIE_DATA2)? / 4)
+            .map_err(|_| Error::Invalid)?;
+        Ok(Self {
+            engine: Engine {
+                io: Mmio {
+                    regs: gpu.regs,
+                    mp0: bank(discovery::HW_ID_MP0, &[(14, 0, 2), (14, 0, 3)], 0, SOS)?,
+                    mp1: bank(discovery::HW_ID_MP1, &[(14, 0, 2), (14, 0, 3)], 1, 0x9a)?,
+                    pcie: (pcie + PCIE_INDEX2, pcie + PCIE_DATA2),
+                    memsize: bank(discovery::HW_ID_NBIF, nbif, 2, MEMSIZE)?,
+                    device,
+                    saved: None,
+                },
+                authority,
+                state: State::Prepared,
+                mode: Mode::Recovery,
+                navi48: true,
+                vbios: Some(vbios),
+                scratch,
+                post: None,
+            },
+        })
     }
     pub fn mode(&self) -> Mode {
         self.engine.mode

@@ -21,6 +21,8 @@ const API_FENCE: u64 = RPTR + 16;
 const DRAIN: u64 = RPTR + 24;
 const CONTEXT: u64 = RPTR + 32;
 const QUERY: u64 = RPTR + 40;
+// The rest of the writeback page is unused; keep detection on its own line.
+const HUNG: u64 = RPTR + 64;
 const CLEANER: u64 = 16384; // firmware owns a complete resource_1 page
 const DOORBELLS: [u32; 2] = [0x16, 0x18]; // dwords, soc24/Navi10 assignment
 const AGGREGATED: [u32; 5] = [0x400, 0x402, 0x404, 0x406, 0x408];
@@ -500,7 +502,12 @@ impl<I: Io> Engine<I> {
                         self.completed[pipe] = seq;
                         return Ok(());
                     }
-                    api::Completion::Rejected(e) => return Err(Error::FirmwareRejected(e)),
+                    api::Completion::Rejected(e) => {
+                        // The query drained this command even though its API
+                        // failed. A follow-up must not reuse its drain value.
+                        self.completed[pipe] = seq;
+                        return Err(Error::FirmwareRejected(e));
+                    }
                     api::Completion::Pending => {}
                 }
             }
@@ -557,6 +564,62 @@ impl<I: Io> Engine<I> {
             api::resume_all()
         };
         self.recovery_command(packet).await
+    }
+    async fn detect_hung_queues(
+        &mut self,
+    ) -> Result<[Option<api::HungQueue>; api::HUNG_QUEUES], Error> {
+        if self.state != State::Ready {
+            return Err(Error::Busy);
+        }
+        let map = self.memory.mapping();
+        let l = self.layout;
+        let packet = api::detect_hung_queues(api::QueueType::Compute, self.memory.address() + HUNG)
+            .map_err(|_| Error::Invalid)?;
+        self.access(|io| {
+            for i in 0..api::HUNG_QUEUES * 2 {
+                io.memory_write(map, HUNG + i as u64 * 4, u32::MAX);
+            }
+            flush(io, l);
+            Ok(())
+        })?;
+        self.recovery_command(packet).await?;
+        let result = self.access(|io| {
+            flush(io, l);
+            let mut words = [0; api::HUNG_QUEUES * 2];
+            for (i, pair) in words.chunks_exact_mut(2).enumerate() {
+                let value = io.memory_read64(map, HUNG + i as u64 * 8);
+                pair[0] = value as u32;
+                pair[1] = (value >> 32) as u32;
+            }
+            api::hung_queues(api::QueueType::Compute, words).map_err(|_| Error::Protocol)
+        });
+        if let Err(error) = result {
+            self.state = State::Failed(error);
+        }
+        result
+    }
+    /// A fully drained suspend rejection permits Linux's detect-only path.
+    /// Timeout/cancellation cannot reuse a command ring still in flight.
+    async fn prepare_compute_reset(&mut self, queue: api::KernelQueue) -> Result<(), Error> {
+        self.ready_for(queue)?;
+        if queue.kind != api::QueueType::Compute {
+            return Err(Error::Invalid);
+        }
+        match self.all_gangs(true).await {
+            Ok(()) => Ok(()),
+            Err(Error::FirmwareRejected(_)) => {
+                let hung = self.detect_hung_queues().await?;
+                if hung.iter().flatten().any(|h| {
+                    h.doorbell != queue.doorbell || h.pipe != queue.pipe || h.queue != queue.queue
+                }) {
+                    // We own only this KCQ. Never reset a foreign user/KFD
+                    // queue or continue with an incomplete ownership proof.
+                    return Err(Error::Unsupported);
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
     /// MES is ready and `queue` is one of the two bootstrap kernel queues.
     fn ready_for(&self, queue: api::KernelQueue) -> Result<(), Error> {
@@ -752,6 +815,17 @@ impl Mes {
     /// The caller owns MES and resumes after every suspend.
     pub(crate) async unsafe fn all_gangs(&mut self, suspend: bool) -> Result<(), Error> {
         self.0.all_gangs(suspend).await
+    }
+    /// Suspend compute gangs, or identify the owned hung HQD after a drained
+    /// suspend rejection. A failed/unknown command stream remains quarantined.
+    /// # Safety
+    /// The caller exclusively owns the compute pipe and resumes all gangs on
+    /// returned paths; no user or KFD queues may be created concurrently.
+    pub(crate) async unsafe fn prepare_compute_reset(
+        &mut self,
+        queue: api::KernelQueue,
+    ) -> Result<(), Error> {
+        self.0.prepare_compute_reset(queue).await
     }
 }
 

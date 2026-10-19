@@ -171,3 +171,24 @@ kernel_test_in!(
     "drivers/gpu/navi48_boot",
     navi48_client_vram_keeps_a_bounded_driver_reserve
 );
+
+/// Recovery builds a fresh owner while retaining the old one. Bound the
+/// by-value owner/result to leave room for nested frames on the 64 KiB ARM
+/// boot stack; actual stack use still depends on compiler-generated frames.
+fn navi48_boot_recovery_owner_has_bounded_stack_payload() -> TestResult {
+    let owner = core::mem::size_of::<ColdBoot>();
+    let result = core::mem::size_of::<Result<ColdBoot, Error>>();
+    if owner > 16 * 1024 || result > 16 * 1024 {
+        use core::fmt::Write;
+        let _ = writeln!(
+            narf_console::Writer,
+            "Navi48 owner bytes={owner} result bytes={result}"
+        );
+        return TestResult::Fail("Navi48 recovery owner exceeds stack budget");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48_boot",
+    navi48_boot_recovery_owner_has_bounded_stack_payload
+);

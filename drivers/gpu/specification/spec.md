@@ -2618,7 +2618,11 @@ This stage makes command processors available but publishes no application queue
 alignment, separately from MES11's four-byte alignment. It provides bounded
 SET_HW_RSRC/SET_HW_RSRC_1, query-status and native kernel queue map/unmap
 commands, typed completion binding and API-error decoding only after the
-trailing query fence drains. Native MQDs use `v12_compute_mqd`, including
+trailing query fence drains. A drained rejection advances the command sequence
+just like a success, preventing reuse of its trailing completion fence.
+`detect_hung_queues(QueueType, output)` emits RESET's detect-only variant;
+`hung_queues` decodes four doorbells and four corresponding packed HQD IDs,
+preserving holes and rejecting duplicate, reserved, misaligned or invalid IDs. Native MQDs use `v12_compute_mqd`, including
 `DB_UPDATED_MSG_EN`, privileged VMID0 and the MES-owned read pointer. Descriptor,
 ring, EOP and pointer ranges must be aligned, disjoint and within 48 bits;
 resources never delegate VMID0 to the scheduler. `tests/mes12_layout.c` checks
@@ -4956,11 +4960,12 @@ Timeouts (`amdgpu_ring_watch`): `Submitter::submit` takes the submitting
 context's `amdgpu_ctx::Health`. A `RingWatch` per ring follows its jobs;
 the front job's timeout (`JOB_TIMEOUT_NS`, amdgpu's 2 s lockup default)
 counts from when it reached the front, and past it the ring is hung: that
-job's `Submitter::error` is `TimedOut` and its context guilty, each later
-job not yet complete is `Canceled` and its context records that, and the
-ring refuses new jobs (`Canceled`). `Submitter::signalled` then reports
-those jobs ended, so waiters return, but `retire` — what frees their
-memory, page tables and VMIDs — still waits for the hardware fence.
+job's `Submitter::error` is `TimedOut` and its context guilty. The ring
+refuses new jobs (`Canceled`) and freezes memory retirement. Later jobs in
+healthy contexts remain pending for replay; jobs in a guilty/canceled context
+are skipped with `Canceled` after reset. Error completion wakes waiters but
+never alone releases buffers, page tables or VMIDs. `RingWatch` retains each
+job descriptor, context health, logical ticket and its hardware fence.
 `AMDGPU_WAIT_CS` of an ended job with an error fails with it
 (amdgpu_cs_wait_ioctl); `AMDGPU_CS` on a context with an error fails with
 it before queueing (amdgpu_ctx_get_entity); `CTX QUERY_STATE2` reports
@@ -4973,12 +4978,15 @@ HQD's pipe, queue, VMID, MQD, doorbell and write pointer; other queues by
 doorbell with `reset_queue_only`), then `Queues::submit_fence` queues a
 fence-only slot as the ring test, which needs a free slot and must land
 within 100 ms (`ColdBoot::recover_client_ring`). Only then does
-`RingWatch::recovered` let the ring take jobs again; the hung and canceled
-jobs keep their errors (`RingWatch::error` remembers the last hang), and
-their memory is retired by the test fence, the first proof the CP moved
-past them. A hung compute ring is recovered as gfx_v12_0_reset_kcq
+the platform re-emits healthy jobs, forcing VM flush, PASID mapping and
+context reload, and binds their original tickets to the new hardware fences.
+`RingWatch::recovered` reopens retirement only after every replay is published.
+The test fence permits retirement of skipped jobs only; innocent jobs keep
+all memory until their translated replay fence passes. Errors survive later
+resets. Cancellation or failed replay leaves the ledger frozen. A hung compute ring is recovered as gfx_v12_0_reset_kcq
 (amdgpu_gfx_reset_mes_compute; GFX12 resets MEC queues by MMIO):
-`Mes::all_gangs(true)` (MES12 SUSPEND, `amdgpu_mes12::suspend_all`), then
+`Mes::prepare_compute_reset` first attempts MES12 SUSPEND
+(`amdgpu_mes12::suspend_all`), then
 `Queues::reset_compute_hqd` (RLC safe mode when RLC is enabled, with a
 100 ms acknowledgement deadline; with the compute queue selected in
 GRBM_GFX_CNTL, CP_HQD_DEQUEUE_REQUEST 2 and SPI_COMPUTE_QUEUE_RESET 1, then
@@ -5001,9 +5009,12 @@ scheduler firmware 0x5a+, `amdgpu_mes12::unmap_reset_kernel_queue`),
 `Queues::restore` (the descriptor as first built, a ring of
 PACKET3(NOP, 0x3fff), read and write pointers 0) and
 `Mes::map_bootstrap_queue`; `Mes::all_gangs(false)` (RESUME,
-`resume_all`) is attempted on every returned path, and the same ring test closes it. A
-failed suspend stops recovery before MMIO writes (Linux's MES hung-queue
-detection is not implemented). A hung SDMA0 ring is recovered as
+`resume_all`) is attempted on every returned path and must succeed before the
+same ring test closes recovery. A fully drained firmware rejection of SUSPEND
+runs MES detect-only against an independently initialized report area. Only
+an empty report or this owner's exact compute doorbell/pipe/HQD permits MMIO;
+a foreign queue refuses recovery, a malformed report fails MES, and timeout
+or cancellation leaves MES quarantined without submitting another command. A hung SDMA0 ring is recovered as
 sdma_v7_0_reset_queue (`ColdBoot::recover_client_sdma`):
 `Sdma::reset_ring` writes SDMA0_QUEUE_RESET_REQ bit 0 and waits up to 100
 ms for the engine to clear it, then programs the ring as
@@ -5014,8 +5025,38 @@ queued slot; `Sdma::submit_fence` is the ring test. Before the test,
 completed, and the platform puts every VRAM clear its ring held past it
 back at the front of the clear queue, unsignalled (`ClearState::requeue`),
 so a clear's fence never reads complete off the test's fence. Innocent
-client jobs are not re-emitted. VRAM clear fences follow SDMA0's hardware
-fence only, never a timeout's verdict.
+client jobs use the same logical-ticket replay as GC12. VRAM clear fences
+follow SDMA0's hardware fence only, never a timeout's verdict.
+
+`unsafe amdgpu_navi48_platform::recover().await` is explicit whole-device
+recovery after ring recovery fails. Its caller must stop every CPU VRAM/GOP
+and mmap accessor and exclude external PCI/firmware owners; the watchdog
+cannot establish these exclusions and does not automatically invoke it.
+Preflight refuses boots that needed GDDR6 training replay. The platform
+withdraws CS, client VRAM allocation, scanout and timestamps, drains CPU views,
+stops the old IH service, and advances the lock-protected fence-reader
+generation. Old fence readers and clear workers cannot access the new owner.
+Failure/cancellation quarantines the retained owner and refuses another reset.
+
+`amdgpu_reset_navi22::Reset::new_navi48_recovery` shares bounded PCI/ReBAR/MSI
+save/restore and the ATOM interpreter with Navi22, using exact Navi48 banks.
+SMU14 mode1 writes debug parameter 0, command 2 and response 0, then waits
+one second without MMIO before restoring PCI decoding. PSP14 bootloader and
+NBIO MEMSIZE waits are bounded. ASIC_Init requires command revision 2.1+,
+normal engine/memory flags, 24-bit boot clocks and sixteen reserved dwords.
+The fresh boot owner reruns firmware, GMC, IH, MES and ring proofs, then the
+CPU interrupt proofs, before publishing submission again. Old published
+firmware/display reservations stay quarantined; client heap allocators retain
+live allocations. VRAM contents are lost and old contexts report reset; new
+contexts are required for submission. The reset counter remains global as in
+the existing Navi22 context-query implementation. Old tickets retain their
+errors and numbering; new hardware sequences start independently. Late
+memory deferrals are covered by the successor ledger. IH registrations gain
+new generations. Power and previously enabled display monitoring restart with
+new worker generations; the display monitor discards old modeset witnesses
+before relighting. The firmware sequence is boxed and the by-value owner/result
+payload is bounded in tests to leave stack space for recovery. Physical
+reset/replay acceptance remains unverified.
 
 The Navi48 platform registers both kernel queues as its card's submitter
 after boot: up to eight IBs per submission (`Job::new`, in order in one

@@ -92,6 +92,7 @@ pub enum Error {
     Queues(queues::Error),
     Interrupts(ih::Error),
     Faults(faults::Error),
+    Reset(crate::amdgpu_reset_navi22::Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -457,7 +458,8 @@ impl Backend for Hardware {
 }
 #[derive(Debug)]
 pub struct ColdBoot {
-    sequence: Sequence<Hardware>,
+    sequence: alloc::boxed::Box<Sequence<Hardware>>,
+    reset: Option<crate::amdgpu_reset_navi22::Reset>,
     display: Result<display::Probe, display::Error>,
     ddc: Result<ddc::Ddc, display::Error>,
     crystal: Result<u32, display::Error>,
@@ -591,7 +593,12 @@ impl ColdBoot {
             vram: gpu.vram,
             ip_blocks: blocks,
             gc_info: gpu.gc_info,
-            vbios: None,
+            vbios: gpu
+                .vbios
+                .as_ref()
+                .map(|v| v.try_clone())
+                .transpose()
+                .map_err(|_| Error::Allocation)?,
             mode: None,
             fw_loaded: false,
         };
@@ -625,7 +632,8 @@ impl ColdBoot {
             client_vram: None,
             client_heap: None,
             unmapped_vram: unmapped,
-            sequence: Sequence {
+            reset: None,
+            sequence: alloc::boxed::Box::new(Sequence {
                 backend: Hardware {
                     gpu: saved,
                     pci,
@@ -653,8 +661,86 @@ impl ColdBoot {
                     queues: None,
                 },
                 state: State::Prepared,
-            },
+            }),
         })
+    }
+    /// Prepare reset before withdrawing any service. Training replay is not
+    /// supported; refuse that configuration before changing hardware.
+    pub(crate) fn prepare_reset(&mut self) -> Result<(), Error> {
+        if self.sequence.backend.trainer.is_some() {
+            return Err(Error::Unsupported);
+        }
+        if self.state() != State::MemoryReady || self.reset.is_some() {
+            return Err(Error::Busy);
+        }
+        let hw = &self.sequence.backend;
+        // SAFETY: preparation performs no writes; the platform establishes
+        // exclusive reader/writer exclusion before polling run_reset.
+        self.reset = Some(
+            unsafe {
+                crate::amdgpu_reset_navi22::Reset::new_navi48_recovery(
+                    &hw.gpu,
+                    hw.authority,
+                    hw.pci,
+                )
+            }
+            .map_err(Error::Reset)?,
+        );
+        Ok(())
+    }
+    /// # Safety
+    /// Stop every external register/VRAM accessor, including IH and clock
+    /// readers. Retain this owner on failure/cancellation; never retry it.
+    pub(crate) async unsafe fn run_reset(&mut self) -> Result<(), Error> {
+        self.reset
+            .as_mut()
+            .ok_or(Error::Invalid)?
+            .run()
+            .await
+            .map_err(Error::Reset)?;
+        Ok(())
+    }
+    /// Fresh firmware/queue/display owners after a proven full reset. Old
+    /// reservations stay quarantined; the client heap's allocator is reused
+    /// so live allocations cannot overlap the new owner's reservations.
+    pub(crate) unsafe fn after_reset(&mut self) -> Result<Self, Error> {
+        if !matches!(
+            self.reset.as_ref().map(|r| r.state()),
+            Some(crate::amdgpu_reset_navi22::State::Complete(_))
+        ) {
+            return Err(Error::Busy);
+        }
+        let hw = &self.sequence.backend;
+        let registry: Cap<narf_firmware::FirmwareRegistry, Read> =
+            narf_firmware::trusted_loader_authority()
+                .ok_or(Error::Invalid)?
+                .derive()
+                .map_err(|_| Error::Revoked)?;
+        let firmware = Firmware::open(&hw.gpu, &registry, gfx::MesMode::Unified)?;
+        // SAFETY: reset and ASIC_Init completed; old owners are never polled
+        // again, their published reservations remain excluded by this pool.
+        let mut new = unsafe {
+            Self::new(
+                &hw.gpu,
+                hw.pci,
+                hw.authority,
+                &hw.pool,
+                self.unmapped_vram.clone(),
+                firmware,
+                None,
+            )
+        }?;
+        new.client_heap = self.client_heap.take();
+        if let Some(heap) = &mut new.client_heap {
+            heap.unmapped = None;
+        }
+        new.client_vram = self.client_vram.take();
+        Ok(new)
+    }
+    pub(crate) fn republish_client_vram(&self) {
+        if let (Some(card), Some(heap)) = (Self::drm_card(), &self.client_heap) {
+            crate::amdgpu_gem::register_vram_heap(card, heap.clone());
+        }
     }
     pub fn state(&self) -> State {
         self.sequence.state
@@ -747,9 +833,9 @@ impl ColdBoot {
     /// every earlier slot, so the hung and abandoned jobs' fences read
     /// complete through it. Returns that fence's sequence.
     ///
-    /// LINUX-GAP: the jobs behind the hung one are not re-emitted. A failed
-    /// suspend does not ask MES which other queues hung; it fails recovery
-    /// before any MMIO reset. There are no user or KFD queues yet.
+    /// A drained suspend rejection asks MES which queues hung before MMIO;
+    /// a report naming a foreign queue refuses recovery. An undrained MES
+    /// command requires whole-device recovery. No user or KFD queues exist.
     /// # Safety
     /// As `submit_client_job`, and every job on the ring keeps what it
     /// reaches until this returns Ok.
@@ -770,11 +856,11 @@ impl ColdBoot {
                 .map_err(queues::Error::Mes)?,
             queues::Pipe::Compute => {
                 // SAFETY: as above; every suspend is followed by a resume.
-                let suspended = unsafe { mes.all_gangs(true) }.await;
+                let suspended = unsafe { mes.prepare_compute_reset(queue) }.await;
                 let reset = async {
                     suspended.map_err(queues::Error::Mes)?;
-                    // SAFETY: the gangs are suspended and OWNER keeps every
-                    // other GRBM selector user out.
+                    // SAFETY: gangs suspended or MES identified only our
+                    // owned hung HQD; OWNER excludes other GRBM selector users.
                     unsafe { queues.reset_compute_hqd() }.await?;
                     // SAFETY: the HQD was just reset.
                     unsafe { mes.unmap_reset_queue(queue) }
@@ -789,11 +875,12 @@ impl ColdBoot {
                         .map_err(queues::Error::Mes)
                 }
                 .await;
-                // amdgpu_mes_resume runs on every path; its result is not the
-                // reset's.
+                // Resume on every returned path, but never reopen submissions
+                // when MES did not confirm that scheduling resumed.
                 // SAFETY: resumes the suspend above.
-                let _ = unsafe { mes.all_gangs(false) }.await;
+                let resumed = unsafe { mes.all_gangs(false) }.await;
                 reset?;
+                resumed.map_err(queues::Error::Mes)?;
             }
         }
         // SAFETY: as above; the slot reaches only the queue's own fence.
@@ -819,9 +906,8 @@ impl ColdBoot {
     /// will read complete through the test's fence. Returns that fence's
     /// sequence.
     ///
-    /// LINUX-GAP: Linux re-emits the skipped jobs that did not hang; here
-    /// only the caller's kernel work runs again (`skipped`), and client
-    /// jobs stay canceled.
+    /// The platform replays healthy client jobs after this test under their
+    /// original logical tickets; `skipped` separately requeues kernel clears.
     /// # Safety
     /// As `submit_client_sdma_job`, and every job on the ring keeps what it
     /// reaches until this returns Ok. Work that must not be skipped is

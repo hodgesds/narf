@@ -67,22 +67,33 @@ pub struct Context {
     pub reset_queried: u64,
 }
 
-/// GPU recoveries completed since boot. Only Navi 22 has a recovery owner;
-/// every other device reads a counter that never moves.
+/// GPU recoveries completed since boot (Navi22 and Navi48 owners).
+/// LINUX-GAP: this historical counter is global, not per DRM card.
 pub fn recoveries() -> u64 {
     crate::amdgpu_navi22_recovery::recoveries()
+        .wrapping_add(crate::amdgpu_navi48_platform::recoveries())
 }
 
 /// What became of a context's jobs: the engine records a hang here, and
 /// the context's later submissions and queries read it.
-#[derive(Debug, Default)]
-pub struct Health(AtomicU8);
+#[derive(Debug)]
+pub struct Health(AtomicU8, u64);
+impl Default for Health {
+    fn default() -> Self {
+        Self(AtomicU8::new(HEALTHY), recoveries())
+    }
+}
 
 const HEALTHY: u8 = 0;
 const CANCELED: u8 = 1;
 const GUILTY: u8 = 2;
 
 impl Health {
+    /// Reset generation at context creation, checked again under the GPU
+    /// owner lock so a submission waiting through reset cannot use lost VRAM.
+    pub(crate) fn reset_epoch(&self) -> u64 {
+        self.1
+    }
     /// A job of this context hung (`-ETIME`): it is guilty.
     pub fn mark_guilty(&self) {
         self.0.store(GUILTY, Ordering::Release);
