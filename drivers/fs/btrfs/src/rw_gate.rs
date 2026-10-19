@@ -429,7 +429,7 @@ const ORPHAN_OBJECTID: u64 = (-5i64) as u64;
 const ORPHAN_ITEM_KEY: u8 = 48;
 /// `btrfs_root_item` field offsets.
 const ROOT_ITEM_BYTENR: usize = 176;
-const ROOT_ITEM_LAST_SNAPSHOT: usize = 200;
+pub(crate) const ROOT_ITEM_LAST_SNAPSHOT: usize = 200;
 const ROOT_ITEM_REFS: usize = 216;
 const ROOT_ITEM_DROP_PROGRESS: usize = 220;
 const ROOT_ITEM_DROP_LEVEL: usize = 237;
@@ -447,7 +447,7 @@ pub const SHARED_DATA_REF_KEY: u8 = 184;
 /// (`update_ref_for_cow`). Until it does, any sharing is refused here.
 pub const WRITER_HANDLES_SHARED_TREES: bool = true;
 
-fn is_fs_tree(id: u64) -> bool {
+pub(crate) fn is_fs_tree(id: u64) -> bool {
     id == format::FS_TREE_OBJECTID
         || (format::FIRST_FREE_OBJECTID..=format::LAST_FREE_OBJECTID).contains(&id)
 }

@@ -469,3 +469,48 @@ kernel_test_in!(
     "drivers/fs/btrfs",
     smoke_btrfs_snapshot_fixture_refs_consistent
 );
+
+/// Full qgroups on a filesystem with snapshots are not recounted (the walk
+/// would charge shared blocks to every referencing tree): enabling them and
+/// writing leaves the status INCONSISTENT with a rescan pending, so Linux
+/// rescans instead of trusting wrong numbers.
+fn smoke_btrfs_qgroups_on_snapshotted_fs_marked_inconsistent() -> TestResult {
+    const STATUS_INCONSISTENT: u64 = 1 << 2;
+    let dev = writable_sparse(FIXTURE_SNAPSHOTS_SPARSE);
+    let vol = match mount_id(&dev, ROOT_SV) {
+        Ok(v) if v.supports_writes() => v,
+        _ => return TestResult::Fail("@ did not mount writable"),
+    };
+    if !matches!(poll_once(crate::write::quota_enable(&*vol)), Some(Ok(()))) {
+        return TestResult::Fail("quota enable failed");
+    }
+    let root = vol.root();
+    let Some(Ok(f)) = poll_once(root.create("after-quota.txt")) else {
+        return TestResult::Fail("create failed");
+    };
+    if !matches!(poll_once(f.write(0, b"q\n")), Some(Ok(2)))
+        || !matches!(poll_once(vol.sync_to_disk()), Some(Ok(())))
+    {
+        return TestResult::Fail("write/sync under qgroups failed");
+    }
+    let (root_tree, _) = vol.root_tree_root();
+    let Some(Ok((quota_root, _))) = poll_once(crate::roots::find_root(
+        &*vol,
+        root_tree,
+        format::QUOTA_TREE_OBJECTID,
+    )) else {
+        return TestResult::Fail("no quota tree");
+    };
+    let key = BtrfsKey::new(0, format::QGROUP_STATUS_KEY, 0);
+    match poll_once(btree::find_item(&*vol, quota_root, &key)) {
+        Some(Ok(Some(status))) if le64(&status, 16).unwrap_or(0) & STATUS_INCONSISTENT != 0 => {
+            TestResult::Pass
+        }
+        Some(Ok(Some(_))) => TestResult::Fail("qgroups recounted on a snapshotted filesystem"),
+        _ => TestResult::Fail("no qgroup status item"),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_qgroups_on_snapshotted_fs_marked_inconsistent
+);

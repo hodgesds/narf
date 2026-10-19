@@ -4216,6 +4216,24 @@ async fn qgroup_reserve<B: BlockDevice + 'static>(
     Ok(())
 }
 
+/// Whether any subvolume ROOT_ITEM in the (logical) root-tree leaf
+/// `root_logical` records a snapshot (`last_snapshot != 0`), i.e. the
+/// filesystem has shared tree blocks.
+pub(crate) fn has_snapshotted_subvolume(root_logical: &[u8]) -> Result<bool, FsError> {
+    for slot in 0..nritems(root_logical)? as usize {
+        let key = leaf_item_key(root_logical, slot)?;
+        if key.item_type != format::ROOT_ITEM_KEY || !crate::rw_gate::is_fs_tree(key.objectid) {
+            continue;
+        }
+        let body = leaf_item_data(root_logical, slot)?;
+        let last = format::le64(body, crate::rw_gate::ROOT_ITEM_LAST_SNAPSHOT).unwrap_or(0);
+        if last != 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 struct QuotaChange<'a> {
     root_logical: &'a [u8],
     pending: &'a BTreeMap<u64, Vec<u8>>,
@@ -4364,8 +4382,15 @@ async fn prepare_quota_tree<B: BlockDevice + 'static>(
     // from the start (Linux `BTRFS_QGROUP_STATUS_FLAG_INCONSISTENT |
     // _RESCAN`, progress 0): the next Linux mount rescans them itself, and
     // nothing NARF records is ever wrong.
-    let defer_rescan =
-        !simple_mode && crate::rw_gate::active_profile() == crate::rw_gate::Profile::RootRw;
+    //
+    // The same applies to any filesystem with snapshots: a subvolume root
+    // with a nonzero `last_snapshot` has shared blocks, which the walk below
+    // charges to every tree that references them instead of splitting
+    // referenced from exclusive as Linux does. Plausible-but-wrong numbers
+    // are worse than a pending rescan, so those are deferred too.
+    let defer_rescan = !simple_mode
+        && (crate::rw_gate::active_profile() == crate::rw_gate::Profile::RootRw
+            || has_snapshotted_subvolume(change.root_logical)?);
     if defer_rescan {
         status[8..16].copy_from_slice(&gen.to_le_bytes());
         let flags = QGROUP_STATUS_ON | QGROUP_STATUS_INCONSISTENT | QGROUP_STATUS_RESCAN;
