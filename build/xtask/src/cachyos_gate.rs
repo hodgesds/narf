@@ -1358,31 +1358,53 @@ impl Gate {
             p.name()
         );
         let mut vm = Vm::spawn(self.narf_cmd(), &log, self.args.verbose)?;
-        // Stage watchdog: GRUB must run the bundle stanza and Limine must
-        // hand over to NARF (its first console line) well before the login
-        // timeout. A hang before the kernel runs (firmware/GRUB/Limine) is
-        // retried once and listed in the `boot chain` row; nothing but the
-        // firmware has run, so no disk can have been written.
-        for attempt in 0..2 {
+        // Stage watchdog: the firmware must reach its boot manager, GRUB
+        // must run the bundle stanza and Limine must hand over to NARF (its
+        // first console line) well before the login timeout. A hang before
+        // the kernel runs (firmware/GRUB/Limine) is retried and listed in the
+        // `boot chain` row; nothing but the firmware has run, so no disk can
+        // have been written.
+        //
+        // The hangs seen are OVMF's, between its console setup and the boot
+        // manager (`BdsDxe:` never printed), and they track host CPU
+        // oversubscription: idle, 0 of 166 boots of this exact QEMU command
+        // line hung; with 14 busy loops on a 12-thread host, boots slowed
+        // from ~2 s to 12-58 s and 7 of 60 never got there (one watched for
+        // 400 s), with `-smp 2` as with `-smp 4`, `-cpu host` as `max`, with
+        // or without the USB devices, but not in 6 boots with `-smp 1`:
+        // OVMF's multi-processor bring-up, its vCPUs preempted by the host.
+        // A host that busy (other QEMU jobs) can hit it twice in a row, so
+        // the firmware stage gets its own short watchdog and up to three
+        // retries.
+        const PREKERNEL_ATTEMPTS: usize = 4;
+        for attempt in 0..PREKERNEL_ATTEMPTS {
             let stage = vm
-                .wait_for(&["Booting `NARF'"], Duration::from_secs(120))
-                .map_err(|_| "GRUB never ran the bundle stanza (120 s)")
+                .wait_for(&["BdsDxe: loading"], Duration::from_secs(60))
+                .map_err(|_| "OVMF never reached its boot manager (60 s)")
+                .and_then(|_| {
+                    vm.wait_for(&["Booting `NARF'"], Duration::from_secs(120))
+                        .map_err(|_| "GRUB never ran the bundle stanza (120 s)")
+                })
                 .and_then(|_| {
                     vm.wait_for(&[KERNEL_HELLO], Duration::from_secs(180))
                         .map_err(|_| "Limine never handed over to NARF (180 s)")
                 });
             match stage {
                 Ok(_) => break,
-                Err(why) if attempt == 0 => {
+                Err(why) if attempt + 1 < PREKERNEL_ATTEMPTS => {
                     vm.kill();
                     self.prekernel_hangs
                         .push(format!("boot {} ({label}): {why}", self.boots));
-                    let retry = self
-                        .logs
-                        .join(format!("{:02}-{label}.retry.serial.log", self.boots));
+                    let retry = self.logs.join(format!(
+                        "{:02}-{label}.retry{}.serial.log",
+                        self.boots,
+                        attempt + 1
+                    ));
                     vm = Vm::spawn(self.narf_cmd(), &retry, self.args.verbose)?;
                 }
-                Err(why) => return Err(vm.err(&format!("{why}, also on the retry"))),
+                Err(why) => {
+                    return Err(vm.err(&format!("{why}, on all {PREKERNEL_ATTEMPTS} attempts")));
+                }
             }
         }
         vm.wait_for(&["disks: POLICY narf.disks="], Duration::from_secs(240))
