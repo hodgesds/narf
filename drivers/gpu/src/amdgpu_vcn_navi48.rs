@@ -42,7 +42,7 @@ pub enum State {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Proof {
     pub sequence: u32,
-    /// Monotonic dword pointers, not masked ring offsets.
+    /// Observed dword ring pointer (the initial proofs do not wrap).
     pub read_pointer: u32,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,6 +100,8 @@ struct Layout {
     vcn: u64,
     nbio: u64,
     gc: u64,
+    mm: u64,
+    oss: u64,
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
@@ -122,6 +124,10 @@ impl Layout {
                 .map_err(|_| Error::Unsupported)?,
             gc: bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 0, 0x263e)
                 .map_err(|_| Error::Unsupported)?,
+            mm: bank(gpu, ip::HW_ID_MMHUB, &[(4, 1, 0)], 0, 0x62e)
+                .map_err(|_| Error::Unsupported)?,
+            oss: bank(gpu, ip::HW_ID_OSSSYS, &[(7, 0, 0)], 0, 0x1f)
+                .map_err(|_| Error::Unsupported)?,
         })
     }
 }
@@ -137,7 +143,7 @@ trait Io {
         narf_time::SleepUntil::new(narf_time::Deadline::after_us(us).as_instant()).await;
     }
 }
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 struct Mmio {
     regs: MmioRegion,
     doorbells: MmioRegion,
@@ -405,14 +411,17 @@ impl<I: Io> Engine<I> {
         ) {
             return Err(Error::Busy);
         }
-        if words.is_empty() || words.len() > 1023 {
+        if words.is_empty() || words.len() > 960 {
             return Err(Error::Invalid);
         }
         let padded = (words.len() as u32 + 63) & !63;
-        let next = self.wptr.wrapping_add(padded);
-        if next.wrapping_sub(self.reg(RPTR)?) > 1024 {
+        // VCN has no support_64bit_ptrs: amdgpu_ring's ptr_mask is its
+        // buf_mask. Leave space so equal masked pointers mean empty.
+        let pending = self.wptr.wrapping_sub(self.reg(RPTR)?) & 1023;
+        if pending + padded >= 1024 {
             return Err(Error::Busy);
         }
+        let next = self.wptr.wrapping_add(padded) & 1023;
         let map = self.memory.mapping();
         let wptr = self.wptr;
         self.access(|io, l| {
@@ -423,7 +432,9 @@ impl<I: Io> Engine<I> {
             io.memory_write(map, WRITEBACK, next);
             flush(io, l)?;
             io.doorbell(DOORBELL, next);
-            checked(io.read(l.vcn + u64::from(STATUS) * 4))?;
+            // Publication is the last operation. Client callers must receive
+            // the sequence even if the device fails immediately afterwards,
+            // so they retain job resources until retirement/error recovery.
             Ok(())
         })?;
         self.wptr = next;
@@ -516,7 +527,7 @@ impl<I: Io> Engine<I> {
     }
     async fn stop_inner(&mut self) -> Result<(), Error> {
         self.shared_mode(2, 2)?;
-        self.wait(RPTR, u32::MAX, self.wptr).await?;
+        self.wait(RPTR, 1023, self.wptr).await?;
         self.wait(STATUS, 7, 2).await?;
         self.wait(LMI_STATUS, 0xf, 0xf).await?;
         self.set(LMI2, 0x100, 0x100)?;
@@ -635,10 +646,56 @@ impl Vcn {
     pub fn interrupt_result(&self) -> Option<Result<InterruptProof, Error>> {
         self.engine.interrupt_result
     }
+    /// Queue a client frame on the verified unified ring.
+    /// # Safety
+    /// Own the client's MMHUB VMID/PASID/root and every IB/resource it reaches.
+    /// Keep them pinned until this sequence completes or reset proves DMA
+    /// retirement, including errors delivered after successful publication.
+    /// Exclude concurrent ring/VMID/firmware/PM/reset writers.
+    pub unsafe fn submit(&mut self, job: crate::amdgpu_gfx12_queue::Job) -> Result<u32, Error> {
+        self.engine.submit(job)
+    }
+    /// The last physical sequence executed by this unified queue.
+    pub fn completed_job(&mut self) -> Result<u32, Error> {
+        self.engine.completed_job()
+    }
+    /// Retain this owner/backing and exclude reset/PM while using the reader.
+    pub fn fence_reader(&self) -> Option<FenceReader> {
+        (self.engine.state == State::InterruptVerified).then_some(FenceReader {
+            io: self.engine.io,
+            authority: self.engine.authority,
+            layout: self.engine.layout,
+            map: self.engine.memory.mapping(),
+        })
+    }
 }
 
 #[path = "amdgpu_vcn_navi48_irq.rs"]
 mod irq;
+
+#[path = "amdgpu_vcn_navi48_cs.rs"]
+mod cs;
+
+#[derive(Clone, Copy, Debug)]
+pub struct FenceReader {
+    io: Mmio,
+    authority: Cap<BusDeviceCap, Write>,
+    layout: Layout,
+    map: MmioRegion,
+}
+impl FenceReader {
+    pub fn completed(&self) -> Result<u32, Error> {
+        let mut io = self.io;
+        let (l, map) = (self.layout, self.map);
+        self.authority
+            .invoke(Op(|| {
+                checked(io.read(l.vcn + u64::from(STATUS) * 4))?;
+                flush(&mut io, l)?;
+                Ok(io.memory_read(map, FENCE))
+            }))
+            .map_err(|_| Error::Revoked)?
+    }
+}
 
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_vcn_navi48_tests.rs"]

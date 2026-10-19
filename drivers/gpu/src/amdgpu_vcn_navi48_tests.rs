@@ -9,6 +9,8 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 const VCN: u64 = 0x10000;
 const NBIO: u64 = 0x30000;
 const GC: u64 = 0x50000;
+const MM: u64 = 0x70000;
+const OSS: u64 = 0x90000;
 const GPU: u64 = 0x8_0000_4000;
 const IMAGE: u64 = 0x8_1000_0000;
 
@@ -30,6 +32,9 @@ struct Fake {
     duplicate: bool,
     corrupt_guard: bool,
     wide_fence: bool,
+    execute: bool,
+    client_ibs: Vec<(u8, u64, u32)>,
+    client_writes: Vec<(u64, u32)>,
 }
 impl Fake {
     fn word(&self, at: u64) -> u32 {
@@ -89,11 +94,54 @@ impl Io for Fake {
         assert_eq!(self.regs[&(NBIO + 0x1cf * 4)] & 0xf1ff_ffbf, 0x4011_8809);
         assert_eq!(self.regs[&(VCN + 0x72 * 4)] & 0x4fff_fffc, 0x4000_0c48);
         assert_eq!(self.regs[&(VCN + 0x85 * 4)] & 0x3c, 4);
+        if let Some((offset, cap)) = self.revoked {
+            if offset == u64::from(at) * 4 {
+                cap.revoke();
+            }
+        }
+        self.regs.insert(VCN + 0xad * 4, value);
+        if !self.execute {
+            return;
+        }
         let mut p = self.regs[&(VCN + 0xac * 4)];
+        let mut hdp = false;
         while p != value {
             let at = RING + u64::from(p & 1023) * 4;
             p = p.wrapping_add(match self.word(at) {
                 0 | 1 => 1,
+                0xb => {
+                    let reg = u64::from(self.word(at + 4));
+                    let value = self.word(at + 8);
+                    self.client_writes.push((reg, value));
+                    self.regs.insert(reg, value);
+                    if reg == MM + 0x587 * 4 {
+                        self.regs.insert(MM + 0x599 * 4, value & 0xffff);
+                    }
+                    if reg == MM + 0x575 * 4 {
+                        self.regs.insert(reg, 1);
+                    } // release semaphore
+                    if reg == 0x7f000 {
+                        hdp = true;
+                    }
+                    3
+                }
+                0xc => {
+                    let reg = u64::from(self.word(at + 4));
+                    let mask = self.word(at + 8);
+                    assert_eq!(self.regs[&reg] & mask, self.word(at + 12));
+                    if reg == MM + 0x575 * 4 {
+                        self.regs.insert(reg, 0);
+                    }
+                    4
+                }
+                2 => {
+                    assert!(hdp, "HDP flush before client IB");
+                    let vmid = self.word(at + 4) as u8;
+                    let address =
+                        u64::from(self.word(at + 8)) | u64::from(self.word(at + 12)) << 32;
+                    self.client_ibs.push((vmid, address, self.word(at + 16)));
+                    5
+                }
                 3 => {
                     let address = u64::from(self.word(at + 4)) | u64::from(self.word(at + 8)) << 32;
                     assert_eq!(address, GPU + FENCE);
@@ -122,7 +170,7 @@ impl Io for Fake {
                     1
                 }
                 op => panic!("unexpected VCN5 transport opcode {op}"),
-            });
+            }) & 1023;
         }
         self.regs.insert(VCN + 0xad * 4, value);
         if self.advance {
@@ -148,6 +196,7 @@ fn fixture() -> (Pool, Engine<Fake>) {
         (VCN + 0x1d6 * 4, 1 << 28),
         (VCN + 0x331 * 4, 0x24f),
         (GC + 0x263e * 4, 0x545),
+        (MM + 0x575 * 4, 1),
     ]);
     let e = Engine {
         io: Fake {
@@ -168,12 +217,17 @@ fn fixture() -> (Pool, Engine<Fake>) {
             duplicate: false,
             corrupt_guard: false,
             wide_fence: false,
+            execute: true,
+            client_ibs: Vec::new(),
+            client_writes: Vec::new(),
         },
         authority: Cap::bootstrap(),
         layout: Layout {
             vcn: VCN,
             nbio: NBIO,
             gc: GC,
+            mm: MM,
+            oss: OSS,
         },
         memory: pool.reserve(BYTES).unwrap(),
         firmware_bytes: 0x11000,
@@ -419,6 +473,11 @@ fn vcn5_layout_rejects_foreign_ip_and_truncated_register_banks() -> TestResult {
         (vcn.major, vcn.minor, vcn.revision) = (5, 0, 0);
         vcn.base_addrs[1] = 0x18000;
         gpu.ip_blocks.push(vcn);
+        let mut oss = vcn;
+        oss.hw_id = ip::HW_ID_OSSSYS;
+        (oss.major, oss.minor, oss.revision) = (7, 0, 0);
+        oss.base_addrs[0] = 0x1a000;
+        gpu.ip_blocks.push(oss);
         gpu // metadata only; no MMIO into this expired register fixture
     };
     let gpu = descriptor();
@@ -427,7 +486,7 @@ fn vcn5_layout_rejects_foreign_ip_and_truncated_register_banks() -> TestResult {
         (layout.vcn, layout.nbio, layout.gc),
         (0x60000, 0x30000, 0x10000)
     );
-    for case in 0..8 {
+    for case in 0..10 {
         let mut gpu = descriptor();
         match case {
             0 => gpu.ip_blocks[5].revision = 1,
@@ -437,7 +496,9 @@ fn vcn5_layout_rejects_foreign_ip_and_truncated_register_banks() -> TestResult {
             4 => gpu.ip_blocks[0].base_addrs[0] = 0x20000 - 0x263e,
             5 => gpu.ip_blocks.push(gpu.ip_blocks[5]),
             6 => gpu.chip.did = crate::amdgpu::NAVI22,
-            _ => gpu.regs.len = 0x7f000,
+            7 => gpu.regs.len = 0x7f000,
+            8 => gpu.ip_blocks[1].minor = 0,
+            _ => gpu.ip_blocks[6].num_bases = 0,
         }
         assert!(Layout::resolve(&gpu).is_err());
     }
@@ -582,4 +643,173 @@ fn vcn5_irq_cancellation_retains_owner_before_and_after_publication() -> TestRes
 kernel_test_in!(
     "drivers/gpu/vcn-navi48",
     vcn5_irq_cancellation_retains_owner_before_and_after_publication
+);
+
+fn vcn5_client_frame_uses_mmhub_pasid_hdp_and_unified_commands() -> TestResult {
+    use crate::amdgpu_gfx12_queue::Job;
+    let job = Job::new(
+        3,
+        0x42,
+        0x1_0000_8001,
+        &[(0x2_0000_1000, 64), (0x2_0000_2000, 8)],
+    )
+    .unwrap();
+    let fence = GPU + FENCE;
+    let want = [
+        0xc,
+        MM as u32 + 0x575 * 4,
+        1,
+        1,
+        0xb,
+        MM as u32 + (0x5cf + 6) * 4,
+        0x8001,
+        0xb,
+        MM as u32 + (0x5d0 + 6) * 4,
+        1,
+        0xb,
+        MM as u32 + 0x587 * 4,
+        8 | 0x1f << 19,
+        0xc,
+        MM as u32 + 0x599 * 4,
+        8,
+        8,
+        0xb,
+        MM as u32 + 0x575 * 4,
+        0,
+        0xc,
+        MM as u32 + (0x5cf + 6) * 4,
+        !0,
+        0x8001,
+        0xb,
+        OSS as u32 + 0x13 * 4,
+        0x42,
+        0xb,
+        0x7f000,
+        0,
+        2,
+        3,
+        0x1000,
+        2,
+        64,
+        2,
+        3,
+        0x2000,
+        2,
+        8,
+        3,
+        fence as u32,
+        (fence >> 32) as u32,
+        7,
+        4,
+        1,
+    ];
+    let words = cs::job_words(job, (MM / 4) as u32, (OSS / 4) as u32, fence, 7).unwrap();
+    assert_eq!(words[..want.len()], want);
+    assert!(words[want.len()..].iter().all(|w| *w == 0));
+    let quiet = Job {
+        flush: false,
+        map_pasid: false,
+        mem_sync: true,
+        ctx_switch: true,
+        ..Job::new(3, 0x42, 0, &[(0x2_0000_3000, 16)]).unwrap()
+    };
+    let words = cs::job_words(quiet, (MM / 4) as u32, (OSS / 4) as u32, fence, 8).unwrap();
+    assert_eq!(
+        words[..14],
+        [
+            0xb,
+            0x7f000,
+            0,
+            2,
+            3,
+            0x3000,
+            2,
+            16,
+            3,
+            fence as u32,
+            (fence >> 32) as u32,
+            8,
+            4,
+            1
+        ]
+    );
+    for bad in [
+        Job { vmid: 0, ..job },
+        Job { ib_count: 0, ..job },
+        Job { ib_count: 9, ..job },
+        Job::new(3, 0x42, 0, &[(0x1001, 4)]).unwrap(),
+        Job::new(3, 0x42, 0, &[(0x1000, 0)]).unwrap(),
+        Job::new(3, 0x42, 0, &[(0x1000, 0x10_0000)]).unwrap(),
+    ] {
+        assert_eq!(
+            cs::job_words(bad, (MM / 4) as u32, (OSS / 4) as u32, fence, 1),
+            Err(Error::Invalid)
+        );
+    }
+    assert_eq!(
+        cs::job_words(job, u32::MAX, 0, fence, 1),
+        Err(Error::Invalid)
+    );
+    assert_eq!(
+        cs::job_words(job, 0, u32::MAX, fence, 1),
+        Err(Error::Invalid)
+    );
+    assert_eq!(cs::job_words(job, 0, 0, fence + 1, 1), Err(Error::Invalid));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi48",
+    vcn5_client_frame_uses_mmhub_pasid_hdp_and_unified_commands
+);
+
+fn verified_client() -> (Pool, Engine<Fake>) {
+    let (pool, mut e) = fixture();
+    run(e.start(IMAGE, power())).unwrap();
+    run(e.prove()).unwrap();
+    let mut observer = irqs(&e, Some(64));
+    run(e.prove_interrupts(&mut observer)).unwrap();
+    (pool, e)
+}
+fn vcn5_client_jobs_wrap_backpressure_and_record_published_sequences() -> TestResult {
+    use crate::amdgpu_gfx12_queue::Job;
+    let job = Job::new(3, 0x42, 0x1_0000_8001, &[(0x2_0000_1000, 64)]).unwrap();
+    let (_pool, mut e) = verified_client();
+    for seq in 3..=8 {
+        assert_eq!(e.submit(job), Ok(seq));
+        assert_eq!(e.completed_job(), Ok(seq));
+        assert_eq!(e.io.client_ibs.last(), Some(&(3, 0x2_0000_1000, 64)));
+        assert_eq!(e.io.regs[&(MM + (0x5cf + 6) * 4)], 0x8001);
+        assert_eq!(e.io.regs[&(OSS + 0x13 * 4)], 0x42);
+        assert_eq!(e.io.regs[&(VCN + 0xac * 4)], e.wptr);
+        assert_eq!(e.wptr, (128 + (seq - 2) * 256) & 1023);
+    }
+    run(e.stop()).unwrap();
+    let (_pool, mut e) = verified_client();
+    e.io.execute = false;
+    for seq in 3..=5 {
+        assert_eq!(e.submit(job), Ok(seq));
+    }
+    assert_eq!((e.seq, e.wptr), (5, 896));
+    assert_eq!(e.submit(job), Err(Error::Busy));
+    assert_eq!((e.seq, e.wptr), (5, 896));
+    // Firmware retired the queued work; the next frame crosses the ring end.
+    e.io.regs.insert(VCN + 0xac * 4, 896);
+    e.io.store(FENCE, 5);
+    e.io.execute = true;
+    assert_eq!(e.submit(job), Ok(6));
+    assert_eq!(e.wptr, 128);
+    assert_eq!(e.completed_job(), Ok(6));
+    let (_pool, mut e) = verified_client();
+    // A revocation at the final doorbell cannot undo publication. Returning
+    // the sequence lets the caller retain the resources, then observe error.
+    e.io.revoked = Some((u64::from(DOORBELL) * 4, e.authority));
+    assert_eq!(e.submit(job), Ok(3));
+    assert_eq!(e.completed_job(), Err(Error::Revoked));
+    assert_eq!(e.submit(job), Err(Error::Revoked));
+    assert!(!e.memory.reusable_for_test());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi48",
+    vcn5_client_jobs_wrap_backpressure_and_record_published_sequences
 );

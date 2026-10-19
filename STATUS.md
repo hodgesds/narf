@@ -925,6 +925,13 @@ cannot overlook a live media owner. Register/queue models cover these paths;
 media client IBs, codecs, JPEG and physical IRQ acceptance remain open, with
 no new media capabilities advertised.
 
+The VCN5 backend can now publish owned client IB frames with MMHUB4.1
+flush/semaphore ordering, the MMHUB PASID LUT, HDP visibility and native
+fences. Masked ring pointers and backpressure match Linux; once published,
+a job always returns a sequence so its resources remain retained through
+later errors. Models cover packet fields, ring wrap/full and revocation at
+publication. DRM media integration, recovery and codec validation remain open.
+
 Still open: physical MSI delivery and reset/replay acceptance, GC12 rendering
 and application shader execution, GPU VM/userspace and DCN4
 clock/bandwidth/link/scanout hardware acceptance, VCN5 client/video queues,

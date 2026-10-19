@@ -6,10 +6,29 @@
 #include "asic_reg/vcn/vcn_5_0_0_sh_mask.h"
 #include "asic_reg/nbif/nbif_6_3_1_offset.h"
 #include "asic_reg/nbif/nbif_6_3_1_sh_mask.h"
+#include "asic_reg/mmhub/mmhub_4_1_0_offset.h"
+#include "asic_reg/oss/osssys_7_0_0_offset.h"
 #include "soc15_ih_clientid.h"
 #include "ivsrcid/vcn/irqsrcs_vcn_5_0.h"
 #define EQ(a, b) _Static_assert((unsigned)(a) == (unsigned)(b), #a)
 #define REG(n, v) EQ(reg##n, v); EQ(reg##n##_BASE_IDX, 1)
+#ifdef VCN_ENC_CMD_IB /* bash drivers/gpu/tests/vcn5/check.sh */
+EQ(VCN_ENC_CMD_NO_OP, 0); EQ(VCN_ENC_CMD_END, 1); EQ(VCN_ENC_CMD_IB, 2);
+EQ(VCN_ENC_CMD_FENCE, 3); EQ(VCN_ENC_CMD_TRAP, 4);
+EQ(VCN_ENC_CMD_REG_WRITE, 0xb); EQ(VCN_ENC_CMD_REG_WAIT, 0xc);
+EQ(AMDGPU_VCN_STACK_SIZE, 128 * 1024); EQ(AMDGPU_VCN_CONTEXT_SIZE, 512 * 1024);
+EQ(AMDGPU_FW_SHARED_FLAG_0_UNIFIED_QUEUE | AMDGPU_VCN_SMU_DPM_INTERFACE_FLAG, 0x804);
+EQ(AMDGPU_VCN_SMU_DPM_INTERFACE_DGPU, 0);
+#endif
+EQ(regMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32, 0x5cf);
+EQ(regMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32, 0x5d0);
+EQ(regMMVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32 - regMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32, 2);
+EQ(regMMVM_INVALIDATE_ENG0_SEM, 0x575);
+EQ(regMMVM_INVALIDATE_ENG0_REQ, 0x587);
+EQ(regMMVM_INVALIDATE_ENG0_ACK, 0x599);
+EQ(regMMVM_CONTEXT15_PAGE_TABLE_END_ADDR_HI32, 0x62e);
+EQ(regMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32_BASE_IDX, 0);
+EQ(regIH_VMID_0_LUT_MM, 0x10); EQ(regIH_VMID_0_LUT_MM_BASE_IDX, 0);
 REG(UVD_IPX_DLDO_CONFIG, 0x000);
 REG(UVD_IPX_DLDO_STATUS, 0x001);
 REG(UVD_POWER_STATUS, 0x002);

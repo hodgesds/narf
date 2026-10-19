@@ -5225,7 +5225,7 @@ follow Linux's SOC24 assignment. VCPU master interrupts remain masked during
 the first transport proof.
 
 `prove().await` emits a native unified FENCE/TRAP/END frame, padded to 64
-dwords, and requires both its new fence and complete monotonic RPTR drain.
+dwords, and requires both its new fence and complete RPTR drain.
 It proves queue transport only. `stop().await` sets DPG hold-off, drains the
 ring, checks VCPU and LMI/UMC write-clean, then blocks/resets VCPU and LMI,
 disables its doorbell/ring and proves posted writes completed before marking
@@ -5249,6 +5249,26 @@ device recovery. VCN/JPEG diagnostics and foreign contexts cannot complete
 the proof; media vectors only wake registered owners, never complete fences.
 Both transport proofs also check the entire fence-page guard and CPU write
 pointer, rejecting wider-than-dword or stray firmware writes.
+
+The low-level `unsafe Vcn::submit(Job)` accepts up to eight owned client
+IBs only after both proofs. Its 256-dword unified frame follows Linux's
+`vcn_v2_0_enc_ring_emit_*` callbacks: MMHUB4.1 engine-0 semaphore/PTB/
+invalidate/ACK/release and final PTB-low wait when flushing, the MMHUB
+PASID LUT when remapping, an unconditional HDP-remap register write, IBs
+under the lent MMHUB VMID, then a 32-bit kernel FENCE/TRAP/END and NOPs.
+VCN has no separate mem-sync/context-control callbacks or user fence.
+The caller retains the job's VMID, mappings and every reachable resource
+until `completed_job`/`FenceReader` passes its returned physical sequence
+or reset proves retirement. Fence readers check live authority/device status
+and HDP visibility before reading the fence.
+
+As `amdgpu_ring` does without `support_64bit_ptrs`, VCN pointers wrap by
+the 1024-dword buffer mask. One gap distinguishes empty/full: at most three
+256-dword client frames are pending. `Busy` changes no sequence or pointer;
+after doorbell publication, submission always returns its sequence so a
+later error cannot discard the resources needed by a published job. Frame,
+ring-wrap/backpressure and publication-revocation models cover this API.
+This backend alone does not register a DRM media client submitter.
 
 The opt-in `amdgpu.media_proof` boot argument requests a retained native
 power-up/start/fence/interrupt/stop/power-down cycle after the GC12/SDMA interrupt
