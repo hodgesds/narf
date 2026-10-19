@@ -3914,8 +3914,11 @@ cold-boot attempt, not an attach, resume or firmware-reload operation.
 The session owns an immutable copy of its register/identity metadata, so it
 does not borrow `AmdGpu` or require a controller guard across any await. Both
 constructors return a `Send + 'static` owner which may leave `with_controller`
-before `run` is polled. This copies no physical ownership: callers must still
-exclude reset/PM/other clients and retain permanent mappings for the session.
+before `run` is polled. The private sequence is heap-owned so consuming and
+returning `ColdBoot` during recovery does not put its retained hardware state
+or full-size result temporaries on the kernel stack. This copies no physical
+ownership: callers must still exclude reset/PM/other clients and retain
+permanent mappings for the session.
 
 `ColdBoot::run().await` executes optional reset-on-init → optional memory training → SOS bootstrap →
 ring creation → trusted-memory setup → SMC upload → SMU version handshake →

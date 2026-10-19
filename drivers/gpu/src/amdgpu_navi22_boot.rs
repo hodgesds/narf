@@ -7,6 +7,7 @@ use crate::{
     amdgpu::AmdGpu, amdgpu_gddr6 as gddr6, amdgpu_gfx_navi22 as gfx, amdgpu_power_navi22 as power,
     amdgpu_psp_boot as sos, amdgpu_psp_ring as psp, amdgpu_smu_navi22 as smu, amdgpu_vram::Pool,
 };
+use alloc::boxed::Box;
 use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, Read, Write};
 
@@ -913,7 +914,10 @@ impl Backend for Hardware {
 }
 #[derive(Debug)]
 pub struct ColdBoot {
-    sequence: Sequence<Hardware>,
+    // Recovery consumes and returns this owner. Keep the retained hardware
+    // off-stack: moving the inline sequence and its Result temporaries used
+    // to overflow the 64 KiB aarch64 boot stack, even when recovery refused.
+    sequence: Box<Sequence<Hardware>>,
 }
 /// Copy only the immutable layout consumed by firmware owners. VBIOS,
 /// userspace topology and live driver state remain with the controller.
@@ -962,7 +966,7 @@ impl ColdBoot {
         let bootstrap =
             unsafe { sos::Bootloader::new(&gpu, authority, pool) }.map_err(Error::Sos)?;
         Ok(Self {
-            sequence: Sequence {
+            sequence: Box::new(Sequence {
                 backend: Hardware {
                     gpu,
                     authority,
@@ -992,7 +996,7 @@ impl ColdBoot {
                     power_saving: None,
                 },
                 state: State::Prepared,
-            },
+            }),
         })
     }
     /// Add long GDDR6 training before SOS, retaining its preimage/cache for
@@ -1017,7 +1021,7 @@ impl ColdBoot {
         let training =
             unsafe { gddr6::Trainer::new(&gpu, authority, exchange) }.map_err(Error::Training)?;
         Ok(Self {
-            sequence: Sequence {
+            sequence: Box::new(Sequence {
                 backend: Hardware {
                     gpu,
                     authority,
@@ -1047,7 +1051,7 @@ impl ColdBoot {
                     power_saving: None,
                 },
                 state: State::Prepared,
-            },
+            }),
         })
     }
     pub fn training_state(&self) -> Option<gddr6::State> {
