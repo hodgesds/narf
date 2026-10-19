@@ -510,7 +510,14 @@ struct Entry {
     mapping: Mapping,
     /// The buffer behind it; none for a PRT range (`AMDGPU_VM_PAGE_PRT`),
     /// which Linux maps through the open's buffer-less `prt_va`.
-    object: Option<alloc::sync::Arc<crate::amdgpu_gem::GemObject>>,
+    object: Option<alloc::sync::Arc<MappedObject>>,
+}
+
+/// The identity used for reservation synchronization and its address lease.
+#[derive(Debug)]
+struct MappedObject {
+    object: alloc::sync::Arc<crate::amdgpu_gem::GemObject>,
+    placement: IrqSafeSpinLock<Option<alloc::sync::Arc<crate::amdgpu_gem::GemPlacement>>>,
 }
 
 /// Per-open GPU address space.
@@ -519,7 +526,12 @@ struct Entry {
 /// than a scan. Linux keeps the same thing in an interval tree per
 /// `amdgpu_vm`, one per DRM file.
 #[derive(Debug)]
-pub struct VmState {
+pub struct VmState(alloc::sync::Arc<VmInner>);
+
+/// Shared VM state, retained by a relocation transaction while its file closes.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct VmInner {
     geometry: Geometry,
     mappings: IrqSafeSpinLock<Option<BTreeMap<u64, Entry>>>,
     /// The root page directory and the hierarchy beneath it. `None` until the
@@ -548,6 +560,122 @@ pub struct VmState {
     kernel_fences: KernelFences,
 }
 
+impl core::ops::Deref for VmState {
+    type Target = VmInner;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+static VMS: IrqSafeSpinLock<Vec<alloc::sync::Weak<VmInner>>> = IrqSafeSpinLock::new(Vec::new());
+
+/// A synchronous relocation commit. Jobs and VA edits are excluded by the
+/// caller's card gate. Existing page tables stay allocated and are rewritten
+/// before releasing that gate, even if copying or allocation fails.
+struct Rebind {
+    object: alloc::sync::Arc<crate::amdgpu_gem::GemObject>,
+    bindings: Vec<(
+        alloc::sync::Arc<VmInner>,
+        Mapping,
+        alloc::sync::Arc<MappedObject>,
+    )>,
+}
+impl Drop for Rebind {
+    fn drop(&mut self) {
+        let placement = self.object.placement();
+        for (vm, mapping, entry) in &self.bindings {
+            vm.rewrite(mapping, &placement, self.object.flags);
+            *entry.placement.lock() = Some(placement.clone());
+            vm.tlb_seq
+                .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        }
+    }
+}
+
+/// Move an idle BO and rebind every registered VM which maps it. Waiting
+/// occurs before releasing any address lease; cancellation leaves mappings
+/// untouched. CPU leases and unregistered VM mappings still pin backing.
+pub(crate) async fn relocate(
+    gate: &crate::amdgpu_gem::PlacementGuard,
+    object: &alloc::sync::Arc<crate::amdgpu_gem::GemObject>,
+    to_vram: bool,
+) -> Result<(), FsError> {
+    use core::sync::atomic::Ordering;
+    let card = gate.card();
+    if object.card() != Some(card) {
+        return Err(FsError::InvalidData);
+    }
+    if object.system() != to_vram {
+        return Ok(());
+    }
+    let vms: Vec<_> = VMS
+        .lock()
+        .iter()
+        .filter_map(|vm| vm.upgrade())
+        .filter(|vm| vm.card == Some(card))
+        .collect();
+    let mut bindings = Vec::new();
+    let mut jobs = Vec::new();
+    for vm in vms {
+        let mapped: Vec<_> = {
+            let mappings = vm.mappings.lock();
+            mappings
+                .as_ref()
+                .into_iter()
+                .flat_map(|m| m.values())
+                .filter_map(|entry| {
+                    let mapped = entry.object.as_ref()?;
+                    alloc::sync::Arc::ptr_eq(&mapped.object, object)
+                        .then(|| (entry.mapping, mapped.clone()))
+                })
+                .collect()
+        };
+        if !mapped.is_empty() {
+            jobs.extend(vm.last_jobs());
+            bindings.extend(mapped.into_iter().map(|(m, e)| (vm.clone(), m, e)));
+        }
+    }
+    let deadline = narf_time::monotonic_ns().saturating_add(5_000_000_000);
+    if let Some(engine) = crate::amdgpu_cs::submitter(card) {
+        for ticket in jobs {
+            if !engine.wait(ticket, deadline).await? {
+                return Err(FsError::Busy);
+            }
+            if let Some(error) = engine.error(ticket) {
+                return Err(error);
+            }
+        }
+        crate::amdgpu_cs::retire(card, &|ticket| engine.signalled(ticket));
+    } else if !jobs.is_empty() {
+        return Err(FsError::NoDevice);
+    }
+    for fence in object
+        .dma_buf()
+        .resv
+        .fences(narf_filesystem::dma_buf::DmaResvUsage::Bookkeep)
+    {
+        while !fence.is_signalled() {
+            if narf_time::monotonic_ns() >= deadline {
+                return Err(FsError::Busy);
+            }
+            narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant()).await;
+        }
+    }
+    // No await after this point. The gate keeps all registered PTE users
+    // idle; another CPU acquiring a CPU lease makes relocate refuse Busy.
+    let rebind = Rebind {
+        object: object.clone(),
+        bindings,
+    };
+    for (vm, _, entry) in &rebind.bindings {
+        entry.placement.lock().take();
+        vm.tlb_seq.fetch_add(1, Ordering::AcqRel);
+    }
+    let result = object.relocate(to_vram);
+    drop(rebind);
+    result
+}
+
 /// [`VmState`]'s kernel fences (`dyn DrmFence` has no `Debug`).
 struct KernelFences(IrqSafeSpinLock<Vec<alloc::sync::Arc<dyn narf_filesystem::DrmFence>>>);
 impl core::ops::Deref for KernelFences {
@@ -562,7 +690,7 @@ impl core::fmt::Debug for KernelFences {
     }
 }
 
-impl Drop for VmState {
+impl Drop for VmInner {
     /// A closing file's tables and buffers wait out its last job too.
     fn drop(&mut self) {
         let root = self.root.lock().take();
@@ -586,18 +714,33 @@ impl Default for VmState {
 
 impl VmState {
     /// A GMC 11 address space.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self::with_geometry(Geometry::GMC11)
     }
 
-    /// The address space a client of DRM card `index` gets: GMC 12's for a
-    /// Navi4x card, GMC 11's (which GMC 10 shares) for every other.
+    /// Layout selected for the DRM card; registered for coordinated relocation.
     pub fn for_card(index: u32) -> Self {
         let family = crate::drm_registry::pci_id(index)
             .and_then(|(vid, did)| crate::amdgpu::family_for_pci_id(vid, did));
         Self::build(Geometry::for_family(family), Some(index))
     }
 
+    pub fn with_geometry(geometry: Geometry) -> Self {
+        Self::build(geometry, None)
+    }
+
+    fn build(geometry: Geometry, card: Option<u32>) -> Self {
+        let state = Self(alloc::sync::Arc::new(VmInner::build(geometry, card)));
+        if card.is_some() {
+            let mut vms = VMS.lock();
+            vms.retain(|vm| vm.strong_count() != 0);
+            vms.push(alloc::sync::Arc::downgrade(&state.0));
+        }
+        state
+    }
+}
+
+impl VmInner {
     /// Record that job `ticket` was submitted in this space (its ring is
     /// `ticket >> 32`, see `amdgpu_cs::Submitter`): from now on, buffers
     /// and page tables it drops wait for the card's engine to complete it
@@ -670,13 +813,8 @@ impl VmState {
         }
     }
 
-    /// An address space laid out and encoded as `geometry`'s generation.
-    pub const fn with_geometry(geometry: Geometry) -> Self {
-        Self::build(geometry, None)
-    }
-
-    const fn build(geometry: Geometry, card: Option<u32>) -> Self {
-        VmState {
+    fn build(geometry: Geometry, card: Option<u32>) -> Self {
+        VmInner {
             geometry,
             mappings: IrqSafeSpinLock::new(None),
             root: IrqSafeSpinLock::new(None),
@@ -749,7 +887,7 @@ impl VmState {
             .range(..=va)
             .next_back()
             .filter(|(_, e)| va < e.mapping.va.saturating_add(e.mapping.size))
-            .and_then(|(_, e)| e.object.clone())
+            .and_then(|(_, e)| e.object.as_ref().map(|o| o.object.clone()))
     }
 
     fn overlaps(map: &BTreeMap<u64, Entry>, va: u64, size: u64) -> bool {
@@ -774,6 +912,12 @@ impl VmState {
         object: Option<alloc::sync::Arc<crate::amdgpu_gem::GemObject>>,
         replace: bool,
     ) -> Result<(), FsError> {
+        let object = object.map(|object| {
+            alloc::sync::Arc::new(MappedObject {
+                placement: IrqSafeSpinLock::new(Some(object.placement())),
+                object,
+            })
+        });
         let removed = {
             let mut g = self.mappings.lock();
             let map = g.get_or_insert_with(BTreeMap::new);
@@ -804,7 +948,7 @@ impl VmState {
         map: &mut BTreeMap<u64, Entry>,
         va: u64,
         size: u64,
-    ) -> Vec<alloc::sync::Arc<crate::amdgpu_gem::GemObject>> {
+    ) -> Vec<alloc::sync::Arc<MappedObject>> {
         let end = va.saturating_add(size);
         let mut removed = Vec::new();
         let doomed: Vec<u64> = map
@@ -853,11 +997,7 @@ impl VmState {
     /// `amdgpu_vm_bo_unmap`: drop the mapping record starting at `va`. Its
     /// buffer comes back to the caller, which must clear the entries
     /// (`retire_range`) before releasing it.
-    fn unmap(
-        &self,
-        va: u64,
-        size: u64,
-    ) -> Result<Vec<alloc::sync::Arc<crate::amdgpu_gem::GemObject>>, FsError> {
+    fn unmap(&self, va: u64, size: u64) -> Result<Vec<alloc::sync::Arc<MappedObject>>, FsError> {
         let mut g = self.mappings.lock();
         let map = g.get_or_insert_with(BTreeMap::new);
         // UNMAP names an existing mapping exactly; Linux answers -ENOENT when
@@ -872,11 +1012,7 @@ impl VmState {
 
     /// `amdgpu_vm_bo_clear_mappings` for `AMDGPU_VA_OP_CLEAR`: as `unmap`,
     /// the removed buffers are the caller's to release after `retire_range`.
-    fn clear(
-        &self,
-        va: u64,
-        size: u64,
-    ) -> Result<Vec<alloc::sync::Arc<crate::amdgpu_gem::GemObject>>, FsError> {
+    fn clear(&self, va: u64, size: u64) -> Result<Vec<alloc::sync::Arc<MappedObject>>, FsError> {
         let mut g = self.mappings.lock();
         let map = g.get_or_insert_with(BTreeMap::new);
         Ok(Self::clear_range(map, va, size))
@@ -887,12 +1023,7 @@ impl VmState {
     /// invalid pattern over `[va, va+size)`, and only then release `removed`
     /// — deferred past every job already submitted in this space, which may
     /// still hold the old translations in its TLB.
-    fn retire_range(
-        &self,
-        va: u64,
-        size: u64,
-        removed: Vec<alloc::sync::Arc<crate::amdgpu_gem::GemObject>>,
-    ) {
+    fn retire_range(&self, va: u64, size: u64, removed: Vec<alloc::sync::Arc<MappedObject>>) {
         if !removed.is_empty() {
             self.tlb_seq
                 .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
@@ -963,6 +1094,37 @@ pub fn dispatch(
     if drm_uapi::ioc_nr(cmd) != drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_GEM_VA {
         return Err(FsError::Unsupported);
     }
+    let _placement = match vm.card() {
+        Some(card) => Some(crate::amdgpu_gem::try_placement(card).ok_or(FsError::Busy)?),
+        None => None,
+    };
+    dispatch_inner(cmd, arg, vm, gem)
+}
+
+/// User ioctl path parks for an in-progress relocation instead of reporting
+/// transient contention as a VA mapping failure.
+pub async fn dispatch_async(
+    cmd: u32,
+    arg: usize,
+    vm: &VmState,
+    gem: &crate::amdgpu_gem::GemState,
+) -> Option<Result<u64, FsError>> {
+    if drm_uapi::ioc_nr(cmd) != drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_GEM_VA {
+        return None;
+    }
+    let _placement = match vm.card() {
+        Some(card) => Some(crate::amdgpu_gem::lock_placement(card).await),
+        None => None,
+    };
+    Some(dispatch_inner(cmd, arg, vm, gem))
+}
+
+fn dispatch_inner(
+    _cmd: u32,
+    arg: usize,
+    vm: &VmState,
+    gem: &crate::amdgpu_gem::GemState,
+) -> Result<u64, FsError> {
     // `struct drm_amdgpu_gem_va`: handle u32, _pad u32, operation u32,
     // flags u32, va_address u64, offset_in_bo u64, map_size u64.
     // SAFETY: `arg` is the ioctl pointer the trap layer validated (or
@@ -1045,12 +1207,15 @@ pub fn dispatch(
                 offset,
                 vm_flags: flags,
             };
+            // Hold the exact backing throughout record insertion and PTE
+            // construction, including if another ioctl removes the record.
+            let placement = object.placement();
             vm.insert(mapping, Some(object.clone()), replace)?;
             // The buffer's creation flags can force the memory type (and on
             // GMC 12 set DCC), whatever the mapping asked for; its placement
             // decides the entry address and whether it is system memory.
-            let at = |offset| object.gpu_at(offset);
-            if let Err(error) = vm.materialise(&mapping, &at, object.system, object.flags) {
+            let at = |offset| placement.gpu_at(offset);
+            if let Err(error) = vm.materialise(&mapping, &at, placement.system, object.flags) {
                 // Leave neither half-written tables nor a mapping record
                 // claiming translations that do not exist.
                 if let Ok(removed) = vm.unmap(va, size) {
@@ -1202,7 +1367,7 @@ fn make_pde(table_phys: u64) -> Result<u64, FsError> {
 /// of tables, enough for 8 GiB of mappings at 4 KiB granularity.
 const MAX_TABLES: u64 = 4096;
 
-impl VmState {
+impl VmInner {
     /// Physical address of the root page directory, for
     /// `VM_CONTEXTn_PAGE_TABLE_BASE_ADDR`. `None` until something is mapped.
     /// The page-directory base a VM flush writes for this address space:
@@ -1294,6 +1459,43 @@ impl VmState {
             node.live += 1;
         }
         Ok(())
+    }
+
+    /// Rewrite an existing mapping after a coordinated move. Its directories
+    /// and accounting remain unchanged; the card gate excludes VA mutation
+    /// and all jobs have retired before any backing lease was released.
+    fn rewrite(
+        &self,
+        mapping: &Mapping,
+        placement: &crate::amdgpu_gem::GemPlacement,
+        bo_flags: u64,
+    ) {
+        let geometry = self.geometry;
+        let flags =
+            geometry
+                .format
+                .pte_flags(base_flags(placement.system), mapping.vm_flags, bo_flags);
+        let root = self.root.lock();
+        let levels: Vec<Level> = geometry.levels().collect();
+        for page in 0..mapping.size / GPU_PAGE_SIZE {
+            let va = mapping.va + page * GPU_PAGE_SIZE;
+            let address = placement
+                .gpu_at(mapping.offset + page * GPU_PAGE_SIZE)
+                .expect("relocation preserves BO size");
+            let pte = make_pte(address, flags).expect("relocation validates destination addresses");
+            let mut node = root
+                .as_ref()
+                .expect("mapped VM retains root during relocation");
+            for window in levels.windows(2) {
+                node = node
+                    .children
+                    .get(&geometry.index_at(va, window[0]))
+                    .expect("relocation retains existing page tables");
+            }
+            // SAFETY: existing page table and geometry-bounded leaf index;
+            // all GPU users are idle and the placement lease owns the page.
+            unsafe { node.table.write(geometry.index_at(va, Level::Ptb), pte) };
+        }
     }
 
     /// Restore the invalid pattern over `[va, va+size)` and free directories

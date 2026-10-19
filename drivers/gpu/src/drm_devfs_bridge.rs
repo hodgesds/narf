@@ -536,6 +536,23 @@ impl FileOps for DriCardFile {
                     return result;
                 }
             }
+            if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
+                if let Some(result) =
+                    crate::amdgpu_gem::dispatch_async(cmd, arg as usize, &self.amdgpu_gem).await
+                {
+                    return result;
+                }
+                if let Some(result) = crate::amdgpu_vm::dispatch_async(
+                    cmd,
+                    arg as usize,
+                    &self.amdgpu_vm,
+                    &self.amdgpu_gem,
+                )
+                .await
+                {
+                    return result;
+                }
+            }
             // amdgpu CS and WAIT_CS park on a card whose queue runs them.
             if crate::drm_registry::driver_name(self.index) == Some("amdgpu")
                 && crate::amdgpu_cs::is_async_ioctl(cmd)
@@ -946,7 +963,7 @@ impl FileOps for AmdgpuDmaBufFile {
     }
 
     fn mmap_lifetime(&self, _offset: u64, _len: usize) -> Option<Arc<dyn MmapLifetime>> {
-        Some(Arc::clone(&self.object) as Arc<dyn MmapLifetime>)
+        Some(self.object.mapping() as Arc<dyn MmapLifetime>)
     }
 
     /// Linux `dma_buf_ioctl` against the buffer's shared reservation.
@@ -1224,6 +1241,23 @@ impl FileOps for DriRenderFile {
             if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
                 if let Some(result) =
                     crate::amdgpu_info::dispatch_live(self.index, cmd, arg as usize).await
+                {
+                    return result;
+                }
+            }
+            if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
+                if let Some(result) =
+                    crate::amdgpu_gem::dispatch_async(cmd, arg as usize, &self.amdgpu_gem).await
+                {
+                    return result;
+                }
+                if let Some(result) = crate::amdgpu_vm::dispatch_async(
+                    cmd,
+                    arg as usize,
+                    &self.amdgpu_vm,
+                    &self.amdgpu_gem,
+                )
+                .await
                 {
                     return result;
                 }

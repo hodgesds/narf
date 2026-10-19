@@ -317,12 +317,16 @@ restart.
 Ordinary VRAM-preferred allocations can fall back to GTT when VRAM is full,
 while retaining their requested preference; discardable VRAM-only allocations
 keep stricter placement requirements.
-GEM can evict idle, exclusively owned visible-VRAM buffers to GTT and promote
-them back when space is available, preserving data. Placement preferences
-are recorded by GEM_SET_PLACEMENT and applied when the buffer is unpinned.
-CPU/GPU mappings, PRIME/shared handles, active jobs and reservation fences pin
-placement. Invisible VRAM does not migrate under this policy; complete Linux
-TTM behavior remains broader than this driver policy.
+GEM can evict visible-VRAM buffers, including same-card PRIME/shared buffers,
+to GTT and promote them back, preserving data. GPU-mapped buffers move under
+card admission exclusion after their VMs' jobs and reservation fences settle;
+existing PTEs are rewritten and TLB sequences advance before submissions
+resume. Strict VRAM allocation retries can reclaim mapped buffers, and CS
+applies listed buffers' placement preferences when possible. Cancellation
+while waiting leaves mappings unchanged.
+CPU mappings and deferred CPU user-fence writes retain address leases; shared
+handles, exported fds and BO lists retain identity without pinning placement.
+CPU mapping revocation and invisible-VRAM migration remain unimplemented.
 
 ## Open items
 

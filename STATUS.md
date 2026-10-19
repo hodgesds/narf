@@ -1032,15 +1032,28 @@ Ordinary VRAM-preferred creation now permits Linux's GTT fallback when VRAM
 is unavailable, preserving reported preferences and discardable-domain rules.
 Visible client VRAM now supports pressure eviction to GTT and promotion back
 to VRAM with data preserved. GEM_SET_PLACEMENT records atomic preferences;
-validation applies them when exclusive ownership permits migration. Mappings,
-PRIME/shared handles, outstanding jobs and reservation fences pin placement.
+validation applies them when address leases and reservation fences permit
+migration. Same-card PRIME/shared handles, exported fds and BO lists no longer
+pin placement by themselves: identity stays shared while backing changes.
+Registered GPU VMs can be rebound after all affected ring jobs and reservation
+fences settle, under a card gate excluding queue publication and VA mutation.
+PTEs keep their virtual addresses and existing table allocations; TLB sequences
+advance before submissions resume. Strict VRAM creation retries can reclaim
+mapped buffers, and CS validates listed buffers' placement preferences.
+Cancellation while waiting leaves leases and PTEs untouched. CPU mappings,
+unregistered VM mappings and deferred CPU user-fence writes remain pinned.
+Completion retirement now samples callbacks outside its lock, allowing native
+progress queries to re-enter retirement safely. Migration regressions cover
+shared PRIME identity, CPU leases, multiple VMs and offsets, split mappings,
+busy-job/reservation cancellation and re-entrant retirement.
 Invisible VRAM remains outside this migration policy. GEM mmap now resolves
 scattered GTT backing page by page. This is a bounded driver placement policy,
 not full Linux TTM parity. Linux conformance covers VRAM module C layouts,
 cache sizes and the compiled GC MMR allow-list as well as the existing family
-inventory. Broad GPU/framebuffer suites passed 1766 x86_64 and 1258 aarch64
+inventory. Broad GPU/framebuffer suites passed 1767 x86_64 and 1259 aarch64
 tests, with production boots and btrfs postflight clean on both architectures.
-Debug kernels and targeted GPU/fb Clippy passed on both architectures. Six
+Debug kernels and targeted GPU/fb Clippy passed on both architectures. Final
+migration-focused reruns passed 66 x86_64 and 42 aarch64 tests. Six
 host profile/metadata tests, Linux C metadata/SMU layouts, formatting and
 constant conformance checks passed. Fence regressions cover valid all-ones
 writebacks, reserved-zero avoidance for CP/SDMA, exact rollback and JPEG IB

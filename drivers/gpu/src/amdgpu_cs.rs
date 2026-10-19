@@ -725,7 +725,7 @@ impl narf_filesystem::DrmFence for JobFence {
 /// a client polling the buffer may see it late and falls back to WAIT_CS,
 /// which retires it.
 struct UserFence {
-    object: Arc<crate::amdgpu_gem::GemObject>,
+    object: Arc<crate::amdgpu_gem::GemMapping>,
     offset: u64,
     ticket: u64,
 }
@@ -755,12 +755,29 @@ pub fn defer_until(card: u32, tickets: Vec<u64>, held: Held) {
 /// Free what card `card` deferred for jobs `done` reports complete. A card's
 /// submitter calls this whenever it learns its engine's progress.
 pub fn retire(card: u32, done: &dyn Fn(u64) -> bool) {
+    // A completion query may itself reap a native ring and re-enter retire.
+    // Sample it outside DEFERRED, then revalidate the immutable tickets under
+    // the lock. Newly queued holds are released only for sampled completions.
+    let mut tickets: Vec<u64> = DEFERRED
+        .lock()
+        .iter()
+        .filter(|entry| entry.0 == card)
+        .flat_map(|entry| entry.1.iter().copied())
+        .collect();
+    tickets.sort_unstable();
+    tickets.dedup();
+    let completed: Vec<_> = tickets.into_iter().filter(|&ticket| done(ticket)).collect();
     let freed: Vec<Held> = {
         let mut deferred = DEFERRED.lock();
         let mut freed = Vec::new();
         let mut i = 0;
         while i < deferred.len() {
-            if deferred[i].0 == card && deferred[i].1.iter().all(|&t| done(t)) {
+            if deferred[i].0 == card
+                && deferred[i]
+                    .1
+                    .iter()
+                    .all(|t| completed.binary_search(t).is_ok())
+            {
                 freed.push(deferred.swap_remove(i).2);
             } else {
                 i += 1;
@@ -1000,7 +1017,7 @@ pub async fn dispatch_async(
             if object.byte_len != 4096 || offset > 4096 - 8 {
                 return Err(FsError::InvalidData);
             }
-            Some((object, u64::from(offset)))
+            Some((object.clone(), object.mapping(), u64::from(offset)))
         }
         None => None,
     };
@@ -1024,7 +1041,7 @@ pub async fn dispatch_async(
     let own = vm.owner();
     let locked: Vec<&Arc<crate::amdgpu_gem::GemObject>> = listed
         .iter()
-        .chain(user_fence.as_ref().map(|(o, _)| o))
+        .chain(user_fence.as_ref().map(|(o, _, _)| o))
         .collect();
     for object in &locked {
         // An EXPLICIT_SYNC buffer still waits for kernel work on it.
@@ -1050,6 +1067,18 @@ pub async fn dispatch_async(
             nap().await;
         }
     }
+    // Includes queue publication, note_job and reservation-fence attachment;
+    // a relocator must never miss a job between those operations. Dependencies
+    // are awaited first so other submissions can satisfy them.
+    let _placement = crate::amdgpu_gem::lock_placement(card).await;
+    for object in &listed {
+        let to_vram = object.preferred_domains() & u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM) != 0;
+        if object.system() == to_vram && object.cpu_visible() {
+            // Failed promotion preserves the current valid placement. A
+            // successful move rewrites every affected VM before this job.
+            let _ = crate::amdgpu_vm::relocate(&_placement, object, to_vram).await;
+        }
+    }
     let seq = engine.submit(vm, &submission, &health).await?;
     note_issued(card, seq);
     // What this space drops from now on waits for this job.
@@ -1062,7 +1091,7 @@ pub async fn dispatch_async(
             narf_filesystem::dma_buf::DmaResvUsage::Write,
         );
     }
-    if let Some((object, offset)) = user_fence {
+    if let Some((_, object, offset)) = user_fence {
         defer_until(
             card,
             alloc::vec![seq],

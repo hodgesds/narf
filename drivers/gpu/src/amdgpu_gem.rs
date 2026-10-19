@@ -41,13 +41,13 @@
 //! (`amdgpu_cs`, `GEM_VA`), as Linux attaches amdgpu_fill_buffer's fence to
 //! the new BO. Such a buffer has no CPU mapping at all.
 //!
-//! Idle, unpinned CPU-visible VRAM buffers can be evicted to GTT under
-//! pressure and promoted on lookup. Every mapping, job, PRIME export and
-//! shared handle pins placement through its strong Arc. Migration requires
-//! exclusive ownership and no unsignalled reservation fence; allocation
-//! failure preserves the source. Invisible VRAM and pinned buffers do not
-//! migrate. GEM_SET_PLACEMENT records the requested normal-domain preference
-//! as Linux does; eligible buffers apply it on their next lookup.
+//! Visible VRAM buffers can be evicted to GTT under pressure and promoted
+//! on validation. Shared handles and PRIME exports retain identity, while
+//! address leases pin backing. The async move path waits for GPU jobs and
+//! rebinds their VMs under card admission exclusion. CPU mappings, deferred
+//! CPU fence writes and invisible VRAM still pin placement. Allocation or
+//! copy failure preserves the source. GEM_SET_PLACEMENT records the normal-
+//! domain preference; eligible buffers apply it on lookup or CS validation.
 //! GEM_WAIT_IDLE is handled by amdgpu_cs::dispatch_async on running cards.
 //!
 //! LINUX-GAP: `GEM_USERPTR` (pinning host pages into the GPU address space)
@@ -231,23 +231,13 @@ enum Backing {
     },
 }
 
-/// One buffer object: a contiguous physical allocation plus what the client
-/// asked for when it created it.
+/// Shared buffer identity and placement policy, independent of backing addresses.
 #[derive(Debug)]
 pub struct GemObject {
-    /// What the CPU maps at the start of the buffer: the first system
-    /// chunk, or the buffer's BAR window (0 for a buffer past the BAR,
-    /// which the CPU cannot map). [`frames`](Self::frames) gives the rest.
-    pub phys: u64,
-    /// What the GPU's page-table entries carry for the first page: the
-    /// first system chunk's address, or the physical VRAM address.
-    /// [`gpu_at`](Self::gpu_at) gives any page.
-    pub gpu: u64,
-    /// The GPU reaches it as system memory (SYSTEM/SNOOPED entries).
-    pub system: bool,
-    /// Rounded up to a page, as `bo_size` is reported back.
+    /// Address leases pin this storage, independently of shared handles.
+    placement: IrqSafeSpinLock<Arc<GemPlacement>>,
+    /// Rounded allocation size, invariant across moves.
     pub byte_len: u64,
-    backing: Backing,
     /// `alignment` as requested, reported back by `GEM_OP`.
     alignment: u64,
     preferred_domains: AtomicU64,
@@ -263,6 +253,40 @@ pub struct GemObject {
     dma_buf: Arc<narf_filesystem::dma_buf::DmaBufObject>,
 }
 
+/// One address-stable backing generation. Retain an Arc while raw CPU frames,
+/// GPU PTEs, or deferred CPU fence writes can still access its addresses.
+/// Sharing a GEM object or dma-buf name does not itself acquire an address lease.
+#[derive(Debug)]
+pub struct GemPlacement {
+    /// What the CPU maps at the start of the buffer: the first system
+    /// chunk, or the buffer's BAR window (0 for a buffer past the BAR,
+    /// which the CPU cannot map). [`frames`](Self::frames) gives the rest.
+    pub phys: u64,
+    /// What the GPU's page-table entries carry for the first page: the
+    /// first system chunk's address, or the physical VRAM address.
+    /// [`gpu_at`](Self::gpu_at) gives any page.
+    pub gpu: u64,
+    /// The GPU reaches it as system memory (SYSTEM/SNOOPED entries).
+    pub system: bool,
+    /// Rounded up to a page, as `bo_size` is reported back.
+    pub byte_len: u64,
+    backing: Backing,
+}
+
+/// A CPU mapping retains both GEM identity and its address-stable backing.
+#[derive(Debug)]
+pub struct GemMapping {
+    _object: Arc<GemObject>,
+    placement: Arc<GemPlacement>,
+}
+
+impl core::ops::Deref for GemMapping {
+    type Target = GemPlacement;
+    fn deref(&self) -> &Self::Target {
+        &self.placement
+    }
+}
+
 /// `amdgpu_bo_user`'s tiling flags and opaque metadata blob.
 #[derive(Debug, Default)]
 struct Metadata {
@@ -275,36 +299,96 @@ impl GemObject {
     pub fn preferred_domains(&self) -> u64 {
         self.preferred_domains.load(Ordering::Acquire)
     }
-    /// Relocate only with exclusive ownership. CPU/GPU mappings, exported
-    /// dma-bufs and in-flight jobs retain an Arc and therefore pin backing.
-    fn relocate(&mut self, to_vram: bool) -> Result<(), FsError> {
-        if self.system != to_vram {
-            return Ok(());
-        }
+    /// Acquire an address lease before exposing physical frames or PTEs.
+    pub fn placement(&self) -> Arc<GemPlacement> {
+        Arc::clone(&self.placement.lock())
+    }
+
+    pub fn mapping(self: &Arc<Self>) -> Arc<GemMapping> {
+        Arc::new(GemMapping {
+            _object: self.clone(),
+            placement: self.placement(),
+        })
+    }
+
+    pub(crate) fn relocate(&self, to_vram: bool) -> Result<(), FsError> {
         let target = if to_vram {
             u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM)
         } else {
             u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT | uapi::AMDGPU_GEM_DOMAIN_CPU)
         };
+        let mut placement = self.placement.lock();
         if self.allowed_domains.load(Ordering::Acquire) & target == 0 {
             return Err(FsError::Busy);
         }
-        if Arc::strong_count(&self.dma_buf) != 1
-            || !self
-                .dma_buf
-                .resv
-                .fences(narf_filesystem::dma_buf::DmaResvUsage::Bookkeep)
-                .is_empty()
+        let backing = Arc::get_mut(&mut placement).ok_or(FsError::Busy)?;
+        if !self
+            .dma_buf
+            .resv
+            .fences(narf_filesystem::dma_buf::DmaResvUsage::Bookkeep)
+            .is_empty()
         {
             return Err(FsError::Busy);
+        }
+        backing.relocate(to_vram, self.card, self.alignment)
+    }
+
+    pub fn phys(&self) -> u64 {
+        self.placement().phys
+    }
+    pub fn gpu(&self) -> u64 {
+        self.placement().gpu
+    }
+    pub fn system(&self) -> bool {
+        self.placement().system
+    }
+    pub fn gpu_at(&self, offset: u64) -> Option<u64> {
+        self.placement().gpu_at(offset)
+    }
+    pub fn load_u64(&self, offset: u64) -> Option<u64> {
+        self.placement().load_u64(offset)
+    }
+    pub fn store_u64(&self, offset: u64, value: u64) -> Option<()> {
+        self.placement().store_u64(offset, value)
+    }
+    pub fn cpu_visible(&self) -> bool {
+        self.placement().cpu_visible()
+    }
+    pub fn frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
+        self.placement().frames(offset, len)
+    }
+    pub fn domain(&self) -> u32 {
+        self.placement().domain()
+    }
+
+    /// The DRM card whose open created the buffer.
+    pub fn card(&self) -> Option<u32> {
+        self.card
+    }
+
+    /// The reservation and name its PRIME exports share.
+    pub fn dma_buf(&self) -> &Arc<narf_filesystem::dma_buf::DmaBufObject> {
+        &self.dma_buf
+    }
+}
+
+impl GemPlacement {
+    /// Copy a uniquely leased backing; publish only after the copy succeeds.
+    fn relocate(
+        &mut self,
+        to_vram: bool,
+        card: Option<u32>,
+        alignment: u64,
+    ) -> Result<(), FsError> {
+        if self.system != to_vram {
+            return Ok(());
         }
         if to_vram {
             let Backing::System(chunks) = &self.backing else {
                 return Err(FsError::Unsupported);
             };
-            let heap = self.card.and_then(vram_heap).ok_or(FsError::NoDevice)?;
-            let alignment = self
-                .alignment
+            let heap = card.and_then(vram_heap).ok_or(FsError::NoDevice)?;
+            let alignment = alignment
                 .max(PAGE_SIZE)
                 .checked_next_power_of_two()
                 .ok_or(FsError::InvalidData)?;
@@ -317,6 +401,8 @@ impl GemObject {
                 .checked_sub(heap.fb_base)
                 .and_then(|a| a.checked_add(heap.fb_offset))
                 .ok_or(FsError::InvalidData)?;
+            crate::amdgpu_vm::make_pte(gpu, 0)?;
+            crate::amdgpu_vm::make_pte(gpu + self.byte_len - PAGE_SIZE, 0)?;
             let map = reservation.mapping();
             let mut offset = 0;
             for &(phys, order) in chunks {
@@ -347,6 +433,13 @@ impl GemObject {
             };
             let source = _held.mapping();
             let chunks = alloc_system(self.byte_len / PAGE_SIZE)?;
+            if chunks.iter().any(|&(phys, order)| {
+                crate::amdgpu_vm::make_pte(phys + (PAGE_SIZE << order) - PAGE_SIZE, 0).is_err()
+            }) {
+                free_chunks(&chunks);
+                GTT_USED.fetch_sub(self.byte_len, Ordering::Relaxed);
+                return Err(FsError::InvalidData);
+            }
             let phys = chunks[0].0;
             let mut offset = 0;
             for &(at, order) in &chunks {
@@ -437,16 +530,6 @@ impl GemObject {
         Some(())
     }
 
-    /// The DRM card whose open created the buffer.
-    pub fn card(&self) -> Option<u32> {
-        self.card
-    }
-
-    /// The reservation and name its PRIME exports share.
-    pub fn dma_buf(&self) -> &Arc<narf_filesystem::dma_buf::DmaBufObject> {
-        &self.dma_buf
-    }
-
     /// Whether the CPU can map the buffer (it is not past the BAR).
     pub fn cpu_visible(&self) -> bool {
         !matches!(self.backing, Backing::Unmapped { .. })
@@ -489,11 +572,10 @@ impl GemObject {
     }
 }
 
-impl Drop for GemObject {
+impl Drop for GemPlacement {
     fn drop(&mut self) {
-        // Memory returns when the last reference (handle, CPU mapping or VA
-        // mapping) goes; an address space a job ran in holds its removed
-        // mappings' buffers until that job's fence (`VmState::note_job`).
+        // Address leases outlive CPU/GPU mappings and deferred user-fence
+        // writes; the last lease returns this backing to its allocator.
         if let Backing::System(chunks) = &self.backing {
             free_chunks(chunks);
             GTT_USED.fetch_sub(self.byte_len, Ordering::Relaxed);
@@ -504,8 +586,38 @@ impl Drop for GemObject {
 type GemTable = IrqSafeSpinLock<BTreeMap<u32, Arc<GemObject>>>;
 static GEM_TABLES: IrqSafeSpinLock<Vec<(u32, Weak<GemTable>)>> = IrqSafeSpinLock::new(Vec::new());
 
-/// Reclaim CPU-visible client VRAM, never a mapped/shared/busy BO. A failed
-/// system allocation leaves the source reservation and its data unchanged.
+// Sharding bounds storage without imposing a lifetime requirement on card
+// registration. Collisions only serialize unrelated cards.
+static PLACEMENT_GATES: [narf_lib::mutex::Mutex<()>; 16] =
+    [const { narf_lib::mutex::Mutex::new(()) }; 16];
+
+/// Excludes new jobs and VA edits while a card's mappings are rebound.
+pub(crate) struct PlacementGuard {
+    card: u32,
+    _held: narf_lib::mutex::MutexGuard<'static, ()>,
+}
+impl PlacementGuard {
+    pub(crate) fn card(&self) -> u32 {
+        self.card
+    }
+}
+pub(crate) async fn lock_placement(card: u32) -> PlacementGuard {
+    PlacementGuard {
+        card,
+        _held: PLACEMENT_GATES[card as usize % PLACEMENT_GATES.len()]
+            .lock()
+            .await,
+    }
+}
+pub(crate) fn try_placement(card: u32) -> Option<PlacementGuard> {
+    Some(PlacementGuard {
+        card,
+        _held: PLACEMENT_GATES[card as usize % PLACEMENT_GATES.len()].try_lock()?,
+    })
+}
+
+/// Reclaim idle client VRAM; address leases and unsignalled fences pin it.
+/// A shared handle or PRIME export alone does not pin placement.
 fn evict_visible(card: u32, pool: &crate::amdgpu_vram::Pool, bytes: u64, alignment: u64) {
     let tables: Vec<_> = GEM_TABLES
         .lock()
@@ -514,18 +626,80 @@ fn evict_visible(card: u32, pool: &crate::amdgpu_vram::Pool, bytes: u64, alignme
         .filter_map(|(_, table)| table.upgrade())
         .collect();
     for table in tables {
-        let mut objects = table.lock();
-        for object in objects.values_mut() {
-            if let Some(object) = Arc::get_mut(object) {
-                if !object.system && matches!(object.backing, Backing::Vram { .. }) {
-                    let _ = object.relocate(false);
-                    if pool.reserve_aligned(bytes, alignment).is_ok() {
-                        return;
-                    }
+        let objects: Vec<_> = table.lock().values().cloned().collect();
+        for object in objects {
+            if !object.system() {
+                let _ = object.relocate(false);
+                if pool.reserve_aligned(bytes, alignment).is_ok() {
+                    return;
                 }
             }
         }
     }
+}
+
+/// A strict VRAM allocation may park to reclaim buffers mapped by idle VMs.
+/// The first create performs all ABI validation; a failure leaves its input
+/// union untouched. Ordinary allocations retain their immediate GTT fallback.
+pub async fn dispatch_async(
+    cmd: u32,
+    arg: usize,
+    state: &GemState,
+) -> Option<Result<u64, FsError>> {
+    if drm_uapi::ioc_nr(cmd) != drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_GEM_CREATE {
+        return None;
+    }
+    let result = create(state, arg);
+    if result != Err(FsError::NoSpace) {
+        return Some(result);
+    }
+    let Some(card) = state.card else {
+        return Some(result);
+    };
+    let Some(heap) = vram_heap(card) else {
+        return Some(result);
+    };
+    // SAFETY: same validated ioctl pointer contract as create; copy_in bounds
+    // and SMAP-brackets a fresh input snapshot. The retry validates it again.
+    let bytes = match unsafe { copy_in(arg, 32) } {
+        Ok(bytes) => bytes,
+        Err(error) => return Some(Err(error)),
+    };
+    let domains = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+    if domains & u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM) == 0 {
+        return Some(result);
+    }
+    let Some(size) =
+        u64::from_le_bytes(bytes[..8].try_into().unwrap()).checked_next_multiple_of(PAGE_SIZE)
+    else {
+        return Some(Err(FsError::InvalidData));
+    };
+    let Some(align) = u64::from_le_bytes(bytes[8..16].try_into().unwrap())
+        .max(PAGE_SIZE)
+        .checked_next_power_of_two()
+    else {
+        return Some(Err(FsError::InvalidData));
+    };
+    let gate = lock_placement(card).await;
+    let tables: Vec<_> = GEM_TABLES
+        .lock()
+        .iter()
+        .filter(|(c, _)| *c == card)
+        .filter_map(|(_, table)| table.upgrade())
+        .collect();
+    for table in tables {
+        let objects: Vec<_> = table.lock().values().cloned().collect();
+        for object in objects {
+            if object.system() || !object.cpu_visible() {
+                continue;
+            }
+            let _ = crate::amdgpu_vm::relocate(&gate, &object, false).await;
+            if heap.pool.reserve_aligned(size, align).is_ok() {
+                return Some(create(state, arg));
+            }
+        }
+    }
+    Some(result)
 }
 
 /// Per-open GEM state. One of these per `/dev/dri/*` open on an amdgpu card.
@@ -617,19 +791,12 @@ impl GemState {
         self.table().lock().get(&handle).cloned()
     }
     fn validated(&self, handle: u32) -> Option<Arc<GemObject>> {
-        let table = self.table();
-        let mut objects = table.lock();
-        let object = objects.get_mut(&handle)?;
-        // Mappings, PRIME and jobs hold strong references and pin placement.
-        // get_mut atomically excludes every such reference before moving it.
-        if let Some(object) = Arc::get_mut(object) {
-            let desired = object.preferred_domains();
-            let target_vram = desired & u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM) != 0;
-            if target_vram == object.system {
-                let _ = object.relocate(target_vram);
-            }
+        let object = self.get(handle)?;
+        let target_vram = object.preferred_domains() & u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM) != 0;
+        if target_vram == object.system() {
+            let _ = object.relocate(target_vram);
         }
-        Some(Arc::clone(object))
+        Some(object)
     }
 
     /// Drop this open's reference. The frames are freed when the last
@@ -658,9 +825,11 @@ impl GemState {
     /// The object an `mmap` of `len` bytes at `offset` maps, which the
     /// mapping holds until it is torn down (`FileOps::mmap_lifetime`), as
     /// Linux's VMA holds its GEM object.
-    pub fn mapping_object(&self, offset: u64, len: usize) -> Option<Arc<GemObject>> {
+    pub fn mapping_object(&self, offset: u64, len: usize) -> Option<Arc<GemMapping>> {
         let handle = u32::try_from(offset >> 12).ok()?;
-        self.validated(handle).filter(|o| len as u64 <= o.byte_len)
+        self.validated(handle)
+            .filter(|o| len as u64 <= o.byte_len)
+            .map(|o| o.mapping())
     }
 
     /// Resolve an `mmap` offset to the object's physical frames.
@@ -848,11 +1017,14 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
             .clear
             .clear(reservation.address(), reservation.size())?;
         let object = GemObject {
-            phys: 0,
-            gpu,
-            system: false,
+            placement: IrqSafeSpinLock::new(Arc::new(GemPlacement {
+                phys: 0,
+                gpu,
+                system: false,
+                byte_len,
+                backing: Backing::Unmapped { _held: reservation },
+            })),
             byte_len,
-            backing: Backing::Unmapped { _held: reservation },
             alignment,
             preferred_domains: AtomicU64::new(domains),
             allowed_domains: AtomicU64::new(initial_allowed_domains(domains, flags)),
@@ -897,11 +1069,14 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
                 .and_then(|a| a.checked_add(heap.fb_offset))
                 .ok_or(FsError::InvalidData)?;
             GemObject {
-                phys: map.phys.raw(),
-                gpu,
-                system: false,
+                placement: IrqSafeSpinLock::new(Arc::new(GemPlacement {
+                    phys: map.phys.raw(),
+                    gpu,
+                    system: false,
+                    byte_len,
+                    backing: Backing::Vram { _held: reservation },
+                })),
                 byte_len,
-                backing: Backing::Vram { _held: reservation },
                 alignment,
                 preferred_domains: AtomicU64::new(domains),
                 allowed_domains: AtomicU64::new(initial_allowed_domains(domains, flags)),
@@ -923,11 +1098,14 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
             let chunks = alloc_system(pages)?;
             let phys = chunks[0].0;
             GemObject {
-                phys,
-                gpu: phys,
-                system: true,
+                placement: IrqSafeSpinLock::new(Arc::new(GemPlacement {
+                    phys,
+                    gpu: phys,
+                    system: true,
+                    byte_len,
+                    backing: Backing::System(chunks),
+                })),
                 byte_len,
-                backing: Backing::System(chunks),
                 alignment,
                 preferred_domains: AtomicU64::new(domains),
                 allowed_domains: AtomicU64::new(initial_allowed_domains(domains, flags)),
@@ -1022,6 +1200,9 @@ fn op(state: &GemState, arg: usize) -> Result<u64, FsError> {
         // Linux records a preference here; validation applies it later.
         // Pinned objects retain their existing placement until unpinned.
         uapi::AMDGPU_GEM_OP_SET_PLACEMENT => {
+            // Serialize policy changes with the allowed-domain check and
+            // backing commit; logical sharing no longer pins a move.
+            let _placement = object.placement.lock();
             object.allowed_domains.store(
                 initial_allowed_domains(value & NORMAL_DOMAINS, 0),
                 Ordering::Release,

@@ -91,14 +91,36 @@ unavailable, as amdgpu_bo_create sets allowed_domains, without rewriting the
 reported preference. Discardable VRAM-only creation keeps its stricter domain
 set; GEM_SET_PLACEMENT updates preferred and allowed normal domains with the
 Linux sole-VRAM-to-GTT fallback rule.
-GEM visible-VRAM pressure can evict idle, exclusively owned buffers to GTT.
-Eligible GTT buffers return to VRAM on lookup if space is available. Allocation
+GEM visible-VRAM pressure can evict idle buffers to GTT, including buffers
+shared through same-card PRIME imports, exported fds and BO lists.
+Eligible unmapped GTT buffers return to VRAM on lookup if space is available;
+CS also validates listed buffers through the coordinated move path. Allocation
 and copying complete before swapping backing and releasing the source; errors
-preserve data, source placement and accounting. CPU mappings, GPU VA mappings,
-PRIME exports, shared handles and outstanding jobs retain strong references
-and pin placement. Unsignalled reservation fences and invisible VRAM also
-prevent migration. This driver pins these mappings rather than invalidating
-live process or GPU PTEs. `GemObject::preferred_domains()` reads the atomic
+preserve data, source placement and accounting. Logical identity
+(`Arc<GemObject>`) is separate from an address lease (`Arc<GemPlacement>`).
+CPU mappings retain both through `GemMapping`; GPU VA records retain both,
+including split and deferred records. Deferred CPU user-fence writes retain
+a `GemMapping` until the write completes. Acquiring a placement lease and
+claiming exclusive backing for a move use the same per-object lock; object
+handles, PRIME exports and BO lists do not pin placement by themselves.
+`VmState::for_card` registers weak shared VM state for coordinated rebinding;
+its constructors now allocate shared state at runtime. `amdgpu_vm::relocate`
+requires the card's placement guard: it waits for every affected VM's last job
+on each ring and for reservation fences before releasing GPU address leases.
+Wait failure or cancellation leaves mappings untouched. Copying and PTE
+rewriting then run synchronously under admission exclusion; errors restore
+leases to unchanged backing. Existing table allocations and virtual addresses
+stay fixed; TLB sequences advance before another submission can run.
+The card gate spans native queue publication, `note_job`, and reservation-fence
+attachment. Dependency waits precede gate acquisition. User GEM_VA ioctls park
+for this gate through `dispatch_async`; synchronous dispatch reports Busy on
+contention. `amdgpu_gem::dispatch_async` retries a strict VRAM create after
+reclaiming GPU-mapped buffers; ordinary allocations retain GTT fallback.
+CPU mappings, unregistered VM mappings, and deferred CPU user-fence writes
+still pin backing. Invisible VRAM still does not migrate. Completed deferred
+holds can be retired while checking progress; `amdgpu_cs::retire` samples
+completion callbacks outside its resource lock, then revalidates tickets.
+`GemObject::preferred_domains()` reads the atomic
 preference; GEM_SET_PLACEMENT records normal-domain bits without moving a
 pinned object. GEM mmap resolves scattered GTT pages through `frames`, never
 by assuming consecutive physical addresses. This is a bounded placement and
@@ -5021,10 +5043,14 @@ paths; only the tables differ.
   allocator lacks is split in two), so a buffer may exceed one 32 MiB
   block and is never rounded up, charged against `gtt_limit()` (half of
   RAM, TTM's default; `gtt_used()` is the charge) and refused `NoSpace`
-  past it; a VRAM-only buffer on a full heap is `NoSpace`.
-  `GemObject::{phys, gpu, system}` give the first page's CPU-mapped and
-  entry addresses and the kind; `gpu_at(offset)` and `frames` give any
-  page, and GEM_VA writes each entry through `gpu_at`. `AMDGPU_INFO_MEMORY`
+  past it; discardable VRAM-only buffers refuse `NoSpace` when their
+  allowed domains exclude GTT.
+  `GemObject::placement()` returns an `Arc<GemPlacement>` address lease.
+  Its `phys`, `gpu`, `system`, `gpu_at(offset)` and `frames` describe the
+  backing until the lease is dropped. GEM_VA retains the exact lease while
+  constructing PTEs and throughout their lifetime. The object's
+  `phys()`, `gpu()` and `system()` accessors give diagnostic snapshots,
+  not a lifetime guarantee for raw addresses. `AMDGPU_INFO_MEMORY`
   and `VRAM_GTT` report that limit as the GTT heap, with its usage.
   `vram_heap_usage(card)` gives a registered heap's `HeapUsage { visible,
   unmapped }` as (size, used) bytes (`Pool::size` / `available`). On an
@@ -5071,7 +5097,7 @@ paths; only the tables differ.
   handles are ENOENT, as amdgpu_gem_metadata_ioctl. `GemObject::load_u64` /
   `store_u64` read and write 8 bytes through the kernel's own mapping.
 - Lifetimes: each VA mapping record holds its buffer (`Arc<GemObject>`, as
-  `amdgpu_bo_va` holds its BO), so `GEM_CLOSE` cannot free pages the tables
+  `amdgpu_bo_va` holds its BO) and its `Arc<GemPlacement>` address lease, so `GEM_CLOSE` cannot free pages the tables
   still point at; a CPU mapping holds it too (`GemState::mapping_object`,
   the card and render nodes' `mmap_lifetime`), as a VMA holds its object. CLEAR and REPLACE split partly covered mappings
   (`amdgpu_vm_bo_clear_mappings`): the remainders keep their records,
@@ -5148,8 +5174,8 @@ Dependencies must name a ring the engine serves and a handle of that ring.
 A `FENCE` chunk (`Submission::user_fence`: handle, offset) names a
 one-page GEM buffer of the open with the 8 bytes at `offset` inside it
 (EINVAL otherwise, as amdgpu_cs_p1_user_fence); the job's handle is stored
-there by the CPU when a fence read retires the job (`GemObject::store_u64`
-through `defer_until`), never replacing a newer handle of the same ring.
+there by the CPU when a fence read retires the job (`GemMapping` retains
+the exact placement through `defer_until`), never replacing a newer handle of the same ring.
 
 Timeouts (`amdgpu_ring_watch`): `Submitter::submit` takes the submitting
 context's `amdgpu_ctx::Health`. A `RingWatch` per ring follows its jobs;
@@ -6262,12 +6288,24 @@ and primary-plane binding; the boot resource is never exposed as a GEM object.
 
 ## 4. Invariants & safety properties
 
+- **GEM address leases:** logical object references alone never authorize
+  retention of raw backing addresses. CPU mappings, GPU PTEs (including
+  removed entries awaiting jobs), and deferred CPU user-fence writes retain
+  the exact backing lease until their last access. A coordinated GPU move
+  excludes new jobs/VA edits, waits all affected VM jobs, releases their
+  leases, copies, rewrites the existing PTEs and restores leases before
+  releasing admission. CPU leases cannot be revoked by this path. A copy
+  requires exclusive backing ownership and no unsignalled reservation fence.
+  Same-card PRIME sharing preserves identity, metadata and reservation across
+  relocation.
+
 - GPU DMA targets are validated against its IOMMU context.
 - A hung GPU causes no kernel hang — the driver domain takes the hit.
-- GEM backing addresses remain stable for every retained mapping, shared
-  handle, export and job reference. Migration requires exclusive Arc ownership,
-  permitted destination domains and settled reservation fences; the source
-  allocation survives until the complete destination copy succeeds.
+- GEM identity, shared metadata and reservations survive migration. Address
+  leases remain stable until released. Moving a GPU-mapped BO additionally
+  requires card admission exclusion and a complete PTE rebind before new
+  jobs; CPU-mapped backing remains pinned. The source allocation survives
+  until the complete destination copy succeeds.
 - VM programming completion never substitutes for a job's lifetime fence.
   Reset generations invalidate retained submitters before queues are reused.
 - Live userspace register queries validate the complete allow-listed range
