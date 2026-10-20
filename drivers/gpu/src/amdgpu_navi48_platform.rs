@@ -1087,7 +1087,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                     self.jpeg_slots
                         .lock()
                         .iter()
-                        .position(|t| t.is_none_or(|t| done(t)))
+                        .position(|t| t.is_none_or(done))
                 });
                 if slot == Some(None) {
                     drop(owner);
