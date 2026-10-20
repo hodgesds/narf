@@ -78,14 +78,14 @@ fn free_pipe(c: &mut Chain, q: u8) {
         (mpcc(q, MPC_STATUS), 1),
         (
             BASE + (0x4ba + u64::from(q) + 1) * 4,
-            0x4000_0000 | 5 * 0x101,
+            0x4000_0000 | (5 * 0x101),
         ),
     ] {
         f.regs.insert(at, value);
     }
     let crb0 = BASE + 0x4ba * 4;
     let v = f.regs.get(&crb0).copied().unwrap_or(0);
-    f.regs.insert(crb0, (v & !0x1f1f) | 11 * 0x101);
+    f.regs.insert(crb0, (v & !0x1f1f) | (11 * 0x101));
     c.e.io.extra |= 1 << q;
 }
 /// One update, run to completion in its own frame (as Chain's steps).
