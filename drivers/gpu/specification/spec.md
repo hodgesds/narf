@@ -1424,7 +1424,12 @@ SDP on), before the SST payload, whose slots, VC rate and minimum blank
 width (`uhbr_dsc_payload`) use the compressed bandwidth. `stop_uhbr_video`
 writes DP_DSC_ENABLE 0 (unchecked) and turns GSP11 off with payload size 0
 after the encoder, before the timing; the DSC stays for a restart until the
-timing retires.
+timing retires. `DscConfig::bpc` is the input depth a configuration was
+computed for (the timing's `display_color_depth`, 8, 10 or 12): the DSC's
+`DSC_CIF_CONFIG0` input depth and the PPS's `bits_per_component` and rate
+control follow it, the DIO and HPO encoders and MSA/VSC keep signalling the
+stream depth, and the blank request's depth must equal it (the OPP feeds the
+DSC that depth; `Error::Invalid` otherwise).
 
 HDMI FRL DSC follows amdgpu_dm's FRL policy (`apply_dsc_policy_for_stream`,
 `create_validate_stream_for_sink`): a stream is compressed only when no
@@ -1456,7 +1461,8 @@ DSC engines, then `hpo_enc401_hdmi_set_dsc_config` (`frl_dsc_start`:
 HDMI_DSC_MODE, FIFO compressed-format bits, zero GCP depth, the CVTEM PPS in
 VPG generic packets 5-10 with Linux's packet-buffer reuse), then the OPTC
 (`OTG_V_SYNC_MODE` 1); stop runs OPTC off, HPO DSC off (`frl_dsc_off`), then
-the DSC disconnect and disable. FRL DSC requires 8-bpc input; DML21 admits
+the DSC disconnect and disable. FRL DSC takes the stream depth as its input
+(`DscConfig::bpc`, with zero GCP depth); DML21 admits
 the compressed stream (`frl_dsc_vectors.txt`, one FRL output per context as
 Linux's `max_num_hdmi_frl_outputs`).
 

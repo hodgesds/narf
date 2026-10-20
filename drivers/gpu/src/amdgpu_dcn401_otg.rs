@@ -326,7 +326,8 @@ pub struct Request {
     /// HDMI YCbCr 4:2:0 output: two pixels per container, so the OTG
     /// divides its horizontal timing by two and formats 4:2:0 data.
     pub ycbcr420: bool,
-    /// Compressed by the pipe's own DSC (8-bit RGB DP SST only, DIO or HPO); with
+    /// Compressed by the pipe's own DSC (RGB at `cfg.bpc`, which the blank
+    /// depth must match: DP SST or MST, DIO or HPO, or HDMI FRL); with
     /// ODM each segment's DSC compresses its segment (its share of the slices).
     pub dsc: Option<crate::amdgpu_dsc::DscConfig>,
     /// ODM 2:1, 3:1 or 4:1 combine (optc401_set_odm_combine): the further

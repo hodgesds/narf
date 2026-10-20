@@ -1396,6 +1396,7 @@ fn dcn401_dsc_follows_link_set_dsc_on_stream() -> TestResult {
         version_minor: 2,
         ycbcr422_simple: false,
         frl: None,
+        bpc: 8,
     };
     let req = Request {
         signal: Signal::DisplayPort,
@@ -1473,6 +1474,99 @@ kernel_test_in!(
     dcn401_dsc_follows_link_set_dsc_on_stream
 );
 
+/// 10- and 12-bpc DSC input, as link_set_dsc_on_stream programs a stream
+/// whose display_color_depth is deeper than 8: DSC_CIF_CONFIG0's
+/// INPUT_BITS_PER_COMPONENT and the PPS's bits_per_component (with the
+/// rate control drm_dsc_compute_rc_parameters gives that depth) follow
+/// the configuration's depth, and the OPP must feed the DSC that depth:
+/// a blank request at another depth is refused. Depths DSC cannot code
+/// are refused before any write.
+fn dcn401_dsc_takes_10_and_12_bpc_input() -> TestResult {
+    use crate::amdgpu_dsc::DscConfig;
+    let pipe = 2u8;
+    let cfg = |bpc| DscConfig {
+        slices_h: 2,
+        slices_v: 10,
+        bpp_x16: 160,
+        block_pred: true,
+        linebuf_depth: 13,
+        version_minor: 2,
+        ycbcr422_simple: false,
+        frl: None,
+        bpc,
+    };
+    for (bpc, depth, other) in [
+        (10u8, ColorDepth::Bpc10, ColorDepth::Bpc8),
+        (12, ColorDepth::Bpc12, ColorDepth::Bpc10),
+    ] {
+        let cfg = cfg(bpc);
+        let req = Request {
+            signal: Signal::DisplayPort,
+            dsc: Some(cfg),
+            ..request(pipe)
+        };
+        let mut e = engine();
+        e.io.regs.insert(BASE + 0x8d * 4, 1); // DSC2 gated
+        if let Err(err) = run(e.prepare(req, clock(req))) {
+            panic!("{bpc}-bpc DSC prepare: {err:?}");
+        }
+        let regs = dsc_hw::dsc_registers(&req, &cfg).unwrap();
+        let want = crate::amdgpu_dsc::prepare(
+            &crate::amdgpu_dsc::DscTiming {
+                pix_clk_100hz: req.timing.pixel_clock_khz * 10,
+                h_active: req.timing.h_active,
+                h_total: req.timing.h_total,
+                v_active: req.timing.v_active,
+                v_total: req.timing.v_total,
+                bpc,
+                encoding: crate::amdgpu_dsc::Encoding::Rgb,
+            },
+            &cfg,
+        )
+        .unwrap();
+        let dsc = |r: u64| {
+            e.io.regs
+                .get(&(BASE + (0x3000 + 2 * 0x5c + r) * 4))
+                .copied()
+                .unwrap_or(0)
+        };
+        if regs != want
+            || regs.pps.bits_per_component != bpc
+            || dsc(5) != u32::from(bpc) << 16 // RGB (0) at the input depth
+            || dsc(0x12) >> 28 != u32::from(bpc)
+            || dsc(0x13) & 0x3ff != 160
+        {
+            return TestResult::Fail("deep DSC input programming");
+        }
+        e.io.retiring = [false; 4];
+        let blank = BlankRequest {
+            depth: other,
+            ..blank_request(pipe)
+        };
+        if run(e.prepare_blank(blank, clock(req))) != Err(Error::Invalid) {
+            return TestResult::Fail("OPP depth disagreeing with the DSC input");
+        }
+        let blank = BlankRequest { depth, ..blank };
+        if run(e.prepare_blank(blank, clock(req))).is_err() {
+            return TestResult::Fail("OPP at the DSC input depth");
+        }
+    }
+    let bad = Request {
+        signal: Signal::DisplayPort,
+        dsc: Some(cfg(14)),
+        ..request(pipe)
+    };
+    let mut e = engine();
+    if run(e.prepare(bad, clock(bad))) != Err(Error::Unsupported) || !e.io.writes.is_empty() {
+        return TestResult::Fail("14-bpc DSC input");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_dsc_takes_10_and_12_bpc_input
+);
+
 /// ODM 2:1 (optc401_set_odm_combine): both OPPs as segments 0 and 1, the
 /// segment width, decide_odm_mem_bit_map's line memories and the halved
 /// horizontal timing; each OPP formats its half and blanks it at its own
@@ -1512,6 +1606,7 @@ fn dcn401_odm_combines_two_opps_with_split_dsc() -> TestResult {
         version_minor: 2,
         ycbcr422_simple: false,
         frl: None,
+        bpc: 8,
     };
     req.dsc = Some(cfg);
     // DISPCLK covers half the pixel clock: each segment's share.
@@ -1692,6 +1787,7 @@ fn dcn401_odm_combines_three_and_four_opps() -> TestResult {
         version_minor: 2,
         ycbcr422_simple: false,
         frl: None,
+        bpc: 8,
     };
     let odm_clock = |req: Request, display_khz| {
         let mut c = clock(req);

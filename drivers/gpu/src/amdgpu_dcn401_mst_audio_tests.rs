@@ -42,7 +42,7 @@ fn set_payload(e: &mut Engine<MstIo>, rows: &[(u8, u8)]) {
     // A compressed stream's VC rate is its compressed bandwidth.
     let stream_kbps = match request.dsc {
         Some(cfg) => crate::amdgpu_dsc::dsc_kbps(
-            &crate::amdgpu_dcn401_otg::dsc_hw::dsc_timing(&request.timing),
+            &crate::amdgpu_dcn401_otg::dsc_hw::dsc_timing(&request.timing, cfg.bpc),
             cfg.bpp_x16,
             cfg.slices_h,
         ),
@@ -489,6 +489,7 @@ fn dcn401_mst_dsc_audio_shares_pps_and_budgets_compressed_bpp() -> TestResult {
         version_minor: 2,
         ycbcr422_simple: false,
         frl: None,
+        bpc: 8,
     };
     for stream in 0..4 {
         let pipe = (stream + 1) % 4;

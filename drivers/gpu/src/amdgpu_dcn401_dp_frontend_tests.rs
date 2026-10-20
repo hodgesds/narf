@@ -526,7 +526,11 @@ fn dcn401_dp_frontend_admits_compressed_payload_on_the_trained_fec_link() -> Tes
         (132, true, ColorDepth::Bpc8, false),
         (192, true, ColorDepth::Bpc8, false),
         (128, false, ColorDepth::Bpc8, false),
-        (128, true, ColorDepth::Bpc10, false),
+        // Deeper input at the same compressed rate fits the same link (the
+        // OPP feeds the DSC the stream's depth, which its PPS codes).
+        (128, true, ColorDepth::Bpc10, true),
+        (128, true, ColorDepth::Bpc12, true),
+        (132, true, ColorDepth::Bpc10, false),
     ] {
         let cfg = crate::amdgpu_dsc::DscConfig {
             slices_h: 2,
@@ -537,6 +541,7 @@ fn dcn401_dp_frontend_admits_compressed_payload_on_the_trained_fec_link() -> Tes
             version_minor: 2,
             ycbcr422_simple: false,
             frl: None,
+            bpc: depth.bpc() as u8,
         };
         let (mut e, mut io, c) = fixture_with(0, 1, 2, depth, false, Some(cfg), false);
         run(e.stop_dp_link(&mut io, path(0))).unwrap();

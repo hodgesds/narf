@@ -964,6 +964,10 @@ pub struct DscConfig {
     pub ycbcr422_simple: bool,
     /// An HDMI FRL stream (is_frl); None for DP.
     pub frl: Option<FrlDscLink>,
+    /// The input depth compressed, 8, 10 or 12 bpc: the timing's
+    /// display_color_depth the configuration was computed for, which Linux
+    /// keeps beside dc_dsc_config in the stream's dc_crtc_timing.
+    pub bpc: u8,
 }
 
 /// What an HDMI FRL DSC stream adds to dc_dsc_config: is_vic_all_bpp, and
@@ -1143,6 +1147,7 @@ fn compute_with(
         version_minor: u32::from(s.common.version & 0xf0) >> 4,
         ycbcr422_simple: s.simple,
         frl: None,
+        bpc: t.bpc,
     })
 }
 

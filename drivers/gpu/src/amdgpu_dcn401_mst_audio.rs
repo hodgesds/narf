@@ -83,7 +83,7 @@ fn payload(f: &DpFrontendReady, slots: u8) -> Result<MstAudioPayload, Error> {
     // (dc_bandwidth_in_kbps_from_timing), as the manager programmed it.
     let kbps = match request.dsc {
         Some(cfg) => crate::amdgpu_dsc::dsc_kbps(
-            &crate::amdgpu_dcn401_otg::dsc_hw::dsc_timing(&request.timing),
+            &crate::amdgpu_dcn401_otg::dsc_hw::dsc_timing(&request.timing, cfg.bpc),
             cfg.bpp_x16,
             cfg.slices_h,
         ),

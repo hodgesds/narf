@@ -43,6 +43,7 @@ fn dcn401_frl_cvtem_packets_match_linux() -> TestResult {
                 all_bpp: false,
                 max_rate: 6,
             }),
+            bpc: 8,
         };
         let mut got = alloc::string::String::new();
         for (index, packet) in cvtem_packets(&t, &cfg, &pps) {
@@ -80,6 +81,7 @@ fn frl_cfg() -> DscConfig {
             all_bpp: false,
             max_rate: 6,
         }),
+        bpc: 8,
     }
 }
 
@@ -105,21 +107,30 @@ fn dcn401_frl_dsc_starts_after_training_and_stops_in_order() -> TestResult {
     let (phy, pipe) = (2u8, 1u8);
     let rate = crate::amdgpu_navi48_boot::FrlRate::new(6).unwrap();
     let cfg = frl_cfg();
-    // The native DSC takes 8-bpc RGB only.
+    let dsc_at = |r: u64| BASE + (0x3000 + u64::from(pipe) * 0x5c + r) * 4;
+    let r = |e: &Engine<FrlIo>, at: u64| e.io.inner.regs.get(&at).copied().unwrap_or(0);
+    // A 10-bpc stream compresses at its own depth: the DSC's input depth
+    // and the PPS say 10, and the stream attribute still sends no GCP
+    // depth.
+    let deep = DscConfig { bpc: 10, ..cfg };
     let (mut e, _fw, request, c) =
-        prepared_frl_video_dsc(false, ColorDepth::Bpc10, rate, Some(cfg));
-    assert_eq!(
-        run(e.start_frl_video(path(phy), request, c)),
-        Err(Error::Unsupported)
-    );
+        prepared_frl_video_dsc(false, ColorDepth::Bpc10, rate, Some(deep));
+    if let Err(err) = run(e.start_frl_video(path(phy), request, c)) {
+        panic!("10-bpc FRL DSC video: {err:?}");
+    }
+    let regs = dsc_hw::dsc_registers(&e.status.blanks[1].unwrap().timing.request, &deep).unwrap();
+    if regs.pps.bits_per_component != 10
+        || r(&e, dsc_at(5)) >> 16 & 0xf != 10
+        || r(&e, frl(0x8e0)) & 0x303_0301 != 1 << 24
+    {
+        return TestResult::Fail("10-bpc FRL DSC input");
+    }
     let (mut e, mut fw, mut request, c) =
         prepared_frl_video_dsc(false, ColorDepth::Bpc8, rate, Some(cfg));
-    let dsc_at = |r: u64| BASE + (0x3000 + u64::from(pipe) * 0x5c + r) * 4;
     let forward = BASE + (0x1a64 + u64::from(pipe)) * 4;
     let format = e.layout.odm(pipe, 0x1acc);
     let vsync = e.layout.otg(pipe, 0x1b3a);
     // Staged, not compressing: no DSC clocked or forwarded, OPTC DSC off.
-    let r = |e: &Engine<FrlIo>, at: u64| e.io.inner.regs.get(&at).copied().unwrap_or(0);
     if r(&e, dsc_at(0)) & 1 != 0 || r(&e, forward) & 1 != 0 || r(&e, format) & 0x30 != 0 {
         return TestResult::Fail("FRL DSC before training");
     }

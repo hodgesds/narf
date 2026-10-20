@@ -35,25 +35,27 @@ const MAX_IMAGE_WIDTH: u32 = 5184;
 const V_SYNC_A_CNTL: u64 = 0x1b3a;
 const V_SYNC_MODE: u32 = 0x100;
 
-/// The DSC timing a DP RGB stream's DSC compresses.
-pub(super) fn dsc_timing(t: &Timing) -> DscTiming {
+/// The DSC timing an RGB stream's DSC compresses at `bpc` (its
+/// display_color_depth). Its bandwidth (dc_dsc_stream_bandwidth_in_kbps)
+/// does not depend on the depth; its PPS does.
+pub(super) fn dsc_timing(t: &Timing, bpc: u8) -> DscTiming {
     DscTiming {
         pix_clk_100hz: t.pixel_clock_khz * 10,
         h_active: t.h_active,
         h_total: t.h_total,
         v_active: t.v_active,
         v_total: t.v_total,
-        bpc: 8,
+        bpc,
         encoding: Encoding::Rgb,
     }
 }
 
 /// dsc401_validate_stream plus this owner's shape: one DSC per ODM segment
 /// (at most four slices each, the slices split evenly, so the segments are
-/// equal: DML takes three only with twelve) on an 8-bit RGB DP
-/// SST stream, 8b/10b (DIO) or 128b/132b (HPO), or HDMI FRL stream. These
-/// are the whole picture's registers: the PPS the sink receives and the
-/// OPTC's bytes per pixel and slice width.
+/// equal: DML takes three only with twelve) on an 8-, 10- or 12-bpc RGB
+/// (`cfg.bpc`) DP SST stream, 8b/10b (DIO) or 128b/132b (HPO), or HDMI FRL
+/// stream. These are the whole picture's registers: the PPS the sink
+/// receives and the OPTC's bytes per pixel and slice width.
 pub(super) fn dsc_registers(request: &Request, cfg: &DscConfig) -> Result<DscRegisters, Error> {
     let segments = request.odm.count();
     let frl = request.signal == Signal::HdmiFrl;
@@ -61,6 +63,7 @@ pub(super) fn dsc_registers(request: &Request, cfg: &DscConfig) -> Result<DscReg
         request.signal,
         Signal::DisplayPort | Signal::HpoDisplayPort | Signal::HdmiFrl
     ) || frl != cfg.frl.is_some()
+        || !matches!(cfg.bpc, 8 | 10 | 12)
         || request.ycbcr420
         || cfg.slices_h % segments != 0
         || cfg.slices_h > 4 * segments
@@ -69,7 +72,7 @@ pub(super) fn dsc_registers(request: &Request, cfg: &DscConfig) -> Result<DscReg
     {
         return Err(Error::Unsupported);
     }
-    amdgpu_dsc::prepare(&dsc_timing(&request.timing), cfg).ok_or(Error::Invalid)
+    amdgpu_dsc::prepare(&dsc_timing(&request.timing, cfg.bpc), cfg).ok_or(Error::Invalid)
 }
 
 /// One segment DSC's registers: Linux's dsc_cfg with pic_width and
@@ -92,7 +95,7 @@ fn segment_registers(request: &Request, cfg: &DscConfig) -> Result<DscRegisters,
         slices_h: cfg.slices_h / n,
         ..*cfg
     };
-    let segment = amdgpu_dsc::prepare(&dsc_timing(&part), &cfg).ok_or(Error::Invalid)?;
+    let segment = amdgpu_dsc::prepare(&dsc_timing(&part, cfg.bpc), &cfg).ok_or(Error::Invalid)?;
     // Every segment slices the line identically, so the OPTC sees one
     // slice width and byte rate either way.
     if segment.slice_width != full.slice_width || segment.bytes_per_pixel != full.bytes_per_pixel {

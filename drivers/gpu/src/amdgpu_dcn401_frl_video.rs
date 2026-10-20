@@ -475,8 +475,11 @@ impl<I: Io> Engine<I> {
             }
         }
         self.frl_video_verify(&link, blank, false)?;
-        // The native DSC compresses 8-bpc RGB (`dsc_hw::dsc_timing`).
-        if timing.dsc.is_some() && blank.request.depth != ColorDepth::Bpc8 {
+        // The native DSC compresses RGB at the stream's depth.
+        if timing
+            .dsc
+            .is_some_and(|c| u32::from(c.bpc) != blank.request.depth.bpc())
+        {
             return Err(Error::Unsupported);
         }
         // Tribyte targets and active borrowing belong to compressed streams.

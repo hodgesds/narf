@@ -79,7 +79,7 @@ fn stream_kbps(t: &crate::amdgpu_dml::Timing, bpc: u32) -> u128 {
 /// dc_dsc_stream_bandwidth_in_kbps (compressed bpp plus the slice
 /// overhead), without 128b/132b padding.
 fn dsc_stream_kbps(t: &crate::amdgpu_dml::Timing, cfg: &crate::amdgpu_dsc::DscConfig) -> u128 {
-    let dsc = crate::amdgpu_dcn401_otg::dsc_hw::dsc_timing(t);
+    let dsc = crate::amdgpu_dcn401_otg::dsc_hw::dsc_timing(t, cfg.bpc);
     u128::from(crate::amdgpu_dsc::dsc_kbps(&dsc, cfg.bpp_x16, cfg.slices_h))
 }
 /// dp_link_bandwidth_kbps for 128b/132b.

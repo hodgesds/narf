@@ -38,6 +38,14 @@ impl ColorDepth {
             Self::Bpc12 => 3,
         }
     }
+    /// Bits per component.
+    pub fn bpc(self) -> u32 {
+        match self {
+            Self::Bpc8 => 8,
+            Self::Bpc10 => 10,
+            Self::Bpc12 => 12,
+        }
+    }
     fn truncate(self) -> u32 {
         match self {
             Self::Bpc8 => 0x11,  // truncation to 8 bpc
@@ -186,6 +194,12 @@ impl<I: Io> Engine<I> {
             // 4:2:0 formatting on 4:2:0 timing only, and always YCbCr's
             // own (limited) range.
             || request.ycbcr420 != timing.request.ycbcr420
+            // A compressed stream's OPP feeds its DSC the depth the PPS
+            // codes (the stream's display_color_depth).
+            || timing
+                .request
+                .dsc
+                .is_some_and(|c| u32::from(c.bpc) != request.depth.bpc())
             || request.ycbcr420 && request.limited
             // `limited` names the limited-range RGB spaces exactly.
             || request.limited

@@ -901,6 +901,7 @@ fn hpo_dsc_config() -> crate::amdgpu_dsc::DscConfig {
         version_minor: 2,
         ycbcr422_simple: false,
         frl: None,
+        bpc: 8,
     }
 }
 /// A trained 128b/132b link on PHY `p` with `pipe`'s timing staged
@@ -1040,7 +1041,7 @@ fn dcn401_uhbr_dsc_stream_sends_pps_through_hpo_like_linux() -> TestResult {
     // dc_dsc_stream_bandwidth_in_kbps (its slice overhead rounded up in
     // fixed point) x 64 / 38,564,000 = 2 + the remainder slots.
     let kbps = crate::amdgpu_dsc::dsc_kbps(
-        &crate::amdgpu_dcn401_otg::dsc_hw::dsc_timing(&req.timing),
+        &crate::amdgpu_dcn401_otg::dsc_hw::dsc_timing(&req.timing, 8),
         128,
         2,
     );
