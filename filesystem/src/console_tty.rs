@@ -289,6 +289,21 @@ pub fn block_on_input() -> bool {
     DISCIPLINE.lock().would_block()
 }
 
+/// `poll(2)` `POLLIN` for the console: true when a `read` would return at
+/// once — completed input (a line in canonical mode, any byte in raw mode) or
+/// a pending `^D` EOF. Linux `n_tty_poll` → `input_available_p`.
+///
+/// Pending ring input is run through the line discipline first, exactly as a
+/// read would, so a partial canonical line does not count: reporting it
+/// readable sends a blocking reader (plymouthd's event loop) into a read
+/// that never returns.
+pub fn poll_readable() -> bool {
+    narf_input::refill_byte_ring(narf_console::try_read_byte);
+    let mut state = DISCIPLINE.lock();
+    pump(&mut state);
+    !state.would_block()
+}
+
 /// Bytes immediately readable without blocking — completed line-discipline
 /// output plus raw input still queued in the rings. Used by FIONREAD and
 /// `poll(2)` readiness.

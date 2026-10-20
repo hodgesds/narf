@@ -1282,6 +1282,18 @@ impl FileOps for DevConsole {
         })
     }
 
+    /// `poll(2)` readiness: writable always, readable only when a read would
+    /// return without blocking. The `FileOps` default (always readable) sent
+    /// plymouthd's event loop into a blocking read of `/dev/tty1` that never
+    /// returned, wedging every console writer behind it.
+    fn poll_readiness(&self) -> u32 {
+        let mut mask = crate::POLL_OUT;
+        if crate::console_tty::poll_readable() {
+            mask |= crate::POLL_IN;
+        }
+        mask
+    }
+
     /// Park an empty `/dev/console` read on the input waker rather than
     /// returning a spurious 0 (EOF). Mirrors fd-0 `ConsoleFile`; true
     /// when the line discipline has no completed input buffered.

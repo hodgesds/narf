@@ -1595,7 +1595,7 @@ impl FileOps for ConsoleFile {
     /// as EOF and exits the moment the user gets to a prompt.
     fn poll_readiness(&self) -> u32 {
         let mut mask = narf_filesystem::POLL_OUT;
-        if narf_filesystem::console_tty::readable_bytes() > 0 {
+        if narf_filesystem::console_tty::poll_readable() {
             mask |= narf_filesystem::POLL_IN;
         }
         mask
