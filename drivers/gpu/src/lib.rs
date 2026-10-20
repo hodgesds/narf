@@ -212,6 +212,7 @@ pub mod amdgpu_dsc;
 pub mod amdgpu_rdna2_fence;
 /// Compatibility alias for the original Navi22 API.
 pub use amdgpu_rdna2_fence as amdgpu_fence_navi22;
+pub mod amdgpu_freesync;
 pub mod amdgpu_frl_cap;
 pub mod amdgpu_frl_training;
 pub mod amdgpu_gddr6;
