@@ -23,7 +23,8 @@ fn completed_modeset(pipe: u8) -> Modeset {
         plan,
         scanout: otg::ScanoutRunning {
             pipe,
-            odm: None,
+            odm: otg::SplitPipes::NONE,
+            mpc: otg::SplitPipes::NONE,
             stream: pipe,
             plan,
             address: 0x8_0000_0000 + u64::from(pipe) * 0x1000000,
@@ -57,7 +58,7 @@ fn navi48_completed_modesets_survive_configuration_and_publication_cancellation(
                 }
                 if during_startup {
                     journal
-                        .begin_activation(3, None, &second.selection)
+                        .begin_activation(3, otg::SplitPipes::NONE, &second.selection)
                         .unwrap();
                 }
                 // Later native startup, or asynchronous platform adoption.
@@ -973,9 +974,8 @@ fn navi48_modeset_selects_every_sink_and_admits_what_fits() -> TestResult {
     if select_all(&paths6, &more, 8, &|_| None).map(|a| a.len()) != Ok(MAX_DISPLAYS) {
         return TestResult::Fail("more than four displays");
     }
-    // A slow board carries 1080p60 but not 2160p120 beside it: the second
-    // display stays dark; alone, the 2160p120 one is refused outright (it
-    // would need a 3:1 ODM split of the 500-MHz DISPCLK).
+    // A slow board carries 1080p60 but not 2160p240 beside it: the second
+    // display stays dark; alone, the 2160p240 one is refused outright.
     let soc = dml::Soc {
         umc_channels: 16,
         uclk_khz: 456_000,
@@ -1001,6 +1001,14 @@ fn navi48_modeset_selects_every_sink_and_admits_what_fits() -> TestResult {
         h_sync_positive: true,
         v_sync_positive: true,
     };
+    // 2160p120 takes a 3:1 ODM split of the 500-MHz DISPCLK: with the
+    // 1080p60 display beside it, all four pipes.
+    match admit_displays(&soc, &[all[0], fast]) {
+        Ok(plans) if plans.len() == 2 && plans[1].pipes == 3 && plans[0].pipes == 1 => {}
+        _ => return TestResult::Fail("3:1 stream beside a single-pipe one"),
+    }
+    // 2160p240 would need more than four pipes' DISPCLK.
+    fast.timing.pixel_clock_khz = 2_376_000;
     match admit_displays(&soc, &[all[0], fast]) {
         Ok(plans) if plans.len() == 1 && plans[0].mode == mode(all[0].timing) => {}
         _ => return TestResult::Fail("configuration not cut to what fits"),
@@ -2270,18 +2278,30 @@ kernel_test_in!(
     navi48_dsc_link_verification_reselects_compressed_geometry
 );
 
-/// A two-pipe plan takes the highest pipe no display of the configuration
-/// is on and no earlier ODM display took; one-pipe plans take none.
+/// An n-pipe plan takes the n - 1 highest pipes no display of the
+/// configuration is on and no earlier ODM display took, left to right in
+/// that order; one-pipe plans take none, and a configuration short of
+/// pipes is refused.
 fn navi48_odm_plans_take_the_highest_free_pipes() -> TestResult {
     let one = completed_modeset(0).plan;
     let two = dml::Plan { pipes: 2, ..one };
+    let three = dml::Plan { pipes: 3, ..one };
+    let four = dml::Plan { pipes: 4, ..one };
+    let s = |p: &[u8]| otg::SplitPipes::new(p).unwrap();
+    let none = otg::SplitPipes::NONE;
     let got = |plans: &[dml::Plan], pipes: &[u8]| odm_pipes(plans, pipes).ok();
-    if got(&[two], &[0]) != Some(alloc::vec![Some(3)])
-        || got(&[two], &[3]) != Some(alloc::vec![Some(2)])
-        || got(&[one, two, one], &[0, 3, 1]) != Some(alloc::vec![None, Some(2), None])
+    if got(&[two], &[0]) != Some(alloc::vec![s(&[3])])
+        || got(&[two], &[3]) != Some(alloc::vec![s(&[2])])
+        || got(&[one, two, one], &[0, 3, 1]) != Some(alloc::vec![none, s(&[2]), none])
         || got(&[one, two, two], &[0, 3, 1]).is_some()
-        || got(&[two, two], &[0, 2]) != Some(alloc::vec![Some(3), Some(1)])
-        || got(&[one, one], &[0, 1]) != Some(alloc::vec![None, None])
+        || got(&[two, two], &[0, 2]) != Some(alloc::vec![s(&[3]), s(&[1])])
+        || got(&[one, one], &[0, 1]) != Some(alloc::vec![none, none])
+        || got(&[three], &[0]) != Some(alloc::vec![s(&[3, 2])])
+        || got(&[four], &[1]) != Some(alloc::vec![s(&[3, 2, 0])])
+        || got(&[three, one], &[0, 1]) != Some(alloc::vec![s(&[3, 2]), none])
+        || got(&[three, one], &[2, 0]) != Some(alloc::vec![s(&[3, 1]), none])
+        || got(&[four, one], &[0, 1]).is_some()
+        || got(&[three, two], &[0, 1]).is_some()
     {
         return TestResult::Fail("ODM pipe allocation");
     }
@@ -2840,14 +2860,26 @@ fn navi48_planes_reach_admission_and_staging() -> TestResult {
         },
         ..base
     };
-    let (primary, overlays) = plane_requests(&s, 0, None, &[Some((3, None)), None, None]);
+    let pp = |pipe: u8, odm: &[u8]| {
+        Some(PlanePipes {
+            pipe,
+            odm: otg::SplitPipes::new(odm).unwrap(),
+            mpc: otg::SplitPipes::NONE,
+        })
+    };
+    let on3 = DisplayPipes {
+        overlays: [pp(3, &[]), None, None],
+        ..DisplayPipes::default()
+    };
+    let (primary, overlays) = plane_requests(&s, 0, &on3);
     let Some(overlay) = overlays[0] else {
         return TestResult::Fail("overlay request");
     };
     let full = Rect::new(0, 0, 1920, 1080);
     if (primary.width, primary.height) != (1280, 720)
         || primary.plane.map(|l| (l.dst, l.stream_width, l.underlay)) != Some((full, 1920, false))
-        || (overlay.pipe, overlay.odm, overlay.format) != (3, None, otg::SurfaceFormat::Argb8888)
+        || (overlay.pipe, overlay.odm, overlay.format)
+            != (3, otg::SplitPipes::NONE, otg::SurfaceFormat::Argb8888)
         || overlay.plane.map(|l| l.dst) != Some(Rect::new(100, 100, 640, 360))
         || overlay.check().is_err()
         || primary.check().is_err()
@@ -2874,7 +2906,9 @@ fn navi48_planes_reach_admission_and_staging() -> TestResult {
     }
     let two = dml::Plan { pipes: 2, ..one };
     let got = |sel: &[Selection], plans: &[dml::Plan], pipes: &[u8], odm: &[Option<u8>]| {
-        overlay_pipes(sel, plans, pipes, odm).ok()
+        let odm: alloc::vec::Vec<otg::SplitPipes> = odm.iter().map(|&q| q.into()).collect();
+        let mpc = alloc::vec![otg::SplitPipes::NONE; odm.len()];
+        overlay_pipes(sel, plans, pipes, (&odm, &mpc)).ok()
     };
     let three = Selection {
         planes: PlaneSetup {
@@ -2885,17 +2919,12 @@ fn navi48_planes_reach_admission_and_staging() -> TestResult {
     };
     if got(&[s, s], &[one, one], &[0, 1], &[None, None])
         != Some(alloc::vec![
-            [Some((3, None)), None, None],
-            [Some((2, None)), None, None]
+            [pp(3, &[]), None, None],
+            [pp(2, &[]), None, None]
         ])
-        || got(&[s], &[two], &[0], &[Some(3)])
-            != Some(alloc::vec![[Some((2, Some(1))), None, None]])
+        || got(&[s], &[two], &[0], &[Some(3)]) != Some(alloc::vec![[pp(2, &[1]), None, None]])
         || got(&[three], &[one], &[0], &[None])
-            != Some(alloc::vec![[
-                Some((3, None)),
-                Some((2, None)),
-                Some((1, None))
-            ]])
+            != Some(alloc::vec![[pp(3, &[]), pp(2, &[]), pp(1, &[])]])
         || got(&[three, base], &[one, one], &[0, 1], &[None, None]).is_some()
         || got(&[s, s], &[two, one], &[0, 1], &[Some(3)]).is_some()
     {
@@ -3115,15 +3144,28 @@ fn navi48_hdmi_frl_dsc_selection_admits_on_two_pipes() -> TestResult {
     );
     let r = timing_request(0, &plan, &s);
     assert_eq!((r.signal, r.dsc), (otg::Signal::HdmiFrl, Some(cfg)));
-    // A board whose DISPCLK cannot split 8K across two pipes refuses it.
+    // A board whose DISPCLK cannot split 8K across two pipes takes four
+    // (ODM 4:1: eight slices are not the twelve 3:1 needs), each DSC on
+    // two slices of its quarter of the line.
     let small = dml::Soc {
         dispclk_max_khz: 1_000_000,
         ..soc
     };
+    refine_dsc(&small, core::slice::from_mut(&mut s)).unwrap();
+    let plan = admit_displays(&small, &[s]).unwrap()[0];
+    assert_eq!(plan.pipes, 4);
     assert_eq!(
-        refine_dsc(&small, core::slice::from_mut(&mut s)),
-        Err(ModesetError::Link)
+        dml::dsc_shape(&t, cfg.slices_h, small.dispclk_max_khz),
+        Some(4)
     );
+    // One whose DISPCLK four pipes cannot cover refuses it.
+    let tiny = dml::Soc {
+        dispclk_max_khz: 500_000,
+        ..soc
+    };
+    let refused = refine_dsc(&tiny, core::slice::from_mut(&mut s)).is_err()
+        || admit_displays(&tiny, &[s]).is_err();
+    assert!(refused, "8K60 on four 500 MHz pipes");
     TestResult::Pass
 }
 kernel_test_in!(
@@ -3193,8 +3235,16 @@ fn navi48_modeset_stages_whole_framebuffers_for_tiled_and_yuv_planes() -> TestRe
             false,
             otg::SurfaceFormat::Xrgb8888,
             &setup,
-            (0, None),
-            &[Some((1, None)), None, None],
+            (0, otg::SplitPipes::NONE, otg::SplitPipes::NONE),
+            &[
+                Some(PlanePipes {
+                    pipe: 1,
+                    odm: otg::SplitPipes::NONE,
+                    mpc: otg::SplitPipes::NONE,
+                }),
+                None,
+                None,
+            ],
         );
         let r = overlays[0].unwrap();
         let src = r.plane.unwrap().src;
@@ -3213,3 +3263,58 @@ kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_modeset_stages_whole_framebuffers_for_tiled_and_yuv_planes
 );
+
+/// Every further pipe DML's split needs, from the top of what the displays
+/// leave: each stream's ODM segments first, then each MPC-combined
+/// primary's second slice, then each overlay's pipe with its stream's
+/// segments or its own MPC slice. More than the four pipes is DML's
+/// `Pipes`; a configuration DML admits always fits.
+fn navi48_split_pipes_follow_dml() -> TestResult {
+    let one = completed_modeset(0).plan;
+    let s = |p: &[u8]| otg::SplitPipes::new(p).unwrap();
+    let none = otg::SplitPipes::NONE;
+    // A primary MPC-combined on two DPPs, in ODM bypass.
+    let mut mpc = one;
+    if let Some(p) = mpc.planes[0].as_mut() {
+        p.dpps = 2;
+    }
+    // A stream with one overlay plane; `ovl_mpc`'s overlay is MPC-combined.
+    let mut ovl = one;
+    let full = dml::Plane::full(&one.mode.timing, one.mode.pitch, 4);
+    ovl.mode.planes = [Some(full), Some(full), None, None];
+    ovl.planes[1] = ovl.planes[0];
+    let mut ovl_mpc = ovl;
+    if let Some(p) = ovl_mpc.planes[1].as_mut() {
+        p.dpps = 2;
+    }
+    let three = dml::Plan { pipes: 3, ..ovl };
+    let pp = |pipe: u8, odm: &[u8], mpc: &[u8]| {
+        Some(PlanePipes {
+            pipe,
+            odm: s(odm),
+            mpc: s(mpc),
+        })
+    };
+    let got = |plans: &[dml::Plan], pipes: &[u8]| plan_pipes(plans, pipes).ok();
+    let d = |odm, mpc, overlays| DisplayPipes { odm, mpc, overlays };
+    if got(&[mpc], &[0]) != Some(alloc::vec![d(none, s(&[3]), [None; 3])])
+        || got(&[mpc, mpc], &[0, 1]) != Some(alloc::vec![d(none, s(&[3]), [None; 3]), d(none, s(&[2]), [None; 3])])
+        || got(&[ovl_mpc], &[1]) != Some(alloc::vec![d(none, none, [pp(3, &[], &[2]), None, None])])
+        || got(&[mpc, ovl], &[0, 1]) != Some(alloc::vec![d(none, s(&[3]), [None; 3]), d(none, none, [pp(2, &[], &[]), None, None])])
+        // ODM first: a 3:1 stream's segments, then its overlay's pipe and
+        // segments, which four pipes cannot hold.
+        || got(&[three], &[0]).is_some()
+        || got(&[dml::Plan { pipes: 2, ..ovl }], &[0])
+            != Some(alloc::vec![d(s(&[3]), none, [pp(2, &[1], &[]), None, None])])
+        || got(&[mpc, mpc, one], &[0, 1, 2]).is_some()
+    {
+        return TestResult::Fail("split pipe allocation");
+    }
+    // The same through the selections' overlays.
+    let base = completed_modeset(0).selection;
+    if display_pipes(&[base], &[mpc], &[0]).ok() != Some(alloc::vec![d(none, s(&[3]), [None; 3])]) {
+        return TestResult::Fail("display pipes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/navi48-modeset", navi48_split_pipes_follow_dml);

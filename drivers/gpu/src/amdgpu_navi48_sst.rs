@@ -40,7 +40,7 @@ pub(super) fn dark_modes(
         }
         let mut modes: Vec<_> = lit.iter().map(selection_mode).collect();
         modes.push(selection_mode(&candidate));
-        if dml::admit_all(soc, &modes).is_ok() {
+        if dml::admit_native(soc, &modes).is_ok() {
             out.push(timing);
         }
     }

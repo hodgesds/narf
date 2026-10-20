@@ -248,7 +248,7 @@ fn hdmi_mode(pipe: u8, plan: &dml::Plan) -> Mode {
         signal: Signal::Tmds,
         ycbcr420: false,
         dsc: None,
-        odm: None,
+        odm: SplitPipes::NONE,
         timing: plan.mode.timing,
         sync: plan.sync,
     };
@@ -270,7 +270,8 @@ fn hdmi_mode(pipe: u8, plan: &dml::Plan) -> Mode {
             width: 640,
             height: 480,
             format: SurfaceFormat::Xrgb8888,
-            odm: None,
+            odm: SplitPipes::NONE,
+            mpc: SplitPipes::NONE,
             plane: None,
         },
         // Room for a back buffer of the same geometry.
@@ -992,4 +993,117 @@ fn dcn401_scanout_chain_programs_crtc_color() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-scanout",
     dcn401_scanout_chain_programs_crtc_color
+);
+
+/// A configuration change keeps a live display lit (dcn401_program_pipe for
+/// a stream the commit keeps): its stream admitted beside a 1080p60 one
+/// takes the new plan's global sync, DLG/TTU and watermarks under one OTG
+/// lock without leaving scanout, once its timing records carry the raised
+/// clocks. prepare_bandwidth's raise-only watermarks keep a higher value
+/// another display needs; optimize_bandwidth's are exact. A plan for
+/// another stream, or one the current clocks do not cover, is refused
+/// without a write.
+fn dcn401_scanout_chain_moves_a_live_display_to_a_new_plan() -> TestResult {
+    use crate::amdgpu_dcn401_otg::WatermarkUpdate;
+    let (t, s, p) = ROUTES[1];
+    let mut c = chain(t, s, p);
+    if run(c.start()).is_err() {
+        return TestResult::Fail("start");
+    }
+    let old = plan();
+    let hd = dml::Mode::new(
+        Timing {
+            pixel_clock_khz: 148_500,
+            h_active: 1920,
+            h_total: 2200,
+            h_front_porch: 88,
+            h_sync_width: 44,
+            v_active: 1080,
+            v_total: 1125,
+            v_front_porch: 4,
+            v_sync_width: 5,
+            h_sync_positive: true,
+            v_sync_positive: true,
+        },
+        1920,
+        4,
+    );
+    let joint = dml::admit_all(&soc(), &[old.mode, hd]).unwrap()[0];
+    if joint == old || joint.mode != old.mode {
+        return TestResult::Fail("joint plan");
+    }
+    let update = |c: &mut Chain, plan: &dml::Plan, wm| {
+        let clock = c.clock;
+        run(c
+            .surfaces
+            .update_live_plan(&mut c.e, p, plan, wm, CRYSTAL_KHZ, || Ok((clock, config()))))
+    };
+    // Not covered by the clocks the timing runs on yet.
+    let writes = c.e.io.writes;
+    if joint.clocks.dispclk_khz > c.clock.global.display_khz
+        && (update(&mut c, &joint, WatermarkUpdate::Raise) != Err(Error::Invalid)
+            || c.e.io.writes != writes)
+    {
+        return TestResult::Fail("plan beyond the running clocks");
+    }
+    // Another stream's plan is not this display's.
+    let other = dml::admit_all(&soc(), &[hd]).unwrap()[0];
+    if update(&mut c, &other, WatermarkUpdate::Raise) != Err(Error::Invalid)
+        || c.e.io.writes != writes
+    {
+        return TestResult::Fail("another stream's plan");
+    }
+    // prepare_bandwidth raised the shared clocks: every timing record
+    // carries them.
+    let mut raised = c.clock;
+    raised.global.display_khz = raised.global.display_khz.max(joint.clocks.dispclk_khz);
+    raised.global.dpp_khz = raised.global.dpp_khz.max(joint.clocks.dpprefclk_khz);
+    raised.global.request.display_khz = raised.global.display_khz;
+    raised.global.request.dpp_khz = raised.global.dpp_khz;
+    raised.request.dpp_khz = raised.request.dpp_khz.max(joint.clocks.dppclk_khz);
+    c.e.status.rebind_timing(p, |a| a.clock = raised);
+    c.clock = raised;
+    if run(c.check()).is_err() {
+        return TestResult::Fail("rebound records");
+    }
+    // Another display's higher urgent watermark in both sets.
+    let wm_a = BASE + 0x4fe * 4;
+    let wm_b = BASE + 0x511 * 4;
+    for at in [wm_a, wm_b] {
+        c.e.io.put(at, 0x3fff);
+    }
+    if update(&mut c, &joint, WatermarkUpdate::Raise).is_err() {
+        return TestResult::Fail("raise update");
+    }
+    let sync = joint.sync;
+    if c.e.status.state != State::ScanoutRunning(p)
+        || c.e.status.deadlines.map(|d| d.plan) != Some(joint)
+        || c.e.status.scanout.map(|s| s.plan) != Some(joint)
+        || c.e.status.pipes[usize::from(p)].map(|a| a.request.sync) != Some(sync)
+        || c.e.status.blanks[usize::from(p)].map(|b| b.timing.request.sync) != Some(sync)
+        || c.e.io.get(otg(p, STARTUP)) & 0x3ff != sync.vstartup
+        || c.e.io.get(otg(p, UPDATE)) & 0x3ffffff != sync.vupdate_offset | sync.vupdate_width << 16
+        || c.e.io.get(otg(p, READY)) & 0xffff != sync.vready_offset
+        || c.e.io.get(otg(p, PSTATE)) & 0x7fff != sync.pstate_keepout
+        || c.e.io.get(wm_a) & 0x3fff != 0x3fff
+        || c.e.io.get(wm_b) & 0x3fff != 0x3fff
+        || c.e.deadline_writes(p, &joint, true).is_ok()
+        || c.e
+            .deadline_writes_with(p, &joint, true, WatermarkUpdate::Raise)
+            .is_err()
+    {
+        return TestResult::Fail("new plan live with raised watermarks");
+    }
+    // optimize_bandwidth: exactly the plan's, and the scanout checks.
+    if update(&mut c, &joint, WatermarkUpdate::Exact).is_err()
+        || c.e.io.get(wm_a) & 0x3fff != joint.watermarks.urgent
+        || run(c.check()).is_err()
+    {
+        return TestResult::Fail("exact watermarks");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_chain_moves_a_live_display_to_a_new_plan
 );

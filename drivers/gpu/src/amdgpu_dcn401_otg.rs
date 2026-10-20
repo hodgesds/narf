@@ -101,6 +101,8 @@ const INPUT_CLOCK: u64 = 0x1ad0;
 const MEMORY: u64 = 0x1ad1;
 /// OPTC_WIDTH_CONTROL: OPTC_SEGMENT_WIDTH (12:0) and the DSC slice width.
 const WIDTH: u64 = 0x1ace;
+/// OPTC_WIDTH_CONTROL2: OPTC_SEGMENT_WIDTH_LAST (12:0), for 3:1.
+const WIDTH2: u64 = 0x1acf;
 const GLOBAL_TIMER: u64 = 0x527; // DCHUBBUB_GLOBAL_TIMER_CNTL
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -317,13 +319,111 @@ pub struct Request {
     /// divides its horizontal timing by two and formats 4:2:0 data.
     pub ycbcr420: bool,
     /// Compressed by the pipe's own DSC (8-bit RGB DP SST only, DIO or HPO); with
-    /// ODM each segment's DSC compresses its half (half the slices).
+    /// ODM each segment's DSC compresses its segment (its share of the slices).
     pub dsc: Option<crate::amdgpu_dsc::DscConfig>,
-    /// ODM 2:1 combine (optc401_set_odm_combine): the second pipe whose
-    /// OPP (and DPP/HUBP/MPCC/DSC) carries the right half of every line.
-    /// The OTG then takes two pixels per clock, so every horizontal timing
-    /// boundary must be even.
-    pub odm: Option<u8>,
+    /// ODM 2:1, 3:1 or 4:1 combine (optc401_set_odm_combine): the further
+    /// pipes, left to right, whose OPPs (and DPP/HUBP/MPCC/DSC) carry the
+    /// following segments of every line. The OTG then takes two pixels per
+    /// clock (four for 3:1 and 4:1), so every horizontal timing boundary
+    /// must divide by that.
+    pub odm: SplitPipes,
+}
+
+/// The further pipes of a split, in order: an ODM stream's segments after
+/// the timing's own pipe (one to three), or an MPC-combined plane's slices
+/// after its first pipe. Empty for a plane or stream on one pipe. Iterates
+/// like the pipes it holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SplitPipes {
+    pipes: [u8; 3],
+    len: u8,
+}
+impl SplitPipes {
+    /// No split: one pipe.
+    pub const NONE: Self = Self {
+        pipes: [0; 3],
+        len: 0,
+    };
+    /// One further pipe (ODM 2:1, or two MPC slices).
+    pub const fn one(pipe: u8) -> Self {
+        Self {
+            pipes: [pipe, 0, 0],
+            len: 1,
+        }
+    }
+    /// The further pipes `pipes` (at most three).
+    pub fn new(pipes: &[u8]) -> Option<Self> {
+        let mut out = Self::NONE;
+        for &p in pipes {
+            *out.pipes.get_mut(usize::from(out.len))? = p;
+            out.len += 1;
+        }
+        Some(out)
+    }
+    pub const fn len(self) -> usize {
+        self.len as usize
+    }
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+    /// Whether there is a split (as `Option::is_some` for one pipe).
+    pub const fn is_some(self) -> bool {
+        self.len != 0
+    }
+    pub const fn is_none(self) -> bool {
+        self.len == 0
+    }
+    /// The first further pipe.
+    pub fn first(self) -> Option<u8> {
+        self.get(0)
+    }
+    pub fn get(self, i: usize) -> Option<u8> {
+        self.pipes[..self.len()].get(i).copied()
+    }
+    pub fn iter(self) -> impl Iterator<Item = u8> + Clone {
+        self.into_iter()
+    }
+    pub fn contains(self, pipe: u8) -> bool {
+        self.iter().any(|p| p == pipe)
+    }
+    /// The further pipes by bit.
+    pub fn mask(self) -> u8 {
+        self.iter().fold(0, |m, p| m | bit(p))
+    }
+    /// Pipes in all, the first included: the split's count.
+    pub const fn count(self) -> u32 {
+        self.len as u32 + 1
+    }
+    /// Well formed beside `first`: every pipe below four, none repeated
+    /// and none `first`.
+    pub fn valid_with(self, first: u8) -> bool {
+        let mask = self.mask() | bit(first);
+        first < 4 && self.iter().all(|p| p < 4) && mask.count_ones() == self.count()
+    }
+}
+impl IntoIterator for SplitPipes {
+    type Item = u8;
+    type IntoIter = core::iter::Take<core::array::IntoIter<u8, 3>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.pipes.into_iter().take(self.len())
+    }
+}
+impl From<Option<u8>> for SplitPipes {
+    fn from(pipe: Option<u8>) -> Self {
+        pipe.map_or(Self::NONE, Self::one)
+    }
+}
+/// How a deadline write programs the DCHUBBUB watermark sets, which every
+/// display of a configuration shares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatermarkUpdate {
+    /// The plan's values, written and checked exactly.
+    Exact,
+    /// hubbub401_program_watermarks with `safe_to_lower` false
+    /// (prepare_bandwidth): each value only raised to the plan's, then
+    /// checked to be at least it, so displays still on their former plans
+    /// keep theirs.
+    Raise,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Applied {
@@ -446,6 +546,51 @@ pub struct Status {
     pub retired: u8,
 }
 impl Status {
+    /// Apply `f` to every record of the timing on `pipe` this display
+    /// keeps: the timing itself, and the copy every staged or running
+    /// record bound to it carries (OPP blank, DPP, MPC, links' blanks,
+    /// running blank and video). A live clock or global sync change keeps
+    /// them all naming the timing as it now runs.
+    pub(crate) fn rebind_timing(&mut self, pipe: u8, f: impl Fn(&mut Applied)) {
+        let g = |a: &mut Applied| {
+            if a.request.pipe == pipe {
+                f(a);
+            }
+        };
+        self.pipes.iter_mut().flatten().for_each(&g);
+        for b in self.blanks.iter_mut().flatten() {
+            g(&mut b.timing);
+        }
+        if let Some(r) = self.running_blank.as_mut() {
+            g(&mut r.blank.timing);
+        }
+        for d in self.dpps.iter_mut().flatten() {
+            g(&mut d.timing);
+        }
+        for m in self.mpcs.iter_mut().flatten() {
+            g(&mut m.dpp.timing);
+        }
+        if let Some(h) = self.hdmi_link_ready.as_mut() {
+            g(&mut h.blank.timing);
+        }
+        if let Some(v) = self.hdmi_video_running.as_mut() {
+            g(&mut v.link.blank.timing);
+            g(&mut v.timing.blank.timing);
+        }
+        if let Some(v) = self.uhbr_video_running.as_mut() {
+            g(&mut v.timing.blank.timing);
+        }
+        if let Some(v) = self.frl_video_running.as_mut() {
+            g(&mut v.timing.blank.timing);
+        }
+        if let Some(f) = self.dp_frontend_ready.as_mut() {
+            g(&mut f.blank.timing);
+        }
+        if let Some(v) = self.dp_video_running.as_mut() {
+            g(&mut v.frontend.blank.timing);
+            g(&mut v.timing.blank.timing);
+        }
+    }
     fn new() -> Self {
         Self {
             state: State::Ready,
@@ -531,12 +676,16 @@ impl Plan {
             (PSTATE, 0x7fff, s.pstate_keepout),
         ]
     }
-    /// OTG_H_TIMING_CNTL: optc401_set_odm_bypass divides by two for two
-    /// pixels per container (4:2:0, whose horizontal timing `plan` requires
-    /// even), as optc401_set_odm_combine does for 2:1 combine; otherwise no
-    /// divide, the hardware's automatic choice unless a horizontal boundary
-    /// is odd, when the manual no-divide mode is set.
+    /// OTG_H_TIMING_CNTL: optc401_set_odm_combine divides by four for 3:1
+    /// and 4:1 (ODM packs four pixels per transfer) and by two for 2:1, as
+    /// optc401_set_odm_bypass does for two pixels per container (4:2:0,
+    /// whose horizontal timing `plan` requires even); otherwise no divide,
+    /// the hardware's automatic choice unless a horizontal boundary is odd,
+    /// when the manual no-divide mode is set.
     fn h_divider(self) -> u32 {
+        if self.request.odm.len() >= 2 {
+            return 3;
+        }
         if self.request.ycbcr420 || self.request.odm.is_some() {
             return 1;
         }
@@ -551,46 +700,72 @@ impl Plan {
     pub(crate) fn opps(self) -> impl Iterator<Item = u8> {
         core::iter::once(self.request.pipe).chain(self.request.odm)
     }
-    /// One ODM segment's width: the whole line in bypass.
+    /// resource_get_odm_slice_dst_width: every segment but the last takes
+    /// the line over the segment count (rounded up to whole pixel pairs for
+    /// 4:2:0), the last the rest. The whole line in bypass.
     pub(crate) fn segment_width(self) -> u32 {
         let t = self.request.timing;
-        if self.request.odm.is_some() {
-            t.h_active / 2
+        let count = self.request.odm.count();
+        let width = t.h_active / count;
+        width + (width & 1 & u32::from(self.request.ycbcr420 && count > 1))
+    }
+    /// The last segment's width (OPTC_SEGMENT_WIDTH_LAST for 3:1).
+    pub(crate) fn last_segment_width(self) -> u32 {
+        let count = self.request.odm.count();
+        self.request.timing.h_active - self.segment_width() * (count - 1)
+    }
+    /// Segment `segment`'s first column and width.
+    pub(crate) fn segment(self, segment: u32) -> (u32, u32) {
+        let x = segment * self.segment_width();
+        if segment + 1 == self.request.odm.count() {
+            (x, self.last_segment_width())
         } else {
-            t.h_active
+            (x, self.segment_width())
         }
     }
-    /// OPTC_DATA_SOURCE_SELECT (mask 0xffff0003): the segment count and
-    /// each segment's OPP, or every source detached (0xf).
+    /// OPTC_DATA_SOURCE_SELECT (mask 0xffff0003): the segment count less
+    /// one (OPTC_NUM_OF_INPUT_SEGMENT) and each segment's OPP, unused
+    /// segments and every source when detached 0xf.
     pub(crate) fn source(self, connected: bool) -> u32 {
-        let p = u32::from(self.request.pipe);
-        match (self.request.odm, connected) {
-            (None, true) => 0xfff0_0000 | p << 16,
-            (None, false) => 0xffff_0000,
-            (Some(q), true) => 0xff00_0001 | p << 16 | u32::from(q) << 20,
-            (Some(_), false) => 0xffff_0001,
-        }
-    }
-    /// OPTC_MEMORY_CONFIG.OPTC_MEM_SEL: none in bypass; for combine,
-    /// decide_odm_mem_bit_map's two 4096-pixel memories per started 4096
-    /// pixels, each OPP's first-preferred one first, then second-preferred.
-    pub(crate) fn memory(self) -> u32 {
-        let Some(q) = self.request.odm else {
-            return 0;
-        };
-        let opps = [self.request.pipe, q];
-        let required = self.request.timing.h_active.div_ceil(4096) * 2;
-        let mut map = 0;
-        let mut allocated = 0;
-        for preference in [1u32, 2] {
-            for &o in &opps {
-                if allocated < required {
-                    map |= preference << (2 * u32::from(o));
-                    allocated += 1;
-                }
+        let segments = self.request.odm.len() as u32;
+        let mut sel = 0xffff_0000u32;
+        if connected {
+            for (k, o) in self.opps().enumerate() {
+                let shift = 16 + 4 * k as u32;
+                sel = sel & !(0xf << shift) | u32::from(o) << shift;
             }
         }
-        map
+        sel | segments
+    }
+    /// OPTC_MEMORY_CONFIG.OPTC_MEM_SEL: none in bypass; for combine,
+    /// decide_odm_mem_bit_map's two 2048-pixel memories per started 4096
+    /// pixels: each OPP's first-preferred one, then each OPP's
+    /// second-preferred one. Linux would go on to other OPPs' second-
+    /// preferred memories, which another display's combine may need; `plan`
+    /// refuses a line that would (more than 4096 pixels per segment).
+    pub(crate) fn memory(self) -> u32 {
+        if self.request.odm.is_none() {
+            return 0;
+        }
+        let required = self.request.timing.h_active.div_ceil(4096) * 2;
+        let mut first = 0u8;
+        let mut second = 0u8;
+        let mut allocated = 0;
+        for o in self.opps() {
+            if allocated < required {
+                first |= bit(o);
+                allocated += 1;
+            }
+        }
+        for o in self.opps() {
+            if allocated < required {
+                second |= bit(o);
+                allocated += 1;
+            }
+        }
+        (0..4u32).fold(0, |map, o| {
+            map | u32::from(first >> o & 1) << (2 * o) | u32::from(second >> o & 1) << (2 * o + 1)
+        })
     }
 }
 impl Request {
@@ -630,7 +805,7 @@ impl Request {
         // 4:2:0 is HDMI only, each OPP's formatter takes at most its 4:2:0
         // line buffer, and every horizontal boundary must divide by two
         // (Linux would switch to the manual mode; this owner refuses).
-        let segments = if self.odm.is_some() { 2 } else { 1 };
+        let segments = self.odm.count();
         if self.ycbcr420
             && (!matches!(self.signal, Signal::Tmds | Signal::HdmiFrl)
                 || t.h_active > segments * dml::FMT_420_BUFFER_WIDTH
@@ -638,18 +813,31 @@ impl Request {
         {
             return Err(Error::Unsupported);
         }
-        // 2:1 combine: two pixels per OTG clock, so every horizontal
-        // boundary divides by two (Linux checks only the active width and
-        // leaves the rest a TODO; this owner refuses odd ones), and each
-        // segment fits OPTC_SEGMENT_WIDTH. Two distinct pipes; a 4:2:0
-        // segment keeps whole pixel pairs (ValidateODMMode).
-        if let Some(q) = self.odm {
-            if q >= 4 || q == self.pipe {
+        // Combine: two pixels per OTG clock for 2:1, four for 3:1 and 4:1,
+        // so every horizontal boundary divides by that (Linux checks only
+        // the active width and leaves the rest a TODO; this owner refuses
+        // the others), and each segment fits OPTC_SEGMENT_WIDTH. Distinct
+        // pipes; a 4:2:0 2:1 segment keeps whole pixel pairs
+        // (ValidateODMMode).
+        if self.odm.is_some() {
+            if !self.odm.valid_with(self.pipe) {
                 return Err(Error::Invalid);
             }
-            if (self.ycbcr420 && t.h_active % 4 != 0)
-                || (t.h_active | t.h_total | t.h_sync_width | hs | he) & 1 != 0
-                || t.h_active > 8192
+            let div = if segments > 2 { 4 } else { 2 };
+            let plan = Plan {
+                request: self,
+                h_blank: 0,
+                v_blank: 0,
+                vtg: 0,
+            };
+            if (self.ycbcr420 && t.h_active % (2 * div) != 0)
+                || [t.h_active, t.h_total, t.h_sync_width, hs, he]
+                    .iter()
+                    .any(|&v| v % div != 0)
+                || plan.segment_width() > 0x1fff
+                || plan.last_segment_width() > 0x1fff
+                // The segments' own ODM memories hold 4096 pixels each.
+                || t.h_active > 4096 * segments
             {
                 return Err(Error::Unsupported);
             }
@@ -675,8 +863,8 @@ impl Request {
             (Signal::Tmds, dccg::PixelClock::Tmds { .. }) => true,
             _ => false,
         };
-        // ODM 2:1 clocks each segment at half the pixel rate.
-        let segments = if self.odm.is_some() { 2 } else { 1 };
+        // ODM clocks each segment at its share of the pixel rate.
+        let segments = self.odm.count();
         if !signal_matches
             || clock.request.pipe != self.pipe
             || self.timing.pixel_clock_khz.div_ceil(segments) > clock.global.display_khz
@@ -840,10 +1028,10 @@ impl Siblings {
             if staged {
                 out.pipes |= 1 << p;
             }
-            // A combined timing holds its ODM pipe from preparation on, and
+            // A combined timing holds its ODM pipes from preparation on, and
             // a staged surface from staging on.
-            if let Some(q) = s.pipes[i].and_then(|a| a.request.odm) {
-                out.pipes |= bit(q);
+            if let Some(a) = s.pipes[i] {
+                out.pipes |= a.request.odm.mask();
             }
             let surface = s.surfaces[i]
                 .or(s.dpps[i].map(|d| d.surface))
@@ -1183,12 +1371,16 @@ impl<I: Io> Engine<I> {
         self.wait(otg(CLOCK), 0x100, 0x100, 1000).await?;
         self.update(l.vtg(pipe), 0x80000000, 0)?;
         // Native ODM bypass: no legacy segment-width programming. One OPP,
-        // all unused segments disconnected, no ODM combining memory. 2:1
-        // combine (optc401_set_odm_combine): both OPPs, the segment width
-        // and the line memories the width needs.
+        // all unused segments disconnected, no ODM combining memory.
+        // Combine (optc401_set_odm_combine): every segment's OPP, the
+        // segment width (and for 3:1 the last segment's) and the line
+        // memories the width needs.
         self.update(odm(SOURCE), u32::MAX, plan.source(true))?;
         if plan.request.odm.is_some() {
             self.update(odm(WIDTH), 0x1fff, plan.segment_width())?;
+        }
+        if plan.request.odm.len() == 2 {
+            self.update(odm(WIDTH2), 0x1fff, plan.last_segment_width())?;
         }
         // Native HW may select divide-by-two automatically only if every
         // horizontal boundary is even. Odd timings require manual no-divide.
@@ -1227,11 +1419,9 @@ impl<I: Io> Engine<I> {
         let plan = request.plan()?;
         request.validate_clock(clock)?;
         self.preflight(request.pipe, false)?;
-        // The ODM pipe joins this display; it must not be another's.
-        if let Some(q) = request.odm {
-            if self.displays.siblings.pipes & bit(q) != 0 {
-                return Err(Error::Busy);
-            }
+        // The ODM pipes join this display; none may be another's.
+        if self.displays.siblings.pipes & request.odm.mask() != 0 {
+            return Err(Error::Busy);
         }
         self.status.state = State::Preparing(request.pipe);
         self.status.dpps[usize::from(request.pipe)] = None;
@@ -1292,7 +1482,7 @@ impl<I: Io> Engine<I> {
             .get(usize::from(pipe))
             .copied()
             .flatten()
-            .and_then(|a| a.request.odm);
+            .map_or(SplitPipes::NONE, |a| a.request.odm);
         self.status.state = State::Retiring(pipe);
         self.status.dpps[usize::from(pipe)] = None;
         self.status.mpcs[usize::from(pipe)] = None;
@@ -1303,7 +1493,7 @@ impl<I: Io> Engine<I> {
         // timing's disable.
         let result = async {
             self.stop_dsc(pipe).await?;
-            if let Some(q) = odm {
+            for q in odm {
                 self.stop_dsc(q).await?;
             }
             self.disable(pipe).await?;
@@ -1377,6 +1567,38 @@ impl Otg {
     pub fn siblings(&self) -> Siblings {
         self.0.displays.siblings
     }
+    /// The consumer registers every display of this owner holds (the
+    /// selected one's too): what a live clock update leaves to them.
+    pub(crate) fn all_held(&self) -> impl Fn(u64) -> bool + Sync + Copy {
+        let d = &self.0.displays;
+        let all = d.siblings.union(Siblings::of(&self.0.status));
+        let layout = self.0.layout;
+        move |at| held_by_sibling(all, layout, at)
+    }
+    /// The registers the displays other than the selected one hold.
+    pub(crate) fn siblings_held(&self) -> impl Fn(u64) -> bool + Sync + Copy {
+        let (held, layout) = self.0.held();
+        move |at| held_by_sibling(held, layout, at)
+    }
+    /// After a live clock update: every record of display `display`'s
+    /// timing carries the clock owner's new record of its pipe, `clock`
+    /// (the global clocks and the DPP DTO it now runs on). Records only; the
+    /// display must be settled.
+    pub(crate) fn rebind_clock(&mut self, display: u8, clock: dccg::Applied) -> Result<(), Error> {
+        let d = &mut *self.0.displays;
+        let status = if display == d.selected {
+            &mut *self.0.status
+        } else {
+            d.parked
+                .get_mut(usize::from(display))
+                .ok_or(Error::Invalid)?
+        };
+        if !status.state.settled() {
+            return Err(Error::Busy);
+        }
+        status.rebind_timing(clock.request.pipe, |a| a.clock = clock);
+        Ok(())
+    }
     /// Prepare disabled fixed-refresh RGB timing against matching current
     /// clocks. No OPP/plane/PHY setup, bandwidth proof or scanout enable.
     pub async fn prepare(
@@ -1395,8 +1617,8 @@ impl Otg {
                 held_by_sibling(held, layout, at)
             })
             .map_err(Error::PipeClocks)?;
-        // The ODM pipe's DPP runs at the same DPPCLK, without a pixel clock.
-        if let Some(q) = request.odm {
+        // Each ODM pipe's DPP runs at the same DPPCLK, without a pixel clock.
+        for q in request.odm {
             let segment = dccg
                 .segment_clock(self.0.io.0, clocks, q, &|at| {
                     held_by_sibling(held, layout, at)

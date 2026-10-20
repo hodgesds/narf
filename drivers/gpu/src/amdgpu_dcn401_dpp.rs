@@ -463,6 +463,7 @@ fn dcn401_dpp_line_buffer_follows_linux() -> narf_kernel_test::TestResult {
                 stream_width: width,
                 stream_height: 64,
                 odm_slice: r,
+                mpc_slice: (0, 1),
                 rotation: spl::Rotation::R0,
                 horizontal_mirror: false,
                 alpha,

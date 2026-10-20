@@ -485,7 +485,8 @@ fn dcn401_uhbr_audio_filters_capabilities_and_binds_scanout() -> TestResult {
     .unwrap();
     let scanout = ScanoutRunning {
         pipe: 1,
-        odm: None,
+        odm: SplitPipes::NONE,
+        mpc: SplitPipes::NONE,
         stream: 2,
         plan,
         address: 0x8_0010_0000,

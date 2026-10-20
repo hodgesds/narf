@@ -12,19 +12,29 @@
 //! optionally with GFX12 DCC (no metadata plane: the mcache's DRAM overhead
 //! and placement), scaled as SPL scales it and scanned horizontally or (a
 //! tiled surface rotated 90/270) vertically, in physical VRAM:
-//! GPUVM/HostVM, MALL/SubVP, cursor, tdlut, dynamic metadata, writeback,
-//! MPC combine and immediate flip are all off; a 4:4:4 DP stream may use
-//! DSC. One tiled RGB plane alone on one pipe requests unbounded.
+//! GPUVM/HostVM, MALL/SubVP, cursor, tdlut, dynamic metadata, writeback and
+//! immediate flip are all off; a 4:4:4 DP stream may use DSC. One tiled RGB
+//! plane alone on one pipe requests unbounded.
 //!
-//! ODM is DML's `dml2_odm_mode_auto` with dynamic ODM off (DecideODMMode),
-//! limited to bypass and 2:1: a stream takes two pipes (DPP + OPP each, one
-//! DSC each) when its pixel clock exceeds the downspread-limited DISPCLK
-//! maximum, its DSC line is wider than 5760 pixels or has more than four
-//! slices, or its 4:2:0 line is wider than 4096 pixels. Each pipe then fetches
-//! half the line at half the pixel clock; ValidateODMMode's even-split, slice
-//! and width limits apply. A stream DML would split 3:1 or 4:1 is rejected,
-//! and so is a configuration needing more than four pipes in all. A two-pipe
-//! [`Plan`] carries both pipes' values: they differ only in the DLG blank end.
+//! ODM is DML's `dml2_odm_mode_auto` with dynamic ODM off (DecideODMMode):
+//! a stream takes two, three or four pipes (DPP + OPP each, one DSC each)
+//! when its pixel clock exceeds that many less one pipes' downspread-limited
+//! DISPCLK maximum, its DSC line is wider than 5760 pixels per DSC or has
+//! more than four slices per DSC (three pipes only for twelve slices), or
+//! its 4:2:0 line is wider than 4096 pixels per pipe. Each pipe then fetches
+//! its segment of the line at its share of the pixel clock;
+//! ValidateODMMode's split (3:1 and 4:1 lines divide by four, 3:1 may be
+//! uneven without DSC), slice and width limits apply, and a configuration
+//! needing more than four pipes in all is rejected. A multi-pipe [`Plan`]
+//! carries every pipe's values: they differ only in the DLG blank end.
+//!
+//! MPC combine follows DML's auto `mpcc_combine_factor` (DC's default): a
+//! plane in ODM bypass whose single DPP would need more than the DPPCLK
+//! maximum or cannot hold its viewport's swath takes two DPPs, each
+//! fetching half the viewport (DCN4's `mpc_combine_limit` is two). Only
+//! linear, horizontally scanned RGB planes without DCC are combined; a
+//! tiled, rotated, 4:2:0 or DCC plane one DPP cannot carry is refused, as
+//! is a DCC plane whose mcaches Linux would split over MPC pipes.
 //!
 //! The default 320-KiB DET from the staged requestor is a fixed input for
 //! every pipe rather than DML's own allocation (four pipes fit the 1280-KiB
@@ -49,8 +59,8 @@ use alloc::vec::Vec;
 pub enum Error {
     /// Inputs that cannot describe a real mode or board.
     Invalid,
-    /// A shape outside the admitted configuration, including a stream DML
-    /// would split 3:1 or 4:1 or one ODM 2:1 cannot divide evenly.
+    /// A shape outside the admitted configuration, including a stream its
+    /// ODM split cannot divide as ValidateODMMode requires.
     Unsupported,
     /// The clock tables cannot supply DML's fabric/DCF state for this UCLK,
     /// or the configuration's SDP bandwidth would make DPMM raise DCFCLK or
@@ -73,7 +83,7 @@ pub enum Error {
     /// A DLG/TTU value exceeds the range DML asserts for its register field.
     Register,
     /// The streams need more than the four DPP/OPP pipes DCN4.0.1 has
-    /// (an ODM 2:1 stream takes two).
+    /// (an ODM stream takes one per segment, an MPC-combined plane two).
     Pipes,
 }
 
@@ -386,24 +396,18 @@ fn dsc_delay(t: &Timing, dsc: Dsc, odm: u32) -> u32 {
 }
 
 /// DecideODMMode for `dml2_odm_mode_auto` (dynamic ODM off): the fewest
-/// pipes whose DISPCLK (the pixel clock over the pipes; an HDMI 4:2:0
-/// output's TMDS rate is never the larger term) fits `dispclk_ss_khz`, at
-/// least two for a DSC line wider than one DSC takes or a 4:2:0 line wider
-/// than one formatter buffer, and two for more than four DSC slices. 3 stands
-/// for any wider split (3:1 or 4:1), which DML would choose but this port
-/// does not admit.
+/// pipes whose DISPCLK (CalculateRequiredDispclk: the pixel clock over the
+/// pipes, at least half of it for an HDMI TMDS 4:2:0 output) fits
+/// `dispclk_ss_khz`, else four; at least as many as a DSC line needs at
+/// 5760 pixels per DSC or a 4:2:0 line at 4096 pixels per formatter; with
+/// DSC, two for more than four slices, three for more than eight, and four
+/// for a three-pipe split whose slices are not twelve.
 fn decide_odm(mode: &Mode, dispclk_ss_khz: u64) -> u32 {
     let t = &mode.timing;
     let pclk = u64::from(t.pixel_clock_khz);
-    let fits = |pipes: u32| pclk <= u64::from(pipes) * dispclk_ss_khz;
-    let span = |limit: u32| t.h_active.div_ceil(limit).max(1);
-    let mut odm = if fits(1) {
-        1
-    } else if fits(2) {
-        2
-    } else {
-        3
-    };
+    let fits = |pipes: u32| pclk <= u64::from(disp_divider(pipes, mode.ycbcr420)) * dispclk_ss_khz;
+    let span = |limit: u32| t.h_active.div_ceil(limit).clamp(1, 4);
+    let mut odm = (1..=3).find(|&n| fits(n)).unwrap_or(4);
     if mode.dsc.is_some() {
         odm = odm.max(span(MAX_PIXELS_PER_DSC));
     }
@@ -417,15 +421,28 @@ fn decide_odm(mode: &Mode, dispclk_ss_khz: u64) -> u32 {
         if odm == 2 && dsc.slices > 2 * MAX_SLICES_PER_DSC {
             odm = 3;
         }
+        if odm == 3 && dsc.slices != 3 * MAX_SLICES_PER_DSC {
+            odm = 4;
+        }
     }
-    odm.min(3)
+    odm
+}
+
+/// CalculateRequiredDispclk's divisor of the pixel clock for `odm` pipes:
+/// the pipe count, but at most two for an HDMI TMDS 4:2:0 output, whose
+/// DISPCLK is at least half the pixel clock (`TMDS420MinPixClock`).
+fn disp_divider(odm: u32, ycbcr420: bool) -> u32 {
+    if ycbcr420 {
+        odm.min(2)
+    } else {
+        odm
+    }
 }
 
 /// The pipes admission gives a DSC stream of `timing` with `slices`
 /// horizontal slices on a board whose highest DISPCLK is
 /// `dispclk_max_khz` (DecideODMMode less downspread, as `admit_all` runs
-/// it): 1, 2, or 3 for a wider split. DSC policy uses it to keep each
-/// segment within one DSC.
+/// it): 1 to 4. DSC policy uses it to keep each segment within one DSC.
 pub fn dsc_pipes(timing: &Timing, slices: u32, dispclk_max_khz: u32) -> u32 {
     let mode = Mode {
         timing: *timing,
@@ -438,6 +455,21 @@ pub fn dsc_pipes(timing: &Timing, slices: u32, dispclk_max_khz: u32) -> u32 {
     let ss = u64::from(dispclk_max_khz) * 10_000 / DOWNSPREAD_TENTHOUSANDTHS as u64;
     decide_odm(&mode, ss)
 }
+
+/// `dsc_pipes` when the native DSCs take the stream's shape: one DSC401
+/// per pipe, each image at most 5184 pixels with at most four slices, the
+/// slices split evenly between the pipes (twelve on three, as
+/// ValidateODMMode requires). `None` otherwise.
+pub fn dsc_shape(timing: &Timing, slices: u32, dispclk_max_khz: u32) -> Option<u32> {
+    let pipes = dsc_pipes(timing, slices, dispclk_max_khz);
+    (slices % pipes == 0
+        && slices <= MAX_SLICES_PER_DSC * pipes
+        && (pipes != 3 || slices == 3 * MAX_SLICES_PER_DSC)
+        && timing.h_active <= DSC401_MAX_IMAGE_WIDTH * pipes)
+        .then_some(pipes)
+}
+/// DSC401's `max_image_width`.
+pub const DSC401_MAX_IMAGE_WIDTH: u32 = 5184;
 
 /// Clocks the plan was computed for. DISPCLK, DPPREFCLK and the pipe's DPPCLK
 /// are minimums the clock owner must meet; DCFCLK/FCLK/UCLK are DML's own
@@ -568,13 +600,15 @@ pub struct Arbiter {
 
 /// A reproducible programming plan for one mode on one board state.
 ///
-/// With `pipes == 2` (ODM 2:1) the stream's one OTG drives two OPPs, each fed
-/// by its own DPP/HUBP reading one half of the line. Both pipes run at
-/// `clocks.dppclk_khz` with `det_bytes` of DET and the same `ttu` and `dlg`,
-/// except that the second pipe's `refcyc_h_blank_end` is
-/// `odm_refcyc_h_blank_end` ([`Plan::pipe_dlg`]); Linux DML21 programs no
-/// other per-pipe difference (check.sh verifies every register of the second
-/// pipe against the first).
+/// With `pipes` of 2 to 4 (ODM 2:1, 3:1, 4:1) the stream's one OTG drives
+/// that many OPPs, each fed by its own DPP/HUBP reading its segment of the
+/// line. Every pipe runs at `clocks.dppclk_khz` with `det_bytes` of DET and
+/// the same `ttu` and `dlg`, except that each further pipe's
+/// `refcyc_h_blank_end` is its `odm_refcyc_h_blank_end` entry
+/// ([`Plan::pipe_dlg`]); Linux DML21 programs no other per-pipe difference
+/// (check.sh verifies every register of every further pipe against the
+/// first). A plane in ODM bypass may still take two DPPs (MPC combine,
+/// [`PlanePlan::dpps`]); both program identical values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Plan {
     pub mode: Mode,
@@ -588,12 +622,13 @@ pub struct Plan {
     pub arbiter: Arbiter,
     /// DET of each of the stream's pipes.
     pub det_bytes: u32,
-    /// DPP/OPP pipes the stream takes: 1 in ODM bypass, 2 in ODM 2:1 combine.
-    /// DML's policy decides it ([`admit_all`]), not the caller.
+    /// ODM segments (OPPs, and DPPs of each plane) the stream takes: 1 in
+    /// ODM bypass, 2 to 4 in ODM 2:1, 3:1 or 4:1 combine. DML's policy
+    /// decides it ([`admit_all`]), not the caller.
     pub pipes: u8,
-    /// The second ODM pipe's `refcyc_h_blank_end`: the blank end moved by
-    /// half the active line. Zero with one pipe.
-    pub odm_refcyc_h_blank_end: u32,
+    /// Each further ODM pipe's `refcyc_h_blank_end` (pipes 1 to 3): the
+    /// blank end moved by the segments before it. Zero past `pipes`.
+    pub odm_refcyc_h_blank_end: [u32; 3],
     /// Vertical blank budgeted for self-refresh entry and exit, if any.
     pub stutter_reserved_us: u32,
     /// Every other mode admitted together with this one, in admission
@@ -610,20 +645,34 @@ pub struct Plan {
 }
 
 /// One plane's share of a stream's [`Plan`] (the plane is the plan's
-/// `mode.plane_list()` entry): every one of its `Plan::pipes` pipes runs at
-/// `dppclk_khz` with `det_bytes` and this DLG/TTU, the second ODM pipe with
-/// its own blank end.
+/// `mode.plane_list()` entry): every one of its `dpps` pipes runs at
+/// `dppclk_khz` with `det_bytes` and this DLG/TTU, each further ODM pipe
+/// with its own blank end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlanePlan {
     pub dppclk_khz: u32,
     pub dlg: Dlg,
     pub ttu: Ttu,
     pub det_bytes: u32,
-    pub odm_refcyc_h_blank_end: u32,
+    pub odm_refcyc_h_blank_end: [u32; 3],
+    /// DML's NoOfDPP for the plane: its stream's `Plan::pipes` ODM
+    /// segments, or 2 in ODM bypass when DML MPC-combines it (each DPP then
+    /// scans half the plane's recout, blended in the segment's MPCC tree).
+    pub dpps: u8,
     /// Every pipe's DCHUBP request configuration.
     pub rq: RqRegs,
     /// A DCC plane's mcache allocation; `None` without DCC.
     pub mcache: Option<McacheAllocation>,
+}
+impl PlanePlan {
+    /// MPC slices of the plane: its DPPs in ODM bypass, else 1.
+    pub fn mpc_slices(&self, odm_pipes: u8) -> u8 {
+        if odm_pipes > 1 {
+            1
+        } else {
+            self.dpps
+        }
+    }
 }
 
 /// A DCC plane's `dml2_mcache_surface_allocation` as DML21 leaves it in the
@@ -856,8 +905,10 @@ fn round(v: Fx) -> i64 {
 fn floor_quarter(v: Fx) -> Fx {
     q(fx(4).times(v).floor(), 4)
 }
+/// DML's math_ceil2(4 * v, 1) / 4: lib_float_math's (int)(x + 0.99999),
+/// so a value within 1e-5 above a quarter line stays on it.
 fn ceil_quarter(v: Fx) -> Fx {
-    q(fx(4).times(v).ceil(), 4)
+    q(fx(4).times(v).plus(q(99_999, 100_000)).floor(), 4)
 }
 fn ceil_to(v: u64, m: u64) -> u64 {
     v.div_ceil(m) * m
@@ -1229,8 +1280,11 @@ struct Shape {
     t: Timing,
     pclk: Fx,
     line: Fx,
-    /// Pipes (ODM segments): 1 or 2.
+    /// ODM segments of the plane's stream: 1 to 4.
     odm: u32,
+    /// The plane's DPPs (DML's NoOfDPP / DPPPerSurface): its stream's ODM
+    /// segments, or 2 for an MPC-combined plane in ODM bypass.
+    dpps: u32,
     /// DETBufferSizeInKByte of each pipe, in bytes.
     det_bytes: u32,
     vblank: u32,
@@ -1455,7 +1509,7 @@ impl Shape {
         {
             return Err(Error::Invalid);
         }
-        let blocks = plane.validate()?;
+        plane.validate()?;
         // DML needs a blank line after VStartup for MIN_DST_Y_NEXT_START.
         if t.v_total - t.v_active < 2
             || t.v_front_porch == 0
@@ -1477,29 +1531,41 @@ impl Shape {
             return Err(Error::PixelClock);
         }
         let odm = decide_odm(mode, dispclk_ss_khz);
-        // Only bypass and 2:1 are admitted; Linux would split wider.
-        if odm > 2 {
-            return Err(Error::Unsupported);
+        // ValidateODMMode: DISPCLK within the maximum (an HDMI 4:2:0 output's
+        // stays at half the pixel clock however wide the split); each pipe
+        // takes an equal share of the line in whole pixel containers (a
+        // 3:1 split only with DSC), and OTG_H_TIMING_DIV_MODE's divisor
+        // (four for 3:1 and 4:1, which pack four pixels per transfer)
+        // divides the line; the formatter's 4:2:0 line buffer per pipe.
+        if u64::from(t.pixel_clock_khz)
+            > u64::from(disp_divider(odm, mode.ycbcr420)) * dispclk_ss_khz
+        {
+            return Err(Error::PixelClock);
         }
-        // ValidateODMMode: each pipe takes an even share of the line (a 4:2:0
-        // output passes two pixels per clock), and fits the formatter's 4:2:0
-        // line buffer.
         let ppc = if mode.ycbcr420 { 2 } else { 1 };
-        if t.h_active % (odm * ppc) != 0
-            || t.h_active % odm.max(ppc) != 0
+        let symmetric = odm != 3 || mode.dsc.is_some();
+        let h_div = match odm {
+            3 | 4 => 4,
+            2 => 2,
+            _ => ppc,
+        };
+        if (symmetric && t.h_active % (odm * ppc) != 0)
+            || t.h_active % h_div != 0
             || (mode.ycbcr420 && t.h_active > odm * FMT_420_BUFFER_WIDTH)
         {
             return Err(Error::Unsupported);
         }
         // With DSC, ValidateODMMode (one DSC per pipe: at most 5760 pixels
         // and four slices each, the slices dividing the line and splitting
-        // evenly between the pipes), the DSC unit/slice checks, and
-        // DSCCLKRequiredMoreThanSupported (a third of each pipe's pixels).
+        // evenly between the pipes, all twelve on three), the DSC unit/slice
+        // checks, and DSCCLKRequiredMoreThanSupported (a third of each
+        // pipe's pixels).
         if let Some(dsc) = mode.dsc {
             if dsc.slices > odm * MAX_SLICES_PER_DSC
                 || t.h_active > odm * MAX_PIXELS_PER_DSC
                 || t.h_active % dsc.slices != 0
                 || dsc.slices % odm != 0
+                || (odm == 3 && dsc.slices != 3 * MAX_SLICES_PER_DSC)
             {
                 return Err(Error::Unsupported);
             }
@@ -1509,21 +1575,36 @@ impl Shape {
                 return Err(Error::PixelClock);
             }
         }
+        Self::with_pipes(mode, plane, stream, odm, odm, channels)
+    }
+    /// The plane's quantities on `dpps` DPPs of a stream split `odm` ways:
+    /// `dpps == odm` for an ODM split, or 2 on one ODM segment for MPC
+    /// combine (the viewport halved).
+    fn with_pipes(
+        mode: &Mode,
+        plane: Plane,
+        stream: usize,
+        odm: u32,
+        dpps: u32,
+        channels: u32,
+    ) -> Result<Self, Error> {
+        let t = mode.timing;
+        let blocks = plane.validate()?;
         // CalculateSwathWidth: the viewport (its height scanning
-        // vertically), or with ODM each pipe's share of the line in source
-        // pixels (math_round), at most that; a 4:2:0 chroma swath is half
-        // the luma one. Each is rounded to whole requests within the
-        // surface.
+        // vertically); with ODM each pipe's share of the line in source
+        // pixels (math_round), at most that; with MPC combine half the
+        // viewport; a 4:2:0 chroma swath is half the luma one. Each is
+        // rounded to whole requests within the surface.
         let vertical = plane.vertical_scan;
         let along = |w: u16, h: u16| u32::from(if vertical { h } else { w });
         let vp = along(plane.viewport_width, plane.viewport_height);
         let swath = if odm > 1 {
-            let share = (u64::from(t.h_active) * u64::from(plane.h_ratio)
-                + u64::from(Plane::UNITY))
-                / (2 * u64::from(Plane::UNITY));
+            let share = (2 * u64::from(t.h_active) * u64::from(plane.h_ratio)
+                + u64::from(odm) * u64::from(Plane::UNITY))
+                / (2 * u64::from(odm) * u64::from(Plane::UNITY));
             vp.min(share as u32)
         } else {
-            vp
+            vp / dpps
         };
         let c = plane.chroma_values();
         let ratio = |r: u32| q(i64::from(r), i64::from(Plane::UNITY));
@@ -1741,6 +1822,7 @@ impl Shape {
             pclk: mhz(u64::from(t.pixel_clock_khz)),
             line: q(i64::from(t.h_total) * 1000, i64::from(t.pixel_clock_khz)),
             odm,
+            dpps,
             det_bytes: det,
             vblank: t.v_total - t.v_active,
             ycbcr420: mode.ycbcr420,
@@ -1748,13 +1830,43 @@ impl Shape {
             plane,
             y,
             c: chroma,
-            dpp: single / f64::from(odm),
+            dpp: single / f64::from(dpps),
             dpp_unit: single == pixel_mhz,
             dram_nom,
             dram_pref,
             mcaches: mcache_count,
             mcache: mcache_alloc,
         })
+    }
+    /// The MPC combine decision of dml2_core_dcn4_calcs.c's mode support
+    /// for a plane in ODM bypass with `mpcc_combine_factor` auto (as DC
+    /// passes it): two DPPs when one would need more than the
+    /// downspread-limited DPPCLK maximum (MinDPPCLKUsingSingleDPP) or
+    /// cannot take the whole viewport (SingleDPPViewportSizeSupport: the
+    /// swath against the DET, the linear swath limit and the line buffer).
+    /// DCN4's `mpc_combine_limit` is two.
+    ///
+    /// Only a linear, horizontally scanned RGB plane without DCC is ever
+    /// combined (what the reference vectors cover); any other plane one DPP
+    /// cannot carry keeps one and is refused below, as with factor 1.
+    fn mpc_combined(self, mode: &Mode, dppclk_ss_khz: u64, channels: u32) -> Result<Self, Error> {
+        if self.odm > 1
+            || self.plane.is_420()
+            || self.plane.dcc
+            || self.plane.vertical_scan
+            || self.plane.swizzle != Swizzle::Linear
+        {
+            return Ok(self);
+        }
+        let dpp_over = if self.dpp_unit {
+            u64::from(self.t.pixel_clock_khz) > dppclk_ss_khz
+        } else {
+            self.dpp > dppclk_ss_khz as f64 / 1000.0
+        };
+        if !dpp_over && self.buffers().is_ok() {
+            return Ok(self);
+        }
+        Self::with_pipes(mode, self.plane, self.stream, 1, 2, channels)
     }
     /// The surfaces of the plane: luma, then a 4:2:0 plane's chroma.
     fn surfaces(&self) -> impl Iterator<Item = &Surf> {
@@ -1821,7 +1933,7 @@ impl Shape {
         Some(time.over(time.minus(urgent)))
     }
     /// `CalculateDCFCLKDeepSleep`'s per-surface term with no tdlut: at
-    /// VRatio up to 1 a pipe delivers its swath in `odm` times its share of
+    /// VRatio up to 1 a pipe delivers its swath in `dpps` times its share of
     /// the line at the scaled rate, above it at the scaler's throughput.
     fn deep_sleep_surface(&self, dpp: Fx) -> Fx {
         let factor = q(DCFCLK_FACTOR_HUNDREDTHS, 100);
@@ -1831,7 +1943,7 @@ impl Shape {
             per_byte
                 .times(self.pclk)
                 .times(y.hratio)
-                .over(fx(i64::from(self.odm)))
+                .over(fx(i64::from(self.dpps)))
         } else {
             per_byte.times(fx_f(y.pscl)).times(dpp)
         };
@@ -1843,7 +1955,7 @@ impl Shape {
         if self.dpp_unit {
             return q(
                 i64::from(self.t.pixel_clock_khz),
-                1000 * i64::from(self.odm),
+                1000 * i64::from(self.dpps),
             );
         }
         fx_f(self.dpp)
@@ -1851,19 +1963,19 @@ impl Shape {
     /// The same as DML hands it to DPMM: truncated to kHz.
     fn dpp_khz(&self) -> u32 {
         if self.dpp_unit {
-            return self.t.pixel_clock_khz / self.odm;
+            return self.t.pixel_clock_khz / self.dpps;
         }
         (self.dpp * 1000.0) as u32
     }
     /// `RequiredDISPCLKPerSurface`: the pixel clock over the pipes, in kHz
     /// as DPMM takes it.
     fn disp_khz(&self) -> u32 {
-        self.t.pixel_clock_khz / self.odm
+        self.t.pixel_clock_khz / disp_divider(self.odm, self.ycbcr420)
     }
     fn disp_mhz(&self) -> Fx {
         q(
             i64::from(self.t.pixel_clock_khz),
-            1000 * i64::from(self.odm),
+            1000 * i64::from(disp_divider(self.odm, self.ycbcr420)),
         )
     }
 }
@@ -1908,7 +2020,7 @@ fn deep_sleep_khz(shapes: &[Shape]) -> u32 {
     shapes.iter().fold(8000.max(bw) as u32, |ds, s| {
         let pclk = u64::from(s.t.pixel_clock_khz);
         let surface =
-            (f as u64 * u64::from(s.y.bpp) * pclk / (100 * 64 * u64::from(s.odm))).max(pclk / 16);
+            (f as u64 * u64::from(s.y.bpp) * pclk / (100 * 64 * u64::from(s.dpps))).max(pclk / 16);
         ds.max(surface as u32)
     })
 }
@@ -1926,7 +2038,7 @@ fn deep_sleep_f(shapes: &[Shape]) -> f64 {
             let (h, v) = (ratio_f(u.h_ratio), ratio_f(u.v_ratio));
             let swath = f64::from(u.swath);
             if v <= 1.0 {
-                swath * f64::from(s.odm) / h / pixel_mhz
+                swath * f64::from(s.dpps) / h / pixel_mhz
             } else {
                 swath / u.pscl / s.dpp
             }
@@ -2024,16 +2136,12 @@ impl Shape {
                 .plus(fx(DISPCLK_DELAY_CYCLES).times(self.pclk).over(dispclk))
                 .plus(fx(i64::from(self.dsc_delay))),
         ) as u32;
-        // ODM combine adds 18 pixels and every further pipe's recout width
-        // (DPP_RECOUT_WIDTH: the swath over the horizontal ratio, truncated).
+        // ODM combine adds 18 pixels, and every further DPP of the plane (ODM
+        // segment or MPC slice) its recout width (DPP_RECOUT_WIDTH: the
+        // swath over the horizontal ratio, truncated).
         let recout = (u64::from(self.y.swath) * u64::from(Plane::UNITY)
             / u64::from(self.plane.h_ratio)) as u32;
-        let dst_x = dst_x
-            + if self.odm > 1 {
-                18 + (self.odm - 1) * recout
-            } else {
-                0
-            };
+        let dst_x = dst_x + if self.odm > 1 { 18 } else { 0 } + (self.dpps - 1) * recout;
         // CalculatePrefetchSchedule: one line after the scaler for a 4:2:0
         // output, then the pixel delay folded into lines.
         let dst_x = dst_x + if self.ycbcr420 { t.h_total } else { 0 };
@@ -2052,7 +2160,7 @@ impl Shape {
         // One-to-one schedule, against this pipe's share of the surface's
         // active bandwidth.
         let min_lsw_oto = q(src_max, MAX_VRATIO_PRE_OTO).max(fx(2));
-        let pipes = fx(i64::from(self.odm));
+        let pipes = fx(i64::from(self.dpps));
         let per_pipe = c.map_or(y.vactive_bw.over(pipes), |c| {
             let bw = if mp { c.vactive_bw_mp } else { c.vactive_bw };
             y.vactive_bw.over(pipes).plus(bw.over(pipes))
@@ -2164,7 +2272,7 @@ fn evaluate(
         let a = available(lat_state).urgent[0];
         a[0].min(a[1])
     };
-    let dpps: i64 = shapes.iter().map(|s| i64::from(s.odm)).sum();
+    let dpps: i64 = shapes.iter().map(|s| i64::from(s.dpps)).sum();
     let t_arb = fx(dpps * PIXEL_CHUNK_KBYTES * 1024).over(return_bw);
     let request = shapes
         .iter()
@@ -2217,7 +2325,7 @@ fn evaluate(
         // no flip, VM, cursor or excess vactive fill; unity MALL factors and
         // DCC's DRAM overhead on DRAM only. Active bandwidth is the
         // surface's; prefetch is per pipe.
-        let pipes = fx(i64::from(shape.odm));
+        let pipes = fx(i64::from(shape.dpps));
         let vbw_y = shape.y.vactive_bw;
         let vbw_c = shape.c.map_or(
             Fx::ZERO,
@@ -2441,7 +2549,8 @@ pub fn admit(soc: &Soc, mode: &Mode) -> Result<Plan, Error> {
 }
 
 /// Admit `modes` together, one stream each on one pipe or, where DML's ODM
-/// policy splits it, two ([`Plan::pipes`]), returning their plans in order or
+/// policy splits it, two to four ([`Plan::pipes`]; an MPC-combined plane in
+/// ODM bypass takes two DPPs, [`PlanePlan::dpps`]), returning their plans in order or
 /// the first DML check the configuration fails. Every pipe keeps the fixed
 /// DET, and the shared quantities are joint as in DML21: read and urgent
 /// bandwidth sum over the surfaces (prefetch over each surface's pipes),
@@ -2450,6 +2559,68 @@ pub fn admit(soc: &Soc, mode: &Mode) -> Result<Plan, Error> {
 /// stream's blank allows it. The global watermarks and arbiter are therefore
 /// the same in every plan.
 pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
+    admit_all_with(soc, modes, Policy::NATIVE)
+}
+
+/// What admission decides beyond DC's own inputs. DC leaves DCN401's
+/// `mpcc_combine_factor` at auto; the factor-1 policy exists only to replay
+/// reference vectors Linux planned with MPC combine forced off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Policy {
+    /// MPC-combine a plane in ODM bypass that one DPP cannot carry (two
+    /// DPPs blended in its stream's MPCC tree, each with half the
+    /// viewport), as DML's auto factor does; off is factor 1.
+    pub mpc_combine: bool,
+}
+impl Policy {
+    /// The native display path's policy: DC's.
+    pub const NATIVE: Self = Self { mpc_combine: true };
+}
+
+/// `admit_all` for what the native display path lights: also refusing
+/// (`Unsupported`) an ODM split whose horizontal timing the native OTG
+/// cannot divide (`odm_timing_ok`). ValidateODMMode checks only the active
+/// width against OTG_H_TIMING_DIV_MODE, leaving the other boundaries a
+/// TODO; Linux plans such a stream.
+pub fn admit_native(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
+    let plans = admit_all(soc, modes)?;
+    if plans
+        .iter()
+        .any(|p| !odm_timing_ok(&p.mode.timing, u32::from(p.pipes), p.mode.ycbcr420))
+    {
+        return Err(Error::Unsupported);
+    }
+    Ok(plans)
+}
+
+/// Whether the native OTG takes stream `t` split `odm` ways (with 4:2:0
+/// output when `ycbcr420`): every horizontal boundary a multiple of the
+/// pixels per OTG clock (two for 2:1, four for 3:1 and 4:1; a 4:2:0 2:1
+/// segment keeps whole pixel pairs), segments of
+/// resource_get_odm_slice_dst_width within OPTC_SEGMENT_WIDTH, and at most
+/// 4096 pixels per segment for its own ODM memories.
+pub fn odm_timing_ok(t: &Timing, odm: u32, ycbcr420: bool) -> bool {
+    if odm < 2 {
+        return true;
+    }
+    let div = if odm > 2 { 4 } else { 2 };
+    let start = t.h_total.wrapping_sub(t.h_front_porch);
+    let end = start.wrapping_sub(t.h_active);
+    let width = t.h_active / odm;
+    let width = width + (width & 1 & u32::from(ycbcr420));
+    let last = t.h_active.saturating_sub(width * (odm - 1));
+    !(ycbcr420 && t.h_active % (2 * div) != 0)
+        && [t.h_active, t.h_total, t.h_sync_width, start, end]
+            .iter()
+            .all(|v| v % div == 0)
+        && width <= 0x1fff
+        && last <= 0x1fff
+        && t.h_active <= 4096 * odm
+}
+
+/// `admit_all` under `policy`. MPC combine only ever admits what factor 1
+/// rejects, so a plan admitted without it re-admits unchanged.
+pub fn admit_all_with(soc: &Soc, modes: &[Mode], policy: Policy) -> Result<Vec<Plan>, Error> {
     soc.validate()?;
     if modes.is_empty() || modes.len() > MAX_STREAMS {
         return Err(Error::Invalid);
@@ -2462,13 +2633,18 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
             if shapes.len() == MAX_PLANES {
                 return Err(Error::Pipes);
             }
-            let shape = Shape::new(mode, plane, k, ss(soc.dispclk_max_khz), soc.umc_channels)?;
+            let mut shape =
+                Shape::new(mode, plane, k, ss(soc.dispclk_max_khz), soc.umc_channels)?;
+            if policy.mpc_combine {
+                shape = shape.mpc_combined(mode, ss(soc.dppclk_max_khz), soc.umc_channels)?;
+            }
             shape.buffers()?;
             shapes.push(shape);
         }
     }
-    // TotalAvailablePipesSupport: one DPP per plane and ODM segment.
-    let dpps = shapes.iter().map(|s| s.odm).sum::<u32>();
+    // TotalAvailablePipesSupport: one DPP per plane and ODM segment or MPC
+    // slice.
+    let dpps = shapes.iter().map(|s| s.dpps).sum::<u32>();
     if dpps > MAX_PIPES {
         return Err(Error::Pipes);
     }
@@ -2527,13 +2703,14 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
     // stream's, DPPREFCLK the fastest plane's.
     for s in &shapes {
         let pclk = u64::from(s.t.pixel_clock_khz);
-        let odm = u64::from(s.odm);
+        let dpps = u64::from(s.dpps);
         let dpp_over = if s.dpp_unit {
-            pclk > odm * ss(soc.dppclk_max_khz)
+            pclk > dpps * ss(soc.dppclk_max_khz)
         } else {
             s.dpp > ss(soc.dppclk_max_khz) as f64 / 1000.0
         };
-        if pclk > odm * ss(soc.dispclk_max_khz) || dpp_over {
+        let disp = u64::from(disp_divider(s.odm, s.ycbcr420));
+        if pclk > disp * ss(soc.dispclk_max_khz) || dpp_over {
             return Err(Error::PixelClock);
         }
     }
@@ -2737,7 +2914,7 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
         // delivers its swath in its pipes' share of the line time at the
         // horizontal ratio (whole pixel counts over the pixel clock: exact);
         // above it at the scaler's throughput, in Linux's doubles.
-        let odm = i128::from(shape.odm);
+        let odm = i128::from(shape.dpps);
         let unity = i128::from(Plane::UNITY);
         let ref_mhz = f64::from(soc.dchub_refclk_khz) / 1000.0;
         let dpp_mhz = f64::from(dppclk_khz[k]) / 1000.0;
@@ -2798,10 +2975,13 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
             plane1_base_address,
             unbounded_request_enabled: unbounded,
         };
-        // rq_dlg_get_dlg_reg: each further ODM pipe's blank ends its share
-        // of the active line later.
+        // rq_dlg_get_dlg_reg: each further ODM pipe's blank ends the
+        // segments before it later (hactive / odm_combine_factor each).
+        let odm_i = i64::from(shape.odm);
         let h_blank_end = |pipe: u32| {
-            (i64::from(t.h_blank_end() + pipe * (t.h_active / shape.odm)) * ref_khz / pclk_i) as u32
+            ((i64::from(t.h_blank_end()) * odm_i + i64::from(pipe) * i64::from(t.h_active))
+                * ref_khz
+                / (pclk_i * odm_i)) as u32
         };
         let sync = GlobalSync {
             vstartup,
@@ -2848,7 +3028,15 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
                     qos_level_fixed_c: 8,
                 },
                 det_bytes: shape.det_bytes,
-                odm_refcyc_h_blank_end: if shape.odm > 1 { h_blank_end(1) } else { 0 },
+                odm_refcyc_h_blank_end: core::array::from_fn(|i| {
+                    let pipe = i as u32 + 1;
+                    if pipe < shape.odm {
+                        h_blank_end(pipe)
+                    } else {
+                        0
+                    }
+                }),
+                dpps: shape.dpps as u8,
                 rq,
                 mcache: shape.mcache,
             },
@@ -2919,17 +3107,20 @@ impl Plan {
     pub fn pipe_dlg(&self, pipe: u8) -> Option<Dlg> {
         self.plane_dlg(0, pipe)
     }
-    /// The DLG of plane `plane`'s pipe `pipe` (as `pipe_dlg`).
+    /// The DLG of plane `plane`'s pipe `pipe` (as `pipe_dlg`; an
+    /// MPC-combined plane's pipes in slice order, all alike).
     pub fn plane_dlg(&self, plane: usize, pipe: u8) -> Option<Dlg> {
         let p = self.planes.get(plane).copied().flatten()?;
-        match pipe {
-            0 => Some(p.dlg),
-            1 if self.pipes == 2 => Some(Dlg {
-                refcyc_h_blank_end: p.odm_refcyc_h_blank_end,
-                ..p.dlg
-            }),
-            _ => None,
+        if pipe >= p.dpps {
+            return None;
         }
+        if pipe == 0 || self.pipes == 1 {
+            return Some(p.dlg);
+        }
+        Some(Dlg {
+            refcyc_h_blank_end: p.odm_refcyc_h_blank_end[usize::from(pipe) - 1],
+            ..p.dlg
+        })
     }
     /// Plane `plane`'s share of the plan.
     pub fn plane(&self, plane: usize) -> Option<PlanePlan> {
@@ -2975,7 +3166,9 @@ impl Plan {
             let (d, t) = (&p.dlg, &p.ttu);
             [
                 (d.refcyc_h_blank_end, 1 << 13),
-                (p.odm_refcyc_h_blank_end, 1 << 13),
+                (p.odm_refcyc_h_blank_end[0], 1 << 13),
+                (p.odm_refcyc_h_blank_end[1], 1 << 13),
+                (p.odm_refcyc_h_blank_end[2], 1 << 13),
                 (d.dlg_vblank_end, 1 << 15),
                 (d.min_dst_y_next_start, 1 << 18),
                 (d.refcyc_per_htotal, 1 << 21),

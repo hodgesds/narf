@@ -91,6 +91,9 @@ impl<I: Io> Engine<I> {
         if plan.request.odm.is_some() {
             self.expect(l.odm(p, WIDTH), 0x1fff, plan.segment_width())?;
         }
+        if plan.request.odm.len() == 2 {
+            self.expect(l.odm(p, WIDTH2), 0x1fff, plan.last_segment_width())?;
+        }
         for (segment, o) in plan.opps().enumerate() {
             self.expect(l.opp(o, PIPE), 0x13, 3)?;
             for (r, mask, value) in blank.request.segment_registers(plan, segment as u32) {

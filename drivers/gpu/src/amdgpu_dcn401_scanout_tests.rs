@@ -195,7 +195,8 @@ fn dcn401_scanout_odm_drives_both_halves_under_one_lock() -> TestResult {
             width: 7680,
             height: 4320,
             format: SurfaceFormat::Xrgb8888,
-            odm: Some(q),
+            odm: SplitPipes::one(q),
+            mpc: SplitPipes::NONE,
             plane: None,
         },
         address: ADDR,
@@ -204,7 +205,7 @@ fn dcn401_scanout_odm_drives_both_halves_under_one_lock() -> TestResult {
     };
     e.status.surfaces[usize::from(pipe)] = Some(surface);
     let p = Pipe {
-        odm: Some(q),
+        odm: SplitPipes::one(q),
         ..target(pipe)
     };
     if run(e.start_fetch(p)).is_err() {
@@ -259,7 +260,8 @@ kernel_test_in!(
 fn target(pipe: u8) -> Pipe {
     Pipe {
         pipe,
-        odm: None,
+        odm: SplitPipes::NONE,
+        mpc: SplitPipes::NONE,
         address: ADDR,
         overlays: [None; MAX_OVERLAYS],
         black: BLACK,
@@ -648,7 +650,8 @@ const OVERLAY_B: u64 = ADDR + 0x0800_0000;
 fn overlay(pipe: u8, odm: Option<u8>, address: u64) -> Option<OverlayScanout> {
     Some(OverlayScanout {
         pipe,
-        odm,
+        odm: odm.into(),
+        mpc: SplitPipes::NONE,
         address,
         underlay: false,
     })
@@ -682,7 +685,8 @@ fn stage_records(e: &mut Engine<Hw>, pipe: u8, odm: Option<u8>, overlays: &[(u8,
             width: 1920,
             height: 1080,
             format: SurfaceFormat::Argb8888,
-            odm,
+            odm: SplitPipes::from(odm),
+            mpc: SplitPipes::NONE,
             plane: None,
         },
         address,
@@ -860,7 +864,7 @@ fn dcn401_scanout_odm_overlay_builds_a_tree_per_segment() -> TestResult {
     let l = e.layout;
     stage_records(&mut e, pipe, Some(q), &[(o, Some(o2))]);
     let p = Pipe {
-        odm: Some(q),
+        odm: SplitPipes::one(q),
         overlays: [overlay(o, Some(o2), OVERLAY_A), None, None],
         ..target(pipe)
     };
@@ -949,4 +953,171 @@ fn dcn401_scanout_underlay_goes_below_the_primary() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-scanout",
     dcn401_scanout_underlay_goes_below_the_primary
+);
+
+/// ODM 4:1: one master lock covers every segment. Start connects each
+/// segment's MPCC to its own OPP, releases every DPG and unblanks every
+/// HUBP at one VUPDATE; a flip re-addresses all four; stop returns each to
+/// staged black.
+fn dcn401_scanout_odm_four_segments_under_one_lock() -> TestResult {
+    let pipe = 0u8;
+    let odm = SplitPipes::new(&[3, 2, 1]).unwrap();
+    let mut e = staged_planes(pipe, None, &[3, 2, 1]);
+    e.status.surfaces[usize::from(pipe)] = Some(SurfaceApplied {
+        request: SurfaceRequest {
+            pipe,
+            width: 7680,
+            height: 4320,
+            format: SurfaceFormat::Xrgb8888,
+            odm,
+            mpc: SplitPipes::NONE,
+            plane: None,
+            surface: PlaneSurface::LINEAR,
+        },
+        address: ADDR,
+        pitch_bytes: 7680 * 4,
+        bytes: 7680 * 4 * 4320,
+    });
+    let p = Pipe {
+        odm,
+        ..target(pipe)
+    };
+    if p.trees() != [[0], [3], [2], [1]] {
+        return TestResult::Fail("one tree per segment");
+    }
+    if run(e.start_fetch(p)).is_err() {
+        return TestResult::Fail("ODM 4:1 start");
+    }
+    let l = e.layout;
+    for s in [0u8, 3, 2, 1] {
+        if e.io.get(l.mpcc(s, TOP)) & 0xf != u32::from(s)
+            || e.io.get(l.mpcc(s, OPP_ID)) & 0xf != u32::from(s)
+            || e.io.get(l.out_mux(s)) & 0xf != u32::from(s)
+            || e.io.get(l.opp(s, DPG)) & DPG_FIELDS != 0
+            || e.io.get(l.hubp(s, HUBP_CONTROL)) & BLANK_EN != 0
+        {
+            return TestResult::Fail("segment routes and unblank");
+        }
+    }
+    if e.live_fetch(pipe, ADDR).is_err() {
+        return TestResult::Fail("every segment live");
+    }
+    let back = ADDR + 0x0200_0000;
+    if run(e.flip_to(Pipe { address: back, ..p })).is_err()
+        || [0u8, 3, 2, 1]
+            .iter()
+            .any(|&s| e.io.get(l.hubp(s, EARLIEST_INUSE)) != back as u32)
+    {
+        return TestResult::Fail("ODM 4:1 flip");
+    }
+    if run(e.stop_fetch(Pipe { address: back, ..p })).is_err() {
+        return TestResult::Fail("ODM 4:1 stop");
+    }
+    for s in [0u8, 3, 2, 1] {
+        if e.io.get(l.mpcc(s, TOP)) & 0xf != 0xf
+            || e.io.get(l.opp(s, DPG)) & DPG_FIELDS != BLACK
+            || e.io.get(l.hubp(s, HUBP_CONTROL)) & 3 != 3
+        {
+            return TestResult::Fail("segment back to staged black");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_odm_four_segments_under_one_lock
+);
+
+/// MPC combine: an MPC-combined primary's two DPPs and an MPC-combined
+/// overlay's two all blend in the stream's one MPCC tree, each plane's
+/// second slice directly below its first (acquire_dpp_pipe_and_add_mpc_
+/// slice links it as the bottom pipe), built from the top down as
+/// mpc1_insert_plane does; only the stream's OPP leaves the DPG; every
+/// slice fetches its plane's address; stop detaches every MPCC.
+fn dcn401_scanout_mpc_slices_blend_in_one_tree() -> TestResult {
+    let (pipe, slice, o, o_slice) = (0u8, 3u8, 2u8, 1u8);
+    let mut e = staged_planes(pipe, None, &[slice, o, o_slice]);
+    let l = e.layout;
+    let p = Pipe {
+        mpc: SplitPipes::one(slice),
+        overlays: [
+            Some(OverlayScanout {
+                pipe: o,
+                odm: SplitPipes::NONE,
+                mpc: SplitPipes::one(o_slice),
+                address: OVERLAY_A,
+                underlay: false,
+            }),
+            None,
+            None,
+        ],
+        ..target(pipe)
+    };
+    if p.trees() != [[slice, pipe, o_slice, o]] || p.pipes().collect::<alloc::vec::Vec<_>>() != [0]
+    {
+        return TestResult::Fail("MPC slice tree");
+    }
+    e.io.log.clear();
+    if run(e.start_fetch(p)).is_err() {
+        return TestResult::Fail("MPC combine start");
+    }
+    let w = |q: u8, r: u64, v: u32| (l.mpcc(q, r), v);
+    let c = |q: u8, v: u32| (l.mpcc(q, MPCC_CONTROL), v);
+    let insert = |q: u8| {
+        [
+            w(q, BOTTOM, 0xf),
+            c(q, 2),
+            w(q, TOP, u32::from(q)),
+            w(q, OPP_ID, u32::from(pipe)),
+            w(q, UPDATE_LOCK, u32::from(pipe)),
+        ]
+    };
+    let mut want = alloc::vec::Vec::new();
+    want.extend(insert(o));
+    want.push((l.out_mux(pipe), u32::from(o)));
+    for (q, above) in [(o_slice, o), (pipe, o_slice), (slice, pipe)] {
+        want.extend(insert(q));
+        want.extend([w(above, BOTTOM, u32::from(q)), c(above, 3)]);
+    }
+    if tree_writes(l, &e.io.log, &[pipe, slice, o, o_slice]) != want {
+        return TestResult::Fail("mpc1_insert_plane order with MPC slices");
+    }
+    for (q, address) in [
+        (pipe, ADDR),
+        (slice, ADDR),
+        (o, OVERLAY_A),
+        (o_slice, OVERLAY_A),
+    ] {
+        if e.io.get(l.hubp(q, HUBP_CONTROL)) & BLANK_EN != 0
+            || e.io.get(l.hubp(q, EARLIEST_INUSE)) != address as u32
+        {
+            return TestResult::Fail("slices live at their planes' addresses");
+        }
+    }
+    if e.io.get(l.opp(pipe, DPG)) & DPG_FIELDS != 0
+        || [slice, o, o_slice]
+            .iter()
+            .any(|&q| e.io.get(l.opp(q, DPG)) != BLACK)
+    {
+        return TestResult::Fail("only the stream's OPP leaves black");
+    }
+    let live = p.live(None);
+    if live.len() != 4 || live.iter().any(|&lp| e.live_pipe(lp).is_err()) {
+        return TestResult::Fail("live witness of every slice");
+    }
+    if live
+        .iter()
+        .find(|lp| lp.pipe == slice)
+        .is_none_or(|lp| lp.routes != [0xf, slice, 0xf, pipe, pipe] || lp.address != ADDR)
+    {
+        return TestResult::Fail("second slice at the bottom of the tree");
+    }
+    if run(e.stop_fetch(p)).is_err() || e.staged(p).is_err() {
+        return TestResult::Fail("MPC combine stop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_mpc_slices_blend_in_one_tree
 );

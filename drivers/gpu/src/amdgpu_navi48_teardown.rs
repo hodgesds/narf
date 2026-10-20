@@ -55,8 +55,9 @@ struct ScanoutWitness {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Request {
     pipe: u8,
-    /// The ODM pipe carrying the right half, whose DSC clock stops too.
-    odm: Option<u8>,
+    /// The further ODM pipes carrying the following segments, whose DSC
+    /// clocks stop too.
+    odm: otg::SplitPipes,
     port: usize,
     protocol: Protocol,
     audio: bool,
@@ -78,7 +79,7 @@ impl Request {
             ..Self::activation(m.pipe, m.scanout.odm, &m.selection)
         }
     }
-    fn activation(pipe: u8, odm: Option<u8>, s: &Selection) -> Self {
+    fn activation(pipe: u8, odm: otg::SplitPipes, s: &Selection) -> Self {
         Self {
             pipe,
             odm,
@@ -184,7 +185,7 @@ impl Teardowns {
     pub(super) fn begin_activation(
         &mut self,
         pipe: u8,
-        odm: Option<u8>,
+        odm: otg::SplitPipes,
         selection: &Selection,
     ) -> Result<(), ModesetError> {
         self.start_activation(Request::activation(pipe, odm, selection))
@@ -427,7 +428,7 @@ impl Backend for ColdBoot {
                 Timing => self.retire_display_timing(r.pipe).await?,
                 DscClock => {
                     self.stop_display_dscclk(r.pipe)?;
-                    if let Some(q) = r.odm {
+                    for q in r.odm {
                         self.stop_display_dscclk(q)?;
                     }
                 }

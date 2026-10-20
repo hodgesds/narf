@@ -375,10 +375,16 @@ pub struct SurfaceRequest {
     pub width: u32,
     pub height: u32,
     pub format: SurfaceFormat,
-    /// ODM 2:1: the second pipe, whose HUBP fetches the right half of the
-    /// same surface (and whose DPP/MPCC/DET follow it). Its own timing,
-    /// surface slot and memory stay unused.
-    pub odm: Option<u8>,
+    /// ODM: the stream's further segment pipes (`Request::odm`), whose
+    /// HUBPs fetch the following segments of the same surface (and whose
+    /// DPP/MPCC/DET follow them). Their own timing, surface slot and memory
+    /// stay unused.
+    pub odm: SplitPipes,
+    /// MPC combine on a stream in ODM bypass: the plane's further pipes,
+    /// each fetching the next slice of its recout (resource_get_mpc_slice_
+    /// index) and blended below the one before in the stream's MPCC tree.
+    /// Never with `odm`; their timing, surface slot and memory stay unused.
+    pub mpc: SplitPipes,
     /// The plane's placement; `None` is the whole surface unscaled on a
     /// stream of its own size, blended as `Blend::default_for` its format.
     pub plane: Option<PlaneLayout>,
@@ -401,9 +407,9 @@ impl SurfaceRequest {
             || self.height == 0
             || self.width > 0x3fff
             || self.height > 0x3fff
-            || self
-                .odm
-                .is_some_and(|q| q >= 4 || q == self.pipe || self.width % 2 != 0)
+            || !self.odm.valid_with(self.pipe)
+            || !self.mpc.valid_with(self.pipe)
+            || (self.odm.is_some() && (self.mpc.is_some() || self.width % 2 != 0))
         {
             return Err(Error::Invalid);
         }
@@ -516,33 +522,56 @@ impl SurfaceRequest {
             && l.stream_height == self.height
             && l.rotation == spl::Rotation::R0
     }
-    /// Each ODM segment's pipe and SPL's input for it, the request's own
-    /// pipe first; the whole stream on that pipe without ODM.
-    /// resource_get_odm_slice_src_rect: even halves, a 4:2:0 right half one
-    /// pixel wider to the left.
+    /// Every pipe the surface's fetch occupies, the request's own first:
+    /// each with the ODM segment its OPP output carries and its MPC slice
+    /// (ODM segments in order, or MPC slices on the one segment).
+    pub(in crate::amdgpu_dcn401_otg) fn slices(
+        self,
+    ) -> impl Iterator<Item = (u8, u32, u32)> + Clone {
+        let odm = self
+            .odm
+            .iter()
+            .enumerate()
+            .map(|(k, p)| (p, k as u32 + 1, 0));
+        let mpc = self
+            .mpc
+            .iter()
+            .enumerate()
+            .map(|(k, p)| (p, 0, k as u32 + 1));
+        core::iter::once((self.pipe, 0, 0)).chain(odm).chain(mpc)
+    }
+    /// Each fetching pipe and SPL's input for it, the request's own pipe
+    /// first; the whole stream on that pipe without ODM.
+    /// resource_get_odm_slice_src_rect: the segments of
+    /// resource_get_odm_slice_dst_width, each 4:2:0 segment after the first
+    /// one pixel wider to the left; an MPC slice's index and count.
     pub(in crate::amdgpu_dcn401_otg) fn spl_inputs(
         self,
     ) -> impl Iterator<Item = (u8, spl::Input)> + Clone {
         let l = self.layout();
         let (w, h) = (l.stream_width as i32, l.stream_height as i32);
-        let half = if self.odm.is_some() { w / 2 } else { w };
         let edge = i32::from(l.ycbcr420);
-        let input = move |odm_slice| spl::Input {
-            src: l.src,
-            dst: l.dst,
-            clip: l.dst,
-            stream_width: w,
-            stream_height: h,
-            odm_slice,
-            rotation: l.rotation,
-            horizontal_mirror: false,
-            alpha: l.blend.per_pixel_alpha,
-            video: self.format.spl_video(),
-        };
-        core::iter::once((self.pipe, input(spl::Rect::new(0, 0, half, h)))).chain(
-            self.odm
-                .map(move |q| (q, input(spl::Rect::new(half - edge, 0, w - half + edge, h)))),
-        )
+        let mpc_count = self.mpc.count() as i32;
+        self.slices()
+            .zip(self.segments())
+            .map(move |((p, segment, slice), (_, x, width))| {
+                let edge = if segment > 0 { edge } else { 0 };
+                let odm_slice = spl::Rect::new(x as i32 - edge, 0, width as i32 + edge, h);
+                let input = spl::Input {
+                    src: l.src,
+                    dst: l.dst,
+                    clip: l.dst,
+                    stream_width: w,
+                    stream_height: h,
+                    odm_slice,
+                    mpc_slice: (slice as i32, mpc_count),
+                    rotation: l.rotation,
+                    horizontal_mirror: false,
+                    alpha: l.blend.per_pixel_alpha,
+                    video: self.format.spl_video(),
+                };
+                (p, input)
+            })
     }
     /// Each segment's pipe and spl_calculate_scaler_params' result. A
     /// request without a layout is the whole surface unscaled: each segment
@@ -556,26 +585,43 @@ impl SurfaceRequest {
         // A 4:2:0 surface always scales its chroma: SPL even for the whole
         // frame.
         let laid_out = self.plane.is_some() || self.format.is_video();
+        let mpc_count = self.mpc.count() as i32;
         self.spl_inputs()
             .zip(self.segments())
             .map(move |((p, input), (_, x, width))| {
                 let scaler = if laid_out {
                     spl::calculate(&input)
+                } else if mpc_count > 1 {
+                    // The MPC slice of the whole unscaled surface.
+                    let r =
+                        spl::mpc_slice(spl::Rect::new(0, 0, width as i32, height), input.mpc_slice);
+                    spl::Scaler::unity_at(r.x, r.x, r.width, height)
                 } else {
                     spl::Scaler::unity(x as i32, width as i32, height)
                 };
                 (p, scaler)
             })
     }
-    /// Each ODM segment's pipe, first stream column and width (its ODM
-    /// slice's destination), the request's own pipe first; the whole
-    /// stream on that pipe without ODM.
+    /// Each fetching pipe with its ODM segment's first stream column and
+    /// width (resource_get_odm_slice_dst_rect: the line over the segment
+    /// count, in whole pixel pairs for 4:2:0, the last segment the rest),
+    /// the request's own pipe first; the whole stream on every pipe
+    /// without ODM (its MPC slices share the one segment).
     pub(in crate::amdgpu_dcn401_otg) fn segments(
         self,
     ) -> impl Iterator<Item = (u8, u32, u32)> + Clone {
-        let w = self.layout().stream_width;
-        let width = if self.odm.is_some() { w / 2 } else { w };
-        core::iter::once((self.pipe, 0, width)).chain(self.odm.map(move |q| (q, width, w - width)))
+        let l = self.layout();
+        let w = l.stream_width;
+        let count = self.odm.count();
+        let first = w / count;
+        let first = first + (first & 1 & u32::from(l.ycbcr420 && count > 1));
+        self.slices().map(move |(p, segment, _)| {
+            if segment + 1 == count {
+                (p, segment * first, w - first * (count - 1))
+            } else {
+                (p, segment * first, first)
+            }
+        })
     }
     /// The plane as DC hands it to DML21 after SPL
     /// (populate_dml21_plane_config_from_plane_state): the surface, the
@@ -594,6 +640,7 @@ impl SurfaceRequest {
                 stream_width: w,
                 stream_height: h,
                 odm_slice: spl::Rect::new(0, 0, w, h),
+                mpc_slice: (0, 1),
                 rotation: l.rotation,
                 horizontal_mirror: false,
                 alpha: l.blend.per_pixel_alpha,
@@ -660,6 +707,7 @@ impl SurfaceRequest {
             self.height,
             self.format,
             self.odm,
+            self.mpc,
             self.bytes(),
         ) == (
             other.pipe,
@@ -667,6 +715,7 @@ impl SurfaceRequest {
             other.height,
             other.format,
             other.odm,
+            other.mpc,
             other.bytes(),
         )
     }
@@ -951,16 +1000,18 @@ impl Surfaces {
 }
 impl<I: Io> Engine<I> {
     /// The pipes `pipe`'s staged surface fetches on: itself, then its ODM
-    /// pipe.
+    /// pipes or MPC slices' pipes.
     pub(in crate::amdgpu_dcn401_otg) fn fetch_pipes(&self, pipe: u8) -> impl Iterator<Item = u8> {
-        let odm = self
+        let (odm, mpc) = self
             .status
             .surfaces
             .get(usize::from(pipe))
             .copied()
             .flatten()
-            .and_then(|a| a.request.odm);
-        core::iter::once(pipe).chain(odm)
+            .map_or((SplitPipes::NONE, SplitPipes::NONE), |a| {
+                (a.request.odm, a.request.mpc)
+            });
+        core::iter::once(pipe).chain(odm).chain(mpc)
     }
     /// A restaged pipe may still show its previous staged address pending:
     /// those buffers stay owned until a separate, stricter release proof.

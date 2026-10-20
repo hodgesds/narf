@@ -120,7 +120,8 @@ fn req(pipe: u8) -> SurfaceRequest {
         width: 65,
         height: 3,
         format: SurfaceFormat::Xrgb8888,
-        odm: None,
+        odm: SplitPipes::NONE,
+        mpc: SplitPipes::NONE,
         plane: None,
     }
 }

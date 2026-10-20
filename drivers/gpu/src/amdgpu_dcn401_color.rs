@@ -360,6 +360,7 @@ impl<I: Io> Engine<I> {
         let p = Pipe {
             pipe,
             odm: running.odm,
+            mpc: running.mpc,
             address: running.address,
             overlays: running.overlays,
             black: 0x41 | blank.request.depth.dpg() << 12,

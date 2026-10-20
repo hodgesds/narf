@@ -1,4 +1,4 @@
-//! Native DCN401 per-pipe DLG/TTU deadlines (both pipes of an ODM pair)
+//! Native DCN401 per-pipe DLG/TTU deadlines (every pipe of an ODM or MPC split)
 //! and DCHUBBUB watermarks from an admitted `amdgpu_dcn401_dml::Plan`.
 //! Linux: hubp401_setup, hubp401_setup_interdependent, hubp401_program_deadline,
 //! hubp401_vready_at_or_After_vsync, hubbub401_program_watermarks,
@@ -241,11 +241,21 @@ fn requestor_writes(rq: &dml::RqRegs) -> [(u64, u32, u32); 5] {
 }
 
 impl<I: Io> Engine<I> {
-    pub(super) fn deadline_writes(
+    pub(in crate::amdgpu_dcn401_otg) fn deadline_writes(
         &mut self,
         pipe: u8,
         plan: &dml::Plan,
         verify: bool,
+    ) -> Result<(), Error> {
+        self.deadline_writes_with(pipe, plan, verify, WatermarkUpdate::Exact)
+    }
+    /// `deadline_writes` with the watermark sets written as `wm` says.
+    pub(in crate::amdgpu_dcn401_otg) fn deadline_writes_with(
+        &mut self,
+        pipe: u8,
+        plan: &dml::Plan,
+        verify: bool,
+        wm: WatermarkUpdate,
     ) -> Result<(), Error> {
         let l = self.layout;
         let hubbub = |reg| l.base + reg * 4;
@@ -257,6 +267,20 @@ impl<I: Io> Engine<I> {
                 Ok(())
             } else {
                 e.update(at, mask, value)
+            }
+        };
+        // A watermark field (mask is its low bits) at least `value`.
+        let raise = |e: &mut Self, at: u64, mask: u32, value: u32| {
+            let current = e.read(at)? & mask;
+            if verify {
+                if current < value & mask {
+                    return Err(Error::Readback(at));
+                }
+                Ok(())
+            } else if current < value & mask {
+                e.update(at, mask, value)
+            } else {
+                Ok(())
             }
         };
         // Every HUBP each plane fetches on, the primary first and then the
@@ -316,7 +340,10 @@ impl<I: Io> Engine<I> {
         }
         for set in [WM_A, WM_B] {
             for (r, mask, value) in watermark_set(set, &plan.watermarks) {
-                each(self, hubbub(r), mask, value)?;
+                match wm {
+                    WatermarkUpdate::Exact => each(self, hubbub(r), mask, value)?,
+                    WatermarkUpdate::Raise => raise(self, hubbub(r), mask, value)?,
+                }
             }
         }
         for (r, mask, value) in arbiter(plan) {
@@ -332,14 +359,15 @@ fn plane_bound(
     plan: &dml::Plan,
     timing: Request,
     surface: SurfaceApplied,
-    planned: dml::Plane,
+    (planned, dpps): (dml::Plane, u8),
 ) -> bool {
     let t = plan.mode.timing;
     let l = surface.request.layout();
     l.stream_width == t.h_active
         && l.stream_height == t.v_active
         && l.ycbcr420 == plan.mode.ycbcr420
-        && surface.request.odm.is_some() == timing.odm.is_some()
+        && surface.request.odm == timing.odm
+        && surface.request.mpc.count() == u32::from(dpps.max(1))
         && surface.request.dml_plane() == planned
         && u64::from(surface.pitch_bytes)
             == u64::from(planned.pitch) * u64::from(planned.bytes_per_pixel)
@@ -369,11 +397,13 @@ pub(super) fn bound(
             Signal::DisplayPort | Signal::HpoDisplayPort | Signal::Tmds
         )
         && a.surface.request.odm == timing.odm
-        && plan.pipes == 1 + u8::from(timing.odm.is_some())
+        && u32::from(plan.pipes) == timing.odm.count()
         && surfaces.clone().count() == planes.len()
-        && surfaces
-            .zip(planes)
-            .all(|(s, p)| plane_bound(plan, timing, s, p))
+        && surfaces.zip(planes).enumerate().all(|(k, (s, p))| {
+            // An MPC-combined plane's DPPs (on an ODM stream its slices are 1).
+            let dpps = plan.plane(k).map_or(0, |q| q.mpc_slices(plan.pipes));
+            plane_bound(plan, timing, s, (p, dpps))
+        })
         && plan
             .planes
             .iter()
@@ -474,7 +504,192 @@ impl Surfaces {
         }
     }
 }
+impl<I: Io> Engine<I> {
+    /// optc1_program_global_sync and the VTG's VSTARTUP point for `plan`'s
+    /// timing, or (with `verify`) that they hold.
+    fn global_sync_writes(&mut self, plan: Plan, verify: bool) -> Result<(), Error> {
+        let l = self.layout;
+        let p = plan.request.pipe;
+        let s = plan.request.sync;
+        for (at, mask, value) in [
+            (l.otg(p, STARTUP), 0x3ff, s.vstartup),
+            (
+                l.otg(p, UPDATE),
+                0x3ffffff,
+                s.vupdate_offset | s.vupdate_width << 16,
+            ),
+            (l.otg(p, READY), 0xffff, s.vready_offset),
+            (l.otg(p, PSTATE), 0x7fff, s.pstate_keepout),
+            (l.vtg(p), 0x7fff7fff, plan.vtg),
+        ] {
+            if verify {
+                if self.read(at)? & mask != value {
+                    return Err(Error::Readback(at));
+                }
+            } else {
+                self.update(at, mask, value)?;
+            }
+        }
+        Ok(())
+    }
+}
+impl Surfaces {
+    /// Move a live scanout to `plan`: its own stream and planes (the same
+    /// mode) admitted in a new configuration, as dcn401_program_pipe updates
+    /// a stream a commit keeps. Under the OTG master lock the global sync
+    /// (optc1_program_global_sync and the VTG's VSTARTUP point), every
+    /// HUBP's DLG/TTU, the DCHUBBUB watermarks (`wm`) and arbiter change and
+    /// latch at one VUPDATE; every record of the timing then carries the
+    /// new sync, the deadlines and scanout the new plan. The plan must be
+    /// bound to the current owners (its clocks within theirs).
+    /// Cancellation or failure quarantines the pipe.
+    pub(in crate::amdgpu_dcn401_otg) async fn update_live_plan<I: Io>(
+        &mut self,
+        e: &mut Engine<I>,
+        pipe: u8,
+        plan: &dml::Plan,
+        wm: WatermarkUpdate,
+        crystal_khz: u32,
+        mut owners: impl FnMut() -> Result<(dccg::Applied, DisplayContext), Error>,
+    ) -> Result<DeadlinesApplied, Error> {
+        if e.status.state != State::ScanoutRunning(pipe) {
+            return Err(Error::Busy);
+        }
+        let running = e.status.scanout.ok_or(Error::Invalid)?;
+        let d = e.status.deadlines.ok_or(Error::Invalid)?;
+        let a = e.status.requestor.ok_or(Error::Invalid)?;
+        let timing = e.status.pipes[usize::from(pipe)].ok_or(Error::Invalid)?;
+        if running.pipe != pipe || d.pipe != pipe || plan.mode != d.plan.mode {
+            return Err(Error::Invalid);
+        }
+        let request = Request {
+            sync: plan.sync,
+            ..timing.request
+        };
+        let new_timing = request.plan()?;
+        let current = owners()?;
+        let refclk = e.dchub_refclk_khz(crystal_khz)?;
+        if !bound(plan, request, a, current.0, refclk) {
+            return Err(Error::Invalid);
+        }
+        // The live scanout is still the one its records name (another
+        // display's update may have raised the shared watermarks).
+        let p = self.scanout_bound_with(e, d, crystal_khz, current, WatermarkUpdate::Raise)?;
+        e.live_fetch(pipe, running.address)?;
+        e.flip_quiet(pipe)?;
+        e.status.state = State::UpdatingStream(pipe);
+        let result = async {
+            e.lock(pipe).await?;
+            e.global_sync_writes(new_timing, false)?;
+            e.deadline_writes_with(pipe, plan, false, wm)?;
+            e.update(e.layout.otg(pipe, LOCK), 1, 0)?;
+            e.drr_trigger(pipe)?;
+            e.stream_latched(p).await?;
+            e.global_sync_writes(new_timing, true)?;
+            e.deadline_writes_with(pipe, plan, true, wm)?;
+            if owners()? != current {
+                return Err(Error::Busy);
+            }
+            e.live_fetch(pipe, running.address)
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                e.status.rebind_timing(pipe, |t| t.request.sync = plan.sync);
+                let report = DeadlinesApplied {
+                    pipe,
+                    plan: *plan,
+                    vready_after_vsync: vready_after_vsync(plan),
+                };
+                e.status.deadlines = Some(report);
+                if let Some(s) = e.status.scanout.as_mut() {
+                    s.plan = *plan;
+                }
+                e.status.state = State::ScanoutRunning(pipe);
+                Ok(report)
+            }
+            Err(err) => {
+                e.status.state = State::Failed(err);
+                Err(err)
+            }
+        }
+    }
+}
 impl Otg {
+    /// Each further pipe of `pipe`'s planes (its primary's MPC slices and
+    /// its overlays' pipes) runs on a DPP-only clock at least at its plane's
+    /// DPPCLK, from global clocks at least the plan's DPPREFCLK.
+    fn split_clocks_ok(
+        &mut self,
+        clocks: &mut clocks::ClockManager,
+        dccg: &mut dccg::Dccg,
+        pipe: u8,
+        plan: &dml::Plan,
+    ) -> Result<(), Error> {
+        let regs = self.0.io.0;
+        let (held, layout) = self.0.held();
+        let Some(r) = self.0.status.requestor.filter(|r| r.pipe == pipe) else {
+            return Ok(());
+        };
+        let mut check = |q: u8, want: u32| {
+            let c = dccg
+                .segment_clock(regs, clocks, q, &|at| held_by_sibling(held, layout, at))
+                .map_err(Error::PipeClocks)?;
+            if c.request.dpp_khz < want || c.global.dpp_khz < plan.clocks.dpprefclk_khz {
+                return Err(Error::Invalid);
+            }
+            Ok(())
+        };
+        for q in r.surface.request.mpc {
+            check(q, plan.clocks.dppclk_khz)?;
+        }
+        for (k, o) in r.overlays.iter().enumerate() {
+            let Some(o) = o else { continue };
+            let want = plan.plane(k + 1).ok_or(Error::Invalid)?.dppclk_khz;
+            for (q, _, _) in o.request.segments() {
+                check(q, want)?;
+            }
+        }
+        Ok(())
+    }
+    /// Move display `pipe`'s live scanout to `plan`, its stream and planes
+    /// admitted in a new configuration (`Surfaces::update_live_plan`):
+    /// global sync, DLG/TTU and watermarks under one OTG lock, without
+    /// leaving scanout. With `raise` (prepare_bandwidth) the shared
+    /// watermarks only rise, so displays still on their former plans keep
+    /// theirs; otherwise (optimize_bandwidth) they are the plan's. Every
+    /// further pipe's DPP-only clock must cover the new plan.
+    /// # Safety
+    /// As for `prepare_deadlines`; the scanout's surfaces stay live.
+    #[allow(clippy::too_many_arguments)]
+    pub async unsafe fn update_live_plan(
+        &mut self,
+        clocks: &mut clocks::ClockManager,
+        dccg: &mut dccg::Dccg,
+        gmc: &mut Gmc,
+        pipe: u8,
+        plan: &dml::Plan,
+        raise: bool,
+        crystal_khz: u32,
+    ) -> Result<DeadlinesApplied, Error> {
+        let wm = if raise {
+            WatermarkUpdate::Raise
+        } else {
+            WatermarkUpdate::Exact
+        };
+        self.0.select_display(pipe)?;
+        self.split_clocks_ok(clocks, dccg, pipe, plan)?;
+        let regs = self.0.io.0;
+        self.1
+            .update_live_plan(&mut self.0, pipe, plan, wm, crystal_khz, || {
+                Ok((
+                    dccg.retained_timing_clock(regs, clocks, pipe)
+                        .map_err(Error::PipeClocks)?,
+                    gmc.display_context(regs).map_err(Error::Memory)?,
+                ))
+            })
+            .await
+    }
     /// Program the admitted plan's DLG/TTU deadlines and DCHUBBUB watermarks
     /// for a pipe whose requestor is staged, after re-admitting the plan and
     /// binding it to every current owner. Self-refresh is forced off.
@@ -495,8 +710,19 @@ impl Otg {
         let regs = self.0.io.0;
         let (held, layout) = self.0.held();
         // Each overlay's DPP runs on its own DPP-only clock (as an ODM
-        // pipe's), at least at its plane's DPPCLK, from the global clocks.
+        // pipe's), at least at its plane's DPPCLK, from the global clocks;
+        // so does each further MPC slice of the primary.
         if let Some(r) = self.0.status.requestor.filter(|r| r.pipe == pipe) {
+            for q in r.surface.request.mpc {
+                let c = dccg
+                    .segment_clock(regs, clocks, q, &|at| held_by_sibling(held, layout, at))
+                    .map_err(Error::PipeClocks)?;
+                if c.request.dpp_khz < plan.clocks.dppclk_khz
+                    || c.global.dpp_khz < plan.clocks.dpprefclk_khz
+                {
+                    return Err(Error::Invalid);
+                }
+            }
             for (k, o) in r.overlays.iter().enumerate() {
                 let Some(o) = o else { continue };
                 let want = plan.plane(k + 1).ok_or(Error::Invalid)?.dppclk_khz;

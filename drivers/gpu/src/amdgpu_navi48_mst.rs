@@ -1083,7 +1083,7 @@ pub(super) fn dark_mst_modes_with(
             continue;
         };
         joint.push(candidate);
-        if crate::amdgpu_dcn401_dml::admit_all(soc, &joint).is_ok() {
+        if crate::amdgpu_dcn401_dml::admit_native(soc, &joint).is_ok() {
             offered.push(t);
         }
         joint.pop();

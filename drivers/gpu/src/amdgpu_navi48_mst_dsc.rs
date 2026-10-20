@@ -327,15 +327,10 @@ async fn write_enable<A: MstAux>(
 }
 
 /// `config` where the native DSCs take its shape: at most four slices per
-/// DSC on at most two (ODM) pipes, as `modeset::dp_dsc` requires.
+/// DSC on up to four (ODM) pipes, as `modeset::dp_dsc` requires.
 pub fn native_config(s: &DscStream, link: &DscLink) -> Option<DscConfig> {
     let cfg = config(s, link)?;
-    let pipes = crate::amdgpu_dcn401_dml::dsc_pipes(&s.timing, cfg.slices_h, link.max_dispclk_khz);
-    (pipes <= 2
-        && cfg.slices_h % pipes == 0
-        && cfg.slices_h <= 4 * pipes
-        && s.timing.h_active <= 5184 * pipes)
-        .then_some(cfg)
+    crate::amdgpu_dcn401_dml::dsc_shape(&s.timing, cfg.slices_h, link.max_dispclk_khz).map(|_| cfg)
 }
 
 /// `compute_link` with the native pipeline's DSC shapes.

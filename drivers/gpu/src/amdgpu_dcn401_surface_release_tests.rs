@@ -47,7 +47,8 @@ fn buffers(pool: &Pool, pipe: u8, height: u32) -> Surface {
         width: 16,
         height,
         format: SurfaceFormat::Xrgb8888,
-        odm: None,
+        odm: SplitPipes::NONE,
+        mpc: SplitPipes::NONE,
         plane: None,
     };
     let reserve = |bytes| {

@@ -167,37 +167,59 @@ impl PlaneSetup {
     }
 }
 
-/// Each overlay's pipe and, on an ODM stream, its ODM pipe, bottom first.
-pub type OverlayPipes = [Option<(u8, Option<u8>)>; otg::MAX_OVERLAYS];
+/// One overlay plane's pipes: the pipe it is staged on, its stream's
+/// further ODM segments' pipes, and on a stream in ODM bypass the pipes of
+/// its further MPC slices.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlanePipes {
+    pub pipe: u8,
+    pub odm: otg::SplitPipes,
+    pub mpc: otg::SplitPipes,
+}
+impl PlanePipes {
+    /// Every pipe the plane fetches on.
+    pub fn all(&self) -> impl Iterator<Item = u8> {
+        core::iter::once(self.pipe).chain(self.odm).chain(self.mpc)
+    }
+}
 
-/// The pipes one display lights on beyond its own: the ODM pipe of its
-/// stream, and each overlay's pipe and (on an ODM stream) ODM pipe.
+/// Each overlay's pipes, bottom first.
+pub type OverlayPipes = [Option<PlanePipes>; otg::MAX_OVERLAYS];
+
+/// The pipes one display lights on beyond its own: its stream's further
+/// ODM segments, its primary's further MPC slices, and each overlay's
+/// pipes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DisplayPipes {
-    pub odm: Option<u8>,
+    pub odm: otg::SplitPipes,
+    pub mpc: otg::SplitPipes,
     pub overlays: OverlayPipes,
 }
 impl DisplayPipes {
-    /// Every overlay pipe (both halves), by bit.
+    /// Every overlay pipe (all segments and slices), by bit.
     pub fn overlay_mask(&self) -> u8 {
         self.overlays
             .iter()
             .flatten()
-            .flat_map(|&(p, q)| core::iter::once(p).chain(q))
+            .flat_map(PlanePipes::all)
             .fold(0, |m, p| m | 1 << p)
+    }
+    /// Every pipe beyond the display's own, by bit.
+    pub fn mask(&self) -> u8 {
+        self.overlay_mask() | self.odm.mask() | self.mpc.mask()
     }
 }
 
-/// The surface requests of selection `s` lit on `pipe` (with its ODM pipe
-/// `odm`): the primary, then each overlay on its pipes in `overlays`
-/// (pipe 0 for an overlay without one: DML and the checks do not depend on
-/// the pipe). Each plane's layout is its source size at its CRTC
-/// rectangle on the stream; the unscaled full-frame primary has none.
+/// The surface requests of selection `s` lit on `pipe` with the further
+/// pipes `pipes`: the primary, then each overlay on its pipes (pipe 0, and
+/// stand-in segment pipes on an ODM stream, for an overlay without any:
+/// DML and the checks do not depend on the pipe). Each plane's layout is
+/// its source size at its CRTC rectangle on the stream; the unscaled
+/// full-frame primary has none.
 pub fn plane_requests(
     s: &Selection,
     pipe: u8,
-    odm: Option<u8>,
-    overlays: &OverlayPipes,
+    pipes: &DisplayPipes,
 ) -> (
     otg::SurfaceRequest,
     [Option<otg::SurfaceRequest>; otg::MAX_OVERLAYS],
@@ -207,8 +229,8 @@ pub fn plane_requests(
         s.ycbcr420,
         s.format,
         &s.planes,
-        (pipe, odm),
-        overlays,
+        (pipe, pipes.odm, pipes.mpc),
+        &pipes.overlays,
     )
 }
 
@@ -219,7 +241,7 @@ pub fn stream_planes(
     ycbcr420: bool,
     format: otg::SurfaceFormat,
     setup: &PlaneSetup,
-    (pipe, odm): (u8, Option<u8>),
+    (pipe, odm, mpc): (u8, otg::SplitPipes, otg::SplitPipes),
     overlays: &OverlayPipes,
 ) -> (
     otg::SurfaceRequest,
@@ -228,7 +250,7 @@ pub fn stream_planes(
     use crate::amdgpu_dcn401_spl::Rect;
     // A plane's surface: its source rectangle, or (tiled / 4:2:0) its whole
     // framebuffer with the source rectangle placed in it.
-    let request = |g: &PlaneGeometry, format: otg::SurfaceFormat, (p, q), underlay| {
+    let request = |g: &PlaneGeometry, format: otg::SurfaceFormat, (p, q, m), underlay| {
         let whole = g.whole_framebuffer(format);
         let (x, y) = if whole { (g.src_x, g.src_y) } else { (0, 0) };
         let (width, height) = if whole {
@@ -242,6 +264,7 @@ pub fn stream_planes(
             height,
             format,
             odm: q,
+            mpc: m,
             plane: Some(otg::PlaneLayout {
                 src: Rect::new(x as i32, y as i32, g.width as i32, g.height as i32),
                 dst: g.dst,
@@ -256,22 +279,34 @@ pub fn stream_planes(
         }
     };
     let primary = match &setup.primary {
-        Some(g) => request(g, format, (pipe, odm), false),
+        Some(g) => request(g, format, (pipe, odm, mpc), false),
         None => otg::SurfaceRequest {
             pipe,
             width: timing.h_active,
             height: timing.v_active,
             format,
             odm,
+            mpc,
             plane: None,
             surface: otg::PlaneSurface::LINEAR,
         },
     };
+    // Stand-in pipes 1.. for an overlay's segments beside stand-in pipe 0.
+    let stand_in = PlanePipes {
+        pipe: 0,
+        odm: otg::SplitPipes::new(&[1, 2, 3][..odm.len()]).unwrap_or_default(),
+        mpc: otg::SplitPipes::NONE,
+    };
     let mut out = [None; otg::MAX_OVERLAYS];
     for ((slot, o), pipes) in out.iter_mut().zip(&setup.overlays).zip(overlays) {
         let Some(o) = o else { continue };
-        let pipes = pipes.unwrap_or((0, odm.map(|_| 1)));
-        *slot = Some(request(&o.geometry, o.format, pipes, o.underlay));
+        let p = pipes.unwrap_or(stand_in);
+        *slot = Some(request(
+            &o.geometry,
+            o.format,
+            (p.pipe, p.odm, p.mpc),
+            o.underlay,
+        ));
     }
     (primary, out)
 }
@@ -629,14 +664,7 @@ pub fn frl_dsc(
         &frl_dsc_timing(t),
         vic,
     )?;
-    let pipes = dml::dsc_pipes(t, cfg.slices_h, max_dispclk_khz);
-    if !(pipes <= 2
-        && cfg.slices_h % pipes == 0
-        && cfg.slices_h <= 4 * pipes
-        && t.h_active <= 5184 * pipes)
-    {
-        return None;
-    }
+    dml::dsc_shape(t, cfg.slices_h, max_dispclk_khz)?;
     let rate = frl_dsc_link(t, FrlDscStream { cfg, vic }, cap, audio)?;
     Some((rate, cfg))
 }
@@ -1310,8 +1338,8 @@ fn dsc_timing(t: &Timing) -> crate::amdgpu_dsc::DscTiming {
 /// sink, its repeaters and the board reach one (FEC is inherent there),
 /// else 8b/10b with FEC. `dsc_link` then picks the link for the compressed
 /// bandwidth. Each DSC takes at most four slices and DSC401's 5184-pixel
-/// image, so the stream must fit the pipes DML gives it (`dml::dsc_pipes`,
-/// ODM 2:1 at most).
+/// image, so the stream must fit the pipes DML gives it (`dml::dsc_shape`:
+/// up to ODM 4:1, twelve slices on three pipes).
 pub fn dp_dsc(
     timing: &Timing,
     caps: DpCaps,
@@ -1335,12 +1363,7 @@ pub fn dp_dsc(
         encoding,
         false,
     )?;
-    let pipes = dml::dsc_pipes(timing, cfg.slices_h, max_dispclk_khz);
-    (pipes <= 2
-        && cfg.slices_h % pipes == 0
-        && cfg.slices_h <= 4 * pipes
-        && timing.h_active <= 5184 * pipes)
-        .then_some(cfg)
+    dml::dsc_shape(timing, cfg.slices_h, max_dispclk_khz).map(|_| cfg)
 }
 
 /// Redo every DSC decision with the board's highest DISPCLK, as Linux's
@@ -1369,12 +1392,8 @@ pub fn refine_dsc(soc: &dml::Soc, selections: &mut [Selection]) -> Result<(), Mo
                 false,
             )
             .ok_or(ModesetError::Link)?;
-            let pipes = dml::dsc_pipes(&s.timing, cfg.slices_h, soc.dispclk_max_khz);
             if (again.slices_h, again.slices_v) != (cfg.slices_h, cfg.slices_v)
-                || pipes > 2
-                || cfg.slices_h % pipes != 0
-                || cfg.slices_h > 4 * pipes
-                || s.timing.h_active > 5184 * pipes
+                || dml::dsc_shape(&s.timing, cfg.slices_h, soc.dispclk_max_khz).is_none()
             {
                 return Err(ModesetError::Link);
             }
@@ -2078,7 +2097,7 @@ pub fn admit_displays(
     let modes: Vec<dml::Mode> = selections.iter().map(selection_mode).collect();
     let mut n = modes.len().min(MAX_DISPLAYS);
     loop {
-        match dml::admit_all(soc, &modes[..n]) {
+        match dml::admit_native(soc, &modes[..n]) {
             Ok(plans) => return Ok(plans),
             Err(e) if n <= 1 => return Err(e),
             Err(_) => n -= 1,
@@ -2195,7 +2214,7 @@ fn admitted_modes(
         if t != current {
             let Some(mode) = candidate(t) else { continue };
             joint[k] = mode;
-            if dml::admit_all(soc, &joint).is_err() {
+            if dml::admit_native(soc, &joint).is_err() {
                 continue;
             }
         }
@@ -2333,7 +2352,7 @@ pub fn with_planes(
         mode.ycbcr420,
         format,
         setup,
-        (0, None),
+        (0, otg::SplitPipes::NONE, otg::SplitPipes::NONE),
         &[None; otg::MAX_OVERLAYS],
     );
     mode.pitch = format.pitch_bytes(mode.timing.h_active) / format.bytes_per_pixel();
@@ -2348,45 +2367,136 @@ pub fn with_planes(
     mode
 }
 
+/// The free pipes of a configuration lit on `used` (by bit), taken from
+/// the top: none left is DML's `Pipes` (DML counts every DPP, so a
+/// configuration it admits always has them; this assigns them).
+struct FreePipes(u8);
+impl FreePipes {
+    fn take(&mut self) -> Result<u8, ModesetError> {
+        let q = (0..4u8)
+            .rev()
+            .find(|&q| self.0 & 1 << q == 0)
+            .ok_or(ModesetError::Display(otg::Error::Admission(
+                dml::Error::Pipes,
+            )))?;
+        self.0 |= 1 << q;
+        Ok(q)
+    }
+    fn split(&mut self, further: usize) -> Result<otg::SplitPipes, ModesetError> {
+        let mut pipes = [0u8; 3];
+        for p in pipes.iter_mut().take(further) {
+            *p = self.take()?;
+        }
+        otg::SplitPipes::new(&pipes[..further.min(3)])
+            .ok_or(ModesetError::Display(otg::Error::Invalid))
+    }
+}
+
+/// Each lit display's primary MPC slices beyond its own pipe (DML's NoOfDPP
+/// for an MPC-combined primary in ODM bypass), from the pipes no display,
+/// ODM segment or earlier slice took, from the top
+/// (acquire_dpp_pipe_and_add_mpc_slice's bottom pipe).
+pub fn mpc_pipes(
+    plans: &[dml::Plan],
+    pipes: &[u8],
+    odm: &[otg::SplitPipes],
+) -> Result<Vec<otg::SplitPipes>, ModesetError> {
+    let mut free = FreePipes(
+        pipes.iter().fold(0u8, |m, &p| m | 1 << p) | odm.iter().fold(0, |m, o| m | o.mask()),
+    );
+    plans
+        .iter()
+        .map(|plan| {
+            let slices = plan.plane(0).map_or(1, |p| p.mpc_slices(plan.pipes));
+            free.split(usize::from(slices.max(1)) - 1)
+        })
+        .collect()
+}
+
 /// Each lit display's overlay pipes: free pipes (neither a display's nor
-/// an ODM pipe, nor another overlay's), taken from the top as ODM pipes
-/// are, one per overlay and a second for an ODM stream's. A configuration
-/// whose planes need more pipes than are free is refused (DML counts the
-/// pipes too; this assigns them).
+/// an ODM or primary MPC pipe, nor another overlay's), taken from the top
+/// as ODM pipes are, one per overlay and one more per further ODM segment
+/// of its stream or MPC slice of its own. A configuration whose planes
+/// need more pipes than are free is refused (DML counts the pipes too;
+/// this assigns them).
 pub fn overlay_pipes(
     selections: &[Selection],
     plans: &[dml::Plan],
     pipes: &[u8],
-    odm: &[Option<u8>],
+    (odm, mpc): (&[otg::SplitPipes], &[otg::SplitPipes]),
 ) -> Result<Vec<OverlayPipes>, ModesetError> {
-    let mut used = pipes
-        .iter()
-        .copied()
-        .chain(odm.iter().flatten().copied())
-        .fold(0u8, |m, p| m | 1 << p);
-    let mut take = || {
-        let q = (0..4u8)
-            .rev()
-            .find(|&q| used & 1 << q == 0)
-            .ok_or(ModesetError::Display(otg::Error::Admission(
-                dml::Error::Pipes,
-            )))?;
-        used |= 1 << q;
-        Ok::<u8, ModesetError>(q)
-    };
-    let mut out = Vec::with_capacity(selections.len());
-    for (s, plan) in selections.iter().zip(plans) {
+    overlay_pipes_of(plans, pipes, (odm, mpc), |i, k| {
+        selections
+            .get(i)
+            .is_some_and(|s| s.planes.overlays[k].is_some())
+    })
+}
+/// `overlay_pipes` for the overlays `present(display, k)` names.
+fn overlay_pipes_of(
+    plans: &[dml::Plan],
+    pipes: &[u8],
+    (odm, mpc): (&[otg::SplitPipes], &[otg::SplitPipes]),
+    present: impl Fn(usize, usize) -> bool,
+) -> Result<Vec<OverlayPipes>, ModesetError> {
+    let mut free = FreePipes(
+        pipes.iter().fold(0u8, |m, &p| m | 1 << p)
+            | odm.iter().chain(mpc).fold(0, |m, o| m | o.mask()),
+    );
+    let mut out = Vec::with_capacity(plans.len());
+    for (i, plan) in plans.iter().enumerate() {
         let mut stack = [None; otg::MAX_OVERLAYS];
-        for (slot, o) in stack.iter_mut().zip(&s.planes.overlays) {
-            if o.is_some() {
-                let p = take()?;
-                let q = if plan.pipes == 2 { Some(take()?) } else { None };
-                *slot = Some((p, q));
+        for (k, slot) in stack.iter_mut().enumerate() {
+            if present(i, k) {
+                let pipe = free.take()?;
+                let odm = free.split(usize::from(plan.pipes.max(1)) - 1)?;
+                let slices = plan.plane(k + 1).map_or(1, |p| p.mpc_slices(plan.pipes));
+                let mpc = free.split(usize::from(slices.max(1)) - 1)?;
+                *slot = Some(PlanePipes { pipe, odm, mpc });
             }
         }
         out.push(stack);
     }
     Ok(out)
+}
+
+/// Every lit display's further pipes, as DML split it (Linux's
+/// dml21_map_dc_state_into_dml_display_cfg then
+/// resource_update_pipes_for_stream_with_slice_count and
+/// resource_update_pipes_for_plane_with_slice_count): first each stream's
+/// ODM segments, then each primary's MPC slices, then each overlay's pipes,
+/// all from the top of the pipes the displays leave free.
+pub fn display_pipes(
+    selections: &[Selection],
+    plans: &[dml::Plan],
+    pipes: &[u8],
+) -> Result<Vec<DisplayPipes>, ModesetError> {
+    let odm = odm_pipes(plans, pipes)?;
+    let mpc = mpc_pipes(plans, pipes, &odm)?;
+    let overlays = overlay_pipes(selections, plans, pipes, (&odm, &mpc))?;
+    Ok(joined(odm, mpc, overlays))
+}
+/// `display_pipes` for the planes the plans were admitted with (each
+/// plan's overlays the planes after its primary).
+pub fn plan_pipes(plans: &[dml::Plan], pipes: &[u8]) -> Result<Vec<DisplayPipes>, ModesetError> {
+    let odm = odm_pipes(plans, pipes)?;
+    let mpc = mpc_pipes(plans, pipes, &odm)?;
+    let overlays = overlay_pipes_of(plans, pipes, (&odm, &mpc), |i, k| {
+        plans
+            .get(i)
+            .is_some_and(|p| p.mode.plane_list().count() > k + 1)
+    })?;
+    Ok(joined(odm, mpc, overlays))
+}
+fn joined(
+    odm: Vec<otg::SplitPipes>,
+    mpc: Vec<otg::SplitPipes>,
+    overlays: Vec<OverlayPipes>,
+) -> Vec<DisplayPipes> {
+    odm.into_iter()
+        .zip(mpc)
+        .zip(overlays)
+        .map(|((odm, mpc), overlays)| DisplayPipes { odm, mpc, overlays })
+        .collect()
 }
 
 /// Global clocks at least as fast as the plan's DISPCLK and DPPREFCLK.
@@ -2426,23 +2536,17 @@ pub fn pipe_clock_request(pipe: u8, plan: &dml::Plan, selection: &Selection) -> 
     }
 }
 
-/// Each plan's ODM pipe: a 2-pipe plan takes the highest pipe no display of
-/// the configuration is lit on and no other ODM display took. Admission
-/// counts every DPP, so a free pipe exists for each.
-pub fn odm_pipes(plans: &[dml::Plan], pipes: &[u8]) -> Result<Vec<Option<u8>>, ModesetError> {
-    let mut used = pipes.iter().fold(0u8, |m, &p| m | 1 << p);
+/// Each plan's further ODM pipes: an n-pipe plan takes the n - 1 highest
+/// pipes no display of the configuration is lit on and no other ODM display
+/// took, left to right in that order. Admission counts every DPP, so a free
+/// pipe exists for each.
+pub fn odm_pipes(plans: &[dml::Plan], pipes: &[u8]) -> Result<Vec<otg::SplitPipes>, ModesetError> {
+    let mut free = FreePipes(pipes.iter().fold(0u8, |m, &p| m | 1 << p));
     plans
         .iter()
         .map(|plan| {
-            if plan.pipes < 2 {
-                return Ok(None);
-            }
-            let q = (0..4u8)
-                .rev()
-                .find(|&q| used & 1 << q == 0)
-                .ok_or(ModesetError::Display(otg::Error::Busy))?;
-            used |= 1 << q;
-            Ok(Some(q))
+            free.split(usize::from(plan.pipes.max(1)) - 1)
+                .map_err(|_| ModesetError::Display(otg::Error::Busy))
         })
         .collect()
 }
@@ -2465,7 +2569,7 @@ pub fn timing_request(pipe: u8, plan: &dml::Plan, selection: &Selection) -> otg:
         },
         ycbcr420: plan.mode.ycbcr420,
         dsc: selection.dsc,
-        odm: None,
+        odm: otg::SplitPipes::NONE,
     }
 }
 
@@ -2836,17 +2940,16 @@ impl ColdBoot {
     }
     /// The configuration's global clocks (one DISPCLK/DPPREFCLK for every
     /// plan), then each display's pipe clocks on `pipes` (and a DPP-only
-    /// clock on each ODM pipe and each overlay's pipes, at its plane's
+    /// clock on each further ODM, MPC and overlay pipe, at its plane's
     /// DPPCLK), all while every display is stopped. Returns each display's
-    /// ODM and overlay pipes.
+    /// further pipes.
     pub(super) async fn prepare_pipes(
         &mut self,
         selections: &[Selection],
         plans: &[dml::Plan],
         pipes: &[u8],
     ) -> Result<Vec<DisplayPipes>, ModesetError> {
-        let odm = odm_pipes(plans, pipes)?;
-        let overlays = overlay_pipes(selections, plans, pipes, &odm)?;
+        let extra = display_pipes(selections, plans, pipes)?;
         let mut request = clock_request(&plans[0]);
         request.displays = plans.len() as u8;
         // dcn401_update_clocks: an FRL stream holds DTBCLK at its highest
@@ -2865,26 +2968,37 @@ impl ColdBoot {
                 self.start_display_dscclk(pipe)?;
             }
         }
-        for ((s, plan), &q) in selections.iter().zip(plans).zip(&odm) {
-            let Some(q) = q else { continue };
-            self.prepare_display_pipe_clocks(dccg::Request {
-                pipe: q,
-                dpp_khz: plan.clocks.dppclk_khz,
-                pixel: dccg::PixelClock::OdmSegment,
-            })
-            .await
-            .map_err(ModesetError::PipeClocks)?;
-            if s.dsc.is_some() {
-                self.start_display_dscclk(q)?;
+        for ((s, plan), d) in selections.iter().zip(plans).zip(&extra) {
+            for q in d.odm {
+                self.prepare_display_pipe_clocks(dccg::Request {
+                    pipe: q,
+                    dpp_khz: plan.clocks.dppclk_khz,
+                    pixel: dccg::PixelClock::OdmSegment,
+                })
+                .await
+                .map_err(ModesetError::PipeClocks)?;
+                if s.dsc.is_some() {
+                    self.start_display_dscclk(q)?;
+                }
+            }
+            // The primary's further MPC slices: DPP-only clocks at its DPPCLK.
+            for q in d.mpc {
+                self.prepare_display_pipe_clocks(dccg::Request {
+                    pipe: q,
+                    dpp_khz: plan.clocks.dppclk_khz,
+                    pixel: dccg::PixelClock::OdmSegment,
+                })
+                .await
+                .map_err(ModesetError::PipeClocks)?;
             }
         }
-        for (plan, stack) in plans.iter().zip(&overlays) {
-            for (k, o) in stack.iter().enumerate() {
-                let Some((p, q)) = *o else { continue };
+        for (plan, d) in plans.iter().zip(&extra) {
+            for (k, o) in d.overlays.iter().enumerate() {
+                let Some(o) = *o else { continue };
                 let plane = plan
                     .plane(k + 1)
                     .ok_or(ModesetError::Display(otg::Error::Invalid))?;
-                for pipe in core::iter::once(p).chain(q) {
+                for pipe in o.all() {
                     self.prepare_display_pipe_clocks(dccg::Request {
                         pipe,
                         dpp_khz: plane.dppclk_khz,
@@ -2895,11 +3009,7 @@ impl ColdBoot {
                 }
             }
         }
-        Ok(odm
-            .into_iter()
-            .zip(overlays)
-            .map(|(odm, overlays)| DisplayPipes { odm, overlays })
-            .collect())
+        Ok(extra)
     }
     /// Light one admitted display on `pipe` (its display slot too), with its
     /// clocks prepared: surface, timing, OPP, DPP, MPC, requestor and
@@ -2949,7 +3059,7 @@ impl ColdBoot {
         fill: &mut impl FnMut(u8, u32, &mut [u32]),
     ) -> Result<Modeset, ModesetError> {
         let odm = pipes.odm;
-        let (primary, overlays) = plane_requests(&selection, pipe, odm, &pipes.overlays);
+        let (primary, overlays) = plane_requests(&selection, pipe, &pipes);
         let (width, height) = (primary.width, primary.height);
         // Each overlay's pipe(s), bottom first.
         let stack: Vec<otg::SurfaceRequest> = overlays.iter().flatten().copied().collect();
@@ -2959,11 +3069,11 @@ impl ColdBoot {
         unsafe {
             self.retire_display_planes().await?;
             self.set_display_hubp_power(pipe, true).await?;
-            if let Some(q) = odm {
+            for q in odm.into_iter().chain(pipes.mpc) {
                 self.set_display_hubp_power(q, true).await?;
             }
             for o in &stack {
-                for p in core::iter::once(o.pipe).chain(o.odm) {
+                for p in core::iter::once(o.pipe).chain(o.odm).chain(o.mpc) {
                     self.set_display_hubp_power(p, true).await?;
                 }
             }
@@ -3077,19 +3187,15 @@ impl ColdBoot {
                     false,
                 )?;
                 let need = crate::amdgpu_dsc::dsc_kbps(&dt, cfg.bpp_x16, cfg.slices_h);
-                let pipes = dml::dsc_pipes(&t, cfg.slices_h, soc.dispclk_max_khz);
                 (super::mst::dsc::peak_pbn(need, encoding) <= i32::from(m.pbn)
-                    && pipes <= 2
-                    && cfg.slices_h % pipes == 0
-                    && cfg.slices_h <= 4 * pipes
-                    && t.h_active <= 5184 * pipes)
-                    .then(|| dml::Mode {
-                        dsc: Some(dml::Dsc {
-                            slices: cfg.slices_h,
-                            bpp_x16: cfg.bpp_x16,
-                        }),
-                        ..plane_mode(t, s.format)
-                    })
+                    && dml::dsc_shape(&t, cfg.slices_h, soc.dispclk_max_khz).is_some())
+                .then(|| dml::Mode {
+                    dsc: Some(dml::Dsc {
+                        slices: cfg.slices_h,
+                        bpp_x16: cfg.bpp_x16,
+                    }),
+                    ..plane_mode(t, s.format)
+                })
             } else {
                 dp_offered_mode(t, &s, soc.dispclk_max_khz)
             }
@@ -3682,3 +3788,389 @@ impl ColdBoot {
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_navi48_modeset_tests.rs"]
 mod tests;
+
+/// The DPP DTO of every pipe display `m` runs on beside its own, as plan
+/// `plan` (its stream admitted anew) clocks them: the timing pipe and its
+/// ODM segments and primary MPC slices at the primary's DPPCLK, each
+/// overlay's pipes at its plane's. What a live clock update's DTO steps
+/// cover (dcn401_update_clocks_update_dpp_dto over the context's pipes).
+pub fn running_dpp_targets(m: &Modeset, plan: &dml::Plan) -> Vec<(u8, u32)> {
+    let s = &m.scanout;
+    let primary = plan.clocks.dppclk_khz;
+    let mut out: Vec<(u8, u32)> = core::iter::once(m.pipe)
+        .chain(s.odm)
+        .chain(s.mpc)
+        .map(|p| (p, primary))
+        .collect();
+    for (k, o) in s.overlays.iter().enumerate() {
+        let Some(o) = o else { continue };
+        let dpp = plan.plane(k + 1).map_or(primary, |p| p.dppclk_khz);
+        out.extend(
+            core::iter::once(o.pipe)
+                .chain(o.odm)
+                .chain(o.mpc)
+                .map(|p| (p, dpp)),
+        );
+    }
+    out
+}
+
+/// Whether running display `m` can move to `plan` without relighting: the
+/// same stream and planes, split the same way (its pipes cannot change
+/// while it scans out).
+pub fn keeps_pipes(m: &Modeset, plan: &dml::Plan) -> bool {
+    plan.mode == m.plan.mode
+        && plan.pipes == m.plan.pipes
+        && (0..dml::MAX_PLANES)
+            .all(|k| plan.plane(k).map(|p| p.dpps) == m.plan.plane(k).map(|p| p.dpps))
+}
+
+/// The global floors a configuration's plans need: the fastest DISPCLK
+/// and DPPREFCLK (every plan of one admission shares them), DTBCLK at its
+/// top level with an FRL stream (dcn401_update_clocks).
+fn configuration_clocks(plans: &[dml::Plan], frl_dtb_khz: Option<u32>) -> clocks::Request {
+    let mut request = clock_request(&plans[0]);
+    request.displays = plans.len() as u8;
+    if let Some(dtb) = frl_dtb_khz {
+        request.dtb_khz = dtb;
+    }
+    request
+}
+
+impl ColdBoot {
+    /// dc_commit_state_no_check for a configuration change that keeps every
+    /// running display lit: prepare_bandwidth (the shared clocks only
+    /// raised, the running pipes' DPP DTOs raised where they need more,
+    /// each running display moved to its new plan with raise-only
+    /// watermarks), then `between` (lighting the new displays), then
+    /// optimize_bandwidth (each running display's exact watermarks, the
+    /// clocks lowered to what the configuration needs, every pipe's DTO
+    /// set). `running` are the displays kept, `plans` their plans in the
+    /// new configuration (same order); `all_plans` every plan of it and
+    /// `all_targets` every pipe's DPPCLK once `between` has lit the rest.
+    /// Updated records go back into `running` and the retained modesets.
+    /// # Safety
+    /// As for `modeset_displays`, except that `running` stay lit.
+    async unsafe fn transition_running(
+        &mut self,
+        running: &mut [Modeset],
+        plans: &[dml::Plan],
+        request: clocks::Request,
+    ) -> Result<(), ModesetError> {
+        if running.len() != plans.len() {
+            return Err(otg::Error::Invalid.into());
+        }
+        if running.iter().zip(plans).any(|(m, p)| !keeps_pipes(m, p)) {
+            return Err(otg::Error::Admission(dml::Error::Pipes).into());
+        }
+        // prepare_bandwidth: raise only.
+        let targets: Vec<(u8, u32)> = running
+            .iter()
+            .zip(plans)
+            .flat_map(|(m, p)| running_dpp_targets(m, p))
+            .collect();
+        self.update_live_display_clocks(request, &targets, false)
+            .await?;
+        for (m, plan) in running.iter_mut().zip(plans) {
+            // SAFETY: the caller's obligations; the scanout stays live.
+            let d = unsafe { self.update_live_display_plan(m.pipe, plan, true) }.await?;
+            m.plan = d.plan;
+            m.scanout.plan = d.plan;
+            self.modesets.retain(*m);
+        }
+        Ok(())
+    }
+    /// optimize_bandwidth after `transition_running` (and any new displays):
+    /// every running display's exact watermarks under its plan, then the
+    /// clocks lowered to `request` with every pipe's DTO (`targets`) set.
+    /// # Safety
+    /// As for `transition_running`.
+    async unsafe fn optimize_running(
+        &mut self,
+        running: &mut [Modeset],
+        request: clocks::Request,
+        targets: &[(u8, u32)],
+    ) -> Result<(), ModesetError> {
+        for m in running.iter_mut() {
+            let plan = m.plan;
+            // SAFETY: the caller's obligations; the scanout stays live.
+            unsafe { self.update_live_display_plan(m.pipe, &plan, false) }.await?;
+        }
+        self.update_live_display_clocks(request, targets, true)
+            .await?;
+        Ok(())
+    }
+    /// Light every new lightable board sink beside the running displays,
+    /// which stay lit: DML admits the running displays' modes with the new
+    /// ones (as many of the new ones as fit, in pipe order; every running
+    /// display must keep its pipes), and the change follows dcn401's
+    /// prepare/optimize ordering (`transition_running`) around lighting the
+    /// new displays on their pipes, whose pipe clocks are programmed beside
+    /// the running ones. `None` when it is refused before any change (an
+    /// MST display or none running, no free display slot, the running
+    /// displays no longer admitted together or not on their pipes), so the
+    /// caller relights instead. Returns every display lit, in pipe order.
+    /// # Safety
+    /// As for `modeset_displays`, except that the running displays stay
+    /// lit and must stay published as they are.
+    pub async unsafe fn modeset_beside(
+        &mut self,
+        mut fill: impl FnMut(u8, u32, &mut [u32]),
+        want: impl Fn(usize) -> Option<Timing>,
+        pipe_of: impl Fn(usize) -> Option<u8>,
+    ) -> Result<Option<Configuration>, ModesetError> {
+        self.teardowns.check_idle()?;
+        let mut running: Vec<Modeset> = self.display_modesets().into_iter().flatten().collect();
+        if running.is_empty() || running.iter().any(|m| m.selection.mst.is_some()) {
+            return Ok(None);
+        }
+        let used = running.iter().fold(0u8, |acc, m| acc | 1 << m.pipe);
+        let ports_used: Vec<usize> = running.iter().map(|m| m.selection.port).collect();
+        // Scan from an idle display slot.
+        let Some(idle) = (0..4u8).find(|p| used & 1 << p == 0) else {
+            return Ok(None);
+        };
+        self.select_display(idle)?;
+        let ports = self.scan_display().await.map_err(ModesetError::Boot)?;
+        let paths = self
+            .display_paths()
+            .map_err(|_| ModesetError::NoSink)?
+            .to_vec();
+        if !self.mst.is_empty() {
+            return Ok(None);
+        }
+        let mut new: Vec<(Selection, u8)> = match select_all(&paths, &ports, max_bpc(), &want) {
+            Ok(selections) => selections,
+            Err(ModesetError::NoSink | ModesetError::Link) => Vec::new(),
+            Err(e) => return Err(e),
+        }
+        .into_iter()
+        .filter(|s| !ports_used.contains(&s.port))
+        .filter_map(|s| Some((s, pipe_of(s.port).filter(|&p| p < 4 && used & 1 << p == 0)?)))
+        .collect();
+        new.sort_by_key(|&(_, pipe)| pipe);
+        if new.windows(2).any(|w| w[0].1 == w[1].1) {
+            return Err(ModesetError::Display(otg::Error::Invalid));
+        }
+        let limited = limited_range(broadcast_rgb());
+        for (s, pipe) in new.iter_mut() {
+            s.limited = limited && !s.ycbcr420;
+            s.format = plane_format(*pipe);
+            s.planes = plane_setup(*pipe);
+            (s.colorspace, s.hdr) = output_color(*pipe);
+        }
+        let soc = self.display_soc()?;
+        {
+            let mut selections: Vec<Selection> = new.iter().map(|&(s, _)| s).collect();
+            refine_dsc(&soc, &mut selections)?;
+            for ((s, _), r) in new.iter_mut().zip(selections) {
+                *s = r;
+            }
+        }
+        // The running displays with as many new ones as fit, in pipe order.
+        let mut n = new.len();
+        let (plans, order) = loop {
+            let mut joint: Vec<(dml::Mode, Option<usize>, u8)> = running
+                .iter()
+                .map(|m| (m.plan.mode, None, m.pipe))
+                .chain(
+                    new[..n]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &(s, p))| (selection_mode(&s), Some(i), p)),
+                )
+                .collect();
+            joint.sort_by_key(|&(_, _, p)| p);
+            let modes: Vec<dml::Mode> = joint.iter().map(|&(m, _, _)| m).collect();
+            match dml::admit_native(&soc, &modes) {
+                Ok(plans) => break (plans, joint),
+                Err(_) if n == 0 => return Ok(None),
+                Err(_) => n -= 1,
+            }
+        };
+        new.truncate(n);
+        if new.is_empty() {
+            running.sort_by_key(|m| m.pipe);
+            self.update_sst_outputs(Some(&soc), &paths, &ports, &running);
+            return Ok(Some(Configuration {
+                displays: running,
+                failed: None,
+            }));
+        }
+        // Each running display's plan, in `running` order; the new ones'.
+        let plan_of = |pipe: u8| {
+            order
+                .iter()
+                .position(|&(_, _, p)| p == pipe)
+                .map(|i| plans[i])
+        };
+        let running_plans: Vec<dml::Plan> = running
+            .iter()
+            .map(|m| plan_of(m.pipe))
+            .collect::<Option<_>>()
+            .ok_or(otg::Error::Invalid)?;
+        let new_plans: Vec<dml::Plan> = new
+            .iter()
+            .map(|&(_, p)| plan_of(p))
+            .collect::<Option<_>>()
+            .ok_or(otg::Error::Invalid)?;
+        let frl = running.iter().any(|m| m.selection.frl.is_some())
+            || new.iter().any(|(s, _)| s.frl.is_some());
+        let frl_dtb = if frl { Some(self.top_dtb_khz()?) } else { None };
+        let request = configuration_clocks(&plans, frl_dtb);
+        // The new displays' further pipes, from what the running ones leave.
+        let running_mask = running.iter().fold(0u8, |acc, m| {
+            acc | 1 << m.pipe
+                | running_dpp_targets(m, &m.plan)
+                    .iter()
+                    .fold(0, |a, &(p, _)| a | 1 << p)
+        });
+        let new_selections: Vec<Selection> = new.iter().map(|&(s, _)| s).collect();
+        let new_pipes: Vec<u8> = new.iter().map(|&(_, p)| p).collect();
+        let extra = display_pipes_beside(&new_selections, &new_plans, &new_pipes, running_mask)?;
+        if running
+            .iter()
+            .zip(&running_plans)
+            .any(|(m, p)| !keeps_pipes(m, p))
+        {
+            return Ok(None);
+        }
+        // SAFETY: the caller's obligations; the running displays stay lit.
+        unsafe { self.transition_running(&mut running, &running_plans, request) }.await?;
+        let mut lit = Vec::with_capacity(new.len());
+        let mut failed = None;
+        for ((&(selection, pipe), plan), d) in new.iter().zip(&new_plans).zip(&extra) {
+            self.select_display(pipe)?;
+            let clocks = async {
+                self.prepare_display_pipe_clocks_beside(pipe_clock_request(pipe, plan, &selection))
+                    .await
+                    .map_err(ModesetError::PipeClocks)?;
+                if selection.dsc.is_some() {
+                    self.start_display_dscclk(pipe)?;
+                }
+                for q in d.odm {
+                    self.prepare_display_pipe_clocks_beside(dccg::Request {
+                        pipe: q,
+                        dpp_khz: plan.clocks.dppclk_khz,
+                        pixel: dccg::PixelClock::OdmSegment,
+                    })
+                    .await
+                    .map_err(ModesetError::PipeClocks)?;
+                    if selection.dsc.is_some() {
+                        self.start_display_dscclk(q)?;
+                    }
+                }
+                for q in d.mpc {
+                    self.prepare_display_pipe_clocks_beside(dccg::Request {
+                        pipe: q,
+                        dpp_khz: plan.clocks.dppclk_khz,
+                        pixel: dccg::PixelClock::OdmSegment,
+                    })
+                    .await
+                    .map_err(ModesetError::PipeClocks)?;
+                }
+                for (k, o) in d.overlays.iter().enumerate() {
+                    let Some(o) = o else { continue };
+                    let dpp = plan
+                        .plane(k + 1)
+                        .ok_or(ModesetError::Display(otg::Error::Invalid))?
+                        .dppclk_khz;
+                    for q in o.all() {
+                        self.prepare_display_pipe_clocks_beside(dccg::Request {
+                            pipe: q,
+                            dpp_khz: dpp,
+                            pixel: dccg::PixelClock::OdmSegment,
+                        })
+                        .await
+                        .map_err(ModesetError::PipeClocks)?;
+                    }
+                }
+                Ok::<(), ModesetError>(())
+            }
+            .await;
+            let result = match clocks {
+                // SAFETY: the caller's obligations; earlier displays stay lit.
+                Ok(()) => unsafe { self.light(pipe, *d, selection, *plan, &mut fill) }.await,
+                Err(e) => Err(e),
+            };
+            match result {
+                Ok(m) => lit.push(m),
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        // optimize_bandwidth over what is lit now (a display that failed to
+        // light is retired by its own unwind; its pipes are not targets).
+        let mut targets: Vec<(u8, u32)> = running
+            .iter()
+            .flat_map(|m| running_dpp_targets(m, &m.plan))
+            .collect();
+        for m in &lit {
+            targets.extend(running_dpp_targets(m, &m.plan));
+        }
+        // SAFETY: as above.
+        unsafe { self.optimize_running(&mut running, request, &targets) }.await?;
+        let mut displays = running;
+        displays.extend(lit);
+        displays.sort_by_key(|m| m.pipe);
+        // Every display's offered modes beside the others, as lighting
+        // computes them.
+        let all = displays.clone();
+        for k in 0..displays.len() {
+            let edid = edid_of(&ports, &paths, &displays[k].selection);
+            displays[k].modes = self.offered_modes(&soc, &all, k, &edid);
+            self.modesets.retain(displays[k]);
+        }
+        self.update_sst_outputs(Some(&soc), &paths, &ports, &displays);
+        Ok(Some(Configuration { displays, failed }))
+    }
+    /// After a display left: DML admits the running displays' modes again
+    /// and, if each keeps its pipes, the configuration moves to the new
+    /// plans in dcn401's prepare/optimize order (the clocks the departed
+    /// display needed lowered last). Returns the updated displays.
+    /// # Safety
+    /// As for `modeset_displays`, except that the running displays stay lit.
+    pub async unsafe fn replan_displays(&mut self) -> Result<Vec<Modeset>, ModesetError> {
+        self.teardowns.check_idle()?;
+        let mut running: Vec<Modeset> = self.display_modesets().into_iter().flatten().collect();
+        if running.is_empty() || running.iter().any(|m| m.selection.mst.is_some()) {
+            return Ok(running);
+        }
+        running.sort_by_key(|m| m.pipe);
+        let soc = self.display_soc()?;
+        let modes: Vec<dml::Mode> = running.iter().map(|m| m.plan.mode).collect();
+        let plans = dml::admit_native(&soc, &modes).map_err(otg::Error::Admission)?;
+        if running.iter().zip(&plans).all(|(m, p)| *p == m.plan) {
+            return Ok(running);
+        }
+        let frl = running.iter().any(|m| m.selection.frl.is_some());
+        let frl_dtb = if frl { Some(self.top_dtb_khz()?) } else { None };
+        let request = configuration_clocks(&plans, frl_dtb);
+        // SAFETY: the caller's obligations.
+        unsafe { self.transition_running(&mut running, &plans, request) }.await?;
+        let targets: Vec<(u8, u32)> = running
+            .iter()
+            .flat_map(|m| running_dpp_targets(m, &m.plan))
+            .collect();
+        // SAFETY: as above.
+        unsafe { self.optimize_running(&mut running, request, &targets) }.await?;
+        Ok(running)
+    }
+}
+
+/// `display_pipes` for new displays on `pipes` lit beside running ones
+/// whose pipes (every one they scan out on, by bit) are `used`: every split
+/// takes only what those leave.
+pub fn display_pipes_beside(
+    selections: &[Selection],
+    plans: &[dml::Plan],
+    pipes: &[u8],
+    used: u8,
+) -> Result<Vec<DisplayPipes>, ModesetError> {
+    // Only the pipes named matter to the allocation, not their order.
+    let mut taken: Vec<u8> = pipes.to_vec();
+    taken.extend((0..4u8).filter(|p| used & 1 << p != 0 && !pipes.contains(p)));
+    display_pipes(selections, plans, &taken)
+}

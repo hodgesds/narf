@@ -56,13 +56,14 @@ const DRAM_STATE: u64 = 0x4fc;
 const PSTATE_FORCE: u32 = 0x30; // ALLOW_PSTATE_CHANGE_FORCE_{VALUE,ENABLE}
 const PSTATE_DISALLOWED: u32 = 0x20;
 
-/// One overlay plane of a scanout: its pipe (and ODM pipe), fetching
-/// `address` above the planes below it, or below the primary for an
-/// underlay.
+/// One overlay plane of a scanout: its pipe (and ODM pipes, or MPC
+/// slices' pipes), fetching `address` above the planes below it, or below
+/// the primary for an underlay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OverlayScanout {
     pub pipe: u8,
-    pub odm: Option<u8>,
+    pub odm: SplitPipes,
+    pub mpc: SplitPipes,
     pub address: u64,
     pub underlay: bool,
 }
@@ -71,18 +72,39 @@ impl OverlayScanout {
         Self {
             pipe: s.request.pipe,
             odm: s.request.odm,
+            mpc: s.request.mpc,
             address: s.address,
             underlay: s.request.layout().underlay,
         }
     }
+    /// Its pipes with the ODM segment each feeds.
+    fn pipes(&self) -> impl Iterator<Item = (u8, usize)> + Clone {
+        plane_pipes(self.pipe, self.odm, self.mpc)
+    }
+}
+
+/// A plane's pipes, the first first, each with the ODM segment (OPP) its
+/// MPCC blends into: one per segment with ODM, every MPC slice on the one
+/// segment without.
+fn plane_pipes(
+    pipe: u8,
+    odm: SplitPipes,
+    mpc: SplitPipes,
+) -> impl Iterator<Item = (u8, usize)> + Clone {
+    let odm = odm.into_iter().enumerate().map(|(k, p)| (p, k + 1));
+    core::iter::once((pipe, 0))
+        .chain(odm)
+        .chain(mpc.into_iter().map(|p| (p, 0)))
 }
 
 /// Evidence that one owned surface is the pipe's live scanout source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanoutRunning {
     pub pipe: u8,
-    /// ODM 2:1: the pipe fetching the right half.
-    pub odm: Option<u8>,
+    /// ODM: the pipes fetching the following segments.
+    pub odm: SplitPipes,
+    /// MPC combine: the pipes fetching the primary's further slices.
+    pub mpc: SplitPipes,
     pub stream: u8,
     /// The admitted plan whose deadlines this fetch runs under.
     pub plan: dml::Plan,
@@ -111,25 +133,32 @@ pub struct LivePipe {
 
 /// Each segment's MPCC tree, bottom first: the underlays' pipes for the
 /// segment, the primary's (whose OPP the tree feeds), then the other
-/// overlays' (normalized zpos order).
+/// overlays' (normalized zpos order). An MPC-combined plane's slices sit
+/// together, each further slice below the one before (its bottom_pipe, as
+/// acquire_dpp_pipe_and_add_mpc_slice links it).
 fn trees(
-    primary: impl Iterator<Item = u8>,
+    (pipe, odm, mpc): (u8, SplitPipes, SplitPipes),
     overlays: &[Option<OverlayScanout>; MAX_OVERLAYS],
 ) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
-    primary
-        .enumerate()
-        .map(|(segment, p)| {
-            let at = move |under: bool| {
-                overlays
-                    .iter()
-                    .flatten()
-                    .filter(move |o| o.underlay == under)
-                    .filter_map(move |o| core::iter::once(o.pipe).chain(o.odm).nth(segment))
+    (0..odm.count() as usize)
+        .map(|segment| {
+            let mut tree = alloc::vec::Vec::new();
+            let mut push = |pipes: &mut dyn Iterator<Item = (u8, usize)>| {
+                let at = tree.len();
+                for (p, s) in pipes {
+                    if s == segment {
+                        tree.insert(at, p);
+                    }
+                }
             };
-            at(true)
-                .chain(core::iter::once(p))
-                .chain(at(false))
-                .collect()
+            for o in overlays.iter().flatten().filter(|o| o.underlay) {
+                push(&mut o.pipes());
+            }
+            push(&mut plane_pipes(pipe, odm, mpc));
+            for o in overlays.iter().flatten().filter(|o| !o.underlay) {
+                push(&mut o.pipes());
+            }
+            tree
         })
         .collect()
 }
@@ -141,35 +170,41 @@ impl ScanoutRunning {
     /// (TOP_BOT_BLENDING), the bottom over the background (TOP_LAYER_ONLY).
     /// The cursor shows on the primary's pipes only.
     pub fn live_pipes(&self, cursor: Option<CursorApplied>) -> alloc::vec::Vec<LivePipe> {
-        live_pipes(self.pipe, self.odm, self.address, &self.overlays, cursor)
+        live_pipes(
+            (self.pipe, self.odm, self.mpc),
+            self.address,
+            &self.overlays,
+            cursor,
+        )
     }
 }
 
 fn live_pipes(
-    pipe: u8,
-    odm: Option<u8>,
+    (pipe, odm, mpc): (u8, SplitPipes, SplitPipes),
     address: u64,
     overlays: &[Option<OverlayScanout>; MAX_OVERLAYS],
     cursor: Option<CursorApplied>,
 ) -> alloc::vec::Vec<LivePipe> {
     let mut out = alloc::vec::Vec::new();
-    let primary = core::iter::once(pipe).chain(odm);
-    for (tree, opp) in trees(primary.clone(), overlays).into_iter().zip(primary) {
+    let opps = core::iter::once(pipe).chain(odm);
+    let primary = plane_pipes(pipe, odm, mpc).fold(0u8, |m, (p, _)| m | bit(p));
+    for (tree, opp) in trees((pipe, odm, mpc), overlays).into_iter().zip(opps) {
         let top = *tree.last().unwrap_or(&opp);
         for (j, &m) in tree.iter().enumerate() {
-            let fetched = if m == opp {
+            let fetched = if primary & bit(m) != 0 {
                 address
             } else {
                 overlays
                     .iter()
                     .flatten()
-                    .find(|o| o.pipe == m || o.odm == Some(m))
+                    .find(|o| o.pipes().any(|(p, _)| p == m))
                     .map_or(0, |o| o.address)
             };
             out.push(LivePipe {
                 pipe: m,
                 address: fetched,
-                cursor: m == opp && cursor.is_some_and(|c| c.pipe == pipe && c.shown_on(m)),
+                cursor: primary & bit(m) != 0
+                    && cursor.is_some_and(|c| c.pipe == pipe && c.shown_on(m)),
                 routes: [
                     if m == opp { top } else { 0xf },
                     m,
@@ -247,8 +282,10 @@ impl ScanoutPosition {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Pipe {
     pub(super) pipe: u8,
-    /// The ODM pipe fetching the right half, under `pipe`'s timing.
-    pub(super) odm: Option<u8>,
+    /// The ODM pipes fetching the following segments, under `pipe`'s timing.
+    pub(super) odm: SplitPipes,
+    /// The primary's further MPC slices' pipes, on `pipe`'s OPP.
+    pub(super) mpc: SplitPipes,
     pub(super) address: u64,
     /// The overlay planes above the primary, bottom first.
     pub(super) overlays: [Option<OverlayScanout>; MAX_OVERLAYS],
@@ -258,21 +295,19 @@ pub(super) struct Pipe {
     pub(super) watch: bool,
 }
 impl Pipe {
-    /// Every pipe whose HUBP/DPP/MPCC/OPP carries the primary plane: the
-    /// stream's OPPs.
+    /// The stream's OPPs: every ODM segment's pipe, whose OPP each tree
+    /// feeds.
     pub(super) fn pipes(self) -> impl Iterator<Item = u8> + Clone {
         core::iter::once(self.pipe).chain(self.odm)
     }
     /// Every HUBP/DPP/MPCC of the scanout with the address it fetches:
     /// the primary's, then each overlay's, bottom first.
     pub(super) fn fetches(self) -> alloc::vec::Vec<(u8, u64)> {
-        let mut out: alloc::vec::Vec<(u8, u64)> = self.pipes().map(|q| (q, self.address)).collect();
+        let mut out: alloc::vec::Vec<(u8, u64)> = plane_pipes(self.pipe, self.odm, self.mpc)
+            .map(|(q, _)| (q, self.address))
+            .collect();
         for o in self.overlays.iter().flatten() {
-            out.extend(
-                core::iter::once(o.pipe)
-                    .chain(o.odm)
-                    .map(|q| (q, o.address)),
-            );
+            out.extend(o.pipes().map(|(q, _)| (q, o.address)));
         }
         out
     }
@@ -282,12 +317,17 @@ impl Pipe {
     }
     /// Each segment's MPCC tree, bottom first.
     pub(super) fn trees(self) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
-        trees(self.pipes(), &self.overlays)
+        trees((self.pipe, self.odm, self.mpc), &self.overlays)
     }
     /// The scanout's pipes as a live check finds them (as
     /// `ScanoutRunning::live_pipes`).
     pub(super) fn live(self, cursor: Option<CursorApplied>) -> alloc::vec::Vec<LivePipe> {
-        live_pipes(self.pipe, self.odm, self.address, &self.overlays, cursor)
+        live_pipes(
+            (self.pipe, self.odm, self.mpc),
+            self.address,
+            &self.overlays,
+            cursor,
+        )
     }
 }
 
@@ -757,13 +797,21 @@ impl<I: Io> Engine<I> {
         pipe: u8,
         address: u64,
     ) -> Result<(), Error> {
-        let odm = self.fetch_pipes(pipe).nth(1);
+        let (odm, mpc) = self
+            .status
+            .surfaces
+            .get(usize::from(pipe))
+            .copied()
+            .flatten()
+            .map_or((SplitPipes::NONE, SplitPipes::NONE), |a| {
+                (a.request.odm, a.request.mpc)
+            });
         let overlays = self
             .status
             .scanout
             .filter(|s| s.pipe == pipe)
             .map_or([None; MAX_OVERLAYS], |s| s.overlays);
-        for live in live_pipes(pipe, odm, address, &overlays, self.status.cursor) {
+        for live in live_pipes((pipe, odm, mpc), address, &overlays, self.status.cursor) {
             self.live_pipe(live)?;
         }
         Ok(())
@@ -894,7 +942,20 @@ impl Surfaces {
         e: &mut Engine<I>,
         d: DeadlinesApplied,
         crystal_khz: u32,
+        current: (dccg::Applied, DisplayContext),
+    ) -> Result<Pipe, Error> {
+        self.scanout_bound_with(e, d, crystal_khz, current, WatermarkUpdate::Exact)
+    }
+    /// `scanout_bound` with the shared watermarks checked as `wm` would
+    /// have written them: exactly, or (while a configuration change raised
+    /// them for another display's new plan) at least this plan's.
+    pub(super) fn scanout_bound_with<I: Io>(
+        &self,
+        e: &mut Engine<I>,
+        d: DeadlinesApplied,
+        crystal_khz: u32,
         (clock, config): (dccg::Applied, DisplayContext),
+        wm: WatermarkUpdate,
     ) -> Result<Pipe, Error> {
         let slot = usize::from(d.pipe);
         let a = e.status.requestor.ok_or(Error::Invalid)?;
@@ -937,7 +998,7 @@ impl Surfaces {
             e.verify_mpc(m)?;
         }
         e.verify_live_requestor(d.pipe)?;
-        e.deadline_writes(d.pipe, &d.plan, true)?;
+        e.deadline_writes_with(d.pipe, &d.plan, true, wm)?;
         let refclk = e.dchub_refclk_khz(crystal_khz)?;
         if !deadline::bound(&d.plan, blank.timing.request, a, clock, refclk) {
             return Err(Error::Invalid);
@@ -945,6 +1006,7 @@ impl Surfaces {
         Ok(Pipe {
             pipe: d.pipe,
             odm: surface.request.odm,
+            mpc: surface.request.mpc,
             address: surface.address,
             overlays: a.overlays.map(|o| o.map(OverlayScanout::of)),
             black: 0x41 | blank.request.depth.dpg() << 12,
@@ -990,6 +1052,7 @@ impl Surfaces {
                 let report = ScanoutRunning {
                     pipe,
                     odm: p.odm,
+                    mpc: p.mpc,
                     stream,
                     plan: d.plan,
                     address: p.address,

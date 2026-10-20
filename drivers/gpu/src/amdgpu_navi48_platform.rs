@@ -3584,7 +3584,8 @@ async unsafe fn copy_whole_plane(
         width,
         height,
         format,
-        odm: None,
+        odm: crate::amdgpu_dcn401_otg::SplitPipes::NONE,
+        mpc: crate::amdgpu_dcn401_otg::SplitPipes::NONE,
         plane: None,
         surface: g.surface,
     }
@@ -3706,6 +3707,12 @@ pub enum MonitorStep {
     /// The configuration was lit again (a new sink, a CRTC switched back on,
     /// another mode or output range): this many displays now run.
     Relit(u8),
+    /// New sinks were lit beside the running displays, which stayed lit
+    /// through a seamless clock change: this many displays were added.
+    LitBeside(u8),
+    /// After a display left, the remaining ones moved to the plans of the
+    /// smaller configuration in place (clocks lowered after): this many.
+    Replanned(u8),
 }
 
 /// Record DRM's CRTC on/off request for display `display`. Level-triggered:
@@ -4207,35 +4214,24 @@ fn admits_with_planes(
         .iter()
         .position(|&(n, _)| n == k)
         .ok_or(PlanesRefused::NotLit)?;
-    let plans = dml::admit_all(soc, &modes).map_err(|e| match e {
+    let plans = dml::admit_native(soc, &modes).map_err(|e| match e {
         dml::Error::Pipes => PlanesRefused::Pipes,
         dml::Error::Unsupported | dml::Error::Invalid => PlanesRefused::Plane,
         _ => PlanesRefused::Bandwidth,
     })?;
-    // Every other display's planes keep theirs; this display's take the
-    // pipes left after every display's own and ODM pipes.
+    // Every display's ODM segments, MPC slices and overlays take the pipes
+    // the displays leave, as lighting assigns them.
     let pipes: Vec<u8> = joint.iter().map(|&(n, _)| n as u8).collect();
-    let odm = boot::odm_pipes(&plans, &pipes).map_err(|_| PlanesRefused::Pipes)?;
-    // The other displays' overlays as admitted (each a pipe per segment).
-    let overlay_pipes = |i: usize| (modes[i].plane_list().count() as u8 - 1) * plans[i].pipes;
-    let others: u8 = (0..joint.len())
-        .filter(|&i| i != at)
-        .map(overlay_pipes)
-        .sum();
-    let free = 4 - pipes.len() as u8 - odm.iter().flatten().count() as u8;
-    if others + overlay_pipes(at) > free {
-        return Err(PlanesRefused::Pipes);
-    }
+    let extra = boot::plan_pipes(&plans, &pipes).map_err(|_| PlanesRefused::Pipes)?;
     let m = &modes[at];
-    let overlays: [Option<(u8, Option<u8>)>; crate::amdgpu_dcn401_otg::MAX_OVERLAYS] =
-        core::array::from_fn(|i| setup.overlays[i].map(|_| (0, odm[at].map(|_| 1))));
+    let d = extra[at];
     let (primary, stack) = boot::stream_planes(
         &m.timing,
         m.ycbcr420,
         format,
         setup,
-        (2, odm[at].map(|_| 3)),
-        &overlays,
+        (pipes[at], d.odm, d.mpc),
+        &d.overlays,
     );
     for r in core::iter::once(primary).chain(stack.into_iter().flatten()) {
         r.check().map_err(|_| PlanesRefused::Plane)?;
@@ -4314,7 +4310,7 @@ fn admits_with_format(
             }
         })
         .collect();
-    joint.iter().any(|&(n, _)| n == k) && dml::admit_all(soc, &modes).is_ok()
+    joint.iter().any(|&(n, _)| n == k) && dml::admit_native(soc, &modes).is_ok()
 }
 
 /// Every display back to the console's defaults (on, preferred mode,
@@ -4672,7 +4668,40 @@ pub async unsafe fn monitor_displays(
         .enumerate()
         .filter(|(_, m)| m.is_some())
         .fold(0u8, |acc, (k, _)| acc | 1 << k);
+    let retired_now = steps
+        .iter()
+        .any(|s| matches!(s, MonitorStep::Unplugged(_) | MonitorStep::Disabled(_)));
+    let (mut relit, mut lit_beside) = (false, false);
     if needs_relight(relight, wanted, lit_mask, &mut displays.considered) {
+        relit = true;
+        // Only new sinks (nothing a running display asked for changed):
+        // light them beside the running displays, which stay lit through
+        // the shared clocks' seamless change, unless that is refused.
+        let beside = if !relight && lit_mask != 0 {
+            let fill = |_: u8, _: u32, row: &mut [u32]| row.fill(0);
+            // SAFETY: as above; the running displays stay lit and published.
+            unsafe { light_beside(boot, &displays.lit, fill) }.await?
+        } else {
+            None
+        };
+        if let Some(config) = beside {
+            if let Some(e) = config.failed {
+                let _ = core::fmt::Write::write_fmt(
+                    &mut narf_console::Writer,
+                    format_args!("amdgpu: navi48 display failed to light: {e:?}\n"),
+                );
+            }
+            let mut count = 0;
+            for m in config.displays {
+                count += u8::from(lit_mask & 1 << m.pipe == 0);
+                displays.lit[usize::from(m.pipe)] = Some(m);
+            }
+            displays.considered = wanted_mask(boot);
+            steps.push(MonitorStep::LitBeside(count));
+            lit_beside = true;
+        }
+    }
+    if relit && !lit_beside {
         // Withdraw every writer, stop every display, light them again.
         for k in (0..4u8).rev() {
             let Some(m) = displays.lit[usize::from(k)] else {
@@ -4747,6 +4776,29 @@ pub async unsafe fn monitor_displays(
                 .fold(0, |acc, (k, _)| acc | 1 << k);
         }
         steps.push(MonitorStep::Relit(count));
+    } else if retired_now && lit_mask != 0 {
+        // A display left the others running: they move to the smaller
+        // configuration's plans in place, its clocks lowered after. A
+        // configuration DML no longer admits as planned stays as it is.
+        // SAFETY: as above; the running displays stay lit and published.
+        match unsafe { boot.replan_displays() }.await {
+            Ok(running) => {
+                let mut outputs = OUTPUTS.lock();
+                for m in &running {
+                    if let Some(c) = outputs.crtcs.get_mut(usize::from(m.pipe)) {
+                        c.admitted = Some((m.plan.soc, m.plan.mode));
+                    }
+                }
+                drop(outputs);
+                let count = running.len() as u8;
+                for m in running {
+                    displays.lit[usize::from(m.pipe)] = Some(m);
+                }
+                steps.push(MonitorStep::Replanned(count));
+            }
+            Err(ModesetError::Display(crate::amdgpu_dcn401_otg::Error::Admission(_))) => {}
+            Err(e) => return Err(e),
+        }
     }
     if !steps.is_empty() {
         publish_outputs();
@@ -6214,4 +6266,92 @@ mod tests {
         result
     }
     kernel_test_in!("drivers/gpu/navi48-kms", navi48_planes_request_and_admit);
+}
+
+/// Light the plugged board sinks DRM wants beside the displays that run
+/// (output k on pipe k), which stay lit: `ColdBoot::modeset_beside`'s
+/// seamless configuration change (shared clocks raised before and lowered
+/// after, the running displays moved to their new plans in place). `None`
+/// when it is refused before any change (an MST configuration, the running
+/// displays no longer fitting as they are), for the caller to relight
+/// instead. Publishes the new displays as `light_displays` does and the
+/// running ones' new admission.
+/// # Safety
+/// As for `light_displays`, except that the running displays stay lit and
+/// published.
+async unsafe fn light_beside(
+    boot: &mut boot::ColdBoot,
+    lit: &[Option<Modeset>; 4],
+    fill: impl FnMut(u8, u32, &mut [u32]),
+) -> Result<Option<crate::amdgpu_navi48_boot::Configuration>, ModesetError> {
+    let lit_mask = lit.iter().flatten().fold(0u8, |acc, m| acc | 1 << m.pipe);
+    let (routes, wants) = {
+        let mut outputs = OUTPUTS.lock();
+        if outputs.mst_port().is_some() {
+            return Ok(None);
+        }
+        outputs.assign_routes();
+        let routes: [Option<Target>; 4] = core::array::from_fn(|k| {
+            let c = &outputs.crtcs[k];
+            c.route.filter(|_| c.active && lit_mask & 1 << k == 0)
+        });
+        let wants: [Option<Timing>; 4] = core::array::from_fn(|k| outputs.crtcs[k].requested);
+        for k in (0..4).filter(|&k| lit_mask & 1 << k == 0) {
+            let (colorspace, hdr) = connector_color(&outputs, k);
+            crate::amdgpu_navi48_boot::set_output_color(k as u8, colorspace, hdr);
+            let c = &outputs.crtcs[k];
+            crate::amdgpu_navi48_boot::set_plane_format(k as u8, c.format);
+            crate::amdgpu_navi48_boot::set_plane_setup(k as u8, c.planes);
+        }
+        (routes, wants)
+    };
+    if routes.iter().all(|r| !matches!(r, Some(Target::Board(_)))) {
+        return Ok(None);
+    }
+    let crtc_of = |t: Target| routes.iter().position(|r| *r == Some(t));
+    let pipe = |port: usize| crtc_of(Target::Board(port)).map(|k| k as u8);
+    let want = |port: usize| crtc_of(Target::Board(port)).and_then(|k| wants[k]);
+    // SAFETY: the caller's obligations.
+    let Some(config) = unsafe { boot.modeset_beside(fill, want, pipe) }.await? else {
+        return Ok(None);
+    };
+    {
+        let mut outputs = OUTPUTS.lock();
+        for port in board_ports(boot) {
+            let hpd = boot.display_hpd(port).ok();
+            let sst = boot.display_sst_outputs().iter().find(|o| o.port == port);
+            let Some(x) = outputs.connector_mut(Target::Board(port)) else {
+                continue;
+            };
+            let changed = x.reconcile_sst(sst);
+            x.last_hpd = hpd;
+            if changed {
+                outputs.invalidate(Target::Board(port), false);
+            }
+        }
+        // The running displays' new admission and offered modes.
+        for m in config
+            .displays
+            .iter()
+            .filter(|m| lit_mask & 1 << m.pipe != 0)
+        {
+            if let Some(c) = outputs.crtcs.get_mut(usize::from(m.pipe)) {
+                c.admitted = Some((m.plan.soc, m.plan.mode));
+                if let Some(shown) = c.shown.as_mut() {
+                    shown.2 = m.modes.iter().flatten().copied().collect();
+                }
+            }
+        }
+    }
+    publish_outputs();
+    for m in config
+        .displays
+        .iter()
+        .filter(|m| lit_mask & 1 << m.pipe == 0)
+    {
+        // SAFETY: as above.
+        unsafe { adopt(boot, m) }.await;
+    }
+    publish_outputs();
+    Ok(Some(config))
 }

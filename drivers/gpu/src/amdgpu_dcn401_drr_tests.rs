@@ -42,7 +42,8 @@ fn live(pipe: u8) -> (Engine<Fake>, Request) {
     e.status.state = State::ScanoutRunning(pipe);
     e.status.scanout = Some(ScanoutRunning {
         pipe,
-        odm: None,
+        odm: SplitPipes::NONE,
+        mpc: SplitPipes::NONE,
         stream: pipe,
         plan: dml::admit(
             &dml::Soc {

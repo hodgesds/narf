@@ -55,7 +55,8 @@ fn owners(plan: &dml::Plan, pipe: u8) -> (Request, RequestorApplied, dccg::Appli
             width: 1920,
             height: 1080,
             format: SurfaceFormat::Xrgb8888,
-            odm: None,
+            odm: SplitPipes::NONE,
+            mpc: SplitPipes::NONE,
             plane: None,
         },
         address: 0x8_0000_0000,
@@ -69,7 +70,7 @@ fn owners(plan: &dml::Plan, pipe: u8) -> (Request, RequestorApplied, dccg::Appli
         signal: Signal::DisplayPort,
         ycbcr420: false,
         dsc: None,
-        odm: None,
+        odm: SplitPipes::NONE,
     };
     let requestor = RequestorApplied {
         pipe,
@@ -440,7 +441,8 @@ fn video_overlay(pipe: u8) -> SurfaceApplied {
         width: 1280,
         height: 720,
         format: SurfaceFormat::Argb8888,
-        odm: None,
+        odm: SplitPipes::NONE,
+        mpc: SplitPipes::NONE,
         plane: Some(PlaneLayout {
             src: crate::amdgpu_dcn401_spl::Rect::new(0, 0, 1280, 720),
             dst: crate::amdgpu_dcn401_spl::Rect::new(100, 100, 640, 360),
@@ -569,7 +571,7 @@ fn dcn401_deadlines_bind_every_planned_plane() -> TestResult {
     };
     let split = SurfaceApplied {
         request: SurfaceRequest {
-            odm: Some(2),
+            odm: SplitPipes::one(2),
             ..ov.request
         },
         ..ov

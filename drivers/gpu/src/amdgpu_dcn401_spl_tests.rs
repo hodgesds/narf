@@ -18,6 +18,7 @@ fn input(a: &[i32]) -> Input {
         stream_width: a[8],
         stream_height: a[9],
         odm_slice: Rect::new(a[10], 0, a[11], a[9]),
+        mpc_slice: (0, 1),
         rotation: [Rotation::R0, Rotation::R90, Rotation::R180, Rotation::R270][a[12] as usize],
         horizontal_mirror: a[13] != 0,
         alpha: a[14] != 0,
@@ -153,6 +154,7 @@ fn dcn401_spl_nv12_full_frame_scales_chroma() -> TestResult {
         stream_width: 1920,
         stream_height: 1080,
         odm_slice: r,
+        mpc_slice: (0, 1),
         rotation: Rotation::R0,
         horizontal_mirror: false,
         alpha: false,
@@ -197,6 +199,7 @@ fn dcn401_spl_scaling_modes() -> TestResult {
         stream_width: dst.0,
         stream_height: dst.1,
         odm_slice: Rect::new(0, 0, dst.0, dst.1),
+        mpc_slice: (0, 1),
         rotation: Rotation::R0,
         horizontal_mirror: false,
         alpha: false,
@@ -226,3 +229,44 @@ fn dcn401_spl_scaling_modes() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/dcn401-spl", dcn401_spl_scaling_modes);
+
+/// Shared with tests/dcn401_spl/check.sh (harness.c with MPC set).
+const MPC_VECTORS: &str = include_str!("../tests/dcn401_spl/mpc_vectors.txt");
+
+/// Every MPC slice of mpc_vectors.txt programs exactly Linux's writes:
+/// calculate_mpc_slice_in_timing_active's share of the plane clip (the
+/// remainder to the last slices), its recout, viewport and inits.
+fn dcn401_spl_matches_linux_mpc_vectors() -> TestResult {
+    let mut n = 0;
+    for line in MPC_VECTORS
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        let Some((inputs, want)) = line.split_once(" = ") else {
+            return TestResult::Fail("malformed vector");
+        };
+        let a: Vec<i32> = inputs
+            .split_whitespace()
+            .filter_map(|v| v.parse().ok())
+            .collect();
+        if a.len() != 17 {
+            return TestResult::Fail("malformed vector inputs");
+        }
+        let input = Input {
+            mpc_slice: (a[15], a[16]),
+            ..input(&a)
+        };
+        if tokens(&input) != want {
+            return TestResult::Fail("MPC slice SPL writes differ from Linux");
+        }
+        n += 1;
+    }
+    if n < 200 {
+        return TestResult::Fail("too few MPC slice vectors");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-spl",
+    dcn401_spl_matches_linux_mpc_vectors
+);

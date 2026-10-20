@@ -1857,7 +1857,9 @@ impl ColdBoot {
         mode: &crate::amdgpu_dcn401_dml::Mode,
     ) -> Result<crate::amdgpu_dcn401_dml::Plan, otg::Error> {
         let soc = self.display_soc()?;
-        crate::amdgpu_dcn401_dml::admit(&soc, mode).map_err(otg::Error::Admission)
+        crate::amdgpu_dcn401_dml::admit_native(&soc, core::slice::from_ref(mode))
+            .map(|plans| plans[0])
+            .map_err(otg::Error::Admission)
     }
     /// DTBCLK's highest usable DPM level, which FRL streams hold
     /// (dcn401_update_clocks).
@@ -1924,6 +1926,107 @@ impl ColdBoot {
                 )
                 .await
         }
+    }
+    /// Move display `pipe`'s live scanout to `plan`, its stream and planes
+    /// admitted in a new configuration, without leaving scanout
+    /// (`Otg::update_live_plan`; `raise` for prepare_bandwidth's
+    /// raise-only watermarks).
+    /// # Safety
+    /// As for `prepare_display_deadlines`; the scanout's surfaces stay live.
+    pub async unsafe fn update_live_display_plan(
+        &mut self,
+        pipe: u8,
+        plan: &crate::amdgpu_dcn401_dml::Plan,
+        raise: bool,
+    ) -> Result<otg::DeadlinesApplied, otg::Error> {
+        if self.display_retirement_busy() {
+            return Err(otg::Error::Busy);
+        }
+        let crystal = *self.crystal.as_ref().map_err(|_| otg::Error::Unsupported)?;
+        let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
+        // SAFETY: matching retained owners are serialized; caller excludes external writers.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .update_live_plan(
+                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                    gmc,
+                    pipe,
+                    plan,
+                    raise,
+                    crystal,
+                )
+                .await
+        }
+    }
+    /// dcn401_update_clocks on the running configuration: the global floors
+    /// moved to `request` (only raised unless `safe_to_lower`) with every
+    /// display live, the DPP DTOs of the running pipes `targets` (pipe,
+    /// DPPCLK) updated at Linux's points, then every clock record and every
+    /// display's timing records rebound to the clocks now running.
+    /// Failure leaves the clock owner failed.
+    pub async fn update_live_display_clocks(
+        &mut self,
+        request: clocks::Request,
+        targets: &[(u8, u32)],
+        safe_to_lower: bool,
+    ) -> Result<clocks::Applied, otg::Error> {
+        if self.display_retirement_busy() {
+            return Err(otg::Error::Busy);
+        }
+        let otg = self.otg.as_mut().map_err(|e| *e)?;
+        let held = otg.all_held();
+        let clocks = self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?;
+        let dccg = self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?;
+        let regs = self.sequence.backend.gpu.regs;
+        let old = clocks
+            .retained_pipe_clocks(regs)
+            .map_err(otg::Error::Clocks)?;
+        let mut dto = |ref_khz: u32| {
+            dccg.update_dpp_dtos(regs, ref_khz, targets, safe_to_lower)
+                .map_err(|_| clocks::Error::Dto)
+        };
+        let new = clocks
+            .update_live(regs, request, safe_to_lower, &held, &mut dto)
+            .await
+            .map_err(otg::Error::Clocks)?;
+        dccg.rebind_global(old, new);
+        let records = dccg.status().pipes;
+        for display in 0..4u8 {
+            let Some(status) = otg.display_status(display) else {
+                continue;
+            };
+            let Some(timing) = status.pipes[usize::from(display)] else {
+                continue;
+            };
+            if let Some(clock) = records[usize::from(timing.request.pipe)] {
+                otg.rebind_clock(display, clock)?;
+            }
+        }
+        Ok(new)
+    }
+    /// Program `request`'s pipe clock for the selected display while the
+    /// others run (their consumers left to them).
+    pub async fn prepare_display_pipe_clocks_beside(
+        &mut self,
+        request: dccg::Request,
+    ) -> Result<dccg::Applied, dccg::Error> {
+        if self.display_retirement_busy() {
+            return Err(dccg::Error::Busy);
+        }
+        let held = self
+            .otg
+            .as_ref()
+            .map_err(|_| dccg::Error::Busy)?
+            .siblings_held();
+        let clocks = self.clocks.as_mut().map_err(|e| dccg::Error::Clocks(*e))?;
+        self.dccg
+            .as_mut()
+            .map_err(|e| *e)?
+            .prepare_except(clocks, request, &held)
+            .await
     }
     /// Make the staged surface the visible source of the pipe's running black
     /// DP video, after re-binding its programmed deadlines.
@@ -3413,15 +3516,15 @@ mod modeset;
 #[path = "amdgpu_navi48_teardown.rs"]
 mod teardown;
 pub use modeset::{
-    broadcast_rgb, edid_timings, frl_audio, frl_cap, frl_carries, frl_dsc, frl_dsc_caps,
-    frl_dsc_carries, frl_dsc_link, frl_enabled, frl_link, frl_video_params, hdmi_avi, hdmi_caps,
-    hdmi_stream, limited_range, max_bpc, odm_pipes, output_color, overlay_pipes, plane_format,
-    plane_mode, plane_requests, plane_setup, selection_mode, set_broadcast_rgb, set_frl,
-    set_max_bpc, set_output_color, set_plane_format, set_plane_setup, sink_audio_info,
-    stream_planes, with_planes, Configuration, DisplayPipes, FrlDscStream, FrlRate, HdmiCaps,
-    HdmiStream, Health, InheritedRetired, Modeset, ModesetError, MstRoute, MstStream, OverlayPlane,
-    PlaneGeometry, PlaneSetup, Selection, SstOutput, BROADCAST_RGB_AUTO, BROADCAST_RGB_FULL,
-    BROADCAST_RGB_LIMITED,
+    broadcast_rgb, display_pipes, edid_timings, frl_audio, frl_cap, frl_carries, frl_dsc,
+    frl_dsc_caps, frl_dsc_carries, frl_dsc_link, frl_enabled, frl_link, frl_video_params, hdmi_avi,
+    hdmi_caps, hdmi_stream, limited_range, max_bpc, mpc_pipes, odm_pipes, output_color,
+    overlay_pipes, plan_pipes, plane_format, plane_mode, plane_requests, plane_setup,
+    selection_mode, set_broadcast_rgb, set_frl, set_max_bpc, set_output_color, set_plane_format,
+    set_plane_setup, sink_audio_info, stream_planes, with_planes, Configuration, DisplayPipes,
+    FrlDscStream, FrlRate, HdmiCaps, HdmiStream, Health, InheritedRetired, Modeset, ModesetError,
+    MstRoute, MstStream, OverlayPlane, PlaneGeometry, PlanePipes, PlaneSetup, Selection, SstOutput,
+    BROADCAST_RGB_AUTO, BROADCAST_RGB_FULL, BROADCAST_RGB_LIMITED,
 };
 pub use teardown::{TeardownStatus, TeardownStep};
 #[cfg(feature = "kernel-test")]

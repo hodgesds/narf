@@ -89,11 +89,11 @@ impl BlankRequest {
         plan: Plan,
         segment: u32,
     ) -> impl Iterator<Item = (u64, u32, u32)> {
-        let width = plan.segment_width();
+        let (x, width) = plan.segment(segment);
         // opp2_get_left_edge_extra_pixel_count: a non-primary OPP's 4:2:0
         // chroma filter takes one pixel from the left neighbour.
         let edge = u32::from(self.ycbcr420 && segment > 0);
-        self.common_registers(plan.request.timing, width, segment * width, edge)
+        self.common_registers(plan.request.timing, width, x, edge)
             .into_iter()
             .chain(self.ycbcr420.then_some((MAP420, 3, 0)))
     }

@@ -401,7 +401,8 @@ fn dcn401_mst_audio_requires_matching_live_scanout_witnesses() -> TestResult {
     };
     let live = ScanoutRunning {
         pipe: 2,
-        odm: None,
+        odm: SplitPipes::NONE,
+        mpc: SplitPipes::NONE,
         stream: 1,
         plan: dml::admit(
             &soc,

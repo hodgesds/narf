@@ -9,10 +9,11 @@
 //! (`force_sharpness` is `SHARPNESS_HW_OFF`, so iSHARP is never enabled),
 //! `max_downscale_src_width` 7680, no `always_scale`, the DCN4.x linear-light
 //! preference left to the format (`LLS_PREF_DONT_CARE`), no HDR
-//! (`dm_helpers_is_hdr_on` is false), no 3D view, no MPC combine (one MPC
-//! slice), no visual confirm, no OPP recout adjustment, cositing none and
-//! zeroed scaling quality (amdgpu_dm_plane_fill_dc_scaling_info), packed
-//! RGB or the 4:2:0 video formats amdgpu_dm offers on DCN401 (NV12/NV21 as
+//! (`dm_helpers_is_hdr_on` is false), no 3D view, MPC slices without recout
+//! alignment or custom width (`Input::mpc_slice`), no visual confirm, no
+//! OPP recout adjustment, cositing none and zeroed scaling quality
+//! (amdgpu_dm_plane_fill_dc_scaling_info), packed RGB or the 4:2:0 video
+//! formats amdgpu_dm offers on DCN401 (NV12/NV21 as
 //! SPL_PIXEL_FORMAT_420BPP8, P010 as 420BPP10) with DCN401's forced
 //! `CHROMA_COSITING_NONE` (`force_cositing`) and no sharpening
 //! (`stream->sharpening_required` stays false, so `is_fullscreen` is too).
@@ -83,6 +84,10 @@ pub struct Input {
     /// This pipe's ODM slice in timing active (`resource_get_odm_slice_src_rect`);
     /// the whole timing without ODM. Its size is the pipe's h/v active.
     pub odm_slice: Rect,
+    /// This pipe's MPC slice of the plane and the plane's slice count
+    /// (`resource_get_mpc_slice_index`, `resource_get_mpc_slice_count`):
+    /// (0, 1) without MPC combine.
+    pub mpc_slice: (i32, i32),
     pub rotation: Rotation,
     pub horizontal_mirror: bool,
     /// `lb_params.alpha_en`: the plane blends per-pixel alpha.
@@ -264,6 +269,26 @@ struct Data {
     inits: [Fx; 4], // h, h_c, v, v_c
 }
 
+/// calculate_mpc_slice_in_timing_active with no 3D view, custom width or
+/// recout alignment: slice `index` of `count` equal parts of the plane
+/// clip, the division's remainder going one pixel each to the last slices
+/// (those past the extra pixel index minus one).
+pub fn mpc_slice(clip: Rect, (index, count): (i32, i32)) -> Rect {
+    let count = count.max(1);
+    let epimo = count - clip.width % count - 1;
+    let mut r = Rect::new(
+        clip.x + clip.width / count * index,
+        clip.y,
+        clip.width / count,
+        clip.height,
+    );
+    if index > epimo {
+        r.x += index - epimo - 1;
+        r.width += 1;
+    }
+    r
+}
+
 impl Input {
     /// calculate_plane_rec_in_timing_active with stream src = dst.
     fn in_timing_active(&self, r: Rect) -> Rect {
@@ -277,11 +302,11 @@ impl Input {
     fn stream_rect(&self) -> Rect {
         Rect::new(0, 0, self.stream_width, self.stream_height)
     }
-    /// spl_calculate_recout with one MPC slice.
+    /// spl_calculate_recout: the pipe's MPC slice of the plane clip within
+    /// its ODM slice.
     fn recout(&self) -> Rect {
         let plane_clip = intersect(self.in_timing_active(self.clip), self.stream_rect());
-        // calculate_mpc_slice_in_timing_active for a single slice.
-        let mpc = plane_clip;
+        let mpc = mpc_slice(plane_clip, self.mpc_slice);
         let odm = self.odm_slice;
         let overlap = intersect(mpc, odm);
         if overlap.height > 0 && overlap.width > 0 {
@@ -1007,10 +1032,15 @@ impl Scaler {
     /// recout and viewport. RGB only: a 4:2:0 plane always scales its
     /// chroma 2x, so even its full frame goes through [`calculate`].
     pub fn unity(x: i32, width: i32, height: i32) -> Self {
+        Self::unity_at(x, 0, width, height)
+    }
+    /// `unity` for an MPC slice: the slice's recout starts `recout_x`
+    /// pixels into its ODM slice.
+    pub fn unity_at(x: i32, recout_x: i32, width: i32, height: i32) -> Self {
         let r = Rect::new(x, 0, width, height);
         let one = 1 << 19 << 5;
         Self {
-            recout: Rect::new(0, 0, width, height),
+            recout: Rect::new(recout_x, 0, width, height),
             mpc_size: (width, height),
             dscl_mode: SCL_MODE_SCALING_444_BYPASS,
             ratios: [one; 4],

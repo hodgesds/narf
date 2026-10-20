@@ -400,7 +400,7 @@ pub(super) fn request(pipe: u8) -> Request {
         signal: Signal::HpoDisplayPort,
         ycbcr420: false,
         dsc: None,
-        odm: None,
+        odm: SplitPipes::NONE,
         timing: Timing {
             pixel_clock_khz: 148_500,
             h_active: 1920,
@@ -1483,7 +1483,7 @@ fn dcn401_odm_combines_two_opps_with_split_dsc() -> TestResult {
     let (pipe, odm) = (0u8, 3u8);
     let mut req = Request {
         signal: Signal::DisplayPort,
-        odm: Some(odm),
+        odm: SplitPipes::one(odm),
         ..request(pipe)
     };
     req.timing = Timing {
@@ -1524,7 +1524,7 @@ fn dcn401_odm_combines_two_opps_with_split_dsc() -> TestResult {
     bypass.request.pipe = pipe;
     if run(engine().prepare(
         Request {
-            odm: None,
+            odm: SplitPipes::NONE,
             dsc: None,
             ..req
         },
@@ -1586,7 +1586,7 @@ fn dcn401_odm_combines_two_opps_with_split_dsc() -> TestResult {
     }
     // One memory pair suffices to 4096 pixels.
     let mut narrow = request(pipe);
-    narrow.odm = Some(odm);
+    narrow.odm = SplitPipes::one(odm);
     narrow.timing.h_active = 3840;
     narrow.timing.h_total = 4000;
     let mut e = engine();
@@ -1625,14 +1625,14 @@ fn dcn401_odm_combines_two_opps_with_split_dsc() -> TestResult {
         (ycbcr, Error::Unsupported),
         (
             Request {
-                odm: Some(pipe),
+                odm: SplitPipes::one(pipe),
                 ..narrow
             },
             Error::Invalid,
         ),
         (
             Request {
-                odm: Some(4),
+                odm: SplitPipes::one(4),
                 ..narrow
             },
             Error::Invalid,
@@ -1648,4 +1648,211 @@ fn dcn401_odm_combines_two_opps_with_split_dsc() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_odm_combines_two_opps_with_split_dsc
+);
+
+/// ODM 3:1 and 4:1 (optc401_set_odm_combine): every OPP as a segment in
+/// order (OPTC_NUM_OF_INPUT_SEGMENT the count less one, unused segments
+/// 0xf), the segment width (and for 3:1 OPTC_SEGMENT_WIDTH_LAST, which an
+/// uneven 3:1 line without DSC makes the rest of the line), the
+/// first-then-second-preferred line memories and the divide-by-four
+/// horizontal timing (four pixels per transfer); each OPP blanks its own
+/// segment at its offset; each segment's DSC compresses its segment with
+/// its share of the slices (twelve on three pipes). Retirement stops every
+/// segment's DSC. A horizontal boundary not divisible by four, a line past
+/// the segments' memories, a repeated pipe and slices that do not split
+/// are refused.
+fn dcn401_odm_combines_three_and_four_opps() -> TestResult {
+    use crate::amdgpu_dsc::DscConfig;
+    let r = |e: &Engine<Fake>, at: u64| e.io.regs.get(&at).copied().unwrap_or(0);
+    let dsc = |e: &Engine<Fake>, k: u64, reg: u64| r(e, BASE + (0x3000 + k * 0x5c + reg) * 4);
+    let pipe = 0u8;
+    let timing = Timing {
+        pixel_clock_khz: 2_400_000,
+        h_active: 7680,
+        h_total: 7840,
+        h_front_porch: 48,
+        h_sync_width: 32,
+        v_active: 4320,
+        v_total: 4400,
+        v_front_porch: 3,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: false,
+    };
+    let cfg = |slices_h| DscConfig {
+        slices_h,
+        slices_v: 4,
+        bpp_x16: 192,
+        block_pred: true,
+        linebuf_depth: 11,
+        version_minor: 2,
+        ycbcr422_simple: false,
+        frl: None,
+    };
+    let odm_clock = |req: Request, display_khz| {
+        let mut c = clock(req);
+        c.request.pixel = dccg::PixelClock::DisplayPort {
+            pixel_hz: u64::from(req.timing.pixel_clock_khz) * 1000,
+        };
+        c.global.display_khz = display_khz;
+        c
+    };
+    for (odm, slices, source, width, memory, display_khz) in [
+        (&[3u8, 2][..], 12, 0xf230_0002, 2560, 0x53, 800_000),
+        (&[3, 2, 1][..], 16, 0x1230_0003, 1920, 0x55, 600_000),
+    ] {
+        let segments = odm.len() as u32 + 1;
+        let req = Request {
+            signal: Signal::DisplayPort,
+            odm: SplitPipes::new(odm).unwrap(),
+            dsc: Some(cfg(slices)),
+            timing,
+            ..request(pipe)
+        };
+        // Each segment's share of the pixel clock must fit DISPCLK.
+        if run(engine().prepare(req, odm_clock(req, display_khz - 200_000))) != Err(Error::Invalid)
+        {
+            return TestResult::Fail("segment share above DISPCLK");
+        }
+        let mut e = engine();
+        for k in core::iter::once(pipe).chain(odm.iter().copied()) {
+            e.io.regs.insert(BASE + (0x89 + 2 * u64::from(k)) * 4, 1); // DSC domains gated
+        }
+        if let Err(err) = run(e.prepare(req, odm_clock(req, display_khz))) {
+            panic!("ODM {segments}:1 prepare: {err:?}");
+        }
+        let l = e.layout;
+        if r(&e, l.odm(pipe, SOURCE)) != source
+            || r(&e, l.odm(pipe, WIDTH)) & 0x1fff != width
+            || (segments == 3 && r(&e, l.odm(pipe, WIDTH2)) & 0x1fff != width)
+            || (segments == 4 && r(&e, l.odm(pipe, WIDTH2)) != 0)
+            || r(&e, l.odm(pipe, MEMORY)) & 0xffff != memory
+            || r(&e, l.otg(pipe, H_TIMING)) & 0x103 != 3
+        {
+            return TestResult::Fail("ODM source, segment widths, memories and divide");
+        }
+        // Each segment's DSC: its width, four slices, from its own OPP.
+        for k in core::iter::once(pipe).chain(odm.iter().copied()) {
+            let k = u64::from(k);
+            if dsc(&e, k, 0x14) & 0xffff != width
+                || dsc(&e, k, 0x15) & 0xffff != width / 4
+                || dsc(&e, k, 0xa) >> 4 & 3 != 3
+                || dsc(&e, k, 0) & 1 != 1
+                || r(&e, BASE + (0x1a64 + k) * 4) & 0x71 != (1 | (k as u32) << 4)
+            {
+                return TestResult::Fail("segment DSC");
+            }
+        }
+        if r(&e, l.odm(pipe, FORMAT)) & 0x30 != 0x10 || r(&e, l.odm(pipe, WIDTH)) >> 16 != width / 4
+        {
+            return TestResult::Fail("OPTC DSC configuration");
+        }
+        e.dsc_running(&req, &cfg(slices)).unwrap();
+        // Every OPP blanks its own segment.
+        e.io.retiring = [false; 4];
+        let a = run(e.prepare_blank(blank_request(pipe), odm_clock(req, display_khz))).unwrap();
+        for (s, o) in core::iter::once(pipe)
+            .chain(odm.iter().copied())
+            .enumerate()
+        {
+            let at = |reg: u64| BASE + (reg + 0x5a * u64::from(o)) * 4;
+            if r(&e, at(0x1856)) != (width << 16 | 4320) || r(&e, at(0x185a)) != s as u32 * width {
+                return TestResult::Fail("segment OPP blank");
+            }
+        }
+        e.verify_blank(a, req.plan().unwrap(), false).unwrap();
+        e.io.retiring = [true; 4];
+        run(e.retire(pipe)).unwrap();
+        for k in core::iter::once(pipe).chain(odm.iter().copied()) {
+            let k = u64::from(k);
+            if r(&e, BASE + (0x1a64 + k) * 4) & 1 != 0 || dsc(&e, k, 0) & 1 != 0 {
+                return TestResult::Fail("segment DSC retirement");
+            }
+        }
+        if r(&e, l.odm(pipe, SOURCE)) & 0xffff_0003 != 0xffff_0000
+            || r(&e, l.odm(pipe, MEMORY)) != 0
+        {
+            return TestResult::Fail("ODM retirement");
+        }
+    }
+    // An uneven 3:1 line without DSC: the last segment takes the rest.
+    let uneven = Request {
+        signal: Signal::DisplayPort,
+        odm: SplitPipes::new(&[2, 3]).unwrap(),
+        timing: Timing {
+            pixel_clock_khz: 2_600_000,
+            h_active: 5120,
+            h_total: 5280,
+            ..timing
+        },
+        ..request(pipe)
+    };
+    let mut e = engine();
+    run(e.prepare(uneven, odm_clock(uneven, 900_000))).unwrap();
+    let l = e.layout;
+    if r(&e, l.odm(pipe, WIDTH)) & 0x1fff != 1706
+        || r(&e, l.odm(pipe, WIDTH2)) & 0x1fff != 1708
+        || r(&e, l.odm(pipe, SOURCE)) != 0xf320_0002
+    {
+        return TestResult::Fail("uneven 3:1 segments");
+    }
+    e.io.retiring = [false; 4];
+    run(e.prepare_blank(blank_request(pipe), odm_clock(uneven, 900_000))).unwrap();
+    for (o, x, w) in [(pipe, 0u32, 1706u32), (2, 1706, 1706), (3, 3412, 1708)] {
+        let at = |reg: u64| BASE + (reg + 0x5a * u64::from(o)) * 4;
+        if r(&e, at(0x1856)) != (w << 16 | 4320) || r(&e, at(0x185a)) != x {
+            return TestResult::Fail("uneven segment OPP blank");
+        }
+    }
+    // Refusals, with no writes.
+    let mut quarter = uneven;
+    quarter.timing.h_total = 5282; // not divisible by four
+    let mut wide = uneven;
+    (wide.timing.h_active, wide.timing.h_total) = (12_800, 13_000);
+    let twelve_on_four = Request {
+        odm: SplitPipes::new(&[1, 2, 3]).unwrap(),
+        dsc: Some(cfg(12)),
+        timing,
+        signal: Signal::DisplayPort,
+        ..request(pipe)
+    };
+    let eight_on_three = Request {
+        odm: SplitPipes::new(&[2, 3]).unwrap(),
+        dsc: Some(cfg(8)),
+        ..twelve_on_four
+    };
+    for (bad, want) in [
+        (quarter, Error::Unsupported),
+        (wide, Error::Unsupported),
+        (eight_on_three, Error::Unsupported),
+        (
+            Request {
+                odm: SplitPipes::new(&[2, 2]).unwrap(),
+                ..uneven
+            },
+            Error::Invalid,
+        ),
+        (
+            Request {
+                odm: SplitPipes::new(&[2, 0]).unwrap(),
+                ..uneven
+            },
+            Error::Invalid,
+        ),
+    ] {
+        let mut e = engine();
+        if run(e.prepare(bad, odm_clock(bad, 900_000))) != Err(want) || !e.io.writes.is_empty() {
+            return TestResult::Fail("refused ODM request");
+        }
+    }
+    // Twelve slices do split over four DSCs of three each.
+    let mut e = engine();
+    if run(e.prepare(twelve_on_four, odm_clock(twelve_on_four, 600_000))).is_err() {
+        return TestResult::Fail("twelve slices on four DSCs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_odm_combines_three_and_four_opps
 );

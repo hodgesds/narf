@@ -1,6 +1,7 @@
 //! Native DCN401 Display Stream Compression on a pipe's own DSC (DSC n on
-//! OPP n; with ODM 2:1 each segment's OPP feeds its own DSC, which
-//! compresses half the line with half the slices), as Linux's
+//! OPP n; with ODM 2:1, 3:1 or 4:1 each segment's OPP feeds its own DSC,
+//! which compresses its segment of the line with its share of the slices),
+//! as Linux's
 //! link_set_dsc_on_stream drives it for DP SST (DIO or HPO) and HDMI FRL:
 //! the DSC power domain (dcn32_dsc_pg_control), dsc_write_to_registers,
 //! dsc401_enable from the OPP, then optc3_set_dsc_config (OTG_V_SYNC_MODE
@@ -48,12 +49,13 @@ pub(super) fn dsc_timing(t: &Timing) -> DscTiming {
 }
 
 /// dsc401_validate_stream plus this owner's shape: one DSC per ODM segment
-/// (at most four slices each, the slices split evenly) on an 8-bit RGB DP
+/// (at most four slices each, the slices split evenly, so the segments are
+/// equal: DML takes three only with twelve) on an 8-bit RGB DP
 /// SST stream, 8b/10b (DIO) or 128b/132b (HPO), or HDMI FRL stream. These
 /// are the whole picture's registers: the PPS the sink receives and the
 /// OPTC's bytes per pixel and slice width.
 pub(super) fn dsc_registers(request: &Request, cfg: &DscConfig) -> Result<DscRegisters, Error> {
-    let segments = if request.odm.is_some() { 2 } else { 1 };
+    let segments = request.odm.count();
     let frl = request.signal == Signal::HdmiFrl;
     if !matches!(
         request.signal,
@@ -62,6 +64,7 @@ pub(super) fn dsc_registers(request: &Request, cfg: &DscConfig) -> Result<DscReg
         || request.ycbcr420
         || cfg.slices_h % segments != 0
         || cfg.slices_h > 4 * segments
+        || request.timing.h_active % segments != 0
         || request.timing.h_active > MAX_IMAGE_WIDTH * segments
     {
         return Err(Error::Unsupported);
@@ -71,26 +74,27 @@ pub(super) fn dsc_registers(request: &Request, cfg: &DscConfig) -> Result<DscReg
 
 /// One segment DSC's registers: Linux's dsc_cfg with pic_width and
 /// num_slices_h divided by the ODM segment count (the whole picture's
-/// without ODM).
+/// without ODM), as dcn32_update_dsc_on_stream sets every segment's DSC.
 fn segment_registers(request: &Request, cfg: &DscConfig) -> Result<DscRegisters, Error> {
     let full = dsc_registers(request, cfg)?;
     if request.odm.is_none() {
         return Ok(full);
     }
+    let n = request.odm.count();
     let t = request.timing;
-    let half = Timing {
-        pixel_clock_khz: t.pixel_clock_khz / 2,
-        h_active: t.h_active / 2,
-        h_total: t.h_total / 2,
+    let part = Timing {
+        pixel_clock_khz: t.pixel_clock_khz / n,
+        h_active: t.h_active / n,
+        h_total: t.h_total / n,
         ..t
     };
     let cfg = DscConfig {
-        slices_h: cfg.slices_h / 2,
+        slices_h: cfg.slices_h / n,
         ..*cfg
     };
-    let segment = amdgpu_dsc::prepare(&dsc_timing(&half), &cfg).ok_or(Error::Invalid)?;
-    // Both halves slice the line identically, so the OPTC sees one slice
-    // width and byte rate either way.
+    let segment = amdgpu_dsc::prepare(&dsc_timing(&part), &cfg).ok_or(Error::Invalid)?;
+    // Every segment slices the line identically, so the OPTC sees one
+    // slice width and byte rate either way.
     if segment.slice_width != full.slice_width || segment.bytes_per_pixel != full.bytes_per_pixel {
         return Err(Error::Invalid);
     }
