@@ -214,6 +214,8 @@ struct Hardware {
     media_encode_required: bool,
     media_jpeg_required: bool,
     media_jpeg_decode_required: bool,
+    /// Keep JPEG0 running for clients after its proofs (with VCN clients).
+    media_jpeg_clients: bool,
     vcn_owner: Option<crate::amdgpu_navi48_dispatch::Handle>,
 }
 impl Backend for Hardware {
@@ -678,6 +680,7 @@ impl ColdBoot {
                     media_encode_required: false,
                     media_jpeg_required: false,
                     media_jpeg_decode_required: false,
+                    media_jpeg_clients: false,
                     vcn_owner: None,
                     mes: None,
                     queues: None,
@@ -1163,6 +1166,7 @@ impl ColdBoot {
     pub(crate) fn publish_unmapped_vram(
         &mut self,
         clear: alloc::sync::Arc<dyn crate::amdgpu_gem::VramClear>,
+        transfer: Option<alloc::sync::Arc<dyn crate::amdgpu_gem::VramTransfer>>,
     ) -> Result<u64, Error> {
         let sdma_ready = self
             .sequence
@@ -1182,12 +1186,72 @@ impl ColdBoot {
             return Err(Error::Busy);
         }
         heap.unmapped = Some(crate::amdgpu_gem::UnmappedHeap {
-            transfer: None,
+            transfer,
             pool: pool.clone(),
             clear,
         });
         crate::amdgpu_gem::register_vram_heap(card, heap.clone());
         Ok(pool.size())
+    }
+    /// A 1 MiB CPU-mapped window of the driver's pool for migration copies,
+    /// once SDMA0 runs jobs (the RX 6000 `reserve_transfer_stage`).
+    pub(crate) fn reserve_transfer_stage(&self) -> Result<crate::amdgpu_vram::Reservation, Error> {
+        let hw = &self.sequence.backend;
+        if !hw
+            .sdma
+            .as_ref()
+            .is_some_and(|s| s.state() == sdma::State::InterruptVerified)
+        {
+            return Err(Error::Busy);
+        }
+        hw.pool.reserve(1 << 20).map_err(|_| Error::Allocation)
+    }
+    /// A bounded BAR access under the live device grant, followed by an HDP
+    /// flush (amdgpu_hdp_generic_flush) so CPU writes reach VRAM before any
+    /// engine reads them.
+    pub(crate) fn access_vram<T>(
+        &self,
+        f: impl FnOnce() -> Result<T, narf_filesystem::FsError>,
+    ) -> Result<T, narf_filesystem::FsError> {
+        use narf_capabilities::{CapError, CapOp};
+        use narf_filesystem::FsError;
+        struct Op<F>(F);
+        impl<F: FnOnce() -> T, T> CapOp<BusDeviceCap, Write> for Op<F> {
+            type Output = T;
+            fn execute(self, _: &Cap<BusDeviceCap, Write>) -> Result<T, CapError> {
+                Ok((self.0)())
+            }
+        }
+        let hw = &self.sequence.backend;
+        let regs = hw.gpu.regs;
+        let nbio = crate::amdgpu_psp_ring::bank(
+            &hw.gpu,
+            crate::amdgpu_discovery::HW_ID_NBIF,
+            &[(6, 3, 1)],
+            2,
+            0xc3,
+        )
+        .map_err(|_| FsError::NoDevice)?;
+        if regs.len < 0x7f004 {
+            return Err(FsError::NoDevice);
+        }
+        hw.authority
+            .invoke(Op(|| {
+                let result = f();
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                // SAFETY: the remapped HDP flush word and NBIO's posting read
+                // lie inside the bounded, owned register BAR.
+                let posted = unsafe {
+                    regs.write32(0x7f000, 0);
+                    regs.read32(nbio + 0xc3 * 4)
+                };
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                if posted == u32::MAX {
+                    return Err(FsError::NoDevice);
+                }
+                result
+            }))
+            .map_err(|_| FsError::NoDevice)?
     }
     pub(crate) fn power_info(&self) -> Option<(Option<smu::Limits>, smu::GfxLevel)> {
         let smu = self.sequence.backend.smu.as_ref()?;

@@ -12,6 +12,8 @@ use narf_lib::mutex::Mutex;
 mod fault_recovery;
 #[path = "amdgpu_navi48_platform_media.rs"]
 mod media_clients;
+#[path = "amdgpu_navi48_platform_transfer.rs"]
+mod transfer;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -352,6 +354,10 @@ fn register_submitter(
             fence,
             sdma_fence: boot.client_sdma_fence_reader(),
             media_fence: narf_lib::sync::IrqSafeSpinLock::new(boot.client_media_fence_reader()),
+            jpeg_fence: narf_lib::sync::IrqSafeSpinLock::new(boot.client_jpeg_fence_reader()),
+            jpeg_slots: narf_lib::sync::IrqSafeSpinLock::new(
+                [None; crate::amdgpu_jpeg_navi48::SLOTS],
+            ),
             contexts: narf_lib::sync::IrqSafeSpinLock::new([(0, 0); RINGS]),
             vmids: narf_lib::sync::IrqSafeSpinLock::new(crate::amdgpu_vmid::VmidManager::new(
                 CLIENT_VMIDS.0,
@@ -364,6 +370,7 @@ fn register_submitter(
             watch: narf_lib::sync::IrqSafeSpinLock::new(watches),
         });
         *SUBMITTER.lock() = Some(submitter.clone());
+        crate::amdgpu_info::publish_navi48_video(boot.proven_video());
         crate::amdgpu_cs::register_submitter(card, submitter.clone());
         narf_scheduler::spawn(watchdog(submitter));
     }
@@ -428,6 +435,7 @@ pub async unsafe fn recover() -> Result<boot::Report, boot::Error> {
     crate::amdgpu_navi48_power::stop();
     *CLEARER.lock() = None;
     crate::amdgpu_info::withdraw_navi48_clock();
+    crate::amdgpu_info::publish_navi48_video(0);
     for pipe in 0..4 {
         present_slot(pipe).native.store(false, Ordering::Release);
     }
@@ -546,6 +554,12 @@ struct Submitter {
     /// as busy until both SDMA proofs pass, as the GC12 queues' are.
     sdma_fence: Option<crate::amdgpu_sdma_navi48::FenceReader>,
     media_fence: narf_lib::sync::IrqSafeSpinLock<Option<crate::amdgpu_vcn_navi48::FenceReader>>,
+    /// JPEG0's decode ring fence, once its proofs reopened it for clients.
+    jpeg_fence: narf_lib::sync::IrqSafeSpinLock<Option<crate::amdgpu_jpeg_navi48::FenceReader>>,
+    /// The ticket of the job whose validated IB copies occupy each kernel
+    /// slot. A slot is reused only once that ticket completed; replay after
+    /// a reset reuses the retained copy. Touched only under OWNER.
+    jpeg_slots: narf_lib::sync::IrqSafeSpinLock<[Option<u64>; crate::amdgpu_jpeg_navi48::SLOTS]>,
     /// Touched only under OWNER, beside the submission it grants.
     vmids: narf_lib::sync::IrqSafeSpinLock<crate::amdgpu_vmid::VmidManager>,
     /// MMHUB VMIDs are independent of the graphics/compute/SDMA namespace.
@@ -569,14 +583,16 @@ enum RingError {
 }
 /// Client VMIDs on each independent hub: 1 up to first_kfd_vmid (8) exclusive.
 const CLIENT_VMIDS: (u8, u8) = (1, 7);
-/// GC12 tickets occupy indices 0/1, SDMA0 index 2, unified VCN0 index 3.
+/// GC12 tickets occupy indices 0/1, SDMA0 index 2, unified VCN0 index 3,
+/// JPEG0's decode ring index 4.
 const PIPES: [crate::amdgpu_gfx12_queue::Pipe; 2] = [
     crate::amdgpu_gfx12_queue::Pipe::Graphics,
     crate::amdgpu_gfx12_queue::Pipe::Compute,
 ];
 const SDMA_RING: u32 = 2;
 const MEDIA_RING: u32 = 3;
-const RINGS: usize = 4;
+const JPEG_RING: u32 = 4;
+const RINGS: usize = 5;
 /// Whether `ticket` is complete, given each ring's completed sequence
 /// (32-bit sequences wrap).
 fn job_done(completed: [u32; RINGS], ticket: u64) -> bool {
@@ -618,6 +634,12 @@ impl Submitter {
             match *self.media_fence.lock() {
                 Some(media) if !frozen[MEDIA_RING as usize] => {
                     completed[MEDIA_RING as usize] = media.completed().ok()?;
+                }
+                _ => {}
+            }
+            match *self.jpeg_fence.lock() {
+                Some(jpeg) if !frozen[JPEG_RING as usize] => {
+                    completed[JPEG_RING as usize] = jpeg.completed().ok()?;
                 }
                 _ => {}
             }
@@ -692,21 +714,37 @@ impl Submitter {
                     self.recover_faults().await;
                     return;
                 }
+                // VCN's restart closes the shared media range, so it also
+                // retires and re-proves a live JPEG ring and replays its jobs.
+                let affected: &[usize] = if ring == MEDIA_RING as usize {
+                    &[MEDIA_RING as usize, JPEG_RING as usize]
+                } else {
+                    core::slice::from_ref(&ring)
+                };
                 {
                     // Drain old synchronous samples before the first reset
                     // write. New readers see the frozen ledger under this
                     // same lock and never read a powered-down media block.
                     let _generation = READ_GENERATION.lock();
-                    self.watch.lock()[ring].freeze();
+                    for &r in affected {
+                        self.watch.lock()[r].freeze();
+                    }
                 }
                 let reset = match (owner.as_mut(), PIPES.get(ring)) {
                     (Some(boot), _) if ring == MEDIA_RING as usize => {
                         // VCN restart clears codec context. Keep every old
                         // media allocation until retirement and both proofs.
                         self.watch.lock()[ring].stop();
-                        // SAFETY: OWNER excludes all writers, this media
-                        // ledger stays frozen and its contexts are cancelled.
+                        // SAFETY: OWNER excludes all writers, both media
+                        // ledgers stay frozen and VCN contexts are cancelled.
                         unsafe { boot.recover_client_media().await }.map_err(RingError::Media)
+                    }
+                    (Some(boot), _) if ring == JPEG_RING as usize => {
+                        // JPEG has no per-context firmware state: innocent
+                        // jobs replay from their retained kernel IB copies.
+                        // SAFETY: OWNER excludes all writers; the frozen
+                        // ledger retains every job's slot and mappings.
+                        unsafe { boot.recover_client_jpeg().await }.map_err(RingError::Media)
                     }
                     // SAFETY: OWNER serializes the queues, SDMA0 and MES;
                     // every job on the ring holds its memory until its
@@ -724,19 +762,22 @@ impl Submitter {
                 };
                 match (reset, owner.as_mut()) {
                     (Ok(test), Some(boot)) => {
-                        let jobs = self.watch.lock()[ring].replay();
                         let mut result = Ok(test);
-                        for (ticket, job) in jobs {
-                            // SAFETY: OWNER stays held across reset and replay;
-                            // the frozen ledger retains all buffers and VMIDs.
-                            let submitted =
-                                unsafe { media_clients::publish_client(boot, ring as u32, job) }
-                                    .map_err(RingError::Client);
-                            match submitted {
-                                Ok(seq) => self.watch.lock()[ring].replayed(ticket, seq),
-                                Err(e) => {
-                                    result = Err(e);
-                                    break;
+                        'replay: for &r in affected {
+                            let jobs = self.watch.lock()[r].replay();
+                            for (ticket, job) in jobs {
+                                // SAFETY: OWNER stays held across reset and
+                                // replay; the frozen ledger retains all
+                                // buffers, VMIDs and staged JPEG copies.
+                                let submitted =
+                                    unsafe { media_clients::publish_client(boot, r as u32, job) }
+                                        .map_err(RingError::Client);
+                                match submitted {
+                                    Ok(seq) => self.watch.lock()[r].replayed(ticket, seq),
+                                    Err(e) => {
+                                        result = Err(e);
+                                        break 'replay;
+                                    }
                                 }
                             }
                         }
@@ -745,9 +786,11 @@ impl Submitter {
                             // their placeholder zero must not become a fence
                             // sample after reopening at physical sequence wrap.
                             let _generation = READ_GENERATION.lock();
-                            // Next normal submission must establish its context.
-                            self.contexts.lock()[ring] = (0, 0);
-                            self.watch.lock()[ring].recovered(narf_time::monotonic_ns());
+                            for &r in affected {
+                                // Next normal submission must establish its context.
+                                self.contexts.lock()[r] = (0, 0);
+                                self.watch.lock()[r].recovered(narf_time::monotonic_ns());
+                            }
                         }
                         result
                     }
@@ -764,7 +807,7 @@ impl Submitter {
                     );
                 }
                 Err(e) => {
-                    if ring == MEDIA_RING as usize {
+                    if ring == MEDIA_RING as usize || ring == JPEG_RING as usize {
                         crate::amdgpu_navi48_interrupts::quarantine().await;
                         for watch in self.watch.lock().iter_mut() {
                             watch.stop();
@@ -810,6 +853,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             ring,
             self.sdma_fence.is_some(),
             self.media_fence.lock().is_some(),
+            self.jpeg_fence.lock().is_some(),
         )
     }
     fn max_ibs(&self, _ring: u32) -> u32 {
@@ -844,8 +888,8 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             let ring = self
                 .ring_for(first.ip_type, first.ip_instance, first.ring)
                 .ok_or(FsError::Unsupported)?;
-            if ring == MEDIA_RING && submission.user_fence.is_some() {
-                return Err(FsError::InvalidData); // VCN5 no_user_fence
+            if matches!(ring, MEDIA_RING | JPEG_RING) && submission.user_fence.is_some() {
+                return Err(FsError::InvalidData); // VCN5/JPEG5 no_user_fence
             }
             if submission.ibs.len() > crate::amdgpu_gfx12_queue::MAX_JOB_IBS
                 || submission
@@ -876,6 +920,22 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                 .ok_or(FsError::InvalidData)?;
             // amdgpu_ib_schedule asks the first IB.
             job.mem_sync = first.flags & crate::amdgpu_uapi::AMDGPU_IB_FLAG_EMIT_MEM_SYNC != 0;
+            // amdgpu_cs_patch_ibs + amdgpu_jpeg_dec_parse_cs: JPEG IBs run as
+            // validated kernel copies, read now through the client's mapping.
+            let copies = if ring == JPEG_RING {
+                let mut copies = alloc::vec::Vec::new();
+                for &(va, dwords) in &ibs {
+                    let words = crate::amdgpu_vcn_navi22_cs::read_words(vm, va, dwords)?;
+                    crate::amdgpu_jpeg_navi48::validate_ib(&words)
+                        .map_err(|_| FsError::InvalidData)?;
+                    copies.push(words);
+                }
+                copies
+            } else {
+                alloc::vec::Vec::new()
+            };
+            let deadline =
+                narf_time::monotonic_ns().saturating_add(crate::amdgpu_ring_watch::JOB_TIMEOUT_NS);
             let entity = (request.owner, submission.ctx_id);
             let result = loop {
                 let mut owner = OWNER.lock().await;
@@ -900,6 +960,22 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                 }
                 let completed = self.progress().ok_or(FsError::NoDevice)?;
                 let done = |t| job_done(completed, t);
+                // A JPEG slot is free once the job whose copy it holds is done.
+                let slot = (ring == JPEG_RING).then(|| {
+                    self.jpeg_slots
+                        .lock()
+                        .iter()
+                        .position(|t| t.is_none_or(|t| done(t)))
+                });
+                if slot == Some(None) {
+                    drop(owner);
+                    if narf_time::monotonic_ns() >= deadline {
+                        break Err(FsError::Busy);
+                    }
+                    narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant())
+                        .await;
+                    continue;
+                }
                 let grant = self.vmids_for(ring).lock().grab(request, &done);
                 let Some(grant) = grant else {
                     // amdgpu_vmid_grab_idle: wait for a VMID to go idle.
@@ -912,9 +988,35 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                 job.flush = grant.needs_flush;
                 job.map_pasid = grant.map_pasid;
                 job.ctx_switch = self.contexts.lock()[ring as usize] != entity;
+                if let Some(Some(slot)) = slot {
+                    // SAFETY: OWNER; the slot's previous job completed and
+                    // the slot is recorded for this job once it publishes.
+                    match unsafe { boot.stage_client_jpeg(slot, &copies) } {
+                        Ok(kernel) => {
+                            for (n, ib) in kernel.into_iter().enumerate() {
+                                job.ibs[n] = ib;
+                            }
+                        }
+                        Err(crate::amdgpu_jpeg_navi48::Error::Invalid) => {
+                            break Err(FsError::InvalidData)
+                        }
+                        Err(crate::amdgpu_jpeg_navi48::Error::Busy) => break Err(FsError::Busy),
+                        Err(_) => break Err(FsError::NoDevice),
+                    }
+                }
                 // SAFETY: OWNER, the granted hub VMID and generic CS's
                 // retained resource list cover synchronous publication.
                 let result = unsafe { media_clients::publish_client(boot, ring, job) };
+                if ring == JPEG_RING && matches!(result, Err(FsError::Busy)) {
+                    // Ring space: wait for the decoder without the owner.
+                    drop(owner);
+                    if narf_time::monotonic_ns() >= deadline {
+                        break Err(FsError::Busy);
+                    }
+                    narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant())
+                        .await;
+                    continue;
+                }
                 break result.map(|physical| {
                     let seq = self.watch.lock()[ring as usize].submitted(
                         physical,
@@ -923,6 +1025,9 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                         narf_time::monotonic_ns(),
                     );
                     let ticket = u64::from(ring) << 32 | u64::from(seq);
+                    if let Some(Some(slot)) = slot {
+                        self.jpeg_slots.lock()[slot] = Some(ticket);
+                    }
                     self.vmids_for(ring).lock().commit(request, grant, ticket);
                     self.contexts.lock()[ring as usize] = entity;
                     seq
@@ -1053,7 +1158,11 @@ fn publish_clearer(boot: &mut boot::ColdBoot) {
         });
         let clearer = VramClearer::new(progress);
         *CLEARER.lock() = Some(clearer.clone());
-        let _ = match boot.publish_unmapped_vram(Arc::new(clearer)) {
+        let mover = boot
+            .reserve_transfer_stage()
+            .ok()
+            .map(|stage| transfer::mover(clearer.clone(), stage));
+        let _ = match boot.publish_unmapped_vram(Arc::new(clearer), mover) {
             Ok(bytes) => writeln!(
                 narf_console::Writer,
                 "amdgpu: navi48 client VRAM past the BAR {} MiB",
@@ -1128,11 +1237,69 @@ fn requeue_clears(completed: u32) {
         narf_scheduler::spawn(clearer.drain());
     }
 }
-#[derive(Debug, Clone)]
+/// One FIFO request: a fill, or a copy of a migration chunk.
+#[derive(Clone)]
 struct Clear {
-    address: u64,
-    bytes: u64,
+    work: Work,
     fence: Arc<ClearFence>,
+    /// What the request reaches, retained until it leaves the ring.
+    _held: Option<Arc<dyn Send + Sync>>,
+}
+impl core::fmt::Debug for Clear {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Clear")
+            .field("work", &self.work)
+            .field("fence", &self.fence)
+            .finish_non_exhaustive()
+    }
+}
+#[derive(Clone)]
+enum Work {
+    Fill {
+        address: u64,
+        bytes: u64,
+    },
+    /// `upload` stages `bytes` of the source at its offset into the CPU
+    /// window (at `virt`) under OWNER right before the job is queued, so a
+    /// requeued copy re-stages after an SDMA0 reset.
+    Copy {
+        src: u64,
+        dst: u64,
+        bytes: u64,
+        upload: Option<(Arc<crate::amdgpu_gem::GemPlacement>, u64, usize)>,
+    },
+}
+impl core::fmt::Debug for Work {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Work::Fill { address, bytes } => write!(f, "Fill({address:#x}, {bytes:#x})"),
+            Work::Copy {
+                src,
+                dst,
+                bytes,
+                upload,
+            } => write!(
+                f,
+                "Copy({src:#x} -> {dst:#x}, {bytes:#x}, upload={})",
+                upload.is_some()
+            ),
+        }
+    }
+}
+impl Work {
+    fn op(&self) -> crate::amdgpu_sdma_navi48::KernelOp {
+        use crate::amdgpu_sdma_navi48::KernelOp;
+        match *self {
+            Work::Fill { address, bytes } => KernelOp::Fill {
+                dst: address,
+                bytes,
+                value: 0,
+            },
+            Work::Copy {
+                src, dst, bytes, ..
+            } => KernelOp::Copy { src, dst, bytes },
+        }
+    }
 }
 /// Fill packets one clear job carries at most: 5 dwords each, well inside
 /// a 256-dword SDMA job slot with its fence.
@@ -1148,6 +1315,14 @@ fn clear_batch(bytes: impl Iterator<Item = u64>) -> usize {
         })
         .count()
         .max(1)
+}
+/// How many front requests one job takes: a copy travels alone (its stage
+/// is written just before the job), fills batch while they fit.
+fn work_batch<'a>(queued: impl Iterator<Item = &'a Clear>) -> usize {
+    clear_batch(queued.map_while(|c| match c.work {
+        Work::Fill { bytes, .. } => Some(bytes),
+        Work::Copy { .. } => None,
+    }))
 }
 /// Whether one job can fill `bytes` at `address`: dword aligned, whole
 /// dwords, and no more packets than a job takes.
@@ -1269,21 +1444,35 @@ impl VramClearer {
                     state.draining = false;
                     return;
                 }
-                let n = clear_batch(state.queued.iter().map(|c| c.bytes));
+                let n = work_batch(state.queued.iter());
                 state.queued.iter().take(n).cloned().collect()
             };
-            let ops: Vec<KernelOp> = batch
-                .iter()
-                .map(|c| KernelOp::Fill {
-                    dst: c.address,
-                    bytes: c.bytes,
-                    value: 0,
-                })
-                .collect();
+            let ops: Vec<KernelOp> = batch.iter().map(|c| c.work.op()).collect();
+            let staged = match (owner.as_ref(), &batch[0].work) {
+                (
+                    Some(boot),
+                    Work::Copy {
+                        bytes,
+                        upload: Some((source, offset, virt)),
+                        ..
+                    },
+                ) => {
+                    boot.access_vram(|| {
+                        // SAFETY: the transfer's stage lock gives this copy
+                        // the CPU window alone, the source is retained by the
+                        // request and OWNER excludes reset; HDP is flushed
+                        // after the write, before SDMA0 can read it.
+                        unsafe { source.write_staging(*offset, *virt as *mut u8, *bytes as usize) }
+                    })
+                }
+                _ => Ok(()),
+            };
             let result = match owner.as_mut() {
+                Some(_) if staged.is_err() => Err(crate::amdgpu_sdma_navi48::Error::Invalid),
                 // SAFETY: OWNER serializes SDMA0's ring; each range is a
                 // client reservation the GEM layer holds no job can reach
-                // before this job's fence (its KERNEL fence).
+                // before this job's fence (its KERNEL fence), or the
+                // transfer's private stage.
                 Some(boot) if (self.0.progress)().is_some() => unsafe {
                     boot.submit_client_sdma_kernel(&ops)
                 },
@@ -1309,7 +1498,8 @@ impl VramClearer {
                         state.retire(completed);
                     }
                 }
-                // `clear` validated every request, so the device is gone.
+                // `clear`/`enqueue` validated every request, so the device is
+                // gone (or the upload's source could not be staged).
                 Err(_) => {
                     for c in &batch {
                         c.fence.gone.store(true, Ordering::Release);
@@ -1340,9 +1530,9 @@ impl crate::amdgpu_gem::VramClear for VramClearer {
                 .try_reserve(1)
                 .map_err(|_| narf_filesystem::FsError::NoSpace)?;
             state.queued.push_back(Clear {
-                address,
-                bytes,
+                work: Work::Fill { address, bytes },
                 fence: fence.clone(),
+                _held: None,
             });
             !core::mem::replace(&mut state.draining, true)
         };
@@ -4126,9 +4316,22 @@ mod tests {
             let fence = Arc::new(ClearFence::new(progress.clone()));
             fence.seq.store(seq, Ordering::Release);
             Clear {
-                address,
-                bytes: 4096,
+                work: if address == 0x3000 {
+                    // Copies requeue exactly like fills.
+                    Work::Copy {
+                        src: address,
+                        dst: 0x9000,
+                        bytes: 4096,
+                        upload: None,
+                    }
+                } else {
+                    Work::Fill {
+                        address,
+                        bytes: 4096,
+                    }
+                },
                 fence,
+                _held: None,
             }
         };
         let mut state = ClearState::default();
@@ -4146,7 +4349,12 @@ mod tests {
         let queued: Vec<(u64, u64)> = state
             .queued
             .iter()
-            .map(|c| (c.address, c.fence.seq.load(Ordering::Acquire)))
+            .map(|c| {
+                let address = match c.work {
+                    Work::Fill { address, .. } | Work::Copy { src: address, .. } => address,
+                };
+                (address, c.fence.seq.load(Ordering::Acquire))
+            })
             .collect();
         if !state.inflight.is_empty()
             || queued != [(0x2000, u64::MAX), (0x3000, u64::MAX), (0x4000, u64::MAX)]
@@ -4202,6 +4410,38 @@ mod tests {
             || clear_batch(core::iter::empty()) != 1
         {
             return TestResult::Fail("clear batching");
+        }
+        let progress: SdmaProgress = Arc::new(|| Some(0));
+        let request = |work| Clear {
+            work,
+            fence: Arc::new(ClearFence::new(progress.clone())),
+            _held: None,
+        };
+        let fill = || {
+            request(Work::Fill {
+                address: 0x10,
+                bytes: 4096,
+            })
+        };
+        let copy = || {
+            request(Work::Copy {
+                src: 0x10,
+                dst: 0x9000,
+                bytes: 4096,
+                upload: None,
+            })
+        };
+        if work_batch([fill(), fill(), copy(), fill()].iter()) != 2
+            || work_batch([copy(), copy()].iter()) != 1
+            || work_batch([copy(), fill()].iter()) != 1
+            || copy().work.op()
+                != (crate::amdgpu_sdma_navi48::KernelOp::Copy {
+                    src: 0x10,
+                    dst: 0x9000,
+                    bytes: 4096,
+                })
+        {
+            return TestResult::Fail("copy batching");
         }
         if !clear_fits(0x10, 32 * GIB)
             || clear_fits(0x10, 32 * GIB + 4)

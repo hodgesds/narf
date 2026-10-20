@@ -414,6 +414,7 @@ pub use amdgpu_rdna2_vcn_cs as amdgpu_vcn_navi22_cs;
 pub mod amdgpu_rdna2_video_caps;
 pub mod amdgpu_vcn_navi48;
 pub mod amdgpu_video;
+pub mod amdgpu_video_caps_navi48;
 /// Compatibility alias for the original Navi22 API.
 pub use amdgpu_rdna2_video_caps as amdgpu_video_caps_navi22;
 pub mod amdgpu_vm;

@@ -422,6 +422,23 @@ pub(crate) fn publish_navi48_clock(clock: crate::amdgpu_smuio14::ClockReader) {
 pub(crate) fn withdraw_navi48_clock() {
     *NAVI48_CLOCK.lock() = None;
 }
+/// Navi48 codec directions proven on the live media rings
+/// (`amdgpu_video_caps_navi48::{AVC_DECODE, AVC_ENCODE, JPEG_DECODE}`).
+static NAVI48_VIDEO: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+pub(crate) fn publish_navi48_video(proven: u8) {
+    NAVI48_VIDEO.store(proven, core::sync::atomic::Ordering::Release);
+}
+/// `AMDGPU_INFO_VIDEO_CAPS` (`soc24_query_video_codecs`) for Navi48.
+fn video_caps(snap: &Snapshot, kind: u32, proven: u8) -> Result<Vec<u8>, FsError> {
+    if snap.did != u32::from(crate::amdgpu::NAVI48) {
+        return Err(FsError::InvalidData);
+    }
+    let vcn = amdgpu_discovery::find_ip(&snap.ip_blocks, amdgpu_discovery::HW_ID_VCN, 0)
+        .ok_or(FsError::InvalidData)?;
+    crate::amdgpu_video_caps_navi48::caps(kind, (vcn.major, vcn.minor, vcn.revision), proven)
+        .map(|caps| as_bytes(&caps))
+        .ok_or(FsError::InvalidData)
+}
 /// DEV_INFO's `[min_engine, max_engine, min_memory, max_memory]` clocks in
 /// kHz, published by the Navi48 SMU owner whenever its DPM state changes.
 static NAVI48_CLOCKS: narf_lib::sync::IrqSafeSpinLock<Option<[u32; 4]>> =
@@ -613,14 +630,13 @@ fn hw_ip_info(snap: &Snapshot, ip_type: u32) -> Result<Vec<u8>, FsError> {
     if let Some(block) = amdgpu_discovery::find_ip(&snap.ip_blocks, hw_id, 0) {
         info.hw_ip_version_major = u32::from(block.major);
         info.hw_ip_version_minor = u32::from(block.minor);
-        // amdgpu_hw_ip_info: unified VCN encode and SDMA use 256/4;
-        // graphics/compute use 32/32.
-        (info.ib_start_alignment, info.ib_size_alignment) =
-            if matches!(ip_type, uapi::AMDGPU_HW_IP_DMA | uapi::AMDGPU_HW_IP_VCN_ENC) {
-                (256, 4)
-            } else {
-                (32, 32)
-            };
+        // amdgpu_hw_ip_info: unified VCN encode and SDMA use 256/4, JPEG
+        // 256/64; graphics/compute use 32/32.
+        (info.ib_start_alignment, info.ib_size_alignment) = match ip_type {
+            uapi::AMDGPU_HW_IP_DMA | uapi::AMDGPU_HW_IP_VCN_ENC => (256, 4),
+            uapi::AMDGPU_HW_IP_VCN_JPEG => (256, 64),
+            _ => (32, 32),
+        };
         // `available_rings` is the open's card's (`dispatch_for`).
         info.ip_discovery_version =
             u32::from(block.major) << 16 | u32::from(block.minor) << 8 | u32::from(block.revision);
@@ -642,7 +658,10 @@ fn hw_id_for_ip_type(ip_type: u32) -> Option<u16> {
     match ip_type {
         uapi::AMDGPU_HW_IP_GFX | uapi::AMDGPU_HW_IP_COMPUTE => Some(amdgpu_discovery::HW_ID_GC),
         uapi::AMDGPU_HW_IP_DMA => Some(amdgpu_discovery::HW_ID_SDMA0),
-        uapi::AMDGPU_HW_IP_VCN_ENC => Some(amdgpu_discovery::HW_ID_VCN),
+        // JPEG_HWIP is enumerated under the VCN discovery entry.
+        uapi::AMDGPU_HW_IP_VCN_ENC | uapi::AMDGPU_HW_IP_VCN_JPEG => {
+            Some(amdgpu_discovery::HW_ID_VCN)
+        }
         _ => None,
     }
 }
@@ -699,6 +718,12 @@ pub fn query_against(snap: &Snapshot, query: u32, payload: [u32; 4]) -> Result<V
         uapi::AMDGPU_INFO_TIMESTAMP => timestamp(snap, *NAVI48_CLOCK.lock()),
         // `query_fw { fw_type, ip_instance, index }`.
         uapi::AMDGPU_INFO_FW_VERSION => firmware_version(snap, *NAVI48_FIRMWARE.lock(), payload[0]),
+        // `query.video_cap.type` is word 0.
+        uapi::AMDGPU_INFO_VIDEO_CAPS => video_caps(
+            snap,
+            payload[0],
+            NAVI48_VIDEO.load(core::sync::atomic::Ordering::Acquire),
+        ),
         // Everything else: `amdgpu_info_ioctl`'s default arm.
         _ => Err(FsError::InvalidData),
     }
@@ -848,6 +873,26 @@ mod topology_tests {
             hw_ip_count(&snap, uapi::AMDGPU_HW_IP_VCN_ENC).unwrap(),
             1u32.to_le_bytes()
         );
+        let info = hw_ip_info(&snap, uapi::AMDGPU_HW_IP_VCN_JPEG).unwrap();
+        let word = |at| u32::from_le_bytes(info[at..at + 4].try_into().unwrap());
+        assert_eq!(
+            (word(0), word(4), word(16), word(20), word(24)),
+            (5, 0, 256, 64, 0)
+        );
+        assert_eq!(
+            hw_ip_count(&snap, uapi::AMDGPU_HW_IP_VCN_JPEG).unwrap(),
+            1u32.to_le_bytes()
+        );
+        // VIDEO_CAPS answers from the proven set, not from the IP alone.
+        let caps = |proven| {
+            let bytes = video_caps(&snap, uapi::AMDGPU_INFO_VIDEO_CAPS_DECODE, proven).unwrap();
+            let codec =
+                |n: usize| u32::from_le_bytes(bytes[n * 24..n * 24 + 4].try_into().unwrap());
+            (0..8).filter(|&n| codec(n) != 0).collect::<Vec<_>>()
+        };
+        assert!(caps(0).is_empty());
+        assert_eq!(caps(5), [3, 5]);
+        assert!(video_caps(&snap, 7, 7).is_err());
         TestResult::Pass
     }
     kernel_test_in!(

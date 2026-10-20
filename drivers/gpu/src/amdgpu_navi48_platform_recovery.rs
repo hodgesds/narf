@@ -22,10 +22,15 @@ impl Submitter {
                 .as_mut()
                 .ok_or(RingError::Interrupts(crate::amdgpu_ih7::Error::Busy))?;
             let media = boot.client_media_owner();
+            // JPEG0 lives only under VCN0's shared range; order follows rings.
+            let owners: alloc::vec::Vec<_> = media
+                .into_iter()
+                .chain(media.and(boot.client_jpeg_owner()))
+                .collect();
             // SAFETY: OWNER excludes every queue/clear/reset/PM user; all
             // ledgers are frozen and remain so on error or cancellation.
             let mut receipt =
-                unsafe { irq::begin_recovery(media).await }.map_err(RingError::Interrupts)?;
+                unsafe { irq::begin_recovery(&owners).await }.map_err(RingError::Interrupts)?;
             for (ring, pipe) in PIPES.into_iter().enumerate() {
                 let vmid = self.watch.lock()[ring].reset_vmid();
                 // SAFETY: all pending allocations/VMIDs stay pinned by the
@@ -49,15 +54,25 @@ impl Submitter {
                 self.watch.lock()[MEDIA_RING as usize].stop();
                 // SAFETY: all ledgers frozen, retained resources and OWNER
                 // cover media drain, VCPU/LMI retirement and fresh transport.
+                // A live JPEG ring is retired first, keeping its staged jobs.
                 unsafe { boot.retire_client_media().await }.map_err(RingError::Media)?;
                 // SAFETY: old media work retired and new transport drained.
                 unsafe { receipt.retired(MEDIA_RING as usize) };
+                if owners.len() > 1 {
+                    // SAFETY: retire_client_media proved JPEG's JMI reset,
+                    // clean DMA and power-down before VCN's own stop.
+                    unsafe { receipt.retired(JPEG_RING as usize) };
+                }
             }
             // SAFETY: all owned retirements proved; OWNER still excludes all
             // submissions and every ledger remains frozen until replay ends.
             let (scope, renewed_media) =
                 unsafe { irq::finish_recovery(receipt).await }.map_err(RingError::Interrupts)?;
-            if let Some(handle) = renewed_media {
+            if let Some(&handle) = renewed_media.get(1) {
+                // SAFETY: the receipt renewed this exact retired JPEG owner.
+                unsafe { boot.jpeg_rearmed(handle) };
+            }
+            if let Some(&handle) = renewed_media.first() {
                 // SAFETY: the receipt renewed this exact retired media owner.
                 unsafe { boot.media_rearmed(handle) };
                 // SAFETY: all rings remain frozen; re-arm restored reporting
@@ -67,7 +82,7 @@ impl Submitter {
             {
                 let mut watches = self.watch.lock();
                 for (ring, watch) in watches.iter_mut().enumerate() {
-                    let hub = if ring == MEDIA_RING as usize {
+                    let hub = if matches!(ring as u32, MEDIA_RING | JPEG_RING) {
                         crate::amdgpu_navi48_faults::Hub::Mm
                     } else {
                         crate::amdgpu_navi48_faults::Hub::Gfx
@@ -82,7 +97,8 @@ impl Submitter {
                 for (ticket, job) in jobs {
                     // SAFETY: OWNER and the frozen ledger retain all
                     // mappings, BOs and the correct hub's VMID. Restarted
-                    // media contexts were cancelled and have no replay jobs.
+                    // media contexts were cancelled and have no replay jobs;
+                    // JPEG jobs replay from their retained kernel IB copies.
                     let seq = unsafe { media_clients::publish_client(boot, ring as u32, job) }
                         .map_err(RingError::Client)?;
                     self.watch.lock()[ring].replayed(ticket, seq);

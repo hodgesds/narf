@@ -983,6 +983,11 @@ plus the active luma/chroma checksum. Input, command and output guards remain
 checked; failure/cancellation retains all backing and requested picture proofs
 repeat after recovery. Models test synthetic pixels, not JPEG decoding;
 physical picture execution and native JPEG clients remain open.
+Native JPEG clients now follow: `amdgpu.navi48_media` keeps JPEG0 running as
+`AMDGPU_HW_IP_VCN_JPEG` ring 4 with Linux-style kernel-copied VMID0 IBs (plus
+a stricter privileged-register filter), client decoder VMIDs on MMHUB engine 1,
+retained per-job copy slots, JPEG-only ring reset with innocent replay, and a
+fifth recovery owner retired before VCN restarts. Model-tested only.
 Fault recovery
 requires all four retirements and renewed owners, followed by a new media
 interrupt and session IB proof before ledger commit. Media restart cancels old codec

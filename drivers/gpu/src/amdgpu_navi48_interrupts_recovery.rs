@@ -3,6 +3,11 @@ use super::*;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
+/// Media registrations follow the three kernel queues, in ring order.
+const MEDIA_KEYS: [dispatch::Key; 2] = [
+    dispatch::Key::Vcn { instance: 0 },
+    dispatch::Key::Jpeg { instance: 0 },
+];
 /// Dropping this receipt leaves the monitor Recovering and retirement blocked.
 pub(crate) struct Recovery {
     generation: u64,
@@ -38,17 +43,19 @@ fn drain_before_rearm(service: &mut Service) -> Result<(), ih::Error> {
 /// # Safety
 /// OWNER excludes submissions, reset and PM, and all client ledgers are
 /// frozen before this await. They remain frozen after any error/cancellation.
+/// `media` is the live VCN0 registration, then JPEG0's (only with VCN0).
 pub(crate) async unsafe fn begin_recovery(
-    media: Option<dispatch::Handle>,
+    media: &[dispatch::Handle],
 ) -> Result<Recovery, ih::Error> {
     let mut slot = SERVICE.lock().await;
     let service = slot.as_mut().ok_or(ih::Error::Busy)?;
     drain_before_rearm(service)?;
     let handles = service.kernel.map(|h| h.ok_or(ih::Error::Protocol));
-    let mut handles = alloc::vec![handles[0]?, handles[1]?, handles[2]?];
-    if let Some(handle) = media {
-        handles.push(handle);
+    if media.len() > MEDIA_KEYS.len() {
+        return Err(ih::Error::Protocol);
     }
+    let mut handles = alloc::vec![handles[0]?, handles[1]?, handles[2]?];
+    handles.extend_from_slice(media);
     {
         let table = dispatch::TABLE.lock();
         table
@@ -56,7 +63,7 @@ pub(crate) async unsafe fn begin_recovery(
             .map_err(|_| ih::Error::Protocol)?;
         let keys = KERNEL
             .into_iter()
-            .chain(media.map(|_| dispatch::Key::Vcn { instance: 0 }));
+            .chain(MEDIA_KEYS.into_iter().take(media.len()));
         for (&h, key) in handles.iter().zip(keys) {
             if table
                 .endpoint(h)
@@ -86,9 +93,9 @@ pub(crate) async unsafe fn begin_recovery(
 /// has assigned every healthy job a new physical fence.
 pub(crate) async unsafe fn finish_recovery(
     receipt: Recovery,
-) -> Result<(faults::RecoveryScope, Option<dispatch::Handle>), ih::Error> {
+) -> Result<(faults::RecoveryScope, Vec<dispatch::Handle>), ih::Error> {
     let mut slot = SERVICE.lock().await;
-    if !(3..=4).contains(&receipt.handles.len())
+    if !(3..=3 + MEDIA_KEYS.len()).contains(&receipt.handles.len())
         || receipt.retired != (1 << receipt.handles.len()) - 1
         || receipt.generation != GENERATION.load(Ordering::Acquire)
     {
@@ -115,7 +122,7 @@ pub(crate) async unsafe fn finish_recovery(
             .reset_owners(receipt.handles)
             .map_err(|_| ih::Error::Protocol)?;
         service.kernel = core::array::from_fn(|i| Some(handles[i]));
-        Ok((scope, handles.get(3).copied()))
+        Ok((scope, handles[3..].to_vec()))
     })();
     if result.is_ok() {
         BLOCKED.store(false, Ordering::Release);
@@ -128,6 +135,7 @@ pub(crate) async unsafe fn finish_recovery(
 pub(crate) async fn quarantine() {
     FAILED.store(true, Ordering::Release);
     BLOCKED.store(true, Ordering::Release);
+    crate::amdgpu_info::publish_navi48_video(0);
     if let Some(service) = SERVICE.lock().await.as_mut() {
         service.stop(dispatch::Terminal::Interrupts(ih::Error::Protocol));
     }

@@ -360,7 +360,11 @@ pub fn forget_owner(owner: u64) {
 
 /// `count` dwords at client VA `va`, read by the CPU through the buffer
 /// the mapping holds; the range must lie inside that one mapping.
-fn read_words(vm: &crate::amdgpu_vm::VmState, va: u64, count: u32) -> Result<Vec<u32>, FsError> {
+pub(crate) fn read_words(
+    vm: &crate::amdgpu_vm::VmState,
+    va: u64,
+    count: u32,
+) -> Result<Vec<u32>, FsError> {
     let mapping = vm.lookup(va).ok_or(FsError::InvalidData)?;
     let object = vm.mapped_object(va).ok_or(FsError::InvalidData)?;
     let end = va

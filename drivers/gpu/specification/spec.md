@@ -5155,6 +5155,16 @@ paths; only the tables differ.
   the buffer's unsignalled KERNEL fences to its space
   (`VmState::depend_on`), and `AMDGPU_CS` waits for the space's
   `VmState::kernel_fences()` before queueing.
+  On Navi48 the heap's `VramTransfer` (`amdgpu_navi48_platform` transfer
+  mover) migrates these buffers: SDMA0 `COPY_LINEAR` kernel jobs move each
+  chunk through a private 1 MiB CPU-mapped window of the driver's pool,
+  queued in the same FIFO as clears so no copy overtakes an earlier clear.
+  A copy travels alone in its job; an upload stages its chunk under the
+  platform owner just before queueing, followed by an HDP flush, so a
+  copy requeued by an SDMA0 reset re-stages. Each chunk's fence is added
+  to the buffer's KERNEL reservation and retains its source/destination
+  until it leaves the ring; a refused, timed-out (5 s) or post-reset chunk
+  fails the move without releasing either placement.
 - PRT (`GEM_VA` with `AMDGPU_VM_PAGE_PRT`): MAP/REPLACE record a range
   with no buffer (the handle is not looked up, as amdgpu_gem_va_ioctl maps
   it through `prt_va`) whose entries carry PRT without VALID; REPLACE with
@@ -5640,8 +5650,45 @@ any client ledger reopens. A live unretired JPEG owner makes a four-owner
 recovery receipt incomplete, requiring whole-device recovery instead.
 
 `amdgpu.jpeg_proof` proves JRBC/IB/interrupt/retirement transport without a
-picture. It advertises no JPEG client ring or codec capability. Native client
-submission and physical acceptance remain required for complete JPEG bring-up.
+picture. It advertises no JPEG client ring or codec capability by itself.
+
+`amdgpu.navi48_media` also runs that JPEG cycle (plus a requested picture
+proof) and keeps the drained ring registered and powered for clients:
+`unsafe Jpeg::open_clients()` moves `Verified`/`DecodeVerified` to `Clients`
+and publishes a separate kernel arena of `SLOTS` (4) x `SLOT_BYTES` (64 KiB)
+IB-copy slots. As Linux's parse_cs path (`amdgpu_cs_patch_ibs`,
+`amdgpu_jpeg_dec_parse_cs`), each client IB is read through the client's
+mapping, checked by `validate_ib` and copied by `unsafe Jpeg::stage(slot,
+copies)` to 256-byte-aligned VMID0 addresses inside one slot. `validate_ib`
+is stricter than Linux: TYPE0/TYPE3 writes to GPCOM (0x404d-0x404f), the
+JRBC ring/IB controls (0x4080-0x408d, 0x4094), the LMI JRBC/decoder VMID and
+fence-address block (0x40a0-0x40af) and the IB BAR/size (0x40b6-0x40bf) are
+refused, because a VMID0 copy could otherwise escape the client's address
+space; Mesa's JPEG paths use none of them. `unsafe Jpeg::submit(job)` accepts
+only staged slot addresses and emits jpeg_v4_0_3's frame in
+`amdgpu_ib_schedule` order: MMHUB4.1 flush on invalidation engine 1 (Linux's
+ring-order allocation after VCN0's engine 0) with semaphore and PTB wait,
+IH_VMID_0_LUT_MM, insert_start, HDP flush, each IB at JRBC VMID0 with
+decoder VMID `v | v << 4 | v << 8`, GPCOM fence/trap, insert_end. Register
+packets use NORMALIZE_JPEG_REG_OFFSET (no RRMT). The 1024-dword ring wraps by
+its buffer mask with one-gap full detection; `Busy` changes no sequence or
+pointer. Client sequences wrap through zero. `Jpeg::fence_reader()` exists
+only in `Clients` and checks live authority/device status/HDP visibility.
+
+`unsafe Jpeg::reset_stop().await` retires a possibly hung ring
+(jpeg_v5_0_0_stop): JMI soft reset, fresh clean-DMA bits, ring hold, doorbell
+and power gating; only success marks every arena stopped. The platform
+publishes logical ring 4 as `AMDGPU_HW_IP_VCN_JPEG` instance 0/ring 0 on the
+shared MMHUB VMID manager; user fences are refused; up to eight IBs fit one
+256-dword frame. A slot records its job's ticket and is reused only after that
+ticket completes; replay after a reset reuses the retained copy. A JPEG
+timeout resets JPEG alone (retire, PowerDownJpeg/Up, start, transport and
+requested picture proofs, reopen, replay innocent jobs). A VCN timeout or
+coordinated fault recovery retires JPEG first, since VCN's stop closes the
+shared range, and re-proves it after VCN; the recovery receipt then includes
+the JPEG registration as its fifth owner. INFO_HW_IP reports JPEG under the
+VCN discovery entry with Linux's 256/64 alignment. Codec/profile capability
+and physical acceptance remain open.
 
 `amdgpu.jpeg_decode_proof` implies that transport cycle and additionally calls
 `unsafe Jpeg::prove_decode().await` on a newly drained kernel VMID0 queue.
