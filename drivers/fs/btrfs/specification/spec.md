@@ -102,6 +102,18 @@ shared-root snapshot ioctl is refused, and full qgroups
 are left inconsistent with a rescan pending instead of being recounted. The
 last view of a writable core commits what it holds.
 
+Testing: besides the in-kernel smokes, `cargo xtask btrfs-host-rw` runs the
+driver in a host process (`verification/btrfs-host`) against
+`mkfs.btrfs --rootdir` fixtures shaped like a CachyOS root and
+`testdata/fixture-snapshots.img.sparse`, mounted exactly as a
+`narf.disks=root-rw` boot mounts them. A seeded random workload is checked
+against a model through NARF, `btrfs check` (with data csums) and
+`btrfs restore` of every subvolume and snapshot; the recorded
+write/flush/FUA stream is replayed at bounded cut points (`--exhaustive`:
+every flush) with volatile writes dropped or torn, and each crashed image
+must pass `btrfs check` and remount with exactly a committed state. The
+`regress-*` scenarios are minimal reproductions of bugs it found.
+
 ## 5. Architecture notes
 
 The registration interface is shared by x86_64 and aarch64. Volume construction

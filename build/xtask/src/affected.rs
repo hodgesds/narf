@@ -367,7 +367,7 @@ pub fn plan(
     // driver/module crates still need bare-metal linting when they change.
     p.host_clippy_crates = lint
         .iter()
-        .filter(|c| matches!(c.as_str(), "xtask" | "cargo-narf"))
+        .filter(|c| matches!(c.as_str(), "xtask" | "cargo-narf" | "narf-btrfs-host"))
         .cloned()
         .collect();
     p.clippy_crates = lint.difference(&p.host_clippy_crates).cloned().collect();

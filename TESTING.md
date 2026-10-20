@@ -11,6 +11,7 @@ QEMU boot to a full real-hardware install on a Renoir-class laptop.
 | Boot under QEMU, graphical | `cargo xtask run --arch=x86_64 --display=gtk` |
 | Run the full kernel-test suite | `cargo xtask test --arch=x86_64` |
 | Run the real-init boot-smoke | `cargo xtask boot-smoke --arch=x86_64` |
+| btrfs root-rw harness on the host (no QEMU, ~1–2 min) | `cargo xtask btrfs-host-rw [--seeds N --ops N --cuts N --exhaustive]` |
 | Build a bootable ISO | `cargo xtask image --arch=x86_64` |
 | ISO + boot under OVMF UEFI | `cargo xtask iso-boot --arch=x86_64` |
 | Installed x86_64 UEFI package | `packaging/test-uefi-boot.sh` |

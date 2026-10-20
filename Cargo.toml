@@ -35,6 +35,7 @@ members = [
     "bus",
     "event_bus",
     "build/xtask",
+    "verification/btrfs-host",
     "build/cargo-narf",
     "abi",
     "io",

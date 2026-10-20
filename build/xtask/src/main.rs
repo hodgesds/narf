@@ -30,6 +30,7 @@ mod bench_stats;
 /// The `bpf-bench` subcommand: boot the suite, harvest the samples, apply §8.
 mod bpf_bench;
 mod btrfs_crash;
+mod btrfs_host;
 mod btrfs_interop;
 /// `cachyos-gate`: the pre-hardware validation matrix for the installed
 /// CachyOS root (docs/BOOTING_ON_CACHYOS.md, "Pre-hardware validation gate").
@@ -157,6 +158,12 @@ enum Cmd {
     /// Kill QEMU right after a btrfs `fsync` returns, reboot, and require the
     /// data back plus a clean host `btrfs check` (commit durability).
     BtrfsCrashSmoke(btrfs_crash::Args),
+    /// Host-side (no QEMU) root-rw btrfs harness: CachyOS-shaped fixtures
+    /// and the Linux snapshot fixture mounted through NARF's btrfs driver in
+    /// a host process, a seeded random workload checked against a model,
+    /// `btrfs check`/`restore`, NARF remount, and crash-consistency replay of
+    /// the recorded write/flush stream (`verification/btrfs-host`).
+    BtrfsHostRw(btrfs_host::Args),
     /// Pre-hardware validation gate for booting the installed CachyOS root:
     /// boots the real `grub-image` bundle (OVMF -> GRUB -> Limine -> NARF) on
     /// a q35 machine with a decoy NVMe and a CachyOS-layout btrfs root NVMe,
@@ -13121,6 +13128,7 @@ fn main() -> Result<()> {
         Cmd::CachyosRootSmoke(args) => cachyos_root::run(&args),
         Cmd::BtrfsRootrwInterop(args) => btrfs_interop::run_cmd(&args),
         Cmd::BtrfsCrashSmoke(args) => btrfs_crash::run(&args),
+        Cmd::BtrfsHostRw(args) => btrfs_host::run(&args),
         Cmd::CachyosGate(args) => cachyos_gate::run(&args),
         Cmd::Http3Smoke(args) => http3_smoke::run(&args),
         Cmd::RunInteractive(args) => run_interactive_cmd(&args),
