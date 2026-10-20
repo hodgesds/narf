@@ -338,6 +338,8 @@ impl Service {
     /// Stop draining for good: mask sources and CPU delivery where authority
     /// permits, then release every waiter with the terminal cause.
     fn stop(&mut self, cause: dispatch::Terminal) {
+        // Nothing attributes IVs by PASID any more.
+        crate::amdgpu_vmid::track_ih_drains(false);
         FAILED.store(true, core::sync::atomic::Ordering::Release);
         BLOCKED.store(true, core::sync::atomic::Ordering::Release);
         self.faults.stop();
@@ -429,6 +431,8 @@ pub(crate) unsafe fn install(
     }
     drop(slot);
     let generation = GENERATION.load(core::sync::atomic::Ordering::Acquire);
+    // Released PASIDs now wait for a drain of IVs that may still name them.
+    crate::amdgpu_vmid::track_ih_drains(true);
     narf_scheduler::spawn(worker(generation));
     Ok(())
 }
@@ -459,6 +463,9 @@ async fn worker(generation: u64) {
             match service.drain() {
                 Ok(pending) => {
                     service.wakes.record(cause, service.drained);
+                    if !pending {
+                        crate::amdgpu_vmid::ih_drained();
+                    }
                     pending
                 }
                 Err(_) => return,

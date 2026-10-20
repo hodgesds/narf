@@ -12527,6 +12527,57 @@ kernel_test_in!(
     smoke_amdgpu_vm_pasids_outlive_their_jobs
 );
 
+/// With an IH service attributing IVs by PASID, a released PASID waits for
+/// an empty-ring pass that began after release before reuse, and a late
+/// fault naming it is charged to no one meanwhile.
+fn smoke_amdgpu_pasid_reuse_waits_for_ih_drain() -> TestResult {
+    use crate::amdgpu_vmid::{
+        fault, ih_drained, record_fault, track_ih_drains, FaultInfo, PasidHandle,
+    };
+    track_ih_drains(true);
+    let a = PasidHandle::alloc().unwrap();
+    let held = a.get();
+    drop(a);
+    let late = FaultInfo {
+        addr: 0x1000,
+        status: 1,
+        vmhub: 0,
+    };
+    record_fault(held, late);
+    let mut result = TestResult::Pass;
+    if fault(held) != FaultInfo::default() {
+        result = TestResult::Fail("late IV charged to a released PASID");
+    }
+    // One drain might have read its write pointer before release.
+    ih_drained();
+    let early = PasidHandle::alloc().unwrap();
+    if early.get() == held {
+        result = TestResult::Fail("reused before a full drain after release");
+    }
+    drop(early);
+    ih_drained();
+    ih_drained();
+    let after = PasidHandle::alloc().unwrap();
+    if after.get() != held {
+        result = TestResult::Fail("drained PASID not reusable");
+    }
+    // Stopping the service frees anything still held at once.
+    let b = PasidHandle::alloc().unwrap();
+    let pending = b.get();
+    drop(b);
+    track_ih_drains(false);
+    let freed = PasidHandle::alloc().unwrap();
+    if freed.get() != pending {
+        result = TestResult::Fail("stopped tracking keeps PASIDs held");
+    }
+    drop((after, freed));
+    result
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_vm",
+    smoke_amdgpu_pasid_reuse_waits_for_ih_drain
+);
+
 /// AMDGPU_INFO_GPUVM_FAULT answers from the open's VM fault cache
 /// (`amdgpu_vm_update_fault_cache`): the last nonzero-status fault charged
 /// to its PASID, zeros before any; a zero status does not replace a useful
