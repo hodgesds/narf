@@ -276,7 +276,9 @@ pub(super) fn bound(
         && surface.request.height == t.v_active
         && surface.request.odm == timing.odm
         && plan.pipes == 1 + u8::from(timing.odm.is_some())
-        && u64::from(surface.pitch_bytes) == u64::from(plan.mode.pitch) * 4
+        && plan.mode.bytes_per_pixel == surface.request.format.bytes_per_pixel()
+        && u64::from(surface.pitch_bytes)
+            == u64::from(plan.mode.pitch) * u64::from(plan.mode.bytes_per_pixel)
         && a.det_bytes == plan.det_bytes
         && clock.request.pipe == a.pipe
         && clock.global.display_khz >= plan.clocks.dispclk_khz

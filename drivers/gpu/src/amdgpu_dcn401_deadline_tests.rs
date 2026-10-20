@@ -197,6 +197,29 @@ fn dcn401_deadlines_bind_only_the_admitted_owners() -> TestResult {
     if !bound(&plan, timing, requestor, faster, 50_000) {
         return TestResult::Fail("faster clocks refused");
     }
+    // A 2-byte plane binds the plan admitted at its depth and pitch only.
+    let Ok(rgb565) = dml::admit(
+        &soc(),
+        &dml::Mode {
+            bytes_per_pixel: 2,
+            ..plan.mode
+        },
+    ) else {
+        return TestResult::Fail("RGB565 1080p60 refused");
+    };
+    let mut half = requestor;
+    half.surface.request.format = SurfaceFormat::Rgb565;
+    half.surface.pitch_bytes = 3840;
+    let synced = Request {
+        sync: rgb565.sync,
+        ..timing
+    };
+    if !bound(&rgb565, synced, half, clock, 50_000)
+        || bound(&plan, timing, half, clock, 50_000)
+        || bound(&rgb565, synced, requestor, clock, 50_000)
+    {
+        return TestResult::Fail("plane depth binding");
+    }
     let mut tampered = plan;
     tampered.watermarks.urgent += 1;
     let mut other_mode = plan;

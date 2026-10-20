@@ -722,6 +722,7 @@ fn select_mst_with_budget(
             }),
             // VRR is DP SST only here (no MST stream features).
             vrr: None,
+            format: otg::SurfaceFormat::Xrgb8888,
         };
         out.push(s);
     }

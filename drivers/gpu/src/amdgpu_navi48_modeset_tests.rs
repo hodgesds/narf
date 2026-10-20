@@ -260,6 +260,55 @@ kernel_test_in!(
     navi48_modeset_requires_link_payload_and_aligns_pitch
 );
 
+/// Each plane format's admission shape: its bytes per pixel and a pitch of
+/// whole 256-byte requests (128, 64 or 32 pixels), the selection's plane
+/// format, and the per-pipe format a lighting takes (XRGB8888 by default).
+fn navi48_modeset_admits_the_plane_format_of_each_pipe() -> TestResult {
+    use otg::SurfaceFormat as F;
+    let paths = [path(inventory::Connector::DisplayPort, 0)];
+    let ports = [port(paths[0], dpcd(0x14, 4), edid_1080p())];
+    let Ok(mut s) = select(&paths, &ports, 8, None) else {
+        return TestResult::Fail("sink rejected");
+    };
+    if s.format != F::Xrgb8888 || selection_mode(&s) != mode(s.timing) {
+        return TestResult::Fail("default plane");
+    }
+    let mut odd = s.timing;
+    odd.h_active = 1366;
+    for (format, bytes, pitch, odd_pitch) in [
+        (F::Rgb565, 2, 1920, 1408),
+        (F::Xbgr2101010, 4, 1920, 1408),
+        (F::Abgr16161616f, 8, 1920, 1376),
+    ] {
+        s.format = format;
+        let m = selection_mode(&s);
+        if m.bytes_per_pixel != bytes
+            || m.pitch != pitch
+            || plane_mode(odd, format).pitch != odd_pitch
+            || (dml::Mode {
+                bytes_per_pixel: 4,
+                pitch: 1920,
+                ..m
+            }) != mode(s.timing)
+        {
+            return TestResult::Fail("plane admission shape");
+        }
+    }
+    let before = plane_format(2);
+    set_plane_format(2, F::Argb16161616f);
+    set_plane_format(7, F::Rgb565);
+    let (two, three) = (plane_format(2), plane_format(3));
+    set_plane_format(2, before);
+    if two != F::Argb16161616f || three != F::Xrgb8888 || plane_format(9) != F::Xrgb8888 {
+        return TestResult::Fail("per-pipe plane format");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_admits_the_plane_format_of_each_pipe
+);
+
 fn navi48_modeset_link_fallback_ladder_skips_short_links() -> TestResult {
     use inventory::Connector::DisplayPort as Dp;
     let paths = [path(Dp, 0)];

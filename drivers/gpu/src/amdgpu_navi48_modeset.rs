@@ -91,6 +91,9 @@ pub struct Selection {
     /// The sink's FreeSync range (amdgpu_dm_update_freesync_caps): DP SST
     /// sinks only; None when the sink is not VRR-capable.
     pub vrr: Option<crate::amdgpu_freesync::VrrRange>,
+    /// The primary plane's surface format: what DRM's framebuffer on the
+    /// display's CRTC holds (`plane_format`), XRGB8888 by default.
+    pub format: otg::SurfaceFormat,
 }
 
 /// A selection's stream on an MST link: its end device and VC payload.
@@ -383,6 +386,29 @@ pub fn set_broadcast_rgb(value: u8) {
 }
 pub fn broadcast_rgb() -> u8 {
     BROADCAST_RGB.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// The surface format each pipe's next lighting scans out, as an index
+/// into `otg::SurfaceFormat::ALL` (0: XRGB8888).
+static PLANE_FORMATS: [core::sync::atomic::AtomicU8; 4] =
+    [const { core::sync::atomic::AtomicU8::new(0) }; 4];
+/// Scan out `format` on pipe `pipe` from its next lighting on (DRM's
+/// framebuffer format on that CRTC). Other pipes are ignored.
+pub fn set_plane_format(pipe: u8, format: otg::SurfaceFormat) {
+    if let (Some(slot), Some(index)) = (
+        PLANE_FORMATS.get(usize::from(pipe)),
+        otg::SurfaceFormat::ALL.iter().position(|&f| f == format),
+    ) {
+        slot.store(index as u8, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+/// The surface format pipe `pipe` lights with.
+pub fn plane_format(pipe: u8) -> otg::SurfaceFormat {
+    PLANE_FORMATS
+        .get(usize::from(pipe))
+        .map(|slot| slot.load(core::sync::atomic::Ordering::Relaxed))
+        .and_then(|index| otg::SurfaceFormat::ALL.get(usize::from(index)).copied())
+        .unwrap_or(otg::SurfaceFormat::Xrgb8888)
 }
 /// amdgpu_dm_get_output_color_space for RGB: COLOR_SPACE_SRGB_LIMITED only
 /// when "Broadcast RGB" is Limited; Automatic outputs full range, as Linux
@@ -850,7 +876,8 @@ fn dp_offered_mode(timing: Timing, s: &Selection, max_dispclk_khz: u32) -> Optio
     };
     let fell_back = selected != Some((s.lanes, s.rate));
     if dp_link(&timing, s.caps).is_some() {
-        return (!fell_back || dp_fits(&timing, s.caps, s.lanes, s.rate)).then(|| mode(timing));
+        return (!fell_back || dp_fits(&timing, s.caps, s.lanes, s.rate))
+            .then(|| plane_mode(timing, s.format));
     }
     let cfg = dp_dsc(&timing, s.caps, max_dispclk_khz)?;
     if fell_back && !dsc_fits(&timing, cfg, s.caps, s.lanes, s.rate) {
@@ -861,7 +888,7 @@ fn dp_offered_mode(timing: Timing, s: &Selection, max_dispclk_khz: u32) -> Optio
             slices: cfg.slices_h,
             bpp_x16: cfg.bpp_x16,
         }),
-        ..mode(timing)
+        ..plane_mode(timing, s.format)
     })
 }
 
@@ -1429,6 +1456,7 @@ pub fn select_all(
                 .dpcd
                 .as_ref()
                 .and_then(|d| crate::amdgpu_freesync::dp_sst_caps(&sink.edid, d)),
+            format: otg::SurfaceFormat::Xrgb8888,
         });
     }
     let mut frl_free = true;
@@ -1484,6 +1512,7 @@ pub fn select_all(
             mst: None,
             // HDMI FreeSync needs the AMD VSDB, which is not parsed.
             vrr: None,
+            format: otg::SurfaceFormat::Xrgb8888,
         });
     }
     out.truncate(MAX_DISPLAYS);
@@ -1641,10 +1670,16 @@ fn admitted_modes(
 
 /// Linear XRGB8888 pitch in pixels: 64-pixel (256-byte) aligned.
 pub fn mode(timing: Timing) -> dml::Mode {
+    plane_mode(timing, otg::SurfaceFormat::Xrgb8888)
+}
+
+/// A `format` plane on `timing`: its bytes per pixel and its pitch in
+/// pixels, the line rounded up to whole 256-byte requests.
+pub fn plane_mode(timing: Timing, format: otg::SurfaceFormat) -> dml::Mode {
     dml::Mode {
         timing,
-        pitch: (timing.h_active + 63) & !63,
-        bytes_per_pixel: 4,
+        pitch: format.pitch_bytes(timing.h_active) / format.bytes_per_pixel(),
+        bytes_per_pixel: format.bytes_per_pixel(),
         ycbcr420: false,
         dsc: None,
     }
@@ -1677,7 +1712,7 @@ pub fn selection_mode(s: &Selection) -> dml::Mode {
             slices: c.slices_h,
             bpp_x16: c.bpp_x16,
         }),
-        ..mode(s.timing)
+        ..plane_mode(s.timing, s.format)
     }
 }
 
@@ -1917,6 +1952,7 @@ impl ColdBoot {
             .to_vec();
         let mut selection = select(&paths, &ports, max_bpc(), want)?;
         selection.limited = limited_range(broadcast_rgb()) && !selection.ycbcr420;
+        selection.format = plane_format(pipe);
         self.select_display(pipe)?;
         let soc = self.prepare_configuration(&[selection]).await?;
         refine_dsc(&soc, core::slice::from_mut(&mut selection))?;
@@ -2040,8 +2076,9 @@ impl ColdBoot {
         let (mut selections, pipes): (Vec<Selection>, Vec<u8>) = routed.into_iter().unzip();
         // "Broadcast RGB" is RGB's: YCbCr is limited range by itself.
         let limited = limited_range(broadcast_rgb());
-        for s in &mut selections {
+        for (s, &pipe) in selections.iter_mut().zip(&pipes) {
             s.limited = limited && !s.ycbcr420;
+            s.format = plane_format(pipe);
         }
         self.select_display(pipes.first().copied().unwrap_or(0))?;
         let soc = self.prepare_configuration(&selections).await?;
@@ -2223,14 +2260,18 @@ impl ColdBoot {
                 pipe,
                 width,
                 height,
-                format: otg::SurfaceFormat::Xrgb8888,
+                format: selection.format,
                 odm,
             })
             .await?;
-            let mut row = alloc::vec![0u32; width as usize];
-            for y in 0..height {
-                fill(pipe, y, &mut row);
-                self.upload_display_surface(pipe, 0, y, &row)?;
+            // `fill` draws XRGB8888 rows; any other format keeps the cleared
+            // surface, which is black in each of them.
+            if selection.format == otg::SurfaceFormat::Xrgb8888 {
+                let mut row = alloc::vec![0u32; width as usize];
+                for y in 0..height {
+                    fill(pipe, y, &mut row);
+                    self.upload_display_surface(pipe, 0, y, &row)?;
+                }
             }
             self.prepare_display_memory(pipe).await?;
             self.prepare_display_timing(otg::Request {
@@ -2286,14 +2327,14 @@ impl ColdBoot {
                 hdmi_output(caps, &t, max_bpc(), frl, sink_audio_info(edid)).map(
                     |(_, ycbcr420, _)| dml::Mode {
                         ycbcr420,
-                        ..mode(t)
+                        ..plane_mode(t, s.format)
                     },
                 )
             } else if let Some(m) = s.mst {
                 // Within the stream's own payload.
                 super::mst::mst_slots(&t, s.lanes, s.rate, s.caps.fec)
                     .is_some_and(|(pbn, slots)| pbn <= m.pbn && slots <= m.slots)
-                    .then(|| mode(t))
+                    .then(|| plane_mode(t, s.format))
             } else {
                 dp_offered_mode(t, &s, soc.dispclk_max_khz)
             }
