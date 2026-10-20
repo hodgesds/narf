@@ -701,6 +701,9 @@ fn dcn401_otg_clock_waits_and_cancellation_quarantine() -> TestResult {
         assert_eq!(run(e.retire(0)), Err(Error::Busy));
         let mut e = engine();
         e.io.stall = stall;
+        // Count polls: a preempted vCPU can otherwise pass the wall-clock
+        // deadline before the first poll returns.
+        e.io.poll_limit = Some(8);
         let mut future = core::pin::pin!(e.prepare(request(0), clock(request(0))));
         assert!(future
             .as_mut()
@@ -710,6 +713,7 @@ fn dcn401_otg_clock_waits_and_cancellation_quarantine() -> TestResult {
     }
     let mut e = engine();
     e.io.stall = 1;
+    e.io.poll_limit = Some(8);
     {
         let mut f = core::pin::pin!(e.prepare(request(0), clock(request(0))));
         assert!(f
