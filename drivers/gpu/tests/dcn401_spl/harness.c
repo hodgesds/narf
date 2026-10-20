@@ -20,12 +20,17 @@
  *                         SCL_COEF_RAM_TAP_DATA words (after TAP_SELECT)
  *   t                     the SCL_MODE coefficient RAM swap (SCL_COEF_RAM_SELECT
  *                         = !CURRENT, SCL_CHROMA_COEF_MODE 0)
+ *   T                     the same swap with SCL_CHROMA_COEF_MODE 1 (YCbCr)
+ * With the argument "video" each line starts with an extra 4:2:0 format
+ * column: 8 for NV12/NV21 (SPL_PIXEL_FORMAT_420BPP8) or 10 for P010
+ * (420BPP10); see video_inputs.txt.
  * A first-time programming: the DPP has no filter cached.
  * dpp401_dscl_find_lb_memory_config and dscl401_calc_lb_num_partitions run
  * on DC's scaler data as translate_SPL_out_params_to_pipe_ctx leaves it.
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "dc_spl.h"
 #include "asic_reg/dcn/dcn_4_1_0_offset.h"
 #include "asic_reg/dcn/dcn_4_1_0_sh_mask.h"
@@ -262,13 +267,16 @@ static void easf(const struct dscl_prog_data *p)
 	  HM(r##_START##sfx, r##_Y_START##sfx),                                                \
 	  HV(r##_START##sfx, r##_X_START##sfx, (R).x) | HV(r##_START##sfx, r##_Y_START##sfx, (R).y))
 
-int main(void)
+int main(int argc, char **argv)
 {
-	long a[15];
+	/* "video": each line starts with a 4:2:0 format, 8 (NV12/NV21,
+	 * SPL_PIXEL_FORMAT_420BPP8) or 10 (P010, 420BPP10). */
+	const bool video = argc > 1 && !strcmp(argv[1], "video");
+	long b[16], *a = b + video;
 
 	while (1) {
-		for (int i = 0; i < 15; i++)
-			if (scanf("%ld", &a[i]) != 1)
+		for (int i = 0; i < 15 + video; i++)
+			if (scanf("%ld", &b[i]) != 1)
 				return 0;
 		static struct spl_in in;
 		static struct spl_out out;
@@ -278,7 +286,8 @@ int main(void)
 		memset(&p, 0, sizeof(p));
 		narf_spl_warnings = 0;
 		in.callbacks.spl_calc_lb_num_partitions = dscl401_spl_calc_lb_num_partitions;
-		in.basic_in.format = SPL_PIXEL_FORMAT_ARGB8888;
+		in.basic_in.format = !video ? SPL_PIXEL_FORMAT_ARGB8888 :
+			b[0] == 10 ? SPL_PIXEL_FORMAT_420BPP10 : SPL_PIXEL_FORMAT_420BPP8;
 		in.basic_out.view_format = SPL_VIEW_3D_NONE;
 		in.basic_in.src_rect = (struct spl_rect){ a[0], a[1], a[2], a[3] };
 		in.basic_in.dst_rect = (struct spl_rect){ a[4], a[5], a[6], a[7] };
@@ -303,7 +312,8 @@ int main(void)
 		in.disable_easf = false;
 		in.adaptive_sharpness.enable = false;
 		in.lls_pref = LLS_PREF_DONT_CARE;
-		in.upsp_mode = UPSP_BYPASS;
+		/* resource_is_upsp_required: 4:2:0 upsamples both ways (unused by DCN401). */
+		in.upsp_mode = video ? UPSP_HORIZONTAL_VERTICAL_UPSAMPLING : UPSP_BYPASS;
 		in.basic_in.cositing = CHROMA_COSITING_NONE;
 		in.h_active = a[11];
 		in.v_active = a[9];
@@ -328,11 +338,12 @@ int main(void)
 		w(REG(MPC_SIZE), FM(MPC_SIZE, MPC_WIDTH) | FM(MPC_SIZE, MPC_HEIGHT),
 		  FV(MPC_SIZE, MPC_WIDTH, p.mpc_size.width) | FV(MPC_SIZE, MPC_HEIGHT, p.mpc_size.height));
 		w(REG(SCL_MODE), FM(SCL_MODE, DSCL_MODE), FV(SCL_MODE, DSCL_MODE, p.dscl_mode));
-		/* dpp401_dscl_set_lb, float format; dcn401 max_lb_partitions 63. */
+		/* dpp401_dscl_set_lb, float format; dcn401 max_lb_partitions 63.
+		 * DCN401's use_max_lb gives a 4:2:0 plane LB_MEMORY_CONFIG_3. */
 		w(REG(LB_DATA_FORMAT), FM(LB_DATA_FORMAT, INTERLEAVE_EN) | FM(LB_DATA_FORMAT, ALPHA_EN),
 		  FV(LB_DATA_FORMAT, ALPHA_EN, a[14]));
 		w(REG(LB_MEMORY_CTRL), FM(LB_MEMORY_CTRL, MEMORY_CONFIG) | FM(LB_MEMORY_CTRL, LB_MAX_PARTITIONS),
-		  FV(LB_MEMORY_CTRL, MEMORY_CONFIG, lb_config(&p, a[14])) |
+		  FV(LB_MEMORY_CTRL, MEMORY_CONFIG, video ? 3 : lb_config(&p, a[14])) |
 		  FV(LB_MEMORY_CTRL, LB_MAX_PARTITIONS, 63));
 		if (p.dscl_mode == SCL_MODE_SCALING_444_BYPASS) {
 			/* dpp401_dscl_disable_easf. */
@@ -362,7 +373,7 @@ int main(void)
 			  FV(SCL_TAP_CONTROL, SCL_V_NUM_TAPS, p.taps.v_taps) | FV(SCL_TAP_CONTROL, SCL_H_NUM_TAPS, p.taps.h_taps) |
 			  FV(SCL_TAP_CONTROL, SCL_V_NUM_TAPS_C, p.taps.v_taps_c) | FV(SCL_TAP_CONTROL, SCL_H_NUM_TAPS_C, p.taps.h_taps_c));
 			isharp();
-			/* dpp401_dscl_set_scl_filter (RGB: no chroma coefficients). DC's
+			/* dpp401_dscl_set_scl_filter (chroma coefficients for YCbCr). DC's
 			 * taps are SPL's plus one; scl_data.sharpness is zero. */
 			uint32_t ht = p.taps.h_taps + 1, hc = p.taps.h_taps_c + 1;
 			uint32_t vt = p.taps.v_taps + 1, vc = p.taps.v_taps_c + 1;
@@ -375,12 +386,22 @@ int main(void)
 			  FV(DSCL_2TAP_CONTROL, SCL_H_2TAP_HARDCODE_COEF_EN, h2) |
 			  FV(DSCL_2TAP_CONTROL, SCL_V_2TAP_HARDCODE_COEF_EN, v2));
 			if (!v2 || !h2) {
-				if (p.filter_h || p.filter_v) {
+				/* A YCbCr plane runs in chroma coefficient mode: its
+				 * chroma filters load after the luma ones and the swap
+				 * sets SCL_CHROMA_COEF_MODE ("T"). */
+				const uint16_t *fhc = video ? p.filter_h_c : NULL;
+				const uint16_t *fvc = video ? p.filter_v_c : NULL;
+
+				if (p.filter_h || p.filter_v || fhc || fvc) {
 					if (!h2 && p.filter_h)
 						coef(ht, 1, p.filter_h);
 					if (!v2 && p.filter_v)
 						coef(vt, 0, p.filter_v);
-					printf(" t");
+					if (!h2 && fhc)
+						coef(hc, 3, fhc);
+					if (!v2 && fvc)
+						coef(vc, 2, fvc);
+					printf(video ? " T" : " t");
 				}
 			}
 			easf(&p);

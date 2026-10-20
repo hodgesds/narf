@@ -21,6 +21,7 @@ fn input(a: &[i32]) -> Input {
         rotation: [Rotation::R0, Rotation::R90, Rotation::R180, Rotation::R270][a[12] as usize],
         horizontal_mirror: a[13] != 0,
         alpha: a[14] != 0,
+        video: None,
     }
 }
 
@@ -48,7 +49,9 @@ fn tokens(input: &Input) -> String {
                 }
                 format!(" c{filter_type}/{taps}/{n}/{hash:08x}")
             }
-            dscl::Op::SwapCoefficientRam => String::from(" t"),
+            dscl::Op::SwapCoefficientRam { chroma } => {
+                String::from(if chroma { " T" } else { " t" })
+            }
         };
     }
     for (reg, mask, value) in dscl::viewport(&s) {
@@ -88,6 +91,100 @@ fn dcn401_spl_matches_linux_vectors() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/dcn401-spl", dcn401_spl_matches_linux_vectors);
 
+/// 4:2:0 planes, shared with check.sh likewise: each line leads with the
+/// format (8 NV12/NV21, 10 P010).
+const VIDEO_VECTORS: &str = include_str!("../tests/dcn401_spl/video_vectors.txt");
+
+/// Every NV12/P010 plane of video_vectors.txt programs exactly Linux's
+/// writes: the halved chroma ratios and viewport, chroma taps and inits,
+/// the 420 SCL mode, LB_MEMORY_CONFIG_3, the luma and chroma coefficient
+/// loads with chroma coefficient mode, and the non-linear EASF controls.
+/// Linux's SPL_ASSERT that a chroma viewport starts on a whole chroma
+/// sample (an odd source origin) only warns; its "WARN" marker is not part
+/// of the programming.
+fn dcn401_spl_matches_linux_video_vectors() -> TestResult {
+    let mut n = 0;
+    for line in VIDEO_VECTORS
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        let Some((inputs, want)) = line.split_once(" = ") else {
+            return TestResult::Fail("malformed vector");
+        };
+        let a: Vec<i32> = inputs
+            .split_whitespace()
+            .filter_map(|v| v.parse().ok())
+            .collect();
+        if a.len() != 16 {
+            return TestResult::Fail("malformed vector inputs");
+        }
+        let video = match a[0] {
+            8 => Video::Nv12,
+            10 => Video::P010,
+            _ => return TestResult::Fail("unknown video format"),
+        };
+        let mut plane = input(&a[1..]);
+        plane.video = Some(video);
+        let want = want.replacen("OK WARN", "OK", 1);
+        if tokens(&plane) != want {
+            return TestResult::Fail("SPL 4:2:0 writes differ from Linux");
+        }
+        n += 1;
+    }
+    if n < 100 {
+        return TestResult::Fail("too few SPL 4:2:0 vectors");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-spl",
+    dcn401_spl_matches_linux_video_vectors
+);
+
+/// An unscaled NV12 frame bypasses only luma (420_LUMA_BYPASS): chroma
+/// is upscaled 2x with four taps on a half-size chroma viewport, in
+/// LB_MEMORY_CONFIG_3; RGB at the same size bypasses the whole scaler.
+fn dcn401_spl_nv12_full_frame_scales_chroma() -> TestResult {
+    let r = Rect::new(0, 0, 1920, 1080);
+    let plane = Input {
+        src: r,
+        dst: r,
+        clip: r,
+        stream_width: 1920,
+        stream_height: 1080,
+        odm_slice: r,
+        rotation: Rotation::R0,
+        horizontal_mirror: false,
+        alpha: false,
+        video: Some(Video::Nv12),
+    };
+    let s = calculate(&plane);
+    if !s.ok
+        || s.dscl_mode != SCL_MODE_SCALING_420_LUMA_BYPASS
+        || s.viewport != r
+        || s.viewport_c != Rect::new(0, 0, 960, 540)
+        || s.ratios != [1 << 24, 1 << 24, 1 << 23, 1 << 23]
+        || s.dc_taps() != [1, 1, 4, 4]
+        || s.lb_memory_config(false) != 3
+        || s.easf.v.en != 0
+        || s.easf.h.en != 0
+    {
+        return TestResult::Fail("NV12 full frame");
+    }
+    let rgb = calculate(&Input {
+        video: None,
+        ..plane
+    });
+    if rgb.dscl_mode != SCL_MODE_SCALING_444_BYPASS || rgb.video.is_some() {
+        return TestResult::Fail("RGB full frame");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-spl",
+    dcn401_spl_nv12_full_frame_scales_chroma
+);
+
 /// A unity full-screen plane bypasses the scaler with one tap; 2:1 and 1.5x
 /// take EASF's six taps; 3:1 falls back to the polyphase filters; past
 /// 7680 source pixels of downscaling SPL fails, as Linux's
@@ -103,6 +200,7 @@ fn dcn401_spl_scaling_modes() -> TestResult {
         rotation: Rotation::R0,
         horizontal_mirror: false,
         alpha: false,
+        video: None,
     };
     let unity = calculate(&full((1920, 1080), (1920, 1080)));
     if !unity.ok

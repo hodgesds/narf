@@ -355,6 +355,7 @@ impl SurfaceRequest {
             rotation: l.rotation,
             horizontal_mirror: false,
             alpha: l.blend.per_pixel_alpha,
+            video: None,
         };
         core::iter::once((self.pipe, input(spl::Rect::new(0, 0, half, h)))).chain(
             self.odm
@@ -412,6 +413,7 @@ impl SurfaceRequest {
                 rotation: l.rotation,
                 horizontal_mirror: false,
                 alpha: l.blend.per_pixel_alpha,
+                video: None,
             })
         } else {
             spl::Scaler::unity(0, w, h)

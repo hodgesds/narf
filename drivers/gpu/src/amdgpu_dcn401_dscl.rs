@@ -70,6 +70,8 @@ const SEC_VIEWPORT_DIMENSION_C: u64 = 0x5f1;
 /// `enum dcn401_coef_filter_type_sel`.
 pub const SCL_COEF_LUMA_VERT_FILTER: u32 = 0;
 pub const SCL_COEF_LUMA_HORZ_FILTER: u32 = 1;
+pub const SCL_COEF_CHROMA_VERT_FILTER: u32 = 2;
+pub const SCL_COEF_CHROMA_HORZ_FILTER: u32 = 3;
 /// SCL_MODE.SCL_COEF_RAM_SELECT and SCL_CHROMA_COEF_MODE; the swap writes
 /// the opposite of SCL_COEF_RAM_SELECT_CURRENT (bit 12).
 pub const COEF_RAM_SELECT: u32 = 0x100;
@@ -91,9 +93,10 @@ pub enum Op {
         taps: u32,
         filter: &'static [u16],
     },
-    /// SCL_MODE: SCL_COEF_RAM_SELECT to the RAM not in use, chroma
-    /// coefficient mode off (RGB).
-    SwapCoefficientRam,
+    /// SCL_MODE: SCL_COEF_RAM_SELECT to the RAM not in use, and
+    /// SCL_CHROMA_COEF_MODE: on for a YCbCr (4:2:0) plane, whose chroma
+    /// filters were loaded too, off for RGB.
+    SwapCoefficientRam { chroma: bool },
 }
 
 /// The SCL_COEF_RAM_TAP_DATA words of one filter load: 33 phases of tap
@@ -218,8 +221,10 @@ fn easf_direction(ops: &mut Vec<Op>, e: &EasfDirection, vertical: bool) {
     }
 }
 
-/// dpp401_dscl_set_scaler_manual_scale for `s` (an RGB plane; `alpha` is
-/// its per-pixel alpha, the line buffer's ALPHA_EN).
+/// dpp401_dscl_set_scaler_manual_scale for `s` (`alpha` is the plane's
+/// per-pixel alpha, the line buffer's ALPHA_EN). A 4:2:0 plane is YCbCr:
+/// dpp401_dscl_set_scl_filter's chroma coefficient mode loads its chroma
+/// filters after the luma ones.
 pub fn program(s: &Scaler, alpha: bool) -> Vec<Op> {
     let mut ops = Vec::with_capacity(96);
     let o = &mut ops;
@@ -287,7 +292,17 @@ pub fn program(s: &Scaler, alpha: bool) -> Vec<Op> {
         0x0711_0711,
         u32::from(h2) | u32::from(v2) << 16,
     );
-    if !(v2 && h2) && (s.filter_h.is_some() || s.filter_v.is_some()) {
+    let chroma = s.video.is_some();
+    let (filter_h_c, filter_v_c) = if chroma {
+        (s.filter_h_c, s.filter_v_c)
+    } else {
+        (None, None)
+    };
+    let any = s.filter_h.is_some()
+        || s.filter_v.is_some()
+        || filter_h_c.is_some()
+        || filter_v_c.is_some();
+    if !(v2 && h2) && any {
         if let Some(filter) = s.filter_h.filter(|_| !h2) {
             o.push(Op::Coefficients {
                 filter_type: SCL_COEF_LUMA_HORZ_FILTER,
@@ -302,7 +317,21 @@ pub fn program(s: &Scaler, alpha: bool) -> Vec<Op> {
                 filter,
             });
         }
-        o.push(Op::SwapCoefficientRam);
+        if let Some(filter) = filter_h_c.filter(|_| !h2) {
+            o.push(Op::Coefficients {
+                filter_type: SCL_COEF_CHROMA_HORZ_FILTER,
+                taps: ht_c,
+                filter,
+            });
+        }
+        if let Some(filter) = filter_v_c.filter(|_| !v2) {
+            o.push(Op::Coefficients {
+                filter_type: SCL_COEF_CHROMA_VERT_FILTER,
+                taps: vt_c,
+                filter,
+            });
+        }
+        o.push(Op::SwapCoefficientRam { chroma });
     }
     // dpp401_dscl_program_easf.
     let e = &s.easf;

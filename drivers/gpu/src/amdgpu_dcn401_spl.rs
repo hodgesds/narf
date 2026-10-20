@@ -11,8 +11,12 @@
 //! preference left to the format (`LLS_PREF_DONT_CARE`), no HDR
 //! (`dm_helpers_is_hdr_on` is false), no 3D view, no MPC combine (one MPC
 //! slice), no visual confirm, no OPP recout adjustment, cositing none and
-//! zeroed scaling quality (amdgpu_dm_plane_fill_dc_scaling_info), and only
-//! packed RGB formats (never subsampled, never video). The stream maps its
+//! zeroed scaling quality (amdgpu_dm_plane_fill_dc_scaling_info), packed
+//! RGB or the 4:2:0 video formats amdgpu_dm offers on DCN401 (NV12/NV21 as
+//! SPL_PIXEL_FORMAT_420BPP8, P010 as 420BPP10) with DCN401's forced
+//! `CHROMA_COSITING_NONE` (`force_cositing`) and no sharpening
+//! (`stream->sharpening_required` stays false, so `is_fullscreen` is too).
+//! The stream maps its
 //! source onto the whole timing (no RMX scaling or underscan): stream src =
 //! dst = output = the addressable timing.
 //!
@@ -53,6 +57,16 @@ pub enum Rotation {
     R270 = 3,
 }
 
+/// A 4:2:0 video surface format (`spl_is_yuv420`): NV12 and NV21 are
+/// SPL_PIXEL_FORMAT_420BPP8, P010 is 420BPP10. SPL treats both alike: the
+/// chroma plane is subsampled 2:1 in both directions, scaled non-linearly
+/// (`spl_choose_lls_policy`: LLS_PREF_NO) and kept on the scaler at 1:1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Video {
+    Nv12,
+    P010,
+}
+
 /// What `translate_SPL_in_params_from_pipe_ctx` hands SPL for one pipe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Input {
@@ -73,11 +87,15 @@ pub struct Input {
     pub horizontal_mirror: bool,
     /// `lb_params.alpha_en`: the plane blends per-pixel alpha.
     pub alpha: bool,
+    /// The surface's 4:2:0 format; `None` for packed RGB.
+    pub video: Option<Video>,
 }
 
 /// `enum scl_mode`.
 pub const SCL_MODE_SCALING_444_BYPASS: u32 = 0;
 pub const SCL_MODE_SCALING_444_RGB_ENABLE: u32 = 1;
+pub const SCL_MODE_SCALING_420_YCBCR_ENABLE: u32 = 3;
+pub const SCL_MODE_SCALING_420_LUMA_BYPASS: u32 = 4;
 
 /// The EASF fields of `struct dscl_prog_data`, as `spl_set_easf_data` fills
 /// them (zero where it leaves them alone).
@@ -144,6 +162,9 @@ pub struct Scaler {
     pub filter_h_c: Option<&'static [u16]>,
     pub filter_v_c: Option<&'static [u16]>,
     pub easf: Easf,
+    /// The surface's 4:2:0 format (`Input::video`); `None` for RGB. DC's
+    /// line-buffer choice and chroma coefficient mode follow it.
+    pub video: Option<Video>,
     /// spl_calculate_scaler_params' result: false when the line buffer
     /// cannot hold the taps the ratio needs, or the viewport is wider than
     /// `max_downscale_src_width` (resource_build_scaling_params fails).
@@ -283,19 +304,27 @@ impl Input {
         let (sw, sh) = (i64::from(self.stream_width), i64::from(self.stream_height));
         vert = Fx(vert.0.wrapping_mul(sh) / sh);
         horz = Fx(horz.0.wrapping_mul(sw) / sw);
+        // 4:2:0 chroma covers half the source in each direction.
+        let (horz_c, vert_c) = if self.video.is_some() {
+            (Fx(horz.0 / 2), Fx(vert.0 / 2))
+        } else {
+            (horz, vert)
+        };
         let horz = truncate(horz, 19);
         let vert = truncate(vert, 19);
+        let horz_c = truncate(horz_c, 19);
+        let vert_c = truncate(vert_c, 19);
         d.ratios = Ratios {
             horz,
             vert,
-            horz_c: horz,
-            vert_c: vert,
+            horz_c,
+            vert_c,
         };
         d.recip = Ratios {
             horz: horz.recip(),
             vert: vert.recip(),
-            horz_c: horz.recip(),
-            vert_c: vert.recip(),
+            horz_c: horz_c.recip(),
+            vert_c: vert_c.recip(),
         };
     }
 }
@@ -345,9 +374,9 @@ fn spl_lb_partitions(alpha: bool, d: &Data, lb_config: u32) -> (i32, i32) {
     (y.min(64), c)
 }
 
-/// spl_get_taps_non_adaptive_scaler with zero input taps (RGB: neither
-/// direction subsampled).
-fn taps_non_adaptive(d: &mut Data) {
+/// spl_get_taps_non_adaptive_scaler with zero input taps; a subsampled
+/// (4:2:0) chroma keeps its taps at 1:1.
+fn taps_non_adaptive(d: &mut Data, subsampled: bool) {
     let pick = |r: Fx| {
         if r.ceil() > 1 {
             (2 * r.ceil()).min(8) as u32
@@ -365,10 +394,10 @@ fn taps_non_adaptive(d: &mut Data) {
     if identity(d.ratios.vert) {
         d.taps.v = 1;
     }
-    if identity(d.ratios.horz_c) {
+    if identity(d.ratios.horz_c) && !subsampled {
         d.taps.h_c = 1;
     }
-    if identity(d.ratios.vert_c) {
+    if identity(d.ratios.vert_c) && !subsampled {
         d.taps.v_c = 1;
     }
 }
@@ -378,24 +407,33 @@ fn taps_non_adaptive(d: &mut Data) {
 enum Lls {
     DontCare,
     Yes,
+    No,
 }
 
 /// spl_get_optimal_number_of_taps: (result, EASF vertical, horizontal).
 /// `lls` is SPL's `spl_in->lls_pref`, which enable_easf resolves.
 fn optimal_taps(input: &Input, d: &mut Data, lls: &mut Lls) -> (bool, bool, bool) {
+    let subsampled = input.video.is_some();
     if d.viewport.width > d.h_active && d.viewport.width > MAX_DOWNSCALE_SRC_WIDTH {
-        taps_non_adaptive(d);
+        taps_non_adaptive(d, subsampled);
         return (false, false, false);
     }
-    // enable_easf: no EASF beyond 2:1 downscaling; the RGB format decides
-    // linear-light scaling, which prefers EASF.
+    // enable_easf: no EASF beyond 2:1 downscaling; the format decides
+    // linear-light scaling (spl_choose_lls_policy: non-linear for 4:2:0).
     // (With prefer_easf set the linear-light preference cannot skip it.)
     let skip_easf = d.ratios.vert.ceil() > 2 || d.ratios.horz.ceil() > 2;
     if *lls == Lls::DontCare {
-        *lls = Lls::Yes;
+        *lls = if subsampled { Lls::No } else { Lls::Yes };
     }
     if skip_easf {
-        taps_non_adaptive(d);
+        taps_non_adaptive(d, subsampled);
+    } else if subsampled {
+        d.taps = Taps {
+            v: 6,
+            h: 6,
+            v_c: 4,
+            h_c: 4,
+        };
     } else {
         d.taps = Taps {
             v: 6,
@@ -406,7 +444,9 @@ fn optimal_taps(input: &Input, d: &mut Data, lls: &mut Lls) -> (bool, bool, bool
     }
     let min_taps_y = d.ratios.vert.ceil();
     let min_taps_c = d.ratios.vert_c.ceil();
-    let (num_part_y, num_part_c) = spl_lb_partitions(input.alpha, d, 0);
+    // LB_MEMORY_CONFIG_3 for 4:2:0.
+    let lb_config = if subsampled { 3 } else { 0 };
+    let (num_part_y, num_part_c) = spl_lb_partitions(input.alpha, d, lb_config);
     let max_taps = |ratio: Fx, parts: i32| -> u32 {
         if ratio.ceil() > 2 {
             if ratio.ceil() - 2 > parts {
@@ -437,8 +477,17 @@ fn optimal_taps(input: &Input, d: &mut Data, lls: &mut Lls) -> (bool, bool, bool
                 *t = 4;
             }
         }
-        // RGB.
-        if d.taps.h <= 3 {
+        if subsampled {
+            // Video: 6x6 / 6x4 luma with 4x4 chroma.
+            if d.taps.h <= 4 {
+            } else if d.taps.v <= 3 {
+                easf_h = true;
+            } else {
+                easf_v = true;
+                easf_h = true;
+            }
+        } else if d.taps.h <= 3 {
+            // RGB.
         } else if d.taps.v < 3 {
             easf_h = true;
         } else {
@@ -446,14 +495,15 @@ fn optimal_taps(input: &Input, d: &mut Data, lls: &mut Lls) -> (bool, bool, bool
             easf_h = true;
         }
     }
-    // iSHARP is off: unity directions take one tap.
+    // iSHARP is off: unity directions take one tap (a subsampled chroma
+    // keeps its taps).
     if identity(d.ratios.horz) && identity(d.ratios.vert) {
         d.taps.h = 1;
         d.taps.v = 1;
-        if identity(d.ratios.horz_c) {
+        if identity(d.ratios.horz_c) && !subsampled {
             d.taps.h_c = 1;
         }
-        if identity(d.ratios.vert_c) {
+        if identity(d.ratios.vert_c) && !subsampled {
             d.taps.v_c = 1;
         }
         easf_v = false;
@@ -465,10 +515,10 @@ fn optimal_taps(input: &Input, d: &mut Data, lls: &mut Lls) -> (bool, bool, bool
         if !easf_v && identity(d.ratios.vert) {
             d.taps.v = 1;
         }
-        if !easf_h && identity(d.ratios.horz_c) {
+        if !easf_h && !subsampled && identity(d.ratios.horz_c) {
             d.taps.h_c = 1;
         }
-        if !easf_v && identity(d.ratios.vert_c) {
+        if !easf_v && !subsampled && identity(d.ratios.vert_c) {
             d.taps.v_c = 1;
         }
     }
@@ -511,9 +561,10 @@ fn init_and_vp(
     (init, vp_offset, vp_size)
 }
 
-/// spl_calculate_inits_and_viewports (RGB: no chroma subsampling or
-/// cositing adjustment).
+/// spl_calculate_inits_and_viewports. 4:2:0 chroma spans half the source
+/// in each direction; cositing is NONE, so no chroma init adjustment.
 fn inits_and_viewports(input: &Input, d: &mut Data) {
+    let div = if input.video.is_some() { 2 } else { 1 };
     let mut src = input.src;
     let odm = input.odm_slice;
     let recout_clip = shift(d.recout, odm.x, odm.y);
@@ -552,7 +603,7 @@ fn inits_and_viewports(input: &Input, d: &mut Data) {
         flip_h,
         in_dst.x,
         d.recout.width,
-        src.width,
+        src.width / div,
         d.taps.h_c as i32,
         d.ratios.horz_c,
         zero,
@@ -570,7 +621,7 @@ fn inits_and_viewports(input: &Input, d: &mut Data) {
         flip_v,
         in_dst.y,
         d.recout.height,
-        src.height,
+        src.height / div,
         d.taps.v_c as i32,
         d.ratios.vert_c,
         zero,
@@ -585,8 +636,8 @@ fn inits_and_viewports(input: &Input, d: &mut Data) {
     }
     d.viewport.x += input.src.x;
     d.viewport.y += input.src.y;
-    d.viewport_c.x += input.src.x;
-    d.viewport_c.y += input.src.y;
+    d.viewport_c.x += input.src.x / div;
+    d.viewport_c.y += input.src.y / div;
 }
 
 /// spl_dscl_get_filter_coeffs_64p.
@@ -764,8 +815,37 @@ const BF3_PWL_L: [[u32; 3]; 6] = [
     [0x0CF7, 0x41, 0],
 ];
 
-/// spl_set_easf_data for an RGB plane at SDR_L (lls_pref YES, no HDR).
-fn easf_data(d: &Data, easf_v: bool, easf_h: bool) -> Easf {
+/// The non-linear BF1/BF3 PWLs and BF2 gains (`lls_pref` NO).
+const BF2_GAINS_NL: [u32; 3] = [13, 15, 14];
+const BF1_PWL_NL: [[u32; 3]; 8] = [
+    [0x440, 0, 2],
+    [0x7C4, 12, 109],
+    [0, 63, 0],
+    [48, 63, 0x7ED],
+    [96, 56, 0x7F0],
+    [144, 50, 0x7B0],
+    [192, 20, 0x7CB],
+    [240, 0, 0],
+];
+const BF3_PWL_NL: [[u32; 3]; 6] = [
+    [0x000, 63, 0],
+    [0x06C0, 63, 0x1896],
+    [0x0700, 20, 0x1810],
+    [0x0740, 0, 0x1878],
+    [0x0761, 0x44, 0x1760],
+    [0x0780, 0x41, 0],
+];
+
+/// spl_set_easf_data without HDR: an RGB plane at SDR_L (lls_pref YES), a
+/// 4:2:0 plane at SDR_NL (lls_pref NO, YUV matrix mode, BF3 chroma
+/// correction off).
+fn easf_data(d: &Data, easf_v: bool, easf_h: bool, lls: Lls, subsampled: bool) -> Easf {
+    let linear = lls == Lls::Yes;
+    let (gains, bf1_pwl, bf3_pwl) = if linear {
+        (BF2_GAINS_L, BF1_PWL_L, BF3_PWL_L)
+    } else {
+        (BF2_GAINS_NL, BF1_PWL_NL, BF3_PWL_NL)
+    };
     let direction = |taps: u32, recip: Fx, vertical: bool| {
         let mut e = EasfDirection {
             en: 1,
@@ -783,11 +863,14 @@ fn easf_data(d: &Data, easf_v: bool, easf_h: bool) -> Easf {
                 by_taps(taps, recip, &[0; 9], &GAIN_RING6_6TAP),
             ],
             bf_max_min: [63, 63, 0, 0],
-            bf1_pwl: BF1_PWL_L,
-            bf3_pwl: BF3_PWL_L,
+            bf1_pwl,
+            bf3_pwl,
             ..EasfDirection::default()
         };
-        [e.bf2_flat1_gain, e.bf2_flat2_gain, e.bf2_roc_gain] = BF2_GAINS_L;
+        [e.bf2_flat1_gain, e.bf2_flat2_gain, e.bf2_roc_gain] = gains;
+        if subsampled {
+            e.bf3_mode = 0;
+        }
         if vertical {
             e.ringest_3tap = [
                 three_tap(taps, recip, &TAP3_DNTILT_UPTILT_OFFSET),
@@ -801,10 +884,15 @@ fn easf_data(d: &Data, easf_v: bool, easf_h: bool) -> Easf {
         e
     };
     Easf {
-        matrix_mode: 0,
-        // Linear input; SDR_L's rec709 luma coefficients.
-        ltonl_en: 1,
-        matrix_c: [0x4EF7, 0x55DC, 0x48BB, 0],
+        matrix_mode: u32::from(subsampled),
+        // Linear input with SDR_L's rec709 luma coefficients, else
+        // non-linear with BT.2020's.
+        ltonl_en: u32::from(linear),
+        matrix_c: if linear {
+            [0x4EF7, 0x55DC, 0x48BB, 0]
+        } else {
+            [0x3434, 0x396D, 0x2B97, 0]
+        },
         v: if easf_v {
             direction(d.taps.v, d.recip.vert, true)
         } else {
@@ -843,8 +931,13 @@ pub fn calculate(input: &Input) -> Scaler {
     let dscl_mode = if r.horz.0 == one && r.vert.0 == one && r.horz_c.0 == one && r.vert_c.0 == one
     {
         SCL_MODE_SCALING_444_BYPASS
-    } else {
+    } else if input.video.is_none() {
         SCL_MODE_SCALING_444_RGB_ENABLE
+    } else if r.horz.0 == one && r.vert.0 == one {
+        // Luma 1:1; chroma stays on the scaler for cositing.
+        SCL_MODE_SCALING_420_LUMA_BYPASS
+    } else {
+        SCL_MODE_SCALING_420_YCBCR_ENABLE
     };
     let pair = |f: Fx| (u0d19(f) << 5, f.floor() as u32);
     let [h, h_c, v, v_c] = d.inits;
@@ -874,7 +967,7 @@ pub fn calculate(input: &Input) -> Scaler {
         (filter(d.taps.v, r.vert), filter(d.taps.v_c, r.vert_c))
     };
     let easf = if ok {
-        easf_data(&d, easf_v, easf_h)
+        easf_data(&d, easf_v, easf_h, lls, input.video.is_some())
     } else {
         Easf::default()
     };
@@ -902,6 +995,7 @@ pub fn calculate(input: &Input) -> Scaler {
         filter_h_c,
         filter_v_c,
         easf,
+        video: input.video,
         ok,
     }
 }
@@ -910,7 +1004,8 @@ impl Scaler {
     /// What SPL computes for an unscaled full-frame plane's ODM slice
     /// `x..x + width` of `height` lines, without the 12-pixel minimum
     /// viewport clamp: the scaler bypassed with one tap, the slice's own
-    /// recout and viewport.
+    /// recout and viewport. RGB only: a 4:2:0 plane always scales its
+    /// chroma 2x, so even its full frame goes through [`calculate`].
     pub fn unity(x: i32, width: i32, height: i32) -> Self {
         let r = Rect::new(x, 0, width, height);
         let one = 1 << 19 << 5;
@@ -928,6 +1023,7 @@ impl Scaler {
             filter_h_c: None,
             filter_v_c: None,
             easf: Easf::default(),
+            video: None,
             ok: true,
         }
     }
@@ -942,9 +1038,15 @@ impl Scaler {
         let back = |r: u32| Fx(i64::from(r >> 5) << (32 - 19)).ceil();
         (back(self.ratios[1]), back(self.ratios[3]))
     }
-    /// dpp401_dscl_find_lb_memory_config (no `use_max_lb`, RGB) with
-    /// dscl401_calc_lb_num_partitions on DC's scaler data.
+    /// dpp401_dscl_find_lb_memory_config with
+    /// dscl401_calc_lb_num_partitions on DC's scaler data. A 4:2:0 plane
+    /// takes LB_MEMORY_CONFIG_3, as DCN401's `use_max_lb` returns for
+    /// PIXEL_FORMAT_420BPP8/10; an RGB plane searches configs 1 and 2
+    /// (the `use_max_lb`-off path the RGB vectors were checked against).
     pub fn lb_memory_config(&self, alpha: bool) -> u32 {
+        if self.video.is_some() {
+            return 3;
+        }
         let [v_taps, _, v_taps_c, _] = self.dc_taps().map(|t| t as i32);
         let (ceil_v, ceil_v_c) = self.ceil_vratios();
         let valid = |ceil_vratio: i32, parts: i32, vtaps: i32| {

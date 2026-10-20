@@ -188,14 +188,14 @@ impl<I: Io> Engine<I> {
                         Ok(())
                     })?;
                 }
-                dscl::Op::SwapCoefficientRam => {
+                dscl::Op::SwapCoefficientRam { chroma } => {
                     // Load into the RAM not in use, then select it.
                     let at = l.dpp(p, dscl::SCL_MODE);
                     let current = self.read(at)? & dscl::COEF_RAM_SELECT_CURRENT != 0;
                     self.update(
                         at,
                         dscl::COEF_RAM_SELECT | dscl::CHROMA_COEF_MODE,
-                        u32::from(!current) << 8,
+                        u32::from(!current) << 8 | u32::from(chroma) << 16,
                     )?;
                     coef_ram = Some(!current);
                 }
@@ -431,6 +431,7 @@ fn dcn401_dpp_line_buffer_follows_linux() -> narf_kernel_test::TestResult {
                 rotation: spl::Rotation::R0,
                 horizontal_mirror: false,
                 alpha,
+                video: None,
             });
             assert_eq!(s.lb_memory_config(alpha), want, "width {width}");
         }
