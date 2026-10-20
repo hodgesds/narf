@@ -86,6 +86,7 @@ pub mod fuse;
 pub mod fuse_conn;
 pub mod inode_id;
 pub mod memfs;
+pub mod mmap_relocation;
 pub mod mqueuefs;
 pub mod ntty;
 pub mod overlayfs;
@@ -861,9 +862,9 @@ pub enum FsError {
 /// Type-erased owner retained for the lifetime of a shared device mapping.
 /// Implementations use this for backing whose lifetime is narrower than the
 /// open file itself (for example, one GEM resource on a long-lived DRM fd).
-pub trait MmapLifetime: Send + Sync {}
+pub trait MmapLifetime: core::any::Any + Send + Sync {}
 
-impl<T: Send + Sync> MmapLifetime for T {}
+impl<T: core::any::Any + Send + Sync> MmapLifetime for T {}
 
 /// Frames paired with their owner. Devices with replaceable storage acquire
 /// both under one lock, preventing reconfiguration between an ownership
@@ -1624,6 +1625,10 @@ pub trait FileOps: Send + Sync {
         let frames = self.mmap_frames(offset, len)?;
         Ok(MmapBacking { frames, lifetime })
     }
+
+    /// Called after shared device PTEs and their lifetime owner are published,
+    /// while the address-space shared-mapping transaction remains held.
+    fn mmap_published(&self, _lifetime: Option<&Arc<dyn MmapLifetime>>) {}
 
     /// True only when mmap_frames/mmap_fault return ordinary allocator RAM
     /// retired via narf_memory::free_frame. Such backing supports independent

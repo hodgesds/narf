@@ -40,7 +40,11 @@ def power_layouts(linux):
         work = Path(temporary)
         for name, text, kind in [("common", header.read_text(), "PPTable_t"), ("beige", header.read_text(), "PPTable_beige_goby_t"), ("legacy", legacy, "PPTable_beige_goby_t")]:
             (work / "interface.h").write_text(text)
-            (work / "layout.c").write_text('#include <stdint.h>\n#include <stddef.h>\n#include <stdio.h>\n#include "interface.h"\nint main(void) { printf("%zu,%zu,%zu", sizeof(' + kind + '), offsetof(' + kind + ', I2cControllers), offsetof(' + kind + ', MmHubPadding)); }\n')
+            limits = "\n".join(
+                f'_Static_assert(offsetof({kind}, {field}) == {offset}, "{field}");'
+                for field, offset in [("FeaturesToRun", 4), ("SocketPowerLimitAc", 12), ("TemperatureLimit", 52), ("FanMaximumRpm", 1018)]
+            )
+            (work / "layout.c").write_text('#include <stdint.h>\n#include <stddef.h>\n#include <stdio.h>\n#include "interface.h"\n' + limits + '\nint main(void) { printf("%zu,%zu,%zu", sizeof(' + kind + '), offsetof(' + kind + ', I2cControllers), offsetof(' + kind + ', MmHubPadding)); }\n')
             subprocess.run(["cc", str(work / "layout.c"), "-o", str(work / "layout")], check=True)
             result[name] = tuple(map(int, subprocess.check_output([str(work / "layout")], text=True).split(",")))
     return result
@@ -57,6 +61,12 @@ def main():
     source = Path(__file__).resolve().parents[1] / "src/amdgpu_rdna2.rs"
     amd = args.linux / "drivers/gpu/drm/amd"
     check_dmub_layouts(amd)
+    with tempfile.TemporaryDirectory(prefix="narf-rdna2-metadata-") as temporary:
+        executable = str(Path(temporary) / "metadata")
+        subprocess.run(["cc", "-Wall", "-Wextra", "-Werror", "-D__counted_by(x)=",
+                        "-I" + str(amd / "include"), str(source.parents[1] / "tests/rdna2_metadata.c"),
+                        "-o", executable], check=True)
+        subprocess.run([executable], check=True)
     pci_table = (amd / "amdgpu/amdgpu_drv.c").read_text()
     ucode = (amd / "amdgpu/amdgpu_ucode.c").read_text()
     dm = (amd / "display/amdgpu_dm/amdgpu_dm.c").read_text().split("static int dm_init_microcode", 1)[1]
@@ -104,7 +114,14 @@ def main():
             hub_fields[(kind, field)] = (header, define)
             hub_output += f'println!("hub-{kind} {field} {{}}", gmc_regs::{symbol}.{field});\n'
     discovery = (amd / "amdgpu/amdgpu_discovery.c").read_text()
+    smuio_selector = discovery.split("switch (amdgpu_ip_version(adev, SMUIO_HWIP, 0))", 1)[1]
     sdma_backend = discovery.split("static int amdgpu_discovery_set_sdma_ip_blocks", 1)[1]
+    nv_source = (amd / "amdgpu/nv.c").read_text()
+    shared = (amd / "include/amd_shared.h").read_text()
+    power_flags = {name: 1 << int(bit) for name, bit in re.findall(
+        r"^#define\s+(AMD_[CP]G_SUPPORT_\w+)\s+\(1(?:ULL|UL|U)?\s*<<\s*(\d+)\)", shared, re.MULTILINE)}
+    ppt_source = (amd / "pm/swsmu/smu11/sienna_cichlid_ppt.c").read_text()
+    metrics_selector = ppt_source.split("static int sienna_cichlid_get_smu_metrics_data", 1)[1].split("ret = smu_cmn_get_metrics_table", 1)[0]
     gfx_source = (amd / "amdgpu/gfx_v10_0.c").read_text()
     golden_selector = gfx_source.split("static void gfx_v10_0_init_golden_registers", 1)[1]
     gc_macros = {}
@@ -146,7 +163,16 @@ def main():
         harness.write_text(
             "#[path = " + json.dumps(str(source)) + "] mod rdna2;\n"
             "#[path = " + json.dumps(str(hub_source)) + "] mod gmc_regs;\n"
-            "fn main() { for p in rdna2::PROFILES {\n"
+            "use rdna2 as amdgpu_rdna2;\n"
+            "#[path = " + json.dumps(str(source.with_name("amdgpu_smu_navi22_telemetry.rs"))) + "] mod telemetry;\n"
+            'fn main() { for revision in 0..=12 { println!("rom 11.0.{} {:?}", revision, rdna2::smuio_rom_forced_on((11,0,revision))); }\n'
+            "for p in rdna2::PROFILES {\n"
+            'for version in [0, 0x3a42ff, 0x3a4300, 0x3a48ff, 0x3a4900, 0x412cff, 0x412d00, 0x3b22ff, 0x3b2300, 0x4910ff, 0x491100, u32::MAX] {'
+            'println!("metrics {} {}.{}.{},{},{:?}", p.asic, p.psp_version.0, p.psp_version.1, p.psp_version.2, version, telemetry::Layout::for_profile(p, version)); }\n'
+            'println!("mall {} {}", p.asic, p.mall_bytes());\n'
+            'println!("cg {} {}", p.asic, p.clock_gating_flags());\n'
+            'println!("pg {} {}", p.asic, p.power_gating_flags());\n'
+            'println!("driver-if {} {}", p.asic, p.smu_driver_interface());\n'
             'for &id in p.pci_ids { println!("id {} {:04x}", p.asic, id); }\n'
             'for (kind, v) in [("gc", p.gc_version), ("psp", p.psp_version), '
             '("smu", p.psp_version), ("sdma", p.sdma_version), ("dcn", p.dcn_version)] {'
@@ -167,6 +193,7 @@ def main():
             'let index = if name == "RLC_RLCS_BOOTLOAD_STATUS" {r.rlc_base_index} '
             'else {r.gc_base_index}; '
             'println!("reg {} {}", name, offset); println!("reg {}_BASE_IDX {}", name, index); }\n'
+            'for offset in rdna2::READ_MMR_GC { println!("mmr gc {}", offset); }\n'
             'for v in rdna2::GMC_MMHUB_VERSIONS { println!("mmhub common {}.{}.{}", v.0, v.1, v.2); }\n'
             'for v in rdna2::IH_OSSSYS_VERSIONS { println!("ih common {}.{}.{}", v.0, v.1, v.2); }\n'
             + hub_output + "}\n"
@@ -178,12 +205,51 @@ def main():
         output = subprocess.check_output([str(work / "inventory")], text=True)
     actual = {name: set() for name in chips}
     golden_actual = {name: [] for name in chips}
+    mmr_actual = []
     firmware_count = 0
     version_count = 0
     register_count = 0
     for line in output.splitlines():
         kind, asic, value = line.split()
-        if kind == "power":
+        if kind == "rom":
+            if "case IP_VERSION(" + asic.replace(".", ", ") + "):" not in smuio_selector:
+                expected = "None"
+            else:
+                body = case_body(smuio_selector, asic)
+                expected = "Some(true)" if "&smuio_v11_0_6_funcs" in body else "Some(false)"
+            if value != expected:
+                raise SystemExit(f"SMUIO {asic} ROM backend differs from Linux")
+        elif kind == "metrics":
+            ip, version, layout = value.split(",")
+            body = case_body(metrics_selector, ip)
+            expected = "V1"
+            for threshold, revision in re.findall(r"smu->smc_fw_version >= (0x[0-9a-fA-F]+)\)\s*use_metrics_v([23]) = true;", body):
+                if int(version) >= int(threshold, 16):
+                    expected = "V" + revision
+                    break
+            if layout != expected:
+                raise SystemExit(f"{asic} firmware {version} metrics layout {layout} != Linux {expected}")
+        elif kind == "mmr":
+            mmr_actual.append(int(value))
+        elif kind == "mall":
+            revision = {"navi21": 0, "navi22": 2, "navi23": 4, "navi24": 5}[asic]
+            body = case_body(gmc[gmc.index("case IP_VERSION(10, 3, 0):", gmc.index("amdgpu_gmc_get_vram_info")):], f"10.3.{revision}")
+            expected = int(re.search(r"adev->gmc.mall_size\s*=\s*(\d+)\s*\*\s*1024\s*\*\s*1024", body).group(1)) * 1024 * 1024
+            if int(value) != expected:
+                raise SystemExit(f"{asic} MALL size differs from Linux")
+        elif kind in ("cg", "pg"):
+            revision = {"navi21": 0, "navi22": 2, "navi23": 4, "navi24": 5}[asic]
+            body = case_body(nv_source, f"10.3.{revision}")
+            expression = re.search(r"adev->" + kind + r"_flags\s*=([^;]+);", body).group(1)
+            expected = sum(power_flags[name] for name in re.findall(r"AMD_[CP]G_SUPPORT_\w+", expression))
+            if int(value) != expected:
+                raise SystemExit(f"{asic} {kind} flags differ from Linux: {value} != {expected}")
+        elif kind == "driver-if":
+            name = "SMU11_DRIVER_IF_VERSION_" + chips[asic].title()
+            expected = int(re.search(r"#define\s+" + name + r"\s+(0x[0-9a-fA-F]+)", ppt_source).group(1), 16)
+            if int(value) != expected:
+                raise SystemExit(f"{asic} SMU driver interface differs from Linux")
+        elif kind == "power":
             layout = tuple(map(int, value.split(",")))
             expected = power_layouts(args.linux)["legacy" if layout[0] == 1700 else "beige" if asic == "navi24" else "common"]
             if layout != expected:
@@ -262,10 +328,16 @@ def main():
                 f"{asic}: missing={sorted(expected - actual[asic])}, "
                 f"extra={sorted(actual[asic] - expected)}"
             )
+    names = re.findall(r"SOC15_REG_ENTRY\(GC, 0, (mm\w+)\)", nv_source.split("nv_allowed_read_registers[]", 1)[1].split("};", 1)[0])
+    if mmr_actual != [gc_macros[name] for name in names]:
+        raise SystemExit("Compiled GC MMR allow-list differs from Linux")
+    print("PASS: atomfirmware VRAM module layouts, RX 6000 MALL sizes and GC MMR allow-list match Linux")
     print(f"PASS: {sum(map(len, actual.values()))} exact PCI IDs and "
           f"{firmware_count} firmware names, {version_count} IP selections and "
           f"{register_count} GPU register fields and {sum(map(len, golden_actual.values()))} "
           f"golden rows match {args.linux}")
+
+    print("PASS: per-ASIC CG/PG flags, SMU interfaces, 48 metrics selections and SMUIO11 ROM backends match Linux")
 
     if args.firmware_dir is not None:
         check_firmware(source, args.firmware_dir, chips)

@@ -77,6 +77,8 @@ pub fn dma_resv_usage_rw(write: bool) -> DmaResvUsage {
 /// Linux `struct dma_resv`: the implicit-sync fences attached to one buffer.
 pub struct DmaResv {
     fences: IrqSafeSpinLock<Vec<(Arc<dyn DrmFence>, DmaResvUsage)>>,
+    /// Bumped under `fences` by every [`DmaResv::add_fence`].
+    generation: core::sync::atomic::AtomicU64,
 }
 
 impl core::fmt::Debug for DmaResv {
@@ -95,6 +97,7 @@ impl Default for DmaResv {
     fn default() -> Self {
         Self {
             fences: IrqSafeSpinLock::new(Vec::new()),
+            generation: core::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -119,6 +122,8 @@ impl DmaResv {
         let signalled: Vec<Arc<dyn DrmFence>> =
             snapshot.into_iter().filter(|f| f.is_signalled()).collect();
         let mut fences = self.fences.lock();
+        self.generation
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         fences.retain(|(old, _)| !signalled.iter().any(|s| Arc::ptr_eq(s, old)));
         for slot in fences.iter_mut() {
             let (old, old_usage) = slot;
@@ -129,6 +134,14 @@ impl DmaResv {
             }
         }
         fences.push((fence, usage));
+    }
+
+    /// Count of fence additions so far. A caller which observed no
+    /// unsignalled fences can later prove, without allocating or sampling
+    /// driver fences, that none was added since: the generation is unchanged.
+    pub fn generation(&self) -> u64 {
+        let _fences = self.fences.lock();
+        self.generation.load(core::sync::atomic::Ordering::Acquire)
     }
 
     /// Linux `dma_resv_get_fences(obj, usage)`: the unsignalled fences whose

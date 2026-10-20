@@ -38,10 +38,11 @@
 //! is flushed and remapped before its next use, as `amdgpu_vm_flush` does
 //! after `amdgpu_vmid_had_gpu_reset`.
 //!
-//! LINUX-GAP: `last_flush` / `pasid_mapping` are the job's own fence, not a
-//! separate `hw_vm_fence` emitted after the flush (later, so conservative);
-//! no `ring->vmid_wait` fairness queue (waiters poll). Dependencies wait in
-//! the ioctl (generic `dispatch_async`).
+//! VM programming has a dedicated writeback before client IBs. VMID reuse
+//! waits for that writeback while active jobs retain their own final fences.
+//! Per-ring FIFO admission parks later clients; the head waits for any fence
+//! IRQ or its hard deadline, with per-future wakers and cancellation cleanup.
+//! Dependencies wait in the ioctl (generic `dispatch_async`).
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -77,8 +78,6 @@ fn fence_slot(id: usize) -> Option<usize> {
 /// Bound on waiting out the per-ring throttle or for an idle VMID before
 /// giving up with EBUSY.
 const THROTTLE_NS: u64 = 10_000_000_000; // linux: n/a (NARF policy)
-/// Poll interval while waiting for a fence or an idle VMID.
-const POLL_US: u64 = 100; // linux: n/a (NARF policy)
 
 /// `amdgpu_ctx_get_entity` for this ASIC: gfx ring 0, compute rings 0–3 on
 /// the one kernel compute queue, one entity per SDMA engine.
@@ -96,7 +95,7 @@ pub fn ring_id(ip_type: u32, ip_instance: u32, ring: u32) -> Option<usize> {
 pub const RING_IDS: usize = 10; // linux: n/a (NARF ticket ring ids)
 /// The ticket ring index of ring `id` in recovery epoch `epoch`.
 pub const fn ring_index(epoch: u64, id: usize) -> u32 {
-    ((epoch as u32 & 0xff) << 4) | id as u32
+    ((epoch as u32 & 0x07ff_ffff) << 4) | id as u32
 }
 /// Whether `ticket` completed, given each ring's completed sequence in
 /// `epoch`. Tickets of another epoch were abandoned by a recovery.
@@ -165,12 +164,25 @@ pub struct Submitter {
     /// platform owner, beside the submission it grants.
     vmids: IrqSafeSpinLock<crate::amdgpu_vmid::VmidManager>,
     rings: IrqSafeSpinLock<[RingState; RING_IDS]>,
+    admission: [crate::amdgpu_admission::Queue; RING_IDS],
 }
 
 impl Submitter {
+    fn vm_progress(&self) -> Option<[u32; RING_IDS]> {
+        let mut completed = [0; RING_IDS];
+        for (id, value) in completed.iter_mut().enumerate() {
+            if let Some(slot) = fence_slot(id).filter(|&slot| self.reader.present(slot)) {
+                *value = self.reader.vm_completed(slot).ok()?;
+            }
+        }
+        Some(completed)
+    }
     /// Every ring's completed sequence, retiring what completed jobs held
     /// and writing their user fences. None when the device stopped answering.
     fn progress(&self) -> Option<[u32; RING_IDS]> {
+        if self.epoch != crate::amdgpu_fence_navi22::generation() {
+            return None;
+        }
         let mut completed = [0; RING_IDS];
         for (i, c) in completed.iter_mut().enumerate() {
             *c = if let Some(slot) = fence_slot(i) {
@@ -190,6 +202,7 @@ impl Submitter {
     }
     async fn wait_for(&self, ticket: u64, deadline_ns: u64) -> Result<bool, FsError> {
         loop {
+            let observed = crate::amdgpu_fence_navi22::change_sequence();
             let completed = self.progress().ok_or(FsError::NoDevice)?;
             if job_done(self.epoch, completed, ticket) {
                 return Ok(true);
@@ -197,7 +210,7 @@ impl Submitter {
             if narf_time::monotonic_ns() >= deadline_ns {
                 return Ok(false);
             }
-            narf_time::SleepUntil::new(narf_time::Deadline::after_us(POLL_US).as_instant()).await;
+            crate::amdgpu_fence_navi22::wait_change(observed, deadline_ns).await;
         }
     }
 }
@@ -256,6 +269,21 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             let index = ring_index(self.epoch, id);
             let request = grab_request(vm, page_table_base, pasid, index);
             let context = entity(request.owner, submission.ctx_id);
+            let deadline = narf_time::monotonic_ns().saturating_add(THROTTLE_NS);
+            let mut admission = core::pin::pin!(self.admission[id].enter());
+            let mut timeout = core::pin::pin!(narf_time::SleepUntil::new(
+                narf_time::Deadline::after_ns(THROTTLE_NS).as_instant()
+            ));
+            let _permit = core::future::poll_fn(|cx| {
+                if let core::task::Poll::Ready(permit) = admission.as_mut().poll(cx) {
+                    return core::task::Poll::Ready(Ok(permit));
+                }
+                if timeout.as_mut().poll(cx).is_ready() {
+                    return core::task::Poll::Ready(Err(FsError::Busy));
+                }
+                core::task::Poll::Pending
+            })
+            .await?;
             if (crate::amdgpu_vcn_navi22_cs::FIRST_ID..8).contains(&id) {
                 // VCN/JPEG: MMHUB VMIDs of their own (amdgpu_vcn_navi22_cs).
                 let progress = || self.progress();
@@ -270,14 +298,21 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             if !fence_slot(id).is_some_and(|slot| self.reader.present(slot)) {
                 return Err(FsError::InvalidData);
             }
-            let deadline = narf_time::monotonic_ns().saturating_add(THROTTLE_NS);
             let seq = loop {
+                let observed = crate::amdgpu_fence_navi22::change_sequence();
                 let throttle = {
                     let mut owner = crate::amdgpu_navi22_platform::owner().await;
                     let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
                     let completed = self.progress().ok_or(FsError::NoDevice)?;
+                    let vm_completed = self.vm_progress().ok_or(FsError::NoDevice)?;
                     let epoch = self.epoch;
-                    let done = |t| job_done(epoch, completed, t);
+                    let done = |t| {
+                        if t & (1 << 63) != 0 {
+                            job_done(epoch, vm_completed, t & !(1 << 63))
+                        } else {
+                            job_done(epoch, completed, t)
+                        }
+                    };
                     let grant = self.vmids.lock().grab(request, &done);
                     let Some(grant) = grant else {
                         // amdgpu_vmid_grab_idle: every client VMID still has
@@ -286,10 +321,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                         if narf_time::monotonic_ns() >= deadline {
                             return Err(FsError::Busy);
                         }
-                        narf_time::SleepUntil::new(
-                            narf_time::Deadline::after_us(POLL_US).as_instant(),
-                        )
-                        .await;
+                        crate::amdgpu_fence_navi22::wait_change(observed, deadline).await;
                         continue;
                     };
                     let result = {
@@ -299,7 +331,12 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                     match result {
                         Ok(seq) => {
                             let ticket = u64::from(index) << 32 | u64::from(seq);
-                            self.vmids.lock().commit(request, grant, ticket);
+                            self.vmids.lock().commit_with_flush(
+                                request,
+                                grant,
+                                ticket,
+                                ticket | (1 << 63),
+                            );
                             break seq;
                         }
                         Err(crate::amdgpu_navi22_boot::Error::Queues(
@@ -359,6 +396,8 @@ pub async fn register(boot: &mut crate::amdgpu_navi22_boot::ColdBoot) {
     let Some(reader) = boot.client_fence_reader() else {
         return;
     };
+    let hidden_ready =
+        boot.unmapped_pool().is_some() && crate::amdgpu_rdna2_vram::publish(card, boot).is_ok();
     let lent = match boot.reserve_client_vmids() {
         Ok(lent) => lent,
         Err(error) => {
@@ -385,7 +424,16 @@ pub async fn register(boot: &mut crate::amdgpu_navi22_boot::ColdBoot) {
                 }
             }
         }
-        if let Some((chunk, heap)) = client.as_ref() {
+        if let Some((chunk, heap)) = client.as_mut() {
+            if hidden_ready && heap.unmapped.is_none() {
+                heap.unmapped = boot
+                    .unmapped_pool()
+                    .map(|pool| crate::amdgpu_gem::UnmappedHeap {
+                        pool,
+                        clear: crate::amdgpu_rdna2_vram::clearer(),
+                        transfer: Some(crate::amdgpu_rdna2_vram::reader(card)),
+                    });
+            }
             crate::amdgpu_gem::register_vram_heap(card, heap.clone());
             let _ = writeln!(
                 narf_console::Writer,
@@ -399,18 +447,25 @@ pub async fn register(boot: &mut crate::amdgpu_navi22_boot::ColdBoot) {
         card,
         Arc::new(Submitter {
             card,
-            epoch: crate::amdgpu_navi22_recovery::recoveries(),
+            // The fence generation advances during quiesce, before restart
+            // registers this submitter. The recovery counter advances later.
+            epoch: crate::amdgpu_fence_navi22::generation(),
             reader,
             vmids: IrqSafeSpinLock::new(vmids),
             rings: IrqSafeSpinLock::new([RingState::new(); RING_IDS]),
+            admission: [const { crate::amdgpu_admission::Queue::new() }; RING_IDS],
         }),
     );
+    // A recovery also replays the still-unsignalled front clear. The queue's
+    // pulse closes the race with a drain noticing the old fence generation.
+    crate::amdgpu_rdna2_vram::engine().kick();
 }
 
 /// Stop accepting client work (recovery is about to rebuild the owner). The
 /// lent VMIDs belonged to the old memory owner and are dropped with it; the
 /// next `register` starts a fresh manager (every VMID flushes again).
 pub fn unregister() {
+    crate::amdgpu_rdna2_vram::suspend();
     if let Some(card) = drm_card() {
         crate::amdgpu_cs::unregister_submitter(card);
         crate::amdgpu_gem::unregister_vram_heap(card);
@@ -451,6 +506,7 @@ mod tests {
             (job_done(0, done, ticket(0, 3, 1)), false),
             // A ticket of an earlier epoch was abandoned by recovery.
             (job_done(1, done, ticket(0, 0, 11)), true),
+            (job_done(256, done, ticket(0, 0, 11)), true),
         ];
         if cases.iter().any(|(got, want)| got != want) {
             return TestResult::Fail("ticket completion or epoch abandonment");
@@ -459,7 +515,7 @@ mod tests {
         if (ring_index(5, 3) % 16) != 3 || (ring_index(5, 7) % 16) != 7 {
             return TestResult::Fail("epoch tag leaked into the ring slot");
         }
-        for epoch in [0, 1, 5, 255] {
+        for epoch in [0, 1, 5, 255, 256, 65536] {
             let mut completed = [0; RING_IDS];
             completed[8] = 12;
             completed[9] = 3;

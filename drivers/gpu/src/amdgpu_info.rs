@@ -17,33 +17,20 @@
 //! query is indistinguishable from an unsupported one, and never a zero that
 //! userspace would believe.
 //!
-//! LINUX-GAP: `ACCEL_WORKING` reports **false**. On a card that registers a
-//! submitter (Navi48) the pieces exist — `AMDGPU_CS` queues jobs on the
-//! kernel graphics, compute and SDMA rings with per-client VMIDs, and
-//! `HW_IP_INFO` reports those rings — but none of it has run on hardware
-//! yet, and rendering also needs eviction and invisible VRAM. Reporting
-//! false keeps Mesa declining the device cleanly at initialisation instead
-//! of coming up and failing at first draw; flipping it is the marker for
-//! the submission path proving itself on silicon.
+//! Discrete RX 6000 replies route to the shared RDNA2 implementation,
+//! including verified/opt-in submission, firmware identity and harvested
+//! topology. The async ioctl path additionally serves Linux's allowed live
+//! register reads under the retained platform owner.
 //!
-//! LINUX-GAP: the queries that need subsystems this driver has not built are
-//! refused rather than guessed. Navi48 answers FW_VERSION (CP firmware),
-//! READ_MMR_REG (GB_ADDR_CONFIG only) and TIMESTAMP (SMUIO's golden TSC)
-//! from what its platform publishes; other parts refuse them.
+//! The generic path reports acceleration unavailable. Navi48's published
+//! firmware, GB_ADDR_CONFIG and SMUIO timestamp are available, while queries
+//! without a source return EINVAL.
 //!
-//! `gpu_counter_freq` is the VBIOS reference clock amdgpu_atomfirmware
-//! reads (smu_info, overridden by gfx_info on Navi and later), times ten.
-//!
-//! `vram_type` / `vram_bit_width` come from the VBIOS umc_info table on
-//! discrete GC 12 parts, as amdgpu_gmc_get_vram_info reads them; other parts
-//! report 0.
-//!
-//! On Navi48 the clocks (`max/min_engine_clock`, `max/min_memory_clock`)
-//! are what its SMU owner publishes: the GFXCLK DPM range, and the UCLK DPM
-//! range or, before display power enables UCLK DPM, the VBIOS boot UCLK.
-//!
-//! LINUX-GAP: other parts report zero clocks; their SMU owners do not
-//! publish to this ioctl.
+//! `gpu_counter_freq` is the VBIOS reference clock (smu_info overridden by
+//! gfx_info on Navi and later), times ten to kHz. VRAM type and width come
+//! from umc_info on discrete GC12 and the strapped vram_info module on RX6000.
+//! RDNA2 and Navi48 clocks come from their SMU owners or the fixed boot MCLK;
+//! other generic parts still lack those published clock ranges.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -75,8 +62,8 @@ fn family_id(snap: &Snapshot) -> Option<u32> {
         Family::Phoenix => Some(uapi::AMDGPU_FAMILY_GC_11_0_1),
         // Renoir / Cezanne / Lucienne / Barcelo are the Raven family line.
         Family::Renoir => Some(uapi::AMDGPU_FAMILY_RV),
-        // The Navi2 bucket also contains Rembrandt, whose UAPI family is
-        // different. Admit Navi 22 only with the matching discovery version.
+        // Navi2 also contains Rembrandt, whose UAPI family differs. Only
+        // exact discrete RDNA2 profiles with matching GC discovery qualify.
         Family::Navi2 => {
             let profile = crate::amdgpu_rdna2::for_pci_id(
                 crate::amdgpu::AMD_VENDOR,
@@ -140,12 +127,41 @@ pub struct Snapshot {
 /// owners that read them (the Navi48 `publish_navi48_topology` pattern).
 static NAVI22: narf_lib::sync::IrqSafeSpinLock<crate::amdgpu_info_navi22::Published> =
     narf_lib::sync::IrqSafeSpinLock::new(crate::amdgpu_info_navi22::Published {
+        vram_module: None,
+        pcie: None,
+        memory_khz: None,
         topology: None,
         pci_revision: None,
         boot: None,
         vcn_harvest: None,
         media_rings: 0,
     });
+/// Board identity sampled before the cold boot, without unguarded ioctl MMIO.
+pub(crate) fn publish_rdna2_board(
+    module: Option<u8>,
+    pcie: Option<(u32, u32)>,
+    memory_khz: Option<(u64, u64)>,
+) {
+    let mut info = NAVI22.lock();
+    info.vram_module = module;
+    info.pcie = pcie;
+    info.memory_khz = memory_khz;
+}
+
+/// atomfirmware VRAM_INFO, selected by the board's memory-module strap.
+pub fn rdna2_vram(vbios: &[u8], module: u8) -> Option<(u32, u32)> {
+    use crate::atombios::{header::parse_rom_header, tables::MasterDataTable};
+    let header = parse_rom_header(vbios).ok()?;
+    let tables = MasterDataTable::parse(vbios, &header).ok()?;
+    let (kind, width) = crate::amdgpu_rdna2::metadata::vram(tables.table_slice(28)?, module)?;
+    let kind = match kind {
+        0x50 => uapi::AMDGPU_VRAM_TYPE_GDDR5,
+        0x60 | 0x61 | 0x80 => uapi::AMDGPU_VRAM_TYPE_HBM,
+        0x70 => uapi::AMDGPU_VRAM_TYPE_GDDR6,
+        _ => uapi::AMDGPU_VRAM_TYPE_UNKNOWN,
+    };
+    Some((kind, width))
+}
 /// From the cold boot's `ReadTopology` stage.
 pub(crate) fn publish_navi22_topology(topology: crate::amdgpu_gfx10_topology::Topology) {
     NAVI22.lock().topology = Some(topology);
@@ -157,6 +173,9 @@ pub(crate) fn publish_navi22_pci_revision(revision: u8) {
 /// After a successful cold boot only.
 pub(crate) fn publish_navi22_boot(boot: crate::amdgpu_info_navi22::Boot) {
     NAVI22.lock().boot = Some(boot);
+}
+pub(crate) fn publish_rdna2_memory_clocks(clocks: Option<(u64, u64)>) {
+    NAVI22.lock().memory_khz = clocks;
 }
 /// The VCN harvest mask, read by the platform owner before the cold boot.
 pub(crate) fn publish_navi22_vcn_harvest(harvest: u8) {
@@ -242,14 +261,26 @@ fn snapshot() -> Option<Snapshot> {
 
 impl Snapshot {
     pub(crate) fn from_gpu(gpu: &crate::amdgpu::AmdGpu) -> Self {
-        // amdgpu_gmc_get_vram_info reads umc_info on discrete GC 12.0.x.
-        // LINUX-GAP: other parts' vram_info / integrated_system_info are not
-        // read; they report 0.
+        // Discrete GC12 uses umc_info; RDNA2 uses the strapped vram_info
+        // module. Integrated-system-info decoding remains a separate path.
+        let rdna2 = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).is_some();
+        let published = if rdna2 {
+            *NAVI22.lock()
+        } else {
+            Default::default()
+        };
         let (vram_type, vram_bit_width) = gpu
             .vbios
             .as_ref()
-            .filter(|_| gpu.chip.family == Family::Navi4 && !gpu.is_apu())
-            .and_then(|v| umc_vram(v.bytes()))
+            .and_then(|v| {
+                if rdna2 {
+                    rdna2_vram(v.bytes(), published.vram_module?)
+                } else if gpu.chip.family == Family::Navi4 && !gpu.is_apu() {
+                    umc_vram(v.bytes())
+                } else {
+                    None
+                }
+            })
             .unwrap_or((0, 0));
         Self {
             did: gpu.chip.did as u32,
@@ -259,11 +290,7 @@ impl Snapshot {
             is_apu: gpu.is_apu(),
             gc: gpu.gc_info,
             ip_blocks: gpu.ip_blocks.clone(),
-            navi22: if crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).is_some() {
-                *NAVI22.lock()
-            } else {
-                Default::default()
-            },
+            navi22: published,
             reference_clock_10khz: gpu
                 .vbios
                 .as_ref()
@@ -1083,4 +1110,133 @@ mod topology_tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/gfx12", info_boot_mclk_follows_atomfirmware);
+}
+
+/// Sample board straps once while the platform exclusively owns the GPU.
+/// No ioctl dereferences MMIO outside a capability invocation.
+pub(crate) fn sample_rdna2_board(
+    gpu: &crate::amdgpu::AmdGpu,
+    cap: &narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+    device: &narf_bus::BusDevice,
+) {
+    use crate::atombios::{header::parse_rom_header, tables::MasterDataTable};
+    use narf_capabilities::{Cap, CapError, CapOp, Write};
+    struct Scratch<'a>(&'a narf_bus::MmioRegion, u64);
+    impl CapOp<narf_bus::BusDeviceCap, Write> for Scratch<'_> {
+        type Output = u32;
+        fn execute(self, _: &Cap<narf_bus::BusDeviceCap, Write>) -> Result<u32, CapError> {
+            // SAFETY: scratch address bounded to BAR5 below; exclusive probe.
+            Ok(unsafe { self.0.read32(self.1) })
+        }
+    }
+    let bios = gpu.vbios.as_ref().map(|v| v.bytes());
+    let module = bios.and_then(|bios| {
+        let header = parse_rom_header(bios).ok()?;
+        let tables = MasterDataTable::parse(bios, &header).ok()?;
+        let firmware = crate::amdgpu_atom_fwinfo::parse(tables.table_slice(4)?).ok()?;
+        let base = firmware.bios_scratch_reg_startaddr;
+        let at = (u64::from(base) + 4) * 4;
+        if base == 0 || at.checked_add(4)? > gpu.regs.len {
+            return None;
+        }
+        let value = cap.invoke(Scratch(&gpu.regs, at)).ok()?;
+        (value != u32::MAX).then_some((value >> 16) as u8)
+    });
+    let memory = bios
+        .and_then(boot_mclk_10khz)
+        .filter(|&v| v != 0)
+        .map(|v| (u64::from(v) * 10, u64::from(v) * 10));
+    let pcie = (|| {
+        let read = cap.derive::<narf_capabilities::Read>().ok()?;
+        let endpoint = narf_bus::pci_express::read_status(&read, device).ok()?;
+        let narf_bus::BusAddr::Pcie(mut address) = device.addr else {
+            return None;
+        };
+        let devices = narf_bus::snapshot();
+        // Follow immediate upstream bridges, skipping switches inside an AMD
+        // dGPU, as amdgpu_device_partner_bandwidth does. Never use Link Status
+        // (it can reflect an idle downshift) for the maximum-capability query.
+        for _ in 0..256 {
+            let mut bridges = devices.iter().filter(|bridge| {
+                let narf_bus::BusAddr::Pcie(a) = bridge.addr else {
+                    return false;
+                };
+                if a.segment != address.segment || bridge.id.class >> 8 != 0x0604 {
+                    return false;
+                }
+                narf_bus::pci::read_config32(cap, bridge, 0x18)
+                    .ok()
+                    .is_some_and(|buses| ((buses >> 8) & 255) == u32::from(address.bus))
+            });
+            let bridge = bridges.next()?;
+            if bridges.next().is_some() {
+                return None;
+            }
+            let narf_bus::BusAddr::Pcie(parent) = bridge.addr else {
+                return None;
+            };
+            if parent.bus >= address.bus {
+                return None;
+            }
+            if bridge.id.vendor != crate::amdgpu::AMD_VENDOR {
+                let partner = narf_bus::pci_express::read_status(&read, bridge).ok()?;
+                return crate::amdgpu_rdna2::metadata::pcie(endpoint.link_caps, partner.link_caps);
+            }
+            address = parent;
+        }
+        None
+    })();
+    publish_rdna2_board(module, pcie, memory);
+}
+
+/// Live RDNA2 register reads sleep for GC power and the retained owner.
+/// Other INFO queries use the ordinary pure snapshot dispatcher.
+pub(crate) async fn dispatch_live(card: u32, cmd: u32, arg: usize) -> Option<Result<u64, FsError>> {
+    if drm_uapi::ioc_nr(cmd) != drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_INFO {
+        return None;
+    }
+    if crate::amdgpu_navi22_cs::drm_card() != Some(card) {
+        return None;
+    }
+    let snap = snapshot()?;
+    if !answers_navi22(&snap) {
+        return None;
+    }
+    // SAFETY: same bounded ioctl copy as dispatch_for.
+    let bytes = match unsafe { crate::drm_ioctl_bridge::copy_in(arg, 32) } {
+        Ok(bytes) => bytes,
+        Err(error) => return Some(Err(error)),
+    };
+    if u32::from_le_bytes(bytes[12..16].try_into().unwrap()) != uapi::AMDGPU_INFO_READ_MMR_REG {
+        return None;
+    }
+    Some(
+        async {
+            let pointer = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+            let size = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+            if pointer == 0 || size == 0 {
+                return Err(FsError::InvalidData);
+            }
+            let payload = core::array::from_fn(|i| {
+                u32::from_le_bytes(bytes[16 + i * 4..20 + i * 4].try_into().unwrap())
+            });
+            crate::amdgpu_rdna2_mmr::validate(payload)?;
+            let _power = crate::amdgpu_navi22_gfxoff::Reference::acquire()
+                .await
+                .map_err(|_| FsError::NoDevice)?;
+            let owner = crate::amdgpu_navi22_platform::owner().await;
+            let boot = owner.as_ref().ok_or(FsError::NoDevice)?;
+            let reply = boot.read_mmr(payload, snap.navi22.topology.map(|t| t.gb_addr_config))?;
+            // SAFETY: nonzero user pointer, bounded by the caller's return_size;
+            // copy_out performs SMAP bracketing and address validation.
+            unsafe {
+                crate::drm_ioctl_bridge::copy_out(
+                    pointer as usize,
+                    &reply[..reply.len().min(size)],
+                )?;
+            }
+            Ok(0)
+        }
+        .await,
+    )
 }

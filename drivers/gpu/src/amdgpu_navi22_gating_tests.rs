@@ -11,6 +11,7 @@ fn abs(reg: Reg) -> u32 {
         + match reg.block {
             Block::Gc0 => 0x1260,
             Block::Gc1 => 0xa000,
+            Block::Gc2 => 0x1c000,
             Block::Mmhub => 0x1a000,
             Block::Athub => 0xc00,
             Block::Hdp => 0xf20,
@@ -108,6 +109,8 @@ fn engine() -> Engine<Fake> {
         io: Fake::new(),
         authority: Cap::bootstrap(),
         cg_flags: NAVY_FLOUNDER_CG,
+        sdma_count: 2,
+        rom_force_on: true,
         in_safe_mode: false,
         state: State::Idle,
     }
@@ -389,4 +392,96 @@ fn navi22_clock_gating_optional_flags_follow_linux() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi22-gating",
     navi22_clock_gating_optional_flags_follow_linux
+);
+
+fn rdna2_gating_all_profiles_and_discovered_engines() -> TestResult {
+    use crate::amdgpu_discovery as ip;
+    for profile in crate::amdgpu_rdna2::PROFILES {
+        for count in 1..=4 {
+            let mut e = engine();
+            e.cg_flags = profile_flags(profile).0;
+            e.sdma_count = count;
+            e.rom_force_on = matches!(profile.asic, "navi22" | "navi24");
+            e.io.regs.extend([
+                (0x1c01b, 0x100),
+                (0x1c41b, 0x100),
+                (0x1c01a, 0x100),
+                (0x1c41a, 0x100),
+            ]);
+            if run(e.set_clockgating(true, ALL)).is_err()
+                || run(e.set_clockgating(false, ALL)).is_err()
+                || e.io.unexpected
+            {
+                return TestResult::Fail("RDNA2 gate/ungate sequence");
+            }
+            for (i, address) in [0x127b, 0x187b, 0x1c01b, 0x1c41b].iter().enumerate() {
+                if e.io.reads.contains(address) != (i < count) {
+                    return TestResult::Fail("gating touched an absent SDMA or missed an engine");
+                }
+            }
+            if e.io.reads.contains(&0x168e4) != e.rom_force_on || e.io.reads.contains(&0x168e3) {
+                return TestResult::Fail("wrong SMUIO ROM backend");
+            }
+            let mut gpu = crate::amdgpu_cp_navi22::tests::rdna2_gpu(profile, profile.pci_ids[0]);
+            for b in &mut gpu.ip_blocks {
+                if b.hw_id == ip::HW_ID_MP1 {
+                    (b.major, b.minor, b.revision) = profile.psp_version;
+                }
+            }
+            let gc = gpu
+                .ip_blocks
+                .iter_mut()
+                .find(|b| b.hw_id == ip::HW_ID_GC)
+                .unwrap();
+            gc.num_bases = 3;
+            let sdma = *gpu
+                .ip_blocks
+                .iter()
+                .find(|b| b.hw_id == ip::HW_ID_SDMA0)
+                .unwrap();
+            for i in 1..count {
+                let mut b = sdma;
+                b.instance = i as u8;
+                gpu.ip_blocks.push(b);
+            }
+            for (id, base) in [(ip::HW_ID_MMHUB, 0x1a000), (ip::HW_ID_ATHUB, 0xc00)] {
+                let mut b = sdma;
+                b.hw_id = id;
+                b.instance = 0;
+                (b.major, b.minor, b.revision) = (2, 1, 0);
+                b.base_addrs[0] = base;
+                gpu.ip_blocks.push(b);
+            }
+            let mut smuio = sdma;
+            smuio.hw_id = ip::HW_ID_SMUIO;
+            smuio.instance = 0;
+            (smuio.major, smuio.minor, smuio.revision) =
+                (11, 0, if e.rom_force_on { 6 } else { 3 });
+            smuio.base_addrs[0] = 0x16800;
+            gpu.ip_blocks.push(smuio);
+            // SAFETY: inert maps, constructor must perform no I/O.
+            let owner = unsafe { Gating::new(&gpu, Cap::bootstrap()) };
+            if owner
+                .as_ref()
+                .map(|g| (g.engine.sdma_count, g.engine.rom_force_on))
+                != Ok((count, e.rom_force_on))
+            {
+                return TestResult::Fail("family gating constructor rejected discovery");
+            }
+            gpu.ip_blocks
+                .iter_mut()
+                .find(|b| b.hw_id == ip::HW_ID_MP1)
+                .unwrap()
+                .revision = 255;
+            // SAFETY: malformed discovery is refused before any register access.
+            if unsafe { Gating::new(&gpu, Cap::bootstrap()) }.is_ok() {
+                return TestResult::Fail("foreign MP1 accepted for gating");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_gating_all_profiles_and_discovered_engines
 );

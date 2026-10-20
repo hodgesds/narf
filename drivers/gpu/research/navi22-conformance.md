@@ -133,3 +133,10 @@ marked `n/a` with a reason, 0 unmapped. Mismatches found: `ENUM_ID_MASK` and
 records, and all twelve imported payloads are byte-identical to
 `/lib/firmware`.
 `navy_flounder_dmcub.bin` is a symlink to `beige_goby_dmcub.bin` there.
+Since linux-firmware 20260916, `navy_flounder_ta.bin` and `_vcn.bin` are also
+aliases of the `beige_goby` blobs, and `_sdma.bin` changed (0x50 -> 0x54).
+`xtask import-firmware` now follows symlinks that resolve to regular files
+(as Linux `request_firmware` does), importing each alias under its own name;
+it used to skip them, which left a stale earlier import in place (or no file
+after `--clean`). Re-import after a linux-firmware upgrade before running the
+byte-identity check.

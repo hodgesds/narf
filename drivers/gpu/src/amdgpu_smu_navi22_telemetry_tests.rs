@@ -38,13 +38,14 @@ fn table(layout: Layout) -> Vec<u8> {
             b[130] = 3; // PcieRate
             b[131] = 6; // PcieWidth
         }
-        Layout::V2 => {
+        Layout::V2 | Layout::V3 => {
             put32(&mut b, 96, 77); // AccCnt
             b[100 + 2] = 12; // ThrottlingPercentage[TEMP_HOTSPOT]
             b[100 + 13] = 1; // ThrottlingPercentage[PPT0]
             put16(&mut b, 122, 1350);
-            b[150] = 3;
-            b[151] = 6;
+            let pcie = if layout == Layout::V3 { 152 } else { 150 };
+            b[pcie] = 3;
+            b[pcie + 1] = 6;
         }
     }
     b
@@ -57,7 +58,7 @@ fn navi22_metrics_decode_both_linux_layouts() -> TestResult {
     {
         return TestResult::Fail("MP1 11.0.11 metrics version threshold");
     }
-    for layout in [Layout::V1, Layout::V2] {
+    for layout in [Layout::V1, Layout::V2, Layout::V3] {
         let m = Metrics::decode(&table(layout), layout);
         let expected = Metrics {
             edge_milli: 51_000,
@@ -191,4 +192,40 @@ fn navi22_register_sensors_match_smu_v11_0() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/smu-navi22",
     navi22_register_sensors_match_smu_v11_0
+);
+
+fn rdna2_metrics_select_exact_asic_thresholds() -> TestResult {
+    use crate::amdgpu_rdna2::*;
+    for (profile, threshold, layout) in [
+        (&NAVI21, 0x3a4300, Layout::V2),
+        (&NAVI21, 0x3a4900, Layout::V3),
+        (&NAVI22, 0x412d00, Layout::V2),
+        (&NAVI23, 0x3b2300, Layout::V2),
+        (&NAVI24, 0x491100, Layout::V2),
+    ] {
+        let before = if layout == Layout::V3 {
+            Layout::V2
+        } else {
+            Layout::V1
+        };
+        if Layout::for_profile(profile, threshold - 1) != before
+            || Layout::for_profile(profile, threshold) != layout
+        {
+            return TestResult::Fail("ASIC-specific metrics threshold");
+        }
+        let decoded = Metrics::decode(&table(layout), layout);
+        if decoded.fan_rpm != 1350
+            || decoded.pcie_rate != 3
+            || decoded.pcie_width != 6
+            || decoded.hotspot_milli != 63000
+            || decoded.throttlers != (1 << 2) | (1 << 13)
+        {
+            return TestResult::Fail("RDNA2 metrics union layout");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_metrics_select_exact_asic_thresholds
 );

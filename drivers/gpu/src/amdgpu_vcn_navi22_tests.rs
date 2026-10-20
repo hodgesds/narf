@@ -1298,6 +1298,25 @@ fn vcn_navi22_client_jobs_frame_flush_and_throttle() -> TestResult {
     {
         return TestResult::Fail("VMID 0 or empty media job accepted");
     }
+    // All-ones is a valid sequence on every media fence. JPEG retains zero
+    // at wrap so its two seq % 2 IB slots continue alternating.
+    for ring in [
+        MediaRing::Dec,
+        MediaRing::Enc(0),
+        MediaRing::Enc(1),
+        MediaRing::Jpeg,
+    ] {
+        let (_, map, _, at) = e.client_ring(ring).unwrap();
+        e.hw.io.put(mc(map, at), u32::MAX);
+        if e.client_fences(ring).map(|f| f.0) != Ok(u32::MAX) {
+            return TestResult::Fail("media all-ones fence mistaken for device loss");
+        }
+    }
+    e.jpeg.as_mut().unwrap().ring.seq = u32::MAX;
+    let copied = alloc::vec![0x6000_0000, 0, 0x4000, 7];
+    if e.submit_client(&client, MediaRing::Jpeg, vm(true), &user, &[copied]) != Ok(0) {
+        return TestResult::Fail("JPEG wrap lost alternating kernel IB slots");
+    }
     TestResult::Pass
 }
 kernel_test_in!(

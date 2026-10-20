@@ -129,6 +129,7 @@ mod abi_async_tests;
 mod abi_bpf_btf_tests;
 mod abi_bpf_tests;
 mod abi_creds_tests;
+mod abi_device_mmap_tests;
 mod abi_drm_prime_tests;
 mod abi_fdio2_tests;
 mod abi_fdio_tests;

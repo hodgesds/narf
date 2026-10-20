@@ -462,7 +462,7 @@ impl VmidManager {
     /// Whether `ticket` belongs to `ring` and needs nothing from another
     /// ring: same-ring jobs run in order, so they never block.
     fn settled(ticket: u64, ring: u32, done: &dyn Fn(u64) -> bool) -> bool {
-        ticket == 0 || (ticket >> 32) as u32 == ring || done(ticket)
+        ticket == 0 || ((ticket & !(1 << 63)) >> 32) as u32 == ring || done(ticket)
     }
 
     /// The grant for `req`, or None to wait for a running job. `done`
@@ -505,17 +505,28 @@ impl VmidManager {
 
     /// Record that job `ticket` runs `req` under `grant` (from `grab`).
     pub fn commit(&mut self, req: GrabRequest, grant: Grant, ticket: u64) {
+        self.commit_with_flush(req, grant, ticket, ticket);
+    }
+    /// Keep VM programming completion separate from the job's final fence.
+    /// Bit 63 distinguishes a dedicated VM writeback from a job ticket.
+    pub fn commit_with_flush(
+        &mut self,
+        req: GrabRequest,
+        grant: Grant,
+        ticket: u64,
+        vm_fence: u64,
+    ) {
         let index = grant.vmid - self.first;
         let Some(id) = self.ids.get_mut(usize::from(index)) else {
             return;
         };
         if grant.needs_flush {
             id.flushed_updates = req.tlb_seq;
-            id.last_flush = ticket;
+            id.last_flush = vm_fence;
         }
         if grant.map_pasid {
             id.pasid = req.pasid;
-            id.pasid_mapping = ticket;
+            id.pasid_mapping = vm_fence;
         }
         id.owner = req.owner;
         id.pd_addr = req.pd_addr;

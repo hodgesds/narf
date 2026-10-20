@@ -71,8 +71,8 @@ sh verification/data/musl-demo/REGEN_mesa_amd.sh
   - `gallium-va=enabled`, `video-codecs=all` (as Alpine): radeonsi's VA-API
     driver (`/usr/lib/dri/radeonsi_drv_video.so`, against Alpine's libva)
     and RADV's Vulkan video (`VK_KHR_video_decode/encode_*`) over the VCN
-    3.0 decode/encode and JPEG 3.0 rings the kernel exposes behind
-    `amdgpu.navi22_accel` (`amdgpu_vcn_navi22_cs`).
+    3.0 decode/encode and JPEG 3.0 rings the kernel exposes while
+    `accel` is on (the default; `amdgpu_vcn_navi22_cs`).
   - Not built: rusticl, zink, VDPAU, other vendors' drivers.
 - **Also built:** `mesa_amd_probe` and `narf_ioctl_trace.so`, against the
   just-installed libraries.
@@ -274,7 +274,7 @@ Run from the image (`chroot_run /bin/busybox sh …`), capturing serial:
 8. Repeat 3–5 with `LD_PRELOAD=/usr/lib/narf/narf_ioctl_trace.so` and diff
    against the Linux reference trace for the same Mesa build.
 
-9. Video (needs `amdgpu.navi22_accel`; the boot log shows
+9. Video (needs `accel`, on unless `amdgpu.rdna2_accel=0`; the boot log shows
    `amdgpu: navi22 media rings for clients 0xf`): `LIBVA_DRIVER_NAME=radeonsi
    mesa_amd_probe va` — one node with `vendor="Mesa Gallium driver … for AMD
    Radeon RX 6750 XT"` and H264High/HEVCMain/HEVCMain10/VP9Profile0/
@@ -291,6 +291,73 @@ Run from the image (`chroot_run /bin/busybox sh …`), capturing serial:
 Failure handling to verify on hardware: kill a client mid-submission
 (context teardown), `AMD_DEBUG=` off/`RADV_DEBUG=hang` on a hang, and that a
 rejected CS returns an error to Mesa rather than wedging the ring.
+
+## RX 6000 boot options
+
+Every functionally complete RX 6000 feature is on by default; none has run on
+silicon yet, so each has an off switch for bring-up:
+
+| Feature | Default | Off / on |
+| --- | --- | --- |
+| Native HDMI/DP display (retires the GOP) | on | `amdgpu.native_display=0` |
+| Native client submission (radeonsi/RADV, VCN/JPEG) | on | `amdgpu.rdna2_accel=0` |
+| DCN3.0 hardware cursor | on | `amdgpu.rdna2_hw_cursor=0` |
+| Power saving (GFXOFF, CG, hub PG, memory/fabric DPM, deep sleep, PMFW watermarks) | all requested | `amdgpu.rdna2_pg=none`, or a list such as `amdgpu.rdna2_pg=gfxoff,cg` |
+| Multi-display (secondary CRTCs) | off | `amdgpu.rdna2_multi` |
+
+Multi-display stays opt-in because secondary CRTCs light with static
+scanouts: they cannot present or deliver vblank yet. Each requested power
+feature is still refused unless its display admission (DML p-state/stutter
+support, watermarks, clock floors) and driver prerequisites hold; the boot log
+names every refusal. If native modeset fails after the GOP stream is retired
+the screen stays dark: reboot with `amdgpu.native_display=0`. There is no
+automatic GPU recovery on a hang (mode1 recovery remains opt-in), so a hang
+under `accel` or power saving needs a reboot with that feature off.
+
+Switches take a bare flag or `=1|on` and `=0|off`; other values keep the
+default. The old `amdgpu.navi22_*` spellings remain supported and the
+canonical name wins. An explicit `rdna2_pg` value takes precedence over
+`navi22_pg`, including an empty or invalid value; invalid lists enable
+nothing.
+
+## RX 6000 software behavior
+
+Device-info replies report VBIOS memory type/bus width and timestamp frequency,
+common GPU/slot PCIe capabilities, Linux's per-ASIC Infinity Cache sizes, and
+SMU memory-clock limits (boot MCLK while UCLK DPM is disabled). Missing board
+metadata stays unknown. Live register queries use Linux's allow-list and wait
+for the retained GPU owner with GC powered.
+
+Native submissions use FIFO ring admission and IRQ-driven fence/VMID waits.
+VM programming has a separate completion writeback before the client IB;
+its completion cannot release a VMID whose job is still running. Reset
+invalidates old submitters using the fence generation established before
+restart.
+
+Ordinary VRAM-preferred allocations can fall back to GTT when VRAM is full,
+while retaining their requested preference; discardable VRAM-only allocations
+keep stricter placement requirements.
+GEM can evict visible-VRAM buffers, including same-card PRIME/shared buffers,
+to GTT and promote them back, preserving data. GPU-mapped buffers move under
+card admission exclusion after their VMs' jobs and reservation fences settle;
+existing PTEs are rewritten and TLB sequences advance before submissions
+resume. Strict VRAM allocation retries can reclaim mapped buffers, and CS
+applies listed buffers' placement preferences when possible. Cancellation
+while waiting leaves mappings unchanged.
+Published GEM/PRIME CPU mappings no longer pin placement: a move revokes every
+CPU alias in all known address spaces, copies under the freeze, and rebinds
+the same virtual addresses and attributes to the new backing (or restores the
+old one on failure). Unpublished mappings, deferred CPU user-fence writes,
+legacy raw leases and aliases in unknown address spaces (a fork child not yet
+visible) still pin backing; device mappings are `VM_SPECIAL`-equivalent and
+never become mlocked. Shared handles, exported fds and BO lists retain
+identity without pinning placement.
+RX6000 invisible VRAM now supports ordered SDMA clearing, eviction to GTT and
+NO_CPU_ACCESS promotion back through a reserved BAR staging window. Transfers
+retain their allocations across cancellation and replay after recovery; only
+real completion permits reuse or user access. Failed copies preserve existing
+PTEs and backing. NO_CPU_ACCESS remains enforced for GEM/PRIME CPU mmap even
+after moving to GTT.
 
 ## Open items
 

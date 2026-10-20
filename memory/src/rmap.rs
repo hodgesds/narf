@@ -330,6 +330,38 @@ impl RmapTable {
         }
     }
 
+    /// Fallible [`Self::prepare_insert`]: grow or rebuild before an insert
+    /// whose caller must not later enter the allocator.
+    fn try_prepare_insert(&mut self) -> Result<(), ()> {
+        let capacity = if self.slots.is_empty() {
+            RMAP_INITIAL_CAPACITY
+        } else {
+            let occupied_after_insert = self.len + self.tombstones + 1;
+            let load_ceiling = self.slots.len() - self.slots.len() / 4;
+            if occupied_after_insert < load_ceiling {
+                return Ok(());
+            }
+            if self.len + 1 < self.slots.len() / 2 {
+                self.slots.len()
+            } else {
+                self.slots.len().checked_mul(2).ok_or(())?
+            }
+        };
+        let slots = Self::try_empty_slots(capacity).ok_or(())?;
+        drop(self.replace_slots(slots));
+        Ok(())
+    }
+
+    /// Insert after a successful [`Self::try_prepare_insert`]; never grows.
+    fn insert_prepared(&mut self, key: u64, owners: OwnerList) {
+        let index = self.insertion_slot(key);
+        if matches!(self.slots[index], RmapSlot::Tombstone) {
+            self.tombstones -= 1;
+        }
+        self.slots[index] = RmapSlot::Occupied { key, owners };
+        self.len += 1;
+    }
+
     fn minimum_capacity(len: usize) -> usize {
         let mut capacity = RMAP_INITIAL_CAPACITY;
         while len.saturating_add(1) >= capacity - capacity / 4 {
@@ -371,12 +403,7 @@ impl RmapTable {
 
     fn insert(&mut self, key: u64, owners: OwnerList) {
         self.prepare_insert();
-        let index = self.insertion_slot(key);
-        if matches!(self.slots[index], RmapSlot::Tombstone) {
-            self.tombstones -= 1;
-        }
-        self.slots[index] = RmapSlot::Occupied { key, owners };
-        self.len += 1;
+        self.insert_prepared(key, owners);
     }
 
     fn remove(&mut self, key: u64) {
@@ -418,9 +445,11 @@ pub fn add(phys: PhysAddr, root: PhysAddr, va: VirtAddr) {
     let mut g = RMAP[shard(key)].map.lock();
     let map = g.get_or_insert_with(RmapTable::new);
     if let Some(list) = map.get_mut(key) {
-        let was_empty = list.len() == 0;
+        // Only an unreserved empty row is a counted reuse shell; a prepared
+        // empty row belongs to its in-flight publisher instead.
+        let was_shell = list.len() == 0 && list.reserved == 0;
         list.add(owner);
-        if was_empty {
+        if was_shell {
             debug_assert!(map.retained_empty != 0);
             map.retained_empty -= 1;
         }
@@ -446,7 +475,58 @@ pub(crate) fn try_reserve_owner_slots(phys: PhysAddr, additional: usize) -> Resu
     list.try_reserve(additional)
 }
 
-/// Allocation-free counterpart to [`try_reserve_owner_slots`].
+/// Fallibly prepare `additional` owner slots for any frame, including one with
+/// no row yet or only a retained empty shell.
+///
+/// Relocation into a fresh destination uses this before revoking a source
+/// leaf: neither the table nor the owner `Vec` may grow afterwards. A
+/// prepared empty row is not a reuse shell (it is excluded from
+/// `retained_empty`) and survives ordinary removal until the matching
+/// [`add_reserved`] or [`release_reserved_owner_slots`].
+pub(crate) fn try_prepare_owner_slots(phys: PhysAddr, additional: usize) -> Result<(), ()> {
+    let key = phys.raw();
+    if key == 0 || additional == 0 {
+        return Ok(());
+    }
+    let mut g = RMAP[shard(key)].map.lock();
+    let map = g.get_or_insert_with(RmapTable::new);
+    if let Some(list) = map.get_mut(key) {
+        if list.len() != 0 {
+            return list.try_reserve(additional);
+        }
+        let was_shell = list.reserved == 0;
+        let mut owners = match core::mem::replace(&mut list.owners, Owners::Empty) {
+            Owners::Many(owners) => owners,
+            _ => Vec::new(),
+        };
+        let promised = list.reserved.checked_add(additional).ok_or(())?;
+        if owners.try_reserve_exact(promised).is_err() {
+            list.owners = Owners::Many(owners);
+            return Err(());
+        }
+        list.owners = Owners::Many(owners);
+        list.reserved = promised;
+        if was_shell {
+            debug_assert!(map.retained_empty != 0);
+            map.retained_empty -= 1;
+        }
+        return Ok(());
+    }
+    let mut owners = Vec::new();
+    owners.try_reserve_exact(additional).map_err(|_| ())?;
+    map.try_prepare_insert()?;
+    map.insert_prepared(
+        key,
+        OwnerList {
+            owners: Owners::Many(owners),
+            reserved: additional,
+        },
+    );
+    Ok(())
+}
+
+/// Allocation-free counterpart to [`try_reserve_owner_slots`] and
+/// [`try_prepare_owner_slots`].
 ///
 /// Panics if the caller did not reserve capacity or if the frame's existing
 /// rmap authority disappeared between reservation and commit.
@@ -481,6 +561,16 @@ pub(crate) fn release_reserved_owner_slots(phys: PhysAddr, count: usize) {
         "rmap rollback released more slots than it reserved"
     );
     list.reserved -= count;
+    if list.len() == 0 && list.reserved == 0 {
+        // The prepared row became an ordinary empty key: count it as a
+        // bounded reuse shell, or retire it like a last-owner removal.
+        let map = g.as_mut().expect("reserved rmap table disappeared");
+        if map.retained_empty < RETAINED_EMPTY_KEYS_PER_SHARD {
+            map.retained_empty += 1;
+        } else {
+            map.remove(key);
+        }
+    }
 }
 
 /// Drop the `(root, va)` mapping of `phys`. The last-owner key is either kept
@@ -491,30 +581,8 @@ pub fn remove(phys: PhysAddr, root: PhysAddr, va: VirtAddr) {
     if key == 0 {
         return;
     }
-    let owner = Owner { root, va };
     let shard_index = shard(key);
-    let shrink_target = {
-        let mut g = RMAP[shard_index].map.lock();
-        g.as_mut().and_then(|map| {
-            let became_empty = if let Some(list) = map.get_mut(key) {
-                let was_nonempty = list.len() != 0;
-                list.remove(owner);
-                was_nonempty && list.len() == 0 && list.reserved == 0
-            } else {
-                false
-            };
-            if became_empty {
-                if map.retained_empty < RETAINED_EMPTY_KEYS_PER_SHARD {
-                    map.retained_empty += 1;
-                } else {
-                    map.remove(key);
-                }
-                map.shrink_target()
-            } else {
-                None
-            }
-        })
-    };
+    let shrink_target = remove_owner(key, Owner { root, va });
 
     // Allocate with the IRQ-safe shard lock released. If allocation fails,
     // leave the valid high-water table alone; a later removal can retry.
@@ -543,6 +611,41 @@ pub fn remove(phys: PhysAddr, root: PhysAddr, va: VirtAddr) {
     // shard lock just like the allocation above.
     drop(slots);
     drop(old);
+}
+
+/// Retire one owner without the opportunistic table shrink, so it never
+/// allocates. Shared-alias relocation calls this while every affected region
+/// table is locked; a later ordinary [`remove`] may contract the table.
+pub(crate) fn remove_without_shrink(phys: PhysAddr, root: PhysAddr, va: VirtAddr) {
+    let key = phys.raw();
+    if key != 0 {
+        let _ = remove_owner(key, Owner { root, va });
+    }
+}
+
+/// Remove `owner` under the shard lock, returning the contraction target the
+/// removal made available.
+fn remove_owner(key: u64, owner: Owner) -> Option<usize> {
+    let mut g = RMAP[shard(key)].map.lock();
+    g.as_mut().and_then(|map| {
+        let became_empty = if let Some(list) = map.get_mut(key) {
+            let was_nonempty = list.len() != 0;
+            list.remove(owner);
+            was_nonempty && list.len() == 0 && list.reserved == 0
+        } else {
+            false
+        };
+        if became_empty {
+            if map.retained_empty < RETAINED_EMPTY_KEYS_PER_SHARD {
+                map.retained_empty += 1;
+            } else {
+                map.remove(key);
+            }
+            map.shrink_target()
+        } else {
+            None
+        }
+    })
 }
 
 /// Allocation-free exact-owner membership check.
@@ -696,6 +799,17 @@ pub fn try_for_each_tracked_frame(mut f: impl FnMut(PhysAddr) -> core::ops::Cont
     }
 }
 
+/// Test-only: owner slots currently promised to in-flight publishers.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __reserved_for_test(phys: PhysAddr) -> usize {
+    RMAP[shard(phys.raw())]
+        .map
+        .lock()
+        .as_ref()
+        .and_then(|map| map.get(phys.raw()))
+        .map_or(0, |list| list.reserved)
+}
+
 /// Test-only: clear all rmap shards so a test's entries never leak into another
 /// test or the live kernel.
 #[doc(hidden)]
@@ -711,7 +825,8 @@ pub fn __reset_for_test() {
 mod tests {
     use super::{
         __reset_for_test, add, add_reserved, for_each_owner, for_each_tracked_frame, move_owner,
-        owner_count, remove, shard, try_reserve_owner_slots, Owner, OwnerList, Owners, RmapTable,
+        owner_count, release_reserved_owner_slots, remove, remove_without_shrink, shard,
+        try_prepare_owner_slots, try_reserve_owner_slots, Owner, OwnerList, Owners, RmapTable,
         RETAINED_EMPTY_KEYS_PER_SHARD, RMAP,
     };
     use crate::{PhysAddr, VirtAddr};
@@ -901,6 +1016,64 @@ mod tests {
         }
     }
     kernel_test_in!("memory/rmap", smoke_rmap_reservation_survives_racing_add);
+
+    fn retained_empty(phys: PhysAddr) -> usize {
+        RMAP[shard(phys.raw())]
+            .map
+            .lock()
+            .as_ref()
+            .map_or(0, |table| table.retained_empty)
+    }
+
+    /// Relocation destinations may have no row or only a reuse shell. Both
+    /// are prepared fallibly, consumed without allocation, and a released
+    /// preparation returns to exact shell accounting.
+    fn smoke_rmap_prepare_fresh_and_shell_destinations() -> TestResult {
+        __reset_for_test();
+        let fresh = PhysAddr::new(0x34_0000);
+        let shell = PhysAddr::new(0x34_0000 + (64 << 12));
+        let root = PhysAddr::new(0x1000);
+        let (v0, v1) = (VirtAddr::new(0x4000_0000), VirtAddr::new(0x5000_0000));
+        let result = (|| {
+            if try_prepare_owner_slots(fresh, 2).is_err() || owner_count(fresh) != 0 {
+                return TestResult::Fail("fresh rmap destination was not prepared");
+            }
+            // A prepared empty row is neither a shell nor removable.
+            remove(fresh, root, v0);
+            add_reserved(fresh, root, v0);
+            add_reserved(fresh, root, v1);
+            if owner_count(fresh) != 2 || retained_empty(fresh) != 0 {
+                return TestResult::Fail("prepared rmap row lost capacity or miscounted");
+            }
+            // Same shard: turn `shell` into a counted reuse shell.
+            add(shell, root, v0);
+            remove(shell, root, v0);
+            if retained_empty(shell) != 1 {
+                return TestResult::Fail("emptied rmap row was not a counted shell");
+            }
+            if try_prepare_owner_slots(shell, 1).is_err() || retained_empty(shell) != 0 {
+                return TestResult::Fail("preparing a shell did not uncount it");
+            }
+            // An ordinary add on a prepared row must not uncount again.
+            add(shell, root, v1);
+            remove_without_shrink(shell, root, v1);
+            release_reserved_owner_slots(shell, 1);
+            if retained_empty(shell) != 1 || owner_count(shell) != 0 {
+                return TestResult::Fail("released preparation did not restore its shell");
+            }
+            add(shell, root, v0);
+            if retained_empty(shell) != 0 || owner_count(shell) != 1 {
+                return TestResult::Fail("restored shell was not reusable");
+            }
+            TestResult::Pass
+        })();
+        __reset_for_test();
+        result
+    }
+    kernel_test_in!(
+        "memory/rmap",
+        smoke_rmap_prepare_fresh_and_shell_destinations
+    );
 
     fn smoke_rmap_frames_independent() -> TestResult {
         __reset_for_test();

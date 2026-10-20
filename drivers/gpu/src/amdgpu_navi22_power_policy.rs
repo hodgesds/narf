@@ -1,4 +1,4 @@
-//! Navi22 power-saving policy. Linux enables GFXOFF, GC/hub clock and
+//! Discrete RDNA2 power-saving policy. Linux enables GFXOFF, GC/hub clock and
 //! power gating, memory/fabric DPM and deep sleep on sienna_cichlid by
 //! default (`amdgpu_pp_feature_mask`, `adev->cg_flags`/`pg_flags` in nv.c,
 //! `sienna_cichlid_get_allowed_feature_mask`), but on that platform DC has
@@ -8,13 +8,15 @@
 //! This module states, as types, what each feature needs from display
 //! admission and from the driver.
 //!
-//! Nothing is enabled by default: `Policy::new()`/`Default` disable every
-//! feature and `request` refuses everything (`HARDWARE_VALIDATED` is false).
-//! The only way a gate opens is [`Policy::request_opted_in`] with an
-//! explicit [`OptIn`] parsed from the `amdgpu.navi22_pg=` boot argument; it
-//! still enforces every display-admission and driver prerequisite, and only
-//! waives the hardware-validation facts (`HARDWARE_VALIDATED`,
-//! `recovery_validated`) the operator accepted by opting in. The sequences
+//! `Policy::new()`/`Default` disable every feature and `request` refuses
+//! everything (`HARDWARE_VALIDATED` is false). A gate opens only through
+//! [`Policy::request_opted_in`] with an [`OptIn`] from `amdgpu.rdna2_pg=`;
+//! when that argument is absent the boot uses
+//! `amdgpu_rdna2::options::DEFAULT_POWER_SAVING` (every feature) as an
+//! implicit opt-in, and `amdgpu.rdna2_pg=none` opts out. Either way every
+//! display-admission and driver prerequisite still applies; only the
+//! hardware-validation facts (`HARDWARE_VALIDATED`, `recovery_validated`)
+//! are waived. The sequences
 //! that then run live in `amdgpu_navi22_gating` (clock gating),
 //! `amdgpu_navi22_gfxoff` (GFXOFF), the SMU owner (feature bits) and
 //! `amdgpu_dcn30_watermarks` (the PMFW watermark table).
@@ -176,7 +178,7 @@ pub const fn requirement(feature: Feature) -> Requirement {
     }
 }
 
-/// Features the operator opted into with `amdgpu.navi22_pg=a,b,...`
+/// Features the operator opted into with `amdgpu.rdna2_pg=a,b,...`
 /// (tokens `gfxoff`, `cg`, `gfxcg`, `hubpg`, `memdpm`, `fclkdpm`, `ds`, and
 /// `wm` for the PMFW watermark table). Absent or unparsable: nothing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
