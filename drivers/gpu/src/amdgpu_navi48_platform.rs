@@ -2715,6 +2715,10 @@ fn publish_outputs() {
 /// move; hide with an off-screen move. Never waits for the owner.
 fn scanout_cursor(image: (u32, u32, &[u32]), position: Option<(i32, i32)>) -> bool {
     let pipe = CURSOR_PIPE.load(Ordering::Acquire);
+    // A DRM cursor plane drives this display's cursor.
+    if drm_owns_cursor(pipe) {
+        return true;
+    }
     let Some(mut owner) = OWNER.try_lock() else {
         return true;
     };
@@ -2722,22 +2726,31 @@ fn scanout_cursor(image: (u32, u32, &[u32]), position: Option<(i32, i32)>) -> bo
         return true;
     };
     let (w, h, _) = image;
-    let shown = boot
-        .display_status(pipe)
-        .ok()
-        .flatten()
-        .and_then(|s| s.cursor)
-        .is_some_and(|c| c.pipe == pipe && (c.width, c.height) == (w, h));
+    // After DRM let go of the cursor the pipe holds DRM's image, whatever
+    // its size: upload the pointer again.
+    let stale = CONSOLE_CURSOR_STALE.load(Ordering::Acquire) & (1u8 << (pipe & 7)) != 0;
+    let shown = !stale
+        && boot
+            .display_status(pipe)
+            .ok()
+            .flatten()
+            .and_then(|s| s.cursor)
+            .is_some_and(|c| c.pipe == pipe && (c.width, c.height) == (w, h));
     // A failure quarantines the pipe in the owner; the pointer just stops.
-    let _ = match (shown, position) {
+    match (shown, position) {
         (false, None) => return true, // never shown: nothing to hide
-        // SAFETY: serialized retained owner; the platform excludes writers.
-        (true, at) => unsafe {
-            boot.move_display_cursor(pipe, at.unwrap_or((-(w as i32), -(h as i32))))
-        },
-        // SAFETY: as above.
-        (false, Some(at)) => unsafe { boot.set_display_cursor(pipe, image, at) },
-    };
+        (true, at) => {
+            // SAFETY: serialized retained owner; the platform excludes writers.
+            let _ =
+                unsafe { boot.move_display_cursor(pipe, at.unwrap_or((-(w as i32), -(h as i32)))) };
+        }
+        (false, Some(at)) => {
+            // SAFETY: as above.
+            if unsafe { boot.set_display_cursor(pipe, image, at) }.is_ok() {
+                CONSOLE_CURSOR_STALE.fetch_and(!(1u8 << (pipe & 7)), Ordering::AcqRel);
+            }
+        }
+    }
     true
 }
 
@@ -3799,6 +3812,231 @@ pub unsafe fn try_move_display_cursor(
     Some(unsafe { boot.move_display_cursor(pipe, position) })
 }
 
+// ── DRM cursor planes ────────────────────────────────────────────────
+//
+// A DRM commit of display k's cursor plane (amdgpu_dm_commit_cursors /
+// handle_cursor_update) sets what pipe k's hardware cursor shows; a task
+// converges the hardware to it under OWNER, as do monitor passes (after a
+// relight, as amdgpu_dm programs the cursor after the planes). It is a FAST
+// update: the cursor's attributes and position on every pipe of the
+// stream, nothing relit. While DRM drives a display's cursor the console's
+// pointer stays off it; on lastclose (`restore_displays`) DRM's cursor goes
+// off and the console's pointer is uploaded again.
+
+/// A DRM cursor plane's framebuffer as the hardware cursor shows it: its
+/// premultiplied ARGB8888 rows (at most 64x64), copied out of the BO.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CursorImage {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u32>,
+}
+
+/// One display's DRM cursor plane as last committed.
+struct DrmCursor {
+    /// The image it shows; None while the plane is off.
+    image: Option<Arc<CursorImage>>,
+    /// The image is not uploaded yet.
+    upload: bool,
+    /// CRTC_X/Y: the image's top-left on the CRTC (negative moves into the
+    /// hotspot, amdgpu_dm_plane_get_cursor_position).
+    position: (i32, i32),
+    /// A commit the hardware has not converged to; a task converges it.
+    dirty: bool,
+    running: bool,
+}
+impl DrmCursor {
+    const OFF: Self = Self {
+        image: None,
+        upload: false,
+        position: (0, 0),
+        dirty: false,
+        running: false,
+    };
+}
+static DRM_CURSORS: [narf_lib::sync::IrqSafeSpinLock<DrmCursor>; 4] =
+    [const { narf_lib::sync::IrqSafeSpinLock::new(DrmCursor::OFF) }; 4];
+/// Displays (by bit) whose cursor DRM drives: the console's stays off them.
+static DRM_CURSOR_OWNED: AtomicU8 = AtomicU8::new(0);
+/// Displays whose cursor DRM let go of: the console uploads its pointer
+/// again rather than moving DRM's image.
+static CONSOLE_CURSOR_STALE: AtomicU8 = AtomicU8::new(0);
+/// A position no pipe shows: the hardware cursor off
+/// (amdgpu_dm_plane_get_cursor_position's position.enable false).
+const CURSOR_OFF: (i32, i32) = (
+    -(crate::amdgpu_dcn401_otg::CURSOR_MAX as i32),
+    -(crate::amdgpu_dcn401_otg::CURSOR_MAX as i32),
+);
+
+/// Commit display `display`'s DRM cursor plane: `image` shown at
+/// `position`, or off (None). Never waits: the hardware converges in a
+/// task. False for a display there is none of.
+pub fn request_display_cursor(
+    display: u8,
+    image: Option<CursorImage>,
+    position: (i32, i32),
+) -> bool {
+    let Some(slot) = DRM_CURSORS.get(usize::from(display)) else {
+        return false;
+    };
+    DRM_CURSOR_OWNED.fetch_or(1 << display, Ordering::AcqRel);
+    CONSOLE_CURSOR_STALE.fetch_and(!(1 << display), Ordering::AcqRel);
+    let spawn = {
+        let mut c = slot.lock();
+        match image {
+            Some(image) => {
+                if c.image.as_deref() != Some(&image) {
+                    c.image = Some(Arc::new(image));
+                    c.upload = true;
+                }
+            }
+            None => c.image = None,
+        }
+        c.position = position;
+        c.dirty = true;
+        !core::mem::replace(&mut c.running, true)
+    };
+    if spawn {
+        narf_scheduler::spawn(drm_cursor_task(display));
+    }
+    true
+}
+
+/// Lastclose: DRM's cursors go off and the console's pointer returns.
+fn release_drm_cursors() {
+    let owned = DRM_CURSOR_OWNED.swap(0, Ordering::AcqRel);
+    for display in (0..DRM_CURSORS.len() as u8).filter(|d| owned & (1 << d) != 0) {
+        let spawn = {
+            let mut c = DRM_CURSORS[usize::from(display)].lock();
+            c.image = None;
+            c.upload = false;
+            c.dirty = true;
+            !core::mem::replace(&mut c.running, true)
+        };
+        if spawn {
+            narf_scheduler::spawn(drm_cursor_task(display));
+        }
+    }
+}
+
+/// Whether DRM drives display `pipe`'s cursor.
+fn drm_owns_cursor(pipe: u8) -> bool {
+    DRM_CURSOR_OWNED.load(Ordering::Acquire) & (1u8 << (pipe & 7)) != 0
+}
+
+async fn drm_cursor_task(display: u8) {
+    let slot = &DRM_CURSORS[usize::from(display)];
+    loop {
+        {
+            let mut c = slot.lock();
+            if !c.dirty {
+                c.running = false;
+                return;
+            }
+            c.dirty = false;
+        }
+        let mut owner = OWNER.lock().await;
+        if let Some(boot) = owner.as_mut() {
+            // SAFETY: serialized retained owner; the platform excludes
+            // other display writers while OWNER is held.
+            unsafe { converge_drm_cursor(boot, display) };
+        }
+    }
+}
+
+/// Every display whose cursor DRM drives, after a monitor pass (a relight
+/// starts its pipes without a cursor).
+/// # Safety
+/// As for `converge_drm_cursor`.
+unsafe fn converge_drm_cursors(boot: &mut boot::ColdBoot) {
+    let owned = DRM_CURSOR_OWNED.load(Ordering::Acquire);
+    for display in (0..DRM_CURSORS.len() as u8).filter(|d| owned & (1 << d) != 0) {
+        // SAFETY: forwarded.
+        unsafe { converge_drm_cursor(boot, display) };
+    }
+}
+
+/// What display `display`'s hardware cursor needs to show its DRM cursor
+/// plane, and doing it: handle_cursor_update's attributes (a new image, or
+/// none on the pipe) and position, or the cursor off.
+/// # Safety
+/// Serialized retained owner; exclude other display writers.
+unsafe fn converge_drm_cursor(boot: &mut boot::ColdBoot, display: u8) {
+    let slot = &DRM_CURSORS[usize::from(display)];
+    let (image, upload, position) = {
+        let mut c = slot.lock();
+        let snapshot = (c.image.clone(), c.upload, c.position);
+        c.upload = false;
+        snapshot
+    };
+    let current = boot
+        .display_status(display)
+        .ok()
+        .flatten()
+        .and_then(|s| s.cursor)
+        .filter(|c| c.pipe == display);
+    let size = image.as_deref().map(|i| (i.width, i.height));
+    // A failure quarantines the pipe in the owner; the cursor just stops.
+    let result = match drm_cursor_step(current, size, upload, position) {
+        CursorStep::Keep => Ok(()),
+        // SAFETY: the caller's obligations.
+        CursorStep::Hide => unsafe { boot.move_display_cursor(display, CURSOR_OFF) }.map(drop),
+        // SAFETY: as above.
+        CursorStep::Move => unsafe { boot.move_display_cursor(display, position) }.map(drop),
+        CursorStep::Upload => match image.as_deref() {
+            // SAFETY: as above.
+            Some(i) => unsafe {
+                boot.set_display_cursor(display, (i.width, i.height, &i.pixels), position)
+            }
+            .map(drop),
+            None => Ok(()),
+        },
+    };
+    if result.is_err() && upload {
+        // Not shown (the pipe not scanning out yet): the next converge
+        // uploads it.
+        slot.lock().upload = true;
+    }
+    if !drm_owns_cursor(display) {
+        CONSOLE_CURSOR_STALE.fetch_or(1 << display, Ordering::AcqRel);
+    }
+}
+
+/// One step of a hardware cursor towards a DRM cursor plane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CursorStep {
+    Keep,
+    Hide,
+    Move,
+    Upload,
+}
+
+/// The step from `current` (the pipe's programmed cursor) to a plane
+/// showing an image of `size` (None: off) at `position`, `upload` when the
+/// image is new: an image the pipe does not hold (none, another size, or a
+/// new one) is uploaded with its position, the one it holds is moved, and
+/// an off plane hides a visible cursor.
+fn drm_cursor_step(
+    current: Option<crate::amdgpu_dcn401_otg::CursorApplied>,
+    size: Option<(u32, u32)>,
+    upload: bool,
+    position: (i32, i32),
+) -> CursorStep {
+    match (size, current) {
+        (None, Some(c)) if c.visible => CursorStep::Hide,
+        (None, _) => CursorStep::Keep,
+        (Some(_), _) if upload => CursorStep::Upload,
+        (Some(size), Some(c)) if (c.width, c.height) == size => {
+            if (c.x, c.y) == position {
+                CursorStep::Keep
+            } else {
+                CursorStep::Move
+            }
+        }
+        (Some(_), _) => CursorStep::Upload,
+    }
+}
+
 /// Highest HDMI output depth native modesets may pick (8, 10 or 12 bpc;
 /// default 8 as DRM's max_requested_bpc). Other values are ignored.
 pub fn set_max_bpc(bpc: u8) {
@@ -4472,6 +4710,7 @@ fn admits_with_format(
 /// Every display back to the console's defaults (on, preferred mode,
 /// automatic routing), as drm_fb_helper restores the console on lastclose.
 pub fn restore_displays() {
+    release_drm_cursors();
     let mut outputs = OUTPUTS.lock();
     for c in outputs.crtcs.iter_mut() {
         c.active = true;
@@ -5004,6 +5243,10 @@ pub async unsafe fn monitor_displays(
     converge_streams(boot).await;
     // Frames that waited for this pass's relight in a new plane format.
     kick_presenters();
+    // DRM cursors on the pipes this pass lit (amdgpu_dm commits the cursor
+    // after the planes).
+    // SAFETY: the caller's obligations; OWNER is held.
+    unsafe { converge_drm_cursors(boot) };
     Ok(steps)
 }
 
@@ -6527,6 +6770,83 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/navi48-kms",
         navi48_plane_zpos_changes_recreate_planes
+    );
+
+    /// How a pipe's hardware cursor converges to its DRM cursor plane: a
+    /// new image, one of another size or a pipe without a cursor (a
+    /// relight) uploads; the image it holds moves, or stays when already
+    /// there; an off plane hides a visible cursor and leaves a hidden or
+    /// absent one.
+    fn navi48_drm_cursor_converges_like_handle_cursor_update() -> TestResult {
+        use crate::amdgpu_dcn401_otg::CursorApplied;
+        let held = CursorApplied {
+            pipe: 1,
+            address: 0x8000_0000,
+            width: 64,
+            height: 64,
+            x: 10,
+            y: 20,
+            visible: true,
+            shown: 0b10,
+        };
+        let hidden = CursorApplied {
+            x: CURSOR_OFF.0,
+            y: CURSOR_OFF.1,
+            visible: false,
+            shown: 0,
+            ..held
+        };
+        let cases = [
+            (None, Some((64, 64)), false, (0, 0), CursorStep::Upload),
+            (
+                Some(held),
+                Some((64, 64)),
+                true,
+                (10, 20),
+                CursorStep::Upload,
+            ),
+            (
+                Some(held),
+                Some((64, 32)),
+                false,
+                (10, 20),
+                CursorStep::Upload,
+            ),
+            (
+                Some(held),
+                Some((64, 64)),
+                false,
+                (10, 20),
+                CursorStep::Keep,
+            ),
+            (
+                Some(held),
+                Some((64, 64)),
+                false,
+                (-5, 20),
+                CursorStep::Move,
+            ),
+            (
+                Some(hidden),
+                Some((64, 64)),
+                false,
+                (10, 20),
+                CursorStep::Move,
+            ),
+            (Some(held), None, false, (10, 20), CursorStep::Hide),
+            (Some(hidden), None, false, (10, 20), CursorStep::Keep),
+            (None, None, true, (0, 0), CursorStep::Keep),
+        ];
+        for (current, size, upload, position, want) in cases {
+            if drm_cursor_step(current, size, upload, position) != want {
+                return TestResult::Fail("cursor step");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi48-kms",
+        navi48_drm_cursor_converges_like_handle_cursor_update
     );
 }
 
