@@ -40,18 +40,20 @@ fn navi48_completed_modesets_survive_configuration_and_publication_cancellation(
         future::Future,
         task::{Context, Waker},
     };
+    // Modeset records are large: keep them on the heap (the aarch64
+    // kernel-test stack is 64 KiB).
     for during_startup in [false, true] {
-        let first = completed_modeset(0);
-        let second = completed_modeset(2);
-        let mut retained = RetainedModesets::new();
+        let first = alloc::boxed::Box::new(completed_modeset(0));
+        let second = alloc::boxed::Box::new(completed_modeset(2));
+        let mut retained = alloc::boxed::Box::new(RetainedModesets::new());
         let mut journal = super::super::teardown::Teardowns::new();
         {
-            let mut future = core::pin::pin!(async {
+            let mut future = alloc::boxed::Box::pin(async {
                 // A caller's temporary configuration disappears on cancellation.
                 let mut local = Vec::new();
-                for m in [first, second] {
-                    retained.retain(m);
-                    local.push(m);
+                for m in [&first, &second] {
+                    retained.retain(**m);
+                    local.push(alloc::boxed::Box::new(**m));
                 }
                 if during_startup {
                     journal
@@ -68,9 +70,11 @@ fn navi48_completed_modesets_survive_configuration_and_publication_cancellation(
                 .is_pending());
         }
         assert_eq!(retained.check_stopped(), Err(otg::Error::Busy.into()));
-        let mut recovered = [None; 4];
+        let mut recovered: alloc::boxed::Box<[Option<Modeset>; 4]> =
+            alloc::boxed::Box::new([None; 4]);
         assert_eq!(retained.restore(&mut recovered), Ok(0b0101));
-        assert_eq!(recovered, [Some(first), None, Some(second), None]);
+        assert!(recovered[0] == Some(*first) && recovered[1].is_none());
+        assert!(recovered[2] == Some(*second) && recovered[3].is_none());
         assert_eq!(retained.restore(&mut recovered), Ok(0));
         // Handle recovery must not clear a cancelled native startup's quarantine.
         if during_startup {
@@ -82,9 +86,9 @@ fn navi48_completed_modesets_survive_configuration_and_publication_cancellation(
         // configuration preparation and stays available after another restore.
         retained.stopped(0);
         assert_eq!(retained.check_stopped(), Err(otg::Error::Busy.into()));
-        let mut again = [None; 4];
+        let mut again: alloc::boxed::Box<[Option<Modeset>; 4]> = alloc::boxed::Box::new([None; 4]);
         assert_eq!(retained.restore(&mut again), Ok(0b0100));
-        assert_eq!(again[2], Some(second));
+        assert!(again[2] == Some(*second));
         retained.stopped(2);
         assert_eq!(retained.check_stopped(), Ok(()));
     }
@@ -96,29 +100,32 @@ kernel_test_in!(
 );
 
 fn navi48_modeset_restore_refuses_conflicting_incarnations_before_changes() -> TestResult {
-    let first = completed_modeset(0);
-    let last = completed_modeset(3);
-    let mut retained = RetainedModesets::new();
-    retained.retain(first);
-    retained.retain(last);
-    let mut old = last;
+    // Modeset records are large: keep them on the heap (the aarch64
+    // kernel-test stack is 64 KiB).
+    let first = alloc::boxed::Box::new(completed_modeset(0));
+    let last = alloc::boxed::Box::new(completed_modeset(3));
+    let mut retained = alloc::boxed::Box::new(RetainedModesets::new());
+    retained.retain(*first);
+    retained.retain(*last);
+    let mut old = last.clone();
     old.scanout.address += 4096;
-    let mut caller = [None, None, None, Some(old)];
-    let before = caller;
+    let mut caller: alloc::boxed::Box<[Option<Modeset>; 4]> = alloc::boxed::Box::new([None; 4]);
+    caller[3] = Some(*old);
+    let before = caller.clone();
     assert_eq!(retained.restore(&mut caller), Err(otg::Error::Busy.into()));
     assert_eq!(
         caller, before,
         "partially restored before detecting a conflict"
     );
     // Updated admission and retraining witnesses replace the retained record.
-    let mut updated = last;
+    let mut updated = last.clone();
     updated.modes[0] = Some(last.selection.timing);
     updated.scanout.frame_before = 10;
     updated.scanout.frame_after = 11;
-    retained.retain(updated);
-    let mut caller = [None; 4];
+    retained.retain(*updated);
+    *caller = [None; 4];
     assert_eq!(retained.restore(&mut caller), Ok(0b1001));
-    assert_eq!(caller[3], Some(updated));
+    assert_eq!(caller[3], Some(*updated));
     TestResult::Pass
 }
 kernel_test_in!(

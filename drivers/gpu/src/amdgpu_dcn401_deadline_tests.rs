@@ -227,7 +227,8 @@ fn dcn401_deadlines_bind_only_the_admitted_owners() -> TestResult {
     tampered.watermarks.urgent += 1;
     let mut other_mode = plan;
     other_mode.mode.pitch = 2048;
-    let cases: [(dml::Plan, Request, RequestorApplied, dccg::Applied, u32); 13] = [
+    // On the heap: thirteen plans are too much for a 64 KiB kernel-test stack.
+    let cases: alloc::vec::Vec<(dml::Plan, Request, RequestorApplied, dccg::Applied, u32)> = alloc::vec![
         (tampered, timing, requestor, clock, 50_000),
         (other_mode, timing, requestor, clock, 50_000),
         (

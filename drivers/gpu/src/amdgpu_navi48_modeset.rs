@@ -626,11 +626,15 @@ pub struct Configuration {
 
 /// Keep the actual completed startup witnesses in the device owner until
 /// native teardown completes, including while callers are publishing them.
+/// On the heap: four whole modesets would dominate the device owner, which
+/// recovery moves by value.
 #[derive(Debug)]
-pub(super) struct RetainedModesets([Option<Modeset>; 4]);
+pub(super) struct RetainedModesets(alloc::boxed::Box<[Option<Modeset>; 4]>);
 impl RetainedModesets {
     pub(super) fn new() -> Self {
-        Self([None; 4])
+        // Built in place (a boxed array literal would pass the stack).
+        let slots: alloc::boxed::Box<[Option<Modeset>]> = alloc::vec![None; 4].into_boxed_slice();
+        Self(slots.try_into().expect("four modeset slots"))
     }
     pub(super) fn retain(&mut self, m: Modeset) {
         self.0[usize::from(m.pipe)] = Some(m);
@@ -646,13 +650,13 @@ impl RetainedModesets {
     }
     fn restore(&self, to: &mut [Option<Modeset>; 4]) -> Result<u8, ModesetError> {
         // Validate the whole transfer before changing any caller's records.
-        for (old, retained) in to.iter().zip(&self.0) {
+        for (old, retained) in to.iter().zip(self.0.iter()) {
             if old.is_some() && retained.is_some() && old != retained {
                 return Err(otg::Error::Busy.into());
             }
         }
         let mut recovered = 0;
-        for (pipe, (old, retained)) in to.iter_mut().zip(&self.0).enumerate() {
+        for (pipe, (old, retained)) in to.iter_mut().zip(self.0.iter()).enumerate() {
             if old.is_none() && retained.is_some() {
                 *old = *retained;
                 recovered |= 1 << pipe;
@@ -665,8 +669,9 @@ impl RetainedModesets {
 impl ColdBoot {
     /// Actual completed startup witnesses, retained through failed/cancelled
     /// configuration publication and teardown. This is not a fresh health check.
-    pub fn display_modesets(&self) -> [Option<Modeset>; 4] {
-        self.modesets.0
+    /// On the heap: four modesets by value are a large stack frame.
+    pub fn display_modesets(&self) -> Vec<Option<Modeset>> {
+        self.modesets.0.to_vec()
     }
     /// Recover missing caller handles without overwriting a different incarnation.
     pub(crate) fn restore_modesets(

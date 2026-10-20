@@ -460,7 +460,9 @@ pub(super) fn clock(request: Request) -> dccg::Applied {
     }
 }
 pub(super) fn run<T>(f: impl Future<Output = T>) -> T {
-    narf_scheduler::block_on_spin(f)
+    // Engine futures carry whole display plans: keep their state on the
+    // heap rather than the 64 KiB aarch64 kernel-test stack.
+    narf_scheduler::block_on_spin(alloc::boxed::Box::pin(f))
 }
 fn reg(e: &Engine<Fake>, index: u64) -> u32 {
     *e.io.regs.get(&(BASE + index * 4)).unwrap_or(&0)

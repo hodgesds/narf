@@ -4,6 +4,7 @@
 //! remapping. Route selectors stay disconnected.
 use super::*;
 use crate::amdgpu_gmc_navi48::{DisplayContext, Gmc};
+use alloc::vec::Vec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MpcApplied {
@@ -138,22 +139,27 @@ impl Layout {
     /// The composition registers, then for a converting stream the output
     /// CSC load (after the bypass write of its mode, which it replaces), for
     /// every ODM segment's MPCC and OPP output in turn.
-    fn mpc_rgb(self, a: MpcApplied) -> impl Iterator<Item = (u64, u32, u32)> {
-        a.dpp
-            .surface
-            .request
-            .segments()
-            .flat_map(move |(p, _, _)| self.mpc_segment(a, p))
+    ///
+    /// Listed into a vector: an iterator would carry copies of the (large)
+    /// layout in its state, which deep scanout paths cannot afford on a
+    /// kernel stack.
+    fn mpc_rgb(&self, a: &MpcApplied) -> Vec<(u64, u32, u32)> {
+        let mut list = Vec::new();
+        let matrix = Self::ocsc_matrix(a);
+        for (p, _, _) in a.dpp.surface.request.segments() {
+            let ocsc = self.ocsc(p);
+            for w in self.mpc_full(a, p) {
+                if !(matrix.is_some() && w.0 == ocsc) {
+                    list.push(w);
+                }
+            }
+            if let Some(m) = matrix {
+                list.extend_from_slice(&self.ocsc_load(p, m));
+            }
+        }
+        list
     }
-    fn mpc_segment(self, a: MpcApplied, p: u8) -> impl Iterator<Item = (u64, u32, u32)> {
-        let load = Self::ocsc_matrix(&a).map(|m| self.ocsc_load(p, m));
-        let converting = load.is_some();
-        self.mpc_full(a, p)
-            .into_iter()
-            .filter(move |&(at, _, _)| !(converting && at == self.ocsc(p)))
-            .chain(load.into_iter().flatten())
-    }
-    fn mpc_full(self, a: MpcApplied, p: u8) -> [(u64, u32, u32); 20] {
+    fn mpc_full(&self, a: &MpcApplied, p: u8) -> [(u64, u32, u32); 20] {
         let denorm = match a.depth {
             ColorDepth::Bpc8 => 2,
             ColorDepth::Bpc10 => 4,
@@ -163,7 +169,7 @@ impl Layout {
             // Top-layer-only (the tree position sets the mode when it is
             // connected), unity gains. An X format's unused bits never
             // become coverage. Disable inherited stereo too.
-            (self.mpcc(p, 3), 0xffff0ff3, blend_control(a) | 2),
+            (self.mpcc(p, 3), 0xffff0ff3, blend_control(*a) | 2),
             (self.mpcc(p, 4), 0x3033f, 0),
             (self.mpcc(p, 6), 0x7ffff, 0x1f000),
             (self.mpcc(p, 7), 0x7ffff, 0x1f000),
@@ -192,7 +198,7 @@ impl Layout {
 impl<I: Io> Engine<I> {
     pub(super) fn verify_mpc(&mut self, a: MpcApplied) -> Result<u16, Error> {
         let l = self.layout;
-        for (at, mask, value) in l.mpc_rgb(a) {
+        for (at, mask, value) in l.mpc_rgb(&a) {
             // The OGAM and its gamut remap follow each pipe's color record
             // (bypass when staged, the CRTC color once scanout programs it).
             let colored = a.dpp.surface.request.segments().find_map(|(p, _, _)| {
@@ -314,7 +320,7 @@ impl Surfaces {
         e.status.requestor = None;
         e.status.deadlines = None;
         let result = (|| {
-            for (at, mask, value) in e.layout.mpc_rgb(a) {
+            for (at, mask, value) in e.layout.mpc_rgb(&a) {
                 e.update(at, mask, value)?;
             }
             if owners()? != (clock, config) {

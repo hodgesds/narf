@@ -123,36 +123,47 @@ pub const MAX_PLANES: usize = 4;
 
 /// One linear RGB plane of a stream as DC passes DML21 a plane state after
 /// SPL: its surface, SPL's whole-plane viewport (DC hands DML the plane's
-/// scaler data as if no ODM split it), the scale ratios and taps.
+/// scaler data as if no ODM split it), the scale ratios and taps. Packed
+/// (surfaces are at most 16383 pixels, taps at most 8): plans carry every
+/// stream's planes and are copied often.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Plane {
-    pub surface_width: u32,
-    pub surface_height: u32,
+    pub surface_width: u16,
+    pub surface_height: u16,
     /// Surface pitch in pixels.
-    pub pitch: u32,
+    pub pitch: u16,
+    pub viewport_width: u16,
+    pub viewport_height: u16,
     /// 2, 4 or 8 (`dml2_444_16`, `dml2_444_32`, `dml2_444_64`).
-    pub bytes_per_pixel: u32,
-    pub viewport_width: u32,
-    pub viewport_height: u32,
+    pub bytes_per_pixel: u8,
+    pub h_taps: u8,
+    pub v_taps: u8,
     /// Input over output in units of 2^-19 (SPL's U3.19 ratios, which DC
     /// converts to the doubles DML takes exactly); `Plane::UNITY` is 1:1.
     pub h_ratio: u32,
     pub v_ratio: u32,
-    pub h_taps: u32,
-    pub v_taps: u32,
 }
 
 impl Plane {
     pub const UNITY: u32 = 1 << 19;
-    /// The unscaled full-frame plane of `timing`.
+    /// A pixel extent as a plane field, saturated (validation refuses it).
+    pub fn extent(v: u32) -> u16 {
+        u16::try_from(v).unwrap_or(u16::MAX)
+    }
+    /// A byte or tap count as a plane field, saturated likewise.
+    pub fn count(v: u32) -> u8 {
+        u8::try_from(v).unwrap_or(u8::MAX)
+    }
+    /// The unscaled full-frame plane of `timing` (a field that does not
+    /// fit saturates, which validation then refuses).
     pub fn full(timing: &Timing, pitch: u32, bytes_per_pixel: u32) -> Self {
         Self {
-            surface_width: timing.h_active,
-            surface_height: timing.v_active,
-            pitch,
-            bytes_per_pixel,
-            viewport_width: timing.h_active,
-            viewport_height: timing.v_active,
+            surface_width: Self::extent(timing.h_active),
+            surface_height: Self::extent(timing.v_active),
+            pitch: Self::extent(pitch),
+            bytes_per_pixel: Self::count(bytes_per_pixel),
+            viewport_width: Self::extent(timing.h_active),
+            viewport_height: Self::extent(timing.v_active),
             h_ratio: Self::UNITY,
             v_ratio: Self::UNITY,
             h_taps: 1,
@@ -435,9 +446,11 @@ pub struct Plan {
     pub odm_refcyc_h_blank_end: u32,
     /// Vertical blank budgeted for self-refresh entry and exit, if any.
     pub stutter_reserved_us: u32,
-    /// Every mode admitted together with this one, in admission order; this
-    /// plan is `streams[stream]`. A plan is only valid in that configuration.
-    pub streams: [Option<Mode>; MAX_STREAMS],
+    /// Every other mode admitted together with this one, in admission
+    /// order (this plan's own, `mode`, belongs at `stream`; `joint_modes`
+    /// lists them all). A plan is only valid in that configuration. Plans
+    /// are copied often, so the record keeps no second copy of `mode`.
+    pub streams: [Option<Mode>; MAX_STREAMS - 1],
     pub stream: u8,
     /// Each of the stream's planes (`Mode::plane_list` order): its own
     /// DPPCLK, DLG, TTU, DET and second ODM pipe's blank end. The fields
@@ -446,12 +459,12 @@ pub struct Plan {
     pub planes: [Option<PlanePlan>; MAX_PLANES],
 }
 
-/// One plane's share of a stream's [`Plan`]: every one of its `Plan::pipes`
-/// pipes runs at `dppclk_khz` with `det_bytes` and this DLG/TTU, the second
-/// ODM pipe with its own blank end.
+/// One plane's share of a stream's [`Plan`] (the plane is the plan's
+/// `mode.plane_list()` entry): every one of its `Plan::pipes` pipes runs at
+/// `dppclk_khz` with `det_bytes` and this DLG/TTU, the second ODM pipe with
+/// its own blank end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlanePlan {
-    pub plane: Plane,
     pub dppclk_khz: u32,
     pub dlg: Dlg,
     pub ttu: Ttu,
@@ -792,9 +805,9 @@ impl Plane {
     /// ScaleRatioAndTapsSupport, ViewportExceedsSurface and PitchSupport:
     /// what DML refuses of a plane on its own.
     fn validate(&self) -> Result<(), Error> {
-        let taps_ok = |t: u32| (1..=MAX_SCL_TAPS).contains(&t);
-        let ratio_ok = |r: u32, taps: u32| {
-            r != 0 && r <= MAX_SCL_RATIO * Self::UNITY && r <= taps * Self::UNITY
+        let taps_ok = |t: u8| (1..=MAX_SCL_TAPS).contains(&u32::from(t));
+        let ratio_ok = |r: u32, taps: u8| {
+            r != 0 && r <= MAX_SCL_RATIO * Self::UNITY && r <= u32::from(taps) * Self::UNITY
         };
         if self.surface_width == 0
             || self.surface_height == 0
@@ -898,7 +911,7 @@ impl Shape {
         // CalculateSwathWidth: the viewport, or with ODM each pipe's share
         // of the line in source pixels (math_round), at most the viewport;
         // rounded to whole requests within the surface.
-        let vp = plane.viewport_width;
+        let vp = u32::from(plane.viewport_width);
         let swath = if odm > 1 {
             let share = (u64::from(t.h_active) * u64::from(plane.h_ratio)
                 + u64::from(Plane::UNITY))
@@ -907,7 +920,7 @@ impl Shape {
         } else {
             vp
         };
-        let bpp = plane.bytes_per_pixel;
+        let bpp = u32::from(plane.bytes_per_pixel);
         let r = u64::from(request_pixels(bpp));
         let w = u64::from(plane.surface_width);
         let swath_ub = ceil_to(w, r).min(ceil_to(u64::from(swath).saturating_sub(1), r) + r) as u32;
@@ -1062,7 +1075,9 @@ fn deep_sleep_khz(shapes: &[Shape]) -> u32 {
     let num: u128 = shapes
         .iter()
         .map(|s| {
-            u128::from(s.plane.viewport_width * s.bpp) * u128::from(s.t.pixel_clock_khz) * den
+            u128::from(u32::from(s.plane.viewport_width) * s.bpp)
+                * u128::from(s.t.pixel_clock_khz)
+                * den
                 / u128::from(s.t.h_total)
         })
         .sum();
@@ -1761,7 +1776,6 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
         per_plane.push((
             sync,
             PlanePlan {
-                plane: shape.plane,
                 dppclk_khz: dppclk_khz[k],
                 dlg: Dlg {
                     refcyc_h_blank_end: h_blank_end(0),
@@ -1835,7 +1849,18 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
             pipes: odm as u8,
             odm_refcyc_h_blank_end: p0.odm_refcyc_h_blank_end,
             stutter_reserved_us: reserved_us as u32,
-            streams,
+            // The plan's own mode is `mode`; the others are kept for
+            // `joint_modes` (records stay small: plans are copied a lot).
+            streams: {
+                let mut others = [None; MAX_STREAMS - 1];
+                for (slot, m) in others
+                    .iter_mut()
+                    .zip(streams.iter().enumerate().filter(|&(n, _)| n != k))
+                {
+                    *slot = *m.1;
+                }
+                others
+            },
             stream: k as u8,
             planes,
         };
@@ -1869,15 +1894,18 @@ impl Plan {
     }
     /// The configuration this plan was admitted in.
     pub fn joint_modes(&self) -> Vec<Mode> {
-        self.streams.iter().flatten().copied().collect()
+        let mut modes: Vec<Mode> = self.streams.iter().flatten().copied().collect();
+        let at = usize::from(self.stream).min(modes.len());
+        modes.insert(at, self.mode);
+        modes
     }
     /// Whether admitting this plan's configuration again yields this plan:
     /// it was produced by [`admit_all`] from its recorded inputs.
     pub fn readmits(&self) -> bool {
+        // Compared in place: plans are large, and this runs deep in the
+        // deadline binding of every scanout operation.
         admit_all(&self.soc, &self.joint_modes())
-            .ok()
-            .and_then(|plans| plans.get(usize::from(self.stream)).copied())
-            == Some(*self)
+            .is_ok_and(|plans| plans.get(usize::from(self.stream)) == Some(self))
     }
     /// Every programmed value must fit its dcn_4_1_0 register field. Linux
     /// only asserts these; a plan that cannot be programmed exactly is

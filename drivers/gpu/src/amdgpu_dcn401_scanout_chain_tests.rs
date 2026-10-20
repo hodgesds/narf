@@ -290,7 +290,9 @@ struct Chain {
     address: u64,
     pipe: u8,
 }
-fn chain(phy_index: u8, stream: u8, pipe: u8) -> Chain {
+/// Boxed: tests hold several chains, each with a whole engine and its
+/// register model (the aarch64 kernel-test stack is 64 KiB).
+fn chain(phy_index: u8, stream: u8, pipe: u8) -> alloc::boxed::Box<Chain> {
     let plan = plan();
     let mode = hdmi_mode(pipe, &plan);
     let (backing, pool, mut e, mut surfaces, clock) =
@@ -364,7 +366,7 @@ fn chain(phy_index: u8, stream: u8, pipe: u8) -> Chain {
     run(e.start_hdmi_video(path(phy_index), clock)).unwrap();
     assert_eq!(e.status.state, State::HdmiVideoRunning(stream));
     e.io.armed = true;
-    Chain {
+    alloc::boxed::Box::new(Chain {
         backing,
         pool,
         e,
@@ -372,7 +374,7 @@ fn chain(phy_index: u8, stream: u8, pipe: u8) -> Chain {
         clock,
         address,
         pipe,
-    }
+    })
 }
 impl Chain {
     async fn start(&mut self) -> Result<ScanoutRunning, Error> {

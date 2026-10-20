@@ -417,17 +417,18 @@ impl SurfaceRequest {
             spl::Scaler::unity(0, w, h)
         };
         let [v_taps, h_taps, _, _] = s.dc_taps();
-        crate::amdgpu_dcn401_dml::Plane {
-            surface_width: self.width,
-            surface_height: self.height,
-            pitch,
-            bytes_per_pixel: bpp,
-            viewport_width: s.viewport.width as u32,
-            viewport_height: s.viewport.height as u32,
+        use crate::amdgpu_dcn401_dml::Plane;
+        Plane {
+            surface_width: Plane::extent(self.width),
+            surface_height: Plane::extent(self.height),
+            pitch: Plane::extent(pitch),
+            bytes_per_pixel: Plane::count(bpp),
+            viewport_width: Plane::extent(s.viewport.width as u32),
+            viewport_height: Plane::extent(s.viewport.height as u32),
             h_ratio: s.ratios[0] >> 5,
             v_ratio: s.ratios[1] >> 5,
-            h_taps,
-            v_taps,
+            h_taps: Plane::count(h_taps),
+            v_taps: Plane::count(v_taps),
         }
     }
     /// Whether `other` fits the same buffers: the same pipe(s), size and

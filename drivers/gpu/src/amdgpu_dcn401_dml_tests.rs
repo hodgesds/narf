@@ -843,7 +843,7 @@ fn dcn401_dml_joint_plans_share_global_state() -> TestResult {
         return TestResult::Fail("joint plan not bound to its configuration");
     }
     let mut edited = a;
-    edited.streams[1] = None;
+    edited.streams[0] = None;
     if edited.readmits() {
         return TestResult::Fail("plan re-admitted outside its configuration");
     }
@@ -912,20 +912,20 @@ fn check_plane_vectors(vectors: &str) -> Result<(u32, u32, u32), &'static str> {
                     return Err("malformed plane");
                 }
                 *slot = Some(Plane {
-                    surface_width: p[0],
-                    surface_height: p[1],
-                    pitch: p[2],
-                    bytes_per_pixel: p[3],
-                    viewport_width: p[4],
-                    viewport_height: p[5],
+                    surface_width: Plane::extent(p[0]),
+                    surface_height: Plane::extent(p[1]),
+                    pitch: Plane::extent(p[2]),
+                    bytes_per_pixel: Plane::count(p[3]),
+                    viewport_width: Plane::extent(p[4]),
+                    viewport_height: Plane::extent(p[5]),
                     h_ratio: p[6],
                     v_ratio: p[7],
-                    h_taps: p[8],
-                    v_taps: p[9],
+                    h_taps: Plane::count(p[8]),
+                    v_taps: Plane::count(p[9]),
                 });
             }
-            mode.pitch = mode.planes[0].map_or(0, |p| p.pitch);
-            mode.bytes_per_pixel = mode.planes[0].map_or(0, |p| p.bytes_per_pixel);
+            mode.pitch = mode.planes[0].map_or(0, |p| u32::from(p.pitch));
+            mode.bytes_per_pixel = mode.planes[0].map_or(0, |p| u32::from(p.bytes_per_pixel));
             modes.push(mode);
         }
         let result = admit_all(&soc, &modes);
