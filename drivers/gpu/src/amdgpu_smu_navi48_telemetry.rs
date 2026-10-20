@@ -49,6 +49,11 @@ const SOFTWARE_SHUTDOWN: usize = 43;
 const CUSTOM_SKU: usize = 4924;
 const PPT_AC: usize = CUSTOM_SKU; // SocketPowerLimitAc[PPT_THROTTLER_PPT0]
 const TEMPERATURE_LIMIT: usize = CUSTOM_SKU + 20;
+// SkuTable_t fields (offsets checked by tests/smu14_metrics.c).
+const MSG_PPT_AC: usize = 3976; // MsgLimits.Power[PPT_THROTTLER_PPT0][AC]
+const OD_MIN_PPT: usize = 4124; // OverDriveLimitsBasicMin.Ppt (percent)
+const OD_MAX_FEATURES: usize = 4188; // OverDriveLimitsBasicMax.FeatureCtrlMask
+const PP_OD_FEATURE_PPT_BIT: u32 = 3;
 const FAN_MAXIMUM_RPM: usize = CUSTOM_SKU + 122;
 const FAN_ABNORMAL_OFFSET: usize = CUSTOM_SKU + 202;
 /// Linux smu_v14_0.h `CTF_OFFSET_{EDGE,HOTSPOT,MEM}`.
@@ -201,6 +206,26 @@ pub struct Limits {
     pub fan_max_rpm: Option<u16>,
     /// AC `SocketPowerLimitAc[PPT0]`, in watts (hwmon `power1_cap_default`).
     pub ppt_default_w: u16,
+    /// smu_v14_0_2_init_ppt_limits' non-overdrive AC range (hwmon
+    /// `power1_cap_{min,max}`): the socket and message limits bound it, the
+    /// minimum lowered by the overdrive minimum percentage when the board
+    /// supports PPT overdrive.
+    pub ppt_min_w: u32,
+    pub ppt_max_w: u32,
+}
+/// `(min, max)` watts for PPT0 on AC, as smu_v14_0_2_init_ppt_limits.
+fn ppt_range(combo: &[u8]) -> (u32, u32) {
+    let pp = u32::from(u16_at(combo, PPT_AC));
+    let msg = u32::from(u16_at(combo, MSG_PPT_AC));
+    let features = u32::from(u16_at(combo, OD_MAX_FEATURES))
+        | u32::from(u16_at(combo, OD_MAX_FEATURES + 2)) << 16;
+    let lower = if features & (1 << PP_OD_FEATURE_PPT_BIT) != 0 {
+        i64::from(u16_at(combo, OD_MIN_PPT) as i16)
+    } else {
+        0
+    };
+    let min = (i64::from(pp.min(msg)) * (100 + lower) / 100).max(0) as u32;
+    (min, pp.max(msg))
 }
 impl Limits {
     /// `combo` is the validated TABLE_COMBO_PPTABLE; `features` its
@@ -227,6 +252,8 @@ impl Limits {
             fan_max_rpm: (features & FEATURE_FAN_CONTROL != 0)
                 .then(|| u16_at(combo, FAN_MAXIMUM_RPM)),
             ppt_default_w: u16_at(combo, PPT_AC),
+            ppt_min_w: ppt_range(combo).0,
+            ppt_max_w: ppt_range(combo).1,
         })
     }
     /// Linux `smu_swctf_delayed_work_handler`: hotspot at or above the

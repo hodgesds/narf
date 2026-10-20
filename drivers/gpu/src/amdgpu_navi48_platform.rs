@@ -1074,6 +1074,15 @@ pub(crate) async fn power_sample() -> Result<crate::amdgpu_navi48_power::Sample,
         .power_sample()
         .await
 }
+/// hwmon `power1_cap`: the AC PPT0 limit in watts, within the board range.
+pub async fn set_power_cap(watts: u32) -> Result<(), boot::Error> {
+    let mut owner = OWNER.lock().await;
+    owner
+        .as_mut()
+        .ok_or(boot::Error::Invalid)?
+        .set_power_cap(watts)
+        .await
+}
 /// Linux `power_dpm_force_performance_level` restricted to GFXCLK soft
 /// limits. Display, memory and fabric clocks stay pinned by their owner.
 pub async fn set_gfx_level(level: crate::amdgpu_smu_navi48::GfxLevel) -> Result<(), boot::Error> {

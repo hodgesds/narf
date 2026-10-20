@@ -37,6 +37,13 @@ EQ(offsetof(struct smu_14_0_2_powerplay_table, software_shutdown_temp), 43);
 EQ(C(SocketPowerLimitAc), 4924); EQ(PPT_THROTTLER_PPT0, 0);
 EQ(C(TemperatureLimit), 4944); EQ(C(FanMaximumRpm), 5046);
 EQ(C(FanAbnormalTempLimitOffset), 5126); EQ(sizeof(CustomSkuTable_t), 360);
+#define K(f) (offsetof(struct smu_14_0_2_powerplay_table, smc_pptable) + \
+              offsetof(PPTable_t, SkuTable) + offsetof(SkuTable_t, f))
+EQ(K(MsgLimits) + offsetof(MsgLimits_t, Power), 3976); EQ(POWER_SOURCE_AC, 0);
+EQ(K(OverDriveLimitsBasicMin) + offsetof(OverDriveLimits_t, Ppt), 4124);
+EQ(K(OverDriveLimitsBasicMax) + offsetof(OverDriveLimits_t, FeatureCtrlMask), 4188);
+EQ(PP_OD_FEATURE_PPT_BIT, 3); EQ(PPSMC_MSG_SetPptLimit, 0x32);
+EQ(FEATURE_THROTTLERS_BIT, 23);
 EQ((1u << FEATURE_THROTTLERS_BIT) | (1u << FEATURE_GTHR_BIT) |
    (1u << FEATURE_ACDC_BIT) | (1u << FEATURE_VR0HOT_BIT) |
    (1u << FEATURE_FW_CTF_BIT) | (1u << FEATURE_FAN_CONTROL_BIT), 0x3e800000);

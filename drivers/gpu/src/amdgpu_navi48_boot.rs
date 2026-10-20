@@ -1279,6 +1279,12 @@ impl ColdBoot {
         })
     }
     /// GFXCLK soft limits only; display/memory clocks stay pinned.
+    pub async fn set_power_cap(&mut self, watts: u32) -> Result<(), Error> {
+        self.power_owner()?
+            .set_ppt_limit(watts)
+            .await
+            .map_err(Error::Smu)
+    }
     pub async fn set_gfx_level(&mut self, level: smu::GfxLevel) -> Result<(), Error> {
         self.power_owner()?
             .set_gfx_level(level)

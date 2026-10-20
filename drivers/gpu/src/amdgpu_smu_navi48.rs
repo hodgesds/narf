@@ -550,6 +550,21 @@ impl<I: Io> Engine<I> {
         self.end_runtime(resume, &result);
         result
     }
+    /// Linux smu_v14_0_set_ppt_limit: PPT0 SetPptLimit in watts, which needs
+    /// the PPT feature (FEATURE_THROTTLERS_BIT on SMU14.0.2) running.
+    async fn set_ppt_limit(&mut self, watts: u32) -> Result<(), Error> {
+        let power = self.power.ok_or(Error::Invalid)?;
+        if power.enabled & (1 << 23) == 0 {
+            return Err(Error::Unsupported);
+        }
+        if watts == 0 || watts > 0xffff {
+            return Err(Error::Invalid);
+        }
+        let resume = self.begin_runtime()?;
+        let result = self.command(0x32, watts).await.map(|_| ());
+        self.end_runtime(resume, &result);
+        result
+    }
     /// Linux smu_v14_0_set_vcn_enable, dGPU instance 0. Static media keeps
     /// MM_DPM/DS_VCN disabled and every autonomous protection running.
     async fn set_vcn_power(&mut self, enabled: bool) -> Result<PowerStatus, Error> {
@@ -803,6 +818,12 @@ impl Smu {
     /// protection are untouched; a clean rejection leaves the owner usable.
     pub async fn set_gfx_level(&mut self, level: GfxLevel) -> Result<(), Error> {
         self.engine.set_gfx_level(level).await
+    }
+    /// Set the AC PPT0 socket power limit (watts). The caller validates it
+    /// against `Limits::{ppt_min_w, ppt_max_w}`; every protection keeps
+    /// running and a clean PMFW rejection leaves the owner usable.
+    pub async fn set_ppt_limit(&mut self, watts: u32) -> Result<(), Error> {
+        self.engine.set_ppt_limit(watts).await
     }
     /// SMU14 dGPU PowerUpVcn/PowerDownVcn for instance 0, with a fresh
     /// protection/static-clock policy check. No display or GFX clocks move.

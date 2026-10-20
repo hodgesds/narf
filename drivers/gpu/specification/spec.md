@@ -574,8 +574,17 @@ with PMFW fan control, read-only `pwm1` (0–255), `pwm1_enable` 2 (automatic),
 `pwm1_min/max`, `fan1_input/min/max`; `in0` (vddgfx, mV); `power1_average`,
 `power1_cap` and `power1_cap_default` in µW labelled PPT; `freq1` (sclk) and
 `freq2` (mclk) in Hz. Linux's smu_v14_0_2 provides no fan-mode or PWM setter,
-so fan control stays automatic. `power1_cap` is read-only, and `power1_input`
-and the overdrive-dependent `power1_cap_min/max` are absent. Values read empty
+so fan control stays automatic. `power1_cap` is writable as
+amdgpu_hwmon_set_power_cap (decimal µW, truncated to W) and accepts only
+smu_v14_0_2_init_ppt_limits' non-overdrive AC range, reported by
+`power1_cap_min`/`power1_cap_max` (`Limits::{ppt_min_w, ppt_max_w}`: socket
+and message limits, the minimum lowered by the overdrive minimum percentage
+when the board supports PPT overdrive); out-of-range writes are EINVAL. The
+store validates synchronously and `amdgpu_navi48_platform::set_power_cap(w)`
+applies SetPptLimit (0x32) on the executor, which needs the PPT feature
+(FEATURE_THROTTLERS_BIT); the next sample's GetPptLimit is what `power1_cap`
+reads. `amdgpu_hwmon::publish_writable` adds writable attributes to the shared
+hwmon node. `power1_input` is absent. Values read empty
 until a sample or board limit exists, never as a fake zero. The monitor logs
 throttlers starting and ending, loss of a recorded protection, the first
 failed refresh, and hotspot reaching `software_shutdown_temp`. Linux powers

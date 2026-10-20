@@ -108,7 +108,7 @@ impl Io for Fake {
             0x1e if p >> 16 == 2 => 1258,
             0x1d => 500,
             0x1e => 3100,
-            0x36 | 6 | 0x19 | 0x1a | 0x2a..=0x2d => 0,
+            0x36 | 6 | 0x19 | 0x1a | 0x2a..=0x2d | 0x32 => 0,
             8 => {
                 self.enabled |= p as u64;
                 0
@@ -662,6 +662,9 @@ fn limits_board() -> Vec<u8> {
     let mut b = board();
     put16(&mut b, 43, 118); // software_shutdown_temp
     put16(&mut b, 4924, 304); // SocketPowerLimitAc[PPT0]
+    put16(&mut b, 3976, 340); // MsgLimits.Power[PPT0][AC]
+    put16(&mut b, 4124, (-10i16) as u16); // OverDriveLimitsBasicMin.Ppt
+    put16(&mut b, 4188, 1 << 3); // OverDriveLimitsBasicMax: PPT overdrive
     for (i, c) in [(0, 100u16), (1, 110), (4, 108)] {
         put16(&mut b, 4944 + 2 * i, c); // TemperatureLimit
     }
@@ -704,6 +707,9 @@ fn smu14_telemetry_decodes_metrics_limits_and_protection() -> TestResult {
             software_shutdown_offset_c: -10,
             fan_max_rpm: Some(3300),
             ppt_default_w: 304,
+            // min(304, 340) * (100 - 10) / 100 and max(304, 340).
+            ppt_min_w: 273,
+            ppt_max_w: 340,
         }
     );
     e.io.metrics = metrics(40, 30);
@@ -857,6 +863,36 @@ fn smu14_gfx_levels_use_soft_limits_only() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/smu-navi48",
     smu14_gfx_levels_use_soft_limits_only
+);
+
+fn smu14_ppt_limit_is_one_set_ppt_limit_with_ppt_running() -> TestResult {
+    let (_, mut e) = powered();
+    assert_ne!(e.power.unwrap().enabled & 1 << 23, 0);
+    e.io.commands.clear();
+    run(e.set_ppt_limit(300)).unwrap();
+    assert_eq!(e.io.commands, [(0x32, 300)]);
+    assert_eq!(e.state, State::PowerReady);
+    e.io.commands.clear();
+    for bad in [0, 0x1_0000] {
+        assert_eq!(run(e.set_ppt_limit(bad)), Err(Error::Invalid));
+    }
+    assert!(e.io.commands.is_empty());
+    e.io.reject = Some(0x32);
+    assert_eq!(run(e.set_ppt_limit(290)), Err(Error::Rejected(0xfd)));
+    assert_eq!(e.state, State::PowerReady);
+    // Without the PPT feature (THROTTLERS) PMFW cannot take a new limit.
+    let (_, mut e) = powered();
+    if let Some(p) = e.power.as_mut() {
+        p.enabled &= !(1 << 23);
+    }
+    e.io.commands.clear();
+    assert_eq!(run(e.set_ppt_limit(300)), Err(Error::Unsupported));
+    assert!(e.io.commands.is_empty());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi48",
+    smu14_ppt_limit_is_one_set_ppt_limit_with_ppt_running
 );
 
 fn smu14_vcn_power_requires_current_static_policy_and_protection() -> TestResult {

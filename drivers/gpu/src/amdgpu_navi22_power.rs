@@ -222,6 +222,9 @@ fn reading(snapshot: Option<&Snapshot>) -> crate::amdgpu_hwmon::Reading {
         power_cap_default_w: snapshot
             .and_then(|s| s.ppt_default_w)
             .or(l.map(|l| l.ppt_table_w.into())),
+        // Not listed for SMU11: power1_cap stays read-only here.
+        power_cap_min_w: None,
+        power_cap_max_w: None,
         // sclk is METRICS_AVERAGE_GFXCLK, mclk METRICS_CURR_UCLK.
         sclk_mhz: m.map(|m| m.gfx_mhz.into()),
         mclk_mhz: m.map(|m| m.uclk_mhz),
