@@ -4118,10 +4118,10 @@ impl ColdBoot {
         // Every display's offered modes beside the others, as lighting
         // computes them.
         let all = displays.clone();
-        for k in 0..displays.len() {
-            let edid = edid_of(&ports, &paths, &displays[k].selection);
-            displays[k].modes = self.offered_modes(&soc, &all, k, &edid);
-            self.modesets.retain(displays[k]);
+        for (k, display) in displays.iter_mut().enumerate() {
+            let edid = edid_of(&ports, &paths, &display.selection);
+            display.modes = self.offered_modes(&soc, &all, k, &edid);
+            self.modesets.retain(*display);
         }
         self.update_sst_outputs(Some(&soc), &paths, &ports, &displays);
         Ok(Some(Configuration { displays, failed }))

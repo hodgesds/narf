@@ -879,8 +879,7 @@ fn dcn401_dml_odm_combine_follows_dml_policy() -> TestResult {
         return TestResult::Fail("3:1 split rejected");
     };
     let third = |k: u32| {
-        ((uhd.timing.h_blank_end() * 3 + k * 3840) * 50_000 / (3 * uhd.timing.pixel_clock_khz))
-            as u32
+        (uhd.timing.h_blank_end() * 3 + k * 3840) * 50_000 / (3 * uhd.timing.pixel_clock_khz)
     };
     if p3.pipes != 3
         || p3.odm_refcyc_h_blank_end != [third(1), third(2), 0]

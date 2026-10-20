@@ -2633,8 +2633,7 @@ pub fn admit_all_with(soc: &Soc, modes: &[Mode], policy: Policy) -> Result<Vec<P
             if shapes.len() == MAX_PLANES {
                 return Err(Error::Pipes);
             }
-            let mut shape =
-                Shape::new(mode, plane, k, ss(soc.dispclk_max_khz), soc.umc_channels)?;
+            let mut shape = Shape::new(mode, plane, k, ss(soc.dispclk_max_khz), soc.umc_channels)?;
             if policy.mpc_combine {
                 shape = shape.mpc_combined(mode, ss(soc.dppclk_max_khz), soc.umc_channels)?;
             }
