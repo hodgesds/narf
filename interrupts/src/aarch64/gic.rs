@@ -113,6 +113,14 @@ pub fn remap_mmio(cpu_index: u32) {
     map_gicr(cpu_index);
 }
 
+/// Raw `GICD_TYPER` (IDbits [23:19], LPIS bit 17). The ITS sizes the LPI
+/// property table from it.
+pub fn gicd_typer() -> u32 {
+    // SAFETY: distributor frame mapped by `init_bsp` / `remap_mmio`;
+    // GICD_TYPER is read-only.
+    unsafe { read_u32((gicd_base() + 0x0004) as *mut u32) }
+}
+
 // Distributor register offsets (SDM of GICv3: IHI0069H).
 const GICD_CTLR: usize = 0x0000;
 
