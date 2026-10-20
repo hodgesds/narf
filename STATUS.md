@@ -596,7 +596,13 @@ link carries it raw (10- and 12-bpc DSC input, the PPS, rate control and DSC
 input depth at that depth; 2000 depth-search vectors against Linux's DSC code).
 MST streams on a link with a DSC decoder take the deepest depth the port and
 the joint fairness search accept (1200 deep-color fairness vectors); MST links
-without a decoder stay 8 bpc. Model-tested only; not run on an RX 9070 XT.
+without a decoder run each stream at the deepest depth its port carries raw,
+its PBN sized for the requested depth as dm_encoder_helper_atomic_check does
+(1500 vectors through amdgpu_dm's depth and PBN code). Every connector, MST end
+devices included, has amdgpu_dm's "max bpc" property (8..16, starting at 16)
+through GETPROPERTY, OBJ_GET/SETPROPERTY, SETPROPERTY and atomic; a change
+relights the display it drives, and amdgpu.max_bpc stays a ceiling over it.
+Model-tested only; not run on an RX 9070 XT.
 Native legacy/HPO DisplayPort stream blanking now waits for actual video-stop
 acknowledgement before resetting or disabling FIFOs. It handles inherited
 disable-in-progress state, keeps timing and link clocks available for PHY
