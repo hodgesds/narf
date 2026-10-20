@@ -561,6 +561,14 @@ amdgpu_dm does: EDID range + DPCD MSA_TIMING_PAR_IGNORED give the connector's
 CRTC's "VRR_ENABLED" reprograms OTG DRR live (optc401_set_drr totals from
 mod_freesync, a manual trigger per flip). HDMI/MST VRR, BTR/LFC and the
 FreeSync infopacket are gaps. Model-tested only; not run on an RX 9070 XT.
+Navi48 color management and HDR follow amdgpu_dm on DCN 4.0.1: CRTC CTM
+(MPC gamut remap), GAMMA_LUT (OGAM PWL from Linux's color_gamma/cm3 math,
+bit-exact against host-built Linux) and legacy SETGAMMA/GETGAMMA (sRGB
+pre-degamma ROM), applied live under the OTG lock; connector Colorspace
+(output CSC, blank, AVI C/EC/Q, DP MSA and VSC SDP) and HDR_OUTPUT_METADATA
+(HDMI DRM InfoFrame, DP HDR SDP, live metadata updates). No DEGAMMA_LUT on
+DCN 4.0.1, as Linux. Gaps: HDR/VSC on UHBR and FRL, MST, DP above 8 bpc.
+Model-tested only; not run on an RX 9070 XT.
 Native legacy/HPO DisplayPort stream blanking now waits for actual video-stop
 acknowledgement before resetting or disabling FIFOs. It handles inherited
 disable-in-progress state, keeps timing and link clocks available for PHY

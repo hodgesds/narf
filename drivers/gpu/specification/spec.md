@@ -3533,6 +3533,113 @@ All of this is model-tested only (`drivers/gpu/freesync`, `dcn401-otg`,
 `dcn401-scanout`, `navi48-modeset`, `navi48-kms`, `drm_ioctl`); it has not
 been validated on hardware.
 
+### Navi 48 color management and HDR output
+
+CRTC color follows amdgpu_dm on DCN 4.0.1 with no plane color properties.
+`amdgpu_dcn_color` is the integer port of the Linux math: `Fixed31_32`
+(dc_fixpt, bit-exact), `DrmColorLut::from_bytes`, `is_lut_linear`
+(__is_lut_linear), `regamma_tf` (256 entries: __set_legacy_tf's sRGB-based
+mod_color_calculate_regamma_params with the user ramp; 4096 entries:
+__set_output_tf's linear-base mod_color_calculate_degamma_params with
+apply_lut_1d), `translate_curve_to_hw_format` /
+`regamma_pwl` (cm3_helper_translate_curve_to_hw_format for the 13-region
+SDR layout, then custom floats), `Pwl::registers()` (the
+cm_helper_program_gamcor_xfer_func words) and `ogam_lut_passes()`
+(mpc3_program_ogam_pwl), and for the CTM `ctm_from_bytes`, `ctm_matrix`
+(__drm_ctm_to_dc_matrix, sign-magnitude S31.32 to 3x4) and `gamut_remap`
+(mpc401_set_gamut_remap's S2.13/S3.12 choice and convert_float_matrix).
+`tests/dcn401_color/check.sh` builds Linux's color_gamma.c, fixpt31_32.c,
+custom_float.c, conversion.c and dcn30_cm_common.c on the host and checks
+every register word for 287 LUT and CTM vectors, which the
+`drivers/gpu/dcn-color` kernel tests replay. The PQ/HLG layouts, degamma
+curves and GAMCOR LUT are not ported because the CRTC properties never
+reach them on DCN 4.0.1.
+
+`ColorProgram { pre_degam_srgb, gamut: Option<GamutProgram>, ogam:
+Option<OgamProgram> }` is what a CRTC programs. `ColorProgram::from_crtc(ctm,
+gamma_lut)` maps blobs as amdgpu_dm_update_crtc_color_mgmt and
+amdgpu_dm_update_plane_color_mgmt do: a 256-entry GAMMA_LUT is legacy gamma
+(sRGB-based regamma, the plane input linearized by the PRE_DEGAM sRGB ROM,
+whatever its values); a 4096-entry one regammas unless it is linear, which
+like no LUT bypasses the OGAM; any CTM is a gamut remap. On each of a
+display's pipes (both ODM halves), in dcn401_program_pipe's order:
+dcn401_program_gamut_remap (MPCC_OGAM gamut remap in the set not current,
+then its mode and format; both MCM remaps bypassed), dcn32_set_input_transfer_func
+(dpp3_set_pre_degam sRGB or bypass, GAMCOR bypassed, CM on) and
+mpc3_set_output_gamma (memory forced on, the RAM bank not current, its
+START/SLOPE/END/REGION words, one or three LUT passes, then SELECT).
+`unsafe Otg::set_color(pipe, Option<Arc<ColorProgram>>)` (ColdBoot
+`set_display_color`) records a display's color; the scanout start programs
+it under the OTG master lock so it latches with the plane, and a
+`ScanoutRunning` pipe is reprogrammed at once under the same lock
+(`State::UpdatingStream`; cancellation or failure quarantines) and waits
+for the latch, as amdgpu_dm's non-modeset update does. `Status::colors`
+(`PipeColor`) records each pipe's selections; the DPP, MPC and scanout
+verifiers check against it and staging resets it to bypass.
+`tests/dcn401_color_regs.c` checks the offsets and fields against
+dcn_4_1_0.
+
+KMS (`amdgpu_navi48_kms::apply_routed_native`, `Card::crtc_color`) gives
+every Navi 48 CRTC amdgpu_dm's `drm_crtc_enable_color_mgmt(crtc, 0, true,
+4096)`: "CTM" and "GAMMA_LUT" blobs and the immutable "GAMMA_LUT_SIZE"
+(4096); DEGAMMA_LUT is not attached (amdgpu_dm_crtc_init omits it on
+DCN_VERSION_4_01). GETCRTC reports gamma_size 256. CTM blobs must be 72
+bytes, GAMMA_LUT blobs whole drm_color_lut entries numbering 4096 or 256
+(amdgpu_dm_verify_lut_sizes), unknown blobs and properties the CRTC lacks
+are EINVAL; atomic commits need no ALLOW_MODESET and TEST_ONLY applies
+nothing; OBJ_SETPROPERTY sets them too. DRM_IOCTL_MODE_SETGAMMA (master,
+not render) copies the ramps into the CRTC's gamma store and commits a
+256-entry GAMMA_LUT with the CTM reset (drm_crtc_legacy_gamma_set);
+GETGAMMA returns the store; a gamma_size other than 256 is EINVAL, an
+unknown CRTC ENOENT. Cards without color management keep SETGAMMA a no-op.
+GETPROPBLOB serves user blobs, and a blob a committed property names
+outlives DESTROYPROPBLOB until the property lets it go
+(`Card::collect_blobs`). A committed change goes to
+`amdgpu_native_kms::request_crtc_color` after the card lock is released;
+the platform builds the program and a stream updater task (and every
+display monitor pass) converges each display.
+
+Every board HDMI and DP connector carries "Colorspace" (Default, BT709_YCC,
+opRGB, BT2020_RGB, BT2020_YCC: drm_mode_create_{hdmi,dp}_colorspace_property
+for amdgpu_dm's supported set, the same list on both) and
+"HDR_OUTPUT_METADATA" (a 32-byte `struct hdr_output_metadata` blob;
+another size is EINVAL). `amdgpu_hdr` ports the rest: blob decoding,
+drm_hdmi_infoframe_set_hdr_metadata and hdmi_drm_infoframe_pack_only,
+amdgpu_dm_fill_hdr_info_packet (HDMI DRM InfoFrame 0x87, DP HDR SDP),
+drm_parse_hdr_metadata_block (`hdr_sink_metadata`, used as Linux does: an
+EOTF the sink does not list is only reported), amdgpu_dm_get_output_color_space
+(`output_color_space`), set_avi_info_frame's C/EC/Q
+(`avi_colorimetry`), enc401's MSA MISC0/MISC1 (`msa_misc`),
+use_vsc_sdp_for_colorimetry (DPCD 1.4 and 0x2210 bit 3, read with the
+extended receiver caps) and mod_build_vsc_infopacket (`vsc_sdp`), checked
+by `tests/dcn401_hdr/check.sh` against code cut from Linux (2443 vectors).
+A new Colorspace or entering/leaving HDR on a driven connector needs
+ALLOW_MODESET (EINVAL through the legacy setters), as
+amdgpu_dm_connector_atomic_check makes it a modeset; new metadata while
+HDR stays on does not. The native card also refuses (EINVAL) HDR metadata
+or a non-default Colorspace on a connector whose lit stream cannot signal
+it (128b/132b DP, and HDR over FRL).
+
+The selection carries `colorspace`, `hdr` and `vsc_colorimetry`;
+`Selection::color_space()` is the stream's dc color space and
+`BlankRequest::colorspace` takes it: the output CSC is find_color_matrix's
+row for it (RGB types bypass, the identity), the blank black follows
+color_space_to_black_color (BT.2020 limited RGB keeps full-range black, as
+Linux does), the HDMI AVI InfoFrame its C/EC/Q, DIO/HPO DP MSA MISC0 and
+DIO MISC1. DIO DP streams on a VSC-capable sink send the VSC SDP in packets
+0 and 1 (GSP0) and, with HDR metadata, the HDR SDP in packet 3 (GSP3)
+before the unblank; HDMI TMDS streams send the DRM InfoFrame in generic
+packet 4 on line 2. `unsafe Otg::set_hdr(pipe, InfoPacket)` (ColdBoot
+`set_display_hdr`) rewrites a running stream's packet with an immediate
+update (amdgpu_dm's hdr_static_metadata stream update). The platform
+relights a display whose connector's Colorspace or HDR on/off changed and
+updates metadata live otherwise. Gaps: HDR packets and the VSC SDP on
+128b/132b and FRL streams, Colorspace/HDR on MST connectors, DP output
+above 8 bpc, plane color pipelines and AMD private properties. Model-tested
+only (`dcn-color`, `hdr`, `dcn401-color`, `dcn401-scanout`, `dcn401-otg`,
+`dcn401-mpc`, `navi48-modeset`, `navi48-kms`, `drm_ioctl`); not validated
+on hardware.
+
 ### Discrete RDNA2 PSP secure-OS bootstrap
 
 `amdgpu_psp_boot::Firmware::open(gpu, registry_cap)` selects
