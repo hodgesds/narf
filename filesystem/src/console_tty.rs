@@ -25,13 +25,23 @@
 //!
 //! Linux ref: `drivers/tty/n_tty.c` (`n_tty_receive_buf`, `n_tty_read`).
 
-use crate::devfs_pty::Termios;
+use crate::devfs_pty::{Termios, WinSize};
 use crate::ntty::{self, LineState};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
 static TERMIOS: IrqSafeSpinLock<Option<Termios>> = IrqSafeSpinLock::new(None);
-static WINSIZE: IrqSafeSpinLock<(u16, u16)> = IrqSafeSpinLock::new((24, 80));
+/// The console's `struct winsize`. 80x24 until the framebuffer console
+/// publishes its text grid (see [`grid_changed`]); a serial-only boot keeps
+/// 80x24. Linux reports 0x0 for a serial console it was never told the size
+/// of, and every reader then falls back to 80 columns; NARF's console is the
+/// serial port and the framebuffer at once, and has always answered 80x24.
+static WINSIZE: IrqSafeSpinLock<WinSize> = IrqSafeSpinLock::new(WinSize {
+    rows: 24,
+    cols: 80,
+    xpixel: 0,
+    ypixel: 0,
+});
 static DISCIPLINE: IrqSafeSpinLock<LineState> = IrqSafeSpinLock::new(LineState::new());
 
 /// The console's foreground process group (job control). Singleton, like
@@ -150,14 +160,39 @@ pub fn set_termios(raw: [u8; 60]) {
     TERMIOS.lock().get_or_insert_with(Termios::default).raw = raw;
 }
 
-/// `(rows, cols)` for TIOCGWINSZ.
-pub fn winsize() -> (u16, u16) {
+/// The console's window size, pixels included, for TIOCGWINSZ.
+pub fn winsize() -> WinSize {
     *WINSIZE.lock()
 }
 
-/// Update `(rows, cols)` (TIOCSWINSZ).
-pub fn set_winsize(rows: u16, cols: u16) {
-    *WINSIZE.lock() = (rows, cols);
+/// Apply a new window size (TIOCSWINSZ, or the framebuffer console's grid),
+/// signalling the foreground process group when it actually changed.
+///
+/// `tty_do_resize` (`drivers/tty/tty_io.c`): an unchanged size returns
+/// early, otherwise `kill_pgrp(pgrp, SIGWINCH, 1)` and store. The early
+/// return keeps a program that re-sends its size from storming SIGWINCH.
+pub fn resize(ws: WinSize) {
+    {
+        let mut cur = WINSIZE.lock();
+        if *cur == ws {
+            return;
+        }
+        *cur = ws;
+    }
+    crate::devfs_pty::pty_deliver_signal(fg_pgrp(), crate::devfs_pty::SIGWINCH);
+}
+
+/// The framebuffer console's text grid changed (installed by the userspace
+/// crate as `narf_console`'s grid hook). Linux's `vc_do_resize` does the
+/// same: rows and columns become the tty's winsize, and the foreground
+/// process group gets SIGWINCH.
+pub fn grid_changed(cols: u16, rows: u16) {
+    resize(WinSize {
+        rows,
+        cols,
+        xpixel: 0,
+        ypixel: 0,
+    });
 }
 
 /// Output-side line-discipline state for the console (OPOST columns).
@@ -303,6 +338,7 @@ pub fn readable_bytes() -> usize {
 #[doc(hidden)]
 pub fn __test_reset_cooked() {
     *DISCIPLINE.lock() = LineState::new();
+    *WINSIZE.lock() = WinSize::default();
     *TERMIOS.lock() = Some(Termios::default());
     FG_PGRP.store(0, Ordering::Release);
 }

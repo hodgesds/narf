@@ -574,7 +574,7 @@ impl Default for WinSize {
 }
 
 /// SIGWINCH — raised on the foreground pgrp when the window size changes.
-const SIGWINCH: u32 = 28;
+pub(crate) const SIGWINCH: u32 = 28;
 
 // ── Pty ───────────────────────────────────────────────────────────────────────
 
@@ -1819,7 +1819,7 @@ fn signal_for_cc(t: &Termios, b: u8) -> Option<u32> {
 
 /// Deliver `signum` to PTY foreground process group `pgrp` via the
 /// installed hook. No-op (false) when no hook is installed or `pgrp` is 0.
-fn pty_deliver_signal(pgrp: u64, signum: u32) -> bool {
+pub(crate) fn pty_deliver_signal(pgrp: u64, signum: u32) -> bool {
     if pgrp == 0 {
         return false;
     }

@@ -6139,14 +6139,19 @@ kernel_test_in!("filesystem", smoke_overlay_copy_up_metadata);
 
 /// Resolve a fresh `/dev/tty1` FileOps (a `DevConsole`) for ioctl tests.
 fn open_dev_tty1_for_test() -> Option<alloc::sync::Arc<dyn crate::FileOps>> {
+    open_dev_node_for_test("tty1")
+}
+
+fn open_dev_node_for_test(name: &str) -> Option<alloc::sync::Arc<dyn crate::FileOps>> {
     use crate::{bootstrap_mount_authority, registry, DevFs};
     let auth = bootstrap_mount_authority();
     // Idempotent: a prior smoke may already own this mountpoint.
     let _ = registry().mount(&auth, "/dev/tty-ioctl-test-mount", DevFs::new());
     registry()
-        .resolve_absolute("/dev/tty-ioctl-test-mount/tty1", |fs, rel| {
-            crate::resolve(fs.root(), rel).ok()
-        })
+        .resolve_absolute(
+            &alloc::format!("/dev/tty-ioctl-test-mount/{name}"),
+            |fs, rel| crate::resolve(fs.root(), rel).ok(),
+        )
         .flatten()
 }
 
@@ -6189,6 +6194,86 @@ kernel_test_in!(
     "filesystem",
     smoke_devfs_tty1_is_console_and_winsize_roundtrip
 );
+
+// The framebuffer console's text grid is the console tty's winsize, on
+// /dev/console and /dev/tty1 alike (Linux: `vc_do_resize` sets the tty's
+// winsize from `vc_cols` / `vc_rows`). A 3840x2160 screen of 8x8 glyphs is
+// 480 columns: reporting 80 makes systemd cut its status lines short.
+fn smoke_console_winsize_follows_fb_text_grid() -> TestResult {
+    use crate::devfs_pty::TIOCGWINSZ;
+    crate::console_tty::__test_reset_cooked();
+    let saved_grid = narf_console::text_grid();
+    narf_console::set_text_grid_hook(crate::console_tty::grid_changed);
+    narf_console::set_text_grid(480, 266);
+    let seen: alloc::vec::Vec<Option<(u16, u16)>> = ["console", "tty1", "tty0"]
+        .into_iter()
+        .map(|name| {
+            let node = open_dev_node_for_test(name)?;
+            let mut ws: [u16; 4] = [0; 4];
+            (node.ioctl(TIOCGWINSZ, ws.as_mut_ptr() as usize) == Ok(0)).then_some((ws[0], ws[1]))
+        })
+        .collect();
+    let (cols, rows) = saved_grid.unwrap_or((0, 0));
+    narf_console::set_text_grid(cols.into(), rows.into());
+    crate::console_tty::__test_reset_cooked();
+    if seen.iter().any(Option::is_none) {
+        return TestResult::Fail("TIOCGWINSZ on a console node failed");
+    }
+    if seen.iter().any(|ws| *ws != Some((266, 480))) {
+        return TestResult::Fail("console winsize does not follow the fb text grid");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_console_winsize_follows_fb_text_grid);
+
+// A console resize raises SIGWINCH on the foreground process group, once:
+// an unchanged size is not a resize (`tty_do_resize`'s early return), and
+// TIOCSWINSZ resizes the same way the grid does.
+fn smoke_console_resize_raises_sigwinch_once() -> TestResult {
+    use crate::devfs_pty::{install_pty_signal_hook, TIOCSWINSZ};
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    fn hook(pgrp: u64, signum: u32) -> bool {
+        CALLS.fetch_add(1, Ordering::AcqRel);
+        LAST.store(pgrp << 8 | signum as u64, Ordering::Release);
+        true
+    }
+
+    crate::console_tty::__test_reset_cooked();
+    CALLS.store(0, Ordering::Release);
+    LAST.store(0, Ordering::Release);
+    install_pty_signal_hook(hook);
+    crate::console_tty::set_fg_pgrp(4242);
+
+    crate::console_tty::grid_changed(160, 50);
+    let after_grid = CALLS.load(Ordering::Acquire);
+    crate::console_tty::grid_changed(160, 50);
+    let after_same = CALLS.load(Ordering::Acquire);
+    let last = LAST.load(Ordering::Acquire);
+    let tiocs_ok = match open_dev_tty1_for_test() {
+        Some(tty1) => {
+            let mut ws: [u16; 4] = [30, 90, 0, 0];
+            tty1.ioctl(TIOCSWINSZ, ws.as_mut_ptr() as usize) == Ok(0)
+        }
+        None => false,
+    };
+    let after_tiocs = CALLS.load(Ordering::Acquire);
+    crate::console_tty::__test_reset_cooked();
+
+    if after_grid != 1 || last != (4242 << 8 | 28) {
+        return TestResult::Fail("grid change did not SIGWINCH the fg pgrp");
+    }
+    if after_same != 1 {
+        return TestResult::Fail("unchanged size raised SIGWINCH");
+    }
+    if !tiocs_ok || after_tiocs != 2 {
+        return TestResult::Fail("TIOCSWINSZ resize did not raise SIGWINCH");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_console_resize_raises_sigwinch_once);
 
 // TIOCSPGRP → TIOCGPGRP round-trip on /dev/console: getty sets the
 // foreground pgrp for the login session; login reads it back.

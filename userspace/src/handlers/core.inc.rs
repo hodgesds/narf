@@ -1049,6 +1049,10 @@ pub fn init_per_task_state() {
             console_tiocnotty,
             console_tiocgsid,
         );
+        // The console tty's winsize follows the framebuffer console's text
+        // grid (Linux `vc_do_resize` → `tty_do_resize`); applied at once if
+        // the framebuffer console is already up.
+        narf_console::set_text_grid_hook(narf_filesystem::console_tty::grid_changed);
     }
 }
 
