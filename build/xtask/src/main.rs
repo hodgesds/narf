@@ -10113,34 +10113,8 @@ fn perf_bench_cmd(args: &BuildArgs) -> Result<()> {
 
     // 1. NARF under QEMU.
     println!("── NARF (microkernel) under QEMU ──");
-    let mut build = args.clone();
-    ensure_feature(&mut build.features, "boot-init");
-    ensure_feature(&mut build.features, "firmware-allow-unsigned");
-    let out_dir = cargo_build(&build, &root)?;
-    let kernel = out_dir.join(&build.package);
-    if !kernel.exists() {
-        bail!(
-            "expected kernel binary at {} — did `cargo build` succeed?",
-            kernel.display()
-        );
-    }
-    let fw_dir = root.join("target").join("firmware");
-    let (fw_initramfs, _) = collect_firmware_blobs(&fw_dir, &build.initramfs_firmware)?;
-    let mut cpio_path = None;
-    if !fw_initramfs.is_empty() {
-        let cpio_entries: Vec<(&str, &[u8])> = fw_initramfs
-            .iter()
-            .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
-            .collect();
-        let cpio = encode_cpio_newc(&cpio_entries);
-        let p = out_dir.join("initramfs.cpio");
-        std::fs::write(&p, &cpio)
-            .with_context(|| format!("writing initramfs CPIO to {}", p.display()))?;
-        cpio_path = Some(p);
-    }
     let typed = format!("chroot_run /bin/busybox sh /perfbench.sh {threads}");
-    let narf_serial =
-        run_interactive_boot(&kernel, cpio_path.as_ref(), &build, &typed, "PERFBENCH-DONE")?;
+    let narf_serial = boot_narf_guest_script(args, &root, &typed, "PERFBENCH-DONE")?;
     let narf = parse_perf_metrics(&narf_serial);
     if narf.is_empty() {
         bail!(
@@ -10236,8 +10210,65 @@ fn perf_bench_cmd(args: &BuildArgs) -> Result<()> {
         );
     }
     println!("└────────────────────────────────────────────────────────────");
+    // A value of 0 almost always means /perfbench.sh's awk extraction did
+    // not match this perf build's output shape (empty capture → `${V:-0}`),
+    // not a real zero. Call those out — otherwise a benchmark that silently
+    // failed to parse folds into an n/a row and a wholly broken sweep still
+    // prints "ok". Mirrors stress_bench_cmd's zero-bogo-ops note.
+    for (side, metrics) in [("NARF", Some(&narf)), ("Linux", linux.as_ref())] {
+        let Some(metrics) = metrics else { continue };
+        for m in metrics {
+            if m.value == 0.0 {
+                println!(
+                    "  note: {side} `{}` extracted 0 — /perfbench.sh awk likely did not match perf output",
+                    m.name
+                );
+            }
+        }
+    }
     println!("\nxtask perf-bench: ok");
     Ok(())
+}
+
+/// Build NARF with the benchmark rootfs features (`boot-init` +
+/// `firmware-allow-unsigned`), stage its firmware CPIO, and boot it under
+/// QEMU typing `typed` at the shell prompt; return the serial transcript
+/// once `expect` appears. The NARF-side counterpart of
+/// [`boot_linux_guest_script`], shared by `stress-bench` and `perf-bench`
+/// so both sweeps boot an identically-configured kernel (any change to how
+/// the benchmark kernel is built/launched now lands in one place).
+fn boot_narf_guest_script(
+    args: &BuildArgs,
+    root: &Path,
+    typed: &str,
+    expect: &str,
+) -> Result<String> {
+    let mut build = args.clone();
+    ensure_feature(&mut build.features, "boot-init");
+    ensure_feature(&mut build.features, "firmware-allow-unsigned");
+    let out_dir = cargo_build(&build, root)?;
+    let kernel = out_dir.join(&build.package);
+    if !kernel.exists() {
+        bail!(
+            "expected kernel binary at {} — did `cargo build` succeed?",
+            kernel.display()
+        );
+    }
+    let fw_dir = root.join("target").join("firmware");
+    let (fw_initramfs, _) = collect_firmware_blobs(&fw_dir, &build.initramfs_firmware)?;
+    let mut cpio_path = None;
+    if !fw_initramfs.is_empty() {
+        let cpio_entries: Vec<(&str, &[u8])> = fw_initramfs
+            .iter()
+            .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
+            .collect();
+        let cpio = encode_cpio_newc(&cpio_entries);
+        let p = out_dir.join("initramfs.cpio");
+        std::fs::write(&p, &cpio)
+            .with_context(|| format!("writing initramfs CPIO to {}", p.display()))?;
+        cpio_path = Some(p);
+    }
+    run_interactive_boot(&kernel, cpio_path.as_ref(), &build, typed, expect)
 }
 
 /// See [`Cmd::StressBench`].
@@ -10280,38 +10311,12 @@ fn stress_bench_cmd(args: &BuildArgs) -> Result<()> {
 
     // 1. NARF under QEMU.
     println!("── NARF (microkernel) under QEMU ──");
-    let mut build = args.clone();
-    ensure_feature(&mut build.features, "boot-init");
-    ensure_feature(&mut build.features, "firmware-allow-unsigned");
-    let out_dir = cargo_build(&build, &root)?;
-    let kernel = out_dir.join(&build.package);
-    if !kernel.exists() {
-        bail!(
-            "expected kernel binary at {} — did `cargo build` succeed?",
-            kernel.display()
-        );
-    }
-    let fw_dir = root.join("target").join("firmware");
-    let (fw_initramfs, _) = collect_firmware_blobs(&fw_dir, &build.initramfs_firmware)?;
-    let mut cpio_path = None;
-    if !fw_initramfs.is_empty() {
-        let cpio_entries: Vec<(&str, &[u8])> = fw_initramfs
-            .iter()
-            .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
-            .collect();
-        let cpio = encode_cpio_newc(&cpio_entries);
-        let p = out_dir.join("initramfs.cpio");
-        std::fs::write(&p, &cpio)
-            .with_context(|| format!("writing initramfs CPIO to {}", p.display()))?;
-        cpio_path = Some(p);
-    }
     let typed = if list.is_empty() {
         format!("chroot_run /bin/busybox sh /sweep.sh {dur} {workers}")
     } else {
         format!("chroot_run /bin/busybox sh /sweep.sh {dur} {workers} {list}")
     };
-    let narf_serial =
-        run_interactive_boot(&kernel, cpio_path.as_ref(), &build, &typed, "SWEEP-DONE")?;
+    let narf_serial = boot_narf_guest_script(args, &root, &typed, "SWEEP-DONE")?;
     let narf = parse_stress_metrics(&narf_serial);
     if narf.is_empty() {
         bail!(
