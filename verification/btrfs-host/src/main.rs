@@ -52,7 +52,7 @@ USAGE: narf-btrfs-host [OPTIONS]
 /// The default selection (`regress` = every `regress-*` case).
 pub const SCENARIOS: [&str; 5] = ["regress", "root", "snapshots", "lba4k", "gate"];
 /// Names `--scenario` also accepts.
-const REGRESS: [&str; 1] = ["regress-zstd-tail"];
+const REGRESS: [&str; 2] = ["regress-zstd-tail", "regress-inline-falloc"];
 
 #[derive(Clone, Debug)]
 struct Args {
@@ -533,6 +533,19 @@ fn regress_zstd_tail() -> Vec<Op> {
     }]
 }
 
+/// fallocate inside an inline file's first sector preallocated an unaligned
+/// extent beside the inline one (`btrfs check`: "file extent overlap"):
+/// snapshots seed 1.
+fn regress_inline_falloc() -> Vec<Op> {
+    vec![Op::Fallocate {
+        sub: 0,
+        path: p("inline"),
+        mode: 0,
+        off: 1154,
+        len: 541,
+    }]
+}
+
 fn regress(name: &'static str, script: fn() -> Vec<Op>) -> Scenario {
     Scenario {
         name,
@@ -566,6 +579,7 @@ fn main() {
     let t0 = Instant::now();
     let scenarios = [
         regress("regress-zstd-tail", regress_zstd_tail),
+        regress("regress-inline-falloc", regress_inline_falloc),
         Scenario {
             name: "root",
             lba: 512,

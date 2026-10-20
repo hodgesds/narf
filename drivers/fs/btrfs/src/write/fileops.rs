@@ -624,6 +624,17 @@ async fn prealloc_once<B: BlockDevice + 'static>(
     }
     let (fs_root, _) = vol.fs_tree_root();
     let items = file_items(vol, fs_root, ino).await?;
+    // A (still) inline file owns its whole first sector: Linux's extent map
+    // reports the inline extent as `[0, sectorsize)`, so `btrfs_fallocate`
+    // finds nothing to preallocate there. Preallocating from the inline
+    // item's byte length instead would put a sector-unaligned PREALLOC
+    // extent beside the inline one, which `btrfs check` rejects.
+    let a = if a < ss && items.iter().any(|i| i.kind == Kind::Inline) {
+        ss
+    } else {
+        a
+    };
+    let b = b.max(a);
     let holes = gaps(&items, a, b, false);
     let root = vol.fs_tree_id();
     // Explicit hole items in the range give way to the prealloc extents.
