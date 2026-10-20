@@ -921,9 +921,10 @@ kernel_test_in!(
     smoke_ath11k_int_wpas_sae_authenticate
 );
 
-/// Recovery restores only what the kernel itself connected: after an
-/// nl80211 CONNECT the loss is reported (DEAUTHENTICATE + DISCONNECT,
-/// reason 1) and NARF does not reassociate; wpa_supplicant reconnects.
+/// A connection made over nl80211 survives a firmware reset like any
+/// other: mac80211's `ieee80211_reconfig` replays the associated station
+/// whoever connected it, so no loss is reported (no DEAUTHENTICATE or
+/// DISCONNECT), the carrier stays on and NARF does not reassociate.
 fn smoke_ath11k_int_recover_nl80211_origin() -> TestResult {
     check(|| {
         let u = up(wpa2_cfg())?;
@@ -942,18 +943,14 @@ fn smoke_ath11k_int_recover_nl80211_origin() -> TestResult {
             "recovered"
         );
         ensure!(
-            u.netdev.stats.reconnects.load(Ordering::Relaxed) == 0 && !u.netdev.link_up(),
-            "no reconnect for a userspace connection"
+            u.netdev.stats.reconnects.load(Ordering::Relaxed) == 0
+                && u.netdev.link_up()
+                && u.netdev.connected_bssid() == Some(BSSID),
+            "station replayed in place, no reassociation"
         );
-        ensure!(*DISC_SEEN.lock() == [(1, false)], "loss reported, reason 1");
-        ensure!(
-            MLME_SEEN
-                .lock()
-                .first()
-                .is_some_and(|f| f[0] == 0xc0 && f[24..26] == [1, 0]),
-            "as our Deauthentication"
-        );
-        ensure!(*LINK_SEEN.lock() == [false], "carrier stays off");
+        ensure!(DISC_SEEN.lock().is_empty(), "no loss reported");
+        ensure!(MLME_SEEN.lock().is_empty(), "no Deauthentication");
+        ensure!(LINK_SEEN.lock().is_empty(), "carrier stays on");
         Ok(())
     })
 }

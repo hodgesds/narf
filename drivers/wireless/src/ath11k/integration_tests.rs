@@ -2188,7 +2188,14 @@ fn smoke_ath11k_int_disconnect_reason() -> TestResult {
             "deauth to another DA ignored"
         );
 
-        // Beacon loss: WMI_ROAM BEACON_MISS, no beacon for 3 s.
+        // Beacon loss: WMI_ROAM BEACON_MISS, no beacon for 3 s, and the AP
+        // is gone: the directed Null probes of ieee80211_mgd_probe_ap go
+        // unacknowledged (an ACK would keep the connection).
+        u.dev.st.borrow_mut().tx_rel = TxRel::Tqm {
+            reason: super::dp_ring::tqm::CMD_REMOVE_TX,
+            peer: AP_PEER_ID as u32,
+            tries: 1,
+        };
         let w = |v: u32| v.to_le_bytes();
         let mut roam = Vec::new();
         for v in [0u32, super::mac::WMI_ROAM_REASON_BEACON_MISS, 0] {
@@ -3894,7 +3901,9 @@ fn htt_types(u: &Up) -> Vec<u8> {
 /// cycle of the device model, QMI to FW_INIT_DONE), `restart_work` →
 /// `ath11k_core_reconfigure_on_crash` (DP / CE / HAL torn down after the
 /// reset, QMI firmware start, CE / HTC / WMI / DP again), the mac layer
-/// restarted, the 4-way handshake again and data through the new rings.
+/// restarted and the station replayed in place as `ieee80211_reconfig`
+/// does (keys re-enabled, no new 4-way handshake, the carrier never
+/// dropped), then data through the new rings.
 fn smoke_ath11k_int_crash_recover_reconnect() -> TestResult {
     check(|| {
         let mut u = up(wpa2_cfg())?;
@@ -3902,6 +3911,17 @@ fn smoke_ath11k_int_crash_recover_reconnect() -> TestResult {
         ensure!(u.netdev.link_up(), "connected before the crash");
         let rings = run(u.shared.lock()).core.hif.ce.hal.srng_ids();
         let htt_before = htt_types(&u);
+        let install_keys = |u: &Up| {
+            u.dev
+                .st
+                .borrow()
+                .wmi
+                .iter()
+                .filter(|c| c.cmd_id == wmi::WMI_VDEV_INSTALL_KEY_CMDID)
+                .count()
+        };
+        ensure!(install_keys(&u) == 2, "PTK + GTK from the 4-way");
+        let m4_before = u.dev.st.borrow().world.ap.m4_ok;
         LINK_SEEN.lock().clear();
         DISC_SEEN.lock().clear();
         crash(&u, FwNotice::Reset(MhiNotify::EeRddm));
@@ -3946,24 +3966,25 @@ fn smoke_ath11k_int_crash_recover_reconnect() -> TestResult {
                 && htt[htt_before.len()..].starts_with(&[0x0, 0xb, 0xb, 0xb, 0xb, 0xb, 0xb, 0xb]),
             "VERSION_REQ + 7 SRING_SETUP after the reset"
         );
-        // Carrier: off for the recovery, on after the reconnect.
-        ensure!(*LINK_SEEN.lock() == [false, true], "carrier off, then on");
-        ensure!(
-            *DISC_SEEN.lock() == [(1, false)],
-            "disconnect reported as a connection loss (reason 1)"
-        );
+        // ieee80211_reconfig keeps the association: no carrier change and
+        // no DISCONNECT for a station it can replay.
+        ensure!(LINK_SEEN.lock().is_empty(), "carrier stays on");
+        ensure!(DISC_SEEN.lock().is_empty(), "no disconnect reported");
         ensure!(
             u.netdev.link_up() && u.netdev.connected_bssid() == Some(BSSID),
-            "reconnected to the AP"
+            "still associated to the AP"
         );
         ensure!(
             u.netdev.stats.recovered.load(Ordering::Relaxed) == 1
-                && u.netdev.stats.reconnects.load(Ordering::Relaxed) == 1,
-            "netdev counters"
+                && u.netdev.stats.reconnects.load(Ordering::Relaxed) == 0,
+            "netdev counters: recovered, no reconnect"
         );
+        // ieee80211_reenable_keys: the same PTK and GTK installed again,
+        // with no new handshake.
+        ensure!(install_keys(&u) == 4, "PTK + GTK re-enabled");
         ensure!(
-            u.dev.st.borrow().world.ap.m4_ok,
-            "4-way handshake completed again"
+            u.dev.st.borrow().world.ap.m4_ok == m4_before,
+            "no new 4-way handshake"
         );
         // Data through the rebuilt DP rings.
         let before = u.dev.st.borrow().tcl_tx.len();
