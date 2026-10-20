@@ -31,8 +31,8 @@ use super::sae::{
 use super::sec::EID_RSNX;
 use super::sec::{bip_cipher, protected_mgmt_mic_len};
 use super::{
-    channel_number_freq, errno, fail, firmware_key_cipher, step, timeout, DataPort, Mac, MacError,
-    ScanState, VdevInstallKeyArg, WmiPort, WMI_KEY_PAIRWISE,
+    errno, fail, firmware_key_cipher, step, timeout, DataPort, Mac, MacError, ScanState,
+    VdevInstallKeyArg, WmiPort, WMI_KEY_PAIRWISE,
 };
 
 /// The keys an external supplicant installed (mac80211's key table for
@@ -450,14 +450,10 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         if self.vif.is_none() {
             return fail(step::CONNECT_STATE, 1, errno::ENOTCONN, "auth (no vdev)");
         }
-        let Some(freq) = channel_number_freq(req.channel) else {
-            return fail(
-                step::CONNECT_NO_BSS,
-                req.channel,
-                errno::EINVAL,
-                "auth (channel)",
-            );
-        };
+        // The BSS is identified by its MHz frequency, as cfg80211's
+        // `ieee80211_get_channel`; the scan-table lookup below rejects any
+        // frequency this radio never saw it on.
+        let freq = req.frequency_mhz;
         let alg = match req.auth_type {
             0 => frame::WLAN_AUTH_OPEN,
             4 => WLAN_AUTH_SAE,

@@ -2261,7 +2261,7 @@ fn smoke_ath11k_mac_userspace_reassociation_fallback() -> TestResult {
         let first = MlmeAuthRequest {
             peer: BSSID,
             ssid: SSID.to_vec(),
-            channel: 6,
+            frequency_mhz: 2437,
             auth_type: 0,
             auth_data: Vec::new(),
             ie: Vec::new(),
@@ -2270,7 +2270,7 @@ fn smoke_ath11k_mac_userspace_reassociation_fallback() -> TestResult {
         block(m.sme_associate(&MlmeAssocRequest {
             peer: BSSID,
             ssid: SSID.to_vec(),
-            channel: 6,
+            frequency_mhz: 2437,
             ie: Vec::new(),
             prev_bssid: None,
             use_mfp: false,
@@ -2282,7 +2282,7 @@ fn smoke_ath11k_mac_userspace_reassociation_fallback() -> TestResult {
         let next = MlmeAuthRequest {
             peer: BSSID2,
             ssid: b"open".to_vec(),
-            channel: 1,
+            frequency_mhz: 2412,
             auth_type: 0,
             auth_data: Vec::new(),
             ie: Vec::new(),
@@ -2292,7 +2292,7 @@ fn smoke_ath11k_mac_userspace_reassociation_fallback() -> TestResult {
         let resp = block(m.sme_associate(&MlmeAssocRequest {
             peer: BSSID2,
             ssid: b"open".to_vec(),
-            channel: 1,
+            frequency_mhz: 2412,
             ie: Vec::new(),
             prev_bssid: Some(BSSID),
             use_mfp: false,

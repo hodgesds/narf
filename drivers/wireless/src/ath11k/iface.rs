@@ -2982,7 +2982,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WirelessNetIface for Ath11kNetdev<Io, Irq, 
             self.set_control_port(req.control_port);
             *self.last_assoc.lock() = None;
             // ieee80211_set_associated → netif_carrier_on.
-            self.set_link(true, b, req.channel);
+            self.set_link(true, b, frame::freq_to_channel(req.frequency_mhz));
         }
         Ok(frame)
     }

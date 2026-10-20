@@ -103,9 +103,11 @@ until its low-power lifecycle enables firmware offload. After firmware
 rekeying, `notify_gtk_rekey` multicasts the same command with only the AP MAC
 and nested `REKEY_DATA_REPLAY_CTR`, matching `cfg80211_gtk_rekey_notify`.
 
-`ScanRequest::frequencies_mhz`, `BssInfo::frequency_mhz`, and
-`AssociateRequest::frequency_mhz` are the authoritative centre-frequency
-identities in MHz. `BssInfo::channel` remains the IEEE channel number for
+`ScanRequest::frequencies_mhz`, `BssInfo::frequency_mhz`,
+`AssociateRequest::frequency_mhz` and the userspace-SME
+`MlmeAuthRequest::frequency_mhz` / `MlmeAssocRequest::frequency_mhz`
+(AUTHENTICATE / ASSOCIATE's `NL80211_ATTR_WIPHY_FREQ`) are the authoritative
+centre-frequency identities in MHz. `BssInfo::channel` remains the IEEE channel number for
 presentation and legacy callers, but is not sufficient to distinguish 6 GHz
 from the same numbered 2.4/5 GHz channels. A scan request that supplies
 frequencies uses them in preference to its legacy `channels` list; an

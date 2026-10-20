@@ -1306,7 +1306,9 @@ pub struct WirelessConfig {
 pub struct MlmeAuthRequest {
     pub peer: [u8; 6],
     pub ssid: Vec<u8>,
-    pub channel: u32,
+    /// NL80211_ATTR_WIPHY_FREQ of the BSS, in MHz. A channel number would
+    /// not do: 6 GHz numbering overlaps the 2.4 GHz band.
+    pub frequency_mhz: u32,
     /// `enum nl80211_auth_type`.
     pub auth_type: u32,
     /// NL80211_ATTR_AUTH_DATA: for SAE the transaction sequence number and
@@ -1322,7 +1324,8 @@ pub struct MlmeAuthRequest {
 pub struct MlmeAssocRequest {
     pub peer: [u8; 6],
     pub ssid: Vec<u8>,
-    pub channel: u32,
+    /// NL80211_ATTR_WIPHY_FREQ of the BSS, in MHz.
+    pub frequency_mhz: u32,
     pub ie: Vec<u8>,
     pub prev_bssid: Option<[u8; 6]>,
     pub use_mfp: bool,
