@@ -215,6 +215,22 @@ fn decide_odm(mode: &Mode, dispclk_ss_khz: u64) -> u32 {
     odm.min(3)
 }
 
+/// The pipes admission gives a DSC stream of `timing` with `slices`
+/// horizontal slices on a board whose highest DISPCLK is
+/// `dispclk_max_khz` (DecideODMMode less downspread, as `admit_all` runs
+/// it): 1, 2, or 3 for a wider split. DSC policy uses it to keep each
+/// segment within one DSC.
+pub fn dsc_pipes(timing: &Timing, slices: u32, dispclk_max_khz: u32) -> u32 {
+    let mode = Mode {
+        timing: *timing,
+        pitch: timing.h_active,
+        ycbcr420: false,
+        dsc: Some(Dsc { slices, bpp_x16: 0 }),
+    };
+    let ss = u64::from(dispclk_max_khz) * 10_000 / DOWNSPREAD_TENTHOUSANDTHS as u64;
+    decide_odm(&mode, ss)
+}
+
 /// Clocks the plan was computed for. DISPCLK, DPPREFCLK and the pipe's DPPCLK
 /// are minimums the clock owner must meet; DCFCLK/FCLK/UCLK are DML's own
 /// state for this UCLK, below the pinned floors.

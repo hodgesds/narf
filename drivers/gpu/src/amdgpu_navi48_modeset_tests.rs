@@ -1341,8 +1341,10 @@ kernel_test_in!(
 /// DSC as amdgpu_dm's SST policy uses it here: a 4K60 sink on two HBR2
 /// lanes (8,380,800 kbps with FEC) cannot take the 14,256,000 kbps stream,
 /// so it is compressed to the highest bpp that link carries, on the
-/// maximum 8b/10b link, without audio; a sink without DSC, without FEC or
-/// with 128b/132b gets no DSC here, and a stream that fits needs none.
+/// maximum 8b/10b link, with its audio; an 8b/10b sink without DSC or
+/// without FEC gets no DSC (128b/132b sinks:
+/// `navi48_modeset_decides_uhbr_dsc_like_linux`), and a stream that fits
+/// needs none.
 fn navi48_modeset_decides_dsc_like_linux() -> TestResult {
     use crate::amdgpu_dsc::{compute_config, DscSinkCaps, DscTiming, Encoding, LinkEncoding};
     let p = path(inventory::Connector::DisplayPort, 0);
@@ -2362,4 +2364,306 @@ fn navi48_modeset_dp_selection_carries_the_freesync_range() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_modeset_dp_selection_carries_the_freesync_range
+);
+
+/// DSC 1.2 decoder caps: slices 1/2/4, 13-bit line buffer, RGB, 8/10/12
+/// bpc, 1000 MP/s per slice, 5120-pixel slices, 1/16 bpp.
+const UHBR_DSC: [u8; 16] = [
+    1, 0x21, 0, 0x0b, 0x0b, 4, 1, 0, 0, 0x13, 0x0e, 0xee, 16, 0, 0, 0,
+];
+/// CVT-RB2-like timings past one 4 x UHBR10 link uncompressed.
+fn big_timing(khz: u32, h_active: u32, v_active: u32, v_total: u32) -> Timing {
+    Timing {
+        pixel_clock_khz: khz,
+        h_active,
+        h_total: h_active + 80,
+        h_front_porch: 48,
+        h_sync_width: 32,
+        v_active,
+        v_total,
+        v_front_porch: 3,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: false,
+    }
+}
+fn uhd8k60() -> Timing {
+    big_timing(2_039_793, 7680, 4320, 4381)
+}
+fn uhd240() -> Timing {
+    big_timing(2_151_590, 3840, 2160, 2287)
+}
+fn uhd144() -> Timing {
+    big_timing(1_254_282, 3840, 2160, 2222)
+}
+
+/// DSC over 128b/132b as amdgpu_dm's SST policy and dc pick it. The DSC
+/// target is dc_link_bandwidth_kbps at the sink's maximum link
+/// (dc_link_get_link_cap): 4 x UHBR10 on a UHBR10 sink, so the 128b/132b
+/// encoding (its padded uncompressed stream decides whether DSC is
+/// needed), not 4 x HBR3 with FEC. Uncompressed UHBR wins whenever any
+/// rate the sink reaches carries the mode (8K60 and 4K240 run uncompressed
+/// on 4 x UHBR13.5). The compressed stream then takes the lowest setting
+/// upward its bandwidth needs. Configurations, compressed bandwidths and
+/// link targets match Linux's dc_dsc_compute_config built on the host
+/// (tests/dcn401_dsc harness): 8K60 4 slices at 16 bpp, 32,905,857 kbps;
+/// 4K240 4 slices at 16 bpp, 34,987,489 kbps; 4K144 on two UHBR10 lanes
+/// 2 slices at 243/16 bpp, 19,213,233 kbps; 8K60 on 4 x HBR3 with FEC 4
+/// slices at 195/16 bpp, 25,129,147 kbps (two DSCs under ODM 2:1).
+fn navi48_modeset_decides_uhbr_dsc_like_linux() -> TestResult {
+    use crate::amdgpu_dsc::{compute_config, dsc_kbps, DscSinkCaps, LinkEncoding};
+    use otg::UhbrRate::{Uhbr10 as U10, Uhbr13_5 as U13, Uhbr20 as U20};
+    use DpRate::{Legacy, Uhbr};
+    let sink = DscSinkCaps::parse(&UHBR_DSC, &[0; 3]).unwrap();
+    let caps = |lanes: u8, uhbr: u8, fec: bool, dsc: bool| DpCaps {
+        lanes,
+        rate: LinkRate::Hbr3,
+        uhbr,
+        fec,
+        dsc: dsc.then_some(sink),
+    };
+    // (timing, caps, link, Some((slices, bpp_x16, kbps, target)) for DSC).
+    type Want = Option<(u32, u32, u32, u64, LinkEncoding)>;
+    type Case = (Timing, DpCaps, Option<(u8, DpRate)>, Want);
+    let cases: [Case; 11] = [
+        (
+            uhd8k60(),
+            caps(4, 0b001, true, true),
+            Some((4, Uhbr(U10))),
+            Some((4, 256, 32_905_857, 38_564_000, LinkEncoding::Dp128b132b)),
+        ),
+        (
+            uhd8k60(),
+            caps(4, 0b011, true, true),
+            Some((4, Uhbr(U13))),
+            None,
+        ),
+        (
+            uhd8k60(),
+            caps(4, 0b101, true, true),
+            Some((4, Uhbr(U20))),
+            None,
+        ),
+        (
+            uhd240(),
+            caps(4, 0b001, true, true),
+            Some((4, Uhbr(U10))),
+            Some((4, 256, 34_987_489, 38_564_000, LinkEncoding::Dp128b132b)),
+        ),
+        (
+            uhd240(),
+            caps(4, 0b111, true, true),
+            Some((4, Uhbr(U13))),
+            None,
+        ),
+        (
+            uhd144(),
+            caps(2, 0b001, true, true),
+            Some((2, Uhbr(U10))),
+            Some((2, 243, 19_213_233, 19_282_000, LinkEncoding::Dp128b132b)),
+        ),
+        (
+            uhd144(),
+            caps(4, 0b001, true, true),
+            Some((4, Uhbr(U10))),
+            None,
+        ),
+        // FEC is inherent in 128b/132b: no 8b/10b FEC cap is needed.
+        (
+            uhd8k60(),
+            caps(4, 0b001, false, true),
+            Some((4, Uhbr(U10))),
+            Some((4, 256, 32_905_857, 38_564_000, LinkEncoding::Dp128b132b)),
+        ),
+        // An 8b/10b-only sink compresses for 4 x HBR3 with FEC; 8K takes
+        // two DSCs (ODM 2:1, two slices each).
+        (
+            uhd8k60(),
+            caps(4, 0, true, true),
+            Some((4, Legacy(LinkRate::Hbr3))),
+            Some((4, 195, 25_129_147, 25_142_400, LinkEncoding::Dp8b10b)),
+        ),
+        // No DSC decoder, or 8b/10b DSC without FEC: no link.
+        (uhd8k60(), caps(4, 0b001, true, false), None, None),
+        (uhd8k60(), caps(4, 0, false, true), None, None),
+    ];
+    for (i, (t, c, link, want)) in cases.into_iter().enumerate() {
+        let uncompressed = dp_link(&t, c);
+        let cfg = dp_dsc(&t, c, NOMINAL_DISPCLK_KHZ);
+        let got = uncompressed.or_else(|| cfg.and_then(|cfg| dsc_link(&t, cfg, c)));
+        assert_eq!(got, link, "case {i}: link");
+        let Some((slices, bpp, kbps, target, encoding)) = want else {
+            assert!(uncompressed.is_some() || got.is_none(), "case {i}: DSC");
+            continue;
+        };
+        assert!(uncompressed.is_none(), "case {i}: carried uncompressed");
+        let cfg = cfg.unwrap();
+        let linux = compute_config(
+            &sink,
+            NOMINAL_DISPCLK_KHZ,
+            target as u32,
+            &dsc_timing(&t),
+            encoding,
+            false,
+        );
+        assert_eq!(Some(cfg), linux, "case {i}: dc_dsc_compute_config");
+        assert_eq!((cfg.slices_h, cfg.bpp_x16), (slices, bpp), "case {i}");
+        assert_eq!(dsc_kbps(&dsc_timing(&t), cfg.bpp_x16, cfg.slices_h), kbps);
+        // The admission shape: the DSCs DML gives the stream.
+        let pipes = dml::dsc_pipes(&t, cfg.slices_h, NOMINAL_DISPCLK_KHZ);
+        assert_eq!(
+            pipes,
+            if t.h_active > 5760 || t.pixel_clock_khz > 1_992_428 {
+                2
+            } else {
+                1
+            }
+        );
+    }
+    // A UHBR sink never compresses onto 8b/10b: 16 bpp is two thirds of
+    // 24, and 8b/10b with FEC at any lane count carries less than two
+    // thirds of UHBR10 at that count. Sweep 4K and 8K pixel clocks.
+    for lanes in [1, 2, 4] {
+        for h_active in [3840, 7680] {
+            for khz in (300_000..2_600_000).step_by(25_000) {
+                let t = big_timing(khz, h_active, 2160, 2222);
+                let c = caps(lanes, 0b111, true, true);
+                if dp_link(&t, c).is_some() {
+                    continue;
+                }
+                if let Some(cfg) = dp_dsc(&t, c, NOMINAL_DISPCLK_KHZ) {
+                    match dsc_link(&t, cfg, c) {
+                        Some((_, Uhbr(_))) => {}
+                        other => panic!("{lanes} lanes {h_active} at {khz}: {other:?}"),
+                    }
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_decides_uhbr_dsc_like_linux
+);
+
+/// A one-lane UHBR10 sink (DSC decoder, board connector at UHBR10) and its
+/// EDID's 4K60 (14,256,000 kbps): neither 1 x HBR3 nor 1 x UHBR10
+/// (9,641,000 kbps) carries it, so select compresses it for 1 x UHBR10,
+/// on 1 x UHBR10, through HPO, without audio. refine_dsc redoes it with
+/// the board's DISPCLK, admission takes it, the timing request is HPO DP
+/// with the DSC, and fallback keeps the PPS: Linux's table through the
+/// 128b/132b settings that carry the compressed stream.
+fn navi48_modeset_selects_dsc_over_uhbr() -> TestResult {
+    use crate::amdgpu_dsc::{compute_config, DscSinkCaps, LinkEncoding};
+    use otg::UhbrRate::{Uhbr10 as U10, Uhbr13_5 as U13, Uhbr20 as U20};
+    use DpRate::Uhbr;
+    let mut p = path(inventory::Connector::DisplayPort, 0);
+    p.max_speed_mhz = 10_000;
+    let sink = display::Sink {
+        dpcd: dpcd(0x1e, 1),
+        edid: edid_uhbr(),
+        lttpr: None,
+        uhbr: 1,
+        lttpr_uhbr: None,
+        fec: true,
+        dsc: Some(UHBR_DSC),
+        verified_link: None,
+    };
+    let port = display::Port {
+        path: p,
+        sink: Ok(sink),
+    };
+    let mut s = match select(&[p], &[port], 8, None) {
+        Ok(s) => s,
+        Err(e) => panic!("UHBR DSC selection {e:?}"),
+    };
+    let want = compute_config(
+        &DscSinkCaps::parse(&UHBR_DSC, &[0; 3]).unwrap(),
+        NOMINAL_DISPCLK_KHZ,
+        9_641_000,
+        &dsc_timing(&s.timing),
+        LinkEncoding::Dp128b132b,
+        false,
+    );
+    if !s.uhbr()
+        || (s.lanes, s.rate) != (1, Uhbr(U10))
+        || s.dsc.is_none()
+        || s.dsc != want
+        || s.audio.is_some()
+        || s.timing.pixel_clock_khz != 594_000
+    {
+        panic!("UHBR DSC selection {s:?}");
+    }
+    let soc = dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [500_000, 2_000_000],
+        dcfclk_khz: [300_000, 1_200_000],
+        socclk_khz: 600_000,
+        dispclk_max_khz: 1_500_000,
+        dppclk_max_khz: 1_500_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    let selected = s;
+    refine_dsc(&soc, core::slice::from_mut(&mut s)).unwrap();
+    if (s.lanes, s.rate) != (1, Uhbr(U10)) || s.dsc.is_none() {
+        return TestResult::Fail("refined UHBR DSC");
+    }
+    let plans = match admit_displays(&soc, &[s]) {
+        Ok(p) => p,
+        Err(e) => panic!("UHBR DSC admission {e:?}"),
+    };
+    let request = timing_request(0, &plans[0], &s);
+    if request.signal != otg::Signal::HpoDisplayPort || request.dsc != s.dsc {
+        return TestResult::Fail("HPO timing request");
+    }
+    assert_eq!(selected_dp_candidates(&s), [(1, Uhbr(U10))]);
+    // From a 4 x UHBR20 setting the compressed stream fits every
+    // 128b/132b row of Linux's table; uncompressed, the one-lane rows
+    // below UHBR20 would not.
+    let wide = Selection {
+        lanes: 4,
+        rate: Uhbr(U20),
+        caps: DpCaps {
+            lanes: 4,
+            uhbr: 0b111,
+            ..s.caps
+        },
+        ..selected
+    };
+    let ladder = selected_dp_candidates(&wide);
+    assert_eq!(
+        ladder,
+        [
+            (4, Uhbr(U20)),
+            (4, Uhbr(U13)),
+            (2, Uhbr(U20)),
+            (4, Uhbr(U10)),
+            (2, Uhbr(U13)),
+            (1, Uhbr(U20)),
+            (2, Uhbr(U10)),
+            (1, Uhbr(U13)),
+            (1, Uhbr(U10)),
+        ]
+    );
+    assert!(!dp_candidates(&wide.timing, wide.caps, 4, Uhbr(U20)).contains(&(1, Uhbr(U13))));
+    // Alternatives are offered with their own DSC for the same maximum
+    // link: 4K90 compresses harder.
+    let offered = dp_offered_mode(s.timing, &s, soc.dispclk_max_khz).and_then(|m| m.dsc);
+    let faster = Timing {
+        pixel_clock_khz: 891_000,
+        ..s.timing
+    };
+    let harder = dp_offered_mode(faster, &s, soc.dispclk_max_khz).and_then(|m| m.dsc);
+    match (offered, harder) {
+        (Some(a), Some(b)) if b.bpp_x16 < a.bpp_x16 => {}
+        other => panic!("offered DSC {other:?}"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_selects_dsc_over_uhbr
 );

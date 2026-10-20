@@ -798,38 +798,62 @@ pub fn dp_link(timing: &Timing, caps: DpCaps) -> Option<(u8, DpRate)> {
         .find(|&(l, r)| l <= caps.lanes && dp_fits(timing, caps, l, r))
 }
 
+/// Whether `lanes` at `rate` carries `cfg`'s compressed stream
+/// (dc_dsc_stream_bandwidth_in_kbps, slice overhead included): 8b/10b only
+/// with FEC, at FEC's efficiency; 128b/132b at its own, its stream
+/// unpadded (apply_128b_132b_stream_overhead skips a DSC stream).
 fn dsc_fits(
     timing: &Timing,
     cfg: crate::amdgpu_dsc::DscConfig,
+    caps: DpCaps,
     lanes: u8,
     rate: DpRate,
-    fec: bool,
 ) -> bool {
-    let DpRate::Legacy(rate) = rate else {
-        return false;
+    let have = match rate {
+        DpRate::Legacy(_) if !caps.fec => return false,
+        DpRate::Legacy(r) => legacy_kbps(lanes, r, true),
+        DpRate::Uhbr(r) => uhbr_kbps(lanes, r),
     };
-    fec && u64::from(crate::amdgpu_dsc::dsc_kbps(
+    u64::from(crate::amdgpu_dsc::dsc_kbps(
         &dsc_timing(timing),
         cfg.bpp_x16,
         cfg.slices_h,
-    )) <= legacy_kbps(lanes, rate, true)
+    )) <= have
+}
+
+/// The link a DSC stream lights on, as for an uncompressed one
+/// (`dp_link`) but for its compressed bandwidth, which Linux's
+/// link_decide_link_settings takes from the DSC config: the sink's maximum
+/// 8b/10b link (with FEC) when that carries it, else the first 128b/132b
+/// setting upward, lanes before rate.
+pub fn dsc_link(
+    timing: &Timing,
+    cfg: crate::amdgpu_dsc::DscConfig,
+    caps: DpCaps,
+) -> Option<(u8, DpRate)> {
+    let legacy = DpRate::Legacy(caps.rate);
+    if dsc_fits(timing, cfg, caps, caps.lanes, legacy) {
+        return Some((caps.lanes, legacy));
+    }
+    caps.uhbr_rates()
+        .flat_map(|r| [1, 2, 4].map(|l| (l, DpRate::Uhbr(r))))
+        .find(|&(l, r)| l <= caps.lanes && dsc_fits(timing, cfg, caps, l, r))
 }
 
 /// Admission shape for an alternative DP timing. Recompute its DSC with the
 /// board's real DISPCLK limit, and after fallback require the configuration
 /// that selection would produce to fit the link which actually trained.
 fn dp_offered_mode(timing: Timing, s: &Selection, max_dispclk_khz: u32) -> Option<dml::Mode> {
-    let selected = if s.dsc.is_some() {
-        Some((s.caps.lanes, DpRate::Legacy(s.caps.rate)))
-    } else {
-        dp_link(&s.timing, s.caps)
+    let selected = match s.dsc {
+        Some(cfg) => dsc_link(&s.timing, cfg, s.caps),
+        None => dp_link(&s.timing, s.caps),
     };
     let fell_back = selected != Some((s.lanes, s.rate));
     if dp_link(&timing, s.caps).is_some() {
         return (!fell_back || dp_fits(&timing, s.caps, s.lanes, s.rate)).then(|| mode(timing));
     }
     let cfg = dp_dsc(&timing, s.caps, max_dispclk_khz)?;
-    if fell_back && !dsc_fits(&timing, cfg, s.lanes, s.rate, s.caps.fec) {
+    if fell_back && !dsc_fits(&timing, cfg, s.caps, s.lanes, s.rate) {
         return None;
     }
     Some(dml::Mode {
@@ -858,11 +882,16 @@ fn dsc_timing(t: &Timing) -> crate::amdgpu_dsc::DscTiming {
     }
 }
 
-/// amdgpu_dm's SST DSC policy (apply_dsc_policy_for_stream) where this
-/// driver can carry DSC: a FEC-capable DSC sink without 128b/132b, whose
-/// uncompressed stream exceeds its maximum 8b/10b link (FEC included) is
-/// compressed to the highest bpp that link carries, on one DSC (at most
-/// four slices). DSC over 128b/132b (HPO) is not implemented.
+/// amdgpu_dm's SST DSC policy (apply_dsc_policy_for_stream) for a sink
+/// without a dongle: a stream that no link carries uncompressed is
+/// compressed by dc_dsc_compute_config to the highest bpp the sink's
+/// maximum link (dc_link_get_link_cap) carries, with the highest link
+/// encoding the link can code: 128b/132b at the best UHBR rate when the
+/// sink, its repeaters and the board reach one (FEC is inherent there),
+/// else 8b/10b with FEC. `dsc_link` then picks the link for the compressed
+/// bandwidth. Each DSC takes at most four slices and DSC401's 5184-pixel
+/// image, so the stream must fit the pipes DML gives it (`dml::dsc_pipes`,
+/// ODM 2:1 at most).
 pub fn dp_dsc(
     timing: &Timing,
     caps: DpCaps,
@@ -870,27 +899,42 @@ pub fn dp_dsc(
 ) -> Option<crate::amdgpu_dsc::DscConfig> {
     use crate::amdgpu_dsc::{compute_config, LinkEncoding};
     let sink = caps.dsc?;
-    if !caps.fec || caps.uhbr != 0 {
-        return None;
-    }
-    let target = u32::try_from(legacy_kbps(caps.lanes, caps.rate, true)).ok()?;
+    let (target, encoding) = match caps.uhbr_rates().last() {
+        Some(r) => (uhbr_kbps(caps.lanes, r), LinkEncoding::Dp128b132b),
+        None if caps.fec => (
+            legacy_kbps(caps.lanes, caps.rate, true),
+            LinkEncoding::Dp8b10b,
+        ),
+        None => return None,
+    };
     let cfg = compute_config(
         &sink,
         max_dispclk_khz,
-        target,
+        u32::try_from(target).ok()?,
         &dsc_timing(timing),
-        LinkEncoding::Dp8b10b,
+        encoding,
         false,
     )?;
-    (cfg.slices_h <= 4 && timing.h_active <= 5184).then_some(cfg)
+    let pipes = dml::dsc_pipes(timing, cfg.slices_h, max_dispclk_khz);
+    (pipes <= 2
+        && cfg.slices_h % pipes == 0
+        && cfg.slices_h <= 4 * pipes
+        && timing.h_active <= 5184 * pipes)
+        .then_some(cfg)
 }
 
 /// Redo every DSC decision with the board's highest DISPCLK, as Linux's
-/// clock manager reports it to dc_dsc_compute_config. A stream that no
-/// longer fits one DSC is a link failure.
+/// clock manager reports it to dc_dsc_compute_config, and the link that
+/// carries the new compressed bandwidth. A stream that no longer fits its
+/// DSCs or a link is a link failure.
 pub fn refine_dsc(soc: &dml::Soc, selections: &mut [Selection]) -> Result<(), ModesetError> {
     for s in selections.iter_mut().filter(|s| s.dsc.is_some()) {
-        s.dsc = Some(dp_dsc(&s.timing, s.caps, soc.dispclk_max_khz).ok_or(ModesetError::Link)?);
+        let cfg = dp_dsc(&s.timing, s.caps, soc.dispclk_max_khz).ok_or(ModesetError::Link)?;
+        (s.lanes, s.rate) = dsc_link(&s.timing, cfg, s.caps).ok_or(ModesetError::Link)?;
+        s.dsc = Some(cfg);
+        if s.uhbr() {
+            s.audio = None;
+        }
     }
     Ok(())
 }
@@ -1325,7 +1369,9 @@ pub fn select_all(
             continue;
         };
         let Some(timing) = pick(index, &sink.edid, &|t| {
-            dp_link(t, caps).is_some() || dp_dsc(t, caps, NOMINAL_DISPCLK_KHZ).is_some()
+            dp_link(t, caps).is_some()
+                || dp_dsc(t, caps, NOMINAL_DISPCLK_KHZ)
+                    .is_some_and(|cfg| dsc_link(t, cfg, caps).is_some())
         }) else {
             continue;
         };
@@ -1333,16 +1379,18 @@ pub fn select_all(
             continue;
         };
         // Uncompressed whenever a link carries the mode, as Linux enables
-        // DSC only when needed; otherwise DSC on the maximum 8b/10b link.
-        let (lanes, rate, dsc) = match dp_link(&timing, caps) {
-            Some((lanes, rate)) => (lanes, rate, None),
-            None => match dp_dsc(&timing, caps, NOMINAL_DISPCLK_KHZ) {
-                Some(cfg) => (caps.lanes, DpRate::Legacy(caps.rate), Some(cfg)),
-                None => {
-                    link_short = true;
-                    continue;
-                }
-            },
+        // DSC only when needed; otherwise DSC for the maximum link, on the
+        // link its compressed bandwidth needs.
+        let compressed = || {
+            let cfg = dp_dsc(&timing, caps, NOMINAL_DISPCLK_KHZ)?;
+            dsc_link(&timing, cfg, caps).map(|(lanes, rate)| (lanes, rate, Some(cfg)))
+        };
+        let Some((lanes, rate, dsc)) = dp_link(&timing, caps)
+            .map(|(lanes, rate)| (lanes, rate, None))
+            .or_else(compressed)
+        else {
+            link_short = true;
+            continue;
         };
         out.push(Selection {
             port: index,
@@ -1354,8 +1402,11 @@ pub fn select_all(
             hdmi: false,
             scdc: false,
             depth: otg::ColorDepth::Bpc8,
-            // HPO exposes only LPCM rates fitting its blanking budget.
+            // HPO exposes only LPCM rates fitting its blanking budget; a
+            // compressed HPO stream carries none (its PPS-sharing SDP path
+            // is not ported).
             audio: sink_audio_info(&sink.edid).and_then(|info| match rate {
+                DpRate::Uhbr(_) if dsc.is_some() => None,
                 DpRate::Uhbr(rate) => otg::uhbr_audio_info(
                     info,
                     &timing,
@@ -1525,26 +1576,36 @@ fn legacy_candidates(
     out
 }
 
-/// Preserve the staged DSC/PPS and DML plan while trying lower link settings.
-/// A configuration needing a different compressed bpp requires re-admission.
+/// Preserve the staged DSC/PPS and DML plan while trying lower link settings
+/// that still carry the compressed stream, as Linux's fallback keeps the
+/// stream's DSC config: narf's 8b/10b ladder for an 8b/10b link, Linux's
+/// bandwidth-ordered table through its 128b/132b settings for a 128b/132b
+/// one. A configuration needing a different compressed bpp requires
+/// re-admission.
 fn selected_dp_candidates(s: &Selection) -> Vec<(u8, DpRate)> {
     let Some(cfg) = s.dsc else {
         return dp_candidates(&s.timing, s.caps, s.lanes, s.rate);
     };
-    let DpRate::Legacy(rate) = s.rate else {
-        return Vec::new();
-    };
-    if s.caps.uhbr != 0 || !matches!(s.lanes, 1 | 2 | 4) {
+    if !matches!(s.lanes, 1 | 2 | 4) {
         return Vec::new();
     }
-    legacy_candidates(s.lanes, rate, |l, r| {
-        l <= s.caps.lanes
-            && r as u8 <= s.caps.rate as u8
-            && dsc_fits(&s.timing, cfg, l, DpRate::Legacy(r), s.caps.fec)
-    })
-    .into_iter()
-    .map(|(l, r)| (l, DpRate::Legacy(r)))
-    .collect()
+    let usable = |l: u8, r: DpRate| l <= s.caps.lanes && dsc_fits(&s.timing, cfg, s.caps, l, r);
+    match s.rate {
+        DpRate::Legacy(rate) => legacy_candidates(s.lanes, rate, |l, r| {
+            r as u8 <= s.caps.rate as u8 && usable(l, DpRate::Legacy(r))
+        })
+        .into_iter()
+        .map(|(l, r)| (l, DpRate::Legacy(r)))
+        .collect(),
+        DpRate::Uhbr(_) => FALLBACKS
+            .into_iter()
+            .skip_while(|&setting| setting != (s.lanes, s.rate))
+            .filter(|&(l, r)| match r {
+                DpRate::Legacy(_) => false,
+                DpRate::Uhbr(u) => s.caps.uhbr_rates().any(|c| c == u) && usable(l, r),
+            })
+            .collect(),
+    }
 }
 
 fn admitted_modes(
@@ -2452,12 +2513,7 @@ impl ColdBoot {
         let mut selection = selection;
         let mut refused = ModesetError::Link;
         let transmitter = self.display_paths().map_err(|_| ModesetError::NoSink)?[port].transmitter;
-        let candidates = dp_candidates(
-            &selection.timing,
-            selection.caps,
-            selection.lanes,
-            selection.rate,
-        );
+        let candidates = selected_dp_candidates(&selection);
         let mut trained = false;
         // SAFETY: the caller's obligations; each step checks its predecessor.
         unsafe {
