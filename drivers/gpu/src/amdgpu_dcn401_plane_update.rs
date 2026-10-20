@@ -146,8 +146,8 @@ pub struct PlanesUpdated {
     pub enabled: u8,
     pub disabled: u8,
     pub kept: u8,
+    /// The live scanout now (its plan the deadlines' too).
     pub scanout: ScanoutRunning,
-    pub deadlines: DeadlinesApplied,
     /// Bytes of the superseded surfaces released once the update latched.
     pub released: u64,
 }
@@ -538,7 +538,7 @@ impl Surfaces {
         plan: &dml::Plan,
         crystal_khz: u32,
         mut owners: impl FnMut() -> Result<(dccg::Applied, DisplayContext), Error>,
-    ) -> Result<PlanesUpdated, Error> {
+    ) -> Result<alloc::boxed::Box<PlanesUpdated>, Error> {
         let slot = usize::from(pipe);
         if e.status.state != State::ScanoutRunning(pipe) {
             return Err(Error::Busy);
@@ -917,11 +917,11 @@ impl Surfaces {
             if let Some((c, segments)) = &change.cursor {
                 e.verify_cursor(*c, segments)?;
             }
-            Ok((report, deadlines))
+            Ok(report)
         }
         .await;
         match result {
-            Ok((scanout, deadlines)) => {
+            Ok(scanout) => {
                 // Nothing fetches the superseded buffers: every plane's HUBP
                 // reports its new surface in use, the freed ones are blank
                 // and drained. Drain CPU writes before reuse.
@@ -940,15 +940,15 @@ impl Surfaces {
                     }
                 }
                 e.status.state = State::ScanoutRunning(pipe);
-                Ok(PlanesUpdated {
+                // Boxed: a plan is large and callers' frames are small.
+                Ok(alloc::boxed::Box::new(PlanesUpdated {
                     update,
                     enabled,
                     disabled,
                     kept: used & old_mask,
                     scanout,
-                    deadlines,
                     released,
-                })
+                }))
             }
             Err(err) => {
                 // Retain everything the hardware may still fetch.
@@ -983,7 +983,7 @@ impl Otg {
         request: &LivePlanes,
         plan: &dml::Plan,
         crystal_khz: u32,
-    ) -> Result<PlanesUpdated, Error> {
+    ) -> Result<alloc::boxed::Box<PlanesUpdated>, Error> {
         self.0.select_display(pipe)?;
         let regs = self.0.io.0;
         let held = self.all_held();

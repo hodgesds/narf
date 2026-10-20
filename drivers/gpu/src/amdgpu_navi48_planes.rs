@@ -20,7 +20,7 @@ use super::*;
 pub struct PlanesChange {
     pub pipe: u8,
     pub displays: Vec<Modeset>,
-    pub updated: otg::PlanesUpdated,
+    pub updated: alloc::boxed::Box<otg::PlanesUpdated>,
 }
 
 /// The first `want` pipes of `current`, then free ones for the rest.

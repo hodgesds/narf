@@ -35,8 +35,10 @@ fn overlay_at(q: u8, x: i32, y: i32) -> SurfaceRequest {
     }
 }
 /// DML21's plan for the 640x480 stream with these planes (the unscaled
-/// full-frame primary is implied).
-fn plan_for(primary: SurfaceRequest, overlays: &[SurfaceRequest]) -> dml::Plan {
+/// full-frame primary is implied). Boxed: plans are large and the aarch64
+/// kernel-test stack is 64 KiB.
+#[inline(never)]
+fn plan_for(primary: SurfaceRequest, overlays: &[SurfaceRequest]) -> alloc::boxed::Box<dml::Plan> {
     let mut mode = plan().mode;
     mode.planes = [None; dml::MAX_PLANES];
     if primary.plane.is_some() {
@@ -45,7 +47,7 @@ fn plan_for(primary: SurfaceRequest, overlays: &[SurfaceRequest]) -> dml::Plan {
     for (k, o) in overlays.iter().enumerate() {
         mode.planes[k + 1] = Some(o.dml_plane());
     }
-    dml::admit_all(&soc(), &[mode]).unwrap()[0]
+    alloc::boxed::Box::new(dml::admit_all(&soc(), &[mode]).unwrap()[0])
 }
 /// prepare_bandwidth raised the shared clocks for `plan`: every timing
 /// record carries them.
@@ -90,7 +92,11 @@ fn free_pipe(c: &mut Chain, q: u8) {
 }
 /// One update, run to completion in its own frame (as Chain's steps).
 #[inline(never)]
-fn update(c: &mut Chain, live: &LivePlanes, plan: &dml::Plan) -> Result<PlanesUpdated, Error> {
+fn update(
+    c: &mut Chain,
+    live: &LivePlanes,
+    plan: &dml::Plan,
+) -> Result<alloc::boxed::Box<PlanesUpdated>, Error> {
     let clock = c.clock;
     let p = c.pipe;
     c.e.io.inner.inner.writes.clear();
@@ -209,7 +215,7 @@ fn dcn401_live_plane_update_scales_the_primary_in_place() -> TestResult {
         || u.scanout.address != address
         || c.pool.available() != available
         || c.e.status.state != State::ScanoutRunning(p)
-        || c.e.status.scanout.map(|r| r.plan) != Some(plan)
+        || c.e.status.scanout.map(|r| r.plan) != Some(*plan)
         || c.e.status.surfaces[usize::from(p)].map(|a| a.request) != Some(scaled)
     {
         return TestResult::Fail("records after the update");

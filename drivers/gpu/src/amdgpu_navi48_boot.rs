@@ -1973,7 +1973,7 @@ impl ColdBoot {
         pipe: u8,
         request: &otg::LivePlanes,
         plan: &crate::amdgpu_dcn401_dml::Plan,
-    ) -> Result<otg::PlanesUpdated, otg::Error> {
+    ) -> Result<alloc::boxed::Box<otg::PlanesUpdated>, otg::Error> {
         if self.display_retirement_busy() {
             return Err(otg::Error::Busy);
         }
