@@ -393,7 +393,9 @@ cargo xtask grub-image --arch=x86_64 \
 ```
 
 Each command emits `narf.disks=<mode> root=UUID=<uuid> rootflags=subvol=/@
-systemd_pid1` (`--rootflags` changes the subvolume), then
+systemd_pid1 systemd.zram=0` (`--rootflags` changes the subvolume;
+`systemd.zram=0` keeps zram-generator from creating swap units for a zram
+device NARF does not have), then
 `narf.bootlog=<token>` and the `--cmdline-extra` arguments. Without
 `--root-policy`, grub-image still writes `boot-only`.
 
@@ -835,7 +837,7 @@ The gate passes `--bootlog-token <token>`. The resulting command line is
 printed in the `topology` row, for example:
 
 ```
-narf.disks=root-rw root=UUID=<fsid> rootflags=subvol=/@ systemd_pid1 narf.bootlog=gate...
+narf.disks=root-rw root=UUID=<fsid> rootflags=subvol=/@ systemd_pid1 systemd.zram=0 narf.bootlog=gate...
 ```
 
 Each boot logs in on the serial console (`root` / `narf`, the image's test
@@ -1014,13 +1016,13 @@ means rebooting and taking the default entry.
 First trial, read-only:
 
 ```text
-narf.disks=root-ro root=UUID=653602c3-cd42-420e-95ef-4c4033d17b56 rootflags=subvol=/@ systemd_pid1 systemd.unit=multi-user.target fsck.mode=skip
+narf.disks=root-ro root=UUID=653602c3-cd42-420e-95ef-4c4033d17b56 rootflags=subvol=/@ systemd_pid1 systemd.zram=0 systemd.unit=multi-user.target fsck.mode=skip
 ```
 
 Read-write, after the root-ro trial worked:
 
 ```text
-narf.disks=root-rw root=UUID=653602c3-cd42-420e-95ef-4c4033d17b56 rootflags=subvol=/@ systemd_pid1 systemd.unit=multi-user.target fsck.mode=skip
+narf.disks=root-rw root=UUID=653602c3-cd42-420e-95ef-4c4033d17b56 rootflags=subvol=/@ systemd_pid1 systemd.zram=0 systemd.unit=multi-user.target fsck.mode=skip
 ```
 
 `cargo xtask grub-image --root-policy root-ro|root-rw --root-uuid <uuid>
@@ -1079,7 +1081,7 @@ host to add failures from the packages it has on top of `base`:
 | --- | --- | --- | --- |
 | `systemd-sysusers`, `systemd-random-seed`, `ldconfig`, `systemd-update-done`, `systemd-journal-catalog-update` | `root-rw` only | NARF's btrfs does not yet implement `chmod`/`chown`/`utimensat` on files (`Operation not supported`) | Each is a first-boot or maintenance task. They retry on the next boot. `/etc/ld.so.cache` and the random seed keep their previous contents. |
 | `ananicy-cpp.service` | sometimes | it cannot create its cgroups (`Read-only file system`) | No automatic nice/ionice rules. |
-| `dev-zram0.swap`, `systemd-zram-setup@zram0` | always (not counted as failed) | no zram driver, and Linux modules cannot load | No compressed swap. |
+| `dev-zram0.swap`, `systemd-zram-setup@zram0` | never generated | NARF has no zram block device (and no `swapon`), so the root-policy command line carries `systemd.zram=0`, zram-generator's opt-out. Without it the swap units wait 90 s for a `/dev/zram0` that never appears (`Timed out waiting for device /dev/zram0`), as on a Linux kernel built without zram. | No compressed swap. |
 | `systemd-modules-load` messages | always | Linux `.ko` modules do not load under NARF (`Failed to find module`) | The unit succeeds; each module is skipped. |
 | `[FAILED] Failed unmounting /root` at power-off | when a shell still has its cwd in `/root` | the unit-level unmount races the session's processes | systemd-shutdown unmounts it in its final pass, then remounts `/` read-only and syncs. |
 

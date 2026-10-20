@@ -545,6 +545,14 @@ fn grub_image_cmdline(cmdline: &str, grub: &GrubImageArgs) -> Result<String> {
     Ok(line)
 }
 
+/// zram-generator's documented opt-out. NARF has no zram block device (and
+/// no `swapon`), so the swap units the distro's zram-generator writes wait
+/// for a `/dev/zram0` that can never appear and time out 90 s into every
+/// boot ("Timed out waiting for device /dev/zram0"), exactly as on a Linux
+/// kernel built without zram. An installed-root boot tells the generator to
+/// stay out instead; `--cmdline-extra systemd.zram=...` overrides it.
+pub(crate) const NO_ZRAM_ARG: &str = "systemd.zram=0";
+
 fn grub_image_policy_cmdline(cmdline: &str, grub: &GrubImageArgs) -> Result<String> {
     let Some(policy) = grub.root_policy else {
         return Ok(cmdline_with_disk_policy(cmdline, grub.allow_all_disks));
@@ -564,11 +572,19 @@ fn grub_image_policy_cmdline(cmdline: &str, grub: &GrubImageArgs) -> Result<Stri
         policy.arg(),
         grub.rootflags
     );
-    let tail = if cmdline.split_whitespace().any(|a| a == "systemd_pid1") {
+    let mut tail = if cmdline.split_whitespace().any(|a| a == "systemd_pid1") {
         tail.trim_end_matches(" systemd_pid1").to_string()
     } else {
         tail
     };
+    let chooses_zram = cmdline
+        .split_whitespace()
+        .chain(grub.cmdline_extra.iter().flat_map(|e| e.split_whitespace()))
+        .any(|a| a.starts_with("systemd.zram="));
+    if !chooses_zram {
+        tail.push(' ');
+        tail.push_str(NO_ZRAM_ARG);
+    }
     Ok(if cmdline.is_empty() {
         tail
     } else {
@@ -708,7 +724,7 @@ mod disk_policy_tests {
         assert_eq!(
             grub_image_cmdline("", &rw).unwrap(),
             format!(
-                "narf.disks=root-rw root=UUID={UUID} rootflags=subvol=/@ systemd_pid1 narf.bootlog={tok}"
+                "narf.disks=root-rw root=UUID={UUID} rootflags=subvol=/@ systemd_pid1 systemd.zram=0 narf.bootlog={tok}"
             )
         );
         let plain = grub(&["--bootlog-token", tok]);
@@ -736,7 +752,7 @@ mod disk_policy_tests {
         let rw = grub(&["--root-policy", "root-rw", "--root-uuid", UUID]);
         assert_eq!(
             grub_image_cmdline("", &rw).unwrap(),
-            format!("narf.disks=root-rw root=UUID={UUID} rootflags=subvol=/@ systemd_pid1")
+            format!("narf.disks=root-rw root=UUID={UUID} rootflags=subvol=/@ systemd_pid1 systemd.zram=0")
         );
         let ro = grub(&[
             "--root-policy",
@@ -750,7 +766,7 @@ mod disk_policy_tests {
             grub_image_cmdline("amdgpu.native_display=1", &ro).unwrap(),
             format!(
                 "amdgpu.native_display=1 narf.disks=root-ro root=UUID={UUID} \
-                 rootflags=subvol=/@,noatime systemd_pid1"
+                 rootflags=subvol=/@,noatime systemd_pid1 systemd.zram=0"
             )
         );
         // No default change: without --root-policy the boot-only line stays.
@@ -832,7 +848,7 @@ mod disk_policy_tests {
             grub_image_cmdline("", &ro).unwrap(),
             format!(
                 "narf.disks=root-ro root=UUID={UUID} rootflags=subvol=/@ systemd_pid1 \
-                 narf.bootlog=0123456789abcdef systemd.unit=multi-user.target fsck.mode=skip"
+                 systemd.zram=0 narf.bootlog=0123456789abcdef systemd.unit=multi-user.target fsck.mode=skip"
             )
         );
         let clash = grub(&[
@@ -844,6 +860,17 @@ mod disk_policy_tests {
             "root=/dev/nvme0n1p2",
         ]);
         assert!(grub_image_cmdline("", &clash).is_err());
+        // An explicit systemd.zram= choice replaces the default opt-out.
+        let zram = grub(&[
+            "--root-policy",
+            "root-ro",
+            "--root-uuid",
+            UUID,
+            "--cmdline-extra",
+            "systemd.zram=1",
+        ]);
+        let line = grub_image_cmdline("", &zram).unwrap();
+        assert!(line.ends_with(" systemd_pid1 systemd.zram=1"), "{line}");
         let plain = grub(&["--cmdline-extra", "quiet"]);
         assert_eq!(
             grub_image_cmdline("", &plain).unwrap(),
