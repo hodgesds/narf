@@ -464,6 +464,19 @@ pub(super) fn run<T>(f: impl Future<Output = T>) -> T {
     // heap rather than the 64 KiB aarch64 kernel-test stack.
     narf_scheduler::block_on_spin(alloc::boxed::Box::pin(f))
 }
+/// `run` for the future `make` returns. A future passed by value is a
+/// stack temporary as large as its whole state machine (14 KiB for a
+/// scanout start) in the caller's frame, under everything its poll calls;
+/// `make` builds it in `boxed`'s frame instead, which is gone before the
+/// first poll.
+pub(super) fn run_boxed<F: Future>(make: impl FnOnce() -> F) -> F::Output {
+    run(boxed(make))
+}
+/// The future `make` returns, moved to the heap in a frame of its own.
+#[inline(never)]
+pub(super) fn boxed<F: Future>(make: impl FnOnce() -> F) -> core::pin::Pin<alloc::boxed::Box<F>> {
+    alloc::boxed::Box::pin(make())
+}
 fn reg(e: &Engine<Fake>, index: u64) -> u32 {
     *e.io.regs.get(&(BASE + index * 4)).unwrap_or(&0)
 }
