@@ -1386,6 +1386,25 @@ mod gpu_backend_tests {
     }
 
     #[test]
+    fn a_passed_through_gpu_is_the_only_display() {
+        let args: Vec<String> = [
+            "-vga",
+            "std",
+            "-device",
+            "virtio-gpu-pci,id=vgpu0",
+            "-device",
+            "nvme,drive=nvm0",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            without_emulated_display(args),
+            ["-device", "nvme,drive=nvm0", "-vga", "none"]
+        );
+    }
+
+    #[test]
     fn passthrough_devices_are_repeatable_typed_boot_options() {
         let cli = Cli::try_parse_from([
             "xtask",
@@ -1632,11 +1651,7 @@ impl Arch {
                 // CI ups this (e.g. NARF_QEMU_MEM_MB=2048) for headroom
                 // without slowing local runs. Must be even — the two NUMA
                 // nodes each get half.
-                let mem_mb: u64 = std::env::var("NARF_QEMU_MEM_MB")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .filter(|&m| m >= 2 && m % 2 == 0)
-                    .unwrap_or(1024);
+                let mem_mb = qemu_guest_mem_mb();
                 let node_mem_mb = mem_mb / 2;
                 // Optional virtio-mem region used by the NUMA memory-hotplug
                 // smoke. The backend is address-space capacity, not initial
@@ -2889,9 +2904,11 @@ fn second_nvme_qemu_args() -> Vec<String> {
         None if KERNEL_TEST_DISK.load(std::sync::atomic::Ordering::Relaxed) => nvme2_image_path(),
         None => return Vec::new(),
     };
+    // `NARF_NVME2_FORMAT=qcow2` for an overlay (`cachyos-root-smoke --disk`).
+    let format = std::env::var("NARF_NVME2_FORMAT").unwrap_or_else(|_| "raw".into());
     vec![
         "-drive".into(),
-        format!("if=none,id=nvm1,format=raw,file={}", path.display()),
+        format!("if=none,id=nvm1,format={format},file={}", path.display()),
         "-device".into(),
         "nvme,drive=nvm1,serial=narf2".into(),
     ]
@@ -4559,7 +4576,52 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
 use std::time::Duration;
 
 fn run_cmd(args: &BuildArgs) -> Result<()> {
-    run_cmd_inner(args, false)
+    let mut args = args.clone();
+    add_passthrough_firmware(&mut args);
+    run_cmd_inner(&args, false)
+}
+
+/// Total x86_64 guest RAM in MiB: `NARF_QEMU_MEM_MB`, default 1024. Must be
+/// even — the two NUMA nodes each get half.
+fn qemu_guest_mem_mb() -> u64 {
+    std::env::var("NARF_QEMU_MEM_MB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&m| m >= 2 && m % 2 == 0)
+        .unwrap_or(1024)
+}
+
+/// A passed-through GPU brings up its display in a boot initcall, before
+/// `firmware-scan-rootfs` runs, so its firmware has to be in the initramfs.
+/// Adds the globs the passed devices need unless `--initramfs-firmware`
+/// already chose some.
+fn add_passthrough_firmware(args: &mut BuildArgs) {
+    if !args.initramfs_firmware.is_empty() || args.passthrough_devices.is_empty() {
+        return;
+    }
+    let globs = passthrough::firmware_globs(&args.passthrough_devices);
+    if !globs.is_empty() {
+        println!("xtask: passthrough: initramfs firmware {}", globs.join(" "));
+    }
+    args.initramfs_firmware = globs;
+}
+
+/// The `--initramfs-firmware` blobs as `(guest path, bytes)` CPIO entries.
+fn initramfs_firmware_entries(args: &BuildArgs, root: &Path) -> Result<Vec<(String, Vec<u8>)>> {
+    if args.initramfs_firmware.is_empty() {
+        return Ok(Vec::new());
+    }
+    let fw_dir = root.join("target").join("firmware");
+    let (blobs, _) = collect_firmware_blobs(&fw_dir, &args.initramfs_firmware)?;
+    if blobs.is_empty() {
+        bail!(
+            "--initramfs-firmware {:?} matched nothing under {} (run `cargo xtask \
+             import-firmware --source /usr/lib/firmware --vendor amdgpu` first)",
+            args.initramfs_firmware,
+            fw_dir.display()
+        );
+    }
+    Ok(blobs)
 }
 
 /// Validate a requested VFIO assignment and return the exact QEMU argv
@@ -4593,7 +4655,7 @@ fn passthrough_qemu_args(args: &BuildArgs) -> Result<Vec<String>> {
         }
     }
 
-    let pf = preflight(devices);
+    let pf = preflight(devices, Some(qemu_guest_mem_mb() << 20));
     print!("{}", pf.report);
     std::io::stdout()
         .flush()
@@ -4634,8 +4696,37 @@ fn qemu_boot_args(args: &BuildArgs, kernel: &Path) -> Result<Vec<String>> {
         args.gpu_backend,
         &composition_bootargs,
     );
+    if args.passthrough_devices.iter().any(passthrough::is_display) {
+        // The passed-through GPU is the guest's only display adapter: no
+        // QEMU VGA and no virtio-gpu for the kernel console or a compositor
+        // to pick instead of it.
+        qemu_args = without_emulated_display(qemu_args);
+    }
     qemu_args.extend(vfio_args);
     Ok(qemu_args)
+}
+
+/// `qemu_args` without virtio-gpu devices and with `-vga none`.
+fn without_emulated_display(qemu_args: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(qemu_args.len() + 2);
+    let mut it = qemu_args.into_iter().peekable();
+    while let Some(arg) = it.next() {
+        let next_is = |it: &mut std::iter::Peekable<std::vec::IntoIter<String>>, p: &str| {
+            it.peek().is_some_and(|n| n.starts_with(p))
+        };
+        if arg == "-device" && next_is(&mut it, "virtio-gpu") {
+            it.next();
+            continue;
+        }
+        if arg == "-vga" {
+            it.next();
+            continue;
+        }
+        out.push(arg);
+    }
+    out.push("-vga".into());
+    out.push("none".into());
+    out
 }
 
 /// Emit enough serial context to diagnose a failed gate without flooding the
@@ -4792,6 +4883,16 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
             .with_context(|| format!("reading composed module {}", path.display()))?;
         fixtures.push((composition::module_guest_path(component), bytes));
     }
+    // `--initramfs-firmware` blobs ride in the same CPIO as the modules.
+    let firmware = initramfs_firmware_entries(args, &root)?;
+    if !firmware.is_empty() {
+        let bytes: usize = firmware.iter().map(|(_, b)| b.len()).sum();
+        println!(
+            "xtask: staged {} firmware blob(s), {bytes} bytes, into the initramfs",
+            firmware.len()
+        );
+        fixtures.extend(firmware);
+    }
 
     // Ship the reference kernel module to the guest, so the in-kernel suite
     // can load a REAL rustc-built `.ko` instead of an ELF synthesized in
@@ -4849,7 +4950,7 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
         let p = out_dir.join("initramfs-modules.cpio");
         match std::fs::write(&p, &cpio) {
             Ok(()) => {
-                for (name, bytes) in &fixtures {
+                for (name, bytes) in fixtures.iter().filter(|(n, _)| !n.starts_with("firmware/")) {
                     println!(
                         "xtask: staged module ({} bytes) -> guest /{}",
                         bytes.len(),
@@ -13621,7 +13722,7 @@ struct PassthroughArgs {
 fn passthrough_cmd(args: &PassthroughArgs) -> Result<()> {
     use passthrough::{explain, note, preflight, qemu_fragment};
 
-    let pf = preflight(&args.devices);
+    let pf = preflight(&args.devices, Some(qemu_guest_mem_mb() << 20));
     print!("{}", pf.report);
     std::io::stdout()
         .flush()

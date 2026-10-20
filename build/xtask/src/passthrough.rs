@@ -291,6 +291,30 @@ pub enum Blocker {
         total: u64,
         window: u64,
     },
+    /// `/dev/vfio/<group>` cannot be opened by this user. QEMU opens the
+    /// group node read-write; vfio-pci creates it root-only.
+    GroupNodeUnusable {
+        group: String,
+        why: GroupNodeError,
+    },
+    /// `RLIMIT_MEMLOCK` is below what QEMU must pin. VFIO type1 pins every
+    /// page of guest RAM for DMA, so a default 8 MiB limit fails the launch
+    /// with `vfio_dma_map ... -12 (Cannot allocate memory)`.
+    MemlockTooLow {
+        limit: u64,
+        need: u64,
+    },
+}
+
+/// Why `/dev/vfio/<group>` could not be opened.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GroupNodeError {
+    Missing,
+    PermissionDenied,
+    /// A VFIO group is single-open: another process (usually a QEMU that is
+    /// still running) holds it.
+    Busy,
+    Other(String),
 }
 
 /// Things worth saying that do not stop the launch.
@@ -508,6 +532,95 @@ fn group_members(group: &str) -> Vec<GroupMember> {
     out
 }
 
+/// Guest RAM QEMU pins beyond `-m`: option ROMs, the firmware's own
+/// buffers and VFIO's bookkeeping. Generous on purpose, because an
+/// undersized limit fails late and obscurely.
+pub const MEMLOCK_SLACK: u64 = 256 << 20;
+
+/// The memlock verdict for a guest of `guest_ram` bytes, given the soft
+/// `RLIMIT_MEMLOCK` (`None` = unlimited). Root holds `CAP_IPC_LOCK`, which
+/// bypasses the limit.
+pub fn memlock_blocker(limit: Option<u64>, guest_ram: u64, is_root: bool) -> Option<Blocker> {
+    let need = guest_ram.saturating_add(MEMLOCK_SLACK);
+    match limit {
+        Some(limit) if !is_root && limit < need => Some(Blocker::MemlockTooLow { limit, need }),
+        _ => None,
+    }
+}
+
+/// The soft `Max locked memory` limit from `/proc/self/limits`, in bytes;
+/// `None` for unlimited (or unreadable, which is then not a blocker).
+pub fn parse_memlock_limit(limits: &str) -> Option<u64> {
+    let line = limits
+        .lines()
+        .find(|l| l.starts_with("Max locked memory"))?;
+    let soft = line
+        .trim_start_matches("Max locked memory")
+        .split_whitespace()
+        .next()?;
+    soft.parse().ok()
+}
+
+fn is_root() -> bool {
+    read_trim(Path::new("/proc/self/status"))
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("Uid:"))
+                .and_then(|l| l.split_whitespace().nth(2).map(|e| e == "0"))
+        })
+        .unwrap_or(false)
+}
+
+/// Open and immediately close `/dev/vfio/<group>` the way QEMU will.
+fn check_group_node(group: &str) -> Result<(), GroupNodeError> {
+    let path = Path::new("/dev/vfio").join(group);
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+    {
+        Ok(_) => Ok(()),
+        Err(e) => Err(match e.kind() {
+            std::io::ErrorKind::NotFound => GroupNodeError::Missing,
+            std::io::ErrorKind::PermissionDenied => GroupNodeError::PermissionDenied,
+            _ if e.raw_os_error() == Some(16) => GroupNodeError::Busy,
+            _ => GroupNodeError::Other(e.to_string()),
+        }),
+    }
+}
+
+/// Is `bdf` a display controller (PCI class 0x03)? A passed-through GPU
+/// should be the guest's only display adapter.
+pub fn is_display(bdf: &Bdf) -> bool {
+    device_class_high(bdf) == 0x03
+}
+
+/// Initramfs firmware globs a passed-through device needs before the root
+/// mounts: the display engine comes up in a boot initcall, ahead of
+/// `firmware-scan-rootfs`.
+pub fn firmware_globs_for(vendor: u16, device: u16) -> &'static [&'static str] {
+    match (vendor, device) {
+        // Navi 22 (RX 6700 / 6700 XT / 6750 XT / 6800M / 6850M XT).
+        (0x1002, 0x73c0..=0x73df) => &["amdgpu/navy_flounder*"],
+        _ => &[],
+    }
+}
+
+/// [`firmware_globs_for`] for every device in the set, read from sysfs.
+pub fn firmware_globs(devices: &[Bdf]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for d in devices {
+        if let Some((v, id)) = device_ids(d) {
+            for g in firmware_globs_for(v, id) {
+                if !out.iter().any(|o| o == g) {
+                    out.push((*g).to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The whole preflight.
 pub struct Preflight {
     pub blockers: Vec<Blocker>,
@@ -515,8 +628,9 @@ pub struct Preflight {
     pub report: String,
 }
 
-/// Run every check for `passing`.
-pub fn preflight(passing: &[Bdf]) -> Preflight {
+/// Run every check for `passing`. `guest_ram` (bytes) adds the memlock
+/// check for a guest of that size.
+pub fn preflight(passing: &[Bdf], guest_ram: Option<u64>) -> Preflight {
     let mut blockers = Vec::new();
     let mut advisories = Vec::new();
     let mut report = String::new();
@@ -587,8 +701,14 @@ pub fn preflight(passing: &[Bdf]) -> Preflight {
             }
         }
 
-        // 4. The group is ours outright.
+        // 4. The group is ours outright, and its node is ours to open.
         if let Some(g) = &group {
+            if let Err(why) = check_group_node(g) {
+                blockers.push(Blocker::GroupNodeUnusable {
+                    group: g.clone(),
+                    why,
+                });
+            }
             let members = group_members(g);
             for m in &members {
                 let _ = writeln!(
@@ -634,6 +754,20 @@ pub fn preflight(passing: &[Bdf]) -> Preflight {
         let (bb, ba) = bar_findings(bdf, &bars);
         blockers.extend(bb);
         advisories.extend(ba);
+    }
+
+    // 6. Locked memory for the guest's RAM.
+    if let Some(ram) = guest_ram.filter(|_| !passing.is_empty()) {
+        let limit = read_trim(Path::new("/proc/self/limits"))
+            .as_deref()
+            .and_then(parse_memlock_limit);
+        let _ = writeln!(
+            report,
+            "memlock: {} for a {} MiB guest",
+            limit.map_or_else(|| "unlimited".into(), |l| format!("{} KiB", l / 1024)),
+            ram >> 20
+        );
+        blockers.extend(memlock_blocker(limit, ram, is_root()));
     }
 
     // Deduplicate: two passed functions in one group would otherwise each
@@ -696,6 +830,29 @@ pub fn explain(b: &Blocker) -> String {
              window in memory/src/x86_64/mmu.rs.",
             total / (1 << 20),
             window / (1 << 20)
+        ),
+        Blocker::GroupNodeUnusable { group, why } => match why {
+            GroupNodeError::Missing => {
+                format!("/dev/vfio/{group} does not exist: is the device bound to vfio-pci?")
+            }
+            GroupNodeError::PermissionDenied => format!(
+                "/dev/vfio/{group} is not readable and writable by this user. \
+                 `sudo chown $USER /dev/vfio/{group}` (until the next rebind), or a \
+                 udev rule: SUBSYSTEM==\"vfio\", OWNER=\"$USER\"."
+            ),
+            GroupNodeError::Busy => format!(
+                "/dev/vfio/{group} is held by another process — usually a QEMU that \
+                 is still running (`fuser -v /dev/vfio/{group}`)."
+            ),
+            GroupNodeError::Other(e) => format!("/dev/vfio/{group}: {e}"),
+        },
+        Blocker::MemlockTooLow { limit, need } => format!(
+            "RLIMIT_MEMLOCK is {} KiB but VFIO pins all guest RAM: {} MiB needed. \
+             Raise it for this shell (`sudo prlimit --pid $$ --memlock=unlimited`) \
+             or persistently with `* - memlock unlimited` in \
+             /etc/security/limits.d/ (new login).",
+            limit / 1024,
+            need >> 20
         ),
     }
 }
@@ -1103,5 +1260,43 @@ mod tests {
             Bdf("0000:ab:0c.d".into())
         );
         assert!("not-a-bdf".parse::<Bdf>().is_err());
+    }
+
+    #[test]
+    fn memlock_must_cover_guest_ram_unless_root() {
+        let ram = 4096u64 << 20;
+        assert_eq!(
+            memlock_blocker(Some(8 << 20), ram, false),
+            Some(Blocker::MemlockTooLow {
+                limit: 8 << 20,
+                need: ram + MEMLOCK_SLACK,
+            })
+        );
+        assert_eq!(memlock_blocker(None, ram, false), None);
+        assert_eq!(memlock_blocker(Some(ram + MEMLOCK_SLACK), ram, false), None);
+        // CAP_IPC_LOCK bypasses the limit.
+        assert_eq!(memlock_blocker(Some(8 << 20), ram, true), None);
+    }
+
+    #[test]
+    fn memlock_limit_is_the_soft_column() {
+        let limits = "Limit                     Soft Limit           Hard Limit           Units     \n\
+                      Max processes             127365               127365               processes \n\
+                      Max locked memory         8388608              16777216             bytes     \n";
+        assert_eq!(parse_memlock_limit(limits), Some(8 << 20));
+        let unlimited =
+            "Max locked memory         unlimited            unlimited            bytes\n";
+        assert_eq!(parse_memlock_limit(unlimited), None);
+    }
+
+    #[test]
+    fn navi22_needs_its_firmware_in_the_initramfs() {
+        assert_eq!(
+            firmware_globs_for(0x1002, 0x73df),
+            &["amdgpu/navy_flounder*"]
+        );
+        // Its HD-audio function and unrelated cards need nothing.
+        assert!(firmware_globs_for(0x1002, 0xab28).is_empty());
+        assert!(firmware_globs_for(0x8086, 0x73df).is_empty());
     }
 }
