@@ -850,7 +850,10 @@ linear framebuffer per HUBP. The pool must belong to this GPU's correctly mapped
 exclusively owned VRAM; the matching ColdBoot/platform
 `prepare_display_surface` wrappers use the boot owner's validated pool after
 the kernel engine proofs. Requests select pipe 0–3, nonzero 14-bit dimensions
-and packed `SurfaceFormat::{Xrgb8888,Xbgr8888}`. Rows are padded to 256 bytes;
+and a packed single-plane `SurfaceFormat`: X/A RGB and BGR 8888 and 2101010,
+`Rgb565`, and X/A RGB and BGR 16161616F (`ALL`, `fourcc`/`from_fourcc`,
+`bytes_per_pixel` 2, 4 or 8, `pitch_bytes`, `per_pixel_alpha`), as
+amdgpu_dm maps the DRM fourccs to DC surface formats. Rows are padded to 256 bytes;
 backing is page-rounded and wholly cleared, including padding. Clearing yields
 between 64 KiB chunks and invokes current authority for each chunk. Native CPU
 HDP flush verifies NBIO's remap, fences stores, writes the flush aperture and
@@ -862,7 +865,9 @@ dimension. Active flips/locks, cursor/metadata/LUT fetches or uncertain power
 reject before allocation or writes. Preconditions are rechecked after clearing.
 The allocation is retained and marked published before register programming;
 the fetch clock is temporarily enabled while blank. Native DCN4 programming
-sets uncompressed RGB8888, pixel pitch minus one, red/blue crossbar, primary and
+sets hubp2_program_pixel_format's uncompressed SURFACE_PIXEL_FORMAT (3 RGB565,
+8 8888, 10 2101010, 24 16161616F) and CB_B/CR_R crossbar (swapped for the BGR
+orders), hubp401_program_size's pitch in pixels minus one, primary and
 secondary viewports, empty chroma viewports, VMID0 and normal non-stereo flip
 controls. It does not touch the obsolete address-config fields. The high GPU
 address precedes the low address which publishes the flip. Final drain, clock
@@ -973,12 +978,17 @@ power policy are rejected before writes. Other DPP instances stay untouched.
 
 Preparation temporarily enables the native DPP clock (bit 4, no obsolete rate
 divider), wakes scaler LUT and iSHARP memories with bounded asynchronous waits,
-and rechecks stopped consumers after each wait. Native RGB8888 conversion uses
-zero expansion and an identity CNVC crossbar; red/blue selection remains in the
-HUBP. FCNV bias/scale and HDR multiplication are identity, pre-degamma/post-CSC/
-gamma/keying/de-alpha are bypassed, and the encoded RGB values pass through.
-The unused source alpha is not used by the line buffer; MPC preparation below
-selects opaque blending. Scaler autocal is disabled, recout begins at zero,
+and rechecks stopped consumers after each wait. Conversion follows
+dpp401_dpp_setup for the surface format: CNVC_SURFACE_PIXEL_FORMAT as the
+HUBP's except 25 for ABGR16161616F, ALPHA_EN except for RGB565, zero expansion
+and an identity CNVC crossbar; red/blue selection remains in the HUBP. FCNV
+bias/scale and HDR multiplication are identity, pre-degamma/post-CSC/
+gamma/keying/de-alpha are bypassed, and the encoded RGB values pass through:
+amdgpu_dm's default plane color state, which is all FP16 needs too (its values
+pass unscaled and the output denormalization clamps them). The line buffer
+carries alpha (LB_DATA_FORMAT ALPHA_EN) exactly for the formats MPC
+preparation below blends per pixel; the partition count is the same either
+way. Scaler autocal is disabled, recout begins at zero,
 and recout/MPC dimensions match the surface. Native `SCALING_444_BYPASS` (mode 0)
 still configures a floating-point line buffer; mode 6 full bypass is not used.
 Line-buffer configurations 1, 2, then 0 are selected using native capacities
@@ -1005,7 +1015,11 @@ bandwidth/deadline admission, route activation and physical-card validation
 remain required.
 
 `unsafe Otg::prepare_mpc(&mut clocks, &mut dccg, &mut gmc, pipe)` stages
-opaque full-frame RGB composition for an owned DPP/surface. ColdBoot exposes
+full-frame RGB composition for an owned DPP/surface: per dcn401_update_mpcc_sequence,
+per-pixel premultiplied alpha for the formats amdgpu_dm's
+fill_blending_from_plane_state blends so under the primary plane's default
+pre-multiplied blend mode (ARGB/ABGR8888, ARGB/ABGR2101010, ARGB16161616F;
+not ABGR16161616F, as in Linux), global opaque alpha for the rest. ColdBoot exposes
 synchronous `prepare_display_mpc(pipe)`; the platform wrapper is asynchronous
 only to acquire its owner mutex. Preparation checks the retained surface, VM,
 DPP, current clock and timing owners, matching OPP format, blank/drained HUBP,
@@ -1076,8 +1090,16 @@ preparation API starts fetch or publishes an active framebuffer.
 scanout admission calculation: Linux DML21's DCN4 mode-support and
 mode-programming path, evaluated in fixed point with no hardware access. It
 admits only the shape the native path implements: one progressive DP SST
-timing and one unscaled, unrotated, full-frame linear 32-bpp surface (pitch a
-multiple of 64 pixels) per pipe with the staged 320-KiB DET. GPUVM/HostVM,
+timing and one unscaled, unrotated, full-frame linear RGB surface per pipe
+with the staged 320-KiB DET. `Mode::bytes_per_pixel` is DML's source format
+(2 `dml2_444_16`, 4 `dml2_444_32`, 8 `dml2_444_64`; anything else is
+`Invalid`) and the pitch must be whole 256-byte requests at that depth; the
+request width, swath, DET lines, read bandwidth and deep-sleep DCFCLK follow
+it (`tests/dcn401_dml21/format_vectors.txt`, checked against Linux with
+`PIXEL_BYTES`). A configuration whose SDP bandwidth would make DPMM raise
+DCFCLK/FCLK above the pinned UCLK's state is `ClockState`: the port plans
+only at that state. VUpdate/VReady widths at the programmed clocks are
+rounded up from their exact value. GPUVM/HostVM,
 DCC, MALL/SubVP, cursor, tdlut, dynamic metadata, writeback, MPC combine and
 immediate flip are excluded rather than approximated.
 
@@ -1713,6 +1735,29 @@ radeonsi from driving render ioctls the native driver does not implement.
 Presentation goes through the back buffer and a latched flip (see live
 updates above), and flip events stay software-paced at the real refresh
 rate.
+
+The primary plane lists `amdgpu_navi48_kms::PLANE_FORMATS`: amdgpu_dm's
+DCN4.0.1 order less RGBA8888, the 16-bit UNORM orders, NV12 and P010.
+ADDFB2 takes a format on a card whose `plane_formats` list it, with Linux's
+pitch and dumb-object size checks (a card without native planes keeps
+XRGB8888/ARGB8888/RGB565); `drm::card::PixelFormat` knows the formats and
+their `cpp`. SETCRTC and atomic commits (TEST_ONLY included) also require
+`amdgpu_native_kms::display_admits_format(display, connector, mode, fourcc)`:
+a format of the depth the display's offered timings were admitted at needs
+nothing more; another depth is admitted by DML against the running
+configuration (`platform::display_admits_format`), which needs the display
+lit on the same connector and timing, else EINVAL. PAGE_FLIP keeps the
+format (EINVAL across formats). A committed framebuffer records its format
+with `request_display_format`; a running display scanning another one is
+relit in it by the monitor, like a mode request, and a failed relight
+returns every display to XRGB8888 with its preferred mode, as does the last
+DRM file closing. `amdgpu_native_kms::present_frame` takes the framebuffer's
+fourcc: a frame in the scanned format is copied as packed words into the back
+buffer; one in the requested format waits for the relight and presents (or
+completes) after that monitor pass; others complete at once. The console and
+the CPU-copy fallback stay XRGB8888 only (`scanout_framebuffer` refuses
+other surfaces). No IN_FORMATS blob is published, so clients take the
+GETPLANE list; no hardware validation of these formats exists.
 
 `platform::spawn_display_monitor` runs after the boot-time native modeset
 (`amdgpu.native_display`). It enables HPD on every routed DP port, then runs

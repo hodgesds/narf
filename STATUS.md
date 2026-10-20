@@ -836,6 +836,13 @@ gives it a free pipe, and the timing, both OPPs and DSCs, both HUBP/DPP/MPCC
 halves, deadlines, flips and the cursor are programmed across the pair
 (implementation and register models; no hardware run).
 
+Navi48 primary planes now take XRGB/ARGB/XBGR/ABGR 8888 and 2101010, RGB565
+and the four FP16 orders end to end (ADDFB2/GETPLANE/SETCRTC/PAGE_FLIP/atomic
+TEST_ONLY, DML21 admission at 2/4/8 bytes matched against Linux on a new
+format vector set, HUBP/DPP/MPC words as Linux programs them, premultiplied
+alpha per amdgpu_dm's default); a format change relights the display.
+Register models and QEMU only; no hardware run.
+
 DP MST now also runs over 128b/132b links: a branch that codes UHBR trains
 MST at its best UHBR rate (as Linux's decide_mst_link_settings does), streams
 share the owner's HPO link encoder with all 64 slots from slot 0, and each
