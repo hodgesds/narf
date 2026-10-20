@@ -1542,8 +1542,11 @@ fn wowlan_handle(
     const ATTR_WOWLAN_TRIGGERS: u16 = 117;
     let attrs = attributes(bytes)?;
     let interfaces = crate::registry::list();
-    let index = super::wiphy_from_attrs(&interfaces, bytes, context.net_ns_id)?;
-    let iface = interfaces[index as usize].clone();
+    let index = super::wiphy_from_attrs(&interfaces, bytes, context.net_ns_id)? as usize;
+    let iface = crate::registry::wiphys()
+        .get(index)
+        .cloned()
+        .ok_or(ENODEV)?;
     let support = iface.wowlan_support().ok_or(EOPNOTSUPP)?;
     match command {
         GET_WOWLAN => {
