@@ -4687,6 +4687,60 @@ kernel_test_in!(
     smoke_abi_ipc_shm_process_exit_updates_nattch
 );
 
+/// Linux `exit_mmap` closes the SysV mappings of an mm that dies without its
+/// owner exiting. NARF used to key this state by the page-table root, so the
+/// next address space to reuse a freed root inherited the dead one's owner
+/// set and its last process exit left `shm_nattch` raised.
+fn smoke_abi_ipc_shm_address_space_teardown_closes_attachments() -> TestResult {
+    with_setup(|| {
+        let id = call(Syscall::Shmget.raw(), a2(0, 4096, IPC_CREAT | 0o600))
+            .filter(|id| *id > 0)
+            .ok_or("setup: shmget failed")? as u64;
+        with_ipc_shm_as(|_| {
+            if call(Syscall::Shmat.raw(), a2(id, 0, 0)).is_none() {
+                return Err("setup: shmat failed");
+            }
+            Ok(())
+        })?;
+        let mut stat = [0u8; 112];
+        if call(
+            Syscall::Shmctl.raw(),
+            a2(id, IPC_STAT, stat.as_mut_ptr() as u64),
+        ) != Some(0)
+            || u64::from_ne_bytes(stat[88..96].try_into().unwrap()) != 0
+        {
+            return Err("a torn-down address space kept its SysV attachment");
+        }
+        // A fresh address space starts with no owners: its own exit closes
+        // its attachment even right after the previous one was freed.
+        with_ipc_shm_as(|_| {
+            if call(Syscall::Shmat.raw(), a2(id, 0, 0)).is_none() {
+                return Err("setup: second shmat failed");
+            }
+            let pid = u64::from(crate::handlers::current_ucred().pid);
+            crate::handlers::shm_process_exit(pid, crate::handlers::current_task_id());
+            let mut stat = [0u8; 112];
+            if call(
+                Syscall::Shmctl.raw(),
+                a2(id, IPC_STAT, stat.as_mut_ptr() as u64),
+            ) != Some(0)
+                || u64::from_ne_bytes(stat[88..96].try_into().unwrap()) != 0
+            {
+                return Err("a new address space inherited a freed one's owners");
+            }
+            Ok(())
+        })?;
+        if call(Syscall::Shmctl.raw(), a2(id, IPC_RMID, 0)) != Some(0) {
+            return Err("IPC_RMID after teardown failed");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/shmat",
+    smoke_abi_ipc_shm_address_space_teardown_closes_attachments
+);
+
 // ── Shmctl ──────────────────────────────────────────────────────────
 //
 // shmctl(shmid, cmd, buf). IPC_RMID on an unknown id → -EINVAL; IPC_STAT

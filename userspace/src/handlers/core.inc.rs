@@ -18936,13 +18936,13 @@ fn shm_as_key(as_ref: &Arc<AddressSpace>) -> u64 {
     shm_as_key_ref(as_ref)
 }
 
+/// The registries' address-space key: the incarnation identity, as Linux
+/// keys this state by `mm_struct`. Never the page-table root: a freed root
+/// frame is reused by the next address space, which then inherited the dead
+/// one's owner set and attachments, so its last process exit left
+/// `shm_nattch` raised (the leftover owner pid never exits).
 fn shm_as_key_ref(as_ref: &AddressSpace) -> u64 {
-    let root = as_ref.root.as_u64();
-    if root != 0 {
-        root
-    } else {
-        as_ref as *const AddressSpace as usize as u64
-    }
+    as_ref.identity()
 }
 
 #[cfg(feature = "container")]
@@ -19143,6 +19143,32 @@ pub(crate) fn shm_process_exit(pid: u64, _tid: u64) {
         }
         closing
     };
+    shm_close_address_spaces(&closing_keys, pid);
+}
+
+/// The address space `address_space_id` reached its last reference: Linux
+/// `exit_mmap` closes every SysV mapping still in it (`shm_close`). Normally
+/// the final owner's exit already did; this covers an address space that
+/// dies without one (exec replacing it, a kernel-built address space).
+pub fn drop_address_space_shm(address_space_id: u64) {
+    let tracked = SHM_AS_OWNERS
+        .lock()
+        .as_mut()
+        .is_some_and(|owners| owners.remove(&address_space_id).is_some());
+    let attached = SHM_ATTACHMENTS
+        .lock()
+        .as_ref()
+        .is_some_and(|map| map.entries.iter().any(|((key, _), _)| *key == address_space_id));
+    if tracked || attached {
+        shm_close_address_spaces(&[address_space_id], 0);
+    } else if let Some(map) = SHM_MAPPING_TRANSACTIONS.lock().as_mut() {
+        map.remove(&address_space_id);
+    }
+}
+
+/// Close every SysV attachment of the address spaces `closing_keys` (sorted)
+/// as `shm_close` does, recording `pid` as the last operator.
+fn shm_close_address_spaces(closing_keys: &[u64], pid: u64) {
     if closing_keys.is_empty() {
         return;
     }
@@ -19181,7 +19207,9 @@ pub(crate) fn shm_process_exit(pid: u64, _tid: u64) {
                 continue;
             };
             seg.nattch = seg.nattch.saturating_sub(1);
-            seg.lpid = pid;
+            if pid != 0 {
+                seg.lpid = pid;
+            }
             seg.dtime = now;
             if seg.nattch == 0 && (seg.removed || shm_forced_rmid(object.0)) {
                 if let Some(seg) = map.remove(&object) {
@@ -19201,7 +19229,7 @@ pub(crate) fn shm_process_exit(pid: u64, _tid: u64) {
     let mut transactions = SHM_MAPPING_TRANSACTIONS.lock();
     if let Some(map) = transactions.as_mut() {
         for key in closing_keys {
-            map.remove(&key);
+            map.remove(key);
         }
     }
 }
