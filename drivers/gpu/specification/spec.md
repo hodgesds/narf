@@ -169,12 +169,19 @@ parser; `amdgpu_rdna2_power` publishes runtime power samples. Existing Navi22
 paths re-export the same modules, preserving type identity and source
 compatibility.
 
-`amdgpu_rdna2::options::BootOptions::parse(cmdline)` accepts bare flags
-`amdgpu.rdna2_accel`, `amdgpu.rdna2_multi`, `amdgpu.rdna2_hw_cursor` and the
-value `amdgpu.rdna2_pg=...`. The corresponding `amdgpu.navi22_*` spellings
-remain aliases. The first canonical power value takes precedence over the
-first legacy value, including an empty or invalid canonical value; invalid
-power lists enable nothing. Defaults remain disabled.
+`amdgpu_rdna2::options::BootOptions::parse(cmdline)` yields
+`{native_display, accel, multi, hw_cursor, power_saving}`. Switches
+`amdgpu.native_display`, `amdgpu.rdna2_accel`, `amdgpu.rdna2_multi` and
+`amdgpu.rdna2_hw_cursor` accept a bare flag or `=1|on|y|yes|true` (on) and
+`=0|off|n|no|false` (off); any other value keeps the default. The
+corresponding `amdgpu.navi22_*` spellings remain aliases; the canonical name
+wins. Defaults: native display, accel and hardware cursor on; multi-display
+off (secondary CRTCs cannot present or deliver vblank yet). `power_saving` is
+the `amdgpu.rdna2_pg=` list, or `DEFAULT_POWER_SAVING` (every feature) when
+absent; `=none|off|0` or an empty value applies nothing. The first canonical
+power value takes precedence over the first legacy value, including an empty
+or invalid canonical value; invalid power lists enable nothing. Defaulted
+power features still pass every display-admission and driver prerequisite.
 
 Clock/power capability flags come from each profile's Linux
 `nv_common_early_init` selection. Navi21/22/23 share the existing capability
@@ -1975,8 +1982,8 @@ the firmware left running. It runs in native dependency order:
    read-only). Idle or soft-reset OTGs are left alone.
 
 HDMI, HPO and MST output are not retired by it; their live state makes it
-fail. The fb boot handoff runs it, followed by `modeset_display(0, black)`,
-only with the `amdgpu.native_display` kernel flag. If the modeset then
+fail. The RDNA2 fb boot handoff runs it, followed by `modeset_display(0, black)`,
+unless `amdgpu.native_display=0` (on by default). If the modeset then
 fails, the GOP no longer scans out and the screen stays dark until a later
 modeset; the console's GOP framebuffer remains valid, excluded memory.
 
@@ -4044,7 +4051,8 @@ DML DRAM- and FCLK-change support, stutter with the deep-sleep DCEFCLK floor,
 bandwidth floors) and driver readiness (GFXOFF-safe GC access, RLC safe mode,
 validated recovery). `Policy::new()`/`Default` disable everything; `request`
 refuses with `NotValidated` while `HARDWARE_VALIDATED` is false.
-`OptIn::parse(Option<&str>)` reads the `amdgpu.navi22_pg=` value (tokens
+`OptIn::parse(Option<&str>)` reads the `amdgpu.rdna2_pg=` value, or
+`DEFAULT_POWER_SAVING` when it is absent (tokens
 `gfxoff`, `cg`, `gfxcg`, `hubpg`, `memdpm`, `fclkdpm`, `ds`, `wm`; any unknown
 token yields `OptIn::NONE`), and `request_opted_in(feature, admission, driver,
 optin)` opens a gate only for a named feature whose display and driver-software
@@ -4122,7 +4130,8 @@ when VCN0 is harvested; encode AVC 4096² and HEVC 8192×4352) as
 plus every VCN instance absent from discovery: on the RX 6750 XT (VCN1
 harvested) decode is the VCN0 table, AV1 included.
 
-Client media rings (append-only additions, `amdgpu.navi22_accel` only):
+Client media rings (append-only additions; only while `accel` is on, the
+default):
 `Media::{client_rings() -> u8, fence_reader() -> MediaFenceReader,
 submit(MediaRing, VmRef, &[Ib], copies),
 client_fences(MediaRing) -> (completed, throttle)}` (and
@@ -4829,9 +4838,10 @@ context's lowest-state plan; when the context fails CRTC 0 lights alone.
 Publication withdraws the console and drains
 `scanout_access` before any teardown; recovery withdraws and stops the pipe
 before reset and the monitor relights once `recoveries()` increments. The fb
-handoff calls `modeset_displays` and the monitor with `amdgpu.native_display`
-(`amdgpu.navi22_hw_cursor` opts into the hardware cursor; display detection
-runs only with `amdgpu.native_display` or `amdgpu.display_probe`).
+handoff calls `modeset_displays` and the monitor unless
+`amdgpu.native_display=0` (the hardware cursor is on unless
+`amdgpu.rdna2_hw_cursor=0`; display detection runs with native display or
+`amdgpu.display_probe`).
 
 ### Navi 22 DP link layer, hot-plug and link loss
 

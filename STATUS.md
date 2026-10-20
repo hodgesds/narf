@@ -1063,6 +1063,18 @@ pin refusals, injected rmap preparation failure, commit rollback,
 fork/split/mremap, syscall-level mmap publication and relocation, VRAM<->GTT
 moves of published views, late fences, allocation failure and fork-gap
 retention.
+RX 6000 defaults: native HDMI/DP display, native client submission (accel),
+the DCN3.0 hardware cursor and every power-saving feature are now requested by
+default, each with an off switch (`amdgpu.native_display=0`,
+`amdgpu.rdna2_accel=0`, `amdgpu.rdna2_hw_cursor=0`, `amdgpu.rdna2_pg=none`);
+earlier "opt-in" notes below describe the previous defaults. Power features
+still pass every display-admission and driver gate (`HARDWARE_VALIDATED`
+stays false; the default list is an implicit opt-in). Multi-display stays
+opt-in until secondary CRTCs can present. A failed native modeset leaves the
+screen dark, and there is no automatic hang recovery, so first hardware boots
+should keep the off switches at hand. Firmware: `xtask import-firmware` now
+follows linux-firmware alias symlinks; re-imported from 20260916, all twelve
+Navi22 payloads match the distribution and the conformance gate passes.
 Memory/filesystem/userspace/GPU/framebuffer suites passed 3333 x86_64 and
 2593 aarch64 (zero failures; 22 and 8 environment skips) with clean
 production boots and btrfs postflights; debug builds and targeted Clippy pass
