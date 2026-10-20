@@ -9,7 +9,7 @@
 #![deny(missing_debug_implementations)]
 
 use core::fmt::{self, Write};
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 use narf_lib::sync::{IrqSafeSpinLock, OnceLock};
 use narf_memory::{PhysAddr, VirtAddr};
@@ -312,6 +312,64 @@ static FB_HOOK: AtomicUsize = AtomicUsize::new(0);
 /// after `graphics::install_fb_console` succeeds.
 pub fn set_fb_hook(hook: FbHook) {
     FB_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Text grid of the framebuffer console, `cols << 16 | rows`; 0 while no
+/// framebuffer console exists (serial only).
+///
+/// Linux keeps this as `vc->vc_cols` / `vc->vc_rows` and pushes it to the
+/// tty with `vc_do_resize` → `tty_do_resize` whenever fbcon's mode or font
+/// changes. Here the producer is `narf_graphics::install_fb_console` and
+/// the consumer is the console tty (`narf_filesystem::console_tty`), which
+/// reports it through `TIOCGWINSZ`. Neither crate can see the other, so
+/// the grid meets here.
+static TEXT_GRID: AtomicU32 = AtomicU32::new(0);
+
+/// `fn(cols, rows)` told about every grid change; 0 = none installed.
+static TEXT_GRID_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Publish the framebuffer console's text grid, calling the installed grid
+/// hook when it changed. A zero dimension clears the grid.
+pub fn set_text_grid(cols: u32, rows: u32) {
+    let packed = if cols == 0 || rows == 0 {
+        0
+    } else {
+        (cols.min(u16::MAX as u32) << 16) | rows.min(u16::MAX as u32)
+    };
+    if TEXT_GRID.swap(packed, Ordering::AcqRel) != packed {
+        notify_text_grid(packed);
+    }
+}
+
+/// The framebuffer console's text grid as `(cols, rows)`; `None` when there
+/// is no framebuffer console.
+pub fn text_grid() -> Option<(u16, u16)> {
+    unpack_text_grid(TEXT_GRID.load(Ordering::Acquire))
+}
+
+/// Install the grid-change hook. It is called at once with the current
+/// grid when there is one, so a consumer installed after the framebuffer
+/// console came up still learns its size.
+pub fn set_text_grid_hook(hook: fn(u16, u16)) {
+    TEXT_GRID_HOOK.store(hook as usize, Ordering::Release);
+    notify_text_grid(TEXT_GRID.load(Ordering::Acquire));
+}
+
+fn unpack_text_grid(packed: u32) -> Option<(u16, u16)> {
+    (packed != 0).then_some(((packed >> 16) as u16, packed as u16))
+}
+
+fn notify_text_grid(packed: u32) {
+    let Some((cols, rows)) = unpack_text_grid(packed) else {
+        return;
+    };
+    let raw = TEXT_GRID_HOOK.load(Ordering::Acquire);
+    if raw != 0 {
+        // SAFETY: stored as `fn(u16, u16) as usize` by `set_text_grid_hook`;
+        // fn pointers and usize share size and alignment.
+        let hook: fn(u16, u16) = unsafe { core::mem::transmute(raw) };
+        hook(cols, rows);
+    }
 }
 
 /// Atomically detach the current FB-console fan-out and return its

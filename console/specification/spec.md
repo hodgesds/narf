@@ -84,6 +84,10 @@ pub fn klog::log_buf_len_value(arg: &str, current: usize) -> Option<usize>;
 pub fn klog::log_buf_len_setup(arg: &str);        // `log_buf_len=`
 pub fn klog::setup_log_buf();                     // once the heap is live
 pub fn klog::set_console_loglevel(level: u32);
+// Framebuffer console text grid (cols, rows) → the console tty's winsize.
+pub fn set_text_grid(cols: u32, rows: u32);          // 0 clears
+pub fn text_grid() -> Option<(u16, u16)>;
+pub fn set_text_grid_hook(hook: fn(u16, u16));       // called now + on change
 ```
 
 `write_str` always records into the kernel log store, then applies Linux's
@@ -126,6 +130,16 @@ the BSP's LAPIC). `panic_sink` runs it first, before any output: every other
 online CPU is NMI'd into a permanent halt (bounded 1 s wait), so no CPU keeps
 issuing filesystem or disk I/O after a panic. CPUs that do not acknowledge
 are reported on the UART.
+
+`set_text_grid` is how the console tty learns the framebuffer console's size,
+Linux's `vc_cols`/`vc_rows` reaching `tty_do_resize` through `vc_do_resize`.
+`narf_graphics::install_fb_console` publishes every new console's grid; the
+userspace crate installs `narf_filesystem::console_tty::grid_changed` as the
+hook at syscall init, which makes the grid the `TIOCGWINSZ` answer of
+`/dev/console`, `/dev/ttyN` and fds 0/1/2 and raises SIGWINCH on the
+foreground process group when it changed. The hook is called right away with
+the current grid, so installing it after the console came up loses nothing.
+Without a framebuffer console the tty keeps 80x24.
 
 ### 3.1 MMU-enable handoff protocol
 

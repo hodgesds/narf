@@ -274,8 +274,15 @@ pub fn is_installed() -> bool {
 /// Install a framebuffer console; subsequent calls to `write_str`
 /// (via the hook below) will mirror kernel logs onto it. If a
 /// console is already installed, the new one replaces it.
+///
+/// The console's text grid is published to `narf_console`, which passes it
+/// on to the console tty's `TIOCGWINSZ` (Linux: `vc_do_resize` →
+/// `tty_do_resize`). That happens after the lock is dropped: the grid hook
+/// may signal the tty's foreground process group.
 pub fn install_fb_console(c: FbConsole) {
+    let (cols, rows) = (c.cols(), c.rows());
     *GLOBAL_FB_CONSOLE.lock() = Some(c);
+    narf_console::set_text_grid(cols, rows);
 }
 
 /// Rebase the installed FbConsole's underlying pixel buffer in
@@ -317,4 +324,5 @@ pub fn write_bytes(bytes: &[u8]) {
 #[doc(hidden)]
 pub fn __reset_for_test() {
     *GLOBAL_FB_CONSOLE.lock() = None;
+    narf_console::set_text_grid(0, 0);
 }
