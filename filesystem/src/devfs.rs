@@ -1450,12 +1450,12 @@ impl FileOps for DevConsole {
                 Ok(0)
             }
             TIOCGWINSZ => {
-                let (rows, cols) = crate::console_tty::winsize();
+                let cur = crate::console_tty::winsize();
                 let ws = WireWinsize {
-                    ws_row: rows,
-                    ws_col: cols,
-                    ws_xpixel: 0,
-                    ws_ypixel: 0,
+                    ws_row: cur.rows,
+                    ws_col: cur.cols,
+                    ws_xpixel: cur.xpixel,
+                    ws_ypixel: cur.ypixel,
                 };
                 // SAFETY: `arg` is the validated user `struct winsize *`.
                 unsafe { write_user_winsize(arg, ws)? };
@@ -1464,7 +1464,12 @@ impl FileOps for DevConsole {
             TIOCSWINSZ => {
                 // SAFETY: `arg` is the validated user `struct winsize *`.
                 let ws = unsafe { read_user_winsize(arg)? };
-                crate::console_tty::set_winsize(ws.ws_row, ws.ws_col);
+                crate::console_tty::resize(crate::devfs_pty::WinSize {
+                    rows: ws.ws_row,
+                    cols: ws.ws_col,
+                    xpixel: ws.ws_xpixel,
+                    ypixel: ws.ws_ypixel,
+                });
                 Ok(0)
             }
             TIOCGPGRP => {

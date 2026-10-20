@@ -508,6 +508,7 @@ mod tests {
     fn navi22_pause_blocks_existing_writers_and_console() -> TestResult {
         let mut pixels = alloc::vec![0u32; 16 * 40];
         let original = narf_graphics::console::GLOBAL_FB_CONSOLE.lock().take();
+        let original_grid = narf_console::text_grid();
         // SAFETY: owned test RAM retained throughout installation and pause.
         let fb = unsafe { narf_graphics::Framebuffer::new(pixels.as_mut_ptr(), 16, 40, 16) };
         narf_graphics::install_fb_console(narf_graphics::FbConsole::new(
@@ -543,6 +544,8 @@ mod tests {
         let quarantined =
             paused() && !narf_graphics::console::is_installed() && crate::select_active().is_none();
         *narf_graphics::console::GLOBAL_FB_CONSOLE.lock() = original;
+        let (cols, rows) = original_grid.unwrap_or((0, 0));
+        narf_console::set_text_grid(cols.into(), rows.into());
         PAUSED.store(false, Ordering::Release);
         if !blocked || !restored || !quarantined {
             return TestResult::Fail("Navi22 CPU framebuffer pause/resume");

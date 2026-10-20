@@ -2720,6 +2720,7 @@ dependencies = [
 name = "narf-graphics"
 version = "0.0.0"
 dependencies = [
+ "narf-console",
  "narf-drivers",
  "narf-kernel-test",
  "narf-lib",

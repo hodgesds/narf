@@ -1460,24 +1460,28 @@ pub struct Winsize {
     pub ws_ypixel: u16,
 }
 
-/// Default console dimensions. Override via TIOCSWINSZ; survives
-/// until reboot. 80x24 matches the historical VT default and is
-/// what every "$LINES not set" autocheck falls back to.
-static CONSOLE_WINSIZE: IrqSafeSpinLock<Winsize> = IrqSafeSpinLock::new(Winsize {
-    ws_row: 24,
-    ws_col: 80,
-    ws_xpixel: 0,
-    ws_ypixel: 0,
-});
-
-/// Query the current console window size. Test hook + introspection.
+/// Query the console window size. fd 0/1/2 and `/dev/console` share the
+/// one `console_tty` winsize, so a TIOCSWINSZ through either is visible to
+/// both, and both follow the framebuffer console's text grid.
 pub fn console_winsize() -> Winsize {
-    *CONSOLE_WINSIZE.lock()
+    let ws = narf_filesystem::console_tty::winsize();
+    Winsize {
+        ws_row: ws.rows,
+        ws_col: ws.cols,
+        ws_xpixel: ws.xpixel,
+        ws_ypixel: ws.ypixel,
+    }
 }
 
-/// Override the console window size. Wired by `TIOCSWINSZ`.
+/// Set the console window size (TIOCSWINSZ); SIGWINCH to the foreground
+/// process group when it changed.
 pub fn set_console_winsize(ws: Winsize) {
-    *CONSOLE_WINSIZE.lock() = ws;
+    narf_filesystem::console_tty::resize(narf_filesystem::devfs_pty::WinSize {
+        rows: ws.ws_row,
+        cols: ws.ws_col,
+        xpixel: ws.ws_xpixel,
+        ypixel: ws.ws_ypixel,
+    });
 }
 
 /// Reset terminal state — test hook. The console's foreground pgrp +
@@ -1485,12 +1489,6 @@ pub fn set_console_winsize(ws: Winsize) {
 /// clear them too (a leaked fg_pgrp would perturb later job-control tests).
 #[doc(hidden)]
 pub fn __test_reset_tty() {
-    *CONSOLE_WINSIZE.lock() = Winsize {
-        ws_row: 24,
-        ws_col: 80,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
     narf_filesystem::console_tty::__test_reset_cooked();
 }
 
