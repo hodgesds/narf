@@ -156,6 +156,58 @@ echo "SWEEP-DONE"
 SWEEP
 chmod +x "$RD/sweep.sh"
 
+# The `cargo xtask perf-bench` sweep drives the upstream `perf bench`
+# micro-benchmarks — on NARF via `chroot_run /bin/busybox sh /perfbench.sh
+# <threads>`, and on a stock Linux kernel booted against this SAME image.
+# These exercise the scheduler/IPC fast paths (wakeup, context switch,
+# futex wake/requeue, epoll fan-out) rather than the memory subsystem the
+# stress-ng sweep leans on. Each line normalizes one result to
+# `PBMETRIC name=<n> value=<v> dir=<higher|lower>` so the parser is robust
+# across the differing per-benchmark output shapes. `$1` is the thread
+# scale (≈ guest vCPUs) so the scheduler has to place and migrate work.
+cat > "$RD/perfbench.sh" <<'PERFBENCH'
+echo "PERFBENCH-START pid=$$"
+cd /tmp 2>/dev/null
+T="${1:-16}"
+PERF=/usr/bin/perf
+emit() { echo "PBMETRIC name=$1 value=$2 dir=$3"; }
+
+echo "PB-RUN sched_pipe"
+V=$($PERF bench sched pipe -l 200000 2>&1 | awk '/ops\/sec/{print $1}')
+emit sched_pipe_ops_per_sec "${V:-0}" higher
+
+echo "PB-RUN syscall_basic"
+V=$($PERF bench syscall basic -l 5000000 2>&1 | awk '/ops\/sec/{print $1}')
+emit syscall_basic_ops_per_sec "${V:-0}" higher
+
+echo "PB-RUN futex_hash"
+V=$($PERF bench futex hash -t "$T" -r 3 2>&1 | awk '/Averaged/{print $2}')
+emit futex_hash_ops_per_sec "${V:-0}" higher
+
+echo "PB-RUN futex_wake"
+V=$($PERF bench futex wake -t "$T" 2>&1 | awk '/^Wokeup/{print $7}')
+emit futex_wake_ms "${V:-0}" lower
+
+echo "PB-RUN futex_requeue"
+V=$($PERF bench futex requeue -t "$T" 2>&1 | awk '/^Requeued/{print $7}')
+emit futex_requeue_ms "${V:-0}" lower
+
+echo "PB-RUN futex_lock_pi"
+V=$($PERF bench futex lock-pi -t "$T" -r 3 2>&1 | awk '/Averaged/{print $2}')
+emit futex_lock_pi_ops_per_sec "${V:-0}" higher
+
+echo "PB-RUN epoll_wait"
+V=$($PERF bench epoll wait -t "$T" -r 3 2>&1 | awk '/Averaged/{print $2}')
+emit epoll_wait_ops_per_sec "${V:-0}" higher
+
+echo "PB-RUN mem_memcpy"
+V=$($PERF bench mem memcpy -f default -s 16MB -l 50 2>&1 | awk '/GB\/sec/{print $1}' | tail -1)
+emit mem_memcpy_gb_per_sec "${V:-0}" higher
+
+echo "PERFBENCH-DONE"
+PERFBENCH
+chmod +x "$RD/perfbench.sh"
+
 # Pack into an ext2 image (256 MiB, 1 KiB blocks).
 mke2fs -q -F -t ext2 -d "$RD" -b 1024 "$OUT" 262144
 echo "built $OUT ($(du -h "$OUT" | cut -f1)); stress-ng+perf present"

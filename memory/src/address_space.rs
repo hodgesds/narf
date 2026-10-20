@@ -817,6 +817,20 @@ impl DemandClaims {
         })
     }
 
+    /// A valid-but-empty table that performs NO allocation. Used only as
+    /// the throwaway placeholder [`RegionTable::empty_placeholder`] swaps
+    /// into a dying address space during teardown: an empty boxed slice
+    /// has no heap backing, so this never touches the allocator and is
+    /// safe to construct in an atomic (IRQ-masked) context.
+    fn empty_placeholder() -> Self {
+        Self {
+            inline: Vec::new().into_boxed_slice(),
+            len: 0,
+            overflow: BTreeMap::new(),
+            next_ticket: 1,
+        }
+    }
+
     fn new() -> Self {
         Self::try_new().expect("allocate pre-sized demand-claim table")
     }
@@ -1087,6 +1101,33 @@ impl RegionTable {
 
     fn new() -> Self {
         Self::try_new().expect("allocate pre-sized address-space metadata")
+    }
+
+    /// A valid-but-empty table that performs NO allocation — every field
+    /// is either a zero-capacity collection or a plain scalar. Teardown
+    /// ([`AddressSpace::drop`]) swaps this in for the real table under the
+    /// `regions` `IrqSafeSpinLock`; because that guard masks IRQs, the
+    /// global allocator would be forced onto its magazine-only atomic path
+    /// there, which returns null once the per-CPU magazine drains under a
+    /// concurrent fork/exit storm. `RegionTable::default()`'s pre-sized
+    /// `DemandClaims` allocation did exactly that and panicked an otherwise
+    /// healthy kernel (gigabytes free) at `address_space.rs` teardown.
+    /// Replacing with this allocation-free placeholder keeps `drop`
+    /// allocation-free. See [`DemandClaims::empty_placeholder`].
+    fn empty_placeholder() -> Self {
+        Self {
+            by_base: RegionIndex::new(),
+            next_mapping_id: 1,
+            future_lock: FutureLockPolicy::None,
+            demand_pages: DemandClaims::empty_placeholder(),
+            cow_pages: BTreeMap::new(),
+            swap_pages: BTreeMap::new(),
+            guard_pages: BTreeSet::new(),
+            acct: RegionAcct::default(),
+            stack_chain_cache: Cell::new(None),
+            #[cfg(target_arch = "x86_64")]
+            anon_reclaim_cursor: Cell::new(0),
+        }
     }
 
     #[inline]
@@ -13334,8 +13375,16 @@ impl Drop for AddressSpace {
             }
             // Take ownership of the region list to avoid borrowing
             // through &mut self below; the list is about to be
-            // dropped anyway.
-            let regions = core::mem::take(&mut *self.regions.lock());
+            // dropped anyway. Swap in the allocation-free placeholder
+            // rather than `mem::take` (which would construct a
+            // `RegionTable::default()` — a pre-sized `DemandClaims`
+            // allocation — WHILE the `regions` IrqSafeSpinLock masks IRQs,
+            // forcing the global allocator onto its magazine-only atomic
+            // path; under a concurrent fork/exit storm that magazine
+            // drains and the allocation returns null, panicking teardown
+            // on an otherwise-healthy kernel with gigabytes free).
+            let placeholder = RegionTable::empty_placeholder();
+            let regions = core::mem::replace(&mut *self.regions.lock(), placeholder);
             #[cfg(target_arch = "x86_64")]
             let mut regions = regions;
             #[cfg(target_arch = "x86_64")]
