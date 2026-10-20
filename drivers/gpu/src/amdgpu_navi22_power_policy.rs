@@ -224,6 +224,48 @@ impl OptIn {
     pub fn is_empty(self) -> bool {
         self.features == 0 && !self.watermarks
     }
+    /// This opt-in with `feature` added or removed.
+    pub fn with(mut self, feature: Feature, on: bool) -> Self {
+        if on {
+            self.features |= 1 << feature as u8;
+        } else {
+            self.features &= !(1 << feature as u8);
+        }
+        self
+    }
+    /// The PMFW bits of the opted-in features (`pp_features` view).
+    pub fn smu_bits(self) -> u64 {
+        FEATURES
+            .iter()
+            .filter(|f| self.contains(**f))
+            .fold(0, |mask, f| mask | requirement(*f).smu_bits)
+    }
+    /// Replace the PMFW-backed features with exactly those whose bits are
+    /// set in `mask`, keeping clock gating and watermarks. A feature must be
+    /// named by all of its bits or none (`InvalidData` otherwise); bits no
+    /// policy feature owns are not part of the result.
+    pub fn with_smu_mask(self, mask: u64) -> Option<Self> {
+        let mut optin = self;
+        for feature in FEATURES {
+            let bits = requirement(feature).smu_bits;
+            if bits == 0 {
+                continue;
+            }
+            match mask & bits {
+                0 => optin = optin.with(feature, false),
+                set if set == bits => optin = optin.with(feature, true),
+                _ => return None,
+            }
+        }
+        Some(optin)
+    }
+}
+/// Every PMFW bit some policy feature owns: the only bits `pp_features` may
+/// change.
+pub fn policy_smu_bits() -> u64 {
+    FEATURES
+        .iter()
+        .fold(0, |mask, f| mask | requirement(*f).smu_bits)
 }
 
 /// No feature here has run on an RX 6750 XT under NARF.

@@ -65,10 +65,12 @@ kernel_test_in!(
     navi22_tdr_times_out_only_stalled_pending_work
 );
 
+/// Detection alone never enables recovery: only the fb handoff of a booted
+/// RX 6000 turns it on (no such card exists under QEMU).
 fn navi22_tdr_records_hangs_without_enabling_recovery() -> TestResult {
     let before = status();
     if before.automatic_recovery {
-        return TestResult::Fail("automatic recovery is on by default");
+        return TestResult::Fail("automatic recovery enabled without an RX 6000 boot");
     }
     let mut w = Watchdog::new(TIMEOUT_MS);
     let stalled = [p(Engine::Compute, 4, 3), p(Engine::Kiq, 2, 2)];
@@ -92,4 +94,21 @@ fn navi22_tdr_records_hangs_without_enabling_recovery() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi22-recovery",
     navi22_tdr_records_hangs_without_enabling_recovery
+);
+
+/// Automatic recovery is budgeted per boot: each one quarantines VRAM.
+fn navi22_tdr_automatic_recovery_budget_is_bounded() -> TestResult {
+    __reset_automatic_recoveries();
+    let claimed = (0..MAX_AUTOMATIC_RECOVERIES).all(|_| claim_automatic_recovery());
+    let refused = !claim_automatic_recovery() && !claim_automatic_recovery();
+    __reset_automatic_recoveries();
+    if claimed && refused {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("automatic recovery budget")
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-recovery",
+    navi22_tdr_automatic_recovery_budget_is_bounded
 );

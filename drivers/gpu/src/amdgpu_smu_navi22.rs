@@ -32,6 +32,10 @@ const ALLOWED_LOW: u32 = 4; // linux: PPSMC_MSG_SetAllowedFeaturesMaskLow
 const ENABLE_FEATURES: u32 = 6; // linux: PPSMC_MSG_EnableAllSmuFeatures
 const RUNNING_LOW: u32 = 0xc; // linux: PPSMC_MSG_GetRunningSmuFeaturesLow
 const RUNNING_HIGH: u32 = 0xd; // linux: PPSMC_MSG_GetRunningSmuFeaturesHigh
+/// GFXCLK performance levels, shared with the Navi48 owner.
+pub use crate::amdgpu_smu_navi48::GfxLevel;
+const SET_SOFT_MIN_BY_FREQ: u32 = 0x19; // linux: PPSMC_MSG_SetSoftMinByFreq
+const SET_SOFT_MAX_BY_FREQ: u32 = 0x1a; // linux: PPSMC_MSG_SetSoftMaxByFreq
 const MIN_DPM_FREQ: u32 = 0x1d; // linux: PPSMC_MSG_GetMinDpmFreq
 const MAX_DPM_FREQ: u32 = 0x1e; // linux: PPSMC_MSG_GetMaxDpmFreq
 const TRANSFER_TO_DRIVER: u32 = 0x12; // linux: PPSMC_MSG_TransferTableSmu2Dram
@@ -962,6 +966,41 @@ impl<I: Io> Engine<I> {
     }
     /// `smu_v11_0_gfx_off_control`: AllowGfxOff / DisallowGfxOff, only once
     /// the opt-in enabled FEATURE_GFXOFF through `update_features`.
+    /// `smu_v11_0_set_performance_level` restricted to GFXCLK, through
+    /// `smu_v11_0_set_soft_freq_limited_range`: SoftMax then SoftMin, with
+    /// 0xffff/0 as PMFW's automatic bounds. Memory and SoC clocks stay with
+    /// the display owner's admitted floors, so no admission reruns.
+    async fn set_gfx_level(&mut self, level: GfxLevel) -> Result<(), Error> {
+        let resume = self.begin_runtime()?;
+        let result = async {
+            let clk = 0u32 << 16; // linux-lit: 0=PPCLK_GFXCLK
+            let (min, max) = match level {
+                GfxLevel::Auto => (0, 0xffff),
+                GfxLevel::Low | GfxLevel::High => {
+                    let min = self.command(MIN_DPM_FREQ, clk).await?;
+                    let max = self.command(MAX_DPM_FREQ, clk).await?;
+                    if min == 0 || min > max || max > u32::from(u16::MAX) {
+                        return Err(Error::Invalid);
+                    }
+                    let pinned = if level == GfxLevel::High { max } else { min };
+                    (pinned, pinned)
+                }
+            };
+            self.command(SET_SOFT_MAX_BY_FREQ, clk | max).await?;
+            self.command(SET_SOFT_MIN_BY_FREQ, clk | min).await?;
+            Ok(())
+        }
+        .await;
+        self.end_runtime(resume, &result);
+        result
+    }
+    /// The PMFW running feature mask (`smu_cmn_get_enabled_mask`).
+    async fn running_features(&mut self) -> Result<u64, Error> {
+        let resume = self.begin_runtime()?;
+        let result = self.running().await;
+        self.end_runtime(resume, &result);
+        result
+    }
     async fn gfx_off_control(&mut self, allow: bool) -> Result<(), Error> {
         if self.gating_allowed & crate::amdgpu_navi22_power_policy::SMU_GFXOFF == 0 {
             return Err(Error::Invalid);
@@ -1254,6 +1293,15 @@ impl Smu {
     /// AllowGfxOff/DisallowGfxOff for `amdgpu_navi22_gfxoff`.
     pub(crate) async fn gfx_off_control(&mut self, allow: bool) -> Result<(), Error> {
         self.engine.gfx_off_control(allow).await
+    }
+    /// `power_dpm_force_performance_level` for GFXCLK; see
+    /// [`Engine::set_gfx_level`]. Rejection leaves the owner reusable.
+    pub async fn set_gfx_level(&mut self, level: GfxLevel) -> Result<(), Error> {
+        self.engine.set_gfx_level(level).await
+    }
+    /// The PMFW running feature mask, for `pp_features`.
+    pub async fn running_features(&mut self) -> Result<u64, Error> {
+        self.engine.running_features().await
     }
     /// Opt-in bits enabled at runtime through `update_gating_features`.
     pub fn gating_features(&self) -> u64 {

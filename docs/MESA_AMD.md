@@ -303,6 +303,7 @@ silicon yet, so each has an off switch for bring-up:
 | Native client submission (radeonsi/RADV, VCN/JPEG) | on | `amdgpu.rdna2_accel=0` |
 | DCN3.0 hardware cursor | on | `amdgpu.rdna2_hw_cursor=0` |
 | Power saving (GFXOFF, CG, hub PG, memory/fabric DPM, deep sleep, PMFW watermarks) | all requested | `amdgpu.rdna2_pg=none`, or a list such as `amdgpu.rdna2_pg=gfxoff,cg` |
+| Automatic GPU recovery after a hang (mode1, at most 3 per boot) | on | `amdgpu.gpu_recovery=0` |
 | Multi-display (secondary CRTCs) | off | `amdgpu.rdna2_multi` |
 
 Multi-display stays opt-in because secondary CRTCs light with static
@@ -310,9 +311,20 @@ scanouts: they cannot present or deliver vblank yet. Each requested power
 feature is still refused unless its display admission (DML p-state/stutter
 support, watermarks, clock floors) and driver prerequisites hold; the boot log
 names every refusal. If native modeset fails after the GOP stream is retired
-the screen stays dark: reboot with `amdgpu.native_display=0`. There is no
-automatic GPU recovery on a hang (mode1 recovery remains opt-in), so a hang
-under `accel` or power saving needs a reboot with that feature off.
+the screen stays dark: reboot with `amdgpu.native_display=0`. A detected ring
+hang (2 s without fence progress) mode1-resets and re-initializes the card,
+as Linux's `amdgpu.gpu_recovery` does; contexts see VRAM lost and in-flight
+work fails. A boot that needed GDDR6 training cannot recover yet, and after
+three recoveries the card is left stopped, because each recovery leaks the
+old owners' quarantined VRAM. A hang that keeps returning needs a reboot with
+the suspect feature off.
+
+At runtime, `/sys/class/drm/card<N>/device/power_dpm_force_performance_level`
+accepts `auto`, `low` and `high` (GFXCLK only; memory clocks stay with the
+display), and `pp_features` shows Linux's PMFW feature table and accepts a hex
+mask that may toggle GFXOFF, hub power gating, memory/fabric DPM and deep
+sleep. Enabling still passes the display-admission gates, and other bits are
+read-only.
 
 Switches take a bare flag or `=1|on` and `=0|off`; other values keep the
 default. The old `amdgpu.navi22_*` spellings remain supported and the

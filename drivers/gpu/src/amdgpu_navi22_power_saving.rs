@@ -167,7 +167,9 @@ async fn upload_watermarks(
     Ok(memory)
 }
 
-/// Apply the opt-in once.
+/// Apply the opt-in: at boot, or again after [`remove`] (`pp_features`).
+/// A re-apply reuses the published PMFW watermark table (Linux never
+/// withdraws it) and the gating owner instead of allocating new ones.
 ///
 /// # Safety
 /// `parts` are the owners of one completed Navi22 boot under its owner lock;
@@ -178,24 +180,28 @@ pub(crate) async unsafe fn apply(
     optin: OptIn,
     retained: &mut Option<Retained>,
 ) -> Result<Applied, Error> {
-    if retained.is_some() || optin.is_empty() {
+    if retained.as_ref().is_some_and(|r| !r.removed) || optin.is_empty() {
         return Err(Error::Busy);
     }
-    let watermarks = if optin.watermarks {
-        Some(upload_watermarks(&mut parts).await?)
-    } else {
-        None
+    let previous = retained.take();
+    let (published, gating) = match previous {
+        Some(r) => (r._watermarks, r.gating),
+        None => (None, None),
+    };
+    let watermarks = match (optin.watermarks, published) {
+        (true, None) => Some(upload_watermarks(&mut parts).await?),
+        (_, kept) => kept,
     };
     // `DisplayAdmission::watermarks` means HUBBUB and PMFW sets; the PMFW
     // half is only certified once this path uploaded it.
     let admission = parts.admission.map(|a| DisplayAdmission {
-        watermarks: a.watermarks && watermarks.is_some(),
+        watermarks: a.watermarks && optin.watermarks && watermarks.is_some(),
         ..a
     });
     let plan = plan(optin, admission.as_ref(), &readiness());
     let mut applied = Applied {
         plan,
-        watermarks: watermarks.is_some(),
+        watermarks: optin.watermarks && watermarks.is_some(),
         smu_bits: 0,
         blocks: Blocks::NONE,
         uclk_floor_mhz: None,
@@ -203,7 +209,7 @@ pub(crate) async unsafe fn apply(
     };
     // Retain everything that touched hardware before any later step fails.
     *retained = Some(Retained {
-        gating: None,
+        gating,
         _watermarks: watermarks,
         applied,
         removed: false,
@@ -211,10 +217,17 @@ pub(crate) async unsafe fn apply(
     let r = retained.as_mut().ok_or(Error::Busy)?;
     let blocks = plan.blocks();
     if !blocks.is_empty() {
-        // SAFETY: the completed boot's exclusive owner; this module is the
-        // only writer of these registers.
-        let gating = unsafe { Gating::new(parts.gpu, parts.authority) }.map_err(Error::Gating)?;
-        let gating = r.gating.insert(gating);
+        // A re-apply reuses the gating owner the boot created.
+        let gating = match r.gating.take() {
+            Some(gating) => r.gating.insert(gating),
+            None => {
+                // SAFETY: the completed boot's exclusive owner; this module is
+                // the only writer of these registers.
+                let gating =
+                    unsafe { Gating::new(parts.gpu, parts.authority) }.map_err(Error::Gating)?;
+                r.gating.insert(gating)
+            }
+        };
         // SAFETY: GFXOFF is not running (caller contract), RLC runs after a
         // completed boot, and the plan admitted exactly these blocks.
         unsafe { gating.set_clockgating(true, blocks) }
@@ -353,7 +366,7 @@ mod tests {
             deep_sleep_dcefclk: false,
         }
     }
-    /// A default boot (no `amdgpu.navi22_pg`) plans nothing: no clock-gating
+    /// No opt-in list (`amdgpu.rdna2_pg=none`) plans nothing: no clock-gating
     /// block, no PMFW bit, no floor, no GFXOFF.
     fn navi22_power_saving_default_boot_plans_nothing() -> TestResult {
         let ready = DriverReadiness {

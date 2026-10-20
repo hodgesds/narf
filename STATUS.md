@@ -1063,6 +1063,43 @@ pin refusals, injected rmap preparation failure, commit rollback,
 fork/split/mremap, syscall-level mmap publication and relocation, VRAM<->GTT
 moves of published views, late fences, allocation failure and fork-gap
 retention.
+RX 6000 (RDNA2: Navi21/22/23/24) current state — the summary to read first;
+the entries below are a dated log.
+- Implemented and model-tested (register/fake-engine models, QEMU suites):
+  native startup for 40 PCI IDs (PSP/SOS, SMU11, GMC/GART/per-client VMs,
+  IH, SDMA, GFX/compute kernel queues, VCN/JPEG), DCN3.0 HDMI/DP modesets
+  with DML30 admission, HDMI audio, the Mesa render ABI (CS, GEM, VA, PRIME,
+  syncobjs, VA-API/Vulkan video rings), full buffer migration (shared,
+  GPU-mapped, CPU-mapped, invisible VRAM), power telemetry and thermal
+  shutdown, hang detection and mode1 recovery.
+- On by default, each with an off switch: native display, accel, hardware
+  cursor, power saving (each feature still admission-gated; GFXOFF stays
+  refused until the CS path declares its GC MMIO GFXOFF-safe) and automatic
+  recovery (`amdgpu.gpu_recovery=0`; at most 3 per boot, because each one
+  quarantines VRAM).
+- Runtime controls: `power_dpm_force_performance_level` (`auto|low|high`,
+  GFXCLK only) and `pp_features` (Linux's PMFW table; policy-owned bits only),
+  on `card<N>/` and `card<N>/device/`.
+- Open: any boot on RX 6000 silicon; multi-display presentation on secondary
+  CRTCs (opt-in until then); GDDR6 short-training resume (training boots
+  cannot recover); VCN dynamic power gating; declaring CS GC MMIO
+  GFXOFF-safe; user CPU mappings of VRAM are not revoked during a reset
+  (Linux behaviour).
+
+RX 6000 runtime power controls and recovery: the DRM card exposes writable
+`power_dpm_force_performance_level` (SMU11 SoftMax/SoftMin on GFXCLK, as
+`smu_v11_0_set_soft_freq_limited_range`) and `pp_features`
+(`smu_cmn_get_pp_feature_mask` text over sienna_cichlid's 43 mapped bits; a
+written mask may toggle only power-policy features and re-plans the power
+saving through its admission gates; power saving can now be re-applied after
+removal). Writes validate synchronously and apply in a serialized task.
+Automatic mode1 recovery after a detected hang is on by default (Linux
+`amdgpu.gpu_recovery`), capped at three per boot; the fb console pauses for
+the reset through a recovery hook and the power controls republish after it.
+`smoke_sync_all_reaches_every_superblock_once` now judges its report against
+a pre-fixture baseline, so mounts or disks left by earlier tests no longer
+fail it. Model tests only.
+
 RX 6000 defaults: native HDMI/DP display, native client submission (accel),
 the DCN3.0 hardware cursor and every power-saving feature are now requested by
 default, each with an off switch (`amdgpu.native_display=0`,
@@ -1206,8 +1243,8 @@ owners can supply display and lifecycle constraints.
 The required firmware set now includes VCN and DMCUB. PSP receives those after
 RLC autoload, and their reported entry addresses must lie inside the retained
 TMR. Missing/malformed media images prevent startup before device writes;
-partial upload failures preserve ownership and prevent replay. Firmware load
-does not yet start VCN queues.
+partial upload failures preserve ownership and prevent replay. VCN queues
+start later, after the fence stage (below).
 Production cold boot now initializes GC/MMHUB VMID0 with a bounded VRAM-only
 test aperture after the protected power policy is active. Both hubs validate
 idle contexts and matching framebuffer geometry, use owned VRAM page tables
@@ -1218,7 +1255,8 @@ contexts 1–15 on an empty root. The hub owner binds pinned system DMA pages
 into the GART and creates per-client GMC10 four-level VMs with Linux PDE/PTE
 encodings, engine-17 invalidation on both hubs, and VMC/UTCL2 fault
 attribution; register-model tests cover isolation, timeouts, cancellation and
-revocation. Not hardware-validated; GEM/CS do not use it yet.
+revocation. Not hardware-validated; GEM/CS now run client IBs on these
+per-client VMs (below).
 SDMA0 now has a cold-start path on GC 10.3.2 and an owned VRAM ring. Production
 boot runs a translated WRITE/COPY/FENCE test after GMC setup and checks both
 read-pointer paths and all copied words. Reset and completion waits are bounded;
@@ -1292,23 +1330,28 @@ with Navi48 (temperatures, fan, power, clocks); fan control stays automatic.
 The SMU11 THM L2H/H2L, GPIO19 CTF and SMU-to-driver interrupts are armed and
 handled as smu_v11_0 does, including the delayed SW CTF check and power-off.
 Kernel-queue hang detection (2 s fence-progress timeout per ring) is active
-and logging; mode1 device recovery with a full cold-boot re-init exists behind
-an explicit opt-in API (display stays dark; training boots refuse it).
-GFXOFF, clock/power gating, memory/fabric DPM and deep sleep stay disabled on
-every default boot. Linux's sequences for them are implemented and model-tested
+and logging; mode1 device recovery with a full cold-boot re-init now runs
+automatically after a hang (see the RX 6000 current-state entry; training
+boots still refuse it).
+GFXOFF, clock/power gating, memory/fabric DPM and deep sleep were disabled on
+every default boot at this point (all are now requested by default; see the
+RX 6000 defaults entry above). Linux's sequences for them are implemented and model-tested
 (gfx_v10_0 MGCG/CGCG/3D CGCG under RLC safe mode, mmhub_v2_0/athub_v2_1/
 hdp_v5_0/navi10_ih/sdma_v5_2/smuio CG with nv.c's navy_flounder flags,
 `amdgpu_gfx_off_ctrl` GFXOFF with its 100 ms delay and disable references,
 runtime PMFW feature bits, DCN3.0 PMFW watermark table, UCLK/FCLK floors). They
-run only for the features an explicit `amdgpu.navi22_pg=` list names and the
-policy admits; today that admits GC clock gating alone (no watermarks from the
-display owner, GC MMIO not yet declared GFXOFF-safe by the CS path).
+run for the features `amdgpu.rdna2_pg=` names (all of them by default) that the
+policy admits. GFXOFF stays refused until the CS path declares its GC MMIO
+GFXOFF-safe; GC clock gating needs only RLC safe mode; the watermark-dependent
+features (hub CG/PG, memory/fabric DPM, deep sleep) follow the live DML30
+admission of the native display, and the boot log names each refusal.
 VCN 3.0 now starts both discovered instances after the fence stage (Linux's
 static, power-gating-disabled path with PSP-loaded TMR images, VCPU reset
 retries, decode/encode ring and IB tests, IH-routed fences) plus JPEG 3.0 with
 a ring test; PSP loads one VCN image per unharvested instance (type 13/58)
 from the discovery harvest table, and media failures leave the boot degraded.
-With `amdgpu.navi22_accel`, VCN decode/encode and JPEG are client IPs on the
+While accel is on (the default; `amdgpu.rdna2_accel=0` disables it), VCN
+decode/encode and JPEG are client IPs on the
 generic CS path (`amdgpu_vcn_navi22_cs`): Linux's ring frames with a
 ring-side MMHUB VM flush under the client VMID, `vcn_v3_0_dec_msg`
 message checks, per-client decode sessions, JPEG `parse_cs` on a kernel
@@ -1325,19 +1368,20 @@ explicitly allowed. Register models only; no physical EDID read yet.
 A native DCN3.0 DML port (`amdgpu_dml30`) admits one unscaled linear plane
 and derives DLG/TTU/RQ and HUBBUB watermark values, checked against host
 vectors computed from the Linux DML30 formulas.
-An opt-in (`amdgpu.native_display`) native HDMI TMDS path lights the first
+A native HDMI TMDS path (default; `amdgpu.native_display=0` keeps the GOP)
+lights the first
 connected HDMI sink on pipe 0 with a test pattern: DCN init, HUBBUB/DML30
 deadlines, the DAL clocks and the VBIOS PixelClock/STREAM_SETUP/transmitter
 tables (sent to DMCUB as `DMUB_CMD__VBIOS` commands while DMUB runs, as
 DCN3.0's `dmub_command_table`; the `atom.c`-faithful interpreter is the logged
 fallback), then fetch and unblank. Model-tested per block; never run on
-hardware. HPD/AUX/DDC engines are armed only with `amdgpu.native_display` or
+hardware. HPD/AUX/DDC engines are armed with native display (the default) or
 `amdgpu.display_probe`; SMU interface mismatches, a fused-off or hung DMCUB,
 stuck HUBP blanks and ASIC_Init's S7 bit are logged, not fatal, as in Linux.
 The lit pipe is presented natively: console/status publication with the
 `scanout_access` withdraw-before-teardown contract, DCN3.0 HUBP VSYNC page
 flips completed from EARLIEST_INUSE (pflip/vupdate IH sources armed), a
-256x256 DCN3.0 cursor (opt-in), KMS on the amdgpu card (DP-1..3, HDMI-A-1;
+256x256 DCN3.0 cursor (default; `amdgpu.rdna2_hw_cursor=0` disables), KMS on the amdgpu card (DP-1..3, HDMI-A-1;
 DML30-admitted modes, SETCRTC/atomic/TEST_ONLY, disable, vblank, flip
 events) and a monitor that relights after GPU recovery. Register models only.
 Navi22 HDMI 2.0 (`amdgpu_dcn30_hdmi`): TMDS above 340 MHz scrambles (1/4
@@ -1355,7 +1399,8 @@ sharing for identical HDMI timings, ODM 2:1 where one pipe cannot carry a
 stream, DSC with FEC on DP SST (`amdgpu_dcn30_dsc`, training through the
 shared DP link layer) and 8b/10b DP MST through the shared sideband manager
 (`amdgpu_dcn30_mst`). Secondary CRTCs route automatically only with
-`amdgpu.navi22_multi`; only CRTC 0 presents (the others show static scanouts).
+`amdgpu.rdna2_multi` (still opt-in); only CRTC 0 presents (the others show
+static scanouts).
 Register models only; never run on hardware.
 For bare-metal runs, `cargo xtask usb-image` builds a UEFI stick whose kernel
 appends its log to `/narf-boot-<n>.log` on that stick (`narf.bootlog=`,
@@ -1392,9 +1437,10 @@ GOP VMID0/DMUB windows/stopped-OTG pipes, an MP1 firmware-ready poll, Linux
 (or longer) PSP/SMU/training deadlines, warn-only PSP status, golden settings
 before SDMA plus the GC 10.3 power brake, and a non-fatal DMUB start after the
 queue stages using the GMC aperture.
-These are software-tested foundations; training resume,
-media submission/DPG, display-aware DPM, user command submission,
-hardware boot and DCN3.0 modesetting remain open. See the
+These were software-tested foundations. User command submission, media
+submission, display-aware DPM gating and DCN3.0 modesetting have since landed
+(register and fake-engine models only); GDDR6 training resume, VCN dynamic
+power gating (DPG) and any hardware boot remain open. See the
 [PCIe probe contract](drivers/gpu/specification/spec.md#amd-discrete-pcie-probe-and-vram). The native path now follows Linux's global order end to end (model-tested over one combined register fake, failure/cancellation per step), retires a live GOP stream like `dcn30_init_hw`, enables OPTC/OTG clocks, lights DP SST (native-AUX 8b/10b training with fallback, DP DTO, MSA/VSC) on any of the six pipes/routes, and quarantines underflows black. HPD/HPD_RX now arrive over the IH ring (DCE src 9) and wake the display monitor, with polling kept as the fallback. A host-side Linux conformance gate (`drivers/gpu/tools/navi22-conformance.sh`) checks about 2.5k annotated Navi22 constants against the exact Linux headers and discovery segments. It also checks NARF's firmware parsers against Linux's parsing of the real blobs. The DP link layer now follows Linux DC (`amdgpu_dcn30_dp_link`): capabilities with LTTPR transparent/non-transparent modes per the VBIOS DCE_INFO bits, TPS3/TPS4 by sink capability, adjust and post-LT adjust requests, destructive link verification with Linux's fallback order, the least verified link per stream, and DP modes in KMS bounded by the verified link; the monitor tears an unplugged display down without AUX, re-detects on HPD changes (dark connectors keep their EDID inventory), and retrains on HPD-RX/polled link loss. Register/AUX models only.
 
 1. **Stage 5 laptop proof:** boot from USB on Renoir/Lucienne or Phoenix

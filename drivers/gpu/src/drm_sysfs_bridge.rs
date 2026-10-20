@@ -30,7 +30,9 @@
 //!     uevent      → MAJOR/MINOR/DEVNAME/DEVTYPE/DRIVER (writable)
 //!     subsystem   → symlink → /sys/class/drm
 //!     device/     → vendor / device / subsystem_vendor / subsystem_device
-//!     power_dpm_state, power_dpm_force_performance_level, [vbios_version], …
+//!     power_dpm_state, power_dpm_force_performance_level (rw),
+//!     [pp_features (rw, RX 6000)], [vbios_version], …
+//!     (the two rw power controls also sit on the PCI device node)
 //!   renderD<N+128>/
 //!     name, dev, uevent (writable), subsystem → /sys/class/drm
 //! /sys/class/drm/card<N>       → ../../devices/platform/narf-drm/card<N>
@@ -100,6 +102,37 @@ pub fn populate_drm_class() {
                 .unwrap_or(0) as u32
         };
         populate_card_node(class_drm.clone(), card, idx);
+    }
+}
+
+/// `power_dpm_force_performance_level` and (where the card has a PMFW
+/// feature mask) `pp_features`, both writable. Values are queried at read
+/// time, unlike the boot-time snapshots above.
+fn add_power_controls(kobj: &Kobject, card: &Arc<dyn crate::drm_registry::DrmCard>) {
+    let utf8 = |data: &[u8]| {
+        core::str::from_utf8(data)
+            .map(String::from)
+            .map_err(|_| narf_filesystem::FsError::InvalidData)
+    };
+    {
+        let show = card.clone();
+        let store = card.clone();
+        kobject_add_writable_attr(
+            kobj,
+            "power_dpm_force_performance_level",
+            move || format!("{}\n", show.performance_level()),
+            move |data: &[u8]| store.set_performance_level(&utf8(data)?),
+        );
+    }
+    if card.pp_features().is_some() {
+        let show = card.clone();
+        let store = card.clone();
+        kobject_add_writable_attr(
+            kobj,
+            "pp_features",
+            move || show.pp_features().unwrap_or_default(),
+            move |data: &[u8]| store.set_pp_features(&utf8(data)?),
+        );
     }
 }
 
@@ -332,9 +365,10 @@ fn populate_card_node(
         let ps = String::from(card.power_state());
         kobject_add_attr(&kobj, "power_dpm_state", move || format!("{}\n", ps));
     }
-    kobject_add_attr(&kobj, "power_dpm_force_performance_level", || {
-        "auto\n".into()
-    });
+    // Runtime power controls: on the card node, and on its PCI device where
+    // Linux tools (`/sys/class/drm/card<N>/device/pp_features`) look.
+    add_power_controls(&kobj, &card);
+    add_power_controls(&dev_kobj, &card);
 
     // ── /sys/class/drm/card<N> + /sys/dev/char/226:<N> symlinks → the node ──
     class_drm.add_symlink(

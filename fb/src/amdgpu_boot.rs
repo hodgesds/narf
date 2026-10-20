@@ -163,6 +163,19 @@ pub(super) fn start() -> InitResult {
             // GFXOFF references and no other GC MMIO client runs yet.
             let _ = narf_scheduler::block_on_spin(unsafe { platform::power_saving(value) });
         }
+        // Automatic GPU recovery after a hang (Linux `amdgpu.gpu_recovery`).
+        // Kernel CPU writers of the boot framebuffer go behind the console
+        // hook first, so a reset never races the console or the pumps.
+        platform::set_recovery_console_hook(recovery_console);
+        // SAFETY: the console hook above pauses every kernel framebuffer
+        // writer for the reset; recovery withdraws the native scanout itself;
+        // user VRAM mappings follow Linux (not revoked, contents lost).
+        unsafe {
+            narf_drivers_gpu::amdgpu_navi22_tdr::set_automatic_recovery(options.gpu_recovery);
+        }
+        // Publish the sysfs power controls (`pp_features`,
+        // `power_dpm_force_performance_level`) with the running PMFW mask.
+        narf_scheduler::block_on_spin(narf_drivers_gpu::amdgpu_rdna2_power_controls::publish());
     }
     // `amdgpu.max_bpc=10|12`: allow HDMI deep colour, as DRM's max bpc.
     if let Some(bpc) = narf_boot::args()
@@ -238,6 +251,24 @@ fn native_display() {
     // SAFETY: the retained owner is serialized by the platform; only the
     // monitor and the published hooks drive the displays from here on.
     unsafe { navi48::spawn_display_monitor(config) };
+}
+
+/// The pause a running GPU recovery holds.
+static RECOVERY_PAUSE: narf_lib::sync::IrqSafeSpinLock<Option<Pause>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// GPU recovery's console hook: pause every kernel framebuffer writer while
+/// the card resets, and resume after a successful recovery. A pause taken
+/// at boot (training quarantine) is left alone.
+fn recovery_console(pause: bool) {
+    if pause {
+        if !paused() {
+            *RECOVERY_PAUSE.lock() = Some(Pause::new());
+        }
+    } else {
+        let held = RECOVERY_PAUSE.lock().take();
+        resume(held);
+    }
 }
 
 fn resume(pause: Option<Pause>) {

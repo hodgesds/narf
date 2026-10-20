@@ -468,9 +468,26 @@ impl crate::amdgpu_navi22_recovery::Backend for Recovering<'_> {
     }
 }
 
-/// Opt-in device recovery (Linux `amdgpu_device_gpu_recover`, mode1): not
-/// triggered automatically unless `amdgpu_navi22_tdr::set_automatic_recovery`
-/// was enabled. Quiesces the services and IH, abandons every fence wait,
+/// Pauses (`true`) and resumes (`false`) every kernel CPU writer of the boot
+/// framebuffer; installed by the fb owner.
+type ConsoleHook = fn(bool);
+static CONSOLE_HOOK: narf_lib::sync::IrqSafeSpinLock<Option<ConsoleHook>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+/// Install the hook [`recover`] uses to keep kernel CPU writers off this
+/// card's framebuffer while it resets.
+pub fn set_recovery_console_hook(hook: ConsoleHook) {
+    *CONSOLE_HOOK.lock() = Some(hook);
+}
+fn console(pause: bool) {
+    let hook = *CONSOLE_HOOK.lock();
+    if let Some(hook) = hook {
+        hook(pause);
+    }
+}
+
+/// Device recovery (Linux `amdgpu_device_gpu_recover`, mode1), triggered by
+/// the hang detector when `amdgpu_navi22_tdr::set_automatic_recovery` is on
+/// (the RX 6000 default; `amdgpu.gpu_recovery=0` turns it off). Quiesces the services and IH, abandons every fence wait,
 /// mode1-resets the ASIC and re-runs the complete cold-boot bring-up on a
 /// fresh owner (DMUB restarted as on cold boot), then restarts telemetry,
 /// thermal and TDR. The native display is withdrawn and stopped first and,
@@ -487,18 +504,32 @@ pub async unsafe fn recover() -> Result<boot::Report, crate::amdgpu_navi22_recov
     let mut recovery = RECOVERY.try_lock().ok_or(Error::Busy)?;
     crate::amdgpu_navi22_cs::unregister();
     let device = amdgpu::pci_device().ok_or(Error::Busy)?;
-    let mut owner = OWNER.lock().await;
-    let mut backend = Recovering {
-        owner: &mut owner,
-        device,
-        interrupts: alloc::vec::Vec::new(),
+    // Kernel CPU writers stay off the framebuffer for the whole reset; the
+    // runtime power controls refer to the old owner's PMFW state.
+    console(true);
+    crate::amdgpu_rdna2_power_controls::withdraw();
+    let result = {
+        let mut owner = OWNER.lock().await;
+        let mut backend = Recovering {
+            owner: &mut owner,
+            device,
+            interrupts: alloc::vec::Vec::new(),
+        };
+        recovery.run(&mut backend).await
     };
-    let result = recovery.run(&mut backend).await;
     use core::fmt::Write;
     let _ = writeln!(
         narf_console::Writer,
         "amdgpu: navi22 GPU recovery {result:?}"
     );
+    if result.is_ok() {
+        // The fresh owner runs without the previous power-saving opt-in and
+        // at automatic GFXCLK limits; publish what it really runs.
+        *REQUESTED.lock() = crate::amdgpu_navi22_power_policy::OptIn::NONE;
+        crate::amdgpu_rdna2_power_controls::publish().await;
+        console(false);
+    }
+    // A lost device keeps the console quarantined, as a failed boot does.
     result
 }
 
@@ -1674,10 +1705,9 @@ async unsafe fn present_native(
 
 // ── Opt-in power saving (`amdgpu.navi22_pg`) ────────────────────────────
 
-/// Apply the features named by the `amdgpu.navi22_pg=` boot argument's
-/// value that the power policy admits (amdgpu_navi22_power_saving), then
-/// start GFXOFF if it was admitted. Never called on a default boot. Each
-/// refusal is reported on the console.
+/// Apply the features named by the `amdgpu.rdna2_pg=` value (or the default
+/// list) that the power policy admits (amdgpu_navi22_power_saving), then
+/// start GFXOFF if it was admitted. Each refusal is reported on the console.
 ///
 /// # Safety
 /// After a successful `run`; every GC MMIO client (TDR, uapi/CS) takes a
@@ -1690,10 +1720,73 @@ pub async unsafe fn power_saving(
     if optin.is_empty() {
         let _ = writeln!(
             narf_console::Writer,
-            "amdgpu: navi22 power saving: unrecognised amdgpu.navi22_pg={value}; nothing enabled"
+            "amdgpu: navi22 power saving: unrecognised amdgpu.rdna2_pg={value}; nothing enabled"
         );
         return Err(boot::Error::Invalid);
     }
+    // SAFETY: forwarded caller contract.
+    unsafe { apply_optin(optin) }.await
+}
+
+/// The opt-in last requested at boot or through `pp_features`.
+static REQUESTED: narf_lib::sync::IrqSafeSpinLock<crate::amdgpu_navi22_power_policy::OptIn> =
+    narf_lib::sync::IrqSafeSpinLock::new(crate::amdgpu_navi22_power_policy::OptIn::NONE);
+/// The opt-in currently requested (for `pp_features` re-planning).
+pub fn requested_power_saving() -> crate::amdgpu_navi22_power_policy::OptIn {
+    *REQUESTED.lock()
+}
+
+/// Remove whatever power saving is applied, then apply `optin` (if not
+/// empty) through the same admission gates as the boot path.
+///
+/// # Safety
+/// As [`power_saving`].
+pub async unsafe fn replace_power_saving(
+    optin: crate::amdgpu_navi22_power_policy::OptIn,
+) -> Result<Option<crate::amdgpu_navi22_power_saving::Applied>, boot::Error> {
+    let applied = {
+        let owner = OWNER.lock().await;
+        owner.as_ref().ok_or(boot::Error::Invalid)?.power_saving()
+    };
+    if applied.is_some() {
+        // SAFETY: forwarded caller contract.
+        unsafe { remove_power_saving() }.await?;
+    }
+    *REQUESTED.lock() = optin;
+    if optin.is_empty() {
+        return Ok(None);
+    }
+    // SAFETY: forwarded caller contract; GFXOFF is stopped by the removal.
+    unsafe { apply_optin(optin) }.await.map(Some)
+}
+
+/// `power_dpm_force_performance_level` on GFXCLK.
+pub async fn set_gfx_level(level: crate::amdgpu_smu_navi22::GfxLevel) -> Result<(), boot::Error> {
+    let mut owner = OWNER.lock().await;
+    owner
+        .as_mut()
+        .ok_or(boot::Error::Invalid)?
+        .set_gfx_level(level)
+        .await
+}
+
+/// The PMFW running feature mask (`pp_features`).
+pub async fn running_features() -> Result<u64, boot::Error> {
+    let mut owner = OWNER.lock().await;
+    owner
+        .as_mut()
+        .ok_or(boot::Error::Invalid)?
+        .running_features()
+        .await
+}
+
+/// # Safety
+/// As [`power_saving`].
+async unsafe fn apply_optin(
+    optin: crate::amdgpu_navi22_power_policy::OptIn,
+) -> Result<crate::amdgpu_navi22_power_saving::Applied, boot::Error> {
+    use core::fmt::Write;
+    *REQUESTED.lock() = optin;
     let result = {
         let mut owner = OWNER.lock().await;
         let boot = owner.as_mut().ok_or(boot::Error::Invalid)?;

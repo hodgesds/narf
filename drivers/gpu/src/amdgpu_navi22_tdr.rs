@@ -7,8 +7,12 @@
 //! scheduler, so this watchdog samples each queue's emitted sequence and its
 //! fence writeback: a queue with unsignalled work whose fence has not moved
 //! for the timeout is hung. Detection is always active and logs once per
-//! stall; recovery stays an explicit opt-in (`set_automatic_recovery`, off
-//! by default) until hardware-validated.
+//! stall. Like Linux's default `amdgpu_gpu_recovery=-1` on a dGPU, a hang
+//! starts recovery (`set_automatic_recovery`, on by default for RX 6000;
+//! `amdgpu.gpu_recovery=0` turns it off), at most
+//! [`MAX_AUTOMATIC_RECOVERIES`] times per boot: each recovery quarantines
+//! (leaks) the old owners' VRAM, so a card that keeps hanging is left
+//! stopped rather than recovered until VRAM runs out.
 use crate::amdgpu_fence_navi22::{signaled, Engine};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -128,19 +132,40 @@ static STATUS: IrqSafeSpinLock<Status> = IrqSafeSpinLock::new(Status {
 });
 static EPOCH: AtomicU64 = AtomicU64::new(0);
 static AUTOMATIC: AtomicBool = AtomicBool::new(false);
+/// Automatic recoveries allowed per boot (explicit `recover()` calls are not
+/// counted).
+pub const MAX_AUTOMATIC_RECOVERIES: u64 = 3;
+static AUTOMATIC_RECOVERIES: AtomicU64 = AtomicU64::new(0);
+/// Test-only: restore the full budget.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __reset_automatic_recoveries() {
+    AUTOMATIC_RECOVERIES.store(0, Ordering::Release);
+}
+/// Claim one automatic recovery; `false` once the boot's budget is spent.
+pub(crate) fn claim_automatic_recovery() -> bool {
+    AUTOMATIC_RECOVERIES
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            (used < MAX_AUTOMATIC_RECOVERIES).then_some(used + 1)
+        })
+        .is_ok()
+}
 pub fn status() -> Status {
     Status {
         automatic_recovery: AUTOMATIC.load(Ordering::Acquire),
         ..*STATUS.lock()
     }
 }
-/// Opt in to Linux's `amdgpu_gpu_recovery=1` behaviour: a detected hang
-/// starts `amdgpu_navi22_platform::recover`. Off by default.
+/// Linux's `amdgpu_gpu_recovery`: a detected hang starts
+/// `amdgpu_navi22_platform::recover`. The fb boot handoff enables it unless
+/// `amdgpu.gpu_recovery=0`.
 ///
 /// # Safety
 /// The caller accepts recovery's contract (`recover`): every kernel queue's
-/// in-flight work is abandoned, the card's display goes dark and the CPU
-/// must not access this card's VRAM while recovery runs.
+/// in-flight work is abandoned, the card's display goes dark, and every
+/// kernel CPU writer of the boot framebuffer is behind the console hook
+/// (`amdgpu_navi22_platform::set_recovery_console_hook`). User CPU mappings
+/// of VRAM are not revoked, as in Linux: their accesses during the reset go
+/// to an unresponsive BAR and the contents are lost afterwards.
 pub unsafe fn set_automatic_recovery(enabled: bool) {
     AUTOMATIC.store(enabled, Ordering::Release);
 }
@@ -197,15 +222,22 @@ pub(crate) async fn monitor(epoch: u64) {
                 hang.stalled_ms
             );
             if AUTOMATIC.load(Ordering::Acquire) {
-                // SAFETY: the caller of set_automatic_recovery accepted
-                // recover()'s contract on behalf of every queue user.
-                let result = unsafe { crate::amdgpu_navi22_platform::recover() }.await;
-                let _ = writeln!(narf_console::Writer, "amdgpu: navi22 recovery {result:?}");
-                return; // a recovered owner starts a fresh detector
+                if claim_automatic_recovery() {
+                    // SAFETY: the caller of set_automatic_recovery accepted
+                    // recover()'s contract on behalf of every queue user.
+                    let result = unsafe { crate::amdgpu_navi22_platform::recover() }.await;
+                    let _ = writeln!(narf_console::Writer, "amdgpu: navi22 recovery {result:?}");
+                    return; // a recovered owner starts a fresh detector
+                }
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: navi22 GPU recovery limit ({MAX_AUTOMATIC_RECOVERIES} per boot) reached; the GPU stays hung"
+                );
+                continue;
             }
             let _ = writeln!(
                 narf_console::Writer,
-                "amdgpu: navi22 GPU recovery disabled (explicit recover() only)"
+                "amdgpu: navi22 GPU recovery disabled (amdgpu.gpu_recovery=0)"
             );
         }
     }

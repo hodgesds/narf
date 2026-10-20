@@ -67,6 +67,29 @@ pub trait DrmCard: Send + Sync {
     ///
     /// Linux ref: `amdgpu_pm_info_read` → `power_dpm_state`.
     fn power_state(&self) -> &str;
+
+    /// `power_dpm_force_performance_level` show. Linux ref:
+    /// `amdgpu_get_power_dpm_force_performance_level`.
+    fn performance_level(&self) -> &'static str {
+        "auto"
+    }
+
+    /// `power_dpm_force_performance_level` store; `Unsupported` where the
+    /// driver has no runtime control.
+    fn set_performance_level(&self, _level: &str) -> Result<(), narf_filesystem::FsError> {
+        Err(narf_filesystem::FsError::Unsupported)
+    }
+
+    /// `pp_features` show, or `None` when the card has no PMFW feature mask.
+    /// Linux ref: `amdgpu_get_pp_features`.
+    fn pp_features(&self) -> Option<alloc::string::String> {
+        None
+    }
+
+    /// `pp_features` store (a hex mask). Linux ref: `amdgpu_set_pp_features`.
+    fn set_pp_features(&self, _mask: &str) -> Result<(), narf_filesystem::FsError> {
+        Err(narf_filesystem::FsError::Unsupported)
+    }
 }
 
 // ── Global registry ────────────────────────────────────────────────────────

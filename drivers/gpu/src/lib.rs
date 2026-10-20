@@ -303,6 +303,7 @@ pub use amdgpu_rdna2_platform as amdgpu_navi22_platform;
 pub mod amdgpu_rdna2_power;
 /// Compatibility alias for the original Navi22 API.
 pub use amdgpu_rdna2_power as amdgpu_navi22_power;
+pub mod amdgpu_rdna2_power_controls;
 #[path = "amdgpu_navi22_power_policy.rs"]
 pub mod amdgpu_rdna2_power_policy;
 /// Compatibility alias for the original Navi22 API.

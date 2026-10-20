@@ -4019,11 +4019,24 @@ queues all verified, a task samples every 250 ms, under the owner lock,
 after an HDP invalidate; an all-ones read-back is device loss). The per-engine
 timer starts when unsignalled work is first seen and restarts on every fence
 advance; a stall past the timeout logs `ring <engine> timeout, signaled seq=…,
-emitted seq=…` once and is retained in `tdr::status()`. Detection is always on;
-recovery is triggered only by `unsafe tdr::set_automatic_recovery(true)` (off by
-default) or an explicit call.
+emitted seq=…` once and is retained in `tdr::status()`. Detection is always on.
+`unsafe tdr::set_automatic_recovery(bool)` (Linux `amdgpu_gpu_recovery`) makes
+a detected hang call `recover()`; the fb boot handoff enables it on RX 6000
+unless `amdgpu.gpu_recovery=0`, after installing the console hook below. At
+most `tdr::MAX_AUTOMATIC_RECOVERIES` (3) automatic recoveries run per boot,
+because each one quarantines the old owners' VRAM; past that the stall is only
+logged. Explicit `recover()` calls are not counted.
 
-`unsafe amdgpu_navi22_platform::recover().await` is the opt-in
+`amdgpu_navi22_platform::set_recovery_console_hook(fn(bool))` installs the
+fb owner's pause (`true`) / resume (`false`) of every kernel CPU writer of the
+boot framebuffer. `recover()` pauses through it before the reset, withdraws
+the runtime power controls, and after success resets the requested power
+opt-in to none, republishes the controls and resumes the console; a lost
+device keeps the console quarantined. User CPU mappings of VRAM are not
+revoked during a reset, as in Linux (their accesses reach an unresponsive BAR
+and the contents are lost).
+
+`unsafe amdgpu_navi22_platform::recover().await` is
 `amdgpu_device_gpu_recover` for mode1 (`amdgpu_navi22_recovery::Recovery`, state
 stored outside the future). `check` refuses (`Unsupported`, no side effects) a
 boot that needed GDDR6 training (no short-training replay yet) or lacks a board
@@ -4063,8 +4076,8 @@ validation facts. `revoke` closes a gate.
 every feature (pure; `Plan::blocks`, `smu_enable`, per-feature `refusals`);
 `readiness()` reports RLC safe mode implemented, recovery unvalidated and GC
 access GFXOFF-safe only after `amdgpu_navi22_gfxoff::declare_submission_guarded`.
-`amdgpu_navi22_platform::power_saving(value)` (fb calls it only when the boot
-argument is present) runs `ColdBoot::apply_power_saving`: optional PMFW
+`amdgpu_navi22_platform::power_saving(value)` (fb calls it with the boot
+argument's list, or the default list) runs `ColdBoot::apply_power_saving`: optional PMFW
 watermark upload (`amdgpu_dcn30_watermarks`: `navi22_ranges`, `encode`,
 `notify` over the DAL mailbox, as `dcn3_notify_wm_ranges`), clock gating
 (`amdgpu_navi22_gating::Gating::set_clockgating(gate, Blocks)`, Linux IP order
@@ -4073,6 +4086,32 @@ common→gmc→ih→gfx→sdma, reverse to ungate, GC under RLC safe mode),
 smu_cmn_feature_update_enable_state with running-set and protection checks),
 the initial `DisallowGfxOff`, and UCLK/FCLK hard minimums at the admitted
 floors (`ClockManager::hard_min`). It then starts the GFXOFF controller.
+`apply` may run again after `remove` (`replace_power_saving`), reusing the
+published PMFW watermark table and the gating owner; a set that is still
+applied refuses `Busy`.
+
+Runtime controls (`amdgpu_rdna2_power_controls`) back two DRM card sysfs
+attributes through `DrmCard::{performance_level, set_performance_level,
+pp_features, set_pp_features}` (defaults: `"auto"`, `Unsupported`, `None`,
+`Unsupported`; `AmdgpuCard` serves RX 6000 PCI IDs). `publish().await` (fb,
+after power saving; recovery, after success) samples the PMFW running mask
+and marks the controls ready; `withdraw()` clears that. Writes validate
+synchronously (`EINVAL` malformed, `ENODEV` before publication, `EOPNOTSUPP`
+unsupported, `EPERM` forbidden bits) and queue the change to a task;
+`CONTROL` serializes changes and a newer write of the same attribute
+supersedes one not yet started. Reads report the applied state.
+- `power_dpm_force_performance_level`: `auto|low|high` move GFXCLK only
+  through `Smu::set_gfx_level(GfxLevel)` (`smu_v11_0_set_soft_freq_limited_range`:
+  SoftMax then SoftMin, `PPCLK_GFXCLK << 16`, 0xffff/0 automatic bounds,
+  `high`/`low` pinned to the live DPM range). Memory/SoC clocks stay at the
+  display owner's floors; `manual` and `profile_*` are refused.
+- `pp_features`: show is `smu_cmn_get_pp_feature_mask`'s text over
+  sienna_cichlid's 43 mapped feature bits. A write is a hex mask; bits outside
+  `power_policy::policy_smu_bits()` must equal the running mask, each policy
+  feature's bits must be all set or all clear (`OptIn::with_smu_mask`), and the
+  resulting opt-in (clock gating and watermarks kept) replaces the applied one
+  through `replace_power_saving`, so enabling still passes every admission
+  gate. `Smu::running_features` is `smu_cmn_get_enabled_mask`.
 `remove_power_saving` stops GFXOFF and undoes the rest in reverse;
 `ColdBoot::power_saving()` reports what was applied.
 

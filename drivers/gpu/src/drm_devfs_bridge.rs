@@ -1596,6 +1596,10 @@ pub struct AmdgpuCard {
 }
 
 impl AmdgpuCard {
+    /// An RX 6000 (RDNA2 discrete) card, served by the RDNA2 controls.
+    fn rdna2(&self) -> bool {
+        crate::amdgpu_rdna2::for_pci_id(self.vid, self.did).is_some()
+    }
     pub fn new(
         card_name: String,
         vid: u16,
@@ -1643,6 +1647,26 @@ impl crate::drm_registry::DrmCard for AmdgpuCard {
     }
     fn power_state(&self) -> &str {
         "D0"
+    }
+    // RX 6000 runtime power controls; other generations keep the defaults.
+    fn performance_level(&self) -> &'static str {
+        crate::amdgpu_rdna2_power_controls::level()
+    }
+    fn set_performance_level(&self, level: &str) -> Result<(), FsError> {
+        if !self.rdna2() {
+            return Err(FsError::Unsupported);
+        }
+        crate::amdgpu_rdna2_power_controls::request_level(level)
+    }
+    fn pp_features(&self) -> Option<String> {
+        self.rdna2()
+            .then(crate::amdgpu_rdna2_power_controls::features)
+    }
+    fn set_pp_features(&self, mask: &str) -> Result<(), FsError> {
+        if !self.rdna2() {
+            return Err(FsError::Unsupported);
+        }
+        crate::amdgpu_rdna2_power_controls::request_features(mask)
     }
 }
 

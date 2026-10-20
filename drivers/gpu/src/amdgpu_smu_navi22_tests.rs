@@ -233,6 +233,8 @@ impl Io for Fake {
                         | ENABLE_FEATURES_HIGH
                         | DISABLE_FEATURES_LOW
                         | DISABLE_FEATURES_HIGH
+                        | SET_SOFT_MIN_BY_FREQ
+                        | SET_SOFT_MAX_BY_FREQ
                 ) {
                     assert_eq!(self.argument, 0);
                 }
@@ -272,6 +274,7 @@ impl Io for Fake {
                             0
                         }
                         ALLOW_GFXOFF | DISALLOW_GFXOFF => 0,
+                        SET_SOFT_MIN_BY_FREQ | SET_SOFT_MAX_BY_FREQ => 0,
                         GET_PPT_LIMIT => self.ppt_limit,
                         _ => panic!("unexpected SMU command"),
                     };
@@ -1249,6 +1252,62 @@ fn smu_navi22_thermal_alert_programs_smu_v11_0_set_irq_state() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/smu-navi22",
     smu_navi22_thermal_alert_programs_smu_v11_0_set_irq_state
+);
+
+/// `power_dpm_force_performance_level` on GFXCLK follows
+/// `smu_v11_0_set_soft_freq_limited_range`: SoftMax before SoftMin, PPCLK
+/// index in the upper half, 0xffff/0 automatic bounds for `auto`, and the
+/// live DPM range pinned for `high`/`low`. Rejection keeps the owner usable;
+/// nothing is sent before power setup completed.
+fn smu_navi22_gfx_level_follows_smu_v11_soft_limits() -> TestResult {
+    let mut cold = engine();
+    if run(cold.set_gfx_level(GfxLevel::High)) != Err(Error::Busy) {
+        return TestResult::Fail("performance level accepted before power setup");
+    }
+    let (mut e, _pool) = powered_engine(0x413f00);
+    let mut expect = |level, sequence: &[(u32, u32)]| {
+        e.io.writes.clear();
+        run(e.set_gfx_level(level)).is_ok()
+            && commands(&e.io.writes) == sequence
+            && e.state == State::PowerReady
+    };
+    if !expect(
+        GfxLevel::High,
+        &[
+            (MIN_DPM_FREQ, 0),
+            (MAX_DPM_FREQ, 0),
+            (SET_SOFT_MAX_BY_FREQ, 2600),
+            (SET_SOFT_MIN_BY_FREQ, 2600),
+        ],
+    ) || !expect(
+        GfxLevel::Low,
+        &[
+            (MIN_DPM_FREQ, 0),
+            (MAX_DPM_FREQ, 0),
+            (SET_SOFT_MAX_BY_FREQ, 500),
+            (SET_SOFT_MIN_BY_FREQ, 500),
+        ],
+    ) || !expect(
+        GfxLevel::Auto,
+        &[(SET_SOFT_MAX_BY_FREQ, 0xffff), (SET_SOFT_MIN_BY_FREQ, 0)],
+    ) {
+        return TestResult::Fail("GFXCLK soft-limit protocol");
+    }
+    e.io.reject = Some((SET_SOFT_MIN_BY_FREQ, 0xfe));
+    if run(e.set_gfx_level(GfxLevel::Auto)) != Err(Error::Rejected(0xfe))
+        || e.state != State::PowerReady
+    {
+        return TestResult::Fail("rejected soft limit left the owner unusable");
+    }
+    e.io.reject = None;
+    if run(e.running_features()) != Ok(e.io.running) {
+        return TestResult::Fail("running feature mask");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi22",
+    smu_navi22_gfx_level_follows_smu_v11_soft_limits
 );
 
 /// Opt-in gating bits: `smu_cmn_feature_update_enable_state` (Low then
