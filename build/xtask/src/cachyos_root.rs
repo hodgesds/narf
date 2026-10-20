@@ -116,6 +116,29 @@ const DEVICE_TIMEOUT_MARKER: &str = "Timed out waiting for device";
 /// stop timeout.
 const STOP_JOB_MARKER: &str = "A stop job is running for";
 
+/// systemd's boot status line for a job still starting.
+const START_JOB_MARKER: &str = "A start job is running for";
+
+/// Minutes a single start job may run before the boot counts as hung on it.
+const STUCK_START_JOB_MIN: u32 = 2;
+
+/// The status line of a start job that has been running for
+/// [`STUCK_START_JOB_MIN`] or more: "A start job is running for <unit>
+/// (2min 3s / no limit)". Nothing in this boot legitimately takes that long,
+/// so the boot is hung on that job (a plymouth client waiting on the socket of
+/// a daemon that had exited was one), and naming it beats a bare login
+/// timeout minutes later.
+fn stuck_start_job(serial: &str) -> Option<&str> {
+    serial.match_indices(START_JOB_MARKER).find_map(|(at, _)| {
+        let rest = &serial[at..];
+        let line = rest.split(['\r', '\n']).next().unwrap_or(rest);
+        let timer = &line[line.rfind('(')? + 1..];
+        let elapsed = timer.split(" / ").next()?;
+        let minutes: u32 = elapsed.split_once("min")?.0.parse().ok()?;
+        (minutes >= STUCK_START_JOB_MIN).then_some(line)
+    })
+}
+
 /// `NARF-JOURNAL-U <n>`: the lines `journalctl -u systemd-journald` printed,
 /// or `None` when the report has no such line (a mistyped command).
 fn journal_unit_lines(report: &str) -> Option<usize> {
@@ -245,6 +268,12 @@ fn boot_and_login(args: &Args) -> Result<()> {
                 }
                 if let Some(hit) = needles.iter().position(|n| serial[from..].contains(*n)) {
                     return Ok(hit);
+                }
+                if let Some(job) = stuck_start_job(&serial[from..]) {
+                    return Err(anyhow::anyhow!(
+                        "boot hung on a start job: {}",
+                        strip_escapes(job)
+                    ));
                 }
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
@@ -579,6 +608,23 @@ mod tests {
         // A mistyped command leaves no verdict rather than a false zero.
         assert_eq!(journal_unit_lines("NARF-STATE running\n"), None);
         assert_eq!(journal_unit_lines("NARF-JOURNAL-U \n"), None);
+    }
+
+    #[test]
+    fn a_start_job_past_two_minutes_is_a_hang() {
+        let line = "\u{1b}[K[  \u{1b}[0;31m*\u{1b}[0m] A start job is running for Tell Ply\u{2026}e Out Runtime Data";
+        let short = format!("{line} (59s / no limit)\r{line} (1min 59s / no limit)\r");
+        assert_eq!(stuck_start_job(&short), None);
+        let long = format!("{short}{line} (2min 1s / no limit)\r\n");
+        assert_eq!(
+            stuck_start_job(&long).map(|l| l.ends_with("(2min 1s / no limit)")),
+            Some(true)
+        );
+        // The limit after the slash is not the elapsed time.
+        assert_eq!(
+            stuck_start_job("A start job is running for dev-x.device (5s / 3min 30s)"),
+            None
+        );
     }
 
     #[test]
