@@ -4613,11 +4613,55 @@ fn emit_serial_tail(serial: &[u8]) {
 
 /// Capture a QEMU serial stream for result parsing, optionally mirroring it
 /// to a file and/or the invoking terminal as bytes arrive.
+/// Liveness of a captured serial stream, shared with the waiting thread so a
+/// stalled or panicked guest is caught long before the overall cap.
+#[derive(Default)]
+struct SerialProgress {
+    /// Milliseconds since `started` at which the last bytes arrived.
+    last_output_ms: std::sync::atomic::AtomicU64,
+    /// A kernel panic/fault marker has been seen.
+    panicked: std::sync::atomic::AtomicBool,
+}
+
+/// Markers of a kernel that stopped making progress for good.
+const PANIC_MARKERS: &[&str] = &[
+    "*** KERNEL PANIC ***",
+    "panicked at",
+    "double fault",
+    "general protection",
+    "kernel page fault",
+    "unsafe precondition",
+];
+
+/// How long the kernel-test phase may print nothing before it is treated as
+/// hung. Every smoke reports a line when it finishes; no single smoke runs
+/// anywhere near this. `0` disables the check.
+fn kernel_test_idle_secs() -> u64 {
+    std::env::var("XTASK_QEMU_IDLE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(300)
+}
+
+/// The last non-empty serial line: in the kernel-test phase, the last smoke
+/// that finished (or the one that began printing and never finished).
+fn last_serial_line(serial: &[u8]) -> String {
+    String::from_utf8_lossy(serial)
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("<no serial output>")
+        .trim()
+        .to_string()
+}
+
 fn capture_serial_stream(
     mut serial: impl Read,
     mut log: Option<std::fs::File>,
     tee_stdout: bool,
+    progress: Option<(std::sync::Arc<SerialProgress>, std::time::Instant)>,
 ) -> Vec<u8> {
+    use std::sync::atomic::Ordering;
     let mut bytes = Vec::new();
     let mut live = tee_stdout.then(std::io::stdout);
     let mut chunk = [0; 16 * 1024];
@@ -4626,7 +4670,21 @@ fn capture_serial_stream(
             Ok(0) => break,
             Ok(length) => {
                 let chunk = &chunk[..length];
-                bytes.extend_from_slice(chunk);
+                if let Some((progress, started)) = &progress {
+                    progress
+                        .last_output_ms
+                        .store(started.elapsed().as_millis() as u64, Ordering::Release);
+                    // Look back one marker length so a marker split across
+                    // reads is still found.
+                    let from = bytes.len().saturating_sub(32);
+                    bytes.extend_from_slice(chunk);
+                    let recent = String::from_utf8_lossy(&bytes[from..]);
+                    if PANIC_MARKERS.iter().any(|marker| recent.contains(marker)) {
+                        progress.panicked.store(true, Ordering::Release);
+                    }
+                } else {
+                    bytes.extend_from_slice(chunk);
+                }
                 if let Some(file) = log.as_mut() {
                     if let Err(error) = file.write_all(chunk) {
                         eprintln!("xtask: serial log write failed: {error}");
@@ -4792,25 +4850,62 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
         .spawn()
         .with_context(|| format!("failed to spawn {qemu}"))?;
     let tee_stdout = serial_tee_enabled();
+    let started = std::time::Instant::now();
+    let progress = std::sync::Arc::new(SerialProgress::default());
+    let reader_progress = progress.clone();
     let serial_reader = child.stdout.take().map(|stdout| {
-        std::thread::spawn(move || capture_serial_stream(stdout, serial_log, tee_stdout))
+        std::thread::spawn(move || {
+            capture_serial_stream(
+                stdout,
+                serial_log,
+                tee_stdout,
+                Some((reader_progress, started)),
+            )
+        })
     });
 
     let secs = kernel_test_timeout_secs();
-    let started = std::time::Instant::now();
+    let idle_secs = kernel_test_idle_secs();
+    // A panicked kernel may halt without QEMU exiting; allow the dump to
+    // drain, then stop waiting.
+    const PANIC_GRACE: Duration = Duration::from_secs(10);
     let deadline = started + Duration::from_secs(secs);
+    let mut panic_seen_at = None;
     let status = loop {
+        use std::sync::atomic::Ordering;
         if let Some(status) = child.try_wait()? {
             break status;
         }
-        if std::time::Instant::now() >= deadline {
+        let now = std::time::Instant::now();
+        let silent_ms = (now - started)
+            .as_millis()
+            .saturating_sub(u128::from(progress.last_output_ms.load(Ordering::Acquire)));
+        if progress.panicked.load(Ordering::Acquire) && panic_seen_at.is_none() {
+            panic_seen_at = Some(now);
+        }
+        let reason = if now >= deadline {
+            Some(format!("timed out after {secs}s (possible kernel hang)"))
+        } else if gate_exit && idle_secs != 0 && silent_ms >= u128::from(idle_secs) * 1000 {
+            Some(format!(
+                "printed nothing for {idle_secs}s (kernel hang; XTASK_QEMU_IDLE_SECS adjusts)"
+            ))
+        } else if panic_seen_at.is_some_and(|at| now - at >= PANIC_GRACE) {
+            Some("reported a kernel panic/fault and did not exit".to_string())
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
             child.kill()?;
             child.wait()?;
             let serial = serial_reader
                 .and_then(|reader| reader.join().ok())
                 .unwrap_or_default();
             emit_serial_tail(&serial);
-            bail!("xtask: {qemu} timed out after {secs}s (possible kernel hang)");
+            bail!(
+                "xtask: {qemu} {reason} after {}s; last serial line: {}",
+                started.elapsed().as_secs(),
+                last_serial_line(&serial)
+            );
         }
         std::thread::sleep(Duration::from_millis(10));
     };
@@ -5068,14 +5163,7 @@ fn wait_for_boot_smoke(
 ) -> Result<()> {
     // Panic markers — any one of these in stdout triggers failure
     // even if QEMU then exits cleanly.
-    let panic_markers: &[&str] = &[
-        "*** KERNEL PANIC ***",
-        "panicked at",
-        "double fault",
-        "general protection",
-        "kernel page fault",
-        "unsafe precondition",
-    ];
+    let panic_markers = PANIC_MARKERS;
 
     // Capture stdout. Successful gates stay concise by default; CI can tee the
     // stream live while retaining the same marker parsing and failure tail.
@@ -5084,7 +5172,8 @@ fn wait_for_boot_smoke(
         .take()
         .ok_or_else(|| anyhow!("qemu child has no stdout"))?;
     let tee_stdout = serial_tee_enabled();
-    let reader_handle = std::thread::spawn(move || capture_serial_stream(stdout, None, tee_stdout));
+    let reader_handle =
+        std::thread::spawn(move || capture_serial_stream(stdout, None, tee_stdout, None));
 
     // Wait for QEMU to exit naturally after the guest powers itself off,
     // OR force-kill on timeout.
@@ -5232,14 +5321,7 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
         .spawn()
         .with_context(|| format!("failed to spawn {qemu}"))?;
 
-    let panic_markers: &[&str] = &[
-        "*** KERNEL PANIC ***",
-        "panicked at",
-        "double fault",
-        "general protection",
-        "kernel page fault",
-        "unsafe precondition",
-    ];
+    let panic_markers = PANIC_MARKERS;
 
     let stdout = child
         .stdout
@@ -10876,6 +10958,50 @@ fn attach_firmware_signature(
     blob[payload_len..payload_len + 64].copy_from_slice(signature);
     blob[payload_len + 64..payload_len + 96].copy_from_slice(&sha2::Sha256::digest(public_key));
     Ok(())
+}
+
+#[cfg(test)]
+mod serial_progress_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn capture_stamps_output_and_flags_split_panic_markers() {
+        // A marker split across two reads must still be seen.
+        struct Chunks(Vec<&'static [u8]>);
+        impl Read for Chunks {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                if self.0.is_empty() {
+                    return Ok(0);
+                }
+                let chunk = self.0.remove(0);
+                out[..chunk.len()].copy_from_slice(chunk);
+                Ok(chunk.len())
+            }
+        }
+        let progress = std::sync::Arc::new(SerialProgress::default());
+        let started = std::time::Instant::now();
+        let quiet = capture_serial_stream(
+            Chunks(vec![b"  [ OK ] a / one\n", b"  [ OK ] a / two\n"]),
+            None,
+            false,
+            Some((progress.clone(), started)),
+        );
+        assert!(!progress.panicked.load(Ordering::Acquire));
+        assert_eq!(last_serial_line(&quiet), "[ OK ] a / two");
+        let loud = capture_serial_stream(
+            Chunks(vec![
+                b"  [ OK ] a / one\n*** KERNEL PA",
+                b"NIC *** at x\n\n",
+            ]),
+            None,
+            false,
+            Some((progress.clone(), started)),
+        );
+        assert!(progress.panicked.load(Ordering::Acquire));
+        assert_eq!(last_serial_line(&loud), "*** KERNEL PANIC *** at x");
+        assert_eq!(last_serial_line(b""), "<no serial output>");
+    }
 }
 
 #[cfg(test)]

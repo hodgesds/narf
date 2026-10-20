@@ -483,7 +483,8 @@ handlers in `build/xtask/src/main.rs`:
 | `XTASK_QEMU_TAP` | virtio-net TAP; e1000 TAP under `--hw-profile=legacy-only` | unset (SLIRP) |
 | `XTASK_QEMU_LEGACY_TAP` | dedicated e1000 TAP in any hardware profile | unset (SLIRP) |
 | `XTASK_QEMU_APPEND` | kernel cmdline via multiboot2 `-append` | unset |
-| `XTASK_QEMU_TIMEOUT_SECS` | `run` watchdog | `600` |
+| `XTASK_QEMU_TIMEOUT_SECS` | `run` / kernel-test overall cap | `2400` |
+| `XTASK_QEMU_IDLE_SECS` | kernel-test phase: fail after this long with no serial output (`0` disables) | `300` |
 | `XTASK_BOOT_SMOKE_TIMEOUT_SECS` | `boot-smoke` timeout | `300` |
 | `XTASK_RI_PROMPT_TIMEOUT_SECS` | `run-interactive` prompt wait | `120` |
 | `XTASK_RI_ECHO_TIMEOUT_SECS` | `run-interactive` per-command wait | `120` |
@@ -556,7 +557,10 @@ them, run on a KVM host or use `XTASK_QEMU_ACCEL=tcg,thread=multi` with a
 CPU model that exposes x2APIC.
 
 **Boot hangs.** `run` kills a hung QEMU after `XTASK_QEMU_TIMEOUT_SECS`
-(default 2400 seconds). For a live debug session, attach gdb with
+(default 2400 seconds). The kernel-test phase of `xtask test` also stops a
+guest that prints nothing for `XTASK_QEMU_IDLE_SECS` (default 300 seconds),
+or that reports a kernel panic/fault and does not exit within 10 seconds,
+and names the last serial line, which is the last smoke that finished. For a live debug session, attach gdb with
 `NARF_QEMU_EXTRA="-gdb tcp::1234 -S"`.
 
 ---
