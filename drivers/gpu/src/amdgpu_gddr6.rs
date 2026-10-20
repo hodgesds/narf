@@ -13,6 +13,7 @@ const ADDRESS: u32 = 0x64; // C2PMSG36: VRAM-relative MiB, not GPU/PCI address
 const SOS: u32 = 0x91; // C2PMSG81
 const DONE: u32 = 1 << 31;
 const LONG_TRAIN: u32 = 0x10_0000;
+const SHORT_TRAIN: u32 = 0x20_0000; // PSP_BL__DRAM_SHORT_TRAIN
 const ENCROACHED: usize = 32 << 20;
 const CHUNK: usize = 4096;
 const SIGNATURE: u32 = 0x5453_4942;
@@ -56,6 +57,9 @@ trait Io {
     fn write_prefix(&mut self, offset: usize, bytes: &[u8]);
     fn flush(&mut self);
     fn read_result(&mut self, offset: u64, bytes: &mut [u8]) -> Result<(), Error>;
+    /// Write the training cache back to C2P and flush it past HDP
+    /// (PSP_MEM_TRAIN_RESTORE's amdgpu_device_vram_access write).
+    fn write_exchange(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error>;
 }
 struct Op<F>(F);
 impl<F: FnOnce() -> T, T> CapOp<BusDeviceCap, Write> for Op<F> {
@@ -156,6 +160,15 @@ impl Io for Mmio {
         crate::amdgpu_vram_access::read(&mut reader, self.size, offset, bytes)
             .map_err(|_| Error::Invalid)
     }
+    fn write_exchange(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error> {
+        // SAFETY: current PCI invocation owns mappings and shared index latch.
+        let mut writer =
+            unsafe { crate::amdgpu_vram_access::MmioReader::new(&self.vram, &self.regs) };
+        crate::amdgpu_vram_access::write(&mut writer, self.size, offset, bytes)
+            .map_err(|_| Error::Invalid)?;
+        self.flush();
+        Ok(())
+    }
 }
 #[derive(Debug)]
 struct Engine<I: Io> {
@@ -189,24 +202,39 @@ impl<I: Io> Engine<I> {
             narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
         }
     }
-    async fn inner(&mut self) -> Result<(), Error> {
+    /// The common preamble: Ok(false) when no training applies (resident
+    /// SOS or disabled by the PSP runtime DB), with the state recorded.
+    async fn prepare(&mut self) -> Result<bool, Error> {
         match self.access(|io| io.read(SOS))? {
             u32::MAX => return Err(Error::DeviceGone),
             0 => {}
             _ => {
                 self.state = State::ResidentSos;
-                return Ok(());
+                return Ok(false);
             }
         }
         if !self.access(|io| io.training_enabled())?? {
             self.state = State::Disabled;
-            return Ok(());
+            return Ok(false);
         }
         // Verify the bootloader is idle before touching VRAM or its address latch.
         self.response().await?;
         if !self.access(|io| io.setup())? {
             return Err(Error::Invalid);
         }
+        Ok(true)
+    }
+    async fn inner(&mut self) -> Result<(), Error> {
+        if !self.prepare().await? {
+            return Ok(());
+        }
+        self.long_train().await?;
+        self.save().await?;
+        self.state = State::Ready;
+        Ok(())
+    }
+    /// PSP_MEM_TRAIN_SEND_LONG_MSG with the encroached 32 MiB preserved.
+    async fn long_train(&mut self) -> Result<(), Error> {
         for (index, chunk) in self.backup.chunks_mut(CHUNK).enumerate() {
             let io = &mut self.io;
             self.authority
@@ -241,6 +269,10 @@ impl<I: Io> Engine<I> {
                 "amdgpu: gddr6 long training status {response:#x}"
             );
         }
+        Ok(())
+    }
+    /// PSP_MEM_TRAIN_SAVE: P2C into the system cache.
+    async fn save(&mut self) -> Result<(), Error> {
         self.state = State::SavingResult;
         let io = &mut self.io;
         let cache = &mut self.cache;
@@ -259,8 +291,87 @@ impl<I: Io> Engine<I> {
                 "amdgpu: gddr6 training cache lacks the BIST signature"
             );
         }
+        Ok(())
+    }
+    /// psp_v14_0_memory_training(PSP_MEM_TRAIN_RESUME) after the ASIC lost
+    /// its trained state (mode1 reset or S3): short training from the
+    /// restored cache, escalating to save and long training exactly as
+    /// Linux does when the cache or P2C result is missing or stale.
+    async fn resume_inner(&mut self) -> Result<(), Error> {
+        if !self.prepare().await? {
+            return Ok(());
+        }
+        let mut p2c = buffer(self.exchange.size as usize)?;
+        {
+            let io = &mut self.io;
+            let offset = self.exchange.p2c;
+            self.authority
+                .invoke(Op(|| io.read_result(offset, &mut p2c)))
+                .map_err(|_| Error::Revoked)??;
+        }
+        let signed = |b: &[u8]| u32::from_le_bytes(b[..4].try_into().unwrap()) == SIGNATURE;
+        let p2c_valid = signed(&p2c);
+        // SEND_SHORT implies RESTORE; RESTORE needs a valid cache (SAVE).
+        let (mut short, restore) = (true, true);
+        let mut save = !self.cache_valid();
+        if p2c_valid && !(self.cache_valid() && self.cache[12..16] == p2c[12..16]) {
+            save = true;
+        }
+        let long = save && !p2c_valid;
+        if long {
+            short = false;
+            save = true;
+        }
+        if long {
+            self.long_train().await?;
+        }
+        if save {
+            self.save().await?;
+        }
+        if restore {
+            // NARF tightening: never hand PSP an unsigned cache to train from.
+            if short && !self.cache_valid() {
+                return Err(Error::InvalidTrainingData);
+            }
+            self.state = State::Restoring;
+            let io = &mut self.io;
+            let (offset, cache) = (self.exchange.c2p, &self.cache);
+            self.authority
+                .invoke(Op(|| io.write_exchange(offset, cache)))
+                .map_err(|_| Error::Revoked)??;
+        }
+        if short {
+            self.state = State::Training;
+            let address = (self.exchange.c2p >> 20) as u32;
+            self.access(|io| {
+                io.write(ADDRESS, address);
+                io.write(STATUS, SHORT_TRAIN);
+            })?;
+            let response = self.response().await?;
+            if response & 0xffff != 0 {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: gddr6 short training status {response:#x}"
+                );
+            }
+        }
         self.state = State::Ready;
         Ok(())
+    }
+    async fn resume(&mut self) -> Result<(), Error> {
+        if !matches!(
+            self.state,
+            State::Ready | State::ResidentSos | State::Disabled
+        ) {
+            return Err(Error::Busy);
+        }
+        self.state = State::Saving;
+        let result = self.resume_inner().await;
+        if result.is_err() {
+            self.state = State::Failed;
+        }
+        result
     }
     fn cache_valid(&self) -> bool {
         u32::from_le_bytes(self.cache[..4].try_into().unwrap()) == SIGNATURE
@@ -468,9 +579,20 @@ impl Trainer {
     pub async fn run(&mut self) -> Result<(), Error> {
         self.engine.run().await
     }
+    /// Replay training after the ASIC lost its trained state (Linux
+    /// `psp_resume` -> `PSP_MEM_TRAIN_RESUME`): short training from the
+    /// retained cache, escalating to save/long training as Linux does. A
+    /// resident SOS or a runtime-DB disable skips training, as at cold boot.
+    ///
+    /// # Safety
+    /// As `new`/`new_navi48` (exclusive PSP/HDP/index/reset ownership and
+    /// quiesced VRAM clients), after a completed ASIC reset or power loss and
+    /// before SOS loads. Long escalation encroaches the bottom 32 MiB as
+    /// `run` does. On failure/cancellation keep this owner and stop.
+    pub async unsafe fn resume(&mut self) -> Result<(), Error> {
+        self.engine.resume().await
+    }
     /// A validated copy of firmware's P2C result, available only after success.
-    /// Retained for subsequent resume implementation; no short-training replay
-    /// is currently exposed.
     pub fn training_data(&self) -> Option<&[u8]> {
         (self.state() == State::Ready && self.engine.cache_valid())
             .then_some(self.engine.cache.as_slice())

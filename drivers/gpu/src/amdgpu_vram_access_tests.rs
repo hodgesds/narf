@@ -345,3 +345,72 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/pcie",
     pcie_probe_reports_memory_and_identity
 );
+
+struct WriteDevice {
+    inner: Device,
+    stored: Vec<(u64, u32)>,
+}
+impl ReadIo for WriteDevice {
+    fn aperture_len(&self) -> u64 {
+        self.inner.aperture_len()
+    }
+    fn registers_len(&self) -> u64 {
+        self.inner.registers_len()
+    }
+    fn read_aperture(&mut self, offset: u64) -> u32 {
+        self.inner.read_aperture(offset)
+    }
+    fn read_register(&mut self, offset: u64) -> u32 {
+        self.inner.read_register(offset)
+    }
+    fn write_register(&mut self, offset: u64, value: u32) {
+        self.inner.write_register(offset, value)
+    }
+}
+impl WriteIo for WriteDevice {
+    fn write_aperture(&mut self, offset: u64, value: u32) {
+        assert!(offset + 4 <= self.inner.aperture);
+        self.stored.push((offset, value));
+    }
+    fn write_data(&mut self, value: u32) {
+        let i = &self.inner;
+        assert_ne!(i.index & 0x8000_0000, 0, "VRAM selector missing");
+        let pos = u64::from(i.index & 0x7fff_ffff) | (u64::from(i.high) << 31);
+        self.stored.push((pos, value));
+    }
+}
+/// amdgpu_device_vram_access writes: aperture first, indexed past it
+/// across the 2 GiB high-latch carry, latches restored, nothing on error.
+fn vram_write_spans_aperture_and_high_latch() -> TestResult {
+    let mut io = WriteDevice {
+        inner: Device::new(8),
+        stored: Vec::new(),
+    };
+    let bytes: Vec<u8> = (1..=12).collect();
+    write(&mut io, 32, 4, &bytes).unwrap();
+    assert_eq!(
+        io.stored,
+        [(4, 0x0403_0201), (8, 0x0807_0605), (12, 0x0c0b_0a09)]
+    );
+    assert_eq!(io.inner.writes.last(), Some(&(0, 0x1234)));
+    let mut io = WriteDevice {
+        inner: Device::new(256 << 20),
+        stored: Vec::new(),
+    };
+    let edge = 1u64 << 31;
+    write(&mut io, 4 << 30, edge - 4, &[0; 8]).unwrap();
+    assert_eq!(io.stored, [(edge - 4, 0), (edge, 0)]);
+    assert_eq!(io.inner.high, 0xdead_beef);
+    let mut io = WriteDevice {
+        inner: Device::new(8),
+        stored: Vec::new(),
+    };
+    assert_eq!(write(&mut io, 32, 2, &[0; 4]), Err(Error::Unaligned));
+    assert_eq!(write(&mut io, 32, 28, &[0; 8]), Err(Error::OutOfRange));
+    assert!(io.stored.is_empty() && io.inner.writes.is_empty());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/pcie",
+    vram_write_spans_aperture_and_high_latch
+);

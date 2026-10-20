@@ -5467,7 +5467,12 @@ generation and at most `MAX_AUTOMATIC_RECOVERIES` (3) times per boot, since
 each recovery quarantines the old owners' VRAM. `set_recovery_console_hook`
 pauses kernel boot-framebuffer writers for the reset; a lost device leaves
 them paused. User CPU mappings of VRAM are not revoked, as in Linux.
-Preflight refuses boots that needed GDDR6 training replay. The platform
+A finished GDDR6 trainer (`Ready`, `ResidentSos` or `Disabled`) moves to
+the new owner, which replays it before SOS with `Trainer::resume`
+(psp_v14_0_memory_training(PSP_MEM_TRAIN_RESUME): restore the cache to C2P
+and short-train, escalating to P2C save and long training as Linux does;
+NARF refuses to short-train from an unsigned cache). Preflight refuses a
+trainer that failed or never finished. The platform
 withdraws CS, client VRAM allocation, scanout and timestamps, drains CPU views,
 stops the old IH service, and advances the lock-protected fence-reader
 generation. Old fence readers and clear workers cannot access the new owner.

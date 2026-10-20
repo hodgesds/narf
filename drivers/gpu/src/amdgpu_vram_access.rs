@@ -76,6 +76,29 @@ impl ReadIo for MmioReader<'_> {
     }
 }
 
+/// Writes for [`write`]: the aperture and the indexed MM_DATA port.
+pub(crate) trait WriteIo: ReadIo {
+    fn write_aperture(&mut self, offset: u64, value: u32);
+    fn write_data(&mut self, value: u32);
+}
+impl WriteIo for MmioReader<'_> {
+    fn write_aperture(&mut self, offset: u64, value: u32) {
+        assert!(
+            offset % 4 == 0
+                && offset
+                    .checked_add(4)
+                    .is_some_and(|end| end <= self.aperture.len)
+        );
+        // SAFETY: write() checks alignment and the whole range; new() owns MMIO.
+        unsafe { self.aperture.write32(offset, value) }
+    }
+    fn write_data(&mut self, value: u32) {
+        assert!(MM_DATA + 4 <= self.registers.len);
+        // SAFETY: write() latched a memory-mode MM_INDEX for this word.
+        unsafe { self.registers.write32(MM_DATA, value) }
+    }
+}
+
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_vram_access_tests.rs"]
 mod tests;
@@ -132,6 +155,56 @@ pub(crate) fn read(
             io.read_register(MM_DATA)
         };
         chunk.copy_from_slice(&word.to_le_bytes());
+    }
+    if let Some((index, high)) = saved {
+        io.write_register(MM_INDEX_HI, high);
+        io.write_register(MM_INDEX, index);
+    }
+    Ok(())
+}
+
+/// Write aligned VRAM bytes, as `amdgpu_device_vram_access(.., true)`: the
+/// aperture first, MM_INDEX/MM_DATA past it, with the latches restored.
+/// Invalid requests fail before any device access.
+pub(crate) fn write(
+    io: &mut impl WriteIo,
+    vram_size: u64,
+    offset: u64,
+    bytes: &[u8],
+) -> Result<(), Error> {
+    if offset % 4 != 0 || bytes.len() % 4 != 0 {
+        return Err(Error::Unaligned);
+    }
+    let end = offset
+        .checked_add(bytes.len() as u64)
+        .ok_or(Error::OutOfRange)?;
+    if end > vram_size || end > (1u64 << 63) {
+        return Err(Error::OutOfRange);
+    }
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let aperture_end = io.aperture_len().min(vram_size) & !3;
+    let indexed = end > aperture_end;
+    if indexed && io.registers_len() < MM_INDEX_HI + 4 {
+        return Err(Error::RegisterWindowTooSmall);
+    }
+    let saved = indexed.then(|| (io.read_register(MM_INDEX), io.read_register(MM_INDEX_HI)));
+    let mut high = None;
+    for (i, chunk) in bytes.chunks_exact(4).enumerate() {
+        let pos = offset + i as u64 * 4;
+        let word = u32::from_le_bytes(chunk.try_into().unwrap());
+        if pos < aperture_end {
+            io.write_aperture(pos, word);
+        } else {
+            io.write_register(MM_INDEX, pos as u32 | 0x8000_0000);
+            let next_high = (pos >> 31) as u32;
+            if high != Some(next_high) {
+                io.write_register(MM_INDEX_HI, next_high);
+                high = Some(next_high);
+            }
+            io.write_data(word);
+        }
     }
     if let Some((index, high)) = saved {
         io.write_register(MM_INDEX_HI, high);

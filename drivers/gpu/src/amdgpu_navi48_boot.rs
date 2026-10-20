@@ -188,6 +188,9 @@ struct Hardware {
     firmware: Firmware,
     dmub: dmub::Dmub,
     trainer: Option<training::Trainer>,
+    /// The trainer finished before an ASIC reset; replay its cache
+    /// (PSP_MEM_TRAIN_RESUME) instead of cold training.
+    training_resume: bool,
     sos: Option<sos::Bootloader>,
     psp: Option<psp::Psp>,
     smu: Option<smu::Smu>,
@@ -223,7 +226,14 @@ impl Backend for Hardware {
         match stage {
             Stage::MemoryTraining => {
                 if let Some(t) = &mut self.trainer {
-                    t.run().await.map_err(Error::Training)?;
+                    if self.training_resume {
+                        // SAFETY: after_reset proved the mode1 reset completed
+                        // and handed over the retained trainer; no VRAM client
+                        // runs before this stage.
+                        unsafe { t.resume() }.await.map_err(Error::Training)?;
+                    } else {
+                        t.run().await.map_err(Error::Training)?;
+                    }
                 }
             }
             Stage::Sos => {
@@ -656,6 +666,7 @@ impl ColdBoot {
                     firmware,
                     dmub,
                     trainer,
+                    training_resume: false,
                     sos: None,
                     psp: None,
                     smu: None,
@@ -692,7 +703,14 @@ impl ColdBoot {
     /// Prepare reset before withdrawing any service. Training replay is not
     /// supported; refuse that configuration before changing hardware.
     pub(crate) fn prepare_reset(&mut self) -> Result<(), Error> {
-        if self.sequence.backend.trainer.is_some() {
+        // A finished trainer is replayed after the reset (PSP_MEM_TRAIN_RESUME);
+        // one that failed or never finished cannot be.
+        if self.sequence.backend.trainer.as_ref().is_some_and(|t| {
+            !matches!(
+                t.state(),
+                training::State::Ready | training::State::ResidentSos | training::State::Disabled
+            )
+        }) {
             return Err(Error::Unsupported);
         }
         if self.state() != State::MemoryReady || self.reset.is_some() {
@@ -758,6 +776,11 @@ impl ColdBoot {
         new.client_heap = self.client_heap.take();
         if let Some(heap) = &mut new.client_heap {
             heap.unmapped = None;
+        }
+        // The trained state did not survive mode1: the new boot replays it.
+        if let Some(trainer) = self.sequence.backend.trainer.take() {
+            new.sequence.backend.trainer = Some(trainer);
+            new.sequence.backend.training_resume = true;
         }
         new.client_vram = self.client_vram.take();
         Ok(new)
