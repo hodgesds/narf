@@ -3328,3 +3328,60 @@ fn navi48_split_pipes_follow_dml() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/navi48-modeset", navi48_split_pipes_follow_dml);
+
+/// DP SST deep color as amdgpu_dm decides it: the sink's EDID 1.4 color
+/// depth (display_info.bpc, 8 when undefined) bounded by the requested
+/// maximum (max_requested_bpc, even), then create_validate_stream_for_sink's
+/// steps of 2 while the link cannot carry the stream; 1080p60 at 10 bpc
+/// (4,455,000 kbps) fits 2 x HBR2 but not 1 x HBR2, which then lights it
+/// at 8 bpc. The training candidates and UHBR budget use the chosen depth.
+fn navi48_modeset_dp_deep_color_like_amdgpu_dm() -> TestResult {
+    let with_bpc = |code: u8| {
+        let mut e = edid_1080p();
+        e[20] = 0x80 | code << 4 | 5;
+        e[127] = narf_edid::compute_checksum(&e);
+        e
+    };
+    assert_eq!(edid_bpc(&with_bpc(3)), 10);
+    assert_eq!(edid_bpc(&with_bpc(4)), 12);
+    assert_eq!(edid_bpc(&with_bpc(0)), 0);
+    assert_eq!(edid_bpc(&edid_1080p()), 8);
+    let mut old = with_bpc(3);
+    old[19] = 3;
+    assert_eq!(edid_bpc(&old), 0);
+    use otg::ColorDepth::{Bpc10, Bpc12, Bpc8};
+    assert_eq!(dp_depths(&with_bpc(4), 12), [Bpc12, Bpc10, Bpc8]);
+    assert_eq!(dp_depths(&with_bpc(4), 11), [Bpc10, Bpc8]);
+    assert_eq!(dp_depths(&with_bpc(3), 12), [Bpc10, Bpc8]);
+    assert_eq!(dp_depths(&with_bpc(0), 12), [Bpc8]);
+    assert_eq!(dp_depths(&with_bpc(1), 12), [Bpc8]);
+    let paths = [path(inventory::Connector::DisplayPort, 0)];
+    let pick = |edid: Vec<u8>, rate: u8, lanes: u8, max: u8| {
+        select(
+            &paths,
+            &[port(paths[0], dpcd(rate, lanes), edid)],
+            max,
+            None,
+        )
+        .unwrap()
+    };
+    let s = pick(with_bpc(3), 0x14, 2, 10);
+    if s.depth != Bpc10 || (s.lanes, s.rate) != (2, DpRate::Legacy(LinkRate::Hbr2)) {
+        panic!("10 bpc on 2 x HBR2: {:?} {} {:?}", s.depth, s.lanes, s.rate);
+    }
+    assert_eq!(s.blank_request(0).depth, Bpc10);
+    // Every fallback candidate carries 30-bit pixels.
+    for (l, r) in selected_dp_candidates(&s) {
+        assert!(dp_fits_bpc(&s.timing, s.caps, l, r, 10), "{l} {r:?}");
+    }
+    assert!(!selected_dp_candidates(&s).contains(&(1, DpRate::Legacy(LinkRate::Hbr2))));
+    assert_eq!(pick(with_bpc(3), 0x14, 1, 10).depth, Bpc8);
+    assert_eq!(pick(with_bpc(3), 0x14, 2, 8).depth, Bpc8);
+    assert_eq!(pick(with_bpc(4), 0x1e, 4, 12).depth, Bpc12);
+    assert_eq!(pick(edid_1080p(), 0x1e, 4, 12).depth, Bpc8);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_dp_deep_color_like_amdgpu_dm
+);

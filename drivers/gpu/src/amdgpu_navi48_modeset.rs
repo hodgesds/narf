@@ -71,7 +71,9 @@ pub struct Selection {
     pub hdmi: bool,
     /// The HDMI sink declared SCDC (HF-VSDB/HF-SCDB SCDC_Present).
     pub scdc: bool,
-    /// Output depth: 8 bpc for DP; for HDMI the deepest the sink, the
+    /// Output depth: for DP SST the deepest uncompressed depth up to the
+    /// sink's EDID bpc and `max_bpc` a link carries (8 for MST and DSC);
+    /// for HDMI the deepest the sink, the
     /// link capacity and the requested maximum allow.
     pub depth: otg::ColorDepth,
     /// The sink's audio; FRL retains only supported LPCM modes.
@@ -1023,7 +1025,11 @@ fn max_link(dpcd: &[u8; 16], lttpr: Option<(u8, u8)>) -> Option<(u8, LinkRate)> 
 
 /// The frontend's 8b/10b payload ceiling for 8-bpc RGB, without FEC.
 pub fn link_fits(timing: &Timing, lanes: u8, rate: LinkRate) -> bool {
-    stream_kbps(timing, false) <= legacy_kbps(lanes, rate, false)
+    link_fits_bpc(timing, lanes, rate, 8)
+}
+/// `link_fits` for RGB at `bpc`.
+pub fn link_fits_bpc(timing: &Timing, lanes: u8, rate: LinkRate, bpc: u8) -> bool {
+    stream_kbps_bpc(timing, false, bpc) <= legacy_kbps(lanes, rate, false)
 }
 
 /// A DP main link's per-lane rate: 8b/10b through the DIO encoders, or
@@ -1214,8 +1220,14 @@ pub fn uhbr_kbps(lanes: u8, rate: otg::UhbrRate) -> u64 {
 /// 128-bit symbols, rounded up. Exact rational arithmetic where Linux uses
 /// 31.32 fixed point.
 pub fn stream_kbps(timing: &Timing, uhbr: bool) -> u64 {
-    let kbps = u64::from(timing.pixel_clock_khz) * 24;
-    let bits = u64::from(timing.h_active) * 24;
+    stream_kbps_bpc(timing, uhbr, 8)
+}
+/// `stream_kbps` for RGB at `bpc` (dc_bandwidth_in_kbps_from_timing's
+/// display_color_depth).
+pub fn stream_kbps_bpc(timing: &Timing, uhbr: bool, bpc: u8) -> u64 {
+    let bpp = 3 * u64::from(bpc);
+    let kbps = u64::from(timing.pixel_clock_khz) * bpp;
+    let bits = u64::from(timing.h_active) * bpp;
     if !uhbr || bits == 0 {
         return kbps;
     }
@@ -1224,11 +1236,15 @@ pub fn stream_kbps(timing: &Timing, uhbr: bool) -> u64 {
 
 /// Whether `lanes` at `rate` carries `timing` on a link with `caps`.
 pub fn dp_fits(timing: &Timing, caps: DpCaps, lanes: u8, rate: DpRate) -> bool {
+    dp_fits_bpc(timing, caps, lanes, rate, 8)
+}
+/// `dp_fits` for RGB at `bpc`.
+pub fn dp_fits_bpc(timing: &Timing, caps: DpCaps, lanes: u8, rate: DpRate, bpc: u8) -> bool {
     let have = match rate {
         DpRate::Legacy(r) => legacy_kbps(lanes, r, caps.fec),
         DpRate::Uhbr(r) => uhbr_kbps(lanes, r),
     };
-    stream_kbps(timing, caps.uhbr != 0) <= have
+    stream_kbps_bpc(timing, caps.uhbr != 0, bpc) <= have
 }
 
 /// The link a DP mode lights on: the sink's maximum 8b/10b link when that
@@ -1236,13 +1252,60 @@ pub fn dp_fits(timing: &Timing, caps: DpCaps, lanes: u8, rate: DpRate) -> bool {
 /// reaches it, searching upward (lanes first, then rate) past every 8b/10b
 /// setting for the first UHBR setting that carries the mode.
 pub fn dp_link(timing: &Timing, caps: DpCaps) -> Option<(u8, DpRate)> {
+    dp_link_bpc(timing, caps, 8)
+}
+/// `dp_link` for RGB at `bpc`.
+pub fn dp_link_bpc(timing: &Timing, caps: DpCaps, bpc: u8) -> Option<(u8, DpRate)> {
     let legacy = DpRate::Legacy(caps.rate);
-    if dp_fits(timing, caps, caps.lanes, legacy) {
+    if dp_fits_bpc(timing, caps, caps.lanes, legacy, bpc) {
         return Some((caps.lanes, legacy));
     }
     caps.uhbr_rates()
         .flat_map(|r| [1, 2, 4].map(|l| (l, DpRate::Uhbr(r))))
-        .find(|&(l, r)| l <= caps.lanes && dp_fits(timing, caps, l, r))
+        .find(|&(l, r)| l <= caps.lanes && dp_fits_bpc(timing, caps, l, r, bpc))
+}
+
+/// drm_add_display_info's display_info.bpc from an EDID 1.4 digital
+/// input's color bit depth (bits 6:4 of byte 20: 6..16 bpc), 0 when
+/// undefined or older.
+pub fn edid_bpc(edid: &[u8]) -> u8 {
+    let (Some(&rev), Some(&input)) = (edid.get(19), edid.get(20)) else {
+        return 0;
+    };
+    if edid.get(18) != Some(&1) || rev < 4 || input & 0x80 == 0 {
+        return 0;
+    }
+    match input >> 4 & 7 {
+        1 => 6,
+        2 => 8,
+        3 => 10,
+        4 => 12,
+        5 => 14,
+        6 => 16,
+        _ => 0,
+    }
+}
+
+/// The depths amdgpu_dm tries for an uncompressed DP SST stream, deepest
+/// first: amdgpu_dm_convert_color_depth_from_display_info's
+/// min(display_info.bpc (8 when undefined), max_requested_bpc rounded down
+/// to even), then create_validate_stream_for_sink's steps of 2 down to 8
+/// (the native encoders take 8, 10 and 12 bpc).
+pub fn dp_depths(edid: &[u8], max_bpc: u8) -> Vec<otg::ColorDepth> {
+    let sink = match edid_bpc(edid) {
+        0 => 8,
+        b => b,
+    };
+    let top = sink.min(max_bpc & !1);
+    [
+        (12, otg::ColorDepth::Bpc12),
+        (10, otg::ColorDepth::Bpc10),
+        (8, otg::ColorDepth::Bpc8),
+    ]
+    .into_iter()
+    .filter(|&(b, _)| b <= top || b == 8)
+    .map(|(_, d)| d)
+    .collect()
 }
 
 /// Whether `lanes` at `rate` carries `cfg`'s compressed stream
@@ -1951,9 +2014,16 @@ pub fn select_all(
             let cfg = dp_dsc(&timing, caps, NOMINAL_DISPCLK_KHZ)?;
             dsc_link(&timing, cfg, caps).map(|(lanes, rate)| (lanes, rate, Some(cfg)))
         };
-        let Some((lanes, rate, dsc)) = dp_link(&timing, caps)
-            .map(|(lanes, rate)| (lanes, rate, None))
-            .or_else(compressed)
+        // The deepest uncompressed depth a link carries
+        // (create_validate_stream_for_sink stepping down from the requested
+        // bpc); DSC compresses 8-bpc input only here.
+        let uncompressed = dp_depths(&sink.edid, max_bpc)
+            .into_iter()
+            .find_map(|depth| {
+                dp_link_bpc(&timing, caps, depth_bpc(depth)).map(|(l, r)| (l, r, None, depth))
+            });
+        let Some((lanes, rate, dsc, depth)) = uncompressed
+            .or_else(|| compressed().map(|(l, r, dsc)| (l, r, dsc, otg::ColorDepth::Bpc8)))
         else {
             link_short = true;
             continue;
@@ -1967,7 +2037,7 @@ pub fn select_all(
             edid,
             hdmi: false,
             scdc: false,
-            depth: otg::ColorDepth::Bpc8,
+            depth,
             // HPO exposes only LPCM rates fitting its blanking budget; a
             // compressed stream's at its DSC bits per pixel and slices, as
             // build_audio_output hands dsc_cfg to check_audio_bandwidth_dp.
@@ -1975,7 +2045,7 @@ pub fn select_all(
                 DpRate::Uhbr(rate) => otg::uhbr_audio_info_with(
                     info,
                     &timing,
-                    8,
+                    u32::from(depth_bpc(depth)),
                     otg::UhbrSettings {
                         lanes,
                         rate,
@@ -2114,11 +2184,21 @@ pub fn admit_displays(
 /// narf's ladder (`link_candidates`). Settings beyond `caps` or that cannot
 /// carry the mode are never tried.
 pub fn dp_candidates(timing: &Timing, caps: DpCaps, lanes: u8, rate: DpRate) -> Vec<(u8, DpRate)> {
+    dp_candidates_bpc(timing, caps, lanes, rate, 8)
+}
+/// `dp_candidates` for RGB at `bpc`.
+pub fn dp_candidates_bpc(
+    timing: &Timing,
+    caps: DpCaps,
+    lanes: u8,
+    rate: DpRate,
+    bpc: u8,
+) -> Vec<(u8, DpRate)> {
     if let DpRate::Legacy(r) = rate {
-        return link_candidates(timing, lanes, r)
+        return legacy_candidates(lanes, r, |l, r| link_fits_bpc(timing, l, r, bpc))
             .into_iter()
             .map(|(l, r)| (l, DpRate::Legacy(r)))
-            .filter(|&(l, r)| dp_fits(timing, caps, l, r))
+            .filter(|&(l, r)| dp_fits_bpc(timing, caps, l, r, bpc))
             .collect();
     }
     let usable = |(l, r): (u8, DpRate)| {
@@ -2127,7 +2207,7 @@ pub fn dp_candidates(timing: &Timing, caps: DpCaps, lanes: u8, rate: DpRate) -> 
                 DpRate::Legacy(_) => false,
                 DpRate::Uhbr(r) => caps.uhbr_rates().any(|u| u == r),
             }
-            && dp_fits(timing, caps, l, r)
+            && dp_fits_bpc(timing, caps, l, r, bpc)
     };
     FALLBACKS
         .into_iter()
@@ -2172,7 +2252,7 @@ fn legacy_candidates(
 /// re-admission.
 fn selected_dp_candidates(s: &Selection) -> Vec<(u8, DpRate)> {
     let Some(cfg) = s.dsc else {
-        return dp_candidates(&s.timing, s.caps, s.lanes, s.rate);
+        return dp_candidates_bpc(&s.timing, s.caps, s.lanes, s.rate, depth_bpc(s.depth));
     };
     if !matches!(s.lanes, 1 | 2 | 4) {
         return Vec::new();
@@ -3492,7 +3572,7 @@ impl ColdBoot {
                 otg::uhbr_audio_info_with(
                     info,
                     &selection.timing,
-                    8,
+                    u32::from(depth_bpc(selection.depth)),
                     video.link.settings,
                     selection.dsc.as_ref(),
                 )
