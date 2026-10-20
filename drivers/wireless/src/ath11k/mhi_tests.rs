@@ -60,6 +60,16 @@ const CHDB: u32 = 0x800;
 const ERDB: u32 = 0xc00;
 const MHICFG_INIT: u32 = 0x0000_0080;
 const SESSION: u32 = 0x0123_4567;
+/// `mhi_prepare_for_power_up` draws the first random sequence ID for the
+/// RDDM BHIe RX table (`mhi_rddm_prepare`), so the BHI image transfer gets
+/// the second and the BHIe image transfer the third.
+const RDDM_SEQ: u32 = SESSION;
+const BHI_SEQ: u32 = SESSION + 1;
+const BHIE_SEQ: u32 = SESSION + 2;
+/// Device writes `prepare_for_power_up` makes: the seven BHIe RX registers
+/// cleared, then `mhi_rddm_prepare`'s RXVECADDR_HIGH, RXVECADDR_LOW,
+/// RXVECSIZE and RXVECDB.
+const PREPARE_WRITES: usize = 11;
 const DMA32: u64 = 0xffff_ffff;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1220,8 +1230,28 @@ fn smoke_mhi_init_dev_ctxt_matches_linux() -> TestResult {
     let w = h.bus.writes();
     let expect: Vec<(u32, u32)> = (0x60..=0x78).step_by(4).map(|o| (BHIE + o, 0)).collect();
     check!(
-        w == expect,
+        w.len() == PREPARE_WRITES && w[..7] == expect[..],
         "prepare writes exactly the seven BHIe RX registers, zeroed"
+    );
+    // mhi_rddm_prepare: the RDDM vector table (one 16-byte entry per
+    // 512 KiB segment of the 4.125 MiB dump), then its sequence ID.
+    check!(
+        w[7].0 == BHIE + BHIE_RXVECADDR_HIGH_OFFS && w[8].0 == BHIE + BHIE_RXVECADDR_LOW_OFFS,
+        "RDDM vector address programmed high then low"
+    );
+    let vec_addr = (u64::from(w[7].1) << 32) | u64::from(w[8].1);
+    check!(
+        vec_addr != 0 && vec_addr % 16 == 0,
+        "RDDM vector table is a DMA address"
+    );
+    let segments = (ATH11K_RDDM_DUMP_SIZE as usize).div_ceil(ATH11K_SEG_LEN) as u32;
+    check!(
+        w[9] == (BHIE + BHIE_RXVECSIZE_OFFS, segments * 16),
+        "RXVECSIZE = segments * 16"
+    );
+    check!(
+        w[10] == (BHIE + BHIE_RXVECDB_OFFS, RDDM_SEQ),
+        "RXVECDB = random sequence ID"
     );
     TestResult::Pass
 }
@@ -1311,7 +1341,7 @@ fn smoke_mhi_boot_to_mission_mode() -> TestResult {
     // mhi_async_power_up: BHI_INTVEC = 0 first after prepare.
     let i0 = find_write(&w, 0, BHI + BHI_INTVEC).unwrap_or(usize::MAX);
     check!(
-        i0 == 7 && w[i0].1 == 0,
+        i0 == PREPARE_WRITES && w[i0].1 == 0,
         "power up starts by zeroing BHI_INTVEC"
     );
 
@@ -1326,7 +1356,7 @@ fn smoke_mhi_boot_to_mission_mode() -> TestResult {
         "IMGSIZE = sbl_size (512 KiB)"
     );
     check!(
-        w[b + 4] == (BHI + BHI_IMGTXDB, SESSION),
+        w[b + 4] == (BHI + BHI_IMGTXDB, BHI_SEQ),
         "IMGTXDB = random session id"
     );
     let img = ((w[b + 1].1 as u64) << 32) | w[b + 2].1 as u64;
@@ -1413,7 +1443,7 @@ fn smoke_mhi_boot_to_mission_mode() -> TestResult {
         "TXVECSIZE = 16 * segments"
     );
     check!(
-        w[v + 3] == (BHIE + BHIE_TXVECDB_OFFS, SESSION + 1),
+        w[v + 3] == (BHIE + BHIE_TXVECDB_OFFS, BHIE_SEQ),
         "TXVECDB = sequence id"
     );
     {
@@ -1675,7 +1705,7 @@ fn smoke_mhi_bhie_error() -> TestResult {
         ..Behaviour::default()
     };
     let (h, r) = boot(beh, firmware(FW_LEN, false));
-    let raw = (BHIE_TXVECSTATUS_STATUS_ERROR << 30) | (SESSION + 1);
+    let raw = (BHIE_TXVECSTATUS_STATUS_ERROR << 30) | BHIE_SEQ;
     check!(
         r == Err(MhiError::new(step::BHIE_ERROR, raw, errno::EIO)),
         "BHIe error must report TXVECSTATUS with -EIO"
@@ -1703,9 +1733,11 @@ fn smoke_mhi_sys_err_event_stops_boot() -> TestResult {
         "SYS_ERR state-change event must fail bring-up"
     );
     check!(h.pm_state == pm::SYS_ERR_DETECT, "PM state SYS_ERR_DETECT");
+    // ath11k sets rddm_size, so mhi_pm_sys_err_handler skips SYS_ERROR
+    // ("Controller supports RDDM, skip SYS_ERROR"): no callback, no reset.
     check!(
-        h.bus.d.borrow().notes.contains(&MhiNotify::SysError),
-        "MHI_CB_SYS_ERROR notified"
+        !h.bus.d.borrow().notes.contains(&MhiNotify::SysError),
+        "RDDM-capable controller skips MHI_CB_SYS_ERROR"
     );
     check!(
         h.bus.now_ms() < 1000,
@@ -1758,13 +1790,14 @@ fn smoke_mhi_syserr_at_power_up_is_reset() -> TestResult {
     let (h, r) = boot(beh, firmware(FW_LEN, false));
     check!(r.is_ok(), "SYS_ERR at power up is reset and boot proceeds");
     let w = h.bus.writes();
-    check!(w[7] == (BHI + BHI_INTVEC, 0), "INTVEC zeroed");
+    let p = PREPARE_WRITES;
+    check!(w[p] == (BHI + BHI_INTVEC, 0), "INTVEC zeroed");
     check!(
-        w[8] == (MHICTRL, MHICTRL_RESET_MASK),
+        w[p + 1] == (MHICTRL, MHICTRL_RESET_MASK),
         "MHICTRL.RESET requested"
     );
     check!(
-        w[9] == (BHI + BHI_INTVEC, 0),
+        w[p + 2] == (BHI + BHI_INTVEC, 0),
         "INTVEC re-programmed after reset"
     );
     let beh = Behaviour {
@@ -1949,7 +1982,10 @@ fn smoke_mhi_channel_wrong_ee() -> TestResult {
         )),
         "IPCR in SBL must be -ENOTCONN"
     );
-    check!(h.bus.writes().len() == 7, "nothing written to the device");
+    check!(
+        h.bus.writes().len() == PREPARE_WRITES,
+        "nothing written to the device"
+    );
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_mhi_channel_wrong_ee);
@@ -2225,7 +2261,9 @@ kernel_test_in!("drivers/wireless/ath11k", smoke_mhi_runtime_state_changes);
 
 fn smoke_mhi_runtime_crash_requests_reset() -> TestResult {
     let syserr = (0xff << 8) | MHISTATUS_SYSERR_MASK;
-    // SYS_ERR in mission mode (intvec): MHI_CB_SYS_ERROR → reset.
+    // SYS_ERR in mission mode (intvec). ath11k's controller has an RDDM
+    // image, so mhi_pm_sys_err_handler skips SYS_ERROR: no callback and no
+    // reset yet. The firmware's RDDM entry owns the one dump-and-reset.
     let mut h = match booted() {
         Some(h) => h,
         None => return TestResult::Fail("boot + IPCR start failed"),
@@ -2235,13 +2273,17 @@ fn smoke_mhi_runtime_crash_requests_reset() -> TestResult {
     h.service();
     check!(h.pm_state == pm::SYS_ERR_DETECT, "SYS_ERR_DETECT");
     check!(
-        h.take_reset_request() == Some(MhiNotify::SysError),
-        "SYS_ERROR queues reset_work"
+        h.take_reset_request().is_none(),
+        "SYS_ERROR waits for RDDM instead of queueing reset_work"
     );
-    check!(h.take_reset_request().is_none(), "taken once");
     check!(
-        h.bus.logged("firmware crashed: MHI_CB_SYS_ERROR"),
-        "ath11k_warn line"
+        !h.bus.d.borrow().notes.contains(&MhiNotify::SysError)
+            && h.bus.logged("SYS_ERR waiting for RDDM"),
+        "MHI_CB_SYS_ERROR skipped for an RDDM-capable controller"
+    );
+    check!(
+        h.failure.is_none(),
+        "a mission-mode SYS_ERR is not a bring-up failure"
     );
     // Another MSI while still in SYS_ERR: no second request.
     raise_intvec(&h, syserr, MhiEe::AMSS);
@@ -2256,7 +2298,7 @@ fn smoke_mhi_runtime_crash_requests_reset() -> TestResult {
     h.service();
     check!(h.ee != MhiEe::RDDM, "ctrl ring idle in SYS_ERR_DETECT");
     // The device enters RDDM and raises the intvec: MHI_CB_EE_RDDM
-    // queues a reset (the previous reason was SYS_ERROR), EE = RDDM.
+    // queues the reset, EE = RDDM.
     raise_intvec(&h, syserr, MhiEe::RDDM);
     h.service();
     check!(h.ee == MhiEe::RDDM, "EE RDDM");
@@ -2317,7 +2359,9 @@ fn smoke_mhi_runtime_crash_requests_reset() -> TestResult {
     check!(h.take_reset_request().is_none(), "inactive: no RDDM");
     check!(h.ee != MhiEe::RDDM, "EE untouched");
 
-    // A fatal error in PBL: MHI_CB_FATAL_ERROR then the SYS_ERR handler.
+    // A fatal error in PBL: MHI_CB_FATAL_ERROR, then mhi_pm_sys_err_handler,
+    // which skips SYS_ERROR for an RDDM-capable controller. ath11k's
+    // status_cb queues reset_work only for EE_RDDM, so nothing is queued.
     let mut h = match booted() {
         Some(h) => h,
         None => return TestResult::Fail("boot + IPCR start failed"),
@@ -2326,12 +2370,16 @@ fn smoke_mhi_runtime_crash_requests_reset() -> TestResult {
     h.service();
     let notes = h.bus.d.borrow().notes.clone();
     check!(
-        notes.ends_with(&[MhiNotify::FatalError, MhiNotify::SysError]),
-        "FATAL_ERROR, SYS_ERROR"
+        notes.ends_with(&[MhiNotify::FatalError]) && !notes.contains(&MhiNotify::SysError),
+        "FATAL_ERROR, SYS_ERROR skipped"
     );
     check!(
-        h.take_reset_request() == Some(MhiNotify::SysError),
-        "PBL crash → reset"
+        h.ee == MhiEe::PBL && h.pm_state == pm::SYS_ERR_DETECT,
+        "PBL crash: EE PBL, SYS_ERR_DETECT"
+    );
+    check!(
+        h.take_reset_request().is_none(),
+        "PBL crash queues no reset (only EE_RDDM does)"
     );
     TestResult::Pass
 }

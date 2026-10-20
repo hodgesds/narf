@@ -603,6 +603,9 @@ pub struct MhiController<B: MhiBus> {
     /// First failure (Linux logs and leaves the PM state; we keep the
     /// reason so the panel can show it).
     pub failure: Option<MhiError>,
+    /// Inside [`Self::sync_power_up`]'s wait, where a SYS_ERR ends bring-up
+    /// even though an RDDM-capable controller skips the SYS_ERROR callback.
+    in_sync_power_up: bool,
     pub stats: MhiStats,
     rx: VecDeque<DlPacket>,
     ipcr_ul: Option<usize>,
@@ -784,6 +787,7 @@ impl<B: MhiBus> MhiController<B> {
             rddm_image: None,
             rddm_snapshot: None,
             failure: None,
+            in_sync_power_up: false,
             stats: MhiStats::default(),
             rx: VecDeque::new(),
             ipcr_ul: None,
@@ -1134,14 +1138,17 @@ impl<B: MhiBus> MhiController<B> {
         if self.rddm_image.is_none() {
             self.rddm_image = Some(self.build_rddm_table()?);
         }
-        let (vector_addr, vector_len, data_segments) = {
+        let (vector_addr, data_segments) = {
             let table = self
                 .rddm_image
                 .as_ref()
                 .expect("RDDM table was just allocated");
             let vector = table.last().expect("RDDM vector follows data segments");
-            (vector.dma(), vector.len(), table.len() - 1)
+            (vector.dma(), table.len() - 1)
         };
+        // `mhi_buf->len` of the vector entry: the entries, not the
+        // page-rounded allocation behind them (as `download_amss_image`).
+        let vector_len = core::mem::size_of::<BhiVecEntry>() * data_segments;
         let sequence_id = self.bus.random_nonzero(BHIE_TXVECSTATUS_SEQNUM_BMSK);
         self.write_reg(
             self.bhie,
@@ -1501,6 +1508,13 @@ impl<B: MhiBus> MhiController<B> {
             // SYS_ERR MSI. Firmware enters RDDM shortly afterwards and the
             // EE_RDDM notification owns the one dump-and-reset sequence.
             mlog!(self, "mhi: SYS_ERR waiting for RDDM (EE {})", ee.name());
+            // Before mission mode the PM state SYS_ERR_DETECT is what ends
+            // `mhi_sync_power_up`'s wait (MHI_PM_IN_ERROR_STATE): bring-up
+            // fails now rather than at the ready timeout. Record why, without
+            // the SYS_ERROR callback Linux skips here.
+            if self.in_sync_power_up {
+                self.fail(MhiError::new(step::SYS_ERR, (ee.0 << 8) | 0xff, errno::EIO));
+            }
             return;
         }
         self.status_cb(MhiNotify::SysError);
@@ -2420,6 +2434,13 @@ impl<B: MhiBus> MhiController<B> {
     /// fatal error). A SYS_ERR ends the wait too (bring-up does not run
     /// Linux's recovery path).
     pub async fn sync_power_up(&mut self) -> Result<(), MhiError> {
+        self.in_sync_power_up = true;
+        let r = self.sync_power_up_inner().await;
+        self.in_sync_power_up = false;
+        r
+    }
+
+    async fn sync_power_up_inner(&mut self) -> Result<(), MhiError> {
         self.async_power_up().await?;
         let timeout = if self.cfg.ready_timeout_ms != 0 {
             self.cfg.ready_timeout_ms
