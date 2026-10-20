@@ -21,8 +21,8 @@ use narf_filesystem::FsError;
 
 use super::{
     align_up, batch_begin, batch_gen, batch_stage_refs, cow_write_file_once, ensure_private_subvol,
-    flush_batch_from, qgroup_begin_op, qgroup_reserve, qgroup_reserve_meta, with_space_retry,
-    DataRef, DataRefId, Edit, FlushOrigin, MAX_BATCH_OPS,
+    flush_batch_from, flush_if_full, qgroup_begin_op, qgroup_reserve, qgroup_reserve_meta,
+    with_space_retry, DataRef, DataRefId, Edit, FlushOrigin, MAX_BATCH_OPS,
 };
 use crate::btree;
 use crate::format::{self, le64, BtrfsKey};
@@ -454,7 +454,7 @@ async fn stage<B: BlockDevice + 'static>(
             batch.alloc = snapshot;
             return Err(err);
         }
-        batch.ops >= MAX_BATCH_OPS
+        batch.ops >= MAX_BATCH_OPS && !vol.commits_held()
     };
     if full {
         flush_batch_from(vol, FlushOrigin::StagingOperation).await?;
@@ -483,7 +483,12 @@ pub async fn truncate_file<B: BlockDevice + 'static>(
     ino: u64,
     new_size: u64,
 ) -> Result<(), FsError> {
-    with_space_retry(vol, || truncate_once(vol, ino, new_size)).await
+    let r = {
+        let _hold = vol.hold_commits();
+        with_space_retry(vol, || truncate_once(vol, ino, new_size)).await
+    };
+    flush_if_full(vol).await?;
+    r
 }
 
 async fn truncate_once<B: BlockDevice + 'static>(
@@ -586,16 +591,25 @@ pub async fn fallocate_file<B: BlockDevice + 'static>(
     }
     let end = offset.checked_add(len).ok_or(FsError::FileTooLarge)?;
     let keep = mode & FALLOC_FL_KEEP_SIZE != 0;
-    if mode & FALLOC_FL_PUNCH_HOLE != 0 {
-        if !keep || mode & FALLOC_FL_ZERO_RANGE != 0 {
-            return Err(FsError::Unsupported);
+    let punch = mode & FALLOC_FL_PUNCH_HOLE != 0;
+    if punch && (!keep || mode & FALLOC_FL_ZERO_RANGE != 0) {
+        return Err(FsError::Unsupported);
+    }
+    // Edge zeroing, uninlining and the allocation are separate stages; keep
+    // them in one transaction.
+    let r = async {
+        let _hold = vol.hold_commits();
+        if punch {
+            return with_space_retry(vol, || punch_once(vol, ino, offset, end)).await;
         }
-        return with_space_retry(vol, || punch_once(vol, ino, offset, end)).await;
+        if mode & FALLOC_FL_ZERO_RANGE != 0 {
+            with_space_retry(vol, || punch_once(vol, ino, offset, end)).await?;
+        }
+        with_space_retry(vol, || prealloc_once(vol, ino, offset, end, keep)).await
     }
-    if mode & FALLOC_FL_ZERO_RANGE != 0 {
-        with_space_retry(vol, || punch_once(vol, ino, offset, end)).await?;
-    }
-    with_space_retry(vol, || prealloc_once(vol, ino, offset, end, keep)).await
+    .await;
+    flush_if_full(vol).await?;
+    r
 }
 
 async fn prealloc_once<B: BlockDevice + 'static>(

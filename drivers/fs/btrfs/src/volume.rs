@@ -222,6 +222,17 @@ impl<B: BlockDevice> Drop for RootPin<B> {
     }
 }
 
+/// Guard of [`VolCore::hold_commits`]; releases the hold when dropped (also
+/// when the operation's future is dropped mid-way).
+#[derive(Debug)]
+pub(crate) struct CommitHold<'a>(&'a core::sync::atomic::AtomicUsize);
+
+impl Drop for CommitHold<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// Per-mount state: which subvolume this mount exposes.
 #[derive(Debug)]
 struct ViewState {
@@ -414,6 +425,9 @@ pub struct VolCore<B: BlockDevice> {
     staged_super: IrqSafeSpinLock<Option<(alloc::vec::Vec<u8>, bool)>>,
     /// Commits staged since the superblock last reached disk.
     staged_count: core::sync::atomic::AtomicUsize,
+    /// Multi-stage operations in flight ([`VolCore::hold_commits`]): while
+    /// non-zero, a full batch is not committed between their stages.
+    commit_holds: core::sync::atomic::AtomicUsize,
     /// Test-only: abort the next commit after its nodes are written but before
     /// the superblock, standing in for a crash at the one instant the COW
     /// invariant is load-bearing.
@@ -1767,6 +1781,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             devices: IrqSafeSpinLock::new(devices),
             staged_super: IrqSafeSpinLock::new(None),
             staged_count: core::sync::atomic::AtomicUsize::new(0),
+            commit_holds: core::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "kernel-test")]
             crash_before_super: core::sync::atomic::AtomicBool::new(false),
             pinned: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
@@ -2266,6 +2281,24 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             done += take;
         }
         Ok(self.invalidate_nodes(logical, src.len()))
+    }
+
+    /// Keep a multi-stage operation (truncate's tail zeroing then its size
+    /// change, a write's EOF-tail zeroing then the write) in one transaction:
+    /// until the returned guard drops, filling the batch does not commit it,
+    /// so a crash can expose all of the operation or none of it. The caller
+    /// commits a batch left full afterwards (`write::flush_if_full`).
+    pub(crate) fn hold_commits(&self) -> CommitHold<'_> {
+        self.commit_holds
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        CommitHold(&self.commit_holds)
+    }
+
+    /// Whether a [`Self::hold_commits`] guard is live.
+    pub(crate) fn commits_held(&self) -> bool {
+        self.commit_holds
+            .load(core::sync::atomic::Ordering::Acquire)
+            != 0
     }
 
     /// Hold a completed commit's superblock image in memory instead of writing

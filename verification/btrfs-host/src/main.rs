@@ -52,7 +52,11 @@ USAGE: narf-btrfs-host [OPTIONS]
 /// The default selection (`regress` = every `regress-*` case).
 pub const SCENARIOS: [&str; 5] = ["regress", "root", "snapshots", "lba4k", "gate"];
 /// Names `--scenario` also accepts.
-const REGRESS: [&str; 2] = ["regress-zstd-tail", "regress-inline-falloc"];
+const REGRESS: [&str; 3] = [
+    "regress-zstd-tail",
+    "regress-inline-falloc",
+    "regress-atomic",
+];
 
 #[derive(Clone, Debug)]
 struct Args {
@@ -546,6 +550,43 @@ fn regress_inline_falloc() -> Vec<Op> {
     }]
 }
 
+/// A truncate's tail zeroing and its size change must commit together: with
+/// the batch one operation short of full, the zeroing filled it and the
+/// commit landed in between, so a crash left the old size with zeroed bytes
+/// (root seed 2, crash cut 2). Same for a write past EOF.
+fn regress_atomic() -> Vec<Op> {
+    let mut ops = vec![Op::Sync { sub: 0 }];
+    for target in ["trunc", "extend"] {
+        for _ in 0..7 {
+            ops.push(Op::Chmod {
+                sub: 0,
+                path: p("pad"),
+                perms: 0o600,
+            });
+        }
+        ops.push(match target {
+            "trunc" => Op::Truncate {
+                sub: 0,
+                path: p("trunc"),
+                len: 13,
+            },
+            _ => Op::WriteAt {
+                sub: 0,
+                path: p("extend"),
+                off: 9000,
+                len: 10,
+            },
+        });
+        ops.push(Op::Chmod {
+            sub: 0,
+            path: p("pad"),
+            perms: 0o644,
+        });
+        ops.push(Op::Sync { sub: 0 });
+    }
+    ops
+}
+
 fn regress(name: &'static str, script: fn() -> Vec<Op>) -> Scenario {
     Scenario {
         name,
@@ -580,6 +621,7 @@ fn main() {
     let scenarios = [
         regress("regress-zstd-tail", regress_zstd_tail),
         regress("regress-inline-falloc", regress_inline_falloc),
+        regress("regress-atomic", regress_atomic),
         Scenario {
             name: "root",
             lba: 512,

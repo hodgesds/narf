@@ -789,10 +789,35 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
     offset: u64,
     data: &[u8],
 ) -> Result<usize, FsError> {
-    if !data.is_empty() {
-        with_space_retry(vol, || fileops::zero_tail_before_write(vol, ino, offset)).await?;
+    let written = {
+        let _hold = vol.hold_commits();
+        if !data.is_empty() {
+            with_space_retry(vol, || fileops::zero_tail_before_write(vol, ino, offset)).await?;
+        }
+        with_space_retry(vol, || cow_write_file_once(vol, ino, inode, offset, data)).await
+    };
+    flush_if_full(vol).await?;
+    written
+}
+
+/// Commit the open batch if it filled while commits were held
+/// ([`crate::volume::VolCore::hold_commits`]).
+pub(crate) async fn flush_if_full<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+) -> Result<(), FsError> {
+    if vol.commits_held() {
+        return Ok(());
     }
-    with_space_retry(vol, || cow_write_file_once(vol, ino, inode, offset, data)).await
+    let full = vol
+        .fs_batch()
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|batch| batch.ops >= MAX_BATCH_OPS);
+    if full {
+        flush_batch_from(vol, FlushOrigin::StagingOperation).await?;
+    }
+    Ok(())
 }
 
 async fn cow_write_file_once<B: BlockDevice + 'static>(
@@ -1092,7 +1117,7 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
     edits.push(Edit::Upsert(inode_key, new_inode));
 
     batch_stage_refs(vol, batch, &edits, dropped_data, converted.added, new_data).await?;
-    let full = batch.ops >= MAX_BATCH_OPS;
+    let full = batch.ops >= MAX_BATCH_OPS && !vol.commits_held();
     drop(guard);
     if full {
         flush_batch_from(vol, FlushOrigin::StagingOperation).await?;
@@ -1853,7 +1878,7 @@ async fn commit_fs_edits_once<B: BlockDevice + 'static>(
         qgroup_begin_op(batch);
         qgroup_reserve_meta(vol, batch, vol.fs_tree_id(), edits.len()).await?;
         batch_stage(vol, batch, edits, dropped_data, new_data).await?;
-        batch.ops >= MAX_BATCH_OPS
+        batch.ops >= MAX_BATCH_OPS && !vol.commits_held()
     };
     if full {
         flush_batch_from(vol, FlushOrigin::StagingOperation).await?;
@@ -5998,7 +6023,7 @@ async fn set_inode_attrs_once<B: BlockDevice + 'static>(
             Vec::new(),
         )
         .await?;
-        batch.ops >= MAX_BATCH_OPS
+        batch.ops >= MAX_BATCH_OPS && !vol.commits_held()
     };
     if full {
         flush_batch_from(vol, FlushOrigin::StagingOperation).await?;

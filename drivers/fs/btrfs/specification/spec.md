@@ -102,6 +102,15 @@ shared-root snapshot ioctl is refused, and full qgroups
 are left inconsistent with a rescan pending instead of being recounted. The
 last view of a writable core commits what it holds.
 
+An operation that stages more than once — a truncate or fallocate that
+zeroes a partial sector before changing the size, a write past EOF that
+first zeroes the old last sector's tail (Linux `btrfs_cont_expand` →
+`btrfs_truncate_block`, also when a compressed extent backs that sector) —
+holds commits (`VolCore::hold_commits`) so its stages land in one
+transaction; a batch it fills commits after it (`write::flush_if_full`).
+An ENOSPC retry still syncs between attempts. A fallocate inside an inline
+file's first sector preallocates nothing there.
+
 Testing: besides the in-kernel smokes, `cargo xtask btrfs-host-rw` runs the
 driver in a host process (`verification/btrfs-host`) against
 `mkfs.btrfs --rootdir` fixtures shaped like a CachyOS root and
