@@ -20,6 +20,12 @@ pub(super) fn park_blocking_read(
                 let uc = &*uctx;
                 uc.console_read_pending
                     .store(true, core::sync::atomic::Ordering::Release);
+                // The rewound read is restart-pending, so a signal that
+                // ends the park completes it as -EINTR unless SA_RESTART.
+                uc.syscall_restart_kind
+                    .store(crate::user_task::SYSCALL_RESTART_SYS, core::sync::atomic::Ordering::Release);
+                uc.syscall_parked_restarting
+                    .store(true, core::sync::atomic::Ordering::Release);
                 ctx.save_user_state(uc.state.get() as *mut u8);
                 *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
                 if narf_scheduler::stackful::user_own_stack_enabled() {
