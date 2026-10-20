@@ -12,6 +12,15 @@
 //! Default mode is `narf.disks=root-ro`. Its SHA-256 is checked
 //! afterwards, so the run also proves that root-ro wrote nothing. `--rw` boots
 //! `narf.disks=root-rw` on a scratch copy of the image instead.
+//!
+//! `--disk <image>` boots an existing installed CachyOS disk instead (for
+//! example a desktop VM image with plymouth and plasmalogin). The image is
+//! only ever a read-only qcow2 backing file: the guest's NVMe is a fresh
+//! overlay, and under root-ro the overlay must come back with no data
+//! allocated. With `--passthrough-device` (a GPU passed through VFIO) and
+//! `--interactive`, this is the bench for a graphical boot on real silicon:
+//! the picture is on the card's own outputs and the serial console is the
+//! terminal.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -34,6 +43,8 @@ const IMAGE: &str = "target/narf-cachyos-root.img";
 const RW_IMAGE: &str = "target/narf-cachyos-root-rw.img";
 /// Decoy disk for the first NVMe controller.
 const DECOY_IMAGE: &str = "target/narf-cachyos-decoy.img";
+/// Copy-on-write overlay over a `--disk` image.
+const DISK_OVERLAY: &str = "target/narf-cachyos-disk-overlay.qcow2";
 const SCRIPT: &str = "verification/data/cachyos-root/REGEN_cachyos_root_image.sh";
 
 /// Options for the CachyOS root smoke.
@@ -68,6 +79,39 @@ pub struct Args {
     /// Seconds to wait for the login prompt.
     #[arg(long, default_value_t = 300)]
     pub timeout: u64,
+
+    /// Boot this installed CachyOS disk image (raw or qcow2) instead of the
+    /// generated fixture. It is never written: the guest gets a fresh qcow2
+    /// overlay backed by it. Its root password is unknown, so the run stops
+    /// at the login prompt unless `--interactive`.
+    #[arg(long, value_name = "IMAGE")]
+    pub disk: Option<PathBuf>,
+
+    /// Filesystem UUID of the `--disk` root. Default: the first btrfs or
+    /// ext4 partition in the image's GPT (raw images only).
+    #[arg(long, value_name = "UUID", requires = "disk")]
+    pub root_uuid: Option<String>,
+
+    /// Keep the `--disk` overlay after the run instead of deleting it.
+    #[arg(long, requires = "disk")]
+    pub keep_overlay: bool,
+
+    /// Attach this terminal to the guest's serial console and run until the
+    /// guest powers off (or Ctrl-C), instead of the scripted login.
+    #[arg(long)]
+    pub interactive: bool,
+
+    /// Also write the guest's serial output to this file.
+    #[arg(long, value_name = "FILE")]
+    pub serial_log: Option<PathBuf>,
+}
+
+/// The `--disk` being booted, as `run` prepared it.
+struct DiskBoot {
+    base: PathBuf,
+    overlay: PathBuf,
+    /// `(length, mtime)` of the base before the boot.
+    base_stamp: (u64, std::time::SystemTime),
 }
 
 /// Printed by the post-login check script once it ran to the end. Written as
@@ -149,6 +193,37 @@ fn journal_unit_lines(report: &str) -> Option<usize> {
     })
 }
 
+/// How many trailing bytes of `bytes` are the start of a UTF-8 sequence the
+/// next read will finish. Decoding them now would turn one `…` into
+/// replacement characters and break substring matches.
+fn incomplete_utf8_tail(bytes: &[u8]) -> usize {
+    match std::str::from_utf8(bytes) {
+        Err(e) if e.error_len().is_none() => bytes.len() - e.valid_up_to(),
+        _ => 0,
+    }
+}
+
+/// The distinct units systemd showed as slow start jobs, with the last
+/// elapsed time it printed for each: `(description, "1min 30s / no limit")`.
+fn slow_start_jobs(serial: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    // systemd redraws the status line with CR, so split before stripping
+    // escapes (which drops CRs).
+    for segment in serial.split(['\n', '\r']) {
+        let line = strip_escapes(segment);
+        for rest in line.split(START_JOB_MARKER).skip(1) {
+            let rest = rest.split_once(')').map_or(rest, |(job, _)| job);
+            let (unit, time) = rest.rsplit_once(" (").unwrap_or((rest, ""));
+            let unit = unit.trim().to_string();
+            match out.iter_mut().find(|(u, _)| *u == unit) {
+                Some(entry) => entry.1 = time.to_string(),
+                None => out.push((unit, time.to_string())),
+            }
+        }
+    }
+    out
+}
+
 const PANIC_MARKERS: &[&str] = &[
     "*** KERNEL PANIC ***",
     "panicked at",
@@ -227,9 +302,38 @@ fn print_report(report: &str) {
 fn boot_and_login(args: &Args) -> Result<()> {
     let mut build = args.build.clone();
     super::configure_systemd_pid1_build(&mut build, false);
+    super::add_passthrough_firmware(&mut build);
     let root = super::workspace_root()?;
     let out_dir = super::cargo_build(&build, &root)?;
     let kernel = out_dir.join(&build.package);
+    // Firmware the display needs before the root mounts (a passed-through
+    // GPU) arrives as the initramfs.
+    let firmware = super::initramfs_firmware_entries(&build, &root)?;
+    let initrd = if firmware.is_empty() {
+        None
+    } else {
+        let entries: Vec<(&str, &[u8])> = firmware
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect();
+        let path = out_dir.join("initramfs-cachyos-firmware.cpio");
+        std::fs::write(&path, super::encode_cpio_newc(&entries))
+            .with_context(|| format!("write {}", path.display()))?;
+        println!(
+            "xtask cachyos-root-smoke: {} firmware blob(s) in the initramfs",
+            firmware.len()
+        );
+        Some(path)
+    };
+    if let Ok(mut slot) = super::TEST_INITRD.lock() {
+        *slot = initrd;
+    }
+    let mut log = match &args.serial_log {
+        Some(path) => Some(
+            std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?,
+        ),
+        None => None,
+    };
     let qemu = build.arch.qemu_bin();
     let mut child = Command::new(qemu)
         .args(super::qemu_boot_args(&build, &kernel)?)
@@ -243,13 +347,21 @@ fn boot_and_login(args: &Args) -> Result<()> {
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let reader = std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
+        // Bytes of a UTF-8 sequence the last read split (systemd's `…`).
+        let mut carry: Vec<u8> = Vec::new();
         loop {
             match stdout.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let _ = std::io::stdout().write_all(&buf[..n]);
                     let _ = std::io::stdout().flush();
-                    if tx.send(buf[..n].to_vec()).is_err() {
+                    if let Some(log) = log.as_mut() {
+                        let _ = log.write_all(&buf[..n]);
+                    }
+                    carry.extend_from_slice(&buf[..n]);
+                    let keep = incomplete_utf8_tail(&carry);
+                    let tail = carry.split_off(carry.len() - keep);
+                    if tx.send(std::mem::replace(&mut carry, tail)).is_err() {
                         break;
                     }
                 }
@@ -288,7 +400,15 @@ fn boot_and_login(args: &Args) -> Result<()> {
                 }
             }
         };
-    let prompt = format!("{IMAGE_HOSTNAME} login:");
+    if args.interactive {
+        return interactive(child, stdin, rx, reader);
+    }
+    // A --disk image has its own hostname.
+    let prompt = if args.disk.is_some() {
+        " login:".to_string()
+    } else {
+        format!("{IMAGE_HOSTNAME} login:")
+    };
     let result = (|| -> Result<()> {
         let emergency = match wait_for(
             &[&prompt, "You are in emergency mode"],
@@ -325,7 +445,7 @@ fn boot_and_login(args: &Args) -> Result<()> {
             }
             bail!("systemd fell back to emergency mode");
         }
-        if args.no_login {
+        if args.no_login || args.disk.is_some() {
             return Ok(());
         }
         // Let both gettys finish printing their banners before typing.
@@ -449,17 +569,81 @@ fn boot_and_login(args: &Args) -> Result<()> {
     let _ = child.wait();
     drop(rx);
     let _ = reader.join();
+    report_start_jobs(&serial);
     result.map_err(|e| anyhow::anyhow!("xtask cachyos-root-smoke: {e}"))
+}
+
+/// Print the units systemd reported as slow start jobs: a unit that hangs
+/// on NARF (and not on Linux) shows up here first.
+fn report_start_jobs(serial: &str) {
+    let jobs = slow_start_jobs(serial);
+    if jobs.is_empty() {
+        return;
+    }
+    println!("\nxtask cachyos-root-smoke: slow start jobs systemd reported:");
+    for (unit, time) in jobs {
+        println!("  {unit}  ({time})");
+    }
+}
+
+/// `--interactive`: this terminal's input goes to the guest's serial
+/// console until QEMU exits — the guest powered off, or Ctrl-C, which the
+/// terminal delivers to QEMU too.
+fn interactive(
+    mut child: std::process::Child,
+    mut stdin: std::process::ChildStdin,
+    rx: mpsc::Receiver<Vec<u8>>,
+    reader: std::thread::JoinHandle<()>,
+) -> Result<()> {
+    println!(
+        "\nxtask cachyos-root-smoke: serial console attached; `systemctl poweroff` in the \
+         guest (or Ctrl-C) ends the run"
+    );
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 256];
+        let mut input = std::io::stdin();
+        while let Ok(n) = input.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            // The terminal is line-buffered and sends LF; a serial getty
+            // expects the CR a real terminal's Enter sends.
+            let bytes: Vec<u8> = buf[..n]
+                .iter()
+                .map(|&b| if b == b'\n' { b'\r' } else { b })
+                .collect();
+            if stdin.write_all(&bytes).and_then(|_| stdin.flush()).is_err() {
+                break;
+            }
+        }
+    });
+    let mut serial = String::new();
+    while let Ok(bytes) = rx.recv() {
+        serial.push_str(&String::from_utf8_lossy(&bytes));
+    }
+    let status = child.wait()?;
+    let _ = reader.join();
+    report_start_jobs(&serial);
+    println!("\nxtask cachyos-root-smoke: QEMU exited ({status})");
+    Ok(())
 }
 
 /// The bare-metal command line, for the smoke image's UUID.
 pub fn smoke_cmdline(uuid: &str, rw: bool, extra: &[String]) -> String {
-    let mut tokens = vec![
-        format!("root=UUID={uuid}"),
-        "rootflags=subvol=/@".to_string(),
+    root_cmdline(uuid, Some("subvol=/@"), rw, extra)
+}
+
+/// The bare-metal command line for any root: `rootflags` only when the root
+/// needs them (a btrfs subvolume).
+fn root_cmdline(uuid: &str, rootflags: Option<&str>, rw: bool, extra: &[String]) -> String {
+    let mut tokens = vec![format!("root=UUID={uuid}")];
+    if let Some(flags) = rootflags {
+        tokens.push(format!("rootflags={flags}"));
+    }
+    tokens.extend([
         "systemd_pid1".to_string(),
         format!("narf.disks={}", if rw { "root-rw" } else { "root-ro" }),
-    ];
+    ]);
     // Same as the grub-image bundle: no zram device, so no zram swap units.
     if !extra.iter().any(|a| a.starts_with("systemd.zram=")) {
         tokens.push(super::NO_ZRAM_ARG.to_string());
@@ -500,6 +684,178 @@ pub(crate) fn ensure_image(root: &Path, rebuild: bool) -> Result<PathBuf> {
     Ok(image)
 }
 
+/// `qcow2` when `path` starts with the qcow2 magic, else `raw`.
+fn image_format(path: &Path) -> Result<&'static str> {
+    let mut magic = [0u8; 4];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .with_context(|| format!("read {}", path.display()))?;
+    Ok(if &magic == b"QFI\xfb" { "qcow2" } else { "raw" })
+}
+
+/// The standard text form of a 16-byte UUID stored in byte order (how both
+/// ext4 and btrfs store theirs).
+fn uuid_text(b: &[u8]) -> String {
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// `(uuid, "btrfs" | "ext4")` of the filesystem at byte `offset`, if any.
+fn probe_fs(file: &mut std::fs::File, offset: u64) -> Option<(String, &'static str)> {
+    use std::io::{Seek, SeekFrom};
+    let mut sb = [0u8; 0x100];
+    // btrfs: primary superblock at 64 KiB, magic at +0x40, fsid at +0x20.
+    file.seek(SeekFrom::Start(offset + 0x1_0000)).ok()?;
+    if file.read_exact(&mut sb).is_ok() && &sb[0x40..0x48] == b"_BHRfS_M" {
+        return Some((uuid_text(&sb[0x20..0x30]), "btrfs"));
+    }
+    // ext2/3/4: superblock at 1 KiB, magic 0xEF53 at +0x38, uuid at +0x68.
+    file.seek(SeekFrom::Start(offset + 1024)).ok()?;
+    if file.read_exact(&mut sb).is_ok() && sb[0x38..0x3a] == [0x53, 0xef] {
+        return Some((uuid_text(&sb[0x68..0x78]), "ext4"));
+    }
+    None
+}
+
+/// The first btrfs or ext4 partition in a raw GPT image (512-byte sectors).
+fn find_root_partition(image: &Path) -> Result<(String, &'static str)> {
+    use std::io::{Seek, SeekFrom};
+    let mut f = std::fs::File::open(image).with_context(|| format!("open {}", image.display()))?;
+    let mut hdr = [0u8; 92];
+    f.seek(SeekFrom::Start(512))?;
+    f.read_exact(&mut hdr)?;
+    if &hdr[..8] != b"EFI PART" {
+        bail!(
+            "{} has no GPT (512-byte sectors); pass --root-uuid",
+            image.display()
+        );
+    }
+    let le64 = |b: &[u8]| u64::from_le_bytes(b.try_into().unwrap());
+    let le32 = |b: &[u8]| u32::from_le_bytes(b.try_into().unwrap());
+    let entries_lba = le64(&hdr[72..80]);
+    let count = le32(&hdr[80..84]).min(256) as usize;
+    let size = le32(&hdr[84..88]) as usize;
+    if size < 128 {
+        bail!("{}: bad GPT entry size {size}", image.display());
+    }
+    let mut table = vec![0u8; count * size];
+    f.seek(SeekFrom::Start(entries_lba * 512))?;
+    f.read_exact(&mut table)?;
+    for entry in table.chunks(size) {
+        let first = le64(&entry[32..40]);
+        if entry[..16].iter().all(|&b| b == 0) || first == 0 {
+            continue;
+        }
+        if let Some(found) = probe_fs(&mut f, first * 512) {
+            return Ok(found);
+        }
+    }
+    bail!(
+        "{}: no btrfs or ext4 partition found; pass --root-uuid",
+        image.display()
+    )
+}
+
+/// `(length, mtime)`: cheap evidence a 40 GiB base image was not written.
+fn file_stamp(path: &Path) -> Result<(u64, std::time::SystemTime)> {
+    let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    Ok((meta.len(), meta.modified()?))
+}
+
+/// Processes other than this one holding `path` open (`fuser`, from /proc).
+fn image_users(path: &Path) -> Vec<String> {
+    let me = std::process::id().to_string();
+    let mut out = Vec::new();
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for p in procs.flatten() {
+        let pid = p.file_name().to_string_lossy().into_owned();
+        if pid == me || !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(p.path().join("fd")) else {
+            continue;
+        };
+        if fds
+            .flatten()
+            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|t| t == path))
+        {
+            let comm = std::fs::read_to_string(p.path().join("comm")).unwrap_or_default();
+            out.push(format!("{pid} ({})", comm.trim()));
+        }
+    }
+    out
+}
+
+/// Did the guest write anything into the overlay? `qemu-img map` lists the
+/// overlay's own data as `depth: 0` extents with `data: true`.
+fn overlay_written_bytes(overlay: &Path) -> Result<u64> {
+    let out = Command::new("qemu-img")
+        .args(["map", "--output=json", "-f", "qcow2"])
+        .arg(overlay)
+        .output()
+        .context("run qemu-img map")?;
+    if !out.status.success() {
+        bail!(
+            "qemu-img map {} failed: {}",
+            overlay.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    overlay_data_bytes(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn overlay_data_bytes(map_json: &str) -> Result<u64> {
+    let extents: Vec<serde_json::Value> =
+        serde_json::from_str(map_json).context("parse qemu-img map output")?;
+    Ok(extents
+        .iter()
+        .filter(|e| e["depth"] == 0 && e["data"] == true)
+        .filter_map(|e| e["length"].as_u64())
+        .sum())
+}
+
+/// Create a fresh overlay for `--disk` and point the second NVMe at it.
+fn prepare_disk(root: &Path, base: &Path) -> Result<DiskBoot> {
+    let base = base
+        .canonicalize()
+        .with_context(|| format!("--disk {}", base.display()))?;
+    let users = image_users(&base);
+    if !users.is_empty() {
+        bail!(
+            "{} is open in another process ({}); never boot an image something else is using",
+            base.display(),
+            users.join(", ")
+        );
+    }
+    let format = image_format(&base)?;
+    let overlay = root.join(DISK_OVERLAY);
+    let _ = std::fs::remove_file(&overlay);
+    let status = Command::new("qemu-img")
+        .args(["create", "-q", "-f", "qcow2", "-F", format, "-b"])
+        .arg(&base)
+        .arg(&overlay)
+        .status()
+        .context("run qemu-img create")?;
+    if !status.success() {
+        bail!("qemu-img create {} failed ({status})", overlay.display());
+    }
+    std::env::set_var("NARF_NVME2_FORMAT", "qcow2");
+    Ok(DiskBoot {
+        base_stamp: file_stamp(&base)?,
+        base,
+        overlay,
+    })
+}
+
 /// A 64 MiB disk with a recognisable pattern: no filesystem, so nothing may
 /// mount it, and any write shows up in its hash.
 fn write_decoy(path: &Path) -> Result<()> {
@@ -513,6 +869,9 @@ fn write_decoy(path: &Path) -> Result<()> {
 
 pub fn run(args: &Args) -> Result<()> {
     let root = super::workspace_root()?;
+    if let Some(base) = &args.disk {
+        return run_disk(args, &root, base);
+    }
     let image = ensure_image(&root, args.rebuild_image)?;
     let disk = if args.rw {
         let copy = root.join(RW_IMAGE);
@@ -544,21 +903,7 @@ pub fn run(args: &Args) -> Result<()> {
         "xtask cachyos-root-smoke: disk {} cmdline `{cmdline}`",
         disk.display()
     );
-    std::env::set_var("NARF_NVME_IMG", &decoy);
-    std::env::set_var("NARF_NVME2_IMG", &disk);
-    let existing = std::env::var("XTASK_QEMU_APPEND").unwrap_or_default();
-    std::env::set_var(
-        "XTASK_QEMU_APPEND",
-        [existing.as_str(), cmdline.as_str()]
-            .iter()
-            .filter(|s| !s.is_empty())
-            .copied()
-            .collect::<Vec<_>>()
-            .join(" "),
-    );
-    if std::env::var_os("NARF_QEMU_MEM_MB").is_none() {
-        std::env::set_var("NARF_QEMU_MEM_MB", "4096");
-    }
+    set_boot_env(&decoy, &disk, &cmdline);
 
     let result = boot_and_login(args);
 
@@ -581,6 +926,89 @@ pub fn run(args: &Args) -> Result<()> {
             "xtask cachyos-root-smoke: image unchanged by the root-ro boot (SHA-256 verified)"
         );
     }
+    result?;
+    println!("xtask cachyos-root-smoke: OK");
+    Ok(())
+}
+
+/// The environment `qemu_boot_args` reads: the decoy on the first NVMe, the
+/// root on the second, the root command line, and the guest's RAM.
+fn set_boot_env(decoy: &Path, disk: &Path, cmdline: &str) {
+    std::env::set_var("NARF_NVME_IMG", decoy);
+    std::env::set_var("NARF_NVME2_IMG", disk);
+    let existing = std::env::var("XTASK_QEMU_APPEND").unwrap_or_default();
+    std::env::set_var(
+        "XTASK_QEMU_APPEND",
+        [existing.as_str(), cmdline]
+            .iter()
+            .filter(|s| !s.is_empty())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+    if std::env::var_os("NARF_QEMU_MEM_MB").is_none() {
+        std::env::set_var("NARF_QEMU_MEM_MB", "4096");
+    }
+}
+
+/// `--disk`: boot an installed image through a fresh overlay.
+fn run_disk(args: &Args, root: &Path, base: &Path) -> Result<()> {
+    let disk = prepare_disk(root, base)?;
+    let (uuid, rootflags) = match &args.root_uuid {
+        Some(uuid) => (uuid.clone(), None),
+        None => {
+            let (uuid, fs) = find_root_partition(&disk.base)?;
+            println!(
+                "xtask cachyos-root-smoke: {} root {fs} UUID {uuid}",
+                disk.base.display()
+            );
+            // CachyOS's btrfs layout puts / in `@`.
+            (uuid, (fs == "btrfs").then_some("subvol=/@"))
+        }
+    };
+    let decoy = root.join(DECOY_IMAGE);
+    write_decoy(&decoy)?;
+    let decoy_before = sha256_file(&decoy)?;
+    let cmdline = root_cmdline(&uuid, rootflags, args.rw, &args.cmdline);
+    println!(
+        "xtask cachyos-root-smoke: disk {} (overlay {}) cmdline `{cmdline}`",
+        disk.base.display(),
+        disk.overlay.display()
+    );
+    set_boot_env(&decoy, &disk.overlay, &cmdline);
+
+    let result = boot_and_login(args);
+
+    let mut verdict = Ok(());
+    if file_stamp(&disk.base)? != disk.base_stamp {
+        verdict = Err(anyhow::anyhow!(
+            "the base image {} CHANGED during the run",
+            disk.base.display()
+        ));
+    }
+    if sha256_file(&decoy)? != decoy_before {
+        verdict = Err(anyhow::anyhow!("the boot MODIFIED the decoy disk"));
+    }
+    let written = overlay_written_bytes(&disk.overlay)?;
+    if args.rw {
+        println!("xtask cachyos-root-smoke: root-rw wrote {written} bytes to the overlay");
+    } else if written != 0 {
+        verdict = Err(anyhow::anyhow!(
+            "narf.disks=root-ro WROTE {written} bytes to the overlay {}",
+            disk.overlay.display()
+        ));
+    } else {
+        println!("xtask cachyos-root-smoke: root-ro boot wrote nothing (overlay holds no data)");
+    }
+    if args.keep_overlay || verdict.is_err() {
+        println!(
+            "xtask cachyos-root-smoke: overlay kept at {}",
+            disk.overlay.display()
+        );
+    } else {
+        let _ = std::fs::remove_file(&disk.overlay);
+    }
+    verdict.map_err(|e| anyhow::anyhow!("xtask cachyos-root-smoke: {e}"))?;
     result?;
     println!("xtask cachyos-root-smoke: OK");
     Ok(())
@@ -625,6 +1053,62 @@ mod tests {
             stuck_start_job("A start job is running for dev-x.device (5s / 3min 30s)"),
             None
         );
+    }
+
+    #[test]
+    fn a_split_ellipsis_waits_for_its_last_byte() {
+        let ellipsis = "…".as_bytes();
+        assert_eq!(incomplete_utf8_tail(b"plain"), 0);
+        assert_eq!(incomplete_utf8_tail(&[b'P', ellipsis[0], ellipsis[1]]), 2);
+        assert_eq!(incomplete_utf8_tail(ellipsis), 0);
+        // Invalid bytes are not held back; they are not going to complete.
+        assert_eq!(incomplete_utf8_tail(&[0xff]), 0);
+    }
+
+    #[test]
+    fn an_ext4_root_gets_no_rootflags() {
+        assert_eq!(
+            root_cmdline("u", None, false, &[]),
+            "root=UUID=u systemd_pid1 narf.disks=root-ro systemd.zram=0"
+        );
+    }
+
+    #[test]
+    fn slow_start_jobs_keep_the_last_time_per_unit() {
+        let serial = "[  *** ] A start job is running for Show Plymouth Boot Screen (5s / no limit)\r\
+                      [ ***  ] A start job is running for Show Plymouth Boot Screen (1min 3s / no limit)\n\
+                      [  OK  ] Started Something.\n\
+                      [***   ] A start job is running for /dev/disk/by-uuid/x (12s / 1min 30s)\n";
+        assert_eq!(
+            slow_start_jobs(serial),
+            vec![
+                (
+                    "Show Plymouth Boot Screen".into(),
+                    "1min 3s / no limit".into()
+                ),
+                ("/dev/disk/by-uuid/x".into(), "12s / 1min 30s".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn uuids_print_in_stored_byte_order() {
+        let b = [
+            0xaf, 0x80, 0xb0, 0x3f, 0xd9, 0xd6, 0x42, 0xf9, 0xb3, 0x37, 0x0f, 0x38, 0x25, 0xc1,
+            0x97, 0x0a,
+        ];
+        assert_eq!(uuid_text(&b), "af80b03f-d9d6-42f9-b337-0f3825c1970a");
+    }
+
+    #[test]
+    fn only_the_overlays_own_data_counts_as_written() {
+        let map = r#"[
+            {"start": 0, "length": 65536, "depth": 1, "present": true, "zero": false, "data": true, "compressed": false},
+            {"start": 65536, "length": 4096, "depth": 0, "present": true, "zero": false, "data": true, "compressed": false},
+            {"start": 69632, "length": 8192, "depth": 0, "present": true, "zero": true, "data": false, "compressed": false}
+        ]"#;
+        assert_eq!(overlay_data_bytes(map).unwrap(), 4096);
+        assert_eq!(overlay_data_bytes("[]").unwrap(), 0);
     }
 
     #[test]

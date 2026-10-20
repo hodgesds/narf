@@ -183,6 +183,17 @@ accelerator. Leave `NARF_QEMU_CPU` unset unless you know the replacement keeps
 the PCI hole below NARF's 1-TiB physical mapping ceiling; xtask clamps its
 default `max` CPU model to 40 physical-address bits for this reason.
 
+The preflight also refuses a group whose
+`/sys/kernel/iommu_groups/<n>/reserved_regions` lists a `direct` range. The
+platform's IOMMU table (AMD IVRS unity ranges, Intel DMAR RMRRs) then requires
+the device to stay identity-mapped, Linux logs "Firmware has requested this
+device have a 1:1 IOMMU mapping", and QEMU fails with `failed to setup
+container for group N: ... Invalid argument`. Only firmware can remove such a
+range; `direct-relaxable` ranges are harmless. The RX 6750 XT on the Gigabyte
+B650I AORUS ULTRA has two (groups 14 and 15), so it cannot be passed through
+on that board as shipped. Test its native modeset by booting NARF on the
+host instead.
+
 On the Linux host, enable AMD-Vi or VT-d in firmware and use the distribution's
 normal early-boot VFIO configuration (`vfio-pci.ids=vendor:device`, initramfs
 module configuration, or `driver_override`) to claim the device. Prefer
@@ -190,6 +201,89 @@ early-boot binding for a GPU. Runtime-unbinding the adapter driving the host
 desktop can terminate the session or leave the card unable to reset. NARF sees
 the assigned function as an ordinary PCIe device and needs no passthrough flag
 inside the guest.
+
+The preflight also checks two host limits that otherwise fail inside QEMU
+with an unhelpful message:
+
+- **`/dev/vfio/<group>` must be openable by your user.** vfio-pci creates the
+  group nodes root-only. Until the next rebind:
+  `sudo chown $USER /dev/vfio/14 /dev/vfio/15` (use your group numbers), or
+  add a udev rule `SUBSYSTEM=="vfio", OWNER="<user>"`.
+- **`RLIMIT_MEMLOCK` must cover the guest's RAM.** VFIO pins every page of
+  guest RAM for DMA; the usual default is 8 MiB. Raise it for the shell you
+  run xtask from (`sudo prlimit --pid $$ --memlock=unlimited`) or add
+  `<user> - memlock unlimited` under `/etc/security/limits.d/` and log in
+  again. The check uses `NARF_QEMU_MEM_MB` (default 1024; 4096 for
+  `cachyos-root-smoke`) plus 256 MiB.
+
+On a desktop whose only display is the card being passed through, the card
+can be handed over without a reboot once nothing uses it:
+
+```sh
+sudo systemctl stop plasmalogin        # or the display manager in use
+sudo modprobe vfio-pci
+for d in 0000:03:00.1 0000:03:00.0; do
+  echo vfio-pci | sudo tee /sys/bus/pci/devices/$d/driver_override
+  echo $d | sudo tee /sys/bus/pci/devices/$d/driver/unbind
+  echo $d | sudo tee /sys/bus/pci/drivers_probe
+done
+```
+
+`driver_override` lasts until the next host boot. Undo it by writing an empty
+line to each `driver_override` and repeating the unbind and `drivers_probe`.
+
+When a passed-through device is a display controller, xtask drops QEMU's own
+display adapters (`-vga none`, no virtio-gpu), so the card is the guest's only
+GPU and the kernel console and any compositor use it. Firmware the card needs
+before the root mounts goes into the initramfs automatically (Navi 22:
+`amdgpu/navy_flounder*`, imported first with
+`cargo xtask import-firmware --source /usr/lib/firmware --vendor amdgpu`);
+`--initramfs-firmware` overrides the choice.
+
+#### Booting an installed CachyOS on the passed-through card
+
+`cargo xtask cachyos-root-smoke` boots CachyOS's own systemd as PID 1 under
+`narf.disks=root-ro`. With `--disk` it boots an existing installed image, for
+example a desktop VM image with plymouth and plasmalogin, instead of the
+generated fixture:
+
+```sh
+cargo xtask cachyos-root-smoke --arch=x86_64 \
+  --disk ~/vms/cachyos-fresh.raw \
+  --passthrough-device 03:00.0 --passthrough-device 03:00.1 \
+  --interactive --serial-log /tmp/narf-gpu.serial
+```
+
+- The image is only ever a read-only backing file. The guest's NVMe is a fresh
+  qcow2 overlay (`target/narf-cachyos-disk-overlay.qcow2`); xtask refuses an
+  image another process has open, and afterwards checks that the base image's
+  size and mtime are unchanged and that a root-ro boot left no data in the
+  overlay.
+- The root's UUID and filesystem are read from the image's GPT (`--root-uuid`
+  for a qcow2 base). An ext4 root gets no `rootflags`; btrfs gets
+  `subvol=/@`.
+- The image's default target (graphical.target with plasmalogin on a desktop
+  install) is booted; add `--cmdline systemd.unit=multi-user.target` for a
+  text boot.
+- `--interactive` attaches the terminal to the serial console until the guest
+  powers off or Ctrl-C. Without it the run stops at the serial login prompt
+  (the image's root password is not known to xtask). Either way the
+  units systemd reported as slow start jobs are listed at the end.
+- The picture is on the card's own outputs, not in a QEMU window.
+
+**Resetting the card between runs.** QEMU resets an assigned device when it
+starts and when the guest reboots. Navi 22 has no function-level reset; the
+host offers only a secondary bus reset (`cat
+/sys/bus/pci/devices/0000:03:00.0/reset_method` prints `bus`), which vfio-pci
+can use because both functions are assigned together. The guest boots without
+OVMF, so nothing posts the card's VBIOS: NARF's Navi 22 init path
+(`drivers/gpu/src/amdgpu_reset_navi22.rs`) checks for a running PSP SOS,
+mode1-resets the ASIC if it finds one (restoring the cached Resizable BAR
+sizes), and posts the card itself through ATOM `ASIC_Init` from the VBIOS. A
+run that ends with the card still running (QEMU killed) is therefore
+recovered by the next guest's own reset. If the host instead reports the card
+gone (`lspci` shows header type 0x7f, or vfio logs `Unknown header type`),
+only a host reboot recovers it.
 
 ### 3.2 The interactive shell + login
 

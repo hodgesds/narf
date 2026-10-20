@@ -326,15 +326,13 @@ fn smoke_nl80211_active_scan_and_ssid_connect() -> TestResult {
     open.rssi = -10;
     open.security = crate::scan::BssSecurity::Open;
     let list = [weak, strong, open];
-    if select_bss(list.iter(), b"home", None, None, Akm::Psk)
-        .unwrap()
-        .bssid
-        != [4; 6]
-        || select_bss(list.iter(), b"home", None, Some(1), Akm::Psk)
-            .unwrap()
-            .bssid
-            != [2; 6]
-        || select_bss(list.iter(), b"home", Some([6; 6]), None, Akm::Psk).is_some()
+    // The frequency filter is NL80211_ATTR_WIPHY_FREQ, in MHz: the weak BSS
+    // on channel 1 is selected by 2412, not by its channel number.
+    let pick =
+        |bssid, freq| select_bss(list.iter(), b"home", bssid, freq, Akm::Psk).map(|b| b.bssid);
+    if pick(None, None) != Some([4; 6])
+        || pick(None, Some(2412)) != Some([2; 6])
+        || pick(Some([6; 6]), None).is_some()
     {
         return TestResult::Fail("connect selection ignored security/BSSID/channel filters");
     }
