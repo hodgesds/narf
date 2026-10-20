@@ -2268,3 +2268,84 @@ fn smoke_pty_slave_write_wakes_master_poller() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/pty", smoke_pty_slave_write_wakes_master_poller);
+
+// ── TIOCCONS: /dev/console output follows the redirect ───────────────────────
+//
+// plymouthd (`--attach-to-session`) opens a pty, points the console at its
+// slave with TIOCCONS and reads systemd's boot messages from the master; it
+// refuses to start when TIOCCONS fails. While the redirect is set, writes to
+// /dev/console reach the slave; /dev/tty1 is a VT and is not redirected; a
+// second redirect is refused (-EBUSY at the ioctl); the master's close hangs
+// the slave up and drops the redirect (`__tty_hangup`), after which the
+// console prints normally again.
+
+fn open_dev_node_for_test(name: &str) -> Option<Arc<dyn FileOps>> {
+    use crate::{bootstrap_mount_authority, registry, DevFs};
+    let auth = bootstrap_mount_authority();
+    // Idempotent: a prior smoke may already own this mountpoint.
+    let _ = registry().mount(&auth, "/dev/pty-tioccons-test-mount", DevFs::new());
+    let path = alloc::format!("/dev/pty-tioccons-test-mount/{name}");
+    registry()
+        .resolve_absolute(&path, |fs, rel| crate::resolve(fs.root(), rel).ok())
+        .flatten()
+}
+
+fn smoke_pty_console_redirect_follows_tioccons() -> TestResult {
+    use crate::console_tty::{clear_redirect_to_tty, redirect, set_redirect, take_redirect};
+    __reset_for_test();
+    drop(take_redirect());
+    let (Some(console), Some(tty1)) = (
+        open_dev_node_for_test("console"),
+        open_dev_node_for_test("tty1"),
+    ) else {
+        return TestResult::Fail("resolve /dev/console or /dev/tty1 failed");
+    };
+    let master = open_ptmx();
+    let Some(pty) = pts_lookup(master.index()) else {
+        return TestResult::Fail("pts_lookup failed");
+    };
+    let slave: Arc<dyn FileOps> = Arc::new(PtySlave::new(pty));
+    let Some(slave_tty) = slave.tty_id() else {
+        return TestResult::Fail("a pty slave has no tty id");
+    };
+    if set_redirect(Arc::clone(&slave)).is_err() {
+        return TestResult::Fail("TIOCCONS redirect refused with none set");
+    }
+    if set_redirect(Arc::clone(&slave)).is_ok() {
+        drop(take_redirect());
+        return TestResult::Fail("a second TIOCCONS redirect was not refused (EBUSY)");
+    }
+    let fail = |msg| {
+        drop(take_redirect());
+        TestResult::Fail(msg)
+    };
+    if !matches!(poll_once(console.write(0, b"boot")), Some(Ok(4))) {
+        return fail("write to the redirected /dev/console failed");
+    }
+    if !matches!(poll_once(tty1.write(0, b"vt")), Some(Ok(2))) {
+        return fail("write to /dev/tty1 failed");
+    }
+    let mut buf = [0u8; 16];
+    match poll_once(master.read(0, &mut buf)) {
+        Some(Ok(4)) if &buf[..4] == b"boot" => {}
+        _ => {
+            return fail("the console write did not reach the redirect target (VT writes must not)")
+        }
+    }
+    // A hangup of an unrelated tty leaves the redirect alone.
+    if clear_redirect_to_tty(slave_tty.wrapping_add(1)).is_some() || redirect().is_none() {
+        return fail("an unrelated tty's hangup dropped the redirect");
+    }
+    drop(master);
+    if redirect().is_some() {
+        return fail("closing the pty master did not drop the redirect");
+    }
+    if !matches!(poll_once(console.write(0, b"\n")), Some(Ok(1))) {
+        return TestResult::Fail("console write after the redirect was dropped failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/pty",
+    smoke_pty_console_redirect_follows_tioccons
+);

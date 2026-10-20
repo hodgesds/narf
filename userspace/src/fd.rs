@@ -1553,6 +1553,11 @@ impl FileOps for ConsoleFile {
         narf_filesystem::console_tty::block_on_input()
     }
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        // fd 0/1/2 of the boot console are `/dev/console`, so a TIOCCONS
+        // redirect applies to them too (`redirected_tty_write`).
+        if let Some(target) = narf_filesystem::console_tty::redirect() {
+            return Box::pin(async move { target.write(0, buf).await });
+        }
         let n = buf.len();
         // Eagerly write: the future just reports the count.
         use core::fmt::Write as _;

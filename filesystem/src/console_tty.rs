@@ -383,3 +383,52 @@ narf_kernel_test::kernel_test_in!(
     "filesystem/console",
     smoke_console_userspace_write_honours_opost
 );
+
+// ── TIOCCONS: console output redirection ────────────────────────────────
+
+/// The tty `/dev/console` output is redirected to (`TIOCCONS`), if any.
+///
+/// Linux `drivers/tty/tty_io.c`: `redirect` holds a reference to the file a
+/// privileged `ioctl(fd, TIOCCONS)` named, and `redirected_tty_write` sends
+/// every write to `/dev/console` there instead. plymouthd (`--attach-to-
+/// session`) points it at a pty slave so the boot messages systemd writes to
+/// the console land in plymouth's log and splash; without it plymouthd
+/// refuses to start (`EX_UNAVAILABLE`). Only writes through `/dev/console`
+/// follow it: the kernel log and the VTs are untouched, as on Linux.
+static REDIRECT: IrqSafeSpinLock<Option<alloc::sync::Arc<dyn crate::FileOps>>> =
+    IrqSafeSpinLock::new(None);
+
+/// The current redirect target, if one is set.
+pub fn redirect() -> Option<alloc::sync::Arc<dyn crate::FileOps>> {
+    REDIRECT.lock().clone()
+}
+
+/// `TIOCCONS` on a tty other than `/dev/console`: redirect console output to
+/// `target`. `Err(())` (Linux `-EBUSY`) when a redirect is already set.
+#[allow(clippy::result_unit_err)]
+pub fn set_redirect(target: alloc::sync::Arc<dyn crate::FileOps>) -> Result<(), ()> {
+    let mut redirect = REDIRECT.lock();
+    if redirect.is_some() {
+        return Err(());
+    }
+    *redirect = Some(target);
+    Ok(())
+}
+
+/// `TIOCCONS` on `/dev/console` itself: stop redirecting. The target's
+/// reference is returned so the caller drops it outside the lock.
+pub fn take_redirect() -> Option<alloc::sync::Arc<dyn crate::FileOps>> {
+    REDIRECT.lock().take()
+}
+
+/// A tty hangup: Linux `__tty_hangup` drops the redirect when it points at
+/// the tty being hung up, so console output does not keep going to a pty
+/// whose master is gone.
+pub fn clear_redirect_to_tty(tty_id: u32) -> Option<alloc::sync::Arc<dyn crate::FileOps>> {
+    let mut redirect = REDIRECT.lock();
+    if redirect.as_ref().and_then(|f| f.tty_id()) == Some(tty_id) {
+        redirect.take()
+    } else {
+        None
+    }
+}

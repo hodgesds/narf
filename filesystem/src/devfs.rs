@@ -1304,6 +1304,13 @@ impl FileOps for DevConsole {
     }
 
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        // `redirected_tty_write`: while a TIOCCONS redirect is set, writes
+        // to `/dev/console` (not the VTs or `/dev/tty`) go to that tty.
+        if matches!(self.kind, ConsoleNodeKind::Console) {
+            if let Some(target) = crate::console_tty::redirect() {
+                return Box::pin(async move { target.write(0, buf).await });
+            }
+        }
         // Same path as `sys_write` to fd 1/2: forward to the kernel
         // console (UART + framebuffer hook if installed). Treat
         // non-UTF-8 input as best-effort lossy by way of
