@@ -724,6 +724,9 @@ pub struct Card {
     /// the hardware scans (see `NativePlane`). `None` keeps the CPU-copy
     /// cards' formats.
     pub plane_formats: Option<&'static [u32]>,
+    /// A native display backend that implements DRIVER_ATOMIC through the
+    /// bridge's native atomic path (the Navi48 card sets it on publish).
+    pub native_atomic: bool,
     /// The CRTCs (by id) carrying the "VRR_ENABLED" property, with the value
     /// DRM last committed. Empty on cards that do not expose it.
     pub vrr_enabled: Vec<(u32, bool)>,
@@ -813,6 +816,7 @@ impl Card {
             native: Vec::new(),
             vblank_source: None,
             plane_formats: None,
+            native_atomic: false,
             vrr_enabled: Vec::new(),
         }
     }

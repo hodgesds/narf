@@ -477,6 +477,7 @@ fn navi48_kms_publishes_an_output_per_port() -> TestResult {
         || [0, 2, 3, 13].map(crtc_display) != [None; 4]
         || card.vblank_source.is_none()
         || card.plane_formats.is_none()
+        || !card.native_atomic
     {
         return TestResult::Fail("CRTC to display");
     }

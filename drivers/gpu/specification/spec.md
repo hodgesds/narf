@@ -1707,6 +1707,11 @@ pipeline does not output. Only the
 EDID's first timing carries PREFERRED; the running timing is listed first and
 is the CRTC's mode. SETCRTC with a mode is refused (EINVAL) unless the mode's
 clock and geometry equal an offered timing.
+The Navi48 card is DRIVER_ATOMIC: its KMS publisher sets
+`Card::native_atomic`, so `SET_CLIENT_CAP(ATOMIC)` and `DRM_IOCTL_MODE_ATOMIC`
+(previously VirtGPU-only) run the bridge's native atomic path, as Linux
+amdgpu always offers atomic; CURSOR_PLANE_HOTSPOT stays VirtGPU-only.
+Navi22's native card still uses legacy KMS.
 An atomic MODE_ID blob is held to the same gate (`accepts_mode_blob`, at
 check time, so TEST_ONLY probes see it). Cards without native outputs are
 unaffected. A DRM client switching the CRTC off (SETCRTC without a

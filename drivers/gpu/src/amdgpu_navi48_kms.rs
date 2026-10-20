@@ -320,6 +320,9 @@ pub fn apply_routed_vrr(
     card.vblank_source = Some(crate::amdgpu_navi48_platform::crtc_vblank);
     card.plane_formats = Some(&PLANE_FORMATS);
     card.native = native;
+    // amdgpu is DRIVER_ATOMIC: the bridge's native atomic path validates
+    // MODE_ID/format/route against this owner and commits through it.
+    card.native_atomic = true;
 }
 
 /// The connector index behind a native connector id.

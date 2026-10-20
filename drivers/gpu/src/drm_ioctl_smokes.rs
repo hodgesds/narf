@@ -332,6 +332,54 @@ kernel_test_in!(
     smoke_drm_ioctl_getresources_populates_crtc_ids
 );
 
+// ── SET_CLIENT_CAP(ATOMIC) on a native-atomic card ─────────────────────
+//
+// A native display backend that published itself DRIVER_ATOMIC (Navi48)
+// takes the ATOMIC client cap and an empty atomic commit, as Linux amdgpu
+// does; CURSOR_PLANE_HOTSPOT stays VirtGPU-only (EOPNOTSUPP).
+fn smoke_drm_ioctl_native_atomic_card_takes_atomic() -> TestResult {
+    let name = format!("card{}", crate::drm_registry::count());
+    let card = Arc::new(BochsCard::new(name));
+    let mut state = make_test_card();
+    state.native_atomic = true;
+    let idx = crate::drm_registry::register_drm_card_with_state(card, state);
+    if let Some(ms) = crate::drm_registry::mode_state(idx) {
+        ms.lock().master_open(SMOKE_MASTER_ID);
+    }
+    let cap = |capability: u64| {
+        let mut c = [0u8; 16];
+        c[0..8].copy_from_slice(&capability.to_le_bytes());
+        c[8..16].copy_from_slice(&1u64.to_le_bytes());
+        dispatch_card(
+            idx,
+            DRM_IOCTL_SET_CLIENT_CAP,
+            c.as_mut_ptr() as usize,
+            false,
+        )
+    };
+    if cap(3) != Ok(0) {
+        return TestResult::Fail("native-atomic card refused SET_CLIENT_CAP(ATOMIC)");
+    }
+    if cap(6) != Err(FsError::Unsupported) {
+        return TestResult::Fail("CURSOR_PLANE_HOTSPOT should stay VirtGPU-only");
+    }
+    let mut req = DrmModeAtomicUapi::default();
+    if dispatch_card(
+        idx,
+        DRM_IOCTL_MODE_ATOMIC,
+        &mut req as *mut _ as usize,
+        false,
+    ) != Ok(0)
+    {
+        return TestResult::Fail("empty atomic commit on a native-atomic card");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_ioctl_native_atomic_card_takes_atomic
+);
+
 // ── SET_CLIENT_CAP: universal planes accepted, atomic rejected ─────────
 //
 // weston's drm-backend REQUIRES DRM_CLIENT_CAP_UNIVERSAL_PLANES (it

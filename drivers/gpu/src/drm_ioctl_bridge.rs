@@ -2875,7 +2875,7 @@ fn handle_set_client_cap(
             }
         }
         DRM_CLIENT_CAP_ATOMIC => {
-            if mode_state.lock().driver_name != "virtio_gpu" {
+            if !atomic_card(&mode_state.lock()) {
                 // Linux returns EOPNOTSUPP when DRIVER_ATOMIC is absent.
                 return Err(FsError::Unsupported);
             }
@@ -3781,6 +3781,12 @@ pub(crate) fn wait_atomic_in_fences(arg: u64, context: &dyn IoctlContext) -> Res
     Ok(())
 }
 
+/// DRIVER_ATOMIC: VirtGPU, or a native display backend that published
+/// itself as atomic (Navi48). Navi22's native card still takes legacy KMS.
+fn atomic_card(card: &crate::drm::card::Card) -> bool {
+    card.driver_name == "virtio_gpu" || card.native_atomic
+}
+
 /// DRM_IOCTL_MODE_ATOMIC — decode objs/props/values arrays, build
 /// `AtomicState`, run `core_check` + `core_commit`.
 ///
@@ -3813,7 +3819,7 @@ fn handle_atomic(
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DrmModeAtomicUapi) };
 
-    if mode_state.lock().driver_name != "virtio_gpu" {
+    if !atomic_card(&mode_state.lock()) {
         return Err(FsError::Unsupported);
     }
     const PAGE_FLIP_EVENT: u32 = 0x0001;
