@@ -464,7 +464,7 @@ fn cmdline(subvol: &str, mode: &str) -> String {
 }
 
 /// `(subvolume id, name)` from `btrfs inspect-internal dump-tree -t root`.
-fn subvol_ids(part: &Path) -> Result<Vec<(u64, String)>> {
+pub(crate) fn subvol_ids(part: &Path) -> Result<Vec<(u64, String)>> {
     let text = run(
         Command::new("btrfs")
             .args(["inspect-internal", "dump-tree", "-t", "root"])

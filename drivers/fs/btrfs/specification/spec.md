@@ -123,6 +123,25 @@ every flush) with volatile writes dropped or torn, and each crashed image
 must pass `btrfs check` and remount with exactly a committed state. The
 `regress-*` scenarios are minimal reproductions of bugs it found.
 
+`cargo xtask btrfs-cycles [--cycles 50] [--seed N] [--jobs N]` runs the
+in-kernel driver through many mount lifetimes in one boot per guest
+(`src/cycles.rs`, entered as `narf.rootrw_interop=cycles`). The host builds a
+CachyOS-shaped root (16 KiB nodes, crc32c, block-group + free-space tree,
+`--compress zstd:1`, default `@` plus `@home`, `--rootdir` seeds) in a GPT
+partition on NVMe with 512-byte LBAs and boots it under `narf.disks=root-rw`
+(designated root, root-rw `rw_gate` profile). The guest detaches `/`, then
+per cycle mounts `@` and `@home` through the `mount -t btrfs` constructor,
+verifies every file and directory of all earlier cycles against a model,
+runs a seeded workload (create inline/medium/multi-MiB files, overwrite,
+append, truncate up/down, punch, fallocate, rename over, hard links,
+mkdir/rmdir, fsync, write+fsync+rename replace), syncs, and drops every
+reference: the shared core must be gone before the next mount reads the
+volume back from disk. After the last cycle the host runs `btrfs check
+--check-data-csum` and `btrfs restore` on every image and compares the
+result with the manifest the guest printed. `--jobs` guests (direct
+`-kernel` boot, `-smp 1`, 1 GiB each, own image copy, seed + job index) run
+in parallel; the default run finishes in well under three minutes.
+
 ## 5. Architecture notes
 
 The registration interface is shared by x86_64 and aarch64. Volume construction
