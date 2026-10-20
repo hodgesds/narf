@@ -675,3 +675,65 @@ kernel_test_in!(
     "drivers/gpu/navi48-kms",
     navi48_kms_publishes_vrr_properties
 );
+
+/// amdgpu_dm's "max bpc" on the native card: a connector the platform
+/// marks gets it at drm_connector_attach_max_bpc_property's initial 16; a
+/// committed value survives republication; an unmarked connector, and
+/// `apply_routed` (Navi22, tests), attach none.
+fn navi48_kms_publishes_connector_max_bpc() -> TestResult {
+    let t = cea_1080p();
+    let edid = [0xa; 128];
+    let mut card = Card::new("amdgpu", "AMD GPU", (3, 0, 0));
+    let crtcs = [lit(&edid, &t, &[]), None, None, None];
+    let connectors = [
+        RoutedConnector {
+            index: 0,
+            kind: ConnectorType::DisplayPort,
+            edid: Some(&edid),
+            offered: &[],
+            crtc: Some(0),
+            possible_crtcs: 0xf,
+        },
+        RoutedConnector {
+            index: 1,
+            kind: ConnectorType::HdmiA,
+            edid: None,
+            offered: &[],
+            crtc: None,
+            possible_crtcs: 0xf,
+        },
+    ];
+    let props = |max_bpc: [bool; 2]| {
+        max_bpc.map(|max_bpc| ConnectorProps {
+            vrr_capable: false,
+            color: true,
+            max_bpc,
+        })
+    };
+    let max_bpc =
+        |card: &Card, n: usize| card.native_output(connector_id(n)).and_then(|o| o.max_bpc);
+    apply_routed_native(&mut card, &crtcs, &connectors, &props([true, false]));
+    if max_bpc(&card, 0) != Some(16) || max_bpc(&card, 1).is_some() {
+        return TestResult::Fail("initial max bpc");
+    }
+    if let Some(n) = card
+        .native
+        .iter_mut()
+        .find(|n| n.connector == connector_id(0))
+    {
+        n.max_bpc = Some(10);
+    }
+    apply_routed_native(&mut card, &crtcs, &connectors, &props([true, true]));
+    if max_bpc(&card, 0) != Some(10) || max_bpc(&card, 1) != Some(16) {
+        return TestResult::Fail("republished max bpc");
+    }
+    apply_routed(&mut card, &crtcs, &connectors);
+    if max_bpc(&card, 0).is_some() {
+        return TestResult::Fail("attached without amdgpu_dm properties");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-kms",
+    navi48_kms_publishes_connector_max_bpc
+);

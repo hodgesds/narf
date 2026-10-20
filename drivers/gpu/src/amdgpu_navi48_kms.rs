@@ -317,6 +317,7 @@ pub fn apply_routed_vrr(
             vrr_capable: vrr_capable.map(|v| v.get(n).copied().unwrap_or(false)),
             colorspace: None,
             hdr_output_metadata: None,
+            max_bpc: None,
         });
     }
     // The CRTCs' vblanks are the displays' hardware ones, and their planes
@@ -386,25 +387,31 @@ pub struct ConnectorProps {
     /// its HDMI and DP connectors (drm_mode_create_{hdmi,dp}_colorspace_property
     /// with the same supported set, drm_connector_attach_hdr_output_metadata_property).
     pub color: bool,
+    /// "max bpc", which amdgpu_dm attaches to every connector, MST end
+    /// devices included (drm_connector_attach_max_bpc_property(connector,
+    /// 8, 16), starting at 16).
+    pub max_bpc: bool,
 }
 
 /// `apply_routed_vrr` with every native property amdgpu_dm attaches on
 /// DCN 4.0.1: the VRR pair, each connector's "Colorspace" and
-/// "HDR_OUTPUT_METADATA" where `props[n].color`, and every CRTC's CTM,
+/// "HDR_OUTPUT_METADATA" where `props[n].color` and "max bpc" where
+/// `props[n].max_bpc`, and every CRTC's CTM,
 /// GAMMA_LUT and GAMMA_LUT_SIZE (`drm_crtc_enable_color_mgmt(crtc, 0,
 /// true, 4096)`: no degamma on 4.0.1) with the legacy 256-entry gamma.
 /// Committed values survive republication: a connector keeps its
-/// Colorspace and HDR blob, a CRTC its CTM, GAMMA_LUT and gamma store.
+/// Colorspace, HDR blob and max bpc, a CRTC its CTM, GAMMA_LUT and gamma
+/// store.
 pub fn apply_routed_native(
     card: &mut Card,
     crtcs: &[Option<Sink>],
     connectors: &[RoutedConnector],
     props: &[ConnectorProps],
 ) {
-    let previous: alloc::vec::Vec<(u32, Option<u32>, Option<u32>)> = card
+    let previous: alloc::vec::Vec<(u32, Option<u32>, Option<u32>, Option<u8>)> = card
         .native
         .iter()
-        .map(|n| (n.connector, n.colorspace, n.hdr_output_metadata))
+        .map(|n| (n.connector, n.colorspace, n.hdr_output_metadata, n.max_bpc))
         .collect();
     let vrr: alloc::vec::Vec<bool> = props.iter().map(|p| p.vrr_capable).collect();
     apply_routed_vrr(card, crtcs, connectors, Some(&vrr));
@@ -415,6 +422,10 @@ pub fn apply_routed_native(
         if let Some(native) = card.native.iter_mut().find(|x| x.connector == id) {
             native.colorspace = attach.then(|| kept.and_then(|p| p.1).unwrap_or(0));
             native.hdr_output_metadata = attach.then(|| kept.and_then(|p| p.2).unwrap_or(0));
+            native.max_bpc = props.get(n).is_some_and(|p| p.max_bpc).then(|| {
+                kept.and_then(|p| p.3)
+                    .unwrap_or(crate::amdgpu_navi48_boot::MAX_REQUESTED_BPC)
+            });
         }
     }
     let crtcs = &crtcs[..crtcs.len().min(MAX_OUTPUTS)];

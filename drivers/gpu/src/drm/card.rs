@@ -899,6 +899,9 @@ pub struct NativeOutput {
     /// The connector's "HDR_OUTPUT_METADATA" blob id (0 for none), when it
     /// has the property (drm_connector_attach_hdr_output_metadata_property).
     pub hdr_output_metadata: Option<u32>,
+    /// The connector's "max bpc" (max_requested_bpc, 8..=16), when it has
+    /// the property (drm_connector_attach_max_bpc_property).
+    pub max_bpc: Option<u8>,
 }
 
 /// System-wide vblank "slack" offset in nanoseconds. A flip-complete event is

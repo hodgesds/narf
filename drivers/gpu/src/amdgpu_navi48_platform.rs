@@ -2446,6 +2446,8 @@ struct ConnectorState {
     colorspace: u32,
     /// DRM's HDR_OUTPUT_METADATA blob, kept with the connector.
     hdr: Option<Vec<u8>>,
+    /// DRM's "max bpc" (max_requested_bpc), kept with the connector.
+    max_bpc: u8,
 }
 impl ConnectorState {
     fn new(target: Target, kind: ConnectorType, index: usize) -> Self {
@@ -2462,6 +2464,15 @@ impl ConnectorState {
             vrr_capable: false,
             colorspace: 0,
             hdr: None,
+            max_bpc: crate::amdgpu_navi48_boot::MAX_REQUESTED_BPC,
+        }
+    }
+    /// The modeset's key for this connector's depth cap: its board port
+    /// and, for an MST end device, its slot.
+    fn requested_key(&self) -> (usize, Option<u8>) {
+        match self.target {
+            Target::Board(port) => (port, None),
+            Target::Mst(port, slot) => (port, Some(slot)),
         }
     }
     /// A board sink's discovery; true when its EDID changed.
@@ -2548,6 +2559,10 @@ struct CrtcState {
     /// What the lit stream can signal: HDR packets and non-default
     /// colorimetry. Every native transport now sends both.
     color_signals: (bool, bool),
+    /// The routed connector's "max bpc" when this CRTC was last lit: a
+    /// change is a modeset (drm_atomic_helper_check_modeset sets
+    /// connectors_changed when max_requested_bpc differs).
+    lit_bpc: Option<u8>,
 }
 impl CrtcState {
     const fn new() -> Self {
@@ -2564,6 +2579,7 @@ impl CrtcState {
             vrr: false,
             color: None,
             color_signals: (true, true),
+            lit_bpc: None,
         }
     }
     fn retrained(&mut self, edid: [u8; 128], timing: Timing, offered: Vec<Timing>) {
@@ -2628,6 +2644,7 @@ impl Outputs {
                             vrr_capable: c.vrr_capable,
                             colorspace: c.colorspace,
                             hdr: c.hdr.clone(),
+                            max_bpc: c.max_bpc,
                         },
                     )
             })
@@ -2762,6 +2779,24 @@ impl Outputs {
             .find(|c| c.index == n)
             .map(|c| c.target)
     }
+    /// Hand every connector's "max bpc" to the next selection
+    /// (`set_requested_bpc`, the per-connector depth cap) and record it as
+    /// lit on the CRTCs `lighting` names.
+    fn stage_requested_bpc(&mut self, lighting: impl Fn(usize) -> bool) {
+        for c in &self.connectors {
+            let (port, slot) = c.requested_key();
+            crate::amdgpu_navi48_boot::set_requested_bpc(port, slot, c.max_bpc);
+        }
+        for k in (0..4).filter(|&k| lighting(k)) {
+            self.crtcs[k].lit_bpc = self.routed(k).map(|c| c.max_bpc);
+        }
+    }
+    /// Whether CRTC k's connector asks another "max bpc" than it was lit
+    /// with: a modeset.
+    fn max_bpc_changed(&self, k: usize) -> bool {
+        let lit = self.crtcs[k].lit_bpc;
+        lit.is_some() && self.routed(k).map(|c| c.max_bpc) != lit
+    }
     /// The MST root port, while its branch's connectors exist.
     fn mst_port(&self) -> Option<usize> {
         self.connectors.iter().find_map(|c| match c.target {
@@ -2835,6 +2870,7 @@ fn publish_outputs() {
         vrr_capable: bool,
         color: bool,
         present: bool,
+        max_bpc: bool,
     }
     // Serializes publishers so an older snapshot never lands after a newer
     // one. Taken before OUTPUTS and never by the card-lock holders.
@@ -2861,6 +2897,7 @@ fn publish_outputs() {
                 vrr_capable: c.present && c.vrr_capable,
                 color: color_connector(c.target),
                 present: c.present,
+                max_bpc: max_bpc_connector(c.target),
             })
             .collect();
         let inactive: Vec<usize> = (0..4)
@@ -2895,6 +2932,7 @@ fn publish_outputs() {
         .map(|c| crate::amdgpu_navi48_kms::ConnectorProps {
             vrr_capable: c.vrr_capable,
             color: c.color,
+            max_bpc: c.max_bpc,
         })
         .collect();
     crate::amdgpu_navi48_kms::publish_routed_native(&crtcs, &connectors, &props);
@@ -3202,11 +3240,13 @@ async unsafe fn light_displays(
             c.route.filter(|_| c.active)
         });
         let wants: [Option<Timing>; 4] = core::array::from_fn(|k| outputs.crtcs[k].requested);
-        // ... and its connector's Colorspace and HDR metadata.
+        // ... and its connector's Colorspace and HDR metadata, and every
+        // connector's "max bpc".
         for k in 0..4 {
             let (colorspace, hdr) = connector_color(&outputs, k);
             crate::amdgpu_navi48_boot::set_output_color(k as u8, colorspace, hdr);
         }
+        outputs.stage_requested_bpc(|k| routes[k].is_some());
         // Display k lights on pipe k with its CRTC's plane format and planes.
         for (k, c) in outputs.crtcs.iter_mut().enumerate() {
             crate::amdgpu_navi48_boot::set_plane_format(k as u8, c.format);
@@ -4379,6 +4419,13 @@ fn color_connector(target: Target) -> bool {
     matches!(target, Target::Board(_) | Target::Mst(..))
 }
 
+/// The connectors amdgpu_dm gives "max bpc" (8..16): every board connector
+/// (amdgpu_dm_connector_init_helper) and every MST end device's
+/// (dm_dp_add_mst_connector attaches the root's property).
+fn max_bpc_connector(target: Target) -> bool {
+    matches!(target, Target::Board(_) | Target::Mst(..))
+}
+
 /// Record DRM's "Colorspace" and HDR_OUTPUT_METADATA for connector
 /// `request.connector`. A new Colorspace, or metadata appearing or
 /// disappearing, relights the display driving it (the display monitor
@@ -4413,6 +4460,24 @@ pub fn request_connector_color(request: crate::amdgpu_native_kms::ConnectorColor
         }
     }
     kick_stream_updater();
+}
+
+/// Record DRM's "max bpc" for connector `connector` (a KMS id): the depth
+/// cap of its next selection. A display it drives lights again with it
+/// (the display monitor compares it with what it lit, as DRM makes a new
+/// max_requested_bpc a modeset).
+pub fn request_connector_max_bpc(connector: u32, bpc: u8) {
+    let Some(index) = crate::amdgpu_navi48_kms::connector_index(connector) else {
+        return;
+    };
+    if let Some(c) = OUTPUTS
+        .lock()
+        .connectors
+        .iter_mut()
+        .find(|c| c.index == index)
+    {
+        c.max_bpc = bpc;
+    }
 }
 
 /// Display `k`'s connector's Colorspace and HDR metadata (Default and none
@@ -5130,6 +5195,11 @@ pub async unsafe fn monitor_displays(
             (colorspace, hdr.is_some())
         })
     };
+    // So is a new "max bpc" (connectors_changed).
+    let bpc_changed: [bool; 4] = {
+        let outputs = OUTPUTS.lock();
+        core::array::from_fn(|k| outputs.max_bpc_changed(k))
+    };
     let limited =
         crate::amdgpu_navi48_boot::limited_range(crate::amdgpu_navi48_boot::broadcast_rgb());
     let pending_mask = (0..4u8)
@@ -5204,6 +5274,7 @@ pub async unsafe fn monitor_displays(
             || desired.is_some_and(|d| d != m.selection.timing)
             || limited != m.selection.limited
             || colors[usize::from(k)] != (m.selection.colorspace, m.selection.hdr.is_some())
+            || bpc_changed[usize::from(k)]
         {
             relight = true;
             continue;
@@ -6027,6 +6098,56 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/navi48-kms",
         navi48_connector_color_follows_the_route
+    );
+
+    /// DRM's "max bpc" stays with its connector (board or MST end device,
+    /// 16 until set, kept across reshaping); a lighting hands every
+    /// connector's to the selection (`set_requested_bpc`) and records the
+    /// routed one's on the CRTCs it lights, and a later change is a modeset
+    /// of the display driving that connector only.
+    fn navi48_connector_max_bpc_relights_its_display() -> TestResult {
+        let (sst, mst) = (Target::Board(0), Target::Mst(1, 2));
+        let mst_shape = (mst, ConnectorType::DisplayPort, MST_INDEX + 2);
+        let mut o = Outputs::new();
+        o.reshape(&[board(0), mst_shape]);
+        if o.connectors.iter().any(|c| c.max_bpc != 16) {
+            return TestResult::Fail("initial max bpc");
+        }
+        o.crtcs[0].route = Some(sst);
+        o.crtcs[1].route = Some(mst);
+        o.connector_mut(mst).unwrap().max_bpc = 10;
+        o.stage_requested_bpc(|k| k == 0);
+        let staged = (
+            boot::requested_bpc(0, None),
+            boot::requested_bpc(1, Some(2)),
+            o.crtcs[0].lit_bpc,
+            o.crtcs[1].lit_bpc,
+        );
+        // Unlit and unrouted CRTCs compare nothing.
+        let unlit = (0..4).any(|k| o.max_bpc_changed(k));
+        o.connector_mut(sst).unwrap().max_bpc = 12;
+        o.reshape(&[board(0), board(1), mst_shape]);
+        let kept = o.connector(sst).map(|c| c.max_bpc) == Some(12)
+            && o.connector(mst).map(|c| c.max_bpc) == Some(10);
+        let changed = o.max_bpc_changed(0) && !o.max_bpc_changed(1);
+        o.stage_requested_bpc(|k| k < 2);
+        let settled = !o.max_bpc_changed(0)
+            && !o.max_bpc_changed(1)
+            && boot::requested_bpc(0, None) == 12
+            && o.crtcs[1].lit_bpc == Some(10);
+        boot::set_requested_bpc(0, None, 16);
+        boot::set_requested_bpc(1, Some(2), 16);
+        if staged != (16, 10, Some(16), None) || unlit {
+            return TestResult::Fail("staged max bpc");
+        }
+        if !kept || !changed || !settled {
+            return TestResult::Fail("max bpc change");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi48-kms",
+        navi48_connector_max_bpc_relights_its_display
     );
 
     /// A board sink's FreeSync capability follows its discovery (published
@@ -7087,6 +7208,7 @@ async unsafe fn light_beside(
             crate::amdgpu_navi48_boot::set_plane_format(k as u8, c.format);
             crate::amdgpu_navi48_boot::set_plane_setup(k as u8, c.planes);
         }
+        outputs.stage_requested_bpc(|k| routes[k].is_some());
         (routes, wants)
     };
     if routes.iter().all(|r| !matches!(r, Some(Target::Board(_)))) {

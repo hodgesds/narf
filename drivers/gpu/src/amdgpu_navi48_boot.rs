@@ -3655,15 +3655,16 @@ mod modeset;
 #[path = "amdgpu_navi48_teardown.rs"]
 mod teardown;
 pub use modeset::{
-    broadcast_rgb, display_pipes, edid_timings, frl_audio, frl_cap, frl_carries, frl_dsc,
-    frl_dsc_caps, frl_dsc_carries, frl_dsc_link, frl_enabled, frl_link, frl_video_params, hdmi_avi,
-    hdmi_caps, hdmi_stream, limited_range, max_bpc, mpc_pipes, odm_pipes, output_color,
+    broadcast_rgb, connector_max_bpc, display_pipes, edid_timings, frl_audio, frl_cap, frl_carries,
+    frl_dsc, frl_dsc_caps, frl_dsc_carries, frl_dsc_link, frl_enabled, frl_link, frl_video_params,
+    hdmi_avi, hdmi_caps, hdmi_stream, limited_range, max_bpc, mpc_pipes, odm_pipes, output_color,
     overlay_pipes, plan_pipes, plane_format, plane_mode, plane_requests, plane_setup,
-    selection_mode, set_broadcast_rgb, set_frl, set_max_bpc, set_output_color, set_plane_format,
-    set_plane_setup, sink_audio_info, stream_planes, with_planes, Configuration, DisplayPipes,
-    FrlDscStream, FrlRate, HdmiCaps, HdmiStream, Health, InheritedRetired, Modeset, ModesetError,
-    MstRoute, MstStream, OverlayPlane, PlaneGeometry, PlanePipes, PlaneSetup, PlanesChange,
-    Selection, SstOutput, BROADCAST_RGB_AUTO, BROADCAST_RGB_FULL, BROADCAST_RGB_LIMITED,
+    requested_bpc, selection_mode, set_broadcast_rgb, set_frl, set_max_bpc, set_output_color,
+    set_plane_format, set_plane_setup, set_requested_bpc, sink_audio_info, stream_planes,
+    with_planes, Configuration, DisplayPipes, FrlDscStream, FrlRate, HdmiCaps, HdmiStream, Health,
+    InheritedRetired, Modeset, ModesetError, MstRoute, MstStream, OverlayPlane, PlaneGeometry,
+    PlanePipes, PlaneSetup, PlanesChange, Selection, SstOutput, BROADCAST_RGB_AUTO,
+    BROADCAST_RGB_FULL, BROADCAST_RGB_LIMITED, MAX_REQUESTED_BPC, MIN_REQUESTED_BPC,
 };
 pub use teardown::{TeardownStatus, TeardownStep};
 #[cfg(feature = "kernel-test")]

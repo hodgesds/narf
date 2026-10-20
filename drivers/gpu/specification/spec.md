@@ -1355,9 +1355,10 @@ DRM does, the VSDB Max_TMDS_Clock and the HF-VSDB or HF-SCDB (extended tag
 lengths, and the VSDB DC_30bit/DC_36bit deep-colour flags. `hdmi_depth` picks
 the deepest declared depth up to `max_bpc()` whose character clock fits,
 stepping down 2 bpc like amdgpu_dm's stream validation; `max_bpc` defaults to
-8 (amdgpu_dm's `max_requested_bpc`) and the `amdgpu.max_bpc=10|12` boot option
-raises it. The blank is staged at that depth. A character clock fits at or
-below 340 MHz within any declared VSDB maximum, and
+8 and the `amdgpu.max_bpc=10|12` boot option raises it. Within it each
+connector's "max bpc" (`requested_bpc`, see "Navi 48 connector max bpc")
+caps that connector's stream, on HDMI and DP alike. The blank is staged at
+that depth. A character clock fits at or below 340 MHz within any declared VSDB maximum, and
 above it (to `TMDS_MAX_KHZ`, 600 MHz) only with SCDC and an HF rate covering
 it. Before the link starts an SCDC sink is configured as Linux's
 `write_scdc_data` does: sink version read, source version 1 written when the
@@ -3937,13 +3938,54 @@ register contract against dcn_4_1_0. DP SST output depth follows amdgpu_dm:
 min(the EDID 1.4 color bit depth, 8 when undefined, `max_bpc` rounded to
 even), stepping down by two until a link carries the uncompressed stream
 (`modeset::dp_depths`, `dp_link_bpc`); training candidates and the UHBR
-audio budget use it. With the default `amdgpu.max_bpc` (8, NARF's
-max_requested_bpc) DP stays 8 bpc. Gaps: DSC streams compress 8-bpc input
-(Linux would compress a 10-bpc stream before dropping to 8 bpc), MST
-streams stay 8 bpc, no per-connector "max bpc" property, plane color
-pipelines and AMD private properties. Model-tested only (`dcn-color`,
+audio budget use it. With the default `amdgpu.max_bpc` (8, a NARF ceiling
+over each connector's "max bpc") DP stays 8 bpc. Gaps: MST streams on a link
+without a DSC decoder stay 8 bpc, plane color pipelines and AMD private
+properties. Model-tested only (`dcn-color`,
 `hdr`, `dcn401-color`, `dcn401-scanout`, `dcn401-otg`, `dcn401-frl-link`,
 `dcn401-mpc`, `navi48-modeset`, `navi48-kms`, `drm_ioctl`); not validated
+on hardware.
+
+### Navi 48 connector max bpc
+
+Every Navi 48 KMS connector, board HDMI and DP and every MST end device,
+carries "max bpc": amdgpu_dm_connector_init_helper's (and
+dm_dp_add_mst_connector's) drm_connector_attach_max_bpc_property(connector,
+8, 16), a RANGE 8..16 property (`MAX_BPC_PROP_ID`, 0x80) whose value is the
+connector state's max_requested_bpc, 16 when the connector is created.
+`NativeOutput::max_bpc` holds it (None: no property; Navi 22's and the
+test cards' connectors keep their lists), `ConnectorProps::max_bpc`
+attaches it in `amdgpu_navi48_kms::apply_routed_native`, and a committed
+value survives republication. GETCONNECTOR and OBJ_GETPROPERTIES list it
+after "Broadcast RGB" and before "Colorspace"; GETPROPERTY reports the
+range. A value outside 8..16, or a connector without the property, is
+EINVAL (drm_property_change_valid_get). A changed value on a connector with
+a CRTC is a modeset of that CRTC (drm_atomic_helper_check_modeset sets
+connectors_changed when max_requested_bpc differs): an atomic commit needs
+ALLOW_MODESET (TEST_ONLY checks it too), while OBJ_SETPROPERTY and the
+legacy SETPROPERTY commit it as set_property_atomic does, whose commit
+allows modesets (drm_atomic_commit_init). After the card lock is released,
+`amdgpu_native_kms::request_connector_max_bpc(connector, bpc)` records it on
+the platform connector (`amdgpu_navi48_platform::request_connector_max_bpc`),
+which a lighting hands to the selection
+(`amdgpu_navi48_boot::set_requested_bpc(port, mst_slot, bpc)`, one entry per
+board port and MST slot, `requested_bpc` reads it) and records per CRTC;
+the display monitor relights a display whose connector's value changed
+since it lit.
+
+Selection caps each stream with `connector_max_bpc(port, mst_slot)`: the
+connector's max_requested_bpc within `amdgpu.max_bpc` (a NARF ceiling,
+default 8; Linux has no such parameter, and with `amdgpu.max_bpc=12` the
+property alone decides, the native encoders taking at most 12 bpc). It is
+the requested bpc of amdgpu_dm_create_validate_stream_for_sink's bpc mask
+and of convert_color_depth_from_display_info (rounded down to even): DP SST
+and HDMI (`select_all`, which applies each port's own value, offered and
+retrained modes) and MST DSC (`MstDscContext::max_bpc`, now a per-end-device
+function). Deviations: an MST link without a DSC
+decoder keeps 8-bpc streams; offered modes of a dark connector
+follow a new value at the next lighting; the property is per connector but
+"Broadcast RGB" stays one setting for the card. Model-tested only
+(`drm_ioctl`, `navi48-kms`, `navi48-modeset`, `navi48-mst`); not validated
 on hardware.
 
 ### Navi 48 plane scaling and overlay planes

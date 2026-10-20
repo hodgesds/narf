@@ -393,11 +393,12 @@ fn navi48_mst_dsc_streams_take_the_deepest_depth() -> TestResult {
             branch_oui: 0,
         };
         let dsc_of = |s: Sink| (s == ROOT_SINK).then_some(mst);
+        let max_bpc = |_: Sink| max_bpc;
         let ctx = MstDscContext {
             topology: &topology,
             dsc_of: &dsc_of,
             max_dispclk_khz: 2_000_000,
-            max_bpc,
+            max_bpc: &max_bpc,
         };
         super::super::select_mst_dsc(0, caps, &devices, &|_| None, &budget, &ctx)
     };

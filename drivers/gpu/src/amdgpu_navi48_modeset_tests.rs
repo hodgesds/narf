@@ -3639,6 +3639,100 @@ kernel_test_in!(
     navi48_modeset_dp_deep_color_like_amdgpu_dm
 );
 
+/// A connector's "max bpc" (max_requested_bpc) caps its own stream as
+/// amdgpu_dm_create_validate_stream_for_sink's bpc mask does, within
+/// `amdgpu.max_bpc`: on 4 x HBR3, a 10-bpc sink lights at 10 bpc when its
+/// connector asks for 10 (or 16), at 8 when it asks for 8 or 9; a 12-bpc
+/// sink's 10 asks it down to 10 and 11 rounds down to 10; another port's
+/// connector is unaffected; with 16 the stream still steps down to what
+/// the link carries (1080p60 at 12 bpc, 5,346,000 kbps, does not fit 1 x
+/// HBR2's 4,320,000 kbps, nor does 10 bpc, 4,455,000: 8 bpc). HDMI takes
+/// the same cap.
+fn navi48_modeset_connector_max_bpc_caps_its_stream() -> TestResult {
+    use otg::ColorDepth::{Bpc10, Bpc12, Bpc8};
+    let with_bpc = |code: u8| {
+        let mut e = edid_1080p();
+        e[20] = 0x80 | code << 4 | 5;
+        e[127] = narf_edid::compute_checksum(&e);
+        e
+    };
+    let before = max_bpc();
+    set_max_bpc(12);
+    let paths = [
+        path(inventory::Connector::DisplayPort, 0),
+        path(inventory::Connector::DisplayPort, 1),
+        path(inventory::Connector::HdmiTypeA, 2),
+    ];
+    let pick = |n: usize, edid: Vec<u8>, rate: u8, lanes: u8, requested: u8| {
+        set_requested_bpc(n, None, requested);
+        let ports = [port(paths[n], dpcd(rate, lanes), edid)];
+        let s = select_all(&paths, &ports, max_bpc(), &|_| None).map(|s| s[0].depth);
+        set_requested_bpc(n, None, MAX_REQUESTED_BPC);
+        s.ok()
+    };
+    let got = [
+        pick(0, with_bpc(3), 0x1e, 4, 10),
+        pick(0, with_bpc(3), 0x1e, 4, 16),
+        pick(0, with_bpc(3), 0x1e, 4, 8),
+        pick(0, with_bpc(3), 0x1e, 4, 9),
+        pick(0, with_bpc(4), 0x1e, 4, 10),
+        pick(0, with_bpc(4), 0x1e, 4, 11),
+        pick(0, with_bpc(4), 0x1e, 4, 16),
+        pick(0, with_bpc(4), 0x14, 1, 16),
+    ];
+    // Port 1's connector asks for 8; port 0's stream does not see it.
+    set_requested_bpc(1, None, 8);
+    let ports = [
+        port(paths[0], dpcd(0x1e, 4), with_bpc(4)),
+        port(paths[1], dpcd(0x1e, 4), with_bpc(4)),
+    ];
+    let both = select_all(&paths, &ports, max_bpc(), &|_| None)
+        .map(|s| s.iter().map(|s| (s.port, s.depth)).collect::<Vec<_>>());
+    set_requested_bpc(1, None, MAX_REQUESTED_BPC);
+    // amdgpu.max_bpc still bounds every connector.
+    set_max_bpc(8);
+    let module = pick(0, with_bpc(4), 0x1e, 4, 16);
+    set_max_bpc(12);
+    // HDMI: 1080p60 RGB 12 bpc (222.75 MHz TMDS) unless its connector
+    // asks for less.
+    let hdmi = |requested: u8| {
+        set_requested_bpc(2, None, requested);
+        let ports = [port(paths[2], None, with_blocks(edid_1080p(), &[VSDB_DC]))];
+        let s = select_all(&paths, &ports, max_bpc(), &|_| None).map(|s| s[0].depth);
+        set_requested_bpc(2, None, MAX_REQUESTED_BPC);
+        s.ok()
+    };
+    let hdmi = [hdmi(16), hdmi(10), hdmi(8)];
+    set_max_bpc(before);
+    let want = [
+        Some(Bpc10),
+        Some(Bpc10),
+        Some(Bpc8),
+        Some(Bpc8),
+        Some(Bpc10),
+        Some(Bpc10),
+        Some(Bpc12),
+        Some(Bpc8),
+    ];
+    if got != want {
+        panic!("DP SST depths {got:?} want {want:?}");
+    }
+    if both.ok() != Some(alloc::vec![(0, Bpc12), (1, Bpc8)]) {
+        return TestResult::Fail("per-connector cap");
+    }
+    if module != Some(Bpc8) {
+        return TestResult::Fail("amdgpu.max_bpc bound");
+    }
+    if hdmi != [Some(Bpc12), Some(Bpc10), Some(Bpc8)] {
+        panic!("HDMI depths {hdmi:?}");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_connector_max_bpc_caps_its_stream
+);
+
 /// The pipes a running display's new planes take without a modeset
 /// (`planes::live_plane_pipes`): a new overlay takes the free pipe from
 /// the top, as resource_update_pipes_for_plane_with_slice_count does; an

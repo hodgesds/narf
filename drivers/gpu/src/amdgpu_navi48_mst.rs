@@ -105,6 +105,17 @@ pub struct MstLink {
 }
 
 impl MstLink {
+    /// End device `sink`'s depth cap on board port `port`: its connector's
+    /// "max bpc" (the KMS slot it holds in `outputs`) within
+    /// `amdgpu.max_bpc` (`modeset::connector_max_bpc`).
+    pub(super) fn max_bpc(&self, port: usize, sink: dp_mst_mgr::Sink) -> u8 {
+        self.outputs
+            .iter()
+            .position(|o| o.as_ref().is_some_and(|o| o.sink == Some(sink)))
+            .map_or_else(modeset::max_bpc, |slot| {
+                modeset::connector_max_bpc(port, Some(slot as u8))
+            })
+    }
     /// Started payload work without a completion witness, including returned
     /// errors and dropped futures. No automatic replay/reset is provided.
     pub fn payload_change(&self) -> Option<MstPayloadChange> {
@@ -728,13 +739,15 @@ pub fn select_mst(
 }
 
 /// What MST DSC needs beyond the selection's inputs: the topology, each end
-/// device's decoder (`MstOutput::dsc`), the board's highest DISPCLK and the
-/// requested maximum depth (`amdgpu.max_bpc`, DRM's max_requested_bpc).
+/// device's decoder (`MstOutput::dsc`), the board's highest DISPCLK and
+/// each end device's requested maximum depth (its connector's
+/// max_requested_bpc within `amdgpu.max_bpc`,
+/// `modeset::connector_max_bpc`).
 pub struct MstDscContext<'a> {
     pub topology: &'a Topology,
     pub dsc_of: &'a dyn Fn(dp_mst_mgr::Sink) -> Option<MstDsc>,
     pub max_dispclk_khz: u32,
-    pub max_bpc: u8,
+    pub max_bpc: &'a dyn Fn(dp_mst_mgr::Sink) -> u8,
 }
 
 /// The payloads (end device and PBN) of `selected`.
@@ -795,7 +808,7 @@ fn mst_vc_rate_dsc(
 /// decoder, as amdgpu_dm admits them: each device (in topology order, at
 /// most `MAX_DISPLAYS`) at the timing `want(k)` asks, else its first EDID
 /// timing, at the deepest of its depths (`modeset::dp_depths` up to
-/// `ctx.max_bpc`, create_validate_stream_for_sink's loop) that
+/// `ctx.max_bpc(sink)`, create_validate_stream_for_sink's loop) that
 /// dm_dp_mst_is_port_support_mode accepts and with which
 /// compute_mst_dsc_configs_for_link finds a configuration for every stream
 /// so far; a device nothing fits stays dark. Every stream's PBN, slots and
@@ -838,7 +851,7 @@ fn select_mst_dsc(
         let decoder = (ctx.dsc_of)(*sink);
         let timings = modeset::edid_timings(edid);
         let wanted = want(k).filter(|w| timings.contains(w));
-        let depths = modeset::dp_depths(edid, ctx.max_bpc);
+        let depths = modeset::dp_depths(edid, (ctx.max_bpc)(*sink));
         let found = wanted
             .into_iter()
             .chain(timings.iter().copied())
@@ -1134,7 +1147,7 @@ pub(super) fn dark_mst_modes_with(
             |alloc: &[(dp_mst_mgr::Sink, u16)]| alloc.last().is_some_and(|a| a.1 <= available);
         // The deepest of the device's depths the port and the link's
         // fairness search take, as for a lit stream (`select_mst_dsc`).
-        let payload = modeset::dp_depths(edid, ctx.max_bpc)
+        let payload = modeset::dp_depths(edid, (ctx.max_bpc)(sink))
             .into_iter()
             .find_map(|depth| {
                 let bpc = modeset::depth_bpc(depth);
@@ -1316,13 +1329,14 @@ impl ColdBoot {
             .filter_map(|o| Some((o.sink?, o.dsc?)))
             .collect();
         let dsc_of = |sink| decoders.iter().find(|d| d.0 == sink).map(|d| d.1);
+        let max_bpc = |sink| link.max_bpc(port, sink);
         let ctx = MstDscContext {
             topology: &link.topology,
             dsc_of: &dsc_of,
             // As for SST DSC, before the board's levels are read;
             // `refine_dsc` checks the shapes against them.
             max_dispclk_khz: modeset::NOMINAL_DISPCLK_KHZ,
-            max_bpc: modeset::max_bpc(),
+            max_bpc: &max_bpc,
         };
         let mut selections = select_mst_outputs_with(
             port,
@@ -1383,11 +1397,23 @@ impl ColdBoot {
                 .filter_map(|o| Some((o.sink?, o.dsc?)))
                 .collect();
             let dsc_of = |sink| decoders.iter().find(|d| d.0 == sink).map(|d| d.1);
+            let caps_of: Vec<_> = link
+                .outputs
+                .iter()
+                .flatten()
+                .filter_map(|o| Some((o.sink?, link.max_bpc(port, o.sink?))))
+                .collect();
+            let max_bpc = |sink| {
+                caps_of
+                    .iter()
+                    .find(|c| c.0 == sink)
+                    .map_or_else(modeset::max_bpc, |c| c.1)
+            };
             let ctx = MstDscContext {
                 topology: &link.topology,
                 dsc_of: &dsc_of,
                 max_dispclk_khz: soc.dispclk_max_khz,
-                max_bpc: modeset::max_bpc(),
+                max_bpc: &max_bpc,
             };
             let mut modes = Vec::new();
             for output in link.outputs.iter().flatten() {

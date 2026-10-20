@@ -549,6 +549,7 @@ fn smoke_drm_ioctl_broadcast_rgb_property() -> TestResult {
         vrr_capable: None,
         colorspace: None,
         hdr_output_metadata: None,
+        max_bpc: None,
     });
     // GETPROPERTY: a settable enum with Linux's three names.
     let mut values = [0u64; 3];
@@ -761,6 +762,7 @@ fn smoke_drm_ioctl_vrr_properties() -> TestResult {
             vrr_capable: Some(true),
             colorspace: None,
             hdr_output_metadata: None,
+            max_bpc: None,
         });
         card.vrr_enabled = alloc::vec![(11, false), (12, false)];
     }
@@ -1075,6 +1077,7 @@ fn color_card() -> Option<u32> {
         vrr_capable: None,
         colorspace: Some(0),
         hdr_output_metadata: Some(0),
+        max_bpc: None,
     });
     Some(idx)
 }
@@ -1414,6 +1417,146 @@ kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_ioctl_connector_hdr_properties
 );
+
+/// Connector "max bpc" as drm_connector_attach_max_bpc_property(connector,
+/// 8, 16) gives it to every amdgpu_dm connector: a RANGE 8..16 property
+/// listed (GETCONNECTOR and OBJ_GETPROPERTIES) after Broadcast RGB and
+/// before Colorspace at its initial 16; values outside the range are
+/// EINVAL; a change on a driven connector is a modeset (atomic needs
+/// ALLOW_MODESET, drm_atomic_helper_check_modeset setting
+/// connectors_changed), which OBJ_SETPROPERTY and the legacy SETPROPERTY
+/// make as set_property_atomic does (drm_atomic_commit_init allows it);
+/// the same value, an undriven connector or TEST_ONLY change nothing else.
+fn smoke_drm_ioctl_connector_max_bpc() -> TestResult {
+    // GETPROPERTY: drm_property_create_range(dev, 0, "max bpc", 8, 16).
+    let idx = register_test_card();
+    if color_getprop(idx, 0x80) != Some((b"max bpc".to_vec(), 1 << 1, alloc::vec![8, 16], 0)) {
+        return TestResult::Fail("max bpc metadata");
+    }
+    // A connector that does not publish it lists and takes none.
+    if color_props(idx, 31, COLOR_CONNECTOR)
+        .iter()
+        .any(|&(p, _)| p == 0x80)
+        || color_obj_set(idx, 10, 0x80, 31, COLOR_CONNECTOR) != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("max bpc on a plain connector");
+    }
+    let Some(idx) = color_card() else {
+        return TestResult::Fail("no mode state");
+    };
+    let Some(ms) = crate::drm_registry::mode_state(idx) else {
+        return TestResult::Fail("no mode state");
+    };
+    if let Some(n) = ms.lock().native.first_mut() {
+        n.broadcast_rgb = Some(0);
+        n.max_bpc = Some(16);
+    }
+    let props = color_props(idx, 31, COLOR_CONNECTOR);
+    let at = |id: u32| props.iter().position(|&(p, _)| p == id);
+    if !props.contains(&(0x80, 16))
+        || !(at(0x61) < at(0x80) && at(0x80) < at(0x67))
+        || at(0x61).is_none()
+    {
+        return TestResult::Fail("max bpc listing");
+    }
+    // GETCONNECTOR lists the same properties and values.
+    let mut ids = [0u32; 16];
+    let mut vals = [0u64; 16];
+    let mut gc = [0u8; 80];
+    // struct drm_mode_get_connector: props_ptr@16, prop_values_ptr@24,
+    // count_props@36, connector_id@48.
+    gc[16..24].copy_from_slice(&(ids.as_mut_ptr() as u64).to_le_bytes());
+    gc[24..32].copy_from_slice(&(vals.as_mut_ptr() as u64).to_le_bytes());
+    gc[36..40].copy_from_slice(&16u32.to_le_bytes());
+    gc[48..52].copy_from_slice(&31u32.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xA7, 80),
+        gc.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+    {
+        return TestResult::Fail("GETCONNECTOR");
+    }
+    let count = u32::from_le_bytes(gc[36..40].try_into().unwrap()) as usize;
+    if !ids[..count.min(16)]
+        .iter()
+        .zip(&vals)
+        .any(|(&p, &v)| (p, v) == (0x80, 16))
+    {
+        return TestResult::Fail("GETCONNECTOR max bpc");
+    }
+    let atomic = |flags: u32, values: &[u64]| {
+        let objects = [31u32];
+        let counts = [values.len() as u32];
+        let props = [0x80u32; 2];
+        let mut req = DrmModeAtomicUapi {
+            flags,
+            count_objs: 1,
+            objs_ptr: objects.as_ptr() as u64,
+            count_props_ptr: counts.as_ptr() as u64,
+            props_ptr: props.as_ptr() as u64,
+            prop_values_ptr: values.as_ptr() as u64,
+            ..Default::default()
+        };
+        dispatch_card(
+            idx,
+            DRM_IOCTL_MODE_ATOMIC,
+            &mut req as *mut _ as usize,
+            false,
+        )
+    };
+    const TEST_ONLY: u32 = 0x100;
+    const ALLOW_MODESET: u32 = 0x400;
+    let value = || color_prop(idx, 31, COLOR_CONNECTOR, 0x80);
+    // The range: 8..=16 (drm_property_change_valid_get).
+    for bad in [0, 7, 17, 1 << 32] {
+        if atomic(ALLOW_MODESET, &[bad]) != Err(FsError::InvalidData)
+            || color_obj_set(idx, bad, 0x80, 31, COLOR_CONNECTOR) != Err(FsError::InvalidData)
+        {
+            return TestResult::Fail("max bpc range");
+        }
+    }
+    // Atomic: a modeset of the driven connector's CRTC; TEST_ONLY checks
+    // without committing; the same value is no modeset.
+    if atomic(0, &[10]) != Err(FsError::InvalidData)
+        || atomic(TEST_ONLY, &[10]) != Err(FsError::InvalidData)
+        || atomic(TEST_ONLY | ALLOW_MODESET, &[10]) != Ok(0)
+        || value() != Some(16)
+        || atomic(ALLOW_MODESET, &[10]) != Ok(0)
+        || value() != Some(10)
+        || atomic(0, &[10]) != Ok(0)
+        // The last of two values in one request wins.
+        || atomic(ALLOW_MODESET, &[12, 9]) != Ok(0)
+        || value() != Some(9)
+    {
+        return TestResult::Fail("atomic max bpc");
+    }
+    // OBJ_SETPROPERTY and SETPROPERTY commit with modesets allowed.
+    let mut b = [0u8; 16];
+    b[0..8].copy_from_slice(&8u64.to_le_bytes());
+    b[8..12].copy_from_slice(&0x80u32.to_le_bytes());
+    b[12..16].copy_from_slice(&31u32.to_le_bytes());
+    if color_obj_set(idx, 12, 0x80, 31, COLOR_CONNECTOR) != Ok(0)
+        || value() != Some(12)
+        || dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xAB, 16),
+            b.as_mut_ptr() as usize,
+            false,
+        ) != Ok(0)
+        || value() != Some(8)
+    {
+        return TestResult::Fail("legacy max bpc");
+    }
+    // An undriven connector: no modeset.
+    ms.lock().encoders[0].crtc_id = None;
+    if atomic(0, &[16]) != Ok(0) || value() != Some(16) {
+        return TestResult::Fail("undriven connector");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_connector_max_bpc);
 
 // ── 6. Render-node fd rejects SETCRTC with PermissionDenied ────────────
 

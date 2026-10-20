@@ -179,6 +179,12 @@ pub fn request_connector_color(request: ConnectorColorRequest) {
         crate::amdgpu_navi48_platform::request_connector_color(request)
     }
 }
+/// Connector "max bpc" (max_requested_bpc). Only Navi48 attaches it.
+pub fn request_connector_max_bpc(connector: u32, bpc: u8) {
+    if !navi22() {
+        crate::amdgpu_navi48_platform::request_connector_max_bpc(connector, bpc)
+    }
+}
 /// Whether connector `connector`'s stream can signal `colorspace` and, with
 /// `hdr`, HDR metadata (Navi48; Navi22 attaches neither property).
 pub fn connector_color_supported(connector: u32, colorspace: u32, hdr: bool) -> bool {

@@ -3007,6 +3007,11 @@ const COLORSPACE_ENUMS: [(u64, &[u8]); 5] = [
     (9, b"BT2020_RGB"),
     (10, b"BT2020_YCC"),
 ];
+/// The connector "max bpc" range (drm_connector_attach_max_bpc_property,
+/// which amdgpu_dm calls with 8..16 on every connector, MST end devices
+/// included).
+const MAX_BPC_PROP_ID: u32 = 0x80;
+const MAX_BPC_RANGE: [u64; 2] = [8, 16];
 /// `sizeof(struct hdr_output_metadata)`, the size
 /// drm_atomic_connector_set_property requires of an HDR_OUTPUT_METADATA blob.
 const HDR_OUTPUT_METADATA_SIZE: usize = 32;
@@ -3339,6 +3344,8 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
             [0, 1],
         )),
         CRTC_VRR_ENABLED_PROP_ID => Some((b"VRR_ENABLED".as_slice(), DRM_MODE_PROP_RANGE, [0, 1])),
+        // drm_property_create_range(dev, 0, "max bpc", 8, 16).
+        MAX_BPC_PROP_ID => Some((b"max bpc".as_slice(), DRM_MODE_PROP_RANGE, MAX_BPC_RANGE)),
         // drm_mode_create_standard_properties: plain blobs and an immutable
         // 0..UINT_MAX range.
         CRTC_CTM_PROP_ID => Some((b"CTM".as_slice(), DRM_MODE_PROP_BLOB, [0, 0])),
@@ -3460,7 +3467,8 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
 }
 
 /// A connector's properties and current values: the EDID blob, the atomic
-/// CRTC_ID, and "Broadcast RGB" and "vrr_capable" where the connector has them.
+/// CRTC_ID, and "Broadcast RGB", "max bpc", "Colorspace",
+/// "HDR_OUTPUT_METADATA" and "vrr_capable" where the connector has them.
 fn connector_properties(
     card: &crate::drm::card::Card,
     connector_id: u32,
@@ -3475,8 +3483,13 @@ fn connector_properties(
         props.push(BROADCAST_RGB_PROP_ID);
         values.push(u64::from(value));
     }
-    // amdgpu_dm_connector_init_helper attaches Colorspace and
-    // HDR_OUTPUT_METADATA before vrr_capable.
+    // amdgpu_dm_connector_init_helper attaches "max bpc" after
+    // Broadcast RGB, then Colorspace and HDR_OUTPUT_METADATA before
+    // vrr_capable.
+    if let Some(bpc) = card.native_output(connector_id).and_then(|n| n.max_bpc) {
+        props.push(MAX_BPC_PROP_ID);
+        values.push(u64::from(bpc));
+    }
     if let Some(value) = card.native_output(connector_id).and_then(|n| n.colorspace) {
         props.push(COLORSPACE_PROP_ID);
         values.push(u64::from(value));
@@ -3766,6 +3779,50 @@ fn apply_vrr_enabled(
         .map(|display| (display, value))
 }
 
+/// Validate a "max bpc" value for `connector`, as
+/// drm_property_change_valid_get does for a range: EINVAL for a connector
+/// without the property or a value outside 8..=16.
+fn max_bpc_value(card: &crate::drm::card::Card, connector: u32, value: u64) -> Result<u8, FsError> {
+    let has = card
+        .native_output(connector)
+        .is_some_and(|n| n.max_bpc.is_some());
+    if !has || !(MAX_BPC_RANGE[0]..=MAX_BPC_RANGE[1]).contains(&value) {
+        return Err(FsError::InvalidData);
+    }
+    Ok(value as u8)
+}
+
+/// Whether a new "max bpc" on `connector` is a modeset: a changed
+/// max_requested_bpc on a connector with a CRTC (its old state's, as
+/// drm_atomic_helper_check_modeset sets that CRTC's connectors_changed).
+fn max_bpc_modeset(card: &crate::drm::card::Card, connector: u32, bpc: u8) -> bool {
+    let crtc = card
+        .connector(connector)
+        .ok()
+        .and_then(|c| c.encoder_id)
+        .and_then(|id| card.encoder(id).ok())
+        .and_then(|e| e.crtc_id);
+    crtc.is_some() && card.native_output(connector).and_then(|n| n.max_bpc) != Some(bpc)
+}
+
+/// Commit a validated "max bpc": the connector reports it and, on the
+/// native card, the display driving it lights again with the new depth cap.
+/// Returns the native request, which the caller makes after releasing the
+/// card lock.
+fn apply_max_bpc(
+    card_index: u32,
+    card: &mut crate::drm::card::Card,
+    connector: u32,
+    bpc: u8,
+) -> Option<(u32, u8)> {
+    let native = card.native.iter_mut().find(|n| n.connector == connector)?;
+    if native.max_bpc == Some(bpc) {
+        return None;
+    }
+    native.max_bpc = Some(bpc);
+    (crate::drm_registry::driver_name(card_index) == Some("amdgpu")).then_some((connector, bpc))
+}
+
 /// Validate a "Broadcast RGB" value for `connector`, as
 /// drm_property_change_valid_get does for an enum: EINVAL for a connector
 /// without the property or a value outside its enum.
@@ -3802,7 +3859,10 @@ fn apply_broadcast_rgb(
 /// DRM_IOCTL_MODE_SETPROPERTY (`struct drm_mode_connector_set_property`:
 /// value@0, prop_id@8, connector_id@12) and DRM_IOCTL_MODE_OBJ_SETPROPERTY
 /// (`struct drm_mode_obj_set_property`: value@0, prop_id@8, obj_id@12,
-/// obj_type@16). Settable this way: a connector's "Broadcast RGB" and,
+/// obj_type@16). Settable this way: a connector's "Broadcast RGB", "max
+/// bpc" (a modeset when it changes on a driven connector, which
+/// set_property_atomic allows: drm_atomic_commit_init sets allow_modeset)
+/// and,
 /// through OBJ_SETPROPERTY only (SETPROPERTY is connector-only), a CRTC's
 /// "VRR_ENABLED" and color properties, and any property of a plane on an
 /// atomic card (committed through [`atomic_commit`] as one-property atomic
@@ -3906,6 +3966,15 @@ fn handle_set_property(
         drop(card);
         if let Some(request) = request {
             crate::amdgpu_native_kms::request_connector_color(request);
+        }
+        return Ok(0);
+    }
+    if prop_id == MAX_BPC_PROP_ID {
+        let bpc = max_bpc_value(&card, obj_id, value)?;
+        let request = apply_max_bpc(card_index, &mut card, obj_id, bpc);
+        drop(card);
+        if let Some((connector, bpc)) = request {
+            crate::amdgpu_native_kms::request_connector_max_bpc(connector, bpc);
         }
         return Ok(0);
     }
@@ -4601,6 +4670,8 @@ fn atomic_commit(
     let mut connector_requests: Vec<crate::amdgpu_native_kms::ConnectorColorRequest> = Vec::new();
     // Native cursor planes' hardware cursors, likewise.
     let mut cursor_requests: Vec<CursorRequest> = Vec::new();
+    // Native connector "max bpc" changes, likewise.
+    let mut max_bpc_requests: Vec<(u32, u8)> = Vec::new();
     let presentation = {
         let mut card = mode_state.lock();
         // Linux's atomic state grows implicitly while properties are decoded:
@@ -4617,6 +4688,8 @@ fn atomic_commit(
             (req.flags & PAGE_FLIP_EVENT != 0).then(|| Vec::with_capacity(card.crtcs.len()));
         // Connector "Broadcast RGB" values, applied only with the commit.
         let mut broadcast_rgb: Vec<(u32, u8)> = Vec::new();
+        // Connector "max bpc" values, likewise.
+        let mut max_bpcs: Vec<(u32, u8)> = Vec::new();
         // CRTC "VRR_ENABLED" values, likewise.
         let mut vrr_enabled: Vec<(u32, bool)> = Vec::new();
         // CRTC CTM/GAMMA_LUT and connector Colorspace/HDR_OUTPUT_METADATA
@@ -4876,6 +4949,15 @@ fn atomic_commit(
                         }
                         BROADCAST_RGB_PROP_ID => broadcast_rgb
                             .push((object_id, broadcast_rgb_value(&card, object_id, value)?)),
+                        MAX_BPC_PROP_ID => {
+                            let bpc = max_bpc_value(&card, object_id, value)?;
+                            // A modeset of the CRTC the connector drove.
+                            if max_bpc_modeset(&card, object_id, bpc) && !state.allow_modeset {
+                                return Err(FsError::InvalidData);
+                            }
+                            max_bpcs.retain(|(id, _)| *id != object_id);
+                            max_bpcs.push((object_id, bpc));
+                        }
                         _ => return Err(FsError::InvalidData),
                     }
                 }
@@ -5041,6 +5123,11 @@ fn atomic_commit(
             cursor_requests = native_cursor_requests(card_index, &mut card, &cursors);
             for &(connector, value) in &broadcast_rgb {
                 apply_broadcast_rgb(card_index, &mut card, connector, value);
+            }
+            for &(connector, bpc) in &max_bpcs {
+                if let Some(request) = apply_max_bpc(card_index, &mut card, connector, bpc) {
+                    max_bpc_requests.push(request);
+                }
             }
             for &(crtc, value) in &vrr_enabled {
                 if let Some(request) = apply_vrr_enabled(card_index, &mut card, crtc, value) {
@@ -5242,6 +5329,9 @@ fn atomic_commit(
         crate::amdgpu_native_kms::request_connector_color(request);
     }
     send_cursor_requests(cursor_requests);
+    for (connector, bpc) in max_bpc_requests {
+        crate::amdgpu_native_kms::request_connector_max_bpc(connector, bpc);
+    }
 
     let (log, n) = should_log(&ATOMIC_N);
     if log {

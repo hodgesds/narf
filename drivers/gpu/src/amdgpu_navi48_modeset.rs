@@ -768,6 +768,52 @@ pub fn max_bpc() -> u8 {
     MAX_BPC.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// The "max bpc" range drm_connector_attach_max_bpc_property(connector, 8,
+/// 16) gives every amdgpu_dm connector, and its initial value (the
+/// connector state's max_requested_bpc).
+pub const MIN_REQUESTED_BPC: u8 = 8;
+pub const MAX_REQUESTED_BPC: u8 = 16;
+/// Board ports and MST end devices per port the per-connector table holds.
+const REQUESTED_PORTS: usize = 8;
+const REQUESTED_SLOTS: usize = 4;
+/// DRM's per-connector "max bpc" (max_requested_bpc) for the next
+/// selection: `[port][0]` board port `port`'s connector, `[port][1 + slot]`
+/// its MST end device `slot`'s (`MstLink::outputs`).
+static REQUESTED_BPC: [[core::sync::atomic::AtomicU8; 1 + REQUESTED_SLOTS]; REQUESTED_PORTS] = [const {
+    [const { core::sync::atomic::AtomicU8::new(MAX_REQUESTED_BPC) }; 1 + REQUESTED_SLOTS]
+};
+    REQUESTED_PORTS];
+fn requested_slot(
+    port: usize,
+    mst_slot: Option<u8>,
+) -> Option<&'static core::sync::atomic::AtomicU8> {
+    let column = mst_slot.map_or(Some(0), |s| {
+        (usize::from(s) < REQUESTED_SLOTS).then_some(1 + usize::from(s))
+    })?;
+    REQUESTED_BPC.get(port)?.get(column)
+}
+/// Record connector (`port`, `mst_slot`)'s "max bpc" for later selections
+/// (values outside 8..=16, which DRM refuses, are ignored).
+pub fn set_requested_bpc(port: usize, mst_slot: Option<u8>, bpc: u8) {
+    if let Some(slot) = requested_slot(port, mst_slot)
+        .filter(|_| (MIN_REQUESTED_BPC..=MAX_REQUESTED_BPC).contains(&bpc))
+    {
+        slot.store(bpc, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+/// Connector (`port`, `mst_slot`)'s "max bpc" (16 until DRM sets one).
+pub fn requested_bpc(port: usize, mst_slot: Option<u8>) -> u8 {
+    requested_slot(port, mst_slot).map_or(MAX_REQUESTED_BPC, |slot| {
+        slot.load(core::sync::atomic::Ordering::Relaxed)
+    })
+}
+/// The deepest output depth a selection for connector (`port`,
+/// `mst_slot`) may ask for: its max_requested_bpc, which amdgpu_dm caps
+/// display_info.bpc with, within `amdgpu.max_bpc`.
+pub fn connector_max_bpc(port: usize, mst_slot: Option<u8>) -> u8 {
+    max_bpc().min(requested_bpc(port, mst_slot))
+}
+
 /// DRM's "Broadcast RGB" connector property values.
 pub const BROADCAST_RGB_AUTO: u8 = 0;
 pub const BROADCAST_RGB_FULL: u8 = 1;
@@ -1367,7 +1413,8 @@ pub fn dsc_link(
 /// Admission shape for an alternative DP timing. Recompute its DSC with the
 /// board's real DISPCLK limit, and after fallback require the configuration
 /// that selection would produce to fit the link which actually trained.
-/// The depths are amdgpu_dm's for the sink (`dp_depths` up to `max_bpc()`),
+/// The depths are amdgpu_dm's for the sink (`dp_depths` up to
+/// `connector_max_bpc`),
 /// deepest first: at each the mode is carried uncompressed, else
 /// compressed, else the next depth is tried (`dp_sst_stream`).
 fn dp_offered_mode(timing: Timing, s: &Selection, max_dispclk_khz: u32) -> Option<dml::Mode> {
@@ -1376,7 +1423,7 @@ fn dp_offered_mode(timing: Timing, s: &Selection, max_dispclk_khz: u32) -> Optio
         None => dp_link_bpc(&s.timing, s.caps, depth_bpc(s.depth)),
     };
     let fell_back = selected != Some((s.lanes, s.rate));
-    for depth in dp_depths(&s.edid, max_bpc()) {
+    for depth in dp_depths(&s.edid, connector_max_bpc(s.port, None)) {
         let bpc = depth_bpc(depth);
         if dp_link_bpc(&timing, s.caps, bpc).is_some() {
             if !fell_back || dp_fits_bpc(&timing, s.caps, s.lanes, s.rate, bpc) {
@@ -2070,6 +2117,9 @@ pub const MAX_DISPLAYS: usize = 4;
 /// Every lightable sink, as `select` judges each: the DP ports in board
 /// order, then the HDMI ports, at most `MAX_DISPLAYS`. `want(port)` is the
 /// timing asked of that port's sink, used where the sink lists and fits it.
+/// `max_bpc` (`amdgpu.max_bpc`) bounds every sink's depth, and each port's
+/// connector "max bpc" (`requested_bpc`) its own, as amdgpu_dm caps the
+/// stream with the connector state's max_requested_bpc.
 /// Empty is an error: `Link` when some sink's mode could not be carried.
 pub fn select_all(
     paths: &[inventory::Path],
@@ -2100,8 +2150,9 @@ pub fn select_all(
         // The depths create_validate_stream_for_sink tries, deepest first:
         // at each, uncompressed whenever a link carries the mode (Linux
         // enables DSC only when needed), otherwise DSC at that depth for the
-        // maximum link, on the link its compressed bandwidth needs.
-        let depths = dp_depths(&sink.edid, max_bpc);
+        // maximum link, on the link its compressed bandwidth needs. The
+        // connector's max_requested_bpc caps them.
+        let depths = dp_depths(&sink.edid, max_bpc.min(requested_bpc(index, None)));
         let Some(timing) = pick(index, &sink.edid, &|t| {
             dp_sst_stream(t, caps, &depths, NOMINAL_DISPCLK_KHZ).is_some()
         }) else {
@@ -2181,6 +2232,7 @@ pub fn select_all(
         };
         // DCN401 has one HPO FRL encoder: one FRL display at most.
         let frl_cap = frl_cap(caps).filter(|_| frl_free);
+        let max_bpc = max_bpc.min(requested_bpc(index, None));
         let audio = sink_audio_info(&sink.edid);
         let Some(timing) = pick(index, &sink.edid, &|t| {
             hdmi_output(caps, t, max_bpc, frl_cap, audio).is_some()
@@ -3333,15 +3385,14 @@ impl ColdBoot {
                 // FRL only for the display holding the HPO FRL encoder.
                 let frl = s.frl.and_then(|_| frl_cap(caps));
                 let audio = sink_audio_info(edid);
-                hdmi_stream(caps, &t, max_bpc(), frl, audio, soc.dispclk_max_khz).map(|h| {
-                    dml::Mode {
-                        ycbcr420: h.ycbcr420,
-                        dsc: h.dsc.map(|c| dml::Dsc {
-                            slices: c.slices_h,
-                            bpp_x16: c.bpp_x16,
-                        }),
-                        ..plane_mode(t, s.format)
-                    }
+                let max_bpc = connector_max_bpc(s.port, None);
+                hdmi_stream(caps, &t, max_bpc, frl, audio, soc.dispclk_max_khz).map(|h| dml::Mode {
+                    ycbcr420: h.ycbcr420,
+                    dsc: h.dsc.map(|c| dml::Dsc {
+                        slices: c.slices_h,
+                        bpp_x16: c.bpp_x16,
+                    }),
+                    ..plane_mode(t, s.format)
                 })
             } else if let Some(m) = s.mst {
                 // Within the stream's own payload: uncompressed, or for a
