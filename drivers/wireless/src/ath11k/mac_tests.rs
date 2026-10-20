@@ -3362,12 +3362,10 @@ fn smoke_ath11k_mac_connect_open_and_disconnect() -> TestResult {
             security: SecurityConfig::Open,
             ie: Vec::new(),
         };
-        // Answer as BSSID2.
-        let r = block(async {
-            // The fake AP answers with BSSID; retarget it.
-            m.connect(&req).await
-        });
-        // The fake AP only knows BSSID: the auth goes unanswered.
+        // The fake AP answers as whichever BSSID a frame is addressed to,
+        // so make it silent: the authentication goes unanswered.
+        set_cfg(&w, |c| c.auth_status = None);
+        let r = block(m.connect(&req));
         ensure!(
             r.map_err(|e| e.step) == Err(step::AUTH_TIMEOUT),
             "auth to a silent AP times out"
