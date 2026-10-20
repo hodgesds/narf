@@ -1999,23 +1999,55 @@ inside the FB aperture. Each call rewrites the image there with transparent
 padding and HDP-flushes it; an image change is not tear-free, because the
 buffer is single.
 
-Programming follows dcn10_set_cursor_attribute and dcn401_set_cursor_position
-inside mpc1_cursor_lock (`CUR_VUPDATE_LOCK_SET` of the pipe's OPP, released
-on every path):
+Programming follows program_cursor_attributes and program_cursor_position:
+on every pipe of the stream that carries a plane (the primary's ODM segments
+and MPC slices and every overlay's pipes), dcn10_set_cursor_attribute and
+dcn401_set_cursor_position, inside mpc1_cursor_lock (`CUR_VUPDATE_LOCK_SET`
+of each ODM segment's OPP, whose MPCC tree carries every plane of the
+segment; released on every path):
 - HUBP: address (high, then low), size, and `CURSOR_CONTROL` with mode 2,
   pitch 64, lines per chunk by width and `CURSOR_REQ_MODE` 1.
 - `CURSOR_SETTINGS`: full write of 0x300.
 - CM_CUR: mode 2, no expansion or degamma ROM, FP16 1.0 scale, matrix bypass.
-- Position, hotspot and `CURSOR_DST_X_OFFSET`, the latter in DCHUB reference
-  clocks.
+- Position, hotspot and `CURSOR_DST_X_OFFSET` per pipe.
 
-Negative origins move into the hotspot. A cursor entirely off screen is
-disabled in both HUBP and CM, and `move_cursor` (or the non-blocking platform
-`try_move_display_cursor`, for pointer pumps) only repositions. The live-fetch
-witness expects exactly the reported cursor enable. Stopping scanout hides the
-cursor under its lock before the plane stops, and drops the report while the
+The position is amdgpu_dm_plane_get_cursor_position's (a negative origin
+moves into the hotspot, at most 63; one 64 or more past the left or top edge
+disables the cursor) taken through dcn401_set_cursor_position for each pipe
+(`cursor::pipe_position`): past the src widths of the ODM slices before the
+pipe (resource_get_odm_slice_src_rect, a 4:2:0 slice one pixel wider), the
+MPC bottom-pipe move, then into the pipe's recout space, every part left of
+or above either moved into the hotspot, disabled when none of the image lands
+in the recout or when resource_can_pipe_disable_cursor finds a plane of
+another layer above whose recout (merged with its other slice) contains the
+pipe's; then hubp401_cursor_set_position: `CURSOR_DST_X_OFFSET` from the
+viewport position (recout to viewport scale) in DCHUB reference clocks over
+the horizontal ratio (dc_fixpt_from_ux_dy of SPL's register), the X hotspot
+clamped to 255. `CursorApplied::shown` names the pipes enabled; the
+live-fetch witness expects exactly those. `move_cursor` (or the non-blocking
+platform `try_move_display_cursor`, for pointer pumps) only repositions. A
+live plane update re-places the cursor on its new pipes under the OTG lock
+(dcn20_update_dchubp_dpp). Stopping scanout hides the cursor on every plane's
+pipe under the locks before the planes stop, and drops the report while the
 buffer stays retained. Any readback mismatch quarantines the pipe.
-`tests/dcn401_cursor.c` checks the registers, including the MPC lock bank.
+`tests/dcn401_cursor.c` checks the registers, including the MPC lock bank;
+`tests/dcn401_cursor_position/check.sh` builds amdgpu_dm_plane_get_cursor_
+position, dcn401_set_cursor_position, adjust_hotspot_between_slices_for_2x_
+magnify, resource_can_pipe_disable_cursor, hubp401_cursor_set_position and
+dpp401_set_cursor_position from the Linux tree on the host and answers 1060
+stream/cursor vectors (`vectors.txt`: single pipes, unscaled, scaled,
+cropped, covering and underlying planes, ODM 2:1, 3:1 and 4:1 with 4:2:0
+slices, MPC slices under and over overlays, five cursor sizes), replayed by
+`dcn401_cursor_matches_linux_vectors`; `stream_cursor_pipes` (the pipes as
+SPL and the MPCC trees describe them) is checked against the vectors' own.
+
+`otg::cursor_mode(dce_ip, crtc_enabled, cursor_scale, planes)` is
+amdgpu_dm_crtc_get_cursor_mode (`CursorMode::{Native, Overlay}`, the planes
+under the cursor as `CursorUnder`, `plane_scale` as dm_get_plane_scale): DCN
+4.0.1 (Navi48), 4.2.0 and 4.2.1 and a disabled CRTC always take the native
+cursor, so amdgpu_dm neither needs the overlay cursor nor refuses a cursor
+over a scaled or YCbCr plane there; other DCN take the overlay cursor over a
+YCbCr plane, a plane scaled unlike the cursor in both directions or a hole.
 The platform publishes a cursor hook with the scanout
 (`amdgpu_dcn_display::publish_external_cursor`, cleared on withdrawal before
 observers run). It try-locks the owner, uploads the image once, moves it
@@ -3918,7 +3950,8 @@ down), returning every MPCC to TOP_LAYER_ONLY. Live checks (`LivePipe`:
 address, cursor, the five tree selectors and the MPCC mode) cover every
 plane, also another display's live pipes. `retire_planes` ends overlay
 staging (records on pipes with neither timing nor blank of their own) and
-returns their pipes and DETs. The cursor stays on the primary's pipes.
+returns their pipes and DETs. The cursor shows on every plane's pipe it
+overlaps (see the cursor below).
 
 **Admission.** `dml::Mode::planes` lists the stream's planes (`dml::Plane`:
 surface, pitch, depth, SPL viewport, ratios and taps; an empty `planes[0]` is
@@ -3973,9 +4006,10 @@ display's and ODM pipe, refusing `Admission(Pipes)`; `prepare_pipes` returns
 each display's `DisplayPipes` and gives the overlay pipes their DPP-only
 clocks; `light` powers, stages (every plane's memory before any plane's DPP)
 and requests every plane. The platform records each CRTC's planes
-(`request_display_planes`), relights a display whose planes changed (DC's
-full update; a failed relight returns every display to the full-frame
-XRGB8888 primary), and admits a configuration with
+(`request_display_planes`), moves a running display to new planes or a new
+primary format without relighting it (see "Navi 48 seamless plane updates";
+only what needs a modeset relights, and a failed relight returns every
+display to the full-frame XRGB8888 primary), and admits a configuration with
 `display_admits_planes(display, connector, mode, fourcc, setup) ->
 Result<(), PlanesRefused>`: the display lit on the same connector and timing
 (`NotLit` otherwise), DML21 with every lit display's admitted planes
@@ -4093,14 +4127,12 @@ framebuffer with the source rectangle placed in it
 (`PlaneGeometry::whole_framebuffer`), so such a primary is always placed,
 and the presenter copies it whole, block row by block row
 (`copy_whole_plane`, `upload_display_plane_back_bytes`); a frame of another
-tiling than shown waits for the relight its plane change requested.
+tiling than shown waits for the plane update its plane change requested.
 SETCRTC admits such a framebuffer as a placed primary
 (`drm_native_planes::setcrtc_planes`), PAGE_FLIP requests the display's
-planes so a tiling change relights.
+planes so a tiling change is a plane update.
 
-Gaps: a plane configuration change relights the display (a visible blank)
-rather than DC's seamless full update; the cursor shows only on the
-primary's pipes, under opaque overlays above it; planes on an ODM stream
+Gaps: planes on an ODM stream
 must reach every segment; only linear, unrotated RGB planes without DCC
 are MPC-combined (any other plane one DPP cannot carry is refused); no
 RGBA8888 or 16-bit UNORM planes, no NV21 (not
@@ -4151,11 +4183,128 @@ beside the running displays when nothing they asked for changed
 (`MonitorStep::LitBeside`) and replans after a display left
 (`MonitorStep::Replanned`), relighting everything only when refused.
 
-Gaps: MST configurations, mode, plane or color changes of a running display
-and FRL retraining still relight; a running display whose new plan needs
-other pipes refuses the seamless change; scanning for the new sinks reads
-every port (AUX/DDC) while the others run. Model-tested only (`dcn401-clk`,
-`dcn401-dccg`, `dcn401-scanout`, `navi48-modeset`); not validated on
+Gaps: MST configurations, mode or color changes of a running display and
+FRL retraining still relight (plane changes no longer do: see below); a
+running display whose new plan needs other pipes refuses the seamless
+change; scanning for the new sinks reads every port (AUX/DDC) while the
+others run. Model-tested only (`dcn401-clk`, `dcn401-dccg`,
+`dcn401-scanout`, `navi48-modeset`); not validated on hardware.
+
+### Navi 48 seamless plane updates
+
+A plane change (placement, scaling, blending, rotation, format, tiling,
+surface, an overlay added or removed, the primary's format) is no modeset
+in amdgpu_dm (amdgpu_dm_commit_planes through dc_update_planes_and_stream),
+and none here: the display keeps scanning out, its OTG, OPP, DSC and link
+untouched.
+
+**Classification.** `otg::plane_update_type(old, new) -> UpdateType`
+(`Fast`, `Med`, `Full`) is det_surface_update for a plane DC keeps:
+get_plane_info_update_type (color space, per-pixel or global alpha and the
+pitch medium; rotation, DC format (X/A twins are one), bytes per pixel,
+tiling and DCC full) and get_scaling_info_update_type (a source or
+destination of another size full, one moved medium).
+`planes_update_type(old, new, reset)` is check_update_surfaces_for_stream
+over the stream's planes: a plane count change (full_update_required_weak)
+or a plane amdgpu_dm recreates (`reset`, should_reset_plane on a zpos
+change: an overlay both setups show moved across the primary or past
+another) is full. An update that takes or frees pipes is full.
+
+**Engine.** `unsafe Otg::update_live_planes(pool, clocks, dccg, gmc, pipe,
+&LivePlanes { primary, overlays, reset }, plan, crystal_khz) ->
+PlanesUpdated` (ColdBoot `update_live_display_planes`) moves display
+`pipe`'s live scanout to the surface requests (the primary on its own pipe
+and ODM pipes, MPC slices free to change; overlays bottom first on pipes of
+their own) under `plan`, its stream's own timing admitted with them, in
+commit_planes_for_stream's order:
+- Checks, before any write: the display scans out, every request stages
+  (SPL), sits on the stream split like it and on pipes no other plane or
+  display holds, underlays below the others, its rows fit the default DET,
+  the plan binds the new planes and the current owners
+  (`deadline::bound`), the live scanout is still the one its records name
+  (`scanout_bound_with`, raise-tolerant watermarks), no flip is pending,
+  and every pipe a new plane takes is free (its OTG idle and unlocked, its
+  MPCC in no tree and idle, and powered, its HUBP blank, drained and gated,
+  its DPP stopped). Every further pipe's DPP-only clock must cover its
+  plane's DPPCLK. A plane of the same allocation on the same pipes keeps
+  its surface (and content); any other takes a fresh, cleared one
+  (unpublished until the hardware hears of it).
+- Before the lock (dcn20_enable_plane): each new pipe powered up if gated
+  (dcn32_hubp_pg_control), its fetch clock, the VMID0 aperture, the
+  requestor on the stream's VTG and the DPP clock; its default DET from the
+  compressed buffer (shrunk first).
+- Under dcn401_interdependent_update_lock (the OTG master lock): the global
+  sync if the plan's differs; plane_atomic_disconnect of every freed pipe
+  (mpc1_remove_mpcc) with its cursor off; each changed or new plane's DPP
+  (dpp401_dpp_setup and the DSCL with the coefficient RAM swap,
+  `program_dpp_live`); on a full update every segment's MPCC tree from its
+  top pipe down as dcn20_update_mpcc does (each MPCC removed, inserted at
+  the bottom with mpc1_insert_plane, then its blending), on a medium one
+  only the changed planes' blending (update_blending); each changed or new
+  plane's HUBP surface, viewport and address; every plane's DLG/TTU with
+  raise-only watermarks; the CRTC color on the new top MPCCs
+  (program_color); the cursor on every pipe it now overlaps; the new pipes
+  unblanked.
+- Unlocked (dcn401_post_unlock_program_front_end): every plane's HUBP
+  reports its surface in use, the OTG's double-buffered state latched, the
+  new MPCCs connected and the freed ones idle; then dcn20_disable_plane on
+  each freed pipe (no outstanding request, blank, fetch and DPP clocks off;
+  its DET stays allocated until a configuration repartitions). The records
+  then name the new planes (surfaces, apertures, DPP/MPC, requestor,
+  deadlines, scanout, cursor, the timing's sync) and pass the scanout's
+  re-binding checks; the surfaces the update superseded (with their back
+  buffers; the primary's cursor image moves with its slot) are released once
+  nothing fetches them, after an HDP flush.
+
+Refusals leave the scanout as it ran; later failure or cancellation
+(`State::UpdatingPlanes`) quarantines the display, retaining every surface.
+`PlanesUpdated` reports the update type, the pipes enabled, disabled and
+kept, the scanout and deadlines, and the bytes released.
+`ColdBoot::prepare_display_plane_clock_live(request)` programs a new
+pipe's DPP-only clock while every display (the selected one's too) runs.
+
+**Configuration.** `unsafe ColdBoot::update_display_planes(display,
+format, setup, reset) -> Option<PlanesChange>` (`PlanesChange { pipe,
+displays, updated }`) admits every running display again with the
+display's new planes (`dml::admit_native`), places them
+(`modeset::planes::live_plane_pipes`: the primary keeps its pipe and ODM
+pipes and the MPC slices the plan keeps; an overlay DC keeps, the same DRM
+plane by `OverlayPlane::plane`, keeps its pipes wherever it moves in the
+stack; a new plane takes free pipes from the top, a freed pipe included),
+then: prepare_bandwidth (`update_live_display_clocks` raising the shared
+clocks and the DTOs of the pipes that keep fetching, the new pipes'
+DPP-only clocks, every other display whose plan moved through
+`update_live_display_plan(raise)`), the plane update, optimize_bandwidth
+(every display's exact watermarks, the clocks lowered). `None`, before any
+change but the clock raise, when it needs a modeset or is refused: an MST
+configuration, a teardown in flight, DML refusing the configuration, another
+ODM split for the display, another display's pipes or split changing, a
+request that does not stage, or the engine's refusal.
+
+**Platform and KMS.** `request_display_planes` and `request_display_format`
+wake the display monitor (it sleeps in 16 ms steps), which applies a plane
+or format change of a display that otherwise runs on through
+`update_display_planes` (`MonitorStep::PlanesUpdated`, not logged),
+withdrawing the console from the display's primary across it, then
+publishes the display's new planes to its presenter (back buffers for new
+overlay pipes, the planes and format shown, the CRTC's admission); it
+relights only when that returns `None` or a modeset is due anyway. A frame
+of a commit whose planes are not shown yet waits in the mailbox for the
+update (at most 2 s, then presents on what is shown), so a commit's new
+planes and framebuffers show from the same update. `drm_native_planes`
+records each overlay's DRM plane id in `OverlayPlane::plane`.
+
+Gaps: the commit's new framebuffer contents reach a plane's surface by the
+presenter's copy after the update latched (a new or reallocated surface
+shows cleared for that frame or two), not at the update's own VUPDATE; a
+change of the stream's ODM split (or another display's pipes) still
+relights; MST displays relight; DET of freed pipes is not returned to the
+compressed buffer until a relight repartitions; no DCC/compbuf or MALL/SubVP
+reprogramming beyond the default DET; the cursor matrix of a YCbCr plane is
+not programmed (its cursor colors pass unconverted); no DRM cursor plane
+(the legacy CURSOR ioctls drive the fb pointer on the hardware cursor).
+Model-tested only (`dcn401-plane-update`, `dcn401-cursor`,
+`dcn401-scanout`, `navi48-modeset`, `navi48-kms`); not validated on
 hardware.
 
 ### Discrete RDNA2 PSP secure-OS bootstrap

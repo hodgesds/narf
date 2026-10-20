@@ -889,7 +889,7 @@ Navi48 primary planes now take XRGB/ARGB/XBGR/ABGR 8888 and 2101010, RGB565
 and the four FP16 orders end to end (ADDFB2/GETPLANE/SETCRTC/PAGE_FLIP/atomic
 TEST_ONLY, DML21 admission at 2/4/8 bytes matched against Linux on a new
 format vector set, HUBP/DPP/MPC words as Linux programs them, premultiplied
-alpha per amdgpu_dm's default); a format change relights the display.
+alpha per amdgpu_dm's default); a format change is a plane update (no relight).
 Register models and QEMU only; no hardware run.
 
 Navi48 planes now scale and stack as amdgpu_dm exposes them on DCN 4.0.1:
@@ -903,8 +903,8 @@ and rotation (0/180; 90/270 refused) properties. DML21 admits the planes
 jointly (matched against Linux on 654 scaled and multi-plane
 configurations); the KMS checks follow amdgpu_dm's (24x12 viewport, 16x up,
 6:1 down, primary required, zpos normalization) on ATOMIC, TEST_ONLY and the
-new SETPLANE, configurations short of pipes are refused, a plane change
-relights the display and framebuffer updates of several planes flip at one
+new SETPLANE, configurations short of pipes are refused, a plane change is
+applied without relighting and framebuffer updates of several planes flip at one
 VUPDATE. Register models and QEMU only; no hardware run.
 
 Navi48 planes now take GFX12 tiled and DCC framebuffers and NV12/P010 on
@@ -922,6 +922,28 @@ mcache plans (618 new configurations against host-built Linux DML21). Tiled
 and 4:2:0
 framebuffers are staged and CPU-copied whole. Register models and QEMU only;
 no hardware run.
+
+Navi48 plane changes no longer relight the display: a plane moved, scaled,
+reblended, given another format, tiling or surface, an overlay added on a
+free pipe or removed, or the primary's format changed is DC's medium or full
+plane update with the timing running (classified as
+dc_check_update_surfaces_for_stream does). DML admits the configuration
+again, every plane DC keeps stays on its pipes, prepare_bandwidth raises the
+shared clocks and watermarks, and under the OTG master lock (dcn401's
+interdependent update lock) the freed pipes leave their MPCC trees, each
+changed plane's DPP, MPCC blending and HUBP surface are reprogrammed (on a
+full update every tree rebuilt top down as dcn20_update_mpcc does), the new
+pipes (enabled off-tree first) unblank; after the latch the freed pipes are
+drained and gated and their surfaces released, then optimize_bandwidth
+lowers what is no longer needed. The display monitor applies a commit's
+planes within a frame or two, its frames waiting for them; only a change of
+the stream itself (its ODM split) or an MST display relights. The hardware
+cursor now shows on every pipe it overlaps (overlays, ODM segments, MPC
+slices), placed as amdgpu_dm and dcn401_set_cursor_position place it (1060
+vectors against those Linux functions built on the host); DCN 4.0.1's cursor
+mode is always native, as amdgpu_dm decides. Register models and QEMU only
+(no OTG or OPP write during any plane update in the models); no hardware
+run.
 
 DP MST now also runs over 128b/132b links: a branch that codes UHBR trains
 MST at its best UHBR rate (as Linux's decide_mst_link_settings does), streams
