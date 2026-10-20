@@ -329,7 +329,10 @@ async fn sink_config(io: &mut impl Transport, plan: DpLinkTrained) -> Result<(),
     if config[0] != plan.phy.settings.rate as u8
         || config[1] != plan.phy.settings.lanes | 0x80
         || config[2] != 0
-        || config[7] != if plan.downspread { 0x10 } else { 0 }
+        // IGNORE_MSA_TIMING_PARAM is the running stream's (link_dpms.c
+        // enable_stream_features), not the link's: training writes it clear.
+        || config[7] & !crate::amdgpu_freesync::DPCD_IGNORE_MSA_TIMING_PARAM
+            != if plan.downspread { 0x10 } else { 0 }
         || config[8] != 1
     {
         return Err(sink_readback(0x100));

@@ -1306,3 +1306,65 @@ fn dcn401_mst_displays_share_one_link() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/dcn401-otg", dcn401_mst_displays_share_one_link);
+
+/// link_dpms.c enable_stream_features: after the stream runs,
+/// DP_DOWNSPREAD_CTRL's IGNORE_MSA_TIMING_PARAM follows the stream's VRR
+/// support by read-modify-write, written only when it changes, keeping the
+/// link's spread bit; the link's own configuration checks ignore the bit.
+fn dcn401_dp_stream_features_set_and_clear_ignore_msa() -> TestResult {
+    let (mut e, mut io, c) = fixture(1, 2, 3, ColorDepth::Bpc8);
+    let p = path(1);
+    // Before video runs: Busy, without AUX traffic.
+    let events = io.events.len();
+    if run(e.dp_stream_features(&mut io, p, true)) != Err(Error::Busy) || io.events.len() != events
+    {
+        return TestResult::Fail("before video");
+    }
+    start(&mut e, &mut io, c);
+    let spread = io.bytes.get(&0x107).copied().unwrap_or(0);
+    let aux = |io: &Link, from: usize| -> Vec<(u8, u32, Vec<u8>)> {
+        io.events[from..]
+            .iter()
+            .filter_map(|ev| match ev {
+                Event::Aux(a, at, d) => Some((*a, *at, d.clone())),
+                _ => None,
+            })
+            .collect()
+    };
+    let from = io.events.len();
+    if run(e.dp_stream_features(&mut io, p, true)) != Ok(true)
+        || aux(&io, from)
+            != [
+                (0x90, 0x107, alloc::vec![0]),
+                (0x80, 0x107, alloc::vec![spread | 0x80]),
+            ]
+        || io.bytes.get(&0x107).copied() != Some(spread | 0x80)
+    {
+        return TestResult::Fail("set");
+    }
+    // Unchanged: read only.
+    let from = io.events.len();
+    if run(e.dp_stream_features(&mut io, p, true)) != Ok(false) || aux(&io, from).len() != 1 {
+        return TestResult::Fail("unchanged");
+    }
+    // Another path is not this stream's.
+    if run(e.dp_stream_features(&mut io, path(2), true)) != Err(Error::Invalid) {
+        return TestResult::Fail("other path");
+    }
+    // The stream restarts with the bit set: the sink checks still pass.
+    run(e.stop_dp_video(&mut io, p)).unwrap();
+    start(&mut e, &mut io, c);
+    if run(e.dp_stream_features(&mut io, p, false)) != Ok(true)
+        || io.bytes.get(&0x107).copied() != Some(spread)
+    {
+        return TestResult::Fail("clear");
+    }
+    if e.status.state != State::DpVideoRunning(2) {
+        return TestResult::Fail("state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_dp_stream_features_set_and_clear_ignore_msa
+);

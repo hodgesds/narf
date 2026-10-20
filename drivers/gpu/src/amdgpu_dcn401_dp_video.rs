@@ -459,6 +459,51 @@ impl<I: Io> Engine<I> {
         }
     }
 }
+impl<I: Io> Engine<I> {
+    /// link_dpms.c enable_stream_features for a DP SST stream (8b/10b or
+    /// 128b/132b) running on `path`: read DP_DOWNSPREAD_CTRL, set or clear
+    /// IGNORE_MSA_TIMING_PARAM as the stream is VRR-capable, and write it back
+    /// only when it changed. True when written. Busy unless SST video (or a
+    /// scanout on it) runs on `path`; MST streams are refused (Linux defers
+    /// them to dm_helpers_mst_enable_stream_features).
+    pub(in crate::amdgpu_dcn401_otg) async fn dp_stream_features(
+        &mut self,
+        io: &mut impl Transport,
+        path: Path,
+        ignore_msa: bool,
+    ) -> Result<bool, Error> {
+        let s = &self.status;
+        let running = matches!(
+            s.state,
+            State::DpVideoRunning(_) | State::UhbrVideoRunning(_) | State::ScanoutRunning(_)
+        );
+        let dio = s
+            .dp_video_running
+            .map(|v| (v.frontend.link.phy.path, v.frontend.link.phy.settings.mst));
+        let hpo = s
+            .uhbr_video_running
+            .map(|v| (v.link.path, v.link.settings.mst));
+        let Some((_, mst)) = [dio, hpo].into_iter().flatten().find(|&(p, _)| p == path) else {
+            return Err(if running { Error::Invalid } else { Error::Busy });
+        };
+        if !running {
+            return Err(Error::Busy);
+        }
+        if mst {
+            return Err(Error::Unsupported);
+        }
+        use crate::amdgpu_freesync::{
+            DPCD_DOWNSPREAD_CTRL as AT, DPCD_IGNORE_MSA_TIMING_PARAM as BIT,
+        };
+        let old = read::<1>(io, path, AT).await?[0];
+        let new = if ignore_msa { old | BIT } else { old & !BIT };
+        if new == old {
+            return Ok(false);
+        }
+        write(io, path, AT, &mut [new]).await?;
+        Ok(true)
+    }
+}
 impl Otg {
     /// Start the prepared RGB black pattern on this owner's trained legacy SST
     /// link. Does not enable memory fetchers or claim sink presentation.
@@ -490,6 +535,23 @@ impl Otg {
             return Err(e);
         }
         Ok(running)
+    }
+    /// Set (or clear) the sink's IGNORE_MSA_TIMING_PARAM for the DP SST
+    /// stream running on `path`, after its video started, as Linux's
+    /// link_set_dpms_on does once the stream is unblanked; true when the
+    /// DPCD byte changed. Linux ignores AUX failures here; callers may too.
+    /// # Safety
+    /// Preserve start_dp_video's (or start_uhbr_video's) exclusive ownership.
+    pub(crate) async unsafe fn set_dp_ignore_msa(
+        &mut self,
+        io: &mut dmub::Dmub,
+        path: Path,
+        ignore_msa: bool,
+    ) -> Result<bool, Error> {
+        if !io.matches_display(self.0.io.0, self.0.layout.base) {
+            return Err(Error::Invalid);
+        }
+        self.0.dp_stream_features(io, path, ignore_msa).await
     }
     fn dp_video_clock(
         &mut self,

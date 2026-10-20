@@ -720,6 +720,8 @@ fn select_mst_with_budget(
                 slots,
                 rate: vc,
             }),
+            // VRR is DP SST only here (no MST stream features).
+            vrr: None,
         };
         out.push(s);
     }

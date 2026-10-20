@@ -88,6 +88,9 @@ pub struct Selection {
     /// A stream to a device behind the port's MST branch, on the port's
     /// 8b/10b MST link.
     pub mst: Option<MstStream>,
+    /// The sink's FreeSync range (amdgpu_dm_update_freesync_caps): DP SST
+    /// sinks only; None when the sink is not VRR-capable.
+    pub vrr: Option<crate::amdgpu_freesync::VrrRange>,
 }
 
 /// A selection's stream on an MST link: its end device and VC payload.
@@ -1371,6 +1374,10 @@ pub fn select_all(
             frl: None,
             dsc,
             mst: None,
+            vrr: sink
+                .dpcd
+                .as_ref()
+                .and_then(|d| crate::amdgpu_freesync::dp_sst_caps(&sink.edid, d)),
         });
     }
     let mut frl_free = true;
@@ -1424,6 +1431,8 @@ pub fn select_all(
             frl,
             dsc: None,
             mst: None,
+            // HDMI FreeSync needs the AMD VSDB, which is not parsed.
+            vrr: None,
         });
     }
     out.truncate(MAX_DISPLAYS);
@@ -1583,6 +1592,17 @@ impl Selection {
     /// A 128b/132b (UHBR) DP link.
     pub fn uhbr(&self) -> bool {
         matches!(self.rate, DpRate::Uhbr(_))
+    }
+    /// amdgpu_dm's vrr_supported: a VRR-capable sink whose range holds this
+    /// mode's refresh. The stream then sets IGNORE_MSA_TIMING_PARAM.
+    pub fn vrr_supported(&self) -> bool {
+        self.mst.is_none() && self.vrr.is_some_and(|r| r.supports(&self.timing))
+    }
+    /// The DRR totals VRR_ENABLED runs this mode at, if any.
+    pub fn drr(&self) -> Option<crate::amdgpu_freesync::Drr> {
+        self.vrr
+            .filter(|_| self.vrr_supported())
+            .and_then(|r| crate::amdgpu_freesync::drr(&self.timing, r))
     }
 }
 
@@ -2325,6 +2345,11 @@ impl ColdBoot {
             self.start_display_dp_video(port).await?;
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Video);
+            // link_set_dpms_on's enable_stream_features once the stream
+            // runs; Linux ignores the AUX result.
+            let _ = self
+                .set_display_dp_ignore_msa(port, selection.vrr_supported())
+                .await;
             let scanout = self.start_display_scanout(pipe).await?;
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Scanout);
@@ -2479,6 +2504,10 @@ impl ColdBoot {
             let video = self.start_display_uhbr_video(port, pipe, pipe).await?;
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Video);
+            // As for 8b/10b SST: enable_stream_features after the stream runs.
+            let _ = self
+                .set_display_dp_ignore_msa(port, selection.vrr_supported())
+                .await;
             let scanout = self.start_display_scanout(pipe).await?;
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Scanout);

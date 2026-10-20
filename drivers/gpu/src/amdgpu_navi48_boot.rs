@@ -2029,6 +2029,20 @@ impl ColdBoot {
                 .move_cursor(pipe, position)
         }
     }
+    /// Run (`Some`) or stop (`None`) DRR on a live pipe's timing.
+    /// # Safety
+    /// As for `set_display_cursor`.
+    pub unsafe fn set_display_drr(
+        &mut self,
+        pipe: u8,
+        drr: Option<crate::amdgpu_freesync::Drr>,
+    ) -> Result<Option<otg::DrrApplied>, otg::Error> {
+        if self.state() != State::MemoryReady {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: serialized retained owner; caller excludes writers.
+        unsafe { self.otg.as_mut().map_err(|e| *e)?.set_drr(pipe, drr) }
+    }
     /// HDP-flush CPU writes to the live scanout surface.
     pub fn flush_display_scanout(&mut self) -> Result<(), otg::Error> {
         if self.state() != State::MemoryReady {
@@ -2315,6 +2329,25 @@ impl ColdBoot {
                     &mut self.sequence.backend.dmub,
                     path,
                 )
+                .await
+        }
+    }
+    /// enable_stream_features on the port's running DP SST stream: the
+    /// sink's IGNORE_MSA_TIMING_PARAM set as the stream is VRR-capable.
+    /// # Safety
+    /// As for `start_display_dp_video`.
+    pub async unsafe fn set_display_dp_ignore_msa(
+        &mut self,
+        port: usize,
+        ignore_msa: bool,
+    ) -> Result<bool, otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: retained matching owners; caller excludes external writers.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .set_dp_ignore_msa(&mut self.sequence.backend.dmub, path, ignore_msa)
                 .await
         }
     }
