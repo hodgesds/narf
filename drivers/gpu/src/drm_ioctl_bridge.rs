@@ -3771,7 +3771,10 @@ fn apply_broadcast_rgb(
 /// (`struct drm_mode_obj_set_property`: value@0, prop_id@8, obj_id@12,
 /// obj_type@16). Settable this way: a connector's "Broadcast RGB" and,
 /// through OBJ_SETPROPERTY only (SETPROPERTY is connector-only), a CRTC's
-/// "VRR_ENABLED", which Linux commits atomically for an atomic driver. Like
+/// "VRR_ENABLED" and color properties, and any property of a plane on an
+/// atomic card (committed through [`atomic_commit`] as one-property atomic
+/// state, as set_property_atomic does), which Linux commits atomically for
+/// an atomic driver. Like
 /// drm_mode_obj_set_property_ioctl, an unknown object is ENOENT and a
 /// property the object lacks is EINVAL. Master only.
 fn handle_set_property(
@@ -3817,6 +3820,36 @@ fn handle_set_property(
             crate::amdgpu_native_kms::request_vrr_enabled(display, enabled);
         }
         return Ok(0);
+    }
+    if obj_type == DRM_MODE_OBJECT_PLANE {
+        // set_property_atomic: a blocking one-property commit without
+        // ALLOW_MODESET, through the same decode, checks and commit as
+        // DRM_IOCTL_MODE_ATOMIC.
+        {
+            let card = mode_state.lock();
+            let known = crate::drm_native_planes::plane_state(&card, obj_id).is_some()
+                || synth_planes(&card).iter().any(|(id, _)| *id == obj_id);
+            if !known {
+                return Err(FsError::NotFound);
+            }
+            if !atomic_card(&card) {
+                return Err(FsError::InvalidData);
+            }
+        }
+        return atomic_commit(
+            card_index,
+            mode_state,
+            AtomicRequest {
+                flags: 0,
+                user_data: 0,
+                objects: &[obj_id],
+                prop_counts: &[1],
+                props: &[prop_id],
+                values: &[value],
+            },
+            None,
+            None,
+        );
     }
     if obj_type != DRM_MODE_OBJECT_CONNECTOR {
         return Err(FsError::InvalidData);
@@ -4461,6 +4494,55 @@ fn handle_atomic(
         .chunks_exact(8)
         .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
         .collect();
+    atomic_commit(
+        card_index,
+        mode_state,
+        AtomicRequest {
+            flags: req.flags,
+            user_data: req.user_data,
+            objects: &objects,
+            prop_counts: &prop_counts,
+            props: &props,
+            values: &values,
+        },
+        events,
+        out_fences,
+    )
+}
+
+/// One decoded DRM_IOCTL_MODE_ATOMIC request: its flags and event cookie
+/// and the object/property/value arrays copied in from userspace (or built
+/// by the kernel, as `set_property_atomic` does for a legacy set).
+struct AtomicRequest<'a> {
+    flags: u32,
+    user_data: u64,
+    objects: &'a [u32],
+    prop_counts: &'a [u32],
+    props: &'a [u32],
+    values: &'a [u64],
+}
+
+/// drm_atomic_commit for a decoded request: decode each object's
+/// properties into the atomic state, check it, then commit and present
+/// (or stop after the check for TEST_ONLY).
+fn atomic_commit(
+    card_index: u32,
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    req: AtomicRequest<'_>,
+    events: Option<&narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>>,
+    out_fences: Option<&narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(u64, u64)>>>,
+) -> Result<u64, FsError> {
+    const PAGE_FLIP_EVENT: u32 = 0x0001;
+    const TEST_ONLY: u32 = 0x0100;
+    const ALLOW_MODESET: u32 = 0x0400;
+    let AtomicRequest {
+        objects,
+        prop_counts,
+        props,
+        values,
+        ..
+    } = req;
+    let total_props = props.len();
 
     // The exact timing an atomic MODE_ID set, for the native display.
     let mut native_modes: Vec<(u32, crate::drm::ioctl::DrmModeModeInfo)> = Vec::new();
@@ -5098,7 +5180,7 @@ fn handle_atomic(
         let _ = writeln!(
             narf_console::Writer,
             "  drm: ATOMIC #{n} objs={} props={} flags={:#x} present={}",
-            req.count_objs,
+            objects.len(),
             total_props,
             req.flags,
             presentation

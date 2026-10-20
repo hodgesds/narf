@@ -3971,8 +3971,12 @@ on tiled surfaces, which Linux allows); DCC data is CPU-copied into the
 owned surface (so written uncompressed) and the post CSC always loads set
 A; the cursor matrix of a YCbCr primary is not programmed; offered alternative modes are admitted without the
 display's overlays, and KMS admits planes only on the lit timing (a mode
-switch with overlays relights and falls back if they no longer fit);
-OBJ_SETPROPERTY does not set plane properties. Model-tested only
+switch with overlays relights and falls back if they no longer fit).
+OBJ_SETPROPERTY on a plane of an atomic card is set_property_atomic: a
+blocking one-property commit without ALLOW_MODESET through the atomic
+decode/check/commit (`drm_ioctl_bridge::atomic_commit`, shared with
+DRM_IOCTL_MODE_ATOMIC); out-of-range, immutable or absent properties are
+EINVAL and an unknown plane ENOENT. Model-tested only
 (`dcn401-spl`, `dcn401-dml`, `dcn401-dpp`, `dcn401-mpc`, `dcn401-requestor`,
 `dcn401-deadline`, `dcn401-scanout`, `navi48-modeset`, `navi48-kms`, `drm`,
 `drm_ioctl`); not validated on hardware.

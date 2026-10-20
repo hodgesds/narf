@@ -4134,6 +4134,38 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
     {
         return TestResult::Fail("RMFB of an overlay's framebuffer");
     }
+    // OBJ_SETPROPERTY on a plane: set_property_atomic, a one-property
+    // commit. A valid value commits; a value outside the property's range,
+    // an immutable property ("type"), or one the plane lacks is EINVAL; an
+    // unknown plane is ENOENT.
+    let plane_set = |value: u64, prop: u32, obj: u32| {
+        let mut b = [0u8; 24];
+        b[0..8].copy_from_slice(&value.to_le_bytes());
+        b[8..12].copy_from_slice(&prop.to_le_bytes());
+        b[12..16].copy_from_slice(&obj.to_le_bytes());
+        b[16..20].copy_from_slice(&0xeeee_eeeeu32.to_le_bytes());
+        dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xBA, 24),
+            b.as_mut_ptr() as usize,
+            false,
+        )
+    };
+    if plane_set(0x8000, planes::ALPHA_PROP_ID, OVERLAY + 2) != Ok(0)
+        || ms.lock().native_plane(OVERLAY + 2).unwrap().props.alpha != 0x8000
+        || plane_set(200, planes::ZPOS_PROP_ID, OVERLAY + 2) != Ok(0)
+        || ms.lock().native_plane(OVERLAY + 2).unwrap().props.zpos != 200
+    {
+        return TestResult::Fail("plane OBJ_SETPROPERTY");
+    }
+    if plane_set(255, planes::ZPOS_PROP_ID, OVERLAY + 2) != Err(FsError::InvalidData)
+        || plane_set(0x8000, planes::ALPHA_PROP_ID, 0x40) != Err(FsError::InvalidData)
+        || plane_set(0, 0x50, OVERLAY + 2) != Err(FsError::InvalidData)
+        || plane_set(0x8000, planes::ALPHA_PROP_ID, 0x7ff) != Err(FsError::NotFound)
+        || ms.lock().native_plane(OVERLAY + 2).unwrap().props.zpos != 200
+    {
+        return TestResult::Fail("plane OBJ_SETPROPERTY refusals");
+    }
     TestResult::Pass
 }
 kernel_test_in!(
