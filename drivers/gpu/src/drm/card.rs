@@ -784,7 +784,8 @@ pub struct Card {
     /// do not expose them.
     pub crtc_color: Vec<CrtcColor>,
     /// A native card's planes with amdgpu_dm's plane properties: every
-    /// CRTC's primary and the overlay planes. Empty on cards without them.
+    /// CRTC's primary, the overlay planes and every CRTC's cursor plane.
+    /// Empty on cards without them.
     pub native_planes: Vec<NativePlane>,
     /// The fourccs the native overlay planes take.
     pub overlay_formats: Option<&'static [u32]>,
@@ -836,22 +837,42 @@ impl PlaneProps {
     }
 }
 
-/// One plane of a native card: its id, the CRTC whose primary it is (an
-/// overlay has none and may go on any), its committed CRTC and framebuffer
-/// (a primary's mirror its CRTC's `primary_fb`), source rectangle (whole
-/// pixels: amdgpu_dm ignores the 16.16 fraction) and CRTC rectangle, and
-/// its properties. A primary whose rectangles no atomic commit or SETPLANE
-/// set (`placed` false) shows the whole mode, as legacy SETCRTC sets it.
+/// One plane of a native card: its id, the CRTC whose primary or cursor
+/// it is (an overlay has neither and may go on any), its committed CRTC and
+/// framebuffer (a primary's mirror its CRTC's `primary_fb`), source
+/// rectangle (whole pixels: amdgpu_dm ignores the 16.16 fraction) and CRTC
+/// rectangle, and its properties. A primary whose rectangles no atomic
+/// commit or SETPLANE set (`placed` false) shows the whole mode, as legacy
+/// SETCRTC sets it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NativePlane {
     pub id: u32,
     pub primary_of: Option<u32>,
+    /// The CRTC whose DRM_PLANE_TYPE_CURSOR plane this is
+    /// (amdgpu_dm_crtc_init); None for a primary or an overlay.
+    pub cursor_of: Option<u32>,
     pub crtc_id: Option<u32>,
     pub fb_id: Option<u32>,
     pub src: (u32, u32, u32, u32),
     pub dst: (i32, i32, u32, u32),
     pub placed: bool,
     pub props: PlaneProps,
+    /// A cursor plane's framebuffer is one the legacy CURSOR ioctl wrapped
+    /// around a BO (drm_internal_framebuffer_create): it goes away when the
+    /// plane lets go of it.
+    pub internal_fb: bool,
+    /// A cursor plane's CRTC's legacy cursor position (drm_crtc's
+    /// cursor_x/cursor_y), which a CURSOR ioctl without MOVE keeps.
+    pub legacy_position: (i32, i32),
+}
+impl NativePlane {
+    /// An overlay: neither a primary nor a cursor plane.
+    pub fn is_overlay(&self) -> bool {
+        self.primary_of.is_none() && self.cursor_of.is_none()
+    }
+    pub fn is_cursor(&self) -> bool {
+        self.cursor_of.is_some()
+    }
 }
 
 /// A connector whose modes and EDID come from a real sink, published by a

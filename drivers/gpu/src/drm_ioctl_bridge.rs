@@ -2184,13 +2184,15 @@ pub(crate) fn dispatch_card_for_file(
         // SETCRTC / PAGE_FLIP — blit dumb buffer into the active scanout.
         IoctlCmd::ModeSetCrtc => handle_setcrtc(card_index, &mode_state, arg, &ctx),
         IoctlCmd::ModePageFlip => handle_page_flip(card_index, &mode_state, arg, &ctx, events),
-        // CURSOR / CURSOR2 — no hardware cursor plane; funnel the pointer
+        // CURSOR / CURSOR2 — a card with native cursor planes (Navi48)
+        // updates the CRTC's cursor plane (drm_mode_cursor_universal).
+        // Otherwise there is no hardware cursor plane: funnel the pointer
         // position + visibility into narf_console so narf_fb's cursor
         // renderer composites a sprite onto the scanout. Without this the
         // compositor's pointer is invisible (the ioctl would otherwise be a
         // silent no-op through the generic path).
-        IoctlCmd::ModeCursor => handle_cursor(arg, false),
-        IoctlCmd::ModeCursor2 => handle_cursor(arg, true),
+        IoctlCmd::ModeCursor => handle_cursor(card_index, &mode_state, arg, false, &ctx),
+        IoctlCmd::ModeCursor2 => handle_cursor(card_index, &mode_state, arg, true, &ctx),
         // GEM_CLOSE — free dumb backing if present.
         IoctlCmd::GemClose => handle_gem_close(&mode_state, arg, &ctx),
         // RMFB of a framebuffer on screen turns its CRTC off; the native
@@ -2209,7 +2211,14 @@ pub(crate) fn dispatch_card_for_file(
                 .lock()
                 .native_planes
                 .iter()
-                .filter(|p| p.primary_of.is_none() && p.fb_id == Some(fb_id))
+                .filter(|p| p.is_overlay() && p.fb_id == Some(fb_id))
+                .filter_map(|p| p.crtc_id)
+                .collect();
+            let cursors: Vec<u32> = mode_state
+                .lock()
+                .native_planes
+                .iter()
+                .filter(|p| p.is_cursor() && p.fb_id == Some(fb_id))
                 .filter_map(|p| p.crtc_id)
                 .collect();
             let result = handle_generic(&mode_state, cmd, arg, &ctx);
@@ -2229,6 +2238,12 @@ pub(crate) fn dispatch_card_for_file(
                             .find(|d| d.crtc_id == crtc_id)
                             .map_or(crate::amdgpu_navi48_boot::PlaneSetup::NONE, |d| d.setup);
                         crate::amdgpu_native_kms::request_display_planes(display, setup);
+                    }
+                }
+                // ... and the cursors scanning it go off.
+                for crtc_id in cursors {
+                    if let Some(display) = crate::amdgpu_native_kms::crtc_display(crtc_id) {
+                        crate::amdgpu_native_kms::request_display_cursor(display, None, (0, 0));
                     }
                 }
             }
@@ -3009,7 +3024,9 @@ const PLANE_CRTC_X_PROP_ID: u32 = 0x5b;
 const PLANE_CRTC_Y_PROP_ID: u32 = 0x5c;
 const PLANE_CRTC_W_PROP_ID: u32 = 0x5d;
 const PLANE_CRTC_H_PROP_ID: u32 = 0x5e;
+const DRM_PLANE_TYPE_OVERLAY: u64 = 0;
 const DRM_PLANE_TYPE_PRIMARY: u64 = 1;
+const DRM_PLANE_TYPE_CURSOR: u64 = 2;
 const DRM_MODE_PROP_RANGE: u32 = 1 << 1;
 const DRM_MODE_PROP_IMMUTABLE: u32 = 1 << 2;
 const DRM_MODE_PROP_ENUM: u32 = 1 << 3;
@@ -3084,13 +3101,14 @@ fn handle_getplane_res(
     let mut bytes = unsafe { copy_in(arg, 16)? };
     let plane_id_ptr = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
     let user_count = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-    // The primaries, then a native card's overlay planes.
+    // The primaries, then a native card's overlay and cursor planes.
     let planes: Vec<u32> = {
         let card = mode_state.lock();
         synth_planes(&card)
             .into_iter()
             .map(|(id, _)| id)
             .chain(crate::drm_native_planes::overlay_ids(&card))
+            .chain(crate::drm_native_planes::cursor_ids(&card))
             .collect()
     };
     if plane_id_ptr != 0 && user_count as usize >= planes.len() {
@@ -3133,11 +3151,21 @@ fn handle_getplane(
                 (0, 0),
             ),
             // amdgpu_dm's overlays: possible on every CRTC (0xff), with
-            // their CRTC and framebuffer as committed.
+            // their CRTC and framebuffer as committed. A cursor plane is
+            // possible on its own CRTC only (drm_crtc_init_with_planes) and
+            // takes ARGB8888.
             None => match card
                 .native_plane(plane_id)
                 .filter(|p| p.primary_of.is_none())
             {
+                Some(p) if p.is_cursor() => (
+                    card.crtcs
+                        .iter()
+                        .position(|c| Some(c.id) == p.cursor_of)
+                        .map_or(0, |i| 1u32 << i),
+                    &crate::drm_native_planes::CURSOR_FORMATS[..],
+                    (p.crtc_id.unwrap_or(0), p.fb_id.unwrap_or(0)),
+                ),
                 Some(p) => (
                     0xff,
                     card.overlay_formats.unwrap_or(&[]),
@@ -3366,6 +3394,11 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
             b"pixel blend mode",
             DRM_MODE_PROP_ENUM,
             &crate::drm_native_planes::BLEND_ENUMS,
+        ),
+        crate::drm_native_planes::CURSOR_BLEND_PROP_ID => (
+            b"pixel blend mode",
+            DRM_MODE_PROP_ENUM,
+            &crate::drm_native_planes::CURSOR_BLEND_ENUMS,
         ),
         crate::drm_native_planes::ROTATION_PROP_ID => (
             b"rotation",
@@ -4059,9 +4092,17 @@ fn handle_obj_getproperties(
             .then(|| crate::drm_native_planes::plane_state(&card, obj_id))
             .flatten();
         if let Some(p) = native {
-            let overlay = card
+            let plane_type = card
                 .native_plane(obj_id)
-                .is_some_and(|n| n.primary_of.is_none());
+                .map_or(DRM_PLANE_TYPE_PRIMARY, |n| {
+                    if n.is_cursor() {
+                        DRM_PLANE_TYPE_CURSOR
+                    } else if n.is_overlay() {
+                        DRM_PLANE_TYPE_OVERLAY
+                    } else {
+                        DRM_PLANE_TYPE_PRIMARY
+                    }
+                });
             let mut props = vec![
                 PLANE_TYPE_PROP_ID,
                 PLANE_FB_ID_PROP_ID,
@@ -4077,7 +4118,7 @@ fn handle_obj_getproperties(
                 PLANE_IN_FENCE_FD_PROP_ID,
             ];
             let mut values = vec![
-                if overlay { 0 } else { DRM_PLANE_TYPE_PRIMARY },
+                plane_type,
                 u64::from(p.fb_id.unwrap_or(0)),
                 u64::from(p.crtc_id.unwrap_or(0)),
                 u64::from(p.src_x) << 16,
@@ -4558,6 +4599,8 @@ fn atomic_commit(
     // Native CRTC color and connector Colorspace/HDR changes, likewise.
     let mut color_requests: Vec<(u8, crate::amdgpu_native_kms::CrtcColorRequest)> = Vec::new();
     let mut connector_requests: Vec<crate::amdgpu_native_kms::ConnectorColorRequest> = Vec::new();
+    // Native cursor planes' hardware cursors, likewise.
+    let mut cursor_requests: Vec<CursorRequest> = Vec::new();
     let presentation = {
         let mut card = mode_state.lock();
         // Linux's atomic state grows implicitly while properties are decoded:
@@ -4591,14 +4634,25 @@ fn atomic_commit(
             prop_index = end;
 
             if let Some(mut plane) = crate::drm_native_planes::plane_state(&card, object_id) {
-                // A native card's plane, primary or overlay: its committed
-                // state plus amdgpu_dm's properties.
+                // A native card's plane, primary, overlay or cursor: its
+                // committed state plus amdgpu_dm's properties.
                 if let (Some(crtc_ids), Some(crtc_id)) = (event_crtc_ids.as_mut(), plane.crtc_id) {
                     if !crtc_ids.contains(&crtc_id) {
                         crtc_ids.push(crtc_id);
                     }
                 }
+                // A SRC_* fraction (amdgpu_dm ignores it on other planes).
+                let mut fraction = false;
                 for (&prop, &value) in object_props.iter().zip(object_values) {
+                    if matches!(
+                        prop,
+                        PLANE_SRC_X_PROP_ID
+                            | PLANE_SRC_Y_PROP_ID
+                            | PLANE_SRC_W_PROP_ID
+                            | PLANE_SRC_H_PROP_ID
+                    ) {
+                        fraction |= value & 0xffff != 0;
+                    }
                     match prop {
                         PLANE_FB_ID_PROP_ID => plane.fb_id = (value != 0).then_some(value as u32),
                         PLANE_CRTC_ID_PROP_ID => {
@@ -4624,6 +4678,11 @@ fn atomic_commit(
                         )? => {}
                         _ => return Err(FsError::InvalidData),
                     }
+                }
+                // dm_check_cursor_fb on SRC_* in 16.16: an enabled cursor
+                // shows its whole framebuffer from 0,0, so no fraction.
+                if fraction && cursor_plane_shown(&card, &plane) {
+                    return Err(FsError::InvalidData);
                 }
                 if let (Some(crtc_ids), Some(crtc_id)) = (event_crtc_ids.as_mut(), plane.crtc_id) {
                     if !crtc_ids.contains(&crtc_id) {
@@ -4970,6 +5029,7 @@ fn atomic_commit(
         if test_only {
             None
         } else {
+            let cursors = crate::drm_native_planes::cursor_changes(&card, &state);
             if let Err(error) = state.core_commit(&mut card) {
                 let _ = writeln!(
                     narf_console::Writer,
@@ -4978,6 +5038,7 @@ fn atomic_commit(
                 return Err(FsError::InvalidData);
             }
             crate::drm_native_planes::commit(&mut card, &state);
+            cursor_requests = native_cursor_requests(card_index, &mut card, &cursors);
             for &(connector, value) in &broadcast_rgb {
                 apply_broadcast_rgb(card_index, &mut card, connector, value);
             }
@@ -5037,11 +5098,14 @@ fn atomic_commit(
                         crate::amdgpu_native_kms::request_display_planes(display, dp.setup);
                     }
                 }
-                // The framebuffers' formats.
+                // The framebuffers' formats (a cursor's is not the display's).
                 for plane in &state.planes {
                     let (Some(crtc_id), Some(fb_id)) = (plane.crtc_id, plane.fb_id) else {
                         continue;
                     };
+                    if card.native_plane(plane.id).is_some_and(|p| p.is_cursor()) {
+                        continue;
+                    }
                     if let (Some(display), Ok(fb)) = (
                         crate::amdgpu_native_kms::crtc_display(crtc_id),
                         card.framebuffer(fb_id),
@@ -5051,10 +5115,12 @@ fn atomic_commit(
                 }
             }
             // Every enabled plane presents on the native card (each on its
-            // own display); the CPU-copy cards show one scanout.
+            // own display); the CPU-copy cards show one scanout. A cursor
+            // plane shows on the hardware cursor instead.
             let active_planes: Vec<(u32, u32)> = state
                 .planes
                 .iter()
+                .filter(|plane| !card.native_plane(plane.id).is_some_and(|p| p.is_cursor()))
                 .filter_map(|plane| Some((plane.crtc_id?, plane.fb_id?)))
                 .take(if amdgpu { usize::MAX } else { 1 })
                 .collect();
@@ -5175,6 +5241,7 @@ fn atomic_commit(
     for request in connector_requests {
         crate::amdgpu_native_kms::request_connector_color(request);
     }
+    send_cursor_requests(cursor_requests);
 
     let (log, n) = should_log(&ATOMIC_N);
     if log {
@@ -5221,13 +5288,21 @@ fn atomic_commit(
 ///
 /// `struct drm_mode_cursor` is `{ flags, crtc_id, x, y, width, height,
 /// handle }` (7 × u32 = 28 bytes); CURSOR2 appends `{ hot_x, hot_y }`
-/// (36 bytes). We have no hardware cursor plane, so we don't consume the
-/// BO bitmap — instead we drive narf_fb's software cursor sprite from the
-/// position + visibility. `DRM_MODE_CURSOR_BO` with handle 0 hides the
-/// pointer; a non-zero handle shows it; `DRM_MODE_CURSOR_MOVE` repositions.
+/// (36 bytes). On a card with native cursor planes this updates the
+/// CRTC's cursor plane (`cursor_universal`). Otherwise we have no hardware
+/// cursor plane, so we don't consume the BO bitmap — instead we drive
+/// narf_fb's software cursor sprite from the position + visibility.
+/// `DRM_MODE_CURSOR_BO` with handle 0 hides the pointer; a non-zero handle
+/// shows it; `DRM_MODE_CURSOR_MOVE` repositions.
 ///
 /// Linux ref: `drivers/gpu/drm/drm_plane.c::drm_mode_cursor_common`.
-fn handle_cursor(arg: usize, with_hotspot: bool) -> Result<u64, FsError> {
+fn handle_cursor(
+    card_index: u32,
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    arg: usize,
+    with_hotspot: bool,
+    ctx: &DrmFileCtx,
+) -> Result<u64, FsError> {
     const DRM_MODE_CURSOR_BO: u32 = 0x01;
     const DRM_MODE_CURSOR_MOVE: u32 = 0x02;
     let want = if with_hotspot { 36 } else { 28 };
@@ -5242,6 +5317,20 @@ fn handle_cursor(arg: usize, with_hotspot: bool) -> Result<u64, FsError> {
     let x = rd_i32(8);
     let y = rd_i32(12);
     let handle = rd_u32(24);
+    if !mode_state.lock().native_planes.is_empty() {
+        return cursor_universal(
+            card_index,
+            mode_state,
+            ctx,
+            LegacyCursor {
+                flags,
+                crtc_id: rd_u32(4),
+                position: (x, y),
+                size: (rd_u32(16), rd_u32(20)),
+                handle,
+            },
+        );
+    }
     // CURSOR2 reports the hotspot — the active point inside the BO. Our
     // sprite's tip is at its own top-left, so shift the draw position by the
     // hotspot to keep the tip under the true pointer.
@@ -5264,6 +5353,197 @@ fn handle_cursor(arg: usize, with_hotspot: bool) -> Result<u64, FsError> {
         narf_console::user_cursor_move(px, py);
     }
     Ok(0)
+}
+
+/// One DRM_IOCTL_MODE_CURSOR{,2} request. CURSOR2's hotspot is not kept:
+/// amdgpu is not DRIVER_CURSOR_HOTSPOT, so its cursor planes carry no
+/// HOTSPOT_X/Y (drm_mode_cursor_universal drops it).
+struct LegacyCursor {
+    flags: u32,
+    crtc_id: u32,
+    position: (i32, i32),
+    size: (u32, u32),
+    handle: u32,
+}
+
+/// drm_mode_cursor_common then drm_mode_cursor_universal on a card with
+/// native cursor planes: the CRTC's cursor plane shows a framebuffer
+/// wrapped around the BO (drm_internal_framebuffer_create: ARGB8888, pitch
+/// width * 4) at the new position or the CRTC's last legacy one, or goes
+/// off, through the cursor plane's atomic checks (`__setplane_atomic`).
+fn cursor_universal(
+    card_index: u32,
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    ctx: &DrmFileCtx,
+    req: LegacyCursor,
+) -> Result<u64, FsError> {
+    const DRM_MODE_CURSOR_BO: u32 = 0x01;
+    const DRM_MODE_CURSOR_MOVE: u32 = 0x02;
+    // CURSOR and CURSOR2 are DRM_MASTER ioctls.
+    if !ctx.is_master {
+        return Err(FsError::PermissionDenied);
+    }
+    if req.flags == 0 || req.flags & !(DRM_MODE_CURSOR_BO | DRM_MODE_CURSOR_MOVE) != 0 {
+        return Err(FsError::InvalidData);
+    }
+    let requests = {
+        let mut card = mode_state.lock();
+        card.crtc(req.crtc_id).map_err(|_| FsError::NotFound)?;
+        let cursor =
+            *crate::drm_native_planes::cursor_of(&card, req.crtc_id).ok_or(FsError::InvalidData)?;
+        let mut wrapped = None;
+        let fb_id = if req.flags & DRM_MODE_CURSOR_BO == 0 {
+            cursor.fb_id
+        } else if req.handle == 0 {
+            None
+        } else {
+            let mut cmd = crate::amdgpu_dm_modifiers::FbCmd {
+                width: req.size.0,
+                height: req.size.1,
+                pixel_format: crate::drm_native_planes::CURSOR_FORMATS[0],
+                ..Default::default()
+            };
+            cmd.handles[0] = req.handle;
+            cmd.pitches[0] = req.size.0.wrapping_mul(4);
+            let id = card.addfb2_cmd(&cmd).map_err(|e| match e {
+                crate::drm::card::CardError::BadGemHandle => FsError::NotFound,
+                _ => FsError::InvalidData,
+            })?;
+            wrapped = Some(id);
+            Some(id)
+        };
+        let position = if req.flags & DRM_MODE_CURSOR_MOVE != 0 {
+            req.position
+        } else {
+            cursor.legacy_position
+        };
+        let (w, h) = fb_id
+            .and_then(|id| card.framebuffer(id).ok())
+            .map_or((0, 0), |fb| (fb.width, fb.height));
+        let plane = crate::drm::atomic::PlaneState {
+            id: cursor.id,
+            crtc_id: fb_id.map(|_| req.crtc_id),
+            fb_id,
+            crtc_x: position.0,
+            crtc_y: position.1,
+            crtc_w: w,
+            crtc_h: h,
+            src_x: 0,
+            src_y: 0,
+            src_w: w,
+            src_h: h,
+            in_fence_fd: None,
+            props: Some(cursor.props),
+        };
+        match commit_cursor_plane(card_index, &mut card, plane) {
+            Ok(requests) => {
+                if let Some(p) = card.native_planes.iter_mut().find(|p| p.id == cursor.id) {
+                    if wrapped.is_some() {
+                        p.internal_fb = true;
+                    }
+                    if req.flags & DRM_MODE_CURSOR_MOVE != 0 {
+                        p.legacy_position = req.position;
+                    }
+                }
+                requests
+            }
+            Err(e) => {
+                // The wrapped framebuffer goes with the failed update.
+                if let Some(id) = wrapped {
+                    release_framebuffer(&mut card, id);
+                }
+                return Err(e);
+            }
+        }
+    };
+    send_cursor_requests(requests);
+    Ok(0)
+}
+
+/// One native cursor plane's commit for the CRTC's hardware cursor.
+struct CursorRequest {
+    crtc_id: u32,
+    image: Option<crate::amdgpu_navi48_platform::CursorImage>,
+    position: (i32, i32),
+}
+
+/// Whether native plane state `plane` is a cursor plane shown on a CRTC.
+fn cursor_plane_shown(
+    card: &crate::drm::card::Card,
+    plane: &crate::drm::atomic::PlaneState,
+) -> bool {
+    plane.fb_id.is_some()
+        && plane.crtc_id.is_some()
+        && card.native_plane(plane.id).is_some_and(|p| p.is_cursor())
+}
+
+/// A one-plane commit of a native cursor plane, as `__setplane_atomic`
+/// (legacy CURSOR, SETPLANE) runs it: the core and amdgpu_dm checks, then
+/// the commit. Returns the hardware cursor requests.
+fn commit_cursor_plane(
+    card_index: u32,
+    card: &mut crate::drm::card::Card,
+    plane: crate::drm::atomic::PlaneState,
+) -> Result<Vec<CursorRequest>, FsError> {
+    let mut state = crate::drm::atomic::AtomicState::default();
+    state.planes.push(plane);
+    let policy = crate::drm::atomic::AtomicCheckPolicy::default();
+    if state.core_check(card, &policy).is_err() {
+        return Err(FsError::InvalidData);
+    }
+    crate::drm_native_planes::check(card, &state, |c| card.crtc(c).ok().and_then(|c| c.mode))?;
+    let cursors = crate::drm_native_planes::cursor_changes(card, &state);
+    if state.core_commit(card).is_err() {
+        return Err(FsError::InvalidData);
+    }
+    crate::drm_native_planes::commit(card, &state);
+    Ok(native_cursor_requests(card_index, card, &cursors))
+}
+
+/// amdgpu_dm_commit_cursors for committed cursor plane changes: each
+/// CRTC's image (read out of the framebuffer's BO) and position for the
+/// native display, after the legacy-wrapped framebuffers the planes let go
+/// of are removed. Only the native amdgpu card has a hardware cursor.
+fn native_cursor_requests(
+    card_index: u32,
+    card: &mut crate::drm::card::Card,
+    changes: &[crate::drm_native_planes::CursorChange],
+) -> Vec<CursorRequest> {
+    for c in changes {
+        if let Some(fb) = c.released_fb {
+            release_framebuffer(card, fb);
+        }
+    }
+    if crate::drm_registry::driver_name(card_index) != Some("amdgpu") {
+        return Vec::new();
+    }
+    changes
+        .iter()
+        .map(|c| CursorRequest {
+            crtc_id: c.crtc_id,
+            image: c
+                .fb_id
+                .and_then(|fb| crate::drm_native_planes::cursor_image(card, fb)),
+            position: c.position,
+        })
+        .collect()
+}
+
+fn send_cursor_requests(requests: Vec<CursorRequest>) {
+    for r in requests {
+        if let Some(display) = crate::amdgpu_native_kms::crtc_display(r.crtc_id) {
+            crate::amdgpu_native_kms::request_display_cursor(display, r.image, r.position);
+        }
+    }
+}
+
+/// Drop a kernel-held framebuffer (a legacy-wrapped cursor one), freeing
+/// its backing when that was the last reference, as RMFB does.
+fn release_framebuffer(card: &mut crate::drm::card::Card, fb_id: u32) {
+    if let Ok(Some((phys, order))) = card.rmfb(fb_id) {
+        let frame = narf_memory::frame::PhysFrame::new(narf_memory::addr::PhysAddr::new(phys));
+        narf_memory::frame::free_pages(frame, order);
+    }
 }
 
 /// DRM_IOCTL_MODE_CREATE_DUMB — allocate a dumb buffer (physically
@@ -6055,6 +6335,7 @@ fn handle_setplane(
     let (crtc_x, crtc_y, crtc_w, crtc_h) = (word(4) as i32, word(5) as i32, word(6), word(7));
     let (src_x, src_y, src_h, src_w) = (word(8), word(9), word(10), word(11));
     let amdgpu = crate::drm_registry::driver_name(card_index) == Some("amdgpu");
+    let mut cursor_requests = Vec::new();
     let presentation = {
         let mut card = mode_state.lock();
         if card.native_planes.is_empty() {
@@ -6062,6 +6343,7 @@ fn handle_setplane(
         }
         let mut plane =
             crate::drm_native_planes::plane_state(&card, plane_id).ok_or(FsError::NotFound)?;
+        let cursor = card.native_plane(plane_id).is_some_and(|p| p.is_cursor());
         if fb_id == 0 {
             plane.crtc_id = None;
             plane.fb_id = None;
@@ -6097,56 +6379,69 @@ fn handle_setplane(
             plane.src_y = src_y >> 16;
             plane.src_w = src_w >> 16;
             plane.src_h = src_h >> 16;
+            // dm_check_cursor_fb on the 16.16 source.
+            if cursor && (src_x | src_y | src_w | src_h) & 0xffff != 0 {
+                return Err(FsError::InvalidData);
+            }
         }
-        let mut state = crate::drm::atomic::AtomicState::default();
-        state.planes.push(plane);
-        let policy = crate::drm::atomic::AtomicCheckPolicy::default();
-        if state.core_check(&card, &policy).is_err() {
-            return Err(FsError::InvalidData);
-        }
-        let displays = crate::drm_native_planes::check(&card, &state, |c| {
-            card.crtc(c).ok().and_then(|c| c.mode)
-        })?;
-        for dp in &displays {
-            if let Some(d) = crate::amdgpu_native_kms::crtc_display(dp.crtc_id).filter(|_| amdgpu) {
-                if !crate::amdgpu_native_kms::display_admits_planes(
-                    d,
-                    None,
-                    None,
-                    dp.primary_format,
-                    &dp.setup,
-                ) {
-                    return Err(FsError::InvalidData);
+        if cursor {
+            // drm_atomic_helper_update_plane: a legacy cursor update.
+            cursor_requests = commit_cursor_plane(card_index, &mut card, plane)?;
+            Vec::new()
+        } else {
+            let mut state = crate::drm::atomic::AtomicState::default();
+            state.planes.push(plane);
+            let policy = crate::drm::atomic::AtomicCheckPolicy::default();
+            if state.core_check(&card, &policy).is_err() {
+                return Err(FsError::InvalidData);
+            }
+            let displays = crate::drm_native_planes::check(&card, &state, |c| {
+                card.crtc(c).ok().and_then(|c| c.mode)
+            })?;
+            for dp in &displays {
+                if let Some(d) =
+                    crate::amdgpu_native_kms::crtc_display(dp.crtc_id).filter(|_| amdgpu)
+                {
+                    if !crate::amdgpu_native_kms::display_admits_planes(
+                        d,
+                        None,
+                        None,
+                        dp.primary_format,
+                        &dp.setup,
+                    ) {
+                        return Err(FsError::InvalidData);
+                    }
                 }
             }
-        }
-        if state.core_commit(&mut card).is_err() {
-            return Err(FsError::InvalidData);
-        }
-        crate::drm_native_planes::commit(&mut card, &state);
-        let mut frames = Vec::new();
-        for dp in &displays {
-            let Some(display) =
-                crate::amdgpu_native_kms::crtc_display(dp.crtc_id).filter(|_| amdgpu)
-            else {
-                continue;
-            };
-            crate::amdgpu_native_kms::request_display_planes(display, dp.setup);
-            let primary = (card.native_plane(plane_id).and_then(|p| p.primary_of)
-                == Some(dp.crtc_id))
-            .then(|| native_plane_frame(&card, &state.planes[0]))
-            .flatten();
-            if let Some(f) = primary {
-                crate::amdgpu_native_kms::request_display_format(display, f.format);
+            if state.core_commit(&mut card).is_err() {
+                return Err(FsError::InvalidData);
             }
-            let overlays = dp.overlays.map(|id| {
-                id.filter(|&id| id == plane_id)
-                    .and_then(|_| native_plane_frame(&card, &state.planes[0]))
-            });
-            frames.push((dp.crtc_id, primary, overlays));
+            crate::drm_native_planes::commit(&mut card, &state);
+            let mut frames = Vec::new();
+            for dp in &displays {
+                let Some(display) =
+                    crate::amdgpu_native_kms::crtc_display(dp.crtc_id).filter(|_| amdgpu)
+                else {
+                    continue;
+                };
+                crate::amdgpu_native_kms::request_display_planes(display, dp.setup);
+                let primary = (card.native_plane(plane_id).and_then(|p| p.primary_of)
+                    == Some(dp.crtc_id))
+                .then(|| native_plane_frame(&card, &state.planes[0]))
+                .flatten();
+                if let Some(f) = primary {
+                    crate::amdgpu_native_kms::request_display_format(display, f.format);
+                }
+                let overlays = dp.overlays.map(|id| {
+                    id.filter(|&id| id == plane_id)
+                        .and_then(|_| native_plane_frame(&card, &state.planes[0]))
+                });
+                frames.push((dp.crtc_id, primary, overlays));
+            }
+            frames
         }
-        frames
     };
+    send_cursor_requests(cursor_requests);
     for (crtc_id, primary, overlays) in presentation {
         present_native_planes(card_index, crtc_id, primary, overlays, None);
     }

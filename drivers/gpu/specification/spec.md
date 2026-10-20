@@ -2082,8 +2082,10 @@ observers run). It try-locks the owner, uploads the image once, moves it
 afterwards, and hides it with an off-screen move. When the owner is busy it
 skips the update but still reports the cursor as handled, so the fb layer
 never paints a software sprite into a hardware-cursor surface. The fb cursor
-pump uses it for both the console pointer and a compositor's DRM cursor
-whenever the console adopted exactly the published scanout.
+pump uses it for the console pointer whenever the console adopted exactly
+the published scanout; on a display whose cursor a DRM cursor plane drives
+(see "Navi 48 DRM cursor planes") it reports the cursor handled and leaves
+the hardware alone.
 
 Native 8b/10b MST uses `dp_mst_mgr::Manager` over the port's DMUB AUX channel.
 `ColdBoot::display_mst_capable(port)` checks DPCD revision and MSTM_CAP before
@@ -4379,10 +4381,93 @@ change of the stream's ODM split (or another display's pipes) still
 relights; MST displays relight; DET of freed pipes is not returned to the
 compressed buffer until a relight repartitions; no DCC/compbuf or MALL/SubVP
 reprogramming beyond the default DET; the cursor matrix of a YCbCr plane is
-not programmed (its cursor colors pass unconverted); no DRM cursor plane
-(the legacy CURSOR ioctls drive the fb pointer on the hardware cursor).
+not programmed (its cursor colors pass unconverted). DRM cursor planes are
+described in "Navi 48 DRM cursor planes".
 Model-tested only (`dcn401-plane-update`, `dcn401-cursor`,
 `dcn401-scanout`, `navi48-modeset`, `navi48-kms`); not validated on
+hardware.
+
+### Navi 48 DRM cursor planes
+
+The native card gives every CRTC amdgpu_dm's DRM_PLANE_TYPE_CURSOR plane
+(amdgpu_dm_crtc_init, amdgpu_dm_plane_init with no plane caps):
+`drm_native_planes::planes_for` appends one per CRTC after the primaries and
+overlays (`CURSOR_PLANE_ID_BASE` 0x47 + CRTC index, `NativePlane::cursor_of`
+naming its CRTC; `NativePlane::is_overlay`/`is_cursor`; `cursor_ids`,
+`cursor_of`). GETPLANERESOURCES lists them last; GETPLANE reports
+possible_crtcs of its own CRTC only (drm_crtc_init_with_planes) and
+`CURSOR_FORMATS` (ARGB8888); OBJ_GETPROPERTIES reports type Cursor (2), the
+core plane properties, its own "pixel blend mode" (`CURSOR_BLEND_PROP_ID`,
+Pre-multiplied only: DC blends the cursor pre-multiplied) and immutable
+"zpos" 255 (`CURSOR_ZPOS_PROP_ID`), then IN_FORMATS and IN_FORMATS_ASYNC:
+ARGB8888 under DRM_FORMAT_MOD_LINEAR alone
+(amdgpu_dm_plane_get_plane_modifiers for a cursor). It has no rotation,
+alpha, color or HOTSPOT_X/Y properties (amdgpu is not
+DRIVER_CURSOR_HOTSPOT), and DRM_CAP_CURSOR_WIDTH/HEIGHT stay 64.
+
+Checks (`drm_native_planes::check`, so ATOMIC with TEST_ONLY, plane
+OBJ_SETPROPERTY, SETPLANE and the legacy ioctls alike), each EINVAL:
+drm_atomic_plane_check's possible_crtcs and format/modifier (ARGB8888,
+LINEAR); for an enabled cursor `check_cursor(CursorFb, src, crtc)`:
+amdgpu_dm_check_native_cursor_state with dm_check_cursor_fb (SRC_X/Y 0, the
+whole framebuffer as source, at most dc caps' max_cursor_size 64 square, a
+pitch of exactly the width in 64, 128 or 256 pixels, linear) and
+amdgpu_dm_atomic_check's DCN 4.x refusal of a scaled cursor (CRTC_W/H equal
+to the source); a SRC_* fraction on an enabled cursor is refused at decode
+(Linux compares the 16.16 values). The cursor's CRTC gets
+dm_crtc_helper_atomic_check (an enabled CRTC needs its primary), but DC gets
+no plane: amdgpu_dm_crtc_get_cursor_mode is always native on DCN 4.0.1, so
+a cursor commit is a FAST update and relights nothing. Negative CRTC_X/Y are
+taken; the hardware moves them into the hotspot
+(amdgpu_dm_plane_get_cursor_position). `tests/dcn401_cursor_plane/check.sh`
+builds dm_check_cursor_fb, amdgpu_dm_check_native_cursor_state and the DCN4
+scaling rule from the Linux tree and answers 2340 vectors (sizes, pitches,
+modifiers and GFX12 tiling flags, cropping, fractions, scaling), replayed by
+`drm_native_planes_check_cursor_matches_linux`.
+
+Commit: `drm_native_planes::cursor_changes(card, state)` (before the commit)
+gives handle_cursor_update's input per cursor plane (the CRTC, the
+framebuffer or off, CRTC_X/Y, a legacy-wrapped framebuffer it lets go of);
+the bridge reads the framebuffer's rows out of its dumb BO
+(`drm_native_planes::cursor_image`) and sends
+`amdgpu_native_kms::request_display_cursor(display, image, position)` after
+the card lock drops. Cursor planes never present frames, set the display's
+format or reserve hardware flip tickets; a cursor-only commit's event is
+software-paced. `platform::request_display_cursor` records the plane per
+display (`CursorImage`, premultiplied ARGB8888) and a task converges the
+pipe's hardware cursor under OWNER (`drm_cursor_step`: an image the pipe does
+not hold is uploaded with `set_display_cursor`, the one it holds is moved,
+an off plane hides it with an off-screen move); every monitor pass converges
+again, so a relit display gets its cursor back (amdgpu_dm commits cursors
+after the planes). While DRM drives a display's cursor the console's cursor
+hook leaves it alone; the last DRM file closing (`restore_displays`) turns
+DRM's cursors off and the console uploads its pointer again. RMFB of a
+cursor's framebuffer turns the cursor off.
+
+Legacy CURSOR/CURSOR2 on a card with native planes are
+drm_mode_cursor_common and drm_mode_cursor_universal: DRM_MASTER (EACCES),
+flags none or unknown EINVAL, an unknown CRTC ENOENT; DRM_MODE_CURSOR_BO
+wraps the BO in an internal framebuffer (drm_internal_framebuffer_create:
+ARGB8888, pitch width * 4, ENOENT for an unknown handle, amdgpu's
+framebuffer checks) or, with handle 0, turns the cursor off; without BO the
+plane keeps its framebuffer; without DRM_MODE_CURSOR_MOVE the position is the
+CRTC's last legacy one (`NativePlane::legacy_position`, updated only by a
+successful MOVE). The update then runs the cursor plane's checks and commit
+(`__setplane_atomic`); a refused update drops the wrapped framebuffer, and
+the plane's previous wrapped framebuffer (`NativePlane::internal_fb`) goes
+when it takes another. CURSOR2's hotspot is dropped, as Linux does for a
+driver without DRIVER_CURSOR_HOTSPOT. SETPLANE of a cursor plane takes the
+same path. Cards without native planes keep the fb pointer path.
+
+Gaps and deviations from Linux: the hardware cursor scans a copy of the
+framebuffer taken at the commit (Linux scans the pinned BO), so drawing into
+a shown cursor BO without a new commit is not seen; a framebuffer without a
+dumb BO turns the cursor off; a wrapped framebuffer is listed by
+GETRESOURCES and removable by id like a client's (Linux keeps it off the
+file's list); OBJ_GETPROPERTIES lists IN_FORMATS after the blend mode and
+zpos, as on the other native planes (Linux attaches it first); cursor
+updates are not tear-free (one cursor buffer per pipe). Model-tested only
+(`drivers/gpu/drm`, `drivers/gpu/drm_ioctl`, `navi48-kms`); not validated on
 hardware.
 
 ### Discrete RDNA2 PSP secure-OS bootstrap

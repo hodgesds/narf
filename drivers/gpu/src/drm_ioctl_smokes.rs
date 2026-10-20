@@ -3792,7 +3792,8 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
         crtc.primary_fb = Some(fbs.0);
         (fbs.0, fbs.1, fbs.2, fbs.3, tiled_fb)
     };
-    // GETPLANERESOURCES: both primaries, then the three overlays.
+    // GETPLANERESOURCES: both primaries, the three overlays, then both
+    // cursor planes.
     let mut ids = [0u32; 8];
     let mut res = [0u8; 16];
     res[0..8].copy_from_slice(&(ids.as_mut_ptr() as u64).to_le_bytes());
@@ -3803,8 +3804,8 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
         res.as_mut_ptr() as usize,
         false,
     ) != Ok(0)
-        || res[8..12] != 5u32.to_le_bytes()
-        || ids[..5] != [0x40, 0x41, OVERLAY, OVERLAY + 1, OVERLAY + 2]
+        || res[8..12] != 7u32.to_le_bytes()
+        || ids[..7] != [0x40, 0x41, OVERLAY, OVERLAY + 1, OVERLAY + 2, 0x47, 0x48]
     {
         return TestResult::Fail("plane resources");
     }
@@ -4238,3 +4239,470 @@ kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_ioctl_native_overlay_planes
 );
+
+// ── amdgpu_dm's cursor planes ─────────────────────────────────────────
+//
+// The Navi48 card's shape again: every CRTC also has amdgpu_dm's
+// DRM_PLANE_TYPE_CURSOR plane. ATOMIC (TEST_ONLY included), SETPLANE and
+// the legacy CURSOR/CURSOR2 ioctls (drm_mode_cursor_universal) update it
+// through amdgpu_dm's cursor checks; the hardware cursor it drives is the
+// native display's (this card has none).
+fn smoke_drm_ioctl_native_cursor_plane() -> TestResult {
+    use crate::amdgpu_dm_modifiers::{FbCmd, FB_MODIFIERS};
+    use crate::drm::card::DumbBacking;
+    use crate::drm_native_planes as planes;
+    const XR24: u32 = 0x3432_5258;
+    const AR24: u32 = 0x3432_5241;
+    const CURSOR: u32 = planes::CURSOR_PLANE_ID_BASE;
+    let idx = register_test_card();
+    let Some(ms) = crate::drm_registry::mode_state(idx) else {
+        return TestResult::Fail("no mode state");
+    };
+    let tiled = crate::amdgpu_dcn401_otg::Tiling {
+        swizzle: crate::amdgpu_dcn401_otg::Swizzle::S256B2D,
+        dcc: None,
+    };
+    let (cursor_fb, narrow_fb, wide_fb, opaque_fb, tiled_fb, cursor_bo, tiled_bo) = {
+        let mut card = ms.lock();
+        card.native_atomic = true;
+        card.plane_formats = Some(&crate::amdgpu_navi48_kms::PLANE_FORMATS);
+        card.overlay_formats = Some(&crate::amdgpu_navi48_kms::PLANE_FORMATS);
+        card.native_planes = planes::planes_for(&[], &[11, 12]);
+        card.gfx12_modifiers = true;
+        let mut bo = |phys: u64, size: usize| {
+            let handle = card.gem.alloc(phys, size).unwrap();
+            card.dumb_backings.push(DumbBacking {
+                gem_handle: handle,
+                phys,
+                byte_len: size,
+                order: 0,
+                mmap_offset: (handle as u64) << 12,
+                refcount: 1,
+                dma_buf: Default::default(),
+            });
+            handle
+        };
+        let primary_bo = bo(0xBE80_0000, 256 * 32);
+        let cursor_bo = bo(0xBE90_0000, 512 * 64);
+        let tiled_bo = bo(0xBEA0_0000, 1 << 20);
+        let mut fb = |w: u32, h: u32, format: u32, pitch: u32, handle: u32, modifier: u64| {
+            let mut cmd = FbCmd {
+                width: w,
+                height: h,
+                pixel_format: format,
+                flags: FB_MODIFIERS,
+                ..FbCmd::default()
+            };
+            cmd.handles[0] = handle;
+            cmd.pitches[0] = pitch;
+            cmd.modifier[0] = modifier;
+            card.addfb2_cmd(&cmd).unwrap()
+        };
+        let primary = fb(64, 32, XR24, 256, primary_bo, 0);
+        let fbs = (
+            fb(64, 64, AR24, 256, cursor_bo, 0),
+            fb(32, 32, AR24, 256, cursor_bo, 0),
+            fb(128, 64, AR24, 512, cursor_bo, 0),
+            fb(64, 64, XR24, 256, cursor_bo, 0),
+            fb(64, 64, AR24, 256, tiled_bo, tiled.modifier()),
+        );
+        let crtc = card.crtc_mut(11).unwrap();
+        crtc.mode = Some(crate::Mode {
+            width: 64,
+            height: 32,
+            refresh_hz: 60,
+            bpp: 32,
+        });
+        crtc.enabled = true;
+        crtc.primary_fb = Some(primary);
+        (fbs.0, fbs.1, fbs.2, fbs.3, fbs.4, cursor_bo, tiled_bo)
+    };
+    // GETPLANE: each CRTC's cursor goes on that CRTC alone and takes
+    // ARGB8888.
+    let getplane = |id: u32| {
+        let mut formats = [0u32; 4];
+        let mut gp = [0u8; 32];
+        gp[0..4].copy_from_slice(&id.to_le_bytes());
+        gp[20..24].copy_from_slice(&4u32.to_le_bytes());
+        gp[24..32].copy_from_slice(&(formats.as_mut_ptr() as u64).to_le_bytes());
+        let r = dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xB6, 32),
+            gp.as_mut_ptr() as usize,
+            false,
+        );
+        let word = |i: usize| u32::from_le_bytes(gp[i * 4..i * 4 + 4].try_into().unwrap());
+        (r, word(1), word(2), word(3), word(5), formats[0])
+    };
+    if getplane(CURSOR) != (Ok(0), 0, 0, 1, 1, AR24) || getplane(CURSOR + 1).3 != 2 {
+        return TestResult::Fail("cursor GETPLANE");
+    }
+    // OBJ_GETPROPERTIES: type Cursor, the core plane properties, then
+    // amdgpu_dm's: its own blend mode and immutable zpos, IN_FORMATS and
+    // IN_FORMATS_ASYNC.
+    let mut props = [0u32; 20];
+    let mut vals = [0u64; 20];
+    let mut og = [0u8; 32];
+    og[0..8].copy_from_slice(&(props.as_mut_ptr() as u64).to_le_bytes());
+    og[8..16].copy_from_slice(&(vals.as_mut_ptr() as u64).to_le_bytes());
+    og[16..20].copy_from_slice(&20u32.to_le_bytes());
+    og[20..24].copy_from_slice(&CURSOR.to_le_bytes());
+    og[24..28].copy_from_slice(&0xeeee_eeeeu32.to_le_bytes());
+    let r = dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xB9, 32),
+        og.as_mut_ptr() as usize,
+        false,
+    );
+    let blob = u64::from(planes::in_formats_blob_id(CURSOR));
+    if r != Ok(0)
+        || og[16..20] != 16u32.to_le_bytes()
+        || (props[0], vals[0]) != (0x50, 2)
+        || props[12..16]
+            != [
+                planes::CURSOR_BLEND_PROP_ID,
+                planes::CURSOR_ZPOS_PROP_ID,
+                planes::IN_FORMATS_PROP_ID,
+                planes::IN_FORMATS_ASYNC_PROP_ID,
+            ]
+        || vals[12..16]
+            != [
+                0,
+                255,
+                blob,
+                u64::from(planes::in_formats_async_blob_id(CURSOR)),
+            ]
+    {
+        return TestResult::Fail("cursor properties");
+    }
+    let getproperty = |id: u32| {
+        let mut values = [0u64; 4];
+        let mut enums = [0u8; 4 * 40];
+        let mut gp = [0u8; 64];
+        gp[0..8].copy_from_slice(&(values.as_mut_ptr() as u64).to_le_bytes());
+        gp[8..16].copy_from_slice(&(enums.as_mut_ptr() as u64).to_le_bytes());
+        gp[16..20].copy_from_slice(&id.to_le_bytes());
+        gp[56..60].copy_from_slice(&4u32.to_le_bytes());
+        gp[60..64].copy_from_slice(&4u32.to_le_bytes());
+        let r = dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xAA, 64),
+            gp.as_mut_ptr() as usize,
+            false,
+        );
+        let flags = u32::from_le_bytes(gp[20..24].try_into().unwrap());
+        let name_end = gp[24..56].iter().position(|&b| b == 0).unwrap_or(32);
+        let name = alloc::vec::Vec::from(&gp[24..24 + name_end]);
+        let n = u32::from_le_bytes(gp[56..60].try_into().unwrap()) as usize;
+        (r, flags, name, values[..n.min(4)].to_vec(), enums)
+    };
+    let (r, flags, name, values, enums) = getproperty(planes::CURSOR_BLEND_PROP_ID);
+    if r != Ok(0)
+        || flags != 8
+        || name != b"pixel blend mode"
+        || values != [0]
+        || &enums[8..23] != b"Pre-multiplied\0"
+    {
+        return TestResult::Fail("cursor pixel blend mode property");
+    }
+    let (r, flags, name, values, _) = getproperty(planes::CURSOR_ZPOS_PROP_ID);
+    if r != Ok(0) || flags != 2 | 4 || name != b"zpos" || values != [255, 255] {
+        return TestResult::Fail("cursor zpos property");
+    }
+    // IN_FORMATS: ARGB8888 under DRM_FORMAT_MOD_LINEAR alone.
+    let mut data = [0u8; 128];
+    let mut gb = [0u8; 16];
+    gb[0..4].copy_from_slice(&(blob as u32).to_le_bytes());
+    gb[4..8].copy_from_slice(&128u32.to_le_bytes());
+    gb[8..16].copy_from_slice(&(data.as_mut_ptr() as u64).to_le_bytes());
+    let r = dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xAC, 16),
+        gb.as_mut_ptr() as usize,
+        false,
+    );
+    if r != Ok(0)
+        || gb[4..8] != 56u32.to_le_bytes()
+        || data[8..12] != 1u32.to_le_bytes()
+        || data[16..20] != 1u32.to_le_bytes()
+        || data[24..28] != AR24.to_le_bytes()
+        || data[48..56] != [0; 8]
+    {
+        return TestResult::Fail("cursor IN_FORMATS blob");
+    }
+    // ATOMIC: set, move and disable the cursor; TEST_ONLY changes nothing.
+    let atomic = |flags: u32, plane: u32, props: &[(u32, u64)]| {
+        let objs = [plane];
+        let counts = [props.len() as u32];
+        let ids: alloc::vec::Vec<u32> = props.iter().map(|p| p.0).collect();
+        let values: alloc::vec::Vec<u64> = props.iter().map(|p| p.1).collect();
+        let mut req = DrmModeAtomicUapi {
+            flags,
+            count_objs: 1,
+            objs_ptr: objs.as_ptr() as u64,
+            count_props_ptr: counts.as_ptr() as u64,
+            props_ptr: ids.as_ptr() as u64,
+            prop_values_ptr: values.as_ptr() as u64,
+            ..Default::default()
+        };
+        dispatch_card(
+            idx,
+            DRM_IOCTL_MODE_ATOMIC,
+            &mut req as *mut _ as usize,
+            false,
+        )
+    };
+    const FB_ID: u32 = 0x55;
+    const CRTC_ID: u32 = 0x56;
+    let place = |fb: u32, crtc: u64, src: (u64, u64), dst: (i64, i64, u64, u64)| {
+        alloc::vec![
+            (FB_ID, u64::from(fb)),
+            (CRTC_ID, crtc),
+            (0x57, 0),
+            (0x58, 0),
+            (0x59, src.0),
+            (0x5a, src.1),
+            (0x5b, dst.0 as u64),
+            (0x5c, dst.1 as u64),
+            (0x5d, dst.2),
+            (0x5e, dst.3),
+        ]
+    };
+    let whole = (64 << 16, 64 << 16);
+    let shown = place(cursor_fb, 11, whole, (10, 20, 64, 64));
+    let state = || {
+        let card = ms.lock();
+        let p = *card.native_plane(CURSOR).unwrap();
+        (p.crtc_id, p.fb_id, p.dst)
+    };
+    if atomic(0x0100, CURSOR, &shown) != Ok(0) || state() != (None, None, (0, 0, 0, 0)) {
+        return TestResult::Fail("TEST_ONLY cursor");
+    }
+    if atomic(0, CURSOR, &shown) != Ok(0)
+        || state() != (Some(11), Some(cursor_fb), (10, 20, 64, 64))
+        || getplane(CURSOR).1 != 11
+        || getplane(CURSOR).2 != cursor_fb
+    {
+        return TestResult::Fail("cursor set");
+    }
+    // Partly past the top-left edge: amdgpu_dm moves it into the hotspot.
+    if atomic(
+        0,
+        CURSOR,
+        &[(0x5b, (-20i64) as u64), (0x5c, (-30i64) as u64)],
+    ) != Ok(0)
+        || state() != (Some(11), Some(cursor_fb), (-20, -30, 64, 64))
+    {
+        return TestResult::Fail("cursor move");
+    }
+    // Refusals, all EINVAL (dm_check_cursor_fb, the DCN4 scaling rule,
+    // drm_atomic_plane_check and the cursor's properties).
+    let refused: [(&str, alloc::vec::Vec<(u32, u64)>); 13] = [
+        (
+            "cursor wider than its pitch",
+            place(narrow_fb, 11, (32 << 16, 32 << 16), (0, 0, 32, 32)),
+        ),
+        (
+            "cursor past 64x64",
+            place(wide_fb, 11, (128 << 16, 64 << 16), (0, 0, 128, 64)),
+        ),
+        ("tiled cursor", place(tiled_fb, 11, whole, (0, 0, 64, 64))),
+        (
+            "XRGB8888 cursor",
+            place(opaque_fb, 11, whole, (0, 0, 64, 64)),
+        ),
+        (
+            "scaled cursor",
+            place(cursor_fb, 11, whole, (0, 0, 128, 128)),
+        ),
+        (
+            "cropped cursor",
+            place(cursor_fb, 11, (32 << 16, 64 << 16), (0, 0, 32, 64)),
+        ),
+        ("fractional cursor source", {
+            let mut v = place(cursor_fb, 11, whole, (0, 0, 64, 64));
+            v[2] = (0x57, 0x8000);
+            v
+        }),
+        (
+            "cursor source width fraction",
+            place(cursor_fb, 11, ((64 << 16) - 1, 64 << 16), (0, 0, 64, 64)),
+        ),
+        (
+            "cursor on another CRTC",
+            place(cursor_fb, 12, whole, (0, 0, 64, 64)),
+        ),
+        (
+            "coverage blend",
+            alloc::vec![(planes::CURSOR_BLEND_PROP_ID, 1)],
+        ),
+        (
+            "cursor zpos",
+            alloc::vec![(planes::CURSOR_ZPOS_PROP_ID, 255)],
+        ),
+        (
+            "cursor rotation",
+            alloc::vec![(planes::ROTATION_PROP_ID, 1)],
+        ),
+        (
+            "overlay blend property",
+            alloc::vec![(planes::BLEND_PROP_ID, 0)],
+        ),
+    ];
+    for (why, props) in &refused {
+        if atomic(0x0100, CURSOR, props) != Err(FsError::InvalidData) {
+            return TestResult::Fail(why);
+        }
+    }
+    if atomic(0, CURSOR, &[(FB_ID, 0), (CRTC_ID, 0)]) != Ok(0) || state().1.is_some() {
+        return TestResult::Fail("cursor disable");
+    }
+    // Legacy CURSOR / CURSOR2 become cursor plane updates
+    // (drm_mode_cursor_universal): a framebuffer wrapped around the BO, the
+    // CRTC's legacy position kept without MOVE, the hotspot dropped (amdgpu
+    // is not DRIVER_CURSOR_HOTSPOT).
+    let cursor_ioctl = |open: u64, two: bool, words: [u32; 9]| {
+        let mut b = [0u8; 36];
+        for (i, w) in words.iter().enumerate() {
+            b[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        let cmd = if two {
+            iowr(DRM_IOCTL_BASE, 0xBB, 36)
+        } else {
+            iowr(DRM_IOCTL_BASE, 0xA3, 28)
+        };
+        crate::drm_ioctl_bridge::dispatch_card(idx, open, cmd, b.as_mut_ptr() as usize, false)
+    };
+    let legacy = |flags: u32, crtc: u32, (x, y): (i32, i32), (w, h): (u32, u32), bo: u32| {
+        cursor_ioctl(
+            SMOKE_MASTER_ID,
+            false,
+            [flags, crtc, x as u32, y as u32, w, h, bo, 0, 0],
+        )
+    };
+    let fbs = || ms.lock().framebuffers.len();
+    let base = fbs();
+    let internal = || ms.lock().native_plane(CURSOR).unwrap().internal_fb;
+    if legacy(0, 11, (0, 0), (64, 64), cursor_bo) != Err(FsError::InvalidData)
+        || legacy(4, 11, (0, 0), (64, 64), cursor_bo) != Err(FsError::InvalidData)
+        || legacy(3, 99, (0, 0), (64, 64), cursor_bo) != Err(FsError::NotFound)
+        || cursor_ioctl(
+            SMOKE_MASTER_ID + 1,
+            false,
+            [3, 11, 0, 0, 64, 64, cursor_bo, 0, 0],
+        ) != Err(FsError::PermissionDenied)
+        || legacy(3, 11, (0, 0), (64, 64), 0x777) != Err(FsError::NotFound)
+        || fbs() != base
+    {
+        return TestResult::Fail("legacy CURSOR argument refusals");
+    }
+    if legacy(3, 11, (100, 50), (64, 64), cursor_bo) != Ok(0)
+        || fbs() != base + 1
+        || !internal()
+        || state().0 != Some(11)
+        || state().2 != (100, 50, 64, 64)
+    {
+        return TestResult::Fail("legacy CURSOR set");
+    }
+    let wrapped = state().1;
+    if legacy(2, 11, (-10, 5), (0, 0), 0) != Ok(0)
+        || state() != (Some(11), wrapped, (-10, 5, 64, 64))
+    {
+        return TestResult::Fail("legacy CURSOR move");
+    }
+    // A new BO without MOVE: the legacy position, the previous wrapped
+    // framebuffer gone.
+    if legacy(1, 11, (0, 0), (64, 16), cursor_bo) != Ok(0)
+        || fbs() != base + 1
+        || state().1 == wrapped
+        || state().2 != (-10, 5, 64, 16)
+    {
+        return TestResult::Fail("legacy CURSOR new BO");
+    }
+    // CURSOR2 at a position: the hotspot does not move it.
+    if cursor_ioctl(
+        SMOKE_MASTER_ID,
+        true,
+        [3, 11, 30, 40, 64, 64, cursor_bo, 5, 5],
+    ) != Ok(0)
+        || state().2 != (30, 40, 64, 64)
+        || fbs() != base + 1
+    {
+        return TestResult::Fail("legacy CURSOR2");
+    }
+    // amdgpu_dm's refusals reach the legacy path too, with the wrapped
+    // framebuffer dropped and the cursor kept: 32 wide (its 128-byte pitch
+    // is not amdgpu's linear pitch alignment), past 64x64, a BO in GFX12
+    // 256B_2D tiles (GEM_METADATA swizzle mode 1).
+    let kept = state();
+    if !ms.lock().set_bo_tiling(tiled_bo, 1, false) {
+        return TestResult::Fail("tiling flags");
+    }
+    for (why, size, bo) in [
+        ("legacy 32x32 cursor", (32, 32), cursor_bo),
+        ("legacy 128x64 cursor", (128, 64), cursor_bo),
+        ("legacy tiled cursor", (64, 64), tiled_bo),
+    ] {
+        if legacy(3, 11, (0, 0), size, bo) != Err(FsError::InvalidData)
+            || state() != kept
+            || fbs() != base + 1
+        {
+            return TestResult::Fail(why);
+        }
+    }
+    // Handle 0 disables it; its wrapped framebuffer goes.
+    if legacy(1, 11, (0, 0), (0, 0), 0) != Ok(0)
+        || state().1.is_some()
+        || internal()
+        || fbs() != base
+    {
+        return TestResult::Fail("legacy CURSOR off");
+    }
+    // SETPLANE on the cursor: __setplane_atomic's legacy cursor update.
+    let setplane = |fb: u32, dst: (i32, i32, u32, u32), src: (u32, u32)| {
+        let mut b = [0u8; 48];
+        let words: [u32; 12] = [
+            CURSOR,
+            11,
+            fb,
+            0,
+            dst.0 as u32,
+            dst.1 as u32,
+            dst.2,
+            dst.3,
+            0,
+            0,
+            src.1 << 16,
+            src.0 << 16,
+        ];
+        for (i, w) in words.iter().enumerate() {
+            b[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xB7, 48),
+            b.as_mut_ptr() as usize,
+            false,
+        )
+    };
+    if setplane(cursor_fb, (5, 6, 128, 128), (64, 64)) != Err(FsError::InvalidData)
+        || setplane(cursor_fb, (5, 6, 64, 64), (64, 64)) != Ok(0)
+        || state() != (Some(11), Some(cursor_fb), (5, 6, 64, 64))
+    {
+        return TestResult::Fail("cursor SETPLANE");
+    }
+    // Removing the cursor's framebuffer turns it off.
+    let mut rm = cursor_fb.to_le_bytes();
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xA8, 4),
+        rm.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+        || state().0.is_some()
+    {
+        return TestResult::Fail("RMFB of the cursor's framebuffer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_native_cursor_plane);
