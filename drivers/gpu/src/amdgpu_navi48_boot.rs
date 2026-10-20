@@ -1961,6 +1961,60 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Move display `pipe`'s live scanout to the planes `request` under
+    /// `plan` without relighting it (`Otg::update_live_planes`: DC's medium
+    /// or full plane update under the OTG lock, new pipes enabled off-tree
+    /// first, freed ones retired after the update latched).
+    /// # Safety
+    /// As for `prepare_display_deadlines`; the scanout stays live. Every CPU
+    /// view of a surface the update replaces must be withdrawn.
+    pub async unsafe fn update_live_display_planes(
+        &mut self,
+        pipe: u8,
+        request: &otg::LivePlanes,
+        plan: &crate::amdgpu_dcn401_dml::Plan,
+    ) -> Result<otg::PlanesUpdated, otg::Error> {
+        if self.display_retirement_busy() {
+            return Err(otg::Error::Busy);
+        }
+        let crystal = *self.crystal.as_ref().map_err(|_| otg::Error::Unsupported)?;
+        let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
+        // SAFETY: matching retained owners are serialized; caller excludes external writers.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .update_live_planes(
+                    &self.sequence.backend.pool,
+                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                    gmc,
+                    pipe,
+                    request,
+                    plan,
+                    crystal,
+                )
+                .await
+        }
+    }
+    /// Program a DPP-only clock (`request`, an `OdmSegment` pipe) for a
+    /// free pipe a live display's new plane takes, every display's
+    /// consumers (the selected one's too) left to them.
+    pub async fn prepare_display_plane_clock_live(
+        &mut self,
+        request: dccg::Request,
+    ) -> Result<dccg::Applied, dccg::Error> {
+        if self.display_retirement_busy() || request.pixel != dccg::PixelClock::OdmSegment {
+            return Err(dccg::Error::Busy);
+        }
+        let held = self.otg.as_ref().map_err(|_| dccg::Error::Busy)?.all_held();
+        let clocks = self.clocks.as_mut().map_err(|e| dccg::Error::Clocks(*e))?;
+        self.dccg
+            .as_mut()
+            .map_err(|e| *e)?
+            .prepare_except(clocks, request, &held)
+            .await
+    }
     /// dcn401_update_clocks on the running configuration: the global floors
     /// moved to `request` (only raised unless `safe_to_lower`) with every
     /// display live, the DPP DTOs of the running pipes `targets` (pipe,
@@ -3528,8 +3582,8 @@ pub use modeset::{
     selection_mode, set_broadcast_rgb, set_frl, set_max_bpc, set_output_color, set_plane_format,
     set_plane_setup, sink_audio_info, stream_planes, with_planes, Configuration, DisplayPipes,
     FrlDscStream, FrlRate, HdmiCaps, HdmiStream, Health, InheritedRetired, Modeset, ModesetError,
-    MstRoute, MstStream, OverlayPlane, PlaneGeometry, PlanePipes, PlaneSetup, Selection, SstOutput,
-    BROADCAST_RGB_AUTO, BROADCAST_RGB_FULL, BROADCAST_RGB_LIMITED,
+    MstRoute, MstStream, OverlayPlane, PlaneGeometry, PlanePipes, PlaneSetup, PlanesChange,
+    Selection, SstOutput, BROADCAST_RGB_AUTO, BROADCAST_RGB_FULL, BROADCAST_RGB_LIMITED,
 };
 pub use teardown::{TeardownStatus, TeardownStep};
 #[cfg(feature = "kernel-test")]

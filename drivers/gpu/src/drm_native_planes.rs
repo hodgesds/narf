@@ -651,6 +651,7 @@ fn display_planes(
                 .iter()
                 .position(|q| q.id == p.id)
                 .is_some_and(|i| i < primary_at),
+            plane: p.id,
         });
         ids[k] = Some(p.id);
     }

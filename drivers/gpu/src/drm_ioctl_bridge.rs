@@ -5030,13 +5030,14 @@ fn atomic_commit(
                         crate::amdgpu_native_kms::request_display_mode(display, wire);
                     }
                 }
-                // So is a plane configuration change (DC's full update).
+                // Planes and plane formats go to the display monitor too,
+                // which applies them without a modeset (DC's plane update).
                 for dp in &native_displays {
                     if let Some(display) = crate::amdgpu_native_kms::crtc_display(dp.crtc_id) {
                         crate::amdgpu_native_kms::request_display_planes(display, dp.setup);
                     }
                 }
-                // So is a plane format change (Linux: a full update).
+                // The framebuffers' formats.
                 for plane in &state.planes {
                     let (Some(crtc_id), Some(fb_id)) = (plane.crtc_id, plane.fb_id) else {
                         continue;

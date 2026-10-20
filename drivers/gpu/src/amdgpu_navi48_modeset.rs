@@ -15,6 +15,9 @@ use crate::dp_link_training::LinkRate;
 #[path = "amdgpu_navi48_sst.rs"]
 mod sst;
 pub use sst::SstOutput;
+#[path = "amdgpu_navi48_planes.rs"]
+mod planes;
+pub use planes::PlanesChange;
 
 /// The DIO stream and pipe are independent of the PHY; the first native
 /// scanout uses one index for both.
@@ -148,6 +151,9 @@ pub struct OverlayPlane {
     pub format: otg::SurfaceFormat,
     /// Its normalized zpos is below the primary's.
     pub underlay: bool,
+    /// The DRM plane's id (0: none known): a seamless plane change keeps a
+    /// plane on its pipes across commits by it.
+    pub plane: u32,
 }
 
 /// A display's planes: the primary's placement (None: the whole

@@ -2760,6 +2760,28 @@ fn publish_console(boot: &boot::ColdBoot, pipe: Option<u8>) {
 /// As for `modeset_displays`.
 async unsafe fn adopt(boot: &mut boot::ColdBoot, m: &Modeset) {
     let pipe = m.pipe;
+    // SAFETY: the caller's obligations.
+    unsafe { adopt_planes(boot, m) }.await;
+    // Its timing generator restarted: the vblank count continues.
+    restart_vblank(pipe);
+    let s = &m.selection;
+    let offered: Vec<Timing> = m.modes.iter().flatten().copied().collect();
+    if let Some(c) = OUTPUTS.lock().crtcs.get_mut(usize::from(pipe)) {
+        c.shown = Some((s.edid, s.timing, offered));
+        c.admitted = Some((m.plan.soc, m.plan.mode));
+        c.retiring = false;
+        // Every native transport signals both: DIO (TMDS, 8b/10b SST and
+        // MST) and HPO (128b/132b SST and MST, FRL) streams.
+        c.color_signals = (true, true);
+    }
+}
+
+/// Present `m`'s planes: a back buffer for each (reused while its surface
+/// is) for tear-free DRM frames, the planes and format its presenter shows.
+/// # Safety
+/// As for `modeset_displays`.
+async unsafe fn adopt_planes(boot: &mut boot::ColdBoot, m: &Modeset) {
+    let pipe = m.pipe;
     // Without a back buffer (allocation failed) DRM frames fall back to
     // copies onto the visible front. Each overlay gets one too.
     // SAFETY: the caller's obligations; touches only owned VRAM and HDP.
@@ -2776,21 +2798,94 @@ async unsafe fn adopt(boot: &mut boot::ColdBoot, m: &Modeset) {
         overlay_pipes,
     };
     present_slot(pipe).native.store(backed, Ordering::Release);
-    // Its timing generator restarted: the vblank count continues.
-    restart_vblank(pipe);
-    let s = &m.selection;
     present_slot(pipe)
         .format
-        .store(s.format.fourcc(), Ordering::Release);
-    let offered: Vec<Timing> = m.modes.iter().flatten().copied().collect();
-    if let Some(c) = OUTPUTS.lock().crtcs.get_mut(usize::from(pipe)) {
-        c.shown = Some((s.edid, s.timing, offered));
-        c.admitted = Some((m.plan.soc, m.plan.mode));
-        c.retiring = false;
-        // Every native transport signals both: DIO (TMDS, 8b/10b SST and
-        // MST) and HPO (128b/132b SST and MST, FRL) streams.
-        c.color_signals = (true, true);
+        .store(m.selection.format.fourcc(), Ordering::Release);
+}
+
+/// Whether amdgpu_dm would recreate a plane going from `old` to `new`
+/// (should_reset_plane): an overlay both show at another normalized zpos,
+/// below or above the primary or in another order among the others.
+fn planes_reordered(old: &boot::PlaneSetup, new: &boot::PlaneSetup) -> bool {
+    let kept = |s: &boot::PlaneSetup, other: &boot::PlaneSetup| -> Vec<(u32, bool)> {
+        s.overlays
+            .iter()
+            .flatten()
+            .filter(|o| o.plane != 0 && other.overlays.iter().flatten().any(|p| p.plane == o.plane))
+            .map(|o| (o.plane, o.underlay))
+            .collect()
+    };
+    kept(old, new) != kept(new, old)
+}
+
+/// Move lit display `k` to `format` and `setup` while it scans out
+/// (`ColdBoot::update_display_planes`), the console withdrawn from its
+/// primary meanwhile. False when that needs a relight (nothing changed).
+/// # Safety
+/// As for `modeset_displays`, except that every display stays lit.
+async unsafe fn update_lit_planes(
+    boot: &mut boot::ColdBoot,
+    displays: &mut Displays,
+    k: u8,
+    format: SurfaceFormat,
+    setup: boot::PlaneSetup,
+) -> Result<bool, ModesetError> {
+    let Some(m) = displays.lit[usize::from(k)] else {
+        return Ok(false);
+    };
+    let reset = planes_reordered(&m.selection.planes, &setup);
+    // A format or size change replaces the primary's surface, which the
+    // console may draw into: withdraw it across the update.
+    let console = CURSOR_PIPE.load(Ordering::Acquire) == k
+        && crate::amdgpu_dcn_display::active_scanout().is_some_and(|fb| {
+            boot.display_scanout_framebuffer(k)
+                .is_ok_and(|f| f.addr == fb.addr)
+        });
+    if console {
+        crate::amdgpu_dcn_display::publish_external(None, None);
     }
+    crate::scanout_access::wait_retired().await;
+    // SAFETY: the caller's obligations; the console no longer draws.
+    let result = unsafe { boot.update_display_planes(k, format, setup, reset) }.await;
+    let changed = match result {
+        Ok(Some(change)) => {
+            {
+                // The timing, link and transport stay as lit: `shown`,
+                // `retiring` and `color_signals` hold; the admission (and,
+                // for this display, the format and planes it now shows)
+                // follow the new plans.
+                let mut outputs = OUTPUTS.lock();
+                for d in &change.displays {
+                    if let Some(c) = outputs.crtcs.get_mut(usize::from(d.pipe)) {
+                        c.admitted = Some((d.plan.soc, d.plan.mode));
+                        if d.pipe == k {
+                            c.format = d.selection.format;
+                            c.planes = d.selection.planes;
+                        }
+                    }
+                }
+            }
+            for d in change.displays {
+                displays.lit[usize::from(d.pipe)] = Some(d);
+            }
+            if let Some(m) = displays.lit[usize::from(k)] {
+                // SAFETY: as above.
+                unsafe { adopt_planes(boot, &m) }.await;
+            }
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            if console {
+                publish_console(boot, Some(k));
+            }
+            return Err(e);
+        }
+    };
+    if console {
+        publish_console(boot, Some(k));
+    }
+    Ok(changed)
 }
 
 /// Stop presenting on `pipe` and, when it carried the console, move the
@@ -3121,6 +3216,8 @@ struct Frame {
     primary: Option<PlaneFrame>,
     overlays: [Option<PlaneFrame>; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
     ticket: Option<u64>,
+    /// When the oldest frame merged into this one was queued.
+    queued_ns: u64,
 }
 impl Frame {
     /// `next` arriving while `self` still waits: each plane's newest
@@ -3134,6 +3231,7 @@ impl Frame {
             primary: next.primary.or(self.primary),
             overlays,
             ticket: next.ticket.max(self.ticket),
+            queued_ns: self.queued_ns.min(next.queued_ns),
         }
     }
 }
@@ -3365,6 +3463,7 @@ pub fn present_planes(
             primary,
             overlays,
             ticket,
+            queued_ns: narf_time::wall::monotonic_ns(),
         };
         // A replaced frame's event completes with the frame replacing it.
         *next = Some(match *next {
@@ -3372,11 +3471,18 @@ pub fn present_planes(
             None => frame,
         });
     }
-    if shown && !slot.presenting.swap(true, Ordering::AcqRel) {
+    // A frame of a commit that also changed the planes waits for the
+    // display monitor's seamless update (`kick_presenters` drains it).
+    if shown && !planes_pending(display) && !slot.presenting.swap(true, Ordering::AcqRel) {
         narf_scheduler::spawn(presenter(display));
     }
     true
 }
+
+/// How long a frame waits for its commit's plane update before it is
+/// presented on the planes shown (or completed): the display monitor
+/// normally applies it within a frame or two.
+const PLANES_WAIT_NS: u64 = 2_000_000_000;
 
 /// Drain frames that waited for a relight (`present_frame`): each display's
 /// presenter shows them in its new format, or completes them.
@@ -3405,6 +3511,25 @@ async fn presenter(display: u8) {
         if !slot.native.load(Ordering::Acquire) {
             complete_flip(display, frame.ticket, None);
             continue;
+        }
+        // Its commit's planes are not shown yet: back into the mailbox
+        // until the display monitor's update kicks the presenter again.
+        let waited = narf_time::wall::monotonic_ns().saturating_sub(frame.queued_ns);
+        if planes_pending(display) && waited < PLANES_WAIT_NS {
+            {
+                let mut next = slot.next.lock();
+                *next = Some(match *next {
+                    Some(newer) => frame.merged(newer),
+                    None => frame,
+                });
+            }
+            slot.presenting.store(false, Ordering::Release);
+            // The update may have landed meanwhile; its kick found the
+            // presenter still running.
+            if !planes_pending(display) && !slot.presenting.swap(true, Ordering::AcqRel) {
+                continue;
+            }
+            return;
         }
         let result = {
             let mut owner = OWNER.lock().await;
@@ -3713,6 +3838,9 @@ pub enum MonitorStep {
     /// After a display left, the remaining ones moved to the plans of the
     /// smaller configuration in place (clocks lowered after): this many.
     Replanned(u8),
+    /// The display moved to DRM's new planes or plane format while it
+    /// scanned out (DC's medium or full update, no relight).
+    PlanesUpdated(u8),
 }
 
 /// Record DRM's CRTC on/off request for display `display`. Level-triggered:
@@ -4099,7 +4227,10 @@ pub fn request_display_format(display: u8, fourcc: u32) -> bool {
     };
     match OUTPUTS.lock().crtcs.get_mut(usize::from(display)) {
         Some(c) => {
-            c.format = format;
+            if c.format != format {
+                c.format = format;
+                PLANES_PENDING.store(true, Ordering::Release);
+            }
             true
         }
         None => false,
@@ -4108,17 +4239,41 @@ pub fn request_display_format(display: u8, fourcc: u32) -> bool {
 
 /// Record DRM's planes on display `display`'s CRTC beyond a full-frame
 /// unscaled primary: the primary's placement and the overlays (bottom
-/// first). A running display showing other planes is lit again with them
-/// (amdgpu_dm's full update; the native path relights). False for a
-/// display past the fourth.
+/// first). A running display showing other planes moves to them without
+/// relighting (amdgpu_dm's plane commit: DC's medium or full update,
+/// `ColdBoot::update_display_planes`), within a frame or two of the
+/// display monitor; it relights only when that needs a modeset. False for
+/// a display past the fourth.
 pub fn request_display_planes(display: u8, setup: boot::PlaneSetup) -> bool {
     match OUTPUTS.lock().crtcs.get_mut(usize::from(display)) {
         Some(c) => {
-            c.planes = setup;
+            if c.planes != setup {
+                c.planes = setup;
+                PLANES_PENDING.store(true, Ordering::Release);
+            }
             true
         }
         None => false,
     }
+}
+
+/// A plane or plane format request the display monitor has not seen yet:
+/// it wakes for it rather than waiting out its period.
+static PLANES_PENDING: AtomicBool = AtomicBool::new(false);
+/// How often a sleeping display monitor looks for plane requests.
+const PLANES_POLL_MS: u64 = 16;
+
+/// Whether display `display`'s requested planes or plane format differ
+/// from what its presenter shows: frames wait for the update.
+fn planes_pending(display: u8) -> bool {
+    let slot = present_slot(display);
+    let shown = slot.shown.lock().planes;
+    let format = slot.format.load(Ordering::Acquire);
+    OUTPUTS
+        .lock()
+        .crtcs
+        .get(usize::from(display))
+        .is_some_and(|c| c.active && (c.planes != shown || c.format.fourcc() != format))
 }
 
 /// The planes display `display` would light with.
@@ -4542,6 +4697,8 @@ pub async unsafe fn monitor_displays(
         })
         .fold(0u8, |mask, p| mask | (1 << p));
     let mut relight = false;
+    // Displays whose planes or plane format DRM changed.
+    let mut plane_updates = 0u8;
     for port in board_ports(boot) {
         if Some(port) == mst_port {
             continue;
@@ -4605,12 +4762,18 @@ pub async unsafe fn monitor_displays(
         if rerouted
             || desired.is_some_and(|d| d != m.selection.timing)
             || limited != m.selection.limited
-            || wants[usize::from(k)].2 != m.selection.format
-            // A plane configuration change is a full update, done as a relight.
-            || wants[usize::from(k)].3 != m.selection.planes
             || colors[usize::from(k)] != (m.selection.colorspace, m.selection.hdr.is_some())
         {
             relight = true;
+            continue;
+        }
+        // A plane or plane format change is no modeset (amdgpu_dm's plane
+        // commit, DC's medium or full update): done below without leaving
+        // scanout, relit only when that needs one.
+        if wants[usize::from(k)].2 != m.selection.format
+            || wants[usize::from(k)].3 != m.selection.planes
+        {
+            plane_updates |= 1 << k;
             continue;
         }
         // SAFETY: serialized retained owners; writers stay excluded.
@@ -4672,6 +4835,22 @@ pub async unsafe fn monitor_displays(
                 unsafe { retire_monitored_display(boot, displays, k, true) }.await?;
                 steps.push(MonitorStep::Unplugged(k));
             }
+        }
+    }
+    // New planes on displays that otherwise run on: DC's plane update with
+    // the stream running, unless a relight is due anyway or the update
+    // needs a modeset.
+    if relight {
+        plane_updates = 0;
+    }
+    for k in (0..4u8).filter(|&k| plane_updates & 1 << k != 0) {
+        let (format, setup) = (wants[usize::from(k)].2, wants[usize::from(k)].3);
+        // SAFETY: as above; the display stays lit and published.
+        if unsafe { update_lit_planes(boot, displays, k, format, setup) }.await? {
+            steps.push(MonitorStep::PlanesUpdated(k));
+        } else {
+            relight = true;
+            break;
         }
     }
     // Sinks to light: a plugged connector, routed (automatically for a new
@@ -4886,7 +5065,20 @@ pub unsafe fn spawn_display_monitor(config: crate::amdgpu_navi48_boot::Configura
             } else {
                 MONITOR_MS
             };
-            if crate::amdgpu_navi48_dispatch::wait_hotplug(&mut hotplug, interval).await {
+            // Sleep out the period in short steps, cut short by a hot-plug
+            // event or by DRM's plane requests (applied within a frame or
+            // two, as amdgpu_dm commits them).
+            let mut woke = false;
+            let mut slept = 0;
+            while slept < interval && !PLANES_PENDING.swap(false, Ordering::AcqRel) {
+                let step = PLANES_POLL_MS.min(interval - slept);
+                if crate::amdgpu_navi48_dispatch::wait_hotplug(&mut hotplug, step).await {
+                    woke = true;
+                    break;
+                }
+                slept += step;
+            }
+            if woke {
                 // Acknowledge (and re-arm the opposite edge of) every port's
                 // raised HPD/HPD-RX before the pass reads the sense.
                 let mut owner = OWNER.lock().await;
@@ -4903,7 +5095,12 @@ pub unsafe fn spawn_display_monitor(config: crate::amdgpu_navi48_boot::Configura
             // SAFETY: the spawner's obligations hold for the task's lifetime.
             match unsafe { monitor_displays(&mut displays) }.await {
                 Ok(steps) => {
-                    for step in steps {
+                    // Plane updates follow DRM commits, possibly every
+                    // frame: not worth a console line each.
+                    for step in steps
+                        .into_iter()
+                        .filter(|s| !matches!(s, MonitorStep::PlanesUpdated(_)))
+                    {
                         let _ = writeln!(narf_console::Writer, "amdgpu: navi48 display {step:?}");
                     }
                 }
@@ -6155,6 +6352,7 @@ mod tests {
                 geometry: geometry(w, h, dst),
                 format: SurfaceFormat::Argb8888,
                 underlay: false,
+                plane: 0,
             };
             let video = overlay(1280, 720, Rect::new(100, 100, 640, 360));
             let one = boot::PlaneSetup {
@@ -6282,6 +6480,54 @@ mod tests {
         result
     }
     kernel_test_in!("drivers/gpu/navi48-kms", navi48_planes_request_and_admit);
+
+    /// amdgpu_dm's should_reset_plane on a zpos change: an overlay both
+    /// configurations show (by DRM plane) moved across the primary or past
+    /// another kept overlay is recreated; one moved on the screen, added
+    /// or removed is not.
+    fn navi48_plane_zpos_changes_recreate_planes() -> TestResult {
+        use crate::amdgpu_dcn401_otg::Blend;
+        use crate::amdgpu_dcn401_spl::{Rect, Rotation};
+        let overlay = |plane: u32, x: i32, underlay: bool| boot::OverlayPlane {
+            geometry: boot::PlaneGeometry {
+                src_x: 0,
+                src_y: 0,
+                width: 64,
+                height: 64,
+                dst: Rect::new(x, 0, 64, 64),
+                rotation: Rotation::R0,
+                blend: Blend::default_for(SurfaceFormat::Argb8888),
+                surface: crate::amdgpu_dcn401_otg::PlaneSurface::LINEAR,
+                fb_size: (64, 64),
+            },
+            format: SurfaceFormat::Argb8888,
+            underlay,
+            plane,
+        };
+        let setup = |o: &[boot::OverlayPlane]| {
+            let mut s = boot::PlaneSetup::NONE;
+            for (slot, p) in s.overlays.iter_mut().zip(o) {
+                *slot = Some(*p);
+            }
+            s
+        };
+        let (a, b) = (overlay(0x44, 0, false), overlay(0x45, 100, false));
+        let ab = setup(&[a, b]);
+        let moved = setup(&[overlay(0x44, 300, false), b]);
+        if planes_reordered(&ab, &moved)
+            || planes_reordered(&ab, &setup(&[a]))
+            || planes_reordered(&setup(&[a]), &ab)
+            || !planes_reordered(&ab, &setup(&[b, a]))
+            || !planes_reordered(&ab, &setup(&[overlay(0x44, 0, true), b]))
+        {
+            return TestResult::Fail("zpos changes");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi48-kms",
+        navi48_plane_zpos_changes_recreate_planes
+    );
 }
 
 /// Light the plugged board sinks DRM wants beside the displays that run

@@ -2857,6 +2857,7 @@ fn navi48_planes_reach_admission_and_staging() -> TestResult {
         ),
         format: otg::SurfaceFormat::Argb8888,
         underlay: false,
+        plane: 0,
     };
     let s = Selection {
         planes: PlaneSetup {
@@ -3234,6 +3235,7 @@ fn navi48_modeset_stages_whole_framebuffers_for_tiled_and_yuv_planes() -> TestRe
                     geometry: geometry(format, surface),
                     format,
                     underlay: false,
+                    plane: 0,
                 }),
                 None,
                 None,
@@ -3384,4 +3386,115 @@ fn navi48_modeset_dp_deep_color_like_amdgpu_dm() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_modeset_dp_deep_color_like_amdgpu_dm
+);
+
+/// The pipes a running display's new planes take without a modeset
+/// (`planes::live_plane_pipes`): a new overlay takes the free pipe from
+/// the top, as resource_update_pipes_for_plane_with_slice_count does; an
+/// overlay DC keeps (the same DRM plane) keeps its pipe wherever it moves
+/// in the stack; a removed one frees its pipe for the next new one; other
+/// displays' pipes are never taken; another ODM split is a modeset.
+fn navi48_live_plane_pipes_keep_every_plane_dc_keeps() -> TestResult {
+    use crate::amdgpu_dcn401_spl::{Rect, Rotation};
+    let soc = dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [300_000, 2_500_000],
+        dcfclk_khz: [200_000, 1_564_000],
+        socclk_khz: 300_000,
+        dispclk_max_khz: 2_000_000,
+        dppclk_max_khz: 2_000_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    let overlay = |plane: u32, x: i32| OverlayPlane {
+        geometry: PlaneGeometry {
+            src_x: 0,
+            src_y: 0,
+            width: 640,
+            height: 360,
+            dst: Rect::new(x, 100, 640, 360),
+            rotation: Rotation::R0,
+            blend: otg::Blend::default_for(otg::SurfaceFormat::Argb8888),
+            surface: otg::PlaneSurface::LINEAR,
+            fb_size: (640, 360),
+        },
+        format: otg::SurfaceFormat::Argb8888,
+        underlay: false,
+        plane,
+    };
+    let setup = |overlays: &[OverlayPlane]| {
+        let mut s = PlaneSetup::NONE;
+        for (o, p) in s.overlays.iter_mut().zip(overlays) {
+            *o = Some(*p);
+        }
+        s
+    };
+    let plan_for = |m: &Modeset, setup: &PlaneSetup| {
+        let mut s = m.selection;
+        s.planes = *setup;
+        admit_displays(&soc, &[s]).unwrap()[0]
+    };
+    let one = |pipe: u8| PlanePipes {
+        pipe,
+        odm: otg::SplitPipes::NONE,
+        mpc: otg::SplitPipes::NONE,
+    };
+    let pipes =
+        |r: Option<(otg::SplitPipes, OverlayPipes)>| r.map(|(_, o)| o.map(|p| p.map(|p| p.pipe)));
+    let mut m = completed_modeset(0);
+    let a = overlay(0x44, 100);
+    let with_a = setup(&[a]);
+    let plan_a = plan_for(&m, &with_a);
+    // A new overlay: the top free pipe, or the next one past another
+    // display's.
+    if pipes(super::planes::live_plane_pipes(&m, &plan_a, &with_a, 0).unwrap())
+        != Some([Some(3), None, None])
+        || pipes(super::planes::live_plane_pipes(&m, &plan_a, &with_a, 1 << 3).unwrap())
+            != Some([Some(2), None, None])
+    {
+        return TestResult::Fail("new overlay pipe");
+    }
+    // Running with A on pipe 2 (another display holds 3): B is added below
+    // A, which stays on pipe 2 although its stack position moved; B takes
+    // pipe 1.
+    m.selection.planes = with_a;
+    m.plan = plan_a;
+    m.scanout.overlays[0] = Some(otg::OverlayScanout {
+        pipe: 2,
+        odm: otg::SplitPipes::NONE,
+        mpc: otg::SplitPipes::NONE,
+        address: 0x8_1000_0000,
+        underlay: false,
+    });
+    let b = overlay(0x45, 900);
+    let with_ba = setup(&[b, a]);
+    let plan_ba = plan_for(&m, &with_ba);
+    let Ok(Some((mpc, got))) = super::planes::live_plane_pipes(&m, &plan_ba, &with_ba, 1 << 3)
+    else {
+        return TestResult::Fail("two overlays");
+    };
+    if mpc != otg::SplitPipes::NONE || got != [Some(one(1)), Some(one(2)), None] {
+        return TestResult::Fail("kept overlay keeps its pipe");
+    }
+    // A removed and C added: C may take A's freed pipe.
+    let c = overlay(0x46, 400);
+    let with_c = setup(&[c]);
+    let plan_c = plan_for(&m, &with_c);
+    if pipes(super::planes::live_plane_pipes(&m, &plan_c, &with_c, 1 << 3).unwrap())
+        != Some([Some(2), None, None])
+    {
+        return TestResult::Fail("freed pipe reused");
+    }
+    // Another ODM split is a modeset.
+    let mut odm = plan_a;
+    odm.pipes = 2;
+    if super::planes::live_plane_pipes(&m, &odm, &with_a, 0) != Ok(None) {
+        return TestResult::Fail("ODM change");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_live_plane_pipes_keep_every_plane_dc_keeps
 );
