@@ -2815,6 +2815,8 @@ fn navi48_planes_reach_admission_and_staging() -> TestResult {
         dst,
         rotation: Rotation::R0,
         blend: otg::Blend::default_for(format),
+        surface: otg::PlaneSurface::LINEAR,
+        fb_size: (w, h),
     };
     let video = OverlayPlane {
         geometry: geometry(
@@ -3127,4 +3129,87 @@ fn navi48_hdmi_frl_dsc_selection_admits_on_two_pipes() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_hdmi_frl_dsc_selection_admits_on_two_pipes
+);
+
+/// A tiled or 4:2:0 plane's surface is its whole framebuffer with the
+/// source rectangle placed in it (DC scans the framebuffer's viewport); a
+/// linear RGB plane's is its source rectangle.
+fn navi48_modeset_stages_whole_framebuffers_for_tiled_and_yuv_planes() -> TestResult {
+    use crate::amdgpu_dcn401_spl::{Rect, Rotation};
+    let timing = Timing {
+        pixel_clock_khz: 148_500,
+        h_active: 1920,
+        h_total: 2200,
+        h_front_porch: 88,
+        h_sync_width: 44,
+        v_active: 1080,
+        v_total: 1125,
+        v_front_porch: 4,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: true,
+    };
+    let geometry = |format: otg::SurfaceFormat, surface: otg::PlaneSurface| PlaneGeometry {
+        src_x: 320,
+        src_y: 180,
+        width: 640,
+        height: 360,
+        dst: Rect::new(100, 50, 960, 540),
+        rotation: Rotation::R0,
+        blend: otg::Blend::default_for(format),
+        surface,
+        fb_size: (1280, 720),
+    };
+    let tiled = otg::PlaneSurface {
+        tiling: otg::Tiling {
+            swizzle: otg::Swizzle::S64K2D,
+            dcc: None,
+        },
+        ..otg::PlaneSurface::LINEAR
+    };
+    for (format, surface, whole) in [
+        (otg::SurfaceFormat::Nv12, otg::PlaneSurface::LINEAR, true),
+        (otg::SurfaceFormat::Xrgb8888, tiled, true),
+        (
+            otg::SurfaceFormat::Xrgb8888,
+            otg::PlaneSurface::LINEAR,
+            false,
+        ),
+    ] {
+        let setup = PlaneSetup {
+            overlays: [
+                Some(OverlayPlane {
+                    geometry: geometry(format, surface),
+                    format,
+                    underlay: false,
+                }),
+                None,
+                None,
+            ],
+            ..PlaneSetup::NONE
+        };
+        let (_, overlays) = stream_planes(
+            &timing,
+            false,
+            otg::SurfaceFormat::Xrgb8888,
+            &setup,
+            (0, None),
+            &[Some((1, None)), None, None],
+        );
+        let r = overlays[0].unwrap();
+        let src = r.plane.unwrap().src;
+        let want = if whole {
+            ((1280, 720), Rect::new(320, 180, 640, 360))
+        } else {
+            ((640, 360), Rect::new(0, 0, 640, 360))
+        };
+        if ((r.width, r.height), src) != want || r.surface != surface || r.check().is_err() {
+            return TestResult::Fail("plane surface");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_stages_whole_framebuffers_for_tiled_and_yuv_planes
 );

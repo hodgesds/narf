@@ -123,6 +123,20 @@ pub struct PlaneGeometry {
     pub dst: crate::amdgpu_dcn401_spl::Rect,
     pub rotation: crate::amdgpu_dcn401_spl::Rotation,
     pub blend: otg::Blend,
+    /// The framebuffer's tiling, DCC and YCbCr color space.
+    pub surface: otg::PlaneSurface,
+    /// The framebuffer's size: a tiled or 4:2:0 plane stages its whole
+    /// framebuffer (`whole_framebuffer`) and scans the source rectangle out
+    /// of it, as DC scans a framebuffer's viewport.
+    pub fb_size: (u32, u32),
+}
+impl PlaneGeometry {
+    /// Whether the plane's surface is its whole framebuffer: a tiled or
+    /// 4:2:0 one, which cannot be cropped by copying rows. A linear RGB
+    /// plane's surface is its source rectangle.
+    pub fn whole_framebuffer(&self, format: otg::SurfaceFormat) -> bool {
+        format.is_video() || self.surface.tiling != otg::Tiling::LINEAR
+    }
 }
 
 /// One overlay plane DRM enabled on a display.
@@ -212,36 +226,52 @@ pub fn stream_planes(
     [Option<otg::SurfaceRequest>; otg::MAX_OVERLAYS],
 ) {
     use crate::amdgpu_dcn401_spl::Rect;
-    let layout = |g: &PlaneGeometry, underlay: bool| otg::PlaneLayout {
-        src: Rect::new(0, 0, g.width as i32, g.height as i32),
-        dst: g.dst,
-        stream_width: timing.h_active,
-        stream_height: timing.v_active,
-        ycbcr420,
-        rotation: g.rotation,
-        blend: g.blend,
-        underlay,
+    // A plane's surface: its source rectangle, or (tiled / 4:2:0) its whole
+    // framebuffer with the source rectangle placed in it.
+    let request = |g: &PlaneGeometry, format: otg::SurfaceFormat, (p, q), underlay| {
+        let whole = g.whole_framebuffer(format);
+        let (x, y) = if whole { (g.src_x, g.src_y) } else { (0, 0) };
+        let (width, height) = if whole {
+            g.fb_size
+        } else {
+            (g.width, g.height)
+        };
+        otg::SurfaceRequest {
+            pipe: p,
+            width,
+            height,
+            format,
+            odm: q,
+            plane: Some(otg::PlaneLayout {
+                src: Rect::new(x as i32, y as i32, g.width as i32, g.height as i32),
+                dst: g.dst,
+                stream_width: timing.h_active,
+                stream_height: timing.v_active,
+                ycbcr420,
+                rotation: g.rotation,
+                blend: g.blend,
+                underlay,
+            }),
+            surface: g.surface,
+        }
     };
-    let primary = otg::SurfaceRequest {
-        pipe,
-        width: setup.primary.map_or(timing.h_active, |g| g.width),
-        height: setup.primary.map_or(timing.v_active, |g| g.height),
-        format,
-        odm,
-        plane: setup.primary.map(|g| layout(&g, false)),
+    let primary = match &setup.primary {
+        Some(g) => request(g, format, (pipe, odm), false),
+        None => otg::SurfaceRequest {
+            pipe,
+            width: timing.h_active,
+            height: timing.v_active,
+            format,
+            odm,
+            plane: None,
+            surface: otg::PlaneSurface::LINEAR,
+        },
     };
     let mut out = [None; otg::MAX_OVERLAYS];
     for ((slot, o), pipes) in out.iter_mut().zip(&setup.overlays).zip(overlays) {
         let Some(o) = o else { continue };
-        let (p, q) = pipes.unwrap_or((0, odm.map(|_| 1)));
-        *slot = Some(otg::SurfaceRequest {
-            pipe: p,
-            width: o.geometry.width,
-            height: o.geometry.height,
-            format: o.format,
-            odm: q,
-            plane: Some(layout(&o.geometry, o.underlay)),
-        });
+        let pipes = pipes.unwrap_or((0, odm.map(|_| 1)));
+        *slot = Some(request(&o.geometry, o.format, pipes, o.underlay));
     }
     (primary, out)
 }
@@ -2186,14 +2216,39 @@ pub fn mode(timing: Timing) -> dml::Mode {
 /// A `format` plane on `timing`: its bytes per pixel and its pitch in
 /// pixels, the line rounded up to whole 256-byte requests.
 pub fn plane_mode(timing: Timing, format: otg::SurfaceFormat) -> dml::Mode {
-    dml::Mode {
+    let mut mode = dml::Mode {
         timing,
         pitch: format.pitch_bytes(timing.h_active) / format.bytes_per_pixel(),
         bytes_per_pixel: format.bytes_per_pixel(),
         ycbcr420: false,
         dsc: None,
         planes: [None; dml::MAX_PLANES],
+    };
+    // A 4:2:0 primary is never the packed full-frame plane: DML takes it
+    // as the explicit plane SPL scales its chroma for.
+    if format.is_video() {
+        let setup = PlaneSetup {
+            primary: Some(PlaneGeometry {
+                src_x: 0,
+                src_y: 0,
+                width: timing.h_active,
+                height: timing.v_active,
+                dst: crate::amdgpu_dcn401_spl::Rect::new(
+                    0,
+                    0,
+                    timing.h_active as i32,
+                    timing.v_active as i32,
+                ),
+                rotation: crate::amdgpu_dcn401_spl::Rotation::R0,
+                blend: otg::Blend::default_for(format),
+                surface: otg::PlaneSurface::LINEAR,
+                fb_size: (timing.h_active, timing.v_active),
+            }),
+            ..PlaneSetup::NONE
+        };
+        mode = with_planes(mode, format, &setup);
     }
+    mode
 }
 
 impl Selection {

@@ -438,6 +438,11 @@ impl FileOps for DriCardFile {
             if let Some(result) = crate::drm_ioctl_bridge::amdgpu_get_cap(cmd, arg) {
                 return result;
             }
+            if let Some(result) =
+                crate::drm_ioctl_bridge::amdgpu_dumb_metadata(self.index, cmd, arg)
+            {
+                return result;
+            }
             match crate::amdgpu_gem::dispatch(cmd, arg, &self.amdgpu_gem) {
                 Err(FsError::Unsupported) => {}
                 result => return result,
@@ -1253,6 +1258,11 @@ impl FileOps for DriRenderFile {
                 return result;
             }
             if let Some(result) = crate::drm_ioctl_bridge::amdgpu_get_cap(cmd, arg) {
+                return result;
+            }
+            if let Some(result) =
+                crate::drm_ioctl_bridge::amdgpu_dumb_metadata(self.index, cmd, arg)
+            {
                 return result;
             }
             match crate::amdgpu_gem::dispatch(cmd, arg, &self.amdgpu_gem) {

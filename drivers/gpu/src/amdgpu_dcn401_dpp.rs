@@ -7,8 +7,11 @@
 //! fetched.
 //!
 //! Every surface format takes amdgpu_dm's default plane color state: no
-//! degamma (in_transfer_func bypass), sRGB color space (post CSC bypass),
-//! no bias/scale (FCNV bias 0, scale 1.0) and the unity HDR multiplier.
+//! degamma (in_transfer_func bypass), no bias/scale (FCNV bias 0, scale
+//! 1.0) and the unity HDR multiplier. RGB is sRGB (post CSC bypass); a
+//! 4:2:0 plane's YCbCr goes through the post CSC with the
+//! `dpp_input_csc_matrix` of its COLOR_ENCODING / COLOR_RANGE color space
+//! (dpp401_dpp_setup's INPUT_CSC_SELECT_ICSC, dpp3_program_post_csc).
 //! FP16 needs nothing more: its values pass through and the output
 //! denormalization clamps them, as on Linux without color properties.
 use super::*;
@@ -45,11 +48,35 @@ impl Layout {
         self.base + (reg + u64::from(pipe) * 0x16b) * 4
     }
 }
-/// The CNVC and CM state of `format`: dpp401_dpp_setup's RGB crossbar and
-/// pixel format, and every color block in bypass.
-fn cnvc_cm(a: DppApplied) -> [(u64, u32, u32); 19] {
+/// The CM_POST_CSC_C11_C12..C33_C34 words of a plane in `format`: none
+/// for RGB (INPUT_CSC_SELECT_BYPASS), else its color space's
+/// dpp_input_csc_matrix packed two coefficients a register, the first low
+/// (cm_helper_program_color_matrices).
+pub(in crate::amdgpu_dcn401_otg) fn post_csc_words(
+    format: SurfaceFormat,
+    color: crate::amdgpu_dcn401_otg::YuvColor,
+) -> Option<[u32; 6]> {
+    if !format.is_video() {
+        return None;
+    }
+    let m = color.matrix();
+    Some(core::array::from_fn(|i| {
+        u32::from(m[2 * i]) | u32::from(m[2 * i + 1]) << 16
+    }))
+}
+/// CM_POST_CSC_CONTROL and its coefficient set A (CM_POST_CSC_C11_C12).
+const POST_CSC: u64 = 0xd68;
+const POST_CSC_C11_C12: u64 = 0xd69;
+/// The CNVC and CM state of `format`: dpp401_dpp_setup's crossbar and
+/// pixel format, and every color block in bypass but a 4:2:0 plane's post
+/// CSC: dpp3_program_post_csc loads its color space's matrix into the set
+/// not in use (A on a pipe staged from bypass) as
+/// cm_helper_program_color_matrices packs it (C11 low, C12 high, ...) and
+/// selects it (CM_POST_CSC_MODE 1, INPUT_CSC_SELECT_ICSC).
+fn cnvc_cm(a: DppApplied) -> alloc::vec::Vec<(u64, u32, u32)> {
     let format = a.surface.request.format;
-    [
+    let csc = post_csc_words(format, a.surface.request.surface.color);
+    let mut out = alloc::vec![
         // RGB crossbar; EXPANSION_MODE_ZERO = 1; ALPHA_EN unless RGB565.
         (
             FORMAT_CONTROL,
@@ -69,13 +96,21 @@ fn cnvc_cm(a: DppApplied) -> [(u64, u32, u32); 19] {
         (0xcd5, 0x7ffff, 0x1f000),
         (0xcd6, 0x7ffff, 0x1f000),
         (CM_CONTROL, 1, 0),
-        (0xd68, 3, 0),   // post CSC bypass
-        (0xd77, 0xf, 0), // gamma correction bypass
-        (0xdc5, 3, 0),   // CM de-alpha off
+    ];
+    if let Some(words) = csc {
+        for (i, word) in words.into_iter().enumerate() {
+            out.push((POST_CSC_C11_C12 + i as u64, u32::MAX, word));
+        }
+    }
+    out.extend([
+        (POST_CSC, 3, u32::from(csc.is_some())), // ICSC for YCbCr, else bypass
+        (0xd77, 0xf, 0),                         // gamma correction bypass
+        (0xdc5, 3, 0),                           // CM de-alpha off
         (0xd75, 0xffff, 0),
         (0xd76, u32::MAX, 0),
         (0xdc1, 0x7ffff, 0x1f000), // unity HDR multiplier
-    ]
+    ]);
+    out
 }
 /// The scaler writes' final field values, as a readback must find them:
 /// each register's last write (the coefficient RAM swap is checked from

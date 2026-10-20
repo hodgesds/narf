@@ -36,11 +36,12 @@ const NVSYNC: u32 = 8;
 const PREFERRED_DRIVER: u32 = 0x8 | 0x40;
 const DRIVER: u32 = 0x40;
 
-/// The primary plane's formats: amdgpu_dm's DCN4.0.1 list
-/// (amdgpu_dm_plane_get_plane_formats: rgb_formats, then the FP16 ones)
-/// less those the native scanout does not program (RGBA8888, the 16-bit
-/// UNORM orders, NV12 and P010).
-pub const PLANE_FORMATS: [u32; 13] = {
+/// Every native plane's formats (primary and overlay alike: DCN4's planes
+/// are all DC_PLANE_TYPE_DCN_UNIVERSAL): amdgpu_dm's DCN4.0.1 list
+/// (`amdgpu_dm_modifiers::DM_PLANE_FORMATS`: rgb_formats, NV12, P010, then
+/// the FP16 ones) less those the native scanout does not program
+/// (RGBA8888 and the 16-bit UNORM orders), in its order.
+pub const PLANE_FORMATS: [u32; 15] = {
     use crate::amdgpu_dcn401_otg::SurfaceFormat as F;
     [
         F::Xrgb8888.fourcc(),
@@ -52,6 +53,8 @@ pub const PLANE_FORMATS: [u32; 13] = {
         F::Xbgr8888.fourcc(),
         F::Abgr8888.fourcc(),
         F::Rgb565.fourcc(),
+        F::Nv12.fourcc(),
+        F::P010.fourcc(),
         F::Xrgb16161616f.fourcc(),
         F::Argb16161616f.fourcc(),
         F::Xbgr16161616f.fourcc(),
@@ -324,7 +327,9 @@ pub fn apply_routed_vrr(
     // amdgpu_dm's planes: each CRTC's primary and DCN401's three overlays.
     let crtc_ids: alloc::vec::Vec<u32> = card.crtcs.iter().map(|c| c.id).collect();
     card.native_planes = crate::drm_native_planes::planes_for(&card.native_planes, &crtc_ids);
-    card.overlay_formats = Some(&crate::drm_native_planes::OVERLAY_FORMATS);
+    card.overlay_formats = Some(&PLANE_FORMATS);
+    // amdgpu_dm_plane_get_plane_modifiers: GFX12 modifiers on every plane.
+    card.gfx12_modifiers = true;
     card.native = native;
     // amdgpu is DRIVER_ATOMIC: the bridge's native atomic path validates
     // MODE_ID/format/route against this owner and commits through it.

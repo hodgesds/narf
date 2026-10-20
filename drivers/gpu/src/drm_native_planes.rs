@@ -40,21 +40,64 @@ pub const ROTATION_PROP_ID: u32 = 0x6d;
 /// "IN_FORMATS" (drm_plane_create_format_property / create_in_format_blob):
 /// an immutable blob of the plane's formats and modifiers.
 pub const IN_FORMATS_PROP_ID: u32 = 0x6e;
-/// Stable IN_FORMATS blob ids, one per plane, regenerated on GETPROPBLOB.
+/// "IN_FORMATS_ASYNC": the same blob for async flips (amdgpu_dm sets
+/// format_mod_supported_async to the same check).
+pub const IN_FORMATS_ASYNC_PROP_ID: u32 = 0x6f;
+/// "COLOR_ENCODING" and "COLOR_RANGE" (drm_plane_create_color_properties),
+/// on planes that scan NV12/P010.
+pub const COLOR_ENCODING_PROP_ID: u32 = 0x70;
+pub const COLOR_RANGE_PROP_ID: u32 = 0x71;
+/// Stable IN_FORMATS (and IN_FORMATS_ASYNC) blob ids, one per plane,
+/// regenerated on GETPROPBLOB.
 const IN_FORMATS_BLOB: u32 = 0x2000;
+const IN_FORMATS_ASYNC_BLOB: u32 = 0x3000;
 pub fn in_formats_blob_id(plane_id: u32) -> u32 {
     IN_FORMATS_BLOB | (plane_id & 0xfff)
 }
-/// `drm_format_modifier_blob` for a native plane: every format the plane
-/// scans with the only modifier this scanout programs, DRM_FORMAT_MOD_LINEAR
-/// (formats at offset 24, the modifier list 8-byte aligned after them).
+pub fn in_formats_async_blob_id(plane_id: u32) -> u32 {
+    IN_FORMATS_ASYNC_BLOB | (plane_id & 0xfff)
+}
+/// drm_color_mgmt.c's color_encoding_name / color_range_name for the
+/// encodings and ranges amdgpu_dm supports.
+pub const COLOR_ENCODING_ENUMS: [(u64, &[u8]); 3] = [
+    (PlaneProps::BT601 as u64, b"ITU-R BT.601 YCbCr"),
+    (PlaneProps::BT709 as u64, b"ITU-R BT.709 YCbCr"),
+    (PlaneProps::BT2020 as u64, b"ITU-R BT.2020 YCbCr"),
+];
+pub const COLOR_RANGE_ENUMS: [(u64, &[u8]); 2] = [
+    (PlaneProps::LIMITED as u64, b"YCbCr limited range"),
+    (PlaneProps::FULL as u64, b"YCbCr full range"),
+];
+/// The formats plane `id` lists: a primary's `plane_formats`, an overlay's
+/// `overlay_formats`.
+fn formats_of(card: &Card, id: u32) -> Option<&'static [u32]> {
+    if card.native_plane(id)?.primary_of.is_some() {
+        card.plane_formats
+    } else {
+        card.overlay_formats
+    }
+}
+/// Whether plane `id` lists a YCbCr format, so carries "COLOR_ENCODING" and
+/// "COLOR_RANGE" (amdgpu_dm attaches them when the plane caps take NV12 or
+/// P010).
+fn has_yuv(card: &Card, id: u32) -> bool {
+    use crate::amdgpu_dm_modifiers::{NV12, P010};
+    formats_of(card, id).is_some_and(|f| f.contains(&NV12) || f.contains(&P010))
+}
+/// `drm_format_modifier_blob` for a native plane (its IN_FORMATS or
+/// IN_FORMATS_ASYNC blob): every format the plane lists with each modifier
+/// it lists and the formats that take it (create_in_format_blob). The
+/// native amdgpu card lists `amdgpu_dm_modifiers::PLANE_MODIFIERS`; any
+/// other card with native planes only DRM_FORMAT_MOD_LINEAR.
 pub fn in_formats_blob(card: &Card, blob_id: u32) -> Option<Vec<u8>> {
-    if blob_id & !0xfff != IN_FORMATS_BLOB {
+    if blob_id & !0xfff != IN_FORMATS_BLOB && blob_id & !0xfff != IN_FORMATS_ASYNC_BLOB {
         return None;
     }
     let plane = blob_id & 0xfff;
-    card.native_plane(plane)?;
-    let formats = card.plane_formats?;
+    let formats = formats_of(card, plane)?;
+    if card.gfx12_modifiers {
+        return crate::amdgpu_dm_modifiers::in_formats_blob(formats);
+    }
     let n = formats.len();
     if n == 0 || n > 64 {
         return None;
@@ -90,16 +133,6 @@ pub const ROTATION_ENUMS: [(u64, &[u8]); 4] = [
     (1, b"rotate-90"),
     (2, b"rotate-180"),
     (3, b"rotate-270"),
-];
-
-/// The overlay planes' formats: amdgpu_dm's overlay_formats less those
-/// the native scanout does not program (RGBA8888, NV21, NV12, P010).
-pub const OVERLAY_FORMATS: [u32; 5] = [
-    SurfaceFormat::Xrgb8888.fourcc(),
-    SurfaceFormat::Argb8888.fourcc(),
-    SurfaceFormat::Xbgr8888.fourcc(),
-    SurfaceFormat::Abgr8888.fourcc(),
-    SurfaceFormat::Rgb565.fourcc(),
 ];
 
 /// DCN401's plane caps (dcn401_resource.c): 16000 (16x) up, 167 (6:1)
@@ -225,6 +258,7 @@ pub fn set_property(
         return Ok(false);
     };
     let overlay = p.primary_of.is_none();
+    let yuv = has_yuv(card, plane.id);
     let props = plane.props.get_or_insert(p.props);
     match prop {
         ALPHA_PROP_ID if overlay => {
@@ -252,6 +286,18 @@ pub fn set_property(
             }
             props.rotation = value as u8;
         }
+        COLOR_ENCODING_PROP_ID if yuv => {
+            if !COLOR_ENCODING_ENUMS.iter().any(|&(v, _)| v == value) {
+                return Err(FsError::InvalidData);
+            }
+            props.color_encoding = value as u8;
+        }
+        COLOR_RANGE_PROP_ID if yuv => {
+            if !COLOR_RANGE_ENUMS.iter().any(|&(v, _)| v == value) {
+                return Err(FsError::InvalidData);
+            }
+            props.color_range = value as u8;
+        }
         _ => return Ok(false),
     }
     Ok(true)
@@ -276,11 +322,22 @@ pub fn object_properties(card: &Card, id: u32) -> Option<(Vec<u32>, Vec<u64>)> {
         ids.push(PRIMARY_ZPOS_PROP_ID);
     }
     values.push(u64::from(props.zpos));
+    if has_yuv(card, id) {
+        ids.extend([COLOR_ENCODING_PROP_ID, COLOR_RANGE_PROP_ID]);
+        values.extend([
+            u64::from(props.color_encoding),
+            u64::from(props.color_range),
+        ]);
+    }
     ids.push(ROTATION_PROP_ID);
     values.push(u64::from(props.rotation));
-    if card.plane_formats.is_some() {
+    if formats_of(card, id).is_some() {
         ids.push(IN_FORMATS_PROP_ID);
         values.push(u64::from(in_formats_blob_id(id)));
+        if card.gfx12_modifiers {
+            ids.push(IN_FORMATS_ASYNC_PROP_ID);
+            values.push(u64::from(in_formats_async_blob_id(id)));
+        }
     }
     Some((ids, values))
 }
@@ -309,6 +366,31 @@ pub fn blend(format: SurfaceFormat, props: PlaneProps, overlay: bool) -> Blend {
         // Only an overlay has "alpha"; a primary stays opaque.
         global_alpha: (overlay && props.alpha < 0xffff).then_some((props.alpha >> 8) as u8),
     }
+}
+
+/// A framebuffer's surface as DC programs it: the tiling and DCC of its
+/// modifier (amdgpu_dm_plane_fill_gfx12_attrs_from_modifiers) and, for a
+/// YCbCr format, the color space of the plane's COLOR_ENCODING and
+/// COLOR_RANGE (fill_plane_color_attributes).
+pub fn plane_surface(
+    fb: &crate::drm::card::Framebuffer,
+    props: PlaneProps,
+) -> Result<crate::amdgpu_dcn401_otg::PlaneSurface, FsError> {
+    use crate::amdgpu_dcn401_otg::{PlaneSurface, Tiling, YuvColor};
+    let yuv = matches!(
+        fb.format,
+        crate::drm::card::PixelFormat::Nv12 | crate::drm::card::PixelFormat::P010
+    );
+    Ok(PlaneSurface {
+        tiling: Tiling::from_modifier(fb.modifier).ok_or(FsError::InvalidData)?,
+        // The DRM color properties only affect YCbCr formats.
+        color: if yuv {
+            YuvColor::from_props(props.color_encoding, props.color_range)
+                .ok_or(FsError::InvalidData)?
+        } else {
+            YuvColor::default()
+        },
+    })
 }
 
 /// The rotation of a DRM_MODE_ROTATE_* bit.
@@ -518,14 +600,22 @@ fn display_planes(
     let format_of = |p: &PlaneState| -> Result<SurfaceFormat, FsError> {
         SurfaceFormat::from_fourcc(fourcc(p)?).ok_or(FsError::InvalidData)
     };
-    let geometry = |p: &PlaneState, format: SurfaceFormat, overlay: bool| PlaneGeometry {
-        src_x: p.src_x,
-        src_y: p.src_y,
-        width: p.src_w,
-        height: p.src_h,
-        dst: Rect::new(p.crtc_x, p.crtc_y, p.crtc_w as i32, p.crtc_h as i32),
-        rotation: rotation(p.props.map_or(1, |r| r.rotation)),
-        blend: blend(format, p.props.unwrap_or(PlaneProps::new(0)), overlay),
+    let geometry = |p: &PlaneState, format: SurfaceFormat, overlay: bool| {
+        let fb = card
+            .framebuffer(p.fb_id.ok_or(FsError::InvalidData)?)
+            .map_err(|_| FsError::NotFound)?;
+        let props = p.props.unwrap_or(PlaneProps::new(0));
+        Ok::<_, FsError>(PlaneGeometry {
+            src_x: p.src_x,
+            src_y: p.src_y,
+            width: p.src_w,
+            height: p.src_h,
+            dst: Rect::new(p.crtc_x, p.crtc_y, p.crtc_w as i32, p.crtc_h as i32),
+            rotation: rotation(props.rotation),
+            blend: blend(format, props, overlay),
+            surface: plane_surface(fb, props)?,
+            fb_size: (fb.width, fb.height),
+        })
     };
     let zpos = |p: &PlaneState| p.props.map_or(0, |r| r.zpos);
     // Normalized order: by zpos, then plane id.
@@ -536,8 +626,11 @@ fn display_planes(
         .position(|p| p.id == primary.id)
         .ok_or(FsError::InvalidData)?;
     let format = format_of(primary)?;
-    let g = geometry(primary, format, false);
-    let full = (g.src_x, g.src_y, g.width, g.height) == (0, 0, mode.0, mode.1)
+    let g = geometry(primary, format, false)?;
+    // A tiled or 4:2:0 primary always goes to DC as a placed plane (its
+    // surface is its whole framebuffer).
+    let full = !g.whole_framebuffer(format)
+        && (g.src_x, g.src_y, g.width, g.height) == (0, 0, mode.0, mode.1)
         && g.dst == Rect::new(0, 0, mode.0 as i32, mode.1 as i32)
         && g.rotation == Rotation::R0
         && g.blend == Blend::default_for(format);
@@ -552,7 +645,7 @@ fn display_planes(
         }
         let format = format_of(p)?;
         setup.overlays[k] = Some(OverlayPlane {
-            geometry: geometry(p, format, true),
+            geometry: geometry(p, format, true)?,
             format,
             underlay: order
                 .iter()
@@ -621,6 +714,53 @@ pub fn flip_fits(card: &Card, crtc_id: u32, fb_id: u32) -> Option<bool> {
     )
 }
 
+/// The planes a legacy SETCRTC of framebuffer `fb_id` at `(x, y)` on CRTC
+/// `crtc_id` of `mode` would give the display (the primary unplaced, the
+/// committed overlays kept), when its primary cannot be the full-frame
+/// default: a tiled or 4:2:0 framebuffer is scanned as a placed plane.
+/// None for a linear RGB framebuffer (its display takes the format check).
+pub fn setcrtc_planes(
+    card: &Card,
+    crtc_id: u32,
+    fb_id: u32,
+    (x, y): (u32, u32),
+    mode: (u32, u32),
+) -> Option<Result<DisplayPlanes, FsError>> {
+    let fb = card.framebuffer(fb_id).ok()?;
+    let format = SurfaceFormat::from_fourcc(fb.format as u32)?;
+    if !format.is_video() && fb.modifier == crate::amdgpu_dm_modifiers::LINEAR {
+        return None;
+    }
+    let primary = card
+        .native_planes
+        .iter()
+        .find(|p| p.primary_of == Some(crtc_id))?;
+    let state = PlaneState {
+        id: primary.id,
+        crtc_id: Some(crtc_id),
+        fb_id: Some(fb_id),
+        crtc_x: 0,
+        crtc_y: 0,
+        crtc_w: mode.0,
+        crtc_h: mode.1,
+        src_x: x,
+        src_y: y,
+        src_w: mode.0,
+        src_h: mode.1,
+        in_fence_fd: None,
+        props: Some(primary.props),
+    };
+    let overlays: Vec<PlaneState> = overlay_ids(card)
+        .into_iter()
+        .filter_map(|id| plane_state(card, id))
+        .filter(|p| p.crtc_id == Some(crtc_id) && p.fb_id.is_some())
+        .collect();
+    Some(
+        check_plane(&state, mode)
+            .and_then(|()| display_planes(card, crtc_id, &state, &overlays, mode)),
+    )
+}
+
 /// Each enabled CRTC's planes as the card now holds them (after a commit,
 /// a framebuffer removal or a SETCRTC), for the displays to light with.
 pub fn displays(card: &Card) -> Vec<DisplayPlanes> {
@@ -674,7 +814,7 @@ mod tests {
             y: 0,
         });
         card.plane_formats = Some(&crate::amdgpu_navi48_kms::PLANE_FORMATS);
-        card.overlay_formats = Some(&OVERLAY_FORMATS);
+        card.overlay_formats = Some(&crate::amdgpu_navi48_kms::PLANE_FORMATS);
         card.native_planes = planes_for(&[], &[1]);
         let mut fb = |w: u32, h: u32, format: u32| {
             let handle = card.gem.alloc(0x1000_0000, (w * h * 4) as usize).unwrap();
@@ -776,18 +916,24 @@ mod tests {
             }
             v
         };
+        // The planes list NV12 and P010, so carry COLOR_ENCODING (BT.709)
+        // and COLOR_RANGE (limited) before the rotation.
         if ids
             != tail(alloc::vec![
                 ALPHA_PROP_ID,
                 BLEND_PROP_ID,
                 ZPOS_PROP_ID,
+                COLOR_ENCODING_PROP_ID,
+                COLOR_RANGE_PROP_ID,
                 ROTATION_PROP_ID
             ])
-            || values[..4] != [0xffff, 0, 8, 1]
+            || values[..6] != [0xffff, 0, 8, 1, 0, 1]
             || object_properties(&card, primary).map(|(i, _)| i)
                 != Some(tail(alloc::vec![
                     BLEND_PROP_ID,
                     PRIMARY_ZPOS_PROP_ID,
+                    COLOR_ENCODING_PROP_ID,
+                    COLOR_RANGE_PROP_ID,
                     ROTATION_PROP_ID
                 ]))
         {
@@ -806,6 +952,9 @@ mod tests {
             (overlay, ZPOS_PROP_ID, 254),
             (primary, ROTATION_PROP_ID, 4),
             (overlay, ROTATION_PROP_ID, 8),
+            (overlay, COLOR_ENCODING_PROP_ID, 0),
+            (primary, COLOR_ENCODING_PROP_ID, 2),
+            (overlay, COLOR_RANGE_PROP_ID, 1),
         ];
         for (id, prop, value) in accepted {
             if !matches!(set(id, prop, value), Ok((true, _))) {
@@ -823,6 +972,8 @@ mod tests {
             (overlay, ROTATION_PROP_ID, 3),
             (overlay, ROTATION_PROP_ID, 0x10),
             (overlay, ROTATION_PROP_ID, 0),
+            (overlay, COLOR_ENCODING_PROP_ID, 3),
+            (primary, COLOR_RANGE_PROP_ID, 2),
         ];
         for (id, prop, value) in refused {
             if set(id, prop, value) != Err(FsError::InvalidData) {
@@ -846,7 +997,7 @@ mod tests {
     fn drm_native_planes_in_formats_blob_lists_linear_formats() -> TestResult {
         let (mut card, _) = card();
         static FORMATS: [u32; 3] = [0x3432_5258, 0x3432_5241, 0x3033_5258];
-        card.plane_formats = Some(&FORMATS);
+        card.overlay_formats = Some(&FORMATS);
         let id = in_formats_blob_id(OVERLAY_PLANE_ID_BASE);
         let blob = in_formats_blob(&card, id).unwrap();
         let word = |at: usize| u32::from_le_bytes(blob[at..at + 4].try_into().unwrap());
@@ -863,13 +1014,150 @@ mod tests {
         assert_eq!(values.last(), Some(&u64::from(id)));
         assert!(in_formats_blob(&card, 0x1000 | OVERLAY_PLANE_ID_BASE).is_none());
         assert!(in_formats_blob(&card, in_formats_blob_id(0x7ff)).is_none());
-        card.plane_formats = None;
+        card.overlay_formats = None;
         assert!(in_formats_blob(&card, id).is_none());
         TestResult::Pass
     }
     kernel_test_in!(
         "drivers/gpu/drm",
         drm_native_planes_in_formats_blob_lists_linear_formats
+    );
+
+    /// The native amdgpu card's planes list the GFX12 modifiers: IN_FORMATS
+    /// and IN_FORMATS_ASYNC carry every PLANE_FORMATS format under all 17
+    /// (amdgpu_dm_plane_format_mod_supported takes each GFX12 modifier for
+    /// every format), for primaries and overlays alike.
+    fn drm_native_planes_in_formats_blob_lists_gfx12_modifiers() -> TestResult {
+        use crate::amdgpu_dm_modifiers::PLANE_MODIFIERS;
+        let (mut card, _) = card();
+        card.gfx12_modifiers = true;
+        let formats = crate::amdgpu_navi48_kms::PLANE_FORMATS;
+        for plane in [PRIMARY_PLANE_ID_BASE, OVERLAY_PLANE_ID_BASE + 2] {
+            for id in [in_formats_blob_id(plane), in_formats_async_blob_id(plane)] {
+                let blob = in_formats_blob(&card, id).unwrap();
+                let word = |at: usize| u32::from_le_bytes(blob[at..at + 4].try_into().unwrap());
+                // 24 + 15 formats * 4 = 84, aligned to 88.
+                assert_eq!(
+                    [word(0), word(4), word(8), word(12), word(16), word(20)],
+                    [1, 0, 15, 24, 17, 88]
+                );
+                assert_eq!(blob.len(), 88 + 17 * 24);
+                for (i, m) in PLANE_MODIFIERS.iter().enumerate() {
+                    let at = 88 + 24 * i;
+                    let mask = u64::from_le_bytes(blob[at..at + 8].try_into().unwrap());
+                    let modifier = u64::from_le_bytes(blob[at + 16..at + 24].try_into().unwrap());
+                    assert_eq!((mask, modifier), ((1 << formats.len()) - 1, *m));
+                }
+            }
+            let (ids, values) = object_properties(&card, plane).unwrap();
+            assert_eq!(
+                ids[ids.len() - 2..],
+                [IN_FORMATS_PROP_ID, IN_FORMATS_ASYNC_PROP_ID]
+            );
+            assert_eq!(
+                values[values.len() - 2..],
+                [
+                    u64::from(in_formats_blob_id(plane)),
+                    u64::from(in_formats_async_blob_id(plane))
+                ]
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/drm",
+        drm_native_planes_in_formats_blob_lists_gfx12_modifiers
+    );
+
+    /// A tiled or 4:2:0 framebuffer reaches DC as its whole surface: an
+    /// NV12 overlay's geometry carries the framebuffer size, its modifier's
+    /// tiling and COLOR_ENCODING / COLOR_RANGE's color space
+    /// (fill_plane_color_attributes), and a tiled primary is never the
+    /// full-frame default even shown whole and unscaled.
+    fn drm_native_planes_carry_tiling_and_yuv_color() -> TestResult {
+        use crate::amdgpu_dcn401_otg::{DccBlock, Swizzle, Tiling, YuvColor};
+        use crate::amdgpu_dm_modifiers::{FbCmd, FB_MODIFIERS, NV12};
+        let (mut card, fbs) = card();
+        card.gfx12_modifiers = true;
+        let tiled = Tiling {
+            swizzle: Swizzle::S256K2D,
+            dcc: Some(DccBlock::B256),
+        };
+        let mut fb = |w: u32, h: u32, format: u32, modifier: u64, chroma: bool| {
+            let size = 64 << 20;
+            let handle = card.gem.alloc(0x2000_0000, size).unwrap();
+            let pitch = if format == NV12 { 2048 } else { 8192 };
+            let mut cmd = FbCmd {
+                width: w,
+                height: h,
+                pixel_format: format,
+                flags: FB_MODIFIERS,
+                ..FbCmd::default()
+            };
+            cmd.handles[0] = handle;
+            cmd.pitches[0] = pitch;
+            cmd.modifier[0] = modifier;
+            if chroma {
+                cmd.handles[1] = handle;
+                cmd.pitches[1] = pitch;
+                cmd.offsets[1] = 8 << 20;
+                cmd.modifier[1] = modifier;
+            }
+            card.addfb2_cmd(&cmd)
+        };
+        let video = fb(1280, 720, NV12, 0, true).unwrap();
+        let primary_tiled = fb(1920, 1080, XR24, tiled.modifier(), false).unwrap();
+        // amdgpu_display_framebuffer_init: one BO for every plane.
+        assert!(fb(1280, 720, NV12, 0, false).is_err());
+        let mut state = AtomicState::default();
+        let mut o = on(
+            OVERLAY_PLANE_ID_BASE,
+            video,
+            (640, 360),
+            (100, 50, 960, 540),
+        );
+        o.src_x = 320;
+        o.src_y = 180;
+        let mut props = PlaneProps::new(overlay_zpos(0));
+        props.color_encoding = PlaneProps::BT601;
+        props.color_range = PlaneProps::FULL;
+        o.props = Some(props);
+        state.planes.push(o);
+        let mode = |_| {
+            Some(crate::Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+                bpp: 32,
+            })
+        };
+        let out = check(&card, &state, mode).unwrap();
+        let g = out[0].setup.overlays[0].unwrap();
+        assert_eq!(g.format, SurfaceFormat::Nv12);
+        assert_eq!(g.geometry.fb_size, (1280, 720));
+        assert_eq!((g.geometry.src_x, g.geometry.src_y), (320, 180));
+        assert_eq!(g.geometry.surface.color, YuvColor::Bt601);
+        assert_eq!(g.geometry.surface.tiling, Tiling::LINEAR);
+        assert!(g.geometry.whole_framebuffer(g.format));
+        // The tiled primary shown whole at the mode is still placed.
+        let mut st = AtomicState::default();
+        st.crtcs.push(crate::drm::atomic::CrtcState {
+            id: 1,
+            enable: true,
+            ..Default::default()
+        });
+        card.crtcs[0].primary_fb = Some(primary_tiled);
+        let out = check(&card, &st, mode).unwrap();
+        let p = out[0].setup.primary.unwrap();
+        assert_eq!(p.surface.tiling, tiled);
+        // Its linear sibling stays the full-frame default.
+        card.crtcs[0].primary_fb = Some(fbs[0]);
+        assert!(check(&card, &st, mode).unwrap()[0].setup.primary.is_none());
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/drm",
+        drm_native_planes_carry_tiling_and_yuv_color
     );
 
     /// drm_atomic_normalize_zpos and the plane setup DC gets: an overlay
@@ -950,13 +1238,11 @@ mod tests {
             off.crtc_id = None;
             off.fb_id = None;
             s.planes.push(off);
-        }) || !refused(&|s| s.planes[0].fb_id = Some(fbs[3]))
-            || !refused(&|s| {
-                let mut primary = plane_state(&card, PRIMARY_PLANE_ID_BASE).unwrap();
-                primary.crtc_id = Some(7);
-                s.planes.push(primary);
-            })
-        {
+        }) || !refused(&|s| {
+            let mut primary = plane_state(&card, PRIMARY_PLANE_ID_BASE).unwrap();
+            primary.crtc_id = Some(7);
+            s.planes.push(primary);
+        }) {
             return TestResult::Fail("refusals");
         }
         TestResult::Pass

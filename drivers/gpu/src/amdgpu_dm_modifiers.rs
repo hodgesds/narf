@@ -127,14 +127,18 @@ impl Tiling {
         }
         m
     }
-    /// amdgpu_dm_plane_fill_gfx12_attrs_from_modifiers for one of the
-    /// plane's modifiers (`None` for one the planes do not list).
+    /// amdgpu_dm_plane_fill_gfx12_attrs_from_modifiers for a framebuffer's
+    /// modifier: LINEAR, or a GFX12 one's swizzle and (with DCC) max
+    /// compressed block. A framebuffer added without modifiers may carry a
+    /// GFX12 modifier the planes do not list (its BO's tiling flags name any
+    /// max block), which Linux scans the same way. `None` for a modifier no
+    /// GC 12 framebuffer can have.
     pub fn from_modifier(modifier: u64) -> Option<Self> {
-        if !PLANE_MODIFIERS.contains(&modifier) {
-            return None;
-        }
         if modifier == LINEAR {
             return Some(Self::LINEAR);
+        }
+        if !is_amd(modifier) || tile_version(modifier) != TILE_VER_GFX12 {
+            return None;
         }
         let swizzle = match tile(modifier) {
             1 => Swizzle::S256B2D,

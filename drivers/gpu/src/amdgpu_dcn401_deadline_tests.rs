@@ -50,6 +50,7 @@ fn hubp_at(pipe: u8, reg: u64) -> u64 {
 fn owners(plan: &dml::Plan, pipe: u8) -> (Request, RequestorApplied, dccg::Applied) {
     let surface = SurfaceApplied {
         request: SurfaceRequest {
+            surface: Default::default(),
             pipe,
             width: 1920,
             height: 1080,
@@ -434,6 +435,7 @@ kernel_test_in!(
 /// (100, 100) of the 1080p stream.
 fn video_overlay(pipe: u8) -> SurfaceApplied {
     let request = SurfaceRequest {
+        surface: Default::default(),
         pipe,
         width: 1280,
         height: 720,

@@ -115,6 +115,7 @@ const HUBP_SEEDS: [(u64, u32); 19] = [
 ];
 fn req(pipe: u8) -> SurfaceRequest {
     SurfaceRequest {
+        surface: Default::default(),
         pipe,
         width: 65,
         height: 3,
@@ -325,12 +326,7 @@ fn dcn401_surface_programs_every_format_as_linux() -> TestResult {
         drop(surfaces);
         assert_eq!(pool.available(), 4096);
     }
-    for fourcc in [
-        0,
-        0x3432_5241 ^ 1,
-        0x3231_564e, /* NV12 */
-        0x3834_5258, /* XR48 */
-    ] {
+    for fourcc in [0, 0x3432_5241 ^ 1, 0x3834_5258 /* XR48 */] {
         assert_eq!(SurfaceFormat::from_fourcc(fourcc), None);
     }
     TestResult::Pass
@@ -777,4 +773,106 @@ fn dcn401_surface_reclaims_staged_buffers_and_restarts_without_vram_growth() -> 
 kernel_test_in!(
     "drivers/gpu/dcn401-release",
     dcn401_surface_reclaims_staged_buffers_and_restarts_without_vram_growth
+);
+
+/// A tiled and DCC NV12 / P010 surface (amdgpu_dm_plane_fill_gfx12_attrs_from_modifiers
+/// and hubp401_program_surface_config / flip_and_addr): SW_MODE the GFX12
+/// swizzle, PRIMARY/SECONDARY_SURFACE_DCC_EN set, PITCH and PITCH_C in
+/// pixels less one, the VIDEO_420 pixel format, and the chroma address
+/// (behind the luma at a block-aligned offset) written before the luma's.
+/// Each plane's layout is the minimum amdgpu_display_verify_sizes takes for
+/// a framebuffer of that size and modifier.
+fn dcn401_surface_stages_tiled_dcc_video() -> TestResult {
+    use crate::amdgpu_dcn401_otg::{DccBlock, PlaneSurface, Swizzle, Tiling};
+    use crate::amdgpu_dm_modifiers as m;
+    let tiling = Tiling {
+        swizzle: Swizzle::S64K2D,
+        dcc: Some(DccBlock::B128),
+    };
+    for (format, hubp, luma_cpp, chroma_cpp) in [
+        (SurfaceFormat::Nv12, 64, 1, 2),
+        (SurfaceFormat::P010, 66, 2, 4),
+    ] {
+        let p = 2;
+        let request = SurfaceRequest {
+            width: 64,
+            height: 16,
+            format,
+            surface: PlaneSurface {
+                tiling,
+                ..PlaneSurface::LINEAR
+            },
+            ..req(p)
+        };
+        let b = request.bytes();
+        // 64K_2D blocks: 256x256 at 1 byte, 256x128 at 2, 128x128 at 4.
+        let (pitch, chroma_pitch) = (256 * luma_cpp, 512);
+        assert_eq!(b.pitch_bytes, pitch);
+        assert_eq!(b.chroma, Some((65536, chroma_pitch)));
+        assert_eq!(b.bytes, 2 * 65536);
+        // The same layout as a framebuffer passes amdgpu's size checks.
+        let info = m::format_info(format.fourcc()).unwrap();
+        let mut cmd = m::FbCmd {
+            width: 64,
+            height: 16,
+            pixel_format: format.fourcc(),
+            flags: m::FB_MODIFIERS,
+            ..Default::default()
+        };
+        cmd.handles[..2].copy_from_slice(&[1, 1]);
+        cmd.pitches[..2].copy_from_slice(&[pitch, chroma_pitch]);
+        cmd.offsets[1] = 65536;
+        cmd.modifier[..2].copy_from_slice(&[tiling.modifier(); 2]);
+        assert_eq!(
+            m::verify_sizes(&info, &cmd, tiling.modifier(), b.bytes),
+            Ok(())
+        );
+        assert!(m::verify_sizes(&info, &cmd, tiling.modifier(), b.bytes - 1).is_err());
+        let (_backing, pool, mut e, mut surfaces) = fixture(p, 2 * 65536 + 8192);
+        let applied = run(surfaces.prepare(&mut e, &pool, request)).unwrap();
+        assert_eq!((applied.pitch_bytes, applied.bytes), (pitch, b.bytes));
+        let chroma = applied.address + 65536;
+        for (r, mask, value) in [
+            (0x5e7, 7, 3),
+            (0x612, 0x213, 0x202),
+            (0x607, 0xffff, pitch / luma_cpp - 1),
+            (0x608, 0xffff, chroma_pitch / chroma_cpp - 1),
+            (0x5e5, 0x17f, hubp),
+            (0x60c, u32::MAX, chroma as u32),
+            (0x60d, 0xffff, (chroma >> 32) as u32),
+            (0x60a, u32::MAX, applied.address as u32),
+        ] {
+            assert_eq!(e.io.inner.regs[&h(p, r)] & mask, value, "reg {r:#x}");
+        }
+        // hubp401_program_surface_flip_and_addr's order: chroma high, chroma
+        // low, luma high, luma low.
+        let order: Vec<u64> =
+            e.io.inner
+                .writes
+                .iter()
+                .map(|&(at, _)| at)
+                .filter(|&at| (0x60a..=0x60d).any(|r| at == h(p, r)))
+                .collect();
+        assert_eq!(
+            order[order.len() - 4..],
+            [h(p, 0x60d), h(p, 0x60c), h(p, 0x60b), h(p, 0x60a)]
+        );
+        drop(surfaces);
+    }
+    // A DCC modifier on a linear swizzle is not one the planes list.
+    assert_eq!(
+        Tiling::from_modifier(
+            Tiling {
+                swizzle: Swizzle::Linear,
+                dcc: Some(DccBlock::B64)
+            }
+            .modifier()
+        ),
+        None
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-surface",
+    dcn401_surface_stages_tiled_dcc_video
 );

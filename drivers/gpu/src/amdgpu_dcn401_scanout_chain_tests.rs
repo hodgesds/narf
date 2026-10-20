@@ -265,6 +265,7 @@ fn hdmi_mode(pipe: u8, plan: &dml::Plan) -> Mode {
     c.global.memory_floor_khz = plan.soc.uclk_khz;
     Mode {
         surface: SurfaceRequest {
+            surface: Default::default(),
             pipe,
             width: 640,
             height: 480,

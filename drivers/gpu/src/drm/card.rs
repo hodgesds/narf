@@ -145,8 +145,9 @@ pub struct Crtc {
 
 /// Colour encoding (pixel format).
 ///
-/// Subset of Linux's `DRM_FORMAT_*` (only what ADDFB2 needs): single-plane
-/// packed RGB. A card's `plane_formats` narrows what its ADDFB2 takes.
+/// Subset of Linux's `DRM_FORMAT_*` (only what ADDFB2 needs): packed RGB
+/// and the two-plane 4:2:0 NV12 / P010. A card's `plane_formats` narrows
+/// what its ADDFB2 takes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum PixelFormat {
@@ -163,6 +164,8 @@ pub enum PixelFormat {
     Argb16161616f = 0x4834_5241, // "AR4H"
     Xbgr16161616f = 0x4834_4258, // "XB4H"
     Abgr16161616f = 0x4834_4241, // "AB4H"
+    Nv12 = 0x3231_564e,          // "NV12": Y plane, then interleaved CbCr
+    P010 = 0x3031_3050,          // "P010": 10-bit (MSB-aligned 16-bit) NV12
 }
 impl PixelFormat {
     /// The format of a DRM fourcc, if ADDFB2 knows it.
@@ -181,14 +184,18 @@ impl PixelFormat {
             Self::Argb16161616f,
             Self::Xbgr16161616f,
             Self::Abgr16161616f,
+            Self::Nv12,
+            Self::P010,
         ]
         .into_iter()
         .find(|f| *f as u32 == fourcc)
     }
-    /// Bytes per pixel (drm_format_info's cpp[0]).
+    /// Bytes per pixel (drm_format_info's cpp[0]; the luma plane's for
+    /// NV12 and P010).
     pub const fn cpp(self) -> u32 {
         match self {
-            Self::Rgb565 => 2,
+            Self::Nv12 => 1,
+            Self::Rgb565 | Self::P010 => 2,
             Self::Xrgb16161616f
             | Self::Argb16161616f
             | Self::Xbgr16161616f
@@ -213,8 +220,18 @@ pub struct Framebuffer {
     pub format: PixelFormat,
     /// Byte pitch of the primary plane.
     pub pitch: u32,
-    /// GEM handle of the backing buffer object.
+    /// GEM handle of the backing buffer object (every plane's: amdgpu
+    /// refuses planes in different BOs).
     pub gem_handle: u32,
+    /// Each plane's byte offset into the BO (plane 1 is NV12/P010's CbCr
+    /// plane; 0 for single-plane formats).
+    pub offsets: [u32; 2],
+    /// Plane 1's byte pitch (0 for single-plane formats).
+    pub chroma_pitch: u32,
+    /// The format modifier: DRM_FORMAT_MOD_LINEAR, or a GFX12 one on the
+    /// native amdgpu card (passed with DRM_MODE_FB_MODIFIERS or converted
+    /// from the BO's tiling flags).
+    pub modifier: u64,
 }
 
 // ── Card ───────────────────────────────────────────────────────────────
@@ -771,6 +788,13 @@ pub struct Card {
     pub native_planes: Vec<NativePlane>,
     /// The fourccs the native overlay planes take.
     pub overlay_formats: Option<&'static [u32]>,
+    /// The native amdgpu card: its planes list the GFX12 modifiers
+    /// (`amdgpu_dm_modifiers::PLANE_MODIFIERS`) and ADDFB2 runs amdgpu's
+    /// framebuffer checks (amdgpu_display_user_framebuffer_create).
+    pub gfx12_modifiers: bool,
+    /// Each dumb BO's GEM_METADATA tiling flags and GFX12_DCC creation flag
+    /// (amdgpu_bo_get_tiling_flags), by handle; a BO not listed has none.
+    pub bo_tiling: Vec<(u32, u64, bool)>,
 }
 
 /// drm_plane_state's blending and orientation as amdgpu_dm attaches them:
@@ -782,12 +806,22 @@ pub struct PlaneProps {
     pub blend: u8,
     pub zpos: u8,
     pub rotation: u8,
+    /// "COLOR_ENCODING" (DRM_COLOR_YCBCR_BT601/709/2020) and "COLOR_RANGE"
+    /// (DRM_COLOR_YCBCR_LIMITED/FULL_RANGE): only YCbCr formats use them.
+    pub color_encoding: u8,
+    pub color_range: u8,
 }
 impl PlaneProps {
     /// DRM_MODE_BLEND_PREMULTI, DRM_MODE_BLEND_COVERAGE, DRM_MODE_BLEND_PIXEL_NONE.
     pub const PREMULTI: u8 = 0;
     pub const COVERAGE: u8 = 1;
     pub const PIXEL_NONE: u8 = 2;
+    /// enum drm_color_encoding and enum drm_color_range.
+    pub const BT601: u8 = 0;
+    pub const BT709: u8 = 1;
+    pub const BT2020: u8 = 2;
+    pub const LIMITED: u8 = 0;
+    pub const FULL: u8 = 1;
     /// A plane's defaults: opaque, pre-multiplied, unrotated, at `zpos`.
     pub const fn new(zpos: u8) -> Self {
         Self {
@@ -795,6 +829,9 @@ impl PlaneProps {
             blend: Self::PREMULTI,
             zpos,
             rotation: 1,
+            // amdgpu_dm_plane_init's defaults: BT.709, limited range.
+            color_encoding: Self::BT709,
+            color_range: Self::LIMITED,
         }
     }
 }
@@ -913,6 +950,8 @@ impl Card {
             crtc_color: Vec::new(),
             native_planes: Vec::new(),
             overlay_formats: None,
+            gfx12_modifiers: false,
+            bo_tiling: Vec::new(),
         }
     }
     /// The native plane `id`, if this card has one.
@@ -1528,42 +1567,102 @@ impl Card {
         pitch: u32,
         gem_handle: u32,
     ) -> Result<u32, CardError> {
-        if width == 0 || height == 0 {
-            return Err(CardError::InvalidDimensions);
-        }
-        // Validate GEM handle exists.
-        if self.gem.lookup(gem_handle).is_none() {
-            return Err(CardError::BadGemHandle);
-        }
-        // Validate pixel format: a format no plane takes is refused.
-        if self
-            .plane_formats
-            .is_some_and(|formats| !formats.contains(&format))
-        {
-            return Err(CardError::UnknownFormat);
-        }
-        // A card without native planes keeps the formats it always took.
-        let legacy = matches!(format, 0x3432_5258 | 0x3432_5241 | 0x3631_4752);
-        if self.plane_formats.is_none() && !legacy {
-            return Err(CardError::UnknownFormat);
-        }
-        let format = PixelFormat::from_fourcc(format).ok_or(CardError::UnknownFormat)?;
-        // drm_framebuffer's framebuffer_check: the pitch holds a line of
-        // the format's pixels; drm_gem_fb_init_with_funcs: a dumb-backed
-        // object holds every line (EINVAL either way).
-        let line = u64::from(width) * u64::from(format.cpp());
-        if u64::from(pitch) < line {
-            return Err(CardError::InvalidDimensions);
-        }
-        if let Some(b) = self
-            .dumb_backings
-            .iter()
-            .find(|b| b.gem_handle == gem_handle)
-        {
-            if (b.byte_len as u64) < u64::from(height - 1) * u64::from(pitch) + line {
+        let mut cmd = crate::amdgpu_dm_modifiers::FbCmd {
+            width,
+            height,
+            pixel_format: format,
+            ..Default::default()
+        };
+        cmd.handles[0] = gem_handle;
+        cmd.pitches[0] = pitch;
+        self.addfb2_cmd(&cmd)
+    }
+
+    /// ADDFB2 with the whole `drm_mode_fb_cmd2`: handles, pitches, offsets
+    /// and modifiers. The native amdgpu card (`gfx12_modifiers`) runs
+    /// drm_internal_framebuffer_create's and amdgpu's checks
+    /// (`amdgpu_dm_modifiers::check_fb_cmd` / `check_amdgpu_fb`: format and
+    /// modifier on a plane, one BO, tiling flags without modifiers, sizes);
+    /// other cards take one plane, LINEAR only.
+    pub fn addfb2_cmd(
+        &mut self,
+        cmd: &crate::amdgpu_dm_modifiers::FbCmd,
+    ) -> Result<u32, CardError> {
+        use crate::amdgpu_dm_modifiers as m;
+        let (width, height, gem_handle) = (cmd.width, cmd.height, cmd.handles[0]);
+        let pitch = cmd.pitches[0];
+        let (offsets, chroma_pitch, modifier) = if self.gfx12_modifiers {
+            let info = m::check_fb_cmd(cmd).map_err(|_| CardError::InvalidDimensions)?;
+            let object = self.gem.lookup(gem_handle).ok_or(CardError::BadGemHandle)?;
+            let bo_size = self
+                .dumb_backings
+                .iter()
+                .find(|b| b.gem_handle == gem_handle)
+                .map_or(object.size as u64, |b| b.byte_len as u64);
+            let (tiling, dcc) = self
+                .bo_tiling
+                .iter()
+                .find(|t| t.0 == gem_handle)
+                .map_or((0, false), |t| (t.1, t.2));
+            let formats = self.plane_formats.unwrap_or(&[]);
+            let modifier = m::check_amdgpu_fb(cmd, &info, formats, tiling, dcc, bo_size)
+                .map_err(|_| CardError::UnknownFormat)?;
+            let two = info.num_planes == 2;
+            (
+                [cmd.offsets[0], if two { cmd.offsets[1] } else { 0 }],
+                if two { cmd.pitches[1] } else { 0 },
+                modifier,
+            )
+        } else {
+            // DRM_MODE_FB_MODIFIERS with anything but LINEAR, or an unknown
+            // flag, is refused (framebuffer_check / drm_mode_addfb2).
+            if cmd.flags & !3 != 0 || (cmd.flags & 2 != 0 && cmd.modifier[0] != 0) {
+                return Err(CardError::UnknownFormat);
+            }
+            if width == 0 || height == 0 {
                 return Err(CardError::InvalidDimensions);
             }
-        }
+            // Validate GEM handle exists.
+            if self.gem.lookup(gem_handle).is_none() {
+                return Err(CardError::BadGemHandle);
+            }
+            let format = cmd.pixel_format;
+            // Validate pixel format: a format no plane takes is refused.
+            if self
+                .plane_formats
+                .is_some_and(|formats| !formats.contains(&format))
+            {
+                return Err(CardError::UnknownFormat);
+            }
+            // A card without native planes keeps the formats it always took.
+            let legacy = matches!(format, 0x3432_5258 | 0x3432_5241 | 0x3631_4752);
+            if self.plane_formats.is_none() && !legacy {
+                return Err(CardError::UnknownFormat);
+            }
+            let format = PixelFormat::from_fourcc(format).ok_or(CardError::UnknownFormat)?;
+            // Two-plane formats need the native amdgpu card's checks.
+            if matches!(format, PixelFormat::Nv12 | PixelFormat::P010) {
+                return Err(CardError::UnknownFormat);
+            }
+            // drm_framebuffer's framebuffer_check: the pitch holds a line of
+            // the format's pixels; drm_gem_fb_init_with_funcs: a dumb-backed
+            // object holds every line (EINVAL either way).
+            let line = u64::from(width) * u64::from(format.cpp());
+            if u64::from(pitch) < line {
+                return Err(CardError::InvalidDimensions);
+            }
+            if let Some(b) = self
+                .dumb_backings
+                .iter()
+                .find(|b| b.gem_handle == gem_handle)
+            {
+                if (b.byte_len as u64) < u64::from(height - 1) * u64::from(pitch) + line {
+                    return Err(CardError::InvalidDimensions);
+                }
+            }
+            ([0, 0], 0, 0)
+        };
+        let format = PixelFormat::from_fourcc(cmd.pixel_format).ok_or(CardError::UnknownFormat)?;
         if self.framebuffers.len() >= 4096 {
             return Err(CardError::TooManyFbs);
         }
@@ -1592,8 +1691,26 @@ impl Card {
             format,
             pitch,
             gem_handle,
+            offsets,
+            chroma_pitch,
+            modifier,
         });
         Ok(id)
+    }
+
+    /// `AMDGPU_GEM_METADATA` SET on a dumb BO of this card: record its
+    /// tiling flags, which a later ADDFB2 without modifiers converts
+    /// (amdgpu_bo_set_tiling_flags). False for a handle that is not one of
+    /// this card's BOs.
+    pub fn set_bo_tiling(&mut self, gem_handle: u32, tiling_flags: u64, gfx12_dcc: bool) -> bool {
+        if self.gem.lookup(gem_handle).is_none() {
+            return false;
+        }
+        self.bo_tiling.retain(|t| t.0 != gem_handle);
+        if tiling_flags != 0 || gfx12_dcc {
+            self.bo_tiling.push((gem_handle, tiling_flags, gfx12_dcc));
+        }
+        true
     }
 
     /// Remove a previously registered framebuffer (RMFB), turning off any

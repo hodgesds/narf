@@ -12,6 +12,8 @@ mod vm;
 pub use vm::MemoryApplied;
 #[path = "amdgpu_dcn401_dpp.rs"]
 mod dpp;
+#[cfg(feature = "kernel-test")]
+pub(in crate::amdgpu_dcn401_otg) use dpp::post_csc_words;
 pub use dpp::DppApplied;
 #[path = "amdgpu_dcn401_mpc.rs"]
 mod mpc;
@@ -37,10 +39,12 @@ pub use scanout::{
     LivePipe, OverlayScanout, ScanoutPosition, ScanoutRunning, ScanoutUnderflow, VblankPhase,
 };
 
-/// A single-plane packed RGB scanout format: the DRM fourccs amdgpu_dm
-/// offers on a DCN4.0.1 primary plane that this path programs, each mapped
-/// to its DC surface format as amdgpu_dm_plane_fill_dc_plane_info_and_addr
-/// does (X and A variants share one; only the blending differs).
+/// A scanout format: the DRM fourccs amdgpu_dm offers on DCN4.0.1 planes
+/// that this path programs, each mapped to its DC surface format as
+/// amdgpu_dm's fill_dc_plane_info_and_addr does (X and A variants share
+/// one; only the blending differs): packed RGB, and the two-plane 4:2:0
+/// video formats (DC's VIDEO_420_YCrCb for NV12 and VIDEO_420_10bpc_YCrCb
+/// for P010, as amdgpu_dm names them).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SurfaceFormat {
     /// Little-endian packed 0xXXRRGGBB pixels (GRPH_ARGB8888).
@@ -69,10 +73,16 @@ pub enum SurfaceFormat {
     Xbgr16161616f,
     /// 16:16:16:16 half-float A:B:G:R (GRPH_ABGR16161616F).
     Abgr16161616f,
+    /// 8-bit Y plane, then an interleaved 8-bit CbCr plane at half
+    /// resolution (VIDEO_420_YCrCb).
+    Nv12,
+    /// NV12 with 10 bits in each MSB-aligned 16-bit sample
+    /// (VIDEO_420_10bpc_YCrCb).
+    P010,
 }
 impl SurfaceFormat {
-    /// Every format, in the order the native plane lists them.
-    pub const ALL: [Self; 13] = [
+    /// Every format (new ones appended, so an index stays stable).
+    pub const ALL: [Self; 15] = [
         Self::Xrgb8888,
         Self::Argb8888,
         Self::Xbgr8888,
@@ -86,6 +96,8 @@ impl SurfaceFormat {
         Self::Argb16161616f,
         Self::Xbgr16161616f,
         Self::Abgr16161616f,
+        Self::Nv12,
+        Self::P010,
     ];
     /// The DRM fourcc (drm_fourcc.h).
     pub const fn fourcc(self) -> u32 {
@@ -103,6 +115,8 @@ impl SurfaceFormat {
             Self::Argb16161616f => *b"AR4H",
             Self::Xbgr16161616f => *b"XB4H",
             Self::Abgr16161616f => *b"AB4H",
+            Self::Nv12 => *b"NV12",
+            Self::P010 => *b"P010",
         };
         u32::from_le_bytes(code)
     }
@@ -110,10 +124,12 @@ impl SurfaceFormat {
     pub fn from_fourcc(fourcc: u32) -> Option<Self> {
         Self::ALL.into_iter().find(|f| f.fourcc() == fourcc)
     }
-    /// Bytes per pixel: DML's 444_16, 444_32 or 444_64 source format.
+    /// Bytes per pixel: DML's 444_16, 444_32 or 444_64 source format; the
+    /// luma plane's for the 4:2:0 formats.
     pub const fn bytes_per_pixel(self) -> u32 {
         match self {
-            Self::Rgb565 => 2,
+            Self::Nv12 => 1,
+            Self::Rgb565 | Self::P010 => 2,
             Self::Xrgb16161616f
             | Self::Argb16161616f
             | Self::Xbgr16161616f
@@ -125,11 +141,36 @@ impl SurfaceFormat {
     pub const fn pitch_bytes(self, width: u32) -> u32 {
         (width * self.bytes_per_pixel()).div_ceil(256) * 256
     }
+    /// A two-plane 4:2:0 format (DC's SURFACE_PIXEL_FORMAT_VIDEO_BEGIN and
+    /// up): its chroma has its own address, pitch and viewport.
+    pub const fn is_video(self) -> bool {
+        matches!(self, Self::Nv12 | Self::P010)
+    }
+    /// SPL's pixel format class (translate_SPL_in_params_from_pipe_ctx):
+    /// SPL_PIXEL_FORMAT_420BPP8 / 420BPP10 for the video formats.
+    pub const fn spl_video(self) -> Option<spl::Video> {
+        match self {
+            Self::Nv12 => Some(spl::Video::Nv12),
+            Self::P010 => Some(spl::Video::P010),
+            _ => None,
+        }
+    }
+    /// Bytes per chroma (CbCr pair) element of a 4:2:0 format; 0 for RGB.
+    pub const fn chroma_bytes_per_pixel(self) -> u32 {
+        match self {
+            Self::Nv12 => 2,
+            Self::P010 => 4,
+            _ => 0,
+        }
+    }
     /// hubp2_program_pixel_format's DCSURF_SURFACE_PIXEL_FORMAT: 3 RGB565,
     /// 8 A*GB8888, 10 A*GB2101010, 24 A*GB16161616F (the crossbar swaps
     /// the BGR orders).
-    const fn hubp_pixel_format(self) -> u32 {
+    pub(in crate::amdgpu_dcn401_otg) const fn hubp_pixel_format(self) -> u32 {
         match self {
+            // VIDEO_420_YCrCb 64, VIDEO_420_10bpc_YCrCb 66.
+            Self::Nv12 => 64,
+            Self::P010 => 66,
             Self::Rgb565 => 3,
             Self::Xrgb8888 | Self::Argb8888 | Self::Xbgr8888 | Self::Abgr8888 => 8,
             Self::Xrgb2101010 | Self::Argb2101010 | Self::Xbgr2101010 | Self::Abgr2101010 => 10,
@@ -186,6 +227,100 @@ impl SurfaceFormat {
         )
     }
 }
+pub use crate::amdgpu_dm_modifiers::{DccBlock, Swizzle, Tiling};
+
+/// A YCbCr plane's color space as amdgpu_dm's fill_plane_color_attributes
+/// derives it from "COLOR_ENCODING" and "COLOR_RANGE" (DC's
+/// COLOR_SPACE_YCBCR601/709 and 2020_YCBCR, full or limited). RGB planes
+/// stay sRGB: their input CSC is bypassed whatever this says.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum YuvColor {
+    Bt601,
+    Bt601Limited,
+    Bt709,
+    /// amdgpu_dm_plane_init's default (BT.709, limited range).
+    #[default]
+    Bt709Limited,
+    Bt2020,
+    Bt2020Limited,
+}
+impl YuvColor {
+    /// fill_plane_color_attributes for DRM_COLOR_YCBCR_BT601/709/2020
+    /// (0, 1, 2) and DRM_COLOR_YCBCR_LIMITED/FULL_RANGE (0, 1); None for
+    /// another encoding (-EINVAL).
+    pub const fn from_props(encoding: u8, range: u8) -> Option<Self> {
+        let full = range == 1;
+        Some(match (encoding, full) {
+            (0, true) => Self::Bt601,
+            (0, false) => Self::Bt601Limited,
+            (1, true) => Self::Bt709,
+            (1, false) => Self::Bt709Limited,
+            (2, true) => Self::Bt2020,
+            (2, false) => Self::Bt2020Limited,
+            _ => return None,
+        })
+    }
+    /// The color space's `dpp_input_csc_matrix` entry (dc/inc/hw/dpp.h):
+    /// the 3x4 YCbCr-to-RGB matrix in S2.13, row by row, which
+    /// dpp3_program_post_csc loads into CM_POST_CSC_C11_C12..C33_C34.
+    pub const fn matrix(self) -> [u16; 12] {
+        match self {
+            Self::Bt601 => [
+                0x2cdd, 0x2000, 0, 0xe991, 0xe926, 0x2000, 0xf4fd, 0x10ef, 0, 0x2000, 0x38b4,
+                0xe3a6,
+            ],
+            Self::Bt601Limited => [
+                0x3353, 0x2568, 0, 0xe400, 0xe5dc, 0x2568, 0xf367, 0x1108, 0, 0x2568, 0x40de,
+                0xdd3a,
+            ],
+            Self::Bt709 => [
+                0x3265, 0x2000, 0, 0xe6ce, 0xf105, 0x2000, 0xfa01, 0xa7d, 0, 0x2000, 0x3b61, 0xe24f,
+            ],
+            Self::Bt709Limited => [
+                0x39a6, 0x2568, 0, 0xe0d6, 0xeedd, 0x2568, 0xf925, 0x9a8, 0, 0x2568, 0x43ee, 0xdbb2,
+            ],
+            Self::Bt2020 => [
+                0x2f30, 0x2000, 0, 0xe869, 0xedb7, 0x2000, 0xfabc, 0xbc6, 0, 0x2000, 0x3c34, 0xe1e6,
+            ],
+            Self::Bt2020Limited => [
+                0x35b9, 0x2543, 0, 0xe2b2, 0xeb2f, 0x2543, 0xfa01, 0x0b1f, 0, 0x2543, 0x4489,
+                0xdb42,
+            ],
+        }
+    }
+}
+
+/// What a plane's framebuffer is beyond its format: its modifier's GFX12
+/// swizzle and DCC (amdgpu_dm_plane_fill_gfx12_attrs_from_modifiers), and
+/// a YCbCr plane's color space.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlaneSurface {
+    pub tiling: Tiling,
+    pub color: YuvColor,
+}
+impl PlaneSurface {
+    /// A linear RGB (or default-colored YCbCr) surface.
+    pub const LINEAR: Self = Self {
+        tiling: Tiling::LINEAR,
+        color: YuvColor::Bt709Limited,
+    };
+}
+
+/// Where each plane of a surface lies in its allocation, as
+/// amdgpu_display_verify_plane sizes a framebuffer's planes: a pitch of
+/// whole swizzle blocks covering the width, whole block rows covering the
+/// height; a 4:2:0 surface's chroma plane (half width and height,
+/// rounded up) follows the luma at a block-aligned offset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SurfaceBytes {
+    pub pitch_bytes: u32,
+    /// The chroma plane's offset from the surface address and its pitch in
+    /// bytes; none for RGB.
+    pub chroma: Option<(u64, u32)>,
+    /// The whole surface, both planes.
+    pub bytes: u64,
+}
+
 /// How a plane blends over what lies below it in the MPCC tree, as
 /// amdgpu_dm_plane_fill_blending_from_plane_state derives it from the DRM
 /// plane's "pixel blend mode" and "alpha" (dcn401_update_mpcc_sequence
@@ -247,6 +382,8 @@ pub struct SurfaceRequest {
     /// The plane's placement; `None` is the whole surface unscaled on a
     /// stream of its own size, blended as `Blend::default_for` its format.
     pub plane: Option<PlaneLayout>,
+    /// The framebuffer's tiling, DCC and YCbCr color space.
+    pub surface: PlaneSurface,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SurfaceApplied {
@@ -299,12 +436,57 @@ impl SurfaceRequest {
                 return Err(Error::Unsupported);
             }
         }
-        // Linear surfaces use 256-byte-aligned rows and page-aligned backing.
-        let pitch = self.format.pitch_bytes(self.width);
-        Ok((pitch, u64::from(pitch) * u64::from(self.height)))
+        // DCC on a format hubbub401_get_dcc_compression_cap refuses.
+        if self.surface.tiling.dcc.is_some()
+            && !crate::amdgpu_dm_modifiers::dcc_capable(self.format.fourcc(), self.width)
+        {
+            return Err(Error::Unsupported);
+        }
+        let b = self.bytes();
+        Ok((b.pitch_bytes, b.bytes))
+    }
+    /// The surface's planes in memory: linear rows 256-byte aligned (one
+    /// LINEAR block), a tiled surface in whole swizzle blocks.
+    pub fn bytes(self) -> SurfaceBytes {
+        let swizzle = self.surface.tiling.swizzle;
+        let plane = |width: u32, height: u32, cpp: u32| {
+            let (block_width, block_height) = swizzle.block(cpp);
+            let block_pitch = block_width * cpp;
+            let pitch = (width * cpp).div_ceil(block_pitch) * block_pitch;
+            let bytes = u64::from(pitch / block_pitch)
+                * (1u64 << swizzle.block_log2())
+                * u64::from(height.div_ceil(block_height));
+            (pitch, bytes)
+        };
+        let (pitch_bytes, luma) = plane(self.width, self.height, self.format.bytes_per_pixel());
+        if !self.format.is_video() {
+            return SurfaceBytes {
+                pitch_bytes,
+                chroma: None,
+                bytes: luma,
+            };
+        }
+        let (chroma_pitch, chroma) = plane(
+            self.width.div_ceil(2),
+            self.height.div_ceil(2),
+            self.format.chroma_bytes_per_pixel(),
+        );
+        // The chroma plane starts on a block (and at least a 4 KiB page).
+        let align = 1u64 << swizzle.block_log2().max(12);
+        let offset = luma.div_ceil(align) * align;
+        SurfaceBytes {
+            pitch_bytes,
+            chroma: Some((offset, chroma_pitch)),
+            bytes: offset + chroma,
+        }
     }
 }
 impl SurfaceRequest {
+    /// A 4:2:0 surface's chroma plane: its offset from the surface address
+    /// and its pitch in bytes.
+    pub fn chroma(self) -> Option<(u64, u32)> {
+        self.bytes().chroma
+    }
     /// The effective layout: the request's, or the whole surface unscaled.
     pub fn layout(self) -> PlaneLayout {
         self.plane.unwrap_or(PlaneLayout {
@@ -355,7 +537,7 @@ impl SurfaceRequest {
             rotation: l.rotation,
             horizontal_mirror: false,
             alpha: l.blend.per_pixel_alpha,
-            video: None,
+            video: self.format.spl_video(),
         };
         core::iter::once((self.pipe, input(spl::Rect::new(0, 0, half, h)))).chain(
             self.odm
@@ -371,7 +553,9 @@ impl SurfaceRequest {
         self,
     ) -> impl Iterator<Item = (u8, spl::Scaler)> + Clone {
         let height = self.height as i32;
-        let laid_out = self.plane.is_some();
+        // A 4:2:0 surface always scales its chroma: SPL even for the whole
+        // frame.
+        let laid_out = self.plane.is_some() || self.format.is_video();
         self.spl_inputs()
             .zip(self.segments())
             .map(move |((p, input), (_, x, width))| {
@@ -399,10 +583,10 @@ impl SurfaceRequest {
     /// stream (`dml::Plane::full` for the unscaled full-frame plane).
     pub fn dml_plane(self) -> crate::amdgpu_dcn401_dml::Plane {
         let bpp = self.format.bytes_per_pixel();
-        let pitch = self.format.pitch_bytes(self.width) / bpp;
+
         let l = self.layout();
         let (w, h) = (l.stream_width as i32, l.stream_height as i32);
-        let s = if self.plane.is_some() {
+        let s = if self.plane.is_some() || self.format.is_video() {
             spl::calculate(&spl::Input {
                 src: l.src,
                 dst: l.dst,
@@ -413,14 +597,48 @@ impl SurfaceRequest {
                 rotation: l.rotation,
                 horizontal_mirror: false,
                 alpha: l.blend.per_pixel_alpha,
-                video: None,
+                video: self.format.spl_video(),
             })
         } else {
             spl::Scaler::unity(0, w, h)
         };
-        let [v_taps, h_taps, _, _] = s.dc_taps();
-        use crate::amdgpu_dcn401_dml::Plane;
+        let [v_taps, h_taps, v_taps_c, h_taps_c] = s.dc_taps();
+        use crate::amdgpu_dcn401_dml::{Chroma, Plane, Source, Swizzle as DmlSwizzle};
+        let bytes = self.bytes();
+        let pitch = bytes.pitch_bytes / bpp;
+        // populate_dml21_surface_config_from_plane_state: the plane's
+        // source format, the DC_ADDR3 swizzle, DCC, the scan direction and
+        // (4:2:0) plane 1: half the surface (DC's chroma_size), its pitch,
+        // and SPL's chroma viewport, ratios and taps.
+        let source = match self.format {
+            SurfaceFormat::Nv12 => Source::Yuv420_8,
+            SurfaceFormat::P010 => Source::Yuv420_10,
+            _ => Source::Rgb,
+        };
+        let swizzle = match self.surface.tiling.swizzle {
+            Swizzle::Linear => DmlSwizzle::Linear,
+            Swizzle::S256B2D => DmlSwizzle::S256B2D,
+            Swizzle::S4K2D => DmlSwizzle::S4K2D,
+            Swizzle::S64K2D => DmlSwizzle::S64K2D,
+            Swizzle::S256K2D => DmlSwizzle::S256K2D,
+        };
+        let chroma = bytes.chroma.map(|(_, pitch_c)| Chroma {
+            surface_width: Plane::extent(self.width / 2),
+            surface_height: Plane::extent(self.height / 2),
+            pitch: Plane::extent(pitch_c / self.format.chroma_bytes_per_pixel()),
+            viewport_width: Plane::extent(s.viewport_c.width as u32),
+            viewport_height: Plane::extent(s.viewport_c.height as u32),
+            h_ratio: s.ratios[2] >> 5,
+            v_ratio: s.ratios[3] >> 5,
+            h_taps: Plane::count(h_taps_c),
+            v_taps: Plane::count(v_taps_c),
+        });
         Plane {
+            source,
+            swizzle,
+            dcc: self.surface.tiling.dcc.is_some(),
+            vertical_scan: matches!(l.rotation, spl::Rotation::R90 | spl::Rotation::R270),
+            chroma,
             surface_width: Plane::extent(self.width),
             surface_height: Plane::extent(self.height),
             pitch: Plane::extent(pitch),
@@ -431,20 +649,26 @@ impl SurfaceRequest {
             v_ratio: s.ratios[1] >> 5,
             h_taps: Plane::count(h_taps),
             v_taps: Plane::count(v_taps),
-            ..Plane::default()
         }
     }
     /// Whether `other` fits the same buffers: the same pipe(s), size and
     /// format (the placement may differ).
     pub(in crate::amdgpu_dcn401_otg) fn same_allocation(self, other: Self) -> bool {
-        (self.pipe, self.width, self.height, self.format, self.odm)
-            == (
-                other.pipe,
-                other.width,
-                other.height,
-                other.format,
-                other.odm,
-            )
+        (
+            self.pipe,
+            self.width,
+            self.height,
+            self.format,
+            self.odm,
+            self.bytes(),
+        ) == (
+            other.pipe,
+            other.width,
+            other.height,
+            other.format,
+            other.odm,
+            other.bytes(),
+        )
     }
     /// Every pipe the surface's fetch occupies, by bit.
     pub(in crate::amdgpu_dcn401_otg) fn pipe_mask(self) -> u8 {
@@ -474,23 +698,44 @@ impl SurfaceApplied {
         }
         Ok(u64::from(y) * u64::from(self.pitch_bytes) + first)
     }
-    /// One segment's HUBP surface registers: the shared address and pitch,
-    /// with SPL's viewport for that segment (hubp401_set_viewport, luma and
-    /// chroma alike for RGB). hubp401_program_size's PITCH is in pixels,
-    /// less one; hubp2_program_rotation and hubp2_program_pixel_format set
-    /// the rotation, format and crossbar.
-    fn registers(self, scaler: &spl::Scaler) -> [(u64, u32, u32); 18] {
+    /// The chroma plane's address (DCSURF_PRIMARY_SURFACE_ADDRESS_C) for a
+    /// surface at `address`; none for RGB.
+    pub fn chroma_address(self, address: u64) -> Option<u64> {
+        self.request.chroma().map(|(offset, _)| address + offset)
+    }
+    /// One segment's HUBP surface registers, in hubp401_program_surface_config
+    /// and hubp401_program_surface_flip_and_addr's terms: DCSURF_SURFACE_CONTROL
+    /// (no TMZ; PRIMARY/SECONDARY_SURFACE_DCC_EN as hubp401_dcc_control sets
+    /// them from the modifier), hubp401_program_tiling's SW_MODE (the GFX12
+    /// swizzle; DIM_TYPE stays at the native 2D), hubp401_program_size's
+    /// PITCH (and a 4:2:0 surface's PITCH_C) in pixels less one,
+    /// hubp2_program_rotation and hubp2_program_pixel_format's rotation,
+    /// format and crossbar, SPL's luma and chroma viewports for that segment
+    /// (hubp401_set_viewport), then the addresses: a 4:2:0 surface's chroma
+    /// first, high halves before low.
+    fn registers(self, scaler: &spl::Scaler) -> alloc::vec::Vec<(u64, u32, u32)> {
         let format = self.request.format;
+        let tiling = self.request.surface.tiling;
         let rotation = self.request.layout().rotation as u32;
         let [d, s, sd, ss, dc, sc, sdc, ssc] = crate::amdgpu_dcn401_dscl::viewport(scaler);
-        [
-            (0x612, 0x203, 0), // primary TMZ, both DCC enables
-            (0x5e7, 7, 0),     // ADDR3 linear; DIM_TYPE stays at native 2D
+        let dcc = if tiling.dcc.is_some() { 0x202 } else { 0 };
+        // PRIMARY_SURFACE_TMZ, and PRIMARY_SURFACE_TMZ_C for a 4:2:0
+        // (VIDEO_PROGRESSIVE) address; both DCC enables.
+        let tmz = if format.is_video() { 0x11 } else { 1 };
+        let mut out = alloc::vec![
+            (0x612, 0x202 | tmz, dcc),
+            (0x5e7, 7, tiling.swizzle as u32),
             (
                 0x607,
                 0xffff,
                 self.pitch_bytes / format.bytes_per_pixel() - 1,
             ),
+        ];
+        let chroma = self.request.chroma();
+        if let Some((_, pitch_c)) = chroma {
+            out.push((0x608, 0xffff, pitch_c / format.chroma_bytes_per_pixel() - 1));
+        }
+        out.extend([
             // ROTATION_ANGLE; no mirror or alpha plane.
             (0x5e5, 0xf7f, format.hubp_pixel_format() | rotation << 8),
             (0x66d, 0xf00000, format.crossbar()),
@@ -505,10 +750,19 @@ impl SurfaceApplied {
             (0x609, 0xf, 0),    // VMID0, physical FB aperture still needs setup
             (FLIP, 0x130f2, 0), // normal, non-stereo, no skipped vupdates
             (FLIP2, 0x700, 0),  // no GSL or triple buffering
+        ]);
+        if let Some(c) = self.chroma_address(self.address) {
+            out.extend([
+                (0x60d, 0xffff, (c >> 32) as u32),
+                (0x60c, u32::MAX, c as u32),
+            ]);
+        }
+        out.extend([
             (0x60b, 0xffff, (self.address >> 32) as u32),
             // Low address publishes the flip: it must be the last surface write.
             (0x60a, u32::MAX, self.address as u32),
-        ]
+        ]);
+        out
     }
 }
 

@@ -203,6 +203,43 @@ fn arbiter(plan: &dml::Plan) -> [(u64, u32, u32); 5] {
     ]
 }
 
+/// hubp401_program_requestor for a plan's RQ registers:
+/// HUBPRET_CONTROL's DET_BUF_PLANE1_BASE_ADDRESS, DCN_EXPANSION_MODE (DRQ,
+/// CRQ, MRQ, PRQ), DCHUBP_REQ_SIZE_CONFIG and _C (swath height, PTE row
+/// height, chunk, minimum chunk, DPTE group and, for luma, VM group sizes),
+/// and DCHUBP_CNTL's HUBP_UNBOUNDED_REQ_MODE (hubp401_set_unbounded_requesting).
+fn requestor_writes(rq: &dml::RqRegs) -> [(u64, u32, u32); 5] {
+    let size = |q: &dml::RqPlane| {
+        q.swath_height
+            | q.pte_row_height_linear << 4
+            | q.chunk_size << 8
+            | q.min_chunk_size << 11
+            | q.dpte_group_size << 20
+    };
+    [
+        (0x66d, 0x7ff0, rq.plane1_base_address << 4),
+        (
+            0x620,
+            0xff,
+            rq.drq_expansion_mode
+                | rq.crq_expansion_mode << 2
+                | rq.mrq_expansion_mode << 4
+                | rq.prq_expansion_mode << 6,
+        ),
+        (
+            0x5f2,
+            0x0770_1f77,
+            size(&rq.luma) | rq.luma.mpte_group_size << 24,
+        ),
+        (0x5f3, 0x0070_1f77, size(&rq.chroma)),
+        (
+            HUBP_CONTROL,
+            0x400,
+            u32::from(rq.unbounded_request_enabled) << 10,
+        ),
+    ]
+}
+
 impl<I: Io> Engine<I> {
     pub(super) fn deadline_writes(
         &mut self,
@@ -256,6 +293,19 @@ impl<I: Io> Engine<I> {
             }
             for (r, mask, value) in hubp(ttu, dlg).into_iter().chain(hubp_ttu(ttu)) {
                 each(self, l.hubp(p, r), mask, value)?;
+            }
+            // A tiled or 4:2:0 plane's requestor is its plan's (the static
+            // one staged before the plan is a linear RGB plane's).
+            if plan
+                .mode
+                .plane_list()
+                .nth(k)
+                .is_some_and(|q| q.source != dml::Source::Rgb || q.swizzle != dml::Swizzle::Linear)
+            {
+                let rq = plan.plane(k).ok_or(Error::Invalid)?.rq;
+                for (r, mask, value) in requestor_writes(&rq) {
+                    each(self, l.hubp(p, r), mask, value)?;
+                }
             }
             let vready = if vready_after_vsync(plan) {
                 VREADY_AFTER_VSYNC

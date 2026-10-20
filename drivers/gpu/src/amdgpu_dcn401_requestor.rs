@@ -166,7 +166,22 @@ impl<I: Io> Engine<I> {
         }
         // Every plane's HUBP follows the primary's timing (its VTG).
         for p in self.plane_pipes(pipe) {
-            for (r, mask, value) in requestor(pipe) {
+            // A tiled or 4:2:0 plane's RQ fields are its plan's
+            // (deadline_writes programs and checks them).
+            let planned = self.status.surfaces.iter().flatten().any(|a| {
+                a.request.pipe_mask() & bit(p) != 0
+                    && (a.request.format.is_video()
+                        || a.request.surface.tiling != crate::amdgpu_dcn401_otg::Tiling::LINEAR)
+            });
+            for (r, mut mask, value) in requestor(pipe) {
+                if planned {
+                    if matches!(r, 0x66d | 0x620 | 0x5f2 | 0x5f3) {
+                        continue;
+                    }
+                    if r == HUBP_CONTROL {
+                        mask &= !0x400;
+                    }
+                }
                 let at = self.layout.hubp(p, r);
                 if self.read(at)? & mask != value {
                     return Err(Error::Readback(at));

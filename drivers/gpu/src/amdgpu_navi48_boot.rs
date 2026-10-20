@@ -2056,6 +2056,28 @@ impl ColdBoot {
                 .upload_plane_back_buffer(display, pipe, x, y, pixels)
         }
     }
+    /// `upload_display_plane_back` by byte offset into the plane's surface
+    /// (tiled and 4:2:0 frames are copied whole, block row by block row).
+    /// # Safety
+    /// As for `upload_display_back`.
+    pub unsafe fn upload_display_plane_back_bytes(
+        &mut self,
+        display: u8,
+        pipe: u8,
+        offset: u64,
+        words: &[u32],
+    ) -> Result<(), otg::Error> {
+        if self.state() != State::MemoryReady {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: serialized retained owner; caller excludes writers.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .upload_plane_back_bytes(display, pipe, offset, words)
+        }
+    }
     /// Flip the planes in `planes` (bit 0 the primary, bit k the k-th
     /// overlay) of display `pipe` to their back buffers at one VUPDATE.
     /// # Safety

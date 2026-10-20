@@ -398,6 +398,7 @@ fn overlay_primary() -> Mode {
     t.timing.v_active = 480;
     Mode {
         surface: SurfaceRequest {
+            surface: Default::default(),
             pipe: 0,
             width: 640,
             height: 480,
@@ -414,6 +415,7 @@ fn overlay_primary() -> Mode {
 /// the 640x480 stream, blended at half plane alpha.
 fn overlay_request(pipe: u8) -> SurfaceRequest {
     SurfaceRequest {
+        surface: Default::default(),
         pipe,
         width: 256,
         height: 128,

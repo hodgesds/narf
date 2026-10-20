@@ -3078,8 +3078,10 @@ fn present_slot(display: u8) -> &'static PresentSlot {
 }
 
 /// One plane's DRM framebuffer: a kernel-mapped dumb buffer, its pitch,
-/// size and fourcc. The plane's source rectangle (the shown planes') is
-/// what the presenter copies out of it.
+/// size and fourcc, each plane's offset (a 4:2:0 framebuffer's chroma
+/// plane at `offsets[1]` with `chroma_pitch`) and its modifier. A linear
+/// RGB plane's source rectangle (the shown planes') is what the presenter
+/// copies out of it; a tiled or 4:2:0 one is copied whole.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlaneFrame {
     pub phys: u64,
@@ -3087,6 +3089,28 @@ pub struct PlaneFrame {
     pub width: u32,
     pub height: u32,
     pub format: u32,
+    pub offsets: [u32; 2],
+    pub chroma_pitch: u32,
+    pub modifier: u64,
+}
+impl PlaneFrame {
+    /// A linear single-plane framebuffer at `phys`.
+    pub const fn linear(phys: u64, pitch: u32, width: u32, height: u32, format: u32) -> Self {
+        Self {
+            phys,
+            pitch,
+            width,
+            height,
+            format,
+            offsets: [0; 2],
+            chroma_pitch: 0,
+            modifier: 0,
+        }
+    }
+    /// The framebuffer's tiling, if one the planes list.
+    fn tiling(&self) -> Option<crate::amdgpu_dcn401_otg::Tiling> {
+        crate::amdgpu_dcn401_otg::Tiling::from_modifier(self.modifier)
+    }
 }
 
 /// A DRM client's frame: a framebuffer for each plane it updates (the
@@ -3289,13 +3313,7 @@ pub fn present_frame(
     ticket: Option<u64>,
     format: u32,
 ) -> bool {
-    let primary = PlaneFrame {
-        phys,
-        pitch,
-        width,
-        height,
-        format,
-    };
+    let primary = PlaneFrame::linear(phys, pitch, width, height, format);
     present_planes(
         display,
         Some(primary),
@@ -3447,11 +3465,20 @@ async unsafe fn present_native(
     crate::scanout_access::wait_retired().await;
     let shown = *present_slot(pipe).shown.lock();
     let mut planes = 0u8;
+    // A frame of another tiling than the plane shows waits for the relight
+    // that switches it, as one of another format does.
+    let surface_of = |g: Option<boot::PlaneGeometry>| {
+        g.map_or(crate::amdgpu_dcn401_otg::PlaneSurface::LINEAR, |g| {
+            g.surface
+        })
+    };
     if let Some(f) = frame.primary {
-        let origin = shown.planes.primary.map_or((0, 0), |g| (g.src_x, g.src_y));
-        // SAFETY: the caller's obligations.
-        unsafe { copy_plane(boot, pipe, pipe, f, origin) }.await?;
-        planes |= 1;
+        let g = shown.planes.primary;
+        if f.tiling() == Some(surface_of(g).tiling) {
+            // SAFETY: the caller's obligations.
+            unsafe { copy_plane(boot, pipe, pipe, f, g) }.await?;
+            planes |= 1;
+        }
     }
     for (k, f) in frame.overlays.iter().enumerate() {
         let (Some(f), Some(o), Some(q)) = (f, shown.planes.overlays[k], shown.overlay_pipes[k])
@@ -3459,11 +3486,13 @@ async unsafe fn present_native(
             continue;
         };
         // An overlay shown in another format waits for its relight.
-        if Some(o.format) != SurfaceFormat::from_fourcc(f.format) {
+        if Some(o.format) != SurfaceFormat::from_fourcc(f.format)
+            || f.tiling() != Some(o.geometry.surface.tiling)
+        {
             continue;
         }
         // SAFETY: the caller's obligations.
-        unsafe { copy_plane(boot, pipe, q, *f, (o.geometry.src_x, o.geometry.src_y)) }.await?;
+        unsafe { copy_plane(boot, pipe, q, *f, Some(o.geometry)) }.await?;
         planes |= 1 << (k + 1);
     }
     if planes == 0 {
@@ -3476,9 +3505,11 @@ async unsafe fn present_native(
     Ok(Some((before, boot.display_scanout_framebuffer(pipe)?)))
 }
 
-/// Copy the source rectangle at `origin` of framebuffer `f` into the back
-/// buffer of display `display`'s plane on `plane_pipe` (its surface is the
-/// rectangle's size), row by row.
+/// Copy framebuffer `f` into the back buffer of display `display`'s plane
+/// on `plane_pipe`, shown with geometry `g` (none: the full-frame
+/// primary): a linear RGB plane's source rectangle (its surface is the
+/// rectangle's size) row by row; a tiled or 4:2:0 plane's whole
+/// framebuffer (its surface is the framebuffer) block row by block row.
 /// # Safety
 /// As for `present_native`.
 async unsafe fn copy_plane(
@@ -3486,8 +3517,15 @@ async unsafe fn copy_plane(
     display: u8,
     plane_pipe: u8,
     f: PlaneFrame,
-    (sx, sy): (u32, u32),
+    g: Option<boot::PlaneGeometry>,
 ) -> Result<(), crate::amdgpu_dcn401_otg::Error> {
+    let format =
+        SurfaceFormat::from_fourcc(f.format).ok_or(crate::amdgpu_dcn401_otg::Error::Invalid)?;
+    if let Some(g) = g.filter(|g| g.whole_framebuffer(format)) {
+        // SAFETY: the caller's obligations.
+        return unsafe { copy_whole_plane(boot, display, plane_pipe, f, format, g) }.await;
+    }
+    let (sx, sy) = g.map_or((0, 0), |g| (g.src_x, g.src_y));
     let back = boot.display_back_framebuffer(plane_pipe)?;
     let cpp = u32::from(back.bpp / 8);
     let width = f.width.saturating_sub(sx).min(back.width);
@@ -3514,6 +3552,92 @@ async unsafe fn copy_plane(
         }?;
         if y % 64 == 63 {
             narf_scheduler::yield_now().await;
+        }
+    }
+    Ok(())
+}
+
+/// `copy_plane` for a tiled or 4:2:0 plane: each plane of the framebuffer
+/// (luma, then a 4:2:0 framebuffer's chroma) block row by block row into
+/// the surface's layout (`SurfaceRequest::bytes`). A block row of
+/// `pitch` bytes holds `pitch / block pitch` whole swizzle blocks, so the
+/// first surface-pitch bytes of each of the framebuffer's block rows are
+/// the blocks the surface holds (its pitch is the framebuffer's minimum,
+/// which amdgpu_display_verify_sizes keeps the framebuffer's pitch above).
+/// # Safety
+/// As for `present_native`.
+async unsafe fn copy_whole_plane(
+    boot: &mut boot::ColdBoot,
+    display: u8,
+    plane_pipe: u8,
+    f: PlaneFrame,
+    format: SurfaceFormat,
+    g: boot::PlaneGeometry,
+) -> Result<(), crate::amdgpu_dcn401_otg::Error> {
+    use crate::amdgpu_dcn401_otg::Error;
+    let (width, height) = g.fb_size;
+    if (f.width, f.height) != (width, height) {
+        return Err(Error::Invalid);
+    }
+    let layout = crate::amdgpu_dcn401_otg::SurfaceRequest {
+        pipe: plane_pipe,
+        width,
+        height,
+        format,
+        odm: None,
+        plane: None,
+        surface: g.surface,
+    }
+    .bytes();
+    let swizzle = g.surface.tiling.swizzle;
+    // (surface offset, surface pitch, framebuffer offset and pitch, bytes
+    // per element, rows): the luma plane, then the chroma's at half height
+    // (amdgpu_display_verify_plane's truncated plane height).
+    let mut planes = alloc::vec![(
+        0u64,
+        layout.pitch_bytes,
+        f.offsets[0],
+        f.pitch,
+        format.bytes_per_pixel(),
+        height
+    )];
+    if let Some((offset, pitch)) = layout.chroma {
+        planes.push((
+            offset,
+            pitch,
+            f.offsets[1],
+            f.chroma_pitch,
+            format.chroma_bytes_per_pixel(),
+            height / 2,
+        ));
+    }
+    let mut chunk = alloc::vec::Vec::new();
+    let mut copied = 0u32;
+    for (at, pitch, from, fb_pitch, cpp, rows) in planes {
+        let (_, block_height) = swizzle.block(cpp);
+        if fb_pitch < pitch {
+            return Err(Error::Invalid);
+        }
+        let bytes = (pitch * block_height) as usize;
+        chunk.resize(bytes / 4, 0u32);
+        for j in 0..rows.div_ceil(block_height) {
+            let src = f.phys
+                + u64::from(from)
+                + u64::from(j) * u64::from(fb_pitch) * u64::from(block_height);
+            // SAFETY: a kernel-mapped dumb buffer: ADDFB2's
+            // amdgpu_display_verify_sizes holds every block row of each
+            // plane within the BO.
+            unsafe {
+                let p = narf_memory::PhysAddr::new(src).kernel_ptr::<u8>();
+                core::ptr::copy_nonoverlapping(p, chunk.as_mut_ptr().cast::<u8>(), bytes);
+            }
+            let to = at + u64::from(j) * bytes as u64;
+            // SAFETY: serialized retained owner; caller excludes writers.
+            unsafe { boot.upload_display_plane_back_bytes(display, plane_pipe, to, &chunk) }?;
+            copied += 1;
+            if copied % 16 == 0 {
+                narf_scheduler::yield_now().await;
+            }
         }
     }
     Ok(())
@@ -5816,7 +5940,7 @@ mod tests {
         const AB30: u32 = 0x3033_4241;
         const RG16: u32 = 0x3631_4752;
         const XR4H: u32 = 0x4834_5258;
-        const NV12: u32 = 0x3231_564e;
+        const RA24: u32 = 0x3432_4152;
         let saved: [_; 4] = {
             let o = OUTPUTS.lock();
             core::array::from_fn(|k| {
@@ -5834,7 +5958,7 @@ mod tests {
             if !request_display_format(1, XR30)
                 || OUTPUTS.lock().crtcs[1].format != SurfaceFormat::Xrgb2101010
                 || request_display_format(4, XR24)
-                || request_display_format(1, NV12)
+                || request_display_format(1, RA24)
                 || OUTPUTS.lock().crtcs[1].format != SurfaceFormat::Xrgb2101010
             {
                 return TestResult::Fail("format requests");
@@ -5874,7 +5998,7 @@ mod tests {
             if !display_admits_format(0, None, None, AB30)
                 || display_admits_format(0, None, None, RG16)
                 || display_admits_format(0, None, None, XR4H)
-                || display_admits_format(0, None, None, NV12)
+                || display_admits_format(0, None, None, RA24)
             {
                 return TestResult::Fail("dark display formats");
             }
@@ -5956,6 +6080,8 @@ mod tests {
                 dst,
                 rotation: Rotation::R0,
                 blend: Blend::default_for(SurfaceFormat::Argb8888),
+                surface: crate::amdgpu_dcn401_otg::PlaneSurface::LINEAR,
+                fb_size: (w, h),
             };
             let overlay = |w, h, dst| boot::OverlayPlane {
                 geometry: geometry(w, h, dst),

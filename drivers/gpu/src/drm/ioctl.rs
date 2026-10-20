@@ -568,24 +568,15 @@ fn handle_addfb2(card: &mut Card, arg: &[u8]) -> Result<DrmIoctlResult, DrmIoctl
     if arg.len() < 68 {
         return Err(DrmIoctlError::BadSize);
     }
-    // fb_id is at offset 0 (output) — skip; width at 4, height at 8.
-    let width = u32::from_le_bytes(arg[4..8].try_into().unwrap());
-    let height = u32::from_le_bytes(arg[8..12].try_into().unwrap());
-    let pixel_format = u32::from_le_bytes(arg[12..16].try_into().unwrap());
-    // flags at 16: DRM_MODE_FB_MODIFIERS (2) carries modifier[0] at 72
-    // (after the offsets and 4 bytes of u64 alignment padding). Only
-    // DRM_FORMAT_MOD_LINEAR scans out here; any other modifier, or an
-    // unknown flag, is EINVAL as drm_mode_addfb2 / framebuffer_check refuse.
-    let flags = u32::from_le_bytes(arg[16..20].try_into().unwrap());
-    if flags & !3 != 0 || (flags & 2 != 0 && arg.get(72..80).is_none_or(|m| m != [0; 8])) {
+    // fb_id at 0 (output); width, height, pixel_format, flags; handles[4]
+    // at 20, pitches[4] at 36, offsets[4] at 52, then (after 4 bytes of u64
+    // alignment padding) modifier[4] at 72. A struct too short for the
+    // modifiers cannot carry DRM_MODE_FB_MODIFIERS.
+    let cmd = crate::amdgpu_dm_modifiers::FbCmd::parse(arg).ok_or(DrmIoctlError::BadSize)?;
+    if cmd.flags & 2 != 0 && arg.len() < 104 {
         return Err(DrmIoctlError::Card(CardError::UnknownFormat));
     }
-    // handles[0] at 20.
-    let gem_handle = u32::from_le_bytes(arg[20..24].try_into().unwrap());
-    // pitches[0] at 36.
-    let pitch = u32::from_le_bytes(arg[36..40].try_into().unwrap());
-
-    let fb_id = card.addfb2(width, height, pixel_format, pitch, gem_handle)?;
+    let fb_id = card.addfb2_cmd(&cmd)?;
     Ok(DrmIoctlResult::AddFb2(fb_id))
 }
 

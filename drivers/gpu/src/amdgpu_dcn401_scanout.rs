@@ -15,6 +15,9 @@ const DPP_CONTROL: u64 = 0xcc5; // DPP_TOP, stride 0x16b
 const DPP_CLOCK_ENABLE: u32 = 0x10;
 const ADDRESS: u64 = 0x60a;
 const ADDRESS_HIGH: u64 = 0x60b;
+/// DCSURF_PRIMARY_SURFACE_ADDRESS_C and _HIGH_C: a 4:2:0 plane's chroma.
+const ADDRESS_C: u64 = 0x60c;
+const ADDRESS_HIGH_C: u64 = 0x60d;
 const EARLIEST_INUSE: u64 = 0x61c;
 const EARLIEST_INUSE_HIGH: u64 = 0x61d;
 const FLIP_PENDING: u32 = 0x100;
@@ -524,6 +527,31 @@ impl<I: Io> Engine<I> {
     pub(super) async fn flip_to(&mut self, p: Pipe) -> Result<u32, Error> {
         self.flip_from(p, None).await
     }
+    /// The chroma plane's offset of the staged 4:2:0 surface HUBP `q`
+    /// fetches (its own or, as an ODM half, its pipe's); none for RGB.
+    fn chroma_offset(&self, q: u8) -> Option<u64> {
+        self.status
+            .surfaces
+            .iter()
+            .flatten()
+            .find(|a| a.request.pipe_mask() & bit(q) != 0)
+            .and_then(|a| a.request.chroma())
+            .map(|(offset, _)| offset)
+    }
+    /// hubp401_program_surface_flip_and_addr's address writes for HUBP `q`
+    /// fetching a surface at `address`: a 4:2:0 surface's chroma first, then
+    /// the luma (or RGB) address, each high half before the low one, whose
+    /// write latches the flip.
+    fn write_fetch_address(&mut self, q: u8, address: u64) -> Result<(), Error> {
+        let l = self.layout;
+        if let Some(offset) = self.chroma_offset(q) {
+            let c = address + offset;
+            self.update(l.hubp(q, ADDRESS_HIGH_C), 0xffff, (c >> 32) as u32)?;
+            self.update(l.hubp(q, ADDRESS_C), u32::MAX, c as u32)?;
+        }
+        self.update(l.hubp(q, ADDRESS_HIGH), 0xffff, (address >> 32) as u32)?;
+        self.update(l.hubp(q, ADDRESS), u32::MAX, address as u32)
+    }
     /// `flip_to`, re-addressing only the planes whose address differs from
     /// `from`'s (all of them without one).
     pub(super) async fn flip_from(&mut self, p: Pipe, from: Option<Pipe>) -> Result<u32, Error> {
@@ -540,8 +568,7 @@ impl<I: Io> Engine<I> {
             {
                 continue;
             }
-            self.update(l.hubp(q, ADDRESS_HIGH), 0xffff, (address >> 32) as u32)?;
-            self.update(l.hubp(q, ADDRESS), u32::MAX, address as u32)?;
+            self.write_fetch_address(q, address)?;
         }
         self.update(l.otg(pipe, LOCK), LOCK_REQUEST, 0)?;
         // Unlocked: under DRR the manual trigger ends the stretched blank.
@@ -605,8 +632,7 @@ impl<I: Io> Engine<I> {
         }
         for (q, address) in p.fetches() {
             // Re-arm the flip: high half first, the low write publishes it.
-            self.update(l.hubp(q, ADDRESS_HIGH), 0xffff, (address >> 32) as u32)?;
-            self.update(l.hubp(q, ADDRESS), u32::MAX, address as u32)?;
+            self.write_fetch_address(q, address)?;
             self.update(l.hubp(q, HUBP_CONTROL), BLANK_EN | TTU_DISABLE, 0)?;
         }
         self.update(l.otg(pipe, LOCK), LOCK_REQUEST, 0)?;

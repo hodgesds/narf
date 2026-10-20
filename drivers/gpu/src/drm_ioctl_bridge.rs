@@ -3186,13 +3186,16 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
     // The connector "EDID" property: an immutable blob. It carries no enum /
     // range values, so both counts stay 0; the bytes are fetched separately via
     // GETPROPBLOB using the blob id GETCONNECTOR reported as this prop's value.
-    if prop_id == EDID_PROP_ID || prop_id == crate::drm_native_planes::IN_FORMATS_PROP_ID {
+    if prop_id == EDID_PROP_ID
+        || prop_id == crate::drm_native_planes::IN_FORMATS_PROP_ID
+        || prop_id == crate::drm_native_planes::IN_FORMATS_ASYNC_PROP_ID
+    {
         out[20..24].copy_from_slice(&(DRM_MODE_PROP_BLOB | DRM_MODE_PROP_IMMUTABLE).to_le_bytes());
         out[24..56].fill(0);
-        let name: &[u8] = if prop_id == EDID_PROP_ID {
-            b"EDID"
-        } else {
-            b"IN_FORMATS"
+        let name: &[u8] = match prop_id {
+            EDID_PROP_ID => b"EDID",
+            crate::drm_native_planes::IN_FORMATS_PROP_ID => b"IN_FORMATS",
+            _ => b"IN_FORMATS_ASYNC",
         };
         out[24..24 + name.len()].copy_from_slice(name);
         out[56..60].copy_from_slice(&0u32.to_le_bytes()); // count_values
@@ -3368,6 +3371,16 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
             b"rotation",
             DRM_MODE_PROP_BITMASK,
             &crate::drm_native_planes::ROTATION_ENUMS,
+        ),
+        crate::drm_native_planes::COLOR_ENCODING_PROP_ID => (
+            b"COLOR_ENCODING",
+            DRM_MODE_PROP_ENUM,
+            &crate::drm_native_planes::COLOR_ENCODING_ENUMS,
+        ),
+        crate::drm_native_planes::COLOR_RANGE_PROP_ID => (
+            b"COLOR_RANGE",
+            DRM_MODE_PROP_ENUM,
+            &crate::drm_native_planes::COLOR_RANGE_ENUMS,
         ),
         _ => return Err(FsError::InvalidData),
     };
@@ -5109,7 +5122,9 @@ fn handle_atomic(
             present_frame(
                 card_index,
                 crtc_id,
-                (src_phys, pitch, width, height, format),
+                crate::amdgpu_navi48_platform::PlaneFrame::linear(
+                    src_phys, pitch, width, height, format,
+                ),
                 flip_ticket,
             );
         } else {
@@ -5192,9 +5207,25 @@ fn handle_create_dumb(
     if req.width == 0 || req.height == 0 || req.bpp == 0 {
         return Err(FsError::InvalidData);
     }
-    // Compute pitch (round up to 64-byte stride for alignment).
     let bpp_bytes = req.bpp.div_ceil(8);
-    let pitch = req.width * bpp_bytes;
+    // The native amdgpu card pads lines as amdgpu_mode_dumb_create does
+    // (amdgpu_gem_align_pitch: a 256-byte multiple for 1-4 bytes per pixel),
+    // which its ADDFB2's LINEAR pitch check (amdgpu_display_verify_sizes)
+    // requires; other cards keep packed lines.
+    let pitch = if mode_state.lock().gfx12_modifiers {
+        let mask = match bpp_bytes {
+            1 => 255,
+            2 => 127,
+            3 | 4 => 63,
+            _ => 0,
+        };
+        req.width
+            .checked_add(mask)
+            .and_then(|w| (w & !mask).checked_mul(bpp_bytes))
+            .ok_or(FsError::InvalidData)?
+    } else {
+        req.width * bpp_bytes
+    };
     let raw_size = pitch as u64 * req.height as u64;
     // Round up to page size.
     let page_size: u64 = 4096;
@@ -5496,7 +5527,7 @@ fn handle_setcrtc(
     let src_pitch: u32;
     let src_w: u32;
     let src_h: u32;
-    let src_format: u32;
+    let src_frame: crate::amdgpu_navi48_platform::PlaneFrame;
     // SETCRTC's single connector id, read before any card lock is held.
     let setcrtc_connector = if req.count_connectors == 1 && req.set_connectors_ptr != 0 {
         // SAFETY: a user pointer to count_connectors (one) u32 ids.
@@ -5576,7 +5607,29 @@ fn handle_setcrtc(
                     .framebuffer(req.fb_id)
                     .map_err(|_| FsError::NotFound)?
                     .format;
-                if !crate::amdgpu_native_kms::display_admits_format(
+                // A tiled or 4:2:0 framebuffer is scanned as a placed
+                // primary: DML admits the display's planes with it.
+                let placed = mode.and_then(|m| {
+                    crate::drm_native_planes::setcrtc_planes(
+                        &card,
+                        req.crtc_id,
+                        req.fb_id,
+                        (req.x, req.y),
+                        (m.width, m.height),
+                    )
+                });
+                if let Some(planes) = placed {
+                    let planes = planes?;
+                    if !crate::amdgpu_native_kms::display_admits_planes(
+                        d,
+                        native_connector,
+                        native_wire.as_ref(),
+                        format as u32,
+                        &planes.setup,
+                    ) {
+                        return Err(FsError::InvalidData);
+                    }
+                } else if !crate::amdgpu_native_kms::display_admits_format(
                     d,
                     native_connector,
                     native_wire.as_ref(),
@@ -5636,9 +5689,9 @@ fn handle_setcrtc(
         src_pitch = fb.pitch;
         src_w = fb.width;
         src_h = fb.height;
-        src_format = fb.format as u32;
         let gem_handle = fb.gem_handle;
         src_phys = card.dumb_backing(gem_handle).map(|b| b.phys);
+        src_frame = fb_frame(fb, src_phys.unwrap_or(0));
         virgl_resource = card.virtgpu_import(gem_handle).cloned();
     }
 
@@ -5663,7 +5716,10 @@ fn handle_setcrtc(
         present_frame(
             card_index,
             req.crtc_id,
-            (src, src_pitch, src_w, src_h, src_format),
+            crate::amdgpu_navi48_platform::PlaneFrame {
+                phys: src,
+                ..src_frame
+            },
             None,
         );
     } else {
@@ -5720,10 +5776,9 @@ fn handle_page_flip(
 
     let src_phys: Option<u64>;
     let virgl_resource: Option<Arc<VirtGpuResource>>;
-    let src_pitch: u32;
     let src_w: u32;
     let src_h: u32;
-    let src_format: u32;
+    let src_frame: crate::amdgpu_navi48_platform::PlaneFrame;
     let mut flip_ticket = None;
     {
         let mut card = mode_state.lock();
@@ -5756,12 +5811,11 @@ fn handle_page_flip(
             None => check_native_plane(&card, req.fb_id, mode, (x, y), None)?,
         }
         let fb = card.framebuffer(req.fb_id).map_err(|_| FsError::NotFound)?;
-        src_pitch = fb.pitch;
         src_w = fb.width;
         src_h = fb.height;
-        src_format = fb.format as u32;
         let gem_handle = fb.gem_handle;
         src_phys = card.dumb_backing(gem_handle).map(|b| b.phys);
+        src_frame = fb_frame(fb, src_phys.unwrap_or(0));
         virgl_resource = card.virtgpu_import(gem_handle).cloned();
 
         // Reserve Linux's per-file event space before changing the CRTC, so an
@@ -5779,6 +5833,19 @@ fn handle_page_flip(
         card.crtc_mut(req.crtc_id)
             .map_err(|_| FsError::NotFound)?
             .primary_fb = Some(req.fb_id);
+        // A framebuffer of another tiling changes the primary's surface
+        // (DC's full update): the display relights with it, as for an
+        // atomic commit.
+        if let Some(display) =
+            crate::amdgpu_native_kms::crtc_display(req.crtc_id).filter(|_| card.gfx12_modifiers)
+        {
+            if let Some(d) = crate::drm_native_planes::displays(&card)
+                .into_iter()
+                .find(|d| d.crtc_id == req.crtc_id)
+            {
+                crate::amdgpu_native_kms::request_display_planes(display, d.setup);
+            }
+        }
 
         if let Some(queue) = event_queue.as_mut() {
             let hardware = (virgl_resource.is_none()
@@ -5821,7 +5888,10 @@ fn handle_page_flip(
         present_frame(
             card_index,
             req.crtc_id,
-            (src, src_pitch, src_w, src_h, src_format),
+            crate::amdgpu_navi48_platform::PlaneFrame {
+                phys: src,
+                ..src_frame
+            },
             flip_ticket,
         );
     } else {
@@ -6008,13 +6078,24 @@ fn native_plane_frame(
 ) -> Option<crate::amdgpu_navi48_platform::PlaneFrame> {
     let fb = card.framebuffer(plane.fb_id?).ok()?;
     let phys = card.dumb_backing(fb.gem_handle)?.phys;
-    Some(crate::amdgpu_navi48_platform::PlaneFrame {
+    Some(fb_frame(fb, phys))
+}
+
+/// Framebuffer `fb` (backed at `phys`) as the presenter copies it.
+fn fb_frame(
+    fb: &crate::drm::card::Framebuffer,
+    phys: u64,
+) -> crate::amdgpu_navi48_platform::PlaneFrame {
+    crate::amdgpu_navi48_platform::PlaneFrame {
         phys,
         pitch: fb.pitch,
         width: fb.width,
         height: fb.height,
         format: fb.format as u32,
-    })
+        offsets: fb.offsets,
+        chroma_pitch: fb.chroma_pitch,
+        modifier: fb.modifier,
+    }
 }
 
 /// A display with native planes presents an atomic commit's planes
@@ -6043,39 +6124,49 @@ fn present_native_planes(
         return;
     }
     if let Some(f) = primary {
-        present_frame(
-            card_index,
-            crtc_id,
-            (f.phys, f.pitch, f.width, f.height, f.format),
-            None,
-        );
+        present_frame(card_index, crtc_id, f, None);
     }
 }
 
 /// `flip_ticket` is the ticket of a flip-complete event waiting for this
 /// frame's hardware flip; it is completed whichever way the frame goes.
-/// `src` is the framebuffer's dumb backing, pitch, size and fourcc.
+/// `f` is the framebuffer: its dumb backing, pitch, size, fourcc and, on
+/// the native amdgpu card, its planes and modifier.
 fn present_frame(
     card_index: u32,
     crtc_id: u32,
-    (src_phys, src_pitch, src_w, src_h, src_format): (u64, u32, u32, u32, u32),
+    f: crate::amdgpu_navi48_platform::PlaneFrame,
     flip_ticket: Option<u64>,
 ) {
+    let (src_phys, src_pitch, src_w, src_h, src_format) =
+        (f.phys, f.pitch, f.width, f.height, f.format);
     let driver = crate::drm_registry::driver_name(card_index);
     // A native amdgpu display presents tear-free through its back buffer
     // and a VUPDATE-latched flip instead of copying onto the visible front.
     if driver == Some("amdgpu") {
         if let Some(display) = crate::amdgpu_native_kms::crtc_display(crtc_id) {
-            // A refused frame completes its ticket at once.
-            let native = crate::amdgpu_native_kms::present_frame(
-                display,
-                src_phys,
-                src_pitch,
-                src_w,
-                src_h,
-                flip_ticket,
-                src_format,
-            );
+            // A refused frame completes its ticket at once. A tiled or 4:2:0
+            // framebuffer (only the Navi 48 card takes them) goes as its
+            // primary plane's frame.
+            let linear = f.modifier == 0 && f.offsets == [0; 2] && f.chroma_pitch == 0;
+            let native = if linear {
+                crate::amdgpu_native_kms::present_frame(
+                    display,
+                    src_phys,
+                    src_pitch,
+                    src_w,
+                    src_h,
+                    flip_ticket,
+                    src_format,
+                )
+            } else {
+                crate::amdgpu_native_kms::present_planes(
+                    display,
+                    Some(f),
+                    [None; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
+                    flip_ticket,
+                )
+            };
             if native {
                 narf_console::fb_take_for_user();
                 return;
@@ -6418,6 +6509,58 @@ pub fn amdgpu_get_cap(cmd: u32, arg: usize) -> Option<Result<u64, FsError>> {
     b[8..16].copy_from_slice(&amdgpu_cap_value(cap).to_le_bytes());
     // SAFETY: as above.
     Some(unsafe { copy_out(arg, &b) }.map(|()| 0))
+}
+
+/// `DRM_IOCTL_AMDGPU_GEM_METADATA` on one of the native amdgpu card's dumb
+/// BOs (Linux dumb buffers are amdgpu BOs, so the ioctl takes them): SET
+/// records the tiling flags a later ADDFB2 without modifiers converts
+/// (convert_tiling_flags_to_modifier_gfx12), GET returns them with no
+/// metadata blob. `None` for another ioctl or a handle that is not a dumb
+/// BO of a native amdgpu card (the per-open amdgpu GEM table answers it).
+pub fn amdgpu_dumb_metadata(card_index: u32, cmd: u32, arg: usize) -> Option<Result<u64, FsError>> {
+    let nr = drm_uapi::ioc_nr(cmd);
+    if (cmd >> 8) & 0xff != u32::from(b'd')
+        || nr != drm_uapi::DRM_COMMAND_BASE + crate::amdgpu_uapi::DRM_AMDGPU_GEM_METADATA
+    {
+        return None;
+    }
+    let mode_state = crate::drm_registry::mode_state(card_index)?;
+    // SAFETY: `arg` is the ioctl pointer; drm_amdgpu_gem_metadata is 288 bytes.
+    let mut b = match unsafe { copy_in(arg, 288) } {
+        Ok(b) => b,
+        Err(e) => return Some(Err(e)),
+    };
+    let field = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+    let (handle, op) = (field(&b, 0), field(&b, 4));
+    let mut card = mode_state.lock();
+    if !card.gfx12_modifiers || card.gem.lookup(handle).is_none() {
+        return None;
+    }
+    match op {
+        crate::amdgpu_uapi::AMDGPU_GEM_METADATA_OP_SET_METADATA => {
+            if field(&b, 24) > 256 {
+                return Some(Err(FsError::InvalidData));
+            }
+            let tiling = u64::from_le_bytes(b[16..24].try_into().unwrap());
+            // A dumb BO is never created with AMDGPU_GEM_CREATE_GFX12_DCC.
+            card.set_bo_tiling(handle, tiling, false);
+            Some(Ok(0))
+        }
+        crate::amdgpu_uapi::AMDGPU_GEM_METADATA_OP_GET_METADATA => {
+            let tiling = card
+                .bo_tiling
+                .iter()
+                .find(|t| t.0 == handle)
+                .map_or(0, |t| t.1);
+            drop(card);
+            b[8..16].fill(0);
+            b[16..24].copy_from_slice(&tiling.to_le_bytes());
+            b[24..28].fill(0);
+            // SAFETY: as above.
+            Some(unsafe { copy_out(arg, &b) }.map(|()| 0))
+        }
+        _ => Some(Ok(0)),
+    }
 }
 
 /// `struct drm_version` for the amdgpu driver: `amdgpu`, `20150101`,

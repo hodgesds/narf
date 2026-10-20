@@ -468,3 +468,111 @@ kernel_test_in!(
     "drivers/gpu/dcn401-dpp",
     dcn401_dpp_ram_wake_timeout_cancellation_and_late_changes_fail_closed
 );
+
+/// tests/dcn401_yuv/vectors.txt: Linux's fill_plane_color_attributes,
+/// dpp401_dpp_setup and hubp2_program_pixel_format for every scanned format
+/// and COLOR_ENCODING / COLOR_RANGE pair; the post CSC words of a YCbCr
+/// plane are its dpp_input_csc_matrix entry as
+/// cm_helper_program_color_matrices packs it.
+fn dcn401_dpp_input_conversion_matches_linux_vectors() -> TestResult {
+    use crate::amdgpu_dcn401_otg::YuvColor;
+    use core::fmt::Write;
+    const VECTORS: &str = include_str!("../tests/dcn401_yuv/vectors.txt");
+    let mut n = 0;
+    for line in VECTORS.lines().filter(|l| !l.starts_with('#')) {
+        let (input, want) = line.split_once(" = ").unwrap();
+        let mut f = input.split_whitespace();
+        let code = f.next().unwrap().as_bytes();
+        let fourcc = u32::from_le_bytes([code[0], code[1], code[2], code[3]]);
+        let enc: u8 = f.next().unwrap().parse().unwrap();
+        let range: u8 = f.next().unwrap().parse().unwrap();
+        let format = SurfaceFormat::from_fourcc(fourcc).unwrap();
+        // fill_plane_color_attributes ignores the properties for RGB.
+        let color = if format.is_video() {
+            YuvColor::from_props(enc, range)
+        } else {
+            Some(YuvColor::default())
+        };
+        let mut got = alloc::string::String::new();
+        match color {
+            None => got.push('-'),
+            Some(color) => {
+                let crossbar = format.crossbar();
+                let csc = crate::amdgpu_dcn401_otg::fetch::post_csc_words(format, color);
+                let _ = write!(
+                    got,
+                    "{} {} {} {} {} {}",
+                    format.hubp_pixel_format(),
+                    crossbar >> 20 & 3,
+                    crossbar >> 22 & 3,
+                    format.cnvc_pixel_format(),
+                    u32::from(format.cnvc_alpha()),
+                    u32::from(csc.is_some()),
+                );
+                for w in csc.into_iter().flatten() {
+                    let _ = write!(got, " {w:x}");
+                }
+            }
+        }
+        if got != want {
+            let _ = writeln!(
+                narf_console::Writer,
+                "dcn401_yuv: {input}: got {got}, want {want}"
+            );
+            return TestResult::Fail("input conversion differs from Linux");
+        }
+        n += 1;
+    }
+    if n != 120 {
+        return TestResult::Fail("vector count");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dpp",
+    dcn401_dpp_input_conversion_matches_linux_vectors
+);
+
+/// An NV12 plane stages dpp401_dpp_setup's VIDEO_420 CNVC format and the
+/// post CSC of its color space (set A, CM_POST_CSC_MODE 1).
+fn dcn401_dpp_stages_nv12_input_csc() -> TestResult {
+    use crate::amdgpu_dcn401_otg::{PlaneSurface, YuvColor};
+    let p = 1;
+    let mut mode = small(p);
+    mode.timing.timing.h_active = 64;
+    mode.timing.timing.v_active = 16;
+    mode.clock = clock(mode.timing);
+    mode.surface = SurfaceRequest {
+        width: 64,
+        height: 16,
+        format: SurfaceFormat::Nv12,
+        surface: PlaneSurface {
+            color: YuvColor::Bt601,
+            ..PlaneSurface::LINEAR
+        },
+        ..req(p)
+    };
+    let (_backing, _pool, mut e, mut surfaces, clock) = ready_with(p, ColorDepth::Bpc8, mode);
+    if run(surfaces.prepare_dpp(&mut e, p, || Ok((clock, config())))).is_err() {
+        return TestResult::Fail("NV12 DPP staging");
+    }
+    let reg = |e: &mut Engine<DppIo>, r: u64| e.fake().regs[&d(p, r)] & !0x8000_0000;
+    if reg(&mut e, 0xccf) & 0x17f != 64 || reg(&mut e, 0xd68) & 3 != 1 {
+        return TestResult::Fail("CNVC format / post CSC mode");
+    }
+    let want = [
+        0x2000_2cdd,
+        0xe991_0000,
+        0x2000_e926,
+        0x10ef_f4fd,
+        0x2000_0000,
+        0xe3a6_38b4,
+    ];
+    for (i, w) in want.into_iter().enumerate() {
+        if reg(&mut e, 0xd69 + i as u64) != w & !0x8000_0000 {
+            return TestResult::Fail("post CSC coefficients");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/dcn401-dpp", dcn401_dpp_stages_nv12_input_csc);

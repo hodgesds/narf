@@ -3442,7 +3442,11 @@ fn smoke_drm_navi48_plane_formats_end_to_end() -> TestResult {
         ms.lock().addfb2(w, h, format, pitch, handle)
     };
     let mut fbs = alloc::vec::Vec::new();
-    for &format in FORMATS {
+    // NV12 and P010 need two planes (smoke_drm_addfb2_takes_gfx12_modifiers_and_nv12).
+    for &format in FORMATS
+        .iter()
+        .filter(|&&f| !matches!(f, 0x3231_564e | 0x3031_3050))
+    {
         let Some(cpp) = PixelFormat::from_fourcc(format).map(PixelFormat::cpp) else {
             return TestResult::Fail("plane format unknown to ADDFB2");
         };
@@ -3717,11 +3721,11 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
     let Some(ms) = crate::drm_registry::mode_state(idx) else {
         return TestResult::Fail("no mode state");
     };
-    let (primary_fb, video_fb, big_fb, deep_fb) = {
+    let (primary_fb, video_fb, big_fb, _deep_fb) = {
         let mut card = ms.lock();
         card.native_atomic = true;
         card.plane_formats = Some(&crate::amdgpu_navi48_kms::PLANE_FORMATS);
-        card.overlay_formats = Some(&planes::OVERLAY_FORMATS);
+        card.overlay_formats = Some(&crate::amdgpu_navi48_kms::PLANE_FORMATS);
         card.native_planes = planes::planes_for(&[], &[11, 12]);
         let mut fb = |phys: u64, w: u32, h: u32, format: u32| {
             let size = (w * h * 4) as usize;
@@ -3743,6 +3747,9 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
             fb(0xBE30_0000, 256, 128, AR24),
             fb(0xBE40_0000, 64, 32, XR30),
         );
+        // The native amdgpu card's GFX12 modifiers (after the packed-pitch
+        // framebuffers above, which its LINEAR pitch rule refuses).
+        card.gfx12_modifiers = true;
         let crtc = card.crtc_mut(11).unwrap();
         crtc.mode = Some(crate::Mode {
             width: 64,
@@ -3789,19 +3796,19 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
     let (r, crtc, fb, possible, count, formats) = getplane(OVERLAY);
     if r != Ok(0)
         || (crtc, fb, possible) != (0, 0, 0xff)
-        || count != 5
-        || formats[..5] != planes::OVERLAY_FORMATS
+        || count != 15
+        || formats[..15] != crate::amdgpu_navi48_kms::PLANE_FORMATS
     {
         return TestResult::Fail("overlay GETPLANE");
     }
     // OBJ_GETPROPERTIES: the core plane properties, then amdgpu_dm's.
     let properties = |id: u32| {
         let mut props = [0u32; 20];
-        let mut vals = [0u64; 20];
+        let mut vals = [0u64; 24];
         let mut og = [0u8; 32];
         og[0..8].copy_from_slice(&(props.as_mut_ptr() as u64).to_le_bytes());
         og[8..16].copy_from_slice(&(vals.as_mut_ptr() as u64).to_le_bytes());
-        og[16..20].copy_from_slice(&20u32.to_le_bytes());
+        og[16..20].copy_from_slice(&24u32.to_le_bytes());
         og[20..24].copy_from_slice(&id.to_le_bytes());
         og[24..28].copy_from_slice(&0xeeee_eeeeu32.to_le_bytes());
         let r = dispatch_card(
@@ -3811,30 +3818,37 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
             false,
         );
         let n = u32::from_le_bytes(og[16..20].try_into().unwrap()) as usize;
-        (r, props[..n.min(20)].to_vec(), vals[..n.min(20)].to_vec())
+        (r, props[..n.min(24)].to_vec(), vals[..n.min(24)].to_vec())
     };
     let (r, props, vals) = properties(OVERLAY + 1);
     let blob = u64::from(planes::in_formats_blob_id(OVERLAY + 1));
+    let async_blob = u64::from(planes::in_formats_async_blob_id(OVERLAY + 1));
+    // The planes scan NV12/P010: COLOR_ENCODING (BT.709) and COLOR_RANGE
+    // (limited) before the rotation; IN_FORMATS and IN_FORMATS_ASYNC last.
     if r != Ok(0)
-        || props.len() != 17
+        || props.len() != 20
         || vals[0] != 0
         || props[12..]
             != [
                 planes::ALPHA_PROP_ID,
                 planes::BLEND_PROP_ID,
                 planes::ZPOS_PROP_ID,
+                planes::COLOR_ENCODING_PROP_ID,
+                planes::COLOR_RANGE_PROP_ID,
                 planes::ROTATION_PROP_ID,
                 planes::IN_FORMATS_PROP_ID,
+                planes::IN_FORMATS_ASYNC_PROP_ID,
             ]
-        || vals[12..] != [0xffff, 0, 9, 1, blob]
+        || vals[12..] != [0xffff, 0, 9, 1, 0, 1, blob, async_blob]
     {
         return TestResult::Fail("overlay properties");
     }
-    // IN_FORMATS through GETPROPBLOB: a version-1 drm_format_modifier_blob.
-    let mut data = [0u8; 256];
+    // IN_FORMATS through GETPROPBLOB: a version-1 drm_format_modifier_blob
+    // of the 15 formats and the 17 GFX12 modifiers.
+    let mut data = alloc::vec![0u8; 512];
     let mut gb = [0u8; 16];
     gb[0..4].copy_from_slice(&(blob as u32).to_le_bytes());
-    gb[4..8].copy_from_slice(&256u32.to_le_bytes());
+    gb[4..8].copy_from_slice(&512u32.to_le_bytes());
     gb[8..16].copy_from_slice(&(data.as_mut_ptr() as u64).to_le_bytes());
     let r = dispatch_card(
         idx,
@@ -3844,9 +3858,13 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
     );
     let len = u32::from_le_bytes(gb[4..8].try_into().unwrap()) as usize;
     if r != Ok(0)
-        || len < 48
+        || len != 88 + 17 * 24
         || data[0..4] != 1u32.to_le_bytes()
-        || data[16..20] != 1u32.to_le_bytes()
+        || data[8..12] != 15u32.to_le_bytes()
+        || data[16..20] != 17u32.to_le_bytes()
+        || data[..len]
+            != crate::amdgpu_dm_modifiers::in_formats_blob(&crate::amdgpu_navi48_kms::PLANE_FORMATS)
+                .unwrap()[..]
     {
         return TestResult::Fail("IN_FORMATS blob");
     }
@@ -3857,8 +3875,11 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
             != [
                 planes::BLEND_PROP_ID,
                 planes::PRIMARY_ZPOS_PROP_ID,
+                planes::COLOR_ENCODING_PROP_ID,
+                planes::COLOR_RANGE_PROP_ID,
                 planes::ROTATION_PROP_ID,
                 planes::IN_FORMATS_PROP_ID,
+                planes::IN_FORMATS_ASYNC_PROP_ID,
             ]
         || vals[13] != 3
         || vals[9..11] != [64, 32]
@@ -3914,6 +3935,26 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
         || &enums[128..138] != b"rotate-270"
     {
         return TestResult::Fail("rotation property");
+    }
+    // drm_plane_create_color_properties' enums with drm_color_mgmt.c's names.
+    let (r, flags, name, values, enums) = getproperty(planes::COLOR_ENCODING_PROP_ID);
+    if r != Ok(0)
+        || flags != 8
+        || name != b"COLOR_ENCODING"
+        || values != [0, 1, 2]
+        || &enums[48..66] != b"ITU-R BT.709 YCbCr"
+    {
+        return TestResult::Fail("COLOR_ENCODING property");
+    }
+    let (r, flags, name, values, enums) = getproperty(planes::COLOR_RANGE_PROP_ID);
+    if r != Ok(0)
+        || flags != 8
+        || name != b"COLOR_RANGE"
+        || values != [0, 1]
+        || &enums[8..27] != b"YCbCr limited range"
+        || &enums[48..64] != b"YCbCr full range"
+    {
+        return TestResult::Fail("COLOR_RANGE property");
     }
     // ATOMIC with amdgpu_dm's checks.
     let atomic = |flags: u32, objects: &[(u32, &[(u32, u64)])]| {
@@ -3973,7 +4014,7 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
     }
     let eighth = place(big_fb, (256, 128), (0, 0, 32, 16));
     type Case = (&'static str, alloc::vec::Vec<(u32, u64)>, u32);
-    let refused: [Case; 7] = [
+    let refused: [Case; 6] = [
         ("8:1 downscale", alloc::vec::Vec::from(eighth), OVERLAY),
         ("rotate-90", with(&[(planes::ROTATION_PROP_ID, 2)]), OVERLAY),
         (
@@ -3989,11 +4030,6 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
         (
             "viewport",
             alloc::vec::Vec::from(place(video_fb, (32, 16), (8, 8, 20, 12))),
-            OVERLAY,
-        ),
-        (
-            "overlay format",
-            alloc::vec::Vec::from(place(deep_fb, (64, 32), (0, 0, 64, 32))),
             OVERLAY,
         ),
         (

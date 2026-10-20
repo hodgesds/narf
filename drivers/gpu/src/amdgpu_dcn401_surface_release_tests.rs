@@ -42,6 +42,7 @@ impl Io for Model {
 
 fn buffers(pool: &Pool, pipe: u8, height: u32) -> Surface {
     let request = SurfaceRequest {
+        surface: Default::default(),
         pipe,
         width: 16,
         height,

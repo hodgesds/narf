@@ -24,6 +24,7 @@ pub use fetch::{
     ScanoutUnderflow, SurfaceApplied, SurfaceFormat, SurfaceRequest, VblankPhase, CURSOR_MAX,
     MAX_OVERLAYS,
 };
+pub use fetch::{DccBlock, PlaneSurface, SurfaceBytes, Swizzle, Tiling, YuvColor};
 #[path = "amdgpu_dcn401_stream.rs"]
 mod stream;
 pub use stream::{DpBlanked, DpEncoderRetired, DpStream};

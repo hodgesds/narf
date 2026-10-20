@@ -190,6 +190,7 @@ fn dcn401_scanout_odm_drives_both_halves_under_one_lock() -> TestResult {
     let mut e = staged_odm(pipe, Some(q));
     let surface = SurfaceApplied {
         request: SurfaceRequest {
+            surface: Default::default(),
             pipe,
             width: 7680,
             height: 4320,
@@ -676,6 +677,7 @@ fn tree_writes(l: Layout, log: &[(u64, u32)], pipes: &[u8]) -> alloc::vec::Vec<(
 fn stage_records(e: &mut Engine<Hw>, pipe: u8, odm: Option<u8>, overlays: &[(u8, Option<u8>)]) {
     let surface = |pipe, odm, address| SurfaceApplied {
         request: SurfaceRequest {
+            surface: Default::default(),
             pipe,
             width: 1920,
             height: 1080,

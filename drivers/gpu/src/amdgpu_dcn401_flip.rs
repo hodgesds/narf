@@ -222,6 +222,46 @@ impl Surfaces {
             Ok(())
         })
     }
+    /// `upload_back` by surface byte offset rather than pixel row: packed
+    /// 32-bit words written from byte `offset` of the back buffer, within
+    /// the surface's bytes (both planes of a 4:2:0 surface, a tiled
+    /// surface's swizzle blocks). The presenter copies tiled and 4:2:0
+    /// framebuffers this way, block row by block row.
+    pub(in crate::amdgpu_dcn401_otg) fn upload_back_bytes<I: Io>(
+        &mut self,
+        e: &mut Engine<I>,
+        pipe: u8,
+        offset: u64,
+        words: &[u32],
+    ) -> Result<(), Error> {
+        let surface = self
+            .0
+            .get(usize::from(pipe))
+            .and_then(Option::as_ref)
+            .ok_or(Error::Invalid)?;
+        let back = surface.back.as_ref().ok_or(Error::Invalid)?;
+        let a = surface.applied;
+        let end = (words.len() as u64)
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(offset))
+            .ok_or(Error::Invalid)?;
+        if words.is_empty() || offset % 4 != 0 || end > a.bytes {
+            return Err(Error::Invalid);
+        }
+        let (_, fetched) = e.live_plane(pipe).ok_or(Error::Busy)?;
+        if fetched != a.address || back.address() == a.address {
+            return Err(Error::Busy);
+        }
+        let map = back.mapping();
+        e.access(|_| {
+            for (index, &word) in words.iter().enumerate() {
+                // SAFETY: checked bounds within the retained back buffer,
+                // which no display fetch reads until the next flip.
+                unsafe { map.write32(offset + index as u64 * 4, word) };
+            }
+            Ok(())
+        })
+    }
     /// Present the back buffer at the next VUPDATE and wait for the HUBP to
     /// report it in use. Any failure quarantines the pipe; both buffers stay
     /// allocated because which one is still fetched is then unknown.
@@ -394,6 +434,20 @@ impl Otg {
     ) -> Result<(), Error> {
         self.0.select_display(display)?;
         self.1.upload_back(&mut self.0, pipe, x, y, pixels)
+    }
+    /// `upload_plane_back_buffer` by byte offset into the surface
+    /// (`Surfaces::upload_back_bytes`).
+    /// # Safety
+    /// As for `upload_back_buffer`.
+    pub unsafe fn upload_plane_back_bytes(
+        &mut self,
+        display: u8,
+        pipe: u8,
+        offset: u64,
+        words: &[u32],
+    ) -> Result<(), Error> {
+        self.0.select_display(display)?;
+        self.1.upload_back_bytes(&mut self.0, pipe, offset, words)
     }
     /// Flip a live scanout to its back buffer at the next VUPDATE.
     /// # Safety

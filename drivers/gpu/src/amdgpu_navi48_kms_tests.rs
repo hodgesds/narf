@@ -494,13 +494,14 @@ kernel_test_in!(
     navi48_kms_publishes_an_output_per_port
 );
 
-/// The primary plane lists amdgpu_dm_plane_get_plane_formats' DCN4.0.1
-/// order (rgb_formats, then the FP16 formats) less RGBA8888, the 16-bit
-/// UNORM orders, NV12 and P010, and every card it publishes carries it.
+/// Every plane lists amdgpu_dm_plane_get_plane_formats' DCN4.0.1 order
+/// (rgb_formats, NV12, P010, then the FP16 formats) less RGBA8888 and the
+/// 16-bit UNORM orders, and every card it publishes carries it on its
+/// primaries and overlays with the GFX12 modifiers.
 fn navi48_kms_plane_formats_follow_amdgpu_dm() -> TestResult {
     let want = [
         *b"XR24", *b"AR24", *b"XR30", *b"XB30", *b"AR30", *b"AB30", *b"XB24", *b"AB24", *b"RG16",
-        *b"XR4H", *b"AR4H", *b"XB4H", *b"AB4H",
+        *b"NV12", *b"P010", *b"XR4H", *b"AR4H", *b"XB4H", *b"AB4H",
     ]
     .map(u32::from_le_bytes);
     if PLANE_FORMATS != want {
@@ -508,8 +509,21 @@ fn navi48_kms_plane_formats_follow_amdgpu_dm() -> TestResult {
     }
     let mut card = Card::new("amdgpu", "AMD GPU", (3, 0, 0));
     apply(&mut card, &[]);
-    if card.plane_formats != Some(&PLANE_FORMATS[..]) {
+    if card.plane_formats != Some(&PLANE_FORMATS[..])
+        || card.overlay_formats != Some(&PLANE_FORMATS[..])
+        || !card.gfx12_modifiers
+    {
         return TestResult::Fail("published plane formats");
+    }
+    // The list is Linux's, in its order, less the formats not programmed.
+    let linux = crate::amdgpu_dm_modifiers::DM_PLANE_FORMATS;
+    let kept: alloc::vec::Vec<u32> = linux
+        .iter()
+        .copied()
+        .filter(|f| PLANE_FORMATS.contains(f))
+        .collect();
+    if kept != PLANE_FORMATS {
+        return TestResult::Fail("plane formats out of Linux's order");
     }
     TestResult::Pass
 }
