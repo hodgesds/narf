@@ -69,7 +69,9 @@ const CHANNELS_PER_UMC: u32 = 2;
 const PER_CHANNEL: u32 = 0x400;
 const INST_DIST: u32 = 0x40000;
 /// UMC_V8_14_CE_CNT_INIT: CE_CNT_MAX - CE_INT_THRESHOLD.
-const CE_CNT_INIT: u32 = 0xffff - 0xffff;
+const CE_CNT_MAX: u32 = 0xffff;
+const CE_INT_THRESHOLD: u32 = 0xffff;
+const CE_CNT_INIT: u32 = CE_CNT_MAX - CE_INT_THRESHOLD;
 pub const MAX_UMCS: usize = 16;
 pub const MAX_CHANNELS: usize = MAX_UMCS * CHANNELS_PER_UMC as usize;
 /// nbif_6_3_1_offset.h: RSMU index/data (BASE_IDX 1), BIF_DOORBELL_INT_CNTL
