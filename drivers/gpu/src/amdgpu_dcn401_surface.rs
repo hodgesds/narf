@@ -431,6 +431,7 @@ impl SurfaceRequest {
             v_ratio: s.ratios[1] >> 5,
             h_taps: Plane::count(h_taps),
             v_taps: Plane::count(v_taps),
+            ..Plane::default()
         }
     }
     /// Whether `other` fits the same buffers: the same pipe(s), size and

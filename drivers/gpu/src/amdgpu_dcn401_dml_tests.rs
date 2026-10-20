@@ -941,6 +941,7 @@ fn check_plane_vectors(vectors: &str) -> Result<(u32, u32, u32), &'static str> {
                     v_ratio: p[7],
                     h_taps: Plane::count(p[8]),
                     v_taps: Plane::count(p[9]),
+                    ..Plane::default()
                 });
             }
             mode.pitch = mode.planes[0].map_or(0, |p| u32::from(p.pitch));
@@ -1015,4 +1016,228 @@ fn dcn401_dml_matches_linux_dml21_plane_vectors() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-dml",
     dcn401_dml_matches_linux_dml21_plane_vectors
+);
+
+/// Shared with tests/dcn401_dml21/check.sh (harness_surfaces.c, RAISED).
+const SURFACE_VECTORS: &str = include_str!("../tests/dcn401_dml21/surface_vectors.txt");
+
+/// The 28 values harness_surfaces.c prints after a plane's 62: the chroma
+/// DLG/TTU delivery, both surfaces' rq_regs, the expansion modes, the DET's
+/// chroma base, unbounded requesting and the arbiter's hw_debug5.
+fn surface_values(plan: &Plan, p: &PlanePlan) -> [u32; 28] {
+    let (d, t, q) = (&p.dlg, &p.ttu, &p.rq);
+    let rq = |r: &RqPlane| {
+        [
+            r.chunk_size,
+            r.min_chunk_size,
+            r.meta_chunk_size,
+            r.min_meta_chunk_size,
+            r.dpte_group_size,
+            r.mpte_group_size,
+            r.swath_height,
+            r.pte_row_height_linear,
+        ]
+    };
+    let (l, c) = (rq(&q.luma), rq(&q.chroma));
+    [
+        d.refcyc_per_line_delivery_pre_c,
+        d.refcyc_per_line_delivery_c,
+        t.refcyc_per_req_delivery_pre_c,
+        t.refcyc_per_req_delivery_c,
+        l[0],
+        l[1],
+        l[2],
+        l[3],
+        l[4],
+        l[5],
+        l[6],
+        l[7],
+        c[0],
+        c[1],
+        c[2],
+        c[3],
+        c[4],
+        c[5],
+        c[6],
+        c[7],
+        q.drq_expansion_mode,
+        q.prq_expansion_mode,
+        q.mrq_expansion_mode,
+        q.crq_expansion_mode,
+        q.plane1_base_address,
+        u32::from(q.unbounded_request_enabled),
+        u32::from(plan.arbiter.allow_sdpif_rate_limit_when_cstate_req),
+        0,
+    ]
+}
+
+/// One harness_surfaces.c plane: the plane_vectors.txt values, then source,
+/// swizzle, DCC, rotation and the chroma plane.
+fn surface_plane(p: &[u32; 23]) -> Option<Plane> {
+    let source = match p[10] {
+        0 => Source::Rgb,
+        1 => Source::Yuv420_8,
+        2 => Source::Yuv420_10,
+        _ => return None,
+    };
+    let swizzle = match p[11] {
+        0 => Swizzle::Linear,
+        1 => Swizzle::S256B2D,
+        2 => Swizzle::S4K2D,
+        3 => Swizzle::S64K2D,
+        4 => Swizzle::S256K2D,
+        _ => return None,
+    };
+    let chroma = (source != Source::Rgb).then(|| Chroma {
+        surface_width: Plane::extent(p[14]),
+        surface_height: Plane::extent(p[15]),
+        pitch: Plane::extent(p[16]),
+        viewport_width: Plane::extent(p[17]),
+        viewport_height: Plane::extent(p[18]),
+        h_ratio: p[19],
+        v_ratio: p[20],
+        h_taps: Plane::count(p[21]),
+        v_taps: Plane::count(p[22]),
+    });
+    Some(Plane {
+        surface_width: Plane::extent(p[0]),
+        surface_height: Plane::extent(p[1]),
+        pitch: Plane::extent(p[2]),
+        bytes_per_pixel: Plane::count(p[3]),
+        viewport_width: Plane::extent(p[4]),
+        viewport_height: Plane::extent(p[5]),
+        h_ratio: p[6],
+        v_ratio: p[7],
+        h_taps: Plane::count(p[8]),
+        v_taps: Plane::count(p[9]),
+        source,
+        swizzle,
+        dcc: p[12] != 0,
+        vertical_scan: p[13] % 2 == 1,
+        chroma,
+    })
+}
+
+/// surface_vectors.txt: every plane's 62 plan values and 27 surface values
+/// (planes in argument order), or the rejection ("! ClockState" for a plan
+/// whose DCF/fabric state DPMM raises). Returns the plans, rejections,
+/// 4:2:0 planes and tiled planes admitted.
+fn check_surface_vectors(vectors: &str) -> Result<[u32; 4], &'static str> {
+    let mut counts = [0u32; 4];
+    for line in vectors.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut words = line.split_whitespace().peekable();
+        let mut s = [0u32; 9];
+        if !parse(&mut words, &mut s) {
+            return Err("malformed surface SoC inputs");
+        }
+        let mut f = [0u32; 19];
+        f[9..18].copy_from_slice(&s);
+        let (soc, _) = inputs(&f);
+        let mut modes = Vec::new();
+        let (mut yuv, mut tiled) = (0, 0);
+        while words.peek().is_some_and(|w| *w != "=" && *w != "!") {
+            let mut t = [0u32; 10];
+            if !parse(&mut words, &mut t) || !(1..=4).contains(&t[9]) {
+                return Err("malformed surface stream");
+            }
+            let mut g = [0u32; 19];
+            g[..9].copy_from_slice(&t[..9]);
+            g[9..18].copy_from_slice(&s);
+            let (_, mut mode) = inputs(&g);
+            for slot in mode.planes.iter_mut().take(t[9] as usize) {
+                let mut p = [0u32; 23];
+                if !parse(&mut words, &mut p) {
+                    return Err("malformed surface plane");
+                }
+                let plane = surface_plane(&p).ok_or("malformed surface plane fields")?;
+                yuv += u32::from(plane.is_420());
+                tiled += u32::from(plane.swizzle != Swizzle::Linear);
+                *slot = Some(plane);
+            }
+            mode.pitch = mode.planes[0].map_or(0, |p| u32::from(p.pitch));
+            mode.bytes_per_pixel = mode.planes[0].map_or(0, |p| u32::from(p.bytes_per_pixel));
+            modes.push(mode);
+        }
+        let result = admit_all(&soc, &modes);
+        match words.next() {
+            Some("=") => {
+                let Ok(got) = &result else {
+                    return Err("Linux-admitted surface configuration rejected");
+                };
+                let mut first = true;
+                for plan in got {
+                    for k in 0..MAX_PLANES {
+                        let Some(view) = plane_view(plan, k) else {
+                            break;
+                        };
+                        if !first && words.next() != Some("|") {
+                            return Err("malformed surface plan separator");
+                        }
+                        first = false;
+                        let mut want = [0u32; 62];
+                        let mut want_s = [0u32; 28];
+                        if !parse(&mut words, &mut want) || !parse(&mut words, &mut want_s[..27]) {
+                            return Err("malformed surface plan");
+                        }
+                        for (i, (&g, &w)) in values(&view).iter().zip(want.iter()).enumerate() {
+                            if g != w && !(TOLERATED.contains(&i) && g.abs_diff(w) == 1) {
+                                return Err("surface plan value differs from Linux DML21");
+                            }
+                        }
+                        let p = plan.plane(k).ok_or("surface plan lost a plane")?;
+                        if surface_values(plan, &p) != want_s {
+                            return Err("surface rq/chroma value differs from Linux DML21");
+                        }
+                        if !pipes_match(&mut words, &view) {
+                            return Err("surface plan ODM pipes differ from Linux DML21");
+                        }
+                    }
+                    if !plan.readmits() {
+                        return Err("surface plan not reproducible");
+                    }
+                }
+                if words.next().is_some() {
+                    return Err("surface plan count");
+                }
+                counts[0] += 1;
+                counts[2] += yuv;
+                counts[3] += tiled;
+            }
+            Some("!") => {
+                let (Some(name), Err(e)) = (words.next(), result) else {
+                    return Err("rejected surface configuration admitted");
+                };
+                if name != "REJECT" && error_name(e) != name {
+                    return Err("surface configuration rejected for a different reason");
+                }
+                counts[1] += 1;
+            }
+            _ => return Err("malformed surface vector kind"),
+        }
+    }
+    Ok(counts)
+}
+
+/// GFX12 tiled (256B to 256KB 2D swizzles), DCC and 4:2:0 (NV12, P010)
+/// planes, scanned horizontally and rotated: block and swath heights, the
+/// DET split and chroma base, unbounded requesting, two-surface prefetch,
+/// bursts, deep sleep and delivery, and DCC's DRAM overhead, as DML21
+/// plans them.
+fn dcn401_dml_matches_linux_dml21_surface_vectors() -> TestResult {
+    match check_surface_vectors(SURFACE_VECTORS) {
+        Ok([plans, rejects, yuv, tiled])
+            if plans >= 400 && rejects >= 20 && yuv >= 150 && tiled >= 300 =>
+        {
+            TestResult::Pass
+        }
+        Ok(_) => TestResult::Fail("surface vector file lost coverage"),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_matches_linux_dml21_surface_vectors
 );

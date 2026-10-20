@@ -49,8 +49,19 @@
 # DCFCLK or FCLK DPMM raises above the pinned UCLK's minimum for bandwidth
 # (harness_multi.c with RAISED set), which the port does not plan; its
 # "! PixelClock dfs" lines are as vectors.txt's.
+# surface_vectors.txt (GFX12 tiled, DCC and 4:2:0 planes) is checked with
+# harness_surfaces.c as plane_vectors.txt, each plan line exact; its
+# "! ClockState" lines are RAISED plans and its "! Unsupported" lines plans
+# that split a DCC plane over two MPC-combined pipes (its mcaches do not fit
+# one), which the port does not admit. --regenerate-surfaces answers its
+# inputs again.
 set -euo pipefail
 here=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+generate_surfaces=0
+if [ "${1:-}" = --regenerate-surfaces ]; then
+	generate_surfaces=1
+	shift
+fi
 generate_dsc=0 generate_format=0
 if [ "${1:-}" = --generate-dsc ]; then
 	generate_dsc=1
@@ -91,6 +102,40 @@ cc -O1 -w "${inc[@]}" "$here/harness.c" "$work/obj/dml2_core_dcn4_calcs.o" $othe
 cc -O1 -w "${inc[@]}" "$here/harness.c" "$work/strict_calcs.o" $others -lm -o "$work/strict"
 cc -O1 -w "${inc[@]}" "$here/harness_multi.c" "$work/strict_calcs.o" $others -lm -o "$work/strict_multi"
 cc -O1 -w "${inc[@]}" "$here/harness_planes.c" "$work/strict_calcs.o" $others -lm -o "$work/strict_planes"
+cc -O1 -w "${inc[@]}" "$here/harness_surfaces.c" "$work/strict_calcs.o" $others -lm -o "$work/strict_surfaces"
+
+# surface_answer <inputs> <strict_surfaces output>: the surface_vectors.txt
+# result. A plane on two pipes with the pipe-0 blank end is MPC combine.
+surface_answer() {
+	case $2 in
+	PLAN*)
+		if echo "${2#PLAN }" | awk '{ f = 0
+			for (i = 1; i <= NF; i++) {
+				if ($i == "|") { f = 0; continue }
+				if ($i == "/2") { if ($(i + 1) == end) mpc = 1; i++; continue }
+				if (f == 13) end = $i
+				f++ } }
+			END { exit !mpc }'; then
+			echo "$1 ! Unsupported"
+		else
+			echo "$1 = ${2#PLAN }"
+		fi ;;
+	RAISED) echo "$1 ! ClockState" ;;
+	*) echo "$1 ! REJECT" ;;
+	esac
+}
+if [ $generate_surfaces -eq 1 ]; then
+	while IFS= read -r line; do
+		case $line in
+		''|'#'*) echo "$line" ;;
+		*)
+			inputs=${line%% [=!] *}
+			read -ra a <<< "$inputs"
+			surface_answer "$inputs" "$(RAISED=1 "$work/strict_surfaces" "${a[@]}")" ;;
+		esac
+	done < "$here/surface_vectors.txt"
+	exit 0
+fi
 
 # dsc_lines [env...]: classify "<slices> <bpp_x16> <multi-stream inputs>"
 # lines from stdin with Linux (harness_multi.c, DSC, the given environment).
@@ -378,4 +423,22 @@ for f in dsc_vectors odm_dsc_vectors; do
 	check_multi "$work/${f}_single.txt" DSC HDMIFRL=1 || mfail=1
 done
 check_multi "$here/frl_dsc_vectors.txt" DSC HDMIFRL=1 || mfail=1
+# check_surfaces <file>: surface_vectors.txt lines, answered again exactly.
+check_surfaces() {
+	local file=$1 pass=0 fail=0
+	while read -r line; do
+		case $line in ''|'#'*) continue ;; esac
+		local inputs=${line%% [=!] *}
+		read -ra a <<< "$inputs"
+		if [ "$(surface_answer "$inputs" "$(RAISED=1 "$work/strict_surfaces" "${a[@]}")")" = "$line" ]; then
+			pass=$((pass + 1))
+		else
+			fail=$((fail + 1))
+			echo "MISMATCH: $line" >&2
+		fi
+	done < "$file"
+	echo "dcn401 DML21 $(basename "$file" .txt): $pass passed, $fail failed"
+	[ $fail -eq 0 ]
+}
+check_surfaces "$here/surface_vectors.txt" || mfail=1
 [ $fail -eq 0 ] && [ $mfail -eq 0 ]

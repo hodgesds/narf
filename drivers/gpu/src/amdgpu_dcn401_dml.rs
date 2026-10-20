@@ -5,11 +5,16 @@
 //! implements and evaluated in fixed point.
 //!
 //! The admitted shape is up to four streams with progressive fixed timing,
-//! each with one unscaled, unrotated, full-frame linear RGB plane of 2, 4 or
-//! 8 bytes per pixel (DML's `dml2_444_16`, `dml2_444_32`, `dml2_444_64`)
-//! in physical VRAM: GPUVM/HostVM, DCC, MALL/SubVP, cursor, tdlut, dynamic
-//! metadata, writeback, MPC combine and immediate flip are all off; a 4:4:4
-//! DP stream may use DSC.
+//! each with up to four planes in all ([`Plane`]): packed RGB of 2, 4 or 8
+//! bytes per pixel (DML's `dml2_444_16`, `dml2_444_32`, `dml2_444_64`) or
+//! 4:2:0 video (`dml2_420_8` NV12, `dml2_420_10` P010, luma and chroma
+//! surfaces), linear or in a GFX12 2D swizzle (256B, 4KB, 64KB, 256KB),
+//! optionally with GFX12 DCC (no metadata plane: the mcache's DRAM overhead
+//! and placement), scaled as SPL scales it and scanned horizontally or (a
+//! tiled surface rotated 90/270) vertically, in physical VRAM:
+//! GPUVM/HostVM, MALL/SubVP, cursor, tdlut, dynamic metadata, writeback,
+//! MPC combine and immediate flip are all off; a 4:4:4 DP stream may use
+//! DSC. One tiled RGB plane alone on one pipe requests unbounded.
 //!
 //! ODM is DML's `dml2_odm_mode_auto` with dynamic ODM off (DecideODMMode),
 //! limited to bypass and 2:1: a stream takes two pipes (DPP + OPP each, one
@@ -121,20 +126,24 @@ pub struct Mode {
 /// Planes (DPP pipes before ODM) every admitted configuration shares.
 pub const MAX_PLANES: usize = 4;
 
-/// One linear RGB plane of a stream as DC passes DML21 a plane state after
-/// SPL: its surface, SPL's whole-plane viewport (DC hands DML the plane's
-/// scaler data as if no ODM split it), the scale ratios and taps. Packed
-/// (surfaces are at most 16383 pixels, taps at most 8): plans carry every
-/// stream's planes and are copied often.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// One plane of a stream as DC passes DML21 a plane state after SPL
+/// (populate_dml21_surface_config_from_plane_state,
+/// populate_dml21_plane_config_from_plane_state): its surface, SPL's
+/// whole-plane viewport (DC hands DML the plane's scaler data as if no ODM
+/// split it), the scale ratios and taps, the GFX12 swizzle and DCC, and a
+/// 4:2:0 source's chroma plane. Packed (surfaces are at most 16383 pixels,
+/// taps at most 8): plans carry every stream's planes and are copied often.
+/// `Default` is an empty linear RGB plane, for `..Plane::default()`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Plane {
     pub surface_width: u16,
     pub surface_height: u16,
-    /// Surface pitch in pixels.
+    /// Surface (luma) pitch in pixels.
     pub pitch: u16,
     pub viewport_width: u16,
     pub viewport_height: u16,
-    /// 2, 4 or 8 (`dml2_444_16`, `dml2_444_32`, `dml2_444_64`).
+    /// An RGB source's 2, 4 or 8 (`dml2_444_16`, `dml2_444_32`,
+    /// `dml2_444_64`); a 4:2:0 source's luma bytes (1 for NV12, 2 for P010).
     pub bytes_per_pixel: u8,
     pub h_taps: u8,
     pub v_taps: u8,
@@ -142,6 +151,81 @@ pub struct Plane {
     /// converts to the doubles DML takes exactly); `Plane::UNITY` is 1:1.
     pub h_ratio: u32,
     pub v_ratio: u32,
+    /// The DML source format class.
+    pub source: Source,
+    /// The surface's GFX12 swizzle (`gfx_addr3_to_dml2_swizzle_mode`).
+    pub swizzle: Swizzle,
+    /// `surface.dcc.enable`: GFX12 DCC (no metadata plane; DCC rate 2.0).
+    pub dcc: bool,
+    /// The plane is rotated 90 or 270 degrees: DML scans the surface
+    /// vertically (`dml_is_vertical_rotation`).
+    pub vertical_scan: bool,
+    /// A 4:2:0 source's chroma plane (`surface.plane1` and the scaler's
+    /// plane1 values); `None` for RGB, whose chroma values are its luma ones.
+    pub chroma: Option<Chroma>,
+}
+
+/// `enum dml2_source_format_class` for the formats DC maps native planes
+/// to: packed RGB (by `Plane::bytes_per_pixel`), `dml2_420_8` (NV12) and
+/// `dml2_420_10` (P010).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Source {
+    #[default]
+    Rgb,
+    Yuv420_8,
+    Yuv420_10,
+}
+
+/// The GFX12 swizzles DC maps onto `dml2_swizzle_mode`: `dml2_sw_linear`,
+/// `dml2_sw_256b_2d`, `dml2_sw_4kb_2d`, `dml2_sw_64kb_2d`,
+/// `dml2_sw_256kb_2d` (DC_ADDR3_SW_LINEAR..DC_ADDR3_SW_256KB_2D).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Swizzle {
+    #[default]
+    Linear,
+    S256B2D,
+    S4K2D,
+    S64K2D,
+    S256K2D,
+}
+
+impl Swizzle {
+    /// dml_get_tile_block_size_bytes.
+    pub const fn block_bytes(self) -> u32 {
+        match self {
+            Self::Linear | Self::S256B2D => 256,
+            Self::S4K2D => 4096,
+            Self::S64K2D => 65536,
+            Self::S256K2D => 262_144,
+        }
+    }
+    /// CalculateBytePerPixelAndBlockSizes' macro tile to 256-byte block
+    /// scale (256B_2D keeps the initial 1).
+    const fn macro_tile_scale(self) -> u32 {
+        match self {
+            Self::Linear | Self::S256B2D => 1,
+            Self::S4K2D => 4,
+            Self::S64K2D => 16,
+            Self::S256K2D => 32,
+        }
+    }
+}
+
+/// A 4:2:0 plane's chroma surface (`surface.plane1`: amdgpu_dm's half-size
+/// chroma surface and pitches[1] in chroma pixels) and SPL's chroma
+/// viewport, ratios and taps.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Chroma {
+    pub surface_width: u16,
+    pub surface_height: u16,
+    /// Chroma pitch in chroma pixels.
+    pub pitch: u16,
+    pub viewport_width: u16,
+    pub viewport_height: u16,
+    pub h_ratio: u32,
+    pub v_ratio: u32,
+    pub h_taps: u8,
+    pub v_taps: u8,
 }
 
 impl Plane {
@@ -168,15 +252,40 @@ impl Plane {
             v_ratio: Self::UNITY,
             h_taps: 1,
             v_taps: 1,
+            ..Self::default()
         }
     }
     /// scaler_info.enabled as dml21_translation_helper sets it with SPL: a
-    /// ratio other than 1, or more than one tap.
+    /// ratio other than 1 (luma or chroma), or more than one tap.
     pub fn scaler_enabled(&self) -> bool {
+        let c = self.chroma_values();
         self.h_ratio != Self::UNITY
             || self.v_ratio != Self::UNITY
             || self.h_taps > 1
             || self.v_taps > 1
+            || c.h_ratio != Self::UNITY
+            || c.v_ratio != Self::UNITY
+            || c.h_taps > 1
+            || c.v_taps > 1
+    }
+    /// The plane1 values DML takes: the chroma plane's, or an RGB plane's
+    /// own luma values.
+    pub fn chroma_values(&self) -> Chroma {
+        self.chroma.unwrap_or(Chroma {
+            surface_width: self.surface_width,
+            surface_height: self.surface_height,
+            pitch: self.pitch,
+            viewport_width: self.viewport_width,
+            viewport_height: self.viewport_height,
+            h_ratio: self.h_ratio,
+            v_ratio: self.v_ratio,
+            h_taps: self.h_taps,
+            v_taps: self.v_taps,
+        })
+    }
+    /// A two-plane (4:2:0) source (`dml_is_420`).
+    pub fn is_420(&self) -> bool {
+        self.source != Source::Rgb
     }
 }
 
@@ -363,6 +472,9 @@ pub struct Dlg {
     pub vratio_prefetch_c: u32,
     pub refcyc_per_line_delivery_pre_l: u32,
     pub refcyc_per_line_delivery_l: u32,
+    /// A 4:2:0 plane's chroma line delivery (zero for RGB).
+    pub refcyc_per_line_delivery_pre_c: u32,
+    pub refcyc_per_line_delivery_c: u32,
     pub vready_after_vcount0: bool,
     pub dst_y_delta_drq_limit: u32,
     pub dmdata_dl_delta: u32,
@@ -377,8 +489,44 @@ pub struct Ttu {
     pub qos_level_flip: u32,
     pub refcyc_per_req_delivery_l: u32,
     pub refcyc_per_req_delivery_pre_l: u32,
+    /// A 4:2:0 plane's chroma request delivery (zero for RGB).
+    pub refcyc_per_req_delivery_c: u32,
+    pub refcyc_per_req_delivery_pre_c: u32,
     pub qos_level_fixed_l: u32,
     pub qos_level_fixed_c: u32,
+}
+
+/// One surface's `struct dml2_display_plane_rq_regs` (DCHUBP_REQ_SIZE_CONFIG
+/// or _C), as rq_dlg_get_rq_reg fills it: log2 sizes less their bias, the
+/// swath height in log2 lines. With GPUVM off and no MRQ the group, meta
+/// and PTE-row fields are zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RqPlane {
+    pub chunk_size: u32,
+    pub min_chunk_size: u32,
+    pub meta_chunk_size: u32,
+    pub min_meta_chunk_size: u32,
+    pub dpte_group_size: u32,
+    pub mpte_group_size: u32,
+    pub swath_height: u32,
+    pub pte_row_height_linear: u32,
+}
+
+/// `struct dml2_display_rq_regs` for every pipe of a plane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RqRegs {
+    /// `rq_regs_l`.
+    pub luma: RqPlane,
+    /// `rq_regs_c`: Linux fills the chunk sizes even for an RGB plane.
+    pub chroma: RqPlane,
+    pub drq_expansion_mode: u32,
+    pub prq_expansion_mode: u32,
+    pub mrq_expansion_mode: u32,
+    pub crq_expansion_mode: u32,
+    /// The DET's chroma base in KiB (zero for RGB).
+    pub plane1_base_address: u32,
+    /// Unbounded requesting (one tiled RGB plane on one pipe).
+    pub unbounded_request_enabled: bool,
 }
 
 /// DCHUBBUB watermark set, in DCHUB reference cycles (fractions in 1/1000).
@@ -414,6 +562,8 @@ pub struct Arbiter {
     pub pstate_stall_threshold: u32,
     pub hvm_max_qos_commit_threshold: u32,
     pub hvm_min_req_outstand_commit_threshold: u32,
+    /// `allow_sdpif_rate_limit_when_cstate_req` (DML's hw_debug5).
+    pub allow_sdpif_rate_limit_when_cstate_req: bool,
 }
 
 /// A reproducible programming plan for one mode on one board state.
@@ -470,6 +620,8 @@ pub struct PlanePlan {
     pub ttu: Ttu,
     pub det_bytes: u32,
     pub odm_refcyc_h_blank_end: u32,
+    /// Every pipe's DCHUBP request configuration.
+    pub rq: RqRegs,
 }
 
 /// Streams admitted together at most: one per pipe.
@@ -527,6 +679,7 @@ const ROB_KBYTES: i64 = 192;
 const CONFIG_RETURN_KBYTES: u32 = 1344;
 const SEGMENT_KBYTES: u32 = 64;
 const PIXEL_CHUNK_KBYTES: i64 = 8;
+const MIN_PIXEL_CHUNK_BYTES: u32 = 1024;
 const LINE_BUFFER_BITS: i64 = 1_171_920;
 const MAX_LINE_BUFFER_LINES: i64 = 32;
 const LB_BITS_PER_PIXEL: i64 = 57;
@@ -559,9 +712,9 @@ const MIN_RETURN_FCLK_CYCLES: i64 = 75;
 // ── Native policy ──────────────────────────────────────────────────────────
 /// The staged requestor's DCN4_01_DEFAULT_DET_SIZE, also DML's nominal DET.
 pub const DET_KBYTES: u32 = 320;
-/// Linear surfaces read one-line 256-byte blocks
-/// (CalculateBytePerPixelAndBlockSizes: BlockHeight256Bytes 1, BlockWidth
-/// 256 / BytePerPixel pixels per request).
+/// The full request size (CalculateSwathAndDETConfiguration: 256 bytes
+/// unless a halved tiled swath requests 64 or 128), and the extra-latency
+/// default.
 const REQUEST_BYTES: i64 = 256;
 /// Upper bound for any clock input: 10 GHz.
 const MAX_CLOCK_KHZ: u32 = 10_000_000;
@@ -570,11 +723,6 @@ pub(crate) const FMT_420_BUFFER_WIDTH: u32 = 4096;
 /// PMO only budgets stutter when the nominal blank is three times its cost.
 const MIN_BLANK_STUTTER_FACTOR: i64 = 3;
 
-/// BlockWidth256BytesY of a linear plane: the pixels one 256-byte request
-/// carries.
-fn request_pixels(bytes_per_pixel: u32) -> u32 {
-    REQUEST_BYTES as u32 / bytes_per_pixel
-}
 fn fx(n: i64) -> Fx {
     Fx::int(n)
 }
@@ -685,6 +833,285 @@ fn latency(s: State, uclk_khz: u64) -> Latency {
     }
 }
 
+/// One DET surface of a plane (its luma, or a 4:2:0 plane's chroma), as
+/// CalculateBytePerPixelAndBlockSizes, CalculateSwathWidth,
+/// CalculateSwathAndDETConfiguration and CalculatePrefetchSourceLines
+/// derive it.
+#[derive(Clone, Copy)]
+struct Surf {
+    /// BytePerPixelY/C.
+    bpp: u32,
+    /// BytePerPixelInDETY/C times three (P010 stores 4/3 and 8/3 bytes).
+    det_bpp3: u32,
+    /// The request width along the swath: Read256BlockWidth scanning
+    /// horizontally, Read256BlockHeight vertically.
+    req_w: u32,
+    /// SwathWidthSingleDPP and each pipe's SwathWidth, and the
+    /// request-rounded swath_width_ub.
+    swath_single: u32,
+    swath: u32,
+    swath_ub: u32,
+    /// MaximumSwathHeight, then the SwathHeight the DET takes.
+    max_height: u32,
+    height: u32,
+    /// DETBufferSizeY/C.
+    det_bytes: u32,
+    request_bytes: u32,
+    /// full_swath_bytes and RoundedUpSwathSizeBytes.
+    full_swath_bytes: u32,
+    rounded_swath_bytes: u32,
+    h_ratio: u32,
+    v_ratio: u32,
+    h_taps: u8,
+    v_taps: u8,
+    hratio: Fx,
+    vratio: Fx,
+    /// VInitPreFill, MaxNumSwath and PrefetchSourceLines
+    /// (CalculatePrefetchSourceLines, viewport not stationary).
+    vinit: u32,
+    max_num_swath: u32,
+    source_lines: i64,
+    /// PSCL_THROUGHPUT(_CHROMA), as Linux's double holds it.
+    pscl: f64,
+    /// vactive_sw_bw in mode support (from the viewport) and mode
+    /// programming (from the swath; the same for luma).
+    vactive_bw: Fx,
+    vactive_bw_mp: Fx,
+}
+
+impl Surf {
+    /// CalculatePrefetchSourceLines with no interlace or stationary
+    /// viewport: VInitPreFill = floor((VRatio + VTaps + 1) / 2), the
+    /// swaths covering it and the partial swath after them.
+    fn source_lines(&mut self) {
+        let unity = u64::from(Plane::UNITY);
+        let vinit = (u64::from(self.v_ratio) + u64::from(self.v_taps + 1) * unity) / (2 * unity);
+        let h = u64::from(self.height);
+        let max_num = (vinit.saturating_sub(1)).div_ceil(h) + 1;
+        let partial = if vinit > 1 {
+            ((vinit - 2) % h).max(1)
+        } else {
+            ((vinit + h - 2) % h).max(1)
+        };
+        self.vinit = vinit as u32;
+        self.max_num_swath = max_num as u32;
+        self.source_lines = (max_num * h + partial) as i64;
+    }
+    /// The whole lines (rounded down to whole swaths) `bytes` of DET hold
+    /// of swaths `width` wide.
+    fn det_lines(&self, bytes: u64, width: u32) -> u64 {
+        let lines = bytes * 3 / (u64::from(self.det_bpp3) * u64::from(width));
+        lines / u64::from(self.height) * u64::from(self.height)
+    }
+}
+
+/// CalculateBytePerPixelAndBlockSizes for a plane: per surface (luma,
+/// chroma) BytePerPixel, BytePerPixelInDET (times three), the 256-byte
+/// block and the macro tile. An RGB plane's chroma entries are zero.
+#[derive(Clone, Copy)]
+struct Blocks {
+    bpp: [u32; 2],
+    det_bpp3: [u32; 2],
+    block_w: [u32; 2],
+    block_h: [u32; 2],
+    tile_w: [u32; 2],
+    tile_h: [u32; 2],
+}
+
+impl Blocks {
+    fn of(p: &Plane) -> Self {
+        let b = u32::from(p.bytes_per_pixel).max(1);
+        let linear = p.swizzle == Swizzle::Linear;
+        let (bpp, det_bpp3, block_h) = match p.source {
+            Source::Rgb => (
+                [b, 0],
+                [3 * b, 0],
+                [
+                    if linear {
+                        1
+                    } else if b == 8 {
+                        4
+                    } else {
+                        8
+                    },
+                    0,
+                ],
+            ),
+            Source::Yuv420_8 => ([1, 2], [3, 6], if linear { [1, 1] } else { [16, 8] }),
+            Source::Yuv420_10 => ([2, 4], [4, 8], if linear { [1, 1] } else { [8, 8] }),
+        };
+        let mut out = Self {
+            bpp,
+            det_bpp3,
+            block_w: [0; 2],
+            block_h,
+            tile_w: [0; 2],
+            tile_h: [0; 2],
+        };
+        for i in 0..2 {
+            if bpp[i] == 0 || block_h[i] == 0 {
+                continue;
+            }
+            out.block_w[i] = 256 / bpp[i] / block_h[i];
+            out.tile_h[i] = p.swizzle.macro_tile_scale() * block_h[i];
+            out.tile_w[i] = p.swizzle.block_bytes() / bpp[i] / out.tile_h[i];
+        }
+        out
+    }
+}
+
+/// dcn4_soc_bb: `mcache_size_bytes`, `mcache_line_size_bytes` (also
+/// `mem_word_bytes`).
+const MCACHE_BYTES: u32 = 2048;
+const MCACHE_LINE_BYTES: u32 = 32;
+/// `num_dcc_mcaches`.
+const DCC_MCACHES: u32 = 8;
+
+/// One DCC surface's calculate_mcache_row_bytes and calculate_mcache_setting
+/// results with GPUVM off and the viewport not stationary: the mcache count,
+/// its first two split offsets (a third only matters once admission has
+/// already failed) and the DRAM overhead factors.
+#[derive(Clone, Copy)]
+struct Mcache {
+    count: u32,
+    offsets: [u32; 2],
+    dram_nom: Fx,
+    dram_pref: Fx,
+    /// lc_comb_mcache (luma's entry): luma and chroma share the last one.
+    shared: bool,
+}
+
+impl Mcache {
+    /// Luma, then a 4:2:0 plane's chroma (`surfs[1]` is ignored for RGB).
+    fn of(p: &Plane, b: &Blocks, surfs: [&Surf; 2], channels: u32) -> [Self; 2] {
+        let vertical = p.vertical_scan;
+        let meta = p.swizzle.block_bytes() as f32 / 256.0 / channels as f32;
+        let meta_ub = (ceil_f(f64::from(meta) / f64::from(MCACHE_LINE_BYTES))
+            * f64::from(MCACHE_LINE_BYTES)) as u32;
+        let c = p.chroma_values();
+        let views = [
+            (p.viewport_width, p.viewport_height),
+            (c.viewport_width, c.viewport_height),
+        ];
+        let surfaces = if p.is_420() { 2 } else { 1 };
+        let mut out = [Self {
+            count: 0,
+            offsets: [0; 2],
+            dram_nom: Fx::ONE,
+            dram_pref: Fx::ONE,
+            shared: false,
+        }; 2];
+        let (mut width_ub, mut per_channel) = ([0u32; 2], [0u32; 2]);
+        for i in 0..surfaces {
+            let (tw, th) = (b.tile_w[i], b.tile_h[i]);
+            let (vw, vh) = (u32::from(views[i].0), u32::from(views[i].1));
+            // meta_row_width_ub along the access, and the row's bytes per
+            // channel.
+            let (row_bytes, pc) = if vertical {
+                width_ub[i] = ceil_to(u64::from(vh - 1), u64::from(th)) as u32 + th;
+                let pc = width_ub[i] / th * meta_ub;
+                (u64::from(pc) * u64::from(channels), pc)
+            } else {
+                width_ub[i] = ceil_to(u64::from(vw - 1), u64::from(tw)) as u32 + tw;
+                let rb = u64::from(width_ub[i]) * u64::from(th) * u64::from(surfs[i].bpp) / 256;
+                let pc = ceil_f(rb as f64 / f64::from(channels) / f64::from(MCACHE_LINE_BYTES))
+                    * f64::from(MCACHE_LINE_BYTES);
+                (rb, pc as u32)
+            };
+            per_channel[i] = pc;
+            out[i].count = pc.div_ceil(MCACHE_BYTES);
+            out[i].dram_nom = if vertical {
+                let m = f64::from(meta);
+                fx_f(1.0 + max_f(1.0 / 256.0, f64::from(meta_ub) / (256.0 * m)))
+            } else {
+                q(257, 256)
+            };
+            // dcc_dr_oh_pref: an (unsigned) quotient of the row's bytes over
+            // the full swath's.
+            let whole = row_bytes / u64::from(surfs[i].full_swath_bytes.max(1));
+            out[i].dram_pref = if whole == 0 {
+                q(257, 256)
+            } else {
+                fx(1 + whole as i64)
+            };
+        }
+        // Luma/chroma sharing the last mcache (no iMALL): both remainders
+        // fit one mcache, luma weighted by its swath-time factor.
+        let access = |i: usize| if vertical { b.tile_h[i] } else { b.tile_w[i] };
+        let (rem_l, rem_c) = (per_channel[0] % MCACHE_BYTES, per_channel[1] % MCACHE_BYTES);
+        let lc_comb = surfaces == 2 && rem_l != 0 && rem_c != 0 && {
+            let factor = if vertical {
+                f64::from(b.tile_w[1]) / f64::from(b.tile_w[0]) * 2.0
+            } else {
+                f64::from(b.tile_h[1]) / f64::from(b.tile_h[0]) * 2.0
+            };
+            (f64::from(rem_l) * factor + f64::from(rem_c)) as u32 <= MCACHE_BYTES
+        };
+        out[0].shared = lc_comb;
+        for (i, m) in out.iter_mut().enumerate().take(surfaces) {
+            let a = access(i);
+            let avg = width_ub[i] / m.count.max(1);
+            for n in 0..m.count.saturating_sub(1).min(2) {
+                m.offsets[n as usize] = if lc_comb {
+                    (n + 1) * (MCACHE_BYTES / meta_ub) * a
+                } else {
+                    (n + 1) * avg / a * a
+                };
+            }
+        }
+        out
+    }
+    /// dml2_top_mcache_validate_admissability for a plane on `odm` pipes
+    /// (no MPC combine): each surface's mcache boundaries no more than its
+    /// pipes and at most one within any pipe's share of the viewport.
+    fn admissible(m: &[Self; 2], p: &Plane, h_active: u32, odm: u32) -> bool {
+        let c = p.chroma_values();
+        let widths = [
+            p.surface_width,
+            if p.is_420() { c.surface_width } else { 0 },
+        ];
+        let ratios = [p.h_ratio, c.h_ratio];
+        for i in 0..2 {
+            let mut span = i64::from(widths[i]);
+            if odm > 1 {
+                let share = ratio_f(ratios[i]) * f64::from(h_active) / f64::from(odm);
+                span = span.min(ceil_f(share) as i64);
+            }
+            span += if i == 0 { 12 } else { 6 };
+            let boundaries = m[i].count.saturating_sub(1);
+            if boundaries > odm
+                || count_in_span(&m[i].offsets[..boundaries.min(2) as usize], span) > 1
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// count_elements_in_span: the most of the (ascending) offsets that lie
+/// within `span` of one another's window start.
+fn count_in_span(offsets: &[u32], span: i64) -> u32 {
+    if offsets.is_empty() || span == 0 {
+        return 1;
+    }
+    let (mut start_value, mut start, mut greatest) = (0i64, 0usize, 0u32);
+    while start < offsets.len() {
+        for (i, &o) in offsets.iter().enumerate().skip(start) {
+            if i64::from(o) - start_value <= span {
+                greatest = greatest.max((i - start + 1) as u32);
+            } else {
+                break;
+            }
+        }
+        start += 1;
+        if start < offsets.len() {
+            start_value = i64::from(offsets[start - 1]) + 1;
+        }
+    }
+    greatest
+}
+
 /// One plane's quantities that no clock changes, with its stream's.
 #[derive(Clone, Copy)]
 struct Shape {
@@ -695,29 +1122,28 @@ struct Shape {
     line: Fx,
     /// Pipes (ODM segments): 1 or 2.
     odm: u32,
-    /// Each pipe's swath width and its request-rounded width.
-    swath: u32,
-    swath_ub: u32,
+    /// DETBufferSizeInKByte of each pipe, in bytes.
     det_bytes: u32,
-    /// The surface's read bandwidth, over all of its pipes.
-    vactive_bw: Fx,
     vblank: u32,
     ycbcr420: bool,
     /// DSCDelayRequirement in pixels (0 without DSC).
     dsc_delay: u32,
-    /// BytePerPixelY (= BytePerPixelDETY for these formats).
-    bpp: u32,
     plane: Plane,
-    hratio: Fx,
-    vratio: Fx,
-    /// PrefetchSourceLinesY: CalculatePrefetchSourceLines for one-line
-    /// (linear) swaths, VInitPreFill plus the mandatory partial swath.
-    source_lines: i64,
-    /// PSCL_THROUGHPUT and RequiredDPPCLK (MHz), as Linux's doubles hold
-    /// them; whether DPPCLK is just the pixel clock over the pipes.
-    pscl: f64,
+    /// The luma (or RGB) surface, and a 4:2:0 plane's chroma.
+    y: Surf,
+    c: Option<Surf>,
+    /// RequiredDPPCLK (MHz), as Linux's double holds it; whether DPPCLK is
+    /// just the pixel clock over the pipes.
     dpp: f64,
     dpp_unit: bool,
+    /// The DCC DRAM overhead factors (calculate_mcache_row_bytes:
+    /// dcc_dram_bw_nom/pref_overhead_factor, luma then chroma), 1 without
+    /// DCC. Only DRAM bandwidth carries them.
+    dram_nom: [Fx; 2],
+    dram_pref: [Fx; 2],
+    /// The DCC mcaches the plane takes (both surfaces, one less when they
+    /// share the last); zero without DCC.
+    mcaches: u32,
 }
 
 /// DPPCLK, DISPCLK and deep-sleep DCFCLK one evaluation runs the pipe at.
@@ -745,8 +1171,12 @@ struct Schedule {
     dst_x: u32,
     dst_y: u32,
     dst_y_prefetch: Fx,
+    /// VRatioPrefetchY/C (C is 1 for RGB: no source lines over Lsw).
     vratio_pre: Fx,
+    vratio_pre_c: Fx,
+    /// RequiredPrefetchPixelDataBWLuma/Chroma and RequiredPrefetchBWMax.
     prefetch_bw: Fx,
+    prefetch_bw_c: Fx,
     prefetch_bw_max: Fx,
     no_time: bool,
 }
@@ -802,43 +1232,103 @@ fn fx_f(v: f64) -> Fx {
 }
 
 impl Plane {
-    /// ScaleRatioAndTapsSupport, ViewportExceedsSurface and PitchSupport:
-    /// what DML refuses of a plane on its own.
-    fn validate(&self) -> Result<(), Error> {
+    /// ScaleRatioAndTapsSupport, SourceFormatPixelAndScanSupport,
+    /// ViewportExceedsSurface and PitchSupport: what DML refuses of a
+    /// plane on its own. Returns the plane's blocks.
+    fn validate(&self) -> Result<Blocks, Error> {
         let taps_ok = |t: u8| (1..=MAX_SCL_TAPS).contains(&u32::from(t));
         let ratio_ok = |r: u32, taps: u8| {
             r != 0 && r <= MAX_SCL_RATIO * Self::UNITY && r <= u32::from(taps) * Self::UNITY
         };
-        if self.surface_width == 0
-            || self.surface_height == 0
-            || self.surface_width > 0x3fff
-            || self.surface_height > 0x3fff
-            || self.viewport_width == 0
-            || self.viewport_height == 0
-            || self.viewport_width > self.surface_width
-            || self.viewport_height > self.surface_height
-            || self.pitch < self.surface_width
-            || !matches!(self.bytes_per_pixel, 2 | 4 | 8)
-            || !taps_ok(self.h_taps)
-            || !taps_ok(self.v_taps)
-            || (self.h_taps > 1 && self.h_taps % 2 == 1)
-            || !ratio_ok(self.h_ratio, self.h_taps)
-            || !ratio_ok(self.v_ratio, self.v_taps)
+        let scaler_ok = |h_taps: u8, v_taps: u8, h: u32, v: u32| {
+            taps_ok(h_taps)
+                && taps_ok(v_taps)
+                && !(h_taps > 1 && h_taps % 2 == 1)
+                && ratio_ok(h, h_taps)
+                && ratio_ok(v, v_taps)
+        };
+        let extent_ok = |w: u16, h: u16, pitch: u16, vw: u16, vh: u16| {
+            w != 0
+                && h != 0
+                && w <= 0x3fff
+                && h <= 0x3fff
+                && vw != 0
+                && vh != 0
+                && vw <= w
+                && vh <= h
+                && pitch >= w
+        };
+        let bpp_ok = match self.source {
+            Source::Rgb => matches!(self.bytes_per_pixel, 2 | 4 | 8),
+            Source::Yuv420_8 => self.bytes_per_pixel == 1,
+            Source::Yuv420_10 => self.bytes_per_pixel == 2,
+        };
+        let chroma_ok = match (self.is_420(), self.chroma) {
+            (false, None) => true,
+            (true, Some(c)) => {
+                extent_ok(
+                    c.surface_width,
+                    c.surface_height,
+                    c.pitch,
+                    c.viewport_width,
+                    c.viewport_height,
+                ) && scaler_ok(c.h_taps, c.v_taps, c.h_ratio, c.v_ratio)
+            }
+            _ => false,
+        };
+        if !extent_ok(
+            self.surface_width,
+            self.surface_height,
+            self.pitch,
+            self.viewport_width,
+            self.viewport_height,
+        ) || !bpp_ok
+            || !scaler_ok(self.h_taps, self.v_taps, self.h_ratio, self.v_ratio)
+            || !chroma_ok
+            // A 4:2:0 plane always scales its chroma.
+            || (self.is_420() && !self.scaler_enabled())
         {
             return Err(Error::Invalid);
         }
-        // A 128-byte-aligned pitch changes the request width this omits.
-        if u64::from(self.pitch) * u64::from(self.bytes_per_pixel) % 256 != 0 {
+        // A linear surface cannot be scanned vertically.
+        if self.vertical_scan && self.swizzle == Swizzle::Linear {
             return Err(Error::Unsupported);
         }
-        Ok(())
+        let b = Blocks::of(self);
+        let c = self.chroma_values();
+        let surfaces = if self.is_420() { 2 } else { 1 };
+        for (i, (pitch, width)) in [(self.pitch, self.surface_width), (c.pitch, c.surface_width)]
+            .into_iter()
+            .take(surfaces)
+            .enumerate()
+        {
+            let (pitch, width) = (u64::from(pitch), u64::from(width));
+            if self.swizzle == Swizzle::Linear {
+                // A 128-byte-aligned linear pitch changes the request
+                // width this omits.
+                if pitch * u64::from(b.bpp[i]) % 256 != 0 {
+                    return Err(Error::Unsupported);
+                }
+            } else if ceil_to(pitch.max(width), u64::from(b.tile_w[i])) > pitch {
+                // A tiled pitch is whole macro tiles.
+                return Err(Error::Invalid);
+            }
+        }
+        Ok(b)
     }
 }
 
 impl Shape {
     /// `dispclk_ss_khz` is DML's `max_dispclk_freq_mhz`: the board maximum
-    /// less downspread, which decides ODM combine.
-    fn new(mode: &Mode, plane: Plane, stream: usize, dispclk_ss_khz: u64) -> Result<Self, Error> {
+    /// less downspread, which decides ODM combine; `channels` the DRAM
+    /// channel count calculate_mcache_row_bytes spreads DCC metadata over.
+    fn new(
+        mode: &Mode,
+        plane: Plane,
+        stream: usize,
+        dispclk_ss_khz: u64,
+        channels: u32,
+    ) -> Result<Self, Error> {
         let t = mode.timing;
         if t.pixel_clock_khz == 0
             || t.h_active == 0
@@ -854,7 +1344,7 @@ impl Shape {
         {
             return Err(Error::Invalid);
         }
-        plane.validate()?;
+        let blocks = plane.validate()?;
         // DML needs a blank line after VStartup for MIN_DST_Y_NEXT_START.
         if t.v_total - t.v_active < 2
             || t.v_front_porch == 0
@@ -908,10 +1398,14 @@ impl Shape {
                 return Err(Error::PixelClock);
             }
         }
-        // CalculateSwathWidth: the viewport, or with ODM each pipe's share
-        // of the line in source pixels (math_round), at most the viewport;
-        // rounded to whole requests within the surface.
-        let vp = u32::from(plane.viewport_width);
+        // CalculateSwathWidth: the viewport (its height scanning
+        // vertically), or with ODM each pipe's share of the line in source
+        // pixels (math_round), at most that; a 4:2:0 chroma swath is half
+        // the luma one. Each is rounded to whole requests within the
+        // surface.
+        let vertical = plane.vertical_scan;
+        let along = |w: u16, h: u16| u32::from(if vertical { h } else { w });
+        let vp = along(plane.viewport_width, plane.viewport_height);
         let swath = if odm > 1 {
             let share = (u64::from(t.h_active) * u64::from(plane.h_ratio)
                 + u64::from(Plane::UNITY))
@@ -920,32 +1414,192 @@ impl Shape {
         } else {
             vp
         };
-        let bpp = u32::from(plane.bytes_per_pixel);
-        let r = u64::from(request_pixels(bpp));
-        let w = u64::from(plane.surface_width);
-        let swath_ub = ceil_to(w, r).min(ceil_to(u64::from(swath).saturating_sub(1), r) + r) as u32;
+        let c = plane.chroma_values();
         let ratio = |r: u32| q(i64::from(r), i64::from(Plane::UNITY));
-        let (hratio, vratio) = (ratio(plane.h_ratio), ratio(plane.v_ratio));
-        // CalculatePrefetchSourceLines: VInitPreFill =
-        // floor((VRatio + VTaps + 1) / 2), then one more line.
-        let vinit = (u64::from(plane.v_ratio)
-            + u64::from(plane.v_taps + 1) * u64::from(Plane::UNITY))
-            / (2 * u64::from(Plane::UNITY));
-        // CalculateSinglePipeDPPCLKAndSCLThroughput, then RequiredDPPCLK.
-        let (h, v) = (ratio_f(plane.h_ratio), ratio_f(plane.v_ratio));
-        let pscl = if h > 1.0 {
-            min_f(
-                MAX_DCHUB_PSCL_BW as f64,
-                MAX_PSCL_LB_BW as f64 * h / ceil_f(f64::from(plane.h_taps) / 6.0),
+        // vactive_sw_bw: the single-pipe swath's bytes per line time at
+        // the vertical ratio.
+        let line_bw = |width: u32, bpp: u32, v: u32| {
+            q(
+                i64::from(width) * i64::from(bpp) * i64::from(t.pixel_clock_khz),
+                i64::from(t.h_total) * 1000,
             )
-        } else {
-            min_f(MAX_DCHUB_PSCL_BW as f64, MAX_PSCL_LB_BW as f64)
+            .times(ratio(v))
         };
+        // CalculateSinglePipeDPPCLKAndSCLThroughput, per surface.
+        let pscl = |h: f64, h_taps: u8| {
+            if h > 1.0 {
+                min_f(
+                    MAX_DCHUB_PSCL_BW as f64,
+                    MAX_PSCL_LB_BW as f64 * h / ceil_f(f64::from(h_taps) / 6.0),
+                )
+            } else {
+                min_f(MAX_DCHUB_PSCL_BW as f64, MAX_PSCL_LB_BW as f64)
+            }
+        };
+        let make = |i: usize,
+                    single: u32,
+                    swath: u32,
+                    surface: (u16, u16),
+                    (h_ratio, v_ratio, h_taps, v_taps): (u32, u32, u8, u8),
+                    bw: (Fx, Fx)| {
+            let (bw_w, bw_h) = (blocks.block_w[i], blocks.block_h[i]);
+            let (req_w, extent, max_height) = if vertical {
+                (bw_h, surface.1, bw_w)
+            } else {
+                (bw_w, surface.0, bw_h)
+            };
+            let r = u64::from(req_w);
+            let swath_ub = ceil_to(u64::from(extent), r)
+                .min(ceil_to(u64::from(swath).saturating_sub(1), r) + r)
+                as u32;
+            let mut full =
+                u64::from(swath_ub) * u64::from(blocks.det_bpp3[i]) * u64::from(max_height) / 3;
+            if plane.source == Source::Yuv420_10 {
+                full = ceil_to(full, 256);
+            }
+            Surf {
+                bpp: blocks.bpp[i],
+                det_bpp3: blocks.det_bpp3[i],
+                req_w,
+                swath_single: single,
+                swath,
+                swath_ub,
+                max_height,
+                height: max_height,
+                det_bytes: 0,
+                request_bytes: 256,
+                full_swath_bytes: full as u32,
+                rounded_swath_bytes: full as u32,
+                h_ratio,
+                v_ratio,
+                h_taps,
+                v_taps,
+                hratio: ratio(h_ratio),
+                vratio: ratio(v_ratio),
+                vinit: 0,
+                max_num_swath: 0,
+                source_lines: 0,
+                pscl: pscl(ratio_f(h_ratio), h_taps),
+                vactive_bw: bw.0,
+                vactive_bw_mp: bw.1,
+            }
+        };
+        let luma_bw = line_bw(vp, blocks.bpp[0], plane.v_ratio);
+        let mut y = make(
+            0,
+            vp,
+            swath,
+            (plane.surface_width, plane.surface_height),
+            (plane.h_ratio, plane.v_ratio, plane.h_taps, plane.v_taps),
+            (luma_bw, luma_bw),
+        );
+        let mut chroma = plane.is_420().then(|| {
+            make(
+                1,
+                vp / 2,
+                swath / 2,
+                (c.surface_width, c.surface_height),
+                (c.h_ratio, c.v_ratio, c.h_taps, c.v_taps),
+                (
+                    line_bw(
+                        along(c.viewport_width, c.viewport_height),
+                        blocks.bpp[1],
+                        c.v_ratio,
+                    ),
+                    line_bw(vp / 2, blocks.bpp[1], c.v_ratio),
+                ),
+            )
+        });
+        // CalculateSwathAndDETConfiguration: the full swaths if two of them
+        // fit half the DET (always for linear), else halved swaths.
+        let det = DET_KBYTES * 1024;
+        let half = det / 2;
+        let full_l = y.full_swath_bytes;
+        let full_c = chroma.map_or(0, |s| s.full_swath_bytes);
+        let half_request = |bpp: u32| if (bpp == 2) == vertical { 128 } else { 64 };
+        let (halve_l, halve_c) = if plane.swizzle == Swizzle::Linear || full_l + full_c <= half {
+            (false, false)
+        } else if 2 * u64::from(full_l) >= 3 * u64::from(full_c) && full_l / 2 + full_c <= half {
+            (true, false)
+        } else if 2 * u64::from(full_l) < 3 * u64::from(full_c) && full_l + full_c / 2 <= half {
+            (false, true)
+        } else {
+            (true, true)
+        };
+        if halve_l {
+            y.height = y.max_height / 2;
+            y.rounded_swath_bytes = full_l / 2;
+            y.request_bytes = half_request(y.bpp);
+        }
+        if let Some(s) = chroma.as_mut() {
+            if halve_c {
+                s.height = s.max_height / 2;
+                s.rounded_swath_bytes = full_c / 2;
+                s.request_bytes = half_request(s.bpp);
+            }
+            if s.height == 0 {
+                s.request_bytes = 0;
+            }
+        }
+        // The DET split between the surfaces.
+        match chroma.as_mut() {
+            None => y.det_bytes = det,
+            Some(s) => {
+                if 2 * u64::from(y.rounded_swath_bytes) <= 3 * u64::from(s.rounded_swath_bytes) {
+                    y.det_bytes = det / 2;
+                } else {
+                    y.det_bytes = det * 2 / 3 / 1024 * 1024;
+                }
+                s.det_bytes = det - y.det_bytes;
+            }
+        }
+        y.source_lines();
+        if let Some(s) = chroma.as_mut() {
+            s.source_lines();
+        }
+        // CalculateSinglePipeDPPCLKAndSCLThroughput, then RequiredDPPCLK:
+        // the faster of luma and chroma.
         let pixel_mhz = f64::from(t.pixel_clock_khz) / 1000.0;
-        let vtaps_term = f64::from(plane.v_taps / 6) * min_f(1.0, h);
-        let mut single = pixel_mhz * max_f(max_f(vtaps_term, h * v / pscl), 1.0);
-        if (plane.h_taps > 6 || plane.v_taps > 6) && single < 2.0 * pixel_mhz {
-            single = 2.0 * pixel_mhz;
+        let single_dpp = |s: &Surf| {
+            let (h, v) = (ratio_f(s.h_ratio), ratio_f(s.v_ratio));
+            let vtaps_term = f64::from(s.v_taps / 6) * min_f(1.0, h);
+            let mut single = pixel_mhz * max_f(max_f(vtaps_term, h * v / s.pscl), 1.0);
+            if (s.h_taps > 6 || s.v_taps > 6) && single < 2.0 * pixel_mhz {
+                single = 2.0 * pixel_mhz;
+            }
+            single
+        };
+        let single = chroma
+            .as_ref()
+            .map_or(single_dpp(&y), |s| max_f(single_dpp(&y), single_dpp(s)));
+        // calculate_mcache_setting (GPUVM off, viewport not stationary):
+        // DCC's DRAM overhead, and the mcaches dml2_top_mcache_validate_
+        // admissability must place on the plane's pipes.
+        let mut dram_nom = [Fx::ONE; 2];
+        let mut dram_pref = [Fx::ONE; 2];
+        let mut mcache_count = 0;
+        if plane.dcc {
+            let mcaches = Mcache::of(
+                &plane,
+                &blocks,
+                [&y, chroma.as_ref().unwrap_or(&y)],
+                channels,
+            );
+            for (i, m) in mcaches
+                .iter()
+                .take(if plane.is_420() { 2 } else { 1 })
+                .enumerate()
+            {
+                dram_nom[i] = m.dram_nom;
+                dram_pref[i] = m.dram_pref;
+                mcache_count += m.count;
+            }
+            mcache_count -= u32::from(mcaches[0].shared);
+            // Linux splits a plane whose mcaches its pipes cannot place
+            // (MPC combine), which this port does not admit.
+            if !Mcache::admissible(&mcaches, &plane, t.h_active, odm) {
+                return Err(Error::Unsupported);
+            }
         }
         Ok(Self {
             stream,
@@ -953,50 +1607,79 @@ impl Shape {
             pclk: mhz(u64::from(t.pixel_clock_khz)),
             line: q(i64::from(t.h_total) * 1000, i64::from(t.pixel_clock_khz)),
             odm,
-            swath,
-            swath_ub,
-            det_bytes: DET_KBYTES * 1024,
-            vactive_bw: q(
-                i64::from(vp) * i64::from(bpp) * i64::from(t.pixel_clock_khz),
-                i64::from(t.h_total) * 1000,
-            )
-            .times(vratio),
+            det_bytes: det,
             vblank: t.v_total - t.v_active,
             ycbcr420: mode.ycbcr420,
             dsc_delay: mode.dsc.map_or(0, |d| dsc_delay(&t, d, odm)),
-            bpp,
             plane,
-            hratio,
-            vratio,
-            source_lines: vinit as i64 + 1,
-            pscl,
+            y,
+            c: chroma,
             dpp: single / f64::from(odm),
             dpp_unit: single == pixel_mhz,
+            dram_nom,
+            dram_pref,
+            mcaches: mcache_count,
         })
     }
-    /// `CalculateSwathAndDETConfiguration` support: the swath fits half
-    /// the DET, the linear swath limit and the line buffer's
+    /// The surfaces of the plane: luma, then a 4:2:0 plane's chroma.
+    fn surfaces(&self) -> impl Iterator<Item = &Surf> {
+        core::iter::once(&self.y).chain(self.c.iter())
+    }
+    /// The surface's read bandwidth (mode support's or mode programming's
+    /// vactive_sw_bw, luma plus chroma), over all of its pipes.
+    fn vactive_bw(&self, mp: bool) -> Fx {
+        let c = self.c.map_or(
+            Fx::ZERO,
+            |c| if mp { c.vactive_bw_mp } else { c.vactive_bw },
+        );
+        self.y.vactive_bw.plus(c)
+    }
+    /// `CalculateSwathAndDETConfiguration` support (ViewportSizeSupport):
+    /// half of each full swath fits half the DET, and each swath fits
+    /// MaximumSwathWidthSupport and the line buffer's
     /// MaximumSwathWidthInLineBuffer for its taps and ratios.
     fn buffers(&self) -> Result<(), Error> {
-        let full_swath = self.swath_ub * self.bpp;
         let p = &self.plane;
+        let full_c = self.c.map_or(0, |c| c.full_swath_bytes);
+        if self.y.full_swath_bytes / 2 + full_c / 2 > self.det_bytes / 2 {
+            return Err(Error::Buffer);
+        }
+        let support = if p.swizzle == Swizzle::Linear {
+            MAX_LINEAR_SWATH
+        } else if p.is_420() {
+            if p.vertical_scan {
+                4320 + 16
+            } else {
+                7680 + 16
+            }
+        } else if p.vertical_scan && self.y.bpp == 8 && p.dcc {
+            3072 + 16
+        } else {
+            6144 + 16
+        };
         let unity = u128::from(Plane::UNITY);
-        let ceil_v = u128::from(p.v_ratio).div_ceil(unity);
-        let lines = u128::from(p.v_taps) + ceil_v.saturating_sub(2);
-        let lb = LINE_BUFFER_BITS as u128 * u128::from(p.h_ratio).max(unity);
-        if full_swath / 2 > self.det_bytes / 2
-            || self.swath > MAX_LINEAR_SWATH
-            || u128::from(self.swath) * LB_BITS_PER_PIXEL as u128 * lines * unity > lb
+        let fits = |s: &Surf, limit: u32| {
+            let ceil_v = u128::from(s.v_ratio).div_ceil(unity);
+            let lines = u128::from(s.v_taps) + ceil_v.saturating_sub(2);
+            let lb = LINE_BUFFER_BITS as u128 * u128::from(s.h_ratio).max(unity);
+            s.swath <= limit
+                && u128::from(s.swath) * LB_BITS_PER_PIXEL as u128 * lines * unity <= lb
+        };
+        let chroma_limit = if p.is_420() { support / 2 } else { support };
+        if !fits(&self.y, support)
+            || self
+                .c
+                .is_some_and(|c| c.height > 0 && !fits(&c, chroma_limit))
         {
             return Err(Error::Buffer);
         }
         Ok(())
     }
-    /// `CalculateUrgentBurstFactor`, luma only. `None` is
+    /// `CalculateUrgentBurstFactor` for one surface. `None` is
     /// NotEnoughUrgentLatencyHiding.
-    fn burst(&self, urgent: Fx, vratio: Fx) -> Option<Fx> {
-        let lines = self.det_bytes / self.bpp / self.swath_ub;
-        let time = fx(i64::from(lines)).times(self.line).over(vratio);
+    fn burst(&self, s: &Surf, urgent: Fx, vratio: Fx) -> Option<Fx> {
+        let lines = s.det_lines(u64::from(s.det_bytes), s.swath_ub);
+        let time = fx(lines as i64).times(self.line).over(vratio);
         if time.minus(urgent) <= Fx::ZERO {
             return None;
         }
@@ -1007,14 +1690,15 @@ impl Shape {
     /// the line at the scaled rate, above it at the scaler's throughput.
     fn deep_sleep_surface(&self, dpp: Fx) -> Fx {
         let factor = q(DCFCLK_FACTOR_HUNDREDTHS, 100);
-        let per_byte = factor.times(fx(i64::from(self.bpp))).over(fx(64));
-        let rate = if self.plane.v_ratio <= Plane::UNITY {
+        let y = &self.y;
+        let per_byte = factor.times(fx(i64::from(y.bpp))).over(fx(64));
+        let rate = if y.v_ratio <= Plane::UNITY {
             per_byte
                 .times(self.pclk)
-                .times(self.hratio)
+                .times(y.hratio)
                 .over(fx(i64::from(self.odm)))
         } else {
-            per_byte.times(fx_f(self.pscl)).times(dpp)
+            per_byte.times(fx_f(y.pscl)).times(dpp)
         };
         rate.max(self.pclk.over(fx(16)))
     }
@@ -1050,12 +1734,16 @@ impl Shape {
 }
 
 /// `CalculateDCFCLKDeepSleep` over every admitted surface: the total read
-/// bandwidth's term against each surface's own.
-fn deep_sleep(shapes: &[Shape]) -> Fx {
+/// bandwidth's term against each surface's own. A 4:2:0 plane's surface
+/// term comes from Linux's doubles (`deep_sleep_khz_f`).
+fn deep_sleep(shapes: &[Shape], mp: bool) -> Fx {
+    if shapes.iter().any(|s| s.c.is_some()) {
+        return fx_f(deep_sleep_f(shapes));
+    }
     let factor = q(DCFCLK_FACTOR_HUNDREDTHS, 100);
     let read = shapes
         .iter()
-        .fold(Fx::ZERO, |sum, s| sum.plus(s.vactive_bw));
+        .fold(Fx::ZERO, |sum, s| sum.plus(s.vactive_bw(mp)));
     shapes.iter().fold(
         fx(8).max(factor.times(read).over(fx(RETURN_BUS_BYTES))),
         |ds, s| ds.max(s.deep_sleep_surface(s.dpp_mhz())),
@@ -1063,10 +1751,12 @@ fn deep_sleep(shapes: &[Shape]) -> Fx {
 }
 /// [`deep_sleep`] as DPMM passes it on: truncated to kHz. Unscaled, it is
 /// computed exactly (over the product of the line totals) so a whole-kHz
-/// result does not lose a unit to rounding; with a scaled plane, in
-/// Linux's own doubles (CalculateDCFCLKDeepSleepTdlut, RequiredDPPCLK).
+/// result does not lose a unit to rounding; with a scaled or 4:2:0 plane,
+/// in Linux's own doubles (CalculateDCFCLKDeepSleepTdlut, RequiredDPPCLK).
 fn deep_sleep_khz(shapes: &[Shape]) -> u32 {
-    let unscaled = |s: &Shape| s.plane.h_ratio == Plane::UNITY && s.plane.v_ratio == Plane::UNITY;
+    let unscaled = |s: &Shape| {
+        s.c.is_none() && s.plane.h_ratio == Plane::UNITY && s.plane.v_ratio == Plane::UNITY
+    };
     if !shapes.iter().all(unscaled) {
         return deep_sleep_khz_f(shapes);
     }
@@ -1075,9 +1765,7 @@ fn deep_sleep_khz(shapes: &[Shape]) -> u32 {
     let num: u128 = shapes
         .iter()
         .map(|s| {
-            u128::from(u32::from(s.plane.viewport_width) * s.bpp)
-                * u128::from(s.t.pixel_clock_khz)
-                * den
+            u128::from(s.y.swath_single * s.y.bpp) * u128::from(s.t.pixel_clock_khz) * den
                 / u128::from(s.t.h_total)
         })
         .sum();
@@ -1085,39 +1773,55 @@ fn deep_sleep_khz(shapes: &[Shape]) -> u32 {
     shapes.iter().fold(8000.max(bw) as u32, |ds, s| {
         let pclk = u64::from(s.t.pixel_clock_khz);
         let surface =
-            (f as u64 * u64::from(s.bpp) * pclk / (100 * 64 * u64::from(s.odm))).max(pclk / 16);
+            (f as u64 * u64::from(s.y.bpp) * pclk / (100 * 64 * u64::from(s.odm))).max(pclk / 16);
         ds.max(surface as u32)
     })
 }
 fn deep_sleep_khz_f(shapes: &[Shape]) -> u32 {
+    (deep_sleep_f(shapes) * 1000.0) as u32
+}
+/// CalculateDCFCLKDeepSleepTdlut in Linux's doubles, in MHz.
+fn deep_sleep_f(shapes: &[Shape]) -> f64 {
     const FACTOR: f64 = 1.15;
     let mut read = 0.0;
     let mut ds_surface: [f64; MAX_PLANES] = [0.0; MAX_PLANES];
     for (k, s) in shapes.iter().enumerate() {
         let pixel_mhz = f64::from(s.t.pixel_clock_khz) / 1000.0;
-        let (h, v) = (ratio_f(s.plane.h_ratio), ratio_f(s.plane.v_ratio));
-        let swath = f64::from(s.swath);
-        let delivery = if v <= 1.0 {
-            swath * f64::from(s.odm) / h / pixel_mhz
-        } else {
-            swath / s.pscl / s.dpp
+        let delivery = |u: &Surf| {
+            let (h, v) = (ratio_f(u.h_ratio), ratio_f(u.v_ratio));
+            let swath = f64::from(u.swath);
+            if v <= 1.0 {
+                swath * f64::from(s.odm) / h / pixel_mhz
+            } else {
+                swath / u.pscl / s.dpp
+            }
         };
-        let per = FACTOR * swath * f64::from(s.bpp) / 64.0 / delivery;
-        ds_surface[k] = max_f(per, pixel_mhz / 16.0);
-        read += f64::from(s.plane.viewport_width) * f64::from(s.bpp)
-            / (f64::from(s.t.h_total) / pixel_mhz)
-            * v;
+        let y = &s.y;
+        ds_surface[k] = match &s.c {
+            None => FACTOR * f64::from(y.swath) * f64::from(y.bpp) / 64.0 / delivery(y),
+            Some(c) => max_f(
+                FACTOR * f64::from(y.swath) * f64::from(y.bpp) / 32.0 / delivery(y),
+                FACTOR * f64::from(c.swath) * f64::from(c.bpp) / 32.0 / delivery(c),
+            ),
+        };
+        ds_surface[k] = max_f(ds_surface[k], pixel_mhz / 16.0);
+        let line = f64::from(s.t.h_total) / pixel_mhz;
+        read += f64::from(y.swath_single) * f64::from(y.bpp) / line * ratio_f(y.v_ratio);
+        if let Some(c) = &s.c {
+            read += f64::from(c.swath_single) * f64::from(c.bpp) / line * ratio_f(c.v_ratio);
+        }
     }
     let mut ds = max_f(8.0, FACTOR * read / RETURN_BUS_BYTES as f64);
     for &d in &ds_surface[..shapes.len()] {
         ds = max_f(ds, d);
     }
-    (ds * 1000.0) as u32
+    ds
 }
 
 impl Shape {
     /// `CalculatePrefetchSchedule` with no VM, rows, meta, tdlut, cursor or
     /// dynamic metadata: VM and row stages take their quarter-line minimum.
+    /// `mp` selects mode programming's vactive bandwidth.
     fn prefetch(
         &self,
         clk: PipeClocks,
@@ -1125,6 +1829,7 @@ impl Shape {
         t_wait: Fx,
         extra_prefetch: Fx,
         t_calc: Fx,
+        mp: bool,
     ) -> Schedule {
         let (t, l) = (self.t, self.line);
         let (dppclk, dispclk, deep_sleep) = (clk.dpp, clk.disp, clk.deep_sleep);
@@ -1186,7 +1891,7 @@ impl Shape {
         ) as u32;
         // ODM combine adds 18 pixels and every further pipe's recout width
         // (DPP_RECOUT_WIDTH: the swath over the horizontal ratio, truncated).
-        let recout = (u64::from(self.swath) * u64::from(Plane::UNITY)
+        let recout = (u64::from(self.y.swath) * u64::from(Plane::UNITY)
             / u64::from(self.plane.h_ratio)) as u32;
         let dst_x = dst_x
             + if self.odm > 1 {
@@ -1201,15 +1906,27 @@ impl Shape {
         s.dst_x = dst_x - s.dst_y * t.h_total;
 
         let quarter = l.over(fx(4));
-        let src = self.source_lines;
-        let sw_bytes = fx(src * i64::from(self.swath_ub * self.bpp));
+        let (y, c) = (&self.y, self.c.as_ref());
+        let src = y.source_lines;
+        let src_c = c.map_or(0, |c| c.source_lines);
+        let src_max = src.max(src_c);
+        let line_bytes = |u: &Surf| fx(i64::from(u.swath_ub * u.bpp));
+        let sw_bytes = c.map_or(fx(src * i64::from(y.swath_ub * y.bpp)), |c| {
+            fx(src * i64::from(y.swath_ub * y.bpp) + src_c * i64::from(c.swath_ub * c.bpp))
+        });
         // One-to-one schedule, against this pipe's share of the surface's
         // active bandwidth.
-        let min_lsw_oto = q(src, MAX_VRATIO_PRE_OTO).max(fx(2));
-        let bw_oto = self
-            .vactive_bw
-            .over(fx(i64::from(self.odm)))
-            .max(fx(i64::from(self.swath_ub * self.bpp)).over(l))
+        let min_lsw_oto = q(src_max, MAX_VRATIO_PRE_OTO).max(fx(2));
+        let pipes = fx(i64::from(self.odm));
+        let per_pipe = c.map_or(y.vactive_bw.over(pipes), |c| {
+            let bw = if mp { c.vactive_bw_mp } else { c.vactive_bw };
+            y.vactive_bw.over(pipes).plus(bw.over(pipes))
+        });
+        let oto_line = c.map_or(line_bytes(y).over(l), |c| {
+            line_bytes(y).over(l).plus(line_bytes(c).over(l))
+        });
+        let bw_oto = per_pipe
+            .max(oto_line)
             .min(sw_bytes.over(min_lsw_oto.times(l)));
         let lsw_oto = ceil_quarter(sw_bytes.over(bw_oto).over(l));
         s.prefetch_bw_max = bw_oto;
@@ -1217,7 +1934,7 @@ impl Shape {
         let dst_oto = q(3, 4).plus(lsw_oto);
         // Equalized schedule.
         let lo = s.dst_y;
-        let min_lsw_equ = q(src, MAX_VRATIO_PRE_EQU).max(fx(2));
+        let min_lsw_equ = q(src_max, MAX_VRATIO_PRE_EQU).max(fx(2));
         let mut equ = fx(i64::from(s.vstartup))
             .minus(
                 s.t_setup
@@ -1253,11 +1970,40 @@ impl Shape {
             return s;
         }
         s.dst_y_prefetch = dst;
-        s.vratio_pre = fx(src).over(lsw).max(Fx::ONE);
+        // VRatioPrefetchY/C: the source lines over Lsw, and with swaths
+        // taller than four lines and a prefill above three, every swath the
+        // prefill spans within the lines after half the prefill's excess.
+        let vratio = |u: Option<&Surf>| -> Option<Fx> {
+            let Some(u) = u else {
+                return Some(Fx::ZERO.max(Fx::ONE));
+            };
+            let mut v = fx(u.source_lines).over(lsw).max(Fx::ONE);
+            if u.height > 4 && u.vinit > 3 {
+                let excess = q(i64::from(u.vinit) - 3, 2);
+                if lsw > excess {
+                    v = v.max(fx(i64::from(u.max_num_swath * u.height)).over(lsw.minus(excess)));
+                } else {
+                    return None;
+                }
+            }
+            Some(v)
+        };
+        let (Some(vy), Some(vc)) = (vratio(Some(y)), vratio(c)) else {
+            s.no_time = true;
+            return s;
+        };
+        s.vratio_pre = vy;
+        s.vratio_pre_c = vc;
         s.prefetch_bw = fx(src)
             .over(lsw)
-            .times(fx(i64::from(self.bpp * self.swath_ub)))
+            .times(fx(i64::from(y.bpp * y.swath_ub)))
             .over(l);
+        if let Some(c) = c {
+            s.prefetch_bw_c = fx(src_c)
+                .over(lsw)
+                .times(fx(i64::from(c.bpp * c.swath_ub)))
+                .over(l);
+        }
         s
     }
 }
@@ -1274,56 +2020,108 @@ fn evaluate(
     clk: &[PipeClocks],
     reserved_us: i64,
 ) -> Result<Evaluation, Error> {
+    let mp = clk[0].khz.is_some();
     let lat = latency(lat_state, uclk_khz);
-    // CalculateExtraLatency: dcn4x, max outstanding when urgent expected;
-    // CalculateTarb: one pixel chunk per DPP.
+    // CalculateExtraLatency: dcn4x, max outstanding when urgent expected
+    // (of the largest request any surface makes); CalculateTarb: one pixel
+    // chunk per DPP.
     let return_bw = {
         let a = available(lat_state).urgent[0];
         a[0].min(a[1])
     };
     let dpps: i64 = shapes.iter().map(|s| i64::from(s.odm)).sum();
     let t_arb = fx(dpps * PIXEL_CHUNK_KBYTES * 1024).over(return_bw);
-    let outstanding = fx(ROB_KBYTES * 1024 - MAX_OUTSTANDING_REQS * REQUEST_BYTES).over(return_bw);
+    let request = shapes
+        .iter()
+        .flat_map(Shape::surfaces)
+        .map(|u| i64::from(u.request_bytes))
+        .max()
+        .unwrap_or(REQUEST_BYTES);
+    let outstanding = fx(ROB_KBYTES * 1024 - MAX_OUTSTANDING_REQS * request).over(return_bw);
     let extra = outstanding.plus(t_arb);
     // Deep-sleep DCFCLK is global: every pipe carries the same value.
     let t_calc = fx(24).over(clk[0].deep_sleep);
     let t_wait = fx(reserved_us).plus(lat.urgent.max(lat.trip));
     let mut planes = [Schedule::default(); MAX_PLANES];
     let (mut urgent, mut non_urgent) = (Fx::ZERO, Fx::ZERO);
+    let (mut urgent_dram, mut non_urgent_dram) = (Fx::ZERO, Fx::ZERO);
     for (k, shape) in shapes.iter().enumerate() {
-        let pre = shape.prefetch(clk[k], &lat, t_wait, extra, t_calc);
+        let pre = shape.prefetch(clk[k], &lat, t_wait, extra, t_calc, mp);
         // NotEnoughUrgentLatencyHiding for active fetch, then the schedule.
         let burst = shape
-            .burst(lat.urgent, shape.vratio)
+            .burst(&shape.y, lat.urgent, shape.y.vratio)
             .ok_or(Error::UrgentLatencyHiding)?;
+        let burst_c = match &shape.c {
+            Some(c) => Some(
+                shape
+                    .burst(c, lat.urgent, c.vratio)
+                    .ok_or(Error::UrgentLatencyHiding)?,
+            ),
+            None => None,
+        };
         if pre.no_time
             || pre.dst_y > 8
             || pre.dst_y_prefetch < fx(2)
             || pre.vratio_pre > fx(MAX_VRATIO_PRE)
+            || pre.vratio_pre_c > fx(MAX_VRATIO_PRE)
         {
             return Err(Error::Prefetch);
         }
         let pre_burst = shape
-            .burst(lat.urgent, pre.vratio_pre)
+            .burst(&shape.y, lat.urgent, pre.vratio_pre)
             .ok_or(Error::UrgentLatencyHiding)?;
-        // calculate_peak_bandwidth_required: no flip, VM, cursor or excess
-        // vactive fill, and unity DCC/MALL factors for both SDP and DRAM.
-        // Active bandwidth is the surface's; prefetch is per pipe.
+        let pre_burst_c = match &shape.c {
+            Some(c) => Some(
+                shape
+                    .burst(c, lat.urgent, pre.vratio_pre_c)
+                    .ok_or(Error::UrgentLatencyHiding)?,
+            ),
+            None => None,
+        };
+        // calculate_peak_bandwidth_required (get_urgent_bandwidth_required):
+        // no flip, VM, cursor or excess vactive fill; unity MALL factors and
+        // DCC's DRAM overhead on DRAM only. Active bandwidth is the
+        // surface's; prefetch is per pipe.
         let pipes = fx(i64::from(shape.odm));
-        urgent = urgent.plus(
-            shape
-                .vactive_bw
-                .times(burst)
-                .max(pre.prefetch_bw.times(pre_burst).times(pipes))
-                .max(pre.prefetch_bw_max.times(pre_burst).times(pipes))
-                .max(shape.vactive_bw),
+        let vbw_y = shape.y.vactive_bw;
+        let vbw_c = shape.c.map_or(
+            Fx::ZERO,
+            |c| if mp { c.vactive_bw_mp } else { c.vactive_bw },
         );
-        non_urgent = non_urgent.plus(
-            shape
-                .vactive_bw
-                .max(pre.prefetch_bw.times(pipes))
-                .max(pre.prefetch_bw_max.times(pipes)),
-        );
+        // One bandwidth sum: `bursts` (active, prefetch luma and chroma)
+        // and the DRAM factors (nominal, prefetch luma and chroma).
+        let required = |bursts: Option<[Fx; 4]>, nom: [Fx; 2], pref: [Fx; 2]| {
+            let [b_y, b_c, pb_y, pb_c] = bursts.unwrap_or([Fx::ONE; 4]);
+            let scale = |v: Fx, f: Fx| if f == Fx::ONE { v } else { v.times(f) };
+            let (bpref_y, bpref_c) = (scale(pb_y, pref[0]), scale(pb_c, pref[1]));
+            let (bnom_y, bnom_c) = (scale(b_y, nom[0]), scale(b_c, nom[1]));
+            let chroma = shape.c.is_some();
+            let with_c = |v: Fx, c: Fx| if chroma { v.plus(c) } else { v };
+            let active = with_c(vbw_y.times(bnom_y), vbw_c.times(bnom_c));
+            let prefetch = with_c(
+                pre.prefetch_bw.times(bpref_y),
+                pre.prefetch_bw_c.times(bpref_c),
+            )
+            .times(pipes);
+            let prefetch_max = with_c(
+                pre.prefetch_bw_max.times(bpref_y),
+                pre.prefetch_bw_c.times(bpref_c),
+            )
+            .times(pipes);
+            let excess = with_c(scale(vbw_y, nom[0]), scale(vbw_c, nom[1]));
+            active.max(prefetch).max(prefetch_max).max(excess)
+        };
+        let bursts = [
+            burst,
+            burst_c.unwrap_or(Fx::ZERO),
+            pre_burst,
+            pre_burst_c.unwrap_or(Fx::ZERO),
+        ];
+        let unity = [Fx::ONE; 2];
+        urgent = urgent.plus(required(Some(bursts), unity, unity));
+        non_urgent = non_urgent.plus(required(None, unity, unity));
+        urgent_dram = urgent_dram.plus(required(Some(bursts), shape.dram_nom, shape.dram_pref));
+        non_urgent_dram = non_urgent_dram.plus(required(None, shape.dram_nom, shape.dram_pref));
         planes[k] = pre;
     }
     // check_urgent_bandwidth_support for sys-active and, with a MALL,
@@ -1331,8 +2129,9 @@ fn evaluate(
     let avail = available(bw_state);
     let mut frac = [Fx::ZERO; 2];
     for (state, a) in avail.urgent.iter().enumerate() {
-        frac[state] = non_urgent.over(a[0]).max(non_urgent.over(a[1]));
-        if (state == 0 || MALL_PRESENT) && (urgent > a[0] || urgent > a[1] || frac[state] > Fx::ONE)
+        frac[state] = non_urgent.over(a[0]).max(non_urgent_dram.over(a[1]));
+        if (state == 0 || MALL_PRESENT)
+            && (urgent > a[0] || urgent_dram > a[1] || frac[state] > Fx::ONE)
         {
             return Err(Error::Bandwidth);
         }
@@ -1353,38 +2152,55 @@ fn evaluate(
 
 impl Shape {
     /// CalculateWatermarksMALLUseAndDRAMSpeedChangeSupport: active latency
-    /// hiding against the GDDR6 temperature-read watermark.
-    fn temp_read_ok(&self, e: &Evaluation, pre: &Schedule, surfaces: usize) -> bool {
-        // LBLatencyHidingSourceLinesY: the lines the line buffer holds of
-        // the swath in source pixels, less the extra vertical taps (an
-        // (unsigned int) of a double, so a negative count wraps).
+    /// hiding (the lesser of luma's and chroma's) against the GDDR6
+    /// temperature-read watermark. With unbounded requesting the luma DET
+    /// also counts the compressed buffer (`compbuf_bytes`).
+    fn temp_read_ok(
+        &self,
+        e: &Evaluation,
+        pre: &Schedule,
+        surfaces: usize,
+        compbuf_bytes: u32,
+    ) -> bool {
         let unity = i64::from(Plane::UNITY);
-        let h = i64::from(self.plane.h_ratio).max(unity);
-        let lb = (LINE_BUFFER_BITS / LB_BITS_PER_PIXEL * h / (i64::from(self.swath) * unity))
-            .min(MAX_LINE_BUFFER_LINES)
-            - (i64::from(self.plane.v_taps) - 1);
-        let lb_lines = i64::from(lb as u32);
-        let det_lines = self.det_bytes / self.bpp / self.swath;
-        let mut hiding = fx(lb_lines + i64::from(det_lines))
-            .times(self.line)
-            .over(self.vratio)
-            .minus(
-                fx(i64::from(pre.dst_x))
-                    .over(fx(i64::from(self.t.h_total)))
-                    .plus(fx(i64::from(pre.dst_y)))
-                    .times(self.line),
-            );
-        // Several surfaces each give up part of a swath.
-        if surfaces > 1 {
-            hiding = hiding.minus(
-                Fx::ONE
-                    .minus(q(1, surfaces as i64))
-                    .times(self.line)
-                    .over(self.vratio),
-            );
+        let hiding = |u: &Surf, det: u64| {
+            // LBLatencyHidingSourceLines: the lines the line buffer holds of
+            // the swath in source pixels, less the extra vertical taps (an
+            // (unsigned int) of a double, so a negative count wraps).
+            let h = i64::from(u.h_ratio).max(unity);
+            let lb = (LINE_BUFFER_BITS / LB_BITS_PER_PIXEL * h / (i64::from(u.swath) * unity))
+                .min(MAX_LINE_BUFFER_LINES)
+                - (i64::from(u.v_taps) - 1);
+            let lb_lines = i64::from(lb as u32);
+            let det_lines = u.det_lines(det, u.swath) as i64;
+            let mut hiding = fx(lb_lines + det_lines)
+                .times(self.line)
+                .over(u.vratio)
+                .minus(
+                    fx(i64::from(pre.dst_x))
+                        .over(fx(i64::from(self.t.h_total)))
+                        .plus(fx(i64::from(pre.dst_y)))
+                        .times(self.line),
+                );
+            // Several surfaces each give up part of a swath.
+            if surfaces > 1 {
+                hiding = hiding.minus(
+                    Fx::ONE
+                        .minus(q(1, surfaces as i64))
+                        .times(fx(i64::from(u.height)))
+                        .times(self.line)
+                        .over(u.vratio),
+                );
+            }
+            hiding
+        };
+        let det_y = u64::from(self.y.det_bytes) + u64::from(compbuf_bytes);
+        let mut hidden = hiding(&self.y, det_y);
+        if let Some(c) = &self.c {
+            hidden = hidden.min(hiding(c, u64::from(c.det_bytes)));
         }
         let urgent_wm = e.lat.urgent.plus(e.extra);
-        hiding.minus(e.lat.g6_temp_read.plus(urgent_wm)) >= Fx::ZERO
+        hidden.minus(e.lat.g6_temp_read.plus(urgent_wm)) >= Fx::ZERO
     }
 }
 
@@ -1511,15 +2327,34 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
             if shapes.len() == MAX_PLANES {
                 return Err(Error::Pipes);
             }
-            let shape = Shape::new(mode, plane, k, ss(soc.dispclk_max_khz))?;
+            let shape = Shape::new(mode, plane, k, ss(soc.dispclk_max_khz), soc.umc_channels)?;
             shape.buffers()?;
             shapes.push(shape);
         }
     }
     // TotalAvailablePipesSupport: one DPP per plane and ODM segment.
-    if shapes.iter().map(|s| s.odm).sum::<u32>() > MAX_PIPES {
+    let dpps = shapes.iter().map(|s| s.odm).sum::<u32>();
+    if dpps > MAX_PIPES {
         return Err(Error::Pipes);
     }
+    // dml2_top_mcache_calc_mcache_count_and_offsets: every DCC plane's
+    // mcaches within the SoC's num_dcc_mcaches.
+    if shapes.iter().map(|s| s.mcaches).sum::<u32>() > DCC_MCACHES {
+        return Err(Error::Unsupported);
+    }
+    // UnboundedRequest: one DPP in all, tiled and without chroma. The
+    // compressed buffer then takes the CRB beyond the DET
+    // (CalculateDETBufferSize); otherwise DML's minimum.
+    let unbounded = dpps == 1
+        && shapes
+            .iter()
+            .all(|s| s.c.is_none() && s.plane.swizzle != Swizzle::Linear);
+    let compbuf_kbytes = if unbounded {
+        CONFIG_RETURN_KBYTES - DET_KBYTES
+    } else {
+        SEGMENT_KBYTES
+    };
+    let compbuf_bytes = if unbounded { compbuf_kbytes * 1024 } else { 0 };
     let (dcfclk_khz, fclk_khz, bw_kbps) = clock_state(soc)?;
     let state = State {
         dcfclk: mhz(dcfclk_khz),
@@ -1551,20 +2386,29 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
     }
     let max_dpp_khz = shapes.iter().map(Shape::dpp_khz).max().unwrap_or(0);
     let max_disp_khz = shapes.iter().map(Shape::disp_khz).max().unwrap_or(0);
-    let ds = deep_sleep(&shapes);
-    // Outstanding-request coverage at DML's DCF state.
+    let ds = deep_sleep(&shapes, false);
+    // Outstanding-request coverage at DML's DCF state, for every surface's
+    // request size.
     let lat = latency(state, uclk_khz);
-    let outstanding_us =
-        fx(MAX_OUTSTANDING_REQS * REQUEST_BYTES).over(state.dcfclk.times(fx(RETURN_BUS_BYTES)));
-    if outstanding_us < lat.avg_urgent || outstanding_us < lat.avg_non_urgent {
-        return Err(Error::Latency);
+    for u in shapes.iter().flat_map(Shape::surfaces) {
+        let outstanding_us = fx(MAX_OUTSTANDING_REQS * i64::from(u.request_bytes))
+            .over(state.dcfclk.times(fx(RETURN_BUS_BYTES)));
+        if outstanding_us < lat.avg_urgent || outstanding_us < lat.avg_non_urgent {
+            return Err(Error::Latency);
+        }
     }
-    // Average bandwidth at maximum clocks.
+    // Average bandwidth at maximum clocks (calculate_avg_bandwidth_required:
+    // DCC's nominal overhead on DRAM).
     let read = shapes
         .iter()
-        .fold(Fx::ZERO, |sum, s| sum.plus(s.vactive_bw));
+        .fold(Fx::ZERO, |sum, s| sum.plus(s.vactive_bw(false)));
+    let read_dram = shapes.iter().fold(Fx::ZERO, |sum, s| {
+        let scale = |v: Fx, f: Fx| if f == Fx::ONE { v } else { v.times(f) };
+        let c = s.c.map_or(Fx::ZERO, |c| scale(c.vactive_bw, s.dram_nom[1]));
+        sum.plus(scale(s.y.vactive_bw, s.dram_nom[0]).plus(c))
+    });
     for a in available(max_state).average {
-        if read > a[0] || read > a[1] {
+        if read > a[0] || read_dram > a[1] {
             return Err(Error::Bandwidth);
         }
     }
@@ -1585,7 +2429,7 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
             return Err(Error::Latency);
         }
         for (shape, pre) in shapes.iter().zip(e.planes.iter()) {
-            if !shape.temp_read_ok(&e, pre, shapes.len()) {
+            if !shape.temp_read_ok(&e, pre, shapes.len(), compbuf_bytes) {
                 return Err(Error::TempRead);
             }
         }
@@ -1676,7 +2520,15 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
     let hysteresis = fx(PIXEL_CHUNK_KBYTES * 1024 * 3 / 4 / 64)
         .minus(min_return)
         .max(fx(32));
-    let min_det = CONFIG_RETURN_KBYTES - SEGMENT_KBYTES;
+    // compbuf_reserved_space_64b: two pixel chunks, or with unbounded
+    // requesting what the ROB leaves beyond eight luma swaths.
+    let mut compbuf_reserved_64b = 2 * PIXEL_CHUNK_KBYTES * 1024 / 64;
+    if unbounded {
+        let swath = i64::from(shapes[0].y.rounded_swath_bytes);
+        compbuf_reserved_64b = compbuf_reserved_64b.max(ROB_KBYTES * 1024 / 64 - swath * 8 / 64);
+    }
+    // hw_debug5 (ALLOW_SDPIF_RATE_LIMIT_PRE_CSTATE): several surfaces.
+    let hw_debug5 = shapes.len() > 1;
     let watermarks = Watermarks {
         urgent: refcyc(urgent_wm),
         sr_enter: refcyc(fx(SR_ENTER_PLUS_EXIT_US).plus(sr_tail)),
@@ -1695,13 +2547,14 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
         max_req_outstanding: MAX_OUTSTANDING_REQS as u32,
         min_req_outstanding: MAX_OUTSTANDING_REQS as u32,
         sat_level_us: 60,
-        compbuf_reserved_space_kbytes: (2 * PIXEL_CHUNK_KBYTES * 1024 / 64 * 64 / 1024) as u32,
-        compbuf_segments: (CONFIG_RETURN_KBYTES - min_det) / SEGMENT_KBYTES,
+        compbuf_reserved_space_kbytes: (compbuf_reserved_64b * 64 / 1024) as u32,
+        compbuf_segments: compbuf_kbytes / SEGMENT_KBYTES,
         sdpif_request_rate_limit: (3 * WORDS_PER_CHANNEL * soc.umc_channels / 4).max(96),
         dcfclk_deep_sleep_hysteresis: hysteresis.floor() as u32,
         pstate_stall_threshold: (MAX_ALLOW_DELAY_US * ref_khz / 1000) as u32,
         hvm_max_qos_commit_threshold: 0xf,
         hvm_min_req_outstand_commit_threshold: 0xa,
+        allow_sdpif_rate_limit_when_cstate_req: hw_debug5,
     };
     let mut streams = [None; MAX_STREAMS];
     for (slot, mode) in streams.iter_mut().zip(modes) {
@@ -1733,34 +2586,65 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
         // above it at the scaler's throughput, in Linux's doubles.
         let odm = i128::from(shape.odm);
         let unity = i128::from(Plane::UNITY);
-        let h = i128::from(shape.plane.h_ratio);
         let ref_mhz = f64::from(soc.dchub_refclk_khz) / 1000.0;
         let dpp_mhz = f64::from(dppclk_khz[k]) / 1000.0;
-        let swath_ub = i128::from(shape.swath_ub);
-        let req_per_swath = f64::from(shape.swath_ub / request_pixels(shape.bpp));
-        let scaled_line = || f64::from(shape.swath_ub) / shape.pscl / dpp_mhz;
-        let delivery = |above_one: bool| -> (u32, u32) {
+        // One surface's line and request delivery (refcyc, and refcyc
+        // in 1/1024ths per request).
+        let delivery = |u: &Surf, above_one: bool| -> (u32, u32) {
             if above_one {
-                let line = scaled_line();
+                let line = f64::from(u.swath_ub) / u.pscl / dpp_mhz;
+                let req_per_swath = f64::from(u.swath_ub / u.req_w);
                 (
                     (line * ref_mhz) as u32,
                     (line / req_per_swath * ref_mhz * 1024.0) as u32,
                 )
             } else {
-                let den = h * i128::from(pclk_i);
+                let den = i128::from(u.h_ratio) * i128::from(pclk_i);
                 (
-                    (swath_ub * odm * unity * i128::from(ref_khz) / den) as u32,
-                    (i128::from(request_pixels(shape.bpp))
-                        * odm
-                        * unity
-                        * 1024
-                        * i128::from(ref_khz)
-                        / den) as u32,
+                    (i128::from(u.swath_ub) * odm * unity * i128::from(ref_khz) / den) as u32,
+                    (i128::from(u.req_w) * odm * unity * 1024 * i128::from(ref_khz) / den) as u32,
                 )
             }
         };
-        let (line_delivery, refcyc_req) = delivery(shape.plane.v_ratio > Plane::UNITY);
-        let (line_delivery_pre, refcyc_req_pre) = delivery(pre.vratio_pre > Fx::ONE);
+        let y = &shape.y;
+        let (line_delivery, refcyc_req) = delivery(y, y.v_ratio > Plane::UNITY);
+        let (line_delivery_pre, refcyc_req_pre) = delivery(y, pre.vratio_pre > Fx::ONE);
+        let ((line_c, req_c), (line_pre_c, req_pre_c)) = match &shape.c {
+            Some(c) => (
+                delivery(c, c.v_ratio > Plane::UNITY),
+                delivery(c, pre.vratio_pre_c > Fx::ONE),
+            ),
+            None => ((0, 0), (0, 0)),
+        };
+        // rq_dlg_get_rq_reg: 8 KiB chunks with a 1 KiB minimum, no groups
+        // or meta without GPUVM and MRQ, log2 swath heights, and a 4:2:0
+        // DET's chroma half (or third, for a luma part over 1.5 times it).
+        let rq_plane = |height: u32| RqPlane {
+            chunk_size: (PIXEL_CHUNK_KBYTES as u32 * 1024).ilog2() - 10,
+            min_chunk_size: MIN_PIXEL_CHUNK_BYTES.ilog2() - 7,
+            swath_height: if height == 0 { 0 } else { height.ilog2() },
+            ..RqPlane::default()
+        };
+        let plane1_base_address = match &shape.c {
+            None => 0,
+            Some(c) => {
+                if 2 * u64::from(y.det_bytes) <= 3 * u64::from(c.det_bytes) {
+                    shape.det_bytes / 2 / 1024
+                } else {
+                    shape.det_bytes * 2 / 3 / 1024
+                }
+            }
+        };
+        let rq = RqRegs {
+            luma: rq_plane(y.height),
+            chroma: rq_plane(shape.c.map_or(0, |c| c.height)),
+            drq_expansion_mode: 2,
+            prq_expansion_mode: 1,
+            mrq_expansion_mode: 1,
+            crq_expansion_mode: 1,
+            plane1_base_address,
+            unbounded_request_enabled: unbounded,
+        };
         // rq_dlg_get_dlg_reg: each further ODM pipe's blank ends its share
         // of the active line later.
         let h_blank_end = |pipe: u32| {
@@ -1789,9 +2673,11 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
                     dst_y_per_row_vblank: 1,
                     ref_freq_to_pix_freq: ((ref_khz << 19) / pclk_i) as u32,
                     vratio_prefetch: reg(pre.vratio_pre.times(fx(1 << 19))),
-                    vratio_prefetch_c: 1 << 19,
+                    vratio_prefetch_c: reg(pre.vratio_pre_c.times(fx(1 << 19))),
                     refcyc_per_line_delivery_pre_l: line_delivery_pre,
                     refcyc_per_line_delivery_l: line_delivery,
+                    refcyc_per_line_delivery_pre_c: line_pre_c,
+                    refcyc_per_line_delivery_c: line_c,
                     vready_after_vcount0: vready_after,
                     dst_y_delta_drq_limit: 0x7fff,
                     dmdata_dl_delta: refcyc(pre.t_dmdl),
@@ -1803,11 +2689,14 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
                     qos_level_flip: 14,
                     refcyc_per_req_delivery_l: refcyc_req,
                     refcyc_per_req_delivery_pre_l: refcyc_req_pre,
+                    refcyc_per_req_delivery_c: req_c,
+                    refcyc_per_req_delivery_pre_c: req_pre_c,
                     qos_level_fixed_l: 8,
                     qos_level_fixed_c: 8,
                 },
                 det_bytes: shape.det_bytes,
                 odm_refcyc_h_blank_end: if shape.odm > 1 { h_blank_end(1) } else { 0 },
+                rq,
             },
         ));
     }
@@ -1946,6 +2835,10 @@ impl Plan {
                 (d.vratio_prefetch_c, 1 << 22),
                 (d.refcyc_per_line_delivery_pre_l, 1 << 13),
                 (d.refcyc_per_line_delivery_l, 1 << 13),
+                (d.refcyc_per_line_delivery_pre_c, 1 << 13),
+                (d.refcyc_per_line_delivery_c, 1 << 13),
+                (t.refcyc_per_req_delivery_pre_c, 1 << 23),
+                (t.refcyc_per_req_delivery_c, 1 << 23),
                 (t.qos_level_high_wm, 1 << 14),
                 (t.min_ttu_vblank, 1 << 24),
                 (t.qos_level_flip, 1 << 4),
