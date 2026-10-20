@@ -109,6 +109,16 @@ pub(super) fn start() -> InitResult {
         // SAFETY: the retained prepared owner and paused CPU writers persist.
         let result = narf_scheduler::block_on_spin(unsafe { navi48::run() });
         completed(generation, result, navi48::status());
+        if result.is_ok() {
+            // Automatic GPU recovery (Linux `amdgpu.gpu_recovery`), as for
+            // RX 6000: kernel boot-framebuffer writers go behind the console
+            // hook first; recovery withdraws the native scanout itself.
+            navi48::set_recovery_console_hook(recovery_console);
+            // SAFETY: the console hook pauses every kernel framebuffer
+            // writer for the reset; user VRAM mappings follow Linux (not
+            // revoked, contents lost).
+            unsafe { navi48::set_automatic_recovery(options.gpu_recovery) };
+        }
         result.is_ok()
     } else {
         let args = narf_boot::args();

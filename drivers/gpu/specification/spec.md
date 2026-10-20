@@ -5359,10 +5359,17 @@ so a clear's fence never reads complete off the test's fence. Innocent
 client jobs use the same logical-ticket replay as GC12. VRAM clear fences
 follow SDMA0's hardware fence only, never a timeout's verdict.
 
-`unsafe amdgpu_navi48_platform::recover().await` is explicit whole-device
-recovery after ring recovery fails. Its caller must stop every CPU VRAM/GOP
-and mmap accessor and exclude external PCI/firmware owners; the watchdog
-cannot establish these exclusions and does not automatically invoke it.
+`unsafe amdgpu_navi48_platform::recover().await` is whole-device recovery
+after ring recovery fails. Its caller must stop every kernel CPU VRAM/GOP
+writer and exclude external PCI/firmware owners. As for RX 6000 (Linux
+`amdgpu.gpu_recovery` on a dGPU), `unsafe set_automatic_recovery(bool)`
+(enabled by the fb boot handoff unless `amdgpu.gpu_recovery=0`) lets the
+watchdog start it after a failed ring reset or a terminal fault (poison,
+lost interrupts, refused coordinated recovery), once per submitter
+generation and at most `MAX_AUTOMATIC_RECOVERIES` (3) times per boot, since
+each recovery quarantines the old owners' VRAM. `set_recovery_console_hook`
+pauses kernel boot-framebuffer writers for the reset; a lost device leaves
+them paused. User CPU mappings of VRAM are not revoked, as in Linux.
 Preflight refuses boots that needed GDDR6 training replay. The platform
 withdraws CS, client VRAM allocation, scanout and timestamps, drains CPU views,
 stops the old IH service, and advances the lock-protected fence-reader

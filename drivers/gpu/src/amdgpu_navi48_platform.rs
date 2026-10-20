@@ -368,6 +368,7 @@ fn register_submitter(
                 CLIENT_VMIDS.1,
             )),
             watch: narf_lib::sync::IrqSafeSpinLock::new(watches),
+            device_recovery: core::sync::atomic::AtomicBool::new(false),
         });
         *SUBMITTER.lock() = Some(submitter.clone());
         crate::amdgpu_info::publish_navi48_video(boot.proven_video());
@@ -404,8 +405,9 @@ impl Drop for RecoveryOwner {
 /// Stop ALL CPU access to this GPU's VRAM, including userspace mmap and GOP
 /// writers, and exclude other PCI/config/firmware owners until successful
 /// return. Keep these exclusions after failure or cancellation. Clients
-/// must handle lost VRAM contents. This cannot safely run from the watchdog
-/// without an external mechanism providing those exclusions. Hardware unvalidated.
+/// must handle lost VRAM contents. The watchdog runs it automatically only
+/// after `set_automatic_recovery` accepted that contract for every user (see
+/// there). Hardware unvalidated.
 pub async unsafe fn recover() -> Result<boot::Report, boot::Error> {
     let mut owner = OWNER.lock().await;
     if RECOVERY_STATE.load(Ordering::Acquire) & 1 != 0 {
@@ -518,6 +520,119 @@ pub async unsafe fn recover() -> Result<boot::Report, boot::Error> {
     Ok(report)
 }
 
+/// Linux `amdgpu.gpu_recovery` on a dGPU: a ring whose reset failed or a
+/// terminal fault (poison, refused coordinated recovery, lost interrupts)
+/// starts [`recover`], at most [`MAX_AUTOMATIC_RECOVERIES`] times per boot,
+/// as the RX 6000 path does: each recovery quarantines the old owners' VRAM.
+static AUTOMATIC_RECOVERY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+pub const MAX_AUTOMATIC_RECOVERIES: u64 = 3;
+static AUTOMATIC_RECOVERIES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Claim one automatic recovery; `false` once the boot's budget is spent.
+fn claim_automatic_recovery() -> bool {
+    AUTOMATIC_RECOVERIES
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            (used < MAX_AUTOMATIC_RECOVERIES).then_some(used + 1)
+        })
+        .is_ok()
+}
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __reset_automatic_recoveries() {
+    AUTOMATIC_RECOVERIES.store(0, Ordering::Release);
+}
+/// Enable or disable automatic recovery (`amdgpu.gpu_recovery`).
+///
+/// # Safety
+/// The caller accepts [`recover`]'s contract for every user: in-flight work
+/// is abandoned with errors, the display goes dark and relights, kernel CPU
+/// writers of a boot framebuffer in this card's VRAM are behind the console
+/// hook ([`set_recovery_console_hook`]) and the native scanout is withdrawn
+/// by recovery itself. User CPU mappings of VRAM are not revoked, as in
+/// Linux: their accesses during the reset reach an unresponsive BAR and
+/// their contents are lost.
+pub unsafe fn set_automatic_recovery(enabled: bool) {
+    AUTOMATIC_RECOVERY.store(enabled, Ordering::Release);
+}
+/// Pauses (`true`) and resumes (`false`) every kernel CPU writer of the boot
+/// framebuffer; installed by the fb owner.
+type ConsoleHook = fn(bool);
+static CONSOLE_HOOK: narf_lib::sync::IrqSafeSpinLock<Option<ConsoleHook>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+pub fn set_recovery_console_hook(hook: ConsoleHook) {
+    *CONSOLE_HOOK.lock() = Some(hook);
+}
+fn console(pause: bool) {
+    let hook = *CONSOLE_HOOK.lock();
+    if let Some(hook) = hook {
+        hook(pause);
+    }
+}
+/// What a device-recovery request should do now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryDecision {
+    Recover,
+    Disabled,
+    LimitReached,
+    AlreadyRequested,
+}
+fn decide_recovery(requested: &core::sync::atomic::AtomicBool) -> RecoveryDecision {
+    if requested.swap(true, Ordering::AcqRel) {
+        RecoveryDecision::AlreadyRequested
+    } else if !AUTOMATIC_RECOVERY.load(Ordering::Acquire) {
+        RecoveryDecision::Disabled
+    } else if !claim_automatic_recovery() {
+        RecoveryDecision::LimitReached
+    } else {
+        RecoveryDecision::Recover
+    }
+}
+impl Submitter {
+    /// One whole-device recovery per submitter generation; the recovered
+    /// owner registers a fresh submitter (and watchdog) of its own.
+    fn request_device_recovery(&self, reason: &'static str) {
+        use core::fmt::Write as _;
+        match decide_recovery(&self.device_recovery) {
+            RecoveryDecision::AlreadyRequested => {}
+            RecoveryDecision::Disabled => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: navi48 {reason}; GPU recovery disabled (amdgpu.gpu_recovery=0)"
+                );
+            }
+            RecoveryDecision::LimitReached => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: navi48 {reason}; GPU recovery limit ({MAX_AUTOMATIC_RECOVERIES} per boot) reached, the GPU stays stopped"
+                );
+            }
+            RecoveryDecision::Recover => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: navi48 {reason}; starting GPU recovery"
+                );
+                narf_scheduler::spawn(async {
+                    use core::fmt::Write as _;
+                    // Kernel CPU writers stay off the boot framebuffer for
+                    // the whole reset.
+                    console(true);
+                    // SAFETY: set_automatic_recovery's caller accepted
+                    // recover()'s contract on behalf of every user.
+                    let result = unsafe { recover() }.await;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: navi48 GPU recovery {:?}",
+                        result.as_ref().map(|_| ())
+                    );
+                    // A lost device keeps the console quarantined.
+                    if result.is_ok() {
+                        console(false);
+                    }
+                });
+            }
+        }
+    }
+}
+
 /// The Navi48 kernel queues behind AMDGPU_CS: up to eight IBs per
 /// submission, all for one ring — graphics, compute or SDMA0 — run
 /// in the open's address space on a GFX hub VMID from 1–7 (8–15 are KFD's,
@@ -570,6 +685,8 @@ struct Submitter {
     contexts: narf_lib::sync::IrqSafeSpinLock<[(u64, u32); RINGS]>,
     /// Each ring's jobs in flight and whether it hung.
     watch: narf_lib::sync::IrqSafeSpinLock<[crate::amdgpu_ring_watch::RingWatch; RINGS]>,
+    /// This generation already asked for whole-device recovery.
+    device_recovery: core::sync::atomic::AtomicBool,
 }
 /// Why a ring's reset failed.
 #[derive(Debug)]
@@ -684,6 +801,10 @@ impl Submitter {
         if crate::amdgpu_navi48_interrupts::blocked() {
             for watch in self.watch.lock().iter_mut() {
                 watch.stop();
+            }
+            // Terminal: poison, lost interrupts or refused fault recovery.
+            if crate::amdgpu_navi48_interrupts::failed() {
+                self.request_device_recovery("terminal device fault");
             }
             return;
         }
@@ -817,6 +938,7 @@ impl Submitter {
                         narf_console::Writer,
                         "amdgpu: navi48 ring {ring} reset failed ({e:?}); ring stopped"
                     );
+                    self.request_device_recovery("ring reset failed");
                 }
             }
         }
@@ -4312,6 +4434,38 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu/navi48",
         navi48_monitor_relights_only_for_new_sinks_and_changes
+    );
+
+    /// Automatic recovery follows amdgpu.gpu_recovery and the per-boot
+    /// budget, once per submitter generation.
+    fn navi48_automatic_recovery_is_budgeted_once_per_generation() -> TestResult {
+        use core::sync::atomic::AtomicBool;
+        __reset_automatic_recoveries();
+        // SAFETY: model only; nothing is spawned by `decide_recovery`.
+        unsafe { set_automatic_recovery(false) };
+        let generation = AtomicBool::new(false);
+        assert_eq!(decide_recovery(&generation), RecoveryDecision::Disabled);
+        assert_eq!(
+            decide_recovery(&generation),
+            RecoveryDecision::AlreadyRequested
+        );
+        // SAFETY: as above.
+        unsafe { set_automatic_recovery(true) };
+        for _ in 0..MAX_AUTOMATIC_RECOVERIES {
+            let fresh = AtomicBool::new(false);
+            assert_eq!(decide_recovery(&fresh), RecoveryDecision::Recover);
+            assert_eq!(decide_recovery(&fresh), RecoveryDecision::AlreadyRequested);
+        }
+        let last = AtomicBool::new(false);
+        assert_eq!(decide_recovery(&last), RecoveryDecision::LimitReached);
+        // SAFETY: as above.
+        unsafe { set_automatic_recovery(false) };
+        __reset_automatic_recoveries();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi48",
+        navi48_automatic_recovery_is_budgeted_once_per_generation
     );
 
     /// After an SDMA0 reset, the clears the ring held past where it
