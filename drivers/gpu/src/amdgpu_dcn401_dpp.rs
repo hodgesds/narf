@@ -130,7 +130,7 @@ fn dscl_state(scaler: &spl::Scaler, alpha: bool) -> alloc::vec::Vec<(u64, u32, u
     out
 }
 impl<I: Io> Engine<I> {
-    fn dpp_stopped(&mut self, pipe: u8, clocked: bool) -> Result<(), Error> {
+    pub(super) fn dpp_stopped(&mut self, pipe: u8, clocked: bool) -> Result<(), Error> {
         if !self.hubp_powered(pipe)? {
             return Err(Error::Busy);
         }
@@ -239,6 +239,72 @@ impl<I: Io> Engine<I> {
         self.update(l.dpp(p, DPP_CLOCK), 0x10, 0)?;
         Ok(coef_ram)
     }
+    /// dpp401_dpp_setup and dpp401_dscl_set_scaler_manual_scale for every
+    /// segment of a live (or just enabled) plane under its OTG lock, as
+    /// dcn20_update_dchubp_dpp programs a pipe a full or medium update keeps:
+    /// its DPP clock runs, the scaler LUT is woken, the CNVC/CM state and the
+    /// scaler are written and the coefficients loaded into the RAM not in
+    /// use and selected (the selection latches with the update). Returns
+    /// each segment's selection.
+    pub(super) async fn program_dpp_live(
+        &mut self,
+        applied: DppApplied,
+    ) -> Result<[Option<bool>; 4], Error> {
+        let l = self.layout;
+        let alpha = applied.surface.request.layout().blend.per_pixel_alpha;
+        let mut coef_ram = [None; 4];
+        for (i, (p, scaler)) in applied.surface.request.scalers().enumerate() {
+            if self.read(l.dpp(p, DPP_CLOCK))? & 0x10 == 0 {
+                return Err(Error::Busy);
+            }
+            self.update(l.dpp(p, SCALER_POWER), 7, 4)?;
+            self.wait(l.dpp(p, SCALER_STATUS), 3, 0, 1000).await?;
+            for (r, mask, value) in cnvc_cm(applied) {
+                self.update(l.dpp(p, r), mask, value)?;
+            }
+            for op in dscl::program(&scaler, alpha) {
+                match op {
+                    dscl::Op::Write { reg, mask, value } => {
+                        self.update(l.dpp(p, reg), mask, value)?
+                    }
+                    dscl::Op::Wait { reg, mask, value } => {
+                        self.wait(l.dpp(p, reg), mask, value, 1000).await?;
+                    }
+                    dscl::Op::Coefficients {
+                        filter_type,
+                        taps,
+                        filter,
+                    } => {
+                        self.update(
+                            l.dpp(p, dscl::SCL_COEF_RAM_TAP_SELECT),
+                            0x73f03,
+                            filter_type << 16,
+                        )?;
+                        let data = l.dpp(p, dscl::SCL_COEF_RAM_TAP_DATA);
+                        self.access(|io| {
+                            for word in dscl::coefficient_words(taps, filter) {
+                                io.write(data, word);
+                            }
+                            Ok(())
+                        })?;
+                    }
+                    dscl::Op::SwapCoefficientRam { chroma } => {
+                        let at = l.dpp(p, dscl::SCL_MODE);
+                        let current = self.read(at)? & dscl::COEF_RAM_SELECT_CURRENT != 0;
+                        self.update(
+                            at,
+                            dscl::COEF_RAM_SELECT | dscl::CHROMA_COEF_MODE,
+                            u32::from(!current) << 8 | u32::from(chroma) << 16,
+                        )?;
+                        if let Some(slot) = coef_ram.get_mut(i) {
+                            *slot = Some(!current);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(coef_ram)
+    }
     pub(super) fn verify_dpp(&mut self, applied: DppApplied) -> Result<(), Error> {
         let alpha = applied.surface.request.layout().blend.per_pixel_alpha;
         for (i, (p, scaler)) in applied.surface.request.scalers().enumerate() {
@@ -293,6 +359,17 @@ impl<I: Io> Engine<I> {
             self.displays.selected
         }
     }
+}
+/// The line-buffer configuration of `surface`'s first segment
+/// (dpp401_dscl_find_lb_memory_config), as a DPP record keeps it; every
+/// segment's SPL must succeed.
+pub(super) fn line_buffer_config(surface: SurfaceRequest) -> Result<u8, Error> {
+    let alpha = surface.layout().blend.per_pixel_alpha;
+    let (_, first) = surface.scalers().next().ok_or(Error::Invalid)?;
+    if surface.scalers().any(|(_, s)| !s.ok) {
+        return Err(Error::Unsupported);
+    }
+    Ok(first.lb_memory_config(alpha) as u8)
 }
 /// Whether `surface` fits the blanked stream `blank` it is to be shown on:
 /// a full-frame plane the timing's own size, or a layout on that stream.

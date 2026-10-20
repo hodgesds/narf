@@ -82,6 +82,9 @@ struct ScanIo {
     /// Set once the lock has been requested (a cancellation point).
     lock_requested: Arc<AtomicBool>,
     pause_wait: bool,
+    /// Further pipes (by bit) whose planes latch with `pipe`'s timing: a
+    /// live display's overlays.
+    extra: u8,
 }
 impl ScanIo {
     fn get(&mut self, at: u64) -> u32 {
@@ -90,8 +93,19 @@ impl ScanIo {
     fn put(&mut self, at: u64, value: u32) {
         self.inner.inner.regs.insert(at, value);
     }
+    /// The pipes latching at the timing's VUPDATE.
+    fn latching(&self) -> alloc::vec::Vec<u8> {
+        let extra = self.extra;
+        core::iter::once(self.pipe)
+            .chain((0..4u8).filter(move |&q| extra & 1 << q != 0))
+            .collect()
+    }
     fn latch(&mut self) {
-        let p = self.pipe;
+        for p in self.latching() {
+            self.latch_pipe(p);
+        }
+    }
+    fn latch_pipe(&mut self, p: u8) {
         let low = self.get(h(p, ADDRESS));
         let high = self.get(h(p, ADDRESS_HIGH));
         self.put(h(p, EARLIEST_INUSE), low);
@@ -177,16 +191,18 @@ impl Io for ScanIo {
         if at == opp(p, DPG) {
             self.put(opp(p, DPG_PENDING), 1);
         }
-        if at == h(p, ADDRESS) {
-            let flip = self.get(h(p, FLIP)) | FLIP_PENDING;
-            self.put(h(p, FLIP), flip);
-        }
-        if at == h(p, HUBP_CONTROL) {
-            if value & BLANK_EN != 0 {
-                value |= NO_OUTSTANDING;
+        for q in self.latching() {
+            if at == h(q, ADDRESS) {
+                let flip = self.get(h(q, FLIP)) | FLIP_PENDING;
+                self.put(h(q, FLIP), flip);
             }
-            if value & HUBP_UNDERFLOW_CLEAR != 0 {
-                value &= !(0x7000_0000 | HUBP_UNDERFLOW_CLEAR);
+            if at == h(q, HUBP_CONTROL) {
+                if value & BLANK_EN != 0 {
+                    value |= NO_OUTSTANDING;
+                }
+                if value & HUBP_UNDERFLOW_CLEAR != 0 {
+                    value &= !(0x7000_0000 | HUBP_UNDERFLOW_CLEAR);
+                }
             }
         }
         if at == optc_input(p) && value & OPTC_UNDERFLOW_CLEAR != 0 {
@@ -354,6 +370,7 @@ fn chain(phy_index: u8, stream: u8, pipe: u8) -> alloc::boxed::Box<Chain> {
             underflow_after: None,
             writes: 0,
             lock_requested: Arc::new(AtomicBool::new(false)),
+            extra: 0,
         },
         authority: e.authority,
         layout: e.layout,
@@ -1124,3 +1141,6 @@ kernel_test_in!(
     "drivers/gpu/dcn401-scanout",
     dcn401_scanout_chain_moves_a_live_display_to_a_new_plan
 );
+
+#[path = "amdgpu_dcn401_plane_update_chain_tests.rs"]
+mod plane_update;

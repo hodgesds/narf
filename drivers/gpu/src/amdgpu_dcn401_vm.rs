@@ -119,7 +119,7 @@ fn global_registers(c: DisplayContext) -> [(u64, u32, u32); 13] {
         (0x55b, u32::MAX, c.root as u32),
     ]
 }
-fn pipe_registers(c: DisplayContext) -> [(u64, u32, u32); 3] {
+pub(super) fn pipe_registers(c: DisplayContext) -> [(u64, u32, u32); 3] {
     [
         (0x62c, 0x3fffffff, (c.fb_base >> 18) as u32),
         (0x62d, 0x3fffffff, (c.fb_top >> 18) as u32),

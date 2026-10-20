@@ -31,10 +31,15 @@ pub use cursor::{cursor_mode, plane_scale, CursorApplied, CursorMode, CursorUnde
 mod color;
 #[path = "amdgpu_dcn401_flip.rs"]
 mod flip;
+#[path = "amdgpu_dcn401_plane_update.rs"]
+mod plane_update;
 #[path = "amdgpu_dcn401_scanout.rs"]
 mod scanout;
 pub use color::{ColorProgram, GamutProgram, OgamProgram, PipeColor};
 pub use flip::FlipDone;
+pub use plane_update::{
+    plane_update_type, planes_update_type, LivePlanes, PlanesUpdated, UpdateType,
+};
 pub use scanout::{
     LivePipe, OverlayScanout, ScanoutPosition, ScanoutRunning, ScanoutUnderflow, VblankPhase,
 };

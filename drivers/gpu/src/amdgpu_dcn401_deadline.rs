@@ -54,7 +54,7 @@ pub struct DeadlinesApplied {
 
 /// `hubp401_vready_at_or_After_vsync`, with Linux's unsigned underflow
 /// (VREADY before the start of blank) treated as "before".
-fn vready_after_vsync(plan: &dml::Plan) -> bool {
+pub(super) fn vready_after_vsync(plan: &dml::Plan) -> bool {
     let (t, s) = (plan.mode.timing, plan.sync);
     let vblank_end = t.v_total - t.v_front_porch - t.v_active;
     let width = s.vready_offset + s.vupdate_width + s.vupdate_offset;
@@ -507,7 +507,7 @@ impl Surfaces {
 impl<I: Io> Engine<I> {
     /// optc1_program_global_sync and the VTG's VSTARTUP point for `plan`'s
     /// timing, or (with `verify`) that they hold.
-    fn global_sync_writes(&mut self, plan: Plan, verify: bool) -> Result<(), Error> {
+    pub(super) fn global_sync_writes(&mut self, plan: Plan, verify: bool) -> Result<(), Error> {
         let l = self.layout;
         let p = plan.request.pipe;
         let s = plan.request.sync;

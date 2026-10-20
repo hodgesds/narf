@@ -8,9 +8,9 @@ use crate::amdgpu_gmc_navi48::{DisplayContext, Gmc};
 
 /// HUBP_UNDERFLOW_STATUS (HUBP_CNTL bits 30:28).
 const HUBP_UNDERFLOW_STATUS: u32 = 0x7000_0000;
-const SEGMENTS: u8 = 21; // DCN4_01_CRB_SIZE_KB / DCN4_01_CRB_SEGMENT_SIZE_KB
-const DET_SEGMENTS: u8 = 5; // DCN4_01_DEFAULT_DET_SIZE = 320 KiB
-const SEGMENT_BYTES: u32 = 65536;
+pub(super) const SEGMENTS: u8 = 21; // DCN4_01_CRB_SIZE_KB / DCN4_01_CRB_SEGMENT_SIZE_KB
+pub(super) const DET_SEGMENTS: u8 = 5; // DCN4_01_DEFAULT_DET_SIZE = 320 KiB
+pub(super) const SEGMENT_BYTES: u32 = 65536;
 
 /// Overlay planes one display may stack above its primary: DCN401's
 /// max_slave_planes, as amdgpu_dm creates its overlay planes.
@@ -41,7 +41,7 @@ fn allocation(det: u8) -> [u8; 5] {
 }
 /// One HUBP's requestor, its VTG the timing's own OTG `vtg` (an ODM
 /// pipe's or overlay's HUBP follows the stream's timing).
-fn requestor(vtg: u8) -> [(u64, u32, u32); 7] {
+pub(super) fn requestor(vtg: u8) -> [(u64, u32, u32); 7] {
     [
         (0x66d, 0x7ff0, 0),  // packed RGB: no second plane in DET
         (0x620, 0xff, 0x56), // DRQ=2, CRQ/MRQ/PRQ=1
@@ -60,7 +60,7 @@ impl Layout {
     }
 }
 impl<I: Io> Engine<I> {
-    fn crb_stable(&mut self) -> Result<[u8; 5], Error> {
+    pub(super) fn crb_stable(&mut self) -> Result<[u8; 5], Error> {
         let mut sizes = [0; 5];
         for (index, size) in sizes.iter_mut().enumerate() {
             let v = self.read(self.layout.crb(index))?;
@@ -78,7 +78,7 @@ impl<I: Io> Engine<I> {
         }
         Ok(sizes)
     }
-    async fn resize_crb(
+    pub(super) async fn resize_crb(
         &mut self,
         sizes: &mut [u8; 5],
         index: usize,
@@ -128,7 +128,7 @@ impl<I: Io> Engine<I> {
     }
     /// Keep error/status acknowledgements and timeout IRQ ownership out of
     /// the setup RMWs. A pre-existing error requires explicit recovery.
-    fn hubp_faults(&mut self, p: u8, tolerated: u32) -> Result<(), Error> {
+    pub(super) fn hubp_faults(&mut self, p: u8, tolerated: u32) -> Result<(), Error> {
         if self.read(self.layout.hubp(p, HUBP_CONTROL))? & 0xfcf00800 & !tolerated != 0 {
             return Err(Error::Busy);
         }

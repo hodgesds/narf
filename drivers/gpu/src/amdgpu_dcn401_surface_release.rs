@@ -66,7 +66,7 @@ impl<I: Io> Engine<I> {
 
 impl Surface {
     /// Caller has proved CPU, display and other-engine access is excluded.
-    unsafe fn release(mut self) -> u64 {
+    pub(super) unsafe fn release(mut self) -> u64 {
         let mut bytes = 0;
         for memory in core::iter::once(&mut self.memory)
             .chain(self.back.iter_mut())

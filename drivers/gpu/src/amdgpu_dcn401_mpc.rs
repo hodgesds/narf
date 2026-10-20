@@ -143,19 +143,25 @@ impl Layout {
     /// Listed into a vector: an iterator would carry copies of the (large)
     /// layout in its state, which deep scanout paths cannot afford on a
     /// kernel stack.
-    fn mpc_rgb(&self, a: &MpcApplied) -> Vec<(u64, u32, u32)> {
+    pub(super) fn mpc_rgb(&self, a: &MpcApplied) -> Vec<(u64, u32, u32)> {
+        let mut list = Vec::new();
+        for (p, _, _) in a.dpp.surface.request.segments() {
+            list.extend(self.mpc_pipe(a, p));
+        }
+        list
+    }
+    /// `mpc_rgb`'s writes for the one pipe `p` of the plane.
+    pub(super) fn mpc_pipe(&self, a: &MpcApplied, p: u8) -> Vec<(u64, u32, u32)> {
         let mut list = Vec::new();
         let matrix = Self::ocsc_matrix(a);
-        for (p, _, _) in a.dpp.surface.request.segments() {
-            let ocsc = self.ocsc(p);
-            for w in self.mpc_full(a, p) {
-                if !(matrix.is_some() && w.0 == ocsc) {
-                    list.push(w);
-                }
+        let ocsc = self.ocsc(p);
+        for w in self.mpc_full(a, p) {
+            if !(matrix.is_some() && w.0 == ocsc) {
+                list.push(w);
             }
-            if let Some(m) = matrix {
-                list.extend_from_slice(&self.ocsc_load(p, m));
-            }
+        }
+        if let Some(m) = matrix {
+            list.extend_from_slice(&self.ocsc_load(p, m));
         }
         list
     }

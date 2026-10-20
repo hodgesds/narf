@@ -12,7 +12,11 @@ pub struct HubpPower {
 }
 
 impl<I: Io> Engine<I> {
-    fn hubp_transactions_stopped(&mut self, pipe: u8, staged: bool) -> Result<(), Error> {
+    pub(super) fn hubp_transactions_stopped(
+        &mut self,
+        pipe: u8,
+        staged: bool,
+    ) -> Result<(), Error> {
         let l = self.layout;
         self.auxiliary_fetchers_stopped(pipe)?;
         for (r, mask) in [
@@ -88,6 +92,19 @@ impl<I: Io> Engine<I> {
         self.fetchers_stopped()
     }
     async fn change_hubp_power(&mut self, request: HubpPower) -> Result<(), Error> {
+        self.gate_hubp(request).await?;
+        // Fresh evidence, including every unrelated domain and consumer.
+        // Acknowledged power-off is not permission to reuse any backing memory.
+        self.hubp_power_tree_stopped()?;
+        if self.hubp_powered(request.pipe)? != request.powered {
+            return Err(Error::Busy);
+        }
+        Ok(())
+    }
+    /// dcn32_hubp_pg_control and, powering up, hubp2_set_blank_regs with
+    /// the fetch clock around it: the domain's own sequence. Callers bring
+    /// the evidence about every other consumer.
+    pub(super) async fn gate_hubp(&mut self, request: HubpPower) -> Result<(), Error> {
         let l = self.layout;
         let p = request.pipe;
         let ip_request = l.base + 0xa0 * 4;
@@ -128,12 +145,7 @@ impl<I: Io> Engine<I> {
                 .await?;
             self.update(l.hubp(p, HUBP_CLOCK), 1, 0)?;
         }
-        // Fresh evidence, including every unrelated domain and consumer.
-        // Acknowledged power-off is not permission to reuse any backing memory.
-        self.hubp_power_tree_stopped()?;
-        if self.hubp_powered(p)? != request.powered
-            || self.read(ip_request)? & 1 != original_request
-        {
+        if self.read(ip_request)? & 1 != original_request {
             return Err(Error::Busy);
         }
         Ok(())

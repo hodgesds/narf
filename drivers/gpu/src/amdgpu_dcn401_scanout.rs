@@ -345,14 +345,14 @@ pub struct ScanoutUnderflow {
 }
 
 impl<I: Io> Engine<I> {
-    fn dpp_control(&self, pipe: u8) -> u64 {
+    pub(super) fn dpp_control(&self, pipe: u8) -> u64 {
         self.layout.base + (DPP_CONTROL + u64::from(pipe) * 0x16b) * 4
     }
     fn optc_input(&self, pipe: u8) -> u64 {
         self.layout.base + (OPTC_INPUT + u64::from(pipe) * 0x10) * 4
     }
     /// The only MPCC/DPP/OPP/OTG instance used for a pipe is the pipe itself.
-    fn routes(&self, pipe: u8, connected: bool) -> [(u64, u32); 5] {
+    pub(super) fn routes(&self, pipe: u8, connected: bool) -> [(u64, u32); 5] {
         let l = self.layout;
         let p = u32::from(pipe);
         let sel = |v: u32| if connected { v } else { 0xf };
@@ -470,7 +470,7 @@ impl<I: Io> Engine<I> {
         })
         .await
     }
-    async fn latched(
+    pub(super) async fn latched(
         &mut self,
         p: Pipe,
         mut done: impl FnMut(&mut Self) -> Result<Option<u64>, Error>,
@@ -500,7 +500,7 @@ impl<I: Io> Engine<I> {
             narf_time::SleepUntil::new(narf_time::Deadline::after_us(10).as_instant()).await;
         }
     }
-    async fn fresh_frames(&mut self, p: Pipe) -> Result<(u32, u32), Error> {
+    pub(super) async fn fresh_frames(&mut self, p: Pipe) -> Result<(u32, u32), Error> {
         let at = self.layout.otg(p.pipe, FRAME_COUNT);
         let before = self.read(at)? & FRAME_MASK;
         let mut seen = 0;
@@ -551,7 +551,7 @@ impl<I: Io> Engine<I> {
     }
     /// `in_use` for every pipe of the scanout at the address it fetches:
     /// the first still waiting.
-    fn all_in_use(&mut self, p: Pipe) -> Result<Option<u64>, Error> {
+    pub(super) fn all_in_use(&mut self, p: Pipe) -> Result<Option<u64>, Error> {
         for (q, address) in p.fetches() {
             if let Some(at) = self.in_use(q, address)? {
                 return Ok(Some(at));
@@ -583,7 +583,7 @@ impl<I: Io> Engine<I> {
     /// fetching a surface at `address`: a 4:2:0 surface's chroma first, then
     /// the luma (or RGB) address, each high half before the low one, whose
     /// write latches the flip.
-    fn write_fetch_address(&mut self, q: u8, address: u64) -> Result<(), Error> {
+    pub(super) fn write_fetch_address(&mut self, q: u8, address: u64) -> Result<(), Error> {
         let l = self.layout;
         if let Some(offset) = self.chroma_offset(q) {
             let c = address + offset;

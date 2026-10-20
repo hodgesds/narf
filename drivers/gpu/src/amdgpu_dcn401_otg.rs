@@ -18,6 +18,7 @@ pub use opp::{BlankApplied, BlankRequest, BlankRunning, ColorDepth};
 #[path = "amdgpu_dcn401_fetch.rs"]
 mod fetch;
 pub use fetch::{cursor_mode, plane_scale, CursorMode, CursorUnder};
+pub use fetch::{plane_update_type, planes_update_type, LivePlanes, PlanesUpdated, UpdateType};
 pub use fetch::{
     Blend, ColorProgram, CursorApplied, DeadlinesApplied, DppApplied, FlipDone, GamutProgram,
     HubpPower, LivePipe, MemoryApplied, MpcApplied, OgamProgram, OverlayScanout, PipeColor,
@@ -231,6 +232,10 @@ pub enum State {
     /// A live scanout's non-modeset stream update (CRTC color, HDR
     /// metadata) under its OTG lock; cancellation quarantines the pipe.
     UpdatingStream(u8),
+    /// A live scanout's plane update (DC's medium or full update, planes
+    /// added or removed) under its OTG lock, the timing running throughout;
+    /// cancellation or failure quarantines the pipe.
+    UpdatingPlanes(u8),
     Cursor(u8),
     Retiring(u8),
     Retired,
