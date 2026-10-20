@@ -2663,7 +2663,8 @@ impl ColdBoot {
         }
     }
     /// Start black 128b/132b video on the port's trained UHBR link through
-    /// HPO stream encoder `stream`, from `pipe`'s prepared timing.
+    /// HPO stream encoder `stream`, from `pipe`'s prepared timing, sending
+    /// the VSC/HDR SDPs `sdp` asks for.
     /// # Safety
     /// Fulfil `Otg::start_uhbr_video` obligations.
     pub async unsafe fn start_display_uhbr_video(
@@ -2671,6 +2672,7 @@ impl ColdBoot {
         port: usize,
         stream: u8,
         pipe: u8,
+        sdp: otg::UhbrSdp,
     ) -> Result<otg::UhbrVideoRunning, otg::Error> {
         let path = self.dp_phy_path(port)?;
         // SAFETY: retained matching owners; caller excludes external writers.
@@ -2685,6 +2687,7 @@ impl ColdBoot {
                     path,
                     stream,
                     pipe,
+                    sdp,
                 )
                 .await
         }
@@ -2709,7 +2712,7 @@ impl ColdBoot {
     }
     /// Prepare the selected display's MST stream on the port's 128b/132b
     /// MST link through HPO stream encoder `stream`, from `pipe`'s prepared
-    /// timing, blank, for a payload of `slots`.
+    /// timing, blank, for a payload of `slots`, with the VSC/HDR SDPs `sdp`.
     /// # Safety
     /// Fulfil `Otg::prepare_uhbr_mst_stream` obligations.
     pub async unsafe fn prepare_display_uhbr_mst_stream(
@@ -2718,6 +2721,7 @@ impl ColdBoot {
         stream: u8,
         pipe: u8,
         slots: u8,
+        sdp: otg::UhbrSdp,
     ) -> Result<otg::UhbrVideoRunning, otg::Error> {
         let path = self.dp_phy_path(port)?;
         // SAFETY: retained matching owners; caller excludes external writers.
@@ -2732,6 +2736,7 @@ impl ColdBoot {
                     stream,
                     pipe,
                     slots,
+                    sdp,
                 )
                 .await
         }

@@ -421,8 +421,9 @@ impl Otg {
     }
     /// New HDR static metadata for display `pipe`'s running stream, which
     /// already sends HDR packets (the stream update amdgpu_dm makes when
-    /// metadata changes while HDR stays on): the HDMI DRM InfoFrame or the
-    /// DP HDR SDP rewritten with an immediate update. `Invalid` for a
+    /// metadata changes while HDR stays on): the HDMI DRM InfoFrame (TMDS
+    /// generic packet 4 or the FRL encoder's packet 4) or the DP HDR SDP
+    /// (DIO or HPO packet 3) rewritten with an immediate update. `Invalid` for a
     /// stream without HDR packets (entering or leaving HDR is a modeset)
     /// or a packet of the other kind; `Busy` without running video.
     /// # Safety
@@ -444,6 +445,11 @@ impl Otg {
                 .status
                 .dp_video_running
                 .is_some_and(|v| v.frontend.request.stream == s && v.frontend.request.pipe == pipe),
+            State::UhbrVideoRunning(s) => e
+                .status
+                .uhbr_video_running
+                .is_some_and(|v| v.stream == s && v.timing.blank.request.pipe == pipe),
+            State::FrlVideoRunning(p) => p == pipe && e.status.frl_video_running.is_some(),
             _ => false,
         };
         if !live {
@@ -451,11 +457,22 @@ impl Otg {
         }
         // The DRM InfoFrame's type sits in HB0; the SDP's in HB1.
         let hdmi = packet.hb[0] == 0x87;
-        let result = match (e.status.hdmi_video_running, e.status.dp_video_running) {
-            (Some(v), _) if v.link.request.pipe == pipe && hdmi => e.hdmi_update_hdr(packet).await,
-            (_, Some(v)) if v.frontend.request.pipe == pipe && !hdmi => {
-                e.dp_update_hdr(packet).await
-            }
+        let s = &e.status;
+        let tmds = s
+            .hdmi_video_running
+            .is_some_and(|v| v.link.request.pipe == pipe);
+        let frl = s.frl_video_running.is_some_and(|v| v.request.pipe == pipe);
+        let dio = s
+            .dp_video_running
+            .is_some_and(|v| v.frontend.request.pipe == pipe);
+        let hpo = s
+            .uhbr_video_running
+            .is_some_and(|v| v.timing.blank.request.pipe == pipe);
+        let result = match (hdmi, tmds, frl, dio, hpo) {
+            (true, true, ..) => e.hdmi_update_hdr(packet).await,
+            (true, _, true, ..) => e.frl_update_hdr(packet).await,
+            (false, _, _, true, _) => e.dp_update_hdr(packet).await,
+            (false, .., true) => e.uhbr_update_hdr(packet).await,
             _ => return Err(Error::Invalid),
         };
         if let Err(err) = result {
@@ -476,7 +493,15 @@ impl Otg {
             .dp_video_running
             .filter(|v| v.frontend.request.pipe == pipe)
             .and_then(|v| v.frontend.request.hdr);
-        hdmi.or(dp)
+        let frl = s
+            .frl_video_running
+            .filter(|v| v.request.pipe == pipe)
+            .and_then(|v| v.request.hdr);
+        let hpo = s
+            .uhbr_video_running
+            .filter(|v| v.timing.blank.request.pipe == pipe)
+            .and_then(|v| v.sdp.hdr);
+        hdmi.or(dp).or(frl).or(hpo)
     }
 }
 

@@ -12,7 +12,7 @@ pub(super) mod training;
 pub use training::{
     uhbr_mst_dsc_rate, uhbr_mst_rate, DpDriveSettings, DpFrontendReady, DpFrontendRequest,
     DpLinkStatus, DpLinkTrained, DpTrainingError, DpVideoRunning, UhbrLinkTrained, UhbrPayload,
-    UhbrSettings, UhbrVideoRunning,
+    UhbrSdp, UhbrSettings, UhbrVideoRunning,
 };
 
 const LANES_MASK: u32 = 0x3e3e3e3e;

@@ -942,7 +942,8 @@ fn select_mst_with_budget(
             vrr: None,
             format: otg::SurfaceFormat::Xrgb8888,
             planes: modeset::PlaneSetup::NONE,
-            // MST connectors carry neither Colorspace nor HDR metadata here.
+            // The connector's Colorspace and HDR metadata (and the root's
+            // VSC colorimetry support) are set when the route is planned.
             colorspace: 0,
             hdr: None,
             vsc_colorimetry: false,
@@ -1187,12 +1188,20 @@ impl ColdBoot {
             .map_err(|_| ModesetError::NoSink)?
             .get(port)
             .ok_or(ModesetError::NoSink)?;
-        let caps = ports
+        let root = ports
             .iter()
             .find(|p| p.path == path)
-            .and_then(|p| p.sink.as_ref().ok())
+            .and_then(|p| p.sink.as_ref().ok());
+        let caps = root
             .and_then(|sink| modeset::dp_caps(&path, sink))
             .ok_or(ModesetError::NoSink)?;
+        // create_stream_for_sink's use_vsc_sdp_for_colorimetry reads the
+        // stream's link (the root branch's DPCD), MST or not.
+        let vsc_colorimetry = root.is_some_and(|sink| {
+            sink.dpcd.as_ref().is_some_and(|d| {
+                crate::amdgpu_hdr::use_vsc_sdp_for_colorimetry(d[0], sink.dprx_feature)
+            })
+        });
         let assigned: Vec<_> = slots
             .iter()
             .map(|&k| route.pipes.get(k).copied().flatten())
@@ -1215,7 +1224,7 @@ impl ColdBoot {
             // `refine_dsc` checks the shapes against them.
             max_dispclk_khz: modeset::NOMINAL_DISPCLK_KHZ,
         };
-        let selections = select_mst_outputs_with(
+        let mut selections = select_mst_outputs_with(
             port,
             caps,
             &devices,
@@ -1224,6 +1233,9 @@ impl ColdBoot {
             &budget,
             Some(&ctx),
         );
+        for (s, _) in selections.iter_mut() {
+            s.vsc_colorimetry = vsc_colorimetry;
+        }
         if let Some(link) = self.mst.get_mut(&port) {
             for output in link.outputs.iter_mut().flatten() {
                 output.modes.clear();
@@ -1329,11 +1341,26 @@ impl ColdBoot {
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Link);
             if uhbr {
-                self.prepare_display_uhbr_mst_stream(port, pipe, pipe, stream.slots)
-                    .await?;
+                self.prepare_display_uhbr_mst_stream(
+                    port,
+                    pipe,
+                    pipe,
+                    stream.slots,
+                    selection.uhbr_sdp(),
+                )
+                .await?;
             } else {
-                self.prepare_display_dp_frontend(port, otg::DpFrontendRequest::new(pipe, pipe))
-                    .await?;
+                // The stream's VSC/HDR SDPs, as for SST (enc401's
+                // update_dp_info_packets serves DIO MST streams too).
+                self.prepare_display_dp_frontend(
+                    port,
+                    otg::DpFrontendRequest {
+                        vsc_colorimetry: selection.vsc_colorimetry,
+                        hdr: selection.hdr_packet(),
+                        ..otg::DpFrontendRequest::new(pipe, pipe)
+                    },
+                )
+                .await?;
             }
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Frontend);

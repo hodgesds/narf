@@ -104,6 +104,13 @@ fn answer(input: &str) -> Option<String> {
                 a.c, a.ec, a.q, a.yq
             );
         }
+        "hpo" => {
+            let cs = DcColorSpace::from_linux(num(1)?)?;
+            let enc = encoding(num(2)?)?;
+            let bpc = u8::try_from(num(3)?).ok()?;
+            let (m0, m1) = hpo_msa_misc(cs, enc, bpc, num(4)? != 0);
+            let _ = write!(out, "msa {m0} {m1}");
+        }
         _ => return None,
     }
     Some(out)

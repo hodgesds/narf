@@ -2355,9 +2355,8 @@ struct CrtcState {
     /// DRM's CRTC CTM and GAMMA_LUT as the color they program (None:
     /// amdgpu_dm's bypass). Kept across relights.
     color: Option<Arc<crate::amdgpu_dcn401_otg::ColorProgram>>,
-    /// What the lit stream can signal: HDR packets (DIO HDMI TMDS and DP
-    /// 8b/10b SST) and non-default colorimetry (also FRL; not 128b/132b,
-    /// whose VSC SDP is not sent here).
+    /// What the lit stream can signal: HDR packets and non-default
+    /// colorimetry. Every native transport now sends both.
     color_signals: (bool, bool),
 }
 impl CrtcState {
@@ -2788,8 +2787,9 @@ async unsafe fn adopt(boot: &mut boot::ColdBoot, m: &Modeset) {
         c.shown = Some((s.edid, s.timing, offered));
         c.admitted = Some((m.plan.soc, m.plan.mode));
         c.retiring = false;
-        let dio = !s.uhbr() && s.mst.is_none();
-        c.color_signals = (dio && s.frl.is_none(), dio);
+        // Every native transport signals both: DIO (TMDS, 8b/10b SST and
+        // MST) and HPO (128b/132b SST and MST, FRL) streams.
+        c.color_signals = (true, true);
     }
 }
 
@@ -3803,11 +3803,12 @@ fn color_program(
     (program != crate::amdgpu_dcn401_otg::ColorProgram::default()).then_some(program)
 }
 
-/// The connectors amdgpu_dm gives Colorspace and HDR_OUTPUT_METADATA that
-/// this owner signals for: the board's HDMI and DP ones (an MST device's
-/// stream sends neither here).
+/// The connectors amdgpu_dm gives Colorspace and HDR_OUTPUT_METADATA: the
+/// board's HDMI and DP ones and, as dm_dp_add_mst_connector attaches the
+/// root's colorspace property and amdgpu_dm_connector_init_helper the HDR
+/// metadata property, every MST end device's.
 fn color_connector(target: Target) -> bool {
-    matches!(target, Target::Board(_))
+    matches!(target, Target::Board(_) | Target::Mst(..))
 }
 
 /// Record DRM's "Colorspace" and HDR_OUTPUT_METADATA for connector
@@ -3865,9 +3866,9 @@ fn connector_color(
 }
 
 /// Whether connector `connector`'s lit stream can carry `colorspace` and,
-/// with `hdr`, HDR packets: HDR goes out on DIO streams (HDMI TMDS, DP
-/// 8b/10b SST), colorimetry also over FRL; a 128b/132b stream carries
-/// neither here. A dark connector accepts both for its next lighting.
+/// with `hdr`, HDR packets: every lit transport (HDMI TMDS and FRL, DP
+/// 8b/10b and 128b/132b, SST and MST) carries both. A dark connector
+/// accepts both for its next lighting.
 pub fn connector_color_supported(connector: u32, colorspace: u32, hdr: bool) -> bool {
     let Some(index) = crate::amdgpu_navi48_kms::connector_index(connector) else {
         return true;
@@ -5361,7 +5362,7 @@ mod tests {
         if connector_color(&o, 0) != (9, None) {
             return TestResult::Fail("malformed metadata");
         }
-        if !color_connector(target) || color_connector(Target::Mst(0, 0)) {
+        if !color_connector(target) || !color_connector(Target::Mst(0, 0)) {
             return TestResult::Fail("color connectors");
         }
         TestResult::Pass

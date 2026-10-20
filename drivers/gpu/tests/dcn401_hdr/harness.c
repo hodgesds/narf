@@ -20,6 +20,9 @@
  *     set_avi_info_frame's C/EC/Q/YQ, enc401's MSA MISC0/MISC1 and
  *     mod_build_vsc_infopacket: "avi <c> <ec> <q> <yq> msa <misc0> <misc1>
  *     vsc <-|36 bytes hex>"
+ *   hpo <dc_color_space> <dc_pixel_encoding> <bpc> <vsc>
+ *     dcn31_hpo_dp_stream_enc_set_stream_attribute's MISC0/MISC1 (the
+ *     128b/132b stream's MSA6/MSA7 lane 3): "msa <misc0> <misc1>"
  * `--generate` prints "input = output" for the deterministic vector set.
  */
 #include <stdio.h>
@@ -295,6 +298,17 @@ static void q_sig(unsigned cs, unsigned enc, unsigned bpc, int qs, int gamma22, 
 		avi.bits.Q0_Q1, avi.bits.YQ0_YQ1, m0, m1, v);
 }
 
+static void q_hpo(unsigned cs, unsigned enc, unsigned bpc, int vsc, char *out)
+{
+	struct dc_crtc_timing t = { 0 };
+	uint32_t m0, m1;
+
+	t.pixel_encoding = enc;
+	t.display_color_depth = depth(bpc);
+	hpo_msa_misc(&t, cs, vsc, &m0, &m1);
+	sprintf(out, "msa %u %u", m0, m1);
+}
+
 static void answer(char *line, char *out)
 {
 	char kind[8], a[2048], b[2048];
@@ -311,6 +325,8 @@ static void answer(char *line, char *out)
 	else if (sscanf(line, "sig %u %u %u %u %u %u %x", &n[0], &n[1], &n[2], &n[3], &n[4],
 			&n[5], &n[6]) == 7)
 		q_sig(n[0], n[1], n[2], n[3], n[4], n[5], n[6], out);
+	else if (sscanf(line, "hpo %u %u %u %u", &n[0], &n[1], &n[2], &n[3]) == 4)
+		q_hpo(n[0], n[1], n[2], n[3], out);
 	else
 		strcpy(out, "?");
 }
@@ -477,6 +493,15 @@ static void generate(void)
 						sprintf(in, "sig %u %u %u %d %d %d %x", cs, enc, bpcs[b], qs, g, vsc, m1);
 						emit(in);
 					}
+
+	/* The 128b/132b stream's MSA MISC bytes */
+	for (unsigned cs = 0; cs <= COLOR_SPACE_YCBCR709_BLACK; cs++)
+		for (unsigned enc = PIXEL_ENCODING_RGB; enc <= PIXEL_ENCODING_YCBCR420; enc++)
+			for (unsigned b = 0; b < 5; b++)
+				for (int vsc = 0; vsc < 2; vsc++) {
+					sprintf(in, "hpo %u %u %u %d", cs, enc, bpcs[b], vsc);
+					emit(in);
+				}
 }
 
 int main(int argc, char **argv)

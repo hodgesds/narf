@@ -2308,6 +2308,14 @@ impl Selection {
             .as_ref()
             .map(|m| crate::amdgpu_hdr::hdr_info_packet(Some(m), connector))
     }
+    /// The VSC/HDR SDPs a 128b/132b stream sends (resource_build_info_frame
+    /// for a DP signal).
+    pub fn uhbr_sdp(&self) -> otg::UhbrSdp {
+        otg::UhbrSdp {
+            vsc_colorimetry: self.vsc_colorimetry,
+            hdr: self.hdr_packet(),
+        }
+    }
     /// A 128b/132b (UHBR) DP link.
     pub fn uhbr(&self) -> bool {
         matches!(self.rate, DpRate::Uhbr(_))
@@ -3468,7 +3476,9 @@ impl ColdBoot {
             }
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Link);
-            let video = self.start_display_uhbr_video(port, pipe, pipe).await?;
+            let video = self
+                .start_display_uhbr_video(port, pipe, pipe, selection.uhbr_sdp())
+                .await?;
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Video);
             // As for 8b/10b SST: enable_stream_features after the stream runs.
@@ -3528,6 +3538,7 @@ impl ColdBoot {
                 hc_active,
                 hc_blank,
                 avi: selection.avi,
+                hdr: selection.hdr_packet(),
             };
             self.start_display_frl_video(port, request).await?;
             self.teardowns

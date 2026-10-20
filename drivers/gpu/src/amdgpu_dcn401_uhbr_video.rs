@@ -7,6 +7,11 @@
 //! pixel format, has the sink decode DSC and its PPS sent through the
 //! stream's VPG, and its VC payload sized for the compressed bandwidth.
 //!
+//! The stream's info packets follow dcn31_hpo_dp_stream_enc_update_dp_info_packets:
+//! a VSC SDP carrying colorimetry in VPG generic packet 0 (GSP0) and HDR
+//! static metadata in packet 3 (GSP3), each written with an immediate
+//! update, with MSA MISC1 bit 6 saying the VSC SDP carries colorimetry.
+//!
 //! The DCCG half (DPSTREAMCLK from the pipe, SYMCLK32_SE from the PHY) is
 //! the clock owner's; this owner requires and rechecks it.
 use super::*;
@@ -181,6 +186,37 @@ fn mst_rate_for(
     let hblank = u16::try_from(mtps.mul(avg).floor()).ok()?;
     Some((x << 25 | y, hblank))
 }
+/// The info packets a 128b/132b stream sends, as resource_build_info_frame
+/// gives them for a DP signal: the VSC SDP when the sink takes colorimetry
+/// in it (use_vsc_sdp_for_colorimetry; mod_build_vsc_infopacket from the
+/// stream's color space and depth) and amdgpu_dm's HDR metadata SDP.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UhbrSdp {
+    pub vsc_colorimetry: bool,
+    pub hdr: Option<crate::amdgpu_hdr::InfoPacket>,
+}
+impl UhbrSdp {
+    /// mod_build_vsc_infopacket for the stream's blank format (RGB).
+    fn vsc(&self, blank: BlankApplied) -> Option<crate::amdgpu_hdr::InfoPacket> {
+        crate::amdgpu_hdr::vsc_sdp(
+            self.vsc_colorimetry,
+            blank.request.colorspace,
+            crate::amdgpu_hdr::PixelEncoding::Rgb,
+            depth_bpc(blank.request.depth) as u8,
+            false,
+        )
+    }
+    /// GSP0 (VSC), GSP2 (SPD), GSP3 (HDR) and GSP5 (adaptive sync)
+    /// continuous transmission as update_dp_info_packets sets them.
+    fn enables(&self, blank: BlankApplied) -> [u32; 4] {
+        [
+            u32::from(self.vsc(blank).is_some()),
+            0,
+            u32::from(self.hdr.is_some()),
+            0,
+        ]
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UhbrVideoRunning {
     pub link: UhbrLinkTrained,
@@ -190,6 +226,8 @@ pub struct UhbrVideoRunning {
     pub payload: UhbrPayload,
     /// The sink acknowledged the payload table and the allocation change.
     pub acknowledged: bool,
+    /// The VSC/HDR SDPs the stream sends.
+    pub sdp: UhbrSdp,
 }
 fn depth_bpc(depth: ColorDepth) -> u32 {
     match depth {
@@ -199,8 +237,9 @@ fn depth_bpc(depth: ColorDepth) -> u32 {
     }
 }
 /// dcn31_hpo_dp_stream_enc_set_stream_attribute's whole-register values:
-/// pixel format, then MSA0..8 (lane k in bits 8k+7:8k).
-fn stream_attributes(blank: BlankApplied) -> [(u64, u32); 10] {
+/// pixel format, then MSA0..8 (lane k in bits 8k+7:8k), MISC1 saying
+/// whether the VSC SDP carries colorimetry.
+fn stream_attributes(blank: BlankApplied, vsc: bool) -> [(u64, u32); 10] {
     let t = blank.timing.request.timing;
     let depth = depth_bpc(blank.request.depth);
     let (field, misc_depth) = match depth {
@@ -208,15 +247,13 @@ fn stream_attributes(blank: BlankApplied) -> [(u64, u32); 10] {
         10 => (2, 0x40),
         _ => (3, 0x60),
     };
-    // enc401's MISC0 for the output color space (no VSC SDP on HPO here).
-    let misc0 = crate::amdgpu_hdr::msa_misc(
+    // The HPO encoder's MISC0/MISC1 for the output color space.
+    let (misc0, misc1) = crate::amdgpu_hdr::hpo_msa_misc(
         blank.request.colorspace,
         crate::amdgpu_hdr::PixelEncoding::Rgb,
         depth as u8,
-        false,
-        0,
-    )
-    .0;
+        vsc,
+    );
     debug_assert_eq!(misc0 & 0xe0, misc_depth);
     // PIXEL_ENCODING_TYPE: compressed for a DSC stream.
     let compressed = u32::from(blank.timing.request.dsc.is_some());
@@ -250,7 +287,12 @@ fn stream_attributes(blank: BlankApplied) -> [(u64, u32); 10] {
         ),
         (
             MSA + 7,
-            lanes([hsp | t.h_sync_width >> 8, vsp | t.v_sync_width >> 8, 0, 0]),
+            lanes([
+                hsp | t.h_sync_width >> 8,
+                vsp | t.v_sync_width >> 8,
+                0,
+                misc1,
+            ]),
         ),
         (
             MSA + 8,
@@ -369,6 +411,87 @@ impl<I: Io> Engine<I> {
         self.uhbr_write(at(VC_RATE + u64::from(stream)), rate)?;
         self.wait(at(0x36b5), 0x1000, 0, 1000).await
     }
+    /// vpg3_update_generic_info_packet(index, packet, immediate) on HPO
+    /// stream encoder `stream`'s VPG.
+    async fn uhbr_packet(
+        &mut self,
+        stream: u8,
+        index: u32,
+        packet: crate::amdgpu_hdr::InfoPacket,
+    ) -> Result<(), Error> {
+        let l = self.layout;
+        let at = move |r| DpStream::Hpo(stream).at(l, r);
+        self.wait(at(VPG_STATUS), 2, 0, 500).await?;
+        self.access(|io| {
+            // CONFLICT_CLR and the data port are commands, not state.
+            let status = checked(io.read(at(VPG_STATUS)))?;
+            io.write(at(VPG_STATUS), status | 0x10);
+            let access = checked(io.read(at(VPG_ACCESS)))?;
+            io.write(at(VPG_ACCESS), (access & !0xff) | (index * 9));
+            for word in packet.words() {
+                io.write(at(VPG_DATA), word);
+            }
+            let immediate = checked(io.read(at(VPG_IMMEDIATE)))?;
+            io.write(at(VPG_IMMEDIATE), immediate | 1 << index);
+            Ok(())
+        })
+    }
+    /// dcn31_hpo_dp_stream_enc_update_dp_info_packets: the VSC SDP in
+    /// packet 0 and the HDR SDP in packet 3 (each with an immediate update),
+    /// then GSP0/GSP2/GSP3/GSP5 continuous transmission for exactly the
+    /// valid ones and the secondary data path on.
+    async fn uhbr_infopackets(
+        &mut self,
+        stream: u8,
+        blank: BlankApplied,
+        sdp: UhbrSdp,
+    ) -> Result<(), Error> {
+        let l = self.layout;
+        let at = |r| DpStream::Hpo(stream).at(l, r);
+        if let Some(vsc) = sdp.vsc(blank) {
+            self.uhbr_packet(stream, 0, vsc).await?;
+        }
+        if let Some(hdr) = sdp.hdr {
+            self.uhbr_packet(stream, 3, hdr).await?;
+        }
+        for (reg, on) in GSP.into_iter().zip(sdp.enables(blank)) {
+            self.update(at(reg), 1, on)?;
+        }
+        self.update(at(SDP), 1, 1)
+    }
+    /// The info packets' transmission enables as `sdp` sets them.
+    fn uhbr_infopackets_verify(
+        &mut self,
+        stream: u8,
+        blank: BlankApplied,
+        sdp: UhbrSdp,
+    ) -> Result<(), Error> {
+        let l = self.layout;
+        let at = |r| DpStream::Hpo(stream).at(l, r);
+        for (reg, on) in GSP.into_iter().zip(sdp.enables(blank)) {
+            if self.read(at(reg))? & 1 != on {
+                return Err(Error::Readback(at(reg)));
+            }
+        }
+        Ok(())
+    }
+    /// New HDR metadata on the running 128b/132b stream (amdgpu_dm's
+    /// hdr_static_metadata stream update): packet 3 rewritten with an
+    /// immediate update. Only a stream already sending the HDR SDP takes
+    /// new contents; entering or leaving HDR is a modeset.
+    pub(in crate::amdgpu_dcn401_otg) async fn uhbr_update_hdr(
+        &mut self,
+        packet: crate::amdgpu_hdr::InfoPacket,
+    ) -> Result<(), Error> {
+        let mut running = self.status.uhbr_video_running.ok_or(Error::Invalid)?;
+        if running.sdp.hdr.is_none() || !packet.valid {
+            return Err(Error::Invalid);
+        }
+        self.uhbr_packet(running.stream, 3, packet).await?;
+        running.sdp.hdr = Some(packet);
+        self.status.uhbr_video_running = Some(running);
+        Ok(())
+    }
     /// dcn31_hpo_dp_stream_enc_set_dsc_pps_info_packet(true, immediate):
     /// GSP11 in 128-byte mode (payload size 3), the packed PPS in the
     /// stream VPG's generic packets 11-14 (type 0x10, 127 bytes) as
@@ -484,6 +607,7 @@ impl<I: Io> Engine<I> {
         stream: u8,
         blank: BlankApplied,
         timeout: u64,
+        sdp: UhbrSdp,
     ) -> Result<BlankRunning, Error> {
         let l = self.layout;
         let at = |r| DpStream::Hpo(stream).at(l, r);
@@ -494,7 +618,7 @@ impl<I: Io> Engine<I> {
         // Stream attributes, single-buffered for a stream being enabled.
         self.update(at(MSA_DOUBLE_BUFFER), 1, 0)?;
         self.update(at(FORMAT_DOUBLE_BUFFER), 1, 0)?;
-        for (reg, value) in stream_attributes(blank) {
+        for (reg, value) in stream_attributes(blank, sdp.vsc_colorimetry) {
             if reg == PIXEL_FORMAT {
                 self.update(at(reg), 0x331, value)?;
             } else {
@@ -503,11 +627,9 @@ impl<I: Io> Engine<I> {
         }
         self.uhbr_stream_enable(stream).await?;
         self.update(self.stream_mapper(stream), 7, u32::from(link.link))?;
-        // update_dp_info_packets with no packet: GSPs off, SDP path on.
-        for reg in GSP {
-            self.update(at(reg), 1, 0)?;
-        }
-        self.update(at(SDP), 1, 1)?;
+        // dcn401_enable_stream's update_info_frame: the VSC/HDR SDPs (or
+        // none: GSPs off), SDP path on.
+        self.uhbr_infopackets(stream, blank, sdp).await?;
         self.uhbr_video_verify(link, stream, blank, false)?;
         let timing = self.enable_blank(blank, timeout).await?;
         self.uhbr_video_verify(link, stream, blank, true)?;
@@ -534,12 +656,13 @@ impl<I: Io> Engine<I> {
         stream: u8,
         blank: BlankApplied,
         payload: UhbrPayload,
+        sdp: UhbrSdp,
     ) -> Result<UhbrVideoRunning, Error> {
         let timeout = blank.timeout_us()?;
         let l = self.layout;
         let at = |r| DpStream::Hpo(stream).at(l, r);
         let timing = self
-            .uhbr_stream_prepare(&link, stream, blank, timeout)
+            .uhbr_stream_prepare(&link, stream, blank, timeout, sdp)
             .await?;
         self.uhbr_dsc_start(io, link.path, stream, &blank.timing.request)
             .await?;
@@ -557,6 +680,7 @@ impl<I: Io> Engine<I> {
             timing,
             payload,
             acknowledged: table && act,
+            sdp,
         };
         self.uhbr_stream_unblank(running, timeout).await
     }
@@ -628,6 +752,19 @@ impl<I: Io> Engine<I> {
         pipe: u8,
         clock: dccg::Applied,
     ) -> Result<UhbrVideoRunning, Error> {
+        self.start_uhbr_video_with(io, path, stream, pipe, clock, UhbrSdp::default())
+            .await
+    }
+    /// `start_uhbr_video` sending the VSC/HDR SDPs `sdp` asks for.
+    pub(in crate::amdgpu_dcn401_otg) async fn start_uhbr_video_with(
+        &mut self,
+        io: &mut impl UhbrTransport,
+        path: Path,
+        stream: u8,
+        pipe: u8,
+        clock: dccg::Applied,
+        sdp: UhbrSdp,
+    ) -> Result<UhbrVideoRunning, Error> {
         if !io.ready() {
             return Err(Error::Busy);
         }
@@ -644,7 +781,7 @@ impl<I: Io> Engine<I> {
         .ok_or(Error::Unsupported)?;
         self.status.state = State::StartingUhbrVideo(stream);
         match self
-            .uhbr_video_start(io, link, stream, blank, payload)
+            .uhbr_video_start(io, link, stream, blank, payload, sdp)
             .await
         {
             Ok(running) => {
@@ -671,6 +808,19 @@ impl<I: Io> Engine<I> {
         clock: dccg::Applied,
         slots: u8,
     ) -> Result<UhbrVideoRunning, Error> {
+        self.prepare_uhbr_mst_stream_with(path, stream, pipe, clock, slots, UhbrSdp::default())
+            .await
+    }
+    /// `prepare_uhbr_mst_stream` sending the VSC/HDR SDPs `sdp` asks for.
+    pub(in crate::amdgpu_dcn401_otg) async fn prepare_uhbr_mst_stream_with(
+        &mut self,
+        path: Path,
+        stream: u8,
+        pipe: u8,
+        clock: dccg::Applied,
+        slots: u8,
+        sdp: UhbrSdp,
+    ) -> Result<UhbrVideoRunning, Error> {
         let (link, blank) = self.uhbr_video_request(path, stream, pipe, clock, true)?;
         let request = blank.timing.request;
         let (vc_rate, hblank_symbols) = match request.dsc {
@@ -689,7 +839,7 @@ impl<I: Io> Engine<I> {
         self.status.state = State::StartingUhbrVideo(stream);
         let result = async {
             let timing = self
-                .uhbr_stream_prepare(&link, stream, blank, timeout)
+                .uhbr_stream_prepare(&link, stream, blank, timeout, sdp)
                 .await?;
             let ready = UhbrVideoRunning {
                 link,
@@ -701,6 +851,7 @@ impl<I: Io> Engine<I> {
                     hblank_symbols,
                 },
                 acknowledged: false,
+                sdp,
             };
             self.uhbr_stream_verify_ready(&ready)?;
             Ok(ready)
@@ -782,12 +933,13 @@ impl<I: Io> Engine<I> {
         if self.read(self.stream_mapper(v.stream))? & 7 != u32::from(v.link.link) {
             return Err(Error::Readback(self.stream_mapper(v.stream)));
         }
-        for (reg, value) in stream_attributes(v.timing.blank) {
+        for (reg, value) in stream_attributes(v.timing.blank, v.sdp.vsc_colorimetry) {
             let mask = if reg == PIXEL_FORMAT { 0x331 } else { u32::MAX };
             if self.read(at(reg))? & mask != value {
                 return Err(Error::Readback(at(reg)));
             }
         }
+        self.uhbr_infopackets_verify(v.stream, v.timing.blank, v.sdp)?;
         self.uhbr_audio_quiet(v.stream)?;
         self.uhbr_video_verify(&v.link, v.stream, v.timing.blank, true)
     }
@@ -827,12 +979,13 @@ impl<I: Io> Engine<I> {
         }
         // Audio bandwidth is valid only for the retained format/timing and
         // native blank width. Recheck them before audio writes and after waits.
-        for (reg, value) in stream_attributes(v.timing.blank) {
+        for (reg, value) in stream_attributes(v.timing.blank, v.sdp.vsc_colorimetry) {
             let mask = if reg == PIXEL_FORMAT { 0x331 } else { u32::MAX };
             if self.read(at(reg))? & mask != value {
                 return Err(Error::Readback(at(reg)));
             }
         }
+        self.uhbr_infopackets_verify(v.stream, v.timing.blank, v.sdp)?;
         if self.read(at(HBLANK))? & 0xffff != u32::from(v.payload.hblank_symbols) {
             return Err(Error::Readback(at(HBLANK)));
         }
@@ -1084,6 +1237,7 @@ impl Otg {
         path: Path,
         stream: u8,
         pipe: u8,
+        sdp: UhbrSdp,
     ) -> Result<UhbrVideoRunning, Error> {
         if self.0.status.state != State::UhbrLinkTrained(path.transmitter) {
             return Err(Error::Busy);
@@ -1097,7 +1251,9 @@ impl Otg {
             .map_err(Error::PipeClocks)?;
         dccg.route_hpo_stream(regs, clocks, stream, pipe, path.transmitter)
             .map_err(Error::PipeClocks)?;
-        self.0.start_uhbr_video(io, path, stream, pipe, clock).await
+        self.0
+            .start_uhbr_video_with(io, path, stream, pipe, clock, sdp)
+            .await
     }
     /// Route HPO stream encoder `stream`'s clocks from `pipe` and prepare
     /// its MST stream on the selected display's 128b/132b MST link, blank,
@@ -1112,6 +1268,7 @@ impl Otg {
         stream: u8,
         pipe: u8,
         slots: u8,
+        sdp: UhbrSdp,
     ) -> Result<UhbrVideoRunning, Error> {
         if self.0.status.state != State::UhbrLinkTrained(path.transmitter) {
             return Err(Error::Busy);
@@ -1123,7 +1280,7 @@ impl Otg {
         dccg.route_hpo_stream(regs, clocks, stream, pipe, path.transmitter)
             .map_err(Error::PipeClocks)?;
         self.0
-            .prepare_uhbr_mst_stream(path, stream, pipe, clock, slots)
+            .prepare_uhbr_mst_stream_with(path, stream, pipe, clock, slots, sdp)
             .await
     }
     /// Unblank the selected display's prepared MST stream, its payload

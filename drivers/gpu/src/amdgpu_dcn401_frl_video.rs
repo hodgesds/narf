@@ -53,6 +53,10 @@ pub struct FrlVideoRequest {
     pub hc_active: u16,
     pub hc_blank: u16,
     pub avi: Avi,
+    /// amdgpu_dm_fill_hdr_info_packet's DRM InfoFrame while
+    /// HDR_OUTPUT_METADATA is set: generic packet 4
+    /// (hpo_enc401_update_hdmi_info_packets' hdrsmd).
+    pub hdr: Option<crate::amdgpu_hdr::InfoPacket>,
 }
 
 /// hpo_enc401_hdmi_set_dsc_config's CVTEM (HDMI 2.1 compressed video
@@ -191,6 +195,22 @@ impl<I: Io> Engine<I> {
                 return Err(Error::Readback(at));
             }
         }
+        self.frl_verify_dsc_packets(blank)
+    }
+    /// The DRM InfoFrame's generic packet 4 sent every frame on line 2.
+    fn frl_verify_hdr(&mut self, request: &FrlVideoRequest) -> Result<(), Error> {
+        if request.hdr.is_none() {
+            return Ok(());
+        }
+        for (at, mask, value) in self.frl_packet_controls(4) {
+            if self.read(at)? & mask != value {
+                return Err(Error::Readback(at));
+            }
+        }
+        Ok(())
+    }
+    /// For a DSC stream, generic packets 5-10 sent every frame on line 2.
+    fn frl_verify_dsc_packets(&mut self, blank: BlankApplied) -> Result<(), Error> {
         if blank.timing.request.dsc.is_some() {
             for index in 5..=10 {
                 for (at, mask, value) in self.frl_packet_controls(index) {
@@ -304,11 +324,29 @@ impl<I: Io> Engine<I> {
             blank.request.ycbcr420,
         );
         let vendor = vendor_infoframe(&t, request.avi);
-        for (index, packet) in [(0u32, Some(avi)), (1, vendor)] {
+        let hdr = request.hdr.filter(|p| p.valid).map(|p| p.bytes());
+        for (index, packet) in [(0u32, Some(avi)), (1, vendor), (4, hdr)] {
             if let Some(packet) = packet {
                 self.frl_vpg_packet(index, &packet).await?;
             }
         }
+        Ok(())
+    }
+    /// New HDR metadata on the running FRL stream (amdgpu_dm's
+    /// hdr_static_metadata stream update): generic packet 4 rewritten and
+    /// latched immediately. Only a stream already sending the DRM InfoFrame
+    /// takes new contents; entering or leaving HDR is a modeset.
+    pub(in crate::amdgpu_dcn401_otg) async fn frl_update_hdr(
+        &mut self,
+        packet: crate::amdgpu_hdr::InfoPacket,
+    ) -> Result<(), Error> {
+        let mut running = self.status.frl_video_running.ok_or(Error::Invalid)?;
+        if running.request.hdr.is_none() || !packet.valid {
+            return Err(Error::Invalid);
+        }
+        self.frl_vpg_packet(4, &packet.bytes()).await?;
+        running.request.hdr = Some(packet);
+        self.status.frl_video_running = Some(running);
         Ok(())
     }
     /// link_set_dsc_on_stream(true) for a compressed FRL timing, after
@@ -482,6 +520,7 @@ impl<I: Io> Engine<I> {
         }
         self.frl_link_witnesses(&v.link)?;
         self.frl_verify_format(v.timing.blank)?;
+        self.frl_verify_hdr(&v.request)?;
         let route = self.layout.base + STREAM_CLOCK * 4;
         if self.read(route)? & 15 != 8 | u32::from(v.request.pipe) {
             return Err(Error::Readback(route));

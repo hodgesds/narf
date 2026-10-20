@@ -17,7 +17,8 @@ pub use link_status::DpLinkStatus;
 #[path = "amdgpu_dcn401_uhbr_link.rs"]
 pub(in super::super) mod uhbr;
 pub use uhbr::{
-    uhbr_mst_dsc_rate, uhbr_mst_rate, UhbrLinkTrained, UhbrPayload, UhbrSettings, UhbrVideoRunning,
+    uhbr_mst_dsc_rate, uhbr_mst_rate, UhbrLinkTrained, UhbrPayload, UhbrSdp, UhbrSettings,
+    UhbrVideoRunning,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

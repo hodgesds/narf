@@ -537,6 +537,65 @@ pub fn msa_misc(
     (misc0, misc1)
 }
 
+/// dcn31_hpo_dp_stream_enc_set_stream_attribute's MISC0/MISC1 for a
+/// 128b/132b stream (DP_SYM32_ENC_VID_MSA6/MSA7 lane 3). Unlike the DIO
+/// encoder it starts from zero: MISC0 bits 2:1 the YCbCr 4:2:2/4:4:4
+/// encoding, bits 7:5 the depth (8, 10, 12 bpc as 1..3, others 0), bit 3
+/// and 4 the CEA range and BT.709 for sRGB limited, 601 and 709; MISC1 bit 6
+/// set exactly when the VSC SDP carries colorimetry (4:2:0 sets it first,
+/// and no VSC clears it again, as Linux's order does).
+pub fn hpo_msa_misc(
+    cs: DcColorSpace,
+    encoding: PixelEncoding,
+    bpc: u8,
+    use_vsc_sdp_for_colorimetry: bool,
+) -> (u32, u32) {
+    use DcColorSpace::*;
+    let mut misc0 = match encoding {
+        PixelEncoding::Ycbcr422 => 0x2,
+        PixelEncoding::Ycbcr444 => 0x4,
+        _ => 0,
+    };
+    let mut misc1 = if encoding == PixelEncoding::Ycbcr420 {
+        0x40
+    } else {
+        0
+    };
+    if use_vsc_sdp_for_colorimetry {
+        misc1 |= 0x40;
+    } else {
+        misc1 &= !0x40;
+    }
+    misc0 |= match bpc {
+        8 => 0x20,
+        10 => 0x40,
+        12 => 0x60,
+        _ => 0,
+    };
+    let ycbcr_bits = match encoding {
+        PixelEncoding::Ycbcr422 => 0x2,
+        PixelEncoding::Ycbcr444 => 0x4,
+        _ => 0,
+    };
+    match cs {
+        Srgb => misc1 &= !0x80,
+        SrgbLimited => {
+            misc0 |= 0x8;
+            misc1 &= !0x80;
+        }
+        Ycbcr601 | Ycbcr601Limited => {
+            misc0 |= 0x8 | ycbcr_bits;
+            misc1 &= !0x80;
+        }
+        Ycbcr709 | Ycbcr709Limited => {
+            misc0 |= 0x18 | ycbcr_bits;
+            misc1 &= !0x80;
+        }
+        _ => {}
+    }
+    (misc0, misc1)
+}
+
 /// DP_DPRX_FEATURE_ENUMERATION_LIST and its
 /// VSC_SDP_EXTENSION_FOR_COLORIMETRY_SUPPORTED bit.
 pub const DP_DPRX_FEATURE_ENUMERATION_LIST: u32 = 0x2210;

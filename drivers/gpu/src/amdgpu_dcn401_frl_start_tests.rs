@@ -322,6 +322,7 @@ fn prepared_frl_video_dsc(
             vic: 16,
             ..Avi::default()
         },
+        hdr: None,
     };
     // HDMISTREAMCLK not routed yet.
     assert!(matches!(
@@ -670,4 +671,86 @@ fn dcn401_frl_420_format_failures_retain_link() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-frl-link",
     dcn401_frl_420_format_failures_retain_link
+);
+
+/// HDR over FRL as hpo_enc401_update_hdmi_info_packets sends it: the DRM
+/// InfoFrame (amdgpu_dm_fill_hdr_info_packet's HDMI packet) in VPG generic
+/// packet 4, latched immediately and sent every frame on line 2
+/// (HDMI_GENERIC4_SEND/CONT, HDMI_GENERIC4_LINE), beside the AVI InfoFrame
+/// in packet 0. New metadata rewrites packet 4; stop clears the controls.
+fn dcn401_frl_video_sends_drm_infoframe_like_linux() -> TestResult {
+    use crate::amdgpu_hdr::{hdr_info_packet, HdrConnector, HdrOutputMetadata};
+    let phy = 2u8;
+    let (mut e, mut fw, request, c) = prepared_frl_video(false, ColorDepth::Bpc10);
+    let mut blob = [0u8; 32];
+    blob[4] = 2;
+    for (i, b) in blob[6..30].iter_mut().enumerate() {
+        *b = 0x40 + i as u8;
+    }
+    let packet = hdr_info_packet(
+        Some(&HdrOutputMetadata::from_blob(&blob).unwrap()),
+        HdrConnector::Hdmi,
+    );
+    assert_eq!(packet.hb, [0x87, 1, 0x1a, 0]);
+    let request = FrlVideoRequest {
+        hdr: Some(packet),
+        ..request
+    };
+    e.io.inner.writes.clear();
+    run(e.start_frl_video(path(phy), request, c)).unwrap();
+    let r = |e: &Engine<FrlIo>, reg: u64| e.io.inner.regs.get(&frl(reg)).copied().unwrap_or(0);
+    // Packets 0 (AVI) and 4 (DRM) SEND|CONT, both on line 2.
+    assert_eq!(r(&e, 0x8e6) & 0x3_0033, 0x3_0003);
+    assert_eq!(r(&e, 0x8eb) & 0x7fff, 2);
+    assert_eq!(r(&e, 0x934) & 0x11, 0x11, "immediate updates");
+    let w = &e.io.inner.writes;
+    let index: Vec<u32> = w
+        .iter()
+        .filter(|&&(at, _)| at == frl(0x931))
+        .map(|&(_, v)| v & 0xff)
+        .collect();
+    assert_eq!(index, [0, 36]);
+    let data: Vec<u32> = w
+        .iter()
+        .filter(|&&(at, _)| at == frl(0x932))
+        .map(|&(_, v)| v)
+        .collect();
+    assert_eq!(data[9..], packet.words());
+    let v = e.status.frl_video_running.unwrap();
+    assert_eq!(v.request.hdr, Some(packet));
+    e.frl_video_verify_running(&v).unwrap();
+    // Live metadata update: packet 4 only.
+    blob[28] = 0x99;
+    let next = hdr_info_packet(
+        Some(&HdrOutputMetadata::from_blob(&blob).unwrap()),
+        HdrConnector::Hdmi,
+    );
+    e.io.inner.writes.clear();
+    run(e.frl_update_hdr(next)).unwrap();
+    let data: Vec<u32> =
+        e.io.inner
+            .writes
+            .iter()
+            .filter(|&&(at, _)| at == frl(0x932))
+            .map(|&(_, v)| v)
+            .collect();
+    assert_eq!(data, next.words());
+    assert_eq!(e.status.frl_video_running.unwrap().request.hdr, Some(next));
+    // A lost packet 4 control is a failed witness.
+    let saved = r(&e, 0x8e6);
+    e.io.inner.regs.insert(frl(0x8e6), saved & !0x3_0000);
+    assert!(matches!(
+        e.frl_video_verify_running(&e.status.frl_video_running.unwrap()),
+        Err(Error::Readback(_))
+    ));
+    e.io.inner.regs.insert(frl(0x8e6), saved);
+    run(e.stop_frl_video(path(phy))).unwrap();
+    assert_eq!(r(&e, 0x8e6), 0);
+    assert_eq!(r(&e, 0x8eb), 0);
+    run(e.stop_frl_link(&mut fw, path(phy))).unwrap();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-frl-link",
+    dcn401_frl_video_sends_drm_infoframe_like_linux
 );
