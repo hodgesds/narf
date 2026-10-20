@@ -327,7 +327,12 @@ pub struct MstStream {
     pub sink: crate::dp_mst_mgr::Sink,
     pub pbn: u16,
     pub slots: u8,
-    /// DP_MSE_RATE X.Y (`otg::vc_rate`).
+    /// The depth `pbn` was sized for: an uncompressed stream on a link
+    /// without DSC decoders reserves drm_dp_calc_pbn_mode at
+    /// `requested_depth_bpc` (dm_encoder_helper_atomic_check), every other
+    /// stream at its own depth (the fairness search's PBN).
+    pub pbn_bpc: u8,
+    /// DP_MSE_RATE X.Y (`otg::vc_rate`), from the stream's own depth.
     pub rate: (u32, u32),
     /// A compressed stream's decoder: where DP_DSC_ENABLE goes.
     pub dsc: Option<super::mst::MstDsc>,
@@ -1366,6 +1371,29 @@ pub fn dp_depths(edid: &[u8], max_bpc: u8) -> Vec<otg::ColorDepth> {
     .filter(|&(b, _)| b <= top || b == 8)
     .map(|(_, d)| d)
     .collect()
+}
+
+/// amdgpu_dm_convert_color_depth_from_display_info for RGB as
+/// dm_encoder_helper_atomic_check calls it with the connector's
+/// max_requested_bpc (`max_bpc`): display_info.bpc (8 when undefined),
+/// capped by `max_bpc` and rounded down to even. An MST stream's PBN is
+/// sized for this depth (`drm_dp_calc_pbn_mode(clock, bpc * 3 << 4)`)
+/// however far its stream steps down.
+pub fn requested_depth_bpc(edid: &[u8], max_bpc: u8) -> u8 {
+    let mut bpc = match edid_bpc(edid) {
+        0 => 8,
+        b => b,
+    };
+    if max_bpc > 0 {
+        bpc = bpc.min(max_bpc);
+        bpc -= bpc & 1;
+    }
+    // COLOR_DEPTH_888 for 0 (DRM parsed no depth).
+    if bpc == 0 {
+        8
+    } else {
+        bpc
+    }
 }
 
 /// Whether `lanes` at `rate` carries `cfg`'s compressed stream
@@ -3398,7 +3426,7 @@ impl ColdBoot {
                 // Within the stream's own payload: uncompressed, or for a
                 // compressed stream at the bpp its PBN carries
                 // (bpp_x16_from_pbn).
-                if super::mst::mst_slots(&t, s.lanes, s.rate, s.caps.fec)
+                if super::mst::mst_slots(&t, m.pbn_bpc, s.lanes, s.rate, s.caps.fec)
                     .is_some_and(|(pbn, slots)| pbn <= m.pbn && slots <= m.slots)
                 {
                     return Some(plane_mode(t, s.format));

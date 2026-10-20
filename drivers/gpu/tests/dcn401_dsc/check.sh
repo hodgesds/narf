@@ -11,13 +11,16 @@
 #   drivers/gpu/tests/dcn401_dsc/check.sh --generate-mst [linux-tree] > mst_vectors.txt
 #   drivers/gpu/tests/dcn401_dsc/check.sh --generate-depth [linux-tree] > depth_vectors.txt
 #   drivers/gpu/tests/dcn401_dsc/check.sh --generate-mst-depth [linux-tree] > mst_depth_vectors.txt
+#   drivers/gpu/tests/dcn401_dsc/check.sh --generate-mst-raw [linux-tree] > mst_raw_vectors.txt
 # cvtem_vectors.txt replays hpo_enc401_hdmi_set_dsc_config's CVTEM packets
 # (cvtem_harness.c) for frl_vectors.txt's PPSes; mst_vectors.txt replays
 # amdgpu_dm's MST DSC fairness search (mst_harness.c); depth_vectors.txt
 # replays amdgpu_dm_create_validate_stream_for_sink's DP SST depth search
 # with DSC at every depth (depth_harness.c); mst_depth_vectors.txt the MST
 # fairness search with 8-, 10- and 12-bpc streams (mst_harness.c with
-# STREAM_BPC).
+# STREAM_BPC); mst_raw_vectors.txt an uncompressed MST stream's depth and
+# its max_requested_bpc-sized PBN on a link without decoders (mst_harness.c
+# with RAW_DEPTH).
 # amdgpu_dsc.rs, the HPO FRL encoder's CVTEM and amdgpu_mst_dsc.rs must
 # produce Linux's output for every line.
 set -euo pipefail
@@ -40,6 +43,9 @@ elif [ "${1:-}" = --generate-depth ]; then
 	shift
 elif [ "${1:-}" = --generate-mst-depth ]; then
 	generate=6
+	shift
+elif [ "${1:-}" = --generate-mst-raw ]; then
+	generate=7
 	shift
 fi
 linux=${1:-/usr/src/linux}
@@ -79,6 +85,69 @@ grep -q 'try_disable_dsc' "$work/mst_fair.c" ||
 cc "${flags[@]}" -I"$work" "$here/mst_harness.c" "$work"/*.o -lm "${alias[@]}" -o "$work/mst"
 cc "${flags[@]}" -DSTREAM_BPC -I"$work" "$here/mst_harness.c" "$work"/*.o -lm "${alias[@]}" \
 	-o "$work/mst_depth"
+# extract <file> <function name>...: each function from its signature line
+# (or the return type line before it) to the first closing brace in column 0.
+extract() {
+	local file=$1 name
+	shift
+	for name in "$@"; do
+		awk -v n="$name" '
+			!f && $0 ~ "^(static |)[a-z_0-9 ]*[ *]" n "\\(" { f = 1 }
+			!f && prev ~ "^(static |)[a-z_0-9 ]*$" && $0 ~ "^" n "\\(" { f = 1; print prev }
+			f { print }
+			f && /^}/ { exit }
+			{ prev = $0 }' "$file" > "$work/fn.c"
+		grep -q . "$work/fn.c" || { echo "missing $name" >&2; exit 1; }
+		cat "$work/fn.c"
+	done
+}
+# The uncompressed MST depth and PBN (mst_harness.c with RAW_DEPTH).
+{
+	echo '#define min_t(t, a, b) ((t)(a) < (t)(b) ? (t)(a) : (t)(b))'
+	echo '#define ALIGN(x, a) (((x) + (a) - 1) / (a) * (a))'
+	echo '#define DIV_ROUND_UP_ULL(n, d) (((unsigned long long)(n) + (d) - 1) / (d))'
+	echo '#define mul_u32_u32(a, b) ((unsigned long long)(u32)(a) * (u32)(b))'
+	echo '#define WARN_ON(x) (x)'
+	echo '#define FXP_Q4_FMT "%d"'
+	echo '#define FXP_Q4_ARGS(x) (x)'
+	echo '#define BIT(n) (1UL << (n))'
+	grep -E '^#define DRM_EDID_YCBCR420_DC_(30|36|48)' "$linux/include/drm/drm_edid.h"
+	grep -E '^#define DRM_DP_BW_OVERHEAD_' "$linux/include/drm/display/drm_dp_helper.h"
+	grep -E '^#define PEAK_FACTOR_X1000' "$d/amdgpu_dm/amdgpu_dm_mst_types.c"
+	extract "$d/amdgpu_dm/amdgpu_dm_connector.c" amdgpu_dm_convert_color_depth_from_display_info \
+		amdgpu_dm_convert_dc_color_depth_into_bpc
+	extract "$d/amdgpu_dm/amdgpu_dm_mst_types.c" kbps_from_pbn
+	extract "$linux/drivers/gpu/drm/display/drm_dp_helper.c" drm_dp_link_data_symbol_cycles \
+		drm_dp_link_symbol_cycles drm_dp_bw_overhead
+	extract "$linux/drivers/gpu/drm/display/drm_dp_mst_topology.c" drm_dp_calc_pbn_mode
+} > "$work/mst_raw.c"
+cc "${flags[@]}" -DRAW_DEPTH -I"$work" "$here/mst_harness.c" "$work"/*.o -lm "${alias[@]}" \
+	-o "$work/mst_raw"
+if [ $generate -eq 7 ]; then
+	echo "# Linux uncompressed MST depth and PBN reference vectors; see check.sh and mst_harness.c."
+	# encoding link_kbps: 4 x HBR3, 4 x HBR2, 2 x HBR2 and 1 x HBR with
+	# FEC; 4 x UHBR10, 4 x UHBR20, 2 x UHBR10.
+	links=("0 25142400" "0 16761600" "0 8380800" "0 2095200" "1 38566400" "1 77132800"
+		"1 19283200")
+	# pix_clk_100hz h_active h_total v_active v_total: 1080p60, 1080p144,
+	# 1440p60, 1440p144, 4K30, 4K60, 4K120, 4K144 RBv2, 5K60.
+	modes=("1485000 1920 2200 1080 1125" "3327000 1920 2080 1080 1111"
+		"2415000 2560 2720 1440 1481" "5868000 2560 2720 1440 1500"
+		"2970000 3840 4400 2160 2250" "5940000 3840 4400 2160 2250"
+		"11880000 3840 4400 2160 2250" "12542820 3840 3920 2160 2222"
+		"9384000 5120 5280 2880 2962")
+	edid=(0 8 10 10 12 12 14 16)
+	RANDOM=6203
+	pick() { local -n a=$1; echo "${a[RANDOM % ${#a[@]}]}"; }
+	for _ in $(seq 1500); do
+		requested=$((8 + RANDOM % 9))
+		# Mostly an unconstrained port; sometimes a narrow one.
+		full=$((RANDOM % 3 == 0 ? 500 + RANDOM % 3500 : 65535))
+		in="$(pick links) $(pick edid) $requested $(pick modes) $full"
+		echo "$in = $(echo "$in" | "$work/mst_raw")"
+	done
+	exit 0
+fi
 # cvtem_vectors.txt: every compressed frl_vectors.txt line's timing, slices,
 # bpp and PPS, with a front porch and sync from its blanking.
 cvtem_inputs() {
@@ -336,10 +405,17 @@ if ! diff -q "$work/want_mst_depth" "$work/got_mst_depth" >/dev/null; then
 	echo "mst_depth_vectors.txt does not match Linux" >&2
 	exit 1
 fi
+grep -v '^#' "$here/mst_raw_vectors.txt" | sed 's/ = .*//' | "$work/mst_raw" > "$work/got_mst_raw"
+grep -v '^#' "$here/mst_raw_vectors.txt" | sed 's/.* = //' > "$work/want_mst_raw"
+if ! diff -q "$work/want_mst_raw" "$work/got_mst_raw" >/dev/null; then
+	diff "$work/want_mst_raw" "$work/got_mst_raw" | head -20 >&2
+	echo "mst_raw_vectors.txt does not match Linux" >&2
+	exit 1
+fi
 # Every cvtem_vectors.txt input comes from frl_vectors.txt's PPSes.
 if ! diff -q <(cvtem_inputs) <(grep -v '^#' "$here/cvtem_vectors.txt" | sed 's/ =.*//') >/dev/null; then
 	echo "cvtem_vectors.txt inputs no longer follow frl_vectors.txt" >&2
 	exit 1
 fi
 echo "$(cat "$work/want" "$work/want_frl" "$work/want_cvtem" "$work/want_mst" \
-	"$work/want_depth" "$work/want_mst_depth" | wc -l) ok"
+	"$work/want_depth" "$work/want_mst_depth" "$work/want_mst_raw" | wc -l) ok"

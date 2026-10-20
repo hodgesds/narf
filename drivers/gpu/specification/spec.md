@@ -1510,7 +1510,9 @@ end device at the deepest of its depths (`dp_depths` up to
 `MstDscContext::max_bpc`, create_validate_stream_for_sink's loop) that the
 port and the joint search take; such a stream leaves at that depth
 compressed or raw (VC rate, PBN and audio budget at it). A link without any
-decoder keeps 8-bpc streams; the
+decoder runs uncompressed streams at the deepest depth its port carries
+raw, their PBN sized for the requested depth (`raw_mst_stream`, see "Navi
+48 connector max bpc"). A compressed stream's
 payload PBN and VC rate come from the compressed bandwidth
 (`uhbr_mst_dsc_rate` on 128b/132b). The decoder is enabled before the
 payload, the PPS is sent per stream (DIO SDP or HPO GSP11) before unblank,
@@ -2184,9 +2186,10 @@ route. Each round is retried as described for `LinkReduced`.
 
 `unsafe ColdBoot::modeset_mst_displays(port, fill, want, pipes)` is
 `modeset_routed` with that route and no board pipes. It lights one
-branch's sinks with joint DML admission, 8-bpc RGB and the maximum supported
-8b/10b link. `pipes[k]: Option<u8>` assigns stable output k to a distinct
-display/pipe, or disables it. Disabled, unreadable and unadmitted devices
+branch's sinks with joint DML admission, RGB at each end device's depth (see
+"Navi 48 connector max bpc") and the maximum supported link.
+`pipes[k]: Option<u8>` assigns stable output k to a distinct display/pipe,
+or disables it. Disabled, unreadable and unadmitted devices
 leave gaps; their successors never inherit their CRTC or requested mode.
 Each payload must fit the remaining 63 slots and the available PBN of every
 connected hop from the sink to the root, after subtracting selected sibling
@@ -3939,9 +3942,8 @@ min(the EDID 1.4 color bit depth, 8 when undefined, `max_bpc` rounded to
 even), stepping down by two until a link carries the uncompressed stream
 (`modeset::dp_depths`, `dp_link_bpc`); training candidates and the UHBR
 audio budget use it. With the default `amdgpu.max_bpc` (8, a NARF ceiling
-over each connector's "max bpc") DP stays 8 bpc. Gaps: MST streams on a link
-without a DSC decoder stay 8 bpc, plane color pipelines and AMD private
-properties. Model-tested only (`dcn-color`,
+over each connector's "max bpc") DP stays 8 bpc. Gaps: plane color
+pipelines and AMD private properties. Model-tested only (`dcn-color`,
 `hdr`, `dcn401-color`, `dcn401-scanout`, `dcn401-otg`, `dcn401-frl-link`,
 `dcn401-mpc`, `navi48-modeset`, `navi48-kms`, `drm_ioctl`); not validated
 on hardware.
@@ -3980,9 +3982,24 @@ property alone decides, the native encoders taking at most 12 bpc). It is
 the requested bpc of amdgpu_dm_create_validate_stream_for_sink's bpc mask
 and of convert_color_depth_from_display_info (rounded down to even): DP SST
 and HDMI (`select_all`, which applies each port's own value, offered and
-retrained modes) and MST DSC (`MstDscContext::max_bpc`, now a per-end-device
-function). Deviations: an MST link without a DSC
-decoder keeps 8-bpc streams; offered modes of a dark connector
+retrained modes), MST DSC (`MstDscContext::max_bpc`, now a per-end-device
+function) and uncompressed MST. On an MST link without DSC decoders each
+stream is `raw_mst_stream`: the deepest of its depths whose raw bandwidth
+dm_dp_mst_is_port_support_mode accepts (`dsc::raw_supported`: within the
+root link and the port's full PBN), with dm_encoder_helper_atomic_check's
+payload, drm_dp_calc_pbn_mode at `requested_depth_bpc` (display_info.bpc,
+8 when undefined, capped by max_requested_bpc and rounded down to even) and
+its slots, however far the stream stepped down; the VC rate and LPCM budget
+are the stream's own depth's (DC's get_pbn_from_timing).
+`MstStream::pbn_bpc` records the depth the PBN was sized for (the stream's
+own on a link the fairness search sized), which a running stream's offered
+modes are measured with. A stepped-down stream whose requested-depth PBN no
+longer fits its port is refused, as Linux's drm_dp_mst_atomic_check refuses
+it. `tests/dcn401_dsc/check.sh` replays 1500 such streams through
+amdgpu_dm's depth, PBN and slot code cut from Linux (mst_harness.c built
+with RAW_DEPTH, mst_raw_vectors.txt). Deviations: 6 bpc (an EDID 6-bpc sink
+gets 8 bpc, its PBN 8 bpc's), 14 and 16 bpc are never streamed (the PBN of
+a 14- or 16-bpc request is Linux's); offered modes of a dark connector
 follow a new value at the next lighting; the property is per connector but
 "Broadcast RGB" stays one setting for the card. Model-tested only
 (`drm_ioctl`, `navi48-kms`, `navi48-modeset`, `navi48-mst`); not validated

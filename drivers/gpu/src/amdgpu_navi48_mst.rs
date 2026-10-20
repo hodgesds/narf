@@ -657,9 +657,6 @@ impl ColdBoot {
     }
 }
 
-/// 8-bit RGB, as MST streams are selected (bpp in 1/16).
-const MST_BPP_X16: u32 = 24 * 16;
-
 /// decide_mst_link_settings: an MST link trains at the sink's verified
 /// link cap, its best 128b/132b rate where it codes one (Linux's
 /// mst_decide_link_encoding_format then picks 128b/132b), else its best
@@ -680,24 +677,44 @@ pub(super) fn mst_total_slots(rate: DpRate) -> u8 {
     }
 }
 
-/// The PBN and time slots of `timing` on an MST link of `lanes` at
-/// `rate`
+/// The PBN and time slots of `timing` in RGB at `bpc` on an MST link of
+/// `lanes` at `rate`
 /// (drm_dp_calc_pbn_mode, dm_mst_get_pbn_divider of the link's
 /// dc_link_bandwidth_kbps, drm_dp_atomic_find_time_slots); None past the
 /// link's slots.
-pub(super) fn mst_slots(timing: &Timing, lanes: u8, rate: DpRate, fec: bool) -> Option<(u16, u8)> {
+pub(super) fn mst_slots(
+    timing: &Timing,
+    bpc: u8,
+    lanes: u8,
+    rate: DpRate,
+    fec: bool,
+) -> Option<(u16, u8)> {
     let link_kbps = match rate {
         DpRate::Legacy(r) => modeset::legacy_kbps(lanes, r, fec),
         DpRate::Uhbr(r) => modeset::uhbr_kbps(lanes, r),
     };
-    let pbn = dp_mst::calc_pbn_mode(timing.pixel_clock_khz, MST_BPP_X16);
-    let div = dp_mst::pbn_div(u32::try_from(link_kbps).ok()?);
+    mst_slots_on(
+        timing,
+        bpc,
+        u32::try_from(link_kbps).ok()?,
+        mst_total_slots(rate),
+    )
+}
+
+/// `mst_slots` on a link of `link_kbps` with `total` time slots.
+pub(super) fn mst_slots_on(
+    timing: &Timing,
+    bpc: u8,
+    link_kbps: u32,
+    total: u8,
+) -> Option<(u16, u8)> {
+    let pbn = dp_mst::calc_pbn_mode(timing.pixel_clock_khz, u32::from(bpc) * 3 * 16);
+    let div = dp_mst::pbn_div(link_kbps);
     if div == 0 {
         return None;
     }
     let slots = dp_mst::time_slots(pbn, div);
-    (slots <= u32::from(mst_total_slots(rate)) && pbn <= u32::from(u16::MAX))
-        .then_some((pbn as u16, slots as u8))
+    (slots <= u32::from(total) && pbn <= u32::from(u16::MAX)).then_some((pbn as u16, slots as u8))
 }
 
 /// The source VC rate (X, Y) of an RGB MST stream at `bpc`: Y in 1/2^26 on
@@ -738,10 +755,10 @@ pub fn select_mst(
     select_mst_with_budget(port, caps, devices, want, &|_, _| u16::MAX, None)
 }
 
-/// What MST DSC needs beyond the selection's inputs: the topology, each end
-/// device's decoder (`MstOutput::dsc`), the board's highest DISPCLK and
-/// each end device's requested maximum depth (its connector's
-/// max_requested_bpc within `amdgpu.max_bpc`,
+/// What MST depth and DSC selection need beyond the selection's inputs:
+/// the topology, each end device's decoder (`MstOutput::dsc`), the board's
+/// highest DISPCLK and each end device's requested maximum depth (its
+/// connector's max_requested_bpc within `amdgpu.max_bpc`,
 /// `modeset::connector_max_bpc`).
 pub struct MstDscContext<'a> {
     pub topology: &'a Topology,
@@ -891,11 +908,7 @@ fn select_mst_dsc(
             continue;
         };
         let timing = stream.timing;
-        let depth = match stream.bpc {
-            12 => otg::ColorDepth::Bpc12,
-            10 => otg::ColorDepth::Bpc10,
-            _ => otg::ColorDepth::Bpc8,
-        };
+        let depth = bpc_depth(stream.bpc);
         let vc = match &p.dsc {
             Some(cfg) => mst_vc_rate_dsc(&timing, cfg, lanes, rate, caps.fec),
             None => mst_vc_rate(&timing, stream.bpc, lanes, rate, caps.fec),
@@ -923,6 +936,7 @@ fn select_mst_dsc(
                 sink: *sink,
                 pbn: p.pbn,
                 slots: p.slots,
+                pbn_bpc: stream.bpc,
                 rate: vc,
                 dsc: p.dsc.and((ctx.dsc_of)(*sink)),
             }),
@@ -1002,21 +1016,22 @@ fn select_mst_with_budget(
         };
         let available = (*available).min(budget(*sink, &allocations(&out)));
         let fits = |t: &Timing| {
-            mst_slots(t, lanes, rate, caps.fec)
-                .filter(|&(pbn, slots)| slots <= free && pbn <= available)
+            raw_mst_stream(t, edid, caps, dsc.map(|c| (*sink, c)))
+                .filter(|r| r.slots <= free && r.pbn <= available)
         };
         let timings = modeset::edid_timings(edid);
         let chosen = want(k)
             .filter(|w| timings.contains(w))
             .and_then(|w| fits(&w).map(|f| (w, f)))
             .or_else(|| timings.iter().find_map(|t| fits(t).map(|f| (*t, f))));
-        let Some((timing, (pbn, slots))) = chosen else {
+        let Some((timing, raw)) = chosen else {
             continue;
         };
-        let Some(vc) = mst_vc_rate(&timing, 8, lanes, rate, caps.fec) else {
+        // The VC rate and audio budget are the stream's own depth's.
+        let Some(vc) = mst_vc_rate(&timing, raw.bpc, lanes, rate, caps.fec) else {
             continue;
         };
-        free -= slots;
+        free -= raw.slots;
         let s = Selection {
             port,
             timing,
@@ -1026,8 +1041,8 @@ fn select_mst_with_budget(
             edid: base,
             hdmi: false,
             scdc: false,
-            depth: otg::ColorDepth::Bpc8,
-            audio: mst_audio(edid, &timing, 8, lanes, rate, caps, None),
+            depth: bpc_depth(raw.bpc),
+            audio: mst_audio(edid, &timing, raw.bpc, lanes, rate, caps, None),
             avi: otg::Avi::default(),
             limited: false,
             ycbcr420: false,
@@ -1035,8 +1050,9 @@ fn select_mst_with_budget(
             dsc: None,
             mst: Some(modeset::MstStream {
                 sink: *sink,
-                pbn,
-                slots,
+                pbn: raw.pbn,
+                slots: raw.slots,
+                pbn_bpc: raw.pbn_bpc,
                 rate: vc,
                 dsc: None,
             }),
@@ -1053,6 +1069,82 @@ fn select_mst_with_budget(
         out.push(s);
     }
     out
+}
+
+/// The native depth of `bpc` (8, 10 or 12).
+fn bpc_depth(bpc: u8) -> otg::ColorDepth {
+    match bpc {
+        12 => otg::ColorDepth::Bpc12,
+        10 => otg::ColorDepth::Bpc10,
+        _ => otg::ColorDepth::Bpc8,
+    }
+}
+
+/// An uncompressed MST stream's depth and payload (`raw_mst_stream`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct RawMstStream {
+    /// The stream's depth.
+    pub bpc: u8,
+    /// The depth its PBN was sized for.
+    pub pbn_bpc: u8,
+    pub pbn: u16,
+    pub slots: u8,
+}
+
+/// An uncompressed stream of `t` to end device `ctx.0` on a link without
+/// DSC decoders, as amdgpu_dm builds it: at the deepest of its depths
+/// (`modeset::dp_depths` up to the context's `max_bpc` for it,
+/// create_validate_stream_for_sink's loop) that
+/// dm_dp_mst_is_port_support_mode carries raw within the root link and the
+/// port's full PBN, with the PBN and slots dm_encoder_helper_atomic_check
+/// reserves: drm_dp_calc_pbn_mode at `modeset::requested_depth_bpc` (the
+/// EDID depth within the same cap), however far the stream stepped down
+/// (8 bpc at least: the encoders send no 6 bpc). None when no depth is
+/// carried or the PBN exceeds the link's slots. Without a context (the
+/// DSC-less model forms) the stream is 8 bpc and unchecked against the
+/// topology, as before deep color.
+pub(super) fn raw_mst_stream(
+    t: &Timing,
+    edid: &[u8],
+    caps: modeset::DpCaps,
+    ctx: Option<(dp_mst_mgr::Sink, &MstDscContext<'_>)>,
+) -> Option<RawMstStream> {
+    let Some((sink, c)) = ctx else {
+        let (lanes, rate) = mst_link(caps);
+        let (pbn, slots) = mst_slots(t, 8, lanes, rate, caps.fec)?;
+        return Some(RawMstStream {
+            bpc: 8,
+            pbn_bpc: 8,
+            pbn,
+            slots,
+        });
+    };
+    let full_pbn = c.topology.port(sink)?.full_pbn;
+    let link = dsc_link(caps, c.max_dispclk_khz)?;
+    raw_mst_choice(t, edid, (c.max_bpc)(sink), full_pbn, &link)
+}
+
+/// `raw_mst_stream` for an end device whose port has `full_pbn`, capped
+/// at `max_bpc`, on `link`.
+pub(super) fn raw_mst_choice(
+    t: &Timing,
+    edid: &[u8],
+    max_bpc: u8,
+    full_pbn: u16,
+    link: &dsc::DscLink,
+) -> Option<RawMstStream> {
+    let bpc = modeset::dp_depths(edid, max_bpc)
+        .into_iter()
+        .map(modeset::depth_bpc)
+        .find(|&bpc| dsc::raw_supported(t, bpc, full_pbn, link))?;
+    let pbn_bpc = modeset::requested_depth_bpc(edid, max_bpc).max(8);
+    let (pbn, slots) = mst_slots_on(t, pbn_bpc, link.kbps, link.slots)?;
+    Some(RawMstStream {
+        bpc,
+        pbn_bpc,
+        pbn,
+        slots,
+    })
 }
 
 /// An end device's available PBN beside the given allocations.
@@ -1176,7 +1268,7 @@ pub(super) fn dark_mst_modes_with(
         .iter()
         .filter_map(|s| s.mst)
         .try_fold(0u8, |n, m| n.checked_add(m.slots));
-    let (lanes, rate) = mst_link(caps);
+    let (_, rate) = mst_link(caps);
     let Some(free) = used.and_then(|n| mst_total_slots(rate).checked_sub(n)) else {
         return Vec::new();
     };
@@ -1186,8 +1278,8 @@ pub(super) fn dark_mst_modes_with(
         if offered.len() == modeset::MAX_MODES {
             break;
         }
-        let candidate = if mst_slots(&t, lanes, rate, caps.fec)
-            .is_some_and(|(pbn, slots)| slots <= free && pbn <= available)
+        let candidate = if raw_mst_stream(&t, edid, caps, dsc)
+            .is_some_and(|r| r.slots <= free && r.pbn <= available)
         {
             modeset::mode(t)
         } else if let Some(m) = compressed(&t) {

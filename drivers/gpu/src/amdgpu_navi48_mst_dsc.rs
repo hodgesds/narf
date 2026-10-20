@@ -338,6 +338,14 @@ pub fn compute(streams: &[DscStream], link: &DscLink, fits: &Fits<'_>) -> Option
     compute_link(streams, link, fits, &|s| native_config(s, link))
 }
 
+/// dm_dp_mst_is_port_support_mode's "DSC unnecessary case": `t` in RGB at
+/// `bpc` (dc_bandwidth_in_kbps_from_timing) within the end-to-end
+/// bandwidth, the root link's and the port's `full_pbn`'s.
+pub fn raw_supported(t: &Timing, bpc: u8, full_pbn: u16, link: &DscLink) -> bool {
+    let stream = amdgpu_dsc::stream_kbps(&mst_dsc_timing(t, bpc), link.encoding);
+    stream <= link.kbps.min(kbps_from_pbn(u32::from(full_pbn)))
+}
+
 /// dm_dp_mst_is_port_support_mode for `t` on end device `port` (RGB at
 /// `bpc`, the stream's display_color_depth):
 /// carried uncompressed within the end-to-end bandwidth (the root link and
@@ -361,7 +369,7 @@ pub fn port_supports_mode(
         return false;
     };
     let end_to_end = link.kbps.min(kbps_from_pbn(u32::from(p.full_pbn)));
-    if stream <= end_to_end {
+    if raw_supported(t, bpc, p.full_pbn, link) {
         return true;
     }
     let Some(d) = dsc else {

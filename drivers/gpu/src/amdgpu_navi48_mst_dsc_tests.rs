@@ -438,3 +438,177 @@ kernel_test_in!(
     "drivers/gpu/navi48-mst",
     navi48_mst_dsc_streams_take_the_deepest_depth
 );
+
+/// Uncompressed MST deep color on a link without DSC decoders, as
+/// amdgpu_dm runs it: a 10-bpc 4K60 sink behind a 4 x HBR3 branch link
+/// (25,920,000 kbps) streams at 10 bpc when its connector asks for 10 or
+/// 16, its payload dm_encoder_helper_atomic_check's drm_dp_calc_pbn_mode
+/// (594,000 kHz, 30 bpp) = 2656 PBN in DIV_ROUND_UP(2656 << 12, 245,760) =
+/// 45 slots and its VC rate 17,820,000 kbps' PBN 2640 over 60 PBN per slot
+/// = exactly 44 slots per MTP; at 8 it streams at 8 bpc in 2125 PBN (36
+/// slots). Behind a port of 2400 full PBN (16,102,800 kbps end to end) the
+/// 10-bpc stream (17,820,000 kbps) steps down to 8 bpc
+/// (dm_dp_mst_is_port_support_mode) but its PBN stays sized for the
+/// requested 10 bpc, which the port cannot hold: the mode is refused until
+/// the connector asks for 8.
+fn navi48_mst_raw_streams_run_deep_color() -> TestResult {
+    let caps = modeset::DpCaps {
+        lanes: 4,
+        rate: crate::dp_link_training::LinkRate::Hbr3,
+        uhbr: 0,
+        fec: false,
+        dsc: None,
+    };
+    let edid = uhd60_edid(3);
+    let pick = |full: u16, max: u8| {
+        let mut hub = Hub::new();
+        hub.resources.insert((1, 1), (full, full - 10));
+        let (_, topology) = probed(&mut hub);
+        assert_eq!(topology.port(ROOT_SINK).map(|p| p.full_pbn), Some(full));
+        let devices = [(ROOT_SINK, edid.clone(), full - 10)];
+        let budget = |_: Sink, _: &[(Sink, u16)]| u16::MAX;
+        let dsc_of = |_: Sink| -> Option<MstDsc> { None };
+        let max_bpc = |_: Sink| max;
+        let ctx = MstDscContext {
+            topology: &topology,
+            dsc_of: &dsc_of,
+            max_dispclk_khz: 2_000_000,
+            max_bpc: &max_bpc,
+        };
+        let t = modeset::edid_timings(&edid)[0];
+        let raw = super::super::raw_mst_stream(&t, &edid, caps, Some((ROOT_SINK, &ctx)));
+        let lit = super::super::select_mst_outputs_with(
+            0,
+            caps,
+            &devices,
+            &|_| None,
+            &[Some(0)],
+            &budget,
+            Some(&ctx),
+        );
+        let lit = lit.first().map(|(s, _)| {
+            (
+                s.depth,
+                s.timing,
+                s.mst.map(|m| (m.pbn, m.slots, m.pbn_bpc, m.rate)),
+            )
+        });
+        (t, raw, lit)
+    };
+    use otg::ColorDepth::{Bpc10, Bpc8};
+    let raw = |bpc, pbn_bpc, pbn, slots| {
+        Some(super::super::RawMstStream {
+            bpc,
+            pbn_bpc,
+            pbn,
+            slots,
+        })
+    };
+    let (t, r, lit) = pick(4000, 10);
+    if t.pixel_clock_khz != 594_000
+        || r != raw(10, 10, 2656, 45)
+        || lit != Some((Bpc10, t, Some((2656, 45, 10, (44, 0)))))
+    {
+        panic!("10-bpc MST stream: {r:?} {lit:?}");
+    }
+    if pick(4000, 16).2 != lit {
+        return TestResult::Fail("max bpc 16");
+    }
+    let rate8 = super::super::mst_vc_rate(&t, 8, 4, DpRate::Legacy(caps.rate), false);
+    let (_, r, lit) = pick(4000, 8);
+    if r != raw(8, 8, 2125, 36) || lit != Some((Bpc8, t, Some((2125, 36, 8, rate8.unwrap())))) {
+        panic!("8-bpc MST stream: {r:?} {lit:?}");
+    }
+    // Stepped down, its PBN still the requested depth's.
+    let (_, r, lit) = pick(2400, 10);
+    if r != raw(8, 10, 2656, 45) || lit.is_some() {
+        panic!("stepped-down MST stream: {r:?} {lit:?}");
+    }
+    let (_, r, lit) = pick(2400, 8);
+    if r != raw(8, 8, 2125, 36) || lit.map(|l| l.0) != Some(Bpc8) {
+        panic!("8 bpc behind a narrow port: {r:?} {lit:?}");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-mst",
+    navi48_mst_raw_streams_run_deep_color
+);
+
+const RAW_VECTORS: &str = include_str!("../tests/dcn401_dsc/mst_raw_vectors.txt");
+
+/// mst_raw_vectors.txt (mst_harness.c built with RAW_DEPTH): Linux's
+/// uncompressed MST stream depth (create_validate_stream_for_sink's mask
+/// with dm_dp_mst_is_port_support_mode) and its PBN and slots
+/// (dm_encoder_helper_atomic_check's drm_dp_calc_pbn_mode at
+/// convert_color_depth_from_display_info of max_requested_bpc), through
+/// `raw_mst_choice`; a stream no depth carries, or whose slots exceed the
+/// link's, is none.
+fn navi48_mst_raw_depth_matches_linux_vectors() -> TestResult {
+    let (mut checked, mut carried, mut stepped) = (0, 0, 0);
+    for line in RAW_VECTORS
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        let Some((input, want)) = line.split_once(" = ") else {
+            return TestResult::Fail("vector line");
+        };
+        let i: Vec<u32> = input
+            .split_whitespace()
+            .filter_map(|v| v.parse().ok())
+            .collect();
+        let w: Vec<u32> = want
+            .split_whitespace()
+            .filter_map(|v| v.parse().ok())
+            .collect();
+        let ([enc, kbps, edid_bpc, requested, pix, ha, ht, va, vt, full], [bpc, pbn, slots]) =
+            (i.as_slice(), w.as_slice())
+        else {
+            return TestResult::Fail("vector fields");
+        };
+        let code = match edid_bpc {
+            0 => 0,
+            8 => 2,
+            10 => 3,
+            12 => 4,
+            14 => 5,
+            16 => 6,
+            _ => return TestResult::Fail("vector EDID depth"),
+        };
+        let link = DscLink {
+            encoding: if *enc == 1 {
+                LinkEncoding::Dp128b132b
+            } else {
+                LinkEncoding::Dp8b10b
+            },
+            kbps: *kbps,
+            slots: if *enc == 1 { 64 } else { 63 },
+            max_dispclk_khz: 2_000_000,
+        };
+        let t = timing(pix / 10, *ha, *ht, *va, *vt);
+        let got = super::super::raw_mst_choice(
+            &t,
+            &uhd60_edid(code),
+            *requested as u8,
+            *full as u16,
+            &link,
+        );
+        let expect = (*bpc != 0 && *slots <= u32::from(link.slots)).then_some((*bpc, *pbn, *slots));
+        if got.map(|r| (u32::from(r.bpc), u32::from(r.pbn), u32::from(r.slots))) != expect {
+            panic!("{input}: {got:?} want {expect:?}");
+        }
+        checked += 1;
+        if let Some(r) = got {
+            carried += 1;
+            stepped += usize::from(r.bpc < r.pbn_bpc);
+        }
+    }
+    if checked < 1400 || carried < 500 || stepped < 20 {
+        panic!("raw vector coverage: {checked} {carried} {stepped}");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-mst",
+    navi48_mst_raw_depth_matches_linux_vectors
+);

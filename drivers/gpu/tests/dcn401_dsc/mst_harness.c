@@ -18,7 +18,31 @@
  *   and, built with -DSTREAM_BPC, <bpc 8|10|12> (the stream's
  *   display_color_depth; 8 otherwise)
  * prints "FAIL" or, per stream, "<pbn> <dsc 0|1> <bpp_x16> <slices_h>
- * <slices_v>" separated by " |". */
+ * <slices_v>" separated by " |".
+ *
+ * Built with -DRAW_DEPTH it instead replays an uncompressed stream on a
+ * link without DSC decoders, where compute_mst_dsc_configs_for_state
+ * leaves each payload alone. check.sh extracts
+ * amdgpu_dm_convert_color_depth_from_display_info and
+ * amdgpu_dm_convert_dc_color_depth_into_bpc (amdgpu_dm_connector.c),
+ * kbps_from_pbn (amdgpu_dm_mst_types.c) and drm_dp_calc_pbn_mode with the
+ * drm_dp_bw_overhead helpers it calls into mst_raw.c. The stream depth is
+ * amdgpu_dm_create_validate_stream_for_sink's loop over the bpc mask
+ * (each depth at or below max_requested_bpc and display_info.bpc), every
+ * try built at convert_color_depth_from_display_info(connector, false,
+ * bpc) as fill_stream_properties_from_drm_display_mode does and kept when
+ * dm_dp_mst_is_port_support_mode's DSC-unnecessary case passes (its
+ * dc_bandwidth_in_kbps_from_timing within min(root link, kbps_from_pbn(
+ * full_pbn))); without a decoder the other case fails. bpc_order is cut to
+ * the native encoders' 12, 10, 8. The payload is
+ * dm_encoder_helper_atomic_check's: drm_dp_calc_pbn_mode(clock, bpp << 4)
+ * at convert_color_depth_from_display_info(connector, false,
+ * max_requested_bpc), and its slots DIV_ROUND_UP(dfixed_const(pbn),
+ * pbn_div). Each stdin line:
+ *   <encoding 0=8b/10b 1=128b/132b> <link_kbps> <display_info.bpc>
+ *   <max_requested_bpc> <pix_clk_100hz> <h_active> <h_total> <v_active>
+ *   <v_total> <port full PBN>
+ * prints "<stream bpc, 0 when none is carried> <pbn> <slots>". */
 #include "dc_dsc.h"
 #include "dsc.h"
 #include "dc.h"
@@ -70,7 +94,11 @@ struct dc_sink {
 typedef struct { uint32_t full; } fixed20_12;
 #define dfixed_const(A) (uint32_t)(((A) << 12))
 #define dfixed_trunc(A) ((A).full >> 12)
-struct drm_display_info { int max_dsc_bpp; };
+struct drm_display_info {
+	int max_dsc_bpp;
+	unsigned int bpc;
+	struct { u8 y420_dc_modes; } hdmi;
+};
 struct drm_connector { struct drm_display_info display_info; };
 struct amdgpu_dm_connector { struct drm_connector base; struct dc_link *dc_link; };
 struct drm_dp_mst_topology_mgr { int unused; };
@@ -143,6 +171,51 @@ int drm_dp_mst_atomic_check(struct drm_atomic_commit *s)
 
 #include "mst_fair.c"
 
+#ifdef RAW_DEPTH
+#include "mst_raw.c"
+
+int main(void)
+{
+	static const u8 bpc_order[] = { 12, 10, 8 };
+	unsigned int enc, link_kbps, edid_bpc, n;
+	int requested, full_pbn;
+	struct dc_crtc_timing t;
+
+	while (scanf("%u %u %u %d %u %u %u %u %u %d", &enc, &link_kbps, &edid_bpc, &requested,
+		     &t.pix_clk_100hz, &t.h_addressable, &t.h_total, &t.v_addressable,
+		     &t.v_total, &full_pbn) == 10) {
+		struct drm_connector connector = { .display_info = { .bpc = edid_bpc } };
+		const struct drm_display_info *info = &connector.display_info;
+		unsigned int end_to_end, j, bpc = 0, pbn_div;
+		enum dc_color_depth depth;
+		int pbn, slots;
+
+		encoding = enc ? DC_LINK_ENCODING_DP_128b_132b : DC_LINK_ENCODING_DP_8b_10b;
+		t.pixel_encoding = PIXEL_ENCODING_RGB;
+		end_to_end = min(link_kbps, kbps_from_pbn(full_pbn));
+		for (j = 0; j < ARRAY_SIZE(bpc_order) && !bpc; j++) {
+			u8 b = bpc_order[j];
+
+			if (requested > 0 && b > requested)
+				continue;
+			if (info->bpc && b > info->bpc)
+				continue;
+			t.display_color_depth =
+				amdgpu_dm_convert_color_depth_from_display_info(&connector, false, b);
+			if (dc_bandwidth_in_kbps_from_timing(&t, encoding) <= end_to_end)
+				bpc = amdgpu_dm_convert_dc_color_depth_into_bpc(t.display_color_depth);
+		}
+		depth = amdgpu_dm_convert_color_depth_from_display_info(&connector, false, requested);
+		pbn = drm_dp_calc_pbn_mode(t.pix_clk_100hz / 10,
+					   (amdgpu_dm_convert_dc_color_depth_into_bpc(depth) * 3) << 4);
+		/* dm_mst_get_pbn_divider. */
+		pbn_div = dfixed_const((uint32_t)((uint64_t)link_kbps * 100 / (8 * 1000 * 54))) / 100;
+		slots = DIV_ROUND_UP(dfixed_const(pbn), pbn_div);
+		printf("%u %d %d\n", bpc, pbn, slots);
+	}
+	return 0;
+}
+#else
 int main(void)
 {
 	static const struct clk_mgr_funcs clk_funcs = { .get_max_clock_khz = max_clock_khz };
@@ -269,3 +342,4 @@ int main(void)
 	}
 	return 0;
 }
+#endif

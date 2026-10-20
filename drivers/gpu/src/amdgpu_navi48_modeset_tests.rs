@@ -2358,7 +2358,7 @@ fn navi48_mst_selection_trains_uhbr_when_the_branch_codes_it() -> TestResult {
     }
     // 64 slots: five such streams would fit the link, as 63 would not.
     let t = s[0].timing;
-    let slots = super::super::mst::mst_slots(&t, 4, s[0].rate, false)
+    let slots = super::super::mst::mst_slots(&t, 8, 4, s[0].rate, false)
         .unwrap()
         .1;
     if super::super::mst::mst_total_slots(s[0].rate) != 64 || slots * 5 > 64 {
