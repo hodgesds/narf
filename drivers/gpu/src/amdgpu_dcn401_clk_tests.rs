@@ -675,3 +675,113 @@ kernel_test_in!(
     "drivers/gpu/dcn401-clk",
     dcn401_pipe_references_require_current_matching_idle_authority
 );
+
+/// One live update with a recording DTO step: the result and the DTO
+/// references, in call order.
+fn live(
+    e: &mut Engine<Fake>,
+    request: Request,
+    lower: bool,
+    held: &(dyn Fn(u64) -> bool + Sync),
+) -> (Result<Applied, Error>, Vec<u32>) {
+    let mut refs = Vec::new();
+    let mut dto = |r: u32| {
+        refs.push(r);
+        Ok(())
+    };
+    let result = run(e.update_live(request, lower, held, &mut dto));
+    (result, refs)
+}
+
+/// The hard-min messages (clock, MHz) a stretch of commands sent.
+fn hard_mins(commands: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    commands
+        .iter()
+        .filter(|&&(m, _)| m == 9)
+        .map(|&(_, a)| (a >> 16, a & 0xffff))
+        .collect()
+}
+
+/// dcn401_update_clocks while displays run. prepare_bandwidth (not safe
+/// to lower) sends the display count, raises DISPCLK and then the DPP DTO
+/// reference before the DTOs (given the reference PMFW returned), and
+/// leaves every lower request alone; optimize_bandwidth (safe to lower)
+/// sends no count, lowers DISPCLK, then raises the DTOs for the lower
+/// reference before lowering it and sets them again for the actual one.
+/// Consumers other than the held ones must be idle.
+fn dcn401_live_clock_updates_follow_dcn401_update_clocks() -> TestResult {
+    let mut e = engine();
+    start(&mut e);
+    run(e.prepare(request())).unwrap();
+    let busy = DIO + 0x1b43 * 4; // OTG0_MASTER_EN: a live display
+    e.io.regs.insert(busy, 1);
+    let up = Request {
+        displays: 2,
+        display_khz: 900_000,
+        dpp_khz: 700_000,
+        dtb_khz: 600_000,
+    };
+    let (refused, refs) = live(&mut e, up, false, &|_| false);
+    if refused != Err(Error::Busy) || !refs.is_empty() {
+        return TestResult::Fail("busy consumer not held");
+    }
+    let held = move |at: u64| at == busy;
+    let before = e.io.commands.len();
+    let (applied, refs) = live(&mut e, up, false, &held);
+    let applied = applied.unwrap();
+    let sent = e.io.commands[before..].to_vec();
+    // Count first, then DISPCLK (6) and DPPCLK (7); DTBCLK unchanged.
+    if sent.first() != Some(&(0xe, 2))
+        || hard_mins(&sent) != [(6, 900), (7, 700)]
+        || refs != [700_000]
+        || applied.request != up
+        || (applied.display_khz, applied.dpp_khz) != (900_000, 700_000)
+    {
+        return TestResult::Fail("prepare raise order");
+    }
+    // A lower request in prepare changes nothing but refreshes the DTOs.
+    let down = Request {
+        displays: 1,
+        display_khz: 300_000,
+        dpp_khz: 200_000,
+        dtb_khz: 600_000,
+    };
+    let before = e.io.commands.len();
+    let (kept, refs) = live(&mut e, down, false, &held);
+    let kept = kept.unwrap();
+    let sent = e.io.commands[before..].to_vec();
+    if sent != [(0xe, 1)]
+        || refs != [700_000]
+        || (kept.request.display_khz, kept.request.dpp_khz) != (900_000, 700_000)
+    {
+        return TestResult::Fail("prepare lowered a clock");
+    }
+    // optimize: DISPCLK lowered, the DTOs raised for the lower reference
+    // before it falls, then set for the reference PMFW reports.
+    e.io.actual = Some(310_000);
+    let before = e.io.commands.len();
+    let (low, refs) = live(&mut e, down, true, &held);
+    let low = low.unwrap();
+    let sent = e.io.commands[before..].to_vec();
+    if sent.iter().any(|&(m, _)| m == 0xe)
+        || hard_mins(&sent) != [(6, 300), (7, 200)]
+        || refs != [200_000, 310_000]
+        || low.dpp_khz != 310_000
+        || low.request.dpp_khz != 200_000
+    {
+        return TestResult::Fail("optimize lower order");
+    }
+    // A failed DTO step leaves the owner failed.
+    e.io.actual = None;
+    let mut fail = |_: u32| Err::<(), Error>(Error::Dto);
+    if run(e.update_live(up, false, &held, &mut fail)) != Err(Error::Dto)
+        || e.status.state != State::Failed(Error::Dto)
+    {
+        return TestResult::Fail("failed DTO step");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-clk",
+    dcn401_live_clock_updates_follow_dcn401_update_clocks
+);
