@@ -968,7 +968,7 @@ impl Shape {
         let full_swath = self.swath_ub * self.bpp;
         let p = &self.plane;
         let unity = u128::from(Plane::UNITY);
-        let ceil_v = (u128::from(p.v_ratio) + unity - 1) / unity;
+        let ceil_v = u128::from(p.v_ratio).div_ceil(unity);
         let lines = u128::from(p.v_taps) + ceil_v.saturating_sub(2);
         let lb = LINE_BUFFER_BITS as u128 * u128::from(p.h_ratio).max(unity);
         if full_swath / 2 > self.det_bytes / 2

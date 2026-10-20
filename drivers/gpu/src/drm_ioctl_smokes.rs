@@ -3949,7 +3949,8 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
         return TestResult::Fail("TEST_ONLY overlay");
     }
     let eighth = place(big_fb, (256, 128), (0, 0, 32, 16));
-    let refused: [(&str, alloc::vec::Vec<(u32, u64)>, u32); 7] = [
+    type Case = (&'static str, alloc::vec::Vec<(u32, u64)>, u32);
+    let refused: [Case; 7] = [
         ("8:1 downscale", alloc::vec::Vec::from(eighth), OVERLAY),
         ("rotate-90", with(&[(planes::ROTATION_PROP_ID, 2)]), OVERLAY),
         (

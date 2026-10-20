@@ -152,12 +152,15 @@ impl PlaneSetup {
     }
 }
 
+/// Each overlay's pipe and, on an ODM stream, its ODM pipe, bottom first.
+pub type OverlayPipes = [Option<(u8, Option<u8>)>; otg::MAX_OVERLAYS];
+
 /// The pipes one display lights on beyond its own: the ODM pipe of its
 /// stream, and each overlay's pipe and (on an ODM stream) ODM pipe.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DisplayPipes {
     pub odm: Option<u8>,
-    pub overlays: [Option<(u8, Option<u8>)>; otg::MAX_OVERLAYS],
+    pub overlays: OverlayPipes,
 }
 impl DisplayPipes {
     /// Every overlay pipe (both halves), by bit.
@@ -179,7 +182,7 @@ pub fn plane_requests(
     s: &Selection,
     pipe: u8,
     odm: Option<u8>,
-    overlays: &[Option<(u8, Option<u8>)>; otg::MAX_OVERLAYS],
+    overlays: &OverlayPipes,
 ) -> (
     otg::SurfaceRequest,
     [Option<otg::SurfaceRequest>; otg::MAX_OVERLAYS],
@@ -202,7 +205,7 @@ pub fn stream_planes(
     format: otg::SurfaceFormat,
     setup: &PlaneSetup,
     (pipe, odm): (u8, Option<u8>),
-    overlays: &[Option<(u8, Option<u8>)>; otg::MAX_OVERLAYS],
+    overlays: &OverlayPipes,
 ) -> (
     otg::SurfaceRequest,
     [Option<otg::SurfaceRequest>; otg::MAX_OVERLAYS],
@@ -1984,7 +1987,7 @@ pub fn overlay_pipes(
     plans: &[dml::Plan],
     pipes: &[u8],
     odm: &[Option<u8>],
-) -> Result<Vec<[Option<(u8, Option<u8>)>; otg::MAX_OVERLAYS]>, ModesetError> {
+) -> Result<Vec<OverlayPipes>, ModesetError> {
     let mut used = pipes
         .iter()
         .copied()

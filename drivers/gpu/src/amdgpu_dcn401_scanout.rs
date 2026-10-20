@@ -520,6 +520,7 @@ impl<I: Io> Engine<I> {
     /// surface in use, without underflow. Returns the frame count then.
     /// Every plane of `p` whose address differs from `from`'s flips; all of
     /// them latch at the one VUPDATE the lock releases to.
+    #[cfg(feature = "kernel-test")]
     pub(super) async fn flip_to(&mut self, p: Pipe) -> Result<u32, Error> {
         self.flip_from(p, None).await
     }
@@ -742,6 +743,7 @@ impl<I: Io> Engine<I> {
         Ok(())
     }
     /// One pipe of a single-plane live scanout, its own tree's only MPCC.
+    #[cfg(feature = "kernel-test")]
     pub(in crate::amdgpu_dcn401_otg) fn live_segment(
         &mut self,
         pipe: u8,

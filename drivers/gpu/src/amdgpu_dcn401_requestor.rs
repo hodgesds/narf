@@ -225,6 +225,7 @@ impl Surfaces {
         }
         Ok(out)
     }
+    #[cfg(feature = "kernel-test")]
     pub(in crate::amdgpu_dcn401_otg) async fn prepare_requestor<I: Io>(
         &mut self,
         e: &mut Engine<I>,
