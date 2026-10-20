@@ -2241,7 +2241,7 @@ fn navi48_dsc_link_verification_reselects_compressed_geometry() -> TestResult {
         &DscSinkCaps::parse(&DSC, &[0; 3]).unwrap(),
         NOMINAL_DISPCLK_KHZ,
         legacy_kbps(2, Hbr2, true) as u32,
-        &dsc_timing(&again.timing),
+        &dsc_timing(&again.timing, 8),
         LinkEncoding::Dp8b10b,
         false,
     );
@@ -2573,7 +2573,7 @@ fn navi48_modeset_decides_uhbr_dsc_like_linux() -> TestResult {
     ];
     for (i, (t, c, link, want)) in cases.into_iter().enumerate() {
         let uncompressed = dp_link(&t, c);
-        let cfg = dp_dsc(&t, c, NOMINAL_DISPCLK_KHZ);
+        let cfg = dp_dsc(&t, c, NOMINAL_DISPCLK_KHZ, 8);
         let got = uncompressed.or_else(|| cfg.and_then(|cfg| dsc_link(&t, cfg, c)));
         assert_eq!(got, link, "case {i}: link");
         let Some((slices, bpp, kbps, target, encoding)) = want else {
@@ -2586,13 +2586,16 @@ fn navi48_modeset_decides_uhbr_dsc_like_linux() -> TestResult {
             &sink,
             NOMINAL_DISPCLK_KHZ,
             target as u32,
-            &dsc_timing(&t),
+            &dsc_timing(&t, 8),
             encoding,
             false,
         );
         assert_eq!(Some(cfg), linux, "case {i}: dc_dsc_compute_config");
         assert_eq!((cfg.slices_h, cfg.bpp_x16), (slices, bpp), "case {i}");
-        assert_eq!(dsc_kbps(&dsc_timing(&t), cfg.bpp_x16, cfg.slices_h), kbps);
+        assert_eq!(
+            dsc_kbps(&dsc_timing(&t, 8), cfg.bpp_x16, cfg.slices_h),
+            kbps
+        );
         // The admission shape: the DSCs DML gives the stream.
         let pipes = dml::dsc_pipes(&t, cfg.slices_h, NOMINAL_DISPCLK_KHZ);
         assert_eq!(
@@ -2615,7 +2618,7 @@ fn navi48_modeset_decides_uhbr_dsc_like_linux() -> TestResult {
                 if dp_link(&t, c).is_some() {
                     continue;
                 }
-                if let Some(cfg) = dp_dsc(&t, c, NOMINAL_DISPCLK_KHZ) {
+                if let Some(cfg) = dp_dsc(&t, c, NOMINAL_DISPCLK_KHZ, 8) {
                     match dsc_link(&t, cfg, c) {
                         Some((_, Uhbr(_))) => {}
                         other => panic!("{lanes} lanes {h_active} at {khz}: {other:?}"),
@@ -2629,6 +2632,125 @@ fn navi48_modeset_decides_uhbr_dsc_like_linux() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_modeset_decides_uhbr_dsc_like_linux
+);
+
+const DEPTH_VECTORS: &str = include_str!("../tests/dcn401_dsc/depth_vectors.txt");
+
+/// An EDID 1.4 base block whose digital input declares `bpc` (0:
+/// undefined), for `dp_depths`.
+fn edid_with_bpc(bpc: u8) -> [u8; 128] {
+    let mut e = [0u8; 128];
+    e[18] = 1;
+    e[19] = 4;
+    let code = match bpc {
+        6 => 1,
+        8 => 2,
+        10 => 3,
+        12 => 4,
+        14 => 5,
+        16 => 6,
+        _ => 0,
+    };
+    e[20] = 0x80 | code << 4;
+    e
+}
+
+/// One depth_vectors.txt line through `dp_sst_stream`, printed as
+/// depth_harness.c prints Linux's choice.
+fn run_depth_vector(input: &str) -> Option<alloc::string::String> {
+    use core::fmt::Write;
+    let w: Vec<&str> = input.split_whitespace().collect();
+    let mut dpcd = [0u8; 16];
+    for (i, b) in dpcd.iter_mut().enumerate() {
+        *b = u8::from_str_radix(w.first()?.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    let n: Vec<u32> = w[1..]
+        .iter()
+        .map(|v| v.parse().ok())
+        .collect::<Option<_>>()?;
+    let (dispclk, pix, ha, ht, va, vt) = (n[0], n[1], n[2], n[3], n[4], n[5]);
+    let (edid_bpc, requested, lanes, rate) = (n[6] as u8, n[7] as u8, n[8] as u8, n[9]);
+    let t = Timing {
+        pixel_clock_khz: pix / 10,
+        h_active: ha,
+        h_total: ht,
+        h_front_porch: 48,
+        h_sync_width: 32,
+        v_active: va,
+        v_total: vt,
+        v_front_porch: 3,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: false,
+    };
+    // The sink's maximum link: an 8b/10b rate with FEC, or 128b/132b up
+    // to the given UHBR rate (the HBR3 8b/10b link below it).
+    let (legacy, uhbr) = match rate {
+        1000 => (LinkRate::Hbr3, 0b001),
+        1350 => (LinkRate::Hbr3, 0b011),
+        2000 => (LinkRate::Hbr3, 0b111),
+        r => (LinkRate::from_dpcd_byte(r as u8)?, 0),
+    };
+    let caps = DpCaps {
+        lanes,
+        rate: legacy,
+        uhbr,
+        fec: true,
+        dsc: crate::amdgpu_dsc::DscSinkCaps::parse(&dpcd, &[0; 3]),
+    };
+    let depths = dp_depths(&edid_with_bpc(edid_bpc), requested);
+    let mut out = alloc::string::String::new();
+    match dp_sst_stream(&t, caps, &depths, dispclk) {
+        None => out.push_str("FAIL"),
+        Some(s) => {
+            let bpc = depth_bpc(s.depth);
+            match s.dsc {
+                None => write!(out, "{bpc} -").ok()?,
+                Some(c) => write!(
+                    out,
+                    "{bpc} {} {} {} {}",
+                    c.slices_h,
+                    c.slices_v,
+                    c.bpp_x16,
+                    crate::amdgpu_dsc::dsc_kbps(&dsc_timing(&t, c.bpc), c.bpp_x16, c.slices_h)
+                )
+                .ok()?,
+            }
+            if s.dsc.is_some_and(|c| c.bpc != bpc) {
+                return None;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Every depth_vectors.txt line: amdgpu_dm_create_validate_stream_for_sink's
+/// DP SST depth search as Linux built on the host runs it (depth_harness.c:
+/// the requested and EDID depths, uncompressed or DSC at each, the first
+/// that fits the maximum link), through `dp_sst_stream` and `dp_depths`.
+fn navi48_dp_sst_depth_search_matches_linux_vectors() -> TestResult {
+    let mut checked = 0;
+    for line in DEPTH_VECTORS
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        let Some((input, want)) = line.split_once(" = ") else {
+            return TestResult::Fail("malformed depth vector");
+        };
+        match run_depth_vector(input) {
+            Some(got) if got == want => checked += 1,
+            Some(got) => panic!("depth vector {input}\n want {want}\n  got {got}"),
+            None => return TestResult::Fail("depth vector input"),
+        }
+    }
+    if checked < 1000 {
+        return TestResult::Fail("too few depth vectors");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_dp_sst_depth_search_matches_linux_vectors
 );
 
 /// A one-lane UHBR10 sink (DSC decoder, board connector at UHBR10) and its
@@ -2668,7 +2790,7 @@ fn navi48_modeset_selects_dsc_over_uhbr() -> TestResult {
         &DscSinkCaps::parse(&UHBR_DSC, &[0; 3]).unwrap(),
         NOMINAL_DISPCLK_KHZ,
         9_641_000,
-        &dsc_timing(&s.timing),
+        &dsc_timing(&s.timing, 8),
         LinkEncoding::Dp128b132b,
         false,
     );
@@ -3599,4 +3721,80 @@ fn navi48_live_plane_pipes_keep_every_plane_dc_keeps() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_live_plane_pipes_keep_every_plane_dc_keeps
+);
+
+/// DSC at the deepest depth, as create_validate_stream_for_sink tries each
+/// depth with apply_dsc_policy_for_stream: a 10-bpc 4K60 sink on 4 x HBR2
+/// with FEC (16,761,600 kbps) would take 8-bpc RGB raw (14,256,000) but
+/// not 10-bpc (17,820,000), so with max_bpc 10 it is compressed from 10 bpc
+/// (dc_dsc_compute_config at that depth) rather than sent raw at 8. A
+/// decoder without 10-bpc input, or max_bpc 8, keeps it raw at 8.
+/// refine_dsc keeps the depth, the timing request compresses at it and the
+/// blank request feeds the DSC that depth.
+fn navi48_modeset_compresses_dp_sst_at_10_bpc_like_amdgpu_dm() -> TestResult {
+    use crate::amdgpu_dsc::{compute_config, DscSinkCaps, LinkEncoding};
+    // DSC 1.2, slices 1/2/4, 13-bit line buffer, RGB, 1000 MP/s per
+    // slice, 5120-pixel slices, 1/16 bpp; 8, 10 and 12 bpc input.
+    const DSC: [u8; 16] = [
+        1, 0x21, 0, 0x0b, 0x0b, 4, 1, 0, 0, 0x13, 0x0e, 0xee, 16, 0, 0, 0,
+    ];
+    let mut edid = edid_uhbr();
+    edid[20] = 0x80 | 3 << 4 | 5; // 10 bpc, DisplayPort
+    edid[127] = 0;
+    edid[127] = narf_edid::compute_checksum(&edid[..128]);
+    let p = path(inventory::Connector::DisplayPort, 0);
+    let pick = |dsc: [u8; 16], max: u8| {
+        let mut device = port(p, dpcd(0x14, 4), edid.clone());
+        let sink = device.sink.as_mut().unwrap();
+        sink.fec = true;
+        sink.dsc = Some(dsc);
+        select(&[p], &[device], max, None).unwrap()
+    };
+    let mut s = pick(DSC, 10);
+    let link = legacy_kbps(4, LinkRate::Hbr2, true);
+    assert_eq!(link, 16_761_600);
+    assert!(stream_kbps_bpc(&s.timing, false, 8) <= link);
+    assert!(stream_kbps_bpc(&s.timing, false, 10) > link);
+    let want = compute_config(
+        &DscSinkCaps::parse(&DSC, &[0; 3]).unwrap(),
+        NOMINAL_DISPCLK_KHZ,
+        link as u32,
+        &dsc_timing(&s.timing, 10),
+        LinkEncoding::Dp8b10b,
+        false,
+    );
+    if s.depth != otg::ColorDepth::Bpc10
+        || want.is_none_or(|c| c.bpc != 10)
+        || s.dsc != want
+        || (s.lanes, s.rate) != (4, DpRate::Legacy(LinkRate::Hbr2))
+    {
+        panic!(
+            "10-bpc DSC: {:?} {:?} {} {:?}",
+            s.depth, s.dsc, s.lanes, s.rate
+        );
+    }
+    let soc = dsc_soc();
+    refine_dsc(&soc, core::slice::from_mut(&mut s)).unwrap();
+    let plans = admit_displays(&soc, &[s]).unwrap();
+    let request = timing_request(0, &plans[0], &s);
+    if s.depth != otg::ColorDepth::Bpc10
+        || request.dsc.map(|c| c.bpc) != Some(10)
+        || s.blank_request(0).depth != otg::ColorDepth::Bpc10
+    {
+        return TestResult::Fail("10-bpc DSC through refine and the requests");
+    }
+    // 8-bpc-only input (DP_DSC_DEC_COLOR_DEPTH_CAP 8 bpc) or max_bpc 8:
+    // 10-bpc DSC fails validation and 8 bpc goes raw.
+    let mut eight = DSC;
+    eight[10] = 0x02;
+    for s in [pick(eight, 10), pick(DSC, 8)] {
+        if s.depth != otg::ColorDepth::Bpc8 || s.dsc.is_some() {
+            panic!("8-bpc fallback: {:?} {:?}", s.depth, s.dsc);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_compresses_dp_sst_at_10_bpc_like_amdgpu_dm
 );

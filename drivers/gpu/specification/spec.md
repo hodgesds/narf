@@ -1389,8 +1389,17 @@ setting that trained, else one RBR lane, as the port's `VerifiedLink`
 a changed EDID/DPCD, a nonresponding or empty port drops it.
 
 DSC follows amdgpu_dm's SST policy for a dongle-less DP sink on either
-encoding. `dp_dsc(timing, caps, max_dispclk_khz)` runs only when no
-uncompressed setting (`dp_link`) carries the mode, and compresses with
+encoding, at every depth amdgpu_dm_create_validate_stream_for_sink tries:
+`dp_sst_stream(timing, caps, depths, max_dispclk_khz) -> Option<DpSstStream {
+lanes, rate, dsc, depth }>` walks `dp_depths` (the EDID 1.4 depth, 8 when
+undefined, up to `max_bpc`, deepest first) and at each depth takes the
+stream raw when a link carries it (`dp_link_bpc`), else compressed from that
+depth, else the next depth; a deeper compressed stream is preferred to a
+shallower raw one, as in Linux (6 bpc, which the native encoders cannot
+send, is never tried). `tests/dcn401_dsc/check.sh` replays 2000
+depth_vectors.txt searches through Linux's DSC code (depth_harness.c).
+`dp_dsc(timing, caps, max_dispclk_khz, bpc)` runs only when no
+uncompressed setting carries the mode at `bpc`, and compresses with
 `dc_dsc_compute_config` against `dc_link_bandwidth_kbps` at the sink's
 maximum link: 4 lanes x the best UHBR rate (`uhbr_kbps`, 128b/132b
 encoding, FEC inherent, no FEC cap needed) when `DpCaps::uhbr` is nonzero,
@@ -1404,8 +1413,9 @@ pixels, so 8K takes two DSCs (four on a board whose DISPCLK two cannot cover).
 FEC when it carries it, else the first 128b/132b setting upward, lanes before
 rate. A UHBR sink therefore never compresses onto 8b/10b (16 bpp is two
 thirds of 24 bpp, and 8b/10b with FEC carries less than two thirds of UHBR10
-at any lane count), and uncompressed UHBR always wins over DSC. `refine_dsc`
-redoes both with the board's DISPCLK. A compressed UHBR stream carries no
+at any lane count), and uncompressed UHBR always wins over DSC at the same
+depth. `refine_dsc` redoes both with the board's DISPCLK, from the selected
+depth down (a depth whose DSC shape the board cannot run falls to the next). A compressed UHBR stream carries no
 audio. Fallback keeps the admitted PPS (`selected_dp_candidates`): Linux's
 `dp_lt_fallbacks` through its 128b/132b settings that carry the compressed
 stream for a UHBR link, narf's 8b/10b ladder for an 8b/10b one. DML21

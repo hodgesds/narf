@@ -74,10 +74,11 @@ pub struct Selection {
     pub hdmi: bool,
     /// The HDMI sink declared SCDC (HF-VSDB/HF-SCDB SCDC_Present).
     pub scdc: bool,
-    /// Output depth: for DP SST the deepest uncompressed depth up to the
-    /// sink's EDID bpc and `max_bpc` a link carries (8 for MST and DSC);
-    /// for HDMI the deepest the sink, the
-    /// link capacity and the requested maximum allow.
+    /// Output depth: for DP SST the deepest depth up to the sink's EDID bpc
+    /// and `max_bpc` a link carries, uncompressed or compressed
+    /// (`dp_sst_stream`; a compressed stream's `DscConfig::bpc`); 8 for
+    /// MST; for HDMI the deepest the sink, the link capacity and the
+    /// requested maximum allow.
     pub depth: otg::ColorDepth,
     /// The sink's audio; FRL retains only supported LPCM modes.
     pub audio: Option<otg::AudioInfo>,
@@ -637,7 +638,7 @@ pub fn frl_video_params(
 
 /// The DSC view of an 8-bpc RGB HDMI FRL stream.
 fn frl_dsc_timing(t: &Timing) -> crate::amdgpu_dsc::DscTiming {
-    dsc_timing(t)
+    dsc_timing(t, 8)
 }
 
 /// update_dsc_caps for an HDMI FRL sink: its HF DSC decoder
@@ -1333,7 +1334,7 @@ fn dsc_fits(
         DpRate::Uhbr(r) => uhbr_kbps(lanes, r),
     };
     u64::from(crate::amdgpu_dsc::dsc_kbps(
-        &dsc_timing(timing),
+        &dsc_timing(timing, cfg.bpc),
         cfg.bpp_x16,
         cfg.slices_h,
     )) <= have
@@ -1361,42 +1362,53 @@ pub fn dsc_link(
 /// Admission shape for an alternative DP timing. Recompute its DSC with the
 /// board's real DISPCLK limit, and after fallback require the configuration
 /// that selection would produce to fit the link which actually trained.
+/// The depths are amdgpu_dm's for the sink (`dp_depths` up to `max_bpc()`),
+/// deepest first: at each the mode is carried uncompressed, else
+/// compressed, else the next depth is tried (`dp_sst_stream`).
 fn dp_offered_mode(timing: Timing, s: &Selection, max_dispclk_khz: u32) -> Option<dml::Mode> {
     let selected = match s.dsc {
         Some(cfg) => dsc_link(&s.timing, cfg, s.caps),
-        None => dp_link(&s.timing, s.caps),
+        None => dp_link_bpc(&s.timing, s.caps, depth_bpc(s.depth)),
     };
     let fell_back = selected != Some((s.lanes, s.rate));
-    if dp_link(&timing, s.caps).is_some() {
-        return (!fell_back || dp_fits(&timing, s.caps, s.lanes, s.rate))
-            .then(|| plane_mode(timing, s.format));
+    for depth in dp_depths(&s.edid, max_bpc()) {
+        let bpc = depth_bpc(depth);
+        if dp_link_bpc(&timing, s.caps, bpc).is_some() {
+            if !fell_back || dp_fits_bpc(&timing, s.caps, s.lanes, s.rate, bpc) {
+                return Some(plane_mode(timing, s.format));
+            }
+            continue;
+        }
+        let Some(cfg) = dp_dsc(&timing, s.caps, max_dispclk_khz, bpc) else {
+            continue;
+        };
+        if fell_back && !dsc_fits(&timing, cfg, s.caps, s.lanes, s.rate) {
+            continue;
+        }
+        return Some(dml::Mode {
+            dsc: Some(dml::Dsc {
+                slices: cfg.slices_h,
+                bpp_x16: cfg.bpp_x16,
+            }),
+            ..plane_mode(timing, s.format)
+        });
     }
-    let cfg = dp_dsc(&timing, s.caps, max_dispclk_khz)?;
-    if fell_back && !dsc_fits(&timing, cfg, s.caps, s.lanes, s.rate) {
-        return None;
-    }
-    Some(dml::Mode {
-        dsc: Some(dml::Dsc {
-            slices: cfg.slices_h,
-            bpp_x16: cfg.bpp_x16,
-        }),
-        ..plane_mode(timing, s.format)
-    })
+    None
 }
 
 /// dcn4_soc_bb's DISPCLK maximum: DSC decisions before the board's levels
 /// are known use it, and are redone with the board's (`refine_dsc`).
 pub(super) const NOMINAL_DISPCLK_KHZ: u32 = 2_000_000;
 
-/// The DSC view of an 8-bit RGB DP stream.
-fn dsc_timing(t: &Timing) -> crate::amdgpu_dsc::DscTiming {
+/// The DSC view of an RGB stream at `bpc` (its display_color_depth).
+fn dsc_timing(t: &Timing, bpc: u8) -> crate::amdgpu_dsc::DscTiming {
     crate::amdgpu_dsc::DscTiming {
         pix_clk_100hz: t.pixel_clock_khz * 10,
         h_active: t.h_active,
         h_total: t.h_total,
         v_active: t.v_active,
         v_total: t.v_total,
-        bpc: 8,
+        bpc,
         encoding: crate::amdgpu_dsc::Encoding::Rgb,
     }
 }
@@ -1410,11 +1422,14 @@ fn dsc_timing(t: &Timing) -> crate::amdgpu_dsc::DscTiming {
 /// else 8b/10b with FEC. `dsc_link` then picks the link for the compressed
 /// bandwidth. Each DSC takes at most four slices and DSC401's 5184-pixel
 /// image, so the stream must fit the pipes DML gives it (`dml::dsc_shape`:
-/// up to ODM 4:1, twelve slices on three pipes).
+/// up to ODM 4:1, twelve slices on three pipes). The input is RGB at `bpc`
+/// (the stream's display_color_depth), which the sink's DSC decoder must
+/// take (DP_DSC_DEC_COLOR_DEPTH_CAP).
 pub fn dp_dsc(
     timing: &Timing,
     caps: DpCaps,
     max_dispclk_khz: u32,
+    bpc: u8,
 ) -> Option<crate::amdgpu_dsc::DscConfig> {
     use crate::amdgpu_dsc::{compute_config, LinkEncoding};
     let sink = caps.dsc?;
@@ -1430,11 +1445,55 @@ pub fn dp_dsc(
         &sink,
         max_dispclk_khz,
         u32::try_from(target).ok()?,
-        &dsc_timing(timing),
+        &dsc_timing(timing, bpc),
         encoding,
         false,
     )?;
     dml::dsc_shape(timing, cfg.slices_h, max_dispclk_khz).map(|_| cfg)
+}
+
+/// How a DP SST stream leaves: its link, DSC and depth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DpSstStream {
+    pub lanes: u8,
+    pub rate: DpRate,
+    pub dsc: Option<crate::amdgpu_dsc::DscConfig>,
+    pub depth: otg::ColorDepth,
+}
+
+/// amdgpu_dm_create_validate_stream_for_sink for a DP SST sink: each of
+/// `depths` (`dp_depths`, deepest first) in turn, the stream at that
+/// depth carried uncompressed when some link does (`dp_link_bpc`), else
+/// compressed at that depth (apply_dsc_policy_for_stream: `dp_dsc`, which
+/// also checks the native DSC shape DML gives it, then `dsc_link`), else
+/// the next depth, as dc_validate_stream and dm_validate_stream_and_context
+/// reject it. A deeper compressed stream is therefore preferred to a
+/// shallower uncompressed one, as in Linux. None when no depth fits.
+pub fn dp_sst_stream(
+    timing: &Timing,
+    caps: DpCaps,
+    depths: &[otg::ColorDepth],
+    max_dispclk_khz: u32,
+) -> Option<DpSstStream> {
+    depths.iter().find_map(|&depth| {
+        let bpc = depth_bpc(depth);
+        if let Some((lanes, rate)) = dp_link_bpc(timing, caps, bpc) {
+            return Some(DpSstStream {
+                lanes,
+                rate,
+                dsc: None,
+                depth,
+            });
+        }
+        let cfg = dp_dsc(timing, caps, max_dispclk_khz, bpc)?;
+        let (lanes, rate) = dsc_link(timing, cfg, caps)?;
+        Some(DpSstStream {
+            lanes,
+            rate,
+            dsc: Some(cfg),
+            depth,
+        })
+    })
 }
 
 /// Redo every DSC decision with the board's highest DISPCLK, as Linux's
@@ -1458,7 +1517,7 @@ pub fn refine_dsc(soc: &dml::Soc, selections: &mut [Selection]) -> Result<(), Mo
                 &caps,
                 soc.dispclk_max_khz,
                 0,
-                &dsc_timing(&s.timing),
+                &dsc_timing(&s.timing, cfg.bpc),
                 encoding,
                 false,
             )
@@ -1490,9 +1549,21 @@ pub fn refine_dsc(soc: &dml::Soc, selections: &mut [Selection]) -> Result<(), Mo
             s.dsc = Some(cfg);
             continue;
         }
-        let cfg = dp_dsc(&s.timing, s.caps, soc.dispclk_max_khz).ok_or(ModesetError::Link)?;
-        (s.lanes, s.rate) = dsc_link(&s.timing, cfg, s.caps).ok_or(ModesetError::Link)?;
-        s.dsc = Some(cfg);
+        // DP SST: the same depth search with the board's DISPCLK from the
+        // selected depth down (uncompressed did not fit at the selected
+        // one), so a configuration the board cannot compress at that
+        // depth tries the next, as Linux's depth loop does.
+        let below: Vec<_> = [
+            otg::ColorDepth::Bpc12,
+            otg::ColorDepth::Bpc10,
+            otg::ColorDepth::Bpc8,
+        ]
+        .into_iter()
+        .filter(|&d| depth_bpc(d) <= depth_bpc(s.depth))
+        .collect();
+        let found = dp_sst_stream(&s.timing, s.caps, &below, soc.dispclk_max_khz)
+            .ok_or(ModesetError::Link)?;
+        (s.lanes, s.rate, s.dsc, s.depth) = (found.lanes, found.rate, found.dsc, found.depth);
         if s.uhbr() {
             s.audio = None;
         }
@@ -2005,33 +2076,25 @@ pub fn select_all(
         let Some(index) = paths.iter().position(|p| *p == port.path) else {
             continue;
         };
+        // The depths create_validate_stream_for_sink tries, deepest first:
+        // at each, uncompressed whenever a link carries the mode (Linux
+        // enables DSC only when needed), otherwise DSC at that depth for the
+        // maximum link, on the link its compressed bandwidth needs.
+        let depths = dp_depths(&sink.edid, max_bpc);
         let Some(timing) = pick(index, &sink.edid, &|t| {
-            dp_link(t, caps).is_some()
-                || dp_dsc(t, caps, NOMINAL_DISPCLK_KHZ)
-                    .is_some_and(|cfg| dsc_link(t, cfg, caps).is_some())
+            dp_sst_stream(t, caps, &depths, NOMINAL_DISPCLK_KHZ).is_some()
         }) else {
             continue;
         };
         let Some(edid) = sink.edid.get(..128).and_then(|b| b.try_into().ok()) else {
             continue;
         };
-        // Uncompressed whenever a link carries the mode, as Linux enables
-        // DSC only when needed; otherwise DSC for the maximum link, on the
-        // link its compressed bandwidth needs.
-        let compressed = || {
-            let cfg = dp_dsc(&timing, caps, NOMINAL_DISPCLK_KHZ)?;
-            dsc_link(&timing, cfg, caps).map(|(lanes, rate)| (lanes, rate, Some(cfg)))
-        };
-        // The deepest uncompressed depth a link carries
-        // (create_validate_stream_for_sink stepping down from the requested
-        // bpc); DSC compresses 8-bpc input only here.
-        let uncompressed = dp_depths(&sink.edid, max_bpc)
-            .into_iter()
-            .find_map(|depth| {
-                dp_link_bpc(&timing, caps, depth_bpc(depth)).map(|(l, r)| (l, r, None, depth))
-            });
-        let Some((lanes, rate, dsc, depth)) = uncompressed
-            .or_else(|| compressed().map(|(l, r, dsc)| (l, r, dsc, otg::ColorDepth::Bpc8)))
+        let Some(DpSstStream {
+            lanes,
+            rate,
+            dsc,
+            depth,
+        }) = dp_sst_stream(&timing, caps, &depths, NOMINAL_DISPCLK_KHZ)
         else {
             link_short = true;
             continue;
@@ -3275,7 +3338,7 @@ impl ColdBoot {
                     crate::amdgpu_dsc::LinkEncoding::Dp8b10b
                 };
                 let kbps = (u64::from(m.pbn) * 994 * 8 * 54 / 64) as u32;
-                let dt = dsc_timing(&t);
+                let dt = dsc_timing(&t, depth_bpc(s.depth));
                 let cfg = crate::amdgpu_dsc::compute_config(
                     &caps,
                     soc.dispclk_max_khz,
