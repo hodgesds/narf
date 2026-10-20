@@ -422,10 +422,19 @@ fn smoke_nl80211_wpa_supplicant_wpa2_psk_end_to_end() -> TestResult {
     };
     let mut random = scan.clone();
     push_attr(&mut random, 158, &(1u32 << 3).to_ne_bytes());
+    // nl80211_trigger_scan: probe IEs up to the advertised
+    // NL80211_ATTR_MAX_SCAN_IE_LEN (512) reach the driver; longer is -EINVAL.
     let mut probe_ies = scan.clone();
     push_attr(&mut probe_ies, 42, &[127, 1, 0]);
+    let mut oversized_ies = scan.clone();
+    push_attr(&mut oversized_ies, 42, &[0; 513]);
+    let carried = matches!(
+        parse_operation(SCAN, &attributes(&probe_ies).unwrap(), true, false),
+        Ok(Operation::Scan(ref r)) if r.extra_ies == [127, 1, 0]
+    );
     if parse_operation(SCAN, &attributes(&random).unwrap(), true, false).err() != Some(EOPNOTSUPP)
-        || parse_operation(SCAN, &attributes(&probe_ies).unwrap(), true, false).err()
+        || !carried
+        || parse_operation(SCAN, &attributes(&oversized_ies).unwrap(), true, false).err()
             != Some(EINVAL)
     {
         return TestResult::Fail("scan flag / probe IE errnos");

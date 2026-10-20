@@ -170,7 +170,14 @@ fn smoke_nl80211_attribute_and_security_validation() -> TestResult {
     if parse_operation(CONNECT, &attributes(&bytes).unwrap(), true, false).is_ok() {
         return TestResult::Fail("unsupported MFP request silently downgraded");
     }
-    if channel(5955).is_ok() || channel(5181).is_ok() {
+    // ieee80211_freq_khz_to_channel: 5955 MHz is 6 GHz channel 1; off-raster
+    // and out-of-band frequencies have no channel.
+    if channel(5955) != Ok(1)
+        || channel(7115) != Ok(233)
+        || channel(5181).is_ok()
+        || channel(7120).is_ok()
+        || channel(2400).is_ok()
+    {
         return TestResult::Fail("unsupported frequency accepted");
     }
     TestResult::Pass

@@ -1159,8 +1159,13 @@ pub(super) fn get_reg(attrs: &[u8], dump: bool, namespace: u64) -> Result<Vec<Ge
             command: GET_REG,
             attrs: global,
         });
-        for (index, iface) in interfaces.iter().enumerate() {
-            if !super::super::in_namespace(iface.as_ref(), namespace) {
+        // One entry per wiphy (`for_each_rdev`), labelled with its `phyN`
+        // index, not one per virtual interface.
+        for (index, iface) in crate::registry::wiphys().iter().enumerate() {
+            if !interfaces.iter().any(|candidate| {
+                candidate.wiphy_id() == iface.wiphy_id()
+                    && super::super::in_namespace(candidate.as_ref(), namespace)
+            }) {
                 continue;
             }
             let Some(d) = iface.regulatory_domain() else {
@@ -1184,7 +1189,11 @@ pub(super) fn get_reg(attrs: &[u8], dump: bool, namespace: u64) -> Result<Vec<Ge
     if find_attr(attrs, 1).is_some() {
         // cfg80211_get_dev_from_info → __cfg80211_rdev_from_attrs.
         let wiphy = super::super::wiphy_from_attrs(&interfaces, attrs, namespace)?;
-        regdom = interfaces[wiphy as usize].regulatory_domain();
+        // `wiphy` is a `phyN` index into the wiphys, not the interface list.
+        regdom = crate::registry::wiphys()
+            .get(wiphy as usize)
+            .ok_or(ENODEV)?
+            .regulatory_domain();
         if regdom.is_some() {
             push_attr(&mut a, 1, &(wiphy as u32).to_ne_bytes());
         }
