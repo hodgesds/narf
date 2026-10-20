@@ -106,6 +106,11 @@ const CHECK_COMMANDS: &[&str] = &[
 /// mount appear in `/proc/self/mountinfo` (a lost libmount change edge).
 const NO_MOUNT_MARKER: &str = "Mount process finished, but there is no mount";
 
+/// systemd's verdict when a device unit (a `/dev/disk/by-uuid` link, a swap
+/// device) never became ready: udev never finished the device, or nothing
+/// will ever create it.
+const DEVICE_TIMEOUT_MARKER: &str = "Timed out waiting for device";
+
 /// Power-off waited on a unit stop job: a scope whose cgroup emptied without
 /// systemd being told (the `cgroup.events` inotify edge) sits out its whole
 /// stop timeout.
@@ -331,6 +336,12 @@ fn boot_and_login(args: &Args) -> Result<()> {
         }
         wait_for(&[DONE_MARKER], mark, 180, &mut serial)?;
         print_report(&serial[mark..]);
+        if let Some(line) = strip_escapes(&serial)
+            .lines()
+            .find(|l| l.contains(DEVICE_TIMEOUT_MARKER))
+        {
+            bail!("a device never became ready: {}", line.trim());
+        }
         if serial.contains(NO_MOUNT_MARKER) {
             bail!("systemd lost a mount: \"{NO_MOUNT_MARKER}\"");
         }
@@ -420,6 +431,10 @@ pub fn smoke_cmdline(uuid: &str, rw: bool, extra: &[String]) -> String {
         "systemd_pid1".to_string(),
         format!("narf.disks={}", if rw { "root-rw" } else { "root-ro" }),
     ];
+    // Same as the grub-image bundle: no zram device, so no zram swap units.
+    if !extra.iter().any(|a| a.starts_with("systemd.zram=")) {
+        tokens.push(super::NO_ZRAM_ARG.to_string());
+    }
     tokens.extend(extra.iter().cloned());
     tokens.join(" ")
 }
@@ -570,11 +585,11 @@ mod tests {
     fn cmdline_is_the_bare_metal_shape() {
         assert_eq!(
             smoke_cmdline("u", false, &[]),
-            "root=UUID=u rootflags=subvol=/@ systemd_pid1 narf.disks=root-ro"
+            "root=UUID=u rootflags=subvol=/@ systemd_pid1 narf.disks=root-ro systemd.zram=0"
         );
         assert_eq!(
             smoke_cmdline("u", true, &["quiet".into()]),
-            "root=UUID=u rootflags=subvol=/@ systemd_pid1 narf.disks=root-rw quiet"
+            "root=UUID=u rootflags=subvol=/@ systemd_pid1 narf.disks=root-rw systemd.zram=0 quiet"
         );
     }
 }

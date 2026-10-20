@@ -828,6 +828,10 @@ const FAIL_MARKERS: &[&str] = &[
     "panicked at",
     "Kernel panic - not syncing",
     "You are in emergency mode",
+    // A device unit timing out (the root's by-uuid link, or any fstab or
+    // swap device) is a udev/systemd readiness failure even when it does
+    // not end in emergency mode.
+    "Timed out waiting for device",
     "Give root password for maintenance",
     "Cannot open access to console",
 ];
