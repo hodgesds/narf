@@ -677,7 +677,15 @@ impl FdTable {
     }
 
     /// Duplicate `oldfd` onto one exact slot, atomically replacing that slot.
-    pub fn duplicate_to(&mut self, oldfd: u32, newfd: u32, flags: u32) -> Option<()> {
+    /// `None` when `oldfd` is not open (or `newfd` is reserved); otherwise the
+    /// file the replaced slot held, which the caller passes to
+    /// [`release_closed`] once the table lock is dropped (`do_dup2` closes it).
+    pub fn duplicate_to(
+        &mut self,
+        oldfd: u32,
+        newfd: u32,
+        flags: u32,
+    ) -> Option<Option<Arc<dyn FileOps>>> {
         // An in-flight fanotify event owns this number until its metadata copy
         // commits or rolls back; do not publish another object into it.
         if self.reserved.contains(&newfd) {
@@ -693,8 +701,13 @@ impl FdTable {
             flags,
             status_flags: description.status_flags(),
         };
+        let replaced = self
+            .slots
+            .get_mut(newfd as usize)
+            .and_then(Option::take)
+            .map(|entry| entry.ops);
         self.set_with_description(newfd, clone, description);
-        Some(())
+        Some(replaced)
     }
 
     /// Export one open file for SCM_RIGHTS. The returned description is the
@@ -782,23 +795,25 @@ impl FdTable {
     /// `close_range(first, last, flags)` — close every open fd in the
     /// inclusive range `[first, last]`. With `cloexec` set
     /// (CLOSE_RANGE_CLOEXEC) the fds are marked FD_CLOEXEC instead of
-    /// being closed. Out-of-range bounds are clamped to the table.
-    pub fn close_range(&mut self, first: u32, last: u32, cloexec: bool) {
+    /// being closed. Out-of-range bounds are clamped to the table. Returns
+    /// the closed files for [`release_closed`].
+    pub fn close_range(&mut self, first: u32, last: u32, cloexec: bool) -> Vec<Arc<dyn FileOps>> {
+        let mut closed = Vec::new();
         let lo = first as usize;
         if lo >= self.slots.len() {
-            return;
+            return closed;
         }
         let hi = (last as usize).min(self.slots.len() - 1);
         if hi < lo {
-            return;
+            return closed;
         }
         let mut lowest_closed = None;
         for (relative, slot) in self.slots[lo..=hi].iter_mut().enumerate() {
             if let Some(entry) = slot {
                 if cloexec {
                     entry.flags |= FD_CLOEXEC;
-                } else {
-                    *slot = None;
+                } else if let Some(entry) = slot.take() {
+                    closed.push(entry.ops);
                     self.descriptions[lo + relative] = None;
                     lowest_closed.get_or_insert(lo + relative);
                 }
@@ -807,29 +822,32 @@ impl FdTable {
         if let Some(fd) = lowest_closed {
             self.next_fd = self.next_fd.min(fd);
         }
+        closed
     }
 
     /// Close every fd marked `FD_CLOEXEC` (the exec path). Returns the
-    /// number closed. Dropping each `Some` entry releases its
-    /// `Arc<dyn FileLike>` reference (closing the underlying object
-    /// when this was the last holder).
-    pub fn close_cloexec_slots(&mut self) -> usize {
-        let mut n = 0;
+    /// closed files; dropping them releases each `Arc<dyn FileOps>`
+    /// reference (closing the underlying object when this was the last
+    /// holder) after [`release_closed`] has run.
+    pub fn close_cloexec_slots(&mut self) -> Vec<Arc<dyn FileOps>> {
+        let mut closed = Vec::new();
         let mut lowest_closed = None;
         for (i, slot) in self.slots.iter_mut().enumerate() {
-            if let Some(entry) = slot {
-                if entry.flags & FD_CLOEXEC != 0 {
-                    *slot = None;
-                    self.descriptions[i] = None;
-                    lowest_closed.get_or_insert(i);
-                    n += 1;
+            if slot
+                .as_ref()
+                .is_some_and(|entry| entry.flags & FD_CLOEXEC != 0)
+            {
+                if let Some(entry) = slot.take() {
+                    closed.push(entry.ops);
                 }
+                self.descriptions[i] = None;
+                lowest_closed.get_or_insert(i);
             }
         }
         if let Some(fd) = lowest_closed {
             self.next_fd = self.next_fd.min(fd);
         }
-        n
+        closed
     }
 
     /// Borrow the entry at `fd` without removing it.
@@ -1533,6 +1551,11 @@ impl FileOps for ConsoleFile {
         narf_filesystem::console_tty::block_on_input()
     }
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        // fd 0/1/2 of the boot console are `/dev/console`, so a TIOCCONS
+        // redirect applies to them too (`redirected_tty_write`).
+        if let Some(target) = narf_filesystem::console_tty::redirect() {
+            return Box::pin(async move { target.write(0, buf).await });
+        }
         let n = buf.len();
         // Eagerly write: the future just reports the count.
         use core::fmt::Write as _;
@@ -1570,7 +1593,7 @@ impl FileOps for ConsoleFile {
     /// as EOF and exits the moment the user gets to a prompt.
     fn poll_readiness(&self) -> u32 {
         let mut mask = narf_filesystem::POLL_OUT;
-        if narf_filesystem::console_tty::readable_bytes() > 0 {
+        if narf_filesystem::console_tty::poll_readable() {
             mask |= narf_filesystem::POLL_IN;
         }
         mask
@@ -1869,6 +1892,49 @@ pub fn fork(parent: u64, child: u64) -> usize {
     copied
 }
 
+/// Release what a socket holds globally (a bound unix name, a listening or
+/// bound port, a TCP connection) for every file in `closed` whose last
+/// descriptor `task` just dropped.
+///
+/// Linux ties these to the socket's lifetime: `sock_close` → `unix_release` /
+/// `inet_release` runs when the last reference to the open file goes,
+/// whichever way it went: close(2), dup2 replacing the slot, close_range, the
+/// exec close-on-exec sweep or exit (`exit_files`). NARF's name registries
+/// hold strong references to bound sockets, so dropping a descriptor never
+/// reaches `SocketFile`'s `Drop` on its own. Every path that discards
+/// descriptors has to come through here; otherwise the name stays bound to
+/// a socket nobody owns, and a later connect(2) to it succeeds and then
+/// waits forever for an accept that never comes.
+///
+/// Call this after the table lock is released. A file still open in this
+/// task's table or any other task's (a fork or SCM_RIGHTS sharer) stays
+/// bound.
+pub(crate) fn release_closed(task: u64, closed: impl IntoIterator<Item = Arc<dyn FileOps>>) {
+    for ops in closed {
+        let Some(sock) = ops
+            .as_any()
+            .and_then(|ops| ops.downcast_ref::<crate::socket::SocketFile>())
+        else {
+            continue;
+        };
+        // Unnamed socketpair endpoints have no global registration, so they
+        // avoid all alias scans. A duplicated listener remains bound when
+        // either descriptor is closed; Arc strong counts also include epoll
+        // and ancillary-data references and therefore cannot answer this.
+        if !sock.has_registration() {
+            continue;
+        }
+        let has_duplicate = with_table(task, |table| table.contains_ops(&ops)).unwrap_or(false);
+        // `contains_ops` only sees THIS process's descriptors. A fork gives
+        // every child its own table holding the same file description, so
+        // each of them looks like the last owner. Release the binding only
+        // when no other table owns this description either.
+        if !has_duplicate && !ops_held_by_other_task(task, &ops) {
+            sock.unregister();
+        }
+    }
+}
+
 /// Whether any fd table OTHER than `closing_task`'s still holds `ops`.
 ///
 /// `FdTable::contains_ops` only sees one process's descriptors, so after a
@@ -1973,14 +2039,31 @@ pub fn close_cloexec(task_id: u64) -> usize {
         Some(a) => a,
         None => return 0,
     };
-    let n = arc.lock().close_cloexec_slots();
+    let closed = arc.lock().close_cloexec_slots();
+    drop(arc);
+    let n = closed.len();
+    release_closed(task_id, closed);
     n
 }
 
 /// Drop the entire fd table for `task_id`. Call on task exit so
 /// the FileOps `Arc`s can release.
 pub fn detach(task_id: u64) {
-    TABLES[table_shard(task_id)].tables.lock().remove(&task_id);
+    let table = TABLES[table_shard(task_id)].tables.lock().remove(&task_id);
+    // `exit_files` → `put_files_struct`: the last thread sharing the table
+    // closes every descriptor in it, exactly like close(2) would.
+    if let Some(table) = table {
+        if Arc::strong_count(&table) == 1 {
+            let closed: Vec<Arc<dyn FileOps>> = table
+                .lock()
+                .slots
+                .iter_mut()
+                .filter_map(|slot| slot.take().map(|entry| entry.ops))
+                .collect();
+            drop(table);
+            release_closed(task_id, closed);
+        }
+    }
     // Drop any advisory POSIX locks the task held so its peers can
     // make progress on shared inodes — and wake their F_SETLKW waiters
     // NOW. This is the FIRST of the two exit-path release_owner calls

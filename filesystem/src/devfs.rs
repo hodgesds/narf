@@ -1282,6 +1282,18 @@ impl FileOps for DevConsole {
         })
     }
 
+    /// `poll(2)` readiness: writable always, readable only when a read would
+    /// return without blocking. The `FileOps` default (always readable) sent
+    /// plymouthd's event loop into a blocking read of `/dev/tty1` that never
+    /// returned, wedging every console writer behind it.
+    fn poll_readiness(&self) -> u32 {
+        let mut mask = crate::POLL_OUT;
+        if crate::console_tty::poll_readable() {
+            mask |= crate::POLL_IN;
+        }
+        mask
+    }
+
     /// Park an empty `/dev/console` read on the input waker rather than
     /// returning a spurious 0 (EOF). Mirrors fd-0 `ConsoleFile`; true
     /// when the line discipline has no completed input buffered.
@@ -1304,6 +1316,13 @@ impl FileOps for DevConsole {
     }
 
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        // `redirected_tty_write`: while a TIOCCONS redirect is set, writes
+        // to `/dev/console` (not the VTs or `/dev/tty`) go to that tty.
+        if matches!(self.kind, ConsoleNodeKind::Console) {
+            if let Some(target) = crate::console_tty::redirect() {
+                return Box::pin(async move { target.write(0, buf).await });
+            }
+        }
         // Same path as `sys_write` to fd 1/2: forward to the kernel
         // console (UART + framebuffer hook if installed). Treat
         // non-UTF-8 input as best-effort lossy by way of

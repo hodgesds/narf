@@ -51,8 +51,14 @@ BTRFS_MIB="${CACHYOS_ROOT_BTRFS_MIB:-4096}"
 BGT="${CACHYOS_ROOT_BGT:-1}"
 COMPRESS="${CACHYOS_ROOT_COMPRESS:-zstd:1}"
 
+# plymouth and ufw are enabled on a default CachyOS desktop install and both
+# start before sysinit.target: plymouthd drives the VT/DRM console and talks
+# to its clients over an abstract unix socket, ufw-init loads netfilter rules.
+# A NARF syscall that hangs instead of failing the way Linux does would stall
+# the whole boot there, so the smoke boots them too.
 PACKAGES="base btrfs-progs dosfstools sudo cachyos-settings cachyos-keyring \
-cachyos-mirrorlist cachyos-v4-mirrorlist ${CACHYOS_ROOT_PACKAGES:-}"
+cachyos-mirrorlist cachyos-v4-mirrorlist plymouth cachyos-plymouth-bootanimation \
+ufw ${CACHYOS_ROOT_PACKAGES:-}"
 
 mkdir -p "$WORK"
 
@@ -90,7 +96,11 @@ in_ns() {
 }
 
 # ------------------------------------------------------------- rootfs ---
-if [ "${CACHYOS_ROOT_REBUILD:-0}" = 1 ] || [ ! -x "$R/usr/lib/systemd/systemd" ]; then
+# A package list that changed since the last install (e.g. a package added
+# here) reinstalls too, so an existing work tree picks it up.
+STAMP="$WORK/packages.stamp"
+if [ "${CACHYOS_ROOT_REBUILD:-0}" = 1 ] || [ ! -x "$R/usr/lib/systemd/systemd" ] ||
+   [ "$(cat "$STAMP" 2>/dev/null)" != "$PACKAGES" ]; then
   echo "cachyos-root: installing CachyOS userspace into $R"
   if [ -d "$STAGE" ]; then
     # Files owned by mapped uids can only be removed from inside the ns.
@@ -115,6 +125,7 @@ if [ "${CACHYOS_ROOT_REBUILD:-0}" = 1 ] || [ ! -x "$R/usr/lib/systemd/systemd" ]
     pacman --config "$CONF" --root "$R" --dbpath "$R/var/lib/pacman" \
       --noconfirm --needed --noprogressbar -S "$@"
   ' -- "$R" "$WORK/pacman.conf" $PACKAGES
+  printf '%s' "$PACKAGES" > "$STAMP"
 fi
 
 # -------------------------------------------------------- configuration ---
@@ -150,6 +161,17 @@ EOF
   sed -i "s|^root:[^:]*:|root:${hash}:|" "$R/etc/shadow"
   ln -sfn /usr/lib/systemd/system/multi-user.target \
     "$R/etc/systemd/system/default.target"
+  # The CachyOS desktop defaults: the boot-animation theme and an enabled
+  # firewall (ufw.conf ENABLED=yes plus the multi-user.target.wants link).
+  if [ -d "$R/usr/share/plymouth/themes/cachyos-bootanimation" ]; then
+    printf "[Daemon]\nTheme=cachyos-bootanimation\n" > "$R/etc/plymouth/plymouthd.conf"
+  fi
+  if [ -f "$R/etc/ufw/ufw.conf" ]; then
+    sed -i "s/^ENABLED=.*/ENABLED=yes/" "$R/etc/ufw/ufw.conf"
+    mkdir -p "$R/etc/systemd/system/multi-user.target.wants"
+    ln -sfn /usr/lib/systemd/system/ufw.service \
+      "$R/etc/systemd/system/multi-user.target.wants/ufw.service"
+  fi
   mkdir -p "$R/etc/systemd/system/getty.target.wants"
   ln -sfn /usr/lib/systemd/system/getty@.service \
     "$R/etc/systemd/system/getty.target.wants/getty@tty1.service"

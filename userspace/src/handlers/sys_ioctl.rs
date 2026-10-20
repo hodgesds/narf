@@ -926,6 +926,40 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
+    // ── TIOCCONS (0x541D) — redirect /dev/console output ──────────────
+    //
+    // `drivers/tty/tty_io.c::tioccons`. Handled here because the redirect
+    // keeps a reference to the open file itself, which only this layer has:
+    //
+    //     if (!capable(CAP_SYS_ADMIN)) return -EPERM;
+    //     if (file->f_op->write_iter == redirected_tty_write) {
+    //             /* /dev/console: drop the redirect */ ... return 0;
+    //     }
+    //     if (file->f_op->write_iter != tty_write) return -ENOTTY;
+    //     if (!(file->f_mode & FMODE_WRITE)) return -EBADF;
+    //     ...
+    //     if (redirect) return -EBUSY;
+    //     redirect = get_file(file);
+    const TIOCCONS: u32 = narf_filesystem::devfs_pty::TIOCCONS;
+    if cmd == TIOCCONS {
+        const CONSOLE_RDEV: u64 = narf_filesystem::devfs::linux_makedev(5, 1);
+        let r = if !capable(CAP_SYS_ADMIN) {
+            errno_ret(EPERM)
+        } else if ops.rdev() == CONSOLE_RDEV && ops.tty_id().is_some() {
+            drop(narf_filesystem::console_tty::take_redirect());
+            SyscallReturn::ok(0)
+        } else if ops.tty_id().is_none() {
+            errno_ret(ENOTTY)
+        } else if status_flags & crate::fd::O_ACCMODE == crate::fd::O_RDONLY {
+            errno_ret(EBADF)
+        } else if narf_filesystem::console_tty::set_redirect(ops.clone()).is_err() {
+            errno_ret(EBUSY)
+        } else {
+            SyscallReturn::ok(0)
+        };
+        ctx.set_return(r);
+        return;
+    }
     // ── nsfs (`fs/nsfs.c::ns_ioctl`) ──────────────────────────────────
     //
     // Handled here rather than behind `FileOps::ioctl` because four of

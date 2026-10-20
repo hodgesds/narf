@@ -28,6 +28,8 @@ pub(crate) fn sys_close_range(ctx: &mut dyn TrapContext) {
     if flags & CLOSE_RANGE_UNSHARE != 0 {
         crate::fd::unshare_table(task);
     }
-    fd::with_table(task, |t| t.close_range(first, last, cloexec));
+    if let Some(closed) = fd::with_table(task, |t| t.close_range(first, last, cloexec)) {
+        fd::release_closed(task, closed);
+    }
     ctx.set_return(SyscallReturn::ok(0));
 }

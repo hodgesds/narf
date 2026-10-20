@@ -75,6 +75,9 @@ pub const TIOCSPTLCK: u32 = 0x40045431;
 pub const TIOCGPTPEER: u32 = 0x5441;
 /// `ioctl(fd, TIOCGWINSZ, &winsize)` — query window dimensions.
 pub const TIOCGWINSZ: u32 = 0x5413;
+/// `ioctl(fd, TIOCCONS)` — redirect `/dev/console` output to this tty, or
+/// (on `/dev/console` itself) stop redirecting. Needs CAP_SYS_ADMIN.
+pub const TIOCCONS: u32 = 0x541D;
 /// `ioctl(fd, TIOCSWINSZ, &winsize)` — set window dimensions.
 pub const TIOCSWINSZ: u32 = 0x5414;
 /// `ioctl(fd, TCGETS, &termios)` — get terminal attributes.
@@ -2400,6 +2403,9 @@ impl Drop for PtyMaster {
         // peer AND `tty_vhangup`s it, so a slave still reading must now see
         // end-of-file rather than wait for a writer that can never return.
         self.pty.master_closed.store(true, Ordering::Release);
+        // `__tty_hangup` also drops a TIOCCONS redirect to the hung-up slave:
+        // console output must not keep going to a pty nobody reads.
+        drop(crate::console_tty::clear_redirect_to_tty(self.pty.id));
         // Wake a slave parked in read/poll so it sees the EOF/HUP now instead of
         // waiting for a writer that can never return.
         self.pty.sync_slave_readiness();

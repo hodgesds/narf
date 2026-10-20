@@ -968,8 +968,21 @@ pub fn get_or_create_child(parent: &Arc<Kobject>, name: &str) -> Arc<Kobject> {
 /// attribute of the `tty0` console device.
 pub fn populate_tty_class() {
     let class_tty = class_register("tty");
-    let tty0 = class_device_register(class_tty, "tty0");
+    let tty0 = class_device_register(class_tty.clone(), "tty0");
     kobject_add_attr(&tty0, "active", crate::vt::active_sysfs);
+    // `/sys/class/tty/console/active`: the console devices behind
+    // `/dev/console`, the one `/dev/console` opens last (`show_cons_active`).
+    // systemd's getty generator starts a serial getty for every serial name
+    // listed, and plymouth picks its terminals from it. NARF's console is the
+    // VT console (`tty0`); its UART mirror has no `/dev/ttyS*` node, so
+    // listing it would start a getty on a device that does not exist.
+    let console = class_device_register(class_tty, "console");
+    kobject_add_attr(&console, "active", console_active_sysfs);
+}
+
+/// Contents of `/sys/class/tty/console/active`.
+pub fn console_active_sysfs() -> String {
+    String::from("tty0\n")
 }
 
 pub fn populate_block_class() {

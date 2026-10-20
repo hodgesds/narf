@@ -1282,6 +1282,61 @@ fn smoke_filesystem_devfs_console_keystrokes() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_filesystem_devfs_console_keystrokes);
 
+/// `poll` on a console tty reports POLLIN only when a read would return:
+/// not for an empty console, not for a partial canonical line, yes once the
+/// line completes, and not again after it is read. Always-readable consoles
+/// sent plymouthd's event loop into a blocking read of /dev/tty1 forever.
+fn smoke_filesystem_devfs_console_poll_matches_read() -> TestResult {
+    use crate::{bootstrap_mount_authority, registry, DevFs, POLL_IN, POLL_OUT};
+    use narf_input::{init_global_ring, push_global, InputEvent, KeyCode, KeyEvent, Modifiers};
+    init_global_ring(64);
+    while narf_input::pop_global().is_some() {}
+    crate::console_tty::__test_reset_cooked();
+    let auth = bootstrap_mount_authority();
+    let _ = registry().mount(&auth, "/dev/console-test-mount", DevFs::new());
+    let Some(tty1) = registry()
+        .resolve_absolute("/dev/console-test-mount/tty1", |fs, rel| {
+            crate::resolve(fs.root(), rel).ok()
+        })
+        .flatten()
+    else {
+        return TestResult::Fail("resolve /dev/tty1 failed");
+    };
+    let key = |code| {
+        push_global(InputEvent::Key(KeyEvent {
+            code,
+            pressed: true,
+            modifiers: Modifiers::EMPTY,
+        }))
+    };
+    if tty1.poll_readiness() != POLL_OUT {
+        return TestResult::Fail("an empty console polled readable (or not writable)");
+    }
+    key(KeyCode::H);
+    if tty1.poll_readiness() & POLL_IN != 0 {
+        crate::console_tty::__test_reset_cooked();
+        return TestResult::Fail("a partial canonical line polled readable");
+    }
+    key(KeyCode::Enter);
+    if tty1.poll_readiness() & POLL_IN == 0 {
+        crate::console_tty::__test_reset_cooked();
+        return TestResult::Fail("a completed line did not poll readable");
+    }
+    let mut buf = [0u8; 8];
+    let n = crate::console_tty::read_into(&mut buf);
+    if &buf[..n] != b"h\n" {
+        return TestResult::Fail("the completed line read back wrong");
+    }
+    if tty1.poll_readiness() & POLL_IN != 0 {
+        return TestResult::Fail("a drained console still polled readable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem",
+    smoke_filesystem_devfs_console_poll_matches_read
+);
+
 fn smoke_filesystem_devfs_mount_default_idempotent() -> TestResult {
     use crate::{mount_devfs_default, registry};
 

@@ -1737,3 +1737,17 @@ fn smoke_core_coldplug_emits_add_per_device() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("sysfs_e2e/core", smoke_core_coldplug_emits_add_per_device);
+
+// /sys/class/tty/console/active lists the console devices behind /dev/console
+// (Linux `show_cons_active`). systemd's getty generator and plymouth choose
+// their terminals from it; NARF's console is the VT console.
+fn smoke_sysfs_tty_console_active() -> TestResult {
+    crate::sysfs::populate_tty_class();
+    let class_tty = crate::sysfs::class_register("tty");
+    let console = crate::sysfs::class_device_register(class_tty, "console");
+    match attr_show_trimmed(&console, "active").as_deref() {
+        Some("tty0") => TestResult::Pass,
+        _ => TestResult::Fail("/sys/class/tty/console/active is not \"tty0\""),
+    }
+}
+kernel_test_in!("filesystem/sysfs", smoke_sysfs_tty_console_active);
