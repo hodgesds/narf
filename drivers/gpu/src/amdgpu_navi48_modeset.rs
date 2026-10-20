@@ -1644,6 +1644,7 @@ pub fn mode(timing: Timing) -> dml::Mode {
     dml::Mode {
         timing,
         pitch: (timing.h_active + 63) & !63,
+        bytes_per_pixel: 4,
         ycbcr420: false,
         dsc: None,
     }

@@ -36,6 +36,7 @@ fn plan() -> dml::Plan {
         &dml::Mode {
             timing: timing(),
             pitch: 1920,
+            bytes_per_pixel: 4,
             ycbcr420: false,
             dsc: None,
         },

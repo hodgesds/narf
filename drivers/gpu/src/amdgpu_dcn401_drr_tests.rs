@@ -59,6 +59,7 @@ fn live(pipe: u8) -> (Engine<Fake>, Request) {
             &dml::Mode {
                 timing: request(pipe).timing,
                 pitch: 1920,
+                bytes_per_pixel: 4,
                 ycbcr420: false,
                 dsc: None,
             },

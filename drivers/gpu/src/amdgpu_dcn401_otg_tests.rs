@@ -1211,6 +1211,7 @@ fn dcn401_admission_inputs_read_live_dchub_timer_and_capped_levels() -> TestResu
             v_sync_positive: true,
         },
         pitch: 1920,
+        bytes_per_pixel: 4,
         ycbcr420: false,
         dsc: None,
     };

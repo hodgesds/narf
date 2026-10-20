@@ -38,6 +38,7 @@ fn inputs(f: &[u32]) -> (Soc, Mode) {
         Mode {
             timing,
             pitch: f[18],
+            bytes_per_pixel: 4,
             ycbcr420: false,
             dsc: None,
         },
@@ -368,6 +369,17 @@ fn check_vectors(
     ycbcr420: bool,
     dsc: bool,
 ) -> Result<(u32, u32, u32), &'static str> {
+    check_vectors_with(vectors, ycbcr420, dsc, false)
+}
+
+/// As `check_vectors`; with `bytes` each line starts with the bytes per
+/// pixel of every stream's plane (format_vectors.txt).
+fn check_vectors_with(
+    vectors: &str,
+    ycbcr420: bool,
+    dsc: bool,
+    bytes: bool,
+) -> Result<(u32, u32, u32), &'static str> {
     let (mut plans, mut rejects, mut odm) = (0, 0, 0);
     for line in vectors.lines() {
         if line.is_empty() || line.starts_with('#') {
@@ -377,6 +389,10 @@ fn check_vectors(
         let mut d = [0u32; 2];
         if dsc && !parse(&mut words, &mut d) {
             return Err("malformed DSC vector");
+        }
+        let mut b = [4u32];
+        if bytes && !parse(&mut words, &mut b) {
+            return Err("malformed format vector");
         }
         let mut s = [0u32; 10];
         if !parse(&mut words, &mut s) || !(1..=4).contains(&s[9]) {
@@ -395,6 +411,7 @@ fn check_vectors(
             f[18] = t[9];
             let (_, mut mode) = inputs(&f);
             mode.ycbcr420 = ycbcr420;
+            mode.bytes_per_pixel = b[0];
             mode.dsc = dsc.then_some(Dsc {
                 slices: d[0],
                 bpp_x16: d[1],
@@ -565,6 +582,97 @@ kernel_test_in!(
     "drivers/gpu/dcn401-dml",
     dcn401_dml_matches_linux_dml21_odm_ycbcr420_vectors
 );
+
+/// Shared with tests/dcn401_dml21/check.sh (harness_multi.c, PIXEL_BYTES).
+const FORMAT_VECTORS: &str = include_str!("../tests/dcn401_dml21/format_vectors.txt");
+
+/// RGB565 (dml2_444_16) and FP16 (dml2_444_64) planes: the request width,
+/// swath, DET lines, read bandwidth and deep-sleep DCFCLK follow the
+/// bytes per pixel, alone, beside other streams and on ODM 2:1 pipes.
+fn dcn401_dml_matches_linux_dml21_format_vectors() -> TestResult {
+    let (mut two, mut eight) = (0, 0);
+    for line in FORMAT_VECTORS.lines() {
+        match line.split_whitespace().next() {
+            Some("2") => two += 1,
+            Some("8") => eight += 1,
+            Some("#") | None => {}
+            Some(_) => return TestResult::Fail("format vector of another depth"),
+        }
+    }
+    match check_vectors_with(FORMAT_VECTORS, false, false, true) {
+        Ok((plans, rejects, odm))
+            if plans >= 1200 && rejects >= 400 && odm >= 300 && two >= 900 && eight >= 900 =>
+        {
+            TestResult::Pass
+        }
+        Ok(_) => TestResult::Fail("format vector file lost coverage"),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_matches_linux_dml21_format_vectors
+);
+
+/// Linux's depth limits: only 2, 4 and 8 bytes per pixel, each with a pitch
+/// of whole 256-byte requests; a 2-byte plane's 64-pixel-aligned pitch is a
+/// 128-byte linear surface DML plans differently.
+fn dcn401_dml_bytes_per_pixel_domain() -> TestResult {
+    let soc = Soc {
+        dcfclk_khz: [1_564_000, 1_564_000],
+        fclk_khz: [2_500_000, 2_500_000],
+        uclk_khz: 1_250_000,
+        dispclk_max_khz: 2_000_000,
+        dppclk_max_khz: 2_000_000,
+        socclk_khz: 1_200_000,
+        umc_channels: 16,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    let t = Timing {
+        pixel_clock_khz: 148_500,
+        h_active: 1920,
+        h_total: 2200,
+        h_front_porch: 88,
+        h_sync_width: 44,
+        v_active: 1080,
+        v_total: 1125,
+        v_front_porch: 4,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: true,
+    };
+    let m = |bytes_per_pixel, pitch| Mode {
+        timing: t,
+        pitch,
+        bytes_per_pixel,
+        ycbcr420: false,
+        dsc: None,
+    };
+    for bad in [0, 1, 3, 6, 16] {
+        if admit(&soc, &m(bad, 1920)) != Err(Error::Invalid) {
+            return TestResult::Fail("unsupported depth admitted");
+        }
+    }
+    if admit(&soc, &m(2, 1984)) != Err(Error::Unsupported) {
+        return TestResult::Fail("128-byte linear pitch admitted");
+    }
+    let (Ok(p2), Ok(p4), Ok(p8)) = (
+        admit(&soc, &m(2, 1920)),
+        admit(&soc, &m(4, 1920)),
+        admit(&soc, &m(8, 1920)),
+    ) else {
+        return TestResult::Fail("1080p60 at a supported depth rejected");
+    };
+    // Twice the bytes per request pixel halves the request's delivery time.
+    if !(p2.ttu.refcyc_per_req_delivery_l > p4.ttu.refcyc_per_req_delivery_l
+        && p4.ttu.refcyc_per_req_delivery_l > p8.ttu.refcyc_per_req_delivery_l)
+    {
+        return TestResult::Fail("request delivery does not follow the depth");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/dcn401-dml", dcn401_dml_bytes_per_pixel_domain);
 
 fn timing(
     pixel_clock_khz: u32,

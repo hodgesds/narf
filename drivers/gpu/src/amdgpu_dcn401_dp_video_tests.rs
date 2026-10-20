@@ -832,6 +832,7 @@ fn dcn401_dp_audio_programs_dto1_secondary_packets_and_endpoint_like_linux() -> 
             &dml::Mode {
                 timing: t,
                 pitch: (t.h_active + 63) & !63,
+                bytes_per_pixel: 4,
                 ycbcr420: false,
                 dsc: None,
             },

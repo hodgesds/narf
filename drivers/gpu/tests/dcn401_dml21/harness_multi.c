@@ -10,6 +10,8 @@
  * every stream is compressed as DC passes a DSC stream. With FMT420 set in the
  * environment every stream leaves as HDMI YCbCr 4:2:0 instead of DP RGB; with
  * DP2P0 set every DP stream rides a 128b/132b (HPO) encoder (dml2_dp2p0).
+ * PIXEL_BYTES=2|8 makes every plane RGB565 or FP16 instead of 32bpp.
+ * RAISED: see below.
  *
  * Original single-stream notes follow.
  *
@@ -41,6 +43,24 @@
 #include "dml2_internal_shared_types.h"
 #include "bounding_boxes/dcn4_soc_bb.h"
 #include "odm_pipes.h"
+
+/* PIXEL_BYTES=2|4|8 in the environment: the plane's dml2_444_16 (RGB565),
+ * dml2_444_32 (8888, 2101010; the default) or dml2_444_64 (FP16) format, as
+ * dml21_translation_helper maps the DC surface formats. */
+static enum dml2_source_format_class pixel_format(void)
+{
+	const char *b = getenv("PIXEL_BYTES");
+
+	if (b && b[0] == '2' && !b[1])
+		return dml2_444_16;
+	if (b && b[0] == '8' && !b[1])
+		return dml2_444_64;
+	if (b && !(b[0] == '4' && !b[1])) {
+		fprintf(stderr, "PIXEL_BYTES must be 2, 4 or 8\n");
+		exit(2);
+	}
+	return dml2_444_32;
+}
 
 static bool no_uclk_pstate(struct dml2_pmo_init_for_pstate_support_in_out *in_out)
 {
@@ -147,7 +167,7 @@ int main(int argc, char **argv)
 
 		struct dml2_plane_parameters *p = &cfg.plane_descriptors[k];
 		p->stream_index = k;
-		p->pixel_format = dml2_444_32;
+		p->pixel_format = pixel_format();
 		p->surface.tiling = dml2_sw_linear;
 		p->surface.plane0.pitch = a[9];
 		p->surface.plane0.width = a[1];
@@ -176,6 +196,17 @@ int main(int argc, char **argv)
 	};
 	if (!dml2_build_mode_programming(&mp)) {
 		puts("REJECT");
+		return 0;
+	}
+	/* With RAISED set, a plan whose DCFCLK or FCLK DPMM raised above the
+	 * pinned UCLK's latency minimum for bandwidth (dml2_dpmm_dcn4's
+	 * calculate_system_active/svp_prefetch_minimums) prints "RAISED": the
+	 * port plans only at that minimum state and rejects these. */
+	const struct dram_bw_to_min_clk_table_entry *e =
+		&init.dml2_instance->min_clk_table.dram_bw_table.entries[0];
+	if (getenv("RAISED") && (prog.min_clocks.dcn4x.active.dcfclk_khz > e->min_dcfclk_khz ||
+				 prog.min_clocks.dcn4x.active.fclk_khz > e->min_fclk_khz)) {
+		puts("RAISED");
 		return 0;
 	}
 	const struct dml2_core_internal_mode_program *m =

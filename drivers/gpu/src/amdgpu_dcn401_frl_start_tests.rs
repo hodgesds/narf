@@ -516,6 +516,7 @@ fn dcn401_frl_controls_bind_live_scanout() -> TestResult {
             &dml::Mode {
                 timing: request(1).timing,
                 pitch: 1920,
+                bytes_per_pixel: 4,
                 ycbcr420: false,
                 dsc: None,
             },

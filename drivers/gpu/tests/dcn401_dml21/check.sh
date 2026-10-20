@@ -35,14 +35,25 @@
 # not depend on the DP encoder.
 # odm_ycbcr420_vectors.txt are checked as multi_vectors.txt, dsc_vectors.txt
 # and ycbcr420_vectors.txt; their streams need ODM 2:1 on most boards.
+# format_vectors.txt lines are "<bytes per pixel>" then a multi_vectors.txt
+# line, every plane RGB565 (2, dml2_444_16) or FP16 (8, dml2_444_64) as
+# harness_multi.c plans it with PIXEL_BYTES set; --generate-format rewrites
+# it from the single-, multi-stream and ODM inputs, each pitch re-aligned to
+# 256 bytes at that depth. Its "! ClockState raised" lines are plans whose
+# DCFCLK or FCLK DPMM raises above the pinned UCLK's minimum for bandwidth
+# (harness_multi.c with RAISED set), which the port does not plan; its
+# "! PixelClock dfs" lines are as vectors.txt's.
 set -euo pipefail
 here=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
-generate_dsc=0
+generate_dsc=0 generate_format=0
 if [ "${1:-}" = --generate-dsc ]; then
 	generate_dsc=1
 	shift
 elif [ "${1:-}" = --regenerate-uhbr-dsc ]; then
 	generate_dsc=2
+	shift
+elif [ "${1:-}" = --generate-format ]; then
+	generate_format=1
 	shift
 fi
 linux=${1:-/usr/src/linux}
@@ -126,6 +137,72 @@ if [ $generate_dsc -eq 2 ]; then
 	exit 0
 fi
 
+# classify <prefix> <line> <strict_multi output>: the generated vector line.
+classify() {
+	local prefix=$1 line=$2 out=$3
+	# A raised DCF/fabric state (RAISED set) is the port's ClockState, and a
+	# DISPCLK or DPPREFCLK above VCO / 2 (DFS divider below 2.0) its
+	# PixelClock, as vectors.txt's "dfs" lines.
+	if [ "$out" = RAISED ]; then
+		echo "$prefix $line ! ClockState raised"
+		return
+	fi
+	if [ "${out%% *}" = PLAN ] && echo "${out#PLAN }" | awk '{ exit !($1 > 2250000 || $2 > 2250000) }'; then
+		echo "$prefix $line ! PixelClock dfs"
+		return
+	fi
+	# A plan whose DLG/TTU/watermark value overflows its register field
+	# (Linux only asserts) is the port's Register rejection; a second
+	# ODM pipe's blank end ("/2 <end>") has the blank end's field.
+	if [ "${out%% *}" = PLAN ] && [[ " $out " == *" /3 "* || " $out " == *" /4 "* ]]; then
+		echo "$prefix $line ! Unsupported odm"
+	elif [ "${out%% *}" = PLAN ] && echo "${out#PLAN }" | awk '
+		BEGIN { n = split("13 8192 14 32768 15 262144 16 2097152 17 8192 18 8 19 256 20 128 21 64 22 2097152 23 4194304 24 4194304 25 8192 26 8192 31 16384 32 16777216 33 16 34 8388608 35 8388608 36 16 38 16384 39 65536 40 65536 41 65536 42 65536 43 65536 44 16384 45 16384 46 16384 47 1024 48 1024 49 1024 55 4096 57 134217728", l)
+			for (i = 1; i < n; i += 2) lim[l[i]] = l[i + 1] }
+		{ f = 0
+		  for (i = 1; i <= NF; i++) {
+			if ($i == "|") { f = 0; continue }
+			if ($i == "/2") { if ($(i + 1) + 0 >= 8192) bad = 1; i++; continue }
+			if (f in lim && $i + 0 >= lim[f] + 0) bad = 1
+			f++ } }
+		END { exit !bad }'; then
+		echo "$prefix $line ! Register"
+	elif [ "${out%% *}" = PLAN ]; then
+		echo "$prefix $line = ${out#PLAN }"
+	else
+		echo "$prefix $line ! REJECT"
+	fi
+}
+# single_as_multi: vectors.txt inputs as one-stream multi_vectors.txt lines.
+single_as_multi() {
+	grep -v '^#' "$here/vectors.txt" | awk '{
+		printf "%s %s %s %s %s %s %s %s %s 1", $10, $11, $12, $13, $14, $15, $16, $17, $18
+		printf " %s %s %s %s %s %s %s %s %s %s\n", $1, $2, $3, $4, $5, $6, $7, $8, $9, $19 }'
+}
+
+if [ $generate_format -eq 1 ]; then
+	echo "# Linux DML21 reference vectors for amdgpu_dcn401_dml.rs with RGB565 (2) and"
+	echo "# FP16 (8 bytes per pixel) planes; see check.sh."
+	# Every single-, multi-stream and ODM input at both depths, each
+	# stream's pitch the line rounded up to whole 256-byte requests.
+	{
+		single_as_multi
+		grep -v '^#' "$here/multi_vectors.txt" | sed 's/ [=!].*//'
+		grep -v '^#' "$here/odm_vectors.txt" | sed 's/ [=!].*//'
+	} | while read -r line; do
+		for b in 2 8; do
+			at=$(echo "$line" | awk -v b=$b '{
+				r = 256 / b
+				for (k = 0; k < $10; k++) { i = 11 + 10 * k; $(i + 9) = int(($(i + 1) + r - 1) / r) * r }
+				print }')
+			read -ra a <<< "$at"
+			out=$(RAISED=1 PIXEL_BYTES=$b "$work/strict_multi" "${a[@]:0:9}" "${a[@]:10}")
+			classify "$b" "$at" "$out"
+		done
+	done
+	exit 0
+fi
+
 tolerated=" 3 47 48 49 "
 # plan_matches <planes> <strict output> <want...>: strict Linux plans
 # <planes> planes with these values token for token ("|" between planes,
@@ -192,28 +269,34 @@ echo "dcn401 DML21 vectors: $pass passed, $fail failed"
 
 # check_multi <file> [env...]: multi-stream vectors with harness_multi.
 check_multi() {
-	local file=$1 pass=0 fail=0 dsc=
+	local file=$1 pass=0 fail=0 dsc= bytes=
 	shift
 	while read -r line; do
 		case $line in ''|'#'*) continue ;; esac
 		read -ra f <<< "$line"
 		if [ "${1:-}" = DSC ]; then
 			dsc="${f[0]} ${f[1]}" f=("${f[@]:2}")
+		elif [ "${1:-}" = FORMAT ]; then
+			bytes=${f[0]} f=("${f[@]:1}")
 		fi
 		local envs=("${@:2}")
-		[ "${1:-}" = DSC ] || envs=("$@")
+		[ "${1:-}" = DSC ] || [ "${1:-}" = FORMAT ] || envs=("$@")
 		n=${f[9]} count=$((10 + 10 * f[9]))
 		inputs=("${f[@]:0:count}") kind=${f[count]} rest=("${f[@]:count+1}")
 		if [ -n "$dsc" ]; then
 			strict=$(env DSC="$dsc" "${envs[@]}" "$work/strict_multi" "${inputs[@]:0:9}" "${inputs[@]:10}")
 		else
-			strict=$(env "${envs[@]}" "$work/strict_multi" "${inputs[@]:0:9}" "${inputs[@]:10}")
+			strict=$(env ${bytes:+RAISED=1 PIXEL_BYTES="$bytes"} "${envs[@]}" "$work/strict_multi" "${inputs[@]:0:9}" "${inputs[@]:10}")
 		fi
 		ok=1
 		if [ "$kind" = "=" ]; then
 			plan_matches "$n" "$strict" "${rest[@]}" || ok=0
 		elif [ "${rest[1]:-}" = odm ]; then
 			odm_plan "$strict" || ok=0
+		elif [ "${rest[1]:-}" = raised ]; then
+			[ "$strict" = RAISED ] || ok=0
+		elif [ "${rest[1]:-}" = dfs ]; then
+			[ "${strict%% *}" = PLAN ] || ok=0
 		elif [ "${rest[0]:-}" = Register ]; then
 			[ "${strict%% *}" = PLAN ] || ok=0
 		else
@@ -243,4 +326,5 @@ check_multi "$here/odm_ycbcr420_vectors.txt" FMT420=1 || mfail=1
 check_multi "$here/dsc_vectors.txt" DSC DP2P0=1 || mfail=1
 check_multi "$here/odm_dsc_vectors.txt" DSC DP2P0=1 || mfail=1
 check_multi "$here/uhbr_dsc_vectors.txt" DSC DP2P0=1 || mfail=1
+check_multi "$here/format_vectors.txt" FORMAT || mfail=1
 [ $fail -eq 0 ] && [ $mfail -eq 0 ]

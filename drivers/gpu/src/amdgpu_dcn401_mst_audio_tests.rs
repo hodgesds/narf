@@ -407,6 +407,7 @@ fn dcn401_mst_audio_requires_matching_live_scanout_witnesses() -> TestResult {
             &dml::Mode {
                 timing: t,
                 pitch: (t.h_active + 63) & !63,
+                bytes_per_pixel: 4,
                 ycbcr420: false,
                 dsc: None,
             },

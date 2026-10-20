@@ -476,6 +476,7 @@ fn dcn401_uhbr_audio_filters_capabilities_and_binds_scanout() -> TestResult {
         &dml::Mode {
             timing,
             pitch: 1920,
+            bytes_per_pixel: 4,
             ycbcr420: false,
             dsc: None,
         },
