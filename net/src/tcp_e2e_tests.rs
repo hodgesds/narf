@@ -1297,6 +1297,62 @@ fn smoke_tcp_e2e_tail_loss_rto() -> TestResult {
 }
 kernel_test_in!("net/tcp_e2e", smoke_tcp_e2e_tail_loss_rto);
 
+// An RTO rewinds the sender's `snd_nxt` to `snd_una` (go-back-N), but the
+// receiver already holds the whole burst and cumulatively ACKs past the
+// rewound `snd_nxt`. That ACK is in range — bounded by the highest sequence
+// ever sent (`snd_high`, Linux's never-rewound `tp->snd_nxt`) — so it ends
+// recovery at once, without resending the rest of the burst.
+fn tcp_e2e_rto_ack_past_rewound_snd_nxt() -> Result<(), &'static str> {
+    reset();
+    let c = open()?;
+    settle();
+    let data = pattern(6 * 1024, 0x5EED);
+    // Every ACK back to the client is lost: the burst arrives, the client
+    // never learns it did.
+    set_fault(Fault::DropControl {
+        dir: Dir::ToClient,
+        flags: FLAG_ACK,
+        count: u32::MAX,
+    });
+    expect(send_errno(c.client, &data), Ok(data.len()), "burst send")?;
+    while deliver_one() {}
+    let mut got = vec![0u8; data.len()];
+    expect(
+        recv_errno(c.server, &mut got),
+        Ok(data.len()),
+        "server holds the burst",
+    )?;
+    let high = __with_tcb(c.client, |t| t.snd_high).ok_or("client gone")?;
+    set_fault(Fault::None);
+    clear_log();
+    // The RTO fires, rewinds, resends the head; the server's ACK covers all.
+    settle();
+    sender_quiescent(c.client)?;
+    if __with_tcb(c.client, |t| t.snd_una).ok_or("client gone")? != high {
+        return Err("the cumulative ACK past the rewound snd_nxt was not taken");
+    }
+    if FORCED_RTOS.load(Ordering::Relaxed) == 0 {
+        return Err("no RTO fired — the ACK loss was not injected");
+    }
+    let resent = wire_log()
+        .iter()
+        .filter(|s| s.dir() == Dir::ToServer && s.payload_len > 0)
+        .count();
+    if resent != 1 {
+        narf_console::klog!("tcp_e2e rto-rewind: {} data segments resent", resent);
+        return Err("recovery resent more than the head segment");
+    }
+    if total_retrans(c.client)? != 1 {
+        return Err("tcpi_total_retrans must count exactly the one resend");
+    }
+    Ok(())
+}
+
+fn smoke_tcp_e2e_rto_ack_past_rewound_snd_nxt() -> TestResult {
+    finish(tcp_e2e_rto_ack_past_rewound_snd_nxt())
+}
+kernel_test_in!("net/tcp_e2e", smoke_tcp_e2e_rto_ack_past_rewound_snd_nxt);
+
 // ── 10. Reordering ──────────────────────────────────────────────────────────
 //
 // Every pair of data segments is swapped in flight. The receiver must

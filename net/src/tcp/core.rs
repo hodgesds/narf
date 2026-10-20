@@ -2674,6 +2674,7 @@ fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
     let mut t = arc.lock();
     let iss = t.iss;
     t.snd_nxt = iss.wrapping_add(1);
+    note_sent(&mut t);
     queue_retransmit(&mut t, iss, 1, flags);
     arm_retransmit_timer(&mut t);
 }
@@ -3067,6 +3068,7 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         t.snd_nxt = seq
             .wrapping_add(payload.len() as u32)
             .wrapping_add((fin != 0) as u32);
+        note_sent(&mut t);
         t.total_retrans = t.total_retrans.saturating_add(1);
         arm_retransmit_timer(&mut t);
     }
@@ -3215,6 +3217,16 @@ fn tick_time_wait(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
 
 /// Drain the send buffer to the wire, honouring cwnd / receiver
 /// window / MSS. Called on each `tcp_send` and after each ACK.
+/// Raise `snd_high` to `snd_nxt` after sequence space was sent. Every path
+/// that advances `snd_nxt` calls it, so `snd_high` is always the highest
+/// sequence number sent: the bound on an acceptable ACK and the mark below
+/// which a send is a retransmission.
+fn note_sent(t: &mut Tcb) {
+    if seq_gt(t.snd_nxt, t.snd_high) {
+        t.snd_high = t.snd_nxt;
+    }
+}
+
 pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     let (id, writable_before) = {
         let t = arc.lock();
@@ -3270,7 +3282,11 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
                 if t.fin_sent && t.snd_nxt == t.fin_seq {
                     let seq = t.fin_seq;
                     let flags = FLAG_FIN;
+                    if seq_lt(seq, t.snd_high) {
+                        t.total_retrans = t.total_retrans.saturating_add(1);
+                    }
                     t.snd_nxt = t.snd_nxt.wrapping_add(1);
+                    note_sent(&mut t);
                     (Vec::<Vec<u8>>::new(), seq, flags, None, true)
                 } else {
                     break;
@@ -3292,6 +3308,18 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
                     remaining = remaining.saturating_sub(chunk.len() as u32);
                     chunks.push(chunk);
                 }
+                // Data below `snd_high` is the go-back-N resend after an RTO
+                // rewound `snd_nxt`: counted per segment, as
+                // `__tcp_retransmit_skb` adds `tcp_skb_pcount`.
+                let mut chunk_seq = starting_seq;
+                let mut resent = 0u32;
+                for c in &chunks {
+                    if seq_lt(chunk_seq, t.snd_high) {
+                        resent = resent.saturating_add(c.len().div_ceil(mss as usize) as u32);
+                    }
+                    chunk_seq = chunk_seq.wrapping_add(c.len() as u32);
+                }
+                t.total_retrans = t.total_retrans.saturating_add(resent);
                 let total: u32 = chunks.iter().map(|c| c.len() as u32).sum();
                 t.snd_nxt = t.snd_nxt.wrapping_add(total);
                 let drained = t.send_buf.unsent_len() == 0;
@@ -3299,6 +3327,7 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
                 if attach_fin {
                     t.snd_nxt = t.snd_nxt.wrapping_add(1);
                 }
+                note_sent(&mut t);
                 (
                     chunks,
                     starting_seq,
@@ -3317,8 +3346,6 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
             break;
         }
         let mut cur_seq = seq;
-        let snd_high = arc.lock().snd_high;
-        let mut resent = 0u32;
         for (i, c) in chunks.iter().enumerate() {
             let last = i == chunks.len() - 1;
             let extra = if last && fin_flag != 0 {
@@ -3332,19 +3359,7 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
             // egress sends normally.
             let seg_tso = tso_arg.filter(|&m| c.len() > m as usize);
             send_data(arc, cur_seq, c, extra, true, seg_tso, !last);
-            if seq_lt(cur_seq, snd_high) {
-                // Go-back-N after an RTO: counted per segment, as
-                // `__tcp_retransmit_skb` adds `tcp_skb_pcount`.
-                resent += seg_tso.map_or(1, |m| c.len().div_ceil(m as usize) as u32);
-            }
             cur_seq = cur_seq.wrapping_add(c.len() as u32);
-        }
-        {
-            let mut t = arc.lock();
-            t.total_retrans = t.total_retrans.saturating_add(resent);
-            if seq_gt(cur_seq, t.snd_high) {
-                t.snd_high = cur_seq;
-            }
         }
         let _ = drained_all;
         if fin_flag != 0 {
@@ -4305,17 +4320,14 @@ fn handle_ack(
     let dup_candidate = payload_len == 0
         && hdr.flags & (FLAG_SYN | FLAG_FIN) == 0
         && (hdr.window as u32) << t.opts.peer_wscale == t.snd_wnd;
-    // Highest sequence number ever sent. An RTO rewinds `snd_nxt` to
-    // `snd_una` (go-back-N), but the peer may already hold the later
-    // segments and cumulatively ACK past the rewound `snd_nxt`; bounding the
-    // acceptable ACK by `snd_nxt` discarded that ACK, and the connection
-    // retransmitted the same segment until it gave up. Every segment sent
-    // and not yet ACKed has a retransmit record, so the records bound it.
-    let snd_max = t
-        .retx_queue
-        .iter()
-        .map(|s| s.end_seq())
-        .fold(t.snd_nxt, |m, e| if seq_gt(e, m) { e } else { m });
+    // Highest sequence number ever sent (Linux's `tp->snd_nxt`, which an RTO
+    // never rewinds). An RTO rewinds our `snd_nxt` to `snd_una` (go-back-N),
+    // but the peer may already hold the later segments and cumulatively ACK
+    // past the rewound `snd_nxt`; bounding the acceptable ACK by `snd_nxt`
+    // discarded that ACK, and the connection retransmitted the same segment
+    // until it gave up. `note_sent` keeps `snd_high` at that mark, so this
+    // no longer walks the retransmit queue on every ACK.
+    let snd_max = t.snd_high;
     // Linux validates the ACK before its `tcp_may_update_window` decision.
     // Preserve that ordering: an out-of-range ACK must not gain authority
     // over SND.WND simply because it carries a fresh segment sequence.
