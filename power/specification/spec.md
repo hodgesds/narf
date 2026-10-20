@@ -206,6 +206,106 @@ Drivers implementing `RuntimePm` can be autosuspended after an
 idle timeout, with wake on the next request. Gated behind
 `Cap<Device, PmControl>`.
 
+The implemented autosuspend controller is `runtime_pm`, a port of Linux
+`drivers/base/power/runtime.c`:
+
+```rust
+pub enum RpmStatus { Active, Resuming, Suspended, Suspending }
+pub enum RpmError { Again, Busy, Access, Invalid, InProgress, NotPermitted, Failed, Cancelled }
+pub enum RpmOk { Done, Already, Queued }
+pub type RpmFuture<'a> = Pin<Box<dyn Future<Output = Result<(), RpmError>> + Send + 'a>>;
+
+pub trait RuntimePmOps: Send + Sync {           // dev_pm_ops runtime half
+    fn runtime_suspend(&self) -> RpmFuture<'_>;
+    fn runtime_resume(&self) -> RpmFuture<'_>;
+    fn runtime_idle(&self) -> RpmFuture<'_>;     // default Ok
+}
+pub trait RpmEnv: Send + Sync {                  // pm_wq + suspend_timer + clock
+    fn now_ns(&self) -> u64;
+    fn queue_work(&self, dev: Arc<RuntimePmDevice>);
+    fn arm_timer(&self, dev: Arc<RuntimePmDevice>, expires_ns: u64);
+}
+pub struct SchedulerEnv;                          // executor tasks + timer wheel
+pub struct ManualEnv;                             // fake clock for tests
+
+impl RuntimePmDevice {
+    pub fn new(name: &str, ops: Option<Arc<dyn RuntimePmOps>>,
+               parent: Option<Arc<RuntimePmDevice>>, env: Arc<dyn RpmEnv>) -> Arc<Self>;
+    pub fn set_active(&self) -> Result<(), RpmError>;     // while disabled
+    pub fn set_suspended(&self) -> Result<(), RpmError>;
+    pub fn enable(&self);
+    pub async fn disable(self: &Arc<Self>);
+    pub fn ignore_children(&self, enable: bool);
+    pub async fn forbid(self: &Arc<Self>) -> Result<RpmOk, RpmError>;
+    pub fn set_forbidden_active(&self) -> Result<(), RpmError>;
+    pub fn allow(self: &Arc<Self>);
+    pub async fn use_autosuspend(self: &Arc<Self>, use_it: bool);
+    pub async fn set_autosuspend_delay(self: &Arc<Self>, delay_ms: i32);
+    pub fn mark_last_busy(&self);
+    pub fn get_noresume(&self);
+    pub fn put_noidle(&self);
+    pub async fn get_sync(self: &Arc<Self>) -> Result<RpmOk, RpmError>;
+    pub async fn resume_and_get(self: &Arc<Self>) -> Result<RpmOk, RpmError>;
+    pub fn get(self: &Arc<Self>) -> Result<RpmOk, RpmError>;          // + async resume
+    pub fn get_if_active(&self) -> Result<bool, RpmError>;
+    pub fn put(self: &Arc<Self>) -> Result<RpmOk, RpmError>;          // + async idle
+    pub async fn put_sync(self: &Arc<Self>) -> Result<RpmOk, RpmError>;
+    pub fn put_autosuspend(self: &Arc<Self>) -> Result<RpmOk, RpmError>;
+    pub fn request_idle / request_resume / request_autosuspend(self: &Arc<Self>) -> Result<RpmOk, RpmError>;
+    pub async fn idle / suspend / autosuspend / resume(self: &Arc<Self>) -> Result<RpmOk, RpmError>;
+    pub fn autosuspend_expiration(&self) -> u64;
+    pub fn state(&self) -> RpmState;
+    pub async fn run_work(self: &Arc<Self>);      // pm_runtime_work (called by the env)
+    pub fn timer_fn(self: &Arc<Self>);            // pm_suspend_timer_fn (called by the env)
+}
+pub async fn active_auto(dev: &Arc<RuntimePmDevice>) -> (RpmActiveRef, Result<RpmOk, RpmError>);
+```
+
+Semantics follow `rpm_idle` / `rpm_suspend` / `rpm_resume` exactly:
+`rpm_check_suspend_allowed` order (runtime_error → disabled → usage →
+active children → pending resume → already suspended), autosuspend
+expiry `last_busy + delay` with the timer re-armed while `last_busy`
+moves, transient (`Again`/`Busy`) versus sticky callback errors, deferred
+resume of a suspending device, `RPM_ASYNC` requests carried out by the
+environment's work item, and the parent rules: a child's resume holds a
+usage reference on its parent and resumes it first (failure is `Busy`),
+an active child counts in its parent's `child_count`, and a completed
+child suspend queues an idle check on the parent. `put_autosuspend` marks
+the device busy, as in current Linux. The state lock is never held across
+an await: callbacks run unlocked and synchronous callers park on a waker
+list. Dropping a future while its device callback runs records the sticky
+`Cancelled` error and wakes every waiter; `set_active`/`set_suspended`
+while disabled clear it. `RpmActiveRef` is the RAII
+`get_sync … put_autosuspend` pair.
+
+`runtime_pm_pci` is the PCI bus layer (`pci_pm_runtime_*`):
+
+```rust
+pub trait PciPmIo: Send + Sync { power_state, set_power_state, save_state,
+                                 restore_state, delay_ms (async) }
+pub struct EcamPciPm;                              // bus::pci helpers, type-0 header
+pub trait PciPlatformPm: Send + Sync { d3cold_supported, power_off, power_on }
+pub struct PciRuntimePm;                           // RuntimePmOps around a driver
+impl PciRuntimePm { pub fn save_state(&self) -> Result<(), PciError>; pub fn current(&self) -> PciTarget; }
+pub fn register_pci_device(name, cap, device, driver, platform, env) -> Result<PciRuntimeNode, RpmError>;
+pub fn register_with_io(name, io, driver, platform, parent, env) -> Result<PciRuntimeNode, RpmError>;
+pub fn bridge_node(bridge: &BusDevice, env: &Arc<dyn RpmEnv>) -> Option<Arc<RuntimePmDevice>>;
+```
+
+Suspend runs the driver's `runtime_suspend`; on success, unless the driver
+saved state itself (`PciRuntimePm::save_state`) or left the function out
+of D0, the layer saves config state and moves the function to D3hot (10 ms
+async settle), then to D3cold when a `PciPlatformPm` can remove power.
+NARF evaluates no AML (§8.3), so no in-tree platform offers D3cold.
+Resume powers the function up (platform power-on, D0, settle), refuses an
+all-ones function, restores state, then runs the driver's
+`runtime_resume`. An unbound function only saves/restores and stays in D0.
+`register_pci_device` leaves the new device as `pci_pm_init` and probe do
+(active, enabled, forbidden, probe reference held) and parents it on a
+shared node per upstream bridge, which is active and forbidden like an
+unbound Linux bridge. The older `DeviceRuntimePm` registry above remains
+the bare suspend/resume fan-out without usage counting.
+
 ### 3.6 System transitions
 
 ```rust
@@ -277,6 +377,12 @@ driver implementation.
 - Per-driver `suspend` must be callable from the runtime or
   system-wide paths; must tolerate concurrent invocation being
   serialised by `power/`.
+- Runtime PM never holds its state lock across an await, and a device
+  callback's failure, cancellation or refusal leaves the status consistent:
+  a refused suspend is `Active`, a failed resume `Suspended`, a cancelled
+  transition carries a sticky error until the driver re-establishes the
+  state. A parent is never runtime-suspended while a child that does not
+  have it ignore children is active.
 - An `AsyncSystemPm` implementation must never retain an IRQ-safe lock across
   an await. Every hook whose prepare completed receives exactly one paired
   resume attempt, including when a later prepare or the synchronous fan-out

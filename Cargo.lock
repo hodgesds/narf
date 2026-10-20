@@ -2962,6 +2962,7 @@ dependencies = [
  "narf-acpi",
  "narf-aml",
  "narf-arch",
+ "narf-bus",
  "narf-capabilities",
  "narf-console",
  "narf-event-bus",

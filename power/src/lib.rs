@@ -41,6 +41,8 @@ pub mod device_pm;
 pub mod laptop_state;
 pub mod orderly;
 pub mod psci;
+pub mod runtime_pm;
+pub mod runtime_pm_pci;
 pub mod suspend;
 pub mod syscall;
 pub mod sysfs_bridge;
@@ -64,6 +66,7 @@ pub mod pstate;
 #[cfg(target_arch = "x86_64")]
 pub mod rapl;
 
+mod runtime_pm_tests;
 mod tests;
 
 pub use suspend::{SuspendError, SuspendPhase};
