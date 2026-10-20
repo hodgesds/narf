@@ -859,6 +859,25 @@ gives it a free pipe, and the timing, both OPPs and DSCs, both HUBP/DPP/MPCC
 halves, deadlines, flips and the cursor are programmed across the pair
 (implementation and register models; no hardware run).
 
+Navi48 streams DML splits wider now run as ODM 3:1 and 4:1 (8K and 10K at
+high refresh, 4K480, 8K DSC of twelve or sixteen slices; DML21 matched
+against Linux on 1927 new configurations): the modeset takes every further
+pipe from the 4-pipe pool (refused when other displays or overlays hold
+them), and the OTG (segment count, widths incl. 3:1's last segment,
+divide-by-four timing, per-segment memories), every OPP's blank, every
+segment's DSC, HUBP viewports and SPL slice rects, deadlines and teardown
+cover each segment. Planes one DPP cannot carry (DPPCLK above the maximum,
+a swath the line buffer cannot hold) are MPC-combined on two DPPs as DML21's
+auto factor decides (matched against Linux on 1512 configurations; SPL MPC
+slices on 210 more), both slices blended in the stream's MPCC tree with
+overlays. New sinks light beside running displays, and the remaining ones
+re-plan after one leaves, without relighting them: shared DISPCLK/DPPCLK/
+DTBCLK follow dcn401's prepare (raise first) / optimize (lower after)
+ordering with the DPP DTO updates, and each running display takes its new
+global sync, DLG/TTU and watermarks under its OTG lock. MST configurations
+and mode changes still relight. Implementation and register models; no
+hardware run.
+
 Navi48 primary planes now take XRGB/ARGB/XBGR/ABGR 8888 and 2101010, RGB565
 and the four FP16 orders end to end (ADDFB2/GETPLANE/SETCRTC/PAGE_FLIP/atomic
 TEST_ONLY, DML21 admission at 2/4/8 bytes matched against Linux on a new

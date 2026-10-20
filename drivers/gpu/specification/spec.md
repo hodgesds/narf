@@ -623,8 +623,18 @@ requires both mailbox acceptance and the corresponding bit from
 DISP/DPP/DTB replies are actual kHz, checked against the requested floor and
 firmware ceiling. `Applied` distinguishes those actual rates from acknowledged
 DCF/UCLK floor requests. FCLK follows DCFCLK on this ASIC; the unsupported
-FCLK-switch message is not sent. This is a conservative pre-modeset policy,
-not active-stream clock scaling or a bandwidth/watermark solution.
+FCLK-switch message is not sent. This is the pre-modeset policy; live
+changes go through `update_live` (below).
+
+`update_live(regs, Request, safe_to_lower, held, dto).await` is
+dcn401_update_clocks while displays run (their consumer registers `held`):
+in prepare_bandwidth (`safe_to_lower` false) it sends the display count and
+only raises clocks, in optimize_bandwidth (true) it also lowers them
+(`should_set_clock`). DTBCLK first, then DISPCLK; a lowered DPPCLK has the
+DPP DTOs set for the new reference (`dto`) before the reference falls and
+again for the actual one after, a raised one is raised before the DTOs are
+updated. DENTIST stays PMFW's. A failed `dto` step is `Error::Dto`; failure
+or cancellation leaves the owner failed.
 
 `Starting`/`Applying` are set before awaits. Failure records `Failed(Error)`;
 cancellation leaves the in-flight state. Both prevent mailbox replay, and
@@ -658,7 +668,13 @@ Disabled pipes park their DPP and pixel clocks; shared root gates remain on.
 Readback verifies every programmed field. Partial failure records a terminal
 `Failed(Error)`; cancellation leaves `Applying`. Neither can replay, and
 historical successful `Applied` entries remain tagged with their global clock
-snapshot. No stream may use a stale snapshot after global clocks change.
+snapshot. No stream may use a stale snapshot after global clocks change:
+`Dccg::update_dpp_dtos(regs, ref_khz, &[(pipe, dpp_khz)], safe_to_lower)` is
+dcn401_update_clocks_update_dpp_dto for live pipes (dccg401_update_dpp_dto's
+phase where the DPPCLK rises, or every one when safe to lower) and
+`rebind_global(old, new)` moves the pipe records to the new global clocks;
+`prepare_except(clocks, request, held)` programs a pipe beside another
+display's running consumers.
 `ColdBoot::prepare_display_pipe_clocks` and the platform wrapper serialize the
 matching owners after drained engine proofs. `display_pipe_clock_status` and
 platform diagnostics expose progress. An uncertain DCCG transition also blocks
@@ -687,8 +703,9 @@ excluded. `prepare(&mut ClockManager, &mut Dccg, Request).await` programs disabl
 progressive timing with fixed refresh and one OPP per OTG. HDMI TMDS and FRL
 also accept YCbCr 4:2:0: horizontal boundaries must be even and active width
 must fit the 4096-pixel formatter buffer. The OTG divides horizontal timing
-by two and selects 4:2:0 data format. Interlace, ODM combining and VRR are not
-represented by this request; a live scanout's DRR is `Otg::set_drr` (Navi 48
+by two and selects 4:2:0 data format. Interlace and VRR are not
+represented by this request (ODM combine is `Request::odm`, see Navi 48
+display admission); a live scanout's DRR is `Otg::set_drr` (Navi 48
 variable refresh). `GlobalSync` supplies
 validated DLG field values (startup/keepout in lines; update/ready in pixels),
 not a bandwidth proof. Totals, porches, sync widths, blanking minima and every
@@ -1102,35 +1119,87 @@ it (`tests/dcn401_dml21/format_vectors.txt`, checked against Linux with
 DCFCLK/FCLK above the pinned UCLK's state is `ClockState`: the port plans
 only at that state. VUpdate/VReady widths at the programmed clocks are
 rounded up from their exact value. GPUVM/HostVM,
-DCC, MALL/SubVP, cursor, tdlut, dynamic metadata, writeback, MPC combine and
-immediate flip are excluded rather than approximated.
+DCC, MALL/SubVP, cursor, tdlut, dynamic metadata, writeback and immediate
+flip are excluded rather than approximated.
 
-ODM follows DML's `dml2_odm_mode_auto` with dynamic ODM off, limited to
-bypass and 2:1: a stream takes two pipes (two DPP/OPP and, with DSC, two
-DSCs) when its pixel clock exceeds the downspread-limited DISPCLK maximum, its
-DSC line exceeds 5760 pixels or four slices, or its 4:2:0 line exceeds 4096
-pixels. A stream DML would split 3:1 or 4:1 is `Unsupported`; more than four
-pipes in all is `Pipes`. `Plan::pipes` (1 or 2) reports the decision; both
-pipes share every programmed value except the DLG blank end
-(`Plan::odm_refcyc_h_blank_end`, `Plan::pipe_dlg`).
+ODM follows DML's `dml2_odm_mode_auto` with dynamic ODM off (DecideODMMode,
+CalculateODMConstraints, ValidateODMMode): a stream takes the fewest of one
+to four pipes (DPP/OPP each and, with DSC, a DSC each) whose DISPCLK
+(CalculateRequiredDispclk: the pixel clock over the pipes, never below half
+of it for HDMI TMDS 4:2:0) fits the downspread-limited maximum, at least
+one per started 5760 DSC pixels or 4096 4:2:0 pixels, two for more than four
+slices, three for more than eight and four for a three-pipe split whose
+slices are not twelve. 3:1 and 4:1 lines divide by four (OTG_H_TIMING_DIV_BY4),
+3:1 may split unevenly without DSC, and with DSC the slices split evenly
+(all twelve on three). More than four pipes in all is `Pipes`. `Plan::pipes`
+(1 to 4) reports the decision; every pipe shares every programmed value
+except the DLG blank end, which each further pipe moves by the segments
+before it (`Plan::odm_refcyc_h_blank_end: [u32; 3]`, `Plan::pipe_dlg`).
+`tests/dcn401_dml21/odm34_vectors.txt` (1927 configurations: 8K, 10K, 5K and
+4K480 streams at every depth, with DSC of 4 to 24 slices, HDMI 4:2:0, beside
+other streams, and every configuration the older files marked "Unsupported
+odm") is answered by Linux DML21 and replayed by
+`dcn401_dml_matches_linux_dml21_odm34_vectors`. `dml::admit_native` (what
+the modeset, platform and MST admission call) also refuses (`Unsupported`)
+an ODM split whose other horizontal boundaries, segment widths
+(OPTC_SEGMENT_WIDTH) or segment memories the native OTG cannot take
+(`dml::odm_timing_ok`); Linux leaves them a TODO. `dml::dsc_shape(timing,
+slices, dispclk_max_khz) -> Option<pipes>` is the DSC policies' native
+shape check (up to four DSC401s of four slices and 5184 pixels each).
 
-A two-pipe plan is programmed as ODM 2:1 (optc401_set_odm_combine). The
-modeset gives it the highest pipe no display of the configuration uses
-(`modeset::odm_pipes`), a DPP-only clock there (`dccg::PixelClock::OdmSegment`,
-plus its DSCCLK), and lights it with `otg::Request::odm` and
-`otg::SurfaceRequest::odm` naming that pipe. The OTG takes both OPPs as
-segments with the segment width, the line memories decide_odm_mem_bit_map
-picks and H divide-by-two (every horizontal boundary even; at most 8192
-active pixels); each OPP formats and blanks its half at its offset (a 4:2:0
-right half takes one extra left-edge pixel); each segment's DSC compresses
-its half with half the slices while the stream's PPS stays whole-picture.
-The ODM pipe's HUBP fetches the right half of the same surface (viewport X
-offset), its DPP/MPCC/DET/requestor (VTG the master OTG) and DLG/TTU follow,
-and start, flip, stop, underflow recovery and live checks act on both halves
-under the master OTG's one lock. The cursor is placed per segment and
-enabled only on the halves it overlaps (`CursorApplied::shown`). The display
-holds the ODM pipe from staging until retirement (`Siblings::pipes`); its
-teardown stops both DSC clocks. `ScanoutRunning::odm` names the pipe.
+MPC combine follows DML's auto `mpcc_combine_factor`, which DC leaves for
+DCN401 (`dml::Policy::NATIVE`; the older vector files replay with factor 1):
+a plane in ODM bypass whose single DPP needs more than the downspread-limited
+DPPCLK maximum (MinDPPCLKUsingSingleDPP) or cannot take the viewport's swath
+(SingleDPPViewportSizeSupport: DET, the 15360-pixel linear swath, the line
+buffer at its taps) takes two DPPs (`PlanePlan::dpps`), each with half the
+viewport, half the DPPCLK, and the swath, delivery, prefetch and deep-sleep
+terms of DPPPerSurface 2; both program identical registers. DCN4's
+`mpc_combine_limit` is two. Only linear, horizontally scanned RGB planes
+without DCC are combined (what the vectors cover); a tiled, rotated, 4:2:0
+or DCC plane one DPP cannot carry is refused, as is a DCC plane whose
+mcaches DML21 would split over MPC pipes. `tests/dcn401_dml21/mpc_vectors.txt` (1512
+plane configurations, 444 MPC-combined planes; harness_planes.c with
+MPC_AUTO) is replayed by `dcn401_dml_matches_linux_dml21_mpc_vectors`.
+
+A multi-pipe plan is programmed as ODM 2:1, 3:1 or 4:1 (optc401_set_odm_combine). The
+modeset gives it the highest pipes no display of the configuration uses
+(`modeset::odm_pipes`, left to right in that order), a DPP-only clock on
+each (`dccg::PixelClock::OdmSegment`, plus its DSCCLK), and lights it with
+`otg::Request::odm` and `otg::SurfaceRequest::odm` naming them
+(`otg::SplitPipes`: one to three further pipes). The OTG takes every OPP as
+a segment (OPTC_NUM_OF_INPUT_SEGMENT the count less one, unused segments
+0xf), the segment width of resource_get_odm_slice_dst_width (the line over
+the count, whole pixel pairs for 4:2:0) and for 3:1 OPTC_SEGMENT_WIDTH_LAST
+(the rest of the line), each segment's own first- then second-preferred line
+memories (decide_odm_mem_bit_map; a line needing another display's is
+refused: at most 4096 pixels per segment), and H divide-by-two for 2:1 or
+divide-by-four for 3:1 and 4:1 (every horizontal boundary divisible by it);
+each OPP formats and blanks its segment at its offset (a 4:2:0 segment after
+the first takes one extra left-edge pixel); each segment's DSC compresses its
+segment with its share of the slices while the stream's PPS stays
+whole-picture. Each ODM pipe's HUBP fetches its segment of the same surface
+(viewport X offset), its DPP/MPCC/DET/requestor (VTG the master OTG) and
+DLG/TTU follow, and start, flip, stop, underflow recovery and live checks
+act on every segment under the master OTG's one lock. The cursor is placed
+per segment and enabled only on the segments it overlaps
+(`CursorApplied::shown`). The display holds its ODM pipes from staging
+until retirement (`Siblings::pipes`); its teardown retires the timing (every
+segment's DSC off, every segment disconnected) before stopping each DSC
+clock. `ScanoutRunning::odm` names the pipes.
+
+An MPC-combined plane (`PlanePlan::dpps` 2 in ODM bypass) takes a further
+pipe from the top (`modeset::mpc_pipes` for the primary, `overlay_pipes` for
+an overlay; ODM segments first, then MPC slices, then overlays, as
+resource_update_pipes_for_stream/plane_with_slice_count acquire them) with a
+DPP-only clock at its DPPCLK; `SurfaceRequest::mpc` names it. Each slice's
+HUBP/DPP takes SPL's viewport and recout for its MPC slice
+(`spl::Input::mpc_slice`, calculate_mpc_slice_in_timing_active: equal shares
+of the plane clip, the remainder to the last slices); both slices' MPCCs
+blend in their stream's one tree, the second directly below the first
+(acquire_dpp_pipe_and_add_mpc_slice's bottom pipe), and every slice fetches
+the plane's address under the one OTG lock (`ScanoutRunning::mpc`,
+`OverlayScanout::mpc`). MPC combine never joins ODM, as DML21 decides it.
 
 `Soc` carries the board state DML depends on: the pinned UCLK, FCLK/DCFCLK DPM
 ranges, minimum SOCCLK, DISPCLK/DPPCLK maxima, the UMC channel count, DENTIST
@@ -1326,9 +1395,10 @@ uncompressed setting (`dp_link`) carries the mode, and compresses with
 maximum link: 4 lanes x the best UHBR rate (`uhbr_kbps`, 128b/132b
 encoding, FEC inherent, no FEC cap needed) when `DpCaps::uhbr` is nonzero,
 else the maximum 8b/10b link with FEC (FEC cap required). Its result must fit
-the pipes admission gives it (`dml::dsc_pipes(timing, slices,
-dispclk_max_khz)`: DecideODMMode less downspread, ODM 2:1 at most), each DSC
-taking at most four slices of at most 5184 pixels, so 8K takes two DSCs.
+the pipes admission gives it (`dml::dsc_shape(timing, slices,
+dispclk_max_khz)`: DecideODMMode less downspread, up to ODM 4:1, twelve
+slices on three pipes), each DSC taking at most four slices of at most 5184
+pixels, so 8K takes two DSCs (four on a board whose DISPCLK two cannot cover).
 `dsc_link(timing, cfg, caps)` is the link for the compressed bandwidth
 (`dc_dsc_stream_bandwidth_in_kbps`, unpadded): the maximum 8b/10b link with
 FEC when it carries it, else the first 128b/132b setting upward, lanes before
@@ -1397,7 +1467,7 @@ DP MST DSC follows amdgpu_dm and DRM on both encodings.
 (`kbps_to_peak_pbn`, 1.006 peak, 1.031 8b/10b FEC), `kbps_from_pbn`,
 `DscLink { encoding, kbps, slots, max_dispclk_khz }`, `DscStream { sink,
 timing, dsc }` and `DscPayload { pbn, slots, dsc }`; `fits` is the topology's
-per-hop PBN check and `native` the display pipeline's DSC shape (at most two
+per-hop PBN check and `native` the display pipeline's DSC shape (`dml::dsc_shape`: up to four
 ODM pipes of four slices). `tests/dcn401_dsc/check.sh` replays 1500
 mst_vectors.txt links through Linux's own fairness functions (mst_harness.c);
 a configuration Linux leaves compressed at bpp 0 is refused. In
@@ -3723,7 +3793,9 @@ dpp401_dscl_find_lb_memory_config), and `viewport()` returns
 hubp401_set_viewport's words (chroma equal to luma for RGB).
 `tests/dcn401_spl/check.sh` builds Linux's SPL on the host and compares
 every register word of 230 vectors (`vectors.txt`: scaled, cropped,
-positioned, ODM-sliced, rotated 180, alpha), which the
+positioned, ODM-sliced, rotated 180, alpha) and 210 MPC slices
+(`mpc_vectors.txt`: two to four slices of scaled, windowed and rotated
+planes; harness.c with MPC set), which the
 `drivers/gpu/dcn401-spl` kernel tests replay.
 
 **Placed planes.** `otg::SurfaceRequest::plane: Option<PlaneLayout>`
@@ -3747,8 +3819,8 @@ plane alpha as global gain, or global alpha; premultiplied unless Coverage).
 the same pipe, size and format whatever the placement.
 
 **Overlays.** A display stacks up to `otg::MAX_OVERLAYS` (3, DCN401's
-`max_slave_planes`) overlay planes on free pipes, two each on an ODM 2:1
-stream, staged on the overlay pipe through `prepare_surface`,
+`max_slave_planes`) overlay planes on free pipes, one per ODM segment of
+their stream (or two for an MPC-combined overlay), staged on the overlay pipe through `prepare_surface`,
 `prepare_memory`, `prepare_dpp` and `prepare_mpc` under the selected
 display's stream (`Engine::stream_pipe`). A memory restage keeps the other
 planes' records when the VMID0 context is unchanged, and staging checks
@@ -3964,8 +4036,10 @@ planes so a tiling change relights.
 
 Gaps: a plane configuration change relights the display (a visible blank)
 rather than DC's seamless full update; the cursor shows only on the
-primary's pipes, under opaque overlays above it; planes on an ODM 2:1 stream
-must reach both halves; no RGBA8888 or 16-bit UNORM planes, no NV21 (not
+primary's pipes, under opaque overlays above it; planes on an ODM stream
+must reach every segment; only linear, unrotated RGB planes without DCC
+are MPC-combined (any other plane one DPP cannot carry is refused); no
+RGBA8888 or 16-bit UNORM planes, no NV21 (not
 on DCN4's universal planes), no plane degamma/CTM, no rotation 90/270 (also
 on tiled surfaces, which Linux allows); DCC data is CPU-copied into the
 owned surface (so written uncompressed) and the post CSC always loads set
@@ -3980,6 +4054,45 @@ EINVAL and an unknown plane ENOENT. Model-tested only
 (`dcn401-spl`, `dcn401-dml`, `dcn401-dpp`, `dcn401-mpc`, `dcn401-requestor`,
 `dcn401-deadline`, `dcn401-scanout`, `navi48-modeset`, `navi48-kms`, `drm`,
 `drm_ioctl`); not validated on hardware.
+
+### Navi 48 seamless shared-clock changes
+
+A configuration change that keeps running displays lit follows
+dc_commit_state_no_check's prepare/optimize ordering with dcn401's clock
+sequence (FAMS2/firmware-assisted P-state is out of scope: UCLK switching
+stays disabled).
+
+`ColdBoot::modeset_beside(fill, want, pipe_of)` lights new board sinks
+beside the running displays: DML admits every running display's mode with
+as many new ones as fit (`dml::admit_native`, pipe order), each running
+display keeping its pipes (`modeset::keeps_pipes`: the same mode, ODM
+segments and MPC slices; otherwise `None`, as for MST, no free slot or a
+running configuration that no longer fits, before any change). Then:
+prepare_bandwidth — `update_live_display_clocks(request, targets, false)`
+(the clock owner's `update_live` with every display's registers held, the
+running pipes' DPP DTOs raised where needed, every DCCG record and every
+display's timing records rebound, `Otg::rebind_clock`), and each running
+display moved to its new plan with raise-only watermarks
+(`update_live_display_plan(pipe, plan, true)`: `Otg::update_live_plan`
+writes optc1_program_global_sync, the VTG's VSTARTUP point, every HUBP's
+DLG/TTU and the DCHUBBUB watermarks (`WatermarkUpdate::Raise`) and arbiter
+under the OTG master lock, waits for the latch and rebinds every record of
+the timing, `Status::rebind_timing`); the new displays' pipe clocks beside
+the running ones (`prepare_display_pipe_clocks_beside`) and their usual
+lighting; optimize_bandwidth — each running display's exact watermarks,
+then `update_live_display_clocks(request, all targets, true)` lowering what
+the configuration no longer needs. `replan_displays()` does the same for the
+displays left after one leaves. The platform monitor lights a new sink
+beside the running displays when nothing they asked for changed
+(`MonitorStep::LitBeside`) and replans after a display left
+(`MonitorStep::Replanned`), relighting everything only when refused.
+
+Gaps: MST configurations, mode, plane or color changes of a running display
+and FRL retraining still relight; a running display whose new plan needs
+other pipes refuses the seamless change; scanning for the new sinks reads
+every port (AUX/DDC) while the others run. Model-tested only (`dcn401-clk`,
+`dcn401-dccg`, `dcn401-scanout`, `navi48-modeset`); not validated on
+hardware.
 
 ### Discrete RDNA2 PSP secure-OS bootstrap
 
