@@ -2,8 +2,10 @@
 //!
 //! Every functionally complete feature is on by default: native display
 //! (retiring the GOP for the native HDMI/DP modeset), the DCN3.0 hardware
-//! cursor, native client submission (`accel`) and power saving. Each has an
-//! off switch (`amdgpu.rdna2_accel=0`, `amdgpu.native_display=0`, ...).
+//! cursor, native client submission (`accel`), power saving and automatic
+//! GPU recovery after a hang. Each has an off switch
+//! (`amdgpu.rdna2_accel=0`, `amdgpu.native_display=0`,
+//! `amdgpu.gpu_recovery=0`, ...).
 //! Multi-display stays opt-in: secondary CRTCs light but cannot present or
 //! deliver vblank yet.
 //!
@@ -22,6 +24,9 @@ pub struct BootOptions<'a> {
     pub accel: bool,
     pub multi: bool,
     pub hw_cursor: bool,
+    /// Linux `amdgpu.gpu_recovery`: automatic recovery after a detected hang
+    /// (`-1` auto and `1` enable it, `0` disables it).
+    pub gpu_recovery: bool,
     /// The power-saving list to apply; `None` applies nothing.
     pub power_saving: Option<&'a str>,
 }
@@ -65,6 +70,7 @@ impl<'a> BootOptions<'a> {
                 Some("amdgpu.navi22_hw_cursor"),
                 true,
             ),
+            gpu_recovery: switch("amdgpu.gpu_recovery", None, true),
             power_saving,
         }
     }
@@ -97,7 +103,11 @@ mod tests {
     fn complete_features_default_on_with_off_switches() {
         let default = BootOptions::parse("quiet");
         assert_eq!(default, BootOptions::default());
-        assert!(default.native_display && default.accel && default.hw_cursor);
+        assert!(
+            default.native_display && default.accel && default.hw_cursor && default.gpu_recovery
+        );
+        assert!(BootOptions::parse("amdgpu.gpu_recovery=-1").gpu_recovery);
+        assert!(!BootOptions::parse("amdgpu.gpu_recovery=0").gpu_recovery);
         assert!(!default.multi);
         assert_eq!(default.power_saving, Some(DEFAULT_POWER_SAVING));
         let off = BootOptions::parse(

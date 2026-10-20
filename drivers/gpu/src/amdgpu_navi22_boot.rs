@@ -2495,6 +2495,19 @@ impl ColdBoot {
             .as_ref()
             .and_then(crate::amdgpu_navi22_power_saving::Retained::applied)
     }
+    /// `power_dpm_force_performance_level` on GFXCLK.
+    pub(crate) async fn set_gfx_level(
+        &mut self,
+        level: crate::amdgpu_smu_navi22::GfxLevel,
+    ) -> Result<(), Error> {
+        let smu = self.sequence.backend.smu.as_mut().ok_or(Error::Invalid)?;
+        smu.set_gfx_level(level).await.map_err(Error::Smu)
+    }
+    /// The PMFW running feature mask.
+    pub(crate) async fn running_features(&mut self) -> Result<u64, Error> {
+        let smu = self.sequence.backend.smu.as_mut().ok_or(Error::Invalid)?;
+        smu.running_features().await.map_err(Error::Smu)
+    }
     /// AllowGfxOff/DisallowGfxOff for the GFXOFF controller, refused unless
     /// the opt-in enabled FEATURE_GFXOFF.
     pub(crate) async fn gfx_off_control(&mut self, allow: bool) -> Result<(), Error> {

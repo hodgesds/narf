@@ -203,6 +203,7 @@ MODULE_GLOBS = [
     "amdgpu_*navi22*.rs", "amdgpu_dcn30_*.rs", "amdgpu_dml30.rs", "amdgpu_psp*.rs",
     "amdgpu_vram_boot.rs", "amdgpu_dcn_*.rs", "amdgpu_gfx_firmware.rs",
     "amdgpu_smc_firmware.rs", "amdgpu_dmub_firmware.rs",
+    "amdgpu_rdna2_power_controls.rs",
 ]
 
 # --------------------------------------------------------------------------
