@@ -97,6 +97,7 @@ impl Aux for Fake {
             (0x90, 0x60, 16) => data.fill(0),
             (0x90, 0, 16) => data.copy_from_slice(&self.dpcd),
             (0x90, 0x2200, 16) => data.copy_from_slice(&self.extended),
+            (0x90, 0x2210, 1) => data[0] = 1 << 3,
             (0, 0x30, 1) => {
                 assert!(!self.mot);
                 self.segment = usize::from(data[0]);
@@ -244,7 +245,7 @@ kernel_test_in!(
 fn navi48_display_cancellation_and_transport_failure_block_reuse() -> TestResult {
     let mut p = probe();
     let mut io = fake(1);
-    io.stall = Some(7); // inside the EDID MOT sequence, after the DPCD reads
+    io.stall = Some(8); // inside the EDID MOT sequence, after the DPCD reads
     {
         let mut future = core::pin::pin!(p.scan_with(&mut io, None::<&mut ddc::Ddc>));
         if !future
@@ -355,6 +356,7 @@ fn navi48_display_scans_hdmi_with_native_ddc_and_dp_with_aux() -> TestResult {
                     lttpr_uhbr: None,
                     fec: false,
                     dsc: None,
+                    dprx_feature: 0,
                     verified_link: None,
                 })
                 .map_err(Error::Ddc)

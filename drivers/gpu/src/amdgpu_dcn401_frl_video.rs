@@ -8,7 +8,7 @@
 //! clock owner's; this owner requires and rechecks it. Stop is Linux's
 //! AVMUTE, hpo_enc401_blank and hpo_enc401_stop_hdmi_info_packets.
 use super::*;
-use crate::amdgpu_dcn401_otg::hdmi_link::{avi_infoframe, vendor_infoframe};
+use crate::amdgpu_dcn401_otg::hdmi_link::{avi_infoframe_in, vendor_infoframe};
 use crate::amdgpu_dcn_inventory::Path;
 
 const PIXEL_FORMAT: u64 = 0x8e0;
@@ -142,10 +142,10 @@ impl<I: Io> Engine<I> {
             self.wait(self.frl_at(VPG_MEM_PWR), 0x100, 0, 1000).await?;
         }
         let t = blank.timing.request.timing;
-        let avi = avi_infoframe(
+        let avi = avi_infoframe_in(
             &t,
             request.avi,
-            blank.request.limited,
+            blank.request.colorspace,
             blank.request.ycbcr420,
         );
         let vendor = vendor_infoframe(&t, request.avi);

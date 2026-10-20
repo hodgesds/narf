@@ -94,6 +94,15 @@ pub struct Selection {
     /// The primary plane's surface format: what DRM's framebuffer on the
     /// display's CRTC holds (`plane_format`), XRGB8888 by default.
     pub format: otg::SurfaceFormat,
+    /// DRM's "Colorspace" on the display's connector (a
+    /// DRM_MODE_COLORIMETRY_*, `output_color`), Default by default.
+    pub colorspace: u32,
+    /// DRM's HDR_OUTPUT_METADATA on the display's connector: the stream
+    /// sends the HDR InfoFrame (HDMI) or SDP (DP).
+    pub hdr: Option<crate::amdgpu_hdr::HdrOutputMetadata>,
+    /// A DP sink that takes colorimetry in the VSC SDP
+    /// (use_vsc_sdp_for_colorimetry: DPCD 1.4 and DPRX feature bit 3).
+    pub vsc_colorimetry: bool,
 }
 
 /// A selection's stream on an MST link: its end device and VC payload.
@@ -401,6 +410,27 @@ pub fn set_plane_format(pipe: u8, format: otg::SurfaceFormat) {
     ) {
         slot.store(index as u8, core::sync::atomic::Ordering::Relaxed);
     }
+}
+static OUTPUT_COLOR: [narf_lib::sync::IrqSafeSpinLock<(
+    u32,
+    Option<crate::amdgpu_hdr::HdrOutputMetadata>,
+)>; 4] = [const { narf_lib::sync::IrqSafeSpinLock::new((0, None)) }; 4];
+/// Light pipe `pipe` with DRM's Colorspace `colorspace` and HDR metadata
+/// `hdr` (its connector's) from its next lighting on.
+pub fn set_output_color(
+    pipe: u8,
+    colorspace: u32,
+    hdr: Option<crate::amdgpu_hdr::HdrOutputMetadata>,
+) {
+    if let Some(slot) = OUTPUT_COLOR.get(usize::from(pipe)) {
+        *slot.lock() = (colorspace, hdr);
+    }
+}
+/// The Colorspace and HDR metadata pipe `pipe` lights with.
+pub fn output_color(pipe: u8) -> (u32, Option<crate::amdgpu_hdr::HdrOutputMetadata>) {
+    OUTPUT_COLOR
+        .get(usize::from(pipe))
+        .map_or((0, None), |slot| *slot.lock())
 }
 /// The surface format pipe `pipe` lights with.
 pub fn plane_format(pipe: u8) -> otg::SurfaceFormat {
@@ -1457,6 +1487,11 @@ pub fn select_all(
                 .as_ref()
                 .and_then(|d| crate::amdgpu_freesync::dp_sst_caps(&sink.edid, d)),
             format: otg::SurfaceFormat::Xrgb8888,
+            colorspace: 0,
+            hdr: None,
+            vsc_colorimetry: sink.dpcd.as_ref().is_some_and(|d| {
+                crate::amdgpu_hdr::use_vsc_sdp_for_colorimetry(d[0], sink.dprx_feature)
+            }),
         });
     }
     let mut frl_free = true;
@@ -1513,6 +1548,9 @@ pub fn select_all(
             // HDMI FreeSync needs the AMD VSDB, which is not parsed.
             vrr: None,
             format: otg::SurfaceFormat::Xrgb8888,
+            colorspace: 0,
+            hdr: None,
+            vsc_colorimetry: false,
         });
     }
     out.truncate(MAX_DISPLAYS);
@@ -1686,6 +1724,43 @@ pub fn plane_mode(timing: Timing, format: otg::SurfaceFormat) -> dml::Mode {
 }
 
 impl Selection {
+    /// amdgpu_dm_get_output_color_space for this stream: its Colorspace,
+    /// pixel encoding (RGB, or YCbCr for 4:2:0), pixel rate and "Broadcast
+    /// RGB" (`limited`).
+    pub fn color_space(&self) -> crate::amdgpu_hdr::DcColorSpace {
+        crate::amdgpu_hdr::output_color_space(
+            self.colorspace,
+            !self.ycbcr420,
+            false,
+            self.timing.pixel_clock_khz.saturating_mul(10),
+            self.limited,
+        )
+    }
+    /// The output-format part of the blank request: depth, the color space
+    /// and the range and encoding it implies.
+    pub fn blank_request(&self, pipe: u8) -> otg::BlankRequest {
+        use crate::amdgpu_hdr::DcColorSpace as C;
+        let colorspace = self.color_space();
+        otg::BlankRequest {
+            pipe,
+            depth: self.depth,
+            limited: matches!(colorspace, C::SrgbLimited | C::Rgb2020Limited),
+            ycbcr420: self.ycbcr420,
+            colorspace,
+        }
+    }
+    /// The HDR packet amdgpu_dm_fill_hdr_info_packet builds for this
+    /// stream's connector type, while HDR_OUTPUT_METADATA is set.
+    pub fn hdr_packet(&self) -> Option<crate::amdgpu_hdr::InfoPacket> {
+        let connector = if self.hdmi {
+            crate::amdgpu_hdr::HdrConnector::Hdmi
+        } else {
+            crate::amdgpu_hdr::HdrConnector::DisplayPort
+        };
+        self.hdr
+            .as_ref()
+            .map(|m| crate::amdgpu_hdr::hdr_info_packet(Some(m), connector))
+    }
     /// A 128b/132b (UHBR) DP link.
     pub fn uhbr(&self) -> bool {
         matches!(self.rate, DpRate::Uhbr(_))
@@ -1953,6 +2028,7 @@ impl ColdBoot {
         let mut selection = select(&paths, &ports, max_bpc(), want)?;
         selection.limited = limited_range(broadcast_rgb()) && !selection.ycbcr420;
         selection.format = plane_format(pipe);
+        (selection.colorspace, selection.hdr) = output_color(pipe);
         self.select_display(pipe)?;
         let soc = self.prepare_configuration(&[selection]).await?;
         refine_dsc(&soc, core::slice::from_mut(&mut selection))?;
@@ -2079,6 +2155,7 @@ impl ColdBoot {
         for (s, &pipe) in selections.iter_mut().zip(&pipes) {
             s.limited = limited && !s.ycbcr420;
             s.format = plane_format(pipe);
+            (s.colorspace, s.hdr) = output_color(pipe);
         }
         self.select_display(pipes.first().copied().unwrap_or(0))?;
         let soc = self.prepare_configuration(&selections).await?;
@@ -2279,13 +2356,8 @@ impl ColdBoot {
                 ..timing_request(pipe, &plan, &selection)
             })
             .await?;
-            self.prepare_display_blank(otg::BlankRequest {
-                pipe,
-                depth: selection.depth,
-                limited: selection.limited,
-                ycbcr420: selection.ycbcr420,
-            })
-            .await?;
+            self.prepare_display_blank(selection.blank_request(pipe))
+                .await?;
             self.prepare_display_dpp(pipe).await?;
             self.prepare_display_mpc(pipe)?;
             self.prepare_display_requestor(pipe).await?;
@@ -2375,6 +2447,7 @@ impl ColdBoot {
                     stream: pipe,
                     pipe,
                     avi: selection.avi,
+                    hdr: selection.hdr_packet(),
                 };
                 self.prepare_display_hdmi_link(port, request).await?;
                 self.teardowns
@@ -2441,8 +2514,15 @@ impl ColdBoot {
             }
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Link);
-            self.prepare_display_dp_frontend(port, otg::DpFrontendRequest { stream: pipe, pipe })
-                .await?;
+            self.prepare_display_dp_frontend(
+                port,
+                otg::DpFrontendRequest {
+                    vsc_colorimetry: selection.vsc_colorimetry,
+                    hdr: selection.hdr_packet(),
+                    ..otg::DpFrontendRequest::new(pipe, pipe)
+                },
+            )
+            .await?;
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Frontend);
             self.start_display_dp_video(port).await?;

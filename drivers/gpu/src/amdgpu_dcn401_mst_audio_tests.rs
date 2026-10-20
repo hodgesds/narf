@@ -291,6 +291,7 @@ fn dcn401_mst_audio_two_streams_survive_link_owner_handover() -> TestResult {
             depth: ColorDepth::Bpc8,
             limited: false,
             ycbcr420: false,
+            colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(false, false),
         },
         c,
     ))

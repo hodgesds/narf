@@ -62,8 +62,23 @@ pub struct BlankRequest {
     /// limited range: `limited` is for RGB) and the blank pattern is YCbCr
     /// black. Requires 4:2:0 timing.
     pub ycbcr420: bool,
+    /// The stream's output color space (amdgpu_dm_get_output_color_space):
+    /// it selects the output CSC (find_color_matrix), the blank black
+    /// (color_space_to_black_color) and the colorimetry the stream signals.
+    /// `limited` must say whether it is a limited-range RGB space.
+    pub colorspace: crate::amdgpu_hdr::DcColorSpace,
 }
 impl BlankRequest {
+    /// The plain stream color spaces `limited` and `ycbcr420` describe
+    /// alone (DRM's Default colorimetry above the SDTV pixel rate).
+    pub fn default_colorspace(limited: bool, ycbcr420: bool) -> crate::amdgpu_hdr::DcColorSpace {
+        use crate::amdgpu_hdr::DcColorSpace as C;
+        match (ycbcr420, limited) {
+            (true, _) => C::Ycbcr709,
+            (false, true) => C::SrgbLimited,
+            (false, false) => C::Srgb,
+        }
+    }
     /// The OPP registers, then for 4:2:0 the 4:2:0 memory's power control
     /// (opp1_program_fmt releases its forced state; RGB leaves it alone).
     /// One ODM segment's OPP (`segment` 0 is the timing's own OPP): the
@@ -83,12 +98,21 @@ impl BlankRequest {
             .chain(self.ycbcr420.then_some((MAP420, 3, 0)))
     }
     fn common_registers(self, t: Timing, width: u32, x: u32, edge: u32) -> [(u64, u32, u32); 14] {
-        // black_color_format: limited black is 0x40 of 10 bits, a YCbCr
-        // chroma midpoint 0x200, MSB aligned in both 16-bit colour fields.
-        let (red, green, blue) = match (self.ycbcr420, self.limited) {
-            (true, _) => (0x8000_8000, 0x1000_1000, 0x8000_8000), // Cr, Y, Cb
-            (false, true) => (0x1000_1000, 0x1000_1000, 0x1000_1000),
-            (false, false) => (0, 0, 0),
+        // color_space_to_black_color: YCbCr spaces' black, sRGB limited's
+        // (0x40 of 10 bits), and full-range black for every other space,
+        // BT.2020 limited RGB included. MSB aligned in both 16-bit colour
+        // fields; YCbCr chroma sits at its 0x200 midpoint.
+        use crate::amdgpu_hdr::DcColorSpace as C;
+        let (red, green, blue) = match self.colorspace {
+            C::Ycbcr601
+            | C::Ycbcr709
+            | C::Ycbcr709Black
+            | C::Ycbcr601Limited
+            | C::Ycbcr709Limited
+            | C::Ycbcr2020Limited
+            | C::Ycbcr2020Full => (0x8000_8000, 0x1000_1000, 0x8000_8000), // Cr, Y, Cb
+            C::SrgbLimited => (0x1000_1000, 0x1000_1000, 0x1000_1000),
+            _ => (0, 0, 0),
         };
         // FMT_PIXEL_ENCODING 4:2:0, subsampling mode 2, Cb/Cr bit
         // reduction bypassed (opp1_set_pixel_encoding); RGB otherwise.
@@ -163,6 +187,13 @@ impl<I: Io> Engine<I> {
             // own (limited) range.
             || request.ycbcr420 != timing.request.ycbcr420
             || request.ycbcr420 && request.limited
+            // `limited` names the limited-range RGB spaces exactly.
+            || request.limited
+                != matches!(
+                    request.colorspace,
+                    crate::amdgpu_hdr::DcColorSpace::SrgbLimited
+                        | crate::amdgpu_hdr::DcColorSpace::Rgb2020Limited
+                )
         {
             return Err(Error::Invalid);
         }

@@ -11,6 +11,31 @@ pub use video::DpVideoRunning;
 pub struct DpFrontendRequest {
     pub stream: u8,
     pub pipe: u8,
+    /// The sink takes colorimetry in the VSC SDP
+    /// (stream->use_vsc_sdp_for_colorimetry): MSA MISC1 says so and the
+    /// video sends mod_build_vsc_infopacket's revision-5 SDP.
+    pub vsc_colorimetry: bool,
+    /// The HDR static metadata SDP (amdgpu_dm_fill_hdr_info_packet), sent
+    /// in GSP3 every frame while HDR_OUTPUT_METADATA is set.
+    pub hdr: Option<crate::amdgpu_hdr::InfoPacket>,
+}
+impl DpFrontendRequest {
+    /// The plain SST/MST stream: no VSC colorimetry, no HDR SDP.
+    pub fn new(stream: u8, pipe: u8) -> Self {
+        Self {
+            stream,
+            pipe,
+            vsc_colorimetry: false,
+            hdr: None,
+        }
+    }
+    /// What the video owner holds of DP_SEC_CNTL for its info packets:
+    /// GSP0 (VSC) and GSP3 (HDR), each with the secondary stream master.
+    pub(in crate::amdgpu_dcn401_otg) fn sdp_enables(self) -> u32 {
+        let vsc = if self.vsc_colorimetry { 1 << 20 | 1 } else { 0 };
+        let hdr = if self.hdr.is_some() { 1 << 23 | 1 } else { 0 };
+        vsc | hdr
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DpFrontendReady {
@@ -134,8 +159,10 @@ impl<I: Io> Engine<I> {
         // video owner's.
         let dsc = plan.blank.timing.request.dsc.is_some();
         let pps = if dsc { 1 } else { 0 };
+        // So are its VSC and HDR SDPs (GSP0, GSP3).
+        let sdp = plan.request.sdp_enables();
         for (reg, mask) in [
-            (0x2141, 0x1ff11111 & !audio & !pps),
+            (0x2141, 0x1ff11111 & !audio & !pps & !sdp),
             (0x2091, 0x1010),
             (0x213d, 0x11),
             (0x2170, 0x3010),
@@ -334,6 +361,15 @@ impl<I: Io> Engine<I> {
             ColorDepth::Bpc10 => 2,
             ColorDepth::Bpc12 => 3,
         };
+        // enc401_stream_encoder_dp_set_stream_attribute's MSA MISC0 and
+        // MISC1 for the output color space (RGB: DP takes no 4:2:0 here).
+        let (misc0, misc1) = crate::amdgpu_hdr::msa_misc(
+            plan.blank.request.colorspace,
+            crate::amdgpu_hdr::PixelEncoding::Rgb,
+            6 + 2 * depth as u8,
+            plan.request.vsc_colorimetry,
+            plan.controls[7],
+        );
         // Source/stereo selection is the OTG, never the physical port index.
         for (slot, mask, value) in [
             (0, 7, u32::from(plan.request.pipe)),
@@ -346,14 +382,12 @@ impl<I: Io> Engine<I> {
                 0x10731,
                 depth << 8 | u32::from(plan.blank.timing.request.dsc.is_some()),
             ),
-            // MSA MISC0: component depth, and bit 3 (CEA dynamic range) for
-            // limited-range RGB as dcn10 stream encoders set it.
-            (
-                6,
-                u32::MAX,
-                (depth << 5 | u32::from(plan.blank.request.limited) << 3) << 24,
-            ),
-            (7, 0xc0, 0), // RGB, MSA colorimetry (no VSC SDP)
+            // MSA MISC0: component depth, bit 3 (CEA dynamic range) for
+            // limited RGB and the YCbCr colorimetry bits.
+            (6, u32::MAX, misc0 << 24),
+            // MISC1: bit 6 when the VSC SDP carries colorimetry, bit 7
+            // (Y-only) cleared for the sRGB/601/709 spaces.
+            (7, 0xc0, misc1),
             (8, u32::MAX, t.h_total << 16 | t.v_total),
             (
                 9,

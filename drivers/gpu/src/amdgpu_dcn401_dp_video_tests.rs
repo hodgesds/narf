@@ -1226,6 +1226,7 @@ fn dcn401_mst_displays_share_one_link() -> TestResult {
             depth: ColorDepth::Bpc8,
             limited: false,
             ycbcr420: false,
+            colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(false, false),
         },
         c1,
     ))
@@ -1368,4 +1369,80 @@ fn dcn401_dp_stream_features_set_and_clear_ignore_msa() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_dp_stream_features_set_and_clear_ignore_msa
+);
+
+/// enc3_stream_encoder_update_dp_info_packets before the unblank: the VSC
+/// SDP in packets 0 and 1 with GSP0, the HDR SDP in packet 3 with GSP3,
+/// the secondary master on; new metadata rewrites packet 3 live; stopping
+/// the video turns both SDPs off.
+fn dcn401_dp_video_sends_vsc_and_hdr_sdps_like_linux() -> TestResult {
+    let (stream, pipe) = (1u8, 2u8);
+    let (mut e, mut io, c) = fixture(2, stream, pipe, ColorDepth::Bpc8);
+    let mut blob = [0u8; 32];
+    blob[4] = 2;
+    let meta = |b: &[u8; 32]| crate::amdgpu_hdr::HdrOutputMetadata::from_blob(b).unwrap();
+    let hdr = crate::amdgpu_hdr::hdr_info_packet(
+        Some(&meta(&blob)),
+        crate::amdgpu_hdr::HdrConnector::DisplayPort,
+    );
+    // The frontend's request carries both, as the modeset builds it.
+    {
+        let f = e.status.dp_frontend_ready.as_mut().unwrap();
+        f.request.vsc_colorimetry = true;
+        f.request.hdr = Some(hdr);
+    }
+    e.io.fake().writes.clear();
+    start(&mut e, &mut io, c);
+    let vsc = crate::amdgpu_hdr::vsc_sdp(
+        true,
+        crate::amdgpu_hdr::DcColorSpace::Srgb,
+        crate::amdgpu_hdr::PixelEncoding::Rgb,
+        8,
+        false,
+    )
+    .unwrap();
+    let packet = |e: &mut Engine<VideoIo>, index: u32| -> alloc::vec::Vec<u32> {
+        let w = &e.io.fake().writes;
+        let Some(at) = w
+            .iter()
+            .position(|&(a, v)| a == dio(stream, 0x2068) && v & 0xff == index * 9)
+        else {
+            return alloc::vec::Vec::new();
+        };
+        w[at..]
+            .iter()
+            .filter(|&&(a, _)| a == dio(stream, 0x2069))
+            .take(9)
+            .map(|&(_, v)| v)
+            .collect()
+    };
+    let sec = |e: &mut Engine<VideoIo>| e.io.fake().regs[&dio(stream, 0x2141)];
+    if packet(&mut e, 0) != vsc.words()
+        || packet(&mut e, 1) != vsc.words()
+        || packet(&mut e, 3) != hdr.words()
+        || sec(&mut e) & (1 << 20 | 1 << 23 | 1) != 1 << 20 | 1 << 23 | 1
+    {
+        return TestResult::Fail("VSC/HDR SDPs at start");
+    }
+    blob[26..28].copy_from_slice(&400u16.to_le_bytes());
+    let brighter = crate::amdgpu_hdr::hdr_info_packet(
+        Some(&meta(&blob)),
+        crate::amdgpu_hdr::HdrConnector::DisplayPort,
+    );
+    e.io.fake().writes.clear();
+    if run(e.dp_update_hdr(brighter)).is_err()
+        || packet(&mut e, 3) != brighter.words()
+        || !packet(&mut e, 0).is_empty()
+    {
+        return TestResult::Fail("live HDR SDP");
+    }
+    run(e.stop_dp_video(&mut io, path(2))).unwrap();
+    if sec(&mut e) & (1 << 20 | 1 << 23 | 1) != 0 {
+        return TestResult::Fail("SDPs after stop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_dp_video_sends_vsc_and_hdr_sdps_like_linux
 );

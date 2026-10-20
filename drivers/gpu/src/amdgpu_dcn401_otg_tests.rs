@@ -942,6 +942,7 @@ fn blank_request(pipe: u8) -> BlankRequest {
         depth: ColorDepth::Bpc8,
         limited: false,
         ycbcr420: false,
+        colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(false, false),
     }
 }
 
@@ -965,6 +966,9 @@ fn dcn401_opp_stages_native_rgb_black_without_claiming_blank_completion() -> Tes
                 depth,
                 limited: false,
                 ycbcr420: false,
+                colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(
+                    false, false,
+                ),
             };
             let a = run(e.prepare_blank(req, clock(request(pipe)))).unwrap();
             assert!(a.pending, "OPP double-buffer still awaits timing enable");
@@ -1286,6 +1290,7 @@ fn dcn401_ycbcr420_divides_horizontal_timing_and_subsamples() -> TestResult {
         e.io.retiring = [false; 4];
         let blank = BlankRequest {
             ycbcr420: true,
+            colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(false, true),
             ..blank_request(pipe)
         };
         for bad in [
@@ -1593,6 +1598,7 @@ fn dcn401_odm_combines_two_opps_with_split_dsc() -> TestResult {
     e.io.retiring = [false; 4];
     let blank420 = BlankRequest {
         ycbcr420: true,
+        colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(false, true),
         ..blank_request(pipe)
     };
     run(e.prepare_blank(blank420, clock(wide420))).unwrap();

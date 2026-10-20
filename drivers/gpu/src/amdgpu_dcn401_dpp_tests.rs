@@ -169,6 +169,10 @@ fn ready_range(
             depth,
             limited,
             ycbcr420: mode.timing.ycbcr420,
+            colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(
+                limited,
+                mode.timing.ycbcr420,
+            ),
         },
         clock,
     ))

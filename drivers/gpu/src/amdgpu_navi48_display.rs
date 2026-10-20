@@ -59,6 +59,9 @@ pub struct Sink {
     pub fec: bool,
     /// DSC decoder caps (DPCD 0x060-0x06F), read from DPCD 1.4 on.
     pub dsc: Option<[u8; 16]>,
+    /// DP_DPRX_FEATURE_ENUMERATION_LIST (0x2210), which retrieve_link_cap
+    /// reads only with an extended receiver capability field; zero else.
+    pub dprx_feature: u8,
     /// Linux's verified_link_cap where training proved less than the caps:
     /// the 8b/10b rate code and lane count the link last trained at after
     /// every setting above it was refused. Never set by a probe; the display
@@ -202,9 +205,11 @@ async fn read_sink(io: &mut impl Aux, instance: u8) -> Result<Sink, Error> {
     if !valid_dpcd(&dpcd) {
         return Err(Error::InvalidDpcd);
     }
+    let mut dprx_feature = [0; 1];
     if dpcd[14] & 0x80 != 0 {
         let mut extended = [0; 16];
         transfer(io, instance, 0x90, 0x2200, &mut extended).await?;
+        transfer(io, instance, 0x90, 0x2210, &mut dprx_feature).await?;
         // drm_dp_read_extended_dpcd_caps keeps base caps for an older revision.
         if extended[0] >= dpcd[0] {
             if !valid_dpcd(&extended) {
@@ -234,6 +239,7 @@ async fn read_sink(io: &mut impl Aux, instance: u8) -> Result<Sink, Error> {
         lttpr_uhbr,
         fec: fec[0] & 1 != 0,
         dsc,
+        dprx_feature: dprx_feature[0],
         verified_link: None,
     })
 }
@@ -325,6 +331,7 @@ impl Probe {
                                 lttpr_uhbr: None,
                                 fec: false,
                                 dsc: None,
+                                dprx_feature: 0,
                                 verified_link: None,
                             })
                             .map_err(Error::Ddc)

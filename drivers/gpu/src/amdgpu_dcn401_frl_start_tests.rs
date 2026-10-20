@@ -283,6 +283,7 @@ fn prepared_frl_video_rate(
         BlankRequest {
             ycbcr420,
             depth,
+            colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(false, ycbcr420),
             ..blank_request(pipe)
         },
         c,

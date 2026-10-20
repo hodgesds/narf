@@ -2108,6 +2108,24 @@ impl ColdBoot {
         // SAFETY: serialized retained owner; caller excludes writers.
         unsafe { self.otg.as_mut().map_err(|e| *e)?.set_color(pipe, program) }.await
     }
+    /// New HDR metadata on display `pipe`'s running stream (no modeset).
+    /// # Safety
+    /// As for `set_display_cursor`.
+    pub async unsafe fn set_display_hdr(
+        &mut self,
+        pipe: u8,
+        packet: crate::amdgpu_hdr::InfoPacket,
+    ) -> Result<(), otg::Error> {
+        if self.state() != State::MemoryReady {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: serialized retained owner; caller excludes writers.
+        unsafe { self.otg.as_mut().map_err(|e| *e)?.set_hdr(pipe, packet) }.await
+    }
+    /// The HDR packet display `pipe`'s running stream sends.
+    pub fn display_hdr(&self, pipe: u8) -> Option<crate::amdgpu_hdr::InfoPacket> {
+        self.otg.as_ref().ok().and_then(|o| o.hdr(pipe))
+    }
     /// The CRTC color display `pipe` was last given.
     pub fn display_color(&self, pipe: u8) -> Option<alloc::sync::Arc<otg::ColorProgram>> {
         self.otg.as_ref().ok().and_then(|o| o.color(pipe))
@@ -3274,10 +3292,10 @@ mod modeset;
 mod teardown;
 pub use modeset::{
     broadcast_rgb, edid_timings, frl_audio, frl_cap, frl_carries, frl_enabled, frl_link, hdmi_avi,
-    hdmi_caps, limited_range, max_bpc, plane_format, plane_mode, set_broadcast_rgb, set_frl,
-    set_max_bpc, set_plane_format, sink_audio_info, Configuration, FrlRate, HdmiCaps, Health,
-    InheritedRetired, Modeset, ModesetError, MstRoute, MstStream, Selection, SstOutput,
-    BROADCAST_RGB_AUTO, BROADCAST_RGB_FULL, BROADCAST_RGB_LIMITED,
+    hdmi_caps, limited_range, max_bpc, output_color, plane_format, plane_mode, set_broadcast_rgb,
+    set_frl, set_max_bpc, set_output_color, set_plane_format, sink_audio_info, Configuration,
+    FrlRate, HdmiCaps, Health, InheritedRetired, Modeset, ModesetError, MstRoute, MstStream,
+    Selection, SstOutput, BROADCAST_RGB_AUTO, BROADCAST_RGB_FULL, BROADCAST_RGB_LIMITED,
 };
 pub use teardown::{TeardownStatus, TeardownStep};
 #[cfg(feature = "kernel-test")]

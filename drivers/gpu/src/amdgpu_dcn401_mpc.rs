@@ -14,6 +14,9 @@ pub struct MpcApplied {
     /// The output CSC converts to BT.709 YCbCr for a 4:2:0 stream (the
     /// blank request's).
     pub ycbcr420: bool,
+    /// The stream's output color space, which picks the output CSC (the
+    /// blank request's).
+    pub colorspace: crate::amdgpu_hdr::DcColorSpace,
     /// CURRENT selectors not yet at the request: location, OGAM, OGAM gamut,
     /// shaper, 3D LUT, post-1D LUT, first/second MCM gamut (all bypass) and
     /// output CSC (bypass, or set A when limited or YCbCr).
@@ -51,25 +54,56 @@ impl Layout {
             (self.ocsc(pipe), 3, 1),
         ]
     }
-    /// The output CSC a stream needs: COLOR_SPACE_YCBCR709 for 4:2:0
-    /// (YCBCR709_TYPE), COLOR_SPACE_SRGB_LIMITED for limited RGB (each
-    /// channel scaled by 0x1B67 plus 0x201), none (bypass) for full RGB.
+    /// The output CSC a stream's color space needs: find_color_matrix's
+    /// row of output_csc_matrix for its get_color_space_type (rows: Cr or R,
+    /// Y or G, Cb or B), or none for an RGB_TYPE space, whose identity
+    /// matrix the bypass equals.
     fn ocsc_matrix(a: &MpcApplied) -> Option<[u32; 12]> {
-        if a.ycbcr420 {
-            Some([
-                0xe04, 0xf345, 0xfeb7, 0x1004, // Cr
-                0x5d3, 0x1399, 0x1fa, 0x201, // Y
-                0xfcca, 0xf533, 0xe04, 0x1004, // Cb
-            ])
-        } else if a.limited {
-            Some([
+        use crate::amdgpu_hdr::DcColorSpace as C;
+        Some(match a.colorspace {
+            // RGB_LIMITED_TYPE: each channel scaled by 0x1B67 plus 0x201.
+            C::SrgbLimited | C::Rgb2020Limited => [
                 0x1b67, 0, 0, 0x201, //
                 0, 0x1b67, 0, 0x201, //
                 0, 0, 0x1b67, 0x201,
-            ])
-        } else {
-            None
-        }
+            ],
+            C::Ycbcr601 | C::XvYcc601 => [
+                0xe04, 0xf444, 0xfdb9, 0x1004, //
+                0x831, 0x1016, 0x320, 0x201, //
+                0xfb45, 0xf6b7, 0xe04, 0x1004,
+            ],
+            C::Ycbcr709 | C::XvYcc709 => [
+                0xe04, 0xf345, 0xfeb7, 0x1004, //
+                0x5d3, 0x1399, 0x1fa, 0x201, //
+                0xfcca, 0xf533, 0xe04, 0x1004,
+            ],
+            C::Ycbcr601Limited => [
+                0xe00, 0xf447, 0xfdb9, 0x1000, //
+                0x991, 0x12c9, 0x3a6, 0x200, //
+                0xfb47, 0xf6b9, 0xe00, 0x1000,
+            ],
+            C::Ycbcr709Limited => [
+                0xe00, 0xf349, 0xfeb7, 0x1000, //
+                0x6ce, 0x16e3, 0x24f, 0x200, //
+                0xfccb, 0xf535, 0xe00, 0x1000,
+            ],
+            C::Ycbcr2020Limited => [
+                0xe04, 0xf31d, 0xfedf, 0x1004, //
+                0x733, 0x1294, 0x1a0, 0x201, //
+                0xfc16, 0xf5e6, 0xe04, 0x1004,
+            ],
+            C::Ycbcr2020Full => [
+                0x1000, 0xf149, 0xfeb7, 0x1004, //
+                0x868, 0x15b2, 0x1e6, 0, //
+                0xfb88, 0xf478, 0x1000, 0x1004,
+            ],
+            C::Ycbcr709Black => [
+                0, 0, 0, 0x1000, //
+                0, 0, 0, 0x200, //
+                0, 0, 0, 0x1000,
+            ],
+            _ => return None,
+        })
     }
     fn mpc_bypass(self, p: u8) -> [(u64, u32); 9] {
         [
@@ -212,6 +246,7 @@ impl Surfaces {
             || a.depth != blank.request.depth
             || a.limited != blank.request.limited
             || a.ycbcr420 != blank.request.ycbcr420
+            || a.colorspace != blank.request.colorspace
             || e.blank_timing(blank.request, clock)? != dpp.timing
             || e.status.memory[slot]
                 != Some(MemoryApplied {
@@ -252,6 +287,7 @@ impl Surfaces {
             depth: blank.request.depth,
             limited: blank.request.limited,
             ycbcr420: blank.request.ycbcr420,
+            colorspace: blank.request.colorspace,
             pending: 0,
         };
         self.verify_mpc_source(e, a, (clock, config))?;

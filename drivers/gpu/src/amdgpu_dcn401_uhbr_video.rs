@@ -192,7 +192,16 @@ fn stream_attributes(blank: BlankApplied) -> [(u64, u32); 10] {
         10 => (2, 0x40),
         _ => (3, 0x60),
     };
-    let misc0 = misc_depth | u32::from(blank.request.limited) << 3;
+    // enc401's MISC0 for the output color space (no VSC SDP on HPO here).
+    let misc0 = crate::amdgpu_hdr::msa_misc(
+        blank.request.colorspace,
+        crate::amdgpu_hdr::PixelEncoding::Rgb,
+        depth as u8,
+        false,
+        0,
+    )
+    .0;
+    debug_assert_eq!(misc0 & 0xe0, misc_depth);
     // PIXEL_ENCODING_TYPE: compressed for a DSC stream.
     let compressed = u32::from(blank.timing.request.dsc.is_some());
     let freq = u64::from(t.pixel_clock_khz) * 1000;

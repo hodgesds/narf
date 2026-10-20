@@ -165,6 +165,7 @@ fn port(path: inventory::Path, dpcd: Option<[u8; 16]>, edid: Vec<u8>) -> display
             lttpr_uhbr: None,
             fec: false,
             dsc: None,
+            dprx_feature: 0,
             verified_link: None,
         }),
     }
@@ -1114,6 +1115,7 @@ fn navi48_modeset_decides_uhbr_like_linux() -> TestResult {
             lttpr_uhbr,
             fec: false,
             dsc: None,
+            dprx_feature: 0,
             verified_link: None,
         };
         dp_caps(&p, &sink).unwrap().uhbr
@@ -1229,6 +1231,7 @@ fn navi48_modeset_decides_uhbr_like_linux() -> TestResult {
         lttpr_uhbr: None,
         fec: false,
         dsc: None,
+        dprx_feature: 0,
         verified_link: None,
     };
     let port = display::Port {
@@ -1410,6 +1413,7 @@ fn navi48_modeset_decides_dsc_like_linux() -> TestResult {
         lttpr_uhbr: None,
         fec,
         dsc,
+        dprx_feature: 0,
         verified_link: None,
     };
     let pick = |s: display::Sink| {
@@ -2158,6 +2162,7 @@ fn navi48_dsc_link_verification_reselects_compressed_geometry() -> TestResult {
         lttpr_uhbr: None,
         fec: true,
         dsc: Some(DSC),
+        dprx_feature: 0,
         verified_link: None,
     };
     let ports = || {
@@ -2617,6 +2622,7 @@ fn navi48_modeset_selects_dsc_over_uhbr() -> TestResult {
         lttpr_uhbr: None,
         fec: true,
         dsc: Some(UHBR_DSC),
+        dprx_feature: 0,
         verified_link: None,
     };
     let port = display::Port {
@@ -2715,4 +2721,58 @@ fn navi48_modeset_selects_dsc_over_uhbr() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_modeset_selects_dsc_over_uhbr
+);
+
+/// A selection's output color space, blank request and HDR packet follow
+/// amdgpu_dm_get_output_color_space and amdgpu_dm_fill_hdr_info_packet;
+/// the DP sink's VSC colorimetry follows its DPCD revision and DPRX bit.
+fn navi48_selection_maps_colorspace_and_hdr_like_amdgpu_dm() -> TestResult {
+    use crate::amdgpu_hdr::DcColorSpace as C;
+    let s = limited_bpp_dsc_selection();
+    if s.colorspace != 0 || s.hdr.is_some() || s.hdr_packet().is_some() {
+        return TestResult::Fail("defaults");
+    }
+    for (colorspace, limited, ycbcr420, cs) in [
+        (0, false, false, C::Srgb),
+        (0, true, false, C::SrgbLimited),
+        (0, false, true, C::Ycbcr709),
+        (9, false, false, C::Rgb2020Full),
+        (9, true, false, C::Rgb2020Limited),
+        (10, false, true, C::Ycbcr2020Limited),
+        (7, false, false, C::AdobeRgb),
+        (2, false, false, C::Ycbcr709),
+    ] {
+        let sel = Selection {
+            colorspace,
+            limited,
+            ycbcr420,
+            ..s
+        };
+        let b = sel.blank_request(2);
+        if sel.color_space() != cs
+            || b.colorspace != cs
+            || b.limited != matches!(cs, C::SrgbLimited | C::Rgb2020Limited)
+            || b.ycbcr420 != ycbcr420
+        {
+            return TestResult::Fail("output color space");
+        }
+    }
+    let mut blob = [0u8; 32];
+    blob[4] = 2;
+    let meta = crate::amdgpu_hdr::HdrOutputMetadata::from_blob(&blob).unwrap();
+    let dp = Selection {
+        hdr: Some(meta),
+        ..s
+    };
+    let hdmi = Selection { hdmi: true, ..dp };
+    if dp.hdr_packet().map(|p| p.hb) != Some([0, 0x87, 0x1d, 0x4c])
+        || hdmi.hdr_packet().map(|p| p.hb) != Some([0x87, 1, 0x1a, 0])
+    {
+        return TestResult::Fail("HDR packet type");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_selection_maps_colorspace_and_hdr_like_amdgpu_dm
 );

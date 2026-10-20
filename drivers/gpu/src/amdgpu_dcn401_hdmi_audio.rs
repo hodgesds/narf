@@ -851,10 +851,12 @@ impl<I: Io> Engine<I> {
         let pps = u32::from(frontend.blank.timing.request.dsc.is_some());
         self.dp_audio_pps_verify(&frontend)?;
         let at = |r| DpStream::Dio(frontend.request.stream).at(self.layout, r);
+        // The video's VSC/HDR SDPs hold GSP0/GSP3 and the master.
+        let sdp = frontend.request.sdp_enables();
         for (reg, mask, value) in [
             (at(AFMT_CNTL), 1, pps),
             (at(AFMT_PACKET), 1, 0),
-            (at(DP_SEC_CNTL), 0x1ff1_1111, pps),
+            (at(DP_SEC_CNTL), 0x1ff1_1111, pps | sdp),
         ] {
             if self.read(reg)? & mask != value {
                 return Err(Error::Busy);

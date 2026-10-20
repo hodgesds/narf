@@ -209,6 +209,7 @@ fn dcn401_drr_is_fixed_before_the_timing_stops_and_bounds_frame_waits() -> TestR
             depth: ColorDepth::Bpc8,
             limited: false,
             ycbcr420: false,
+            colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(false, false),
         },
         timing: Applied {
             request: req,

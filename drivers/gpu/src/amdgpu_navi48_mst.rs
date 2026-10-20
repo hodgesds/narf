@@ -723,6 +723,10 @@ fn select_mst_with_budget(
             // VRR is DP SST only here (no MST stream features).
             vrr: None,
             format: otg::SurfaceFormat::Xrgb8888,
+            // MST connectors carry neither Colorspace nor HDR metadata here.
+            colorspace: 0,
+            hdr: None,
+            vsc_colorimetry: false,
         };
         out.push(s);
     }
@@ -1009,11 +1013,8 @@ impl ColdBoot {
                 self.prepare_display_uhbr_mst_stream(port, pipe, pipe, stream.slots)
                     .await?;
             } else {
-                self.prepare_display_dp_frontend(
-                    port,
-                    otg::DpFrontendRequest { stream: pipe, pipe },
-                )
-                .await?;
+                self.prepare_display_dp_frontend(port, otg::DpFrontendRequest::new(pipe, pipe))
+                    .await?;
             }
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Frontend);

@@ -356,6 +356,7 @@ fn chain(phy_index: u8, stream: u8, pipe: u8) -> Chain {
         stream,
         pipe,
         avi: Default::default(),
+        hdr: None,
     };
     run(e.prepare_hdmi_link(&mut fw, path(phy_index), request, clock)).unwrap();
     run(e.start_hdmi_video(path(phy_index), clock)).unwrap();
@@ -968,7 +969,7 @@ fn dcn401_scanout_chain_programs_crtc_color() -> TestResult {
         c.e.io.pause_wait = true;
         let requested = c.e.io.lock_requested.clone();
         requested.store(false, Ordering::SeqCst);
-        cancel_at(c.e.set_color(p, Some(color(195, false))), || {
+        cancel_at(c.e.set_color(p, Some(color(195, true))), || {
             requested.load(Ordering::SeqCst)
         });
         if c.e.status.state != State::UpdatingStream(p) {

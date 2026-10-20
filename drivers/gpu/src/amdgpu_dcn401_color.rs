@@ -10,6 +10,7 @@
 //! - dcn401_set_output_transfer_func -> mpc3_set_output_gamma: GAMMA_LUT's
 //!   PWL into the OGAM RAM bank not in use (mpc3_program_luta/b and
 //!   mpc3_program_ogam_pwl), then that bank selected; bypass without one.
+//!
 //! The scanout start programs them under its OTG master lock; a live update
 //! takes the same lock, so the double-buffered selections latch together at
 //! one VUPDATE, and waits for that latch before reporting.
@@ -406,6 +407,65 @@ impl Otg {
             .get(usize::from(pipe))
             .cloned()
             .flatten()
+    }
+    /// New HDR static metadata for display `pipe`'s running stream, which
+    /// already sends HDR packets (the stream update amdgpu_dm makes when
+    /// metadata changes while HDR stays on): the HDMI DRM InfoFrame or the
+    /// DP HDR SDP rewritten with an immediate update. `Invalid` for a
+    /// stream without HDR packets (entering or leaving HDR is a modeset)
+    /// or a packet of the other kind; `Busy` without running video.
+    /// # Safety
+    /// Exclude firmware/FAMS and concurrent display writers.
+    pub async unsafe fn set_hdr(
+        &mut self,
+        pipe: u8,
+        packet: crate::amdgpu_hdr::InfoPacket,
+    ) -> Result<(), Error> {
+        self.0.select_display(pipe)?;
+        let e = &mut self.0;
+        let live = match e.status.state {
+            State::ScanoutRunning(p) => p == pipe,
+            State::HdmiVideoRunning(s) => e
+                .status
+                .hdmi_video_running
+                .is_some_and(|v| v.link.request.stream == s && v.link.request.pipe == pipe),
+            State::DpVideoRunning(s) => e
+                .status
+                .dp_video_running
+                .is_some_and(|v| v.frontend.request.stream == s && v.frontend.request.pipe == pipe),
+            _ => false,
+        };
+        if !live {
+            return Err(Error::Busy);
+        }
+        // The DRM InfoFrame's type sits in HB0; the SDP's in HB1.
+        let hdmi = packet.hb[0] == 0x87;
+        let result = match (e.status.hdmi_video_running, e.status.dp_video_running) {
+            (Some(v), _) if v.link.request.pipe == pipe && hdmi => e.hdmi_update_hdr(packet).await,
+            (_, Some(v)) if v.frontend.request.pipe == pipe && !hdmi => {
+                e.dp_update_hdr(packet).await
+            }
+            _ => return Err(Error::Invalid),
+        };
+        if let Err(err) = result {
+            if err != Error::Invalid {
+                e.status.state = State::Failed(err);
+            }
+        }
+        result
+    }
+    /// The HDR packet display `pipe`'s running stream sends, if any.
+    pub fn hdr(&self, pipe: u8) -> Option<crate::amdgpu_hdr::InfoPacket> {
+        let s = self.display_status(pipe)?;
+        let hdmi = s
+            .hdmi_video_running
+            .filter(|v| v.link.request.pipe == pipe)
+            .and_then(|v| v.link.request.hdr);
+        let dp = s
+            .dp_video_running
+            .filter(|v| v.frontend.request.pipe == pipe)
+            .and_then(|v| v.frontend.request.hdr);
+        hdmi.or(dp)
     }
 }
 
