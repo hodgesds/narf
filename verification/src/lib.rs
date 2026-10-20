@@ -313,6 +313,9 @@ pub fn run_subsystems(wanted: &[&str]) -> Summary {
         if !wanted.iter().any(|w| subsystem_selected(t.subsystem, w)) {
             continue;
         }
+        // As in `run_all`: a test that hangs (an aarch64 stack overflow
+        // does, silently) is the last one named.
+        let _ = writeln!(Writer, "  [run] {} / {}", t.subsystem, t.name);
         match (t.run)() {
             TestResult::Pass => {
                 let _ = writeln!(Writer, "  [ OK ] {} / {}", t.subsystem, t.name);
