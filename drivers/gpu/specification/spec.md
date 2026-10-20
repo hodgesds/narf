@@ -1354,16 +1354,68 @@ SDP on), before the SST payload, whose slots, VC rate and minimum blank
 width (`uhbr_dsc_payload`) use the compressed bandwidth. `stop_uhbr_video`
 writes DP_DSC_ENABLE 0 (unchecked) and turns GSP11 off with payload size 0
 after the encoder, before the timing; the DSC stays for a restart until the
-timing retires. MST DSC over 128b/132b is refused (`Unsupported`). HDMI FRL
-DSC is not implemented: it needs the EDID HF-VSDB DSC caps
-(`dc_dsc_parse_dsc_edid`), DC's HDMI DSC slice and bpp rules
-(`hdmi_dsc_get_num_slices`/`hdmi_dsc_get_bpp`, native 4:2:2, 7 bpp minimum,
-`frl_dsc_max_frl_rate`), the compressed FRL capacity check
-(`dml1_frl_cap_chk_compressed` and the DSC padding/borrow adjustments of
-`calculate_timing_params_for_dsc_with_padding`/`update_borrow_mode_from_dsc_padding`), and
-`hpo_enc401_hdmi_set_dsc_config` (HDMI_DSC_MODE, the FIFO compressed-format
-bits, zero GCP depth, the CVTEM PPS in generic packets 5-10) after FRL
-training.
+timing retires.
+
+HDMI FRL DSC follows amdgpu_dm's FRL policy (`apply_dsc_policy_for_stream`,
+`create_validate_stream_for_sink`): a stream is compressed only when no
+uncompressed RGB/4:2:0 depth fits the sink's maximum FRL rate.
+`amdgpu_dsc::HdmiDscCaps::parse(flags, max_frl_rate, total_chunk)` reads the
+HF-VSDB DSC bytes as drm_edid does and `DscSinkCaps::from_hdmi` is
+`dc_dsc_parse_dsc_edid` (`is_frl`, `all_bpp`, `total_chunk_bytes`).
+`compute_frl_config(sink, max_dispclk_khz, max_rate, timing, vic)` is
+`dc_dsc_compute_config` on `LinkEncoding::HdmiFrl`: `hdmi_num_slices` and
+`hdmi_bpp_x16` (`hdmi_dsc_get_num_slices`/`hdmi_dsc_get_bpp` with the
+`prim_bpp` tables for CTA/HDMI VICs), `frl_params` per FRL rate
+(`compute_bpp_x16_from_frl_params`), the FRL `decide_dsc_bandwidth_range`
+branch with no DP slice overhead, and the FRL minimum-bpp fallback;
+`DscConfig::frl = Some(FrlDscLink { all_bpp, max_rate })`. The FRL rate is
+the lowest one whose compressed capacity check passes:
+`amdgpu_frl_cap::frl_cap_check` with `FrlCapInput::dsc = Some(FrlDsc { slices,
+slice_width, bpp_x16, vic, all_bpp })` is `dml1_frl_cap_chk_compressed`
+(prim_format tables, 192 kHz audio reserve) returning `FrlCap::Ok {
+audio_packets_line, borrow, hc_active, hc_blank }`, and `dsc_borrow` is
+`frl_modify_borrow_mode_for_dsc_padding` (Linux's 100 Hz pixel clock units
+kept). `tests/dcn401_frl/check.sh` replays 3564 uncompressed and 2970
+compressed vectors against Linux built on the host; `tests/dcn401_dsc/
+check.sh` replays 3000 FRL DSC configurations and 890 CVTEM packet sets.
+`modeset::hdmi_stream` selects the stream (8-bpc RGB, then 4:2:0 DSC, as
+Linux orders encodings); `frl_video_params` gives the HPO FRL video request's
+`FrlVideoRequest { audio_packets_line, borrow, hc_active, hc_blank }`.
+Lighting runs link_set_dsc_on_stream's FRL order after training: the pipe's
+DSC engines, then `hpo_enc401_hdmi_set_dsc_config` (`frl_dsc_start`:
+HDMI_DSC_MODE, FIFO compressed-format bits, zero GCP depth, the CVTEM PPS in
+VPG generic packets 5-10 with Linux's packet-buffer reuse), then the OPTC
+(`OTG_V_SYNC_MODE` 1); stop runs OPTC off, HPO DSC off (`frl_dsc_off`), then
+the DSC disconnect and disable. FRL DSC requires 8-bpc input; DML21 admits
+the compressed stream (`frl_dsc_vectors.txt`, one FRL output per context as
+Linux's `max_num_hdmi_frl_outputs`).
+
+DP MST DSC follows amdgpu_dm and DRM on both encodings.
+`amdgpu_mst_dsc::compute_link(streams, link, fits, native)` is
+`compute_mst_dsc_configs_for_link` with `increase_dsc_bpp`,
+`try_disable_dsc` and `set_dsc_configs_from_fairness_vars`: `peak_pbn`
+(`kbps_to_peak_pbn`, 1.006 peak, 1.031 8b/10b FEC), `kbps_from_pbn`,
+`DscLink { encoding, kbps, slots, max_dispclk_khz }`, `DscStream { sink,
+timing, dsc }` and `DscPayload { pbn, slots, dsc }`; `fits` is the topology's
+per-hop PBN check and `native` the display pipeline's DSC shape (at most two
+ODM pipes of four slices). `tests/dcn401_dsc/check.sh` replays 1500
+mst_vectors.txt links through Linux's own fairness functions (mst_harness.c);
+a configuration Linux leaves compressed at bpp 0 is refused. In
+`amdgpu_navi48_mst::dsc`, `dsc_aux_for_port` is
+`drm_dp_mst_dsc_aux_for_port` (end device, DP-to-DP virtual-DPCD peer with
+passthrough, DP-to-HDMI/virtual sink, `DSC_WITHOUT_VIRTUAL_DPCD` hubs),
+`read_dsc` is `validate_dsc_caps_on_connector` returning `MstDsc { caps, aux,
+passthrough, end_link_kbps, branch_oui }`, `port_supports_mode` is
+`dm_dp_mst_is_port_support_mode`, and `set_rx` is
+`dm_helpers_dp_write_dsc_enable` (passthrough 2 before decoder 1; disable
+reverse) through `dp_mst_mgr::Manager::remote_dpcd_read/write`. Selection
+and offered modes run the fairness search jointly across the branch; the
+payload PBN and VC rate come from the compressed bandwidth
+(`uhbr_mst_dsc_rate` on 128b/132b). The decoder is enabled before the
+payload, the PPS is sent per stream (DIO SDP or HPO GSP11) before unblank,
+and teardown stops the stream before clearing DP_DSC_ENABLE. MST DSC streams
+carry no audio; Synaptics cascaded/Panamera workarounds and DP-to-HDMI PCON
+FRL DSC are not ported.
 `modeset_display_mode` and `modeset_displays` select, admit and light again
 (at most `VERIFY_ROUNDS`) when the first display reports `LinkReduced`; a later
 display's reduction is returned in `Configuration::failed`, and the monitor
@@ -1425,7 +1477,8 @@ Writes and live format checks reject mismatched encoding, depth, compression
 or width. Startup rechecks the stream, link, clock route and format after its
 final frame wait before publishing running video. Failure after writes retains
 the link and quarantines the video owner. FRL LPCM uses the audio contract
-below; FRL DSC and physical acceptance remain open.
+below; FRL DSC is described with the DSC policy above. Physical acceptance
+remains open.
 
 `amdgpu_frl_training::poll_status` handles live SCDC FRL_Start, FLT_Update
 and Source_Test_Update requests as Linux's `hdmi_frl_poll_status_flag` does.
@@ -2058,7 +2111,8 @@ GETCONNECTOR and the platform's mode-request gate without setting a CRTC mode
 or framebuffer. A missing EDID suppresses the offered timings. Ordinary MST
 disable retains previously admitted timings without restarting siblings;
 the next configuration/reprobe recomputes admission against remaining resources.
-DSC on MST and more than one MST branch remain unsupported.
+MST DSC follows amdgpu_dm's fairness search (see the DSC policy above); more
+than one MST branch remains unsupported.
 
 An MST branch that codes 128b/132b runs UHBR MST, as Linux's
 decide_mst_link_settings trains MST at the verified cap: the best UHBR rate
@@ -2677,7 +2731,7 @@ uses the actual trained lane count/rate and reduces 8b/10b capacity to 97% when
 FEC runs. Uncompressed RGB uses its component depth; DSC uses the validated
 PPS's bits per pixel and per-slice overhead, so a mode which needs compression
 is not rejected against its uncompressed size. This native DSC path requires
-8-bpc RGB SST and a FEC-trained link; other depths, MST DSC and insufficient
+8-bpc RGB and a FEC-trained link (SST or MST); other depths and insufficient
 compressed capacity reject before frontend writes. This is not DML admission
 or a watermark proof.
 Native pixel packing selects 1/2/4/8 pixels per cycle from pixel rate and DPREF.

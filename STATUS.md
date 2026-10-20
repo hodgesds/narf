@@ -528,7 +528,22 @@ training fallback, half-width encoder counts, AVI colorimetry and shared OPP/MPC
 subsampling/BT.709 conversion. The pixel DTO keeps the full pixel rate; live
 format checks reject stale compression or encoding state. Y420VDB modes stay
 4:2:0, and Y420CMDB modes use RGB when it fits. The single-OPP 4096-pixel limit
-remains; FRL DSC and physical transitions are still open.
+remains; physical transitions are still open.
+FRL DSC (model-tested, not hardware-validated) follows amdgpu_dm: a stream is
+compressed only when no uncompressed encoding fits, with the EDID HF-VSDB DSC
+caps, DC's HDMI slice/bpp rules, the compressed FRL capacity check and DSC
+padding borrow bit-exact against Linux built on the host (2970 capacity, 3000
+configuration and 890 CVTEM vectors). Lighting programs the DSC engines, the
+HPO encoder's DSC mode and CVTEM PPS (generic packets 5-10), then the OPTC
+after training; teardown reverses it. 7680x4320@60 on a 4x12G DSC sink picks
+4x6G with 8 slices at 159/16 bpp. FRL DSC is 8-bpc RGB/4:2:0 only.
+DP MST DSC (model-tested, not hardware-validated) on 8b/10b and UHBR follows
+amdgpu_dm's fairness search (1500 link vectors through Linux's own functions),
+drm_dp_mst_dsc_aux_for_port (virtual DPCD, passthrough, Synaptics/Realtek
+quirk) and dm_helpers_dp_write_dsc_enable over remote DPCD; payload PBN uses
+the compressed bandwidth and each stream sends its own PPS. Two 4K144 sinks
+behind one HBR3 x4 branch both compress at equal bpp. MST DSC streams carry no
+audio; Synaptics cascaded workarounds and PCON FRL DSC are not ported.
 FRL now carries LPCM through AFMT4, lane-rate ACR and the pipe's Azalia endpoint.
 Admission/training reserve the sink's supported LPCM bandwidth; SD timings use
 layout 0. Audio starts after scanout and stops before it, preserving the
@@ -730,7 +745,7 @@ to the trained link; cancellation/failure retain ownership and block replay.
 The native frontend payload guard now accounts for DSC's compressed bits per
 pixel and slice overhead instead of rejecting it as uncompressed RGB. Actual
 trained rate/lanes and FEC's capacity reduction bound both kinds of stream;
-DSC requires the supported 8-bpc RGB SST/FEC path. A native regression exercises
+DSC requires the supported 8-bpc RGB/FEC path (SST or MST). A native regression exercises
 DSC fitting one RBR lane when RGB does not, including the FEC capacity boundary.
 Legacy DSC training can now fall back among rate/lane settings that carry its
 unchanged admitted PPS and bpp. Alternative DP modes carry DSC into joint DML
