@@ -45,7 +45,24 @@ impl Surfaces {
             return Err(Error::Invalid);
         }
         engine.status.state = State::PreparingMemory(pipe);
-        engine.status.memory = [None; 4]; // global aperture/context will change
+        // The global aperture/context may change. Another plane's pipe
+        // staged against exactly this context (an overlay's primary, or
+        // the overlay itself) keeps its records: the rewrite is identical.
+        let s = &engine.status;
+        let same = |i: usize| {
+            i != usize::from(pipe)
+                && s.memory[i].is_some_and(|m| {
+                    (
+                        m.framebuffer_base,
+                        m.framebuffer_top,
+                        m.framebuffer_offset,
+                        m.page_table_base,
+                    ) == (config.fb_base, config.fb_top, config.fb_offset, config.root)
+                })
+        };
+        let kept: [bool; 4] = core::array::from_fn(same);
+        let saved = (s.memory, s.dpps, s.mpcs);
+        engine.status.memory = [None; 4];
         engine.status.dpps = [None; 4];
         engine.status.mpcs = [None; 4];
         engine.status.requestor = None;
@@ -70,6 +87,14 @@ impl Surfaces {
             framebuffer_offset: config.fb_offset,
             page_table_base: config.root,
         };
+        for i in (0..4).filter(|&i| kept[i]) {
+            // Fresh evidence for the kept pipes too.
+            if engine.verify_memory(i as u8, config).is_ok() {
+                engine.status.memory[i] = saved.0[i];
+                engine.status.dpps[i] = saved.1[i];
+                engine.status.mpcs[i] = saved.2[i];
+            }
+        }
         engine.status.memory[usize::from(pipe)] = Some(applied);
         engine.status.state = State::MemoryPrepared;
         Ok(applied)

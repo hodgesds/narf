@@ -724,7 +724,13 @@ fn dcn401_second_display_leaves_the_live_one_alone() -> TestResult {
         mst: 0,
         live: [None; 4],
     };
-    want.live[usize::from(p)] = Some((live.address, false));
+    want.live[usize::from(p)] = Some(LivePipe {
+        pipe: p,
+        address: live.address,
+        cursor: false,
+        routes: [p, p, 0xf, p, p],
+        mode: 2,
+    });
     if held != want {
         return TestResult::Fail("siblings derived from the live display");
     }

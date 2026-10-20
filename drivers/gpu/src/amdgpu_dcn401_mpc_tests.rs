@@ -55,21 +55,15 @@ fn ready_mpc_range(
     mode: Mode,
     limited: bool,
 ) -> (Vec<u32>, Pool, Engine<MemoryIo>, Surfaces, dccg::Applied) {
-    let (backing, pool, mut e, mut surfaces, clock) = ready_range(p, depth, mode, limited);
-    e.io.delay = [0; 2]; // DPP acknowledgement timing is covered by its own tests.
-    run(surfaces.prepare_dpp(&mut e, p, || Ok((clock, config())))).unwrap();
-    let mut e = Engine {
-        io: e.io.memory,
-        authority: e.authority,
-        layout: e.layout,
-        status: e.status,
-        displays: e.displays,
-    };
-    let f = &mut e.io.surface.inner;
+    ready_mpc_pipes(p, 0, depth, mode, limited)
+}
+/// A stopped MPCC's inherited state: every staged field off its target,
+/// and the CURRENT selectors left at inherited values (stopped timing
+/// never latches them).
+fn seed_mpc(f: &mut Fake, p: u8, depth: ColorDepth) {
     for (at, mask, value) in rgb(p, depth) {
         f.regs.insert(at, (0x40000000 & !mask) | (value ^ mask));
     }
-    // Stopped timing deliberately keeps CURRENT selectors at inherited values.
     for (at, bits) in [
         (MPC_BASE + (9 + u64::from(p) * 0x15) * 4, 0x10),
         (MPC_BASE + (0x7e + u64::from(p) * 0x5e) * 4, 0x180),
@@ -82,6 +76,30 @@ fn ready_mpc_range(
         (MPC_BASE + (0x30b + u64::from(p) * 0xd) * 4, 0x180),
     ] {
         *f.regs.entry(at).or_default() |= bits;
+    }
+}
+/// `ready_mpc_range`, the pipes in `extra` ready for overlay planes too.
+fn ready_mpc_pipes(
+    p: u8,
+    extra: u8,
+    depth: ColorDepth,
+    mode: Mode,
+    limited: bool,
+) -> (Vec<u32>, Pool, Engine<MemoryIo>, Surfaces, dccg::Applied) {
+    let (backing, pool, mut e, mut surfaces, clock) =
+        ready_range_pipes(p, extra, depth, mode, limited);
+    e.io.delay = [0; 2]; // DPP acknowledgement timing is covered by its own tests.
+    run(surfaces.prepare_dpp(&mut e, p, || Ok((clock, config())))).unwrap();
+    let mut e = Engine {
+        io: e.io.memory,
+        authority: e.authority,
+        layout: e.layout,
+        status: e.status,
+        displays: e.displays,
+    };
+    let f = &mut e.io.surface.inner;
+    for q in (0..4u8).filter(|&q| q == p || extra & 1 << q != 0) {
+        seed_mpc(f, q, depth);
     }
     f.writes.clear();
     (backing, pool, e, surfaces, clock)

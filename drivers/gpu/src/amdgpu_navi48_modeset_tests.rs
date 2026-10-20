@@ -27,6 +27,7 @@ fn completed_modeset(pipe: u8) -> Modeset {
             stream: pipe,
             plan,
             address: 0x8_0000_0000 + u64::from(pipe) * 0x1000000,
+            overlays: [None; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
             frame_before: 2,
             frame_after: 3,
         },
@@ -1752,7 +1753,7 @@ fn navi48_mst_admits_dark_connector_modes() -> TestResult {
         &devices,
         &|_| None,
         &[None],
-        &|_, _| u16::MAX
+        &|_, _| { u16::MAX }
     )
     .is_empty());
     let enabled = super::super::mst::select_mst_outputs(

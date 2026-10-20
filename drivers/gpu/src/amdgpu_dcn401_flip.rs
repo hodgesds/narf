@@ -6,7 +6,6 @@
 use super::*;
 use crate::amdgpu_gmc_navi48::{DisplayContext, Gmc};
 use narf_graphics_driver::generic::GenericFb;
-use scanout::Pipe;
 
 /// A completed flip. The previous front is now the back buffer and may be
 /// rewritten: the HUBP reported the new address in use.
@@ -19,6 +18,19 @@ pub struct FlipDone {
     pub frame: u32,
 }
 
+/// Which plane of the live scanout `pipe` is: 0 the primary, k the k-th
+/// overlay from the bottom.
+fn plane_index(scanout: &ScanoutRunning, pipe: u8) -> Option<usize> {
+    if scanout.pipe == pipe {
+        return Some(0);
+    }
+    scanout
+        .overlays
+        .iter()
+        .position(|o| o.is_some_and(|o| o.pipe == pipe))
+        .map(|k| k + 1)
+}
+
 impl<I: Io> Engine<I> {
     /// Every retained report names the surface by value; after a flip the
     /// front address changes in all of them together.
@@ -26,16 +38,24 @@ impl<I: Io> Engine<I> {
         let slot = usize::from(pipe);
         let to = SurfaceApplied { address, ..from };
         let s = &mut self.status;
-        let (Some(dpp), Some(mpc), Some(requestor), Some(scanout)) =
+        let (Some(dpp), Some(mpc), Some(mut requestor), Some(mut scanout)) =
             (s.dpps[slot], s.mpcs[slot], s.requestor, s.scanout)
         else {
             return Err(Error::Invalid);
         };
+        let plane = plane_index(&scanout, pipe).ok_or(Error::Invalid)?;
+        let (named, fetched) = match plane {
+            0 => (Some(requestor.surface), scanout.address),
+            k => (
+                requestor.overlays[k - 1],
+                scanout.overlays[k - 1].map_or(0, |o| o.address),
+            ),
+        };
         if s.surfaces[slot] != Some(from)
             || dpp.surface != from
             || mpc.dpp.surface != from
-            || requestor.surface != from
-            || scanout.address != from.address
+            || named != Some(from)
+            || fetched != from.address
         {
             return Err(Error::Invalid);
         }
@@ -48,12 +68,34 @@ impl<I: Io> Engine<I> {
             },
             ..mpc
         });
-        s.requestor = Some(RequestorApplied {
-            surface: to,
-            ..requestor
-        });
-        s.scanout = Some(ScanoutRunning { address, ..scanout });
+        match plane {
+            0 => {
+                requestor.surface = to;
+                scanout.address = address;
+            }
+            k => {
+                requestor.overlays[k - 1] = Some(to);
+                if let Some(o) = scanout.overlays[k - 1].as_mut() {
+                    o.address = address;
+                }
+            }
+        }
+        s.requestor = Some(requestor);
+        s.scanout = Some(scanout);
         Ok(())
+    }
+    /// The live scanout (of the selected display) fetching plane `pipe`,
+    /// and the address that plane fetches.
+    fn live_plane(&self, pipe: u8) -> Option<(ScanoutRunning, u64)> {
+        let s = self.status.scanout?;
+        if self.status.state != State::ScanoutRunning(s.pipe) {
+            return None;
+        }
+        let address = match plane_index(&s, pipe)? {
+            0 => s.address,
+            k => s.overlays[k - 1]?.address,
+        };
+        Some((s, address))
     }
 }
 
@@ -69,7 +111,8 @@ impl Surfaces {
         config: DisplayContext,
     ) -> Result<u64, Error> {
         let slot = usize::from(pipe);
-        let live = e.status.state == State::ScanoutRunning(pipe);
+        // The primary or an overlay of the live scanout, or a staged plane.
+        let live = e.live_plane(pipe).is_some();
         if !(live || e.status.state.reusable()) {
             return Err(Error::Busy);
         }
@@ -114,7 +157,7 @@ impl Surfaces {
         // Retained even if the state moved meanwhile, until explicit surface release.
         let surface = self.0[slot].as_mut().ok_or(Error::Invalid)?;
         surface.back = Some(memory);
-        if live && e.status.state != State::ScanoutRunning(pipe) {
+        if live && e.live_plane(pipe).is_none() {
             return Err(Error::Busy);
         }
         Ok(address)
@@ -162,14 +205,11 @@ impl Surfaces {
         let back = surface.back.as_ref().ok_or(Error::Invalid)?;
         let a = surface.applied;
         let start = a.row_words(x, y, pixels.len())?;
-        // Only while this pipe scans out its front: during a flip which buffer
-        // is fetched is in transition, and after a failure it is unknown.
-        let running = e.status.scanout.ok_or(Error::Busy)?;
-        if e.status.state != State::ScanoutRunning(pipe)
-            || running.pipe != pipe
-            || running.address != a.address
-            || back.address() == a.address
-        {
+        // Only while this plane scans out its front: during a flip which
+        // buffer is fetched is in transition, and after a failure it is
+        // unknown.
+        let (_, fetched) = e.live_plane(pipe).ok_or(Error::Busy)?;
+        if fetched != a.address || back.address() == a.address {
             return Err(Error::Busy);
         }
         let map = back.mapping();
@@ -190,50 +230,95 @@ impl Surfaces {
         e: &mut Engine<I>,
         pipe: u8,
         crystal_khz: u32,
-        mut owners: impl FnMut() -> Result<(dccg::Applied, DisplayContext), Error>,
+        owners: impl FnMut() -> Result<(dccg::Applied, DisplayContext), Error>,
     ) -> Result<FlipDone, Error> {
-        let slot = usize::from(pipe);
+        let done = self.flip_planes(e, pipe, 1, crystal_khz, owners).await?;
+        done[0].ok_or(Error::Invalid)
+    }
+    /// Flip the planes in `planes` (bit 0 the primary, bit k the k-th
+    /// overlay from the bottom) of display `pipe`'s live scanout to their
+    /// back buffers together: every new address under the one OTG lock,
+    /// latching at the same VUPDATE (commit_planes_for_stream's single
+    /// pipe-control lock over all the stream's planes). Each flipped plane's
+    /// report, in plane order.
+    pub(in crate::amdgpu_dcn401_otg) async fn flip_planes<I: Io>(
+        &mut self,
+        e: &mut Engine<I>,
+        pipe: u8,
+        planes: u8,
+        crystal_khz: u32,
+        mut owners: impl FnMut() -> Result<(dccg::Applied, DisplayContext), Error>,
+    ) -> Result<[Option<FlipDone>; 1 + MAX_OVERLAYS], Error> {
         let running = e.status.scanout.ok_or(Error::Invalid)?;
         if e.status.state != State::ScanoutRunning(pipe) || running.pipe != pipe {
             return Err(Error::Busy);
         }
         let deadlines = e.status.deadlines.ok_or(Error::Invalid)?;
-        let back = self
-            .0
-            .get(slot)
-            .and_then(Option::as_ref)
-            .and_then(|s| s.back.as_ref())
-            .map(Reservation::address)
-            .ok_or(Error::Invalid)?;
+        // Each flipping plane's pipe and back buffer.
+        let mut flips: [Option<(u8, u64)>; 1 + MAX_OVERLAYS] = [None; 1 + MAX_OVERLAYS];
+        for (k, slot) in flips.iter_mut().enumerate() {
+            if planes & 1 << k == 0 {
+                continue;
+            }
+            let q = match k {
+                0 => pipe,
+                k => running.overlays[k - 1].ok_or(Error::Invalid)?.pipe,
+            };
+            let back = self
+                .0
+                .get(usize::from(q))
+                .and_then(Option::as_ref)
+                .and_then(|s| s.back.as_ref())
+                .map(Reservation::address)
+                .ok_or(Error::Invalid)?;
+            *slot = Some((q, back));
+        }
+        if planes == 0 || planes >> (1 + MAX_OVERLAYS) != 0 {
+            return Err(Error::Invalid);
+        }
         let current = owners()?;
         let p = self.scanout_bound(e, deadlines, crystal_khz, current)?;
-        if p.address != running.address {
+        if p.address != running.address || p.overlays != running.overlays {
             return Err(Error::Invalid);
+        }
+        let mut next = p;
+        if let Some((_, back)) = flips[0] {
+            next.address = back;
+        }
+        for (k, o) in next.overlays.iter_mut().enumerate() {
+            if let (Some(o), Some((_, back))) = (o.as_mut(), flips[k + 1]) {
+                o.address = back;
+            }
         }
         e.live_fetch(pipe, p.address)?;
         e.flip_quiet(pipe)?;
-        // The producer's CPU writes to the back buffer must be in VRAM first.
+        // The producer's CPU writes to the back buffers must be in VRAM first.
         e.flush_surface_writes()?;
         e.status.state = State::Flipping(pipe);
         let result = async {
-            let frame = e.flip_to(Pipe { address: back, ..p }).await?;
+            let frame = e.flip_from(next, Some(p)).await?;
             if owners()? != current {
                 return Err(Error::Busy);
             }
-            let surface = self.0[slot].as_mut().ok_or(Error::Invalid)?;
-            let from = surface.applied;
-            e.retarget(pipe, from, back)?;
-            let front = surface.back.take().ok_or(Error::Invalid)?;
-            surface.back = Some(core::mem::replace(&mut surface.memory, front));
-            surface.applied.address = back;
+            let mut done = [None; 1 + MAX_OVERLAYS];
+            for (slot, flip) in done.iter_mut().zip(flips) {
+                let Some((q, back)) = flip else { continue };
+                let surface = self.0[usize::from(q)].as_mut().ok_or(Error::Invalid)?;
+                let from = surface.applied;
+                e.retarget(q, from, back)?;
+                let front = surface.back.take().ok_or(Error::Invalid)?;
+                surface.back = Some(core::mem::replace(&mut surface.memory, front));
+                surface.applied.address = back;
+                *slot = Some(FlipDone {
+                    pipe: q,
+                    front: back,
+                    back: from.address,
+                    frame,
+                });
+            }
             self.scanout_bound(e, deadlines, crystal_khz, current)?;
-            e.live_fetch(pipe, back)?;
-            Ok(FlipDone {
-                pipe,
-                front: back,
-                back: from.address,
-                frame,
-            })
+            e.live_fetch(pipe, next.address)?;
+            Ok(done)
         }
         .await;
         match result {
@@ -260,8 +345,21 @@ impl Otg {
         gmc: &mut Gmc,
         pipe: u8,
     ) -> Result<u64, Error> {
-        // Display k scans out on pipe k: address that display's records.
-        self.0.select_display(pipe)?;
+        // SAFETY: the caller's obligations; display k scans out on pipe k.
+        unsafe { self.prepare_plane_back_buffer(pool, gmc, pipe, pipe) }.await
+    }
+    /// `prepare_back_buffer` for plane `pipe` of display `display`: its
+    /// primary (`pipe == display`) or one of its overlays.
+    /// # Safety
+    /// As for `prepare_back_buffer`.
+    pub async unsafe fn prepare_plane_back_buffer(
+        &mut self,
+        pool: &Pool,
+        gmc: &mut Gmc,
+        display: u8,
+        pipe: u8,
+    ) -> Result<u64, Error> {
+        self.0.select_display(display)?;
         let config = gmc.display_context(self.0.io.0).map_err(Error::Memory)?;
         self.1.prepare_back(&mut self.0, pool, pipe, config).await
     }
@@ -280,8 +378,21 @@ impl Otg {
         y: u32,
         pixels: &[u32],
     ) -> Result<(), Error> {
-        // Display k scans out on pipe k: address that display's records.
-        self.0.select_display(pipe)?;
+        // SAFETY: the caller's obligations; display k scans out on pipe k.
+        unsafe { self.upload_plane_back_buffer(pipe, pipe, x, y, pixels) }
+    }
+    /// `upload_back_buffer` into plane `pipe` of display `display`.
+    /// # Safety
+    /// As for `upload_back_buffer`.
+    pub unsafe fn upload_plane_back_buffer(
+        &mut self,
+        display: u8,
+        pipe: u8,
+        x: u32,
+        y: u32,
+        pixels: &[u32],
+    ) -> Result<(), Error> {
+        self.0.select_display(display)?;
         self.1.upload_back(&mut self.0, pipe, x, y, pixels)
     }
     /// Flip a live scanout to its back buffer at the next VUPDATE.
@@ -302,6 +413,32 @@ impl Otg {
         let regs = self.0.io.0;
         self.1
             .flip(&mut self.0, pipe, crystal_khz, || {
+                Ok((
+                    dccg.retained_timing_clock(regs, clocks, pipe)
+                        .map_err(Error::PipeClocks)?,
+                    gmc.display_context(regs).map_err(Error::Memory)?,
+                ))
+            })
+            .await
+    }
+    /// Flip the planes in `planes` (bit 0 the primary, bit k the k-th
+    /// overlay) of display `pipe`'s live scanout to their back buffers at
+    /// the same VUPDATE.
+    /// # Safety
+    /// As for `flip`, for every flipping plane's back buffer.
+    pub async unsafe fn flip_planes(
+        &mut self,
+        clocks: &mut clocks::ClockManager,
+        dccg: &mut dccg::Dccg,
+        gmc: &mut Gmc,
+        pipe: u8,
+        planes: u8,
+        crystal_khz: u32,
+    ) -> Result<[Option<FlipDone>; 1 + MAX_OVERLAYS], Error> {
+        self.0.select_display(pipe)?;
+        let regs = self.0.io.0;
+        self.1
+            .flip_planes(&mut self.0, pipe, planes, crystal_khz, || {
                 Ok((
                     dccg.retained_timing_clock(regs, clocks, pipe)
                         .map_err(Error::PipeClocks)?,

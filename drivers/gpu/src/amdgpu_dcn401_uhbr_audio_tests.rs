@@ -489,6 +489,7 @@ fn dcn401_uhbr_audio_filters_capabilities_and_binds_scanout() -> TestResult {
         stream: 2,
         plan,
         address: 0x8_0010_0000,
+        overlays: [None; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
         frame_before: 1,
         frame_after: 2,
     };

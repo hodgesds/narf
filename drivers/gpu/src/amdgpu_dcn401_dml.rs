@@ -111,10 +111,10 @@ pub struct Mode {
     /// (timing.dsc: enabled with the slice count and compressed bpp).
     pub dsc: Option<Dsc>,
     /// The stream's planes, bottom (the primary) first, as
-    /// populate_dml21_plane_config_from_plane_state describes them; the
-    /// first `None` ends the list. With none at all the stream shows one
-    /// unscaled full-frame plane of `pitch` and `bytes_per_pixel`, and
-    /// those two fields describe it; otherwise the planes' own do.
+    /// populate_dml21_plane_config_from_plane_state describes them. An
+    /// empty `planes[0]` is the unscaled full-frame primary of `pitch` and
+    /// `bytes_per_pixel`; the overlays follow from `planes[1]` up to the
+    /// first `None` (`Mode::plane_list`).
     pub planes: [Option<Plane>; MAX_PLANES],
 }
 
@@ -181,12 +181,13 @@ impl Mode {
             planes: [None; MAX_PLANES],
         }
     }
-    /// The planes DML sees, in order.
+    /// The planes DML sees, in order: the primary (`planes[0]`, or the
+    /// whole unscaled surface of `pitch` and `bytes_per_pixel` when none),
+    /// then the overlays up to the first empty slot.
     pub fn plane_list(&self) -> impl Iterator<Item = Plane> + '_ {
-        let full = self.planes[0]
-            .is_none()
-            .then(|| Plane::full(&self.timing, self.pitch, self.bytes_per_pixel));
-        full.into_iter().chain(self.planes.iter().map_while(|p| *p))
+        let primary = self.planes[0]
+            .unwrap_or_else(|| Plane::full(&self.timing, self.pitch, self.bytes_per_pixel));
+        core::iter::once(primary).chain(self.planes[1..].iter().map_while(|p| *p))
     }
 }
 

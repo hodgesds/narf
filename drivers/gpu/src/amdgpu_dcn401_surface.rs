@@ -18,7 +18,7 @@ mod mpc;
 pub use mpc::MpcApplied;
 #[path = "amdgpu_dcn401_requestor.rs"]
 mod requestor;
-pub use requestor::RequestorApplied;
+pub use requestor::{RequestorApplied, MAX_OVERLAYS};
 #[path = "amdgpu_dcn401_deadline.rs"]
 mod deadline;
 pub use deadline::DeadlinesApplied;
@@ -33,7 +33,9 @@ mod flip;
 mod scanout;
 pub use color::{ColorProgram, GamutProgram, OgamProgram, PipeColor};
 pub use flip::FlipDone;
-pub use scanout::{ScanoutPosition, ScanoutRunning, ScanoutUnderflow, VblankPhase};
+pub use scanout::{
+    LivePipe, OverlayScanout, ScanoutPosition, ScanoutRunning, ScanoutUnderflow, VblankPhase,
+};
 
 /// A single-plane packed RGB scanout format: the DRM fourccs amdgpu_dm
 /// offers on a DCN4.0.1 primary plane that this path programs, each mapped
@@ -228,6 +230,9 @@ pub struct PlaneLayout {
     /// vertically (SourceFormatPixelAndScanSupport).
     pub rotation: spl::Rotation,
     pub blend: Blend,
+    /// An overlay below the primary (its normalized zpos lower than the
+    /// primary's): it blends under the primary instead of above it.
+    pub underlay: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SurfaceRequest {
@@ -305,6 +310,7 @@ impl SurfaceRequest {
             ycbcr420: false,
             rotation: spl::Rotation::R0,
             blend: Blend::default_for(self.format),
+            underlay: false,
         })
     }
     /// Whether this is the unscaled full-frame plane of its stream.
@@ -373,6 +379,56 @@ impl SurfaceRequest {
         let w = self.layout().stream_width;
         let width = if self.odm.is_some() { w / 2 } else { w };
         core::iter::once((self.pipe, 0, width)).chain(self.odm.map(move |q| (q, width, w - width)))
+    }
+    /// The plane as DC hands it to DML21 after SPL
+    /// (populate_dml21_plane_config_from_plane_state): the surface, the
+    /// whole-plane viewport, ratios and taps SPL computes on the whole
+    /// stream (`dml::Plane::full` for the unscaled full-frame plane).
+    pub fn dml_plane(self) -> crate::amdgpu_dcn401_dml::Plane {
+        let bpp = self.format.bytes_per_pixel();
+        let pitch = self.format.pitch_bytes(self.width) / bpp;
+        let l = self.layout();
+        let (w, h) = (l.stream_width as i32, l.stream_height as i32);
+        let s = if self.plane.is_some() {
+            spl::calculate(&spl::Input {
+                src: l.src,
+                dst: l.dst,
+                clip: l.dst,
+                stream_width: w,
+                stream_height: h,
+                odm_slice: spl::Rect::new(0, 0, w, h),
+                rotation: l.rotation,
+                horizontal_mirror: false,
+                alpha: l.blend.per_pixel_alpha,
+            })
+        } else {
+            spl::Scaler::unity(0, w, h)
+        };
+        let [v_taps, h_taps, _, _] = s.dc_taps();
+        crate::amdgpu_dcn401_dml::Plane {
+            surface_width: self.width,
+            surface_height: self.height,
+            pitch,
+            bytes_per_pixel: bpp,
+            viewport_width: s.viewport.width as u32,
+            viewport_height: s.viewport.height as u32,
+            h_ratio: s.ratios[0] >> 5,
+            v_ratio: s.ratios[1] >> 5,
+            h_taps,
+            v_taps,
+        }
+    }
+    /// Whether `other` fits the same buffers: the same pipe(s), size and
+    /// format (the placement may differ).
+    pub(in crate::amdgpu_dcn401_otg) fn same_allocation(self, other: Self) -> bool {
+        (self.pipe, self.width, self.height, self.format, self.odm)
+            == (
+                other.pipe,
+                other.width,
+                other.height,
+                other.format,
+                other.odm,
+            )
     }
     /// Every pipe the surface's fetch occupies, by bit.
     pub(in crate::amdgpu_dcn401_otg) fn pipe_mask(self) -> u8 {
@@ -493,14 +549,18 @@ impl Surfaces {
         // surface. Mode switches between the sink's few offered modes then
         // retain at most one surface (front, back, cursor) per geometry.
         if let Some(old) = self.0[slot].take() {
-            if old.applied.request == request {
+            if old.applied.request.same_allocation(request) {
                 self.0[slot] = Some(old);
             } else {
                 self.1.push(old);
             }
         }
         if self.0[slot].is_none() {
-            if let Some(i) = self.1.iter().position(|p| p.applied.request == request) {
+            if let Some(i) = self
+                .1
+                .iter()
+                .position(|p| p.applied.request.same_allocation(request))
+            {
                 self.0[slot] = Some(self.1.swap_remove(i));
             }
         }
@@ -638,7 +698,9 @@ impl<I: Io> Engine<I> {
         if restage {
             self.hubp_tree_stopped(Some(pipe))?;
         } else {
-            self.hubp_power_tree_stopped()?;
+            // The display's planes already staged (an overlay's primary)
+            // may hold their own pending addresses; nothing else may.
+            self.hubp_tree_stopped_mask(self.staged_planes())?;
         }
         if !self.hubp_powered(pipe)? {
             return Err(Error::Busy);
@@ -700,7 +762,7 @@ impl<I: Io> Engine<I> {
                 .await?;
             self.update(l.hubp(p, HUBP_CLOCK), 1, 0)?;
         }
-        self.hubp_tree_stopped_mask(surface.request.pipe_mask())?;
+        self.hubp_tree_stopped_mask(surface.request.pipe_mask() | self.staged_planes())?;
         self.verify_surface(surface)
     }
 }

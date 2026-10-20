@@ -67,6 +67,7 @@ fn live(pipe: u8) -> (Engine<Fake>, Request) {
         )
         .unwrap(),
         address: 0x8_0010_0000,
+        overlays: [None; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
         frame_before: 1,
         frame_after: 2,
     });

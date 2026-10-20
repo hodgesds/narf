@@ -525,6 +525,7 @@ fn dcn401_frl_controls_bind_live_scanout() -> TestResult {
         )
         .unwrap(),
         address: 0x8_0010_0000,
+        overlays: [None; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
         frame_before: 1,
         frame_after: 2,
     };

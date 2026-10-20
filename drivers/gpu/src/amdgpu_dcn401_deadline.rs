@@ -65,8 +65,7 @@ fn vready_after_vsync(plan: &dml::Plan) -> bool {
 /// Per-pipe DLG/TTU fields, `hubp401_program_deadline` then
 /// `hubp401_setup_interdependent` order. VM/PTE/meta/flip/chroma/cursor and
 /// 3D-LUT fields are explicitly zero: none is enabled in the admitted shape.
-fn hubp(plan: &dml::Plan, d: dml::Dlg) -> [(u64, u32, u32); 31] {
-    let t = plan.ttu;
+fn hubp(t: dml::Ttu, d: dml::Dlg) -> [(u64, u32, u32); 31] {
     let zero23 = 0x7fffff;
     [
         (
@@ -128,8 +127,7 @@ fn hubp(plan: &dml::Plan, d: dml::Dlg) -> [(u64, u32, u32); 31] {
 }
 /// The remaining interdependent TTU fields; the global TTU write preserves
 /// the flush/row-TTU mode bits Linux leaves alone.
-fn hubp_ttu(plan: &dml::Plan) -> [(u64, u32, u32); 4] {
-    let t = plan.ttu;
+fn hubp_ttu(t: dml::Ttu) -> [(u64, u32, u32); 4] {
     [
         (SURF0_TTU1, 0x7fffff, t.refcyc_per_req_delivery_pre_l),
         (SURF1_TTU1, 0x7fffff, 0),
@@ -211,11 +209,25 @@ impl<I: Io> Engine<I> {
                 e.update(at, mask, value)
             }
         };
-        // Every HUBP the surface fetches on: an ODM pipe gets the same
-        // DLG/TTU values but for its own blank end (Plan::pipe_dlg).
-        let pipes: alloc::vec::Vec<u8> = self.fetch_pipes(pipe).collect();
-        for (i, p) in pipes.into_iter().enumerate() {
-            let dlg = plan.pipe_dlg(i as u8).ok_or(Error::Invalid)?;
+        // Every HUBP each plane fetches on, the primary first and then the
+        // staged overlays bottom up (the plan's planes in order): an ODM
+        // pipe gets its plane's DLG/TTU values but for its own blank end
+        // (Plan::plane_dlg).
+        let mut planes: alloc::vec::Vec<alloc::vec::Vec<u8>> =
+            alloc::vec![self.fetch_pipes(pipe).collect()];
+        if let Some(r) = self.status.requestor.filter(|r| r.pipe == pipe) {
+            for o in r.overlays.iter().flatten() {
+                planes.push(o.request.segments().map(|(p, _, _)| p).collect());
+            }
+        }
+        let segments = planes
+            .iter()
+            .enumerate()
+            .flat_map(|(k, pipes)| pipes.iter().enumerate().map(move |(i, &p)| (k, i as u8, p)));
+        let segments: alloc::vec::Vec<(usize, u8, u8)> = segments.collect();
+        for (k, i, p) in segments {
+            let dlg = plan.plane_dlg(k, i).ok_or(Error::Invalid)?;
+            let ttu = plan.plane(k).ok_or(Error::Invalid)?.ttu;
             // Linux writes the whole register to enter DLG mission mode and
             // never reads it back; only that bit is required to read back.
             let debug = l.hubp(p, DEBUG_DB);
@@ -229,7 +241,7 @@ impl<I: Io> Engine<I> {
                     Ok(())
                 })?;
             }
-            for (r, mask, value) in hubp(plan, dlg).into_iter().chain(hubp_ttu(plan)) {
+            for (r, mask, value) in hubp(ttu, dlg).into_iter().chain(hubp_ttu(ttu)) {
                 each(self, l.hubp(p, r), mask, value)?;
             }
             let vready = if vready_after_vsync(plan) {
@@ -250,11 +262,31 @@ impl<I: Io> Engine<I> {
         Ok(())
     }
 }
+/// Whether `surface`'s layout is a plane of the stream `plan` admitted:
+/// on a stream of its size and encoding, split like it, and exactly the
+/// surface, viewport, ratios and taps DML planned (`dml_plane`).
+fn plane_bound(
+    plan: &dml::Plan,
+    timing: Request,
+    surface: SurfaceApplied,
+    planned: dml::Plane,
+) -> bool {
+    let t = plan.mode.timing;
+    let l = surface.request.layout();
+    l.stream_width == t.h_active
+        && l.stream_height == t.v_active
+        && l.ycbcr420 == plan.mode.ycbcr420
+        && surface.request.odm.is_some() == timing.odm.is_some()
+        && surface.request.dml_plane() == planned
+        && u64::from(surface.pitch_bytes)
+            == u64::from(planned.pitch) * u64::from(planned.bytes_per_pixel)
+}
 /// Every owner the plan was admitted against must still be the one in place:
 /// a plan is only valid for exactly this timing, sync, DP SST or TMDS signal,
-/// full-frame surface, DET and DCHUB reference, and for at least its clocks
-/// with the pinned UCLK/DCFCLK floors it assumed. The plan is also
-/// re-admitted, so a value built or edited outside admission is refused.
+/// these planes (the primary's surface and placement, then each overlay's),
+/// DET and DCHUB reference, and for at least its clocks with the pinned
+/// UCLK/DCFCLK floors it assumed. The plan is also re-admitted, so a value
+/// built or edited outside admission is refused.
 pub(super) fn bound(
     plan: &dml::Plan,
     timing: Request,
@@ -263,7 +295,8 @@ pub(super) fn bound(
     dchub_refclk_khz: u32,
 ) -> bool {
     let t = plan.mode.timing;
-    let surface = a.surface;
+    let surfaces = core::iter::once(a.surface).chain(a.overlays.iter().flatten().copied());
+    let planes: alloc::vec::Vec<dml::Plane> = plan.mode.plane_list().collect();
     plan.readmits()
         && timing.pipe == a.pipe
         && timing.timing == t
@@ -272,13 +305,17 @@ pub(super) fn bound(
             timing.signal,
             Signal::DisplayPort | Signal::HpoDisplayPort | Signal::Tmds
         )
-        && surface.request.width == t.h_active
-        && surface.request.height == t.v_active
-        && surface.request.odm == timing.odm
+        && a.surface.request.odm == timing.odm
         && plan.pipes == 1 + u8::from(timing.odm.is_some())
-        && plan.mode.bytes_per_pixel == surface.request.format.bytes_per_pixel()
-        && u64::from(surface.pitch_bytes)
-            == u64::from(plan.mode.pitch) * u64::from(plan.mode.bytes_per_pixel)
+        && surfaces.clone().count() == planes.len()
+        && surfaces
+            .zip(planes)
+            .all(|(s, p)| plane_bound(plan, timing, s, p))
+        && plan
+            .planes
+            .iter()
+            .flatten()
+            .all(|p| p.det_bytes == a.det_bytes)
         && a.det_bytes == plan.det_bytes
         && clock.request.pipe == a.pipe
         && clock.global.display_khz >= plan.clocks.dispclk_khz
@@ -300,6 +337,14 @@ impl Surfaces {
         let mpc = e.status.mpcs[usize::from(a.pipe)].ok_or(Error::Invalid)?;
         self.verify_mpc_source(e, mpc, (clock, config))?;
         e.verify_mpc(mpc)?;
+        for o in a.overlays.iter().flatten() {
+            let m = e.status.mpcs[usize::from(o.request.pipe)].ok_or(Error::Invalid)?;
+            if m.dpp.surface != *o {
+                return Err(Error::Invalid);
+            }
+            self.verify_mpc_source(e, m, (clock, config))?;
+            e.verify_mpc(m)?;
+        }
         e.verify_requestor(a.pipe)?;
         let refclk = e.dchub_refclk_khz(crystal_khz)?;
         if !bound(plan, mpc.dpp.timing.request, a, clock, refclk) {
@@ -329,14 +374,15 @@ impl Surfaces {
         let result = async {
             // Fetch is stopped and blank; the HUBP clocks are enabled only
             // around programming, as for the requestor.
-            for (p, _, _) in a.surface.request.segments() {
+            let pipes = e.plane_pipes(pipe);
+            for &p in &pipes {
                 e.update(e.layout.hubp(p, HUBP_CLOCK), 1, 1)?;
                 e.wait(e.layout.hubp(p, HUBP_CONTROL), 0x1007, 3, 100_000)
                     .await?;
             }
             e.requestor_errors(pipe)?;
             e.deadline_writes(pipe, plan, false)?;
-            for (p, _, _) in a.surface.request.segments() {
+            for &p in &pipes {
                 e.update(e.layout.hubp(p, HUBP_CLOCK), 1, 0)?;
             }
             if owners()? != current {
@@ -385,6 +431,22 @@ impl Otg {
     ) -> Result<DeadlinesApplied, Error> {
         let regs = self.0.io.0;
         let (held, layout) = self.0.held();
+        // Each overlay's DPP runs on its own DPP-only clock (as an ODM
+        // pipe's), at least at its plane's DPPCLK, from the global clocks.
+        if let Some(r) = self.0.status.requestor.filter(|r| r.pipe == pipe) {
+            for (k, o) in r.overlays.iter().enumerate() {
+                let Some(o) = o else { continue };
+                let want = plan.plane(k + 1).ok_or(Error::Invalid)?.dppclk_khz;
+                for (q, _, _) in o.request.segments() {
+                    let c = dccg
+                        .segment_clock(regs, clocks, q, &|at| held_by_sibling(held, layout, at))
+                        .map_err(Error::PipeClocks)?;
+                    if c.request.dpp_khz < want || c.global.dpp_khz < plan.clocks.dpprefclk_khz {
+                        return Err(Error::Invalid);
+                    }
+                }
+            }
+        }
         self.1
             .prepare_deadlines(&mut self.0, pipe, plan, crystal_khz, || {
                 Ok((

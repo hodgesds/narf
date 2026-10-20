@@ -50,6 +50,11 @@ impl Io for SurfaceIo {
     }
 }
 fn fixture(p: u8, bytes: usize) -> (Vec<u32>, Pool, Engine<SurfaceIo>, Surfaces) {
+    fixture_pipes(p, 0, bytes)
+}
+/// `fixture` with the pipes in `extra` powered and retired too, ready for
+/// overlay planes.
+fn fixture_pipes(p: u8, extra: u8, bytes: usize) -> (Vec<u32>, Pool, Engine<SurfaceIo>, Surfaces) {
     let mut backing = vec![0xdeadbeef; (bytes + 4096) / 4];
     let map = MmioRegion {
         phys: narf_memory::PhysAddr::new(0x90000000),
@@ -60,33 +65,17 @@ fn fixture(p: u8, bytes: usize) -> (Vec<u32>, Pool, Engine<SurfaceIo>, Surfaces)
     // SAFETY: model memory backed by the returned heap vector. Fake never
     // performs DMA; the vector outlives all CPU accesses in each test.
     let pool = unsafe { Pool::from_owned_range(map, 0x8_0010_2000) }.unwrap();
-    let mut e = planes(0xf ^ (1 << p));
+    let pipes = 1 << p | extra;
+    let mut e = planes(0xf & !pipes);
     run(e.retire_planes()).unwrap();
     e.io.writes.clear();
     e.io.stall = 512 | 1024;
     e.io.regs.insert(e.layout.nbio + 0x12d * 4, 0x7f000);
-    for (r, value) in [
-        (0x5e5, 0x40000f7f),
-        (0x5e7, 0x40000087),
-        (0x607, 0x4000abcd),
-        (0x612, 0x40000313),
-        (0x66d, 0x40f08000),
-        (0x5e6, 0x13579),
-        (0x5eb, 0x40014001),
-        (0x5e9, 0x10001),
-        (0x5ef, 0x40014001),
-        (0x5ee, 0x10001),
-        (0x5ed, 0x40014001),
-        (0x5ec, 0x10001),
-        (0x5f1, 0x40014001),
-        (0x5f0, 0x10001),
-        (0x609, 0x4000000f),
-        (0x613, 0x400130f2),
-        (0x614, 0x40000600),
-        (0x60a, 0x12340000),
-        (0x60b, 0x40000123),
-    ] {
-        e.io.regs.insert(h(p, r), value);
+    for (q, (r, value)) in (0..4u8)
+        .filter(|q| pipes & 1 << q != 0)
+        .flat_map(|q| HUBP_SEEDS.into_iter().map(move |seed| (q, seed)))
+    {
+        e.io.regs.insert(h(q, r), value);
     }
     let engine = Engine {
         io: SurfaceIo {
@@ -102,6 +91,28 @@ fn fixture(p: u8, bytes: usize) -> (Vec<u32>, Pool, Engine<SurfaceIo>, Surfaces)
     };
     (backing, pool, engine, Surfaces::new())
 }
+/// Each fixture pipe's inherited HUBP surface registers.
+const HUBP_SEEDS: [(u64, u32); 19] = [
+    (0x5e5, 0x40000f7f),
+    (0x5e7, 0x40000087),
+    (0x607, 0x4000abcd),
+    (0x612, 0x40000313),
+    (0x66d, 0x40f08000),
+    (0x5e6, 0x13579),
+    (0x5eb, 0x40014001),
+    (0x5e9, 0x10001),
+    (0x5ef, 0x40014001),
+    (0x5ee, 0x10001),
+    (0x5ed, 0x40014001),
+    (0x5ec, 0x10001),
+    (0x5f1, 0x40014001),
+    (0x5f0, 0x10001),
+    (0x609, 0x4000000f),
+    (0x613, 0x400130f2),
+    (0x614, 0x40000600),
+    (0x60a, 0x12340000),
+    (0x60b, 0x40000123),
+];
 fn req(pipe: u8) -> SurfaceRequest {
     SurfaceRequest {
         pipe,

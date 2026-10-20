@@ -840,6 +840,7 @@ fn dcn401_dp_audio_programs_dto1_secondary_packets_and_endpoint_like_linux() -> 
         )
         .unwrap(),
         address: 0,
+        overlays: [None; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
         frame_before: 0,
         frame_after: 0,
     };

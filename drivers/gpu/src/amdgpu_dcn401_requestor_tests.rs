@@ -390,3 +390,211 @@ kernel_test_in!(
     "drivers/gpu/dcn401-requestor",
     dcn401_requestor_shares_the_crb_with_other_displays
 );
+
+/// A 640x480 primary on pipe 0's timing, room in the pool for overlays.
+fn overlay_primary() -> Mode {
+    let mut t = request(0);
+    t.timing.h_active = 640;
+    t.timing.v_active = 480;
+    Mode {
+        surface: SurfaceRequest {
+            pipe: 0,
+            width: 640,
+            height: 480,
+            format: SurfaceFormat::Xrgb8888,
+            odm: None,
+            plane: None,
+        },
+        bytes: 2 << 20,
+        timing: t,
+        clock: clock(t),
+    }
+}
+/// A 256x128 ARGB8888 overlay on `pipe`, downscaled 2:1 to (64, 32) of
+/// the 640x480 stream, blended at half plane alpha.
+fn overlay_request(pipe: u8) -> SurfaceRequest {
+    SurfaceRequest {
+        pipe,
+        width: 256,
+        height: 128,
+        format: SurfaceFormat::Argb8888,
+        odm: None,
+        plane: Some(PlaneLayout {
+            src: crate::amdgpu_dcn401_spl::Rect::new(0, 0, 256, 128),
+            dst: crate::amdgpu_dcn401_spl::Rect::new(64, 32, 128, 64),
+            stream_width: 640,
+            stream_height: 480,
+            ycbcr420: false,
+            rotation: crate::amdgpu_dcn401_spl::Rotation::R0,
+            blend: Blend {
+                global_alpha: Some(0x80),
+                ..Blend::default_for(SurfaceFormat::Argb8888)
+            },
+            underlay: false,
+        }),
+    }
+}
+/// Stage the primary on pipe 0 through its MPC and each overlay of
+/// `overlays` on its own pipe through the real surface, memory, DPP and
+/// MPC steps (under pipe 0's stream), then hand the engine to the
+/// requestor model.
+fn overlay_chain(overlays: &[u8]) -> (Vec<u32>, Pool, Engine<RequestIo>, Surfaces, dccg::Applied) {
+    let extra = overlays.iter().fold(0, |m, &o| m | 1 << o);
+    let (backing, pool, mut e, mut surfaces, clock) =
+        ready_mpc_pipes(0, extra, ColorDepth::Bpc8, overlay_primary(), false);
+    surfaces
+        .prepare_mpc(&mut e, 0, || Ok((clock, config())))
+        .unwrap();
+    let mut next = pool.address() + 640 * 4 * 480;
+    for &o in overlays {
+        // The surface model checks each publication against its address.
+        e.io.surface.address = next;
+        let a = run(surfaces.prepare(&mut e, &pool, overlay_request(o))).unwrap();
+        assert_eq!(a.address, next, "overlay allocation");
+        next += a.bytes.div_ceil(4096) * 4096;
+        run(surfaces.prepare_memory(&mut e, o, || Ok(config()))).unwrap();
+        let mut d = Engine {
+            io: DppIo {
+                memory: e.io,
+                pipe: o,
+                waking: 0,
+                delay: [0; 2],
+                stall: 0,
+            },
+            authority: e.authority,
+            layout: e.layout,
+            status: e.status,
+            displays: e.displays,
+        };
+        // The overlay takes the selected display's (pipe 0's) stream.
+        let dpp = run(surfaces.prepare_dpp(&mut d, o, || Ok((clock, config())))).unwrap();
+        assert_eq!(dpp.timing, d.status.blanks[0].unwrap().timing);
+        e = Engine {
+            io: d.io.memory,
+            authority: d.authority,
+            layout: d.layout,
+            status: d.status,
+            displays: d.displays,
+        };
+        surfaces
+            .prepare_mpc(&mut e, o, || Ok((clock, config())))
+            .unwrap();
+        // amdgpu_dm's blending: per-pixel premultiplied alpha with the plane
+        // alpha as global gain, as staged in MPCC_CONTROL (top only).
+        let control = e.io.surface.inner.regs[&(MPC_BASE + (3 + u64::from(o) * 0x15) * 4)];
+        assert_eq!(control & 0xffff_00f3, 0x8080_0052);
+    }
+    let f = &mut e.io.surface.inner;
+    for p in core::iter::once(0).chain(overlays.iter().copied()) {
+        *f.regs.entry(h(p, 0x5f4)).or_default() &= !0xfcf00800;
+        for (r, bits) in [
+            (0x66d, 0x7ff0),
+            (0x620, 0xa9),
+            (0x5f2, 0x7701f77),
+            (0x5f3, 0x701f77),
+            (0x5f4, 0x4f0),
+            (0x5f7, 3),
+        ] {
+            *f.regs.entry(h(p, r)).or_default() |= bits;
+        }
+    }
+    for index in 0..5 {
+        f.regs.insert(
+            crb(index),
+            0x40000000 | if index == 0 { 21 * 0x101 } else { 0 },
+        );
+    }
+    f.regs.insert(BASE + 0x4c4 * 4, 0x40000abc);
+    f.writes.clear();
+    let e = Engine {
+        io: RequestIo {
+            inner: e.io,
+            pending: [None; 5],
+            delay: [1; 5],
+            stall: 0,
+            pipe: 0,
+        },
+        authority: e.authority,
+        layout: e.layout,
+        status: e.status,
+        displays: e.displays,
+    };
+    (backing, pool, e, surfaces, clock)
+}
+
+/// Two overlays staged on free pipes above the primary: the requestor
+/// gives every plane's HUBP the default DET (the compressed buffer what
+/// is left) and the primary's VTG, and records the stack; the display then
+/// holds the overlay pipes and their DETs. Overlays on the primary's own
+/// pipe, an unstaged pipe or another display's pipe, or more than DCN401's
+/// three, are refused before any write; retiring the planes ends the
+/// overlays' staging and returns their pipes.
+fn dcn401_requestor_stages_overlays_on_free_pipes() -> TestResult {
+    let (_backing, _pool, mut e, mut surfaces, clock) = overlay_chain(&[2, 3]);
+    let owners = || Ok((clock, config()));
+    for (bad, want, why) in [
+        (&[0u8][..], Error::Invalid, "overlay on the primary's pipe"),
+        (&[1], Error::Invalid, "overlay on an unstaged pipe"),
+        (&[2, 2], Error::Invalid, "one pipe twice"),
+        (&[2, 3, 1, 1], Error::Unsupported, "four overlays"),
+    ] {
+        let result = run(surfaces.prepare_requestor_planes(&mut e, 0, bad, owners));
+        if result != Err(want) {
+            let _ = core::fmt::Write::write_fmt(
+                &mut narf_console::Writer,
+                format_args!("  overlay stack {bad:?}: {result:?}, want {want:?}\n"),
+            );
+            return TestResult::Fail(why);
+        }
+        if !e.io.fake().writes.is_empty() {
+            return TestResult::Fail("refused stack wrote");
+        }
+    }
+    e.displays.siblings.pipes = 1 << 3;
+    if run(surfaces.prepare_requestor_planes(&mut e, 0, &[2, 3], owners)) != Err(Error::Invalid) {
+        return TestResult::Fail("another display's pipe");
+    }
+    e.displays.siblings.pipes = 0;
+    let Ok(a) = run(surfaces.prepare_requestor_planes(&mut e, 0, &[2, 3], owners)) else {
+        return TestResult::Fail("two overlays");
+    };
+    let staged = |o: usize| e.status.surfaces[o];
+    if a.overlays != [staged(2), staged(3), None] || e.status.requestor != Some(a) {
+        return TestResult::Fail("overlay stack recorded");
+    }
+    let sizes: alloc::vec::Vec<u32> = (0..5).map(|i| e.io.fake().regs[&crb(i)] & 0x1f).collect();
+    if sizes != [6, 5, 0, 5, 5] || a.compbuf_bytes != 6 << 16 {
+        return TestResult::Fail("a DET per plane");
+    }
+    for p in [0u8, 2, 3] {
+        if e.io.fake().regs[&h(p, 0x5f4)] & 0x4f0 != 0
+            || e.io.fake().regs[&h(p, 0x620)] & 0xff != 0x56
+            || e.io.fake().regs[&h(p, 0x5f5)] & 1 != 0
+        {
+            return TestResult::Fail("plane requestor on the primary's VTG");
+        }
+    }
+    if e.verify_requestor(0).is_err() || e.plane_pipes(0) != [0, 2, 3] {
+        return TestResult::Fail("planes verified together");
+    }
+    let held = Siblings::of(&e.status);
+    if held.pipes & 0b1101 != 0b1101 || held.det != 0b1101 {
+        return TestResult::Fail("the display holds its overlay pipes");
+    }
+    e.drop_overlays();
+    if e.status.surfaces[2].is_some()
+        || e.status.mpcs[3].is_some()
+        || e.status
+            .requestor
+            .is_some_and(|r| r.overlays != [None; MAX_OVERLAYS])
+        || e.status.mpcs[0].is_none()
+        || Siblings::of(&e.status).pipes & 0b1100 != 0
+    {
+        return TestResult::Fail("retirement ends overlay staging");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-requestor",
+    dcn401_requestor_stages_overlays_on_free_pipes
+);

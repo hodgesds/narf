@@ -187,8 +187,9 @@ impl OgamProgram {
 }
 
 impl<I: Io> Engine<I> {
-    /// dcn401_program_gamut_remap on MPCC `q`, its stream's top (and only)
-    /// layer. Returns the coefficient set now selected.
+    /// dcn401_program_gamut_remap on MPCC `q`: the stream's remap on its
+    /// segment's top layer, bypass (`None`) below. Returns the coefficient
+    /// set now selected.
     fn program_gamut(
         &mut self,
         q: u8,
@@ -291,22 +292,30 @@ impl<I: Io> Engine<I> {
     }
     /// Program display `p.pipe`'s requested color on each of its pipes, in
     /// dcn401_program_pipe's order (gamut remap, input then output transfer
-    /// function). The caller holds the OTG master lock.
+    /// function). Every plane takes the input transfer function amdgpu_dm
+    /// derives from the CRTC; the stream's gamut remap and regamma go on
+    /// each segment's top MPCC only (dcn401_program_gamut_remap and
+    /// dcn401_set_output_transfer_func's is_top_pipe), the MPCCs below it
+    /// in bypass. The caller holds the OTG master lock.
     pub(super) async fn program_color(&mut self, p: Pipe) -> Result<(), Error> {
         let program = self.displays.color[usize::from(p.pipe)].clone();
         let program = program.as_deref();
-        for q in p.pipes() {
-            let pre_degam_srgb = program.is_some_and(|c| c.pre_degam_srgb);
-            let gamut = self.program_gamut(q, program.and_then(|c| c.gamut.as_ref()))?;
-            self.program_input_tf(q, pre_degam_srgb)?;
-            let ogam = self
-                .program_ogam(q, program.and_then(|c| c.ogam.as_ref()))
-                .await?;
-            self.status.colors[usize::from(q)] = PipeColor {
-                pre_degam_srgb,
-                gamut,
-                ogam,
-            };
+        let pre_degam_srgb = program.is_some_and(|c| c.pre_degam_srgb);
+        for tree in p.trees() {
+            let top = tree.last().copied();
+            for &q in &tree {
+                let stream = program.filter(|_| Some(q) == top);
+                let gamut = self.program_gamut(q, stream.and_then(|c| c.gamut.as_ref()))?;
+                self.program_input_tf(q, pre_degam_srgb)?;
+                let ogam = self
+                    .program_ogam(q, stream.and_then(|c| c.ogam.as_ref()))
+                    .await?;
+                self.status.colors[usize::from(q)] = PipeColor {
+                    pre_degam_srgb,
+                    gamut,
+                    ogam,
+                };
+            }
         }
         Ok(())
     }
@@ -352,6 +361,7 @@ impl<I: Io> Engine<I> {
             pipe,
             odm: running.odm,
             address: running.address,
+            overlays: running.overlays,
             black: 0x41 | blank.request.depth.dpg() << 12,
             timeout_us: self.frame_timeout_us(pipe, blank)?,
             watch: true,
@@ -365,7 +375,7 @@ impl<I: Io> Engine<I> {
             self.update(self.layout.otg(pipe, LOCK), 1, 0)?;
             self.drr_trigger(pipe)?;
             self.stream_latched(p).await?;
-            for q in p.pipes() {
+            for q in p.all_pipes() {
                 self.verify_color(q)?;
             }
             self.live_fetch(pipe, running.address)

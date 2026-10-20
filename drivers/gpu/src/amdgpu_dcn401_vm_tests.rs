@@ -74,7 +74,16 @@ fn staged_with(
     request: SurfaceRequest,
     bytes: usize,
 ) -> (Vec<u32>, Pool, Engine<MemoryIo>, Surfaces) {
-    let (backing, pool, mut e, mut surfaces) = fixture(p, bytes);
+    staged_pipes(p, 0, request, bytes)
+}
+/// `staged_with`, the pipes in `extra` ready for overlay planes too.
+fn staged_pipes(
+    p: u8,
+    extra: u8,
+    request: SurfaceRequest,
+    bytes: usize,
+) -> (Vec<u32>, Pool, Engine<MemoryIo>, Surfaces) {
+    let (backing, pool, mut e, mut surfaces) = fixture_pipes(p, extra, bytes);
     run(surfaces.prepare(&mut e, &pool, request)).unwrap();
     e.io.inner.writes.clear();
     // Poison every programmable field, including valid inherited root, so a
@@ -84,8 +93,10 @@ fn staged_with(
     ] {
         e.io.inner.regs.insert(BASE + r * 4, 0xdeadbeef);
     }
-    for r in [0x62c, 0x62d, 0x63a] {
-        e.io.inner.regs.insert(h(p, r), 0xdeadbeef);
+    for q in (0..4u8).filter(|&q| q == p || extra & 1 << q != 0) {
+        for r in [0x62c, 0x62d, 0x63a] {
+            e.io.inner.regs.insert(h(q, r), 0xdeadbeef);
+        }
     }
     e.io.inner.regs.insert(BASE + 0x560 * 4, 0x12345678); // VMID1 untouched
     let engine = Engine {

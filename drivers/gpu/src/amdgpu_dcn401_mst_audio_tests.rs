@@ -416,6 +416,7 @@ fn dcn401_mst_audio_requires_matching_live_scanout_witnesses() -> TestResult {
         )
         .unwrap(),
         address: 0x8_0010_2000,
+        overlays: [None; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
         frame_before: 2,
         frame_after: 3,
     };

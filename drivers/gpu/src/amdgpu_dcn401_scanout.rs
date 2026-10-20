@@ -48,9 +48,31 @@ const V_BLANK_START_END: u64 = 0x1b38;
 const MPC_STATUS: u64 = 0xe;
 const MPCC_CONTROL: u64 = 3;
 const MPCC_MODE_TOP_ONLY: u32 = 2;
+const MPCC_MODE_TOP_BOT: u32 = 3;
 const DRAM_STATE: u64 = 0x4fc;
 const PSTATE_FORCE: u32 = 0x30; // ALLOW_PSTATE_CHANGE_FORCE_{VALUE,ENABLE}
 const PSTATE_DISALLOWED: u32 = 0x20;
+
+/// One overlay plane of a scanout: its pipe (and ODM pipe), fetching
+/// `address` above the planes below it, or below the primary for an
+/// underlay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OverlayScanout {
+    pub pipe: u8,
+    pub odm: Option<u8>,
+    pub address: u64,
+    pub underlay: bool,
+}
+impl OverlayScanout {
+    fn of(s: SurfaceApplied) -> Self {
+        Self {
+            pipe: s.request.pipe,
+            odm: s.request.odm,
+            address: s.address,
+            underlay: s.request.layout().underlay,
+        }
+    }
+}
 
 /// Evidence that one owned surface is the pipe's live scanout source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,9 +85,104 @@ pub struct ScanoutRunning {
     pub plan: dml::Plan,
     /// GPU address the HUBP reported in use after the configuration latched.
     pub address: u64,
+    /// The overlay planes blended above the primary, bottom first, each
+    /// with the address its HUBP reported in use.
+    pub overlays: [Option<OverlayScanout>; MAX_OVERLAYS],
     /// Two distinct frame counts sampled after the latch with no underflow.
     pub frame_before: u32,
     pub frame_after: u32,
+}
+
+/// What one HUBP/DPP/MPCC of a live scanout must show: the address it
+/// fetches, whether the cursor is on, its MPCC's tree selectors (the
+/// OUT_MUX of the OPP with its index, TOP, BOT, OPP_ID and UPDATE_LOCK
+/// selects) and MPCC_MODE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LivePipe {
+    pub pipe: u8,
+    pub address: u64,
+    pub cursor: bool,
+    pub routes: [u8; 5],
+    pub mode: u8,
+}
+
+/// Each segment's MPCC tree, bottom first: the underlays' pipes for the
+/// segment, the primary's (whose OPP the tree feeds), then the other
+/// overlays' (normalized zpos order).
+fn trees(
+    primary: impl Iterator<Item = u8>,
+    overlays: &[Option<OverlayScanout>; MAX_OVERLAYS],
+) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+    primary
+        .enumerate()
+        .map(|(segment, p)| {
+            let at = move |under: bool| {
+                overlays
+                    .iter()
+                    .flatten()
+                    .filter(move |o| o.underlay == under)
+                    .filter_map(move |o| core::iter::once(o.pipe).chain(o.odm).nth(segment))
+            };
+            at(true)
+                .chain(core::iter::once(p))
+                .chain(at(false))
+                .collect()
+        })
+        .collect()
+}
+
+impl ScanoutRunning {
+    /// Every pipe of this scanout as a live check finds it, mpc1_insert_plane
+    /// having built each segment's tree from the top plane down: the top
+    /// MPCC on the OPP's OUT_MUX, each blending over the next lower one
+    /// (TOP_BOT_BLENDING), the bottom over the background (TOP_LAYER_ONLY).
+    /// The cursor shows on the primary's pipes only.
+    pub fn live_pipes(&self, cursor: Option<CursorApplied>) -> alloc::vec::Vec<LivePipe> {
+        live_pipes(self.pipe, self.odm, self.address, &self.overlays, cursor)
+    }
+}
+
+fn live_pipes(
+    pipe: u8,
+    odm: Option<u8>,
+    address: u64,
+    overlays: &[Option<OverlayScanout>; MAX_OVERLAYS],
+    cursor: Option<CursorApplied>,
+) -> alloc::vec::Vec<LivePipe> {
+    let mut out = alloc::vec::Vec::new();
+    let primary = core::iter::once(pipe).chain(odm);
+    for (tree, opp) in trees(primary.clone(), overlays).into_iter().zip(primary) {
+        let top = *tree.last().unwrap_or(&opp);
+        for (j, &m) in tree.iter().enumerate() {
+            let fetched = if m == opp {
+                address
+            } else {
+                overlays
+                    .iter()
+                    .flatten()
+                    .find(|o| o.pipe == m || o.odm == Some(m))
+                    .map_or(0, |o| o.address)
+            };
+            out.push(LivePipe {
+                pipe: m,
+                address: fetched,
+                cursor: m == opp && cursor.is_some_and(|c| c.pipe == pipe && c.shown_on(m)),
+                routes: [
+                    if m == opp { top } else { 0xf },
+                    m,
+                    if j == 0 { 0xf } else { tree[j - 1] },
+                    opp,
+                    opp,
+                ],
+                mode: if j == 0 {
+                    MPCC_MODE_TOP_ONLY as u8
+                } else {
+                    MPCC_MODE_TOP_BOT as u8
+                },
+            });
+        }
+    }
+    out
 }
 
 /// A running timing generator's position, as Linux's get_crtc_scanoutpos
@@ -130,15 +247,44 @@ pub(super) struct Pipe {
     /// The ODM pipe fetching the right half, under `pipe`'s timing.
     pub(super) odm: Option<u8>,
     pub(super) address: u64,
+    /// The overlay planes above the primary, bottom first.
+    pub(super) overlays: [Option<OverlayScanout>; MAX_OVERLAYS],
     pub(super) black: u32,
     pub(super) timeout_us: u64,
     /// Fail waits on underflow; cleared only while recovering from one.
     pub(super) watch: bool,
 }
 impl Pipe {
-    /// Every pipe whose HUBP/DPP/MPCC/OPP carries this scanout.
+    /// Every pipe whose HUBP/DPP/MPCC/OPP carries the primary plane: the
+    /// stream's OPPs.
     pub(super) fn pipes(self) -> impl Iterator<Item = u8> + Clone {
         core::iter::once(self.pipe).chain(self.odm)
+    }
+    /// Every HUBP/DPP/MPCC of the scanout with the address it fetches:
+    /// the primary's, then each overlay's, bottom first.
+    pub(super) fn fetches(self) -> alloc::vec::Vec<(u8, u64)> {
+        let mut out: alloc::vec::Vec<(u8, u64)> = self.pipes().map(|q| (q, self.address)).collect();
+        for o in self.overlays.iter().flatten() {
+            out.extend(
+                core::iter::once(o.pipe)
+                    .chain(o.odm)
+                    .map(|q| (q, o.address)),
+            );
+        }
+        out
+    }
+    /// Every pipe of the scanout.
+    pub(super) fn all_pipes(self) -> alloc::vec::Vec<u8> {
+        self.fetches().into_iter().map(|(q, _)| q).collect()
+    }
+    /// Each segment's MPCC tree, bottom first.
+    pub(super) fn trees(self) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+        trees(self.pipes(), &self.overlays)
+    }
+    /// The scanout's pipes as a live check finds them (as
+    /// `ScanoutRunning::live_pipes`).
+    pub(super) fn live(self, cursor: Option<CursorApplied>) -> alloc::vec::Vec<LivePipe> {
+        live_pipes(self.pipe, self.odm, self.address, &self.overlays, cursor)
     }
 }
 
@@ -175,8 +321,7 @@ impl<I: Io> Engine<I> {
         ]
     }
     fn underflow(&mut self, pipe: u8) -> Result<(), Error> {
-        let pipes: alloc::vec::Vec<u8> = self.fetch_pipes(pipe).collect();
-        for p in pipes {
+        for p in self.plane_pipes(pipe) {
             let at = self.layout.hubp(p, HUBP_CONTROL);
             if self.read(at)? & HUBP_UNDERFLOW != 0 {
                 return Err(Error::Underflow(at));
@@ -207,9 +352,12 @@ impl<I: Io> Engine<I> {
         }
         let pipes: alloc::vec::Vec<u8> = self.fetch_pipes(pipe).collect();
         for p in pipes {
-            if self.read(l.opp(p, DPG_PENDING))? & 1 != 0
-                || self.read(l.mpcc(p, UPDATE_LOCK))? & 0x70 != 0
-            {
+            if self.read(l.opp(p, DPG_PENDING))? & 1 != 0 {
+                return Err(Error::Busy);
+            }
+        }
+        for p in self.plane_pipes(pipe) {
+            if self.read(l.mpcc(p, UPDATE_LOCK))? & 0x70 != 0 {
                 return Err(Error::Busy);
             }
         }
@@ -220,6 +368,11 @@ impl<I: Io> Engine<I> {
     fn staged(&mut self, p: Pipe) -> Result<(), Error> {
         let l = self.layout;
         for q in p.pipes() {
+            if self.read(l.opp(q, DPG))? & DPG_FIELDS != p.black {
+                return Err(Error::Readback(l.opp(q, DPG)));
+            }
+        }
+        for (q, address) in p.fetches() {
             for (at, mask, value) in [
                 (
                     l.hubp(q, HUBP_CONTROL),
@@ -228,11 +381,10 @@ impl<I: Io> Engine<I> {
                 ),
                 (l.hubp(q, HUBP_CLOCK), 1, 0),
                 (self.dpp_control(q), DPP_CLOCK_ENABLE, 0),
-                (l.opp(q, DPG), DPG_FIELDS, p.black),
                 (l.mpcc(q, MPCC_CONTROL), 3, MPCC_MODE_TOP_ONLY),
                 (l.hubp(q, CURSOR), CURSOR_REQ_MODE | 1, CURSOR_REQ_MODE),
-                (l.hubp(q, ADDRESS), u32::MAX, p.address as u32),
-                (l.hubp(q, ADDRESS_HIGH), 0xffff, (p.address >> 32) as u32),
+                (l.hubp(q, ADDRESS), u32::MAX, address as u32),
+                (l.hubp(q, ADDRESS_HIGH), 0xffff, (address >> 32) as u32),
             ] {
                 if self.read(at)? & mask != value {
                     return Err(Error::Readback(at));
@@ -344,8 +496,7 @@ impl<I: Io> Engine<I> {
                 return Err(Error::Busy);
             }
         }
-        let pipes: alloc::vec::Vec<u8> = self.fetch_pipes(pipe).collect();
-        for q in pipes {
+        for q in self.plane_pipes(pipe) {
             if self.read(l.hubp(q, FLIP))? & FLIP_PENDING != 0
                 || self.read(l.mpcc(q, UPDATE_LOCK))? & 0x70 != 0
             {
@@ -354,9 +505,10 @@ impl<I: Io> Engine<I> {
         }
         self.underflow(pipe)
     }
-    /// `in_use` for every pipe of the scanout: the first still waiting.
-    fn all_in_use(&mut self, p: Pipe, address: u64) -> Result<Option<u64>, Error> {
-        for q in p.pipes() {
+    /// `in_use` for every pipe of the scanout at the address it fetches:
+    /// the first still waiting.
+    fn all_in_use(&mut self, p: Pipe) -> Result<Option<u64>, Error> {
+        for (q, address) in p.fetches() {
             if let Some(at) = self.in_use(q, address)? {
                 return Ok(Some(at));
             }
@@ -366,20 +518,60 @@ impl<I: Io> Engine<I> {
     /// Re-address the live fetch under the master-update lock (a VSYNC flip:
     /// the staged flip type is 0) and wait for the HUBP to report the new
     /// surface in use, without underflow. Returns the frame count then.
+    /// Every plane of `p` whose address differs from `from`'s flips; all of
+    /// them latch at the one VUPDATE the lock releases to.
     pub(super) async fn flip_to(&mut self, p: Pipe) -> Result<u32, Error> {
+        self.flip_from(p, None).await
+    }
+    /// `flip_to`, re-addressing only the planes whose address differs from
+    /// `from`'s (all of them without one).
+    pub(super) async fn flip_from(&mut self, p: Pipe, from: Option<Pipe>) -> Result<u32, Error> {
         let l = self.layout;
         let pipe = p.pipe;
         self.lock(pipe).await?;
-        // Both ODM halves re-address under the one master lock.
-        for q in p.pipes() {
-            self.update(l.hubp(q, ADDRESS_HIGH), 0xffff, (p.address >> 32) as u32)?;
-            self.update(l.hubp(q, ADDRESS), u32::MAX, p.address as u32)?;
+        // Both ODM halves of every flipping plane re-address under the one
+        // master lock.
+        let old = from.map(Pipe::fetches);
+        for (i, (q, address)) in p.fetches().into_iter().enumerate() {
+            if old
+                .as_ref()
+                .is_some_and(|o| o.get(i) == Some(&(q, address)))
+            {
+                continue;
+            }
+            self.update(l.hubp(q, ADDRESS_HIGH), 0xffff, (address >> 32) as u32)?;
+            self.update(l.hubp(q, ADDRESS), u32::MAX, address as u32)?;
         }
         self.update(l.otg(pipe, LOCK), LOCK_REQUEST, 0)?;
         // Unlocked: under DRR the manual trigger ends the stretched blank.
         self.drr_trigger(pipe)?;
-        self.latched(p, |e| e.all_in_use(p, p.address)).await?;
+        self.latched(p, |e| e.all_in_use(p)).await?;
         Ok(self.read(l.otg(pipe, FRAME_COUNT))? & FRAME_MASK)
+    }
+    /// The MPCC tree writes of one segment, as mpc1_insert_plane makes them
+    /// for its planes inserted from the top down, each at the bottom: the
+    /// new MPCC alone at the bottom over the background (TOP_LAYER_ONLY),
+    /// the one above it then blending over it (TOP_BOT_BLENDING), the first
+    /// (top) one on the OPP's OUT_MUX.
+    fn insert_tree(&mut self, opp: u8, tree: &[u8]) -> Result<(), Error> {
+        let l = self.layout;
+        let mut above: Option<u8> = None;
+        for &m in tree.iter().rev() {
+            self.update(l.mpcc(m, BOTTOM), 0xf, 0xf)?;
+            self.update(l.mpcc(m, MPCC_CONTROL), 3, MPCC_MODE_TOP_ONLY)?;
+            self.update(l.mpcc(m, TOP), 0xf, u32::from(m))?;
+            self.update(l.mpcc(m, OPP_ID), 0xf, u32::from(opp))?;
+            self.update(l.mpcc(m, UPDATE_LOCK), 0xf, u32::from(opp))?;
+            match above {
+                None => self.update(l.out_mux(opp), 0xf, u32::from(m))?,
+                Some(a) => {
+                    self.update(l.mpcc(a, BOTTOM), 0xf, u32::from(m))?;
+                    self.update(l.mpcc(a, MPCC_CONTROL), 3, MPCC_MODE_TOP_BOT)?;
+                }
+            }
+            above = Some(m);
+        }
+        Ok(())
     }
     /// Connect and unblank under one OTG master-update lock so DPG release,
     /// MPCC insertion, address and HUBP unblank latch at the same VUPDATE.
@@ -389,7 +581,7 @@ impl<I: Io> Engine<I> {
         let hubbub = |r: u64| l.base + r * 4;
         // Clocks first, while blanked and detached; Linux never has them gated
         // on a live plane.
-        for q in p.pipes() {
+        for q in p.all_pipes() {
             self.update(l.hubp(q, HUBP_CLOCK), 1, 1)?;
             self.update(self.dpp_control(q), DPP_CLOCK_ENABLE, DPP_CLOCK_ENABLE)?;
             self.wait(l.hubp(q, HUBP_CONTROL), 0x1007, 3, 100_000)
@@ -402,22 +594,18 @@ impl<I: Io> Engine<I> {
         // dcn401_program_pipe's color for an enabled pipe: CRTC color under
         // the same lock, latching with the plane.
         self.program_color(p).await?;
-        // Each ODM segment's OPP, MPCC tree and HUBP under the one master
+        // Each ODM segment's OPP, MPCC tree and HUBPs under the one master
         // lock: they latch together at the combined timing's VUPDATE.
         for q in p.pipes() {
             self.update(l.opp(q, DPG), DPG_FIELDS, 0)?; // video mode
-            for (at, value) in [
-                (l.mpcc(q, BOTTOM), 0xf),
-                (l.mpcc(q, TOP), u32::from(q)),
-                (l.mpcc(q, OPP_ID), u32::from(q)),
-                (l.mpcc(q, UPDATE_LOCK), u32::from(q)),
-                (l.out_mux(q), u32::from(q)),
-            ] {
-                self.update(at, 0xf, value)?;
-            }
+        }
+        for (tree, opp) in p.trees().into_iter().zip(p.pipes()) {
+            self.insert_tree(opp, &tree)?;
+        }
+        for (q, address) in p.fetches() {
             // Re-arm the flip: high half first, the low write publishes it.
-            self.update(l.hubp(q, ADDRESS_HIGH), 0xffff, (p.address >> 32) as u32)?;
-            self.update(l.hubp(q, ADDRESS), u32::MAX, p.address as u32)?;
+            self.update(l.hubp(q, ADDRESS_HIGH), 0xffff, (address >> 32) as u32)?;
+            self.update(l.hubp(q, ADDRESS), u32::MAX, address as u32)?;
             self.update(l.hubp(q, HUBP_CONTROL), BLANK_EN | TTU_DISABLE, 0)?;
         }
         self.update(l.otg(pipe, LOCK), LOCK_REQUEST, 0)?;
@@ -425,7 +613,7 @@ impl<I: Io> Engine<I> {
         // when no flip is pending and EARLIEST_INUSE reports its address. A
         // requested-address readback is not that evidence.
         self.latched(p, |e| {
-            if let Some(at) = e.all_in_use(p, p.address)? {
+            if let Some(at) = e.all_in_use(p)? {
                 return Ok(Some(at));
             }
             for (at, mask, value) in [
@@ -437,34 +625,36 @@ impl<I: Io> Engine<I> {
                 }
             }
             for q in p.pipes() {
-                for (at, mask, value) in [
-                    (l.opp(q, DPG_PENDING), 1, 0),
-                    (l.opp(q, DPG), DPG_EN, 0),
-                    (l.mpcc(q, MPC_STATUS), 4, 0), // MPCC no longer DISABLED
-                ] {
+                for (at, mask, value) in [(l.opp(q, DPG_PENDING), 1, 0), (l.opp(q, DPG), DPG_EN, 0)]
+                {
                     if e.read(at)? & mask != value {
                         return Ok(Some(at));
                     }
+                }
+            }
+            for q in p.all_pipes() {
+                let at = l.mpcc(q, MPC_STATUS); // MPCC no longer DISABLED
+                if e.read(at)? & 4 != 0 {
+                    return Ok(Some(at));
                 }
             }
             Ok(None)
         })
         .await?;
         self.update(hubbub(DRAM_STATE), PSTATE_FORCE, 0)?;
-        for q in p.pipes() {
-            for (at, value) in self.routes(q, true) {
-                if self.read(at)? & 0xf != value {
-                    return Err(Error::Readback(at));
-                }
-            }
-            if self.read(l.hubp(q, HUBP_CONTROL))? & (BLANK_EN | TTU_DISABLE) != 0 {
-                return Err(Error::Readback(l.hubp(q, HUBP_CONTROL)));
+        for live in p.live(None) {
+            self.tree_routes(live)?;
+            let at = l.hubp(live.pipe, HUBP_CONTROL);
+            if self.read(at)? & (BLANK_EN | TTU_DISABLE) != 0 {
+                return Err(Error::Readback(at));
             }
         }
         self.fresh_frames(p).await
     }
-    /// Black first, detach under the lock, then drain and blank the HUBP and
-    /// gate its clocks only after the MPCC and memory requests are idle.
+    /// Black first, detach under the lock, then drain and blank the HUBPs and
+    /// gate their clocks only after the MPCCs and memory requests are idle.
+    /// Every MPCC leaves the tree at once (mpc1_remove_mpcc for each plane,
+    /// the overlays first), back to its staged TOP_LAYER_ONLY mode.
     pub(super) async fn stop_fetch(&mut self, p: Pipe) -> Result<(), Error> {
         let l = self.layout;
         let pipe = p.pipe;
@@ -476,9 +666,14 @@ impl<I: Io> Engine<I> {
         self.lock(pipe).await?;
         for q in p.pipes() {
             self.update(l.opp(q, DPG), DPG_FIELDS, p.black)?;
+        }
+        let mut detach = p.all_pipes();
+        detach.reverse();
+        for &q in &detach {
             for (at, value) in self.routes(q, false) {
                 self.update(at, 0xf, value)?;
             }
+            self.update(l.mpcc(q, MPCC_CONTROL), 3, MPCC_MODE_TOP_ONLY)?;
         }
         self.update(l.otg(pipe, LOCK), LOCK_REQUEST, 0)?;
         // Black must be on screen before the MPCC may report disconnection.
@@ -496,6 +691,8 @@ impl<I: Io> Engine<I> {
                         return Ok(Some(at));
                     }
                 }
+            }
+            for &q in &detach {
                 // mpc2_assert_idle_mpcc: DISABLED, or IDLE and not BUSY.
                 let at = l.mpcc(q, MPC_STATUS);
                 let status = e.read(at)?;
@@ -506,7 +703,7 @@ impl<I: Io> Engine<I> {
             Ok(None)
         })
         .await?;
-        for q in p.pipes() {
+        for &q in &detach {
             // hubp2_set_blank(true): no outstanding requests before blanking.
             self.wait(
                 l.hubp(q, HUBP_CONTROL),
@@ -523,36 +720,79 @@ impl<I: Io> Engine<I> {
         }
         self.staged(p)
     }
-    /// The owned pipe as `start_fetch` left it: unblanked fetch of the owned
-    /// surface, clocks on, routes connected, DPG released, cursor off.
+    /// The owned scanout as `start_fetch` left it: unblanked fetch of each
+    /// plane's surface, clocks on, trees connected, DPG released, the cursor
+    /// as recorded.
+    /// The primary's pipes fetch `address`; the overlays are the recorded
+    /// live scanout's.
     pub(in crate::amdgpu_dcn401_otg) fn live_fetch(
         &mut self,
         pipe: u8,
         address: u64,
     ) -> Result<(), Error> {
-        let cursor = self.status.cursor.filter(|c| c.pipe == pipe);
-        let pipes: alloc::vec::Vec<u8> = self.fetch_pipes(pipe).collect();
-        for q in pipes {
-            self.live_segment(q, address, cursor.is_some_and(|c| c.shown_on(q)))?;
+        let odm = self.fetch_pipes(pipe).nth(1);
+        let overlays = self
+            .status
+            .scanout
+            .filter(|s| s.pipe == pipe)
+            .map_or([None; MAX_OVERLAYS], |s| s.overlays);
+        for live in live_pipes(pipe, odm, address, &overlays, self.status.cursor) {
+            self.live_pipe(live)?;
         }
         Ok(())
     }
-    /// One HUBP/DPP/MPCC/OPP of a live scanout. Also what another display's
-    /// live pipe is checked against (each of its pipes on its own).
+    /// One pipe of a single-plane live scanout, its own tree's only MPCC.
     pub(in crate::amdgpu_dcn401_otg) fn live_segment(
         &mut self,
         pipe: u8,
         address: u64,
         cursor: bool,
     ) -> Result<(), Error> {
+        self.live_pipe(LivePipe {
+            pipe,
+            address,
+            cursor,
+            routes: [pipe, pipe, 0xf, pipe, pipe],
+            mode: MPCC_MODE_TOP_ONLY as u8,
+        })
+    }
+    /// One pipe's MPCC tree selectors, and in a tree of several planes its
+    /// MPCC_MODE (a single plane's is the staged TOP_LAYER_ONLY, which
+    /// connection leaves alone).
+    fn tree_routes(&mut self, live: LivePipe) -> Result<(), Error> {
         let l = self.layout;
+        let q = live.pipe;
+        let [mux, top, bot, opp, lock] = live.routes.map(u32::from);
+        for (at, value) in [
+            (l.out_mux(q), mux),
+            (l.mpcc(q, TOP), top),
+            (l.mpcc(q, BOTTOM), bot),
+            (l.mpcc(q, OPP_ID), opp),
+            (l.mpcc(q, UPDATE_LOCK), lock),
+        ] {
+            if self.read(at)? & 0xf != value {
+                return Err(Error::Readback(at));
+            }
+        }
+        let stacked = live.routes[2] != 0xf || live.routes[0] != q;
+        let at = l.mpcc(q, MPCC_CONTROL);
+        if stacked && self.read(at)? & 3 != u32::from(live.mode) {
+            return Err(Error::Readback(at));
+        }
+        Ok(())
+    }
+    /// One HUBP/DPP/MPCC (with its OPP's DPG when it is the tree's OPP) of a
+    /// live scanout. Also what another display's live pipes are checked
+    /// against (each on its own).
+    pub(in crate::amdgpu_dcn401_otg) fn live_pipe(&mut self, live: LivePipe) -> Result<(), Error> {
+        let l = self.layout;
+        let (pipe, address) = (live.pipe, live.address);
         for (at, mask, value) in [
             (l.hubp(pipe, HUBP_CONTROL), BLANK_EN | 4 | TTU_DISABLE, 0),
             (l.hubp(pipe, HUBP_CLOCK), 1, 1),
             (self.dpp_control(pipe), DPP_CLOCK_ENABLE, DPP_CLOCK_ENABLE),
-            (l.opp(pipe, DPG), DPG_FIELDS, 0),
             (l.mpcc(pipe, MPC_STATUS), 4, 0),
-            (l.hubp(pipe, CURSOR), 1, u32::from(cursor)),
+            (l.hubp(pipe, CURSOR), 1, u32::from(live.cursor)),
             (l.hubp(pipe, ADDRESS), u32::MAX, address as u32),
             (l.hubp(pipe, ADDRESS_HIGH), 0xffff, (address >> 32) as u32),
             (l.hubp(pipe, EARLIEST_INUSE), u32::MAX, address as u32),
@@ -566,12 +806,10 @@ impl<I: Io> Engine<I> {
                 return Err(Error::Readback(at));
             }
         }
-        for (at, value) in self.routes(pipe, true) {
-            if self.read(at)? & 0xf != value {
-                return Err(Error::Readback(at));
-            }
+        if live.routes[3] == pipe && self.read(l.opp(pipe, DPG))? & DPG_FIELDS != 0 {
+            return Err(Error::Readback(l.opp(pipe, DPG)));
         }
-        Ok(())
+        self.tree_routes(live)
     }
     /// Record an underflow, return the pipe to black through the normal stop
     /// sequence without failing on the (sticky) status, then clear it. Linux
@@ -579,7 +817,7 @@ impl<I: Io> Engine<I> {
     pub(super) async fn recover_fetch(&mut self, p: Pipe) -> Result<ScanoutUnderflow, Error> {
         let l = self.layout;
         let mut hubp = 0;
-        for q in p.pipes() {
+        for q in p.all_pipes() {
             hubp |= self.read(l.hubp(q, HUBP_CONTROL))?;
         }
         let optc = self.read(self.optc_input(p.pipe))?;
@@ -592,7 +830,8 @@ impl<I: Io> Engine<I> {
         };
         self.stop_fetch(Pipe { watch: false, ..p }).await?;
         let clears = p
-            .pipes()
+            .all_pipes()
+            .into_iter()
             .map(|q| (l.hubp(q, HUBP_CONTROL), HUBP_UNDERFLOW_CLEAR))
             .chain([(self.optc_input(p.pipe), OPTC_UNDERFLOW_CLEAR)]);
         for (at, clear) in clears {
@@ -652,6 +891,23 @@ impl Surfaces {
         e.verify_surface(surface)?;
         e.verify_memory(d.pipe, config)?;
         e.verify_mpc(mpc)?;
+        // Each overlay's records name its surface and the same stream.
+        for o in a.overlays.iter().flatten() {
+            let slot = usize::from(o.request.pipe);
+            let staged = self.0.get(slot).and_then(Option::as_ref).map(|s| s.applied);
+            let m = e.status.mpcs[slot].ok_or(Error::Invalid)?;
+            if staged != Some(*o)
+                || e.status.surfaces[slot] != Some(*o)
+                || e.status.dpps[slot] != Some(m.dpp)
+                || m.dpp.surface != *o
+                || m.dpp.timing != blank.timing
+            {
+                return Err(Error::Invalid);
+            }
+            e.verify_surface(*o)?;
+            e.verify_memory(o.request.pipe, config)?;
+            e.verify_mpc(m)?;
+        }
         e.verify_live_requestor(d.pipe)?;
         e.deadline_writes(d.pipe, &d.plan, true)?;
         let refclk = e.dchub_refclk_khz(crystal_khz)?;
@@ -662,6 +918,7 @@ impl Surfaces {
             pipe: d.pipe,
             odm: surface.request.odm,
             address: surface.address,
+            overlays: a.overlays.map(|o| o.map(OverlayScanout::of)),
             black: 0x41 | blank.request.depth.dpg() << 12,
             timeout_us: e.frame_timeout_us(d.pipe, blank)?,
             watch: true,
@@ -708,6 +965,7 @@ impl Surfaces {
                     stream,
                     plan: d.plan,
                     address: p.address,
+                    overlays: p.overlays,
                     frame_before,
                     frame_after,
                 };
@@ -769,7 +1027,10 @@ impl Surfaces {
         let deadlines = e.status.deadlines.ok_or(Error::Invalid)?;
         let current = owners()?;
         let p = self.scanout_bound(e, deadlines, crystal_khz, current)?;
-        if p.address != running.address || deadlines.plan != running.plan {
+        if p.address != running.address
+            || p.overlays != running.overlays
+            || deadlines.plan != running.plan
+        {
             return Err(Error::Invalid);
         }
         match e.underflow(pipe) {
@@ -801,7 +1062,7 @@ impl Surfaces {
         let d = e.status.deadlines.ok_or(Error::Invalid)?;
         let current = owners()?;
         let p = self.scanout_bound(e, d, crystal_khz, current)?;
-        if p.address != running.address {
+        if p.address != running.address || p.overlays != running.overlays {
             return Err(Error::Invalid);
         }
         e.status.state = State::StoppingScanout(pipe);

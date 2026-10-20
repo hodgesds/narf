@@ -159,7 +159,26 @@ fn ready_range(
     mode: Mode,
     limited: bool,
 ) -> (Vec<u32>, Pool, Engine<DppIo>, Surfaces, dccg::Applied) {
-    let (backing, pool, mut e, mut surfaces) = staged_with(p, mode.surface, mode.bytes);
+    ready_range_pipes(p, 0, depth, mode, limited)
+}
+/// A powered, stopped DPP's inherited state, every field off its target.
+fn seed_dpp(f: &mut Fake, p: u8) {
+    for (r, value) in RGB {
+        f.regs.insert(d(p, r), 0x80000000 | (value ^ 1));
+    }
+    f.regs.insert(d(p, 0xcc5), 0x80050100);
+    f.regs.insert(d(p, 0xd24), 3);
+    f.regs.insert(d(p, 0xd62), 3);
+}
+/// `ready_range`, the pipes in `extra` ready for overlay planes too.
+fn ready_range_pipes(
+    p: u8,
+    extra: u8,
+    depth: ColorDepth,
+    mode: Mode,
+    limited: bool,
+) -> (Vec<u32>, Pool, Engine<DppIo>, Surfaces, dccg::Applied) {
+    let (backing, pool, mut e, mut surfaces) = staged_pipes(p, extra, mode.surface, mode.bytes);
     run(surfaces.prepare_memory(&mut e, p, || Ok(config()))).unwrap();
     let (t, clock) = (mode.timing, mode.clock);
     run(e.prepare(t, clock)).unwrap();
@@ -177,15 +196,9 @@ fn ready_range(
         clock,
     ))
     .unwrap();
-    for (r, value) in RGB {
-        e.io.surface
-            .inner
-            .regs
-            .insert(d(p, r), 0x80000000 | (value ^ 1));
+    for q in (0..4u8).filter(|&q| q == p || extra & 1 << q != 0) {
+        seed_dpp(&mut e.io.surface.inner, q);
     }
-    e.io.surface.inner.regs.insert(d(p, 0xcc5), 0x80050100);
-    e.io.surface.inner.regs.insert(d(p, 0xd24), 3);
-    e.io.surface.inner.regs.insert(d(p, 0xd62), 3);
     e.io.surface.inner.writes.clear();
     let engine = Engine {
         io: DppIo {

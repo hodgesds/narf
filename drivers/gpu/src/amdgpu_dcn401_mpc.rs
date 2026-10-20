@@ -248,7 +248,8 @@ impl Surfaces {
             .get(slot)
             .and_then(Option::as_ref)
             .ok_or(Error::Invalid)?;
-        let blank = e.status.blanks[slot].ok_or(Error::Invalid)?;
+        // An overlay shows on the selected display's stream.
+        let blank = e.status.blanks[usize::from(e.stream_pipe(pipe))].ok_or(Error::Invalid)?;
         if e.status.surfaces[slot] != Some(surface.applied)
             || e.status.dpps[slot] != Some(dpp)
             || dpp.surface != surface.applied
@@ -290,7 +291,7 @@ impl Surfaces {
             return Err(Error::Busy);
         }
         let dpp = e.status.dpps[slot].ok_or(Error::Invalid)?;
-        let blank = e.status.blanks[slot].ok_or(Error::Invalid)?;
+        let blank = e.status.blanks[usize::from(e.stream_pipe(pipe))].ok_or(Error::Invalid)?;
         let (clock, config) = owners()?;
         let mut a = MpcApplied {
             dpp,
@@ -337,8 +338,10 @@ impl Surfaces {
     }
 }
 impl Otg {
-    /// Prepare full-frame RGB composition (opaque, or per-pixel premultiplied
-    /// alpha over the black background) while every route is detached.
+    /// Prepare a plane's RGB composition (its blend over the planes below,
+    /// or the black background for the primary) while every route is
+    /// detached: a display's primary, or an overlay on a free pipe of the
+    /// selected display, blended into its tree when scanout starts.
     /// # Safety
     /// Retain all owners and inherited resources on every outcome. Exclude
     /// firmware/FAMS and concurrent display, hub/VM, clock, reset and power writers.
@@ -351,9 +354,10 @@ impl Otg {
     ) -> Result<MpcApplied, Error> {
         let regs = self.0.io.0;
         let (held, layout) = self.0.held();
+        let stream = self.0.stream_pipe(pipe);
         self.1.prepare_mpc(&mut self.0, pipe, || {
             Ok((
-                dccg.timing_clock_except(regs, clocks, pipe, &|at| {
+                dccg.timing_clock_except(regs, clocks, stream, &|at| {
                     held_by_sibling(held, layout, at)
                 })
                 .map_err(Error::PipeClocks)?,

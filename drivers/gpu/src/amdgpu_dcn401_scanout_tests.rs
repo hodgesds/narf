@@ -15,6 +15,10 @@ struct Hw {
     pipe: u8,
     /// An ODM pipe latching with `pipe`'s timing.
     odm: Option<u8>,
+    /// Overlay pipes latching with it too.
+    overlays: alloc::vec::Vec<u8>,
+    /// Every write, in order.
+    log: alloc::vec::Vec<(u64, u32)>,
     grant: bool,
     latch: bool,
     underflow_after: Option<usize>,
@@ -30,8 +34,10 @@ impl Hw {
     fn get(&self, at: u64) -> u32 {
         self.regs.get(&at).copied().unwrap_or(0)
     }
-    fn pipes(&self) -> impl Iterator<Item = u8> {
-        core::iter::once(self.pipe).chain(self.odm)
+    fn pipes(&self) -> impl Iterator<Item = u8> + '_ {
+        core::iter::once(self.pipe)
+            .chain(self.odm)
+            .chain(self.overlays.iter().copied())
     }
     fn latch(&mut self) {
         let pipes: alloc::vec::Vec<u8> = self.pipes().collect();
@@ -72,6 +78,7 @@ impl Io for Hw {
     }
     fn write(&mut self, at: u64, value: u32) {
         self.writes += 1;
+        self.log.push((at, value));
         let (l, p) = (self.layout, self.pipe);
         if at == l.otg(p, 0x1b3c) {
             let state = (
@@ -125,6 +132,10 @@ fn staged(pipe: u8) -> Engine<Hw> {
     staged_odm(pipe, None)
 }
 fn staged_odm(pipe: u8, odm: Option<u8>) -> Engine<Hw> {
+    staged_planes(pipe, odm, &[])
+}
+/// `staged_odm` with overlay planes staged on `overlays` too.
+fn staged_planes(pipe: u8, odm: Option<u8>, overlays: &[u8]) -> Engine<Hw> {
     let e = engine();
     let l = e.layout;
     let mut hw = Hw {
@@ -132,6 +143,8 @@ fn staged_odm(pipe: u8, odm: Option<u8>) -> Engine<Hw> {
         layout: l,
         pipe,
         odm,
+        overlays: overlays.to_vec(),
+        log: alloc::vec::Vec::new(),
         grant: true,
         latch: true,
         underflow_after: None,
@@ -140,7 +153,10 @@ fn staged_odm(pipe: u8, odm: Option<u8>) -> Engine<Hw> {
         triggers: alloc::vec::Vec::new(),
     };
     hw.regs.insert(l.otg(pipe, CONTROL), OTG_MASTER_EN);
-    for q in core::iter::once(pipe).chain(odm) {
+    for q in core::iter::once(pipe)
+        .chain(odm)
+        .chain(overlays.iter().copied())
+    {
         for (at, value) in [
             (l.hubp(q, HUBP_CONTROL), 3 | u32::from(pipe) << 4),
             (l.hubp(q, CURSOR), CURSOR_REQ_MODE),
@@ -244,6 +260,7 @@ fn target(pipe: u8) -> Pipe {
         pipe,
         odm: None,
         address: ADDR,
+        overlays: [None; MAX_OVERLAYS],
         black: BLACK,
         timeout_us: 2000,
         watch: true,
@@ -622,4 +639,312 @@ fn dcn401_scanout_cursor_programs_under_its_lock_and_stops_with_fetch() -> TestR
 kernel_test_in!(
     "drivers/gpu/dcn401-scanout",
     dcn401_scanout_cursor_programs_under_its_lock_and_stops_with_fetch
+);
+
+const OVERLAY_A: u64 = ADDR + 0x0400_0000;
+const OVERLAY_B: u64 = ADDR + 0x0800_0000;
+
+fn overlay(pipe: u8, odm: Option<u8>, address: u64) -> Option<OverlayScanout> {
+    Some(OverlayScanout {
+        pipe,
+        odm,
+        address,
+        underlay: false,
+    })
+}
+/// The writes of `log` to MPCC tree selectors (low nibble) and MPCC_MODE
+/// (MPCC_CONTROL's low two bits) of `pipes`, in order.
+fn tree_writes(l: Layout, log: &[(u64, u32)], pipes: &[u8]) -> alloc::vec::Vec<(u64, u32)> {
+    let mut regs = alloc::vec::Vec::new();
+    for &q in pipes {
+        for r in [TOP, BOTTOM, OPP_ID, UPDATE_LOCK] {
+            regs.push((l.mpcc(q, r), 0xf));
+        }
+        regs.push((l.out_mux(q), 0xf));
+        regs.push((l.mpcc(q, MPCC_CONTROL), 3));
+    }
+    log.iter()
+        .filter_map(|&(at, v)| {
+            regs.iter()
+                .find(|&&(r, _)| r == at)
+                .map(|&(_, mask)| (at, v & mask))
+        })
+        .collect()
+}
+/// The primary's surface and the display's requestor naming the overlays
+/// (what `plane_pipes` and the underflow checks follow).
+fn stage_records(e: &mut Engine<Hw>, pipe: u8, odm: Option<u8>, overlays: &[(u8, Option<u8>)]) {
+    let surface = |pipe, odm, address| SurfaceApplied {
+        request: SurfaceRequest {
+            pipe,
+            width: 1920,
+            height: 1080,
+            format: SurfaceFormat::Argb8888,
+            odm,
+            plane: None,
+        },
+        address,
+        pitch_bytes: 7680,
+        bytes: 7680 * 1080,
+    };
+    let primary = surface(pipe, odm, ADDR);
+    e.status.surfaces[usize::from(pipe)] = Some(primary);
+    let mut stack = [None; MAX_OVERLAYS];
+    for (k, &(o, o_odm)) in overlays.iter().enumerate() {
+        stack[k] = Some(surface(o, o_odm, [OVERLAY_A, OVERLAY_B][k]));
+    }
+    e.status.requestor = Some(RequestorApplied {
+        pipe,
+        surface: primary,
+        overlays: stack,
+        det_bytes: 327_680,
+        compbuf_bytes: 65_536,
+        pixel_chunk_bytes: 8192,
+        minimum_chunk_bytes: 1024,
+    });
+}
+
+/// Two overlays above the primary: dcn20_program_pipe takes the planes
+/// from the top down and mpc1_insert_plane puts each at the bottom of the
+/// OPP's tree, so the top overlay's MPCC goes on the OUT_MUX first, alone
+/// (TOP_LAYER_ONLY), and each lower plane's MPCC then becomes the bottom of
+/// the one above it, which switches to TOP_BOT_BLENDING. Every HUBP
+/// unblanks and every plane's address latches under the one OTG lock;
+/// only the primary's OPP leaves the DPG. The CRTC color (gamut remap)
+/// goes on the top MPCC only, the input transfer function on every DPP.
+fn dcn401_scanout_overlays_blend_in_linux_mpcc_order() -> TestResult {
+    let (pipe, a, b) = (0u8, 2u8, 3u8);
+    let mut e = staged_planes(pipe, None, &[a, b]);
+    let l = e.layout;
+    stage_records(&mut e, pipe, None, &[(a, None), (b, None)]);
+    e.displays.color[usize::from(pipe)] = Some(alloc::sync::Arc::new(ColorProgram {
+        pre_degam_srgb: true,
+        gamut: Some(GamutProgram {
+            coef: [1, 2, 3, 4, 5, 6],
+            s3_12: false,
+        }),
+        ogam: None,
+    }));
+    let p = Pipe {
+        overlays: [
+            overlay(a, None, OVERLAY_A),
+            overlay(b, None, OVERLAY_B),
+            None,
+        ],
+        ..target(pipe)
+    };
+    e.io.log.clear();
+    if run(e.start_fetch(p)).is_err() {
+        return TestResult::Fail("start with overlays");
+    }
+    let w = |q: u8, r: u64, v: u32| (l.mpcc(q, r), v);
+    let c = |q: u8, v: u32| (l.mpcc(q, MPCC_CONTROL), v);
+    let want = [
+        // The top overlay alone on the OPP's output.
+        w(b, BOTTOM, 0xf),
+        c(b, 2),
+        w(b, TOP, u32::from(b)),
+        w(b, OPP_ID, u32::from(pipe)),
+        w(b, UPDATE_LOCK, u32::from(pipe)),
+        (l.out_mux(pipe), u32::from(b)),
+        // The lower overlay inserted at the bottom.
+        w(a, BOTTOM, 0xf),
+        c(a, 2),
+        w(a, TOP, u32::from(a)),
+        w(a, OPP_ID, u32::from(pipe)),
+        w(a, UPDATE_LOCK, u32::from(pipe)),
+        w(b, BOTTOM, u32::from(a)),
+        c(b, 3),
+        // The primary at the very bottom.
+        w(pipe, BOTTOM, 0xf),
+        c(pipe, 2),
+        w(pipe, TOP, u32::from(pipe)),
+        w(pipe, OPP_ID, u32::from(pipe)),
+        w(pipe, UPDATE_LOCK, u32::from(pipe)),
+        w(a, BOTTOM, u32::from(pipe)),
+        c(a, 3),
+    ];
+    if tree_writes(l, &e.io.log, &[pipe, a, b]) != want {
+        return TestResult::Fail("mpc1_insert_plane order");
+    }
+    for (q, address, dpg) in [
+        (pipe, ADDR, Some(0)),
+        (a, OVERLAY_A, None),
+        (b, OVERLAY_B, None),
+    ] {
+        if e.io.get(l.hubp(q, HUBP_CONTROL)) & BLANK_EN != 0
+            || e.io.get(l.hubp(q, EARLIEST_INUSE)) != address as u32
+            || dpg.is_some_and(|v| e.io.get(l.opp(q, DPG)) & DPG_FIELDS != v)
+        {
+            return TestResult::Fail("planes live at their addresses");
+        }
+    }
+    // The overlays' OPPs never leave black: they are not this stream's.
+    if e.io.get(l.opp(a, DPG)) != BLACK || e.io.get(l.opp(b, DPG)) != BLACK {
+        return TestResult::Fail("overlay OPP released");
+    }
+    // Stream gamut remap on the top MPCC only; sRGB input on every DPP.
+    if e.io.get(l.ogam(b, 0xc9)) & 3 != 1
+        || e.io.get(l.ogam(a, 0xc9)) & 3 != 0
+        || e.io.get(l.ogam(pipe, 0xc9)) & 3 != 0
+        || [pipe, a, b]
+            .iter()
+            .any(|&q| e.io.get(l.dpp(q, 0xced)) & 0x73 != 1)
+        || e.status.colors[usize::from(b)].gamut.is_none()
+        || e.status.colors[usize::from(a)].gamut.is_some()
+        || e.status.colors[usize::from(pipe)].gamut.is_some()
+    {
+        return TestResult::Fail("CRTC color on the top MPCC");
+    }
+    for live in p.live(None) {
+        if e.live_pipe(live).is_err() {
+            return TestResult::Fail("live witness of every plane");
+        }
+    }
+    // A plane whose tree position is wrong is not this scanout.
+    let mut bad = p.live(None)[1];
+    bad.routes[2] = 0xf;
+    if e.live_pipe(bad).is_ok() {
+        return TestResult::Fail("wrong BOT_SEL accepted");
+    }
+    // Flipping the top overlay alone re-addresses only its HUBP.
+    let mut next = p;
+    next.overlays[1] = overlay(b, None, OVERLAY_B + 0x1000);
+    e.io.log.clear();
+    if run(e.flip_from(next, Some(p))).is_err() {
+        return TestResult::Fail("overlay flip");
+    }
+    let addressed: alloc::vec::Vec<u8> = [pipe, a, b]
+        .into_iter()
+        .filter(|&q| e.io.log.iter().any(|&(at, _)| at == l.hubp(q, ADDRESS)))
+        .collect();
+    if addressed != [b]
+        || e.io.get(l.hubp(b, EARLIEST_INUSE)) != (OVERLAY_B + 0x1000) as u32
+        || e.io.get(l.hubp(a, EARLIEST_INUSE)) != OVERLAY_A as u32
+    {
+        return TestResult::Fail("only the flipped plane re-addresses");
+    }
+    // Stop detaches the overlays first (top down), every MPCC back to its
+    // staged TOP_LAYER_ONLY, every HUBP blank, the OPP black.
+    e.io.log.clear();
+    if run(e.stop_fetch(next)).is_err() || e.staged(next).is_err() {
+        return TestResult::Fail("stop with overlays");
+    }
+    let detached: alloc::vec::Vec<u64> = e
+        .io
+        .log
+        .iter()
+        .filter(|&&(at, v)| [pipe, a, b].iter().any(|&q| at == l.mpcc(q, TOP)) && v & 0xf == 0xf)
+        .map(|&(at, _)| at)
+        .collect();
+    if detached != [l.mpcc(b, TOP), l.mpcc(a, TOP), l.mpcc(pipe, TOP)] {
+        return TestResult::Fail("overlays leave the tree first");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_overlays_blend_in_linux_mpcc_order
+);
+
+/// An overlay on an ODM 2:1 stream takes a pipe in each half: each OPP has
+/// its own tree, the overlay's left pipe above the primary's left pipe,
+/// its right pipe above the primary's right one, both trees latching
+/// under the one master lock; an underflow on the overlay's right half is
+/// the scanout's.
+fn dcn401_scanout_odm_overlay_builds_a_tree_per_segment() -> TestResult {
+    let (pipe, q, o, o2) = (0u8, 1u8, 2u8, 3u8);
+    let mut e = staged_planes(pipe, Some(q), &[o, o2]);
+    let l = e.layout;
+    stage_records(&mut e, pipe, Some(q), &[(o, Some(o2))]);
+    let p = Pipe {
+        odm: Some(q),
+        overlays: [overlay(o, Some(o2), OVERLAY_A), None, None],
+        ..target(pipe)
+    };
+    if p.trees() != [[pipe, o], [q, o2]] {
+        return TestResult::Fail("segment trees");
+    }
+    if run(e.start_fetch(p)).is_err() {
+        return TestResult::Fail("ODM start with overlay");
+    }
+    for (opp, top) in [(pipe, o), (q, o2)] {
+        if e.io.get(l.out_mux(opp)) & 0xf != u32::from(top)
+            || e.io.get(l.mpcc(top, BOTTOM)) & 0xf != u32::from(opp)
+            || e.io.get(l.mpcc(top, OPP_ID)) & 0xf != u32::from(opp)
+            || e.io.get(l.mpcc(top, MPCC_CONTROL)) & 3 != 3
+            || e.io.get(l.mpcc(opp, MPCC_CONTROL)) & 3 != 2
+            || e.io.get(l.mpcc(opp, BOTTOM)) & 0xf != 0xf
+            || e.io.get(l.opp(opp, DPG)) & DPG_FIELDS != 0
+        {
+            return TestResult::Fail("one tree per OPP");
+        }
+    }
+    *e.io.regs.entry(l.hubp(o2, HUBP_CONTROL)).or_default() |= 0x1000_0000;
+    if e.underflow(pipe) != Err(Error::Underflow(l.hubp(o2, HUBP_CONTROL))) {
+        return TestResult::Fail("overlay right half underflow");
+    }
+    *e.io.regs.entry(l.hubp(o2, HUBP_CONTROL)).or_default() &= !0x1000_0000;
+    if run(e.stop_fetch(p)).is_err() {
+        return TestResult::Fail("ODM overlay stop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_odm_overlay_builds_a_tree_per_segment
+);
+
+/// An underlay (an overlay whose zpos is below the primary's) is the
+/// bottom of the tree: the primary blends over it and still feeds its own
+/// OPP, the overlay above both; the stream's color goes on the top.
+fn dcn401_scanout_underlay_goes_below_the_primary() -> TestResult {
+    let (pipe, under, over) = (1u8, 3u8, 0u8);
+    let mut e = staged_planes(pipe, None, &[under, over]);
+    let l = e.layout;
+    stage_records(&mut e, pipe, None, &[(under, None), (over, None)]);
+    let p = Pipe {
+        overlays: [
+            Some(OverlayScanout {
+                underlay: true,
+                ..overlay(under, None, OVERLAY_A).unwrap()
+            }),
+            overlay(over, None, OVERLAY_B),
+            None,
+        ],
+        ..target(pipe)
+    };
+    if p.trees() != [[under, pipe, over]] {
+        return TestResult::Fail("underlay at the bottom of the tree");
+    }
+    if run(e.start_fetch(p)).is_err() {
+        return TestResult::Fail("start with an underlay");
+    }
+    let sel = |q: u8, r| e.io.get(l.mpcc(q, r)) & 0xf;
+    let mode = |q: u8| e.io.get(l.mpcc(q, MPCC_CONTROL)) & 3;
+    if e.io.get(l.out_mux(pipe)) & 0xf != u32::from(over)
+        || sel(over, BOTTOM) != u32::from(pipe)
+        || sel(pipe, BOTTOM) != u32::from(under)
+        || sel(under, BOTTOM) != 0xf
+        || [under, pipe, over]
+            .iter()
+            .any(|&q| sel(q, OPP_ID) != u32::from(pipe))
+        || (mode(under), mode(pipe), mode(over)) != (2, 3, 3)
+        || e.io.get(l.opp(pipe, DPG)) & DPG_FIELDS != 0
+    {
+        return TestResult::Fail("primary blends over the underlay");
+    }
+    for live in p.live(None) {
+        if e.live_pipe(live).is_err() {
+            return TestResult::Fail("live underlay witness");
+        }
+    }
+    if run(e.stop_fetch(p)).is_err() || e.staged(p).is_err() {
+        return TestResult::Fail("stop with an underlay");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_underlay_goes_below_the_primary
 );

@@ -19,9 +19,10 @@ pub use opp::{BlankApplied, BlankRequest, BlankRunning, ColorDepth};
 mod fetch;
 pub use fetch::{
     Blend, ColorProgram, CursorApplied, DeadlinesApplied, DppApplied, FlipDone, GamutProgram,
-    HubpPower, MemoryApplied, MpcApplied, OgamProgram, PipeColor, PlaneLayout, PlanesRetired,
-    RequestorApplied, ScanoutPosition, ScanoutRunning, ScanoutUnderflow, SurfaceApplied,
-    SurfaceFormat, SurfaceRequest, VblankPhase, CURSOR_MAX,
+    HubpPower, LivePipe, MemoryApplied, MpcApplied, OgamProgram, OverlayScanout, PipeColor,
+    PlaneLayout, PlanesRetired, RequestorApplied, ScanoutPosition, ScanoutRunning,
+    ScanoutUnderflow, SurfaceApplied, SurfaceFormat, SurfaceRequest, VblankPhase, CURSOR_MAX,
+    MAX_OVERLAYS,
 };
 #[path = "amdgpu_dcn401_stream.rs"]
 mod stream;
@@ -806,7 +807,8 @@ pub struct Siblings {
     /// Transmitters whose running link is MST (8b/10b or 128b/132b):
     /// others' streams may share them.
     pub mst: u8,
-    pub live: [Option<(u64, bool)>; 4],
+    /// Each live pipe as its display's scanout leaves it (pipe-indexed).
+    pub live: [Option<LivePipe>; 4],
 }
 /// An instance's bit in a `Siblings` mask; none for an instance past 7.
 pub(crate) fn bit(instance: u8) -> u8 {
@@ -844,8 +846,15 @@ impl Siblings {
             }
         }
         if let Some(r) = s.requestor {
-            out.pipes |= r.surface.request.pipe_mask();
-            out.det |= r.surface.request.pipe_mask();
+            let planes = r
+                .overlays
+                .iter()
+                .flatten()
+                .fold(r.surface.request.pipe_mask(), |m, o| {
+                    m | o.request.pipe_mask()
+                });
+            out.pipes |= planes;
+            out.det |= planes;
         }
         let uhbr = |stream: u8| {
             s.uhbr_video_running
@@ -864,18 +873,15 @@ impl Siblings {
             State::DpVideoRunning(stream) => {
                 (stream, s.dp_video_running.map(|v| v.frontend.link.phy.path))
             }
-            State::ScanoutRunning(p) => {
+            State::ScanoutRunning(_) => {
                 let Some(live) = s.scanout else {
                     return out;
                 };
-                // Both ODM halves fetch the same surface.
-                for q in core::iter::once(p).chain(live.odm) {
-                    out.pipes |= bit(q);
-                    if let Some(slot) = out.live.get_mut(usize::from(q)) {
-                        *slot = Some((
-                            live.address,
-                            s.cursor.is_some_and(|c| c.pipe == p && c.shown_on(q)),
-                        ));
+                // Both ODM halves of every plane, each fetching its surface.
+                for l in live.live_pipes(s.cursor) {
+                    out.pipes |= bit(l.pipe);
+                    if let Some(slot) = out.live.get_mut(usize::from(l.pipe)) {
+                        *slot = Some(l);
                     }
                 }
                 let hdmi = s
