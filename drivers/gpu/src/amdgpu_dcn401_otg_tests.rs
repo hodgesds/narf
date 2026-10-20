@@ -1391,6 +1391,7 @@ fn dcn401_dsc_follows_link_set_dsc_on_stream() -> TestResult {
         linebuf_depth: 11,
         version_minor: 2,
         ycbcr422_simple: false,
+        frl: None,
     };
     let req = Request {
         signal: Signal::DisplayPort,
@@ -1506,6 +1507,7 @@ fn dcn401_odm_combines_two_opps_with_split_dsc() -> TestResult {
         linebuf_depth: 11,
         version_minor: 2,
         ycbcr422_simple: false,
+        frl: None,
     };
     req.dsc = Some(cfg);
     // DISPCLK covers half the pixel clock: each segment's share.

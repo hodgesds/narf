@@ -571,6 +571,25 @@ kernel_test_in!(
     dcn401_dml_matches_linux_dml21_uhbr_dsc_vectors
 );
 
+/// Shared with tests/dcn401_dml21/check.sh (harness_multi.c, DSC, HDMIFRL).
+const FRL_DSC_VECTORS: &str = include_str!("../tests/dcn401_dml21/frl_dsc_vectors.txt");
+
+/// The DSC streams the HDMI FRL DSC policy picks (8K60 VIC 199 at its
+/// 159/16-bpp preset, 8K60 and 4K240 RBv2 at 12 bpp, eight slices each),
+/// as DC passes them on HDMI FRL encoders (dml2_hdmifrl): Linux plans a
+/// 4:4:4 DSC stream there as on DP, so admission takes the same inputs.
+fn dcn401_dml_matches_linux_dml21_frl_dsc_vectors() -> TestResult {
+    match check_vectors(FRL_DSC_VECTORS, false, true) {
+        Ok((plans, rejects, odm)) if plans >= 4 && rejects >= 2 && odm >= 4 => TestResult::Pass,
+        Ok(_) => TestResult::Fail("FRL DSC vector file lost coverage"),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_matches_linux_dml21_frl_dsc_vectors
+);
+
 /// 4:2:0 lines wider than one formatter buffer, on two pipes.
 fn dcn401_dml_matches_linux_dml21_odm_ycbcr420_vectors() -> TestResult {
     match check_vectors(ODM_YCBCR420_VECTORS, true, false) {

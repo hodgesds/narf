@@ -64,6 +64,11 @@ impl<I: Io> Engine<I> {
     ) -> Result<(), Error> {
         let l = self.layout;
         let p = blank.request.pipe;
+        // A staged HDMI FRL timing compresses only once its video started it.
+        let dsc = plan
+            .request
+            .dsc
+            .filter(|_| plan.request.signal != Signal::HdmiFrl || self.status.frl_dsc == Some(p));
         for (r, mask, value) in plan.registers() {
             self.expect(l.otg(p, r), mask, value)?;
         }
@@ -77,8 +82,7 @@ impl<I: Io> Engine<I> {
             (
                 l.odm(p, FORMAT),
                 0x33,
-                if plan.request.ycbcr420 { 2 } else { 0 }
-                    | if plan.request.dsc.is_some() { 0x10 } else { 0 },
+                if plan.request.ycbcr420 { 2 } else { 0 } | if dsc.is_some() { 0x10 } else { 0 },
             ),
             (l.vtg(p), 0xffff7fff, plan.vtg | u32::from(running) << 31),
         ] {
@@ -94,7 +98,7 @@ impl<I: Io> Engine<I> {
                 self.expect(l.opp(o, r), mask, value)?;
             }
         }
-        if let Some(cfg) = plan.request.dsc {
+        if let Some(cfg) = dsc {
             self.dsc_running(&plan.request, &cfg)?;
         }
         Ok(())

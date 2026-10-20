@@ -1,16 +1,24 @@
 #!/usr/bin/env bash
-# Verify drivers/gpu/tests/dcn401_dsc/vectors.txt against Linux's DSC
-# decision and configuration (dc/dsc/dc_dsc.c, dcn20_dsc.c's
-# dsc_prepare_config, rc_calc*.c and DRM's drm_dsc_helper.c), compiled on
-# the host with DCN401's encoder; see harness.c for the line format.
+# Verify drivers/gpu/tests/dcn401_dsc/vectors.txt (DP) and frl_vectors.txt
+# (HDMI FRL) against Linux's DSC decision and configuration
+# (dc/dsc/dc_dsc.c, dcn20_dsc.c's dsc_prepare_config, rc_calc*.c and DRM's
+# drm_dsc_helper.c), compiled on the host with DCN401's encoder; see
+# harness.c and frl_harness.c for the line formats.
 #   drivers/gpu/tests/dcn401_dsc/check.sh [linux-tree]
 #   drivers/gpu/tests/dcn401_dsc/check.sh --generate [linux-tree] > vectors.txt
+#   drivers/gpu/tests/dcn401_dsc/check.sh --generate-frl [linux-tree] > frl_vectors.txt
 # amdgpu_dsc.rs must produce Linux's output for every line.
 set -euo pipefail
 here=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 generate=0
 if [ "${1:-}" = --generate ]; then
 	generate=1
+	shift
+elif [ "${1:-}" = --generate-frl ]; then
+	generate=2
+	shift
+elif [ "${1:-}" = --generate-cvtem ]; then
+	generate=3
 	shift
 fi
 linux=${1:-/usr/src/linux}
@@ -30,6 +38,68 @@ done
 alias=()
 for n in "" 2 3 4 5 6 7 8; do alias+=("-Wl,--defsym=generic_reg_get$n=abort"); done
 cc "${flags[@]}" "$here/harness.c" "$work"/*.o -lm "${alias[@]}" -o "$work/dsc"
+cc "${flags[@]}" "$here/frl_harness.c" "$work"/*.o -lm "${alias[@]}" -o "$work/frl"
+# hpo_enc401_hdmi_set_dsc_config, extracted from the Linux source
+# (cvtem_harness.c supplies its types and captures its packets).
+awk '/^void hpo_enc401_hdmi_set_dsc_config\(/ { on = 1 } on { print } on && /^}/ { exit }' \
+	"$d/dc/hpo/dcn401/dcn401_hpo_frl_stream_encoder.c" > "$work/set_dsc_config.c"
+grep -q 'emp_packet' "$work/set_dsc_config.c" ||
+	{ echo "hpo_enc401_hdmi_set_dsc_config not found" >&2; exit 1; }
+cc -O1 -w -I"$work" "$here/cvtem_harness.c" -o "$work/cvtem"
+# cvtem_vectors.txt: every compressed frl_vectors.txt line's timing, slices,
+# bpp and PPS, with a front porch and sync from its blanking.
+cvtem_inputs() {
+	grep -v '^#' "$here/frl_vectors.txt" | awk -F' = ' 'length($2) > 300 {
+		split($1, i, " "); n = split($2, o, " ")
+		ha = i[10]; ht = i[11]; b = ht - ha
+		print ha, ht, int(b / 4), int(b / 8) < 4 ? 4 : int(b / 8), o[2], o[4], o[n]
+	}'
+}
+if [ $generate -eq 3 ]; then
+	echo "# Linux hpo_enc401_hdmi_set_dsc_config CVTEM packets; see check.sh and cvtem_harness.c."
+	cvtem_inputs | while read -r line; do
+		echo "$line =$(echo "$line" | "$work/cvtem")"
+	done
+	exit 0
+fi
+
+if [ $generate -eq 2 ]; then
+	echo "# Linux HDMI FRL DSC reference vectors (DCN401 encoder); see check.sh and frl_harness.c."
+	# pix_clk_100hz h_active h_total v_active v_total vic hdmi_vic: 4K30 (HDMI
+	# VIC 1), 4K60 (97), 4K120 (118), 4K144 and 4K240 (RBv2), 5K120 (193),
+	# 8K30 (196), 8K60 (199), 8K60 RBv2, 8K120 (201), 10K60 (215), 4096x2160
+	# @120 (219), 1080p120 (63).
+	modes=("2970000 3840 4400 2160 2250 0 1" "5940000 3840 4400 2160 2250 97 0"
+		"11880000 3840 4400 2160 2250 118 0" "13330000 3840 3920 2160 2287 0 0"
+		"22440000 3840 3920 2160 2384 0 0" "14850000 5120 5500 2160 2250 193 0"
+		"11880000 7680 9000 4320 4400 196 0" "23760000 7680 9000 4320 4400 199 0"
+		"20850000 7680 7760 4320 4481 0 0" "47520000 7680 9000 4320 4400 201 0"
+		"29700000 10240 11000 4320 4500 215 0" "11880000 4096 4400 2160 2250 219 0"
+		"2970000 1920 2200 1080 1125 63 0")
+	clocks=(1200000 2000000 2400000 3000000)
+	RANDOM=4401
+	pick() { local -n a=$1; echo "${a[RANDOM % ${#a[@]}]}"; }
+	for _ in $(seq 3000); do
+		read -r pix ha ht va vt vic hvic <<<"$(pick modes)"
+		# Mostly the mode's VIC; sometimes none (a detailed timing).
+		if [ $((RANDOM % 4)) -eq 0 ]; then vic=0 hvic=0; fi
+		# Mostly a well-formed 8-bpc RGB sink with slices, rate and chunk
+		# buffer; the rest arbitrary.
+		if [ $((RANDOM % 10)) -lt 7 ]; then
+			caps="$((RANDOM % 2)) $((RANDOM % 2)) $((RANDOM % 3 == 0)) $((RANDOM % 2))"
+			caps="$caps $((3 + RANDOM % 6)) $((3 + RANDOM % 4)) $((15 + RANDOM % 49))"
+			fmt="$(( RANDOM % 4 == 0 ? (RANDOM % 3) * 2 + 8 : 8 )) $((RANDOM % 4 == 0 ? RANDOM % 4 : 0))"
+		else
+			caps="$((RANDOM % 2)) $((RANDOM % 2)) $((RANDOM % 3 == 0)) $((RANDOM % 2))"
+			caps="$caps $((RANDOM % 9)) $((RANDOM % 8 == 0 ? RANDOM % 7 : 1 + RANDOM % 6))"
+			caps="$caps $((RANDOM % 64))"
+			fmt="$(( (RANDOM % 3) * 2 + 8 )) $((RANDOM % 4))"
+		fi
+		in="$caps $(pick clocks) $pix $ha $ht $va $vt $fmt $vic $hvic"
+		echo "$in = $(echo "$in" | "$work/frl")"
+	done
+	exit 0
+fi
 
 if [ $generate -eq 1 ]; then
 	echo "# Linux DSC reference vectors (DCN401 encoder); see check.sh and harness.c."
@@ -98,4 +168,23 @@ if ! diff -q "$work/want" "$work/got" >/dev/null; then
 	echo "vectors.txt does not match Linux" >&2
 	exit 1
 fi
-echo "$(wc -l < "$work/want") ok"
+grep -v '^#' "$here/frl_vectors.txt" | sed 's/ = .*//' | "$work/frl" > "$work/got_frl"
+grep -v '^#' "$here/frl_vectors.txt" | sed 's/.* = //' > "$work/want_frl"
+if ! diff -q "$work/want_frl" "$work/got_frl" >/dev/null; then
+	diff "$work/want_frl" "$work/got_frl" | head -20 >&2
+	echo "frl_vectors.txt does not match Linux" >&2
+	exit 1
+fi
+grep -v '^#' "$here/cvtem_vectors.txt" | sed 's/ =.*//' | "$work/cvtem" > "$work/got_cvtem"
+grep -v '^#' "$here/cvtem_vectors.txt" | sed 's/^[^=]*=//' > "$work/want_cvtem"
+if ! diff -q "$work/want_cvtem" "$work/got_cvtem" >/dev/null; then
+	diff "$work/want_cvtem" "$work/got_cvtem" | head -20 >&2
+	echo "cvtem_vectors.txt does not match Linux" >&2
+	exit 1
+fi
+# Every cvtem_vectors.txt input comes from frl_vectors.txt's PPSes.
+if ! diff -q <(cvtem_inputs) <(grep -v '^#' "$here/cvtem_vectors.txt" | sed 's/ =.*//') >/dev/null; then
+	echo "cvtem_vectors.txt inputs no longer follow frl_vectors.txt" >&2
+	exit 1
+fi
+echo "$(cat "$work/want" "$work/want_frl" "$work/want_cvtem" | wc -l) ok"

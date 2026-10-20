@@ -2070,6 +2070,8 @@ fn navi48_frl_selection_reserves_audio_bandwidth() -> TestResult {
         Some(crate::amdgpu_frl_cap::FrlCap::Ok {
             audio_packets_line: 2,
             borrow: crate::amdgpu_frl_cap::FrlBorrow::None,
+            hc_active: 0,
+            hc_blank: 0,
         })
     );
     // A compressed-only sink remains usable as silent FRL video.
@@ -2902,4 +2904,227 @@ fn navi48_planes_reach_admission_and_staging() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_planes_reach_admission_and_staging
+);
+
+/// An HDMI 2.1 sink's HF-VSDB with its DSC fields: 600 MHz, SCDC,
+/// Max_FRL_Rate 6, DSC 1.2 with 10 bpc, DSC_Max_FRL_Rate 6, DSC_MaxSlices
+/// code 4 (eight slices at 340 MP/s) and 20 KiB of chunk buffer.
+const HF_DSC: &[u8] = &[
+    3 << 5 | 13,
+    0xd8,
+    0x5d,
+    0xc4,
+    1,
+    120,
+    0x80,
+    0x60,
+    0,
+    0,
+    0,
+    0x81,
+    0x64,
+    19,
+];
+/// The 7680x4320@60 CTA mode (VIC 199) as narf's timing model takes it.
+fn cta8k60() -> Timing {
+    crate::amdgpu_dcn_display::timing_from_edid(
+        &narf_edid::modes::cea_mode(199).unwrap().detailed(),
+    )
+    .unwrap()
+}
+fn dsc_soc() -> dml::Soc {
+    dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [300_000, 2_500_000],
+        dcfclk_khz: [200_000, 1_564_000],
+        socclk_khz: 300_000,
+        dispclk_max_khz: 2_000_000,
+        dppclk_max_khz: 2_000_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    }
+}
+
+/// amdgpu_dm's HDMI FRL DSC policy on DCN401: the HF DSC fields as DRM
+/// parses them; a stream compresses only when its raw bandwidth exceeds the
+/// verified FRL link's, at each encoding and depth Linux tries in turn
+/// (RGB before 4:2:0, 8-bpc RGB only natively), with dc_dsc_compute_config
+/// against the sink's DSC_Max_FRL_Rate and the lowest rate the compressed
+/// capacity check passes. The 8K60 CTA mode takes HDMI 2.1's eight slices
+/// and VIC 199's preset 159/16 bpp, and (as Linux's dml1 tables give it)
+/// 4 x 6G with the primary format's 3182/140 tribytes, borrowing from
+/// blank; checked against the host build in tests/dcn401_frl.
+fn navi48_hdmi_frl_dsc_policy_matches_linux() -> TestResult {
+    use crate::amdgpu_dsc::{FrlDscLink, HdmiDscCaps};
+    use crate::amdgpu_frl_cap::FrlBorrow;
+    let vdb: &[u8] = &[2 << 5 | 2, 199, 118];
+    let edid = with_blocks(edid_1080p(), &[VSDB, HF_DSC, vdb]);
+    let caps = hdmi_caps(&edid);
+    let want = HdmiDscCaps {
+        bpc10: true,
+        bpc12: false,
+        all_bpp: false,
+        native_420: false,
+        max_slices: 4,
+        max_frl_rate: 6,
+        total_chunk_kbytes: 19,
+    };
+    if caps.dsc != Some(want) || caps.max_frl_rate != 6 {
+        return TestResult::Fail("HF DSC fields");
+    }
+    let t = cta8k60();
+    let enabled = frl_enabled();
+    set_frl(true);
+    let cap = frl_cap(caps);
+    let stream = |caps: HdmiCaps, t: &Timing, bpc: u8, cap: Option<FrlRate>| {
+        hdmi_stream(caps, t, bpc, cap, None, 2_000_000)
+    };
+    let got = stream(caps, &t, 8, cap).unwrap();
+    let cfg = got.dsc.unwrap();
+    if got.depth != otg::ColorDepth::Bpc8
+        || got.ycbcr420
+        || got.frl.map(FrlRate::code) != Some(3)
+        || (cfg.slices_h, cfg.slices_v, cfg.bpp_x16) != (8, 40, 159)
+        || cfg.frl
+            != Some(FrlDscLink {
+                all_bpp: false,
+                max_rate: 6,
+            })
+    {
+        panic!("8K60 FRL DSC: {got:?}");
+    }
+    let quiet = frl_audio(None, t.v_active);
+    let dsc = FrlDscStream {
+        cfg,
+        vic: crate::amdgpu_dsc::Vic { cta: 199, hdmi: 0 },
+    };
+    // The trained link's encoder parameters: from 4 x 6G up the same
+    // primary-format targets; below it the tribyte borrow is too large.
+    for code in 3..=6 {
+        assert_eq!(
+            frl_video_params(&t, 8, false, Some(dsc), FrlRate::new(code).unwrap(), quiet),
+            Some((1, FrlBorrow::FromBlank, 3182, 140)),
+            "rate {code}"
+        );
+    }
+    assert!(frl_dsc_carries(&t, dsc, FrlRate::new(2).unwrap(), quiet).is_none());
+    // The 4K120 CTA mode fits the link raw: uncompressed, even so.
+    let uhd120 = crate::amdgpu_dcn_display::timing_from_edid(
+        &narf_edid::modes::cea_mode(118).unwrap().detailed(),
+    )
+    .unwrap();
+    let raw = stream(caps, &uhd120, 8, cap).unwrap();
+    // Deeper output compresses in Linux; the native path takes 8 bpc RGB,
+    // so a 10-bpc request compresses at 8 bpc.
+    let deep = HdmiCaps { dc30: true, ..caps };
+    let no_rate = HdmiCaps {
+        dsc: Some(HdmiDscCaps {
+            max_frl_rate: 0,
+            ..want
+        }),
+        ..caps
+    };
+    let no_dsc = HdmiCaps { dsc: None, ..caps };
+    let also_420 = HdmiCaps {
+        y420_also: [0, 0, 0, 1 << (199 - 192)],
+        ..caps
+    };
+    let slow = HdmiCaps {
+        max_frl_rate: 2,
+        ..caps
+    };
+    let results = (
+        raw.dsc,
+        raw.frl.map(FrlRate::code),
+        stream(deep, &t, 10, cap).map(|s| (s.depth, s.dsc.is_some())),
+        stream(no_rate, &t, 8, cap),
+        stream(no_dsc, &t, 8, cap),
+        stream(also_420, &t, 8, cap).map(|s| (s.ycbcr420, s.dsc.is_some())),
+        stream(
+            HdmiCaps {
+                dsc: None,
+                ..also_420
+            },
+            &t,
+            8,
+            cap,
+        )
+        .map(|s| (s.ycbcr420, s.dsc.is_some(), s.frl.map(FrlRate::code))),
+        stream(slow, &t, 8, frl_cap(slow)),
+    );
+    set_frl(false);
+    let off = stream(caps, &t, 8, frl_cap(caps));
+    set_frl(enabled);
+    assert_eq!(results.0, None);
+    assert_eq!(results.1, Some(4));
+    assert_eq!(results.2, Some((otg::ColorDepth::Bpc8, true)));
+    // No DSC rate (update_dsc_caps) or decoder: 8K60 RGB does not fit.
+    assert_eq!(results.3, None);
+    assert_eq!(results.4, None);
+    // RGB is tried (and compressed) before 4:2:0, as Linux orders them;
+    // without a decoder the 4:2:0 stream is carried raw.
+    assert_eq!(results.5, Some((false, true)));
+    assert_eq!(results.6, Some((true, false, Some(4))));
+    // A 3 x 6G sink: the DSC stream fails its capacity check at the cap.
+    assert_eq!(results.7, None);
+    assert_eq!(off, None);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_hdmi_frl_dsc_policy_matches_linux
+);
+
+/// A compressed FRL selection: the configuration's one FRL display keeps
+/// the HF decoder for `refine_dsc`, stages an FRL timing with its DSC, and
+/// DML admits it on two pipes (DSC per ODM segment).
+fn navi48_hdmi_frl_dsc_selection_admits_on_two_pipes() -> TestResult {
+    let vdb: &[u8] = &[2 << 5 | 1, 199];
+    let edid = with_blocks(edid_1080p(), &[VSDB, HF_DSC, vdb]);
+    let paths = [path(inventory::Connector::HdmiTypeA, 0)];
+    let t = cta8k60();
+    let enabled = frl_enabled();
+    set_frl(true);
+    let chosen = select(&paths, &[port(paths[0], None, edid)], 8, Some(t));
+    set_frl(enabled);
+    let mut s = chosen.unwrap();
+    let cfg = s.dsc.unwrap();
+    if s.timing != t
+        || s.frl.map(FrlRate::code) != Some(3)
+        || s.caps.dsc.is_none_or(|c| !c.is_frl)
+        || s.avi.vic != 199
+        || FrlDscStream::of(&s).map(|d| d.vic.cta_equivalent()) != Some(199)
+    {
+        panic!("FRL DSC selection: {s:?}");
+    }
+    let soc = dsc_soc();
+    let before = s;
+    refine_dsc(&soc, core::slice::from_mut(&mut s)).unwrap();
+    assert_eq!(s, before);
+    let plan = admit_displays(&soc, &[s]).unwrap()[0];
+    assert_eq!(plan.pipes, 2);
+    assert_eq!(
+        plan.mode.dsc,
+        Some(dml::Dsc {
+            slices: cfg.slices_h,
+            bpp_x16: cfg.bpp_x16
+        })
+    );
+    let r = timing_request(0, &plan, &s);
+    assert_eq!((r.signal, r.dsc), (otg::Signal::HdmiFrl, Some(cfg)));
+    // A board whose DISPCLK cannot split 8K across two pipes refuses it.
+    let small = dml::Soc {
+        dispclk_max_khz: 1_000_000,
+        ..soc
+    };
+    assert_eq!(
+        refine_dsc(&small, core::slice::from_mut(&mut s)),
+        Err(ModesetError::Link)
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_hdmi_frl_dsc_selection_admits_on_two_pipes
 );

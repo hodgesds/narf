@@ -88,6 +88,7 @@ fn dcn30_dsc_odm_halves_and_register_image() -> TestResult {
         linebuf_depth: 13,
         version_minor: 2,
         ycbcr422_simple: false,
+        frl: None,
     };
     let (Ok(whole), Ok(odm)) = (plan(&uhd(), &cfg, false), plan(&uhd(), &cfg, true)) else {
         return TestResult::Fail("plans refused");

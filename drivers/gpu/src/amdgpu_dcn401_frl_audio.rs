@@ -2,8 +2,7 @@
 //! Linux: hpo_enc401_setup_hdmi_audio + afmt3_setup_hdmi_audio. AFMT4 has
 //! no DIO AFMT_CNTL clock; afmt3 clears MEM_PWR_FORCE during source setup.
 use super::*;
-use crate::amdgpu_frl_cap::{FrlBorrow, FrlCap};
-use crate::amdgpu_navi48_boot::{frl_audio, frl_carries, FrlRate};
+use crate::amdgpu_navi48_boot::{frl_audio, frl_video_params, FrlDscStream, FrlRate};
 
 const FRL_ACR: u64 = 0x8e2;
 const FRL_INFO: u64 = 0x8e3;
@@ -64,22 +63,32 @@ impl<I: Io> Engine<I> {
             ColorDepth::Bpc10 => 10,
             ColorDepth::Bpc12 => 12,
         };
-        let Some(FrlCap::Ok {
-            audio_packets_line,
-            borrow,
-        }) = frl_carries(
+        // A compressed stream's budget is the compressed check's (which
+        // already reserves 192 kHz), with its decided-link borrow mode.
+        let dsc = blank
+            .timing
+            .request
+            .dsc
+            .filter(|c| c.frl.is_some())
+            .map(|cfg| FrlDscStream {
+                cfg,
+                vic: crate::amdgpu_dsc::Vic {
+                    cta: v.request.avi.vic,
+                    hdmi: v.request.avi.hdmi_vic,
+                },
+            });
+        let Some(params) = frl_video_params(
             &t,
             bpc,
             blank.request.ycbcr420,
+            dsc,
             rate,
             frl_audio(Some(info), t.v_active),
-        )
-        else {
+        ) else {
             return Err(Error::Unsupported);
         };
-        if audio_packets_line != u32::from(v.request.audio_packets_line)
-            || (borrow == FrlBorrow::FromBlank) != v.request.borrow_from_blank
-        {
+        let r = v.request;
+        if params != (r.audio_packets_line, r.borrow, r.hc_active, r.hc_blank) {
             return Err(Error::Invalid);
         }
         Ok(())
@@ -111,7 +120,12 @@ impl<I: Io> Engine<I> {
             (FRL_INFO, 0x7fff_7000, 2 << 16 | 0x1000),
             (FRL_MEM, 0x30, 0),
             (0x8e1, 0x1f, u32::from(v.request.audio_packets_line)),
-            (0x908, 3, if v.request.borrow_from_blank { 2 } else { 0 }),
+            (0x908, 3, v.request.borrow as u32),
+            (
+                0x901,
+                u32::MAX,
+                u32::from(v.request.hc_active) | u32::from(v.request.hc_blank) << 16,
+            ),
         ] {
             let at = self.frl_at(reg);
             if self.read(at)? & mask != value {

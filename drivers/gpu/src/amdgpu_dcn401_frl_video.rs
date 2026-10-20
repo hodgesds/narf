@@ -4,18 +4,26 @@
 //! line, general control, audio InfoFrame line), the AVI (and HDMI 1.4b
 //! vendor) InfoFrame in VPG4 (hpo_enc401_update_hdmi_info_packets),
 //! hpo_enc401_enable from the OTG, the timing running, hpo_enc401_unblank.
+//! A compressed (DSC) timing is compressed between the stream attribute and
+//! the InfoFrames, as link_set_dsc_on_stream runs after FRL training: the
+//! pipe's DSC engines, hpo_enc401_hdmi_set_dsc_config (HDMI_DSC_MODE, the
+//! FIFO's compressed format, the CVTEM PPS in generic packets 5-10) and the
+//! OPTC's DSC mode; the stream attribute then zeroes the GCP depth.
 //! RGB or YCbCr black until a scanout takes over. The HDMISTREAMCLK half is the
 //! clock owner's; this owner requires and rechecks it. Stop is Linux's
-//! AVMUTE, hpo_enc401_blank and hpo_enc401_stop_hdmi_info_packets.
+//! AVMUTE, hpo_enc401_blank and hpo_enc401_stop_hdmi_info_packets; a DSC
+//! stays until the timing retires (`stop_dsc`).
 use super::*;
 use crate::amdgpu_dcn401_otg::hdmi_link::{avi_infoframe_in, vendor_infoframe};
 use crate::amdgpu_dcn_inventory::Path;
+use crate::amdgpu_frl_cap::FrlBorrow;
 
 const PIXEL_FORMAT: u64 = 0x8e0;
 const PACKET_CONTROL: u64 = 0x8e1;
 const VBI_PACKET_CONTROL1: u64 = 0x8e3;
 const GC_CONTROL: u64 = 0x8e5;
 const GENERIC_CONTROL0: u64 = 0x8e6;
+const GENERIC_CONTROL1: u64 = 0x8e7;
 const GENERIC_LINE0_1: u64 = 0x8e9;
 const H_ACTIVE_BLANK: u64 = 0x900;
 const HC_ACTIVE_BLANK: u64 = 0x901;
@@ -37,9 +45,78 @@ const STREAM_CLOCK: u64 = 0x59;
 pub struct FrlVideoRequest {
     pub pipe: u8,
     pub audio_packets_line: u8,
-    /// FRL_BORROW_MODE_FROM_BLANK rather than none.
-    pub borrow_from_blank: bool,
+    /// HDMI_BORROW_MODE: the capacity check's, or for a DSC stream the
+    /// decided link's (update_borrow_mode_from_dsc_padding).
+    pub borrow: FrlBorrow,
+    /// HDMI_HC_ACTIVE/HDMI_HC_BLANK: the compressed check's tribyte
+    /// targets; zero for an uncompressed stream.
+    pub hc_active: u16,
+    pub hc_blank: u16,
     pub avi: Avi,
+}
+
+/// hpo_enc401_hdmi_set_dsc_config's CVTEM (HDMI 2.1 compressed video
+/// transport EMP) for a PPS, as the generic packets it writes in order:
+/// packet 5 (first, New), 6-9, 10 (last), then 5 again with New cleared.
+/// Linux fills one packet buffer throughout, so later packets keep bytes the
+/// earlier ones left (packet 10's from packet 9, the second packet 5's from
+/// packet 10); this keeps them. With no DSC padding (enable_hblank_borrow
+/// off) Hback is the timing's back porch and HCactive_bytes covers each
+/// slice's ceil(slice width x bpp / 8).
+pub(crate) fn cvtem_packets(
+    t: &crate::amdgpu_dml::Timing,
+    cfg: &crate::amdgpu_dsc::DscConfig,
+    pps: &[u8; 128],
+) -> [(u32, [u8; 36]); 7] {
+    let slices = cfg.slices_h;
+    let pic_width = t.h_active;
+    let h_back = t.h_total - pic_width - t.h_sync_width - t.h_front_porch;
+    let hc_bytes = slices * (pic_width / slices * cfg.bpp_x16).div_ceil(128);
+    // [hb0, hb1, hb2, hb3, sb0..sb31].
+    let mut p = [0u8; 36];
+    let mut out = [(0, [0u8; 36]); 7];
+    let sb = 4;
+    p[0] = 0x7f;
+    p[1] = 0x80;
+    p[2] = 0;
+    // Sync, VFR and New; Organization_ID 1 (VESA); Data_Set_Tag 2;
+    // Data_Set_Length 136.
+    p[sb] = 1 << 1 | 1 << 2 | 1 << 7;
+    p[sb + 2] = 1;
+    p[sb + 4] = 2;
+    p[sb + 6] = 136;
+    p[sb + 7..sb + 28].copy_from_slice(&pps[..21]);
+    out[0] = (5, p);
+    p[1] = 0;
+    for i in 1..4 {
+        p[2] = i as u8;
+        p[sb..sb + 28].copy_from_slice(&pps[21 + 28 * (i - 1)..21 + 28 * i]);
+        out[i] = (5 + i as u32, p);
+    }
+    p[2] = 4;
+    p[sb..sb + 23].copy_from_slice(&pps[105..128]);
+    p[sb + 23] = t.h_front_porch as u8;
+    p[sb + 24] = (t.h_front_porch >> 8) as u8;
+    p[sb + 25] = t.h_sync_width as u8;
+    p[sb + 26] = (t.h_sync_width >> 8) as u8;
+    p[sb + 27] = h_back as u8;
+    out[4] = (9, p);
+    p[1] = 1 << 6;
+    p[2] = 5;
+    p[sb] = (h_back >> 8) as u8;
+    p[sb + 1] = hc_bytes as u8;
+    p[sb + 2] = (hc_bytes >> 8) as u8;
+    out[5] = (10, p);
+    p[0] = 0x7f;
+    p[1] = 0x80;
+    p[2] = 0;
+    p[sb] = 1 << 1 | 1 << 2;
+    p[sb + 2] = 1;
+    p[sb + 4] = 2;
+    p[sb + 6] = 136;
+    p[sb + 7..sb + 28].copy_from_slice(&pps[..21]);
+    out[6] = (5, p);
+    out
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrlVideoRunning {
@@ -69,11 +146,13 @@ impl<I: Io> Engine<I> {
     }
     /// hpo_enc401_set_hdmi_stream_attribute and set_dsc_config(NULL):
     /// uncompressed RGB or 4:2:0. The DTO keeps the full pixel rate;
-    /// subsampled active/blank widths count pixel pairs in the encoder.
+    /// subsampled active/blank widths count pixel pairs in the encoder. A
+    /// compressed stream's GCP carries no depth.
     fn frl_format_registers(blank: BlankApplied) -> [(u64, u32, u32); 3] {
         let t = blank.timing.request.timing;
         let y420 = u32::from(blank.request.ycbcr420);
         let (depth, deep) = match blank.request.depth {
+            _ if blank.timing.request.dsc.is_some() => (0, 0),
             ColorDepth::Bpc8 => (0, 0),
             ColorDepth::Bpc10 => (1, 1),
             ColorDepth::Bpc12 => (2, 1),
@@ -88,14 +167,58 @@ impl<I: Io> Engine<I> {
             ),
         ]
     }
+    /// hpo_enc401_hdmi_set_dsc_config's fields: the FIFO's pixel encoding
+    /// type (compressed) and compressed format (4:4:4), and HDMI_DSC_MODE
+    /// (OPTC_DSC_ENABLED_444); all zero uncompressed.
+    fn frl_dsc_fields(blank: BlankApplied) -> [(u64, u32, u32); 2] {
+        let dsc = blank.timing.request.dsc.is_some();
+        [
+            (FIFO, 0x10100, if dsc { 0x100 } else { 0 }),
+            (PIXEL_FORMAT, 0x300_0000, if dsc { 1 << 24 } else { 0 }),
+        ]
+    }
+    /// The stream attribute and DSC fields as the running stream has them,
+    /// and for a DSC stream generic packets 5-10 sent every frame on line 2.
     fn frl_verify_format(&mut self, blank: BlankApplied) -> Result<(), Error> {
+        let dsc = Self::frl_dsc_fields(blank);
         for (reg, mask, value) in Self::frl_format_registers(blank) {
+            let (dsc_mask, dsc_value) = dsc
+                .iter()
+                .find(|d| d.0 == reg)
+                .map_or((0, 0), |d| (d.1, d.2));
             let at = self.frl_at(reg);
-            if self.read(at)? & mask != value {
+            if self.read(at)? & mask != (value & !dsc_mask) | dsc_value {
                 return Err(Error::Readback(at));
             }
         }
+        if blank.timing.request.dsc.is_some() {
+            for index in 5..=10 {
+                for (at, mask, value) in self.frl_packet_controls(index) {
+                    if self.read(at)? & mask != value {
+                        return Err(Error::Readback(at));
+                    }
+                }
+            }
+        }
         Ok(())
+    }
+    /// A generic packet's SEND/CONT pair and its line (2) register field.
+    fn frl_packet_controls(&self, index: u32) -> [(u64, u32, u32); 2] {
+        let control = if index < 8 {
+            GENERIC_CONTROL0
+        } else {
+            GENERIC_CONTROL1
+        };
+        let send = 3 << (4 * (index % 8));
+        let line = 16 * (index % 2);
+        [
+            (self.frl_at(control), send, send),
+            (
+                self.frl_at(GENERIC_LINE0_1 + u64::from(index / 2)),
+                0x7fff << line,
+                2 << line,
+            ),
+        ]
     }
     /// Program the uncompressed format and capacity-check borrow parameters.
     fn frl_stream_attribute(
@@ -106,17 +229,17 @@ impl<I: Io> Engine<I> {
         for (reg, mask, value) in Self::frl_format_registers(blank) {
             self.update(self.frl_at(reg), mask, value)?;
         }
-        self.update(
-            self.frl_at(MODE),
-            3,
-            if request.borrow_from_blank { 2 } else { 0 },
-        )?;
+        self.update(self.frl_at(MODE), 3, request.borrow as u32)?;
         self.update(
             self.frl_at(PACKET_CONTROL),
             0x1f,
             u32::from(request.audio_packets_line),
         )?;
-        self.update(self.frl_at(HC_ACTIVE_BLANK), u32::MAX, 0)?;
+        self.update(
+            self.frl_at(HC_ACTIVE_BLANK),
+            u32::MAX,
+            u32::from(request.hc_active) | u32::from(request.hc_blank) << 16,
+        )?;
         // General control every frame, no ACP, the audio InfoFrame sent and
         // latched now, on line 2; AVMUTE off.
         self.update(self.frl_at(VBI_PACKET_CONTROL1), 0x1103, 0x1003)?;
@@ -129,6 +252,41 @@ impl<I: Io> Engine<I> {
         self.update(self.frl_at(VBI_PACKET_CONTROL1), 0x7fff_0000, 2 << 16)?;
         self.update(self.frl_at(GC_CONTROL), 1, 0)
     }
+    /// vpg31_poweron.
+    async fn frl_vpg_on(&mut self) -> Result<(), Error> {
+        if self.read(self.frl_at(VPG_MEM_PWR))? & 0x100 != 0 {
+            self.update(self.frl_at(VPG_MEM_PWR), 0x11, 1)?;
+            self.wait(self.frl_at(VPG_MEM_PWR), 0x100, 0, 1000).await?;
+        }
+        Ok(())
+    }
+    /// hpo_enc401_update_hdmi_info_packet for a valid packet: VPG4's
+    /// generic packet `index` written and latched immediately
+    /// (vpg3_update_generic_info_packet), then sent every frame on line 2.
+    async fn frl_vpg_packet(&mut self, index: u32, packet: &[u8; 36]) -> Result<(), Error> {
+        let base = self.layout.mpc_base;
+        self.wait(self.frl_at(VPG_STATUS), 2, 0, 500).await?;
+        self.access(|io| {
+            let at = |r: u64| base + r * 4;
+            let status = checked(io.read(at(VPG_STATUS)))?;
+            io.write(at(VPG_STATUS), status | 0x10);
+            let access = checked(io.read(at(VPG_ACCESS)))?;
+            io.write(at(VPG_ACCESS), (access & !0xff) | (index * 9));
+            for word in packet.chunks_exact(4) {
+                io.write(
+                    at(VPG_DATA),
+                    u32::from_le_bytes([word[0], word[1], word[2], word[3]]),
+                );
+            }
+            let immediate = checked(io.read(at(VPG_IMMEDIATE)))?;
+            io.write(at(VPG_IMMEDIATE), immediate | 1 << index);
+            Ok(())
+        })?;
+        for (at, mask, value) in self.frl_packet_controls(index) {
+            self.update(at, mask, value)?;
+        }
+        Ok(())
+    }
     /// vpg31_poweron, then the AVI InfoFrame in generic packet 0 and, for
     /// an HDMI VIC, the vendor InfoFrame in 1: each written at its index,
     /// latched immediately, sent every frame on line 2.
@@ -137,10 +295,7 @@ impl<I: Io> Engine<I> {
         request: FrlVideoRequest,
         blank: BlankApplied,
     ) -> Result<(), Error> {
-        if self.read(self.frl_at(VPG_MEM_PWR))? & 0x100 != 0 {
-            self.update(self.frl_at(VPG_MEM_PWR), 0x11, 1)?;
-            self.wait(self.frl_at(VPG_MEM_PWR), 0x100, 0, 1000).await?;
-        }
+        self.frl_vpg_on().await?;
         let t = blank.timing.request.timing;
         let avi = avi_infoframe_in(
             &t,
@@ -149,40 +304,47 @@ impl<I: Io> Engine<I> {
             blank.request.ycbcr420,
         );
         let vendor = vendor_infoframe(&t, request.avi);
-        let base = self.layout.mpc_base;
         for (index, packet) in [(0u32, Some(avi)), (1, vendor)] {
-            let Some(packet) = packet else {
-                continue;
-            };
-            self.wait(self.frl_at(VPG_STATUS), 2, 0, 500).await?;
-            self.access(|io| {
-                let at = |r: u64| base + r * 4;
-                let status = checked(io.read(at(VPG_STATUS)))?;
-                io.write(at(VPG_STATUS), status | 0x10);
-                let access = checked(io.read(at(VPG_ACCESS)))?;
-                io.write(at(VPG_ACCESS), (access & !0xff) | (index * 9));
-                for word in packet.chunks_exact(4) {
-                    io.write(
-                        at(VPG_DATA),
-                        u32::from_le_bytes([word[0], word[1], word[2], word[3]]),
-                    );
-                }
-                let immediate = checked(io.read(at(VPG_IMMEDIATE)))?;
-                io.write(at(VPG_IMMEDIATE), immediate | 1 << index);
-                Ok(())
-            })?;
-            self.update(
-                self.frl_at(GENERIC_CONTROL0),
-                3 << (4 * index),
-                3 << (4 * index),
-            )?;
-            self.update(
-                self.frl_at(GENERIC_LINE0_1),
-                0x7fff << (16 * index),
-                2 << (16 * index),
-            )?;
+            if let Some(packet) = packet {
+                self.frl_vpg_packet(index, &packet).await?;
+            }
         }
         Ok(())
+    }
+    /// link_set_dsc_on_stream(true) for a compressed FRL timing, after
+    /// training: each segment's DSC, hpo_enc401_hdmi_set_dsc_config (its
+    /// fields, then the CVTEM PPS), then the OPTC's DSC mode. An earlier
+    /// start's DSC on this stopped stream is turned off first.
+    async fn frl_dsc_start(&mut self, blank: BlankApplied) -> Result<(), Error> {
+        let request = blank.timing.request;
+        let Some(cfg) = request.dsc else {
+            return Ok(());
+        };
+        let plan = request.plan()?;
+        if self.status.frl_dsc == Some(request.pipe) {
+            for o in plan.opps() {
+                self.stop_dsc(o).await?;
+            }
+        }
+        self.start_dsc_engines(&request, &cfg).await?;
+        self.status.frl_dsc = Some(request.pipe);
+        for (reg, mask, value) in Self::frl_dsc_fields(blank) {
+            self.update(self.frl_at(reg), mask, value)?;
+        }
+        let regs = crate::amdgpu_dcn401_otg::dsc_hw::dsc_registers(&request, &cfg)?;
+        let pps = crate::amdgpu_dsc::pack_pps(&regs.pps);
+        self.frl_vpg_on().await?;
+        for (index, packet) in cvtem_packets(&request.timing, &cfg, &pps) {
+            self.frl_vpg_packet(index, &packet).await?;
+        }
+        self.start_dsc_optc(&request, &cfg)
+    }
+    /// hpo_enc401_hdmi_set_dsc_config(NULL): the FIFO's compressed fields
+    /// and HDMI_DSC_MODE off (the generic packets are stopped with the
+    /// video).
+    pub(in crate::amdgpu_dcn401_otg) fn frl_dsc_off(&mut self) -> Result<(), Error> {
+        self.update(self.frl_at(FIFO), 0x10100, 0)?;
+        self.update(self.frl_at(PIXEL_FORMAT), 0x300_0000, 0)
     }
     /// hpo_enc401_enable from OTG `pipe`.
     async fn frl_stream_enable(&mut self, pipe: u8) -> Result<(), Error> {
@@ -213,6 +375,7 @@ impl<I: Io> Engine<I> {
     ) -> Result<FrlVideoRunning, Error> {
         let timeout = blank.timeout_us()?;
         self.frl_stream_attribute(request, blank)?;
+        self.frl_dsc_start(blank).await?;
         self.frl_infoframes(request, blank).await?;
         self.frl_stream_enable(request.pipe).await?;
         self.frl_video_verify(&link, blank, false)?;
@@ -245,7 +408,12 @@ impl<I: Io> Engine<I> {
         }
         let link = self.status.frl_link.ok_or(Error::Invalid)?;
         let pipe = request.pipe;
-        if link.path != path || pipe >= 4 || request.audio_packets_line > 0x1f {
+        if link.path != path
+            || pipe >= 4
+            || request.audio_packets_line > 0x1f
+            || request.hc_active > 0x7fff
+            || request.hc_blank > 0x7fff
+        {
             return Err(Error::Invalid);
         }
         let blank = self.status.blanks[usize::from(pipe)].ok_or(Error::Invalid)?;
@@ -269,6 +437,18 @@ impl<I: Io> Engine<I> {
             }
         }
         self.frl_video_verify(&link, blank, false)?;
+        // The native DSC compresses 8-bpc RGB (`dsc_hw::dsc_timing`).
+        if timing.dsc.is_some() && blank.request.depth != ColorDepth::Bpc8 {
+            return Err(Error::Unsupported);
+        }
+        // Tribyte targets and active borrowing belong to compressed streams.
+        if timing.dsc.is_none()
+            && (request.hc_active != 0
+                || request.hc_blank != 0
+                || request.borrow == FrlBorrow::FromActive)
+        {
+            return Err(Error::Invalid);
+        }
         self.status.state = State::StartingFrlVideo(pipe);
         match self.frl_video_start(link, request, blank).await {
             Ok(running) => {

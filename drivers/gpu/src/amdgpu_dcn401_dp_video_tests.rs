@@ -1023,6 +1023,7 @@ fn dcn401_dp_video_sends_dsc_pps_like_linux() -> TestResult {
         linebuf_depth: 11,
         version_minor: 2,
         ycbcr422_simple: false,
+        frl: None,
     };
     let (mut e, mut io, c) = fixture_dsc(2, stream, pipe, ColorDepth::Bpc8, None, Some(cfg));
     if e.io.fake().regs[&dio(stream, 0x211f)] & 1 != 1 {
@@ -1080,6 +1081,7 @@ fn dsc_audio_fixture(stream: u8, pipe: u8) -> (Engine<AudioIo>, Link) {
         linebuf_depth: 11,
         version_minor: 2,
         ycbcr422_simple: false,
+        frl: None,
     };
     let (mut e, mut io, c) = fixture_dsc(2, stream, pipe, ColorDepth::Bpc8, None, Some(cfg));
     start(&mut e, &mut io, c);

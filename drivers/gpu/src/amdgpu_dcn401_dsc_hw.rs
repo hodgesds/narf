@@ -1,11 +1,15 @@
 //! Native DCN401 Display Stream Compression on a pipe's own DSC (DSC n on
 //! OPP n; with ODM 2:1 each segment's OPP feeds its own DSC, which
 //! compresses half the line with half the slices), as Linux's
-//! link_set_dsc_on_stream drives it for DP SST (DIO or HPO):
+//! link_set_dsc_on_stream drives it for DP SST (DIO or HPO) and HDMI FRL:
 //! the DSC power domain (dcn32_dsc_pg_control), dsc_write_to_registers,
-//! dsc401_enable from the OPP, then optc2/3_set_dsc_config. Stop is the
-//! reverse: OPTC DSC off, dsc401_disconnect and dsc401_disable, the domain
-//! gated. DSCCLK is the clock owner's (dccg401_set_dto_dscclk).
+//! dsc401_enable from the OPP, then optc3_set_dsc_config (OTG_V_SYNC_MODE
+//! 1 on HDMI FRL). A DP timing compresses when staged; an FRL one after FRL
+//! training, with the HPO FRL encoder's DSC configuration between the
+//! engines and the OPTC (`start_dsc_engines`, `start_dsc_optc`). Stop is
+//! the reverse: OPTC DSC off (V_SYNC_MODE 0), the HPO FRL encoder's DSC
+//! mode off for an FRL timing, dsc401_disconnect and dsc401_disable, the
+//! domain gated. DSCCLK is the clock owner's (dccg401_set_dto_dscclk).
 use super::*;
 use crate::amdgpu_dsc::{self, DscConfig, DscRegisters, DscTiming, Encoding, PixelFormat};
 
@@ -26,6 +30,9 @@ const BYTES_PER_PIXEL: u64 = 0x1acd;
 const WIDTH_CONTROL: u64 = 0x1ace;
 /// DSC401's max_image_width.
 const MAX_IMAGE_WIDTH: u32 = 5184;
+/// OTG_V_SYNC_A_CNTL.OTG_V_SYNC_MODE.
+const V_SYNC_A_CNTL: u64 = 0x1b3a;
+const V_SYNC_MODE: u32 = 0x100;
 
 /// The DSC timing a DP RGB stream's DSC compresses.
 pub(super) fn dsc_timing(t: &Timing) -> DscTiming {
@@ -42,12 +49,16 @@ pub(super) fn dsc_timing(t: &Timing) -> DscTiming {
 
 /// dsc401_validate_stream plus this owner's shape: one DSC per ODM segment
 /// (at most four slices each, the slices split evenly) on an 8-bit RGB DP
-/// SST stream, 8b/10b (DIO) or 128b/132b (HPO). These are the whole
-/// picture's registers: the PPS the sink receives and the OPTC's bytes per
-/// pixel and slice width.
+/// SST stream, 8b/10b (DIO) or 128b/132b (HPO), or HDMI FRL stream. These
+/// are the whole picture's registers: the PPS the sink receives and the
+/// OPTC's bytes per pixel and slice width.
 pub(super) fn dsc_registers(request: &Request, cfg: &DscConfig) -> Result<DscRegisters, Error> {
     let segments = if request.odm.is_some() { 2 } else { 1 };
-    if !matches!(request.signal, Signal::DisplayPort | Signal::HpoDisplayPort)
+    let frl = request.signal == Signal::HdmiFrl;
+    if !matches!(
+        request.signal,
+        Signal::DisplayPort | Signal::HpoDisplayPort | Signal::HdmiFrl
+    ) || frl != cfg.frl.is_some()
         || request.ycbcr420
         || cfg.slices_h % segments != 0
         || cfg.slices_h > 4 * segments
@@ -223,7 +234,15 @@ impl<I: Io> Engine<I> {
         request: &Request,
         cfg: &DscConfig,
     ) -> Result<(), Error> {
-        let regs = dsc_registers(request, cfg)?;
+        self.start_dsc_engines(request, cfg).await?;
+        self.start_dsc_optc(request, cfg)
+    }
+    /// dsc_set_config and dsc_enable for each segment's DSC.
+    pub(super) async fn start_dsc_engines(
+        &mut self,
+        request: &Request,
+        cfg: &DscConfig,
+    ) -> Result<(), Error> {
         let segment = segment_registers(request, cfg)?;
         let pipe = request.pipe;
         // Each segment's DSC from its own OPP, the left one (this pipe's)
@@ -246,6 +265,18 @@ impl<I: Io> Engine<I> {
             self.update(self.dsc_at(dsc, TOP_CONTROL), 1, 1)?;
             self.update(self.dsc_forward_at(dsc), 0x71, 1 | u32::from(dsc) << 4)?;
         }
+        Ok(())
+    }
+    /// optc3_set_dsc_config(OPTC_DSC_ENABLED_444): the whole picture's bytes
+    /// per pixel and slice width; OTG_V_SYNC_MODE 1 on HDMI FRL (it stays 0
+    /// off FRL, where Linux writes 0).
+    pub(super) fn start_dsc_optc(
+        &mut self,
+        request: &Request,
+        cfg: &DscConfig,
+    ) -> Result<(), Error> {
+        let regs = dsc_registers(request, cfg)?;
+        let pipe = request.pipe;
         let l = self.layout;
         self.update(l.odm(pipe, FORMAT), 0x30, 1 << 4)?; // OPTC_DSC_ENABLED_444
         let bytes = l.odm(pipe, BYTES_PER_PIXEL);
@@ -261,7 +292,9 @@ impl<I: Io> Engine<I> {
             0x1fff_0000,
             regs.slice_width << 16,
         )?;
-        // optc3_set_dsc_config: V_SYNC_MODE stays 0 off HDMI FRL.
+        if request.signal == Signal::HdmiFrl {
+            self.update(l.otg(pipe, V_SYNC_A_CNTL), V_SYNC_MODE, V_SYNC_MODE)?;
+        }
         Ok(())
     }
     /// The running DSC as programmed for `request`.
@@ -298,6 +331,15 @@ impl<I: Io> Engine<I> {
                 0x1fff_0000,
                 regs.slice_width << 16,
             ),
+            (
+                l.otg(pipe, V_SYNC_A_CNTL),
+                V_SYNC_MODE,
+                if request.signal == Signal::HdmiFrl {
+                    V_SYNC_MODE
+                } else {
+                    0
+                },
+            ),
         ] {
             if self.read(at)? & mask != value {
                 return Err(Error::Readback(at));
@@ -305,9 +347,12 @@ impl<I: Io> Engine<I> {
         }
         Ok(())
     }
-    /// link_set_dsc_on_stream(false) for the pipe's own DSC: OPTC DSC off,
-    /// disconnect, disable, then power gating (dcn32_update_dsc_pg). A DSC
-    /// never enabled is left as it is.
+    /// link_set_dsc_on_stream(false) for the pipe's own DSC: OPTC DSC off
+    /// (and OTG_V_SYNC_MODE 0), for the FRL timing whose DSC this pipe
+    /// started the HPO FRL encoder's DSC mode off
+    /// (hpo_enc401_hdmi_set_dsc_config(NULL)), then disconnect, disable and
+    /// power gating (dcn32_update_dsc_pg). A DSC never enabled is left as it
+    /// is.
     pub(super) async fn stop_dsc(&mut self, pipe: u8) -> Result<(), Error> {
         let l = self.layout;
         let forward = self.read(self.dsc_forward_at(pipe))?;
@@ -320,6 +365,13 @@ impl<I: Io> Engine<I> {
             self.update(l.odm(pipe, FORMAT), 0x30, 0)?;
             self.update(l.odm(pipe, BYTES_PER_PIXEL), 0x7fff_ffff, 0)?;
             self.update(l.odm(pipe, WIDTH_CONTROL), 0x1fff_0000, 0)?;
+        }
+        if self.read(l.otg(pipe, V_SYNC_A_CNTL))? & V_SYNC_MODE != 0 {
+            self.update(l.otg(pipe, V_SYNC_A_CNTL), V_SYNC_MODE, 0)?;
+        }
+        if self.status.frl_dsc == Some(pipe) {
+            self.frl_dsc_off()?;
+            self.status.frl_dsc = None;
         }
         if forward & 1 == 0 && !clocked {
             return Ok(());

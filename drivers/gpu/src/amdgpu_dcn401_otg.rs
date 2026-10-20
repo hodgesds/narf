@@ -431,6 +431,11 @@ pub struct Status {
     pub frl_video_running: Option<FrlVideoRunning>,
     /// Owned AFMT4/ACR and Azalia endpoint; stop before FRL video/link.
     pub frl_audio: Option<DisplayAudio>,
+    /// The pipe whose staged HDMI FRL timing compresses: its DSC, the HPO
+    /// FRL encoder's DSC mode and CVTEM PPS and the OPTC's DSC mode were
+    /// programmed after FRL training (link_set_dsc_on_stream), as a DP
+    /// timing's are when staged. Cleared when that DSC is turned off.
+    pub frl_dsc: Option<u8>,
     /// The display whose MST link this one's stream rides (attached, not
     /// trained, by this display); its link record is a copy of theirs.
     pub mst_owner: Option<u8>,
@@ -484,6 +489,7 @@ impl Status {
             frl_link: None,
             frl_video_running: None,
             frl_audio: None,
+            frl_dsc: None,
             mst_owner: None,
             frl_disabled: None,
             retired: 0,
@@ -1198,11 +1204,16 @@ impl<I: Io> Engine<I> {
         let format = if plan.request.ycbcr420 { 2 } else { 0 };
         self.update(odm(FORMAT), 0x33, format)?;
         // link_set_dsc_on_stream: the pipe's DSC (any earlier one on this
-        // stopped pipe turned off first), then the OPTC's DSC mode.
+        // stopped pipe turned off first), then the OPTC's DSC mode. An HDMI
+        // FRL timing compresses only after FRL training, with its video.
         for o in plan.opps() {
             self.stop_dsc(o).await?;
         }
-        if let Some(cfg) = plan.request.dsc {
+        if let Some(cfg) = plan
+            .request
+            .dsc
+            .filter(|_| plan.request.signal != Signal::HdmiFrl)
+        {
             self.start_dsc(&plan.request, &cfg).await?;
         } else {
             for o in plan.opps() {

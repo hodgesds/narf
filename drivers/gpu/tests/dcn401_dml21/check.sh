@@ -34,7 +34,11 @@
 # 128b/132b encoder (DP2P0=1, dml2_dp2p0 as DC passes an HPO stream);
 # --regenerate-uhbr-dsc answers its inputs again. dsc_vectors.txt and
 # odm_dsc_vectors.txt are replayed with DP2P0=1 too: the port's plan does
-# not depend on the DP encoder.
+# not depend on the DP encoder. frl_dsc_vectors.txt holds the configurations
+# the native HDMI FRL DSC policy picks (8K60 VIC 199, 8K60 and 4K240
+# RBv2), every stream on an HDMI FRL encoder (HDMIFRL=1, dml2_hdmifrl);
+# --regenerate-frl-dsc answers its inputs again, and dsc_vectors.txt and
+# odm_dsc_vectors.txt are replayed with HDMIFRL=1 as well.
 # odm_ycbcr420_vectors.txt are checked as multi_vectors.txt, dsc_vectors.txt
 # and ycbcr420_vectors.txt; their streams need ODM 2:1 on most boards.
 # format_vectors.txt lines are "<bytes per pixel>" then a multi_vectors.txt
@@ -56,6 +60,9 @@ elif [ "${1:-}" = --regenerate-uhbr-dsc ]; then
 	shift
 elif [ "${1:-}" = --generate-format ]; then
 	generate_format=1
+	shift
+elif [ "${1:-}" = --regenerate-frl-dsc ]; then
+	generate_dsc=3
 	shift
 fi
 linux=${1:-/usr/src/linux}
@@ -126,6 +133,16 @@ if [ $generate_dsc -eq 1 ]; then
 		grep -v '^#' "$here/multi_vectors.txt" | sed 's/ [=!].*//'
 	} | awk 'BEGIN { split("1 2 4 3 8 1 2 4", sl); split("128 192 256 160 96 200 144 120 240", bpp) }
 		{ print sl[NR % 8 + 1], bpp[NR % 9 + 1], $0 }' | dsc_lines
+	exit 0
+fi
+if [ $generate_dsc -eq 3 ]; then
+	# frl_dsc_vectors.txt likewise, every stream on an HDMI FRL encoder.
+	while IFS= read -r line; do
+		case $line in
+		''|'#'*) echo "$line" ;;
+		*) echo "${line%% [=!]*}" | dsc_lines HDMIFRL=1 ;;
+		esac
+	done < "$here/frl_dsc_vectors.txt"
 	exit 0
 fi
 if [ $generate_dsc -eq 2 ]; then
@@ -353,4 +370,12 @@ check_multi "$here/dsc_vectors.txt" DSC DP2P0=1 || mfail=1
 check_multi "$here/odm_dsc_vectors.txt" DSC DP2P0=1 || mfail=1
 check_multi "$here/uhbr_dsc_vectors.txt" DSC DP2P0=1 || mfail=1
 check_multi "$here/format_vectors.txt" FORMAT || mfail=1
+# DC passes an HDMI FRL stream as dml2_hdmifrl; for a 4:4:4 DSC stream DML's
+# DSC delays and plan do not depend on it either. DCN401 has one HDMI FRL
+# output (NumberOfHDMIFRLSupport), so only the single-stream lines replay.
+for f in dsc_vectors odm_dsc_vectors; do
+	awk '/^#/ || $12 == 1' "$here/$f.txt" > "$work/${f}_single.txt"
+	check_multi "$work/${f}_single.txt" DSC HDMIFRL=1 || mfail=1
+done
+check_multi "$here/frl_dsc_vectors.txt" DSC HDMIFRL=1 || mfail=1
 [ $fail -eq 0 ] && [ $mfail -eq 0 ]

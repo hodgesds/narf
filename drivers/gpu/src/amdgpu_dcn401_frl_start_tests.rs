@@ -5,6 +5,8 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU8, Ordering};
 #[path = "amdgpu_dcn401_frl_audio_tests.rs"]
 mod audio;
+#[path = "amdgpu_dcn401_frl_dsc_tests.rs"]
+mod dsc;
 
 /// The firmware's half of an FRL link as the registers show it: ENABLE
 /// brings up the lanes and TX clocks, routes the PHY to the HPO FRL
@@ -249,6 +251,15 @@ fn prepared_frl_video_rate(
     depth: ColorDepth,
     rate: crate::amdgpu_navi48_boot::FrlRate,
 ) -> (Engine<FrlIo>, Fw, FrlVideoRequest, dccg::Applied) {
+    prepared_frl_video_dsc(ycbcr420, depth, rate, None)
+}
+/// An FRL link trained and a pipe-1 timing staged, compressed by `dsc`.
+fn prepared_frl_video_dsc(
+    ycbcr420: bool,
+    depth: ColorDepth,
+    rate: crate::amdgpu_navi48_boot::FrlRate,
+    dsc: Option<crate::amdgpu_dsc::DscConfig>,
+) -> (Engine<FrlIo>, Fw, FrlVideoRequest, dccg::Applied) {
     let (phy, pipe) = (2u8, 1u8);
     let event = Arc::new(AtomicU8::new(0));
     let mut e = engine();
@@ -276,6 +287,7 @@ fn prepared_frl_video_rate(
     let mut req = request(pipe);
     req.signal = Signal::HdmiFrl;
     req.ycbcr420 = ycbcr420;
+    req.dsc = dsc;
     let c = clock(req);
     run(e.prepare(req, c)).unwrap();
     e.io.inner.retiring = [false; 4];
@@ -303,7 +315,9 @@ fn prepared_frl_video_rate(
     let request = FrlVideoRequest {
         pipe,
         audio_packets_line: 1,
-        borrow_from_blank: true,
+        borrow: crate::amdgpu_frl_cap::FrlBorrow::FromBlank,
+        hc_active: 0,
+        hc_blank: 0,
         avi: Avi {
             vic: 16,
             ..Avi::default()

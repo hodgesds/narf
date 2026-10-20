@@ -1,6 +1,6 @@
 use super::*;
 use crate::amdgpu_dcn401_otg::tests::hdmi_link as hdmi;
-use crate::amdgpu_frl_cap::{FrlBorrow, FrlCap};
+use crate::amdgpu_frl_cap::FrlCap;
 use crate::amdgpu_navi48_boot::{frl_audio, frl_carries, FrlRate};
 
 struct AudioIo {
@@ -69,12 +69,13 @@ fn fixture(rate: u8, y420: bool, depth: ColorDepth) -> (Engine<AudioIo>, Fw) {
     let Some(FrlCap::Ok {
         audio_packets_line,
         borrow,
+        ..
     }) = frl_carries(&t, bpc, y420, rate, frl_audio(Some(a), t.v_active))
     else {
         panic!("fixture FRL bandwidth");
     };
     request.audio_packets_line = audio_packets_line as u8;
-    request.borrow_from_blank = borrow == FrlBorrow::FromBlank;
+    request.borrow = borrow;
     run(e.start_frl_video(path(2), request, clock)).unwrap();
     (
         Engine {

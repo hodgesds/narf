@@ -62,7 +62,8 @@ pub struct Selection {
     /// DP link settings; unused (zero lanes) for HDMI.
     pub lanes: u8,
     pub rate: DpRate,
-    /// The DP sink's usable links; `DpCaps::NONE` for HDMI.
+    /// The DP sink's usable links; `DpCaps::NONE` for HDMI, with the HF DSC
+    /// decoder (`DscSinkCaps::from_hdmi`) of a compressed FRL stream.
     pub caps: DpCaps,
     /// The sink's base EDID block, reported to DRM verbatim.
     pub edid: [u8; 128],
@@ -433,8 +434,179 @@ pub fn frl_carries(
             FrlEncoding::Rgb444
         },
         audio,
+        dsc: None,
     });
     matches!(check, FrlCap::Ok { .. }).then_some(check)
+}
+
+/// A compressed HDMI FRL stream: its DSC configuration and VICs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrlDscStream {
+    pub cfg: crate::amdgpu_dsc::DscConfig,
+    pub vic: crate::amdgpu_dsc::Vic,
+}
+impl FrlDscStream {
+    /// A selection's compressed FRL stream.
+    pub fn of(s: &Selection) -> Option<Self> {
+        let cfg = s.dsc.filter(|c| c.frl.is_some())?;
+        s.frl?;
+        Some(Self {
+            cfg,
+            vic: crate::amdgpu_dsc::Vic {
+                cta: s.avi.vic,
+                hdmi: s.avi.hdmi_vic,
+            },
+        })
+    }
+}
+
+/// frl_validate_mode_timing for a DSC stream (8-bpc RGB): Linux's
+/// compressed capacity check (hpo_enc3_validate_hdmi_frl_output) with no
+/// raw bandwidth bound, at the sink's DSC_Max_FRL_Rate when `rate` is
+/// faster.
+pub fn frl_dsc_carries(
+    t: &Timing,
+    dsc: FrlDscStream,
+    rate: FrlRate,
+    audio: crate::amdgpu_frl_cap::FrlAudio,
+) -> Option<crate::amdgpu_frl_cap::FrlCap> {
+    use crate::amdgpu_frl_cap::{frl_cap_check, FrlCap, FrlCapInput, FrlDsc, FrlEncoding};
+    let link = dsc.cfg.frl?;
+    let h_blank = t.h_total.checked_sub(t.h_active)?;
+    if t.pixel_clock_khz == 0 || t.h_active == 0 || h_blank == 0 || dsc.cfg.slices_h == 0 {
+        return None;
+    }
+    let checked = if rate.code() > link.max_rate {
+        FrlRate::new(link.max_rate)?
+    } else {
+        rate
+    };
+    let check = frl_cap_check(&FrlCapInput {
+        lanes: checked.lanes(),
+        gbps: checked.gbps(),
+        pixel_clock_100hz: t.pixel_clock_khz.checked_mul(10)?,
+        h_active: t.h_active,
+        h_blank,
+        bpc: 8,
+        encoding: FrlEncoding::Rgb444,
+        audio,
+        dsc: Some(FrlDsc {
+            slices: dsc.cfg.slices_h,
+            slice_width: t.h_active.div_ceil(dsc.cfg.slices_h),
+            bpp_x16: dsc.cfg.bpp_x16,
+            vic: dsc.vic.cta_equivalent(),
+            all_bpp: link.all_bpp,
+        }),
+    });
+    matches!(check, FrlCap::Ok { .. }).then_some(check)
+}
+
+/// hdmi_frl_decide_link_settings for a DSC stream: validated at the cap,
+/// then the lowest rate code from 3 x 3G up that carries it.
+pub fn frl_dsc_link(
+    t: &Timing,
+    dsc: FrlDscStream,
+    cap: FrlRate,
+    audio: crate::amdgpu_frl_cap::FrlAudio,
+) -> Option<FrlRate> {
+    frl_dsc_carries(t, dsc, cap, audio)?;
+    (1..=cap.code())
+        .filter_map(FrlRate::new)
+        .find(|&r| frl_dsc_carries(t, dsc, r, audio).is_some())
+}
+
+/// What the HPO FRL stream encoder takes for a stream on `rate`: packets
+/// per line, borrow mode and HCactive/HCblank. Uncompressed, Linux's
+/// capacity check's (no tribyte targets); compressed, its compressed check
+/// with the borrow mode update_borrow_mode_from_dsc_padding gives `rate`.
+pub fn frl_video_params(
+    t: &Timing,
+    bpc: u8,
+    ycbcr420: bool,
+    dsc: Option<FrlDscStream>,
+    rate: FrlRate,
+    audio: crate::amdgpu_frl_cap::FrlAudio,
+) -> Option<(u8, crate::amdgpu_frl_cap::FrlBorrow, u16, u16)> {
+    use crate::amdgpu_frl_cap::{dsc_borrow, FrlCap};
+    let check = match dsc {
+        Some(d) => frl_dsc_carries(t, d, rate, audio)?,
+        None => frl_carries(t, bpc, ycbcr420, rate, audio)?,
+    };
+    let FrlCap::Ok {
+        audio_packets_line,
+        mut borrow,
+        hc_active,
+        hc_blank,
+    } = check
+    else {
+        return None;
+    };
+    if dsc.is_some() {
+        borrow = dsc_borrow(
+            t.pixel_clock_khz * 10,
+            t.h_active,
+            t.h_total - t.h_active,
+            hc_active,
+            hc_blank,
+            rate.lanes(),
+            rate.gbps(),
+        );
+    }
+    Some((
+        u8::try_from(audio_packets_line).ok()?,
+        borrow,
+        u16::try_from(hc_active).ok()?,
+        u16::try_from(hc_blank).ok()?,
+    ))
+}
+
+/// The DSC view of an 8-bpc RGB HDMI FRL stream.
+fn frl_dsc_timing(t: &Timing) -> crate::amdgpu_dsc::DscTiming {
+    dsc_timing(t)
+}
+
+/// update_dsc_caps for an HDMI FRL sink: its HF DSC decoder
+/// (dc_dsc_parse_dsc_edid) only with FRL and a DSC_Max_FRL_Rate.
+pub fn frl_dsc_caps(caps: HdmiCaps) -> Option<(crate::amdgpu_dsc::DscSinkCaps, u8)> {
+    let dsc = caps.dsc?;
+    (frl_cap(caps).is_some() && dsc.max_frl_rate > 0).then(|| {
+        (
+            crate::amdgpu_dsc::DscSinkCaps::from_hdmi(&dsc),
+            dsc.max_frl_rate,
+        )
+    })
+}
+
+/// amdgpu_dm's HDMI FRL DSC policy for an 8-bpc RGB stream the verified FRL
+/// link `cap` cannot carry raw: dc_dsc_compute_config at the sink's DSC rate
+/// (`frl_dsc_caps`), within the pipes admission gives it (as `dp_dsc`),
+/// then the link for the compressed stream (`frl_dsc_link`).
+pub fn frl_dsc(
+    t: &Timing,
+    sink: &crate::amdgpu_dsc::DscSinkCaps,
+    max_rate: u8,
+    cap: FrlRate,
+    audio: crate::amdgpu_frl_cap::FrlAudio,
+    max_dispclk_khz: u32,
+    vic: crate::amdgpu_dsc::Vic,
+) -> Option<(FrlRate, crate::amdgpu_dsc::DscConfig)> {
+    let cfg = crate::amdgpu_dsc::compute_frl_config(
+        sink,
+        max_dispclk_khz,
+        max_rate,
+        &frl_dsc_timing(t),
+        vic,
+    )?;
+    let pipes = dml::dsc_pipes(t, cfg.slices_h, max_dispclk_khz);
+    if !(pipes <= 2
+        && cfg.slices_h % pipes == 0
+        && cfg.slices_h <= 4 * pipes
+        && t.h_active <= 5184 * pipes)
+    {
+        return None;
+    }
+    let rate = frl_dsc_link(t, FrlDscStream { cfg, vic }, cap, audio)?;
+    Some((rate, cfg))
 }
 
 /// hdmi_frl_decide_link_settings: the lowest rate code from 3 x 3G up
@@ -1145,6 +1317,26 @@ pub fn dp_dsc(
 /// DSCs or a link is a link failure.
 pub fn refine_dsc(soc: &dml::Soc, selections: &mut [Selection]) -> Result<(), ModesetError> {
     for s in selections.iter_mut().filter(|s| s.dsc.is_some()) {
+        if let Some(d) = FrlDscStream::of(s) {
+            // HDMI FRL: the same policy at the selected (lowest carrying)
+            // rate, which a compressed stream unchanged still fits.
+            let (sink, link) = s.caps.dsc.zip(d.cfg.frl).ok_or(ModesetError::Link)?;
+            let rate = s.frl.ok_or(ModesetError::Link)?;
+            let audio = frl_audio(s.audio, s.timing.v_active);
+            let (rate, cfg) = frl_dsc(
+                &s.timing,
+                &sink,
+                link.max_rate,
+                rate,
+                audio,
+                soc.dispclk_max_khz,
+                d.vic,
+            )
+            .ok_or(ModesetError::Link)?;
+            s.frl = Some(rate);
+            s.dsc = Some(cfg);
+            continue;
+        }
         let cfg = dp_dsc(&s.timing, s.caps, soc.dispclk_max_khz).ok_or(ModesetError::Link)?;
         (s.lanes, s.rate) = dsc_link(&s.timing, cfg, s.caps).ok_or(ModesetError::Link)?;
         s.dsc = Some(cfg);
@@ -1253,6 +1445,8 @@ pub struct HdmiCaps {
     /// HF Max_FRL_Rate (drm_get_max_frl_rate's code: 1 = 3 x 3G ... 6 =
     /// 4 x 12G), zero for none or an unknown code.
     pub max_frl_rate: u8,
+    /// The HF DSC 1.2 decoder (dc_edid_caps' frl_dsc_*), when declared.
+    pub dsc: Option<crate::amdgpu_dsc::HdmiDscCaps>,
 }
 pub fn hdmi_caps(edid: &[u8]) -> HdmiCaps {
     use narf_edid::cta861::{CtaExtension, DataBlock};
@@ -1347,6 +1541,12 @@ pub fn hdmi_caps(edid: &[u8]) -> HdmiCaps {
                 caps.dc30_420 = frl & 1 != 0;
                 caps.dc36_420 = frl & 2 != 0;
                 caps.max_frl_rate = Some(frl >> 4).filter(|r| (1..=6).contains(r)).unwrap_or(0);
+            }
+            // HF-SCDS bytes 11-13 (drm_parse_dsc_info), parsed when byte 11
+            // is present and nonzero; a zero byte 12 or 13 reads as absent.
+            if let Some(&flags) = forum.and_then(|f| f.get(7)).filter(|&&b| b != 0) {
+                let byte = |i: usize| forum.and_then(|f| f.get(i)).copied().filter(|&b| b != 0);
+                caps.dsc = crate::amdgpu_dsc::HdmiDscCaps::parse(flags, byte(8), byte(9));
             }
         }
     }
@@ -1480,12 +1680,8 @@ pub fn hdmi_depth(caps: HdmiCaps, pixel_khz: u32, max_bpc: u8) -> Option<otg::Co
     .map(|(_, _, depth, _)| depth)
 }
 
-/// How an HDMI sink carries `t`: TMDS where `hdmi_format` finds a depth
-/// (Linux keeps TMDS whenever it suffices), else FRL at `frl_cap` (none
-/// when FRL is off or taken): RGB first unless the mode is 4:2:0-only,
-/// then 4:2:0 where declared. Each uses the deepest declared depth up to
-/// `max_bpc` with a carrying rate, and the lowest such rate. FRL reserves
-/// bandwidth for the sink's supported LPCM modes (layout 0 at SD timings).
+/// The tuple tests compare: depth, 4:2:0 and FRL rate of `hdmi_stream` at
+/// DCN401's nominal DISPCLK, without its DSC configuration.
 pub fn hdmi_output(
     caps: HdmiCaps,
     t: &Timing,
@@ -1493,10 +1689,54 @@ pub fn hdmi_output(
     frl_cap: Option<FrlRate>,
     audio: Option<otg::AudioInfo>,
 ) -> Option<(otg::ColorDepth, bool, Option<FrlRate>)> {
+    hdmi_stream(caps, t, max_bpc, frl_cap, audio, NOMINAL_DISPCLK_KHZ)
+        .map(|s| (s.depth, s.ycbcr420, s.frl))
+}
+
+/// How an HDMI stream leaves: its depth, 4:2:0, FRL link and DSC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HdmiStream {
+    pub depth: otg::ColorDepth,
+    pub ycbcr420: bool,
+    pub frl: Option<FrlRate>,
+    pub dsc: Option<crate::amdgpu_dsc::DscConfig>,
+}
+
+/// How an HDMI sink carries `t`: TMDS where `hdmi_format` finds a depth
+/// (Linux keeps TMDS whenever it suffices), else FRL at `frl_cap` (none
+/// when FRL is off or taken): RGB first unless the mode is 4:2:0-only,
+/// then 4:2:0 where declared, each from the deepest declared depth up to
+/// `max_bpc` down, as amdgpu_dm_create_validate_stream_for_sink tries them.
+/// At each, as apply_dsc_policy_for_stream does for SIGNAL_TYPE_HDMI_FRL,
+/// a stream whose raw bandwidth exceeds `frl_cap`'s is compressed for a
+/// sink with an HF DSC decoder (`frl_dsc`; the native DSC path takes 8-bpc
+/// RGB only, so deeper or 4:2:0 compressed streams are passed over), and
+/// any other is carried uncompressed at the lowest carrying rate. FRL
+/// reserves bandwidth for the sink's supported LPCM modes (layout 0 at SD
+/// timings).
+pub fn hdmi_stream(
+    caps: HdmiCaps,
+    t: &Timing,
+    max_bpc: u8,
+    frl_cap: Option<FrlRate>,
+    audio: Option<otg::AudioInfo>,
+    max_dispclk_khz: u32,
+) -> Option<HdmiStream> {
     if let Some((depth, ycbcr420)) = hdmi_format(caps, t, max_bpc) {
-        return Some((depth, ycbcr420, None));
+        return Some(HdmiStream {
+            depth,
+            ycbcr420,
+            frl: None,
+            dsc: None,
+        });
     }
     let cap = frl_cap?;
+    let avi = hdmi_avi(caps, t);
+    let stream_vic = crate::amdgpu_dsc::Vic {
+        cta: avi.vic,
+        hdmi: avi.hdmi_vic,
+    };
+    let dsc_caps = frl_dsc_caps(caps);
     let vic = narf_edid::modes::match_cea_mode(edid_mode(t));
     let listed = |map: [u64; 4]| vic != 0 && map[usize::from(vic / 64)] & 1 << (vic % 64) != 0;
     let only420 = listed(caps.y420_only);
@@ -1519,10 +1759,38 @@ pub fn hdmi_output(
             (10, dc30, otg::ColorDepth::Bpc10),
             (8, true, otg::ColorDepth::Bpc8),
         ] {
-            if bpc <= max_bpc && declared {
-                if let Some(rate) = frl_link(t, bpc, ycbcr420, cap, audio) {
-                    return Some((depth, ycbcr420, Some(rate)));
+            if bpc > max_bpc || !declared {
+                continue;
+            }
+            // dc_bandwidth_in_kbps_from_timing on the FRL link against
+            // dc_link_frl_bandwidth_kbps of the verified cap.
+            let raw = u64::from(t.pixel_clock_khz) * u64::from(bpc) * 3 / (1 + u64::from(ycbcr420));
+            if raw > cap.kbps() {
+                if let Some((sink, max_rate)) = &dsc_caps {
+                    if bpc == 8 && !ycbcr420 {
+                        let dispclk = max_dispclk_khz;
+                        if let Some((rate, cfg)) =
+                            frl_dsc(t, sink, *max_rate, cap, audio, dispclk, stream_vic)
+                        {
+                            return Some(HdmiStream {
+                                depth,
+                                ycbcr420,
+                                frl: Some(rate),
+                                dsc: Some(cfg),
+                            });
+                        }
+                    }
+                    // A compressed stream DSC cannot form fails validation.
+                    continue;
                 }
+            }
+            if let Some(rate) = frl_link(t, bpc, ycbcr420, cap, audio) {
+                return Some(HdmiStream {
+                    depth,
+                    ycbcr420,
+                    frl: Some(rate),
+                    dsc: None,
+                });
             }
         }
     }
@@ -1678,7 +1946,12 @@ pub fn select_all(
         let Some(edid) = sink.edid.get(..128).and_then(|b| b.try_into().ok()) else {
             continue;
         };
-        let Some((depth, ycbcr420, frl)) = hdmi_output(caps, &timing, max_bpc, frl_cap, audio)
+        let Some(HdmiStream {
+            depth,
+            ycbcr420,
+            frl,
+            dsc,
+        }) = hdmi_stream(caps, &timing, max_bpc, frl_cap, audio, NOMINAL_DISPCLK_KHZ)
         else {
             link_short = true;
             continue;
@@ -1689,7 +1962,12 @@ pub fn select_all(
             timing,
             lanes: 0,
             rate: DpRate::Legacy(LinkRate::Rbr),
-            caps: DpCaps::NONE,
+            // A compressed FRL stream keeps the sink's HF DSC decoder for
+            // `refine_dsc`.
+            caps: DpCaps {
+                dsc: dsc.and(frl_dsc_caps(caps)).map(|(sink, _)| sink),
+                ..DpCaps::NONE
+            },
             edid,
             hdmi: true,
             scdc: caps.scdc,
@@ -1703,7 +1981,7 @@ pub fn select_all(
             limited: false,
             ycbcr420,
             frl,
-            dsc: None,
+            dsc,
             mst: None,
             // HDMI FreeSync needs the AMD VSDB, which is not parsed.
             vrr: None,
@@ -2674,12 +2952,17 @@ impl ColdBoot {
             if s.hdmi {
                 // FRL only for the display holding the HPO FRL encoder.
                 let frl = s.frl.and_then(|_| frl_cap(caps));
-                hdmi_output(caps, &t, max_bpc(), frl, sink_audio_info(edid)).map(
-                    |(_, ycbcr420, _)| dml::Mode {
-                        ycbcr420,
+                let audio = sink_audio_info(edid);
+                hdmi_stream(caps, &t, max_bpc(), frl, audio, soc.dispclk_max_khz).map(|h| {
+                    dml::Mode {
+                        ycbcr420: h.ycbcr420,
+                        dsc: h.dsc.map(|c| dml::Dsc {
+                            slices: c.slices_h,
+                            bpp_x16: c.bpp_x16,
+                        }),
                         ..plane_mode(t, s.format)
-                    },
-                )
+                    }
+                })
             } else if let Some(m) = s.mst {
                 // Within the stream's own payload.
                 super::mst::mst_slots(&t, s.lanes, s.rate, s.caps.fec)
@@ -2987,29 +3270,29 @@ impl ColdBoot {
         rate: FrlRate,
         pipe: u8,
     ) -> Result<(Selection, otg::ScanoutRunning), ModesetError> {
-        use crate::amdgpu_frl_cap::{FrlBorrow, FrlCap};
         let port = selection.port;
         let bpc = depth_bpc(selection.depth);
         let ycbcr420 = selection.ycbcr420;
         let audio = frl_audio(selection.audio, selection.timing.v_active);
+        let dsc = FrlDscStream::of(&selection);
         // SAFETY: the caller's obligations; each step checks its predecessor.
         unsafe {
             let trained = self
-                .start_frl(port, &selection.timing, bpc, ycbcr420, rate, audio)
+                .start_frl(port, &selection.timing, bpc, ycbcr420, dsc, rate, audio)
                 .await?;
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Scdc);
-            let Some(FrlCap::Ok {
-                audio_packets_line,
-                borrow,
-            }) = frl_carries(&selection.timing, bpc, ycbcr420, trained, audio)
-            else {
-                return Err(ModesetError::Link);
-            };
+            // The trained link's capacity-check parameters (for DSC the
+            // compressed check's tribyte targets and padding borrow mode).
+            let (audio_packets_line, borrow, hc_active, hc_blank) =
+                frl_video_params(&selection.timing, bpc, ycbcr420, dsc, trained, audio)
+                    .ok_or(ModesetError::Link)?;
             let request = otg::FrlVideoRequest {
                 pipe,
-                audio_packets_line: audio_packets_line as u8,
-                borrow_from_blank: borrow == FrlBorrow::FromBlank,
+                audio_packets_line,
+                borrow,
+                hc_active,
+                hc_blank,
                 avi: selection.avi,
             };
             self.start_display_frl_video(port, request).await?;
@@ -3069,16 +3352,19 @@ impl ColdBoot {
     /// `port`, from `rate` down: hdmi_frl_perform_link_training_with_retries
     /// at each rate, stepping one rate code down when the sink asks for a
     /// lower rate (as Linux's verification walk does), never below one that
-    /// still carries the mode. A timeout or Sink_Version 0 ends it. On
-    /// success the link sends FRL output and FRL_Start was awaited.
+    /// still carries the mode (a DSC stream `dsc`, compressed). A timeout or
+    /// Sink_Version 0 ends it. On success the link sends FRL output and
+    /// FRL_Start was awaited.
     /// # Safety
     /// As for `start_link`; the port's sink declared FRL and SCDC.
+    #[allow(clippy::too_many_arguments)]
     pub async unsafe fn start_frl(
         &mut self,
         port: usize,
         timing: &Timing,
         bpc: u8,
         ycbcr420: bool,
+        dsc: Option<FrlDscStream>,
         rate: FrlRate,
         audio: crate::amdgpu_frl_cap::FrlAudio,
     ) -> Result<FrlRate, ModesetError> {
@@ -3088,7 +3374,7 @@ impl ColdBoot {
         unsafe {
             loop {
                 let r = FrlRate::new(code).ok_or(ModesetError::Link)?;
-                if frl_carries(timing, bpc, ycbcr420, r, audio).is_none() {
+                if frl_video_params(timing, bpc, ycbcr420, dsc, r, audio).is_none() {
                     return Err(ModesetError::Link);
                 }
                 self.start_display_frl_link(port, r.lanes(), r.character_khz())

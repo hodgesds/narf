@@ -900,6 +900,7 @@ fn hpo_dsc_config() -> crate::amdgpu_dsc::DscConfig {
         linebuf_depth: 11,
         version_minor: 2,
         ycbcr422_simple: false,
+        frl: None,
     }
 }
 /// A trained 128b/132b link on PHY `p` with `pipe`'s timing staged

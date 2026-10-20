@@ -536,6 +536,7 @@ fn dcn401_dp_frontend_admits_compressed_payload_on_the_trained_fec_link() -> Tes
             linebuf_depth: 11,
             version_minor: 2,
             ycbcr422_simple: false,
+            frl: None,
         };
         let (mut e, mut io, c) = fixture_with(0, 1, 2, depth, false, Some(cfg), false);
         run(e.stop_dp_link(&mut io, path(0))).unwrap();
