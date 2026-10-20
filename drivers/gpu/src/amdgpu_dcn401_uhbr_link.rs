@@ -13,7 +13,7 @@ use super::*;
 pub use dmub::UhbrRate;
 #[path = "amdgpu_dcn401_uhbr_video.rs"]
 pub(in crate::amdgpu_dcn401_otg) mod video;
-pub use video::{uhbr_mst_rate, UhbrPayload, UhbrVideoRunning};
+pub use video::{uhbr_mst_dsc_rate, uhbr_mst_rate, UhbrPayload, UhbrVideoRunning};
 
 const LINK_CLOCK: u64 = 0x369f;
 const CONTROL: u64 = 0x36b4;

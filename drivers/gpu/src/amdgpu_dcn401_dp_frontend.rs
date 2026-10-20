@@ -265,11 +265,11 @@ impl<I: Io> Engine<I> {
         };
         // Necessary payload ceiling only, not DML admission/watermark validation.
         let required = if let Some(cfg) = timing.dsc {
-            // This native DSC path is 8-bpc RGB SST with FEC. Its validated
-            // PPS determines the payload, including the per-slice overhead;
-            // comparing the uncompressed pixels would reject the very modes
-            // which need compression to fit their link.
-            if !link.fec || bpc != 8 || link.phy.settings.mst {
+            // This native DSC path is 8-bpc RGB (SST or MST) with FEC. Its
+            // validated PPS determines the payload, including the per-slice
+            // overhead; comparing the uncompressed pixels would reject the
+            // very modes which need compression to fit their link.
+            if !link.fec || bpc != 8 {
                 return Err(Error::Unsupported);
             }
             u64::from(crate::amdgpu_dsc::dsc_kbps(

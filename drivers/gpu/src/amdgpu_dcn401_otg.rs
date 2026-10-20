@@ -33,9 +33,9 @@ pub use link::DpSstDisabled;
 #[path = "amdgpu_dcn401_dp_phy.rs"]
 mod dp_phy;
 pub use dp_phy::{
-    uhbr_mst_rate, DpDriveSettings, DpFrontendReady, DpFrontendRequest, DpLinkStatus,
-    DpLinkTrained, DpPhyReady, DpPhySettings, DpTrainingError, DpVideoRunning, UhbrLinkTrained,
-    UhbrPayload, UhbrRate, UhbrSettings, UhbrVideoRunning,
+    uhbr_mst_dsc_rate, uhbr_mst_rate, DpDriveSettings, DpFrontendReady, DpFrontendRequest,
+    DpLinkStatus, DpLinkTrained, DpPhyReady, DpPhySettings, DpTrainingError, DpVideoRunning,
+    UhbrLinkTrained, UhbrPayload, UhbrRate, UhbrSettings, UhbrVideoRunning,
 };
 #[path = "amdgpu_dcn401_hpo_link.rs"]
 mod hpo_link;

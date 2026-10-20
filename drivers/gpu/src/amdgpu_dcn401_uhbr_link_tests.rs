@@ -1083,8 +1083,7 @@ kernel_test_in!(
 );
 
 /// A sink that does not take DP_DSC_ENABLE fails the start before the
-/// PPS or the payload; an MST stream stays uncompressed (MST DSC over
-/// 128b/132b is not ported).
+/// PPS or the payload.
 fn dcn401_uhbr_dsc_refusals() -> TestResult {
     let (p, stream, pipe) = (2, 1, 3);
     let settings = UhbrSettings {
@@ -1110,14 +1109,77 @@ fn dcn401_uhbr_dsc_refusals() -> TestResult {
     {
         return TestResult::Fail("DSC refused by the sink");
     }
-    let mst = UhbrSettings {
-        mst: true,
-        ..settings
-    };
-    let (mut e, _, _, c) = uhbr_dsc_fixture(p, stream, pipe, mst, hpo_dsc_config());
-    match run(e.prepare_uhbr_mst_stream(path(p), stream, pipe, c, 3)) {
-        Err(Error::Unsupported) => TestResult::Pass,
-        other => panic!("MST DSC stream {other:?}"),
-    }
+    TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/dcn401-otg", dcn401_uhbr_dsc_refusals);
+
+/// An MST DSC stream over 128b/132b, as link_set_dpms_on runs one: the
+/// stream is prepared blank with its VC rate from the compressed
+/// bandwidth (dc_dsc_stream_bandwidth_in_kbps, as amdgpu_dm's PBN), the
+/// manager writes the payload, and the PPS goes out in the stream's own
+/// GSP11 before it unblanks; stopping it turns GSP11 off. (The decoder's
+/// DP_DSC_ENABLE is the MST manager's, through the branch.)
+fn dcn401_uhbr_mst_dsc_stream_sends_its_own_pps() -> TestResult {
+    let (p, stream, pipe) = (2, 1, 3);
+    let settings = UhbrSettings {
+        lanes: 4,
+        rate: UhbrRate::Uhbr10,
+        mst: true,
+    };
+    let cfg = hpo_dsc_config();
+    let (mut e, _, req, c) = uhbr_dsc_fixture(p, stream, pipe, settings, cfg);
+    let ready = match run(e.prepare_uhbr_mst_stream(path(p), stream, pipe, c, 3)) {
+        Ok(ready) => ready,
+        Err(err) => panic!("MST DSC prepare {err:?}"),
+    };
+    let r =
+        |e: &Engine<UhbrIo>, reg: u64| e.io.inner.regs.get(&hpo(stream, reg)).copied().unwrap_or(0);
+    let Some((rate, hblank)) =
+        crate::amdgpu_dcn401_otg::uhbr_mst_dsc_rate(&req.timing, &cfg, settings)
+    else {
+        return TestResult::Fail("compressed MST rate");
+    };
+    if ready.payload.vc_rate != rate
+        || ready.payload.hblank_symbols != hblank
+        || rate >> 25 != 2
+        || r(&e, 0x3677) & 1 != 0
+    {
+        panic!("prepared MST DSC stream {:x?}", ready.payload);
+    }
+    e.io.inner.writes.clear();
+    let table = [MstAllocation { stream, slots: 3 }];
+    if uhbr_mst_payload(&mut e, p, &table).is_err() || run(e.start_uhbr_mst_video(path(p))).is_err()
+    {
+        return TestResult::Fail("MST DSC video");
+    }
+    let w = &e.io.inner.writes;
+    let headers = w
+        .iter()
+        .filter(|&&(at, v)| at == hpo(stream, 0x3652) && v == 0x007f_1000)
+        .count();
+    let on = w
+        .iter()
+        .position(|&(a, v)| a == hpo(stream, 0x3677) && v & 1 == 1);
+    let unblank = w.iter().rposition(|&(a, _)| a == hpo(stream, 0x3685));
+    if headers != 4
+        || on.is_none()
+        || unblank.is_none()
+        || on > unblank
+        || r(&e, 0x3685) & 0x101 != 0x101
+    {
+        panic!("PPS before unblank: {headers} headers, GSP11 on {on:?}, unblank {unblank:?}");
+    }
+    if run(e.blank_uhbr_mst_video(path(p))).is_err()
+        || run(e.set_uhbr_mst_vc_rate(p, stream, (0, 0))).is_err()
+        || run(e.update_uhbr_mst_allocation(p, &[])).is_err()
+        || run(e.stop_uhbr_mst_stream(path(p))).is_err()
+        || r(&e, 0x3677) & 0x61 != 0
+    {
+        return TestResult::Fail("MST DSC stop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_uhbr_mst_dsc_stream_sends_its_own_pps
+);

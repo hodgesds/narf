@@ -1802,8 +1802,8 @@ fn navi48_mst_selection_obeys_shared_path_budget() -> TestResult {
     ];
     // Both end ports can carry 1080p, but their common upstream hop cannot
     // carry two such streams. The second keeps its pipe and takes 720p.
-    let budget = |_, selected: &[Selection]| {
-        900u16.saturating_sub(selected.iter().filter_map(|s| s.mst).map(|m| m.pbn).sum())
+    let budget = |_, selected: &[(crate::dp_mst_mgr::Sink, u16)]| {
+        900u16.saturating_sub(selected.iter().map(|a| a.1).sum())
     };
     let picked = super::super::mst::select_mst_outputs(
         0,

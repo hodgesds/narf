@@ -62,6 +62,8 @@ struct Request {
     audio: bool,
     scdc: bool,
     dsc: bool,
+    /// A compressed MST stream's decoder, told to stop after its stream.
+    mst_dsc: Option<super::MstDsc>,
     // The original modeset witness, not the changing front address after flips.
     scanout: Option<ScanoutWitness>,
 }
@@ -97,6 +99,7 @@ impl Request {
             audio: s.audio.is_some(),
             scdc: s.scdc,
             dsc: s.dsc.is_some(),
+            mst_dsc: s.mst.and_then(|m| m.dsc).filter(|_| s.dsc.is_some()),
             scanout: None,
         }
     }
@@ -392,10 +395,19 @@ impl Backend for ColdBoot {
                     }
                 }
                 Payload => self.remove_display_mst_payload(r.port, r.pipe).await?,
-                Frontend if r.protocol == Protocol::UhbrMst => {
-                    self.stop_display_uhbr_mst_stream(r.port).await?
+                Frontend => {
+                    if r.protocol == Protocol::UhbrMst {
+                        self.stop_display_uhbr_mst_stream(r.port).await?
+                    } else {
+                        self.stop_display_dp_frontend(r.port).await?
+                    }
+                    // link_set_dsc_enable(false) after the stream:
+                    // dp_set_dsc_on_rx's result is ignored, and a departed
+                    // sink is not addressed.
+                    if let Some(d) = r.mst_dsc.filter(|_| !status.unplugged) {
+                        let _ = self.set_display_mst_dsc(r.port, &d, false).await;
+                    }
                 }
-                Frontend => self.stop_display_dp_frontend(r.port).await?,
                 Link => match r.protocol {
                     Protocol::Tmds => self.stop_display_hdmi_link(r.port).await?,
                     Protocol::Frl => self.stop_display_frl_link(r.port).await?,

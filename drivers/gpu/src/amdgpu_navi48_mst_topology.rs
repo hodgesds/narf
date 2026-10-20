@@ -22,6 +22,8 @@ pub struct MstOutput {
     /// Independently admitted timings while no stream is lit on this output.
     /// Recomputed against the current configuration; empty after a reprobe.
     pub modes: Vec<Timing>,
+    /// The end device's DSC decoder (`dsc::read_dsc`), read with its EDID.
+    pub dsc: Option<super::dsc::MstDsc>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -41,6 +43,7 @@ fn reconcile(previous: &[Option<MstOutput>; 4], topology: &Topology) -> [Option<
         o.sink = None;
         o.edid.clear();
         o.modes.clear();
+        o.dsc = None;
     }
     let Some(root) = topology.branches.first() else {
         return out;
@@ -81,6 +84,7 @@ fn reconcile(previous: &[Option<MstOutput>; 4], topology: &Topology) -> [Option<
             sink: Some(sink),
             edid: Vec::new(),
             modes: Vec::new(),
+            dsc: None,
         });
     }
     out
@@ -188,6 +192,8 @@ impl MstLink {
                 output.edid = read_edid(&mut self.manager, aux, &topology, sink)
                     .await
                     .unwrap_or_default();
+                // validate_dsc_caps_on_connector, beside the EDID.
+                output.dsc = super::dsc::read_dsc(&mut self.manager, aux, &topology, sink).await;
             }
         }
         self.topology = topology;

@@ -5273,6 +5273,7 @@ mod tests {
             sink: Some(crate::dp_mst_mgr::Sink { branch: 1, port: 3 }),
             edid: alloc::vec![0; 256],
             modes: Vec::new(),
+            dsc: None,
         };
         let timing = hd();
         let target = Target::Mst(0, 1);

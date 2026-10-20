@@ -104,6 +104,7 @@ fn request(protocol: Protocol) -> Request {
         audio: true,
         scdc: protocol == Protocol::Tmds,
         dsc: protocol == Protocol::Sst,
+        mst_dsc: None,
         scanout: Some(ScanoutWitness {
             address: 0x8_0000_1000,
             stream: 2,

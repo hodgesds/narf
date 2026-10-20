@@ -506,6 +506,65 @@ impl Manager {
             pending: None,
         })
     }
+    /// drm_dp_send_dpcd_read: `len` bytes of the DPCD behind `port` (an
+    /// output port's own AUX, drm_dp_mst_port's `aux`) from `address`,
+    /// through the port's branch. A short or misdirected reply is Malformed.
+    pub async fn remote_dpcd_read<A: MstAux>(
+        &mut self,
+        aux: &mut A,
+        topology: &Topology,
+        port: Sink,
+        address: u32,
+        len: u8,
+    ) -> Result<Vec<u8>, MstError<A::Error>> {
+        let branch = topology
+            .branches
+            .get(port.branch)
+            .ok_or(MstError::Malformed)?;
+        let request = Request::RemoteDpcdRead {
+            port: port.port,
+            address,
+            len,
+        };
+        match self
+            .transact(aux, branch.lct, &branch.rad, &request)
+            .await?
+        {
+            Reply::RemoteDpcdRead { port: p, bytes }
+                if p == port.port && bytes.len() == usize::from(len) =>
+            {
+                Ok(bytes)
+            }
+            _ => Err(MstError::Malformed),
+        }
+    }
+    /// drm_dp_send_dpcd_write: `bytes` to the DPCD behind `port` at
+    /// `address`, through the port's branch.
+    pub async fn remote_dpcd_write<A: MstAux>(
+        &mut self,
+        aux: &mut A,
+        topology: &Topology,
+        port: Sink,
+        address: u32,
+        bytes: &[u8],
+    ) -> Result<(), MstError<A::Error>> {
+        let branch = topology
+            .branches
+            .get(port.branch)
+            .ok_or(MstError::Malformed)?;
+        let request = Request::RemoteDpcdWrite {
+            port: port.port,
+            address,
+            bytes: bytes.to_vec(),
+        };
+        match self
+            .transact(aux, branch.lct, &branch.rad, &request)
+            .await?
+        {
+            Reply::RemoteDpcdWrite { port: p } if p == port.port => Ok(()),
+            _ => Err(MstError::Malformed),
+        }
+    }
     /// Read EDID block `block` of an end device through its branch
     /// (drm_do_probe_ddc_edid over drm_dp_mst_i2c_read).
     pub async fn read_edid_block<A: MstAux>(

@@ -396,12 +396,16 @@ impl<I: Io> Engine<I> {
         w.timing = true;
         self.dp_video_verify(w)?;
         // link_set_dpms_on after enable_stream: the sink decodes DSC
-        // (dp_set_dsc_on_rx), then the PPS SDP, before unblanking.
+        // (dp_set_dsc_on_rx), then the PPS SDP, before unblanking. An MST
+        // stream's decoder sits behind the branch: the MST manager enabled
+        // it through its DSC AUX before the payload.
         if w.frontend.blank.timing.request.dsc.is_some() {
-            let path = w.frontend.link.phy.path;
-            write(io, path, DSC_ENABLE, &mut [1]).await?;
-            if read::<1>(io, path, DSC_ENABLE).await?[0] & 1 != 1 {
-                return Err(sink_readback(DSC_ENABLE));
+            if !w.frontend.link.phy.settings.mst {
+                let path = w.frontend.link.phy.path;
+                write(io, path, DSC_ENABLE, &mut [1]).await?;
+                if read::<1>(io, path, DSC_ENABLE).await?[0] & 1 != 1 {
+                    return Err(sink_readback(DSC_ENABLE));
+                }
             }
             self.dp_video_pps(&w).await?;
             self.dp_video_verify(w)?;
@@ -533,7 +537,10 @@ impl<I: Io> Engine<I> {
             // as Linux ignores it), then the PPS SDP; disable() turns the
             // OPTC's DSC and the DSC off before the timing.
             if frontend.blank.timing.request.dsc.is_some() {
-                let _ = write(io, path, DSC_ENABLE, &mut [0]).await;
+                // An MST stream's decoder is the manager's to stop.
+                if !frontend.link.phy.settings.mst {
+                    let _ = write(io, path, DSC_ENABLE, &mut [0]).await;
+                }
                 self.dp_video_pps_off(&w)?;
             }
             self.dp_video_infopackets_off(&w)?;

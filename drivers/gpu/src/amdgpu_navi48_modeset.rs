@@ -254,6 +254,8 @@ pub struct MstStream {
     pub slots: u8,
     /// DP_MSE_RATE X.Y (`otg::vc_rate`).
     pub rate: (u32, u32),
+    /// A compressed stream's decoder: where DP_DSC_ENABLE goes.
+    pub dsc: Option<super::mst::MstDsc>,
 }
 
 /// The sink's audio description as amdgpu_dm_fill_audio_info builds it from
@@ -1255,7 +1257,7 @@ fn dp_offered_mode(timing: Timing, s: &Selection, max_dispclk_khz: u32) -> Optio
 
 /// dcn4_soc_bb's DISPCLK maximum: DSC decisions before the board's levels
 /// are known use it, and are redone with the board's (`refine_dsc`).
-const NOMINAL_DISPCLK_KHZ: u32 = 2_000_000;
+pub(super) const NOMINAL_DISPCLK_KHZ: u32 = 2_000_000;
 
 /// The DSC view of an 8-bit RGB DP stream.
 fn dsc_timing(t: &Timing) -> crate::amdgpu_dsc::DscTiming {
@@ -1317,6 +1319,37 @@ pub fn dp_dsc(
 /// DSCs or a link is a link failure.
 pub fn refine_dsc(soc: &dml::Soc, selections: &mut [Selection]) -> Result<(), ModesetError> {
     for s in selections.iter_mut().filter(|s| s.dsc.is_some()) {
+        if let Some(m) = s.mst {
+            // An MST stream keeps the link's fairness result (its PBN and
+            // bpp); dc_dsc_compute_config with the board's DISPCLK must give
+            // the same shape, which the native DSCs must take.
+            let cfg = s.dsc.ok_or(ModesetError::Link)?;
+            let caps = m.dsc.ok_or(ModesetError::Link)?.caps;
+            let encoding = if s.uhbr() {
+                crate::amdgpu_dsc::LinkEncoding::Dp128b132b
+            } else {
+                crate::amdgpu_dsc::LinkEncoding::Dp8b10b
+            };
+            let again = crate::amdgpu_dsc::compute_config(
+                &caps,
+                soc.dispclk_max_khz,
+                0,
+                &dsc_timing(&s.timing),
+                encoding,
+                false,
+            )
+            .ok_or(ModesetError::Link)?;
+            let pipes = dml::dsc_pipes(&s.timing, cfg.slices_h, soc.dispclk_max_khz);
+            if (again.slices_h, again.slices_v) != (cfg.slices_h, cfg.slices_v)
+                || pipes > 2
+                || cfg.slices_h % pipes != 0
+                || cfg.slices_h > 4 * pipes
+                || s.timing.h_active > 5184 * pipes
+            {
+                return Err(ModesetError::Link);
+            }
+            continue;
+        }
         if let Some(d) = FrlDscStream::of(s) {
             // HDMI FRL: the same policy at the selected (lowest carrying)
             // rate, which a compressed stream unchanged still fits.
@@ -2964,10 +2997,44 @@ impl ColdBoot {
                     }
                 })
             } else if let Some(m) = s.mst {
-                // Within the stream's own payload.
-                super::mst::mst_slots(&t, s.lanes, s.rate, s.caps.fec)
+                // Within the stream's own payload: uncompressed, or for a
+                // compressed stream at the bpp its PBN carries
+                // (bpp_x16_from_pbn).
+                if super::mst::mst_slots(&t, s.lanes, s.rate, s.caps.fec)
                     .is_some_and(|(pbn, slots)| pbn <= m.pbn && slots <= m.slots)
-                    .then(|| plane_mode(t, s.format))
+                {
+                    return Some(plane_mode(t, s.format));
+                }
+                let caps = m.dsc?.caps;
+                let encoding = if s.uhbr() {
+                    crate::amdgpu_dsc::LinkEncoding::Dp128b132b
+                } else {
+                    crate::amdgpu_dsc::LinkEncoding::Dp8b10b
+                };
+                let kbps = (u64::from(m.pbn) * 994 * 8 * 54 / 64) as u32;
+                let dt = dsc_timing(&t);
+                let cfg = crate::amdgpu_dsc::compute_config(
+                    &caps,
+                    soc.dispclk_max_khz,
+                    kbps,
+                    &dt,
+                    encoding,
+                    false,
+                )?;
+                let need = crate::amdgpu_dsc::dsc_kbps(&dt, cfg.bpp_x16, cfg.slices_h);
+                let pipes = dml::dsc_pipes(&t, cfg.slices_h, soc.dispclk_max_khz);
+                (super::mst::dsc::peak_pbn(need, encoding) <= i32::from(m.pbn)
+                    && pipes <= 2
+                    && cfg.slices_h % pipes == 0
+                    && cfg.slices_h <= 4 * pipes
+                    && t.h_active <= 5184 * pipes)
+                    .then(|| dml::Mode {
+                        dsc: Some(dml::Dsc {
+                            slices: cfg.slices_h,
+                            bpp_x16: cfg.bpp_x16,
+                        }),
+                        ..plane_mode(t, s.format)
+                    })
             } else {
                 dp_offered_mode(t, &s, soc.dispclk_max_khz)
             }

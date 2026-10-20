@@ -142,13 +142,29 @@ pub fn uhbr_mst_rate(
     bpc: u32,
     settings: UhbrSettings,
 ) -> Option<(u32, u16)> {
+    mst_rate_for(t, stream_kbps(t, bpc), settings)
+}
+/// `uhbr_mst_rate` for a DSC stream: its PBN from the compressed bandwidth
+/// (dc_dsc_stream_bandwidth_in_kbps, no 128b/132b padding).
+pub fn uhbr_mst_dsc_rate(
+    t: &crate::amdgpu_dml::Timing,
+    cfg: &crate::amdgpu_dsc::DscConfig,
+    settings: UhbrSettings,
+) -> Option<(u32, u16)> {
+    mst_rate_for(t, dsc_stream_kbps(t, cfg), settings)
+}
+fn mst_rate_for(
+    t: &crate::amdgpu_dml::Timing,
+    kbps: u128,
+    settings: UhbrSettings,
+) -> Option<(u32, u16)> {
     use crate::amdgpu_dsc::Fixed;
     let link = i64::try_from(link_kbps(settings)).ok()?;
     let per_slot = Fixed::int(i32::try_from(link / 8000).ok()?).div_int(54);
     if per_slot.0 == 0 || t.pixel_clock_khz == 0 || link == 0 {
         return None;
     }
-    let pbn = Fixed::fraction(i64::try_from(stream_kbps(t, bpc) * 64).ok()?, 54 * 8 * 1000);
+    let pbn = Fixed::fraction(i64::try_from(kbps * 64).ok()?, 54 * 8 * 1000);
     let avg = pbn.div(per_slot);
     let mut x = u32::try_from(avg.floor()).ok()?;
     let mut y = Fixed(avg.sub_int(x as i32).0 << 25).ceil() as u32;
@@ -571,11 +587,7 @@ impl<I: Io> Engine<I> {
             return Err(Error::Invalid);
         }
         let request = blank.timing.request;
-        // MST DSC is not ported: an MST stream is uncompressed.
-        if request.signal != Signal::HpoDisplayPort
-            || request.ycbcr420
-            || (mst && request.dsc.is_some())
-        {
+        if request.signal != Signal::HpoDisplayPort || request.ycbcr420 {
             return Err(Error::Unsupported);
         }
         request.validate_clock(clock)?;
@@ -660,11 +672,15 @@ impl<I: Io> Engine<I> {
         slots: u8,
     ) -> Result<UhbrVideoRunning, Error> {
         let (link, blank) = self.uhbr_video_request(path, stream, pipe, clock, true)?;
-        let (vc_rate, hblank_symbols) = uhbr_mst_rate(
-            &blank.timing.request.timing,
-            depth_bpc(blank.request.depth),
-            link.settings,
-        )
+        let request = blank.timing.request;
+        let (vc_rate, hblank_symbols) = match request.dsc {
+            Some(cfg) => uhbr_mst_dsc_rate(&request.timing, &cfg, link.settings),
+            None => uhbr_mst_rate(
+                &request.timing,
+                depth_bpc(blank.request.depth),
+                link.settings,
+            ),
+        }
         .ok_or(Error::Unsupported)?;
         if !(1..=64).contains(&slots) || vc_rate >> 25 > u32::from(slots) {
             return Err(Error::Invalid);
@@ -727,7 +743,14 @@ impl<I: Io> Engine<I> {
             acknowledged: true,
             ..v
         };
-        match self.uhbr_stream_unblank(running, timeout).await {
+        // A compressed stream's PPS SDP (its decoder was enabled through the
+        // MST manager before the payload), then the unblank.
+        let request = v.timing.blank.timing.request;
+        let started = async {
+            self.uhbr_pps(v.stream, &request).await?;
+            self.uhbr_stream_unblank(running, timeout).await
+        };
+        match started.await {
             Ok(running) => {
                 self.status.uhbr_video_running = Some(running);
                 self.status.state = State::UhbrVideoRunning(v.stream);
@@ -965,6 +988,10 @@ impl<I: Io> Engine<I> {
             self.update(at(SDP), 1, 0)?;
             for reg in GSP {
                 self.update(at(reg), 1, 0)?;
+            }
+            // dp_set_dsc_pps_info_packet(false): GSP11 off, payload size 0.
+            if blank.timing.request.dsc.is_some() {
+                self.update(at(GSP11), 0x61, 0)?;
             }
             self.update(at(SYM32_CONTROL), 1, 0)?;
             self.update(at(SE_CLOCK), 1, 0)?;

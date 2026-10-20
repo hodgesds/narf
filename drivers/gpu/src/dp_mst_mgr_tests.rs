@@ -28,6 +28,13 @@ pub(crate) struct Hub {
     pub(crate) resources: BTreeMap<(u8, u8), (u16, u16)>,
     pub(crate) resource_reply_port: Option<u8>,
     recursive: bool,
+    /// Each output port's DPCD revision in LINK_ADDRESS replies.
+    pub(crate) port_rev: u8,
+    /// Remote DPCD behind (LCT, port): REMOTE_DPCD_READ answers from it
+    /// (a port without one gets a malformed reply), REMOTE_DPCD_WRITE
+    /// stores into it and is logged.
+    pub(crate) remote: BTreeMap<(u8, u8), BTreeMap<u32, u8>>,
+    pub(crate) remote_writes: Vec<(u8, u8, u32, Vec<u8>)>,
 }
 const ROOT: [u8; 16] = [0x11; 16];
 const CHILD: [u8; 16] = [0x22; 16];
@@ -56,6 +63,9 @@ impl Hub {
             resources: BTreeMap::new(),
             resource_reply_port: None,
             recursive: false,
+            port_rev: 0x12,
+            remote: BTreeMap::new(),
+            remote_writes: Vec::new(),
         }
     }
     fn esi(&mut self) {
@@ -68,13 +78,21 @@ impl Hub {
         }
         self.dpcd.insert(ESI0, v);
     }
-    fn port(input: bool, pdt: u8, port: u8, mcs: bool, ddps: bool, guid: [u8; 16]) -> Vec<u8> {
+    fn port(
+        &self,
+        input: bool,
+        pdt: u8,
+        port: u8,
+        mcs: bool,
+        ddps: bool,
+        guid: [u8; 16],
+    ) -> Vec<u8> {
         let mut b = vec![
             u8::from(input) << 7 | pdt << 4 | port,
             u8::from(mcs) << 7 | u8::from(ddps) << 6,
         ];
         if !input {
-            b.push(0x12);
+            b.push(self.port_rev);
             b.extend_from_slice(&guid);
             b.push(0x11);
         }
@@ -88,26 +106,19 @@ impl Hub {
                 let mut r = vec![0x01];
                 r.extend_from_slice(&CHILD);
                 r.push(3);
-                r.extend(Self::port(true, 2, 0, true, true, [0; 16]));
-                r.extend(Self::port(false, 3, 1, false, true, [0x33; 16]));
-                r.extend(Self::port(false, 0, 2, false, false, [0; 16]));
+                r.extend(self.port(true, 2, 0, true, true, [0; 16]));
+                r.extend(self.port(false, 3, 1, false, true, [0x33; 16]));
+                r.extend(self.port(false, 0, 2, false, false, [0; 16]));
                 r
             }
             LINK_ADDRESS_KIND => {
                 let mut r = vec![0x01];
                 r.extend_from_slice(&ROOT);
                 r.push(4);
-                r.extend(Self::port(true, 1, 0, false, true, [0; 16]));
-                r.extend(Self::port(
-                    false,
-                    3,
-                    1,
-                    false,
-                    self.root_sink_present,
-                    [0x44; 16],
-                ));
-                r.extend(Self::port(false, 2, 2, true, self.child_present, CHILD));
-                r.extend(Self::port(false, 0, 3, false, false, [0; 16]));
+                r.extend(self.port(true, 1, 0, false, true, [0; 16]));
+                r.extend(self.port(false, 3, 1, false, self.root_sink_present, [0x44; 16]));
+                r.extend(self.port(false, 2, 2, true, self.child_present, CHILD));
+                r.extend(self.port(false, 0, 3, false, false, [0; 16]));
                 r
             }
             dp_mst::ENUM_PATH_RESOURCES => {
@@ -145,6 +156,32 @@ impl Hub {
             }
             dp_mst::ALLOCATE_PAYLOAD => {
                 vec![kind, body[1] & 0xf0, body[2], body[3], body[4]]
+            }
+            dp_mst::REMOTE_DPCD_READ => {
+                let port = body[1] >> 4;
+                let address =
+                    u32::from(body[1] & 0xf) << 16 | u32::from(body[2]) << 8 | u32::from(body[3]);
+                let len = body[4];
+                let Some(dpcd) = self.remote.get(&(lct, port)) else {
+                    return vec![kind];
+                };
+                let mut r = vec![kind, port, len];
+                for i in 0..u32::from(len) {
+                    r.push(dpcd.get(&(address + i)).copied().unwrap_or(0));
+                }
+                r
+            }
+            dp_mst::REMOTE_DPCD_WRITE => {
+                let port = body[1] >> 4;
+                let address =
+                    u32::from(body[1] & 0xf) << 16 | u32::from(body[2]) << 8 | u32::from(body[3]);
+                let bytes = body[5..5 + usize::from(body[4])].to_vec();
+                let dpcd = self.remote.entry((lct, port)).or_default();
+                for (i, &b) in bytes.iter().enumerate() {
+                    dpcd.insert(address + i as u32, b);
+                }
+                self.remote_writes.push((lct, port, address, bytes));
+                vec![kind, port]
             }
             _ => vec![kind],
         }
