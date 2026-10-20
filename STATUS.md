@@ -542,8 +542,10 @@ amdgpu_dm's fairness search (1500 link vectors through Linux's own functions),
 drm_dp_mst_dsc_aux_for_port (virtual DPCD, passthrough, Synaptics/Realtek
 quirk) and dm_helpers_dp_write_dsc_enable over remote DPCD; payload PBN uses
 the compressed bandwidth and each stream sends its own PPS. Two 4K144 sinks
-behind one HBR3 x4 branch both compress at equal bpp. MST DSC streams carry no
-audio; Synaptics cascaded workarounds and PCON FRL DSC are not ported.
+behind one HBR3 x4 branch both compress at equal bpp. MST DSC and UHBR DSC
+streams now keep LPCM, budgeted at the compressed bpp and slice count as
+Linux's check_audio_bandwidth_dp does (6048 host-checked DSC vectors);
+Synaptics cascaded workarounds and PCON FRL DSC are not ported.
 FRL now carries LPCM through AFMT4, lane-rate ACR and the pipe's Azalia endpoint.
 Admission/training reserve the sink's supported LPCM bandwidth; SD timings use
 layout 0. Audio starts after scanout and stops before it, preserving the
@@ -582,8 +584,13 @@ bit-exact against host-built Linux) and legacy SETGAMMA/GETGAMMA (sRGB
 pre-degamma ROM), applied live under the OTG lock; connector Colorspace
 (output CSC, blank, AVI C/EC/Q, DP MSA and VSC SDP) and HDR_OUTPUT_METADATA
 (HDMI DRM InfoFrame, DP HDR SDP, live metadata updates). No DEGAMMA_LUT on
-DCN 4.0.1, as Linux. Gaps: HDR/VSC on UHBR and FRL, MST, DP above 8 bpc.
-Model-tested only; not run on an RX 9070 XT.
+DCN 4.0.1, as Linux. HDR and VSC colorimetry now also go out on 128b/132b SST
+and MST streams (HPO VPG packets 0/3, GSP0/GSP3, MISC1), DIO MST streams and
+HDMI FRL (HPO FRL generic packet 4), with live metadata updates, and MST
+end-device connectors carry Colorspace/HDR_OUTPUT_METADATA. DP SST picks its
+output depth as amdgpu_dm does (EDID bpc bounded by max_bpc, stepping down
+until a link fits; 8 bpc by default). Gaps: 10-bpc DSC input and MST deep
+color. Model-tested only; not run on an RX 9070 XT.
 Native legacy/HPO DisplayPort stream blanking now waits for actual video-stop
 acknowledgement before resetting or disabling FIFOs. It handles inherited
 disable-in-progress state, keeps timing and link clocks available for PHY
@@ -933,7 +940,7 @@ against Linux's dc_dsc_compute_config on the host), lights on the lowest
 DSCs under ODM 2:1. The HPO stream marks the format compressed, enables sink
 decoding and sends the PPS through its VPG (GSP11, VBID[6]) before a VC
 payload sized for the compressed bandwidth; fallback keeps the PPS. DML21
-plans match Linux with DP2P0 encoders. UHBR DSC carries no audio, MST DSC
+plans match Linux with DP2P0 encoders. UHBR DSC now carries audio, MST DSC
 stays unsupported, and HDMI FRL DSC remains open (EDID DSC caps, compressed
 FRL capacity, CVTEM PPS). Implementation and register models; no hardware run.
 
@@ -960,8 +967,11 @@ port-bound bandwidth queries. Existing payloads are added back before comparing
 capacity, avoiding relights caused by our own allocations. Capacity changes retire
 old streams before reprobe/re-admission. Every shared path hop constrains payload
 and dark-mode admission; zero PBN rejects new modes. Incomplete resource queries
-retain the session and refuse replay. MST DSC and more than one branch
-remain open; no physical validation.
+retain the session and refuse replay. Cascaded (daisy-chained) branches share
+one link's payload table, hop budgets and DSC fairness; a downstream change
+that keeps every lit route (a branch or device added or removed elsewhere) is
+adopted live without stopping streams, as Linux handles a CSN. MST on more
+than one DP port at a time remains open; no physical validation.
 The MST manager now also exposes bounded idle notification polling over
 DMUB AUX, retains fragmented messages across transaction/poll boundaries and
 applies queue backpressure. Connection notices drive topology reconciliation

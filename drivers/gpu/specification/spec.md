@@ -1484,7 +1484,7 @@ payload PBN and VC rate come from the compressed bandwidth
 (`uhbr_mst_dsc_rate` on 128b/132b). The decoder is enabled before the
 payload, the PPS is sent per stream (DIO SDP or HPO GSP11) before unblank,
 and teardown stops the stream before clearing DP_DSC_ENABLE. MST DSC streams
-carry no audio; Synaptics cascaded/Panamera workarounds and DP-to-HDMI PCON
+keep their LPCM (see audio below); Synaptics cascaded/Panamera workarounds and DP-to-HDMI PCON
 FRL DSC are not ported.
 `modeset_display_mode` and `modeset_displays` select, admit and light again
 (at most `VERIFY_ROUNDS`) when the first display reports `LinkReduced`; a later
@@ -2048,6 +2048,8 @@ leaves the next branch chunk unacknowledged until the caller drains the queue.
 Down transactions still consume their own replies while that queue is full.
 Truncated bodies fail instead of manufacturing zero-filled status fields.
 An event survives failure to send its sideband ACK after ESI acknowledgement.
+The ACK goes to the primary branch (broadcast, LCT 1) whichever downstream
+branch sent the notification, as drm_dp_send_up_ack_reply(mgr, mst_primary).
 `ColdBoot::poll_display_mst(port)` and `take_display_mst_events(port)` expose
 this service over DMUB AUX. `service_display_mst` drains before/after polling
 and marks known-branch/known-port connection notifications for reprobe. Resource
@@ -2057,9 +2059,21 @@ must match the requested port and have available PBN no greater than full PBN.
 The driver adds its current payload PBN back to the queried free capacity,
 including descendant streams on a shared branch hop. Its own allocations thus
 do not cause repeated relights. A changed capacity/FEC snapshot requests
-reconfiguration. The monitor stops all streams using their old routes, reprobes,
-then relights enabled outputs. Notifications received during queries/reprobe
-remain queued for the next pass. Unknown branch/port, input-port and disconnected
+reconfiguration. While streams run, `MstLink::reprobe_live` (inside
+`service_display_mst`) first probes the tree again, as Linux handles a CSN
+without touching unaffected streams: branches with the same GUID and route
+keep their `Topology::branches` index (new ones fill vacated indices, then
+append; unfilled vacancies are port-less placeholders), every hop's reported
+free PBN is credited with the driver's own payloads, and the new topology is
+adopted only if every payload's end device is still connected and its PBN
+fits every hop beside the others. Adoption reconciles outputs, rereads
+EDID/DSC, readmits dark outputs' modes beside the running displays and
+clears the dirty mark; the monitor republishes the connectors and relights
+only when a new end device appeared. Otherwise (a lit route or its hop
+capacity lost) the old topology and routes stay and the monitor stops all
+streams using their old routes, reprobes, then relights enabled outputs.
+A failed or cancelled live probe retains the session like `prepare`.
+Notifications received during queries/reprobe remain queued for the next pass. Unknown branch/port, input-port and disconnected
 resource notices are ignored.
 
 `MstLink::resource_query_pending()` reports an incomplete resource-query batch.
@@ -2171,16 +2185,27 @@ whose connector routing changes is relit. The last DRM file closing restores
 automatic routing. An all-off DRM configuration keeps connector identities
 and requests while the branch remains connected; removing the branch (with
 no stream left on it) drops its connectors and their routes. Shared-link loss stops and relights the whole configuration instead
-of invoking the SST retrain path. Downstream changes use the same whole-link
-stop/reprobe/relight sequence, so other streams briefly blank. KMS can publish
+of invoking the SST retrain path. A downstream change that keeps every lit
+route is adopted live (`reprobe_live`, above) and only republishes the
+connectors, relighting just for a newly appeared end device; one that loses
+a lit route or its hop capacity uses the same whole-link stop/reprobe/relight
+sequence, so other streams briefly blank. KMS can publish
 a newly discovered EDID and independently admitted timings as connected with
 its CRTC off (`amdgpu_navi48_kms::Output::{edid, offered}`). These timings reach
 GETCONNECTOR and the platform's mode-request gate without setting a CRTC mode
 or framebuffer. A missing EDID suppresses the offered timings. Ordinary MST
 disable retains previously admitted timings without restarting siblings;
 the next configuration/reprobe recomputes admission against remaining resources.
-MST DSC follows amdgpu_dm's fairness search (see the DSC policy above); more
-than one MST branch remains unsupported.
+MST DSC follows amdgpu_dm's fairness search (see the DSC policy above).
+Cascaded (daisy-chained) branches are one topology: each branch is probed by
+LINK_ADDRESS at its own LCT/RAD (`dp_mst_mgr::child_rad`), sideband
+transactions for an end device (ALLOCATE_PAYLOAD, REMOTE_I2C_READ, remote
+DPCD) go to that device's own branch, end devices across branches share the
+link's payload table and the four stable connector slots, and every hop of a
+device's path bounds its payload, dark-mode admission and the DSC fairness
+search jointly with the sibling streams crossing that hop. Only one DP port
+runs MST at a time (the first connected branch); end devices beyond the four
+slots are not published.
 
 An MST branch that codes 128b/132b runs UHBR MST, as Linux's
 decide_mst_link_settings trains MST at the verified cap: the best UHBR rate
@@ -2560,7 +2585,21 @@ programmed by the native stream owner, including pixel padding, rather than
 stereo layout; 3..8 channels conservatively use the eight-channel layout.
 No remaining rates means silent video without an audio endpoint. Linux-host
 vectors cover this explicit input contract at all UHBR rates/lane counts and
-8/10/12-bpc RGB depths; they do not validate audible output or DSC/MST audio.
+8/10/12-bpc RGB depths; they do not validate audible output.
+
+Compressed DP streams keep their LPCM as Linux does: build_audio_output hands
+dsc_cfg (bits per pixel in 1/16, num_slices_h) to check_audio_bandwidth_dp,
+which budgets the compressed bpp and subtracts four EOC symbols per slice
+(in Linux's unsigned arithmetic). `uhbr_audio_info_with` and
+`mst_audio_info_with` take the stream's `DscConfig`; selection keeps audio on
+UHBR SST DSC and on 8b/10b and 128b/132b MST DSC streams, the UHBR budget
+uses the minimum blank width the compressed payload programs
+(`uhbr_dsc_payload`), and startup re-filters at the trained link. The APG
+and DIO AFMT share the PPS's secondary data path: legacy MST audio start
+expects the PPS's AFMT clock and master (and the VSC/HDR SDP enables) and
+stop leaves them set, as SST does. `check.py --dsc` compiles Linux's routine
+for 4536 UHBR and 1512 legacy MST DSC vectors (compressed bpp, slices and an
+explicit blank width), which the kernel tests replay.
 
 Live UHBR checks verify retained MSA/format/blank width and APG/packet/endpoint
 state. Stop disables audio packets and APG, then the endpoint, before scanout
@@ -2596,9 +2635,10 @@ payload before muting samples, disabling packets/AFMT and the endpoint; only
 then may scanout, video and payload retire. The MST activation checkpoint covers
 completed scanout before audio starts. Models cover independent stream/pipe/PHY
 indices, all RGB depths, malformed/stale payloads, failures, endpoint collisions,
-shared DTO and two-stream link handover. 2268 bandwidth vectors match Linux's
-routines. MST DSC and physical audio acceptance remain outside this
-contract.
+shared DTO and two-stream link handover. 2268 bandwidth vectors (plus 1512
+compressed ones) match Linux's routines. A compressed MST stream's payload
+witness expects its compressed VC rate. Physical audio acceptance remains
+outside this contract.
 
 `start_display_hdmi_video(port)` starts the blank timing, repeats the FIFO reset
 under live symclk, clears AVMUTE and waits for a fresh frame
@@ -3746,13 +3786,14 @@ EOTF the sink does not list is only reported), amdgpu_dm_get_output_color_space
 (`avi_colorimetry`), enc401's MSA MISC0/MISC1 (`msa_misc`),
 use_vsc_sdp_for_colorimetry (DPCD 1.4 and 0x2210 bit 3, read with the
 extended receiver caps) and mod_build_vsc_infopacket (`vsc_sdp`), checked
-by `tests/dcn401_hdr/check.sh` against code cut from Linux (2443 vectors).
-A new Colorspace or entering/leaving HDR on a driven connector needs
-ALLOW_MODESET (EINVAL through the legacy setters), as
+by `tests/dcn401_hdr/check.sh` against code cut from Linux (3323 vectors with the HPO MISC cases).
+MST end-device connectors carry both properties too (dm_dp_add_mst_connector
+attaches the root's Colorspace property; amdgpu_dm_connector_init_helper the
+HDR metadata property). A new Colorspace or entering/leaving HDR on a driven
+connector needs ALLOW_MODESET (EINVAL through the legacy setters), as
 amdgpu_dm_connector_atomic_check makes it a modeset; new metadata while
-HDR stays on does not. The native card also refuses (EINVAL) HDR metadata
-or a non-default Colorspace on a connector whose lit stream cannot signal
-it (128b/132b DP, and HDR over FRL).
+HDR stays on does not. Every native transport signals both, so no lit
+stream refuses them.
 
 The selection carries `colorspace`, `hdr` and `vsc_colorimetry`;
 `Selection::color_space()` is the stream's dc color space and
@@ -3760,17 +3801,40 @@ The selection carries `colorspace`, `hdr` and `vsc_colorimetry`;
 row for it (RGB types bypass, the identity), the blank black follows
 color_space_to_black_color (BT.2020 limited RGB keeps full-range black, as
 Linux does), the HDMI AVI InfoFrame its C/EC/Q, DIO/HPO DP MSA MISC0 and
-DIO MISC1. DIO DP streams on a VSC-capable sink send the VSC SDP in packets
-0 and 1 (GSP0) and, with HDR metadata, the HDR SDP in packet 3 (GSP3)
-before the unblank; HDMI TMDS streams send the DRM InfoFrame in generic
-packet 4 on line 2. `unsafe Otg::set_hdr(pipe, InfoPacket)` (ColdBoot
-`set_display_hdr`) rewrites a running stream's packet with an immediate
-update (amdgpu_dm's hdr_static_metadata stream update). The platform
-relights a display whose connector's Colorspace or HDR on/off changed and
-updates metadata live otherwise. Gaps: HDR packets and the VSC SDP on
-128b/132b and FRL streams, Colorspace/HDR on MST connectors, DP output
-above 8 bpc, plane color pipelines and AMD private properties. Model-tested
-only (`dcn-color`, `hdr`, `dcn401-color`, `dcn401-scanout`, `dcn401-otg`,
+DIO MISC1. DIO DP streams (SST and MST; enc401_stream_encoder_update_dp_info_packets
+serves both) on a VSC-capable sink send the VSC SDP in packets 0 and 1
+(GSP0) and, with HDR metadata, the HDR SDP in packet 3 (GSP3) before the
+unblank. 128b/132b streams (SST and MST) do as
+dcn31_hpo_dp_stream_enc_update_dp_info_packets does through the stream's VPG
+(`otg::UhbrSdp`, the Otg/ColdBoot UHBR start and MST prepare entries take
+it): the VSC SDP in packet 0, the HDR SDP in packet 3, each with an
+immediate update, then GSP0/GSP3 continuous transmission for the valid ones
+(GSP2/GSP5 off) and the SDP path on, all before the unblank; MSA MISC1 bit 6
+marks VSC colorimetry (`amdgpu_hdr::hpo_msa_misc`, the HPO encoder's own
+MISC0/MISC1, which start from zero). Ready and transport witnesses recheck
+the GSP enables. HDMI TMDS streams send the DRM InfoFrame in generic packet
+4 on line 2; FRL streams in the HPO FRL encoder's generic packet 4 on line
+2 (`FrlVideoRequest::hdr`, hpo_enc401_update_hdmi_info_packets). An MST
+stream's VSC support is the root link's DPCD (create_stream_for_sink reads
+stream->link). The packet bytes are the same on every transport (Linux
+builds them from the connector type only). `unsafe Otg::set_hdr(pipe,
+InfoPacket)` (ColdBoot `set_display_hdr`) rewrites a running stream's packet
+with an immediate update (amdgpu_dm's hdr_static_metadata stream update) on
+TMDS, FRL, DIO and HPO streams. The platform relights a display whose
+connector's Colorspace or HDR on/off changed and updates metadata live
+otherwise. `tests/dcn401_hdr/check.sh` also cuts the HPO MISC computation out
+of dcn31_hpo_dp_stream_encoder.c (3323 vectors in all) and
+`tests/dcn401_hdr/registers.c` checks the HPO GSP/VPG/MSA7 and FRL packet-4
+register contract against dcn_4_1_0. DP SST output depth follows amdgpu_dm:
+min(the EDID 1.4 color bit depth, 8 when undefined, `max_bpc` rounded to
+even), stepping down by two until a link carries the uncompressed stream
+(`modeset::dp_depths`, `dp_link_bpc`); training candidates and the UHBR
+audio budget use it. With the default `amdgpu.max_bpc` (8, NARF's
+max_requested_bpc) DP stays 8 bpc. Gaps: DSC streams compress 8-bpc input
+(Linux would compress a 10-bpc stream before dropping to 8 bpc), MST
+streams stay 8 bpc, no per-connector "max bpc" property, plane color
+pipelines and AMD private properties. Model-tested only (`dcn-color`,
+`hdr`, `dcn401-color`, `dcn401-scanout`, `dcn401-otg`, `dcn401-frl-link`,
 `dcn401-mpc`, `navi48-modeset`, `navi48-kms`, `drm_ioctl`); not validated
 on hardware.
 
