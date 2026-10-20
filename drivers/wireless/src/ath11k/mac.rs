@@ -2528,6 +2528,9 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             self.authorize().await?;
             self.setup_ps().await;
         }
+        // Associated with its keys back in firmware: the panel shows the
+        // station connected again, as after the original join.
+        narf_memory::diag::set_wifi_stage(narf_memory::diag::WifiStage::Connected);
         Ok(())
     }
 
