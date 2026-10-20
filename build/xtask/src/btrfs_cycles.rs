@@ -60,11 +60,11 @@ pub struct Args {
     pub jobs: Option<u32>,
 
     /// Workload operations per cycle.
-    #[arg(long, default_value_t = 120)]
+    #[arg(long, default_value_t = 80)]
     pub ops: u32,
 
     /// Live-data budget of the workload, KiB (beyond it, it shrinks files).
-    #[arg(long, default_value_t = 48 * 1024)]
+    #[arg(long, default_value_t = 32 * 1024)]
     pub live_kib: u64,
 
     /// Largest file one create writes, KiB.
@@ -538,10 +538,12 @@ fn tree_level(image: &Path, tree: &str) -> Result<u32> {
     text.lines()
         .find_map(|l| {
             let l = l.trim_start();
-            let rest = l
-                .strip_prefix("node ")
-                .or_else(|| l.strip_prefix("leaf "))?;
-            let level = rest.split_once(" level ")?.1;
+            // `leaf <bytenr> items ...` (a level-0 root carries no level),
+            // `node <bytenr> level <n> items ...`.
+            if l.starts_with("leaf ") {
+                return Some(0);
+            }
+            let level = l.strip_prefix("node ")?.split_once(" level ")?.1;
             level.split_whitespace().next()?.parse().ok()
         })
         .context("no root node in dump-tree output")

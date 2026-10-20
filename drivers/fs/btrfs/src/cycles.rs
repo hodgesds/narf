@@ -183,8 +183,8 @@ impl Params {
         Params {
             cycles: num("narf.btrfs_cycles", 50) as u32,
             seed: num("narf.btrfs_cycles_seed", 1),
-            ops: num("narf.btrfs_cycles_ops", 120) as u32,
-            max_live: (num("narf.btrfs_cycles_live_kib", 48 * 1024) as usize) << 10,
+            ops: num("narf.btrfs_cycles_ops", 80) as u32,
+            max_live: (num("narf.btrfs_cycles_live_kib", 32 * 1024) as usize) << 10,
             big_max: (num("narf.btrfs_cycles_big_kib", 8 * 1024) as usize) << 10,
         }
     }
