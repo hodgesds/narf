@@ -47,7 +47,7 @@ fn dcn401_plane_update_types_follow_dc() -> TestResult {
             r.plane = Some(l);
         })
     };
-    let cases: [(SurfaceRequest, UpdateType); 14] = [
+    let cases: [(SurfaceRequest, UpdateType); 16] = [
         (base, Fast),
         // A moved destination, or source origin: position_change.
         (layout(&|l| l.dst.x = 400), Med),
@@ -64,7 +64,10 @@ fn dcn401_plane_update_types_follow_dc() -> TestResult {
         (with(&|r| r.format = SurfaceFormat::Xrgb8888), Fast),
         (with(&|r| r.format = SurfaceFormat::Abgr8888), Full),
         (with(&|r| r.format = SurfaceFormat::Rgb565), Full),
+        // Any new ROTATION_ANGLE: rotation_change.
         (layout(&|l| l.rotation = Rotation::R180), Full),
+        (layout(&|l| l.rotation = Rotation::R90), Full),
+        (layout(&|l| l.rotation = Rotation::R270), Full),
         // A new pitch (wider surface, same rectangles): plane_size_change.
         (with(&|r| r.width = 1920), Med),
         (
@@ -89,6 +92,13 @@ fn dcn401_plane_update_types_follow_dc() -> TestResult {
     };
     if plane_update_type(video, bt601) != Med || plane_update_type(base, video) != Full {
         return TestResult::Fail("color space and video format");
+    }
+    // 90 to 270 keeps the scan direction but not the angle.
+    let turned = layout(&|l| l.rotation = Rotation::R90);
+    if plane_update_type(turned, layout(&|l| l.rotation = Rotation::R270)) != Full
+        || plane_update_type(turned, turned) != Fast
+    {
+        return TestResult::Fail("rotation 90/270 update type");
     }
     // Stream level: a plane count change or a recreated plane is full.
     let moved = layout(&|l| l.dst.x = 400);

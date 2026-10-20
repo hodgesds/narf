@@ -9,12 +9,13 @@
 //! amdgpu_dm_plane_helper_check_state (the 24x12 viewport minimum and
 //! drm_atomic_helper_check_plane_state's scale limits from the DCN401
 //! plane caps: 16x up, 6:1 down), amdgpu_dm_plane_fill_dc_scaling_info,
-//! dm_crtc_helper_atomic_check's primary requirement, then
+//! dm_crtc_helper_atomic_check's primary requirement, DML21's refusal of a
+//! linear surface rotated 90/270 (tiled ones scan vertically), then
 //! drm_atomic_normalize_zpos and DML21 admission of the whole configuration
 //! (dc_validate_global_state) with a free pipe for every overlay. A plane
 //! configuration change relights the display (DC's full update); a commit
 //! that only changes framebuffers flips every changed plane at one VUPDATE.
-use crate::amdgpu_dcn401_otg::{Blend, SurfaceFormat, MAX_OVERLAYS};
+use crate::amdgpu_dcn401_otg::{Blend, SurfaceFormat, Swizzle, MAX_OVERLAYS};
 use crate::amdgpu_dcn401_spl::{Rect, Rotation};
 use crate::amdgpu_navi48_boot::{OverlayPlane, PlaneGeometry, PlaneSetup};
 use crate::drm::atomic::{AtomicState, PlaneState};
@@ -417,9 +418,9 @@ fn calc_scale(src: i64, dst: i64) -> i64 {
 /// amdgpu_dm_plane_helper_check_state, drm_atomic_helper_check_plane_state
 /// (can_position, can_update_disabled) and
 /// amdgpu_dm_plane_fill_dc_scaling_info for an enabled plane on a CRTC of
-/// `mode` (width, height). The rotation 90/270 refusal is DML21's: a
-/// linear surface cannot be scanned vertically
-/// (SourceFormatPixelAndScanSupport), so dc_validate_global_state fails.
+/// `mode` (width, height). A 90/270 rotation swaps the source's sides for
+/// the helper's scale limits (drm_rect_rotate) but not for
+/// fill_dc_scaling_info's, which takes SRC_W/SRC_H as they are.
 pub fn check_plane(p: &PlaneState, mode: (u32, u32)) -> Result<(), FsError> {
     let (x, y, w, h) = (
         i64::from(p.crtc_x),
@@ -447,9 +448,10 @@ pub fn check_plane(p: &PlaneState, mode: (u32, u32)) -> Result<(), FsError> {
     // min_scale = 1.0 / max_upscale, max_scale = 1.0 / min_downscale.
     let min_scale = (1000 << 16) / MAX_UPSCALE;
     let max_scale = (1000 << 16) / MIN_DOWNSCALE;
-    let (rot90, sw, sh) = match rotation(p.props.map_or(1, |r| r.rotation)) {
-        Rotation::R90 | Rotation::R270 => (true, i64::from(p.src_h), i64::from(p.src_w)),
-        _ => (false, i64::from(p.src_w), i64::from(p.src_h)),
+    let (sw, sh) = if rotation(p.props.map_or(1, |r| r.rotation)).orthogonal() {
+        (i64::from(p.src_h), i64::from(p.src_w))
+    } else {
+        (i64::from(p.src_w), i64::from(p.src_h))
     };
     // Linux's helper fails these with -ERANGE; FsError has no ERANGE, so
     // the refusal is EINVAL here as for every other plane check.
@@ -468,9 +470,6 @@ pub fn check_plane(p: &PlaneState, mode: (u32, u32)) -> Result<(), FsError> {
     if !(MIN_DOWNSCALE..=MAX_UPSCALE).contains(&scale_w)
         || !(MIN_DOWNSCALE..=MAX_UPSCALE).contains(&scale_h)
     {
-        return Err(FsError::InvalidData);
-    }
-    if rot90 {
         return Err(FsError::InvalidData);
     }
     Ok(())
@@ -605,15 +604,23 @@ fn display_planes(
             .framebuffer(p.fb_id.ok_or(FsError::InvalidData)?)
             .map_err(|_| FsError::NotFound)?;
         let props = p.props.unwrap_or(PlaneProps::new(0));
+        let surface = plane_surface(fb, props)?;
+        let rotation = rotation(props.rotation);
+        // DML21's SourceFormatPixelAndScanSupport: a linear surface cannot
+        // be scanned vertically, so dc_validate_global_state refuses a
+        // linear plane rotated 90 or 270 whatever the mode.
+        if rotation.orthogonal() && surface.tiling.swizzle == Swizzle::Linear {
+            return Err(FsError::InvalidData);
+        }
         Ok::<_, FsError>(PlaneGeometry {
             src_x: p.src_x,
             src_y: p.src_y,
             width: p.src_w,
             height: p.src_h,
             dst: Rect::new(p.crtc_x, p.crtc_y, p.crtc_w as i32, p.crtc_h as i32),
-            rotation: rotation(props.rotation),
+            rotation,
             blend: blend(format, props, overlay),
-            surface: plane_surface(fb, props)?,
+            surface,
             fb_size: (fb.width, fb.height),
         })
     };
@@ -851,7 +858,9 @@ mod tests {
     /// amdgpu_dm_plane_helper_check_state and fill_dc_scaling_info with
     /// DCN401's caps: 16x up passes and 17x does not; 6:1 down is refused
     /// by the integer limits (scale 166 < 167), 5.9:1 passes; the viewport
-    /// left on the CRTC must be 24x12; 90/270 rotation is refused.
+    /// left on the CRTC must be 24x12. A 90/270 rotation swaps the source
+    /// for the helper's limits: a 1920x200 source shown at 1920x200 is
+    /// 9.6:1 down vertically once turned.
     fn drm_native_planes_scaling_and_viewport_limits() -> TestResult {
         let mode = (1920, 1080);
         let p = |src: (u32, u32), dst| on(OVERLAY_PLANE_ID_BASE, 0, src, dst);
@@ -881,12 +890,15 @@ mod tests {
             return TestResult::Fail("plane outside the caps accepted");
         }
         let mut turned = ok[0].clone();
+        let mut strip = p((1920, 200), (0, 0, 1920, 200));
         for (rotation, fine) in [(1u8, true), (2, false), (4, true), (8, false)] {
-            turned.props = Some(PlaneProps {
+            let props = Some(PlaneProps {
                 rotation,
                 ..PlaneProps::new(0)
             });
-            if check_plane(&turned, mode).is_ok() != fine {
+            turned.props = props;
+            strip.props = props;
+            if check_plane(&turned, mode).is_err() || check_plane(&strip, mode).is_ok() != fine {
                 return TestResult::Fail("rotation");
             }
         }
@@ -1159,6 +1171,124 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/drm",
         drm_native_planes_carry_tiling_and_yuv_color
+    );
+
+    /// amdgpu_dm's "rotation" reaches DC on every plane (fill_dc_plane_info_
+    /// and_addr's ROTATION_ANGLE): a tiled overlay or primary turned 90 or
+    /// 270 is placed with its rotation, and a linear one is refused (DML21
+    /// scans no linear surface vertically), as is a linear NV12 one; 180
+    /// stays fine on linear.
+    fn drm_native_planes_rotate_tiled_planes_90_and_270() -> TestResult {
+        use crate::amdgpu_dcn401_otg::{DccBlock, Tiling};
+        use crate::amdgpu_dm_modifiers::{FbCmd, FB_MODIFIERS, NV12};
+        let (mut card, fbs) = card();
+        card.gfx12_modifiers = true;
+        let tiled = Tiling {
+            swizzle: Swizzle::S64K2D,
+            dcc: Some(DccBlock::B128),
+        };
+        let mut fb = |w: u32, h: u32, format: u32, modifier: u64| {
+            let handle = card.gem.alloc(0x3000_0000, 64 << 20).unwrap();
+            let mut cmd = FbCmd {
+                width: w,
+                height: h,
+                pixel_format: format,
+                flags: FB_MODIFIERS,
+                ..FbCmd::default()
+            };
+            cmd.handles[0] = handle;
+            cmd.pitches[0] = if format == NV12 { 2048 } else { 8192 };
+            cmd.modifier[0] = modifier;
+            if format == NV12 {
+                cmd.handles[1] = handle;
+                cmd.pitches[1] = 2048;
+                cmd.offsets[1] = 8 << 20;
+            }
+            card.addfb2_cmd(&cmd).unwrap()
+        };
+        let portrait = fb(1080, 1920, XR24, tiled.modifier());
+        let video = fb(720, 1280, NV12, 0);
+        let mode = |_| {
+            Some(crate::Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+                bpp: 32,
+            })
+        };
+        let turned = |id: u32, fb: u32, src: (u32, u32), dst, rotation: u8| {
+            let mut p = on(id, fb, src, dst);
+            p.props = Some(PlaneProps {
+                rotation,
+                ..PlaneProps::new(if id == OVERLAY_PLANE_ID_BASE {
+                    overlay_zpos(0)
+                } else {
+                    PRIMARY_ZPOS
+                })
+            });
+            p
+        };
+        let with = |planes: &[PlaneState]| {
+            let mut state = AtomicState::default();
+            state.planes.extend_from_slice(planes);
+            check(&card, &state, mode)
+        };
+        // A portrait overlay turned onto a landscape window.
+        for (bits, rotation) in [(2u8, Rotation::R90), (8, Rotation::R270)] {
+            let o = turned(
+                OVERLAY_PLANE_ID_BASE,
+                portrait,
+                (1080, 1920),
+                (100, 50, 960, 540),
+                bits,
+            );
+            let Ok(out) = with(&[o]) else {
+                return TestResult::Fail("tiled overlay turned 90/270 refused");
+            };
+            let Some(g) = out[0].setup.overlays[0] else {
+                return TestResult::Fail("turned overlay lost");
+            };
+            if g.geometry.rotation != rotation
+                || g.geometry.surface.tiling != tiled
+                || (g.geometry.width, g.geometry.height) != (1080, 1920)
+                || g.geometry.dst != Rect::new(100, 50, 960, 540)
+            {
+                return TestResult::Fail("turned overlay geometry");
+            }
+            // The primary turned too: placed, never the full-frame default.
+            let primary = turned(
+                PRIMARY_PLANE_ID_BASE,
+                portrait,
+                (1080, 1920),
+                (0, 0, 1920, 1080),
+                bits,
+            );
+            let Ok(out) = with(&[primary]) else {
+                return TestResult::Fail("tiled primary turned 90/270 refused");
+            };
+            if out[0].setup.primary.map(|g| g.rotation) != Some(rotation) {
+                return TestResult::Fail("turned primary geometry");
+            }
+        }
+        // Linear surfaces: 90/270 refused, 180 placed.
+        for (fb, src, bits, fine) in [
+            (fbs[1], (1280, 720), 2u8, false),
+            (fbs[1], (1280, 720), 8, false),
+            (video, (720, 1280), 2, false),
+            (fbs[1], (1280, 720), 4, true),
+        ] {
+            let o = turned(OVERLAY_PLANE_ID_BASE, fb, src, (0, 0, 640, 360), bits);
+            match with(&[o]) {
+                Ok(_) if fine => {}
+                Err(FsError::InvalidData) if !fine => {}
+                _ => return TestResult::Fail("linear rotation"),
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/drm",
+        drm_native_planes_rotate_tiled_planes_90_and_270
     );
 
     /// drm_atomic_normalize_zpos and the plane setup DC gets: an overlay

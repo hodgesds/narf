@@ -366,8 +366,9 @@ pub struct PlaneLayout {
     /// The stream leaves as YCbCr 4:2:0: an ODM right half's OPP takes one
     /// extra left-edge pixel (resource_get_odm_slice_src_rect).
     pub ycbcr420: bool,
-    /// ROTATE_0 or ROTATE_180: DML refuses a linear surface scanned
-    /// vertically (SourceFormatPixelAndScanSupport).
+    /// DRM's ROTATE_0/90/180/270 as DC's ROTATION_ANGLE. A 90/270 plane
+    /// is scanned vertically, which DML refuses for a linear surface
+    /// (SourceFormatPixelAndScanSupport).
     pub rotation: spl::Rotation,
     pub blend: Blend,
     /// An overlay below the primary (its normalized zpos lower than the
@@ -432,7 +433,6 @@ impl SurfaceRequest {
                 || p.stream_width > 0x3fff
                 || p.stream_height > 0x3fff
                 || self.odm.is_some() && p.stream_width % 2 != 0
-                || !matches!(p.rotation, spl::Rotation::R0 | spl::Rotation::R180)
                 || (p.blend.per_pixel_alpha && !self.format.cnvc_alpha())
                 // Some pixel must land on the stream.
                 || d.x >= p.stream_width as i32
@@ -441,6 +441,11 @@ impl SurfaceRequest {
                 || i64::from(d.y) + i64::from(d.height) <= 0
             {
                 return Err(Error::Invalid);
+            }
+            // DML's SourceFormatPixelAndScanSupport: no linear surface
+            // scanned vertically.
+            if p.rotation.orthogonal() && self.surface.tiling.swizzle == Swizzle::Linear {
+                return Err(Error::Unsupported);
             }
             // Every pipe's SPL must succeed (resource_build_scaling_params).
             if self.scalers().any(|(_, scaler)| !scaler.ok) {
@@ -689,7 +694,7 @@ impl SurfaceRequest {
             source,
             swizzle,
             dcc: self.surface.tiling.dcc.is_some(),
-            vertical_scan: matches!(l.rotation, spl::Rotation::R90 | spl::Rotation::R270),
+            vertical_scan: l.rotation.orthogonal(),
             chroma,
             surface_width: Plane::extent(self.width),
             surface_height: Plane::extent(self.height),

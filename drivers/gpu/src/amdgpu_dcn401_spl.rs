@@ -57,6 +57,13 @@ pub enum Rotation {
     R180 = 2,
     R270 = 3,
 }
+impl Rotation {
+    /// 90 or 270 degrees: the surface is scanned vertically (SPL's
+    /// orthogonal rotation, DML's dml_is_vertical_rotation).
+    pub const fn orthogonal(self) -> bool {
+        matches!(self, Rotation::R90 | Rotation::R270)
+    }
+}
 
 /// A 4:2:0 video surface format (`spl_is_yuv420`): NV12 and NV21 are
 /// SPL_PIXEL_FORMAT_420BPP8, P010 is 420BPP10. SPL treats both alike: the
@@ -316,7 +323,7 @@ impl Input {
         }
     }
     fn orthogonal(&self) -> bool {
-        matches!(self.rotation, Rotation::R90 | Rotation::R270)
+        self.rotation.orthogonal()
     }
     /// spl_calculate_scaling_ratios (stream scaling is unity).
     fn ratios(&self, d: &mut Data) {

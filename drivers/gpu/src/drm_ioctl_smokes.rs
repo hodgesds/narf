@@ -3721,7 +3721,7 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
     let Some(ms) = crate::drm_registry::mode_state(idx) else {
         return TestResult::Fail("no mode state");
     };
-    let (primary_fb, video_fb, big_fb, _deep_fb) = {
+    let (primary_fb, video_fb, big_fb, _deep_fb, tiled_fb) = {
         let mut card = ms.lock();
         card.native_atomic = true;
         card.plane_formats = Some(&crate::amdgpu_navi48_kms::PLANE_FORMATS);
@@ -3750,6 +3750,37 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
         // The native amdgpu card's GFX12 modifiers (after the packed-pitch
         // framebuffers above, which its LINEAR pitch rule refuses).
         card.gfx12_modifiers = true;
+        // A 32x32 XRGB8888 framebuffer in GFX12 256B_2D tiles, which DC
+        // can scan vertically (rotation 90/270).
+        let tiled_fb = {
+            use crate::amdgpu_dm_modifiers::{FbCmd, FB_MODIFIERS};
+            let tiling = crate::amdgpu_dcn401_otg::Tiling {
+                swizzle: crate::amdgpu_dcn401_otg::Swizzle::S256B2D,
+                dcc: None,
+            };
+            let (phys, size) = (0xBE50_0000, 64 << 10);
+            let handle = card.gem.alloc(phys, size).unwrap();
+            card.dumb_backings.push(DumbBacking {
+                gem_handle: handle,
+                phys,
+                byte_len: size,
+                order: 0,
+                mmap_offset: (handle as u64) << 12,
+                refcount: 1,
+                dma_buf: Default::default(),
+            });
+            let mut cmd = FbCmd {
+                width: 32,
+                height: 32,
+                pixel_format: XR24,
+                flags: FB_MODIFIERS,
+                ..FbCmd::default()
+            };
+            cmd.handles[0] = handle;
+            cmd.pitches[0] = 32 * 4;
+            cmd.modifier[0] = tiling.modifier();
+            card.addfb2_cmd(&cmd).unwrap()
+        };
         let crtc = card.crtc_mut(11).unwrap();
         crtc.mode = Some(crate::Mode {
             width: 64,
@@ -3759,7 +3790,7 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
         });
         crtc.enabled = true;
         crtc.primary_fb = Some(fbs.0);
-        fbs
+        (fbs.0, fbs.1, fbs.2, fbs.3, tiled_fb)
     };
     // GETPLANERESOURCES: both primaries, then the three overlays.
     let mut ids = [0u32; 8];
@@ -4016,7 +4047,11 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
     type Case = (&'static str, alloc::vec::Vec<(u32, u64)>, u32);
     let refused: [Case; 6] = [
         ("8:1 downscale", alloc::vec::Vec::from(eighth), OVERLAY),
-        ("rotate-90", with(&[(planes::ROTATION_PROP_ID, 2)]), OVERLAY),
+        (
+            "linear rotate-90",
+            with(&[(planes::ROTATION_PROP_ID, 2)]),
+            OVERLAY,
+        ),
         (
             "two rotations",
             with(&[(planes::ROTATION_PROP_ID, 5)]),
@@ -4042,6 +4077,37 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
         if atomic(0x0100, &[(*plane, props)]) != Err(FsError::InvalidData) {
             return TestResult::Fail(why);
         }
+    }
+    // amdgpu_dm's rotate-90/270 on a tiled surface: a 32x16 source turned
+    // onto a 32x32 window (2x up across, 1:1 down), TEST_ONLY then a
+    // commit that records it, then the plane disabled again.
+    let turned = |rotation: u64| {
+        let mut v = alloc::vec::Vec::from(place(tiled_fb, (32, 16), (0, 0, 32, 32)));
+        v.push((planes::ROTATION_PROP_ID, rotation));
+        v
+    };
+    if atomic(0x0100, &[(OVERLAY + 2, &turned(2))]) != Ok(0)
+        || atomic(0x0100, &[(0x40, &turned(8))]) != Ok(0)
+        || ms.lock().native_plane(OVERLAY + 2).unwrap().fb_id.is_some()
+    {
+        return TestResult::Fail("TEST_ONLY tiled rotate-90/270");
+    }
+    if atomic(0, &[(OVERLAY + 2, &turned(2))]) != Ok(0) {
+        return TestResult::Fail("tiled rotate-90 commit");
+    }
+    {
+        let card = ms.lock();
+        let p = card.native_plane(OVERLAY + 2).unwrap();
+        if (p.crtc_id, p.fb_id, p.props.rotation) != (Some(11), Some(tiled_fb), 2)
+            || p.dst != (0, 0, 32, 32)
+        {
+            return TestResult::Fail("committed rotate-90 state");
+        }
+    }
+    if atomic(0, &[(OVERLAY + 2, &[(FB_ID, 0), (CRTC_ID, 0)])]) != Ok(0)
+        || ms.lock().native_plane(OVERLAY + 2).unwrap().fb_id.is_some()
+    {
+        return TestResult::Fail("rotated overlay disable");
     }
     // An enabled CRTC needs its primary plane (dm_crtc_helper_atomic_check).
     if atomic(0x0100, &[(0x40, &[(FB_ID, 0), (CRTC_ID, 0)])]) != Err(FsError::InvalidData) {

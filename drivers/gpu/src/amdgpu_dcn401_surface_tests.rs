@@ -877,3 +877,79 @@ kernel_test_in!(
     "drivers/gpu/dcn401-surface",
     dcn401_surface_stages_tiled_dcc_video
 );
+
+/// A tiled surface turned 90 or 270 degrees: hubp2_program_rotation's
+/// ROTATION_ANGLE (1 or 3, no H_MIRROR_EN: amdgpu_dm never mirrors) beside
+/// the pixel format, and hubp401_set_viewport's viewport in surface space
+/// (SPL's orthogonal viewport, 64x32 for a 64x32 source shown 32x64). DML
+/// scans it vertically. A linear surface turned so, or a 90/270 plane
+/// without a layout's tiling, is `Unsupported` before anything is touched.
+fn dcn401_surface_stages_rotated_tiled_planes() -> TestResult {
+    use crate::amdgpu_dcn401_otg::{DccBlock, PlaneLayout, PlaneSurface, Swizzle, Tiling};
+    use crate::amdgpu_dcn401_spl::{Rect, Rotation};
+    let tiling = Tiling {
+        swizzle: Swizzle::S64K2D,
+        dcc: Some(DccBlock::B256),
+    };
+    let request = |rotation, tiling| SurfaceRequest {
+        width: 64,
+        height: 32,
+        surface: PlaneSurface {
+            tiling,
+            ..PlaneSurface::LINEAR
+        },
+        plane: Some(PlaneLayout {
+            src: Rect::new(0, 0, 64, 32),
+            dst: Rect::new(100, 50, 32, 64),
+            stream_width: 1920,
+            stream_height: 1080,
+            ycbcr420: false,
+            rotation,
+            blend: Blend::default_for(SurfaceFormat::Xrgb8888),
+            underlay: false,
+        }),
+        ..req(1)
+    };
+    for (rotation, angle) in [(Rotation::R90, 1), (Rotation::R270, 3)] {
+        let r = request(rotation, tiling);
+        if r.check().is_err() || !r.dml_plane().vertical_scan {
+            return TestResult::Fail("rotated tiled plane refused");
+        }
+        let scaler = r.scalers().next().unwrap().1;
+        if (scaler.viewport.width, scaler.viewport.height) != (64, 32)
+            || (scaler.recout.width, scaler.recout.height) != (32, 64)
+        {
+            return TestResult::Fail("rotated viewport and recout");
+        }
+        let (_backing, pool, mut e, mut surfaces) = fixture(1, 65536 + 8192);
+        let Ok(applied) = run(surfaces.prepare(&mut e, &pool, r)) else {
+            return TestResult::Fail("rotated tiled plane not staged");
+        };
+        if applied.bytes != 65536 {
+            return TestResult::Fail("rotated tiled bytes");
+        }
+        let reg = |at: u64, mask: u32| e.io.inner.regs[&h(1, at)] & mask;
+        if reg(0x5e5, 0xf7f) != 8 | angle << 8
+            || reg(0x5e7, 7) != Swizzle::S64K2D as u32
+            || reg(0x612, 0x202) != 0x202
+            || reg(0x5eb, 0x3fff_3fff) != 32 << 16 | 64
+            || reg(0x5e9, u32::MAX) != 0
+        {
+            return TestResult::Fail("rotated HUBP surface registers");
+        }
+        drop(surfaces);
+        let linear = request(rotation, Tiling::LINEAR);
+        let (_backing, pool, mut e, mut surfaces) = fixture(1, 65536 + 8192);
+        if linear.check() != Err(Error::Unsupported)
+            || run(surfaces.prepare(&mut e, &pool, linear)) != Err(Error::Unsupported)
+            || !e.io.inner.writes.is_empty()
+        {
+            return TestResult::Fail("rotated linear plane staged");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-surface",
+    dcn401_surface_stages_rotated_tiled_planes
+);

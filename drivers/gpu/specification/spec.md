@@ -3888,8 +3888,8 @@ EASF, the line buffer of dscl401_spl_calc_lb_num_partitions /
 dpp401_dscl_find_lb_memory_config), and `viewport()` returns
 hubp401_set_viewport's words (chroma equal to luma for RGB).
 `tests/dcn401_spl/check.sh` builds Linux's SPL on the host and compares
-every register word of 230 vectors (`vectors.txt`: scaled, cropped,
-positioned, ODM-sliced, rotated 180, alpha) and 210 MPC slices
+every register word of 248 vectors (`vectors.txt`: scaled, cropped,
+positioned, ODM-sliced, rotated 90/180/270, alpha) and 210 MPC slices
 (`mpc_vectors.txt`: two to four slices of scaled, windowed and rotated
 planes; harness.c with MPC set), which the
 `drivers/gpu/dcn401-spl` kernel tests replay.
@@ -3897,9 +3897,10 @@ planes; harness.c with MPC set), which the
 **Placed planes.** `otg::SurfaceRequest::plane: Option<PlaneLayout>`
 places a surface on its stream as amdgpu_dm_plane_fill_dc_scaling_info hands
 DC a plane: the source rectangle, the destination on the stream (the clip is
-the destination), the stream's size and 4:2:0 encoding, the rotation (0 or
-180; 90/270 is `Invalid`, as DML refuses a linear surface scanned vertically),
-the blending (`Blend`: per-pixel alpha, premultiplied, global alpha) and
+the destination), the stream's size and 4:2:0 encoding, the rotation (0,
+90, 180 or 270, DC's ROTATION_ANGLE; a linear surface at 90/270 is
+`Unsupported`, as DML refuses a linear surface scanned vertically,
+`Rotation::orthogonal`), the blending (`Blend`: per-pixel alpha, premultiplied, global alpha) and
 `underlay`. `None` is the unscaled full-frame primary (each ODM segment
 `Scaler::unity`). Each segment's SPL input is its ODM slice
 (resource_get_odm_slice_src_rect) and must succeed
@@ -3989,8 +3990,9 @@ per-line delivery registers, SURF1_TTU0/1; for a tiled or 4:2:0 plane
 hubp401_program_requestor's HUBPRET_CONTROL plane-1 base,
 DCN_EXPANSION_MODE, DCHUBP_REQ_SIZE_CONFIG(_C) and the unbounded-request
 bit, which the static requestor check then leaves to it).
-`tests/dcn401_dml21/surface_vectors.txt` (618 configurations: every swizzle,
-DCC, NV12/P010, scaled, ODM, vertical scan, refusals) is answered by Linux
+`tests/dcn401_dml21/surface_vectors.txt` (628 configurations: every swizzle,
+DCC, NV12/P010, scaled, ODM, vertical scan incl. rotated overlays beside an
+unrotated primary, refusals) is answered by Linux
 (`harness_surfaces.c`) and replayed by
 `dcn401_dml_matches_linux_dml21_surface_vectors`. A 4:2:0 primary is never
 the packed full-frame plane (`modeset::plane_mode` gives DML its explicit
@@ -4041,8 +4043,12 @@ amdgpu_dm_plane_helper_check_state (the 24x12 viewport left on the CRTC,
 drm_atomic_helper_check_plane_state with DCN401's 16x upscale and 6:1
 downscale caps) and amdgpu_dm_plane_fill_dc_scaling_info (non-empty
 rectangles, 167..16000 per mille); an enabled CRTC needs its primary
-(dm_crtc_helper_atomic_check); rotation 90/270 is refused (DML21 cannot scan
-a linear surface vertically); drm_atomic_normalize_zpos (zpos, then plane id)
+(dm_crtc_helper_atomic_check); rotation 90/270 swaps the source for the
+helper's scale limits and is refused on a linear framebuffer (RGB or
+NV12/P010: DML21's SourceFormatPixelAndScanSupport scans no linear surface
+vertically), while a GFX12-tiled one is placed with its rotation (HUBP
+ROTATION_ANGLE, SPL's orthogonal viewport, DML's vertical scan; never
+H_MIRROR_EN, as amdgpu_dm exposes no reflect-x/y); drm_atomic_normalize_zpos (zpos, then plane id)
 orders the stack, overlays below the primary being underlays; and the
 platform's admission. Every refusal is EINVAL (Linux's scale check returns
 -ERANGE, which FsError cannot express). A plane change needs no
@@ -4112,8 +4118,8 @@ cm_helper_program_color_matrices' packing). SPL takes `spl::Video`
 (SPL_PIXEL_FORMAT_420BPP8/10): chroma ratios/viewports/inits/taps, the 420
 SCL modes, chroma coefficient loads, EASF's video rules, LB config 3; a 4:2:0
 plane always goes through `spl::calculate` (its chroma is upscaled even
-unscaled). `tests/dcn401_spl/check.sh` also checks 124 video vectors
-(`video_vectors.txt`); `tests/dcn401_yuv/check.sh` checks 120 vectors of
+unscaled). `tests/dcn401_spl/check.sh` also checks 137 video vectors
+(`video_vectors.txt`, rotations 90/180/270 included); `tests/dcn401_yuv/check.sh` checks 120 vectors of
 fill_plane_color_attributes, dpp401_dpp_setup's format switch,
 hubp2_program_pixel_format and the post-CSC words extracted from Linux,
 replayed by `dcn401_dpp_input_conversion_matches_linux_vectors`.
@@ -4136,8 +4142,8 @@ Gaps: planes on an ODM stream
 must reach every segment; only linear, unrotated RGB planes without DCC
 are MPC-combined (any other plane one DPP cannot carry is refused); no
 RGBA8888 or 16-bit UNORM planes, no NV21 (not
-on DCN4's universal planes), no plane degamma/CTM, no rotation 90/270 (also
-on tiled surfaces, which Linux allows); DCC data is CPU-copied into the
+on DCN4's universal planes), no plane degamma/CTM, no MPC combine of a
+rotated plane (Linux splits one that a single DPP cannot carry); DCC data is CPU-copied into the
 owned surface (so written uncompressed) and the post CSC always loads set
 A; the cursor matrix of a YCbCr primary is not programmed; offered alternative modes are admitted without the
 display's overlays, and KMS admits planes only on the lit timing (a mode

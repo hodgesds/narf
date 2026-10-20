@@ -2948,6 +2948,108 @@ kernel_test_in!(
     navi48_planes_reach_admission_and_staging
 );
 
+/// amdgpu_dm's rotation 90/270 through to DML21: a portrait 1080x1920
+/// framebuffer in 64KB tiles with DCC turned onto the 1080p stream as the
+/// primary (and as an overlay window beside an unrotated primary) is
+/// admitted, its plane scanned vertically with SPL's surface-space
+/// viewport and unity ratios; the same plane linear is DML's Unsupported
+/// (SourceFormatPixelAndScanSupport).
+#[inline(never)]
+fn navi48_rotated_planes_reach_admission() -> TestResult {
+    use crate::amdgpu_dcn401_spl::{Rect, Rotation};
+    let base = completed_modeset(0).selection;
+    let soc = dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [300_000, 2_500_000],
+        dcfclk_khz: [200_000, 1_564_000],
+        socclk_khz: 300_000,
+        dispclk_max_khz: 2_000_000,
+        dppclk_max_khz: 2_000_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    let tiled = otg::PlaneSurface {
+        tiling: otg::Tiling {
+            swizzle: otg::Swizzle::S64K2D,
+            dcc: Some(otg::DccBlock::B128),
+        },
+        ..otg::PlaneSurface::LINEAR
+    };
+    let portrait = |dst: Rect, rotation, surface| PlaneGeometry {
+        src_x: 0,
+        src_y: 0,
+        width: 1080,
+        height: 1920,
+        dst,
+        rotation,
+        blend: otg::Blend::default_for(base.format),
+        surface,
+        fb_size: (1080, 1920),
+    };
+    let full = Rect::new(0, 0, 1920, 1080);
+    for rotation in [Rotation::R90, Rotation::R270] {
+        let primary = Selection {
+            planes: PlaneSetup {
+                primary: Some(portrait(full, rotation, tiled)),
+                ..PlaneSetup::NONE
+            },
+            ..base
+        };
+        let window = Selection {
+            planes: PlaneSetup {
+                overlays: [
+                    Some(OverlayPlane {
+                        geometry: portrait(Rect::new(960, 0, 960, 540), rotation, tiled),
+                        format: base.format,
+                        underlay: false,
+                        plane: 0,
+                    }),
+                    None,
+                    None,
+                ],
+                ..PlaneSetup::NONE
+            },
+            ..base
+        };
+        let mode = selection_mode(&primary);
+        let Some(p) = mode.planes[0] else {
+            return TestResult::Fail("rotated primary not a DML plane");
+        };
+        if !p.vertical_scan
+            || (u32::from(p.viewport_width), u32::from(p.viewport_height)) != (1080, 1920)
+            || (p.h_ratio, p.v_ratio) != (1 << 19, 1 << 19)
+        {
+            return TestResult::Fail("rotated primary DML plane");
+        }
+        if admit_displays(&soc, &[primary]).is_err() {
+            return TestResult::Fail("rotated tiled primary refused");
+        }
+        match admit_displays(&soc, &[window]) {
+            Ok(plans) if plans[0].plane(1).is_some() => {}
+            _ => return TestResult::Fail("rotated tiled overlay refused"),
+        }
+        let linear = Selection {
+            planes: PlaneSetup {
+                primary: Some(portrait(full, rotation, otg::PlaneSurface::LINEAR)),
+                ..PlaneSetup::NONE
+            },
+            ..base
+        };
+        if !matches!(
+            admit_displays(&soc, &[linear]),
+            Err(dml::Error::Unsupported)
+        ) {
+            return TestResult::Fail("rotated linear primary admitted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_rotated_planes_reach_admission
+);
+
 /// An HDMI 2.1 sink's HF-VSDB with its DSC fields: 600 MHz, SCDC,
 /// Max_FRL_Rate 6, DSC 1.2 with 10 bpc, DSC_Max_FRL_Rate 6, DSC_MaxSlices
 /// code 4 (eight slices at 340 MP/s) and 20 KiB of chunk buffer.
