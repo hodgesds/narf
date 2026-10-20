@@ -149,8 +149,37 @@ fn write32(io: &mut impl Io, at: u64, value: u32) -> Result<(), Error> {
     }
     Ok(())
 }
-fn program(io: &mut impl Io, l: Layout, vector: u8, apic: u32) -> Result<(), Error> {
+/// The one MSI message the function posts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Message {
+    address: u64,
+    data: u16,
+}
+/// x86 LAPIC-directed message: fixed delivery, physical destination.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+fn x86_message(vector: u8, apic: u32) -> Result<Message, Error> {
     if !(48..240).contains(&vector) || apic > 255 {
+        return Err(Error::Unsupported);
+    }
+    Ok(Message {
+        address: 0xfee00000 | (u64::from(apic) << 12),
+        data: u16::from(vector),
+    })
+}
+/// GICv3 ITS message: the function writes its EventID to GITS_TRANSLATER
+/// (Linux its_pci_msi_prepare / its_irq_compose_msi_msg).
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn its_message(doorbell: u64, event: u32) -> Result<Message, Error> {
+    if doorbell == 0 || doorbell & 3 != 0 {
+        return Err(Error::Unsupported);
+    }
+    Ok(Message {
+        address: doorbell,
+        data: u16::try_from(event).map_err(|_| Error::Unsupported)?,
+    })
+}
+fn program(io: &mut impl Io, l: Layout, msg: Message) -> Result<(), Error> {
+    if msg.address & 3 != 0 || (!l.address64 && msg.address >> 32 != 0) {
         return Err(Error::Unsupported);
     }
     check(io, l)?;
@@ -164,15 +193,11 @@ fn program(io: &mut impl Io, l: Layout, vector: u8, apic: u32) -> Result<(), Err
     } else {
         0
     };
-    write32(io, l.msi + 4, 0xfee00000 | (apic << 12))?;
+    write32(io, l.msi + 4, msg.address as u32)?;
     if l.address64 {
-        write32(io, l.msi + 8, 0)?;
+        write32(io, l.msi + 8, (msg.address >> 32) as u32)?;
     }
-    write16(
-        io,
-        l.msi + if l.address64 { 12 } else { 8 },
-        u16::from(vector),
-    )?;
+    write16(io, l.msi + if l.address64 { 12 } else { 8 }, msg.data)?;
     let old = io.reg_read(l.nbio);
     if old == u32::MAX {
         return Err(Error::DeviceGone);
@@ -191,9 +216,13 @@ fn program(io: &mut impl Io, l: Layout, vector: u8, apic: u32) -> Result<(), Err
     }
     write16(io, l.msi + 2, control | 1)
 }
-fn target_apic() -> Result<u32, Error> {
+/// Where this function's MSIs go: the x2APIC ID on x86_64, the ITS
+/// DeviceID of this function on aarch64 (RID mapped through IORT / DT
+/// msi-map). Side-effect free, so a refusal leaves the route Prepared.
+fn target(rid: (u16, u16)) -> Result<u32, Error> {
     #[cfg(target_arch = "x86_64")]
     {
+        let _ = rid;
         // SAFETY: native route enable requires initialized CPU interrupt control.
         let id = unsafe { narf_interrupts::x86_64::apic::apic_id() };
         if id <= 255 {
@@ -202,11 +231,42 @@ fn target_apic() -> Result<u32, Error> {
             Err(Error::Unsupported)
         }
     }
-    // The current ITS helper has no hardware ITT backing. Do not emit a device
-    // MSI using its QEMU-only mapping; the ring service can still poll on ARM.
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
     {
+        use narf_interrupts::aarch64::its;
+        if its::status().is_none() {
+            return Err(Error::Unsupported);
+        }
+        its::pci_device_id(rid.0, rid.1).ok_or(Error::Unsupported)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = rid;
         Err(Error::Unsupported)
+    }
+}
+/// Bind `vector` for `target` and build the message to program.
+///
+/// aarch64: a one-vector ITT for the DeviceID (MAPD), EventID 0 → the
+/// vector's LPI (MAPTI + INV + SYNC). Like the handler, the mapping is
+/// retained with the vector after failure or disable.
+///
+/// # Safety
+/// `target` came from [`target`] for this exclusively owned function.
+unsafe fn bind(vector: u8, target: u32) -> Result<Message, Error> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        use narf_interrupts::aarch64::its;
+        // SAFETY: caller contract: this DeviceID is our function's.
+        unsafe { its::create_device(target, 1) }.map_err(|_| Error::Unsupported)?;
+        // SAFETY: same device; LPI of a vector we own.
+        unsafe { its::map_event(target, 0, its::lpi_for_vector(vector), 0) }
+            .map_err(|_| Error::Unsupported)?;
+        its_message(its::doorbell_pa(), 0)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        x86_message(vector, target)
     }
 }
 #[derive(Debug)]
@@ -216,6 +276,8 @@ pub struct Route {
     layout: Layout,
     state: State,
     vector: Option<u8>,
+    /// PCI (segment, requester ID), for the ITS DeviceID.
+    rid: (u16, u16),
 }
 impl Route {
     /// # Safety
@@ -234,9 +296,13 @@ impl Route {
         {
             return Err(Error::Unsupported);
         }
-        let BusKind::Pcie { cfg_phys, .. } = pci.kind else {
+        let BusKind::Pcie { cfg_phys, addr } = pci.kind else {
             return Err(Error::Unsupported);
         };
+        let rid = (
+            addr.segment,
+            u16::from(addr.bus) << 8 | u16::from(addr.device) << 3 | u16::from(addr.function),
+        );
         let config = narf_bus::ecam::va_for(cfg_phys).ok_or(Error::Unsupported)?;
         let ip = ip::find_ip(&gpu.ip_blocks, ip::HW_ID_NBIF, 0).ok_or(Error::Unsupported)?;
         let (index, reg) = if ip.major == 6 {
@@ -284,6 +350,7 @@ impl Route {
             layout,
             state: State::Prepared,
             vector: None,
+            rid,
         })
     }
     pub fn state(&self) -> State {
@@ -302,7 +369,7 @@ impl Route {
             return Err(Error::Busy);
         }
         {
-            let apic = target_apic()?;
+            let target = target(self.rid)?;
             let vector = narf_interrupts::vector::alloc().map_err(|_| Error::Exhausted)?;
             // 0xf0 is also the architecture's fixed TLB-shootdown vector.
             // Never attach a device there even if the generic pool offers it.
@@ -317,10 +384,14 @@ impl Route {
             });
             let io = &mut self.io;
             let l = self.layout;
-            let result = self
-                .authority
-                .invoke(Op(|| program(io, l, vector, apic)))
-                .map_err(|_| Error::Revoked)
+            let authority = &self.authority;
+            // SAFETY: `target` names this exclusively owned function.
+            let result = unsafe { bind(vector, target) }
+                .and_then(|msg| {
+                    authority
+                        .invoke(Op(|| program(io, l, msg)))
+                        .map_err(|_| Error::Revoked)
+                })
                 .and_then(|r| r)
                 .and_then(|()| {
                     // SAFETY: the named handler is installed and PCI MSI readback
