@@ -15,7 +15,8 @@
 //!
 //! ## What this file owns
 //!
-//! - The legacy ARP cache + `arp_resolve` helper (kept so the
+//! - The legacy ARP cache + the neighbour output queue
+//!   (`neigh_output_in`, never waiting on a reply) (kept so the
 //!   existing `arp_cache`, `dhcp`, `udp_sock`, `icmp_sock`, and
 //!   `ipv6_stack` modules keep compiling without churn).
 //! - The L2 → L3 RX dispatch that routes incoming frames to
@@ -28,7 +29,6 @@ use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
-use narf_scheduler::narf_time;
 
 use crate::arp_cache;
 use crate::iface;
@@ -94,77 +94,120 @@ pub fn send_arp_request_in(net_ns_id: u64, target_ip: [u8; 4]) -> Result<(), ()>
     iface.xmit(&frame[..n])
 }
 
-/// Resolve `ip` to a MAC: cache → ARP-request → busy-wait for reply.
-/// Returns the MAC on success, `Err(())` on timeout.
 /// Non-blocking neighbour lookup: the cached MAC for `ip`, or `None`.
 /// For RX-path callers (e.g. a TCP reset) that must never spin on ARP.
 pub(crate) fn arp_cached_in(net_ns_id: u64, ip: [u8; 4]) -> Option<[u8; 6]> {
     arp_lookup_local(net_ns_id, ip)
 }
 
-pub fn arp_resolve(ip: [u8; 4], timeout_ms: u64) -> Result<[u8; 6], ()> {
-    arp_resolve_in(0, ip, timeout_ms)
+/// `neigh_output` / `neigh_resolve_output` for an IPv4 next hop: run `cont`
+/// with the MAC now if the neighbour is known, otherwise queue it on the
+/// neighbour (`__neigh_event_send`) and start resolution — never wait. The
+/// ARP reply runs the queued continuations ([`neigh_resolved`]); the
+/// neighbour timer ([`neigh_tick`]) retransmits the request and, once the
+/// probes are spent, runs them with `None` (`arp_error_report`). A
+/// neighbour already given up on (NUD_FAILED) fails at once. `len` is the
+/// frame's size, for the `unres_qlen_bytes` bound.
+pub fn neigh_output_in(net_ns_id: u64, nexthop: [u8; 4], len: usize, cont: arp_cache::NeighCont) {
+    if let Some(mac) = arp_lookup_local(net_ns_id, nexthop) {
+        cont(Some(mac));
+        return;
+    }
+    let Some(name) = iface::for_dst_in(net_ns_id, nexthop).map(|i| i.name) else {
+        cont(None);
+        return;
+    };
+    if arp_cache::resolution_failed(&name, nexthop) {
+        cont(None);
+        return;
+    }
+    let resolving = matches!(
+        arp_cache::entry_state(&name, nexthop),
+        Some(arp_cache::ArpState::Incomplete)
+    );
+    // Queue before asking, so a reply cannot overtake the transmit.
+    arp_cache::queue_pending(net_ns_id, &name, nexthop, len, cont);
+    if !resolving {
+        arp_cache::mark_incomplete(&name, nexthop);
+        let _ = send_arp_request_in(net_ns_id, nexthop);
+    }
+    // Resolved between the lookup and the queueing: flush now.
+    if let Some(mac) = arp_lookup_local(net_ns_id, nexthop) {
+        neigh_resolved(net_ns_id, &name, nexthop, mac);
+    }
 }
 
-pub fn arp_resolve_in(net_ns_id: u64, ip: [u8; 4], timeout_ms: u64) -> Result<[u8; 6], ()> {
-    if let Some(m) = arp_lookup_local(net_ns_id, ip) {
-        return Ok(m);
+/// Start resolving `nexthop` unless that is already under way, without
+/// waiting: the cached MAC if it is known, else `None` after the request is
+/// out. For callers with their own queue of frames for the neighbour.
+pub fn neigh_start_in(net_ns_id: u64, nexthop: [u8; 4]) -> Option<[u8; 6]> {
+    if let Some(mac) = arp_lookup_local(net_ns_id, nexthop) {
+        return Some(mac);
     }
-    // The cache is keyed by interface, so resolution state is tracked
-    // against the interface that actually owns the route.
-    let iface_name = iface::for_dst_in(net_ns_id, ip).map(|i| i.name);
+    let name = iface::for_dst_in(net_ns_id, nexthop)?.name;
+    if arp_cache::resolution_failed(&name, nexthop)
+        || matches!(
+            arp_cache::entry_state(&name, nexthop),
+            Some(arp_cache::ArpState::Incomplete)
+        )
+    {
+        return None;
+    }
+    arp_cache::mark_incomplete(&name, nexthop);
+    let _ = send_arp_request_in(net_ns_id, nexthop);
+    arp_lookup_local(net_ns_id, nexthop)
+}
 
-    // Negative cache. Linux drops packets to a NUD_FAILED neighbour without
-    // re-probing; without this, every send to a host that is switched off
-    // restarts a full probe cycle, turning one unreachable address into a
-    // burst of broadcast per packet.
-    if let Some(name) = iface_name.as_deref() {
-        if crate::arp_cache::resolution_failed(name, ip) {
-            return Err(());
+/// An ARP packet taught us `ip`'s MAC on `iface_name`: send everything that
+/// was waiting for it (`neigh_update` → `neigh_update_process_arp_queue`).
+pub fn neigh_resolved(net_ns_id: u64, iface_name: &str, ip: [u8; 4], mac: [u8; 6]) {
+    for cont in arp_cache::take_pending(net_ns_id, iface_name, ip) {
+        cont(Some(mac));
+    }
+    crate::udp_sock::neighbor_resolved(net_ns_id, iface_name, ip, mac);
+}
+
+/// The neighbour timer (`neigh_timer_handler`) for resolutions that have
+/// transmits waiting: retransmit the request every `RETRANS_TIME`, and once
+/// the probe budget is spent mark the neighbour FAILED and fail its queue.
+pub fn neigh_tick() {
+    let mut waiting = arp_cache::pending_neighbours();
+    for n in crate::udp_sock::pending_neighbours() {
+        if !waiting.contains(&n) {
+            waiting.push(n);
         }
-        crate::arp_cache::mark_incomplete(name, ip);
     }
-
-    let _ = send_arp_request_in(net_ns_id, ip);
-    let deadline = narf_time::Deadline::after_ns(timeout_ms.saturating_mul(1_000_000));
-    let mut gave_up = false;
-    let _ = narf_scheduler::responsive_spin_until(
-        || {
-            while iface::drain_pump() {}
-            if arp_lookup_local(net_ns_id, ip).is_some() {
-                return true;
+    for (net_ns_id, name, ip) in waiting {
+        match arp_cache::poll_resolution(&name, ip) {
+            arp_cache::ResolutionStep::Retransmit => {
+                let _ = send_arp_request_in(net_ns_id, ip);
             }
-            // Retransmit on the 1 s timer rather than firing once and
-            // hoping. A single request lost to a dropped frame used to sink
-            // the whole resolution until the caller's timeout expired.
-            if let Some(name) = iface_name.as_deref() {
-                match crate::arp_cache::poll_resolution(name, ip) {
-                    crate::arp_cache::ResolutionStep::Retransmit => {
-                        let _ = send_arp_request_in(net_ns_id, ip);
+            arp_cache::ResolutionStep::GaveUp => {
+                for cont in arp_cache::take_pending(net_ns_id, &name, ip) {
+                    cont(None);
+                }
+                crate::udp_sock::neighbor_failed(net_ns_id, &name, ip);
+            }
+            arp_cache::ResolutionStep::Wait => {
+                // A neighbour that is no longer resolving (resolved by a
+                // path that did not flush, or evicted) releases its queue.
+                if !matches!(
+                    arp_cache::entry_state(&name, ip),
+                    Some(arp_cache::ArpState::Incomplete)
+                ) {
+                    match arp_lookup_local(net_ns_id, ip) {
+                        Some(mac) => neigh_resolved(net_ns_id, &name, ip, mac),
+                        None => {
+                            for cont in arp_cache::take_pending(net_ns_id, &name, ip) {
+                                cont(None);
+                            }
+                            crate::udp_sock::neighbor_failed(net_ns_id, &name, ip);
+                        }
                     }
-                    crate::arp_cache::ResolutionStep::GaveUp => {
-                        gave_up = true;
-                        return true;
-                    }
-                    crate::arp_cache::ResolutionStep::Wait => {}
                 }
             }
-            false
-        },
-        deadline,
-    );
-    if gave_up {
-        return Err(());
+        }
     }
-    let resolved = arp_lookup_local(net_ns_id, ip);
-    if resolved.is_none() {
-        // The caller's deadline expired before the probe budget did. That
-        // is NOT a failed resolution — the entry stays Incomplete so a
-        // later attempt resumes the remaining probes instead of starting a
-        // negative-cache entry the host never earned.
-        return Err(());
-    }
-    resolved.ok_or(())
 }
 
 // ── RX dispatch ─────────────────────────────────────────────────
@@ -390,7 +433,7 @@ pub fn handle_arp_on_in(body: &[u8], net_ns_id: u64, iface_name: Option<&str>) {
     // Per-iface cache: record on the ingress interface if known.
     if let Some(name) = iface_name {
         arp_cache::insert(name, arp.spa, arp.sha);
-        crate::udp_sock::neighbor_resolved(net_ns_id, name, arp.spa, arp.sha);
+        neigh_resolved(net_ns_id, name, arp.spa, arp.sha);
     }
     if arp.op == ARP_OP_REQUEST {
         // Answer from whichever iface actually owns the requested
@@ -706,6 +749,7 @@ pub fn signal_icmp_error_in(
 static TIMER_PUMP_INSTALLED: AtomicUsize = AtomicUsize::new(0);
 
 fn timer_tick_pump() {
+    neigh_tick();
     crate::tcp::core::tick_all();
     crate::ip_fragment::tick();
 }

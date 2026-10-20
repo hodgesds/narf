@@ -56,10 +56,6 @@ use crate::pkt_icmp_extra::{
     DUR_NET_UNREACHABLE, ICMP_DEST_UNREACHABLE, TE_TTL_EXCEEDED_IN_TRANSIT,
 };
 use crate::route;
-use crate::tcp_stack::arp_resolve_in;
-
-/// How long to wait for the next hop's MAC. Matches the ICMP reply path.
-const ARP_TIMEOUT_MS: u64 = 1000;
 
 /// IPv4 fragment-control bits, in the flags/offset word at byte 6.
 const IP_DF: u16 = 0x4000;
@@ -235,12 +231,20 @@ pub fn try_forward(net_ns_id: u64, iface_in: &str, packet: &[u8]) -> bool {
     owned[CHECKSUM_OFF..CHECKSUM_OFF + 2].copy_from_slice(&cs.to_be_bytes());
 
     // ── Emit ──
-    let dst_mac = match arp_resolve_in(net_ns_id, route.nexthop.0, ARP_TIMEOUT_MS) {
-        Ok(m) => m,
-        // Linux answers an unresolvable neighbour with Host Unreachable.
-        Err(_) => return true,
-    };
-    send_ipv4(net_ns_id, &egress, dst_mac, &owned);
+    // `ip_finish_output2` → `neigh_output`: forwarding runs in the RX path, so
+    // an unresolved next hop queues the packet on the neighbour rather than
+    // waiting for it; resolution failing drops it.
+    let len = ETH_HDR_LEN + owned.len();
+    crate::tcp_stack::neigh_output_in(
+        net_ns_id,
+        route.nexthop.0,
+        len,
+        alloc::boxed::Box::new(move |mac| {
+            if let Some(mac) = mac {
+                send_ipv4(net_ns_id, &egress, mac, &owned);
+            }
+        }),
+    );
     true
 }
 
@@ -314,16 +318,12 @@ fn send_ipv4(net_ns_id: u64, egress: &iface::NetIfaceSnapshot, dst_mac: [u8; 6],
 /// by definition somewhere else, and for an off-link one its own address has
 /// no MAC on this segment to find.
 fn send_icmp_error(net_ns_id: u64, dst: Ipv4Addr, icmp_body: Vec<u8>) {
-    send_icmp_error_with(net_ns_id, dst, None, icmp_body, |nexthop| {
-        arp_resolve_in(net_ns_id, nexthop, ARP_TIMEOUT_MS).ok()
-    });
+    send_icmp_error_with(net_ns_id, dst, None, icmp_body);
 }
 
-/// [`send_icmp_error`] for callers that must never spin on ARP — the
-/// fragment-reassembly expiry runs from the net timer pump, where a 1 s
-/// busy-wait for a neighbour would stall every other pump. An unresolved
-/// next hop gets an ARP request and the error is dropped, the way it would
-/// be once a neighbour's queue overflows.
+/// [`send_icmp_error`] with a source address override. Neither waits on
+/// ARP (both run in the RX path or the net timer pump): an unresolved next
+/// hop queues the error on the neighbour.
 ///
 /// `src` overrides the source address: an error about a datagram that was
 /// addressed to this host is sourced from that destination address
@@ -334,13 +334,7 @@ pub(crate) fn send_icmp_error_nonblocking(
     src: Option<[u8; 4]>,
     icmp_body: Vec<u8>,
 ) {
-    send_icmp_error_with(net_ns_id, dst, src, icmp_body, |nexthop| {
-        let mac = crate::tcp_stack::arp_cached_in(net_ns_id, nexthop);
-        if mac.is_none() {
-            let _ = crate::tcp_stack::send_arp_request_in(net_ns_id, nexthop);
-        }
-        mac
-    });
+    send_icmp_error_with(net_ns_id, dst, src, icmp_body);
 }
 
 fn send_icmp_error_with(
@@ -348,7 +342,6 @@ fn send_icmp_error_with(
     dst: Ipv4Addr,
     src_override: Option<[u8; 4]>,
     icmp_body: Vec<u8>,
-    resolve: impl FnOnce([u8; 4]) -> Option<[u8; 6]>,
 ) {
     let (egress, nexthop, src) = match route::route_lookup_in(net_ns_id, dst) {
         Some(r) => match iface::lookup_in(net_ns_id, &r.iface) {
@@ -373,13 +366,10 @@ fn send_icmp_error_with(
         },
     };
     let src = src_override.unwrap_or(src);
-    let dst_mac = match resolve(nexthop.0) {
-        Some(m) => m,
-        None => return,
-    };
     let ip_total = MIN_HDR + icmp_body.len();
     let mut frame = alloc::vec![0u8; ETH_HDR_LEN + ip_total];
-    write_eth_header(&mut frame, dst_mac, egress.mac, ETHERTYPE_IPV4);
+    // The destination MAC is filled in once the next hop resolves.
+    write_eth_header(&mut frame, [0u8; 6], egress.mac, ETHERTYPE_IPV4);
     crate::pkt::write_ipv4_header(
         &mut frame[ETH_HDR_LEN..],
         ip_total as u16,
@@ -389,7 +379,18 @@ fn send_icmp_error_with(
     );
     crate::pkt::set_ipv4_checksum(&mut frame[ETH_HDR_LEN..ETH_HDR_LEN + MIN_HDR]);
     frame[ETH_HDR_LEN + MIN_HDR..].copy_from_slice(&icmp_body);
-    let _ = egress.xmit(&frame);
+    let len = frame.len();
+    crate::tcp_stack::neigh_output_in(
+        net_ns_id,
+        nexthop.0,
+        len,
+        alloc::boxed::Box::new(move |mac| {
+            if let Some(mac) = mac {
+                frame[..6].copy_from_slice(&mac);
+                let _ = egress.xmit(&frame);
+            }
+        }),
+    );
 }
 
 // ── ICMP Redirect ───────────────────────────────────────────────────────────

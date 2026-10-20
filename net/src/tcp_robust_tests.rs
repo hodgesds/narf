@@ -312,6 +312,217 @@ fn smoke_isn_monotonic_per_tuple() -> TestResult {
 }
 kernel_test_in!("net/tcp/robust", smoke_isn_monotonic_per_tuple);
 
+// ── Neighbour resolution never waits (`neigh_output`) ──────────────────
+
+const OUR_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0x31];
+
+fn ethertype(f: &[u8]) -> u16 {
+    u16::from_be_bytes([f[12], f[13]])
+}
+
+fn arp_requests_for(frames: &[Vec<u8>], ip: [u8; 4]) -> usize {
+    frames
+        .iter()
+        .filter(|f| ethertype(f) == 0x0806 && f.get(38..42) == Some(&ip[..]))
+        .count()
+}
+
+fn tcp_frames(frames: &[Vec<u8>]) -> Vec<&Vec<u8>> {
+    frames
+        .iter()
+        .filter(|f| ethertype(f) == 0x0800 && f.get(ETH_HDR_LEN + 9) == Some(&6))
+        .collect()
+}
+
+/// `peer` (at `peer_mac`) answers our ARP request on `iface`.
+fn arp_reply(iface: &str, local: [u8; 4], peer: [u8; 4], peer_mac: [u8; 6]) {
+    let request = crate::pkt::ArpPacket {
+        op: crate::pkt::ARP_OP_REQUEST,
+        sha: OUR_MAC,
+        spa: local,
+        tha: [0; 6],
+        tpa: peer,
+    };
+    let mut frame = [0u8; 64];
+    let n = crate::pkt::build_arp_reply(&mut frame, peer_mac, peer, &request).unwrap_or(0);
+    crate::tcp_stack::handle_arp_on_in(&frame[ETH_HDR_LEN..n], 0, Some(iface));
+}
+
+/// An active open to an on-link peer whose MAC is unknown returns at once:
+/// the ARP request goes out and the SYN waits on the neighbour (Linux
+/// `__neigh_event_send`) — no busy-wait in connect. The ARP reply sends the
+/// SYN, addressed to the MAC it taught, and the TCB keeps that MAC.
+fn smoke_connect_queues_syn_on_unresolved_neighbour() -> TestResult {
+    let local = [10, 0, 99, 1];
+    let _ = reset("tcp-rob-neigh", local);
+    let peer = [10, 0, 99, 7];
+    let peer_mac = [0x52, 0x54, 0, 0, 0, 7];
+    let t0 = narf_scheduler::narf_time::monotonic_ns();
+    let Ok(id) = core::connect_start_in(0, peer, 80, core::ConnectOptions::default()) else {
+        return TestResult::Fail("connect_start_in failed for an on-link peer");
+    };
+    if narf_scheduler::narf_time::monotonic_ns() - t0 > 200_000_000 {
+        return TestResult::Fail("connect_start_in waited on ARP");
+    }
+    let frames = drain();
+    if arp_requests_for(&frames, peer) != 1 || !tcp_frames(&frames).is_empty() {
+        return TestResult::Fail("want exactly one ARP request and no SYN before resolution");
+    }
+    if crate::arp_cache::__pending_count("tcp-rob-neigh", peer) != 1 {
+        return TestResult::Fail("the SYN is not queued on the neighbour");
+    }
+    arp_reply("tcp-rob-neigh", local, peer, peer_mac);
+    let frames = drain();
+    let syns = tcp_frames(&frames);
+    if syns.len() != 1 || frame_flags(syns[0]) & FLAG_SYN == 0 || syns[0][..6] != peer_mac {
+        return TestResult::Fail("the ARP reply did not send the SYN to the taught MAC");
+    }
+    if __with_tcb(id, |t| t.remote_mac) != Some(peer_mac) {
+        return TestResult::Fail("the TCB did not keep the resolved MAC");
+    }
+    if crate::arp_cache::__pending_count("tcp-rob-neigh", peer) != 0 {
+        return TestResult::Fail("the neighbour queue was not drained");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_connect_queues_syn_on_unresolved_neighbour
+);
+
+/// Resolution giving up fails the queued SYN back to its socket as an ICMP
+/// host unreachable (`arp_error_report` → `tcp_v4_err`): the connect ends
+/// with EHOSTUNREACH once the probes are spent, and every probe was sent.
+fn smoke_connect_fails_ehostunreach_when_arp_gives_up() -> TestResult {
+    let local = [10, 0, 99, 1];
+    let _ = reset("tcp-rob-neigh-fail", local);
+    let peer = [10, 0, 99, 8];
+    let Ok(id) = core::connect_start_in(0, peer, 80, core::ConnectOptions::default()) else {
+        return TestResult::Fail("connect_start_in failed");
+    };
+    let mut requests = arp_requests_for(&drain(), peer);
+    // `connect_status` takes the error (`sock_error`), so keep what it said.
+    let mut status = core::connect_status(id);
+    for _ in 0..16 {
+        if status != core::ConnectStatus::InProgress {
+            break;
+        }
+        crate::arp_cache::__force_retrans_due("tcp-rob-neigh-fail", peer);
+        crate::tcp_stack::neigh_tick();
+        requests += arp_requests_for(&drain(), peer);
+        status = core::connect_status(id);
+    }
+    if requests != 6 {
+        return TestResult::Fail("want the full probe budget (6 requests) before giving up");
+    }
+    if status != core::ConnectStatus::Failed(narf_lib::errno::EHOSTUNREACH as i32) {
+        return TestResult::Fail("a connect whose neighbour failed must be EHOSTUNREACH");
+    }
+    if crate::arp_cache::__pending_count("tcp-rob-neigh-fail", peer) != 0 {
+        return TestResult::Fail("the failed neighbour kept its queue");
+    }
+    core::release(id);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_connect_fails_ehostunreach_when_arp_gives_up
+);
+
+/// A SYN from a peer whose MAC we do not know is answered without waiting in
+/// the RX path: the SYN-ACK queues on the neighbour and goes out with the ARP
+/// reply. (This used to spin up to 500 ms inside the receive handler.)
+fn smoke_passive_synack_queues_on_unresolved_neighbour() -> TestResult {
+    let local = [10, 0, 99, 1];
+    let _ = reset("tcp-rob-neigh-rx", local);
+    let peer = [10, 0, 99, 9];
+    let peer_mac = [0x52, 0x54, 0, 0, 0, 9];
+    if listen(local, 8080, 16).is_err() {
+        return TestResult::Fail("setup: listen failed");
+    }
+    let t0 = narf_scheduler::narf_time::monotonic_ns();
+    inject(Seg {
+        src: peer,
+        dst: local,
+        sport: 40_300,
+        dport: 8080,
+        seq: 0x1000,
+        ack: 0,
+        flags: FLAG_SYN,
+        window: 65535,
+        options: Vec::new(),
+        payload: &[],
+    });
+    if narf_scheduler::narf_time::monotonic_ns() - t0 > 200_000_000 {
+        return TestResult::Fail("the RX path waited on ARP for a SYN-ACK");
+    }
+    let frames = drain();
+    if arp_requests_for(&frames, peer) != 1 || !tcp_frames(&frames).is_empty() {
+        return TestResult::Fail("want an ARP request and the SYN-ACK held back");
+    }
+    arp_reply("tcp-rob-neigh-rx", local, peer, peer_mac);
+    let frames = drain();
+    let out = tcp_frames(&frames);
+    if out.len() != 1
+        || frame_flags(out[0]) & (FLAG_SYN | FLAG_ACK) != FLAG_SYN | FLAG_ACK
+        || out[0][..6] != peer_mac
+    {
+        return TestResult::Fail("the ARP reply did not send the SYN-ACK");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_passive_synack_queues_on_unresolved_neighbour
+);
+
+/// `unres_qlen_bytes`: a neighbour holds at most `UNRES_QLEN_BYTES` of queued
+/// transmits; past it the oldest are dropped (never called), and the rest
+/// run in order when the neighbour resolves.
+fn smoke_neigh_queue_drops_oldest_past_unres_qlen_bytes() -> TestResult {
+    use ::core::sync::atomic::{AtomicU32, Ordering};
+    static SENT: AtomicU32 = AtomicU32::new(0);
+    static ORDER_OK: AtomicU32 = AtomicU32::new(1);
+    static LAST: AtomicU32 = AtomicU32::new(0);
+    let local = [10, 0, 99, 1];
+    let _ = reset("tcp-rob-neigh-q", local);
+    SENT.store(0, Ordering::SeqCst);
+    LAST.store(0, Ordering::SeqCst);
+    ORDER_OK.store(1, Ordering::SeqCst);
+    let peer = [10, 0, 99, 10];
+    let chunk = crate::arp_cache::UNRES_QLEN_BYTES / 4;
+    for i in 1..=6u32 {
+        crate::tcp_stack::neigh_output_in(
+            0,
+            peer,
+            chunk,
+            alloc::boxed::Box::new(move |mac| {
+                if mac.is_some() {
+                    SENT.fetch_add(1, Ordering::SeqCst);
+                    if LAST.swap(i, Ordering::SeqCst) >= i {
+                        ORDER_OK.store(0, Ordering::SeqCst);
+                    }
+                }
+            }),
+        );
+    }
+    if crate::arp_cache::__pending_count("tcp-rob-neigh-q", peer) != 4 {
+        return TestResult::Fail("the queue did not cap at unres_qlen_bytes");
+    }
+    arp_reply("tcp-rob-neigh-q", local, peer, [0x52, 0x54, 0, 0, 0, 10]);
+    if SENT.load(Ordering::SeqCst) != 4 || ORDER_OK.load(Ordering::SeqCst) != 1 {
+        return TestResult::Fail("the four newest transmits must run, in order");
+    }
+    if LAST.load(Ordering::SeqCst) != 6 {
+        return TestResult::Fail("the oldest transmits were not the ones dropped");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_neigh_queue_drops_oldest_past_unres_qlen_bytes
+);
+
 // ── TIME-WAIT reuse ─────────────────────────────────────────────────────
 
 /// A bare SYN from `peer:pport` to `local:lport` at `seq`.

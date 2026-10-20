@@ -2096,7 +2096,7 @@ fn vnet0_send_frame_zc(frame: narf_net::Frame, _meta: narf_net::TxMeta) -> Resul
 static DRAIN_PAIR_RR: AtomicU64 = AtomicU64::new(0);
 
 /// `iface::DrainFn` — synchronous one-frame drain used by the TCP stack's
-/// `arp_resolve` / `connect` busy-waits inside a syscall handler. A caller can
+/// in-kernel `connect_wait` busy-wait (kernel callers that cannot park). A caller can
 /// be occupying its executor while it waits, so it cannot rely on the spawned
 /// RX forwarders making progress. Drain one frame from every active queue pair
 /// in rotating order: with F_MQ, a flow's SYN-ACK returns on the pair selected

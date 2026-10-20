@@ -492,7 +492,6 @@ fn smoke_ipout_arp_pending_flushes_all_fragments() -> TestResult {
             SocketAddrV4::new(UNRESOLVED, 39214),
             &payload,
             &UdpOptions::default(),
-            0,
             None,
         );
         if sent != Ok(4000) {

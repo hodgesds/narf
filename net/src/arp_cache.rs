@@ -43,7 +43,8 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -453,10 +454,118 @@ pub fn __force_retrans_due(iface_name: &str, ip: [u8; 4]) {
     }
 }
 
+// ── Transmits waiting on resolution (`neigh->arp_queue`) ────────────────
+
+/// A transmit waiting for its next hop's MAC — Linux queues the skb on the
+/// neighbour (`__neigh_event_send`). Called once: with the MAC when an ARP
+/// reply resolves the neighbour, or with `None` when resolution gives up
+/// (`neigh_invalidate` → `arp_error_report`). A continuation dropped from a
+/// full queue is never called, as Linux frees the oldest skb.
+pub type NeighCont = Box<dyn FnOnce(Option<[u8; 6]>) + Send>;
+
+struct Pending {
+    net_ns_id: u64,
+    iface: String,
+    ip: [u8; 4],
+    len: usize,
+    cont: NeighCont,
+}
+
+/// `neigh->parms->queue_len_bytes` (`/proc/sys/net/ipv4/neigh/*/unres_qlen_bytes`,
+/// default `SK_WMEM_MAX` = 212992): the bytes one neighbour may hold queued.
+pub const UNRES_QLEN_BYTES: usize = 212_992;
+
+static PENDING: IrqSafeSpinLock<VecDeque<Pending>> = IrqSafeSpinLock::new(VecDeque::new());
+
+/// Queue `cont` (a frame of `len` bytes) on the neighbour `(iface, ip)`. Past
+/// [`UNRES_QLEN_BYTES`] the neighbour's oldest transmits are dropped first.
+pub fn queue_pending(net_ns_id: u64, iface_name: &str, ip: [u8; 4], len: usize, cont: NeighCont) {
+    let mut dropped = Vec::new();
+    {
+        let mut q = PENDING.lock();
+        let mine = |p: &Pending| p.net_ns_id == net_ns_id && p.iface == iface_name && p.ip == ip;
+        let mut held: usize = q.iter().filter(|p| mine(p)).map(|p| p.len).sum();
+        while held.saturating_add(len) > UNRES_QLEN_BYTES {
+            let Some(i) = q.iter().position(&mine) else {
+                break;
+            };
+            if let Some(old) = q.remove(i) {
+                held = held.saturating_sub(old.len);
+                dropped.push(old);
+            }
+        }
+        q.push_back(Pending {
+            net_ns_id,
+            iface: String::from(iface_name),
+            ip,
+            len,
+            cont,
+        });
+    }
+    // Freed outside the lock: a continuation's captures may hold other locks'
+    // owners alive, and dropping them must not run under this one.
+    drop(dropped);
+}
+
+/// Take every transmit queued on `(iface, ip)`, oldest first.
+pub fn take_pending(net_ns_id: u64, iface_name: &str, ip: [u8; 4]) -> Vec<NeighCont> {
+    let mut q = PENDING.lock();
+    let mut out = Vec::new();
+    let mut keep = VecDeque::with_capacity(q.len());
+    while let Some(p) = q.pop_front() {
+        if p.net_ns_id == net_ns_id && p.iface == iface_name && p.ip == ip {
+            out.push(p.cont);
+        } else {
+            keep.push_back(p);
+        }
+    }
+    *q = keep;
+    out
+}
+
+/// The neighbours with transmits queued, once each.
+pub fn pending_neighbours() -> Vec<(u64, String, [u8; 4])> {
+    let q = PENDING.lock();
+    let mut out: Vec<(u64, String, [u8; 4])> = Vec::new();
+    for p in q.iter() {
+        if !out
+            .iter()
+            .any(|(ns, name, ip)| *ns == p.net_ns_id && name == &p.iface && *ip == p.ip)
+        {
+            out.push((p.net_ns_id, p.iface.clone(), p.ip));
+        }
+    }
+    out
+}
+
+/// Drop every transmit queued on `iface_name` (the interface is going away).
+pub fn remove_interface_pending(iface_name: &str) {
+    let gone: Vec<Pending> = {
+        let mut q = PENDING.lock();
+        let (gone, keep): (VecDeque<Pending>, VecDeque<Pending>) =
+            q.drain(..).partition(|p| p.iface == iface_name);
+        *q = keep;
+        gone.into_iter().collect()
+    };
+    drop(gone);
+}
+
+/// Test helper: transmits queued on `(iface, ip)`.
+#[doc(hidden)]
+pub fn __pending_count(iface_name: &str, ip: [u8; 4]) -> usize {
+    PENDING
+        .lock()
+        .iter()
+        .filter(|p| p.iface == iface_name && p.ip == ip)
+        .count()
+}
+
 /// Test helper: flush all ARP caches.
 #[doc(hidden)]
 pub fn __reset_for_test() {
     CACHES.lock().clear();
+    let q: VecDeque<Pending> = core::mem::take(&mut *PENDING.lock());
+    drop(q);
 }
 
 /// Snapshot of one ARP cache entry. Used by `/proc/net/arp` to

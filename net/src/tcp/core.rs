@@ -207,7 +207,12 @@ pub struct Tcb {
     pub local_addr6: [u8; 16],
     pub remote_addr6: [u8; 16],
     pub remote_port: u16,
+    /// The next hop's MAC; all-zero until the neighbour resolves, in which
+    /// case `emit_tcb_frame` queues frames on it (`neigh_output`).
     pub remote_mac: [u8; 6],
+    /// IPv4 next hop `remote_mac` belongs to (the route's gateway, or the
+    /// peer itself on-link — `rt_nexthop`).
+    pub nexthop: [u8; 4],
     pub state: TcpState,
 
     // ── Sequence space (RFC 9293 §3.3.1) ──
@@ -416,16 +421,88 @@ fn emit_tcb_frame(
             iface_name,
             &mut frame.bytes_mut()[crate::pkt::ETH_HDR_LEN..],
         ) == crate::netfilter::Verdict::Accept;
-    if accepted {
-        match frame {
-            TxFrame::Owned(v) => {
-                let _ = dev.xmit_meta(&v, meta);
-            }
-            TxFrame::Dma(f) => {
-                let _ = dev.xmit_frame(f, meta);
-            }
+    if !accepted {
+        return;
+    }
+    // `ip_finish_output2` → `neigh_output`: an unresolved next hop queues the
+    // frame on the neighbour instead of waiting for it.
+    let unresolved = {
+        let tcb = arc.lock();
+        (!tcb.is_ipv6 && tcb.remote_mac == [0u8; 6]).then_some(tcb.nexthop)
+    };
+    if let Some(nexthop) = unresolved {
+        let mut v = match frame {
+            TxFrame::Owned(v) => v,
+            // A DMA pool buffer must not sit on a neighbour queue.
+            TxFrame::Dma(f) => f.payload().to_vec(),
+        };
+        let tcb = arc.clone();
+        let dev = dev.clone();
+        let len = v.len();
+        crate::tcp_stack::neigh_output_in(
+            net_ns_id,
+            nexthop,
+            len,
+            alloc::boxed::Box::new(move |mac| match mac {
+                Some(mac) => {
+                    {
+                        let mut t = tcb.lock();
+                        if t.remote_mac == [0u8; 6] {
+                            t.remote_mac = mac;
+                        }
+                    }
+                    v[..6].copy_from_slice(&mac);
+                    let _ = dev.xmit_meta(&v, meta);
+                }
+                None => neigh_failed(&tcb, &v),
+            }),
+        );
+        return;
+    }
+    match frame {
+        TxFrame::Owned(v) => {
+            let _ = dev.xmit_meta(&v, meta);
+        }
+        TxFrame::Dma(f) => {
+            let _ = dev.xmit_frame(f, meta);
         }
     }
+}
+
+/// `arp_error_report` → `ipv4_link_failure`: a segment whose next hop could
+/// not be resolved comes back to its socket as an ICMP host unreachable
+/// (`tcp_v4_err`): fatal in SYN-SENT (connect fails with EHOSTUNREACH), a
+/// soft error once established.
+fn neigh_failed(arc: &Arc<IrqSafeSpinLock<Tcb>>, frame: &[u8]) {
+    const ICMP_DEST_UNREACH: u8 = 3;
+    const ICMP_HOST_UNREACH: u8 = 1;
+    let tcp = crate::pkt::ETH_HDR_LEN + crate::pkt::IPV4_HDR_LEN;
+    let Some(seq) = frame
+        .get(tcp + 4..tcp + 8)
+        .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    else {
+        return;
+    };
+    let (ns, remote, rport, local, lport) = {
+        let t = arc.lock();
+        (
+            t.net_ns_id,
+            t.remote_addr,
+            t.remote_port,
+            t.local_addr,
+            t.local_port,
+        )
+    };
+    signal_icmp_error_in(
+        ns,
+        remote,
+        rport,
+        local,
+        lport,
+        ICMP_DEST_UNREACH,
+        ICMP_HOST_UNREACH,
+        seq,
+    );
 }
 
 impl core::fmt::Debug for Tcb {
@@ -465,6 +542,7 @@ impl Tcb {
             remote_addr6: [0; 16],
             remote_port,
             remote_mac,
+            nexthop: remote_addr,
             state: TcpState::Closed,
             snd_una: iss,
             snd_nxt: iss,
@@ -1658,8 +1736,10 @@ pub fn connect_start_in(
     let nexthop = crate::route::route_lookup_in(net_ns_id, crate::ipv4::Ipv4Addr(remote_addr))
         .map(|r| r.nexthop.0)
         .unwrap_or(remote_addr);
-    let mac = crate::tcp_stack::arp_resolve_in(net_ns_id, nexthop, 1000)
-        .map_err(|()| errno::EHOSTUNREACH as i32)?;
+    // `tcp_v4_connect` does not wait for the neighbour: an unresolved next
+    // hop leaves the MAC zero, and the SYN queues on it in `emit_tcb_frame`.
+    // Resolution failing reaches the socket as EHOSTUNREACH (`tcp_v4_err`).
+    let mac = crate::tcp_stack::arp_cached_in(net_ns_id, nexthop).unwrap_or([0u8; 6]);
     let id = fresh_tcb_id();
     // Port choice and index insertion are one step, so two racing connects
     // to the same destination cannot both take a free port.
@@ -1678,6 +1758,7 @@ pub fn connect_start_in(
             iss,
         )
         .with_net_ns(net_ns_id);
+        tcb.nexthop = nexthop;
         tcb.state = TcpState::SynSent;
         tcb.syn_retries = options.syn_retries.clamp(1, 127);
         install_tcb(tcb)
@@ -1711,8 +1792,9 @@ pub fn connect_wait(id: u32, options: ConnectOptions) -> Result<u32, i32> {
     let _ = narf_scheduler::responsive_spin_until(
         || {
             while iface::drain_pump() {}
-            // Pump retransmits from inside the spin so a lost SYN
-            // gets retried before the deadline.
+            // Pump the neighbour and SYN timers from inside the spin so a
+            // lost ARP request or SYN gets retried before the deadline.
+            crate::tcp_stack::neigh_tick();
             tick_retransmit(&arc);
             !matches!(arc.lock().state, TcpState::SynSent | TcpState::SynReceived)
         },
@@ -3751,18 +3833,19 @@ fn accept_into_listen(
         let l = listen_arc.lock();
         (l.backlog, l.net_ns_id)
     };
-    let mac = match crate::tcp_stack::arp_resolve_in(net_ns_id, src, 500) {
-        Ok(m) => m,
-        Err(_) => {
-            // Without an ARP MAC we can't reply — just drop.
-            return;
-        }
-    };
+    // The SYN-ACK goes through the neighbour like any output (`ip_build_and_
+    // send_pkt`): this runs in the RX path and must not wait for ARP, so an
+    // unresolved next hop leaves the MAC zero and the SYN-ACK queues on it.
+    let nexthop = crate::route::route_lookup_in(net_ns_id, crate::ipv4::Ipv4Addr(src))
+        .map(|r| r.nexthop.0)
+        .unwrap_or(src);
+    let mac = crate::tcp_stack::arp_cached_in(net_ns_id, nexthop).unwrap_or([0u8; 6]);
     let id = fresh_tcb_id();
     // `tcp_v4_init_seq`: our address and port first.
     let iss = secure_tcp_seq(net_ns_id, dst, src, hdr.dst_port, hdr.src_port);
     let mut child =
         Tcb::new_active(id, dst, hdr.dst_port, src, hdr.src_port, mac, iss).with_net_ns(net_ns_id);
+    child.nexthop = nexthop;
     child.state = TcpState::SynReceived;
     child.irs = hdr.sequence;
     child.rcv_nxt = hdr.sequence.wrapping_add(1);
