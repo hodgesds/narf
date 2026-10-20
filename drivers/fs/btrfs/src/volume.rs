@@ -290,6 +290,11 @@ impl<B: BlockDevice> Drop for BtrfsVolume<B> {
 
 /// Accessors on the shared core.
 impl<B: BlockDevice> VolCore<B> {
+    /// The live superblock's generation (the last committed transaction).
+    pub(crate) fn committed_generation(&self) -> u64 {
+        self.state.lock().superblock.generation
+    }
+
     /// The live [`MmapAnchor`] of inode `ino` in fs tree `tree`, created on
     /// first use. Dead entries are pruned as the table grows.
     pub(crate) fn mmap_anchor(&self, tree: u64, ino: u64) -> Arc<MmapAnchor> {

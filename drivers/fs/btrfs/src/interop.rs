@@ -66,7 +66,7 @@ pub const JOURNAL_PREALLOC: u64 = 8 << 20;
 /// Size of the journal files the image ships.
 pub const JOURNAL_SIZE: u64 = 256 * 1024;
 
-async fn dir_at(root: &Arc<dyn DirOps>, path: &str) -> Result<Arc<dyn DirOps>, FsError> {
+pub(crate) async fn dir_at(root: &Arc<dyn DirOps>, path: &str) -> Result<Arc<dyn DirOps>, FsError> {
     let mut dir = root.clone();
     for part in path.split('/').filter(|p| !p.is_empty()) {
         dir = dir.lookup_dir_async(part).await?;
@@ -74,7 +74,11 @@ async fn dir_at(root: &Arc<dyn DirOps>, path: &str) -> Result<Arc<dyn DirOps>, F
     Ok(dir)
 }
 
-async fn write_all(file: &Arc<dyn FileOps>, offset: u64, data: &[u8]) -> Result<(), FsError> {
+pub(crate) async fn write_all(
+    file: &Arc<dyn FileOps>,
+    offset: u64,
+    data: &[u8],
+) -> Result<(), FsError> {
     let mut done = 0usize;
     while done < data.len() {
         let n = file.write(offset + done as u64, &data[done..]).await?;
@@ -86,7 +90,11 @@ async fn write_all(file: &Arc<dyn FileOps>, offset: u64, data: &[u8]) -> Result<
     Ok(())
 }
 
-async fn read_exact(file: &Arc<dyn FileOps>, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
+pub(crate) async fn read_exact(
+    file: &Arc<dyn FileOps>,
+    offset: u64,
+    len: usize,
+) -> Result<Vec<u8>, FsError> {
     let mut buf = alloc::vec![0u8; len];
     let mut done = 0usize;
     while done < len {
@@ -638,6 +646,11 @@ pub fn run(mode: &str) -> narf_init::InitResult {
     if let Err(why) = verdict {
         line(&format!("REFUSED ({why})"));
         return narf_init::InitResult::Error("btrfs root-rw interop refused a non-harness root");
+    }
+    // `cargo xtask btrfs-cycles`: detaches this root and runs its own
+    // mount/unmount cycles over the same image.
+    if mode == "cycles" {
+        return crate::cycles::run(fs);
     }
     let root = fs.root();
     let result = narf_scheduler::block_on(async {
