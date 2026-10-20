@@ -31,10 +31,12 @@
 //! MPC combine follows DML's auto `mpcc_combine_factor` (DC's default): a
 //! plane in ODM bypass whose single DPP would need more than the DPPCLK
 //! maximum or cannot hold its viewport's swath takes two DPPs, each
-//! fetching half the viewport (DCN4's `mpc_combine_limit` is two). Only
-//! linear, horizontally scanned RGB planes without DCC are combined; a
-//! tiled, rotated, 4:2:0 or DCC plane one DPP cannot carry is refused, as
-//! is a DCC plane whose mcaches Linux would split over MPC pipes.
+//! fetching half the viewport (DCN4's `mpc_combine_limit` is two), for
+//! every surface: linear or GFX12-tiled, RGB or 4:2:0 (each DPP half the
+//! luma and chroma swath), with or without DCC, scanned horizontally or
+//! vertically. A DCC plane whose mcaches its pipes cannot place is split
+//! over two DPPs by the mcache phase whatever the factor
+//! (pmo_dcn4_fams2_optimize_dcc_mcache), and refused on an ODM stream.
 //!
 //! The default 320-KiB DET from the staged requestor is a fixed input for
 //! every pipe rather than DML's own allocation (four pipes fit the 1280-KiB
@@ -786,6 +788,9 @@ fn first_second_splitting(
 pub const MAX_STREAMS: usize = 4;
 /// `max_num_dpp` / `max_num_opp`: pipes every admitted stream shares.
 pub const MAX_PIPES: u32 = 4;
+/// DCN4's `mpc_combine_limit` (dml2_pmo_dcn4_fams2): at most two DPPs per
+/// MPC-combined plane.
+const MPC_COMBINE_LIMIT: u32 = 2;
 
 // ── dml2_socbb_dcn401 / dml_dcn4_variant_a_soc_qos_params ──────────────────
 const CHANNEL_BYTES: u64 = 2;
@@ -1221,10 +1226,13 @@ impl Mcache {
         }
         out
     }
-    /// dml2_top_mcache_validate_admissability for a plane on `odm` pipes
-    /// (no MPC combine): each surface's mcache boundaries no more than its
-    /// pipes and at most one within any pipe's share of the viewport.
-    fn admissible(m: &[Self; 2], p: &Plane, h_active: u32, odm: u32) -> bool {
+    /// dml2_top_mcache_validate_admissability for a plane on `dpps` pipes
+    /// of a stream split `odm` ways: each surface's mcache boundaries no
+    /// more than its pipes and at most one within any pipe's share of the
+    /// viewport (an ODM segment's source pixels, at most the surface; an
+    /// MPC slice's share of the surface width). The viewport is never
+    /// stationary, so no shift is searched.
+    fn admissible(m: &[Self; 2], p: &Plane, h_active: u32, odm: u32, dpps: u32) -> bool {
         let c = p.chroma_values();
         let widths = [
             p.surface_width,
@@ -1236,10 +1244,12 @@ impl Mcache {
             if odm > 1 {
                 let share = ratio_f(ratios[i]) * f64::from(h_active) / f64::from(odm);
                 span = span.min(ceil_f(share) as i64);
+            } else {
+                span /= i64::from(dpps.max(1));
             }
             span += if i == 0 { 12 } else { 6 };
             let boundaries = m[i].count.saturating_sub(1);
-            if boundaries > odm
+            if boundaries > dpps
                 || count_in_span(&m[i].offsets[..boundaries.min(2) as usize], span) > 1
             {
                 return false;
@@ -1309,6 +1319,9 @@ struct Shape {
     mcaches: u32,
     /// The DCC plane's allocation, its ids still zero.
     mcache: Option<McacheAllocation>,
+    /// dml2_top_mcache_validate_admissability's verdict for the plane on
+    /// its pipes (true without DCC).
+    mcache_fits: bool,
 }
 
 /// DPPCLK, DISPCLK and deep-sleep DCFCLK one evaluation runs the pipe at.
@@ -1771,6 +1784,7 @@ impl Shape {
         let mut dram_pref = [Fx::ONE; 2];
         let mut mcache_count = 0;
         let mut mcache_alloc = None;
+        let mut mcache_fits = true;
         if plane.dcc {
             let mcaches = Mcache::of(
                 &plane,
@@ -1810,11 +1824,10 @@ impl Shape {
                 }
             }
             mcache_alloc = Some(a);
-            // Linux splits a plane whose mcaches its pipes cannot place
-            // (MPC combine), which this port does not admit.
-            if !Mcache::admissible(&mcaches, &plane, t.h_active, odm) {
-                return Err(Error::Unsupported);
-            }
+            // Whether the plane's pipes can place its mcaches; if not,
+            // admission MPC-splits it as pmo_dcn4_fams2_optimize_dcc_mcache
+            // does.
+            mcache_fits = Mcache::admissible(&mcaches, &plane, t.h_active, odm, dpps);
         }
         Ok(Self {
             stream,
@@ -1836,6 +1849,7 @@ impl Shape {
             dram_pref,
             mcaches: mcache_count,
             mcache: mcache_alloc,
+            mcache_fits,
         })
     }
     /// The MPC combine decision of dml2_core_dcn4_calcs.c's mode support
@@ -1844,18 +1858,11 @@ impl Shape {
     /// downspread-limited DPPCLK maximum (MinDPPCLKUsingSingleDPP) or
     /// cannot take the whole viewport (SingleDPPViewportSizeSupport: the
     /// swath against the DET, the linear swath limit and the line buffer).
-    /// DCN4's `mpc_combine_limit` is two.
-    ///
-    /// Only a linear, horizontally scanned RGB plane without DCC is ever
-    /// combined (what the reference vectors cover); any other plane one DPP
-    /// cannot carry keeps one and is refused below, as with factor 1.
+    /// DCN4's `mpc_combine_limit` is two. The decision is the same for
+    /// every surface: linear or tiled, RGB or 4:2:0, with or without DCC,
+    /// scanned horizontally or (rotated 90/270) vertically.
     fn mpc_combined(self, mode: &Mode, dppclk_ss_khz: u64, channels: u32) -> Result<Self, Error> {
-        if self.odm > 1
-            || self.plane.is_420()
-            || self.plane.dcc
-            || self.plane.vertical_scan
-            || self.plane.swizzle != Swizzle::Linear
-        {
+        if self.odm > 1 || self.dpps > 1 {
             return Ok(self);
         }
         let dpp_over = if self.dpp_unit {
@@ -1866,7 +1873,14 @@ impl Shape {
         if !dpp_over && self.buffers().is_ok() {
             return Ok(self);
         }
-        Self::with_pipes(mode, self.plane, self.stream, 1, 2, channels)
+        Self::with_pipes(
+            mode,
+            self.plane,
+            self.stream,
+            1,
+            MPC_COMBINE_LIMIT,
+            channels,
+        )
     }
     /// The surfaces of the plane: luma, then a 4:2:0 plane's chroma.
     fn surfaces(&self) -> impl Iterator<Item = &Surf> {
@@ -2618,15 +2632,60 @@ pub fn odm_timing_ok(t: &Timing, odm: u32, ycbcr420: bool) -> bool {
         && t.h_active <= 4096 * odm
 }
 
+/// DML's max_dispclk/dppclk_freq_mhz: a board maximum less downspread.
+fn ss_khz(khz: u32) -> u64 {
+    u64::from(khz) * 10_000 / DOWNSPREAD_TENTHOUSANDTHS as u64
+}
+
 /// `admit_all` under `policy`. MPC combine only ever admits what factor 1
 /// rejects, so a plan admitted without it re-admits unchanged.
+///
+/// dml2_top_soc15_build_mode_programming's mcache phase follows mode
+/// support whatever the policy: when a supported configuration has a DCC
+/// plane whose pipes cannot place its mcaches
+/// (dml2_top_mcache_validate_admissability), pmo_dcn4_fams2_optimize_dcc_
+/// mcache (no dynamic ODM: optimize_dcc_mcache_no_odm) gives each such
+/// plane one more DPP from the free pipes, up to `mpc_combine_limit`, and
+/// mode support runs again with those planes MPC-combined. A failing plane
+/// on an ODM stream, at the limit or without a free pipe is rejected.
 pub fn admit_all_with(soc: &Soc, modes: &[Mode], policy: Policy) -> Result<Vec<Plan>, Error> {
     soc.validate()?;
     if modes.is_empty() || modes.len() > MAX_STREAMS {
         return Err(Error::Invalid);
     }
-    // DML's max_dispclk/dppclk_freq_mhz: the board maximums less downspread.
-    let ss = |khz: u32| u64::from(khz) * 10_000 / DOWNSPREAD_TENTHOUSANDTHS as u64;
+    // The planes the mcache phase has put on two DPPs (factor 2).
+    let mut split = [false; MAX_PLANES];
+    loop {
+        let shapes = shapes_for(soc, modes, policy, &split)?;
+        if shapes.iter().all(|s| s.mcache_fits) {
+            return plan_shapes(soc, modes, shapes, false);
+        }
+        // The mcache phase starts from a configuration mode support takes.
+        plan_shapes(soc, modes, shapes.clone(), true)?;
+        let used = shapes.iter().map(|s| s.dpps).sum::<u32>();
+        let mut free = MAX_PIPES.saturating_sub(used);
+        for (k, s) in shapes.iter().enumerate() {
+            if s.mcache_fits {
+                continue;
+            }
+            if s.odm > 1 || s.dpps >= MPC_COMBINE_LIMIT || free == 0 {
+                return Err(Error::Unsupported);
+            }
+            split[k] = true;
+            free -= 1;
+        }
+    }
+}
+
+/// Every plane's shape in admission order: its ODM split, then MPC combine
+/// as `policy` decides it or (`split`) the mcache phase forces it.
+fn shapes_for(
+    soc: &Soc,
+    modes: &[Mode],
+    policy: Policy,
+    split: &[bool; MAX_PLANES],
+) -> Result<Vec<Shape>, Error> {
+    let ss = ss_khz;
     let mut shapes = Vec::with_capacity(MAX_PLANES);
     for (k, mode) in modes.iter().enumerate() {
         for plane in mode.plane_list() {
@@ -2634,13 +2693,27 @@ pub fn admit_all_with(soc: &Soc, modes: &[Mode], policy: Policy) -> Result<Vec<P
                 return Err(Error::Pipes);
             }
             let mut shape = Shape::new(mode, plane, k, ss(soc.dispclk_max_khz), soc.umc_channels)?;
-            if policy.mpc_combine {
+            if split[shapes.len()] && shape.odm == 1 {
+                shape = Shape::with_pipes(mode, plane, k, 1, MPC_COMBINE_LIMIT, soc.umc_channels)?;
+            } else if policy.mpc_combine {
                 shape = shape.mpc_combined(mode, ss(soc.dppclk_max_khz), soc.umc_channels)?;
             }
             shape.buffers()?;
             shapes.push(shape);
         }
     }
+    Ok(shapes)
+}
+
+/// Mode support and (unless `support_only`, which returns no plans) mode
+/// programming of `shapes`.
+fn plan_shapes(
+    soc: &Soc,
+    modes: &[Mode],
+    mut shapes: Vec<Shape>,
+    support_only: bool,
+) -> Result<Vec<Plan>, Error> {
+    let ss = ss_khz;
     // TotalAvailablePipesSupport: one DPP per plane and ODM segment or MPC
     // slice.
     let dpps = shapes.iter().map(|s| s.dpps).sum::<u32>();
@@ -2779,6 +2852,9 @@ pub fn admit_all_with(soc: &Soc, modes: &[Mode], policy: Policy) -> Result<Vec<P
         Some(e) => (SR_ENTER_PLUS_EXIT_US, e),
         None => (0, unreserved),
     };
+    if support_only {
+        return Ok(Vec::new());
+    }
     if bandwidth_raises_clocks(&supported, read, dcfclk_khz, fclk_khz) {
         return Err(Error::ClockState);
     }

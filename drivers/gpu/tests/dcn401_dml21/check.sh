@@ -51,10 +51,14 @@
 # "! PixelClock dfs" lines are as vectors.txt's.
 # surface_vectors.txt (GFX12 tiled, DCC and 4:2:0 planes) is checked with
 # harness_surfaces.c as plane_vectors.txt, each plan line exact; its
-# "! ClockState" lines are RAISED plans and its "! Unsupported" lines plans
-# that split a DCC plane over two MPC-combined pipes (its mcaches do not fit
-# one), which the port does not admit. --regenerate-surfaces answers its
-# inputs again.
+# "! ClockState" lines are RAISED plans. A DCC plane whose mcaches one pipe
+# cannot place is split over two MPC-combined pipes ("/2" and the pipe-0
+# blank end) by pmo_dcn4_fams2_optimize_dcc_mcache whatever the factor.
+# --regenerate-surfaces answers its inputs again.
+# surface_mpc_vectors.txt is as surface_vectors.txt, planned with MPC_AUTO
+# (DC's auto mpcc_combine_factor): tiled, DCC, rotated and 4:2:0 planes one
+# DPP cannot carry take two. --regenerate-surface-mpc answers its inputs
+# again.
 # odm34_vectors.txt lines are "<bytes per pixel> <DSC slices> <DSC bpp_x16>
 # <4:2:0>" then a multi_vectors.txt line, each stream's plane at that depth,
 # compressed so unless the slices are 0 and leaving as HDMI 4:2:0 if the
@@ -68,7 +72,7 @@
 # cannot carry take two ("/2"). --regenerate-mpc answers its inputs again.
 set -euo pipefail
 case ${1:-} in
---regenerate-odm34 | --regenerate-mpc)
+--regenerate-odm34 | --regenerate-mpc | --regenerate-surface-mpc)
 	regenerate=$1
 	shift ;;
 *) regenerate= ;;
@@ -122,24 +126,22 @@ cc -O1 -w "${inc[@]}" "$here/harness_planes.c" "$work/strict_calcs.o" $others -l
 cc -O1 -w "${inc[@]}" "$here/harness_surfaces.c" "$work/strict_calcs.o" $others -lm -o "$work/strict_surfaces"
 
 # surface_answer <inputs> <strict_surfaces output>: the surface_vectors.txt
-# result. A plane on two pipes with the pipe-0 blank end is MPC combine.
+# (and surface_mpc_vectors.txt) result.
 surface_answer() {
 	case $2 in
-	PLAN*)
-		if echo "${2#PLAN }" | awk '{ f = 0
-			for (i = 1; i <= NF; i++) {
-				if ($i == "|") { f = 0; continue }
-				if ($i == "/2") { if ($(i + 1) == end) mpc = 1; i++; continue }
-				if (f == 13) end = $i
-				f++ } }
-			END { exit !mpc }'; then
-			echo "$1 ! Unsupported"
-		else
-			echo "$1 = ${2#PLAN }"
-		fi ;;
+	PLAN*) echo "$1 = ${2#PLAN }" ;;
 	RAISED) echo "$1 ! ClockState" ;;
 	*) echo "$1 ! REJECT" ;;
 	esac
+}
+# surface_mpc_answer: answer surface_mpc_vectors.txt inputs from stdin with
+# Linux (harness_surfaces.c, RAISED, MPC_AUTO).
+surface_mpc_answer() {
+	local line a
+	while read -r line; do
+		read -ra a <<< "$line"
+		surface_answer "$line" "$(RAISED=1 MPC_AUTO=1 "$work/strict_surfaces" "${a[@]}")"
+	done
 }
 if [ $generate_surfaces -eq 1 ]; then
 	while IFS= read -r line; do
@@ -223,6 +225,9 @@ if [ "$regenerate" = --regenerate-odm34 ]; then
 	exit 0
 elif [ "$regenerate" = --regenerate-mpc ]; then
 	regenerate_file "$here/mpc_vectors.txt" mpc_answer
+	exit 0
+elif [ "$regenerate" = --regenerate-surface-mpc ]; then
+	regenerate_file "$here/surface_mpc_vectors.txt" surface_mpc_answer
 	exit 0
 fi
 
@@ -561,4 +566,5 @@ check_answered() {
 check_surfaces "$here/surface_vectors.txt" || mfail=1
 check_answered "$here/odm34_vectors.txt" odm34_answer || mfail=1
 check_answered "$here/mpc_vectors.txt" mpc_answer || mfail=1
+check_answered "$here/surface_mpc_vectors.txt" surface_mpc_answer || mfail=1
 [ $fail -eq 0 ] && [ $mfail -eq 0 ]

@@ -1189,7 +1189,8 @@ fn surface_values(plan: &Plan, k: usize, p: &PlanePlan) -> [u32; 56] {
     }
     v.push(u32::from(a.shared));
     let plane = plan.mode.plane_list().nth(k).unwrap_or_default();
-    let n = u32::from(plan.pipes);
+    // The plane's pipes: its stream's ODM segments or its MPC slices.
+    let n = u32::from(p.dpps);
     for j in 0..2u32 {
         if j >= n {
             v.extend([0; 6]);
@@ -1317,7 +1318,13 @@ fn surface_plane(p: &[u32; 23]) -> Option<Plane> {
 /// whose DCF/fabric state DPMM raises). Returns the plans, rejections,
 /// 4:2:0 planes and tiled planes admitted.
 fn check_surface_vectors(vectors: &str) -> Result<[u32; 4], &'static str> {
-    let mut counts = [0u32; 4];
+    check_surface_vectors_policy(vectors, NO_MPC).map(|c| [c[0], c[1], c[2], c[3]])
+}
+
+/// As `check_surface_vectors` under `policy`; also counts the planes on two
+/// MPC-combined DPPs, and of those the tiled, rotated, 4:2:0 and DCC ones.
+fn check_surface_vectors_policy(vectors: &str, policy: Policy) -> Result<[u32; 9], &'static str> {
+    let mut counts = [0u32; 9];
     for line in vectors.lines() {
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -1355,7 +1362,7 @@ fn check_surface_vectors(vectors: &str) -> Result<[u32; 4], &'static str> {
             mode.bytes_per_pixel = mode.planes[0].map_or(0, |p| u32::from(p.bytes_per_pixel));
             modes.push(mode);
         }
-        let result = admit_all_with(&soc, &modes, NO_MPC);
+        let result = admit_all_with(&soc, &modes, policy);
         match words.next() {
             Some("=") => {
                 let Ok(got) = &result else {
@@ -1387,6 +1394,14 @@ fn check_surface_vectors(vectors: &str) -> Result<[u32; 4], &'static str> {
                         }
                         if !pipes_match(&mut words, &view) {
                             return Err("surface plan ODM pipes differ from Linux DML21");
+                        }
+                        if plan.pipes == 1 && p.dpps == 2 {
+                            let q = plan.mode.plane_list().nth(k).unwrap_or_default();
+                            counts[4] += 1;
+                            counts[5] += u32::from(q.swizzle != Swizzle::Linear);
+                            counts[6] += u32::from(q.vertical_scan);
+                            counts[7] += u32::from(q.is_420());
+                            counts[8] += u32::from(q.dcc);
                         }
                     }
                     if !plan.readmits() {
@@ -1434,6 +1449,53 @@ fn dcn401_dml_matches_linux_dml21_surface_vectors() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-dml",
     dcn401_dml_matches_linux_dml21_surface_vectors
+);
+
+/// Shared with tests/dcn401_dml21/check.sh (harness_surfaces.c, RAISED,
+/// MPC_AUTO).
+const SURFACE_MPC_VECTORS: &str = include_str!("../tests/dcn401_dml21/surface_mpc_vectors.txt");
+
+/// MPC combine of GFX12 tiled, DCC, rotated (scanned vertically) and 4:2:0
+/// planes as DML21's auto factor chooses it, exactly as for linear RGB:
+/// two DPPs when one would exceed the DPPCLK maximum or cannot take the
+/// viewport's swath (DET, the tiled, 4:2:0 and vertical swath limits, the
+/// line buffer), each with half the swath, luma and chroma; the DET split,
+/// DCC overhead and mcache registers of each half.
+fn dcn401_dml_matches_linux_dml21_surface_mpc_vectors() -> TestResult {
+    match check_surface_vectors_policy(SURFACE_MPC_VECTORS, Policy::NATIVE) {
+        Ok([plans, rejects, _, _, mpc, tiled, rotated, yuv, dcc])
+            if plans >= 1000
+                && rejects >= 50
+                && mpc >= 250
+                && tiled >= 200
+                && rotated >= 100
+                && yuv >= 100
+                && dcc >= 100 =>
+        {
+            TestResult::Pass
+        }
+        Ok(_) => TestResult::Fail("surface MPC vector file lost coverage"),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_matches_linux_dml21_surface_mpc_vectors
+);
+
+/// The mcache phase splits a DCC plane whose mcaches one pipe cannot place
+/// over two MPC-combined DPPs whatever the factor (Linux overrides it), so
+/// surface_vectors.txt's factor-1 plans hold such planes too.
+fn dcn401_dml_mcache_phase_splits_dcc_planes() -> TestResult {
+    match check_surface_vectors_policy(SURFACE_VECTORS, NO_MPC) {
+        Ok(c) if c[4] >= 2 && c[8] == c[4] => TestResult::Pass,
+        Ok(_) => TestResult::Fail("no mcache-split DCC plane in surface_vectors.txt"),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_mcache_phase_splits_dcc_planes
 );
 
 /// Shared with tests/dcn401_dml21/check.sh (harness_planes.c, RAISED,

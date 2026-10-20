@@ -28,6 +28,8 @@
  * last_slice_sharing.plane0_plane1) and, for two pipes, the main mcache
  * registers dml2_build_mcache_programming derives (p0 then p1: first id,
  * second id, split location; zeros past the plane's pipes).
+ * With MPC_AUTO set, every plane's mpcc_combine_factor is DC's auto (0):
+ * a plane one DPP cannot carry takes two (MPC combine, "/2").
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -213,7 +215,11 @@ int main(int argc, char **argv)
 			p->composition.scaler_info.rect_out_width = t9[1];
 			p->composition.rect_out_height_spans_vactive = true;
 			p->overrides.det_size_override_kb = 320;
-			p->overrides.mpcc_combine_factor = 1;
+			/* MPC_AUTO: DC's auto factor (0), as dml21_translation_helper
+			 * leaves it; otherwise MPC combine is off (factor 1), except
+			 * where pmo_dcn4_fams2_optimize_dcc_mcache splits a DCC plane
+			 * whose mcaches one pipe cannot place. */
+			p->overrides.mpcc_combine_factor = getenv("MPC_AUTO") ? 0 : 1;
 			p->overrides.gpuvm_min_page_size_kbytes = init.soc_bb.gpuvm_min_page_size_kbytes;
 		}
 		n++;

@@ -1157,12 +1157,25 @@ DPPCLK maximum (MinDPPCLKUsingSingleDPP) or cannot take the viewport's swath
 buffer at its taps) takes two DPPs (`PlanePlan::dpps`), each with half the
 viewport, half the DPPCLK, and the swath, delivery, prefetch and deep-sleep
 terms of DPPPerSurface 2; both program identical registers. DCN4's
-`mpc_combine_limit` is two. Only linear, horizontally scanned RGB planes
-without DCC are combined (what the vectors cover); a tiled, rotated, 4:2:0
-or DCC plane one DPP cannot carry is refused, as is a DCC plane whose
-mcaches DML21 would split over MPC pipes. `tests/dcn401_dml21/mpc_vectors.txt` (1512
-plane configurations, 444 MPC-combined planes; harness_planes.c with
-MPC_AUTO) is replayed by `dcn401_dml_matches_linux_dml21_mpc_vectors`.
+`mpc_combine_limit` is two. The decision is the same for every surface:
+linear or GFX12-tiled (the 6144-pixel tiled swath limit, 7680 for 4:2:0,
+4320 for 4:2:0 and 3072 for 64-bpp DCC scanned vertically), RGB or 4:2:0
+(each DPP half the luma and chroma swath, the DET split per pipe), with or
+without DCC (each pipe's DCC overhead), scanned horizontally or rotated
+90/270. `admit_all_with` then runs dml2_top_soc15's mcache phase whatever the
+policy: a DCC plane of a supported configuration whose pipes cannot place its
+mcaches (dml2_top_mcache_validate_admissability: at most one boundary within
+a pipe's share of the surface width, no more boundaries than pipes) takes one
+more DPP from the free pipes (pmo_dcn4_fams2_optimize_dcc_mcache's
+optimize_dcc_mcache_no_odm, up to the limit) and mode support runs again; a
+failing plane on an ODM stream, at the limit or without a free pipe is
+`Unsupported`. `tests/dcn401_dml21/mpc_vectors.txt` (1512 plane
+configurations, 444 MPC-combined planes; harness_planes.c with MPC_AUTO) is
+replayed by `dcn401_dml_matches_linux_dml21_mpc_vectors`, and
+`surface_mpc_vectors.txt` (1116 tiled, DCC, rotated and NV12/P010
+configurations, 258 MPC-combined planes; harness_surfaces.c with MPC_AUTO)
+by `dcn401_dml_matches_linux_dml21_surface_mpc_vectors`, every plan value and
+both pipes' mcache registers exact.
 
 A multi-pipe plan is programmed as ODM 2:1, 3:1 or 4:1 (optc401_set_odm_combine). The
 modeset gives it the highest pipes no display of the configuration uses
