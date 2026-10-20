@@ -379,14 +379,16 @@ kernel_test_in!("bus", smoke_bus_bar_read_on_q35);
 
 #[cfg(target_arch = "aarch64")]
 fn smoke_its_doorbell_addr() -> TestResult {
-    // The ITS doorbell on QEMU virt is GITS_TRANSLATER at offset
-    // 0x10040 from the ITS base 0x0808_0000. `program_vector` on
-    // aarch64 emits this address into msg_addr; verify the helper
-    // returns the documented value so a regression in the constant
-    // is caught structurally.
-    let pa = narf_interrupts::aarch64::its::doorbell_pa();
-    if pa != 0x0808_0000 + 0x10040 {
-        return TestResult::Fail("ITS doorbell address mismatch");
+    // `program_vector` on aarch64 emits GITS_TRANSLATER (ITS base +
+    // 0x10040) into msg_addr. The base comes from firmware discovery;
+    // QEMU virt describes (and the fallback assumes) 0x0808_0000.
+    use narf_interrupts::aarch64::its;
+    let base = its::its_base_pa();
+    if its::doorbell_pa() != base + 0x10040 || base & 0xFFFF != 0 {
+        return TestResult::Fail("ITS doorbell is not GITS_TRANSLATER of a 64 KiB-aligned frame");
+    }
+    if its::source() != narf_interrupts::its_fw::Source::Acpi && base != 0x0808_0000 {
+        return TestResult::Fail("QEMU virt ITS base mismatch");
     }
     TestResult::Pass
 }

@@ -135,6 +135,13 @@ pub unsafe fn init(
     }
     #[cfg(target_arch = "aarch64")]
     {
+        // ITS / redistributor / msi-map discovery has to precede the ITS
+        // bring-up, which the boot path runs after bus enumeration. No-op
+        // once the ITS is up, and a `None` DTB keeps earlier results.
+        // SAFETY: same live DTB contract as the enumerator below.
+        unsafe {
+            narf_interrupts::aarch64::its::discover_firmware(dtb);
+        }
         // SAFETY: FDT walker tolerates null / bad magic by returning
         // an empty Vec (same tolerance as `boot/src/aarch64` §parse_raw).
         // SAFETY: Valid memory or trusted environment
