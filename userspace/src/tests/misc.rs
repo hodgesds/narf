@@ -3991,3 +3991,110 @@ fn smoke_blocked_syscall_decodes_saved_registers() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace", smoke_blocked_syscall_decodes_saved_registers);
+
+// `/proc/<pid>/syscall` prints `task_current_syscall()`'s whole result:
+// number, six arguments, then the user SP and PC. Both come from the same
+// saved frame as the arguments, for every frame layout the decoder handles.
+// (It used to read `UserTaskCtx::state`, which own-stack parks in `read`,
+// `futex` or `wait4` never refresh, so the frame was an old trap's.)
+fn smoke_blocked_syscall_frame_reports_user_sp_and_pc() -> TestResult {
+    use crate::user_task::UserTaskCtx;
+    use core::sync::atomic::Ordering;
+
+    #[repr(C, align(16))]
+    struct Stack([u8; 4096]);
+    let mut stack = alloc::boxed::Box::new(Stack([0; 4096]));
+    let top = stack.0.as_mut_ptr() as u64 + 4096;
+    const SP: u64 = 0x7fff_e000;
+    const PC: u64 = 0x0040_2000;
+    let want = |num: u64| {
+        [
+            u64::from(crate::syscall::syscall_number(num as u32)),
+            0x11,
+            0x22,
+            0x33,
+            0x44,
+            0x55,
+            0x66,
+            SP,
+            PC,
+        ]
+    };
+    let uc = UserTaskCtx::new();
+    uc.parked_in_syscall.store(true, Ordering::Release);
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        use narf_arch::x86_64::trap_frame::TrapFrame;
+        use narf_arch::x86_64::user_mode::UserState;
+        // SAFETY: `state` is a UserState-sized buffer owned by `uc`.
+        let st = unsafe { &mut *uc.state.get() };
+        (st.rax, st.rdi, st.rsi, st.rdx, st.r10, st.r8, st.r9) =
+            (0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66);
+        (st.rsp, st.rip, st.valid) = (SP, PC, 1);
+        if uc.blocked_syscall_frame() != Some(want(0)) {
+            return TestResult::Fail("longjmp-model snapshot: wrong sp/pc");
+        }
+        uc.kernel_stack_top.store(top, Ordering::Release);
+        let us = (top - 16 - core::mem::size_of::<UserState>() as u64) as *mut UserState;
+        // SAFETY: inside `stack`, suitably aligned.
+        unsafe {
+            (*us).rax = 202;
+            ((*us).rdi, (*us).rsi, (*us).rdx) = (0x11, 0x22, 0x33);
+            ((*us).r10, (*us).r8, (*us).r9) = (0x44, 0x55, 0x66);
+            ((*us).rsp, (*us).rip, (*us).valid) = (SP, PC, 1);
+        }
+        if uc.blocked_syscall_frame() != Some(want(202)) {
+            return TestResult::Fail("syscall-entry UserState: wrong sp/pc");
+        }
+        // SAFETY: as above.
+        unsafe { (*us).valid = 0 };
+        let tf = (top - core::mem::size_of::<TrapFrame>() as u64) as *mut TrapFrame;
+        // SAFETY: inside `stack`, suitably aligned.
+        unsafe {
+            (*tf).rax = 61;
+            ((*tf).rdi, (*tf).rsi, (*tf).rdx) = (0x11, 0x22, 0x33);
+            ((*tf).r10, (*tf).r8, (*tf).r9) = (0x44, 0x55, 0x66);
+            ((*tf).rsp, (*tf).rip, (*tf).ss) = (SP, PC, 0x1b);
+        }
+        if uc.blocked_syscall_frame() != Some(want(61)) {
+            return TestResult::Fail("int 0x80 TrapFrame: wrong sp/pc");
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        use narf_arch::aarch64::trap_frame::TrapFrame;
+        // SAFETY: `state` is a UserState-sized buffer owned by `uc`.
+        let st = unsafe { &mut *uc.state.get() };
+        st.x[8] = 63;
+        st.x[..6].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        (st.sp, st.pc, st.valid) = (SP, PC, 1);
+        if uc.blocked_syscall_frame() != Some(want(63)) {
+            return TestResult::Fail("longjmp-model snapshot: wrong sp/pc");
+        }
+        uc.kernel_stack_top.store(top, Ordering::Release);
+        let tf = (top - core::mem::size_of::<TrapFrame>() as u64) as *mut TrapFrame;
+        // SAFETY: inside `stack`, suitably aligned.
+        unsafe {
+            (*tf).x8 = 98;
+            ((*tf).x0, (*tf).x1, (*tf).x2) = (0x11, 0x22, 0x33);
+            ((*tf).x3, (*tf).x4, (*tf).x5) = (0x44, 0x55, 0x66);
+            ((*tf).sp_el0, (*tf).elr) = (SP, PC);
+        }
+        if uc.blocked_syscall_frame() != Some(want(98)) {
+            return TestResult::Fail("vector-entry TrapFrame: wrong sp/pc");
+        }
+    }
+
+    uc.parked_in_syscall.store(false, Ordering::Release);
+    if uc.blocked_syscall_frame().is_some() {
+        return TestResult::Fail("a task that woke still reported a frame");
+    }
+    drop(stack);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_blocked_syscall_frame_reports_user_sp_and_pc
+);

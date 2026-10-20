@@ -591,7 +591,7 @@ impl Default for UserTaskCtx {
 /// the task's user trap snapshot; `state` must point at a readable
 /// `UserState`-sized buffer.
 #[cfg(target_arch = "x86_64")]
-pub(crate) unsafe fn saved_syscall_regs(top: u64, state: *const u8) -> Option<[u64; 7]> {
+pub(crate) unsafe fn saved_syscall_regs(top: u64, state: *const u8) -> Option<[u64; 9]> {
     use narf_arch::x86_64::trap_frame::TrapFrame;
     use narf_arch::x86_64::user_mode::UserState as X86State;
     if top != 0 {
@@ -603,17 +603,21 @@ pub(crate) unsafe fn saved_syscall_regs(top: u64, state: *const u8) -> Option<[u
             let f = top - core::mem::size_of::<TrapFrame>() as u64;
             // SAFETY: as above.
             let t = unsafe { core::ptr::read_volatile(f as *const TrapFrame) };
-            return Some([t.rax, t.rdi, t.rsi, t.rdx, t.r10, t.r8, t.r9]);
+            return Some([t.rax, t.rdi, t.rsi, t.rdx, t.r10, t.r8, t.r9, t.rsp, t.rip]);
         }
         // `syscall`: UserState below the 16-byte domain snapshot.
         let f = top - 16 - core::mem::size_of::<X86State>() as u64;
         // SAFETY: as above.
         let st = unsafe { core::ptr::read_volatile(f as *const X86State) };
-        return (st.valid == 1).then_some([st.rax, st.rdi, st.rsi, st.rdx, st.r10, st.r8, st.r9]);
+        return (st.valid == 1).then_some([
+            st.rax, st.rdi, st.rsi, st.rdx, st.r10, st.r8, st.r9, st.rsp, st.rip,
+        ]);
     }
     // SAFETY: the caller's contract on `state`.
     let st = unsafe { core::ptr::read_volatile(state as *const X86State) };
-    (st.valid != 0).then_some([st.rax, st.rdi, st.rsi, st.rdx, st.r10, st.r8, st.r9])
+    (st.valid != 0).then_some([
+        st.rax, st.rdi, st.rsi, st.rdx, st.r10, st.r8, st.r9, st.rsp, st.rip,
+    ])
 }
 
 /// aarch64 counterpart of the x86_64 decoder above.
@@ -621,24 +625,24 @@ pub(crate) unsafe fn saved_syscall_regs(top: u64, state: *const u8) -> Option<[u
 /// # Safety
 /// As for the x86_64 version.
 #[cfg(target_arch = "aarch64")]
-pub(crate) unsafe fn saved_syscall_regs(top: u64, state: *const u8) -> Option<[u64; 7]> {
+pub(crate) unsafe fn saved_syscall_regs(top: u64, state: *const u8) -> Option<[u64; 9]> {
     use narf_arch::aarch64::trap_frame::TrapFrame;
     use narf_arch::aarch64::user_mode::UserState as A64State;
     if top != 0 {
         let f = top - core::mem::size_of::<TrapFrame>() as u64;
         // SAFETY: the caller's contract; the frame is on the task's stack.
         let t = unsafe { core::ptr::read_volatile(f as *const TrapFrame) };
-        return Some([t.x8, t.x0, t.x1, t.x2, t.x3, t.x4, t.x5]);
+        return Some([t.x8, t.x0, t.x1, t.x2, t.x3, t.x4, t.x5, t.sp_el0, t.elr]);
     }
     // SAFETY: the caller's contract on `state`.
     let st = unsafe { core::ptr::read_volatile(state as *const A64State) };
     (st.valid != 0).then_some([
-        st.x[8], st.x[0], st.x[1], st.x[2], st.x[3], st.x[4], st.x[5],
+        st.x[8], st.x[0], st.x[1], st.x[2], st.x[3], st.x[4], st.x[5], st.sp, st.pc,
     ])
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub(crate) unsafe fn saved_syscall_regs(_top: u64, _state: *const u8) -> Option<[u64; 7]> {
+pub(crate) unsafe fn saved_syscall_regs(_top: u64, _state: *const u8) -> Option<[u64; 9]> {
     None
 }
 
@@ -671,6 +675,14 @@ impl UserTaskCtx {
     /// Like Linux, the parked flag is re-checked after the copy: a task that
     /// woke meanwhile may be rewriting its frame, and reads as not blocked.
     pub fn blocked_syscall(&self) -> Option<[u64; 7]> {
+        self.blocked_syscall_frame()
+            .map(|f| [f[0], f[1], f[2], f[3], f[4], f[5], f[6]])
+    }
+
+    /// [`Self::blocked_syscall`] plus the user stack pointer and the user PC
+    /// (just past the syscall instruction): the whole
+    /// `task_current_syscall()` result `/proc/<pid>/syscall` prints.
+    pub fn blocked_syscall_frame(&self) -> Option<[u64; 9]> {
         if !self.parked_in_syscall.load(Ordering::Acquire) {
             return None;
         }
@@ -692,6 +704,8 @@ impl UserTaskCtx {
             regs[4],
             regs[5],
             regs[6],
+            regs[7],
+            regs[8],
         ])
     }
 
