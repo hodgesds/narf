@@ -1764,6 +1764,12 @@ impl UserPagePin {
         }
     }
 
+    /// The retained page's physical address, for device DMA mappings that
+    /// live no longer than this pin.
+    pub fn phys(&self) -> PhysAddr {
+        self.phys
+    }
+
     /// Raw kernel alias of retained RAM. Valid while this pin is alive; the
     /// contents may change concurrently. Do not form Rust references to it.
     pub fn kernel_pointer(&self) -> *const u8 {

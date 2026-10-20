@@ -50,8 +50,11 @@
 //! domain preference; eligible buffers apply it on lookup or CS validation.
 //! GEM_WAIT_IDLE is handled by amdgpu_cs::dispatch_async on running cards.
 //!
-//! LINUX-GAP: `GEM_USERPTR` (pinning host pages into the GPU address space)
-//! and `GEM_LIST_HANDLES` are not implemented and return EINVAL.
+//! `GEM_USERPTR` pins the caller's pages at creation (Linux faults them with
+//! HMM and re-validates through an MMU interval notifier). LINUX-GAP: without
+//! a notifier the pins are a snapshot: a later CPU remap, fork-COW split or
+//! munmap leaves the GPU on the pinned frames, never on freed memory.
+//! `GEM_LIST_HANDLES` is not implemented and returns EINVAL.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
@@ -323,7 +326,12 @@ enum Backing {
     Unmapped {
         _held: crate::amdgpu_vram::UnmappedReservation,
     },
+    /// `GEM_USERPTR`: the caller's pinned pages, one per buffer page.
+    User(Vec<narf_memory::address_space::UserPagePin>),
 }
+/// Internal BO flag (outside every AMDGPU_GEM_CREATE_* bit): GPU mappings
+/// of a READONLY userptr drop WRITEABLE. Never reported to userspace.
+pub(crate) const BO_GPU_READONLY: u64 = 1 << 63;
 
 /// Shared buffer identity and placement policy, independent of backing addresses.
 #[derive(Debug)]
@@ -470,7 +478,9 @@ impl GemObject {
             u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT | uapi::AMDGPU_GEM_DOMAIN_CPU)
         };
         let mut placement = self.placement.lock();
-        if self.allowed_domains.load(Ordering::Acquire) & target == 0 {
+        if self.allowed_domains.load(Ordering::Acquire) & target == 0
+            || matches!(placement.backing, Backing::User(_))
+        {
             return Err(FsError::Busy);
         }
         let backing = Arc::get_mut(&mut placement).ok_or(FsError::Busy)?;
@@ -505,6 +515,10 @@ impl GemObject {
     }
     pub fn cpu_visible(&self) -> bool {
         self.placement().cpu_visible()
+    }
+    /// Created by `GEM_USERPTR` (amdgpu_ttm_tt_get_usermm).
+    pub fn is_userptr(&self) -> bool {
+        matches!(self.placement().backing, Backing::User(_))
     }
     pub fn frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
         self.placement().frames(offset, len)
@@ -731,6 +745,11 @@ impl GemPlacement {
                 }
                 None
             }
+            Backing::User(pins) => {
+                let page = pins.get((offset / PAGE_SIZE) as usize)?;
+                let within = offset % PAGE_SIZE;
+                Some((page.phys().raw() + within, PAGE_SIZE - within))
+            }
             _ => Some((self.gpu + offset, self.byte_len - offset)),
         }
     }
@@ -748,7 +767,7 @@ impl GemPlacement {
             return None;
         }
         Some(match &self.backing {
-            Backing::System(_) => {
+            Backing::System(_) | Backing::User(_) => {
                 let (at, run) = self.locate(offset)?;
                 if run < 8 {
                     return None;
@@ -802,7 +821,7 @@ impl GemPlacement {
         }
         (0..len / PAGE_SIZE)
             .map(|i| match self.backing {
-                Backing::System(_) => self
+                Backing::System(_) | Backing::User(_) => self
                     .locate(offset + i * PAGE_SIZE)
                     .map(|(at, _)| at)
                     .ok_or(FsError::InvalidData),
@@ -1435,6 +1454,95 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
     finish_create(state, arg, object)
 }
 
+/// `amdgpu_gem_userptr_ioctl` on `drm_amdgpu_gem_userptr { addr, size,
+/// flags, handle }`: page-aligned range, known flags, writable mappings
+/// only with REGISTER (EACCES), ANONONLY refusing file/shared mappings
+/// (EPERM). Every page is faulted in (resolving COW for a writable one) and
+/// pinned now, VALIDATE or not; the GTT-only buffer cannot be CPU mapped,
+/// exported or migrated.
+fn userptr(state: &GemState, arg: usize) -> Result<u64, FsError> {
+    use uapi::{
+        AMDGPU_GEM_USERPTR_ANONONLY as ANONONLY, AMDGPU_GEM_USERPTR_READONLY as READONLY,
+        AMDGPU_GEM_USERPTR_REGISTER as REGISTER, AMDGPU_GEM_USERPTR_VALIDATE as VALIDATE,
+    };
+    // SAFETY: `arg` is the ioctl pointer the trap layer validated; copy_in
+    // bounds the read and SMAP-brackets it.
+    let bytes = unsafe { copy_in(arg, 24)? };
+    let addr = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let size = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    let flags = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+    if (addr | size) % PAGE_SIZE != 0
+        || size == 0
+        || flags & !(READONLY | ANONONLY | VALIDATE | REGISTER) != 0
+        || addr.checked_add(size).is_none()
+    {
+        return Err(FsError::InvalidData);
+    }
+    if flags & READONLY == 0 && flags & REGISTER == 0 {
+        return Err(FsError::PermissionDenied);
+    }
+    if size > gtt_limit() {
+        return Err(FsError::NoSpace);
+    }
+    let space = narf_scheduler::current_address_space().ok_or(FsError::BadAddress)?;
+    let pages = size / PAGE_SIZE;
+    let mut pins = Vec::new();
+    pins.try_reserve_exact(pages as usize)
+        .map_err(|_| FsError::OutOfMemory)?;
+    for page in 0..pages {
+        let va = addr + page * PAGE_SIZE;
+        let at = narf_memory::VirtAddr::new(va);
+        if flags & ANONONLY != 0 {
+            use narf_memory::address_space::RegionPerms as P;
+            let region = space.lookup(at).ok_or(FsError::BadAddress)?;
+            if region.perms.contains(P::FILE_DEMAND)
+                || region.perms.contains(P::SHARED)
+                || region.perms.contains(P::SYSV_SHM)
+            {
+                return Err(FsError::OperationNotPermitted);
+            }
+        }
+        // Fault the page in through a guarded user access first.
+        // SAFETY: copy_in range-checks and guards the one-byte read.
+        unsafe { copy_in(va as usize, 1)? };
+        // SAFETY: the kernel identity map and COW tables are live; the
+        // address space belongs to the calling task.
+        if flags & READONLY == 0 && !unsafe { space.user_page_writable_or_resolve(at) } {
+            return Err(FsError::BadAddress);
+        }
+        let pin = space.pin_user_page(at).ok_or(FsError::BadAddress)?;
+        crate::amdgpu_vm::make_pte(pin.phys().raw(), 0)?;
+        pins.push(pin);
+    }
+    let first = pins[0].phys().raw();
+    let gtt = u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT);
+    let object = GemObject {
+        placement: IrqSafeSpinLock::new(Arc::new(GemPlacement {
+            phys: first,
+            gpu: first,
+            system: true,
+            byte_len: size,
+            backing: Backing::User(pins),
+        })),
+        byte_len: size,
+        alignment: PAGE_SIZE,
+        preferred_domains: AtomicU64::new(gtt),
+        allowed_domains: AtomicU64::new(gtt),
+        flags: if flags & READONLY != 0 {
+            BO_GPU_READONLY
+        } else {
+            0
+        },
+        metadata: IrqSafeSpinLock::new(Metadata::default()),
+        card: state.card,
+        dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
+    };
+    let handle = state.insert(object)?;
+    // SAFETY: as above; `handle` is the struct's last field.
+    unsafe { copy_out(arg + 20, &handle.to_le_bytes())? };
+    Ok(0)
+}
+
 /// Give a new buffer a handle and report it.
 fn finish_create(state: &GemState, arg: usize, object: GemObject) -> Result<u64, FsError> {
     // A failed insert drops the object, which returns its memory (a clear
@@ -1458,8 +1566,8 @@ fn mmap(state: &GemState, arg: usize) -> Result<u64, FsError> {
     let bytes = unsafe { copy_in(arg, 8)? };
     let handle = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
     let object = state.get(handle).ok_or(FsError::InvalidData)?;
-    // Linux refuses a NO_CPU_ACCESS buffer outright, wherever it landed.
-    if object.flags & uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS as u64 != 0 {
+    // Linux refuses a userptr or NO_CPU_ACCESS buffer outright.
+    if object.is_userptr() || object.flags & uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS as u64 != 0 {
         return Err(FsError::OperationNotPermitted);
     }
     let mut out = [0u8; 8];
@@ -1506,7 +1614,7 @@ fn op(state: &GemState, arg: usize) -> Result<u64, FsError> {
             info[0..8].copy_from_slice(&object.byte_len.to_le_bytes());
             info[8..16].copy_from_slice(&object.alignment.to_le_bytes());
             info[16..24].copy_from_slice(&object.preferred_domains().to_le_bytes());
-            info[24..32].copy_from_slice(&object.flags.to_le_bytes());
+            info[24..32].copy_from_slice(&(object.flags & !BO_GPU_READONLY).to_le_bytes());
             // SAFETY: `value` is the user out-pointer the caller supplied and
             // is non-zero here; exactly 32 bytes are written, which is
             // `sizeof(struct drm_amdgpu_gem_create_in)`.
@@ -1569,6 +1677,7 @@ pub fn dispatch(cmd: u32, arg: usize, state: &GemState) -> Result<u64, FsError> 
         uapi::DRM_AMDGPU_GEM_WAIT_IDLE => wait_idle(state, arg),
         uapi::DRM_AMDGPU_GEM_OP => op(state, arg),
         uapi::DRM_AMDGPU_GEM_METADATA => metadata(state, arg),
+        uapi::DRM_AMDGPU_GEM_USERPTR => userptr(state, arg),
         _ => Err(FsError::Unsupported),
     }
 }

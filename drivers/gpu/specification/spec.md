@@ -5317,6 +5317,17 @@ paths; only the tables differ.
   to the buffer's KERNEL reservation and retains its source/destination
   until it leaves the ring; a refused, timed-out (5 s) or post-reset chunk
   fails the move without releasing either placement.
+- `GEM_USERPTR` (`amdgpu_gem_userptr_ioctl`): page-aligned non-empty
+  ranges and known flags (else EINVAL); a writable range needs REGISTER
+  (EACCES); ANONONLY refuses file-backed, shared and SysV ranges (EPERM).
+  Every page is faulted in with a guarded user read, COW-resolved when
+  writable (`AddressSpace::user_page_writable_or_resolve`) and pinned
+  (`pin_user_page`) at creation, VALIDATE or not. The buffer is GTT-only,
+  its entries follow each pin, READONLY maps without WRITEABLE (internal
+  `BO_GPU_READONLY`, masked from GEM_OP), and GEM_MMAP, PRIME export and
+  placement moves refuse it, as Linux does. LINUX-GAP: no MMU interval
+  notifier, so the pins are a snapshot: later CPU remaps, fork-COW splits or
+  munmap leave the GPU on the pinned frames (never freed memory).
 - PRT (`GEM_VA` with `AMDGPU_VM_PAGE_PRT`): MAP/REPLACE record a range
   with no buffer (the handle is not looked up, as amdgpu_gem_va_ioctl maps
   it through `prt_va`) whose entries carry PRT without VALID; REPLACE with

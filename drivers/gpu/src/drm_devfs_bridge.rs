@@ -937,7 +937,10 @@ pub(crate) struct AmdgpuDmaBufFile {
 pub(crate) fn amdgpu_dma_buf_file(
     object: Arc<crate::amdgpu_gem::GemObject>,
 ) -> Result<Arc<dyn FileOps>, FsError> {
-    if object.flags & u64::from(crate::amdgpu_uapi::AMDGPU_GEM_CREATE_VM_ALWAYS_VALID) != 0 {
+    // ...and a userptr (amdgpu_ttm_tt_get_usermm).
+    if object.is_userptr()
+        || object.flags & u64::from(crate::amdgpu_uapi::AMDGPU_GEM_CREATE_VM_ALWAYS_VALID) != 0
+    {
         return Err(FsError::OperationNotPermitted);
     }
     Ok(Arc::new(AmdgpuDmaBufFile {

@@ -998,3 +998,103 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/render-abi",
     suspend_eviction_moves_vram_only_buffers_and_restores_domains
 );
+
+/// amdgpu_gem_userptr_ioctl argument checks, which run before any page is
+/// touched: alignment and flags EINVAL, a writable range without REGISTER
+/// EACCES; a kernel task (no user address space) faults.
+fn userptr_ioctl_validates_like_linux() -> TestResult {
+    let state = GemState::for_card(0xfee4);
+    let call = |addr: u64, size: u64, flags: u32| {
+        let mut b = [0u8; 24];
+        b[0..8].copy_from_slice(&addr.to_le_bytes());
+        b[8..16].copy_from_slice(&size.to_le_bytes());
+        b[16..20].copy_from_slice(&flags.to_le_bytes());
+        dispatch(
+            amd(uapi::DRM_AMDGPU_GEM_USERPTR),
+            b.as_mut_ptr() as usize,
+            &state,
+        )
+    };
+    let ro = uapi::AMDGPU_GEM_USERPTR_READONLY;
+    assert_eq!(call(0x1000_0001, 4096, ro), Err(FsError::InvalidData));
+    assert_eq!(call(0x1000_0000, 4095, ro), Err(FsError::InvalidData));
+    assert_eq!(call(0x1000_0000, 0, ro), Err(FsError::InvalidData));
+    assert_eq!(call(0x1000_0000, 4096, 1 << 4), Err(FsError::InvalidData));
+    assert_eq!(call(0x1000_0000, 4096, 0), Err(FsError::PermissionDenied));
+    assert_eq!(
+        call(0x1000_0000, 4096, uapi::AMDGPU_GEM_USERPTR_VALIDATE),
+        Err(FsError::PermissionDenied)
+    );
+    assert_eq!(call(0x1000_0000, 4096, ro), Err(FsError::BadAddress));
+    assert_eq!(
+        call(
+            0x1000_0000,
+            4096,
+            uapi::AMDGPU_GEM_USERPTR_REGISTER | uapi::AMDGPU_GEM_USERPTR_ANONONLY
+        ),
+        Err(FsError::BadAddress)
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/render-abi",
+    userptr_ioctl_validates_like_linux
+);
+
+/// A userptr buffer is its pinned pages: GPU entries follow each pin, a
+/// READONLY one maps without WRITEABLE, and it is never CPU mapped through
+/// GEM_MMAP, exported or migrated.
+fn userptr_backing_follows_pins_and_refuses_mmap_export_and_moves() -> TestResult {
+    use narf_memory::address_space::UserPagePin;
+    let frames: Vec<_> = (0..2)
+        .map(|_| narf_memory::alloc_frame().unwrap())
+        .collect();
+    let pins: Vec<_> = frames
+        .iter()
+        // SAFETY: freshly allocated frames, freed below after the pins drop.
+        .map(|f| unsafe { UserPagePin::retain_ram(f.start_address()) })
+        .collect();
+    let (a, b) = (
+        frames[0].start_address().raw(),
+        frames[1].start_address().raw(),
+    );
+    let gtt = u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT);
+    let object = Arc::new(GemObject {
+        placement: IrqSafeSpinLock::new(Arc::new(GemPlacement {
+            phys: a,
+            gpu: a,
+            system: true,
+            byte_len: 2 * PAGE_SIZE,
+            backing: Backing::User(pins),
+        })),
+        byte_len: 2 * PAGE_SIZE,
+        alignment: PAGE_SIZE,
+        preferred_domains: AtomicU64::new(gtt),
+        allowed_domains: AtomicU64::new(gtt),
+        flags: BO_GPU_READONLY,
+        metadata: IrqSafeSpinLock::new(Metadata::default()),
+        card: Some(0xfee5),
+        dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
+    });
+    assert!(object.is_userptr());
+    assert_eq!(object.frames(0, 2 * 4096).unwrap(), [a, b]);
+    let placement = object.placement();
+    assert_eq!(placement.gpu_at(4096 + 8), Some(b + 8));
+    assert_eq!(object.relocate(true), Err(FsError::Busy));
+    assert_eq!(object.relocate(false), Err(FsError::Busy));
+    assert!(crate::drm_devfs_bridge::amdgpu_dma_buf_file(object.clone()).is_err());
+    let rw = uapi::AMDGPU_VM_PAGE_READABLE | uapi::AMDGPU_VM_PAGE_WRITEABLE;
+    let flags = crate::amdgpu_vm::PteFormat::Gfx12.pte_flags(0, rw, object.flags);
+    assert_eq!(flags & crate::amdgpu_vm::PTE_WRITEABLE, 0);
+    let writable = crate::amdgpu_vm::PteFormat::Gfx12.pte_flags(0, rw, 0);
+    assert_ne!(writable & crate::amdgpu_vm::PTE_WRITEABLE, 0);
+    drop((placement, object));
+    for frame in frames {
+        narf_memory::free_frame(frame);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/render-abi",
+    userptr_backing_follows_pins_and_refuses_mmap_export_and_moves
+);
