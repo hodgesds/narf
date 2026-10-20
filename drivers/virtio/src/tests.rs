@@ -1222,20 +1222,39 @@ fn smoke_virtio_snd_pci_playback_queues_async() -> TestResult {
     if early >= frames / 2 {
         return TestResult::Fail("pointer reported queued frames as played");
     }
-    // Completions must still arrive and advance the pointer to the end.
+    // Completions must still arrive and advance the pointer to the end. The
+    // device plays in real time, but the kernel-test boot never calibrates
+    // the TSC (`frame/src/bare_main.rs`), so a monotonic-ns budget here is
+    // raw cycles: on a 4.7 GHz host 3 "s" is 0.64 s, less than the 683 ms of
+    // queued audio, and the last periods always missed it. Bound the wait by
+    // a stall — no completion for STALL_NS — instead of by total time, with a
+    // generous overall cap so a slow-but-steady device still finishes.
+    const STALL_NS: u64 = 3_000_000_000;
     let mut last = early;
+    let mut progressed_at = narf_time::wall::monotonic_ns();
+    let mut stalled = false;
     let drained = narf_scheduler::responsive_spin_until(
         || {
             let now = stream.pointer();
             if now < last {
                 return true;
             }
+            let t = narf_time::wall::monotonic_ns();
+            if now != last {
+                progressed_at = t;
+            } else if t - progressed_at > STALL_NS {
+                stalled = true;
+                return true;
+            }
             last = now;
             now >= frames
         },
-        narf_time::Deadline::after_ms(3_000),
+        narf_time::Deadline::after_ms(60_000),
     );
     let _ = stream.stop();
+    if stalled {
+        return TestResult::Fail("device completions stalled before the end of the ring");
+    }
     if !drained || last != frames {
         return TestResult::Fail("device completions did not advance the pointer to the end");
     }

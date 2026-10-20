@@ -198,6 +198,9 @@ pub fn drop_mapped_file_address_space(address_space_id: u64) {
     // The NUMA scan cursor is address-space state for the same reason the
     // range policies are, so it dies with the address space too.
     handlers::drop_address_space_numa_cursor(address_space_id);
+    // SysV attachments belong to the mm as well: Linux `exit_mmap` closes
+    // whatever shm mappings are left when it is torn down.
+    handlers::drop_address_space_shm(address_space_id);
 }
 
 /// Filesystem truncation bridge installed during common boot init.
