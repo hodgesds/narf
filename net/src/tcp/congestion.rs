@@ -495,21 +495,21 @@ pub fn seq_leq(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b) as i32) <= 0
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
 
-    #[test]
-    fn fresh_state_starts_in_slow_start() {
+    fn fresh_state_starts_in_slow_start() -> narf_kernel_test::TestResult {
         let c = CcState::new(1460);
         // IW10 init.
-        assert_eq!(c.cwnd, 14_600);
-        assert_eq!(c.ssthresh, u32::MAX);
-        assert!(!c.in_recovery);
+        narf_kernel_test::kt_assert_eq!(c.cwnd, 14_600);
+        narf_kernel_test::kt_assert_eq!(c.ssthresh, u32::MAX);
+        narf_kernel_test::kt_assert!(!c.in_recovery);
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/congestion", fresh_state_starts_in_slow_start);
 
-    #[test]
-    fn reno_slow_start_doubles_per_rtt() {
+    fn reno_slow_start_doubles_per_rtt() -> narf_kernel_test::TestResult {
         let mut s = CcState::new(1000);
         s.cwnd = 1000;
         let cc = Reno;
@@ -517,11 +517,12 @@ mod tests {
         cc.on_ack(&mut s, 1000, 0);
         cc.on_ack(&mut s, 1000, 0);
         // Three acks of 1 MSS each: cwnd grows by 3 MSS.
-        assert_eq!(s.cwnd, 4000);
+        narf_kernel_test::kt_assert_eq!(s.cwnd, 4000);
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/congestion", reno_slow_start_doubles_per_rtt);
 
-    #[test]
-    fn reno_fast_recovery_halves_cwnd() {
+    fn reno_fast_recovery_halves_cwnd() -> narf_kernel_test::TestResult {
         let mut s = CcState::new(1000);
         s.cwnd = 10_000;
         s.ssthresh = u32::MAX;
@@ -534,31 +535,34 @@ mod tests {
                 cycles_per_ns: 1,
             },
         );
-        assert_eq!(s.ssthresh, 5000);
-        assert_eq!(s.cwnd, 8000);
-        assert!(s.in_recovery);
+        narf_kernel_test::kt_assert_eq!(s.ssthresh, 5000);
+        narf_kernel_test::kt_assert_eq!(s.cwnd, 8000);
+        narf_kernel_test::kt_assert!(s.in_recovery);
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/congestion", reno_fast_recovery_halves_cwnd);
 
-    #[test]
-    fn cubic_rto_resets_cwnd_to_one_mss() {
+    fn cubic_rto_resets_cwnd_to_one_mss() -> narf_kernel_test::TestResult {
         let mut s = CcState::new(1000);
         s.cwnd = 20_000;
         Cubic.on_rto(&mut s, 20_000, 0, 1);
-        assert_eq!(s.cwnd, 1000);
-        assert!(s.ssthresh >= 2000);
+        narf_kernel_test::kt_assert_eq!(s.cwnd, 1000);
+        narf_kernel_test::kt_assert!(s.ssthresh >= 2000);
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/congestion", cubic_rto_resets_cwnd_to_one_mss);
 
-    #[test]
-    fn three_dup_acks_trigger_fast_retransmit() {
+    fn three_dup_acks_trigger_fast_retransmit() -> narf_kernel_test::TestResult {
         let mut s = CcState::new(1000);
-        assert!(!s.on_dup_ack());
-        assert!(!s.on_dup_ack());
-        assert!(s.on_dup_ack());
-        assert!(!s.on_dup_ack());
+        narf_kernel_test::kt_assert!(!s.on_dup_ack());
+        narf_kernel_test::kt_assert!(!s.on_dup_ack());
+        narf_kernel_test::kt_assert!(s.on_dup_ack());
+        narf_kernel_test::kt_assert!(!s.on_dup_ack());
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/congestion", three_dup_acks_trigger_fast_retransmit);
 
-    #[test]
-    fn cubic_grows_after_loss() {
+    fn cubic_grows_after_loss() -> narf_kernel_test::TestResult {
         let mut s = CcState::new(1000);
         s.cwnd = 10_000;
         s.ssthresh = 5_000;
@@ -576,20 +580,24 @@ mod tests {
         let initial = s.cwnd;
         let mss = s.mss;
         cc.on_ack(&mut s, mss, 1_000_000_000);
-        assert!(s.cwnd >= initial);
+        narf_kernel_test::kt_assert!(s.cwnd >= initial);
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/congestion", cubic_grows_after_loss);
 
-    #[test]
-    fn seq_compare_handles_wrap() {
-        assert!(seq_lt(0xFFFFFFF0, 0x00000010));
-        assert!(seq_gt(0x00000010, 0xFFFFFFF0));
-        assert!(seq_geq(0x00000010, 0xFFFFFFF0));
+    fn seq_compare_handles_wrap() -> narf_kernel_test::TestResult {
+        narf_kernel_test::kt_assert!(seq_lt(0xFFFFFFF0, 0x00000010));
+        narf_kernel_test::kt_assert!(seq_gt(0x00000010, 0xFFFFFFF0));
+        narf_kernel_test::kt_assert!(seq_geq(0x00000010, 0xFFFFFFF0));
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/congestion", seq_compare_handles_wrap);
 
-    #[test]
-    fn install_requires_live_cap() {
+    fn install_requires_live_cap() -> narf_kernel_test::TestResult {
         let cap = Cap::<Cc, Grant>::bootstrap();
         let boxed = install(&cap, Reno).expect("live cap installs");
-        assert_eq!(boxed.name(), "reno");
+        narf_kernel_test::kt_assert_eq!(boxed.name(), "reno");
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/congestion", install_requires_live_cap);
 }

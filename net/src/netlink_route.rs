@@ -1974,6 +1974,6 @@ pub fn successful_mutation_notifications_in(
 #[path = "netlink_route/dump.rs"]
 mod dump;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "kernel-test"))]
 #[path = "netlink_route/tests.rs"]
 mod tests;

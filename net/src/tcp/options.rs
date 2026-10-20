@@ -474,22 +474,22 @@ pub fn encode_data_options(
     opts
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_finds_all_negotiated_options() {
+    fn parse_finds_all_negotiated_options() -> narf_kernel_test::TestResult {
         let opts = encode_syn_options(1460, 7, 0xDEADBEEF, 0, SynOptionPolicy::ALL);
         let parsed = ParsedOptions::parse(&opts);
-        assert_eq!(parsed.mss, Some(1460));
-        assert_eq!(parsed.wscale, Some(7));
-        assert!(parsed.sack_permitted);
-        assert_eq!(parsed.timestamps, Some((0xDEADBEEF, 0)));
+        narf_kernel_test::kt_assert_eq!(parsed.mss, Some(1460));
+        narf_kernel_test::kt_assert_eq!(parsed.wscale, Some(7));
+        narf_kernel_test::kt_assert!(parsed.sack_permitted);
+        narf_kernel_test::kt_assert_eq!(parsed.timestamps, Some((0xDEADBEEF, 0)));
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/options", parse_finds_all_negotiated_options);
 
-    #[test]
-    fn negotiate_picks_lower_mss() {
+    fn negotiate_picks_lower_mss() -> narf_kernel_test::TestResult {
         let mut state = OptionsState::new();
         state.our_mss = 1460;
         let peer = ParsedOptions {
@@ -497,37 +497,42 @@ mod tests {
             ..Default::default()
         };
         state.negotiate(&peer, 7);
-        assert_eq!(state.peer_mss, 536);
+        narf_kernel_test::kt_assert_eq!(state.peer_mss, 536);
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/options", negotiate_picks_lower_mss);
 
-    #[test]
-    fn paws_rejects_old_tsval() {
+    fn paws_rejects_old_tsval() -> narf_kernel_test::TestResult {
         let mut state = OptionsState::new();
         state.timestamps_active = true;
         state.ts_recent = 100;
-        assert!(state.paws_reject(50, 0, 0));
-        assert!(!state.paws_reject(100, 0, 0));
-        assert!(!state.paws_reject(150, 0, 0));
+        narf_kernel_test::kt_assert!(state.paws_reject(50, 0, 0));
+        narf_kernel_test::kt_assert!(!state.paws_reject(100, 0, 0));
+        narf_kernel_test::kt_assert!(!state.paws_reject(150, 0, 0));
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/options", paws_rejects_old_tsval);
 
-    #[test]
-    fn window_scale_encode_round_trip() {
+    fn window_scale_encode_round_trip() -> narf_kernel_test::TestResult {
         let mut state = OptionsState::new();
         state.our_wscale = 7;
         state.peer_wscale = 7;
         state.wscale_active = true;
         // 256 KiB effective → 2048 on the wire after shift.
-        assert_eq!(state.encode_our_window(256 * 1024), 2048);
+        narf_kernel_test::kt_assert_eq!(state.encode_our_window(256 * 1024), 2048);
         // 2048 on the wire from peer → 256 KiB.
-        assert_eq!(state.decode_peer_window(2048), 256 * 1024);
+        narf_kernel_test::kt_assert_eq!(state.decode_peer_window(2048), 256 * 1024);
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/options", window_scale_encode_round_trip);
 
-    #[test]
-    fn wscale_disabled_if_peer_didnt_offer() {
+    fn wscale_disabled_if_peer_didnt_offer() -> narf_kernel_test::TestResult {
         let mut state = OptionsState::new();
         let peer = ParsedOptions::default();
         state.negotiate(&peer, 7);
-        assert!(!state.wscale_active);
-        assert_eq!(state.our_wscale, 0);
+        narf_kernel_test::kt_assert!(!state.wscale_active);
+        narf_kernel_test::kt_assert_eq!(state.our_wscale, 0);
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/options", wscale_disabled_if_peer_didnt_offer);
 }

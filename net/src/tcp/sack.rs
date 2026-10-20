@@ -241,12 +241,11 @@ fn seq_max(a: u32, b: u32) -> u32 {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
 
-    #[test]
-    fn encode_decode_round_trip_three_blocks() {
+    fn encode_decode_round_trip_three_blocks() -> narf_kernel_test::TestResult {
         let blocks = alloc::vec![
             SackBlock {
                 left: 1000,
@@ -262,13 +261,14 @@ mod tests {
             },
         ];
         let encoded = encode_blocks(&blocks);
-        assert_eq!(encoded.len(), 8 * 3);
+        narf_kernel_test::kt_assert_eq!(encoded.len(), 8 * 3);
         let decoded = decode_blocks(&encoded);
-        assert_eq!(decoded, blocks);
+        narf_kernel_test::kt_assert_eq!(decoded, blocks);
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/sack", encode_decode_round_trip_three_blocks);
 
-    #[test]
-    fn encode_caps_at_four_blocks() {
+    fn encode_caps_at_four_blocks() -> narf_kernel_test::TestResult {
         let blocks = alloc::vec![
             SackBlock { left: 1, right: 2 },
             SackBlock { left: 3, right: 4 },
@@ -277,36 +277,39 @@ mod tests {
             SackBlock { left: 9, right: 10 },
         ];
         let encoded = encode_blocks(&blocks);
-        assert_eq!(encoded.len(), 8 * 4);
+        narf_kernel_test::kt_assert_eq!(encoded.len(), 8 * 4);
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/sack", encode_caps_at_four_blocks);
 
-    #[test]
-    fn book_merges_adjacent_ranges() {
+    fn book_merges_adjacent_ranges() -> narf_kernel_test::TestResult {
         let mut b = SackBook::new();
         b.add_range(1000, 2000);
         b.add_range(2000, 3000); // adjacent right
-        assert_eq!(b.blocks().len(), 1);
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(b.blocks().len(), 1);
+        narf_kernel_test::kt_assert_eq!(
             b.blocks()[0],
             SackBlock {
                 left: 1000,
                 right: 3000
             }
         );
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/sack", book_merges_adjacent_ranges);
 
-    #[test]
-    fn book_keeps_mru_order() {
+    fn book_keeps_mru_order() -> narf_kernel_test::TestResult {
         let mut b = SackBook::new();
         b.add_range(1000, 2000);
         b.add_range(5000, 6000);
         // 5000..6000 should be first (MRU).
-        assert_eq!(b.blocks()[0].left, 5000);
-        assert_eq!(b.blocks()[1].left, 1000);
+        narf_kernel_test::kt_assert_eq!(b.blocks()[0].left, 5000);
+        narf_kernel_test::kt_assert_eq!(b.blocks()[1].left, 1000);
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/sack", book_keeps_mru_order);
 
-    #[test]
-    fn scoreboard_pruning() {
+    fn scoreboard_pruning() -> narf_kernel_test::TestResult {
         let mut s = SenderScoreboard::new();
         s.update_from(&[
             SackBlock {
@@ -319,7 +322,9 @@ mod tests {
             },
         ]);
         s.prune_below(250); // covers first block
-        assert_eq!(s.blocks.len(), 1);
-        assert_eq!(s.blocks[0].left, 300);
+        narf_kernel_test::kt_assert_eq!(s.blocks.len(), 1);
+        narf_kernel_test::kt_assert_eq!(s.blocks[0].left, 300);
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/sack", scoreboard_pruning);
 }

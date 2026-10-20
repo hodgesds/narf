@@ -5,15 +5,18 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-/// Build a `struct nlmsghdr` request buffer: len is filled to header size,
-/// type/flags/seq/pid as given.
+/// Build a dump request: a `struct nlmsghdr` plus a one-byte `struct
+/// rtgenmsg` (AF_UNSPEC), padded to NLMSG_ALIGN. Linux's `rtnetlink_rcv_msg`
+/// silently ignores a message without even that byte, so a header-only
+/// request is not a dump request at all.
 fn req(msg_type: u16, seq: u32, pid: u32) -> Vec<u8> {
     let mut b = Vec::new();
-    b.extend_from_slice(&(NLMSG_HDRLEN as u32).to_le_bytes());
+    b.extend_from_slice(&(NLMSG_HDRLEN as u32 + 1).to_le_bytes());
     b.extend_from_slice(&msg_type.to_le_bytes());
     b.extend_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_le_bytes());
     b.extend_from_slice(&seq.to_le_bytes());
     b.extend_from_slice(&pid.to_le_bytes());
+    b.extend_from_slice(&[0, 0, 0, 0]);
     b
 }
 
@@ -42,31 +45,35 @@ fn find_rtattr(msg: &[u8], ifhdr_len: usize, want_type: u16) -> Option<Vec<u8>> 
     None
 }
 
-#[test]
-fn align_helpers_round_to_four() {
-    assert_eq!(nlmsg_align(0), 0);
-    assert_eq!(nlmsg_align(1), 4);
-    assert_eq!(nlmsg_align(4), 4);
-    assert_eq!(nlmsg_align(5), 8);
-    assert_eq!(rta_align(6), 8);
+fn align_helpers_round_to_four() -> narf_kernel_test::TestResult {
+    narf_kernel_test::kt_assert_eq!(nlmsg_align(0), 0);
+    narf_kernel_test::kt_assert_eq!(nlmsg_align(1), 4);
+    narf_kernel_test::kt_assert_eq!(nlmsg_align(4), 4);
+    narf_kernel_test::kt_assert_eq!(nlmsg_align(5), 8);
+    narf_kernel_test::kt_assert_eq!(rta_align(6), 8);
     // Every framed message length is 4-byte aligned.
     let msgs = build_dump(&req(RTM_GETLINK, 7, 99));
     for m in &msgs {
-        assert_eq!(m.len() % NLMSG_ALIGNTO, 0, "message not NLMSG_ALIGN-padded");
+        narf_kernel_test::kt_assert_eq!(
+            m.len() % NLMSG_ALIGNTO,
+            0,
+            "message not NLMSG_ALIGN-padded"
+        );
     }
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!("net/netlink_route", align_helpers_round_to_four);
 
-#[test]
-fn getlink_dump_has_loopback_and_terminates() {
+fn getlink_dump_has_loopback_and_terminates() -> narf_kernel_test::TestResult {
     let msgs = build_dump(&req(RTM_GETLINK, 42, 1234));
-    assert!(msgs.len() >= 2, "expected >=1 NEWLINK + a DONE");
+    narf_kernel_test::kt_assert!(msgs.len() >= 2, "expected >=1 NEWLINK + a DONE");
 
     // First message is an RTM_NEWLINK with echoed seq/pid and NLM_F_MULTI.
     let (_len, mtype, flags, seq, pid) = hdr_of(&msgs[0]);
-    assert_eq!(mtype, RTM_NEWLINK);
-    assert_eq!(seq, 42);
-    assert_eq!(pid, 0, "reply sender is the kernel netlink endpoint");
-    assert_ne!(
+    narf_kernel_test::kt_assert_eq!(mtype, RTM_NEWLINK);
+    narf_kernel_test::kt_assert_eq!(seq, 42);
+    narf_kernel_test::kt_assert_eq!(pid, 0, "reply sender is the kernel netlink endpoint");
+    narf_kernel_test::kt_assert_ne!(
         flags & NLM_F_MULTI,
         0,
         "dump entries must carry NLM_F_MULTI"
@@ -75,16 +82,16 @@ fn getlink_dump_has_loopback_and_terminates() {
     // The loopback entry names itself "lo" via IFLA_IFNAME. ifinfomsg is
     // 16 bytes: family/pad/type(2)/index(4)/flags(4)/change(4).
     let name = find_rtattr(&msgs[0], 16, IFLA_IFNAME).expect("first link has IFLA_IFNAME");
-    assert_eq!(&name, b"lo\0", "ifindex-1 link is the loopback");
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(&name, b"lo\0", "ifindex-1 link is the loopback");
+    narf_kernel_test::kt_assert_eq!(
         find_rtattr(&msgs[0], 16, IFLA_OPERSTATE).as_deref(),
         Some(&[IF_OPER_UP][..])
     );
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         find_rtattr(&msgs[0], 16, IFLA_QDISC).as_deref(),
         Some(&b"noqueue\0"[..])
     );
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         find_rtattr(&msgs[0], 16, IFLA_STATS64)
             .expect("link has IFLA_STATS64")
             .len(),
@@ -93,12 +100,16 @@ fn getlink_dump_has_loopback_and_terminates() {
 
     // Last message is NLMSG_DONE.
     let (_l, dtype, _f, dseq, _p) = hdr_of(msgs.last().unwrap());
-    assert_eq!(dtype, NLMSG_DONE);
-    assert_eq!(dseq, 42, "DONE echoes the request seq");
+    narf_kernel_test::kt_assert_eq!(dtype, NLMSG_DONE);
+    narf_kernel_test::kt_assert_eq!(dseq, 42, "DONE echoes the request seq");
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!(
+    "net/netlink_route",
+    getlink_dump_has_loopback_and_terminates
+);
 
-#[test]
-fn getlink_point_query_returns_one_non_multipart_link() {
+fn getlink_point_query_returns_one_non_multipart_link() -> narf_kernel_test::TestResult {
     let mut body = vec![0, 0];
     body.extend_from_slice(&0u16.to_ne_bytes());
     body.extend_from_slice(&1i32.to_ne_bytes());
@@ -106,11 +117,11 @@ fn getlink_point_query_returns_one_non_multipart_link() {
     body.extend_from_slice(&0u32.to_ne_bytes());
     let request = frame_message(RTM_GETLINK, NLM_F_REQUEST, 43, 7, &body);
     let replies = build_dump(&request);
-    assert_eq!(replies.len(), 1);
+    narf_kernel_test::kt_assert_eq!(replies.len(), 1);
     let hdr = parse_hdr(&replies[0]).unwrap();
-    assert_eq!(hdr.msg_type, RTM_NEWLINK);
-    assert_eq!(hdr.flags & NLM_F_MULTI, 0);
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(hdr.msg_type, RTM_NEWLINK);
+    narf_kernel_test::kt_assert_eq!(hdr.flags & NLM_F_MULTI, 0);
+    narf_kernel_test::kt_assert_eq!(
         find_rtattr(&replies[0], 16, IFLA_IFNAME).as_deref(),
         Some(&b"lo\0"[..])
     );
@@ -118,7 +129,7 @@ fn getlink_point_query_returns_one_non_multipart_link() {
     body[4..8].copy_from_slice(&999i32.to_ne_bytes());
     let missing = frame_message(RTM_GETLINK, NLM_F_REQUEST, 44, 7, &body);
     let replies = build_dump(&missing);
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         i32::from_ne_bytes(
             replies[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
                 .try_into()
@@ -126,37 +137,42 @@ fn getlink_point_query_returns_one_non_multipart_link() {
         ),
         -ENODEV
     );
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!(
+    "net/netlink_route",
+    getlink_point_query_returns_one_non_multipart_link
+);
 
-#[test]
-fn getaddr_dump_is_well_formed() {
+fn getaddr_dump_is_well_formed() -> narf_kernel_test::TestResult {
     let msgs = build_dump(&req(RTM_GETADDR, 5, 77));
-    assert!(msgs.len() >= 2, "expected >=1 NEWADDR + a DONE");
+    narf_kernel_test::kt_assert!(msgs.len() >= 2, "expected >=1 NEWADDR + a DONE");
 
     // First address is loopback 127.0.0.1/8 with an IFA_LOCAL attribute.
     let (_len, mtype, _flags, seq, _pid) = hdr_of(&msgs[0]);
-    assert_eq!(mtype, RTM_NEWADDR);
-    assert_eq!(seq, 5);
+    narf_kernel_test::kt_assert_eq!(mtype, RTM_NEWADDR);
+    narf_kernel_test::kt_assert_eq!(seq, 5);
     // ifaddrmsg is 8 bytes: family/prefixlen/flags/scope/index(4).
-    assert_eq!(msgs[0][NLMSG_HDRLEN], AF_INET, "ifa_family = AF_INET");
-    assert_eq!(msgs[0][NLMSG_HDRLEN + 1], 8, "loopback prefixlen /8");
+    narf_kernel_test::kt_assert_eq!(msgs[0][NLMSG_HDRLEN], AF_INET, "ifa_family = AF_INET");
+    narf_kernel_test::kt_assert_eq!(msgs[0][NLMSG_HDRLEN + 1], 8, "loopback prefixlen /8");
     let local = find_rtattr(&msgs[0], 8, IFA_LOCAL).expect("addr has IFA_LOCAL");
-    assert_eq!(&local, &[127, 0, 0, 1], "first addr is 127.0.0.1");
+    narf_kernel_test::kt_assert_eq!(&local, &[127, 0, 0, 1], "first addr is 127.0.0.1");
 
     let (_l, dtype, _f, _s, _p) = hdr_of(msgs.last().unwrap());
-    assert_eq!(dtype, NLMSG_DONE);
+    narf_kernel_test::kt_assert_eq!(dtype, NLMSG_DONE);
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!("net/netlink_route", getaddr_dump_is_well_formed);
 
-#[test]
-fn getaddr_dump_honors_family_and_ignores_legacy_ifindex() {
+fn getaddr_dump_honors_family_and_ignores_legacy_ifindex() -> narf_kernel_test::TestResult {
     let mut body = [0u8; 8];
     body[0] = AF_INET6;
     let ipv6 = frame_message(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 6, 0, &body);
     let replies = build_dump(&ipv6);
-    assert!(replies[..replies.len() - 1]
+    narf_kernel_test::kt_assert!(replies[..replies.len() - 1]
         .iter()
         .all(|m| m[NLMSG_HDRLEN] == AF_INET6));
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         parse_hdr(replies.last().unwrap()).unwrap().msg_type,
         NLMSG_DONE
     );
@@ -166,47 +182,64 @@ fn getaddr_dump_honors_family_and_ignores_legacy_ifindex() {
     body[4..8].copy_from_slice(&999u32.to_ne_bytes());
     let legacy_index = frame_message(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 7, 0, &body);
     let replies = build_dump(&legacy_index);
-    assert_eq!(parse_hdr(&replies[0]).unwrap().msg_type, RTM_NEWADDR);
+    narf_kernel_test::kt_assert_eq!(parse_hdr(&replies[0]).unwrap().msg_type, RTM_NEWADDR);
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!(
+    "net/netlink_route",
+    getaddr_dump_honors_family_and_ignores_legacy_ifindex
+);
 
-#[test]
-fn getroute_dump_has_loopback_and_terminates() {
+fn getroute_dump_has_loopback_and_terminates() -> narf_kernel_test::TestResult {
     let msgs = build_dump(&req(RTM_GETROUTE, 19, 88));
-    assert!(msgs.len() >= 2, "expected >=1 NEWROUTE + a DONE");
+    narf_kernel_test::kt_assert!(msgs.len() >= 2, "expected >=1 NEWROUTE + a DONE");
 
-    let (_len, mtype, flags, seq, pid) = hdr_of(&msgs[0]);
-    assert_eq!(mtype, RTM_NEWROUTE);
-    assert_eq!(flags & NLM_F_MULTI, NLM_F_MULTI);
-    assert_eq!(seq, 19);
-    assert_eq!(pid, 0);
+    // Other smokes may have configured interfaces and routes before this one
+    // runs, so the loopback route is found by content, not position.
+    let Some(lo) = msgs.iter().find(|m| {
+        m.len() > NLMSG_HDRLEN + 12
+            && m[NLMSG_HDRLEN + 4] == crate::route::TABLE_LOCAL
+            && find_rtattr(m, 12, RTA_DST).as_deref() == Some(&[127, 0, 0, 0][..])
+    }) else {
+        return narf_kernel_test::TestResult::Fail("no 127.0.0.0/8 local route in the dump");
+    };
+    let (_len, mtype, flags, seq, pid) = hdr_of(lo);
+    narf_kernel_test::kt_assert_eq!(mtype, RTM_NEWROUTE);
+    narf_kernel_test::kt_assert_eq!(flags & NLM_F_MULTI, NLM_F_MULTI);
+    narf_kernel_test::kt_assert_eq!(seq, 19);
+    narf_kernel_test::kt_assert_eq!(pid, 0);
 
     // struct rtmsg is 12 bytes. The always-present synthetic loopback route
     // is AF_INET 127.0.0.0/8, local-table, host-scope, with oif=1.
-    assert_eq!(msgs[0][NLMSG_HDRLEN], AF_INET);
-    assert_eq!(msgs[0][NLMSG_HDRLEN + 1], 8);
-    assert_eq!(msgs[0][NLMSG_HDRLEN + 4], crate::route::TABLE_LOCAL);
-    assert_eq!(msgs[0][NLMSG_HDRLEN + 6], crate::route::Scope::Host as u8);
-    assert_eq!(msgs[0][NLMSG_HDRLEN + 7], RTN_LOCAL);
-    assert_eq!(
-        find_rtattr(&msgs[0], 12, RTA_DST).as_deref(),
+    narf_kernel_test::kt_assert_eq!(lo[NLMSG_HDRLEN], AF_INET);
+    narf_kernel_test::kt_assert_eq!(lo[NLMSG_HDRLEN + 1], 8);
+    narf_kernel_test::kt_assert_eq!(lo[NLMSG_HDRLEN + 4], crate::route::TABLE_LOCAL);
+    narf_kernel_test::kt_assert_eq!(lo[NLMSG_HDRLEN + 6], crate::route::Scope::Host as u8);
+    narf_kernel_test::kt_assert_eq!(lo[NLMSG_HDRLEN + 7], RTN_LOCAL);
+    narf_kernel_test::kt_assert_eq!(
+        find_rtattr(lo, 12, RTA_DST).as_deref(),
         Some(&[127, 0, 0, 0][..])
     );
-    assert_eq!(
-        find_rtattr(&msgs[0], 12, RTA_OIF).as_deref(),
+    narf_kernel_test::kt_assert_eq!(
+        find_rtattr(lo, 12, RTA_OIF).as_deref(),
         Some(&1u32.to_le_bytes()[..])
     );
-    assert_eq!(
-        find_rtattr(&msgs[0], 12, RTA_PREFSRC).as_deref(),
+    narf_kernel_test::kt_assert_eq!(
+        find_rtattr(lo, 12, RTA_PREFSRC).as_deref(),
         Some(&[127, 0, 0, 1][..])
     );
 
     let (_l, dtype, _f, dseq, _p) = hdr_of(msgs.last().unwrap());
-    assert_eq!(dtype, NLMSG_DONE);
-    assert_eq!(dseq, 19);
+    narf_kernel_test::kt_assert_eq!(dtype, NLMSG_DONE);
+    narf_kernel_test::kt_assert_eq!(dseq, 19);
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!(
+    "net/netlink_route",
+    getroute_dump_has_loopback_and_terminates
+);
 
-#[test]
-fn getroute_point_query_uses_longest_prefix_match() {
+fn getroute_point_query_uses_longest_prefix_match() -> narf_kernel_test::TestResult {
     fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
         Ok(())
     }
@@ -238,20 +271,20 @@ fn getroute_point_query_uses_longest_prefix_match() {
     push_rtattr(&mut body, RTA_DST, &[198, 18, 7, 99]);
     let request = frame_message(RTM_GETROUTE, NLM_F_REQUEST, 62, 8, &body);
     let replies = build_dump(&request);
-    assert_eq!(replies.len(), 1);
+    narf_kernel_test::kt_assert_eq!(replies.len(), 1);
     let hdr = parse_hdr(&replies[0]).unwrap();
-    assert_eq!(hdr.msg_type, RTM_NEWROUTE);
-    assert_eq!(hdr.flags & NLM_F_MULTI, 0);
-    assert_eq!(replies[0][NLMSG_HDRLEN + 1], 24);
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(hdr.msg_type, RTM_NEWROUTE);
+    narf_kernel_test::kt_assert_eq!(hdr.flags & NLM_F_MULTI, 0);
+    narf_kernel_test::kt_assert_eq!(replies[0][NLMSG_HDRLEN + 1], 24);
+    narf_kernel_test::kt_assert_eq!(
         find_rtattr(&replies[0], 12, RTA_DST).as_deref(),
         Some(&[198, 18, 7, 0][..])
     );
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         find_rtattr(&replies[0], 12, RTA_GATEWAY).as_deref(),
         Some(&[192, 0, 2, 24][..])
     );
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         find_rtattr(&replies[0], 12, RTA_OIF).as_deref(),
         Some(&ifindex.to_ne_bytes()[..])
     );
@@ -272,27 +305,35 @@ fn getroute_point_query_uses_longest_prefix_match() {
         name,
         crate::route::TABLE_MAIN,
     );
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!(
+    "net/netlink_route",
+    getroute_point_query_uses_longest_prefix_match
+);
 
-#[test]
-fn getroute_dump_honors_table_filter() {
+fn getroute_dump_honors_table_filter() -> narf_kernel_test::TestResult {
     let mut body = [0u8; 12];
     body[0] = AF_INET;
     body[4] = crate::route::TABLE_MAIN;
     let request = frame_message(RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, 63, 0, &body);
-    let replies = build_dump(&request);
-    assert_eq!(
+    // `inet_dump_fib` applies rtm_table only under NETLINK_GET_STRICT_CHK
+    // (`ip_valid_fib_dump_req`); a legacy dump ignores it and lets the caller
+    // filter, as iproute2 does.
+    let replies = build_get_in(0, &request, true, false);
+    narf_kernel_test::kt_assert_eq!(
         parse_hdr(replies.last().unwrap()).unwrap().msg_type,
         NLMSG_DONE
     );
     for reply in &replies[..replies.len() - 1] {
-        assert_eq!(parse_hdr(reply).unwrap().msg_type, RTM_NEWROUTE);
-        assert_eq!(reply[NLMSG_HDRLEN + 4], crate::route::TABLE_MAIN);
+        narf_kernel_test::kt_assert_eq!(parse_hdr(reply).unwrap().msg_type, RTM_NEWROUTE);
+        narf_kernel_test::kt_assert_eq!(reply[NLMSG_HDRLEN + 4], crate::route::TABLE_MAIN);
     }
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!("net/netlink_route", getroute_dump_honors_table_filter);
 
-#[test]
-fn newneigh_wire_layout_carries_ipv4_destination_and_mac() {
+fn newneigh_wire_layout_carries_ipv4_destination_and_mac() -> narf_kernel_test::TestResult {
     let msg = build_newneigh(
         &NeighInfo {
             family: AF_INET,
@@ -306,43 +347,48 @@ fn newneigh_wire_layout_carries_ipv4_destination_and_mac() {
         0,
     );
     let (_len, mtype, flags, seq, pid) = hdr_of(&msg);
-    assert_eq!(mtype, RTM_NEWNEIGH);
-    assert_eq!(flags, NLM_F_MULTI);
-    assert_eq!(seq, 31);
-    assert_eq!(pid, 0);
-    assert_eq!(msg[NLMSG_HDRLEN], AF_INET);
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(mtype, RTM_NEWNEIGH);
+    narf_kernel_test::kt_assert_eq!(flags, NLM_F_MULTI);
+    narf_kernel_test::kt_assert_eq!(seq, 31);
+    narf_kernel_test::kt_assert_eq!(pid, 0);
+    narf_kernel_test::kt_assert_eq!(msg[NLMSG_HDRLEN], AF_INET);
+    narf_kernel_test::kt_assert_eq!(
         i32::from_ne_bytes(msg[NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8].try_into().unwrap()),
         3
     );
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         u16::from_ne_bytes(msg[NLMSG_HDRLEN + 8..NLMSG_HDRLEN + 10].try_into().unwrap()),
         NUD_STALE
     );
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         find_rtattr(&msg, 12, NDA_DST).as_deref(),
         Some(&[192, 0, 2, 1][..])
     );
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         find_rtattr(&msg, 12, NDA_LLADDR).as_deref(),
         Some(&[0x02, 0, 0, 0, 0, 1][..])
     );
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!(
+    "net/netlink_route",
+    newneigh_wire_layout_carries_ipv4_destination_and_mac
+);
 
-#[test]
-fn getneigh_dump_terminates() {
+fn getneigh_dump_terminates() -> narf_kernel_test::TestResult {
     let msgs = build_dump(&req(RTM_GETNEIGH, 44, 12));
-    assert_eq!(hdr_of(msgs.last().unwrap()).1, NLMSG_DONE);
-    assert!(msgs
+    narf_kernel_test::kt_assert_eq!(hdr_of(msgs.last().unwrap()).1, NLMSG_DONE);
+    narf_kernel_test::kt_assert!(msgs
         .iter()
         .all(|msg| matches!(hdr_of(msg).1, RTM_NEWNEIGH | NLMSG_DONE)));
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!("net/netlink_route", getneigh_dump_terminates);
 
 /// `inet_fill_ifaddr`: every IPv4 RTM_NEWADDR carries the 32-bit IFA_FLAGS
 /// and IFA_CACHEINFO; a static address is IFA_F_PERMANENT with infinite
 /// lifetimes. systemd-resolved rejects an address message without IFA_FLAGS.
-#[test]
-fn ipv4_address_message_carries_ifa_flags_and_cacheinfo() {
+fn ipv4_address_message_carries_ifa_flags_and_cacheinfo() -> narf_kernel_test::TestResult {
     let addr = AddrInfo {
         ifindex: 1,
         prefix_len: 8,
@@ -351,18 +397,22 @@ fn ipv4_address_message_carries_ifa_flags_and_cacheinfo() {
     };
     let msg = build_newaddr(&addr, 3, 0);
     let flags = find_rtattr(&msg, 8, IFA_FLAGS).expect("IFA_FLAGS present");
-    assert_eq!(flags, IFA_F_PERMANENT.to_ne_bytes());
-    assert_eq!(u32::from(msg[NLMSG_HDRLEN + 2]), IFA_F_PERMANENT);
+    narf_kernel_test::kt_assert_eq!(flags, IFA_F_PERMANENT.to_ne_bytes());
+    narf_kernel_test::kt_assert_eq!(u32::from(msg[NLMSG_HDRLEN + 2]), IFA_F_PERMANENT);
     let ci = find_rtattr(&msg, 8, IFA_CACHEINFO).expect("IFA_CACHEINFO present");
-    assert_eq!(ci.len(), 16);
-    assert_eq!(&ci[0..4], &u32::MAX.to_ne_bytes());
-    assert_eq!(&ci[4..8], &u32::MAX.to_ne_bytes());
+    narf_kernel_test::kt_assert_eq!(ci.len(), 16);
+    narf_kernel_test::kt_assert_eq!(&ci[0..4], &u32::MAX.to_ne_bytes());
+    narf_kernel_test::kt_assert_eq!(&ci[4..8], &u32::MAX.to_ne_bytes());
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!(
+    "net/netlink_route",
+    ipv4_address_message_carries_ifa_flags_and_cacheinfo
+);
 
 /// `inet6_fill_ifaddr`: a SLAAC address with finite lifetimes is not
 /// IFA_F_PERMANENT and reports its remaining lifetimes.
-#[test]
-fn ipv6_address_message_with_lifetimes_is_not_permanent() {
+fn ipv6_address_message_with_lifetimes_is_not_permanent() -> narf_kernel_test::TestResult {
     let addr = crate::ipv6::addrs::Ipv6IfAddr {
         iface: "eth0".into(),
         addr: [0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
@@ -376,33 +426,41 @@ fn ipv6_address_message_with_lifetimes_is_not_permanent() {
     let msg = build_newaddr_v6(&addr, 2, 1, 0);
     let flags = find_rtattr(&msg, 8, IFA_FLAGS).expect("IFA_FLAGS present");
     let flags = u32::from_ne_bytes(flags[..4].try_into().unwrap());
-    assert_eq!(flags, IFA_F_TENTATIVE | IFA_F_TEMPORARY);
-    assert_eq!(u32::from(msg[NLMSG_HDRLEN + 2]), flags);
+    narf_kernel_test::kt_assert_eq!(flags, IFA_F_TENTATIVE | IFA_F_TEMPORARY);
+    narf_kernel_test::kt_assert_eq!(u32::from(msg[NLMSG_HDRLEN + 2]), flags);
     let ci = find_rtattr(&msg, 8, IFA_CACHEINFO).expect("IFA_CACHEINFO present");
-    assert_ne!(&ci[4..8], &u32::MAX.to_ne_bytes());
+    narf_kernel_test::kt_assert_ne!(&ci[4..8], &u32::MAX.to_ne_bytes());
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!(
+    "net/netlink_route",
+    ipv6_address_message_with_lifetimes_is_not_permanent
+);
 
 /// A notification echoed from an `RTM_NEWADDR` request without IFA_FLAGS or
 /// IFA_CACHEINFO gains both, as `rtmsg_ifa` would have emitted them.
-#[test]
-fn address_notification_is_completed_with_flags() {
+fn address_notification_is_completed_with_flags() -> narf_kernel_test::TestResult {
     let mut body = vec![AF_INET, 24, 0, 0];
     body.extend_from_slice(&2u32.to_ne_bytes());
     push_rtattr(&mut body, IFA_LOCAL, &[10, 0, 0, 2]);
     let mut msg = frame_message(RTM_NEWADDR, 0, 0, 0, &body);
     complete_addr_notification(&mut msg);
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         u32::from_ne_bytes(msg[0..4].try_into().unwrap()) as usize,
         msg.len()
     );
     let flags = find_rtattr(&msg, 8, IFA_FLAGS).expect("IFA_FLAGS appended");
-    assert_eq!(flags, IFA_F_PERMANENT.to_ne_bytes());
-    assert!(find_rtattr(&msg, 8, IFA_CACHEINFO).is_some());
-    assert!(find_rtattr(&msg, 8, IFA_LOCAL).is_some());
+    narf_kernel_test::kt_assert_eq!(flags, IFA_F_PERMANENT.to_ne_bytes());
+    narf_kernel_test::kt_assert!(find_rtattr(&msg, 8, IFA_CACHEINFO).is_some());
+    narf_kernel_test::kt_assert!(find_rtattr(&msg, 8, IFA_LOCAL).is_some());
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!(
+    "net/netlink_route",
+    address_notification_is_completed_with_flags
+);
 
-#[test]
-fn ipv6_address_message_uses_linux_ifaddr_layout() {
+fn ipv6_address_message_uses_linux_ifaddr_layout() -> narf_kernel_test::TestResult {
     let addr = crate::ipv6::addrs::Ipv6IfAddr {
         iface: "eth0".into(),
         addr: [0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
@@ -414,22 +472,26 @@ fn ipv6_address_message_uses_linux_ifaddr_layout() {
         temporary: false,
     };
     let msg = build_newaddr_v6(&addr, 7, 46, 0);
-    assert_eq!(hdr_of(&msg).1, RTM_NEWADDR);
-    assert_eq!(msg[NLMSG_HDRLEN], AF_INET6);
-    assert_eq!(msg[NLMSG_HDRLEN + 1], 64);
-    assert_eq!(msg[NLMSG_HDRLEN + 2], 0x80);
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(hdr_of(&msg).1, RTM_NEWADDR);
+    narf_kernel_test::kt_assert_eq!(msg[NLMSG_HDRLEN], AF_INET6);
+    narf_kernel_test::kt_assert_eq!(msg[NLMSG_HDRLEN + 1], 64);
+    narf_kernel_test::kt_assert_eq!(msg[NLMSG_HDRLEN + 2], 0x80);
+    narf_kernel_test::kt_assert_eq!(
         u32::from_ne_bytes(msg[NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8].try_into().unwrap()),
         7
     );
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         find_rtattr(&msg, 8, IFA_ADDRESS).as_deref(),
         Some(&addr.addr[..])
     );
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!(
+    "net/netlink_route",
+    ipv6_address_message_uses_linux_ifaddr_layout
+);
 
-#[test]
-fn ipv6_route_message_reports_gateway_and_oif() {
+fn ipv6_route_message_reports_gateway_and_oif() -> narf_kernel_test::TestResult {
     let route = crate::ipv6::route::Route {
         prefix: [0; 16],
         prefix_len: 0,
@@ -439,62 +501,78 @@ fn ipv6_route_message_reports_gateway_and_oif() {
         valid_deadline_ns: 0,
     };
     let msg = build_newroute_v6(&route, 7, 47, 0);
-    assert_eq!(hdr_of(&msg).1, RTM_NEWROUTE);
-    assert_eq!(msg[NLMSG_HDRLEN], AF_INET6);
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(hdr_of(&msg).1, RTM_NEWROUTE);
+    narf_kernel_test::kt_assert_eq!(msg[NLMSG_HDRLEN], AF_INET6);
+    narf_kernel_test::kt_assert_eq!(
         find_rtattr(&msg, 12, RTA_OIF).as_deref(),
         Some(&7u32.to_ne_bytes()[..])
     );
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         find_rtattr(&msg, 12, RTA_GATEWAY).as_deref(),
         route.gateway.as_ref().map(|gateway| &gateway[..])
     );
-    assert!(find_rtattr(&msg, 12, RTA_DST).is_none());
+    narf_kernel_test::kt_assert!(find_rtattr(&msg, 12, RTA_DST).is_none());
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!(
+    "net/netlink_route",
+    ipv6_route_message_reports_gateway_and_oif
+);
 
-#[test]
-fn getneigh_dump_honors_ifindex_filter() {
+fn getneigh_dump_honors_ifindex_filter() -> narf_kernel_test::TestResult {
     // `neigh_valid_dump_req`: the device filter is NDA_IFINDEX (8), not
     // ndm_ifindex.
     let mut body = vec![0u8; 12];
     push_rtattr(&mut body, 8, &99u32.to_ne_bytes());
     let request = frame_message(RTM_GETNEIGH, NLM_F_REQUEST | NLM_F_DUMP, 45, 12, &body);
     let msgs = build_dump(&request);
-    assert_eq!(msgs.len(), 1);
-    assert_eq!(hdr_of(&msgs[0]).1, NLMSG_DONE);
+    narf_kernel_test::kt_assert_eq!(msgs.len(), 1);
+    narf_kernel_test::kt_assert_eq!(hdr_of(&msgs[0]).1, NLMSG_DONE);
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!("net/netlink_route", getneigh_dump_honors_ifindex_filter);
 
-#[test]
-fn getrule_dump_has_linux_default_ipv4_rules() {
+fn getrule_dump_has_linux_default_ipv4_rules() -> narf_kernel_test::TestResult {
     let msgs = build_dump(&req(RTM_GETRULE, 52, 9));
-    assert_eq!(msgs.len(), 4);
+    narf_kernel_test::kt_assert_eq!(msgs.len(), 4);
     let expected = [
         (crate::route::TABLE_LOCAL, 0u32),
         (crate::route::TABLE_MAIN, 32_766u32),
         (crate::route::TABLE_DEFAULT, 32_767u32),
     ];
     for (msg, (table, priority)) in msgs.iter().zip(expected) {
-        assert_eq!(hdr_of(msg).1, RTM_NEWRULE);
-        assert_eq!(msg[NLMSG_HDRLEN], AF_INET);
-        assert_eq!(msg[NLMSG_HDRLEN + 4], table);
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(hdr_of(msg).1, RTM_NEWRULE);
+        narf_kernel_test::kt_assert_eq!(msg[NLMSG_HDRLEN], AF_INET);
+        narf_kernel_test::kt_assert_eq!(msg[NLMSG_HDRLEN + 4], table);
+        narf_kernel_test::kt_assert_eq!(
             find_rtattr(msg, 12, FRA_PRIORITY).as_deref(),
             Some(&priority.to_ne_bytes()[..])
         );
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(
             find_rtattr(msg, 12, FRA_TABLE).as_deref(),
             Some(&(table as u32).to_ne_bytes()[..])
         );
     }
-    assert_eq!(hdr_of(msgs.last().unwrap()).1, NLMSG_DONE);
+    narf_kernel_test::kt_assert_eq!(hdr_of(msgs.last().unwrap()).1, NLMSG_DONE);
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!(
+    "net/netlink_route",
+    getrule_dump_has_linux_default_ipv4_rules
+);
 
-#[test]
-fn getqdisc_reports_noqueue_for_loopback() {
-    let msgs = build_dump(&req(RTM_GETQDISC, 61, 4));
-    assert!(msgs.len() >= 2);
-    assert_eq!(hdr_of(&msgs[0]).1, RTM_NEWQDISC);
-    assert_eq!(
+fn getqdisc_reports_noqueue_for_loopback() -> narf_kernel_test::TestResult {
+    // `tc_dump_qdisc` parses a full struct tcmsg; a shorter request is -EINVAL.
+    let msgs = build_dump(&frame_message(
+        RTM_GETQDISC,
+        NLM_F_REQUEST | NLM_F_DUMP,
+        61,
+        4,
+        &[0u8; 20],
+    ));
+    narf_kernel_test::kt_assert!(msgs.len() >= 2);
+    narf_kernel_test::kt_assert_eq!(hdr_of(&msgs[0]).1, RTM_NEWQDISC);
+    narf_kernel_test::kt_assert_eq!(
         i32::from_ne_bytes(
             msgs[0][NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8]
                 .try_into()
@@ -502,27 +580,29 @@ fn getqdisc_reports_noqueue_for_loopback() {
         ),
         1
     );
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         find_rtattr(&msgs[0], 20, TCA_KIND).as_deref(),
         Some(&b"noqueue\0"[..])
     );
-    assert_eq!(hdr_of(msgs.last().unwrap()).1, NLMSG_DONE);
+    narf_kernel_test::kt_assert_eq!(hdr_of(msgs.last().unwrap()).1, NLMSG_DONE);
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!("net/netlink_route", getqdisc_reports_noqueue_for_loopback);
 
-#[test]
-fn getqdisc_dump_ignores_ifindex() {
+fn getqdisc_dump_ignores_ifindex() -> narf_kernel_test::TestResult {
     // `tc_dump_qdisc` walks every device; tcm_ifindex is not a dump filter.
     let mut body = [0u8; 20];
     body[4..8].copy_from_slice(&99i32.to_ne_bytes());
     let request = frame_message(RTM_GETQDISC, NLM_F_REQUEST | NLM_F_DUMP, 62, 20, &body);
     let msgs = build_dump(&request);
-    assert!(msgs.len() >= 2);
-    assert_eq!(hdr_of(&msgs[0]).1, RTM_NEWQDISC);
-    assert_eq!(hdr_of(msgs.last().unwrap()).1, NLMSG_DONE);
+    narf_kernel_test::kt_assert!(msgs.len() >= 2);
+    narf_kernel_test::kt_assert_eq!(hdr_of(&msgs[0]).1, RTM_NEWQDISC);
+    narf_kernel_test::kt_assert_eq!(hdr_of(msgs.last().unwrap()).1, NLMSG_DONE);
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!("net/netlink_route", getqdisc_dump_ignores_ifindex);
 
-#[test]
-fn absent_optional_collections_return_empty_completed_dumps() {
+fn absent_optional_collections_return_empty_completed_dumps() -> narf_kernel_test::TestResult {
     // Each request carries its full family header. RTM_GETADDRLABEL is only
     // registered for PF_INET6 and RTM_GETMDB only for PF_BRIDGE.
     for (msg_type, family, hdrlen) in [
@@ -543,23 +623,27 @@ fn absent_optional_collections_return_empty_completed_dumps() {
             &body,
         );
         let msgs = build_dump(&request);
-        assert_eq!(msgs.len(), 1, "type {msg_type} was not an empty dump");
+        narf_kernel_test::kt_assert_eq!(msgs.len(), 1, "type {msg_type} was not an empty dump");
         let hdr = parse_hdr(&msgs[0]).unwrap();
-        assert_eq!(hdr.msg_type, NLMSG_DONE);
-        assert_eq!(hdr.seq, msg_type as u32);
+        narf_kernel_test::kt_assert_eq!(hdr.msg_type, NLMSG_DONE);
+        narf_kernel_test::kt_assert_eq!(hdr.seq, msg_type as u32);
     }
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!(
+    "net/netlink_route",
+    absent_optional_collections_return_empty_completed_dumps
+);
 
-#[test]
-fn unsupported_request_yields_eopnotsupp_error() {
+fn unsupported_request_yields_eopnotsupp_error() -> narf_kernel_test::TestResult {
     // RTM_GETLINK is 18; use a bogus type the responder doesn't handle.
     let bogus: u16 = 999;
     let msgs = build_dump(&req(bogus, 8, 55));
-    assert_eq!(msgs.len(), 1, "error dump is a single message");
+    narf_kernel_test::kt_assert_eq!(msgs.len(), 1, "error dump is a single message");
     let (_len, mtype, _flags, seq, pid) = hdr_of(&msgs[0]);
-    assert_eq!(mtype, NLMSG_ERROR);
-    assert_eq!(seq, 8);
-    assert_eq!(pid, 0);
+    narf_kernel_test::kt_assert_eq!(mtype, NLMSG_ERROR);
+    narf_kernel_test::kt_assert_eq!(seq, 8);
+    narf_kernel_test::kt_assert_eq!(pid, 0);
     // nlmsgerr.error is the first i32 of the payload: -EOPNOTSUPP.
     let err = i32::from_le_bytes([
         msgs[0][NLMSG_HDRLEN],
@@ -567,44 +651,52 @@ fn unsupported_request_yields_eopnotsupp_error() {
         msgs[0][NLMSG_HDRLEN + 2],
         msgs[0][NLMSG_HDRLEN + 3],
     ]);
-    assert_eq!(err, -EOPNOTSUPP, "error payload carries -EOPNOTSUPP");
+    narf_kernel_test::kt_assert_eq!(err, -EOPNOTSUPP, "error payload carries -EOPNOTSUPP");
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!(
+    "net/netlink_route",
+    unsupported_request_yields_eopnotsupp_error
+);
 
-#[test]
-fn batched_requests_keep_sequence_and_ack_independent() {
+fn batched_requests_keep_sequence_and_ack_independent() -> narf_kernel_test::TestResult {
     let mut first = req(RTM_GETLINK, 101, 77);
     first[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP | NLM_F_ACK).to_le_bytes());
     let second = req(RTM_GETADDR, 202, 77);
     first.extend_from_slice(&second);
 
     let replies = build_replies(&first).expect("valid batched datagram");
-    assert!(replies.iter().any(|m| {
+    narf_kernel_test::kt_assert!(replies.iter().any(|m| {
         let h = parse_hdr(m).unwrap();
         h.msg_type == RTM_NEWLINK && h.seq == 101
     }));
     // A dump that starts is never ACKed, even with NLM_F_ACK
     // (`__netlink_dump_start` returns -EINTR; `netlink_rcv_skb` skips).
-    assert!(!replies.iter().any(|m| {
+    narf_kernel_test::kt_assert!(!replies.iter().any(|m| {
         let h = parse_hdr(m).unwrap();
         h.msg_type == NLMSG_ERROR && h.seq == 101
     }));
-    assert!(replies.iter().any(|m| {
+    narf_kernel_test::kt_assert!(replies.iter().any(|m| {
         let h = parse_hdr(m).unwrap();
         h.msg_type == RTM_NEWADDR && h.seq == 202
     }));
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!(
+    "net/netlink_route",
+    batched_requests_keep_sequence_and_ack_independent
+);
 
 // Linux `netlink_rcv_skb` stops at a header whose nlmsg_len is below
 // NLMSG_HDRLEN or past the end of the buffer: no reply, and sendmsg still
 // returns the full length (request content never fails the send).
-#[test]
-fn malformed_message_length_ends_the_walk_silently() {
+fn malformed_message_length_ends_the_walk_silently() -> narf_kernel_test::TestResult {
     let mut message = req(RTM_GETLINK, 1, 0);
     message[0..4].copy_from_slice(&15u32.to_le_bytes());
-    assert_eq!(build_replies(&message).unwrap().len(), 0);
+    narf_kernel_test::kt_assert_eq!(build_replies(&message).unwrap().len(), 0);
 
     message[0..4].copy_from_slice(&1024u32.to_le_bytes());
-    assert_eq!(build_replies(&message).unwrap().len(), 0);
+    narf_kernel_test::kt_assert_eq!(build_replies(&message).unwrap().len(), 0);
 
     // Messages before the malformed one are still processed.
     let mut batch = req(RTM_GETLINK, 2, 0);
@@ -612,39 +704,48 @@ fn malformed_message_length_ends_the_walk_silently() {
     bad[0..4].copy_from_slice(&4u32.to_le_bytes());
     batch.extend_from_slice(&bad);
     let replies = build_replies(&batch).unwrap();
-    assert!(!replies.is_empty());
-    assert!(replies.iter().all(|m| parse_hdr(m).unwrap().seq == 2));
+    narf_kernel_test::kt_assert!(!replies.is_empty());
+    narf_kernel_test::kt_assert!(replies.iter().all(|m| parse_hdr(m).unwrap().seq == 2));
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!(
+    "net/netlink_route",
+    malformed_message_length_ends_the_walk_silently
+);
 
 // iproute2 `ip addr` sends its RTM_GETADDR dump in a zero-padded buffer: the
 // 24-byte request then 128 zero bytes (a trailing nlmsg_len == 0 header). Linux
 // answers the dump and ignores the padding; NARF failed the send with EINVAL
 // ("Cannot send dump request: Invalid argument").
-#[test]
-fn iproute2_zero_padded_getaddr_dump_is_answered() {
+fn iproute2_zero_padded_getaddr_dump_is_answered() -> narf_kernel_test::TestResult {
     let body = [0u8; 8]; // struct ifaddrmsg, AF_UNSPEC
     let mut datagram = frame_message(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 9, 0, &body);
-    assert_eq!(datagram.len(), 24);
+    narf_kernel_test::kt_assert_eq!(datagram.len(), 24);
     datagram.resize(152, 0);
     let replies = build_replies(&datagram).unwrap();
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         parse_hdr(replies.last().unwrap()).unwrap().msg_type,
         NLMSG_DONE
     );
-    assert!(replies.iter().all(|m| parse_hdr(m).unwrap().seq == 9));
+    narf_kernel_test::kt_assert!(replies.iter().all(|m| parse_hdr(m).unwrap().seq == 9));
 
     // A trailing fragment shorter than a header is ignored the same way.
     let mut short = frame_message(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 10, 0, &body);
     short.extend_from_slice(&[0u8; 7]);
     let replies = build_replies(&short).unwrap();
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         parse_hdr(replies.last().unwrap()).unwrap().msg_type,
         NLMSG_DONE
     );
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!(
+    "net/netlink_route",
+    iproute2_zero_padded_getaddr_dump_is_answered
+);
 
-#[test]
-fn delegated_admin_can_set_mtu_but_unprivileged_socket_gets_eperm() {
+fn delegated_admin_can_set_mtu_but_unprivileged_socket_gets_eperm() -> narf_kernel_test::TestResult
+{
     fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
         Ok(())
     }
@@ -664,7 +765,7 @@ fn delegated_admin_can_set_mtu_but_unprivileged_socket_gets_eperm() {
     let request = frame_message(RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, 99, 42, &body);
 
     let denied = build_replies(&request).unwrap();
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         i32::from_ne_bytes(
             denied[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
                 .try_into()
@@ -685,9 +786,9 @@ fn delegated_admin_can_set_mtu_but_unprivileged_socket_gets_eperm() {
     // -EPERM: no NL_SET_ERR_MSG, so no extended-ACK message and no
     // NLM_F_ACK_TLVS.
     let ext_hdr = parse_hdr(&ext_denied[0]).unwrap();
-    assert_eq!(ext_hdr.flags & NLM_F_ACK_TLVS, 0);
+    narf_kernel_test::kt_assert_eq!(ext_hdr.flags & NLM_F_ACK_TLVS, 0);
     let echoed_len = parse_hdr(&request).unwrap().len as usize;
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         find_rtattr(
             &ext_denied[0],
             4 + nlmsg_align(echoed_len),
@@ -707,14 +808,14 @@ fn delegated_admin_can_set_mtu_but_unprivileged_socket_gets_eperm() {
     )
     .unwrap();
     let capped_hdr = parse_hdr(&capped[0]).unwrap();
-    assert_ne!(capped_hdr.flags & NLM_F_CAPPED, 0);
-    assert_eq!(capped_hdr.flags & NLM_F_ACK_TLVS, 0);
-    assert_eq!(find_rtattr(&capped[0], 20, NLMSGERR_ATTR_MSG), None);
+    narf_kernel_test::kt_assert_ne!(capped_hdr.flags & NLM_F_CAPPED, 0);
+    narf_kernel_test::kt_assert_eq!(capped_hdr.flags & NLM_F_ACK_TLVS, 0);
+    narf_kernel_test::kt_assert_eq!(find_rtattr(&capped[0], 20, NLMSGERR_ATTR_MSG), None);
 
     let cap = narf_capabilities::Cap::<crate::AdminCap, narf_capabilities::Invoke>::bootstrap();
     let admin = crate::AdminHandle::new(cap, alloc::string::String::from(name));
     let allowed = build_replies_authorized(&request, Some(&admin)).unwrap();
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         i32::from_ne_bytes(
             allowed[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
                 .try_into()
@@ -722,26 +823,31 @@ fn delegated_admin_can_set_mtu_but_unprivileged_socket_gets_eperm() {
         ),
         0
     );
-    assert_eq!(crate::iface::lookup(name).unwrap().mtu, 9000);
+    narf_kernel_test::kt_assert_eq!(crate::iface::lookup(name).unwrap().mtu, 9000);
     let notifications = successful_mutation_notifications(&request, &allowed);
-    assert_eq!(notifications.len(), 1);
-    assert_eq!(notifications[0].0, 1);
+    narf_kernel_test::kt_assert_eq!(notifications.len(), 1);
+    narf_kernel_test::kt_assert_eq!(notifications[0].0, 1);
     let event = parse_hdr(&notifications[0].1).unwrap();
-    assert_eq!(event.msg_type, RTM_NEWLINK);
-    assert_eq!(event.flags, 0);
-    assert_eq!(event.seq, 0);
-    assert_eq!(event.pid, 0);
+    narf_kernel_test::kt_assert_eq!(event.msg_type, RTM_NEWLINK);
+    narf_kernel_test::kt_assert_eq!(event.flags, 0);
+    narf_kernel_test::kt_assert_eq!(event.seq, 0);
+    narf_kernel_test::kt_assert_eq!(event.pid, 0);
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!(
+    "net/netlink_route",
+    delegated_admin_can_set_mtu_but_unprivileged_socket_gets_eperm
+);
 
-#[test]
-fn setlink_notification_reports_complete_post_mutation_link_state() {
+fn setlink_notification_reports_complete_post_mutation_link_state() -> narf_kernel_test::TestResult
+{
     fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
         Ok(())
     }
 
     let name = "rtnl-link-event0";
     crate::iface::register(name, [0x02, 0, 0, 0, 1, 2], discard);
-    assert!(crate::iface::set_link_metadata(name, true, None, None));
+    narf_kernel_test::kt_assert!(crate::iface::set_link_metadata(name, true, None, None));
     let ifindex = crate::iface::ifindex_of(name).unwrap();
 
     // NetworkManager changes only IFF_UP. The multicast RTM_NEWLINK must be
@@ -757,36 +863,40 @@ fn setlink_notification_reports_complete_post_mutation_link_state() {
     let admin = crate::AdminHandle::new(cap, alloc::string::String::from(name));
     let replies = build_replies_authorized(&request, Some(&admin)).unwrap();
     let notifications = successful_mutation_notifications_in(0, &request, &replies);
-    assert_eq!(notifications.len(), 1);
-    assert_eq!(notifications[0].0, 1);
+    narf_kernel_test::kt_assert_eq!(notifications.len(), 1);
+    narf_kernel_test::kt_assert_eq!(notifications[0].0, 1);
 
     let message = &notifications[0].1;
     let event = parse_hdr(message).unwrap();
-    assert_eq!(event.msg_type, RTM_NEWLINK);
-    assert_eq!(event.flags, 0);
-    assert_eq!(event.seq, 0);
-    assert_eq!(event.pid, 0);
+    narf_kernel_test::kt_assert_eq!(event.msg_type, RTM_NEWLINK);
+    narf_kernel_test::kt_assert_eq!(event.flags, 0);
+    narf_kernel_test::kt_assert_eq!(event.seq, 0);
+    narf_kernel_test::kt_assert_eq!(event.pid, 0);
     let flags = u32::from_ne_bytes(message[24..28].try_into().unwrap());
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         flags & (IFF_UP | IFF_RUNNING | IFF_LOWER_UP),
         IFF_UP | IFF_RUNNING | IFF_LOWER_UP
     );
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         find_rtattr(message, 16, IFLA_OPERSTATE).as_deref(),
         Some(&[IF_OPER_UP][..])
     );
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         find_rtattr(message, 16, IFLA_CARRIER).as_deref(),
         Some(&[1][..])
     );
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         find_rtattr(message, 16, IFLA_IFNAME).as_deref(),
         Some(&b"rtnl-link-event0\0"[..])
     );
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!(
+    "net/netlink_route",
+    setlink_notification_reports_complete_post_mutation_link_state
+);
 
-#[test]
-fn strict_check_rejects_short_dump_and_accepts_typed_request() {
+fn strict_check_rejects_short_dump_and_accepts_typed_request() -> narf_kernel_test::TestResult {
     // A strict dump's validation error is the NLMSG_DONE payload
     // (`netlink_dump_done`), not an NLMSG_ERROR.
     let short = frame_message(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 120, 0, &[0]);
@@ -799,8 +909,8 @@ fn strict_check_rejects_short_dump_and_accepts_typed_request() {
         },
     )
     .unwrap();
-    assert_eq!(parse_hdr(&denied[0]).unwrap().msg_type, NLMSG_DONE);
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(parse_hdr(&denied[0]).unwrap().msg_type, NLMSG_DONE);
+    narf_kernel_test::kt_assert_eq!(
         i32::from_ne_bytes(
             denied[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
                 .try_into()
@@ -820,11 +930,15 @@ fn strict_check_rejects_short_dump_and_accepts_typed_request() {
         },
     )
     .unwrap();
-    assert_eq!(parse_hdr(&allowed[0]).unwrap().msg_type, RTM_NEWADDR);
+    narf_kernel_test::kt_assert_eq!(parse_hdr(&allowed[0]).unwrap().msg_type, RTM_NEWADDR);
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!(
+    "net/netlink_route",
+    strict_check_rejects_short_dump_and_accepts_typed_request
+);
 
-#[test]
-fn delegated_admin_can_add_and_delete_ipv4_route() {
+fn delegated_admin_can_add_and_delete_ipv4_route() -> narf_kernel_test::TestResult {
     fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
         Ok(())
     }
@@ -860,15 +974,15 @@ fn delegated_admin_can_add_and_delete_ipv4_route() {
     };
 
     let add = build_replies_authorized(&route_request(RTM_NEWROUTE), Some(&admin)).unwrap();
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         i32::from_ne_bytes(add[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap()),
         0
     );
-    assert!(crate::route::route_list().iter().any(|route| {
+    narf_kernel_test::kt_assert!(crate::route::route_list().iter().any(|route| {
         route.iface == name && route.dst.addr.0 == [198, 51, 100, 0] && route.dst.prefix_len == 24
     }));
     let duplicate = build_replies_authorized(&route_request(RTM_NEWROUTE), Some(&admin)).unwrap();
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         i32::from_ne_bytes(
             duplicate[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
                 .try_into()
@@ -878,7 +992,7 @@ fn delegated_admin_can_add_and_delete_ipv4_route() {
     );
 
     let delete = build_replies_authorized(&route_request(RTM_DELROUTE), Some(&admin)).unwrap();
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         i32::from_ne_bytes(
             delete[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
                 .try_into()
@@ -886,11 +1000,11 @@ fn delegated_admin_can_add_and_delete_ipv4_route() {
         ),
         0
     );
-    assert!(!crate::route::route_list().iter().any(|route| {
+    narf_kernel_test::kt_assert!(!crate::route::route_list().iter().any(|route| {
         route.iface == name && route.dst.addr.0 == [198, 51, 100, 0] && route.dst.prefix_len == 24
     }));
     let missing = build_replies_authorized(&route_request(RTM_DELROUTE), Some(&admin)).unwrap();
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         i32::from_ne_bytes(
             missing[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
                 .try_into()
@@ -899,10 +1013,14 @@ fn delegated_admin_can_add_and_delete_ipv4_route() {
         // `fib_table_delete` answers a missing route with -ESRCH.
         -ESRCH
     );
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!(
+    "net/netlink_route",
+    delegated_admin_can_add_and_delete_ipv4_route
+);
 
-#[test]
-fn delegated_admin_can_add_and_delete_ipv6_address_and_route() {
+fn delegated_admin_can_add_and_delete_ipv6_address_and_route() -> narf_kernel_test::TestResult {
     fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
         Ok(())
     }
@@ -929,7 +1047,7 @@ fn delegated_admin_can_add_and_delete_ipv6_address_and_route() {
         frame_message(kind, flags, 205, 1, &body)
     };
     let add_addr = build_replies_authorized(&addr_request(RTM_NEWADDR), Some(&admin)).unwrap();
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         i32::from_ne_bytes(
             add_addr[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
                 .try_into()
@@ -937,10 +1055,10 @@ fn delegated_admin_can_add_and_delete_ipv6_address_and_route() {
         ),
         0
     );
-    assert!(crate::ipv6::addrs::is_local_on(name, &addr));
+    narf_kernel_test::kt_assert!(crate::ipv6::addrs::is_local_on(name, &addr));
     let addr_events = successful_mutation_notifications(&addr_request(RTM_NEWADDR), &add_addr);
-    assert_eq!(addr_events.len(), 1);
-    assert_eq!(addr_events[0].0, 1u32 << (9 - 1));
+    narf_kernel_test::kt_assert_eq!(addr_events.len(), 1);
+    narf_kernel_test::kt_assert_eq!(addr_events[0].0, 1u32 << (9 - 1));
 
     let route_request = |kind| {
         let mut body = vec![
@@ -966,7 +1084,7 @@ fn delegated_admin_can_add_and_delete_ipv6_address_and_route() {
         frame_message(kind, flags, 206, 1, &body)
     };
     let add_route = build_replies_authorized(&route_request(RTM_NEWROUTE), Some(&admin)).unwrap();
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         i32::from_ne_bytes(
             add_route[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
                 .try_into()
@@ -974,15 +1092,15 @@ fn delegated_admin_can_add_and_delete_ipv6_address_and_route() {
         ),
         0
     );
-    assert!(crate::ipv6::route::list_all()
+    narf_kernel_test::kt_assert!(crate::ipv6::route::list_all()
         .iter()
         .any(|route| { route.iface == name && route.prefix == prefix && route.prefix_len == 64 }));
     let route_events = successful_mutation_notifications(&route_request(RTM_NEWROUTE), &add_route);
-    assert_eq!(route_events.len(), 1);
-    assert_eq!(route_events[0].0, 1u32 << (11 - 1));
+    narf_kernel_test::kt_assert_eq!(route_events.len(), 1);
+    narf_kernel_test::kt_assert_eq!(route_events[0].0, 1u32 << (11 - 1));
 
     let del_route = build_replies_authorized(&route_request(RTM_DELROUTE), Some(&admin)).unwrap();
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         i32::from_ne_bytes(
             del_route[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
                 .try_into()
@@ -991,7 +1109,7 @@ fn delegated_admin_can_add_and_delete_ipv6_address_and_route() {
         0
     );
     let del_addr = build_replies_authorized(&addr_request(RTM_DELADDR), Some(&admin)).unwrap();
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         i32::from_ne_bytes(
             del_addr[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
                 .try_into()
@@ -999,11 +1117,15 @@ fn delegated_admin_can_add_and_delete_ipv6_address_and_route() {
         ),
         0
     );
-    assert!(!crate::ipv6::addrs::is_local_on(name, &addr));
+    narf_kernel_test::kt_assert!(!crate::ipv6::addrs::is_local_on(name, &addr));
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!(
+    "net/netlink_route",
+    delegated_admin_can_add_and_delete_ipv6_address_and_route
+);
 
-#[test]
-fn delegated_admin_can_add_and_delete_ipv4_neighbor() {
+fn delegated_admin_can_add_and_delete_ipv4_neighbor() -> narf_kernel_test::TestResult {
     fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
         Ok(())
     }
@@ -1032,16 +1154,16 @@ fn delegated_admin_can_add_and_delete_ipv4_neighbor() {
     };
 
     let add = build_replies_authorized(&neighbor_request(RTM_NEWNEIGH), Some(&admin)).unwrap();
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         i32::from_ne_bytes(add[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap()),
         0
     );
-    assert!(crate::arp::snapshot().iter().any(|(iface, entry)| {
+    narf_kernel_test::kt_assert!(crate::arp::snapshot().iter().any(|(iface, entry)| {
         iface == name && entry.ip == [203, 0, 113, 9] && entry.mac == [0x02, 0, 0, 0, 3, 9]
     }));
 
     let delete = build_replies_authorized(&neighbor_request(RTM_DELNEIGH), Some(&admin)).unwrap();
-    assert_eq!(
+    narf_kernel_test::kt_assert_eq!(
         i32::from_ne_bytes(
             delete[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
                 .try_into()
@@ -1049,7 +1171,12 @@ fn delegated_admin_can_add_and_delete_ipv4_neighbor() {
         ),
         0
     );
-    assert!(!crate::arp::snapshot()
+    narf_kernel_test::kt_assert!(!crate::arp::snapshot()
         .iter()
         .any(|(iface, entry)| iface == name && entry.ip == [203, 0, 113, 9]));
+    narf_kernel_test::TestResult::Pass
 }
+narf_kernel_test::kernel_test_in!(
+    "net/netlink_route",
+    delegated_admin_can_add_and_delete_ipv4_neighbor
+);

@@ -1056,7 +1056,7 @@ mod authority_tests {
     );
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
 
@@ -1071,21 +1071,21 @@ mod tests {
         msg
     }
 
-    #[test]
-    fn resolves_control_family_by_name() {
+    fn resolves_control_family_by_name() -> narf_kernel_test::TestResult {
         let replies = build_replies(&request(Some(b"nlctrl\0"), 1)).unwrap();
-        assert_eq!(replies.len(), 1);
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(replies.len(), 1);
+        narf_kernel_test::kt_assert_eq!(
             u16::from_ne_bytes(replies[0][4..6].try_into().unwrap()),
             GENL_ID_CTRL
         );
-        assert!(replies[0].windows(7).any(|w| w == b"nlctrl\0"));
+        narf_kernel_test::kt_assert!(replies[0].windows(7).any(|w| w == b"nlctrl\0"));
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/netlink_generic", resolves_control_family_by_name);
 
-    #[test]
-    fn unknown_family_returns_enoent() {
-        let replies = build_replies(&request(Some(b"nl80211\0"), 1)).unwrap();
-        assert_eq!(
+    fn unknown_family_returns_enoent() -> narf_kernel_test::TestResult {
+        let replies = build_replies(&request(Some(b"narf-no-such-family\0"), 1)).unwrap();
+        narf_kernel_test::kt_assert_eq!(
             i32::from_ne_bytes(
                 replies[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
                     .try_into()
@@ -1093,27 +1093,29 @@ mod tests {
             ),
             -ENOENT
         );
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/netlink_generic", unknown_family_returns_enoent);
 
-    #[test]
-    fn resolves_control_family_by_id() {
+    fn resolves_control_family_by_id() -> narf_kernel_test::TestResult {
         let mut body = vec![CTRL_CMD_GETFAMILY, CTRL_VERSION, 0, 0];
         push_attr(&mut body, CTRL_ATTR_FAMILY_ID, &GENL_ID_CTRL.to_ne_bytes());
         let request = frame(GENL_ID_CTRL, 1, 78, &body);
         let replies = build_replies(&request).unwrap();
-        assert_eq!(replies.len(), 1);
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(replies.len(), 1);
+        narf_kernel_test::kt_assert_eq!(
             u16::from_ne_bytes(replies[0][4..6].try_into().unwrap()),
             GENL_ID_CTRL
         );
-        assert!(replies[0].windows(7).any(|window| window == b"nlctrl\0"));
+        narf_kernel_test::kt_assert!(replies[0].windows(7).any(|window| window == b"nlctrl\0"));
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/netlink_generic", resolves_control_family_by_id);
 
-    #[test]
-    fn family_description_advertises_ops_and_notify_group() {
+    fn family_description_advertises_ops_and_notify_group() -> narf_kernel_test::TestResult {
         let replies = build_replies(&request(Some(b"nlctrl\0"), 1)).unwrap();
         let reply = &replies[0];
-        assert!(reply.windows(7).any(|window| window == b"notify\0"));
+        narf_kernel_test::kt_assert!(reply.windows(7).any(|window| window == b"notify\0"));
 
         let attrs = &reply[NLMSG_HDRLEN + 4..];
         let mut off = 0;
@@ -1129,13 +1131,19 @@ mod tests {
             saw_groups |= kind == CTRL_ATTR_MCAST_GROUPS | NLA_F_NESTED;
             off += align(len);
         }
-        assert!(saw_ops);
-        assert!(saw_groups);
+        narf_kernel_test::kt_assert!(saw_ops);
+        narf_kernel_test::kt_assert!(saw_groups);
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!(
+        "net/netlink_generic",
+        family_description_advertises_ops_and_notify_group
+    );
 
-    #[test]
-    fn unknown_family_supports_capped_extended_ack() {
-        let request = request(Some(b"nl80211\0"), 1);
+    fn unknown_family_supports_capped_extended_ack() -> narf_kernel_test::TestResult {
+        // nl80211 is a registered family in the test kernel; use a name nothing
+        // registers.
+        let request = request(Some(b"narf-no-such-family\0"), 1);
         let replies = build_replies_with_options(
             &request,
             ReplyOptions {
@@ -1145,25 +1153,33 @@ mod tests {
         )
         .unwrap();
         let flags = u16::from_ne_bytes(replies[0][6..8].try_into().unwrap());
-        assert_ne!(flags & NLM_F_CAPPED, 0);
-        assert_ne!(flags & NLM_F_ACK_TLVS, 0);
-        assert!(replies[0]
+        narf_kernel_test::kt_assert_ne!(flags & NLM_F_CAPPED, 0);
+        narf_kernel_test::kt_assert_ne!(flags & NLM_F_ACK_TLVS, 0);
+        narf_kernel_test::kt_assert!(replies[0]
             .windows(b"generic-netlink family does not exist\0".len())
             .any(|window| window == b"generic-netlink family does not exist\0"));
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!(
+        "net/netlink_generic",
+        unknown_family_supports_capped_extended_ack
+    );
 
-    #[test]
-    fn dump_terminates() {
+    fn dump_terminates() -> narf_kernel_test::TestResult {
+        // One CTRL_CMD_NEWFAMILY per registered family (nlctrl at least; the
+        // test kernel registers more), then exactly one NLMSG_DONE.
         let replies = build_replies(&request(None, 1 | NLM_F_DUMP)).unwrap();
-        assert_eq!(replies.len(), 2);
-        assert_eq!(
-            u16::from_ne_bytes(replies[1][4..6].try_into().unwrap()),
-            NLMSG_DONE
-        );
+        narf_kernel_test::kt_assert!(replies.len() >= 2);
+        let kind = |m: &Vec<u8>| u16::from_ne_bytes([m[4], m[5]]);
+        narf_kernel_test::kt_assert_eq!(kind(replies.last().unwrap()), NLMSG_DONE);
+        narf_kernel_test::kt_assert!(replies[..replies.len() - 1]
+            .iter()
+            .all(|m| kind(m) == GENL_ID_CTRL));
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/netlink_generic", dump_terminates);
 
-    #[test]
-    fn batched_requests_preserve_sequences() {
+    fn batched_requests_preserve_sequences() -> narf_kernel_test::TestResult {
         let mut first = request(Some(b"nlctrl\0"), 1);
         first[8..12].copy_from_slice(&101u32.to_ne_bytes());
         first.resize(align(first.len()), 0);
@@ -1172,26 +1188,28 @@ mod tests {
         first.extend_from_slice(&second);
 
         let replies = build_replies(&first).unwrap();
-        assert_eq!(replies.len(), 2);
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(replies.len(), 2);
+        narf_kernel_test::kt_assert_eq!(
             u32::from_ne_bytes(replies[0][8..12].try_into().unwrap()),
             101
         );
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(
             u32::from_ne_bytes(replies[1][8..12].try_into().unwrap()),
             202
         );
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/netlink_generic", batched_requests_preserve_sequences);
 
-    #[test]
-    fn malformed_batch_length_is_rejected() {
+    fn malformed_batch_length_is_rejected() -> narf_kernel_test::TestResult {
         let mut request = request(Some(b"nlctrl\0"), 1);
         request[0..4].copy_from_slice(&15u32.to_ne_bytes());
-        assert!(build_replies(&request).is_err());
+        narf_kernel_test::kt_assert!(build_replies(&request).is_err());
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/netlink_generic", malformed_batch_length_is_rejected);
 
-    #[test]
-    fn registered_family_is_discoverable_and_dispatched() {
+    fn registered_family_is_discoverable_and_dispatched() -> narf_kernel_test::TestResult {
         fn handler(command: u8, _: &[u8], _: bool) -> Result<Vec<GenlReply>, i32> {
             Ok(vec![GenlReply {
                 command: command + 1,
@@ -1214,7 +1232,7 @@ mod tests {
 
         let lookup = request(Some(b"narf-test\0"), 1);
         let replies = build_replies(&lookup).unwrap();
-        assert!(replies[0]
+        narf_kernel_test::kt_assert!(replies[0]
             .windows(10)
             .any(|window| window == b"narf-test\0"));
 
@@ -1222,14 +1240,19 @@ mod tests {
         push_attr(&mut body, 1, &7u32.to_ne_bytes());
         let family_request = frame(0x30, 1, 303, &body);
         let replies = build_replies(&family_request).unwrap();
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(
             u16::from_ne_bytes(replies[0][4..6].try_into().unwrap()),
             0x30
         );
-        assert_eq!(replies[0][NLMSG_HDRLEN], 10);
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(replies[0][NLMSG_HDRLEN], 10);
+        narf_kernel_test::kt_assert_eq!(
             u32::from_ne_bytes(replies[0][8..12].try_into().unwrap()),
             303
         );
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!(
+        "net/netlink_generic",
+        registered_family_is_discoverable_and_dispatched
+    );
 }
