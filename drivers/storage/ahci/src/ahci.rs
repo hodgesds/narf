@@ -3543,14 +3543,16 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // above-map BARs and equals the PA only for identity-mapped ones.
     AHCI_MMIO_BASE.store(dev.mmio.virt as usize, Ordering::Release);
     let mut dev = dev;
+    // Whether any port holds an ATA disk (`block_port` falls back to port
+    // 0 when none does).
+    let has_disk = dev
+        .ports
+        .iter()
+        .any(|p| p.index == dev.block_port && p.kind == PortKind::Sata);
     // Cache the disk size for `AhciBlockSync::capacity` (Linux
     // `ata_id_n_sectors`: LBA48 words 100..103 when the device reports
     // 48-bit support, else LBA28 words 60..61). IDENTIFY only reads.
-    if dev
-        .ports
-        .iter()
-        .any(|p| p.index == dev.block_port && p.kind == PortKind::Sata)
-    {
+    if has_disk {
         // SAFETY: the HBA is not installed yet, so we own it; the port
         // classified as an ATA disk.
         if let Ok(id) = unsafe { dev.identify_device(dev.block_port) } {
@@ -3566,6 +3568,21 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         hba_enable_irq(&Abar(&dev.mmio));
     }
     *CONTROLLER.lock() = Some(dev);
+    // An HBA with no ATA disk behind it (QEMU q35's built-in ICH9 with no
+    // `-drive` on it, a laptop chipset SATA controller with empty ports)
+    // has nothing to read: registering `sata0` anyway put a phantom disk in
+    // the registry whose every read waited out the command timeouts on an
+    // empty port 0 — and root designation, which reads every device's
+    // UUID, stalled ~40 s on it. Linux's libata likewise creates no
+    // `ata_device` (so no `sd`) for a port whose link is down.
+    if !has_disk {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "  ahci: no ATA disk on any port; not registering sata0"
+        );
+        return Ok(());
+    }
     // Register against the unified block-device registry.
     let parent =
         alloc::sync::Arc::new(AhciBlockSync) as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>;
