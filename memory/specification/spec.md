@@ -988,7 +988,8 @@ impl AddressSpace {
 /// Failure-atomic revocation of every CPU alias of externally owned shared
 /// frames across `spaces` (deduplicated, locked in identity order under the
 /// global shared-mapping transaction). `aliases(phys)` is the owner's count of
-/// retained metadata aliases; a shortfall (fork child, retiring root),
+/// retained metadata aliases (called under the region locks; leaf locks
+/// only); a shortfall (fork child, retiring root),
 /// LOCKED/physical pins, a non-base leaf or a reverse-map owner outside the
 /// found aliases refuses `Pinned`/`Overlap` before mutation. Destination
 /// reverse-map rows and owner slots are prepared before revocation; `commit`

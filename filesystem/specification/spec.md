@@ -526,7 +526,8 @@ revocation: `relocate` calls the VM hook synchronously, which revokes every
 CPU alias of `old`, runs `commit`, then rebinds to `new` on success or restores
 `old` on error. Neither hook nor commit may await, and commit must not
 allocate. `aliases(phys)` must count every retained metadata alias of a device
-frame, including fork children not yet scheduler-visible. The alias hooks are a
+frame, including fork children not yet scheduler-visible; it runs with every
+affected region table locked and may take only leaf locks. The alias hooks are a
 single-provider registry (currently amdgpu); installing a different provider
 panics. `DmaResv::generation` counts fence additions without allocating or
 sampling driver fences, so a caller that saw no unsignalled fence can later

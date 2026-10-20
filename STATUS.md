@@ -1056,11 +1056,13 @@ rechecks kernel fences after admission and promotion; GEM/PRIME mmap cannot
 bypass NO_CPU_ACCESS after a move to GTT. Published GEM/PRIME CPU mappings
 are now revocable: moves freeze every CPU alias across known address spaces
 (failure-atomic, allocation-free commit, exact leaf restore), rebinding CPU
-and GPU aliases together. Unpublished mappings, address leases, mlock and
-unknown fork-child aliases refuse safely. Regressions cover multi-space
-scatter/partial/PROT_NONE aliases, census and pin refusals, injected rmap
-preparation failure, commit rollback, fork/split/mremap, VRAM<->GTT moves of
-published views, late fences, allocation failure and fork-gap retention.
+and GPU aliases together. Unpublished mappings, address leases and unknown
+fork-child aliases refuse safely; device mappings never become mlocked.
+Regressions cover multi-space scatter/partial/PROT_NONE aliases, census and
+pin refusals, injected rmap preparation failure, commit rollback,
+fork/split/mremap, syscall-level mmap publication and relocation, VRAM<->GTT
+moves of published views, late fences, allocation failure and fork-gap
+retention.
 Memory/filesystem/userspace/GPU/framebuffer suites passed 3333 x86_64 and
 2593 aarch64 (zero failures; 22 and 8 environment skips) with clean
 production boots and btrfs postflights; debug builds and targeted Clippy pass

@@ -48,7 +48,8 @@ struct Span {
 /// await nor enter VMA/shared transactions, acquire a region lock, or release
 /// either frame list. It must preserve old backing on error and must not
 /// allocate. The alias counter must count all externally retained metadata
-/// aliases, including aliases not yet scheduler-visible.
+/// aliases, including aliases not yet scheduler-visible; it runs with every
+/// selected region table locked and may take only leaf locks.
 pub unsafe fn with_revoked_shared_frames(
     spaces: &[Arc<AddressSpace>],
     old: &[PhysAddr],
