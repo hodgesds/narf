@@ -96,6 +96,7 @@ impl<I: Io> Engine<I> {
             self.status.count += 1;
         }
         self.status.recovery.observe(record);
+        self.status.first.get_or_insert(record);
         self.status.last = Some(record);
     }
     pub(super) fn begin_recovery(&mut self) -> Result<u64, Error> {

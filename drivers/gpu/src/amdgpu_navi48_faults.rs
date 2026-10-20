@@ -1,11 +1,12 @@
 //! Native GC12/MMHUB4.1 fault sources owned by the independent IH service.
 //! The monitor preserves evidence and contains reporting; per-owner delivery
 //! and recovery generations live in amdgpu_navi48_dispatch. There is no VM
-//! replay, PTE repair or GPU reset.
+//! replay, PTE repair or GPU reset. Poison/ECC vectors are not faults: the
+//! retained RAS monitor (amdgpu_navi48_ras) does exactly what Linux does.
 pub use crate::amdgpu_navi48_sources::{CommandFault, Poison, SdmaFault, ShaderError};
 use crate::{
-    amdgpu::AmdGpu, amdgpu_discovery as ip, amdgpu_ih7 as ih, amdgpu_navi48_sources as src,
-    amdgpu_psp_ring::bank,
+    amdgpu::AmdGpu, amdgpu_discovery as ip, amdgpu_ih7 as ih, amdgpu_navi48_ras as ras,
+    amdgpu_navi48_sources as src, amdgpu_psp_ring::bank,
 };
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
@@ -25,6 +26,15 @@ pub enum Error {
     Readback,
     Gmc(crate::amdgpu_gmc_navi48::Error),
     DeviceResetRequired,
+    Ras(ras::Error),
+}
+impl From<ras::Error> for Error {
+    fn from(e: ras::Error) -> Self {
+        match e {
+            ras::Error::DeviceGone => Error::DeviceGone,
+            e => Error::Ras(e),
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -66,8 +76,6 @@ pub enum Kind {
     /// SQ error word: illegal instruction or memory violation, with the
     /// 21-bit detail field and the IV's VMID/PASID naming the context.
     Shader { error: ShaderError, detail: u32 },
-    /// Poison/RAS consumption. Terminal for every owner.
-    Poison(Poison),
     /// A hub protection latch found set by `sweep` after IH vectors were
     /// lost; the latch's own VMID is the only context evidence.
     Latched { hub: Hub },
@@ -97,7 +105,6 @@ fn classify(event: ih::Event) -> Option<Kind> {
             queue,
         },
         src::Class::Fault(src::Fault::Shader { error, detail }) => Kind::Shader { error, detail },
-        src::Class::Poison(p) => Kind::Poison(p),
         _ => return None,
     })
 }
@@ -141,6 +148,9 @@ pub struct Record {
 pub struct Status {
     pub state: State,
     pub count: u64,
+    /// The first fault since boot: later faults are usually consequences, so
+    /// its evidence is never overwritten.
+    pub first: Option<Record>,
     pub last: Option<Record>,
     /// A failed mask attempt means hardware sources may still be enabled.
     pub mask_error: Option<Error>,
@@ -357,7 +367,7 @@ impl<I: Io> Engine<I> {
                 }
                 checked(io.read(status))
             })?;
-            self.status.last.as_mut().unwrap().protection = Some(Protection::decode(raw));
+            self.update_last(|r| r.protection = Some(Protection::decode(raw)));
             // A latch has no PASID, even when its VMID matches the IV: it
             // may describe another fault after that VMID was reassigned.
             self.status.recovery.latch(hub, Protection::decode(raw));
@@ -380,6 +390,17 @@ impl<I: Io> Engine<I> {
         }
         self.contain()
     }
+    /// Complete the latest record, and the first one while they coincide.
+    fn update_last(&mut self, f: impl Fn(&mut Record)) {
+        if let Some(r) = self.status.last.as_mut() {
+            f(r);
+        }
+        if self.status.count == 1 {
+            if let Some(r) = self.status.first.as_mut() {
+                f(r);
+            }
+        }
+    }
     // Retain the latch before acknowledging it. Do not retry a fault, fill a
     // PTE or redirect any failed access into host memory.
     fn acknowledge(&mut self, control: u64) -> Result<(), Error> {
@@ -389,7 +410,7 @@ impl<I: Io> Engine<I> {
             checked(io.read(control))?; // post the self-clearing write
             Ok(())
         })?;
-        self.status.last.as_mut().unwrap().acknowledged = true;
+        self.update_last(|r| r.acknowledged = true);
         Ok(())
     }
     fn contain(&mut self) -> Result<(), Error> {
@@ -452,7 +473,7 @@ impl<I: Io> Engine<I> {
     }
 }
 #[derive(Debug)]
-pub(crate) struct Monitor(Engine<Mmio>);
+pub(crate) struct Monitor(Engine<Mmio>, ras::Monitor);
 impl Monitor {
     /// # Safety
     /// Own this physical GPU and permanent register mapping. After arming,
@@ -464,23 +485,29 @@ impl Monitor {
     ) -> Result<Self, Error> {
         let layout = Layout::resolve(gpu)?;
         authority.invoke(Op(|| ())).map_err(|_| Error::Revoked)?;
-        Ok(Self(Engine {
-            io: Mmio(gpu.regs),
-            authority,
-            layout,
-            status: Status {
-                state: State::Prepared,
-                count: 0,
-                last: None,
-                mask_error: None,
-                recovery: RecoveryScope::default(),
-                recoveries: 0,
+        // SAFETY: forwarded ownership; construction performs no device access.
+        let ras = unsafe { ras::Monitor::new(gpu, authority) }?;
+        Ok(Self(
+            Engine {
+                io: Mmio(gpu.regs),
+                authority,
+                layout,
+                status: Status {
+                    state: State::Prepared,
+                    count: 0,
+                    first: None,
+                    last: None,
+                    mask_error: None,
+                    recovery: RecoveryScope::default(),
+                    recoveries: 0,
+                },
+                published: 0,
+                owned_clients: false,
+                controls: [0; 35],
+                recovery_mark: 0,
             },
-            published: 0,
-            owned_clients: false,
-            controls: [0; 35],
-            recovery_mark: 0,
-        }))
+            ras,
+        ))
     }
     /// # Safety
     /// Matching GMC and kernel queues are ready; no client has submitted work.
@@ -498,10 +525,26 @@ impl Monitor {
             self.0.status.state = State::Failed(error);
             error
         })?;
-        self.0.enable(Some(clients))
+        self.0.enable(Some(clients))?;
+        // amdgpu_umc_ras_late_init / soc24_common_late_init, when Linux's
+        // RAS policy for this board enables them.
+        self.1.arm().map_err(Error::from)
     }
-    pub(crate) fn handle(&mut self, event: ih::Event) -> Result<(), Error> {
-        self.0.handle(event)
+    /// Record and contain a fault vector, or run Linux's RAS handler for a
+    /// poison/ECC vector. Returns a RAS event that requires a device reset.
+    pub(crate) fn handle(&mut self, event: ih::Event) -> Result<Option<ras::Fatal>, Error> {
+        self.0.handle(event)?;
+        match src::classify(&event) {
+            src::Class::Poison(p) => self.1.handle(event, p).map_err(Error::from),
+            _ => Ok(None),
+        }
+    }
+    /// Linux's per-interrupt fatal-error poll (no-op unless DF RAS is on).
+    pub(crate) fn poll_ras(&mut self) -> Result<Option<ras::Fatal>, Error> {
+        self.1.poll().map_err(Error::from)
+    }
+    pub(crate) fn ras_status(&self) -> ras::Status {
+        self.1.status()
     }
     pub(crate) fn sweep(&mut self) -> Result<[Option<u8>; 2], Error> {
         self.0.sweep()

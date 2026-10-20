@@ -83,6 +83,7 @@ fn fixture() -> Engine<Fake> {
         status: Status {
             state: State::Prepared,
             count: 0,
+            first: None,
             last: None,
             mask_error: None,
             recovery: RecoveryScope::default(),
@@ -292,16 +293,6 @@ fn navi48_sdma_shader_and_poison_faults_keep_iv_evidence_without_latch_io() -> T
                 detail: 0x55,
             },
         ),
-        (sq(0), Kind::Poison(Poison::Shader { fatal: true })),
-        (event(0x0a, 201, 0), Kind::Poison(Poison::CpFue)),
-        (event(0x17, 0, 0), Kind::Poison(Poison::Umc)),
-        (
-            event(0x10, 160, 0),
-            Kind::Poison(Poison::Media {
-                instance: 0,
-                source: 160,
-            }),
-        ),
     ] {
         let mut e = fixture();
         e.enable(None).unwrap();
@@ -315,14 +306,31 @@ fn navi48_sdma_shader_and_poison_faults_keep_iv_evidence_without_latch_io() -> T
         assert!(!e.io.reads.contains(&GST) && !e.io.reads.contains(&MST));
         assert_eq!(e.io.writes.len(), 5);
     }
-    // Shader wave messages and media traps are not faults.
+    // Shader wave messages, media traps and poison/ECC vectors are not
+    // faults: Linux contains nothing for them on Navi48 (amdgpu_navi48_ras).
     let mut e = fixture();
     e.enable(None).unwrap();
     let mut wave = event(0x0a, 239, 0);
     wave.vector.data = [1 << 21, 1 << 6, 0, 0];
     e.handle(wave).unwrap();
     e.handle(event(0x10, 119, 0)).unwrap();
+    for poison in [
+        sq(0),
+        sq(3),
+        event(0x0a, 1, 0),
+        event(0x0a, 128, 0),
+        event(0x0a, 197, 0),
+        event(0x0a, 201, 0),
+        event(0x0a, 62, 0x10),
+        event(0x0a, 64, 0),
+        event(0x17, 0, 0),
+        event(0x03, 0x61, 0),
+        event(0x10, 160, 0),
+    ] {
+        e.handle(poison).unwrap();
+    }
     assert_eq!((e.status.state, e.status.count), (State::Armed, 0));
+    assert_eq!((e.status.first, e.status.last), (None, None));
     TestResult::Pass
 }
 kernel_test_in!(

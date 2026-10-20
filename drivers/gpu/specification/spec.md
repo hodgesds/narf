@@ -3463,13 +3463,43 @@ protection faults, the twelve SDMA7 error sources (SRBM write, invalid
 doorbell, queue hang, atomic/poll/page timeouts, null page, page fault, VM
 hole, frozen engine and both semaphore timeouts, with SDMA instance and queue
 from the IV ring ID), SQ error words (illegal instruction and memory
-violation with their 21-bit detail) and poison: UTCL2 data poisoning,
-RLC_GC_FED, CP ECC/FUE, SDMA ECC/SRAM ECC, SQ EDC FUE/FED, VCN5 UVD/JPEG
-poison, DF/UMC ECC and NBIF ATHUB error events. These have no latch to read,
-so the full IV is the retained evidence; they contain reporting like the
-existing faults. Only VM, CP privileged/opcode and SDMA0 trap sources are
-actually enabled by the service; the rest are classified if the IP raises
-them.
+violation with their 21-bit detail). These have no latch to read, so the
+full IV is the retained evidence; they contain reporting like the existing
+faults. Only VM, CP privileged/opcode and SDMA0 trap sources are actually
+enabled by the service; the rest are classified if the IP raises them.
+`Status::first` keeps the first fault record (with its latch snapshot and
+acknowledgement) beside `last`, so later consequential faults never
+overwrite the original evidence.
+
+Poison/ECC vectors (UTCL2 data poisoning, RLC_GC_FED, CP ECC/FUE, SDMA
+ECC/SRAM ECC, SQ EDC FUE/FED, VCN5 UVD/DJPEG/EJPEG poison, DF/UMC ECC and
+NBIF ATHUB error events) are not faults and never contain, fault an owner or
+terminate by themselves. `amdgpu_navi48_ras` does what Linux's amdgpu_ras
+does on bare-metal Navi48 and nothing else. `amdgpu_ras_asic_supported`
+accepts MP0 14.0.3 and PSP14 has no RAS capability query, so the block mask
+comes from the VBIOS: `Caps::from_vbios` reads umc_info's ECC-capable bit
+(v3.1–v3.3, v4.0) and firmware_info's SRAM_ECC capability, and `hw_enabled`
+reproduces `amdgpu_ras_check_supported` (mem ECC → UMC|DF; SRAM ECC → every
+other block except VCN/JPEG and XGMI). A consumer board reporting neither has
+RAS disabled. `disposition` then follows the IP handlers: GFX12, SDMA7,
+UTCL2 and JPEG5 register no poison source and KFD v11's ISR drops them;
+VCN 5.0.0's UVD_POISON handler returns without a VCN RAS object; the ATHUB IV
+is a dummy. These are counted with first/last IV evidence in `ras::Status`.
+Only with UMC RAS on (VBIOS mem ECC and UMC 8.14) does the DF ECC IV run
+`amdgpu_ras_interrupt_umc_handler`: FED is set, every UMC 8.14 channel's
+GeccErrCnt is read through NBIF 6.3.1's RSMU index/data pair and retained,
+then cleared; an uncorrectable count is `ras::Fatal::Umc`. UMC 8.14 has no
+error-address query, so no page is retired. With DF RAS on, the service polls
+BIF_DOORBELL_INT_CNTL after every IH pass as
+`amdgpu_ras_interrupt_fatal_error_handler` does; a set ATHUB status is
+cleared after capture and is `ras::Fatal::Athub`. Arming mirrors
+`amdgpu_umc_ras_late_init` (boot counts read and cleared, GeccErrInt = APIC)
+and `soc24_common_late_init` (ATHUB event enabled). Only the first fatal
+event counts (`amdgpu_ras_in_intr`). The service stops with
+`Terminal::Ras(fatal)`, and the platform's terminal-fault path performs the
+mode-1 device recovery Linux's `amdgpu_ras_reset_gpu` requests. The RAS TA
+feature-enable command is not sent; Linux falls back to the same software
+object when the TA refuses it.
 
 After a lost batch the service wakes every dispatch owner to re-check its
 fence and runs `sweep`: both hub protection latches are read (GC first
@@ -3515,7 +3545,19 @@ until the endpoint changes or a 100 ms watchdog fires (Linux's fallback timer
 role); every wait also takes a mandatory deadline. Completion vectors match
 the exact slot first and then the doorbell, as gfx_v12_0_eop_irq does, and
 must carry the owner's VMID/PASID. Vectors for unregistered, retired or
-mismatched owners and unknown sources are counted without completing work.
+mismatched owners and unknown sources are counted without completing work;
+unknown, unregistered and malformed vectors return `Delivery::Unhandled`
+(`Counters::unknown`/`unhandled`), and the first and latest unowned,
+unattributed or unhandled IVs are kept in `Summary`. The service writes the
+first 16 such vectors to the console (`Status::logged`). Registration and
+routing accept only identities Linux has rings for: CP ME 0–2, SDMA
+instance 0/1 queue 0 (a trap naming instance > 1 or another queue is
+unhandled, as in `sdma_v7_0_process_trap_irq`), VCN client instance 0/1 and
+JPEG on the VCN client only (`jpeg_v5_0_0` registers nothing on VCN1).
+VCN sources other than 119 and 160 and JPEG sources other than 153 are
+unhandled. A CP privileged/opcode fault goes to the kernel ring at its slot
+alone; only without one does the context-ID doorbell name a user queue, and
+then only in the IV's PASID (`amdgpu_userq_process_reset_irq`).
 VCN source 119 wakes its registered unified owner, identified by client
 instance plus VMID/PASID as in `vcn_v5_0_0_process_interrupt`; its ring payload
 has no separate queue selector. Other media, power and SQ messages remain
@@ -3533,8 +3575,10 @@ GFXHUB). The first fault is kept; waiters on a faulted endpoint return
 `Faulted` unless their fence already completed. `unsafe recover` is the
 controlled-recovery step: once the owner has reset or unmapped its queue it
 gets a new generation, and every handle of the faulted generation is `Stale`
-forever. Faults without an owner are counted as unattributed. Poison is
-terminal, as Linux's poison consumption ends in a GPU reset. The interrupt
+forever. Faults without an owner are counted as unattributed. Poison IVs
+are counted (`Counters::poison`) and delivered nowhere; a RAS event that
+Linux answers with a mode-1 reset reaches waiters as `Terminal::Ras`. The
+interrupt
 service delivers its own failures (all-ones MMIO as `DeviceGone`, overflow,
 protocol, revocation, fault-monitor errors) with `fail_all`: every current
 waiter wakes with `Terminal`, new waits return it without reading memory, and
@@ -6355,7 +6399,7 @@ after ring recovery fails. Its caller must stop every kernel CPU VRAM/GOP
 writer and exclude external PCI/firmware owners. As for RX 6000 (Linux
 `amdgpu.gpu_recovery` on a dGPU), `unsafe set_automatic_recovery(bool)`
 (enabled by the fb boot handoff unless `amdgpu.gpu_recovery=0`) lets the
-watchdog start it after a failed ring reset or a terminal fault (poison,
+watchdog start it after a failed ring reset or a terminal fault (RAS fatal error,
 lost interrupts, refused coordinated recovery) or after the display monitor
 stops with a quarantined display owner, once per submitter
 generation and at most `MAX_AUTOMATIC_RECOVERIES` (3) times per boot, since

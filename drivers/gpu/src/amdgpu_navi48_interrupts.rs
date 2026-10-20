@@ -5,7 +5,7 @@
 //! IV payload. A service failure is delivered to every waiter as terminal.
 use crate::{
     amdgpu_ih7 as ih, amdgpu_navi48_dispatch as dispatch, amdgpu_navi48_faults as faults,
-    amdgpu_navi48_msi as msi, amdgpu_navi48_sources as src,
+    amdgpu_navi48_msi as msi, amdgpu_navi48_ras as ras, amdgpu_navi48_sources as src,
 };
 use narf_lib::mutex::Mutex;
 
@@ -58,6 +58,9 @@ pub struct Status {
     pub vcn0_traps: u64,
     pub jpeg0_traps: u64,
     pub faults: faults::Status,
+    pub ras: ras::Status,
+    /// Unmatched vectors written to the console (bounded by `LOG_BUDGET`).
+    pub logged: u8,
     /// Kernel graphics, compute and SDMA0 owners registered by the service.
     pub kernel: [Option<dispatch::Endpoint>; 3],
     pub dispatch: dispatch::Summary,
@@ -244,6 +247,17 @@ struct Service {
     kernel: [Option<dispatch::Handle>; 3],
     wakes: Wakes,
     drained: usize,
+    logged: u8,
+}
+/// Console lines for unmatched vectors per service; counters keep counting.
+const LOG_BUDGET: u8 = 16;
+fn reason(d: dispatch::Delivery) -> Option<&'static str> {
+    Some(match d {
+        dispatch::Delivery::Unowned => "no live owner",
+        dispatch::Delivery::Unattributed => "fault without owner",
+        dispatch::Delivery::Unhandled => "unhandled",
+        _ => return None,
+    })
 }
 impl Service {
     fn status(&self) -> Status {
@@ -260,6 +274,8 @@ impl Service {
             vcn0_traps: self.history.vcn0_traps,
             jpeg0_traps: self.history.jpeg0_traps,
             faults: self.faults.status(),
+            ras: self.faults.ras_status(),
+            logged: self.logged,
             kernel: self
                 .kernel
                 .map(|h| h.and_then(|h| dispatch::endpoint(h).ok())),
@@ -282,9 +298,13 @@ impl Service {
                 // Retain the whole batch first: a register/capability failure
                 // while decoding one fault must not discard already-drained IVs.
                 let mut failed = None;
+                let mut fatal = None;
                 for event in batch.events() {
-                    if let Err(e) = self.faults.handle(*event) {
-                        failed.get_or_insert(e);
+                    match self.faults.handle(*event) {
+                        Ok(f) => fatal = fatal.or(f),
+                        Err(e) => {
+                            failed.get_or_insert(e);
+                        }
                     }
                 }
                 if self.faults.status().state != faults::State::Armed {
@@ -292,12 +312,15 @@ impl Service {
                 }
                 // Deliver after the monitor captured and acknowledged its
                 // evidence, so a woken owner never races the latch.
+                let mut unmatched = [None; 32];
                 {
                     let mut table = dispatch::TABLE.lock();
-                    for event in batch.events() {
-                        table.route(event, src::classify(event));
+                    for (slot, event) in unmatched.iter_mut().zip(batch.events()) {
+                        let delivery = table.route(event, src::classify(event));
+                        *slot = reason(delivery).map(|r| (*event, r));
                     }
                 }
+                self.log(&unmatched);
                 if batch.lost {
                     // Overwritten vectors may have held completions, display
                     // events or faults: wake every owner to re-check, and
@@ -320,6 +343,20 @@ impl Service {
                         }
                     }
                 }
+                // amdgpu_irq_handler: amdgpu_ras_interrupt_fatal_error_handler
+                // runs after every IH pass, whether or not it found vectors.
+                match self.faults.poll_ras() {
+                    Ok(f) => fatal = fatal.or(f),
+                    Err(e) => {
+                        failed.get_or_insert(e);
+                    }
+                }
+                if let Some(f) = fatal {
+                    // Linux sets FED and requests a mode-1 reset; terminal
+                    // delivery makes the platform run device recovery.
+                    self.stop(dispatch::Terminal::Ras(f));
+                    return Err(ih::Error::Protocol);
+                }
                 if let Some(e) = failed {
                     self.stop(match e {
                         faults::Error::DeviceGone => dispatch::Terminal::DeviceGone,
@@ -333,6 +370,22 @@ impl Service {
                 self.stop(terminal(e));
                 Err(e)
             }
+        }
+    }
+    /// Bounded console evidence for vectors that completed nothing.
+    fn log(&mut self, unmatched: &[Option<(ih::Event, &'static str)>]) {
+        use core::fmt::Write as _;
+        for (e, why) in unmatched.iter().flatten() {
+            if self.logged >= LOG_BUDGET {
+                return;
+            }
+            self.logged += 1;
+            let v = e.vector;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi48 IV {why}: ring{} client={:#x} src={} ring_id={:#x} vmid={} pasid={} data={:#x}",
+                e.ih_ring, v.client, v.source, v.ring, v.vmid, v.pasid, v.data[0]
+            );
         }
     }
     /// Stop draining for good: mask sources and CPU delivery where authority
@@ -390,6 +443,7 @@ pub(crate) unsafe fn install(
         kernel: [None; 3],
         wakes: Wakes::default(),
         drained: 0,
+        logged: 0,
     });
     let service = slot.as_mut().unwrap();
     for (handle, key) in service.kernel.iter_mut().zip(KERNEL) {

@@ -712,7 +712,7 @@ async unsafe fn restart(
 }
 
 /// Linux `amdgpu.gpu_recovery` on a dGPU: a ring whose reset failed or a
-/// terminal fault (poison, refused coordinated recovery, lost interrupts)
+/// terminal fault (RAS fatal error, refused coordinated recovery, lost interrupts)
 /// starts [`recover`], at most [`MAX_AUTOMATIC_RECOVERIES`] times per boot,
 /// as the RX 6000 path does: each recovery quarantines the old owners' VRAM.
 static AUTOMATIC_RECOVERY: core::sync::atomic::AtomicBool =
@@ -993,7 +993,7 @@ impl Submitter {
             for watch in self.watch.lock().iter_mut() {
                 watch.stop();
             }
-            // Terminal: poison, lost interrupts or refused fault recovery.
+            // Terminal: RAS fatal error, lost interrupts or refused fault recovery.
             if crate::amdgpu_navi48_interrupts::failed() {
                 self.request_device_recovery("terminal device fault");
             }
