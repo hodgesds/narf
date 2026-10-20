@@ -2252,6 +2252,10 @@ struct ConnectorState {
     last_hpd: Option<bool>,
     /// The sink is FreeSync-capable (KMS "vrr_capable"); DP SST only.
     vrr_capable: bool,
+    /// DRM's "Colorspace" (a DRM_MODE_COLORIMETRY_*), kept with the connector.
+    colorspace: u32,
+    /// DRM's HDR_OUTPUT_METADATA blob, kept with the connector.
+    hdr: Option<Vec<u8>>,
 }
 impl ConnectorState {
     fn new(target: Target, kind: ConnectorType, index: usize) -> Self {
@@ -2266,6 +2270,8 @@ impl ConnectorState {
             mst_id: None,
             last_hpd: None,
             vrr_capable: false,
+            colorspace: 0,
+            hdr: None,
         }
     }
     /// A board sink's discovery; true when its EDID changed.
@@ -2343,6 +2349,13 @@ struct CrtcState {
     explicit: bool,
     /// DRM's "VRR_ENABLED": run the lit mode's DRR when it is VRR-supported.
     vrr: bool,
+    /// DRM's CRTC CTM and GAMMA_LUT as the color they program (None:
+    /// amdgpu_dm's bypass). Kept across relights.
+    color: Option<Arc<crate::amdgpu_dcn401_otg::ColorProgram>>,
+    /// What the lit stream can signal: HDR packets (DIO HDMI TMDS and DP
+    /// 8b/10b SST) and non-default colorimetry (also FRL; not 128b/132b,
+    /// whose VSC SDP is not sent here).
+    color_signals: (bool, bool),
 }
 impl CrtcState {
     const fn new() -> Self {
@@ -2356,6 +2369,8 @@ impl CrtcState {
             route: None,
             explicit: false,
             vrr: false,
+            color: None,
+            color_signals: (true, true),
         }
     }
     fn retrained(&mut self, edid: [u8; 128], timing: Timing, offered: Vec<Timing>) {
@@ -2418,6 +2433,8 @@ impl Outputs {
                             mst_id: c.mst_id,
                             last_hpd: c.last_hpd,
                             vrr_capable: c.vrr_capable,
+                            colorspace: c.colorspace,
+                            hdr: c.hdr.clone(),
                         },
                     )
             })
@@ -2623,6 +2640,7 @@ fn publish_outputs() {
         offered: Vec<Timing>,
         crtc: Option<usize>,
         vrr_capable: bool,
+        color: bool,
     }
     // Serializes publishers so an older snapshot never lands after a newer
     // one. Taken before OUTPUTS and never by the card-lock holders.
@@ -2647,6 +2665,7 @@ fn publish_outputs() {
                 },
                 crtc: outputs.crtc_of(c.target),
                 vrr_capable: c.present && c.vrr_capable,
+                color: color_connector(c.target),
             })
             .collect();
         let inactive: Vec<usize> = (0..4)
@@ -2676,8 +2695,14 @@ fn publish_outputs() {
             possible_crtcs: 0xf,
         })
         .collect();
-    let vrr_capable: Vec<bool> = owned.iter().map(|c| c.vrr_capable).collect();
-    crate::amdgpu_navi48_kms::publish_routed_vrr(&crtcs, &connectors, &vrr_capable);
+    let props: Vec<crate::amdgpu_navi48_kms::ConnectorProps> = owned
+        .iter()
+        .map(|c| crate::amdgpu_navi48_kms::ConnectorProps {
+            vrr_capable: c.vrr_capable,
+            color: c.color,
+        })
+        .collect();
+    crate::amdgpu_navi48_kms::publish_routed_native(&crtcs, &connectors, &props);
     for k in inactive {
         crate::amdgpu_navi48_kms::set_active(k, false);
     }
@@ -2751,6 +2776,8 @@ async unsafe fn adopt(boot: &mut boot::ColdBoot, m: &Modeset) {
         c.shown = Some((s.edid, s.timing, offered));
         c.admitted = Some((m.plan.soc, m.plan.mode));
         c.retiring = false;
+        let dio = !s.uhbr() && s.mst.is_none();
+        c.color_signals = (dio && s.frl.is_none(), dio);
     }
 }
 
@@ -2853,6 +2880,11 @@ async unsafe fn light_displays(
             c.route.filter(|_| c.active)
         });
         let wants: [Option<Timing>; 4] = core::array::from_fn(|k| outputs.crtcs[k].requested);
+        // ... and its connector's Colorspace and HDR metadata.
+        for k in 0..4 {
+            let (colorspace, hdr) = connector_color(&outputs, k);
+            crate::amdgpu_navi48_boot::set_output_color(k as u8, colorspace, hdr);
+        }
         // Display k lights on pipe k with its CRTC's plane format.
         for (k, c) in outputs.crtcs.iter_mut().enumerate() {
             crate::amdgpu_navi48_boot::set_plane_format(k as u8, c.format);
@@ -3470,6 +3502,215 @@ pub fn request_connector_crtc(connector: u32, display: Option<u8>) -> bool {
     }
 }
 
+/// Record DRM's CRTC CTM and GAMMA_LUT for display `display` (blob bytes
+/// the bridge validated) as the color they program on DCN 4.0.1
+/// (`color_program`). Not a modeset: the stream updater reprograms a live
+/// scanout at once; a dark display takes it at its next scanout start.
+pub fn request_crtc_color(display: u8, request: crate::amdgpu_native_kms::CrtcColorRequest) {
+    let program = color_program(&request).map(Arc::new);
+    {
+        let mut outputs = OUTPUTS.lock();
+        let Some(c) = outputs.crtcs.get_mut(usize::from(display)) else {
+            return;
+        };
+        c.color = program;
+    }
+    kick_stream_updater();
+}
+
+/// amdgpu_dm_update_crtc_color_mgmt and amdgpu_dm_update_plane_color_mgmt
+/// for a CRTC whose plane has no color of its own, on DCN 4.0.1:
+/// - a 256-entry GAMMA_LUT is legacy gamma (__set_legacy_tf: sRGB-based
+///   regamma) whose input the PRE_DEGAM sRGB ROM linearizes
+///   (cm_is_degamma_srgb, map_crtc_degamma_to_dc_plane);
+/// - a 4096-entry one that is not linear (__is_lut_linear) becomes the
+///   distributed-points regamma of amdgpu_dm_set_atomic_regamma; a linear
+///   one, like none, bypasses the OGAM;
+/// - a CTM is the stream's gamut remap (__drm_ctm_to_dc_matrix).
+///
+/// None when everything is bypass.
+fn color_program(
+    request: &crate::amdgpu_native_kms::CrtcColorRequest,
+) -> Option<crate::amdgpu_dcn401_otg::ColorProgram> {
+    let program = crate::amdgpu_dcn401_otg::ColorProgram::from_crtc(
+        request.ctm.as_deref(),
+        request.gamma_lut.as_deref(),
+    )?;
+    (program != crate::amdgpu_dcn401_otg::ColorProgram::default()).then_some(program)
+}
+
+/// The connectors amdgpu_dm gives Colorspace and HDR_OUTPUT_METADATA that
+/// this owner signals for: the board's HDMI and DP ones (an MST device's
+/// stream sends neither here).
+fn color_connector(target: Target) -> bool {
+    matches!(target, Target::Board(_))
+}
+
+/// Record DRM's "Colorspace" and HDR_OUTPUT_METADATA for connector
+/// `request.connector`. A new Colorspace, or metadata appearing or
+/// disappearing, relights the display driving it (the display monitor
+/// compares them with what it lit, as amdgpu_dm makes them a modeset);
+/// new metadata while HDR stays on goes to the running stream at once.
+pub fn request_connector_color(request: crate::amdgpu_native_kms::ConnectorColorRequest) {
+    let Some(index) = crate::amdgpu_navi48_kms::connector_index(request.connector) else {
+        return;
+    };
+    {
+        let mut outputs = OUTPUTS.lock();
+        let Some(c) = outputs.connectors.iter_mut().find(|c| c.index == index) else {
+            return;
+        };
+        c.colorspace = request.colorspace;
+        c.hdr = request.hdr_output_metadata;
+        // drm_hdmi_infoframe_set_hdr_metadata only notes an EOTF the
+        // sink's HDR Static Metadata Data Block does not list.
+        let metadata = c
+            .hdr
+            .as_deref()
+            .and_then(|b| crate::amdgpu_hdr::HdrOutputMetadata::from_blob(b).ok());
+        if let Some(m) = metadata {
+            let sink = crate::amdgpu_hdr::hdr_sink_metadata(&c.edid).map_or(0, |s| s.eotf);
+            let eotf = m.hdmi_metadata_type1.eotf;
+            if !crate::amdgpu_hdr::eotf_supported_by_sink(eotf, sink) {
+                let _ = core::fmt::Write::write_fmt(
+                    &mut narf_console::Writer,
+                    format_args!("amdgpu: navi48 connector {index}: unknown EOTF {eotf}\n"),
+                );
+            }
+        }
+    }
+    kick_stream_updater();
+}
+
+/// Display `k`'s connector's Colorspace and HDR metadata (Default and none
+/// without a routed connector).
+fn connector_color(
+    outputs: &Outputs,
+    k: usize,
+) -> (u32, Option<crate::amdgpu_hdr::HdrOutputMetadata>) {
+    outputs.crtcs[k]
+        .route
+        .and_then(|t| outputs.connector(t))
+        .map_or((0, None), |c| {
+            let hdr = c
+                .hdr
+                .as_deref()
+                .and_then(|b| crate::amdgpu_hdr::HdrOutputMetadata::from_blob(b).ok());
+            (c.colorspace, hdr)
+        })
+}
+
+/// Whether connector `connector`'s lit stream can carry `colorspace` and,
+/// with `hdr`, HDR packets: HDR goes out on DIO streams (HDMI TMDS, DP
+/// 8b/10b SST), colorimetry also over FRL; a 128b/132b stream carries
+/// neither here. A dark connector accepts both for its next lighting.
+pub fn connector_color_supported(connector: u32, colorspace: u32, hdr: bool) -> bool {
+    let Some(index) = crate::amdgpu_navi48_kms::connector_index(connector) else {
+        return true;
+    };
+    let outputs = OUTPUTS.lock();
+    let Some(k) = outputs
+        .connectors
+        .iter()
+        .find(|c| c.index == index)
+        .and_then(|c| outputs.crtc_of(c.target))
+    else {
+        return true;
+    };
+    let c = &outputs.crtcs[k];
+    let (hdr_ok, colorimetry_ok) = if c.shown.is_some() {
+        c.color_signals
+    } else {
+        (true, true)
+    };
+    (!hdr || hdr_ok) && (colorspace == 0 || colorimetry_ok)
+}
+static STREAM_UPDATER: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static STREAM_DIRTY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Run the stream updater (once at a time) to apply new non-modeset stream
+/// state: CRTC color and HDR metadata.
+fn kick_stream_updater() {
+    STREAM_DIRTY.store(true, Ordering::Release);
+    if !STREAM_UPDATER.swap(true, Ordering::AcqRel) {
+        narf_scheduler::spawn(stream_updater());
+    }
+}
+async fn stream_updater() {
+    loop {
+        STREAM_DIRTY.store(false, Ordering::Release);
+        {
+            let mut owner = OWNER.lock().await;
+            if let Some(boot) = owner.as_mut() {
+                converge_streams(boot).await;
+            }
+        }
+        STREAM_UPDATER.store(false, Ordering::Release);
+        // A request that raced the release reruns the updater here.
+        if !STREAM_DIRTY.load(Ordering::Acquire) || STREAM_UPDATER.swap(true, Ordering::AcqRel) {
+            return;
+        }
+    }
+}
+
+/// Bring every display's CRTC color to what DRM committed: recorded for a
+/// dark display's next lighting, reprogrammed on a live one (amdgpu_dm's
+/// non-modeset update). A refused change is reported and retried by the
+/// display monitor's next pass.
+async fn converge_streams(boot: &mut boot::ColdBoot) {
+    let wants: [Option<Arc<crate::amdgpu_dcn401_otg::ColorProgram>>; 4] = {
+        let outputs = OUTPUTS.lock();
+        core::array::from_fn(|k| outputs.crtcs[k].color.clone())
+    };
+    // New HDR metadata on a stream that already sends it: a stream update.
+    // Entering or leaving HDR (or a new Colorspace) waits for the relight.
+    let colors: [(u32, Option<crate::amdgpu_hdr::HdrOutputMetadata>); 4] = {
+        let outputs = OUTPUTS.lock();
+        core::array::from_fn(|k| connector_color(&outputs, k))
+    };
+    for m in boot.display_modesets().into_iter().flatten() {
+        let k = usize::from(m.pipe);
+        let (colorspace, Some(metadata)) = colors[k] else {
+            continue;
+        };
+        if colorspace != m.selection.colorspace || m.selection.hdr.is_none() {
+            continue;
+        }
+        let want = crate::amdgpu_navi48_boot::Selection {
+            hdr: Some(metadata),
+            ..m.selection
+        }
+        .hdr_packet();
+        let Some(want) = want.filter(|w| boot.display_hdr(m.pipe) != Some(*w)) else {
+            continue;
+        };
+        // SAFETY: OWNER is held; the platform excludes other display writers.
+        if let Err(e) = unsafe { boot.set_display_hdr(m.pipe, want) }.await {
+            let _ = core::fmt::Write::write_fmt(
+                &mut narf_console::Writer,
+                format_args!("amdgpu: navi48 display {k} HDR metadata not applied: {e:?}\n"),
+            );
+        }
+    }
+    for (k, want) in wants.into_iter().enumerate() {
+        let have = boot.display_color(k as u8);
+        let same = match (&have, &want) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            continue;
+        }
+        // SAFETY: OWNER is held; the platform excludes other display writers.
+        if let Err(e) = unsafe { boot.set_display_color(k as u8, want) }.await {
+            let _ = core::fmt::Write::write_fmt(
+                &mut narf_console::Writer,
+                format_args!("amdgpu: navi48 display {k} color not applied: {e:?}\n"),
+            );
+        }
+    }
+}
+
 /// Record DRM's "VRR_ENABLED" for CRTC `display`. Like Linux, a request
 /// for a sink or mode that cannot vary its refresh is accepted and the
 /// display stays fixed. A running display is reprogrammed at once when the
@@ -3884,6 +4125,15 @@ pub async unsafe fn monitor_displays(
             (c.active, c.requested, c.format)
         })
     };
+    // A new Colorspace, or entering or leaving HDR, is a modeset
+    // (amdgpu_dm_connector_atomic_check); new metadata in HDR is not.
+    let colors: [(u32, bool); 4] = {
+        let outputs = OUTPUTS.lock();
+        core::array::from_fn(|k| {
+            let (colorspace, hdr) = connector_color(&outputs, k);
+            (colorspace, hdr.is_some())
+        })
+    };
     let limited =
         crate::amdgpu_navi48_boot::limited_range(crate::amdgpu_navi48_boot::broadcast_rgb());
     let pending_mask = (0..4u8)
@@ -3941,6 +4191,7 @@ pub async unsafe fn monitor_displays(
             || desired.is_some_and(|d| d != m.selection.timing)
             || limited != m.selection.limited
             || wants[usize::from(k)].2 != m.selection.format
+            || colors[usize::from(k)] != (m.selection.colorspace, m.selection.hdr.is_some())
         {
             relight = true;
             continue;
@@ -4096,6 +4347,8 @@ pub async unsafe fn monitor_displays(
     }
     // VRR_ENABLED needs no relight: converge every live timing's DRR.
     converge_vrr(boot);
+    // Nor do CRTC color and HDR metadata changes.
+    converge_streams(boot).await;
     // Frames that waited for this pass's relight in a new plane format.
     kick_presenters();
     Ok(steps)
@@ -4618,6 +4871,46 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/navi48-kms",
         navi48_dark_sst_connector_preserves_disable_and_invalidates_replacement
+    );
+
+    /// A display's Colorspace and HDR metadata are its routed connector's,
+    /// kept across reshaping; an HDR blob of the wrong size is none; only
+    /// board connectors carry them.
+    fn navi48_connector_color_follows_the_route() -> TestResult {
+        let target = Target::Board(0);
+        let mut o = Outputs::new();
+        o.reshape(&[board(0)]);
+        let mut blob = alloc::vec![0u8; 32];
+        blob[4] = 2;
+        {
+            let c = o.connector_mut(target).unwrap();
+            c.colorspace = 9;
+            c.hdr = Some(blob.clone());
+        }
+        if connector_color(&o, 0) != (0, None) {
+            return TestResult::Fail("unrouted display");
+        }
+        o.crtcs[0].route = Some(target);
+        let want = crate::amdgpu_hdr::HdrOutputMetadata::from_blob(&blob).ok();
+        if connector_color(&o, 0) != (9, want) {
+            return TestResult::Fail("routed connector's color");
+        }
+        o.reshape(&[board(0), board(1)]);
+        if connector_color(&o, 0) != (9, want) {
+            return TestResult::Fail("color across reshape");
+        }
+        o.connector_mut(target).unwrap().hdr = Some(alloc::vec![0; 30]);
+        if connector_color(&o, 0) != (9, None) {
+            return TestResult::Fail("malformed metadata");
+        }
+        if !color_connector(target) || color_connector(Target::Mst(0, 0)) {
+            return TestResult::Fail("color connectors");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi48-kms",
+        navi48_connector_color_follows_the_route
     );
 
     /// A board sink's FreeSync capability follows its discovery (published

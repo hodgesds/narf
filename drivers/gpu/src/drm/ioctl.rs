@@ -51,6 +51,7 @@ pub enum IoctlCmd {
     ModeGetCrtc = 0xA1,
     ModeSetCrtc = 0xA2,
     ModeCursor = 0xA3,
+    ModeGetGamma = 0xA4,
     ModeSetGamma = 0xA5,
     ModeGetEncoder = 0xA6,
     ModeGetConnector = 0xA7,
@@ -101,6 +102,7 @@ impl IoctlCmd {
             0xA1 => IoctlCmd::ModeGetCrtc,
             0xA2 => IoctlCmd::ModeSetCrtc,
             0xA3 => IoctlCmd::ModeCursor,
+            0xA4 => IoctlCmd::ModeGetGamma,
             0xA5 => IoctlCmd::ModeSetGamma,
             0xA6 => IoctlCmd::ModeGetEncoder,
             0xA7 => IoctlCmd::ModeGetConnector,
@@ -428,6 +430,7 @@ pub fn dispatch(
         | IoctlCmd::ModeSetCrtc
         | IoctlCmd::ModeGetCrtc
         | IoctlCmd::ModeGetEncoder
+        | IoctlCmd::ModeGetGamma
         | IoctlCmd::ModeSetGamma
         | IoctlCmd::SetMaster
         | IoctlCmd::DropMaster

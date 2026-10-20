@@ -123,3 +123,39 @@ pub fn console_pipe() -> u8 {
         crate::amdgpu_navi48_platform::console_pipe()
     }
 }
+/// A CRTC's committed CTM and GAMMA_LUT blob bytes (None: the property is
+/// clear), as DRM hands amdgpu_dm a color_mgmt_changed CRTC state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CrtcColorRequest {
+    pub ctm: Option<alloc::vec::Vec<u8>>,
+    pub gamma_lut: Option<alloc::vec::Vec<u8>>,
+}
+/// A connector's committed "Colorspace" and HDR_OUTPUT_METADATA bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectorColorRequest {
+    pub connector: u32,
+    pub colorspace: u32,
+    pub hdr_output_metadata: Option<alloc::vec::Vec<u8>>,
+}
+/// CRTC CTM / GAMMA_LUT. Only Navi48 attaches them.
+pub fn request_crtc_color(display: u8, request: CrtcColorRequest) {
+    if !navi22() {
+        crate::amdgpu_navi48_platform::request_crtc_color(display, request)
+    }
+}
+/// Connector Colorspace / HDR_OUTPUT_METADATA. Only Navi48 attaches them.
+pub fn request_connector_color(request: ConnectorColorRequest) {
+    if !navi22() {
+        crate::amdgpu_navi48_platform::request_connector_color(request)
+    }
+}
+/// Whether connector `connector`'s stream can signal `colorspace` and, with
+/// `hdr`, HDR metadata (Navi48; Navi22 attaches neither property).
+pub fn connector_color_supported(connector: u32, colorspace: u32, hdr: bool) -> bool {
+    navi22() || crate::amdgpu_navi48_platform::connector_color_supported(connector, colorspace, hdr)
+}
+/// Whether an HDR_OUTPUT_METADATA blob builds an HDR infoframe
+/// (amdgpu_dm_fill_hdr_info_packet succeeds).
+pub fn hdr_metadata_valid(blob: &[u8]) -> bool {
+    crate::amdgpu_hdr::HdrOutputMetadata::from_blob(blob).is_ok()
+}

@@ -547,6 +547,8 @@ fn smoke_drm_ioctl_broadcast_rgb_property() -> TestResult {
         timings: alloc::vec::Vec::new(),
         broadcast_rgb: Some(0),
         vrr_capable: None,
+        colorspace: None,
+        hdr_output_metadata: None,
     });
     // GETPROPERTY: a settable enum with Linux's three names.
     let mut values = [0u64; 3];
@@ -757,6 +759,8 @@ fn smoke_drm_ioctl_vrr_properties() -> TestResult {
             timings: alloc::vec::Vec::new(),
             broadcast_rgb: None,
             vrr_capable: Some(true),
+            colorspace: None,
+            hdr_output_metadata: None,
         });
         card.vrr_enabled = alloc::vec![(11, false), (12, false)];
     }
@@ -863,6 +867,553 @@ fn smoke_drm_ioctl_vrr_properties() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_vrr_properties);
+
+// ── CRTC CTM / GAMMA_LUT and connector Colorspace / HDR_OUTPUT_METADATA ─
+//
+// amdgpu_dm on DCN 4.0.1: drm_crtc_enable_color_mgmt(crtc, 0, true, 4096)
+// (CTM, GAMMA_LUT, GAMMA_LUT_SIZE; no degamma) with the 256-entry legacy
+// gamma, and Colorspace / HDR_OUTPUT_METADATA on HDMI and DP connectors.
+// Blob properties are validated as drm_property_replace_blob_from_id and
+// amdgpu_dm_verify_lut_sizes do; Colorspace and entering/leaving HDR need
+// a modeset; a referenced blob outlives DESTROYPROPBLOB.
+fn color_getprop(
+    idx: u32,
+    prop: u32,
+) -> Option<(alloc::vec::Vec<u8>, u32, alloc::vec::Vec<u64>, u32)> {
+    let mut values = [0u64; 8];
+    let mut gp = [0u8; 64];
+    gp[0..8].copy_from_slice(&(values.as_mut_ptr() as u64).to_le_bytes());
+    gp[16..20].copy_from_slice(&prop.to_le_bytes());
+    gp[56..60].copy_from_slice(&8u32.to_le_bytes());
+    dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xAA, 64),
+        gp.as_mut_ptr() as usize,
+        false,
+    )
+    .ok()?;
+    let end = gp[24..56].iter().position(|&c| c == 0).unwrap_or(32);
+    let count = u32::from_le_bytes(gp[56..60].try_into().unwrap());
+    Some((
+        alloc::vec::Vec::from(&gp[24..24 + end]),
+        u32::from_le_bytes(gp[20..24].try_into().unwrap()),
+        values[..(count as usize).min(8)].to_vec(),
+        u32::from_le_bytes(gp[60..64].try_into().unwrap()),
+    ))
+}
+fn color_props(idx: u32, obj: u32, kind: u32) -> alloc::vec::Vec<(u32, u64)> {
+    let mut props = [0u32; 16];
+    let mut vals = [0u64; 16];
+    let mut og = [0u8; 32];
+    og[0..8].copy_from_slice(&(props.as_mut_ptr() as u64).to_le_bytes());
+    og[8..16].copy_from_slice(&(vals.as_mut_ptr() as u64).to_le_bytes());
+    og[16..20].copy_from_slice(&16u32.to_le_bytes());
+    og[20..24].copy_from_slice(&obj.to_le_bytes());
+    og[24..28].copy_from_slice(&kind.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xB9, 32),
+        og.as_mut_ptr() as usize,
+        false,
+    )
+    .is_err()
+    {
+        return alloc::vec::Vec::new();
+    }
+    let count = u32::from_le_bytes(og[16..20].try_into().unwrap()) as usize;
+    props[..count]
+        .iter()
+        .copied()
+        .zip(vals[..count].iter().copied())
+        .collect()
+}
+fn color_prop(idx: u32, obj: u32, kind: u32, prop: u32) -> Option<u64> {
+    color_props(idx, obj, kind)
+        .into_iter()
+        .find(|&(p, _)| p == prop)
+        .map(|(_, v)| v)
+}
+fn color_obj_set(idx: u32, value: u64, prop: u32, obj: u32, kind: u32) -> Result<u64, FsError> {
+    let mut b = [0u8; 24];
+    b[0..8].copy_from_slice(&value.to_le_bytes());
+    b[8..12].copy_from_slice(&prop.to_le_bytes());
+    b[12..16].copy_from_slice(&obj.to_le_bytes());
+    b[16..20].copy_from_slice(&kind.to_le_bytes());
+    dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xBA, 24),
+        b.as_mut_ptr() as usize,
+        false,
+    )
+}
+fn color_blob(idx: u32, data: &[u8]) -> u32 {
+    let mut b = [0u8; 16];
+    b[0..8].copy_from_slice(&(data.as_ptr() as u64).to_le_bytes());
+    b[8..12].copy_from_slice(&(data.len() as u32).to_le_bytes());
+    let _ = dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xBD, 16),
+        b.as_mut_ptr() as usize,
+        false,
+    );
+    u32::from_le_bytes(b[12..16].try_into().unwrap())
+}
+fn color_blob_bytes(idx: u32, id: u32) -> Option<alloc::vec::Vec<u8>> {
+    let mut data = alloc::vec![0u8; 0x8000];
+    let mut b = [0u8; 16];
+    b[0..4].copy_from_slice(&id.to_le_bytes());
+    b[4..8].copy_from_slice(&(data.len() as u32).to_le_bytes());
+    b[8..16].copy_from_slice(&(data.as_mut_ptr() as u64).to_le_bytes());
+    dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xAC, 16),
+        b.as_mut_ptr() as usize,
+        false,
+    )
+    .ok()?;
+    data.truncate(u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize);
+    Some(data)
+}
+/// A GAMMA_LUT / legacy ramp of `n` equal-channel entries.
+fn color_lut(n: usize) -> alloc::vec::Vec<u8> {
+    (0..n)
+        .flat_map(|i| {
+            let v = (i * 0xffff / (n - 1)) as u16;
+            [v, v, v, 0].into_iter().flat_map(u16::to_le_bytes)
+        })
+        .collect()
+}
+const COLOR_CONNECTOR: u32 = 0xc0c0_c0c0;
+const COLOR_CRTC: u32 = 0xcccc_cccc;
+
+fn smoke_drm_ioctl_color_property_metadata() -> TestResult {
+    let idx = register_test_card();
+    // drm_mode_create_standard_properties: plain blobs, an immutable range.
+    if color_getprop(idx, 0x64) != Some((b"CTM".to_vec(), 1 << 4, alloc::vec![], 0))
+        || color_getprop(idx, 0x65) != Some((b"GAMMA_LUT".to_vec(), 1 << 4, alloc::vec![], 0))
+        || color_getprop(idx, 0x66)
+            != Some((
+                b"GAMMA_LUT_SIZE".to_vec(),
+                1 << 1 | 1 << 2,
+                alloc::vec![0, 0xffff_ffff],
+                0,
+            ))
+        || color_getprop(idx, 0x68)
+            != Some((b"HDR_OUTPUT_METADATA".to_vec(), 1 << 4, alloc::vec![], 0))
+    {
+        return TestResult::Fail("color property metadata");
+    }
+    // Colorspace: Default plus amdgpu_dm's four, the same on HDMI and DP.
+    let mut values = [0u64; 5];
+    let mut enums = [0u8; 5 * 40];
+    let mut gp = [0u8; 64];
+    gp[0..8].copy_from_slice(&(values.as_mut_ptr() as u64).to_le_bytes());
+    gp[8..16].copy_from_slice(&(enums.as_mut_ptr() as u64).to_le_bytes());
+    gp[16..20].copy_from_slice(&0x67u32.to_le_bytes());
+    gp[56..60].copy_from_slice(&5u32.to_le_bytes());
+    gp[60..64].copy_from_slice(&5u32.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xAA, 64),
+        gp.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+        || &gp[24..35] != b"Colorspace\0"
+        || u32::from_le_bytes(gp[20..24].try_into().unwrap()) != 1 << 3
+        || values != [0, 2, 7, 9, 10]
+    {
+        return TestResult::Fail("Colorspace enum");
+    }
+    let names: [&[u8]; 5] = [
+        b"Default",
+        b"BT709_YCC",
+        b"opRGB",
+        b"BT2020_RGB",
+        b"BT2020_YCC",
+    ];
+    for (i, name) in names.iter().enumerate() {
+        let e = &enums[i * 40..i * 40 + 40];
+        if u64::from_le_bytes(e[..8].try_into().unwrap()) != values[i]
+            || &e[8..8 + name.len()] != *name
+            || e[8 + name.len()] != 0
+        {
+            return TestResult::Fail("Colorspace names");
+        }
+    }
+    // A card that does not publish them lists none, takes none, and keeps
+    // a zero gamma size.
+    if color_prop(idx, 11, COLOR_CRTC, 0x64).is_some()
+        || color_obj_set(idx, 0, 0x64, 11, COLOR_CRTC) != Err(FsError::InvalidData)
+        || color_obj_set(idx, 0, 0x67, 31, COLOR_CONNECTOR) != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("color properties on a plain card");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_ioctl_color_property_metadata
+);
+
+/// The native-atomic test card with color management on both CRTCs and
+/// Colorspace / HDR_OUTPUT_METADATA on its connector, which drives CRTC 11.
+fn color_card() -> Option<u32> {
+    let idx = register_test_card();
+    let ms = crate::drm_registry::mode_state(idx)?;
+    let mut card = ms.lock();
+    card.native_atomic = true;
+    card.crtc_color = alloc::vec![
+        crate::drm::card::CrtcColor::new(11),
+        crate::drm::card::CrtcColor::new(12),
+    ];
+    card.encoders[0].crtc_id = Some(11);
+    card.native.push(crate::drm::card::NativeOutput {
+        connector: 31,
+        edid: None,
+        timings: alloc::vec::Vec::new(),
+        broadcast_rgb: None,
+        vrr_capable: None,
+        colorspace: Some(0),
+        hdr_output_metadata: Some(0),
+    });
+    Some(idx)
+}
+
+fn smoke_drm_ioctl_crtc_color_blobs() -> TestResult {
+    let Some(idx) = color_card() else {
+        return TestResult::Fail("no mode state");
+    };
+    // CRTC listing: CTM, GAMMA_LUT and GAMMA_LUT_SIZE = 4096 after the
+    // core properties; GETCRTC reports the legacy gamma size.
+    let props = color_props(idx, 11, COLOR_CRTC);
+    if props[props.len().saturating_sub(3)..] != [(0x64, 0), (0x65, 0), (0x66, 4096)] {
+        return TestResult::Fail("CRTC color properties");
+    }
+    let mut crtc = [0u8; 104];
+    crtc[12..16].copy_from_slice(&11u32.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xA1, 104),
+        crtc.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+        || u32::from_le_bytes(crtc[28..32].try_into().unwrap()) != 256
+    {
+        return TestResult::Fail("GETCRTC gamma_size");
+    }
+    // CTM: exactly 72 bytes; unknown blobs are EINVAL.
+    let ctm = color_blob(idx, &[0u8; 72]);
+    let short = color_blob(idx, &[0u8; 64]);
+    if color_obj_set(idx, u64::from(short), 0x64, 11, COLOR_CRTC) != Err(FsError::InvalidData)
+        || color_obj_set(idx, 0xdead, 0x64, 11, COLOR_CRTC) != Err(FsError::InvalidData)
+        || color_obj_set(idx, u64::from(ctm), 0x64, 11, COLOR_CRTC) != Ok(0)
+        || color_prop(idx, 11, COLOR_CRTC, 0x64) != Some(u64::from(ctm))
+        || color_prop(idx, 12, COLOR_CRTC, 0x64) != Some(0)
+    {
+        return TestResult::Fail("CTM blob");
+    }
+    // GAMMA_LUT: whole drm_color_lut entries, 4096 or 256 of them.
+    let full = color_blob(idx, &color_lut(4096));
+    let legacy = color_blob(idx, &color_lut(256));
+    let odd = color_blob(idx, &color_lut(1024));
+    let ragged = color_blob(idx, &[0u8; 2052]);
+    if color_obj_set(idx, u64::from(odd), 0x65, 11, COLOR_CRTC) != Err(FsError::InvalidData)
+        || color_obj_set(idx, u64::from(ragged), 0x65, 11, COLOR_CRTC) != Err(FsError::InvalidData)
+        || color_obj_set(idx, u64::from(full), 0x65, 11, COLOR_CRTC) != Ok(0)
+        || color_obj_set(idx, u64::from(legacy), 0x65, 12, COLOR_CRTC) != Ok(0)
+        || color_prop(idx, 11, COLOR_CRTC, 0x65) != Some(u64::from(full))
+        || color_prop(idx, 12, COLOR_CRTC, 0x65) != Some(u64::from(legacy))
+        || color_obj_set(idx, 4096, 0x66, 11, COLOR_CRTC) != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("GAMMA_LUT blob");
+    }
+    // A committed blob outlives its creator's reference, then goes.
+    let mut d = [0u8; 4];
+    d.copy_from_slice(&full.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xBE, 4),
+        d.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+        || color_blob_bytes(idx, full) != Some(color_lut(4096))
+        || color_obj_set(idx, 0, 0x65, 11, COLOR_CRTC) != Ok(0)
+        || color_blob_bytes(idx, full).is_some()
+        || color_blob_bytes(idx, legacy) != Some(color_lut(256))
+    {
+        return TestResult::Fail("blob lifetime");
+    }
+    // Atomic: no ALLOW_MODESET needed; TEST_ONLY applies nothing; a bad
+    // size fails the whole request.
+    let atomic = |flags: u32, props: &[u32], values: &[u64]| {
+        let objects = [11u32];
+        let counts = [props.len() as u32];
+        let mut req = DrmModeAtomicUapi {
+            flags,
+            count_objs: 1,
+            objs_ptr: objects.as_ptr() as u64,
+            count_props_ptr: counts.as_ptr() as u64,
+            props_ptr: props.as_ptr() as u64,
+            prop_values_ptr: values.as_ptr() as u64,
+            ..Default::default()
+        };
+        dispatch_card(
+            idx,
+            DRM_IOCTL_MODE_ATOMIC,
+            &mut req as *mut _ as usize,
+            false,
+        )
+    };
+    let full = color_blob(idx, &color_lut(4096));
+    if atomic(0x0100, &[0x65, 0x64], &[u64::from(full), 0]) != Ok(0)
+        || color_prop(idx, 11, COLOR_CRTC, 0x65) != Some(0)
+        || color_prop(idx, 11, COLOR_CRTC, 0x64) != Some(u64::from(ctm))
+    {
+        return TestResult::Fail("TEST_ONLY applied");
+    }
+    if atomic(0, &[0x65, 0x64], &[u64::from(full), u64::from(odd)]) != Err(FsError::InvalidData)
+        || atomic(0, &[0x65, 0x64], &[u64::from(odd), 0]) != Err(FsError::InvalidData)
+        || color_prop(idx, 11, COLOR_CRTC, 0x65) != Some(0)
+    {
+        return TestResult::Fail("bad atomic accepted");
+    }
+    if atomic(0, &[0x65, 0x64], &[u64::from(full), 0]) != Ok(0)
+        || color_prop(idx, 11, COLOR_CRTC, 0x65) != Some(u64::from(full))
+        || color_prop(idx, 11, COLOR_CRTC, 0x64) != Some(0)
+    {
+        return TestResult::Fail("atomic color commit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_crtc_color_blobs);
+
+/// DRM_IOCTL_MODE_SETGAMMA / GETGAMMA on a color-managed CRTC: the gamma
+/// store, then drm_crtc_legacy_gamma_set's 256-entry GAMMA_LUT with the
+/// CTM reset; size, CRTC, master and render-node checks.
+fn smoke_drm_ioctl_legacy_gamma() -> TestResult {
+    let Some(idx) = color_card() else {
+        return TestResult::Fail("no mode state");
+    };
+    let lut = |crtc: u32, size: u32, r: &mut [u16], g: &mut [u16], b: &mut [u16]| {
+        let mut req = [0u8; 32];
+        req[0..4].copy_from_slice(&crtc.to_le_bytes());
+        req[4..8].copy_from_slice(&size.to_le_bytes());
+        for (at, ramp) in [
+            (8, r.as_mut_ptr()),
+            (16, g.as_mut_ptr()),
+            (24, b.as_mut_ptr()),
+        ] {
+            req[at..at + 8].copy_from_slice(&(ramp as u64).to_le_bytes());
+        }
+        req
+    };
+    let (mut r, mut g, mut b) = ([0u16; 256], [0u16; 256], [0u16; 256]);
+    // The initial store is the identity ramp (i << 8).
+    let mut get = lut(11, 256, &mut r, &mut g, &mut b);
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xA4, 32),
+        get.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+        || (0..256).any(|i| r[i] != (i as u16) << 8 || b[i] != (i as u16) << 8)
+    {
+        return TestResult::Fail("initial gamma store");
+    }
+    let ctm = color_blob(idx, &[0u8; 72]);
+    if color_obj_set(idx, u64::from(ctm), 0x64, 11, COLOR_CRTC) != Ok(0) {
+        return TestResult::Fail("CTM before SETGAMMA");
+    }
+    let (mut r, mut g, mut b) = (
+        core::array::from_fn::<u16, 256, _>(|i| 0xffff - (i as u16) * 0x101),
+        core::array::from_fn::<u16, 256, _>(|i| (i as u16) * 0x80),
+        [0x1234u16; 256],
+    );
+    let mut set = lut(11, 256, &mut r, &mut g, &mut b);
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xA5, 32),
+        set.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+    {
+        return TestResult::Fail("SETGAMMA");
+    }
+    let Some(blob) = color_prop(idx, 11, COLOR_CRTC, 0x65) else {
+        return TestResult::Fail("GAMMA_LUT after SETGAMMA");
+    };
+    let bytes = color_blob_bytes(idx, blob as u32).unwrap_or_default();
+    let entry = |i: usize| -> [u16; 3] {
+        let e = &bytes[i * 8..i * 8 + 6];
+        [0, 2, 4].map(|o| u16::from_le_bytes([e[o], e[o + 1]]))
+    };
+    if bytes.len() != 256 * 8
+        || (0..256).any(|i| entry(i) != [r[i], g[i], b[i]])
+        || color_prop(idx, 11, COLOR_CRTC, 0x64) != Some(0)
+    {
+        return TestResult::Fail("legacy GAMMA_LUT / CTM reset");
+    }
+    let (mut gr, mut gg, mut gb) = ([0u16; 256], [0u16; 256], [0u16; 256]);
+    let mut get = lut(11, 256, &mut gr, &mut gg, &mut gb);
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xA4, 32),
+        get.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+        || gr != r
+        || gg != g
+        || gb != b
+    {
+        return TestResult::Fail("GETGAMMA after SETGAMMA");
+    }
+    // The only blob reference is the property's: replacing it frees it.
+    if color_obj_set(idx, 0, 0x65, 11, COLOR_CRTC) != Ok(0)
+        || color_blob_bytes(idx, blob as u32).is_some()
+    {
+        return TestResult::Fail("legacy blob lifetime");
+    }
+    let mut bad = lut(11, 255, &mut r, &mut g, &mut b);
+    let mut gone = lut(99, 256, &mut r, &mut g, &mut b);
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xA5, 32),
+        bad.as_mut_ptr() as usize,
+        false,
+    ) != Err(FsError::InvalidData)
+        || dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xA4, 32),
+            bad.as_mut_ptr() as usize,
+            false,
+        ) != Err(FsError::InvalidData)
+        || dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xA5, 32),
+            gone.as_mut_ptr() as usize,
+            false,
+        ) != Err(FsError::NotFound)
+        || dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xA4, 32),
+            set.as_mut_ptr() as usize,
+            true,
+        ) != Err(FsError::PermissionDenied)
+        || crate::drm_ioctl_bridge::dispatch_card(
+            idx,
+            SMOKE_MASTER_ID + 1,
+            iowr(DRM_IOCTL_BASE, 0xA5, 32),
+            set.as_mut_ptr() as usize,
+            false,
+        ) != Err(FsError::PermissionDenied)
+    {
+        return TestResult::Fail("SETGAMMA/GETGAMMA checks");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_legacy_gamma);
+
+/// Connector Colorspace and HDR_OUTPUT_METADATA: listed with the
+/// connector, values validated, a Colorspace change or entering/leaving
+/// HDR on a driven connector needs ALLOW_MODESET (EINVAL through the legacy
+/// setters), a metadata change while in HDR does not, and only blobs of
+/// sizeof(struct hdr_output_metadata) are taken.
+fn smoke_drm_ioctl_connector_hdr_properties() -> TestResult {
+    let Some(idx) = color_card() else {
+        return TestResult::Fail("no mode state");
+    };
+    let props = color_props(idx, 31, COLOR_CONNECTOR);
+    if !props.contains(&(0x67, 0)) || !props.contains(&(0x68, 0)) {
+        return TestResult::Fail("connector properties");
+    }
+    let atomic = |flags: u32, props: &[u32], values: &[u64]| {
+        let objects = [31u32];
+        let counts = [props.len() as u32];
+        let mut req = DrmModeAtomicUapi {
+            flags,
+            count_objs: 1,
+            objs_ptr: objects.as_ptr() as u64,
+            count_props_ptr: counts.as_ptr() as u64,
+            props_ptr: props.as_ptr() as u64,
+            prop_values_ptr: values.as_ptr() as u64,
+            ..Default::default()
+        };
+        dispatch_card(
+            idx,
+            DRM_IOCTL_MODE_ATOMIC,
+            &mut req as *mut _ as usize,
+            false,
+        )
+    };
+    const ALLOW_MODESET: u32 = 0x400;
+    // Colorspace: enum values only; a modeset on the driven connector.
+    if atomic(ALLOW_MODESET, &[0x67], &[1]) != Err(FsError::InvalidData)
+        || atomic(0, &[0x67], &[9]) != Err(FsError::InvalidData)
+        || color_obj_set(idx, 9, 0x67, 31, COLOR_CONNECTOR) != Err(FsError::InvalidData)
+        || atomic(ALLOW_MODESET, &[0x67], &[9]) != Ok(0)
+        || color_prop(idx, 31, COLOR_CONNECTOR, 0x67) != Some(9)
+        // Unchanged is no modeset.
+        || atomic(0, &[0x67], &[9]) != Ok(0)
+    {
+        return TestResult::Fail("Colorspace");
+    }
+    // HDR_OUTPUT_METADATA: a static type 1 PQ infoframe.
+    let mut hdr = [0u8; 32];
+    hdr[4] = 2; // EOTF SMPTE ST 2084
+    hdr[22..24].copy_from_slice(&1000u16.to_le_bytes());
+    let pq = color_blob(idx, &hdr);
+    hdr[26..28].copy_from_slice(&400u16.to_le_bytes());
+    let brighter = color_blob(idx, &hdr);
+    // drm_hdmi_infoframe_set_hdr_metadata reads only the type 1 frame: the
+    // outer metadata_type is not checked.
+    hdr[0] = 1;
+    let other_type = color_blob(idx, &hdr);
+    let short = color_blob(idx, &hdr[..30]);
+    if atomic(ALLOW_MODESET, &[0x68], &[u64::from(short)]) != Err(FsError::InvalidData)
+        || atomic(0, &[0x68], &[u64::from(pq)]) != Err(FsError::InvalidData)
+        || color_obj_set(idx, u64::from(pq), 0x68, 31, COLOR_CONNECTOR) != Err(FsError::InvalidData)
+        || atomic(ALLOW_MODESET, &[0x68], &[u64::from(pq)]) != Ok(0)
+        || color_prop(idx, 31, COLOR_CONNECTOR, 0x68) != Some(u64::from(pq))
+    {
+        return TestResult::Fail("entering HDR");
+    }
+    // New metadata while in HDR is a stream update; leaving is a modeset.
+    if atomic(0, &[0x68], &[u64::from(brighter)]) != Ok(0)
+        || atomic(0, &[0x68], &[u64::from(other_type)]) != Ok(0)
+        || color_obj_set(idx, u64::from(pq), 0x68, 31, COLOR_CONNECTOR) != Ok(0)
+        || atomic(0, &[0x68], &[0]) != Err(FsError::InvalidData)
+        || atomic(ALLOW_MODESET, &[0x68], &[0]) != Ok(0)
+        || color_prop(idx, 31, COLOR_CONNECTOR, 0x68) != Some(0)
+    {
+        return TestResult::Fail("HDR metadata updates");
+    }
+    // An undriven connector: no modeset and no infoframe check (as
+    // amdgpu_dm_connector_atomic_check skips it); sizes still apply.
+    if let Some(ms) = crate::drm_registry::mode_state(idx) {
+        ms.lock().encoders[0].crtc_id = None;
+    }
+    if color_obj_set(idx, u64::from(other_type), 0x68, 31, COLOR_CONNECTOR) != Ok(0)
+        || color_obj_set(idx, 2, 0x67, 31, COLOR_CONNECTOR) != Ok(0)
+        || color_obj_set(idx, u64::from(short), 0x68, 31, COLOR_CONNECTOR)
+            != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("undriven connector");
+    }
+    // A connector without the properties takes neither.
+    if let Some(ms) = crate::drm_registry::mode_state(idx) {
+        ms.lock().native.clear();
+    }
+    if color_obj_set(idx, 0, 0x67, 31, COLOR_CONNECTOR) != Err(FsError::InvalidData)
+        || color_obj_set(idx, 0, 0x68, 31, COLOR_CONNECTOR) != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("properties on a plain connector");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_ioctl_connector_hdr_properties
+);
 
 // ── 6. Render-node fd rejects SETCRTC with PermissionDenied ────────────
 

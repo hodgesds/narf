@@ -292,6 +292,39 @@ pub(crate) struct VirtGpuImport {
 pub(crate) struct PropertyBlob {
     pub(crate) id: u32,
     pub(crate) data: Vec<u8>,
+    /// Still owned by its creator: DESTROYPROPBLOB not yet called. A blob a
+    /// committed property still names outlives its creator's reference, as
+    /// a refcounted `drm_property_blob` does (`Card::collect_blobs`).
+    pub(crate) user: bool,
+}
+
+/// `drm_crtc::gamma_size` of every color-managed CRTC: amdgpu_dm's
+/// `drm_mode_crtc_set_gamma_size(MAX_COLOR_LEGACY_LUT_ENTRIES)`.
+pub const LEGACY_GAMMA_SIZE: usize = 256;
+
+/// A CRTC's color management as amdgpu_dm attaches it on DCN 4.0.1
+/// (`drm_crtc_enable_color_mgmt(crtc, 0, true, MAX_COLOR_LUT_ENTRIES)`:
+/// CTM, GAMMA_LUT and GAMMA_LUT_SIZE, no degamma) with the blobs DRM last
+/// committed (0 for none) and the legacy gamma store GETGAMMA reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrtcColor {
+    pub crtc: u32,
+    pub ctm: u32,
+    pub gamma_lut: u32,
+    /// `drm_crtc::gamma_store`: `LEGACY_GAMMA_SIZE` red, then green, then
+    /// blue entries, initialised to the identity ramp (`i << 8`).
+    pub gamma_store: Vec<u16>,
+}
+impl CrtcColor {
+    pub fn new(crtc: u32) -> Self {
+        let ramp = (0..LEGACY_GAMMA_SIZE as u16).map(|i| i << 8);
+        Self {
+            crtc,
+            ctm: 0,
+            gamma_lut: 0,
+            gamma_store: ramp.clone().chain(ramp.clone()).chain(ramp).collect(),
+        }
+    }
 }
 
 /// Flip-complete events owned by one open DRM primary-node file.
@@ -730,6 +763,9 @@ pub struct Card {
     /// The CRTCs (by id) carrying the "VRR_ENABLED" property, with the value
     /// DRM last committed. Empty on cards that do not expose it.
     pub vrr_enabled: Vec<(u32, bool)>,
+    /// The CRTCs carrying color management properties. Empty on cards that
+    /// do not expose them.
+    pub crtc_color: Vec<CrtcColor>,
 }
 
 /// A connector whose modes and EDID come from a real sink, published by a
@@ -749,6 +785,13 @@ pub struct NativeOutput {
     /// The connector's immutable "vrr_capable" value, when it has the
     /// property (drm_connector_attach_vrr_capable_property).
     pub vrr_capable: Option<bool>,
+    /// The connector's "Colorspace" value (a DRM_MODE_COLORIMETRY_*), when
+    /// it has the property. amdgpu_dm's supported set gives HDMI and DP
+    /// connectors the same list.
+    pub colorspace: Option<u32>,
+    /// The connector's "HDR_OUTPUT_METADATA" blob id (0 for none), when it
+    /// has the property (drm_connector_attach_hdr_output_metadata_property).
+    pub hdr_output_metadata: Option<u32>,
 }
 
 /// System-wide vblank "slack" offset in nanoseconds. A flip-complete event is
@@ -818,6 +861,7 @@ impl Card {
             plane_formats: None,
             native_atomic: false,
             vrr_enabled: Vec::new(),
+            crtc_color: Vec::new(),
         }
     }
     /// Wire form of a CRTC mode: the exact native timing when a published
@@ -1246,7 +1290,11 @@ impl Card {
             id = id.wrapping_add(1).max(1);
         }
         self.next_property_blob_id = id.wrapping_add(1).max(1);
-        self.property_blobs.push(PropertyBlob { id, data });
+        self.property_blobs.push(PropertyBlob {
+            id,
+            data,
+            user: true,
+        });
         Ok(id)
     }
 
@@ -1258,13 +1306,50 @@ impl Card {
             .map(|blob| blob.data.as_slice())
     }
 
-    /// Destroy a KMS property blob. Returns false for an unknown id.
+    /// Destroy a KMS property blob. Returns false for an unknown id (or one
+    /// already destroyed). A blob a committed property still names stays
+    /// readable until that property lets it go, as Linux's reference does.
     pub(crate) fn destroy_property_blob(&mut self, id: u32) -> bool {
-        let Some(pos) = self.property_blobs.iter().position(|blob| blob.id == id) else {
+        let Some(blob) = self
+            .property_blobs
+            .iter_mut()
+            .find(|blob| blob.id == id && blob.user)
+        else {
             return false;
         };
-        self.property_blobs.swap_remove(pos);
+        blob.user = false;
+        self.collect_blobs();
         true
+    }
+
+    /// Whether a committed color or HDR property names blob `id`.
+    fn blob_referenced(&self, id: u32) -> bool {
+        id != 0
+            && (self
+                .crtc_color
+                .iter()
+                .any(|c| c.ctm == id || c.gamma_lut == id)
+                || self
+                    .native
+                    .iter()
+                    .any(|n| n.hdr_output_metadata == Some(id)))
+    }
+
+    /// Free destroyed blobs no committed property names any more (the last
+    /// `drm_property_blob_put`).
+    pub(crate) fn collect_blobs(&mut self) {
+        let keep: Vec<bool> = self
+            .property_blobs
+            .iter()
+            .map(|b| b.user || self.blob_referenced(b.id))
+            .collect();
+        let mut keep = keep.into_iter();
+        self.property_blobs.retain(|_| keep.next().unwrap_or(true));
+    }
+
+    /// The color management of CRTC `crtc`, when it has the properties.
+    pub fn crtc_color(&self, crtc: u32) -> Option<&CrtcColor> {
+        self.crtc_color.iter().find(|c| c.crtc == crtc)
     }
 
     /// Look up a dumb backing by mmap offset.

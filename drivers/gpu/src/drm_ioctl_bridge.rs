@@ -2096,10 +2096,13 @@ pub(crate) fn dispatch_card_for_file(
             handle_set_property(card_index, &mode_state, arg, &ctx, true)
         }
         IoctlCmd::ModeGetPropBlob => handle_getpropblob(&mode_state, arg, &ctx),
-        // SETGAMMA — accept + no-op. We scan out the framebuffer verbatim
-        // (no hardware gamma LUT), so modetest's post-modeset gamma reset
-        // succeeds silently instead of warning `failed to set gamma`.
-        IoctlCmd::ModeSetGamma => Ok(0),
+        // SETGAMMA / GETGAMMA: the legacy gamma of a color-managed CRTC
+        // (drm_mode_gamma_set_ioctl / drm_mode_gamma_get_ioctl). Other
+        // cards scan out the framebuffer verbatim (no hardware gamma LUT):
+        // SETGAMMA is accepted as a no-op there, so modetest's
+        // post-modeset gamma reset succeeds instead of warning.
+        IoctlCmd::ModeSetGamma => handle_gamma(card_index, &mode_state, arg, &ctx, true),
+        IoctlCmd::ModeGetGamma => handle_gamma(card_index, &mode_state, arg, &ctx, false),
         // SET_MASTER — claim DRM master for this open. Succeeds if the device
         // master is free (or already ours); EBUSY if another open holds it.
         // Render nodes carry no display authority → EACCES. Mirrors
@@ -2814,7 +2817,11 @@ fn handle_getcrtc(
         out[16..20].copy_from_slice(&crtc.primary_fb.unwrap_or(0).to_le_bytes()); // fb_id
         out[20..24].copy_from_slice(&crtc.x.to_le_bytes());
         out[24..28].copy_from_slice(&crtc.y.to_le_bytes());
-        out[28..32].copy_from_slice(&0u32.to_le_bytes()); // gamma_size
+        // drm_crtc::gamma_size: the legacy LUT's, on CRTCs that have one.
+        let gamma_size = card
+            .crtc_color(crtc_id)
+            .map_or(0, |_| crate::drm::card::LEGACY_GAMMA_SIZE as u32);
+        out[28..32].copy_from_slice(&gamma_size.to_le_bytes());
         let mode_valid: u32 = crtc.mode.is_some() as u32;
         out[32..36].copy_from_slice(&mode_valid.to_le_bytes());
         match &crtc.mode {
@@ -2937,6 +2944,37 @@ const BROADCAST_RGB_ENUMS: EnumEntries = [(0, b"Automatic"), (1, b"Full"), (2, b
 /// prop_vrr_enabled): ranges 0..1, the latter settable and not ATOMIC-only.
 const VRR_CAPABLE_PROP_ID: u32 = 0x62;
 const CRTC_VRR_ENABLED_PROP_ID: u32 = 0x63;
+/// amdgpu_dm's CRTC color management on DCN 4.0.1:
+/// `drm_crtc_enable_color_mgmt(crtc, 0, true, MAX_COLOR_LUT_ENTRIES)`
+/// attaches "CTM", "GAMMA_LUT" and the immutable "GAMMA_LUT_SIZE" (no
+/// DEGAMMA_LUT: amdgpu_dm_crtc_init leaves it off DCN_VERSION_4_01).
+const CRTC_CTM_PROP_ID: u32 = 0x64;
+const CRTC_GAMMA_LUT_PROP_ID: u32 = 0x65;
+const CRTC_GAMMA_LUT_SIZE_PROP_ID: u32 = 0x66;
+/// MAX_COLOR_LUT_ENTRIES, the GAMMA_LUT_SIZE value.
+const GAMMA_LUT_SIZE: u64 = 4096;
+/// `sizeof(struct drm_color_ctm)`: nine S31.32 sign-magnitude u64s.
+const CTM_BLOB_SIZE: usize = 72;
+/// `sizeof(struct drm_color_lut)`, a GAMMA_LUT blob's element.
+const COLOR_LUT_ENTRY_SIZE: usize = 8;
+/// The connector "Colorspace" enum and "HDR_OUTPUT_METADATA" blob
+/// (amdgpu_dm_connector_init_helper on HDMI and DP connectors).
+const COLORSPACE_PROP_ID: u32 = 0x67;
+const HDR_OUTPUT_METADATA_PROP_ID: u32 = 0x68;
+/// drm_mode_create_{hdmi,dp}_colorspace_property for amdgpu_dm's
+/// supported_colorspaces (BT709_YCC | OPRGB | BT2020_RGB | BT2020_YCC),
+/// plus Default: the same list on HDMI and DP, in DRM_MODE_COLORIMETRY_*
+/// order with drm_connector.c's colorspace_names.
+const COLORSPACE_ENUMS: [(u64, &[u8]); 5] = [
+    (0, b"Default"),
+    (2, b"BT709_YCC"),
+    (7, b"opRGB"),
+    (9, b"BT2020_RGB"),
+    (10, b"BT2020_YCC"),
+];
+/// `sizeof(struct hdr_output_metadata)`, the size
+/// drm_atomic_connector_set_property requires of an HDR_OUTPUT_METADATA blob.
+const HDR_OUTPUT_METADATA_SIZE: usize = 32;
 /// `IN_FENCE_FD` on a plane: a sync_file fd (-1 = none) gating the flip.
 const PLANE_IN_FENCE_FD_PROP_ID: u32 = 0x5f;
 const CRTC_MODE_ID_PROP_ID: u32 = 0x53;
@@ -3224,6 +3262,20 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
             [0, 1],
         )),
         CRTC_VRR_ENABLED_PROP_ID => Some((b"VRR_ENABLED".as_slice(), DRM_MODE_PROP_RANGE, [0, 1])),
+        // drm_mode_create_standard_properties: plain blobs and an immutable
+        // 0..UINT_MAX range.
+        CRTC_CTM_PROP_ID => Some((b"CTM".as_slice(), DRM_MODE_PROP_BLOB, [0, 0])),
+        CRTC_GAMMA_LUT_PROP_ID => Some((b"GAMMA_LUT".as_slice(), DRM_MODE_PROP_BLOB, [0, 0])),
+        CRTC_GAMMA_LUT_SIZE_PROP_ID => Some((
+            b"GAMMA_LUT_SIZE".as_slice(),
+            DRM_MODE_PROP_RANGE | DRM_MODE_PROP_IMMUTABLE,
+            [0, u32::MAX as u64],
+        )),
+        HDR_OUTPUT_METADATA_PROP_ID => Some((
+            b"HDR_OUTPUT_METADATA".as_slice(),
+            DRM_MODE_PROP_BLOB,
+            [0, 0],
+        )),
         _ => None,
     };
     if let Some((name, flags, values)) = simple {
@@ -3242,13 +3294,16 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
         unsafe { copy_out(arg, &out)? };
         return Ok(0);
     }
-    let (name, flags, enums): (&[u8], u32, EnumEntries) = match prop_id {
+    const PLANE_TYPE_ENUMS: EnumEntries = [(0, b"Overlay"), (1, b"Primary"), (2, b"Cursor")];
+    type Enum = (&'static [u8], u32, &'static [(u64, &'static [u8])]);
+    let (name, flags, enums): Enum = match prop_id {
         PLANE_TYPE_PROP_ID => (
             b"type",
             DRM_MODE_PROP_ENUM | DRM_MODE_PROP_IMMUTABLE,
-            [(0, b"Overlay"), (1, b"Primary"), (2, b"Cursor")],
+            &PLANE_TYPE_ENUMS,
         ),
-        BROADCAST_RGB_PROP_ID => (b"Broadcast RGB", DRM_MODE_PROP_ENUM, BROADCAST_RGB_ENUMS),
+        BROADCAST_RGB_PROP_ID => (b"Broadcast RGB", DRM_MODE_PROP_ENUM, &BROADCAST_RGB_ENUMS),
+        COLORSPACE_PROP_ID => (b"Colorspace", DRM_MODE_PROP_ENUM, &COLORSPACE_ENUMS),
         _ => return Err(FsError::InvalidData),
     };
     out[20..24].copy_from_slice(&flags.to_le_bytes());
@@ -3268,7 +3323,7 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
             buf[i * 8..i * 8 + 8].copy_from_slice(&val.to_le_bytes());
         }
         // SAFETY: `values_ptr` is the user array out-pointer sized
-        // for `user_values_count` >= 3 entries of 8 bytes each.
+        // for `user_values_count` >= `enums.len()` entries of 8 bytes each.
         unsafe { copy_out(values_ptr as usize, &buf)? };
     }
 
@@ -3282,7 +3337,7 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
             buf[base + 8..base + 8 + nm.len()].copy_from_slice(nm);
         }
         // SAFETY: `enum_blob_ptr` is the user enum-array out-pointer sized
-        // for `user_enum_count` >= 3 entries of 40 bytes each.
+        // for `user_enum_count` >= `enums.len()` entries of 40 bytes each.
         unsafe { copy_out(enum_blob_ptr as usize, &buf)? };
     }
     out[56..60].copy_from_slice(&(enums.len() as u32).to_le_bytes()); // count_values
@@ -3309,11 +3364,254 @@ fn connector_properties(
         props.push(BROADCAST_RGB_PROP_ID);
         values.push(u64::from(value));
     }
+    // amdgpu_dm_connector_init_helper attaches Colorspace and
+    // HDR_OUTPUT_METADATA before vrr_capable.
+    if let Some(value) = card.native_output(connector_id).and_then(|n| n.colorspace) {
+        props.push(COLORSPACE_PROP_ID);
+        values.push(u64::from(value));
+    }
+    if let Some(blob) = card
+        .native_output(connector_id)
+        .and_then(|n| n.hdr_output_metadata)
+    {
+        props.push(HDR_OUTPUT_METADATA_PROP_ID);
+        values.push(u64::from(blob));
+    }
     if let Some(capable) = card.native_output(connector_id).and_then(|n| n.vrr_capable) {
         props.push(VRR_CAPABLE_PROP_ID);
         values.push(u64::from(capable));
     }
     (props, values)
+}
+
+/// A CRTC color or connector HDR blob property value, validated as
+/// drm_property_replace_blob_from_id does: 0 clears; otherwise the blob must
+/// exist (EINVAL), be exactly `size` bytes when given and a whole number of
+/// `element`-byte entries when given.
+fn blob_value(
+    card: &crate::drm::card::Card,
+    value: u64,
+    size: Option<usize>,
+    element: Option<usize>,
+) -> Result<u32, FsError> {
+    if value == 0 {
+        return Ok(0);
+    }
+    let id = u32::try_from(value).map_err(|_| FsError::InvalidData)?;
+    let data = card.property_blob(id).ok_or(FsError::InvalidData)?;
+    if size.is_some_and(|n| data.len() != n) || element.is_some_and(|n| data.len() % n != 0) {
+        return Err(FsError::InvalidData);
+    }
+    Ok(id)
+}
+
+/// A CRTC's color properties' new values from one request: each is
+/// `None` while the request leaves it alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CrtcColorChange {
+    ctm: Option<u32>,
+    gamma_lut: Option<u32>,
+}
+
+/// Decode one CRTC color property into `change`: EINVAL on a CRTC without
+/// the property, for a blob of the wrong size, and (amdgpu_dm_verify_lut_sizes)
+/// for a GAMMA_LUT of other than 4096 or 256 entries. Returns false for a
+/// property that is not a color one.
+fn crtc_color_property(
+    card: &crate::drm::card::Card,
+    crtc: u32,
+    prop: u32,
+    value: u64,
+    change: &mut CrtcColorChange,
+) -> Result<bool, FsError> {
+    if !matches!(prop, CRTC_CTM_PROP_ID | CRTC_GAMMA_LUT_PROP_ID) {
+        return Ok(false);
+    }
+    if card.crtc_color(crtc).is_none() {
+        return Err(FsError::InvalidData);
+    }
+    if prop == CRTC_CTM_PROP_ID {
+        change.ctm = Some(blob_value(card, value, Some(CTM_BLOB_SIZE), None)?);
+        return Ok(true);
+    }
+    let id = blob_value(card, value, None, Some(COLOR_LUT_ENTRY_SIZE))?;
+    if id != 0 {
+        let entries = card
+            .property_blob(id)
+            .map_or(0, |b| b.len() / COLOR_LUT_ENTRY_SIZE);
+        if entries != GAMMA_LUT_SIZE as usize && entries != crate::drm::card::LEGACY_GAMMA_SIZE {
+            return Err(FsError::InvalidData);
+        }
+    }
+    change.gamma_lut = Some(id);
+    Ok(true)
+}
+
+/// Commit a CRTC's color change: the CRTC reports the new blobs (DRM's
+/// color_mgmt_changed). Returns the native display and the committed CTM
+/// and GAMMA_LUT bytes to program, which the caller requests after
+/// releasing the card lock; None when nothing changed.
+fn apply_crtc_color(
+    card_index: u32,
+    card: &mut crate::drm::card::Card,
+    crtc: u32,
+    change: CrtcColorChange,
+) -> Option<(u8, crate::amdgpu_native_kms::CrtcColorRequest)> {
+    let color = card.crtc_color.iter_mut().find(|c| c.crtc == crtc)?;
+    let before = (color.ctm, color.gamma_lut);
+    if let Some(id) = change.ctm {
+        color.ctm = id;
+    }
+    if let Some(id) = change.gamma_lut {
+        color.gamma_lut = id;
+    }
+    let (ctm, gamma_lut) = (color.ctm, color.gamma_lut);
+    card.collect_blobs();
+    if (ctm, gamma_lut) == before {
+        return None;
+    }
+    let bytes = |id: u32| {
+        (id != 0)
+            .then(|| card.property_blob(id).map(<[u8]>::to_vec))
+            .flatten()
+    };
+    let request = crate::amdgpu_native_kms::CrtcColorRequest {
+        ctm: bytes(ctm),
+        gamma_lut: bytes(gamma_lut),
+    };
+    (crate::drm_registry::driver_name(card_index) == Some("amdgpu"))
+        .then(|| crate::amdgpu_native_kms::crtc_display(crtc))
+        .flatten()
+        .map(|display| (display, request))
+}
+
+/// A connector's Colorspace / HDR_OUTPUT_METADATA values from one request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ConnectorColorChange {
+    colorspace: Option<u32>,
+    hdr_output_metadata: Option<u32>,
+}
+
+/// Decode one connector Colorspace or HDR_OUTPUT_METADATA value into
+/// `change`: EINVAL on a connector without the property, off the enum, or
+/// for a blob of other than `sizeof(struct hdr_output_metadata)` bytes.
+/// Returns false for any other property.
+fn connector_color_property(
+    card: &crate::drm::card::Card,
+    connector: u32,
+    prop: u32,
+    value: u64,
+    change: &mut ConnectorColorChange,
+) -> Result<bool, FsError> {
+    let native = card.native_output(connector);
+    match prop {
+        COLORSPACE_PROP_ID => {
+            if native.and_then(|n| n.colorspace).is_none()
+                || !COLORSPACE_ENUMS.iter().any(|&(v, _)| v == value)
+            {
+                return Err(FsError::InvalidData);
+            }
+            change.colorspace = Some(value as u32);
+        }
+        HDR_OUTPUT_METADATA_PROP_ID => {
+            if native.and_then(|n| n.hdr_output_metadata).is_none() {
+                return Err(FsError::InvalidData);
+            }
+            change.hdr_output_metadata = Some(blob_value(
+                card,
+                value,
+                Some(HDR_OUTPUT_METADATA_SIZE),
+                None,
+            )?);
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// amdgpu_dm_connector_atomic_check for a connector driving CRTC `crtc`
+/// (None: unchecked, as Linux skips a connector without one): new HDR
+/// metadata must build an infoframe (amdgpu_dm_fill_hdr_info_packet,
+/// EINVAL otherwise). On the native card (`native`) the stream must also
+/// be able to signal the result: EINVAL for HDR metadata or a non-default
+/// Colorspace that the connector's lit link cannot carry. Returns whether
+/// the change needs a modeset: a new Colorspace does, and so does entering
+/// or leaving HDR (metadata appearing or disappearing); changing the
+/// metadata while it is set does not.
+fn connector_color_check(
+    card: &crate::drm::card::Card,
+    native_card: bool,
+    connector: u32,
+    crtc: Option<u32>,
+    change: ConnectorColorChange,
+) -> Result<bool, FsError> {
+    let Some(native) = card.native_output(connector) else {
+        return Ok(false);
+    };
+    if crtc.is_none() {
+        return Ok(false);
+    }
+    let mut modeset = change
+        .colorspace
+        .is_some_and(|v| Some(v) != native.colorspace);
+    if let Some(new) = change.hdr_output_metadata {
+        let old = native.hdr_output_metadata.unwrap_or(0);
+        let bytes = |id: u32| (id != 0).then(|| card.property_blob(id)).flatten();
+        // drm_connector_atomic_hdr_metadata_equal compares the bytes.
+        if bytes(old) != bytes(new) {
+            if let Some(data) = bytes(new) {
+                if !crate::amdgpu_native_kms::hdr_metadata_valid(data) {
+                    return Err(FsError::InvalidData);
+                }
+            }
+            modeset |= old == 0 || new == 0;
+        }
+    }
+    let colorspace = change.colorspace.or(native.colorspace).unwrap_or(0);
+    let hdr = change
+        .hdr_output_metadata
+        .or(native.hdr_output_metadata)
+        .is_some_and(|id| id != 0);
+    if native_card
+        && !crate::amdgpu_native_kms::connector_color_supported(connector, colorspace, hdr)
+    {
+        return Err(FsError::InvalidData);
+    }
+    Ok(modeset)
+}
+
+/// Commit a connector's Colorspace / HDR_OUTPUT_METADATA: the connector
+/// reports them. Returns what the native display owner must apply, which
+/// the caller requests after releasing the card lock.
+fn apply_connector_color(
+    card_index: u32,
+    card: &mut crate::drm::card::Card,
+    connector: u32,
+    change: ConnectorColorChange,
+) -> Option<crate::amdgpu_native_kms::ConnectorColorRequest> {
+    let native = card.native.iter_mut().find(|n| n.connector == connector)?;
+    let before = (native.colorspace, native.hdr_output_metadata);
+    if let Some(v) = change.colorspace {
+        native.colorspace = Some(v);
+    }
+    if let Some(id) = change.hdr_output_metadata {
+        native.hdr_output_metadata = Some(id);
+    }
+    let after = (native.colorspace, native.hdr_output_metadata);
+    card.collect_blobs();
+    if after == before || crate::drm_registry::driver_name(card_index) != Some("amdgpu") {
+        return None;
+    }
+    let hdr = after
+        .1
+        .filter(|&id| id != 0)
+        .and_then(|id| card.property_blob(id))
+        .map(<[u8]>::to_vec);
+    Some(crate::amdgpu_native_kms::ConnectorColorRequest {
+        connector,
+        colorspace: after.0.unwrap_or(0),
+        hdr_output_metadata: hdr,
+    })
 }
 
 /// A CRTC's "VRR_ENABLED" value, when the CRTC has the property.
@@ -3421,6 +3719,16 @@ fn handle_set_property(
     if obj_type == DRM_MODE_OBJECT_CRTC {
         let mut card = mode_state.lock();
         card.crtc(obj_id).map_err(|_| FsError::NotFound)?;
+        // set_property_atomic: a one-property commit (no modeset needed).
+        let mut color = CrtcColorChange::default();
+        if crtc_color_property(&card, obj_id, prop_id, value, &mut color)? {
+            let request = apply_crtc_color(card_index, &mut card, obj_id, color);
+            drop(card);
+            if let Some((display, request)) = request {
+                crate::amdgpu_native_kms::request_crtc_color(display, request);
+            }
+            return Ok(0);
+        }
         if prop_id != CRTC_VRR_ENABLED_PROP_ID {
             return Err(FsError::InvalidData);
         }
@@ -3436,12 +3744,129 @@ fn handle_set_property(
         return Err(FsError::InvalidData);
     }
     let mut card = mode_state.lock();
-    card.connector(obj_id).map_err(|_| FsError::NotFound)?;
+    let crtc = card
+        .connector(obj_id)
+        .map_err(|_| FsError::NotFound)?
+        .encoder_id
+        .and_then(|id| card.encoder(id).ok())
+        .and_then(|encoder| encoder.crtc_id);
+    let mut color = ConnectorColorChange::default();
+    if connector_color_property(&card, obj_id, prop_id, value, &mut color)? {
+        // set_property_atomic never allows a modeset: a Colorspace change
+        // or entering/leaving HDR on a driven connector is EINVAL.
+        let native = crate::drm_registry::driver_name(card_index) == Some("amdgpu");
+        if connector_color_check(&card, native, obj_id, crtc, color)? {
+            return Err(FsError::InvalidData);
+        }
+        let request = apply_connector_color(card_index, &mut card, obj_id, color);
+        drop(card);
+        if let Some(request) = request {
+            crate::amdgpu_native_kms::request_connector_color(request);
+        }
+        return Ok(0);
+    }
     if prop_id != BROADCAST_RGB_PROP_ID {
         return Err(FsError::InvalidData);
     }
     let value = broadcast_rgb_value(&card, obj_id, value)?;
     apply_broadcast_rgb(card_index, &mut card, obj_id, value);
+    Ok(0)
+}
+
+/// DRM_IOCTL_MODE_SETGAMMA (`set`) and DRM_IOCTL_MODE_GETGAMMA on
+/// `struct drm_mode_crtc_lut { u32 crtc_id; u32 gamma_size; u64 red, green,
+/// blue; }`. Neither is a render-node ioctl and SETGAMMA is DRM_MASTER
+/// (EACCES); an unknown CRTC is ENOENT and a gamma_size other than the
+/// CRTC's EINVAL. SETGAMMA copies the ramps into the CRTC's gamma store,
+/// then commits them as drm_crtc_legacy_gamma_set does: a 256-entry
+/// GAMMA_LUT with the CTM reset (amdgpu_dm then programs the sRGB-based
+/// legacy regamma). GETGAMMA returns the gamma store.
+fn handle_gamma(
+    card_index: u32,
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    arg: usize,
+    ctx: &DrmFileCtx,
+    set: bool,
+) -> Result<u64, FsError> {
+    // A card without color management keeps its unconditional no-op.
+    if set && mode_state.lock().crtc_color.is_empty() {
+        return Ok(0);
+    }
+    if ctx.is_render_client() || set && !ctx.is_master {
+        return Err(FsError::PermissionDenied);
+    }
+    // SAFETY: `arg` is the fixed 32-byte ioctl structure.
+    let bytes = unsafe { copy_in(arg, 32)? };
+    let crtc_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    let size = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let ptr = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize;
+    let (red, green, blue) = (ptr(8), ptr(16), ptr(24));
+    let card = mode_state.lock();
+    card.crtc(crtc_id).map_err(|_| FsError::NotFound)?;
+    let Some(color) = card.crtc_color(crtc_id) else {
+        // drm_crtc_supports_legacy_gamma is false (gamma_size 0).
+        return if set {
+            Err(FsError::NotImplemented) // ENOSYS
+        } else if size == 0 {
+            Ok(0)
+        } else {
+            Err(FsError::InvalidData)
+        };
+    };
+    if size != crate::drm::card::LEGACY_GAMMA_SIZE {
+        return Err(FsError::InvalidData);
+    }
+    if !set {
+        let store = color.gamma_store.clone();
+        drop(card);
+        for (k, at) in [red, green, blue].into_iter().enumerate() {
+            let ramp: Vec<u8> = store[k * size..(k + 1) * size]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            // SAFETY: a user array of gamma_size u16s; copy_out faults cleanly.
+            unsafe { copy_out(at, &ramp)? };
+        }
+        return Ok(0);
+    }
+    drop(card);
+    let mut store = Vec::with_capacity(3 * size);
+    for at in [red, green, blue] {
+        // SAFETY: a user array of gamma_size u16s; copy_in faults cleanly.
+        let ramp = unsafe { copy_in(at, 2 * size)? };
+        store.extend(
+            ramp.chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]])),
+        );
+    }
+    let mut card = mode_state.lock();
+    // The CRTC may have gone while the card lock was released.
+    if card.crtc_color(crtc_id).is_none() {
+        return Err(FsError::NotFound);
+    }
+    let mut lut = Vec::with_capacity(size * COLOR_LUT_ENTRY_SIZE);
+    for i in 0..size {
+        for v in [store[i], store[size + i], store[2 * size + i], 0] {
+            lut.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    let blob = card
+        .create_property_blob(lut)
+        .map_err(|_| FsError::OutOfMemory)?;
+    if let Some(c) = card.crtc_color.iter_mut().find(|c| c.crtc == crtc_id) {
+        c.gamma_store = store;
+    }
+    let change = CrtcColorChange {
+        ctm: Some(0),
+        gamma_lut: Some(blob),
+    };
+    let request = apply_crtc_color(card_index, &mut card, crtc_id, change);
+    // drm_property_blob_put: only the committed GAMMA_LUT holds it now.
+    card.destroy_property_blob(blob);
+    drop(card);
+    if let Some((display, request)) = request {
+        crate::amdgpu_native_kms::request_crtc_color(display, request);
+    }
     Ok(0)
 }
 
@@ -3463,10 +3888,20 @@ fn handle_getpropblob(
     let user_len = u32::from_le_bytes(out[4..8].try_into().unwrap());
     let data_ptr = u64::from_le_bytes(out[8..16].try_into().unwrap());
 
-    let connector_id = connector_id_from_edid_blob(blob_id).ok_or(FsError::InvalidData)?;
+    // A userspace blob (MODE_ID, CTM, GAMMA_LUT, HDR_OUTPUT_METADATA), or a
+    // connector's EDID.
     let edid = {
         let card = mode_state.lock();
-        connector_edid(&card, connector_id).ok_or(FsError::InvalidData)?
+        match card.property_blob(blob_id) {
+            Some(data) => data.to_vec(),
+            None => {
+                let connector_id =
+                    connector_id_from_edid_blob(blob_id).ok_or(FsError::InvalidData)?;
+                connector_edid(&card, connector_id)
+                    .ok_or(FsError::InvalidData)?
+                    .to_vec()
+            }
+        }
     };
 
     // Second pass: copy the bytes out when the caller sized its buffer.
@@ -3570,6 +4005,18 @@ fn handle_obj_getproperties(
             if let Some(vrr) = crtc_vrr_enabled(&card, obj_id) {
                 props.push(CRTC_VRR_ENABLED_PROP_ID);
                 values.push(u64::from(vrr));
+            }
+            if let Some(color) = card.crtc_color(obj_id) {
+                props.extend([
+                    CRTC_CTM_PROP_ID,
+                    CRTC_GAMMA_LUT_PROP_ID,
+                    CRTC_GAMMA_LUT_SIZE_PROP_ID,
+                ]);
+                values.extend([
+                    u64::from(color.ctm),
+                    u64::from(color.gamma_lut),
+                    GAMMA_LUT_SIZE,
+                ]);
             }
             (props, values)
         } else if obj_type == DRM_MODE_OBJECT_CONNECTOR {
@@ -3903,6 +4350,9 @@ fn handle_atomic(
     let mut prop_index = 0usize;
     // Native VRR changes, requested once the card lock is released.
     let mut vrr_requests: Vec<(u8, bool)> = Vec::new();
+    // Native CRTC color and connector Colorspace/HDR changes, likewise.
+    let mut color_requests: Vec<(u8, crate::amdgpu_native_kms::CrtcColorRequest)> = Vec::new();
+    let mut connector_requests: Vec<crate::amdgpu_native_kms::ConnectorColorRequest> = Vec::new();
     let presentation = {
         let mut card = mode_state.lock();
         // Linux's atomic state grows implicitly while properties are decoded:
@@ -3921,6 +4371,10 @@ fn handle_atomic(
         let mut broadcast_rgb: Vec<(u32, u8)> = Vec::new();
         // CRTC "VRR_ENABLED" values, likewise.
         let mut vrr_enabled: Vec<(u32, bool)> = Vec::new();
+        // CRTC CTM/GAMMA_LUT and connector Colorspace/HDR_OUTPUT_METADATA
+        // values, likewise.
+        let mut crtc_colors: Vec<(u32, CrtcColorChange)> = Vec::new();
+        let mut connector_colors: Vec<(u32, ConnectorColorChange)> = Vec::new();
         for (object_index, object_id) in objects.iter().copied().enumerate() {
             let object_prop_count = prop_counts[object_index] as usize;
             let end = prop_index
@@ -4008,8 +4462,10 @@ fn handle_atomic(
                     mode: old_mode,
                     ..Default::default()
                 };
+                let mut color = CrtcColorChange::default();
                 for (&prop, &value) in object_props.iter().zip(object_values) {
                     match prop {
+                        p if crtc_color_property(&card, object_id, p, value, &mut color)? => {}
                         CRTC_ACTIVE_PROP_ID => {
                             if value > 1 {
                                 return Err(FsError::InvalidData);
@@ -4069,6 +4525,12 @@ fn handle_atomic(
                         _ => return Err(FsError::InvalidData),
                     }
                 }
+                // Not a modeset: amdgpu_dm updates the stream's transfer
+                // function and gamut remap in place.
+                if color != CrtcColorChange::default() {
+                    crtc_colors.retain(|(id, _)| *id != object_id);
+                    crtc_colors.push((object_id, color));
+                }
                 // Linux's drm_atomic_helper_check_modeset compares the
                 // completed old/new CRTC states; merely including MODE_ID or
                 // ACTIVE in an atomic request does not require ALLOW_MODESET.
@@ -4099,8 +4561,10 @@ fn handle_atomic(
                         crtc_ids.push(crtc_id);
                     }
                 }
+                let mut color = ConnectorColorChange::default();
                 for (&prop, &value) in object_props.iter().zip(object_values) {
                     match prop {
+                        p if connector_color_property(&card, object_id, p, value, &mut color)? => {}
                         CONNECTOR_CRTC_ID_PROP_ID => {
                             connector_state.crtc_id = (value != 0).then_some(value as u32)
                         }
@@ -4108,6 +4572,24 @@ fn handle_atomic(
                             .push((object_id, broadcast_rgb_value(&card, object_id, value)?)),
                         _ => return Err(FsError::InvalidData),
                     }
+                }
+                // amdgpu_dm_connector_atomic_check against the CRTC the
+                // connector drives after this request: a Colorspace change or
+                // entering/leaving HDR is a modeset of that CRTC.
+                if color != ConnectorColorChange::default() {
+                    let native = crate::drm_registry::driver_name(card_index) == Some("amdgpu");
+                    if connector_color_check(
+                        &card,
+                        native,
+                        object_id,
+                        connector_state.crtc_id,
+                        color,
+                    )? && !state.allow_modeset
+                    {
+                        return Err(FsError::InvalidData);
+                    }
+                    connector_colors.retain(|(id, _)| *id != object_id);
+                    connector_colors.push((object_id, color));
                 }
                 if let (Some(crtc_ids), Some(crtc_id)) =
                     (event_crtc_ids.as_mut(), connector_state.crtc_id)
@@ -4211,6 +4693,18 @@ fn handle_atomic(
             for &(crtc, value) in &vrr_enabled {
                 if let Some(request) = apply_vrr_enabled(card_index, &mut card, crtc, value) {
                     vrr_requests.push(request);
+                }
+            }
+            for &(crtc, change) in &crtc_colors {
+                if let Some(request) = apply_crtc_color(card_index, &mut card, crtc, change) {
+                    color_requests.push(request);
+                }
+            }
+            for &(connector, change) in &connector_colors {
+                if let Some(request) =
+                    apply_connector_color(card_index, &mut card, connector, change)
+                {
+                    connector_requests.push(request);
                 }
             }
             let amdgpu = crate::drm_registry::driver_name(card_index) == Some("amdgpu");
@@ -4345,6 +4839,12 @@ fn handle_atomic(
     };
     for (display, enabled) in vrr_requests {
         crate::amdgpu_native_kms::request_vrr_enabled(display, enabled);
+    }
+    for (display, request) in color_requests {
+        crate::amdgpu_native_kms::request_crtc_color(display, request);
+    }
+    for request in connector_requests {
+        crate::amdgpu_native_kms::request_connector_color(request);
     }
 
     let (log, n) = should_log(&ATOMIC_N);
