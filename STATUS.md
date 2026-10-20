@@ -845,6 +845,18 @@ arithmetic) and only then unblanked; teardown blanks, removes the payload and
 stops the stream. Its LPCM rides the stream's HPO APG once the payload
 completed (implementation and register models; no hardware run).
 
+Navi48 DP SST DSC now also runs over 128b/132b: a mode no uncompressed link
+carries is compressed for the sink's maximum (UHBR) link as amdgpu_dm's
+policy does (8K60 and 4K240 at 16 bpp on 4 x UHBR10, configurations matched
+against Linux's dc_dsc_compute_config on the host), lights on the lowest
+128b/132b setting its compressed bandwidth needs, and wide streams use two
+DSCs under ODM 2:1. The HPO stream marks the format compressed, enables sink
+decoding and sends the PPS through its VPG (GSP11, VBID[6]) before a VC
+payload sized for the compressed bandwidth; fallback keeps the PPS. DML21
+plans match Linux with DP2P0 encoders. UHBR DSC carries no audio, MST DSC
+stays unsupported, and HDMI FRL DSC remains open (EDID DSC caps, compressed
+FRL capacity, CVTEM PPS). Implementation and register models; no hardware run.
+
 Native 8b/10b DP MST now reaches the platform display monitor and KMS for one
 branch, beside every board port: KMS routes any connector (board port or end
 device) to any of the four CRTCs, as SETCRTC/atomic CRTC_ID set it or

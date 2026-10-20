@@ -1294,6 +1294,52 @@ setting that trained, else one RBR lane, as the port's `VerifiedLink`
 (`apply_verified_links`), so `dp_caps`, selection, offered modes and DSC
 (`dp_dsc`/`refine_dsc`) use the verified link and no 128b/132b; another sink,
 a changed EDID/DPCD, a nonresponding or empty port drops it.
+
+DSC follows amdgpu_dm's SST policy for a dongle-less DP sink on either
+encoding. `dp_dsc(timing, caps, max_dispclk_khz)` runs only when no
+uncompressed setting (`dp_link`) carries the mode, and compresses with
+`dc_dsc_compute_config` against `dc_link_bandwidth_kbps` at the sink's
+maximum link: 4 lanes x the best UHBR rate (`uhbr_kbps`, 128b/132b
+encoding, FEC inherent, no FEC cap needed) when `DpCaps::uhbr` is nonzero,
+else the maximum 8b/10b link with FEC (FEC cap required). Its result must fit
+the pipes admission gives it (`dml::dsc_pipes(timing, slices,
+dispclk_max_khz)`: DecideODMMode less downspread, ODM 2:1 at most), each DSC
+taking at most four slices of at most 5184 pixels, so 8K takes two DSCs.
+`dsc_link(timing, cfg, caps)` is the link for the compressed bandwidth
+(`dc_dsc_stream_bandwidth_in_kbps`, unpadded): the maximum 8b/10b link with
+FEC when it carries it, else the first 128b/132b setting upward, lanes before
+rate. A UHBR sink therefore never compresses onto 8b/10b (16 bpp is two
+thirds of 24 bpp, and 8b/10b with FEC carries less than two thirds of UHBR10
+at any lane count), and uncompressed UHBR always wins over DSC. `refine_dsc`
+redoes both with the board's DISPCLK. A compressed UHBR stream carries no
+audio. Fallback keeps the admitted PPS (`selected_dp_candidates`): Linux's
+`dp_lt_fallbacks` through its 128b/132b settings that carry the compressed
+stream for a UHBR link, narf's 8b/10b ladder for an 8b/10b one. DML21
+admission takes the same inputs on both encoders: Linux plans every DSC
+vector identically with `dml2_dp2p0` (check.sh replays `dsc_vectors.txt` and
+`odm_dsc_vectors.txt` with `DP2P0=1`; `uhbr_dsc_vectors.txt` holds the
+configurations this policy picks). On the HPO path `otg::Request::dsc` is
+accepted for `Signal::HpoDisplayPort` SST: the pipe's DSC and OPTC compress
+from timing staging (link_set_dsc_on_stream programs nothing more for HPO),
+`DP_SYM32_ENC_VID_PIXEL_FORMAT.PIXEL_ENCODING_TYPE` is set, and after the
+encoder is enabled and mapped `start_uhbr_video` writes DP_DSC_ENABLE 1 (read
+back), then sends the PPS as `dcn31_hpo_dp_stream_enc_set_dsc_pps_info_packet`
+does (GSP11 payload size 3, VPG n+5 generic packets 11-14 with header
+00 10 7F 00 latched immediately, GSP11 line 2, VBID[6] line 3, GSP11 and
+SDP on), before the SST payload, whose slots, VC rate and minimum blank
+width (`uhbr_dsc_payload`) use the compressed bandwidth. `stop_uhbr_video`
+writes DP_DSC_ENABLE 0 (unchecked) and turns GSP11 off with payload size 0
+after the encoder, before the timing; the DSC stays for a restart until the
+timing retires. MST DSC over 128b/132b is refused (`Unsupported`). HDMI FRL
+DSC is not implemented: it needs the EDID HF-VSDB DSC caps
+(`dc_dsc_parse_dsc_edid`), DC's HDMI DSC slice and bpp rules
+(`hdmi_dsc_get_num_slices`/`hdmi_dsc_get_bpp`, native 4:2:2, 7 bpp minimum,
+`frl_dsc_max_frl_rate`), the compressed FRL capacity check
+(`dml1_frl_cap_chk_compressed` and the DSC padding/borrow adjustments of
+`calculate_timing_params_for_dsc_with_padding`/`update_borrow_mode_from_dsc_padding`), and
+`hpo_enc401_hdmi_set_dsc_config` (HDMI_DSC_MODE, the FIFO compressed-format
+bits, zero GCP depth, the CVTEM PPS in generic packets 5-10) after FRL
+training.
 `modeset_display_mode` and `modeset_displays` select, admit and light again
 (at most `VERIFY_ROUNDS`) when the first display reports `LinkReduced`; a later
 display's reduction is returned in `Configuration::failed`, and the monitor
