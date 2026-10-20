@@ -534,6 +534,25 @@ kernel_test_in!(
     dcn401_dml_matches_linux_dml21_odm_dsc_vectors
 );
 
+/// Shared with tests/dcn401_dml21/check.sh (harness_multi.c, DSC, DP2P0).
+const UHBR_DSC_VECTORS: &str = include_str!("../tests/dcn401_dml21/uhbr_dsc_vectors.txt");
+
+/// The DSC streams the UHBR DSC policy picks (8K60 and 4K240 at 16 bpp on
+/// four slices, 4K144 at 243/16 bpp on two), alone and beside each other,
+/// as DC passes them on 128b/132b encoders (dml2_dp2p0): admission takes
+/// the same inputs as on 8b/10b, and Linux plans them identically.
+fn dcn401_dml_matches_linux_dml21_uhbr_dsc_vectors() -> TestResult {
+    match check_vectors(UHBR_DSC_VECTORS, false, true) {
+        Ok((plans, rejects, odm)) if plans >= 20 && rejects >= 3 && odm >= 15 => TestResult::Pass,
+        Ok(_) => TestResult::Fail("UHBR DSC vector file lost coverage"),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_matches_linux_dml21_uhbr_dsc_vectors
+);
+
 /// 4:2:0 lines wider than one formatter buffer, on two pipes.
 fn dcn401_dml_matches_linux_dml21_odm_ycbcr420_vectors() -> TestResult {
     match check_vectors(ODM_YCBCR420_VECTORS, true, false) {

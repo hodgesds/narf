@@ -27,6 +27,12 @@
 # line, every stream compressed so (harness_multi.c with DSC set); "! REJECT"
 # asks only that Linux rejects. --generate-dsc rewrites it from the single-
 # and multi-stream inputs. odm_vectors.txt, odm_dsc_vectors.txt and
+# uhbr_dsc_vectors.txt holds the DSC configurations the native UHBR DSC
+# policy picks (8K60, 4K240, 4K144 and pairs of them), every stream on a
+# 128b/132b encoder (DP2P0=1, dml2_dp2p0 as DC passes an HPO stream);
+# --regenerate-uhbr-dsc answers its inputs again. dsc_vectors.txt and
+# odm_dsc_vectors.txt are replayed with DP2P0=1 too: the port's plan does
+# not depend on the DP encoder.
 # odm_ycbcr420_vectors.txt are checked as multi_vectors.txt, dsc_vectors.txt
 # and ycbcr420_vectors.txt; their streams need ODM 2:1 on most boards.
 set -euo pipefail
@@ -34,6 +40,9 @@ here=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 generate_dsc=0
 if [ "${1:-}" = --generate-dsc ]; then
 	generate_dsc=1
+	shift
+elif [ "${1:-}" = --regenerate-uhbr-dsc ]; then
+	generate_dsc=2
 	shift
 fi
 linux=${1:-/usr/src/linux}
@@ -62,20 +71,12 @@ cc -O1 -w "${inc[@]}" "$here/harness.c" "$work/obj/dml2_core_dcn4_calcs.o" $othe
 cc -O1 -w "${inc[@]}" "$here/harness.c" "$work/strict_calcs.o" $others -lm -o "$work/strict"
 cc -O1 -w "${inc[@]}" "$here/harness_multi.c" "$work/strict_calcs.o" $others -lm -o "$work/strict_multi"
 
-if [ $generate_dsc -eq 1 ]; then
-	echo "# Linux DML21 reference vectors for amdgpu_dcn401_dml.rs with DSC; see check.sh."
-	# Every single- and multi-stream input, as multi-stream lines, with a
-	# cycle of slice counts (including counts one DSC cannot take) and
-	# compressed bpps.
-	{
-		grep -v '^#' "$here/vectors.txt" | awk '{
-			printf "%s %s %s %s %s %s %s %s %s 1", $10, $11, $12, $13, $14, $15, $16, $17, $18
-			printf " %s %s %s %s %s %s %s %s %s %s\n", $1, $2, $3, $4, $5, $6, $7, $8, $9, $19 }'
-		grep -v '^#' "$here/multi_vectors.txt" | sed 's/ [=!].*//'
-	} | awk 'BEGIN { split("1 2 4 3 8 1 2 4", sl); split("128 192 256 160 96 200 144 120 240", bpp) }
-		{ print sl[NR % 8 + 1], bpp[NR % 9 + 1], $0 }' | while read -r sl bp line; do
+# dsc_lines [env...]: classify "<slices> <bpp_x16> <multi-stream inputs>"
+# lines from stdin with Linux (harness_multi.c, DSC, the given environment).
+dsc_lines() {
+	while read -r sl bp line; do
 		read -ra a <<< "$line"
-		out=$(DSC="$sl $bp" "$work/strict_multi" "${a[@]:0:9}" "${a[@]:10}")
+		out=$(env DSC="$sl $bp" "$@" "$work/strict_multi" "${a[@]:0:9}" "${a[@]:10}")
 		# A plan whose DLG/TTU/watermark value overflows its register field
 		# (Linux only asserts) is the port's Register rejection; a second
 		# ODM pipe's blank end ("/2 <end>") has the blank end's field.
@@ -98,6 +99,30 @@ if [ $generate_dsc -eq 1 ]; then
 			echo "$sl $bp $line ! REJECT"
 		fi
 	done
+}
+if [ $generate_dsc -eq 1 ]; then
+	echo "# Linux DML21 reference vectors for amdgpu_dcn401_dml.rs with DSC; see check.sh."
+	# Every single- and multi-stream input, as multi-stream lines, with a
+	# cycle of slice counts (including counts one DSC cannot take) and
+	# compressed bpps.
+	{
+		grep -v '^#' "$here/vectors.txt" | awk '{
+			printf "%s %s %s %s %s %s %s %s %s 1", $10, $11, $12, $13, $14, $15, $16, $17, $18
+			printf " %s %s %s %s %s %s %s %s %s %s\n", $1, $2, $3, $4, $5, $6, $7, $8, $9, $19 }'
+		grep -v '^#' "$here/multi_vectors.txt" | sed 's/ [=!].*//'
+	} | awk 'BEGIN { split("1 2 4 3 8 1 2 4", sl); split("128 192 256 160 96 200 144 120 240", bpp) }
+		{ print sl[NR % 8 + 1], bpp[NR % 9 + 1], $0 }' | dsc_lines
+	exit 0
+fi
+if [ $generate_dsc -eq 2 ]; then
+	# uhbr_dsc_vectors.txt keeps its comments and inputs; Linux answers
+	# each again with every stream on a 128b/132b (dml2_dp2p0) encoder.
+	while IFS= read -r line; do
+		case $line in
+		''|'#'*) echo "$line" ;;
+		*) echo "${line%% [=!]*}" | dsc_lines DP2P0=1 ;;
+		esac
+	done < "$here/uhbr_dsc_vectors.txt"
 	exit 0
 fi
 
@@ -175,12 +200,14 @@ check_multi() {
 		if [ "${1:-}" = DSC ]; then
 			dsc="${f[0]} ${f[1]}" f=("${f[@]:2}")
 		fi
+		local envs=("${@:2}")
+		[ "${1:-}" = DSC ] || envs=("$@")
 		n=${f[9]} count=$((10 + 10 * f[9]))
 		inputs=("${f[@]:0:count}") kind=${f[count]} rest=("${f[@]:count+1}")
 		if [ -n "$dsc" ]; then
-			strict=$(DSC="$dsc" "$work/strict_multi" "${inputs[@]:0:9}" "${inputs[@]:10}")
+			strict=$(env DSC="$dsc" "${envs[@]}" "$work/strict_multi" "${inputs[@]:0:9}" "${inputs[@]:10}")
 		else
-			strict=$(env "$@" "$work/strict_multi" "${inputs[@]:0:9}" "${inputs[@]:10}")
+			strict=$(env "${envs[@]}" "$work/strict_multi" "${inputs[@]:0:9}" "${inputs[@]:10}")
 		fi
 		ok=1
 		if [ "$kind" = "=" ]; then
@@ -200,7 +227,7 @@ check_multi() {
 			echo "  strict: $strict" >&2
 		fi
 	done < "$file"
-	echo "dcn401 DML21 $(basename "$file" .txt): $pass passed, $fail failed"
+	echo "dcn401 DML21 $(basename "$file" .txt)${envs[*]:+ (${envs[*]})}: $pass passed, $fail failed"
 	[ $fail -eq 0 ]
 }
 mfail=0
@@ -210,4 +237,10 @@ check_multi "$here/dsc_vectors.txt" DSC || mfail=1
 check_multi "$here/odm_vectors.txt" || mfail=1
 check_multi "$here/odm_dsc_vectors.txt" DSC || mfail=1
 check_multi "$here/odm_ycbcr420_vectors.txt" FMT420=1 || mfail=1
+# DC passes a 128b/132b stream as dml2_dp2p0; the port's plans do not depend
+# on the DP encoder (the output link is disabled, the compressed bpp is
+# forced), so the DSC sets must match Linux on HPO outputs unchanged.
+check_multi "$here/dsc_vectors.txt" DSC DP2P0=1 || mfail=1
+check_multi "$here/odm_dsc_vectors.txt" DSC DP2P0=1 || mfail=1
+check_multi "$here/uhbr_dsc_vectors.txt" DSC DP2P0=1 || mfail=1
 [ $fail -eq 0 ] && [ $mfail -eq 0 ]

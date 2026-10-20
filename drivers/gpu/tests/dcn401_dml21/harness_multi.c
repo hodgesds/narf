@@ -8,7 +8,8 @@
  * line (a plane on several ODM pipes followed by them as odm_pipes.h
  * describes), planes separated by " |", or "REJECT". With DSC="<slices> <bpp_x16>"
  * every stream is compressed as DC passes a DSC stream. With FMT420 set in the
- * environment every stream leaves as HDMI YCbCr 4:2:0 instead of DP RGB.
+ * environment every stream leaves as HDMI YCbCr 4:2:0 instead of DP RGB; with
+ * DP2P0 set every DP stream rides a 128b/132b (HPO) encoder (dml2_dp2p0).
  *
  * Original single-stream notes follow.
  *
@@ -123,7 +124,10 @@ int main(int argc, char **argv)
 		t->vblank_nom = a[6] - a[5];
 		t->drr_config.disallowed = true;
 		s->output.output_format = getenv("FMT420") ? dml2_420 : dml2_444;
-		s->output.output_encoder = getenv("FMT420") ? dml2_hdmi : dml2_dp;
+		/* populate_dml21_output_config_from_stream_state: dml2_dp2p0 for a
+		 * stream on an HPO (128b/132b) encoder. */
+		s->output.output_encoder = getenv("FMT420") ? dml2_hdmi :
+			getenv("DP2P0") ? dml2_dp2p0 : dml2_dp;
 		s->output.output_dp_lane_count = 4;
 		s->output.output_disabled = true;
 		/* dml21_translation_helper: a DSC stream's slices and bpp. */
