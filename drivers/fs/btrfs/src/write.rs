@@ -789,6 +789,9 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
     offset: u64,
     data: &[u8],
 ) -> Result<usize, FsError> {
+    if !data.is_empty() {
+        with_space_retry(vol, || fileops::zero_tail_before_write(vol, ino, offset)).await?;
+    }
     with_space_retry(vol, || cow_write_file_once(vol, ino, inode, offset, data)).await
 }
 

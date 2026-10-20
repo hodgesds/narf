@@ -222,3 +222,20 @@ pub fn mkfs(img: &Path, rootdir: &Path, spec: &MkfsSpec) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// The tiny fixture of the `regress` scenario: one file per regression case
+/// (see `regress_script`).
+pub fn populate_regress(dir: &Path, _seed: u64, _scale: usize) {
+    let _ = std::fs::remove_dir_all(dir);
+    let r = dir.join("@/regress");
+    // Compressible, non-zero, size not sector aligned: one zstd extent whose
+    // frame holds exactly 11082 bytes of a 12288-byte extent.
+    let tail: Vec<u8> = (0..11082usize).map(|i| 0xbc + (i / 512) as u8).collect();
+    write(&r.join("zstd-tail"), &tail, 0o644);
+    write(&r.join("inline"), b"twenty-one bytes ....", 0o644);
+    write(&r.join("trunc"), b"%NAME%\npkg395\n%VERSION%\n1.0\n", 0o644);
+    write(&r.join("extend"), &vec![0x5a; 5000], 0o644);
+    write(&r.join("pad"), b"pad\n", 0o644);
+    std::fs::create_dir_all(dir.join("@home/user")).unwrap();
+    write(&dir.join("@home/user/.profile"), b"umask 022\n", 0o644);
+}

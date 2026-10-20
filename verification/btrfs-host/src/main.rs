@@ -40,7 +40,7 @@ USAGE: narf-btrfs-host [OPTIONS]
                     others scale from it; 0 disables the crash pass)
   --exhaustive      crash-test every flush boundary plus two random cuts per
                     flush window (slow)
-  --scenario LIST   comma-separated subset of: root,snapshots,lba4k,gate
+  --scenario LIST   comma-separated subset of: regress,root,snapshots,lba4k,gate
                     (default all)
   --jobs N          concurrent `btrfs check` processes in the crash pass
                     (default 3)
@@ -49,7 +49,10 @@ USAGE: narf-btrfs-host [OPTIONS]
   -v                print the op trace of a failing run
 ";
 
-pub const SCENARIOS: [&str; 4] = ["root", "snapshots", "lba4k", "gate"];
+/// The default selection (`regress` = every `regress-*` case).
+pub const SCENARIOS: [&str; 5] = ["regress", "root", "snapshots", "lba4k", "gate"];
+/// Names `--scenario` also accepts.
+const REGRESS: [&str; 1] = ["regress-zstd-tail"];
 
 #[derive(Clone, Debug)]
 struct Args {
@@ -101,7 +104,7 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     for s in &a.scenarios {
-        if !SCENARIOS.contains(&s.as_str()) {
+        if !SCENARIOS.contains(&s.as_str()) && !REGRESS.contains(&s.as_str()) {
             return Err(format!("unknown scenario {s}"));
         }
     }
@@ -512,6 +515,45 @@ fn run_gate(args: &Args) -> Result<String, String> {
     Ok(format!("gate: OK\n{}", lines.join("\n")))
 }
 
+// Minimal reproductions of the bugs this harness found, each first seen on
+// a random seed (see the driver spec's testing section).
+fn p(n: &str) -> String {
+    format!("regress/{n}")
+}
+
+/// A write past EOF must zero the old last sector's tail even when a
+/// compressed extent backs it (`mkfs --compress` frames end at i_size):
+/// root seed 1, where `btrfs restore` read stale bytes in the gap.
+fn regress_zstd_tail() -> Vec<Op> {
+    vec![Op::WriteAt {
+        sub: 0,
+        path: p("zstd-tail"),
+        off: 30413,
+        len: 100,
+    }]
+}
+
+fn regress(name: &'static str, script: fn() -> Vec<Op>) -> Scenario {
+    Scenario {
+        name,
+        lba: 512,
+        ops: 0,
+        cuts: 1,
+        source: Source::Mkfs {
+            populate: fixture::populate_regress,
+            scale: 1,
+            size: 256 << 20,
+        },
+        params: Params {
+            ops: 0,
+            data_budget: 0,
+            large_file: 0,
+            burst: 0,
+        },
+        script: Some(script),
+    }
+}
+
 fn main() {
     let args = match parse_args() {
         Ok(a) => a,
@@ -523,6 +565,7 @@ fn main() {
     host::init();
     let t0 = Instant::now();
     let scenarios = [
+        regress("regress-zstd-tail", regress_zstd_tail),
         Scenario {
             name: "root",
             lba: 512,
