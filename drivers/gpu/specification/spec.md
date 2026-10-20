@@ -496,8 +496,10 @@ settings. Board information comes from this GPU's running firmware; no
 Navi22 table layout, reference-board replacement or overdrive is used.
 
 After graphics/RLC boot, `configure_power().await` runs DC BTC, installs a
-board-supported mask for GFX DPM and autonomous thermal/fan/electrical
-protection, enables it and verifies the running mask and GFX frequency range.
+board-supported mask for GFX DPM, autonomous thermal/fan/electrical
+protection and BACO (FEATURE_BACO_BIT 19, which runtime PM needs and Linux
+always allows), enables it and verifies the running mask and GFX frequency
+range.
 Boot display/memory/link clocks and automatic gating remain excluded until
 native DCN owns their constraints. The owner publishes `PowerStatus` only
 after the whole sequence succeeds. Each operation is single-attempt; timeout,
@@ -6538,6 +6540,82 @@ fresh owner as recovery does, then restores the widened domains; buffers
 stay in system memory until validation promotes them. The interrupt-gated
 device-PM handler accepts Navi48 only while the async prepare holds it
 (`system_suspended()`). Hardware unvalidated.
+S3 (and runtime) resume start from a clean quiesce (`Mode::Resume`), so
+`restart` drops that owner instead of quarantining it and returns the VRAM
+it published to the driver pool (`amdgpu_vram::Pool::reclaim_retired`:
+a dropped published reservation is retired, still excluded, until a
+resume post proves no hardware can reach it). Recovery (`Mode::Recovery`)
+keeps quarantining. The S3 prepare holds a runtime-PM reference and
+resumes a runtime-suspended card first (device_prepare/device_complete).
+
+Runtime PM (`amdgpu_navi48_runtime_pm`, on `narf_power::runtime_pm` and
+its PCI layer) follows amdgpu_drv.c:
+
+```rust
+pub enum Mode { None, Px, Boco, Baco, Bamaco }            // AMDGPU_RUNPM_*
+pub struct Platform { pub external: bool, pub px: bool, pub boco: bool, pub passthrough: bool }
+pub fn detect_mode(runpm: i32, support: u8, platform: Platform) -> Mode;
+pub fn describe(runpm: i32, support: u8, mode: Mode, platform: Platform) -> &'static str;
+pub fn parse_runpm(value: Option<&str>) -> i32;           // amdgpu.runpm, default -1
+pub fn check_display(runpm: i32, lit: u8, connected: bool) -> Result<(), RpmError>;
+pub fn baco_path(mode: Mode, audio_present: bool, audio_bound: bool) -> platform::Baco;
+pub enum Audio { Absent, Unbound, Bound { d3: bool } }
+pub unsafe async fn register(runpm: i32, console_on_gpu: bool) -> Option<Mode>;
+pub async fn ioctl_enter(card: u32) -> Result<Option<RpmActiveRef>, FsError>;
+pub fn on_open(card: u32);
+pub fn displays_changed(lit: u8, connected: bool) -> DisplayDelta;
+pub fn apply_display_refs(delta: DisplayDelta);
+pub async fn system_prepare(); pub fn system_complete();
+pub async fn access() -> Result<Option<RpmActiveRef>, boot::Error>;
+pub fn device() -> Option<Arc<RuntimePmDevice>>; pub fn mode() -> Option<Mode>;
+
+// amdgpu_navi48_platform
+pub struct Baco { pub bamaco: bool, pub armd3: bool }
+pub unsafe async fn runtime_suspend(baco: Baco) -> Result<(), boot::Error>;
+pub unsafe async fn runtime_resume() -> Result<boot::Report, boot::Error>;
+pub async fn bamaco_support() -> u8;
+// amdgpu_smu_navi48::Smu
+pub fn bamaco_support(&self) -> u8;                        // BACO_SUPPORT | MACO_SUPPORT
+pub unsafe async fn baco_enter(&mut self, bamaco: bool, armd3: bool) -> Result<(), Error>;
+pub unsafe async fn baco_exit(&mut self, armd3: bool) -> Result<bool, Error>;
+// amdgpu_reset_navi22::Reset
+pub unsafe fn clear_post_scratch(&mut self) -> Result<(), Error>;
+```
+
+`register` (fb boot handoff, after `register_system_pm`) runs
+`amdgpu_device_detect_runtime_pm_mode` with `amdgpu.runpm` (-1/-2 auto,
+0 off, 1 BACO, 2 BAMACO) and `amdgpu_device_supports_baco`
+(smu_v14_0_get_bamaco_support: board platform_caps BACO/MACO, and PMFW's
+BACO feature, now allowed at boot). NARF evaluates no AML, so neither PX
+(ATPX) nor BOCO (`_PR3`) is available and auto selects BAMACO on a board
+with MACO circuitry, else BACO. The PCI function is registered as probe
+leaves it, with a 5000 ms autosuspend, `allow` and `put_autosuspend`.
+References: every DRM ioctl on the card and render node
+(amdgpu_drm_ioctl), an open queues a resume (devfs lookup is synchronous),
+each lit CRTC (amdgpu_dm's commit tail, from `publish_outputs`), hwmon
+power-cap and performance-level writes (amdgpu_pm_get_access), the S3
+transition, and permanently a kernel console that draws into this GPU's
+VRAM (boot framebuffer on the card or `amdgpu.native_display`) — the lit
+fbcon display that keeps Linux's dGPU awake. The idle/suspend check refuses
+while a CRTC is lit and, unless `runpm=-2`, while a sink is connected
+(published by the display monitor, else scanned at suspend). Suspend
+drains the rings (bounded at 10 s, else `Busy`), evicts client VRAM and
+quiesces as S3 without pausing the console, saves PCI state, then
+smu_v14_0_2_baco_enter: with the audio function enabled or absent
+(smu_cmn_is_audio_func_enabled: a bound driver) ArmD3(BAMACO when the
+board has MACO, else BACO) and PMFW powers down when the PCI layer writes
+D3hot; otherwise EnterBaco(BACO_SEQ_BAMACO or BACO) and 10 ms. A bound
+audio function that is not in D3 refuses (`Busy`): PMFW would keep the card
+up and NARF cannot resume a card whose SOS survived without a reset. A
+refused BACO entry restarts the card through the resume post and is a
+sticky runtime-PM error. Resume (after the PCI layer's D0 and header
+restore): ExitBaco plus BIOS_SCRATCH_6/7 = 0, or 10 ms and ArmD3(ULPS),
+then the S3 restart: PCI restore, post as need_post decides, GDDR6
+training replay and a fresh owner that skips the SMC load while PMFW stayed
+resident (psp_load_smu_fw's in_runpm skip; a mode1 resume reloads it). VRAM
+contents follow Linux: client buffers were evicted to system memory and
+kernel owners are rebuilt. A failed resume loses the device; later ioctls
+fail. Hardware unvalidated.
 A finished GDDR6 trainer (`Ready`, `ResidentSos` or `Disabled`) moves to
 the new owner, which replays it before SOS with `Trainer::resume`
 (psp_v14_0_memory_training(PSP_MEM_TRAIN_RESUME): restore the cache to C2P

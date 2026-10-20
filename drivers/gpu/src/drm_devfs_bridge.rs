@@ -176,6 +176,9 @@ impl DriCardFile {
         if let Some(ms) = crate::drm_registry::mode_state(index) {
             ms.lock().master_open(open_id);
         }
+        // amdgpu_driver_open_kms: runtime-resume the card (queued; devfs
+        // lookup is synchronous and the first ioctl waits for it).
+        crate::amdgpu_navi48_runtime_pm::on_open(index);
         Some(DriCardFile {
             index,
             open_id,
@@ -498,6 +501,8 @@ impl FileOps for DriCardFile {
         context: &'a dyn narf_filesystem::IoctlContext,
     ) -> FsFuture<'a, u64> {
         Box::pin(async move {
+            // amdgpu_drm_ioctl: pm_runtime_get_sync … put_autosuspend.
+            let _rpm = crate::amdgpu_navi48_runtime_pm::ioctl_enter(self.index).await?;
             if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu")
                 && crate::drm_ioctl_bridge::is_virtgpu_wait_ioctl(cmd)
             {
@@ -1320,6 +1325,8 @@ impl FileOps for DriRenderFile {
         context: &'a dyn narf_filesystem::IoctlContext,
     ) -> FsFuture<'a, u64> {
         Box::pin(async move {
+            // amdgpu_drm_ioctl: pm_runtime_get_sync … put_autosuspend.
+            let _rpm = crate::amdgpu_navi48_runtime_pm::ioctl_enter(self.index).await?;
             // DRM syncobjs from a user open: fd export/import and waits
             // that park this syscall. amdgpu has timelines, virtio-gpu not.
             let driver = crate::drm_registry::driver_name(self.index);
@@ -1496,6 +1503,7 @@ impl DirOps for DriDir {
                     let idx = render_idx - 128;
                     if (idx as usize) < crate::drm_registry::count() {
                         let metadata = crate::drm_registry::node_metadata(idx, true)?;
+                        crate::amdgpu_navi48_runtime_pm::on_open(idx);
                         return Some(Arc::new(DriRenderFile {
                             index: idx,
                             metadata,

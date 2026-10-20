@@ -191,6 +191,9 @@ struct Hardware {
     /// The trainer finished before an ASIC reset; replay its cache
     /// (PSP_MEM_TRAIN_RESUME) instead of cold training.
     training_resume: bool,
+    /// Runtime resume from BACO: PMFW kept running, so PSP must not load
+    /// SMU firmware again (psp_load_smu_fw's in_runpm BACO/BAMACO skip).
+    smu_resident: bool,
     sos: Option<sos::Bootloader>,
     psp: Option<psp::Psp>,
     smu: Option<smu::Smu>,
@@ -269,6 +272,13 @@ impl Backend for Hardware {
                 .setup_tmr_navi48(&self.firmware.sos)
                 .await
                 .map_err(Error::Psp)?,
+            Stage::Smc if self.smu_resident => {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: navi48 SMU firmware resident across BACO; not reloaded"
+                );
+            }
             Stage::Smc => self
                 .psp
                 .as_mut()
@@ -484,6 +494,9 @@ impl Backend for Hardware {
 pub struct ColdBoot {
     sequence: alloc::boxed::Box<Sequence<Hardware>>,
     reset: Option<crate::amdgpu_reset_navi22::Reset>,
+    /// PMFW acknowledged the BACO exit of a runtime resume: SMU firmware
+    /// stayed resident (psp_load_smu_fw skips it for BACO runpm).
+    baco_exited: bool,
     display: Result<display::Probe, display::Error>,
     ddc: Result<ddc::Ddc, display::Error>,
     crystal: Result<u32, display::Error>,
@@ -657,6 +670,7 @@ impl ColdBoot {
             client_heap: None,
             unmapped_vram: unmapped,
             reset: None,
+            baco_exited: false,
             sequence: alloc::boxed::Box::new(Sequence {
                 backend: Hardware {
                     gpu: saved,
@@ -667,6 +681,7 @@ impl ColdBoot {
                     dmub,
                     trainer,
                     training_resume: false,
+                    smu_resident: false,
                     sos: None,
                     psp: None,
                     smu: None,
@@ -774,12 +789,11 @@ impl ColdBoot {
     /// reservations stay quarantined; the client heap's allocator is reused
     /// so live allocations cannot overlap the new owner's reservations.
     pub(crate) unsafe fn after_reset(&mut self) -> Result<Self, Error> {
-        if !matches!(
-            self.reset.as_ref().map(|r| r.state()),
-            Some(crate::amdgpu_reset_navi22::State::Complete(_))
-        ) {
+        let Some(crate::amdgpu_reset_navi22::State::Complete(report)) =
+            self.reset.as_ref().map(|r| r.state())
+        else {
             return Err(Error::Busy);
-        }
+        };
         let hw = &self.sequence.backend;
         let registry: Cap<narf_firmware::FirmwareRegistry, Read> =
             narf_firmware::trusted_loader_authority()
@@ -810,7 +824,73 @@ impl ColdBoot {
             new.sequence.backend.training_resume = true;
         }
         new.client_vram = self.client_vram.take();
+        // Only a BACO exit that needed no reset keeps PMFW resident; a
+        // mode1 on resume (SOS survived) reloads it as recovery does.
+        new.sequence.backend.smu_resident =
+            self.baco_exited && report.method == crate::amdgpu_reset_navi22::Method::PowerCycle;
         Ok(new)
+    }
+    /// Why the prepared reset runs (S3/runtime resume or recovery).
+    pub(crate) fn reset_mode(&self) -> Option<crate::amdgpu_reset_navi22::Mode> {
+        self.reset.as_ref().map(|r| r.mode())
+    }
+    /// Return the VRAM of dropped, published reservations to the pool.
+    ///
+    /// # Safety
+    /// As `amdgpu_vram::Pool::reclaim_retired`: every owner that published
+    /// a retired range was quiesced and dropped before a completed resume
+    /// post (power cycle or mode1) of this GPU.
+    pub(crate) unsafe fn reclaim_retired_vram(&self) -> u64 {
+        // SAFETY: forwarded contract.
+        unsafe { self.sequence.backend.pool.reclaim_retired() }
+    }
+    /// This GPU's PCI function and its device authority.
+    pub(crate) fn pci_function(&self) -> (narf_bus::BusDevice, Cap<BusDeviceCap, Write>) {
+        (self.sequence.backend.pci, self.sequence.backend.authority)
+    }
+    /// `amdgpu_device_supports_baco` for this owner's PMFW and board.
+    pub(crate) fn bamaco_support(&self) -> u8 {
+        self.sequence
+            .backend
+            .smu
+            .as_ref()
+            .map_or(0, smu::Smu::bamaco_support)
+    }
+    /// `amdgpu_device_baco_enter` (no RAS doorbell interrupt on NBIF 6.3.1).
+    ///
+    /// # Safety
+    /// After `prepare_suspend` + `save_for_suspend` on this quiesced owner;
+    /// see `Smu::baco_enter`.
+    pub(crate) async unsafe fn enter_baco(
+        &mut self,
+        bamaco: bool,
+        armd3: bool,
+    ) -> Result<(), Error> {
+        if self.reset.as_ref().map(|r| r.mode()) != Some(crate::amdgpu_reset_navi22::Mode::Resume) {
+            return Err(Error::Busy);
+        }
+        let smu = self.sequence.backend.smu.as_mut().ok_or(Error::Invalid)?;
+        // SAFETY: forwarded contract.
+        unsafe { smu.baco_enter(bamaco, armd3) }
+            .await
+            .map_err(Error::Smu)
+    }
+    /// `amdgpu_device_baco_exit`: ExitBaco (and the BIOS scratch clear) or
+    /// ArmD3(ULPS). The resume reset then restores PCI state and posts.
+    ///
+    /// # Safety
+    /// After `enter_baco`, with the PCI function back in D0.
+    pub(crate) async unsafe fn exit_baco(&mut self, armd3: bool) -> Result<(), Error> {
+        let smu = self.sequence.backend.smu.as_mut().ok_or(Error::Invalid)?;
+        // SAFETY: forwarded contract.
+        let clear = unsafe { smu.baco_exit(armd3) }.await.map_err(Error::Smu)?;
+        if clear {
+            let reset = self.reset.as_mut().ok_or(Error::Invalid)?;
+            // SAFETY: ExitBaco acknowledged; the reset has not run.
+            unsafe { reset.clear_post_scratch() }.map_err(Error::Reset)?;
+        }
+        self.baco_exited = true;
+        Ok(())
     }
     pub(crate) fn republish_client_vram(&self) {
         if let (Some(card), Some(heap)) = (Self::drm_card(), &self.client_heap) {

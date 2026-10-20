@@ -18,6 +18,9 @@ struct Inner {
     mapping: MmioRegion,
     address: u64,
     used: IrqSafeSpinLock<Vec<Range<u64>>>,
+    /// Published ranges whose reservation was dropped: still excluded
+    /// (hardware may reach them) until a proven power cycle reclaims them.
+    retired: IrqSafeSpinLock<Vec<Range<u64>>>,
 }
 #[derive(Clone, Debug)]
 pub struct Pool(Arc<Inner>);
@@ -83,7 +86,33 @@ impl Pool {
             mapping,
             address,
             used: IrqSafeSpinLock::new(used),
+            retired: IrqSafeSpinLock::new(Vec::new()),
         })))
+    }
+    /// Return every retired range (a dropped reservation that was exposed
+    /// to hardware) to the pool. Returns the bytes reclaimed.
+    ///
+    /// # Safety
+    /// No device or CPU access can reach a retired range any more: every
+    /// owner that published one was quiesced and dropped, and the GPU went
+    /// through a full power cycle or reset since (S3/BACO resume post).
+    pub(crate) unsafe fn reclaim_retired(&self) -> u64 {
+        let retired = core::mem::take(&mut *self.0.retired.lock());
+        let mut used = self.0.used.lock();
+        let mut bytes = 0;
+        for range in retired {
+            let before = used.len();
+            used.retain(|r| *r != range);
+            if used.len() != before {
+                bytes += range.end - range.start;
+            }
+        }
+        bytes
+    }
+    /// Bytes held by dropped-but-published reservations.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn retired(&self) -> u64 {
+        self.0.retired.lock().iter().map(|r| r.end - r.start).sum()
     }
     pub fn reserve(&self, size: u64) -> Result<Reservation, Error> {
         self.reserve_aligned(size, 4096)
@@ -325,7 +354,9 @@ impl Drop for Reservation {
             self.pool.used.lock().retain(|r| *r != self.range);
         } else {
             // Keep the exclusion record alive even when the last pool handle
-            // is dropped. Recovery must not recycle unknown device ownership.
+            // is dropped. Recovery must not recycle unknown device ownership;
+            // only `Pool::reclaim_retired` after a proven power cycle may.
+            self.pool.retired.lock().push(self.range.clone());
             core::mem::forget(self.pool.clone());
         }
     }
@@ -368,6 +399,47 @@ mod tests {
         let rest = pool.reserve(12288).unwrap();
         if rest.address() != 0x1_0000_1000 || pool.reserve(1).is_ok() {
             return TestResult::Fail("quarantined range recycled");
+        }
+        TestResult::Pass
+    }
+    /// A published reservation dropped by its owner stays excluded until a
+    /// proven power cycle reclaims it; live and protected ranges never are.
+    fn vram_retired_ranges_return_only_on_reclaim() -> TestResult {
+        let map = MmioRegion {
+            phys: narf_memory::PhysAddr::new(0),
+            virt: 0,
+            len: 5 * 4096,
+            kind: narf_bus::BarKind::Mmio32 { prefetchable: true },
+        };
+        // SAFETY: bookkeeping-only model; no mapping access is performed.
+        let pool = unsafe {
+            Pool::from_owned_aperture(
+                map,
+                0x1_0000_0000,
+                core::slice::from_ref(&(4 * 4096..5 * 4096)),
+            )
+        }
+        .unwrap();
+        let mut old = pool.reserve(2 * 4096).unwrap();
+        old.publish();
+        let mut kept = pool.reserve(4096).unwrap();
+        kept.publish();
+        drop(old);
+        if pool.retired() != 2 * 4096 || pool.available() != 4096 {
+            return TestResult::Fail("dropped published range not retired");
+        }
+        // SAFETY: model; no hardware can reach the retired range.
+        let reclaimed = unsafe { pool.reclaim_retired() };
+        if reclaimed != 2 * 4096 || pool.retired() != 0 || pool.available() != 3 * 4096 {
+            return TestResult::Fail("reclaim must return exactly the retired range");
+        }
+        let again = pool.reserve(2 * 4096).unwrap();
+        if again.address() != 0x1_0000_0000 || pool.reserve(2 * 4096).is_ok() {
+            return TestResult::Fail("reclaimed range not reused, or a live/protected one was");
+        }
+        // SAFETY: as above; nothing is retired now.
+        if unsafe { pool.reclaim_retired() } != 0 || kept.address() != 0x1_0000_2000 {
+            return TestResult::Fail("reclaim touched a live reservation");
         }
         TestResult::Pass
     }
@@ -416,6 +488,10 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu-dmub",
         vram_reservations_reuse_only_quiescent_ranges
+    );
+    kernel_test_in!(
+        "drivers/gpu/amdgpu-dmub",
+        vram_retired_ranges_return_only_on_reclaim
     );
     kernel_test_in!(
         "drivers/gpu/amdgpu-dmub",

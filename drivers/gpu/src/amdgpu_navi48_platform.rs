@@ -418,17 +418,29 @@ pub async unsafe fn recover() -> Result<boot::Report, boot::Error> {
     unsafe { restart(&mut owner, quiesced) }.await
 }
 
-/// The owner withdrawn for S3 and the allowed domains eviction widened.
+/// The owner withdrawn for S3 or runtime PM and the allowed domains
+/// eviction widened.
 struct Suspended {
     quiesced: Quiesced,
     domains: Vec<(Arc<crate::amdgpu_gem::GemObject>, u64)>,
+    /// Runtime suspend through BACO/BAMACO: how PMFW was told to enter.
+    baco: Option<Baco>,
+}
+/// How runtime suspend entered BACO (smu_v14_0_2_baco_enter).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Baco {
+    /// The runtime mode is BAMACO (EnterBaco's BACO_SEQ_BAMACO).
+    pub bamaco: bool,
+    /// The audio function is enabled (or absent): ArmD3, PMFW enters BACO
+    /// when the PCI layer moves the functions to D3.
+    pub armd3: bool,
 }
 // SAFETY: only moved between prepare_suspend and resume_from_suspend; the
 // retained owner is never polled while parked here.
 unsafe impl Send for Suspended {}
 static SUSPENDED: narf_lib::sync::IrqSafeSpinLock<Option<Suspended>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
-/// Whether the async prepare parked this card for system suspend.
+/// Whether the async prepare (system or runtime) parked this card.
 pub fn system_suspended() -> bool {
     SUSPENDED.lock().is_some()
 }
@@ -443,6 +455,78 @@ pub fn system_suspended() -> bool {
 /// As [`recover`]: no external CPU mapping user, PCI or firmware owner may
 /// touch the card until resume. Runs from the async system-PM prepare phase.
 pub async unsafe fn prepare_suspend() -> Result<(), boot::Error> {
+    // SAFETY: forwarded contract.
+    unsafe { suspend_device(None) }.await
+}
+/// Linux `amdgpu_pmops_runtime_suspend` for BACO/BAMACO after its checks:
+/// drain the rings (amdgpu_fence_wait_empty, bounded here), then
+/// amdgpu_device_prepare + amdgpu_device_suspend(notify_clients = false),
+/// i.e. the S3 eviction and quiesce without pausing the console, then
+/// amdgpu_device_baco_enter. A drain timeout or refused eviction is
+/// `Busy` with the device running. A BACO entry PMFW refuses brings the
+/// card straight back (resume post, mode1 when SOS still runs) and is
+/// returned as a hard error. After success only [`runtime_resume`] may
+/// touch the card; the PCI layer then saves config state and enters D3.
+///
+/// # Safety
+/// As [`prepare_suspend`]. The caller (runtime PM) proved no display is lit
+/// and holds no console writer on this GPU's VRAM.
+pub async unsafe fn runtime_suspend(baco: Baco) -> Result<(), boot::Error> {
+    if !rings_idle(RING_DRAIN_MS).await {
+        return Err(boot::Error::Busy);
+    }
+    // SAFETY: forwarded contract.
+    unsafe { suspend_device(Some(baco)) }.await
+}
+/// How long runtime suspend waits for submitted jobs (the GFX job timeout).
+const RING_DRAIN_MS: u64 = 10_000;
+/// Whether every ring's submitted jobs completed within `ms`, polling the
+/// fences each millisecond. True without a submitter.
+async fn rings_idle(ms: u64) -> bool {
+    let deadline = narf_time::Deadline::after_ms(ms);
+    loop {
+        let submitter = SUBMITTER.lock().clone();
+        let Some(submitter) = submitter else {
+            return true;
+        };
+        if submitter.progress().is_none() {
+            return false;
+        }
+        if !submitter.watch.lock().iter().any(|w| w.busy()) {
+            return true;
+        }
+        if deadline.expired() {
+            return false;
+        }
+        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
+    }
+}
+/// `amdgpu_device_supports_baco` for the running owner.
+pub async fn bamaco_support() -> u8 {
+    OWNER
+        .lock()
+        .await
+        .as_ref()
+        .map_or(0, |b| b.bamaco_support())
+}
+/// The running owner's PCI function and device authority.
+pub(crate) async fn pci_function() -> Option<(
+    narf_bus::BusDevice,
+    narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+)> {
+    OWNER.lock().await.as_ref().map(|b| b.pci_function())
+}
+/// Whether the native display monitor owns the outputs (otherwise the
+/// connector state is unknown and runtime suspend scans the board ports).
+pub(crate) fn native_display_running() -> bool {
+    DISPLAY_GENERATION.load(Ordering::Acquire) != 0
+}
+/// The S3 and runtime suspend shared by amdgpu_device_prepare and
+/// amdgpu_device_suspend; `baco` selects the runtime form.
+///
+/// # Safety
+/// As [`prepare_suspend`].
+async unsafe fn suspend_device(baco: Option<Baco>) -> Result<(), boot::Error> {
     if SUSPENDED.lock().is_some() {
         return Err(boot::Error::Busy);
     }
@@ -468,7 +552,12 @@ pub async unsafe fn prepare_suspend() -> Result<(), boot::Error> {
         );
         return Err(boot::Error::Busy);
     }
-    console(true);
+    // amdgpu_device_suspend's drm_client_dev_suspend only for system
+    // suspend: runtime PM never suspends under a console on this GPU.
+    let pause_console = baco.is_none();
+    if pause_console {
+        console(true);
+    }
     let mut owner = OWNER.lock().await;
     // SAFETY: forwarded caller contract; client VRAM is empty.
     let quiesced = match unsafe { quiesce(&mut owner, boot::ColdBoot::prepare_suspend) }.await {
@@ -477,7 +566,9 @@ pub async unsafe fn prepare_suspend() -> Result<(), boot::Error> {
             drop(owner);
             crate::amdgpu_gem::restore_domains(domains);
             republish().await;
-            console(false);
+            if pause_console {
+                console(false);
+            }
             return Err(error);
         }
     };
@@ -498,7 +589,9 @@ pub async unsafe fn prepare_suspend() -> Result<(), boot::Error> {
         };
         drop(owner);
         crate::amdgpu_gem::restore_domains(domains);
-        console(restarted.is_err());
+        if pause_console {
+            console(restarted.is_err());
+        }
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
@@ -506,7 +599,28 @@ pub async unsafe fn prepare_suspend() -> Result<(), boot::Error> {
         );
         return Err(boot::Error::Busy);
     }
-    *SUSPENDED.lock() = Some(Suspended { quiesced, domains });
+    if let Some(baco) = baco {
+        // SAFETY: quiesced, evicted and PCI state saved (bus mastering off).
+        if let Err(error) = unsafe { boot.enter_baco(baco.bamaco, baco.armd3) }.await {
+            // PMFW kept the chip up: bring it back through the resume post
+            // (mode1 while SOS runs), as a failed resume would.
+            // SAFETY: the same quiesced owner; its PCI state was saved.
+            let restarted = unsafe { restart(&mut owner, quiesced) }.await.map(|_| ());
+            drop(owner);
+            crate::amdgpu_gem::restore_domains(domains);
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi48 BACO entry {error:?}; device restart {restarted:?}"
+            );
+            return Err(error);
+        }
+    }
+    *SUSPENDED.lock() = Some(Suspended {
+        quiesced,
+        domains,
+        baco,
+    });
     Ok(())
 }
 /// Linux `amdgpu_pmops_resume`: restore PCI state, post the cold card
@@ -517,7 +631,50 @@ pub async unsafe fn prepare_suspend() -> Result<(), boot::Error> {
 /// # Safety
 /// As [`prepare_suspend`]; after system resume restored the bus.
 pub async unsafe fn resume_from_suspend() -> Result<boot::Report, boot::Error> {
-    let suspended = SUSPENDED.lock().take().ok_or(boot::Error::Busy)?;
+    // SAFETY: forwarded contract.
+    unsafe { resume_device(false) }.await
+}
+/// Linux `amdgpu_pmops_runtime_resume` for BACO/BAMACO, after the PCI layer
+/// restored D0 and the config header: amdgpu_device_baco_exit (ExitBaco and
+/// the BIOS scratch clear, or ArmD3(ULPS) after 10 ms), then
+/// amdgpu_device_resume: the resume post decides ASIC_Init, GDDR6 training
+/// replays and a fresh owner comes up without reloading the resident SMU
+/// firmware. A failure is terminal, as a failed recovery.
+///
+/// # Safety
+/// As [`resume_from_suspend`]; the parked suspend came from
+/// [`runtime_suspend`].
+pub async unsafe fn runtime_resume() -> Result<boot::Report, boot::Error> {
+    // SAFETY: forwarded contract.
+    unsafe { resume_device(true) }.await
+}
+async unsafe fn resume_device(runtime: bool) -> Result<boot::Report, boot::Error> {
+    let mut suspended = {
+        let mut parked = SUSPENDED.lock();
+        if parked.as_ref().is_none_or(|s| s.baco.is_some() != runtime) {
+            return Err(boot::Error::Busy);
+        }
+        parked.take().unwrap()
+    };
+    if let Some(baco) = suspended.baco {
+        let boot = suspended
+            .quiesced
+            .retained
+            .boot
+            .as_mut()
+            .ok_or(boot::Error::Invalid)?;
+        // SAFETY: parked by runtime_suspend; the PCI layer restored D0.
+        if let Err(error) = unsafe { boot.exit_baco(baco.armd3) }.await {
+            crate::amdgpu_gem::restore_domains(suspended.domains);
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi48 BACO exit {error:?}; device lost"
+            );
+            // Dropping the retained owner quarantines it and marks it lost.
+            return Err(error);
+        }
+    }
     let mut owner = OWNER.lock().await;
     // SAFETY: forwarded contract; the parked owner was quiesced and saved.
     let result = unsafe { restart(&mut owner, suspended.quiesced) }.await;
@@ -526,11 +683,12 @@ pub async unsafe fn resume_from_suspend() -> Result<boot::Report, boot::Error> {
     use core::fmt::Write as _;
     let _ = writeln!(
         narf_console::Writer,
-        "amdgpu: navi48 resume {:?}",
+        "amdgpu: navi48 {}resume {:?}",
+        if runtime { "runtime " } else { "" },
         result.as_ref().map(|_| ())
     );
     // A lost device keeps the console quarantined, as a failed recovery does.
-    if result.is_ok() {
+    if result.is_ok() && !runtime {
         console(false);
     }
     result
@@ -539,19 +697,29 @@ struct SystemPm;
 impl narf_power::system_pm::AsyncSystemPm for SystemPm {
     fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
         alloc::boxed::Box::pin(async {
+            // device_prepare: a runtime-PM reference for the transition,
+            // resuming a runtime-suspended card first (pci_pm_prepare).
+            crate::amdgpu_navi48_runtime_pm::system_prepare().await;
             // SAFETY: register_system_pm's caller accepted the contract.
-            unsafe { prepare_suspend() }
+            let result = unsafe { prepare_suspend() }
                 .await
-                .map_err(|_| narf_power::device_pm::DeviceSuspendError::Busy)
+                .map_err(|_| narf_power::device_pm::DeviceSuspendError::Busy);
+            if result.is_err() {
+                crate::amdgpu_navi48_runtime_pm::system_complete();
+            }
+            result
         })
     }
     fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
         alloc::boxed::Box::pin(async {
             // SAFETY: as above.
-            unsafe { resume_from_suspend() }
+            let result = unsafe { resume_from_suspend() }
                 .await
                 .map(|_| ())
-                .map_err(|_| narf_power::device_pm::DeviceSuspendError::DriverError)
+                .map_err(|_| narf_power::device_pm::DeviceSuspendError::DriverError);
+            // device_complete: drop the transition's runtime-PM reference.
+            crate::amdgpu_navi48_runtime_pm::system_complete();
+            result
         })
     }
 }
@@ -636,12 +804,32 @@ async unsafe fn restart(
         restart_display,
     } = q;
     let old = retained.boot.as_mut().unwrap();
+    // S3 and runtime resume start from a clean quiesce (every engine
+    // withdrawn with proof), unlike recovery from a fault.
+    let clean = old.reset_mode() == Some(crate::amdgpu_reset_navi22::Mode::Resume);
     // SAFETY: OWNER excludes async access; readers, IH and publication were
     // withdrawn. The caller excludes all external CPU mappings and PCI users.
     unsafe { old.run_reset().await }?;
     // SAFETY: full reset and ASIC_Init proved old hardware no longer executes.
     let new = alloc::boxed::Box::new(unsafe { old.after_reset() }?);
-    QUARANTINED.lock().push(retained.boot.replace(new).unwrap());
+    let old = retained.boot.replace(new).unwrap();
+    if clean {
+        // The cleanly quiesced owner went through a resume post: drop it
+        // (no hardware access on drop) and reclaim the VRAM it published,
+        // so repeated S3/runtime cycles do not exhaust the driver pool.
+        drop(old);
+        // SAFETY: the dropped owner was quiesced and the GPU was posted
+        // after a power cycle or mode1; the new owner has published nothing.
+        let reclaimed = unsafe { retained.boot.as_ref().unwrap().reclaim_retired_vram() };
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: navi48 resume reclaimed {} KiB of the previous owner's VRAM",
+            reclaimed >> 10
+        );
+    } else {
+        QUARANTINED.lock().push(old);
+    }
     let boot = retained.boot.as_mut().unwrap();
     let report = boot.run().await?;
     crate::amdgpu_navi48_dispatch::TABLE.lock().restart();
@@ -1389,6 +1577,7 @@ pub(crate) async fn power_sample() -> Result<crate::amdgpu_navi48_power::Sample,
 }
 /// hwmon `power1_cap`: the AC PPT0 limit in watts, within the board range.
 pub async fn set_power_cap(watts: u32) -> Result<(), boot::Error> {
+    let _rpm = crate::amdgpu_navi48_runtime_pm::access().await?;
     let mut owner = OWNER.lock().await;
     owner
         .as_mut()
@@ -1399,6 +1588,7 @@ pub async fn set_power_cap(watts: u32) -> Result<(), boot::Error> {
 /// Linux `power_dpm_force_performance_level` restricted to GFXCLK soft
 /// limits. Display, memory and fabric clocks stay pinned by their owner.
 pub async fn set_gfx_level(level: crate::amdgpu_smu_navi48::GfxLevel) -> Result<(), boot::Error> {
+    let _rpm = crate::amdgpu_navi48_runtime_pm::access().await?;
     let mut owner = OWNER.lock().await;
     owner
         .as_mut()
@@ -2644,10 +2834,11 @@ fn publish_outputs() {
         crtc: Option<usize>,
         vrr_capable: bool,
         color: bool,
+        present: bool,
     }
     // Serializes publishers so an older snapshot never lands after a newer
     // one. Taken before OUTPUTS and never by the card-lock holders.
-    let _publishing = PUBLISHING.lock();
+    let publishing = PUBLISHING.lock();
     let (shown, owned, inactive) = {
         let outputs = OUTPUTS.lock();
         let shown: Vec<Option<Shown>> = (0..4).map(|k| outputs.published(k).cloned()).collect();
@@ -2669,6 +2860,7 @@ fn publish_outputs() {
                 crtc: outputs.crtc_of(c.target),
                 vrr_capable: c.present && c.vrr_capable,
                 color: color_connector(c.target),
+                present: c.present,
             })
             .collect();
         let inactive: Vec<usize> = (0..4)
@@ -2706,9 +2898,19 @@ fn publish_outputs() {
         })
         .collect();
     crate::amdgpu_navi48_kms::publish_routed_native(&crtcs, &connectors, &props);
+    // amdgpu_dm_atomic_commit_tail: a runtime-PM reference per enabled
+    // CRTC, dropped (put_autosuspend) when it is disabled. The delta is
+    // taken in publication order; references move after the lock.
+    let lit = (0..4)
+        .filter(|&k| shown[k].is_some() && !inactive.contains(&k))
+        .fold(0u8, |m, k| m | 1 << k);
+    let delta =
+        crate::amdgpu_navi48_runtime_pm::displays_changed(lit, owned.iter().any(|c| c.present));
     for k in inactive {
         crate::amdgpu_navi48_kms::set_active(k, false);
     }
+    drop(publishing);
+    crate::amdgpu_navi48_runtime_pm::apply_display_refs(delta);
 }
 
 /// Cursor hook published with the console's scanout: upload once, then

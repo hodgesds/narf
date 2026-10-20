@@ -848,3 +848,60 @@ kernel_test_in!(
     "drivers/gpu/reset_navi22",
     navi48_resume_with_live_sos_takes_mode1_and_restore_failure_is_terminal
 );
+
+/// Navi48 runtime resume from BACO (smu_v14_0_baco_set_state(EXIT)): the
+/// cleared BIOS_SCRATCH_6/7 make amdgpu_device_need_post true, so the resume
+/// posts a card whose scratch still said ASIC_INIT_COMPLETE; without the
+/// clear (the ArmD3/ULPS path) the post is skipped, as in Linux. The clear
+/// is refused outside a prepared Navi48 resume.
+fn navi48_baco_exit_scratch_clear_forces_the_resume_post() -> TestResult {
+    for clear in [true, false] {
+        let mut io = Fake::posted();
+        io.reset = true; // SOS gone with chip power, bus (and config) alive
+        io.clears_s7 = false; // BACO keeps BIOS_SCRATCH_7 ASIC_INIT_COMPLETE
+        let mut e = engine(io);
+        e.navi48 = true;
+        e.mode = Mode::Resume;
+        if clear && e.clear_post_scratch().is_err() {
+            return TestResult::Fail("scratch clear refused before a resume");
+        }
+        let report = match run(e.run()) {
+            Ok(Some(report)) => report,
+            _ => return TestResult::Fail("BACO resume did not complete"),
+        };
+        if report.method != Method::PowerCycle || report.post.ran != clear {
+            return TestResult::Fail("post must follow the BACO scratch clear");
+        }
+        let writes: Vec<_> =
+            e.io.events
+                .iter()
+                .filter(|e| matches!(e, Event::Reg(..)))
+                .copied()
+                .collect();
+        let mut want = Vec::new();
+        if clear {
+            want.push(Event::Reg(SCRATCH + 6, 0));
+            want.push(Event::Reg(S7, 0));
+            // ASIC_Init ORs ASIC_INIT_COMPLETE into the cleared scratch.
+            let mut init = asic_init_writes();
+            *init.last_mut().unwrap() = Event::Reg(S7, 0x200);
+            want.extend(init);
+        }
+        if writes != want || e.io.stray != 0 {
+            return TestResult::Fail("BACO exit scratch writes or ASIC_Init order");
+        }
+        if e.clear_post_scratch() != Err(Error::Busy) {
+            return TestResult::Fail("scratch clear accepted after the resume ran");
+        }
+    }
+    let mut e = engine(Fake::posted());
+    e.navi48 = true;
+    if e.clear_post_scratch() != Err(Error::Busy) {
+        return TestResult::Fail("scratch clear accepted outside a resume");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/reset_navi22",
+    navi48_baco_exit_scratch_clear_forces_the_resume_post
+);

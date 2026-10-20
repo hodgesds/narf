@@ -1003,6 +1003,18 @@ impl<I: Io> Engine<I> {
             post,
         })
     }
+    /// Navi48 BACO exit (smu_v14_0_baco_set_state): BIOS_SCRATCH_6/7 = 0.
+    fn clear_post_scratch(&mut self) -> Result<(), Error> {
+        if !self.navi48 || self.mode != Mode::Resume || self.state != State::Prepared {
+            return Err(Error::Busy);
+        }
+        let scratch = self.scratch;
+        self.access(|io| {
+            // linux: n/a (WREG32(adev->bios_scratch_reg_offset + 6/7, 0), smu_v14_0.c)
+            io.set_reg(scratch + 6, 0);
+            io.set_reg(scratch + 7, 0);
+        })
+    }
     async fn run(&mut self) -> Result<Option<Report>, Error> {
         if self.state != State::Prepared {
             return Err(Error::Busy);
@@ -1238,6 +1250,15 @@ impl Reset {
         }
         let authority = self.engine.authority;
         self.engine.io.save_and_quiesce(&authority)
+    }
+    /// smu_v14_0_baco_set_state(EXIT): after ExitBaco, clear BIOS_SCRATCH_6
+    /// and BIOS_SCRATCH_7 "for coming asic reinit", so the resume's post
+    /// (`amdgpu_device_need_post`) runs ASIC_Init. Navi48 runtime resume
+    /// only, before `run`.
+    /// # Safety
+    /// As [`Self::save_for_resume`]; PMFW acknowledged ExitBaco.
+    pub unsafe fn clear_post_scratch(&mut self) -> Result<(), Error> {
+        self.engine.clear_post_scratch()
     }
     pub fn mode(&self) -> Mode {
         self.engine.mode
