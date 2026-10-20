@@ -293,7 +293,9 @@ struct Chain {
     pipe: u8,
 }
 /// Boxed: tests hold several chains, each with a whole engine and its
-/// register model (the aarch64 kernel-test stack is 64 KiB).
+/// register model (the aarch64 kernel-test stack is 64 KiB). Never inlined:
+/// its staging frame must be gone before a test polls the chain.
+#[inline(never)]
 fn chain(phy_index: u8, stream: u8, pipe: u8) -> alloc::boxed::Box<Chain> {
     let plan = plan();
     let mode = hdmi_mode(pipe, &plan);
@@ -378,24 +380,39 @@ fn chain(phy_index: u8, stream: u8, pipe: u8) -> alloc::boxed::Box<Chain> {
         pipe,
     })
 }
+/// Each step runs to completion in its own frame and hands back a ready
+/// future, so a test's frame never holds the step's (large) future while
+/// the chain fixtures below it run on the 64 KiB aarch64 stack.
 impl Chain {
-    async fn start(&mut self) -> Result<ScanoutRunning, Error> {
+    #[inline(never)]
+    fn start(&mut self) -> core::future::Ready<Result<ScanoutRunning, Error>> {
         let c = self.clock;
-        self.surfaces
-            .start_scanout(&mut self.e, self.pipe, CRYSTAL_KHZ, || Ok((c, config())))
-            .await
+        core::future::ready(run(self.surfaces.start_scanout(
+            &mut self.e,
+            self.pipe,
+            CRYSTAL_KHZ,
+            || Ok((c, config())),
+        )))
     }
-    async fn check(&mut self) -> Result<u32, Error> {
+    #[inline(never)]
+    fn check(&mut self) -> core::future::Ready<Result<u32, Error>> {
         let c = self.clock;
-        self.surfaces
-            .check_scanout(&mut self.e, self.pipe, CRYSTAL_KHZ, || Ok((c, config())))
-            .await
+        core::future::ready(run(self.surfaces.check_scanout(
+            &mut self.e,
+            self.pipe,
+            CRYSTAL_KHZ,
+            || Ok((c, config())),
+        )))
     }
-    async fn stop(&mut self) -> Result<(), Error> {
+    #[inline(never)]
+    fn stop(&mut self) -> core::future::Ready<Result<(), Error>> {
         let c = self.clock;
-        self.surfaces
-            .stop_scanout(&mut self.e, self.pipe, CRYSTAL_KHZ, || Ok((c, config())))
-            .await
+        core::future::ready(run(self.surfaces.stop_scanout(
+            &mut self.e,
+            self.pipe,
+            CRYSTAL_KHZ,
+            || Ok((c, config())),
+        )))
     }
 }
 /// Poll `f` until `reached`, then drop it: cancellation at that point.
