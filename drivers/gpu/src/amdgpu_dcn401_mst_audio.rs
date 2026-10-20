@@ -12,6 +12,7 @@ pub struct MstAudioPayload {
 
 /// Legacy MST LPCM within Linux's blanking budget; compressed SADs pass
 /// through as dce_aud_az_configure programs them.
+#[cfg(feature = "kernel-test")]
 pub(crate) fn mst_audio_info(
     info: AudioInfo,
     timing: &Timing,

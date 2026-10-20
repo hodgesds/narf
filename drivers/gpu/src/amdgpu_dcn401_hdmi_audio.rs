@@ -25,12 +25,16 @@ use super::*;
 mod frl_audio;
 #[path = "amdgpu_dcn401_uhbr_audio.rs"]
 mod uhbr_audio;
-pub(crate) use uhbr_audio::{uhbr_audio_info, uhbr_audio_info_with};
+#[cfg(feature = "kernel-test")]
+pub(crate) use uhbr_audio::uhbr_audio_info;
+pub(crate) use uhbr_audio::uhbr_audio_info_with;
 #[path = "amdgpu_dcn401_dp_audio_bw.rs"]
 mod bandwidth;
 #[path = "amdgpu_dcn401_mst_audio.rs"]
 mod mst_audio;
-pub(crate) use mst_audio::{mst_audio_info, mst_audio_info_with};
+#[cfg(feature = "kernel-test")]
+pub(crate) use mst_audio::mst_audio_info;
+pub(crate) use mst_audio::mst_audio_info_with;
 pub use mst_audio::MstAudioPayload;
 
 /// One CEA Short Audio Descriptor, as amdgpu_dm copies it from the EDID.

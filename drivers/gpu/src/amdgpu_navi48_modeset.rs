@@ -1024,6 +1024,7 @@ fn max_link(dpcd: &[u8; 16], lttpr: Option<(u8, u8)>) -> Option<(u8, LinkRate)> 
 }
 
 /// The frontend's 8b/10b payload ceiling for 8-bpc RGB, without FEC.
+#[cfg(feature = "kernel-test")]
 pub fn link_fits(timing: &Timing, lanes: u8, rate: LinkRate) -> bool {
     link_fits_bpc(timing, lanes, rate, 8)
 }
@@ -1219,6 +1220,7 @@ pub fn uhbr_kbps(lanes: u8, rate: otg::UhbrRate) -> u64 {
 /// of apply_128b_132b_stream_overhead: the active line's 24-bit pixels in
 /// 128-bit symbols, rounded up. Exact rational arithmetic where Linux uses
 /// 31.32 fixed point.
+#[cfg(feature = "kernel-test")]
 pub fn stream_kbps(timing: &Timing, uhbr: bool) -> u64 {
     stream_kbps_bpc(timing, uhbr, 8)
 }
@@ -2183,6 +2185,7 @@ pub fn admit_displays(
 /// mode that needs 8b/10b instead is a new selection. An 8b/10b link keeps
 /// narf's ladder (`link_candidates`). Settings beyond `caps` or that cannot
 /// carry the mode are never tried.
+#[cfg(feature = "kernel-test")]
 pub fn dp_candidates(timing: &Timing, caps: DpCaps, lanes: u8, rate: DpRate) -> Vec<(u8, DpRate)> {
     dp_candidates_bpc(timing, caps, lanes, rate, 8)
 }
@@ -2220,6 +2223,7 @@ pub fn dp_candidates_bpc(
 /// and restart from this attempt's starting rate (narf's DP fallback
 /// ladder, as in `dp_link_training`). Settings that cannot carry the mode are
 /// never tried.
+#[cfg(feature = "kernel-test")]
 pub fn link_candidates(timing: &Timing, lanes: u8, rate: LinkRate) -> Vec<(u8, LinkRate)> {
     legacy_candidates(lanes, rate, |l, r| link_fits(timing, l, r))
 }

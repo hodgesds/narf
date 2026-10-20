@@ -16,6 +16,7 @@ const PACKETS: u64 = 0x367c;
 /// Filter LPCM against the actual trained UHBR link and native blank budget;
 /// compressed SADs pass through as dce_aud_az_configure programs them. No
 /// surviving LPCM rate means silent video.
+#[cfg(feature = "kernel-test")]
 pub(crate) fn uhbr_audio_info(
     info: AudioInfo,
     timing: &Timing,

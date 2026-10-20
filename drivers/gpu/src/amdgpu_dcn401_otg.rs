@@ -48,9 +48,10 @@ pub use hdmi::HdmiTmdsRetired;
 mod hdmi_link;
 pub use hdmi_link::audio::MstAudioPayload;
 pub(crate) use hdmi_link::audio::{
-    acr, channels, descriptors, frl_audio_info, mst_audio_info, mst_audio_info_with,
-    uhbr_audio_info, uhbr_audio_info_with,
+    acr, channels, descriptors, frl_audio_info, mst_audio_info_with, uhbr_audio_info_with,
 };
+#[cfg(feature = "kernel-test")]
+pub(crate) use hdmi_link::audio::{mst_audio_info, uhbr_audio_info};
 pub(crate) use hdmi_link::{avi_infoframe, vendor_infoframe};
 pub use hdmi_link::{
     AudioInfo, AudioMode, Avi, DisplayAudio, HdmiLinkReady, HdmiLinkRequest, HdmiVideoRunning,

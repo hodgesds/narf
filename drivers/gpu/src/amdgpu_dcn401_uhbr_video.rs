@@ -744,6 +744,7 @@ impl<I: Io> Engine<I> {
     /// Start black RGB video on the trained 128b/132b link through HPO
     /// stream encoder `stream`, from the prepared timing of `pipe`, whose
     /// stream clocks the clock owner has routed.
+    #[cfg(feature = "kernel-test")]
     pub(in crate::amdgpu_dcn401_otg) async fn start_uhbr_video(
         &mut self,
         io: &mut impl UhbrTransport,
@@ -800,6 +801,7 @@ impl<I: Io> Engine<I> {
     /// mapped, its timing started blank, ready for the MST manager to add
     /// its `slots` payload (`update_uhbr_mst_allocation`,
     /// `set_uhbr_mst_vc_rate`) before `start_uhbr_mst_video` unblanks it.
+    #[cfg(feature = "kernel-test")]
     pub(in crate::amdgpu_dcn401_otg) async fn prepare_uhbr_mst_stream(
         &mut self,
         path: Path,
@@ -1229,6 +1231,7 @@ impl Otg {
     /// # Safety
     /// start_dp_video's obligations for the 128b/132b link and HPO stream
     /// encoder `stream`, which no other display may use.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async unsafe fn start_uhbr_video(
         &mut self,
         clocks: &mut clocks::ClockManager,
@@ -1260,6 +1263,7 @@ impl Otg {
     /// for a payload of `slots`.
     /// # Safety
     /// As for `start_uhbr_video`; the MST manager owns the link's payloads.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async unsafe fn prepare_uhbr_mst_stream(
         &mut self,
         clocks: &mut clocks::ClockManager,
