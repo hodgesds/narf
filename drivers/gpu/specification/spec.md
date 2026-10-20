@@ -4259,7 +4259,7 @@ commit_planes_for_stream's order:
 Refusals leave the scanout as it ran; later failure or cancellation
 (`State::UpdatingPlanes`) quarantines the display, retaining every surface.
 `PlanesUpdated` reports the update type, the pipes enabled, disabled and
-kept, the scanout and deadlines, and the bytes released.
+kept, the scanout (its plan the deadlines') and the bytes released (boxed).
 `ColdBoot::prepare_display_plane_clock_live(request)` programs a new
 pipe's DPP-only clock while every display (the selected one's too) runs.
 
