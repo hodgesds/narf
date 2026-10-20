@@ -1796,10 +1796,12 @@ Presentation goes through the back buffer and a latched flip (see live
 updates above), and flip events stay software-paced at the real refresh
 rate.
 
-The primary plane lists `amdgpu_navi48_kms::PLANE_FORMATS`: amdgpu_dm's
-DCN4.0.1 order less RGBA8888, the 16-bit UNORM orders, NV12 and P010. The
-overlay planes, plane properties, placement and SETPLANE are described in
-"Navi 48 plane scaling and overlay planes".
+Every native plane (primary and overlay: DCN4's planes are all
+DC_PLANE_TYPE_DCN_UNIVERSAL) lists `amdgpu_navi48_kms::PLANE_FORMATS`:
+amdgpu_dm's DCN4.0.1 order (`amdgpu_dm_modifiers::DM_PLANE_FORMATS`:
+rgb_formats, NV12, P010, the FP16 orders) less RGBA8888 and the 16-bit UNORM
+orders. The overlay planes, plane properties, placement, SETPLANE, tiling and
+4:2:0 planes are described in "Navi 48 plane scaling and overlay planes".
 ADDFB2 takes a format on a card whose `plane_formats` list it, with Linux's
 pitch and dumb-object size checks (a card without native planes keeps
 XRGB8888/ARGB8888/RGB565); `drm::card::PixelFormat` knows the formats and
@@ -1818,14 +1820,10 @@ fourcc: a frame in the scanned format is copied as packed words into the back
 buffer; one in the requested format waits for the relight and presents (or
 completes) after that monitor pass; others complete at once. The console and
 the CPU-copy fallback stay XRGB8888 only (`scanout_framebuffer` refuses
-other surfaces). Every native plane (primary and overlay) lists an immutable
-`IN_FORMATS` blob (`drm_native_planes::IN_FORMATS_PROP_ID`, blob id
-`in_formats_blob_id(plane)`, served by GETPROPBLOB): a version-1
-`drm_format_modifier_blob` with the card's plane formats and a single
-DRM_FORMAT_MOD_LINEAR entry covering all of them. amdgpu answers
-`DRM_CAP_ADDFB2_MODIFIERS` = 1; ADDFB2 with `DRM_MODE_FB_MODIFIERS` accepts
-only a LINEAR modifier[0], and an unknown flag or other modifier is EINVAL.
-No hardware validation of these formats exists.
+other surfaces). Format modifiers are described in "Navi 48 plane scaling
+and overlay planes" (GFX12 modifiers); amdgpu answers
+`DRM_CAP_ADDFB2_MODIFIERS` = 1. No hardware validation of these formats
+exists.
 
 `platform::spawn_display_monitor` runs after the boot-time native modeset
 (`amdgpu.native_display`). It enables HPD on every routed DP port, then runs
@@ -3803,7 +3801,31 @@ TTU, DET, ODM blank end; line and request delivery above a vertical ratio of
 primary's. `tests/dcn401_dml21/plane_vectors.txt` (654 configurations:
 scaled primaries, one to three overlays, ODM 2:1 streams with overlays, two
 streams) is answered by Linux DML21 (`harness_planes.c`), checked by
-`check.sh` and replayed by `dcn401_dml_matches_linux_dml21_plane_vectors`.
+`check.sh` and replayed by `dcn401_dml_matches_linux_dml21_plane_vectors`. A
+`dml::Plane` also carries its `source` (`Source::Rgb`, `Yuv420_8`,
+`Yuv420_10`), `swizzle` (`dml::Swizzle`, DC_ADDR3 linear to 256KB_2D),
+`dcc`, `vertical_scan` and a 4:2:0 plane's `chroma` (`dml::Chroma`: half
+surface, pitch, SPL's chroma viewport, ratios and taps), as
+populate_dml21_surface_config_from_plane_state hands them DML
+(`SurfaceRequest::dml_plane`); admission then follows
+dml2_core_dcn4_calcs.c for both surfaces (block and macro-tile sizes, luma
+and chroma swaths and requests, the DET split and chroma base, two-surface
+prefetch, bursts, deep sleep, DPPCLK and delivery, unbounded requesting,
+DCC's mcache allocation and overhead; a linear vertical scan is refused, a
+plane needing an MPC split for its mcaches is `Unsupported`). `PlanePlan`
+adds `rq` (`dml::RqRegs`: luma and chroma `RqPlane`, expansion modes, the
+DET plane-1 base, unbounded requesting), `mcache` and the chroma DLG/TTU
+delivery fields, which `deadline_writes` programs (the *_C halves of the
+per-line delivery registers, SURF1_TTU0/1; for a tiled or 4:2:0 plane
+hubp401_program_requestor's HUBPRET_CONTROL plane-1 base,
+DCN_EXPANSION_MODE, DCHUBP_REQ_SIZE_CONFIG(_C) and the unbounded-request
+bit, which the static requestor check then leaves to it).
+`tests/dcn401_dml21/surface_vectors.txt` (618 configurations: every swizzle,
+DCC, NV12/P010, scaled, ODM, vertical scan, refusals) is answered by Linux
+(`harness_surfaces.c`) and replayed by
+`dcn401_dml_matches_linux_dml21_surface_vectors`. A 4:2:0 primary is never
+the packed full-frame plane (`modeset::plane_mode` gives DML its explicit
+plane).
 
 **Modeset and platform.** `modeset::PlaneSetup` (the primary's
 `PlaneGeometry`: source origin and size, CRTC rectangle, rotation, blending;
@@ -3831,8 +3853,8 @@ changed plane together.
 **KMS.** `drm_native_planes` gives the Navi 48 card amdgpu_dm's planes
 (amdgpu_dm_initialize_drm_device, amdgpu_dm_plane_init): each CRTC's primary
 (id 0x40 + n) and three overlays (0x44-0x46, possible_crtcs 0xff, the
-supported subset of amdgpu_dm's overlay_formats: XRGB/ARGB/XBGR/ABGR8888 and
-RGB565, `OVERLAY_FORMATS`), listed by GETPLANERESOURCES and GETPLANE (an
+primaries' `PLANE_FORMATS`, as amdgpu_dm_plane_get_plane_formats gives
+DCN4's universal overlays), listed by GETPLANERESOURCES and GETPLANE (an
 overlay's CRTC and framebuffer as committed). Properties
 (`Card::native_planes`, `PlaneProps`): "pixel blend mode" (None,
 Pre-multiplied, Coverage; default Pre-multiplied) on every plane, "alpha"
@@ -3861,11 +3883,93 @@ its source rectangle, ENOSPC otherwise), SETCRTC shows the framebuffer whole
 again (drm_atomic_helper_set_config) and RMFB disables the overlays scanning
 the removed framebuffer.
 
+**GFX12 modifiers.** `amdgpu_dm_modifiers` is amdgpu's GC 12 modifier
+layer. `PLANE_MODIFIERS` is amdgpu_dm_plane_get_plane_modifiers for a GC 12
+primary or overlay: amdgpu_dm_plane_add_gfx12_modifiers' twelve DCC entries
+(256K_2D, 64K_2D, 4K_2D, 256B_2D, each with max compressed block 256B, 128B,
+64B), the four swizzles without DCC, then LINEAR (17; INVALID ends Linux's
+list and is not one of them). `format_mod_supported` is
+amdgpu_dm_plane_format_mod_supported: LINEAR and INVALID always, a listed
+GFX12 modifier for every format (no GFX9-11 D-swizzle/DCC rules). On the
+native card (`Card::gfx12_modifiers`) every plane's `IN_FORMATS` and
+`IN_FORMATS_ASYNC` blob (`drm_native_planes::IN_FORMATS_PROP_ID` /
+`IN_FORMATS_ASYNC_PROP_ID`, blob ids `in_formats_blob_id` /
+`in_formats_async_blob_id`, GETPROPBLOB) is create_in_format_blob's
+version-1 `drm_format_modifier_blob`: the plane's 15 formats, then the 17
+modifiers each with the mask of the formats that take it (all of them); a
+card with native planes but no GFX12 modifiers lists LINEAR alone.
+`Tiling::from_modifier` is amdgpu_dm_plane_fill_gfx12_attrs_from_modifiers
+(swizzle and DCC max block of any GFX12 modifier). ADDFB2
+(`Card::addfb2_cmd`, the whole 104-byte `drm_mode_fb_cmd2`:
+`amdgpu_dm_modifiers::FbCmd`) on the native card runs
+drm_internal_framebuffer_create (flags, 16384x16384, a DRM format,
+framebuffer_check: handles, pitches, overflow, per-plane modifiers equal,
+unused planes zero), the BO lookup, then amdgpu_display_gem_fb_verify_and_init
+(`check_amdgpu_fb`: drm_any_plane_has_format with modifier[0], every plane
+in the same BO, without DRM_MODE_FB_MODIFIERS the BO's tiling flags through
+convert_tiling_flags_to_modifier_gfx12, amdgpu_display_verify_sizes: each
+plane's pitch whole swizzle blocks and at least its width, block-aligned
+offsets, whole block rows within the BO, LINEAR in 256-byte units); a
+refusal is EINVAL (FsError has no ERANGE). `Framebuffer` records
+`offsets`, `chroma_pitch` and `modifier`. `AMDGPU_GEM_METADATA` on one of
+the card's dumb BOs (`drm_ioctl_bridge::amdgpu_dumb_metadata`) sets/gets its
+tiling flags (`Card::set_bo_tiling`); CREATE_DUMB pads the pitch as
+amdgpu_mode_dumb_create does (amdgpu_gem_align_pitch). Other cards keep
+LINEAR-only ADDFB2. `tests/amd_modifiers/check.sh` extracts Linux's
+functions (amdgpu_dm_plane.c, amdgpu_display.c, drm_plane.c,
+drm_framebuffer.c, drm_fourcc.c), builds them with an RX 9070 XT stand-in
+and checks 2454 vectors (modifier/format lists, blobs, support, tiling
+flags, ADDFB2), replayed by `amd_modifiers_match_linux_vectors`.
+DCC capability is hubbub401_get_dcc_compression_cap as amdgpu_dm calls it
+(`dcc_capable`: every scanned format; GC 12.0.1 has no DCC width limit).
+
+**Tiled, DCC and 4:2:0 surfaces.** `otg::SurfaceRequest::surface`
+(`PlaneSurface`: `Tiling` and a `YuvColor`) and `SurfaceFormat::{Nv12,
+P010}` (DC's VIDEO_420_YCrCb / 10bpc_YCrCb, as amdgpu_dm maps them;
+`is_video`, `chroma_bytes_per_pixel`). `SurfaceRequest::bytes` lays each
+plane out as amdgpu_display_verify_plane sizes a framebuffer (pitch of whole
+swizzle blocks, whole block rows; a 4:2:0 chroma plane at half size behind
+the luma, block and page aligned). HUBP: DCSURF_SURFACE_CONTROL
+PRIMARY/SECONDARY_SURFACE_DCC_EN from the modifier (hubp401_dcc_control),
+SW_MODE the swizzle (hubp401_program_tiling), PITCH and PITCH_C
+(hubp401_program_size), the VIDEO_420 pixel format (64/66), SPL's chroma
+viewport, and the chroma address before the luma's
+(hubp401_program_surface_flip_and_addr), also on flips and at scanout start
+(`Engine::write_fetch_address`). DPP: CNVC_SURFACE_PIXEL_FORMAT 64/66 and,
+for 4:2:0, CM_POST_CSC set A with the color space's dpp_input_csc_matrix
+(dpp401_dpp_setup's INPUT_CSC_SELECT_ICSC, dpp3_program_post_csc,
+cm_helper_program_color_matrices' packing). SPL takes `spl::Video`
+(SPL_PIXEL_FORMAT_420BPP8/10): chroma ratios/viewports/inits/taps, the 420
+SCL modes, chroma coefficient loads, EASF's video rules, LB config 3; a 4:2:0
+plane always goes through `spl::calculate` (its chroma is upscaled even
+unscaled). `tests/dcn401_spl/check.sh` also checks 124 video vectors
+(`video_vectors.txt`); `tests/dcn401_yuv/check.sh` checks 120 vectors of
+fill_plane_color_attributes, dpp401_dpp_setup's format switch,
+hubp2_program_pixel_format and the post-CSC words extracted from Linux,
+replayed by `dcn401_dpp_input_conversion_matches_linux_vectors`.
+KMS: primaries and overlays carry "COLOR_ENCODING" (BT.601/709/2020,
+default BT.709) and "COLOR_RANGE" (limited/full, default limited) as
+drm_plane_create_color_properties makes them (they only affect YCbCr; a
+value outside the enum is EINVAL). `drm_native_planes::plane_surface`
+gives each plane's `PlaneGeometry::surface` (fill_plane_color_attributes'
+color space) and `fb_size`; a tiled or 4:2:0 plane is staged as its whole
+framebuffer with the source rectangle placed in it
+(`PlaneGeometry::whole_framebuffer`), so such a primary is always placed,
+and the presenter copies it whole, block row by block row
+(`copy_whole_plane`, `upload_display_plane_back_bytes`); a frame of another
+tiling than shown waits for the relight its plane change requested.
+SETCRTC admits such a framebuffer as a placed primary
+(`drm_native_planes::setcrtc_planes`), PAGE_FLIP requests the display's
+planes so a tiling change relights.
+
 Gaps: a plane configuration change relights the display (a visible blank)
 rather than DC's seamless full update; the cursor shows only on the
 primary's pipes, under opaque overlays above it; planes on an ODM 2:1 stream
-must reach both halves; no NV12/P010/RGBA8888 overlays, plane color or
-plane rotation 90/270; offered alternative modes are admitted without the
+must reach both halves; no RGBA8888 or 16-bit UNORM planes, no NV21 (not
+on DCN4's universal planes), no plane degamma/CTM, no rotation 90/270 (also
+on tiled surfaces, which Linux allows); DCC data is CPU-copied into the
+owned surface (so written uncompressed) and the post CSC always loads set
+A; the cursor matrix of a YCbCr primary is not programmed; offered alternative modes are admitted without the
 display's overlays, and KMS admits planes only on the lit timing (a mode
 switch with overlays relights and falls back if they no longer fit);
 OBJ_SETPROPERTY does not set plane properties. Model-tested only

@@ -881,6 +881,22 @@ new SETPLANE, configurations short of pipes are refused, a plane change
 relights the display and framebuffer updates of several planes flip at one
 VUPDATE. Register models and QEMU only; no hardware run.
 
+Navi48 planes now take GFX12 tiled and DCC framebuffers and NV12/P010 on
+every plane, as amdgpu_dm exposes them on DCN 4.0.1: the 17 GFX12 modifiers
+(12 DCC variants, 4 swizzles, LINEAR) in IN_FORMATS / IN_FORMATS_ASYNC,
+ADDFB2 with per-plane handles/pitches/offsets/modifiers and amdgpu's size
+checks, GEM_METADATA tiling flags converted for ADDFB2 without modifiers
+(modifier list, blobs and ADDFB2 decisions matched against Linux's own
+functions built on the host, 2454 vectors); HUBP swizzle, DCC enable, luma
+and chroma pitch/address; SPL 4:2:0 chroma scaling (124 new vectors against
+host-built Linux SPL); the YCbCr post CSC from COLOR_ENCODING/COLOR_RANGE
+(120 vectors against Linux's tables and switches); DML21 admission of
+tiled, DCC and two-surface 4:2:0 planes with their RQ, chroma DLG/TTU and
+mcache plans (618 new configurations against host-built Linux DML21). Tiled
+and 4:2:0
+framebuffers are staged and CPU-copied whole. Register models and QEMU only;
+no hardware run.
+
 DP MST now also runs over 128b/132b links: a branch that codes UHBR trains
 MST at its best UHBR rate (as Linux's decide_mst_link_settings does), streams
 share the owner's HPO link encoder with all 64 slots from slot 0, and each
