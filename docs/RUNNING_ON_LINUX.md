@@ -183,6 +183,17 @@ accelerator. Leave `NARF_QEMU_CPU` unset unless you know the replacement keeps
 the PCI hole below NARF's 1-TiB physical mapping ceiling; xtask clamps its
 default `max` CPU model to 40 physical-address bits for this reason.
 
+The preflight also refuses a group whose
+`/sys/kernel/iommu_groups/<n>/reserved_regions` lists a `direct` range. The
+platform's IOMMU table (AMD IVRS unity ranges, Intel DMAR RMRRs) then requires
+the device to stay identity-mapped, Linux logs "Firmware has requested this
+device have a 1:1 IOMMU mapping", and QEMU fails with `failed to setup
+container for group N: ... Invalid argument`. Only firmware can remove such a
+range; `direct-relaxable` ranges are harmless. The RX 6750 XT on the Gigabyte
+B650I AORUS ULTRA has two (groups 14 and 15), so it cannot be passed through
+on that board as shipped. Test its native modeset by booting NARF on the
+host instead.
+
 On the Linux host, enable AMD-Vi or VT-d in firmware and use the distribution's
 normal early-boot VFIO configuration (`vfio-pci.ids=vendor:device`, initramfs
 module configuration, or `driver_override`) to claim the device. Prefer

@@ -304,6 +304,17 @@ pub enum Blocker {
         limit: u64,
         need: u64,
     },
+    /// The firmware's IOMMU table (AMD IVRS IVMD unity ranges, Intel DMAR
+    /// RMRRs) gives the group `direct` reserved regions: ranges the device
+    /// must see identity-mapped. Linux then refuses any domain but the
+    /// identity one, so claiming the group for a guest fails with
+    /// "Firmware has requested this device have a 1:1 IOMMU mapping" and
+    /// QEMU's `failed to setup container for group N: ... Invalid argument`.
+    /// `direct-relaxable` ranges do not do this.
+    FirmwareDirectMapping {
+        group: String,
+        ranges: Vec<String>,
+    },
 }
 
 /// Why `/dev/vfio/<group>` could not be opened.
@@ -532,6 +543,20 @@ fn group_members(group: &str) -> Vec<GroupMember> {
     out
 }
 
+/// The `direct` lines of a group's `reserved_regions` (`<start> <end>
+/// <type>`), as `start-end`. Only the exact type `direct` counts:
+/// `direct-relaxable`, `msi` and `reserved` do not force an identity domain.
+pub fn direct_ranges(reserved_regions: &str) -> Vec<String> {
+    reserved_regions
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let (start, end, kind) = (f.next()?, f.next()?, f.next()?);
+            (kind == "direct").then(|| format!("{start}-{end}"))
+        })
+        .collect()
+}
+
 /// Guest RAM QEMU pins beyond `-m`: option ROMs, the firmware's own
 /// buffers and VFIO's bookkeeping. Generous on purpose, because an
 /// undersized limit fails late and obscurely.
@@ -720,6 +745,16 @@ pub fn preflight(passing: &[Bdf], guest_ram: Option<u64>) -> Preflight {
                     if m.is_bridge() { " (bridge)" } else { "" },
                 );
             }
+            let regions = Path::new("/sys/kernel/iommu_groups")
+                .join(g)
+                .join("reserved_regions");
+            let ranges = direct_ranges(&std::fs::read_to_string(regions).unwrap_or_default());
+            if !ranges.is_empty() {
+                blockers.push(Blocker::FirmwareDirectMapping {
+                    group: g.clone(),
+                    ranges,
+                });
+            }
             blockers.extend(isolation_blockers(g, &members, passing));
             advisories.extend(sibling_advisories(&members, passing));
         }
@@ -853,6 +888,15 @@ pub fn explain(b: &Blocker) -> String {
              /etc/security/limits.d/ (new login).",
             limit / 1024,
             need >> 20
+        ),
+        Blocker::FirmwareDirectMapping { group, ranges } => format!(
+            "IOMMU group {group} has firmware-mandated identity ranges ({}): the \
+             platform's IOMMU table (AMD IVRS / Intel DMAR) requires this device \
+             to stay 1:1 mapped, so Linux will not let VFIO give it to a guest. \
+             Check firmware options (IOMMU, DMA protection) or a firmware update; \
+             the kernel log says \"Firmware has requested this device have a 1:1 \
+             IOMMU mapping\".",
+            ranges.join(", ")
         ),
     }
 }
@@ -1276,6 +1320,26 @@ mod tests {
         assert_eq!(memlock_blocker(Some(ram + MEMLOCK_SLACK), ram, false), None);
         // CAP_IPC_LOCK bypasses the limit.
         assert_eq!(memlock_blocker(Some(8 << 20), ram, true), None);
+    }
+
+    #[test]
+    fn only_direct_reserved_regions_force_identity() {
+        // The B650I's RX 6750 XT group: two IVMD unity ranges.
+        let rx6750 = "0x000000008b06b000 0x000000008b06cfff direct\n\
+                      0x0000000096035000 0x0000000096035fff direct\n\
+                      0x00000000fee00000 0x00000000feefffff msi\n\
+                      0x000000fd00000000 0x000000ffffffffff reserved\n";
+        assert_eq!(
+            direct_ranges(rx6750),
+            vec![
+                "0x000000008b06b000-0x000000008b06cfff".to_string(),
+                "0x0000000096035000-0x0000000096035fff".to_string(),
+            ]
+        );
+        let relaxable = "0x00000000000a0000 0x00000000000bffff direct-relaxable\n\
+                         0x00000000fee00000 0x00000000feefffff msi\n";
+        assert!(direct_ranges(relaxable).is_empty());
+        assert!(direct_ranges("").is_empty());
     }
 
     #[test]
