@@ -797,10 +797,12 @@ fn smoke_nl80211_ext_power_reg_interface_station() -> TestResult {
     }) {
         return TestResult::Fail("GET_REG global domain");
     }
+    // NL80211_ATTR_WIPHY is the `phyN` index, not the interface position.
     let wiphy = crate::registry::list()
         .iter()
-        .position(|i| i.name() == NAME)
-        .unwrap_or(0) as u32;
+        .find(|i| i.name() == NAME)
+        .and_then(|i| crate::registry::wiphy_index(i.wiphy_id()))
+        .unwrap_or(0);
     let mut w = Vec::new();
     push_attr(&mut w, 1, &wiphy.to_ne_bytes());
     let own = run(station::GET_REG, &w).ok();
@@ -828,13 +830,18 @@ fn smoke_nl80211_ext_power_reg_interface_station() -> TestResult {
                 }) => {}
         _ => return TestResult::Fail("GET_REG dump lacks the self-managed wiphy"),
     }
-    // GET_INTERFACE carries WDEV = wiphy << 32 | 1.
+    // GET_INTERFACE carries WDEV = wiphy << 32 | identifier, the identifier
+    // being the netdev's ifindex (station::wdev_id), which wiphy_from_attrs
+    // decodes back.
     let mut i = Vec::new();
     push_attr(&mut i, 3, &r.ifindex.to_ne_bytes());
     let iface = super::super::handle_in(NL80211_CMD_GET_INTERFACE, &i, false, 0).ok();
-    if !iface.as_ref().and_then(|v| v.first()).is_some_and(|g| {
-        find_attr(&g.attrs, 153) == Some(&(((wiphy as u64) << 32) | 1).to_ne_bytes()[..])
-    }) {
+    let wdev = ((wiphy as u64) << 32) | u64::from(r.ifindex.max(1));
+    let got = iface
+        .as_ref()
+        .and_then(|v| v.first())
+        .and_then(|g| find_attr(&g.attrs, 153));
+    if got != Some(&wdev.to_ne_bytes()[..]) {
         return TestResult::Fail("GET_INTERFACE lacks NL80211_ATTR_WDEV");
     }
     // GET_STATION: the driver's signal, TX rate and completion counters.
@@ -934,7 +941,9 @@ fn smoke_nl80211_ext_connect_owner_release() -> TestResult {
         psk_offload: false,
         sae_offload: false,
         external: true,
-        cipher_suites: &[],
+        // nl80211_crypto_settings checks the ciphers against the wiphy's
+        // cipher_suites (-EINVAL otherwise), so the wiphy advertises CCMP.
+        cipher_suites: &[crate::CIPHER_SUITE_CCMP],
         scan_random_mac: false,
         connected: false,
     };
