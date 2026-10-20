@@ -235,9 +235,11 @@ const MPC_VECTORS: &str = include_str!("../tests/dcn401_spl/mpc_vectors.txt");
 
 /// Every MPC slice of mpc_vectors.txt programs exactly Linux's writes:
 /// calculate_mpc_slice_in_timing_active's share of the plane clip (the
-/// remainder to the last slices), its recout, viewport and inits.
+/// remainder to the last slices), its recout, viewport and inits. A plane
+/// rotated 90 or 270 splits its recout across the stream as any other, and
+/// SPL maps each slice to a band along the source's vertical axis.
 fn dcn401_spl_matches_linux_mpc_vectors() -> TestResult {
-    let mut n = 0;
+    let (mut n, mut rotated) = (0, 0);
     for line in MPC_VECTORS
         .lines()
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
@@ -260,8 +262,9 @@ fn dcn401_spl_matches_linux_mpc_vectors() -> TestResult {
             return TestResult::Fail("MPC slice SPL writes differ from Linux");
         }
         n += 1;
+        rotated += u32::from(input.rotation.orthogonal());
     }
-    if n < 200 {
+    if n < 280 || rotated < 70 {
         return TestResult::Fail("too few MPC slice vectors");
     }
     TestResult::Pass
@@ -269,4 +272,54 @@ fn dcn401_spl_matches_linux_mpc_vectors() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-spl",
     dcn401_spl_matches_linux_mpc_vectors
+);
+
+/// Shared with tests/dcn401_spl/check.sh (harness.c video with MPC set).
+const VIDEO_MPC_VECTORS: &str = include_str!("../tests/dcn401_spl/video_mpc_vectors.txt");
+
+/// Every MPC slice of an NV12/P010 plane in video_mpc_vectors.txt programs
+/// exactly Linux's writes: the luma viewport of the slice's recout and the
+/// chroma viewport SPL derives from it at half the luma ratio (its start
+/// and inits on the chroma grid), upright and rotated 90/270.
+fn dcn401_spl_matches_linux_video_mpc_vectors() -> TestResult {
+    let (mut n, mut rotated) = (0, 0);
+    for line in VIDEO_MPC_VECTORS
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        let Some((inputs, want)) = line.split_once(" = ") else {
+            return TestResult::Fail("malformed vector");
+        };
+        let a: Vec<i32> = inputs
+            .split_whitespace()
+            .filter_map(|v| v.parse().ok())
+            .collect();
+        if a.len() != 18 {
+            return TestResult::Fail("malformed vector inputs");
+        }
+        let video = match a[0] {
+            8 => Video::Nv12,
+            10 => Video::P010,
+            _ => return TestResult::Fail("unknown video format"),
+        };
+        let plane = Input {
+            mpc_slice: (a[16], a[17]),
+            video: Some(video),
+            ..input(&a[1..])
+        };
+        let want = want.replacen("OK WARN", "OK", 1);
+        if tokens(&plane) != want {
+            return TestResult::Fail("SPL 4:2:0 MPC slice writes differ from Linux");
+        }
+        n += 1;
+        rotated += u32::from(plane.rotation.orthogonal());
+    }
+    if n < 70 || rotated < 20 {
+        return TestResult::Fail("too few SPL 4:2:0 MPC slice vectors");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-spl",
+    dcn401_spl_matches_linux_video_mpc_vectors
 );
