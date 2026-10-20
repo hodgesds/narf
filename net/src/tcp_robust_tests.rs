@@ -256,6 +256,62 @@ fn smoke_sack_blocks_fit_beside_timestamps() -> TestResult {
 }
 kernel_test_in!("net/tcp/robust", smoke_sack_blocks_fit_beside_timestamps);
 
+// ── Initial sequence numbers (RFC 6528) ─────────────────────────────────
+
+/// Spin until the 64 ns ISN clock has moved on.
+fn isn_clock_tick() {
+    let t0 = narf_scheduler::narf_time::monotonic_ns();
+    while narf_scheduler::narf_time::monotonic_ns() < t0 + 1_000 {
+        ::core::hint::spin_loop();
+    }
+}
+
+/// `secure_tcp_seq`: one 4-tuple's ISNs increase with time, so a reused
+/// tuple's new SYN is past the old connection's sequence space and a peer's
+/// TIME-WAIT takes it as a new connection. The old ISN was a multiplicative
+/// hash of the clock, below the previous incarnation's about half the time,
+/// and such a SYN is dropped as an old duplicate. Distinct tuples (and
+/// namespaces) get unrelated offsets.
+fn smoke_isn_monotonic_per_tuple() -> TestResult {
+    let (a, b) = ([10, 0, 2, 15], [10, 0, 2, 2]);
+    let mut prev = core::__secure_tcp_seq_for_test(0, a, b, 32_819, 17_782);
+    for _ in 0..64 {
+        isn_clock_tick();
+        let next = core::__secure_tcp_seq_for_test(0, a, b, 32_819, 17_782);
+        if (next.wrapping_sub(prev) as i32) <= 0 {
+            return TestResult::Fail("an ISN for the same 4-tuple did not increase");
+        }
+        prev = next;
+    }
+    let base = core::__secure_tcp_seq_for_test(0, a, b, 32_819, 17_782);
+    let others = [
+        core::__secure_tcp_seq_for_test(0, a, b, 32_820, 17_782),
+        core::__secure_tcp_seq_for_test(0, a, b, 32_819, 17_783),
+        core::__secure_tcp_seq_for_test(0, b, a, 32_819, 17_782),
+        core::__secure_tcp_seq_for_test(1, a, b, 32_819, 17_782),
+    ];
+    // The clock advances them all alike, so tuples apart by only a few ticks
+    // would mean the hash ignored the tuple.
+    if others
+        .iter()
+        .any(|&o| o.wrapping_sub(base).wrapping_add(1 << 20) < 1 << 21)
+    {
+        return TestResult::Fail("distinct 4-tuples got nearly the same ISN offset");
+    }
+    let (a6, b6) = (
+        [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        [0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+    );
+    let first = core::__secure_tcpv6_seq_for_test(a6, b6, 40_000, 443);
+    isn_clock_tick();
+    let second = core::__secure_tcpv6_seq_for_test(a6, b6, 40_000, 443);
+    if (second.wrapping_sub(first) as i32) <= 0 {
+        return TestResult::Fail("an IPv6 ISN for the same 4-tuple did not increase");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp/robust", smoke_isn_monotonic_per_tuple);
+
 // ── TIME-WAIT reuse ─────────────────────────────────────────────────────
 
 /// A bare SYN from `peer:pport` to `local:lport` at `seq`.

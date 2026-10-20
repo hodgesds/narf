@@ -960,6 +960,27 @@ fn pick_local_port4(net_ns_id: u64, local: [u8; 4], remote: [u8; 4], rport: u16)
 }
 
 #[doc(hidden)]
+pub fn __secure_tcp_seq_for_test(
+    net_ns_id: u64,
+    saddr: [u8; 4],
+    daddr: [u8; 4],
+    sport: u16,
+    dport: u16,
+) -> u32 {
+    secure_tcp_seq(net_ns_id, saddr, daddr, sport, dport)
+}
+
+#[doc(hidden)]
+pub fn __secure_tcpv6_seq_for_test(
+    saddr: [u8; 16],
+    daddr: [u8; 16],
+    sport: u16,
+    dport: u16,
+) -> u32 {
+    secure_tcpv6_seq(0, saddr, daddr, sport, dport)
+}
+
+#[doc(hidden)]
 pub fn __pick_local_port_with_for_test(in_use: impl FnMut(u16) -> bool) -> Option<u16> {
     pick_local_port(in_use)
 }
@@ -1625,13 +1646,13 @@ pub fn connect_errno_with_options_in(
     let mac = crate::tcp_stack::arp_resolve_in(net_ns_id, nexthop, 1000)
         .map_err(|()| errno::EHOSTUNREACH as i32)?;
     let id = fresh_tcb_id();
-    let iss = compute_isn();
     // Port choice and index insertion are one step, so two racing connects
     // to the same destination cannot both take a free port.
     let (id, arc) = {
         let _bind = CONNECT_BIND_LOCK.lock();
         let local_port = pick_local_port4(net_ns_id, iface.ipv4, remote_addr, remote_port)
             .ok_or(errno::EADDRNOTAVAIL as i32)?;
+        let iss = secure_tcp_seq(net_ns_id, iface.ipv4, remote_addr, local_port, remote_port);
         let mut tcb = Tcb::new_active(
             id,
             iface.ipv4,
@@ -1713,11 +1734,11 @@ pub fn connect6_errno_with_options_in(
     let mac = crate::ipv6::ndp::neigh_lookup_in(net_ns_id, &iface_name, &neighbor)
         .ok_or(errno::EHOSTUNREACH as i32)?;
     let id = fresh_tcb_id();
-    let iss = compute_isn();
     let (id, arc) = {
         let _bind = CONNECT_BIND_LOCK.lock();
         let local_port = pick_local_port6(net_ns_id, local_addr, remote_addr, remote_port)
             .ok_or(errno::EADDRNOTAVAIL as i32)?;
+        let iss = secure_tcpv6_seq(net_ns_id, local_addr, remote_addr, local_port, remote_port);
         let mut tcb = Tcb::new_active6(
             id,
             local_addr,
@@ -1782,11 +1803,71 @@ pub fn connect6_errno_in(
     )
 }
 
-fn compute_isn() -> u32 {
-    let t = narf_scheduler::narf_time::monotonic_ns();
-    // Twist with a constant so two near-simultaneous opens land
-    // in different windows.
-    (t as u32).wrapping_mul(2654435769)
+/// `net_secret`: the boot-random SipHash key behind every ISN
+/// (`net_secret_init` → `net_get_random_once`).
+static TCP_SEQ_KEY: narf_lib::sync::OnceLock<[u64; 2]> = narf_lib::sync::OnceLock::new();
+
+fn tcp_seq_key() -> &'static [u64; 2] {
+    TCP_SEQ_KEY.get_or_init(|| {
+        let mut b = [0u8; 16];
+        crate::ip_output::get_random_bytes(&mut b);
+        let (k0, k1) = b.split_at(8);
+        [
+            u64::from_le_bytes(k0.try_into().unwrap_or([0; 8])),
+            u64::from_le_bytes(k1.try_into().unwrap_or([0; 8])),
+        ]
+    })
+}
+
+/// `seq_scale`: add a 64 ns clock (period 274 s), so one 4-tuple's ISNs keep
+/// increasing across incarnations. A peer's TIME-WAIT accepts a new SYN only
+/// when its sequence number is past the old connection's (RFC 6528;
+/// `tcp_timewait_state_process`), so a reused tuple must start above where
+/// it left off. Linux reads `ktime_get_real_ns`; the monotonic clock never
+/// steps backwards when the wall clock is set, which this property needs.
+fn seq_scale(hash: u32) -> u32 {
+    hash.wrapping_add((narf_scheduler::narf_time::monotonic_ns() >> 6) as u32)
+}
+
+/// `secure_tcp_seq(saddr, daddr, sport, dport)` (net/core/secure_seq.c):
+/// `siphash_3u32(saddr, daddr, sport << 16 | dport, net_secret)`, then
+/// `seq_scale`. Our side is `saddr`/`sport` for an active and a passive
+/// open alike (`tcp_v4_connect`, `tcp_v4_init_seq`). The namespace id is
+/// hashed too, standing in for Linux's per-netns secret.
+fn secure_tcp_seq(net_ns_id: u64, saddr: [u8; 4], daddr: [u8; 4], sport: u16, dport: u16) -> u32 {
+    let ports = u64::from(sport) << 16 | u64::from(dport);
+    let hash = crate::ip_output::siphash24(
+        tcp_seq_key(),
+        &[
+            u64::from(u32::from_be_bytes(saddr)) | u64::from(u32::from_be_bytes(daddr)) << 32,
+            ports | (net_ns_id & 0xFFFF_FFFF) << 32,
+            net_ns_id >> 32,
+        ],
+    );
+    seq_scale(hash as u32)
+}
+
+/// `secure_tcpv6_seq`: the same over the IPv6 4-tuple.
+fn secure_tcpv6_seq(
+    net_ns_id: u64,
+    saddr: [u8; 16],
+    daddr: [u8; 16],
+    sport: u16,
+    dport: u16,
+) -> u32 {
+    let word = |b: &[u8]| u64::from_le_bytes(b.try_into().unwrap_or([0; 8]));
+    let hash = crate::ip_output::siphash24(
+        tcp_seq_key(),
+        &[
+            word(&saddr[..8]),
+            word(&saddr[8..]),
+            word(&daddr[..8]),
+            word(&daddr[8..]),
+            u64::from(sport) << 16 | u64::from(dport),
+            net_ns_id,
+        ],
+    );
+    seq_scale(hash as u32)
 }
 
 // ── Public API: send / recv ─────────────────────────────────────────
@@ -3612,7 +3693,8 @@ fn accept_into_listen(
         }
     };
     let id = fresh_tcb_id();
-    let iss = compute_isn();
+    // `tcp_v4_init_seq`: our address and port first.
+    let iss = secure_tcp_seq(net_ns_id, dst, src, hdr.dst_port, hdr.src_port);
     let mut child =
         Tcb::new_active(id, dst, hdr.dst_port, src, hdr.src_port, mac, iss).with_net_ns(net_ns_id);
     child.state = TcpState::SynReceived;
@@ -3676,8 +3758,9 @@ fn accept_into_listen6(
         return;
     };
     let id = fresh_tcb_id();
-    let mut child = Tcb::new_active6(id, dst, hdr.dst_port, src, hdr.src_port, mac, compute_isn())
-        .with_net_ns(net_ns_id);
+    let iss = secure_tcpv6_seq(net_ns_id, dst, src, hdr.dst_port, hdr.src_port);
+    let mut child =
+        Tcb::new_active6(id, dst, hdr.dst_port, src, hdr.src_port, mac, iss).with_net_ns(net_ns_id);
     child.state = TcpState::SynReceived;
     child.irs = hdr.sequence;
     child.rcv_nxt = hdr.sequence.wrapping_add(1);
