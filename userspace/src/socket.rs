@@ -3412,19 +3412,25 @@ impl SocketFile {
             }
         };
         match reg {
+            // Unix names, like the inet listeners below, are only unpublished
+            // when the entry is THIS socket. A merely-bound pathname socket
+            // never entered LISTENERS (listen() does that), a socket-activation
+            // handoff re-keys the path to the new listener, and a release that
+            // runs a second time (a later close of a duplicate) must not evict
+            // whoever has bound the name since.
             Reg::Unix(p) => {
                 if let Some(map) = LISTENERS.lock().as_mut() {
-                    map.remove(&p);
+                    remove_if_self(map, &p, self);
                 }
             }
             Reg::AbstractStream(n) => {
                 if let Some(map) = ABSTRACT_STREAM.lock().as_mut() {
-                    map.remove(&n);
+                    remove_if_self(map, &n, self);
                 }
             }
             Reg::AbstractDgram(n) => {
                 if let Some(map) = ABSTRACT_DGRAM.lock().as_mut() {
-                    map.remove(&n);
+                    remove_if_self(map, &n, self);
                 }
             }
             // Only unpublish the entry if it is THIS socket: a merely-bound
@@ -3453,7 +3459,7 @@ impl SocketFile {
             }
             Reg::UnixDgram(p) => {
                 if let Some(map) = UNIX_DGRAM_BOUND.lock().as_mut() {
-                    map.remove(&p);
+                    remove_if_self(map, &p, self);
                 }
             }
             Reg::InetDgram(port, port_locked) => {
@@ -10574,6 +10580,17 @@ fn unix_stream_listener_at_path(p: &str) -> bool {
 
 /// Abstract-namespace SOCK_STREAM / SOCK_SEQPACKET listeners: name → socket.
 type AbstractSocketRegistry = BTreeMap<(u64, Vec<u8>), Arc<SocketFile>>;
+
+/// Remove `key` from a name → socket registry only if it still maps to
+/// `sock`.
+fn remove_if_self<K: Ord>(map: &mut BTreeMap<K, Arc<SocketFile>>, key: &K, sock: &SocketFile) {
+    if map
+        .get(key)
+        .is_some_and(|s| core::ptr::eq(Arc::as_ptr(s), sock))
+    {
+        map.remove(key);
+    }
+}
 
 static ABSTRACT_STREAM: IrqSafeSpinLock<Option<AbstractSocketRegistry>> =
     IrqSafeSpinLock::new(None);

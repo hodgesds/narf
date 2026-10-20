@@ -4209,6 +4209,167 @@ fn smoke_abi_socket_abstract_stream_inuse() -> TestResult {
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_socket_abstract_stream_inuse);
 
+// ─────── A socket's name lives as long as the socket, however it goes ───────
+//
+// Linux releases a bound unix name in `unix_release`, which runs when the last
+// reference to the open file goes: close(2), dup2 over the descriptor,
+// close_range, the exec close-on-exec sweep or exit. A connect to the name
+// afterwards is ECONNREFUSED. A name that outlives its socket is worse than a
+// refusal: connect() succeeds against a listener nobody will ever accept from,
+// and the client waits forever (the CachyOS boot stalled this way on
+// `plymouth update-root-fs` after plymouthd had exited without closing its
+// "/org/freedesktop/plymouthd" listener).
+
+/// Bind `fd` to the abstract stream `name` and listen on it.
+fn listen_abstract(fd: u64, name: &[u8]) -> Result<(), &'static str> {
+    let (addr, alen) = abstract_sockaddr(name);
+    if call(
+        Syscall::SocketBind.raw(),
+        a2(fd, addr.as_ptr() as u64, alen),
+    ) != Some(0)
+    {
+        return Err("bind() to an abstract stream name failed");
+    }
+    if call(Syscall::SocketListen.raw(), a2(fd, 8, 0)) != Some(0) {
+        return Err("listen() on the abstract stream socket failed");
+    }
+    Ok(())
+}
+
+/// connect() a fresh stream socket to the abstract `name`; the raw result.
+fn connect_abstract(name: &[u8]) -> Result<Option<i64>, &'static str> {
+    let c = open_unix(SOCK_STREAM)?;
+    let (addr, alen) = abstract_sockaddr(name);
+    let r = call(
+        Syscall::SocketConnect.raw(),
+        a2(c, addr.as_ptr() as u64, alen),
+    );
+    let _ = call(Syscall::Close.raw(), a1(c, 0));
+    Ok(r)
+}
+
+/// The released name refuses connections and can be bound again.
+fn expect_abstract_released(name: &[u8], how: &'static str) -> Result<(), &'static str> {
+    if connect_abstract(name)? != Some(-111) {
+        return Err(how);
+    }
+    let again = open_unix(SOCK_STREAM)?;
+    listen_abstract(again, name)
+        .map_err(|_| "the released abstract name could not be bound again")?;
+    let _ = call(Syscall::Close.raw(), a1(again, 0));
+    Ok(())
+}
+
+/// Exit (the fd table dropped without close(2)) releases a listener's
+/// abstract name.
+fn smoke_abi_socket_abstract_listener_released_on_exit() -> TestResult {
+    with_setup(|| {
+        let name = b"narf-abstract-exit";
+        let l = open_unix(SOCK_STREAM)?;
+        listen_abstract(l, name)?;
+        if connect_abstract(name)? != Some(0) {
+            return Err("connect() to a live abstract listener failed");
+        }
+        crate::fd::detach(FAKE_TASK);
+        expect_abstract_released(
+            name,
+            "connect() after the listener's owner exited was not ECONNREFUSED",
+        )
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_abstract_listener_released_on_exit
+);
+
+/// dup2() over a listener's only descriptor closes the listener.
+fn smoke_abi_socket_abstract_listener_released_by_dup2() -> TestResult {
+    with_setup(|| {
+        let name = b"narf-abstract-dup2";
+        let l = open_unix(SOCK_STREAM)?;
+        listen_abstract(l, name)?;
+        let other = open_unix(SOCK_STREAM)?;
+        if call(Syscall::Dup2.raw(), a2(other, l, 0)) != Some(l as i64) {
+            return Err("dup2() onto the listener's descriptor failed");
+        }
+        expect_abstract_released(
+            name,
+            "connect() after dup2 replaced the listener was not ECONNREFUSED",
+        )
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_abstract_listener_released_by_dup2
+);
+
+/// close_range() over a listener closes it.
+fn smoke_abi_socket_abstract_listener_released_by_close_range() -> TestResult {
+    with_setup(|| {
+        let name = b"narf-abstract-close-range";
+        let l = open_unix(SOCK_STREAM)?;
+        listen_abstract(l, name)?;
+        if call(Syscall::CloseRange.raw(), a3(l, l, 0, 0)) != Some(0) {
+            return Err("close_range() over the listener failed");
+        }
+        expect_abstract_released(
+            name,
+            "connect() after close_range closed the listener was not ECONNREFUSED",
+        )
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_abstract_listener_released_by_close_range
+);
+
+/// The exec close-on-exec sweep closes a SOCK_CLOEXEC listener.
+fn smoke_abi_socket_abstract_listener_released_by_cloexec() -> TestResult {
+    with_setup(|| {
+        const SOCK_CLOEXEC: u64 = 0o2000000;
+        let name = b"narf-abstract-cloexec";
+        let l = open_unix(SOCK_STREAM | SOCK_CLOEXEC)?;
+        listen_abstract(l, name)?;
+        if crate::fd::close_cloexec(FAKE_TASK) == 0 {
+            return Err("the close-on-exec sweep closed nothing");
+        }
+        expect_abstract_released(
+            name,
+            "connect() after exec closed the CLOEXEC listener was not ECONNREFUSED",
+        )
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_abstract_listener_released_by_cloexec
+);
+
+/// A listener still open in another task (a forked child's inherited copy)
+/// stays bound when the first owner exits.
+fn smoke_abi_socket_abstract_listener_kept_by_other_owner() -> TestResult {
+    with_setup(|| {
+        const CHILD: u64 = FAKE_TASK - 1;
+        let name = b"narf-abstract-shared";
+        let l = open_unix(SOCK_STREAM)?;
+        listen_abstract(l, name)?;
+        crate::fd::fork(FAKE_TASK, CHILD);
+        crate::fd::detach(FAKE_TASK);
+        let live = connect_abstract(name)?;
+        crate::fd::detach(CHILD);
+        if live != Some(0) {
+            return Err("a listener the child still holds stopped accepting connects");
+        }
+        expect_abstract_released(
+            name,
+            "connect() after the last owner exited was not ECONNREFUSED",
+        )
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_abstract_listener_kept_by_other_owner
+);
+
 /// Autobind: bind with `addrlen == sizeof(sa_family_t)` (2) assigns a
 /// fresh abstract name; getsockname reports a usable abstract address
 /// (leading NUL, non-empty).
@@ -11799,6 +11960,10 @@ kernel_test_in!(
 /// IP_MULTICAST_ALL is set (`ip_mc_sf_allow`).
 fn smoke_abi_socket_sockopt_mcast_delivery_pos() -> TestResult {
     with_setup(|| {
+        // Boot registers `lo` with the stack (`install_net_stack`); the
+        // kernel-test boot does not run that path, and which smoke ran first
+        // is a link-order accident, so register it here like the siblings.
+        narf_net::iface::register_loopback_iface();
         const PORT: u16 = 47_351;
         let group = ip_mreqn(so::MDNS_V4, 0, 1);
         let mut members = [0u64; 2];

@@ -42,7 +42,9 @@ pub(crate) fn sys_dup3(ctx: &mut dyn TrapContext) {
     }
     let outcome = fd::with_table(task, |t| t.duplicate_to(oldfd, newfd, descriptor_flags));
     match outcome {
-        Some(Some(())) => {
+        Some(Some(replaced)) => {
+            // `do_dup2` closes the file the slot held (`filp_close`).
+            fd::release_closed(task, replaced);
             crate::mqueue::duplicate_fd_path(task, oldfd, newfd);
             ctx.set_return(SyscallReturn::ok(newfd as u64));
         }
