@@ -360,6 +360,8 @@ impl<I: Io> Engine<I> {
             self.update(l.hubp(q, ADDRESS), u32::MAX, p.address as u32)?;
         }
         self.update(l.otg(pipe, LOCK), LOCK_REQUEST, 0)?;
+        // Unlocked: under DRR the manual trigger ends the stretched blank.
+        self.drr_trigger(pipe)?;
         self.latched(p, |e| e.all_in_use(p, p.address)).await?;
         Ok(self.read(l.otg(pipe, FRAME_COUNT))? & FRAME_MASK)
     }
@@ -447,6 +449,9 @@ impl<I: Io> Engine<I> {
     pub(super) async fn stop_fetch(&mut self, p: Pipe) -> Result<(), Error> {
         let l = self.layout;
         let pipe = p.pipe;
+        // Leaving scanout returns to fixed refresh, so the later video and
+        // timing waits see nominal frames; `p` already bounds a stretched one.
+        self.drr_fixed(pipe)?;
         // The cursor is a fetch source too; it latches off with the black.
         self.hide_cursor(pipe)?;
         self.lock(pipe).await?;
@@ -639,7 +644,7 @@ impl Surfaces {
             odm: surface.request.odm,
             address: surface.address,
             black: 0x41 | blank.request.depth.dpg() << 12,
-            timeout_us: blank.timeout_us()?,
+            timeout_us: e.frame_timeout_us(d.pipe, blank)?,
             watch: true,
         })
     }

@@ -1,6 +1,7 @@
 //! Native DCN401 timing preparation and retirement. Register layout comes
 //! from dcn_4_1_0; sequencing from Linux dcn401_optc.c/dcn10_optc.c.
-//! Progressive RGB, fixed refresh and one OPP per OTG only. Internal black
+//! Progressive RGB and one OPP per OTG only; timing is prepared at fixed
+//! refresh, and a live scanout may then run DRR (`amdgpu_dcn401_drr`). Internal black
 //! timing and owned legacy DP black video can run with fetchers stopped;
 //! surface scanout still needs its owners.
 use crate::{
@@ -62,6 +63,9 @@ mod dsc_hw;
 #[path = "amdgpu_dcn401_mst.rs"]
 mod mst;
 pub use mst::{vc_rate, MstAllocation};
+#[path = "amdgpu_dcn401_drr.rs"]
+mod drr;
+pub use drr::DrrApplied;
 #[path = "amdgpu_dcn401_frl.rs"]
 mod frl;
 pub use frl::{
@@ -357,6 +361,9 @@ pub struct Status {
     pub underflow: Option<ScanoutUnderflow>,
     /// The owned cursor on the live pipe; cleared when scanout stops.
     pub cursor: Option<CursorApplied>,
+    /// Live DRR on the scanout's timing; cleared when fixed refresh is
+    /// restored (on request, before fetch stops, and before the timing stops).
+    pub drr: Option<DrrApplied>,
     /// Historical DP video blanking only; never PHY, timing or memory retirement.
     pub dp_blanked: Option<DpBlanked>,
     /// Historical stream-encoder shutdown only; PHYs and memory stay retained.
@@ -443,6 +450,7 @@ impl Status {
             scanout: None,
             underflow: None,
             cursor: None,
+            drr: None,
             dp_blanked: None,
             dp_encoder_retired: None,
             dp_sst_disabled: None,
@@ -1230,6 +1238,7 @@ impl<I: Io> Engine<I> {
     }
     async fn disable(&mut self, pipe: u8) -> Result<(), Error> {
         let l = self.layout;
+        self.drr_fixed(pipe)?;
         self.update(l.odm(pipe, SOURCE), 0xffff0003, 0xffff0000)?;
         self.update(l.odm(pipe, MEMORY), 0xffff, 0)?;
         self.update(l.otg(pipe, CONTROL), 1, 0)?;

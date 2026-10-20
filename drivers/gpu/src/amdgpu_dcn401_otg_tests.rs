@@ -19,7 +19,7 @@ pub(super) struct Fake {
     poll_limit: Option<u32>,
     retiring: [bool; 4],
     delay: [u8; 4],
-    reject: Option<usize>,
+    pub(super) reject: Option<usize>,
     gone: Option<usize>,
     revoke: Option<(usize, Cap<BusDeviceCap, Write>)>,
     after_enable: Option<(u64, u32)>,
@@ -391,7 +391,7 @@ pub(super) fn engine() -> Engine<Fake> {
         displays: Displays::new(),
     }
 }
-fn request(pipe: u8) -> Request {
+pub(super) fn request(pipe: u8) -> Request {
     Request {
         pipe,
         signal: Signal::HpoDisplayPort,
@@ -420,7 +420,7 @@ fn request(pipe: u8) -> Request {
         },
     }
 }
-fn clock(request: Request) -> dccg::Applied {
+pub(super) fn clock(request: Request) -> dccg::Applied {
     dccg::Applied {
         request: dccg::Request {
             pipe: request.pipe,

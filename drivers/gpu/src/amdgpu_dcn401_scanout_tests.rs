@@ -20,6 +20,8 @@ struct Hw {
     underflow_after: Option<usize>,
     writes: usize,
     frame: u32,
+    /// OTG_TRIGA_MANUAL_TRIG writes: (value, OTG lock, HUBP address) then.
+    triggers: alloc::vec::Vec<(u32, u32, u32)>,
 }
 impl Hw {
     fn optc_input(&self) -> u64 {
@@ -71,6 +73,15 @@ impl Io for Hw {
     fn write(&mut self, at: u64, value: u32) {
         self.writes += 1;
         let (l, p) = (self.layout, self.pipe);
+        if at == l.otg(p, 0x1b3c) {
+            let state = (
+                value,
+                self.get(l.otg(p, LOCK)),
+                self.get(l.hubp(p, ADDRESS)),
+            );
+            self.triggers.push(state);
+            return;
+        }
         let mut value = value;
         if at == l.otg(p, LOCK) {
             if value & LOCK_REQUEST != 0 {
@@ -126,6 +137,7 @@ fn staged_odm(pipe: u8, odm: Option<u8>) -> Engine<Hw> {
         underflow_after: None,
         writes: 0,
         frame: 7,
+        triggers: alloc::vec::Vec::new(),
     };
     hw.regs.insert(l.otg(pipe, CONTROL), OTG_MASTER_EN);
     for q in core::iter::once(pipe).chain(odm) {
@@ -512,6 +524,47 @@ fn dcn401_scanout_flip_latches_new_address_under_the_lock() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-scanout",
     dcn401_scanout_flip_latches_new_address_under_the_lock
+);
+
+/// Under DRR a flip fires OTG_TRIGA_MANUAL_TRIG once, after the address
+/// update is unlocked (commit_planes_for_stream's manual trigger); at fixed
+/// refresh, or for another pipe's DRR, it never does. Completion evidence is
+/// unchanged: the new address in use.
+fn dcn401_scanout_flip_fires_drr_manual_trigger_only_when_active() -> TestResult {
+    const BACK: u64 = 0x8_0090_0000;
+    let drr = crate::amdgpu_freesync::Drr {
+        v_total_min: 1125,
+        v_total_max: 1688,
+    };
+    for (active, other) in [(false, false), (true, false), (false, true)] {
+        let pipe = 1;
+        let mut e = staged(pipe);
+        let p = target(pipe);
+        if run(e.start_fetch(p)).is_err() || e.flip_quiet(pipe).is_err() {
+            return TestResult::Fail("start");
+        }
+        if active || other {
+            let on = if other { 3 } else { pipe };
+            e.status.drr = Some(crate::amdgpu_dcn401_otg::DrrApplied::for_test(on, drr));
+        }
+        let next = Pipe { address: BACK, ..p };
+        if run(e.flip_to(next)).is_err() || e.live_fetch(pipe, BACK).is_err() {
+            return TestResult::Fail("flip");
+        }
+        let expected: alloc::vec::Vec<(u32, u32, u32)> = if active {
+            alloc::vec![(1, 0, BACK as u32)]
+        } else {
+            alloc::vec::Vec::new()
+        };
+        if e.io.triggers != expected {
+            return TestResult::Fail("manual trigger");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_flip_fires_drr_manual_trigger_only_when_active
 );
 
 fn dcn401_scanout_cursor_programs_under_its_lock_and_stops_with_fetch() -> TestResult {
