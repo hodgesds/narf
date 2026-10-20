@@ -202,6 +202,13 @@ mod tests {
     /// flushed once (a disk and its partition are one flush), and a disk the
     /// policy keeps read-only is not touched.
     fn smoke_sync_all_reaches_every_superblock_once() -> TestResult {
+        // `sync_all` walks every mount and disk in the kernel, including any
+        // an earlier test left behind. Judge the report against a baseline
+        // taken before this test's fixtures exist, so only their outcome
+        // counts.
+        let Some(baseline) = poll_ready(super::sync_all()) else {
+            return TestResult::Fail("baseline sync_all did not complete");
+        };
         let auth = crate::bootstrap_mount_authority();
         let shared = Arc::new(CountFs::default());
         let private = Arc::new(CountFs::default());
@@ -259,7 +266,10 @@ mod tests {
         if flushes != 1 {
             return TestResult::Fail("a disk and its partition must get exactly one flush");
         }
-        if report.fs_errors != 0 || report.flush_errors != 0 || report.filesystems < 2 {
+        if report.fs_errors > baseline.fs_errors
+            || report.flush_errors > baseline.flush_errors
+            || report.filesystems < baseline.filesystems + 2
+        {
             return TestResult::Fail("sync report inconsistent");
         }
         TestResult::Pass
