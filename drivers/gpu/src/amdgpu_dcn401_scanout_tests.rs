@@ -179,6 +179,7 @@ fn dcn401_scanout_odm_drives_both_halves_under_one_lock() -> TestResult {
             height: 4320,
             format: SurfaceFormat::Xrgb8888,
             odm: Some(q),
+            plane: None,
         },
         address: ADDR,
         pitch_bytes: 7680 * 4,

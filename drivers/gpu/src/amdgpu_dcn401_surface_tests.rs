@@ -109,6 +109,7 @@ fn req(pipe: u8) -> SurfaceRequest {
         height: 3,
         format: SurfaceFormat::Xrgb8888,
         odm: None,
+        plane: None,
     }
 }
 
@@ -355,8 +356,8 @@ fn dcn401_surface_stages_owned_padded_rgb_on_every_pipe() -> TestResult {
                 (0x5ef, 0x40034041),
                 (0x5e9, 0),
                 (0x5ee, 0),
-                (0x5ed, 0x40004000),
-                (0x5f1, 0x40004000),
+                (0x5ed, 0x40034041),
+                (0x5f1, 0x40034041),
                 (0x5ec, 0),
                 (0x5f0, 0),
                 (0x609, 0x40000000),

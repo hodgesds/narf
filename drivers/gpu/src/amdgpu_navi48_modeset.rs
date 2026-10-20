@@ -2339,6 +2339,7 @@ impl ColdBoot {
                 height,
                 format: selection.format,
                 odm,
+                plane: None,
             })
             .await?;
             // `fill` draws XRGB8888 rows; any other format keeps the cleared

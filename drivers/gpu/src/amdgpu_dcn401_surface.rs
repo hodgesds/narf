@@ -2,6 +2,7 @@
 //! hubp401_program_surface_config, hubp401_set_viewport and
 //! hubp401_program_surface_flip_and_addr. Fetch remains blank and disconnected.
 use super::*;
+use crate::amdgpu_dcn401_spl as spl;
 use crate::amdgpu_vram::{Pool, Reservation};
 use core::sync::atomic::{fence, Ordering};
 #[path = "amdgpu_dcn401_surface_release.rs"]
@@ -183,6 +184,51 @@ impl SurfaceFormat {
         )
     }
 }
+/// How a plane blends over what lies below it in the MPCC tree, as
+/// amdgpu_dm_plane_fill_blending_from_plane_state derives it from the DRM
+/// plane's "pixel blend mode" and "alpha" (dcn401_update_mpcc_sequence
+/// programs it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Blend {
+    /// Per-pixel alpha: an A format with blend mode Pre-multiplied or
+    /// Coverage. Also the line buffer's ALPHA_EN.
+    pub per_pixel_alpha: bool,
+    /// Pre-multiplied (not Coverage) per-pixel alpha.
+    pub premultiplied: bool,
+    /// The plane alpha below 0xffff, as amdgpu_dm passes it to an 8-bit
+    /// MPCC_GLOBAL_ALPHA (`alpha >> 8`); none while opaque.
+    pub global_alpha: Option<u8>,
+}
+impl Blend {
+    /// The default plane state (blend mode Pre-multiplied, alpha opaque).
+    pub const fn default_for(format: SurfaceFormat) -> Self {
+        Self {
+            per_pixel_alpha: format.per_pixel_alpha(),
+            premultiplied: true,
+            global_alpha: None,
+        }
+    }
+}
+/// Where a plane's surface shows, as amdgpu_dm_plane_fill_dc_scaling_info
+/// hands it to DC: its source rectangle in the surface and its destination
+/// on the stream (DRM's SRC_* and CRTC_*, the clip being the destination),
+/// with the stream it is scanned out on, and the plane's rotation and
+/// blending. SPL turns it into each pipe's viewport, recout and scaler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaneLayout {
+    pub src: spl::Rect,
+    pub dst: spl::Rect,
+    /// The stream's addressable size.
+    pub stream_width: u32,
+    pub stream_height: u32,
+    /// The stream leaves as YCbCr 4:2:0: an ODM right half's OPP takes one
+    /// extra left-edge pixel (resource_get_odm_slice_src_rect).
+    pub ycbcr420: bool,
+    /// ROTATE_0 or ROTATE_180: DML refuses a linear surface scanned
+    /// vertically (SourceFormatPixelAndScanSupport).
+    pub rotation: spl::Rotation,
+    pub blend: Blend,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SurfaceRequest {
     pub pipe: u8,
@@ -193,6 +239,9 @@ pub struct SurfaceRequest {
     /// same surface (and whose DPP/MPCC/DET follow it). Its own timing,
     /// surface slot and memory stay unused.
     pub odm: Option<u8>,
+    /// The plane's placement; `None` is the whole surface unscaled on a
+    /// stream of its own size, blended as `Blend::default_for` its format.
+    pub plane: Option<PlaneLayout>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SurfaceApplied {
@@ -216,23 +265,114 @@ impl SurfaceRequest {
         {
             return Err(Error::Invalid);
         }
+        if let Some(p) = self.plane {
+            let (s, d) = (p.src, p.dst);
+            let within = |start: i32, len: i32, size: u32| {
+                start >= 0 && len > 0 && start as u64 + len as u64 <= u64::from(size)
+            };
+            if !within(s.x, s.width, self.width)
+                || !within(s.y, s.height, self.height)
+                || d.width <= 0
+                || d.height <= 0
+                || p.stream_width == 0
+                || p.stream_height == 0
+                || p.stream_width > 0x3fff
+                || p.stream_height > 0x3fff
+                || self.odm.is_some() && p.stream_width % 2 != 0
+                || !matches!(p.rotation, spl::Rotation::R0 | spl::Rotation::R180)
+                || (p.blend.per_pixel_alpha && !self.format.cnvc_alpha())
+            {
+                return Err(Error::Invalid);
+            }
+            // Every pipe's SPL must succeed (resource_build_scaling_params).
+            if self.scalers().any(|(_, scaler)| !scaler.ok) {
+                return Err(Error::Unsupported);
+            }
+        }
         // Linear surfaces use 256-byte-aligned rows and page-aligned backing.
         let pitch = self.format.pitch_bytes(self.width);
         Ok((pitch, u64::from(pitch) * u64::from(self.height)))
     }
 }
 impl SurfaceRequest {
-    /// Each ODM segment's pipe, first column and width, the request's own
-    /// pipe first; the whole line on that pipe without ODM.
+    /// The effective layout: the request's, or the whole surface unscaled.
+    pub fn layout(self) -> PlaneLayout {
+        self.plane.unwrap_or(PlaneLayout {
+            src: spl::Rect::new(0, 0, self.width as i32, self.height as i32),
+            dst: spl::Rect::new(0, 0, self.width as i32, self.height as i32),
+            stream_width: self.width,
+            stream_height: self.height,
+            ycbcr420: false,
+            rotation: spl::Rotation::R0,
+            blend: Blend::default_for(self.format),
+        })
+    }
+    /// Whether this is the unscaled full-frame plane of its stream.
+    pub fn full_frame(self) -> bool {
+        let l = self.layout();
+        l.src == spl::Rect::new(0, 0, self.width as i32, self.height as i32)
+            && l.dst == spl::Rect::new(0, 0, l.stream_width as i32, l.stream_height as i32)
+            && l.stream_width == self.width
+            && l.stream_height == self.height
+            && l.rotation == spl::Rotation::R0
+    }
+    /// Each ODM segment's pipe and SPL's input for it, the request's own
+    /// pipe first; the whole stream on that pipe without ODM.
+    /// resource_get_odm_slice_src_rect: even halves, a 4:2:0 right half one
+    /// pixel wider to the left.
+    pub(in crate::amdgpu_dcn401_otg) fn spl_inputs(
+        self,
+    ) -> impl Iterator<Item = (u8, spl::Input)> + Clone {
+        let l = self.layout();
+        let (w, h) = (l.stream_width as i32, l.stream_height as i32);
+        let half = if self.odm.is_some() { w / 2 } else { w };
+        let edge = i32::from(l.ycbcr420);
+        let input = move |odm_slice| spl::Input {
+            src: l.src,
+            dst: l.dst,
+            clip: l.dst,
+            stream_width: w,
+            stream_height: h,
+            odm_slice,
+            rotation: l.rotation,
+            horizontal_mirror: false,
+            alpha: l.blend.per_pixel_alpha,
+        };
+        core::iter::once((self.pipe, input(spl::Rect::new(0, 0, half, h)))).chain(
+            self.odm
+                .map(move |q| (q, input(spl::Rect::new(half - edge, 0, w - half + edge, h)))),
+        )
+    }
+    /// Each segment's pipe and spl_calculate_scaler_params' result. A
+    /// request without a layout is the whole surface unscaled: each segment
+    /// bypasses the scaler with its own columns (`spl::Scaler::unity`), as
+    /// SPL computes it for any surface of at least its 12-pixel minimum
+    /// viewport and no 4:2:0 ODM.
+    pub(in crate::amdgpu_dcn401_otg) fn scalers(
+        self,
+    ) -> impl Iterator<Item = (u8, spl::Scaler)> + Clone {
+        let height = self.height as i32;
+        let laid_out = self.plane.is_some();
+        self.spl_inputs()
+            .zip(self.segments())
+            .map(move |((p, input), (_, x, width))| {
+                let scaler = if laid_out {
+                    spl::calculate(&input)
+                } else {
+                    spl::Scaler::unity(x as i32, width as i32, height)
+                };
+                (p, scaler)
+            })
+    }
+    /// Each ODM segment's pipe, first stream column and width (its ODM
+    /// slice's destination), the request's own pipe first; the whole
+    /// stream on that pipe without ODM.
     pub(in crate::amdgpu_dcn401_otg) fn segments(
         self,
     ) -> impl Iterator<Item = (u8, u32, u32)> + Clone {
-        let width = if self.odm.is_some() {
-            self.width / 2
-        } else {
-            self.width
-        };
-        core::iter::once((self.pipe, 0, width)).chain(self.odm.map(|q| (q, width, width)))
+        let w = self.layout().stream_width;
+        let width = if self.odm.is_some() { w / 2 } else { w };
+        core::iter::once((self.pipe, 0, width)).chain(self.odm.map(move |q| (q, width, w - width)))
     }
     /// Every pipe the surface's fetch occupies, by bit.
     pub(in crate::amdgpu_dcn401_otg) fn pipe_mask(self) -> u8 {
@@ -263,12 +403,14 @@ impl SurfaceApplied {
         Ok(u64::from(y) * u64::from(self.pitch_bytes) + first)
     }
     /// One segment's HUBP surface registers: the shared address and pitch,
-    /// with a viewport of that segment's columns (hubp401_set_viewport).
-    /// hubp401_program_size's PITCH is in pixels, less one;
-    /// hubp2_program_pixel_format sets the format and crossbar.
-    fn registers(self, x: u32, width: u32) -> [(u64, u32, u32); 18] {
-        let dimensions = width | self.request.height << 16;
+    /// with SPL's viewport for that segment (hubp401_set_viewport, luma and
+    /// chroma alike for RGB). hubp401_program_size's PITCH is in pixels,
+    /// less one; hubp2_program_rotation and hubp2_program_pixel_format set
+    /// the rotation, format and crossbar.
+    fn registers(self, scaler: &spl::Scaler) -> [(u64, u32, u32); 18] {
         let format = self.request.format;
+        let rotation = self.request.layout().rotation as u32;
+        let [d, s, sd, ss, dc, sc, sdc, ssc] = crate::amdgpu_dcn401_dscl::viewport(scaler);
         [
             (0x612, 0x203, 0), // primary TMZ, both DCC enables
             (0x5e7, 7, 0),     // ADDR3 linear; DIM_TYPE stays at native 2D
@@ -277,17 +419,17 @@ impl SurfaceApplied {
                 0xffff,
                 self.pitch_bytes / format.bytes_per_pixel() - 1,
             ),
-            // No rotation, mirror or alpha plane.
-            (0x5e5, 0xf7f, format.hubp_pixel_format()),
+            // ROTATION_ANGLE; no mirror or alpha plane.
+            (0x5e5, 0xf7f, format.hubp_pixel_format() | rotation << 8),
             (0x66d, 0xf00000, format.crossbar()),
-            (0x5eb, 0x3fff3fff, dimensions),
-            (0x5e9, u32::MAX, x),
-            (0x5ef, 0x3fff3fff, dimensions),
-            (0x5ee, u32::MAX, x),
-            (0x5ed, 0x3fff3fff, 0),
-            (0x5ec, u32::MAX, 0),
-            (0x5f1, 0x3fff3fff, 0),
-            (0x5f0, u32::MAX, 0),
+            d,
+            s,
+            sd,
+            ss,
+            dc,
+            sc,
+            sdc,
+            ssc,
             (0x609, 0xf, 0),    // VMID0, physical FB aperture still needs setup
             (FLIP, 0x130f2, 0), // normal, non-stereo, no skipped vupdates
             (FLIP2, 0x700, 0),  // no GSL or triple buffering
@@ -526,14 +668,14 @@ impl<I: Io> Engine<I> {
     }
     fn verify_surface(&mut self, surface: SurfaceApplied) -> Result<(), Error> {
         let l = self.layout;
-        for (p, x, width) in surface.request.segments() {
+        for (p, scaler) in surface.request.scalers() {
             if !self.hubp_powered(p)? {
                 return Err(Error::Busy);
             }
             if self.read(l.hubp(p, 0x5e7))? & 0x180 != 0x80 {
                 return Err(Error::Busy);
             }
-            for (r, mask, value) in surface.registers(x, width) {
+            for (r, mask, value) in surface.registers(&scaler) {
                 let at = l.hubp(p, r);
                 if self.read(at)? & mask != value {
                     return Err(Error::Readback(at));
@@ -544,11 +686,11 @@ impl<I: Io> Engine<I> {
     }
     async fn program_surface(&mut self, surface: SurfaceApplied) -> Result<(), Error> {
         let l = self.layout;
-        for (p, x, width) in surface.request.segments() {
+        for (p, scaler) in surface.request.scalers() {
             self.update(l.hubp(p, HUBP_CLOCK), 1, 1)?;
             self.wait(l.hubp(p, HUBP_CONTROL), 0x1007, 3, 100_000)
                 .await?;
-            for (r, mask, value) in surface.registers(x, width) {
+            for (r, mask, value) in surface.registers(&scaler) {
                 self.update(l.hubp(p, r), mask, value)?;
             }
             // Address writes may leave a pending flip until timing runs. That

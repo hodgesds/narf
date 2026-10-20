@@ -907,6 +907,30 @@ pub fn calculate(input: &Input) -> Scaler {
 }
 
 impl Scaler {
+    /// What SPL computes for an unscaled full-frame plane's ODM slice
+    /// `x..x + width` of `height` lines, without the 12-pixel minimum
+    /// viewport clamp: the scaler bypassed with one tap, the slice's own
+    /// recout and viewport.
+    pub fn unity(x: i32, width: i32, height: i32) -> Self {
+        let r = Rect::new(x, 0, width, height);
+        let one = 1 << 19 << 5;
+        Self {
+            recout: Rect::new(0, 0, width, height),
+            mpc_size: (width, height),
+            dscl_mode: SCL_MODE_SCALING_444_BYPASS,
+            ratios: [one; 4],
+            init: Init::default(),
+            taps: [0; 4],
+            viewport: r,
+            viewport_c: r,
+            filter_h: None,
+            filter_v: None,
+            filter_h_c: None,
+            filter_v_c: None,
+            easf: Easf::default(),
+            ok: true,
+        }
+    }
     /// The taps (v, h, v_c, h_c), as translate_SPL_out_params_to_pipe_ctx
     /// returns them to DC.
     pub fn dc_taps(&self) -> [u32; 4] {

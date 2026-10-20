@@ -170,17 +170,22 @@ impl<I: Io> Engine<I> {
             .copied()
             .flatten()
             .ok_or(Error::Invalid)?;
+        // dcn401_set_cursor_position: DCN4 blends the cursor after the
+        // scaler, so each pipe takes it in its own recout's space, past
+        // the ODM slices before it, and shows it only within that recout.
         Ok(surface
             .request
             .segments()
-            .map(|(p, x, width)| {
+            .zip(surface.request.scalers())
+            .map(|((p, x, _), (_, scaler))| {
+                let r = scaler.recout;
                 (
                     p,
                     placement(
-                        a.x - x as i32,
-                        a.y,
+                        a.x - x as i32 - r.x,
+                        a.y - r.y,
                         (a.width, a.height),
-                        (width, timing.v_active),
+                        (r.width.max(0) as u32, r.height.max(0) as u32),
                         (deadlines.plan.soc.dchub_refclk_khz, timing.pixel_clock_khz),
                     ),
                 )

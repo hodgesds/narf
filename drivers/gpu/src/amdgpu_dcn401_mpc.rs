@@ -23,6 +23,23 @@ pub struct MpcApplied {
     /// Timing is stopped; writing a bypass request does not prove its latch.
     pub pending: u16,
 }
+/// dcn401_update_mpcc_sequence's blend configuration in MPCC_CONTROL
+/// (mode bits clear): per-pixel alpha, combined with the plane alpha as
+/// global gain when one is set, pre-multiplied unless Coverage; otherwise
+/// global alpha, the plane's or opaque. 4-bit background, unity gains.
+pub(in crate::amdgpu_dcn401_otg) fn blend_control(a: MpcApplied) -> u32 {
+    let b = a.dpp.surface.request.layout().blend;
+    let global = u32::from(b.global_alpha.unwrap_or(0xff));
+    let (mode, multiplied, gain) = match (b.per_pixel_alpha, b.global_alpha) {
+        // MPCC_ALPHA_BLEND_MODE_PER_PIXEL_ALPHA_COMBINED_GLOBAL_GAIN.
+        (true, Some(alpha)) => (1, b.premultiplied, u32::from(alpha)),
+        // MPCC_ALPHA_BLEND_MODE_PER_PIXEL_ALPHA.
+        (true, None) => (0, b.premultiplied, 0xff),
+        // MPCC_ALPHA_BLEND_MODE_GLOBAL_ALPHA, never multiplied.
+        (false, _) => (2, false, 0xff),
+    };
+    mode << 4 | u32::from(multiplied) << 6 | 4 << 8 | global << 16 | gain << 24
+}
 impl Layout {
     fn mpc_out(self, pipe: u8, r: u64) -> u64 {
         self.mpc_base + (r + u64::from(pipe) * 4) * 4
@@ -142,18 +159,11 @@ impl Layout {
             ColorDepth::Bpc10 => 4,
             ColorDepth::Bpc12 => 6,
         };
-        // dcn401_update_mpcc_sequence: per-pixel premultiplied alpha for the
-        // formats amdgpu_dm blends so (SurfaceFormat::per_pixel_alpha), else
-        // global alpha; global alpha and gain 0xff, 4-bit background.
-        let blend = if a.dpp.surface.request.format.per_pixel_alpha() {
-            0x40 // MPCC_ALPHA_BLEND_MODE_PER_PIXEL_ALPHA, multiplied
-        } else {
-            0x20 // MPCC_ALPHA_BLEND_MODE_GLOBAL_ALPHA
-        };
         [
-            // Top-layer-only, unity gains. An X format's unused bits never
+            // Top-layer-only (the tree position sets the mode when it is
+            // connected), unity gains. An X format's unused bits never
             // become coverage. Disable inherited stereo too.
-            (self.mpcc(p, 3), 0xffff0ff3, 0xffff0402 | blend),
+            (self.mpcc(p, 3), 0xffff0ff3, blend_control(a) | 2),
             (self.mpcc(p, 4), 0x3033f, 0),
             (self.mpcc(p, 6), 0x7ffff, 0x1f000),
             (self.mpcc(p, 7), 0x7ffff, 0x1f000),

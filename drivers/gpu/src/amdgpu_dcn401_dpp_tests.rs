@@ -228,7 +228,7 @@ fn dcn401_dpp_stages_native_rgb_and_unity_scaling_on_all_pipes() -> TestResult {
                 (if r == 0xd76 { 0 } else { 0x80000000 }) | value | pending
             );
         }
-        assert_eq!(e.fake().writes.len(), 34);
+        assert_eq!(e.fake().writes.len(), 35);
         assert_eq!(e.fake().regs[&h(p, 0x613)] & 0x100, 0x100);
         assert_eq!(
             e.fake().regs[&(MPC_BASE + (0x2f2 + u64::from(p) * 4) * 4)] & 0xf,
@@ -357,7 +357,7 @@ kernel_test_in!(
 
 fn dcn401_dpp_lost_writes_revocation_and_device_loss_quarantine() -> TestResult {
     for mode in 0..3 {
-        for n in 1..=34 {
+        for n in 1..=35 {
             let (_backing, pool, mut e, mut surfaces, clock) = ready(2);
             let authority = e.authority;
             match mode {
@@ -414,7 +414,9 @@ fn dcn401_dpp_ram_wake_timeout_cancellation_and_late_changes_fail_closed() -> Te
                 State::PreparingDpp(1) | State::Failed(Error::Timeout(_))
             ));
             assert_eq!(e.status.dpps, [None; 4]);
-            assert_eq!(e.fake().writes.len(), 2 + stage);
+            // The scaler LUT wakes first; the iSHARP LUT inside the DSCL
+            // programming, after the 19 CNVC/CM and 11 DSCL writes.
+            assert_eq!(e.fake().writes.len(), [2, 32][stage]);
             assert_eq!(e.fake().regs[&d(1, 0xcc5)] & 0x10, 0x10); // no speculative rollback
             drop(surfaces);
             assert_eq!(pool.available(), 4096);
@@ -423,9 +425,9 @@ fn dcn401_dpp_ram_wake_timeout_cancellation_and_late_changes_fail_closed() -> Te
     for (n, at, value) in [
         (2, BASE + 0x1b43 * 4, 1),
         (3, d(0, 0xcc6), 1),
-        (34, d(0, 0xcd4), 0),
-        (34, h(0, 0x60a), 0),
-        (34, BASE + 0x477 * 4, 0),
+        (35, d(0, 0xcd4), 0),
+        (35, h(0, 0x60a), 0),
+        (35, BASE + 0x477 * 4, 0),
     ] {
         let (_backing, _pool, mut e, mut surfaces, clock) = ready(0);
         e.fake().after_write = Some((n, at, value));

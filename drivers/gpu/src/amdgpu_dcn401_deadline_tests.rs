@@ -54,6 +54,7 @@ fn owners(plan: &dml::Plan, pipe: u8) -> (Request, RequestorApplied, dccg::Appli
             height: 1080,
             format: SurfaceFormat::Xrgb8888,
             odm: None,
+            plane: None,
         },
         address: 0x8_0000_0000,
         pitch_bytes: 7680,

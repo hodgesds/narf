@@ -269,6 +269,7 @@ fn hdmi_mode(pipe: u8, plan: &dml::Plan) -> Mode {
             height: 480,
             format: SurfaceFormat::Xrgb8888,
             odm: None,
+            plane: None,
         },
         // Room for a back buffer of the same geometry.
         bytes: 2 * 640 * 4 * 480,

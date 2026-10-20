@@ -47,6 +47,7 @@ fn buffers(pool: &Pool, pipe: u8, height: u32) -> Surface {
         height,
         format: SurfaceFormat::Xrgb8888,
         odm: None,
+        plane: None,
     };
     let reserve = |bytes| {
         let mut r = pool.reserve(bytes).unwrap();
