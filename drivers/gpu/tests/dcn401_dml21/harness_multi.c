@@ -188,7 +188,8 @@ int main(int argc, char **argv)
 		p->composition.scaler_info.rect_out_width = a[1];
 		p->composition.rect_out_height_spans_vactive = true;
 		p->overrides.det_size_override_kb = 320;
-		p->overrides.mpcc_combine_factor = 1;
+		/* MPC_AUTO: DC's auto factor (0); otherwise MPC combine is off. */
+		p->overrides.mpcc_combine_factor = getenv("MPC_AUTO") ? 0 : 1;
 		p->overrides.gpuvm_min_page_size_kbytes = init.soc_bb.gpuvm_min_page_size_kbytes;
 	}
 

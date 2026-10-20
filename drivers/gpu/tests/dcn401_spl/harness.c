@@ -272,10 +272,15 @@ int main(int argc, char **argv)
 	/* "video": each line starts with a 4:2:0 format, 8 (NV12/NV21,
 	 * SPL_PIXEL_FORMAT_420BPP8) or 10 (P010, 420BPP10). */
 	const bool video = argc > 1 && !strcmp(argv[1], "video");
-	long b[16], *a = b + video;
+	/* MPC set: two more values per line, the MPC slice index and count
+	 * (resource_get_mpc_slice_index/count; 0 1 without MPC combine). */
+	const int n = 15 + video + (getenv("MPC") ? 2 : 0);
+	long b[18], *a = b + video;
 
 	while (1) {
-		for (int i = 0; i < 15 + video; i++)
+		a[15] = 0;
+		a[16] = 1;
+		for (int i = 0; i < n; i++)
 			if (scanf("%ld", &b[i]) != 1)
 				return 0;
 		static struct spl_in in;
@@ -297,8 +302,8 @@ int main(int argc, char **argv)
 		in.basic_in.rotation = (enum spl_rotation_angle)a[12];
 		in.basic_in.horizontal_mirror = a[13];
 		in.basic_in.num_h_slices_recout_width_align.use_recout_width_aligned = false;
-		in.basic_in.num_h_slices_recout_width_align.num_slices_recout_width.mpc_num_h_slices = 1;
-		in.basic_in.mpc_h_slice_index = 0;
+		in.basic_in.num_h_slices_recout_width_align.num_slices_recout_width.mpc_num_h_slices = a[16];
+		in.basic_in.mpc_h_slice_index = a[15];
 		in.basic_out.odm_slice_rect = (struct spl_rect){ a[10], 0, a[11], a[9] };
 		in.basic_out.odm_combine_factor = 0;
 		in.odm_slice_index = 0;

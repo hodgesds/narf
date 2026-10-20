@@ -6,6 +6,9 @@
 #   drivers/gpu/tests/dcn401_spl/check.sh [linux-tree]
 #   drivers/gpu/tests/dcn401_spl/check.sh --generate [linux-tree] > vectors.txt
 #   drivers/gpu/tests/dcn401_spl/check.sh --generate-video [linux-tree] > video_vectors.txt
+#   drivers/gpu/tests/dcn401_spl/check.sh --generate-mpc [linux-tree] > mpc_vectors.txt
+# mpc_vectors.txt answers mpc_inputs.txt: planes split into MPC slices, each
+# line two values longer (the slice index and count; harness.c with MPC set).
 # amdgpu_dcn401_spl.rs and amdgpu_dcn401_dscl.rs must produce Linux's
 # output for every line (amdgpu_dcn401_spl_tests.rs replays them).
 set -euo pipefail
@@ -14,6 +17,7 @@ generate=
 case ${1:-} in
 --generate) generate=rgb; shift ;;
 --generate-video) generate=video; shift ;;
+--generate-mpc) generate=mpc; shift ;;
 esac
 linux=${1:-/usr/src/linux}
 sspl=$linux/drivers/gpu/drm/amd/display/dc/sspl
@@ -39,6 +43,15 @@ done
 cc "${flags[@]}" "$here/harness.c" "$work"/*.o -o "$work/spl"
 
 fields="src_x src_y src_w src_h dst_x dst_y dst_w dst_h stream_w stream_h odm_x odm_w rotation mirror alpha"
+if [ "$generate" = mpc ]; then
+	echo "# Linux SPL reference vectors for amdgpu_dcn401_spl.rs with MPC slices; see check.sh."
+	echo "# $fields mpc_index mpc_count = writes"
+	grep -v '^#' "$here/mpc_inputs.txt" | while read -r in; do
+		[ -n "$in" ] || continue
+		echo "$in = $(echo "$in" | MPC=1 "$work/spl")"
+	done
+	exit 0
+fi
 if [ "$generate" = rgb ]; then
 	echo "# Linux SPL reference vectors for amdgpu_dcn401_spl.rs; see check.sh and harness.c."
 	echo "# $fields = writes"
@@ -80,5 +93,6 @@ verify() {
 }
 verify "$here/vectors.txt"
 verify "$here/video_vectors.txt" video
+MPC=1 verify "$here/mpc_vectors.txt"
 [ $fail -eq 0 ] || exit 1
 echo "dcn401_spl: all vectors match Linux SPL"

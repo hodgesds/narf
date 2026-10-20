@@ -55,7 +55,24 @@
 # that split a DCC plane over two MPC-combined pipes (its mcaches do not fit
 # one), which the port does not admit. --regenerate-surfaces answers its
 # inputs again.
+# odm34_vectors.txt lines are "<bytes per pixel> <DSC slices> <DSC bpp_x16>
+# <4:2:0>" then a multi_vectors.txt line, each stream's plane at that depth,
+# compressed so unless the slices are 0 and leaving as HDMI 4:2:0 if the
+# flag is 1 (harness_multi.c with RAISED, PIXEL_BYTES, DSC and FMT420): ODM
+# 3:1 and 4:1, which the port now plans; a plane on n pipes ends with "/<n>"
+# and each further pipe's blank end. "! ClockState raised", "! PixelClock
+# dfs" and "! Register" are as format_vectors.txt's, "! REJECT" any Linux
+# rejection. --regenerate-odm34 answers its inputs again.
+# mpc_vectors.txt is as plane_vectors.txt, planned with MPC_AUTO (DC's auto
+# mpcc_combine_factor, where every other file forces 1): planes one DPP
+# cannot carry take two ("/2"). --regenerate-mpc answers its inputs again.
 set -euo pipefail
+case ${1:-} in
+--regenerate-odm34 | --regenerate-mpc)
+	regenerate=$1
+	shift ;;
+*) regenerate= ;;
+esac
 here=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 generate_surfaces=0
 if [ "${1:-}" = --regenerate-surfaces ]; then
@@ -134,6 +151,78 @@ if [ $generate_surfaces -eq 1 ]; then
 			surface_answer "$inputs" "$(RAISED=1 "$work/strict_surfaces" "${a[@]}")" ;;
 		esac
 	done < "$here/surface_vectors.txt"
+	exit 0
+fi
+
+# odm34_answer: answer "<bytes> <slices> <bpp_x16> <4:2:0> <multi inputs>"
+# lines from stdin with Linux (harness_multi.c, RAISED).
+odm34_answer() {
+	local b sl bp f line out envs a
+	while read -r b sl bp f line; do
+		read -ra a <<< "$line"
+		envs=(RAISED=1)
+		[ "$b" = 4 ] || envs+=(PIXEL_BYTES="$b")
+		[ "$sl" = 0 ] || envs+=(DSC="$sl $bp")
+		[ "$f" = 0 ] || envs+=(FMT420=1)
+		out=$(env "${envs[@]}" "$work/strict_multi" "${a[@]:0:9}" "${a[@]:10}")
+		local prefix="$b $sl $bp $f $line"
+		if [ "$out" = RAISED ]; then
+			echo "$prefix ! ClockState raised"
+		elif [ "${out%% *}" = PLAN ] && echo "${out#PLAN }" | awk '{ exit !($1 > 2250000 || $2 > 2250000) }'; then
+			echo "$prefix ! PixelClock dfs"
+		elif [ "${out%% *}" = PLAN ] && echo "${out#PLAN }" | awk '
+			BEGIN { n = split("13 8192 14 32768 15 262144 16 2097152 17 8192 18 8 19 256 20 128 21 64 22 2097152 23 4194304 24 4194304 25 8192 26 8192 31 16384 32 16777216 33 16 34 8388608 35 8388608 36 16 38 16384 39 65536 40 65536 41 65536 42 65536 43 65536 44 16384 45 16384 46 16384 47 1024 48 1024 49 1024 55 4096 57 134217728", l)
+				for (i = 1; i < n; i += 2) lim[l[i]] = l[i + 1] }
+			{ f = 0
+			  for (i = 1; i <= NF; i++) {
+				if ($i == "|") { f = 0; continue }
+				# A plane on k pipes: its k - 1 further blank ends.
+				if ($i ~ /^\/[234]$/) {
+					k = substr($i, 2) + 0
+					for (j = 1; j < k; j++) { i++; if ($i + 0 >= 8192) bad = 1 }
+					continue
+				}
+				if (f in lim && $i + 0 >= lim[f] + 0) bad = 1
+				f++ } }
+			END { exit !bad }'; then
+			echo "$prefix ! Register"
+		elif [ "${out%% *}" = PLAN ]; then
+			echo "$prefix = ${out#PLAN }"
+		else
+			echo "$prefix ! REJECT"
+		fi
+	done
+}
+# mpc_answer: answer plane_vectors.txt inputs from stdin with Linux
+# (harness_planes.c, RAISED, MPC_AUTO).
+mpc_answer() {
+	local line out a
+	while read -r line; do
+		read -ra a <<< "$line"
+		out=$(RAISED=1 MPC_AUTO=1 "$work/strict_planes" "${a[@]}")
+		if [ "${out%% *}" = PLAN ]; then
+			echo "$line = ${out#PLAN }"
+		else
+			echo "$line ! REJECT"
+		fi
+	done
+}
+# regenerate <file> <answer>: keep the file's comments and inputs, answered
+# again by Linux.
+regenerate_file() {
+	local file=$1 answer=$2 line
+	while IFS= read -r line; do
+		case $line in
+		''|'#'*) echo "$line" ;;
+		*) echo "${line%% [=!] *}" | $answer ;;
+		esac
+	done < "$file"
+}
+if [ "$regenerate" = --regenerate-odm34 ]; then
+	regenerate_file "$here/odm34_vectors.txt" odm34_answer
+	exit 0
+elif [ "$regenerate" = --regenerate-mpc ]; then
+	regenerate_file "$here/mpc_vectors.txt" mpc_answer
 	exit 0
 fi
 
@@ -440,5 +529,36 @@ check_surfaces() {
 	echo "dcn401 DML21 $(basename "$file" .txt): $pass passed, $fail failed"
 	[ $fail -eq 0 ]
 }
+# check_answered <file> <answer>: every line is Linux's answer to its own
+# inputs, token for token but for check_multi's +-1 tolerated fields.
+check_answered() {
+	local file=$1 answer=$2 pass=0 fail=0 line got want n
+	while IFS= read -r line; do
+		case $line in ''|'#'*) continue ;; esac
+		got=$(echo "${line%% [=!] *}" | $answer)
+		if [ "$got" = "$line" ]; then
+			pass=$((pass + 1))
+			continue
+		fi
+		# Plans equal up to the tolerated fields: count the planes and
+		# compare with plan_matches.
+		want=${line#* = }
+		if [ "$want" != "$line" ] && [ "${got#* = }" != "$got" ]; then
+			n=$(echo " $want" | awk '{ print gsub(/ \| /, "&") + 1 }')
+			read -ra w <<< "$want"
+			if plan_matches "$n" "PLAN ${got#* = }" "${w[@]}"; then
+				pass=$((pass + 1))
+				continue
+			fi
+		fi
+		fail=$((fail + 1))
+		echo "MISMATCH: $line" >&2
+		echo "  linux: $got" >&2
+	done < "$file"
+	echo "dcn401 DML21 $(basename "$file" .txt): $pass passed, $fail failed"
+	[ $fail -eq 0 ]
+}
 check_surfaces "$here/surface_vectors.txt" || mfail=1
+check_answered "$here/odm34_vectors.txt" odm34_answer || mfail=1
+check_answered "$here/mpc_vectors.txt" mpc_answer || mfail=1
 [ $fail -eq 0 ] && [ $mfail -eq 0 ]
