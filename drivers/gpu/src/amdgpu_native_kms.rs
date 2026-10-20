@@ -49,6 +49,12 @@ pub fn request_display_mode(display: u8, mode: Option<&DrmModeModeInfo>) -> bool
         crate::amdgpu_navi48_platform::request_display_mode(display, mode)
     }
 }
+/// CRTC "VRR_ENABLED". Only Navi48 attaches the property; Navi22 ignores it.
+pub fn request_vrr_enabled(display: u8, enabled: bool) {
+    if !navi22() {
+        crate::amdgpu_navi48_platform::request_vrr_enabled(display, enabled)
+    }
+}
 /// "Broadcast RGB" applies to the next modeset on either generation (both
 /// select the AVI quantization through the same setting).
 pub fn request_broadcast_rgb(value: u8) {

@@ -688,7 +688,8 @@ progressive timing with fixed refresh and one OPP per OTG. HDMI TMDS and FRL
 also accept YCbCr 4:2:0: horizontal boundaries must be even and active width
 must fit the 4096-pixel formatter buffer. The OTG divides horizontal timing
 by two and selects 4:2:0 data format. Interlace, ODM combining and VRR are not
-represented by this request. `GlobalSync` supplies
+represented by this request; a live scanout's DRR is `Otg::set_drr` (Navi 48
+variable refresh). `GlobalSync` supplies
 validated DLG field values (startup/keepout in lines; update/ready in pixels),
 not a bandwidth proof. Totals, porches, sync widths, blanking minima and every
 native field width are checked before writes. Zero vertical front porch is
@@ -1737,7 +1738,8 @@ new front, the now-reusable back and the frame count. Any failure leaves
 unknown. The platform `flip_display` moves a console that had adopted the old
 front onto the new one and drains CPU views before releasing the owner lock.
 There is no flip interrupt or event queue yet:
-completion is polled.
+completion is polled. Under DRR the flip also fires the OTG manual trigger
+after the lock release (Navi 48 variable refresh).
 
 Live updates have one synchronization policy per writer. The front's
 `upload_surface` stays stopped-only. `unsafe Otg::upload_back_buffer(pipe,
@@ -3339,6 +3341,101 @@ pauses CPU console/framebuffer writers before preparation, and runs startup
 without a spinlock or executor poll on the stack. A preflight error resumes
 writers. A started failure/cancellation on the primary GPU keeps them stopped;
 an unrelated secondary GPU cannot quarantine another device's framebuffer.
+
+### Navi 48 variable refresh (DP Adaptive-Sync)
+
+`amdgpu_freesync` is the shared, integer-only VRR policy (Linux drm_edid.c,
+amdgpu_dm and modules/freesync). `monitor_range(edid)` is
+drm_get_monitor_range over the whole EDID: EDID 1.4 with continuous
+frequency only, every detailed block of the base block, CTA-861 extension
+DTD areas and VTB extensions, "range limits only" (flags 0x01) descriptors
+with the 1.4 +255 offsets, the last one winning; `None` when none qualifies.
+`dp_sst_caps(edid, dpcd)` is amdgpu_dm_update_freesync_caps for a DP SST
+sink: DPCD 0x007 bit 6 (MSA_TIMING_PAR_IGNORED) and a range more than 10 Hz
+wide give a `VrrRange`. `VrrRange::supports(timing)` is vrr_supported
+(drm_mode_vrefresh within the range). `drr(timing, range)` is
+mod_freesync_build_vrr_params for VRR_STATE_ACTIVE_VARIABLE on DCN401: the
+minimum is raised to the hardware floor (pixel clock over h_total times
+32767 minus the front porch plus one), the maximum capped at the nominal
+refresh, the exact-2x rule applied, and fewer than 10 Hz left is fixed
+refresh (`None`). `v_total_min` comes from the maximum and `v_total_max`
+from the minimum refresh through `calc_v_total_from_refresh`, whose
+stream-limit arguments amdgpu_dm leaves zero (so it rounds up), never below
+the nominal total. Totals above 32767 are refused as
+dc_stream_adjust_vmin_vmax does. Not implemented, and so not VRR-capable
+here: HDMI FreeSync (the AMD VSDB), DisplayID ranges, DP MST, PCON
+whitelists, MCCS, below-the-range frame insertion (BTR/LFC), V_TOTAL_MID and
+the FreeSync VSIF/SDP infopacket.
+
+`Selection::vrr` carries a DP SST sink's range (`None` for HDMI and MST
+streams); `Selection::vrr_supported()` and `Selection::drr()` give the mode's
+answer and totals. `SstOutput::vrr_capable` reports the connector's
+capability. Once an SST stream's video runs (8b/10b or 128b/132b),
+`start_link` calls `unsafe ColdBoot::set_display_dp_ignore_msa(port,
+vrr_supported)` (`Otg::set_dp_ignore_msa`): enable_stream_features reads
+DP_DOWNSPREAD_CTRL (0x107), sets or clears IGNORE_MSA_TIMING_PARAM (bit 7)
+and writes it back only if it changed (true when written). It requires SST
+video, or a scanout on it, on that path (`Busy`, `Invalid` for another
+path, `Unsupported` for MST); as in Linux the modeset ignores AUX failures.
+Training still writes 0x107 with the bit clear; sink configuration checks
+mask the stream-owned bit. The DCN401 stream encoder's MSA is unchanged.
+
+DML21 admission is unchanged and evaluated at the nominal timing. DCN4's
+mode-support and programming calculations do not read `drr_config`; only
+the PMO's UCLK p-state strategies (FAMS2/DRR) do, and this owner disables
+memory clock switching so those strategies are never searched. DRR only
+lengthens the vertical blank (`v_total_min` is at least the mode's total)
+at the same line time, so every per-line, prefetch, DET and watermark bound
+admitted at the nominal timing still holds, and the stutter budget (taken
+from the nominal blank) only gains idle time.
+
+`unsafe Otg::set_drr(pipe, Option<Drr>)` (ColdBoot `set_display_drr`) runs
+or stops DRR on a `ScanoutRunning` pipe (`Busy` otherwise), following
+dcn10_set_drr and optc401_set_drr's non-FAMS branch. Enabling writes
+V_TOTAL_MAX then V_TOTAL_MIN (minus one), OTG_V_TOTAL_CONTROL MIN_SEL and
+MAX_SEL with the TRIGA event in SET_V_TOTAL_MIN_MASK (FORCE_LOCK_ON_EVENT
+clear, MID fields untouched), then OTG_STATIC_SCREEN_CONTROL's TRIGA event
+over two frames. Totals below the mode's, inverted or above 32767 are
+`Invalid` before any write; unchanged totals write nothing. `Status::drr`
+(`DrrApplied`) records the totals and the static-screen control replaced.
+Disabling clears the selectors first, then restores V_TOTAL_MAX/MIN to
+V_TOTAL (fixed refresh exactly as `prepare` programs it; Linux writes zero,
+unused once the selectors are clear) and the replaced static-screen
+control. Fixed refresh is also restored before fetch stops (scanout stop
+and underflow recovery) and before the timing is disabled. A register
+failure leaves `Failed` with the record kept, so a later stop still
+restores. While DRR runs, `flip` writes OTG_TRIGA_MANUAL_TRIG after the
+address update's lock release (optc2_program_manual_trigger, as
+commit_planes_for_stream fires it) so the stretched blank ends at the flip;
+flip completion evidence is unchanged. Frame waits on a DRR pipe are bounded
+by three frames at `v_total_max` plus 5 ms. TRIGA_CNTL is left as reset, as
+Linux's DCN401 path does not program it.
+
+KMS (`amdgpu_navi48_kms::{apply_routed_vrr, publish_routed_vrr}`) attaches,
+as amdgpu_dm does, an immutable "vrr_capable" range 0..1 to every native
+connector (`NativeOutput::vrr_capable`, the published sink's capability)
+and a "VRR_ENABLED" range 0..1 to every CRTC (`Card::vrr_enabled`, the
+committed values, kept across republication). `apply_routed` attaches
+neither, so Navi22 and other cards are unchanged. GETPROPERTY reports both
+(vrr_capable RANGE|IMMUTABLE, VRR_ENABLED RANGE); GETCONNECTOR and
+OBJ_GETPROPERTIES list them with their values on objects that have them.
+VRR_ENABLED is set by DRM_MASTER through OBJ_SETPROPERTY on a CRTC (an
+atomic driver's legacy path; connector SETPROPERTY never reaches it) or an
+atomic commit (no ALLOW_MODESET needed; TEST_ONLY applies nothing). Values
+above 1 and CRTCs without the property are EINVAL, vrr_capable is
+immutable (EINVAL), unknown objects ENOENT. As in Linux, enabling VRR on a
+sink or mode that cannot vary is accepted and the display stays fixed.
+A committed value goes to `amdgpu_native_kms::request_vrr_enabled` after the
+card lock is released (Navi22 ignores it), then
+`amdgpu_navi48_platform::request_vrr_enabled`, which records it and, when
+the display owner is free, reprograms each live scanout's DRR at once
+(`Selection::drr()` while VRR_ENABLED and the CRTC is on, else fixed) with
+no modeset; the display monitor converges the same at the end of every
+pass, including after a relight.
+
+All of this is model-tested only (`drivers/gpu/freesync`, `dcn401-otg`,
+`dcn401-scanout`, `navi48-modeset`, `navi48-kms`, `drm_ioctl`); it has not
+been validated on hardware.
 
 ### Discrete RDNA2 PSP secure-OS bootstrap
 

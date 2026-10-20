@@ -573,3 +573,66 @@ kernel_test_in!(
     "drivers/gpu/navi48-kms",
     navi48_kms_routes_connectors_to_any_crtc
 );
+
+/// amdgpu_dm's VRR properties on the native card: every connector carries
+/// the immutable "vrr_capable" (its sink's FreeSync capability) and every
+/// CRTC "VRR_ENABLED", whose committed value survives republication and
+/// topology changes for CRTCs that remain. `apply_routed` (Navi22, tests)
+/// attaches neither.
+fn navi48_kms_publishes_vrr_properties() -> TestResult {
+    let t = cea_1080p();
+    let edid = [0xa; 128];
+    let mut card = Card::new("amdgpu", "AMD GPU", (3, 0, 0));
+    let crtcs = [lit(&edid, &t, &[]), None, None, None];
+    let connectors = [
+        RoutedConnector {
+            index: 0,
+            kind: ConnectorType::DisplayPort,
+            edid: Some(&edid),
+            offered: &[],
+            crtc: Some(0),
+            possible_crtcs: 0xf,
+        },
+        RoutedConnector {
+            index: 1,
+            kind: ConnectorType::HdmiA,
+            edid: None,
+            offered: &[],
+            crtc: None,
+            possible_crtcs: 0xf,
+        },
+    ];
+    apply_routed_vrr(&mut card, &crtcs, &connectors, Some(&[true]));
+    let capable = |card: &Card, n: usize| {
+        card.native_output(connector_id(n))
+            .and_then(|o| o.vrr_capable)
+    };
+    if capable(&card, 0) != Some(true) || capable(&card, 1) != Some(false) {
+        return TestResult::Fail("vrr_capable values");
+    }
+    let ids: alloc::vec::Vec<(u32, bool)> = (0..4).map(|k| (crtc_id(k), false)).collect();
+    if card.vrr_enabled != ids {
+        return TestResult::Fail("VRR_ENABLED on every CRTC");
+    }
+    // A committed value survives republishing the same and a smaller
+    // topology; a CRTC that goes away drops it.
+    card.vrr_enabled[0].1 = true;
+    card.vrr_enabled[3].1 = true;
+    apply_routed_vrr(&mut card, &crtcs, &connectors, Some(&[false, false]));
+    if card.vrr_enabled[0] != (crtc_id(0), true) || capable(&card, 0) != Some(false) {
+        return TestResult::Fail("republished");
+    }
+    apply_routed_vrr(&mut card, &crtcs[..2], &connectors, Some(&[true, true]));
+    if card.vrr_enabled != [(crtc_id(0), true), (crtc_id(1), false)] {
+        return TestResult::Fail("smaller topology");
+    }
+    apply_routed(&mut card, &crtcs, &connectors);
+    if !card.vrr_enabled.is_empty() || capable(&card, 0).is_some() {
+        return TestResult::Fail("attached without VRR");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-kms",
+    navi48_kms_publishes_vrr_properties
+);

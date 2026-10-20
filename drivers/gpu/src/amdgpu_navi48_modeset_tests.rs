@@ -2293,3 +2293,73 @@ kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_mst_selection_trains_uhbr_when_the_branch_codes_it
 );
+
+/// A 1080p60 EDID 1.4 with continuous frequency and a 48-75 Hz "range
+/// limits only" descriptor.
+fn edid_vrr_48_75() -> Vec<u8> {
+    let mut e = edid_1080p();
+    e[24] |= 1;
+    e[90..108].copy_from_slice(&[0, 0, 0, 0xfd, 0, 48, 75, 30, 90, 17, 1, 0, 0, 0, 0, 0, 0, 0]);
+    e[127] = 0;
+    e[127] = narf_edid::compute_checksum(&e);
+    e
+}
+
+/// amdgpu_dm_update_freesync_caps on the selected DP SST sink: the EDID
+/// range when DPCD 0x007 bit 6 allows invalid MSA timing; the mode is then
+/// vrr_supported and VRR_ENABLED runs it at mod_freesync's totals (1125 to
+/// ceil(1406.25) = 1407 for 48 Hz). HDMI sinks are not VRR-capable here.
+fn navi48_modeset_dp_selection_carries_the_freesync_range() -> TestResult {
+    use inventory::Connector::{DisplayPort as Dp, HdmiTypeA as Hdmi};
+    let p = path(Dp, 0);
+    let mut caps = dpcd(0x14, 4);
+    let s = select(&[p], &[port(p, caps, edid_vrr_48_75())], 8, None).unwrap();
+    if s.vrr.is_some() || s.vrr_supported() || s.drr().is_some() {
+        return TestResult::Fail("MSA_TIMING_PAR_IGNORED clear");
+    }
+    caps.as_mut().unwrap()[7] = 0x40;
+    let s = select(&[p], &[port(p, caps, edid_vrr_48_75())], 8, None).unwrap();
+    let range = crate::amdgpu_freesync::VrrRange {
+        min_hz: 48,
+        max_hz: 75,
+    };
+    if s.vrr != Some(range)
+        || !s.vrr_supported()
+        || s.drr()
+            != Some(crate::amdgpu_freesync::Drr {
+                v_total_min: 1125,
+                v_total_max: 1407,
+            })
+    {
+        return TestResult::Fail("capable DP sink");
+    }
+    // A sink without the range descriptor is not capable either.
+    let s = select(&[p], &[port(p, caps, edid_1080p())], 8, None).unwrap();
+    if s.vrr.is_some() {
+        return TestResult::Fail("no range");
+    }
+    // A mode outside the range keeps the sink capable but the mode fixed.
+    let mut outside = s;
+    outside.vrr = Some(crate::amdgpu_freesync::VrrRange {
+        min_hz: 61,
+        max_hz: 144,
+    });
+    if outside.vrr_supported() || outside.drr().is_some() {
+        return TestResult::Fail("mode outside the range");
+    }
+    let h = path(Hdmi, 1);
+    let hdmi = select(
+        &[h],
+        &[port(h, None, with_cta(edid_vrr_48_75(), true))],
+        8,
+        None,
+    );
+    if hdmi.map(|s| s.vrr) != Ok(None) {
+        return TestResult::Fail("HDMI");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_dp_selection_carries_the_freesync_range
+);

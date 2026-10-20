@@ -680,6 +680,9 @@ pub struct Card {
     /// the hardware scans (see `NativePlane`). `None` keeps the CPU-copy
     /// cards' formats.
     pub plane_formats: Option<&'static [u32]>,
+    /// The CRTCs (by id) carrying the "VRR_ENABLED" property, with the value
+    /// DRM last committed. Empty on cards that do not expose it.
+    pub vrr_enabled: Vec<(u32, bool)>,
 }
 
 /// A connector whose modes and EDID come from a real sink, published by a
@@ -696,6 +699,9 @@ pub struct NativeOutput {
     /// The connector's "Broadcast RGB" value (0 Automatic, 1 Full,
     /// 2 Limited 16:235), when it has the property.
     pub broadcast_rgb: Option<u8>,
+    /// The connector's immutable "vrr_capable" value, when it has the
+    /// property (drm_connector_attach_vrr_capable_property).
+    pub vrr_capable: Option<bool>,
 }
 
 /// System-wide vblank "slack" offset in nanoseconds. A flip-complete event is
@@ -763,6 +769,7 @@ impl Card {
             native: Vec::new(),
             vblank_source: None,
             plane_formats: None,
+            vrr_enabled: Vec::new(),
         }
     }
     /// Wire form of a CRTC mode: the exact native timing when a published

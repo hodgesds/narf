@@ -2058,6 +2058,8 @@ struct ConnectorState {
     modes: Vec<Timing>,
     mst_id: Option<boot::MstOutputId>,
     last_hpd: Option<bool>,
+    /// The sink is FreeSync-capable (KMS "vrr_capable"); DP SST only.
+    vrr_capable: bool,
 }
 impl ConnectorState {
     fn new(target: Target, kind: ConnectorType, index: usize) -> Self {
@@ -2071,15 +2073,18 @@ impl ConnectorState {
             modes: Vec::new(),
             mst_id: None,
             last_hpd: None,
+            vrr_capable: false,
         }
     }
     /// A board sink's discovery; true when its EDID changed.
     fn reconcile_sst(&mut self, output: Option<&boot::SstOutput>) -> bool {
         self.present = output.is_some();
         self.modes.clear();
+        self.vrr_capable = false;
         let Some(output) = output else {
             return false;
         };
+        self.vrr_capable = output.vrr_capable;
         let changed = self.edid != output.edid;
         if changed {
             self.edid.clone_from(&output.edid);
@@ -2137,6 +2142,8 @@ struct CrtcState {
     route: Option<Target>,
     /// DRM chose `route` (including none): automatic routing leaves it.
     explicit: bool,
+    /// DRM's "VRR_ENABLED": run the lit mode's DRR when it is VRR-supported.
+    vrr: bool,
 }
 impl CrtcState {
     const fn new() -> Self {
@@ -2147,6 +2154,7 @@ impl CrtcState {
             shown: None,
             route: None,
             explicit: false,
+            vrr: false,
         }
     }
     fn retrained(&mut self, edid: [u8; 128], timing: Timing, offered: Vec<Timing>) {
@@ -2208,6 +2216,7 @@ impl Outputs {
                             modes: c.modes.clone(),
                             mst_id: c.mst_id,
                             last_hpd: c.last_hpd,
+                            vrr_capable: c.vrr_capable,
                         },
                     )
             })
@@ -2424,7 +2433,12 @@ fn publish_outputs() {
             possible_crtcs: 0xf,
         })
         .collect();
-    crate::amdgpu_navi48_kms::publish_routed(&crtcs, &connectors);
+    let vrr_capable: Vec<bool> = outputs
+        .connectors
+        .iter()
+        .map(|c| c.present && c.vrr_capable)
+        .collect();
+    crate::amdgpu_navi48_kms::publish_routed_vrr(&crtcs, &connectors, &vrr_capable);
     for (k, sink) in crtcs.iter().enumerate() {
         if sink.is_some() && !outputs.crtcs[k].published_active() {
             crate::amdgpu_navi48_kms::set_active(k, false);
@@ -3164,6 +3178,64 @@ pub fn request_connector_crtc(connector: u32, display: Option<u8>) -> bool {
     }
 }
 
+/// Record DRM's "VRR_ENABLED" for CRTC `display`. Like Linux, a request
+/// for a sink or mode that cannot vary its refresh is accepted and the
+/// display stays fixed. A running display is reprogrammed at once when the
+/// owner is free (no modeset: only its timing's DRR changes), otherwise by
+/// the display monitor's next pass.
+pub fn request_vrr_enabled(display: u8, enabled: bool) {
+    {
+        let mut outputs = OUTPUTS.lock();
+        let Some(c) = outputs.crtcs.get_mut(usize::from(display)) else {
+            return;
+        };
+        c.vrr = enabled;
+    }
+    let Some(mut owner) = OWNER.try_lock() else {
+        return;
+    };
+    if let Some(boot) = owner.as_mut() {
+        converge_vrr(boot);
+    }
+}
+
+/// What DRR display `pipe`'s lit modeset should run: its mode's totals
+/// while DRM enabled VRR on its CRTC and the mode is VRR-supported.
+fn wanted_drr(m: &Modeset, vrr: bool) -> Option<crate::amdgpu_freesync::Drr> {
+    vrr.then(|| m.selection.drr()).flatten()
+}
+
+/// Bring every live scanout's DRR to what DRM asked (amdgpu_dm's
+/// VRR_STATE_ACTIVE_VARIABLE or INACTIVE). Displays not scanning out are
+/// left alone (their timing is fixed); a refused change is reported and
+/// retried by the next pass.
+fn converge_vrr(boot: &mut boot::ColdBoot) {
+    let wants: [bool; 4] = {
+        let outputs = OUTPUTS.lock();
+        core::array::from_fn(|k| outputs.crtcs[k].vrr && outputs.crtcs[k].published_active())
+    };
+    for m in boot.display_modesets().into_iter().flatten() {
+        let k = usize::from(m.pipe);
+        let Ok(Some(status)) = boot.display_status(m.pipe) else {
+            continue;
+        };
+        if status.state != crate::amdgpu_dcn401_otg::State::ScanoutRunning(m.pipe) {
+            continue;
+        }
+        let want = wanted_drr(&m, wants[k]);
+        if status.drr.map(|a| a.drr) == want {
+            continue;
+        }
+        // SAFETY: OWNER is held; the platform excludes other timing writers.
+        if let Err(e) = unsafe { boot.set_display_drr(m.pipe, want) } {
+            let _ = core::fmt::Write::write_fmt(
+                &mut narf_console::Writer,
+                format_args!("amdgpu: navi48 display {k} DRR not applied: {e:?}\n"),
+            );
+        }
+    }
+}
+
 /// Record a DRM "Broadcast RGB" value (0 Automatic, 1 Full, 2 Limited
 /// 16:235) for the native displays. Like a mode request, the display
 /// monitor relights running displays whose output range no longer matches.
@@ -3625,6 +3697,8 @@ pub async unsafe fn monitor_displays(
     if !steps.is_empty() {
         publish_outputs();
     }
+    // VRR_ENABLED needs no relight: converge every live timing's DRR.
+    converge_vrr(boot);
     Ok(steps)
 }
 
@@ -4093,6 +4167,7 @@ mod tests {
             port: 2,
             edid: alloc::vec![0; 256],
             modes: alloc::vec![timing],
+            vrr_capable: false,
         };
         let mut o = Outputs::new();
         o.reshape(&[(target, ConnectorType::DisplayPort, 0)]);
@@ -4138,6 +4213,44 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/navi48-kms",
         navi48_dark_sst_connector_preserves_disable_and_invalidates_replacement
+    );
+
+    /// A board sink's FreeSync capability follows its discovery (published
+    /// as "vrr_capable"), survives reshaping, and goes with the sink; a
+    /// CRTC's VRR_ENABLED request is DRM's and starts off.
+    fn navi48_connector_vrr_capability_follows_discovery() -> TestResult {
+        let target = Target::Board(0);
+        let mut output = boot::SstOutput {
+            port: 0,
+            edid: alloc::vec![0; 128],
+            modes: alloc::vec![hd()],
+            vrr_capable: true,
+        };
+        let mut o = Outputs::new();
+        o.reshape(&[board(0)]);
+        assert!(o.crtcs.iter().all(|c| !c.vrr));
+        o.connector_mut(target)
+            .unwrap()
+            .reconcile_sst(Some(&output));
+        assert!(o.connector(target).unwrap().vrr_capable);
+        o.reshape(&[board(0), board(1)]);
+        assert!(o.connector(target).unwrap().vrr_capable);
+        output.vrr_capable = false;
+        o.connector_mut(target)
+            .unwrap()
+            .reconcile_sst(Some(&output));
+        assert!(!o.connector(target).unwrap().vrr_capable);
+        output.vrr_capable = true;
+        o.connector_mut(target)
+            .unwrap()
+            .reconcile_sst(Some(&output));
+        o.connector_mut(target).unwrap().observe_sst_hpd(false);
+        assert!(!o.connector(target).unwrap().vrr_capable);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi48-kms",
+        navi48_connector_vrr_capability_follows_discovery
     );
 
     fn navi48_retraining_refreshes_published_modes_and_drops_invalid_requests() -> TestResult {

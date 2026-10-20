@@ -7,6 +7,8 @@ pub struct SstOutput {
     pub edid: Vec<u8>,
     /// Independent candidates beside the current streams, not reservations.
     pub modes: Vec<Timing>,
+    /// amdgpu_dm's freesync_capable for this sink (DP SST only here).
+    pub vrr_capable: bool,
 }
 
 pub(super) fn dark_modes(
@@ -81,10 +83,17 @@ impl ColdBoot {
                         dark_modes(soc, paths, port, max_bpc(), &selections)
                     })
                 };
+                let vrr_capable = path.connector == inventory::Connector::DisplayPort
+                    && sink
+                        .dpcd
+                        .as_ref()
+                        .and_then(|d| crate::amdgpu_freesync::dp_sst_caps(&sink.edid, d))
+                        .is_some();
                 Some(SstOutput {
                     port: index,
                     edid: sink.edid.clone(),
                     modes,
+                    vrr_capable,
                 })
             })
             .collect();

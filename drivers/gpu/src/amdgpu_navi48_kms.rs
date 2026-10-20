@@ -139,6 +139,20 @@ pub fn apply(card: &mut Card, outputs: &[Output]) {
 /// has an EDID. The topology is rebuilt only when the CRTC count or the
 /// connectors' identities change.
 pub fn apply_routed(card: &mut Card, crtcs: &[Option<Sink>], connectors: &[RoutedConnector]) {
+    apply_routed_vrr(card, crtcs, connectors, None);
+}
+
+/// `apply_routed` that also attaches the VRR properties, as amdgpu_dm does
+/// on DP and HDMI connectors: each connector's immutable "vrr_capable"
+/// (`vrr_capable[n]` for `connectors[n]`, false past its end) and every
+/// CRTC's "VRR_ENABLED", whose committed values survive republication.
+/// `None` attaches neither (and drops any), as `apply_routed`.
+pub fn apply_routed_vrr(
+    card: &mut Card,
+    crtcs: &[Option<Sink>],
+    connectors: &[RoutedConnector],
+    vrr_capable: Option<&[bool]>,
+) {
     let crtcs = &crtcs[..crtcs.len().min(MAX_OUTPUTS)];
     let same = card.crtcs.len() == crtcs.len()
         && card.connectors.len() == connectors.len()
@@ -197,8 +211,22 @@ pub fn apply_routed(card: &mut Card, crtcs: &[Option<Sink>], connectors: &[Route
             }
         }
     }
+    card.vrr_enabled = match vrr_capable {
+        Some(_) => (0..crtcs.len())
+            .map(|k| {
+                let id = crtc_id(k);
+                let value = card
+                    .vrr_enabled
+                    .iter()
+                    .find(|&&(c, _)| c == id)
+                    .is_some_and(|&(_, v)| v);
+                (id, value)
+            })
+            .collect(),
+        None => alloc::vec::Vec::new(),
+    };
     let mut native = alloc::vec::Vec::with_capacity(connectors.len());
-    for c in connectors {
+    for (n, c) in connectors.iter().enumerate() {
         let shown = c.crtc.and_then(|k| crtcs.get(k).copied().flatten());
         let edid = shown.map(|s| s.edid).or(c.edid);
         let wire = shown.map(|s| timing_wire(s.timing));
@@ -263,6 +291,7 @@ pub fn apply_routed(card: &mut Card, crtcs: &[Option<Sink>], connectors: &[Route
             // amdgpu_dm attaches it to HDMI and SST DP connectors, which is
             // all these ever are.
             broadcast_rgb: Some(crate::amdgpu_navi48_boot::broadcast_rgb()),
+            vrr_capable: vrr_capable.map(|v| v.get(n).copied().unwrap_or(false)),
         });
     }
     // The CRTCs' vblanks are the displays' hardware ones, and their planes
@@ -311,6 +340,15 @@ pub fn publish(outputs: &[Output]) {
 /// `apply_routed` on the registered amdgpu card.
 pub fn publish_routed(crtcs: &[Option<Sink>], connectors: &[RoutedConnector]) {
     with_card(|card| apply_routed(card, crtcs, connectors));
+}
+
+/// `apply_routed_vrr` on the registered amdgpu card.
+pub fn publish_routed_vrr(
+    crtcs: &[Option<Sink>],
+    connectors: &[RoutedConnector],
+    vrr_capable: &[bool],
+) {
+    with_card(|card| apply_routed_vrr(card, crtcs, connectors, Some(vrr_capable)));
 }
 
 fn with_card(update: impl FnOnce(&mut Card)) {

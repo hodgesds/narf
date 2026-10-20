@@ -2932,6 +2932,11 @@ const BROADCAST_RGB_PROP_ID: u32 = 0x61;
 /// An enum property's (value, name) entries.
 type EnumEntries = [(u64, &'static [u8]); 3];
 const BROADCAST_RGB_ENUMS: EnumEntries = [(0, b"Automatic"), (1, b"Full"), (2, b"Limited 16:235")];
+/// The connector "vrr_capable" immutable bool and the CRTC "VRR_ENABLED"
+/// bool (drm_connector_attach_vrr_capable_property, drm_mode_config's
+/// prop_vrr_enabled): ranges 0..1, the latter settable and not ATOMIC-only.
+const VRR_CAPABLE_PROP_ID: u32 = 0x62;
+const CRTC_VRR_ENABLED_PROP_ID: u32 = 0x63;
 /// `IN_FENCE_FD` on a plane: a sync_file fd (-1 = none) gating the flip.
 const PLANE_IN_FENCE_FD_PROP_ID: u32 = 0x5f;
 const CRTC_MODE_ID_PROP_ID: u32 = 0x53;
@@ -3211,6 +3216,12 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
             DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC,
             [0, u64::MAX],
         )),
+        VRR_CAPABLE_PROP_ID => Some((
+            b"vrr_capable".as_slice(),
+            DRM_MODE_PROP_RANGE | DRM_MODE_PROP_IMMUTABLE,
+            [0, 1],
+        )),
+        CRTC_VRR_ENABLED_PROP_ID => Some((b"VRR_ENABLED".as_slice(), DRM_MODE_PROP_RANGE, [0, 1])),
         _ => None,
     };
     if let Some((name, flags, values)) = simple {
@@ -3281,7 +3292,7 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
 }
 
 /// A connector's properties and current values: the EDID blob, the atomic
-/// CRTC_ID, and "Broadcast RGB" where the connector has it.
+/// CRTC_ID, and "Broadcast RGB" and "vrr_capable" where the connector has them.
 fn connector_properties(
     card: &crate::drm::card::Card,
     connector_id: u32,
@@ -3296,7 +3307,52 @@ fn connector_properties(
         props.push(BROADCAST_RGB_PROP_ID);
         values.push(u64::from(value));
     }
+    if let Some(capable) = card.native_output(connector_id).and_then(|n| n.vrr_capable) {
+        props.push(VRR_CAPABLE_PROP_ID);
+        values.push(u64::from(capable));
+    }
     (props, values)
+}
+
+/// A CRTC's "VRR_ENABLED" value, when the CRTC has the property.
+fn crtc_vrr_enabled(card: &crate::drm::card::Card, crtc_id: u32) -> Option<bool> {
+    card.vrr_enabled
+        .iter()
+        .find(|&&(id, _)| id == crtc_id)
+        .map(|&(_, v)| v)
+}
+
+/// Validate a "VRR_ENABLED" value for `crtc` as drm_property_change_valid_get
+/// does for a bool: EINVAL on a CRTC without it or a value above 1. Like
+/// Linux, enabling is accepted whatever the sink or mode supports; the
+/// display stays at fixed refresh when it cannot vary.
+fn vrr_enabled_value(
+    card: &crate::drm::card::Card,
+    crtc: u32,
+    value: u64,
+) -> Result<bool, FsError> {
+    if crtc_vrr_enabled(card, crtc).is_none() || value > 1 {
+        return Err(FsError::InvalidData);
+    }
+    Ok(value != 0)
+}
+
+/// Commit a validated "VRR_ENABLED" value: the CRTC reports it. Returns the
+/// native display to reprogram, which the caller requests after releasing
+/// the card lock (the request takes the display owner's locks).
+fn apply_vrr_enabled(
+    card_index: u32,
+    card: &mut crate::drm::card::Card,
+    crtc: u32,
+    value: bool,
+) -> Option<(u8, bool)> {
+    if let Some(slot) = card.vrr_enabled.iter_mut().find(|(id, _)| *id == crtc) {
+        slot.1 = value;
+    }
+    (crate::drm_registry::driver_name(card_index) == Some("amdgpu"))
+        .then(|| crate::amdgpu_native_kms::crtc_display(crtc))
+        .flatten()
+        .map(|display| (display, value))
 }
 
 /// Validate a "Broadcast RGB" value for `connector`, as
@@ -3335,8 +3391,10 @@ fn apply_broadcast_rgb(
 /// DRM_IOCTL_MODE_SETPROPERTY (`struct drm_mode_connector_set_property`:
 /// value@0, prop_id@8, connector_id@12) and DRM_IOCTL_MODE_OBJ_SETPROPERTY
 /// (`struct drm_mode_obj_set_property`: value@0, prop_id@8, obj_id@12,
-/// obj_type@16). Only a connector's "Broadcast RGB" is settable this way;
-/// like drm_mode_obj_set_property_ioctl, an unknown object is ENOENT and a
+/// obj_type@16). Settable this way: a connector's "Broadcast RGB" and,
+/// through OBJ_SETPROPERTY only (SETPROPERTY is connector-only), a CRTC's
+/// "VRR_ENABLED", which Linux commits atomically for an atomic driver. Like
+/// drm_mode_obj_set_property_ioctl, an unknown object is ENOENT and a
 /// property the object lacks is EINVAL. Master only.
 fn handle_set_property(
     card_index: u32,
@@ -3353,8 +3411,26 @@ fn handle_set_property(
     let value = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
     let prop_id = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
     let obj_id = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
-    if object && u32::from_le_bytes(bytes[16..20].try_into().unwrap()) != DRM_MODE_OBJECT_CONNECTOR
-    {
+    let obj_type = if object {
+        u32::from_le_bytes(bytes[16..20].try_into().unwrap())
+    } else {
+        DRM_MODE_OBJECT_CONNECTOR
+    };
+    if obj_type == DRM_MODE_OBJECT_CRTC {
+        let mut card = mode_state.lock();
+        card.crtc(obj_id).map_err(|_| FsError::NotFound)?;
+        if prop_id != CRTC_VRR_ENABLED_PROP_ID {
+            return Err(FsError::InvalidData);
+        }
+        let value = vrr_enabled_value(&card, obj_id, value)?;
+        let request = apply_vrr_enabled(card_index, &mut card, obj_id, value);
+        drop(card);
+        if let Some((display, enabled)) = request {
+            crate::amdgpu_native_kms::request_vrr_enabled(display, enabled);
+        }
+        return Ok(0);
+    }
+    if obj_type != DRM_MODE_OBJECT_CONNECTOR {
         return Err(FsError::InvalidData);
     }
     let mut card = mode_state.lock();
@@ -3481,16 +3557,19 @@ fn handle_obj_getproperties(
             )
         } else if obj_type == DRM_MODE_OBJECT_CRTC {
             let crtc = card.crtc(obj_id).map_err(|_| FsError::InvalidData)?;
-            (
-                vec![
-                    CRTC_ACTIVE_PROP_ID,
-                    CRTC_MODE_ID_PROP_ID,
-                    CRTC_OUT_FENCE_PTR_PROP_ID,
-                ],
-                // OUT_FENCE_PTR reads back as 0 (write-only request),
-                // matching drm_atomic_crtc_get_property.
-                vec![crtc.enabled as u64, 0, 0],
-            )
+            let mut props = vec![
+                CRTC_ACTIVE_PROP_ID,
+                CRTC_MODE_ID_PROP_ID,
+                CRTC_OUT_FENCE_PTR_PROP_ID,
+            ];
+            // OUT_FENCE_PTR reads back as 0 (write-only request),
+            // matching drm_atomic_crtc_get_property.
+            let mut values = vec![crtc.enabled as u64, 0, 0];
+            if let Some(vrr) = crtc_vrr_enabled(&card, obj_id) {
+                props.push(CRTC_VRR_ENABLED_PROP_ID);
+                values.push(u64::from(vrr));
+            }
+            (props, values)
         } else if obj_type == DRM_MODE_OBJECT_CONNECTOR {
             let connector = card.connector(obj_id).map_err(|_| FsError::InvalidData)?;
             let crtc_id = connector
@@ -3814,6 +3893,8 @@ fn handle_atomic(
     let policy = crate::drm::atomic::AtomicCheckPolicy::default();
     let test_only = req.flags & TEST_ONLY != 0;
     let mut prop_index = 0usize;
+    // Native VRR changes, requested once the card lock is released.
+    let mut vrr_requests: Vec<(u8, bool)> = Vec::new();
     let presentation = {
         let mut card = mode_state.lock();
         // Linux's atomic state grows implicitly while properties are decoded:
@@ -3830,6 +3911,8 @@ fn handle_atomic(
             (req.flags & PAGE_FLIP_EVENT != 0).then(|| Vec::with_capacity(card.crtcs.len()));
         // Connector "Broadcast RGB" values, applied only with the commit.
         let mut broadcast_rgb: Vec<(u32, u8)> = Vec::new();
+        // CRTC "VRR_ENABLED" values, likewise.
+        let mut vrr_enabled: Vec<(u32, bool)> = Vec::new();
         for (object_index, object_id) in objects.iter().copied().enumerate() {
             let object_prop_count = prop_counts[object_index] as usize;
             let end = prop_index
@@ -3972,6 +4055,9 @@ fn handle_atomic(
                             // set_out_fence_for_crtc treats 0 as clear).
                             crtc_state.out_fence_ptr = (value != 0).then_some(value);
                         }
+                        // Not a modeset: amdgpu_dm reprograms DRR in place.
+                        CRTC_VRR_ENABLED_PROP_ID => vrr_enabled
+                            .push((object_id, vrr_enabled_value(&card, object_id, value)?)),
                         _ => return Err(FsError::InvalidData),
                     }
                 }
@@ -4082,6 +4168,11 @@ fn handle_atomic(
             }
             for &(connector, value) in &broadcast_rgb {
                 apply_broadcast_rgb(card_index, &mut card, connector, value);
+            }
+            for &(crtc, value) in &vrr_enabled {
+                if let Some(request) = apply_vrr_enabled(card_index, &mut card, crtc, value) {
+                    vrr_requests.push(request);
+                }
             }
             let amdgpu = crate::drm_registry::driver_name(card_index) == Some("amdgpu");
             if amdgpu {
@@ -4203,6 +4294,9 @@ fn handle_atomic(
             Some(presentations)
         }
     };
+    for (display, enabled) in vrr_requests {
+        crate::amdgpu_native_kms::request_vrr_enabled(display, enabled);
+    }
 
     let (log, n) = should_log(&ATOMIC_N);
     if log {

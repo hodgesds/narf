@@ -498,6 +498,7 @@ fn smoke_drm_ioctl_broadcast_rgb_property() -> TestResult {
         edid: None,
         timings: alloc::vec::Vec::new(),
         broadcast_rgb: Some(0),
+        vrr_capable: None,
     });
     // GETPROPERTY: a settable enum with Linux's three names.
     let mut values = [0u64; 3];
@@ -609,6 +610,211 @@ kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_ioctl_broadcast_rgb_property
 );
+
+// ── Connector "vrr_capable" and CRTC "VRR_ENABLED" ────────────────────
+//
+// amdgpu_dm attaches drm_connector_attach_vrr_capable_property (an
+// immutable bool) to DP/HDMI connectors, and every CRTC of an atomic driver
+// carries the VRR_ENABLED bool. Only cards that publish them list them;
+// OBJ_SETPROPERTY and atomic commits set VRR_ENABLED (0..1) and refuse
+// vrr_capable. Enabling is accepted whether or not the sink can vary.
+fn smoke_drm_ioctl_vrr_properties() -> TestResult {
+    let getprop = |idx: u32, prop: u32| -> Option<(alloc::vec::Vec<u8>, u32, [u64; 2], u32)> {
+        let mut values = [9u64; 2];
+        let mut gp = [0u8; 64];
+        gp[0..8].copy_from_slice(&(values.as_mut_ptr() as u64).to_le_bytes());
+        gp[16..20].copy_from_slice(&prop.to_le_bytes());
+        gp[56..60].copy_from_slice(&2u32.to_le_bytes());
+        dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xAA, 64),
+            gp.as_mut_ptr() as usize,
+            false,
+        )
+        .ok()?;
+        let end = gp[24..56].iter().position(|&c| c == 0).unwrap_or(32);
+        Some((
+            alloc::vec::Vec::from(&gp[24..24 + end]),
+            u32::from_le_bytes(gp[20..24].try_into().unwrap()),
+            values,
+            u32::from_le_bytes(gp[56..60].try_into().unwrap()),
+        ))
+    };
+    let read = |idx: u32, obj: u32, kind: u32| -> Option<alloc::vec::Vec<(u32, u64)>> {
+        let mut props = [0u32; 8];
+        let mut vals = [0u64; 8];
+        let mut og = [0u8; 32];
+        og[0..8].copy_from_slice(&(props.as_mut_ptr() as u64).to_le_bytes());
+        og[8..16].copy_from_slice(&(vals.as_mut_ptr() as u64).to_le_bytes());
+        og[16..20].copy_from_slice(&8u32.to_le_bytes());
+        og[20..24].copy_from_slice(&obj.to_le_bytes());
+        og[24..28].copy_from_slice(&kind.to_le_bytes());
+        dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xB9, 32),
+            og.as_mut_ptr() as usize,
+            false,
+        )
+        .ok()?;
+        let count = u32::from_le_bytes(og[16..20].try_into().unwrap()) as usize;
+        Some(
+            props[..count]
+                .iter()
+                .copied()
+                .zip(vals[..count].iter().copied())
+                .collect(),
+        )
+    };
+    let obj_set = |idx: u32, value: u64, prop: u32, obj: u32, kind: u32| {
+        let mut b = [0u8; 24];
+        b[0..8].copy_from_slice(&value.to_le_bytes());
+        b[8..12].copy_from_slice(&prop.to_le_bytes());
+        b[12..16].copy_from_slice(&obj.to_le_bytes());
+        b[16..20].copy_from_slice(&kind.to_le_bytes());
+        dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xBA, 24),
+            b.as_mut_ptr() as usize,
+            false,
+        )
+    };
+    const CONNECTOR: u32 = 0xc0c0_c0c0;
+    const CRTC: u32 = 0xcccc_cccc;
+    // Metadata: both are 0..1 ranges; vrr_capable immutable, VRR_ENABLED not.
+    let idx = register_test_card();
+    if getprop(idx, 0x62) != Some((b"vrr_capable".to_vec(), 1 << 1 | 1 << 2, [0, 1], 2))
+        || getprop(idx, 0x63) != Some((b"VRR_ENABLED".to_vec(), 1 << 1, [0, 1], 2))
+    {
+        return TestResult::Fail("VRR property metadata");
+    }
+    // A card that does not publish them lists neither and refuses both.
+    let has = |list: &Option<alloc::vec::Vec<(u32, u64)>>, prop: u32| {
+        list.as_ref()
+            .is_some_and(|l| l.iter().any(|&(p, _)| p == prop))
+    };
+    if has(&read(idx, 31, CONNECTOR), 0x62)
+        || has(&read(idx, 11, CRTC), 0x63)
+        || obj_set(idx, 1, 0x63, 11, CRTC) != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("VRR properties on a plain card");
+    }
+    let Some(ms) = crate::drm_registry::mode_state(idx) else {
+        return TestResult::Fail("no mode state");
+    };
+    {
+        let mut card = ms.lock();
+        card.native.push(crate::drm::card::NativeOutput {
+            connector: 31,
+            edid: None,
+            timings: alloc::vec::Vec::new(),
+            broadcast_rgb: None,
+            vrr_capable: Some(true),
+        });
+        card.vrr_enabled = alloc::vec![(11, false), (12, false)];
+    }
+    let connector = read(idx, 31, CONNECTOR);
+    if connector.as_ref().and_then(|l| l.last().copied()) != Some((0x62, 1))
+        || read(idx, 11, CRTC).and_then(|l| l.last().copied()) != Some((0x63, 0))
+    {
+        return TestResult::Fail("VRR property values");
+    }
+    // OBJ_SETPROPERTY: VRR_ENABLED on a CRTC; bad values, the immutable
+    // vrr_capable and unknown objects are refused without effect.
+    if obj_set(idx, 1, 0x63, 12, CRTC) != Ok(0)
+        || read(idx, 12, CRTC).and_then(|l| l.last().copied()) != Some((0x63, 1))
+        || read(idx, 11, CRTC).and_then(|l| l.last().copied()) != Some((0x63, 0))
+    {
+        return TestResult::Fail("OBJ_SETPROPERTY VRR_ENABLED");
+    }
+    if obj_set(idx, 2, 0x63, 12, CRTC) != Err(FsError::InvalidData)
+        || obj_set(idx, 0, 0x62, 31, CONNECTOR) != Err(FsError::InvalidData)
+        || obj_set(idx, 0, 0x52, 12, CRTC) != Err(FsError::InvalidData)
+        || obj_set(idx, 0, 0x63, 99, CRTC) != Err(FsError::NotFound)
+        || obj_set(idx, 0, 0x63, 31, CONNECTOR) != Err(FsError::InvalidData)
+        || read(idx, 12, CRTC).and_then(|l| l.last().copied()) != Some((0x63, 1))
+    {
+        return TestResult::Fail("invalid VRR set accepted");
+    }
+    // Legacy connector SETPROPERTY never reaches a CRTC property.
+    let mut b = [0u8; 16];
+    b[0..8].copy_from_slice(&0u64.to_le_bytes());
+    b[8..12].copy_from_slice(&0x63u32.to_le_bytes());
+    b[12..16].copy_from_slice(&12u32.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xAB, 16),
+        b.as_mut_ptr() as usize,
+        false,
+    ) != Err(FsError::NotFound)
+    {
+        return TestResult::Fail("SETPROPERTY on a CRTC");
+    }
+    // Master only.
+    let mut b = [0u8; 24];
+    b[8..12].copy_from_slice(&0x63u32.to_le_bytes());
+    b[12..16].copy_from_slice(&12u32.to_le_bytes());
+    b[16..20].copy_from_slice(&CRTC.to_le_bytes());
+    if crate::drm_ioctl_bridge::dispatch_card(
+        idx,
+        SMOKE_MASTER_ID + 1,
+        iowr(DRM_IOCTL_BASE, 0xBA, 24),
+        b.as_mut_ptr() as usize,
+        false,
+    ) != Err(FsError::PermissionDenied)
+    {
+        return TestResult::Fail("non-master VRR set");
+    }
+    // Atomic (on the atomic VirtIO card): VRR_ENABLED alone needs no
+    // ALLOW_MODESET; TEST_ONLY validates without applying; bad values fail.
+    let idx = register_test_virtio_card();
+    let Some(ms) = crate::drm_registry::mode_state(idx) else {
+        return TestResult::Fail("no virtio mode state");
+    };
+    ms.lock().vrr_enabled = alloc::vec![(11, false), (12, false)];
+    let atomic = |flags: u32, value: u64| {
+        let objects = [11u32];
+        let prop_counts = [1u32];
+        let props = [0x63u32];
+        let values = [value];
+        let mut req = DrmModeAtomicUapi {
+            flags,
+            count_objs: 1,
+            objs_ptr: objects.as_ptr() as u64,
+            count_props_ptr: prop_counts.as_ptr() as u64,
+            props_ptr: props.as_ptr() as u64,
+            prop_values_ptr: values.as_ptr() as u64,
+            ..Default::default()
+        };
+        dispatch_card(
+            idx,
+            DRM_IOCTL_MODE_ATOMIC,
+            &mut req as *mut _ as usize,
+            false,
+        )
+    };
+    let value = |crtc: u32| {
+        ms.lock()
+            .vrr_enabled
+            .iter()
+            .find(|&&(id, _)| id == crtc)
+            .map(|&(_, v)| v)
+    };
+    if atomic(0x0100, 1) != Ok(0) || value(11) != Some(false) {
+        return TestResult::Fail("TEST_ONLY applied");
+    }
+    if atomic(0, 1) != Ok(0) || value(11) != Some(true) || value(12) != Some(false) {
+        return TestResult::Fail("atomic VRR_ENABLED");
+    }
+    if atomic(0, 2) != Err(FsError::InvalidData) || value(11) != Some(true) {
+        return TestResult::Fail("atomic bad value");
+    }
+    ms.lock().vrr_enabled.clear();
+    if atomic(0, 0) != Err(FsError::InvalidData) {
+        return TestResult::Fail("atomic on a CRTC without it");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_vrr_properties);
 
 // ── 6. Render-node fd rejects SETCRTC with PermissionDenied ────────────
 
