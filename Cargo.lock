@@ -1042,6 +1042,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-btrfs-host"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "narf-block",
+ "narf-console",
+ "narf-drivers-fs-btrfs",
+ "narf-filesystem",
+ "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
+]
+
+[[package]]
 name = "narf-bus"
 version = "0.0.0"
 dependencies = [

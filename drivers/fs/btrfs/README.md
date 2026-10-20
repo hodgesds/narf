@@ -427,3 +427,5 @@ regenerate with a newer one). The parser rejects every assumption it cannot
 meet, so a drifted mkfs default fails loudly rather than mis-reading.
 
 Run the tests with `cargo xtask test --subsystem drivers/fs/btrfs`.
+The host-side harness (no QEMU; root-rw workload, Linux interop and crash
+replay) is `cargo xtask btrfs-host-rw` — see `verification/btrfs-host`.

@@ -21,8 +21,8 @@ use narf_filesystem::FsError;
 
 use super::{
     align_up, batch_begin, batch_gen, batch_stage_refs, cow_write_file_once, ensure_private_subvol,
-    flush_batch_from, qgroup_begin_op, qgroup_reserve, qgroup_reserve_meta, with_space_retry,
-    DataRef, DataRefId, Edit, FlushOrigin, MAX_BATCH_OPS,
+    flush_batch_from, flush_if_full, qgroup_begin_op, qgroup_reserve, qgroup_reserve_meta,
+    with_space_retry, DataRef, DataRefId, Edit, FlushOrigin, MAX_BATCH_OPS,
 };
 use crate::btree;
 use crate::format::{self, le64, BtrfsKey};
@@ -42,6 +42,7 @@ pub const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
 const MAX_PREALLOC_EXTENT: u64 = 8 << 20;
 
 // `btrfs_file_extent_item` offsets.
+const FE_COMPRESSION: usize = 16;
 const FE_TYPE: usize = 20;
 const FE_DISK_BYTENR: usize = 21;
 const FE_DISK_NUM: usize = 29;
@@ -282,13 +283,59 @@ async fn zero_if_dirty<B: BlockDevice + 'static>(
     let (fs_root, _) = vol.fs_tree_root();
     let mut buf = alloc::vec![0u8; (to - from) as usize];
     let n = crate::extent::read_file(vol, fs_root, ino, cover, from, &mut buf).await?;
-    if buf[..n].iter().all(|&b| b == 0) {
+    if buf[..n].iter().all(|&b| b == 0) && !compressed_in(vol, fs_root, ino, from, to).await? {
         return Ok(());
     }
     let inode = InodeItem::decode(&inode_body(vol, ino).await?)?;
     let zeros = alloc::vec![0u8; (to - from) as usize];
     cow_write_file_once(vol, ino, &inode, from, &zeros).await?;
     Ok(())
+}
+
+/// Whether a compressed extent backs any of `[from, to)`. Its bytes past
+/// EOF are whatever the decompressor leaves beyond the end of the stream
+/// (`mkfs.btrfs --compress` frames hold exactly `i_size` bytes; Linux zero
+/// fills, `btrfs restore` does not), so a range of one that must read as
+/// zeros is rewritten rather than trusted.
+async fn compressed_in<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    fs_root: u64,
+    ino: u64,
+    from: u64,
+    to: u64,
+) -> Result<bool, FsError> {
+    Ok(file_items(vol, fs_root, ino).await?.iter().any(|item| {
+        item.start < to
+            && item.end > from
+            && !matches!(item.kind, Kind::Hole | Kind::Disk { prealloc: true })
+            && item
+                .body
+                .get(FE_COMPRESSION)
+                .is_some_and(|&c| c != format::COMPRESS_NONE)
+    }))
+}
+
+/// Linux `btrfs_cont_expand` → `btrfs_truncate_block(inode, oldsize, 0, 0)`
+/// for a write starting past the sector that holds EOF: the rest of that
+/// sector becomes part of the gap the write opens, so it must read as zeros
+/// whatever the old extent holds past EOF. (A write starting inside that
+/// sector rewrites it itself.)
+pub(crate) async fn zero_tail_before_write<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    ino: u64,
+    offset: u64,
+) -> Result<(), FsError> {
+    let inode = InodeItem::decode(&inode_body(vol, ino).await?)?;
+    if !inode.is_regular() {
+        return Ok(());
+    }
+    let ss = u64::from(vol.sectorsize());
+    let old_size = inode.size;
+    let sector_end = align_up(old_size, ss);
+    if old_size % ss == 0 || offset < sector_end {
+        return Ok(());
+    }
+    zero_if_dirty(vol, ino, old_size, sector_end, sector_end).await
 }
 
 /// Rewrite an inline extent as a regular one (same bytes), so ranges after
@@ -407,7 +454,7 @@ async fn stage<B: BlockDevice + 'static>(
             batch.alloc = snapshot;
             return Err(err);
         }
-        batch.ops >= MAX_BATCH_OPS
+        batch.ops >= MAX_BATCH_OPS && !vol.commits_held()
     };
     if full {
         flush_batch_from(vol, FlushOrigin::StagingOperation).await?;
@@ -436,7 +483,12 @@ pub async fn truncate_file<B: BlockDevice + 'static>(
     ino: u64,
     new_size: u64,
 ) -> Result<(), FsError> {
-    with_space_retry(vol, || truncate_once(vol, ino, new_size)).await
+    let r = {
+        let _hold = vol.hold_commits();
+        with_space_retry(vol, || truncate_once(vol, ino, new_size)).await
+    };
+    flush_if_full(vol).await?;
+    r
 }
 
 async fn truncate_once<B: BlockDevice + 'static>(
@@ -539,16 +591,25 @@ pub async fn fallocate_file<B: BlockDevice + 'static>(
     }
     let end = offset.checked_add(len).ok_or(FsError::FileTooLarge)?;
     let keep = mode & FALLOC_FL_KEEP_SIZE != 0;
-    if mode & FALLOC_FL_PUNCH_HOLE != 0 {
-        if !keep || mode & FALLOC_FL_ZERO_RANGE != 0 {
-            return Err(FsError::Unsupported);
+    let punch = mode & FALLOC_FL_PUNCH_HOLE != 0;
+    if punch && (!keep || mode & FALLOC_FL_ZERO_RANGE != 0) {
+        return Err(FsError::Unsupported);
+    }
+    // Edge zeroing, uninlining and the allocation are separate stages; keep
+    // them in one transaction.
+    let r = async {
+        let _hold = vol.hold_commits();
+        if punch {
+            return with_space_retry(vol, || punch_once(vol, ino, offset, end)).await;
         }
-        return with_space_retry(vol, || punch_once(vol, ino, offset, end)).await;
+        if mode & FALLOC_FL_ZERO_RANGE != 0 {
+            with_space_retry(vol, || punch_once(vol, ino, offset, end)).await?;
+        }
+        with_space_retry(vol, || prealloc_once(vol, ino, offset, end, keep)).await
     }
-    if mode & FALLOC_FL_ZERO_RANGE != 0 {
-        with_space_retry(vol, || punch_once(vol, ino, offset, end)).await?;
-    }
-    with_space_retry(vol, || prealloc_once(vol, ino, offset, end, keep)).await
+    .await;
+    flush_if_full(vol).await?;
+    r
 }
 
 async fn prealloc_once<B: BlockDevice + 'static>(
@@ -577,6 +638,17 @@ async fn prealloc_once<B: BlockDevice + 'static>(
     }
     let (fs_root, _) = vol.fs_tree_root();
     let items = file_items(vol, fs_root, ino).await?;
+    // A (still) inline file owns its whole first sector: Linux's extent map
+    // reports the inline extent as `[0, sectorsize)`, so `btrfs_fallocate`
+    // finds nothing to preallocate there. Preallocating from the inline
+    // item's byte length instead would put a sector-unaligned PREALLOC
+    // extent beside the inline one, which `btrfs check` rejects.
+    let a = if a < ss && items.iter().any(|i| i.kind == Kind::Inline) {
+        ss
+    } else {
+        a
+    };
+    let b = b.max(a);
     let holes = gaps(&items, a, b, false);
     let root = vol.fs_tree_id();
     // Explicit hole items in the range give way to the prealloc extents.

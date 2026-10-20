@@ -1,0 +1,26 @@
+[package]
+name = "narf-btrfs-host"
+description = "Host-side (std, no QEMU) root-rw workload, Linux-interop and crash-consistency harness for the btrfs driver."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "narf-btrfs-host"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+narf-block = { path = "../../block" }
+narf-console = { path = "../../console" }
+narf-drivers-fs-btrfs = { path = "../../drivers/fs/btrfs" }
+narf-filesystem = { path = "../../filesystem" }
+narf-lib = { path = "../../lib" }
+narf-memory = { path = "../../memory" }
+narf-scheduler = { path = "../../scheduler" }
+
+[lints]
+workspace = true
