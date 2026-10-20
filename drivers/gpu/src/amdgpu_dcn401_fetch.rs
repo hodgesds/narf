@@ -11,6 +11,7 @@ mod surface;
 #[cfg(feature = "kernel-test")]
 pub(super) use surface::post_csc_words;
 pub(super) use surface::Surfaces;
+pub use surface::{cursor_mode, plane_scale, CursorMode, CursorUnder};
 pub use surface::{
     Blend, ColorProgram, CursorApplied, DeadlinesApplied, DppApplied, FlipDone, GamutProgram,
     LivePipe, MemoryApplied, MpcApplied, OgamProgram, OverlayScanout, PipeColor, PlaneLayout,

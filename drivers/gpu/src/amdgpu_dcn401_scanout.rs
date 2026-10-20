@@ -68,7 +68,7 @@ pub struct OverlayScanout {
     pub underlay: bool,
 }
 impl OverlayScanout {
-    fn of(s: SurfaceApplied) -> Self {
+    pub(super) fn of(s: SurfaceApplied) -> Self {
         Self {
             pipe: s.request.pipe,
             odm: s.request.odm,
@@ -136,7 +136,7 @@ pub struct LivePipe {
 /// overlays' (normalized zpos order). An MPC-combined plane's slices sit
 /// together, each further slice below the one before (its bottom_pipe, as
 /// acquire_dpp_pipe_and_add_mpc_slice links it).
-fn trees(
+pub(super) fn trees(
     (pipe, odm, mpc): (u8, SplitPipes, SplitPipes),
     overlays: &[Option<OverlayScanout>; MAX_OVERLAYS],
 ) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
@@ -168,7 +168,7 @@ impl ScanoutRunning {
     /// having built each segment's tree from the top plane down: the top
     /// MPCC on the OPP's OUT_MUX, each blending over the next lower one
     /// (TOP_BOT_BLENDING), the bottom over the background (TOP_LAYER_ONLY).
-    /// The cursor shows on the primary's pipes only.
+    /// The cursor shows on every pipe `CursorApplied::shown` names.
     pub fn live_pipes(&self, cursor: Option<CursorApplied>) -> alloc::vec::Vec<LivePipe> {
         live_pipes(
             (self.pipe, self.odm, self.mpc),
@@ -203,8 +203,9 @@ fn live_pipes(
             out.push(LivePipe {
                 pipe: m,
                 address: fetched,
-                cursor: primary & bit(m) != 0
-                    && cursor.is_some_and(|c| c.pipe == pipe && c.shown_on(m)),
+                // dcn401_set_cursor_position runs on every pipe of the
+                // stream: any plane's pipe the cursor overlaps shows it.
+                cursor: cursor.is_some_and(|c| c.pipe == pipe && c.shown_on(m)),
                 routes: [
                     if m == opp { top } else { 0xf },
                     m,

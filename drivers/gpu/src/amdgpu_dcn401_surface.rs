@@ -26,7 +26,7 @@ mod deadline;
 pub use deadline::DeadlinesApplied;
 #[path = "amdgpu_dcn401_cursor.rs"]
 mod cursor;
-pub use cursor::{CursorApplied, CURSOR_MAX};
+pub use cursor::{cursor_mode, plane_scale, CursorApplied, CursorMode, CursorUnder, CURSOR_MAX};
 #[path = "amdgpu_dcn401_color.rs"]
 mod color;
 #[path = "amdgpu_dcn401_flip.rs"]
