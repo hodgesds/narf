@@ -235,6 +235,13 @@ pub struct Tcb {
     pub retx_deadline_cycles: u64,
     /// Number of back-to-back RTOs without a fresh ACK.
     pub rto_count: u32,
+    /// Segments retransmitted over the connection's lifetime (Linux
+    /// `tp->total_retrans`, `tcpi_total_retrans`): RTO, fast retransmit and
+    /// the go-back-N resends after an RTO.
+    pub total_retrans: u32,
+    /// Highest sequence number sent so far (Linux `tp->snd_nxt` before an RTO
+    /// rewinds ours); data sent below it is a retransmission.
+    pub snd_high: u32,
 
     // ── Congestion control ──
     /// Per-socket cc state (cwnd, ssthresh, CUBIC curve params).
@@ -474,6 +481,8 @@ impl Tcb {
             retx_queue: VecDeque::new(),
             retx_deadline_cycles: 0,
             rto_count: 0,
+            total_retrans: 0,
+            snd_high: iss,
             cong: CcState::default(),
             cc: default_cc(),
             flightsize: 0,
@@ -1303,7 +1312,7 @@ pub fn tcp_info(id: u32) -> Option<TcpInfoSnapshot> {
         advmss: t.opts.our_mss as u32,
         reordering: 3,
         rcv_space: t.recv_buf.limit.min(u32::MAX as usize) as u32,
-        total_retrans: t.rto_count,
+        total_retrans: t.total_retrans,
         notsent_bytes: t.send_buf.len().min(u32::MAX as usize) as u32,
         snd_wnd: t.snd_wnd,
         rcv_wnd: t.rcv_wnd,
@@ -3015,6 +3024,7 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
             // Roll back snd_nxt so send_syn re-installs the
             // retransmit record at the correct seq.
             t.snd_nxt = t.iss;
+            t.total_retrans = t.total_retrans.saturating_add(1);
         }
         send_syn(arc, ack_too);
         return;
@@ -3057,6 +3067,7 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         t.snd_nxt = seq
             .wrapping_add(payload.len() as u32)
             .wrapping_add((fin != 0) as u32);
+        t.total_retrans = t.total_retrans.saturating_add(1);
         arm_retransmit_timer(&mut t);
     }
 }
@@ -3306,6 +3317,8 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
             break;
         }
         let mut cur_seq = seq;
+        let snd_high = arc.lock().snd_high;
+        let mut resent = 0u32;
         for (i, c) in chunks.iter().enumerate() {
             let last = i == chunks.len() - 1;
             let extra = if last && fin_flag != 0 {
@@ -3319,7 +3332,19 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
             // egress sends normally.
             let seg_tso = tso_arg.filter(|&m| c.len() > m as usize);
             send_data(arc, cur_seq, c, extra, true, seg_tso, !last);
+            if seq_lt(cur_seq, snd_high) {
+                // Go-back-N after an RTO: counted per segment, as
+                // `__tcp_retransmit_skb` adds `tcp_skb_pcount`.
+                resent += seg_tso.map_or(1, |m| c.len().div_ceil(m as usize) as u32);
+            }
             cur_seq = cur_seq.wrapping_add(c.len() as u32);
+        }
+        {
+            let mut t = arc.lock();
+            t.total_retrans = t.total_retrans.saturating_add(resent);
+            if seq_gt(cur_seq, t.snd_high) {
+                t.snd_high = cur_seq;
+            }
         }
         let _ = drained_all;
         if fin_flag != 0 {
@@ -4471,6 +4496,7 @@ fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     );
     emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None, false));
     let mut t = arc.lock();
+    t.total_retrans = t.total_retrans.saturating_add(1);
     // Karn: no RTT sample from any record covering the resent range.
     let end = seq.wrapping_add(payload.len() as u32);
     for r in t.retx_queue.iter_mut() {

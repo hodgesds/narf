@@ -990,6 +990,9 @@ fn tcp_e2e_bulk(client_to_server: bool) -> Result<(), &'static str> {
     if retransmitted_data_segments(&log) != 0 {
         return Err("clean link produced data retransmissions");
     }
+    if total_retrans(from)? != 0 {
+        return Err("tcpi_total_retrans must stay 0 on a clean link");
+    }
     if log.iter().any(|s| s.has(FLAG_RST)) {
         return Err("RST during bulk transfer");
     }
@@ -1235,7 +1238,19 @@ fn tcp_e2e_fast_retransmit(dir: Dir) -> Result<(), &'static str> {
     if FORCED_RTOS.load(Ordering::Relaxed) != 0 {
         return Err("recovery needed an RTO; fast retransmit should have repaired a single loss");
     }
+    // `tcpi_total_retrans` is cumulative (Linux `tp->total_retrans`): it
+    // still counts the repair after the ACK that ended recovery.
+    if total_retrans(from)? == 0 {
+        return Err("tcpi_total_retrans did not count the fast retransmission");
+    }
     Ok(())
+}
+
+/// `tcpi_total_retrans` of `id`.
+fn total_retrans(id: u32) -> Result<u32, &'static str> {
+    tcp_core::tcp_info(id)
+        .map(|i| i.total_retrans)
+        .ok_or("TCB gone")
 }
 
 fn smoke_tcp_e2e_fast_retransmit_client_data() -> TestResult {
@@ -1270,6 +1285,9 @@ fn tcp_e2e_tail_loss_rto() -> Result<(), &'static str> {
     let rto_count = __with_tcb(c.client, |t| t.rto_count).ok_or("client gone")?;
     if rto_count != 0 {
         return Err("rto_count must reset once new data is ACKed");
+    }
+    if total_retrans(c.client)? == 0 {
+        return Err("tcpi_total_retrans must keep counting after rto_count resets");
     }
     Ok(())
 }
