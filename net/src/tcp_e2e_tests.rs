@@ -2113,6 +2113,64 @@ fn smoke_tcp_e2e_errno_reset_close_wait() -> TestResult {
 }
 kernel_test_in!("net/tcp_e2e", smoke_tcp_e2e_errno_reset_close_wait);
 
+// Non-blocking active open (`tcp_v4_connect` returns after the SYN): the
+// handshake runs from RX and the timers, and `connect_status` reports it the
+// way `__inet_stream_connect` sees it. While SYN-SENT: in progress, no
+// POLLERR/POLLHUP, no peer name. Established: connected, peer name. Refused:
+// `sock_error()` = ECONNREFUSED once, then ECONNABORTED; TCP_CLOSE polls
+// HUP with ERR until the error is read.
+fn tcp_e2e_connect_start_status() -> Result<(), &'static str> {
+    use crate::tcp::core::{connect_start_in, connect_status, has_peer_name, poll_err_hup};
+    use crate::tcp::core::{ConnectOptions, ConnectStatus};
+    reset();
+    let listener = listen(SERVER_IP, SERVER_PORT, 16).map_err(|_| "listen failed")?;
+    let id = connect_start_in(0, SERVER_IP, SERVER_PORT, ConnectOptions::default())
+        .map_err(|_| "connect_start_in failed")?;
+    if connect_status(id) != ConnectStatus::InProgress {
+        return Err("a just-started connect must be in progress");
+    }
+    if state_of(id) != Some(TcpState::SynSent) {
+        return Err("connect_start_in must return in SYN-SENT");
+    }
+    if has_peer_name(id) {
+        return Err("getpeername must be ENOTCONN in SYN-SENT");
+    }
+    if poll_err_hup(id) != (false, false) || tcp_core::writable(id) || tcp_core::readable(id) {
+        return Err("a connecting socket must poll no events");
+    }
+    settle();
+    if connect_status(id) != ConnectStatus::Connected {
+        return Err("the handshake did not complete without a waiter");
+    }
+    if !has_peer_name(id) || !tcp_core::writable(id) {
+        return Err("an established connect must have a peer and poll writable");
+    }
+    let _ = accept_one(listener)?;
+
+    let refused = connect_start_in(0, SERVER_IP, CLOSED_PORT, ConnectOptions::default())
+        .map_err(|_| "connect_start_in (closed port) failed")?;
+    settle();
+    if poll_err_hup(refused) != (true, true) {
+        return Err("a refused connect must poll ERR|HUP");
+    }
+    if connect_status(refused) != ConnectStatus::Failed(ECONNREFUSED) {
+        return Err("a refused connect must report ECONNREFUSED");
+    }
+    if connect_status(refused) != ConnectStatus::Failed(errno::ECONNABORTED as i32) {
+        return Err("once its error is taken, a failed connect is ECONNABORTED");
+    }
+    if poll_err_hup(refused) != (false, true) {
+        return Err("a failed connect whose error was read polls HUP without ERR");
+    }
+    tcp_core::release(refused);
+    Ok(())
+}
+
+fn smoke_tcp_e2e_connect_start_status() -> TestResult {
+    finish(tcp_e2e_connect_start_status())
+}
+kernel_test_in!("net/tcp_e2e", smoke_tcp_e2e_connect_start_status);
+
 // connect(): RST → ECONNREFUSED; silence → ETIMEDOUT; unresolvable next
 // hop → EHOSTUNREACH; no interface → ENETUNREACH.
 fn tcp_e2e_errno_connect_failures() -> Result<(), &'static str> {

@@ -1624,6 +1624,21 @@ pub fn connect_errno_with_options_in(
     remote_port: u16,
     options: ConnectOptions,
 ) -> Result<u32, i32> {
+    let id = connect_start_in(net_ns_id, remote_addr, remote_port, options)?;
+    connect_wait(id, options)
+}
+
+/// `tcp_v4_connect`: route, choose the port and ISN, install the SYN-SENT
+/// TCB and send the SYN, then return its id without waiting — the
+/// handshake completes (or fails) from RX and the TCP timers, and
+/// [`connect_status`] reports it. Failures known before the SYN is sent are
+/// returned as the errnos [`connect_errno_with_options_in`] lists.
+pub fn connect_start_in(
+    net_ns_id: u64,
+    remote_addr: [u8; 4],
+    remote_port: u16,
+    options: ConnectOptions,
+) -> Result<u32, i32> {
     let iface = iface::for_dst_in(net_ns_id, remote_addr).ok_or(errno::ENETUNREACH as i32)?;
     // Resolve the ROUTE's next hop, not the interface's `gateway` field.
     //
@@ -1670,10 +1685,21 @@ pub fn connect_errno_with_options_in(
 
     // Emit the SYN with our negotiation options.
     send_syn(&arc, false);
+    Ok(id)
+}
 
-    // Linux TCP_SYNCNT counts SYN retransmits. Derive the blocking-connect
-    // deadline from the same exponentially backed-off 1s initial RTO rather
-    // than imposing the old fixed five-second ceiling.
+/// The blocking wait of an in-kernel caller: drive RX and the SYN timer
+/// until the handshake ends. Linux TCP_SYNCNT counts SYN retransmits; the
+/// deadline follows the same exponentially backed-off 1 s initial RTO.
+/// Userspace `connect(2)` does not come here: it parks on the socket's
+/// readiness instead (`inet_wait_for_connect`), so the CPU idles.
+pub fn connect_wait(id: u32, options: ConnectOptions) -> Result<u32, i32> {
+    let Some(arc) = lookup_tcb(id) else {
+        return match connect_status(id) {
+            ConnectStatus::Failed(e) => Err(e),
+            _ => Err(errno::ECONNABORTED as i32),
+        };
+    };
     let mut timeout_secs = 1u64;
     let mut rto_secs = 1u64;
     for _ in 0..options.syn_retries {
@@ -1688,8 +1714,7 @@ pub fn connect_errno_with_options_in(
             // Pump retransmits from inside the spin so a lost SYN
             // gets retried before the deadline.
             tick_retransmit(&arc);
-            let st = arc.lock().state;
-            st != TcpState::SynSent && st != TcpState::SynReceived
+            !matches!(arc.lock().state, TcpState::SynSent | TcpState::SynReceived)
         },
         deadline,
     );
@@ -1714,7 +1739,81 @@ pub fn connect_errno_with_options_in(
     }
 }
 
+/// Where an active open stands, for a `connect(2)` that does not block on
+/// it (`__inet_stream_connect` after `inet_wait_for_connect`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectStatus {
+    /// SYN-SENT / SYN-RECEIVED: the handshake is still running.
+    InProgress,
+    /// The connection is established (or has moved on from there).
+    Connected,
+    /// TCP_CLOSE: `sock_error()` — the reset / timeout / ICMP errno, taken
+    /// once — or `ECONNABORTED` when there is none left to report.
+    Failed(i32),
+}
+
+/// See [`ConnectStatus`]. A `Failed` result consumes the pending error, as
+/// `sock_error` does.
+pub fn connect_status(id: u32) -> ConnectStatus {
+    let aborted = errno::ECONNABORTED as i32;
+    match lookup_tcb(id) {
+        Some(arc) => {
+            let mut t = arc.lock();
+            match t.state {
+                TcpState::SynSent | TcpState::SynReceived => ConnectStatus::InProgress,
+                TcpState::Closed | TcpState::Listen => {
+                    ConnectStatus::Failed(take_sk_err(&mut t).unwrap_or(aborted))
+                }
+                _ => ConnectStatus::Connected,
+            }
+        }
+        None => ConnectStatus::Failed(take_tombstone(id).filter(|&e| e != 0).unwrap_or(aborted)),
+    }
+}
+
+/// `inet_getname(peer = 1)`: a peer name exists unless the socket is
+/// TCP_SYN_SENT or TCP_CLOSE (gone, or finished into TIME-WAIT — Linux's
+/// socket is TCP_CLOSE once `tcp_time_wait` takes over); otherwise ENOTCONN.
+pub fn has_peer_name(id: u32) -> bool {
+    lookup_tcb(id).is_some_and(|arc| {
+        !matches!(
+            arc.lock().state,
+            TcpState::SynSent | TcpState::Closed | TcpState::TimeWait
+        )
+    })
+}
+
+/// `tcp_poll`'s EPOLLERR / EPOLLHUP inputs: `(sk_err pending, TCP_CLOSE)`.
+/// A connection that is gone is TCP_CLOSE; its error is the tombstone's.
+pub fn poll_err_hup(id: u32) -> (bool, bool) {
+    match lookup_tcb(id) {
+        Some(arc) => {
+            let t = arc.lock();
+            (t.sk_err != 0, t.state == TcpState::Closed)
+        }
+        None => (
+            TOMBSTONES
+                .lock()
+                .as_ref()
+                .and_then(|m| m.get(&id))
+                .is_some_and(|t| t.err != 0),
+            true,
+        ),
+    }
+}
+
 pub fn connect6_errno_with_options_in(
+    net_ns_id: u64,
+    remote_addr: [u8; 16],
+    remote_port: u16,
+    options: ConnectOptions,
+) -> Result<u32, i32> {
+    let id = connect6_start_in(net_ns_id, remote_addr, remote_port, options)?;
+    connect_wait(id, options)
+}
+
+/// [`connect_start_in`] for IPv6 (`tcp_v6_connect`).
+pub fn connect6_start_in(
     net_ns_id: u64,
     remote_addr: [u8; 16],
     remote_port: u16,
@@ -1754,40 +1853,7 @@ pub fn connect6_errno_with_options_in(
         install_tcb(tcb)
     };
     send_syn(&arc, false);
-
-    let mut timeout_secs = 1u64;
-    let mut rto_secs = 1u64;
-    for _ in 0..options.syn_retries {
-        rto_secs = rto_secs.saturating_mul(2).min(60);
-        timeout_secs = timeout_secs.saturating_add(rto_secs);
-    }
-    let deadline =
-        narf_scheduler::narf_time::Deadline::after_ns(timeout_secs.saturating_mul(1_000_000_000));
-    let _ = narf_scheduler::responsive_spin_until(
-        || {
-            while iface::drain_pump() {}
-            tick_retransmit(&arc);
-            !matches!(arc.lock().state, TcpState::SynSent | TcpState::SynReceived)
-        },
-        deadline,
-    );
-    let (state, hard, soft) = {
-        let tcb = arc.lock();
-        (tcb.state, tcb.sk_err, tcb.sk_err_soft)
-    };
-    if state == TcpState::Established {
-        Ok(id)
-    } else {
-        remove_tcb(id);
-        release(id);
-        Err(if hard != 0 {
-            hard
-        } else if soft != 0 {
-            soft
-        } else {
-            errno::ETIMEDOUT as i32
-        })
-    }
+    Ok(id)
 }
 
 pub fn connect6_errno_in(
@@ -4015,6 +4081,10 @@ fn handle_in_syn_sent(
     // Final ACK of the handshake.
     send_ack(arc, 0);
     let _ = payload; // SYN+ACK shouldn't carry data
+                     // `tcp_finish_connect` → `sk_state_change`: wake a connect(2) parked on
+                     // this socket (`inet_wait_for_connect`) and pollers waiting for POLLOUT.
+    let id = arc.lock().id as u64;
+    crate::readiness::notify(id);
 }
 
 fn handle_in_syn_received(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, payload: &[u8]) {
@@ -4061,6 +4131,9 @@ fn handle_in_syn_received(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, payl
     if let Some(listener_id) = add_to_listener_accept_queue(arc, !payload.is_empty()) {
         crate::readiness::notify(listener_id as u64);
     }
+    // A simultaneous open is an active connect(2) completing here.
+    let id = arc.lock().id as u64;
+    crate::readiness::notify(id);
 }
 
 /// Hash the connection's remote endpoint (+ local port) to a stable

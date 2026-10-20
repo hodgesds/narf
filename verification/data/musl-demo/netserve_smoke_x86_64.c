@@ -37,6 +37,7 @@
 //   * "netserve-udp-gso-ok" — UDP GSO send + UDP_GRO receive (5).
 // Sizes and the pattern MUST match `net_smoke_cmd_with_nic` in xtask.
 //   * "netserve-dns-ok"     — after a valid DNS response.
+//   * "netserve-nbconnect-ok" — connect(2)'s non-blocking / refused / retry states.
 //   * "netserve-ok"         — all three paths passed.
 //
 // Build: the uniform musl-demo recipe (musl-gcc -O2 -fPIE -pie).
@@ -437,6 +438,61 @@ static int icmp_probe(const char *dst, int count, long *mean_rtt_us) {
     close(s);
     *mean_rtt_us = got ? total_us / got : -1;
     return got;
+}
+
+// (6b) connect(2)'s state machine against real peers (`__inet_stream_connect`):
+// a non-blocking connect is EINPROGRESS and completes in the background; the
+// connect after it is 0, then EISCONN. A refused one polls ERR|HUP, reports
+// ECONNREFUSED through SO_ERROR, then ECONNABORTED. A blocking connect that
+// fails leaves the socket unconnected, so it can connect again. Host port 1
+// is closed, and SLIRP answers its SYN with a reset.
+static int nb_connect_checks(void) {
+    struct sockaddr_in ok_addr, refused_addr;
+    host_addr(&ok_addr, PAR_PORT);
+    host_addr(&refused_addr, 1);
+    int err;
+    socklen_t l = sizeof err;
+
+    int c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (c < 0) return failf("nbconnect socket", 0, 0);
+    if (connect(c, (struct sockaddr *)&ok_addr, sizeof ok_addr) != -1 || errno != EINPROGRESS)
+        return failf("nbconnect: non-blocking connect must be EINPROGRESS", 0, 0);
+    struct pollfd p = {.fd = c, .events = POLLOUT};
+    if (poll(&p, 1, 20000) != 1 || !(p.revents & POLLOUT) || (p.revents & (POLLERR | POLLHUP)))
+        return failf("nbconnect: poll for the handshake; revents", p.revents, 0);
+    err = -1;
+    if (getsockopt(c, SOL_SOCKET, SO_ERROR, &err, &l) || err != 0)
+        return failf("nbconnect: SO_ERROR after the handshake", (unsigned long)err, 0);
+    if (connect(c, (struct sockaddr *)&ok_addr, sizeof ok_addr) != 0)
+        return failf("nbconnect: the connect after completion must be 0", 0, 0);
+    if (connect(c, (struct sockaddr *)&ok_addr, sizeof ok_addr) != -1 || errno != EISCONN)
+        return failf("nbconnect: then EISCONN", 0, 0);
+    close(c);
+
+    c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (c < 0) return failf("nbconnect socket", 0, 0);
+    if (connect(c, (struct sockaddr *)&refused_addr, sizeof refused_addr) != -1 || errno != EINPROGRESS)
+        return failf("nbconnect: refused non-blocking connect must be EINPROGRESS", 0, 0);
+    p.fd = c;
+    p.revents = 0;
+    if (poll(&p, 1, 20000) != 1 || (p.revents & (POLLERR | POLLHUP)) != (POLLERR | POLLHUP))
+        return failf("nbconnect: a refused connect must poll ERR|HUP; revents", p.revents, 0);
+    err = -1;
+    if (getsockopt(c, SOL_SOCKET, SO_ERROR, &err, &l) || err != ECONNREFUSED)
+        return failf("nbconnect: SO_ERROR after the reset", (unsigned long)err, 0);
+    if (connect(c, (struct sockaddr *)&refused_addr, sizeof refused_addr) != -1 || errno != ECONNABORTED)
+        return failf("nbconnect: connect after the reported refusal must be ECONNABORTED", 0, 0);
+    close(c);
+
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    if (c < 0) return failf("nbconnect socket", 0, 0);
+    if (connect(c, (struct sockaddr *)&refused_addr, sizeof refused_addr) != -1 || errno != ECONNREFUSED)
+        return failf("nbconnect: blocking connect to a closed port must be ECONNREFUSED", 0, 0);
+    if (connect(c, (struct sockaddr *)&ok_addr, sizeof ok_addr) != 0)
+        return failf("nbconnect: the socket must connect again after a failed connect", 0, 0);
+    close(c);
+    w("netserve-nbconnect-ok\n");
+    return 0;
 }
 
 static int icmp_checks(void) {
@@ -1866,6 +1922,7 @@ int main(void) {
         return 1;
     }
     w("netserve-dns-ok\n");
+    if (nb_connect_checks()) return 1;
     if (icmp_checks()) return 1;
     if (robust_phases()) return 1;
     w("netserve-ok\n");
