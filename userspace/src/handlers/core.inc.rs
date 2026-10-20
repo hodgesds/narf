@@ -10391,6 +10391,9 @@ fn shmem_vtable() -> Option<&'static ShmemSyscallVtable> {
 }
 
 pub fn retain_external_shared_frame(phys: u64) {
+    if narf_filesystem::mmap_relocation::retain_alias(phys) {
+        return;
+    }
     if narf_filesystem::page_cache::retain_mapped_folio(phys) {
         return;
     }
@@ -10403,6 +10406,9 @@ pub fn retain_external_shared_frame(phys: u64) {
 }
 
 pub fn release_external_shared_frame(phys: u64) {
+    if narf_filesystem::mmap_relocation::release_alias(phys) {
+        return;
+    }
     if narf_filesystem::page_cache::release_mapped_folio(phys) {
         return;
     }
@@ -14078,6 +14084,17 @@ pub(crate) fn own_stack_block(_ctx: &mut dyn TrapContext) {
 pub(crate) fn park_reexecute_on_io(ctx: &mut dyn TrapContext) -> bool {
     let deadline = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
     park_reexecute_on_io_until(ctx, deadline, false)
+}
+
+/// Whether this syscall can park its task and re-execute (the precondition
+/// [`park_reexecute_on_io_until`] checks): false in kernel-test and nested
+/// contexts, which have to wait in place instead.
+pub(crate) fn can_park_reexecute() -> bool {
+    crate::user_task::current_user_task().is_some()
+        && crate::epoll::can_park_with_task_context(
+            narf_scheduler::stackful::user_own_stack_enabled(),
+            crate::user_task::yield_hook().is_some(),
+        )
 }
 
 /// Common net-I/O park setup. A durable per-fd [`Readiness`] arm passes

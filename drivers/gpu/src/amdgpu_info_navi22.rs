@@ -1,8 +1,8 @@
-//! Navi 22 (GC 10.3.2) `AMDGPU_INFO` replies, as Linux `amdgpu_kms.c`
-//! answers them for this ASIC.
+//! Discrete RDNA2 (GC 10.3) `AMDGPU_INFO` replies, following Linux
+//! `amdgpu_kms.c` for the RX 6000 ASIC profiles.
 //!
-//! [`crate::amdgpu_info`] routes a bound Navi 22 here. The identity and
-//! topology fields come from three published sources, never from a per-board
+//! [`crate::amdgpu_info`] routes bound Navi21/22/23/24 here. Identity and
+//! topology come from the discovery data and published owners, never a per-board
 //! table:
 //!
 //! - the discovery GC table (maxima), already in the [`Snapshot`];
@@ -25,14 +25,14 @@
 //! the DRM version minor and whether `amdgpu_navi22_cs` registers the card's
 //! submitter.
 //!
-//! LINUX-GAP: `gpu_counter_freq` (VBIOS gfx_info refclk), `vram_type` /
-//! `vram_bit_width` (VBIOS vram_info), memory clocks (SMU UCLK range),
-//! `pcie_gen` / `pcie_num_lanes`, and `mall_size` (discovery MALL table) are
-//! zero; Mesa uses them for heuristics only on GFX10.3. Pinned-VRAM
-//! accounting is zero until GEM owns VRAM placement; GTT is zero until GART.
-//! READ_MMR_REG answers GB_ADDR_CONFIG only; the live-status registers of
-//! `nv_allowed_read_registers` need GC MMIO the cold-boot owner holds, and
-//! return EFAULT. See `drivers/gpu/research/navi22-mesa-abi.md`.
+//! `gpu_counter_freq` uses the VBIOS reference clock sampled at probe.
+//!
+//! VRAM type/width use atomfirmware's strapped module, memory clocks use
+//! boot MCLK or the SMU UCLK limits, PCIe capabilities intersect the GPU and
+//! physical upstream partner, and MALL size follows gmc_v10_0_sw_init.
+//! Live READ_MMR_REG requests use nv.c's allow-list under the async platform
+//! owner and a GFXOFF reference. Pure snapshot queries can answer the cached
+//! GB_ADDR_CONFIG only; they never perform unguarded hardware access.
 
 use alloc::vec::Vec;
 
@@ -126,7 +126,7 @@ pub struct Firmware {
     pub rlc_srls: Version,
     pub rlcp: Version,
     pub rlcv: Version,
-    /// Both SDMA instances load the same file.
+    /// Every discovered SDMA instance loads the same per-ASIC file.
     pub sdma: Version,
     pub sos: Version,
     pub vcn: Version,
@@ -237,6 +237,12 @@ pub struct Boot {
 /// Everything published for the bound Navi 22.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Published {
+    /// Board module selected by BIOS_SCRATCH_4, read under PCI authority.
+    pub vram_module: Option<u8>,
+    /// Maximum common GPU/physical-slot PCIe capabilities.
+    pub pcie: Option<(u32, u32)>,
+    /// Observed UCLK limits in kHz; boot MCLK while UCLK DPM is disabled.
+    pub memory_khz: Option<(u64, u64)>,
     pub topology: Option<Topology>,
     /// PCI config revision (offset 0x08), `pdev->revision`.
     pub pci_revision: Option<u8>,
@@ -328,6 +334,15 @@ fn dev_info(snap: &Snapshot, submission: Submission) -> Result<Vec<u8>, FsError>
         num_shader_arrays_per_engine: table.num_sa_per_se,
         max_engine_clock: max_sclk,
         min_engine_clock: min_sclk,
+        gpu_counter_freq: snap.reference_clock_10khz.saturating_mul(10),
+        vram_type: snap.vram_type,
+        vram_bit_width: snap.vram_bit_width,
+        min_memory_clock: snap.navi22.memory_khz.map_or(0, |v| v.0),
+        max_memory_clock: snap.navi22.memory_khz.map_or(0, |v| v.1),
+        pcie_gen: snap.navi22.pcie.map_or(0, |v| v.0),
+        pcie_num_lanes: snap.navi22.pcie.map_or(0, |v| v.1),
+        mall_size: crate::amdgpu_rdna2::for_pci_id(crate::amdgpu::AMD_VENDOR, snap.did as u16)
+            .map_or(0, |profile| profile.mall_bytes()),
         cu_active_number: topology.map_or(0, |t| t.active_cus),
         cu_ao_mask: topology.map_or(0, |t| t.ao_cu_mask),
         cu_bitmap: topology.map_or([[0; 4]; 4], |t| t.cu_bitmap),

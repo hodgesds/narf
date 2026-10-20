@@ -235,6 +235,13 @@ pub struct Tcb {
     pub retx_deadline_cycles: u64,
     /// Number of back-to-back RTOs without a fresh ACK.
     pub rto_count: u32,
+    /// Segments retransmitted over the connection's lifetime (Linux
+    /// `tp->total_retrans`, `tcpi_total_retrans`): RTO, fast retransmit and
+    /// the go-back-N resends after an RTO.
+    pub total_retrans: u32,
+    /// Highest sequence number sent so far (Linux `tp->snd_nxt` before an RTO
+    /// rewinds ours); data sent below it is a retransmission.
+    pub snd_high: u32,
 
     // ── Congestion control ──
     /// Per-socket cc state (cwnd, ssthresh, CUBIC curve params).
@@ -474,6 +481,8 @@ impl Tcb {
             retx_queue: VecDeque::new(),
             retx_deadline_cycles: 0,
             rto_count: 0,
+            total_retrans: 0,
+            snd_high: iss,
             cong: CcState::default(),
             cc: default_cc(),
             flightsize: 0,
@@ -951,6 +960,27 @@ fn pick_local_port4(net_ns_id: u64, local: [u8; 4], remote: [u8; 4], rport: u16)
 }
 
 #[doc(hidden)]
+pub fn __secure_tcp_seq_for_test(
+    net_ns_id: u64,
+    saddr: [u8; 4],
+    daddr: [u8; 4],
+    sport: u16,
+    dport: u16,
+) -> u32 {
+    secure_tcp_seq(net_ns_id, saddr, daddr, sport, dport)
+}
+
+#[doc(hidden)]
+pub fn __secure_tcpv6_seq_for_test(
+    saddr: [u8; 16],
+    daddr: [u8; 16],
+    sport: u16,
+    dport: u16,
+) -> u32 {
+    secure_tcpv6_seq(0, saddr, daddr, sport, dport)
+}
+
+#[doc(hidden)]
 pub fn __pick_local_port_with_for_test(in_use: impl FnMut(u16) -> bool) -> Option<u16> {
     pick_local_port(in_use)
 }
@@ -1047,17 +1077,22 @@ pub(crate) fn remove_namespace(net_ns_id: u64) {
 // Linux keeps `struct sock` — with its `sk_err` and `SOCK_DONE` — alive
 // until the owning fd is closed, so a read or write after a reset or a
 // timeout still reports why the connection died. NARF frees the TCB at
-// teardown, so the two facts the socket API still needs are parked here,
-// keyed by TCB id, until the socket is closed (`close` / `release`).
-// Bounded: a connection nobody ever accepts or closes cannot grow it
-// without limit (the oldest entry is evicted).
+// teardown, so what the socket API still needs is parked here, keyed by TCB
+// id, until the socket is closed (`close` / `release`): the error, the FIN,
+// and the received bytes the application had not read yet — `tcp_done`
+// leaves `sk_receive_queue` alone, and `tcp_recvmsg_locked` drains it before
+// it looks at `SOCK_DONE` or `sk_err`. Bounded: a connection nobody ever
+// accepts or closes cannot grow it without limit (the oldest entry is
+// evicted).
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 struct Tombstone {
     /// Pending `sk_err` (positive errno; 0 once reported).
     err: i32,
     /// Linux `SOCK_DONE`: the peer's FIN had been received.
     done: bool,
+    /// Received bytes still unread when the connection died.
+    unread: RecvBuf,
 }
 
 const MAX_TOMBSTONES: usize = 4096;
@@ -1066,22 +1101,28 @@ static TOMBSTONES: IrqSafeSpinLock<Option<BTreeMap<u32, Tombstone>>> = IrqSafeSp
 
 /// Linux `tcp_done_with_error`: record `err` as the socket error, move to
 /// CLOSED, and free the TCB. `err` is a positive errno from
-/// `narf_lib::errno`.
+/// `narf_lib::errno`; 0 ends the connection without one. Unread received
+/// bytes stay readable until the socket is closed.
 fn abort_tcb(arc: &Arc<IrqSafeSpinLock<Tcb>>, err: i32, cause: DropCause) {
-    let (id, done) = {
+    let (id, done, unread) = {
         let mut t = arc.lock();
         t.sk_err = err;
         t.drop_cause = Some(cause);
         t.state = TcpState::Closed;
-        (t.id, t.fin_received)
+        // A closed (orphaned) socket has no reader left to drain it.
+        let unread = match t.orphan {
+            false => core::mem::take(&mut t.recv_buf),
+            true => RecvBuf::default(),
+        };
+        (t.id, t.fin_received, unread)
     };
-    if err != 0 {
+    if err != 0 || unread.has_data() {
         let mut g = TOMBSTONES.lock();
         let m = g.get_or_insert_with(BTreeMap::new);
         if m.len() >= MAX_TOMBSTONES {
             m.pop_first();
         }
-        m.insert(id, Tombstone { err, done });
+        m.insert(id, Tombstone { err, done, unread });
     }
     remove_tcb(id);
     // A reader or writer parked on this socket must wake to see the error.
@@ -1089,14 +1130,38 @@ fn abort_tcb(arc: &Arc<IrqSafeSpinLock<Tcb>>, err: i32, cause: DropCause) {
 }
 
 /// Take a dead connection's pending error (Linux `sock_error`: report
-/// once, then clear). `None` if the id has no tombstone.
-fn take_tombstone(id: u32) -> Option<Tombstone> {
+/// once, then clear; 0 once reported). `None` if the id has no tombstone.
+fn take_tombstone(id: u32) -> Option<i32> {
     let mut g = TOMBSTONES.lock();
-    let m = g.as_mut()?;
-    let ts = m.get_mut(&id)?;
-    let out = *ts;
-    ts.err = 0;
-    Some(out)
+    let ts = g.as_mut()?.get_mut(&id)?;
+    Some(core::mem::take(&mut ts.err))
+}
+
+/// `tcp_recvmsg_locked` on a connection that is gone: the unread bytes
+/// first, then — with nothing left — 0 after the peer's FIN (`SOCK_DONE`),
+/// else the pending error once, else 0 (`RCV_SHUTDOWN`).
+fn recv_dead(id: u32, buf: &mut [u8], peek: bool) -> Result<usize, i32> {
+    let mut g = TOMBSTONES.lock();
+    let Some(ts) = g.as_mut().and_then(|m| m.get_mut(&id)) else {
+        return Ok(0);
+    };
+    let n = match peek {
+        true => ts.unread.peek(buf),
+        false => ts.unread.read(buf),
+    };
+    if n > 0 || ts.done || ts.err == 0 {
+        return Ok(n);
+    }
+    Err(core::mem::take(&mut ts.err))
+}
+
+/// `tcp_inq` on a connection that is gone: its unread bytes.
+fn inq_dead(id: u32) -> u32 {
+    TOMBSTONES
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&id))
+        .map_or(0, |t| t.unread.in_order_len().min(i32::MAX as usize) as u32)
 }
 
 /// Forget everything about `id`. Called when the owning socket closes.
@@ -1268,7 +1333,7 @@ pub fn tcp_info(id: u32) -> Option<TcpInfoSnapshot> {
         advmss: t.opts.our_mss as u32,
         reordering: 3,
         rcv_space: t.recv_buf.limit.min(u32::MAX as usize) as u32,
-        total_retrans: t.rto_count,
+        total_retrans: t.total_retrans,
         notsent_bytes: t.send_buf.len().min(u32::MAX as usize) as u32,
         snd_wnd: t.snd_wnd,
         rcv_wnd: t.rcv_wnd,
@@ -1289,10 +1354,13 @@ pub enum TcpQueueIoctl {
 
 /// Linux `tcp_ioctl` for SIOCINQ / SIOCOUTQ / SIOCOUTQNSD: `Err(EINVAL)` on a
 /// listener, 0 during the handshake. A connection already torn down (no
-/// TCB) has nothing queued.
+/// TCB) has nothing left to send, only its unread received bytes.
 pub fn queue_ioctl(id: u32, which: TcpQueueIoctl) -> Result<u32, i32> {
     let Some(arc) = lookup_tcb(id) else {
-        return Ok(0);
+        return Ok(match which {
+            TcpQueueIoctl::Inq => inq_dead(id),
+            TcpQueueIoctl::Outq | TcpQueueIoctl::OutqNsd => 0,
+        });
     };
     let t = arc.lock();
     if t.state == TcpState::Listen {
@@ -1556,6 +1624,21 @@ pub fn connect_errno_with_options_in(
     remote_port: u16,
     options: ConnectOptions,
 ) -> Result<u32, i32> {
+    let id = connect_start_in(net_ns_id, remote_addr, remote_port, options)?;
+    connect_wait(id, options)
+}
+
+/// `tcp_v4_connect`: route, choose the port and ISN, install the SYN-SENT
+/// TCB and send the SYN, then return its id without waiting — the
+/// handshake completes (or fails) from RX and the TCP timers, and
+/// [`connect_status`] reports it. Failures known before the SYN is sent are
+/// returned as the errnos [`connect_errno_with_options_in`] lists.
+pub fn connect_start_in(
+    net_ns_id: u64,
+    remote_addr: [u8; 4],
+    remote_port: u16,
+    options: ConnectOptions,
+) -> Result<u32, i32> {
     let iface = iface::for_dst_in(net_ns_id, remote_addr).ok_or(errno::ENETUNREACH as i32)?;
     // Resolve the ROUTE's next hop, not the interface's `gateway` field.
     //
@@ -1578,13 +1661,13 @@ pub fn connect_errno_with_options_in(
     let mac = crate::tcp_stack::arp_resolve_in(net_ns_id, nexthop, 1000)
         .map_err(|()| errno::EHOSTUNREACH as i32)?;
     let id = fresh_tcb_id();
-    let iss = compute_isn();
     // Port choice and index insertion are one step, so two racing connects
     // to the same destination cannot both take a free port.
     let (id, arc) = {
         let _bind = CONNECT_BIND_LOCK.lock();
         let local_port = pick_local_port4(net_ns_id, iface.ipv4, remote_addr, remote_port)
             .ok_or(errno::EADDRNOTAVAIL as i32)?;
+        let iss = secure_tcp_seq(net_ns_id, iface.ipv4, remote_addr, local_port, remote_port);
         let mut tcb = Tcb::new_active(
             id,
             iface.ipv4,
@@ -1602,10 +1685,21 @@ pub fn connect_errno_with_options_in(
 
     // Emit the SYN with our negotiation options.
     send_syn(&arc, false);
+    Ok(id)
+}
 
-    // Linux TCP_SYNCNT counts SYN retransmits. Derive the blocking-connect
-    // deadline from the same exponentially backed-off 1s initial RTO rather
-    // than imposing the old fixed five-second ceiling.
+/// The blocking wait of an in-kernel caller: drive RX and the SYN timer
+/// until the handshake ends. Linux TCP_SYNCNT counts SYN retransmits; the
+/// deadline follows the same exponentially backed-off 1 s initial RTO.
+/// Userspace `connect(2)` does not come here: it parks on the socket's
+/// readiness instead (`inet_wait_for_connect`), so the CPU idles.
+pub fn connect_wait(id: u32, options: ConnectOptions) -> Result<u32, i32> {
+    let Some(arc) = lookup_tcb(id) else {
+        return match connect_status(id) {
+            ConnectStatus::Failed(e) => Err(e),
+            _ => Err(errno::ECONNABORTED as i32),
+        };
+    };
     let mut timeout_secs = 1u64;
     let mut rto_secs = 1u64;
     for _ in 0..options.syn_retries {
@@ -1620,8 +1714,7 @@ pub fn connect_errno_with_options_in(
             // Pump retransmits from inside the spin so a lost SYN
             // gets retried before the deadline.
             tick_retransmit(&arc);
-            let st = arc.lock().state;
-            st != TcpState::SynSent && st != TcpState::SynReceived
+            !matches!(arc.lock().state, TcpState::SynSent | TcpState::SynReceived)
         },
         deadline,
     );
@@ -1646,7 +1739,81 @@ pub fn connect_errno_with_options_in(
     }
 }
 
+/// Where an active open stands, for a `connect(2)` that does not block on
+/// it (`__inet_stream_connect` after `inet_wait_for_connect`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectStatus {
+    /// SYN-SENT / SYN-RECEIVED: the handshake is still running.
+    InProgress,
+    /// The connection is established (or has moved on from there).
+    Connected,
+    /// TCP_CLOSE: `sock_error()` — the reset / timeout / ICMP errno, taken
+    /// once — or `ECONNABORTED` when there is none left to report.
+    Failed(i32),
+}
+
+/// See [`ConnectStatus`]. A `Failed` result consumes the pending error, as
+/// `sock_error` does.
+pub fn connect_status(id: u32) -> ConnectStatus {
+    let aborted = errno::ECONNABORTED as i32;
+    match lookup_tcb(id) {
+        Some(arc) => {
+            let mut t = arc.lock();
+            match t.state {
+                TcpState::SynSent | TcpState::SynReceived => ConnectStatus::InProgress,
+                TcpState::Closed | TcpState::Listen => {
+                    ConnectStatus::Failed(take_sk_err(&mut t).unwrap_or(aborted))
+                }
+                _ => ConnectStatus::Connected,
+            }
+        }
+        None => ConnectStatus::Failed(take_tombstone(id).filter(|&e| e != 0).unwrap_or(aborted)),
+    }
+}
+
+/// `inet_getname(peer = 1)`: a peer name exists unless the socket is
+/// TCP_SYN_SENT or TCP_CLOSE (gone, or finished into TIME-WAIT — Linux's
+/// socket is TCP_CLOSE once `tcp_time_wait` takes over); otherwise ENOTCONN.
+pub fn has_peer_name(id: u32) -> bool {
+    lookup_tcb(id).is_some_and(|arc| {
+        !matches!(
+            arc.lock().state,
+            TcpState::SynSent | TcpState::Closed | TcpState::TimeWait
+        )
+    })
+}
+
+/// `tcp_poll`'s EPOLLERR / EPOLLHUP inputs: `(sk_err pending, TCP_CLOSE)`.
+/// A connection that is gone is TCP_CLOSE; its error is the tombstone's.
+pub fn poll_err_hup(id: u32) -> (bool, bool) {
+    match lookup_tcb(id) {
+        Some(arc) => {
+            let t = arc.lock();
+            (t.sk_err != 0, t.state == TcpState::Closed)
+        }
+        None => (
+            TOMBSTONES
+                .lock()
+                .as_ref()
+                .and_then(|m| m.get(&id))
+                .is_some_and(|t| t.err != 0),
+            true,
+        ),
+    }
+}
+
 pub fn connect6_errno_with_options_in(
+    net_ns_id: u64,
+    remote_addr: [u8; 16],
+    remote_port: u16,
+    options: ConnectOptions,
+) -> Result<u32, i32> {
+    let id = connect6_start_in(net_ns_id, remote_addr, remote_port, options)?;
+    connect_wait(id, options)
+}
+
+/// [`connect_start_in`] for IPv6 (`tcp_v6_connect`).
+pub fn connect6_start_in(
     net_ns_id: u64,
     remote_addr: [u8; 16],
     remote_port: u16,
@@ -1666,11 +1833,11 @@ pub fn connect6_errno_with_options_in(
     let mac = crate::ipv6::ndp::neigh_lookup_in(net_ns_id, &iface_name, &neighbor)
         .ok_or(errno::EHOSTUNREACH as i32)?;
     let id = fresh_tcb_id();
-    let iss = compute_isn();
     let (id, arc) = {
         let _bind = CONNECT_BIND_LOCK.lock();
         let local_port = pick_local_port6(net_ns_id, local_addr, remote_addr, remote_port)
             .ok_or(errno::EADDRNOTAVAIL as i32)?;
+        let iss = secure_tcpv6_seq(net_ns_id, local_addr, remote_addr, local_port, remote_port);
         let mut tcb = Tcb::new_active6(
             id,
             local_addr,
@@ -1686,40 +1853,7 @@ pub fn connect6_errno_with_options_in(
         install_tcb(tcb)
     };
     send_syn(&arc, false);
-
-    let mut timeout_secs = 1u64;
-    let mut rto_secs = 1u64;
-    for _ in 0..options.syn_retries {
-        rto_secs = rto_secs.saturating_mul(2).min(60);
-        timeout_secs = timeout_secs.saturating_add(rto_secs);
-    }
-    let deadline =
-        narf_scheduler::narf_time::Deadline::after_ns(timeout_secs.saturating_mul(1_000_000_000));
-    let _ = narf_scheduler::responsive_spin_until(
-        || {
-            while iface::drain_pump() {}
-            tick_retransmit(&arc);
-            !matches!(arc.lock().state, TcpState::SynSent | TcpState::SynReceived)
-        },
-        deadline,
-    );
-    let (state, hard, soft) = {
-        let tcb = arc.lock();
-        (tcb.state, tcb.sk_err, tcb.sk_err_soft)
-    };
-    if state == TcpState::Established {
-        Ok(id)
-    } else {
-        remove_tcb(id);
-        release(id);
-        Err(if hard != 0 {
-            hard
-        } else if soft != 0 {
-            soft
-        } else {
-            errno::ETIMEDOUT as i32
-        })
-    }
+    Ok(id)
 }
 
 pub fn connect6_errno_in(
@@ -1735,11 +1869,71 @@ pub fn connect6_errno_in(
     )
 }
 
-fn compute_isn() -> u32 {
-    let t = narf_scheduler::narf_time::monotonic_ns();
-    // Twist with a constant so two near-simultaneous opens land
-    // in different windows.
-    (t as u32).wrapping_mul(2654435769)
+/// `net_secret`: the boot-random SipHash key behind every ISN
+/// (`net_secret_init` → `net_get_random_once`).
+static TCP_SEQ_KEY: narf_lib::sync::OnceLock<[u64; 2]> = narf_lib::sync::OnceLock::new();
+
+fn tcp_seq_key() -> &'static [u64; 2] {
+    TCP_SEQ_KEY.get_or_init(|| {
+        let mut b = [0u8; 16];
+        crate::ip_output::get_random_bytes(&mut b);
+        let (k0, k1) = b.split_at(8);
+        [
+            u64::from_le_bytes(k0.try_into().unwrap_or([0; 8])),
+            u64::from_le_bytes(k1.try_into().unwrap_or([0; 8])),
+        ]
+    })
+}
+
+/// `seq_scale`: add a 64 ns clock (period 274 s), so one 4-tuple's ISNs keep
+/// increasing across incarnations. A peer's TIME-WAIT accepts a new SYN only
+/// when its sequence number is past the old connection's (RFC 6528;
+/// `tcp_timewait_state_process`), so a reused tuple must start above where
+/// it left off. Linux reads `ktime_get_real_ns`; the monotonic clock never
+/// steps backwards when the wall clock is set, which this property needs.
+fn seq_scale(hash: u32) -> u32 {
+    hash.wrapping_add((narf_scheduler::narf_time::monotonic_ns() >> 6) as u32)
+}
+
+/// `secure_tcp_seq(saddr, daddr, sport, dport)` (net/core/secure_seq.c):
+/// `siphash_3u32(saddr, daddr, sport << 16 | dport, net_secret)`, then
+/// `seq_scale`. Our side is `saddr`/`sport` for an active and a passive
+/// open alike (`tcp_v4_connect`, `tcp_v4_init_seq`). The namespace id is
+/// hashed too, standing in for Linux's per-netns secret.
+fn secure_tcp_seq(net_ns_id: u64, saddr: [u8; 4], daddr: [u8; 4], sport: u16, dport: u16) -> u32 {
+    let ports = u64::from(sport) << 16 | u64::from(dport);
+    let hash = crate::ip_output::siphash24(
+        tcp_seq_key(),
+        &[
+            u64::from(u32::from_be_bytes(saddr)) | u64::from(u32::from_be_bytes(daddr)) << 32,
+            ports | (net_ns_id & 0xFFFF_FFFF) << 32,
+            net_ns_id >> 32,
+        ],
+    );
+    seq_scale(hash as u32)
+}
+
+/// `secure_tcpv6_seq`: the same over the IPv6 4-tuple.
+fn secure_tcpv6_seq(
+    net_ns_id: u64,
+    saddr: [u8; 16],
+    daddr: [u8; 16],
+    sport: u16,
+    dport: u16,
+) -> u32 {
+    let word = |b: &[u8]| u64::from_le_bytes(b.try_into().unwrap_or([0; 8]));
+    let hash = crate::ip_output::siphash24(
+        tcp_seq_key(),
+        &[
+            word(&saddr[..8]),
+            word(&saddr[8..]),
+            word(&daddr[..8]),
+            word(&daddr[8..]),
+            u64::from(sport) << 16 | u64::from(dport),
+            net_ns_id,
+        ],
+    );
+    seq_scale(hash as u32)
 }
 
 // ── Public API: send / recv ─────────────────────────────────────────
@@ -1817,10 +2011,7 @@ pub fn send_errno(id: u32, buf: &[u8]) -> Result<usize, i32> {
     let epipe = errno::EPIPE as i32;
     let Some(arc) = lookup_tcb(id) else {
         // TCP_CLOSE: `sk_stream_wait_connect` → `sock_error` ?: -EPIPE.
-        return Err(take_tombstone(id)
-            .map(|t| t.err)
-            .filter(|&e| e != 0)
-            .unwrap_or(epipe));
+        return Err(take_tombstone(id).filter(|&e| e != 0).unwrap_or(epipe));
     };
     let n = {
         let mut t = arc.lock();
@@ -1872,15 +2063,7 @@ fn recv_errno_flags(id: u32, buf: &mut [u8], peek: bool) -> Result<usize, i32> {
     let Some(arc) = lookup_tcb(id) else {
         // `tcp_done` set RCV_SHUTDOWN. SOCK_DONE is checked before
         // `sk_err`, so after a FIN the error stays pending (for a send).
-        let pending = TOMBSTONES
-            .lock()
-            .as_ref()
-            .and_then(|m| m.get(&id).copied())
-            .is_some_and(|t| !t.done && t.err != 0);
-        return match pending {
-            true => Err(take_tombstone(id).map_or(0, |t| t.err)),
-            false => Ok(0),
-        };
+        return recv_dead(id, buf, peek);
     };
     let mut t = arc.lock();
     if t.state == TcpState::Listen {
@@ -1960,7 +2143,7 @@ pub fn take_sock_error(id: u32) -> i32 {
             }
             core::mem::take(&mut t.sk_err_soft)
         }
-        None => take_tombstone(id).map_or(0, |t| t.err),
+        None => take_tombstone(id).unwrap_or(0),
     }
 }
 
@@ -2638,6 +2821,7 @@ fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
     let mut t = arc.lock();
     let iss = t.iss;
     t.snd_nxt = iss.wrapping_add(1);
+    note_sent(&mut t);
     queue_retransmit(&mut t, iss, 1, flags);
     arm_retransmit_timer(&mut t);
 }
@@ -2988,6 +3172,7 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
             // Roll back snd_nxt so send_syn re-installs the
             // retransmit record at the correct seq.
             t.snd_nxt = t.iss;
+            t.total_retrans = t.total_retrans.saturating_add(1);
         }
         send_syn(arc, ack_too);
         return;
@@ -3030,6 +3215,8 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         t.snd_nxt = seq
             .wrapping_add(payload.len() as u32)
             .wrapping_add((fin != 0) as u32);
+        note_sent(&mut t);
+        t.total_retrans = t.total_retrans.saturating_add(1);
         arm_retransmit_timer(&mut t);
     }
 }
@@ -3177,6 +3364,16 @@ fn tick_time_wait(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
 
 /// Drain the send buffer to the wire, honouring cwnd / receiver
 /// window / MSS. Called on each `tcp_send` and after each ACK.
+/// Raise `snd_high` to `snd_nxt` after sequence space was sent. Every path
+/// that advances `snd_nxt` calls it, so `snd_high` is always the highest
+/// sequence number sent: the bound on an acceptable ACK and the mark below
+/// which a send is a retransmission.
+fn note_sent(t: &mut Tcb) {
+    if seq_gt(t.snd_nxt, t.snd_high) {
+        t.snd_high = t.snd_nxt;
+    }
+}
+
 pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     let (id, writable_before) = {
         let t = arc.lock();
@@ -3232,7 +3429,11 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
                 if t.fin_sent && t.snd_nxt == t.fin_seq {
                     let seq = t.fin_seq;
                     let flags = FLAG_FIN;
+                    if seq_lt(seq, t.snd_high) {
+                        t.total_retrans = t.total_retrans.saturating_add(1);
+                    }
                     t.snd_nxt = t.snd_nxt.wrapping_add(1);
+                    note_sent(&mut t);
                     (Vec::<Vec<u8>>::new(), seq, flags, None, true)
                 } else {
                     break;
@@ -3254,6 +3455,18 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
                     remaining = remaining.saturating_sub(chunk.len() as u32);
                     chunks.push(chunk);
                 }
+                // Data below `snd_high` is the go-back-N resend after an RTO
+                // rewound `snd_nxt`: counted per segment, as
+                // `__tcp_retransmit_skb` adds `tcp_skb_pcount`.
+                let mut chunk_seq = starting_seq;
+                let mut resent = 0u32;
+                for c in &chunks {
+                    if seq_lt(chunk_seq, t.snd_high) {
+                        resent = resent.saturating_add(c.len().div_ceil(mss as usize) as u32);
+                    }
+                    chunk_seq = chunk_seq.wrapping_add(c.len() as u32);
+                }
+                t.total_retrans = t.total_retrans.saturating_add(resent);
                 let total: u32 = chunks.iter().map(|c| c.len() as u32).sum();
                 t.snd_nxt = t.snd_nxt.wrapping_add(total);
                 let drained = t.send_buf.unsent_len() == 0;
@@ -3261,6 +3474,7 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
                 if attach_fin {
                     t.snd_nxt = t.snd_nxt.wrapping_add(1);
                 }
+                note_sent(&mut t);
                 (
                     chunks,
                     starting_seq,
@@ -3320,8 +3534,20 @@ pub fn handle_segment_in(net_ns_id: u64, src: [u8; 4], dst: [u8; 4], segment: &[
     };
     // Find a connected-TCB match first (O(1) sharded 4-tuple index, no
     // global lock); on miss, fall back to a matching LISTEN TCB.
+    let listener = || {
+        listen_index_group(net_ns_id, dst, hdr.dst_port)
+            .into_iter()
+            .next()
+    };
     if let Some(arc) = conn_index_lookup(conn_key(net_ns_id, src, hdr.src_port, dst, hdr.dst_port))
     {
+        if time_wait_accepts_syn(&arc, &hdr, segment) {
+            if let Some(listen_arc) = listener() {
+                abort_tcb(&arc, 0, DropCause::Graceful);
+                accept_into_listen(&listen_arc, src, dst, &hdr, segment);
+                return;
+            }
+        }
         process_in_state(&arc, src, dst, &hdr, segment);
         return;
     }
@@ -3346,7 +3572,19 @@ pub fn handle_segment6_in(net_ns_id: u64, src: [u8; 16], dst: [u8; 16], segment:
         Err(_) => return,
     };
     let key = (net_ns_id, src, hdr.src_port, dst, hdr.dst_port);
+    let listener = || {
+        listen_index6_group(net_ns_id, dst, hdr.dst_port)
+            .into_iter()
+            .next()
+    };
     if let Some(arc) = conn_index6_lookup(key) {
+        if time_wait_accepts_syn(&arc, &hdr, segment) {
+            if let Some(listen_arc) = listener() {
+                abort_tcb(&arc, 0, DropCause::Graceful);
+                accept_into_listen6(&listen_arc, src, dst, &hdr, segment);
+                return;
+            }
+        }
         process_in_state(&arc, [0; 4], [0; 4], &hdr, segment);
         return;
     }
@@ -3521,7 +3759,8 @@ fn accept_into_listen(
         }
     };
     let id = fresh_tcb_id();
-    let iss = compute_isn();
+    // `tcp_v4_init_seq`: our address and port first.
+    let iss = secure_tcp_seq(net_ns_id, dst, src, hdr.dst_port, hdr.src_port);
     let mut child =
         Tcb::new_active(id, dst, hdr.dst_port, src, hdr.src_port, mac, iss).with_net_ns(net_ns_id);
     child.state = TcpState::SynReceived;
@@ -3585,8 +3824,9 @@ fn accept_into_listen6(
         return;
     };
     let id = fresh_tcb_id();
-    let mut child = Tcb::new_active6(id, dst, hdr.dst_port, src, hdr.src_port, mac, compute_isn())
-        .with_net_ns(net_ns_id);
+    let iss = secure_tcpv6_seq(net_ns_id, dst, src, hdr.dst_port, hdr.src_port);
+    let mut child =
+        Tcb::new_active6(id, dst, hdr.dst_port, src, hdr.src_port, mac, iss).with_net_ns(net_ns_id);
     child.state = TcpState::SynReceived;
     child.irs = hdr.sequence;
     child.rcv_nxt = hdr.sequence.wrapping_add(1);
@@ -3604,6 +3844,39 @@ fn accept_into_listen6(
     child.cong.set_mss(child.opts.peer_mss as u32);
     let (_, child) = install_tcb(child);
     send_syn(&child, true);
+}
+
+/// Linux `tcp_timewait_state_process` → `TCP_TW_SYN`: a new SYN (no ACK, no
+/// RST) for a 4-tuple in TIME-WAIT reopens it when it is not an old
+/// duplicate — its sequence number is past RCV.NXT, or its timestamp is newer
+/// than the last one seen — and PAWS does not reject it. `tcp_v4_rcv` then
+/// kills the timewait sock and hands the SYN to the listener. Peers reuse a
+/// port quickly under connection churn (a NAT forwarding many short
+/// connections from one host); dropping such a SYN left the connection hung.
+fn time_wait_accepts_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, segment: &[u8]) -> bool {
+    if hdr.flags & (FLAG_SYN | FLAG_ACK | FLAG_RST) != FLAG_SYN {
+        return false;
+    }
+    let t = arc.lock();
+    if t.state != TcpState::TimeWait {
+        return false;
+    }
+    let opts_end = (hdr.header_len as usize).min(segment.len());
+    let tsval = match opts_end > TCP_HDR_MIN {
+        true => ParsedOptions::parse(&segment[TCP_HDR_MIN..opts_end])
+            .timestamps
+            .map(|(tsv, _)| tsv),
+        false => None,
+    };
+    let now = narf_scheduler::narf_time::now_cycles();
+    // `tcp_paws_reject(&tmp_opt, th->rst)`: `tcp_paws_check(rx_opt, 0)`.
+    if tsval.is_some_and(|tsv| t.opts.paws_reject(tsv, now, 0)) {
+        return false;
+    }
+    seq_gt(hdr.sequence, t.rcv_nxt)
+        || tsval.is_some_and(|tsv| {
+            t.opts.timestamps_active && (t.opts.ts_recent.wrapping_sub(tsv) as i32) < 0
+        })
 }
 
 /// State-aware processing of an arrived segment.
@@ -3728,11 +4001,15 @@ fn handle_rst(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader) {
     }
     // Linux `tcp_reset` (net/ipv4/tcp_input.c): "the right error as BSD
     // sees it" — SYN-SENT → ECONNREFUSED, CLOSE-WAIT → EPIPE, CLOSED →
-    // ignore, anything else → ECONNRESET.
+    // ignore, anything else → ECONNRESET. TIME-WAIT is not a socket state
+    // there: `tcp_time_wait` already finished the socket (`tcp_done`) and
+    // the reset only kills the timewait sock (`tcp_timewait_state_process`,
+    // `tcp_rfc1337` = 0), so the application sees no error.
     let err = match t.state {
         TcpState::SynSent => errno::ECONNREFUSED,
         TcpState::CloseWait => errno::EPIPE,
         TcpState::Closed => return,
+        TcpState::TimeWait => 0,
         _ => errno::ECONNRESET,
     } as i32;
     drop(t);
@@ -3804,6 +4081,10 @@ fn handle_in_syn_sent(
     // Final ACK of the handshake.
     send_ack(arc, 0);
     let _ = payload; // SYN+ACK shouldn't carry data
+                     // `tcp_finish_connect` → `sk_state_change`: wake a connect(2) parked on
+                     // this socket (`inet_wait_for_connect`) and pollers waiting for POLLOUT.
+    let id = arc.lock().id as u64;
+    crate::readiness::notify(id);
 }
 
 fn handle_in_syn_received(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, payload: &[u8]) {
@@ -3850,6 +4131,9 @@ fn handle_in_syn_received(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, payl
     if let Some(listener_id) = add_to_listener_accept_queue(arc, !payload.is_empty()) {
         crate::readiness::notify(listener_id as u64);
     }
+    // A simultaneous open is an active connect(2) completing here.
+    let id = arc.lock().id as u64;
+    crate::readiness::notify(id);
 }
 
 /// Hash the connection's remote endpoint (+ local port) to a stable
@@ -4192,21 +4476,27 @@ fn handle_ack(
     let dup_candidate = payload_len == 0
         && hdr.flags & (FLAG_SYN | FLAG_FIN) == 0
         && (hdr.window as u32) << t.opts.peer_wscale == t.snd_wnd;
-    // Highest sequence number ever sent. An RTO rewinds `snd_nxt` to
-    // `snd_una` (go-back-N), but the peer may already hold the later
-    // segments and cumulatively ACK past the rewound `snd_nxt`; bounding the
-    // acceptable ACK by `snd_nxt` discarded that ACK, and the connection
-    // retransmitted the same segment until it gave up. Every segment sent
-    // and not yet ACKed has a retransmit record, so the records bound it.
-    let snd_max = t
-        .retx_queue
-        .iter()
-        .map(|s| s.end_seq())
-        .fold(t.snd_nxt, |m, e| if seq_gt(e, m) { e } else { m });
+    // Highest sequence number ever sent (Linux's `tp->snd_nxt`, which an RTO
+    // never rewinds). An RTO rewinds our `snd_nxt` to `snd_una` (go-back-N),
+    // but the peer may already hold the later segments and cumulatively ACK
+    // past the rewound `snd_nxt`; bounding the acceptable ACK by `snd_nxt`
+    // discarded that ACK, and the connection retransmitted the same segment
+    // until it gave up. `note_sent` keeps `snd_high` at that mark, so this
+    // no longer walks the retransmit queue on every ACK.
+    let snd_max = t.snd_high;
     // Linux validates the ACK before its `tcp_may_update_window` decision.
     // Preserve that ordering: an out-of-range ACK must not gain authority
     // over SND.WND simply because it carries a fresh segment sequence.
     let ack_in_range = seq_geq(ack, t.snd_una) && seq_leq(ack, snd_max);
+    // `tcp_ack`: any acceptable ACK — the bare one answering a keepalive
+    // probe included — clears `icsk_probes_out` and stamps `rcv_tstamp`, the
+    // idle clock `tcp_keepalive_timer` measures. Counting only ACKs that
+    // advanced SND.UNA killed every idle connection after `keepcnt` probes
+    // however promptly the peer answered them.
+    if ack_in_range {
+        t.keepalive_probes_sent = 0;
+        t.last_progress_cycles = narf_scheduler::narf_time::now_cycles();
+    }
     // Window update.  Follow Linux `tcp_may_update_window`: a newly
     // cumulative ACK is authoritative even if reverse-direction data made
     // SEG.SEQ older than SND.WL1; with the same SEG.SEQ, only a larger window
@@ -4374,6 +4664,7 @@ fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     );
     emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None, false));
     let mut t = arc.lock();
+    t.total_retrans = t.total_retrans.saturating_add(1);
     // Karn: no RTT sample from any record covering the resent range.
     let end = seq.wrapping_add(payload.len() as u32);
     for r in t.retx_queue.iter_mut() {
@@ -4598,6 +4889,16 @@ pub fn __install_test_tcb_in(
     tcb.send_buf.unacked_head_seq = iss;
     let (id, _arc) = install_tcb(tcb);
     id
+}
+
+/// Test-only: have TCB `id` send its peer a bare RST at its `snd_nxt` — the
+/// exact reset `tcp_validate_incoming` accepts on the far side.
+#[doc(hidden)]
+pub fn __send_rst_for_test(id: u32) -> Option<()> {
+    let arc = lookup_tcb(id)?;
+    let seq = arc.lock().snd_nxt;
+    send_rst(&arc, seq, 0, false);
+    Some(())
 }
 
 /// Test-only: borrow the TCB lock for assertion.

@@ -990,6 +990,9 @@ fn tcp_e2e_bulk(client_to_server: bool) -> Result<(), &'static str> {
     if retransmitted_data_segments(&log) != 0 {
         return Err("clean link produced data retransmissions");
     }
+    if total_retrans(from)? != 0 {
+        return Err("tcpi_total_retrans must stay 0 on a clean link");
+    }
     if log.iter().any(|s| s.has(FLAG_RST)) {
         return Err("RST during bulk transfer");
     }
@@ -1235,7 +1238,19 @@ fn tcp_e2e_fast_retransmit(dir: Dir) -> Result<(), &'static str> {
     if FORCED_RTOS.load(Ordering::Relaxed) != 0 {
         return Err("recovery needed an RTO; fast retransmit should have repaired a single loss");
     }
+    // `tcpi_total_retrans` is cumulative (Linux `tp->total_retrans`): it
+    // still counts the repair after the ACK that ended recovery.
+    if total_retrans(from)? == 0 {
+        return Err("tcpi_total_retrans did not count the fast retransmission");
+    }
     Ok(())
+}
+
+/// `tcpi_total_retrans` of `id`.
+fn total_retrans(id: u32) -> Result<u32, &'static str> {
+    tcp_core::tcp_info(id)
+        .map(|i| i.total_retrans)
+        .ok_or("TCB gone")
 }
 
 fn smoke_tcp_e2e_fast_retransmit_client_data() -> TestResult {
@@ -1271,6 +1286,9 @@ fn tcp_e2e_tail_loss_rto() -> Result<(), &'static str> {
     if rto_count != 0 {
         return Err("rto_count must reset once new data is ACKed");
     }
+    if total_retrans(c.client)? == 0 {
+        return Err("tcpi_total_retrans must keep counting after rto_count resets");
+    }
     Ok(())
 }
 
@@ -1278,6 +1296,62 @@ fn smoke_tcp_e2e_tail_loss_rto() -> TestResult {
     finish(tcp_e2e_tail_loss_rto())
 }
 kernel_test_in!("net/tcp_e2e", smoke_tcp_e2e_tail_loss_rto);
+
+// An RTO rewinds the sender's `snd_nxt` to `snd_una` (go-back-N), but the
+// receiver already holds the whole burst and cumulatively ACKs past the
+// rewound `snd_nxt`. That ACK is in range — bounded by the highest sequence
+// ever sent (`snd_high`, Linux's never-rewound `tp->snd_nxt`) — so it ends
+// recovery at once, without resending the rest of the burst.
+fn tcp_e2e_rto_ack_past_rewound_snd_nxt() -> Result<(), &'static str> {
+    reset();
+    let c = open()?;
+    settle();
+    let data = pattern(6 * 1024, 0x5EED);
+    // Every ACK back to the client is lost: the burst arrives, the client
+    // never learns it did.
+    set_fault(Fault::DropControl {
+        dir: Dir::ToClient,
+        flags: FLAG_ACK,
+        count: u32::MAX,
+    });
+    expect(send_errno(c.client, &data), Ok(data.len()), "burst send")?;
+    while deliver_one() {}
+    let mut got = vec![0u8; data.len()];
+    expect(
+        recv_errno(c.server, &mut got),
+        Ok(data.len()),
+        "server holds the burst",
+    )?;
+    let high = __with_tcb(c.client, |t| t.snd_high).ok_or("client gone")?;
+    set_fault(Fault::None);
+    clear_log();
+    // The RTO fires, rewinds, resends the head; the server's ACK covers all.
+    settle();
+    sender_quiescent(c.client)?;
+    if __with_tcb(c.client, |t| t.snd_una).ok_or("client gone")? != high {
+        return Err("the cumulative ACK past the rewound snd_nxt was not taken");
+    }
+    if FORCED_RTOS.load(Ordering::Relaxed) == 0 {
+        return Err("no RTO fired — the ACK loss was not injected");
+    }
+    let resent = wire_log()
+        .iter()
+        .filter(|s| s.dir() == Dir::ToServer && s.payload_len > 0)
+        .count();
+    if resent != 1 {
+        narf_console::klog!("tcp_e2e rto-rewind: {} data segments resent", resent);
+        return Err("recovery resent more than the head segment");
+    }
+    if total_retrans(c.client)? != 1 {
+        return Err("tcpi_total_retrans must count exactly the one resend");
+    }
+    Ok(())
+}
+
+fn smoke_tcp_e2e_rto_ack_past_rewound_snd_nxt() -> TestResult {
+    finish(tcp_e2e_rto_ack_past_rewound_snd_nxt())
+}
+kernel_test_in!("net/tcp_e2e", smoke_tcp_e2e_rto_ack_past_rewound_snd_nxt);
 
 // ── 10. Reordering ──────────────────────────────────────────────────────────
 //
@@ -1681,7 +1755,10 @@ kernel_test_in!("net/tcp_e2e", smoke_tcp_e2e_zero_window);
 
 use narf_lib::errno;
 
-use crate::tcp::core::{connect_errno_in, recv_errno, send_errno, shutdown_errno, take_sock_error};
+use crate::tcp::core::{
+    connect_errno_in, recv_errno, recv_peek_errno, send_errno, shutdown_errno, take_sock_error,
+    TcpQueueIoctl,
+};
 
 const EAGAIN: i32 = errno::EAGAIN as i32;
 const EPIPE: i32 = errno::EPIPE as i32;
@@ -1887,6 +1964,119 @@ fn smoke_tcp_e2e_errno_reset_established() -> TestResult {
 }
 kernel_test_in!("net/tcp_e2e", smoke_tcp_e2e_errno_reset_established);
 
+// RST with unread data: `tcp_done` keeps `sk_receive_queue`, so the bytes
+// that arrived before the reset are read first (SIOCINQ counts them), then
+// ECONNRESET once, then EOF.
+fn tcp_e2e_errno_reset_keeps_unread_data() -> Result<(), &'static str> {
+    reset();
+    let listener = listen(SERVER_IP, SERVER_PORT, 16).map_err(|_| "listen failed")?;
+    let client = connect(SERVER_IP, SERVER_PORT).map_err(|_| "connect failed")?;
+    let server = accept_one(listener)?;
+    settle();
+    expect(send_errno(server, b"unread"), Ok(6), "server send")?;
+    settle();
+    tcp_core::remove_tcb(server);
+    expect(send_errno(client, b"hello?"), Ok(6), "send before the RST")?;
+    if !run_until(BUDGET_SMALL, || lookup_tcb(client).is_none()) {
+        return Err("client not torn down by the RST");
+    }
+    if tcp_core::queue_ioctl(client, TcpQueueIoctl::Inq) != Ok(6) {
+        return Err("SIOCINQ after the RST must count the unread bytes");
+    }
+    let mut b = [0u8; 4];
+    expect(
+        recv_peek_errno(client, &mut b),
+        Ok(4),
+        "MSG_PEEK the unread bytes",
+    )?;
+    expect(
+        recv_errno(client, &mut b),
+        Ok(4),
+        "unread bytes come before the error",
+    )?;
+    if &b != b"unre" {
+        return Err("wrong bytes read after the RST");
+    }
+    expect(
+        recv_errno(client, &mut b),
+        Ok(2),
+        "the rest of the unread bytes",
+    )?;
+    if &b[..2] != b"ad" {
+        return Err("wrong tail read after the RST");
+    }
+    expect(
+        recv_errno(client, &mut b),
+        Err(ECONNRESET),
+        "drained: then ECONNRESET",
+    )?;
+    expect(recv_errno(client, &mut b), Ok(0), "then EOF")?;
+    tcp_core::release(client);
+    Ok(())
+}
+
+fn smoke_tcp_e2e_errno_reset_keeps_unread_data() -> TestResult {
+    finish(tcp_e2e_errno_reset_keeps_unread_data())
+}
+kernel_test_in!("net/tcp_e2e", smoke_tcp_e2e_errno_reset_keeps_unread_data);
+
+// RST in TIME-WAIT with the peer's last bytes unread — the request/response
+// shape where the client half-closes, the server answers and closes, and a
+// NAT (QEMU's SLIRP) then resets the finished connection. Linux's socket is
+// already done (`tcp_time_wait`); the reset only kills the timewait sock
+// (`tcp_timewait_state_process`), so the answer is still read, then EOF,
+// and no error is ever reported.
+fn tcp_e2e_errno_reset_time_wait_keeps_unread_data() -> Result<(), &'static str> {
+    reset();
+    let c = open()?;
+    shutdown_errno(c.client, Shutdown::Write).map_err(|_| "client SHUT_WR failed")?;
+    settle();
+    expect(send_errno(c.server, b"K"), Ok(1), "server answer")?;
+    settle();
+    // Keep the server in LAST-ACK, so it is still there to send the reset:
+    // drop the client's ACK of its FIN, and run the wire without the clock
+    // (no FIN retransmission).
+    set_fault(Fault::DropControl {
+        dir: Dir::ToServer,
+        flags: FLAG_ACK,
+        count: 1,
+    });
+    shutdown_errno(c.server, Shutdown::Write).map_err(|_| "server SHUT_WR failed")?;
+    while deliver_one() {}
+    if state_of(c.client) != Some(TcpState::TimeWait) {
+        return Err("client not in TIME-WAIT");
+    }
+    set_fault(Fault::None);
+    tcp_core::__send_rst_for_test(c.server).ok_or("server TCB gone before the RST")?;
+    while deliver_one() {}
+    if lookup_tcb(c.client).is_some() {
+        return Err("TIME-WAIT not ended by the RST");
+    }
+    let mut b = [0u8; 4];
+    expect(
+        recv_errno(c.client, &mut b),
+        Ok(1),
+        "the answer survives the RST",
+    )?;
+    if b[0] != b'K' {
+        return Err("wrong byte read after the TIME-WAIT RST");
+    }
+    expect(recv_errno(c.client, &mut b), Ok(0), "then EOF")?;
+    if take_sock_error(c.client) != 0 {
+        return Err("an RST in TIME-WAIT must leave no SO_ERROR");
+    }
+    tcp_core::release(c.client);
+    Ok(())
+}
+
+fn smoke_tcp_e2e_errno_reset_time_wait_keeps_unread_data() -> TestResult {
+    finish(tcp_e2e_errno_reset_time_wait_keeps_unread_data())
+}
+kernel_test_in!(
+    "net/tcp_e2e",
+    smoke_tcp_e2e_errno_reset_time_wait_keeps_unread_data
+);
+
 // RST in CLOSE-WAIT is EPIPE (tcp_reset), and since the peer's FIN was
 // received (SOCK_DONE), recv still reports EOF rather than the error.
 fn tcp_e2e_errno_reset_close_wait() -> Result<(), &'static str> {
@@ -1922,6 +2112,64 @@ fn smoke_tcp_e2e_errno_reset_close_wait() -> TestResult {
     finish(tcp_e2e_errno_reset_close_wait())
 }
 kernel_test_in!("net/tcp_e2e", smoke_tcp_e2e_errno_reset_close_wait);
+
+// Non-blocking active open (`tcp_v4_connect` returns after the SYN): the
+// handshake runs from RX and the timers, and `connect_status` reports it the
+// way `__inet_stream_connect` sees it. While SYN-SENT: in progress, no
+// POLLERR/POLLHUP, no peer name. Established: connected, peer name. Refused:
+// `sock_error()` = ECONNREFUSED once, then ECONNABORTED; TCP_CLOSE polls
+// HUP with ERR until the error is read.
+fn tcp_e2e_connect_start_status() -> Result<(), &'static str> {
+    use crate::tcp::core::{connect_start_in, connect_status, has_peer_name, poll_err_hup};
+    use crate::tcp::core::{ConnectOptions, ConnectStatus};
+    reset();
+    let listener = listen(SERVER_IP, SERVER_PORT, 16).map_err(|_| "listen failed")?;
+    let id = connect_start_in(0, SERVER_IP, SERVER_PORT, ConnectOptions::default())
+        .map_err(|_| "connect_start_in failed")?;
+    if connect_status(id) != ConnectStatus::InProgress {
+        return Err("a just-started connect must be in progress");
+    }
+    if state_of(id) != Some(TcpState::SynSent) {
+        return Err("connect_start_in must return in SYN-SENT");
+    }
+    if has_peer_name(id) {
+        return Err("getpeername must be ENOTCONN in SYN-SENT");
+    }
+    if poll_err_hup(id) != (false, false) || tcp_core::writable(id) || tcp_core::readable(id) {
+        return Err("a connecting socket must poll no events");
+    }
+    settle();
+    if connect_status(id) != ConnectStatus::Connected {
+        return Err("the handshake did not complete without a waiter");
+    }
+    if !has_peer_name(id) || !tcp_core::writable(id) {
+        return Err("an established connect must have a peer and poll writable");
+    }
+    let _ = accept_one(listener)?;
+
+    let refused = connect_start_in(0, SERVER_IP, CLOSED_PORT, ConnectOptions::default())
+        .map_err(|_| "connect_start_in (closed port) failed")?;
+    settle();
+    if poll_err_hup(refused) != (true, true) {
+        return Err("a refused connect must poll ERR|HUP");
+    }
+    if connect_status(refused) != ConnectStatus::Failed(ECONNREFUSED) {
+        return Err("a refused connect must report ECONNREFUSED");
+    }
+    if connect_status(refused) != ConnectStatus::Failed(errno::ECONNABORTED as i32) {
+        return Err("once its error is taken, a failed connect is ECONNABORTED");
+    }
+    if poll_err_hup(refused) != (false, true) {
+        return Err("a failed connect whose error was read polls HUP without ERR");
+    }
+    tcp_core::release(refused);
+    Ok(())
+}
+
+fn smoke_tcp_e2e_connect_start_status() -> TestResult {
+    finish(tcp_e2e_connect_start_status())
+}
+kernel_test_in!("net/tcp_e2e", smoke_tcp_e2e_connect_start_status);
 
 // connect(): RST → ECONNREFUSED; silence → ETIMEDOUT; unresolvable next
 // hop → EHOSTUNREACH; no interface → ENETUNREACH.

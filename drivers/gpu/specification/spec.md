@@ -44,7 +44,158 @@ infrastructure (Phase B).
 
 ## 3. Public interface
 
+### RX 6000 device queries, scheduling and memory pressure
+
+`amdgpu_rdna2::metadata::vram(table, module)` bounds atomfirmware
+VRAM_INFO 2.3/2.4/2.5/2.6 variable-length modules. Platform preparation reads
+the module selector from BIOS_SCRATCH_4 under PCI authority and publishes it
+through `amdgpu_rdna2_info::Published::vram_module`. Invalid straps fall back
+to module zero; malformed tables remain unknown. `Snapshot` carries the
+resulting VRAM type and bus width. `Published::pcie` holds the maximum common
+endpoint/physical-partner generation and width, skipping AMD internal
+switches; negotiated idle Link Status is not a maximum-capability source.
+Unavailable or ambiguous partner discovery leaves the fields zero.
+`Profile::mall_bytes()` mirrors gmc_v10_0_sw_init's 128/96/32/16 MiB for
+Navi21/22/23/24. `Published::memory_khz` reports boot MCLK while UCLK DPM is
+disabled, or GetMin/MaxDpmFreq(PPCLK_UCLK) when enabled. Publication refreshes
+after boot/recovery and power-policy changes, clearing unavailable values.
+The cold-boot owner retains the immutable boot clock independently of its
+reduced GPU layout snapshot, which intentionally omits the VBIOS.
+
+Real device `READ_MMR_REG` ioctls on both primary and render nodes acquire a
+GFXOFF reference before awaiting the platform owner. The whole register range
+is checked against nv.c's unindexed GC/SDMA0/SDMA1 allow-list and BAR bounds
+before one live PCI capability invocation reads it. GB_ADDR_CONFIG uses the
+published topology cache. Pure `query_with` calls retain their cached-only
+behavior; they never access live MMIO. Count, SE/SH indices, copy bounds and
+short replies retain the existing AMDGPU_INFO ABI.
+
+Each native ring has FIFO admission with per-waiter wakers and cancellation
+cleanup. VMID exhaustion and ring throttling wait for any fence IRQ or a hard
+deadline; an interrupt sequence sampled before inspecting completion closes
+the registration race. Every client owns its waiter entry. CP and SDMA emit a
+dedicated VM writeback after invalidation/PASID mapping and before client IBs.
+`VmidManager::commit_with_flush` tracks this separately from each job's final
+fence: early VM completion cannot release an active VMID. Bit 63 tags these
+internal VM tickets; native job tickets use four ring bits and 27 generation
+bits. Generation advances during quiesce before submitter registration, and
+old submitters refuse further progress/submissions after that transition.
+All-ones writeback sequences remain valid; device loss is detected through
+HDP liveness, not the fence value. CP/SDMA skip reserved zero at sequence wrap
+and failed submissions restore the previous sequence exactly. Media retains
+zero at wrap because its nonzero ring tag distinguishes the ticket and JPEG's
+two kernel IB slots must continue alternating by sequence parity.
+
+Ordinary VRAM-preferred GEM creation also permits GTT fallback when VRAM is
+unavailable, as amdgpu_bo_create sets allowed_domains, without rewriting the
+reported preference. Discardable VRAM-only creation keeps its stricter domain
+set; GEM_SET_PLACEMENT updates preferred and allowed normal domains with the
+Linux sole-VRAM-to-GTT fallback rule.
+GEM visible-VRAM pressure can evict idle buffers to GTT, including buffers
+shared through same-card PRIME imports, exported fds and BO lists.
+Eligible unmapped GTT buffers return to VRAM on lookup if space is available;
+CS also validates listed buffers through the coordinated move path. Allocation
+and copying complete before swapping backing and releasing the source; errors
+preserve data, source placement and accounting. Logical identity
+(`Arc<GemObject>`) is separate from an address lease (`Arc<GemPlacement>`).
+Legacy CPU mappings retain both through `GemMapping` (revocable GEM/PRIME
+mmap uses the `CpuMap` token described below); GPU VA records retain both,
+including split and deferred records. Deferred CPU user-fence writes retain
+a `GemMapping` until the write completes. Acquiring a placement lease and
+claiming exclusive backing for a move use the same per-object lock; object
+handles, PRIME exports and BO lists do not pin placement by themselves.
+`VmState::for_card` registers weak shared VM state for coordinated rebinding;
+its constructors now allocate shared state at runtime. `amdgpu_vm::relocate`
+requires the card's placement guard: it waits for every affected VM's last job
+on each ring and for reservation fences before releasing GPU address leases.
+Wait failure or cancellation leaves mappings untouched. CPU-visible copying and PTE
+rewriting run synchronously under admission exclusion; errors restore
+leases to unchanged backing. Existing table allocations and virtual addresses
+stay fixed; TLB sequences advance before another submission can run.
+The card gate spans native queue publication, `note_job`, and reservation-fence
+attachment. Dependency waits precede gate acquisition. User GEM_VA ioctls park
+for this gate through `dispatch_async`; synchronous dispatch reports Busy on
+contention. `amdgpu_gem::dispatch_async` retries a strict VRAM create after
+reclaiming GPU-mapped buffers; ordinary allocations retain GTT fallback.
+Unregistered VM mappings, deferred CPU user-fence writes and legacy raw
+address leases (`GemMapping`, `mmap_lifetime`) still pin backing. GEM and
+PRIME `mmap_backing` instead return a revocable `CpuMap` token
+(`amdgpu_gem::cpu_mapping`): one `CpuBacking` per object holds the current
+placement lease and registers every frame of that generation with a count of
+external metadata aliases (`retain_cpu_frame`/`release_cpu_frame`, reached
+through the filesystem alias hooks), so the backing survives fork's interval
+before owner publication. A token is pending until `mmap_published`; pending
+tokens, a moving backing, and any extra placement lease refuse the move
+(`Busy`). `amdgpu_vm::relocate`'s CPU-visible path allocates the destination
+and registers its rows, samples an empty reservation set and its generation,
+then asks the VM to revoke every CPU alias. The frozen commit releases the
+backing lease, rechecks exclusive ownership, domain and resv generation, copies
+and swaps placement without allocating or sampling fences; errors restore the
+lease and old frames. A backing retires (rows and lease dropped) only once no
+token and no alias remain, and a retired backing is never reused.
+RX6000 invisible VRAM supports asynchronous staged copying
+to GTT and promotion of NO_CPU_ACCESS GTT buffers back into invisible VRAM.
+`UnmappedHeap::transfer` optionally supplies `VramTransfer::read/write`; the
+coordinator retains old GPU leases until the entire private copy completes,
+then commits backing and rebinds PTEs without awaiting. Errors or cancellation
+preserve the original placement. The native SDMA5.2 worker uses a reserved
+1 MiB BAR window, ordered clears/copies and real current-generation fences.
+Each queued copy retains its allocations independently of its waiting task
+and attaches a KERNEL reservation fence to the source BO. Stage reuse waits
+for the previous copy even after cancellation. Upload staging is refreshed
+from the retained GTT source on every recovery replay. Reset exclusion,
+current PCI capability invocation and a GC power reference protect CPU BAR
+accesses; an epoch change invalidates an unconsumed readback. A reset, timeout
+or device loss never signals unfinished kernel work as complete. Recovery
+publication restarts queued work. CS re-samples live mapped/listed BO KERNEL
+fences under placement admission and after attempted promotion, with bounded
+waits before publishing user work. NO_CPU_ACCESS also rejects forged GEM and
+PRIME CPU mappings after a move into GTT. Completed deferred
+holds can be retired while checking progress; `amdgpu_cs::retire` samples
+completion callbacks outside its resource lock, then revalidates tickets.
+`GemObject::preferred_domains()` reads the atomic
+preference; GEM_SET_PLACEMENT records normal-domain bits without moving a
+pinned object. GEM mmap resolves scattered GTT pages through `frames`, never
+by assuming consecutive physical addresses. This is a bounded placement and
+eviction policy, not the complete Linux TTM feature set.
+
 ### Shared RDNA2 execution and family limits
+
+The shared public modules use `amdgpu_rdna2_{boot,platform,gating,power,
+power_policy,power_saving,gfxoff,thermal,tdr,recovery,cs,kms,modeset,display,
+scanout,submit,bios}` names, with matching canonical names for shared firmware,
+queue and hardware backends. `amdgpu_rdna2_board_power` is the board-table
+parser; `amdgpu_rdna2_power` publishes runtime power samples. Existing Navi22
+paths re-export the same modules, preserving type identity and source
+compatibility.
+
+`amdgpu_rdna2::options::BootOptions::parse(cmdline)` yields
+`{native_display, accel, multi, hw_cursor, power_saving}`. Switches
+`amdgpu.native_display`, `amdgpu.rdna2_accel`, `amdgpu.rdna2_multi` and
+`amdgpu.rdna2_hw_cursor` accept a bare flag or `=1|on|y|yes|true` (on) and
+`=0|off|n|no|false` (off); any other value keeps the default. The
+corresponding `amdgpu.navi22_*` spellings remain aliases; the canonical name
+wins. Defaults: native display, accel and hardware cursor on; multi-display
+off (secondary CRTCs cannot present or deliver vblank yet). `power_saving` is
+the `amdgpu.rdna2_pg=` list, or `DEFAULT_POWER_SAVING` (every feature) when
+absent; `=none|off|0` or an empty value applies nothing. The first canonical
+power value takes precedence over the first legacy value, including an empty
+or invalid canonical value; invalid power lists enable nothing. Defaulted
+power features still pass every display-admission and driver prerequisite.
+
+Clock/power capability flags come from each profile's Linux
+`nv_common_early_init` selection. Navi21/22/23 share the existing capability
+set; Navi24 omits JPEG CG/PG. Gating resolves exact PCI/GC/MP1/SDMA identity,
+compatible hub/controller banks and one through four discovered engines;
+absent SDMA engines are never accessed. ROM handling selects the discovered
+SMUIO backend: the older backend skips disabled ROM gating, while the newer
+backend explicitly forces ROM clocks on.
+
+SMU telemetry selects `SmuMetrics_t`, `_V2_t` or `_V3_t` using exact per-ASIC
+firmware thresholds from `sienna_cichlid_get_smu_metrics_data`. SMU11's shared
+THM11.0/SMUIO11.0 register layouts are resolved through discovered banks;
+missing, duplicate, truncated or other-generation banks remain unavailable.
+Firmware interface diagnostics use the ASIC-specific driver interface version.
 
 `ColdBoot::new_rdna2` validates the exact PCI/GC/PSP identity and matching
 SOS, SMC and graphics bundle before device I/O. Recovery rebuilds through
@@ -88,7 +239,7 @@ The shared coordinator validates the discovered IP versions, matching firmware
 bundle and board policy; identification alone does not bypass these checks.
 Legacy firmware loading is rejected for every discrete RDNA2 ID; Rembrandt
 retains its separate APU path. Existing `amdgpu.navi22_*` boot options name the
-shared discrete path. Optional Navi22 clock-gating policy remains ASIC-specific.
+shared discrete path as compatibility aliases for the canonical RDNA2 options.
 Run
 `python3 drivers/gpu/tools/check_rdna2_profiles.py --linux ~/git/linux` to
 compile the profile unit tests and compare the compiled IDs and firmware names
@@ -197,7 +348,9 @@ runs (8 on Navi48, `MAX_JOB_IBS`) and 0 for the rest.
 ten (kHz), from `amdgpu_info::reference_clock_10khz(vbios, navi)`:
 smu_info v3/v4 `core_refclk_10khz` (byte 16), replaced on Navi and later by
 gfx_info v3.x/v2.2+ timer reference (byte 40), as
-amdgpu_atomfirmware_get_clock_info; 0 without a VBIOS.
+amdgpu_atomfirmware_get_clock_info; 0 without a VBIOS. This also applies to
+the shared discrete RX 6000 reply on Navi21/22/23/24, independently of
+acceleration opt-in or cold-boot publication.
 `DEV_INFO.vram_type` / `vram_bit_width` are `Snapshot::{vram_type,
 vram_bit_width}`, from `amdgpu_info::umc_vram(vbios)` on discrete Navi4
 parts only (amdgpu_gmc_get_vram_info's GC 12.0.x arm): umc_info (master
@@ -1829,8 +1982,8 @@ the firmware left running. It runs in native dependency order:
    read-only). Idle or soft-reset OTGs are left alone.
 
 HDMI, HPO and MST output are not retired by it; their live state makes it
-fail. The fb boot handoff runs it, followed by `modeset_display(0, black)`,
-only with the `amdgpu.native_display` kernel flag. If the modeset then
+fail. The RDNA2 fb boot handoff runs it, followed by `modeset_display(0, black)`,
+unless `amdgpu.native_display=0` (on by default). If the modeset then
 fails, the GOP no longer scans out and the screen stays dark until a later
 modeset; the console's GOP framebuffer remains valid, excluded memory.
 
@@ -3898,7 +4051,8 @@ DML DRAM- and FCLK-change support, stutter with the deep-sleep DCEFCLK floor,
 bandwidth floors) and driver readiness (GFXOFF-safe GC access, RLC safe mode,
 validated recovery). `Policy::new()`/`Default` disable everything; `request`
 refuses with `NotValidated` while `HARDWARE_VALIDATED` is false.
-`OptIn::parse(Option<&str>)` reads the `amdgpu.navi22_pg=` value (tokens
+`OptIn::parse(Option<&str>)` reads the `amdgpu.rdna2_pg=` value, or
+`DEFAULT_POWER_SAVING` when it is absent (tokens
 `gfxoff`, `cg`, `gfxcg`, `hubpg`, `memdpm`, `fclkdpm`, `ds`, `wm`; any unknown
 token yields `OptIn::NONE`), and `request_opted_in(feature, admission, driver,
 optin)` opens a gate only for a named feature whose display and driver-software
@@ -3976,7 +4130,8 @@ when VCN0 is harvested; encode AVC 4096² and HEVC 8192×4352) as
 plus every VCN instance absent from discovery: on the RX 6750 XT (VCN1
 harvested) decode is the VCN0 table, AV1 included.
 
-Client media rings (append-only additions, `amdgpu.navi22_accel` only):
+Client media rings (append-only additions; only while `accel` is on, the
+default):
 `Media::{client_rings() -> u8, fence_reader() -> MediaFenceReader,
 submit(MediaRing, VmRef, &[Ib], copies),
 client_fences(MediaRing) -> (completed, throttle)}` (and
@@ -4683,9 +4838,10 @@ context's lowest-state plan; when the context fails CRTC 0 lights alone.
 Publication withdraws the console and drains
 `scanout_access` before any teardown; recovery withdraws and stops the pipe
 before reset and the monitor relights once `recoveries()` increments. The fb
-handoff calls `modeset_displays` and the monitor with `amdgpu.native_display`
-(`amdgpu.navi22_hw_cursor` opts into the hardware cursor; display detection
-runs only with `amdgpu.native_display` or `amdgpu.display_probe`).
+handoff calls `modeset_displays` and the monitor unless
+`amdgpu.native_display=0` (the hardware cursor is on unless
+`amdgpu.rdna2_hw_cursor=0`; display detection runs with native display or
+`amdgpu.display_probe`).
 
 ### Navi 22 DP link layer, hot-plug and link loss
 
@@ -4930,10 +5086,14 @@ paths; only the tables differ.
   allocator lacks is split in two), so a buffer may exceed one 32 MiB
   block and is never rounded up, charged against `gtt_limit()` (half of
   RAM, TTM's default; `gtt_used()` is the charge) and refused `NoSpace`
-  past it; a VRAM-only buffer on a full heap is `NoSpace`.
-  `GemObject::{phys, gpu, system}` give the first page's CPU-mapped and
-  entry addresses and the kind; `gpu_at(offset)` and `frames` give any
-  page, and GEM_VA writes each entry through `gpu_at`. `AMDGPU_INFO_MEMORY`
+  past it; discardable VRAM-only buffers refuse `NoSpace` when their
+  allowed domains exclude GTT.
+  `GemObject::placement()` returns an `Arc<GemPlacement>` address lease.
+  Its `phys`, `gpu`, `system`, `gpu_at(offset)` and `frames` describe the
+  backing until the lease is dropped. GEM_VA retains the exact lease while
+  constructing PTEs and throughout their lifetime. The object's
+  `phys()`, `gpu()` and `system()` accessors give diagnostic snapshots,
+  not a lifetime guarantee for raw addresses. `AMDGPU_INFO_MEMORY`
   and `VRAM_GTT` report that limit as the GTT heap, with its usage.
   `vram_heap_usage(card)` gives a registered heap's `HeapUsage { visible,
   unmapped }` as (size, used) bytes (`Pool::size` / `available`). On an
@@ -4980,7 +5140,7 @@ paths; only the tables differ.
   handles are ENOENT, as amdgpu_gem_metadata_ioctl. `GemObject::load_u64` /
   `store_u64` read and write 8 bytes through the kernel's own mapping.
 - Lifetimes: each VA mapping record holds its buffer (`Arc<GemObject>`, as
-  `amdgpu_bo_va` holds its BO), so `GEM_CLOSE` cannot free pages the tables
+  `amdgpu_bo_va` holds its BO) and its `Arc<GemPlacement>` address lease, so `GEM_CLOSE` cannot free pages the tables
   still point at; a CPU mapping holds it too (`GemState::mapping_object`,
   the card and render nodes' `mmap_lifetime`), as a VMA holds its object. CLEAR and REPLACE split partly covered mappings
   (`amdgpu_vm_bo_clear_mappings`): the remainders keep their records,
@@ -5057,8 +5217,8 @@ Dependencies must name a ring the engine serves and a handle of that ring.
 A `FENCE` chunk (`Submission::user_fence`: handle, offset) names a
 one-page GEM buffer of the open with the 8 bytes at `offset` inside it
 (EINVAL otherwise, as amdgpu_cs_p1_user_fence); the job's handle is stored
-there by the CPU when a fence read retires the job (`GemObject::store_u64`
-through `defer_until`), never replacing a newer handle of the same ring.
+there by the CPU when a fence read retires the job (`GemMapping` retains
+the exact placement through `defer_until`), never replacing a newer handle of the same ring.
 
 Timeouts (`amdgpu_ring_watch`): `Submitter::submit` takes the submitting
 context's `amdgpu_ctx::Health`. A `RingWatch` per ring follows its jobs;
@@ -6171,8 +6331,38 @@ and primary-plane binding; the boot resource is never exposed as a GEM object.
 
 ## 4. Invariants & safety properties
 
+- **GEM address leases:** logical object references alone never authorize
+  retention of raw backing addresses. CPU mappings, GPU PTEs (including
+  removed entries awaiting jobs), and deferred CPU user-fence writes retain
+  the exact backing lease until their last access. A coordinated GPU move
+  excludes new jobs/VA edits, waits all affected VM jobs, copies into private
+  backing, rewrites the existing PTEs and replaces their backing leases before
+  releasing admission. CPU leases cannot be revoked by this path. A copy
+  requires exclusive backing ownership and no unsignalled reservation fence
+  when committing. Asynchronous invisible-VRAM copying retains old GPU leases
+  and keeps the destination private until then. Before starting it, an address
+  lease census permits only registered idle GPU mappings and the coordinator:
+  a deferred CPU writer or unregistered lease refuses the copy before staging
+  can read its source. Kernel DMA owns both source
+  and destination until actual completion, independently of waiter lifetime;
+  cancelled move fences block subsequent user jobs, including jobs that omit
+  the object from their BO list. Scratch reuse and recovery replay cannot
+  overwrite a predecessor's still-live transfer.
+  Same-card PRIME sharing preserves identity, metadata and reservation across
+  relocation.
+
 - GPU DMA targets are validated against its IOMMU context.
 - A hung GPU causes no kernel hang — the driver domain takes the hit.
+- GEM identity, shared metadata and reservations survive migration. Address
+  leases remain stable until released. Moving a GPU-mapped BO additionally
+  requires card admission exclusion and a complete PTE rebind before new
+  jobs; CPU-mapped backing remains pinned. The source allocation survives
+  until the complete destination copy succeeds.
+- VM programming completion never substitutes for a job's lifetime fence.
+  Reset generations invalidate retained submitters before queues are reused.
+- Live userspace register queries validate the complete allow-listed range
+  before accessing MMIO, under current PCI authority, the retained hardware
+  owner and a GC power reference.
 
 ## 5. Architecture notes
 

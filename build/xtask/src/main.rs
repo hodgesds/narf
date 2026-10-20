@@ -7646,6 +7646,15 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         bail!("xtask {smoke_name}: guest DNS query did not return a valid answer");
     }
 
+    // 6a. connect(2): non-blocking (EINPROGRESS → POLLOUT → SO_ERROR), refused
+    // (POLLERR|POLLHUP, ECONNREFUSED, then ECONNABORTED), and a reconnect
+    // after a failed blocking connect.
+    if !wait_for(b"netserve-nbconnect-ok", timeout_secs) {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("xtask {smoke_name}: guest connect(2) state checks failed");
+    }
+
     // 6b. The TCP robustness phases, in the guest's order.
     for (token, secs) in &robust_tokens {
         if !wait_for(token.as_bytes(), *secs) {

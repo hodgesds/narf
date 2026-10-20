@@ -515,6 +515,7 @@ async fn queue(
     let deadline = narf_time::monotonic_ns().saturating_add(THROTTLE_NS);
     let ticket = |seq: u32| u64::from(request.ring) << 32 | u64::from(seq);
     loop {
+        let observed = crate::amdgpu_fence_navi22::change_sequence();
         let wait_for = {
             let mut owner = crate::amdgpu_navi22_platform::owner().await;
             let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
@@ -553,6 +554,11 @@ async fn queue(
         };
         // Two jobs in flight (or no idle VMID): wait without the owner.
         loop {
+            let observed = if wait_for.is_none() {
+                observed
+            } else {
+                crate::amdgpu_fence_navi22::change_sequence()
+            };
             let completed = progress().ok_or(FsError::NoDevice)?;
             if wait_for.is_some_and(|t| job_done(epoch, completed, t)) {
                 break;
@@ -560,7 +566,7 @@ async fn queue(
             if narf_time::monotonic_ns() >= deadline {
                 return Err(FsError::Busy);
             }
-            narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant()).await;
+            crate::amdgpu_fence_navi22::wait_change(observed, deadline).await;
             if wait_for.is_none() {
                 break;
             }

@@ -12615,6 +12615,470 @@ fn smoke_shared_frame_replacement_updates_all_aliases() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_shared_frame_replacement_updates_all_aliases);
 
+/// Metadata-alias census consulted by `with_revoked_shared_frames` tests.
+#[cfg(feature = "kernel-test")]
+static REVOCATION_TEST_ALIASES: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(u64, usize)>> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+#[cfg(feature = "kernel-test")]
+fn revocation_test_aliases(phys: u64) -> usize {
+    REVOCATION_TEST_ALIASES
+        .lock()
+        .iter()
+        .find(|(frame, _)| *frame == phys)
+        .map_or(0, |(_, count)| *count)
+}
+
+/// Shared CPU alias revocation across two roots: scatter frames, a second
+/// read-only alias in one space, a partial reordered view, and a PROT_NONE
+/// metadata-only alias. Census/root/pin refusals and an injected destination
+/// reverse-map failure leave every leaf untouched; a commit error restores
+/// the exact original leaves; success rebinds leaves, metadata and rmap.
+#[cfg(all(
+    feature = "kernel-test",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn smoke_memory_shared_revocation_rebinds_or_restores() -> TestResult {
+    use crate::address_space::{
+        __shared_alias_census, __test_fail_shared_revocation_prepare_at, with_revoked_shared_frames,
+    };
+    use crate::VirtAddr;
+    use crate::{AddressSpace, AddressSpaceError, PhysAddr, PhysFrame, Region, RegionPerms};
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+
+    #[cfg(target_arch = "aarch64")]
+    use crate::aarch64::paging::{flags_at, translate, PtFlags};
+    #[cfg(target_arch = "x86_64")]
+    use crate::x86_64::paging::{flags_at, translate, PtFlags};
+
+    fn leaf(space: &AddressSpace, va: VirtAddr) -> (Option<PhysAddr>, Option<PtFlags>) {
+        // SAFETY: test-owned live root, never concurrently mutated here.
+        unsafe { (translate(space.root, va), flags_at(space.root, va)) }
+    }
+
+    let mut frames = Vec::new();
+    for _ in 0..6 {
+        match crate::alloc_frame() {
+            Ok(frame) => frames.push(frame.start_address()),
+            Err(_) => {
+                for &phys in &frames {
+                    crate::free_frame(PhysFrame::new(phys));
+                }
+                return TestResult::Skip("revocation frame allocation failed");
+            }
+        }
+    }
+    let old: Vec<PhysAddr> = frames[..3].to_vec();
+    let new: Vec<PhysAddr> = frames[3..].to_vec();
+    let free = |frames: &[PhysAddr]| {
+        for &phys in frames {
+            crate::free_frame(PhysFrame::new(phys));
+        }
+    };
+    // SAFETY: fresh user roots, owned exclusively by this test.
+    let (a, b) = match unsafe { (AddressSpace::new_for_user(), AddressSpace::new_for_user()) } {
+        (Ok(a), Ok(b)) => (Arc::new(a), Arc::new(b)),
+        _ => {
+            free(&frames);
+            return TestResult::Skip("revocation root allocation failed");
+        }
+    };
+    let rw = RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED;
+    let va1 = VirtAddr::new(0x0000_40a0_0000_0000);
+    let va2 = VirtAddr::new(0x0000_40a1_0000_0000);
+    let va3 = VirtAddr::new(0x0000_40a2_0000_0000);
+    let va4 = VirtAddr::new(0x0000_40a3_0000_0000);
+    let layout: [(&Arc<AddressSpace>, VirtAddr, RegionPerms, Vec<PhysAddr>); 4] = [
+        (&a, va1, rw, old.clone()),
+        (
+            &a,
+            va2,
+            RegionPerms::READ | RegionPerms::SHARED,
+            alloc::vec![old[1]],
+        ),
+        (&b, va3, rw, alloc::vec![old[2], old[0]]),
+        (&b, va4, RegionPerms::SHARED, alloc::vec![old[1]]),
+    ];
+    for (space, base, perms, phys) in &layout {
+        let len = phys.len() as u64 * 4096;
+        if space
+            .map_region(Region {
+                base: *base,
+                len,
+                perms: *perms,
+                phys: phys.clone().into(),
+            })
+            .is_err()
+        {
+            free(&frames);
+            return TestResult::Fail("revocation alias registration failed");
+        }
+    }
+    // SAFETY: fresh live roots with registered live frames.
+    if unsafe { a.materialize().and_then(|()| b.materialize()) }.is_err() {
+        free(&frames);
+        return TestResult::Fail("revocation alias materialization failed");
+    }
+    // Every (space, va) and the old frame index it maps.
+    let views: Vec<(&Arc<AddressSpace>, VirtAddr, usize, bool)> = alloc::vec![
+        (&a, va1, 0, true),
+        (&a, VirtAddr::new(va1.raw() + 0x1000), 1, true),
+        (&a, VirtAddr::new(va1.raw() + 0x2000), 2, true),
+        (&a, va2, 1, true),
+        (&b, va3, 2, true),
+        (&b, VirtAddr::new(va3.raw() + 0x1000), 0, true),
+        (&b, va4, 1, false),
+    ];
+    let original: Vec<_> = views.iter().map(|(s, va, _, _)| leaf(s, *va)).collect();
+    let set_census = |frames: &[PhysAddr], counts: [usize; 3]| {
+        *REVOCATION_TEST_ALIASES.lock() = frames
+            .iter()
+            .zip(counts)
+            .map(|(phys, count)| (phys.raw(), count))
+            .collect();
+    };
+    let both = [a.clone(), b.clone()];
+    let untouched = |label: &'static str| -> Result<(), &'static str> {
+        for ((space, va, _, _), before) in views.iter().zip(&original) {
+            if leaf(space, *va) != *before {
+                return Err(label);
+            }
+        }
+        if old
+            .iter()
+            .zip([2usize, 2, 2])
+            .any(|(&p, n)| crate::rmap::owner_count(p) != n)
+            || new.iter().any(|&p| {
+                crate::rmap::owner_count(p) != 0 || crate::rmap::__reserved_for_test(p) != 0
+            })
+        {
+            return Err(label);
+        }
+        Ok(())
+    };
+    let mut commits = 0usize;
+    let result = (|| -> Result<(), &'static str> {
+        if original[6] != (None, None) || original.iter().take(6).any(|l| l.0.is_none()) {
+            return Err("revocation fixture did not materialize as laid out");
+        }
+        // 1. Census shortfall (an unknown fork child holding old[0]).
+        set_census(&old, [3, 3, 2]);
+        // SAFETY: both frame lists outlive the call; roots are live.
+        let refused = unsafe {
+            with_revoked_shared_frames(&both, &old, &new, revocation_test_aliases, || {
+                commits += 1;
+                Ok(())
+            })
+        };
+        if refused != Err(AddressSpaceError::Pinned) || commits != 0 {
+            return Err("census mismatch did not refuse before commit");
+        }
+        untouched("census refusal changed CPU aliases")?;
+        // 2. A root missing from the snapshot.
+        set_census(&old, [2, 3, 2]);
+        // SAFETY: as above.
+        let refused = unsafe {
+            with_revoked_shared_frames(&both[..1], &old, &new, revocation_test_aliases, || {
+                commits += 1;
+                Ok(())
+            })
+        };
+        if refused != Err(AddressSpaceError::Pinned) || commits != 0 {
+            return Err("missing root did not refuse before commit");
+        }
+        untouched("missing-root refusal changed CPU aliases")?;
+        // 3. Injected destination rmap preparation failure after a row.
+        __test_fail_shared_revocation_prepare_at(1);
+        // SAFETY: as above.
+        let refused = unsafe {
+            with_revoked_shared_frames(&both, &old, &new, revocation_test_aliases, || {
+                commits += 1;
+                Ok(())
+            })
+        };
+        if refused != Err(AddressSpaceError::AllocationFailed) || commits != 0 {
+            return Err("rmap preparation failure did not refuse before revocation");
+        }
+        untouched("rmap preparation rollback leaked a reservation")?;
+        // 4. Commit error: every leaf absent inside, then exactly restored.
+        let mut absent_inside = true;
+        // SAFETY: as above.
+        let failed = unsafe {
+            with_revoked_shared_frames(&both, &old, &new, revocation_test_aliases, || {
+                commits += 1;
+                absent_inside = views.iter().all(|(s, va, _, _)| leaf(s, *va).0.is_none());
+                Err(AddressSpaceError::NotImplemented)
+            })
+        };
+        if failed != Err(AddressSpaceError::NotImplemented) || commits != 1 || !absent_inside {
+            return Err("commit error was not called with every alias revoked");
+        }
+        untouched("commit error did not restore the exact original leaves")?;
+        // 5. Success: same attributes on new frames; metadata follows.
+        // SAFETY: as above.
+        let moved = unsafe {
+            with_revoked_shared_frames(&both, &old, &new, revocation_test_aliases, || {
+                commits += 1;
+                absent_inside &= views.iter().all(|(s, va, _, _)| leaf(s, *va).0.is_none());
+                Ok(())
+            })
+        };
+        if moved.is_err() || commits != 2 || !absent_inside {
+            return Err("successful revocation did not run with every alias absent");
+        }
+        for ((space, va, frame, present), before) in views.iter().zip(&original) {
+            let after = leaf(space, *va);
+            let expected = if *present {
+                (Some(new[*frame]), before.1)
+            } else {
+                (None, None)
+            };
+            if after != expected {
+                return Err("rebound leaf lost its frame or original attributes");
+            }
+        }
+        if old.iter().any(|&p| crate::rmap::owner_count(p) != 0)
+            || new.iter().any(|&p| {
+                crate::rmap::owner_count(p) != 2 || crate::rmap::__reserved_for_test(p) != 0
+            })
+            || __shared_alias_census(&b, new[1]) != (1, 0)
+            || __shared_alias_census(&a, new[1]) != (2, 2)
+            || old.iter().any(|&p| {
+                __shared_alias_census(&a, p) != (0, 0) || __shared_alias_census(&b, p) != (0, 0)
+            })
+        {
+            return Err("successful revocation left stale rmap or metadata aliases");
+        }
+        // 6. A LOCKED alias is a long-term pin.
+        let pin = VirtAddr::new(0x0000_40a4_0000_0000);
+        a.map_region(Region {
+            base: pin,
+            len: 4096,
+            perms: rw | RegionPerms::LOCKED,
+            phys: alloc::vec![new[0]].into(),
+        })
+        .map_err(|_| "LOCKED alias registration failed")?;
+        set_census(&new, [3, 3, 2]);
+        // SAFETY: as above, moving back onto the original frames.
+        let pinned = unsafe {
+            with_revoked_shared_frames(&both, &new, &old, revocation_test_aliases, || {
+                commits += 1;
+                Ok(())
+            })
+        };
+        if pinned != Err(AddressSpaceError::Pinned) || commits != 2 {
+            return Err("LOCKED alias did not pin its frame");
+        }
+        Ok(())
+    })();
+    REVOCATION_TEST_ALIASES.lock().clear();
+    drop(both);
+    drop(a);
+    drop(b);
+    free(&frames);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+#[cfg(all(
+    feature = "kernel-test",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+kernel_test_in!("memory", smoke_memory_shared_revocation_rebinds_or_restores);
+
+/// Revocation over aliases shaped by real VM operations: an mprotect
+/// PROT_NONE page, a fixed-punch split, an mremap move, and a fork child.
+/// The child's retained metadata refuses the move until its root is known;
+/// after the child exits, the parent alone moves back.
+#[cfg(all(
+    feature = "kernel-test",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn smoke_memory_shared_revocation_follows_fork_split_mremap() -> TestResult {
+    use crate::address_space::{__shared_alias_census, with_revoked_shared_frames};
+    use crate::{
+        AddressSpace, AddressSpaceError, MremapLimits, PhysAddr, PhysFrame, Region, RegionPerms,
+        VirtAddr,
+    };
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+
+    #[cfg(target_arch = "aarch64")]
+    use crate::aarch64::paging::{flags_at, translate};
+    #[cfg(target_arch = "x86_64")]
+    use crate::x86_64::paging::{flags_at, translate};
+
+    let leaf = |space: &AddressSpace, va: VirtAddr| {
+        // SAFETY: test-owned live roots, not concurrently mutated.
+        unsafe { (translate(space.root, va), flags_at(space.root, va)) }
+    };
+    let mut frames = Vec::new();
+    for _ in 0..8 {
+        match crate::alloc_frame() {
+            Ok(frame) => frames.push(frame.start_address()),
+            Err(_) => {
+                for &phys in &frames {
+                    crate::free_frame(PhysFrame::new(phys));
+                }
+                return TestResult::Skip("fork revocation frame allocation failed");
+            }
+        }
+    }
+    let old: Vec<PhysAddr> = frames[..4].to_vec();
+    let new: Vec<PhysAddr> = frames[4..].to_vec();
+    // SAFETY: fresh user root owned exclusively by this test.
+    let parent = match unsafe { AddressSpace::new_for_user() } {
+        Ok(space) => Arc::new(space),
+        Err(_) => {
+            for &phys in &frames {
+                crate::free_frame(PhysFrame::new(phys));
+            }
+            return TestResult::Skip("fork revocation root allocation failed");
+        }
+    };
+    let base = VirtAddr::new(0x0000_40b0_0000_0000);
+    let moved = VirtAddr::new(0x0000_40b1_0000_0000);
+    let page = |n: u64| VirtAddr::new(base.raw() + n * 4096);
+    let census = |spaces: &[&Arc<AddressSpace>], frames: &[PhysAddr]| {
+        *REVOCATION_TEST_ALIASES.lock() = frames
+            .iter()
+            .map(|&phys| {
+                let count = spaces
+                    .iter()
+                    .map(|space| __shared_alias_census(space, phys).0)
+                    .sum();
+                (phys.raw(), count)
+            })
+            .collect();
+    };
+    let result = (|| -> Result<(), &'static str> {
+        parent
+            .map_region(Region {
+                base,
+                len: 4 * 4096,
+                perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
+                phys: old.clone().into(),
+            })
+            .map_err(|_| "shared region registration failed")?;
+        // SAFETY: live test root and registered live frames.
+        unsafe { parent.materialize() }.map_err(|_| "shared region materialize failed")?;
+        parent
+            .mprotect_range(page(1), 4096, RegionPerms(0))
+            .map_err(|_| "PROT_NONE split failed")?;
+        parent
+            .punch_fixed(page(2), 4096)
+            .map_err(|_| "fixed punch split failed")?;
+        // SAFETY: live test root; the wrapper supplies both transactions.
+        unsafe {
+            parent.relocate_shared_region_limited(
+                page(3),
+                4096,
+                moved,
+                4096,
+                MremapLimits::UNLIMITED,
+            )
+        }
+        .map_err(|_| "shared mremap move failed")?;
+        // SAFETY: live test root; the child is owned by this test.
+        let child = Arc::new(unsafe { parent.clone_for_fork() }.map_err(|_| "fork failed")?);
+        let views = [
+            (&parent, page(0), 0usize),
+            (&parent, page(1), 1),
+            (&parent, moved, 3),
+            (&child, page(0), 0),
+            (&child, page(1), 1),
+            (&child, moved, 3),
+        ];
+        let before: Vec<_> = views.iter().map(|(s, va, _)| leaf(s, *va)).collect();
+        if before[0].0 != Some(old[0]) || before[1].0.is_some() || before[2].0 != Some(old[3]) {
+            return Err("VM operations did not shape the parent aliases as expected");
+        }
+        if __shared_alias_census(&parent, old[2]) != (0, 0)
+            || __shared_alias_census(&child, old[1]).0 != 1
+        {
+            return Err("punch or fork did not update metadata aliases");
+        }
+        census(&[&parent, &child], &old);
+        // The child is not yet visible to the relocator: fork gap.
+        // SAFETY: both frame lists outlive the call; roots are live.
+        let refused = unsafe {
+            with_revoked_shared_frames(
+                core::slice::from_ref(&parent),
+                &old,
+                &new,
+                revocation_test_aliases,
+                || Ok(()),
+            )
+        };
+        if refused != Err(AddressSpaceError::Pinned) {
+            return Err("unpublished fork child did not refuse revocation");
+        }
+        let both = [parent.clone(), child.clone()];
+        // SAFETY: as above.
+        unsafe {
+            with_revoked_shared_frames(&both, &old, &new, revocation_test_aliases, || Ok(()))
+        }
+        .map_err(|_| "published child did not permit revocation")?;
+        for ((space, va, frame), was) in views.iter().zip(&before) {
+            let expected = (was.0.map(|_| new[*frame]), was.1);
+            if leaf(space, *va) != expected
+                || space.lookup(*va).and_then(|r| {
+                    r.phys
+                        .get(((va.raw() - r.base.raw()) / 4096) as usize)
+                        .copied()
+                }) != Some(new[*frame])
+            {
+                return Err("fork/split/mremap alias did not rebind exactly");
+            }
+        }
+        // The PROT_NONE page's retained owner moved with its metadata.
+        if old.iter().any(|&p| crate::rmap::owner_count(p) != 0)
+            || crate::rmap::owner_count(new[1]) != 1
+            || crate::rmap::owner_count(new[0]) != 1
+        {
+            return Err("revocation left stale owners of the old frames");
+        }
+        // Child exit: its metadata leaves; the parent alone moves back.
+        drop(both);
+        drop(child);
+        census(&[&parent], &new);
+        // SAFETY: as above.
+        unsafe {
+            with_revoked_shared_frames(
+                core::slice::from_ref(&parent),
+                &new,
+                &old,
+                revocation_test_aliases,
+                || Ok(()),
+            )
+        }
+        .map_err(|_| "parent did not move back after child exit")?;
+        if leaf(&parent, page(0)).0 != Some(old[0]) || leaf(&parent, moved).0 != Some(old[3]) {
+            return Err("parent did not rebind after child exit");
+        }
+        Ok(())
+    })();
+    REVOCATION_TEST_ALIASES.lock().clear();
+    drop(parent);
+    for &phys in &frames {
+        crate::free_frame(PhysFrame::new(phys));
+    }
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+#[cfg(all(
+    feature = "kernel-test",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+kernel_test_in!(
+    "memory",
+    smoke_memory_shared_revocation_follows_fork_split_mremap
+);
+
 // ════════════════════════════════════════════════════════════════════
 // mlock / munlock semantics.
 //

@@ -194,6 +194,14 @@ const SO_LINGER: i32 = 13;
 const IPPROTO_TCP: i32 = 6;
 const TCP_INFO: i32 = 11;
 
+/// Receive buffer for the SLIRP-side servers that make the guest's window
+/// close by pausing. Those servers sit behind SLIRP on loopback, where the
+/// MSS is ~64 KiB: a buffer much below that keeps Linux's receiver
+/// silly-window avoidance from ever advertising a usable window, so SLIRP's
+/// host socket crawls on zero-window probes (a 4 KiB buffer moves ~40 KB/s)
+/// and the guest's window stays closed for a minute even while we read.
+const SMALL_LO_RCVBUF: i32 = 64 << 10;
+
 fn set_rcvbuf(fd: &impl AsRawFd, bytes: i32) {
     // SAFETY: `fd` is an open socket; the option value is a live i32 of the
     // length passed.
@@ -432,7 +440,7 @@ fn zwin_rx_server(mut s: TcpStream, _r: &Report) -> Result<(), String> {
 fn zwin_tx_server(mut s: TcpStream, _r: &Report) -> Result<(), String> {
     // The guest sends `total`; we read in bursts with pauses. A tiny receive
     // buffer makes SLIRP's window close soon after we stop reading.
-    set_rcvbuf(&s, 4096);
+    set_rcvbuf(&s, SMALL_LO_RCVBUF);
     let pauses: Vec<u64> = if long() {
         vec![10_000, 10_000, 70_000, 10_000, 30_000, 10_000]
     } else {
@@ -528,7 +536,7 @@ fn bigio_server(mut s: TcpStream, _r: &Report) -> Result<(), String> {
             Ok(())
         }
         4 => {
-            set_rcvbuf(&s, 4096);
+            set_rcvbuf(&s, SMALL_LO_RCVBUF);
             std::thread::sleep(Duration::from_millis(1500));
             recv_stream(&mut s, 4 * MIB, seed, false)?;
             io(s.write_all(b"K"), "verdict")?;

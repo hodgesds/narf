@@ -367,7 +367,7 @@ pub fn ip_select_ident_hashed(
 
 /// SipHash-2-4 over `words` (little-endian 64-bit message words), as
 /// `lib/siphash.c` computes it.
-fn siphash24(key: &[u64; 2], words: &[u64]) -> u64 {
+pub(crate) fn siphash24(key: &[u64; 2], words: &[u64]) -> u64 {
     let mut v0 = 0x736f_6d65_7073_6575u64 ^ key[0];
     let mut v1 = 0x646f_7261_6e64_6f6du64 ^ key[1];
     let mut v2 = 0x6c79_6765_6e65_7261u64 ^ key[0];

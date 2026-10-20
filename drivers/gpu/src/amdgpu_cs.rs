@@ -725,7 +725,7 @@ impl narf_filesystem::DrmFence for JobFence {
 /// a client polling the buffer may see it late and falls back to WAIT_CS,
 /// which retires it.
 struct UserFence {
-    object: Arc<crate::amdgpu_gem::GemObject>,
+    object: Arc<crate::amdgpu_gem::GemMapping>,
     offset: u64,
     ticket: u64,
 }
@@ -755,12 +755,29 @@ pub fn defer_until(card: u32, tickets: Vec<u64>, held: Held) {
 /// Free what card `card` deferred for jobs `done` reports complete. A card's
 /// submitter calls this whenever it learns its engine's progress.
 pub fn retire(card: u32, done: &dyn Fn(u64) -> bool) {
+    // A completion query may itself reap a native ring and re-enter retire.
+    // Sample it outside DEFERRED, then revalidate the immutable tickets under
+    // the lock. Newly queued holds are released only for sampled completions.
+    let mut tickets: Vec<u64> = DEFERRED
+        .lock()
+        .iter()
+        .filter(|entry| entry.0 == card)
+        .flat_map(|entry| entry.1.iter().copied())
+        .collect();
+    tickets.sort_unstable();
+    tickets.dedup();
+    let completed: Vec<_> = tickets.into_iter().filter(|&ticket| done(ticket)).collect();
     let freed: Vec<Held> = {
         let mut deferred = DEFERRED.lock();
         let mut freed = Vec::new();
         let mut i = 0;
         while i < deferred.len() {
-            if deferred[i].0 == card && deferred[i].1.iter().all(|&t| done(t)) {
+            if deferred[i].0 == card
+                && deferred[i]
+                    .1
+                    .iter()
+                    .all(|t| completed.binary_search(t).is_ok())
+            {
                 freed.push(deferred.swap_remove(i).2);
             } else {
                 i += 1;
@@ -821,6 +838,21 @@ async fn nap() {
     narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant()).await;
 }
 
+async fn wait_kernel(
+    fences: Vec<Arc<dyn narf_filesystem::DrmFence>>,
+    started: u64,
+) -> Result<(), FsError> {
+    for fence in fences {
+        while !fence.is_signalled() {
+            if narf_time::monotonic_ns() >= started.saturating_add(5_000_000_000) {
+                return Err(FsError::TimedOut);
+            }
+            nap().await;
+        }
+    }
+    Ok(())
+}
+
 /// `AMDGPU_CS`, `AMDGPU_WAIT_CS`, `AMDGPU_GEM_WAIT_IDLE`,
 /// `AMDGPU_WAIT_FENCES` and `AMDGPU_FENCE_TO_HANDLE` on DRM card `card`.
 /// CS, WAIT_CS and WAIT_IDLE need a registered submitter (`Unsupported`
@@ -877,7 +909,7 @@ pub async fn dispatch_async(
         }
         let mut out = [0u8; 8];
         out[0..4].copy_from_slice(&u32::from(!idle).to_le_bytes());
-        out[4..8].copy_from_slice(&(object.preferred_domains as u32).to_le_bytes());
+        out[4..8].copy_from_slice(&(object.preferred_domains() as u32).to_le_bytes());
         // SAFETY: as above.
         unsafe { copy_out(arg, &out)? };
         return Ok(0);
@@ -1000,7 +1032,7 @@ pub async fn dispatch_async(
             if object.byte_len != 4096 || offset > 4096 - 8 {
                 return Err(FsError::InvalidData);
             }
-            Some((object, u64::from(offset)))
+            Some((object.clone(), object.mapping(), u64::from(offset)))
         }
         None => None,
     };
@@ -1024,9 +1056,23 @@ pub async fn dispatch_async(
     let own = vm.owner();
     let locked: Vec<&Arc<crate::amdgpu_gem::GemObject>> = listed
         .iter()
-        .chain(user_fence.as_ref().map(|(o, _)| o))
+        .chain(user_fence.as_ref().map(|(o, _, _)| o))
         .collect();
     for object in &locked {
+        // Kernel initialization must finish before user work can observe a
+        // fresh allocation. A stopped clear queue is not a successful fence.
+        for fence in object
+            .dma_buf()
+            .resv
+            .fences(narf_filesystem::dma_buf::DmaResvUsage::Kernel)
+        {
+            while !fence.is_signalled() {
+                if narf_time::monotonic_ns() >= started.saturating_add(5_000_000_000) {
+                    return Err(FsError::TimedOut);
+                }
+                nap().await;
+            }
+        }
         // An EXPLICIT_SYNC buffer still waits for kernel work on it.
         let usage = if object.flags & u64::from(uapi::AMDGPU_GEM_CREATE_EXPLICIT_SYNC) != 0 {
             narf_filesystem::dma_buf::DmaResvUsage::Kernel
@@ -1047,7 +1093,45 @@ pub async fn dispatch_async(
     // lands before any job here runs, listed or not.
     for fence in vm.kernel_fences() {
         while !fence.is_signalled() {
+            if narf_time::monotonic_ns() >= started.saturating_add(5_000_000_000) {
+                return Err(FsError::TimedOut);
+            }
             nap().await;
+        }
+    }
+    // Includes queue publication, note_job and reservation-fence attachment;
+    // a relocator must never miss a job between those operations. Dependencies
+    // are awaited first so other submissions can satisfy them.
+    let _placement = crate::amdgpu_gem::lock_placement(card).await;
+    // A cancelled relocation can leave kernel DMA alive after releasing the
+    // card gate. Re-sample move fences after admission, including BOs omitted
+    // from the list, before a new job can write their old backing.
+    let mut kernel = vm.kernel_fences();
+    for object in &locked {
+        kernel.extend(
+            object
+                .dma_buf()
+                .resv
+                .fences(narf_filesystem::dma_buf::DmaResvUsage::Kernel),
+        );
+    }
+    wait_kernel(kernel, started).await?;
+    for object in &listed {
+        let to_vram = object.preferred_domains() & u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM) != 0;
+        if object.system() == to_vram && object.cpu_visible() {
+            // Failed promotion preserves the current valid placement. A
+            // successful move rewrites every affected VM before this job.
+            let _ = crate::amdgpu_vm::relocate(&_placement, object, to_vram).await;
+            // A failed copy can still own queued DMA. Falling back to the
+            // old placement is safe only after that move fence settles.
+            wait_kernel(
+                object
+                    .dma_buf()
+                    .resv
+                    .fences(narf_filesystem::dma_buf::DmaResvUsage::Kernel),
+                started,
+            )
+            .await?;
         }
     }
     let seq = engine.submit(vm, &submission, &health).await?;
@@ -1062,7 +1146,7 @@ pub async fn dispatch_async(
             narf_filesystem::dma_buf::DmaResvUsage::Write,
         );
     }
-    if let Some((object, offset)) = user_fence {
+    if let Some((_, object, offset)) = user_fence {
         defer_until(
             card,
             alloc::vec![seq],

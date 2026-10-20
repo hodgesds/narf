@@ -1,16 +1,11 @@
-//! Navi22 clock gating, as Linux applies it in `amdgpu_device_set_cg_state`
-//! for the IP blocks of a GC 10.3.2 (navy_flounder) board: `nv_common`
-//! (nbio_v2_3, hdp_v5_0, smuio_v11_0_6), `gmc_v10_0` (mmhub_v2_0 for MMHUB
-//! 2.1.0, athub_v2_1), `navi10_ih`, `gfx_v10_0` and `sdma_v5_2`. VCN/JPEG
-//! clock gating belongs to their own idle work in Linux and is not driven
-//! here. Every sequence is a register-for-register copy of Linux's, keyed on
-//! the `adev->cg_flags` nv.c sets for this ASIC ([`NAVY_FLOUNDER_CG`]);
-//! where Linux's guard returns for a flag navy_flounder lacks, so does this.
+//! Discrete RDNA2 clock gating: `nv_common`, GMC10, navi10 IH, GFX10
+//! and SDMA5.2 sequences selected by each ASIC's `nv_common_early_init`
+//! flags. VCN/JPEG idle work remains owned by the media engine. SDMA uses
+//! the validated discovered engine count and GC segments 0/2.
 //!
-//! Nothing here runs on a default boot: the only caller is the explicit
-//! `amdgpu.navi22_pg` opt-in, after `amdgpu_navi22_power_policy` admitted the
-//! feature. GFX programming requires GFXOFF to be disallowed (GC powered) —
-//! as in Linux, where CG is applied in late init before GFXOFF is allowed.
+//! Runs only after the explicit `amdgpu.rdna2_pg` opt-in (legacy
+//! `amdgpu.navi22_pg` is an alias) and policy admission. GC must be powered
+//! for every GFX transition; RLC safe mode brackets those writes.
 use crate::{amdgpu::AmdGpu, amdgpu_discovery as discovery};
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
@@ -68,11 +63,17 @@ pub const NAVY_FLOUNDER_CG: u64 = cg::GFX_MGCG
 /// MMHUB/ATHUB PG are PMFW features (`FEATURE_MMHUB_PG/ATHUB_PG`).
 pub const NAVY_FLOUNDER_PG: u32 = pg::VCN | pg::VCN_DPG | pg::JPEG | pg::ATHUB | pg::MMHUB;
 
+/// `nv_common_early_init` flags for bare-metal discrete RDNA2.
+pub fn profile_flags(profile: &crate::amdgpu_rdna2::Profile) -> (u64, u32) {
+    (profile.clock_gating_flags(), profile.power_gating_flags())
+}
+
 /// SOC15 register: one discovery base segment plus the header offset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Block {
     Gc0,
     Gc1,
+    Gc2,
     Mmhub,
     Athub,
     Hdp,
@@ -294,6 +295,7 @@ struct Mmio {
     regs: MmioRegion,
     gc0: u64,
     gc1: u64,
+    gc2: Option<u64>,
     mmhub: u64,
     athub: u64,
     hdp: u64,
@@ -305,6 +307,7 @@ impl Mmio {
         let base = match reg.block {
             Block::Gc0 => self.gc0,
             Block::Gc1 => self.gc1,
+            Block::Gc2 => self.gc2.expect("validated SDMA2/3 bank"),
             Block::Mmhub => self.mmhub,
             Block::Athub => self.athub,
             Block::Hdp => self.hdp,
@@ -362,6 +365,8 @@ struct Engine<I: Io> {
     io: I,
     authority: Cap<BusDeviceCap, Write>,
     cg_flags: u64,
+    sdma_count: usize,
+    rom_force_on: bool,
     /// `adev->gfx.rlc.in_safe_mode[0]`.
     in_safe_mode: bool,
     state: State,
@@ -386,10 +391,14 @@ impl<I: Io> Engine<I> {
             return Err(Error::Unsupported);
         }
         let flags = self.cg_flags;
+        let rom_force_on = self.rom_force_on;
         self.access(|s| {
             hdp_mem_power_gating(s, flags, enable)?;
             hdp_medium_grain_clock_gating(s, flags, enable)?;
-            smuio_rom_clock_gating(s, flags, enable)
+            if rom_force_on || flags & cg::ROM_MGCG != 0 {
+                smuio_rom_clock_gating(s, flags, enable)?;
+            }
+            Ok(())
         })?
     }
     // ── gmc_v10_0: mmhub_v2_0 (2.1.0), athub_v2_1 ───────────────────────
@@ -446,11 +455,13 @@ impl<I: Io> Engine<I> {
     // ── sdma_v5_2_set_clockgating_state ─────────────────────────────────
     fn sdma(&mut self, enable: bool) -> Result<(), Error> {
         let flags = self.cg_flags;
+        let s_count = self.sdma_count;
         self.access(|s| {
             // update_medium_grain_clock_gating, then _light_sleep, each over
             // both instances. Without SDMA_MGCG / SDMA_LS Linux takes the
             // "disable" branch on GATE as well.
-            for clk in SDMA_CLK_CTRL {
+            for i in 0..s_count {
+                let clk = sdma_register(i, SDMA_CLK_CTRL);
                 let def = s.rd(clk)?;
                 let data = if enable && flags & cg::SDMA_MGCG != 0 {
                     def & !SDMA_SOFT_OVERRIDES
@@ -459,7 +470,8 @@ impl<I: Io> Engine<I> {
                 };
                 s.update(clk, def, data);
             }
-            for power in SDMA_POWER_CNTL {
+            for i in 0..s_count {
+                let power = sdma_register(i, SDMA_POWER_CNTL);
                 let def = s.rd(power)?;
                 let data = if enable && flags & cg::SDMA_LS != 0 {
                     def | SDMA_MEM_POWER_OVERRIDE
@@ -569,6 +581,15 @@ impl<I: Io> Engine<I> {
             gated.without(blocks)
         });
         Ok(())
+    }
+}
+
+fn sdma_register(instance: usize, low: [Reg; 2]) -> Reg {
+    if instance < 2 {
+        low[instance]
+    } else {
+        // sdma_v5_2_get_reg_offset: instances 2/3 use GC segment 2, stride 0x400.
+        reg(Block::Gc2, low[0].offset + (instance as u32 - 2) * 0x400)
     }
 }
 
@@ -819,7 +840,7 @@ fn gui_idle_interrupt<I: Io>(s: &mut Seq<'_, I>, enable: bool) -> Result<(), Err
     Ok(())
 }
 
-/// Exclusive owner of the Navi22 clock-gating registers listed above.
+/// Exclusive owner of the discrete RDNA2 clock-gating registers.
 #[derive(Debug)]
 pub struct Gating {
     engine: Engine<Mmio>,
@@ -828,52 +849,85 @@ impl Gating {
     /// Resolve every bank; no register access.
     ///
     /// # Safety
-    /// Caller exclusively owns this physical Navi22 GPU (the retained cold
+    /// Caller exclusively owns this physical discrete RDNA2 GPU (the retained cold
     /// boot owner) with permanent mappings, and no other code writes these
     /// clock-gating registers for the owner's lifetime.
     pub unsafe fn new(gpu: &AmdGpu, authority: Cap<BusDeviceCap, Write>) -> Result<Self, Error> {
-        crate::amdgpu_smu_navi22::mp1_bank(gpu).map_err(|_| Error::Unsupported)?;
-        let bank = |id, version, index, last| {
-            crate::amdgpu_psp_ring::bank(gpu, id, &[version], index, last).map_err(|error| {
-                match error {
-                    crate::amdgpu_psp_ring::Error::Invalid => Error::Invalid,
-                    _ => Error::Unsupported,
-                }
-            })
+        let (layout, count) =
+            crate::amdgpu_sdma_navi22_queues::resolve_rdna2(gpu).map_err(|_| Error::Unsupported)?;
+        let profile = layout.profile;
+        let bank = |id, versions: &[(u8, u8, u8)], index, last| {
+            crate::amdgpu_psp_ring::bank(gpu, id, versions, index, last)
+                .map_err(|_| Error::Unsupported)
         };
-        let gc = (10, 3, 2);
+        bank(discovery::HW_ID_MP1, &[profile.psp_version], 0, 0)?;
+        let smuio_ip = gpu
+            .ip_blocks
+            .iter()
+            .find(|b| b.hw_id == discovery::HW_ID_SMUIO && b.instance == 0)
+            .ok_or(Error::Unsupported)?;
+        let rom_force_on = crate::amdgpu_rdna2::smuio_rom_forced_on((
+            smuio_ip.major,
+            smuio_ip.minor,
+            smuio_ip.revision,
+        ))
+        .ok_or(Error::Unsupported)?;
+        let smuio = bank(
+            discovery::HW_ID_SMUIO,
+            &[(smuio_ip.major, smuio_ip.minor, smuio_ip.revision)],
+            0,
+            if rom_force_on {
+                CGTT_ROM_CLK_CTRL0.offset
+            } else {
+                0
+            },
+        )?;
         let io = Mmio {
             regs: gpu.regs,
-            gc0: bank(discovery::HW_ID_GC, gc, 0, GC0_LAST)?,
-            gc1: bank(discovery::HW_ID_GC, gc, 1, GC1_LAST)?,
+            gc0: bank(discovery::HW_ID_GC, &[profile.gc_version], 0, GC0_LAST)?,
+            gc1: bank(discovery::HW_ID_GC, &[profile.gc_version], 1, GC1_LAST)?,
+            gc2: layout.sdma_high,
             mmhub: bank(
                 discovery::HW_ID_MMHUB,
-                (2, 1, 0),
+                crate::amdgpu_rdna2::GMC_MMHUB_VERSIONS,
                 0,
                 DAGB0_CNTL_MISC2.offset,
             )?,
-            athub: bank(discovery::HW_ID_ATHUB, (2, 1, 0), 0, ATHUB_MISC_CNTL.offset)?,
-            hdp: bank(discovery::HW_ID_HDP, (5, 0, 3), 0, HDP_CLK_CNTL.offset)?,
-            osssys: bank(discovery::HW_ID_OSSSYS, (5, 0, 3), 0, IH_CLK_CTRL.offset)?,
-            smuio: bank(
-                discovery::HW_ID_SMUIO,
-                (11, 0, 6),
+            athub: bank(
+                discovery::HW_ID_ATHUB,
+                &[(2, 1, 0), (2, 1, 1), (2, 1, 2)],
                 0,
-                CGTT_ROM_CLK_CTRL0.offset,
+                ATHUB_MISC_CNTL.offset,
             )?,
+            hdp: bank(
+                discovery::HW_ID_HDP,
+                &[(5, 0, 0), (5, 0, 1), (5, 0, 2), (5, 0, 3), (5, 0, 4)],
+                0,
+                HDP_CLK_CNTL.offset,
+            )?,
+            osssys: bank(
+                discovery::HW_ID_OSSSYS,
+                crate::amdgpu_rdna2::IH_OSSSYS_VERSIONS,
+                0,
+                IH_CLK_CTRL.offset,
+            )?,
+            // smuio_v11_0_6 forces the ROM clock on without ROM_MGCG;
+            // smuio_v11_0 returns before touching its different ROM offset.
+            smuio,
         };
-        // Both SDMA instances live on the GC bank (sdma_v5_2_get_reg_offset).
-        bank(discovery::HW_ID_SDMA0, (5, 2, 2), 0, 0)?;
         Ok(Self {
             engine: Engine {
                 io,
                 authority,
-                cg_flags: NAVY_FLOUNDER_CG,
+                cg_flags: profile_flags(profile).0,
+                sdma_count: count,
+                rom_force_on,
                 in_safe_mode: false,
                 state: State::Idle,
             },
         })
     }
+
     pub fn state(&self) -> State {
         self.engine.state
     }

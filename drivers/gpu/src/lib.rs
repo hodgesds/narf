@@ -154,7 +154,10 @@ pub mod amdgpu_clearstate;
 pub mod amdgpu_clearstate_gfx10;
 pub mod amdgpu_compute;
 pub mod amdgpu_cp_fw;
-pub mod amdgpu_cp_navi22;
+#[path = "amdgpu_cp_navi22.rs"]
+pub mod amdgpu_rdna2_cp;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_cp as amdgpu_cp_navi22;
 pub mod amdgpu_cs;
 pub mod amdgpu_ctx;
 pub mod amdgpu_dc;
@@ -196,13 +199,19 @@ pub mod amdgpu_dml_regs;
 pub mod amdgpu_dmub;
 pub mod amdgpu_dmub_boot;
 pub mod amdgpu_dmub_firmware;
-pub mod amdgpu_dmub_navi22;
+#[path = "amdgpu_dmub_navi22.rs"]
+pub mod amdgpu_rdna2_dmub;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_dmub as amdgpu_dmub_navi22;
 pub mod amdgpu_dmub_navi48;
 pub mod amdgpu_dp_training;
 pub mod amdgpu_dp_tunnel;
 pub mod amdgpu_dpm;
 pub mod amdgpu_dsc;
-pub mod amdgpu_fence_navi22;
+#[path = "amdgpu_fence_navi22.rs"]
+pub mod amdgpu_rdna2_fence;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_fence as amdgpu_fence_navi22;
 pub mod amdgpu_frl_cap;
 pub mod amdgpu_frl_training;
 pub mod amdgpu_gddr6;
@@ -215,20 +224,35 @@ pub mod amdgpu_gfx12_setup;
 pub mod amdgpu_gfx12_shader;
 pub mod amdgpu_gfx12_topology;
 pub mod amdgpu_gfx_firmware;
-pub mod amdgpu_gfx_navi22;
+#[path = "amdgpu_gfx_navi22.rs"]
+pub mod amdgpu_rdna2_gfx;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_gfx as amdgpu_gfx_navi22;
 pub mod amdgpu_gmc;
-pub mod amdgpu_gmc_navi22;
+#[path = "amdgpu_gmc_navi22.rs"]
+pub mod amdgpu_rdna2_gmc;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_gmc as amdgpu_gmc_navi22;
 pub mod amdgpu_gmc_navi48;
 pub mod amdgpu_hdmi_audio;
 pub mod amdgpu_hpd;
 pub mod amdgpu_hwmon;
 pub mod amdgpu_ih;
 pub mod amdgpu_ih7;
-pub mod amdgpu_ih_navi22;
+#[path = "amdgpu_ih_navi22.rs"]
+pub mod amdgpu_rdna2_ih;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_ih as amdgpu_ih_navi22;
 pub mod amdgpu_info;
-pub mod amdgpu_info_navi22;
+#[path = "amdgpu_info_navi22.rs"]
+pub mod amdgpu_rdna2_info;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_info as amdgpu_info_navi22;
 pub mod amdgpu_jpeg_navi48;
-pub mod amdgpu_kiq_navi22;
+#[path = "amdgpu_kiq_navi22.rs"]
+pub mod amdgpu_rdna2_kiq;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_kiq as amdgpu_kiq_navi22;
 pub mod amdgpu_mes;
 pub mod amdgpu_mes12;
 pub mod amdgpu_mes12_hw;
@@ -237,25 +261,76 @@ pub mod amdgpu_modeset;
 pub mod amdgpu_mqd;
 pub mod amdgpu_mst;
 pub mod amdgpu_native_kms;
-pub mod amdgpu_navi22_bios;
-pub mod amdgpu_navi22_boot;
-pub mod amdgpu_navi22_cs;
-pub mod amdgpu_navi22_display;
-pub mod amdgpu_navi22_gating;
-pub mod amdgpu_navi22_gfxoff;
-pub mod amdgpu_navi22_kms;
-pub mod amdgpu_navi22_modeset;
+#[path = "amdgpu_navi22_bios.rs"]
+pub mod amdgpu_rdna2_bios;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_bios as amdgpu_navi22_bios;
+#[path = "amdgpu_navi22_boot.rs"]
+pub mod amdgpu_rdna2_boot;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_boot as amdgpu_navi22_boot;
+#[path = "amdgpu_navi22_cs.rs"]
+pub mod amdgpu_rdna2_cs;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_cs as amdgpu_navi22_cs;
+#[path = "amdgpu_navi22_display.rs"]
+pub mod amdgpu_rdna2_display;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_display as amdgpu_navi22_display;
+#[path = "amdgpu_navi22_gating.rs"]
+pub mod amdgpu_rdna2_gating;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_gating as amdgpu_navi22_gating;
+#[path = "amdgpu_navi22_gfxoff.rs"]
+pub mod amdgpu_rdna2_gfxoff;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_gfxoff as amdgpu_navi22_gfxoff;
+#[path = "amdgpu_navi22_kms.rs"]
+pub mod amdgpu_rdna2_kms;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_kms as amdgpu_navi22_kms;
+#[path = "amdgpu_navi22_modeset.rs"]
+pub mod amdgpu_rdna2_modeset;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_modeset as amdgpu_navi22_modeset;
 #[cfg(feature = "kernel-test")]
 mod amdgpu_navi22_modeset_model;
-pub mod amdgpu_navi22_platform;
-pub mod amdgpu_navi22_power;
-pub mod amdgpu_navi22_power_policy;
-pub mod amdgpu_navi22_power_saving;
-pub mod amdgpu_navi22_recovery;
-pub mod amdgpu_navi22_scanout;
-pub mod amdgpu_navi22_submit;
-pub mod amdgpu_navi22_tdr;
-pub mod amdgpu_navi22_thermal;
+#[path = "amdgpu_navi22_platform.rs"]
+pub mod amdgpu_rdna2_platform;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_platform as amdgpu_navi22_platform;
+#[path = "amdgpu_navi22_power.rs"]
+pub mod amdgpu_rdna2_power;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_power as amdgpu_navi22_power;
+#[path = "amdgpu_navi22_power_policy.rs"]
+pub mod amdgpu_rdna2_power_policy;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_power_policy as amdgpu_navi22_power_policy;
+#[path = "amdgpu_navi22_power_saving.rs"]
+pub mod amdgpu_rdna2_power_saving;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_power_saving as amdgpu_navi22_power_saving;
+#[path = "amdgpu_navi22_recovery.rs"]
+pub mod amdgpu_rdna2_recovery;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_recovery as amdgpu_navi22_recovery;
+#[path = "amdgpu_navi22_scanout.rs"]
+pub mod amdgpu_rdna2_scanout;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_scanout as amdgpu_navi22_scanout;
+#[path = "amdgpu_navi22_submit.rs"]
+pub mod amdgpu_rdna2_submit;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_submit as amdgpu_navi22_submit;
+#[path = "amdgpu_navi22_tdr.rs"]
+pub mod amdgpu_rdna2_tdr;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_tdr as amdgpu_navi22_tdr;
+#[path = "amdgpu_navi22_thermal.rs"]
+pub mod amdgpu_rdna2_thermal;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_thermal as amdgpu_navi22_thermal;
 pub mod amdgpu_navi48_boot;
 pub mod amdgpu_navi48_dispatch;
 pub mod amdgpu_navi48_display;
@@ -276,26 +351,49 @@ pub mod amdgpu_pcie_recovery;
 pub mod amdgpu_platform;
 pub mod amdgpu_pm4;
 pub mod amdgpu_pm4_defs;
-pub mod amdgpu_power_navi22;
+#[path = "amdgpu_power_navi22.rs"]
+pub mod amdgpu_rdna2_board_power;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_board_power as amdgpu_power_navi22;
+mod amdgpu_admission;
 pub mod amdgpu_psp;
 pub mod amdgpu_psp_boot;
 pub mod amdgpu_psp_firmware;
 pub mod amdgpu_psp_ring;
 pub mod amdgpu_rdna2;
+mod amdgpu_rdna2_mmr;
+#[path = "amdgpu_reset_navi22.rs"]
+pub mod amdgpu_rdna2_reset;
+mod amdgpu_rdna2_vram;
 mod amdgpu_reg_window;
 pub mod amdgpu_reset;
-pub mod amdgpu_reset_navi22;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_reset as amdgpu_reset_navi22;
+#[path = "amdgpu_sdma_navi22.rs"]
+pub mod amdgpu_rdna2_sdma;
 pub mod amdgpu_ring;
 pub mod amdgpu_ring_watch;
 pub mod amdgpu_rlc;
 pub mod amdgpu_sdma;
-pub mod amdgpu_sdma_navi22;
-pub mod amdgpu_sdma_navi22_queues;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_sdma as amdgpu_sdma_navi22;
+#[path = "amdgpu_sdma_navi22_queues.rs"]
+pub mod amdgpu_rdna2_sdma_queues;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_sdma_queues as amdgpu_sdma_navi22_queues;
+#[path = "amdgpu_smu_navi22.rs"]
+pub mod amdgpu_rdna2_smu;
 pub mod amdgpu_sdma_navi48;
 pub mod amdgpu_smc_firmware;
 pub mod amdgpu_smu;
-pub mod amdgpu_smu_navi22;
-pub mod amdgpu_smu_navi22_telemetry;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_smu as amdgpu_smu_navi22;
+#[path = "amdgpu_smu_navi22_telemetry.rs"]
+pub mod amdgpu_rdna2_smu_telemetry;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_smu_telemetry as amdgpu_smu_navi22_telemetry;
+#[path = "amdgpu_vcn_navi22.rs"]
+pub mod amdgpu_rdna2_vcn;
 pub mod amdgpu_smu_navi48;
 pub mod amdgpu_smu_navi48_telemetry;
 pub mod amdgpu_smu_v12;
@@ -305,11 +403,18 @@ pub mod amdgpu_uapi;
 pub mod amdgpu_ucode_header;
 pub mod amdgpu_usbc;
 pub mod amdgpu_vbios;
-pub mod amdgpu_vcn_navi22;
-pub mod amdgpu_vcn_navi22_cs;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_vcn as amdgpu_vcn_navi22;
+#[path = "amdgpu_vcn_navi22_cs.rs"]
+pub mod amdgpu_rdna2_vcn_cs;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_vcn_cs as amdgpu_vcn_navi22_cs;
 pub mod amdgpu_vcn_navi48;
+#[path = "amdgpu_video_caps_navi22.rs"]
+pub mod amdgpu_rdna2_video_caps;
 pub mod amdgpu_video;
-pub mod amdgpu_video_caps_navi22;
+/// Compatibility alias for the original Navi22 API.
+pub use amdgpu_rdna2_video_caps as amdgpu_video_caps_navi22;
 pub mod amdgpu_vm;
 pub mod amdgpu_vmhub_regs;
 pub mod amdgpu_vmid;

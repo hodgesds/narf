@@ -521,6 +521,7 @@ pub(crate) const RPTR: u64 = WB;
 pub(crate) const WPTR: u64 = WB + 8;
 pub(crate) const FENCE: u64 = WB + 16;
 pub(crate) const SCRATCH: u64 = WB + 24;
+pub(crate) const VM_FENCE: u64 = WB + 32;
 pub(crate) const IB: u64 = 12288; // linux: n/a (NARF queue layout)
 pub(crate) const MQD: u64 = 16384; // linux: n/a (NARF queue layout)
 pub(crate) const EOP: u64 = 20480; // linux: n/a (NARF queue layout)
@@ -649,7 +650,8 @@ impl Queue {
         io.read_memory(self.map(), offset)
     }
     pub(crate) fn next_seq(&mut self) -> u32 {
-        self.seq = self.seq.wrapping_add(1);
+        // Zero is the initial writeback and the VMID manager's "no job".
+        self.seq = self.seq.wrapping_add(1).max(1);
         self.seq
     }
 }
@@ -743,6 +745,12 @@ impl FenceReader {
     }
     /// The last sequence ring `ring` (0 gfx, 1 compute, 2/3 SDMA) wrote.
     pub fn completed(&self, ring: usize) -> Result<u32, Error> {
+        self.completed_at(ring, FENCE)
+    }
+    pub(crate) fn vm_completed(&self, ring: usize) -> Result<u32, Error> {
+        self.completed_at(ring, VM_FENCE)
+    }
+    fn completed_at(&self, ring: usize, offset: u64) -> Result<u32, Error> {
         let slot = self
             .slots
             .get(ring)
@@ -757,9 +765,11 @@ impl FenceReader {
                 // writeback reservation, whose FENCE dword is in bounds.
                 unsafe {
                     regs.write32(hdp, 1);
-                    regs.read32(hdp);
+                    checked(regs.read32(hdp))?;
                     barrier(Ordering::SeqCst);
-                    checked(slot.read32(FENCE))
+                    // All 32 bits of a fence value, including all-ones,
+                    // are valid. Detect loss from the HDP register instead.
+                    Ok(slot.read32(offset))
                 }
             }))
             .map_err(|_| Error::Revoked)?

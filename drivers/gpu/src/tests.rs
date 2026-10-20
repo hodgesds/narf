@@ -9693,8 +9693,8 @@ fn smoke_amdgpu_gem_lifecycle_and_handle_isolation() -> TestResult {
         return TestResult::Fail("GEM_OP must report the domain the client asked for");
     }
 
-    // SET_PLACEMENT needs a migration path there isn't one of, and must be
-    // refused rather than accepted-and-ignored.
+    // SET_PLACEMENT records a preference, as Linux does; pinned mappings
+    // keep their backing until the final mapping/reference is released.
     let mut setp = [0u8; 24];
     setp[0..4].copy_from_slice(&handle.to_le_bytes());
     setp[4..8].copy_from_slice(&u::AMDGPU_GEM_OP_SET_PLACEMENT.to_le_bytes());
@@ -9703,9 +9703,9 @@ fn smoke_amdgpu_gem_lifecycle_and_handle_isolation() -> TestResult {
         setp.as_mut_ptr() as usize,
         &state,
     )
-    .is_ok()
+    .is_err()
     {
-        return TestResult::Fail("SET_PLACEMENT should be refused while nothing can migrate");
+        return TestResult::Fail("SET_PLACEMENT should record a valid preference");
     }
 
     // ── isolation: a second open's table does not see this handle ──
@@ -11118,7 +11118,7 @@ fn smoke_amdgpu_vm_mappings_hold_their_buffers() -> TestResult {
     if gem_va_on(&vm, &gem, u::AMDGPU_VA_OP_MAP, handle, va, 0, 4 * P).is_err() {
         return TestResult::Fail("setup: MAP");
     }
-    let phys = gem.object(handle).unwrap().phys;
+    let phys = gem.object(handle).unwrap().phys();
     let mut close = [0u8; 8];
     close[0..4].copy_from_slice(&handle.to_le_bytes());
     let _ = crate::amdgpu_gem::dispatch(0x09, close.as_mut_ptr() as usize, &gem);
@@ -11126,7 +11126,7 @@ fn smoke_amdgpu_vm_mappings_hold_their_buffers() -> TestResult {
         return TestResult::Fail("setup: close");
     }
     match vm.mapped_object(va) {
-        Some(o) if o.phys == phys && alloc::sync::Arc::strong_count(&o) == 2 => {}
+        Some(o) if o.phys() == phys && alloc::sync::Arc::strong_count(&o) == 2 => {}
         _ => return TestResult::Fail("closed handle freed a mapped buffer"),
     }
     if vm
@@ -11174,7 +11174,8 @@ kernel_test_in!(
 /// zeroed pool reservation: the CPU maps its BAR window, and its entries
 /// carry the physical VRAM address (`address - fb_base + fb_offset`)
 /// without SYSTEM or SNOOPED. GTT-only buffers, and VRAM|GTT ones once the
-/// heap is full, are system pages; a VRAM-only buffer then fails.
+/// heap is full, are system pages; ordinary VRAM-preferred buffers also
+/// allow GTT fallback, as amdgpu_bo_create sets allowed_domains.
 fn smoke_amdgpu_gem_places_buffers_in_card_vram() -> TestResult {
     use crate::amdgpu_gem::{register_vram_heap, unregister_vram_heap, GemState, VramHeap};
     use crate::amdgpu_uapi as u;
@@ -11217,7 +11218,7 @@ fn smoke_amdgpu_gem_places_buffers_in_card_vram() -> TestResult {
         let zeroed = unsafe { core::slice::from_raw_parts(virt, 2 * P as usize) }
             .iter()
             .all(|b| *b == 0);
-        if o.system || o.phys != phys || o.gpu != 0x1_0000_0000 || !zeroed {
+        if o.system() || o.phys() != phys || o.gpu() != 0x1_0000_0000 || !zeroed {
             return None;
         }
         // MEMORY's usage: two of the heap's four pages are taken.
@@ -11248,20 +11249,21 @@ fn smoke_amdgpu_gem_places_buffers_in_card_vram() -> TestResult {
         }
         // GTT-only stays system memory on this card.
         let gtt = gem_create_on(&gem, P, u::AMDGPU_GEM_DOMAIN_GTT).ok()?;
-        if !gem.object(gtt)?.system {
+        if !gem.object(gtt)?.system() {
             return None;
         }
-        // Two pages left: a three-page VRAM|GTT buffer falls back to GTT,
-        // a three-page VRAM-only one fails.
+        // Two pages left: both VRAM|GTT and ordinary VRAM-only requests
+        // permit GTT fallback, without rewriting the preferred domains.
         let both = gem_create_on(
             &gem,
             3 * P,
             u::AMDGPU_GEM_DOMAIN_VRAM | u::AMDGPU_GEM_DOMAIN_GTT,
         )
         .ok()?;
-        if !gem.object(both)?.system
-            || gem_create_on(&gem, 3 * P, u::AMDGPU_GEM_DOMAIN_VRAM)
-                != Err(narf_filesystem::FsError::NoSpace)
+        let preferred = gem_create_on(&gem, 3 * P, u::AMDGPU_GEM_DOMAIN_VRAM).ok()?;
+        if !gem.object(both)?.system()
+            || !gem.object(preferred)?.system()
+            || gem.object(preferred)?.preferred_domains() != u64::from(u::AMDGPU_GEM_DOMAIN_VRAM)
         {
             return None;
         }
@@ -11272,7 +11274,7 @@ fn smoke_amdgpu_gem_places_buffers_in_card_vram() -> TestResult {
         close[0..4].copy_from_slice(&vram.to_le_bytes());
         let _ = crate::amdgpu_gem::dispatch(0x09, close.as_mut_ptr() as usize, &gem);
         let again = gem_create_on(&gem, 4 * P, u::AMDGPU_GEM_DOMAIN_VRAM).ok()?;
-        (!gem.object(again)?.system).then_some(())
+        (!gem.object(again)?.system()).then_some(())
     })();
     unregister_vram_heap(card);
     drop(gem);
@@ -11380,6 +11382,7 @@ fn smoke_amdgpu_gem_places_hidden_buffers_past_the_bar() -> TestResult {
             fb_base,
             fb_offset: 0x1_0000_0000,
             unmapped: Some(UnmappedHeap {
+                transfer: None,
                 pool: unmapped.clone(),
                 clear: engine.clone(),
             }),
@@ -11390,7 +11393,7 @@ fn smoke_amdgpu_gem_places_hidden_buffers_past_the_bar() -> TestResult {
     let result = (|| -> Result<(), &'static str> {
         let h = create(&gem, 2 * P, hidden).map_err(|_| "hidden create")?;
         let o = gem.object(h).ok_or("hidden object")?;
-        if o.system || o.cpu_visible() || o.phys != 0 || o.gpu != 0x1_1000_0000 {
+        if o.system() || o.cpu_visible() || o.phys() != 0 || o.gpu() != 0x1_1000_0000 {
             return Err("hidden buffer not past the BAR");
         }
         if *engine.calls.lock() != [(past, 2 * P)] || unmapped.available() != 2 * P {
@@ -13623,7 +13626,7 @@ fn smoke_amdgpu_gem_system_buffers_span_chunks() -> TestResult {
                 .map(|&f| Some(f))
                 .collect::<alloc::vec::Vec<_>>()
             || o.gpu_at(3 * P).is_some()
-            || frames[0] != o.phys
+            || frames[0] != o.phys()
         {
             return Err("frames and GPU addresses disagree");
         }
@@ -13708,7 +13711,7 @@ fn smoke_amdgpu_gem_mapping_outlives_gem_close() -> TestResult {
     let Some(mapping) = state.mapping_object(offset, 8192) else {
         return TestResult::Fail("the mapping's buffer");
     };
-    let weak = alloc::sync::Arc::downgrade(&mapping);
+    let weak = alloc::sync::Arc::downgrade(&state.object(handle).unwrap());
     let mut close = [0u8; 8];
     close[0..4].copy_from_slice(&handle.to_le_bytes());
     if dispatch(0x09, close.as_mut_ptr() as usize, &state).is_err()
@@ -13793,7 +13796,7 @@ fn smoke_amdgpu_gem_prime_export_import() -> TestResult {
     let Some(object) = weak.upgrade() else {
         return TestResult::Fail("buffer");
     };
-    if file.mmap_frames(4096, 4096) != Ok(alloc::vec![object.phys + 4096])
+    if file.mmap_frames(4096, 4096) != Ok(alloc::vec![object.phys() + 4096])
         || file.mmap_frames(4096, 8192).is_ok()
         || file.mmap_frames(100, 4096).is_ok()
         || file.stat().size != 8192

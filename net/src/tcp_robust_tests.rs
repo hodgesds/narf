@@ -21,11 +21,11 @@ use narf_lib::sync::IrqSafeSpinLock;
 use crate::arp_cache;
 use crate::iface;
 use crate::pkt::{ETH_HDR_LEN, IPV4_HDR_LEN};
-use crate::pkt_tcp::{ipv4_pseudo_checksum, TcpHeader, FLAG_ACK, FLAG_FIN, FLAG_RST};
+use crate::pkt_tcp::{ipv4_pseudo_checksum, TcpHeader, FLAG_ACK, FLAG_FIN, FLAG_RST, FLAG_SYN};
 use crate::route;
 use crate::tcp::core::{
-    self, __install_test_tcb, __with_tcb, __with_tcb_mut, close, handle_segment, lookup_tcb,
-    queue_ioctl, recv_errno, recv_peek_errno, send, tick_retransmit, TcpQueueIoctl,
+    self, __install_test_tcb, __with_tcb, __with_tcb_mut, close, handle_segment, listen,
+    lookup_tcb, queue_ioctl, recv_errno, recv_peek_errno, send, tick_retransmit, TcpQueueIoctl,
 };
 use crate::tcp::options::{encode_data_options, OptionsState, MAX_TCP_OPTION_SPACE};
 use crate::tcp::sack::SackBlock;
@@ -256,6 +256,235 @@ fn smoke_sack_blocks_fit_beside_timestamps() -> TestResult {
 }
 kernel_test_in!("net/tcp/robust", smoke_sack_blocks_fit_beside_timestamps);
 
+// ── Initial sequence numbers (RFC 6528) ─────────────────────────────────
+
+/// Spin until the 64 ns ISN clock has moved on.
+fn isn_clock_tick() {
+    let t0 = narf_scheduler::narf_time::monotonic_ns();
+    while narf_scheduler::narf_time::monotonic_ns() < t0 + 1_000 {
+        ::core::hint::spin_loop();
+    }
+}
+
+/// `secure_tcp_seq`: one 4-tuple's ISNs increase with time, so a reused
+/// tuple's new SYN is past the old connection's sequence space and a peer's
+/// TIME-WAIT takes it as a new connection. The old ISN was a multiplicative
+/// hash of the clock, below the previous incarnation's about half the time,
+/// and such a SYN is dropped as an old duplicate. Distinct tuples (and
+/// namespaces) get unrelated offsets.
+fn smoke_isn_monotonic_per_tuple() -> TestResult {
+    let (a, b) = ([10, 0, 2, 15], [10, 0, 2, 2]);
+    let mut prev = core::__secure_tcp_seq_for_test(0, a, b, 32_819, 17_782);
+    for _ in 0..64 {
+        isn_clock_tick();
+        let next = core::__secure_tcp_seq_for_test(0, a, b, 32_819, 17_782);
+        if (next.wrapping_sub(prev) as i32) <= 0 {
+            return TestResult::Fail("an ISN for the same 4-tuple did not increase");
+        }
+        prev = next;
+    }
+    let base = core::__secure_tcp_seq_for_test(0, a, b, 32_819, 17_782);
+    let others = [
+        core::__secure_tcp_seq_for_test(0, a, b, 32_820, 17_782),
+        core::__secure_tcp_seq_for_test(0, a, b, 32_819, 17_783),
+        core::__secure_tcp_seq_for_test(0, b, a, 32_819, 17_782),
+        core::__secure_tcp_seq_for_test(1, a, b, 32_819, 17_782),
+    ];
+    // The clock advances them all alike, so tuples apart by only a few ticks
+    // would mean the hash ignored the tuple.
+    if others
+        .iter()
+        .any(|&o| o.wrapping_sub(base).wrapping_add(1 << 20) < 1 << 21)
+    {
+        return TestResult::Fail("distinct 4-tuples got nearly the same ISN offset");
+    }
+    let (a6, b6) = (
+        [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        [0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+    );
+    let first = core::__secure_tcpv6_seq_for_test(a6, b6, 40_000, 443);
+    isn_clock_tick();
+    let second = core::__secure_tcpv6_seq_for_test(a6, b6, 40_000, 443);
+    if (second.wrapping_sub(first) as i32) <= 0 {
+        return TestResult::Fail("an IPv6 ISN for the same 4-tuple did not increase");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp/robust", smoke_isn_monotonic_per_tuple);
+
+// ── TIME-WAIT reuse ─────────────────────────────────────────────────────
+
+/// A bare SYN from `peer:pport` to `local:lport` at `seq`.
+fn syn(local: [u8; 4], lport: u16, peer: [u8; 4], pport: u16, seq: u32) -> Seg<'static> {
+    Seg {
+        src: peer,
+        dst: local,
+        sport: pport,
+        dport: lport,
+        seq,
+        ack: 0,
+        flags: FLAG_SYN,
+        window: 65535,
+        options: Vec::new(),
+        payload: &[],
+    }
+}
+
+fn syn_acks(frames: &[Vec<u8>]) -> usize {
+    frames
+        .iter()
+        .filter(|f| frame_flags(f) & (FLAG_SYN | FLAG_ACK) == FLAG_SYN | FLAG_ACK)
+        .count()
+}
+
+/// A new SYN for a 4-tuple in TIME-WAIT reopens it when its sequence number
+/// is past RCV.NXT (Linux `tcp_timewait_state_process` → `TCP_TW_SYN`, then
+/// `tcp_v4_rcv` hands it to the listener). Under connection churn through a
+/// NAT the peer reuses a port while our side still holds it in TIME-WAIT;
+/// dropping that SYN hung the new connection.
+fn smoke_time_wait_new_syn_reopens() -> TestResult {
+    let local = [10, 0, 96, 1];
+    let peer = reset("tcp-rob-twsyn", local);
+    if listen(local, 7_795, 16).is_err() {
+        return TestResult::Fail("setup: listen failed");
+    }
+    let tw = __install_test_tcb(local, 7_795, peer, 40_100, TcpState::TimeWait);
+    let rcv_nxt = __with_tcb(tw, |t| t.rcv_nxt).unwrap_or(0);
+    let _ = drain();
+    inject(syn(
+        local,
+        7_795,
+        peer,
+        40_100,
+        rcv_nxt.wrapping_add(100_000),
+    ));
+    if lookup_tcb(tw).is_some() {
+        return TestResult::Fail("a new SYN did not end TIME-WAIT");
+    }
+    if syn_acks(&drain()) != 1 {
+        return TestResult::Fail("the listener did not answer the new SYN with a SYN-ACK");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp/robust", smoke_time_wait_new_syn_reopens);
+
+/// An old duplicate SYN (sequence at or before RCV.NXT, no newer timestamp)
+/// leaves TIME-WAIT alone and is only ACKed; so is any SYN when nothing
+/// listens on the port.
+fn smoke_time_wait_old_syn_ignored() -> TestResult {
+    let local = [10, 0, 97, 1];
+    let peer = reset("tcp-rob-twold", local);
+    if listen(local, 7_796, 16).is_err() {
+        return TestResult::Fail("setup: listen failed");
+    }
+    let tw = __install_test_tcb(local, 7_796, peer, 40_101, TcpState::TimeWait);
+    let rcv_nxt = __with_tcb(tw, |t| t.rcv_nxt).unwrap_or(0);
+    let _ = drain();
+    inject(syn(local, 7_796, peer, 40_101, rcv_nxt.wrapping_sub(1_000)));
+    if __with_tcb(tw, |t| t.state) != Some(TcpState::TimeWait) {
+        return TestResult::Fail("an old duplicate SYN ended TIME-WAIT");
+    }
+    if syn_acks(&drain()) != 0 {
+        return TestResult::Fail("an old duplicate SYN opened a connection");
+    }
+    // No listener: the TIME-WAIT connection stays, whatever the sequence.
+    let tw2 = __install_test_tcb(local, 7_797, peer, 40_102, TcpState::TimeWait);
+    let rcv_nxt = __with_tcb(tw2, |t| t.rcv_nxt).unwrap_or(0);
+    inject(syn(
+        local,
+        7_797,
+        peer,
+        40_102,
+        rcv_nxt.wrapping_add(100_000),
+    ));
+    if __with_tcb(tw2, |t| t.state) != Some(TcpState::TimeWait) {
+        return TestResult::Fail("a SYN with no listener ended TIME-WAIT");
+    }
+    if syn_acks(&drain()) != 0 {
+        return TestResult::Fail("a SYN with no listener opened a connection");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp/robust", smoke_time_wait_old_syn_ignored);
+
+// ── Keepalive ───────────────────────────────────────────────────────────
+
+/// Arm keepalive (1 s idle / 1 s interval / 3 probes) on `id` and make it
+/// look idle for the full window, so the next tick is due.
+fn keepalive_idle(id: u32) {
+    let _ = __with_tcb_mut(id, |t| {
+        t.keepalive_enabled = true;
+        t.keepalive_idle_ns = 1_000_000_000;
+        t.keepalive_intvl_ns = 1_000_000_000;
+        t.keepalive_cnt = 3;
+        let window = narf_scheduler::narf_time::ns_to_cycles(10_000_000_000);
+        t.last_progress_cycles = narf_scheduler::narf_time::now_cycles().saturating_sub(window);
+    });
+}
+
+fn tick(id: u32) {
+    if let Some(arc) = lookup_tcb(id) {
+        tick_retransmit(&arc);
+    }
+}
+
+/// A keepalive probe the peer answers keeps the connection alive: the bare
+/// ACK at SND.UNA clears the probe count and restarts the idle clock (Linux
+/// `tcp_ack`: `icsk_probes_out = 0`, `rcv_tstamp`). Only ACKs that advanced
+/// SND.UNA used to count, so an idle connection died after `keepcnt`
+/// answered probes. Unanswered, it still dies with ETIMEDOUT.
+fn smoke_keepalive_answered_probe_keeps_connection() -> TestResult {
+    let local = [10, 0, 98, 1];
+    let peer = reset("tcp-rob-ka", local);
+    let id = established(local, 40_200, peer, 80);
+    let (snd_una, rcv_nxt) = __with_tcb(id, |t| (t.snd_una, t.rcv_nxt)).unwrap_or((0, 0));
+    for _ in 0..6 {
+        keepalive_idle(id);
+        let _ = drain();
+        tick(id);
+        if drain().is_empty() {
+            return TestResult::Fail("an idle connection sent no keepalive probe");
+        }
+        inject(Seg {
+            src: peer,
+            dst: local,
+            sport: 80,
+            dport: 40_200,
+            seq: rcv_nxt,
+            ack: snd_una,
+            flags: FLAG_ACK,
+            window: 65535,
+            options: Vec::new(),
+            payload: &[],
+        });
+        if __with_tcb(id, |t| t.keepalive_probes_sent) != Some(0) {
+            return TestResult::Fail(
+                "the answer to a keepalive probe did not reset the probe count",
+            );
+        }
+    }
+    // Unanswered: three probes, then the connection is dropped.
+    for _ in 0..4 {
+        let _ = __with_tcb_mut(id, |t| {
+            let window = narf_scheduler::narf_time::ns_to_cycles(10_000_000_000);
+            t.last_progress_cycles = narf_scheduler::narf_time::now_cycles().saturating_sub(window);
+        });
+        tick(id);
+    }
+    if lookup_tcb(id).is_some() {
+        return TestResult::Fail("unanswered keepalive probes never dropped the connection");
+    }
+    if recv_errno(id, &mut [0u8; 4]) != Err(narf_lib::errno::ETIMEDOUT as i32) {
+        return TestResult::Fail("a keepalive timeout must report ETIMEDOUT");
+    }
+    core::release(id);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_keepalive_answered_probe_keeps_connection
+);
+
 // ── Resets (RFC 5961) ───────────────────────────────────────────────────
 
 /// Fill the receive buffer so the advertised window is 0.
@@ -294,7 +523,8 @@ fn smoke_exact_rst_accepted_with_zero_window() -> TestResult {
     if __with_tcb(id, |t| t.recv_buf.window()).unwrap_or(1) != 0 {
         return TestResult::Fail("setup: the receive window did not close");
     }
-    let rcv_nxt = __with_tcb(id, |t| t.rcv_nxt).unwrap_or(0);
+    let (rcv_nxt, queued) =
+        __with_tcb(id, |t| (t.rcv_nxt, t.recv_buf.in_order_len())).unwrap_or((0, 0));
     inject(Seg {
         src: peer,
         dst: local,
@@ -310,7 +540,23 @@ fn smoke_exact_rst_accepted_with_zero_window() -> TestResult {
     if lookup_tcb(id).is_some() {
         return TestResult::Fail("an exact-sequence RST was ignored with a zero window");
     }
-    if recv_errno(id, &mut [0u8; 8]) != Err(narf_lib::errno::ECONNRESET as i32) {
+    // `tcp_done` keeps the receive queue: the full window is read first.
+    let (mut got, mut buf) = (0usize, [0u8; 4096]);
+    let end = loop {
+        match recv_errno(id, &mut buf) {
+            Ok(n) if n > 0 => {
+                if buf[..n].iter().any(|&b| b != 0x11) {
+                    return TestResult::Fail("unread bytes corrupted by the reset");
+                }
+                got += n;
+            }
+            other => break other,
+        }
+    };
+    if queued == 0 || got != queued {
+        return TestResult::Fail("the unread window was not readable after the reset");
+    }
+    if end != Err(narf_lib::errno::ECONNRESET as i32) {
         return TestResult::Fail("the reset was not reported as ECONNRESET");
     }
     core::release(id);

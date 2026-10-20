@@ -37,6 +37,58 @@ static INTERRUPTS: [AtomicU64; ENGINES] = [const { AtomicU64::new(0) }; ENGINES]
 /// Bumped when the device is reset or lost: work emitted before it can
 /// never signal, so every waiter that started earlier completes with error.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+static CHANGE: AtomicU64 = AtomicU64::new(0);
+static NEXT_CHANGE_WAITER: AtomicU64 = AtomicU64::new(1);
+static CHANGE_WAITERS: IrqSafeSpinLock<alloc::vec::Vec<(u64, Waker)>> =
+    IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+pub(crate) fn change_sequence() -> u64 {
+    CHANGE.load(Ordering::Acquire)
+}
+
+/// Wake every VMID/job waiter on any fence IRQ, or its hard deadline.
+/// Registration is per future, so concurrent clients cannot replace each
+/// other's wakers. Capturing the sequence before sampling prevents lost IRQs.
+pub(crate) async fn wait_change(observed: u64, deadline_ns: u64) {
+    struct Changed {
+        id: u64,
+        observed: u64,
+        sleep: narf_time::SleepUntil,
+    }
+    impl Future for Changed {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            {
+                let mut waiters = CHANGE_WAITERS.lock();
+                if let Some((_, waker)) = waiters.iter_mut().find(|(id, _)| *id == self.id) {
+                    if !waker.will_wake(cx.waker()) {
+                        *waker = cx.waker().clone();
+                    }
+                } else {
+                    waiters.push((self.id, cx.waker().clone()));
+                }
+            }
+            if CHANGE.load(Ordering::Acquire) != self.observed {
+                return Poll::Ready(());
+            }
+            Pin::new(&mut self.sleep).poll(cx)
+        }
+    }
+    impl Drop for Changed {
+        fn drop(&mut self) {
+            CHANGE_WAITERS.lock().retain(|(id, _)| *id != self.id);
+        }
+    }
+    Changed {
+        id: NEXT_CHANGE_WAITER.fetch_add(1, Ordering::Relaxed),
+        observed,
+        sleep: narf_time::SleepUntil::new(
+            narf_time::Deadline::after_ns(deadline_ns.saturating_sub(narf_time::monotonic_ns()))
+                .as_instant(),
+        ),
+    }
+    .await
+}
 
 /// Recovery/device-loss hook (`amdgpu_fence_driver_force_completion`):
 /// abandon every outstanding wait and wake it to complete with its error.
@@ -52,6 +104,11 @@ pub fn generation() -> u64 {
 /// IH hook: an engine reported completion. Safe from IRQ or task context:
 /// the stored waker is only woken by reference, never dropped here.
 pub fn notify(engine: Engine) {
+    CHANGE.fetch_add(1, Ordering::AcqRel);
+    // Wake by reference only: IRQ context never allocates or drops a waker.
+    for (_, waker) in CHANGE_WAITERS.lock().iter() {
+        waker.wake_by_ref();
+    }
     INTERRUPTS[engine as usize].fetch_add(1, Ordering::Relaxed);
     if let Some(waker) = WAKERS[engine as usize].lock().as_ref() {
         waker.wake_by_ref();
@@ -207,5 +264,62 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/cp-navi22",
         navi22_fence_wait_is_bounded_and_wrap_safe
+    );
+}
+
+#[cfg(feature = "kernel-test")]
+mod change_tests {
+    use super::*;
+    use alloc::sync::Arc;
+    use core::sync::atomic::AtomicUsize;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+    struct Counter(AtomicUsize);
+    impl alloc::task::Wake for Counter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    fn rdna2_fence_changes_wake_all_and_cancel_cleanly() -> TestResult {
+        let a = Arc::new(Counter(AtomicUsize::new(0)));
+        let b = Arc::new(Counter(AtomicUsize::new(0)));
+        let wa = Waker::from(a.clone());
+        let wb = Waker::from(b.clone());
+        let mut ca = Context::from_waker(&wa);
+        let mut cb = Context::from_waker(&wb);
+        let sequence = change_sequence();
+        let deadline = narf_time::monotonic_ns().saturating_add(1_000_000_000);
+        let before = CHANGE_WAITERS.lock().len();
+        let mut fa = alloc::boxed::Box::pin(wait_change(sequence, deadline));
+        let mut fb = alloc::boxed::Box::pin(wait_change(sequence, deadline));
+        if fa.as_mut().poll(&mut ca).is_ready() || fb.as_mut().poll(&mut cb).is_ready() {
+            return TestResult::Fail("fence wait completed without IRQ/deadline");
+        }
+        notify(Engine::Sdma2);
+        if a.0.load(Ordering::Relaxed) == 0
+            || b.0.load(Ordering::Relaxed) == 0
+            || fa.as_mut().poll(&mut ca).is_pending()
+            || fb.as_mut().poll(&mut cb).is_pending()
+        {
+            return TestResult::Fail("IRQ lost or only one client woke");
+        }
+        drop(fa);
+        drop(fb);
+        let sequence = change_sequence();
+        notify(Engine::Gfx);
+        let mut raced = core::pin::pin!(wait_change(sequence, deadline));
+        if raced.as_mut().poll(&mut ca).is_pending() {
+            return TestResult::Fail("IRQ between sampling and registration was lost");
+        }
+        if CHANGE_WAITERS.lock().len() != before {
+            return TestResult::Fail("completed/cancelled fence wait retained a waker");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/rdna2",
+        rdna2_fence_changes_wake_all_and_cancel_cleanly
     );
 }

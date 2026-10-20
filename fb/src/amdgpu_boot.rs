@@ -1,8 +1,8 @@
 //! Boot-only CPU framebuffer handoff for discrete AMD GDDR6 training. This is not a
 //! runtime pause API: mmap writers cannot be stopped by a software flag.
 use core::sync::atomic::{AtomicBool, Ordering};
-use narf_drivers_gpu::amdgpu_navi22_platform as platform;
 use narf_drivers_gpu::amdgpu_navi48_platform as navi48;
+use narf_drivers_gpu::amdgpu_rdna2_platform as platform;
 use narf_init::InitResult;
 
 static PAUSED: AtomicBool = AtomicBool::new(false);
@@ -35,6 +35,8 @@ pub(super) fn start() -> InitResult {
     if ATTEMPTED.swap(true, Ordering::AcqRel) {
         return InitResult::NotPresent;
     }
+    let options =
+        narf_drivers_gpu::amdgpu_rdna2::options::BootOptions::parse(narf_boot::args().raw());
     let framebuffer = *super::BOOT_GENERIC.lock();
     let navi48 = narf_drivers_gpu::amdgpu::with_controller(|g| {
         g.chip.did == narf_drivers_gpu::amdgpu::NAVI48
@@ -93,11 +95,9 @@ pub(super) fn start() -> InitResult {
     // pumps, not the executor. No spinlock guard is held; spin works even if
     // this boot profile has not enabled interrupts yet.
     // SAFETY: all CPU writers remain paused until successful terminal return.
-    // `amdgpu.navi22_accel`: advertise native client submission (Mesa
-    // radeonsi/RADV). Off by default until validated on hardware.
-    narf_drivers_gpu::amdgpu_info_navi22::set_accel(
-        narf_boot::args().has_flag("amdgpu.navi22_accel"),
-    );
+    // `amdgpu.rdna2_accel`: advertise native client submission (Mesa
+    // radeonsi/RADV). On by default; `amdgpu.rdna2_accel=0` turns it off.
+    narf_drivers_gpu::amdgpu_info_navi22::set_accel(options.accel);
     navi48::set_shader_proof(narf_boot::args().has_flag("amdgpu.shader_proof"));
     navi48::set_media_proof(narf_boot::args().has_flag("amdgpu.media_proof"));
     navi48::set_media_clients(narf_boot::args().has_flag("amdgpu.navi48_media"));
@@ -113,7 +113,7 @@ pub(super) fn start() -> InitResult {
     } else {
         let args = narf_boot::args();
         platform::set_display_engines(
-            args.has_flag("amdgpu.native_display") || args.has_flag("amdgpu.display_probe"),
+            options.native_display || args.has_flag("amdgpu.display_probe"),
         );
         // SAFETY: the retained prepared owner and paused CPU writers persist.
         let result = narf_scheduler::block_on_spin(unsafe { platform::run() });
@@ -142,24 +142,23 @@ pub(super) fn start() -> InitResult {
         if paused() { "quarantined" } else { "available" }
     );
     if ok && !navi48 {
-        // Display detection programs the HPD, AUX and DDC engines, so the
-        // firmware bring-up stays free of display side effects unless the
-        // native display (or an explicit probe) was requested. Both flags
-        // are off by default until a board validates the path.
-        let native = narf_boot::args().has_flag("amdgpu.native_display");
+        // Display detection programs the HPD, AUX and DDC engines. RDNA2
+        // native display is on by default (`amdgpu.native_display=0` keeps
+        // the GOP framebuffer and leaves those engines untouched).
+        let native = options.native_display;
         if native || narf_boot::args().has_flag("amdgpu.display_probe") {
             report_displays();
         }
-        // `amdgpu.navi22_multi`: light every connected sink (KMS CRTCs 1..).
-        narf_drivers_gpu::amdgpu_navi22_kms::set_auto_multi(
-            narf_boot::args().has_flag("amdgpu.navi22_multi"),
-        );
+        // `amdgpu.rdna2_multi`: light every connected sink (KMS CRTCs 1..).
+        narf_drivers_gpu::amdgpu_rdna2_kms::set_auto_multi(options.multi);
         if native {
             navi22_native_display();
         }
-        // Power saving (GFXOFF, clock gating, memory DPM, ...) only on an
-        // explicit `amdgpu.navi22_pg=` list; a default boot programs none.
-        if let Some(value) = narf_boot::args().value("amdgpu.navi22_pg") {
+        // Power saving (GFXOFF, clock gating, memory DPM, ...) runs after the
+        // native modeset so display-dependent features see its admission;
+        // each feature still passes its own gate. `amdgpu.rdna2_pg=none`
+        // programs none.
+        if let Some(value) = options.power_saving {
             // SAFETY: after a successful firmware run; the TDR sampler takes
             // GFXOFF references and no other GC MMIO client runs yet.
             let _ = narf_scheduler::block_on_spin(unsafe { platform::power_saving(value) });
@@ -375,20 +374,23 @@ fn completed(generation: &str, result: impl core::fmt::Debug, status: impl core:
     );
 }
 
-/// Opt-in native Navi22 HDMI scanout, first drawn as a colour-bar test
-/// pattern. On success the published front buffer moves the console (and
+/// Native RDNA2 HDMI/DP scanout (default; `amdgpu.native_display=0` keeps
+/// the GOP framebuffer), first drawn as a colour-bar test pattern. On success the published front buffer moves the console (and
 /// the fb status panel) there and the amdgpu card gets native KMS state; the
 /// display monitor then serves DRM modesets, flips and GPU recovery
 /// relights. On failure the retained owner reports where it stopped and the
-/// monitor still publishes the connectors. `amdgpu.navi22_hw_cursor` opts in
-/// to the DCN3.0 hardware cursor.
+/// monitor still publishes the connectors. The DCN3.0 hardware cursor is on
+/// unless `amdgpu.rdna2_hw_cursor=0`.
 fn navi22_native_display() {
     use core::fmt::Write;
-    platform::set_hw_cursor(narf_boot::args().has_flag("amdgpu.navi22_hw_cursor"));
+    platform::set_hw_cursor(
+        narf_drivers_gpu::amdgpu_rdna2::options::BootOptions::parse(narf_boot::args().raw())
+            .hw_cursor,
+    );
     // SAFETY: final synchronous boot initcall after a successful firmware run;
     // no other display client exists and only the console writes scanout.
     let lit = narf_scheduler::block_on_spin(unsafe {
-        platform::modeset_displays(narf_drivers_gpu::amdgpu_navi22_modeset::test_pattern)
+        platform::modeset_displays(narf_drivers_gpu::amdgpu_rdna2_modeset::test_pattern)
     });
     let _ = match lit {
         Ok(out) => writeln!(
@@ -419,7 +421,7 @@ fn navi22_native_display() {
 /// changes no stream, scanout or framebuffer state.
 fn report_displays() {
     use core::fmt::Write;
-    use narf_drivers_gpu::amdgpu_navi22_display::{Detection, Signal};
+    use narf_drivers_gpu::amdgpu_rdna2_display::{Detection, Signal};
     let reports = match narf_scheduler::block_on_spin(platform::detect_displays()) {
         Ok(reports) => reports,
         Err(error) => {

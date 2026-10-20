@@ -23,6 +23,46 @@ use narf_filesystem::{FileOps, MmapLifetime};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::{AddressSpaceError, FileFaultError, MappingReceipt, PhysAddr};
 
+/// Snapshot process roots; the memory transaction's metadata census refuses
+/// roots still being built by fork or retiring outside this snapshot.
+pub(crate) fn relocate_device_frames(
+    old: &[u64],
+    new: &[u64],
+    aliases: fn(u64) -> usize,
+    commit: &mut dyn FnMut() -> Result<(), FsError>,
+) -> Result<(), FsError> {
+    let mut spaces = crate::handlers::all_address_spaces();
+    if let Some(current) = crate::handlers::active_user_as() {
+        if !spaces.iter().any(|space| Arc::ptr_eq(space, &current)) {
+            spaces.push(current);
+        }
+    }
+    let old: Vec<_> = old.iter().copied().map(PhysAddr::new).collect();
+    let new: Vec<_> = new.iter().copied().map(PhysAddr::new).collect();
+    let mut failure = None;
+    // SAFETY: the driver retains both allocations and card admission through
+    // this synchronous call. Process Arc snapshots retain live roots; the
+    // external-frame census covers unpublished fork metadata too.
+    let result = unsafe {
+        narf_memory::address_space::with_revoked_shared_frames(&spaces, &old, &new, aliases, || {
+            match commit() {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    failure = Some(error);
+                    Err(AddressSpaceError::NotImplemented)
+                }
+            }
+        })
+    };
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    result.map_err(|error| match error {
+        AddressSpaceError::AllocationFailed => FsError::OutOfMemory,
+        _ => FsError::Busy,
+    })
+}
+
 #[derive(Clone)]
 struct FileWriteback {
     offset: u64,

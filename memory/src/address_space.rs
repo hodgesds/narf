@@ -26,9 +26,16 @@ use narf_lib::sync::IrqSafeSpinLock;
 mod region_index;
 #[path = "remote_access.rs"]
 mod remote_access;
+#[path = "shared_relocation.rs"]
+mod shared_relocation;
 use crate::region_backing::RegionBacking;
 use region_index::RegionIndex;
 pub use remote_access::{RemoteAccess, RemoteBuf};
+pub use shared_relocation::with_revoked_shared_frames;
+#[cfg(feature = "kernel-test")]
+pub(crate) use shared_relocation::{
+    __shared_alias_census, __test_fail_shared_revocation_prepare_at,
+};
 
 /// Serializes creation and replacement of externally-owned shared aliases.
 ///

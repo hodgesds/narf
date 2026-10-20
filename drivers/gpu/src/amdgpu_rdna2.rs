@@ -9,6 +9,16 @@
 
 #[path = "amdgpu_rdna2_golden.rs"]
 pub mod golden;
+#[path = "amdgpu_rdna2_metadata.rs"]
+pub mod metadata;
+#[path = "amdgpu_rdna2_options.rs"]
+pub mod options;
+
+// gc_10_1_0_offset.h; BASE_IDX 0 for every entry.
+pub const READ_MMR_GC: &[u32] = &[
+    0x0da4, 0x0da2, 0x0da5, 0x0da6, 0x0dae, 0x0daf, 0x0f40, 0x0f3d, 0x0f3e, 0x0f3c, 0x0e28, 0x0e29,
+    0x0e27, 0x0e25, 0x0e26, 0x0e24, 0x13de,
+];
 
 /// Serialized PowerPlay SKU and board boundaries. Beige Goby's original
 /// fbe8115c6ab7 interface remains in shipping firmware alongside the newer ABI.
@@ -21,6 +31,55 @@ pub struct PowerTableLayout {
     pub board_end: usize,
 }
 impl Profile {
+    /// gmc_v10_0_sw_init: MALL size for the discrete GC 10.3 revisions.
+    pub const fn mall_bytes(&self) -> u64 {
+        let mib = match self.gc_version {
+            (10, 3, 0) => 128,
+            (10, 3, 2) => 96,
+            (10, 3, 4) => 32,
+            (10, 3, 5) => 16,
+            _ => 0,
+        };
+        mib * 1024 * 1024
+    }
+    /// Bare-metal `nv_common_early_init` clock-gating flags. Media applies
+    /// its own flags; Navi24 has no JPEG clock-gating capability flag.
+    pub const fn clock_gating_flags(&self) -> u64 {
+        let common = (1 << 0)
+            | (1 << 2)
+            | (1 << 3)
+            | (1 << 8)
+            | (1 << 9)
+            | (1 << 15)
+            | (1 << 16)
+            | (1 << 20)
+            | (1 << 24)
+            | (1 << 27);
+        match self.gc_version {
+            (10, 3, 0 | 2 | 4) => common | (1 << 30),
+            (10, 3, 5) => common,
+            _ => 0,
+        }
+    }
+    /// Bare-metal `nv_common_early_init` power-gating capability flags.
+    pub const fn power_gating_flags(&self) -> u32 {
+        let common = (1 << 13) | (1 << 14) | (1 << 15) | (1 << 16);
+        match self.gc_version {
+            (10, 3, 0 | 2 | 4) => common | (1 << 17),
+            (10, 3, 5) => common,
+            _ => 0,
+        }
+    }
+    /// `sienna_cichlid_set_smc_driver_if_version` (diagnostic comparison).
+    pub const fn smu_driver_interface(&self) -> u32 {
+        match self.psp_version {
+            (11, 0, 7) => 0x40,
+            (11, 0, 11) => 0xe,
+            (11, 0, 12) => 0xf,
+            (11, 0, 13) => 0xd,
+            _ => 0,
+        }
+    }
     pub fn power_table_layout(&self, smc_bytes: usize) -> Option<PowerTableLayout> {
         let (format_revision, format_id, board_start, board_end) = match (self.asic, smc_bytes) {
             ("navi21", 1668) => (15, 0x80, 1344, 1636),
@@ -42,6 +101,16 @@ impl Profile {
 
 /// Compatible navi10_ih backends; discovery remains authoritative per board.
 pub const IH_OSSSYS_VERSIONS: &[(u8, u8, u8)] = &[(5, 0, 0), (5, 0, 1), (5, 0, 2), (5, 0, 3)];
+
+/// Linux's SMUIO11 ROM callback selection. The newer callback forces ROM
+/// clocks on when ROM_MGCG is absent; the older callback performs no I/O.
+pub const fn smuio_rom_forced_on(version: (u8, u8, u8)) -> Option<bool> {
+    match version {
+        (11, 0, 6 | 10 | 11) => Some(true),
+        (11, 0, 0 | 2 | 3 | 4 | 7 | 8) => Some(false),
+        _ => None,
+    }
+}
 
 /// One discrete RDNA2 ASIC, independently of its marketed board name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
