@@ -2337,6 +2337,9 @@ struct CrtcState {
     /// The primary plane format DRM's framebuffer holds (XRGB8888 until a
     /// client sets another): the surface format of the next lighting.
     format: SurfaceFormat,
+    /// DRM's planes on the CRTC beyond a full-frame unscaled primary (the
+    /// primary's placement, the overlays): the next lighting's planes.
+    planes: boot::PlaneSetup,
     /// The lit sink: EDID, running timing and every offered timing.
     shown: Option<([u8; 128], Timing, Vec<Timing>)>,
     /// The lit configuration's board inputs and this display's admitted
@@ -2364,6 +2367,7 @@ impl CrtcState {
             retiring: false,
             requested: None,
             format: SurfaceFormat::Xrgb8888,
+            planes: boot::PlaneSetup::NONE,
             shown: None,
             admitted: None,
             route: None,
@@ -2758,13 +2762,21 @@ fn publish_console(boot: &boot::ColdBoot, pipe: Option<u8>) {
 async unsafe fn adopt(boot: &mut boot::ColdBoot, m: &Modeset) {
     let pipe = m.pipe;
     // Without a back buffer (allocation failed) DRM frames fall back to
-    // copies onto the visible front.
+    // copies onto the visible front. Each overlay gets one too.
     // SAFETY: the caller's obligations; touches only owned VRAM and HDP.
     let _ = unsafe { boot.prepare_display_back_buffer(pipe).await };
-    present_slot(pipe).native.store(
-        boot.display_back_framebuffer(pipe).is_ok(),
-        Ordering::Release,
-    );
+    let overlay_pipes = m.scanout.overlays.map(|o| o.map(|o| o.pipe));
+    let mut backed = boot.display_back_framebuffer(pipe).is_ok();
+    for &q in overlay_pipes.iter().flatten() {
+        // SAFETY: as above.
+        let _ = unsafe { boot.prepare_display_plane_back_buffer(pipe, q).await };
+        backed &= boot.display_back_framebuffer(q).is_ok();
+    }
+    *present_slot(pipe).shown.lock() = PlanesShown {
+        planes: m.selection.planes,
+        overlay_pipes,
+    };
+    present_slot(pipe).native.store(backed, Ordering::Release);
     // Its timing generator restarted: the vblank count continues.
     restart_vblank(pipe);
     let s = &m.selection;
@@ -2885,9 +2897,10 @@ async unsafe fn light_displays(
             let (colorspace, hdr) = connector_color(&outputs, k);
             crate::amdgpu_navi48_boot::set_output_color(k as u8, colorspace, hdr);
         }
-        // Display k lights on pipe k with its CRTC's plane format.
+        // Display k lights on pipe k with its CRTC's plane format and planes.
         for (k, c) in outputs.crtcs.iter_mut().enumerate() {
             crate::amdgpu_navi48_boot::set_plane_format(k as u8, c.format);
+            crate::amdgpu_navi48_boot::set_plane_setup(k as u8, c.planes);
             if c.active {
                 c.admitted = None;
             }
@@ -3041,6 +3054,8 @@ struct PresentSlot {
     /// The fourcc of the surface the display scans out: frames of another
     /// format wait for the relight that switches it.
     format: core::sync::atomic::AtomicU32,
+    /// The planes it shows.
+    shown: narf_lib::sync::IrqSafeSpinLock<PlanesShown>,
     next: narf_lib::sync::IrqSafeSpinLock<Option<Frame>>,
 }
 impl PresentSlot {
@@ -3049,6 +3064,10 @@ impl PresentSlot {
             native: AtomicBool::new(false),
             presenting: AtomicBool::new(false),
             format: core::sync::atomic::AtomicU32::new(SurfaceFormat::Xrgb8888.fourcc()),
+            shown: narf_lib::sync::IrqSafeSpinLock::new(PlanesShown {
+                planes: boot::PlaneSetup::NONE,
+                overlay_pipes: [None; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
+            }),
             next: narf_lib::sync::IrqSafeSpinLock::new(None),
         }
     }
@@ -3058,18 +3077,49 @@ fn present_slot(display: u8) -> &'static PresentSlot {
     &PRESENT[usize::from(display).min(PRESENT.len() - 1)]
 }
 
-/// A DRM client's frame (in the scanout's surface format) in a
-/// kernel-mapped dumb buffer, and the flip-complete ticket (see
-/// `drm::card::FlipLog`) its flip completes.
+/// One plane's DRM framebuffer: a kernel-mapped dumb buffer, its pitch,
+/// size and fourcc. The plane's source rectangle (the shown planes') is
+/// what the presenter copies out of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaneFrame {
+    pub phys: u64,
+    pub pitch: u32,
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,
+}
+
+/// A DRM client's frame: a framebuffer for each plane it updates (the
+/// primary, the overlays bottom first; None keeps a plane's content), and
+/// the flip-complete ticket (see `drm::card::FlipLog`) its flip completes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Frame {
-    phys: u64,
-    pitch: u32,
-    width: u32,
-    height: u32,
+    primary: Option<PlaneFrame>,
+    overlays: [Option<PlaneFrame>; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
     ticket: Option<u64>,
-    /// The framebuffer's fourcc.
-    format: u32,
+}
+impl Frame {
+    /// `next` arriving while `self` still waits: each plane's newest
+    /// framebuffer, the event of both completing with the flip.
+    fn merged(self, next: Self) -> Self {
+        let mut overlays = self.overlays;
+        for (o, n) in overlays.iter_mut().zip(next.overlays) {
+            *o = n.or(*o);
+        }
+        Self {
+            primary: next.primary.or(self.primary),
+            overlays,
+            ticket: next.ticket.max(self.ticket),
+        }
+    }
+}
+
+/// The planes a display shows: its lit plane configuration and the pipe
+/// of each overlay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlanesShown {
+    planes: boot::PlaneSetup,
+    overlay_pipes: [Option<u8>; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
 }
 
 /// Whether `present_frame` on `display` would present through a hardware
@@ -3239,10 +3289,42 @@ pub fn present_frame(
     ticket: Option<u64>,
     format: u32,
 ) -> bool {
-    let fmt = SurfaceFormat::from_fourcc(format);
-    let bytes = fmt.map_or(0, SurfaceFormat::bytes_per_pixel);
+    let primary = PlaneFrame {
+        phys,
+        pitch,
+        width,
+        height,
+        format,
+    };
+    present_planes(
+        display,
+        Some(primary),
+        [None; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
+        ticket,
+    )
+}
+
+/// `present_frame` for an atomic commit's planes on display `display`:
+/// each updated plane's framebuffer (the primary's and each overlay's,
+/// bottom first; None keeps that plane's content). Their copies flip
+/// together at one VUPDATE. An overlay's frame in a format other than the
+/// one the display shows it in waits for the relight that switches it,
+/// as a primary's does.
+pub fn present_planes(
+    display: u8,
+    primary: Option<PlaneFrame>,
+    overlays: [Option<PlaneFrame>; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
+    ticket: Option<u64>,
+) -> bool {
+    let fits = |f: &PlaneFrame| {
+        let bytes = SurfaceFormat::from_fourcc(f.format).map_or(0, SurfaceFormat::bytes_per_pixel);
+        f.width != 0 && f.height != 0 && u64::from(f.pitch) >= u64::from(f.width) * u64::from(bytes)
+    };
     let k = usize::from(display);
-    let shown = k < PRESENT.len() && present_slot(display).format.load(Ordering::Acquire) == format;
+    let format = primary.map(|f| f.format);
+    let fmt = format.and_then(SurfaceFormat::from_fourcc);
+    let shown = k < PRESENT.len()
+        && format.is_none_or(|f| present_slot(display).format.load(Ordering::Acquire) == f);
     let switching = !shown
         && fmt.is_some()
         && OUTPUTS
@@ -3251,9 +3333,9 @@ pub fn present_frame(
             .get(k)
             .is_some_and(|c| Some(c.format) == fmt);
     if !(native_present_ready(display) && shown || switching)
-        || width == 0
-        || height == 0
-        || u64::from(pitch) < u64::from(width) * u64::from(bytes)
+        || primary.is_some_and(|f| !fits(&f))
+        || overlays.iter().flatten().any(|f| !fits(f))
+        || (primary.is_none() && overlays.iter().all(Option::is_none))
     {
         complete_flip(display, ticket, None);
         return false;
@@ -3261,15 +3343,15 @@ pub fn present_frame(
     let slot = present_slot(display);
     {
         let mut next = slot.next.lock();
-        // A replaced frame's event completes with the frame replacing it.
-        let ticket = ticket.max(next.and_then(|f| f.ticket));
-        *next = Some(Frame {
-            phys,
-            pitch,
-            width,
-            height,
+        let frame = Frame {
+            primary,
+            overlays,
             ticket,
-            format,
+        };
+        // A replaced frame's event completes with the frame replacing it.
+        *next = Some(match *next {
+            Some(old) => old.merged(frame),
+            None => frame,
         });
     }
     if shown && !slot.presenting.swap(true, Ordering::AcqRel) {
@@ -3309,20 +3391,25 @@ async fn presenter(display: u8) {
         let result = {
             let mut owner = OWNER.lock().await;
             // A relight in another format since the frame was queued.
-            if slot.format.load(Ordering::Acquire) != frame.format {
+            if frame
+                .primary
+                .is_some_and(|f| slot.format.load(Ordering::Acquire) != f.format)
+            {
                 complete_flip(display, frame.ticket, None);
                 continue;
             }
             match owner.as_mut() {
                 // SAFETY: the owner lock serializes display writers; the
-                // frame's dumb buffer stays valid under DRM's buffer rules.
+                // frame's dumb buffers stay valid under DRM's buffer rules.
                 Some(boot) => match unsafe { present_native(boot, display, frame).await } {
                     // The vblank the flip latched in, as DRM counts it.
-                    Ok((before, after, _)) => {
+                    Ok(Some((before, after))) => {
                         let latched = read_vblank(boot, display);
                         follow_flip(before, after).await;
                         Ok(latched)
                     }
+                    // Nothing this lighting shows: complete in place.
+                    Ok(None) => Ok(None),
                     Err(e) => Err(e),
                 },
                 None => Err(crate::amdgpu_dcn401_otg::Error::Busy),
@@ -3344,46 +3431,92 @@ async fn presenter(display: u8) {
     }
 }
 
-/// Copy `frame` into the back buffer of the live pipe, then flip to it.
-/// Returns the published front before and after, and the flip.
+/// Copy each plane of `frame` into its back buffer on display `pipe`'s
+/// live scanout, then flip those planes together. Returns the published
+/// front before and after, or None when the frame updates no plane the
+/// display shows.
 /// # Safety
-/// The caller holds the owner lock; `frame` names a mapped dumb buffer.
+/// The caller holds the owner lock; `frame` names mapped dumb buffers.
 async unsafe fn present_native(
     boot: &mut boot::ColdBoot,
     pipe: u8,
     frame: Frame,
-) -> Result<
-    (GenericFb, GenericFb, crate::amdgpu_dcn401_otg::FlipDone),
-    crate::amdgpu_dcn401_otg::Error,
-> {
+) -> Result<Option<(GenericFb, GenericFb)>, crate::amdgpu_dcn401_otg::Error> {
     // A previous presenter may have been cancelled while draining the old
     // front after a successful flip. Finish that barrier before reusing it.
     crate::scanout_access::wait_retired().await;
-    let back = boot.display_back_framebuffer(pipe)?;
-    let width = frame.width.min(back.width);
+    let shown = *present_slot(pipe).shown.lock();
+    let mut planes = 0u8;
+    if let Some(f) = frame.primary {
+        let origin = shown.planes.primary.map_or((0, 0), |g| (g.src_x, g.src_y));
+        // SAFETY: the caller's obligations.
+        unsafe { copy_plane(boot, pipe, pipe, f, origin) }.await?;
+        planes |= 1;
+    }
+    for (k, f) in frame.overlays.iter().enumerate() {
+        let (Some(f), Some(o), Some(q)) = (f, shown.planes.overlays[k], shown.overlay_pipes[k])
+        else {
+            continue;
+        };
+        // An overlay shown in another format waits for its relight.
+        if Some(o.format) != SurfaceFormat::from_fourcc(f.format) {
+            continue;
+        }
+        // SAFETY: the caller's obligations.
+        unsafe { copy_plane(boot, pipe, q, *f, (o.geometry.src_x, o.geometry.src_y)) }.await?;
+        planes |= 1 << (k + 1);
+    }
+    if planes == 0 {
+        return Ok(None);
+    }
+    let before = boot.display_scanout_framebuffer(pipe)?;
+    // SAFETY: the back buffers hold the complete frame; no other writer
+    // touches them until the next flip (the owner lock is held).
+    unsafe { boot.flip_display_planes(pipe, planes).await }?;
+    Ok(Some((before, boot.display_scanout_framebuffer(pipe)?)))
+}
+
+/// Copy the source rectangle at `origin` of framebuffer `f` into the back
+/// buffer of display `display`'s plane on `plane_pipe` (its surface is the
+/// rectangle's size), row by row.
+/// # Safety
+/// As for `present_native`.
+async unsafe fn copy_plane(
+    boot: &mut boot::ColdBoot,
+    display: u8,
+    plane_pipe: u8,
+    f: PlaneFrame,
+    (sx, sy): (u32, u32),
+) -> Result<(), crate::amdgpu_dcn401_otg::Error> {
+    let back = boot.display_back_framebuffer(plane_pipe)?;
+    let cpp = u32::from(back.bpp / 8);
+    let width = f.width.saturating_sub(sx).min(back.width);
     // The row's pixels as packed 32-bit words; an odd RGB565 row ends in a
     // half word, read alone so the copy never reads past the row.
-    let bytes = width as usize * usize::from(back.bpp / 8);
+    let bytes = (width * cpp) as usize;
     let mut row = alloc::vec![0u32; bytes.div_ceil(4)];
-    for y in 0..frame.height.min(back.height) {
-        let at = frame.phys + u64::from(y) * u64::from(frame.pitch);
+    for y in 0..f.height.saturating_sub(sy).min(back.height) {
+        let at = f.phys + u64::from(sy + y) * u64::from(f.pitch) + u64::from(sx * cpp);
         // SAFETY: a kernel-mapped dumb buffer row of at least `bytes` bytes
-        // (pitch >= width * bytes per pixel was checked when queued).
+        // past the origin (pitch >= width * bytes per pixel was checked when
+        // queued, and the rectangle lies within the framebuffer).
         unsafe {
             let src = narf_memory::PhysAddr::new(at).kernel_ptr::<u8>();
             core::ptr::copy_nonoverlapping(src, row.as_mut_ptr().cast::<u8>(), bytes);
         }
         // SAFETY: serialized retained owner; caller excludes writers.
-        unsafe { boot.upload_display_back(pipe, 0, y, &row) }?;
+        unsafe {
+            if plane_pipe == display {
+                boot.upload_display_back(display, 0, y, &row)
+            } else {
+                boot.upload_display_plane_back(display, plane_pipe, 0, y, &row)
+            }
+        }?;
         if y % 64 == 63 {
             narf_scheduler::yield_now().await;
         }
     }
-    let before = boot.display_scanout_framebuffer(pipe)?;
-    // SAFETY: the back buffer holds the complete frame; no other writer
-    // touches it until the next flip (the owner lock is held).
-    let done = unsafe { boot.flip_display(pipe).await }?;
-    Ok((before, boot.display_scanout_framebuffer(pipe)?, done))
+    Ok(())
 }
 
 /// Show a premultiplied ARGB8888 cursor (at most 64x64) on a live pipe.
@@ -3841,6 +3974,151 @@ pub fn request_display_format(display: u8, fourcc: u32) -> bool {
     }
 }
 
+/// Record DRM's planes on display `display`'s CRTC beyond a full-frame
+/// unscaled primary: the primary's placement and the overlays (bottom
+/// first). A running display showing other planes is lit again with them
+/// (amdgpu_dm's full update; the native path relights). False for a
+/// display past the fourth.
+pub fn request_display_planes(display: u8, setup: boot::PlaneSetup) -> bool {
+    match OUTPUTS.lock().crtcs.get_mut(usize::from(display)) {
+        Some(c) => {
+            c.planes = setup;
+            true
+        }
+        None => false,
+    }
+}
+
+/// The planes display `display` would light with.
+pub fn requested_display_planes(display: u8) -> boot::PlaneSetup {
+    OUTPUTS
+        .lock()
+        .crtcs
+        .get(usize::from(display))
+        .map_or(boot::PlaneSetup::NONE, |c| c.planes)
+}
+
+/// Why `display_admits_planes` refused a plane configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanesRefused {
+    /// The display is not lit on that connector and timing, so its
+    /// configuration cannot be admitted (another mode needs its own lighting).
+    NotLit,
+    /// A plane's surface or placement fails staging's checks (SPL).
+    Plane,
+    /// The planes need more pipes than the configuration has free.
+    Pipes,
+    /// DML21 cannot carry the configuration (bandwidth, clocks, latency).
+    Bandwidth,
+}
+
+/// Whether display `display` can show the planes `setup` with its primary
+/// in `fourcc`, in `mode` (its current timing when None) on its routed
+/// connector, or on `connector` when the same request routes it there: the
+/// configuration of every lit display, with this display's planes, must be
+/// DML21-admitted together (dc_validate_global_state), each plane must pass
+/// staging's SPL checks on its pipes, and every plane must get a pipe of
+/// its own (two on an ODM 2:1 stream) beside the other displays'. The
+/// full-frame unscaled primary alone is `display_admits_format`.
+pub fn display_admits_planes(
+    display: u8,
+    connector: Option<u32>,
+    mode: Option<&crate::drm::ioctl::DrmModeModeInfo>,
+    fourcc: u32,
+    setup: &boot::PlaneSetup,
+) -> Result<(), PlanesRefused> {
+    if *setup == boot::PlaneSetup::NONE {
+        return display_admits_format(display, connector, mode, fourcc)
+            .then_some(())
+            .ok_or(PlanesRefused::Bandwidth);
+    }
+    let format = SurfaceFormat::from_fourcc(fourcc).ok_or(PlanesRefused::Plane)?;
+    let k = usize::from(display);
+    let (joint, soc) = {
+        let outputs = OUTPUTS.lock();
+        let c = outputs.crtcs.get(k).ok_or(PlanesRefused::NotLit)?;
+        let (Some((soc, _)), Some((_, timing, _))) = (c.admitted, &c.shown) else {
+            return Err(PlanesRefused::NotLit);
+        };
+        let target = match connector {
+            Some(id) => outputs.target_of_id(id),
+            None => c.route,
+        };
+        let same_timing =
+            mode.is_none_or(|m| outputs.find_mode(k, None, m).as_ref() == Some(timing));
+        if target != c.route || !same_timing {
+            return Err(PlanesRefused::NotLit);
+        }
+        let joint: Vec<(usize, dml::Mode)> = outputs
+            .crtcs
+            .iter()
+            .enumerate()
+            .filter_map(|(n, c)| Some((n, c.admitted?.1)))
+            .collect();
+        (joint, soc)
+    };
+    admits_with_planes(&soc, &joint, k, format, setup)
+}
+
+/// DML admission and pipe assignment of the lit configuration `joint`
+/// (display, admitted mode; in pipe order) with display `k`'s planes.
+fn admits_with_planes(
+    soc: &dml::Soc,
+    joint: &[(usize, dml::Mode)],
+    k: usize,
+    format: SurfaceFormat,
+    setup: &boot::PlaneSetup,
+) -> Result<(), PlanesRefused> {
+    let modes: Vec<dml::Mode> = joint
+        .iter()
+        .map(|&(n, m)| {
+            if n == k {
+                boot::with_planes(m, format, setup)
+            } else {
+                m
+            }
+        })
+        .collect();
+    let at = joint
+        .iter()
+        .position(|&(n, _)| n == k)
+        .ok_or(PlanesRefused::NotLit)?;
+    let plans = dml::admit_all(soc, &modes).map_err(|e| match e {
+        dml::Error::Pipes => PlanesRefused::Pipes,
+        dml::Error::Unsupported | dml::Error::Invalid => PlanesRefused::Plane,
+        _ => PlanesRefused::Bandwidth,
+    })?;
+    // Every other display's planes keep theirs; this display's take the
+    // pipes left after every display's own and ODM pipes.
+    let pipes: Vec<u8> = joint.iter().map(|&(n, _)| n as u8).collect();
+    let odm = boot::odm_pipes(&plans, &pipes).map_err(|_| PlanesRefused::Pipes)?;
+    // The other displays' overlays as admitted (each a pipe per segment).
+    let overlay_pipes = |i: usize| (modes[i].plane_list().count() as u8 - 1) * plans[i].pipes;
+    let others: u8 = (0..joint.len())
+        .filter(|&i| i != at)
+        .map(overlay_pipes)
+        .sum();
+    let free = 4 - pipes.len() as u8 - odm.iter().flatten().count() as u8;
+    if others + overlay_pipes(at) > free {
+        return Err(PlanesRefused::Pipes);
+    }
+    let m = &modes[at];
+    let overlays: [Option<(u8, Option<u8>)>; crate::amdgpu_dcn401_otg::MAX_OVERLAYS] =
+        core::array::from_fn(|i| setup.overlays[i].map(|_| (0, odm[at].map(|_| 1))));
+    let (primary, stack) = boot::stream_planes(
+        &m.timing,
+        m.ycbcr420,
+        format,
+        setup,
+        (2, odm[at].map(|_| 3)),
+        &overlays,
+    );
+    for r in core::iter::once(primary).chain(stack.into_iter().flatten()) {
+        r.check().map_err(|_| PlanesRefused::Plane)?;
+    }
+    Ok(())
+}
+
 /// Whether display `display` can scan out a `fourcc` plane in `mode` (its
 /// current timing when None) on its routed connector, or on `connector`
 /// when the same request routes it there; the timing itself must be one
@@ -3923,6 +4201,7 @@ pub fn restore_displays() {
         c.active = true;
         c.requested = None;
         c.format = SurfaceFormat::Xrgb8888;
+        c.planes = boot::PlaneSetup::NONE;
         c.explicit = false;
     }
     for x in outputs.connectors.iter_mut() {
@@ -4118,11 +4397,11 @@ pub async unsafe fn monitor_displays(
         }
     }
     let mst_port = OUTPUTS.lock().mst_port();
-    let wants: [(bool, Option<Timing>, SurfaceFormat); 4] = {
+    let wants: [(bool, Option<Timing>, SurfaceFormat, boot::PlaneSetup); 4] = {
         let outputs = OUTPUTS.lock();
         core::array::from_fn(|k| {
             let c = &outputs.crtcs[k];
-            (c.active, c.requested, c.format)
+            (c.active, c.requested, c.format, c.planes)
         })
     };
     // A new Colorspace, or entering or leaving HDR, is a modeset
@@ -4191,6 +4470,8 @@ pub async unsafe fn monitor_displays(
             || desired.is_some_and(|d| d != m.selection.timing)
             || limited != m.selection.limited
             || wants[usize::from(k)].2 != m.selection.format
+            // A plane configuration change is a full update, done as a relight.
+            || wants[usize::from(k)].3 != m.selection.planes
             || colors[usize::from(k)] != (m.selection.colorspace, m.selection.hdr.is_some())
         {
             relight = true;
@@ -4290,14 +4571,14 @@ pub async unsafe fn monitor_displays(
                 None
             }
             Err(e)
-                if wants
-                    .iter()
-                    .any(|w| w.1.is_some() || w.2 != SurfaceFormat::Xrgb8888)
-                    && !pending_display_work(boot) =>
+                if wants.iter().any(|w| {
+                    w.1.is_some() || w.2 != SurfaceFormat::Xrgb8888 || w.3 != boot::PlaneSetup::NONE
+                }) && !pending_display_work(boot) =>
             {
-                // A requested mode or plane format did not light: go back
-                // to the preferred XRGB8888 modes rather than leave the
-                // sinks dark.
+                // A requested mode, plane format or plane configuration did
+                // not light: go back to the preferred XRGB8888 modes with
+                // the full-frame primary alone rather than leave the sinks
+                // dark.
                 let _ = core::fmt::Write::write_fmt(
                     &mut narf_console::Writer,
                     format_args!("amdgpu: navi48 mode switch failed: {e:?}\n"),
@@ -4305,6 +4586,7 @@ pub async unsafe fn monitor_displays(
                 for c in OUTPUTS.lock().crtcs.iter_mut() {
                     c.requested = None;
                     c.format = SurfaceFormat::Xrgb8888;
+                    c.planes = boot::PlaneSetup::NONE;
                 }
                 // SAFETY: as above.
                 Some(unsafe { light_displays(boot, fill) }.await?)
@@ -5641,4 +5923,168 @@ mod tests {
         "drivers/gpu/navi48-kms",
         navi48_plane_formats_request_and_admit
     );
+
+    /// Plane configurations are requested per display and admitted against
+    /// the lit configuration: DML21 with every display's planes, a free
+    /// pipe per overlay (two on an ODM 2:1 stream) beside the other
+    /// displays' pipes, and staging's SPL checks; a dark display, another
+    /// timing or another connector cannot be checked and is refused.
+    fn navi48_planes_request_and_admit() -> TestResult {
+        use crate::amdgpu_dcn401_otg::Blend;
+        use crate::amdgpu_dcn401_spl::{Rect, Rotation};
+        const AR24: u32 = 0x3432_5241;
+        let saved: [_; 4] = {
+            let o = OUTPUTS.lock();
+            core::array::from_fn(|k| {
+                let c = &o.crtcs[k];
+                (c.planes, c.admitted, c.shown.clone(), c.route)
+            })
+        };
+        let restore = || {
+            let mut o = OUTPUTS.lock();
+            for (c, (planes, admitted, shown, route)) in o.crtcs.iter_mut().zip(saved.clone()) {
+                (c.planes, c.admitted, c.shown, c.route) = (planes, admitted, shown, route);
+            }
+        };
+        let result = (|| {
+            let geometry = |w: u32, h: u32, dst: Rect| boot::PlaneGeometry {
+                src_x: 0,
+                src_y: 0,
+                width: w,
+                height: h,
+                dst,
+                rotation: Rotation::R0,
+                blend: Blend::default_for(SurfaceFormat::Argb8888),
+            };
+            let overlay = |w, h, dst| boot::OverlayPlane {
+                geometry: geometry(w, h, dst),
+                format: SurfaceFormat::Argb8888,
+                underlay: false,
+            };
+            let video = overlay(1280, 720, Rect::new(100, 100, 640, 360));
+            let one = boot::PlaneSetup {
+                primary: None,
+                overlays: [Some(video), None, None],
+            };
+            let three = boot::PlaneSetup {
+                primary: Some(geometry(1280, 720, Rect::new(0, 0, 1920, 1080))),
+                overlays: [Some(video); 3],
+            };
+            if !request_display_planes(1, one)
+                || requested_display_planes(1) != one
+                || request_display_planes(4, one)
+            {
+                return TestResult::Fail("plane requests");
+            }
+            let soc = dml::Soc {
+                umc_channels: 16,
+                uclk_khz: 1_250_000,
+                fclk_khz: [300_000, 2_500_000],
+                dcfclk_khz: [200_000, 1_564_000],
+                socclk_khz: 300_000,
+                dispclk_max_khz: 2_000_000,
+                dppclk_max_khz: 2_000_000,
+                dentist_vco_khz: 4_500_000,
+                dchub_refclk_khz: 50_000,
+            };
+            let timing = Timing {
+                pixel_clock_khz: 148_500,
+                h_active: 1920,
+                h_total: 2200,
+                h_front_porch: 88,
+                h_sync_width: 44,
+                v_active: 1080,
+                v_total: 1125,
+                v_front_porch: 4,
+                v_sync_width: 5,
+                h_sync_positive: true,
+                v_sync_positive: true,
+            };
+            let mode = crate::amdgpu_navi48_boot::plane_mode(timing, SurfaceFormat::Xrgb8888);
+            let light = |n: usize| {
+                let mut o = OUTPUTS.lock();
+                for (k, c) in o.crtcs.iter_mut().enumerate() {
+                    (c.admitted, c.shown) = if k < n {
+                        (
+                            Some((soc, mode)),
+                            Some(([0; 128], timing, alloc::vec![timing])),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                }
+            };
+            light(0);
+            if display_admits_planes(0, None, None, AR24, &one) != Err(PlanesRefused::NotLit) {
+                return TestResult::Fail("dark display");
+            }
+            light(1);
+            if display_admits_planes(0, None, None, AR24, &one).is_err()
+                || display_admits_planes(0, None, None, AR24, &three).is_err()
+            {
+                return TestResult::Fail("one display's overlays");
+            }
+            // Another timing cannot be admitted before it is lit.
+            let other = crate::amdgpu_navi48_kms::timing_wire(&Timing {
+                pixel_clock_khz: 74_250,
+                ..timing
+            });
+            if display_admits_planes(0, None, Some(&other), AR24, &one)
+                != Err(PlanesRefused::NotLit)
+            {
+                return TestResult::Fail("unverified timing");
+            }
+            // Two lit displays leave two free pipes: one display's three
+            // overlays need a fifth.
+            light(2);
+            if display_admits_planes(0, None, None, AR24, &one).is_err()
+                || display_admits_planes(0, None, None, AR24, &three) != Err(PlanesRefused::Pipes)
+            {
+                return TestResult::Fail("pipes beside another display");
+            }
+            // The other display's admitted overlays hold their pipes too.
+            let joint = [
+                (0, mode),
+                (
+                    1,
+                    crate::amdgpu_navi48_boot::with_planes(mode, SurfaceFormat::Xrgb8888, &one),
+                ),
+            ];
+            let two = boot::PlaneSetup {
+                overlays: [Some(video), Some(video), None],
+                ..one
+            };
+            if admits_with_planes(&soc, &joint, 0, SurfaceFormat::Argb8888, &one).is_err()
+                || admits_with_planes(&soc, &joint, 0, SurfaceFormat::Argb8888, &two)
+                    != Err(PlanesRefused::Pipes)
+            {
+                return TestResult::Fail("other display's overlays");
+            }
+            // A plane staging refuses (no pixel inside the stream) fails.
+            let outside = boot::PlaneSetup {
+                overlays: [
+                    Some(overlay(256, 256, Rect::new(4000, 100, 256, 256))),
+                    None,
+                    None,
+                ],
+                ..one
+            };
+            if display_admits_planes(0, None, None, AR24, &outside).is_ok() {
+                return TestResult::Fail("plane off the stream");
+            }
+            restore_displays();
+            if OUTPUTS
+                .lock()
+                .crtcs
+                .iter()
+                .any(|c| c.planes != boot::PlaneSetup::NONE)
+            {
+                return TestResult::Fail("console restore keeps planes");
+            }
+            TestResult::Pass
+        })();
+        restore();
+        result
+    }
+    kernel_test_in!("drivers/gpu/navi48-kms", navi48_planes_request_and_admit);
 }

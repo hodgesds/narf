@@ -723,6 +723,7 @@ fn select_mst_with_budget(
             // VRR is DP SST only here (no MST stream features).
             vrr: None,
             format: otg::SurfaceFormat::Xrgb8888,
+            planes: modeset::PlaneSetup::NONE,
             // MST connectors carry neither Colorspace nor HDR metadata here.
             colorspace: 0,
             hdr: None,

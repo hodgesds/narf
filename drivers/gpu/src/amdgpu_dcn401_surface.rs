@@ -286,6 +286,11 @@ impl SurfaceRequest {
                 || self.odm.is_some() && p.stream_width % 2 != 0
                 || !matches!(p.rotation, spl::Rotation::R0 | spl::Rotation::R180)
                 || (p.blend.per_pixel_alpha && !self.format.cnvc_alpha())
+                // Some pixel must land on the stream.
+                || d.x >= p.stream_width as i32
+                || d.y >= p.stream_height as i32
+                || i64::from(d.x) + i64::from(d.width) <= 0
+                || i64::from(d.y) + i64::from(d.height) <= 0
             {
                 return Err(Error::Invalid);
             }
@@ -312,6 +317,13 @@ impl SurfaceRequest {
             blend: Blend::default_for(self.format),
             underlay: false,
         })
+    }
+    /// Whether staging would take this request: its surface and layout
+    /// are well formed and every ODM segment's SPL succeeds
+    /// (resource_build_scaling_params). `Invalid` or `Unsupported` as
+    /// staging would refuse it; nothing is touched.
+    pub fn check(self) -> Result<(), Error> {
+        self.geometry().map(|_| ())
     }
     /// Whether this is the unscaled full-frame plane of its stream.
     pub fn full_frame(self) -> bool {

@@ -1821,6 +1821,34 @@ impl ColdBoot {
                 .await
         }
     }
+    /// `prepare_display_requestor` for the primary on `pipe` and the
+    /// overlay planes staged on `overlays` (bottom first).
+    /// # Safety
+    /// As for `prepare_display_requestor`.
+    pub async unsafe fn prepare_display_requestor_planes(
+        &mut self,
+        pipe: u8,
+        overlays: &[u8],
+    ) -> Result<otg::RequestorApplied, otg::Error> {
+        if self.display_retirement_busy() {
+            return Err(otg::Error::Busy);
+        }
+        let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
+        // SAFETY: matching retained owners are serialized; caller excludes external writers.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .prepare_requestor_planes(
+                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                    gmc,
+                    pipe,
+                    overlays,
+                )
+                .await
+        }
+    }
     /// Admit one single-pipe scanout mode against the live board: started
     /// PMFW levels, the DENTIST VCO, the DCHUB timer and the VBIOS crystal.
     /// Read-only; the plan's clocks and global sync feed the later requests.
@@ -1981,6 +2009,77 @@ impl ColdBoot {
                 .as_mut()
                 .map_err(|e| *e)?
                 .prepare_back_buffer(&self.sequence.backend.pool, gmc, pipe)
+                .await
+        }
+    }
+    /// `prepare_display_back_buffer` for plane `pipe` (an overlay's) of
+    /// display `display`.
+    /// # Safety
+    /// As for `prepare_display_back_buffer`.
+    pub async unsafe fn prepare_display_plane_back_buffer(
+        &mut self,
+        display: u8,
+        pipe: u8,
+    ) -> Result<u64, otg::Error> {
+        if self.state() != State::MemoryReady {
+            return Err(otg::Error::Busy);
+        }
+        let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
+        // SAFETY: this owner retains its pool and GMC; caller excludes writers.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .prepare_plane_back_buffer(&self.sequence.backend.pool, gmc, display, pipe)
+                .await
+        }
+    }
+    /// `upload_display_back` into plane `pipe` of display `display`.
+    /// # Safety
+    /// As for `upload_display_back`.
+    pub unsafe fn upload_display_plane_back(
+        &mut self,
+        display: u8,
+        pipe: u8,
+        x: u32,
+        y: u32,
+        pixels: &[u32],
+    ) -> Result<(), otg::Error> {
+        if self.state() != State::MemoryReady {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: serialized retained owner; caller excludes writers.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .upload_plane_back_buffer(display, pipe, x, y, pixels)
+        }
+    }
+    /// Flip the planes in `planes` (bit 0 the primary, bit k the k-th
+    /// overlay) of display `pipe` to their back buffers at one VUPDATE.
+    /// # Safety
+    /// As for `flip_display`, for every flipping plane.
+    pub async unsafe fn flip_display_planes(
+        &mut self,
+        pipe: u8,
+        planes: u8,
+    ) -> Result<[Option<otg::FlipDone>; 1 + otg::MAX_OVERLAYS], otg::Error> {
+        let crystal = *self.crystal.as_ref().map_err(|_| otg::Error::Unsupported)?;
+        let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
+        // SAFETY: matching retained owners are serialized; caller excludes writers.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .flip_planes(
+                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                    gmc,
+                    pipe,
+                    planes,
+                    crystal,
+                )
                 .await
         }
     }
@@ -3292,10 +3391,13 @@ mod modeset;
 mod teardown;
 pub use modeset::{
     broadcast_rgb, edid_timings, frl_audio, frl_cap, frl_carries, frl_enabled, frl_link, hdmi_avi,
-    hdmi_caps, limited_range, max_bpc, output_color, plane_format, plane_mode, set_broadcast_rgb,
-    set_frl, set_max_bpc, set_output_color, set_plane_format, sink_audio_info, Configuration,
-    FrlRate, HdmiCaps, Health, InheritedRetired, Modeset, ModesetError, MstRoute, MstStream,
-    Selection, SstOutput, BROADCAST_RGB_AUTO, BROADCAST_RGB_FULL, BROADCAST_RGB_LIMITED,
+    hdmi_caps, limited_range, max_bpc, odm_pipes, output_color, overlay_pipes, plane_format,
+    plane_mode, plane_requests, plane_setup, selection_mode, set_broadcast_rgb, set_frl,
+    set_max_bpc, set_output_color, set_plane_format, set_plane_setup, sink_audio_info,
+    stream_planes, with_planes, Configuration, DisplayPipes, FrlRate, HdmiCaps, Health,
+    InheritedRetired, Modeset, ModesetError, MstRoute, MstStream, OverlayPlane, PlaneGeometry,
+    PlaneSetup, Selection, SstOutput, BROADCAST_RGB_AUTO, BROADCAST_RGB_FULL,
+    BROADCAST_RGB_LIMITED,
 };
 pub use teardown::{TeardownStatus, TeardownStep};
 #[cfg(feature = "kernel-test")]

@@ -2777,3 +2777,122 @@ kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_selection_maps_colorspace_and_hdr_like_amdgpu_dm
 );
+
+/// DRM's planes reach DML and staging as DC hands them over: the scaled
+/// primary's and each overlay's surface request (layout on the stream,
+/// format, pipe) and, from them, the admission mode's plane list (SPL's
+/// viewport, ratios and taps). The full-frame primary alone keeps the
+/// single-plane mode. Overlays take free pipes from the top (one per
+/// segment of an ODM stream); a configuration short of pipes is refused.
+fn navi48_planes_reach_admission_and_staging() -> TestResult {
+    use crate::amdgpu_dcn401_spl::{Rect, Rotation};
+    let base = completed_modeset(0).selection;
+    let soc = dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [300_000, 2_500_000],
+        dcfclk_khz: [200_000, 1_564_000],
+        socclk_khz: 300_000,
+        dispclk_max_khz: 2_000_000,
+        dppclk_max_khz: 2_000_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    let geometry = |w: u32, h: u32, dst: Rect, format: otg::SurfaceFormat| PlaneGeometry {
+        src_x: 0,
+        src_y: 0,
+        width: w,
+        height: h,
+        dst,
+        rotation: Rotation::R0,
+        blend: otg::Blend::default_for(format),
+    };
+    let video = OverlayPlane {
+        geometry: geometry(
+            1280,
+            720,
+            Rect::new(100, 100, 640, 360),
+            otg::SurfaceFormat::Argb8888,
+        ),
+        format: otg::SurfaceFormat::Argb8888,
+        underlay: false,
+    };
+    let s = Selection {
+        planes: PlaneSetup {
+            primary: Some(geometry(
+                1280,
+                720,
+                Rect::new(0, 0, 1920, 1080),
+                base.format,
+            )),
+            overlays: [Some(video), None, None],
+        },
+        ..base
+    };
+    let (primary, overlays) = plane_requests(&s, 0, None, &[Some((3, None)), None, None]);
+    let Some(overlay) = overlays[0] else {
+        return TestResult::Fail("overlay request");
+    };
+    let full = Rect::new(0, 0, 1920, 1080);
+    if (primary.width, primary.height) != (1280, 720)
+        || primary.plane.map(|l| (l.dst, l.stream_width, l.underlay)) != Some((full, 1920, false))
+        || (overlay.pipe, overlay.odm, overlay.format) != (3, None, otg::SurfaceFormat::Argb8888)
+        || overlay.plane.map(|l| l.dst) != Some(Rect::new(100, 100, 640, 360))
+        || overlay.check().is_err()
+        || primary.check().is_err()
+    {
+        return TestResult::Fail("surface requests");
+    }
+    let mode = selection_mode(&s);
+    let planes: alloc::vec::Vec<dml::Plane> = mode.plane_list().collect();
+    if planes != [primary.dml_plane(), overlay.dml_plane()]
+        || planes[0].h_ratio != (1280 << 19) / 1920
+        || planes[1].v_ratio != 2 << 19
+    {
+        return TestResult::Fail("admission planes");
+    }
+    if selection_mode(&base).planes != [None; dml::MAX_PLANES] {
+        return TestResult::Fail("full-frame primary alone");
+    }
+    let Ok(plans) = admit_displays(&soc, &[s]) else {
+        return TestResult::Fail("scaled primary with an overlay refused");
+    };
+    let one = plans[0];
+    if one.plane(1).is_none() || one.plane(2).is_some() {
+        return TestResult::Fail("planned planes");
+    }
+    let two = dml::Plan { pipes: 2, ..one };
+    let got = |sel: &[Selection], plans: &[dml::Plan], pipes: &[u8], odm: &[Option<u8>]| {
+        overlay_pipes(sel, plans, pipes, odm).ok()
+    };
+    let three = Selection {
+        planes: PlaneSetup {
+            overlays: [Some(video); 3],
+            ..s.planes
+        },
+        ..s
+    };
+    if got(&[s, s], &[one, one], &[0, 1], &[None, None])
+        != Some(alloc::vec![
+            [Some((3, None)), None, None],
+            [Some((2, None)), None, None]
+        ])
+        || got(&[s], &[two], &[0], &[Some(3)])
+            != Some(alloc::vec![[Some((2, Some(1))), None, None]])
+        || got(&[three], &[one], &[0], &[None])
+            != Some(alloc::vec![[
+                Some((3, None)),
+                Some((2, None)),
+                Some((1, None))
+            ]])
+        || got(&[three, base], &[one, one], &[0, 1], &[None, None]).is_some()
+        || got(&[s, s], &[two, one], &[0, 1], &[Some(3)]).is_some()
+    {
+        return TestResult::Fail("overlay pipes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_planes_reach_admission_and_staging
+);

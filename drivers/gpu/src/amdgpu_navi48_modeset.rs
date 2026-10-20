@@ -103,6 +103,143 @@ pub struct Selection {
     /// A DP sink that takes colorimetry in the VSC SDP
     /// (use_vsc_sdp_for_colorimetry: DPCD 1.4 and DPRX feature bit 3).
     pub vsc_colorimetry: bool,
+    /// DRM's planes on the display's CRTC beyond a full-frame unscaled
+    /// primary (`plane_setup`): the primary's placement and the overlays.
+    pub planes: PlaneSetup,
+}
+
+/// Where one plane shows, as DRM's plane state hands it to DC
+/// (amdgpu_dm_plane_fill_dc_scaling_info): its source rectangle (whose
+/// size is the plane's surface; the presenter copies the framebuffer's
+/// source rectangle into it) and its CRTC rectangle, with the plane's
+/// rotation and blending (amdgpu_dm_plane_fill_blending_from_plane_state).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaneGeometry {
+    pub src_x: u32,
+    pub src_y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub dst: crate::amdgpu_dcn401_spl::Rect,
+    pub rotation: crate::amdgpu_dcn401_spl::Rotation,
+    pub blend: otg::Blend,
+}
+
+/// One overlay plane DRM enabled on a display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OverlayPlane {
+    pub geometry: PlaneGeometry,
+    pub format: otg::SurfaceFormat,
+    /// Its normalized zpos is below the primary's.
+    pub underlay: bool,
+}
+
+/// A display's planes: the primary's placement (None: the whole
+/// framebuffer unscaled at the mode's size, blended as its format's
+/// default) and up to three overlays, bottom first, each on a free pipe.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlaneSetup {
+    pub primary: Option<PlaneGeometry>,
+    pub overlays: [Option<OverlayPlane>; otg::MAX_OVERLAYS],
+}
+impl PlaneSetup {
+    /// The full-frame unscaled primary alone.
+    pub const NONE: Self = Self {
+        primary: None,
+        overlays: [None; otg::MAX_OVERLAYS],
+    };
+    pub fn overlay_count(&self) -> usize {
+        self.overlays.iter().flatten().count()
+    }
+}
+
+/// The pipes one display lights on beyond its own: the ODM pipe of its
+/// stream, and each overlay's pipe and (on an ODM stream) ODM pipe.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DisplayPipes {
+    pub odm: Option<u8>,
+    pub overlays: [Option<(u8, Option<u8>)>; otg::MAX_OVERLAYS],
+}
+impl DisplayPipes {
+    /// Every overlay pipe (both halves), by bit.
+    pub fn overlay_mask(&self) -> u8 {
+        self.overlays
+            .iter()
+            .flatten()
+            .flat_map(|&(p, q)| core::iter::once(p).chain(q))
+            .fold(0, |m, p| m | 1 << p)
+    }
+}
+
+/// The surface requests of selection `s` lit on `pipe` (with its ODM pipe
+/// `odm`): the primary, then each overlay on its pipes in `overlays`
+/// (pipe 0 for an overlay without one: DML and the checks do not depend on
+/// the pipe). Each plane's layout is its source size at its CRTC
+/// rectangle on the stream; the unscaled full-frame primary has none.
+pub fn plane_requests(
+    s: &Selection,
+    pipe: u8,
+    odm: Option<u8>,
+    overlays: &[Option<(u8, Option<u8>)>; otg::MAX_OVERLAYS],
+) -> (
+    otg::SurfaceRequest,
+    [Option<otg::SurfaceRequest>; otg::MAX_OVERLAYS],
+) {
+    stream_planes(
+        &s.timing,
+        s.ycbcr420,
+        s.format,
+        &s.planes,
+        (pipe, odm),
+        overlays,
+    )
+}
+
+/// `plane_requests` for planes `setup` (primary `format`) on a stream of
+/// `timing`.
+pub fn stream_planes(
+    timing: &Timing,
+    ycbcr420: bool,
+    format: otg::SurfaceFormat,
+    setup: &PlaneSetup,
+    (pipe, odm): (u8, Option<u8>),
+    overlays: &[Option<(u8, Option<u8>)>; otg::MAX_OVERLAYS],
+) -> (
+    otg::SurfaceRequest,
+    [Option<otg::SurfaceRequest>; otg::MAX_OVERLAYS],
+) {
+    use crate::amdgpu_dcn401_spl::Rect;
+    let layout = |g: &PlaneGeometry, underlay: bool| otg::PlaneLayout {
+        src: Rect::new(0, 0, g.width as i32, g.height as i32),
+        dst: g.dst,
+        stream_width: timing.h_active,
+        stream_height: timing.v_active,
+        ycbcr420,
+        rotation: g.rotation,
+        blend: g.blend,
+        underlay,
+    };
+    let primary = otg::SurfaceRequest {
+        pipe,
+        width: setup.primary.map_or(timing.h_active, |g| g.width),
+        height: setup.primary.map_or(timing.v_active, |g| g.height),
+        format,
+        odm,
+        plane: setup.primary.map(|g| layout(&g, false)),
+    };
+    let mut out = [None; otg::MAX_OVERLAYS];
+    for ((slot, o), pipes) in out.iter_mut().zip(&setup.overlays).zip(overlays) {
+        let Some(o) = o else { continue };
+        let (p, q) = pipes.unwrap_or((0, odm.map(|_| 1)));
+        *slot = Some(otg::SurfaceRequest {
+            pipe: p,
+            width: o.geometry.width,
+            height: o.geometry.height,
+            format: o.format,
+            odm: q,
+            plane: Some(layout(&o.geometry, o.underlay)),
+        });
+    }
+    (primary, out)
 }
 
 /// A selection's stream on an MST link: its end device and VC payload.
@@ -431,6 +568,20 @@ pub fn output_color(pipe: u8) -> (u32, Option<crate::amdgpu_hdr::HdrOutputMetada
     OUTPUT_COLOR
         .get(usize::from(pipe))
         .map_or((0, None), |slot| *slot.lock())
+}
+static PLANE_SETUPS: [narf_lib::sync::IrqSafeSpinLock<PlaneSetup>; 4] =
+    [const { narf_lib::sync::IrqSafeSpinLock::new(PlaneSetup::NONE) }; 4];
+/// Light pipe `pipe` with DRM's planes `setup` from its next lighting on.
+pub fn set_plane_setup(pipe: u8, setup: PlaneSetup) {
+    if let Some(slot) = PLANE_SETUPS.get(usize::from(pipe)) {
+        *slot.lock() = setup;
+    }
+}
+/// The planes pipe `pipe` lights with.
+pub fn plane_setup(pipe: u8) -> PlaneSetup {
+    PLANE_SETUPS
+        .get(usize::from(pipe))
+        .map_or(PlaneSetup::NONE, |slot| *slot.lock())
 }
 /// The surface format pipe `pipe` lights with.
 pub fn plane_format(pipe: u8) -> otg::SurfaceFormat {
@@ -1487,6 +1638,7 @@ pub fn select_all(
                 .as_ref()
                 .and_then(|d| crate::amdgpu_freesync::dp_sst_caps(&sink.edid, d)),
             format: otg::SurfaceFormat::Xrgb8888,
+            planes: PlaneSetup::NONE,
             colorspace: 0,
             hdr: None,
             vsc_colorimetry: sink.dpcd.as_ref().is_some_and(|d| {
@@ -1548,6 +1700,7 @@ pub fn select_all(
             // HDMI FreeSync needs the AMD VSDB, which is not parsed.
             vrr: None,
             format: otg::SurfaceFormat::Xrgb8888,
+            planes: PlaneSetup::NONE,
             colorspace: 0,
             hdr: None,
             vsc_colorimetry: false,
@@ -1780,16 +1933,86 @@ impl Selection {
 }
 
 /// The admission mode of a selected sink: its timing, as 4:2:0 output
-/// when it leaves so.
+/// when it leaves so, with its planes as DC hands them to DML21 (each
+/// plane's SPL viewport, ratios and taps on the stream).
 pub fn selection_mode(s: &Selection) -> dml::Mode {
-    dml::Mode {
+    let mode = dml::Mode {
         ycbcr420: s.ycbcr420,
         dsc: s.dsc.map(|c| dml::Dsc {
             slices: c.slices_h,
             bpp_x16: c.bpp_x16,
         }),
         ..plane_mode(s.timing, s.format)
+    };
+    with_planes(mode, s.format, &s.planes)
+}
+
+/// `mode` (one stream's admission mode) with the planes `setup`, primary
+/// in `format`: each plane as DC hands it to DML21 after SPL on the stream.
+pub fn with_planes(
+    mut mode: dml::Mode,
+    format: otg::SurfaceFormat,
+    setup: &PlaneSetup,
+) -> dml::Mode {
+    let (primary, overlays) = stream_planes(
+        &mode.timing,
+        mode.ycbcr420,
+        format,
+        setup,
+        (0, None),
+        &[None; otg::MAX_OVERLAYS],
+    );
+    mode.pitch = format.pitch_bytes(mode.timing.h_active) / format.bytes_per_pixel();
+    mode.bytes_per_pixel = format.bytes_per_pixel();
+    mode.planes = [None; dml::MAX_PLANES];
+    if primary.plane.is_some() {
+        mode.planes[0] = Some(primary.dml_plane());
     }
+    for (slot, o) in mode.planes[1..].iter_mut().zip(overlays.iter().flatten()) {
+        *slot = Some(o.dml_plane());
+    }
+    mode
+}
+
+/// Each lit display's overlay pipes: free pipes (neither a display's nor
+/// an ODM pipe, nor another overlay's), taken from the top as ODM pipes
+/// are, one per overlay and a second for an ODM stream's. A configuration
+/// whose planes need more pipes than are free is refused (DML counts the
+/// pipes too; this assigns them).
+pub fn overlay_pipes(
+    selections: &[Selection],
+    plans: &[dml::Plan],
+    pipes: &[u8],
+    odm: &[Option<u8>],
+) -> Result<Vec<[Option<(u8, Option<u8>)>; otg::MAX_OVERLAYS]>, ModesetError> {
+    let mut used = pipes
+        .iter()
+        .copied()
+        .chain(odm.iter().flatten().copied())
+        .fold(0u8, |m, p| m | 1 << p);
+    let mut take = || {
+        let q = (0..4u8)
+            .rev()
+            .find(|&q| used & 1 << q == 0)
+            .ok_or(ModesetError::Display(otg::Error::Admission(
+                dml::Error::Pipes,
+            )))?;
+        used |= 1 << q;
+        Ok::<u8, ModesetError>(q)
+    };
+    let mut out = Vec::with_capacity(selections.len());
+    for (s, plan) in selections.iter().zip(plans) {
+        let mut stack = [None; otg::MAX_OVERLAYS];
+        for (slot, o) in stack.iter_mut().zip(&s.planes.overlays) {
+            if o.is_some() {
+                let p = take()?;
+                let q = if plan.pipes == 2 { Some(take()?) } else { None };
+                *slot = Some((p, q));
+            }
+        }
+        out.push(stack);
+    }
+    Ok(out)
 }
 
 /// Global clocks at least as fast as the plan's DISPCLK and DPPREFCLK.
@@ -2029,15 +2252,16 @@ impl ColdBoot {
         let mut selection = select(&paths, &ports, max_bpc(), want)?;
         selection.limited = limited_range(broadcast_rgb()) && !selection.ycbcr420;
         selection.format = plane_format(pipe);
+        selection.planes = plane_setup(pipe);
         (selection.colorspace, selection.hdr) = output_color(pipe);
         self.select_display(pipe)?;
         let soc = self.prepare_configuration(&[selection]).await?;
         refine_dsc(&soc, core::slice::from_mut(&mut selection))?;
         let plans = admit_displays(&soc, &[selection]).map_err(otg::Error::Admission)?;
-        let odm = self.prepare_pipes(&[selection], &plans, &[pipe]).await?;
+        let pipes = self.prepare_pipes(&[selection], &plans, &[pipe]).await?;
         // SAFETY: the caller's obligations.
         let mut lit = unsafe {
-            self.light(pipe, odm[0], selection, plans[0], &mut |_, y, row| {
+            self.light(pipe, pipes[0], selection, plans[0], &mut |_, y, row| {
                 fill(y, row)
             })
         }
@@ -2156,6 +2380,7 @@ impl ColdBoot {
         for (s, &pipe) in selections.iter_mut().zip(&pipes) {
             s.limited = limited && !s.ycbcr420;
             s.format = plane_format(pipe);
+            s.planes = plane_setup(pipe);
             (s.colorspace, s.hdr) = output_color(pipe);
         }
         self.select_display(pipes.first().copied().unwrap_or(0))?;
@@ -2173,15 +2398,15 @@ impl ColdBoot {
         refine_dsc(&soc, &mut selections)?;
         let plans = admit_displays(&soc, &selections).map_err(otg::Error::Admission)?;
         selections.truncate(plans.len());
-        let odm = self.prepare_pipes(&selections, &plans, &pipes).await?;
+        let extra = self.prepare_pipes(&selections, &plans, &pipes).await?;
         let mut lit = Vec::with_capacity(selections.len());
         let mut failed = None;
-        for (((selection, plan), &pipe), &odm) in
-            selections.iter().zip(&plans).zip(&pipes).zip(&odm)
+        for (((selection, plan), &pipe), &extra) in
+            selections.iter().zip(&plans).zip(&pipes).zip(&extra)
         {
             // SAFETY: the caller's obligations; every earlier display is lit
             // in its own slot and left to it by each step.
-            match unsafe { self.light(pipe, odm, *selection, *plan, &mut fill) }.await {
+            match unsafe { self.light(pipe, extra, *selection, *plan, &mut fill) }.await {
                 Ok(m) => lit.push(m),
                 Err(e) if lit.is_empty() => return Err(e),
                 Err(e) => {
@@ -2237,15 +2462,17 @@ impl ColdBoot {
     }
     /// The configuration's global clocks (one DISPCLK/DPPREFCLK for every
     /// plan), then each display's pipe clocks on `pipes` (and a DPP-only
-    /// clock on each ODM pipe), all while every display is stopped. Returns
-    /// each display's ODM pipe.
+    /// clock on each ODM pipe and each overlay's pipes, at its plane's
+    /// DPPCLK), all while every display is stopped. Returns each display's
+    /// ODM and overlay pipes.
     pub(super) async fn prepare_pipes(
         &mut self,
         selections: &[Selection],
         plans: &[dml::Plan],
         pipes: &[u8],
-    ) -> Result<Vec<Option<u8>>, ModesetError> {
+    ) -> Result<Vec<DisplayPipes>, ModesetError> {
         let odm = odm_pipes(plans, pipes)?;
+        let overlays = overlay_pipes(selections, plans, pipes, &odm)?;
         let mut request = clock_request(&plans[0]);
         request.displays = plans.len() as u8;
         // dcn401_update_clocks: an FRL stream holds DTBCLK at its highest
@@ -2277,7 +2504,28 @@ impl ColdBoot {
                 self.start_display_dscclk(q)?;
             }
         }
-        Ok(odm)
+        for (plan, stack) in plans.iter().zip(&overlays) {
+            for (k, o) in stack.iter().enumerate() {
+                let Some((p, q)) = *o else { continue };
+                let plane = plan
+                    .plane(k + 1)
+                    .ok_or(ModesetError::Display(otg::Error::Invalid))?;
+                for pipe in core::iter::once(p).chain(q) {
+                    self.prepare_display_pipe_clocks(dccg::Request {
+                        pipe,
+                        dpp_khz: plane.dppclk_khz,
+                        pixel: dccg::PixelClock::OdmSegment,
+                    })
+                    .await
+                    .map_err(ModesetError::PipeClocks)?;
+                }
+            }
+        }
+        Ok(odm
+            .into_iter()
+            .zip(overlays)
+            .map(|(odm, overlays)| DisplayPipes { odm, overlays })
+            .collect())
     }
     /// Light one admitted display on `pipe` (its display slot too), with its
     /// clocks prepared: surface, timing, OPP, DPP, MPC, requestor and
@@ -2288,15 +2536,16 @@ impl ColdBoot {
     pub(super) async unsafe fn light(
         &mut self,
         pipe: u8,
-        odm: Option<u8>,
+        pipes: DisplayPipes,
         selection: Selection,
         plan: dml::Plan,
         fill: &mut impl FnMut(u8, u32, &mut [u32]),
     ) -> Result<Modeset, ModesetError> {
         self.select_display(pipe)?;
-        self.teardowns.begin_activation(pipe, odm, &selection)?;
+        self.teardowns
+            .begin_activation(pipe, pipes.odm, &selection)?;
         // SAFETY: the caller owns this unpublished activation and every writer.
-        match unsafe { self.light_inner(pipe, odm, selection, plan, fill) }.await {
+        match unsafe { self.light_inner(pipe, pipes, selection, plan, fill) }.await {
             Ok(m) => {
                 // No await between native completion and retained ownership.
                 // A later pipe or platform adoption can suspend or be dropped.
@@ -2320,12 +2569,17 @@ impl ColdBoot {
     async unsafe fn light_inner(
         &mut self,
         pipe: u8,
-        odm: Option<u8>,
+        pipes: DisplayPipes,
         selection: Selection,
         plan: dml::Plan,
         fill: &mut impl FnMut(u8, u32, &mut [u32]),
     ) -> Result<Modeset, ModesetError> {
-        let (width, height) = (selection.timing.h_active, selection.timing.v_active);
+        let odm = pipes.odm;
+        let (primary, overlays) = plane_requests(&selection, pipe, odm, &pipes.overlays);
+        let (width, height) = (primary.width, primary.height);
+        // Each overlay's pipe(s), bottom first.
+        let stack: Vec<otg::SurfaceRequest> = overlays.iter().flatten().copied().collect();
+        let overlay_pipes: Vec<u8> = stack.iter().map(|o| o.pipe).collect();
         // SAFETY: the caller's exclusion and retention obligations cover each
         // retained owner below; every step validates its own preconditions.
         unsafe {
@@ -2334,15 +2588,12 @@ impl ColdBoot {
             if let Some(q) = odm {
                 self.set_display_hubp_power(q, true).await?;
             }
-            self.prepare_display_surface(otg::SurfaceRequest {
-                pipe,
-                width,
-                height,
-                format: selection.format,
-                odm,
-                plane: None,
-            })
-            .await?;
+            for o in &stack {
+                for p in core::iter::once(o.pipe).chain(o.odm) {
+                    self.set_display_hubp_power(p, true).await?;
+                }
+            }
+            self.prepare_display_surface(primary).await?;
             // `fill` draws XRGB8888 rows; any other format keeps the cleared
             // surface, which is black in each of them.
             if selection.format == otg::SurfaceFormat::Xrgb8888 {
@@ -2352,7 +2603,17 @@ impl ColdBoot {
                     self.upload_display_surface(pipe, 0, y, &row)?;
                 }
             }
+            // Each overlay's surface starts cleared: transparent in its
+            // alpha formats, black in the others, until DRM presents.
+            for &o in &stack {
+                self.prepare_display_surface(o).await?;
+            }
+            // Every plane's apertures before any plane's DPP: a memory
+            // restage keeps only the planes staged on the same context.
             self.prepare_display_memory(pipe).await?;
+            for &o in &overlay_pipes {
+                self.prepare_display_memory(o).await?;
+            }
             self.prepare_display_timing(otg::Request {
                 odm,
                 ..timing_request(pipe, &plan, &selection)
@@ -2361,8 +2622,15 @@ impl ColdBoot {
             self.prepare_display_blank(selection.blank_request(pipe))
                 .await?;
             self.prepare_display_dpp(pipe).await?;
+            for &o in &overlay_pipes {
+                self.prepare_display_dpp(o).await?;
+            }
             self.prepare_display_mpc(pipe)?;
-            self.prepare_display_requestor(pipe).await?;
+            for &o in &overlay_pipes {
+                self.prepare_display_mpc(o)?;
+            }
+            self.prepare_display_requestor_planes(pipe, &overlay_pipes)
+                .await?;
             self.prepare_display_deadlines(pipe, &plan).await?;
             match self.enable_display_hpd(selection.port) {
                 // A board without an HPD selector still lights; monitoring
