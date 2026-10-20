@@ -136,11 +136,12 @@ impl Surfaces {
             a.request.width,
             a.request.height,
             a.pitch_bytes,
-            32,
+            (a.request.format.bytes_per_pixel() * 8) as u8,
         ))
     }
-    /// Write part of one row of the next frame into the back buffer of a live
-    /// pipe. The back buffer is the one surface no HUBP fetches while the
+    /// Write part of one row of the next frame (packed 32-bit words from
+    /// pixel `x`, as the front's `upload` takes them) into the back buffer of
+    /// a live pipe. The back buffer is the one surface no HUBP fetches while the
     /// pipe scans out and no flip is in progress, so this is the live update
     /// path that never races scanout; the front's `upload` stays
     /// stopped-only. No raw CPU pointer escapes. The writes become visible to
@@ -160,13 +161,7 @@ impl Surfaces {
             .ok_or(Error::Invalid)?;
         let back = surface.back.as_ref().ok_or(Error::Invalid)?;
         let a = surface.applied;
-        let count = u32::try_from(pixels.len()).map_err(|_| Error::Invalid)?;
-        if count == 0
-            || y >= a.request.height
-            || x.checked_add(count).is_none_or(|end| end > a.request.width)
-        {
-            return Err(Error::Invalid);
-        }
+        let start = a.row_words(x, y, pixels.len())?;
         // Only while this pipe scans out its front: during a flip which buffer
         // is fetched is in transition, and after a failure it is unknown.
         let running = e.status.scanout.ok_or(Error::Busy)?;
@@ -178,7 +173,6 @@ impl Surfaces {
             return Err(Error::Busy);
         }
         let map = back.mapping();
-        let start = u64::from(y) * u64::from(a.pitch_bytes) + u64::from(x) * 4;
         e.access(|_| {
             for (index, &pixel) in pixels.iter().enumerate() {
                 // SAFETY: checked row bounds within the retained back buffer,

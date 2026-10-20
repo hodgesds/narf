@@ -1,6 +1,7 @@
-//! Native opaque RGB composition preparation. Linux DCN401 uses
-//! mpc2_update_blending, mpc3 output denormalization/CSC/OGAM, mpc32 MCM
-//! bypass and mpc401 gamut remapping. Route selectors stay disconnected.
+//! Native RGB composition preparation. Linux DCN401 uses
+//! mpc2_update_blending (dcn401_update_mpcc_sequence's blend config), mpc3
+//! output denormalization/CSC/OGAM, mpc32 MCM bypass and mpc401 gamut
+//! remapping. Route selectors stay disconnected.
 use super::*;
 use crate::amdgpu_gmc_navi48::{DisplayContext, Gmc};
 
@@ -107,10 +108,18 @@ impl Layout {
             ColorDepth::Bpc10 => 4,
             ColorDepth::Bpc12 => 6,
         };
+        // dcn401_update_mpcc_sequence: per-pixel premultiplied alpha for the
+        // formats amdgpu_dm blends so (SurfaceFormat::per_pixel_alpha), else
+        // global alpha; global alpha and gain 0xff, 4-bit background.
+        let blend = if a.dpp.surface.request.format.per_pixel_alpha() {
+            0x40 // MPCC_ALPHA_BLEND_MODE_PER_PIXEL_ALPHA, multiplied
+        } else {
+            0x20 // MPCC_ALPHA_BLEND_MODE_GLOBAL_ALPHA
+        };
         [
-            // Top-layer-only, global opaque alpha, unity gains. XRGB's unused
-            // byte must never become coverage. Disable inherited stereo too.
-            (self.mpcc(p, 3), 0xffff0ff3, 0xffff0422),
+            // Top-layer-only, unity gains. An X format's unused bits never
+            // become coverage. Disable inherited stereo too.
+            (self.mpcc(p, 3), 0xffff0ff3, 0xffff0402 | blend),
             (self.mpcc(p, 4), 0x3033f, 0),
             (self.mpcc(p, 6), 0x7ffff, 0x1f000),
             (self.mpcc(p, 7), 0x7ffff, 0x1f000),
@@ -253,7 +262,8 @@ impl Surfaces {
     }
 }
 impl Otg {
-    /// Prepare opaque full-frame RGB composition while every route is detached.
+    /// Prepare full-frame RGB composition (opaque, or per-pixel premultiplied
+    /// alpha over the black background) while every route is detached.
     /// # Safety
     /// Retain all owners and inherited resources on every outcome. Exclude
     /// firmware/FAMS and concurrent display, hub/VM, clock, reset and power writers.

@@ -124,6 +124,42 @@ fn dcn401_mpc_stages_opaque_rgb_all_depths_and_pipes_without_connecting() -> Tes
     }
     TestResult::Pass
 }
+/// dcn401_update_mpcc_sequence's blend config: MPCC_ALPHA_BLND_MODE 0
+/// (per-pixel) with MPCC_ALPHA_MULTIPLIED_MODE for the formats amdgpu_dm
+/// blends per pixel by default, 2 (global alpha 0xff) for the rest.
+fn dcn401_mpc_blends_alpha_formats_premultiplied_like_linux() -> TestResult {
+    for (format, _, _, _, _, _, _, alpha) in LINUX_FORMATS {
+        let p = 3;
+        let mode = Mode {
+            surface: SurfaceRequest { format, ..req(p) },
+            ..small(p)
+        };
+        let (_backing, pool, mut e, mut surfaces, clock) =
+            ready_mpc_with(p, ColorDepth::Bpc10, mode);
+        let before = e.io.surface.inner.regs.clone();
+        surfaces
+            .prepare_mpc(&mut e, p, || Ok((clock, config())))
+            .unwrap();
+        let control = if alpha { 0xffff0442 } else { 0xffff0422 };
+        let f = &e.io.surface.inner;
+        for (at, mask, value) in rgb(p, ColorDepth::Bpc10) {
+            let value = if at == MPC_BASE + (3 + u64::from(p) * 0x15) * 4 {
+                control
+            } else {
+                value
+            };
+            assert_eq!(f.regs[&at], (before[&at] & !mask) | value);
+        }
+        drop(surfaces);
+        assert_eq!(pool.available(), 4096);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-mpc",
+    dcn401_mpc_blends_alpha_formats_premultiplied_like_linux
+);
+
 /// A limited-range stream loads mpc3_set_ocsc_default's
 /// COLOR_SPACE_SRGB_LIMITED matrix into set A in S2.13 format and selects
 /// it, replacing the bypass write; set A in use is not pending.

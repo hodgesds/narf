@@ -31,12 +31,154 @@ mod scanout;
 pub use flip::FlipDone;
 pub use scanout::{ScanoutPosition, ScanoutRunning, ScanoutUnderflow, VblankPhase};
 
+/// A single-plane packed RGB scanout format: the DRM fourccs amdgpu_dm
+/// offers on a DCN4.0.1 primary plane that this path programs, each mapped
+/// to its DC surface format as amdgpu_dm_plane_fill_dc_plane_info_and_addr
+/// does (X and A variants share one; only the blending differs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SurfaceFormat {
-    /// Little-endian packed 0xXXRRGGBB pixels.
+    /// Little-endian packed 0xXXRRGGBB pixels (GRPH_ARGB8888).
     Xrgb8888,
-    /// Little-endian packed 0xXXBBGGRR pixels.
+    /// Little-endian packed 0xAARRGGBB pixels (GRPH_ARGB8888).
+    Argb8888,
+    /// Little-endian packed 0xXXBBGGRR pixels (GRPH_ABGR8888).
     Xbgr8888,
+    /// Little-endian packed 0xAABBGGRR pixels (GRPH_ABGR8888).
+    Abgr8888,
+    /// 2:10:10:10 x:R:G:B, little-endian (GRPH_ARGB2101010).
+    Xrgb2101010,
+    /// 2:10:10:10 A:R:G:B (GRPH_ARGB2101010).
+    Argb2101010,
+    /// 2:10:10:10 x:B:G:R (GRPH_ABGR2101010).
+    Xbgr2101010,
+    /// 2:10:10:10 A:B:G:R (GRPH_ABGR2101010).
+    Abgr2101010,
+    /// 5:6:5 R:G:B, little-endian 16-bit (GRPH_RGB565).
+    Rgb565,
+    /// 16:16:16:16 half-float x:R:G:B (GRPH_ARGB16161616F).
+    Xrgb16161616f,
+    /// 16:16:16:16 half-float A:R:G:B (GRPH_ARGB16161616F).
+    Argb16161616f,
+    /// 16:16:16:16 half-float x:B:G:R (GRPH_ABGR16161616F).
+    Xbgr16161616f,
+    /// 16:16:16:16 half-float A:B:G:R (GRPH_ABGR16161616F).
+    Abgr16161616f,
+}
+impl SurfaceFormat {
+    /// Every format, in the order the native plane lists them.
+    pub const ALL: [Self; 13] = [
+        Self::Xrgb8888,
+        Self::Argb8888,
+        Self::Xbgr8888,
+        Self::Abgr8888,
+        Self::Xrgb2101010,
+        Self::Argb2101010,
+        Self::Xbgr2101010,
+        Self::Abgr2101010,
+        Self::Rgb565,
+        Self::Xrgb16161616f,
+        Self::Argb16161616f,
+        Self::Xbgr16161616f,
+        Self::Abgr16161616f,
+    ];
+    /// The DRM fourcc (drm_fourcc.h).
+    pub const fn fourcc(self) -> u32 {
+        let code = match self {
+            Self::Xrgb8888 => *b"XR24",
+            Self::Argb8888 => *b"AR24",
+            Self::Xbgr8888 => *b"XB24",
+            Self::Abgr8888 => *b"AB24",
+            Self::Xrgb2101010 => *b"XR30",
+            Self::Argb2101010 => *b"AR30",
+            Self::Xbgr2101010 => *b"XB30",
+            Self::Abgr2101010 => *b"AB30",
+            Self::Rgb565 => *b"RG16",
+            Self::Xrgb16161616f => *b"XR4H",
+            Self::Argb16161616f => *b"AR4H",
+            Self::Xbgr16161616f => *b"XB4H",
+            Self::Abgr16161616f => *b"AB4H",
+        };
+        u32::from_le_bytes(code)
+    }
+    /// The format of a DRM fourcc, if this path scans it out.
+    pub fn from_fourcc(fourcc: u32) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.fourcc() == fourcc)
+    }
+    /// Bytes per pixel: DML's 444_16, 444_32 or 444_64 source format.
+    pub const fn bytes_per_pixel(self) -> u32 {
+        match self {
+            Self::Rgb565 => 2,
+            Self::Xrgb16161616f
+            | Self::Argb16161616f
+            | Self::Xbgr16161616f
+            | Self::Abgr16161616f => 8,
+            _ => 4,
+        }
+    }
+    /// The 256-byte-aligned linear pitch of a `width`-pixel line, in bytes.
+    pub const fn pitch_bytes(self, width: u32) -> u32 {
+        (width * self.bytes_per_pixel()).div_ceil(256) * 256
+    }
+    /// hubp2_program_pixel_format's DCSURF_SURFACE_PIXEL_FORMAT: 3 RGB565,
+    /// 8 A*GB8888, 10 A*GB2101010, 24 A*GB16161616F (the crossbar swaps
+    /// the BGR orders).
+    const fn hubp_pixel_format(self) -> u32 {
+        match self {
+            Self::Rgb565 => 3,
+            Self::Xrgb8888 | Self::Argb8888 | Self::Xbgr8888 | Self::Abgr8888 => 8,
+            Self::Xrgb2101010 | Self::Argb2101010 | Self::Xbgr2101010 | Self::Abgr2101010 => 10,
+            _ => 24,
+        }
+    }
+    /// The DC ABGR surface formats, whose red and blue come in swapped.
+    const fn abgr(self) -> bool {
+        matches!(
+            self,
+            Self::Xbgr8888
+                | Self::Abgr8888
+                | Self::Xbgr2101010
+                | Self::Abgr2101010
+                | Self::Xbgr16161616f
+                | Self::Abgr16161616f
+        )
+    }
+    /// HUBPRET_CONTROL CROSSBAR_SRC_CB_B and CROSSBAR_SRC_CR_R
+    /// (hubp2_program_pixel_format): blue from 2 and red from 3, swapped
+    /// for the ABGR formats.
+    pub(in crate::amdgpu_dcn401_otg) const fn crossbar(self) -> u32 {
+        let (blue, red) = if self.abgr() { (3, 2) } else { (2, 3) };
+        blue << 20 | red << 22
+    }
+    /// dpp401_dpp_setup's CNVC_SURFACE_PIXEL_FORMAT: as the HUBP's, except
+    /// ABGR16161616F is 25 (Linux programs both its HUBP crossbar swap and
+    /// this).
+    pub(in crate::amdgpu_dcn401_otg) const fn cnvc_pixel_format(self) -> u32 {
+        match self {
+            Self::Xbgr16161616f | Self::Abgr16161616f => 25,
+            _ => self.hubp_pixel_format(),
+        }
+    }
+    /// dpp401_dpp_setup's FORMAT_CONTROL ALPHA_EN: off only for RGB565,
+    /// which carries no alpha.
+    pub(in crate::amdgpu_dcn401_otg) const fn cnvc_alpha(self) -> bool {
+        !matches!(self, Self::Rgb565)
+    }
+    /// Per-pixel premultiplied alpha, as
+    /// amdgpu_dm_plane_fill_blending_from_plane_state sets it for the
+    /// primary plane's default "pixel blend mode" (Pre-multiplied): only its
+    /// alpha_formats list, which (as in Linux) has ARGB16161616F but not
+    /// ABGR16161616F. Every X format, and these otherwise, blends opaque
+    /// (MPCC global alpha 0xff).
+    pub const fn per_pixel_alpha(self) -> bool {
+        matches!(
+            self,
+            Self::Argb8888
+                | Self::Abgr8888
+                | Self::Argb2101010
+                | Self::Abgr2101010
+                | Self::Argb16161616f
+        )
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SurfaceRequest {
@@ -72,7 +214,7 @@ impl SurfaceRequest {
             return Err(Error::Invalid);
         }
         // Linear surfaces use 256-byte-aligned rows and page-aligned backing.
-        let pitch = ((self.width + 63) & !63) * 4;
+        let pitch = self.format.pitch_bytes(self.width);
         Ok((pitch, u64::from(pitch) * u64::from(self.height)))
     }
 }
@@ -95,20 +237,46 @@ impl SurfaceRequest {
     }
 }
 impl SurfaceApplied {
+    /// The byte offset of `count` packed 32-bit words written into row `y`
+    /// from pixel `x`: they start on a word and end within the row's pixels
+    /// rounded up to whole words (inside the 256-byte-aligned pitch).
+    pub(in crate::amdgpu_dcn401_otg) fn row_words(
+        self,
+        x: u32,
+        y: u32,
+        count: usize,
+    ) -> Result<u64, Error> {
+        let bpp = self.request.format.bytes_per_pixel();
+        let count = u32::try_from(count).map_err(|_| Error::Invalid)?;
+        let row = (self.request.width * bpp).div_ceil(4);
+        let first = u64::from(x) * u64::from(bpp);
+        if count == 0
+            || y >= self.request.height
+            || first % 4 != 0
+            || first / 4 + u64::from(count) > u64::from(row)
+        {
+            return Err(Error::Invalid);
+        }
+        Ok(u64::from(y) * u64::from(self.pitch_bytes) + first)
+    }
     /// One segment's HUBP surface registers: the shared address and pitch,
     /// with a viewport of that segment's columns (hubp401_set_viewport).
+    /// hubp401_program_size's PITCH is in pixels, less one;
+    /// hubp2_program_pixel_format sets the format and crossbar.
     fn registers(self, x: u32, width: u32) -> [(u64, u32, u32); 18] {
         let dimensions = width | self.request.height << 16;
-        let crossbar = match self.request.format {
-            SurfaceFormat::Xrgb8888 => 0xe00000,
-            SurfaceFormat::Xbgr8888 => 0xb00000,
-        };
+        let format = self.request.format;
         [
             (0x612, 0x203, 0), // primary TMZ, both DCC enables
             (0x5e7, 7, 0),     // ADDR3 linear; DIM_TYPE stays at native 2D
-            (0x607, 0xffff, self.pitch_bytes / 4 - 1),
-            (0x5e5, 0xf7f, 8), // RGB8888, no rotation/mirror/alpha plane
-            (0x66d, 0xf00000, crossbar),
+            (
+                0x607,
+                0xffff,
+                self.pitch_bytes / format.bytes_per_pixel() - 1,
+            ),
+            // No rotation, mirror or alpha plane.
+            (0x5e5, 0xf7f, format.hubp_pixel_format()),
+            (0x66d, 0xf00000, format.crossbar()),
             (0x5eb, 0x3fff3fff, dimensions),
             (0x5e9, u32::MAX, x),
             (0x5ef, 0x3fff3fff, dimensions),
@@ -278,20 +446,13 @@ impl Surfaces {
             .and_then(Option::as_ref)
             .ok_or(Error::Invalid)?;
         let a = surface.applied;
-        let count = u32::try_from(pixels.len()).map_err(|_| Error::Invalid)?;
-        if count == 0
-            || y >= a.request.height
-            || x.checked_add(count).is_none_or(|end| end > a.request.width)
-        {
-            return Err(Error::Invalid);
-        }
+        let start = a.row_words(x, y, pixels.len())?;
         if !engine.status.state.reusable() || engine.status.surfaces[usize::from(pipe)] != Some(a) {
             return Err(Error::Busy);
         }
         engine.hubp_tree_stopped(Some(pipe))?;
         engine.verify_surface(a)?;
         let map = surface.memory.mapping();
-        let start = u64::from(y) * u64::from(a.pitch_bytes) + u64::from(x) * 4;
         engine.status.state = State::PreparingSurface(pipe);
         let result = engine
             .access(|_| {
@@ -415,8 +576,10 @@ impl Otg {
     ) -> Result<SurfaceApplied, Error> {
         self.1.prepare(&mut self.0, pool, request).await
     }
-    /// Upload part of one visible row of a staged, stopped surface. No raw CPU
-    /// pointer escapes. The native HDP flush publishes the CPU writes.
+    /// Upload part of one visible row of a staged, stopped surface: `pixels`
+    /// are the row's packed little-endian 32-bit words from pixel `x` (one
+    /// word per pixel at 4 bytes per pixel). No raw CPU pointer escapes. The
+    /// native HDP flush publishes the CPU writes.
     /// # Safety
     /// Exclude concurrent firmware/FAMS/display/HDP/clock/power writers and
     /// retain the owner and all inherited resources on every outcome.

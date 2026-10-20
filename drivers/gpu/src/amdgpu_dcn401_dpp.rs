@@ -1,6 +1,12 @@
-//! DCN401 opaque, unscaled full-frame RGB preparation. Native references:
+//! DCN401 unscaled full-frame RGB preparation. Native references:
 //! dpp401_dpp_setup, dpp401_dscl_set_scaler_manual_scale, dpp35 FCNV and
 //! dpp3 CM programming. MPC remains disconnected; no pixels are fetched.
+//!
+//! Every surface format takes amdgpu_dm's default plane color state: no
+//! degamma (in_transfer_func bypass), sRGB color space (post CSC bypass),
+//! no bias/scale (FCNV bias 0, scale 1.0) and the unity HDR multiplier.
+//! FP16 needs nothing more: its values pass through and the output
+//! denormalization clamps them, as on Linux without color properties.
 use super::*;
 use crate::amdgpu_gmc_navi48::{DisplayContext, Gmc};
 
@@ -31,7 +37,9 @@ impl Layout {
 }
 // Native dscl401_calc_lb_num_partitions and dpp401_dscl_is_lb_conf_valid:
 // RGB unity uses ceil(width/6) entries per row and one vertical tap; that
-// needs at least two partitions. No per-pixel alpha, chroma or scaling.
+// needs at least two partitions. A per-pixel alpha line takes as many
+// entries in the same memories, so it never lowers the count. No chroma or
+// scaling.
 fn line_buffer(width: u32) -> Result<u8, Error> {
     if width == 0 {
         return Err(Error::Invalid);
@@ -48,10 +56,20 @@ fn line_buffer(width: u32) -> Result<u8, Error> {
 /// size cover the segment's columns.
 fn registers(a: DppApplied, width: u32) -> [(u64, u32, u32); 29] {
     let dimensions = width | a.surface.request.height << 16;
+    let format = a.surface.request.format;
+    // The scaler's line buffer carries alpha only where the MPCC blends it
+    // (lb_params.alpha_en = per_pixel_alpha).
+    let lb_alpha = u32::from(format.per_pixel_alpha()) << 4;
     [
-        (FORMAT_CONTROL, 0x3f033111, 0x24000101), // RGB crossbar; EXPANSION_MODE_ZERO = 1
-        (0xccf, 0x17f, 8),                        // RGB8888, no separate alpha plane
-        (0xcd7, 0x33, 0),                         // color/luma keying disabled
+        // RGB crossbar; EXPANSION_MODE_ZERO = 1; ALPHA_EN unless RGB565.
+        (
+            FORMAT_CONTROL,
+            0x3f033111,
+            0x24000001 | u32::from(format.cnvc_alpha()) << 8,
+        ),
+        // dpp401_dpp_setup's format, no separate alpha plane.
+        (0xccf, 0x17f, format.cnvc_pixel_format()),
+        (0xcd7, 0x33, 0), // color/luma keying disabled
         (0xcde, 0x11, 0),
         (0xcee, 0x11, 0), // pre de/re-alpha off
         (0xced, 0x73, 0), // pre-degamma bypass (encoded RGB passes through)
@@ -73,8 +91,8 @@ fn registers(a: DppApplied, width: u32) -> [(u64, u32, u32); 29] {
         (0xd1e, 0x3fff3fff, 0),    // full-frame origin
         (0xd1f, 0x3fff3fff, dimensions),
         (0xd20, 0x3fff3fff, dimensions),
-        (0xd08, 7, 0),    // native SCALING_444_BYPASS, not full DSCL bypass (6)
-        (0xd21, 0x11, 0), // float line buffer, no interleave or per-pixel alpha
+        (0xd08, 7, 0),           // native SCALING_444_BYPASS, not full DSCL bypass (6)
+        (0xd21, 0x11, lb_alpha), // float line buffer, no interleave
         (0xd22, 0x3f03, 0x3f00 | u32::from(a.line_buffer_config)),
         (0xd28, 1, 0),
         (0xd29, 1, 0), // no adaptive filtering
@@ -257,7 +275,8 @@ impl Surfaces {
 }
 impl Otg {
     /// Stage native unscaled RGB conversion and line-buffer setup for a retained
-    /// full-frame surface. Fetch, MPC and timing remain stopped.
+    /// full-frame surface of any `SurfaceFormat`. Fetch, MPC and timing
+    /// remain stopped.
     /// # Safety
     /// Retain all owners and inherited resources on every outcome. Exclude
     /// firmware/FAMS and concurrent display, hub/VM, clock, reset and power writers.

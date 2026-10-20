@@ -112,6 +112,222 @@ fn req(pipe: u8) -> SurfaceRequest {
     }
 }
 
+/// Each format as Linux programs it, written out from
+/// amdgpu_dm_plane_fill_dc_plane_info_and_addr (fourcc to DC format),
+/// hubp2_program_pixel_format (SURFACE_PIXEL_FORMAT and the HUBPRET
+/// CROSSBAR_SRC_CB_B/CR_R fields, shifts 20/22 in dcn_4_1_0_sh_mask.h),
+/// dpp401_dpp_setup (CNVC_SURFACE_PIXEL_FORMAT, FORMAT_CONTROL ALPHA_EN)
+/// and amdgpu_dm_plane_fill_blending_from_plane_state's alpha_formats with
+/// the default pre-multiplied blend mode: (format, fourcc, bytes per pixel,
+/// SURFACE_PIXEL_FORMAT, crossbar, CNVC format, ALPHA_EN, per-pixel alpha).
+pub(super) type LinuxFormat = (SurfaceFormat, u32, u32, u32, u32, u32, u32, bool);
+pub(super) const LINUX_FORMATS: [LinuxFormat; 13] = [
+    (
+        SurfaceFormat::Xrgb8888,
+        0x3432_5258,
+        4,
+        8,
+        0xe00000,
+        8,
+        1,
+        false,
+    ),
+    (
+        SurfaceFormat::Argb8888,
+        0x3432_5241,
+        4,
+        8,
+        0xe00000,
+        8,
+        1,
+        true,
+    ),
+    (
+        SurfaceFormat::Xbgr8888,
+        0x3432_4258,
+        4,
+        8,
+        0xb00000,
+        8,
+        1,
+        false,
+    ),
+    (
+        SurfaceFormat::Abgr8888,
+        0x3432_4241,
+        4,
+        8,
+        0xb00000,
+        8,
+        1,
+        true,
+    ),
+    (
+        SurfaceFormat::Xrgb2101010,
+        0x3033_5258,
+        4,
+        10,
+        0xe00000,
+        10,
+        1,
+        false,
+    ),
+    (
+        SurfaceFormat::Argb2101010,
+        0x3033_5241,
+        4,
+        10,
+        0xe00000,
+        10,
+        1,
+        true,
+    ),
+    (
+        SurfaceFormat::Xbgr2101010,
+        0x3033_4258,
+        4,
+        10,
+        0xb00000,
+        10,
+        1,
+        false,
+    ),
+    (
+        SurfaceFormat::Abgr2101010,
+        0x3033_4241,
+        4,
+        10,
+        0xb00000,
+        10,
+        1,
+        true,
+    ),
+    (
+        SurfaceFormat::Rgb565,
+        0x3631_4752,
+        2,
+        3,
+        0xe00000,
+        3,
+        0,
+        false,
+    ),
+    (
+        SurfaceFormat::Xrgb16161616f,
+        0x4834_5258,
+        8,
+        24,
+        0xe00000,
+        24,
+        1,
+        false,
+    ),
+    (
+        SurfaceFormat::Argb16161616f,
+        0x4834_5241,
+        8,
+        24,
+        0xe00000,
+        24,
+        1,
+        true,
+    ),
+    (
+        SurfaceFormat::Xbgr16161616f,
+        0x4834_4258,
+        8,
+        24,
+        0xb00000,
+        25,
+        1,
+        false,
+    ),
+    // Linux's alpha_formats omits ABGR16161616F: it blends opaque.
+    (
+        SurfaceFormat::Abgr16161616f,
+        0x4834_4241,
+        8,
+        24,
+        0xb00000,
+        25,
+        1,
+        false,
+    ),
+];
+
+/// Every format's fourcc, depth, linear pitch and HUBP words, and the
+/// word-granular row upload at each depth.
+fn dcn401_surface_programs_every_format_as_linux() -> TestResult {
+    for (format, fourcc, bpp, hubp, crossbar, _, _, alpha) in LINUX_FORMATS {
+        assert_eq!(SurfaceFormat::from_fourcc(fourcc), Some(format));
+        assert_eq!(format.fourcc(), fourcc);
+        assert_eq!(format.bytes_per_pixel(), bpp);
+        assert_eq!(format.per_pixel_alpha(), alpha);
+        // 65 pixels: 130, 260 or 520 bytes, each rounded up to 256.
+        let pitch = match bpp {
+            2 => 256,
+            4 => 512,
+            _ => 768,
+        };
+        let p = 1;
+        let (_backing, pool, mut e, mut surfaces) = fixture(p, 8192);
+        let request = SurfaceRequest { format, ..req(p) };
+        let applied = run(surfaces.prepare(&mut e, &pool, request)).unwrap();
+        assert_eq!(applied.pitch_bytes, pitch);
+        assert_eq!(applied.bytes, 3 * u64::from(pitch));
+        for (r, expected) in [
+            (0x5e5, 0x40000000 | hubp),
+            (0x607, 0x40000000 | (pitch / bpp - 1)),
+            (0x66d, 0x40008000 | crossbar),
+            (0x5eb, 0x40034041),
+        ] {
+            assert_eq!(e.io.inner.regs[&h(p, r)], expected);
+        }
+        // Words start on a word and stay within the row's pixels.
+        let words = (65 * bpp).div_ceil(4) as usize;
+        let row = alloc::vec![0x0102_0304u32; words];
+        assert_eq!(surfaces.upload(&mut e, p, 0, 1, &row), Ok(()));
+        let more = alloc::vec![0u32; words + 1];
+        assert_eq!(surfaces.upload(&mut e, p, 0, 1, &more), Err(Error::Invalid));
+        // SAFETY: reads stay inside the test's owned heap mapping.
+        let last = unsafe { e.io.map.read32(u64::from(pitch) + 4 * (words as u64 - 1)) };
+        assert_eq!(last, 0x0102_0304);
+        // SAFETY: as above; the padding past the row stays cleared.
+        let padding = unsafe { e.io.map.read32(u64::from(pitch) + 4 * words as u64) };
+        assert_eq!(padding, 0);
+        if bpp == 2 {
+            assert_eq!(surfaces.upload(&mut e, p, 1, 1, &[1]), Err(Error::Invalid));
+            assert_eq!(surfaces.upload(&mut e, p, 64, 1, &[1]), Ok(()));
+            assert_eq!(
+                surfaces.upload(&mut e, p, 64, 1, &[1, 2]),
+                Err(Error::Invalid)
+            );
+        }
+        if bpp == 8 {
+            assert_eq!(surfaces.upload(&mut e, p, 64, 1, &[1, 2]), Ok(()));
+            assert_eq!(
+                surfaces.upload(&mut e, p, 64, 1, &[1, 2, 3]),
+                Err(Error::Invalid)
+            );
+        }
+        drop(surfaces);
+        assert_eq!(pool.available(), 4096);
+    }
+    for fourcc in [
+        0,
+        0x3432_5241 ^ 1,
+        0x3231_564e, /* NV12 */
+        0x3834_5258, /* XR48 */
+    ] {
+        assert_eq!(SurfaceFormat::from_fourcc(fourcc), None);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-surface",
+    dcn401_surface_programs_every_format_as_linux
+);
+
 fn dcn401_surface_stages_owned_padded_rgb_on_every_pipe() -> TestResult {
     for p in 0..4 {
         for format in [SurfaceFormat::Xrgb8888, SurfaceFormat::Xbgr8888] {

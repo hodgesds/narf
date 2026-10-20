@@ -244,6 +244,42 @@ kernel_test_in!(
     dcn401_dpp_stages_native_rgb_and_unity_scaling_on_all_pipes
 );
 
+/// dpp401_dpp_setup's CNVC format and ALPHA_EN, and the line buffer's
+/// alpha (lb_params.alpha_en = per_pixel_alpha), for every format; the
+/// rest of the unity RGB state is the same for all of them.
+fn dcn401_dpp_programs_every_format_as_linux() -> TestResult {
+    for (format, _, _, _, _, cnvc, alpha_en, alpha) in LINUX_FORMATS {
+        let p = 2;
+        let mode = Mode {
+            surface: SurfaceRequest { format, ..req(p) },
+            ..small(p)
+        };
+        let (_backing, pool, mut e, mut surfaces, clock) = ready_with(p, ColorDepth::Bpc8, mode);
+        let a = run(surfaces.prepare_dpp(&mut e, p, || Ok((clock, config())))).unwrap();
+        assert_eq!(a.line_buffer_config, 1);
+        for (r, value) in RGB {
+            let value = match r {
+                0xcd0 => 0x24000001 | alpha_en << 8 | 0x100000,
+                0xccf => cnvc,
+                0xd21 => u32::from(alpha) << 4,
+                0xd67 => value | 0x100,
+                _ => value,
+            };
+            assert_eq!(
+                e.fake().regs[&d(p, r)],
+                (if r == 0xd76 { 0 } else { 0x80000000 }) | value
+            );
+        }
+        drop(surfaces);
+        assert_eq!(pool.available(), 4096);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dpp",
+    dcn401_dpp_programs_every_format_as_linux
+);
+
 fn dcn401_dpp_preflight_rejects_stale_owners_geometry_and_pending_updates() -> TestResult {
     let (_backing, _pool, mut e, mut surfaces, clock) = ready(0);
     for p in [1, 4, 255] {
