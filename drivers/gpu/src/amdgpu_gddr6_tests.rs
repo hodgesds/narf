@@ -20,6 +20,8 @@ struct Fake {
     setup: bool,
     enabled: bool,
     violation: bool,
+    /// The cache written back to C2P (PSP_MEM_TRAIN_RESTORE).
+    exchanged: Option<Vec<u8>>,
 }
 impl Io for Fake {
     fn read(&mut self, reg: u32) -> u32 {
@@ -31,7 +33,12 @@ impl Io for Fake {
     }
     fn write(&mut self, reg: u32, value: u32) {
         self.writes.push((reg, value));
-        if reg == STATUS {
+        if reg == STATUS && value == SHORT_TRAIN {
+            // Short training reads the restored C2P cache; it does not
+            // encroach on the bottom of VRAM.
+            self.violation |= self.exchanged.is_none();
+            self.status = self.completion.unwrap_or(0);
+        } else if reg == STATUS {
             self.violation |= self.copied != self.memory.len() || value != LONG_TRAIN;
             self.memory.fill(0xee); // BIST encroaches on the boot framebuffer.
             self.status = self.completion.unwrap_or(0);
@@ -57,6 +64,11 @@ impl Io for Fake {
         self.violation |= self.restored != self.memory.len();
         self.flushed = true;
     }
+    fn write_exchange(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error> {
+        self.violation |= offset != (12 << 30) - (9 << 20) || bytes.len() != 4096;
+        self.exchanged = Some(bytes.to_vec());
+        Ok(())
+    }
     fn read_result(&mut self, offset: u64, bytes: &mut [u8]) -> Result<(), Error> {
         self.violation |= !self.flushed || offset != (12 << 30) - 0x8000 || bytes.len() != 4096;
         bytes.fill(0xa5);
@@ -81,6 +93,7 @@ fn engine() -> Engine<Fake> {
             setup: true,
             enabled: true,
             violation: false,
+            exchanged: None,
         },
         authority: Cap::bootstrap(),
         exchange: Training {
@@ -350,4 +363,73 @@ fn gddr6_runtime_training_policy_is_bounded() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/gddr6",
     gddr6_runtime_training_policy_is_bounded
+);
+
+/// psp_v14_0_memory_training(PSP_MEM_TRAIN_RESUME): with a valid cache that
+/// matches P2C, restore it to C2P and send short training only.
+fn gddr6_resume_restores_cache_and_short_trains() -> TestResult {
+    let mut e = engine();
+    run(e.run()).unwrap();
+    let cache = e.cache.clone();
+    let (copied, original) = (e.io.copied, e.io.memory.clone());
+    e.io.writes.clear();
+    e.io.flushed = true;
+    run(e.resume()).unwrap();
+    assert_eq!(e.state, State::Ready);
+    assert!(!e.io.violation);
+    assert_eq!(e.io.exchanged.as_deref(), Some(&cache[..]));
+    assert_eq!(e.io.writes, [(ADDRESS, 12279), (STATUS, SHORT_TRAIN)]);
+    // No long training: the 32 MiB preimage is neither copied nor written.
+    assert_eq!((e.io.copied, &e.io.memory), (copied, &original));
+    // A resident SOS skips training on resume too.
+    e.io.heartbeat = 1;
+    e.io.writes.clear();
+    run(e.resume()).unwrap();
+    assert_eq!(e.state, State::ResidentSos);
+    assert!(e.io.writes.is_empty());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gddr6",
+    gddr6_resume_restores_cache_and_short_trains
+);
+
+/// The firmware trained at boot (SOS resident, no cache): resume saves P2C
+/// first; with no signed P2C either, it escalates to long training + save.
+fn gddr6_resume_escalates_to_save_and_long_training_like_linux() -> TestResult {
+    let mut e = engine();
+    e.io.heartbeat = 1;
+    run(e.run()).unwrap();
+    assert_eq!(e.state, State::ResidentSos);
+    e.io.heartbeat = 0;
+    e.io.flushed = true;
+    run(e.resume()).unwrap();
+    assert!(e.cache_valid() && !e.io.violation);
+    assert_eq!(e.io.writes, [(ADDRESS, 12279), (STATUS, SHORT_TRAIN)]);
+    assert_eq!(e.io.copied, 0);
+    // No cache and an unsigned P2C (VRAM lost): long training with the
+    // preimage kept, save, restore, and no short message (Linux drops SHORT
+    // once LONG is set).
+    let mut e = engine();
+    e.state = State::Disabled;
+    e.io.result = false;
+    e.io.flushed = true; // the P2C header read precedes training on resume
+    let original = e.io.memory.clone();
+    run(e.resume()).unwrap();
+    assert_eq!(e.state, State::Ready);
+    assert_eq!(e.io.writes, [(ADDRESS, 12279), (STATUS, LONG_TRAIN)]);
+    assert_eq!(e.io.memory, original);
+    assert!(e.io.exchanged.is_some() && !e.io.violation);
+    // Only a finished trainer may replay.
+    let mut fresh = engine();
+    assert_eq!(run(fresh.resume()), Err(Error::Busy));
+    let mut failed = engine();
+    failed.io.completion = None;
+    assert!(run(failed.run()).is_err());
+    assert_eq!(run(failed.resume()), Err(Error::Busy));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gddr6",
+    gddr6_resume_escalates_to_save_and_long_training_like_linux
 );

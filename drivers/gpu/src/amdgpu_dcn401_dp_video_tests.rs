@@ -825,19 +825,23 @@ fn dcn401_dp_audio_programs_dto1_secondary_packets_and_endpoint_like_linux() -> 
         .timing;
     let live = ScanoutRunning {
         pipe,
-        odm: None,
+        odm: SplitPipes::NONE,
+        mpc: SplitPipes::NONE,
         stream,
         plan: dml::admit(
             &soc,
             &dml::Mode {
                 timing: t,
                 pitch: (t.h_active + 63) & !63,
+                bytes_per_pixel: 4,
                 ycbcr420: false,
                 dsc: None,
+                planes: [None; dml::MAX_PLANES],
             },
         )
         .unwrap(),
         address: 0,
+        overlays: [None; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
         frame_before: 0,
         frame_after: 0,
     };
@@ -1020,6 +1024,8 @@ fn dcn401_dp_video_sends_dsc_pps_like_linux() -> TestResult {
         linebuf_depth: 11,
         version_minor: 2,
         ycbcr422_simple: false,
+        frl: None,
+        bpc: 8,
     };
     let (mut e, mut io, c) = fixture_dsc(2, stream, pipe, ColorDepth::Bpc8, None, Some(cfg));
     if e.io.fake().regs[&dio(stream, 0x211f)] & 1 != 1 {
@@ -1077,6 +1083,8 @@ fn dsc_audio_fixture(stream: u8, pipe: u8) -> (Engine<AudioIo>, Link) {
         linebuf_depth: 11,
         version_minor: 2,
         ycbcr422_simple: false,
+        frl: None,
+        bpc: 8,
     };
     let (mut e, mut io, c) = fixture_dsc(2, stream, pipe, ColorDepth::Bpc8, None, Some(cfg));
     start(&mut e, &mut io, c);
@@ -1225,6 +1233,7 @@ fn dcn401_mst_displays_share_one_link() -> TestResult {
             depth: ColorDepth::Bpc8,
             limited: false,
             ycbcr420: false,
+            colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(false, false),
         },
         c1,
     ))
@@ -1306,3 +1315,141 @@ fn dcn401_mst_displays_share_one_link() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/dcn401-otg", dcn401_mst_displays_share_one_link);
+
+/// link_dpms.c enable_stream_features: after the stream runs,
+/// DP_DOWNSPREAD_CTRL's IGNORE_MSA_TIMING_PARAM follows the stream's VRR
+/// support by read-modify-write, written only when it changes, keeping the
+/// link's spread bit; the link's own configuration checks ignore the bit.
+fn dcn401_dp_stream_features_set_and_clear_ignore_msa() -> TestResult {
+    let (mut e, mut io, c) = fixture(1, 2, 3, ColorDepth::Bpc8);
+    let p = path(1);
+    // Before video runs: Busy, without AUX traffic.
+    let events = io.events.len();
+    if run(e.dp_stream_features(&mut io, p, true)) != Err(Error::Busy) || io.events.len() != events
+    {
+        return TestResult::Fail("before video");
+    }
+    start(&mut e, &mut io, c);
+    let spread = io.bytes.get(&0x107).copied().unwrap_or(0);
+    let aux = |io: &Link, from: usize| -> Vec<(u8, u32, Vec<u8>)> {
+        io.events[from..]
+            .iter()
+            .filter_map(|ev| match ev {
+                Event::Aux(a, at, d) => Some((*a, *at, d.clone())),
+                _ => None,
+            })
+            .collect()
+    };
+    let from = io.events.len();
+    if run(e.dp_stream_features(&mut io, p, true)) != Ok(true)
+        || aux(&io, from)
+            != [
+                (0x90, 0x107, alloc::vec![0]),
+                (0x80, 0x107, alloc::vec![spread | 0x80]),
+            ]
+        || io.bytes.get(&0x107).copied() != Some(spread | 0x80)
+    {
+        return TestResult::Fail("set");
+    }
+    // Unchanged: read only.
+    let from = io.events.len();
+    if run(e.dp_stream_features(&mut io, p, true)) != Ok(false) || aux(&io, from).len() != 1 {
+        return TestResult::Fail("unchanged");
+    }
+    // Another path is not this stream's.
+    if run(e.dp_stream_features(&mut io, path(2), true)) != Err(Error::Invalid) {
+        return TestResult::Fail("other path");
+    }
+    // The stream restarts with the bit set: the sink checks still pass.
+    run(e.stop_dp_video(&mut io, p)).unwrap();
+    start(&mut e, &mut io, c);
+    if run(e.dp_stream_features(&mut io, p, false)) != Ok(true)
+        || io.bytes.get(&0x107).copied() != Some(spread)
+    {
+        return TestResult::Fail("clear");
+    }
+    if e.status.state != State::DpVideoRunning(2) {
+        return TestResult::Fail("state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_dp_stream_features_set_and_clear_ignore_msa
+);
+
+/// enc3_stream_encoder_update_dp_info_packets before the unblank: the VSC
+/// SDP in packets 0 and 1 with GSP0, the HDR SDP in packet 3 with GSP3,
+/// the secondary master on; new metadata rewrites packet 3 live; stopping
+/// the video turns both SDPs off.
+fn dcn401_dp_video_sends_vsc_and_hdr_sdps_like_linux() -> TestResult {
+    let (stream, pipe) = (1u8, 2u8);
+    let (mut e, mut io, c) = fixture(2, stream, pipe, ColorDepth::Bpc8);
+    let mut blob = [0u8; 32];
+    blob[4] = 2;
+    let meta = |b: &[u8; 32]| crate::amdgpu_hdr::HdrOutputMetadata::from_blob(b).unwrap();
+    let hdr = crate::amdgpu_hdr::hdr_info_packet(
+        Some(&meta(&blob)),
+        crate::amdgpu_hdr::HdrConnector::DisplayPort,
+    );
+    // The frontend's request carries both, as the modeset builds it.
+    {
+        let f = e.status.dp_frontend_ready.as_mut().unwrap();
+        f.request.vsc_colorimetry = true;
+        f.request.hdr = Some(hdr);
+    }
+    e.io.fake().writes.clear();
+    start(&mut e, &mut io, c);
+    let vsc = crate::amdgpu_hdr::vsc_sdp(
+        true,
+        crate::amdgpu_hdr::DcColorSpace::Srgb,
+        crate::amdgpu_hdr::PixelEncoding::Rgb,
+        8,
+        false,
+    )
+    .unwrap();
+    let packet = |e: &mut Engine<VideoIo>, index: u32| -> alloc::vec::Vec<u32> {
+        let w = &e.io.fake().writes;
+        let Some(at) = w
+            .iter()
+            .position(|&(a, v)| a == dio(stream, 0x2068) && v & 0xff == index * 9)
+        else {
+            return alloc::vec::Vec::new();
+        };
+        w[at..]
+            .iter()
+            .filter(|&&(a, _)| a == dio(stream, 0x2069))
+            .take(9)
+            .map(|&(_, v)| v)
+            .collect()
+    };
+    let sec = |e: &mut Engine<VideoIo>| e.io.fake().regs[&dio(stream, 0x2141)];
+    if packet(&mut e, 0) != vsc.words()
+        || packet(&mut e, 1) != vsc.words()
+        || packet(&mut e, 3) != hdr.words()
+        || sec(&mut e) & (1 << 20 | 1 << 23 | 1) != 1 << 20 | 1 << 23 | 1
+    {
+        return TestResult::Fail("VSC/HDR SDPs at start");
+    }
+    blob[26..28].copy_from_slice(&400u16.to_le_bytes());
+    let brighter = crate::amdgpu_hdr::hdr_info_packet(
+        Some(&meta(&blob)),
+        crate::amdgpu_hdr::HdrConnector::DisplayPort,
+    );
+    e.io.fake().writes.clear();
+    if run(e.dp_update_hdr(brighter)).is_err()
+        || packet(&mut e, 3) != brighter.words()
+        || !packet(&mut e, 0).is_empty()
+    {
+        return TestResult::Fail("live HDR SDP");
+    }
+    run(e.stop_dp_video(&mut io, path(2))).unwrap();
+    if sec(&mut e) & (1 << 20 | 1 << 23 | 1) != 0 {
+        return TestResult::Fail("SDPs after stop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_dp_video_sends_vsc_and_hdr_sdps_like_linux
+);

@@ -55,21 +55,15 @@ fn ready_mpc_range(
     mode: Mode,
     limited: bool,
 ) -> (Vec<u32>, Pool, Engine<MemoryIo>, Surfaces, dccg::Applied) {
-    let (backing, pool, mut e, mut surfaces, clock) = ready_range(p, depth, mode, limited);
-    e.io.delay = [0; 2]; // DPP acknowledgement timing is covered by its own tests.
-    run(surfaces.prepare_dpp(&mut e, p, || Ok((clock, config())))).unwrap();
-    let mut e = Engine {
-        io: e.io.memory,
-        authority: e.authority,
-        layout: e.layout,
-        status: e.status,
-        displays: e.displays,
-    };
-    let f = &mut e.io.surface.inner;
+    ready_mpc_pipes(p, 0, depth, mode, limited)
+}
+/// A stopped MPCC's inherited state: every staged field off its target,
+/// and the CURRENT selectors left at inherited values (stopped timing
+/// never latches them).
+fn seed_mpc(f: &mut Fake, p: u8, depth: ColorDepth) {
     for (at, mask, value) in rgb(p, depth) {
         f.regs.insert(at, (0x40000000 & !mask) | (value ^ mask));
     }
-    // Stopped timing deliberately keeps CURRENT selectors at inherited values.
     for (at, bits) in [
         (MPC_BASE + (9 + u64::from(p) * 0x15) * 4, 0x10),
         (MPC_BASE + (0x7e + u64::from(p) * 0x5e) * 4, 0x180),
@@ -82,6 +76,30 @@ fn ready_mpc_range(
         (MPC_BASE + (0x30b + u64::from(p) * 0xd) * 4, 0x180),
     ] {
         *f.regs.entry(at).or_default() |= bits;
+    }
+}
+/// `ready_mpc_range`, the pipes in `extra` ready for overlay planes too.
+fn ready_mpc_pipes(
+    p: u8,
+    extra: u8,
+    depth: ColorDepth,
+    mode: Mode,
+    limited: bool,
+) -> (Vec<u32>, Pool, Engine<MemoryIo>, Surfaces, dccg::Applied) {
+    let (backing, pool, mut e, mut surfaces, clock) =
+        ready_range_pipes(p, extra, depth, mode, limited);
+    e.io.delay = [0; 2]; // DPP acknowledgement timing is covered by its own tests.
+    run(surfaces.prepare_dpp(&mut e, p, || Ok((clock, config())))).unwrap();
+    let mut e = Engine {
+        io: e.io.memory,
+        authority: e.authority,
+        layout: e.layout,
+        status: e.status,
+        displays: e.displays,
+    };
+    let f = &mut e.io.surface.inner;
+    for q in (0..4u8).filter(|&q| q == p || extra & 1 << q != 0) {
+        seed_mpc(f, q, depth);
     }
     f.writes.clear();
     (backing, pool, e, surfaces, clock)
@@ -124,6 +142,42 @@ fn dcn401_mpc_stages_opaque_rgb_all_depths_and_pipes_without_connecting() -> Tes
     }
     TestResult::Pass
 }
+/// dcn401_update_mpcc_sequence's blend config: MPCC_ALPHA_BLND_MODE 0
+/// (per-pixel) with MPCC_ALPHA_MULTIPLIED_MODE for the formats amdgpu_dm
+/// blends per pixel by default, 2 (global alpha 0xff) for the rest.
+fn dcn401_mpc_blends_alpha_formats_premultiplied_like_linux() -> TestResult {
+    for (format, _, _, _, _, _, _, alpha) in LINUX_FORMATS {
+        let p = 3;
+        let mode = Mode {
+            surface: SurfaceRequest { format, ..req(p) },
+            ..small(p)
+        };
+        let (_backing, pool, mut e, mut surfaces, clock) =
+            ready_mpc_with(p, ColorDepth::Bpc10, mode);
+        let before = e.io.surface.inner.regs.clone();
+        surfaces
+            .prepare_mpc(&mut e, p, || Ok((clock, config())))
+            .unwrap();
+        let control = if alpha { 0xffff0442 } else { 0xffff0422 };
+        let f = &e.io.surface.inner;
+        for (at, mask, value) in rgb(p, ColorDepth::Bpc10) {
+            let value = if at == MPC_BASE + (3 + u64::from(p) * 0x15) * 4 {
+                control
+            } else {
+                value
+            };
+            assert_eq!(f.regs[&at], (before[&at] & !mask) | value);
+        }
+        drop(surfaces);
+        assert_eq!(pool.available(), 4096);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-mpc",
+    dcn401_mpc_blends_alpha_formats_premultiplied_like_linux
+);
+
 /// A limited-range stream loads mpc3_set_ocsc_default's
 /// COLOR_SPACE_SRGB_LIMITED matrix into set A in S2.13 format and selects
 /// it, replacing the bypass write; set A in use is not pending.
@@ -327,6 +381,9 @@ fn dcn401_mpc_late_changes_fail_closed_and_reprepare_invalidates_reports() -> Te
                         depth: ColorDepth::Bpc12,
                         limited: false,
                         ycbcr420: false,
+                        colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(
+                            false, false,
+                        ),
                     },
                     clock,
                 ))
@@ -401,4 +458,57 @@ fn dcn401_mpc_loads_ycbcr709_output_csc_for_420() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-mpc",
     dcn401_mpc_loads_ycbcr709_output_csc_for_420
+);
+
+/// find_color_matrix by the stream's color space: a BT.2020 YCbCr or
+/// BT.601 4:2:0 stream loads output_csc_matrix's YCBCR2020_LIMITED or
+/// YCBCR601 row instead of BT.709's.
+fn dcn401_mpc_loads_the_output_csc_of_the_color_space() -> TestResult {
+    use crate::amdgpu_hdr::DcColorSpace as C;
+    for (cs, row) in [
+        (
+            C::Ycbcr2020Limited,
+            [
+                0xe04, 0xf31d, 0xfedf, 0x1004, 0x733, 0x1294, 0x1a0, 0x201, 0xfc16, 0xf5e6, 0xe04,
+                0x1004,
+            ],
+        ),
+        (
+            C::Ycbcr601,
+            [
+                0xe04, 0xf444, 0xfdb9, 0x1004, 0x831, 0x1016, 0x320, 0x201, 0xfb45, 0xf6b7, 0xe04,
+                0x1004,
+            ],
+        ),
+    ] {
+        let p = 1u8;
+        let mut mode = small(p);
+        (mode.timing.signal, mode.timing.ycbcr420) = (Signal::Tmds, true);
+        mode.timing.timing.h_active = 64;
+        mode.surface.width = 64;
+        mode.clock = clock(mode.timing);
+        let (_backing, _pool, mut e, mut surfaces, clock) =
+            ready_mpc_range(p, ColorDepth::Bpc8, mode, false);
+        e.status.blanks[usize::from(p)]
+            .as_mut()
+            .unwrap()
+            .request
+            .colorspace = cs;
+        let csc = |r: u64| MPC_BASE + (0x30b + u64::from(p) * 0xd + r) * 4;
+        let Ok(a) = surfaces.prepare_mpc(&mut e, p, || Ok((clock, config()))) else {
+            return TestResult::Fail("prepare");
+        };
+        let f = &e.io.surface.inner;
+        if a.colorspace != cs
+            || (0..6).any(|i| f.regs[&csc(1 + i as u64)] != row[2 * i] | row[2 * i + 1] << 16)
+            || f.regs[&csc(0)] & 3 != 1
+        {
+            return TestResult::Fail("color space output CSC");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-mpc",
+    dcn401_mpc_loads_the_output_csc_of_the_color_space
 );

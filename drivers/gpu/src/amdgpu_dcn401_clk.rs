@@ -37,6 +37,8 @@ pub enum Error {
     HardMinTimeout(Clock),
     Frequency(Clock, u32),
     Power(smu::Error),
+    /// The display owner's DPP DTO update inside a live clock update failed.
+    Dto,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -525,6 +527,80 @@ impl<I: Io> Engine<I> {
         }
         result
     }
+    /// dcn401_update_clocks while displays run: the bandwidth sequence's
+    /// display count (prepare only), then the display sequence. A clock
+    /// changes when `should_set_clock`: it rises, or `safe_to_lower` and it
+    /// falls. DTBCLK first, then DISPCLK; a lowered DPPCLK (the DPP DTOs'
+    /// reference) has its DTOs raised for the new reference before the
+    /// reference falls and set again for the actual one after, a raised one
+    /// is raised before its DTOs are updated (`dto`, given the reference in
+    /// kHz). DENTIST is PMFW's on DCN401. Every consumer register other
+    /// than `held` must be idle.
+    async fn update_live(
+        &mut self,
+        request: Request,
+        safe_to_lower: bool,
+        held: &(dyn Fn(u64) -> bool + Sync),
+        dto: &mut (dyn FnMut(u32) -> Result<(), Error> + Send),
+    ) -> Result<Applied, Error> {
+        if self.status.state != State::Applied {
+            return Err(Error::Busy);
+        }
+        let levels = self.status.levels.ok_or(Error::Invalid)?;
+        let current = self.status.applied.ok_or(Error::Invalid)?;
+        if !(1..=4).contains(&request.displays) {
+            return Err(Error::Invalid);
+        }
+        let display = levels.range(Clock::Display).request(request.display_khz)?;
+        let dpp = levels.range(Clock::Dpp).request(request.dpp_khz)?;
+        let dtb = levels.range(Clock::Dtb).request(request.dtb_khz)?;
+        self.idle_except(held)?;
+        let set = |new: u32, cur: u32| (safe_to_lower && new < cur) || new > cur;
+        let mut next = current;
+        self.status.state = State::Applying;
+        let result = async {
+            // CLK_MGR401_UPDATE_NUM_DISPLAYS: sent in prepare while any
+            // display stays on.
+            if !safe_to_lower {
+                self.command(0xe, u32::from(request.displays)).await?;
+                next.request.displays = request.displays;
+            }
+            if set(dtb, current.request.dtb_khz) {
+                next.dtb_khz = self.hard_min(Clock::Dtb, dtb).await?;
+                next.request.dtb_khz = dtb;
+            }
+            let update_dpp = set(dpp, current.request.dpp_khz);
+            let lowered = update_dpp && dpp < current.request.dpp_khz;
+            if set(display, current.request.display_khz) {
+                next.display_khz = self.hard_min(Clock::Display, display).await?;
+                next.request.display_khz = display;
+            }
+            if lowered {
+                // Increase the DTOs before lowering their reference.
+                dto(dpp)?;
+                next.dpp_khz = self.hard_min(Clock::Dpp, dpp).await?;
+                next.request.dpp_khz = dpp;
+                dto(next.dpp_khz)?;
+            } else {
+                // Raise the reference before updating the DTOs.
+                if update_dpp {
+                    next.dpp_khz = self.hard_min(Clock::Dpp, dpp).await?;
+                    next.request.dpp_khz = dpp;
+                }
+                dto(next.dpp_khz)?;
+            }
+            Ok(next)
+        }
+        .await;
+        match result {
+            Ok(applied) => {
+                self.status.applied = Some(applied);
+                self.status.state = State::Applied;
+            }
+            Err(e) => self.status.state = State::Failed(e),
+        }
+        result
+    }
 }
 #[derive(Debug)]
 pub struct ClockManager(Engine<Mmio>);
@@ -594,6 +670,25 @@ impl ClockManager {
     /// activity before writes; failures retain partial floors without rollback.
     pub async fn prepare(&mut self, request: Request) -> Result<Applied, Error> {
         self.0.prepare(request).await
+    }
+    /// Move the floors to `request` while the display owner's displays run
+    /// (their consumer registers `held`), in dcn401_update_clocks order:
+    /// prepare_bandwidth (`safe_to_lower` false) only raises clocks,
+    /// optimize_bandwidth (true) also lowers them. `dto` updates the DPP
+    /// DTOs against the DPPCLK reference it is given, at the points Linux
+    /// does. Failure or cancellation leaves the owner failed.
+    pub(crate) async fn update_live(
+        &mut self,
+        regs: MmioRegion,
+        request: Request,
+        safe_to_lower: bool,
+        held: &(dyn Fn(u64) -> bool + Sync),
+        dto: &mut (dyn FnMut(u32) -> Result<(), Error> + Send),
+    ) -> Result<Applied, Error> {
+        if regs.phys != self.0.io.0.phys || regs.len != self.0.io.0.len {
+            return Err(Error::Invalid);
+        }
+        self.0.update_live(request, safe_to_lower, held, dto).await
     }
 }
 #[cfg(feature = "kernel-test")]

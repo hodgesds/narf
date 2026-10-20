@@ -174,7 +174,10 @@ impl PteFormat {
         } else {
             flags &= !PTE_READABLE;
         }
-        if vm_flags & uapi::AMDGPU_VM_PAGE_WRITEABLE != 0 {
+        // amdgpu_ttm_tt_is_readonly: a READONLY userptr is never writable.
+        if vm_flags & uapi::AMDGPU_VM_PAGE_WRITEABLE != 0
+            && bo_flags & crate::amdgpu_gem::BO_GPU_READONLY == 0
+        {
             flags |= PTE_WRITEABLE;
         } else {
             flags &= !PTE_WRITEABLE;

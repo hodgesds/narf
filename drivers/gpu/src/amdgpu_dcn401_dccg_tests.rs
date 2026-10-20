@@ -923,3 +923,77 @@ fn dcn401_dscclk_follows_linux() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/dcn401-dccg", dcn401_dscclk_follows_linux);
+
+/// dcn401_update_clocks_update_dpp_dto on live pipes: dccg401_update_dpp_dto's
+/// phase (255 modulo, rounded up) against the reference it is given, only
+/// where the DPPCLK rises unless safe to lower; pipe records follow the
+/// clocks they now run on (`rebind_global`). A pipe another display holds
+/// may be busy while a pipe is programmed beside it (`prepare_except`).
+fn dcn401_dccg_live_dpp_dtos_follow_dcn401_update_clocks() -> TestResult {
+    let mut e = engine();
+    let g = clocks();
+    for pipe in [0u8, 2] {
+        run(e.prepare(request(pipe), g)).unwrap();
+    }
+    let phase = |e: &Engine<Fake>, p: u64| reg(e, DPP_PARAM + p) & 0xff;
+    // 148.5 of 351 MHz: ceil(255 * 148500 / 351000) = 108.
+    if phase(&e, 0) != 108 || phase(&e, 2) != 108 {
+        return TestResult::Fail("staged phases");
+    }
+    // prepare: the reference rose to 700 MHz; pipe 0 needs 300 MHz now,
+    // pipe 2 keeps 148.5 (and its phase: faster on the higher reference).
+    e.io.writes.clear();
+    e.update_dpp_dtos(700_000, &[(0, 300_000), (2, 148_500)], false)
+        .unwrap();
+    if phase(&e, 0) != (255u32 * 300_000).div_ceil(700_000)
+        || phase(&e, 2) != 108
+        || e.io
+            .writes
+            .iter()
+            .any(|&(at, _)| at == BASE + (DPP_PARAM + 2) * 4)
+    {
+        return TestResult::Fail("prepare raises only rising DTOs");
+    }
+    // optimize: every DTO set for the lower reference.
+    e.update_dpp_dtos(400_000, &[(0, 300_000), (2, 148_500)], true)
+        .unwrap();
+    if phase(&e, 0) != (255u32 * 300_000).div_ceil(400_000)
+        || phase(&e, 2) != (255u32 * 148_500).div_ceil(400_000)
+        || reg(&e, DPP_PARAM) >> 16 != 0xff
+        || reg(&e, DPP_ENABLE) & 1 != 1
+    {
+        return TestResult::Fail("optimize sets every DTO");
+    }
+    let rec = |e: &Engine<Fake>, p: usize| e.status.pipes[p].unwrap();
+    if rec(&e, 0).dpp_phase as u32 != phase(&e, 0) || rec(&e, 0).request.dpp_khz != 300_000 {
+        return TestResult::Fail("pipe record follows its DTO");
+    }
+    // A DPPCLK above the reference, or a pipe with no clock, is refused.
+    if e.update_dpp_dtos(200_000, &[(0, 300_000)], true) != Err(Error::Invalid)
+        || e.update_dpp_dtos(400_000, &[(1, 100_000)], true) != Err(Error::Invalid)
+    {
+        return TestResult::Fail("bad DTO targets");
+    }
+    // Records of the old global clocks now run on the new ones.
+    let mut new = g;
+    new.dpp_khz = 400_000;
+    new.request.dpp_khz = 400_000;
+    e.rebind_global(g, new);
+    if rec(&e, 0).global != new || rec(&e, 2).global != new {
+        return TestResult::Fail("records rebound");
+    }
+    // Programming a pipe beside another display's busy consumer.
+    let idle = e.layout.idle;
+    let (busy, mask) = idle[0];
+    e.io.regs.insert(busy, mask);
+    if run(e.prepare(request(1), new)) != Err(Error::Busy)
+        || run(e.prepare_except(request(1), new, &move |at| at == busy)).is_err()
+    {
+        return TestResult::Fail("programming beside a held consumer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dccg",
+    dcn401_dccg_live_dpp_dtos_follow_dcn401_update_clocks
+);

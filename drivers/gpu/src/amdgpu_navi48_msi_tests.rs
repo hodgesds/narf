@@ -77,7 +77,7 @@ fn fixture(address64: bool, masks: bool) -> (Fake, Layout) {
 fn navi48_msi_programs_one_message_with_masks_and_enable_last() -> TestResult {
     for (wide, masks) in [(false, false), (false, true), (true, false), (true, true)] {
         let (mut io, l) = fixture(wide, masks);
-        program(&mut io, l, 63, 7).unwrap();
+        program(&mut io, l, x86_message(63, 7).unwrap()).unwrap();
         assert_eq!(io.cfg32(0x84), 0xfee07000);
         assert_eq!(io.cfg16(if wide { 0x8c } else { 0x88 }), 63);
         if wide {
@@ -121,13 +121,11 @@ fn navi48_msi_refuses_inherited_routes_bad_capabilities_and_cpu_ids() -> TestRes
             7 => l.msix = Some(0x8c),
             _ => io.config[0x80] = 0x11,
         }
-        assert!(program(&mut io, l, 63, 1).is_err());
+        assert!(program(&mut io, l, x86_message(63, 1).unwrap()).is_err());
         assert!(io.writes.is_empty());
     }
     for (v, apic) in [(47, 1), (240, 1), (255, 1), (63, 256)] {
-        let (mut io, l) = fixture(true, true);
-        assert_eq!(program(&mut io, l, v, apic), Err(Error::Unsupported));
-        assert!(io.writes.is_empty());
+        assert_eq!(x86_message(v, apic), Err(Error::Unsupported));
     }
     TestResult::Pass
 }
@@ -140,7 +138,10 @@ fn navi48_msi_readback_failure_and_revocation_prevent_delivery() -> TestResult {
     for refuse in [(4, 0x84), (2, 0x8c), (0, 0x603c4), (2, 4)] {
         let (mut io, l) = fixture(true, true);
         io.refuse = Some(refuse);
-        assert_eq!(program(&mut io, l, 63, 1), Err(Error::Readback));
+        assert_eq!(
+            program(&mut io, l, x86_message(63, 1).unwrap()),
+            Err(Error::Readback)
+        );
         assert_eq!(io.cfg16(0x82) & 1, 0);
         assert!(!io
             .writes
@@ -150,11 +151,43 @@ fn navi48_msi_readback_failure_and_revocation_prevent_delivery() -> TestResult {
     let (mut io, l) = fixture(true, true);
     let authority = Cap::<BusDeviceCap, Write>::bootstrap();
     authority.revoke();
-    assert!(authority.invoke(Op(|| program(&mut io, l, 63, 1))).is_err());
+    let msg = x86_message(63, 1).unwrap();
+    assert!(authority.invoke(Op(|| program(&mut io, l, msg))).is_err());
     assert!(io.writes.is_empty());
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/navi48-msi",
     navi48_msi_readback_failure_and_revocation_prevent_delivery
+);
+
+fn navi48_msi_programs_its_doorbell_and_event() -> TestResult {
+    // GITS_TRANSLATER of an ITS at 0x0808_0000, EventID 0.
+    let msg = its_message(0x0808_0000 + 0x10040, 0).unwrap();
+    for (wide, masks) in [(false, true), (true, true), (true, false)] {
+        let (mut io, l) = fixture(wide, masks);
+        program(&mut io, l, msg).unwrap();
+        assert_eq!(io.cfg32(0x84), 0x0809_0040);
+        if wide {
+            assert_eq!(io.cfg32(0x88), 0);
+        }
+        assert_eq!(io.cfg16(if wide { 0x8c } else { 0x88 }), 0);
+        assert_eq!(io.cfg16(0x82) & 0x71, 1);
+    }
+    // A doorbell above 4 GiB needs the 64-bit message address.
+    let high = its_message(0x40_0808_0000 + 0x10040, 0).unwrap();
+    let (mut io, l) = fixture(false, true);
+    assert_eq!(program(&mut io, l, high), Err(Error::Unsupported));
+    assert!(io.writes.is_empty());
+    let (mut io, l) = fixture(true, true);
+    program(&mut io, l, high).unwrap();
+    assert_eq!((io.cfg32(0x84), io.cfg32(0x88)), (0x0809_0040, 0x40));
+    assert_eq!(its_message(0, 0), Err(Error::Unsupported));
+    assert_eq!(its_message(0x0809_0042, 0), Err(Error::Unsupported));
+    assert_eq!(its_message(0x0809_0040, 0x1_0000), Err(Error::Unsupported));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-msi",
+    navi48_msi_programs_its_doorbell_and_event
 );

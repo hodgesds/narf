@@ -145,13 +145,64 @@ pub struct Crtc {
 
 /// Colour encoding (pixel format).
 ///
-/// Subset of Linux's `DRM_FORMAT_*` (only what ADDFB2 needs).
+/// Subset of Linux's `DRM_FORMAT_*` (only what ADDFB2 needs): packed RGB
+/// and the two-plane 4:2:0 NV12 / P010. A card's `plane_formats` narrows
+/// what its ADDFB2 takes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum PixelFormat {
-    Xrgb8888 = 0x3432_5258, // "XR24" little-endian
-    Argb8888 = 0x3432_5241, // "AR24"
-    Rgb565 = 0x3631_4752,   // "RG16"
+    Xrgb8888 = 0x3432_5258,      // "XR24" little-endian
+    Argb8888 = 0x3432_5241,      // "AR24"
+    Xbgr8888 = 0x3432_4258,      // "XB24"
+    Abgr8888 = 0x3432_4241,      // "AB24"
+    Xrgb2101010 = 0x3033_5258,   // "XR30"
+    Argb2101010 = 0x3033_5241,   // "AR30"
+    Xbgr2101010 = 0x3033_4258,   // "XB30"
+    Abgr2101010 = 0x3033_4241,   // "AB30"
+    Rgb565 = 0x3631_4752,        // "RG16"
+    Xrgb16161616f = 0x4834_5258, // "XR4H"
+    Argb16161616f = 0x4834_5241, // "AR4H"
+    Xbgr16161616f = 0x4834_4258, // "XB4H"
+    Abgr16161616f = 0x4834_4241, // "AB4H"
+    Nv12 = 0x3231_564e,          // "NV12": Y plane, then interleaved CbCr
+    P010 = 0x3031_3050,          // "P010": 10-bit (MSB-aligned 16-bit) NV12
+}
+impl PixelFormat {
+    /// The format of a DRM fourcc, if ADDFB2 knows it.
+    pub fn from_fourcc(fourcc: u32) -> Option<Self> {
+        [
+            Self::Xrgb8888,
+            Self::Argb8888,
+            Self::Xbgr8888,
+            Self::Abgr8888,
+            Self::Xrgb2101010,
+            Self::Argb2101010,
+            Self::Xbgr2101010,
+            Self::Abgr2101010,
+            Self::Rgb565,
+            Self::Xrgb16161616f,
+            Self::Argb16161616f,
+            Self::Xbgr16161616f,
+            Self::Abgr16161616f,
+            Self::Nv12,
+            Self::P010,
+        ]
+        .into_iter()
+        .find(|f| *f as u32 == fourcc)
+    }
+    /// Bytes per pixel (drm_format_info's cpp[0]; the luma plane's for
+    /// NV12 and P010).
+    pub const fn cpp(self) -> u32 {
+        match self {
+            Self::Nv12 => 1,
+            Self::Rgb565 | Self::P010 => 2,
+            Self::Xrgb16161616f
+            | Self::Argb16161616f
+            | Self::Xbgr16161616f
+            | Self::Abgr16161616f => 8,
+            _ => 4,
+        }
+    }
 }
 
 /// Kernel-side framebuffer descriptor (result of ADDFB2).
@@ -169,8 +220,18 @@ pub struct Framebuffer {
     pub format: PixelFormat,
     /// Byte pitch of the primary plane.
     pub pitch: u32,
-    /// GEM handle of the backing buffer object.
+    /// GEM handle of the backing buffer object (every plane's: amdgpu
+    /// refuses planes in different BOs).
     pub gem_handle: u32,
+    /// Each plane's byte offset into the BO (plane 1 is NV12/P010's CbCr
+    /// plane; 0 for single-plane formats).
+    pub offsets: [u32; 2],
+    /// Plane 1's byte pitch (0 for single-plane formats).
+    pub chroma_pitch: u32,
+    /// The format modifier: DRM_FORMAT_MOD_LINEAR, or a GFX12 one on the
+    /// native amdgpu card (passed with DRM_MODE_FB_MODIFIERS or converted
+    /// from the BO's tiling flags).
+    pub modifier: u64,
 }
 
 // ── Card ───────────────────────────────────────────────────────────────
@@ -248,6 +309,39 @@ pub(crate) struct VirtGpuImport {
 pub(crate) struct PropertyBlob {
     pub(crate) id: u32,
     pub(crate) data: Vec<u8>,
+    /// Still owned by its creator: DESTROYPROPBLOB not yet called. A blob a
+    /// committed property still names outlives its creator's reference, as
+    /// a refcounted `drm_property_blob` does (`Card::collect_blobs`).
+    pub(crate) user: bool,
+}
+
+/// `drm_crtc::gamma_size` of every color-managed CRTC: amdgpu_dm's
+/// `drm_mode_crtc_set_gamma_size(MAX_COLOR_LEGACY_LUT_ENTRIES)`.
+pub const LEGACY_GAMMA_SIZE: usize = 256;
+
+/// A CRTC's color management as amdgpu_dm attaches it on DCN 4.0.1
+/// (`drm_crtc_enable_color_mgmt(crtc, 0, true, MAX_COLOR_LUT_ENTRIES)`:
+/// CTM, GAMMA_LUT and GAMMA_LUT_SIZE, no degamma) with the blobs DRM last
+/// committed (0 for none) and the legacy gamma store GETGAMMA reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrtcColor {
+    pub crtc: u32,
+    pub ctm: u32,
+    pub gamma_lut: u32,
+    /// `drm_crtc::gamma_store`: `LEGACY_GAMMA_SIZE` red, then green, then
+    /// blue entries, initialised to the identity ramp (`i << 8`).
+    pub gamma_store: Vec<u16>,
+}
+impl CrtcColor {
+    pub fn new(crtc: u32) -> Self {
+        let ramp = (0..LEGACY_GAMMA_SIZE as u16).map(|i| i << 8);
+        Self {
+            crtc,
+            ctm: 0,
+            gamma_lut: 0,
+            gamma_store: ramp.clone().chain(ramp.clone()).chain(ramp).collect(),
+        }
+    }
 }
 
 /// Flip-complete events owned by one open DRM primary-node file.
@@ -680,6 +774,105 @@ pub struct Card {
     /// the hardware scans (see `NativePlane`). `None` keeps the CPU-copy
     /// cards' formats.
     pub plane_formats: Option<&'static [u32]>,
+    /// A native display backend that implements DRIVER_ATOMIC through the
+    /// bridge's native atomic path (the Navi48 card sets it on publish).
+    pub native_atomic: bool,
+    /// The CRTCs (by id) carrying the "VRR_ENABLED" property, with the value
+    /// DRM last committed. Empty on cards that do not expose it.
+    pub vrr_enabled: Vec<(u32, bool)>,
+    /// The CRTCs carrying color management properties. Empty on cards that
+    /// do not expose them.
+    pub crtc_color: Vec<CrtcColor>,
+    /// A native card's planes with amdgpu_dm's plane properties: every
+    /// CRTC's primary, the overlay planes and every CRTC's cursor plane.
+    /// Empty on cards without them.
+    pub native_planes: Vec<NativePlane>,
+    /// The fourccs the native overlay planes take.
+    pub overlay_formats: Option<&'static [u32]>,
+    /// The native amdgpu card: its planes list the GFX12 modifiers
+    /// (`amdgpu_dm_modifiers::PLANE_MODIFIERS`) and ADDFB2 runs amdgpu's
+    /// framebuffer checks (amdgpu_display_user_framebuffer_create).
+    pub gfx12_modifiers: bool,
+    /// Each dumb BO's GEM_METADATA tiling flags and GFX12_DCC creation flag
+    /// (amdgpu_bo_get_tiling_flags), by handle; a BO not listed has none.
+    pub bo_tiling: Vec<(u32, u64, bool)>,
+}
+
+/// drm_plane_state's blending and orientation as amdgpu_dm attaches them:
+/// "alpha" (overlays; 0xffff opaque), "pixel blend mode"
+/// (DRM_MODE_BLEND_*), "zpos" and "rotation" (one DRM_MODE_ROTATE_* bit).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaneProps {
+    pub alpha: u16,
+    pub blend: u8,
+    pub zpos: u8,
+    pub rotation: u8,
+    /// "COLOR_ENCODING" (DRM_COLOR_YCBCR_BT601/709/2020) and "COLOR_RANGE"
+    /// (DRM_COLOR_YCBCR_LIMITED/FULL_RANGE): only YCbCr formats use them.
+    pub color_encoding: u8,
+    pub color_range: u8,
+}
+impl PlaneProps {
+    /// DRM_MODE_BLEND_PREMULTI, DRM_MODE_BLEND_COVERAGE, DRM_MODE_BLEND_PIXEL_NONE.
+    pub const PREMULTI: u8 = 0;
+    pub const COVERAGE: u8 = 1;
+    pub const PIXEL_NONE: u8 = 2;
+    /// enum drm_color_encoding and enum drm_color_range.
+    pub const BT601: u8 = 0;
+    pub const BT709: u8 = 1;
+    pub const BT2020: u8 = 2;
+    pub const LIMITED: u8 = 0;
+    pub const FULL: u8 = 1;
+    /// A plane's defaults: opaque, pre-multiplied, unrotated, at `zpos`.
+    pub const fn new(zpos: u8) -> Self {
+        Self {
+            alpha: 0xffff,
+            blend: Self::PREMULTI,
+            zpos,
+            rotation: 1,
+            // amdgpu_dm_plane_init's defaults: BT.709, limited range.
+            color_encoding: Self::BT709,
+            color_range: Self::LIMITED,
+        }
+    }
+}
+
+/// One plane of a native card: its id, the CRTC whose primary or cursor
+/// it is (an overlay has neither and may go on any), its committed CRTC and
+/// framebuffer (a primary's mirror its CRTC's `primary_fb`), source
+/// rectangle (whole pixels: amdgpu_dm ignores the 16.16 fraction) and CRTC
+/// rectangle, and its properties. A primary whose rectangles no atomic
+/// commit or SETPLANE set (`placed` false) shows the whole mode, as legacy
+/// SETCRTC sets it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativePlane {
+    pub id: u32,
+    pub primary_of: Option<u32>,
+    /// The CRTC whose DRM_PLANE_TYPE_CURSOR plane this is
+    /// (amdgpu_dm_crtc_init); None for a primary or an overlay.
+    pub cursor_of: Option<u32>,
+    pub crtc_id: Option<u32>,
+    pub fb_id: Option<u32>,
+    pub src: (u32, u32, u32, u32),
+    pub dst: (i32, i32, u32, u32),
+    pub placed: bool,
+    pub props: PlaneProps,
+    /// A cursor plane's framebuffer is one the legacy CURSOR ioctl wrapped
+    /// around a BO (drm_internal_framebuffer_create): it goes away when the
+    /// plane lets go of it.
+    pub internal_fb: bool,
+    /// A cursor plane's CRTC's legacy cursor position (drm_crtc's
+    /// cursor_x/cursor_y), which a CURSOR ioctl without MOVE keeps.
+    pub legacy_position: (i32, i32),
+}
+impl NativePlane {
+    /// An overlay: neither a primary nor a cursor plane.
+    pub fn is_overlay(&self) -> bool {
+        self.primary_of.is_none() && self.cursor_of.is_none()
+    }
+    pub fn is_cursor(&self) -> bool {
+        self.cursor_of.is_some()
+    }
 }
 
 /// A connector whose modes and EDID come from a real sink, published by a
@@ -696,6 +889,19 @@ pub struct NativeOutput {
     /// The connector's "Broadcast RGB" value (0 Automatic, 1 Full,
     /// 2 Limited 16:235), when it has the property.
     pub broadcast_rgb: Option<u8>,
+    /// The connector's immutable "vrr_capable" value, when it has the
+    /// property (drm_connector_attach_vrr_capable_property).
+    pub vrr_capable: Option<bool>,
+    /// The connector's "Colorspace" value (a DRM_MODE_COLORIMETRY_*), when
+    /// it has the property. amdgpu_dm's supported set gives HDMI and DP
+    /// connectors the same list.
+    pub colorspace: Option<u32>,
+    /// The connector's "HDR_OUTPUT_METADATA" blob id (0 for none), when it
+    /// has the property (drm_connector_attach_hdr_output_metadata_property).
+    pub hdr_output_metadata: Option<u32>,
+    /// The connector's "max bpc" (max_requested_bpc, 8..=16), when it has
+    /// the property (drm_connector_attach_max_bpc_property).
+    pub max_bpc: Option<u8>,
 }
 
 /// System-wide vblank "slack" offset in nanoseconds. A flip-complete event is
@@ -763,7 +969,18 @@ impl Card {
             native: Vec::new(),
             vblank_source: None,
             plane_formats: None,
+            native_atomic: false,
+            vrr_enabled: Vec::new(),
+            crtc_color: Vec::new(),
+            native_planes: Vec::new(),
+            overlay_formats: None,
+            gfx12_modifiers: false,
+            bo_tiling: Vec::new(),
         }
+    }
+    /// The native plane `id`, if this card has one.
+    pub fn native_plane(&self, id: u32) -> Option<&NativePlane> {
+        self.native_planes.iter().find(|p| p.id == id)
     }
     /// Wire form of a CRTC mode: the exact native timing when a published
     /// connector carries this mode, otherwise the synthesized one.
@@ -1191,7 +1408,11 @@ impl Card {
             id = id.wrapping_add(1).max(1);
         }
         self.next_property_blob_id = id.wrapping_add(1).max(1);
-        self.property_blobs.push(PropertyBlob { id, data });
+        self.property_blobs.push(PropertyBlob {
+            id,
+            data,
+            user: true,
+        });
         Ok(id)
     }
 
@@ -1203,13 +1424,50 @@ impl Card {
             .map(|blob| blob.data.as_slice())
     }
 
-    /// Destroy a KMS property blob. Returns false for an unknown id.
+    /// Destroy a KMS property blob. Returns false for an unknown id (or one
+    /// already destroyed). A blob a committed property still names stays
+    /// readable until that property lets it go, as Linux's reference does.
     pub(crate) fn destroy_property_blob(&mut self, id: u32) -> bool {
-        let Some(pos) = self.property_blobs.iter().position(|blob| blob.id == id) else {
+        let Some(blob) = self
+            .property_blobs
+            .iter_mut()
+            .find(|blob| blob.id == id && blob.user)
+        else {
             return false;
         };
-        self.property_blobs.swap_remove(pos);
+        blob.user = false;
+        self.collect_blobs();
         true
+    }
+
+    /// Whether a committed color or HDR property names blob `id`.
+    fn blob_referenced(&self, id: u32) -> bool {
+        id != 0
+            && (self
+                .crtc_color
+                .iter()
+                .any(|c| c.ctm == id || c.gamma_lut == id)
+                || self
+                    .native
+                    .iter()
+                    .any(|n| n.hdr_output_metadata == Some(id)))
+    }
+
+    /// Free destroyed blobs no committed property names any more (the last
+    /// `drm_property_blob_put`).
+    pub(crate) fn collect_blobs(&mut self) {
+        let keep: Vec<bool> = self
+            .property_blobs
+            .iter()
+            .map(|b| b.user || self.blob_referenced(b.id))
+            .collect();
+        let mut keep = keep.into_iter();
+        self.property_blobs.retain(|_| keep.next().unwrap_or(true));
+    }
+
+    /// The color management of CRTC `crtc`, when it has the properties.
+    pub fn crtc_color(&self, crtc: u32) -> Option<&CrtcColor> {
+        self.crtc_color.iter().find(|c| c.crtc == crtc)
     }
 
     /// Look up a dumb backing by mmap offset.
@@ -1333,26 +1591,102 @@ impl Card {
         pitch: u32,
         gem_handle: u32,
     ) -> Result<u32, CardError> {
-        if width == 0 || height == 0 {
-            return Err(CardError::InvalidDimensions);
-        }
-        // Validate GEM handle exists.
-        if self.gem.lookup(gem_handle).is_none() {
-            return Err(CardError::BadGemHandle);
-        }
-        // Validate pixel format: a format no plane takes is refused.
-        if self
-            .plane_formats
-            .is_some_and(|formats| !formats.contains(&format))
-        {
-            return Err(CardError::UnknownFormat);
-        }
-        let format = match format {
-            0x3432_5258 => PixelFormat::Xrgb8888,
-            0x3432_5241 => PixelFormat::Argb8888,
-            0x3631_4752 => PixelFormat::Rgb565,
-            _ => return Err(CardError::UnknownFormat),
+        let mut cmd = crate::amdgpu_dm_modifiers::FbCmd {
+            width,
+            height,
+            pixel_format: format,
+            ..Default::default()
         };
+        cmd.handles[0] = gem_handle;
+        cmd.pitches[0] = pitch;
+        self.addfb2_cmd(&cmd)
+    }
+
+    /// ADDFB2 with the whole `drm_mode_fb_cmd2`: handles, pitches, offsets
+    /// and modifiers. The native amdgpu card (`gfx12_modifiers`) runs
+    /// drm_internal_framebuffer_create's and amdgpu's checks
+    /// (`amdgpu_dm_modifiers::check_fb_cmd` / `check_amdgpu_fb`: format and
+    /// modifier on a plane, one BO, tiling flags without modifiers, sizes);
+    /// other cards take one plane, LINEAR only.
+    pub fn addfb2_cmd(
+        &mut self,
+        cmd: &crate::amdgpu_dm_modifiers::FbCmd,
+    ) -> Result<u32, CardError> {
+        use crate::amdgpu_dm_modifiers as m;
+        let (width, height, gem_handle) = (cmd.width, cmd.height, cmd.handles[0]);
+        let pitch = cmd.pitches[0];
+        let (offsets, chroma_pitch, modifier) = if self.gfx12_modifiers {
+            let info = m::check_fb_cmd(cmd).map_err(|_| CardError::InvalidDimensions)?;
+            let object = self.gem.lookup(gem_handle).ok_or(CardError::BadGemHandle)?;
+            let bo_size = self
+                .dumb_backings
+                .iter()
+                .find(|b| b.gem_handle == gem_handle)
+                .map_or(object.size as u64, |b| b.byte_len as u64);
+            let (tiling, dcc) = self
+                .bo_tiling
+                .iter()
+                .find(|t| t.0 == gem_handle)
+                .map_or((0, false), |t| (t.1, t.2));
+            let formats = self.plane_formats.unwrap_or(&[]);
+            let modifier = m::check_amdgpu_fb(cmd, &info, formats, tiling, dcc, bo_size)
+                .map_err(|_| CardError::UnknownFormat)?;
+            let two = info.num_planes == 2;
+            (
+                [cmd.offsets[0], if two { cmd.offsets[1] } else { 0 }],
+                if two { cmd.pitches[1] } else { 0 },
+                modifier,
+            )
+        } else {
+            // DRM_MODE_FB_MODIFIERS with anything but LINEAR, or an unknown
+            // flag, is refused (framebuffer_check / drm_mode_addfb2).
+            if cmd.flags & !3 != 0 || (cmd.flags & 2 != 0 && cmd.modifier[0] != 0) {
+                return Err(CardError::UnknownFormat);
+            }
+            if width == 0 || height == 0 {
+                return Err(CardError::InvalidDimensions);
+            }
+            // Validate GEM handle exists.
+            if self.gem.lookup(gem_handle).is_none() {
+                return Err(CardError::BadGemHandle);
+            }
+            let format = cmd.pixel_format;
+            // Validate pixel format: a format no plane takes is refused.
+            if self
+                .plane_formats
+                .is_some_and(|formats| !formats.contains(&format))
+            {
+                return Err(CardError::UnknownFormat);
+            }
+            // A card without native planes keeps the formats it always took.
+            let legacy = matches!(format, 0x3432_5258 | 0x3432_5241 | 0x3631_4752);
+            if self.plane_formats.is_none() && !legacy {
+                return Err(CardError::UnknownFormat);
+            }
+            let format = PixelFormat::from_fourcc(format).ok_or(CardError::UnknownFormat)?;
+            // Two-plane formats need the native amdgpu card's checks.
+            if matches!(format, PixelFormat::Nv12 | PixelFormat::P010) {
+                return Err(CardError::UnknownFormat);
+            }
+            // drm_framebuffer's framebuffer_check: the pitch holds a line of
+            // the format's pixels; drm_gem_fb_init_with_funcs: a dumb-backed
+            // object holds every line (EINVAL either way).
+            let line = u64::from(width) * u64::from(format.cpp());
+            if u64::from(pitch) < line {
+                return Err(CardError::InvalidDimensions);
+            }
+            if let Some(b) = self
+                .dumb_backings
+                .iter()
+                .find(|b| b.gem_handle == gem_handle)
+            {
+                if (b.byte_len as u64) < u64::from(height - 1) * u64::from(pitch) + line {
+                    return Err(CardError::InvalidDimensions);
+                }
+            }
+            ([0, 0], 0, 0)
+        };
+        let format = PixelFormat::from_fourcc(cmd.pixel_format).ok_or(CardError::UnknownFormat)?;
         if self.framebuffers.len() >= 4096 {
             return Err(CardError::TooManyFbs);
         }
@@ -1381,8 +1715,26 @@ impl Card {
             format,
             pitch,
             gem_handle,
+            offsets,
+            chroma_pitch,
+            modifier,
         });
         Ok(id)
+    }
+
+    /// `AMDGPU_GEM_METADATA` SET on a dumb BO of this card: record its
+    /// tiling flags, which a later ADDFB2 without modifiers converts
+    /// (amdgpu_bo_set_tiling_flags). False for a handle that is not one of
+    /// this card's BOs.
+    pub fn set_bo_tiling(&mut self, gem_handle: u32, tiling_flags: u64, gfx12_dcc: bool) -> bool {
+        if self.gem.lookup(gem_handle).is_none() {
+            return false;
+        }
+        self.bo_tiling.retain(|t| t.0 != gem_handle);
+        if tiling_flags != 0 || gfx12_dcc {
+            self.bo_tiling.push((gem_handle, tiling_flags, gfx12_dcc));
+        }
+        true
     }
 
     /// Remove a previously registered framebuffer (RMFB), turning off any
@@ -1410,6 +1762,14 @@ impl Card {
             crtc.primary_fb = None;
             crtc.enabled = false;
             crtc.mode = None;
+        }
+        for p in self
+            .native_planes
+            .iter_mut()
+            .filter(|p| p.fb_id == Some(fb_id))
+        {
+            p.fb_id = None;
+            p.crtc_id = None;
         }
         let freed = self.remove_dumb_backing(fb.gem_handle);
         if freed.is_none() {

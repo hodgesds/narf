@@ -496,8 +496,10 @@ settings. Board information comes from this GPU's running firmware; no
 Navi22 table layout, reference-board replacement or overdrive is used.
 
 After graphics/RLC boot, `configure_power().await` runs DC BTC, installs a
-board-supported mask for GFX DPM and autonomous thermal/fan/electrical
-protection, enables it and verifies the running mask and GFX frequency range.
+board-supported mask for GFX DPM, autonomous thermal/fan/electrical
+protection and BACO (FEATURE_BACO_BIT 19, which runtime PM needs and Linux
+always allows), enables it and verifies the running mask and GFX frequency
+range.
 Boot display/memory/link clocks and automatic gating remain excluded until
 native DCN owns their constraints. The owner publishes `PowerStatus` only
 after the whole sequence succeeds. Each operation is single-attempt; timeout,
@@ -574,8 +576,17 @@ with PMFW fan control, read-only `pwm1` (0–255), `pwm1_enable` 2 (automatic),
 `pwm1_min/max`, `fan1_input/min/max`; `in0` (vddgfx, mV); `power1_average`,
 `power1_cap` and `power1_cap_default` in µW labelled PPT; `freq1` (sclk) and
 `freq2` (mclk) in Hz. Linux's smu_v14_0_2 provides no fan-mode or PWM setter,
-so fan control stays automatic. `power1_cap` is read-only, and `power1_input`
-and the overdrive-dependent `power1_cap_min/max` are absent. Values read empty
+so fan control stays automatic. `power1_cap` is writable as
+amdgpu_hwmon_set_power_cap (decimal µW, truncated to W) and accepts only
+smu_v14_0_2_init_ppt_limits' non-overdrive AC range, reported by
+`power1_cap_min`/`power1_cap_max` (`Limits::{ppt_min_w, ppt_max_w}`: socket
+and message limits, the minimum lowered by the overdrive minimum percentage
+when the board supports PPT overdrive); out-of-range writes are EINVAL. The
+store validates synchronously and `amdgpu_navi48_platform::set_power_cap(w)`
+applies SetPptLimit (0x32) on the executor, which needs the PPT feature
+(FEATURE_THROTTLERS_BIT); the next sample's GetPptLimit is what `power1_cap`
+reads. `amdgpu_hwmon::publish_writable` adds writable attributes to the shared
+hwmon node. `power1_input` is absent. Values read empty
 until a sample or board limit exists, never as a fake zero. The monitor logs
 throttlers starting and ending, loss of a recorded protection, the first
 failed refresh, and hotspot reaching `software_shutdown_temp`. Linux powers
@@ -614,8 +625,18 @@ requires both mailbox acceptance and the corresponding bit from
 DISP/DPP/DTB replies are actual kHz, checked against the requested floor and
 firmware ceiling. `Applied` distinguishes those actual rates from acknowledged
 DCF/UCLK floor requests. FCLK follows DCFCLK on this ASIC; the unsupported
-FCLK-switch message is not sent. This is a conservative pre-modeset policy,
-not active-stream clock scaling or a bandwidth/watermark solution.
+FCLK-switch message is not sent. This is the pre-modeset policy; live
+changes go through `update_live` (below).
+
+`update_live(regs, Request, safe_to_lower, held, dto).await` is
+dcn401_update_clocks while displays run (their consumer registers `held`):
+in prepare_bandwidth (`safe_to_lower` false) it sends the display count and
+only raises clocks, in optimize_bandwidth (true) it also lowers them
+(`should_set_clock`). DTBCLK first, then DISPCLK; a lowered DPPCLK has the
+DPP DTOs set for the new reference (`dto`) before the reference falls and
+again for the actual one after, a raised one is raised before the DTOs are
+updated. DENTIST stays PMFW's. A failed `dto` step is `Error::Dto`; failure
+or cancellation leaves the owner failed.
 
 `Starting`/`Applying` are set before awaits. Failure records `Failed(Error)`;
 cancellation leaves the in-flight state. Both prevent mailbox replay, and
@@ -649,7 +670,13 @@ Disabled pipes park their DPP and pixel clocks; shared root gates remain on.
 Readback verifies every programmed field. Partial failure records a terminal
 `Failed(Error)`; cancellation leaves `Applying`. Neither can replay, and
 historical successful `Applied` entries remain tagged with their global clock
-snapshot. No stream may use a stale snapshot after global clocks change.
+snapshot. No stream may use a stale snapshot after global clocks change:
+`Dccg::update_dpp_dtos(regs, ref_khz, &[(pipe, dpp_khz)], safe_to_lower)` is
+dcn401_update_clocks_update_dpp_dto for live pipes (dccg401_update_dpp_dto's
+phase where the DPPCLK rises, or every one when safe to lower) and
+`rebind_global(old, new)` moves the pipe records to the new global clocks;
+`prepare_except(clocks, request, held)` programs a pipe beside another
+display's running consumers.
 `ColdBoot::prepare_display_pipe_clocks` and the platform wrapper serialize the
 matching owners after drained engine proofs. `display_pipe_clock_status` and
 platform diagnostics expose progress. An uncertain DCCG transition also blocks
@@ -678,8 +705,10 @@ excluded. `prepare(&mut ClockManager, &mut Dccg, Request).await` programs disabl
 progressive timing with fixed refresh and one OPP per OTG. HDMI TMDS and FRL
 also accept YCbCr 4:2:0: horizontal boundaries must be even and active width
 must fit the 4096-pixel formatter buffer. The OTG divides horizontal timing
-by two and selects 4:2:0 data format. Interlace, ODM combining and VRR are not
-represented by this request. `GlobalSync` supplies
+by two and selects 4:2:0 data format. Interlace and VRR are not
+represented by this request (ODM combine is `Request::odm`, see Navi 48
+display admission); a live scanout's DRR is `Otg::set_drr` (Navi 48
+variable refresh). `GlobalSync` supplies
 validated DLG field values (startup/keepout in lines; update/ready in pixels),
 not a bandwidth proof. Totals, porches, sync widths, blanking minima and every
 native field width are checked before writes. Zero vertical front porch is
@@ -840,7 +869,10 @@ linear framebuffer per HUBP. The pool must belong to this GPU's correctly mapped
 exclusively owned VRAM; the matching ColdBoot/platform
 `prepare_display_surface` wrappers use the boot owner's validated pool after
 the kernel engine proofs. Requests select pipe 0–3, nonzero 14-bit dimensions
-and packed `SurfaceFormat::{Xrgb8888,Xbgr8888}`. Rows are padded to 256 bytes;
+and a packed single-plane `SurfaceFormat`: X/A RGB and BGR 8888 and 2101010,
+`Rgb565`, and X/A RGB and BGR 16161616F (`ALL`, `fourcc`/`from_fourcc`,
+`bytes_per_pixel` 2, 4 or 8, `pitch_bytes`, `per_pixel_alpha`), as
+amdgpu_dm maps the DRM fourccs to DC surface formats. Rows are padded to 256 bytes;
 backing is page-rounded and wholly cleared, including padding. Clearing yields
 between 64 KiB chunks and invokes current authority for each chunk. Native CPU
 HDP flush verifies NBIO's remap, fences stores, writes the flush aperture and
@@ -852,7 +884,9 @@ dimension. Active flips/locks, cursor/metadata/LUT fetches or uncertain power
 reject before allocation or writes. Preconditions are rechecked after clearing.
 The allocation is retained and marked published before register programming;
 the fetch clock is temporarily enabled while blank. Native DCN4 programming
-sets uncompressed RGB8888, pixel pitch minus one, red/blue crossbar, primary and
+sets hubp2_program_pixel_format's uncompressed SURFACE_PIXEL_FORMAT (3 RGB565,
+8 8888, 10 2101010, 24 16161616F) and CB_B/CR_R crossbar (swapped for the BGR
+orders), hubp401_program_size's pitch in pixels minus one, primary and
 secondary viewports, empty chroma viewports, VMID0 and normal non-stereo flip
 controls. It does not touch the obsolete address-config fields. The high GPU
 address precedes the low address which publishes the flip. Final drain, clock
@@ -955,26 +989,32 @@ surface. ColdBoot/platform `prepare_display_dpp(pipe)` wrappers borrow the
 matching retained owners after the kernel engine proofs. It requires the same
 surface and DCN VM setup, current readback-checked clocks, matching stopped
 timing and prepared RGB black OPP, and a disconnected, blank, drained HUBP.
-Source and timing active dimensions must match; no scaling, crop, alpha blend
-or multi-pipe composition is accepted. The selected DPP clock must be disabled,
+A full-frame surface matches the timing's active size; a placed one is
+scaled through SPL (see "Navi 48 plane scaling and overlay planes"), on the
+display's own pipe or an overlay's. The selected DPP clock must be disabled,
 resets clear, its cursor disabled with no pending update, and inherited CNVC,
 scaler and CM updates complete. Test clocks and forced/manual line-buffer
 power policy are rejected before writes. Other DPP instances stay untouched.
 
 Preparation temporarily enables the native DPP clock (bit 4, no obsolete rate
 divider), wakes scaler LUT and iSHARP memories with bounded asynchronous waits,
-and rechecks stopped consumers after each wait. Native RGB8888 conversion uses
-zero expansion and an identity CNVC crossbar; red/blue selection remains in the
-HUBP. FCNV bias/scale and HDR multiplication are identity, pre-degamma/post-CSC/
-gamma/keying/de-alpha are bypassed, and the encoded RGB values pass through.
-The unused source alpha is not used by the line buffer; MPC preparation below
-selects opaque blending. Scaler autocal is disabled, recout begins at zero,
-and recout/MPC dimensions match the surface. Native `SCALING_444_BYPASS` (mode 0)
-still configures a floating-point line buffer; mode 6 full bypass is not used.
-Line-buffer configurations 1, 2, then 0 are selected using native capacities
-970, 1290, 3430 and `ceil(width/6)` entries per row, requiring two rows for unity
-scaling. Widths above 10290 reject as unsupported on this single-pipe path.
-Adaptive filtering and iSHARP are disabled without programming coefficient RAM.
+and rechecks stopped consumers after each wait. Conversion follows
+dpp401_dpp_setup for the surface format: CNVC_SURFACE_PIXEL_FORMAT as the
+HUBP's except 25 for ABGR16161616F, ALPHA_EN except for RGB565, zero expansion
+and an identity CNVC crossbar; red/blue selection remains in the HUBP. FCNV
+bias/scale and HDR multiplication are identity, pre-degamma/post-CSC/
+gamma/keying/de-alpha are bypassed, and the encoded RGB values pass through:
+amdgpu_dm's default plane color state, which is all FP16 needs too (its values
+pass unscaled and the output denormalization clamps them). The line buffer
+carries alpha (LB_DATA_FORMAT ALPHA_EN) exactly for the formats MPC
+preparation below blends per pixel; the partition count is the same either
+way. The scaler is programmed from SPL's scaler data
+(`amdgpu_dcn401_dscl::program`): a unity segment in native
+`SCALING_444_BYPASS` (mode 0, still a floating-point line buffer; mode 6 full
+bypass is not used), a scaled one with its ratios, inits, taps, polyphase or
+EASF coefficients (loaded into the coefficient RAM not in use, then
+selected) and recout/MPC size. The line-buffer configuration is
+dpp401_dscl_find_lb_memory_config's on SPL's data. iSHARP stays disabled.
 
 Final checks require DPP clock-off, unchanged live owners/surface/timing/VM,
 stopped consumers and full DPP register readback. `DppApplied` records the
@@ -995,7 +1035,11 @@ bandwidth/deadline admission, route activation and physical-card validation
 remain required.
 
 `unsafe Otg::prepare_mpc(&mut clocks, &mut dccg, &mut gmc, pipe)` stages
-opaque full-frame RGB composition for an owned DPP/surface. ColdBoot exposes
+full-frame RGB composition for an owned DPP/surface: per dcn401_update_mpcc_sequence,
+per-pixel premultiplied alpha for the formats amdgpu_dm's
+fill_blending_from_plane_state blends so under the primary plane's default
+pre-multiplied blend mode (ARGB/ABGR8888, ARGB/ABGR2101010, ARGB16161616F;
+not ABGR16161616F, as in Linux), global opaque alpha for the rest. ColdBoot exposes
 synchronous `prepare_display_mpc(pipe)`; the platform wrapper is asynchronous
 only to acquire its owner mutex. Preparation checks the retained surface, VM,
 DPP, current clock and timing owners, matching OPP format, blank/drained HUBP,
@@ -1065,38 +1109,99 @@ preparation API starts fetch or publishes an active framebuffer.
 `amdgpu_dcn401_dml::admit(&Soc, &Mode) -> Result<Plan, Error>` is the native
 scanout admission calculation: Linux DML21's DCN4 mode-support and
 mode-programming path, evaluated in fixed point with no hardware access. It
-admits only the shape the native path implements: one progressive DP SST
-timing and one unscaled, unrotated, full-frame linear 32-bpp surface (pitch a
-multiple of 64 pixels) per pipe with the staged 320-KiB DET. GPUVM/HostVM,
-DCC, MALL/SubVP, cursor, tdlut, dynamic metadata, writeback, MPC combine and
-immediate flip are excluded rather than approximated.
+admits the shape the native path implements: progressive streams of linear
+RGB planes (`Mode::planes`: the primary, scaled or not, and overlays; see
+"Navi 48 plane scaling and overlay planes"), each pipe with the staged
+320-KiB DET. `Mode::bytes_per_pixel` is DML's source format
+(2 `dml2_444_16`, 4 `dml2_444_32`, 8 `dml2_444_64`; anything else is
+`Invalid`) and the pitch must be whole 256-byte requests at that depth; the
+request width, swath, DET lines, read bandwidth and deep-sleep DCFCLK follow
+it (`tests/dcn401_dml21/format_vectors.txt`, checked against Linux with
+`PIXEL_BYTES`). A configuration whose SDP bandwidth would make DPMM raise
+DCFCLK/FCLK above the pinned UCLK's state is `ClockState`: the port plans
+only at that state. VUpdate/VReady widths at the programmed clocks are
+rounded up from their exact value. GPUVM/HostVM,
+DCC, MALL/SubVP, cursor, tdlut, dynamic metadata, writeback and immediate
+flip are excluded rather than approximated.
 
-ODM follows DML's `dml2_odm_mode_auto` with dynamic ODM off, limited to
-bypass and 2:1: a stream takes two pipes (two DPP/OPP and, with DSC, two
-DSCs) when its pixel clock exceeds the downspread-limited DISPCLK maximum, its
-DSC line exceeds 5760 pixels or four slices, or its 4:2:0 line exceeds 4096
-pixels. A stream DML would split 3:1 or 4:1 is `Unsupported`; more than four
-pipes in all is `Pipes`. `Plan::pipes` (1 or 2) reports the decision; both
-pipes share every programmed value except the DLG blank end
-(`Plan::odm_refcyc_h_blank_end`, `Plan::pipe_dlg`).
+ODM follows DML's `dml2_odm_mode_auto` with dynamic ODM off (DecideODMMode,
+CalculateODMConstraints, ValidateODMMode): a stream takes the fewest of one
+to four pipes (DPP/OPP each and, with DSC, a DSC each) whose DISPCLK
+(CalculateRequiredDispclk: the pixel clock over the pipes, never below half
+of it for HDMI TMDS 4:2:0) fits the downspread-limited maximum, at least
+one per started 5760 DSC pixels or 4096 4:2:0 pixels, two for more than four
+slices, three for more than eight and four for a three-pipe split whose
+slices are not twelve. 3:1 and 4:1 lines divide by four (OTG_H_TIMING_DIV_BY4),
+3:1 may split unevenly without DSC, and with DSC the slices split evenly
+(all twelve on three). More than four pipes in all is `Pipes`. `Plan::pipes`
+(1 to 4) reports the decision; every pipe shares every programmed value
+except the DLG blank end, which each further pipe moves by the segments
+before it (`Plan::odm_refcyc_h_blank_end: [u32; 3]`, `Plan::pipe_dlg`).
+`tests/dcn401_dml21/odm34_vectors.txt` (1927 configurations: 8K, 10K, 5K and
+4K480 streams at every depth, with DSC of 4 to 24 slices, HDMI 4:2:0, beside
+other streams, and every configuration the older files marked "Unsupported
+odm") is answered by Linux DML21 and replayed by
+`dcn401_dml_matches_linux_dml21_odm34_vectors`. `dml::admit_native` (what
+the modeset, platform and MST admission call) also refuses (`Unsupported`)
+an ODM split whose other horizontal boundaries, segment widths
+(OPTC_SEGMENT_WIDTH) or segment memories the native OTG cannot take
+(`dml::odm_timing_ok`); Linux leaves them a TODO. `dml::dsc_shape(timing,
+slices, dispclk_max_khz) -> Option<pipes>` is the DSC policies' native
+shape check (up to four DSC401s of four slices and 5184 pixels each).
 
-A two-pipe plan is programmed as ODM 2:1 (optc401_set_odm_combine). The
-modeset gives it the highest pipe no display of the configuration uses
-(`modeset::odm_pipes`), a DPP-only clock there (`dccg::PixelClock::OdmSegment`,
-plus its DSCCLK), and lights it with `otg::Request::odm` and
-`otg::SurfaceRequest::odm` naming that pipe. The OTG takes both OPPs as
-segments with the segment width, the line memories decide_odm_mem_bit_map
-picks and H divide-by-two (every horizontal boundary even; at most 8192
-active pixels); each OPP formats and blanks its half at its offset (a 4:2:0
-right half takes one extra left-edge pixel); each segment's DSC compresses
-its half with half the slices while the stream's PPS stays whole-picture.
-The ODM pipe's HUBP fetches the right half of the same surface (viewport X
-offset), its DPP/MPCC/DET/requestor (VTG the master OTG) and DLG/TTU follow,
-and start, flip, stop, underflow recovery and live checks act on both halves
-under the master OTG's one lock. The cursor is placed per segment and
-enabled only on the halves it overlaps (`CursorApplied::shown`). The display
-holds the ODM pipe from staging until retirement (`Siblings::pipes`); its
-teardown stops both DSC clocks. `ScanoutRunning::odm` names the pipe.
+MPC combine follows DML's auto `mpcc_combine_factor`, which DC leaves for
+DCN401 (`dml::Policy::NATIVE`; the older vector files replay with factor 1):
+a plane in ODM bypass whose single DPP needs more than the downspread-limited
+DPPCLK maximum (MinDPPCLKUsingSingleDPP) or cannot take the viewport's swath
+(SingleDPPViewportSizeSupport: DET, the 15360-pixel linear swath, the line
+buffer at its taps) takes two DPPs (`PlanePlan::dpps`), each with half the
+viewport, half the DPPCLK, and the swath, delivery, prefetch and deep-sleep
+terms of DPPPerSurface 2; both program identical registers. DCN4's
+`mpc_combine_limit` is two. Only linear, horizontally scanned RGB planes
+without DCC are combined (what the vectors cover); a tiled, rotated, 4:2:0
+or DCC plane one DPP cannot carry is refused, as is a DCC plane whose
+mcaches DML21 would split over MPC pipes. `tests/dcn401_dml21/mpc_vectors.txt` (1512
+plane configurations, 444 MPC-combined planes; harness_planes.c with
+MPC_AUTO) is replayed by `dcn401_dml_matches_linux_dml21_mpc_vectors`.
+
+A multi-pipe plan is programmed as ODM 2:1, 3:1 or 4:1 (optc401_set_odm_combine). The
+modeset gives it the highest pipes no display of the configuration uses
+(`modeset::odm_pipes`, left to right in that order), a DPP-only clock on
+each (`dccg::PixelClock::OdmSegment`, plus its DSCCLK), and lights it with
+`otg::Request::odm` and `otg::SurfaceRequest::odm` naming them
+(`otg::SplitPipes`: one to three further pipes). The OTG takes every OPP as
+a segment (OPTC_NUM_OF_INPUT_SEGMENT the count less one, unused segments
+0xf), the segment width of resource_get_odm_slice_dst_width (the line over
+the count, whole pixel pairs for 4:2:0) and for 3:1 OPTC_SEGMENT_WIDTH_LAST
+(the rest of the line), each segment's own first- then second-preferred line
+memories (decide_odm_mem_bit_map; a line needing another display's is
+refused: at most 4096 pixels per segment), and H divide-by-two for 2:1 or
+divide-by-four for 3:1 and 4:1 (every horizontal boundary divisible by it);
+each OPP formats and blanks its segment at its offset (a 4:2:0 segment after
+the first takes one extra left-edge pixel); each segment's DSC compresses its
+segment with its share of the slices while the stream's PPS stays
+whole-picture. Each ODM pipe's HUBP fetches its segment of the same surface
+(viewport X offset), its DPP/MPCC/DET/requestor (VTG the master OTG) and
+DLG/TTU follow, and start, flip, stop, underflow recovery and live checks
+act on every segment under the master OTG's one lock. The cursor is placed
+per segment and enabled only on the segments it overlaps
+(`CursorApplied::shown`). The display holds its ODM pipes from staging
+until retirement (`Siblings::pipes`); its teardown retires the timing (every
+segment's DSC off, every segment disconnected) before stopping each DSC
+clock. `ScanoutRunning::odm` names the pipes.
+
+An MPC-combined plane (`PlanePlan::dpps` 2 in ODM bypass) takes a further
+pipe from the top (`modeset::mpc_pipes` for the primary, `overlay_pipes` for
+an overlay; ODM segments first, then MPC slices, then overlays, as
+resource_update_pipes_for_stream/plane_with_slice_count acquire them) with a
+DPP-only clock at its DPPCLK; `SurfaceRequest::mpc` names it. Each slice's
+HUBP/DPP takes SPL's viewport and recout for its MPC slice
+(`spl::Input::mpc_slice`, calculate_mpc_slice_in_timing_active: equal shares
+of the plane clip, the remainder to the last slices); both slices' MPCCs
+blend in their stream's one tree, the second directly below the first
+(acquire_dpp_pipe_and_add_mpc_slice's bottom pipe), and every slice fetches
+the plane's address under the one OTG lock (`ScanoutRunning::mpc`,
+`OverlayScanout::mpc`). MPC combine never joins ODM, as DML21 decides it.
 
 `Soc` carries the board state DML depends on: the pinned UCLK, FCLK/DCFCLK DPM
 ranges, minimum SOCCLK, DISPCLK/DPPCLK maxima, the UMC channel count, DENTIST
@@ -1250,9 +1355,10 @@ DRM does, the VSDB Max_TMDS_Clock and the HF-VSDB or HF-SCDB (extended tag
 lengths, and the VSDB DC_30bit/DC_36bit deep-colour flags. `hdmi_depth` picks
 the deepest declared depth up to `max_bpc()` whose character clock fits,
 stepping down 2 bpc like amdgpu_dm's stream validation; `max_bpc` defaults to
-8 (amdgpu_dm's `max_requested_bpc`) and the `amdgpu.max_bpc=10|12` boot option
-raises it. The blank is staged at that depth. A character clock fits at or
-below 340 MHz within any declared VSDB maximum, and
+8 and the `amdgpu.max_bpc=10|12` boot option raises it. Within it each
+connector's "max bpc" (`requested_bpc`, see "Navi 48 connector max bpc")
+caps that connector's stream, on HDMI and DP alike. The blank is staged at
+that depth. A character clock fits at or below 340 MHz within any declared VSDB maximum, and
 above it (to `TMDS_MAX_KHZ`, 600 MHz) only with SCDC and an HF rate covering
 it. Before the link starts an SCDC sink is configured as Linux's
 `write_scdc_data` does: sink version read, source version 1 written when the
@@ -1284,6 +1390,135 @@ setting that trained, else one RBR lane, as the port's `VerifiedLink`
 (`apply_verified_links`), so `dp_caps`, selection, offered modes and DSC
 (`dp_dsc`/`refine_dsc`) use the verified link and no 128b/132b; another sink,
 a changed EDID/DPCD, a nonresponding or empty port drops it.
+
+DSC follows amdgpu_dm's SST policy for a dongle-less DP sink on either
+encoding, at every depth amdgpu_dm_create_validate_stream_for_sink tries:
+`dp_sst_stream(timing, caps, depths, max_dispclk_khz) -> Option<DpSstStream {
+lanes, rate, dsc, depth }>` walks `dp_depths` (the EDID 1.4 depth, 8 when
+undefined, up to `max_bpc`, deepest first) and at each depth takes the
+stream raw when a link carries it (`dp_link_bpc`), else compressed from that
+depth, else the next depth; a deeper compressed stream is preferred to a
+shallower raw one, as in Linux (6 bpc, which the native encoders cannot
+send, is never tried). `tests/dcn401_dsc/check.sh` replays 2000
+depth_vectors.txt searches through Linux's DSC code (depth_harness.c).
+`dp_dsc(timing, caps, max_dispclk_khz, bpc)` runs only when no
+uncompressed setting carries the mode at `bpc`, and compresses with
+`dc_dsc_compute_config` against `dc_link_bandwidth_kbps` at the sink's
+maximum link: 4 lanes x the best UHBR rate (`uhbr_kbps`, 128b/132b
+encoding, FEC inherent, no FEC cap needed) when `DpCaps::uhbr` is nonzero,
+else the maximum 8b/10b link with FEC (FEC cap required). Its result must fit
+the pipes admission gives it (`dml::dsc_shape(timing, slices,
+dispclk_max_khz)`: DecideODMMode less downspread, up to ODM 4:1, twelve
+slices on three pipes), each DSC taking at most four slices of at most 5184
+pixels, so 8K takes two DSCs (four on a board whose DISPCLK two cannot cover).
+`dsc_link(timing, cfg, caps)` is the link for the compressed bandwidth
+(`dc_dsc_stream_bandwidth_in_kbps`, unpadded): the maximum 8b/10b link with
+FEC when it carries it, else the first 128b/132b setting upward, lanes before
+rate. A UHBR sink therefore never compresses onto 8b/10b (16 bpp is two
+thirds of 24 bpp, and 8b/10b with FEC carries less than two thirds of UHBR10
+at any lane count), and uncompressed UHBR always wins over DSC at the same
+depth. `refine_dsc` redoes both with the board's DISPCLK, from the selected
+depth down (a depth whose DSC shape the board cannot run falls to the next). A compressed UHBR stream carries no
+audio. Fallback keeps the admitted PPS (`selected_dp_candidates`): Linux's
+`dp_lt_fallbacks` through its 128b/132b settings that carry the compressed
+stream for a UHBR link, narf's 8b/10b ladder for an 8b/10b one. DML21
+admission takes the same inputs on both encoders: Linux plans every DSC
+vector identically with `dml2_dp2p0` (check.sh replays `dsc_vectors.txt` and
+`odm_dsc_vectors.txt` with `DP2P0=1`; `uhbr_dsc_vectors.txt` holds the
+configurations this policy picks). On the HPO path `otg::Request::dsc` is
+accepted for `Signal::HpoDisplayPort` SST: the pipe's DSC and OPTC compress
+from timing staging (link_set_dsc_on_stream programs nothing more for HPO),
+`DP_SYM32_ENC_VID_PIXEL_FORMAT.PIXEL_ENCODING_TYPE` is set, and after the
+encoder is enabled and mapped `start_uhbr_video` writes DP_DSC_ENABLE 1 (read
+back), then sends the PPS as `dcn31_hpo_dp_stream_enc_set_dsc_pps_info_packet`
+does (GSP11 payload size 3, VPG n+5 generic packets 11-14 with header
+00 10 7F 00 latched immediately, GSP11 line 2, VBID[6] line 3, GSP11 and
+SDP on), before the SST payload, whose slots, VC rate and minimum blank
+width (`uhbr_dsc_payload`) use the compressed bandwidth. `stop_uhbr_video`
+writes DP_DSC_ENABLE 0 (unchecked) and turns GSP11 off with payload size 0
+after the encoder, before the timing; the DSC stays for a restart until the
+timing retires. `DscConfig::bpc` is the input depth a configuration was
+computed for (the timing's `display_color_depth`, 8, 10 or 12): the DSC's
+`DSC_CIF_CONFIG0` input depth and the PPS's `bits_per_component` and rate
+control follow it, the DIO and HPO encoders and MSA/VSC keep signalling the
+stream depth, and the blank request's depth must equal it (the OPP feeds the
+DSC that depth; `Error::Invalid` otherwise).
+
+HDMI FRL DSC follows amdgpu_dm's FRL policy (`apply_dsc_policy_for_stream`,
+`create_validate_stream_for_sink`): at each depth, deepest first, a stream
+is compressed from that depth only when it does not fit the sink's maximum
+FRL rate raw; a depth DSC cannot form (the HF-VSDB's DSC_10bpc/DSC_12bpc
+decide 10- and 12-bpc input) tries the next.
+`amdgpu_dsc::HdmiDscCaps::parse(flags, max_frl_rate, total_chunk)` reads the
+HF-VSDB DSC bytes as drm_edid does and `DscSinkCaps::from_hdmi` is
+`dc_dsc_parse_dsc_edid` (`is_frl`, `all_bpp`, `total_chunk_bytes`).
+`compute_frl_config(sink, max_dispclk_khz, max_rate, timing, vic)` is
+`dc_dsc_compute_config` on `LinkEncoding::HdmiFrl`: `hdmi_num_slices` and
+`hdmi_bpp_x16` (`hdmi_dsc_get_num_slices`/`hdmi_dsc_get_bpp` with the
+`prim_bpp` tables for CTA/HDMI VICs), `frl_params` per FRL rate
+(`compute_bpp_x16_from_frl_params`), the FRL `decide_dsc_bandwidth_range`
+branch with no DP slice overhead, and the FRL minimum-bpp fallback;
+`DscConfig::frl = Some(FrlDscLink { all_bpp, max_rate })`. The FRL rate is
+the lowest one whose compressed capacity check passes:
+`amdgpu_frl_cap::frl_cap_check` with `FrlCapInput::dsc = Some(FrlDsc { slices,
+slice_width, bpp_x16, vic, all_bpp })` is `dml1_frl_cap_chk_compressed`
+(prim_format tables, 192 kHz audio reserve) returning `FrlCap::Ok {
+audio_packets_line, borrow, hc_active, hc_blank }`, and `dsc_borrow` is
+`frl_modify_borrow_mode_for_dsc_padding` (Linux's 100 Hz pixel clock units
+kept). `tests/dcn401_frl/check.sh` replays 3564 uncompressed and 2970
+compressed vectors against Linux built on the host; `tests/dcn401_dsc/
+check.sh` replays 3000 FRL DSC configurations and 890 CVTEM packet sets.
+`modeset::hdmi_stream` selects the stream (RGB at 12, 10 then 8 bpc, raw or
+compressed, then 4:2:0 raw, as Linux orders encodings and depths;
+`frl_dsc(.., bpc)` compresses at a depth); `refine_dsc` redoes the FRL DSC
+from the selected depth down with the board's DISPCLK; `frl_video_params` gives the HPO FRL video request's
+`FrlVideoRequest { audio_packets_line, borrow, hc_active, hc_blank }`.
+Lighting runs link_set_dsc_on_stream's FRL order after training: the pipe's
+DSC engines, then `hpo_enc401_hdmi_set_dsc_config` (`frl_dsc_start`:
+HDMI_DSC_MODE, FIFO compressed-format bits, zero GCP depth, the CVTEM PPS in
+VPG generic packets 5-10 with Linux's packet-buffer reuse), then the OPTC
+(`OTG_V_SYNC_MODE` 1); stop runs OPTC off, HPO DSC off (`frl_dsc_off`), then
+the DSC disconnect and disable. FRL DSC takes the stream depth as its input
+(`DscConfig::bpc`, with zero GCP depth); DML21 admits
+the compressed stream (`frl_dsc_vectors.txt`, one FRL output per context as
+Linux's `max_num_hdmi_frl_outputs`).
+
+DP MST DSC follows amdgpu_dm and DRM on both encodings.
+`amdgpu_mst_dsc::compute_link(streams, link, fits, native)` is
+`compute_mst_dsc_configs_for_link` with `increase_dsc_bpp`,
+`try_disable_dsc` and `set_dsc_configs_from_fairness_vars`: `peak_pbn`
+(`kbps_to_peak_pbn`, 1.006 peak, 1.031 8b/10b FEC), `kbps_from_pbn`,
+`DscLink { encoding, kbps, slots, max_dispclk_khz }`, `DscStream { sink,
+timing, dsc, bpc }` (the stream's depth: its uncompressed bandwidth and DSC
+input) and `DscPayload { pbn, slots, dsc }`; `fits` is the topology's
+per-hop PBN check and `native` the display pipeline's DSC shape (`dml::dsc_shape`: up to four
+ODM pipes of four slices). `tests/dcn401_dsc/check.sh` replays 1500
+mst_vectors.txt links through Linux's own fairness functions (mst_harness.c)
+and 1200 mst_depth_vectors.txt links of 8-, 10- and 12-bpc streams (built
+with `STREAM_BPC`);
+a configuration Linux leaves compressed at bpp 0 is refused. In
+`amdgpu_navi48_mst::dsc`, `dsc_aux_for_port` is
+`drm_dp_mst_dsc_aux_for_port` (end device, DP-to-DP virtual-DPCD peer with
+passthrough, DP-to-HDMI/virtual sink, `DSC_WITHOUT_VIRTUAL_DPCD` hubs),
+`read_dsc` is `validate_dsc_caps_on_connector` returning `MstDsc { caps, aux,
+passthrough, end_link_kbps, branch_oui }`, `port_supports_mode(t, bpc, ..)` is
+`dm_dp_mst_is_port_support_mode` at the stream's depth, and `set_rx` is
+`dm_helpers_dp_write_dsc_enable` (passthrough 2 before decoder 1; disable
+reverse) through `dp_mst_mgr::Manager::remote_dpcd_read/write`. Selection
+and offered modes run the fairness search jointly across the branch, each
+end device at the deepest of its depths (`dp_depths` up to
+`MstDscContext::max_bpc`, create_validate_stream_for_sink's loop) that the
+port and the joint search take; such a stream leaves at that depth
+compressed or raw (VC rate, PBN and audio budget at it). A link without any
+decoder runs uncompressed streams at the deepest depth its port carries
+raw, their PBN sized for the requested depth (`raw_mst_stream`, see "Navi
+48 connector max bpc"). A compressed stream's
+payload PBN and VC rate come from the compressed bandwidth
+(`uhbr_mst_dsc_rate` on 128b/132b). The decoder is enabled before the
+payload, the PPS is sent per stream (DIO SDP or HPO GSP11) before unblank,
+and teardown stops the stream before clearing DP_DSC_ENABLE. MST DSC streams
+keep their LPCM (see audio below); Synaptics cascaded/Panamera workarounds and DP-to-HDMI PCON
+FRL DSC are not ported.
 `modeset_display_mode` and `modeset_displays` select, admit and light again
 (at most `VERIFY_ROUNDS`) when the first display reports `LinkReduced`; a later
 display's reduction is returned in `Configuration::failed`, and the monitor
@@ -1345,7 +1580,8 @@ Writes and live format checks reject mismatched encoding, depth, compression
 or width. Startup rechecks the stream, link, clock route and format after its
 final frame wait before publishing running video. Failure after writes retains
 the link and quarantines the video owner. FRL LPCM uses the audio contract
-below; FRL DSC and physical acceptance remain open.
+below; FRL DSC is described with the DSC policy above. Physical acceptance
+remains open.
 
 `amdgpu_frl_training::poll_status` handles live SCDC FRL_Start, FLT_Update
 and Source_Test_Update requests as Linux's `hdmi_frl_poll_status_flag` does.
@@ -1629,6 +1865,11 @@ pipeline does not output. Only the
 EDID's first timing carries PREFERRED; the running timing is listed first and
 is the CRTC's mode. SETCRTC with a mode is refused (EINVAL) unless the mode's
 clock and geometry equal an offered timing.
+The Navi48 card is DRIVER_ATOMIC: its KMS publisher sets
+`Card::native_atomic`, so `SET_CLIENT_CAP(ATOMIC)` and `DRM_IOCTL_MODE_ATOMIC`
+(previously VirtGPU-only) run the bridge's native atomic path, as Linux
+amdgpu always offers atomic; CURSOR_PLANE_HOTSPOT stays VirtGPU-only.
+Navi22's native card still uses legacy KMS.
 An atomic MODE_ID blob is held to the same gate (`accepts_mode_blob`, at
 check time, so TEST_ONLY probes see it). Cards without native outputs are
 unaffected. A DRM client switching the CRTC off (SETCRTC without a
@@ -1657,6 +1898,35 @@ radeonsi from driving render ioctls the native driver does not implement.
 Presentation goes through the back buffer and a latched flip (see live
 updates above), and flip events stay software-paced at the real refresh
 rate.
+
+Every native plane (primary and overlay: DCN4's planes are all
+DC_PLANE_TYPE_DCN_UNIVERSAL) lists `amdgpu_navi48_kms::PLANE_FORMATS`:
+amdgpu_dm's DCN4.0.1 order (`amdgpu_dm_modifiers::DM_PLANE_FORMATS`:
+rgb_formats, NV12, P010, the FP16 orders) less RGBA8888 and the 16-bit UNORM
+orders. The overlay planes, plane properties, placement, SETPLANE, tiling and
+4:2:0 planes are described in "Navi 48 plane scaling and overlay planes".
+ADDFB2 takes a format on a card whose `plane_formats` list it, with Linux's
+pitch and dumb-object size checks (a card without native planes keeps
+XRGB8888/ARGB8888/RGB565); `drm::card::PixelFormat` knows the formats and
+their `cpp`. SETCRTC and atomic commits (TEST_ONLY included) also require
+`amdgpu_native_kms::display_admits_format(display, connector, mode, fourcc)`:
+a format of the depth the display's offered timings were admitted at needs
+nothing more; another depth is admitted by DML against the running
+configuration (`platform::display_admits_format`), which needs the display
+lit on the same connector and timing, else EINVAL. PAGE_FLIP keeps the
+format (EINVAL across formats). A committed framebuffer records its format
+with `request_display_format`; a running display scanning another one is
+relit in it by the monitor, like a mode request, and a failed relight
+returns every display to XRGB8888 with its preferred mode, as does the last
+DRM file closing. `amdgpu_native_kms::present_frame` takes the framebuffer's
+fourcc: a frame in the scanned format is copied as packed words into the back
+buffer; one in the requested format waits for the relight and presents (or
+completes) after that monitor pass; others complete at once. The console and
+the CPU-copy fallback stay XRGB8888 only (`scanout_framebuffer` refuses
+other surfaces). Format modifiers are described in "Navi 48 plane scaling
+and overlay planes" (GFX12 modifiers); amdgpu answers
+`DRM_CAP_ADDFB2_MODIFIERS` = 1. No hardware validation of these formats
+exists.
 
 `platform::spawn_display_monitor` runs after the boot-time native modeset
 (`amdgpu.native_display`). It enables HPD on every routed DP port, then runs
@@ -1728,7 +1998,8 @@ new front, the now-reusable back and the frame count. Any failure leaves
 unknown. The platform `flip_display` moves a console that had adopted the old
 front onto the new one and drains CPU views before releasing the owner lock.
 There is no flip interrupt or event queue yet:
-completion is polled.
+completion is polled. Under DRR the flip also fires the OTG manual trigger
+after the lock release (Navi 48 variable refresh).
 
 Live updates have one synchronization policy per writer. The front's
 `upload_surface` stays stopped-only. `unsafe Otg::upload_back_buffer(pipe,
@@ -1761,31 +2032,65 @@ inside the FB aperture. Each call rewrites the image there with transparent
 padding and HDP-flushes it; an image change is not tear-free, because the
 buffer is single.
 
-Programming follows dcn10_set_cursor_attribute and dcn401_set_cursor_position
-inside mpc1_cursor_lock (`CUR_VUPDATE_LOCK_SET` of the pipe's OPP, released
-on every path):
+Programming follows program_cursor_attributes and program_cursor_position:
+on every pipe of the stream that carries a plane (the primary's ODM segments
+and MPC slices and every overlay's pipes), dcn10_set_cursor_attribute and
+dcn401_set_cursor_position, inside mpc1_cursor_lock (`CUR_VUPDATE_LOCK_SET`
+of each ODM segment's OPP, whose MPCC tree carries every plane of the
+segment; released on every path):
 - HUBP: address (high, then low), size, and `CURSOR_CONTROL` with mode 2,
   pitch 64, lines per chunk by width and `CURSOR_REQ_MODE` 1.
 - `CURSOR_SETTINGS`: full write of 0x300.
 - CM_CUR: mode 2, no expansion or degamma ROM, FP16 1.0 scale, matrix bypass.
-- Position, hotspot and `CURSOR_DST_X_OFFSET`, the latter in DCHUB reference
-  clocks.
+- Position, hotspot and `CURSOR_DST_X_OFFSET` per pipe.
 
-Negative origins move into the hotspot. A cursor entirely off screen is
-disabled in both HUBP and CM, and `move_cursor` (or the non-blocking platform
-`try_move_display_cursor`, for pointer pumps) only repositions. The live-fetch
-witness expects exactly the reported cursor enable. Stopping scanout hides the
-cursor under its lock before the plane stops, and drops the report while the
+The position is amdgpu_dm_plane_get_cursor_position's (a negative origin
+moves into the hotspot, at most 63; one 64 or more past the left or top edge
+disables the cursor) taken through dcn401_set_cursor_position for each pipe
+(`cursor::pipe_position`): past the src widths of the ODM slices before the
+pipe (resource_get_odm_slice_src_rect, a 4:2:0 slice one pixel wider), the
+MPC bottom-pipe move, then into the pipe's recout space, every part left of
+or above either moved into the hotspot, disabled when none of the image lands
+in the recout or when resource_can_pipe_disable_cursor finds a plane of
+another layer above whose recout (merged with its other slice) contains the
+pipe's; then hubp401_cursor_set_position: `CURSOR_DST_X_OFFSET` from the
+viewport position (recout to viewport scale) in DCHUB reference clocks over
+the horizontal ratio (dc_fixpt_from_ux_dy of SPL's register), the X hotspot
+clamped to 255. `CursorApplied::shown` names the pipes enabled; the
+live-fetch witness expects exactly those. `move_cursor` (or the non-blocking
+platform `try_move_display_cursor`, for pointer pumps) only repositions. A
+live plane update re-places the cursor on its new pipes under the OTG lock
+(dcn20_update_dchubp_dpp). Stopping scanout hides the cursor on every plane's
+pipe under the locks before the planes stop, and drops the report while the
 buffer stays retained. Any readback mismatch quarantines the pipe.
-`tests/dcn401_cursor.c` checks the registers, including the MPC lock bank.
+`tests/dcn401_cursor.c` checks the registers, including the MPC lock bank;
+`tests/dcn401_cursor_position/check.sh` builds amdgpu_dm_plane_get_cursor_
+position, dcn401_set_cursor_position, adjust_hotspot_between_slices_for_2x_
+magnify, resource_can_pipe_disable_cursor, hubp401_cursor_set_position and
+dpp401_set_cursor_position from the Linux tree on the host and answers 1060
+stream/cursor vectors (`vectors.txt`: single pipes, unscaled, scaled,
+cropped, covering and underlying planes, ODM 2:1, 3:1 and 4:1 with 4:2:0
+slices, MPC slices under and over overlays, five cursor sizes), replayed by
+`dcn401_cursor_matches_linux_vectors`; `stream_cursor_pipes` (the pipes as
+SPL and the MPCC trees describe them) is checked against the vectors' own.
+
+`otg::cursor_mode(dce_ip, crtc_enabled, cursor_scale, planes)` is
+amdgpu_dm_crtc_get_cursor_mode (`CursorMode::{Native, Overlay}`, the planes
+under the cursor as `CursorUnder`, `plane_scale` as dm_get_plane_scale): DCN
+4.0.1 (Navi48), 4.2.0 and 4.2.1 and a disabled CRTC always take the native
+cursor, so amdgpu_dm neither needs the overlay cursor nor refuses a cursor
+over a scaled or YCbCr plane there; other DCN take the overlay cursor over a
+YCbCr plane, a plane scaled unlike the cursor in both directions or a hole.
 The platform publishes a cursor hook with the scanout
 (`amdgpu_dcn_display::publish_external_cursor`, cleared on withdrawal before
 observers run). It try-locks the owner, uploads the image once, moves it
 afterwards, and hides it with an off-screen move. When the owner is busy it
 skips the update but still reports the cursor as handled, so the fb layer
 never paints a software sprite into a hardware-cursor surface. The fb cursor
-pump uses it for both the console pointer and a compositor's DRM cursor
-whenever the console adopted exactly the published scanout.
+pump uses it for the console pointer whenever the console adopted exactly
+the published scanout; on a display whose cursor a DRM cursor plane drives
+(see "Navi 48 DRM cursor planes") it reports the cursor handled and leaves
+the hardware alone.
 
 Native 8b/10b MST uses `dp_mst_mgr::Manager` over the port's DMUB AUX channel.
 `ColdBoot::display_mst_capable(port)` checks DPCD revision and MSTM_CAP before
@@ -1810,6 +2115,8 @@ leaves the next branch chunk unacknowledged until the caller drains the queue.
 Down transactions still consume their own replies while that queue is full.
 Truncated bodies fail instead of manufacturing zero-filled status fields.
 An event survives failure to send its sideband ACK after ESI acknowledgement.
+The ACK goes to the primary branch (broadcast, LCT 1) whichever downstream
+branch sent the notification, as drm_dp_send_up_ack_reply(mgr, mst_primary).
 `ColdBoot::poll_display_mst(port)` and `take_display_mst_events(port)` expose
 this service over DMUB AUX. `service_display_mst` drains before/after polling
 and marks known-branch/known-port connection notifications for reprobe. Resource
@@ -1819,9 +2126,21 @@ must match the requested port and have available PBN no greater than full PBN.
 The driver adds its current payload PBN back to the queried free capacity,
 including descendant streams on a shared branch hop. Its own allocations thus
 do not cause repeated relights. A changed capacity/FEC snapshot requests
-reconfiguration. The monitor stops all streams using their old routes, reprobes,
-then relights enabled outputs. Notifications received during queries/reprobe
-remain queued for the next pass. Unknown branch/port, input-port and disconnected
+reconfiguration. While streams run, `MstLink::reprobe_live` (inside
+`service_display_mst`) first probes the tree again, as Linux handles a CSN
+without touching unaffected streams: branches with the same GUID and route
+keep their `Topology::branches` index (new ones fill vacated indices, then
+append; unfilled vacancies are port-less placeholders), every hop's reported
+free PBN is credited with the driver's own payloads, and the new topology is
+adopted only if every payload's end device is still connected and its PBN
+fits every hop beside the others. Adoption reconciles outputs, rereads
+EDID/DSC, readmits dark outputs' modes beside the running displays and
+clears the dirty mark; the monitor republishes the connectors and relights
+only when a new end device appeared. Otherwise (a lit route or its hop
+capacity lost) the old topology and routes stay and the monitor stops all
+streams using their old routes, reprobes, then relights enabled outputs.
+A failed or cancelled live probe retains the session like `prepare`.
+Notifications received during queries/reprobe remain queued for the next pass. Unknown branch/port, input-port and disconnected
 resource notices are ignored.
 
 `MstLink::resource_query_pending()` reports an incomplete resource-query batch.
@@ -1867,9 +2186,10 @@ route. Each round is retried as described for `LinkReduced`.
 
 `unsafe ColdBoot::modeset_mst_displays(port, fill, want, pipes)` is
 `modeset_routed` with that route and no board pipes. It lights one
-branch's sinks with joint DML admission, 8-bpc RGB and the maximum supported
-8b/10b link. `pipes[k]: Option<u8>` assigns stable output k to a distinct
-display/pipe, or disables it. Disabled, unreadable and unadmitted devices
+branch's sinks with joint DML admission, RGB at each end device's depth (see
+"Navi 48 connector max bpc") and the maximum supported link.
+`pipes[k]: Option<u8>` assigns stable output k to a distinct display/pipe,
+or disables it. Disabled, unreadable and unadmitted devices
 leave gaps; their successors never inherit their CRTC or requested mode.
 Each payload must fit the remaining 63 slots and the available PBN of every
 connected hop from the sink to the root, after subtracting selected sibling
@@ -1933,15 +2253,27 @@ whose connector routing changes is relit. The last DRM file closing restores
 automatic routing. An all-off DRM configuration keeps connector identities
 and requests while the branch remains connected; removing the branch (with
 no stream left on it) drops its connectors and their routes. Shared-link loss stops and relights the whole configuration instead
-of invoking the SST retrain path. Downstream changes use the same whole-link
-stop/reprobe/relight sequence, so other streams briefly blank. KMS can publish
+of invoking the SST retrain path. A downstream change that keeps every lit
+route is adopted live (`reprobe_live`, above) and only republishes the
+connectors, relighting just for a newly appeared end device; one that loses
+a lit route or its hop capacity uses the same whole-link stop/reprobe/relight
+sequence, so other streams briefly blank. KMS can publish
 a newly discovered EDID and independently admitted timings as connected with
 its CRTC off (`amdgpu_navi48_kms::Output::{edid, offered}`). These timings reach
 GETCONNECTOR and the platform's mode-request gate without setting a CRTC mode
 or framebuffer. A missing EDID suppresses the offered timings. Ordinary MST
 disable retains previously admitted timings without restarting siblings;
 the next configuration/reprobe recomputes admission against remaining resources.
-DSC on MST and more than one MST branch remain unsupported.
+MST DSC follows amdgpu_dm's fairness search (see the DSC policy above).
+Cascaded (daisy-chained) branches are one topology: each branch is probed by
+LINK_ADDRESS at its own LCT/RAD (`dp_mst_mgr::child_rad`), sideband
+transactions for an end device (ALLOCATE_PAYLOAD, REMOTE_I2C_READ, remote
+DPCD) go to that device's own branch, end devices across branches share the
+link's payload table and the four stable connector slots, and every hop of a
+device's path bounds its payload, dark-mode admission and the DSC fairness
+search jointly with the sibling streams crossing that hop. Only one DP port
+runs MST at a time (the first connected branch); end devices beyond the four
+slots are not published.
 
 An MST branch that codes 128b/132b runs UHBR MST, as Linux's
 decide_mst_link_settings trains MST at the verified cap: the best UHBR rate
@@ -2321,7 +2653,21 @@ programmed by the native stream owner, including pixel padding, rather than
 stereo layout; 3..8 channels conservatively use the eight-channel layout.
 No remaining rates means silent video without an audio endpoint. Linux-host
 vectors cover this explicit input contract at all UHBR rates/lane counts and
-8/10/12-bpc RGB depths; they do not validate audible output or DSC/MST audio.
+8/10/12-bpc RGB depths; they do not validate audible output.
+
+Compressed DP streams keep their LPCM as Linux does: build_audio_output hands
+dsc_cfg (bits per pixel in 1/16, num_slices_h) to check_audio_bandwidth_dp,
+which budgets the compressed bpp and subtracts four EOC symbols per slice
+(in Linux's unsigned arithmetic). `uhbr_audio_info_with` and
+`mst_audio_info_with` take the stream's `DscConfig`; selection keeps audio on
+UHBR SST DSC and on 8b/10b and 128b/132b MST DSC streams, the UHBR budget
+uses the minimum blank width the compressed payload programs
+(`uhbr_dsc_payload`), and startup re-filters at the trained link. The APG
+and DIO AFMT share the PPS's secondary data path: legacy MST audio start
+expects the PPS's AFMT clock and master (and the VSC/HDR SDP enables) and
+stop leaves them set, as SST does. `check.py --dsc` compiles Linux's routine
+for 4536 UHBR and 1512 legacy MST DSC vectors (compressed bpp, slices and an
+explicit blank width), which the kernel tests replay.
 
 Live UHBR checks verify retained MSA/format/blank width and APG/packet/endpoint
 state. Stop disables audio packets and APG, then the endpoint, before scanout
@@ -2357,9 +2703,10 @@ payload before muting samples, disabling packets/AFMT and the endpoint; only
 then may scanout, video and payload retire. The MST activation checkpoint covers
 completed scanout before audio starts. Models cover independent stream/pipe/PHY
 indices, all RGB depths, malformed/stale payloads, failures, endpoint collisions,
-shared DTO and two-stream link handover. 2268 bandwidth vectors match Linux's
-routines. MST DSC and physical audio acceptance remain outside this
-contract.
+shared DTO and two-stream link handover. 2268 bandwidth vectors (plus 1512
+compressed ones) match Linux's routines. A compressed MST stream's payload
+witness expects its compressed VC rate. Physical audio acceptance remains
+outside this contract.
 
 `start_display_hdmi_video(port)` starts the blank timing, repeats the FIFO reset
 under live symclk, clears AVMUTE and waits for a fresh frame
@@ -2560,7 +2907,7 @@ uses the actual trained lane count/rate and reduces 8b/10b capacity to 97% when
 FEC runs. Uncompressed RGB uses its component depth; DSC uses the validated
 PPS's bits per pixel and per-slice overhead, so a mode which needs compression
 is not rejected against its uncompressed size. This native DSC path requires
-8-bpc RGB SST and a FEC-trained link; other depths, MST DSC and insufficient
+8-bpc RGB and a FEC-trained link (SST or MST); other depths and insufficient
 compressed capacity reject before frontend writes. This is not DML admission
 or a watermark proof.
 Native pixel packing selects 1/2/4/8 pixels per cycle from pixel rate and DPREF.
@@ -3152,13 +3499,43 @@ protection faults, the twelve SDMA7 error sources (SRBM write, invalid
 doorbell, queue hang, atomic/poll/page timeouts, null page, page fault, VM
 hole, frozen engine and both semaphore timeouts, with SDMA instance and queue
 from the IV ring ID), SQ error words (illegal instruction and memory
-violation with their 21-bit detail) and poison: UTCL2 data poisoning,
-RLC_GC_FED, CP ECC/FUE, SDMA ECC/SRAM ECC, SQ EDC FUE/FED, VCN5 UVD/JPEG
-poison, DF/UMC ECC and NBIF ATHUB error events. These have no latch to read,
-so the full IV is the retained evidence; they contain reporting like the
-existing faults. Only VM, CP privileged/opcode and SDMA0 trap sources are
-actually enabled by the service; the rest are classified if the IP raises
-them.
+violation with their 21-bit detail). These have no latch to read, so the
+full IV is the retained evidence; they contain reporting like the existing
+faults. Only VM, CP privileged/opcode and SDMA0 trap sources are actually
+enabled by the service; the rest are classified if the IP raises them.
+`Status::first` keeps the first fault record (with its latch snapshot and
+acknowledgement) beside `last`, so later consequential faults never
+overwrite the original evidence.
+
+Poison/ECC vectors (UTCL2 data poisoning, RLC_GC_FED, CP ECC/FUE, SDMA
+ECC/SRAM ECC, SQ EDC FUE/FED, VCN5 UVD/DJPEG/EJPEG poison, DF/UMC ECC and
+NBIF ATHUB error events) are not faults and never contain, fault an owner or
+terminate by themselves. `amdgpu_navi48_ras` does what Linux's amdgpu_ras
+does on bare-metal Navi48 and nothing else. `amdgpu_ras_asic_supported`
+accepts MP0 14.0.3 and PSP14 has no RAS capability query, so the block mask
+comes from the VBIOS: `Caps::from_vbios` reads umc_info's ECC-capable bit
+(v3.1–v3.3, v4.0) and firmware_info's SRAM_ECC capability, and `hw_enabled`
+reproduces `amdgpu_ras_check_supported` (mem ECC → UMC|DF; SRAM ECC → every
+other block except VCN/JPEG and XGMI). A consumer board reporting neither has
+RAS disabled. `disposition` then follows the IP handlers: GFX12, SDMA7,
+UTCL2 and JPEG5 register no poison source and KFD v11's ISR drops them;
+VCN 5.0.0's UVD_POISON handler returns without a VCN RAS object; the ATHUB IV
+is a dummy. These are counted with first/last IV evidence in `ras::Status`.
+Only with UMC RAS on (VBIOS mem ECC and UMC 8.14) does the DF ECC IV run
+`amdgpu_ras_interrupt_umc_handler`: FED is set, every UMC 8.14 channel's
+GeccErrCnt is read through NBIF 6.3.1's RSMU index/data pair and retained,
+then cleared; an uncorrectable count is `ras::Fatal::Umc`. UMC 8.14 has no
+error-address query, so no page is retired. With DF RAS on, the service polls
+BIF_DOORBELL_INT_CNTL after every IH pass as
+`amdgpu_ras_interrupt_fatal_error_handler` does; a set ATHUB status is
+cleared after capture and is `ras::Fatal::Athub`. Arming mirrors
+`amdgpu_umc_ras_late_init` (boot counts read and cleared, GeccErrInt = APIC)
+and `soc24_common_late_init` (ATHUB event enabled). Only the first fatal
+event counts (`amdgpu_ras_in_intr`). The service stops with
+`Terminal::Ras(fatal)`, and the platform's terminal-fault path performs the
+mode-1 device recovery Linux's `amdgpu_ras_reset_gpu` requests. The RAS TA
+feature-enable command is not sent; Linux falls back to the same software
+object when the TA refuses it.
 
 After a lost batch the service wakes every dispatch owner to re-check its
 fence and runs `sweep`: both hub protection latches are read (GC first
@@ -3204,7 +3581,19 @@ until the endpoint changes or a 100 ms watchdog fires (Linux's fallback timer
 role); every wait also takes a mandatory deadline. Completion vectors match
 the exact slot first and then the doorbell, as gfx_v12_0_eop_irq does, and
 must carry the owner's VMID/PASID. Vectors for unregistered, retired or
-mismatched owners and unknown sources are counted without completing work.
+mismatched owners and unknown sources are counted without completing work;
+unknown, unregistered and malformed vectors return `Delivery::Unhandled`
+(`Counters::unknown`/`unhandled`), and the first and latest unowned,
+unattributed or unhandled IVs are kept in `Summary`. The service writes the
+first 16 such vectors to the console (`Status::logged`). Registration and
+routing accept only identities Linux has rings for: CP ME 0–2, SDMA
+instance 0/1 queue 0 (a trap naming instance > 1 or another queue is
+unhandled, as in `sdma_v7_0_process_trap_irq`), VCN client instance 0/1 and
+JPEG on the VCN client only (`jpeg_v5_0_0` registers nothing on VCN1).
+VCN sources other than 119 and 160 and JPEG sources other than 153 are
+unhandled. A CP privileged/opcode fault goes to the kernel ring at its slot
+alone; only without one does the context-ID doorbell name a user queue, and
+then only in the IV's PASID (`amdgpu_userq_process_reset_irq`).
 VCN source 119 wakes its registered unified owner, identified by client
 instance plus VMID/PASID as in `vcn_v5_0_0_process_interrupt`; its ring payload
 has no separate queue selector. Other media, power and SQ messages remain
@@ -3222,8 +3611,10 @@ GFXHUB). The first fault is kept; waiters on a faulted endpoint return
 `Faulted` unless their fence already completed. `unsafe recover` is the
 controlled-recovery step: once the owner has reset or unmapped its queue it
 gets a new generation, and every handle of the faulted generation is `Stale`
-forever. Faults without an owner are counted as unattributed. Poison is
-terminal, as Linux's poison consumption ends in a GPU reset. The interrupt
+forever. Faults without an owner are counted as unattributed. Poison IVs
+are counted (`Counters::poison`) and delivered nowhere; a RAS event that
+Linux answers with a mode-1 reset reaches waiters as `Terminal::Ras`. The
+interrupt
 service delivers its own failures (all-ones MMIO as `DeviceGone`, overflow,
 protocol, revocation, fault-monitor errors) with `fail_all`: every current
 waiter wakes with `Terminal`, new waits return it without reading memory, and
@@ -3330,6 +3721,815 @@ pauses CPU console/framebuffer writers before preparation, and runs startup
 without a spinlock or executor poll on the stack. A preflight error resumes
 writers. A started failure/cancellation on the primary GPU keeps them stopped;
 an unrelated secondary GPU cannot quarantine another device's framebuffer.
+
+### Navi 48 variable refresh (DP Adaptive-Sync)
+
+`amdgpu_freesync` is the shared, integer-only VRR policy (Linux drm_edid.c,
+amdgpu_dm and modules/freesync). `monitor_range(edid)` is
+drm_get_monitor_range over the whole EDID: EDID 1.4 with continuous
+frequency only, every detailed block of the base block, CTA-861 extension
+DTD areas and VTB extensions, "range limits only" (flags 0x01) descriptors
+with the 1.4 +255 offsets, the last one winning; `None` when none qualifies.
+`dp_sst_caps(edid, dpcd)` is amdgpu_dm_update_freesync_caps for a DP SST
+sink: DPCD 0x007 bit 6 (MSA_TIMING_PAR_IGNORED) and a range more than 10 Hz
+wide give a `VrrRange`. `VrrRange::supports(timing)` is vrr_supported
+(drm_mode_vrefresh within the range). `drr(timing, range)` is
+mod_freesync_build_vrr_params for VRR_STATE_ACTIVE_VARIABLE on DCN401: the
+minimum is raised to the hardware floor (pixel clock over h_total times
+32767 minus the front porch plus one), the maximum capped at the nominal
+refresh, the exact-2x rule applied, and fewer than 10 Hz left is fixed
+refresh (`None`). `v_total_min` comes from the maximum and `v_total_max`
+from the minimum refresh through `calc_v_total_from_refresh`, whose
+stream-limit arguments amdgpu_dm leaves zero (so it rounds up), never below
+the nominal total. Totals above 32767 are refused as
+dc_stream_adjust_vmin_vmax does. Not implemented, and so not VRR-capable
+here: HDMI FreeSync (the AMD VSDB), DisplayID ranges, DP MST, PCON
+whitelists, MCCS, below-the-range frame insertion (BTR/LFC), V_TOTAL_MID and
+the FreeSync VSIF/SDP infopacket.
+
+`Selection::vrr` carries a DP SST sink's range (`None` for HDMI and MST
+streams); `Selection::vrr_supported()` and `Selection::drr()` give the mode's
+answer and totals. `SstOutput::vrr_capable` reports the connector's
+capability. Once an SST stream's video runs (8b/10b or 128b/132b),
+`start_link` calls `unsafe ColdBoot::set_display_dp_ignore_msa(port,
+vrr_supported)` (`Otg::set_dp_ignore_msa`): enable_stream_features reads
+DP_DOWNSPREAD_CTRL (0x107), sets or clears IGNORE_MSA_TIMING_PARAM (bit 7)
+and writes it back only if it changed (true when written). It requires SST
+video, or a scanout on it, on that path (`Busy`, `Invalid` for another
+path, `Unsupported` for MST); as in Linux the modeset ignores AUX failures.
+Training still writes 0x107 with the bit clear; sink configuration checks
+mask the stream-owned bit. The DCN401 stream encoder's MSA is unchanged.
+
+DML21 admission is unchanged and evaluated at the nominal timing. DCN4's
+mode-support and programming calculations do not read `drr_config`; only
+the PMO's UCLK p-state strategies (FAMS2/DRR) do, and this owner disables
+memory clock switching so those strategies are never searched. DRR only
+lengthens the vertical blank (`v_total_min` is at least the mode's total)
+at the same line time, so every per-line, prefetch, DET and watermark bound
+admitted at the nominal timing still holds, and the stutter budget (taken
+from the nominal blank) only gains idle time.
+
+`unsafe Otg::set_drr(pipe, Option<Drr>)` (ColdBoot `set_display_drr`) runs
+or stops DRR on a `ScanoutRunning` pipe (`Busy` otherwise), following
+dcn10_set_drr and optc401_set_drr's non-FAMS branch. Enabling writes
+V_TOTAL_MAX then V_TOTAL_MIN (minus one), OTG_V_TOTAL_CONTROL MIN_SEL and
+MAX_SEL with the TRIGA event in SET_V_TOTAL_MIN_MASK (FORCE_LOCK_ON_EVENT
+clear, MID fields untouched), then OTG_STATIC_SCREEN_CONTROL's TRIGA event
+over two frames. Totals below the mode's, inverted or above 32767 are
+`Invalid` before any write; unchanged totals write nothing. `Status::drr`
+(`DrrApplied`) records the totals and the static-screen control replaced.
+Disabling clears the selectors first, then restores V_TOTAL_MAX/MIN to
+V_TOTAL (fixed refresh exactly as `prepare` programs it; Linux writes zero,
+unused once the selectors are clear) and the replaced static-screen
+control. Fixed refresh is also restored before fetch stops (scanout stop
+and underflow recovery) and before the timing is disabled. A register
+failure leaves `Failed` with the record kept, so a later stop still
+restores. While DRR runs, `flip` writes OTG_TRIGA_MANUAL_TRIG after the
+address update's lock release (optc2_program_manual_trigger, as
+commit_planes_for_stream fires it) so the stretched blank ends at the flip;
+flip completion evidence is unchanged. Frame waits on a DRR pipe are bounded
+by three frames at `v_total_max` plus 5 ms. TRIGA_CNTL is left as reset, as
+Linux's DCN401 path does not program it.
+
+KMS (`amdgpu_navi48_kms::{apply_routed_vrr, publish_routed_vrr}`) attaches,
+as amdgpu_dm does, an immutable "vrr_capable" range 0..1 to every native
+connector (`NativeOutput::vrr_capable`, the published sink's capability)
+and a "VRR_ENABLED" range 0..1 to every CRTC (`Card::vrr_enabled`, the
+committed values, kept across republication). `apply_routed` attaches
+neither, so Navi22 and other cards are unchanged. GETPROPERTY reports both
+(vrr_capable RANGE|IMMUTABLE, VRR_ENABLED RANGE); GETCONNECTOR and
+OBJ_GETPROPERTIES list them with their values on objects that have them.
+VRR_ENABLED is set by DRM_MASTER through OBJ_SETPROPERTY on a CRTC (an
+atomic driver's legacy path; connector SETPROPERTY never reaches it) or an
+atomic commit (no ALLOW_MODESET needed; TEST_ONLY applies nothing). Values
+above 1 and CRTCs without the property are EINVAL, vrr_capable is
+immutable (EINVAL), unknown objects ENOENT. As in Linux, enabling VRR on a
+sink or mode that cannot vary is accepted and the display stays fixed.
+A committed value goes to `amdgpu_native_kms::request_vrr_enabled` after the
+card lock is released (Navi22 ignores it), then
+`amdgpu_navi48_platform::request_vrr_enabled`, which records it and, when
+the display owner is free, reprograms each live scanout's DRR at once
+(`Selection::drr()` while VRR_ENABLED and the CRTC is on, else fixed) with
+no modeset; the display monitor converges the same at the end of every
+pass, including after a relight.
+
+All of this is model-tested only (`drivers/gpu/freesync`, `dcn401-otg`,
+`dcn401-scanout`, `navi48-modeset`, `navi48-kms`, `drm_ioctl`); it has not
+been validated on hardware.
+
+### Navi 48 color management and HDR output
+
+CRTC color follows amdgpu_dm on DCN 4.0.1 with no plane color properties.
+`amdgpu_dcn_color` is the integer port of the Linux math: `Fixed31_32`
+(dc_fixpt, bit-exact), `DrmColorLut::from_bytes`, `is_lut_linear`
+(__is_lut_linear), `regamma_tf` (256 entries: __set_legacy_tf's sRGB-based
+mod_color_calculate_regamma_params with the user ramp; 4096 entries:
+__set_output_tf's linear-base mod_color_calculate_degamma_params with
+apply_lut_1d), `translate_curve_to_hw_format` /
+`regamma_pwl` (cm3_helper_translate_curve_to_hw_format for the 13-region
+SDR layout, then custom floats), `Pwl::registers()` (the
+cm_helper_program_gamcor_xfer_func words) and `ogam_lut_passes()`
+(mpc3_program_ogam_pwl), and for the CTM `ctm_from_bytes`, `ctm_matrix`
+(__drm_ctm_to_dc_matrix, sign-magnitude S31.32 to 3x4) and `gamut_remap`
+(mpc401_set_gamut_remap's S2.13/S3.12 choice and convert_float_matrix).
+`tests/dcn401_color/check.sh` builds Linux's color_gamma.c, fixpt31_32.c,
+custom_float.c, conversion.c and dcn30_cm_common.c on the host and checks
+every register word for 287 LUT and CTM vectors, which the
+`drivers/gpu/dcn-color` kernel tests replay. The PQ/HLG layouts, degamma
+curves and GAMCOR LUT are not ported because the CRTC properties never
+reach them on DCN 4.0.1.
+
+`ColorProgram { pre_degam_srgb, gamut: Option<GamutProgram>, ogam:
+Option<OgamProgram> }` is what a CRTC programs. `ColorProgram::from_crtc(ctm,
+gamma_lut)` maps blobs as amdgpu_dm_update_crtc_color_mgmt and
+amdgpu_dm_update_plane_color_mgmt do: a 256-entry GAMMA_LUT is legacy gamma
+(sRGB-based regamma, the plane input linearized by the PRE_DEGAM sRGB ROM,
+whatever its values); a 4096-entry one regammas unless it is linear, which
+like no LUT bypasses the OGAM; any CTM is a gamut remap. On each of a
+display's pipes (both ODM halves; with overlays, the gamut remap and regamma
+on each segment's top MPCC only and bypass below it, the input transfer
+function on every plane's DPP), in dcn401_program_pipe's order:
+dcn401_program_gamut_remap (MPCC_OGAM gamut remap in the set not current,
+then its mode and format; both MCM remaps bypassed), dcn32_set_input_transfer_func
+(dpp3_set_pre_degam sRGB or bypass, GAMCOR bypassed, CM on) and
+mpc3_set_output_gamma (memory forced on, the RAM bank not current, its
+START/SLOPE/END/REGION words, one or three LUT passes, then SELECT).
+`unsafe Otg::set_color(pipe, Option<Arc<ColorProgram>>)` (ColdBoot
+`set_display_color`) records a display's color; the scanout start programs
+it under the OTG master lock so it latches with the plane, and a
+`ScanoutRunning` pipe is reprogrammed at once under the same lock
+(`State::UpdatingStream`; cancellation or failure quarantines) and waits
+for the latch, as amdgpu_dm's non-modeset update does. `Status::colors`
+(`PipeColor`) records each pipe's selections; the DPP, MPC and scanout
+verifiers check against it and staging resets it to bypass.
+`tests/dcn401_color_regs.c` checks the offsets and fields against
+dcn_4_1_0.
+
+KMS (`amdgpu_navi48_kms::apply_routed_native`, `Card::crtc_color`) gives
+every Navi 48 CRTC amdgpu_dm's `drm_crtc_enable_color_mgmt(crtc, 0, true,
+4096)`: "CTM" and "GAMMA_LUT" blobs and the immutable "GAMMA_LUT_SIZE"
+(4096); DEGAMMA_LUT is not attached (amdgpu_dm_crtc_init omits it on
+DCN_VERSION_4_01). GETCRTC reports gamma_size 256. CTM blobs must be 72
+bytes, GAMMA_LUT blobs whole drm_color_lut entries numbering 4096 or 256
+(amdgpu_dm_verify_lut_sizes), unknown blobs and properties the CRTC lacks
+are EINVAL; atomic commits need no ALLOW_MODESET and TEST_ONLY applies
+nothing; OBJ_SETPROPERTY sets them too. DRM_IOCTL_MODE_SETGAMMA (master,
+not render) copies the ramps into the CRTC's gamma store and commits a
+256-entry GAMMA_LUT with the CTM reset (drm_crtc_legacy_gamma_set);
+GETGAMMA returns the store; a gamma_size other than 256 is EINVAL, an
+unknown CRTC ENOENT. Cards without color management keep SETGAMMA a no-op.
+GETPROPBLOB serves user blobs, and a blob a committed property names
+outlives DESTROYPROPBLOB until the property lets it go
+(`Card::collect_blobs`). A committed change goes to
+`amdgpu_native_kms::request_crtc_color` after the card lock is released;
+the platform builds the program and a stream updater task (and every
+display monitor pass) converges each display.
+
+Every board HDMI and DP connector carries "Colorspace" (Default, BT709_YCC,
+opRGB, BT2020_RGB, BT2020_YCC: drm_mode_create_{hdmi,dp}_colorspace_property
+for amdgpu_dm's supported set, the same list on both) and
+"HDR_OUTPUT_METADATA" (a 32-byte `struct hdr_output_metadata` blob;
+another size is EINVAL). `amdgpu_hdr` ports the rest: blob decoding,
+drm_hdmi_infoframe_set_hdr_metadata and hdmi_drm_infoframe_pack_only,
+amdgpu_dm_fill_hdr_info_packet (HDMI DRM InfoFrame 0x87, DP HDR SDP),
+drm_parse_hdr_metadata_block (`hdr_sink_metadata`, used as Linux does: an
+EOTF the sink does not list is only reported), amdgpu_dm_get_output_color_space
+(`output_color_space`), set_avi_info_frame's C/EC/Q
+(`avi_colorimetry`), enc401's MSA MISC0/MISC1 (`msa_misc`),
+use_vsc_sdp_for_colorimetry (DPCD 1.4 and 0x2210 bit 3, read with the
+extended receiver caps) and mod_build_vsc_infopacket (`vsc_sdp`), checked
+by `tests/dcn401_hdr/check.sh` against code cut from Linux (3323 vectors with the HPO MISC cases).
+MST end-device connectors carry both properties too (dm_dp_add_mst_connector
+attaches the root's Colorspace property; amdgpu_dm_connector_init_helper the
+HDR metadata property). A new Colorspace or entering/leaving HDR on a driven
+connector needs ALLOW_MODESET (EINVAL through the legacy setters), as
+amdgpu_dm_connector_atomic_check makes it a modeset; new metadata while
+HDR stays on does not. Every native transport signals both, so no lit
+stream refuses them.
+
+The selection carries `colorspace`, `hdr` and `vsc_colorimetry`;
+`Selection::color_space()` is the stream's dc color space and
+`BlankRequest::colorspace` takes it: the output CSC is find_color_matrix's
+row for it (RGB types bypass, the identity), the blank black follows
+color_space_to_black_color (BT.2020 limited RGB keeps full-range black, as
+Linux does), the HDMI AVI InfoFrame its C/EC/Q, DIO/HPO DP MSA MISC0 and
+DIO MISC1. DIO DP streams (SST and MST; enc401_stream_encoder_update_dp_info_packets
+serves both) on a VSC-capable sink send the VSC SDP in packets 0 and 1
+(GSP0) and, with HDR metadata, the HDR SDP in packet 3 (GSP3) before the
+unblank. 128b/132b streams (SST and MST) do as
+dcn31_hpo_dp_stream_enc_update_dp_info_packets does through the stream's VPG
+(`otg::UhbrSdp`, the Otg/ColdBoot UHBR start and MST prepare entries take
+it): the VSC SDP in packet 0, the HDR SDP in packet 3, each with an
+immediate update, then GSP0/GSP3 continuous transmission for the valid ones
+(GSP2/GSP5 off) and the SDP path on, all before the unblank; MSA MISC1 bit 6
+marks VSC colorimetry (`amdgpu_hdr::hpo_msa_misc`, the HPO encoder's own
+MISC0/MISC1, which start from zero). Ready and transport witnesses recheck
+the GSP enables. HDMI TMDS streams send the DRM InfoFrame in generic packet
+4 on line 2; FRL streams in the HPO FRL encoder's generic packet 4 on line
+2 (`FrlVideoRequest::hdr`, hpo_enc401_update_hdmi_info_packets). An MST
+stream's VSC support is the root link's DPCD (create_stream_for_sink reads
+stream->link). The packet bytes are the same on every transport (Linux
+builds them from the connector type only). `unsafe Otg::set_hdr(pipe,
+InfoPacket)` (ColdBoot `set_display_hdr`) rewrites a running stream's packet
+with an immediate update (amdgpu_dm's hdr_static_metadata stream update) on
+TMDS, FRL, DIO and HPO streams. The platform relights a display whose
+connector's Colorspace or HDR on/off changed and updates metadata live
+otherwise. `tests/dcn401_hdr/check.sh` also cuts the HPO MISC computation out
+of dcn31_hpo_dp_stream_encoder.c (3323 vectors in all) and
+`tests/dcn401_hdr/registers.c` checks the HPO GSP/VPG/MSA7 and FRL packet-4
+register contract against dcn_4_1_0. DP SST output depth follows amdgpu_dm:
+min(the EDID 1.4 color bit depth, 8 when undefined, `max_bpc` rounded to
+even), stepping down by two until a link carries the uncompressed stream
+(`modeset::dp_depths`, `dp_link_bpc`); training candidates and the UHBR
+audio budget use it. With the default `amdgpu.max_bpc` (8, a NARF ceiling
+over each connector's "max bpc") DP stays 8 bpc. Gaps: plane color
+pipelines and AMD private properties. Model-tested only (`dcn-color`,
+`hdr`, `dcn401-color`, `dcn401-scanout`, `dcn401-otg`, `dcn401-frl-link`,
+`dcn401-mpc`, `navi48-modeset`, `navi48-kms`, `drm_ioctl`); not validated
+on hardware.
+
+### Navi 48 connector max bpc
+
+Every Navi 48 KMS connector, board HDMI and DP and every MST end device,
+carries "max bpc": amdgpu_dm_connector_init_helper's (and
+dm_dp_add_mst_connector's) drm_connector_attach_max_bpc_property(connector,
+8, 16), a RANGE 8..16 property (`MAX_BPC_PROP_ID`, 0x80) whose value is the
+connector state's max_requested_bpc, 16 when the connector is created.
+`NativeOutput::max_bpc` holds it (None: no property; Navi 22's and the
+test cards' connectors keep their lists), `ConnectorProps::max_bpc`
+attaches it in `amdgpu_navi48_kms::apply_routed_native`, and a committed
+value survives republication. GETCONNECTOR and OBJ_GETPROPERTIES list it
+after "Broadcast RGB" and before "Colorspace"; GETPROPERTY reports the
+range. A value outside 8..16, or a connector without the property, is
+EINVAL (drm_property_change_valid_get). A changed value on a connector with
+a CRTC is a modeset of that CRTC (drm_atomic_helper_check_modeset sets
+connectors_changed when max_requested_bpc differs): an atomic commit needs
+ALLOW_MODESET (TEST_ONLY checks it too), while OBJ_SETPROPERTY and the
+legacy SETPROPERTY commit it as set_property_atomic does, whose commit
+allows modesets (drm_atomic_commit_init). After the card lock is released,
+`amdgpu_native_kms::request_connector_max_bpc(connector, bpc)` records it on
+the platform connector (`amdgpu_navi48_platform::request_connector_max_bpc`),
+which a lighting hands to the selection
+(`amdgpu_navi48_boot::set_requested_bpc(port, mst_slot, bpc)`, one entry per
+board port and MST slot, `requested_bpc` reads it) and records per CRTC;
+the display monitor relights a display whose connector's value changed
+since it lit.
+
+Selection caps each stream with `connector_max_bpc(port, mst_slot)`: the
+connector's max_requested_bpc within `amdgpu.max_bpc` (a NARF ceiling,
+default 8; Linux has no such parameter, and with `amdgpu.max_bpc=12` the
+property alone decides, the native encoders taking at most 12 bpc). It is
+the requested bpc of amdgpu_dm_create_validate_stream_for_sink's bpc mask
+and of convert_color_depth_from_display_info (rounded down to even): DP SST
+and HDMI (`select_all`, which applies each port's own value, offered and
+retrained modes), MST DSC (`MstDscContext::max_bpc`, now a per-end-device
+function) and uncompressed MST. On an MST link without DSC decoders each
+stream is `raw_mst_stream`: the deepest of its depths whose raw bandwidth
+dm_dp_mst_is_port_support_mode accepts (`dsc::raw_supported`: within the
+root link and the port's full PBN), with dm_encoder_helper_atomic_check's
+payload, drm_dp_calc_pbn_mode at `requested_depth_bpc` (display_info.bpc,
+8 when undefined, capped by max_requested_bpc and rounded down to even) and
+its slots, however far the stream stepped down; the VC rate and LPCM budget
+are the stream's own depth's (DC's get_pbn_from_timing).
+`MstStream::pbn_bpc` records the depth the PBN was sized for (the stream's
+own on a link the fairness search sized), which a running stream's offered
+modes are measured with. A stepped-down stream whose requested-depth PBN no
+longer fits its port is refused, as Linux's drm_dp_mst_atomic_check refuses
+it. `tests/dcn401_dsc/check.sh` replays 1500 such streams through
+amdgpu_dm's depth, PBN and slot code cut from Linux (mst_harness.c built
+with RAW_DEPTH, mst_raw_vectors.txt). Deviations: 6 bpc (an EDID 6-bpc sink
+gets 8 bpc, its PBN 8 bpc's), 14 and 16 bpc are never streamed (the PBN of
+a 14- or 16-bpc request is Linux's); offered modes of a dark connector
+follow a new value at the next lighting; the property is per connector but
+"Broadcast RGB" stays one setting for the card. Model-tested only
+(`drm_ioctl`, `navi48-kms`, `navi48-modeset`, `navi48-mst`); not validated
+on hardware.
+
+### Navi 48 plane scaling and overlay planes
+
+**SPL and DSCL.** `amdgpu_dcn401_spl::calculate(&Input) -> Scaler` is the
+integer port of DC's SPL (dc/sspl `spl_calculate_scaler_params`) with
+DCN401's configuration: SPL on, EASF preferred, iSHARP off, linear-light
+scaling for RGB (EASF with six taps while the ceiling ratio is at most 2,
+polyphase otherwise), `max_downscale_src_width` 7680 and the 12-pixel
+`MIN_VIEWPORT_SIZE`. It computes the recout, MPC size, ratios, inits, taps,
+luma/chroma viewports, polyphase filters and EASF coefficients in dc_fixpt
+arithmetic (`amdgpu_dcn_color::Fixed31_32`), with the filter tables
+generated from Linux (`amdgpu_dcn401_spl_filters`). `Scaler::unity` is the
+bypassed full-frame segment. `amdgpu_dcn401_dscl::program(&Scaler, alpha)`
+returns dpp401_dscl_set_scaler_manual_scale's register sequence (SCL mode,
+ratios/inits/taps, coefficient RAM loads with the SCL_COEF_RAM_SELECT swap,
+EASF, the line buffer of dscl401_spl_calc_lb_num_partitions /
+dpp401_dscl_find_lb_memory_config), and `viewport()` returns
+hubp401_set_viewport's words (chroma equal to luma for RGB).
+`tests/dcn401_spl/check.sh` builds Linux's SPL on the host and compares
+every register word of 248 vectors (`vectors.txt`: scaled, cropped,
+positioned, ODM-sliced, rotated 90/180/270, alpha) and 210 MPC slices
+(`mpc_vectors.txt`: two to four slices of scaled, windowed and rotated
+planes; harness.c with MPC set), which the
+`drivers/gpu/dcn401-spl` kernel tests replay.
+
+**Placed planes.** `otg::SurfaceRequest::plane: Option<PlaneLayout>`
+places a surface on its stream as amdgpu_dm_plane_fill_dc_scaling_info hands
+DC a plane: the source rectangle, the destination on the stream (the clip is
+the destination), the stream's size and 4:2:0 encoding, the rotation (0,
+90, 180 or 270, DC's ROTATION_ANGLE; a linear surface at 90/270 is
+`Unsupported`, as DML refuses a linear surface scanned vertically,
+`Rotation::orthogonal`), the blending (`Blend`: per-pixel alpha, premultiplied, global alpha) and
+`underlay`. `None` is the unscaled full-frame primary (each ODM segment
+`Scaler::unity`). Each segment's SPL input is its ODM slice
+(resource_get_odm_slice_src_rect) and must succeed
+(resource_build_scaling_params), and some pixel must land on the stream,
+else `Unsupported` or `Invalid` (`SurfaceRequest::check`). The HUBP takes
+SPL's viewport and ROTATION_ANGLE, the DPP the DSCL program (the iSHARP LUT
+ends at Linux's final value), the cursor is placed in recout space
+(dcn401_set_cursor_position), and MPCC_CONTROL the blend
+(dcn401_update_mpcc_sequence: per-pixel alpha, per-pixel combined with the
+plane alpha as global gain, or global alpha; premultiplied unless Coverage).
+`SurfaceRequest::dml_plane()` is the plane as DC hands DML21 one after SPL
+(whole-stream viewport, ratios and taps). A restage reuses the buffers of
+the same pipe, size and format whatever the placement.
+
+**Overlays.** A display stacks up to `otg::MAX_OVERLAYS` (3, DCN401's
+`max_slave_planes`) overlay planes on free pipes, one per ODM segment of
+their stream (or two for an MPC-combined overlay), staged on the overlay pipe through `prepare_surface`,
+`prepare_memory`, `prepare_dpp` and `prepare_mpc` under the selected
+display's stream (`Engine::stream_pipe`). A memory restage keeps the other
+planes' records when the VMID0 context is unchanged, and staging checks
+tolerate the display's own pending staged addresses (`staged_planes`).
+`unsafe Otg::prepare_requestor_planes(.., pipe, overlays)` (ColdBoot
+`prepare_display_requestor_planes`; overlays bottom first, underlays before
+the others) gives every plane's HUBP the default DET and the primary's VTG
+and records `RequestorApplied::overlays`; it refuses an overlay on the
+primary's pipes, an unstaged pipe, a pipe used twice, another display's pipe
+(`Siblings::pipes`, which counts overlay pipes and DETs) or an underlay above
+an overlay (`Invalid`), and a fourth overlay (`Unsupported`). Deadlines
+program each plane's HUBPs its plan's DLG/TTU (`dml::Plan::plane_dlg`,
+`Plan::plane`) after binding the plan to the plane list (`deadline::bound`:
+each surface's `dml_plane`, stream size, ODM and DET); `Otg::prepare_deadlines`
+also checks each overlay pipe's DPP-only clock against its plane's DPPCLK.
+`start_scanout` builds each ODM segment's MPCC tree as mpc1_insert_plane does
+for planes programmed from the top down (each new MPCC at the bottom over the
+background, TOP_LAYER_ONLY; the one above it switched to TOP_BOT_BLENDING;
+the top MPCC on the OPP's OUT_MUX; an underlay below the primary, which still
+feeds its own OPP), all under the one OTG lock with every HUBP unblanked, and
+waits for every plane's EARLIEST_INUSE. `ScanoutRunning::overlays`
+(`OverlayScanout`) records them. The CRTC's gamut remap and regamma go on
+each segment's top MPCC only (dcn401_program_gamut_remap and
+dcn401_set_output_transfer_func's `is_top_pipe`), the input transfer
+function on every DPP. `unsafe Otg::flip_planes(.., pipe, mask, ..)`
+(ColdBoot `flip_display_planes`) re-addresses any set of planes (bit 0 the
+primary, bit k the k-th overlay) under one lock so they latch at one VUPDATE;
+`prepare_plane_back_buffer` and `upload_plane_back_buffer` serve the
+overlays' back buffers. `stop_scanout` detaches the overlays first (top
+down), returning every MPCC to TOP_LAYER_ONLY. Live checks (`LivePipe`:
+address, cursor, the five tree selectors and the MPCC mode) cover every
+plane, also another display's live pipes. `retire_planes` ends overlay
+staging (records on pipes with neither timing nor blank of their own) and
+returns their pipes and DETs. The cursor shows on every plane's pipe it
+overlaps (see the cursor below).
+
+**Admission.** `dml::Mode::planes` lists the stream's planes (`dml::Plane`:
+surface, pitch, depth, SPL viewport, ratios and taps; an empty `planes[0]` is
+the full-frame primary of `pitch` and `bytes_per_pixel`, overlays follow
+from `planes[1]`, `Mode::plane_list`); `admit_all` takes at most
+`dml::MAX_PLANES` (4) planes and four pipes in all (`Pipes`). Per plane it
+follows dml2_core_dcn4_calcs.c: DPPCLK from the PSCL throughput
+(CalculateSinglePipeDPPCLKAndSCLThroughput), DPPREFCLK from the fastest
+plane and DISPCLK from the fastest stream, the scaler's DPPCycles, prefetch
+source lines from the vertical ratio and taps, the swath and ODM recout width
+at the horizontal ratio, active burst at the vertical ratio, line-buffer
+hiding with the extra taps and the several-surface share, deep-sleep DCFCLK
+per plane, and per-plane DLG/TTU (`Plan::planes`, `PlanePlan`: DPPCLK, DLG,
+TTU, DET, ODM blank end; line and request delivery above a vertical ratio of
+1 at the scaler's throughput). The plan's top-level DLG/TTU are the
+primary's. `tests/dcn401_dml21/plane_vectors.txt` (654 configurations:
+scaled primaries, one to three overlays, ODM 2:1 streams with overlays, two
+streams) is answered by Linux DML21 (`harness_planes.c`), checked by
+`check.sh` and replayed by `dcn401_dml_matches_linux_dml21_plane_vectors`. A
+`dml::Plane` also carries its `source` (`Source::Rgb`, `Yuv420_8`,
+`Yuv420_10`), `swizzle` (`dml::Swizzle`, DC_ADDR3 linear to 256KB_2D),
+`dcc`, `vertical_scan` and a 4:2:0 plane's `chroma` (`dml::Chroma`: half
+surface, pitch, SPL's chroma viewport, ratios and taps), as
+populate_dml21_surface_config_from_plane_state hands them DML
+(`SurfaceRequest::dml_plane`); admission then follows
+dml2_core_dcn4_calcs.c for both surfaces (block and macro-tile sizes, luma
+and chroma swaths and requests, the DET split and chroma base, two-surface
+prefetch, bursts, deep sleep, DPPCLK and delivery, unbounded requesting,
+DCC's mcache allocation and overhead; a linear vertical scan is refused, a
+plane needing an MPC split for its mcaches is `Unsupported`). `PlanePlan`
+adds `rq` (`dml::RqRegs`: luma and chroma `RqPlane`, expansion modes, the
+DET plane-1 base, unbounded requesting), `mcache` and the chroma DLG/TTU
+delivery fields, which `deadline_writes` programs (the *_C halves of the
+per-line delivery registers, SURF1_TTU0/1; for a tiled or 4:2:0 plane
+hubp401_program_requestor's HUBPRET_CONTROL plane-1 base,
+DCN_EXPANSION_MODE, DCHUBP_REQ_SIZE_CONFIG(_C) and the unbounded-request
+bit, which the static requestor check then leaves to it).
+`tests/dcn401_dml21/surface_vectors.txt` (628 configurations: every swizzle,
+DCC, NV12/P010, scaled, ODM, vertical scan incl. rotated overlays beside an
+unrotated primary, refusals) is answered by Linux
+(`harness_surfaces.c`) and replayed by
+`dcn401_dml_matches_linux_dml21_surface_vectors`. A 4:2:0 primary is never
+the packed full-frame plane (`modeset::plane_mode` gives DML its explicit
+plane).
+
+**Modeset and platform.** `modeset::PlaneSetup` (the primary's
+`PlaneGeometry`: source origin and size, CRTC rectangle, rotation, blending;
+`OverlayPlane`s bottom first with format and `underlay`) is set per pipe
+(`set_plane_setup`, `plane_setup`, `Selection::planes`). `selection_mode` and
+`with_planes` give DML every plane (`plane_requests`/`stream_planes` build the
+surface requests); `overlay_pipes` takes free pipes from the top after every
+display's and ODM pipe, refusing `Admission(Pipes)`; `prepare_pipes` returns
+each display's `DisplayPipes` and gives the overlay pipes their DPP-only
+clocks; `light` powers, stages (every plane's memory before any plane's DPP)
+and requests every plane. The platform records each CRTC's planes
+(`request_display_planes`), moves a running display to new planes or a new
+primary format without relighting it (see "Navi 48 seamless plane updates";
+only what needs a modeset relights, and a failed relight returns every
+display to the full-frame XRGB8888 primary), and admits a configuration with
+`display_admits_planes(display, connector, mode, fourcc, setup) ->
+Result<(), PlanesRefused>`: the display lit on the same connector and timing
+(`NotLit` otherwise), DML21 with every lit display's admitted planes
+(`Bandwidth`, `Plane`), a free pipe for each overlay beside the other
+displays' (`Pipes`) and staging's checks (`Plane`).
+`present_planes(display, primary, overlays, ticket)` queues a commit's
+`PlaneFrame`s (merged per plane in the mailbox); the presenter copies each
+plane's framebuffer source rectangle into its back buffer and flips every
+changed plane together.
+
+**KMS.** `drm_native_planes` gives the Navi 48 card amdgpu_dm's planes
+(amdgpu_dm_initialize_drm_device, amdgpu_dm_plane_init): each CRTC's primary
+(id 0x40 + n) and three overlays (0x44-0x46, possible_crtcs 0xff, the
+primaries' `PLANE_FORMATS`, as amdgpu_dm_plane_get_plane_formats gives
+DCN4's universal overlays), listed by GETPLANERESOURCES and GETPLANE (an
+overlay's CRTC and framebuffer as committed). Properties
+(`Card::native_planes`, `PlaneProps`): "pixel blend mode" (None,
+Pre-multiplied, Coverage; default Pre-multiplied) on every plane, "alpha"
+(0..0xffff) on the overlays, "zpos" (the primary's immutable at 3; an
+overlay's 0..254, default 3 + 1 + its DRM plane index after the four
+primaries, 8-10) and the "rotation" bitmask (rotate-0/90/180/270, exactly
+one); a value outside its property or a write to the immutable zpos is
+EINVAL. ATOMIC (TEST_ONLY included) and DRM_IOCTL_MODE_SETPLANE (master;
+drm_mode_setplane's atomic path: fb 0 disables, unknown plane, CRTC or
+framebuffer ENOENT, a source outside the framebuffer ENOSPC) run
+`drm_native_planes::check`: drm_atomic_plane_check's CRTC rules (a plane
+moved straight to another CRTC, a primary off its own CRTC) and formats;
+amdgpu_dm_plane_helper_check_state (the 24x12 viewport left on the CRTC,
+drm_atomic_helper_check_plane_state with DCN401's 16x upscale and 6:1
+downscale caps) and amdgpu_dm_plane_fill_dc_scaling_info (non-empty
+rectangles, 167..16000 per mille); an enabled CRTC needs its primary
+(dm_crtc_helper_atomic_check); rotation 90/270 swaps the source for the
+helper's scale limits and is refused on a linear framebuffer (RGB or
+NV12/P010: DML21's SourceFormatPixelAndScanSupport scans no linear surface
+vertically), while a GFX12-tiled one is placed with its rotation (HUBP
+ROTATION_ANGLE, SPL's orthogonal viewport, DML's vertical scan; never
+H_MIRROR_EN, as amdgpu_dm exposes no reflect-x/y); drm_atomic_normalize_zpos (zpos, then plane id)
+orders the stack, overlays below the primary being underlays; and the
+platform's admission. Every refusal is EINVAL (Linux's scale check returns
+-ERANGE, which FsError cannot express). A plane change needs no
+ALLOW_MODESET. A commit records the planes' state and requests each touched
+display's planes; the planes it updates present together (`present_planes`).
+PAGE_FLIP keeps a placed primary's placement (the new framebuffer must hold
+its source rectangle, ENOSPC otherwise), SETCRTC shows the framebuffer whole
+again (drm_atomic_helper_set_config) and RMFB disables the overlays scanning
+the removed framebuffer.
+
+**GFX12 modifiers.** `amdgpu_dm_modifiers` is amdgpu's GC 12 modifier
+layer. `PLANE_MODIFIERS` is amdgpu_dm_plane_get_plane_modifiers for a GC 12
+primary or overlay: amdgpu_dm_plane_add_gfx12_modifiers' twelve DCC entries
+(256K_2D, 64K_2D, 4K_2D, 256B_2D, each with max compressed block 256B, 128B,
+64B), the four swizzles without DCC, then LINEAR (17; INVALID ends Linux's
+list and is not one of them). `format_mod_supported` is
+amdgpu_dm_plane_format_mod_supported: LINEAR and INVALID always, a listed
+GFX12 modifier for every format (no GFX9-11 D-swizzle/DCC rules). On the
+native card (`Card::gfx12_modifiers`) every plane's `IN_FORMATS` and
+`IN_FORMATS_ASYNC` blob (`drm_native_planes::IN_FORMATS_PROP_ID` /
+`IN_FORMATS_ASYNC_PROP_ID`, blob ids `in_formats_blob_id` /
+`in_formats_async_blob_id`, GETPROPBLOB) is create_in_format_blob's
+version-1 `drm_format_modifier_blob`: the plane's 15 formats, then the 17
+modifiers each with the mask of the formats that take it (all of them); a
+card with native planes but no GFX12 modifiers lists LINEAR alone.
+`Tiling::from_modifier` is amdgpu_dm_plane_fill_gfx12_attrs_from_modifiers
+(swizzle and DCC max block of any GFX12 modifier). ADDFB2
+(`Card::addfb2_cmd`, the whole 104-byte `drm_mode_fb_cmd2`:
+`amdgpu_dm_modifiers::FbCmd`) on the native card runs
+drm_internal_framebuffer_create (flags, 16384x16384, a DRM format,
+framebuffer_check: handles, pitches, overflow, per-plane modifiers equal,
+unused planes zero), the BO lookup, then amdgpu_display_gem_fb_verify_and_init
+(`check_amdgpu_fb`: drm_any_plane_has_format with modifier[0], every plane
+in the same BO, without DRM_MODE_FB_MODIFIERS the BO's tiling flags through
+convert_tiling_flags_to_modifier_gfx12, amdgpu_display_verify_sizes: each
+plane's pitch whole swizzle blocks and at least its width, block-aligned
+offsets, whole block rows within the BO, LINEAR in 256-byte units); a
+refusal is EINVAL (FsError has no ERANGE). `Framebuffer` records
+`offsets`, `chroma_pitch` and `modifier`. `AMDGPU_GEM_METADATA` on one of
+the card's dumb BOs (`drm_ioctl_bridge::amdgpu_dumb_metadata`) sets/gets its
+tiling flags (`Card::set_bo_tiling`); CREATE_DUMB pads the pitch as
+amdgpu_mode_dumb_create does (amdgpu_gem_align_pitch). Other cards keep
+LINEAR-only ADDFB2. `tests/amd_modifiers/check.sh` extracts Linux's
+functions (amdgpu_dm_plane.c, amdgpu_display.c, drm_plane.c,
+drm_framebuffer.c, drm_fourcc.c), builds them with an RX 9070 XT stand-in
+and checks 2454 vectors (modifier/format lists, blobs, support, tiling
+flags, ADDFB2), replayed by `amd_modifiers_match_linux_vectors`.
+DCC capability is hubbub401_get_dcc_compression_cap as amdgpu_dm calls it
+(`dcc_capable`: every scanned format; GC 12.0.1 has no DCC width limit).
+
+**Tiled, DCC and 4:2:0 surfaces.** `otg::SurfaceRequest::surface`
+(`PlaneSurface`: `Tiling` and a `YuvColor`) and `SurfaceFormat::{Nv12,
+P010}` (DC's VIDEO_420_YCrCb / 10bpc_YCrCb, as amdgpu_dm maps them;
+`is_video`, `chroma_bytes_per_pixel`). `SurfaceRequest::bytes` lays each
+plane out as amdgpu_display_verify_plane sizes a framebuffer (pitch of whole
+swizzle blocks, whole block rows; a 4:2:0 chroma plane at half size behind
+the luma, block and page aligned). HUBP: DCSURF_SURFACE_CONTROL
+PRIMARY/SECONDARY_SURFACE_DCC_EN from the modifier (hubp401_dcc_control),
+SW_MODE the swizzle (hubp401_program_tiling), PITCH and PITCH_C
+(hubp401_program_size), the VIDEO_420 pixel format (64/66), SPL's chroma
+viewport, and the chroma address before the luma's
+(hubp401_program_surface_flip_and_addr), also on flips and at scanout start
+(`Engine::write_fetch_address`). DPP: CNVC_SURFACE_PIXEL_FORMAT 64/66 and,
+for 4:2:0, CM_POST_CSC set A with the color space's dpp_input_csc_matrix
+(dpp401_dpp_setup's INPUT_CSC_SELECT_ICSC, dpp3_program_post_csc,
+cm_helper_program_color_matrices' packing). SPL takes `spl::Video`
+(SPL_PIXEL_FORMAT_420BPP8/10): chroma ratios/viewports/inits/taps, the 420
+SCL modes, chroma coefficient loads, EASF's video rules, LB config 3; a 4:2:0
+plane always goes through `spl::calculate` (its chroma is upscaled even
+unscaled). `tests/dcn401_spl/check.sh` also checks 137 video vectors
+(`video_vectors.txt`, rotations 90/180/270 included); `tests/dcn401_yuv/check.sh` checks 120 vectors of
+fill_plane_color_attributes, dpp401_dpp_setup's format switch,
+hubp2_program_pixel_format and the post-CSC words extracted from Linux,
+replayed by `dcn401_dpp_input_conversion_matches_linux_vectors`.
+KMS: primaries and overlays carry "COLOR_ENCODING" (BT.601/709/2020,
+default BT.709) and "COLOR_RANGE" (limited/full, default limited) as
+drm_plane_create_color_properties makes them (they only affect YCbCr; a
+value outside the enum is EINVAL). `drm_native_planes::plane_surface`
+gives each plane's `PlaneGeometry::surface` (fill_plane_color_attributes'
+color space) and `fb_size`; a tiled or 4:2:0 plane is staged as its whole
+framebuffer with the source rectangle placed in it
+(`PlaneGeometry::whole_framebuffer`), so such a primary is always placed,
+and the presenter copies it whole, block row by block row
+(`copy_whole_plane`, `upload_display_plane_back_bytes`); a frame of another
+tiling than shown waits for the plane update its plane change requested.
+SETCRTC admits such a framebuffer as a placed primary
+(`drm_native_planes::setcrtc_planes`), PAGE_FLIP requests the display's
+planes so a tiling change is a plane update.
+
+Gaps: planes on an ODM stream
+must reach every segment; only linear, unrotated RGB planes without DCC
+are MPC-combined (any other plane one DPP cannot carry is refused); no
+RGBA8888 or 16-bit UNORM planes, no NV21 (not
+on DCN4's universal planes), no plane degamma/CTM, no MPC combine of a
+rotated plane (Linux splits one that a single DPP cannot carry); DCC data is CPU-copied into the
+owned surface (so written uncompressed) and the post CSC always loads set
+A; the cursor matrix of a YCbCr primary is not programmed; offered alternative modes are admitted without the
+display's overlays, and KMS admits planes only on the lit timing (a mode
+switch with overlays relights and falls back if they no longer fit).
+OBJ_SETPROPERTY on a plane of an atomic card is set_property_atomic: a
+blocking one-property commit without ALLOW_MODESET through the atomic
+decode/check/commit (`drm_ioctl_bridge::atomic_commit`, shared with
+DRM_IOCTL_MODE_ATOMIC); out-of-range, immutable or absent properties are
+EINVAL and an unknown plane ENOENT. Model-tested only
+(`dcn401-spl`, `dcn401-dml`, `dcn401-dpp`, `dcn401-mpc`, `dcn401-requestor`,
+`dcn401-deadline`, `dcn401-scanout`, `navi48-modeset`, `navi48-kms`, `drm`,
+`drm_ioctl`); not validated on hardware.
+
+### Navi 48 seamless shared-clock changes
+
+A configuration change that keeps running displays lit follows
+dc_commit_state_no_check's prepare/optimize ordering with dcn401's clock
+sequence (FAMS2/firmware-assisted P-state is out of scope: UCLK switching
+stays disabled).
+
+`ColdBoot::modeset_beside(fill, want, pipe_of)` lights new board sinks
+beside the running displays: DML admits every running display's mode with
+as many new ones as fit (`dml::admit_native`, pipe order), each running
+display keeping its pipes (`modeset::keeps_pipes`: the same mode, ODM
+segments and MPC slices; otherwise `None`, as for MST, no free slot or a
+running configuration that no longer fits, before any change). Then:
+prepare_bandwidth — `update_live_display_clocks(request, targets, false)`
+(the clock owner's `update_live` with every display's registers held, the
+running pipes' DPP DTOs raised where needed, every DCCG record and every
+display's timing records rebound, `Otg::rebind_clock`), and each running
+display moved to its new plan with raise-only watermarks
+(`update_live_display_plan(pipe, plan, true)`: `Otg::update_live_plan`
+writes optc1_program_global_sync, the VTG's VSTARTUP point, every HUBP's
+DLG/TTU and the DCHUBBUB watermarks (`WatermarkUpdate::Raise`) and arbiter
+under the OTG master lock, waits for the latch and rebinds every record of
+the timing, `Status::rebind_timing`); the new displays' pipe clocks beside
+the running ones (`prepare_display_pipe_clocks_beside`) and their usual
+lighting; optimize_bandwidth — each running display's exact watermarks,
+then `update_live_display_clocks(request, all targets, true)` lowering what
+the configuration no longer needs. `replan_displays()` does the same for the
+displays left after one leaves. The platform monitor lights a new sink
+beside the running displays when nothing they asked for changed
+(`MonitorStep::LitBeside`) and replans after a display left
+(`MonitorStep::Replanned`), relighting everything only when refused.
+
+Gaps: MST configurations, mode or color changes of a running display and
+FRL retraining still relight (plane changes no longer do: see below); a
+running display whose new plan needs other pipes refuses the seamless
+change; scanning for the new sinks reads every port (AUX/DDC) while the
+others run. Model-tested only (`dcn401-clk`, `dcn401-dccg`,
+`dcn401-scanout`, `navi48-modeset`); not validated on hardware.
+
+### Navi 48 seamless plane updates
+
+A plane change (placement, scaling, blending, rotation, format, tiling,
+surface, an overlay added or removed, the primary's format) is no modeset
+in amdgpu_dm (amdgpu_dm_commit_planes through dc_update_planes_and_stream),
+and none here: the display keeps scanning out, its OTG, OPP, DSC and link
+untouched.
+
+**Classification.** `otg::plane_update_type(old, new) -> UpdateType`
+(`Fast`, `Med`, `Full`) is det_surface_update for a plane DC keeps:
+get_plane_info_update_type (color space, per-pixel or global alpha and the
+pitch medium; rotation, DC format (X/A twins are one), bytes per pixel,
+tiling and DCC full) and get_scaling_info_update_type (a source or
+destination of another size full, one moved medium).
+`planes_update_type(old, new, reset)` is check_update_surfaces_for_stream
+over the stream's planes: a plane count change (full_update_required_weak)
+or a plane amdgpu_dm recreates (`reset`, should_reset_plane on a zpos
+change: an overlay both setups show moved across the primary or past
+another) is full. An update that takes or frees pipes is full.
+
+**Engine.** `unsafe Otg::update_live_planes(pool, clocks, dccg, gmc, pipe,
+&LivePlanes { primary, overlays, reset }, plan, crystal_khz) ->
+PlanesUpdated` (ColdBoot `update_live_display_planes`) moves display
+`pipe`'s live scanout to the surface requests (the primary on its own pipe
+and ODM pipes, MPC slices free to change; overlays bottom first on pipes of
+their own) under `plan`, its stream's own timing admitted with them, in
+commit_planes_for_stream's order:
+- Checks, before any write: the display scans out, every request stages
+  (SPL), sits on the stream split like it and on pipes no other plane or
+  display holds, underlays below the others, its rows fit the default DET,
+  the plan binds the new planes and the current owners
+  (`deadline::bound`), the live scanout is still the one its records name
+  (`scanout_bound_with`, raise-tolerant watermarks), no flip is pending,
+  and every pipe a new plane takes is free (its OTG idle and unlocked, its
+  MPCC in no tree and idle, and powered, its HUBP blank, drained and gated,
+  its DPP stopped). Every further pipe's DPP-only clock must cover its
+  plane's DPPCLK. A plane of the same allocation on the same pipes keeps
+  its surface (and content); any other takes a fresh, cleared one
+  (unpublished until the hardware hears of it).
+- Before the lock (dcn20_enable_plane): each new pipe powered up if gated
+  (dcn32_hubp_pg_control), its fetch clock, the VMID0 aperture, the
+  requestor on the stream's VTG and the DPP clock; its default DET from the
+  compressed buffer (shrunk first).
+- Under dcn401_interdependent_update_lock (the OTG master lock): the global
+  sync if the plan's differs; plane_atomic_disconnect of every freed pipe
+  (mpc1_remove_mpcc) with its cursor off; each changed or new plane's DPP
+  (dpp401_dpp_setup and the DSCL with the coefficient RAM swap,
+  `program_dpp_live`); on a full update every segment's MPCC tree from its
+  top pipe down as dcn20_update_mpcc does (each MPCC removed, inserted at
+  the bottom with mpc1_insert_plane, then its blending), on a medium one
+  only the changed planes' blending (update_blending); each changed or new
+  plane's HUBP surface, viewport and address; every plane's DLG/TTU with
+  raise-only watermarks; the CRTC color on the new top MPCCs
+  (program_color); the cursor on every pipe it now overlaps; the new pipes
+  unblanked.
+- Unlocked (dcn401_post_unlock_program_front_end): every plane's HUBP
+  reports its surface in use, the OTG's double-buffered state latched, the
+  new MPCCs connected and the freed ones idle; then dcn20_disable_plane on
+  each freed pipe (no outstanding request, blank, fetch and DPP clocks off;
+  its DET stays allocated until a configuration repartitions). The records
+  then name the new planes (surfaces, apertures, DPP/MPC, requestor,
+  deadlines, scanout, cursor, the timing's sync) and pass the scanout's
+  re-binding checks; the surfaces the update superseded (with their back
+  buffers; the primary's cursor image moves with its slot) are released once
+  nothing fetches them, after an HDP flush.
+
+Refusals leave the scanout as it ran; later failure or cancellation
+(`State::UpdatingPlanes`) quarantines the display, retaining every surface.
+`PlanesUpdated` reports the update type, the pipes enabled, disabled and
+kept, the scanout (its plan the deadlines') and the bytes released (boxed).
+`ColdBoot::prepare_display_plane_clock_live(request)` programs a new
+pipe's DPP-only clock while every display (the selected one's too) runs.
+
+**Configuration.** `unsafe ColdBoot::update_display_planes(display,
+format, setup, reset) -> Option<PlanesChange>` (`PlanesChange { pipe,
+displays, updated }`) admits every running display again with the
+display's new planes (`dml::admit_native`), places them
+(`modeset::planes::live_plane_pipes`: the primary keeps its pipe and ODM
+pipes and the MPC slices the plan keeps; an overlay DC keeps, the same DRM
+plane by `OverlayPlane::plane`, keeps its pipes wherever it moves in the
+stack; a new plane takes free pipes from the top, a freed pipe included),
+then: prepare_bandwidth (`update_live_display_clocks` raising the shared
+clocks and the DTOs of the pipes that keep fetching, the new pipes'
+DPP-only clocks, every other display whose plan moved through
+`update_live_display_plan(raise)`), the plane update, optimize_bandwidth
+(every display's exact watermarks, the clocks lowered). `None`, before any
+change but the clock raise, when it needs a modeset or is refused: an MST
+configuration, a teardown in flight, DML refusing the configuration, another
+ODM split for the display, another display's pipes or split changing, a
+request that does not stage, or the engine's refusal.
+
+**Platform and KMS.** `request_display_planes` and `request_display_format`
+wake the display monitor (it sleeps in 16 ms steps), which applies a plane
+or format change of a display that otherwise runs on through
+`update_display_planes` (`MonitorStep::PlanesUpdated`, not logged),
+withdrawing the console from the display's primary across it, then
+publishes the display's new planes to its presenter (back buffers for new
+overlay pipes, the planes and format shown, the CRTC's admission); it
+relights only when that returns `None` or a modeset is due anyway. A frame
+of a commit whose planes are not shown yet waits in the mailbox for the
+update (at most 2 s, then presents on what is shown), so a commit's new
+planes and framebuffers show from the same update. `drm_native_planes`
+records each overlay's DRM plane id in `OverlayPlane::plane`.
+
+Gaps: the commit's new framebuffer contents reach a plane's surface by the
+presenter's copy after the update latched (a new or reallocated surface
+shows cleared for that frame or two), not at the update's own VUPDATE; a
+change of the stream's ODM split (or another display's pipes) still
+relights; MST displays relight; DET of freed pipes is not returned to the
+compressed buffer until a relight repartitions; no DCC/compbuf or MALL/SubVP
+reprogramming beyond the default DET; the cursor matrix of a YCbCr plane is
+not programmed (its cursor colors pass unconverted). DRM cursor planes are
+described in "Navi 48 DRM cursor planes".
+Model-tested only (`dcn401-plane-update`, `dcn401-cursor`,
+`dcn401-scanout`, `navi48-modeset`, `navi48-kms`); not validated on
+hardware.
+
+### Navi 48 DRM cursor planes
+
+The native card gives every CRTC amdgpu_dm's DRM_PLANE_TYPE_CURSOR plane
+(amdgpu_dm_crtc_init, amdgpu_dm_plane_init with no plane caps):
+`drm_native_planes::planes_for` appends one per CRTC after the primaries and
+overlays (`CURSOR_PLANE_ID_BASE` 0x47 + CRTC index, `NativePlane::cursor_of`
+naming its CRTC; `NativePlane::is_overlay`/`is_cursor`; `cursor_ids`,
+`cursor_of`). GETPLANERESOURCES lists them last; GETPLANE reports
+possible_crtcs of its own CRTC only (drm_crtc_init_with_planes) and
+`CURSOR_FORMATS` (ARGB8888); OBJ_GETPROPERTIES reports type Cursor (2), the
+core plane properties, its own "pixel blend mode" (`CURSOR_BLEND_PROP_ID`,
+Pre-multiplied only: DC blends the cursor pre-multiplied) and immutable
+"zpos" 255 (`CURSOR_ZPOS_PROP_ID`), then IN_FORMATS and IN_FORMATS_ASYNC:
+ARGB8888 under DRM_FORMAT_MOD_LINEAR alone
+(amdgpu_dm_plane_get_plane_modifiers for a cursor). It has no rotation,
+alpha, color or HOTSPOT_X/Y properties (amdgpu is not
+DRIVER_CURSOR_HOTSPOT), and DRM_CAP_CURSOR_WIDTH/HEIGHT stay 64.
+
+Checks (`drm_native_planes::check`, so ATOMIC with TEST_ONLY, plane
+OBJ_SETPROPERTY, SETPLANE and the legacy ioctls alike), each EINVAL:
+drm_atomic_plane_check's possible_crtcs and format/modifier (ARGB8888,
+LINEAR); for an enabled cursor `check_cursor(CursorFb, src, crtc)`:
+amdgpu_dm_check_native_cursor_state with dm_check_cursor_fb (SRC_X/Y 0, the
+whole framebuffer as source, at most dc caps' max_cursor_size 64 square, a
+pitch of exactly the width in 64, 128 or 256 pixels, linear) and
+amdgpu_dm_atomic_check's DCN 4.x refusal of a scaled cursor (CRTC_W/H equal
+to the source); a SRC_* fraction on an enabled cursor is refused at decode
+(Linux compares the 16.16 values). The cursor's CRTC gets
+dm_crtc_helper_atomic_check (an enabled CRTC needs its primary), but DC gets
+no plane: amdgpu_dm_crtc_get_cursor_mode is always native on DCN 4.0.1, so
+a cursor commit is a FAST update and relights nothing. Negative CRTC_X/Y are
+taken; the hardware moves them into the hotspot
+(amdgpu_dm_plane_get_cursor_position). `tests/dcn401_cursor_plane/check.sh`
+builds dm_check_cursor_fb, amdgpu_dm_check_native_cursor_state and the DCN4
+scaling rule from the Linux tree and answers 2340 vectors (sizes, pitches,
+modifiers and GFX12 tiling flags, cropping, fractions, scaling), replayed by
+`drm_native_planes_check_cursor_matches_linux`.
+
+Commit: `drm_native_planes::cursor_changes(card, state)` (before the commit)
+gives handle_cursor_update's input per cursor plane (the CRTC, the
+framebuffer or off, CRTC_X/Y, a legacy-wrapped framebuffer it lets go of);
+the bridge reads the framebuffer's rows out of its dumb BO
+(`drm_native_planes::cursor_image`) and sends
+`amdgpu_native_kms::request_display_cursor(display, image, position)` after
+the card lock drops. Cursor planes never present frames, set the display's
+format or reserve hardware flip tickets; a cursor-only commit's event is
+software-paced. `platform::request_display_cursor` records the plane per
+display (`CursorImage`, premultiplied ARGB8888) and a task converges the
+pipe's hardware cursor under OWNER (`drm_cursor_step`: an image the pipe does
+not hold is uploaded with `set_display_cursor`, the one it holds is moved,
+an off plane hides it with an off-screen move); every monitor pass converges
+again, so a relit display gets its cursor back (amdgpu_dm commits cursors
+after the planes). While DRM drives a display's cursor the console's cursor
+hook leaves it alone; the last DRM file closing (`restore_displays`) turns
+DRM's cursors off and the console uploads its pointer again. RMFB of a
+cursor's framebuffer turns the cursor off.
+
+Legacy CURSOR/CURSOR2 on a card with native planes are
+drm_mode_cursor_common and drm_mode_cursor_universal: DRM_MASTER (EACCES),
+flags none or unknown EINVAL, an unknown CRTC ENOENT; DRM_MODE_CURSOR_BO
+wraps the BO in an internal framebuffer (drm_internal_framebuffer_create:
+ARGB8888, pitch width * 4, ENOENT for an unknown handle, amdgpu's
+framebuffer checks) or, with handle 0, turns the cursor off; without BO the
+plane keeps its framebuffer; without DRM_MODE_CURSOR_MOVE the position is the
+CRTC's last legacy one (`NativePlane::legacy_position`, updated only by a
+successful MOVE). The update then runs the cursor plane's checks and commit
+(`__setplane_atomic`); a refused update drops the wrapped framebuffer, and
+the plane's previous wrapped framebuffer (`NativePlane::internal_fb`) goes
+when it takes another. CURSOR2's hotspot is dropped, as Linux does for a
+driver without DRIVER_CURSOR_HOTSPOT. SETPLANE of a cursor plane takes the
+same path. Cards without native planes keep the fb pointer path.
+
+Gaps and deviations from Linux: the hardware cursor scans a copy of the
+framebuffer taken at the commit (Linux scans the pinned BO), so drawing into
+a shown cursor BO without a new commit is not seen; a framebuffer without a
+dumb BO turns the cursor off; a wrapped framebuffer is listed by
+GETRESOURCES and removable by id like a client's (Linux keeps it off the
+file's list); OBJ_GETPROPERTIES lists IN_FORMATS after the blend mode and
+zpos, as on the other native planes (Linux attaches it first); cursor
+updates are not tear-free (one cursor buffer per pipe). Model-tested only
+(`drivers/gpu/drm`, `drivers/gpu/drm_ioctl`, `navi48-kms`); not validated on
+hardware.
 
 ### Discrete RDNA2 PSP secure-OS bootstrap
 
@@ -5155,6 +6355,34 @@ paths; only the tables differ.
   the buffer's unsignalled KERNEL fences to its space
   (`VmState::depend_on`), and `AMDGPU_CS` waits for the space's
   `VmState::kernel_fences()` before queueing.
+  On Navi48 the heap's `VramTransfer` (`amdgpu_navi48_platform` transfer
+  mover) migrates these buffers: SDMA0 `COPY_LINEAR` kernel jobs move each
+  chunk through a private 1 MiB CPU-mapped window of the driver's pool,
+  queued in the same FIFO as clears so no copy overtakes an earlier clear.
+  A copy travels alone in its job; an upload stages its chunk under the
+  platform owner just before queueing, followed by an HDP flush, so a
+  copy requeued by an SDMA0 reset re-stages. Each chunk's fence is added
+  to the buffer's KERNEL reservation and retains its source/destination
+  until it leaves the ring; a refused, timed-out (5 s) or post-reset chunk
+  fails the move without releasing either placement.
+- Foreign PRIME import on an amdgpu card (`amdgpu_gem_prime_import` with
+  `dma_buf_dynamic_attach`): another card's GTT amdgpu buffer or any card's
+  KMS dumb buffer becomes a GTT-only buffer over the exporter's RAM pages
+  (`GemState::import_foreign`), holding the exporter's placement or dumb
+  lease and sharing its reservation for implicit sync; it never moves.
+  Another card's VRAM (PCIe peer-to-peer) and other exporters are EINVAL.
+  A buffer of the same card stays the same object.
+- `GEM_USERPTR` (`amdgpu_gem_userptr_ioctl`): page-aligned non-empty
+  ranges and known flags (else EINVAL); a writable range needs REGISTER
+  (EACCES); ANONONLY refuses file-backed, shared and SysV ranges (EPERM).
+  Every page is faulted in with a guarded user read, COW-resolved when
+  writable (`AddressSpace::user_page_writable_or_resolve`) and pinned
+  (`pin_user_page`) at creation, VALIDATE or not. The buffer is GTT-only,
+  its entries follow each pin, READONLY maps without WRITEABLE (internal
+  `BO_GPU_READONLY`, masked from GEM_OP), and GEM_MMAP, PRIME export and
+  placement moves refuse it, as Linux does. LINUX-GAP: no MMU interval
+  notifier, so the pins are a snapshot: later CPU remaps, fork-COW splits or
+  munmap leave the GPU on the pinned frames (never freed memory).
 - PRT (`GEM_VA` with `AMDGPU_VM_PAGE_PRT`): MAP/REPLACE record a range
   with no buffer (the handle is not looked up, as amdgpu_gem_va_ioctl maps
   it through `prt_va`) whose entries carry PRT without VALID; REPLACE with
@@ -5340,11 +6568,119 @@ so a clear's fence never reads complete off the test's fence. Innocent
 client jobs use the same logical-ticket replay as GC12. VRAM clear fences
 follow SDMA0's hardware fence only, never a timeout's verdict.
 
-`unsafe amdgpu_navi48_platform::recover().await` is explicit whole-device
-recovery after ring recovery fails. Its caller must stop every CPU VRAM/GOP
-and mmap accessor and exclude external PCI/firmware owners; the watchdog
-cannot establish these exclusions and does not automatically invoke it.
-Preflight refuses boots that needed GDDR6 training replay. The platform
+`unsafe amdgpu_navi48_platform::recover().await` is whole-device recovery
+after ring recovery fails. Its caller must stop every kernel CPU VRAM/GOP
+writer and exclude external PCI/firmware owners. As for RX 6000 (Linux
+`amdgpu.gpu_recovery` on a dGPU), `unsafe set_automatic_recovery(bool)`
+(enabled by the fb boot handoff unless `amdgpu.gpu_recovery=0`) lets the
+watchdog start it after a failed ring reset or a terminal fault (RAS fatal error,
+lost interrupts, refused coordinated recovery) or after the display monitor
+stops with a quarantined display owner, once per submitter
+generation and at most `MAX_AUTOMATIC_RECOVERIES` (3) times per boot, since
+each recovery quarantines the old owners' VRAM. `set_recovery_console_hook`
+pauses kernel boot-framebuffer writers for the reset; a lost device leaves
+them paused. User CPU mappings of VRAM are not revoked, as in Linux.
+
+System suspend (S3) uses the async system-PM phase
+(`unsafe register_system_pm()`, installed by the fb boot handoff).
+`prepare_suspend` follows amdgpu_pmops_suspend for a dGPU: it unregisters
+the client VRAM heap and evicts every client VRAM buffer to system memory
+(`amdgpu_gem::evict_all`, as ttm_resource_manager_evict_all, widening each
+buffer's allowed domains with GTT for the move and waiting for its jobs),
+pauses kernel boot-framebuffer writers, then quiesces exactly as recovery
+does and saves PCI state with bus mastering cleared
+(`Reset::save_for_resume`). A refused eviction or preflight leaves the
+device running; a failed PCI save recovers immediately with mode1.
+`resume_from_suspend` (amdgpu_pmops_resume) restores PCI state before any
+MMIO, waits for the bootloader, posts the cold card with ATOM ASIC_Init as
+amdgpu_device_need_post decides (`Mode::Resume`, `Method::PowerCycle`;
+mode1 + post when SOS survived), replays GDDR6 training and brings up a
+fresh owner as recovery does, then restores the widened domains; buffers
+stay in system memory until validation promotes them. The interrupt-gated
+device-PM handler accepts Navi48 only while the async prepare holds it
+(`system_suspended()`). Hardware unvalidated.
+S3 (and runtime) resume start from a clean quiesce (`Mode::Resume`), so
+`restart` drops that owner instead of quarantining it and returns the VRAM
+it published to the driver pool (`amdgpu_vram::Pool::reclaim_retired`:
+a dropped published reservation is retired, still excluded, until a
+resume post proves no hardware can reach it). Recovery (`Mode::Recovery`)
+keeps quarantining. The S3 prepare holds a runtime-PM reference and
+resumes a runtime-suspended card first (device_prepare/device_complete).
+
+Runtime PM (`amdgpu_navi48_runtime_pm`, on `narf_power::runtime_pm` and
+its PCI layer) follows amdgpu_drv.c:
+
+```rust
+pub enum Mode { None, Px, Boco, Baco, Bamaco }            // AMDGPU_RUNPM_*
+pub struct Platform { pub external: bool, pub px: bool, pub boco: bool, pub passthrough: bool }
+pub fn detect_mode(runpm: i32, support: u8, platform: Platform) -> Mode;
+pub fn describe(runpm: i32, support: u8, mode: Mode, platform: Platform) -> &'static str;
+pub fn parse_runpm(value: Option<&str>) -> i32;           // amdgpu.runpm, default -1
+pub fn check_display(runpm: i32, lit: u8, connected: bool) -> Result<(), RpmError>;
+pub fn baco_path(mode: Mode, audio_present: bool, audio_bound: bool) -> platform::Baco;
+pub enum Audio { Absent, Unbound, Bound { d3: bool } }
+pub unsafe async fn register(runpm: i32, console_on_gpu: bool) -> Option<Mode>;
+pub async fn ioctl_enter(card: u32) -> Result<Option<RpmActiveRef>, FsError>;
+pub fn on_open(card: u32);
+pub fn displays_changed(lit: u8, connected: bool) -> DisplayDelta;
+pub fn apply_display_refs(delta: DisplayDelta);
+pub async fn system_prepare(); pub fn system_complete();
+pub async fn access() -> Result<Option<RpmActiveRef>, boot::Error>;
+pub fn device() -> Option<Arc<RuntimePmDevice>>; pub fn mode() -> Option<Mode>;
+
+// amdgpu_navi48_platform
+pub struct Baco { pub bamaco: bool, pub armd3: bool }
+pub unsafe async fn runtime_suspend(baco: Baco) -> Result<(), boot::Error>;
+pub unsafe async fn runtime_resume() -> Result<boot::Report, boot::Error>;
+pub async fn bamaco_support() -> u8;
+// amdgpu_smu_navi48::Smu
+pub fn bamaco_support(&self) -> u8;                        // BACO_SUPPORT | MACO_SUPPORT
+pub unsafe async fn baco_enter(&mut self, bamaco: bool, armd3: bool) -> Result<(), Error>;
+pub unsafe async fn baco_exit(&mut self, armd3: bool) -> Result<bool, Error>;
+// amdgpu_reset_navi22::Reset
+pub unsafe fn clear_post_scratch(&mut self) -> Result<(), Error>;
+```
+
+`register` (fb boot handoff, after `register_system_pm`) runs
+`amdgpu_device_detect_runtime_pm_mode` with `amdgpu.runpm` (-1/-2 auto,
+0 off, 1 BACO, 2 BAMACO) and `amdgpu_device_supports_baco`
+(smu_v14_0_get_bamaco_support: board platform_caps BACO/MACO, and PMFW's
+BACO feature, now allowed at boot). NARF evaluates no AML, so neither PX
+(ATPX) nor BOCO (`_PR3`) is available and auto selects BAMACO on a board
+with MACO circuitry, else BACO. The PCI function is registered as probe
+leaves it, with a 5000 ms autosuspend, `allow` and `put_autosuspend`.
+References: every DRM ioctl on the card and render node
+(amdgpu_drm_ioctl), an open queues a resume (devfs lookup is synchronous),
+each lit CRTC (amdgpu_dm's commit tail, from `publish_outputs`), hwmon
+power-cap and performance-level writes (amdgpu_pm_get_access), the S3
+transition, and permanently a kernel console that draws into this GPU's
+VRAM (boot framebuffer on the card or `amdgpu.native_display`) — the lit
+fbcon display that keeps Linux's dGPU awake. The idle/suspend check refuses
+while a CRTC is lit and, unless `runpm=-2`, while a sink is connected
+(published by the display monitor, else scanned at suspend). Suspend
+drains the rings (bounded at 10 s, else `Busy`), evicts client VRAM and
+quiesces as S3 without pausing the console, saves PCI state, then
+smu_v14_0_2_baco_enter: with the audio function enabled or absent
+(smu_cmn_is_audio_func_enabled: a bound driver) ArmD3(BAMACO when the
+board has MACO, else BACO) and PMFW powers down when the PCI layer writes
+D3hot; otherwise EnterBaco(BACO_SEQ_BAMACO or BACO) and 10 ms. A bound
+audio function that is not in D3 refuses (`Busy`): PMFW would keep the card
+up and NARF cannot resume a card whose SOS survived without a reset. A
+refused BACO entry restarts the card through the resume post and is a
+sticky runtime-PM error. Resume (after the PCI layer's D0 and header
+restore): ExitBaco plus BIOS_SCRATCH_6/7 = 0, or 10 ms and ArmD3(ULPS),
+then the S3 restart: PCI restore, post as need_post decides, GDDR6
+training replay and a fresh owner that skips the SMC load while PMFW stayed
+resident (psp_load_smu_fw's in_runpm skip; a mode1 resume reloads it). VRAM
+contents follow Linux: client buffers were evicted to system memory and
+kernel owners are rebuilt. A failed resume loses the device; later ioctls
+fail. Hardware unvalidated.
+A finished GDDR6 trainer (`Ready`, `ResidentSos` or `Disabled`) moves to
+the new owner, which replays it before SOS with `Trainer::resume`
+(psp_v14_0_memory_training(PSP_MEM_TRAIN_RESUME): restore the cache to C2P
+and short-train, escalating to P2C save and long training as Linux does;
+NARF refuses to short-train from an unsigned cache). Preflight refuses a
+trainer that failed or never finished. The platform
 withdraws CS, client VRAM allocation, scanout and timestamps, drains CPU views,
 stops the old IH service, and advances the lock-protected fence-reader
 generation. Old fence readers and clear workers cannot access the new owner.
@@ -5640,8 +6976,45 @@ any client ledger reopens. A live unretired JPEG owner makes a four-owner
 recovery receipt incomplete, requiring whole-device recovery instead.
 
 `amdgpu.jpeg_proof` proves JRBC/IB/interrupt/retirement transport without a
-picture. It advertises no JPEG client ring or codec capability. Native client
-submission and physical acceptance remain required for complete JPEG bring-up.
+picture. It advertises no JPEG client ring or codec capability by itself.
+
+`amdgpu.navi48_media` also runs that JPEG cycle (plus a requested picture
+proof) and keeps the drained ring registered and powered for clients:
+`unsafe Jpeg::open_clients()` moves `Verified`/`DecodeVerified` to `Clients`
+and publishes a separate kernel arena of `SLOTS` (4) x `SLOT_BYTES` (64 KiB)
+IB-copy slots. As Linux's parse_cs path (`amdgpu_cs_patch_ibs`,
+`amdgpu_jpeg_dec_parse_cs`), each client IB is read through the client's
+mapping, checked by `validate_ib` and copied by `unsafe Jpeg::stage(slot,
+copies)` to 256-byte-aligned VMID0 addresses inside one slot. `validate_ib`
+is stricter than Linux: TYPE0/TYPE3 writes to GPCOM (0x404d-0x404f), the
+JRBC ring/IB controls (0x4080-0x408d, 0x4094), the LMI JRBC/decoder VMID and
+fence-address block (0x40a0-0x40af) and the IB BAR/size (0x40b6-0x40bf) are
+refused, because a VMID0 copy could otherwise escape the client's address
+space; Mesa's JPEG paths use none of them. `unsafe Jpeg::submit(job)` accepts
+only staged slot addresses and emits jpeg_v4_0_3's frame in
+`amdgpu_ib_schedule` order: MMHUB4.1 flush on invalidation engine 1 (Linux's
+ring-order allocation after VCN0's engine 0) with semaphore and PTB wait,
+IH_VMID_0_LUT_MM, insert_start, HDP flush, each IB at JRBC VMID0 with
+decoder VMID `v | v << 4 | v << 8`, GPCOM fence/trap, insert_end. Register
+packets use NORMALIZE_JPEG_REG_OFFSET (no RRMT). The 1024-dword ring wraps by
+its buffer mask with one-gap full detection; `Busy` changes no sequence or
+pointer. Client sequences wrap through zero. `Jpeg::fence_reader()` exists
+only in `Clients` and checks live authority/device status/HDP visibility.
+
+`unsafe Jpeg::reset_stop().await` retires a possibly hung ring
+(jpeg_v5_0_0_stop): JMI soft reset, fresh clean-DMA bits, ring hold, doorbell
+and power gating; only success marks every arena stopped. The platform
+publishes logical ring 4 as `AMDGPU_HW_IP_VCN_JPEG` instance 0/ring 0 on the
+shared MMHUB VMID manager; user fences are refused; up to eight IBs fit one
+256-dword frame. A slot records its job's ticket and is reused only after that
+ticket completes; replay after a reset reuses the retained copy. A JPEG
+timeout resets JPEG alone (retire, PowerDownJpeg/Up, start, transport and
+requested picture proofs, reopen, replay innocent jobs). A VCN timeout or
+coordinated fault recovery retires JPEG first, since VCN's stop closes the
+shared range, and re-proves it after VCN; the recovery receipt then includes
+the JPEG registration as its fifth owner. INFO_HW_IP reports JPEG under the
+VCN discovery entry with Linux's 256/64 alignment. Codec/profile capability
+and physical acceptance remain open.
 
 `amdgpu.jpeg_decode_proof` implies that transport cycle and additionally calls
 `unsafe Jpeg::prove_decode().await` on a newly drained kernel VMID0 queue.

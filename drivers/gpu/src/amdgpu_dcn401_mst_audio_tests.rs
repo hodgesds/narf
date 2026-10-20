@@ -38,11 +38,17 @@ fn set_payload(e: &mut Engine<MstIo>, rows: &[(u8, u8)]) {
         ColorDepth::Bpc10 => 10,
         ColorDepth::Bpc12 => 12,
     };
-    let (x, y) = vc_rate(
-        f.blank.timing.request.timing.pixel_clock_khz * depth * 3,
-        kbps,
-    )
-    .unwrap();
+    let request = f.blank.timing.request;
+    // A compressed stream's VC rate is its compressed bandwidth.
+    let stream_kbps = match request.dsc {
+        Some(cfg) => crate::amdgpu_dsc::dsc_kbps(
+            &crate::amdgpu_dcn401_otg::dsc_hw::dsc_timing(&request.timing, cfg.bpc),
+            cfg.bpp_x16,
+            cfg.slices_h,
+        ),
+        None => request.timing.pixel_clock_khz * depth * 3,
+    };
+    let (x, y) = vc_rate(stream_kbps, kbps).unwrap();
     let stream = f.request.stream;
     let phy = f.link.phy.path.transmitter;
     let mut words = [0u32; 2];
@@ -291,6 +297,7 @@ fn dcn401_mst_audio_two_streams_survive_link_owner_handover() -> TestResult {
             depth: ColorDepth::Bpc8,
             limited: false,
             ycbcr420: false,
+            colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(false, false),
         },
         c,
     ))
@@ -400,19 +407,23 @@ fn dcn401_mst_audio_requires_matching_live_scanout_witnesses() -> TestResult {
     };
     let live = ScanoutRunning {
         pipe: 2,
-        odm: None,
+        odm: SplitPipes::NONE,
+        mpc: SplitPipes::NONE,
         stream: 1,
         plan: dml::admit(
             &soc,
             &dml::Mode {
                 timing: t,
                 pitch: (t.h_active + 63) & !63,
+                bytes_per_pixel: 4,
                 ycbcr420: false,
                 dsc: None,
+                planes: [None; dml::MAX_PLANES],
             },
         )
         .unwrap(),
         address: 0x8_0010_2000,
+        overlays: [None; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
         frame_before: 2,
         frame_after: 3,
     };
@@ -462,4 +473,82 @@ fn dcn401_mst_audio_requires_matching_live_scanout_witnesses() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-mst-audio",
     dcn401_mst_audio_requires_matching_live_scanout_witnesses
+);
+
+/// Linux keeps LPCM on a compressed MST stream (build_audio_output passes
+/// dsc_cfg into check_audio_bandwidth_dp): the endpoint starts beside the
+/// PPS that shares the stream's AFMT clock and secondary master, its rates
+/// budgeted at the compressed bpp, and stopping it leaves the PPS sending.
+fn dcn401_mst_dsc_audio_shares_pps_and_budgets_compressed_bpp() -> TestResult {
+    let cfg = crate::amdgpu_dsc::DscConfig {
+        slices_h: 2,
+        slices_v: 10,
+        bpp_x16: 128,
+        block_pred: true,
+        linebuf_depth: 11,
+        version_minor: 2,
+        ycbcr422_simple: false,
+        frl: None,
+        bpc: 8,
+    };
+    for stream in 0..4 {
+        let pipe = (stream + 1) % 4;
+        let (mut e, mut link, c) =
+            fixture_mode(2, stream, pipe, ColorDepth::Bpc8, None, Some(cfg), true);
+        start(&mut e, &mut link, c);
+        let mut e = Engine {
+            io: MstIo {
+                inner: AudioIo {
+                    inner: e.io,
+                    az: BTreeMap::new(),
+                    index: [0; 4],
+                },
+                writes: Vec::new(),
+                drop: None,
+            },
+            authority: e.authority,
+            layout: e.layout,
+            status: e.status,
+            displays: e.displays,
+        };
+        set_payload(&mut e, &[(stream, 24)]);
+        let pps = |e: &mut Engine<MstIo>| {
+            [0x2169, 0x2177, 0x2170].map(|r| e.io.fake().regs[&dio(stream, r)])
+        };
+        let before = pps(&mut e);
+        for _ in 0..2 {
+            let a = run(e.start_mst_audio(path(2), info(), 24)).unwrap();
+            let f = e.status.dp_video_running.unwrap().frontend;
+            let t = f.blank.timing.request.timing;
+            assert_eq!(
+                Some(a.info),
+                mst_audio_info_with(info(), &t, 8, f.link.phy.settings, Some(&cfg))
+            );
+            assert_eq!(pps(&mut e), before);
+            assert_eq!(e.io.fake().regs[&dio(stream, 0x2141)] & 0x1111, 0x1111);
+            run(e.stop_dp_audio(path(2))).unwrap();
+            let regs = &e.io.fake().regs;
+            assert_eq!(
+                regs[&dio(stream, 0x2141)] & 0x1ff1_1111,
+                1,
+                "PPS master lost"
+            );
+            assert_eq!(regs[&dio(stream, 0x20ba)] & 1, 1, "PPS clock lost");
+            assert_eq!(regs[&dio(stream, 0x2082)] & 1, 0);
+            assert_eq!(pps(&mut e), before);
+            assert!(e.status.dp_audio.is_none() && e.status.mst_audio_payload.is_none());
+        }
+        assert!(
+            e.io.writes.iter().all(|&(at, value)| {
+                ![dio(stream, 0x2141), dio(stream, 0x20ba)].contains(&at) || value & 1 != 0
+            }),
+            "audio transiently disabled the PPS's clock or master"
+        );
+        run(e.stop_dp_video(&mut link, path(2))).unwrap();
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-mst-audio",
+    dcn401_mst_dsc_audio_shares_pps_and_budgets_compressed_bpp
 );

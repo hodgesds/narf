@@ -7,6 +7,28 @@ const VECTORS: &str = include_str!("../tests/dcn401_dml21/vectors.txt");
 /// Deep-sleep DCFCLK and the three urgent-bandwidth fractions truncate a
 /// double in Linux and a fixed-point value here; they may differ by one.
 const TOLERATED: [usize; 4] = [3, 47, 48, 49];
+/// The vector files before mpc_vectors.txt were planned with
+/// `mpcc_combine_factor` 1 (MPC combine off).
+const NO_MPC: Policy = Policy { mpc_combine: false };
+
+/// Linux plans some stream of the configuration on three or four ODM
+/// pipes ("! Unsupported odm" lines, from before the port admitted 3:1 and
+/// 4:1; odm34_vectors.txt holds their plans): the port must admit it with
+/// such a stream, or refuse a plan value outside its register field as it
+/// refuses Linux's other overflowing plans (`Register`).
+fn wide_odm(result: &Result<Vec<Plan>, Error>) -> bool {
+    match result {
+        Ok(plans) => plans.iter().any(|p| p.pipes >= 3),
+        Err(e) => *e == Error::Register,
+    }
+}
+/// Whether a rejection matches a vector's `name`. Before the port admitted
+/// 3:1 and 4:1 it named every configuration needing them `Unsupported`;
+/// Linux rejects those configurations too (check.sh verifies it), and the
+/// port now names the check they fail (pipes, DISPCLK, bandwidth).
+fn rejected_as(e: Error, name: &str) -> bool {
+    name == "REJECT" || name == "Unsupported" || error_name(e) == name
+}
 
 fn inputs(f: &[u32]) -> (Soc, Mode) {
     let soc = Soc {
@@ -38,8 +60,10 @@ fn inputs(f: &[u32]) -> (Soc, Mode) {
         Mode {
             timing,
             pitch: f[18],
+            bytes_per_pixel: 4,
             ycbcr420: false,
             dsc: None,
+            planes: [None; MAX_PLANES],
         },
     )
 }
@@ -135,26 +159,57 @@ fn parse<'a>(words: &mut impl Iterator<Item = &'a str>, out: &mut [u32]) -> bool
     }
     true
 }
-/// A plane's values end with "/2 <refcyc_h_blank_end>" when DML puts it on
-/// two ODM pipes (check.sh has verified the second pipe's other registers
-/// equal the first's); otherwise the plan must be single-pipe.
+/// A plane's values end with "/<n>" and each further pipe's
+/// refcyc_h_blank_end when DML puts it on n > 1 DPPs, ODM segments or MPC
+/// slices (check.sh has verified every further pipe's other registers
+/// equal the first's); otherwise the plan's first plane must be
+/// single-pipe.
 fn pipes_match<'a, I: Iterator<Item = &'a str>>(
     words: &mut core::iter::Peekable<I>,
     plan: &Plan,
 ) -> bool {
-    if words.next_if_eq(&"/2").is_none() {
-        return plan.pipes == 1 && plan.odm_refcyc_h_blank_end == 0 && plan.pipe_dlg(1).is_none();
+    let Some(p) = plan.plane(0) else {
+        return false;
+    };
+    let n = match words.peek().and_then(|w| w.strip_prefix('/')) {
+        Some(n) => match n.parse::<u8>() {
+            Ok(n @ 2..=4) => n,
+            _ => return false,
+        },
+        None => 1,
+    };
+    if n > 1 {
+        words.next();
     }
-    let mut end = [0u32; 1];
-    parse(words, &mut end)
-        && plan.pipes == 2
-        && plan.odm_refcyc_h_blank_end == end[0]
-        && plan.pipe_dlg(1)
-            == Some(Dlg {
-                refcyc_h_blank_end: end[0],
-                ..plan.dlg
-            })
-        && plan.pipe_dlg(2).is_none()
+    // An ODM stream's plane has the stream's pipes; an MPC-combined one
+    // two DPPs on a single segment.
+    if p.dpps != n || !(plan.pipes == n || (plan.pipes == 1 && n == 2)) {
+        return false;
+    }
+    for i in 1..n {
+        let mut end = [0u32; 1];
+        if !parse(words, &mut end)
+            || plan.pipe_dlg(i)
+                != Some(Dlg {
+                    refcyc_h_blank_end: end[0],
+                    ..plan.dlg
+                })
+        {
+            return false;
+        }
+        let odm = if plan.pipes > 1 {
+            p.odm_refcyc_h_blank_end[usize::from(i) - 1]
+        } else {
+            plan.dlg.refcyc_h_blank_end
+        };
+        if odm != end[0] {
+            return false;
+        }
+    }
+    plan.pipe_dlg(n).is_none()
+        && p.odm_refcyc_h_blank_end[usize::from(plan.pipes.max(1) - 1)..]
+            .iter()
+            .all(|&e| e == 0)
 }
 fn reference_1080p() -> (Soc, Mode) {
     inputs(&[
@@ -175,7 +230,8 @@ fn dcn401_dml_matches_linux_dml21_vectors() -> TestResult {
             return TestResult::Fail("malformed vector inputs");
         }
         let (soc, mode) = inputs(&f);
-        let result = admit(&soc, &mode);
+        let joint = admit_all_with(&soc, &[mode], NO_MPC);
+        let result = joint.clone().map(|p| p[0]);
         match words.next() {
             Some("=") => {
                 let mut want = [0u32; 62];
@@ -199,10 +255,18 @@ fn dcn401_dml_matches_linux_dml21_vectors() -> TestResult {
                 plans += 1;
             }
             Some("!") => {
-                let (Some(name), Err(e)) = (words.next(), result) else {
+                let name = words.next();
+                if name == Some("Unsupported") && words.peek() == Some(&"odm") {
+                    if !wide_odm(&joint) {
+                        return TestResult::Fail("Linux's 3:1/4:1 plan not admitted");
+                    }
+                    rejects += 1;
+                    continue;
+                }
+                let (Some(name), Err(e)) = (name, result) else {
                     return TestResult::Fail("rejected mode admitted");
                 };
-                if error_name(e) != name {
+                if !rejected_as(e, name) {
                     return TestResult::Fail("rejected for a different reason");
                 }
                 rejects += 1;
@@ -331,14 +395,19 @@ fn dcn401_dml_rejects_invalid_and_unmodeled_inputs() -> TestResult {
     if admit(&soc, &fast) != Err(Error::PixelClock) {
         return TestResult::Fail("over-fast pixel clock admitted");
     }
-    // Wider than the DCN4 linear swath limit.
+    // Wider than the DCN4 linear swath limit: one DPP cannot take it, so
+    // DML's auto factor MPC-combines it (refused when combine is off).
     let mut wide = mode;
     wide.timing.h_active = 15_424;
     wide.timing.h_total = 15_600;
     wide.pitch = 15_424;
     wide.timing.pixel_clock_khz = 600_000;
-    if admit(&soc, &wide) != Err(Error::Buffer) {
+    if admit_all_with(&soc, &[wide], NO_MPC) != Err(Error::Buffer) {
         return TestResult::Fail("over-wide swath admitted");
+    }
+    match admit(&soc, &wide) {
+        Ok(p) if p.pipes == 1 && p.plane(0).is_some_and(|q| q.dpps == 2) => {}
+        _ => return TestResult::Fail("over-wide swath not MPC-combined"),
     }
     TestResult::Pass
 }
@@ -368,16 +437,65 @@ fn check_vectors(
     ycbcr420: bool,
     dsc: bool,
 ) -> Result<(u32, u32, u32), &'static str> {
-    let (mut plans, mut rejects, mut odm) = (0, 0, 0);
+    check_vectors_with(vectors, ycbcr420, dsc, false)
+}
+
+/// As `check_vectors`; with `bytes` each line starts with the bytes per
+/// pixel of every stream's plane (format_vectors.txt).
+fn check_vectors_with(
+    vectors: &str,
+    ycbcr420: bool,
+    dsc: bool,
+    bytes: bool,
+) -> Result<(u32, u32, u32), &'static str> {
+    let prefix = match (dsc, bytes) {
+        (true, _) => Prefix::Dsc,
+        (_, true) => Prefix::Bytes,
+        _ => Prefix::None,
+    };
+    check_vectors_policy(vectors, ycbcr420, prefix, NO_MPC).map(|c| (c.0, c.1, c.2))
+}
+
+/// What a vector line carries before its multi_vectors.txt inputs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Prefix {
+    None,
+    /// "<slices> <bpp_x16>": every stream compressed so.
+    Dsc,
+    /// "<bytes per pixel>" of every stream's plane.
+    Bytes,
+    /// "<bytes per pixel> <slices> <bpp_x16> <4:2:0>": all three, slices 0
+    /// for no DSC (odm34_vectors.txt).
+    Full,
+}
+
+/// As `check_vectors_with` under `policy`; also counts the configurations
+/// with a stream on three or four pipes, and with an MPC-combined plane.
+fn check_vectors_policy(
+    vectors: &str,
+    ycbcr420: bool,
+    prefix: Prefix,
+    policy: Policy,
+) -> Result<(u32, u32, u32, u32, u32), &'static str> {
+    let (mut plans, mut rejects, mut odm, mut wide, mut mpc) = (0, 0, 0, 0, 0);
     for line in vectors.lines() {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         let mut words = line.split_whitespace().peekable();
+        let mut b = [4u32];
+        if matches!(prefix, Prefix::Bytes | Prefix::Full) && !parse(&mut words, &mut b) {
+            return Err("malformed format vector");
+        }
         let mut d = [0u32; 2];
-        if dsc && !parse(&mut words, &mut d) {
+        if matches!(prefix, Prefix::Dsc | Prefix::Full) && !parse(&mut words, &mut d) {
             return Err("malformed DSC vector");
         }
+        let mut f420 = [u32::from(ycbcr420)];
+        if prefix == Prefix::Full && !parse(&mut words, &mut f420) {
+            return Err("malformed 4:2:0 flag");
+        }
+        let dsc = d[0] != 0;
         let mut s = [0u32; 10];
         if !parse(&mut words, &mut s) || !(1..=4).contains(&s[9]) {
             return Err("malformed multi-stream SoC inputs");
@@ -394,7 +512,8 @@ fn check_vectors(
             f[9..18].copy_from_slice(&s[..9]);
             f[18] = t[9];
             let (_, mut mode) = inputs(&f);
-            mode.ycbcr420 = ycbcr420;
+            mode.ycbcr420 = f420[0] != 0;
+            mode.bytes_per_pixel = b[0];
             mode.dsc = dsc.then_some(Dsc {
                 slices: d[0],
                 bpp_x16: d[1],
@@ -404,7 +523,7 @@ fn check_vectors(
         let mut f = [0u32; 19];
         f[9..18].copy_from_slice(&s[..9]);
         let (soc, _) = inputs(&f);
-        let result = admit_all(&soc, &modes);
+        let result = admit_all_with(&soc, &modes, policy);
         match words.next() {
             Some("=") => {
                 let Ok(got) = &result else {
@@ -434,13 +553,26 @@ fn check_vectors(
                     return Err("joint plan count");
                 }
                 plans += 1;
-                odm += u32::from(got.iter().any(|p| p.pipes == 2));
+                odm += u32::from(got.iter().any(|p| p.pipes >= 2));
+                wide += u32::from(got.iter().any(|p| p.pipes >= 3));
+                mpc += u32::from(
+                    got.iter()
+                        .any(|p| p.pipes == 1 && p.planes.iter().flatten().any(|q| q.dpps == 2)),
+                );
             }
             Some("!") => {
-                let (Some(name), Err(e)) = (words.next(), result) else {
+                let name = words.next();
+                if name == Some("Unsupported") && words.peek() == Some(&"odm") {
+                    if !wide_odm(&result) {
+                        return Err("Linux's 3:1/4:1 configuration not admitted");
+                    }
+                    rejects += 1;
+                    continue;
+                }
+                let (Some(name), Err(e)) = (name, result) else {
                     return Err("rejected configuration admitted");
                 };
-                if name != "REJECT" && error_name(e) != name {
+                if !rejected_as(e, name) {
                     return Err("configuration rejected for a different reason");
                 }
                 rejects += 1;
@@ -448,7 +580,7 @@ fn check_vectors(
             _ => return Err("malformed multi-stream vector kind"),
         }
     }
-    Ok((plans, rejects, odm))
+    Ok((plans, rejects, odm, wide, mpc))
 }
 
 fn dcn401_dml_matches_linux_dml21_multi_stream_vectors() -> TestResult {
@@ -534,6 +666,44 @@ kernel_test_in!(
     dcn401_dml_matches_linux_dml21_odm_dsc_vectors
 );
 
+/// Shared with tests/dcn401_dml21/check.sh (harness_multi.c, DSC, DP2P0).
+const UHBR_DSC_VECTORS: &str = include_str!("../tests/dcn401_dml21/uhbr_dsc_vectors.txt");
+
+/// The DSC streams the UHBR DSC policy picks (8K60 and 4K240 at 16 bpp on
+/// four slices, 4K144 at 243/16 bpp on two), alone and beside each other,
+/// as DC passes them on 128b/132b encoders (dml2_dp2p0): admission takes
+/// the same inputs as on 8b/10b, and Linux plans them identically.
+fn dcn401_dml_matches_linux_dml21_uhbr_dsc_vectors() -> TestResult {
+    match check_vectors(UHBR_DSC_VECTORS, false, true) {
+        Ok((plans, rejects, odm)) if plans >= 20 && rejects >= 3 && odm >= 15 => TestResult::Pass,
+        Ok(_) => TestResult::Fail("UHBR DSC vector file lost coverage"),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_matches_linux_dml21_uhbr_dsc_vectors
+);
+
+/// Shared with tests/dcn401_dml21/check.sh (harness_multi.c, DSC, HDMIFRL).
+const FRL_DSC_VECTORS: &str = include_str!("../tests/dcn401_dml21/frl_dsc_vectors.txt");
+
+/// The DSC streams the HDMI FRL DSC policy picks (8K60 VIC 199 at its
+/// 159/16-bpp preset, 8K60 and 4K240 RBv2 at 12 bpp, eight slices each),
+/// as DC passes them on HDMI FRL encoders (dml2_hdmifrl): Linux plans a
+/// 4:4:4 DSC stream there as on DP, so admission takes the same inputs.
+fn dcn401_dml_matches_linux_dml21_frl_dsc_vectors() -> TestResult {
+    match check_vectors(FRL_DSC_VECTORS, false, true) {
+        Ok((plans, rejects, odm)) if plans >= 4 && rejects >= 2 && odm >= 4 => TestResult::Pass,
+        Ok(_) => TestResult::Fail("FRL DSC vector file lost coverage"),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_matches_linux_dml21_frl_dsc_vectors
+);
+
 /// 4:2:0 lines wider than one formatter buffer, on two pipes.
 fn dcn401_dml_matches_linux_dml21_odm_ycbcr420_vectors() -> TestResult {
     match check_vectors(ODM_YCBCR420_VECTORS, true, false) {
@@ -546,6 +716,98 @@ kernel_test_in!(
     "drivers/gpu/dcn401-dml",
     dcn401_dml_matches_linux_dml21_odm_ycbcr420_vectors
 );
+
+/// Shared with tests/dcn401_dml21/check.sh (harness_multi.c, PIXEL_BYTES).
+const FORMAT_VECTORS: &str = include_str!("../tests/dcn401_dml21/format_vectors.txt");
+
+/// RGB565 (dml2_444_16) and FP16 (dml2_444_64) planes: the request width,
+/// swath, DET lines, read bandwidth and deep-sleep DCFCLK follow the
+/// bytes per pixel, alone, beside other streams and on ODM 2:1 pipes.
+fn dcn401_dml_matches_linux_dml21_format_vectors() -> TestResult {
+    let (mut two, mut eight) = (0, 0);
+    for line in FORMAT_VECTORS.lines() {
+        match line.split_whitespace().next() {
+            Some("2") => two += 1,
+            Some("8") => eight += 1,
+            Some("#") | None => {}
+            Some(_) => return TestResult::Fail("format vector of another depth"),
+        }
+    }
+    match check_vectors_with(FORMAT_VECTORS, false, false, true) {
+        Ok((plans, rejects, odm))
+            if plans >= 1200 && rejects >= 400 && odm >= 300 && two >= 900 && eight >= 900 =>
+        {
+            TestResult::Pass
+        }
+        Ok(_) => TestResult::Fail("format vector file lost coverage"),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_matches_linux_dml21_format_vectors
+);
+
+/// Linux's depth limits: only 2, 4 and 8 bytes per pixel, each with a pitch
+/// of whole 256-byte requests; a 2-byte plane's 64-pixel-aligned pitch is a
+/// 128-byte linear surface DML plans differently.
+fn dcn401_dml_bytes_per_pixel_domain() -> TestResult {
+    let soc = Soc {
+        dcfclk_khz: [1_564_000, 1_564_000],
+        fclk_khz: [2_500_000, 2_500_000],
+        uclk_khz: 1_250_000,
+        dispclk_max_khz: 2_000_000,
+        dppclk_max_khz: 2_000_000,
+        socclk_khz: 1_200_000,
+        umc_channels: 16,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    let t = Timing {
+        pixel_clock_khz: 148_500,
+        h_active: 1920,
+        h_total: 2200,
+        h_front_porch: 88,
+        h_sync_width: 44,
+        v_active: 1080,
+        v_total: 1125,
+        v_front_porch: 4,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: true,
+    };
+    let m = |bytes_per_pixel, pitch| Mode {
+        timing: t,
+        pitch,
+        bytes_per_pixel,
+        ycbcr420: false,
+        dsc: None,
+        planes: [None; MAX_PLANES],
+    };
+    for bad in [0, 1, 3, 6, 16] {
+        if admit(&soc, &m(bad, 1920)) != Err(Error::Invalid) {
+            return TestResult::Fail("unsupported depth admitted");
+        }
+    }
+    if admit(&soc, &m(2, 1984)) != Err(Error::Unsupported) {
+        return TestResult::Fail("128-byte linear pitch admitted");
+    }
+    let (Ok(p2), Ok(p4), Ok(p8)) = (
+        admit(&soc, &m(2, 1920)),
+        admit(&soc, &m(4, 1920)),
+        admit(&soc, &m(8, 1920)),
+    ) else {
+        return TestResult::Fail("1080p60 at a supported depth rejected");
+    };
+    // Twice the bytes per request pixel halves the request's delivery time.
+    if !(p2.ttu.refcyc_per_req_delivery_l > p4.ttu.refcyc_per_req_delivery_l
+        && p4.ttu.refcyc_per_req_delivery_l > p8.ttu.refcyc_per_req_delivery_l)
+    {
+        return TestResult::Fail("request delivery does not follow the depth");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/dcn401-dml", dcn401_dml_bytes_per_pixel_domain);
 
 fn timing(
     pixel_clock_khz: u32,
@@ -610,10 +872,33 @@ fn dcn401_dml_odm_combine_follows_dml_policy() -> TestResult {
                 }) => {}
         _ => return TestResult::Fail("second ODM pipe's DLG"),
     }
-    // Past two pipes' DISPCLK DML would split 3:1, which is not admitted.
+    // Past two pipes' DISPCLK DML splits 3:1 (without DSC the segments
+    // may be uneven, but the line divides by four), past three 4:1.
     uhd.timing.pixel_clock_khz = 2 * ss + 1;
-    if admit(&soc, &uhd) != Err(Error::Unsupported) {
-        return TestResult::Fail("3:1 split admitted");
+    let Ok(p3) = admit(&soc, &uhd) else {
+        return TestResult::Fail("3:1 split rejected");
+    };
+    let third = |k: u32| {
+        (uhd.timing.h_blank_end() * 3 + k * 3840) * 50_000 / (3 * uhd.timing.pixel_clock_khz)
+    };
+    if p3.pipes != 3
+        || p3.odm_refcyc_h_blank_end != [third(1), third(2), 0]
+        || p3.pipe_dlg(2).map(|d| d.refcyc_h_blank_end) != Some(third(2))
+        || p3.pipe_dlg(3).is_some()
+        || p3.clocks.dispclk_khz < uhd.timing.pixel_clock_khz / 3
+    {
+        return TestResult::Fail("3:1 plan");
+    }
+    uhd.timing.pixel_clock_khz = 3 * ss + 1;
+    if admit(&soc, &uhd).map(|p| p.pipes) != Ok(4) {
+        return TestResult::Fail("4:1 split not chosen past three pipes");
+    }
+    // A 3:1 or 4:1 line must divide by four (OTG_H_TIMING_DIV_BY4).
+    let mut by4 = uhd;
+    by4.timing.h_active = 3838;
+    by4.timing.pixel_clock_khz = 2 * ss + 1;
+    if admit(&soc, &by4) != Err(Error::Unsupported) {
+        return TestResult::Fail("3:1 line not divisible by four admitted");
     }
     uhd.timing.pixel_clock_khz = 2_217_600;
     // Four pipes in all: two ODM streams, or one beside two single pipes.
@@ -714,7 +999,7 @@ fn dcn401_dml_joint_plans_share_global_state() -> TestResult {
         return TestResult::Fail("joint plan not bound to its configuration");
     }
     let mut edited = a;
-    edited.streams[1] = None;
+    edited.streams[0] = None;
     if edited.readmits() {
         return TestResult::Fail("plan re-admitted outside its configuration");
     }
@@ -728,4 +1013,474 @@ fn dcn401_dml_joint_plans_share_global_state() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-dml",
     dcn401_dml_joint_plans_share_global_state
+);
+
+/// Shared with tests/dcn401_dml21/check.sh (harness_planes.c, RAISED).
+const PLANE_VECTORS: &str = include_str!("../tests/dcn401_dml21/plane_vectors.txt");
+
+/// `plan` as plane `k` of its stream sees it: the plane's DPPCLK, DLG,
+/// TTU, DET and ODM blank end in the stream's plan.
+fn plane_view(plan: &Plan, k: usize) -> Option<Plan> {
+    let p = plan.plane(k)?;
+    Some(Plan {
+        clocks: Clocks {
+            dppclk_khz: p.dppclk_khz,
+            ..plan.clocks
+        },
+        dlg: p.dlg,
+        ttu: p.ttu,
+        det_bytes: p.det_bytes,
+        odm_refcyc_h_blank_end: p.odm_refcyc_h_blank_end,
+        planes: [Some(p), None, None, None],
+        ..*plan
+    })
+}
+
+/// plane_vectors.txt: every plane's plan values (as multi_vectors.txt's,
+/// planes in argument order), or the rejection.
+fn check_plane_vectors(vectors: &str) -> Result<(u32, u32, u32), &'static str> {
+    check_plane_vectors_policy(vectors, NO_MPC).map(|c| (c.0, c.1, c.2))
+}
+
+/// As `check_plane_vectors` under `policy`; also counts MPC-combined planes.
+fn check_plane_vectors_policy(
+    vectors: &str,
+    policy: Policy,
+) -> Result<(u32, u32, u32, u32), &'static str> {
+    let (mut plans, mut rejects, mut overlays, mut mpc) = (0, 0, 0, 0);
+    for line in vectors.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut words = line.split_whitespace().peekable();
+        let mut s = [0u32; 9];
+        if !parse(&mut words, &mut s) {
+            return Err("malformed plane SoC inputs");
+        }
+        let mut f = [0u32; 19];
+        f[9..18].copy_from_slice(&s);
+        let (soc, _) = inputs(&f);
+        let mut modes = Vec::new();
+        while words.peek().is_some_and(|w| *w != "=" && *w != "!") {
+            let mut t = [0u32; 10];
+            if !parse(&mut words, &mut t) || !(1..=4).contains(&t[9]) {
+                return Err("malformed plane stream");
+            }
+            let mut g = [0u32; 19];
+            g[..9].copy_from_slice(&t[..9]);
+            g[9..18].copy_from_slice(&s);
+            let (_, mut mode) = inputs(&g);
+            for slot in mode.planes.iter_mut().take(t[9] as usize) {
+                let mut p = [0u32; 10];
+                if !parse(&mut words, &mut p) {
+                    return Err("malformed plane");
+                }
+                *slot = Some(Plane {
+                    surface_width: Plane::extent(p[0]),
+                    surface_height: Plane::extent(p[1]),
+                    pitch: Plane::extent(p[2]),
+                    bytes_per_pixel: Plane::count(p[3]),
+                    viewport_width: Plane::extent(p[4]),
+                    viewport_height: Plane::extent(p[5]),
+                    h_ratio: p[6],
+                    v_ratio: p[7],
+                    h_taps: Plane::count(p[8]),
+                    v_taps: Plane::count(p[9]),
+                    ..Plane::default()
+                });
+            }
+            mode.pitch = mode.planes[0].map_or(0, |p| u32::from(p.pitch));
+            mode.bytes_per_pixel = mode.planes[0].map_or(0, |p| u32::from(p.bytes_per_pixel));
+            modes.push(mode);
+        }
+        let result = admit_all_with(&soc, &modes, policy);
+        match words.next() {
+            Some("=") => {
+                let Ok(got) = &result else {
+                    return Err("Linux-admitted plane configuration rejected");
+                };
+                let mut first = true;
+                for plan in got {
+                    for k in 0..MAX_PLANES {
+                        let Some(view) = plane_view(plan, k) else {
+                            break;
+                        };
+                        if !first && words.next() != Some("|") {
+                            return Err("malformed plane plan separator");
+                        }
+                        first = false;
+                        let mut want = [0u32; 62];
+                        if !parse(&mut words, &mut want) {
+                            return Err("malformed plane plan");
+                        }
+                        for (i, (&g, &w)) in values(&view).iter().zip(want.iter()).enumerate() {
+                            if g != w && !(TOLERATED.contains(&i) && g.abs_diff(w) == 1) {
+                                return Err("plane plan value differs from Linux DML21");
+                            }
+                        }
+                        if !pipes_match(&mut words, &view) {
+                            return Err("plane plan ODM pipes differ from Linux DML21");
+                        }
+                        overlays += u32::from(k > 0);
+                        mpc += u32::from(
+                            plan.pipes == 1 && view.planes[0].is_some_and(|p| p.dpps == 2),
+                        );
+                    }
+                    if !plan.readmits() {
+                        return Err("plane plan not reproducible");
+                    }
+                }
+                if words.next().is_some() {
+                    return Err("plane plan count");
+                }
+                plans += 1;
+            }
+            Some("!") => {
+                let (Some(name), Err(e)) = (words.next(), result) else {
+                    return Err("rejected plane configuration admitted");
+                };
+                if name != "REJECT" && error_name(e) != name {
+                    return Err("plane configuration rejected for a different reason");
+                }
+                rejects += 1;
+            }
+            _ => return Err("malformed plane vector kind"),
+        }
+    }
+    Ok((plans, rejects, overlays, mpc))
+}
+
+/// Scaled planes (SPL's viewport, ratios and taps: DPPCLK, scaler delay,
+/// prefetch source lines, line-buffer and DET hiding at the ratios) and
+/// several planes per stream (one DPP each, joint bandwidth, extra latency
+/// and deep sleep), as DML21 plans them.
+fn dcn401_dml_matches_linux_dml21_plane_vectors() -> TestResult {
+    match check_plane_vectors(PLANE_VECTORS) {
+        Ok((plans, _, overlays)) if plans >= 300 && overlays >= 300 => TestResult::Pass,
+        Ok(_) => TestResult::Fail("plane vector file lost coverage"),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_matches_linux_dml21_plane_vectors
+);
+
+/// Shared with tests/dcn401_dml21/check.sh (harness_surfaces.c, RAISED).
+const SURFACE_VECTORS: &str = include_str!("../tests/dcn401_dml21/surface_vectors.txt");
+
+/// The 56 values harness_surfaces.c prints after a plane's 62: the chroma
+/// DLG/TTU delivery, both surfaces' rq_regs, the expansion modes, the DET's
+/// chroma base, unbounded requesting, the arbiter's hw_debug5, the mcache
+/// allocation and two pipes' mcache registers.
+fn surface_values(plan: &Plan, k: usize, p: &PlanePlan) -> [u32; 56] {
+    let mut out = [0u32; 56];
+    out[..27].copy_from_slice(&surface_rq_values(plan, p)[..27]);
+    // The mcache allocation, then each of two pipes' mcache registers with
+    // pipe j of n taking the j-th n-th of each viewport (harness_surfaces.c).
+    let a = p.mcache.unwrap_or_default();
+    let mut v = alloc::vec::Vec::with_capacity(29);
+    v.extend(a.count.map(u32::from));
+    for i in 0..2 {
+        v.extend(a.offsets[i].map(u32::from));
+    }
+    for i in 0..2 {
+        v.extend(a.ids[i].map(u32::from));
+    }
+    v.push(u32::from(a.shared));
+    let plane = plan.mode.plane_list().nth(k).unwrap_or_default();
+    let n = u32::from(plan.pipes);
+    for j in 0..2u32 {
+        if j >= n {
+            v.extend([0; 6]);
+            continue;
+        }
+        let share = |w: u16| (j * (u32::from(w) / n), u32::from(w) / n);
+        let regs = match p.mcache {
+            None => Some([McacheRegs::UNASSIGNED; 2]),
+            Some(a) => a.pipe_regs(
+                share(plane.viewport_width),
+                plane.chroma.map(|c| share(c.viewport_width)),
+            ),
+        };
+        match regs {
+            Some(r) => {
+                for s in r {
+                    v.extend([s.id_first, s.id_second, s.split_location]);
+                }
+            }
+            None => v.extend([0; 6]),
+        }
+    }
+    out[27..].copy_from_slice(&v);
+    out
+}
+
+/// The chroma delivery, rq_regs, expansion modes, DET chroma base,
+/// unbounded requesting and hw_debug5 (28 with a zero pad).
+fn surface_rq_values(plan: &Plan, p: &PlanePlan) -> [u32; 28] {
+    let (d, t, q) = (&p.dlg, &p.ttu, &p.rq);
+    let rq = |r: &RqPlane| {
+        [
+            r.chunk_size,
+            r.min_chunk_size,
+            r.meta_chunk_size,
+            r.min_meta_chunk_size,
+            r.dpte_group_size,
+            r.mpte_group_size,
+            r.swath_height,
+            r.pte_row_height_linear,
+        ]
+    };
+    let (l, c) = (rq(&q.luma), rq(&q.chroma));
+    [
+        d.refcyc_per_line_delivery_pre_c,
+        d.refcyc_per_line_delivery_c,
+        t.refcyc_per_req_delivery_pre_c,
+        t.refcyc_per_req_delivery_c,
+        l[0],
+        l[1],
+        l[2],
+        l[3],
+        l[4],
+        l[5],
+        l[6],
+        l[7],
+        c[0],
+        c[1],
+        c[2],
+        c[3],
+        c[4],
+        c[5],
+        c[6],
+        c[7],
+        q.drq_expansion_mode,
+        q.prq_expansion_mode,
+        q.mrq_expansion_mode,
+        q.crq_expansion_mode,
+        q.plane1_base_address,
+        u32::from(q.unbounded_request_enabled),
+        u32::from(plan.arbiter.allow_sdpif_rate_limit_when_cstate_req),
+        0,
+    ]
+}
+
+/// One harness_surfaces.c plane: the plane_vectors.txt values, then source,
+/// swizzle, DCC, rotation and the chroma plane.
+fn surface_plane(p: &[u32; 23]) -> Option<Plane> {
+    let source = match p[10] {
+        0 => Source::Rgb,
+        1 => Source::Yuv420_8,
+        2 => Source::Yuv420_10,
+        _ => return None,
+    };
+    let swizzle = match p[11] {
+        0 => Swizzle::Linear,
+        1 => Swizzle::S256B2D,
+        2 => Swizzle::S4K2D,
+        3 => Swizzle::S64K2D,
+        4 => Swizzle::S256K2D,
+        _ => return None,
+    };
+    let chroma = (source != Source::Rgb).then(|| Chroma {
+        surface_width: Plane::extent(p[14]),
+        surface_height: Plane::extent(p[15]),
+        pitch: Plane::extent(p[16]),
+        viewport_width: Plane::extent(p[17]),
+        viewport_height: Plane::extent(p[18]),
+        h_ratio: p[19],
+        v_ratio: p[20],
+        h_taps: Plane::count(p[21]),
+        v_taps: Plane::count(p[22]),
+    });
+    Some(Plane {
+        surface_width: Plane::extent(p[0]),
+        surface_height: Plane::extent(p[1]),
+        pitch: Plane::extent(p[2]),
+        bytes_per_pixel: Plane::count(p[3]),
+        viewport_width: Plane::extent(p[4]),
+        viewport_height: Plane::extent(p[5]),
+        h_ratio: p[6],
+        v_ratio: p[7],
+        h_taps: Plane::count(p[8]),
+        v_taps: Plane::count(p[9]),
+        source,
+        swizzle,
+        dcc: p[12] != 0,
+        vertical_scan: p[13] % 2 == 1,
+        chroma,
+    })
+}
+
+/// surface_vectors.txt: every plane's 62 plan values and 56 surface values
+/// (planes in argument order), or the rejection ("! ClockState" for a plan
+/// whose DCF/fabric state DPMM raises). Returns the plans, rejections,
+/// 4:2:0 planes and tiled planes admitted.
+fn check_surface_vectors(vectors: &str) -> Result<[u32; 4], &'static str> {
+    let mut counts = [0u32; 4];
+    for line in vectors.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut words = line.split_whitespace().peekable();
+        let mut s = [0u32; 9];
+        if !parse(&mut words, &mut s) {
+            return Err("malformed surface SoC inputs");
+        }
+        let mut f = [0u32; 19];
+        f[9..18].copy_from_slice(&s);
+        let (soc, _) = inputs(&f);
+        let mut modes = Vec::new();
+        let (mut yuv, mut tiled) = (0, 0);
+        while words.peek().is_some_and(|w| *w != "=" && *w != "!") {
+            let mut t = [0u32; 10];
+            if !parse(&mut words, &mut t) || !(1..=4).contains(&t[9]) {
+                return Err("malformed surface stream");
+            }
+            let mut g = [0u32; 19];
+            g[..9].copy_from_slice(&t[..9]);
+            g[9..18].copy_from_slice(&s);
+            let (_, mut mode) = inputs(&g);
+            for slot in mode.planes.iter_mut().take(t[9] as usize) {
+                let mut p = [0u32; 23];
+                if !parse(&mut words, &mut p) {
+                    return Err("malformed surface plane");
+                }
+                let plane = surface_plane(&p).ok_or("malformed surface plane fields")?;
+                yuv += u32::from(plane.is_420());
+                tiled += u32::from(plane.swizzle != Swizzle::Linear);
+                *slot = Some(plane);
+            }
+            mode.pitch = mode.planes[0].map_or(0, |p| u32::from(p.pitch));
+            mode.bytes_per_pixel = mode.planes[0].map_or(0, |p| u32::from(p.bytes_per_pixel));
+            modes.push(mode);
+        }
+        let result = admit_all_with(&soc, &modes, NO_MPC);
+        match words.next() {
+            Some("=") => {
+                let Ok(got) = &result else {
+                    return Err("Linux-admitted surface configuration rejected");
+                };
+                let mut first = true;
+                for plan in got {
+                    for k in 0..MAX_PLANES {
+                        let Some(view) = plane_view(plan, k) else {
+                            break;
+                        };
+                        if !first && words.next() != Some("|") {
+                            return Err("malformed surface plan separator");
+                        }
+                        first = false;
+                        let mut want = [0u32; 62];
+                        let mut want_s = [0u32; 56];
+                        if !parse(&mut words, &mut want) || !parse(&mut words, &mut want_s) {
+                            return Err("malformed surface plan");
+                        }
+                        for (i, (&g, &w)) in values(&view).iter().zip(want.iter()).enumerate() {
+                            if g != w && !(TOLERATED.contains(&i) && g.abs_diff(w) == 1) {
+                                return Err("surface plan value differs from Linux DML21");
+                            }
+                        }
+                        let p = plan.plane(k).ok_or("surface plan lost a plane")?;
+                        if surface_values(plan, k, &p) != want_s {
+                            return Err("surface rq/chroma value differs from Linux DML21");
+                        }
+                        if !pipes_match(&mut words, &view) {
+                            return Err("surface plan ODM pipes differ from Linux DML21");
+                        }
+                    }
+                    if !plan.readmits() {
+                        return Err("surface plan not reproducible");
+                    }
+                }
+                if words.next().is_some() {
+                    return Err("surface plan count");
+                }
+                counts[0] += 1;
+                counts[2] += yuv;
+                counts[3] += tiled;
+            }
+            Some("!") => {
+                let (Some(name), Err(e)) = (words.next(), result) else {
+                    return Err("rejected surface configuration admitted");
+                };
+                if name != "REJECT" && error_name(e) != name {
+                    return Err("surface configuration rejected for a different reason");
+                }
+                counts[1] += 1;
+            }
+            _ => return Err("malformed surface vector kind"),
+        }
+    }
+    Ok(counts)
+}
+
+/// GFX12 tiled (256B to 256KB 2D swizzles), DCC and 4:2:0 (NV12, P010)
+/// planes, scanned horizontally and rotated: block and swath heights, the
+/// DET split and chroma base, unbounded requesting, two-surface prefetch,
+/// bursts, deep sleep and delivery, and DCC's DRAM overhead, as DML21
+/// plans them.
+fn dcn401_dml_matches_linux_dml21_surface_vectors() -> TestResult {
+    match check_surface_vectors(SURFACE_VECTORS) {
+        Ok([plans, rejects, yuv, tiled])
+            if plans >= 400 && rejects >= 20 && yuv >= 150 && tiled >= 300 =>
+        {
+            TestResult::Pass
+        }
+        Ok(_) => TestResult::Fail("surface vector file lost coverage"),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_matches_linux_dml21_surface_vectors
+);
+
+/// Shared with tests/dcn401_dml21/check.sh (harness_planes.c, RAISED,
+/// MPC_AUTO).
+const MPC_VECTORS: &str = include_str!("../tests/dcn401_dml21/mpc_vectors.txt");
+
+/// MPC combine as DML21's auto factor chooses it: a plane in ODM bypass
+/// whose single DPP would exceed the DPPCLK maximum or whose swath the line
+/// buffer cannot hold takes two DPPs (half the viewport each, DPPCLK and
+/// delivery per DPP, both DLGs alike), alone, with overlays and beside
+/// other streams; never on an ODM stream.
+fn dcn401_dml_matches_linux_dml21_mpc_vectors() -> TestResult {
+    match check_plane_vectors_policy(MPC_VECTORS, Policy::NATIVE) {
+        Ok((plans, rejects, overlays, mpc))
+            if plans >= 1200 && rejects >= 200 && overlays >= 60 && mpc >= 400 =>
+        {
+            TestResult::Pass
+        }
+        Ok(_) => TestResult::Fail("MPC vector file lost coverage"),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_matches_linux_dml21_mpc_vectors
+);
+
+/// Shared with tests/dcn401_dml21/check.sh (harness_multi.c, RAISED, with
+/// each line's PIXEL_BYTES, DSC and FMT420).
+const ODM34_VECTORS: &str = include_str!("../tests/dcn401_dml21/odm34_vectors.txt");
+
+/// ODM 3:1 and 4:1 as DML21's auto policy chooses them: pixel clocks past
+/// two or three pipes' DISPCLK, DSC lines past two DSCs or with more than
+/// eight slices (three pipes only for twelve, else four), alone and beside
+/// other streams, at every depth; every further pipe's blank end as Linux
+/// programs it, and a fifth pipe, a line not divisible by four or an uneven
+/// DSC split rejected.
+fn dcn401_dml_matches_linux_dml21_odm34_vectors() -> TestResult {
+    match check_vectors_policy(ODM34_VECTORS, false, Prefix::Full, Policy::NATIVE) {
+        Ok((plans, rejects, _, wide, _)) if plans >= 1000 && rejects >= 400 && wide >= 700 => {
+            TestResult::Pass
+        }
+        Ok(_) => TestResult::Fail("ODM 3:1/4:1 vector file lost coverage"),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_matches_linux_dml21_odm34_vectors
 );

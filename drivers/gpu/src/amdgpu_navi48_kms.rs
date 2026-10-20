@@ -36,8 +36,31 @@ const NVSYNC: u32 = 8;
 const PREFERRED_DRIVER: u32 = 0x8 | 0x40;
 const DRIVER: u32 = 0x40;
 
-/// DRM_FORMAT_XRGB8888 and ARGB8888: what the native scanout presents.
-const PLANE_FORMATS: [u32; 2] = [0x3432_5258, 0x3432_5241];
+/// Every native plane's formats (primary and overlay alike: DCN4's planes
+/// are all DC_PLANE_TYPE_DCN_UNIVERSAL): amdgpu_dm's DCN4.0.1 list
+/// (`amdgpu_dm_modifiers::DM_PLANE_FORMATS`: rgb_formats, NV12, P010, then
+/// the FP16 ones) less those the native scanout does not program
+/// (RGBA8888 and the 16-bit UNORM orders), in its order.
+pub const PLANE_FORMATS: [u32; 15] = {
+    use crate::amdgpu_dcn401_otg::SurfaceFormat as F;
+    [
+        F::Xrgb8888.fourcc(),
+        F::Argb8888.fourcc(),
+        F::Xrgb2101010.fourcc(),
+        F::Xbgr2101010.fourcc(),
+        F::Argb2101010.fourcc(),
+        F::Abgr2101010.fourcc(),
+        F::Xbgr8888.fourcc(),
+        F::Abgr8888.fourcc(),
+        F::Rgb565.fourcc(),
+        F::Nv12.fourcc(),
+        F::P010.fourcc(),
+        F::Xrgb16161616f.fourcc(),
+        F::Argb16161616f.fourcc(),
+        F::Xbgr16161616f.fourcc(),
+        F::Abgr16161616f.fourcc(),
+    ]
+};
 
 /// The display (and pipe) behind a native CRTC id.
 pub fn crtc_display(crtc_id: u32) -> Option<u8> {
@@ -139,6 +162,20 @@ pub fn apply(card: &mut Card, outputs: &[Output]) {
 /// has an EDID. The topology is rebuilt only when the CRTC count or the
 /// connectors' identities change.
 pub fn apply_routed(card: &mut Card, crtcs: &[Option<Sink>], connectors: &[RoutedConnector]) {
+    apply_routed_vrr(card, crtcs, connectors, None);
+}
+
+/// `apply_routed` that also attaches the VRR properties, as amdgpu_dm does
+/// on DP and HDMI connectors: each connector's immutable "vrr_capable"
+/// (`vrr_capable[n]` for `connectors[n]`, false past its end) and every
+/// CRTC's "VRR_ENABLED", whose committed values survive republication.
+/// `None` attaches neither (and drops any), as `apply_routed`.
+pub fn apply_routed_vrr(
+    card: &mut Card,
+    crtcs: &[Option<Sink>],
+    connectors: &[RoutedConnector],
+    vrr_capable: Option<&[bool]>,
+) {
     let crtcs = &crtcs[..crtcs.len().min(MAX_OUTPUTS)];
     let same = card.crtcs.len() == crtcs.len()
         && card.connectors.len() == connectors.len()
@@ -197,8 +234,22 @@ pub fn apply_routed(card: &mut Card, crtcs: &[Option<Sink>], connectors: &[Route
             }
         }
     }
+    card.vrr_enabled = match vrr_capable {
+        Some(_) => (0..crtcs.len())
+            .map(|k| {
+                let id = crtc_id(k);
+                let value = card
+                    .vrr_enabled
+                    .iter()
+                    .find(|&&(c, _)| c == id)
+                    .is_some_and(|&(_, v)| v);
+                (id, value)
+            })
+            .collect(),
+        None => alloc::vec::Vec::new(),
+    };
     let mut native = alloc::vec::Vec::with_capacity(connectors.len());
-    for c in connectors {
+    for (n, c) in connectors.iter().enumerate() {
         let shown = c.crtc.and_then(|k| crtcs.get(k).copied().flatten());
         let edid = shown.map(|s| s.edid).or(c.edid);
         let wire = shown.map(|s| timing_wire(s.timing));
@@ -263,13 +314,27 @@ pub fn apply_routed(card: &mut Card, crtcs: &[Option<Sink>], connectors: &[Route
             // amdgpu_dm attaches it to HDMI and SST DP connectors, which is
             // all these ever are.
             broadcast_rgb: Some(crate::amdgpu_navi48_boot::broadcast_rgb()),
+            vrr_capable: vrr_capable.map(|v| v.get(n).copied().unwrap_or(false)),
+            colorspace: None,
+            hdr_output_metadata: None,
+            max_bpc: None,
         });
     }
     // The CRTCs' vblanks are the displays' hardware ones, and their planes
-    // scan 32-bit RGB (alpha unused: nothing lies below the primary).
+    // scan packed RGB (an A format's alpha blends over the black background:
+    // nothing lies below the primary).
     card.vblank_source = Some(crate::amdgpu_navi48_platform::crtc_vblank);
     card.plane_formats = Some(&PLANE_FORMATS);
+    // amdgpu_dm's planes: each CRTC's primary and DCN401's three overlays.
+    let crtc_ids: alloc::vec::Vec<u32> = card.crtcs.iter().map(|c| c.id).collect();
+    card.native_planes = crate::drm_native_planes::planes_for(&card.native_planes, &crtc_ids);
+    card.overlay_formats = Some(&PLANE_FORMATS);
+    // amdgpu_dm_plane_get_plane_modifiers: GFX12 modifiers on every plane.
+    card.gfx12_modifiers = true;
     card.native = native;
+    // amdgpu is DRIVER_ATOMIC: the bridge's native atomic path validates
+    // MODE_ID/format/route against this owner and commits through it.
+    card.native_atomic = true;
 }
 
 /// The connector index behind a native connector id.
@@ -311,6 +376,79 @@ pub fn publish(outputs: &[Output]) {
 /// `apply_routed` on the registered amdgpu card.
 pub fn publish_routed(crtcs: &[Option<Sink>], connectors: &[RoutedConnector]) {
     with_card(|card| apply_routed(card, crtcs, connectors));
+}
+
+/// What the Navi48 platform attaches to a routed connector beyond its sink.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConnectorProps {
+    /// The immutable "vrr_capable" value.
+    pub vrr_capable: bool,
+    /// "Colorspace" and "HDR_OUTPUT_METADATA", which amdgpu_dm attaches to
+    /// its HDMI and DP connectors (drm_mode_create_{hdmi,dp}_colorspace_property
+    /// with the same supported set, drm_connector_attach_hdr_output_metadata_property).
+    pub color: bool,
+    /// "max bpc", which amdgpu_dm attaches to every connector, MST end
+    /// devices included (drm_connector_attach_max_bpc_property(connector,
+    /// 8, 16), starting at 16).
+    pub max_bpc: bool,
+}
+
+/// `apply_routed_vrr` with every native property amdgpu_dm attaches on
+/// DCN 4.0.1: the VRR pair, each connector's "Colorspace" and
+/// "HDR_OUTPUT_METADATA" where `props[n].color` and "max bpc" where
+/// `props[n].max_bpc`, and every CRTC's CTM,
+/// GAMMA_LUT and GAMMA_LUT_SIZE (`drm_crtc_enable_color_mgmt(crtc, 0,
+/// true, 4096)`: no degamma on 4.0.1) with the legacy 256-entry gamma.
+/// Committed values survive republication: a connector keeps its
+/// Colorspace, HDR blob and max bpc, a CRTC its CTM, GAMMA_LUT and gamma
+/// store.
+pub fn apply_routed_native(
+    card: &mut Card,
+    crtcs: &[Option<Sink>],
+    connectors: &[RoutedConnector],
+    props: &[ConnectorProps],
+) {
+    /// A connector's committed Colorspace, HDR blob and max bpc.
+    type Committed = (u32, Option<u32>, Option<u32>, Option<u8>);
+    let previous: alloc::vec::Vec<Committed> = card
+        .native
+        .iter()
+        .map(|n| (n.connector, n.colorspace, n.hdr_output_metadata, n.max_bpc))
+        .collect();
+    let vrr: alloc::vec::Vec<bool> = props.iter().map(|p| p.vrr_capable).collect();
+    apply_routed_vrr(card, crtcs, connectors, Some(&vrr));
+    for (n, c) in connectors.iter().enumerate() {
+        let id = connector_id(c.index);
+        let attach = props.get(n).is_some_and(|p| p.color);
+        let kept = previous.iter().find(|p| p.0 == id);
+        if let Some(native) = card.native.iter_mut().find(|x| x.connector == id) {
+            native.colorspace = attach.then(|| kept.and_then(|p| p.1).unwrap_or(0));
+            native.hdr_output_metadata = attach.then(|| kept.and_then(|p| p.2).unwrap_or(0));
+            native.max_bpc = props.get(n).is_some_and(|p| p.max_bpc).then(|| {
+                kept.and_then(|p| p.3)
+                    .unwrap_or(crate::amdgpu_navi48_boot::MAX_REQUESTED_BPC)
+            });
+        }
+    }
+    let crtcs = &crtcs[..crtcs.len().min(MAX_OUTPUTS)];
+    card.crtc_color = (0..crtcs.len())
+        .map(|k| {
+            let id = crtc_id(k);
+            card.crtc_color(id)
+                .cloned()
+                .unwrap_or_else(|| crate::drm::card::CrtcColor::new(id))
+        })
+        .collect();
+    card.collect_blobs();
+}
+
+/// `apply_routed_native` on the registered amdgpu card.
+pub fn publish_routed_native(
+    crtcs: &[Option<Sink>],
+    connectors: &[RoutedConnector],
+    props: &[ConnectorProps],
+) {
+    with_card(|card| apply_routed_native(card, crtcs, connectors, props));
 }
 
 fn with_card(update: impl FnOnce(&mut Card)) {

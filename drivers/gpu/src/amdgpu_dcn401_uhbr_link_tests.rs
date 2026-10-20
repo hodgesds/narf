@@ -105,6 +105,8 @@ struct Sink {
     event: Arc<AtomicU8>,
     mode: Arc<AtomicU8>,
     lttpr: Option<[u8; 10]>,
+    /// A DPCD address whose writes the sink ignores.
+    deaf: Option<u32>,
 }
 impl super::super::super::super::dp_phy::Firmware for Sink {
     fn ready(&self) -> bool {
@@ -134,6 +136,9 @@ impl Transport for Sink {
             0x80 => {
                 let mode = self.mode.load(Ordering::SeqCst);
                 self.steps.push(Step::Write(address, data.to_vec(), mode));
+                if Some(address) == self.deaf {
+                    return Ok(());
+                }
                 for (i, b) in data.iter().enumerate() {
                     self.bytes.insert(address + i as u32, *b);
                 }
@@ -229,6 +234,7 @@ fn uhbr_fixture(p: u8, settings: UhbrSettings) -> (Engine<UhbrIo>, Sink) {
         event: event.clone(),
         mode: mode.clone(),
         lttpr: None,
+        deaf: None,
     };
     // DPCD 1.4 base caps pointing at DP 2.1 extended caps with 128b/132b.
     let mut caps = [0u8; 16];
@@ -881,4 +887,513 @@ fn dcn401_uhbr_mst_streams_share_one_link() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_uhbr_mst_streams_share_one_link
+);
+
+/// The 1080p60 DSC configuration the legacy DSC tests use: two slices,
+/// 8 bpp.
+fn hpo_dsc_config() -> crate::amdgpu_dsc::DscConfig {
+    crate::amdgpu_dsc::DscConfig {
+        slices_h: 2,
+        slices_v: 10,
+        bpp_x16: 128,
+        block_pred: true,
+        linebuf_depth: 11,
+        version_minor: 2,
+        ycbcr422_simple: false,
+        frl: None,
+        bpc: 8,
+    }
+}
+/// A trained 128b/132b link on PHY `p` with `pipe`'s timing staged
+/// compressed by `cfg` and HPO stream `stream`'s clocks routed.
+fn uhbr_dsc_fixture(
+    p: u8,
+    stream: u8,
+    pipe: u8,
+    settings: UhbrSettings,
+    cfg: crate::amdgpu_dsc::DscConfig,
+) -> (Engine<UhbrIo>, Sink, Request, dccg::Applied) {
+    let (mut e, mut sink) = uhbr_fixture(p, settings);
+    if settings.mst {
+        sink.bytes.insert(0x111, 7);
+    }
+    let mut req = request(pipe);
+    req.dsc = Some(cfg);
+    let c = clock(req);
+    run(e.prepare(req, c)).unwrap();
+    e.io.inner.retiring = [false; 4];
+    run(e.prepare_blank(blank_request(pipe), c)).unwrap();
+    let bank1 = e.layout.dio_clock - 0xa0 * 4;
+    e.io.inner
+        .regs
+        .insert(bank1 + (0x80 + 4 * u64::from(pipe)) * 4, 0x1090);
+    e.io.inner.regs.insert(bank1 + 0x68 * 4, 4 << (pipe * 3));
+    for h in 0..4 {
+        e.io.inner.regs.insert(BASE + (0x5f4 + h * 0xdc) * 4, 3);
+    }
+    sink.status = VecDeque::from([status(7, 0xd, [0; 4])]);
+    run(e.train_uhbr_link(&mut sink, path(p), settings, LINK)).unwrap();
+    route_uhbr_stream(&mut e, p, stream, pipe);
+    (e, sink, req, c)
+}
+
+/// A DSC stream on a trained 128b/132b link, in link_set_dpms_on's order:
+/// the pipe's DSC and OPTC compress from the timing's staging
+/// (link_set_dsc_on_stream does nothing more for HPO); the pixel format
+/// is marked compressed; after enable_stream the sink decodes DSC
+/// (DP_DSC_ENABLE 1, read back) and the PPS goes out as
+/// dcn31_hpo_dp_stream_enc_set_dsc_pps_info_packet sends it: GSP11 in
+/// 128-byte mode, the legacy PPS builder's 128 bytes in the stream's VPG
+/// generic packets 11-14 (type 0x10, 127 bytes) latched immediately, GSP11
+/// on line 2 and VBID[6] on line 3, then GSP11 and the SDP path on. Only
+/// then the payload, sized for the compressed 1,222,560 kbps (8 bpp plus
+/// two slices' overhead): 2.03 of 64 slots, so 3 slots, X 2, 18 blanking
+/// symbols. Stop clears DP_DSC_ENABLE and the PPS after the encoder; the
+/// DSC stays for a restart, which sends the PPS again.
+fn dcn401_uhbr_dsc_stream_sends_pps_through_hpo_like_linux() -> TestResult {
+    let (p, stream, pipe) = (2, 1, 3);
+    let settings = UhbrSettings {
+        lanes: 4,
+        rate: UhbrRate::Uhbr10,
+        mst: false,
+    };
+    let cfg = hpo_dsc_config();
+    let (mut e, mut sink, req, c) = uhbr_dsc_fixture(p, stream, pipe, settings, cfg);
+    // The pipe's DSC compresses from the staged timing, before the link.
+    let forward = BASE + (0x1a64 + u64::from(pipe)) * 4;
+    if e.io.inner.regs[&forward] & 1 != 1 {
+        return TestResult::Fail("DSC staged with the timing");
+    }
+    sink.steps.clear();
+    e.io.inner.writes.clear();
+    let v = match run(e.start_uhbr_video(&mut sink, path(p), stream, pipe, c)) {
+        Ok(v) => v,
+        Err(err) => panic!("UHBR DSC video: {err:?}"),
+    };
+    let r =
+        |e: &Engine<UhbrIo>, reg: u64| e.io.inner.regs.get(&hpo(stream, reg)).copied().unwrap_or(0);
+    if r(&e, 0x3661) & 0x331 != 0x101 {
+        return TestResult::Fail("compressed pixel encoding");
+    }
+    // The PPS words, exactly as the legacy (Linux-matched) builder packs
+    // them, after each packet's header.
+    let regs = crate::amdgpu_dcn401_otg::dsc_hw::dsc_registers(&req, &cfg).unwrap();
+    let pps = crate::amdgpu_dsc::pack_pps(&regs.pps);
+    let mut want = Vec::new();
+    for chunk in pps.chunks_exact(32) {
+        want.push(0x007f_1000);
+        want.extend(
+            chunk
+                .chunks_exact(4)
+                .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])),
+        );
+    }
+    let w = &e.io.inner.writes;
+    let data: Vec<u32> = w
+        .iter()
+        .filter(|&&(at, _)| at == hpo(stream, 0x3652))
+        .map(|&(_, v)| v)
+        .collect();
+    let index: Vec<u32> = w
+        .iter()
+        .filter(|&&(at, _)| at == hpo(stream, 0x3651))
+        .map(|&(_, v)| v & 0xff)
+        .collect();
+    if data != want || index != [99, 108, 117, 126] || r(&e, 0x3654) & 0x7800 != 0x7800 {
+        return TestResult::Fail("PPS in VPG generic packets 11-14");
+    }
+    if r(&e, 0x3677) & 0xffff_0061 != (2 << 16 | 3 << 5 | 1)
+        || r(&e, 0x3684) & 0xffff_0001 != 3 << 16
+        || r(&e, 0x367b) & 1 != 1
+    {
+        return TestResult::Fail("GSP11 and VBID[6]");
+    }
+    // Order: payload size before the packets, enable after them, all
+    // before the VC rate; the sink decodes DSC before the payload table.
+    let pos = |at: u64, f: &dyn Fn(u32) -> bool| w.iter().position(|&(a, v)| a == at && f(v));
+    let size = pos(hpo(stream, 0x3677), &|v| v & 0x60 == 0x60).unwrap();
+    let first = pos(hpo(stream, 0x3652), &|_| true).unwrap();
+    let on = pos(hpo(stream, 0x3677), &|v| v & 1 == 1).unwrap();
+    let last = w
+        .iter()
+        .rposition(|&(a, _)| a == hpo(stream, 0x3652))
+        .unwrap();
+    let rate = pos(hpo(LINK, 0x36b9 + u64::from(stream)), &|v| v != 0).unwrap();
+    if !(size < first && last < on && on < rate) {
+        return TestResult::Fail("PPS programming order");
+    }
+    let dpcd = writes(&sink);
+    let enable = dpcd
+        .iter()
+        .position(|w| (w.0, &w.1[..]) == (0x160, &[1][..]));
+    let table = dpcd.iter().position(|w| w.0 == 0x2c0);
+    if enable.is_none() || enable >= table {
+        return TestResult::Fail("DP_DSC_ENABLE before the payload");
+    }
+    let payload = v.payload;
+    if (payload.slots, payload.vc_rate >> 25, payload.hblank_symbols) != (3, 2, 18)
+        || dpcd[table.unwrap() + 3] != (0x1c2, vec![3], 2)
+        || e.io.inner.regs[&hpo(LINK, 0x36bf)] & 0x7f07 != u32::from(stream) | 3 << 8
+        || r(&e, 0x366b) != 18
+    {
+        panic!("compressed payload {payload:x?}");
+    }
+    // dc_dsc_stream_bandwidth_in_kbps (its slice overhead rounded up in
+    // fixed point) x 64 / 38,564,000 = 2 + the remainder slots.
+    let kbps = crate::amdgpu_dsc::dsc_kbps(
+        &crate::amdgpu_dcn401_otg::dsc_hw::dsc_timing(&req.timing, 8),
+        128,
+        2,
+    );
+    assert!((1_222_560..=1_222_561).contains(&kbps), "{kbps}");
+    let y = ((u64::from(kbps) * 64 - 2 * 38_564_000) << 25).div_ceil(38_564_000) as u32;
+    if payload.vc_rate != 2 << 25 | y {
+        return TestResult::Fail("compressed VC rate");
+    }
+    sink.steps.clear();
+    e.io.inner.writes.clear();
+    run(e.stop_uhbr_video(&mut sink, path(p))).unwrap();
+    let w = &e.io.inner.writes;
+    let encoder_off = w
+        .iter()
+        .position(|&(a, v)| a == hpo(stream, 0x365d) && v & 1 == 0)
+        .unwrap();
+    let pps_off = w
+        .iter()
+        .position(|&(a, v)| a == hpo(stream, 0x3677) && v & 0x61 == 0)
+        .unwrap();
+    if sink.bytes.get(&0x160) != Some(&0)
+        || r(&e, 0x3677) & 0x61 != 0
+        || pps_off < encoder_off
+        || e.status.state != State::UhbrLinkTrained(p)
+    {
+        return TestResult::Fail("DSC stop");
+    }
+    if e.io.inner.regs[&forward] & 1 != 1 {
+        return TestResult::Fail("DSC kept for restart");
+    }
+    run(e.start_uhbr_video(&mut sink, path(p), stream, pipe, c)).unwrap();
+    if sink.bytes.get(&0x160) != Some(&1) || r(&e, 0x3677) & 1 != 1 {
+        return TestResult::Fail("DSC restart");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_uhbr_dsc_stream_sends_pps_through_hpo_like_linux
+);
+
+/// A sink that does not take DP_DSC_ENABLE fails the start before the
+/// PPS or the payload.
+fn dcn401_uhbr_dsc_refusals() -> TestResult {
+    let (p, stream, pipe) = (2, 1, 3);
+    let settings = UhbrSettings {
+        lanes: 4,
+        rate: UhbrRate::Uhbr10,
+        mst: false,
+    };
+    let (mut e, mut sink, _, c) = uhbr_dsc_fixture(p, stream, pipe, settings, hpo_dsc_config());
+    // The sink's DSC_ENABLE reads back 0 whatever is written.
+    sink.deaf = Some(0x160);
+    sink.steps.clear();
+    let result = run(e.start_uhbr_video(&mut sink, path(p), stream, pipe, c));
+    if result.is_ok()
+        || e.io
+            .inner
+            .regs
+            .get(&hpo(stream, 0x3677))
+            .copied()
+            .unwrap_or(0)
+            & 1
+            != 0
+        || writes(&sink).iter().any(|w| w.0 == 0x2c0)
+    {
+        return TestResult::Fail("DSC refused by the sink");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/dcn401-otg", dcn401_uhbr_dsc_refusals);
+
+/// An MST DSC stream over 128b/132b, as link_set_dpms_on runs one: the
+/// stream is prepared blank with its VC rate from the compressed
+/// bandwidth (dc_dsc_stream_bandwidth_in_kbps, as amdgpu_dm's PBN), the
+/// manager writes the payload, and the PPS goes out in the stream's own
+/// GSP11 before it unblanks; stopping it turns GSP11 off. (The decoder's
+/// DP_DSC_ENABLE is the MST manager's, through the branch.)
+fn dcn401_uhbr_mst_dsc_stream_sends_its_own_pps() -> TestResult {
+    let (p, stream, pipe) = (2, 1, 3);
+    let settings = UhbrSettings {
+        lanes: 4,
+        rate: UhbrRate::Uhbr10,
+        mst: true,
+    };
+    let cfg = hpo_dsc_config();
+    let (mut e, _, req, c) = uhbr_dsc_fixture(p, stream, pipe, settings, cfg);
+    let ready = match run(e.prepare_uhbr_mst_stream(path(p), stream, pipe, c, 3)) {
+        Ok(ready) => ready,
+        Err(err) => panic!("MST DSC prepare {err:?}"),
+    };
+    let r =
+        |e: &Engine<UhbrIo>, reg: u64| e.io.inner.regs.get(&hpo(stream, reg)).copied().unwrap_or(0);
+    let Some((rate, hblank)) =
+        crate::amdgpu_dcn401_otg::uhbr_mst_dsc_rate(&req.timing, &cfg, settings)
+    else {
+        return TestResult::Fail("compressed MST rate");
+    };
+    if ready.payload.vc_rate != rate
+        || ready.payload.hblank_symbols != hblank
+        || rate >> 25 != 2
+        || r(&e, 0x3677) & 1 != 0
+    {
+        panic!("prepared MST DSC stream {:x?}", ready.payload);
+    }
+    e.io.inner.writes.clear();
+    let table = [MstAllocation { stream, slots: 3 }];
+    if uhbr_mst_payload(&mut e, p, &table).is_err() || run(e.start_uhbr_mst_video(path(p))).is_err()
+    {
+        return TestResult::Fail("MST DSC video");
+    }
+    let w = &e.io.inner.writes;
+    let headers = w
+        .iter()
+        .filter(|&&(at, v)| at == hpo(stream, 0x3652) && v == 0x007f_1000)
+        .count();
+    let on = w
+        .iter()
+        .position(|&(a, v)| a == hpo(stream, 0x3677) && v & 1 == 1);
+    let unblank = w.iter().rposition(|&(a, _)| a == hpo(stream, 0x3685));
+    if headers != 4
+        || on.is_none()
+        || unblank.is_none()
+        || on > unblank
+        || r(&e, 0x3685) & 0x101 != 0x101
+    {
+        panic!("PPS before unblank: {headers} headers, GSP11 on {on:?}, unblank {unblank:?}");
+    }
+    if run(e.blank_uhbr_mst_video(path(p))).is_err()
+        || run(e.set_uhbr_mst_vc_rate(p, stream, (0, 0))).is_err()
+        || run(e.update_uhbr_mst_allocation(p, &[])).is_err()
+        || run(e.stop_uhbr_mst_stream(path(p))).is_err()
+        || r(&e, 0x3677) & 0x61 != 0
+    {
+        return TestResult::Fail("MST DSC stop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_uhbr_mst_dsc_stream_sends_its_own_pps
+);
+
+/// A 128b/132b stream's info packets as dcn31_hpo_dp_stream_enc_update_dp_info_packets
+/// sends them: on a VSC-colorimetry sink with BT.2020 RGB and HDR metadata,
+/// mod_build_vsc_infopacket's VSC SDP in VPG packet 0 and the HDR SDP in
+/// packet 3 (each with an immediate update), GSP0 and GSP3 continuously
+/// transmitting (GSP2/GSP5 off), MSA MISC1 bit 6, all before the unblank.
+/// New metadata rewrites packet 3 only; stopping turns the GSPs off. The
+/// MST prepare sends the same packets for its stream.
+fn dcn401_uhbr_stream_sends_vsc_and_hdr_sdps_like_linux() -> TestResult {
+    use crate::amdgpu_hdr::{
+        hdr_info_packet, vsc_sdp, DcColorSpace, HdrConnector, HdrOutputMetadata, PixelEncoding,
+    };
+    let (p, stream, pipe) = (2, 1, 3);
+    let settings = UhbrSettings {
+        lanes: 4,
+        rate: UhbrRate::Uhbr10,
+        mst: false,
+    };
+    let mut blob = [0u8; 32];
+    blob[4] = 2; // SMPTE ST 2084
+    for (i, b) in blob[6..30].iter_mut().enumerate() {
+        *b = 0x10 + i as u8;
+    }
+    let meta = HdrOutputMetadata::from_blob(&blob).unwrap();
+    let hdr = hdr_info_packet(Some(&meta), HdrConnector::DisplayPort);
+    let sdp = UhbrSdp {
+        vsc_colorimetry: true,
+        hdr: Some(hdr),
+    };
+    let (mut e, mut sink) = uhbr_fixture(p, settings);
+    let req = request(pipe);
+    let c = clock(req);
+    run(e.prepare(req, c)).unwrap();
+    e.io.inner.retiring = [false; 4];
+    let blank = BlankRequest {
+        colorspace: DcColorSpace::Rgb2020Full,
+        ..blank_request(pipe)
+    };
+    run(e.prepare_blank(blank, c)).unwrap();
+    let bank1 = e.layout.dio_clock - 0xa0 * 4;
+    e.io.inner
+        .regs
+        .insert(bank1 + (0x80 + 4 * u64::from(pipe)) * 4, 0x1090);
+    e.io.inner.regs.insert(bank1 + 0x68 * 4, 4 << (pipe * 3));
+    for h in 0..4 {
+        e.io.inner.regs.insert(BASE + (0x5f4 + h * 0xdc) * 4, 3);
+    }
+    sink.status = VecDeque::from([status(7, 0xd, [0; 4])]);
+    run(e.train_uhbr_link(&mut sink, path(p), settings, LINK)).unwrap();
+    route_uhbr_stream(&mut e, p, stream, pipe);
+    e.io.inner.writes.clear();
+    let v = run(e.start_uhbr_video_with(&mut sink, path(p), stream, pipe, c, sdp)).unwrap();
+    assert_eq!(v.sdp, sdp);
+    let r =
+        |e: &Engine<UhbrIo>, reg: u64| e.io.inner.regs.get(&hpo(stream, reg)).copied().unwrap_or(0);
+    let vsc = vsc_sdp(
+        true,
+        DcColorSpace::Rgb2020Full,
+        PixelEncoding::Rgb,
+        8,
+        false,
+    )
+    .unwrap();
+    // BT.2020 RGB colorimetry (6), 8 bpc (1), full range.
+    assert_eq!((vsc.sb[16], vsc.sb[17]), (0x06, 0x01));
+    let w = &e.io.inner.writes;
+    let data: Vec<u32> = w
+        .iter()
+        .filter(|&&(at, _)| at == hpo(stream, 0x3652))
+        .map(|&(_, v)| v)
+        .collect();
+    let index: Vec<u32> = w
+        .iter()
+        .filter(|&&(at, _)| at == hpo(stream, 0x3651))
+        .map(|&(_, v)| v & 0xff)
+        .collect();
+    let mut want = vsc.words().to_vec();
+    want.extend(hdr.words());
+    assert_eq!(data, want);
+    assert_eq!(index, [0, 27]);
+    assert_eq!(r(&e, 0x3654) & 0x9, 0x9, "immediate updates");
+    for (reg, on) in [
+        (0x366c, 1),
+        (0x366e, 0),
+        (0x366f, 1),
+        (0x3671, 0),
+        (0x367b, 1),
+    ] {
+        assert_eq!(r(&e, reg) & 1, on, "GSP/SDP {reg:#x}");
+    }
+    // MSA6 lane 3 MISC0 (8 bpc, nothing for BT.2020), MSA7 lane 3 MISC1.
+    assert_eq!(r(&e, 0x3668) >> 24, 0x20);
+    assert_eq!(r(&e, 0x3669) >> 24, 0x40);
+    assert_eq!(
+        crate::amdgpu_hdr::hpo_msa_misc(DcColorSpace::Rgb2020Full, PixelEncoding::Rgb, 8, true),
+        (0x20, 0x40)
+    );
+    // Packets before the unblank (VID_STREAM enable).
+    let last_packet = w
+        .iter()
+        .rposition(|&(at, _)| at == hpo(stream, 0x3652))
+        .unwrap();
+    let unblank = w
+        .iter()
+        .position(|&(at, v)| at == hpo(stream, 0x3685) && v & 1 != 0)
+        .unwrap();
+    assert!(last_packet < unblank);
+    // Live metadata: packet 3 only.
+    let mut blob2 = blob;
+    blob2[26] = 0x55;
+    let hdr2 = hdr_info_packet(
+        Some(&HdrOutputMetadata::from_blob(&blob2).unwrap()),
+        HdrConnector::DisplayPort,
+    );
+    e.io.inner.writes.clear();
+    run(e.uhbr_update_hdr(hdr2)).unwrap();
+    let w = &e.io.inner.writes;
+    assert_eq!(
+        w.iter()
+            .filter(|&&(at, _)| at == hpo(stream, 0x3652))
+            .map(|&(_, v)| v)
+            .collect::<Vec<_>>(),
+        hdr2.words()
+    );
+    assert!(w
+        .iter()
+        .filter(|&&(at, _)| at == hpo(stream, 0x3651))
+        .all(|&(_, v)| v & 0xff == 27));
+    assert_eq!(e.status.uhbr_video_running.unwrap().sdp.hdr, Some(hdr2));
+    assert_eq!(
+        run(e.uhbr_update_hdr(crate::amdgpu_hdr::InfoPacket::default())),
+        Err(Error::Invalid)
+    );
+    run(e.stop_uhbr_video(&mut sink, path(p))).unwrap();
+    for reg in [0x366c, 0x366e, 0x366f, 0x3671] {
+        assert_eq!(r(&e, reg) & 1, 0);
+    }
+    // Without HDR metadata, a stream refuses a metadata update.
+    unroute_uhbr_stream(&mut e, stream);
+    route_uhbr_stream(&mut e, p, stream, pipe);
+    let plain = run(e.start_uhbr_video(&mut sink, path(p), stream, pipe, c)).unwrap();
+    assert_eq!(plain.sdp, UhbrSdp::default());
+    assert_eq!(r(&e, 0x3669) >> 24, 0);
+    assert_eq!(run(e.uhbr_update_hdr(hdr)), Err(Error::Invalid));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_uhbr_stream_sends_vsc_and_hdr_sdps_like_linux
+);
+
+/// An MST stream on a 128b/132b link prepares with its own VSC/HDR SDPs
+/// (enc401/dcn31 update_dp_info_packets per stream encoder): packets
+/// 0 and 3 written and GSP0/GSP3 on while the stream is still blank.
+fn dcn401_uhbr_mst_stream_sends_its_own_sdps() -> TestResult {
+    use crate::amdgpu_hdr::{hdr_info_packet, HdrConnector, HdrOutputMetadata};
+    let (p, s0, p0) = (2u8, 1u8, 1u8);
+    let settings = UhbrSettings {
+        lanes: 4,
+        rate: UhbrRate::Uhbr10,
+        mst: true,
+    };
+    let (mut e, mut sink) = uhbr_fixture(p, settings);
+    for h in 0..4 {
+        e.io.inner.regs.insert(BASE + (0x5f4 + h * 0xdc) * 4, 3);
+    }
+    sink.status = VecDeque::from([status(7, 0xd, [0; 4])]);
+    sink.bytes.insert(0x111, 7);
+    let c0 = stage_uhbr_timing(&mut e, p0).unwrap();
+    run(e.train_uhbr_link(&mut sink, path(p), settings, LINK)).unwrap();
+    route_uhbr_stream(&mut e, p, s0, p0);
+    let mut blob = [0u8; 32];
+    blob[4] = 3;
+    let hdr = hdr_info_packet(
+        Some(&HdrOutputMetadata::from_blob(&blob).unwrap()),
+        HdrConnector::DisplayPort,
+    );
+    let sdp = UhbrSdp {
+        vsc_colorimetry: false,
+        hdr: Some(hdr),
+    };
+    e.io.inner.writes.clear();
+    let ready = run(e.prepare_uhbr_mst_stream_with(path(p), s0, p0, c0, 6, sdp)).unwrap();
+    assert_eq!(ready.sdp, sdp);
+    let r = |e: &Engine<UhbrIo>, reg: u64| e.io.inner.regs.get(&hpo(s0, reg)).copied().unwrap_or(0);
+    // No VSC (the sink takes no colorimetry in it): HDR only, MISC1 clear.
+    for (reg, on) in [(0x366c, 0), (0x366f, 1), (0x367b, 1)] {
+        assert_eq!(r(&e, reg) & 1, on);
+    }
+    assert_eq!(r(&e, 0x3669) >> 24, 0);
+    let data: Vec<u32> =
+        e.io.inner
+            .writes
+            .iter()
+            .filter(|&&(at, _)| at == hpo(s0, 0x3652))
+            .map(|&(_, v)| v)
+            .collect();
+    assert_eq!(data, hdr.words());
+    assert_eq!(e.status.state, State::UhbrStreamReady(s0));
+    // A drifted GSP fails the ready witness the payload steps recheck.
+    let at = hpo(s0, 0x366f);
+    let saved = e.io.inner.regs[&at];
+    e.io.inner.regs.insert(at, saved & !1);
+    assert_eq!(
+        run(e.start_uhbr_mst_video(path(p))),
+        Err(Error::Readback(at))
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_uhbr_mst_stream_sends_its_own_sdps
 );

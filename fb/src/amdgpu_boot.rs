@@ -109,6 +109,34 @@ pub(super) fn start() -> InitResult {
         // SAFETY: the retained prepared owner and paused CPU writers persist.
         let result = narf_scheduler::block_on_spin(unsafe { navi48::run() });
         completed(generation, result, navi48::status());
+        if result.is_ok() {
+            // Automatic GPU recovery (Linux `amdgpu.gpu_recovery`), as for
+            // RX 6000: kernel boot-framebuffer writers go behind the console
+            // hook first; recovery withdraws the native scanout itself.
+            navi48::set_recovery_console_hook(recovery_console);
+            // SAFETY: the console hook pauses every kernel framebuffer
+            // writer for the reset; user VRAM mappings follow Linux (not
+            // revoked, contents lost).
+            unsafe { navi48::set_automatic_recovery(options.gpu_recovery) };
+            // S3 through the async system-PM phase (evict VRAM, quiesce,
+            // save PCI state; resume posts and re-runs bring-up).
+            // SAFETY: same console hook and user-mapping policy as recovery.
+            unsafe { navi48::register_system_pm() };
+            // Runtime PM (`amdgpu.runpm`, BACO/BAMACO autosuspend). A kernel
+            // console drawing into this GPU's VRAM, the boot framebuffer or
+            // the native scanout, keeps it active, as fbcon's lit display
+            // keeps Linux's dGPU awake.
+            let runpm = narf_drivers_gpu::amdgpu_navi48_runtime_pm::parse_runpm(
+                narf_boot::args().value("amdgpu.runpm"),
+            );
+            let console_on_gpu =
+                !console_off_gpu || narf_boot::args().has_flag("amdgpu.native_display");
+            // SAFETY: the S3 contract above (console hook, user mappings)
+            // covers runtime suspend, which never pauses the console.
+            narf_scheduler::block_on_spin(unsafe {
+                narf_drivers_gpu::amdgpu_navi48_runtime_pm::register(runpm, console_on_gpu)
+            });
+        }
         result.is_ok()
     } else {
         let args = narf_boot::args();

@@ -243,6 +243,141 @@ pub fn pm_d3hot_cycle(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice) -> Res
     Ok(())
 }
 
+/// PCI PM 1.2 §5.4 / Linux `pci_pm_d3hot_delay`: the minimum interval after
+/// a D3hot↔D0 PowerState write before the next config access.
+pub const PM_D3HOT_DELAY_MS: u64 = 10;
+
+/// The PowerState field of PMCSR (PCI PM 1.2 §3.2.4).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PciPowerState {
+    D0,
+    D1,
+    D2,
+    D3Hot,
+}
+
+impl PciPowerState {
+    const fn bits(self) -> u16 {
+        match self {
+            PciPowerState::D0 => 0,
+            PciPowerState::D1 => 1,
+            PciPowerState::D2 => 2,
+            PciPowerState::D3Hot => 3,
+        }
+    }
+    const fn from_bits(bits: u16) -> Self {
+        match bits & PM_PMCSR_STATE_MASK {
+            0 => PciPowerState::D0,
+            1 => PciPowerState::D1,
+            2 => PciPowerState::D2,
+            _ => PciPowerState::D3Hot,
+        }
+    }
+}
+
+fn pmcsr_offset(device: &BusDevice) -> Result<u64, PciError> {
+    // SAFETY: walking the cap-list on identity-mapped PCIe ECAM.
+    match unsafe { crate::pci_cap::find_cap(device, PM_CAP_ID) } {
+        Ok(Some(off)) => Ok(off + PM_PMCSR_OFFSET),
+        _ => Err(PciError::CapNotPresent),
+    }
+}
+
+/// Read PMCSR's PowerState (Linux `pci_read_config_word(PCI_PM_CTRL)`).
+/// `Ok(None)` when the function reads all-ones (gone from the bus).
+pub fn power_state(
+    cap: &Cap<BusDeviceCap, Write>,
+    device: &BusDevice,
+) -> Result<Option<PciPowerState>, PciError> {
+    cap.check_live()?;
+    let off = pmcsr_offset(device)?;
+    let cfg = pcie_cfg_phys(device)?;
+    // SAFETY: PMCSR is a 2-byte aligned register inside the PM capability.
+    let pmcsr = unsafe { cfg_read16(cfg, off) };
+    Ok((pmcsr != u16::MAX).then_some(PciPowerState::from_bits(pmcsr)))
+}
+
+/// Write PMCSR's PowerState, preserving every other field and writing 0
+/// to the RW1C PME_Status bit (Linux `pci_raw_set_power_state`'s PMCSR
+/// update). Performs no delay: the caller waits [`PM_D3HOT_DELAY_MS`]
+/// after a D3hot entry or exit before the next config access, with an
+/// async sleep. D1/D2 are refused unless the PMC register advertises them.
+pub fn set_power_state(
+    cap: &Cap<BusDeviceCap, Write>,
+    device: &BusDevice,
+    state: PciPowerState,
+) -> Result<(), PciError> {
+    cap.check_live()?;
+    let off = pmcsr_offset(device)?;
+    let cfg = pcie_cfg_phys(device)?;
+    // SAFETY: PMC (cap + 2) and PMCSR are inside the PM capability.
+    let pmc = unsafe { cfg_read16(cfg, off - PM_PMCSR_OFFSET + 2) };
+    let supported = match state {
+        PciPowerState::D1 => pmc & (1 << 9) != 0,
+        PciPowerState::D2 => pmc & (1 << 10) != 0,
+        PciPowerState::D0 | PciPowerState::D3Hot => true,
+    };
+    if !supported {
+        return Err(PciError::CapNotPresent);
+    }
+    // SAFETY: same register; the live Write cap proves device authority.
+    unsafe {
+        let pmcsr = cfg_read16(cfg, off);
+        // linux-lit: 0x8000=PCI_PM_CTRL_PME_STATUS (RW1C)
+        cfg_write16(
+            cfg,
+            off,
+            (pmcsr & !PM_PMCSR_STATE_MASK & !0x8000) | state.bits(),
+        );
+    }
+    Ok(())
+}
+
+/// A type-1 (bridge) header's secondary and subordinate bus numbers
+/// (cfg 0x19 / 0x1A), or `None` for a type-0 function.
+pub fn bridge_bus_range(device: &BusDevice) -> Option<(u8, u8)> {
+    let cfg = pcie_cfg_phys(device).ok()?;
+    // SAFETY: header-type and bus-number bytes are inside the 64-byte header.
+    let (header, secondary, subordinate) = unsafe {
+        (
+            cfg_read8(cfg, 0x0E),
+            cfg_read8(cfg, 0x19),
+            cfg_read8(cfg, 0x1A),
+        )
+    };
+    (header != u8::MAX && header & 0x7f == 1).then_some((secondary, subordinate))
+}
+
+/// Linux `pci_upstream_bridge`: the bridge whose secondary bus is this
+/// function's bus, among the registered devices. `None` for a function on
+/// a root bus (or a non-PCIe device).
+pub fn upstream_bridge(device: &BusDevice) -> Option<BusDevice> {
+    let BusKind::Pcie { addr, .. } = device.kind else {
+        return None;
+    };
+    crate::registry::devices().into_iter().find(|candidate| {
+        let BusKind::Pcie { addr: bridge, .. } = candidate.kind else {
+            return false;
+        };
+        bridge.segment == addr.segment
+            && bridge != addr
+            && bridge_bus_range(candidate).is_some_and(|(secondary, _)| secondary == addr.bus)
+    })
+}
+
+/// Another function of the same PCI device (Linux
+/// `pci_get_domain_bus_and_slot(domain, bus, PCI_DEVFN(slot, function))`).
+pub fn sibling_function(device: &BusDevice, function: u8) -> Option<BusDevice> {
+    let BusKind::Pcie { addr, .. } = device.kind else {
+        return None;
+    };
+    crate::registry::devices().into_iter().find(|candidate| {
+        matches!(candidate.kind, BusKind::Pcie { addr: other, .. }
+            if other.segment == addr.segment && other.bus == addr.bus
+                && other.device == addr.device && other.function == function)
+    })
+}
+
 #[inline]
 fn pcie_cfg_phys(device: &BusDevice) -> Result<PhysAddr, PciError> {
     match device.kind {

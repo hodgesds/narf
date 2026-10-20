@@ -62,8 +62,9 @@ fn navi48_jpeg_dispatch_separates_unified_traps_and_keeps_mmhub_fault_scope() ->
     let mut wait = core::pin::pin!(wait_in(&table, jpeg, far(), || done.get().then_some(7)));
     assert!(poll(wait.as_mut()).is_pending());
     for (client, source, vmid, pasid, expected) in [
-        (0x10, 154, 0, 0, Delivery::Ignored),
-        (0x0e, 153, 0, 0, Delivery::Unowned),
+        (0x10, 154, 0, 0, Delivery::Unhandled),
+        // jpeg_v5_0_0 registers only on the VCN client.
+        (0x0e, 153, 0, 0, Delivery::Unhandled),
         (0x10, 153, 1, 0, Delivery::Unowned),
         (0x10, 153, 0, 1, Delivery::Unowned),
         (0x10, 119, 0, 0, Delivery::Signaled),
@@ -123,8 +124,8 @@ fn navi48_vcn_dispatch_requires_registered_unified_source_and_owned_context() ->
         (0x0e, 119, 0, 0, Delivery::Unowned),
         (0x10, 119, 1, 0, Delivery::Unowned),
         (0x10, 119, 0, 1, Delivery::Unowned),
-        (0x10, 114, 0, 0, Delivery::Ignored),
-        (0x10, 120, 0, 0, Delivery::Ignored),
+        (0x10, 114, 0, 0, Delivery::Unhandled),
+        (0x10, 120, 0, 0, Delivery::Unhandled),
         (0x10, 153, 0, 0, Delivery::Unowned),
     ] {
         assert_eq!(
@@ -244,13 +245,13 @@ fn navi48_dispatch_routes_completions_only_to_exact_live_owners() -> TestResult 
         Delivery::Signaled
     );
     // Diagnostics and unknown vectors are never completions.
-    for e in [
-        iv(CLIENT_GFX, 239, 0, 0, 0, 0),
-        iv(CLIENT_GFX, 177, 0, 0, 0, 0),
-        iv(0x0f, 0, 0, 0, 0, 0),
-        iv(0x1b, 0, 0, 0, 0, 0),
+    for (e, expected) in [
+        (iv(CLIENT_GFX, 239, 0, 0, 0, 0), Delivery::Ignored),
+        (iv(CLIENT_GFX, 177, 0, 0, 0, 0), Delivery::Unhandled),
+        (iv(0x0f, 0, 0, 0, 0, 0), Delivery::Ignored),
+        (iv(0x1b, 0, 0, 0, 0, 0), Delivery::Unhandled),
     ] {
-        assert_eq!(route(&t, e), Delivery::Ignored);
+        assert_eq!(route(&t, e), expected);
     }
     let s = t.lock().summary();
     assert_eq!(s.live, 3);
@@ -420,7 +421,8 @@ fn navi48_dispatch_terminal_errors_release_every_waiter_and_refuse_new_work() ->
     for terminal in [
         Terminal::DeviceGone,
         Terminal::Interrupts(ih::Error::Overflow(0)),
-        Terminal::Poison(src::Poison::Utcl2),
+        Terminal::Ras(ras::Fatal::Umc { ce: 1, ue: 2 }),
+        Terminal::Ras(ras::Fatal::Athub { raw: 4 }),
     ] {
         let t = IrqSafeSpinLock::new(Table::new());
         let a = t.lock().register(kernel(Key::Cp(GFX))).unwrap();
@@ -431,14 +433,12 @@ fn navi48_dispatch_terminal_errors_release_every_waiter_and_refuse_new_work() ->
         assert!(poll(wa.as_mut()).is_pending());
         assert!(poll(wb.as_mut()).is_pending());
         assert!(poll(wd.as_mut()).is_pending());
-        if let Terminal::Poison(_) = terminal {
-            assert_eq!(
-                route(&t, iv(CLIENT_GFX, 1, 0, 0, 0, 0)),
-                Delivery::Terminal(terminal)
-            );
-        } else {
-            t.lock().fail_all(terminal);
-        }
+        // A poison IV by itself is not terminal: the service's RAS monitor
+        // decides, and on Navi48 Linux mostly does nothing.
+        assert_eq!(route(&t, iv(CLIENT_GFX, 1, 0, 0, 0, 0)), Delivery::Ignored);
+        assert!(poll(wa.as_mut()).is_pending());
+        assert_eq!(t.lock().summary().counters.poison, 1);
+        t.lock().fail_all(terminal);
         let e = Err(WaitError::Terminal(terminal));
         assert_eq!(poll(wa.as_mut()), Poll::Ready(e));
         assert_eq!(poll(wb.as_mut()), Poll::Ready(e));
@@ -742,4 +742,106 @@ fn navi48_dispatch_pasid_survives_vmid_reuse_and_latches_stay_on_their_hub() -> 
 kernel_test_in!(
     "drivers/gpu/navi48-interrupts",
     navi48_dispatch_pasid_survives_vmid_reuse_and_latches_stay_on_their_hub
+);
+
+fn navi48_dispatch_follows_linux_owner_priority_instances_and_evidence() -> TestResult {
+    let t = IrqSafeSpinLock::new(Table::new());
+    // Only identities Linux has kernel rings for may register.
+    for key in [
+        Key::Cp(src::Queue::from_ring(0x0c)),
+        Key::Sdma {
+            instance: 2,
+            queue: 0,
+        },
+        Key::Sdma {
+            instance: 0,
+            queue: 1,
+        },
+        Key::Jpeg { instance: 1 },
+    ] {
+        assert_eq!(t.lock().register(kernel(key)), Err(RegisterError::Invalid));
+    }
+    let slot = src::Queue::from_ring(0x14);
+    let kq = t.lock().register(kernel(Key::Cp(slot))).unwrap();
+    let uq = t.lock().register(user(0x20)).unwrap();
+    // amdgpu_gfx_handle_priv_fault: the kernel ring at the slot wins even if
+    // context ID 0 carries a doorbell.
+    assert_eq!(
+        route(&t, iv(CLIENT_GFX, 184, 0x14, 3, 5, 0x20)),
+        Delivery::Faulted(1)
+    );
+    assert!(t.lock().endpoint(kq).unwrap().fault.is_some());
+    assert_eq!(t.lock().endpoint(uq).unwrap().fault, None);
+    // Without a kernel ring the doorbell names a user queue only in the IV's
+    // address space (amdgpu_userq_process_reset_irq matches the PASID).
+    let other = src::Queue::from_ring(0x24);
+    assert_eq!(
+        route(&t, iv(CLIENT_GFX, 183, 0x24, 3, 6, 0x20)),
+        Delivery::Unattributed
+    );
+    assert_eq!(t.lock().endpoint(uq).unwrap().fault, None);
+    assert_eq!(
+        route(&t, iv(CLIENT_GFX, 183, 0x24, 3, 5, 0x420)),
+        Delivery::Faulted(1)
+    );
+    assert_eq!(
+        t.lock().endpoint(uq).unwrap().fault,
+        Some(src::Fault::Command {
+            fault: src::CommandFault::BadOpcode,
+            queue: other
+        })
+    );
+    // sdma_v7_0_process_trap_irq: instance > 1 is malformed; queue != 0 has
+    // no kernel ring. Neither is ever a completion.
+    let sdma = t
+        .lock()
+        .register(kernel(Key::Sdma {
+            instance: 1,
+            queue: 0,
+        }))
+        .unwrap();
+    for ring in [0x20, 0x11, 0xf0] {
+        assert_eq!(
+            route(&t, iv(CLIENT_GFX, 49, ring, 0, 0, 0)),
+            Delivery::Unhandled
+        );
+    }
+    assert_eq!(t.lock().endpoint(sdma).unwrap().stats.signals, 0);
+    assert_eq!(
+        route(&t, iv(CLIENT_GFX, 49, 0x10, 0, 0, 0)),
+        Delivery::Signaled
+    );
+    // Poison is evidence for the RAS monitor, never terminal by itself.
+    let mut w = core::pin::pin!(wait_in(&t, sdma, far(), || None::<()>));
+    assert!(poll(w.as_mut()).is_pending());
+    for (client, source) in [
+        (CLIENT_GFX, 1),
+        (CLIENT_GFX, 62),
+        (CLIENT_GFX, 201),
+        (0x10, 160),
+        (0x17, 0),
+        (0x03, 0x61),
+    ] {
+        assert_eq!(route(&t, iv(client, source, 0, 0, 0, 0)), Delivery::Ignored);
+    }
+    assert!(poll(w.as_mut()).is_pending());
+    let s = t.lock().summary();
+    assert_eq!((s.terminal, s.counters.poison), (None, 6));
+    assert_eq!(s.counters.unhandled, 3);
+    // Unmatched vectors keep their first and latest IVs as evidence.
+    assert_eq!(
+        s.first_unmatched,
+        Some(iv(CLIENT_GFX, 183, 0x24, 3, 6, 0x20))
+    );
+    assert_eq!(s.last_unmatched, Some(iv(CLIENT_GFX, 49, 0xf0, 0, 0, 0)));
+    assert_eq!(route(&t, iv(0x1b, 7, 0, 0, 0, 0)), Delivery::Unhandled);
+    assert_eq!(
+        t.lock().summary().last_unmatched,
+        Some(iv(0x1b, 7, 0, 0, 0, 0))
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-interrupts",
+    navi48_dispatch_follows_linux_owner_priority_instances_and_evidence
 );

@@ -1,5 +1,7 @@
 //! One retained Navi48 firmware owner, entered by the framebuffer boot handoff.
 //! Preparation is read-only; the caller stops CPU writers before entering it.
+use crate::amdgpu_dcn401_dml as dml;
+use crate::amdgpu_dcn401_otg::SurfaceFormat;
 use crate::amdgpu_navi48_display as display;
 use crate::{amdgpu, amdgpu_navi48_boot as boot, amdgpu_vram_boot as vram};
 use alloc::sync::Arc;
@@ -12,6 +14,8 @@ use narf_lib::mutex::Mutex;
 mod fault_recovery;
 #[path = "amdgpu_navi48_platform_media.rs"]
 mod media_clients;
+#[path = "amdgpu_navi48_platform_transfer.rs"]
+mod transfer;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -352,6 +356,10 @@ fn register_submitter(
             fence,
             sdma_fence: boot.client_sdma_fence_reader(),
             media_fence: narf_lib::sync::IrqSafeSpinLock::new(boot.client_media_fence_reader()),
+            jpeg_fence: narf_lib::sync::IrqSafeSpinLock::new(boot.client_jpeg_fence_reader()),
+            jpeg_slots: narf_lib::sync::IrqSafeSpinLock::new(
+                [None; crate::amdgpu_jpeg_navi48::SLOTS],
+            ),
             contexts: narf_lib::sync::IrqSafeSpinLock::new([(0, 0); RINGS]),
             vmids: narf_lib::sync::IrqSafeSpinLock::new(crate::amdgpu_vmid::VmidManager::new(
                 CLIENT_VMIDS.0,
@@ -362,8 +370,10 @@ fn register_submitter(
                 CLIENT_VMIDS.1,
             )),
             watch: narf_lib::sync::IrqSafeSpinLock::new(watches),
+            device_recovery: core::sync::atomic::AtomicBool::new(false),
         });
         *SUBMITTER.lock() = Some(submitter.clone());
+        crate::amdgpu_info::publish_navi48_video(boot.proven_video());
         crate::amdgpu_cs::register_submitter(card, submitter.clone());
         narf_scheduler::spawn(watchdog(submitter));
     }
@@ -397,16 +407,353 @@ impl Drop for RecoveryOwner {
 /// Stop ALL CPU access to this GPU's VRAM, including userspace mmap and GOP
 /// writers, and exclude other PCI/config/firmware owners until successful
 /// return. Keep these exclusions after failure or cancellation. Clients
-/// must handle lost VRAM contents. This cannot safely run from the watchdog
-/// without an external mechanism providing those exclusions. Hardware unvalidated.
+/// must handle lost VRAM contents. The watchdog runs it automatically only
+/// after `set_automatic_recovery` accepted that contract for every user (see
+/// there). Hardware unvalidated.
 pub async unsafe fn recover() -> Result<boot::Report, boot::Error> {
     let mut owner = OWNER.lock().await;
+    // SAFETY: forwarded caller contract.
+    let quiesced = unsafe { quiesce(&mut owner, boot::ColdBoot::prepare_reset) }.await?;
+    // SAFETY: forwarded caller contract; every accessor was withdrawn.
+    unsafe { restart(&mut owner, quiesced) }.await
+}
+
+/// The owner withdrawn for S3 or runtime PM and the allowed domains
+/// eviction widened.
+struct Suspended {
+    quiesced: Quiesced,
+    domains: Vec<(Arc<crate::amdgpu_gem::GemObject>, u64)>,
+    /// Runtime suspend through BACO/BAMACO: how PMFW was told to enter.
+    baco: Option<Baco>,
+}
+/// How runtime suspend entered BACO (smu_v14_0_2_baco_enter).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Baco {
+    /// The runtime mode is BAMACO (EnterBaco's BACO_SEQ_BAMACO).
+    pub bamaco: bool,
+    /// The audio function is enabled (or absent): ArmD3, PMFW enters BACO
+    /// when the PCI layer moves the functions to D3.
+    pub armd3: bool,
+}
+// SAFETY: only moved between prepare_suspend and resume_from_suspend; the
+// retained owner is never polled while parked here.
+unsafe impl Send for Suspended {}
+static SUSPENDED: narf_lib::sync::IrqSafeSpinLock<Option<Suspended>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+/// Whether the async prepare (system or runtime) parked this card.
+pub fn system_suspended() -> bool {
+    SUSPENDED.lock().is_some()
+}
+/// Linux `amdgpu_pmops_suspend` for the dGPU: evict every client VRAM buffer
+/// to system memory (amdgpu_device_evict_resources, waiting for its jobs),
+/// pause kernel framebuffer writers, withdraw every engine user and the IH
+/// service as recovery does, then save PCI state and clear bus mastering.
+/// A refused eviction or preflight leaves the device running. After this,
+/// only [`resume_from_suspend`] may touch the card.
+///
+/// # Safety
+/// As [`recover`]: no external CPU mapping user, PCI or firmware owner may
+/// touch the card until resume. Runs from the async system-PM prepare phase.
+pub async unsafe fn prepare_suspend() -> Result<(), boot::Error> {
+    // SAFETY: forwarded contract.
+    unsafe { suspend_device(None) }.await
+}
+/// Linux `amdgpu_pmops_runtime_suspend` for BACO/BAMACO after its checks:
+/// drain the rings (amdgpu_fence_wait_empty, bounded here), then
+/// amdgpu_device_prepare + amdgpu_device_suspend(notify_clients = false),
+/// i.e. the S3 eviction and quiesce without pausing the console, then
+/// amdgpu_device_baco_enter. A drain timeout or refused eviction is
+/// `Busy` with the device running. A BACO entry PMFW refuses brings the
+/// card straight back (resume post, mode1 when SOS still runs) and is
+/// returned as a hard error. After success only [`runtime_resume`] may
+/// touch the card; the PCI layer then saves config state and enters D3.
+///
+/// # Safety
+/// As [`prepare_suspend`]. The caller (runtime PM) proved no display is lit
+/// and holds no console writer on this GPU's VRAM.
+pub async unsafe fn runtime_suspend(baco: Baco) -> Result<(), boot::Error> {
+    if !rings_idle(RING_DRAIN_MS).await {
+        return Err(boot::Error::Busy);
+    }
+    // SAFETY: forwarded contract.
+    unsafe { suspend_device(Some(baco)) }.await
+}
+/// How long runtime suspend waits for submitted jobs (the GFX job timeout).
+const RING_DRAIN_MS: u64 = 10_000;
+/// Whether every ring's submitted jobs completed within `ms`, polling the
+/// fences each millisecond. True without a submitter.
+async fn rings_idle(ms: u64) -> bool {
+    let deadline = narf_time::Deadline::after_ms(ms);
+    loop {
+        let submitter = SUBMITTER.lock().clone();
+        let Some(submitter) = submitter else {
+            return true;
+        };
+        if submitter.progress().is_none() {
+            return false;
+        }
+        if !submitter.watch.lock().iter().any(|w| w.busy()) {
+            return true;
+        }
+        if deadline.expired() {
+            return false;
+        }
+        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
+    }
+}
+/// `amdgpu_device_supports_baco` for the running owner.
+pub async fn bamaco_support() -> u8 {
+    OWNER
+        .lock()
+        .await
+        .as_ref()
+        .map_or(0, |b| b.bamaco_support())
+}
+/// The running owner's PCI function and device authority.
+pub(crate) async fn pci_function() -> Option<(
+    narf_bus::BusDevice,
+    narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+)> {
+    OWNER.lock().await.as_ref().map(|b| b.pci_function())
+}
+/// Whether the native display monitor owns the outputs (otherwise the
+/// connector state is unknown and runtime suspend scans the board ports).
+pub(crate) fn native_display_running() -> bool {
+    DISPLAY_GENERATION.load(Ordering::Acquire) != 0
+}
+/// The S3 and runtime suspend shared by amdgpu_device_prepare and
+/// amdgpu_device_suspend; `baco` selects the runtime form.
+///
+/// # Safety
+/// As [`prepare_suspend`].
+async unsafe fn suspend_device(baco: Option<Baco>) -> Result<(), boot::Error> {
+    if SUSPENDED.lock().is_some() {
+        return Err(boot::Error::Busy);
+    }
+    let card = boot::ColdBoot::drm_card().ok_or(boot::Error::Invalid)?;
+    // No new VRAM placement while the old ones leave.
+    crate::amdgpu_gem::unregister_vram_heap(card);
+    let (domains, evicted) = {
+        let gate = crate::amdgpu_gem::lock_placement(card).await;
+        crate::amdgpu_gem::evict_all(&gate).await
+    };
+    let republish = || async {
+        if let Some(boot) = OWNER.lock().await.as_ref() {
+            boot.republish_client_vram();
+        }
+    };
+    if let Err(error) = evicted {
+        crate::amdgpu_gem::restore_domains(domains);
+        republish().await;
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: navi48 suspend refused: VRAM eviction {error:?}"
+        );
+        return Err(boot::Error::Busy);
+    }
+    // amdgpu_device_suspend's drm_client_dev_suspend only for system
+    // suspend: runtime PM never suspends under a console on this GPU.
+    let pause_console = baco.is_none();
+    if pause_console {
+        console(true);
+    }
+    let mut owner = OWNER.lock().await;
+    // SAFETY: forwarded caller contract; client VRAM is empty.
+    let quiesced = match unsafe { quiesce(&mut owner, boot::ColdBoot::prepare_suspend) }.await {
+        Ok(q) => q,
+        Err(error) => {
+            drop(owner);
+            crate::amdgpu_gem::restore_domains(domains);
+            republish().await;
+            if pause_console {
+                console(false);
+            }
+            return Err(error);
+        }
+    };
+    let mut quiesced = quiesced;
+    let boot = quiesced
+        .retained
+        .boot
+        .as_mut()
+        .ok_or(boot::Error::Invalid)?;
+    // SAFETY: quiesce withdrew every engine user, CPU view and IH.
+    if let Err(error) = unsafe { boot.save_for_suspend() } {
+        // Nothing can resume this owner without its PCI state: recover now.
+        boot.cancel_suspend();
+        let restarted = match boot.prepare_reset() {
+            // SAFETY: the same quiesced owner and exclusions.
+            Ok(()) => unsafe { restart(&mut owner, quiesced) }.await.map(|_| ()),
+            Err(e) => Err(e),
+        };
+        drop(owner);
+        crate::amdgpu_gem::restore_domains(domains);
+        if pause_console {
+            console(restarted.is_err());
+        }
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: navi48 suspend refused: PCI state {error:?}; recovery {restarted:?}"
+        );
+        return Err(boot::Error::Busy);
+    }
+    if let Some(baco) = baco {
+        // SAFETY: quiesced, evicted and PCI state saved (bus mastering off).
+        if let Err(error) = unsafe { boot.enter_baco(baco.bamaco, baco.armd3) }.await {
+            // PMFW kept the chip up: bring it back through the resume post
+            // (mode1 while SOS runs), as a failed resume would.
+            // SAFETY: the same quiesced owner; its PCI state was saved.
+            let restarted = unsafe { restart(&mut owner, quiesced) }.await.map(|_| ());
+            drop(owner);
+            crate::amdgpu_gem::restore_domains(domains);
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi48 BACO entry {error:?}; device restart {restarted:?}"
+            );
+            return Err(error);
+        }
+    }
+    *SUSPENDED.lock() = Some(Suspended {
+        quiesced,
+        domains,
+        baco,
+    });
+    Ok(())
+}
+/// Linux `amdgpu_pmops_resume`: restore PCI state, post the cold card
+/// (ATOM ASIC_Init, or mode1 + post when power was never removed), replay
+/// GDDR6 training, then bring up a fresh owner exactly as recovery does.
+/// Evicted buffers stay in system memory until validation promotes them.
+///
+/// # Safety
+/// As [`prepare_suspend`]; after system resume restored the bus.
+pub async unsafe fn resume_from_suspend() -> Result<boot::Report, boot::Error> {
+    // SAFETY: forwarded contract.
+    unsafe { resume_device(false) }.await
+}
+/// Linux `amdgpu_pmops_runtime_resume` for BACO/BAMACO, after the PCI layer
+/// restored D0 and the config header: amdgpu_device_baco_exit (ExitBaco and
+/// the BIOS scratch clear, or ArmD3(ULPS) after 10 ms), then
+/// amdgpu_device_resume: the resume post decides ASIC_Init, GDDR6 training
+/// replays and a fresh owner comes up without reloading the resident SMU
+/// firmware. A failure is terminal, as a failed recovery.
+///
+/// # Safety
+/// As [`resume_from_suspend`]; the parked suspend came from
+/// [`runtime_suspend`].
+pub async unsafe fn runtime_resume() -> Result<boot::Report, boot::Error> {
+    // SAFETY: forwarded contract.
+    unsafe { resume_device(true) }.await
+}
+async unsafe fn resume_device(runtime: bool) -> Result<boot::Report, boot::Error> {
+    let mut suspended = {
+        let mut parked = SUSPENDED.lock();
+        if parked.as_ref().is_none_or(|s| s.baco.is_some() != runtime) {
+            return Err(boot::Error::Busy);
+        }
+        parked.take().unwrap()
+    };
+    if let Some(baco) = suspended.baco {
+        let boot = suspended
+            .quiesced
+            .retained
+            .boot
+            .as_mut()
+            .ok_or(boot::Error::Invalid)?;
+        // SAFETY: parked by runtime_suspend; the PCI layer restored D0.
+        if let Err(error) = unsafe { boot.exit_baco(baco.armd3) }.await {
+            crate::amdgpu_gem::restore_domains(suspended.domains);
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi48 BACO exit {error:?}; device lost"
+            );
+            // Dropping the retained owner quarantines it and marks it lost.
+            return Err(error);
+        }
+    }
+    let mut owner = OWNER.lock().await;
+    // SAFETY: forwarded contract; the parked owner was quiesced and saved.
+    let result = unsafe { restart(&mut owner, suspended.quiesced) }.await;
+    drop(owner);
+    crate::amdgpu_gem::restore_domains(suspended.domains);
+    use core::fmt::Write as _;
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: navi48 {}resume {:?}",
+        if runtime { "runtime " } else { "" },
+        result.as_ref().map(|_| ())
+    );
+    // A lost device keeps the console quarantined, as a failed recovery does.
+    if result.is_ok() && !runtime {
+        console(false);
+    }
+    result
+}
+struct SystemPm;
+impl narf_power::system_pm::AsyncSystemPm for SystemPm {
+    fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        alloc::boxed::Box::pin(async {
+            // device_prepare: a runtime-PM reference for the transition,
+            // resuming a runtime-suspended card first (pci_pm_prepare).
+            crate::amdgpu_navi48_runtime_pm::system_prepare().await;
+            // SAFETY: register_system_pm's caller accepted the contract.
+            let result = unsafe { prepare_suspend() }
+                .await
+                .map_err(|_| narf_power::device_pm::DeviceSuspendError::Busy);
+            if result.is_err() {
+                crate::amdgpu_navi48_runtime_pm::system_complete();
+            }
+            result
+        })
+    }
+    fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        alloc::boxed::Box::pin(async {
+            // SAFETY: as above.
+            let result = unsafe { resume_from_suspend() }
+                .await
+                .map(|_| ())
+                .map_err(|_| narf_power::device_pm::DeviceSuspendError::DriverError);
+            // device_complete: drop the transition's runtime-PM reference.
+            crate::amdgpu_navi48_runtime_pm::system_complete();
+            result
+        })
+    }
+}
+/// Register Navi48 S3 with the async system-PM phase.
+///
+/// # Safety
+/// The caller accepts [`prepare_suspend`]'s contract for every user, as
+/// [`set_automatic_recovery`] does for recovery.
+pub unsafe fn register_system_pm() {
+    narf_power::system_pm::register_async_system_pm("amdgpu-navi48", Arc::new(SystemPm));
+}
+
+/// A withdrawn owner between `quiesce` and `restart`.
+struct Quiesced {
+    retained: RecoveryOwner,
+    old_submitter: Option<Arc<Submitter>>,
+    restart_display: bool,
+}
+/// Run `prepare` (which may refuse with everything still running), then
+/// withdraw CS, client VRAM allocation, scanout, timestamps and the IH
+/// service from the owner, leaving it retained for `restart`.
+///
+/// # Safety
+/// As [`recover`].
+async unsafe fn quiesce(
+    owner: &mut Option<alloc::boxed::Box<boot::ColdBoot>>,
+    prepare: fn(&mut boot::ColdBoot) -> Result<(), boot::Error>,
+) -> Result<Quiesced, boot::Error> {
     if RECOVERY_STATE.load(Ordering::Acquire) & 1 != 0 {
         return Err(boot::Error::Busy);
     }
-    owner.as_mut().ok_or(boot::Error::Busy)?.prepare_reset()?;
+    prepare(owner.as_mut().ok_or(boot::Error::Busy)?)?;
     RECOVERY_STATE.store(1, Ordering::Release);
-    let mut retained = RecoveryOwner {
+    let retained = RecoveryOwner {
         boot: owner.take(),
         armed: true,
     };
@@ -428,19 +775,61 @@ pub async unsafe fn recover() -> Result<boot::Report, boot::Error> {
     crate::amdgpu_navi48_power::stop();
     *CLEARER.lock() = None;
     crate::amdgpu_info::withdraw_navi48_clock();
+    crate::amdgpu_info::publish_navi48_video(0);
     for pipe in 0..4 {
         present_slot(pipe).native.store(false, Ordering::Release);
     }
     crate::amdgpu_dcn_display::publish_external(None, None);
     crate::scanout_access::wait_retired().await;
     crate::amdgpu_navi48_interrupts::stop_for_reset().await;
+    Ok(Quiesced {
+        retained,
+        old_submitter,
+        restart_display,
+    })
+}
+/// Reset (or resume-post) the quiesced owner and bring a fresh one up:
+/// firmware, IH, queue proofs, media proofs, submitter, VRAM heap, power
+/// monitor and display monitor.
+///
+/// # Safety
+/// As [`recover`]; `q` came from `quiesce` on this same OWNER.
+async unsafe fn restart(
+    owner: &mut Option<alloc::boxed::Box<boot::ColdBoot>>,
+    q: Quiesced,
+) -> Result<boot::Report, boot::Error> {
+    let Quiesced {
+        mut retained,
+        old_submitter,
+        restart_display,
+    } = q;
     let old = retained.boot.as_mut().unwrap();
+    // S3 and runtime resume start from a clean quiesce (every engine
+    // withdrawn with proof), unlike recovery from a fault.
+    let clean = old.reset_mode() == Some(crate::amdgpu_reset_navi22::Mode::Resume);
     // SAFETY: OWNER excludes async access; readers, IH and publication were
     // withdrawn. The caller excludes all external CPU mappings and PCI users.
     unsafe { old.run_reset().await }?;
     // SAFETY: full reset and ASIC_Init proved old hardware no longer executes.
     let new = alloc::boxed::Box::new(unsafe { old.after_reset() }?);
-    QUARANTINED.lock().push(retained.boot.replace(new).unwrap());
+    let old = retained.boot.replace(new).unwrap();
+    if clean {
+        // The cleanly quiesced owner went through a resume post: drop it
+        // (no hardware access on drop) and reclaim the VRAM it published,
+        // so repeated S3/runtime cycles do not exhaust the driver pool.
+        drop(old);
+        // SAFETY: the dropped owner was quiesced and the GPU was posted
+        // after a power cycle or mode1; the new owner has published nothing.
+        let reclaimed = unsafe { retained.boot.as_ref().unwrap().reclaim_retired_vram() };
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: navi48 resume reclaimed {} KiB of the previous owner's VRAM",
+            reclaimed >> 10
+        );
+    } else {
+        QUARANTINED.lock().push(old);
+    }
     let boot = retained.boot.as_mut().unwrap();
     let report = boot.run().await?;
     crate::amdgpu_navi48_dispatch::TABLE.lock().restart();
@@ -510,6 +899,119 @@ pub async unsafe fn recover() -> Result<boot::Report, boot::Error> {
     Ok(report)
 }
 
+/// Linux `amdgpu.gpu_recovery` on a dGPU: a ring whose reset failed or a
+/// terminal fault (RAS fatal error, refused coordinated recovery, lost interrupts)
+/// starts [`recover`], at most [`MAX_AUTOMATIC_RECOVERIES`] times per boot,
+/// as the RX 6000 path does: each recovery quarantines the old owners' VRAM.
+static AUTOMATIC_RECOVERY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+pub const MAX_AUTOMATIC_RECOVERIES: u64 = 3;
+static AUTOMATIC_RECOVERIES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Claim one automatic recovery; `false` once the boot's budget is spent.
+fn claim_automatic_recovery() -> bool {
+    AUTOMATIC_RECOVERIES
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            (used < MAX_AUTOMATIC_RECOVERIES).then_some(used + 1)
+        })
+        .is_ok()
+}
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __reset_automatic_recoveries() {
+    AUTOMATIC_RECOVERIES.store(0, Ordering::Release);
+}
+/// Enable or disable automatic recovery (`amdgpu.gpu_recovery`).
+///
+/// # Safety
+/// The caller accepts [`recover`]'s contract for every user: in-flight work
+/// is abandoned with errors, the display goes dark and relights, kernel CPU
+/// writers of a boot framebuffer in this card's VRAM are behind the console
+/// hook ([`set_recovery_console_hook`]) and the native scanout is withdrawn
+/// by recovery itself. User CPU mappings of VRAM are not revoked, as in
+/// Linux: their accesses during the reset reach an unresponsive BAR and
+/// their contents are lost.
+pub unsafe fn set_automatic_recovery(enabled: bool) {
+    AUTOMATIC_RECOVERY.store(enabled, Ordering::Release);
+}
+/// Pauses (`true`) and resumes (`false`) every kernel CPU writer of the boot
+/// framebuffer; installed by the fb owner.
+type ConsoleHook = fn(bool);
+static CONSOLE_HOOK: narf_lib::sync::IrqSafeSpinLock<Option<ConsoleHook>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+pub fn set_recovery_console_hook(hook: ConsoleHook) {
+    *CONSOLE_HOOK.lock() = Some(hook);
+}
+fn console(pause: bool) {
+    let hook = *CONSOLE_HOOK.lock();
+    if let Some(hook) = hook {
+        hook(pause);
+    }
+}
+/// What a device-recovery request should do now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryDecision {
+    Recover,
+    Disabled,
+    LimitReached,
+    AlreadyRequested,
+}
+fn decide_recovery(requested: &core::sync::atomic::AtomicBool) -> RecoveryDecision {
+    if requested.swap(true, Ordering::AcqRel) {
+        RecoveryDecision::AlreadyRequested
+    } else if !AUTOMATIC_RECOVERY.load(Ordering::Acquire) {
+        RecoveryDecision::Disabled
+    } else if !claim_automatic_recovery() {
+        RecoveryDecision::LimitReached
+    } else {
+        RecoveryDecision::Recover
+    }
+}
+impl Submitter {
+    /// One whole-device recovery per submitter generation; the recovered
+    /// owner registers a fresh submitter (and watchdog) of its own.
+    fn request_device_recovery(&self, reason: &'static str) {
+        use core::fmt::Write as _;
+        match decide_recovery(&self.device_recovery) {
+            RecoveryDecision::AlreadyRequested => {}
+            RecoveryDecision::Disabled => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: navi48 {reason}; GPU recovery disabled (amdgpu.gpu_recovery=0)"
+                );
+            }
+            RecoveryDecision::LimitReached => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: navi48 {reason}; GPU recovery limit ({MAX_AUTOMATIC_RECOVERIES} per boot) reached, the GPU stays stopped"
+                );
+            }
+            RecoveryDecision::Recover => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: navi48 {reason}; starting GPU recovery"
+                );
+                narf_scheduler::spawn(async {
+                    use core::fmt::Write as _;
+                    // Kernel CPU writers stay off the boot framebuffer for
+                    // the whole reset.
+                    console(true);
+                    // SAFETY: set_automatic_recovery's caller accepted
+                    // recover()'s contract on behalf of every user.
+                    let result = unsafe { recover() }.await;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: navi48 GPU recovery {:?}",
+                        result.as_ref().map(|_| ())
+                    );
+                    // A lost device keeps the console quarantined.
+                    if result.is_ok() {
+                        console(false);
+                    }
+                });
+            }
+        }
+    }
+}
+
 /// The Navi48 kernel queues behind AMDGPU_CS: up to eight IBs per
 /// submission, all for one ring — graphics, compute or SDMA0 — run
 /// in the open's address space on a GFX hub VMID from 1–7 (8–15 are KFD's,
@@ -546,6 +1048,12 @@ struct Submitter {
     /// as busy until both SDMA proofs pass, as the GC12 queues' are.
     sdma_fence: Option<crate::amdgpu_sdma_navi48::FenceReader>,
     media_fence: narf_lib::sync::IrqSafeSpinLock<Option<crate::amdgpu_vcn_navi48::FenceReader>>,
+    /// JPEG0's decode ring fence, once its proofs reopened it for clients.
+    jpeg_fence: narf_lib::sync::IrqSafeSpinLock<Option<crate::amdgpu_jpeg_navi48::FenceReader>>,
+    /// The ticket of the job whose validated IB copies occupy each kernel
+    /// slot. A slot is reused only once that ticket completed; replay after
+    /// a reset reuses the retained copy. Touched only under OWNER.
+    jpeg_slots: narf_lib::sync::IrqSafeSpinLock<[Option<u64>; crate::amdgpu_jpeg_navi48::SLOTS]>,
     /// Touched only under OWNER, beside the submission it grants.
     vmids: narf_lib::sync::IrqSafeSpinLock<crate::amdgpu_vmid::VmidManager>,
     /// MMHUB VMIDs are independent of the graphics/compute/SDMA namespace.
@@ -556,6 +1064,8 @@ struct Submitter {
     contexts: narf_lib::sync::IrqSafeSpinLock<[(u64, u32); RINGS]>,
     /// Each ring's jobs in flight and whether it hung.
     watch: narf_lib::sync::IrqSafeSpinLock<[crate::amdgpu_ring_watch::RingWatch; RINGS]>,
+    /// This generation already asked for whole-device recovery.
+    device_recovery: core::sync::atomic::AtomicBool,
 }
 /// Why a ring's reset failed.
 #[derive(Debug)]
@@ -569,14 +1079,16 @@ enum RingError {
 }
 /// Client VMIDs on each independent hub: 1 up to first_kfd_vmid (8) exclusive.
 const CLIENT_VMIDS: (u8, u8) = (1, 7);
-/// GC12 tickets occupy indices 0/1, SDMA0 index 2, unified VCN0 index 3.
+/// GC12 tickets occupy indices 0/1, SDMA0 index 2, unified VCN0 index 3,
+/// JPEG0's decode ring index 4.
 const PIPES: [crate::amdgpu_gfx12_queue::Pipe; 2] = [
     crate::amdgpu_gfx12_queue::Pipe::Graphics,
     crate::amdgpu_gfx12_queue::Pipe::Compute,
 ];
 const SDMA_RING: u32 = 2;
 const MEDIA_RING: u32 = 3;
-const RINGS: usize = 4;
+const JPEG_RING: u32 = 4;
+const RINGS: usize = 5;
 /// Whether `ticket` is complete, given each ring's completed sequence
 /// (32-bit sequences wrap).
 fn job_done(completed: [u32; RINGS], ticket: u64) -> bool {
@@ -618,6 +1130,12 @@ impl Submitter {
             match *self.media_fence.lock() {
                 Some(media) if !frozen[MEDIA_RING as usize] => {
                     completed[MEDIA_RING as usize] = media.completed().ok()?;
+                }
+                _ => {}
+            }
+            match *self.jpeg_fence.lock() {
+                Some(jpeg) if !frozen[JPEG_RING as usize] => {
+                    completed[JPEG_RING as usize] = jpeg.completed().ok()?;
                 }
                 _ => {}
             }
@@ -663,6 +1181,10 @@ impl Submitter {
             for watch in self.watch.lock().iter_mut() {
                 watch.stop();
             }
+            // Terminal: RAS fatal error, lost interrupts or refused fault recovery.
+            if crate::amdgpu_navi48_interrupts::failed() {
+                self.request_device_recovery("terminal device fault");
+            }
             return;
         }
         if !self.watch.lock().iter().any(|w| w.busy()) {
@@ -692,21 +1214,37 @@ impl Submitter {
                     self.recover_faults().await;
                     return;
                 }
+                // VCN's restart closes the shared media range, so it also
+                // retires and re-proves a live JPEG ring and replays its jobs.
+                let affected: &[usize] = if ring == MEDIA_RING as usize {
+                    &[MEDIA_RING as usize, JPEG_RING as usize]
+                } else {
+                    core::slice::from_ref(&ring)
+                };
                 {
                     // Drain old synchronous samples before the first reset
                     // write. New readers see the frozen ledger under this
                     // same lock and never read a powered-down media block.
                     let _generation = READ_GENERATION.lock();
-                    self.watch.lock()[ring].freeze();
+                    for &r in affected {
+                        self.watch.lock()[r].freeze();
+                    }
                 }
                 let reset = match (owner.as_mut(), PIPES.get(ring)) {
                     (Some(boot), _) if ring == MEDIA_RING as usize => {
                         // VCN restart clears codec context. Keep every old
                         // media allocation until retirement and both proofs.
                         self.watch.lock()[ring].stop();
-                        // SAFETY: OWNER excludes all writers, this media
-                        // ledger stays frozen and its contexts are cancelled.
+                        // SAFETY: OWNER excludes all writers, both media
+                        // ledgers stay frozen and VCN contexts are cancelled.
                         unsafe { boot.recover_client_media().await }.map_err(RingError::Media)
+                    }
+                    (Some(boot), _) if ring == JPEG_RING as usize => {
+                        // JPEG has no per-context firmware state: innocent
+                        // jobs replay from their retained kernel IB copies.
+                        // SAFETY: OWNER excludes all writers; the frozen
+                        // ledger retains every job's slot and mappings.
+                        unsafe { boot.recover_client_jpeg().await }.map_err(RingError::Media)
                     }
                     // SAFETY: OWNER serializes the queues, SDMA0 and MES;
                     // every job on the ring holds its memory until its
@@ -724,19 +1262,22 @@ impl Submitter {
                 };
                 match (reset, owner.as_mut()) {
                     (Ok(test), Some(boot)) => {
-                        let jobs = self.watch.lock()[ring].replay();
                         let mut result = Ok(test);
-                        for (ticket, job) in jobs {
-                            // SAFETY: OWNER stays held across reset and replay;
-                            // the frozen ledger retains all buffers and VMIDs.
-                            let submitted =
-                                unsafe { media_clients::publish_client(boot, ring as u32, job) }
-                                    .map_err(RingError::Client);
-                            match submitted {
-                                Ok(seq) => self.watch.lock()[ring].replayed(ticket, seq),
-                                Err(e) => {
-                                    result = Err(e);
-                                    break;
+                        'replay: for &r in affected {
+                            let jobs = self.watch.lock()[r].replay();
+                            for (ticket, job) in jobs {
+                                // SAFETY: OWNER stays held across reset and
+                                // replay; the frozen ledger retains all
+                                // buffers, VMIDs and staged JPEG copies.
+                                let submitted =
+                                    unsafe { media_clients::publish_client(boot, r as u32, job) }
+                                        .map_err(RingError::Client);
+                                match submitted {
+                                    Ok(seq) => self.watch.lock()[r].replayed(ticket, seq),
+                                    Err(e) => {
+                                        result = Err(e);
+                                        break 'replay;
+                                    }
                                 }
                             }
                         }
@@ -745,9 +1286,11 @@ impl Submitter {
                             // their placeholder zero must not become a fence
                             // sample after reopening at physical sequence wrap.
                             let _generation = READ_GENERATION.lock();
-                            // Next normal submission must establish its context.
-                            self.contexts.lock()[ring] = (0, 0);
-                            self.watch.lock()[ring].recovered(narf_time::monotonic_ns());
+                            for &r in affected {
+                                // Next normal submission must establish its context.
+                                self.contexts.lock()[r] = (0, 0);
+                                self.watch.lock()[r].recovered(narf_time::monotonic_ns());
+                            }
                         }
                         result
                     }
@@ -764,7 +1307,7 @@ impl Submitter {
                     );
                 }
                 Err(e) => {
-                    if ring == MEDIA_RING as usize {
+                    if ring == MEDIA_RING as usize || ring == JPEG_RING as usize {
                         crate::amdgpu_navi48_interrupts::quarantine().await;
                         for watch in self.watch.lock().iter_mut() {
                             watch.stop();
@@ -774,6 +1317,7 @@ impl Submitter {
                         narf_console::Writer,
                         "amdgpu: navi48 ring {ring} reset failed ({e:?}); ring stopped"
                     );
+                    self.request_device_recovery("ring reset failed");
                 }
             }
         }
@@ -810,6 +1354,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             ring,
             self.sdma_fence.is_some(),
             self.media_fence.lock().is_some(),
+            self.jpeg_fence.lock().is_some(),
         )
     }
     fn max_ibs(&self, _ring: u32) -> u32 {
@@ -844,8 +1389,8 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             let ring = self
                 .ring_for(first.ip_type, first.ip_instance, first.ring)
                 .ok_or(FsError::Unsupported)?;
-            if ring == MEDIA_RING && submission.user_fence.is_some() {
-                return Err(FsError::InvalidData); // VCN5 no_user_fence
+            if matches!(ring, MEDIA_RING | JPEG_RING) && submission.user_fence.is_some() {
+                return Err(FsError::InvalidData); // VCN5/JPEG5 no_user_fence
             }
             if submission.ibs.len() > crate::amdgpu_gfx12_queue::MAX_JOB_IBS
                 || submission
@@ -876,6 +1421,22 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                 .ok_or(FsError::InvalidData)?;
             // amdgpu_ib_schedule asks the first IB.
             job.mem_sync = first.flags & crate::amdgpu_uapi::AMDGPU_IB_FLAG_EMIT_MEM_SYNC != 0;
+            // amdgpu_cs_patch_ibs + amdgpu_jpeg_dec_parse_cs: JPEG IBs run as
+            // validated kernel copies, read now through the client's mapping.
+            let copies = if ring == JPEG_RING {
+                let mut copies = alloc::vec::Vec::new();
+                for &(va, dwords) in &ibs {
+                    let words = crate::amdgpu_vcn_navi22_cs::read_words(vm, va, dwords)?;
+                    crate::amdgpu_jpeg_navi48::validate_ib(&words)
+                        .map_err(|_| FsError::InvalidData)?;
+                    copies.push(words);
+                }
+                copies
+            } else {
+                alloc::vec::Vec::new()
+            };
+            let deadline =
+                narf_time::monotonic_ns().saturating_add(crate::amdgpu_ring_watch::JOB_TIMEOUT_NS);
             let entity = (request.owner, submission.ctx_id);
             let result = loop {
                 let mut owner = OWNER.lock().await;
@@ -900,6 +1461,22 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                 }
                 let completed = self.progress().ok_or(FsError::NoDevice)?;
                 let done = |t| job_done(completed, t);
+                // A JPEG slot is free once the job whose copy it holds is done.
+                let slot = (ring == JPEG_RING).then(|| {
+                    self.jpeg_slots
+                        .lock()
+                        .iter()
+                        .position(|t| t.is_none_or(done))
+                });
+                if slot == Some(None) {
+                    drop(owner);
+                    if narf_time::monotonic_ns() >= deadline {
+                        break Err(FsError::Busy);
+                    }
+                    narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant())
+                        .await;
+                    continue;
+                }
                 let grant = self.vmids_for(ring).lock().grab(request, &done);
                 let Some(grant) = grant else {
                     // amdgpu_vmid_grab_idle: wait for a VMID to go idle.
@@ -912,9 +1489,35 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                 job.flush = grant.needs_flush;
                 job.map_pasid = grant.map_pasid;
                 job.ctx_switch = self.contexts.lock()[ring as usize] != entity;
+                if let Some(Some(slot)) = slot {
+                    // SAFETY: OWNER; the slot's previous job completed and
+                    // the slot is recorded for this job once it publishes.
+                    match unsafe { boot.stage_client_jpeg(slot, &copies) } {
+                        Ok(kernel) => {
+                            for (n, ib) in kernel.into_iter().enumerate() {
+                                job.ibs[n] = ib;
+                            }
+                        }
+                        Err(crate::amdgpu_jpeg_navi48::Error::Invalid) => {
+                            break Err(FsError::InvalidData)
+                        }
+                        Err(crate::amdgpu_jpeg_navi48::Error::Busy) => break Err(FsError::Busy),
+                        Err(_) => break Err(FsError::NoDevice),
+                    }
+                }
                 // SAFETY: OWNER, the granted hub VMID and generic CS's
                 // retained resource list cover synchronous publication.
                 let result = unsafe { media_clients::publish_client(boot, ring, job) };
+                if ring == JPEG_RING && matches!(result, Err(FsError::Busy)) {
+                    // Ring space: wait for the decoder without the owner.
+                    drop(owner);
+                    if narf_time::monotonic_ns() >= deadline {
+                        break Err(FsError::Busy);
+                    }
+                    narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant())
+                        .await;
+                    continue;
+                }
                 break result.map(|physical| {
                     let seq = self.watch.lock()[ring as usize].submitted(
                         physical,
@@ -923,6 +1526,9 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                         narf_time::monotonic_ns(),
                     );
                     let ticket = u64::from(ring) << 32 | u64::from(seq);
+                    if let Some(Some(slot)) = slot {
+                        self.jpeg_slots.lock()[slot] = Some(ticket);
+                    }
                     self.vmids_for(ring).lock().commit(request, grant, ticket);
                     self.contexts.lock()[ring as usize] = entity;
                     seq
@@ -969,9 +1575,20 @@ pub(crate) async fn power_sample() -> Result<crate::amdgpu_navi48_power::Sample,
         .power_sample()
         .await
 }
+/// hwmon `power1_cap`: the AC PPT0 limit in watts, within the board range.
+pub async fn set_power_cap(watts: u32) -> Result<(), boot::Error> {
+    let _rpm = crate::amdgpu_navi48_runtime_pm::access().await?;
+    let mut owner = OWNER.lock().await;
+    owner
+        .as_mut()
+        .ok_or(boot::Error::Invalid)?
+        .set_power_cap(watts)
+        .await
+}
 /// Linux `power_dpm_force_performance_level` restricted to GFXCLK soft
 /// limits. Display, memory and fabric clocks stay pinned by their owner.
 pub async fn set_gfx_level(level: crate::amdgpu_smu_navi48::GfxLevel) -> Result<(), boot::Error> {
+    let _rpm = crate::amdgpu_navi48_runtime_pm::access().await?;
     let mut owner = OWNER.lock().await;
     owner
         .as_mut()
@@ -1053,7 +1670,11 @@ fn publish_clearer(boot: &mut boot::ColdBoot) {
         });
         let clearer = VramClearer::new(progress);
         *CLEARER.lock() = Some(clearer.clone());
-        let _ = match boot.publish_unmapped_vram(Arc::new(clearer)) {
+        let mover = boot
+            .reserve_transfer_stage()
+            .ok()
+            .map(|stage| transfer::mover(clearer.clone(), stage));
+        let _ = match boot.publish_unmapped_vram(Arc::new(clearer), mover) {
             Ok(bytes) => writeln!(
                 narf_console::Writer,
                 "amdgpu: navi48 client VRAM past the BAR {} MiB",
@@ -1128,11 +1749,69 @@ fn requeue_clears(completed: u32) {
         narf_scheduler::spawn(clearer.drain());
     }
 }
-#[derive(Debug, Clone)]
+/// One FIFO request: a fill, or a copy of a migration chunk.
+#[derive(Clone)]
 struct Clear {
-    address: u64,
-    bytes: u64,
+    work: Work,
     fence: Arc<ClearFence>,
+    /// What the request reaches, retained until it leaves the ring.
+    _held: Option<Arc<dyn Send + Sync>>,
+}
+impl core::fmt::Debug for Clear {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Clear")
+            .field("work", &self.work)
+            .field("fence", &self.fence)
+            .finish_non_exhaustive()
+    }
+}
+#[derive(Clone)]
+enum Work {
+    Fill {
+        address: u64,
+        bytes: u64,
+    },
+    /// `upload` stages `bytes` of the source at its offset into the CPU
+    /// window (at `virt`) under OWNER right before the job is queued, so a
+    /// requeued copy re-stages after an SDMA0 reset.
+    Copy {
+        src: u64,
+        dst: u64,
+        bytes: u64,
+        upload: Option<(Arc<crate::amdgpu_gem::GemPlacement>, u64, usize)>,
+    },
+}
+impl core::fmt::Debug for Work {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Work::Fill { address, bytes } => write!(f, "Fill({address:#x}, {bytes:#x})"),
+            Work::Copy {
+                src,
+                dst,
+                bytes,
+                upload,
+            } => write!(
+                f,
+                "Copy({src:#x} -> {dst:#x}, {bytes:#x}, upload={})",
+                upload.is_some()
+            ),
+        }
+    }
+}
+impl Work {
+    fn op(&self) -> crate::amdgpu_sdma_navi48::KernelOp {
+        use crate::amdgpu_sdma_navi48::KernelOp;
+        match *self {
+            Work::Fill { address, bytes } => KernelOp::Fill {
+                dst: address,
+                bytes,
+                value: 0,
+            },
+            Work::Copy {
+                src, dst, bytes, ..
+            } => KernelOp::Copy { src, dst, bytes },
+        }
+    }
 }
 /// Fill packets one clear job carries at most: 5 dwords each, well inside
 /// a 256-dword SDMA job slot with its fence.
@@ -1148,6 +1827,14 @@ fn clear_batch(bytes: impl Iterator<Item = u64>) -> usize {
         })
         .count()
         .max(1)
+}
+/// How many front requests one job takes: a copy travels alone (its stage
+/// is written just before the job), fills batch while they fit.
+fn work_batch<'a>(queued: impl Iterator<Item = &'a Clear>) -> usize {
+    clear_batch(queued.map_while(|c| match c.work {
+        Work::Fill { bytes, .. } => Some(bytes),
+        Work::Copy { .. } => None,
+    }))
 }
 /// Whether one job can fill `bytes` at `address`: dword aligned, whole
 /// dwords, and no more packets than a job takes.
@@ -1269,21 +1956,35 @@ impl VramClearer {
                     state.draining = false;
                     return;
                 }
-                let n = clear_batch(state.queued.iter().map(|c| c.bytes));
+                let n = work_batch(state.queued.iter());
                 state.queued.iter().take(n).cloned().collect()
             };
-            let ops: Vec<KernelOp> = batch
-                .iter()
-                .map(|c| KernelOp::Fill {
-                    dst: c.address,
-                    bytes: c.bytes,
-                    value: 0,
-                })
-                .collect();
+            let ops: Vec<KernelOp> = batch.iter().map(|c| c.work.op()).collect();
+            let staged = match (owner.as_ref(), &batch[0].work) {
+                (
+                    Some(boot),
+                    Work::Copy {
+                        bytes,
+                        upload: Some((source, offset, virt)),
+                        ..
+                    },
+                ) => {
+                    boot.access_vram(|| {
+                        // SAFETY: the transfer's stage lock gives this copy
+                        // the CPU window alone, the source is retained by the
+                        // request and OWNER excludes reset; HDP is flushed
+                        // after the write, before SDMA0 can read it.
+                        unsafe { source.write_staging(*offset, *virt as *mut u8, *bytes as usize) }
+                    })
+                }
+                _ => Ok(()),
+            };
             let result = match owner.as_mut() {
+                Some(_) if staged.is_err() => Err(crate::amdgpu_sdma_navi48::Error::Invalid),
                 // SAFETY: OWNER serializes SDMA0's ring; each range is a
                 // client reservation the GEM layer holds no job can reach
-                // before this job's fence (its KERNEL fence).
+                // before this job's fence (its KERNEL fence), or the
+                // transfer's private stage.
                 Some(boot) if (self.0.progress)().is_some() => unsafe {
                     boot.submit_client_sdma_kernel(&ops)
                 },
@@ -1309,7 +2010,8 @@ impl VramClearer {
                         state.retire(completed);
                     }
                 }
-                // `clear` validated every request, so the device is gone.
+                // `clear`/`enqueue` validated every request, so the device is
+                // gone (or the upload's source could not be staged).
                 Err(_) => {
                     for c in &batch {
                         c.fence.gone.store(true, Ordering::Release);
@@ -1340,9 +2042,9 @@ impl crate::amdgpu_gem::VramClear for VramClearer {
                 .try_reserve(1)
                 .map_err(|_| narf_filesystem::FsError::NoSpace)?;
             state.queued.push_back(Clear {
-                address,
-                bytes,
+                work: Work::Fill { address, bytes },
                 fence: fence.clone(),
+                _held: None,
             });
             !core::mem::replace(&mut state.draining, true)
         };
@@ -1556,7 +2258,8 @@ pub async unsafe fn prepare_display_surface(
     unsafe { boot.prepare_display_surface(request).await }
 }
 
-/// Upload a visible row segment of a staged, stopped framebuffer.
+/// Upload a visible row segment of a staged, stopped framebuffer: packed
+/// 32-bit words from pixel `x` (one per pixel at 4 bytes per pixel).
 /// # Safety
 /// Exclude firmware/FAMS and concurrent display/HDP/clock/power writers;
 /// retain the owner and inherited resources on every outcome.
@@ -1737,6 +2440,14 @@ struct ConnectorState {
     modes: Vec<Timing>,
     mst_id: Option<boot::MstOutputId>,
     last_hpd: Option<bool>,
+    /// The sink is FreeSync-capable (KMS "vrr_capable"); DP SST only.
+    vrr_capable: bool,
+    /// DRM's "Colorspace" (a DRM_MODE_COLORIMETRY_*), kept with the connector.
+    colorspace: u32,
+    /// DRM's HDR_OUTPUT_METADATA blob, kept with the connector.
+    hdr: Option<Vec<u8>>,
+    /// DRM's "max bpc" (max_requested_bpc), kept with the connector.
+    max_bpc: u8,
 }
 impl ConnectorState {
     fn new(target: Target, kind: ConnectorType, index: usize) -> Self {
@@ -1750,15 +2461,29 @@ impl ConnectorState {
             modes: Vec::new(),
             mst_id: None,
             last_hpd: None,
+            vrr_capable: false,
+            colorspace: 0,
+            hdr: None,
+            max_bpc: crate::amdgpu_navi48_boot::MAX_REQUESTED_BPC,
+        }
+    }
+    /// The modeset's key for this connector's depth cap: its board port
+    /// and, for an MST end device, its slot.
+    fn requested_key(&self) -> (usize, Option<u8>) {
+        match self.target {
+            Target::Board(port) => (port, None),
+            Target::Mst(port, slot) => (port, Some(slot)),
         }
     }
     /// A board sink's discovery; true when its EDID changed.
     fn reconcile_sst(&mut self, output: Option<&boot::SstOutput>) -> bool {
         self.present = output.is_some();
         self.modes.clear();
+        self.vrr_capable = false;
         let Some(output) = output else {
             return false;
         };
+        self.vrr_capable = output.vrr_capable;
         let changed = self.edid != output.edid;
         if changed {
             self.edid.clone_from(&output.edid);
@@ -1810,12 +2535,34 @@ struct CrtcState {
     retiring: bool,
     /// The mode DRM last set, or None for the sink's preferred mode.
     requested: Option<Timing>,
+    /// The primary plane format DRM's framebuffer holds (XRGB8888 until a
+    /// client sets another): the surface format of the next lighting.
+    format: SurfaceFormat,
+    /// DRM's planes on the CRTC beyond a full-frame unscaled primary (the
+    /// primary's placement, the overlays): the next lighting's planes.
+    planes: boot::PlaneSetup,
     /// The lit sink: EDID, running timing and every offered timing.
     shown: Option<([u8; 128], Timing, Vec<Timing>)>,
+    /// The lit configuration's board inputs and this display's admitted
+    /// mode, for checking a plane format of another depth
+    /// (`display_admits_format`).
+    admitted: Option<(dml::Soc, dml::Mode)>,
     /// The connector this CRTC drives.
     route: Option<Target>,
     /// DRM chose `route` (including none): automatic routing leaves it.
     explicit: bool,
+    /// DRM's "VRR_ENABLED": run the lit mode's DRR when it is VRR-supported.
+    vrr: bool,
+    /// DRM's CRTC CTM and GAMMA_LUT as the color they program (None:
+    /// amdgpu_dm's bypass). Kept across relights.
+    color: Option<Arc<crate::amdgpu_dcn401_otg::ColorProgram>>,
+    /// What the lit stream can signal: HDR packets and non-default
+    /// colorimetry. Every native transport now sends both.
+    color_signals: (bool, bool),
+    /// The routed connector's "max bpc" when this CRTC was last lit: a
+    /// change is a modeset (drm_atomic_helper_check_modeset sets
+    /// connectors_changed when max_requested_bpc differs).
+    lit_bpc: Option<u8>,
 }
 impl CrtcState {
     const fn new() -> Self {
@@ -1823,9 +2570,16 @@ impl CrtcState {
             active: true,
             retiring: false,
             requested: None,
+            format: SurfaceFormat::Xrgb8888,
+            planes: boot::PlaneSetup::NONE,
             shown: None,
+            admitted: None,
             route: None,
             explicit: false,
+            vrr: false,
+            color: None,
+            color_signals: (true, true),
+            lit_bpc: None,
         }
     }
     fn retrained(&mut self, edid: [u8; 128], timing: Timing, offered: Vec<Timing>) {
@@ -1887,6 +2641,10 @@ impl Outputs {
                             modes: c.modes.clone(),
                             mst_id: c.mst_id,
                             last_hpd: c.last_hpd,
+                            vrr_capable: c.vrr_capable,
+                            colorspace: c.colorspace,
+                            hdr: c.hdr.clone(),
+                            max_bpc: c.max_bpc,
                         },
                     )
             })
@@ -1906,6 +2664,7 @@ impl Outputs {
         c.explicit = false;
         c.requested = None;
         c.shown = None;
+        c.admitted = None;
     }
     /// A connector's sink changed: requests for the old one are void; a
     /// new device in an MST slot also forgets the CRTC's off request.
@@ -1914,6 +2673,7 @@ impl Outputs {
             let c = &mut self.crtcs[k];
             c.requested = None;
             c.shown = None;
+            c.admitted = None;
             if reset {
                 c.active = true;
             }
@@ -1971,6 +2731,7 @@ impl Outputs {
             c.route = target;
             c.requested = None;
             c.shown = None;
+            c.admitted = None;
         }
         self.crtcs[k].explicit = true;
     }
@@ -2017,6 +2778,24 @@ impl Outputs {
             .iter()
             .find(|c| c.index == n)
             .map(|c| c.target)
+    }
+    /// Hand every connector's "max bpc" to the next selection
+    /// (`set_requested_bpc`, the per-connector depth cap) and record it as
+    /// lit on the CRTCs `lighting` names.
+    fn stage_requested_bpc(&mut self, lighting: impl Fn(usize) -> bool) {
+        for c in &self.connectors {
+            let (port, slot) = c.requested_key();
+            crate::amdgpu_navi48_boot::set_requested_bpc(port, slot, c.max_bpc);
+        }
+        for k in (0..4).filter(|&k| lighting(k)) {
+            self.crtcs[k].lit_bpc = self.routed(k).map(|c| c.max_bpc);
+        }
+    }
+    /// Whether CRTC k's connector asks another "max bpc" than it was lit
+    /// with: a modeset.
+    fn max_bpc_changed(&self, k: usize) -> bool {
+        let lit = self.crtcs[k].lit_bpc;
+        lit.is_some() && self.routed(k).map(|c| c.max_bpc) != lit
     }
     /// The MST root port, while its branch's connectors exist.
     fn mst_port(&self) -> Option<usize> {
@@ -2075,12 +2854,61 @@ fn board_ports(boot: &boot::ColdBoot) -> Vec<usize> {
 
 /// Publish every connector and CRTC on the amdgpu card's KMS state; a
 /// shown sink whose CRTC DRM switched off stays connected with its CRTC off.
+/// A published CRTC's sink EDID, scanned-out timing and offered modes.
+type Shown = ([u8; 128], Timing, Vec<Timing>);
+static PUBLISHING: narf_lib::sync::IrqSafeSpinLock<()> = narf_lib::sync::IrqSafeSpinLock::new(());
 fn publish_outputs() {
-    let outputs = OUTPUTS.lock();
-    let crtcs: Vec<Option<crate::amdgpu_navi48_kms::Sink>> = (0..4)
-        .map(|k| {
-            outputs
-                .published(k)
+    // Snapshot under OUTPUTS, then publish with it released: SETCRTC holds
+    // the card lock while it asks OUTPUTS (display_offers, request_*), so
+    // taking the card lock under OUTPUTS here would invert that order.
+    struct Owned {
+        index: usize,
+        kind: ConnectorType,
+        edid: Option<[u8; 128]>,
+        offered: Vec<Timing>,
+        crtc: Option<usize>,
+        vrr_capable: bool,
+        color: bool,
+        present: bool,
+        max_bpc: bool,
+    }
+    // Serializes publishers so an older snapshot never lands after a newer
+    // one. Taken before OUTPUTS and never by the card-lock holders.
+    let publishing = PUBLISHING.lock();
+    let (shown, owned, inactive) = {
+        let outputs = OUTPUTS.lock();
+        let shown: Vec<Option<Shown>> = (0..4).map(|k| outputs.published(k).cloned()).collect();
+        let owned: Vec<Owned> = outputs
+            .connectors
+            .iter()
+            .map(|c| Owned {
+                index: c.index,
+                kind: c.kind,
+                edid: c
+                    .present
+                    .then(|| c.edid.get(..128).and_then(|e| e.try_into().ok()))
+                    .flatten(),
+                offered: if c.present {
+                    c.modes.clone()
+                } else {
+                    Vec::new()
+                },
+                crtc: outputs.crtc_of(c.target),
+                vrr_capable: c.present && c.vrr_capable,
+                color: color_connector(c.target),
+                present: c.present,
+                max_bpc: max_bpc_connector(c.target),
+            })
+            .collect();
+        let inactive: Vec<usize> = (0..4)
+            .filter(|&k| shown[k].is_some() && !outputs.crtcs[k].published_active())
+            .collect();
+        (shown, owned, inactive)
+    };
+    let crtcs: Vec<Option<crate::amdgpu_navi48_kms::Sink>> = shown
+        .iter()
+        .map(|s| {
+            s.as_ref()
                 .map(|(edid, timing, offered)| crate::amdgpu_navi48_kms::Sink {
                     edid,
                     timing,
@@ -2088,33 +2916,49 @@ fn publish_outputs() {
                 })
         })
         .collect();
-    let connectors: Vec<crate::amdgpu_navi48_kms::RoutedConnector> = outputs
-        .connectors
+    let connectors: Vec<crate::amdgpu_navi48_kms::RoutedConnector> = owned
         .iter()
         .map(|c| crate::amdgpu_navi48_kms::RoutedConnector {
             index: c.index,
             kind: c.kind,
-            edid: c
-                .present
-                .then(|| c.edid.get(..128).and_then(|e| e.try_into().ok()))
-                .flatten(),
-            offered: if c.present { &c.modes } else { &[] },
-            crtc: outputs.crtc_of(c.target),
+            edid: c.edid.as_ref(),
+            offered: &c.offered,
+            crtc: c.crtc,
             possible_crtcs: 0xf,
         })
         .collect();
-    crate::amdgpu_navi48_kms::publish_routed(&crtcs, &connectors);
-    for (k, sink) in crtcs.iter().enumerate() {
-        if sink.is_some() && !outputs.crtcs[k].published_active() {
-            crate::amdgpu_navi48_kms::set_active(k, false);
-        }
+    let props: Vec<crate::amdgpu_navi48_kms::ConnectorProps> = owned
+        .iter()
+        .map(|c| crate::amdgpu_navi48_kms::ConnectorProps {
+            vrr_capable: c.vrr_capable,
+            color: c.color,
+            max_bpc: c.max_bpc,
+        })
+        .collect();
+    crate::amdgpu_navi48_kms::publish_routed_native(&crtcs, &connectors, &props);
+    // amdgpu_dm_atomic_commit_tail: a runtime-PM reference per enabled
+    // CRTC, dropped (put_autosuspend) when it is disabled. The delta is
+    // taken in publication order; references move after the lock.
+    let lit = (0..4)
+        .filter(|&k| shown[k].is_some() && !inactive.contains(&k))
+        .fold(0u8, |m, k| m | 1 << k);
+    let delta =
+        crate::amdgpu_navi48_runtime_pm::displays_changed(lit, owned.iter().any(|c| c.present));
+    for k in inactive {
+        crate::amdgpu_navi48_kms::set_active(k, false);
     }
+    drop(publishing);
+    crate::amdgpu_navi48_runtime_pm::apply_display_refs(delta);
 }
 
 /// Cursor hook published with the console's scanout: upload once, then
 /// move; hide with an off-screen move. Never waits for the owner.
 fn scanout_cursor(image: (u32, u32, &[u32]), position: Option<(i32, i32)>) -> bool {
     let pipe = CURSOR_PIPE.load(Ordering::Acquire);
+    // A DRM cursor plane drives this display's cursor.
+    if drm_owns_cursor(pipe) {
+        return true;
+    }
     let Some(mut owner) = OWNER.try_lock() else {
         return true;
     };
@@ -2122,22 +2966,31 @@ fn scanout_cursor(image: (u32, u32, &[u32]), position: Option<(i32, i32)>) -> bo
         return true;
     };
     let (w, h, _) = image;
-    let shown = boot
-        .display_status(pipe)
-        .ok()
-        .flatten()
-        .and_then(|s| s.cursor)
-        .is_some_and(|c| c.pipe == pipe && (c.width, c.height) == (w, h));
+    // After DRM let go of the cursor the pipe holds DRM's image, whatever
+    // its size: upload the pointer again.
+    let stale = CONSOLE_CURSOR_STALE.load(Ordering::Acquire) & (1u8 << (pipe & 7)) != 0;
+    let shown = !stale
+        && boot
+            .display_status(pipe)
+            .ok()
+            .flatten()
+            .and_then(|s| s.cursor)
+            .is_some_and(|c| c.pipe == pipe && (c.width, c.height) == (w, h));
     // A failure quarantines the pipe in the owner; the pointer just stops.
-    let _ = match (shown, position) {
+    match (shown, position) {
         (false, None) => return true, // never shown: nothing to hide
-        // SAFETY: serialized retained owner; the platform excludes writers.
-        (true, at) => unsafe {
-            boot.move_display_cursor(pipe, at.unwrap_or((-(w as i32), -(h as i32))))
-        },
-        // SAFETY: as above.
-        (false, Some(at)) => unsafe { boot.set_display_cursor(pipe, image, at) },
-    };
+        (true, at) => {
+            // SAFETY: serialized retained owner; the platform excludes writers.
+            let _ =
+                unsafe { boot.move_display_cursor(pipe, at.unwrap_or((-(w as i32), -(h as i32)))) };
+        }
+        (false, Some(at)) => {
+            // SAFETY: as above.
+            if unsafe { boot.set_display_cursor(pipe, image, at) }.is_ok() {
+                CONSOLE_CURSOR_STALE.fetch_and(!(1u8 << (pipe & 7)), Ordering::AcqRel);
+            }
+        }
+    }
     true
 }
 
@@ -2160,22 +3013,132 @@ fn publish_console(boot: &boot::ColdBoot, pipe: Option<u8>) {
 /// As for `modeset_displays`.
 async unsafe fn adopt(boot: &mut boot::ColdBoot, m: &Modeset) {
     let pipe = m.pipe;
-    // Without a back buffer (allocation failed) DRM frames fall back to
-    // copies onto the visible front.
-    // SAFETY: the caller's obligations; touches only owned VRAM and HDP.
-    let _ = unsafe { boot.prepare_display_back_buffer(pipe).await };
-    present_slot(pipe).native.store(
-        boot.display_back_framebuffer(pipe).is_ok(),
-        Ordering::Release,
-    );
+    // SAFETY: the caller's obligations.
+    unsafe { adopt_planes(boot, m) }.await;
     // Its timing generator restarted: the vblank count continues.
     restart_vblank(pipe);
     let s = &m.selection;
     let offered: Vec<Timing> = m.modes.iter().flatten().copied().collect();
     if let Some(c) = OUTPUTS.lock().crtcs.get_mut(usize::from(pipe)) {
         c.shown = Some((s.edid, s.timing, offered));
+        c.admitted = Some((m.plan.soc, m.plan.mode));
         c.retiring = false;
+        // Every native transport signals both: DIO (TMDS, 8b/10b SST and
+        // MST) and HPO (128b/132b SST and MST, FRL) streams.
+        c.color_signals = (true, true);
     }
+}
+
+/// Present `m`'s planes: a back buffer for each (reused while its surface
+/// is) for tear-free DRM frames, the planes and format its presenter shows.
+/// # Safety
+/// As for `modeset_displays`.
+async unsafe fn adopt_planes(boot: &mut boot::ColdBoot, m: &Modeset) {
+    let pipe = m.pipe;
+    // Without a back buffer (allocation failed) DRM frames fall back to
+    // copies onto the visible front. Each overlay gets one too.
+    // SAFETY: the caller's obligations; touches only owned VRAM and HDP.
+    let _ = unsafe { boot.prepare_display_back_buffer(pipe).await };
+    let overlay_pipes = m.scanout.overlays.map(|o| o.map(|o| o.pipe));
+    let mut backed = boot.display_back_framebuffer(pipe).is_ok();
+    for &q in overlay_pipes.iter().flatten() {
+        // SAFETY: as above.
+        let _ = unsafe { boot.prepare_display_plane_back_buffer(pipe, q).await };
+        backed &= boot.display_back_framebuffer(q).is_ok();
+    }
+    *present_slot(pipe).shown.lock() = PlanesShown {
+        planes: m.selection.planes,
+        overlay_pipes,
+    };
+    present_slot(pipe).native.store(backed, Ordering::Release);
+    present_slot(pipe)
+        .format
+        .store(m.selection.format.fourcc(), Ordering::Release);
+}
+
+/// Whether amdgpu_dm would recreate a plane going from `old` to `new`
+/// (should_reset_plane): an overlay both show at another normalized zpos,
+/// below or above the primary or in another order among the others.
+fn planes_reordered(old: &boot::PlaneSetup, new: &boot::PlaneSetup) -> bool {
+    let kept = |s: &boot::PlaneSetup, other: &boot::PlaneSetup| -> Vec<(u32, bool)> {
+        s.overlays
+            .iter()
+            .flatten()
+            .filter(|o| o.plane != 0 && other.overlays.iter().flatten().any(|p| p.plane == o.plane))
+            .map(|o| (o.plane, o.underlay))
+            .collect()
+    };
+    kept(old, new) != kept(new, old)
+}
+
+/// Move lit display `k` to `format` and `setup` while it scans out
+/// (`ColdBoot::update_display_planes`), the console withdrawn from its
+/// primary meanwhile. False when that needs a relight (nothing changed).
+/// # Safety
+/// As for `modeset_displays`, except that every display stays lit.
+async unsafe fn update_lit_planes(
+    boot: &mut boot::ColdBoot,
+    displays: &mut Displays,
+    k: u8,
+    format: SurfaceFormat,
+    setup: boot::PlaneSetup,
+) -> Result<bool, ModesetError> {
+    let Some(m) = displays.lit[usize::from(k)] else {
+        return Ok(false);
+    };
+    let reset = planes_reordered(&m.selection.planes, &setup);
+    // A format or size change replaces the primary's surface, which the
+    // console may draw into: withdraw it across the update.
+    let console = CURSOR_PIPE.load(Ordering::Acquire) == k
+        && crate::amdgpu_dcn_display::active_scanout().is_some_and(|fb| {
+            boot.display_scanout_framebuffer(k)
+                .is_ok_and(|f| f.addr == fb.addr)
+        });
+    if console {
+        crate::amdgpu_dcn_display::publish_external(None, None);
+    }
+    crate::scanout_access::wait_retired().await;
+    // SAFETY: the caller's obligations; the console no longer draws.
+    let result = unsafe { boot.update_display_planes(k, format, setup, reset) }.await;
+    let changed = match result {
+        Ok(Some(change)) => {
+            {
+                // The timing, link and transport stay as lit: `shown`,
+                // `retiring` and `color_signals` hold; the admission (and,
+                // for this display, the format and planes it now shows)
+                // follow the new plans.
+                let mut outputs = OUTPUTS.lock();
+                for d in &change.displays {
+                    if let Some(c) = outputs.crtcs.get_mut(usize::from(d.pipe)) {
+                        c.admitted = Some((d.plan.soc, d.plan.mode));
+                        if d.pipe == k {
+                            c.format = d.selection.format;
+                            c.planes = d.selection.planes;
+                        }
+                    }
+                }
+            }
+            for d in change.displays {
+                displays.lit[usize::from(d.pipe)] = Some(d);
+            }
+            if let Some(m) = displays.lit[usize::from(k)] {
+                // SAFETY: as above.
+                unsafe { adopt_planes(boot, &m) }.await;
+            }
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            if console {
+                publish_console(boot, Some(k));
+            }
+            return Err(e);
+        }
+    };
+    if console {
+        publish_console(boot, Some(k));
+    }
+    Ok(changed)
 }
 
 /// Stop presenting on `pipe` and, when it carried the console, move the
@@ -2277,6 +3240,21 @@ async unsafe fn light_displays(
             c.route.filter(|_| c.active)
         });
         let wants: [Option<Timing>; 4] = core::array::from_fn(|k| outputs.crtcs[k].requested);
+        // ... and its connector's Colorspace and HDR metadata, and every
+        // connector's "max bpc".
+        for k in 0..4 {
+            let (colorspace, hdr) = connector_color(&outputs, k);
+            crate::amdgpu_navi48_boot::set_output_color(k as u8, colorspace, hdr);
+        }
+        outputs.stage_requested_bpc(|k| routes[k].is_some());
+        // Display k lights on pipe k with its CRTC's plane format and planes.
+        for (k, c) in outputs.crtcs.iter_mut().enumerate() {
+            crate::amdgpu_navi48_boot::set_plane_format(k as u8, c.format);
+            crate::amdgpu_navi48_boot::set_plane_setup(k as u8, c.planes);
+            if c.active {
+                c.admitted = None;
+            }
+        }
         (routes, wants)
     };
     let crtc_of = |t: Target| routes.iter().position(|r| *r == Some(t));
@@ -2423,6 +3401,11 @@ async fn follow_flip(before: GenericFb, after: GenericFb) {
 struct PresentSlot {
     native: AtomicBool,
     presenting: AtomicBool,
+    /// The fourcc of the surface the display scans out: frames of another
+    /// format wait for the relight that switches it.
+    format: core::sync::atomic::AtomicU32,
+    /// The planes it shows.
+    shown: narf_lib::sync::IrqSafeSpinLock<PlanesShown>,
     next: narf_lib::sync::IrqSafeSpinLock<Option<Frame>>,
 }
 impl PresentSlot {
@@ -2430,6 +3413,11 @@ impl PresentSlot {
         Self {
             native: AtomicBool::new(false),
             presenting: AtomicBool::new(false),
+            format: core::sync::atomic::AtomicU32::new(SurfaceFormat::Xrgb8888.fourcc()),
+            shown: narf_lib::sync::IrqSafeSpinLock::new(PlanesShown {
+                planes: boot::PlaneSetup::NONE,
+                overlay_pipes: [None; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
+            }),
             next: narf_lib::sync::IrqSafeSpinLock::new(None),
         }
     }
@@ -2439,15 +3427,76 @@ fn present_slot(display: u8) -> &'static PresentSlot {
     &PRESENT[usize::from(display).min(PRESENT.len() - 1)]
 }
 
-/// A DRM client's XRGB8888 frame in a kernel-mapped dumb buffer, and the
-/// flip-complete ticket (see `drm::card::FlipLog`) its flip completes.
+/// One plane's DRM framebuffer: a kernel-mapped dumb buffer, its pitch,
+/// size and fourcc, each plane's offset (a 4:2:0 framebuffer's chroma
+/// plane at `offsets[1]` with `chroma_pitch`) and its modifier. A linear
+/// RGB plane's source rectangle (the shown planes') is what the presenter
+/// copies out of it; a tiled or 4:2:0 one is copied whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaneFrame {
+    pub phys: u64,
+    pub pitch: u32,
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,
+    pub offsets: [u32; 2],
+    pub chroma_pitch: u32,
+    pub modifier: u64,
+}
+impl PlaneFrame {
+    /// A linear single-plane framebuffer at `phys`.
+    pub const fn linear(phys: u64, pitch: u32, width: u32, height: u32, format: u32) -> Self {
+        Self {
+            phys,
+            pitch,
+            width,
+            height,
+            format,
+            offsets: [0; 2],
+            chroma_pitch: 0,
+            modifier: 0,
+        }
+    }
+    /// The framebuffer's tiling, if one the planes list.
+    fn tiling(&self) -> Option<crate::amdgpu_dcn401_otg::Tiling> {
+        crate::amdgpu_dcn401_otg::Tiling::from_modifier(self.modifier)
+    }
+}
+
+/// A DRM client's frame: a framebuffer for each plane it updates (the
+/// primary, the overlays bottom first; None keeps a plane's content), and
+/// the flip-complete ticket (see `drm::card::FlipLog`) its flip completes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Frame {
-    phys: u64,
-    pitch: u32,
-    width: u32,
-    height: u32,
+    primary: Option<PlaneFrame>,
+    overlays: [Option<PlaneFrame>; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
     ticket: Option<u64>,
+    /// When the oldest frame merged into this one was queued.
+    queued_ns: u64,
+}
+impl Frame {
+    /// `next` arriving while `self` still waits: each plane's newest
+    /// framebuffer, the event of both completing with the flip.
+    fn merged(self, next: Self) -> Self {
+        let mut overlays = self.overlays;
+        for (o, n) in overlays.iter_mut().zip(next.overlays) {
+            *o = n.or(*o);
+        }
+        Self {
+            primary: next.primary.or(self.primary),
+            overlays,
+            ticket: next.ticket.max(self.ticket),
+            queued_ns: self.queued_ns.min(next.queued_ns),
+        }
+    }
+}
+
+/// The planes a display shows: its lit plane configuration and the pipe
+/// of each overlay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlanesShown {
+    planes: boot::PlaneSetup,
+    overlay_pipes: [Option<u8>; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
 }
 
 /// Whether `present_frame` on `display` would present through a hardware
@@ -2602,6 +3651,12 @@ fn complete_flip(display: u8, ticket: Option<u64>, latched: Option<crate::drm::c
 /// DRM's buffer rules make the deferred read safe: a client leaves a
 /// submitted framebuffer untouched until its flip-complete event, which
 /// is not sent before the copy is done.
+///
+/// `format` is the framebuffer's fourcc: only frames in the format the
+/// display scans out are presented. A frame in the format DRM requested
+/// for the display (`request_display_format`) while it still scans another
+/// waits for the relight that switches it, and then presents (or, if the
+/// display does not light so, completes) after the display monitor's pass.
 pub fn present_frame(
     display: u8,
     phys: u64,
@@ -2609,11 +3664,49 @@ pub fn present_frame(
     width: u32,
     height: u32,
     ticket: Option<u64>,
+    format: u32,
 ) -> bool {
-    if !native_present_ready(display)
-        || width == 0
-        || height == 0
-        || pitch < width.saturating_mul(4)
+    let primary = PlaneFrame::linear(phys, pitch, width, height, format);
+    present_planes(
+        display,
+        Some(primary),
+        [None; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
+        ticket,
+    )
+}
+
+/// `present_frame` for an atomic commit's planes on display `display`:
+/// each updated plane's framebuffer (the primary's and each overlay's,
+/// bottom first; None keeps that plane's content). Their copies flip
+/// together at one VUPDATE. An overlay's frame in a format other than the
+/// one the display shows it in waits for the relight that switches it,
+/// as a primary's does.
+pub fn present_planes(
+    display: u8,
+    primary: Option<PlaneFrame>,
+    overlays: [Option<PlaneFrame>; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
+    ticket: Option<u64>,
+) -> bool {
+    let fits = |f: &PlaneFrame| {
+        let bytes = SurfaceFormat::from_fourcc(f.format).map_or(0, SurfaceFormat::bytes_per_pixel);
+        f.width != 0 && f.height != 0 && u64::from(f.pitch) >= u64::from(f.width) * u64::from(bytes)
+    };
+    let k = usize::from(display);
+    let format = primary.map(|f| f.format);
+    let fmt = format.and_then(SurfaceFormat::from_fourcc);
+    let shown = k < PRESENT.len()
+        && format.is_none_or(|f| present_slot(display).format.load(Ordering::Acquire) == f);
+    let switching = !shown
+        && fmt.is_some()
+        && OUTPUTS
+            .lock()
+            .crtcs
+            .get(k)
+            .is_some_and(|c| Some(c.format) == fmt);
+    if !(native_present_ready(display) && shown || switching)
+        || primary.is_some_and(|f| !fits(&f))
+        || overlays.iter().flatten().any(|f| !fits(f))
+        || (primary.is_none() && overlays.iter().all(Option::is_none))
     {
         complete_flip(display, ticket, None);
         return false;
@@ -2621,20 +3714,40 @@ pub fn present_frame(
     let slot = present_slot(display);
     {
         let mut next = slot.next.lock();
-        // A replaced frame's event completes with the frame replacing it.
-        let ticket = ticket.max(next.and_then(|f| f.ticket));
-        *next = Some(Frame {
-            phys,
-            pitch,
-            width,
-            height,
+        let frame = Frame {
+            primary,
+            overlays,
             ticket,
+            queued_ns: narf_time::wall::monotonic_ns(),
+        };
+        // A replaced frame's event completes with the frame replacing it.
+        *next = Some(match *next {
+            Some(old) => old.merged(frame),
+            None => frame,
         });
     }
-    if !slot.presenting.swap(true, Ordering::AcqRel) {
+    // A frame of a commit that also changed the planes waits for the
+    // display monitor's seamless update (`kick_presenters` drains it).
+    if shown && !planes_pending(display) && !slot.presenting.swap(true, Ordering::AcqRel) {
         narf_scheduler::spawn(presenter(display));
     }
     true
+}
+
+/// How long a frame waits for its commit's plane update before it is
+/// presented on the planes shown (or completed): the display monitor
+/// normally applies it within a frame or two.
+const PLANES_WAIT_NS: u64 = 2_000_000_000;
+
+/// Drain frames that waited for a relight (`present_frame`): each display's
+/// presenter shows them in its new format, or completes them.
+fn kick_presenters() {
+    for display in 0..PRESENT.len() as u8 {
+        let slot = present_slot(display);
+        if slot.next.lock().is_some() && !slot.presenting.swap(true, Ordering::AcqRel) {
+            narf_scheduler::spawn(presenter(display));
+        }
+    }
 }
 
 async fn presenter(display: u8) {
@@ -2654,18 +3767,47 @@ async fn presenter(display: u8) {
             complete_flip(display, frame.ticket, None);
             continue;
         }
+        // Its commit's planes are not shown yet: back into the mailbox
+        // until the display monitor's update kicks the presenter again.
+        let waited = narf_time::wall::monotonic_ns().saturating_sub(frame.queued_ns);
+        if planes_pending(display) && waited < PLANES_WAIT_NS {
+            {
+                let mut next = slot.next.lock();
+                *next = Some(match *next {
+                    Some(newer) => frame.merged(newer),
+                    None => frame,
+                });
+            }
+            slot.presenting.store(false, Ordering::Release);
+            // The update may have landed meanwhile; its kick found the
+            // presenter still running.
+            if !planes_pending(display) && !slot.presenting.swap(true, Ordering::AcqRel) {
+                continue;
+            }
+            return;
+        }
         let result = {
             let mut owner = OWNER.lock().await;
+            // A relight in another format since the frame was queued.
+            if frame
+                .primary
+                .is_some_and(|f| slot.format.load(Ordering::Acquire) != f.format)
+            {
+                complete_flip(display, frame.ticket, None);
+                continue;
+            }
             match owner.as_mut() {
                 // SAFETY: the owner lock serializes display writers; the
-                // frame's dumb buffer stays valid under DRM's buffer rules.
+                // frame's dumb buffers stay valid under DRM's buffer rules.
                 Some(boot) => match unsafe { present_native(boot, display, frame).await } {
                     // The vblank the flip latched in, as DRM counts it.
-                    Ok((before, after, _)) => {
+                    Ok(Some((before, after))) => {
                         let latched = read_vblank(boot, display);
                         follow_flip(before, after).await;
                         Ok(latched)
                     }
+                    // Nothing this lighting shows: complete in place.
+                    Ok(None) => Ok(None),
                     Err(e) => Err(e),
                 },
                 None => Err(crate::amdgpu_dcn401_otg::Error::Busy),
@@ -2687,44 +3829,199 @@ async fn presenter(display: u8) {
     }
 }
 
-/// Copy `frame` into the back buffer of the live pipe, then flip to it.
-/// Returns the published front before and after, and the flip.
+/// Copy each plane of `frame` into its back buffer on display `pipe`'s
+/// live scanout, then flip those planes together. Returns the published
+/// front before and after, or None when the frame updates no plane the
+/// display shows.
 /// # Safety
-/// The caller holds the owner lock; `frame` names a mapped dumb buffer.
+/// The caller holds the owner lock; `frame` names mapped dumb buffers.
 async unsafe fn present_native(
     boot: &mut boot::ColdBoot,
     pipe: u8,
     frame: Frame,
-) -> Result<
-    (GenericFb, GenericFb, crate::amdgpu_dcn401_otg::FlipDone),
-    crate::amdgpu_dcn401_otg::Error,
-> {
+) -> Result<Option<(GenericFb, GenericFb)>, crate::amdgpu_dcn401_otg::Error> {
     // A previous presenter may have been cancelled while draining the old
     // front after a successful flip. Finish that barrier before reusing it.
     crate::scanout_access::wait_retired().await;
-    let back = boot.display_back_framebuffer(pipe)?;
-    let width = frame.width.min(back.width);
-    for y in 0..frame.height.min(back.height) {
-        let at = frame.phys + u64::from(y) * u64::from(frame.pitch);
-        // SAFETY: a kernel-mapped dumb buffer row of at least `width` pixels
-        // (pitch >= 4 * width was checked when queued).
-        let row = unsafe {
-            core::slice::from_raw_parts(
-                narf_memory::PhysAddr::new(at).kernel_ptr::<u32>(),
-                width as usize,
-            )
+    let shown = *present_slot(pipe).shown.lock();
+    let mut planes = 0u8;
+    // A frame of another tiling than the plane shows waits for the relight
+    // that switches it, as one of another format does.
+    let surface_of = |g: Option<boot::PlaneGeometry>| {
+        g.map_or(crate::amdgpu_dcn401_otg::PlaneSurface::LINEAR, |g| {
+            g.surface
+        })
+    };
+    if let Some(f) = frame.primary {
+        let g = shown.planes.primary;
+        if f.tiling() == Some(surface_of(g).tiling) {
+            // SAFETY: the caller's obligations.
+            unsafe { copy_plane(boot, pipe, pipe, f, g) }.await?;
+            planes |= 1;
+        }
+    }
+    for (k, f) in frame.overlays.iter().enumerate() {
+        let (Some(f), Some(o), Some(q)) = (f, shown.planes.overlays[k], shown.overlay_pipes[k])
+        else {
+            continue;
         };
+        // An overlay shown in another format waits for its relight.
+        if Some(o.format) != SurfaceFormat::from_fourcc(f.format)
+            || f.tiling() != Some(o.geometry.surface.tiling)
+        {
+            continue;
+        }
+        // SAFETY: the caller's obligations.
+        unsafe { copy_plane(boot, pipe, q, *f, Some(o.geometry)) }.await?;
+        planes |= 1 << (k + 1);
+    }
+    if planes == 0 {
+        return Ok(None);
+    }
+    let before = boot.display_scanout_framebuffer(pipe)?;
+    // SAFETY: the back buffers hold the complete frame; no other writer
+    // touches them until the next flip (the owner lock is held).
+    unsafe { boot.flip_display_planes(pipe, planes).await }?;
+    Ok(Some((before, boot.display_scanout_framebuffer(pipe)?)))
+}
+
+/// Copy framebuffer `f` into the back buffer of display `display`'s plane
+/// on `plane_pipe`, shown with geometry `g` (none: the full-frame
+/// primary): a linear RGB plane's source rectangle (its surface is the
+/// rectangle's size) row by row; a tiled or 4:2:0 plane's whole
+/// framebuffer (its surface is the framebuffer) block row by block row.
+/// # Safety
+/// As for `present_native`.
+async unsafe fn copy_plane(
+    boot: &mut boot::ColdBoot,
+    display: u8,
+    plane_pipe: u8,
+    f: PlaneFrame,
+    g: Option<boot::PlaneGeometry>,
+) -> Result<(), crate::amdgpu_dcn401_otg::Error> {
+    let format =
+        SurfaceFormat::from_fourcc(f.format).ok_or(crate::amdgpu_dcn401_otg::Error::Invalid)?;
+    if let Some(g) = g.filter(|g| g.whole_framebuffer(format)) {
+        // SAFETY: the caller's obligations.
+        return unsafe { copy_whole_plane(boot, display, plane_pipe, f, format, g) }.await;
+    }
+    let (sx, sy) = g.map_or((0, 0), |g| (g.src_x, g.src_y));
+    let back = boot.display_back_framebuffer(plane_pipe)?;
+    let cpp = u32::from(back.bpp / 8);
+    let width = f.width.saturating_sub(sx).min(back.width);
+    // The row's pixels as packed 32-bit words; an odd RGB565 row ends in a
+    // half word, read alone so the copy never reads past the row.
+    let bytes = (width * cpp) as usize;
+    let mut row = alloc::vec![0u32; bytes.div_ceil(4)];
+    for y in 0..f.height.saturating_sub(sy).min(back.height) {
+        let at = f.phys + u64::from(sy + y) * u64::from(f.pitch) + u64::from(sx * cpp);
+        // SAFETY: a kernel-mapped dumb buffer row of at least `bytes` bytes
+        // past the origin (pitch >= width * bytes per pixel was checked when
+        // queued, and the rectangle lies within the framebuffer).
+        unsafe {
+            let src = narf_memory::PhysAddr::new(at).kernel_ptr::<u8>();
+            core::ptr::copy_nonoverlapping(src, row.as_mut_ptr().cast::<u8>(), bytes);
+        }
         // SAFETY: serialized retained owner; caller excludes writers.
-        unsafe { boot.upload_display_back(pipe, 0, y, row) }?;
+        unsafe {
+            if plane_pipe == display {
+                boot.upload_display_back(display, 0, y, &row)
+            } else {
+                boot.upload_display_plane_back(display, plane_pipe, 0, y, &row)
+            }
+        }?;
         if y % 64 == 63 {
             narf_scheduler::yield_now().await;
         }
     }
-    let before = boot.display_scanout_framebuffer(pipe)?;
-    // SAFETY: the back buffer holds the complete frame; no other writer
-    // touches it until the next flip (the owner lock is held).
-    let done = unsafe { boot.flip_display(pipe).await }?;
-    Ok((before, boot.display_scanout_framebuffer(pipe)?, done))
+    Ok(())
+}
+
+/// `copy_plane` for a tiled or 4:2:0 plane: each plane of the framebuffer
+/// (luma, then a 4:2:0 framebuffer's chroma) block row by block row into
+/// the surface's layout (`SurfaceRequest::bytes`). A block row of
+/// `pitch` bytes holds `pitch / block pitch` whole swizzle blocks, so the
+/// first surface-pitch bytes of each of the framebuffer's block rows are
+/// the blocks the surface holds (its pitch is the framebuffer's minimum,
+/// which amdgpu_display_verify_sizes keeps the framebuffer's pitch above).
+/// # Safety
+/// As for `present_native`.
+async unsafe fn copy_whole_plane(
+    boot: &mut boot::ColdBoot,
+    display: u8,
+    plane_pipe: u8,
+    f: PlaneFrame,
+    format: SurfaceFormat,
+    g: boot::PlaneGeometry,
+) -> Result<(), crate::amdgpu_dcn401_otg::Error> {
+    use crate::amdgpu_dcn401_otg::Error;
+    let (width, height) = g.fb_size;
+    if (f.width, f.height) != (width, height) {
+        return Err(Error::Invalid);
+    }
+    let layout = crate::amdgpu_dcn401_otg::SurfaceRequest {
+        pipe: plane_pipe,
+        width,
+        height,
+        format,
+        odm: crate::amdgpu_dcn401_otg::SplitPipes::NONE,
+        mpc: crate::amdgpu_dcn401_otg::SplitPipes::NONE,
+        plane: None,
+        surface: g.surface,
+    }
+    .bytes();
+    let swizzle = g.surface.tiling.swizzle;
+    // (surface offset, surface pitch, framebuffer offset and pitch, bytes
+    // per element, rows): the luma plane, then the chroma's at half height
+    // (amdgpu_display_verify_plane's truncated plane height).
+    let mut planes = alloc::vec![(
+        0u64,
+        layout.pitch_bytes,
+        f.offsets[0],
+        f.pitch,
+        format.bytes_per_pixel(),
+        height
+    )];
+    if let Some((offset, pitch)) = layout.chroma {
+        planes.push((
+            offset,
+            pitch,
+            f.offsets[1],
+            f.chroma_pitch,
+            format.chroma_bytes_per_pixel(),
+            height / 2,
+        ));
+    }
+    let mut chunk = alloc::vec::Vec::new();
+    let mut copied = 0u32;
+    for (at, pitch, from, fb_pitch, cpp, rows) in planes {
+        let (_, block_height) = swizzle.block(cpp);
+        if fb_pitch < pitch {
+            return Err(Error::Invalid);
+        }
+        let bytes = (pitch * block_height) as usize;
+        chunk.resize(bytes / 4, 0u32);
+        for j in 0..rows.div_ceil(block_height) {
+            let src = f.phys
+                + u64::from(from)
+                + u64::from(j) * u64::from(fb_pitch) * u64::from(block_height);
+            // SAFETY: a kernel-mapped dumb buffer: ADDFB2's
+            // amdgpu_display_verify_sizes holds every block row of each
+            // plane within the BO.
+            unsafe {
+                let p = narf_memory::PhysAddr::new(src).kernel_ptr::<u8>();
+                core::ptr::copy_nonoverlapping(p, chunk.as_mut_ptr().cast::<u8>(), bytes);
+            }
+            let to = at + u64::from(j) * bytes as u64;
+            // SAFETY: serialized retained owner; caller excludes writers.
+            unsafe { boot.upload_display_plane_back_bytes(display, plane_pipe, to, &chunk) }?;
+            copied += 1;
+            if copied % 16 == 0 {
+                narf_scheduler::yield_now().await;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Show a premultiplied ARGB8888 cursor (at most 64x64) on a live pipe.
@@ -2755,6 +4052,231 @@ pub unsafe fn try_move_display_cursor(
     let boot = owner.as_mut()?;
     // SAFETY: serialized retained owner; caller excludes external writers.
     Some(unsafe { boot.move_display_cursor(pipe, position) })
+}
+
+// ── DRM cursor planes ────────────────────────────────────────────────
+//
+// A DRM commit of display k's cursor plane (amdgpu_dm_commit_cursors /
+// handle_cursor_update) sets what pipe k's hardware cursor shows; a task
+// converges the hardware to it under OWNER, as do monitor passes (after a
+// relight, as amdgpu_dm programs the cursor after the planes). It is a FAST
+// update: the cursor's attributes and position on every pipe of the
+// stream, nothing relit. While DRM drives a display's cursor the console's
+// pointer stays off it; on lastclose (`restore_displays`) DRM's cursor goes
+// off and the console's pointer is uploaded again.
+
+/// A DRM cursor plane's framebuffer as the hardware cursor shows it: its
+/// premultiplied ARGB8888 rows (at most 64x64), copied out of the BO.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CursorImage {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u32>,
+}
+
+/// One display's DRM cursor plane as last committed.
+struct DrmCursor {
+    /// The image it shows; None while the plane is off.
+    image: Option<Arc<CursorImage>>,
+    /// The image is not uploaded yet.
+    upload: bool,
+    /// CRTC_X/Y: the image's top-left on the CRTC (negative moves into the
+    /// hotspot, amdgpu_dm_plane_get_cursor_position).
+    position: (i32, i32),
+    /// A commit the hardware has not converged to; a task converges it.
+    dirty: bool,
+    running: bool,
+}
+impl DrmCursor {
+    const OFF: Self = Self {
+        image: None,
+        upload: false,
+        position: (0, 0),
+        dirty: false,
+        running: false,
+    };
+}
+static DRM_CURSORS: [narf_lib::sync::IrqSafeSpinLock<DrmCursor>; 4] =
+    [const { narf_lib::sync::IrqSafeSpinLock::new(DrmCursor::OFF) }; 4];
+/// Displays (by bit) whose cursor DRM drives: the console's stays off them.
+static DRM_CURSOR_OWNED: AtomicU8 = AtomicU8::new(0);
+/// Displays whose cursor DRM let go of: the console uploads its pointer
+/// again rather than moving DRM's image.
+static CONSOLE_CURSOR_STALE: AtomicU8 = AtomicU8::new(0);
+/// A position no pipe shows: the hardware cursor off
+/// (amdgpu_dm_plane_get_cursor_position's position.enable false).
+const CURSOR_OFF: (i32, i32) = (
+    -(crate::amdgpu_dcn401_otg::CURSOR_MAX as i32),
+    -(crate::amdgpu_dcn401_otg::CURSOR_MAX as i32),
+);
+
+/// Commit display `display`'s DRM cursor plane: `image` shown at
+/// `position`, or off (None). Never waits: the hardware converges in a
+/// task. False for a display there is none of.
+pub fn request_display_cursor(
+    display: u8,
+    image: Option<CursorImage>,
+    position: (i32, i32),
+) -> bool {
+    let Some(slot) = DRM_CURSORS.get(usize::from(display)) else {
+        return false;
+    };
+    DRM_CURSOR_OWNED.fetch_or(1 << display, Ordering::AcqRel);
+    CONSOLE_CURSOR_STALE.fetch_and(!(1 << display), Ordering::AcqRel);
+    let spawn = {
+        let mut c = slot.lock();
+        match image {
+            Some(image) => {
+                if c.image.as_deref() != Some(&image) {
+                    c.image = Some(Arc::new(image));
+                    c.upload = true;
+                }
+            }
+            None => c.image = None,
+        }
+        c.position = position;
+        c.dirty = true;
+        !core::mem::replace(&mut c.running, true)
+    };
+    if spawn {
+        narf_scheduler::spawn(drm_cursor_task(display));
+    }
+    true
+}
+
+/// Lastclose: DRM's cursors go off and the console's pointer returns.
+fn release_drm_cursors() {
+    let owned = DRM_CURSOR_OWNED.swap(0, Ordering::AcqRel);
+    for display in (0..DRM_CURSORS.len() as u8).filter(|d| owned & (1 << d) != 0) {
+        let spawn = {
+            let mut c = DRM_CURSORS[usize::from(display)].lock();
+            c.image = None;
+            c.upload = false;
+            c.dirty = true;
+            !core::mem::replace(&mut c.running, true)
+        };
+        if spawn {
+            narf_scheduler::spawn(drm_cursor_task(display));
+        }
+    }
+}
+
+/// Whether DRM drives display `pipe`'s cursor.
+fn drm_owns_cursor(pipe: u8) -> bool {
+    DRM_CURSOR_OWNED.load(Ordering::Acquire) & (1u8 << (pipe & 7)) != 0
+}
+
+async fn drm_cursor_task(display: u8) {
+    let slot = &DRM_CURSORS[usize::from(display)];
+    loop {
+        {
+            let mut c = slot.lock();
+            if !c.dirty {
+                c.running = false;
+                return;
+            }
+            c.dirty = false;
+        }
+        let mut owner = OWNER.lock().await;
+        if let Some(boot) = owner.as_mut() {
+            // SAFETY: serialized retained owner; the platform excludes
+            // other display writers while OWNER is held.
+            unsafe { converge_drm_cursor(boot, display) };
+        }
+    }
+}
+
+/// Every display whose cursor DRM drives, after a monitor pass (a relight
+/// starts its pipes without a cursor).
+/// # Safety
+/// As for `converge_drm_cursor`.
+unsafe fn converge_drm_cursors(boot: &mut boot::ColdBoot) {
+    let owned = DRM_CURSOR_OWNED.load(Ordering::Acquire);
+    for display in (0..DRM_CURSORS.len() as u8).filter(|d| owned & (1 << d) != 0) {
+        // SAFETY: forwarded.
+        unsafe { converge_drm_cursor(boot, display) };
+    }
+}
+
+/// What display `display`'s hardware cursor needs to show its DRM cursor
+/// plane, and doing it: handle_cursor_update's attributes (a new image, or
+/// none on the pipe) and position, or the cursor off.
+/// # Safety
+/// Serialized retained owner; exclude other display writers.
+unsafe fn converge_drm_cursor(boot: &mut boot::ColdBoot, display: u8) {
+    let slot = &DRM_CURSORS[usize::from(display)];
+    let (image, upload, position) = {
+        let mut c = slot.lock();
+        let snapshot = (c.image.clone(), c.upload, c.position);
+        c.upload = false;
+        snapshot
+    };
+    let current = boot
+        .display_status(display)
+        .ok()
+        .flatten()
+        .and_then(|s| s.cursor)
+        .filter(|c| c.pipe == display);
+    let size = image.as_deref().map(|i| (i.width, i.height));
+    // A failure quarantines the pipe in the owner; the cursor just stops.
+    let result = match drm_cursor_step(current, size, upload, position) {
+        CursorStep::Keep => Ok(()),
+        // SAFETY: the caller's obligations.
+        CursorStep::Hide => unsafe { boot.move_display_cursor(display, CURSOR_OFF) }.map(drop),
+        // SAFETY: as above.
+        CursorStep::Move => unsafe { boot.move_display_cursor(display, position) }.map(drop),
+        CursorStep::Upload => match image.as_deref() {
+            // SAFETY: as above.
+            Some(i) => unsafe {
+                boot.set_display_cursor(display, (i.width, i.height, &i.pixels), position)
+            }
+            .map(drop),
+            None => Ok(()),
+        },
+    };
+    if result.is_err() && upload {
+        // Not shown (the pipe not scanning out yet): the next converge
+        // uploads it.
+        slot.lock().upload = true;
+    }
+    if !drm_owns_cursor(display) {
+        CONSOLE_CURSOR_STALE.fetch_or(1 << display, Ordering::AcqRel);
+    }
+}
+
+/// One step of a hardware cursor towards a DRM cursor plane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CursorStep {
+    Keep,
+    Hide,
+    Move,
+    Upload,
+}
+
+/// The step from `current` (the pipe's programmed cursor) to a plane
+/// showing an image of `size` (None: off) at `position`, `upload` when the
+/// image is new: an image the pipe does not hold (none, another size, or a
+/// new one) is uploaded with its position, the one it holds is moved, and
+/// an off plane hides a visible cursor.
+fn drm_cursor_step(
+    current: Option<crate::amdgpu_dcn401_otg::CursorApplied>,
+    size: Option<(u32, u32)>,
+    upload: bool,
+    position: (i32, i32),
+) -> CursorStep {
+    match (size, current) {
+        (None, Some(c)) if c.visible => CursorStep::Hide,
+        (None, _) => CursorStep::Keep,
+        (Some(_), _) if upload => CursorStep::Upload,
+        (Some(size), Some(c)) if (c.width, c.height) == size => {
+            if (c.x, c.y) == position {
+                CursorStep::Keep
+            } else {
+                CursorStep::Move
+            }
+        }
+        (Some(_), _) => CursorStep::Upload,
+    }
 }
 
 /// Highest HDMI output depth native modesets may pick (8, 10 or 12 bpc;
@@ -2790,6 +4312,15 @@ pub enum MonitorStep {
     /// The configuration was lit again (a new sink, a CRTC switched back on,
     /// another mode or output range): this many displays now run.
     Relit(u8),
+    /// New sinks were lit beside the running displays, which stayed lit
+    /// through a seamless clock change: this many displays were added.
+    LitBeside(u8),
+    /// After a display left, the remaining ones moved to the plans of the
+    /// smaller configuration in place (clocks lowered after): this many.
+    Replanned(u8),
+    /// The display moved to DRM's new planes or plane format while it
+    /// scanned out (DC's medium or full update, no relight).
+    PlanesUpdated(u8),
 }
 
 /// Record DRM's CRTC on/off request for display `display`. Level-triggered:
@@ -2839,6 +4370,299 @@ pub fn request_connector_crtc(connector: u32, display: Option<u8>) -> bool {
                 outputs.route(k, None);
             }
             true
+        }
+    }
+}
+
+/// Record DRM's CRTC CTM and GAMMA_LUT for display `display` (blob bytes
+/// the bridge validated) as the color they program on DCN 4.0.1
+/// (`color_program`). Not a modeset: the stream updater reprograms a live
+/// scanout at once; a dark display takes it at its next scanout start.
+pub fn request_crtc_color(display: u8, request: crate::amdgpu_native_kms::CrtcColorRequest) {
+    let program = color_program(&request).map(Arc::new);
+    {
+        let mut outputs = OUTPUTS.lock();
+        let Some(c) = outputs.crtcs.get_mut(usize::from(display)) else {
+            return;
+        };
+        c.color = program;
+    }
+    kick_stream_updater();
+}
+
+/// amdgpu_dm_update_crtc_color_mgmt and amdgpu_dm_update_plane_color_mgmt
+/// for a CRTC whose plane has no color of its own, on DCN 4.0.1:
+/// - a 256-entry GAMMA_LUT is legacy gamma (__set_legacy_tf: sRGB-based
+///   regamma) whose input the PRE_DEGAM sRGB ROM linearizes
+///   (cm_is_degamma_srgb, map_crtc_degamma_to_dc_plane);
+/// - a 4096-entry one that is not linear (__is_lut_linear) becomes the
+///   distributed-points regamma of amdgpu_dm_set_atomic_regamma; a linear
+///   one, like none, bypasses the OGAM;
+/// - a CTM is the stream's gamut remap (__drm_ctm_to_dc_matrix).
+///
+/// None when everything is bypass.
+fn color_program(
+    request: &crate::amdgpu_native_kms::CrtcColorRequest,
+) -> Option<crate::amdgpu_dcn401_otg::ColorProgram> {
+    let program = crate::amdgpu_dcn401_otg::ColorProgram::from_crtc(
+        request.ctm.as_deref(),
+        request.gamma_lut.as_deref(),
+    )?;
+    (program != crate::amdgpu_dcn401_otg::ColorProgram::default()).then_some(program)
+}
+
+/// The connectors amdgpu_dm gives Colorspace and HDR_OUTPUT_METADATA: the
+/// board's HDMI and DP ones and, as dm_dp_add_mst_connector attaches the
+/// root's colorspace property and amdgpu_dm_connector_init_helper the HDR
+/// metadata property, every MST end device's.
+fn color_connector(target: Target) -> bool {
+    matches!(target, Target::Board(_) | Target::Mst(..))
+}
+
+/// The connectors amdgpu_dm gives "max bpc" (8..16): every board connector
+/// (amdgpu_dm_connector_init_helper) and every MST end device's
+/// (dm_dp_add_mst_connector attaches the root's property).
+fn max_bpc_connector(target: Target) -> bool {
+    matches!(target, Target::Board(_) | Target::Mst(..))
+}
+
+/// Record DRM's "Colorspace" and HDR_OUTPUT_METADATA for connector
+/// `request.connector`. A new Colorspace, or metadata appearing or
+/// disappearing, relights the display driving it (the display monitor
+/// compares them with what it lit, as amdgpu_dm makes them a modeset);
+/// new metadata while HDR stays on goes to the running stream at once.
+pub fn request_connector_color(request: crate::amdgpu_native_kms::ConnectorColorRequest) {
+    let Some(index) = crate::amdgpu_navi48_kms::connector_index(request.connector) else {
+        return;
+    };
+    {
+        let mut outputs = OUTPUTS.lock();
+        let Some(c) = outputs.connectors.iter_mut().find(|c| c.index == index) else {
+            return;
+        };
+        c.colorspace = request.colorspace;
+        c.hdr = request.hdr_output_metadata;
+        // drm_hdmi_infoframe_set_hdr_metadata only notes an EOTF the
+        // sink's HDR Static Metadata Data Block does not list.
+        let metadata = c
+            .hdr
+            .as_deref()
+            .and_then(|b| crate::amdgpu_hdr::HdrOutputMetadata::from_blob(b).ok());
+        if let Some(m) = metadata {
+            let sink = crate::amdgpu_hdr::hdr_sink_metadata(&c.edid).map_or(0, |s| s.eotf);
+            let eotf = m.hdmi_metadata_type1.eotf;
+            if !crate::amdgpu_hdr::eotf_supported_by_sink(eotf, sink) {
+                let _ = core::fmt::Write::write_fmt(
+                    &mut narf_console::Writer,
+                    format_args!("amdgpu: navi48 connector {index}: unknown EOTF {eotf}\n"),
+                );
+            }
+        }
+    }
+    kick_stream_updater();
+}
+
+/// Record DRM's "max bpc" for connector `connector` (a KMS id): the depth
+/// cap of its next selection. A display it drives lights again with it
+/// (the display monitor compares it with what it lit, as DRM makes a new
+/// max_requested_bpc a modeset).
+pub fn request_connector_max_bpc(connector: u32, bpc: u8) {
+    let Some(index) = crate::amdgpu_navi48_kms::connector_index(connector) else {
+        return;
+    };
+    if let Some(c) = OUTPUTS
+        .lock()
+        .connectors
+        .iter_mut()
+        .find(|c| c.index == index)
+    {
+        c.max_bpc = bpc;
+    }
+}
+
+/// Display `k`'s connector's Colorspace and HDR metadata (Default and none
+/// without a routed connector).
+fn connector_color(
+    outputs: &Outputs,
+    k: usize,
+) -> (u32, Option<crate::amdgpu_hdr::HdrOutputMetadata>) {
+    outputs.crtcs[k]
+        .route
+        .and_then(|t| outputs.connector(t))
+        .map_or((0, None), |c| {
+            let hdr = c
+                .hdr
+                .as_deref()
+                .and_then(|b| crate::amdgpu_hdr::HdrOutputMetadata::from_blob(b).ok());
+            (c.colorspace, hdr)
+        })
+}
+
+/// Whether connector `connector`'s lit stream can carry `colorspace` and,
+/// with `hdr`, HDR packets: every lit transport (HDMI TMDS and FRL, DP
+/// 8b/10b and 128b/132b, SST and MST) carries both. A dark connector
+/// accepts both for its next lighting.
+pub fn connector_color_supported(connector: u32, colorspace: u32, hdr: bool) -> bool {
+    let Some(index) = crate::amdgpu_navi48_kms::connector_index(connector) else {
+        return true;
+    };
+    let outputs = OUTPUTS.lock();
+    let Some(k) = outputs
+        .connectors
+        .iter()
+        .find(|c| c.index == index)
+        .and_then(|c| outputs.crtc_of(c.target))
+    else {
+        return true;
+    };
+    let c = &outputs.crtcs[k];
+    let (hdr_ok, colorimetry_ok) = if c.shown.is_some() {
+        c.color_signals
+    } else {
+        (true, true)
+    };
+    (!hdr || hdr_ok) && (colorspace == 0 || colorimetry_ok)
+}
+static STREAM_UPDATER: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static STREAM_DIRTY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Run the stream updater (once at a time) to apply new non-modeset stream
+/// state: CRTC color and HDR metadata.
+fn kick_stream_updater() {
+    STREAM_DIRTY.store(true, Ordering::Release);
+    if !STREAM_UPDATER.swap(true, Ordering::AcqRel) {
+        narf_scheduler::spawn(stream_updater());
+    }
+}
+async fn stream_updater() {
+    loop {
+        STREAM_DIRTY.store(false, Ordering::Release);
+        {
+            let mut owner = OWNER.lock().await;
+            if let Some(boot) = owner.as_mut() {
+                converge_streams(boot).await;
+            }
+        }
+        STREAM_UPDATER.store(false, Ordering::Release);
+        // A request that raced the release reruns the updater here.
+        if !STREAM_DIRTY.load(Ordering::Acquire) || STREAM_UPDATER.swap(true, Ordering::AcqRel) {
+            return;
+        }
+    }
+}
+
+/// Bring every display's CRTC color to what DRM committed: recorded for a
+/// dark display's next lighting, reprogrammed on a live one (amdgpu_dm's
+/// non-modeset update). A refused change is reported and retried by the
+/// display monitor's next pass.
+async fn converge_streams(boot: &mut boot::ColdBoot) {
+    let wants: [Option<Arc<crate::amdgpu_dcn401_otg::ColorProgram>>; 4] = {
+        let outputs = OUTPUTS.lock();
+        core::array::from_fn(|k| outputs.crtcs[k].color.clone())
+    };
+    // New HDR metadata on a stream that already sends it: a stream update.
+    // Entering or leaving HDR (or a new Colorspace) waits for the relight.
+    let colors: [(u32, Option<crate::amdgpu_hdr::HdrOutputMetadata>); 4] = {
+        let outputs = OUTPUTS.lock();
+        core::array::from_fn(|k| connector_color(&outputs, k))
+    };
+    for m in boot.display_modesets().into_iter().flatten() {
+        let k = usize::from(m.pipe);
+        let (colorspace, Some(metadata)) = colors[k] else {
+            continue;
+        };
+        if colorspace != m.selection.colorspace || m.selection.hdr.is_none() {
+            continue;
+        }
+        let want = crate::amdgpu_navi48_boot::Selection {
+            hdr: Some(metadata),
+            ..m.selection
+        }
+        .hdr_packet();
+        let Some(want) = want.filter(|w| boot.display_hdr(m.pipe) != Some(*w)) else {
+            continue;
+        };
+        // SAFETY: OWNER is held; the platform excludes other display writers.
+        if let Err(e) = unsafe { boot.set_display_hdr(m.pipe, want) }.await {
+            let _ = core::fmt::Write::write_fmt(
+                &mut narf_console::Writer,
+                format_args!("amdgpu: navi48 display {k} HDR metadata not applied: {e:?}\n"),
+            );
+        }
+    }
+    for (k, want) in wants.into_iter().enumerate() {
+        let have = boot.display_color(k as u8);
+        let same = match (&have, &want) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            continue;
+        }
+        // SAFETY: OWNER is held; the platform excludes other display writers.
+        if let Err(e) = unsafe { boot.set_display_color(k as u8, want) }.await {
+            let _ = core::fmt::Write::write_fmt(
+                &mut narf_console::Writer,
+                format_args!("amdgpu: navi48 display {k} color not applied: {e:?}\n"),
+            );
+        }
+    }
+}
+
+/// Record DRM's "VRR_ENABLED" for CRTC `display`. Like Linux, a request
+/// for a sink or mode that cannot vary its refresh is accepted and the
+/// display stays fixed. A running display is reprogrammed at once when the
+/// owner is free (no modeset: only its timing's DRR changes), otherwise by
+/// the display monitor's next pass.
+pub fn request_vrr_enabled(display: u8, enabled: bool) {
+    {
+        let mut outputs = OUTPUTS.lock();
+        let Some(c) = outputs.crtcs.get_mut(usize::from(display)) else {
+            return;
+        };
+        c.vrr = enabled;
+    }
+    let Some(mut owner) = OWNER.try_lock() else {
+        return;
+    };
+    if let Some(boot) = owner.as_mut() {
+        converge_vrr(boot);
+    }
+}
+
+/// What DRR display `pipe`'s lit modeset should run: its mode's totals
+/// while DRM enabled VRR on its CRTC and the mode is VRR-supported.
+fn wanted_drr(m: &Modeset, vrr: bool) -> Option<crate::amdgpu_freesync::Drr> {
+    vrr.then(|| m.selection.drr()).flatten()
+}
+
+/// Bring every live scanout's DRR to what DRM asked (amdgpu_dm's
+/// VRR_STATE_ACTIVE_VARIABLE or INACTIVE). Displays not scanning out are
+/// left alone (their timing is fixed); a refused change is reported and
+/// retried by the next pass.
+fn converge_vrr(boot: &mut boot::ColdBoot) {
+    let wants: [bool; 4] = {
+        let outputs = OUTPUTS.lock();
+        core::array::from_fn(|k| outputs.crtcs[k].vrr && outputs.crtcs[k].published_active())
+    };
+    for m in boot.display_modesets().into_iter().flatten() {
+        let k = usize::from(m.pipe);
+        let Ok(Some(status)) = boot.display_status(m.pipe) else {
+            continue;
+        };
+        if status.state != crate::amdgpu_dcn401_otg::State::ScanoutRunning(m.pipe) {
+            continue;
+        }
+        let want = wanted_drr(&m, wants[k]);
+        if status.drr.map(|a| a.drr) == want {
+            continue;
+        }
+        // SAFETY: OWNER is held; the platform excludes other timing writers.
+        if let Err(e) = unsafe { boot.set_display_drr(m.pipe, want) } {
+            let _ = core::fmt::Write::write_fmt(
+                &mut narf_console::Writer,
+                format_args!("amdgpu: navi48 display {k} DRR not applied: {e:?}\n"),
+            );
         }
     }
 }
@@ -2898,13 +4722,268 @@ pub fn request_display_mode(
     }
 }
 
+/// Record the primary plane format DRM's framebuffer on display
+/// `display`'s CRTC holds (a DRM fourcc). A running display scanning
+/// another format is lit again with it, as a mode request is. False for a
+/// format the native plane does not scan out.
+pub fn request_display_format(display: u8, fourcc: u32) -> bool {
+    let Some(format) = SurfaceFormat::from_fourcc(fourcc) else {
+        return false;
+    };
+    match OUTPUTS.lock().crtcs.get_mut(usize::from(display)) {
+        Some(c) => {
+            if c.format != format {
+                c.format = format;
+                PLANES_PENDING.store(true, Ordering::Release);
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// Record DRM's planes on display `display`'s CRTC beyond a full-frame
+/// unscaled primary: the primary's placement and the overlays (bottom
+/// first). A running display showing other planes moves to them without
+/// relighting (amdgpu_dm's plane commit: DC's medium or full update,
+/// `ColdBoot::update_display_planes`), within a frame or two of the
+/// display monitor; it relights only when that needs a modeset. False for
+/// a display past the fourth.
+pub fn request_display_planes(display: u8, setup: boot::PlaneSetup) -> bool {
+    match OUTPUTS.lock().crtcs.get_mut(usize::from(display)) {
+        Some(c) => {
+            if c.planes != setup {
+                c.planes = setup;
+                PLANES_PENDING.store(true, Ordering::Release);
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// A plane or plane format request the display monitor has not seen yet:
+/// it wakes for it rather than waiting out its period.
+static PLANES_PENDING: AtomicBool = AtomicBool::new(false);
+/// How often a sleeping display monitor looks for plane requests.
+const PLANES_POLL_MS: u64 = 16;
+
+/// Whether display `display`'s requested planes or plane format differ
+/// from what its presenter shows: frames wait for the update.
+fn planes_pending(display: u8) -> bool {
+    let slot = present_slot(display);
+    let shown = slot.shown.lock().planes;
+    let format = slot.format.load(Ordering::Acquire);
+    OUTPUTS
+        .lock()
+        .crtcs
+        .get(usize::from(display))
+        .is_some_and(|c| c.active && (c.planes != shown || c.format.fourcc() != format))
+}
+
+/// The planes display `display` would light with.
+pub fn requested_display_planes(display: u8) -> boot::PlaneSetup {
+    OUTPUTS
+        .lock()
+        .crtcs
+        .get(usize::from(display))
+        .map_or(boot::PlaneSetup::NONE, |c| c.planes)
+}
+
+/// Why `display_admits_planes` refused a plane configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanesRefused {
+    /// The display is not lit on that connector and timing, so its
+    /// configuration cannot be admitted (another mode needs its own lighting).
+    NotLit,
+    /// A plane's surface or placement fails staging's checks (SPL).
+    Plane,
+    /// The planes need more pipes than the configuration has free.
+    Pipes,
+    /// DML21 cannot carry the configuration (bandwidth, clocks, latency).
+    Bandwidth,
+}
+
+/// Whether display `display` can show the planes `setup` with its primary
+/// in `fourcc`, in `mode` (its current timing when None) on its routed
+/// connector, or on `connector` when the same request routes it there: the
+/// configuration of every lit display, with this display's planes, must be
+/// DML21-admitted together (dc_validate_global_state), each plane must pass
+/// staging's SPL checks on its pipes, and every plane must get a pipe of
+/// its own (two on an ODM 2:1 stream) beside the other displays'. The
+/// full-frame unscaled primary alone is `display_admits_format`.
+pub fn display_admits_planes(
+    display: u8,
+    connector: Option<u32>,
+    mode: Option<&crate::drm::ioctl::DrmModeModeInfo>,
+    fourcc: u32,
+    setup: &boot::PlaneSetup,
+) -> Result<(), PlanesRefused> {
+    if *setup == boot::PlaneSetup::NONE {
+        return display_admits_format(display, connector, mode, fourcc)
+            .then_some(())
+            .ok_or(PlanesRefused::Bandwidth);
+    }
+    let format = SurfaceFormat::from_fourcc(fourcc).ok_or(PlanesRefused::Plane)?;
+    let k = usize::from(display);
+    let (joint, soc) = {
+        let outputs = OUTPUTS.lock();
+        let c = outputs.crtcs.get(k).ok_or(PlanesRefused::NotLit)?;
+        let (Some((soc, _)), Some((_, timing, _))) = (c.admitted, &c.shown) else {
+            return Err(PlanesRefused::NotLit);
+        };
+        let target = match connector {
+            Some(id) => outputs.target_of_id(id),
+            None => c.route,
+        };
+        let same_timing =
+            mode.is_none_or(|m| outputs.find_mode(k, None, m).as_ref() == Some(timing));
+        if target != c.route || !same_timing {
+            return Err(PlanesRefused::NotLit);
+        }
+        let joint: Vec<(usize, dml::Mode)> = outputs
+            .crtcs
+            .iter()
+            .enumerate()
+            .filter_map(|(n, c)| Some((n, c.admitted?.1)))
+            .collect();
+        (joint, soc)
+    };
+    admits_with_planes(&soc, &joint, k, format, setup)
+}
+
+/// DML admission and pipe assignment of the lit configuration `joint`
+/// (display, admitted mode; in pipe order) with display `k`'s planes.
+fn admits_with_planes(
+    soc: &dml::Soc,
+    joint: &[(usize, dml::Mode)],
+    k: usize,
+    format: SurfaceFormat,
+    setup: &boot::PlaneSetup,
+) -> Result<(), PlanesRefused> {
+    let modes: Vec<dml::Mode> = joint
+        .iter()
+        .map(|&(n, m)| {
+            if n == k {
+                boot::with_planes(m, format, setup)
+            } else {
+                m
+            }
+        })
+        .collect();
+    let at = joint
+        .iter()
+        .position(|&(n, _)| n == k)
+        .ok_or(PlanesRefused::NotLit)?;
+    let plans = dml::admit_native(soc, &modes).map_err(|e| match e {
+        dml::Error::Pipes => PlanesRefused::Pipes,
+        dml::Error::Unsupported | dml::Error::Invalid => PlanesRefused::Plane,
+        _ => PlanesRefused::Bandwidth,
+    })?;
+    // Every display's ODM segments, MPC slices and overlays take the pipes
+    // the displays leave, as lighting assigns them.
+    let pipes: Vec<u8> = joint.iter().map(|&(n, _)| n as u8).collect();
+    let extra = boot::plan_pipes(&plans, &pipes).map_err(|_| PlanesRefused::Pipes)?;
+    let m = &modes[at];
+    let d = extra[at];
+    let (primary, stack) = boot::stream_planes(
+        &m.timing,
+        m.ycbcr420,
+        format,
+        setup,
+        (pipes[at], d.odm, d.mpc),
+        &d.overlays,
+    );
+    for r in core::iter::once(primary).chain(stack.into_iter().flatten()) {
+        r.check().map_err(|_| PlanesRefused::Plane)?;
+    }
+    Ok(())
+}
+
+/// Whether display `display` can scan out a `fourcc` plane in `mode` (its
+/// current timing when None) on its routed connector, or on `connector`
+/// when the same request routes it there; the timing itself must be one
+/// the display offers (`display_offers`). Formats of the depth its offered
+/// timings were admitted at (the running plane's, else 4 bytes) need
+/// nothing more. Another depth is DML-admitted against the running
+/// configuration, which needs the display lit, on the same connector and
+/// timing: otherwise it is refused, never guessed.
+pub fn display_admits_format(
+    display: u8,
+    connector: Option<u32>,
+    mode: Option<&crate::drm::ioctl::DrmModeModeInfo>,
+    fourcc: u32,
+) -> bool {
+    let Some(format) = SurfaceFormat::from_fourcc(fourcc) else {
+        return false;
+    };
+    let k = usize::from(display);
+    let (joint, soc) = {
+        let outputs = OUTPUTS.lock();
+        let Some(c) = outputs.crtcs.get(k) else {
+            return false;
+        };
+        let current = c.admitted.map_or(4, |(_, m)| m.bytes_per_pixel);
+        if format.bytes_per_pixel() == current {
+            return true;
+        }
+        let (Some((soc, _)), Some((_, timing, _))) = (c.admitted, &c.shown) else {
+            return false;
+        };
+        let target = match connector {
+            Some(id) => outputs.target_of_id(id),
+            None => c.route,
+        };
+        let same_timing =
+            mode.is_none_or(|m| outputs.find_mode(k, None, m).as_ref() == Some(timing));
+        if target != c.route || !same_timing {
+            return false;
+        }
+        let joint: Vec<(usize, dml::Mode)> = outputs
+            .crtcs
+            .iter()
+            .enumerate()
+            .filter_map(|(n, c)| Some((n, c.admitted?.1)))
+            .collect();
+        (joint, soc)
+    };
+    admits_with_format(&soc, &joint, k, format)
+}
+
+/// DML admission of the lit configuration `joint` (display, admitted mode;
+/// in pipe order) with display `k`'s plane in `format`.
+fn admits_with_format(
+    soc: &dml::Soc,
+    joint: &[(usize, dml::Mode)],
+    k: usize,
+    format: SurfaceFormat,
+) -> bool {
+    let modes: Vec<dml::Mode> = joint
+        .iter()
+        .map(|&(n, m)| {
+            if n != k {
+                return m;
+            }
+            dml::Mode {
+                pitch: format.pitch_bytes(m.timing.h_active) / format.bytes_per_pixel(),
+                bytes_per_pixel: format.bytes_per_pixel(),
+                ..m
+            }
+        })
+        .collect();
+    joint.iter().any(|&(n, _)| n == k) && dml::admit_native(soc, &modes).is_ok()
+}
+
 /// Every display back to the console's defaults (on, preferred mode,
 /// automatic routing), as drm_fb_helper restores the console on lastclose.
 pub fn restore_displays() {
+    release_drm_cursors();
     let mut outputs = OUTPUTS.lock();
     for c in outputs.crtcs.iter_mut() {
         c.active = true;
         c.requested = None;
+        c.format = SurfaceFormat::Xrgb8888;
+        c.planes = boot::PlaneSetup::NONE;
         c.explicit = false;
     }
     for x in outputs.connectors.iter_mut() {
@@ -3010,6 +5089,7 @@ async unsafe fn retire_monitored_display(
     {
         let mut outputs = OUTPUTS.lock();
         outputs.crtcs[usize::from(pipe)].shown = None;
+        outputs.crtcs[usize::from(pipe)].admitted = None;
         // A disable need not relight siblings. Retain the modes already
         // admitted beside them, without a CRTC mode; the next configuration
         // or reprobe recomputes independent admission.
@@ -3051,6 +5131,7 @@ pub async unsafe fn monitor_displays(
         displays.considered = 0;
         for c in &mut OUTPUTS.lock().crtcs {
             c.shown = None;
+            c.admitted = None;
             c.retiring = false;
         }
     }
@@ -3098,9 +5179,26 @@ pub async unsafe fn monitor_displays(
         }
     }
     let mst_port = OUTPUTS.lock().mst_port();
-    let wants: [(bool, Option<Timing>); 4] = {
+    let wants: [(bool, Option<Timing>, SurfaceFormat, boot::PlaneSetup); 4] = {
         let outputs = OUTPUTS.lock();
-        core::array::from_fn(|k| (outputs.crtcs[k].active, outputs.crtcs[k].requested))
+        core::array::from_fn(|k| {
+            let c = &outputs.crtcs[k];
+            (c.active, c.requested, c.format, c.planes)
+        })
+    };
+    // A new Colorspace, or entering or leaving HDR, is a modeset
+    // (amdgpu_dm_connector_atomic_check); new metadata in HDR is not.
+    let colors: [(u32, bool); 4] = {
+        let outputs = OUTPUTS.lock();
+        core::array::from_fn(|k| {
+            let (colorspace, hdr) = connector_color(&outputs, k);
+            (colorspace, hdr.is_some())
+        })
+    };
+    // So is a new "max bpc" (connectors_changed).
+    let bpc_changed: [bool; 4] = {
+        let outputs = OUTPUTS.lock();
+        core::array::from_fn(|k| outputs.max_bpc_changed(k))
     };
     let limited =
         crate::amdgpu_navi48_boot::limited_range(crate::amdgpu_navi48_boot::broadcast_rgb());
@@ -3110,6 +5208,8 @@ pub async unsafe fn monitor_displays(
         })
         .fold(0u8, |mask, p| mask | (1 << p));
     let mut relight = false;
+    // Displays whose planes or plane format DRM changed.
+    let mut plane_updates = 0u8;
     for port in board_ports(boot) {
         if Some(port) == mst_port {
             continue;
@@ -3129,7 +5229,22 @@ pub async unsafe fn monitor_displays(
             && boot.display_hpd(port) == Ok(true)
             && boot.display_mst(port).is_some()
         {
+            let shown = |boot: &boot::ColdBoot| {
+                boot.display_mst(port).map(|l| {
+                    l.outputs.each_ref().map(|o| {
+                        o.as_ref()
+                            .map(|o| (o.id, o.sink, o.edid.len(), o.modes.clone()))
+                    })
+                })
+            };
+            let before = shown(boot);
             relight |= boot.service_display_mst(port).await?;
+            // A change adopted beside the running streams shows its
+            // connectors at once.
+            if shown(boot) != before {
+                reconcile_mst_outputs(boot, port);
+                publish_outputs();
+            }
         }
     }
     for k in monitor_order(pending_mask) {
@@ -3158,8 +5273,19 @@ pub async unsafe fn monitor_displays(
         if rerouted
             || desired.is_some_and(|d| d != m.selection.timing)
             || limited != m.selection.limited
+            || colors[usize::from(k)] != (m.selection.colorspace, m.selection.hdr.is_some())
+            || bpc_changed[usize::from(k)]
         {
             relight = true;
+            continue;
+        }
+        // A plane or plane format change is no modeset (amdgpu_dm's plane
+        // commit, DC's medium or full update): done below without leaving
+        // scanout, relit only when that needs one.
+        if wants[usize::from(k)].2 != m.selection.format
+            || wants[usize::from(k)].3 != m.selection.planes
+        {
+            plane_updates |= 1 << k;
             continue;
         }
         // SAFETY: serialized retained owners; writers stay excluded.
@@ -3223,6 +5349,22 @@ pub async unsafe fn monitor_displays(
             }
         }
     }
+    // New planes on displays that otherwise run on: DC's plane update with
+    // the stream running, unless a relight is due anyway or the update
+    // needs a modeset.
+    if relight {
+        plane_updates = 0;
+    }
+    for k in (0..4u8).filter(|&k| plane_updates & 1 << k != 0) {
+        let (format, setup) = (wants[usize::from(k)].2, wants[usize::from(k)].3);
+        // SAFETY: as above; the display stays lit and published.
+        if unsafe { update_lit_planes(boot, displays, k, format, setup) }.await? {
+            steps.push(MonitorStep::PlanesUpdated(k));
+        } else {
+            relight = true;
+            break;
+        }
+    }
     // Sinks to light: a plugged connector, routed (automatically for a new
     // sink) to a CRTC DRM has not switched off.
     OUTPUTS.lock().assign_routes();
@@ -3233,7 +5375,40 @@ pub async unsafe fn monitor_displays(
         .enumerate()
         .filter(|(_, m)| m.is_some())
         .fold(0u8, |acc, (k, _)| acc | 1 << k);
+    let retired_now = steps
+        .iter()
+        .any(|s| matches!(s, MonitorStep::Unplugged(_) | MonitorStep::Disabled(_)));
+    let (mut relit, mut lit_beside) = (false, false);
     if needs_relight(relight, wanted, lit_mask, &mut displays.considered) {
+        relit = true;
+        // Only new sinks (nothing a running display asked for changed):
+        // light them beside the running displays, which stay lit through
+        // the shared clocks' seamless change, unless that is refused.
+        let beside = if !relight && lit_mask != 0 {
+            let fill = |_: u8, _: u32, row: &mut [u32]| row.fill(0);
+            // SAFETY: as above; the running displays stay lit and published.
+            unsafe { light_beside(boot, &displays.lit, fill) }.await?
+        } else {
+            None
+        };
+        if let Some(config) = beside {
+            if let Some(e) = config.failed {
+                let _ = core::fmt::Write::write_fmt(
+                    &mut narf_console::Writer,
+                    format_args!("amdgpu: navi48 display failed to light: {e:?}\n"),
+                );
+            }
+            let mut count = 0;
+            for m in config.displays {
+                count += u8::from(lit_mask & 1 << m.pipe == 0);
+                displays.lit[usize::from(m.pipe)] = Some(m);
+            }
+            displays.considered = wanted_mask(boot);
+            steps.push(MonitorStep::LitBeside(count));
+            lit_beside = true;
+        }
+    }
+    if relit && !lit_beside {
         // Withdraw every writer, stop every display, light them again.
         for k in (0..4u8).rev() {
             let Some(m) = displays.lit[usize::from(k)] else {
@@ -3255,15 +5430,23 @@ pub async unsafe fn monitor_displays(
                 );
                 None
             }
-            Err(e) if wants.iter().any(|w| w.1.is_some()) && !pending_display_work(boot) => {
-                // A requested mode did not light: go back to the preferred
-                // modes rather than leave the sinks dark.
+            Err(e)
+                if wants.iter().any(|w| {
+                    w.1.is_some() || w.2 != SurfaceFormat::Xrgb8888 || w.3 != boot::PlaneSetup::NONE
+                }) && !pending_display_work(boot) =>
+            {
+                // A requested mode, plane format or plane configuration did
+                // not light: go back to the preferred XRGB8888 modes with
+                // the full-frame primary alone rather than leave the sinks
+                // dark.
                 let _ = core::fmt::Write::write_fmt(
                     &mut narf_console::Writer,
                     format_args!("amdgpu: navi48 mode switch failed: {e:?}\n"),
                 );
                 for c in OUTPUTS.lock().crtcs.iter_mut() {
                     c.requested = None;
+                    c.format = SurfaceFormat::Xrgb8888;
+                    c.planes = boot::PlaneSetup::NONE;
                 }
                 // SAFETY: as above.
                 Some(unsafe { light_displays(boot, fill) }.await?)
@@ -3300,10 +5483,43 @@ pub async unsafe fn monitor_displays(
                 .fold(0, |acc, (k, _)| acc | 1 << k);
         }
         steps.push(MonitorStep::Relit(count));
+    } else if retired_now && lit_mask != 0 {
+        // A display left the others running: they move to the smaller
+        // configuration's plans in place, its clocks lowered after. A
+        // configuration DML no longer admits as planned stays as it is.
+        // SAFETY: as above; the running displays stay lit and published.
+        match unsafe { boot.replan_displays() }.await {
+            Ok(running) => {
+                let mut outputs = OUTPUTS.lock();
+                for m in &running {
+                    if let Some(c) = outputs.crtcs.get_mut(usize::from(m.pipe)) {
+                        c.admitted = Some((m.plan.soc, m.plan.mode));
+                    }
+                }
+                drop(outputs);
+                let count = running.len() as u8;
+                for m in running {
+                    displays.lit[usize::from(m.pipe)] = Some(m);
+                }
+                steps.push(MonitorStep::Replanned(count));
+            }
+            Err(ModesetError::Display(crate::amdgpu_dcn401_otg::Error::Admission(_))) => {}
+            Err(e) => return Err(e),
+        }
     }
     if !steps.is_empty() {
         publish_outputs();
     }
+    // VRR_ENABLED needs no relight: converge every live timing's DRR.
+    converge_vrr(boot);
+    // Nor do CRTC color and HDR metadata changes.
+    converge_streams(boot).await;
+    // Frames that waited for this pass's relight in a new plane format.
+    kick_presenters();
+    // DRM cursors on the pipes this pass lit (amdgpu_dm commits the cursor
+    // after the planes).
+    // SAFETY: the caller's obligations; OWNER is held.
+    unsafe { converge_drm_cursors(boot) };
     Ok(steps)
 }
 
@@ -3365,7 +5581,20 @@ pub unsafe fn spawn_display_monitor(config: crate::amdgpu_navi48_boot::Configura
             } else {
                 MONITOR_MS
             };
-            if crate::amdgpu_navi48_dispatch::wait_hotplug(&mut hotplug, interval).await {
+            // Sleep out the period in short steps, cut short by a hot-plug
+            // event or by DRM's plane requests (applied within a frame or
+            // two, as amdgpu_dm commits them).
+            let mut woke = false;
+            let mut slept = 0;
+            while slept < interval && !PLANES_PENDING.swap(false, Ordering::AcqRel) {
+                let step = PLANES_POLL_MS.min(interval - slept);
+                if crate::amdgpu_navi48_dispatch::wait_hotplug(&mut hotplug, step).await {
+                    woke = true;
+                    break;
+                }
+                slept += step;
+            }
+            if woke {
                 // Acknowledge (and re-arm the opposite edge of) every port's
                 // raised HPD/HPD-RX before the pass reads the sense.
                 let mut owner = OWNER.lock().await;
@@ -3382,16 +5611,27 @@ pub unsafe fn spawn_display_monitor(config: crate::amdgpu_navi48_boot::Configura
             // SAFETY: the spawner's obligations hold for the task's lifetime.
             match unsafe { monitor_displays(&mut displays) }.await {
                 Ok(steps) => {
-                    for step in steps {
+                    // Plane updates follow DRM commits, possibly every
+                    // frame: not worth a console line each.
+                    for step in steps
+                        .into_iter()
+                        .filter(|s| !matches!(s, MonitorStep::PlanesUpdated(_)))
+                    {
                         let _ = writeln!(narf_console::Writer, "amdgpu: navi48 display {step:?}");
                     }
                 }
                 Err(e) => {
-                    // The failed owner stays quarantined where it stopped.
+                    // The failed owner stays quarantined where it stopped;
+                    // only a whole-device reset can reconcile its hardware.
+                    // Recovery relights through a fresh monitor.
                     let _ = writeln!(
                         narf_console::Writer,
                         "amdgpu: navi48 display monitor stopped: {e:?}"
                     );
+                    let submitter = SUBMITTER.lock().clone();
+                    if let Some(submitter) = submitter {
+                        submitter.request_device_recovery("display owner quarantined");
+                    }
                     return;
                 }
             }
@@ -3772,6 +6012,7 @@ mod tests {
             port: 2,
             edid: alloc::vec![0; 256],
             modes: alloc::vec![timing],
+            vrr_capable: false,
         };
         let mut o = Outputs::new();
         o.reshape(&[(target, ConnectorType::DisplayPort, 0)]);
@@ -3819,6 +6060,134 @@ mod tests {
         navi48_dark_sst_connector_preserves_disable_and_invalidates_replacement
     );
 
+    /// A display's Colorspace and HDR metadata are its routed connector's,
+    /// kept across reshaping; an HDR blob of the wrong size is none; only
+    /// board connectors carry them.
+    fn navi48_connector_color_follows_the_route() -> TestResult {
+        let target = Target::Board(0);
+        let mut o = Outputs::new();
+        o.reshape(&[board(0)]);
+        let mut blob = alloc::vec![0u8; 32];
+        blob[4] = 2;
+        {
+            let c = o.connector_mut(target).unwrap();
+            c.colorspace = 9;
+            c.hdr = Some(blob.clone());
+        }
+        if connector_color(&o, 0) != (0, None) {
+            return TestResult::Fail("unrouted display");
+        }
+        o.crtcs[0].route = Some(target);
+        let want = crate::amdgpu_hdr::HdrOutputMetadata::from_blob(&blob).ok();
+        if connector_color(&o, 0) != (9, want) {
+            return TestResult::Fail("routed connector's color");
+        }
+        o.reshape(&[board(0), board(1)]);
+        if connector_color(&o, 0) != (9, want) {
+            return TestResult::Fail("color across reshape");
+        }
+        o.connector_mut(target).unwrap().hdr = Some(alloc::vec![0; 30]);
+        if connector_color(&o, 0) != (9, None) {
+            return TestResult::Fail("malformed metadata");
+        }
+        if !color_connector(target) || !color_connector(Target::Mst(0, 0)) {
+            return TestResult::Fail("color connectors");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi48-kms",
+        navi48_connector_color_follows_the_route
+    );
+
+    /// DRM's "max bpc" stays with its connector (board or MST end device,
+    /// 16 until set, kept across reshaping); a lighting hands every
+    /// connector's to the selection (`set_requested_bpc`) and records the
+    /// routed one's on the CRTCs it lights, and a later change is a modeset
+    /// of the display driving that connector only.
+    fn navi48_connector_max_bpc_relights_its_display() -> TestResult {
+        let (sst, mst) = (Target::Board(0), Target::Mst(1, 2));
+        let mst_shape = (mst, ConnectorType::DisplayPort, MST_INDEX + 2);
+        let mut o = Outputs::new();
+        o.reshape(&[board(0), mst_shape]);
+        if o.connectors.iter().any(|c| c.max_bpc != 16) {
+            return TestResult::Fail("initial max bpc");
+        }
+        o.crtcs[0].route = Some(sst);
+        o.crtcs[1].route = Some(mst);
+        o.connector_mut(mst).unwrap().max_bpc = 10;
+        o.stage_requested_bpc(|k| k == 0);
+        let staged = (
+            boot::requested_bpc(0, None),
+            boot::requested_bpc(1, Some(2)),
+            o.crtcs[0].lit_bpc,
+            o.crtcs[1].lit_bpc,
+        );
+        // Unlit and unrouted CRTCs compare nothing.
+        let unlit = (0..4).any(|k| o.max_bpc_changed(k));
+        o.connector_mut(sst).unwrap().max_bpc = 12;
+        o.reshape(&[board(0), board(1), mst_shape]);
+        let kept = o.connector(sst).map(|c| c.max_bpc) == Some(12)
+            && o.connector(mst).map(|c| c.max_bpc) == Some(10);
+        let changed = o.max_bpc_changed(0) && !o.max_bpc_changed(1);
+        o.stage_requested_bpc(|k| k < 2);
+        let settled = !o.max_bpc_changed(0)
+            && !o.max_bpc_changed(1)
+            && boot::requested_bpc(0, None) == 12
+            && o.crtcs[1].lit_bpc == Some(10);
+        boot::set_requested_bpc(0, None, 16);
+        boot::set_requested_bpc(1, Some(2), 16);
+        if staged != (16, 10, Some(16), None) || unlit {
+            return TestResult::Fail("staged max bpc");
+        }
+        if !kept || !changed || !settled {
+            return TestResult::Fail("max bpc change");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi48-kms",
+        navi48_connector_max_bpc_relights_its_display
+    );
+
+    /// A board sink's FreeSync capability follows its discovery (published
+    /// as "vrr_capable"), survives reshaping, and goes with the sink; a
+    /// CRTC's VRR_ENABLED request is DRM's and starts off.
+    fn navi48_connector_vrr_capability_follows_discovery() -> TestResult {
+        let target = Target::Board(0);
+        let mut output = boot::SstOutput {
+            port: 0,
+            edid: alloc::vec![0; 128],
+            modes: alloc::vec![hd()],
+            vrr_capable: true,
+        };
+        let mut o = Outputs::new();
+        o.reshape(&[board(0)]);
+        assert!(o.crtcs.iter().all(|c| !c.vrr));
+        o.connector_mut(target)
+            .unwrap()
+            .reconcile_sst(Some(&output));
+        assert!(o.connector(target).unwrap().vrr_capable);
+        o.reshape(&[board(0), board(1)]);
+        assert!(o.connector(target).unwrap().vrr_capable);
+        output.vrr_capable = false;
+        o.connector_mut(target)
+            .unwrap()
+            .reconcile_sst(Some(&output));
+        assert!(!o.connector(target).unwrap().vrr_capable);
+        output.vrr_capable = true;
+        o.connector_mut(target)
+            .unwrap()
+            .reconcile_sst(Some(&output));
+        o.connector_mut(target).unwrap().observe_sst_hpd(false);
+        assert!(!o.connector(target).unwrap().vrr_capable);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi48-kms",
+        navi48_connector_vrr_capability_follows_discovery
+    );
+
     fn navi48_retraining_refreshes_published_modes_and_drops_invalid_requests() -> TestResult {
         let timing = hd();
         let faster = Timing {
@@ -3859,6 +6228,7 @@ mod tests {
             sink: Some(crate::dp_mst_mgr::Sink { branch: 1, port: 3 }),
             edid: alloc::vec![0; 256],
             modes: Vec::new(),
+            dsc: None,
         };
         let timing = hd();
         let target = Target::Mst(0, 1);
@@ -4016,20 +6386,21 @@ mod tests {
     /// its wrap and a relight into DRM's vblank count.
     fn navi48_present_completes_refused_flip_and_extends_vblanks() -> TestResult {
         use crate::drm::card::flips;
+        const XRGB8888: u32 = 0x3432_5258;
         // On every display: its own flip log, its own refusal.
         for display in 0..4 {
             let ticket = flips(display).lock().reserve();
             if native_present_ready(display) {
                 return TestResult::Fail("test kernel unexpectedly presents natively");
             }
-            if present_frame(display, 0x1000, 64, 16, 16, Some(ticket)) {
+            if present_frame(display, 0x1000, 64, 16, 16, Some(ticket), XRGB8888) {
                 return TestResult::Fail("frame taken without a native display");
             }
             if flips(display).lock().stamp(ticket).is_none() {
                 return TestResult::Fail("refused frame left its event waiting");
             }
         }
-        if native_present_ready(4) || present_frame(9, 0x1000, 64, 16, 16, None) {
+        if native_present_ready(4) || present_frame(9, 0x1000, 64, 16, 16, None, XRGB8888) {
             return TestResult::Fail("display out of range presents");
         }
         use crate::amdgpu_dcn401_otg::VblankPhase;
@@ -4115,6 +6486,38 @@ mod tests {
         navi48_monitor_relights_only_for_new_sinks_and_changes
     );
 
+    /// Automatic recovery follows amdgpu.gpu_recovery and the per-boot
+    /// budget, once per submitter generation.
+    fn navi48_automatic_recovery_is_budgeted_once_per_generation() -> TestResult {
+        use core::sync::atomic::AtomicBool;
+        __reset_automatic_recoveries();
+        // SAFETY: model only; nothing is spawned by `decide_recovery`.
+        unsafe { set_automatic_recovery(false) };
+        let generation = AtomicBool::new(false);
+        assert_eq!(decide_recovery(&generation), RecoveryDecision::Disabled);
+        assert_eq!(
+            decide_recovery(&generation),
+            RecoveryDecision::AlreadyRequested
+        );
+        // SAFETY: as above.
+        unsafe { set_automatic_recovery(true) };
+        for _ in 0..MAX_AUTOMATIC_RECOVERIES {
+            let fresh = AtomicBool::new(false);
+            assert_eq!(decide_recovery(&fresh), RecoveryDecision::Recover);
+            assert_eq!(decide_recovery(&fresh), RecoveryDecision::AlreadyRequested);
+        }
+        let last = AtomicBool::new(false);
+        assert_eq!(decide_recovery(&last), RecoveryDecision::LimitReached);
+        // SAFETY: as above.
+        unsafe { set_automatic_recovery(false) };
+        __reset_automatic_recoveries();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi48",
+        navi48_automatic_recovery_is_budgeted_once_per_generation
+    );
+
     /// After an SDMA0 reset, the clears the ring held past where it
     /// stopped go back to the queue's front, in order and unsignalled;
     /// those it completed are forgotten, and a drain starts only if none
@@ -4126,9 +6529,22 @@ mod tests {
             let fence = Arc::new(ClearFence::new(progress.clone()));
             fence.seq.store(seq, Ordering::Release);
             Clear {
-                address,
-                bytes: 4096,
+                work: if address == 0x3000 {
+                    // Copies requeue exactly like fills.
+                    Work::Copy {
+                        src: address,
+                        dst: 0x9000,
+                        bytes: 4096,
+                        upload: None,
+                    }
+                } else {
+                    Work::Fill {
+                        address,
+                        bytes: 4096,
+                    }
+                },
                 fence,
+                _held: None,
             }
         };
         let mut state = ClearState::default();
@@ -4146,7 +6562,12 @@ mod tests {
         let queued: Vec<(u64, u64)> = state
             .queued
             .iter()
-            .map(|c| (c.address, c.fence.seq.load(Ordering::Acquire)))
+            .map(|c| {
+                let address = match c.work {
+                    Work::Fill { address, .. } | Work::Copy { src: address, .. } => address,
+                };
+                (address, c.fence.seq.load(Ordering::Acquire))
+            })
             .collect();
         if !state.inflight.is_empty()
             || queued != [(0x2000, u64::MAX), (0x3000, u64::MAX), (0x4000, u64::MAX)]
@@ -4202,6 +6623,38 @@ mod tests {
             || clear_batch(core::iter::empty()) != 1
         {
             return TestResult::Fail("clear batching");
+        }
+        let progress: SdmaProgress = Arc::new(|| Some(0));
+        let request = |work| Clear {
+            work,
+            fence: Arc::new(ClearFence::new(progress.clone())),
+            _held: None,
+        };
+        let fill = || {
+            request(Work::Fill {
+                address: 0x10,
+                bytes: 4096,
+            })
+        };
+        let copy = || {
+            request(Work::Copy {
+                src: 0x10,
+                dst: 0x9000,
+                bytes: 4096,
+                upload: None,
+            })
+        };
+        if work_batch([fill(), fill(), copy(), fill()].iter()) != 2
+            || work_batch([copy(), copy()].iter()) != 1
+            || work_batch([copy(), fill()].iter()) != 1
+            || copy().work.op()
+                != (crate::amdgpu_sdma_navi48::KernelOp::Copy {
+                    src: 0x10,
+                    dst: 0x9000,
+                    bytes: 4096,
+                })
+        {
+            return TestResult::Fail("copy batching");
         }
         if !clear_fits(0x10, 32 * GIB)
             || clear_fits(0x10, 32 * GIB + 4)
@@ -4303,4 +6756,508 @@ mod tests {
         "drivers/gpu/amdgpu/navi48",
         navi48_training_refuses_live_firmware_in_overwritten_prefix
     );
+
+    /// A plane format request is recorded per CRTC and reset with the
+    /// console; restore and a failed relight return XRGB8888. A format of
+    /// the depth the display's offered timings were admitted at needs
+    /// nothing more; another is DML-admitted against the lit configuration:
+    /// two 3840x2160 533.25 MHz streams on a two-channel 456 MHz UCLK board
+    /// (a Linux DML21 multi_vectors.txt plan at 4 bytes) take RGB565 on one
+    /// of them but not FP16, by the port's DML21 admission (Linux rejects
+    /// both streams at FP16 in format_vectors.txt).
+    fn navi48_plane_formats_request_and_admit() -> TestResult {
+        const XR24: u32 = 0x3432_5258;
+        const XR30: u32 = 0x3033_5258;
+        const AB30: u32 = 0x3033_4241;
+        const RG16: u32 = 0x3631_4752;
+        const XR4H: u32 = 0x4834_5258;
+        const RA24: u32 = 0x3432_4152;
+        let saved: [_; 4] = {
+            let o = OUTPUTS.lock();
+            core::array::from_fn(|k| {
+                let c = &o.crtcs[k];
+                (c.format, c.admitted, c.shown.clone(), c.route)
+            })
+        };
+        let restore = || {
+            let mut o = OUTPUTS.lock();
+            for (c, (format, admitted, shown, route)) in o.crtcs.iter_mut().zip(saved.clone()) {
+                (c.format, c.admitted, c.shown, c.route) = (format, admitted, shown, route);
+            }
+        };
+        let result = (|| {
+            if !request_display_format(1, XR30)
+                || OUTPUTS.lock().crtcs[1].format != SurfaceFormat::Xrgb2101010
+                || request_display_format(4, XR24)
+                || request_display_format(1, RA24)
+                || OUTPUTS.lock().crtcs[1].format != SurfaceFormat::Xrgb2101010
+            {
+                return TestResult::Fail("format requests");
+            }
+            let soc = dml::Soc {
+                umc_channels: 2,
+                uclk_khz: 456_000,
+                fclk_khz: [300_000, 2_500_000],
+                dcfclk_khz: [200_000, 1_564_000],
+                socclk_khz: 300_000,
+                dispclk_max_khz: 2_000_000,
+                dppclk_max_khz: 2_000_000,
+                dentist_vco_khz: 4_500_000,
+                dchub_refclk_khz: 50_000,
+            };
+            let timing = Timing {
+                pixel_clock_khz: 533_250,
+                h_active: 3840,
+                h_total: 4000,
+                h_front_porch: 48,
+                h_sync_width: 32,
+                v_active: 2160,
+                v_total: 2222,
+                v_front_porch: 3,
+                v_sync_width: 5,
+                h_sync_positive: true,
+                v_sync_positive: true,
+            };
+            let mode = crate::amdgpu_navi48_boot::plane_mode(timing, SurfaceFormat::Xrgb8888);
+            {
+                let mut o = OUTPUTS.lock();
+                for c in o.crtcs.iter_mut() {
+                    (c.admitted, c.shown, c.route) = (None, None, None);
+                }
+            }
+            // Dark: only the 4-byte formats the offered timings assume.
+            if !display_admits_format(0, None, None, AB30)
+                || display_admits_format(0, None, None, RG16)
+                || display_admits_format(0, None, None, XR4H)
+                || display_admits_format(0, None, None, RA24)
+            {
+                return TestResult::Fail("dark display formats");
+            }
+            {
+                let mut o = OUTPUTS.lock();
+                for c in o.crtcs.iter_mut().take(2) {
+                    c.admitted = Some((soc, mode));
+                    c.shown = Some(([0; 128], timing, alloc::vec![timing]));
+                }
+            }
+            if !display_admits_format(0, None, None, XR30)
+                || !display_admits_format(0, None, None, RG16)
+                || display_admits_format(0, None, None, XR4H)
+                || display_admits_format(1, None, None, XR4H)
+            {
+                return TestResult::Fail("lit configuration admission");
+            }
+            // Another timing or connector at another depth is not guessed.
+            let wire = crate::amdgpu_navi48_kms::timing_wire(&timing);
+            if display_admits_format(0, None, Some(&wire), RG16) {
+                return TestResult::Fail("depth change with an unverified timing");
+            }
+            // The admitted mode of another depth: its pitch and bytes.
+            let joint = [(0, mode), (1, mode)];
+            if !admits_with_format(&soc, &joint, 1, SurfaceFormat::Rgb565)
+                || admits_with_format(&soc, &joint, 1, SurfaceFormat::Abgr16161616f)
+                || admits_with_format(&soc, &joint, 2, SurfaceFormat::Rgb565)
+                || !admits_with_format(&soc, &joint[..1], 0, SurfaceFormat::Xrgb16161616f)
+            {
+                return TestResult::Fail("joint admission per depth");
+            }
+            restore_displays();
+            if OUTPUTS
+                .lock()
+                .crtcs
+                .iter()
+                .any(|c| c.format != SurfaceFormat::Xrgb8888)
+            {
+                return TestResult::Fail("console restore keeps a plane format");
+            }
+            TestResult::Pass
+        })();
+        restore();
+        result
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi48-kms",
+        navi48_plane_formats_request_and_admit
+    );
+
+    /// Plane configurations are requested per display and admitted against
+    /// the lit configuration: DML21 with every display's planes, a free
+    /// pipe per overlay (two on an ODM 2:1 stream) beside the other
+    /// displays' pipes, and staging's SPL checks; a dark display, another
+    /// timing or another connector cannot be checked and is refused.
+    fn navi48_planes_request_and_admit() -> TestResult {
+        use crate::amdgpu_dcn401_otg::Blend;
+        use crate::amdgpu_dcn401_spl::{Rect, Rotation};
+        const AR24: u32 = 0x3432_5241;
+        let saved: [_; 4] = {
+            let o = OUTPUTS.lock();
+            core::array::from_fn(|k| {
+                let c = &o.crtcs[k];
+                (c.planes, c.admitted, c.shown.clone(), c.route)
+            })
+        };
+        let restore = || {
+            let mut o = OUTPUTS.lock();
+            for (c, (planes, admitted, shown, route)) in o.crtcs.iter_mut().zip(saved.clone()) {
+                (c.planes, c.admitted, c.shown, c.route) = (planes, admitted, shown, route);
+            }
+        };
+        let result = (|| {
+            let geometry = |w: u32, h: u32, dst: Rect| boot::PlaneGeometry {
+                src_x: 0,
+                src_y: 0,
+                width: w,
+                height: h,
+                dst,
+                rotation: Rotation::R0,
+                blend: Blend::default_for(SurfaceFormat::Argb8888),
+                surface: crate::amdgpu_dcn401_otg::PlaneSurface::LINEAR,
+                fb_size: (w, h),
+            };
+            let overlay = |w, h, dst| boot::OverlayPlane {
+                geometry: geometry(w, h, dst),
+                format: SurfaceFormat::Argb8888,
+                underlay: false,
+                plane: 0,
+            };
+            let video = overlay(1280, 720, Rect::new(100, 100, 640, 360));
+            let one = boot::PlaneSetup {
+                primary: None,
+                overlays: [Some(video), None, None],
+            };
+            let three = boot::PlaneSetup {
+                primary: Some(geometry(1280, 720, Rect::new(0, 0, 1920, 1080))),
+                overlays: [Some(video); 3],
+            };
+            if !request_display_planes(1, one)
+                || requested_display_planes(1) != one
+                || request_display_planes(4, one)
+            {
+                return TestResult::Fail("plane requests");
+            }
+            let soc = dml::Soc {
+                umc_channels: 16,
+                uclk_khz: 1_250_000,
+                fclk_khz: [300_000, 2_500_000],
+                dcfclk_khz: [200_000, 1_564_000],
+                socclk_khz: 300_000,
+                dispclk_max_khz: 2_000_000,
+                dppclk_max_khz: 2_000_000,
+                dentist_vco_khz: 4_500_000,
+                dchub_refclk_khz: 50_000,
+            };
+            let timing = Timing {
+                pixel_clock_khz: 148_500,
+                h_active: 1920,
+                h_total: 2200,
+                h_front_porch: 88,
+                h_sync_width: 44,
+                v_active: 1080,
+                v_total: 1125,
+                v_front_porch: 4,
+                v_sync_width: 5,
+                h_sync_positive: true,
+                v_sync_positive: true,
+            };
+            let mode = crate::amdgpu_navi48_boot::plane_mode(timing, SurfaceFormat::Xrgb8888);
+            let light = |n: usize| {
+                let mut o = OUTPUTS.lock();
+                for (k, c) in o.crtcs.iter_mut().enumerate() {
+                    (c.admitted, c.shown) = if k < n {
+                        (
+                            Some((soc, mode)),
+                            Some(([0; 128], timing, alloc::vec![timing])),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                }
+            };
+            light(0);
+            if display_admits_planes(0, None, None, AR24, &one) != Err(PlanesRefused::NotLit) {
+                return TestResult::Fail("dark display");
+            }
+            light(1);
+            if display_admits_planes(0, None, None, AR24, &one).is_err()
+                || display_admits_planes(0, None, None, AR24, &three).is_err()
+            {
+                return TestResult::Fail("one display's overlays");
+            }
+            // Another timing cannot be admitted before it is lit.
+            let other = crate::amdgpu_navi48_kms::timing_wire(&Timing {
+                pixel_clock_khz: 74_250,
+                ..timing
+            });
+            if display_admits_planes(0, None, Some(&other), AR24, &one)
+                != Err(PlanesRefused::NotLit)
+            {
+                return TestResult::Fail("unverified timing");
+            }
+            // Two lit displays leave two free pipes: one display's three
+            // overlays need a fifth.
+            light(2);
+            if display_admits_planes(0, None, None, AR24, &one).is_err()
+                || display_admits_planes(0, None, None, AR24, &three) != Err(PlanesRefused::Pipes)
+            {
+                return TestResult::Fail("pipes beside another display");
+            }
+            // The other display's admitted overlays hold their pipes too.
+            let joint = [
+                (0, mode),
+                (
+                    1,
+                    crate::amdgpu_navi48_boot::with_planes(mode, SurfaceFormat::Xrgb8888, &one),
+                ),
+            ];
+            let two = boot::PlaneSetup {
+                overlays: [Some(video), Some(video), None],
+                ..one
+            };
+            if admits_with_planes(&soc, &joint, 0, SurfaceFormat::Argb8888, &one).is_err()
+                || admits_with_planes(&soc, &joint, 0, SurfaceFormat::Argb8888, &two)
+                    != Err(PlanesRefused::Pipes)
+            {
+                return TestResult::Fail("other display's overlays");
+            }
+            // A plane staging refuses (no pixel inside the stream) fails.
+            let outside = boot::PlaneSetup {
+                overlays: [
+                    Some(overlay(256, 256, Rect::new(4000, 100, 256, 256))),
+                    None,
+                    None,
+                ],
+                ..one
+            };
+            if display_admits_planes(0, None, None, AR24, &outside).is_ok() {
+                return TestResult::Fail("plane off the stream");
+            }
+            restore_displays();
+            if OUTPUTS
+                .lock()
+                .crtcs
+                .iter()
+                .any(|c| c.planes != boot::PlaneSetup::NONE)
+            {
+                return TestResult::Fail("console restore keeps planes");
+            }
+            TestResult::Pass
+        })();
+        restore();
+        result
+    }
+    kernel_test_in!("drivers/gpu/navi48-kms", navi48_planes_request_and_admit);
+
+    /// amdgpu_dm's should_reset_plane on a zpos change: an overlay both
+    /// configurations show (by DRM plane) moved across the primary or past
+    /// another kept overlay is recreated; one moved on the screen, added
+    /// or removed is not.
+    fn navi48_plane_zpos_changes_recreate_planes() -> TestResult {
+        use crate::amdgpu_dcn401_otg::Blend;
+        use crate::amdgpu_dcn401_spl::{Rect, Rotation};
+        let overlay = |plane: u32, x: i32, underlay: bool| boot::OverlayPlane {
+            geometry: boot::PlaneGeometry {
+                src_x: 0,
+                src_y: 0,
+                width: 64,
+                height: 64,
+                dst: Rect::new(x, 0, 64, 64),
+                rotation: Rotation::R0,
+                blend: Blend::default_for(SurfaceFormat::Argb8888),
+                surface: crate::amdgpu_dcn401_otg::PlaneSurface::LINEAR,
+                fb_size: (64, 64),
+            },
+            format: SurfaceFormat::Argb8888,
+            underlay,
+            plane,
+        };
+        let setup = |o: &[boot::OverlayPlane]| {
+            let mut s = boot::PlaneSetup::NONE;
+            for (slot, p) in s.overlays.iter_mut().zip(o) {
+                *slot = Some(*p);
+            }
+            s
+        };
+        let (a, b) = (overlay(0x44, 0, false), overlay(0x45, 100, false));
+        let ab = setup(&[a, b]);
+        let moved = setup(&[overlay(0x44, 300, false), b]);
+        if planes_reordered(&ab, &moved)
+            || planes_reordered(&ab, &setup(&[a]))
+            || planes_reordered(&setup(&[a]), &ab)
+            || !planes_reordered(&ab, &setup(&[b, a]))
+            || !planes_reordered(&ab, &setup(&[overlay(0x44, 0, true), b]))
+        {
+            return TestResult::Fail("zpos changes");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi48-kms",
+        navi48_plane_zpos_changes_recreate_planes
+    );
+
+    /// How a pipe's hardware cursor converges to its DRM cursor plane: a
+    /// new image, one of another size or a pipe without a cursor (a
+    /// relight) uploads; the image it holds moves, or stays when already
+    /// there; an off plane hides a visible cursor and leaves a hidden or
+    /// absent one.
+    fn navi48_drm_cursor_converges_like_handle_cursor_update() -> TestResult {
+        use crate::amdgpu_dcn401_otg::CursorApplied;
+        let held = CursorApplied {
+            pipe: 1,
+            address: 0x8000_0000,
+            width: 64,
+            height: 64,
+            x: 10,
+            y: 20,
+            visible: true,
+            shown: 0b10,
+        };
+        let hidden = CursorApplied {
+            x: CURSOR_OFF.0,
+            y: CURSOR_OFF.1,
+            visible: false,
+            shown: 0,
+            ..held
+        };
+        let cases = [
+            (None, Some((64, 64)), false, (0, 0), CursorStep::Upload),
+            (
+                Some(held),
+                Some((64, 64)),
+                true,
+                (10, 20),
+                CursorStep::Upload,
+            ),
+            (
+                Some(held),
+                Some((64, 32)),
+                false,
+                (10, 20),
+                CursorStep::Upload,
+            ),
+            (
+                Some(held),
+                Some((64, 64)),
+                false,
+                (10, 20),
+                CursorStep::Keep,
+            ),
+            (
+                Some(held),
+                Some((64, 64)),
+                false,
+                (-5, 20),
+                CursorStep::Move,
+            ),
+            (
+                Some(hidden),
+                Some((64, 64)),
+                false,
+                (10, 20),
+                CursorStep::Move,
+            ),
+            (Some(held), None, false, (10, 20), CursorStep::Hide),
+            (Some(hidden), None, false, (10, 20), CursorStep::Keep),
+            (None, None, true, (0, 0), CursorStep::Keep),
+        ];
+        for (current, size, upload, position, want) in cases {
+            if drm_cursor_step(current, size, upload, position) != want {
+                return TestResult::Fail("cursor step");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi48-kms",
+        navi48_drm_cursor_converges_like_handle_cursor_update
+    );
+}
+
+/// Light the plugged board sinks DRM wants beside the displays that run
+/// (output k on pipe k), which stay lit: `ColdBoot::modeset_beside`'s
+/// seamless configuration change (shared clocks raised before and lowered
+/// after, the running displays moved to their new plans in place). `None`
+/// when it is refused before any change (an MST configuration, the running
+/// displays no longer fitting as they are), for the caller to relight
+/// instead. Publishes the new displays as `light_displays` does and the
+/// running ones' new admission.
+/// # Safety
+/// As for `light_displays`, except that the running displays stay lit and
+/// published.
+async unsafe fn light_beside(
+    boot: &mut boot::ColdBoot,
+    lit: &[Option<Modeset>; 4],
+    fill: impl FnMut(u8, u32, &mut [u32]),
+) -> Result<Option<crate::amdgpu_navi48_boot::Configuration>, ModesetError> {
+    let lit_mask = lit.iter().flatten().fold(0u8, |acc, m| acc | 1 << m.pipe);
+    let (routes, wants) = {
+        let mut outputs = OUTPUTS.lock();
+        if outputs.mst_port().is_some() {
+            return Ok(None);
+        }
+        outputs.assign_routes();
+        let routes: [Option<Target>; 4] = core::array::from_fn(|k| {
+            let c = &outputs.crtcs[k];
+            c.route.filter(|_| c.active && lit_mask & 1 << k == 0)
+        });
+        let wants: [Option<Timing>; 4] = core::array::from_fn(|k| outputs.crtcs[k].requested);
+        for k in (0..4).filter(|&k| lit_mask & 1 << k == 0) {
+            let (colorspace, hdr) = connector_color(&outputs, k);
+            crate::amdgpu_navi48_boot::set_output_color(k as u8, colorspace, hdr);
+            let c = &outputs.crtcs[k];
+            crate::amdgpu_navi48_boot::set_plane_format(k as u8, c.format);
+            crate::amdgpu_navi48_boot::set_plane_setup(k as u8, c.planes);
+        }
+        outputs.stage_requested_bpc(|k| routes[k].is_some());
+        (routes, wants)
+    };
+    if routes.iter().all(|r| !matches!(r, Some(Target::Board(_)))) {
+        return Ok(None);
+    }
+    let crtc_of = |t: Target| routes.iter().position(|r| *r == Some(t));
+    let pipe = |port: usize| crtc_of(Target::Board(port)).map(|k| k as u8);
+    let want = |port: usize| crtc_of(Target::Board(port)).and_then(|k| wants[k]);
+    // SAFETY: the caller's obligations.
+    let Some(config) = unsafe { boot.modeset_beside(fill, want, pipe) }.await? else {
+        return Ok(None);
+    };
+    {
+        let mut outputs = OUTPUTS.lock();
+        for port in board_ports(boot) {
+            let hpd = boot.display_hpd(port).ok();
+            let sst = boot.display_sst_outputs().iter().find(|o| o.port == port);
+            let Some(x) = outputs.connector_mut(Target::Board(port)) else {
+                continue;
+            };
+            let changed = x.reconcile_sst(sst);
+            x.last_hpd = hpd;
+            if changed {
+                outputs.invalidate(Target::Board(port), false);
+            }
+        }
+        // The running displays' new admission and offered modes.
+        for m in config
+            .displays
+            .iter()
+            .filter(|m| lit_mask & 1 << m.pipe != 0)
+        {
+            if let Some(c) = outputs.crtcs.get_mut(usize::from(m.pipe)) {
+                c.admitted = Some((m.plan.soc, m.plan.mode));
+                if let Some(shown) = c.shown.as_mut() {
+                    shown.2 = m.modes.iter().flatten().copied().collect();
+                }
+            }
+        }
+    }
+    publish_outputs();
+    for m in config
+        .displays
+        .iter()
+        .filter(|m| lit_mask & 1 << m.pipe == 0)
+    {
+        // SAFETY: as above.
+        unsafe { adopt(boot, m) }.await;
+    }
+    publish_outputs();
+    Ok(Some(config))
 }

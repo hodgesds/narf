@@ -6483,6 +6483,187 @@ fn smoke_drm_addfb2_rmfb_roundtrip() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/drm", smoke_drm_addfb2_rmfb_roundtrip);
 
+/// drm_mode_addfb2 with DRM_MODE_FB_MODIFIERS: modifier[0] (offset 72 in
+/// the 104-byte drm_mode_fb_cmd2) of DRM_FORMAT_MOD_LINEAR is accepted; any
+/// other modifier, or an unknown flag, is refused before a framebuffer is
+/// made.
+fn smoke_drm_addfb2_accepts_only_linear_modifier() -> TestResult {
+    use crate::drm::ioctl::{dispatch, DrmIoctlResult};
+    use crate::drm::render_node::DrmFileCtx;
+    let mut card = make_test_card_for_ioctl();
+    let ctx = DrmFileCtx::primary_master();
+    let gem_handle = card.gem.alloc(0x8000_0000, 64 * 64 * 4).unwrap();
+    let cmd = |flags: u32, modifier: u64| {
+        let mut arg = [0u8; 104];
+        arg[4..8].copy_from_slice(&64u32.to_le_bytes());
+        arg[8..12].copy_from_slice(&64u32.to_le_bytes());
+        arg[12..16].copy_from_slice(&0x3432_5258u32.to_le_bytes());
+        arg[16..20].copy_from_slice(&flags.to_le_bytes());
+        arg[20..24].copy_from_slice(&gem_handle.to_le_bytes());
+        arg[36..40].copy_from_slice(&256u32.to_le_bytes());
+        arg[72..80].copy_from_slice(&modifier.to_le_bytes());
+        arg
+    };
+    for (flags, modifier) in [(2, 1u64 << 56 | 1), (2, u64::MAX >> 8), (4, 0)] {
+        if dispatch(&mut card, 0xB8, &cmd(flags, modifier), &ctx).is_ok() {
+            return TestResult::Fail("non-linear modifier or unknown flag accepted");
+        }
+    }
+    if !card.framebuffers.is_empty() {
+        return TestResult::Fail("refused ADDFB2 left a framebuffer");
+    }
+    for flags in [0, 2] {
+        if !matches!(
+            dispatch(&mut card, 0xB8, &cmd(flags, 0), &ctx),
+            Ok(DrmIoctlResult::AddFb2(_))
+        ) {
+            return TestResult::Fail("LINEAR ADDFB2 refused");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm",
+    smoke_drm_addfb2_accepts_only_linear_modifier
+);
+
+/// ADDFB2 on the native amdgpu card (amdgpu_display_user_framebuffer_create
+/// with GFX12 modifiers): NV12 with both planes in one BO and a 64K_2D DCC
+/// modifier on each, a tiled XRGB8888, LINEAR's 256-byte pitch rule, and
+/// without DRM_MODE_FB_MODIFIERS the BO's GEM_METADATA tiling flags; a
+/// modifier the planes do not list, mismatched per-plane modifiers, a
+/// second BO or a short BO are EINVAL.
+fn smoke_drm_addfb2_takes_gfx12_modifiers_and_nv12() -> TestResult {
+    use crate::amdgpu_dm_modifiers::{DccBlock, Swizzle, Tiling, NV12};
+    use crate::drm::ioctl::{dispatch, DrmIoctlResult};
+    use crate::drm::render_node::DrmFileCtx;
+    let mut card = make_test_card_for_ioctl();
+    card.plane_formats = Some(&crate::amdgpu_navi48_kms::PLANE_FORMATS);
+    card.gfx12_modifiers = true;
+    let ctx = DrmFileCtx::primary_master();
+    let bo = card.gem.alloc(0x8000_0000, 16 << 20).unwrap();
+    let other = card.gem.alloc(0x9000_0000, 16 << 20).unwrap();
+    let small = card.gem.alloc(0xa000_0000, 1 << 20).unwrap();
+    let t64k = Tiling {
+        swizzle: Swizzle::S64K2D,
+        dcc: Some(DccBlock::B64),
+    }
+    .modifier();
+    // (format, w, h, flags, [(handle, pitch, offset, modifier); 2]).
+    type Plane = (u32, u32, u32, u64);
+    let cmd = |format: u32, w: u32, h: u32, flags: u32, planes: [Plane; 2]| {
+        let mut arg = [0u8; 104];
+        arg[4..8].copy_from_slice(&w.to_le_bytes());
+        arg[8..12].copy_from_slice(&h.to_le_bytes());
+        arg[12..16].copy_from_slice(&format.to_le_bytes());
+        arg[16..20].copy_from_slice(&flags.to_le_bytes());
+        for (i, (handle, pitch, offset, modifier)) in planes.into_iter().enumerate() {
+            arg[20 + 4 * i..24 + 4 * i].copy_from_slice(&handle.to_le_bytes());
+            arg[36 + 4 * i..40 + 4 * i].copy_from_slice(&pitch.to_le_bytes());
+            arg[52 + 4 * i..56 + 4 * i].copy_from_slice(&offset.to_le_bytes());
+            arg[72 + 8 * i..80 + 8 * i].copy_from_slice(&modifier.to_le_bytes());
+        }
+        arg
+    };
+    let none = (0, 0, 0, 0);
+    let mut add = |arg: [u8; 104]| match dispatch(&mut card, 0xB8, &arg, &ctx) {
+        Ok(DrmIoctlResult::AddFb2(id)) => Some(id),
+        _ => None,
+    };
+    let ok = [
+        // NV12 1920x1080, 64K_2D + DCC: luma pitch 2048, chroma at 2.5 MiB.
+        cmd(
+            NV12,
+            1920,
+            1080,
+            2,
+            [(bo, 2048, 0, t64k), (bo, 2048, 0x28_0000, t64k)],
+        ),
+        // NV12 linear without modifiers.
+        cmd(
+            NV12,
+            1920,
+            1080,
+            0,
+            [(bo, 2048, 0, 0), (bo, 2048, 0x21_c000, 0)],
+        ),
+        // Tiled XRGB8888.
+        cmd(0x3432_5258, 1920, 1080, 2, [(bo, 8192, 0, t64k), none]),
+    ];
+    let mut ids = alloc::vec::Vec::new();
+    for arg in ok {
+        let Some(id) = add(arg) else {
+            return TestResult::Fail("valid GFX12 / NV12 ADDFB2 refused");
+        };
+        ids.push(id);
+    }
+    let refused = [
+        // A GFX11 modifier no plane lists.
+        cmd(
+            0x3432_5258,
+            1920,
+            1080,
+            2,
+            [(bo, 8192, 0, 2 << 56 | 4 | 27 << 8), none],
+        ),
+        // Per-plane modifiers differ.
+        cmd(
+            NV12,
+            1920,
+            1080,
+            2,
+            [(bo, 2048, 0, t64k), (bo, 2048, 0x28_0000, 0)],
+        ),
+        // The chroma in another BO.
+        cmd(NV12, 1920, 1080, 0, [(bo, 1920, 0, 0), (other, 1920, 0, 0)]),
+        // No chroma plane.
+        cmd(NV12, 1920, 1080, 0, [(bo, 1920, 0, 0), none]),
+        // LINEAR pitch not a 256-byte multiple.
+        cmd(0x3432_5258, 100, 100, 0, [(bo, 400, 0, 0), none]),
+        // The tiled planes do not fit the BO.
+        cmd(0x3432_5258, 1920, 1080, 2, [(small, 8192, 0, t64k), none]),
+    ];
+    for arg in refused {
+        if add(arg).is_some() {
+            return TestResult::Fail("invalid GFX12 / NV12 ADDFB2 accepted");
+        }
+    }
+    let fb = |id: u32| card.framebuffer(id).unwrap().clone();
+    let v = fb(ids[0]);
+    if v.modifier != t64k || v.offsets != [0, 0x28_0000] || v.chroma_pitch != 2048 {
+        return TestResult::Fail("NV12 framebuffer planes");
+    }
+    // GEM_METADATA tiling flags (64K_2D, max block 128B) become the
+    // modifier of an ADDFB2 without modifiers.
+    if !card.set_bo_tiling(bo, 3 | 1 << 3, false) {
+        return TestResult::Fail("dumb BO tiling flags");
+    }
+    let Ok(DrmIoctlResult::AddFb2(id)) = dispatch(
+        &mut card,
+        0xB8,
+        &cmd(0x3432_5258, 1920, 1080, 0, [(bo, 8192, 0, 0), none]),
+        &ctx,
+    ) else {
+        return TestResult::Fail("tiling-flags ADDFB2 refused");
+    };
+    let want = crate::amdgpu_dm_modifiers::from_tiling_flags(3 | 1 << 3, false);
+    let plain = Tiling {
+        swizzle: Swizzle::S64K2D,
+        dcc: None,
+    };
+    if card.framebuffer(id).unwrap().modifier != want
+        || want != plain.modifier() | 1 << 18
+        || Tiling::from_modifier(want) != Some(plain)
+    {
+        return TestResult::Fail("tiling flags to modifier");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm",
+    smoke_drm_addfb2_takes_gfx12_modifiers_and_nv12
+);
+
 fn smoke_drm_getcap_shape() -> TestResult {
     use crate::drm::ioctl::{dispatch, drm_cap, DrmIoctlResult};
     use crate::drm::render_node::DrmFileCtx;
@@ -12525,6 +12706,57 @@ fn smoke_amdgpu_vm_pasids_outlive_their_jobs() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu_vm",
     smoke_amdgpu_vm_pasids_outlive_their_jobs
+);
+
+/// With an IH service attributing IVs by PASID, a released PASID waits for
+/// an empty-ring pass that began after release before reuse, and a late
+/// fault naming it is charged to no one meanwhile.
+fn smoke_amdgpu_pasid_reuse_waits_for_ih_drain() -> TestResult {
+    use crate::amdgpu_vmid::{
+        fault, ih_drained, record_fault, track_ih_drains, FaultInfo, PasidHandle,
+    };
+    track_ih_drains(true);
+    let a = PasidHandle::alloc().unwrap();
+    let held = a.get();
+    drop(a);
+    let late = FaultInfo {
+        addr: 0x1000,
+        status: 1,
+        vmhub: 0,
+    };
+    record_fault(held, late);
+    let mut result = TestResult::Pass;
+    if fault(held) != FaultInfo::default() {
+        result = TestResult::Fail("late IV charged to a released PASID");
+    }
+    // One drain might have read its write pointer before release.
+    ih_drained();
+    let early = PasidHandle::alloc().unwrap();
+    if early.get() == held {
+        result = TestResult::Fail("reused before a full drain after release");
+    }
+    drop(early);
+    ih_drained();
+    ih_drained();
+    let after = PasidHandle::alloc().unwrap();
+    if after.get() != held {
+        result = TestResult::Fail("drained PASID not reusable");
+    }
+    // Stopping the service frees anything still held at once.
+    let b = PasidHandle::alloc().unwrap();
+    let pending = b.get();
+    drop(b);
+    track_ih_drains(false);
+    let freed = PasidHandle::alloc().unwrap();
+    if freed.get() != pending {
+        result = TestResult::Fail("stopped tracking keeps PASIDs held");
+    }
+    drop((after, freed));
+    result
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_vm",
+    smoke_amdgpu_pasid_reuse_waits_for_ih_drain
 );
 
 /// AMDGPU_INFO_GPUVM_FAULT answers from the open's VM fault cache

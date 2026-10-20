@@ -8,12 +8,18 @@ mod power;
 pub use power::HubpPower;
 #[path = "amdgpu_dcn401_surface.rs"]
 mod surface;
+#[cfg(feature = "kernel-test")]
+pub(super) use surface::post_csc_words;
 pub(super) use surface::Surfaces;
+pub use surface::{cursor_mode, plane_scale, CursorMode, CursorUnder};
+pub use surface::{plane_update_type, planes_update_type, LivePlanes, PlanesUpdated, UpdateType};
 pub use surface::{
-    CursorApplied, DeadlinesApplied, DppApplied, FlipDone, MemoryApplied, MpcApplied,
+    Blend, ColorProgram, CursorApplied, DeadlinesApplied, DppApplied, FlipDone, GamutProgram,
+    LivePipe, MemoryApplied, MpcApplied, OgamProgram, OverlayScanout, PipeColor, PlaneLayout,
     RequestorApplied, ScanoutPosition, ScanoutRunning, ScanoutUnderflow, SurfaceApplied,
-    SurfaceFormat, SurfaceRequest, VblankPhase, CURSOR_MAX,
+    SurfaceFormat, SurfaceRequest, VblankPhase, CURSOR_MAX, MAX_OVERLAYS,
 };
+pub use surface::{DccBlock, PlaneSurface, SurfaceBytes, Swizzle, Tiling, YuvColor};
 
 const HUBP_CONTROL: u64 = 0x5f4;
 const HUBP_CLOCK: u64 = 0x5f5;
@@ -82,26 +88,16 @@ impl<I: Io> Engine<I> {
         live: Option<ScanoutRunning>,
     ) -> Result<(), Error> {
         let l = self.layout;
+        let mine = live.map_or_else(alloc::vec::Vec::new, |s| s.live_pipes(self.status.cursor));
         for pipe in 0..4 {
-            // The owned live scanout, either of its ODM halves.
-            if let Some(s) = live.filter(|s| s.pipe == pipe || s.odm == Some(pipe)) {
+            // The owned live scanout's pipes (every plane, both ODM halves),
+            // and another display's, must be exactly that.
+            let theirs = self.displays.siblings.live[usize::from(pipe)];
+            if let Some(lp) = mine.iter().copied().find(|l| l.pipe == pipe).or(theirs) {
                 if !self.hubp_powered(pipe)? {
                     return Err(Error::Busy);
                 }
-                let cursor = self
-                    .status
-                    .cursor
-                    .is_some_and(|c| c.pipe == s.pipe && c.shown_on(pipe));
-                self.live_segment(pipe, s.address, cursor)?;
-                self.auxiliary_fetchers_stopped(pipe)?;
-                continue;
-            }
-            // Another display's live scanout must be exactly that.
-            if let Some((address, cursor)) = self.displays.siblings.live[usize::from(pipe)] {
-                if !self.hubp_powered(pipe)? {
-                    return Err(Error::Busy);
-                }
-                self.live_segment(pipe, address, cursor)?;
+                self.live_pipe(lp)?;
                 self.auxiliary_fetchers_stopped(pipe)?;
                 continue;
             }
@@ -276,12 +272,39 @@ impl<I: Io> Engine<I> {
         }
         Ok(())
     }
+    /// With every plane retired the overlays' staging ends: a plane's
+    /// records on a pipe with neither timing nor blank of its own, other
+    /// than the display's, are an overlay's (ODM pipes have none). Their
+    /// pipes and DETs return to the pool; the next configuration stages its
+    /// own overlays.
+    pub(in crate::amdgpu_dcn401_otg) fn drop_overlays(&mut self) {
+        let own = usize::from(self.displays.selected);
+        let s = &mut self.status;
+        let overlay =
+            |s: &Status, i: usize| i != own && s.pipes[i].is_none() && s.blanks[i].is_none();
+        for i in 0..4 {
+            if !overlay(s, i) {
+                continue;
+            }
+            s.surfaces[i] = None;
+            s.memory[i] = None;
+            s.dpps[i] = None;
+            s.mpcs[i] = None;
+        }
+        if let Some(r) = s.requestor.as_mut() {
+            if r.overlays.iter().any(Option::is_some) {
+                r.overlays = [None; MAX_OVERLAYS];
+                s.deadlines = None;
+            }
+        }
+    }
     pub(super) async fn retire_planes(&mut self) -> Result<PlanesRetired, Error> {
         let plan = self.planes_preflight()?;
         self.status.state = State::RetiringPlanes;
         match self.disconnect_planes(plan).await {
             Ok(()) => {
                 self.status.planes_retired = Some(plan);
+                self.drop_overlays();
                 self.status.state = State::PlanesRetired;
                 Ok(plan)
             }

@@ -7,12 +7,23 @@ impl Hardware {
     /// and the independent IH worker/CPU route stay active. Retain every
     /// owner after error/cancellation; only a full-device reset may recover
     /// when this extra live JPEG registration has not proved retirement.
+    /// With `keep`, the drained ring stays registered and powered for
+    /// clients; a retained registration is accepted only for that client
+    /// ring after `retire_client_jpeg` proved its retirement.
     pub(crate) async unsafe fn prove_jpeg(
         &mut self,
         doorbells: narf_bus::MmioRegion,
         decode: bool,
+        keep: bool,
     ) -> Result<jpeg::Proof, Error> {
-        if self.jpeg_owner.is_some() {
+        let retained = self.jpeg_owner.is_some();
+        if retained
+            && !(keep
+                && self
+                    .jpeg
+                    .as_ref()
+                    .is_some_and(|j| j.state() == jpeg::State::Stopped))
+        {
             return Err(Error::Busy);
         }
         self.jpeg_test = Some(Err(Error::Busy));
@@ -24,15 +35,18 @@ impl Hardware {
                         .map_err(Error::Jpeg)?,
                 );
             }
-            self.jpeg_owner = Some(
-                dispatch::register(dispatch::Owner {
-                    key: dispatch::Key::Jpeg { instance: 0 },
-                    vmid: 0,
-                    pasid: 0,
-                })
-                .map_err(|_| Error::Interrupts(ih::Error::Busy))?,
-            );
-            // SAFETY: exclusive JPEG lifetime; no address was submitted yet.
+            if !retained {
+                self.jpeg_owner = Some(
+                    dispatch::register(dispatch::Owner {
+                        key: dispatch::Key::Jpeg { instance: 0 },
+                        vmid: 0,
+                        pasid: 0,
+                    })
+                    .map_err(|_| Error::Interrupts(ih::Error::Busy))?,
+                );
+            }
+            // SAFETY: exclusive JPEG lifetime; no address was submitted yet
+            // (or the client ring's retirement was proved before power-down).
             let power = unsafe {
                 self.smu
                     .as_mut()
@@ -53,6 +67,12 @@ impl Hardware {
                 proof = unsafe { jpeg.prove_decode().await }
                     .map_err(Error::Jpeg)?
                     .completion;
+            }
+            if keep {
+                // SAFETY: proofs drained the ring; the registration, power,
+                // VCN range and GMC stay retained while clients may publish.
+                unsafe { jpeg.open_clients() }.map_err(Error::Jpeg)?;
+                return Ok(proof);
             }
             // SAFETY: proof drained its commands; all clients remain excluded.
             unsafe { jpeg.stop().await }.map_err(Error::Jpeg)?;
@@ -75,5 +95,32 @@ impl Hardware {
         .await;
         self.jpeg_test = Some(result);
         result
+    }
+    /// Close JPEG client publication and prove retirement of a possibly hung
+    /// ring: JMI reset with clean DMA, then PowerDownJpeg. The dispatch
+    /// registration stays live for the following in-place re-proof.
+    /// # Safety
+    /// OWNER excludes publishers/PM, the JPEG ledger is frozen, and every
+    /// pending job's mappings and staged slot remain retained afterwards.
+    pub(crate) async unsafe fn retire_client_jpeg(&mut self) -> Result<(), Error> {
+        if self.jpeg_owner.is_none() || !self.media_jpeg_clients {
+            return Err(Error::Busy);
+        }
+        self.jpeg_test = Some(Err(Error::Busy));
+        let jpeg = self.jpeg.as_mut().ok_or(Error::Invalid)?;
+        // SAFETY: all publishers excluded; resources retained on failure.
+        unsafe { jpeg.reset_stop().await }.map_err(Error::Jpeg)?;
+        // SAFETY: JMI reset and power gating proved JRBC/decoder retirement.
+        self.power = Some(
+            unsafe {
+                self.smu
+                    .as_mut()
+                    .ok_or(Error::Invalid)?
+                    .set_jpeg_power(false)
+                    .await
+            }
+            .map_err(Error::Smu)?,
+        );
+        Ok(())
     }
 }

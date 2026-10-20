@@ -4,10 +4,17 @@
 //!
 //! - `DscSinkCaps::parse` is dc_dsc_parse_dsc_dpcd on DPCD 0x060-0x06F and
 //!   the branch decoder caps (0x0A0-0x0A2, zero without a dongle);
+//! - `HdmiDscCaps::parse` is DRM's drm_parse_dsc_info as amdgpu_dm's
+//!   populate_hdmi_info_from_connector stores it (dc_edid_caps' frl_dsc_*),
+//!   and `DscSinkCaps::from_hdmi` is dc_dsc_parse_dsc_edid;
 //! - `compute_config` is amdgpu_dm's SST policy for a DP sink without a
 //!   dongle (apply_dsc_policy_for_stream): dc_dsc_compute_config with
 //!   DCN401's encoder (dsc401_get_single_enc_caps; four DSCs, ODM factor 4;
 //!   DSCCLK a third of the highest DISPCLK) and Linux's default policy;
+//!   `compute_frl_config` is the same for an HDMI FRL sink (is_frl:
+//!   hdmi_dsc_get_num_slices, hdmi_dsc_get_bpp with the CTA preset bpps,
+//!   compute_bpp_x16_from_frl_params, the FRL bandwidth range and minimum
+//!   bpp), and `bandwidth_range` is dc_dsc_compute_bandwidth_range;
 //! - `prepare` is dsc_prepare_config: the PPS with its rate-control
 //!   parameters (rc_calc_fpu.c in Linux's own float/double arithmetic, then
 //!   drm_dsc_compute_rc_parameters) and the OPTC's bytes per pixel;
@@ -15,7 +22,7 @@
 //! - `stream_kbps` and `dsc_kbps` are dc_bandwidth_in_kbps_from_timing and
 //!   dc_dsc_stream_bandwidth_in_kbps, in Linux's 31.32 fixed point.
 //!
-//! HDMI FRL DSC (is_frl), eDP and DP-HDMI converters are not ported.
+//! eDP and DP-HDMI converters are not ported.
 #[path = "amdgpu_dsc_qp.rs"]
 mod qp;
 
@@ -78,6 +85,12 @@ impl Fixed {
     pub(crate) fn sub_int(self, v: i32) -> Self {
         Self(self.0.wrapping_sub(Self::int(v).0))
     }
+    pub(crate) fn add(self, other: Self) -> Self {
+        Self(self.0.wrapping_add(other.0))
+    }
+    pub(crate) fn sub(self, other: Self) -> Self {
+        Self(self.0.wrapping_sub(other.0))
+    }
     pub(crate) fn floor(self) -> i32 {
         let v = (self.0.unsigned_abs() >> 32) as i32;
         if self.0 >= 0 {
@@ -110,6 +123,8 @@ pub enum Encoding {
 pub enum LinkEncoding {
     Dp8b10b,
     Dp128b132b,
+    /// DC_LINK_ENCODING_HDMI_FRL: an HDMI link with a verified FRL rate.
+    HdmiFrl,
 }
 
 /// The parts of a `dc_crtc_timing` DSC reads (no borders).
@@ -158,6 +173,13 @@ pub struct DscSinkCaps {
     pub branch_throughput_0_mps: u32,
     pub branch_throughput_1_mps: u32,
     pub branch_max_line_width: u32,
+    /// An HDMI FRL sink's caps (dc_dsc_parse_dsc_edid's is_frl): its slice
+    /// count and bpp follow the HDMI rules.
+    pub is_frl: bool,
+    /// HF DSC_All_bpp (is_vic_all_bpp).
+    pub all_bpp: bool,
+    /// HF DSC_TotalChunkKBytes as Linux stores it: 1024 x (1 + the field).
+    pub total_chunk_bytes: u32,
 }
 
 /// dsc_throughput_from_dpcd.
@@ -235,6 +257,103 @@ impl DscSinkCaps {
             branch_throughput_0_mps: branch_throughput(branch[0]),
             branch_throughput_1_mps: branch_throughput(branch[1]),
             branch_max_line_width: u32::from(branch[2]) * 320,
+            is_frl: false,
+            all_bpp: false,
+            total_chunk_bytes: 0,
+        })
+    }
+    /// dc_dsc_parse_dsc_edid: an HDMI 2.1 sink's DSC 1.2 decoder from its
+    /// HF-VSDB/HF-SCDB fields.
+    pub fn from_hdmi(e: &HdmiDscCaps) -> Self {
+        // frl_dsc_max_slices: the slice counts and per-slice throughputs
+        // (modes 0 and 1) each code stands for; 8 and above as 8.
+        let (counts, mode_0, mode_1): (&[u32], u32, u32) = match e.max_slices {
+            0 => (&[], 0, 0),
+            1 => (&[1], 340, 680),
+            2 => (&[1, 2], 340, 680),
+            3 => (&[1, 2, 4], 340, 680),
+            4 => (&[1, 2, 4, 8], 340, 680),
+            5 => (&[1, 2, 4, 8], 400, 800),
+            6 => (&[1, 2, 4, 8, 12], 400, 800),
+            7 => (&[1, 2, 4, 8, 12], 600, 1200),
+            _ => (&[1, 2, 4, 8, 12], 900, 1800),
+        };
+        let mut s = 0;
+        for &n in counts {
+            s |= 1 << n;
+        }
+        Self {
+            version: 0x21,
+            rc_buffer_size: 0,
+            slices: s,
+            // HDMI 2.1 Table 7-25.
+            lb_bit_depth: 13,
+            block_pred: true,
+            max_bpp_x16: 0,
+            // RGB, YCbCr 4:4:4, native 4:2:2, and native 4:2:0 if declared.
+            color_formats: 0x0b | u8::from(e.native_420) << 4,
+            color_depth: 2 | u8::from(e.bpc10) << 2 | u8::from(e.bpc12) << 3,
+            throughput_0_mps: mode_0,
+            throughput_1_mps: mode_1,
+            max_slice_width: 2560,
+            bpp_increment_div: 16,
+            branch_throughput_0_mps: 0,
+            branch_throughput_1_mps: 0,
+            branch_max_line_width: 0,
+            is_frl: true,
+            all_bpp: e.all_bpp,
+            total_chunk_bytes: 1024 * (1 + u32::from(e.total_chunk_kbytes)),
+        }
+    }
+}
+
+/// An HDMI 2.1 sink's DSC fields (HF-VSDB/HF-SCDB bytes 11-13) as
+/// drm_parse_dsc_info reads them and amdgpu_dm's
+/// populate_hdmi_info_from_connector stores them in dc_edid_caps.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HdmiDscCaps {
+    /// frl_dsc_10bpc / frl_dsc_12bpc: DSC_10bpc, DSC_12bpc or DSC_16bpc
+    /// (DRM's bpc_supported, cumulative).
+    pub bpc10: bool,
+    pub bpc12: bool,
+    pub all_bpp: bool,
+    pub native_420: bool,
+    /// frl_dsc_max_slices (get_dsc_max_slices: DSC_MaxSlices 1-7, else 0).
+    pub max_slices: u8,
+    /// frl_dsc_max_frl_rate (get_max_frl_rate: DSC_Max_FRL_Rate 1-6, else 0).
+    pub max_frl_rate: u8,
+    /// DSC_TotalChunkKBytes (6 bits).
+    pub total_chunk_kbytes: u8,
+}
+impl HdmiDscCaps {
+    /// drm_parse_hdmi_forum_scds' DSC part: `flags` is HF-SCDS byte 11
+    /// (parsed only when present and nonzero), `rate` byte 12 and `chunk`
+    /// byte 13 (each ignored when absent or zero). None without DSC_1p2.
+    pub fn parse(flags: u8, rate: Option<u8>, chunk: Option<u8>) -> Option<Self> {
+        if flags & 0x80 == 0 {
+            return None;
+        }
+        // DSC_16bpc implies 12 and 10, DSC_12bpc implies 10.
+        let bpc = if flags & 4 != 0 {
+            16
+        } else if flags & 2 != 0 {
+            12
+        } else if flags & 1 != 0 {
+            10
+        } else {
+            8
+        };
+        let rate = rate.unwrap_or(0);
+        Some(Self {
+            bpc10: bpc >= 10,
+            bpc12: bpc >= 12,
+            all_bpp: flags & 8 != 0,
+            native_420: flags & 0x40 != 0,
+            max_slices: Some(rate & 0xf)
+                .filter(|c| (1..=7).contains(c))
+                .unwrap_or(0),
+            max_frl_rate: Some(rate >> 4).filter(|c| (1..=6).contains(c)).unwrap_or(0),
+            total_chunk_kbytes: chunk.unwrap_or(0) & 0x3f,
         })
     }
 }
@@ -298,6 +417,12 @@ struct Common {
     max_slice_width: u32,
     bpp_increment_div: u32,
     max_bpp_x16: u32,
+    is_frl: bool,
+    all_bpp: bool,
+    total_chunk_bytes: u32,
+    /// The lanes and per-lane Mbps of an FRL target bandwidth
+    /// (convert_bandwidth_to_frl_params), when it is one.
+    frl: Option<(u32, u32)>,
 }
 
 /// intersect_dsc_caps.
@@ -332,6 +457,10 @@ fn intersect(sink: &DscSinkCaps, enc: &EncCaps, encoding: Encoding) -> Option<Co
         max_slice_width,
         bpp_increment_div,
         max_bpp_x16: sink.max_bpp_x16,
+        is_frl: sink.is_frl,
+        all_bpp: sink.all_bpp,
+        total_chunk_bytes: sink.total_chunk_bytes,
+        frl: None,
     })
 }
 
@@ -386,7 +515,10 @@ pub fn stream_kbps(t: &DscTiming, link: LinkEncoding) -> u32 {
 }
 
 /// dc_dsc_stream_bandwidth_overhead_in_kbps (DP only).
-fn overhead_kbps(t: &DscTiming, slices_h: u32) -> u32 {
+fn overhead_kbps(t: &DscTiming, slices_h: u32, is_dp: bool) -> u32 {
+    if !is_dp {
+        return 0;
+    }
     let refresh = Fixed::int(t.pix_clk_100hz as i32)
         .div_int(i64::from(t.h_total))
         .div_int(i64::from(t.v_total))
@@ -401,7 +533,17 @@ fn overhead_kbps(t: &DscTiming, slices_h: u32) -> u32 {
 
 /// dc_dsc_stream_bandwidth_in_kbps for a DP sink.
 pub fn dsc_kbps(t: &DscTiming, bpp_x16: u32, slices_h: u32) -> u32 {
-    let overhead = overhead_kbps(t, slices_h);
+    dsc_kbps_for(t, bpp_x16, slices_h, true)
+}
+
+/// dc_dsc_stream_bandwidth_in_kbps for an HDMI FRL sink (no is_dp slice
+/// overhead).
+pub fn frl_dsc_kbps(t: &DscTiming, bpp_x16: u32) -> u32 {
+    dsc_kbps_for(t, bpp_x16, 0, false)
+}
+
+fn dsc_kbps_for(t: &DscTiming, bpp_x16: u32, slices_h: u32, is_dp: bool) -> u32 {
+    let overhead = overhead_kbps(t, slices_h, is_dp);
     let bpp = Fixed::fraction(i64::from(bpp_x16), 16);
     Fixed::fraction(i64::from(t.pix_clk_100hz), 10)
         .mul(bpp)
@@ -410,8 +552,14 @@ pub fn dsc_kbps(t: &DscTiming, bpp_x16: u32, slices_h: u32) -> u32 {
 }
 
 /// compute_bpp_x16_from_target_bandwidth.
-fn bpp_x16_for(bandwidth_kbps: u32, t: &DscTiming, slices_h: u32, increment_div: u32) -> u32 {
-    let overhead = overhead_kbps(t, slices_h);
+fn bpp_x16_for(
+    bandwidth_kbps: u32,
+    t: &DscTiming,
+    slices_h: u32,
+    increment_div: u32,
+    is_dp: bool,
+) -> u32 {
+    let overhead = overhead_kbps(t, slices_h, is_dp);
     let bpp = Fixed::int(bandwidth_kbps as i32)
         .sub_int(overhead as i32)
         .mul_int(10)
@@ -423,24 +571,386 @@ fn bpp_x16_for(bandwidth_kbps: u32, t: &DscTiming, slices_h: u32, increment_div:
 }
 
 /// dc_dsc_get_policy_for_timing with Linux's defaults: minimum slices,
-/// slice height 108, the DP bpp bounds capped at 16 bpp.
+/// slice height 108, the DP bpp bounds capped at 16 bpp; HDMI FRL takes
+/// 4:2:2 natively (7 bpp to twice the depth).
 struct Policy {
     min_bpp: u32,
     max_bpp: u32,
+    ycbcr422_simple: bool,
 }
-fn policy(t: &DscTiming) -> Policy {
+fn policy(t: &DscTiming, link: LinkEncoding) -> Policy {
     let bpc = u32::from(t.bpc);
-    let (min_bpp, max_bpp) = match t.encoding {
-        Encoding::Ycbcr420 => (6, bpc * 3 / 2),
-        _ => (8, 3 * bpc),
+    let (min_bpp, max_bpp, simple) = match t.encoding {
+        Encoding::Ycbcr420 => (6, bpc * 3 / 2, false),
+        Encoding::Ycbcr422 if link == LinkEncoding::HdmiFrl => (7, 2 * bpc, false),
+        _ => (8, 3 * bpc, true),
     };
     Policy {
         min_bpp,
         max_bpp: max_bpp.min(16),
+        ycbcr422_simple: simple,
     }
 }
 
-/// A DSC configuration (dc_dsc_config, DP SST).
+/// The CTA and HDMI VICs of an HDMI stream (dc_crtc_timing vic and
+/// hdmi_vic, from its AVI and vendor InfoFrames).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Vic {
+    pub cta: u8,
+    pub hdmi: u8,
+}
+impl Vic {
+    /// get_vic_preset_bpp's (and the FRL capacity check's) CTA VIC: an
+    /// HDMI 1.4b 4K VIC stands for its CTA equivalent.
+    pub fn cta_equivalent(self) -> u8 {
+        match self.hdmi {
+            1 => 95,
+            2 => 94,
+            3 => 93,
+            4 => 98,
+            _ => self.cta,
+        }
+    }
+}
+
+/// prim_bpp_444/422/420: the HDMI 2.1 compressed bpp (x16) of CTA formats.
+const PRIM_BPP_444: [(u8, u16); 58] = [
+    (64, 192),
+    (77, 192),
+    (63, 192),
+    (78, 192),
+    (93, 192),
+    (103, 192),
+    (94, 192),
+    (104, 192),
+    (95, 192),
+    (105, 192),
+    (114, 192),
+    (116, 192),
+    (96, 192),
+    (106, 192),
+    (97, 192),
+    (107, 192),
+    (117, 192),
+    (119, 192),
+    (118, 192),
+    (120, 192),
+    (98, 192),
+    (99, 192),
+    (100, 192),
+    (115, 192),
+    (101, 192),
+    (102, 192),
+    (218, 192),
+    (219, 192),
+    (121, 192),
+    (122, 192),
+    (123, 192),
+    (124, 192),
+    (125, 192),
+    (126, 173),
+    (127, 192),
+    (193, 175),
+    (194, 192),
+    (202, 192),
+    (195, 192),
+    (203, 192),
+    (196, 192),
+    (204, 192),
+    (197, 157),
+    (205, 157),
+    (198, 157),
+    (206, 157),
+    (199, 159),
+    (207, 159),
+    (200, 134),
+    (208, 134),
+    (201, 130),
+    (209, 130),
+    (210, 182),
+    (211, 181),
+    (212, 177),
+    (213, 163),
+    (214, 162),
+    (215, 157),
+];
+const PRIM_BPP_422: [(u8, u16); 47] = [
+    (114, 192),
+    (116, 192),
+    (96, 192),
+    (106, 192),
+    (97, 192),
+    (107, 192),
+    (117, 137),
+    (119, 137),
+    (118, 113),
+    (120, 113),
+    (115, 192),
+    (101, 192),
+    (102, 192),
+    (218, 192),
+    (219, 192),
+    (121, 192),
+    (122, 192),
+    (123, 192),
+    (124, 192),
+    (125, 192),
+    (126, 173),
+    (127, 192),
+    (193, 175),
+    (194, 123),
+    (202, 123),
+    (195, 123),
+    (203, 123),
+    (196, 118),
+    (204, 118),
+    (197, 123),
+    (205, 123),
+    (198, 123),
+    (206, 123),
+    (199, 119),
+    (207, 119),
+    (200, 134),
+    (208, 134),
+    (201, 130),
+    (209, 130),
+    (210, 182),
+    (211, 181),
+    (212, 177),
+    (213, 126),
+    (214, 125),
+    (215, 117),
+    (216, 125),
+    (217, 117),
+];
+const PRIM_BPP_420: [(u8, u16); 44] = [
+    (114, 192),
+    (116, 192),
+    (96, 192),
+    (106, 192),
+    (97, 192),
+    (107, 192),
+    (117, 137),
+    (119, 137),
+    (118, 113),
+    (120, 113),
+    (115, 192),
+    (101, 192),
+    (102, 192),
+    (218, 129),
+    (219, 106),
+    (124, 192),
+    (125, 192),
+    (126, 173),
+    (127, 192),
+    (193, 175),
+    (194, 123),
+    (202, 123),
+    (195, 123),
+    (203, 123),
+    (196, 118),
+    (204, 118),
+    (197, 123),
+    (205, 123),
+    (198, 123),
+    (206, 123),
+    (199, 119),
+    (207, 119),
+    (200, 112),
+    (208, 112),
+    (201, 103),
+    (209, 103),
+    (210, 98),
+    (211, 98),
+    (212, 177),
+    (213, 98),
+    (214, 125),
+    (215, 117),
+    (216, 107),
+    (217, 97),
+];
+
+/// get_vic_preset_bpp.
+fn vic_preset_bpp(t: &DscTiming, vic: Vic) -> Option<u32> {
+    if vic.cta == 0 && vic.hdmi == 0 {
+        return None;
+    }
+    let id = vic.cta_equivalent();
+    let table: &[(u8, u16)] = match t.encoding {
+        Encoding::Rgb | Encoding::Ycbcr444 => &PRIM_BPP_444,
+        Encoding::Ycbcr422 => &PRIM_BPP_422,
+        Encoding::Ycbcr420 => &PRIM_BPP_420,
+    };
+    table.iter().find(|e| e.0 == id).map(|e| u32::from(e.1))
+}
+
+/// hdmi_dsc_get_num_slices: HDMI 2.1's slice count for the pixel rate
+/// (doubled for 4:4:4), at most 2720 pixels a slice; 0 past 16 slices.
+fn hdmi_num_slices(t: &DscTiming) -> u32 {
+    let k = if matches!(t.encoding, Encoding::Rgb | Encoding::Ycbcr444) {
+        2
+    } else {
+        1
+    };
+    let adj = k * t.pix_clk_100hz / 10000 / 2;
+    let ratio = adj * t.h_active / t.h_total;
+    let mut min_slices = if adj <= 2720 {
+        adj.div_ceil(340)
+    } else if adj <= 4800 {
+        adj.div_ceil(400)
+    } else if ratio <= 4800 {
+        ratio.div_ceil(600)
+    } else {
+        ratio.div_ceil(900)
+    };
+    loop {
+        let target = match min_slices {
+            ..=1 => 1,
+            2 => 2,
+            3..=4 => 4,
+            5..=8 => 8,
+            9..=12 => 12,
+            13..=16 => 16,
+            _ => return 0,
+        };
+        min_slices += 1;
+        if t.h_active / target <= 2720 {
+            return target;
+        }
+    }
+}
+
+/// hdmi_dsc_get_bpp: the highest bpp (x16) whose compressed line fits the
+/// sink's chunk buffer, at most 12 bpp (and the CTA preset) unless it takes
+/// every bpp; 0 when none does.
+fn hdmi_bpp_x16(t: &DscTiming, common: &Common, vic: Vic) -> u32 {
+    let bpc = u32::from(t.bpc);
+    let (min_bpp, mut max_bpp) = match t.encoding {
+        Encoding::Rgb | Encoding::Ycbcr444 => (8, 3 * bpc),
+        Encoding::Ycbcr422 => (7, 2 * bpc),
+        Encoding::Ycbcr420 => (6, 3 * bpc / 2),
+    };
+    if !common.all_bpp {
+        max_bpp = max_bpp.min(12);
+    }
+    let slices = hdmi_num_slices(t);
+    if slices == 0 {
+        return 0;
+    }
+    let slice_width = t.h_active / slices;
+    let decrement = 16 / common.bpp_increment_div;
+    let mut x16 = if common.all_bpp {
+        max_bpp * 16 - decrement
+    } else {
+        max_bpp * 16
+    };
+    let bytes = |x16: u32| slices * slice_width * x16 / 16 / 8;
+    loop {
+        if x16 <= min_bpp * 16 {
+            return 0;
+        }
+        if bytes(x16) <= common.total_chunk_bytes {
+            break;
+        }
+        x16 -= decrement;
+    }
+    if !common.all_bpp {
+        if let Some(preset) = vic_preset_bpp(t, vic) {
+            if bytes(preset) > common.total_chunk_bytes {
+                return 0;
+            }
+            return preset;
+        }
+    }
+    x16
+}
+
+/// convert_bandwidth_to_frl_params: the lanes and per-lane Mbps of an
+/// exact FRL link bandwidth.
+fn frl_params(kbps: u32) -> Option<(u32, u32)> {
+    Some(match kbps {
+        9_000_000 => (3, 3000),
+        18_000_000 => (3, 6000),
+        24_000_000 => (4, 6000),
+        32_000_000 => (4, 8000),
+        40_000_000 => (4, 10000),
+        48_000_000 => (4, 12000),
+        _ => return None,
+    })
+}
+
+/// compute_bpp_x16_from_frl_params: the highest bpp (x16) whose tribyte
+/// blanking still carries the audio minimum on the sink's DSC FRL link,
+/// in Linux's 31.32 fixed point.
+fn frl_link_bpp_x16(t: &DscTiming, slices_h: u32, common: &Common) -> u32 {
+    let (lanes, rate) = common.frl.unwrap_or((0, 0));
+    let (lanes, rate) = (lanes as i32, rate as i32);
+    let h_active = t.h_active as i32;
+    let h_blank = (t.h_total - t.h_active) as i32;
+    let bpc = u32::from(t.bpc);
+    let (min_x16, max_x16) = match t.encoding {
+        Encoding::Rgb | Encoding::Ycbcr444 => (8 * 16, 3 * 16 * bpc),
+        Encoding::Ycbcr422 => (7 * 16, 2 * 16 * bpc),
+        Encoding::Ycbcr420 => (6 * 16, 3 * 16 * bpc / 2),
+    };
+    let mut max_x16 = max_x16.min(256);
+    if !common.all_bpp {
+        max_x16 = max_x16.min(192);
+    }
+    let c_frl_sb = 4 * 510 + lanes;
+    let pixel_clock = Fixed::int(t.pix_clk_100hz as i32).div_int(10000);
+    let r_bit = Fixed::int(rate);
+    let tolerance = Fixed::int(5).div_int(1000);
+    let overhead_sb = Fixed::int(lanes).div_int(i64::from(c_frl_sb));
+    let overhead_rs = Fixed::int(32).div_int(i64::from(c_frl_sb));
+    let overhead_map = Fixed::int(25).div_int(i64::from(c_frl_sb * 10));
+    let overhead_min = overhead_sb.add(overhead_rs).add(overhead_map);
+    let overhead_max = overhead_min.add(Fixed::int(3).div_int(1000));
+    let pixel_clock_max = pixel_clock.mul(tolerance.add_int(1));
+    let t_line = Fixed::int(h_active + h_blank).div(pixel_clock_max);
+    let r_bit_min = r_bit.mul(Fixed::int(1).sub(Fixed::int(300).div_int(1_000_000)));
+    let r_frl_char_min = r_bit_min.div_int(18);
+    let c_frl_line_int = t_line.mul(r_frl_char_min).mul_int(lanes).floor();
+    let c_frl_av_int = Fixed::int(1)
+        .sub(overhead_max)
+        .mul_int(c_frl_line_int)
+        .floor();
+    let r_ap = Fixed::int(192_000)
+        .max(Fixed::int(48_000 * 4))
+        .add(Fixed::int(2 * 1500));
+    let tolerance_audio = Fixed::int(1).add(Fixed::int(1000).div_int(1_000_000));
+    let r_ap = r_ap.mul(tolerance_audio);
+    let packets = r_ap.mul(t_line).div_int(1_000_000).ceil();
+    let hc_blank_audio_min = 32 + 32 * packets;
+    let mut slice_width = Fixed::int(h_active).div_int(i64::from(slices_h)).ceil();
+    if t.encoding == Encoding::Ycbcr420 && slice_width % 2 != 0 {
+        slice_width += 1;
+    }
+    let mut i = max_x16;
+    while i >= min_x16 {
+        let bytes_target = slices_h as i32
+            * Fixed::int((i * slice_width as u32) as i32)
+                .div_int(8 * 16)
+                .ceil();
+        let hc_active_target = Fixed::int(bytes_target).div_int(3).ceil();
+        let est1 = Fixed::int(hc_active_target * h_blank)
+            .div_int(i64::from(h_active))
+            .ceil();
+        let est2 = Fixed::int(est1).max(Fixed::int(hc_blank_audio_min)).floor();
+        let bandwidth = Fixed::int(3).div_int(2).mul(Fixed::int(hc_active_target));
+        let bandwidth = Fixed::int(c_frl_av_int)
+            .sub(bandwidth)
+            .min(Fixed::int(est2))
+            .div_int(4);
+        if bandwidth.floor() * 4 >= hc_blank_audio_min {
+            return i;
+        }
+        i -= 1;
+    }
+    0
+}
+
+/// A DSC configuration (dc_dsc_config).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DscConfig {
     pub slices_h: u32,
@@ -452,6 +962,22 @@ pub struct DscConfig {
     pub version_minor: u32,
     /// 4:2:2 sent as simple 4:2:2.
     pub ycbcr422_simple: bool,
+    /// An HDMI FRL stream (is_frl); None for DP.
+    pub frl: Option<FrlDscLink>,
+    /// The input depth compressed, 8, 10 or 12 bpc: the timing's
+    /// display_color_depth the configuration was computed for, which Linux
+    /// keeps beside dc_dsc_config in the stream's dc_crtc_timing.
+    pub bpc: u8,
+}
+
+/// What an HDMI FRL DSC stream adds to dc_dsc_config: is_vic_all_bpp, and
+/// the sink's frl_dsc_max_frl_rate, the link (FRL rate code) the FRL
+/// capacity check takes a DSC stream at whenever a faster one is chosen
+/// (validate_hdmi_frl_output's dsc_max_rate).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrlDscLink {
+    pub all_bpp: bool,
+    pub max_rate: u8,
 }
 
 /// dc_dsc_compute_config as amdgpu_dm's SST policy calls it for a DP sink:
@@ -474,7 +1000,60 @@ pub fn compute_config(
         t,
         link,
         force,
+        Vic::default(),
     )
+}
+
+/// frl_link_bandwidth_kbps (and link_bw_kbps_from_raw_frl_link_rate_data)
+/// of an FRL rate code: lanes x the raw per-lane rate; 0 for none.
+pub fn frl_rate_kbps(code: u8) -> u32 {
+    match code {
+        1 => 9_000_000,
+        2 => 18_000_000,
+        3 => 24_000_000,
+        4 => 32_000_000,
+        5 => 40_000_000,
+        6 => 48_000_000,
+        _ => 0,
+    }
+}
+
+/// dc_dsc_compute_config as amdgpu_dm's HDMI FRL policy calls it
+/// (apply_dsc_policy_for_stream for SIGNAL_TYPE_HDMI_FRL): for an
+/// `is_frl` sink, against the bandwidth of its DSC_Max_FRL_Rate
+/// (`max_rate`), on DC_LINK_ENCODING_HDMI_FRL, the stream's VICs choosing
+/// the HDMI 2.1 bpp. The caller compresses only when the stream's raw
+/// bandwidth exceeds the verified FRL link's.
+pub fn compute_frl_config(
+    sink: &DscSinkCaps,
+    max_dispclk_khz: u32,
+    max_rate: u8,
+    t: &DscTiming,
+    vic: Vic,
+) -> Option<DscConfig> {
+    // Without a DSC rate (which the policy never compresses for) no bpp is
+    // decided, as dc_dsc_compute_config leaves it for a zero target.
+    let target = frl_rate_kbps(max_rate);
+    if !sink.is_frl {
+        return None;
+    }
+    let cfg = compute_with(
+        enc_caps(max_dispclk_khz),
+        sink,
+        max_dispclk_khz,
+        target,
+        t,
+        LinkEncoding::HdmiFrl,
+        false,
+        vic,
+    )?;
+    Some(DscConfig {
+        frl: Some(FrlDscLink {
+            all_bpp: sink.all_bpp,
+            max_rate,
+        }),
+        ..cfg
+    })
 }
 
 /// `dsc2_get_enc_caps` (DCN2.0, used by DCN3.0): slices 1-4 on one engine
@@ -528,9 +1107,21 @@ pub fn compute_config_dcn20(
         t,
         LinkEncoding::Dp8b10b,
         force,
+        Vic::default(),
     )
 }
 
+/// setup_dsc_config's slice and caps decisions, before the bpp: the common
+/// caps, horizontal slices and slice height.
+struct Setup {
+    common: Common,
+    policy: Policy,
+    slices_h: u32,
+    slices_v: u32,
+    simple: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn compute_with(
     enc: EncCaps,
     sink: &DscSinkCaps,
@@ -539,7 +1130,35 @@ fn compute_with(
     t: &DscTiming,
     link: LinkEncoding,
     force: bool,
+    vic: Vic,
 ) -> Option<DscConfig> {
+    let s = setup(&enc, sink, max_dispclk_khz, target_kbps, t, link)?;
+    let bpp_x16 = if target_kbps > 0 {
+        target_bpp_x16(&s, target_kbps, t, link, force, vic)?
+    } else {
+        0
+    };
+    Some(DscConfig {
+        slices_h: s.slices_h,
+        slices_v: s.slices_v,
+        bpp_x16,
+        block_pred: s.common.block_pred,
+        linebuf_depth: s.common.lb_bit_depth,
+        version_minor: u32::from(s.common.version & 0xf0) >> 4,
+        ycbcr422_simple: s.simple,
+        frl: None,
+        bpc: t.bpc,
+    })
+}
+
+fn setup(
+    enc: &EncCaps,
+    sink: &DscSinkCaps,
+    max_dispclk_khz: u32,
+    target_kbps: u32,
+    t: &DscTiming,
+    link: LinkEncoding,
+) -> Option<Setup> {
     // get_min_dsc_slice_count_for_odm.
     let pic_width = t.h_active;
     let pic_height = t.v_active;
@@ -551,11 +1170,12 @@ fn compute_with(
             .max(Fixed::int(pic_width as i32).div_int(i64::from(enc.max_slice_width)))
             .ceil() as u32
     };
-    let policy = policy(t);
+    let policy = policy(t, link);
     if sink.branch_max_line_width != 0 && sink.branch_max_line_width < pic_width {
         return None;
     }
-    let common = intersect(sink, &enc, t.encoding)?;
+    let mut common = intersect(sink, enc, t.encoding)?;
+    common.frl = frl_params(target_kbps);
     let (format, per_slice_mps, branch_mps, simple) = match t.encoding {
         Encoding::Rgb => (
             1,
@@ -569,8 +1189,14 @@ fn compute_with(
             sink.branch_throughput_0_mps,
             false,
         ),
-        // Linux's policy sends 4:2:2 as simple 4:2:2.
-        Encoding::Ycbcr422 => (4, sink.throughput_0_mps, 0, true),
+        // Linux's policy sends 4:2:2 as simple 4:2:2, except on HDMI FRL.
+        Encoding::Ycbcr422 if policy.ycbcr422_simple => (4, sink.throughput_0_mps, 0, true),
+        Encoding::Ycbcr422 => (
+            8,
+            sink.throughput_1_mps,
+            sink.branch_throughput_1_mps,
+            false,
+        ),
         Encoding::Ycbcr420 => (
             16,
             sink.throughput_1_mps,
@@ -615,8 +1241,13 @@ fn compute_with(
     if min_slices > max_slices || max_slices == 0 || min_slices == 0 {
         return None;
     }
-    let slices_h = min_slices;
-    if pic_width / slices_h > common.max_slice_width {
+    // An HDMI FRL sink's slice count is HDMI 2.1's for the pixel rate.
+    let slices_h = if sink.is_frl {
+        hdmi_num_slices(t)
+    } else {
+        min_slices
+    };
+    if slices_h == 0 || pic_width / slices_h > common.max_slice_width {
         return None;
     }
     let mut slice_height = 108.min(pic_height);
@@ -629,58 +1260,154 @@ fn compute_with(
     if (ycbcr420 && slice_height % 2 != 0) || slice_height == 0 {
         return None;
     }
-    let bpp_x16 = if target_kbps > 0 {
-        target_bpp_x16(&policy, &common, target_kbps, t, slices_h, link, force)?
-    } else {
-        0
-    };
-    Some(DscConfig {
+    Some(Setup {
+        common,
+        policy,
         slices_h,
         slices_v: pic_height / slice_height,
-        bpp_x16,
-        block_pred: common.block_pred,
-        linebuf_depth: common.lb_bit_depth,
-        version_minor: u32::from(common.version & 0xf0) >> 4,
-        ycbcr422_simple: simple,
+        simple,
     })
 }
 
-/// decide_dsc_bandwidth_range then decide_dsc_target_bpp_x16 (DP).
-fn target_bpp_x16(
-    policy: &Policy,
+/// dc_dsc_bw_range: a DSC stream's bpp bounds and their bandwidths, and the
+/// uncompressed stream's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BwRange {
+    pub min_bpp_x16: u32,
+    pub max_bpp_x16: u32,
+    pub min_kbps: u32,
+    pub max_kbps: u32,
+    pub stream_kbps: u32,
+}
+
+/// decide_dsc_bandwidth_range: the HDMI rules for an FRL sink, the eDP
+/// sink's maximum otherwise when declared, else `min_bpp_x16..=max_bpp_x16`.
+#[allow(clippy::too_many_arguments)]
+fn bandwidth_range_for(
+    min_bpp_x16: u32,
+    max_bpp_x16: u32,
+    slices_h: u32,
     common: &Common,
+    t: &DscTiming,
+    link: LinkEncoding,
+    vic: Vic,
+) -> Option<BwRange> {
+    let (min, max) = if common.is_frl {
+        let preferred = hdmi_bpp_x16(t, common, vic);
+        if vic.cta != 0 {
+            // CTA timings follow the HDMI specification strictly.
+            let min = if common.all_bpp {
+                min_bpp_x16
+            } else {
+                preferred
+            };
+            (min, preferred)
+        } else {
+            let calculated = if vic.hdmi == 0 {
+                frl_link_bpp_x16(t, slices_h, common)
+            } else {
+                0
+            };
+            let preferred = if calculated != 0 {
+                calculated.min(preferred)
+            } else {
+                preferred
+            };
+            (min_bpp_x16, max_bpp_x16.min(preferred))
+        }
+    } else if common.max_bpp_x16 != 0 {
+        (min_bpp_x16, common.max_bpp_x16.min(max_bpp_x16))
+    } else {
+        (min_bpp_x16, max_bpp_x16)
+    };
+    if max < min || min == 0 {
+        return None;
+    }
+    let is_dp = !common.is_frl;
+    let range = BwRange {
+        min_bpp_x16: min,
+        max_bpp_x16: max,
+        stream_kbps: stream_kbps(t, link),
+        max_kbps: dsc_kbps_for(t, max, slices_h, is_dp),
+        min_kbps: dsc_kbps_for(t, min, slices_h, is_dp),
+    };
+    (range.max_kbps >= range.min_kbps && range.min_kbps > 0).then_some(range)
+}
+
+/// dc_dsc_compute_bandwidth_range with DCN401's encoder: the bpp range
+/// (`min_bpp_x16..=max_bpp_x16`, narrowed by the sink's rules) a stream
+/// can be compressed to with the slices setup_dsc_config picks, and the
+/// bandwidths. None when DSC cannot carry the stream.
+pub fn bandwidth_range(
+    sink: &DscSinkCaps,
+    max_dispclk_khz: u32,
+    min_bpp_x16: u32,
+    max_bpp_x16: u32,
+    t: &DscTiming,
+    link: LinkEncoding,
+) -> Option<BwRange> {
+    let enc = enc_caps(max_dispclk_khz);
+    let s = setup(&enc, sink, max_dispclk_khz, 0, t, link)?;
+    bandwidth_range_for(
+        min_bpp_x16,
+        max_bpp_x16,
+        s.slices_h,
+        &s.common,
+        t,
+        link,
+        Vic::default(),
+    )
+}
+
+/// The DSC policy's bpp bounds for `t` (dc_dsc_get_policy_for_timing),
+/// in 1/16 bpp: what amdgpu_dm's MST DSC search takes as its range.
+pub fn policy_bpp_x16(t: &DscTiming, link: LinkEncoding) -> (u32, u32) {
+    let p = policy(t, link);
+    (p.min_bpp * 16, p.max_bpp * 16)
+}
+
+/// decide_dsc_bandwidth_range then decide_dsc_target_bpp_x16. An FRL
+/// stream short of even its minimum bandwidth takes the minimum bpp, whose
+/// tribyte borrowing the FRL capacity check then validates.
+fn target_bpp_x16(
+    s: &Setup,
     target_kbps: u32,
     t: &DscTiming,
-    slices_h: u32,
     link: LinkEncoding,
     force: bool,
+    vic: Vic,
 ) -> Option<u32> {
-    let (min_bpp, mut max_bpp) = (policy.min_bpp * 16, policy.max_bpp * 16);
-    if common.max_bpp_x16 != 0 {
-        max_bpp = common.max_bpp_x16.min(max_bpp);
-    }
-    if max_bpp < min_bpp || min_bpp == 0 {
-        return None;
-    }
-    let stream = stream_kbps(t, link);
-    let max_kbps = dsc_kbps(t, max_bpp, slices_h);
-    let min_kbps = dsc_kbps(t, min_bpp, slices_h);
-    if max_kbps < min_kbps || min_kbps == 0 {
-        return None;
-    }
-    let bpp = if target_kbps >= stream {
+    let range = bandwidth_range_for(
+        s.policy.min_bpp * 16,
+        s.policy.max_bpp * 16,
+        s.slices_h,
+        &s.common,
+        t,
+        link,
+        vic,
+    )?;
+    let mut bpp = if target_kbps >= range.stream_kbps {
         if force {
-            max_bpp
+            range.max_bpp_x16
         } else {
             0
         }
-    } else if target_kbps >= max_kbps {
-        max_bpp
-    } else if target_kbps >= min_kbps {
-        bpp_x16_for(target_kbps, t, slices_h, common.bpp_increment_div)
+    } else if target_kbps >= range.max_kbps {
+        range.max_bpp_x16
+    } else if target_kbps >= range.min_kbps {
+        bpp_x16_for(
+            target_kbps,
+            t,
+            s.slices_h,
+            s.common.bpp_increment_div,
+            !s.common.is_frl,
+        )
     } else {
         0
     };
+    if target_kbps < range.min_kbps && s.common.is_frl {
+        bpp = range.min_bpp_x16;
+    }
     (bpp != 0).then_some(bpp)
 }
 

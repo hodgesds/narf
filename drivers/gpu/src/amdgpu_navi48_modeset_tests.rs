@@ -23,10 +23,12 @@ fn completed_modeset(pipe: u8) -> Modeset {
         plan,
         scanout: otg::ScanoutRunning {
             pipe,
-            odm: None,
+            odm: otg::SplitPipes::NONE,
+            mpc: otg::SplitPipes::NONE,
             stream: pipe,
             plan,
             address: 0x8_0000_0000 + u64::from(pipe) * 0x1000000,
+            overlays: [None; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
             frame_before: 2,
             frame_after: 3,
         },
@@ -39,22 +41,24 @@ fn navi48_completed_modesets_survive_configuration_and_publication_cancellation(
         future::Future,
         task::{Context, Waker},
     };
+    // Modeset records are large: keep them on the heap (the aarch64
+    // kernel-test stack is 64 KiB).
     for during_startup in [false, true] {
-        let first = completed_modeset(0);
-        let second = completed_modeset(2);
-        let mut retained = RetainedModesets::new();
+        let first = alloc::boxed::Box::new(completed_modeset(0));
+        let second = alloc::boxed::Box::new(completed_modeset(2));
+        let mut retained = alloc::boxed::Box::new(RetainedModesets::new());
         let mut journal = super::super::teardown::Teardowns::new();
         {
-            let mut future = core::pin::pin!(async {
+            let mut future = alloc::boxed::Box::pin(async {
                 // A caller's temporary configuration disappears on cancellation.
                 let mut local = Vec::new();
-                for m in [first, second] {
-                    retained.retain(m);
-                    local.push(m);
+                for m in [&first, &second] {
+                    retained.retain(**m);
+                    local.push(alloc::boxed::Box::new(**m));
                 }
                 if during_startup {
                     journal
-                        .begin_activation(3, None, &second.selection)
+                        .begin_activation(3, otg::SplitPipes::NONE, &second.selection)
                         .unwrap();
                 }
                 // Later native startup, or asynchronous platform adoption.
@@ -67,9 +71,11 @@ fn navi48_completed_modesets_survive_configuration_and_publication_cancellation(
                 .is_pending());
         }
         assert_eq!(retained.check_stopped(), Err(otg::Error::Busy.into()));
-        let mut recovered = [None; 4];
+        let mut recovered: alloc::boxed::Box<[Option<Modeset>; 4]> =
+            alloc::boxed::Box::new([None; 4]);
         assert_eq!(retained.restore(&mut recovered), Ok(0b0101));
-        assert_eq!(recovered, [Some(first), None, Some(second), None]);
+        assert!(recovered[0] == Some(*first) && recovered[1].is_none());
+        assert!(recovered[2] == Some(*second) && recovered[3].is_none());
         assert_eq!(retained.restore(&mut recovered), Ok(0));
         // Handle recovery must not clear a cancelled native startup's quarantine.
         if during_startup {
@@ -81,9 +87,9 @@ fn navi48_completed_modesets_survive_configuration_and_publication_cancellation(
         // configuration preparation and stays available after another restore.
         retained.stopped(0);
         assert_eq!(retained.check_stopped(), Err(otg::Error::Busy.into()));
-        let mut again = [None; 4];
+        let mut again: alloc::boxed::Box<[Option<Modeset>; 4]> = alloc::boxed::Box::new([None; 4]);
         assert_eq!(retained.restore(&mut again), Ok(0b0100));
-        assert_eq!(again[2], Some(second));
+        assert!(again[2] == Some(*second));
         retained.stopped(2);
         assert_eq!(retained.check_stopped(), Ok(()));
     }
@@ -95,29 +101,32 @@ kernel_test_in!(
 );
 
 fn navi48_modeset_restore_refuses_conflicting_incarnations_before_changes() -> TestResult {
-    let first = completed_modeset(0);
-    let last = completed_modeset(3);
-    let mut retained = RetainedModesets::new();
-    retained.retain(first);
-    retained.retain(last);
-    let mut old = last;
+    // Modeset records are large: keep them on the heap (the aarch64
+    // kernel-test stack is 64 KiB).
+    let first = alloc::boxed::Box::new(completed_modeset(0));
+    let last = alloc::boxed::Box::new(completed_modeset(3));
+    let mut retained = alloc::boxed::Box::new(RetainedModesets::new());
+    retained.retain(*first);
+    retained.retain(*last);
+    let mut old = last.clone();
     old.scanout.address += 4096;
-    let mut caller = [None, None, None, Some(old)];
-    let before = caller;
+    let mut caller: alloc::boxed::Box<[Option<Modeset>; 4]> = alloc::boxed::Box::new([None; 4]);
+    caller[3] = Some(*old);
+    let before = caller.clone();
     assert_eq!(retained.restore(&mut caller), Err(otg::Error::Busy.into()));
     assert_eq!(
         caller, before,
         "partially restored before detecting a conflict"
     );
     // Updated admission and retraining witnesses replace the retained record.
-    let mut updated = last;
+    let mut updated = last.clone();
     updated.modes[0] = Some(last.selection.timing);
     updated.scanout.frame_before = 10;
     updated.scanout.frame_after = 11;
-    retained.retain(updated);
-    let mut caller = [None; 4];
+    retained.retain(*updated);
+    *caller = [None; 4];
     assert_eq!(retained.restore(&mut caller), Ok(0b1001));
-    assert_eq!(caller[3], Some(updated));
+    assert_eq!(caller[3], Some(*updated));
     TestResult::Pass
 }
 kernel_test_in!(
@@ -165,6 +174,7 @@ fn port(path: inventory::Path, dpcd: Option<[u8; 16]>, edid: Vec<u8>) -> display
             lttpr_uhbr: None,
             fec: false,
             dsc: None,
+            dprx_feature: 0,
             verified_link: None,
         }),
     }
@@ -258,6 +268,55 @@ fn navi48_modeset_requires_link_payload_and_aligns_pitch() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_modeset_requires_link_payload_and_aligns_pitch
+);
+
+/// Each plane format's admission shape: its bytes per pixel and a pitch of
+/// whole 256-byte requests (128, 64 or 32 pixels), the selection's plane
+/// format, and the per-pipe format a lighting takes (XRGB8888 by default).
+fn navi48_modeset_admits_the_plane_format_of_each_pipe() -> TestResult {
+    use otg::SurfaceFormat as F;
+    let paths = [path(inventory::Connector::DisplayPort, 0)];
+    let ports = [port(paths[0], dpcd(0x14, 4), edid_1080p())];
+    let Ok(mut s) = select(&paths, &ports, 8, None) else {
+        return TestResult::Fail("sink rejected");
+    };
+    if s.format != F::Xrgb8888 || selection_mode(&s) != mode(s.timing) {
+        return TestResult::Fail("default plane");
+    }
+    let mut odd = s.timing;
+    odd.h_active = 1366;
+    for (format, bytes, pitch, odd_pitch) in [
+        (F::Rgb565, 2, 1920, 1408),
+        (F::Xbgr2101010, 4, 1920, 1408),
+        (F::Abgr16161616f, 8, 1920, 1376),
+    ] {
+        s.format = format;
+        let m = selection_mode(&s);
+        if m.bytes_per_pixel != bytes
+            || m.pitch != pitch
+            || plane_mode(odd, format).pitch != odd_pitch
+            || (dml::Mode {
+                bytes_per_pixel: 4,
+                pitch: 1920,
+                ..m
+            }) != mode(s.timing)
+        {
+            return TestResult::Fail("plane admission shape");
+        }
+    }
+    let before = plane_format(2);
+    set_plane_format(2, F::Argb16161616f);
+    set_plane_format(7, F::Rgb565);
+    let (two, three) = (plane_format(2), plane_format(3));
+    set_plane_format(2, before);
+    if two != F::Argb16161616f || three != F::Xrgb8888 || plane_format(9) != F::Xrgb8888 {
+        return TestResult::Fail("per-pipe plane format");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_admits_the_plane_format_of_each_pipe
 );
 
 fn navi48_modeset_link_fallback_ladder_skips_short_links() -> TestResult {
@@ -915,9 +974,8 @@ fn navi48_modeset_selects_every_sink_and_admits_what_fits() -> TestResult {
     if select_all(&paths6, &more, 8, &|_| None).map(|a| a.len()) != Ok(MAX_DISPLAYS) {
         return TestResult::Fail("more than four displays");
     }
-    // A slow board carries 1080p60 but not 2160p120 beside it: the second
-    // display stays dark; alone, the 2160p120 one is refused outright (it
-    // would need a 3:1 ODM split of the 500-MHz DISPCLK).
+    // A slow board carries 1080p60 but not 2160p240 beside it: the second
+    // display stays dark; alone, the 2160p240 one is refused outright.
     let soc = dml::Soc {
         umc_channels: 16,
         uclk_khz: 456_000,
@@ -943,6 +1001,14 @@ fn navi48_modeset_selects_every_sink_and_admits_what_fits() -> TestResult {
         h_sync_positive: true,
         v_sync_positive: true,
     };
+    // 2160p120 takes a 3:1 ODM split of the 500-MHz DISPCLK: with the
+    // 1080p60 display beside it, all four pipes.
+    match admit_displays(&soc, &[all[0], fast]) {
+        Ok(plans) if plans.len() == 2 && plans[1].pipes == 3 && plans[0].pipes == 1 => {}
+        _ => return TestResult::Fail("3:1 stream beside a single-pipe one"),
+    }
+    // 2160p240 would need more than four pipes' DISPCLK.
+    fast.timing.pixel_clock_khz = 2_376_000;
     match admit_displays(&soc, &[all[0], fast]) {
         Ok(plans) if plans.len() == 1 && plans[0].mode == mode(all[0].timing) => {}
         _ => return TestResult::Fail("configuration not cut to what fits"),
@@ -1065,6 +1131,7 @@ fn navi48_modeset_decides_uhbr_like_linux() -> TestResult {
             lttpr_uhbr,
             fec: false,
             dsc: None,
+            dprx_feature: 0,
             verified_link: None,
         };
         dp_caps(&p, &sink).unwrap().uhbr
@@ -1148,8 +1215,8 @@ fn navi48_modeset_decides_uhbr_like_linux() -> TestResult {
     };
     if dp_link(&edge, DpCaps { fec: false, ..fec }) != Some((4, Legacy(LinkRate::Hbr2)))
         || dp_link(&edge, fec).is_some()
-        || !dp_fits(&timing(698_400, 3840), fec, 4, Legacy(LinkRate::Hbr2))
-        || dp_fits(&timing(698_401, 3840), fec, 4, Legacy(LinkRate::Hbr2))
+        || !dp_fits_bpc(&timing(698_400, 3840), fec, 4, Legacy(LinkRate::Hbr2), 8)
+        || dp_fits_bpc(&timing(698_401, 3840), fec, 4, Legacy(LinkRate::Hbr2), 8)
     {
         return TestResult::Fail("8b/10b FEC bandwidth");
     }
@@ -1180,6 +1247,7 @@ fn navi48_modeset_decides_uhbr_like_linux() -> TestResult {
         lttpr_uhbr: None,
         fec: false,
         dsc: None,
+        dprx_feature: 0,
         verified_link: None,
     };
     let port = display::Port {
@@ -1341,8 +1409,10 @@ kernel_test_in!(
 /// DSC as amdgpu_dm's SST policy uses it here: a 4K60 sink on two HBR2
 /// lanes (8,380,800 kbps with FEC) cannot take the 14,256,000 kbps stream,
 /// so it is compressed to the highest bpp that link carries, on the
-/// maximum 8b/10b link, without audio; a sink without DSC, without FEC or
-/// with 128b/132b gets no DSC here, and a stream that fits needs none.
+/// maximum 8b/10b link, with its audio; an 8b/10b sink without DSC or
+/// without FEC gets no DSC (128b/132b sinks:
+/// `navi48_modeset_decides_uhbr_dsc_like_linux`), and a stream that fits
+/// needs none.
 fn navi48_modeset_decides_dsc_like_linux() -> TestResult {
     use crate::amdgpu_dsc::{compute_config, DscSinkCaps, DscTiming, Encoding, LinkEncoding};
     let p = path(inventory::Connector::DisplayPort, 0);
@@ -1359,6 +1429,7 @@ fn navi48_modeset_decides_dsc_like_linux() -> TestResult {
         lttpr_uhbr: None,
         fec,
         dsc,
+        dprx_feature: 0,
         verified_link: None,
     };
     let pick = |s: display::Sink| {
@@ -1697,7 +1768,7 @@ fn navi48_mst_admits_dark_connector_modes() -> TestResult {
         &devices,
         &|_| None,
         &[None],
-        &|_, _| u16::MAX
+        &|_, _| { u16::MAX }
     )
     .is_empty());
     let enabled = super::super::mst::select_mst_outputs(
@@ -1739,8 +1810,8 @@ fn navi48_mst_selection_obeys_shared_path_budget() -> TestResult {
     ];
     // Both end ports can carry 1080p, but their common upstream hop cannot
     // carry two such streams. The second keeps its pipe and takes 720p.
-    let budget = |_, selected: &[Selection]| {
-        900u16.saturating_sub(selected.iter().filter_map(|s| s.mst).map(|m| m.pbn).sum())
+    let budget = |_, selected: &[(crate::dp_mst_mgr::Sink, u16)]| {
+        900u16.saturating_sub(selected.iter().map(|a| a.1).sum())
     };
     let picked = super::super::mst::select_mst_outputs(
         0,
@@ -2007,6 +2078,8 @@ fn navi48_frl_selection_reserves_audio_bandwidth() -> TestResult {
         Some(crate::amdgpu_frl_cap::FrlCap::Ok {
             audio_packets_line: 2,
             borrow: crate::amdgpu_frl_cap::FrlBorrow::None,
+            hc_active: 0,
+            hc_blank: 0,
         })
     );
     // A compressed-only sink remains usable as silent FRL video.
@@ -2107,6 +2180,7 @@ fn navi48_dsc_link_verification_reselects_compressed_geometry() -> TestResult {
         lttpr_uhbr: None,
         fec: true,
         dsc: Some(DSC),
+        dprx_feature: 0,
         verified_link: None,
     };
     let ports = || {
@@ -2167,7 +2241,7 @@ fn navi48_dsc_link_verification_reselects_compressed_geometry() -> TestResult {
         &DscSinkCaps::parse(&DSC, &[0; 3]).unwrap(),
         NOMINAL_DISPCLK_KHZ,
         legacy_kbps(2, Hbr2, true) as u32,
-        &dsc_timing(&again.timing),
+        &dsc_timing(&again.timing, 8),
         LinkEncoding::Dp8b10b,
         false,
     );
@@ -2204,18 +2278,30 @@ kernel_test_in!(
     navi48_dsc_link_verification_reselects_compressed_geometry
 );
 
-/// A two-pipe plan takes the highest pipe no display of the configuration
-/// is on and no earlier ODM display took; one-pipe plans take none.
+/// An n-pipe plan takes the n - 1 highest pipes no display of the
+/// configuration is on and no earlier ODM display took, left to right in
+/// that order; one-pipe plans take none, and a configuration short of
+/// pipes is refused.
 fn navi48_odm_plans_take_the_highest_free_pipes() -> TestResult {
     let one = completed_modeset(0).plan;
     let two = dml::Plan { pipes: 2, ..one };
+    let three = dml::Plan { pipes: 3, ..one };
+    let four = dml::Plan { pipes: 4, ..one };
+    let s = |p: &[u8]| otg::SplitPipes::new(p).unwrap();
+    let none = otg::SplitPipes::NONE;
     let got = |plans: &[dml::Plan], pipes: &[u8]| odm_pipes(plans, pipes).ok();
-    if got(&[two], &[0]) != Some(alloc::vec![Some(3)])
-        || got(&[two], &[3]) != Some(alloc::vec![Some(2)])
-        || got(&[one, two, one], &[0, 3, 1]) != Some(alloc::vec![None, Some(2), None])
+    if got(&[two], &[0]) != Some(alloc::vec![s(&[3])])
+        || got(&[two], &[3]) != Some(alloc::vec![s(&[2])])
+        || got(&[one, two, one], &[0, 3, 1]) != Some(alloc::vec![none, s(&[2]), none])
         || got(&[one, two, two], &[0, 3, 1]).is_some()
-        || got(&[two, two], &[0, 2]) != Some(alloc::vec![Some(3), Some(1)])
-        || got(&[one, one], &[0, 1]) != Some(alloc::vec![None, None])
+        || got(&[two, two], &[0, 2]) != Some(alloc::vec![s(&[3]), s(&[1])])
+        || got(&[one, one], &[0, 1]) != Some(alloc::vec![none, none])
+        || got(&[three], &[0]) != Some(alloc::vec![s(&[3, 2])])
+        || got(&[four], &[1]) != Some(alloc::vec![s(&[3, 2, 0])])
+        || got(&[three, one], &[0, 1]) != Some(alloc::vec![s(&[3, 2]), none])
+        || got(&[three, one], &[2, 0]) != Some(alloc::vec![s(&[3, 1]), none])
+        || got(&[four, one], &[0, 1]).is_some()
+        || got(&[three, two], &[0, 1]).is_some()
     {
         return TestResult::Fail("ODM pipe allocation");
     }
@@ -2272,7 +2358,7 @@ fn navi48_mst_selection_trains_uhbr_when_the_branch_codes_it() -> TestResult {
     }
     // 64 slots: five such streams would fit the link, as 63 would not.
     let t = s[0].timing;
-    let slots = super::super::mst::mst_slots(&t, 4, s[0].rate, false)
+    let slots = super::super::mst::mst_slots(&t, 8, 4, s[0].rate, false)
         .unwrap()
         .1;
     if super::super::mst::mst_total_slots(s[0].rate) != 64 || slots * 5 > 64 {
@@ -2292,4 +2378,1544 @@ fn navi48_mst_selection_trains_uhbr_when_the_branch_codes_it() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_mst_selection_trains_uhbr_when_the_branch_codes_it
+);
+
+/// A 1080p60 EDID 1.4 with continuous frequency and a 48-75 Hz "range
+/// limits only" descriptor.
+fn edid_vrr_48_75() -> Vec<u8> {
+    let mut e = edid_1080p();
+    e[24] |= 1;
+    e[90..108].copy_from_slice(&[0, 0, 0, 0xfd, 0, 48, 75, 30, 90, 17, 1, 0, 0, 0, 0, 0, 0, 0]);
+    e[127] = 0;
+    e[127] = narf_edid::compute_checksum(&e);
+    e
+}
+
+/// amdgpu_dm_update_freesync_caps on the selected DP SST sink: the EDID
+/// range when DPCD 0x007 bit 6 allows invalid MSA timing; the mode is then
+/// vrr_supported and VRR_ENABLED runs it at mod_freesync's totals (1125 to
+/// ceil(1406.25) = 1407 for 48 Hz). HDMI sinks are not VRR-capable here.
+fn navi48_modeset_dp_selection_carries_the_freesync_range() -> TestResult {
+    use inventory::Connector::{DisplayPort as Dp, HdmiTypeA as Hdmi};
+    let p = path(Dp, 0);
+    let mut caps = dpcd(0x14, 4);
+    let s = select(&[p], &[port(p, caps, edid_vrr_48_75())], 8, None).unwrap();
+    if s.vrr.is_some() || s.vrr_supported() || s.drr().is_some() {
+        return TestResult::Fail("MSA_TIMING_PAR_IGNORED clear");
+    }
+    caps.as_mut().unwrap()[7] = 0x40;
+    let s = select(&[p], &[port(p, caps, edid_vrr_48_75())], 8, None).unwrap();
+    let range = crate::amdgpu_freesync::VrrRange {
+        min_hz: 48,
+        max_hz: 75,
+    };
+    if s.vrr != Some(range)
+        || !s.vrr_supported()
+        || s.drr()
+            != Some(crate::amdgpu_freesync::Drr {
+                v_total_min: 1125,
+                v_total_max: 1407,
+            })
+    {
+        return TestResult::Fail("capable DP sink");
+    }
+    // A sink without the range descriptor is not capable either.
+    let s = select(&[p], &[port(p, caps, edid_1080p())], 8, None).unwrap();
+    if s.vrr.is_some() {
+        return TestResult::Fail("no range");
+    }
+    // A mode outside the range keeps the sink capable but the mode fixed.
+    let mut outside = s;
+    outside.vrr = Some(crate::amdgpu_freesync::VrrRange {
+        min_hz: 61,
+        max_hz: 144,
+    });
+    if outside.vrr_supported() || outside.drr().is_some() {
+        return TestResult::Fail("mode outside the range");
+    }
+    let h = path(Hdmi, 1);
+    let hdmi = select(
+        &[h],
+        &[port(h, None, with_cta(edid_vrr_48_75(), true))],
+        8,
+        None,
+    );
+    if hdmi.map(|s| s.vrr) != Ok(None) {
+        return TestResult::Fail("HDMI");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_dp_selection_carries_the_freesync_range
+);
+
+/// DSC 1.2 decoder caps: slices 1/2/4, 13-bit line buffer, RGB, 8/10/12
+/// bpc, 1000 MP/s per slice, 5120-pixel slices, 1/16 bpp.
+const UHBR_DSC: [u8; 16] = [
+    1, 0x21, 0, 0x0b, 0x0b, 4, 1, 0, 0, 0x13, 0x0e, 0xee, 16, 0, 0, 0,
+];
+/// CVT-RB2-like timings past one 4 x UHBR10 link uncompressed.
+fn big_timing(khz: u32, h_active: u32, v_active: u32, v_total: u32) -> Timing {
+    Timing {
+        pixel_clock_khz: khz,
+        h_active,
+        h_total: h_active + 80,
+        h_front_porch: 48,
+        h_sync_width: 32,
+        v_active,
+        v_total,
+        v_front_porch: 3,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: false,
+    }
+}
+fn uhd8k60() -> Timing {
+    big_timing(2_039_793, 7680, 4320, 4381)
+}
+fn uhd240() -> Timing {
+    big_timing(2_151_590, 3840, 2160, 2287)
+}
+fn uhd144() -> Timing {
+    big_timing(1_254_282, 3840, 2160, 2222)
+}
+
+/// DSC over 128b/132b as amdgpu_dm's SST policy and dc pick it. The DSC
+/// target is dc_link_bandwidth_kbps at the sink's maximum link
+/// (dc_link_get_link_cap): 4 x UHBR10 on a UHBR10 sink, so the 128b/132b
+/// encoding (its padded uncompressed stream decides whether DSC is
+/// needed), not 4 x HBR3 with FEC. Uncompressed UHBR wins whenever any
+/// rate the sink reaches carries the mode (8K60 and 4K240 run uncompressed
+/// on 4 x UHBR13.5). The compressed stream then takes the lowest setting
+/// upward its bandwidth needs. Configurations, compressed bandwidths and
+/// link targets match Linux's dc_dsc_compute_config built on the host
+/// (tests/dcn401_dsc harness): 8K60 4 slices at 16 bpp, 32,905,857 kbps;
+/// 4K240 4 slices at 16 bpp, 34,987,489 kbps; 4K144 on two UHBR10 lanes
+/// 2 slices at 243/16 bpp, 19,213,233 kbps; 8K60 on 4 x HBR3 with FEC 4
+/// slices at 195/16 bpp, 25,129,147 kbps (two DSCs under ODM 2:1).
+fn navi48_modeset_decides_uhbr_dsc_like_linux() -> TestResult {
+    use crate::amdgpu_dsc::{compute_config, dsc_kbps, DscSinkCaps, LinkEncoding};
+    use otg::UhbrRate::{Uhbr10 as U10, Uhbr13_5 as U13, Uhbr20 as U20};
+    use DpRate::{Legacy, Uhbr};
+    let sink = DscSinkCaps::parse(&UHBR_DSC, &[0; 3]).unwrap();
+    let caps = |lanes: u8, uhbr: u8, fec: bool, dsc: bool| DpCaps {
+        lanes,
+        rate: LinkRate::Hbr3,
+        uhbr,
+        fec,
+        dsc: dsc.then_some(sink),
+    };
+    // (timing, caps, link, Some((slices, bpp_x16, kbps, target)) for DSC).
+    type Want = Option<(u32, u32, u32, u64, LinkEncoding)>;
+    type Case = (Timing, DpCaps, Option<(u8, DpRate)>, Want);
+    let cases: [Case; 11] = [
+        (
+            uhd8k60(),
+            caps(4, 0b001, true, true),
+            Some((4, Uhbr(U10))),
+            Some((4, 256, 32_905_857, 38_564_000, LinkEncoding::Dp128b132b)),
+        ),
+        (
+            uhd8k60(),
+            caps(4, 0b011, true, true),
+            Some((4, Uhbr(U13))),
+            None,
+        ),
+        (
+            uhd8k60(),
+            caps(4, 0b101, true, true),
+            Some((4, Uhbr(U20))),
+            None,
+        ),
+        (
+            uhd240(),
+            caps(4, 0b001, true, true),
+            Some((4, Uhbr(U10))),
+            Some((4, 256, 34_987_489, 38_564_000, LinkEncoding::Dp128b132b)),
+        ),
+        (
+            uhd240(),
+            caps(4, 0b111, true, true),
+            Some((4, Uhbr(U13))),
+            None,
+        ),
+        (
+            uhd144(),
+            caps(2, 0b001, true, true),
+            Some((2, Uhbr(U10))),
+            Some((2, 243, 19_213_233, 19_282_000, LinkEncoding::Dp128b132b)),
+        ),
+        (
+            uhd144(),
+            caps(4, 0b001, true, true),
+            Some((4, Uhbr(U10))),
+            None,
+        ),
+        // FEC is inherent in 128b/132b: no 8b/10b FEC cap is needed.
+        (
+            uhd8k60(),
+            caps(4, 0b001, false, true),
+            Some((4, Uhbr(U10))),
+            Some((4, 256, 32_905_857, 38_564_000, LinkEncoding::Dp128b132b)),
+        ),
+        // An 8b/10b-only sink compresses for 4 x HBR3 with FEC; 8K takes
+        // two DSCs (ODM 2:1, two slices each).
+        (
+            uhd8k60(),
+            caps(4, 0, true, true),
+            Some((4, Legacy(LinkRate::Hbr3))),
+            Some((4, 195, 25_129_147, 25_142_400, LinkEncoding::Dp8b10b)),
+        ),
+        // No DSC decoder, or 8b/10b DSC without FEC: no link.
+        (uhd8k60(), caps(4, 0b001, true, false), None, None),
+        (uhd8k60(), caps(4, 0, false, true), None, None),
+    ];
+    for (i, (t, c, link, want)) in cases.into_iter().enumerate() {
+        let uncompressed = dp_link(&t, c);
+        let cfg = dp_dsc(&t, c, NOMINAL_DISPCLK_KHZ, 8);
+        let got = uncompressed.or_else(|| cfg.and_then(|cfg| dsc_link(&t, cfg, c)));
+        assert_eq!(got, link, "case {i}: link");
+        let Some((slices, bpp, kbps, target, encoding)) = want else {
+            assert!(uncompressed.is_some() || got.is_none(), "case {i}: DSC");
+            continue;
+        };
+        assert!(uncompressed.is_none(), "case {i}: carried uncompressed");
+        let cfg = cfg.unwrap();
+        let linux = compute_config(
+            &sink,
+            NOMINAL_DISPCLK_KHZ,
+            target as u32,
+            &dsc_timing(&t, 8),
+            encoding,
+            false,
+        );
+        assert_eq!(Some(cfg), linux, "case {i}: dc_dsc_compute_config");
+        assert_eq!((cfg.slices_h, cfg.bpp_x16), (slices, bpp), "case {i}");
+        assert_eq!(
+            dsc_kbps(&dsc_timing(&t, 8), cfg.bpp_x16, cfg.slices_h),
+            kbps
+        );
+        // The admission shape: the DSCs DML gives the stream.
+        let pipes = dml::dsc_pipes(&t, cfg.slices_h, NOMINAL_DISPCLK_KHZ);
+        assert_eq!(
+            pipes,
+            if t.h_active > 5760 || t.pixel_clock_khz > 1_992_428 {
+                2
+            } else {
+                1
+            }
+        );
+    }
+    // A UHBR sink never compresses onto 8b/10b: 16 bpp is two thirds of
+    // 24, and 8b/10b with FEC at any lane count carries less than two
+    // thirds of UHBR10 at that count. Sweep 4K and 8K pixel clocks.
+    for lanes in [1, 2, 4] {
+        for h_active in [3840, 7680] {
+            for khz in (300_000..2_600_000).step_by(25_000) {
+                let t = big_timing(khz, h_active, 2160, 2222);
+                let c = caps(lanes, 0b111, true, true);
+                if dp_link(&t, c).is_some() {
+                    continue;
+                }
+                if let Some(cfg) = dp_dsc(&t, c, NOMINAL_DISPCLK_KHZ, 8) {
+                    match dsc_link(&t, cfg, c) {
+                        Some((_, Uhbr(_))) => {}
+                        other => panic!("{lanes} lanes {h_active} at {khz}: {other:?}"),
+                    }
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_decides_uhbr_dsc_like_linux
+);
+
+const DEPTH_VECTORS: &str = include_str!("../tests/dcn401_dsc/depth_vectors.txt");
+
+/// An EDID 1.4 base block whose digital input declares `bpc` (0:
+/// undefined), for `dp_depths`.
+fn edid_with_bpc(bpc: u8) -> [u8; 128] {
+    let mut e = [0u8; 128];
+    e[18] = 1;
+    e[19] = 4;
+    let code = match bpc {
+        6 => 1,
+        8 => 2,
+        10 => 3,
+        12 => 4,
+        14 => 5,
+        16 => 6,
+        _ => 0,
+    };
+    e[20] = 0x80 | code << 4;
+    e
+}
+
+/// One depth_vectors.txt line through `dp_sst_stream`, printed as
+/// depth_harness.c prints Linux's choice.
+fn run_depth_vector(input: &str) -> Option<alloc::string::String> {
+    use core::fmt::Write;
+    let w: Vec<&str> = input.split_whitespace().collect();
+    let mut dpcd = [0u8; 16];
+    for (i, b) in dpcd.iter_mut().enumerate() {
+        *b = u8::from_str_radix(w.first()?.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    let n: Vec<u32> = w[1..]
+        .iter()
+        .map(|v| v.parse().ok())
+        .collect::<Option<_>>()?;
+    let (dispclk, pix, ha, ht, va, vt) = (n[0], n[1], n[2], n[3], n[4], n[5]);
+    let (edid_bpc, requested, lanes, rate) = (n[6] as u8, n[7] as u8, n[8] as u8, n[9]);
+    let t = Timing {
+        pixel_clock_khz: pix / 10,
+        h_active: ha,
+        h_total: ht,
+        h_front_porch: 48,
+        h_sync_width: 32,
+        v_active: va,
+        v_total: vt,
+        v_front_porch: 3,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: false,
+    };
+    // The sink's maximum link: an 8b/10b rate with FEC, or 128b/132b up
+    // to the given UHBR rate (the HBR3 8b/10b link below it).
+    let (legacy, uhbr) = match rate {
+        1000 => (LinkRate::Hbr3, 0b001),
+        1350 => (LinkRate::Hbr3, 0b011),
+        2000 => (LinkRate::Hbr3, 0b111),
+        r => (LinkRate::from_dpcd_byte(r as u8)?, 0),
+    };
+    let caps = DpCaps {
+        lanes,
+        rate: legacy,
+        uhbr,
+        fec: true,
+        dsc: crate::amdgpu_dsc::DscSinkCaps::parse(&dpcd, &[0; 3]),
+    };
+    let depths = dp_depths(&edid_with_bpc(edid_bpc), requested);
+    let mut out = alloc::string::String::new();
+    match dp_sst_stream(&t, caps, &depths, dispclk) {
+        None => out.push_str("FAIL"),
+        Some(s) => {
+            let bpc = depth_bpc(s.depth);
+            match s.dsc {
+                None => write!(out, "{bpc} -").ok()?,
+                Some(c) => write!(
+                    out,
+                    "{bpc} {} {} {} {}",
+                    c.slices_h,
+                    c.slices_v,
+                    c.bpp_x16,
+                    crate::amdgpu_dsc::dsc_kbps(&dsc_timing(&t, c.bpc), c.bpp_x16, c.slices_h)
+                )
+                .ok()?,
+            }
+            if s.dsc.is_some_and(|c| c.bpc != bpc) {
+                return None;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Every depth_vectors.txt line: amdgpu_dm_create_validate_stream_for_sink's
+/// DP SST depth search as Linux built on the host runs it (depth_harness.c:
+/// the requested and EDID depths, uncompressed or DSC at each, the first
+/// that fits the maximum link), through `dp_sst_stream` and `dp_depths`.
+fn navi48_dp_sst_depth_search_matches_linux_vectors() -> TestResult {
+    let mut checked = 0;
+    for line in DEPTH_VECTORS
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        let Some((input, want)) = line.split_once(" = ") else {
+            return TestResult::Fail("malformed depth vector");
+        };
+        match run_depth_vector(input) {
+            Some(got) if got == want => checked += 1,
+            Some(got) => panic!("depth vector {input}\n want {want}\n  got {got}"),
+            None => return TestResult::Fail("depth vector input"),
+        }
+    }
+    if checked < 1000 {
+        return TestResult::Fail("too few depth vectors");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_dp_sst_depth_search_matches_linux_vectors
+);
+
+/// A one-lane UHBR10 sink (DSC decoder, board connector at UHBR10) and its
+/// EDID's 4K60 (14,256,000 kbps): neither 1 x HBR3 nor 1 x UHBR10
+/// (9,641,000 kbps) carries it, so select compresses it for 1 x UHBR10,
+/// on 1 x UHBR10, through HPO, with its LPCM budgeted at the compressed
+/// bits per pixel (build_audio_output's dsc_cfg). refine_dsc redoes it with
+/// the board's DISPCLK, admission takes it, the timing request is HPO DP
+/// with the DSC, and fallback keeps the PPS: Linux's table through the
+/// 128b/132b settings that carry the compressed stream.
+fn navi48_modeset_selects_dsc_over_uhbr() -> TestResult {
+    use crate::amdgpu_dsc::{compute_config, DscSinkCaps, LinkEncoding};
+    use otg::UhbrRate::{Uhbr10 as U10, Uhbr13_5 as U13, Uhbr20 as U20};
+    use DpRate::Uhbr;
+    let mut p = path(inventory::Connector::DisplayPort, 0);
+    p.max_speed_mhz = 10_000;
+    let sink = display::Sink {
+        dpcd: dpcd(0x1e, 1),
+        edid: edid_uhbr(),
+        lttpr: None,
+        uhbr: 1,
+        lttpr_uhbr: None,
+        fec: true,
+        dsc: Some(UHBR_DSC),
+        dprx_feature: 0,
+        verified_link: None,
+    };
+    let port = display::Port {
+        path: p,
+        sink: Ok(sink),
+    };
+    let mut s = match select(&[p], &[port], 8, None) {
+        Ok(s) => s,
+        Err(e) => panic!("UHBR DSC selection {e:?}"),
+    };
+    let want = compute_config(
+        &DscSinkCaps::parse(&UHBR_DSC, &[0; 3]).unwrap(),
+        NOMINAL_DISPCLK_KHZ,
+        9_641_000,
+        &dsc_timing(&s.timing, 8),
+        LinkEncoding::Dp128b132b,
+        false,
+    );
+    if !s.uhbr()
+        || (s.lanes, s.rate) != (1, Uhbr(U10))
+        || s.dsc.is_none()
+        || s.dsc != want
+        || s.timing.pixel_clock_khz != 594_000
+    {
+        panic!("UHBR DSC selection {s:?}");
+    }
+    let settings = otg::UhbrSettings {
+        lanes: 1,
+        rate: U10,
+        mst: false,
+    };
+    let audio = sink_audio_info(&edid_uhbr())
+        .and_then(|a| otg::uhbr_audio_info_with(a, &s.timing, 8, settings, s.dsc.as_ref()));
+    if audio.is_none() || s.audio != audio {
+        panic!("UHBR DSC audio {:?} want {audio:?}", s.audio);
+    }
+    let soc = dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [500_000, 2_000_000],
+        dcfclk_khz: [300_000, 1_200_000],
+        socclk_khz: 600_000,
+        dispclk_max_khz: 1_500_000,
+        dppclk_max_khz: 1_500_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    let selected = s;
+    refine_dsc(&soc, core::slice::from_mut(&mut s)).unwrap();
+    if (s.lanes, s.rate) != (1, Uhbr(U10)) || s.dsc.is_none() {
+        return TestResult::Fail("refined UHBR DSC");
+    }
+    let plans = match admit_displays(&soc, &[s]) {
+        Ok(p) => p,
+        Err(e) => panic!("UHBR DSC admission {e:?}"),
+    };
+    let request = timing_request(0, &plans[0], &s);
+    if request.signal != otg::Signal::HpoDisplayPort || request.dsc != s.dsc {
+        return TestResult::Fail("HPO timing request");
+    }
+    assert_eq!(selected_dp_candidates(&s), [(1, Uhbr(U10))]);
+    // From a 4 x UHBR20 setting the compressed stream fits every
+    // 128b/132b row of Linux's table; uncompressed, the one-lane rows
+    // below UHBR20 would not.
+    let wide = Selection {
+        lanes: 4,
+        rate: Uhbr(U20),
+        caps: DpCaps {
+            lanes: 4,
+            uhbr: 0b111,
+            ..s.caps
+        },
+        ..selected
+    };
+    let ladder = selected_dp_candidates(&wide);
+    assert_eq!(
+        ladder,
+        [
+            (4, Uhbr(U20)),
+            (4, Uhbr(U13)),
+            (2, Uhbr(U20)),
+            (4, Uhbr(U10)),
+            (2, Uhbr(U13)),
+            (1, Uhbr(U20)),
+            (2, Uhbr(U10)),
+            (1, Uhbr(U13)),
+            (1, Uhbr(U10)),
+        ]
+    );
+    assert!(!dp_candidates(&wide.timing, wide.caps, 4, Uhbr(U20)).contains(&(1, Uhbr(U13))));
+    // Alternatives are offered with their own DSC for the same maximum
+    // link: 4K90 compresses harder.
+    let offered = dp_offered_mode(s.timing, &s, soc.dispclk_max_khz).and_then(|m| m.dsc);
+    let faster = Timing {
+        pixel_clock_khz: 891_000,
+        ..s.timing
+    };
+    let harder = dp_offered_mode(faster, &s, soc.dispclk_max_khz).and_then(|m| m.dsc);
+    match (offered, harder) {
+        (Some(a), Some(b)) if b.bpp_x16 < a.bpp_x16 => {}
+        other => panic!("offered DSC {other:?}"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_selects_dsc_over_uhbr
+);
+
+/// A selection's output color space, blank request and HDR packet follow
+/// amdgpu_dm_get_output_color_space and amdgpu_dm_fill_hdr_info_packet;
+/// the DP sink's VSC colorimetry follows its DPCD revision and DPRX bit.
+fn navi48_selection_maps_colorspace_and_hdr_like_amdgpu_dm() -> TestResult {
+    use crate::amdgpu_hdr::DcColorSpace as C;
+    let s = limited_bpp_dsc_selection();
+    if s.colorspace != 0 || s.hdr.is_some() || s.hdr_packet().is_some() {
+        return TestResult::Fail("defaults");
+    }
+    for (colorspace, limited, ycbcr420, cs) in [
+        (0, false, false, C::Srgb),
+        (0, true, false, C::SrgbLimited),
+        (0, false, true, C::Ycbcr709),
+        (9, false, false, C::Rgb2020Full),
+        (9, true, false, C::Rgb2020Limited),
+        (10, false, true, C::Ycbcr2020Limited),
+        (7, false, false, C::AdobeRgb),
+        (2, false, false, C::Ycbcr709),
+    ] {
+        let sel = Selection {
+            colorspace,
+            limited,
+            ycbcr420,
+            ..s
+        };
+        let b = sel.blank_request(2);
+        if sel.color_space() != cs
+            || b.colorspace != cs
+            || b.limited != matches!(cs, C::SrgbLimited | C::Rgb2020Limited)
+            || b.ycbcr420 != ycbcr420
+        {
+            return TestResult::Fail("output color space");
+        }
+    }
+    let mut blob = [0u8; 32];
+    blob[4] = 2;
+    let meta = crate::amdgpu_hdr::HdrOutputMetadata::from_blob(&blob).unwrap();
+    let dp = Selection {
+        hdr: Some(meta),
+        ..s
+    };
+    let hdmi = Selection { hdmi: true, ..dp };
+    if dp.hdr_packet().map(|p| p.hb) != Some([0, 0x87, 0x1d, 0x4c])
+        || hdmi.hdr_packet().map(|p| p.hb) != Some([0x87, 1, 0x1a, 0])
+    {
+        return TestResult::Fail("HDR packet type");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_selection_maps_colorspace_and_hdr_like_amdgpu_dm
+);
+
+/// DRM's planes reach DML and staging as DC hands them over: the scaled
+/// primary's and each overlay's surface request (layout on the stream,
+/// format, pipe) and, from them, the admission mode's plane list (SPL's
+/// viewport, ratios and taps). The full-frame primary alone keeps the
+/// single-plane mode. Overlays take free pipes from the top (one per
+/// segment of an ODM stream); a configuration short of pipes is refused.
+fn navi48_planes_reach_admission_and_staging() -> TestResult {
+    use crate::amdgpu_dcn401_spl::{Rect, Rotation};
+    let base = completed_modeset(0).selection;
+    let soc = dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [300_000, 2_500_000],
+        dcfclk_khz: [200_000, 1_564_000],
+        socclk_khz: 300_000,
+        dispclk_max_khz: 2_000_000,
+        dppclk_max_khz: 2_000_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    let geometry = |w: u32, h: u32, dst: Rect, format: otg::SurfaceFormat| PlaneGeometry {
+        src_x: 0,
+        src_y: 0,
+        width: w,
+        height: h,
+        dst,
+        rotation: Rotation::R0,
+        blend: otg::Blend::default_for(format),
+        surface: otg::PlaneSurface::LINEAR,
+        fb_size: (w, h),
+    };
+    let video = OverlayPlane {
+        geometry: geometry(
+            1280,
+            720,
+            Rect::new(100, 100, 640, 360),
+            otg::SurfaceFormat::Argb8888,
+        ),
+        format: otg::SurfaceFormat::Argb8888,
+        underlay: false,
+        plane: 0,
+    };
+    let s = Selection {
+        planes: PlaneSetup {
+            primary: Some(geometry(
+                1280,
+                720,
+                Rect::new(0, 0, 1920, 1080),
+                base.format,
+            )),
+            overlays: [Some(video), None, None],
+        },
+        ..base
+    };
+    let pp = |pipe: u8, odm: &[u8]| {
+        Some(PlanePipes {
+            pipe,
+            odm: otg::SplitPipes::new(odm).unwrap(),
+            mpc: otg::SplitPipes::NONE,
+        })
+    };
+    let on3 = DisplayPipes {
+        overlays: [pp(3, &[]), None, None],
+        ..DisplayPipes::default()
+    };
+    let (primary, overlays) = plane_requests(&s, 0, &on3);
+    let Some(overlay) = overlays[0] else {
+        return TestResult::Fail("overlay request");
+    };
+    let full = Rect::new(0, 0, 1920, 1080);
+    if (primary.width, primary.height) != (1280, 720)
+        || primary.plane.map(|l| (l.dst, l.stream_width, l.underlay)) != Some((full, 1920, false))
+        || (overlay.pipe, overlay.odm, overlay.format)
+            != (3, otg::SplitPipes::NONE, otg::SurfaceFormat::Argb8888)
+        || overlay.plane.map(|l| l.dst) != Some(Rect::new(100, 100, 640, 360))
+        || overlay.check().is_err()
+        || primary.check().is_err()
+    {
+        return TestResult::Fail("surface requests");
+    }
+    let mode = selection_mode(&s);
+    let planes: alloc::vec::Vec<dml::Plane> = mode.plane_list().collect();
+    if planes != [primary.dml_plane(), overlay.dml_plane()]
+        || planes[0].h_ratio != (1280 << 19) / 1920
+        || planes[1].v_ratio != 2 << 19
+    {
+        return TestResult::Fail("admission planes");
+    }
+    if selection_mode(&base).planes != [None; dml::MAX_PLANES] {
+        return TestResult::Fail("full-frame primary alone");
+    }
+    let Ok(plans) = admit_displays(&soc, &[s]) else {
+        return TestResult::Fail("scaled primary with an overlay refused");
+    };
+    let one = plans[0];
+    if one.plane(1).is_none() || one.plane(2).is_some() {
+        return TestResult::Fail("planned planes");
+    }
+    let two = dml::Plan { pipes: 2, ..one };
+    let got = |sel: &[Selection], plans: &[dml::Plan], pipes: &[u8], odm: &[Option<u8>]| {
+        let odm: alloc::vec::Vec<otg::SplitPipes> = odm.iter().map(|&q| q.into()).collect();
+        let mpc = alloc::vec![otg::SplitPipes::NONE; odm.len()];
+        overlay_pipes(sel, plans, pipes, (&odm, &mpc)).ok()
+    };
+    let three = Selection {
+        planes: PlaneSetup {
+            overlays: [Some(video); 3],
+            ..s.planes
+        },
+        ..s
+    };
+    if got(&[s, s], &[one, one], &[0, 1], &[None, None])
+        != Some(alloc::vec![
+            [pp(3, &[]), None, None],
+            [pp(2, &[]), None, None]
+        ])
+        || got(&[s], &[two], &[0], &[Some(3)]) != Some(alloc::vec![[pp(2, &[1]), None, None]])
+        || got(&[three], &[one], &[0], &[None])
+            != Some(alloc::vec![[pp(3, &[]), pp(2, &[]), pp(1, &[])]])
+        || got(&[three, base], &[one, one], &[0, 1], &[None, None]).is_some()
+        || got(&[s, s], &[two, one], &[0, 1], &[Some(3)]).is_some()
+    {
+        return TestResult::Fail("overlay pipes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_planes_reach_admission_and_staging
+);
+
+/// amdgpu_dm's rotation 90/270 through to DML21: a portrait 1080x1920
+/// framebuffer in 64KB tiles with DCC turned onto the 1080p stream as the
+/// primary (and as an overlay window beside an unrotated primary) is
+/// admitted, its plane scanned vertically with SPL's surface-space
+/// viewport and unity ratios; the same plane linear is DML's Unsupported
+/// (SourceFormatPixelAndScanSupport).
+#[inline(never)]
+fn navi48_rotated_planes_reach_admission() -> TestResult {
+    use crate::amdgpu_dcn401_spl::{Rect, Rotation};
+    let base = completed_modeset(0).selection;
+    let soc = dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [300_000, 2_500_000],
+        dcfclk_khz: [200_000, 1_564_000],
+        socclk_khz: 300_000,
+        dispclk_max_khz: 2_000_000,
+        dppclk_max_khz: 2_000_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    let tiled = otg::PlaneSurface {
+        tiling: otg::Tiling {
+            swizzle: otg::Swizzle::S64K2D,
+            dcc: Some(otg::DccBlock::B128),
+        },
+        ..otg::PlaneSurface::LINEAR
+    };
+    let portrait = |dst: Rect, rotation, surface| PlaneGeometry {
+        src_x: 0,
+        src_y: 0,
+        width: 1080,
+        height: 1920,
+        dst,
+        rotation,
+        blend: otg::Blend::default_for(base.format),
+        surface,
+        fb_size: (1080, 1920),
+    };
+    let full = Rect::new(0, 0, 1920, 1080);
+    for rotation in [Rotation::R90, Rotation::R270] {
+        let primary = Selection {
+            planes: PlaneSetup {
+                primary: Some(portrait(full, rotation, tiled)),
+                ..PlaneSetup::NONE
+            },
+            ..base
+        };
+        let window = Selection {
+            planes: PlaneSetup {
+                overlays: [
+                    Some(OverlayPlane {
+                        geometry: portrait(Rect::new(960, 0, 960, 540), rotation, tiled),
+                        format: base.format,
+                        underlay: false,
+                        plane: 0,
+                    }),
+                    None,
+                    None,
+                ],
+                ..PlaneSetup::NONE
+            },
+            ..base
+        };
+        let mode = selection_mode(&primary);
+        let Some(p) = mode.planes[0] else {
+            return TestResult::Fail("rotated primary not a DML plane");
+        };
+        if !p.vertical_scan
+            || (u32::from(p.viewport_width), u32::from(p.viewport_height)) != (1080, 1920)
+            || (p.h_ratio, p.v_ratio) != (1 << 19, 1 << 19)
+        {
+            return TestResult::Fail("rotated primary DML plane");
+        }
+        if admit_displays(&soc, &[primary]).is_err() {
+            return TestResult::Fail("rotated tiled primary refused");
+        }
+        match admit_displays(&soc, &[window]) {
+            Ok(plans) if plans[0].plane(1).is_some() => {}
+            _ => return TestResult::Fail("rotated tiled overlay refused"),
+        }
+        let linear = Selection {
+            planes: PlaneSetup {
+                primary: Some(portrait(full, rotation, otg::PlaneSurface::LINEAR)),
+                ..PlaneSetup::NONE
+            },
+            ..base
+        };
+        if !matches!(
+            admit_displays(&soc, &[linear]),
+            Err(dml::Error::Unsupported)
+        ) {
+            return TestResult::Fail("rotated linear primary admitted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_rotated_planes_reach_admission
+);
+
+/// An HDMI 2.1 sink's HF-VSDB with its DSC fields: 600 MHz, SCDC,
+/// Max_FRL_Rate 6, DSC 1.2 with 10 bpc, DSC_Max_FRL_Rate 6, DSC_MaxSlices
+/// code 4 (eight slices at 340 MP/s) and 20 KiB of chunk buffer.
+const HF_DSC: &[u8] = &[
+    3 << 5 | 13,
+    0xd8,
+    0x5d,
+    0xc4,
+    1,
+    120,
+    0x80,
+    0x60,
+    0,
+    0,
+    0,
+    0x81,
+    0x64,
+    19,
+];
+/// The 7680x4320@60 CTA mode (VIC 199) as narf's timing model takes it.
+fn cta8k60() -> Timing {
+    crate::amdgpu_dcn_display::timing_from_edid(
+        &narf_edid::modes::cea_mode(199).unwrap().detailed(),
+    )
+    .unwrap()
+}
+fn dsc_soc() -> dml::Soc {
+    dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [300_000, 2_500_000],
+        dcfclk_khz: [200_000, 1_564_000],
+        socclk_khz: 300_000,
+        dispclk_max_khz: 2_000_000,
+        dppclk_max_khz: 2_000_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    }
+}
+
+/// amdgpu_dm's HDMI FRL DSC policy on DCN401: the HF DSC fields as DRM
+/// parses them; a stream compresses only when its raw bandwidth exceeds the
+/// verified FRL link's, at each encoding and depth Linux tries in turn
+/// (RGB before 4:2:0, the deepest depth first, compressed RGB only
+/// natively), with dc_dsc_compute_config
+/// against the sink's DSC_Max_FRL_Rate and the lowest rate the compressed
+/// capacity check passes. The 8K60 CTA mode takes HDMI 2.1's eight slices
+/// and VIC 199's preset 159/16 bpp, and (as Linux's dml1 tables give it)
+/// 4 x 6G with the primary format's 3182/140 tribytes, borrowing from
+/// blank; checked against the host build in tests/dcn401_frl.
+fn navi48_hdmi_frl_dsc_policy_matches_linux() -> TestResult {
+    use crate::amdgpu_dsc::{FrlDscLink, HdmiDscCaps};
+    use crate::amdgpu_frl_cap::FrlBorrow;
+    let vdb: &[u8] = &[2 << 5 | 2, 199, 118];
+    let edid = with_blocks(edid_1080p(), &[VSDB, HF_DSC, vdb]);
+    let caps = hdmi_caps(&edid);
+    let want = HdmiDscCaps {
+        bpc10: true,
+        bpc12: false,
+        all_bpp: false,
+        native_420: false,
+        max_slices: 4,
+        max_frl_rate: 6,
+        total_chunk_kbytes: 19,
+    };
+    if caps.dsc != Some(want) || caps.max_frl_rate != 6 {
+        return TestResult::Fail("HF DSC fields");
+    }
+    let t = cta8k60();
+    let enabled = frl_enabled();
+    set_frl(true);
+    let cap = frl_cap(caps);
+    let stream = |caps: HdmiCaps, t: &Timing, bpc: u8, cap: Option<FrlRate>| {
+        hdmi_stream(caps, t, bpc, cap, None, 2_000_000)
+    };
+    let got = stream(caps, &t, 8, cap).unwrap();
+    let cfg = got.dsc.unwrap();
+    if got.depth != otg::ColorDepth::Bpc8
+        || got.ycbcr420
+        || got.frl.map(FrlRate::code) != Some(3)
+        || (cfg.slices_h, cfg.slices_v, cfg.bpp_x16) != (8, 40, 159)
+        || cfg.frl
+            != Some(FrlDscLink {
+                all_bpp: false,
+                max_rate: 6,
+            })
+    {
+        panic!("8K60 FRL DSC: {got:?}");
+    }
+    let quiet = frl_audio(None, t.v_active);
+    let dsc = FrlDscStream {
+        cfg,
+        vic: crate::amdgpu_dsc::Vic { cta: 199, hdmi: 0 },
+    };
+    // The trained link's encoder parameters: from 4 x 6G up the same
+    // primary-format targets; below it the tribyte borrow is too large.
+    for code in 3..=6 {
+        assert_eq!(
+            frl_video_params(&t, 8, false, Some(dsc), FrlRate::new(code).unwrap(), quiet),
+            Some((1, FrlBorrow::FromBlank, 3182, 140)),
+            "rate {code}"
+        );
+    }
+    assert!(frl_dsc_carries(&t, dsc, FrlRate::new(2).unwrap(), quiet).is_none());
+    // The 4K120 CTA mode fits the link raw: uncompressed, even so.
+    let uhd120 = crate::amdgpu_dcn_display::timing_from_edid(
+        &narf_edid::modes::cea_mode(118).unwrap().detailed(),
+    )
+    .unwrap();
+    let raw = stream(caps, &uhd120, 8, cap).unwrap();
+    // Deeper output compresses from 10 bpc (the decoder's DSC_10bpc), as
+    // Linux tries it before 8; without DSC_10bpc 10-bpc DSC cannot form
+    // and 8 bpc compresses.
+    let deep = HdmiCaps { dc30: true, ..caps };
+    let deep_dsc8 = HdmiCaps {
+        dsc: Some(HdmiDscCaps {
+            bpc10: false,
+            ..want
+        }),
+        ..deep
+    };
+    let no_rate = HdmiCaps {
+        dsc: Some(HdmiDscCaps {
+            max_frl_rate: 0,
+            ..want
+        }),
+        ..caps
+    };
+    let no_dsc = HdmiCaps { dsc: None, ..caps };
+    let also_420 = HdmiCaps {
+        y420_also: [0, 0, 0, 1 << (199 - 192)],
+        ..caps
+    };
+    let slow = HdmiCaps {
+        max_frl_rate: 2,
+        ..caps
+    };
+    let results = (
+        raw.dsc,
+        raw.frl.map(FrlRate::code),
+        stream(deep, &t, 10, cap).map(|s| (s.depth, s.dsc.map(|c| c.bpc), s.frl)),
+        stream(no_rate, &t, 8, cap),
+        stream(no_dsc, &t, 8, cap),
+        stream(also_420, &t, 8, cap).map(|s| (s.ycbcr420, s.dsc.is_some())),
+        stream(
+            HdmiCaps {
+                dsc: None,
+                ..also_420
+            },
+            &t,
+            8,
+            cap,
+        )
+        .map(|s| (s.ycbcr420, s.dsc.is_some(), s.frl.map(FrlRate::code))),
+        stream(slow, &t, 8, frl_cap(slow)),
+    );
+    let deep8 = stream(deep_dsc8, &t, 10, cap).map(|s| (s.depth, s.dsc.map(|c| c.bpc)));
+    set_frl(false);
+    let off = stream(caps, &t, 8, frl_cap(caps));
+    set_frl(enabled);
+    assert_eq!(results.0, None);
+    assert_eq!(results.1, Some(4));
+    let deep10 = crate::amdgpu_dsc::compute_frl_config(
+        &crate::amdgpu_dsc::DscSinkCaps::from_hdmi(&want),
+        2_000_000,
+        6,
+        &frl_dsc_timing(&t, 10),
+        dsc.vic,
+    )
+    .unwrap();
+    assert_eq!(deep10.bpc, 10);
+    assert_eq!(
+        results.2,
+        Some((
+            otg::ColorDepth::Bpc10,
+            Some(10),
+            frl_dsc_link(&t, FrlDscStream { cfg: deep10, ..dsc }, cap.unwrap(), quiet)
+        ))
+    );
+    assert_eq!(deep8, Some((otg::ColorDepth::Bpc8, Some(8))));
+    // No DSC rate (update_dsc_caps) or decoder: 8K60 RGB does not fit.
+    assert_eq!(results.3, None);
+    assert_eq!(results.4, None);
+    // RGB is tried (and compressed) before 4:2:0, as Linux orders them;
+    // without a decoder the 4:2:0 stream is carried raw.
+    assert_eq!(results.5, Some((false, true)));
+    assert_eq!(results.6, Some((true, false, Some(4))));
+    // A 3 x 6G sink: the DSC stream fails its capacity check at the cap.
+    assert_eq!(results.7, None);
+    assert_eq!(off, None);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_hdmi_frl_dsc_policy_matches_linux
+);
+
+/// A compressed FRL selection: the configuration's one FRL display keeps
+/// the HF decoder for `refine_dsc`, stages an FRL timing with its DSC, and
+/// DML admits it on two pipes (DSC per ODM segment).
+fn navi48_hdmi_frl_dsc_selection_admits_on_two_pipes() -> TestResult {
+    let vdb: &[u8] = &[2 << 5 | 1, 199];
+    let edid = with_blocks(edid_1080p(), &[VSDB, HF_DSC, vdb]);
+    let paths = [path(inventory::Connector::HdmiTypeA, 0)];
+    let t = cta8k60();
+    let enabled = frl_enabled();
+    set_frl(true);
+    let chosen = select(&paths, &[port(paths[0], None, edid)], 8, Some(t));
+    set_frl(enabled);
+    let mut s = chosen.unwrap();
+    let cfg = s.dsc.unwrap();
+    if s.timing != t
+        || s.frl.map(FrlRate::code) != Some(3)
+        || s.caps.dsc.is_none_or(|c| !c.is_frl)
+        || s.avi.vic != 199
+        || FrlDscStream::of(&s).map(|d| d.vic.cta_equivalent()) != Some(199)
+    {
+        panic!("FRL DSC selection: {s:?}");
+    }
+    let soc = dsc_soc();
+    let before = s;
+    refine_dsc(&soc, core::slice::from_mut(&mut s)).unwrap();
+    assert_eq!(s, before);
+    let plan = admit_displays(&soc, &[s]).unwrap()[0];
+    assert_eq!(plan.pipes, 2);
+    assert_eq!(
+        plan.mode.dsc,
+        Some(dml::Dsc {
+            slices: cfg.slices_h,
+            bpp_x16: cfg.bpp_x16
+        })
+    );
+    let r = timing_request(0, &plan, &s);
+    assert_eq!((r.signal, r.dsc), (otg::Signal::HdmiFrl, Some(cfg)));
+    // A board whose DISPCLK cannot split 8K across two pipes takes four
+    // (ODM 4:1: eight slices are not the twelve 3:1 needs), each DSC on
+    // two slices of its quarter of the line.
+    let small = dml::Soc {
+        dispclk_max_khz: 1_000_000,
+        ..soc
+    };
+    refine_dsc(&small, core::slice::from_mut(&mut s)).unwrap();
+    let plan = admit_displays(&small, &[s]).unwrap()[0];
+    assert_eq!(plan.pipes, 4);
+    assert_eq!(
+        dml::dsc_shape(&t, cfg.slices_h, small.dispclk_max_khz),
+        Some(4)
+    );
+    // One whose DISPCLK four pipes cannot cover refuses it.
+    let tiny = dml::Soc {
+        dispclk_max_khz: 500_000,
+        ..soc
+    };
+    let refused = refine_dsc(&tiny, core::slice::from_mut(&mut s)).is_err()
+        || admit_displays(&tiny, &[s]).is_err();
+    assert!(refused, "8K60 on four 500 MHz pipes");
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_hdmi_frl_dsc_selection_admits_on_two_pipes
+);
+
+/// A tiled or 4:2:0 plane's surface is its whole framebuffer with the
+/// source rectangle placed in it (DC scans the framebuffer's viewport); a
+/// linear RGB plane's is its source rectangle.
+fn navi48_modeset_stages_whole_framebuffers_for_tiled_and_yuv_planes() -> TestResult {
+    use crate::amdgpu_dcn401_spl::{Rect, Rotation};
+    let timing = Timing {
+        pixel_clock_khz: 148_500,
+        h_active: 1920,
+        h_total: 2200,
+        h_front_porch: 88,
+        h_sync_width: 44,
+        v_active: 1080,
+        v_total: 1125,
+        v_front_porch: 4,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: true,
+    };
+    let geometry = |format: otg::SurfaceFormat, surface: otg::PlaneSurface| PlaneGeometry {
+        src_x: 320,
+        src_y: 180,
+        width: 640,
+        height: 360,
+        dst: Rect::new(100, 50, 960, 540),
+        rotation: Rotation::R0,
+        blend: otg::Blend::default_for(format),
+        surface,
+        fb_size: (1280, 720),
+    };
+    let tiled = otg::PlaneSurface {
+        tiling: otg::Tiling {
+            swizzle: otg::Swizzle::S64K2D,
+            dcc: None,
+        },
+        ..otg::PlaneSurface::LINEAR
+    };
+    for (format, surface, whole) in [
+        (otg::SurfaceFormat::Nv12, otg::PlaneSurface::LINEAR, true),
+        (otg::SurfaceFormat::Xrgb8888, tiled, true),
+        (
+            otg::SurfaceFormat::Xrgb8888,
+            otg::PlaneSurface::LINEAR,
+            false,
+        ),
+    ] {
+        let setup = PlaneSetup {
+            overlays: [
+                Some(OverlayPlane {
+                    geometry: geometry(format, surface),
+                    format,
+                    underlay: false,
+                    plane: 0,
+                }),
+                None,
+                None,
+            ],
+            ..PlaneSetup::NONE
+        };
+        let (_, overlays) = stream_planes(
+            &timing,
+            false,
+            otg::SurfaceFormat::Xrgb8888,
+            &setup,
+            (0, otg::SplitPipes::NONE, otg::SplitPipes::NONE),
+            &[
+                Some(PlanePipes {
+                    pipe: 1,
+                    odm: otg::SplitPipes::NONE,
+                    mpc: otg::SplitPipes::NONE,
+                }),
+                None,
+                None,
+            ],
+        );
+        let r = overlays[0].unwrap();
+        let src = r.plane.unwrap().src;
+        let want = if whole {
+            ((1280, 720), Rect::new(320, 180, 640, 360))
+        } else {
+            ((640, 360), Rect::new(0, 0, 640, 360))
+        };
+        if ((r.width, r.height), src) != want || r.surface != surface || r.check().is_err() {
+            return TestResult::Fail("plane surface");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_stages_whole_framebuffers_for_tiled_and_yuv_planes
+);
+
+/// Every further pipe DML's split needs, from the top of what the displays
+/// leave: each stream's ODM segments first, then each MPC-combined
+/// primary's second slice, then each overlay's pipe with its stream's
+/// segments or its own MPC slice. More than the four pipes is DML's
+/// `Pipes`; a configuration DML admits always fits.
+fn navi48_split_pipes_follow_dml() -> TestResult {
+    let one = completed_modeset(0).plan;
+    let s = |p: &[u8]| otg::SplitPipes::new(p).unwrap();
+    let none = otg::SplitPipes::NONE;
+    // A primary MPC-combined on two DPPs, in ODM bypass.
+    let mut mpc = one;
+    if let Some(p) = mpc.planes[0].as_mut() {
+        p.dpps = 2;
+    }
+    // A stream with one overlay plane; `ovl_mpc`'s overlay is MPC-combined.
+    let mut ovl = one;
+    let full = dml::Plane::full(&one.mode.timing, one.mode.pitch, 4);
+    ovl.mode.planes = [Some(full), Some(full), None, None];
+    ovl.planes[1] = ovl.planes[0];
+    let mut ovl_mpc = ovl;
+    if let Some(p) = ovl_mpc.planes[1].as_mut() {
+        p.dpps = 2;
+    }
+    let three = dml::Plan { pipes: 3, ..ovl };
+    let pp = |pipe: u8, odm: &[u8], mpc: &[u8]| {
+        Some(PlanePipes {
+            pipe,
+            odm: s(odm),
+            mpc: s(mpc),
+        })
+    };
+    let got = |plans: &[dml::Plan], pipes: &[u8]| plan_pipes(plans, pipes).ok();
+    let d = |odm, mpc, overlays| DisplayPipes { odm, mpc, overlays };
+    if got(&[mpc], &[0]) != Some(alloc::vec![d(none, s(&[3]), [None; 3])])
+        || got(&[mpc, mpc], &[0, 1]) != Some(alloc::vec![d(none, s(&[3]), [None; 3]), d(none, s(&[2]), [None; 3])])
+        || got(&[ovl_mpc], &[1]) != Some(alloc::vec![d(none, none, [pp(3, &[], &[2]), None, None])])
+        || got(&[mpc, ovl], &[0, 1]) != Some(alloc::vec![d(none, s(&[3]), [None; 3]), d(none, none, [pp(2, &[], &[]), None, None])])
+        // ODM first: a 3:1 stream's segments, then its overlay's pipe and
+        // segments, which four pipes cannot hold.
+        || got(&[three], &[0]).is_some()
+        || got(&[dml::Plan { pipes: 2, ..ovl }], &[0])
+            != Some(alloc::vec![d(s(&[3]), none, [pp(2, &[1], &[]), None, None])])
+        || got(&[mpc, mpc, one], &[0, 1, 2]).is_some()
+    {
+        return TestResult::Fail("split pipe allocation");
+    }
+    // The same through the selections' overlays.
+    let base = completed_modeset(0).selection;
+    if display_pipes(&[base], &[mpc], &[0]).ok() != Some(alloc::vec![d(none, s(&[3]), [None; 3])]) {
+        return TestResult::Fail("display pipes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/navi48-modeset", navi48_split_pipes_follow_dml);
+
+/// DP SST deep color as amdgpu_dm decides it: the sink's EDID 1.4 color
+/// depth (display_info.bpc, 8 when undefined) bounded by the requested
+/// maximum (max_requested_bpc, even), then create_validate_stream_for_sink's
+/// steps of 2 while the link cannot carry the stream; 1080p60 at 10 bpc
+/// (4,455,000 kbps) fits 2 x HBR2 but not 1 x HBR2, which then lights it
+/// at 8 bpc. The training candidates and UHBR budget use the chosen depth.
+fn navi48_modeset_dp_deep_color_like_amdgpu_dm() -> TestResult {
+    let with_bpc = |code: u8| {
+        let mut e = edid_1080p();
+        e[20] = 0x80 | code << 4 | 5;
+        e[127] = narf_edid::compute_checksum(&e);
+        e
+    };
+    assert_eq!(edid_bpc(&with_bpc(3)), 10);
+    assert_eq!(edid_bpc(&with_bpc(4)), 12);
+    assert_eq!(edid_bpc(&with_bpc(0)), 0);
+    assert_eq!(edid_bpc(&edid_1080p()), 8);
+    let mut old = with_bpc(3);
+    old[19] = 3;
+    assert_eq!(edid_bpc(&old), 0);
+    use otg::ColorDepth::{Bpc10, Bpc12, Bpc8};
+    assert_eq!(dp_depths(&with_bpc(4), 12), [Bpc12, Bpc10, Bpc8]);
+    assert_eq!(dp_depths(&with_bpc(4), 11), [Bpc10, Bpc8]);
+    assert_eq!(dp_depths(&with_bpc(3), 12), [Bpc10, Bpc8]);
+    assert_eq!(dp_depths(&with_bpc(0), 12), [Bpc8]);
+    assert_eq!(dp_depths(&with_bpc(1), 12), [Bpc8]);
+    let paths = [path(inventory::Connector::DisplayPort, 0)];
+    let pick = |edid: Vec<u8>, rate: u8, lanes: u8, max: u8| {
+        select(
+            &paths,
+            &[port(paths[0], dpcd(rate, lanes), edid)],
+            max,
+            None,
+        )
+        .unwrap()
+    };
+    let s = pick(with_bpc(3), 0x14, 2, 10);
+    if s.depth != Bpc10 || (s.lanes, s.rate) != (2, DpRate::Legacy(LinkRate::Hbr2)) {
+        panic!("10 bpc on 2 x HBR2: {:?} {} {:?}", s.depth, s.lanes, s.rate);
+    }
+    assert_eq!(s.blank_request(0).depth, Bpc10);
+    // Every fallback candidate carries 30-bit pixels.
+    for (l, r) in selected_dp_candidates(&s) {
+        assert!(dp_fits_bpc(&s.timing, s.caps, l, r, 10), "{l} {r:?}");
+    }
+    assert!(!selected_dp_candidates(&s).contains(&(1, DpRate::Legacy(LinkRate::Hbr2))));
+    assert_eq!(pick(with_bpc(3), 0x14, 1, 10).depth, Bpc8);
+    assert_eq!(pick(with_bpc(3), 0x14, 2, 8).depth, Bpc8);
+    assert_eq!(pick(with_bpc(4), 0x1e, 4, 12).depth, Bpc12);
+    assert_eq!(pick(edid_1080p(), 0x1e, 4, 12).depth, Bpc8);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_dp_deep_color_like_amdgpu_dm
+);
+
+/// A connector's "max bpc" (max_requested_bpc) caps its own stream as
+/// amdgpu_dm_create_validate_stream_for_sink's bpc mask does, within
+/// `amdgpu.max_bpc`: on 4 x HBR3, a 10-bpc sink lights at 10 bpc when its
+/// connector asks for 10 (or 16), at 8 when it asks for 8 or 9; a 12-bpc
+/// sink's 10 asks it down to 10 and 11 rounds down to 10; another port's
+/// connector is unaffected; with 16 the stream still steps down to what
+/// the link carries (1080p60 at 12 bpc, 5,346,000 kbps, does not fit 1 x
+/// HBR2's 4,320,000 kbps, nor does 10 bpc, 4,455,000: 8 bpc). HDMI takes
+/// the same cap.
+fn navi48_modeset_connector_max_bpc_caps_its_stream() -> TestResult {
+    use otg::ColorDepth::{Bpc10, Bpc12, Bpc8};
+    let with_bpc = |code: u8| {
+        let mut e = edid_1080p();
+        e[20] = 0x80 | code << 4 | 5;
+        e[127] = narf_edid::compute_checksum(&e);
+        e
+    };
+    let before = max_bpc();
+    set_max_bpc(12);
+    let paths = [
+        path(inventory::Connector::DisplayPort, 0),
+        path(inventory::Connector::DisplayPort, 1),
+        path(inventory::Connector::HdmiTypeA, 2),
+    ];
+    let pick = |n: usize, edid: Vec<u8>, rate: u8, lanes: u8, requested: u8| {
+        set_requested_bpc(n, None, requested);
+        let ports = [port(paths[n], dpcd(rate, lanes), edid)];
+        let s = select_all(&paths, &ports, max_bpc(), &|_| None).map(|s| s[0].depth);
+        set_requested_bpc(n, None, MAX_REQUESTED_BPC);
+        s.ok()
+    };
+    let got = [
+        pick(0, with_bpc(3), 0x1e, 4, 10),
+        pick(0, with_bpc(3), 0x1e, 4, 16),
+        pick(0, with_bpc(3), 0x1e, 4, 8),
+        pick(0, with_bpc(3), 0x1e, 4, 9),
+        pick(0, with_bpc(4), 0x1e, 4, 10),
+        pick(0, with_bpc(4), 0x1e, 4, 11),
+        pick(0, with_bpc(4), 0x1e, 4, 16),
+        pick(0, with_bpc(4), 0x14, 1, 16),
+    ];
+    // Port 1's connector asks for 8; port 0's stream does not see it.
+    set_requested_bpc(1, None, 8);
+    let ports = [
+        port(paths[0], dpcd(0x1e, 4), with_bpc(4)),
+        port(paths[1], dpcd(0x1e, 4), with_bpc(4)),
+    ];
+    let both = select_all(&paths, &ports, max_bpc(), &|_| None)
+        .map(|s| s.iter().map(|s| (s.port, s.depth)).collect::<Vec<_>>());
+    set_requested_bpc(1, None, MAX_REQUESTED_BPC);
+    // amdgpu.max_bpc still bounds every connector.
+    set_max_bpc(8);
+    let module = pick(0, with_bpc(4), 0x1e, 4, 16);
+    set_max_bpc(12);
+    // HDMI: 1080p60 RGB 12 bpc (222.75 MHz TMDS) unless its connector
+    // asks for less.
+    let hdmi = |requested: u8| {
+        set_requested_bpc(2, None, requested);
+        let ports = [port(paths[2], None, with_blocks(edid_1080p(), &[VSDB_DC]))];
+        let s = select_all(&paths, &ports, max_bpc(), &|_| None).map(|s| s[0].depth);
+        set_requested_bpc(2, None, MAX_REQUESTED_BPC);
+        s.ok()
+    };
+    let hdmi = [hdmi(16), hdmi(10), hdmi(8)];
+    set_max_bpc(before);
+    let want = [
+        Some(Bpc10),
+        Some(Bpc10),
+        Some(Bpc8),
+        Some(Bpc8),
+        Some(Bpc10),
+        Some(Bpc10),
+        Some(Bpc12),
+        Some(Bpc8),
+    ];
+    if got != want {
+        panic!("DP SST depths {got:?} want {want:?}");
+    }
+    if both.ok() != Some(alloc::vec![(0, Bpc12), (1, Bpc8)]) {
+        return TestResult::Fail("per-connector cap");
+    }
+    if module != Some(Bpc8) {
+        return TestResult::Fail("amdgpu.max_bpc bound");
+    }
+    if hdmi != [Some(Bpc12), Some(Bpc10), Some(Bpc8)] {
+        panic!("HDMI depths {hdmi:?}");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_connector_max_bpc_caps_its_stream
+);
+
+/// The pipes a running display's new planes take without a modeset
+/// (`planes::live_plane_pipes`): a new overlay takes the free pipe from
+/// the top, as resource_update_pipes_for_plane_with_slice_count does; an
+/// overlay DC keeps (the same DRM plane) keeps its pipe wherever it moves
+/// in the stack; a removed one frees its pipe for the next new one; other
+/// displays' pipes are never taken; another ODM split is a modeset.
+fn navi48_live_plane_pipes_keep_every_plane_dc_keeps() -> TestResult {
+    use crate::amdgpu_dcn401_spl::{Rect, Rotation};
+    let soc = dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [300_000, 2_500_000],
+        dcfclk_khz: [200_000, 1_564_000],
+        socclk_khz: 300_000,
+        dispclk_max_khz: 2_000_000,
+        dppclk_max_khz: 2_000_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    let overlay = |plane: u32, x: i32| OverlayPlane {
+        geometry: PlaneGeometry {
+            src_x: 0,
+            src_y: 0,
+            width: 640,
+            height: 360,
+            dst: Rect::new(x, 100, 640, 360),
+            rotation: Rotation::R0,
+            blend: otg::Blend::default_for(otg::SurfaceFormat::Argb8888),
+            surface: otg::PlaneSurface::LINEAR,
+            fb_size: (640, 360),
+        },
+        format: otg::SurfaceFormat::Argb8888,
+        underlay: false,
+        plane,
+    };
+    let setup = |overlays: &[OverlayPlane]| {
+        let mut s = PlaneSetup::NONE;
+        for (o, p) in s.overlays.iter_mut().zip(overlays) {
+            *o = Some(*p);
+        }
+        s
+    };
+    let plan_for = |m: &Modeset, setup: &PlaneSetup| {
+        let mut s = m.selection;
+        s.planes = *setup;
+        admit_displays(&soc, &[s]).unwrap()[0]
+    };
+    let one = |pipe: u8| PlanePipes {
+        pipe,
+        odm: otg::SplitPipes::NONE,
+        mpc: otg::SplitPipes::NONE,
+    };
+    let pipes =
+        |r: Option<(otg::SplitPipes, OverlayPipes)>| r.map(|(_, o)| o.map(|p| p.map(|p| p.pipe)));
+    let mut m = completed_modeset(0);
+    let a = overlay(0x44, 100);
+    let with_a = setup(&[a]);
+    let plan_a = plan_for(&m, &with_a);
+    // A new overlay: the top free pipe, or the next one past another
+    // display's.
+    if pipes(super::planes::live_plane_pipes(&m, &plan_a, &with_a, 0).unwrap())
+        != Some([Some(3), None, None])
+        || pipes(super::planes::live_plane_pipes(&m, &plan_a, &with_a, 1 << 3).unwrap())
+            != Some([Some(2), None, None])
+    {
+        return TestResult::Fail("new overlay pipe");
+    }
+    // Running with A on pipe 2 (another display holds 3): B is added below
+    // A, which stays on pipe 2 although its stack position moved; B takes
+    // pipe 1.
+    m.selection.planes = with_a;
+    m.plan = plan_a;
+    m.scanout.overlays[0] = Some(otg::OverlayScanout {
+        pipe: 2,
+        odm: otg::SplitPipes::NONE,
+        mpc: otg::SplitPipes::NONE,
+        address: 0x8_1000_0000,
+        underlay: false,
+    });
+    let b = overlay(0x45, 900);
+    let with_ba = setup(&[b, a]);
+    let plan_ba = plan_for(&m, &with_ba);
+    let Ok(Some((mpc, got))) = super::planes::live_plane_pipes(&m, &plan_ba, &with_ba, 1 << 3)
+    else {
+        return TestResult::Fail("two overlays");
+    };
+    if mpc != otg::SplitPipes::NONE || got != [Some(one(1)), Some(one(2)), None] {
+        return TestResult::Fail("kept overlay keeps its pipe");
+    }
+    // A removed and C added: C may take A's freed pipe.
+    let c = overlay(0x46, 400);
+    let with_c = setup(&[c]);
+    let plan_c = plan_for(&m, &with_c);
+    if pipes(super::planes::live_plane_pipes(&m, &plan_c, &with_c, 1 << 3).unwrap())
+        != Some([Some(2), None, None])
+    {
+        return TestResult::Fail("freed pipe reused");
+    }
+    // Another ODM split is a modeset.
+    let mut odm = plan_a;
+    odm.pipes = 2;
+    if super::planes::live_plane_pipes(&m, &odm, &with_a, 0) != Ok(None) {
+        return TestResult::Fail("ODM change");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_live_plane_pipes_keep_every_plane_dc_keeps
+);
+
+/// DSC at the deepest depth, as create_validate_stream_for_sink tries each
+/// depth with apply_dsc_policy_for_stream: a 10-bpc 4K60 sink on 4 x HBR2
+/// with FEC (16,761,600 kbps) would take 8-bpc RGB raw (14,256,000) but
+/// not 10-bpc (17,820,000), so with max_bpc 10 it is compressed from 10 bpc
+/// (dc_dsc_compute_config at that depth) rather than sent raw at 8. A
+/// decoder without 10-bpc input, or max_bpc 8, keeps it raw at 8.
+/// refine_dsc keeps the depth, the timing request compresses at it and the
+/// blank request feeds the DSC that depth.
+fn navi48_modeset_compresses_dp_sst_at_10_bpc_like_amdgpu_dm() -> TestResult {
+    use crate::amdgpu_dsc::{compute_config, DscSinkCaps, LinkEncoding};
+    // DSC 1.2, slices 1/2/4, 13-bit line buffer, RGB, 1000 MP/s per
+    // slice, 5120-pixel slices, 1/16 bpp; 8, 10 and 12 bpc input.
+    const DSC: [u8; 16] = [
+        1, 0x21, 0, 0x0b, 0x0b, 4, 1, 0, 0, 0x13, 0x0e, 0xee, 16, 0, 0, 0,
+    ];
+    let mut edid = edid_uhbr();
+    edid[20] = 0x80 | 3 << 4 | 5; // 10 bpc, DisplayPort
+    edid[127] = 0;
+    edid[127] = narf_edid::compute_checksum(&edid[..128]);
+    let p = path(inventory::Connector::DisplayPort, 0);
+    let pick = |dsc: [u8; 16], max: u8| {
+        let mut device = port(p, dpcd(0x14, 4), edid.clone());
+        let sink = device.sink.as_mut().unwrap();
+        sink.fec = true;
+        sink.dsc = Some(dsc);
+        select(&[p], &[device], max, None).unwrap()
+    };
+    let mut s = pick(DSC, 10);
+    let link = legacy_kbps(4, LinkRate::Hbr2, true);
+    assert_eq!(link, 16_761_600);
+    assert!(stream_kbps_bpc(&s.timing, false, 8) <= link);
+    assert!(stream_kbps_bpc(&s.timing, false, 10) > link);
+    let want = compute_config(
+        &DscSinkCaps::parse(&DSC, &[0; 3]).unwrap(),
+        NOMINAL_DISPCLK_KHZ,
+        link as u32,
+        &dsc_timing(&s.timing, 10),
+        LinkEncoding::Dp8b10b,
+        false,
+    );
+    if s.depth != otg::ColorDepth::Bpc10
+        || want.is_none_or(|c| c.bpc != 10)
+        || s.dsc != want
+        || (s.lanes, s.rate) != (4, DpRate::Legacy(LinkRate::Hbr2))
+    {
+        panic!(
+            "10-bpc DSC: {:?} {:?} {} {:?}",
+            s.depth, s.dsc, s.lanes, s.rate
+        );
+    }
+    let soc = dsc_soc();
+    refine_dsc(&soc, core::slice::from_mut(&mut s)).unwrap();
+    let plans = admit_displays(&soc, &[s]).unwrap();
+    let request = timing_request(0, &plans[0], &s);
+    if s.depth != otg::ColorDepth::Bpc10
+        || request.dsc.map(|c| c.bpc) != Some(10)
+        || s.blank_request(0).depth != otg::ColorDepth::Bpc10
+    {
+        return TestResult::Fail("10-bpc DSC through refine and the requests");
+    }
+    // 8-bpc-only input (DP_DSC_DEC_COLOR_DEPTH_CAP 8 bpc) or max_bpc 8:
+    // 10-bpc DSC fails validation and 8 bpc goes raw.
+    let mut eight = DSC;
+    eight[10] = 0x02;
+    for s in [pick(eight, 10), pick(DSC, 8)] {
+        if s.depth != otg::ColorDepth::Bpc8 || s.dsc.is_some() {
+            panic!("8-bpc fallback: {:?} {:?}", s.depth, s.dsc);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_compresses_dp_sst_at_10_bpc_like_amdgpu_dm
 );

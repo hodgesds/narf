@@ -70,8 +70,8 @@ pub enum ShaderError {
     IllegalInstruction,
     MemoryViolation,
 }
-/// Poison / RAS sources. Each one means data the GPU produced or consumed may
-/// be corrupt; Linux answers them with RAS poison handling and a GPU reset.
+/// Poison / RAS sources the IPs can raise. What Linux does with each one on
+/// Navi48 (mostly nothing) is decided by amdgpu_navi48_ras::disposition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Poison {
     /// GFX UTCL2_DATA_POISONING.
@@ -140,8 +140,9 @@ pub enum Display {
     /// DMCUB outbox low-priority ready.
     DmubOutbox,
 }
-/// VCN5 unified-queue and JPEG traps. Sources 119 and 153 wake their exact
-/// registered owners; other media messages remain diagnostic.
+/// VCN5 unified-queue and JPEG traps. Sources 119 and 153 (JPEG on the VCN
+/// client only) wake their exact registered owners; Linux registers no other
+/// media trap, so the rest are counted as unhandled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Media {
     Vcn { instance: u8, source: u8 },
@@ -276,7 +277,8 @@ fn media(v: &ih::Vector, instance: u8) -> Class {
             instance,
             source: v.source,
         }),
-        149 | 151 | 153 | 171..=175 | 177 | 178 => Class::Media(Media::Jpeg {
+        // jpeg_v5_0_0 lives on SOC15_IH_CLIENTID_VCN only.
+        149 | 151 | 153 | 171..=175 | 177 | 178 if instance == 0 => Class::Media(Media::Jpeg {
             instance,
             source: v.source,
         }),

@@ -67,6 +67,33 @@ pub unsafe fn ipi::shoot_full_mask(target_cpus: u64);
 
 #[cfg(target_arch = "aarch64")]
 pub fn gic::configure_pmu_ppi(intid: u32) -> Result<(), ()>;
+#[cfg(target_arch = "aarch64")]
+pub fn gic::gicd_typer() -> u32;
+
+// GICv3 ITS (aarch64). Pure model + firmware parsers are arch-neutral.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn its::discover_firmware(dtb: Option<PhysAddr>) -> its_fw::Source;
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn its::init_bsp() -> Result<(), its::ItsError>;
+#[cfg(target_arch = "aarch64")]
+pub fn its::doorbell_pa() -> u64;          // GITS_TRANSLATER of the discovered ITS
+#[cfg(target_arch = "aarch64")]
+pub fn its::pci_device_id(segment: u16, rid: u16) -> Option<u32>;
+#[cfg(target_arch = "aarch64")]
+pub const fn its::lpi_for_vector(v: u8) -> u32; // LPI_BASE + v
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn its::create_device(device_id: u32, nvecs: u32) -> Result<its::DeviceInfo, its::ItsError>;
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn its::map_event(device_id: u32, event: u32, lpi: u32, collection: u16) -> Result<(), its::ItsError>;
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn its::unmap_event(device_id: u32, event: u32) -> Result<(), its::ItsError>;
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn its::free_device(device_id: u32) -> Result<(), its::ItsError>;
+#[cfg(target_arch = "aarch64")]
+pub fn its::status() -> Option<its::Status>;
+pub mod its_core; // GITS_BASER / CBASER / PROPBASER / PENDBASER negotiation,
+                  // ITT sizing, command encodings, queue wrap + stall
+pub mod its_fw;   // FDT / MADT / IORT parsing, RID → DeviceID
 
 pub fn vector::alloc() -> Result<u8, VectorError>;
 pub fn vector::alloc_block(n: u8) -> Result<u8, VectorError>;
@@ -94,6 +121,23 @@ when a total is requested. The unmasked `shoot_range`, `shoot_tag_only`, and
 On aarch64, tagged memory requests use Inner Shareable TLBI operations and do
 not enter the SGI bridge. The bridge remains responsible for untagged local
 `VMALLE1` requests, which require peer execution to become system-wide.
+
+ITS contract (aarch64). `narf_bus::init` calls `discover_firmware` before the
+boot path runs `init_bsp`; ACPI (MADT GIC ITS / GICR / GICC + IORT) wins when
+an RSDP is cached, then the devicetree (`arm,gic-v3`, `arm,gic-v3-its`,
+`msi-map`), else the QEMU `virt` layout is assumed and logged. `init_bsp`
+provisions flat device / collection tables from each `GITS_BASER<n>`'s Type
+and Entry_Size with a read-back page size and shareability (tables, command
+queue and property table are cleaned to PoC when the GIC reports
+non-shareable), sizes the property table for the configured IDbits, gives the
+BSP redistributor (found by `GICR_TYPER` affinity) a 64 KiB-aligned pending
+table, and maps collection 0 to it. `map_event` creates a device's ITT on
+first use (`DEFAULT_DEVICE_EVENTS` entries; `create_device` picks the size),
+sets the LPI's enable bit, and issues MAPD / MAPTI / INV / SYNC; a second map
+for the same DeviceID reuses its ITT. Every LPI targets collection 0. Command
+submission is bounded (~1 s per wait) and reports `GITS_CREADR.Stalled` as
+`ItsError::CmdStalled`. MSI-X (`narf_bus::msix`) and the Navi48 MSI route
+translate the PCI RID through `pci_device_id` before mapping.
 
 The PMU route accepts only private INTIDs 16–31, enables the current CPU's
 redistributor immediately, and is inherited by subsequent per-CPU GIC
@@ -145,6 +189,12 @@ initialisation. Its input must come from firmware discovery.
 
 ### aarch64
 - Controllers: GICv3 with ITS for MSI-like delivery. LPIs for per-device.
+- ITS bring-up follows Linux `irq-gic-v3-its.c` (`its_alloc_tables`,
+  `its_setup_baser`, `its_cpu_init_lpis`, `its_create_device`); DeviceIDs
+  follow `iort_node_map_id` / `of_map_id`. Indirect (two-level) tables,
+  multiple ITSes, per-CPU collections and vLPIs are not implemented; the
+  distributor / per-CPU redistributor setup in `gic.rs` still assumes the
+  QEMU `virt` bases. Validated on QEMU and against register models only.
 - User-mode delivery: no direct UIPI equivalent; closest is FIQ or
   explicit event-register polling by the driver task.
 

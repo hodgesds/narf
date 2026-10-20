@@ -159,7 +159,26 @@ fn ready_range(
     mode: Mode,
     limited: bool,
 ) -> (Vec<u32>, Pool, Engine<DppIo>, Surfaces, dccg::Applied) {
-    let (backing, pool, mut e, mut surfaces) = staged_with(p, mode.surface, mode.bytes);
+    ready_range_pipes(p, 0, depth, mode, limited)
+}
+/// A powered, stopped DPP's inherited state, every field off its target.
+fn seed_dpp(f: &mut Fake, p: u8) {
+    for (r, value) in RGB {
+        f.regs.insert(d(p, r), 0x80000000 | (value ^ 1));
+    }
+    f.regs.insert(d(p, 0xcc5), 0x80050100);
+    f.regs.insert(d(p, 0xd24), 3);
+    f.regs.insert(d(p, 0xd62), 3);
+}
+/// `ready_range`, the pipes in `extra` ready for overlay planes too.
+fn ready_range_pipes(
+    p: u8,
+    extra: u8,
+    depth: ColorDepth,
+    mode: Mode,
+    limited: bool,
+) -> (Vec<u32>, Pool, Engine<DppIo>, Surfaces, dccg::Applied) {
+    let (backing, pool, mut e, mut surfaces) = staged_pipes(p, extra, mode.surface, mode.bytes);
     run(surfaces.prepare_memory(&mut e, p, || Ok(config()))).unwrap();
     let (t, clock) = (mode.timing, mode.clock);
     run(e.prepare(t, clock)).unwrap();
@@ -169,19 +188,17 @@ fn ready_range(
             depth,
             limited,
             ycbcr420: mode.timing.ycbcr420,
+            colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(
+                limited,
+                mode.timing.ycbcr420,
+            ),
         },
         clock,
     ))
     .unwrap();
-    for (r, value) in RGB {
-        e.io.surface
-            .inner
-            .regs
-            .insert(d(p, r), 0x80000000 | (value ^ 1));
+    for q in (0..4u8).filter(|&q| q == p || extra & 1 << q != 0) {
+        seed_dpp(&mut e.io.surface.inner, q);
     }
-    e.io.surface.inner.regs.insert(d(p, 0xcc5), 0x80050100);
-    e.io.surface.inner.regs.insert(d(p, 0xd24), 3);
-    e.io.surface.inner.regs.insert(d(p, 0xd62), 3);
     e.io.surface.inner.writes.clear();
     let engine = Engine {
         io: DppIo {
@@ -224,7 +241,7 @@ fn dcn401_dpp_stages_native_rgb_and_unity_scaling_on_all_pipes() -> TestResult {
                 (if r == 0xd76 { 0 } else { 0x80000000 }) | value | pending
             );
         }
-        assert_eq!(e.fake().writes.len(), 34);
+        assert_eq!(e.fake().writes.len(), 35);
         assert_eq!(e.fake().regs[&h(p, 0x613)] & 0x100, 0x100);
         assert_eq!(
             e.fake().regs[&(MPC_BASE + (0x2f2 + u64::from(p) * 4) * 4)] & 0xf,
@@ -242,6 +259,42 @@ fn dcn401_dpp_stages_native_rgb_and_unity_scaling_on_all_pipes() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-dpp",
     dcn401_dpp_stages_native_rgb_and_unity_scaling_on_all_pipes
+);
+
+/// dpp401_dpp_setup's CNVC format and ALPHA_EN, and the line buffer's
+/// alpha (lb_params.alpha_en = per_pixel_alpha), for every format; the
+/// rest of the unity RGB state is the same for all of them.
+fn dcn401_dpp_programs_every_format_as_linux() -> TestResult {
+    for (format, _, _, _, _, cnvc, alpha_en, alpha) in LINUX_FORMATS {
+        let p = 2;
+        let mode = Mode {
+            surface: SurfaceRequest { format, ..req(p) },
+            ..small(p)
+        };
+        let (_backing, pool, mut e, mut surfaces, clock) = ready_with(p, ColorDepth::Bpc8, mode);
+        let a = run(surfaces.prepare_dpp(&mut e, p, || Ok((clock, config())))).unwrap();
+        assert_eq!(a.line_buffer_config, 1);
+        for (r, value) in RGB {
+            let value = match r {
+                0xcd0 => 0x24000001 | alpha_en << 8 | 0x100000,
+                0xccf => cnvc,
+                0xd21 => u32::from(alpha) << 4,
+                0xd67 => value | 0x100,
+                _ => value,
+            };
+            assert_eq!(
+                e.fake().regs[&d(p, r)],
+                (if r == 0xd76 { 0 } else { 0x80000000 }) | value
+            );
+        }
+        drop(surfaces);
+        assert_eq!(pool.available(), 4096);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dpp",
+    dcn401_dpp_programs_every_format_as_linux
 );
 
 fn dcn401_dpp_preflight_rejects_stale_owners_geometry_and_pending_updates() -> TestResult {
@@ -317,7 +370,7 @@ kernel_test_in!(
 
 fn dcn401_dpp_lost_writes_revocation_and_device_loss_quarantine() -> TestResult {
     for mode in 0..3 {
-        for n in 1..=34 {
+        for n in 1..=35 {
             let (_backing, pool, mut e, mut surfaces, clock) = ready(2);
             let authority = e.authority;
             match mode {
@@ -374,7 +427,9 @@ fn dcn401_dpp_ram_wake_timeout_cancellation_and_late_changes_fail_closed() -> Te
                 State::PreparingDpp(1) | State::Failed(Error::Timeout(_))
             ));
             assert_eq!(e.status.dpps, [None; 4]);
-            assert_eq!(e.fake().writes.len(), 2 + stage);
+            // The scaler LUT wakes first; the iSHARP LUT inside the DSCL
+            // programming, after the 19 CNVC/CM and 11 DSCL writes.
+            assert_eq!(e.fake().writes.len(), [2, 32][stage]);
             assert_eq!(e.fake().regs[&d(1, 0xcc5)] & 0x10, 0x10); // no speculative rollback
             drop(surfaces);
             assert_eq!(pool.available(), 4096);
@@ -383,9 +438,9 @@ fn dcn401_dpp_ram_wake_timeout_cancellation_and_late_changes_fail_closed() -> Te
     for (n, at, value) in [
         (2, BASE + 0x1b43 * 4, 1),
         (3, d(0, 0xcc6), 1),
-        (34, d(0, 0xcd4), 0),
-        (34, h(0, 0x60a), 0),
-        (34, BASE + 0x477 * 4, 0),
+        (35, d(0, 0xcd4), 0),
+        (35, h(0, 0x60a), 0),
+        (35, BASE + 0x477 * 4, 0),
     ] {
         let (_backing, _pool, mut e, mut surfaces, clock) = ready(0);
         e.fake().after_write = Some((n, at, value));
@@ -413,3 +468,111 @@ kernel_test_in!(
     "drivers/gpu/dcn401-dpp",
     dcn401_dpp_ram_wake_timeout_cancellation_and_late_changes_fail_closed
 );
+
+/// tests/dcn401_yuv/vectors.txt: Linux's fill_plane_color_attributes,
+/// dpp401_dpp_setup and hubp2_program_pixel_format for every scanned format
+/// and COLOR_ENCODING / COLOR_RANGE pair; the post CSC words of a YCbCr
+/// plane are its dpp_input_csc_matrix entry as
+/// cm_helper_program_color_matrices packs it.
+fn dcn401_dpp_input_conversion_matches_linux_vectors() -> TestResult {
+    use crate::amdgpu_dcn401_otg::YuvColor;
+    use core::fmt::Write;
+    const VECTORS: &str = include_str!("../tests/dcn401_yuv/vectors.txt");
+    let mut n = 0;
+    for line in VECTORS.lines().filter(|l| !l.starts_with('#')) {
+        let (input, want) = line.split_once(" = ").unwrap();
+        let mut f = input.split_whitespace();
+        let code = f.next().unwrap().as_bytes();
+        let fourcc = u32::from_le_bytes([code[0], code[1], code[2], code[3]]);
+        let enc: u8 = f.next().unwrap().parse().unwrap();
+        let range: u8 = f.next().unwrap().parse().unwrap();
+        let format = SurfaceFormat::from_fourcc(fourcc).unwrap();
+        // fill_plane_color_attributes ignores the properties for RGB.
+        let color = if format.is_video() {
+            YuvColor::from_props(enc, range)
+        } else {
+            Some(YuvColor::default())
+        };
+        let mut got = alloc::string::String::new();
+        match color {
+            None => got.push('-'),
+            Some(color) => {
+                let crossbar = format.crossbar();
+                let csc = crate::amdgpu_dcn401_otg::fetch::post_csc_words(format, color);
+                let _ = write!(
+                    got,
+                    "{} {} {} {} {} {}",
+                    format.hubp_pixel_format(),
+                    crossbar >> 20 & 3,
+                    crossbar >> 22 & 3,
+                    format.cnvc_pixel_format(),
+                    u32::from(format.cnvc_alpha()),
+                    u32::from(csc.is_some()),
+                );
+                for w in csc.into_iter().flatten() {
+                    let _ = write!(got, " {w:x}");
+                }
+            }
+        }
+        if got != want {
+            let _ = writeln!(
+                narf_console::Writer,
+                "dcn401_yuv: {input}: got {got}, want {want}"
+            );
+            return TestResult::Fail("input conversion differs from Linux");
+        }
+        n += 1;
+    }
+    if n != 120 {
+        return TestResult::Fail("vector count");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dpp",
+    dcn401_dpp_input_conversion_matches_linux_vectors
+);
+
+/// An NV12 plane stages dpp401_dpp_setup's VIDEO_420 CNVC format and the
+/// post CSC of its color space (set A, CM_POST_CSC_MODE 1).
+fn dcn401_dpp_stages_nv12_input_csc() -> TestResult {
+    use crate::amdgpu_dcn401_otg::{PlaneSurface, YuvColor};
+    let p = 1;
+    let mut mode = small(p);
+    mode.timing.timing.h_active = 64;
+    mode.timing.timing.v_active = 16;
+    mode.clock = clock(mode.timing);
+    mode.surface = SurfaceRequest {
+        width: 64,
+        height: 16,
+        format: SurfaceFormat::Nv12,
+        surface: PlaneSurface {
+            color: YuvColor::Bt601,
+            ..PlaneSurface::LINEAR
+        },
+        ..req(p)
+    };
+    let (_backing, _pool, mut e, mut surfaces, clock) = ready_with(p, ColorDepth::Bpc8, mode);
+    if run(surfaces.prepare_dpp(&mut e, p, || Ok((clock, config())))).is_err() {
+        return TestResult::Fail("NV12 DPP staging");
+    }
+    let reg = |e: &mut Engine<DppIo>, r: u64| e.fake().regs[&d(p, r)] & !0x8000_0000;
+    if reg(&mut e, 0xccf) & 0x17f != 64 || reg(&mut e, 0xd68) & 3 != 1 {
+        return TestResult::Fail("CNVC format / post CSC mode");
+    }
+    let want = [
+        0x2000_2cdd,
+        0xe991_0000,
+        0x2000_e926,
+        0x10ef_f4fd,
+        0x2000_0000,
+        0xe3a6_38b4,
+    ];
+    for (i, w) in want.into_iter().enumerate() {
+        if reg(&mut e, 0xd69 + i as u64) != w & !0x8000_0000 {
+            return TestResult::Fail("post CSC coefficients");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/dcn401-dpp", dcn401_dpp_stages_nv12_input_csc);

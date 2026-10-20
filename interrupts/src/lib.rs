@@ -17,9 +17,13 @@
 extern crate alloc;
 
 pub mod dispatch;
+pub mod its_core;
+pub mod its_fw;
 pub mod vector;
 pub mod wait;
 
+#[path = "its_tests.rs"]
+mod its_tests;
 mod tests;
 
 pub use dispatch::{

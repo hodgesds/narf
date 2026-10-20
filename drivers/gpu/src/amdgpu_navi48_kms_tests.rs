@@ -477,6 +477,7 @@ fn navi48_kms_publishes_an_output_per_port() -> TestResult {
         || [0, 2, 3, 13].map(crtc_display) != [None; 4]
         || card.vblank_source.is_none()
         || card.plane_formats.is_none()
+        || !card.native_atomic
     {
         return TestResult::Fail("CRTC to display");
     }
@@ -491,6 +492,44 @@ fn navi48_kms_publishes_an_output_per_port() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-kms",
     navi48_kms_publishes_an_output_per_port
+);
+
+/// Every plane lists amdgpu_dm_plane_get_plane_formats' DCN4.0.1 order
+/// (rgb_formats, NV12, P010, then the FP16 formats) less RGBA8888 and the
+/// 16-bit UNORM orders, and every card it publishes carries it on its
+/// primaries and overlays with the GFX12 modifiers.
+fn navi48_kms_plane_formats_follow_amdgpu_dm() -> TestResult {
+    let want = [
+        *b"XR24", *b"AR24", *b"XR30", *b"XB30", *b"AR30", *b"AB30", *b"XB24", *b"AB24", *b"RG16",
+        *b"NV12", *b"P010", *b"XR4H", *b"AR4H", *b"XB4H", *b"AB4H",
+    ]
+    .map(u32::from_le_bytes);
+    if PLANE_FORMATS != want {
+        return TestResult::Fail("plane format list");
+    }
+    let mut card = Card::new("amdgpu", "AMD GPU", (3, 0, 0));
+    apply(&mut card, &[]);
+    if card.plane_formats != Some(&PLANE_FORMATS[..])
+        || card.overlay_formats != Some(&PLANE_FORMATS[..])
+        || !card.gfx12_modifiers
+    {
+        return TestResult::Fail("published plane formats");
+    }
+    // The list is Linux's, in its order, less the formats not programmed.
+    let linux = crate::amdgpu_dm_modifiers::DM_PLANE_FORMATS;
+    let kept: alloc::vec::Vec<u32> = linux
+        .iter()
+        .copied()
+        .filter(|f| PLANE_FORMATS.contains(f))
+        .collect();
+    if kept != PLANE_FORMATS {
+        return TestResult::Fail("plane formats out of Linux's order");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-kms",
+    navi48_kms_plane_formats_follow_amdgpu_dm
 );
 
 /// Routed outputs: four CRTCs, one encoder per connector able to drive
@@ -572,4 +611,129 @@ fn navi48_kms_routes_connectors_to_any_crtc() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-kms",
     navi48_kms_routes_connectors_to_any_crtc
+);
+
+/// amdgpu_dm's VRR properties on the native card: every connector carries
+/// the immutable "vrr_capable" (its sink's FreeSync capability) and every
+/// CRTC "VRR_ENABLED", whose committed value survives republication and
+/// topology changes for CRTCs that remain. `apply_routed` (Navi22, tests)
+/// attaches neither.
+fn navi48_kms_publishes_vrr_properties() -> TestResult {
+    let t = cea_1080p();
+    let edid = [0xa; 128];
+    let mut card = Card::new("amdgpu", "AMD GPU", (3, 0, 0));
+    let crtcs = [lit(&edid, &t, &[]), None, None, None];
+    let connectors = [
+        RoutedConnector {
+            index: 0,
+            kind: ConnectorType::DisplayPort,
+            edid: Some(&edid),
+            offered: &[],
+            crtc: Some(0),
+            possible_crtcs: 0xf,
+        },
+        RoutedConnector {
+            index: 1,
+            kind: ConnectorType::HdmiA,
+            edid: None,
+            offered: &[],
+            crtc: None,
+            possible_crtcs: 0xf,
+        },
+    ];
+    apply_routed_vrr(&mut card, &crtcs, &connectors, Some(&[true]));
+    let capable = |card: &Card, n: usize| {
+        card.native_output(connector_id(n))
+            .and_then(|o| o.vrr_capable)
+    };
+    if capable(&card, 0) != Some(true) || capable(&card, 1) != Some(false) {
+        return TestResult::Fail("vrr_capable values");
+    }
+    let ids: alloc::vec::Vec<(u32, bool)> = (0..4).map(|k| (crtc_id(k), false)).collect();
+    if card.vrr_enabled != ids {
+        return TestResult::Fail("VRR_ENABLED on every CRTC");
+    }
+    // A committed value survives republishing the same and a smaller
+    // topology; a CRTC that goes away drops it.
+    card.vrr_enabled[0].1 = true;
+    card.vrr_enabled[3].1 = true;
+    apply_routed_vrr(&mut card, &crtcs, &connectors, Some(&[false, false]));
+    if card.vrr_enabled[0] != (crtc_id(0), true) || capable(&card, 0) != Some(false) {
+        return TestResult::Fail("republished");
+    }
+    apply_routed_vrr(&mut card, &crtcs[..2], &connectors, Some(&[true, true]));
+    if card.vrr_enabled != [(crtc_id(0), true), (crtc_id(1), false)] {
+        return TestResult::Fail("smaller topology");
+    }
+    apply_routed(&mut card, &crtcs, &connectors);
+    if !card.vrr_enabled.is_empty() || capable(&card, 0).is_some() {
+        return TestResult::Fail("attached without VRR");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-kms",
+    navi48_kms_publishes_vrr_properties
+);
+
+/// amdgpu_dm's "max bpc" on the native card: a connector the platform
+/// marks gets it at drm_connector_attach_max_bpc_property's initial 16; a
+/// committed value survives republication; an unmarked connector, and
+/// `apply_routed` (Navi22, tests), attach none.
+fn navi48_kms_publishes_connector_max_bpc() -> TestResult {
+    let t = cea_1080p();
+    let edid = [0xa; 128];
+    let mut card = Card::new("amdgpu", "AMD GPU", (3, 0, 0));
+    let crtcs = [lit(&edid, &t, &[]), None, None, None];
+    let connectors = [
+        RoutedConnector {
+            index: 0,
+            kind: ConnectorType::DisplayPort,
+            edid: Some(&edid),
+            offered: &[],
+            crtc: Some(0),
+            possible_crtcs: 0xf,
+        },
+        RoutedConnector {
+            index: 1,
+            kind: ConnectorType::HdmiA,
+            edid: None,
+            offered: &[],
+            crtc: None,
+            possible_crtcs: 0xf,
+        },
+    ];
+    let props = |max_bpc: [bool; 2]| {
+        max_bpc.map(|max_bpc| ConnectorProps {
+            vrr_capable: false,
+            color: true,
+            max_bpc,
+        })
+    };
+    let max_bpc =
+        |card: &Card, n: usize| card.native_output(connector_id(n)).and_then(|o| o.max_bpc);
+    apply_routed_native(&mut card, &crtcs, &connectors, &props([true, false]));
+    if max_bpc(&card, 0) != Some(16) || max_bpc(&card, 1).is_some() {
+        return TestResult::Fail("initial max bpc");
+    }
+    if let Some(n) = card
+        .native
+        .iter_mut()
+        .find(|n| n.connector == connector_id(0))
+    {
+        n.max_bpc = Some(10);
+    }
+    apply_routed_native(&mut card, &crtcs, &connectors, &props([true, true]));
+    if max_bpc(&card, 0) != Some(10) || max_bpc(&card, 1) != Some(16) {
+        return TestResult::Fail("republished max bpc");
+    }
+    apply_routed(&mut card, &crtcs, &connectors);
+    if max_bpc(&card, 0).is_some() {
+        return TestResult::Fail("attached without amdgpu_dm properties");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-kms",
+    navi48_kms_publishes_connector_max_bpc
 );

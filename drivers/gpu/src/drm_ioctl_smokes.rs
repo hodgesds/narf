@@ -332,6 +332,54 @@ kernel_test_in!(
     smoke_drm_ioctl_getresources_populates_crtc_ids
 );
 
+// ── SET_CLIENT_CAP(ATOMIC) on a native-atomic card ─────────────────────
+//
+// A native display backend that published itself DRIVER_ATOMIC (Navi48)
+// takes the ATOMIC client cap and an empty atomic commit, as Linux amdgpu
+// does; CURSOR_PLANE_HOTSPOT stays VirtGPU-only (EOPNOTSUPP).
+fn smoke_drm_ioctl_native_atomic_card_takes_atomic() -> TestResult {
+    let name = format!("card{}", crate::drm_registry::count());
+    let card = Arc::new(BochsCard::new(name));
+    let mut state = make_test_card();
+    state.native_atomic = true;
+    let idx = crate::drm_registry::register_drm_card_with_state(card, state);
+    if let Some(ms) = crate::drm_registry::mode_state(idx) {
+        ms.lock().master_open(SMOKE_MASTER_ID);
+    }
+    let cap = |capability: u64| {
+        let mut c = [0u8; 16];
+        c[0..8].copy_from_slice(&capability.to_le_bytes());
+        c[8..16].copy_from_slice(&1u64.to_le_bytes());
+        dispatch_card(
+            idx,
+            DRM_IOCTL_SET_CLIENT_CAP,
+            c.as_mut_ptr() as usize,
+            false,
+        )
+    };
+    if cap(3) != Ok(0) {
+        return TestResult::Fail("native-atomic card refused SET_CLIENT_CAP(ATOMIC)");
+    }
+    if cap(6) != Err(FsError::Unsupported) {
+        return TestResult::Fail("CURSOR_PLANE_HOTSPOT should stay VirtGPU-only");
+    }
+    let mut req = DrmModeAtomicUapi::default();
+    if dispatch_card(
+        idx,
+        DRM_IOCTL_MODE_ATOMIC,
+        &mut req as *mut _ as usize,
+        false,
+    ) != Ok(0)
+    {
+        return TestResult::Fail("empty atomic commit on a native-atomic card");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_ioctl_native_atomic_card_takes_atomic
+);
+
 // ── SET_CLIENT_CAP: universal planes accepted, atomic rejected ─────────
 //
 // weston's drm-backend REQUIRES DRM_CLIENT_CAP_UNIVERSAL_PLANES (it
@@ -498,6 +546,10 @@ fn smoke_drm_ioctl_broadcast_rgb_property() -> TestResult {
         edid: None,
         timings: alloc::vec::Vec::new(),
         broadcast_rgb: Some(0),
+        vrr_capable: None,
+        colorspace: None,
+        hdr_output_metadata: None,
+        max_bpc: None,
     });
     // GETPROPERTY: a settable enum with Linux's three names.
     let mut values = [0u64; 3];
@@ -609,6 +661,903 @@ kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_ioctl_broadcast_rgb_property
 );
+
+// ── Connector "vrr_capable" and CRTC "VRR_ENABLED" ────────────────────
+//
+// amdgpu_dm attaches drm_connector_attach_vrr_capable_property (an
+// immutable bool) to DP/HDMI connectors, and every CRTC of an atomic driver
+// carries the VRR_ENABLED bool. Only cards that publish them list them;
+// OBJ_SETPROPERTY and atomic commits set VRR_ENABLED (0..1) and refuse
+// vrr_capable. Enabling is accepted whether or not the sink can vary.
+fn smoke_drm_ioctl_vrr_properties() -> TestResult {
+    let getprop = |idx: u32, prop: u32| -> Option<(alloc::vec::Vec<u8>, u32, [u64; 2], u32)> {
+        let mut values = [9u64; 2];
+        let mut gp = [0u8; 64];
+        gp[0..8].copy_from_slice(&(values.as_mut_ptr() as u64).to_le_bytes());
+        gp[16..20].copy_from_slice(&prop.to_le_bytes());
+        gp[56..60].copy_from_slice(&2u32.to_le_bytes());
+        dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xAA, 64),
+            gp.as_mut_ptr() as usize,
+            false,
+        )
+        .ok()?;
+        let end = gp[24..56].iter().position(|&c| c == 0).unwrap_or(32);
+        Some((
+            alloc::vec::Vec::from(&gp[24..24 + end]),
+            u32::from_le_bytes(gp[20..24].try_into().unwrap()),
+            values,
+            u32::from_le_bytes(gp[56..60].try_into().unwrap()),
+        ))
+    };
+    let read = |idx: u32, obj: u32, kind: u32| -> Option<alloc::vec::Vec<(u32, u64)>> {
+        let mut props = [0u32; 8];
+        let mut vals = [0u64; 8];
+        let mut og = [0u8; 32];
+        og[0..8].copy_from_slice(&(props.as_mut_ptr() as u64).to_le_bytes());
+        og[8..16].copy_from_slice(&(vals.as_mut_ptr() as u64).to_le_bytes());
+        og[16..20].copy_from_slice(&8u32.to_le_bytes());
+        og[20..24].copy_from_slice(&obj.to_le_bytes());
+        og[24..28].copy_from_slice(&kind.to_le_bytes());
+        dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xB9, 32),
+            og.as_mut_ptr() as usize,
+            false,
+        )
+        .ok()?;
+        let count = u32::from_le_bytes(og[16..20].try_into().unwrap()) as usize;
+        Some(
+            props[..count]
+                .iter()
+                .copied()
+                .zip(vals[..count].iter().copied())
+                .collect(),
+        )
+    };
+    let obj_set = |idx: u32, value: u64, prop: u32, obj: u32, kind: u32| {
+        let mut b = [0u8; 24];
+        b[0..8].copy_from_slice(&value.to_le_bytes());
+        b[8..12].copy_from_slice(&prop.to_le_bytes());
+        b[12..16].copy_from_slice(&obj.to_le_bytes());
+        b[16..20].copy_from_slice(&kind.to_le_bytes());
+        dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xBA, 24),
+            b.as_mut_ptr() as usize,
+            false,
+        )
+    };
+    const CONNECTOR: u32 = 0xc0c0_c0c0;
+    const CRTC: u32 = 0xcccc_cccc;
+    // Metadata: both are 0..1 ranges; vrr_capable immutable, VRR_ENABLED not.
+    let idx = register_test_card();
+    if getprop(idx, 0x62) != Some((b"vrr_capable".to_vec(), 1 << 1 | 1 << 2, [0, 1], 2))
+        || getprop(idx, 0x63) != Some((b"VRR_ENABLED".to_vec(), 1 << 1, [0, 1], 2))
+    {
+        return TestResult::Fail("VRR property metadata");
+    }
+    // A card that does not publish them lists neither and refuses both.
+    let has = |list: &Option<alloc::vec::Vec<(u32, u64)>>, prop: u32| {
+        list.as_ref()
+            .is_some_and(|l| l.iter().any(|&(p, _)| p == prop))
+    };
+    if has(&read(idx, 31, CONNECTOR), 0x62)
+        || has(&read(idx, 11, CRTC), 0x63)
+        || obj_set(idx, 1, 0x63, 11, CRTC) != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("VRR properties on a plain card");
+    }
+    let Some(ms) = crate::drm_registry::mode_state(idx) else {
+        return TestResult::Fail("no mode state");
+    };
+    {
+        let mut card = ms.lock();
+        card.native.push(crate::drm::card::NativeOutput {
+            connector: 31,
+            edid: None,
+            timings: alloc::vec::Vec::new(),
+            broadcast_rgb: None,
+            vrr_capable: Some(true),
+            colorspace: None,
+            hdr_output_metadata: None,
+            max_bpc: None,
+        });
+        card.vrr_enabled = alloc::vec![(11, false), (12, false)];
+    }
+    let connector = read(idx, 31, CONNECTOR);
+    if connector.as_ref().and_then(|l| l.last().copied()) != Some((0x62, 1))
+        || read(idx, 11, CRTC).and_then(|l| l.last().copied()) != Some((0x63, 0))
+    {
+        return TestResult::Fail("VRR property values");
+    }
+    // OBJ_SETPROPERTY: VRR_ENABLED on a CRTC; bad values, the immutable
+    // vrr_capable and unknown objects are refused without effect.
+    if obj_set(idx, 1, 0x63, 12, CRTC) != Ok(0)
+        || read(idx, 12, CRTC).and_then(|l| l.last().copied()) != Some((0x63, 1))
+        || read(idx, 11, CRTC).and_then(|l| l.last().copied()) != Some((0x63, 0))
+    {
+        return TestResult::Fail("OBJ_SETPROPERTY VRR_ENABLED");
+    }
+    if obj_set(idx, 2, 0x63, 12, CRTC) != Err(FsError::InvalidData)
+        || obj_set(idx, 0, 0x62, 31, CONNECTOR) != Err(FsError::InvalidData)
+        || obj_set(idx, 0, 0x52, 12, CRTC) != Err(FsError::InvalidData)
+        || obj_set(idx, 0, 0x63, 99, CRTC) != Err(FsError::NotFound)
+        || obj_set(idx, 0, 0x63, 31, CONNECTOR) != Err(FsError::InvalidData)
+        || read(idx, 12, CRTC).and_then(|l| l.last().copied()) != Some((0x63, 1))
+    {
+        return TestResult::Fail("invalid VRR set accepted");
+    }
+    // Legacy connector SETPROPERTY never reaches a CRTC property.
+    let mut b = [0u8; 16];
+    b[0..8].copy_from_slice(&0u64.to_le_bytes());
+    b[8..12].copy_from_slice(&0x63u32.to_le_bytes());
+    b[12..16].copy_from_slice(&12u32.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xAB, 16),
+        b.as_mut_ptr() as usize,
+        false,
+    ) != Err(FsError::NotFound)
+    {
+        return TestResult::Fail("SETPROPERTY on a CRTC");
+    }
+    // Master only.
+    let mut b = [0u8; 24];
+    b[8..12].copy_from_slice(&0x63u32.to_le_bytes());
+    b[12..16].copy_from_slice(&12u32.to_le_bytes());
+    b[16..20].copy_from_slice(&CRTC.to_le_bytes());
+    if crate::drm_ioctl_bridge::dispatch_card(
+        idx,
+        SMOKE_MASTER_ID + 1,
+        iowr(DRM_IOCTL_BASE, 0xBA, 24),
+        b.as_mut_ptr() as usize,
+        false,
+    ) != Err(FsError::PermissionDenied)
+    {
+        return TestResult::Fail("non-master VRR set");
+    }
+    // Atomic (on the atomic VirtIO card): VRR_ENABLED alone needs no
+    // ALLOW_MODESET; TEST_ONLY validates without applying; bad values fail.
+    let idx = register_test_virtio_card();
+    let Some(ms) = crate::drm_registry::mode_state(idx) else {
+        return TestResult::Fail("no virtio mode state");
+    };
+    ms.lock().vrr_enabled = alloc::vec![(11, false), (12, false)];
+    let atomic = |flags: u32, value: u64| {
+        let objects = [11u32];
+        let prop_counts = [1u32];
+        let props = [0x63u32];
+        let values = [value];
+        let mut req = DrmModeAtomicUapi {
+            flags,
+            count_objs: 1,
+            objs_ptr: objects.as_ptr() as u64,
+            count_props_ptr: prop_counts.as_ptr() as u64,
+            props_ptr: props.as_ptr() as u64,
+            prop_values_ptr: values.as_ptr() as u64,
+            ..Default::default()
+        };
+        dispatch_card(
+            idx,
+            DRM_IOCTL_MODE_ATOMIC,
+            &mut req as *mut _ as usize,
+            false,
+        )
+    };
+    let value = |crtc: u32| {
+        ms.lock()
+            .vrr_enabled
+            .iter()
+            .find(|&&(id, _)| id == crtc)
+            .map(|&(_, v)| v)
+    };
+    if atomic(0x0100, 1) != Ok(0) || value(11) != Some(false) {
+        return TestResult::Fail("TEST_ONLY applied");
+    }
+    if atomic(0, 1) != Ok(0) || value(11) != Some(true) || value(12) != Some(false) {
+        return TestResult::Fail("atomic VRR_ENABLED");
+    }
+    if atomic(0, 2) != Err(FsError::InvalidData) || value(11) != Some(true) {
+        return TestResult::Fail("atomic bad value");
+    }
+    ms.lock().vrr_enabled.clear();
+    if atomic(0, 0) != Err(FsError::InvalidData) {
+        return TestResult::Fail("atomic on a CRTC without it");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_vrr_properties);
+
+// ── CRTC CTM / GAMMA_LUT and connector Colorspace / HDR_OUTPUT_METADATA ─
+//
+// amdgpu_dm on DCN 4.0.1: drm_crtc_enable_color_mgmt(crtc, 0, true, 4096)
+// (CTM, GAMMA_LUT, GAMMA_LUT_SIZE; no degamma) with the 256-entry legacy
+// gamma, and Colorspace / HDR_OUTPUT_METADATA on HDMI and DP connectors.
+// Blob properties are validated as drm_property_replace_blob_from_id and
+// amdgpu_dm_verify_lut_sizes do; Colorspace and entering/leaving HDR need
+// a modeset; a referenced blob outlives DESTROYPROPBLOB.
+fn color_getprop(
+    idx: u32,
+    prop: u32,
+) -> Option<(alloc::vec::Vec<u8>, u32, alloc::vec::Vec<u64>, u32)> {
+    let mut values = [0u64; 8];
+    let mut gp = [0u8; 64];
+    gp[0..8].copy_from_slice(&(values.as_mut_ptr() as u64).to_le_bytes());
+    gp[16..20].copy_from_slice(&prop.to_le_bytes());
+    gp[56..60].copy_from_slice(&8u32.to_le_bytes());
+    dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xAA, 64),
+        gp.as_mut_ptr() as usize,
+        false,
+    )
+    .ok()?;
+    let end = gp[24..56].iter().position(|&c| c == 0).unwrap_or(32);
+    let count = u32::from_le_bytes(gp[56..60].try_into().unwrap());
+    Some((
+        alloc::vec::Vec::from(&gp[24..24 + end]),
+        u32::from_le_bytes(gp[20..24].try_into().unwrap()),
+        values[..(count as usize).min(8)].to_vec(),
+        u32::from_le_bytes(gp[60..64].try_into().unwrap()),
+    ))
+}
+fn color_props(idx: u32, obj: u32, kind: u32) -> alloc::vec::Vec<(u32, u64)> {
+    let mut props = [0u32; 16];
+    let mut vals = [0u64; 16];
+    let mut og = [0u8; 32];
+    og[0..8].copy_from_slice(&(props.as_mut_ptr() as u64).to_le_bytes());
+    og[8..16].copy_from_slice(&(vals.as_mut_ptr() as u64).to_le_bytes());
+    og[16..20].copy_from_slice(&16u32.to_le_bytes());
+    og[20..24].copy_from_slice(&obj.to_le_bytes());
+    og[24..28].copy_from_slice(&kind.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xB9, 32),
+        og.as_mut_ptr() as usize,
+        false,
+    )
+    .is_err()
+    {
+        return alloc::vec::Vec::new();
+    }
+    let count = u32::from_le_bytes(og[16..20].try_into().unwrap()) as usize;
+    props[..count]
+        .iter()
+        .copied()
+        .zip(vals[..count].iter().copied())
+        .collect()
+}
+fn color_prop(idx: u32, obj: u32, kind: u32, prop: u32) -> Option<u64> {
+    color_props(idx, obj, kind)
+        .into_iter()
+        .find(|&(p, _)| p == prop)
+        .map(|(_, v)| v)
+}
+fn color_obj_set(idx: u32, value: u64, prop: u32, obj: u32, kind: u32) -> Result<u64, FsError> {
+    let mut b = [0u8; 24];
+    b[0..8].copy_from_slice(&value.to_le_bytes());
+    b[8..12].copy_from_slice(&prop.to_le_bytes());
+    b[12..16].copy_from_slice(&obj.to_le_bytes());
+    b[16..20].copy_from_slice(&kind.to_le_bytes());
+    dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xBA, 24),
+        b.as_mut_ptr() as usize,
+        false,
+    )
+}
+fn color_blob(idx: u32, data: &[u8]) -> u32 {
+    let mut b = [0u8; 16];
+    b[0..8].copy_from_slice(&(data.as_ptr() as u64).to_le_bytes());
+    b[8..12].copy_from_slice(&(data.len() as u32).to_le_bytes());
+    let _ = dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xBD, 16),
+        b.as_mut_ptr() as usize,
+        false,
+    );
+    u32::from_le_bytes(b[12..16].try_into().unwrap())
+}
+fn color_blob_bytes(idx: u32, id: u32) -> Option<alloc::vec::Vec<u8>> {
+    let mut data = alloc::vec![0u8; 0x8000];
+    let mut b = [0u8; 16];
+    b[0..4].copy_from_slice(&id.to_le_bytes());
+    b[4..8].copy_from_slice(&(data.len() as u32).to_le_bytes());
+    b[8..16].copy_from_slice(&(data.as_mut_ptr() as u64).to_le_bytes());
+    dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xAC, 16),
+        b.as_mut_ptr() as usize,
+        false,
+    )
+    .ok()?;
+    data.truncate(u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize);
+    Some(data)
+}
+/// A GAMMA_LUT / legacy ramp of `n` equal-channel entries.
+fn color_lut(n: usize) -> alloc::vec::Vec<u8> {
+    (0..n)
+        .flat_map(|i| {
+            let v = (i * 0xffff / (n - 1)) as u16;
+            [v, v, v, 0].into_iter().flat_map(u16::to_le_bytes)
+        })
+        .collect()
+}
+const COLOR_CONNECTOR: u32 = 0xc0c0_c0c0;
+const COLOR_CRTC: u32 = 0xcccc_cccc;
+
+fn smoke_drm_ioctl_color_property_metadata() -> TestResult {
+    let idx = register_test_card();
+    // drm_mode_create_standard_properties: plain blobs, an immutable range.
+    if color_getprop(idx, 0x64) != Some((b"CTM".to_vec(), 1 << 4, alloc::vec![], 0))
+        || color_getprop(idx, 0x65) != Some((b"GAMMA_LUT".to_vec(), 1 << 4, alloc::vec![], 0))
+        || color_getprop(idx, 0x66)
+            != Some((
+                b"GAMMA_LUT_SIZE".to_vec(),
+                1 << 1 | 1 << 2,
+                alloc::vec![0, 0xffff_ffff],
+                0,
+            ))
+        || color_getprop(idx, 0x68)
+            != Some((b"HDR_OUTPUT_METADATA".to_vec(), 1 << 4, alloc::vec![], 0))
+    {
+        return TestResult::Fail("color property metadata");
+    }
+    // Colorspace: Default plus amdgpu_dm's four, the same on HDMI and DP.
+    let mut values = [0u64; 5];
+    let mut enums = [0u8; 5 * 40];
+    let mut gp = [0u8; 64];
+    gp[0..8].copy_from_slice(&(values.as_mut_ptr() as u64).to_le_bytes());
+    gp[8..16].copy_from_slice(&(enums.as_mut_ptr() as u64).to_le_bytes());
+    gp[16..20].copy_from_slice(&0x67u32.to_le_bytes());
+    gp[56..60].copy_from_slice(&5u32.to_le_bytes());
+    gp[60..64].copy_from_slice(&5u32.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xAA, 64),
+        gp.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+        || &gp[24..35] != b"Colorspace\0"
+        || u32::from_le_bytes(gp[20..24].try_into().unwrap()) != 1 << 3
+        || values != [0, 2, 7, 9, 10]
+    {
+        return TestResult::Fail("Colorspace enum");
+    }
+    let names: [&[u8]; 5] = [
+        b"Default",
+        b"BT709_YCC",
+        b"opRGB",
+        b"BT2020_RGB",
+        b"BT2020_YCC",
+    ];
+    for (i, name) in names.iter().enumerate() {
+        let e = &enums[i * 40..i * 40 + 40];
+        if u64::from_le_bytes(e[..8].try_into().unwrap()) != values[i]
+            || &e[8..8 + name.len()] != *name
+            || e[8 + name.len()] != 0
+        {
+            return TestResult::Fail("Colorspace names");
+        }
+    }
+    // A card that does not publish them lists none, takes none, and keeps
+    // a zero gamma size.
+    if color_prop(idx, 11, COLOR_CRTC, 0x64).is_some()
+        || color_obj_set(idx, 0, 0x64, 11, COLOR_CRTC) != Err(FsError::InvalidData)
+        || color_obj_set(idx, 0, 0x67, 31, COLOR_CONNECTOR) != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("color properties on a plain card");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_ioctl_color_property_metadata
+);
+
+/// The native-atomic test card with color management on both CRTCs and
+/// Colorspace / HDR_OUTPUT_METADATA on its connector, which drives CRTC 11.
+fn color_card() -> Option<u32> {
+    let idx = register_test_card();
+    let ms = crate::drm_registry::mode_state(idx)?;
+    let mut card = ms.lock();
+    card.native_atomic = true;
+    card.crtc_color = alloc::vec![
+        crate::drm::card::CrtcColor::new(11),
+        crate::drm::card::CrtcColor::new(12),
+    ];
+    card.encoders[0].crtc_id = Some(11);
+    card.native.push(crate::drm::card::NativeOutput {
+        connector: 31,
+        edid: None,
+        timings: alloc::vec::Vec::new(),
+        broadcast_rgb: None,
+        vrr_capable: None,
+        colorspace: Some(0),
+        hdr_output_metadata: Some(0),
+        max_bpc: None,
+    });
+    Some(idx)
+}
+
+fn smoke_drm_ioctl_crtc_color_blobs() -> TestResult {
+    let Some(idx) = color_card() else {
+        return TestResult::Fail("no mode state");
+    };
+    // CRTC listing: CTM, GAMMA_LUT and GAMMA_LUT_SIZE = 4096 after the
+    // core properties; GETCRTC reports the legacy gamma size.
+    let props = color_props(idx, 11, COLOR_CRTC);
+    if props[props.len().saturating_sub(3)..] != [(0x64, 0), (0x65, 0), (0x66, 4096)] {
+        return TestResult::Fail("CRTC color properties");
+    }
+    let mut crtc = [0u8; 104];
+    crtc[12..16].copy_from_slice(&11u32.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xA1, 104),
+        crtc.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+        || u32::from_le_bytes(crtc[28..32].try_into().unwrap()) != 256
+    {
+        return TestResult::Fail("GETCRTC gamma_size");
+    }
+    // CTM: exactly 72 bytes; unknown blobs are EINVAL.
+    let ctm = color_blob(idx, &[0u8; 72]);
+    let short = color_blob(idx, &[0u8; 64]);
+    if color_obj_set(idx, u64::from(short), 0x64, 11, COLOR_CRTC) != Err(FsError::InvalidData)
+        || color_obj_set(idx, 0xdead, 0x64, 11, COLOR_CRTC) != Err(FsError::InvalidData)
+        || color_obj_set(idx, u64::from(ctm), 0x64, 11, COLOR_CRTC) != Ok(0)
+        || color_prop(idx, 11, COLOR_CRTC, 0x64) != Some(u64::from(ctm))
+        || color_prop(idx, 12, COLOR_CRTC, 0x64) != Some(0)
+    {
+        return TestResult::Fail("CTM blob");
+    }
+    // GAMMA_LUT: whole drm_color_lut entries, 4096 or 256 of them.
+    let full = color_blob(idx, &color_lut(4096));
+    let legacy = color_blob(idx, &color_lut(256));
+    let odd = color_blob(idx, &color_lut(1024));
+    let ragged = color_blob(idx, &[0u8; 2052]);
+    if color_obj_set(idx, u64::from(odd), 0x65, 11, COLOR_CRTC) != Err(FsError::InvalidData)
+        || color_obj_set(idx, u64::from(ragged), 0x65, 11, COLOR_CRTC) != Err(FsError::InvalidData)
+        || color_obj_set(idx, u64::from(full), 0x65, 11, COLOR_CRTC) != Ok(0)
+        || color_obj_set(idx, u64::from(legacy), 0x65, 12, COLOR_CRTC) != Ok(0)
+        || color_prop(idx, 11, COLOR_CRTC, 0x65) != Some(u64::from(full))
+        || color_prop(idx, 12, COLOR_CRTC, 0x65) != Some(u64::from(legacy))
+        || color_obj_set(idx, 4096, 0x66, 11, COLOR_CRTC) != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("GAMMA_LUT blob");
+    }
+    // A committed blob outlives its creator's reference, then goes.
+    let mut d = [0u8; 4];
+    d.copy_from_slice(&full.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xBE, 4),
+        d.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+        || color_blob_bytes(idx, full) != Some(color_lut(4096))
+        || color_obj_set(idx, 0, 0x65, 11, COLOR_CRTC) != Ok(0)
+        || color_blob_bytes(idx, full).is_some()
+        || color_blob_bytes(idx, legacy) != Some(color_lut(256))
+    {
+        return TestResult::Fail("blob lifetime");
+    }
+    // Atomic: no ALLOW_MODESET needed; TEST_ONLY applies nothing; a bad
+    // size fails the whole request.
+    let atomic = |flags: u32, props: &[u32], values: &[u64]| {
+        let objects = [11u32];
+        let counts = [props.len() as u32];
+        let mut req = DrmModeAtomicUapi {
+            flags,
+            count_objs: 1,
+            objs_ptr: objects.as_ptr() as u64,
+            count_props_ptr: counts.as_ptr() as u64,
+            props_ptr: props.as_ptr() as u64,
+            prop_values_ptr: values.as_ptr() as u64,
+            ..Default::default()
+        };
+        dispatch_card(
+            idx,
+            DRM_IOCTL_MODE_ATOMIC,
+            &mut req as *mut _ as usize,
+            false,
+        )
+    };
+    let full = color_blob(idx, &color_lut(4096));
+    if atomic(0x0100, &[0x65, 0x64], &[u64::from(full), 0]) != Ok(0)
+        || color_prop(idx, 11, COLOR_CRTC, 0x65) != Some(0)
+        || color_prop(idx, 11, COLOR_CRTC, 0x64) != Some(u64::from(ctm))
+    {
+        return TestResult::Fail("TEST_ONLY applied");
+    }
+    if atomic(0, &[0x65, 0x64], &[u64::from(full), u64::from(odd)]) != Err(FsError::InvalidData)
+        || atomic(0, &[0x65, 0x64], &[u64::from(odd), 0]) != Err(FsError::InvalidData)
+        || color_prop(idx, 11, COLOR_CRTC, 0x65) != Some(0)
+    {
+        return TestResult::Fail("bad atomic accepted");
+    }
+    if atomic(0, &[0x65, 0x64], &[u64::from(full), 0]) != Ok(0)
+        || color_prop(idx, 11, COLOR_CRTC, 0x65) != Some(u64::from(full))
+        || color_prop(idx, 11, COLOR_CRTC, 0x64) != Some(0)
+    {
+        return TestResult::Fail("atomic color commit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_crtc_color_blobs);
+
+/// DRM_IOCTL_MODE_SETGAMMA / GETGAMMA on a color-managed CRTC: the gamma
+/// store, then drm_crtc_legacy_gamma_set's 256-entry GAMMA_LUT with the
+/// CTM reset; size, CRTC, master and render-node checks.
+fn smoke_drm_ioctl_legacy_gamma() -> TestResult {
+    let Some(idx) = color_card() else {
+        return TestResult::Fail("no mode state");
+    };
+    let lut = |crtc: u32, size: u32, r: &mut [u16], g: &mut [u16], b: &mut [u16]| {
+        let mut req = [0u8; 32];
+        req[0..4].copy_from_slice(&crtc.to_le_bytes());
+        req[4..8].copy_from_slice(&size.to_le_bytes());
+        for (at, ramp) in [
+            (8, r.as_mut_ptr()),
+            (16, g.as_mut_ptr()),
+            (24, b.as_mut_ptr()),
+        ] {
+            req[at..at + 8].copy_from_slice(&(ramp as u64).to_le_bytes());
+        }
+        req
+    };
+    let (mut r, mut g, mut b) = ([0u16; 256], [0u16; 256], [0u16; 256]);
+    // The initial store is the identity ramp (i << 8).
+    let mut get = lut(11, 256, &mut r, &mut g, &mut b);
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xA4, 32),
+        get.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+        || (0..256).any(|i| r[i] != (i as u16) << 8 || b[i] != (i as u16) << 8)
+    {
+        return TestResult::Fail("initial gamma store");
+    }
+    let ctm = color_blob(idx, &[0u8; 72]);
+    if color_obj_set(idx, u64::from(ctm), 0x64, 11, COLOR_CRTC) != Ok(0) {
+        return TestResult::Fail("CTM before SETGAMMA");
+    }
+    let (mut r, mut g, mut b) = (
+        core::array::from_fn::<u16, 256, _>(|i| 0xffff - (i as u16) * 0x101),
+        core::array::from_fn::<u16, 256, _>(|i| (i as u16) * 0x80),
+        [0x1234u16; 256],
+    );
+    let mut set = lut(11, 256, &mut r, &mut g, &mut b);
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xA5, 32),
+        set.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+    {
+        return TestResult::Fail("SETGAMMA");
+    }
+    let Some(blob) = color_prop(idx, 11, COLOR_CRTC, 0x65) else {
+        return TestResult::Fail("GAMMA_LUT after SETGAMMA");
+    };
+    let bytes = color_blob_bytes(idx, blob as u32).unwrap_or_default();
+    let entry = |i: usize| -> [u16; 3] {
+        let e = &bytes[i * 8..i * 8 + 6];
+        [0, 2, 4].map(|o| u16::from_le_bytes([e[o], e[o + 1]]))
+    };
+    if bytes.len() != 256 * 8
+        || (0..256).any(|i| entry(i) != [r[i], g[i], b[i]])
+        || color_prop(idx, 11, COLOR_CRTC, 0x64) != Some(0)
+    {
+        return TestResult::Fail("legacy GAMMA_LUT / CTM reset");
+    }
+    let (mut gr, mut gg, mut gb) = ([0u16; 256], [0u16; 256], [0u16; 256]);
+    let mut get = lut(11, 256, &mut gr, &mut gg, &mut gb);
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xA4, 32),
+        get.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+        || gr != r
+        || gg != g
+        || gb != b
+    {
+        return TestResult::Fail("GETGAMMA after SETGAMMA");
+    }
+    // The only blob reference is the property's: replacing it frees it.
+    if color_obj_set(idx, 0, 0x65, 11, COLOR_CRTC) != Ok(0)
+        || color_blob_bytes(idx, blob as u32).is_some()
+    {
+        return TestResult::Fail("legacy blob lifetime");
+    }
+    let mut bad = lut(11, 255, &mut r, &mut g, &mut b);
+    let mut gone = lut(99, 256, &mut r, &mut g, &mut b);
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xA5, 32),
+        bad.as_mut_ptr() as usize,
+        false,
+    ) != Err(FsError::InvalidData)
+        || dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xA4, 32),
+            bad.as_mut_ptr() as usize,
+            false,
+        ) != Err(FsError::InvalidData)
+        || dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xA5, 32),
+            gone.as_mut_ptr() as usize,
+            false,
+        ) != Err(FsError::NotFound)
+        || dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xA4, 32),
+            set.as_mut_ptr() as usize,
+            true,
+        ) != Err(FsError::PermissionDenied)
+        || crate::drm_ioctl_bridge::dispatch_card(
+            idx,
+            SMOKE_MASTER_ID + 1,
+            iowr(DRM_IOCTL_BASE, 0xA5, 32),
+            set.as_mut_ptr() as usize,
+            false,
+        ) != Err(FsError::PermissionDenied)
+    {
+        return TestResult::Fail("SETGAMMA/GETGAMMA checks");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_legacy_gamma);
+
+/// Connector Colorspace and HDR_OUTPUT_METADATA: listed with the
+/// connector, values validated, a Colorspace change or entering/leaving
+/// HDR on a driven connector needs ALLOW_MODESET (EINVAL through the legacy
+/// setters), a metadata change while in HDR does not, and only blobs of
+/// sizeof(struct hdr_output_metadata) are taken.
+fn smoke_drm_ioctl_connector_hdr_properties() -> TestResult {
+    let Some(idx) = color_card() else {
+        return TestResult::Fail("no mode state");
+    };
+    let props = color_props(idx, 31, COLOR_CONNECTOR);
+    if !props.contains(&(0x67, 0)) || !props.contains(&(0x68, 0)) {
+        return TestResult::Fail("connector properties");
+    }
+    let atomic = |flags: u32, props: &[u32], values: &[u64]| {
+        let objects = [31u32];
+        let counts = [props.len() as u32];
+        let mut req = DrmModeAtomicUapi {
+            flags,
+            count_objs: 1,
+            objs_ptr: objects.as_ptr() as u64,
+            count_props_ptr: counts.as_ptr() as u64,
+            props_ptr: props.as_ptr() as u64,
+            prop_values_ptr: values.as_ptr() as u64,
+            ..Default::default()
+        };
+        dispatch_card(
+            idx,
+            DRM_IOCTL_MODE_ATOMIC,
+            &mut req as *mut _ as usize,
+            false,
+        )
+    };
+    const ALLOW_MODESET: u32 = 0x400;
+    // Colorspace: enum values only; a modeset on the driven connector.
+    if atomic(ALLOW_MODESET, &[0x67], &[1]) != Err(FsError::InvalidData)
+        || atomic(0, &[0x67], &[9]) != Err(FsError::InvalidData)
+        || color_obj_set(idx, 9, 0x67, 31, COLOR_CONNECTOR) != Err(FsError::InvalidData)
+        || atomic(ALLOW_MODESET, &[0x67], &[9]) != Ok(0)
+        || color_prop(idx, 31, COLOR_CONNECTOR, 0x67) != Some(9)
+        // Unchanged is no modeset.
+        || atomic(0, &[0x67], &[9]) != Ok(0)
+    {
+        return TestResult::Fail("Colorspace");
+    }
+    // HDR_OUTPUT_METADATA: a static type 1 PQ infoframe.
+    let mut hdr = [0u8; 32];
+    hdr[4] = 2; // EOTF SMPTE ST 2084
+    hdr[22..24].copy_from_slice(&1000u16.to_le_bytes());
+    let pq = color_blob(idx, &hdr);
+    hdr[26..28].copy_from_slice(&400u16.to_le_bytes());
+    let brighter = color_blob(idx, &hdr);
+    // drm_hdmi_infoframe_set_hdr_metadata reads only the type 1 frame: the
+    // outer metadata_type is not checked.
+    hdr[0] = 1;
+    let other_type = color_blob(idx, &hdr);
+    let short = color_blob(idx, &hdr[..30]);
+    if atomic(ALLOW_MODESET, &[0x68], &[u64::from(short)]) != Err(FsError::InvalidData)
+        || atomic(0, &[0x68], &[u64::from(pq)]) != Err(FsError::InvalidData)
+        || color_obj_set(idx, u64::from(pq), 0x68, 31, COLOR_CONNECTOR) != Err(FsError::InvalidData)
+        || atomic(ALLOW_MODESET, &[0x68], &[u64::from(pq)]) != Ok(0)
+        || color_prop(idx, 31, COLOR_CONNECTOR, 0x68) != Some(u64::from(pq))
+    {
+        return TestResult::Fail("entering HDR");
+    }
+    // New metadata while in HDR is a stream update; leaving is a modeset.
+    if atomic(0, &[0x68], &[u64::from(brighter)]) != Ok(0)
+        || atomic(0, &[0x68], &[u64::from(other_type)]) != Ok(0)
+        || color_obj_set(idx, u64::from(pq), 0x68, 31, COLOR_CONNECTOR) != Ok(0)
+        || atomic(0, &[0x68], &[0]) != Err(FsError::InvalidData)
+        || atomic(ALLOW_MODESET, &[0x68], &[0]) != Ok(0)
+        || color_prop(idx, 31, COLOR_CONNECTOR, 0x68) != Some(0)
+    {
+        return TestResult::Fail("HDR metadata updates");
+    }
+    // An undriven connector: no modeset and no infoframe check (as
+    // amdgpu_dm_connector_atomic_check skips it); sizes still apply.
+    if let Some(ms) = crate::drm_registry::mode_state(idx) {
+        ms.lock().encoders[0].crtc_id = None;
+    }
+    if color_obj_set(idx, u64::from(other_type), 0x68, 31, COLOR_CONNECTOR) != Ok(0)
+        || color_obj_set(idx, 2, 0x67, 31, COLOR_CONNECTOR) != Ok(0)
+        || color_obj_set(idx, u64::from(short), 0x68, 31, COLOR_CONNECTOR)
+            != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("undriven connector");
+    }
+    // A connector without the properties takes neither.
+    if let Some(ms) = crate::drm_registry::mode_state(idx) {
+        ms.lock().native.clear();
+    }
+    if color_obj_set(idx, 0, 0x67, 31, COLOR_CONNECTOR) != Err(FsError::InvalidData)
+        || color_obj_set(idx, 0, 0x68, 31, COLOR_CONNECTOR) != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("properties on a plain connector");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_ioctl_connector_hdr_properties
+);
+
+/// Connector "max bpc" as drm_connector_attach_max_bpc_property(connector,
+/// 8, 16) gives it to every amdgpu_dm connector: a RANGE 8..16 property
+/// listed (GETCONNECTOR and OBJ_GETPROPERTIES) after Broadcast RGB and
+/// before Colorspace at its initial 16; values outside the range are
+/// EINVAL; a change on a driven connector is a modeset (atomic needs
+/// ALLOW_MODESET, drm_atomic_helper_check_modeset setting
+/// connectors_changed), which OBJ_SETPROPERTY and the legacy SETPROPERTY
+/// make as set_property_atomic does (drm_atomic_commit_init allows it);
+/// the same value, an undriven connector or TEST_ONLY change nothing else.
+fn smoke_drm_ioctl_connector_max_bpc() -> TestResult {
+    // GETPROPERTY: drm_property_create_range(dev, 0, "max bpc", 8, 16).
+    let idx = register_test_card();
+    if color_getprop(idx, 0x80) != Some((b"max bpc".to_vec(), 1 << 1, alloc::vec![8, 16], 0)) {
+        return TestResult::Fail("max bpc metadata");
+    }
+    // A connector that does not publish it lists and takes none.
+    if color_props(idx, 31, COLOR_CONNECTOR)
+        .iter()
+        .any(|&(p, _)| p == 0x80)
+        || color_obj_set(idx, 10, 0x80, 31, COLOR_CONNECTOR) != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("max bpc on a plain connector");
+    }
+    let Some(idx) = color_card() else {
+        return TestResult::Fail("no mode state");
+    };
+    let Some(ms) = crate::drm_registry::mode_state(idx) else {
+        return TestResult::Fail("no mode state");
+    };
+    if let Some(n) = ms.lock().native.first_mut() {
+        n.broadcast_rgb = Some(0);
+        n.max_bpc = Some(16);
+    }
+    let props = color_props(idx, 31, COLOR_CONNECTOR);
+    let at = |id: u32| props.iter().position(|&(p, _)| p == id);
+    let listed = props.contains(&(0x80, 16))
+        && at(0x61).is_some()
+        && at(0x61) < at(0x80)
+        && at(0x80) < at(0x67);
+    if !listed {
+        return TestResult::Fail("max bpc listing");
+    }
+    // GETCONNECTOR lists the same properties and values.
+    let mut ids = [0u32; 16];
+    let mut vals = [0u64; 16];
+    let mut gc = [0u8; 80];
+    // struct drm_mode_get_connector: props_ptr@16, prop_values_ptr@24,
+    // count_props@36, connector_id@48.
+    gc[16..24].copy_from_slice(&(ids.as_mut_ptr() as u64).to_le_bytes());
+    gc[24..32].copy_from_slice(&(vals.as_mut_ptr() as u64).to_le_bytes());
+    gc[36..40].copy_from_slice(&16u32.to_le_bytes());
+    gc[48..52].copy_from_slice(&31u32.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xA7, 80),
+        gc.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+    {
+        return TestResult::Fail("GETCONNECTOR");
+    }
+    let count = u32::from_le_bytes(gc[36..40].try_into().unwrap()) as usize;
+    if !ids[..count.min(16)]
+        .iter()
+        .zip(&vals)
+        .any(|(&p, &v)| (p, v) == (0x80, 16))
+    {
+        return TestResult::Fail("GETCONNECTOR max bpc");
+    }
+    let atomic = |flags: u32, values: &[u64]| {
+        let objects = [31u32];
+        let counts = [values.len() as u32];
+        let props = [0x80u32; 2];
+        let mut req = DrmModeAtomicUapi {
+            flags,
+            count_objs: 1,
+            objs_ptr: objects.as_ptr() as u64,
+            count_props_ptr: counts.as_ptr() as u64,
+            props_ptr: props.as_ptr() as u64,
+            prop_values_ptr: values.as_ptr() as u64,
+            ..Default::default()
+        };
+        dispatch_card(
+            idx,
+            DRM_IOCTL_MODE_ATOMIC,
+            &mut req as *mut _ as usize,
+            false,
+        )
+    };
+    const TEST_ONLY: u32 = 0x100;
+    const ALLOW_MODESET: u32 = 0x400;
+    let value = || color_prop(idx, 31, COLOR_CONNECTOR, 0x80);
+    // The range: 8..=16 (drm_property_change_valid_get).
+    for bad in [0, 7, 17, 1 << 32] {
+        if atomic(ALLOW_MODESET, &[bad]) != Err(FsError::InvalidData)
+            || color_obj_set(idx, bad, 0x80, 31, COLOR_CONNECTOR) != Err(FsError::InvalidData)
+        {
+            return TestResult::Fail("max bpc range");
+        }
+    }
+    // Atomic: a modeset of the driven connector's CRTC; TEST_ONLY checks
+    // without committing; the same value is no modeset.
+    if atomic(0, &[10]) != Err(FsError::InvalidData)
+        || atomic(TEST_ONLY, &[10]) != Err(FsError::InvalidData)
+        || atomic(TEST_ONLY | ALLOW_MODESET, &[10]) != Ok(0)
+        || value() != Some(16)
+        || atomic(ALLOW_MODESET, &[10]) != Ok(0)
+        || value() != Some(10)
+        || atomic(0, &[10]) != Ok(0)
+        // The last of two values in one request wins.
+        || atomic(ALLOW_MODESET, &[12, 9]) != Ok(0)
+        || value() != Some(9)
+    {
+        return TestResult::Fail("atomic max bpc");
+    }
+    // OBJ_SETPROPERTY and SETPROPERTY commit with modesets allowed.
+    let mut b = [0u8; 16];
+    b[0..8].copy_from_slice(&8u64.to_le_bytes());
+    b[8..12].copy_from_slice(&0x80u32.to_le_bytes());
+    b[12..16].copy_from_slice(&31u32.to_le_bytes());
+    if color_obj_set(idx, 12, 0x80, 31, COLOR_CONNECTOR) != Ok(0)
+        || value() != Some(12)
+        || dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xAB, 16),
+            b.as_mut_ptr() as usize,
+            false,
+        ) != Ok(0)
+        || value() != Some(8)
+    {
+        return TestResult::Fail("legacy max bpc");
+    }
+    // An undriven connector: no modeset.
+    ms.lock().encoders[0].crtc_id = None;
+    if atomic(0, &[16]) != Ok(0) || value() != Some(16) {
+        return TestResult::Fail("undriven connector");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_connector_max_bpc);
 
 // ── 6. Render-node fd rejects SETCRTC with PermissionDenied ────────────
 
@@ -1577,11 +2526,12 @@ fn smoke_drm_dumb_backing_survives_gem_close_while_fb_held() -> TestResult {
     use crate::drm::card::DumbBacking;
     let mut card = make_test_card();
     let fake_phys = 0xB00B_0000u64;
-    let handle = card.gem.alloc(fake_phys, 4096).unwrap();
+    // Room for the 64x64 XRGB8888 framebuffer (ADDFB2 checks the size).
+    let handle = card.gem.alloc(fake_phys, 64 * 64 * 4).unwrap();
     card.dumb_backings.push(DumbBacking {
         gem_handle: handle,
         phys: fake_phys,
-        byte_len: 4096,
+        byte_len: 64 * 64 * 4,
         order: 0,
         mmap_offset: (handle as u64) << 12,
         refcount: 1,
@@ -2585,6 +3535,187 @@ kernel_test_in!(
     smoke_drm_native_planes_refuse_what_scanout_cannot_show
 );
 
+/// The Navi48 primary plane's formats (amdgpu_dm's DCN4.0.1 list less
+/// what the native scanout cannot program): ADDFB2 takes each with a pitch
+/// of a line of its pixels on a GEM object holding every line (EINVAL
+/// otherwise, as framebuffer_check and drm_gem_fb_init_with_funcs refuse
+/// them), refuses the formats it leaves out, GETPLANE lists them, SETCRTC
+/// shows each full screen, PAGE_FLIP keeps the format (EINVAL across
+/// formats, as drm_mode_page_flip_ioctl) and the atomic plane check takes
+/// them. A card without native planes keeps its three legacy formats.
+fn smoke_drm_navi48_plane_formats_end_to_end() -> TestResult {
+    use crate::drm::atomic::{AtomicState, PlaneState};
+    use crate::drm::card::{CardError, DumbBacking, PixelFormat};
+    use crate::drm_uapi::{DrmModeCrtcUapi, DRM_IOCTL_MODE_SETCRTC};
+    const FORMATS: &[u32] = &crate::amdgpu_navi48_kms::PLANE_FORMATS;
+    let idx = register_test_card();
+    let Some(ms) = crate::drm_registry::mode_state(idx) else {
+        return TestResult::Fail("no mode state");
+    };
+    let dumb = |card: &mut crate::drm::card::Card, phys: u64, size: usize| {
+        let handle = card.gem.alloc(phys, size).unwrap();
+        card.dumb_backings.push(DumbBacking {
+            gem_handle: handle,
+            phys,
+            byte_len: size,
+            order: 0,
+            mmap_offset: (handle as u64) << 12,
+            refcount: 1,
+            dma_buf: Default::default(),
+        });
+        handle
+    };
+    let (big, small, legacy) = {
+        let mut card = ms.lock();
+        // Before the planes exist: only XR24, AR24 and RG16.
+        let legacy = dumb(&mut card, 0xBEE0_0000, 64 * 32 * 8);
+        if card.addfb2(64, 32, 0x3033_5258, 64 * 4, legacy) != Err(CardError::UnknownFormat)
+            || card.addfb2(64, 32, 0x3631_4752, 64 * 2, legacy).is_err()
+        {
+            return TestResult::Fail("formats of a card without native planes");
+        }
+        card.plane_formats = Some(FORMATS);
+        (
+            dumb(&mut card, 0xBEEF_0000, 64 * 32 * 8),
+            dumb(&mut card, 0xBEF0_0000, 64 * 32 * 4),
+            legacy,
+        )
+    };
+    let _ = legacy;
+    let addfb = |w: u32, h: u32, format: u32, pitch: u32, handle: u32| {
+        ms.lock().addfb2(w, h, format, pitch, handle)
+    };
+    let mut fbs = alloc::vec::Vec::new();
+    // NV12 and P010 need two planes (smoke_drm_addfb2_takes_gfx12_modifiers_and_nv12).
+    for &format in FORMATS
+        .iter()
+        .filter(|&&f| !matches!(f, 0x3231_564e | 0x3031_3050))
+    {
+        let Some(cpp) = PixelFormat::from_fourcc(format).map(PixelFormat::cpp) else {
+            return TestResult::Fail("plane format unknown to ADDFB2");
+        };
+        if addfb(64, 32, format, 64 * cpp - 2, big) != Err(CardError::InvalidDimensions) {
+            return TestResult::Fail("pitch shorter than a line accepted");
+        }
+        // A 64x32 line of 8-byte pixels does not fit the 4-byte object.
+        if (cpp == 8)
+            != (addfb(64, 32, format, 64 * cpp, small) == Err(CardError::InvalidDimensions))
+        {
+            return TestResult::Fail("GEM object size check");
+        }
+        match addfb(64, 32, format, 64 * cpp, big) {
+            Ok(fb) => fbs.push((format, fb)),
+            Err(_) => return TestResult::Fail("plane format refused"),
+        }
+    }
+    // RGBA8888, XRGB16161616 (UNORM), NV12 and C8: Linux's other formats.
+    for format in [0x3432_4152, 0x3834_5258, 0x3231_564e, 0x2020_3843] {
+        if addfb(64, 32, format, 64 * 8, big) != Err(CardError::UnknownFormat) {
+            return TestResult::Fail("format the native plane leaves out accepted");
+        }
+    }
+    // GETPLANE lists exactly the plane's formats.
+    let mut ids = [0u32; 4];
+    let mut res = [0u8; 16];
+    res[0..8].copy_from_slice(&(ids.as_mut_ptr() as u64).to_le_bytes());
+    res[8..12].copy_from_slice(&4u32.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xB5, 16),
+        res.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+    {
+        return TestResult::Fail("GETPLANERESOURCES");
+    }
+    let mut listed = [0u32; 16];
+    let mut gp = [0u8; 32];
+    gp[0..4].copy_from_slice(&ids[0].to_le_bytes());
+    gp[20..24].copy_from_slice(&16u32.to_le_bytes());
+    gp[24..32].copy_from_slice(&(listed.as_mut_ptr() as u64).to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xB6, 32),
+        gp.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+        || gp[20..24] != (FORMATS.len() as u32).to_le_bytes()
+        || listed[..FORMATS.len()] != *FORMATS
+    {
+        return TestResult::Fail("plane formats");
+    }
+    // SETCRTC shows each full screen in a 64x32 mode.
+    let setcrtc = |fb_id: u32| {
+        let mut req = DrmModeCrtcUapi {
+            crtc_id: 11,
+            fb_id,
+            mode_valid: 1,
+            ..Default::default()
+        };
+        req.mode.hdisplay = 64;
+        req.mode.vdisplay = 32;
+        req.mode.vrefresh = 60;
+        dispatch_card(
+            idx,
+            DRM_IOCTL_MODE_SETCRTC,
+            &mut req as *mut _ as usize,
+            false,
+        )
+    };
+    for &(_, fb) in &fbs {
+        if setcrtc(fb) != Ok(0) {
+            return TestResult::Fail("full-screen plane of a native format");
+        }
+    }
+    // PAGE_FLIP keeps the format: FP16 to FP16 flips, FP16 to XRGB8888
+    // does not.
+    let (Some(&(_, last)), Some(&(_, xrgb))) = (fbs.last(), fbs.first()) else {
+        return TestResult::Fail("no framebuffers");
+    };
+    let Ok(again) = addfb(64, 32, *FORMATS.last().unwrap(), 64 * 8, big) else {
+        return TestResult::Fail("second FP16 framebuffer");
+    };
+    let flip = |fb: u32| {
+        let mut flip = [0u8; 24];
+        flip[0..4].copy_from_slice(&11u32.to_le_bytes());
+        flip[4..8].copy_from_slice(&fb.to_le_bytes());
+        dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xB0, 24),
+            flip.as_mut_ptr() as usize,
+            false,
+        )
+    };
+    if ms.lock().crtc(11).unwrap().primary_fb != Some(last)
+        || flip(xrgb) != Err(FsError::InvalidData)
+        || flip(again) != Ok(0)
+    {
+        return TestResult::Fail("PAGE_FLIP format rules");
+    }
+    // The atomic plane check takes every format unscaled and full screen.
+    for &(_, fb) in &fbs {
+        let mut state = AtomicState::default();
+        state.planes.push(PlaneState {
+            id: ids[0],
+            crtc_id: Some(11),
+            fb_id: Some(fb),
+            crtc_w: 64,
+            crtc_h: 32,
+            src_w: 64,
+            src_h: 32,
+            ..Default::default()
+        });
+        if crate::drm_ioctl_bridge::check_native_atomic(&ms.lock(), &state) != Ok(()) {
+            return TestResult::Fail("atomic plane of a native format");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_navi48_plane_formats_end_to_end
+);
+
 // ── User-copy range + fault checks (Linux access_ok / copy_*_user) ───────────
 
 /// Last byte of the user half, and the first canonical kernel address.
@@ -2715,3 +3846,1007 @@ kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_user_copies_version_strings
 );
+
+// ── amdgpu_dm's native overlay planes ─────────────────────────────────
+//
+// A card publishing native planes (the Navi48 card's shape) exposes each
+// CRTC's primary and DCN401's three overlays with amdgpu_dm's properties,
+// and runs amdgpu_dm's plane checks on ATOMIC (TEST_ONLY included) and
+// SETPLANE. DML admission and presentation are the native display's
+// (exercised by the navi48 tests); this card has none.
+fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
+    use crate::drm::card::DumbBacking;
+    use crate::drm_native_planes as planes;
+    const XR24: u32 = 0x3432_5258;
+    const AR24: u32 = 0x3432_5241;
+    const XR30: u32 = 0x3033_5258;
+    const OVERLAY: u32 = planes::OVERLAY_PLANE_ID_BASE;
+    let idx = register_test_card();
+    let Some(ms) = crate::drm_registry::mode_state(idx) else {
+        return TestResult::Fail("no mode state");
+    };
+    let (primary_fb, video_fb, big_fb, _deep_fb, tiled_fb) = {
+        let mut card = ms.lock();
+        card.native_atomic = true;
+        card.plane_formats = Some(&crate::amdgpu_navi48_kms::PLANE_FORMATS);
+        card.overlay_formats = Some(&crate::amdgpu_navi48_kms::PLANE_FORMATS);
+        card.native_planes = planes::planes_for(&[], &[11, 12]);
+        let mut fb = |phys: u64, w: u32, h: u32, format: u32| {
+            let size = (w * h * 4) as usize;
+            let handle = card.gem.alloc(phys, size).unwrap();
+            card.dumb_backings.push(DumbBacking {
+                gem_handle: handle,
+                phys,
+                byte_len: size,
+                order: 0,
+                mmap_offset: (handle as u64) << 12,
+                refcount: 1,
+                dma_buf: Default::default(),
+            });
+            card.addfb2(w, h, format, w * 4, handle).unwrap()
+        };
+        let fbs = (
+            fb(0xBE10_0000, 64, 32, XR24),
+            fb(0xBE20_0000, 32, 16, AR24),
+            fb(0xBE30_0000, 256, 128, AR24),
+            fb(0xBE40_0000, 64, 32, XR30),
+        );
+        // The native amdgpu card's GFX12 modifiers (after the packed-pitch
+        // framebuffers above, which its LINEAR pitch rule refuses).
+        card.gfx12_modifiers = true;
+        // A 32x32 XRGB8888 framebuffer in GFX12 256B_2D tiles, which DC
+        // can scan vertically (rotation 90/270).
+        let tiled_fb = {
+            use crate::amdgpu_dm_modifiers::{FbCmd, FB_MODIFIERS};
+            let tiling = crate::amdgpu_dcn401_otg::Tiling {
+                swizzle: crate::amdgpu_dcn401_otg::Swizzle::S256B2D,
+                dcc: None,
+            };
+            let (phys, size) = (0xBE50_0000, 64 << 10);
+            let handle = card.gem.alloc(phys, size).unwrap();
+            card.dumb_backings.push(DumbBacking {
+                gem_handle: handle,
+                phys,
+                byte_len: size,
+                order: 0,
+                mmap_offset: (handle as u64) << 12,
+                refcount: 1,
+                dma_buf: Default::default(),
+            });
+            let mut cmd = FbCmd {
+                width: 32,
+                height: 32,
+                pixel_format: XR24,
+                flags: FB_MODIFIERS,
+                ..FbCmd::default()
+            };
+            cmd.handles[0] = handle;
+            cmd.pitches[0] = 32 * 4;
+            cmd.modifier[0] = tiling.modifier();
+            card.addfb2_cmd(&cmd).unwrap()
+        };
+        let crtc = card.crtc_mut(11).unwrap();
+        crtc.mode = Some(crate::Mode {
+            width: 64,
+            height: 32,
+            refresh_hz: 60,
+            bpp: 32,
+        });
+        crtc.enabled = true;
+        crtc.primary_fb = Some(fbs.0);
+        (fbs.0, fbs.1, fbs.2, fbs.3, tiled_fb)
+    };
+    // GETPLANERESOURCES: both primaries, the three overlays, then both
+    // cursor planes.
+    let mut ids = [0u32; 8];
+    let mut res = [0u8; 16];
+    res[0..8].copy_from_slice(&(ids.as_mut_ptr() as u64).to_le_bytes());
+    res[8..12].copy_from_slice(&8u32.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xB5, 16),
+        res.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+        || res[8..12] != 7u32.to_le_bytes()
+        || ids[..7] != [0x40, 0x41, OVERLAY, OVERLAY + 1, OVERLAY + 2, 0x47, 0x48]
+    {
+        return TestResult::Fail("plane resources");
+    }
+    // GETPLANE: an overlay goes on any CRTC and takes the overlay formats.
+    let getplane = |id: u32| {
+        let mut formats = [0u32; 16];
+        let mut gp = [0u8; 32];
+        gp[0..4].copy_from_slice(&id.to_le_bytes());
+        gp[20..24].copy_from_slice(&16u32.to_le_bytes());
+        gp[24..32].copy_from_slice(&(formats.as_mut_ptr() as u64).to_le_bytes());
+        let r = dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xB6, 32),
+            gp.as_mut_ptr() as usize,
+            false,
+        );
+        let word = |i: usize| u32::from_le_bytes(gp[i * 4..i * 4 + 4].try_into().unwrap());
+        (r, word(1), word(2), word(3), word(5), formats)
+    };
+    let (r, crtc, fb, possible, count, formats) = getplane(OVERLAY);
+    if r != Ok(0)
+        || (crtc, fb, possible) != (0, 0, 0xff)
+        || count != 15
+        || formats[..15] != crate::amdgpu_navi48_kms::PLANE_FORMATS
+    {
+        return TestResult::Fail("overlay GETPLANE");
+    }
+    // OBJ_GETPROPERTIES: the core plane properties, then amdgpu_dm's.
+    let properties = |id: u32| {
+        let mut props = [0u32; 20];
+        let mut vals = [0u64; 24];
+        let mut og = [0u8; 32];
+        og[0..8].copy_from_slice(&(props.as_mut_ptr() as u64).to_le_bytes());
+        og[8..16].copy_from_slice(&(vals.as_mut_ptr() as u64).to_le_bytes());
+        og[16..20].copy_from_slice(&24u32.to_le_bytes());
+        og[20..24].copy_from_slice(&id.to_le_bytes());
+        og[24..28].copy_from_slice(&0xeeee_eeeeu32.to_le_bytes());
+        let r = dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xB9, 32),
+            og.as_mut_ptr() as usize,
+            false,
+        );
+        let n = u32::from_le_bytes(og[16..20].try_into().unwrap()) as usize;
+        (r, props[..n.min(24)].to_vec(), vals[..n.min(24)].to_vec())
+    };
+    let (r, props, vals) = properties(OVERLAY + 1);
+    let blob = u64::from(planes::in_formats_blob_id(OVERLAY + 1));
+    let async_blob = u64::from(planes::in_formats_async_blob_id(OVERLAY + 1));
+    // The planes scan NV12/P010: COLOR_ENCODING (BT.709) and COLOR_RANGE
+    // (limited) before the rotation; IN_FORMATS and IN_FORMATS_ASYNC last.
+    if r != Ok(0)
+        || props.len() != 20
+        || vals[0] != 0
+        || props[12..]
+            != [
+                planes::ALPHA_PROP_ID,
+                planes::BLEND_PROP_ID,
+                planes::ZPOS_PROP_ID,
+                planes::COLOR_ENCODING_PROP_ID,
+                planes::COLOR_RANGE_PROP_ID,
+                planes::ROTATION_PROP_ID,
+                planes::IN_FORMATS_PROP_ID,
+                planes::IN_FORMATS_ASYNC_PROP_ID,
+            ]
+        || vals[12..] != [0xffff, 0, 9, 1, 0, 1, blob, async_blob]
+    {
+        return TestResult::Fail("overlay properties");
+    }
+    // IN_FORMATS through GETPROPBLOB: a version-1 drm_format_modifier_blob
+    // of the 15 formats and the 17 GFX12 modifiers.
+    let mut data = alloc::vec![0u8; 512];
+    let mut gb = [0u8; 16];
+    gb[0..4].copy_from_slice(&(blob as u32).to_le_bytes());
+    gb[4..8].copy_from_slice(&512u32.to_le_bytes());
+    gb[8..16].copy_from_slice(&(data.as_mut_ptr() as u64).to_le_bytes());
+    let r = dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xAC, 16),
+        gb.as_mut_ptr() as usize,
+        false,
+    );
+    let len = u32::from_le_bytes(gb[4..8].try_into().unwrap()) as usize;
+    if r != Ok(0)
+        || len != 88 + 17 * 24
+        || data[0..4] != 1u32.to_le_bytes()
+        || data[8..12] != 15u32.to_le_bytes()
+        || data[16..20] != 17u32.to_le_bytes()
+        || data[..len]
+            != crate::amdgpu_dm_modifiers::in_formats_blob(&crate::amdgpu_navi48_kms::PLANE_FORMATS)
+                .unwrap()[..]
+    {
+        return TestResult::Fail("IN_FORMATS blob");
+    }
+    let (r, props, vals) = properties(0x40);
+    if r != Ok(0)
+        || vals[0] != 1
+        || props[12..]
+            != [
+                planes::BLEND_PROP_ID,
+                planes::PRIMARY_ZPOS_PROP_ID,
+                planes::COLOR_ENCODING_PROP_ID,
+                planes::COLOR_RANGE_PROP_ID,
+                planes::ROTATION_PROP_ID,
+                planes::IN_FORMATS_PROP_ID,
+                planes::IN_FORMATS_ASYNC_PROP_ID,
+            ]
+        || vals[13] != 3
+        || vals[9..11] != [64, 32]
+    {
+        return TestResult::Fail("primary properties");
+    }
+    // GETPROPERTY: the ranges (the primary's zpos immutable), the enum and
+    // the rotation bitmask with Linux's names.
+    let getproperty = |id: u32| {
+        let mut values = [0u64; 4];
+        let mut enums = [0u8; 4 * 40];
+        let mut gp = [0u8; 64];
+        gp[0..8].copy_from_slice(&(values.as_mut_ptr() as u64).to_le_bytes());
+        gp[8..16].copy_from_slice(&(enums.as_mut_ptr() as u64).to_le_bytes());
+        gp[16..20].copy_from_slice(&id.to_le_bytes());
+        gp[56..60].copy_from_slice(&4u32.to_le_bytes());
+        gp[60..64].copy_from_slice(&4u32.to_le_bytes());
+        let r = dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xAA, 64),
+            gp.as_mut_ptr() as usize,
+            false,
+        );
+        let flags = u32::from_le_bytes(gp[20..24].try_into().unwrap());
+        let name_end = gp[24..56].iter().position(|&b| b == 0).unwrap_or(32);
+        let name = alloc::vec::Vec::from(&gp[24..24 + name_end]);
+        let n = u32::from_le_bytes(gp[56..60].try_into().unwrap()) as usize;
+        (r, flags, name, values[..n.min(4)].to_vec(), enums)
+    };
+    let (r, flags, name, values, _) = getproperty(planes::PRIMARY_ZPOS_PROP_ID);
+    if r != Ok(0) || flags != 2 | 4 || name != b"zpos" || values != [3, 3] {
+        return TestResult::Fail("primary zpos property");
+    }
+    let (r, flags, name, values, _) = getproperty(planes::ALPHA_PROP_ID);
+    if r != Ok(0) || flags != 2 || name != b"alpha" || values != [0, 0xffff] {
+        return TestResult::Fail("alpha property");
+    }
+    let (r, flags, name, values, enums) = getproperty(planes::BLEND_PROP_ID);
+    if r != Ok(0)
+        || flags != 8
+        || name != b"pixel blend mode"
+        || values != [2, 0, 1]
+        || &enums[8..12] != b"None"
+        || &enums[48..62] != b"Pre-multiplied"
+    {
+        return TestResult::Fail("pixel blend mode property");
+    }
+    let (r, flags, name, values, enums) = getproperty(planes::ROTATION_PROP_ID);
+    if r != Ok(0)
+        || flags != 0x20
+        || name != b"rotation"
+        || values != [0, 1, 2, 3]
+        || &enums[128..138] != b"rotate-270"
+    {
+        return TestResult::Fail("rotation property");
+    }
+    // drm_plane_create_color_properties' enums with drm_color_mgmt.c's names.
+    let (r, flags, name, values, enums) = getproperty(planes::COLOR_ENCODING_PROP_ID);
+    if r != Ok(0)
+        || flags != 8
+        || name != b"COLOR_ENCODING"
+        || values != [0, 1, 2]
+        || &enums[48..66] != b"ITU-R BT.709 YCbCr"
+    {
+        return TestResult::Fail("COLOR_ENCODING property");
+    }
+    let (r, flags, name, values, enums) = getproperty(planes::COLOR_RANGE_PROP_ID);
+    if r != Ok(0)
+        || flags != 8
+        || name != b"COLOR_RANGE"
+        || values != [0, 1]
+        || &enums[8..27] != b"YCbCr limited range"
+        || &enums[48..64] != b"YCbCr full range"
+    {
+        return TestResult::Fail("COLOR_RANGE property");
+    }
+    // ATOMIC with amdgpu_dm's checks.
+    let atomic = |flags: u32, objects: &[(u32, &[(u32, u64)])]| {
+        let objs: alloc::vec::Vec<u32> = objects.iter().map(|o| o.0).collect();
+        let counts: alloc::vec::Vec<u32> = objects.iter().map(|o| o.1.len() as u32).collect();
+        let props: alloc::vec::Vec<u32> = objects
+            .iter()
+            .flat_map(|o| o.1.iter().map(|p| p.0))
+            .collect();
+        let values: alloc::vec::Vec<u64> = objects
+            .iter()
+            .flat_map(|o| o.1.iter().map(|p| p.1))
+            .collect();
+        let mut req = DrmModeAtomicUapi {
+            flags,
+            count_objs: objs.len() as u32,
+            objs_ptr: objs.as_ptr() as u64,
+            count_props_ptr: counts.as_ptr() as u64,
+            props_ptr: props.as_ptr() as u64,
+            prop_values_ptr: values.as_ptr() as u64,
+            ..Default::default()
+        };
+        dispatch_card(
+            idx,
+            DRM_IOCTL_MODE_ATOMIC,
+            &mut req as *mut _ as usize,
+            false,
+        )
+    };
+    const FB_ID: u32 = 0x55;
+    const CRTC_ID: u32 = 0x56;
+    let place = |fb: u32, src: (u64, u64), dst: (i64, i64, u64, u64)| {
+        [
+            (FB_ID, u64::from(fb)),
+            (CRTC_ID, 11),
+            (0x57, 0),
+            (0x58, 0),
+            (0x59, src.0 << 16),
+            (0x5a, src.1 << 16),
+            (0x5b, dst.0 as u64),
+            (0x5c, dst.1 as u64),
+            (0x5d, dst.2),
+            (0x5e, dst.3),
+        ]
+    };
+    let video = place(video_fb, (32, 16), (8, 8, 24, 12));
+    let with = |extra: &[(u32, u64)]| {
+        let mut v = alloc::vec::Vec::from(video);
+        v.extend_from_slice(extra);
+        v
+    };
+    let half = with(&[(planes::ALPHA_PROP_ID, 0x8000), (planes::BLEND_PROP_ID, 1)]);
+    if atomic(0x0100, &[(OVERLAY, &half)]) != Ok(0)
+        || ms.lock().native_plane(OVERLAY).unwrap().fb_id.is_some()
+    {
+        return TestResult::Fail("TEST_ONLY overlay");
+    }
+    let eighth = place(big_fb, (256, 128), (0, 0, 32, 16));
+    type Case = (&'static str, alloc::vec::Vec<(u32, u64)>, u32);
+    let refused: [Case; 6] = [
+        ("8:1 downscale", alloc::vec::Vec::from(eighth), OVERLAY),
+        (
+            "linear rotate-90",
+            with(&[(planes::ROTATION_PROP_ID, 2)]),
+            OVERLAY,
+        ),
+        (
+            "two rotations",
+            with(&[(planes::ROTATION_PROP_ID, 5)]),
+            OVERLAY,
+        ),
+        (
+            "alpha range",
+            with(&[(planes::ALPHA_PROP_ID, 0x1_0000)]),
+            OVERLAY,
+        ),
+        (
+            "viewport",
+            alloc::vec::Vec::from(place(video_fb, (32, 16), (8, 8, 20, 12))),
+            OVERLAY,
+        ),
+        (
+            "primary zpos",
+            alloc::vec![(planes::PRIMARY_ZPOS_PROP_ID, 3)],
+            0x40,
+        ),
+    ];
+    for (why, props, plane) in &refused {
+        if atomic(0x0100, &[(*plane, props)]) != Err(FsError::InvalidData) {
+            return TestResult::Fail(why);
+        }
+    }
+    // amdgpu_dm's rotate-90/270 on a tiled surface: a 32x16 source turned
+    // onto a 32x32 window (2x up across, 1:1 down), TEST_ONLY then a
+    // commit that records it, then the plane disabled again.
+    let turned = |rotation: u64| {
+        let mut v = alloc::vec::Vec::from(place(tiled_fb, (32, 16), (0, 0, 32, 32)));
+        v.push((planes::ROTATION_PROP_ID, rotation));
+        v
+    };
+    if atomic(0x0100, &[(OVERLAY + 2, &turned(2))]) != Ok(0)
+        || atomic(0x0100, &[(0x40, &turned(8))]) != Ok(0)
+        || ms.lock().native_plane(OVERLAY + 2).unwrap().fb_id.is_some()
+    {
+        return TestResult::Fail("TEST_ONLY tiled rotate-90/270");
+    }
+    if atomic(0, &[(OVERLAY + 2, &turned(2))]) != Ok(0) {
+        return TestResult::Fail("tiled rotate-90 commit");
+    }
+    {
+        let card = ms.lock();
+        let p = card.native_plane(OVERLAY + 2).unwrap();
+        if (p.crtc_id, p.fb_id, p.props.rotation) != (Some(11), Some(tiled_fb), 2)
+            || p.dst != (0, 0, 32, 32)
+        {
+            return TestResult::Fail("committed rotate-90 state");
+        }
+    }
+    if atomic(0, &[(OVERLAY + 2, &[(FB_ID, 0), (CRTC_ID, 0)])]) != Ok(0)
+        || ms.lock().native_plane(OVERLAY + 2).unwrap().fb_id.is_some()
+    {
+        return TestResult::Fail("rotated overlay disable");
+    }
+    // An enabled CRTC needs its primary plane (dm_crtc_helper_atomic_check).
+    if atomic(0x0100, &[(0x40, &[(FB_ID, 0), (CRTC_ID, 0)])]) != Err(FsError::InvalidData) {
+        return TestResult::Fail("CRTC without its primary");
+    }
+    // A commit records the overlay's state; GETPLANE reports it.
+    if atomic(0, &[(OVERLAY, &half)]) != Ok(0) {
+        return TestResult::Fail("overlay commit");
+    }
+    {
+        let card = ms.lock();
+        let p = card.native_plane(OVERLAY).unwrap();
+        if (p.crtc_id, p.fb_id) != (Some(11), Some(video_fb))
+            || p.props.alpha != 0x8000
+            || p.props.blend != 1
+            || p.dst != (8, 8, 24, 12)
+            || card.crtc(11).unwrap().primary_fb != Some(primary_fb)
+        {
+            return TestResult::Fail("committed overlay state");
+        }
+    }
+    if getplane(OVERLAY).1 != 11 || getplane(OVERLAY).2 != video_fb {
+        return TestResult::Fail("GETPLANE of an enabled overlay");
+    }
+    // drm_atomic_plane_check: no direct move to another CRTC.
+    let mut moved = alloc::vec::Vec::from(video);
+    moved[1] = (CRTC_ID, 12);
+    if atomic(0x0100, &[(OVERLAY, &moved)]) != Err(FsError::InvalidData) {
+        return TestResult::Fail("overlay switched CRTC directly");
+    }
+    // SETPLANE: the plane alone, through the same checks.
+    let setplane =
+        |master: bool, plane: u32, fb: u32, dst: (i32, i32, u32, u32), src: (u32, u32)| {
+            let mut b = [0u8; 48];
+            let words: [u32; 12] = [
+                plane,
+                11,
+                fb,
+                0,
+                dst.0 as u32,
+                dst.1 as u32,
+                dst.2,
+                dst.3,
+                0,
+                0,
+                src.1 << 16,
+                src.0 << 16,
+            ];
+            for (i, w) in words.iter().enumerate() {
+                b[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            let id = if master {
+                SMOKE_MASTER_ID
+            } else {
+                SMOKE_MASTER_ID + 1
+            };
+            crate::drm_ioctl_bridge::dispatch_card(
+                idx,
+                id,
+                iowr(DRM_IOCTL_BASE, 0xB7, 48),
+                b.as_mut_ptr() as usize,
+                false,
+            )
+        };
+    if setplane(false, OVERLAY + 1, video_fb, (0, 0, 32, 16), (32, 16))
+        != Err(FsError::PermissionDenied)
+        || setplane(true, 0x99, video_fb, (0, 0, 32, 16), (32, 16)) != Err(FsError::NotFound)
+        || setplane(true, OVERLAY + 1, video_fb, (0, 0, 32, 16), (33, 16)) != Err(FsError::NoSpace)
+        || setplane(true, OVERLAY + 1, big_fb, (0, 0, 32, 16), (256, 128))
+            != Err(FsError::InvalidData)
+        || setplane(true, OVERLAY + 1, video_fb, (16, 8, 48, 24), (32, 16)) != Ok(0)
+    {
+        return TestResult::Fail("SETPLANE");
+    }
+    if ms.lock().native_plane(OVERLAY + 1).unwrap().dst != (16, 8, 48, 24)
+        || setplane(true, OVERLAY + 1, 0, (0, 0, 0, 0), (0, 0)) != Ok(0)
+        || ms.lock().native_plane(OVERLAY + 1).unwrap().fb_id.is_some()
+    {
+        return TestResult::Fail("SETPLANE state");
+    }
+    // Removing the overlay's framebuffer disables it.
+    let mut rm = video_fb.to_le_bytes();
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xA8, 4),
+        rm.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+        || ms.lock().native_plane(OVERLAY).unwrap().crtc_id.is_some()
+    {
+        return TestResult::Fail("RMFB of an overlay's framebuffer");
+    }
+    // OBJ_SETPROPERTY on a plane: set_property_atomic, a one-property
+    // commit. A valid value commits; a value outside the property's range,
+    // an immutable property ("type"), or one the plane lacks is EINVAL; an
+    // unknown plane is ENOENT.
+    let plane_set = |value: u64, prop: u32, obj: u32| {
+        let mut b = [0u8; 24];
+        b[0..8].copy_from_slice(&value.to_le_bytes());
+        b[8..12].copy_from_slice(&prop.to_le_bytes());
+        b[12..16].copy_from_slice(&obj.to_le_bytes());
+        b[16..20].copy_from_slice(&0xeeee_eeeeu32.to_le_bytes());
+        dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xBA, 24),
+            b.as_mut_ptr() as usize,
+            false,
+        )
+    };
+    if plane_set(0x8000, planes::ALPHA_PROP_ID, OVERLAY + 2) != Ok(0)
+        || ms.lock().native_plane(OVERLAY + 2).unwrap().props.alpha != 0x8000
+        || plane_set(200, planes::ZPOS_PROP_ID, OVERLAY + 2) != Ok(0)
+        || ms.lock().native_plane(OVERLAY + 2).unwrap().props.zpos != 200
+    {
+        return TestResult::Fail("plane OBJ_SETPROPERTY");
+    }
+    if plane_set(255, planes::ZPOS_PROP_ID, OVERLAY + 2) != Err(FsError::InvalidData)
+        || plane_set(0x8000, planes::ALPHA_PROP_ID, 0x40) != Err(FsError::InvalidData)
+        || plane_set(0, 0x50, OVERLAY + 2) != Err(FsError::InvalidData)
+        || plane_set(0x8000, planes::ALPHA_PROP_ID, 0x7ff) != Err(FsError::NotFound)
+        || ms.lock().native_plane(OVERLAY + 2).unwrap().props.zpos != 200
+    {
+        return TestResult::Fail("plane OBJ_SETPROPERTY refusals");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_ioctl_native_overlay_planes
+);
+
+// ── amdgpu_dm's cursor planes ─────────────────────────────────────────
+//
+// The Navi48 card's shape again: every CRTC also has amdgpu_dm's
+// DRM_PLANE_TYPE_CURSOR plane. ATOMIC (TEST_ONLY included), SETPLANE and
+// the legacy CURSOR/CURSOR2 ioctls (drm_mode_cursor_universal) update it
+// through amdgpu_dm's cursor checks; the hardware cursor it drives is the
+// native display's (this card has none).
+fn smoke_drm_ioctl_native_cursor_plane() -> TestResult {
+    use crate::amdgpu_dm_modifiers::{FbCmd, FB_MODIFIERS};
+    use crate::drm::card::DumbBacking;
+    use crate::drm_native_planes as planes;
+    const XR24: u32 = 0x3432_5258;
+    const AR24: u32 = 0x3432_5241;
+    const CURSOR: u32 = planes::CURSOR_PLANE_ID_BASE;
+    let idx = register_test_card();
+    let Some(ms) = crate::drm_registry::mode_state(idx) else {
+        return TestResult::Fail("no mode state");
+    };
+    let tiled = crate::amdgpu_dcn401_otg::Tiling {
+        swizzle: crate::amdgpu_dcn401_otg::Swizzle::S256B2D,
+        dcc: None,
+    };
+    let (cursor_fb, narrow_fb, wide_fb, opaque_fb, tiled_fb, cursor_bo, tiled_bo) = {
+        let mut card = ms.lock();
+        card.native_atomic = true;
+        card.plane_formats = Some(&crate::amdgpu_navi48_kms::PLANE_FORMATS);
+        card.overlay_formats = Some(&crate::amdgpu_navi48_kms::PLANE_FORMATS);
+        card.native_planes = planes::planes_for(&[], &[11, 12]);
+        card.gfx12_modifiers = true;
+        let mut bo = |phys: u64, size: usize| {
+            let handle = card.gem.alloc(phys, size).unwrap();
+            card.dumb_backings.push(DumbBacking {
+                gem_handle: handle,
+                phys,
+                byte_len: size,
+                order: 0,
+                mmap_offset: (handle as u64) << 12,
+                refcount: 1,
+                dma_buf: Default::default(),
+            });
+            handle
+        };
+        let primary_bo = bo(0xBE80_0000, 256 * 32);
+        let cursor_bo = bo(0xBE90_0000, 512 * 64);
+        let tiled_bo = bo(0xBEA0_0000, 1 << 20);
+        let mut fb = |w: u32, h: u32, format: u32, pitch: u32, handle: u32, modifier: u64| {
+            let mut cmd = FbCmd {
+                width: w,
+                height: h,
+                pixel_format: format,
+                flags: FB_MODIFIERS,
+                ..FbCmd::default()
+            };
+            cmd.handles[0] = handle;
+            cmd.pitches[0] = pitch;
+            cmd.modifier[0] = modifier;
+            card.addfb2_cmd(&cmd).unwrap()
+        };
+        let primary = fb(64, 32, XR24, 256, primary_bo, 0);
+        let fbs = (
+            fb(64, 64, AR24, 256, cursor_bo, 0),
+            fb(32, 32, AR24, 256, cursor_bo, 0),
+            fb(128, 64, AR24, 512, cursor_bo, 0),
+            fb(64, 64, XR24, 256, cursor_bo, 0),
+            fb(64, 64, AR24, 256, tiled_bo, tiled.modifier()),
+        );
+        let crtc = card.crtc_mut(11).unwrap();
+        crtc.mode = Some(crate::Mode {
+            width: 64,
+            height: 32,
+            refresh_hz: 60,
+            bpp: 32,
+        });
+        crtc.enabled = true;
+        crtc.primary_fb = Some(primary);
+        (fbs.0, fbs.1, fbs.2, fbs.3, fbs.4, cursor_bo, tiled_bo)
+    };
+    // GETPLANE: each CRTC's cursor goes on that CRTC alone and takes
+    // ARGB8888.
+    let getplane = |id: u32| {
+        let mut formats = [0u32; 4];
+        let mut gp = [0u8; 32];
+        gp[0..4].copy_from_slice(&id.to_le_bytes());
+        gp[20..24].copy_from_slice(&4u32.to_le_bytes());
+        gp[24..32].copy_from_slice(&(formats.as_mut_ptr() as u64).to_le_bytes());
+        let r = dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xB6, 32),
+            gp.as_mut_ptr() as usize,
+            false,
+        );
+        let word = |i: usize| u32::from_le_bytes(gp[i * 4..i * 4 + 4].try_into().unwrap());
+        (r, word(1), word(2), word(3), word(5), formats[0])
+    };
+    if getplane(CURSOR) != (Ok(0), 0, 0, 1, 1, AR24) || getplane(CURSOR + 1).3 != 2 {
+        return TestResult::Fail("cursor GETPLANE");
+    }
+    // OBJ_GETPROPERTIES: type Cursor, the core plane properties, then
+    // amdgpu_dm's: its own blend mode and immutable zpos, IN_FORMATS and
+    // IN_FORMATS_ASYNC.
+    let mut props = [0u32; 20];
+    let mut vals = [0u64; 20];
+    let mut og = [0u8; 32];
+    og[0..8].copy_from_slice(&(props.as_mut_ptr() as u64).to_le_bytes());
+    og[8..16].copy_from_slice(&(vals.as_mut_ptr() as u64).to_le_bytes());
+    og[16..20].copy_from_slice(&20u32.to_le_bytes());
+    og[20..24].copy_from_slice(&CURSOR.to_le_bytes());
+    og[24..28].copy_from_slice(&0xeeee_eeeeu32.to_le_bytes());
+    let r = dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xB9, 32),
+        og.as_mut_ptr() as usize,
+        false,
+    );
+    let blob = u64::from(planes::in_formats_blob_id(CURSOR));
+    if r != Ok(0)
+        || og[16..20] != 16u32.to_le_bytes()
+        || (props[0], vals[0]) != (0x50, 2)
+        || props[12..16]
+            != [
+                planes::CURSOR_BLEND_PROP_ID,
+                planes::CURSOR_ZPOS_PROP_ID,
+                planes::IN_FORMATS_PROP_ID,
+                planes::IN_FORMATS_ASYNC_PROP_ID,
+            ]
+        || vals[12..16]
+            != [
+                0,
+                255,
+                blob,
+                u64::from(planes::in_formats_async_blob_id(CURSOR)),
+            ]
+    {
+        return TestResult::Fail("cursor properties");
+    }
+    let getproperty = |id: u32| {
+        let mut values = [0u64; 4];
+        let mut enums = [0u8; 4 * 40];
+        let mut gp = [0u8; 64];
+        gp[0..8].copy_from_slice(&(values.as_mut_ptr() as u64).to_le_bytes());
+        gp[8..16].copy_from_slice(&(enums.as_mut_ptr() as u64).to_le_bytes());
+        gp[16..20].copy_from_slice(&id.to_le_bytes());
+        gp[56..60].copy_from_slice(&4u32.to_le_bytes());
+        gp[60..64].copy_from_slice(&4u32.to_le_bytes());
+        let r = dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xAA, 64),
+            gp.as_mut_ptr() as usize,
+            false,
+        );
+        let flags = u32::from_le_bytes(gp[20..24].try_into().unwrap());
+        let name_end = gp[24..56].iter().position(|&b| b == 0).unwrap_or(32);
+        let name = alloc::vec::Vec::from(&gp[24..24 + name_end]);
+        let n = u32::from_le_bytes(gp[56..60].try_into().unwrap()) as usize;
+        (r, flags, name, values[..n.min(4)].to_vec(), enums)
+    };
+    let (r, flags, name, values, enums) = getproperty(planes::CURSOR_BLEND_PROP_ID);
+    if r != Ok(0)
+        || flags != 8
+        || name != b"pixel blend mode"
+        || values != [0]
+        || &enums[8..23] != b"Pre-multiplied\0"
+    {
+        return TestResult::Fail("cursor pixel blend mode property");
+    }
+    let (r, flags, name, values, _) = getproperty(planes::CURSOR_ZPOS_PROP_ID);
+    if r != Ok(0) || flags != 2 | 4 || name != b"zpos" || values != [255, 255] {
+        return TestResult::Fail("cursor zpos property");
+    }
+    // IN_FORMATS: ARGB8888 under DRM_FORMAT_MOD_LINEAR alone.
+    let mut data = [0u8; 128];
+    let mut gb = [0u8; 16];
+    gb[0..4].copy_from_slice(&(blob as u32).to_le_bytes());
+    gb[4..8].copy_from_slice(&128u32.to_le_bytes());
+    gb[8..16].copy_from_slice(&(data.as_mut_ptr() as u64).to_le_bytes());
+    let r = dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xAC, 16),
+        gb.as_mut_ptr() as usize,
+        false,
+    );
+    if r != Ok(0)
+        || gb[4..8] != 56u32.to_le_bytes()
+        || data[8..12] != 1u32.to_le_bytes()
+        || data[16..20] != 1u32.to_le_bytes()
+        || data[24..28] != AR24.to_le_bytes()
+        || data[48..56] != [0; 8]
+    {
+        return TestResult::Fail("cursor IN_FORMATS blob");
+    }
+    // ATOMIC: set, move and disable the cursor; TEST_ONLY changes nothing.
+    let atomic = |flags: u32, plane: u32, props: &[(u32, u64)]| {
+        let objs = [plane];
+        let counts = [props.len() as u32];
+        let ids: alloc::vec::Vec<u32> = props.iter().map(|p| p.0).collect();
+        let values: alloc::vec::Vec<u64> = props.iter().map(|p| p.1).collect();
+        let mut req = DrmModeAtomicUapi {
+            flags,
+            count_objs: 1,
+            objs_ptr: objs.as_ptr() as u64,
+            count_props_ptr: counts.as_ptr() as u64,
+            props_ptr: ids.as_ptr() as u64,
+            prop_values_ptr: values.as_ptr() as u64,
+            ..Default::default()
+        };
+        dispatch_card(
+            idx,
+            DRM_IOCTL_MODE_ATOMIC,
+            &mut req as *mut _ as usize,
+            false,
+        )
+    };
+    const FB_ID: u32 = 0x55;
+    const CRTC_ID: u32 = 0x56;
+    let place = |fb: u32, crtc: u64, src: (u64, u64), dst: (i64, i64, u64, u64)| {
+        alloc::vec![
+            (FB_ID, u64::from(fb)),
+            (CRTC_ID, crtc),
+            (0x57, 0),
+            (0x58, 0),
+            (0x59, src.0),
+            (0x5a, src.1),
+            (0x5b, dst.0 as u64),
+            (0x5c, dst.1 as u64),
+            (0x5d, dst.2),
+            (0x5e, dst.3),
+        ]
+    };
+    let whole = (64 << 16, 64 << 16);
+    let shown = place(cursor_fb, 11, whole, (10, 20, 64, 64));
+    let state = || {
+        let card = ms.lock();
+        let p = *card.native_plane(CURSOR).unwrap();
+        (p.crtc_id, p.fb_id, p.dst)
+    };
+    if atomic(0x0100, CURSOR, &shown) != Ok(0) || state() != (None, None, (0, 0, 0, 0)) {
+        return TestResult::Fail("TEST_ONLY cursor");
+    }
+    if atomic(0, CURSOR, &shown) != Ok(0)
+        || state() != (Some(11), Some(cursor_fb), (10, 20, 64, 64))
+        || getplane(CURSOR).1 != 11
+        || getplane(CURSOR).2 != cursor_fb
+    {
+        return TestResult::Fail("cursor set");
+    }
+    // Partly past the top-left edge: amdgpu_dm moves it into the hotspot.
+    if atomic(
+        0,
+        CURSOR,
+        &[(0x5b, (-20i64) as u64), (0x5c, (-30i64) as u64)],
+    ) != Ok(0)
+        || state() != (Some(11), Some(cursor_fb), (-20, -30, 64, 64))
+    {
+        return TestResult::Fail("cursor move");
+    }
+    // Refusals, all EINVAL (dm_check_cursor_fb, the DCN4 scaling rule,
+    // drm_atomic_plane_check and the cursor's properties).
+    let refused: [(&str, alloc::vec::Vec<(u32, u64)>); 13] = [
+        (
+            "cursor wider than its pitch",
+            place(narrow_fb, 11, (32 << 16, 32 << 16), (0, 0, 32, 32)),
+        ),
+        (
+            "cursor past 64x64",
+            place(wide_fb, 11, (128 << 16, 64 << 16), (0, 0, 128, 64)),
+        ),
+        ("tiled cursor", place(tiled_fb, 11, whole, (0, 0, 64, 64))),
+        (
+            "XRGB8888 cursor",
+            place(opaque_fb, 11, whole, (0, 0, 64, 64)),
+        ),
+        (
+            "scaled cursor",
+            place(cursor_fb, 11, whole, (0, 0, 128, 128)),
+        ),
+        (
+            "cropped cursor",
+            place(cursor_fb, 11, (32 << 16, 64 << 16), (0, 0, 32, 64)),
+        ),
+        ("fractional cursor source", {
+            let mut v = place(cursor_fb, 11, whole, (0, 0, 64, 64));
+            v[2] = (0x57, 0x8000);
+            v
+        }),
+        (
+            "cursor source width fraction",
+            place(cursor_fb, 11, ((64 << 16) - 1, 64 << 16), (0, 0, 64, 64)),
+        ),
+        (
+            "cursor on another CRTC",
+            place(cursor_fb, 12, whole, (0, 0, 64, 64)),
+        ),
+        (
+            "coverage blend",
+            alloc::vec![(planes::CURSOR_BLEND_PROP_ID, 1)],
+        ),
+        (
+            "cursor zpos",
+            alloc::vec![(planes::CURSOR_ZPOS_PROP_ID, 255)],
+        ),
+        (
+            "cursor rotation",
+            alloc::vec![(planes::ROTATION_PROP_ID, 1)],
+        ),
+        (
+            "overlay blend property",
+            alloc::vec![(planes::BLEND_PROP_ID, 0)],
+        ),
+    ];
+    for (why, props) in &refused {
+        if atomic(0x0100, CURSOR, props) != Err(FsError::InvalidData) {
+            return TestResult::Fail(why);
+        }
+    }
+    if atomic(0, CURSOR, &[(FB_ID, 0), (CRTC_ID, 0)]) != Ok(0) || state().1.is_some() {
+        return TestResult::Fail("cursor disable");
+    }
+    // Legacy CURSOR / CURSOR2 become cursor plane updates
+    // (drm_mode_cursor_universal): a framebuffer wrapped around the BO, the
+    // CRTC's legacy position kept without MOVE, the hotspot dropped (amdgpu
+    // is not DRIVER_CURSOR_HOTSPOT).
+    let cursor_ioctl = |open: u64, two: bool, words: [u32; 9]| {
+        let mut b = [0u8; 36];
+        for (i, w) in words.iter().enumerate() {
+            b[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        let cmd = if two {
+            iowr(DRM_IOCTL_BASE, 0xBB, 36)
+        } else {
+            iowr(DRM_IOCTL_BASE, 0xA3, 28)
+        };
+        crate::drm_ioctl_bridge::dispatch_card(idx, open, cmd, b.as_mut_ptr() as usize, false)
+    };
+    let legacy = |flags: u32, crtc: u32, (x, y): (i32, i32), (w, h): (u32, u32), bo: u32| {
+        cursor_ioctl(
+            SMOKE_MASTER_ID,
+            false,
+            [flags, crtc, x as u32, y as u32, w, h, bo, 0, 0],
+        )
+    };
+    let fbs = || ms.lock().framebuffers.len();
+    let base = fbs();
+    let internal = || ms.lock().native_plane(CURSOR).unwrap().internal_fb;
+    if legacy(0, 11, (0, 0), (64, 64), cursor_bo) != Err(FsError::InvalidData)
+        || legacy(4, 11, (0, 0), (64, 64), cursor_bo) != Err(FsError::InvalidData)
+        || legacy(3, 99, (0, 0), (64, 64), cursor_bo) != Err(FsError::NotFound)
+        || cursor_ioctl(
+            SMOKE_MASTER_ID + 1,
+            false,
+            [3, 11, 0, 0, 64, 64, cursor_bo, 0, 0],
+        ) != Err(FsError::PermissionDenied)
+        || legacy(3, 11, (0, 0), (64, 64), 0x777) != Err(FsError::NotFound)
+        || fbs() != base
+    {
+        return TestResult::Fail("legacy CURSOR argument refusals");
+    }
+    if legacy(3, 11, (100, 50), (64, 64), cursor_bo) != Ok(0)
+        || fbs() != base + 1
+        || !internal()
+        || state().0 != Some(11)
+        || state().2 != (100, 50, 64, 64)
+    {
+        return TestResult::Fail("legacy CURSOR set");
+    }
+    let wrapped = state().1;
+    if legacy(2, 11, (-10, 5), (0, 0), 0) != Ok(0)
+        || state() != (Some(11), wrapped, (-10, 5, 64, 64))
+    {
+        return TestResult::Fail("legacy CURSOR move");
+    }
+    // A new BO without MOVE: the legacy position, the previous wrapped
+    // framebuffer gone.
+    if legacy(1, 11, (0, 0), (64, 16), cursor_bo) != Ok(0)
+        || fbs() != base + 1
+        || state().1 == wrapped
+        || state().2 != (-10, 5, 64, 16)
+    {
+        return TestResult::Fail("legacy CURSOR new BO");
+    }
+    // CURSOR2 at a position: the hotspot does not move it.
+    if cursor_ioctl(
+        SMOKE_MASTER_ID,
+        true,
+        [3, 11, 30, 40, 64, 64, cursor_bo, 5, 5],
+    ) != Ok(0)
+        || state().2 != (30, 40, 64, 64)
+        || fbs() != base + 1
+    {
+        return TestResult::Fail("legacy CURSOR2");
+    }
+    // amdgpu_dm's refusals reach the legacy path too, with the wrapped
+    // framebuffer dropped and the cursor kept: 32 wide (its 128-byte pitch
+    // is not amdgpu's linear pitch alignment), past 64x64, a BO in GFX12
+    // 256B_2D tiles (GEM_METADATA swizzle mode 1).
+    let kept = state();
+    if !ms.lock().set_bo_tiling(tiled_bo, 1, false) {
+        return TestResult::Fail("tiling flags");
+    }
+    for (why, size, bo) in [
+        ("legacy 32x32 cursor", (32, 32), cursor_bo),
+        ("legacy 128x64 cursor", (128, 64), cursor_bo),
+        ("legacy tiled cursor", (64, 64), tiled_bo),
+    ] {
+        if legacy(3, 11, (0, 0), size, bo) != Err(FsError::InvalidData)
+            || state() != kept
+            || fbs() != base + 1
+        {
+            return TestResult::Fail(why);
+        }
+    }
+    // Handle 0 disables it; its wrapped framebuffer goes.
+    if legacy(1, 11, (0, 0), (0, 0), 0) != Ok(0)
+        || state().1.is_some()
+        || internal()
+        || fbs() != base
+    {
+        return TestResult::Fail("legacy CURSOR off");
+    }
+    // SETPLANE on the cursor: __setplane_atomic's legacy cursor update.
+    let setplane = |fb: u32, dst: (i32, i32, u32, u32), src: (u32, u32)| {
+        let mut b = [0u8; 48];
+        let words: [u32; 12] = [
+            CURSOR,
+            11,
+            fb,
+            0,
+            dst.0 as u32,
+            dst.1 as u32,
+            dst.2,
+            dst.3,
+            0,
+            0,
+            src.1 << 16,
+            src.0 << 16,
+        ];
+        for (i, w) in words.iter().enumerate() {
+            b[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xB7, 48),
+            b.as_mut_ptr() as usize,
+            false,
+        )
+    };
+    if setplane(cursor_fb, (5, 6, 128, 128), (64, 64)) != Err(FsError::InvalidData)
+        || setplane(cursor_fb, (5, 6, 64, 64), (64, 64)) != Ok(0)
+        || state() != (Some(11), Some(cursor_fb), (5, 6, 64, 64))
+    {
+        return TestResult::Fail("cursor SETPLANE");
+    }
+    // Removing the cursor's framebuffer turns it off.
+    let mut rm = cursor_fb.to_le_bytes();
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xA8, 4),
+        rm.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+        || state().0.is_some()
+    {
+        return TestResult::Fail("RMFB of the cursor's framebuffer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_native_cursor_plane);

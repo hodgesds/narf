@@ -98,12 +98,13 @@ fn cancel(f: impl Future) {
 fn request(protocol: Protocol) -> Request {
     Request {
         pipe: 1,
-        odm: None,
+        odm: otg::SplitPipes::NONE,
         port: 3,
         protocol,
         audio: true,
         scdc: protocol == Protocol::Tmds,
         dsc: protocol == Protocol::Sst,
+        mst_dsc: None,
         scanout: Some(ScanoutWitness {
             address: 0x8_0000_1000,
             stream: 2,

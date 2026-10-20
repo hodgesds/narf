@@ -64,6 +64,11 @@ impl<I: Io> Engine<I> {
     ) -> Result<(), Error> {
         let l = self.layout;
         let p = blank.request.pipe;
+        // A staged HDMI FRL timing compresses only once its video started it.
+        let dsc = plan
+            .request
+            .dsc
+            .filter(|_| plan.request.signal != Signal::HdmiFrl || self.status.frl_dsc == Some(p));
         for (r, mask, value) in plan.registers() {
             self.expect(l.otg(p, r), mask, value)?;
         }
@@ -77,8 +82,7 @@ impl<I: Io> Engine<I> {
             (
                 l.odm(p, FORMAT),
                 0x33,
-                if plan.request.ycbcr420 { 2 } else { 0 }
-                    | if plan.request.dsc.is_some() { 0x10 } else { 0 },
+                if plan.request.ycbcr420 { 2 } else { 0 } | if dsc.is_some() { 0x10 } else { 0 },
             ),
             (l.vtg(p), 0xffff7fff, plan.vtg | u32::from(running) << 31),
         ] {
@@ -87,6 +91,9 @@ impl<I: Io> Engine<I> {
         if plan.request.odm.is_some() {
             self.expect(l.odm(p, WIDTH), 0x1fff, plan.segment_width())?;
         }
+        if plan.request.odm.len() == 2 {
+            self.expect(l.odm(p, WIDTH2), 0x1fff, plan.last_segment_width())?;
+        }
         for (segment, o) in plan.opps().enumerate() {
             self.expect(l.opp(o, PIPE), 0x13, 3)?;
             for (r, mask, value) in blank.request.segment_registers(plan, segment as u32) {
@@ -94,7 +101,7 @@ impl<I: Io> Engine<I> {
                 self.expect(l.opp(o, r), mask, value)?;
             }
         }
-        if let Some(cfg) = plan.request.dsc {
+        if let Some(cfg) = dsc {
             self.dsc_running(&plan.request, &cfg)?;
         }
         Ok(())

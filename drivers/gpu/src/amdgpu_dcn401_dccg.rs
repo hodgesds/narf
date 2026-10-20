@@ -532,6 +532,57 @@ impl<I: Io> Engine<I> {
         self.status.dscclk |= 1 << pipe;
         Ok(true)
     }
+    /// dcn401_update_clocks_update_dpp_dto against a DPPCLK reference of
+    /// `ref_khz` for every live pipe `targets` names with its new DPPCLK:
+    /// dccg401_update_dpp_dto's phase (modulo 255, rounded up) where the
+    /// clock rises or `safe_to_lower`; a pipe left alone keeps its phase,
+    /// which runs it at least as fast against a higher reference. Each
+    /// pipe needs a record of a running clock.
+    fn update_dpp_dtos(
+        &mut self,
+        ref_khz: u32,
+        targets: &[(u8, u32)],
+        safe_to_lower: bool,
+    ) -> Result<(), Error> {
+        if !matches!(self.status.state, State::Ready | State::Applied) {
+            return Err(Error::Busy);
+        }
+        for &(pipe, dpp_khz) in targets {
+            let plan = self
+                .status
+                .pipes
+                .get(usize::from(pipe))
+                .copied()
+                .flatten()
+                .ok_or(Error::Invalid)?;
+            if plan.request.pixel == PixelClock::Disabled || dpp_khz == 0 || dpp_khz > ref_khz {
+                return Err(Error::Invalid);
+            }
+            if !(safe_to_lower || plan.request.dpp_khz < dpp_khz) {
+                continue;
+            }
+            let phase = (255 * u64::from(dpp_khz)).div_ceil(u64::from(ref_khz)) as u8;
+            self.update(
+                DPP_PARAM + u64::from(pipe),
+                u32::MAX,
+                u32::from(phase) | 0xff << 16,
+            )?;
+            self.update(DPP_ENABLE, 1 << (3 * pipe), 1 << (3 * pipe))?;
+            if let Some(p) = self.status.pipes[usize::from(pipe)].as_mut() {
+                p.dpp_phase = phase;
+                p.request.dpp_khz = dpp_khz;
+            }
+        }
+        Ok(())
+    }
+    /// Every pipe record of the global clocks `old` now runs on `new`.
+    fn rebind_global(&mut self, old: clocks::Applied, new: clocks::Applied) {
+        for p in self.status.pipes.iter_mut().flatten() {
+            if p.global == old && p.request.dpp_khz <= new.dpp_khz {
+                p.global = new;
+            }
+        }
+    }
     /// dccg401_set_ref_dscclk: DSC `pipe` back on REFCLK.
     fn stop_dscclk(&mut self, pipe: u8) -> Result<(), Error> {
         if pipe >= 4 {
@@ -667,11 +718,19 @@ impl<I: Io> Engine<I> {
         request: Request,
         global: clocks::Applied,
     ) -> Result<Applied, Error> {
+        self.prepare_except(request, global, &|_| false).await
+    }
+    async fn prepare_except(
+        &mut self,
+        request: Request,
+        global: clocks::Applied,
+        held: &(dyn Fn(u64) -> bool + Sync),
+    ) -> Result<Applied, Error> {
         if !matches!(self.status.state, State::Ready | State::Applied) {
             return Err(Error::Busy);
         }
         request.validate(global)?;
-        self.idle()?;
+        self.idle_except(held)?;
         let reference = match request.pixel {
             PixelClock::DisplayPort { .. } => dpref_hz(self.read(PLL)?, self.read(DPREF)?)?,
             PixelClock::HdmiFrl { .. } => global.dtb_khz.checked_mul(1000).ok_or(Error::Invalid)?,
@@ -823,6 +882,41 @@ impl Dccg {
         }
         let global = clocks.retained_pipe_clocks(regs).map_err(Error::Clocks)?;
         self.0.start_dscclk(pipe, global)
+    }
+    /// The DPP DTO step of a live clock update (`ClockManager::update_live`)
+    /// for the running pipes `targets`, against the DPPCLK reference
+    /// `ref_khz` it is at.
+    pub(crate) fn update_dpp_dtos(
+        &mut self,
+        regs: MmioRegion,
+        ref_khz: u32,
+        targets: &[(u8, u32)],
+        safe_to_lower: bool,
+    ) -> Result<(), Error> {
+        if regs.phys != self.0.io.0.phys || regs.len != self.0.io.0.len {
+            return Err(Error::Invalid);
+        }
+        self.0.update_dpp_dtos(ref_khz, targets, safe_to_lower)
+    }
+    /// After a live clock update: every pipe record of the global clocks
+    /// `old` (and a DPPCLK within the new reference) is current for the
+    /// clock owner's `new` ones.
+    pub(crate) fn rebind_global(&mut self, old: clocks::Applied, new: clocks::Applied) {
+        self.0.rebind_global(old, new);
+    }
+    /// Program `request`'s pipe while other pipes of the display owner run
+    /// on the current global clocks: as `prepare`, every consumer register
+    /// but `held` (theirs) idle.
+    pub(crate) async fn prepare_except(
+        &mut self,
+        clocks: &mut clocks::ClockManager,
+        request: Request,
+        held: &(dyn Fn(u64) -> bool + Sync),
+    ) -> Result<Applied, Error> {
+        let global = clocks
+            .pipe_clocks_except(self.0.io.0, held)
+            .map_err(Error::Clocks)?;
+        self.0.prepare_except(request, global, held).await
     }
     /// Return DSC `pipe`'s DSCCLK to REFCLK once the DSC is disabled.
     pub(crate) fn stop_dscclk(&mut self, regs: MmioRegion, pipe: u8) -> Result<(), Error> {

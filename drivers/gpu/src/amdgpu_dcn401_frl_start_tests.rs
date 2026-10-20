@@ -5,6 +5,8 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU8, Ordering};
 #[path = "amdgpu_dcn401_frl_audio_tests.rs"]
 mod audio;
+#[path = "amdgpu_dcn401_frl_dsc_tests.rs"]
+mod dsc;
 
 /// The firmware's half of an FRL link as the registers show it: ENABLE
 /// brings up the lanes and TX clocks, routes the PHY to the HPO FRL
@@ -249,6 +251,15 @@ fn prepared_frl_video_rate(
     depth: ColorDepth,
     rate: crate::amdgpu_navi48_boot::FrlRate,
 ) -> (Engine<FrlIo>, Fw, FrlVideoRequest, dccg::Applied) {
+    prepared_frl_video_dsc(ycbcr420, depth, rate, None)
+}
+/// An FRL link trained and a pipe-1 timing staged, compressed by `dsc`.
+fn prepared_frl_video_dsc(
+    ycbcr420: bool,
+    depth: ColorDepth,
+    rate: crate::amdgpu_navi48_boot::FrlRate,
+    dsc: Option<crate::amdgpu_dsc::DscConfig>,
+) -> (Engine<FrlIo>, Fw, FrlVideoRequest, dccg::Applied) {
     let (phy, pipe) = (2u8, 1u8);
     let event = Arc::new(AtomicU8::new(0));
     let mut e = engine();
@@ -276,6 +287,7 @@ fn prepared_frl_video_rate(
     let mut req = request(pipe);
     req.signal = Signal::HdmiFrl;
     req.ycbcr420 = ycbcr420;
+    req.dsc = dsc;
     let c = clock(req);
     run(e.prepare(req, c)).unwrap();
     e.io.inner.retiring = [false; 4];
@@ -283,6 +295,7 @@ fn prepared_frl_video_rate(
         BlankRequest {
             ycbcr420,
             depth,
+            colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(false, ycbcr420),
             ..blank_request(pipe)
         },
         c,
@@ -302,11 +315,14 @@ fn prepared_frl_video_rate(
     let request = FrlVideoRequest {
         pipe,
         audio_packets_line: 1,
-        borrow_from_blank: true,
+        borrow: crate::amdgpu_frl_cap::FrlBorrow::FromBlank,
+        hc_active: 0,
+        hc_blank: 0,
         avi: Avi {
             vic: 16,
             ..Avi::default()
         },
+        hdr: None,
     };
     // HDMISTREAMCLK not routed yet.
     assert!(matches!(
@@ -499,7 +515,8 @@ fn dcn401_frl_controls_bind_live_scanout() -> TestResult {
     let (mut e, mut fw) = live_frl_video();
     let scanout = ScanoutRunning {
         pipe: 1,
-        odm: None,
+        odm: SplitPipes::NONE,
+        mpc: SplitPipes::NONE,
         stream: 1,
         plan: dml::admit(
             &dml::Soc {
@@ -516,12 +533,15 @@ fn dcn401_frl_controls_bind_live_scanout() -> TestResult {
             &dml::Mode {
                 timing: request(1).timing,
                 pitch: 1920,
+                bytes_per_pixel: 4,
                 ycbcr420: false,
                 dsc: None,
+                planes: [None; dml::MAX_PLANES],
             },
         )
         .unwrap(),
         address: 0x8_0010_0000,
+        overlays: [None; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
         frame_before: 1,
         frame_after: 2,
     };
@@ -651,4 +671,86 @@ fn dcn401_frl_420_format_failures_retain_link() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-frl-link",
     dcn401_frl_420_format_failures_retain_link
+);
+
+/// HDR over FRL as hpo_enc401_update_hdmi_info_packets sends it: the DRM
+/// InfoFrame (amdgpu_dm_fill_hdr_info_packet's HDMI packet) in VPG generic
+/// packet 4, latched immediately and sent every frame on line 2
+/// (HDMI_GENERIC4_SEND/CONT, HDMI_GENERIC4_LINE), beside the AVI InfoFrame
+/// in packet 0. New metadata rewrites packet 4; stop clears the controls.
+fn dcn401_frl_video_sends_drm_infoframe_like_linux() -> TestResult {
+    use crate::amdgpu_hdr::{hdr_info_packet, HdrConnector, HdrOutputMetadata};
+    let phy = 2u8;
+    let (mut e, mut fw, request, c) = prepared_frl_video(false, ColorDepth::Bpc10);
+    let mut blob = [0u8; 32];
+    blob[4] = 2;
+    for (i, b) in blob[6..30].iter_mut().enumerate() {
+        *b = 0x40 + i as u8;
+    }
+    let packet = hdr_info_packet(
+        Some(&HdrOutputMetadata::from_blob(&blob).unwrap()),
+        HdrConnector::Hdmi,
+    );
+    assert_eq!(packet.hb, [0x87, 1, 0x1a, 0]);
+    let request = FrlVideoRequest {
+        hdr: Some(packet),
+        ..request
+    };
+    e.io.inner.writes.clear();
+    run(e.start_frl_video(path(phy), request, c)).unwrap();
+    let r = |e: &Engine<FrlIo>, reg: u64| e.io.inner.regs.get(&frl(reg)).copied().unwrap_or(0);
+    // Packets 0 (AVI) and 4 (DRM) SEND|CONT, both on line 2.
+    assert_eq!(r(&e, 0x8e6) & 0x3_0033, 0x3_0003);
+    assert_eq!(r(&e, 0x8eb) & 0x7fff, 2);
+    assert_eq!(r(&e, 0x934) & 0x11, 0x11, "immediate updates");
+    let w = &e.io.inner.writes;
+    let index: Vec<u32> = w
+        .iter()
+        .filter(|&&(at, _)| at == frl(0x931))
+        .map(|&(_, v)| v & 0xff)
+        .collect();
+    assert_eq!(index, [0, 36]);
+    let data: Vec<u32> = w
+        .iter()
+        .filter(|&&(at, _)| at == frl(0x932))
+        .map(|&(_, v)| v)
+        .collect();
+    assert_eq!(data[9..], packet.words());
+    let v = e.status.frl_video_running.unwrap();
+    assert_eq!(v.request.hdr, Some(packet));
+    e.frl_video_verify_running(&v).unwrap();
+    // Live metadata update: packet 4 only.
+    blob[28] = 0x99;
+    let next = hdr_info_packet(
+        Some(&HdrOutputMetadata::from_blob(&blob).unwrap()),
+        HdrConnector::Hdmi,
+    );
+    e.io.inner.writes.clear();
+    run(e.frl_update_hdr(next)).unwrap();
+    let data: Vec<u32> =
+        e.io.inner
+            .writes
+            .iter()
+            .filter(|&&(at, _)| at == frl(0x932))
+            .map(|&(_, v)| v)
+            .collect();
+    assert_eq!(data, next.words());
+    assert_eq!(e.status.frl_video_running.unwrap().request.hdr, Some(next));
+    // A lost packet 4 control is a failed witness.
+    let saved = r(&e, 0x8e6);
+    e.io.inner.regs.insert(frl(0x8e6), saved & !0x3_0000);
+    assert!(matches!(
+        e.frl_video_verify_running(&e.status.frl_video_running.unwrap()),
+        Err(Error::Readback(_))
+    ));
+    e.io.inner.regs.insert(frl(0x8e6), saved);
+    run(e.stop_frl_video(path(phy))).unwrap();
+    assert_eq!(r(&e, 0x8e6), 0);
+    assert_eq!(r(&e, 0x8eb), 0);
+    run(e.stop_frl_link(&mut fw, path(phy))).unwrap();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-frl-link",
+    dcn401_frl_video_sends_drm_infoframe_like_linux
 );

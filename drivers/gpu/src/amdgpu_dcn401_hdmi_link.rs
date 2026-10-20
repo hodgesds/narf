@@ -44,6 +44,9 @@ pub struct HdmiLinkRequest {
     pub stream: u8,
     pub pipe: u8,
     pub avi: Avi,
+    /// The HDR DRM InfoFrame (amdgpu_dm_fill_hdr_info_packet), sent in
+    /// generic packet 4 every frame while HDR_OUTPUT_METADATA is set.
+    pub hdr: Option<crate::amdgpu_hdr::InfoPacket>,
 }
 /// What the AVI InfoFrame says beyond the timing, as amdgpu_dm derives it
 /// from the mode and the sink (drm_hdmi_avi_infoframe_from_display_mode).
@@ -74,7 +77,7 @@ pub struct HdmiLinkReady {
     pub character_khz: u32,
     /// Above TMDS_SCRAMBLE_KHZ: scrambled, 1/4-rate clock channel.
     pub scrambled: bool,
-    controls: [u32; 17],
+    controls: [u32; 18],
     /// Every backend's frontend selection, so no other route moves.
     backend_routes: [u32; 4],
     /// The stream's DCCG symclk route, which TMDS leaves untouched.
@@ -83,7 +86,7 @@ pub struct HdmiLinkReady {
     on: bool,
 }
 impl HdmiLinkReady {
-    fn registers(self, l: Layout) -> [(u64, u32); 17] {
+    fn registers(self, l: Layout) -> [(u64, u32); 18] {
         let phy = self.path.transmitter;
         let s = self.request.stream;
         let be = |r| DpStream::Dio(phy).at(l, r);
@@ -105,9 +108,10 @@ impl HdmiLinkReady {
             (fe(0x209e), 0x3100701f), // HDMI_CONTROL (not error/metadata status)
             (fe(0x20a2), 0x1031),     // GC/NULL send, ACP off
             (fe(0x20a8), 1),          // GC AVMUTE
-            (fe(0x20a5), u32::MAX),   // generic packets 0..7: only AVI (0)
+            (fe(0x20a5), u32::MAX),   // generic packets 0..7: AVI, vendor, HDR (4)
             (fe(0x20a9), u32::MAX),   // generic packets 0 (AVI) and 1 (vendor) line
             (fe(0x20b1), 0x1000),     // HDMI_DB_DISABLE
+            (fe(0x20ab), u32::MAX),   // generic packets 4 (HDR) and 5 line
         ]
     }
 }
@@ -183,33 +187,52 @@ pub(crate) fn vendor_infoframe(t: &crate::amdgpu_dml::Timing, avi: Avi) -> Optio
     Some(p)
 }
 
-/// The AVI InfoFrame Linux's set_avi_info_frame builds for this stream: RGB
-/// (sRGB, so C no data) or YCbCr 4:2:0 (BT.709, YQ limited), active
-/// format valid with both bars, underscan,
-/// uniform scaling, IT content, and `avi`'s VIC and picture aspect. Q names
-/// the output range (`limited` or full) when the sink can select it, else
-/// stays default. Version 3 for VICs of 128 and up. Returns HB0..HB3 then SB0..SB27, as the nine
-/// VPG_GENERIC_PACKET_DATA words carry them (HB3 and SB28.. stay zero).
+/// The AVI InfoFrame Linux's set_avi_info_frame builds for an sRGB or
+/// sRGB-limited RGB stream or a BT.709 YCbCr 4:2:0 one: `avi_colorimetry`
+/// of the plain color space `limited` and `ycbcr420` name.
 pub(crate) fn avi_infoframe(
     t: &crate::amdgpu_dml::Timing,
     avi: Avi,
     limited: bool,
     ycbcr420: bool,
 ) -> [u8; 36] {
-    // Q names an RGB range only; YCbCr's YQ stays limited (0).
-    let q = match (avi.qs && !ycbcr420, limited) {
-        (false, _) => 0,
-        (true, true) => 1,
-        (true, false) => 2,
+    avi_infoframe_in(
+        t,
+        avi,
+        BlankRequest::default_colorspace(limited, ycbcr420),
+        ycbcr420,
+    )
+}
+/// The AVI InfoFrame Linux's set_avi_info_frame builds for this stream: RGB
+/// or YCbCr 4:2:0 (YQ limited), active format valid with both bars,
+/// underscan, uniform scaling, IT content, `avi`'s VIC and picture aspect,
+/// and the colorimetry (C, EC) and RGB range (Q, when the sink can select
+/// it) of the output color space (`amdgpu_hdr::avi_colorimetry`). Version 3
+/// for VICs of 128 and up. Returns HB0..HB3 then SB0..SB31, as the nine
+/// VPG_GENERIC_PACKET_DATA words carry them (HB3 and SB14.. stay zero).
+pub(crate) fn avi_infoframe_in(
+    t: &crate::amdgpu_dml::Timing,
+    avi: Avi,
+    colorspace: crate::amdgpu_hdr::DcColorSpace,
+    ycbcr420: bool,
+) -> [u8; 36] {
+    use crate::amdgpu_hdr::PixelEncoding;
+    let encoding = if ycbcr420 {
+        PixelEncoding::Ycbcr420
+    } else {
+        PixelEncoding::Rgb
     };
-    // Y: 4:2:0 (3) or RGB (0); C: BT.709 (2) for COLOR_SPACE_YCBCR709.
-    let (y, c) = if ycbcr420 { (3, 2) } else { (0, 0) };
+    // CRTC color management never selects a Gamma 2.2 output transfer.
+    let color = crate::amdgpu_hdr::avi_colorimetry(colorspace, encoding, avi.qs, false);
+    let (q, c, ec) = (color.q, color.c, color.ec);
+    // Y: 4:2:0 (3) or RGB (0).
+    let y = if ycbcr420 { 3 } else { 0 };
     let mut p = [0u8; 36];
     p[..3].copy_from_slice(&[0x82, if avi.vic >= 128 { 3 } else { 2 }, 13]);
     let sb = &mut p[4..];
     sb[1] = 2 | 3 << 2 | 1 << 4 | y << 5; // S underscan, B both bars, A0 valid, Y
     sb[2] = 8 | (avi.aspect & 3) << 4 | c << 6; // R same as picture, M, C
-    sb[3] = 1 << 7 | q << 2; // SC uniform, Q, EC 0, ITC
+    sb[3] = 1 << 7 | ec << 4 | q << 2; // SC uniform, EC, Q, ITC
     sb[4] = avi.vic;
     // Linux's bar fields: borders are zero, so bottom/right are total + 1.
     sb[8..10].copy_from_slice(&((t.v_total + 1) as u16).to_le_bytes());
@@ -413,9 +436,10 @@ impl<I: Io> Engine<I> {
         Ok(())
     }
     /// enc3_update_hdmi_info_packet(0, AVI), then (1, vendor) when the
-    /// timing has an HDMI VIC: DB disable, VPG power-on if gated, then per
-    /// packet a conflict clear, nine data words at its index, an immediate
-    /// update, and sending every frame on line 2. No AFMT audio clock.
+    /// timing has an HDMI VIC and (4, HDR DRM) while HDR metadata is set:
+    /// DB disable, VPG power-on if gated, then per packet a conflict clear,
+    /// nine data words at its index, an immediate update, and sending every
+    /// frame on line 2. No AFMT audio clock.
     async fn hdmi_avi(&mut self, plan: &mut HdmiLinkReady) -> Result<(), Error> {
         let l = self.layout;
         let stream = plan.request.stream;
@@ -427,38 +451,76 @@ impl<I: Io> Engine<I> {
             self.wait(vpg(0x206d), 0x100, 0, 1000).await?;
         }
         let timing = plan.blank.timing.request.timing;
-        let avi = avi_infoframe(
+        let avi = avi_infoframe_in(
             &timing,
             plan.request.avi,
-            plan.blank.request.limited,
+            plan.blank.request.colorspace,
             plan.blank.request.ycbcr420,
         );
         let vendor = vendor_infoframe(&timing, plan.request.avi);
-        for (index, packet) in [(0u32, Some(avi)), (1, vendor)] {
+        let hdr = plan.request.hdr.map(|p| p.bytes());
+        for (index, packet) in [(0u32, Some(avi)), (1, vendor), (4, hdr)] {
             let Some(packet) = packet else {
                 continue;
             };
-            self.wait(vpg(0x206c), 2, 0, 500).await?;
-            self.access(|io| {
-                // CONFLICT_CLR and the data port are commands, not state.
-                let status = checked(io.read(vpg(0x206c)))?;
-                io.write(vpg(0x206c), status | 0x10);
-                let access = checked(io.read(vpg(0x2068)))?;
-                io.write(vpg(0x2068), (access & !0xff) | (index * 9));
-                for word in packet.chunks_exact(4) {
-                    io.write(
-                        vpg(0x2069),
-                        u32::from_le_bytes([word[0], word[1], word[2], word[3]]),
-                    );
-                }
-                // Self-clearing: latch the double-buffered packet now.
-                let immediate = checked(io.read(vpg(0x206b)))?;
-                io.write(vpg(0x206b), immediate | 1 << index);
-                Ok(())
-            })?;
-            // GENERICn_SEND and _CONT, then its line (2).
+            self.hdmi_packet(stream, index, &packet).await?;
+            // GENERICn_SEND and _CONT, then its line (2): packets 0/1 in
+            // GENERIC_PACKET_CONTROL1, 4/5 in CONTROL3.
+            let line = if index < 2 { 15 } else { 17 };
+            let shift = 16 * (index % 2);
             self.hdmi_update(plan, 14, 3 << (4 * index), 3 << (4 * index))?;
-            self.hdmi_update(plan, 15, 0xffff << (16 * index), 2 << (16 * index))?;
+            self.hdmi_update(plan, line, 0xffff << shift, 2 << shift)?;
+        }
+        Ok(())
+    }
+    /// vpg3_update_generic_info_packet(index, packet, immediate) on stream
+    /// encoder `stream`'s VPG: a conflict clear, nine data words at the
+    /// packet's index, then the self-clearing immediate update.
+    async fn hdmi_packet(
+        &mut self,
+        stream: u8,
+        index: u32,
+        packet: &[u8; 36],
+    ) -> Result<(), Error> {
+        let l = self.layout;
+        let vpg = move |r| DpStream::Dio(stream).at(l, r);
+        self.wait(vpg(0x206c), 2, 0, 500).await?;
+        self.access(|io| {
+            // CONFLICT_CLR and the data port are commands, not state.
+            let status = checked(io.read(vpg(0x206c)))?;
+            io.write(vpg(0x206c), status | 0x10);
+            let access = checked(io.read(vpg(0x2068)))?;
+            io.write(vpg(0x2068), (access & !0xff) | (index * 9));
+            for word in packet.chunks_exact(4) {
+                io.write(
+                    vpg(0x2069),
+                    u32::from_le_bytes([word[0], word[1], word[2], word[3]]),
+                );
+            }
+            // Self-clearing: latch the double-buffered packet now.
+            let immediate = checked(io.read(vpg(0x206b)))?;
+            io.write(vpg(0x206b), immediate | 1 << index);
+            Ok(())
+        })
+    }
+    /// New HDR metadata on the running HDMI stream (amdgpu_dm's
+    /// hdr_static_metadata stream update): generic packet 4 rewritten with
+    /// an immediate update. Entering or leaving HDR is a modeset; only a
+    /// stream that already sends the packet takes new contents here.
+    pub(in crate::amdgpu_dcn401_otg) async fn hdmi_update_hdr(
+        &mut self,
+        packet: crate::amdgpu_hdr::InfoPacket,
+    ) -> Result<(), Error> {
+        let mut running = self.status.hdmi_video_running.ok_or(Error::Invalid)?;
+        if running.link.request.hdr.is_none() || !packet.valid {
+            return Err(Error::Invalid);
+        }
+        let stream = running.link.request.stream;
+        self.hdmi_packet(stream, 4, &packet.bytes()).await?;
+        running.link.request.hdr = Some(packet);
+        self.status.hdmi_video_running = Some(running);
+        if let Some(link) = self.status.hdmi_link_ready.as_mut() {
+            link.request.hdr = Some(packet);
         }
         Ok(())
     }
@@ -524,7 +586,7 @@ impl<I: Io> Engine<I> {
             depth,
             character_khz,
             scrambled: character_khz > TMDS_SCRAMBLE_KHZ,
-            controls: [0; 17],
+            controls: [0; 18],
             backend_routes: [0; 4],
             clock_route: 0,
             on: false,

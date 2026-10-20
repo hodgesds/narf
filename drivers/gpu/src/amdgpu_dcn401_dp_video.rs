@@ -277,6 +277,104 @@ impl<I: Io> Engine<I> {
         self.update(at(GSP11), 0x10, 0x10)?;
         self.update(at(SEC_CNTL), 1, 1)
     }
+    /// enc3_stream_encoder_update_dp_info_packets for the stream's VSC SDP
+    /// (packets 0 and 1, GSP0) and HDR metadata SDP (packet 3, GSP3):
+    /// vpg3_update_generic_info_packet with immediate update for each valid
+    /// packet, then the packet enables and the secondary stream master.
+    async fn dp_video_infopackets(&mut self, w: &Work) -> Result<(), Error> {
+        let r = w.frontend.request;
+        let vsc = crate::amdgpu_hdr::vsc_sdp(
+            r.vsc_colorimetry,
+            w.frontend.blank.request.colorspace,
+            crate::amdgpu_hdr::PixelEncoding::Rgb,
+            match w.frontend.blank.request.depth {
+                ColorDepth::Bpc8 => 8,
+                ColorDepth::Bpc10 => 10,
+                ColorDepth::Bpc12 => 12,
+            },
+            false,
+        );
+        if vsc.is_none() && r.hdr.is_none() {
+            return Ok(());
+        }
+        let l = self.layout;
+        let at = |reg| w.at(l, reg);
+        if self.read(at(0x206d))? & 0x100 != 0 {
+            self.update(at(0x206d), 0x11, 1)?;
+            self.wait(at(0x206d), 0x100, 0, 1000).await?;
+        }
+        for (index, packet) in [(0u32, vsc), (1, vsc), (3, r.hdr)] {
+            if let Some(p) = packet {
+                self.dp_packet(r.stream, index, p).await?;
+            }
+        }
+        self.update(at(SEC_CNTL), 1 << 20, u32::from(vsc.is_some()) << 20)?;
+        self.update(at(SEC_CNTL), 1 << 23, u32::from(r.hdr.is_some()) << 23)?;
+        if self.read(at(SEC_CNTL))? != 0 {
+            self.update(at(SEC_CNTL), 1, 1)?;
+        }
+        Ok(())
+    }
+    /// vpg3_update_generic_info_packet(index, packet, immediate) on DIO
+    /// stream encoder `stream`'s VPG.
+    async fn dp_packet(
+        &mut self,
+        stream: u8,
+        index: u32,
+        packet: crate::amdgpu_hdr::InfoPacket,
+    ) -> Result<(), Error> {
+        let l = self.layout;
+        let at = move |r| DpStream::Dio(stream).at(l, r);
+        self.wait(at(0x206c), 2, 0, 500).await?;
+        self.access(|io| {
+            // CONFLICT_CLR and the data port are commands, not state.
+            let status = checked(io.read(at(0x206c)))?;
+            io.write(at(0x206c), status | 0x10);
+            let access = checked(io.read(at(0x2068)))?;
+            io.write(at(0x2068), (access & !0xff) | (index * 9));
+            for word in packet.words() {
+                io.write(at(0x2069), word);
+            }
+            let immediate = checked(io.read(at(0x206b)))?;
+            io.write(at(0x206b), immediate | 1 << index);
+            Ok(())
+        })
+    }
+    /// enc3_stop_dp_info_packets for the VSC and HDR SDPs: their enables
+    /// off, the secondary master kept while another packet (audio, PPS)
+    /// still needs it.
+    fn dp_video_infopackets_off(&mut self, w: &Work) -> Result<(), Error> {
+        if w.frontend.request.sdp_enables() == 0 {
+            return Ok(());
+        }
+        let at = w.at(self.layout, SEC_CNTL);
+        self.update(at, 1 << 20 | 1 << 23, 0)?;
+        if self.read(at)? & !1 == 0 {
+            self.update(at, 1, 0)?;
+        }
+        Ok(())
+    }
+    /// New HDR metadata on the running DP stream (amdgpu_dm's
+    /// hdr_static_metadata stream update): packet 3 rewritten with an
+    /// immediate update. Entering or leaving HDR is a modeset; only a
+    /// stream that already sends the SDP takes new contents here.
+    pub(in crate::amdgpu_dcn401_otg) async fn dp_update_hdr(
+        &mut self,
+        packet: crate::amdgpu_hdr::InfoPacket,
+    ) -> Result<(), Error> {
+        let mut running = self.status.dp_video_running.ok_or(Error::Invalid)?;
+        if running.frontend.request.hdr.is_none() || !packet.valid {
+            return Err(Error::Invalid);
+        }
+        self.dp_packet(running.frontend.request.stream, 3, packet)
+            .await?;
+        running.frontend.request.hdr = Some(packet);
+        self.status.dp_video_running = Some(running);
+        if let Some(f) = self.status.dp_frontend_ready.as_mut() {
+            f.request.hdr = Some(packet);
+        }
+        Ok(())
+    }
     /// enc3_dp_set_dsc_pps_info_packet(false).
     fn dp_video_pps_off(&mut self, w: &Work) -> Result<(), Error> {
         if w.frontend.blank.timing.request.dsc.is_none() {
@@ -298,16 +396,23 @@ impl<I: Io> Engine<I> {
         w.timing = true;
         self.dp_video_verify(w)?;
         // link_set_dpms_on after enable_stream: the sink decodes DSC
-        // (dp_set_dsc_on_rx), then the PPS SDP, before unblanking.
+        // (dp_set_dsc_on_rx), then the PPS SDP, before unblanking. An MST
+        // stream's decoder sits behind the branch: the MST manager enabled
+        // it through its DSC AUX before the payload.
         if w.frontend.blank.timing.request.dsc.is_some() {
-            let path = w.frontend.link.phy.path;
-            write(io, path, DSC_ENABLE, &mut [1]).await?;
-            if read::<1>(io, path, DSC_ENABLE).await?[0] & 1 != 1 {
-                return Err(sink_readback(DSC_ENABLE));
+            if !w.frontend.link.phy.settings.mst {
+                let path = w.frontend.link.phy.path;
+                write(io, path, DSC_ENABLE, &mut [1]).await?;
+                if read::<1>(io, path, DSC_ENABLE).await?[0] & 1 != 1 {
+                    return Err(sink_readback(DSC_ENABLE));
+                }
             }
             self.dp_video_pps(&w).await?;
             self.dp_video_verify(w)?;
         }
+        // dcn20_update_info_frame before the unblank: VSC and HDR SDPs.
+        self.dp_video_infopackets(&w).await?;
+        self.dp_video_verify(w)?;
         // Native RGB stream/link ratio: no component-depth or lane multiplier.
         self.dp_video_mn(&mut w, 0, 0x100, 0)?;
         self.dp_video_mn(&mut w, 1, 0xffffff, NVID)?;
@@ -432,9 +537,13 @@ impl<I: Io> Engine<I> {
             // as Linux ignores it), then the PPS SDP; disable() turns the
             // OPTC's DSC and the DSC off before the timing.
             if frontend.blank.timing.request.dsc.is_some() {
-                let _ = write(io, path, DSC_ENABLE, &mut [0]).await;
+                // An MST stream's decoder is the manager's to stop.
+                if !frontend.link.phy.settings.mst {
+                    let _ = write(io, path, DSC_ENABLE, &mut [0]).await;
+                }
                 self.dp_video_pps_off(&w)?;
             }
+            self.dp_video_infopackets_off(&w)?;
             self.disable(frontend.request.pipe).await?;
             w.timing = false;
             self.dp_video_verify_route(w, false)?;
@@ -457,6 +566,51 @@ impl<I: Io> Engine<I> {
                 Err(e)
             }
         }
+    }
+}
+impl<I: Io> Engine<I> {
+    /// link_dpms.c enable_stream_features for a DP SST stream (8b/10b or
+    /// 128b/132b) running on `path`: read DP_DOWNSPREAD_CTRL, set or clear
+    /// IGNORE_MSA_TIMING_PARAM as the stream is VRR-capable, and write it back
+    /// only when it changed. True when written. Busy unless SST video (or a
+    /// scanout on it) runs on `path`; MST streams are refused (Linux defers
+    /// them to dm_helpers_mst_enable_stream_features).
+    pub(in crate::amdgpu_dcn401_otg) async fn dp_stream_features(
+        &mut self,
+        io: &mut impl Transport,
+        path: Path,
+        ignore_msa: bool,
+    ) -> Result<bool, Error> {
+        let s = &self.status;
+        let running = matches!(
+            s.state,
+            State::DpVideoRunning(_) | State::UhbrVideoRunning(_) | State::ScanoutRunning(_)
+        );
+        let dio = s
+            .dp_video_running
+            .map(|v| (v.frontend.link.phy.path, v.frontend.link.phy.settings.mst));
+        let hpo = s
+            .uhbr_video_running
+            .map(|v| (v.link.path, v.link.settings.mst));
+        let Some((_, mst)) = [dio, hpo].into_iter().flatten().find(|&(p, _)| p == path) else {
+            return Err(if running { Error::Invalid } else { Error::Busy });
+        };
+        if !running {
+            return Err(Error::Busy);
+        }
+        if mst {
+            return Err(Error::Unsupported);
+        }
+        use crate::amdgpu_freesync::{
+            DPCD_DOWNSPREAD_CTRL as AT, DPCD_IGNORE_MSA_TIMING_PARAM as BIT,
+        };
+        let old = read::<1>(io, path, AT).await?[0];
+        let new = if ignore_msa { old | BIT } else { old & !BIT };
+        if new == old {
+            return Ok(false);
+        }
+        write(io, path, AT, &mut [new]).await?;
+        Ok(true)
     }
 }
 impl Otg {
@@ -490,6 +644,23 @@ impl Otg {
             return Err(e);
         }
         Ok(running)
+    }
+    /// Set (or clear) the sink's IGNORE_MSA_TIMING_PARAM for the DP SST
+    /// stream running on `path`, after its video started, as Linux's
+    /// link_set_dpms_on does once the stream is unblanked; true when the
+    /// DPCD byte changed. Linux ignores AUX failures here; callers may too.
+    /// # Safety
+    /// Preserve start_dp_video's (or start_uhbr_video's) exclusive ownership.
+    pub(crate) async unsafe fn set_dp_ignore_msa(
+        &mut self,
+        io: &mut dmub::Dmub,
+        path: Path,
+        ignore_msa: bool,
+    ) -> Result<bool, Error> {
+        if !io.matches_display(self.0.io.0, self.0.layout.base) {
+            return Err(Error::Invalid);
+        }
+        self.0.dp_stream_features(io, path, ignore_msa).await
     }
     fn dp_video_clock(
         &mut self,

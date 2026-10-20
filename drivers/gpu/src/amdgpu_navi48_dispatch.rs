@@ -6,7 +6,7 @@
 //! lost, and terminal delivery replaces amdgpu_fence_driver_force_completion
 //! on a dead device. No IV payload ever completes work by itself, and a vector
 //! for an unregistered, retired or mismatched owner only increments a counter.
-use crate::{amdgpu_ih7 as ih, amdgpu_navi48_sources as src};
+use crate::{amdgpu_ih7 as ih, amdgpu_navi48_ras as ras, amdgpu_navi48_sources as src};
 use core::{
     future::Future,
     pin::Pin,
@@ -57,8 +57,9 @@ pub enum Terminal {
     DeviceGone,
     /// The interrupt service failed and stopped draining.
     Interrupts(ih::Error),
-    /// Poison/RAS consumption; Linux would reset the GPU.
-    Poison(src::Poison),
+    /// A RAS event after which Linux requests a mode-1 reset. Poison IVs
+    /// alone never reach this: Navi48's IPs leave them unhandled.
+    Ras(ras::Fatal),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaitError {
@@ -144,7 +145,14 @@ pub struct Counters {
     pub media: u64,
     pub power: u64,
     pub shader_messages: u64,
+    /// Client/source pairs with no Navi48 decoding at all.
     pub unknown: u64,
+    /// Decoded vectors Linux leaves without a handler on Navi48 (for example
+    /// VCN sources other than 119/160, JPEG on VCN1) or rejects as malformed
+    /// (an SDMA trap naming instance > 1 or a queue without a kernel ring).
+    pub unhandled: u64,
+    /// Poison/ECC vectors; amdgpu_navi48_ras decides what Linux does.
+    pub poison: u64,
     /// IH overflows: every waiter was woken to re-check its fence.
     pub lost: u64,
     /// Waiters that could not park and rely on the watchdog alone.
@@ -156,6 +164,10 @@ pub struct Summary {
     pub live: usize,
     pub counters: Counters,
     pub display: DisplayEvents,
+    /// The first and latest vectors counted as unowned, unattributed,
+    /// unknown or unhandled: evidence, never completion.
+    pub first_unmatched: Option<ih::Event>,
+    pub last_unmatched: Option<ih::Event>,
 }
 /// What one vector did, for diagnostics and models.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,7 +178,11 @@ pub enum Delivery {
     Unattributed,
     Terminal(Terminal),
     Display,
+    /// An expected vector with nothing to deliver (power, IH self, wave
+    /// messages, poison that Linux leaves unhandled).
     Ignored,
+    /// Unknown, unregistered or malformed: counted and kept as evidence.
+    Unhandled,
 }
 
 type Waiters = [Option<(u64, u32, Waker)>; WAITERS];
@@ -250,6 +266,8 @@ pub struct Table {
     display_waiters: Waiters,
     next_id: u64,
     counters: Counters,
+    first_unmatched: Option<ih::Event>,
+    last_unmatched: Option<ih::Event>,
 }
 impl Default for Table {
     fn default() -> Self {
@@ -280,9 +298,13 @@ impl Table {
                 power: 0,
                 shader_messages: 0,
                 unknown: 0,
+                unhandled: 0,
+                poison: 0,
                 lost: 0,
                 unparked: 0,
             },
+            first_unmatched: None,
+            last_unmatched: None,
         }
     }
     fn slot(&self, h: Handle) -> Result<&Slot, WaitError> {
@@ -300,9 +322,15 @@ impl Table {
         if let Some(t) = self.terminal {
             return Err(RegisterError::Terminal(t));
         }
+        // Linux kernel rings exist only at these identities: CP ME 0..2,
+        // SDMA instance 0/1 queue 0 (sdma_v7_0_process_trap_irq), VCN client
+        // instance 0/1, and JPEG 5.0.0 on the VCN client only.
         if owner.key == Key::Doorbell(0)
             || owner.vmid > 15
-            || matches!(owner.key, Key::Vcn { instance } | Key::Jpeg { instance } if instance > 1)
+            || matches!(owner.key, Key::Cp(q) if q.me > 2)
+            || matches!(owner.key, Key::Sdma { instance, queue } if instance > 1 || queue != 0)
+            || matches!(owner.key, Key::Vcn { instance } if instance > 1)
+            || matches!(owner.key, Key::Jpeg { instance } if instance != 0)
         {
             return Err(RegisterError::Invalid);
         }
@@ -406,7 +434,18 @@ impl Table {
             live: self.slots.iter().filter(|s| s.owner.is_some()).count(),
             counters: self.counters,
             display: self.display,
+            first_unmatched: self.first_unmatched,
+            last_unmatched: self.last_unmatched,
         }
+    }
+    fn unmatched(&mut self, event: &ih::Event) {
+        self.first_unmatched.get_or_insert(*event);
+        self.last_unmatched = Some(*event);
+    }
+    fn unhandled(&mut self, event: &ih::Event) -> Delivery {
+        self.counters.unhandled = self.counters.unhandled.saturating_add(1);
+        self.unmatched(event);
+        Delivery::Unhandled
     }
     fn find(&self, key: Key) -> Option<usize> {
         self.slots
@@ -449,7 +488,10 @@ impl Table {
                         && matches!(owner.key, Key::Vcn { .. } | Key::Jpeg { .. }) == mm
                 }
             } else {
+                // amdgpu_userq_process_reset_irq: a doorbell names a user
+                // queue only within the IV's address space.
                 keys.contains(&owner.key)
+                    && (!matches!(owner.key, Key::Doorbell(_)) || owner.pasid == v.pasid)
             };
             if attributed {
                 // Keep the first fault: later ones are usually consequences.
@@ -485,7 +527,7 @@ impl Table {
         if let Some(t) = self.terminal {
             return Delivery::Terminal(t);
         }
-        match class {
+        let delivery = match class {
             src::Class::Eop { queue, doorbell } => {
                 // gfx_v12_0_eop_irq: the exact kernel slot wins; only then
                 // does a non-zero doorbell name a user queue.
@@ -494,6 +536,11 @@ impl Table {
                 } else {
                     self.signal(&[Key::Cp(queue)], v)
                 }
+            }
+            // sdma_v7_0_process_trap_irq rejects instance > 1 and has a
+            // kernel ring only at queue 0.
+            src::Class::SdmaTrap { instance, queue } if instance > 1 || queue != 0 => {
+                self.unhandled(event)
             }
             src::Class::SdmaTrap { instance, queue } => {
                 self.signal(&[Key::Sdma { instance, queue }], v)
@@ -506,12 +553,13 @@ impl Table {
                 Delivery::Unowned
             }
             src::Class::Fault(f) => match f {
-                // amdgpu_gfx_handle_priv_fault: slot first, then the user
-                // queue doorbell carried in context ID 0.
+                // amdgpu_gfx_handle_priv_fault: a kernel ring at the slot
+                // takes the fault alone; only otherwise does the context-ID
+                // doorbell (AMDGPU_CTXID0_DOORBELL_ID_MASK) name a user queue.
                 src::Fault::Command { queue, .. } => {
                     let doorbell = v.data[0] & 0x3ff;
-                    if doorbell != 0 {
-                        self.fault(&[Key::Cp(queue), Key::Doorbell(doorbell)], v, f)
+                    if doorbell != 0 && self.find(Key::Cp(queue)).is_none() {
+                        self.fault(&[Key::Doorbell(doorbell)], v, f)
                     } else {
                         self.fault(&[Key::Cp(queue)], v, f)
                     }
@@ -521,9 +569,11 @@ impl Table {
                 } => self.fault(&[Key::Sdma { instance, queue }], v, f),
                 src::Fault::Vm { .. } | src::Fault::Shader { .. } => self.fault(&[], v, f),
             },
-            src::Class::Poison(p) => {
-                self.fail_all(Terminal::Poison(p));
-                Delivery::Terminal(Terminal::Poison(p))
+            // The service's RAS monitor runs Linux's handler (if any) first;
+            // a poison IV never completes, faults or terminates by itself.
+            src::Class::Poison(_) => {
+                self.counters.poison = self.counters.poison.saturating_add(1);
+                Delivery::Ignored
             }
             src::Class::Display(d) => self.display(d),
             src::Class::Media(media) => {
@@ -534,10 +584,11 @@ impl Table {
                         source: 119,
                     } => self.signal(&[Key::Vcn { instance }], v),
                     src::Media::Jpeg {
-                        instance,
+                        instance: 0,
                         source: 153,
-                    } => self.signal(&[Key::Jpeg { instance }], v),
-                    _ => Delivery::Ignored,
+                    } => self.signal(&[Key::Jpeg { instance: 0 }], v),
+                    // vcn_v5_0_0/jpeg_v5_0_0 register nothing else.
+                    _ => self.unhandled(event),
                 }
             }
             src::Class::Power => {
@@ -551,9 +602,14 @@ impl Table {
             src::Class::IhSelf => Delivery::Ignored,
             src::Class::Unknown => {
                 self.counters.unknown = self.counters.unknown.saturating_add(1);
-                Delivery::Ignored
+                self.unmatched(event);
+                Delivery::Unhandled
             }
+        };
+        if matches!(delivery, Delivery::Unowned | Delivery::Unattributed) {
+            self.unmatched(event);
         }
+        delivery
     }
     /// A VM protection latch found after lost vectors. Only its VMID is
     /// known, so every owner in that VMID on that hub is faulted.

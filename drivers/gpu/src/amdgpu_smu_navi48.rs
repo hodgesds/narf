@@ -24,8 +24,11 @@ const REQUIRED: u64 = (1 << 1) | (1 << 23) | (1 << 28) | (1 << 36);
 const DISPLAY: u64 = (1 << 3) | (1 << 4) | (1 << 5) | (1 << 7);
 // Keep boot display/memory/link clocks fixed until DCN owns their constraints.
 // SMU throttlers, fan/thermal shutdown and electrical protections stay enabled.
+// FEATURE_BACO_BIT (19): runtime PM's BACO/BAMACO needs PMFW's BACO feature
+// running (smu_v14_0_get_bamaco_support); Linux allows every feature.
 const ALLOWED: u64 = REQUIRED
     | (1 << 0)
+    | FEATURE_BACO
     | (1 << 25)
     | (1 << 26)
     | (1 << 27)
@@ -55,6 +58,35 @@ const DEEP_SLEEP_MEMORY_FABRIC: u64 = (1 << 11) | (1 << 12) | (1 << 13) | (1 << 
 const PPCLK_GFXCLK: u32 = 0;
 const PPCLK_UCLK: u32 = 2;
 const FEATURE_DPM_UCLK: u64 = 1 << 3;
+// smu_v14_0_2_ppsmc.h; checked by tests/smu14_baco.c.
+const MSG_ENTER_BACO: u32 = 0x15;
+const MSG_EXIT_BACO: u32 = 0x16;
+const MSG_ARM_D3: u32 = 0x17;
+// smu14_driver_if_v14_0.h FEATURE_BACO_BIT.
+const FEATURE_BACO: u64 = 1 << 19;
+// offsetof(struct smu_14_0_2_powerplay_table, platform_caps) and
+// SMU_14_0_2_PP_PLATFORM_CAP_BACO / _MACO (smu_v14_0_2_pptable.h).
+const PLATFORM_CAPS: usize = 32;
+const PLATFORM_CAP_BACO: u32 = 0x8;
+const PLATFORM_CAP_MACO: u32 = 0x10;
+/// amdgpu_smu.h `BACO_SUPPORT` / `MACO_SUPPORT`, as
+/// `amdgpu_device_supports_baco` returns them.
+pub const BACO_SUPPORT: u8 = 1;
+pub const MACO_SUPPORT: u8 = 2;
+/// amdgpu_smu.h `enum smu_baco_seq`, the EnterBaco / ArmD3 argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BacoSeq {
+    Baco = 0,
+    Msr = 1,
+    Bamaco = 2,
+    Ulps = 3,
+}
+/// `enum smu_baco_state`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BacoState {
+    Exit,
+    Enter,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Unsupported,
@@ -84,6 +116,13 @@ pub enum State {
     DisplayPowerReady,
     /// A runtime telemetry/DPM command is in flight; cancellation leaves it.
     Runtime,
+    /// PMFW accepted EnterBaco or ArmD3(BACO/BAMACO): only the matching
+    /// exit may follow.
+    Baco,
+    /// A BACO entry or exit message is in flight; cancellation leaves it.
+    BacoTransition,
+    /// BACO was exited: this owner retired; the next bring-up makes a new one.
+    BacoExited,
     Failed,
 }
 /// GFXCLK soft limits, Linux `smu_v14_0_set_performance_level` restricted to
@@ -261,6 +300,11 @@ struct Engine<I: Io> {
     /// PROTECTION bits running when boot power configuration completed.
     protection: u64,
     gfx_level: GfxLevel,
+    /// `smu_baco->state`.
+    baco: BacoState,
+    /// The features running after boot configuration (Linux's SUPPORTED
+    /// feature list, smu_smc_hw_setup).
+    boot_enabled: u64,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> T) -> Result<T, Error> {
@@ -444,6 +488,7 @@ impl<I: Io> Engine<I> {
         if let Ok(p) = result {
             self.power = Some(p);
             self.protection = p.enabled & PROTECTION;
+            self.boot_enabled = p.enabled;
         }
         result
     }
@@ -522,6 +567,126 @@ impl<I: Io> Engine<I> {
     fn protected(&self, enabled: u64) -> bool {
         self.power.is_some() && enabled & self.protection == self.protection
     }
+    /// The board table's `platform_caps` (read with the combo table).
+    fn platform_caps(&self) -> u32 {
+        if self.board.len() < PLATFORM_CAPS + 4 || self.features == 0 {
+            return 0;
+        }
+        u32_at(&self.board, PLATFORM_CAPS)
+    }
+    /// smu_v14_0_get_bamaco_support (smu_v14_0_2_check_powerplay_table
+    /// sets `platform_support` / `maco_support` from the platform caps).
+    /// "Supported" features are those running after boot configuration
+    /// (smu_feature_list SUPPORTED); "enabled" is the last observed mask.
+    fn bamaco_support(&self) -> u8 {
+        let caps = self.platform_caps();
+        if caps & PLATFORM_CAP_BACO == 0 {
+            return 0;
+        }
+        let support = if caps & PLATFORM_CAP_MACO != 0 {
+            MACO_SUPPORT
+        } else {
+            0
+        };
+        if self.baco == BacoState::Enter {
+            return support | BACO_SUPPORT;
+        }
+        let Some(power) = self.power else {
+            return 0;
+        };
+        if self.boot_enabled & FEATURE_BACO != 0 && power.enabled & FEATURE_BACO == 0 {
+            return 0;
+        }
+        support | BACO_SUPPORT
+    }
+    /// One BACO message from a powered owner (entry) or a BACO owner
+    /// (exit). A clean rejection restores the previous state; anything else
+    /// is terminal, and cancellation leaves `BacoTransition`.
+    async fn baco_message(
+        &mut self,
+        message: u32,
+        parameter: u32,
+        enter: bool,
+    ) -> Result<(), Error> {
+        let resume = self.state;
+        let allowed = if enter {
+            matches!(resume, State::PowerReady | State::DisplayPowerReady)
+        } else {
+            resume == State::Baco
+        };
+        if !allowed {
+            return Err(Error::Busy);
+        }
+        self.state = State::BacoTransition;
+        let result = self.command(message, parameter).await.map(|_| ());
+        self.state = match (&result, enter) {
+            (Ok(()), true) => State::Baco,
+            (Ok(()), false) => State::BacoExited,
+            (Err(Error::Rejected(_)), _) => resume,
+            (Err(_), _) => State::Failed,
+        };
+        result
+    }
+    /// smu_v14_0_baco_set_state: EnterBaco(BAMACO or BACO sequence) or
+    /// ExitBaco, nothing when already in that state.
+    async fn baco_set_state(&mut self, state: BacoState, bamaco: bool) -> Result<(), Error> {
+        if self.baco == state {
+            self.access(|_| ())?;
+            return Ok(());
+        }
+        match state {
+            BacoState::Enter => {
+                let seq = if bamaco {
+                    BacoSeq::Bamaco
+                } else {
+                    BacoSeq::Baco
+                };
+                self.baco_message(MSG_ENTER_BACO, seq as u32, true).await?
+            }
+            BacoState::Exit => self.baco_message(MSG_EXIT_BACO, 0, false).await?,
+        }
+        self.baco = state;
+        Ok(())
+    }
+    /// smu_v14_0_2_baco_enter (see `Smu::baco_enter`).
+    async fn baco_enter(&mut self, bamaco: bool, armd3: bool) -> Result<(), Error> {
+        if armd3 {
+            // smu_baco->maco_support, not the runtime mode, picks the sequence.
+            let seq = if self.platform_caps() & PLATFORM_CAP_MACO != 0 {
+                BacoSeq::Bamaco
+            } else {
+                BacoSeq::Baco
+            };
+            return self.baco_arm_d3(seq).await;
+        }
+        self.baco_set_state(BacoState::Enter, bamaco).await?;
+        // smu_v14_0_baco_enter: msleep(10).
+        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(10).as_instant()).await;
+        Ok(())
+    }
+    /// smu_v14_0_2_baco_exit (see `Smu::baco_exit`).
+    async fn baco_exit(&mut self, armd3: bool) -> Result<bool, Error> {
+        if armd3 {
+            // "Wait for PMFW handling for the Dstate change".
+            narf_time::SleepUntil::new(narf_time::Deadline::after_ms(10).as_instant()).await;
+            self.baco_arm_d3(BacoSeq::Ulps).await?;
+            return Ok(false);
+        }
+        self.baco_set_state(BacoState::Exit, false).await?;
+        Ok(true)
+    }
+    /// smu_v14_0_baco_set_armd3_sequence: ArmD3(seq); BACO/BAMACO arm the
+    /// entry PMFW performs on the next D3 transition, anything else exits.
+    async fn baco_arm_d3(&mut self, seq: BacoSeq) -> Result<(), Error> {
+        let enter = matches!(seq, BacoSeq::Baco | BacoSeq::Bamaco);
+        self.baco_message(MSG_ARM_D3, seq as u32, enter).await?;
+        self.baco = if enter {
+            BacoState::Enter
+        } else {
+            BacoState::Exit
+        };
+        Ok(())
+    }
     async fn running(&mut self) -> Result<u64, Error> {
         let low = u64::from(self.command(0xc, 0).await?);
         Ok(low | (u64::from(self.command(0xd, 0).await?) << 32))
@@ -547,6 +712,21 @@ impl<I: Io> Engine<I> {
             })
         }
         .await;
+        self.end_runtime(resume, &result);
+        result
+    }
+    /// Linux smu_v14_0_set_ppt_limit: PPT0 SetPptLimit in watts, which needs
+    /// the PPT feature (FEATURE_THROTTLERS_BIT on SMU14.0.2) running.
+    async fn set_ppt_limit(&mut self, watts: u32) -> Result<(), Error> {
+        let power = self.power.ok_or(Error::Invalid)?;
+        if power.enabled & (1 << 23) == 0 {
+            return Err(Error::Unsupported);
+        }
+        if watts == 0 || watts > 0xffff {
+            return Err(Error::Invalid);
+        }
+        let resume = self.begin_runtime()?;
+        let result = self.command(0x32, watts).await.map(|_| ());
         self.end_runtime(resume, &result);
         result
     }
@@ -751,6 +931,8 @@ impl Smu {
                 limits: None,
                 protection: 0,
                 gfx_level: GfxLevel::Auto,
+                baco: BacoState::Exit,
+                boot_enabled: 0,
             },
             // smu_v14_0_get_vbios_bootup_values: 10 kHz, used in MHz.
             boot_uclk_mhz: gpu
@@ -804,6 +986,12 @@ impl Smu {
     pub async fn set_gfx_level(&mut self, level: GfxLevel) -> Result<(), Error> {
         self.engine.set_gfx_level(level).await
     }
+    /// Set the AC PPT0 socket power limit (watts). The caller validates it
+    /// against `Limits::{ppt_min_w, ppt_max_w}`; every protection keeps
+    /// running and a clean PMFW rejection leaves the owner usable.
+    pub async fn set_ppt_limit(&mut self, watts: u32) -> Result<(), Error> {
+        self.engine.set_ppt_limit(watts).await
+    }
     /// SMU14 dGPU PowerUpVcn/PowerDownVcn for instance 0, with a fresh
     /// protection/static-clock policy check. No display or GFX clocks move.
     /// # Safety
@@ -818,6 +1006,37 @@ impl Smu {
     /// owner has proved JRBC/JMI retirement and excluded every submission.
     pub async unsafe fn set_jpeg_power(&mut self, enabled: bool) -> Result<PowerStatus, Error> {
         self.engine.set_jpeg_power(enabled).await
+    }
+    /// `amdgpu_device_supports_baco` (smu_v14_0_get_bamaco_support):
+    /// `BACO_SUPPORT` and/or `MACO_SUPPORT`, 0 without board BACO circuitry.
+    pub fn bamaco_support(&self) -> u8 {
+        self.engine.bamaco_support()
+    }
+    pub fn baco_state(&self) -> BacoState {
+        self.engine.baco
+    }
+    /// smu_v14_0_2_baco_enter. For runtime PM with the audio function
+    /// enabled (`armd3`), arm PMFW with ArmD3 (BAMACO when the board has
+    /// MACO circuitry, else BACO); PMFW enters on the next D3 of both
+    /// functions. Otherwise EnterBaco with the runtime mode's sequence
+    /// (`bamaco`), then the 10 ms of smu_v14_0_baco_enter.
+    ///
+    /// # Safety
+    /// Every engine, display, IH and CPU accessor of this GPU is quiesced,
+    /// client VRAM is evicted and PCI state was saved; until the matching
+    /// [`Self::baco_exit`] only the PCI layer touches the function.
+    pub async unsafe fn baco_enter(&mut self, bamaco: bool, armd3: bool) -> Result<(), Error> {
+        self.engine.baco_enter(bamaco, armd3).await
+    }
+    /// smu_v14_0_2_baco_exit: after the PCI layer restored D0, wait 10 ms
+    /// for PMFW's D-state handling and ArmD3(ULPS) (`armd3`), else
+    /// ExitBaco. Returns whether the caller must clear BIOS_SCRATCH_6/7
+    /// for the coming ASIC re-init (the ExitBaco path).
+    ///
+    /// # Safety
+    /// As [`Self::baco_enter`]; the PCI function is back in D0.
+    pub async unsafe fn baco_exit(&mut self, armd3: bool) -> Result<bool, Error> {
+        self.engine.baco_exit(armd3).await
     }
     /// Let PMFW enter one deep-sleep group. Disabled policy: nothing in narf
     /// calls this yet. Every failure is terminal.

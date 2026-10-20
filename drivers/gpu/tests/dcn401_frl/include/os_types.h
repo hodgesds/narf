@@ -11,4 +11,5 @@
 #define ASSERT(x) ((void)0)
 #define __maybe_unused __attribute__((unused))
 #define dc_assert_fp_enabled() ((void)0)
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #endif

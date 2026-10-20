@@ -89,6 +89,7 @@ fn fixture_with(
             depth,
             limited,
             ycbcr420: false,
+            colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(limited, false),
         },
         c,
     ))
@@ -154,7 +155,7 @@ fn io_settings() -> DpPhySettings {
     }
 }
 fn req(stream: u8, pipe: u8) -> DpFrontendRequest {
-    DpFrontendRequest { stream, pipe }
+    DpFrontendRequest::new(stream, pipe)
 }
 /// Limited-range RGB sets MSA MISC0 bit 3 (CEA dynamic range) beside the
 /// component depth, as dcn10 stream encoders do for COLOR_SPACE_SRGB_LIMITED.
@@ -525,7 +526,11 @@ fn dcn401_dp_frontend_admits_compressed_payload_on_the_trained_fec_link() -> Tes
         (132, true, ColorDepth::Bpc8, false),
         (192, true, ColorDepth::Bpc8, false),
         (128, false, ColorDepth::Bpc8, false),
-        (128, true, ColorDepth::Bpc10, false),
+        // Deeper input at the same compressed rate fits the same link (the
+        // OPP feeds the DSC the stream's depth, which its PPS codes).
+        (128, true, ColorDepth::Bpc10, true),
+        (128, true, ColorDepth::Bpc12, true),
+        (132, true, ColorDepth::Bpc10, false),
     ] {
         let cfg = crate::amdgpu_dsc::DscConfig {
             slices_h: 2,
@@ -535,6 +540,8 @@ fn dcn401_dp_frontend_admits_compressed_payload_on_the_trained_fec_link() -> Tes
             linebuf_depth: 11,
             version_minor: 2,
             ycbcr422_simple: false,
+            frl: None,
+            bpc: depth.bpc() as u8,
         };
         let (mut e, mut io, c) = fixture_with(0, 1, 2, depth, false, Some(cfg), false);
         run(e.stop_dp_link(&mut io, path(0))).unwrap();
@@ -636,4 +643,34 @@ fn dcn401_dp_frontend_stop_faults_keep_link_and_frontend_owned() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_dp_frontend_stop_faults_keep_link_and_frontend_owned
+);
+
+/// enc401_stream_encoder_dp_set_stream_attribute for a BT.2020 stream on a
+/// sink with VSC colorimetry: MISC0 keeps only the depth (the VSC SDP
+/// carries the colorimetry), MISC1 sets bit 6 and keeps the inherited
+/// bit 7; without VSC support bit 6 clears.
+fn dcn401_dp_frontend_signals_vsc_colorimetry_in_msa_misc1() -> TestResult {
+    for vsc in [true, false] {
+        let (mut e, mut io, c) = fixture_range(1, 2, 3, ColorDepth::Bpc10, false);
+        e.status.blanks[3].as_mut().unwrap().request.colorspace =
+            crate::amdgpu_hdr::DcColorSpace::Rgb2020Full;
+        let request = DpFrontendRequest {
+            vsc_colorimetry: vsc,
+            ..req(2, 3)
+        };
+        if run(e.prepare_dp_frontend(&mut io, path(1), request, c)).is_err() {
+            return TestResult::Fail("BT.2020 frontend");
+        }
+        let regs = &e.io.fake().regs;
+        if regs[&dio(2, 0x2120)] != (2 << 5) << 24
+            || regs[&dio(2, 0x2124)] != 0x12345680 | u32::from(vsc) << 6
+        {
+            return TestResult::Fail("BT.2020 MSA MISC");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_dp_frontend_signals_vsc_colorimetry_in_msa_misc1
 );

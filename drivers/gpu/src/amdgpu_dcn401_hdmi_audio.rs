@@ -25,12 +25,16 @@ use super::*;
 mod frl_audio;
 #[path = "amdgpu_dcn401_uhbr_audio.rs"]
 mod uhbr_audio;
+#[cfg(feature = "kernel-test")]
 pub(crate) use uhbr_audio::uhbr_audio_info;
+pub(crate) use uhbr_audio::uhbr_audio_info_with;
 #[path = "amdgpu_dcn401_dp_audio_bw.rs"]
 mod bandwidth;
 #[path = "amdgpu_dcn401_mst_audio.rs"]
 mod mst_audio;
+#[cfg(feature = "kernel-test")]
 pub(crate) use mst_audio::mst_audio_info;
+pub(crate) use mst_audio::mst_audio_info_with;
 pub use mst_audio::MstAudioPayload;
 
 /// One CEA Short Audio Descriptor, as amdgpu_dm copies it from the EDID.
@@ -851,10 +855,12 @@ impl<I: Io> Engine<I> {
         let pps = u32::from(frontend.blank.timing.request.dsc.is_some());
         self.dp_audio_pps_verify(&frontend)?;
         let at = |r| DpStream::Dio(frontend.request.stream).at(self.layout, r);
+        // The video's VSC/HDR SDPs hold GSP0/GSP3 and the master.
+        let sdp = frontend.request.sdp_enables();
         for (reg, mask, value) in [
             (at(AFMT_CNTL), 1, pps),
             (at(AFMT_PACKET), 1, 0),
-            (at(DP_SEC_CNTL), 0x1ff1_1111, pps),
+            (at(DP_SEC_CNTL), 0x1ff1_1111, pps | sdp),
         ] {
             if self.read(reg)? & mask != value {
                 return Err(Error::Busy);

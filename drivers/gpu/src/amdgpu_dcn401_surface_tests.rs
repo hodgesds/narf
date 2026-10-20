@@ -50,6 +50,11 @@ impl Io for SurfaceIo {
     }
 }
 fn fixture(p: u8, bytes: usize) -> (Vec<u32>, Pool, Engine<SurfaceIo>, Surfaces) {
+    fixture_pipes(p, 0, bytes)
+}
+/// `fixture` with the pipes in `extra` powered and retired too, ready for
+/// overlay planes.
+fn fixture_pipes(p: u8, extra: u8, bytes: usize) -> (Vec<u32>, Pool, Engine<SurfaceIo>, Surfaces) {
     let mut backing = vec![0xdeadbeef; (bytes + 4096) / 4];
     let map = MmioRegion {
         phys: narf_memory::PhysAddr::new(0x90000000),
@@ -60,33 +65,17 @@ fn fixture(p: u8, bytes: usize) -> (Vec<u32>, Pool, Engine<SurfaceIo>, Surfaces)
     // SAFETY: model memory backed by the returned heap vector. Fake never
     // performs DMA; the vector outlives all CPU accesses in each test.
     let pool = unsafe { Pool::from_owned_range(map, 0x8_0010_2000) }.unwrap();
-    let mut e = planes(0xf ^ (1 << p));
+    let pipes = 1 << p | extra;
+    let mut e = planes(0xf & !pipes);
     run(e.retire_planes()).unwrap();
     e.io.writes.clear();
     e.io.stall = 512 | 1024;
     e.io.regs.insert(e.layout.nbio + 0x12d * 4, 0x7f000);
-    for (r, value) in [
-        (0x5e5, 0x40000f7f),
-        (0x5e7, 0x40000087),
-        (0x607, 0x4000abcd),
-        (0x612, 0x40000313),
-        (0x66d, 0x40f08000),
-        (0x5e6, 0x13579),
-        (0x5eb, 0x40014001),
-        (0x5e9, 0x10001),
-        (0x5ef, 0x40014001),
-        (0x5ee, 0x10001),
-        (0x5ed, 0x40014001),
-        (0x5ec, 0x10001),
-        (0x5f1, 0x40014001),
-        (0x5f0, 0x10001),
-        (0x609, 0x4000000f),
-        (0x613, 0x400130f2),
-        (0x614, 0x40000600),
-        (0x60a, 0x12340000),
-        (0x60b, 0x40000123),
-    ] {
-        e.io.regs.insert(h(p, r), value);
+    for (q, (r, value)) in (0..4u8)
+        .filter(|q| pipes & 1 << q != 0)
+        .flat_map(|q| HUBP_SEEDS.into_iter().map(move |seed| (q, seed)))
+    {
+        e.io.regs.insert(h(q, r), value);
     }
     let engine = Engine {
         io: SurfaceIo {
@@ -102,15 +91,251 @@ fn fixture(p: u8, bytes: usize) -> (Vec<u32>, Pool, Engine<SurfaceIo>, Surfaces)
     };
     (backing, pool, engine, Surfaces::new())
 }
+/// Each fixture pipe's inherited HUBP surface registers.
+const HUBP_SEEDS: [(u64, u32); 19] = [
+    (0x5e5, 0x40000f7f),
+    (0x5e7, 0x40000087),
+    (0x607, 0x4000abcd),
+    (0x612, 0x40000313),
+    (0x66d, 0x40f08000),
+    (0x5e6, 0x13579),
+    (0x5eb, 0x40014001),
+    (0x5e9, 0x10001),
+    (0x5ef, 0x40014001),
+    (0x5ee, 0x10001),
+    (0x5ed, 0x40014001),
+    (0x5ec, 0x10001),
+    (0x5f1, 0x40014001),
+    (0x5f0, 0x10001),
+    (0x609, 0x4000000f),
+    (0x613, 0x400130f2),
+    (0x614, 0x40000600),
+    (0x60a, 0x12340000),
+    (0x60b, 0x40000123),
+];
 fn req(pipe: u8) -> SurfaceRequest {
     SurfaceRequest {
+        surface: Default::default(),
         pipe,
         width: 65,
         height: 3,
         format: SurfaceFormat::Xrgb8888,
-        odm: None,
+        odm: SplitPipes::NONE,
+        mpc: SplitPipes::NONE,
+        plane: None,
     }
 }
+
+/// Each format as Linux programs it, written out from
+/// amdgpu_dm_plane_fill_dc_plane_info_and_addr (fourcc to DC format),
+/// hubp2_program_pixel_format (SURFACE_PIXEL_FORMAT and the HUBPRET
+/// CROSSBAR_SRC_CB_B/CR_R fields, shifts 20/22 in dcn_4_1_0_sh_mask.h),
+/// dpp401_dpp_setup (CNVC_SURFACE_PIXEL_FORMAT, FORMAT_CONTROL ALPHA_EN)
+/// and amdgpu_dm_plane_fill_blending_from_plane_state's alpha_formats with
+/// the default pre-multiplied blend mode: (format, fourcc, bytes per pixel,
+/// SURFACE_PIXEL_FORMAT, crossbar, CNVC format, ALPHA_EN, per-pixel alpha).
+pub(super) type LinuxFormat = (SurfaceFormat, u32, u32, u32, u32, u32, u32, bool);
+pub(super) const LINUX_FORMATS: [LinuxFormat; 13] = [
+    (
+        SurfaceFormat::Xrgb8888,
+        0x3432_5258,
+        4,
+        8,
+        0xe00000,
+        8,
+        1,
+        false,
+    ),
+    (
+        SurfaceFormat::Argb8888,
+        0x3432_5241,
+        4,
+        8,
+        0xe00000,
+        8,
+        1,
+        true,
+    ),
+    (
+        SurfaceFormat::Xbgr8888,
+        0x3432_4258,
+        4,
+        8,
+        0xb00000,
+        8,
+        1,
+        false,
+    ),
+    (
+        SurfaceFormat::Abgr8888,
+        0x3432_4241,
+        4,
+        8,
+        0xb00000,
+        8,
+        1,
+        true,
+    ),
+    (
+        SurfaceFormat::Xrgb2101010,
+        0x3033_5258,
+        4,
+        10,
+        0xe00000,
+        10,
+        1,
+        false,
+    ),
+    (
+        SurfaceFormat::Argb2101010,
+        0x3033_5241,
+        4,
+        10,
+        0xe00000,
+        10,
+        1,
+        true,
+    ),
+    (
+        SurfaceFormat::Xbgr2101010,
+        0x3033_4258,
+        4,
+        10,
+        0xb00000,
+        10,
+        1,
+        false,
+    ),
+    (
+        SurfaceFormat::Abgr2101010,
+        0x3033_4241,
+        4,
+        10,
+        0xb00000,
+        10,
+        1,
+        true,
+    ),
+    (
+        SurfaceFormat::Rgb565,
+        0x3631_4752,
+        2,
+        3,
+        0xe00000,
+        3,
+        0,
+        false,
+    ),
+    (
+        SurfaceFormat::Xrgb16161616f,
+        0x4834_5258,
+        8,
+        24,
+        0xe00000,
+        24,
+        1,
+        false,
+    ),
+    (
+        SurfaceFormat::Argb16161616f,
+        0x4834_5241,
+        8,
+        24,
+        0xe00000,
+        24,
+        1,
+        true,
+    ),
+    (
+        SurfaceFormat::Xbgr16161616f,
+        0x4834_4258,
+        8,
+        24,
+        0xb00000,
+        25,
+        1,
+        false,
+    ),
+    // Linux's alpha_formats omits ABGR16161616F: it blends opaque.
+    (
+        SurfaceFormat::Abgr16161616f,
+        0x4834_4241,
+        8,
+        24,
+        0xb00000,
+        25,
+        1,
+        false,
+    ),
+];
+
+/// Every format's fourcc, depth, linear pitch and HUBP words, and the
+/// word-granular row upload at each depth.
+fn dcn401_surface_programs_every_format_as_linux() -> TestResult {
+    for (format, fourcc, bpp, hubp, crossbar, _, _, alpha) in LINUX_FORMATS {
+        assert_eq!(SurfaceFormat::from_fourcc(fourcc), Some(format));
+        assert_eq!(format.fourcc(), fourcc);
+        assert_eq!(format.bytes_per_pixel(), bpp);
+        assert_eq!(format.per_pixel_alpha(), alpha);
+        // 65 pixels: 130, 260 or 520 bytes, each rounded up to 256.
+        let pitch = match bpp {
+            2 => 256,
+            4 => 512,
+            _ => 768,
+        };
+        let p = 1;
+        let (_backing, pool, mut e, mut surfaces) = fixture(p, 8192);
+        let request = SurfaceRequest { format, ..req(p) };
+        let applied = run(surfaces.prepare(&mut e, &pool, request)).unwrap();
+        assert_eq!(applied.pitch_bytes, pitch);
+        assert_eq!(applied.bytes, 3 * u64::from(pitch));
+        for (r, expected) in [
+            (0x5e5, 0x40000000 | hubp),
+            (0x607, 0x40000000 | (pitch / bpp - 1)),
+            (0x66d, 0x40008000 | crossbar),
+            (0x5eb, 0x40034041),
+        ] {
+            assert_eq!(e.io.inner.regs[&h(p, r)], expected);
+        }
+        // Words start on a word and stay within the row's pixels.
+        let words = (65 * bpp).div_ceil(4) as usize;
+        let row = alloc::vec![0x0102_0304u32; words];
+        assert_eq!(surfaces.upload(&mut e, p, 0, 1, &row), Ok(()));
+        let more = alloc::vec![0u32; words + 1];
+        assert_eq!(surfaces.upload(&mut e, p, 0, 1, &more), Err(Error::Invalid));
+        // SAFETY: reads stay inside the test's owned heap mapping.
+        let last = unsafe { e.io.map.read32(u64::from(pitch) + 4 * (words as u64 - 1)) };
+        assert_eq!(last, 0x0102_0304);
+        // SAFETY: as above; the padding past the row stays cleared.
+        let padding = unsafe { e.io.map.read32(u64::from(pitch) + 4 * words as u64) };
+        assert_eq!(padding, 0);
+        if bpp == 2 {
+            assert_eq!(surfaces.upload(&mut e, p, 1, 1, &[1]), Err(Error::Invalid));
+            assert_eq!(surfaces.upload(&mut e, p, 64, 1, &[1]), Ok(()));
+            assert_eq!(
+                surfaces.upload(&mut e, p, 64, 1, &[1, 2]),
+                Err(Error::Invalid)
+            );
+        }
+        if bpp == 8 {
+            assert_eq!(surfaces.upload(&mut e, p, 64, 1, &[1, 2]), Ok(()));
+            assert_eq!(
+                surfaces.upload(&mut e, p, 64, 1, &[1, 2, 3]),
+                Err(Error::Invalid)
+            );
+        }
+        drop(surfaces);
+        assert_eq!(pool.available(), 4096);
+    }
+    for fourcc in [0, 0x3432_5241 ^ 1, 0x3834_5258 /* XR48 */] {
+        assert_eq!(SurfaceFormat::from_fourcc(fourcc), None);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-surface",
+    dcn401_surface_programs_every_format_as_linux
+);
 
 fn dcn401_surface_stages_owned_padded_rgb_on_every_pipe() -> TestResult {
     for p in 0..4 {
@@ -139,8 +364,8 @@ fn dcn401_surface_stages_owned_padded_rgb_on_every_pipe() -> TestResult {
                 (0x5ef, 0x40034041),
                 (0x5e9, 0),
                 (0x5ee, 0),
-                (0x5ed, 0x40004000),
-                (0x5f1, 0x40004000),
+                (0x5ed, 0x40034041),
+                (0x5f1, 0x40034041),
                 (0x5ec, 0),
                 (0x5f0, 0),
                 (0x609, 0x40000000),
@@ -549,4 +774,182 @@ fn dcn401_surface_reclaims_staged_buffers_and_restarts_without_vram_growth() -> 
 kernel_test_in!(
     "drivers/gpu/dcn401-release",
     dcn401_surface_reclaims_staged_buffers_and_restarts_without_vram_growth
+);
+
+/// A tiled and DCC NV12 / P010 surface (amdgpu_dm_plane_fill_gfx12_attrs_from_modifiers
+/// and hubp401_program_surface_config / flip_and_addr): SW_MODE the GFX12
+/// swizzle, PRIMARY/SECONDARY_SURFACE_DCC_EN set, PITCH and PITCH_C in
+/// pixels less one, the VIDEO_420 pixel format, and the chroma address
+/// (behind the luma at a block-aligned offset) written before the luma's.
+/// Each plane's layout is the minimum amdgpu_display_verify_sizes takes for
+/// a framebuffer of that size and modifier.
+fn dcn401_surface_stages_tiled_dcc_video() -> TestResult {
+    use crate::amdgpu_dcn401_otg::{DccBlock, PlaneSurface, Swizzle, Tiling};
+    use crate::amdgpu_dm_modifiers as m;
+    let tiling = Tiling {
+        swizzle: Swizzle::S64K2D,
+        dcc: Some(DccBlock::B128),
+    };
+    for (format, hubp, luma_cpp, chroma_cpp) in [
+        (SurfaceFormat::Nv12, 64, 1, 2),
+        (SurfaceFormat::P010, 66, 2, 4),
+    ] {
+        let p = 2;
+        let request = SurfaceRequest {
+            width: 64,
+            height: 16,
+            format,
+            surface: PlaneSurface {
+                tiling,
+                ..PlaneSurface::LINEAR
+            },
+            ..req(p)
+        };
+        let b = request.bytes();
+        // 64K_2D blocks: 256x256 at 1 byte, 256x128 at 2, 128x128 at 4.
+        let (pitch, chroma_pitch) = (256 * luma_cpp, 512);
+        assert_eq!(b.pitch_bytes, pitch);
+        assert_eq!(b.chroma, Some((65536, chroma_pitch)));
+        assert_eq!(b.bytes, 2 * 65536);
+        // The same layout as a framebuffer passes amdgpu's size checks.
+        let info = m::format_info(format.fourcc()).unwrap();
+        let mut cmd = m::FbCmd {
+            width: 64,
+            height: 16,
+            pixel_format: format.fourcc(),
+            flags: m::FB_MODIFIERS,
+            ..Default::default()
+        };
+        cmd.handles[..2].copy_from_slice(&[1, 1]);
+        cmd.pitches[..2].copy_from_slice(&[pitch, chroma_pitch]);
+        cmd.offsets[1] = 65536;
+        cmd.modifier[..2].copy_from_slice(&[tiling.modifier(); 2]);
+        assert_eq!(
+            m::verify_sizes(&info, &cmd, tiling.modifier(), b.bytes),
+            Ok(())
+        );
+        assert!(m::verify_sizes(&info, &cmd, tiling.modifier(), b.bytes - 1).is_err());
+        let (_backing, pool, mut e, mut surfaces) = fixture(p, 2 * 65536 + 8192);
+        let applied = run(surfaces.prepare(&mut e, &pool, request)).unwrap();
+        assert_eq!((applied.pitch_bytes, applied.bytes), (pitch, b.bytes));
+        let chroma = applied.address + 65536;
+        for (r, mask, value) in [
+            (0x5e7, 7, 3),
+            (0x612, 0x213, 0x202),
+            (0x607, 0xffff, pitch / luma_cpp - 1),
+            (0x608, 0xffff, chroma_pitch / chroma_cpp - 1),
+            (0x5e5, 0x17f, hubp),
+            (0x60c, u32::MAX, chroma as u32),
+            (0x60d, 0xffff, (chroma >> 32) as u32),
+            (0x60a, u32::MAX, applied.address as u32),
+        ] {
+            assert_eq!(e.io.inner.regs[&h(p, r)] & mask, value, "reg {r:#x}");
+        }
+        // hubp401_program_surface_flip_and_addr's order: chroma high, chroma
+        // low, luma high, luma low.
+        let order: Vec<u64> =
+            e.io.inner
+                .writes
+                .iter()
+                .map(|&(at, _)| at)
+                .filter(|&at| (0x60a..=0x60d).any(|r| at == h(p, r)))
+                .collect();
+        assert_eq!(
+            order[order.len() - 4..],
+            [h(p, 0x60d), h(p, 0x60c), h(p, 0x60b), h(p, 0x60a)]
+        );
+        drop(surfaces);
+    }
+    // A DCC modifier on a linear swizzle is not one the planes list.
+    assert_eq!(
+        Tiling::from_modifier(
+            Tiling {
+                swizzle: Swizzle::Linear,
+                dcc: Some(DccBlock::B64)
+            }
+            .modifier()
+        ),
+        None
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-surface",
+    dcn401_surface_stages_tiled_dcc_video
+);
+
+/// A tiled surface turned 90 or 270 degrees: hubp2_program_rotation's
+/// ROTATION_ANGLE (1 or 3, no H_MIRROR_EN: amdgpu_dm never mirrors) beside
+/// the pixel format, and hubp401_set_viewport's viewport in surface space
+/// (SPL's orthogonal viewport, 64x32 for a 64x32 source shown 32x64). DML
+/// scans it vertically. A linear surface turned so, or a 90/270 plane
+/// without a layout's tiling, is `Unsupported` before anything is touched.
+fn dcn401_surface_stages_rotated_tiled_planes() -> TestResult {
+    use crate::amdgpu_dcn401_otg::{DccBlock, PlaneLayout, PlaneSurface, Swizzle, Tiling};
+    use crate::amdgpu_dcn401_spl::{Rect, Rotation};
+    let tiling = Tiling {
+        swizzle: Swizzle::S64K2D,
+        dcc: Some(DccBlock::B256),
+    };
+    let request = |rotation, tiling| SurfaceRequest {
+        width: 64,
+        height: 32,
+        surface: PlaneSurface {
+            tiling,
+            ..PlaneSurface::LINEAR
+        },
+        plane: Some(PlaneLayout {
+            src: Rect::new(0, 0, 64, 32),
+            dst: Rect::new(100, 50, 32, 64),
+            stream_width: 1920,
+            stream_height: 1080,
+            ycbcr420: false,
+            rotation,
+            blend: Blend::default_for(SurfaceFormat::Xrgb8888),
+            underlay: false,
+        }),
+        ..req(1)
+    };
+    for (rotation, angle) in [(Rotation::R90, 1), (Rotation::R270, 3)] {
+        let r = request(rotation, tiling);
+        if r.check().is_err() || !r.dml_plane().vertical_scan {
+            return TestResult::Fail("rotated tiled plane refused");
+        }
+        let scaler = r.scalers().next().unwrap().1;
+        if (scaler.viewport.width, scaler.viewport.height) != (64, 32)
+            || (scaler.recout.width, scaler.recout.height) != (32, 64)
+        {
+            return TestResult::Fail("rotated viewport and recout");
+        }
+        let (_backing, pool, mut e, mut surfaces) = fixture(1, 65536 + 8192);
+        let Ok(applied) = run(surfaces.prepare(&mut e, &pool, r)) else {
+            return TestResult::Fail("rotated tiled plane not staged");
+        };
+        if applied.bytes != 65536 {
+            return TestResult::Fail("rotated tiled bytes");
+        }
+        let reg = |at: u64, mask: u32| e.io.inner.regs[&h(1, at)] & mask;
+        if reg(0x5e5, 0xf7f) != 8 | angle << 8
+            || reg(0x5e7, 7) != Swizzle::S64K2D as u32
+            || reg(0x612, 0x202) != 0x202
+            || reg(0x5eb, 0x3fff_3fff) != 32 << 16 | 64
+            || reg(0x5e9, u32::MAX) != 0
+        {
+            return TestResult::Fail("rotated HUBP surface registers");
+        }
+        drop(surfaces);
+        let linear = request(rotation, Tiling::LINEAR);
+        let (_backing, pool, mut e, mut surfaces) = fixture(1, 65536 + 8192);
+        if linear.check() != Err(Error::Unsupported)
+            || run(surfaces.prepare(&mut e, &pool, linear)) != Err(Error::Unsupported)
+            || !e.io.inner.writes.is_empty()
+        {
+            return TestResult::Fail("rotated linear plane staged");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-surface",
+    dcn401_surface_stages_rotated_tiled_planes
 );

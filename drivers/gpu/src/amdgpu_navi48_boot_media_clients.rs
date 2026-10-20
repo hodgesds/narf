@@ -18,6 +18,32 @@ impl ColdBoot {
         }
         vcn.fence_reader()
     }
+    /// Codec directions whose native proof passed on rings clients can use
+    /// now, as `amdgpu_video_caps_navi48` bits.
+    pub(crate) fn proven_video(&self) -> u8 {
+        use crate::amdgpu_video_caps_navi48 as caps;
+        let mut proven = 0;
+        if let Some(vcn) = self
+            .sequence
+            .backend
+            .vcn
+            .as_ref()
+            .filter(|_| self.client_media_fence_reader().is_some())
+        {
+            if matches!(vcn.decode_result(), Some(Ok(_))) {
+                proven |= caps::AVC_DECODE;
+            }
+            if matches!(vcn.encode_result(), Some(Ok(_))) {
+                proven |= caps::AVC_ENCODE;
+            }
+        }
+        if self.client_jpeg_fence_reader().is_some()
+            && matches!(self.media_jpeg_decode_result(), Some(Ok(_)))
+        {
+            proven |= caps::JPEG_DECODE;
+        }
+        proven
+    }
     pub(crate) fn client_media_owner(&self) -> Option<dispatch::Handle> {
         self.sequence.backend.vcn_owner
     }
@@ -66,6 +92,12 @@ impl ColdBoot {
         }
         let hw = &mut self.sequence.backend;
         hw.media_test = Some(Err(Error::Busy));
+        if hw.media_jpeg_clients && hw.jpeg_owner.is_some() {
+            // VCN's stop closes the shared NBIO range; retire JPEG first.
+            // SAFETY: the caller froze the JPEG ledger too; its jobs keep
+            // their staged slots and mappings for replay after re-proof.
+            unsafe { hw.retire_client_jpeg().await }?;
+        }
         let vcn = hw.vcn.as_mut().ok_or(Error::Invalid)?;
         let smu = hw.smu.as_mut().ok_or(Error::Invalid)?;
         // SAFETY: all publishers are excluded and pending resources remain
@@ -100,6 +132,7 @@ impl ColdBoot {
         let encode = hw.media_encode_required;
         let jpeg = hw.media_jpeg_required;
         let jpeg_decode = hw.media_jpeg_decode_required;
+        let jpeg_clients = hw.media_jpeg_clients;
         // SAFETY: coordinated re-arm completed, media registration retained,
         // native transport drained and independent IH service remains active.
         let result = async {
@@ -128,7 +161,7 @@ impl ColdBoot {
                 let doorbells =
                     unsafe { mes::map_doorbells(&hw.pci, &hw.authority) }.map_err(Error::Mes)?;
                 // SAFETY: registered media, retained GMC and active IH route.
-                unsafe { hw.prove_jpeg(doorbells, jpeg_decode).await }?;
+                unsafe { hw.prove_jpeg(doorbells, jpeg_decode, jpeg_clients).await }?;
             }
             Ok(proof)
         }
@@ -147,5 +180,87 @@ impl ColdBoot {
         // its retained registration and new transport now support the proof.
         let proof = unsafe { self.reprove_client_media().await }?;
         Ok(proof.fence.sequence)
+    }
+    pub(crate) fn client_jpeg_fence_reader(
+        &self,
+    ) -> Option<crate::amdgpu_jpeg_navi48::FenceReader> {
+        let hw = &self.sequence.backend;
+        if !self.media_submission_ready() || !hw.media_jpeg_clients || hw.jpeg_owner.is_none() {
+            return None;
+        }
+        hw.jpeg_test?.ok()?;
+        hw.jpeg.as_ref()?.fence_reader()
+    }
+    pub(crate) fn client_jpeg_owner(&self) -> Option<dispatch::Handle> {
+        let hw = &self.sequence.backend;
+        hw.media_jpeg_clients.then_some(hw.jpeg_owner).flatten()
+    }
+    /// # Safety
+    /// A coordinated recovery receipt retired and renewed this JPEG owner.
+    pub(crate) unsafe fn jpeg_rearmed(&mut self, handle: dispatch::Handle) {
+        let hw = &mut self.sequence.backend;
+        assert!(hw.jpeg_owner.is_some() && hw.media_jpeg_clients);
+        hw.jpeg_owner = Some(handle);
+    }
+    fn jpeg_clients_open(&self) -> bool {
+        self.state() == State::MemoryReady
+            && self.media_submission_ready()
+            && !crate::amdgpu_navi48_interrupts::blocked()
+            && self.client_jpeg_owner().is_some()
+            && self.sequence.backend.jpeg_test.is_some_and(|r| r.is_ok())
+            && self.media_jpeg_state() == Some(crate::amdgpu_jpeg_navi48::State::Clients)
+    }
+    /// # Safety
+    /// OWNER serializes staging; the slot's previous job has completed and
+    /// the slot stays reserved for the job that is published next.
+    pub(crate) unsafe fn stage_client_jpeg(
+        &mut self,
+        slot: usize,
+        copies: &[alloc::vec::Vec<u32>],
+    ) -> Result<alloc::vec::Vec<(u64, u32)>, crate::amdgpu_jpeg_navi48::Error> {
+        if !self.jpeg_clients_open() {
+            return Err(crate::amdgpu_jpeg_navi48::Error::Busy);
+        }
+        let jpeg = self.sequence.backend.jpeg.as_mut();
+        // SAFETY: forwarded caller contract.
+        unsafe {
+            jpeg.ok_or(crate::amdgpu_jpeg_navi48::Error::Busy)?
+                .stage(slot, copies)
+        }
+    }
+    /// # Safety
+    /// OWNER serializes publication. The caller lends a distinct MMHUB VMID,
+    /// the staged slot and the job's VM/BO backing until its fence passes or
+    /// a reset proves the engine cannot access them again.
+    pub(crate) unsafe fn submit_client_jpeg_job(
+        &mut self,
+        job: crate::amdgpu_gfx12_queue::Job,
+    ) -> Result<u32, crate::amdgpu_jpeg_navi48::Error> {
+        if !self.jpeg_clients_open() {
+            return Err(crate::amdgpu_jpeg_navi48::Error::Busy);
+        }
+        let jpeg = self.sequence.backend.jpeg.as_mut();
+        // SAFETY: forwarded caller contract.
+        unsafe {
+            jpeg.ok_or(crate::amdgpu_jpeg_navi48::Error::Busy)?
+                .submit(job)
+        }
+    }
+    /// JPEG-only ring reset (jpeg_v5_0_0_ring_reset): retire, power-cycle,
+    /// restart and re-prove in place, then reopen clients. VCN keeps running.
+    /// # Safety
+    /// OWNER excludes publishers/PM, the JPEG ledger is frozen and keeps
+    /// every pending job's slot and mappings through failure/cancellation.
+    pub(crate) async unsafe fn recover_client_jpeg(&mut self) -> Result<u32, Error> {
+        // SAFETY: forwarded exclusion and retention.
+        unsafe { self.sequence.backend.retire_client_jpeg().await }?;
+        let hw = &mut self.sequence.backend;
+        let decode = hw.media_jpeg_decode_required;
+        // SAFETY: same owned PCI function and BAR2; VCN retains the range.
+        let doorbells =
+            unsafe { mes::map_doorbells(&hw.pci, &hw.authority) }.map_err(Error::Mes)?;
+        // SAFETY: retained registration and IH route; ring retirement proved.
+        let proof = unsafe { hw.prove_jpeg(doorbells, decode, true).await }?;
+        Ok(proof.sequence)
     }
 }

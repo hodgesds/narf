@@ -42,11 +42,14 @@ impl Io for Model {
 
 fn buffers(pool: &Pool, pipe: u8, height: u32) -> Surface {
     let request = SurfaceRequest {
+        surface: Default::default(),
         pipe,
         width: 16,
         height,
         format: SurfaceFormat::Xrgb8888,
-        odm: None,
+        odm: SplitPipes::NONE,
+        mpc: SplitPipes::NONE,
+        plane: None,
     };
     let reserve = |bytes| {
         let mut r = pool.reserve(bytes).unwrap();

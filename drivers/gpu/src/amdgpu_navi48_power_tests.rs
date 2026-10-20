@@ -15,8 +15,52 @@ fn limits(fan: bool) -> Limits {
         software_shutdown_offset_c: -10,
         fan_max_rpm: fan.then_some(3300),
         ppt_default_w: 304,
+        ppt_min_w: 273,
+        ppt_max_w: 340,
     }
 }
+fn navi48_power_cap_writes_follow_amdgpu_hwmon_units_and_range() -> TestResult {
+    let l = Some(limits(true));
+    // Microwatts truncate to watts, as amdgpu_hwmon_set_power_cap.
+    assert_eq!(power_cap_request(l, b"300000000\n"), Ok(300));
+    assert_eq!(power_cap_request(l, b"273999999"), Ok(273));
+    assert_eq!(power_cap_request(l, b"340000000"), Ok(340));
+    for bad in [
+        &b"272999999"[..],
+        b"341000000",
+        b"0",
+        b"",
+        b"-5",
+        b"3e8",
+        b"300 W",
+    ] {
+        assert_eq!(
+            power_cap_request(l, bad),
+            Err(FsError::InvalidData),
+            "{bad:?}"
+        );
+    }
+    assert_eq!(
+        power_cap_request(None, b"300000000"),
+        Err(FsError::NoDevice)
+    );
+    let snapshot = Snapshot {
+        telemetry: None,
+        limits: l,
+        protected: true,
+        gfx_level: smu::GfxLevel::Auto,
+        error: None,
+        samples: 0,
+    };
+    assert_eq!(show(Some(&snapshot), "power1_cap_min"), "273000000\n");
+    assert_eq!(show(Some(&snapshot), "power1_cap_max"), "340000000\n");
+    assert!(attributes(false).contains(&"power1_cap_min"));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-power",
+    navi48_power_cap_writes_follow_amdgpu_hwmon_units_and_range
+);
 fn telemetry(hotspot_c: i32, throttlers: u32) -> Telemetry {
     Telemetry {
         metrics: Metrics {
@@ -93,7 +137,7 @@ kernel_test_in!(
 
 fn navi48_hwmon_follows_linux_amdgpu_units_and_visibility() -> TestResult {
     let names = attributes(true);
-    assert_eq!(names.len(), 32);
+    assert_eq!(names.len(), 34); // plus power1_cap_{min,max}
     assert!(names.contains(&"pwm1") && names.contains(&"fan1_max"));
     let fanless = attributes(false);
     assert!(!fanless

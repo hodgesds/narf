@@ -103,7 +103,8 @@ pub fn record_fault(pasid: Pasid, info: FaultInfo) {
         return;
     }
     let allocated = PASIDS.lock()[usize::from(pasid) / 64] & 1 << (pasid % 64) != 0;
-    if allocated {
+    // A retiring PASID's space is gone: a late vector belongs to no one.
+    if allocated && !RETIRING.lock().iter().any(|&(p, _)| p == pasid) {
         FAULTS.lock().insert(pasid, info);
     }
 }
@@ -113,6 +114,44 @@ pub fn fault(pasid: Pasid) -> FaultInfo {
     FAULTS.lock().get(&pasid).copied().unwrap_or_default()
 }
 
+/// Completed passes in which a tracking interrupt service drained its IH
+/// ring to empty (`ih_drained`).
+static IH_DRAINS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// A service attributes IVs by PASID and reports its drains.
+static IH_TRACKING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Dropped PASIDs with the drain count at release. Vectors the hardware wrote
+/// before release may still sit in the IH ring; reusing the PASID before
+/// they are processed would charge them to its next owner. An empty-ring
+/// pass that started after release is the second increment past the mark.
+static RETIRING: narf_lib::sync::IrqSafeSpinLock<Vec<(Pasid, u64)>> =
+    narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+/// An interrupt service drained its ring to empty after reading the write
+/// pointer: every IV written before that read has been attributed.
+pub fn ih_drained() {
+    IH_DRAINS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+}
+/// Start (or stop) holding released PASIDs for an IH drain. Stopping means
+/// no IV is attributed any more, so held PASIDs become free at once.
+pub fn track_ih_drains(on: bool) {
+    IH_TRACKING.store(on, core::sync::atomic::Ordering::Release);
+    if !on {
+        let mut used = PASIDS.lock();
+        for (pasid, _) in RETIRING.lock().drain(..) {
+            used[usize::from(pasid) / 64] &= !(1 << (pasid % 64));
+        }
+    }
+}
+fn reap_retiring(used: &mut [u64; 1024]) {
+    let drains = IH_DRAINS.load(core::sync::atomic::Ordering::Acquire);
+    RETIRING.lock().retain(|&(pasid, mark)| {
+        let done = drains >= mark.saturating_add(2);
+        if done {
+            used[usize::from(pasid) / 64] &= !(1 << (pasid % 64));
+        }
+        !done
+    });
+}
+
 /// An allocated PASID, returned when dropped (`amdgpu_pasid_free`).
 #[derive(Debug)]
 pub struct PasidHandle(Pasid);
@@ -120,6 +159,7 @@ impl PasidHandle {
     /// The lowest free PASID, 0 excepted.
     pub fn alloc() -> Option<Self> {
         let mut used = PASIDS.lock();
+        reap_retiring(&mut used);
         let pasid = (1..=u16::MAX).find(|&p| used[usize::from(p) / 64] & 1 << (p % 64) == 0)?;
         used[usize::from(pasid) / 64] |= 1 << (pasid % 64);
         Some(Self(pasid))
@@ -131,7 +171,13 @@ impl PasidHandle {
 impl Drop for PasidHandle {
     fn drop(&mut self) {
         FAULTS.lock().remove(&self.0);
-        PASIDS.lock()[usize::from(self.0) / 64] &= !(1 << (self.0 % 64));
+        let mut used = PASIDS.lock();
+        if IH_TRACKING.load(core::sync::atomic::Ordering::Acquire) {
+            let mark = IH_DRAINS.load(core::sync::atomic::Ordering::Acquire);
+            RETIRING.lock().push((self.0, mark));
+        } else {
+            used[usize::from(self.0) / 64] &= !(1 << (self.0 % 64));
+        }
     }
 }
 

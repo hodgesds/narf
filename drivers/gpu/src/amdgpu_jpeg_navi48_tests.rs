@@ -11,8 +11,12 @@ const VCN: u64 = 0x10000;
 const NBIO: u64 = 0x30000;
 const GC: u64 = 0x50000;
 const GPU: u64 = 0x8_0000_4000;
+#[path = "amdgpu_jpeg_navi48_cs_tests.rs"]
+mod cs_tests;
 #[path = "amdgpu_jpeg_navi48_decode_tests.rs"]
 mod decode_tests;
+const MM: u64 = 0x68000;
+const OSS: u64 = 0x4e000;
 fn jpeg5_layout_rejects_wrong_mmhub_or_truncated_jpeg_banks() -> TestResult {
     let descriptor = || {
         let mut backing = vec![0; 0x80000 / 4];
@@ -24,11 +28,18 @@ fn jpeg5_layout_rejects_wrong_mmhub_or_truncated_jpeg_banks() -> TestResult {
         (vcn.major, vcn.minor, vcn.revision) = (5, 0, 0);
         vcn.base_addrs[1] = 0x18000;
         gpu.ip_blocks.push(vcn);
+        // IH_VMID_0_LUT_MM for client PASID mapping.
+        let mut oss = vcn;
+        oss.hw_id = ip::HW_ID_OSSSYS;
+        (oss.major, oss.minor, oss.revision) = (7, 0, 0);
+        oss.base_addrs[0] = 0x1a000;
+        gpu.ip_blocks.push(oss);
         gpu // Metadata only; no access into the expired register backing.
     };
     let gpu = descriptor();
     assert_eq!(Layout::resolve(&gpu).unwrap().vcn, 0x60000);
-    for case in 0..7 {
+    assert_eq!(Layout::resolve(&gpu).unwrap().oss, 0x68000);
+    for case in 0..8 {
         let mut gpu = descriptor();
         match case {
             0 => gpu.ip_blocks[1].minor = 2,
@@ -37,6 +48,7 @@ fn jpeg5_layout_rejects_wrong_mmhub_or_truncated_jpeg_banks() -> TestResult {
             3 => gpu.ip_blocks[5].revision = 1,
             4 => gpu.ip_blocks.push(gpu.ip_blocks[5]),
             5 => gpu.chip.did = crate::amdgpu::NAVI22,
+            6 => gpu.ip_blocks[6].minor = 1,
             _ => gpu.regs.len = 0x7f000,
         }
         assert!(Layout::resolve(&gpu).is_err());
@@ -51,6 +63,8 @@ struct Fake {
     picture: decode_tests::Model,
     regs: BTreeMap<u64, u32>,
     memory: Vec<u8>,
+    /// The client IB arena (`cs::CLIENT_BYTES` mapping).
+    client: Vec<u8>,
     writes: Vec<(u64, u32)>,
     packets: BTreeMap<u32, u32>,
     dirty: bool,
@@ -65,11 +79,21 @@ struct Fake {
     damage: bool,
     ignored: Option<u64>,
     revoke: Option<Cap<BusDeviceCap, Write>>,
+    client_gpu: u64,
+    /// Executed client IB copies: (decoder VMID, arena offset, dwords).
+    client_ibs: Vec<(u32, u64, u32)>,
 }
 impl Fake {
     fn word(&self, at: u64) -> u32 {
         u32::from_le_bytes(
             self.memory[at as usize..at as usize + 4]
+                .try_into()
+                .unwrap(),
+        )
+    }
+    fn client_word(&self, at: u64) -> u32 {
+        u32::from_le_bytes(
+            self.client[at as usize..at as usize + 4]
                 .try_into()
                 .unwrap(),
         )
@@ -89,9 +113,27 @@ impl Fake {
                         self.regs.insert(VCN + u64::from(PITCH) * 4, value);
                     }
                     if reg == 0x18000 {
-                        let target = self.packets[&0x1bfff];
-                        assert!(matches!(target, 0x69004 | 0x7f000));
-                        self.regs.insert(u64::from(target), value);
+                        let target = u64::from(self.packets[&0x1bfff]);
+                        let req = MM + (0x587 + 1) * 4;
+                        assert!(
+                            matches!(target, 0x69004 | 0x7f000)
+                                || (MM..MM + 0x700 * 4).contains(&target)
+                                || (OSS..OSS + 0x20 * 4).contains(&target)
+                        );
+                        // A released MMHUB semaphore reads back as available.
+                        let sem = MM + (0x575 + 1) * 4;
+                        self.regs.insert(
+                            target,
+                            if target == sem && value == 0 {
+                                1
+                            } else {
+                                value
+                            },
+                        );
+                        if target == req {
+                            // MMHUB engine 1 acknowledges the requested VMIDs.
+                            *self.regs.entry(MM + (0x599 + 1) * 4).or_default() |= value & 0xffff;
+                        }
                     }
                     if reg == 0x404d && value == 8 && self.fence {
                         let address = (u64::from(self.packets[&0x40ac]) << 32)
@@ -108,7 +150,6 @@ impl Fake {
                 }
                 2 => {
                     assert_eq!(self.packets[&0x40a4], 0);
-                    assert_eq!(self.packets[&0x40a6], 0);
                     assert_eq!(self.regs[&0x69004], 0x80010000);
                     if !self.ib {
                         return false;
@@ -116,7 +157,21 @@ impl Fake {
                     let address =
                         (u64::from(self.packets[&0x40b7]) << 32) | u64::from(self.packets[&0x40b6]);
                     let dwords = self.packets[&0x4082];
-                    if self.picture.contains(address) {
+                    if let Some(at) = address
+                        .checked_sub(self.client_gpu)
+                        .filter(|at| *at < cs::CLIENT_BYTES)
+                    {
+                        let vmid = self.packets[&0x40a6] & 15;
+                        assert_eq!(self.packets[&0x40a6], vmid * 0x111);
+                        self.client_ibs.push((vmid, at, dwords));
+                        for n in (0..dwords).step_by(2) {
+                            let header = self.client_word(at + u64::from(n) * 4);
+                            let value = self.client_word(at + u64::from(n + 1) * 4);
+                            if header == words::PITCH && self.pitch {
+                                self.regs.insert(VCN + u64::from(PITCH) * 4, value);
+                            }
+                        }
+                    } else if self.picture.contains(address) {
                         if !self.picture.execute(address, dwords) {
                             return false;
                         }
@@ -127,6 +182,14 @@ impl Fake {
                         assert_eq!(address, GPU + IB);
                         assert_eq!(dwords, 16);
                         assert!(self.execute(IB, 16));
+                    }
+                }
+                3 if reg == 0x18000 => {
+                    // External register wait: stall until it matches.
+                    let target = u64::from(self.packets[&0x1bfff]);
+                    let reference = self.packets[&0x4084];
+                    if self.regs.get(&target).copied().unwrap_or(0) & value != reference & value {
+                        return false;
                     }
                 }
                 3 => {
@@ -175,12 +238,21 @@ impl Io for Fake {
     }
     fn memory_read(&mut self, map: MmioRegion, at: u64) -> u32 {
         assert!(!self.dirty);
+        if map.len == cs::CLIENT_BYTES {
+            return self.client_word(at);
+        }
         if let Some(value) = self.picture.read(map, at) {
             return value;
         }
         self.word(at)
     }
     fn memory_write(&mut self, map: MmioRegion, at: u64, value: u32) {
+        if map.len == cs::CLIENT_BYTES {
+            self.client_gpu = GPU + map.phys.raw() - 0x90004000;
+            self.client[at as usize..at as usize + 4].copy_from_slice(&value.to_le_bytes());
+            self.dirty = true;
+            return;
+        }
         if self.picture.write(map, at, value) {
             self.dirty = true;
             return;
@@ -199,7 +271,15 @@ impl Io for Fake {
         assert!(!self.dirty);
         assert_eq!(self.word(WRITEBACK), value);
         let previous = self.regs[&(VCN + u64::from(RPTR) * 4)];
-        if self.advance && self.execute(RING + u64::from(previous) * 4, value - previous) {
+        // JRBC wraps at RB_SIZE (1024 dwords).
+        let ran = self.advance
+            && if value >= previous {
+                self.execute(RING + u64::from(previous) * 4, value - previous)
+            } else {
+                self.execute(RING + u64::from(previous) * 4, 1024 - previous)
+                    && self.execute(RING, value)
+            };
+        if ran {
             self.regs.insert(VCN + u64::from(RPTR) * 4, value);
         }
         if let Some(cap) = self.revoke {
@@ -274,6 +354,7 @@ fn fixture_capacity(capacity: u64) -> (Pool, Engine<Fake>, Irqs) {
             (VCN + u64::from(RPTR) * 4, 0),
         ]),
         memory: vec![0x5a; BYTES as usize],
+        client: vec![0x5a; cs::CLIENT_BYTES as usize],
         writes: Vec::new(),
         packets: BTreeMap::new(),
         dirty: false,
@@ -288,6 +369,8 @@ fn fixture_capacity(capacity: u64) -> (Pool, Engine<Fake>, Irqs) {
         damage: false,
         ignored: None,
         revoke: None,
+        client_gpu: u64::MAX,
+        client_ibs: Vec::new(),
     };
     let observer = Irqs {
         signals,
@@ -301,10 +384,13 @@ fn fixture_capacity(capacity: u64) -> (Pool, Engine<Fake>, Irqs) {
             vcn: VCN,
             nbio: NBIO,
             gc: GC,
+            mm: MM,
+            oss: OSS,
         },
         memory: pool.reserve(BYTES).unwrap(),
         pool: pool.clone(),
         decode_memory: None,
+        client_memory: None,
         state: State::Prepared,
         result: None,
         decode_result: None,

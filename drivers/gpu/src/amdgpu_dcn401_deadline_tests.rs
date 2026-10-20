@@ -36,8 +36,10 @@ fn plan() -> dml::Plan {
         &dml::Mode {
             timing: timing(),
             pitch: 1920,
+            bytes_per_pixel: 4,
             ycbcr420: false,
             dsc: None,
+            planes: [None; dml::MAX_PLANES],
         },
     )
     .unwrap()
@@ -48,11 +50,14 @@ fn hubp_at(pipe: u8, reg: u64) -> u64 {
 fn owners(plan: &dml::Plan, pipe: u8) -> (Request, RequestorApplied, dccg::Applied) {
     let surface = SurfaceApplied {
         request: SurfaceRequest {
+            surface: Default::default(),
             pipe,
             width: 1920,
             height: 1080,
             format: SurfaceFormat::Xrgb8888,
-            odm: None,
+            odm: SplitPipes::NONE,
+            mpc: SplitPipes::NONE,
+            plane: None,
         },
         address: 0x8_0000_0000,
         pitch_bytes: 7680,
@@ -65,11 +70,12 @@ fn owners(plan: &dml::Plan, pipe: u8) -> (Request, RequestorApplied, dccg::Appli
         signal: Signal::DisplayPort,
         ycbcr420: false,
         dsc: None,
-        odm: None,
+        odm: SplitPipes::NONE,
     };
     let requestor = RequestorApplied {
         pipe,
         surface,
+        overlays: [None; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
         det_bytes: 327_680,
         compbuf_bytes: 1_048_576,
         pixel_chunk_bytes: 8192,
@@ -196,11 +202,35 @@ fn dcn401_deadlines_bind_only_the_admitted_owners() -> TestResult {
     if !bound(&plan, timing, requestor, faster, 50_000) {
         return TestResult::Fail("faster clocks refused");
     }
+    // A 2-byte plane binds the plan admitted at its depth and pitch only.
+    let Ok(rgb565) = dml::admit(
+        &soc(),
+        &dml::Mode {
+            bytes_per_pixel: 2,
+            ..plan.mode
+        },
+    ) else {
+        return TestResult::Fail("RGB565 1080p60 refused");
+    };
+    let mut half = requestor;
+    half.surface.request.format = SurfaceFormat::Rgb565;
+    half.surface.pitch_bytes = 3840;
+    let synced = Request {
+        sync: rgb565.sync,
+        ..timing
+    };
+    if !bound(&rgb565, synced, half, clock, 50_000)
+        || bound(&plan, timing, half, clock, 50_000)
+        || bound(&rgb565, synced, requestor, clock, 50_000)
+    {
+        return TestResult::Fail("plane depth binding");
+    }
     let mut tampered = plan;
     tampered.watermarks.urgent += 1;
     let mut other_mode = plan;
     other_mode.mode.pitch = 2048;
-    let cases: [(dml::Plan, Request, RequestorApplied, dccg::Applied, u32); 13] = [
+    // On the heap: thirteen plans are too much for a 64 KiB kernel-test stack.
+    let cases: alloc::vec::Vec<(dml::Plan, Request, RequestorApplied, dccg::Applied, u32)> = alloc::vec![
         (tampered, timing, requestor, clock, 50_000),
         (other_mode, timing, requestor, clock, 50_000),
         (
@@ -400,4 +430,193 @@ fn dcn401_deadlines_follow_linux_vready_rule_and_gate_on_requestor() -> TestResu
 kernel_test_in!(
     "drivers/gpu/dcn401-deadline",
     dcn401_deadlines_follow_linux_vready_rule_and_gate_on_requestor
+);
+
+/// A 1280x720 ARGB8888 video overlay on pipe `pipe`, downscaled 2:1 into
+/// (100, 100) of the 1080p stream.
+fn video_overlay(pipe: u8) -> SurfaceApplied {
+    let request = SurfaceRequest {
+        surface: Default::default(),
+        pipe,
+        width: 1280,
+        height: 720,
+        format: SurfaceFormat::Argb8888,
+        odm: SplitPipes::NONE,
+        mpc: SplitPipes::NONE,
+        plane: Some(PlaneLayout {
+            src: crate::amdgpu_dcn401_spl::Rect::new(0, 0, 1280, 720),
+            dst: crate::amdgpu_dcn401_spl::Rect::new(100, 100, 640, 360),
+            stream_width: 1920,
+            stream_height: 1080,
+            ycbcr420: false,
+            rotation: crate::amdgpu_dcn401_spl::Rotation::R0,
+            blend: Blend::default_for(SurfaceFormat::Argb8888),
+            underlay: false,
+        }),
+    };
+    SurfaceApplied {
+        request,
+        address: 0x8_1000_0000,
+        pitch_bytes: 5120,
+        bytes: 5120 * 720,
+    }
+}
+/// The 1080p primary with `overlay` above it, as DML21 plans the pair.
+fn overlay_plan(overlay: SurfaceApplied) -> dml::Plan {
+    let mut mode = plan().mode;
+    mode.planes[1] = Some(overlay.request.dml_plane());
+    dml::admit(&soc(), &mode).unwrap()
+}
+
+/// Each plane's HUBP gets its own plane's DLG/TTU: the primary the first
+/// plane's, the scaled overlay the second's (CalculatePixelDeliveryTimes
+/// at its ratios), the global watermarks once.
+fn dcn401_deadlines_program_each_plane_its_own_dlg() -> TestResult {
+    let ov = video_overlay(3);
+    let plan = overlay_plan(ov);
+    let (Some(first), Some(second)) = (plan.plane(0), plan.plane(1)) else {
+        return TestResult::Fail("two planned planes");
+    };
+    if first.dlg == second.dlg || first.ttu == second.ttu || plan.planes[2].is_some() {
+        return TestResult::Fail("the scaled overlay's own DLG");
+    }
+    let (_, mut requestor, _) = owners(&plan, 0);
+    requestor.overlays[0] = Some(ov);
+    let mut e = engine();
+    e.status.requestor = Some(requestor);
+    if e.deadline_writes(0, &plan, false).is_err() || e.deadline_writes(0, &plan, true).is_err() {
+        return TestResult::Fail("program/verify both planes");
+    }
+    let regs = e.io.regs.clone();
+    let hubp = |p: u8, r| regs.get(&hubp_at(p, r)).copied().unwrap_or(0);
+    for (p, plane) in [(0u8, first), (3, second)] {
+        let (d, t) = (plane.dlg, plane.ttu);
+        let want = [
+            (DEBUG_DB, 0x100),
+            (BLANK1, d.min_dst_y_next_start),
+            (
+                DST_AFTER,
+                d.refcyc_x_after_scaler | d.dst_y_after_scaler << 16,
+            ),
+            (PREFETCH, d.vratio_prefetch | d.dst_y_prefetch << 24),
+            (PER_LINE, d.refcyc_per_line_delivery_l),
+            (PER_LINE_PRE, d.refcyc_per_line_delivery_pre_l),
+            (
+                SURF0_TTU0,
+                t.refcyc_per_req_delivery_l | t.qos_level_fixed_l << 24,
+            ),
+            (SURF0_TTU1, t.refcyc_per_req_delivery_pre_l),
+        ];
+        if want.iter().any(|&(r, v)| hubp(p, r) != v) {
+            return TestResult::Fail("plane DLG/TTU value");
+        }
+    }
+    // Pipes outside the display's planes are never written.
+    if e.io
+        .writes
+        .iter()
+        .any(|&(at, _)| [1u8, 2].iter().any(|&p| at == hubp_at(p, PER_LINE)))
+    {
+        return TestResult::Fail("unrelated pipe programmed");
+    }
+    // A plan short of the staged overlay cannot program it.
+    if e.deadline_writes(0, &plan_without(&plan), false) != Err(Error::Invalid) {
+        return TestResult::Fail("overlay without a planned plane");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-deadline",
+    dcn401_deadlines_program_each_plane_its_own_dlg
+);
+fn plan_without(plan: &dml::Plan) -> dml::Plan {
+    let mut p = *plan;
+    p.planes[1] = None;
+    p
+}
+
+/// A plan binds exactly its planes: the primary and each overlay's
+/// surface, placement, depth and pipes, none missing and none extra.
+fn dcn401_deadlines_bind_every_planned_plane() -> TestResult {
+    let ov = video_overlay(3);
+    let plan = overlay_plan(ov);
+    let (timing, mut requestor, clock) = owners(&plan, 0);
+    let single = owners(&self::plan(), 0).1;
+    requestor.overlays[0] = Some(ov);
+    if !bound(&plan, timing, requestor, clock, 50_000) {
+        return TestResult::Fail("matching planes refused");
+    }
+    let with = |s: SurfaceApplied| RequestorApplied {
+        overlays: [Some(s), None, None],
+        ..requestor
+    };
+    let layout = ov.request.plane.unwrap();
+    let moved = SurfaceApplied {
+        request: SurfaceRequest {
+            plane: Some(PlaneLayout {
+                dst: crate::amdgpu_dcn401_spl::Rect::new(100, 100, 960, 540),
+                ..layout
+            }),
+            ..ov.request
+        },
+        ..ov
+    };
+    let fp16 = SurfaceApplied {
+        request: SurfaceRequest {
+            format: SurfaceFormat::Argb16161616f,
+            ..ov.request
+        },
+        pitch_bytes: 10240,
+        ..ov
+    };
+    let split = SurfaceApplied {
+        request: SurfaceRequest {
+            odm: SplitPipes::one(2),
+            ..ov.request
+        },
+        ..ov
+    };
+    let other_stream = SurfaceApplied {
+        request: SurfaceRequest {
+            plane: Some(PlaneLayout {
+                stream_width: 1280,
+                stream_height: 720,
+                ..layout
+            }),
+            ..ov.request
+        },
+        ..ov
+    };
+    let doubled = RequestorApplied {
+        overlays: [
+            Some(ov),
+            Some(SurfaceApplied {
+                request: SurfaceRequest {
+                    pipe: 2,
+                    ..ov.request
+                },
+                ..ov
+            }),
+            None,
+        ],
+        ..requestor
+    };
+    for (p, r) in [
+        (plan, single),
+        (self::plan(), requestor),
+        (plan, with(moved)),
+        (plan, with(fp16)),
+        (plan, with(split)),
+        (plan, with(other_stream)),
+        (plan, doubled),
+    ] {
+        if bound(&p, timing, r, clock, 50_000) {
+            return TestResult::Fail("mismatched plane accepted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-deadline",
+    dcn401_deadlines_bind_every_planned_plane
 );

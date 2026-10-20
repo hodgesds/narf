@@ -67,8 +67,10 @@ impl ColdBoot {
         hw.media_test = Some(Err(Error::Busy));
         hw.media_decode_required = decode;
         hw.media_encode_required = encode;
-        let jpeg = jpeg || jpeg_decode;
+        // Client media publishes JPEG0 beside the unified VCN queue.
+        let jpeg = jpeg || jpeg_decode || keep_running;
         hw.media_jpeg_required = jpeg;
+        hw.media_jpeg_clients = keep_running;
         hw.media_jpeg_decode_required = jpeg_decode;
         let result = async {
             let image = hw
@@ -144,7 +146,7 @@ impl ColdBoot {
             if jpeg {
                 // SAFETY: VCN retains the shared media range and GMC, no
                 // clients can publish, and IH/CPU delivery remains active.
-                unsafe { hw.prove_jpeg(doorbells, jpeg_decode).await }?;
+                unsafe { hw.prove_jpeg(doorbells, jpeg_decode, keep_running).await }?;
             }
             if keep_running {
                 return Ok(proof);

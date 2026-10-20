@@ -13,6 +13,8 @@ use crate::{
 use core::sync::atomic::{fence, Ordering};
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
+#[path = "amdgpu_jpeg_navi48_cs.rs"]
+mod cs;
 #[path = "amdgpu_jpeg_navi48_decode.rs"]
 mod decode_proof;
 #[path = "amdgpu_jpeg_navi48_decode_words.rs"]
@@ -45,6 +47,8 @@ pub enum State {
     Verified,
     DecodeTesting,
     DecodeVerified,
+    /// Proofs drained; the wrapping ring now carries validated client frames.
+    Clients,
     Stopping,
     Stopped,
     Failed(Error),
@@ -103,6 +107,8 @@ struct Layout {
     vcn: u64,
     nbio: u64,
     gc: u64,
+    mm: u64,
+    oss: u64,
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
@@ -119,8 +125,12 @@ impl Layout {
             return Err(Error::Unsupported);
         }
         // The start/end packets use MMHUB4.1's PCTL0 command format/address.
-        bank(gpu, ip::HW_ID_MMHUB, &[(4, 1, 0)], 0, 0x62e).map_err(|_| Error::Unsupported)?;
+        let mm =
+            bank(gpu, ip::HW_ID_MMHUB, &[(4, 1, 0)], 0, 0x62e).map_err(|_| Error::Unsupported)?;
         Ok(Self {
+            mm,
+            oss: bank(gpu, ip::HW_ID_OSSSYS, &[(7, 0, 0)], 0, 0x1f)
+                .map_err(|_| Error::Unsupported)?,
             vcn: bank(gpu, ip::HW_ID_VCN, &[(5, 0, 0)], 1, CG_CTRL)
                 .map_err(|_| Error::Unsupported)?,
             nbio: bank(gpu, ip::HW_ID_NBIF, &[(6, 3, 1)], 2, RANGE)
@@ -158,6 +168,8 @@ struct Engine<I: Io> {
     memory: Reservation,
     pool: Pool,
     decode_memory: Option<Reservation>,
+    /// Kernel VMID0 copies of validated client IBs (`cs::SLOTS` slots).
+    client_memory: Option<Reservation>,
     state: State,
     result: Option<Result<Proof, Error>>,
     decode_result: Option<Result<DecodeProof, Error>>,
@@ -306,7 +318,7 @@ impl<I: Io> Engine<I> {
     async fn stop(&mut self) -> Result<(), Error> {
         if !matches!(
             self.state,
-            State::Ready | State::Verified | State::DecodeVerified
+            State::Ready | State::Verified | State::DecodeVerified | State::Clients
         ) {
             return Err(Error::Busy);
         }
@@ -325,6 +337,9 @@ impl<I: Io> Engine<I> {
             unsafe {
                 self.memory.stopped();
                 if let Some(memory) = self.decode_memory.as_mut() {
+                    memory.stopped();
+                }
+                if let Some(memory) = self.client_memory.as_mut() {
                     memory.stopped();
                 }
             }
@@ -401,6 +416,7 @@ impl Jpeg {
                 memory,
                 pool: pool.clone(),
                 decode_memory: None,
+                client_memory: None,
                 state: State::Prepared,
                 result: None,
                 decode_result: None,
@@ -451,6 +467,64 @@ impl Jpeg {
     }
     pub fn result(&self) -> Option<Result<Proof, Error>> {
         self.engine.result
+    }
+    /// Turn the drained, verified transport into the client ring.
+    /// # Safety
+    /// Keep the registered JPEG0 owner, VCN's shared range and GMC live and
+    /// exclude PM/reset; the client arena is retired only by a later stop.
+    pub unsafe fn open_clients(&mut self) -> Result<(), Error> {
+        self.engine.open_clients()
+    }
+    /// Copy validated client IB words into kernel `slot` and return their
+    /// VMID0 addresses for [`Self::submit`].
+    /// # Safety
+    /// The slot's previous job completed (or a stop/reset proved retirement)
+    /// and stays unused by any other job until this one completes.
+    pub unsafe fn stage(
+        &mut self,
+        slot: usize,
+        copies: &[alloc::vec::Vec<u32>],
+    ) -> Result<alloc::vec::Vec<(u64, u32)>, Error> {
+        self.engine.stage(slot, copies)
+    }
+    /// Queue a client frame whose IBs are staged kernel copies.
+    /// # Safety
+    /// Own the client's MMHUB VMID/PASID/root and every resource its IBs
+    /// reach, plus the staged slot, until this sequence completes or reset
+    /// proves retirement. Exclude ring/VMID/PM/reset writers.
+    pub unsafe fn submit(&mut self, job: crate::amdgpu_gfx12_queue::Job) -> Result<u32, Error> {
+        self.engine.submit(job)
+    }
+    /// Retire a possibly hung client ring before PowerDownJpeg.
+    /// # Safety
+    /// Exclude every publisher/PM writer and retain the dispatch registration,
+    /// VCN's shared range and all backing through failure or cancellation.
+    pub async unsafe fn reset_stop(&mut self) -> Result<(), Error> {
+        self.engine.reset_stop().await
+    }
+    /// Retain this owner/backing and exclude reset/PM while using the reader.
+    pub fn fence_reader(&self) -> Option<FenceReader> {
+        (self.engine.state == State::Clients).then_some(FenceReader {
+            io: self.engine.io,
+            authority: self.engine.authority,
+            layout: self.engine.layout,
+            map: self.engine.memory.mapping(),
+        })
+    }
+}
+pub use cs::{validate_ib, SLOTS, SLOT_BYTES};
+#[derive(Clone, Copy, Debug)]
+pub struct FenceReader {
+    io: Mmio,
+    authority: Cap<BusDeviceCap, Write>,
+    layout: Layout,
+    map: MmioRegion,
+}
+impl FenceReader {
+    /// The last physical sequence the JPEG ring's GPCOM fence wrote.
+    pub fn completed(&self) -> Result<u32, Error> {
+        let mut io = self.io;
+        cs::client_fence(&mut io, self.authority, self.layout, self.map)
     }
 }
 #[cfg(feature = "kernel-test")]

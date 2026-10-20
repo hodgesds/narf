@@ -221,6 +221,10 @@ fn fixture_req(
             depth,
             limited: false,
             ycbcr420: req.ycbcr420,
+            colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(
+                false,
+                req.ycbcr420,
+            ),
         },
         c,
     ))
@@ -269,6 +273,7 @@ pub(in crate::amdgpu_dcn401_otg::tests) fn link(stream: u8, pipe: u8) -> HdmiLin
         stream,
         pipe,
         avi: Default::default(),
+        hdr: None,
     }
 }
 
@@ -1074,4 +1079,121 @@ fn dcn401_hdmi_link_carries_ycbcr420_at_half_rate() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_hdmi_link_carries_ycbcr420_at_half_rate
+);
+
+/// set_avi_info_frame's colorimetry for the output color space: the plain
+/// spaces match the range/encoding form byte for byte; BT.2020 and
+/// AdobeRGB are extended colorimetry (C 3, EC 6 / 4) with Q for the
+/// BT.2020 RGB ranges.
+fn dcn401_hdmi_avi_signals_output_colorimetry() -> TestResult {
+    use crate::amdgpu_hdr::DcColorSpace as C;
+    let t = request(0).timing;
+    let avi = crate::amdgpu_dcn401_otg::Avi {
+        vic: 16,
+        aspect: 2,
+        qs: true,
+        hdmi_vic: 0,
+    };
+    let f = |cs, y420| crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe_in(&t, avi, cs, y420);
+    let sum = |p: &[u8; 36]| {
+        p[..3]
+            .iter()
+            .chain(&p[4..18])
+            .fold(0u8, |s, b| s.wrapping_add(*b))
+    };
+    for (limited, y420) in [(false, false), (true, false), (false, true)] {
+        if f(BlankRequest::default_colorspace(limited, y420), y420)
+            != crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe(&t, avi, limited, y420)
+        {
+            return TestResult::Fail("plain colorimetry changed");
+        }
+    }
+    // SB1 Y; SB2 C (bits 7:6) over R 8 and M 16:9; SB3 SC, EC (6:4), Q (3:2).
+    for (cs, y420, sb1, sb2, sb3) in [
+        (C::Rgb2020Full, false, 0x1e, 0xe8, 0x80 | 6 << 4 | 2 << 2),
+        (C::Rgb2020Limited, false, 0x1e, 0xe8, 0x80 | 6 << 4 | 1 << 2),
+        (C::AdobeRgb, false, 0x1e, 0xe8, 0x80 | 4 << 4),
+        (C::Ycbcr2020Limited, true, 0x7e, 0xe8, 0x80 | 6 << 4),
+        (C::Ycbcr601, true, 0x7e, 0x68, 0x80),
+    ] {
+        let p = f(cs, y420);
+        if p[5..8] != [sb1, sb2, sb3] || sum(&p) != 0 {
+            return TestResult::Fail("extended colorimetry");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_hdmi_avi_signals_output_colorimetry
+);
+
+/// amdgpu_dm_fill_hdr_info_packet's DRM InfoFrame in generic packet 4
+/// (enc3_stream_encoder_update_hdmi_info_packets): written with an
+/// immediate update at data index 36, sent every frame on line 2 (CONTROL3);
+/// new metadata on the running stream rewrites only packet 4.
+fn dcn401_hdmi_sends_the_hdr_drm_infoframe() -> TestResult {
+    let mut blob = [0u8; 32];
+    blob[4] = 2; // SMPTE ST 2084
+    blob[22..24].copy_from_slice(&1000u16.to_le_bytes());
+    let meta = crate::amdgpu_hdr::HdrOutputMetadata::from_blob(&blob).unwrap();
+    let packet =
+        crate::amdgpu_hdr::hdr_info_packet(Some(&meta), crate::amdgpu_hdr::HdrConnector::Hdmi);
+    let words = |e: &Engine<TmdsIo>, from: usize, index: u32| -> Option<alloc::vec::Vec<u32>> {
+        let w = &e.io.inner.writes[from..];
+        let at = w
+            .iter()
+            .position(|&(a, v)| a == dio(1, 0x2068) && v & 0xff == index * 9)?;
+        Some(
+            w[at..]
+                .iter()
+                .filter(|&&(a, _)| a == dio(1, 0x2069))
+                .take(9)
+                .map(|&(_, v)| v)
+                .collect(),
+        )
+    };
+    // Without metadata packet 4 stays off.
+    let (mut e, mut fw, c) = fixture(1, 1, 1);
+    run(e.prepare_hdmi_link(&mut fw, path(1), link(1, 1), c)).unwrap();
+    if e.io.inner.regs[&dio(1, 0x20a5)] & 0x30000 != 0 || words(&e, 0, 4).is_some() {
+        return TestResult::Fail("HDR packet without metadata");
+    }
+    let (mut e, mut fw, c) = fixture(1, 1, 1);
+    let request = HdmiLinkRequest {
+        hdr: Some(packet),
+        ..link(1, 1)
+    };
+    run(e.prepare_hdmi_link(&mut fw, path(1), request, c)).unwrap();
+    if words(&e, 0, 4).as_deref() != Some(&packet.words()[..])
+        || e.io.inner.regs[&dio(1, 0x20a5)] & 0x30000 != 0x30000
+        || e.io.inner.regs[&dio(1, 0x20ab)] & 0xffff != 2
+        || !e
+            .io
+            .inner
+            .writes
+            .iter()
+            .any(|&(a, v)| a == dio(1, 0x206b) && v & 0x10 != 0)
+    {
+        return TestResult::Fail("HDR DRM InfoFrame at link start");
+    }
+    run(e.start_hdmi_video(path(1), c)).unwrap();
+    blob[26..28].copy_from_slice(&400u16.to_le_bytes());
+    let brighter = crate::amdgpu_hdr::hdr_info_packet(
+        Some(&crate::amdgpu_hdr::HdrOutputMetadata::from_blob(&blob).unwrap()),
+        crate::amdgpu_hdr::HdrConnector::Hdmi,
+    );
+    let from = e.io.inner.writes.len();
+    if run(e.hdmi_update_hdr(brighter)).is_err()
+        || words(&e, from, 4).as_deref() != Some(&brighter.words()[..])
+        || words(&e, from, 0).is_some()
+        || e.status.hdmi_video_running.map(|v| v.link.request.hdr) != Some(Some(brighter))
+    {
+        return TestResult::Fail("live HDR metadata");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_hdmi_sends_the_hdr_drm_infoframe
 );

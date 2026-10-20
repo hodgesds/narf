@@ -476,6 +476,11 @@ fn sync_timeline_ioctls() -> TestResult {
     // ioctl's start, -ETIME after (drm_syncobj_find_fence).
     let core = table.lock().get(c).unwrap().core().clone();
     let flags = u64::from(so::SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT);
+    // A start 6 s in the past needs 6 s of uptime: earlier, the subtraction
+    // below saturates to 0 and the bound has not passed yet.
+    while narf_time::monotonic_ns() < 6_000_000_000 {
+        core::hint::spin_loop();
+    }
     let now = narf_time::monotonic_ns();
     if !matches!(
         crate::drm::syncobj_ioctl::find_fence_step(&core, 9, flags, now),

@@ -937,3 +937,226 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     rdna2_hidden_readback_preserves_vm_and_rolls_back_failure
 );
+
+/// System suspend eviction (ttm_resource_manager_evict_all): every VRAM
+/// buffer of the card moves to system memory even when VRAM is its only
+/// allowed domain; restore_domains puts the original domains back.
+fn suspend_eviction_moves_vram_only_buffers_and_restores_domains() -> TestResult {
+    const CARD: u32 = 0xfee3;
+    let mut memory = alloc::vec![0u8; 4 * 4096];
+    let map = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(0xb100_0000),
+        virt: memory.as_mut_ptr() as u64,
+        len: memory.len() as u64,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    // SAFETY: this test exclusively owns memory until the heap and every
+    // object are dropped; no hardware accesses these mappings.
+    let pool = unsafe { crate::amdgpu_vram::Pool::from_owned_range(map, 0x8_0000_0000) }.unwrap();
+    register_vram_heap(
+        CARD,
+        VramHeap {
+            pool: pool.clone(),
+            fb_base: 0x8_0000_0000,
+            fb_offset: 0x9_0000_0000,
+            unmapped: None,
+        },
+    );
+    let state = GemState::for_card(CARD);
+    let vram_only = u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM);
+    let a = state.get(create(&state, 4096, vram_only)).unwrap();
+    let b = state
+        .get(create(
+            &state,
+            8192,
+            vram_only | u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT),
+        ))
+        .unwrap();
+    assert!(!a.system() && !b.system());
+    // VRAM-preferred buffers allow GTT as in Linux; make `a` VRAM-only, as
+    // a DISCARDABLE buffer is. Plain relocation refuses it.
+    a.allowed_domains.store(vram_only, Ordering::Release);
+    assert_eq!(a.relocate(false), Err(FsError::Busy));
+    let (touched, result) = narf_scheduler::block_on_spin(async {
+        let gate = lock_placement(CARD).await;
+        evict_all(&gate).await
+    });
+    assert_eq!(result, Ok(()));
+    assert!(a.system() && b.system());
+    assert_eq!(touched.len(), 2);
+    assert_eq!(pool.available(), 4 * 4096);
+    restore_domains(touched);
+    assert_eq!(a.allowed_domains.load(Ordering::Acquire), vram_only);
+    assert_ne!(
+        b.allowed_domains.load(Ordering::Acquire) & u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT),
+        0
+    );
+    unregister_vram_heap(CARD);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/render-abi",
+    suspend_eviction_moves_vram_only_buffers_and_restores_domains
+);
+
+/// amdgpu_gem_userptr_ioctl argument checks, which run before any page is
+/// touched: alignment and flags EINVAL, a writable range without REGISTER
+/// EACCES; a kernel task (no user address space) faults.
+fn userptr_ioctl_validates_like_linux() -> TestResult {
+    let state = GemState::for_card(0xfee4);
+    let call = |addr: u64, size: u64, flags: u32| {
+        let mut b = [0u8; 24];
+        b[0..8].copy_from_slice(&addr.to_le_bytes());
+        b[8..16].copy_from_slice(&size.to_le_bytes());
+        b[16..20].copy_from_slice(&flags.to_le_bytes());
+        dispatch(
+            amd(uapi::DRM_AMDGPU_GEM_USERPTR),
+            b.as_mut_ptr() as usize,
+            &state,
+        )
+    };
+    let ro = uapi::AMDGPU_GEM_USERPTR_READONLY;
+    assert_eq!(call(0x1000_0001, 4096, ro), Err(FsError::InvalidData));
+    assert_eq!(call(0x1000_0000, 4095, ro), Err(FsError::InvalidData));
+    assert_eq!(call(0x1000_0000, 0, ro), Err(FsError::InvalidData));
+    assert_eq!(call(0x1000_0000, 4096, 1 << 4), Err(FsError::InvalidData));
+    assert_eq!(call(0x1000_0000, 4096, 0), Err(FsError::PermissionDenied));
+    assert_eq!(
+        call(0x1000_0000, 4096, uapi::AMDGPU_GEM_USERPTR_VALIDATE),
+        Err(FsError::PermissionDenied)
+    );
+    assert_eq!(call(0x1000_0000, 4096, ro), Err(FsError::BadAddress));
+    assert_eq!(
+        call(
+            0x1000_0000,
+            4096,
+            uapi::AMDGPU_GEM_USERPTR_REGISTER | uapi::AMDGPU_GEM_USERPTR_ANONONLY
+        ),
+        Err(FsError::BadAddress)
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/render-abi",
+    userptr_ioctl_validates_like_linux
+);
+
+/// A userptr buffer is its pinned pages: GPU entries follow each pin, a
+/// READONLY one maps without WRITEABLE, and it is never CPU mapped through
+/// GEM_MMAP, exported or migrated.
+fn userptr_backing_follows_pins_and_refuses_mmap_export_and_moves() -> TestResult {
+    use narf_memory::address_space::UserPagePin;
+    let frames: Vec<_> = (0..2)
+        .map(|_| narf_memory::alloc_frame().unwrap())
+        .collect();
+    let pins: Vec<_> = frames
+        .iter()
+        // SAFETY: freshly allocated frames, freed below after the pins drop.
+        .map(|f| unsafe { UserPagePin::retain_ram(f.start_address()) })
+        .collect();
+    let (a, b) = (
+        frames[0].start_address().raw(),
+        frames[1].start_address().raw(),
+    );
+    let gtt = u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT);
+    let object = Arc::new(GemObject {
+        placement: IrqSafeSpinLock::new(Arc::new(GemPlacement {
+            phys: a,
+            gpu: a,
+            system: true,
+            byte_len: 2 * PAGE_SIZE,
+            backing: Backing::User(pins),
+        })),
+        byte_len: 2 * PAGE_SIZE,
+        alignment: PAGE_SIZE,
+        preferred_domains: AtomicU64::new(gtt),
+        allowed_domains: AtomicU64::new(gtt),
+        flags: BO_GPU_READONLY,
+        metadata: IrqSafeSpinLock::new(Metadata::default()),
+        card: Some(0xfee5),
+        dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
+    });
+    assert!(object.is_userptr());
+    assert_eq!(object.frames(0, 2 * 4096).unwrap(), [a, b]);
+    let placement = object.placement();
+    assert_eq!(placement.gpu_at(4096 + 8), Some(b + 8));
+    assert_eq!(object.relocate(true), Err(FsError::Busy));
+    assert_eq!(object.relocate(false), Err(FsError::Busy));
+    assert!(crate::drm_devfs_bridge::amdgpu_dma_buf_file(object.clone()).is_err());
+    let rw = uapi::AMDGPU_VM_PAGE_READABLE | uapi::AMDGPU_VM_PAGE_WRITEABLE;
+    let flags = crate::amdgpu_vm::PteFormat::Gfx12.pte_flags(0, rw, object.flags);
+    assert_eq!(flags & crate::amdgpu_vm::PTE_WRITEABLE, 0);
+    let writable = crate::amdgpu_vm::PteFormat::Gfx12.pte_flags(0, rw, 0);
+    assert_ne!(writable & crate::amdgpu_vm::PTE_WRITEABLE, 0);
+    drop((placement, object));
+    for frame in frames {
+        narf_memory::free_frame(frame);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/render-abi",
+    userptr_backing_follows_pins_and_refuses_mmap_export_and_moves
+);
+
+/// amdgpu_gem_prime_import of another card's GTT buffer attaches it as GTT
+/// over the exporter's pages, sharing its reservation; the importer never
+/// moves it, and another card's VRAM buffer is refused (no PCIe P2P).
+fn prime_import_attaches_foreign_gtt_and_refuses_foreign_vram() -> TestResult {
+    const EXPORTER: u32 = 0xfee6;
+    const IMPORTER: u32 = 0xfee7;
+    let exporter = GemState::for_card(EXPORTER);
+    let importer = GemState::for_card(IMPORTER);
+    let gtt = u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT);
+    let source = exporter.get(create(&exporter, 2 * 4096, gtt)).unwrap();
+    assert!(source.system());
+    let file = crate::drm_devfs_bridge::amdgpu_dma_buf_file(source.clone()).unwrap();
+    let handle = crate::drm_devfs_bridge::amdgpu_prime_import(&importer, &file).unwrap();
+    let imported = importer.get(handle).unwrap();
+    assert!(!Arc::ptr_eq(&imported, &source));
+    assert_eq!(imported.frames(0, 8192), source.frames(0, 8192));
+    assert!(Arc::ptr_eq(imported.dma_buf(), source.dma_buf()));
+    assert_eq!(imported.card(), Some(IMPORTER));
+    assert_eq!(imported.relocate(true), Err(FsError::Busy));
+    // The same card's export is the same object.
+    let again = crate::drm_devfs_bridge::amdgpu_prime_import(&exporter, &file).unwrap();
+    assert!(Arc::ptr_eq(&exporter.get(again).unwrap(), &source));
+    // A foreign VRAM buffer would need peer-to-peer DMA.
+    let mut memory = alloc::vec![0u8; 2 * 4096];
+    let map = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(0xb200_0000),
+        virt: memory.as_mut_ptr() as u64,
+        len: memory.len() as u64,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    // SAFETY: test-owned memory; no hardware reaches it.
+    let pool = unsafe { crate::amdgpu_vram::Pool::from_owned_range(map, 0x8_0000_0000) }.unwrap();
+    register_vram_heap(
+        EXPORTER,
+        VramHeap {
+            pool,
+            fb_base: 0x8_0000_0000,
+            fb_offset: 0x9_0000_0000,
+            unmapped: None,
+        },
+    );
+    let vram = exporter
+        .get(create(
+            &exporter,
+            4096,
+            u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM),
+        ))
+        .unwrap();
+    assert!(!vram.system());
+    let file = crate::drm_devfs_bridge::amdgpu_dma_buf_file(vram).unwrap();
+    assert_eq!(
+        crate::drm_devfs_bridge::amdgpu_prime_import(&importer, &file),
+        Err(FsError::InvalidData)
+    );
+    unregister_vram_heap(EXPORTER);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/render-abi",
+    prime_import_attaches_foreign_gtt_and_refuses_foreign_vram
+);

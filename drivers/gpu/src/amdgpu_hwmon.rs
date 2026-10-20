@@ -24,6 +24,10 @@ pub(crate) struct Reading {
     pub power_average_w: Option<u32>,
     pub power_cap_w: Option<u32>,
     pub power_cap_default_w: Option<u32>,
+    /// The settable `power1_cap` range, watts; None hides nothing but reads
+    /// empty.
+    pub power_cap_min_w: Option<u32>,
+    pub power_cap_max_w: Option<u32>,
     /// MHz: sclk is the effective average GFXCLK, mclk the current UCLK.
     pub sclk_mhz: Option<u32>,
     pub mclk_mhz: Option<u32>,
@@ -132,6 +136,8 @@ pub(crate) fn show(r: &Reading, name: &str) -> String {
         "power1_average" => r.power_average_w.map(|w| i64::from(w) * 1_000_000),
         "power1_cap" => r.power_cap_w.map(|w| i64::from(w) * 1_000_000),
         "power1_cap_default" => r.power_cap_default_w.map(|w| i64::from(w) * 1_000_000),
+        "power1_cap_min" => r.power_cap_min_w.map(|w| i64::from(w) * 1_000_000),
+        "power1_cap_max" => r.power_cap_max_w.map(|w| i64::from(w) * 1_000_000),
         // Hz (amdgpu_hwmon_show_sclk/mclk: 10 kHz sensor units * 10 * 1000).
         "freq1_input" => r.sclk_mhz.map(|m| i64::from(m) * 1_000_000),
         "freq2_input" => r.mclk_mhz.map(|m| i64::from(m) * 1_000_000),
@@ -143,7 +149,22 @@ pub(crate) fn show(r: &Reading, name: &str) -> String {
 /// Publish `/sys/class/hwmon/hwmon<N>` (first free N) named `amdgpu`, each
 /// attribute rendered on read by `show`.
 pub(crate) fn publish(names: Vec<&'static str>, show: fn(&'static str) -> String) {
-    use narf_filesystem::sysfs::{class_device_register, class_register, kobject_add_attr};
+    publish_writable(names, show, &[], |_, _| {
+        Err(narf_filesystem::FsError::OperationNotPermitted)
+    });
+}
+
+/// [`publish`] with `writable` attributes stored through `store`
+/// (`S_IRUGO | S_IWUSR` in amdgpu_pm.c), which gets the raw written bytes.
+pub(crate) fn publish_writable(
+    names: Vec<&'static str>,
+    show: fn(&'static str) -> String,
+    writable: &[&'static str],
+    store: fn(&'static str, &[u8]) -> Result<(), narf_filesystem::FsError>,
+) {
+    use narf_filesystem::sysfs::{
+        class_device_register, class_register, kobject_add_attr, kobject_add_writable_attr,
+    };
     let class = class_register("hwmon");
     let taken = class.child_names();
     let index = (0..).find(|i| !taken.iter().any(|n| *n == format!("hwmon{i}")));
@@ -153,6 +174,21 @@ pub(crate) fn publish(names: Vec<&'static str>, show: fn(&'static str) -> String
     // Linux hwmon class devices have no device node, so no DEVNAME/MAJOR.
     narf_filesystem::sysfs::kobject_add_uevent_attr(&node, String::new());
     for name in names {
-        kobject_add_attr(&node, name, move || show(name));
+        if writable.contains(&name) {
+            kobject_add_writable_attr(&node, name, move || show(name), move |b| store(name, b));
+        } else {
+            kobject_add_attr(&node, name, move || show(name));
+        }
     }
+}
+
+/// `kstrtou32(buf, 10)` as sysfs stores parse it: decimal, optional
+/// trailing newline.
+pub(crate) fn parse_u32(bytes: &[u8]) -> Option<u32> {
+    let text = core::str::from_utf8(bytes).ok()?;
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
 }

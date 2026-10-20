@@ -243,21 +243,22 @@ impl MsixTable {
         // LAPIC delivers directly so no analog is needed.
         #[cfg(target_arch = "aarch64")]
         {
-            let device_id = crate::pci::requester_id(&self.device).ok_or(MsixError::NotPcie)?;
+            use narf_interrupts::aarch64::its;
+            let rid = crate::pci::requester_id(&self.device).ok_or(MsixError::NotPcie)?;
+            let segment = match self.device.kind {
+                BusKind::Pcie { addr, .. } => addr.segment,
+                _ => 0,
+            };
+            // RID → DeviceID through IORT / DT msi-map (its_pci_msi_prepare).
+            let device_id = its::pci_device_id(segment, rid).ok_or(MsixError::Unsupported)?;
             let event_id = irq_vector as u32;
-            let lpi = narf_interrupts::aarch64::its::LPI_BASE + irq_vector as u32;
+            let lpi = its::lpi_for_vector(irq_vector);
             let collection = (target_apic_id & 0xFFFF) as u16;
             // SAFETY: ITS is initialised at boot; lpi is bounded by
-            // its::NUM_LPIS.
-            // SAFETY: Valid memory or trusted environment
+            // its::NUM_LPIS (a u8 vector); the device is ours.
             unsafe {
-                narf_interrupts::aarch64::its::map_event(
-                    device_id as u32,
-                    event_id,
-                    lpi,
-                    collection,
-                )
-                .map_err(|_| MsixError::Unsupported)?;
+                its::map_event(device_id, event_id, lpi, collection)
+                    .map_err(|_| MsixError::Unsupported)?;
             }
         }
 

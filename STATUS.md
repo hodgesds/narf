@@ -528,7 +528,26 @@ training fallback, half-width encoder counts, AVI colorimetry and shared OPP/MPC
 subsampling/BT.709 conversion. The pixel DTO keeps the full pixel rate; live
 format checks reject stale compression or encoding state. Y420VDB modes stay
 4:2:0, and Y420CMDB modes use RGB when it fits. The single-OPP 4096-pixel limit
-remains; FRL DSC and physical transitions are still open.
+remains; physical transitions are still open.
+FRL DSC (model-tested, not hardware-validated) follows amdgpu_dm: a stream is
+compressed only when no uncompressed encoding fits, with the EDID HF-VSDB DSC
+caps, DC's HDMI slice/bpp rules, the compressed FRL capacity check and DSC
+padding borrow bit-exact against Linux built on the host (2970 capacity, 3000
+configuration and 890 CVTEM vectors). Lighting programs the DSC engines, the
+HPO encoder's DSC mode and CVTEM PPS (generic packets 5-10), then the OPTC
+after training; teardown reverses it. 7680x4320@60 on a 4x12G DSC sink picks
+4x6G with 8 slices at 159/16 bpp. FRL DSC compresses RGB from 12, 10 or 8 bpc
+(the deepest the HF-VSDB's DSC_10bpc/DSC_12bpc and amdgpu.max_bpc allow, as
+Linux tries each depth); compressed 4:2:0 is not native.
+DP MST DSC (model-tested, not hardware-validated) on 8b/10b and UHBR follows
+amdgpu_dm's fairness search (1500 link vectors through Linux's own functions),
+drm_dp_mst_dsc_aux_for_port (virtual DPCD, passthrough, Synaptics/Realtek
+quirk) and dm_helpers_dp_write_dsc_enable over remote DPCD; payload PBN uses
+the compressed bandwidth and each stream sends its own PPS. Two 4K144 sinks
+behind one HBR3 x4 branch both compress at equal bpp. MST DSC and UHBR DSC
+streams now keep LPCM, budgeted at the compressed bpp and slice count as
+Linux's check_audio_bandwidth_dp does (6048 host-checked DSC vectors);
+Synaptics cascaded workarounds and PCON FRL DSC are not ported.
 FRL now carries LPCM through AFMT4, lane-rate ACR and the pipe's Azalia endpoint.
 Admission/training reserve the sink's supported LPCM bandwidth; SD timings use
 layout 0. Audio starts after scanout and stops before it, preserving the
@@ -555,6 +574,35 @@ The lit Navi48 display is published as DRM KMS state on the amdgpu card, with
 the sink's real EDID and exact timing (disconnected on unplug). SETCRTC
 accepts only that timing, and the base amdgpu DRM version 3.0.0 claims no
 render ABI. Flip events remain software-paced.
+Navi48 DP SST displays now support VRR (FreeSync / DP Adaptive-Sync) as
+amdgpu_dm does: EDID range + DPCD MSA_TIMING_PAR_IGNORED give the connector's
+"vrr_capable", a VRR-supported stream sets IGNORE_MSA_TIMING_PARAM, and the
+CRTC's "VRR_ENABLED" reprograms OTG DRR live (optc401_set_drr totals from
+mod_freesync, a manual trigger per flip). HDMI/MST VRR, BTR/LFC and the
+FreeSync infopacket are gaps. Model-tested only; not run on an RX 9070 XT.
+Navi48 color management and HDR follow amdgpu_dm on DCN 4.0.1: CRTC CTM
+(MPC gamut remap), GAMMA_LUT (OGAM PWL from Linux's color_gamma/cm3 math,
+bit-exact against host-built Linux) and legacy SETGAMMA/GETGAMMA (sRGB
+pre-degamma ROM), applied live under the OTG lock; connector Colorspace
+(output CSC, blank, AVI C/EC/Q, DP MSA and VSC SDP) and HDR_OUTPUT_METADATA
+(HDMI DRM InfoFrame, DP HDR SDP, live metadata updates). No DEGAMMA_LUT on
+DCN 4.0.1, as Linux. HDR and VSC colorimetry now also go out on 128b/132b SST
+and MST streams (HPO VPG packets 0/3, GSP0/GSP3, MISC1), DIO MST streams and
+HDMI FRL (HPO FRL generic packet 4), with live metadata updates, and MST
+end-device connectors carry Colorspace/HDR_OUTPUT_METADATA. DP SST picks its
+output depth as amdgpu_dm does (EDID bpc bounded by max_bpc, stepping down
+until a link fits; 8 bpc by default), and at each depth compresses when no
+link carries it raw (10- and 12-bpc DSC input, the PPS, rate control and DSC
+input depth at that depth; 2000 depth-search vectors against Linux's DSC code).
+MST streams on a link with a DSC decoder take the deepest depth the port and
+the joint fairness search accept (1200 deep-color fairness vectors); MST links
+without a decoder run each stream at the deepest depth its port carries raw,
+its PBN sized for the requested depth as dm_encoder_helper_atomic_check does
+(1500 vectors through amdgpu_dm's depth and PBN code). Every connector, MST end
+devices included, has amdgpu_dm's "max bpc" property (8..16, starting at 16)
+through GETPROPERTY, OBJ_GET/SETPROPERTY, SETPROPERTY and atomic; a change
+relights the display it drives, and amdgpu.max_bpc stays a ceiling over it.
+Model-tested only; not run on an RX 9070 XT.
 Native legacy/HPO DisplayPort stream blanking now waits for actual video-stop
 acknowledgement before resetting or disabling FIFOs. It handles inherited
 disable-in-progress state, keeps timing and link clocks available for PHY
@@ -716,7 +764,8 @@ to the trained link; cancellation/failure retain ownership and block replay.
 The native frontend payload guard now accounts for DSC's compressed bits per
 pixel and slice overhead instead of rejecting it as uncompressed RGB. Actual
 trained rate/lanes and FEC's capacity reduction bound both kinds of stream;
-DSC requires the supported 8-bpc RGB SST/FEC path. A native regression exercises
+DSC requires the supported RGB/FEC path (SST or MST) at the blank depth its
+PPS codes. A native regression exercises
 DSC fitting one RBR lane when RGB does not, including the FEC capacity boundary.
 Legacy DSC training can now fall back among rate/lane settings that carry its
 unchanged admitted PPS and bpp. Alternative DP modes carry DSC into joint DML
@@ -830,6 +879,85 @@ gives it a free pipe, and the timing, both OPPs and DSCs, both HUBP/DPP/MPCC
 halves, deadlines, flips and the cursor are programmed across the pair
 (implementation and register models; no hardware run).
 
+Navi48 streams DML splits wider now run as ODM 3:1 and 4:1 (8K and 10K at
+high refresh, 4K480, 8K DSC of twelve or sixteen slices; DML21 matched
+against Linux on 1927 new configurations): the modeset takes every further
+pipe from the 4-pipe pool (refused when other displays or overlays hold
+them), and the OTG (segment count, widths incl. 3:1's last segment,
+divide-by-four timing, per-segment memories), every OPP's blank, every
+segment's DSC, HUBP viewports and SPL slice rects, deadlines and teardown
+cover each segment. Planes one DPP cannot carry (DPPCLK above the maximum,
+a swath the line buffer cannot hold) are MPC-combined on two DPPs as DML21's
+auto factor decides (matched against Linux on 1512 configurations; SPL MPC
+slices on 210 more), both slices blended in the stream's MPCC tree with
+overlays. New sinks light beside running displays, and the remaining ones
+re-plan after one leaves, without relighting them: shared DISPCLK/DPPCLK/
+DTBCLK follow dcn401's prepare (raise first) / optimize (lower after)
+ordering with the DPP DTO updates, and each running display takes its new
+global sync, DLG/TTU and watermarks under its OTG lock. MST configurations
+and mode changes still relight. Implementation and register models; no
+hardware run.
+
+Navi48 primary planes now take XRGB/ARGB/XBGR/ABGR 8888 and 2101010, RGB565
+and the four FP16 orders end to end (ADDFB2/GETPLANE/SETCRTC/PAGE_FLIP/atomic
+TEST_ONLY, DML21 admission at 2/4/8 bytes matched against Linux on a new
+format vector set, HUBP/DPP/MPC words as Linux programs them, premultiplied
+alpha per amdgpu_dm's default); a format change is a plane update (no relight).
+Register models and QEMU only; no hardware run.
+
+Navi48 planes now scale and stack as amdgpu_dm exposes them on DCN 4.0.1:
+the primary is placed and scaled through a port of DC's SPL (viewport,
+recout, ratios, taps, polyphase/EASF filters; every register word matched
+against host-built Linux SPL on 230 vectors) and the DSCL program, and up to
+three overlay planes (possible on every CRTC, XRGB/ARGB/XBGR/ABGR8888 and
+RGB565) take free pipes, blended above or below the primary through MPCC
+trees built as mpc1_insert_plane does, with alpha, pixel blend mode, zpos
+and rotation (0/180; 90/270 refused) properties. DML21 admits the planes
+jointly (matched against Linux on 654 scaled and multi-plane
+configurations); the KMS checks follow amdgpu_dm's (24x12 viewport, 16x up,
+6:1 down, primary required, zpos normalization) on ATOMIC, TEST_ONLY and the
+new SETPLANE, configurations short of pipes are refused, a plane change is
+applied without relighting and framebuffer updates of several planes flip at one
+VUPDATE. Register models and QEMU only; no hardware run.
+
+Navi48 planes now take GFX12 tiled and DCC framebuffers and NV12/P010 on
+every plane, as amdgpu_dm exposes them on DCN 4.0.1: the 17 GFX12 modifiers
+(12 DCC variants, 4 swizzles, LINEAR) in IN_FORMATS / IN_FORMATS_ASYNC,
+ADDFB2 with per-plane handles/pitches/offsets/modifiers and amdgpu's size
+checks, GEM_METADATA tiling flags converted for ADDFB2 without modifiers
+(modifier list, blobs and ADDFB2 decisions matched against Linux's own
+functions built on the host, 2454 vectors); HUBP swizzle, DCC enable, luma
+and chroma pitch/address; SPL 4:2:0 chroma scaling (124 new vectors against
+host-built Linux SPL); the YCbCr post CSC from COLOR_ENCODING/COLOR_RANGE
+(120 vectors against Linux's tables and switches); DML21 admission of
+tiled, DCC and two-surface 4:2:0 planes with their RQ, chroma DLG/TTU and
+mcache plans (618 new configurations against host-built Linux DML21). Tiled
+and 4:2:0
+framebuffers are staged and CPU-copied whole. Register models and QEMU only;
+no hardware run.
+
+Navi48 plane changes no longer relight the display: a plane moved, scaled,
+reblended, given another format, tiling or surface, an overlay added on a
+free pipe or removed, or the primary's format changed is DC's medium or full
+plane update with the timing running (classified as
+dc_check_update_surfaces_for_stream does). DML admits the configuration
+again, every plane DC keeps stays on its pipes, prepare_bandwidth raises the
+shared clocks and watermarks, and under the OTG master lock (dcn401's
+interdependent update lock) the freed pipes leave their MPCC trees, each
+changed plane's DPP, MPCC blending and HUBP surface are reprogrammed (on a
+full update every tree rebuilt top down as dcn20_update_mpcc does), the new
+pipes (enabled off-tree first) unblank; after the latch the freed pipes are
+drained and gated and their surfaces released, then optimize_bandwidth
+lowers what is no longer needed. The display monitor applies a commit's
+planes within a frame or two, its frames waiting for them; only a change of
+the stream itself (its ODM split) or an MST display relights. The hardware
+cursor now shows on every pipe it overlaps (overlays, ODM segments, MPC
+slices), placed as amdgpu_dm and dcn401_set_cursor_position place it (1060
+vectors against those Linux functions built on the host); DCN 4.0.1's cursor
+mode is always native, as amdgpu_dm decides. Register models and QEMU only
+(no OTG or OPP write during any plane update in the models); no hardware
+run.
+
 DP MST now also runs over 128b/132b links: a branch that codes UHBR trains
 MST at its best UHBR rate (as Linux's decide_mst_link_settings does), streams
 share the owner's HPO link encoder with all 64 slots from slot 0, and each
@@ -838,6 +966,18 @@ the VC rate and blanking width matched against Linux's fixed-point
 arithmetic) and only then unblanked; teardown blanks, removes the payload and
 stops the stream. Its LPCM rides the stream's HPO APG once the payload
 completed (implementation and register models; no hardware run).
+
+Navi48 DP SST DSC now also runs over 128b/132b: a mode no uncompressed link
+carries is compressed for the sink's maximum (UHBR) link as amdgpu_dm's
+policy does (8K60 and 4K240 at 16 bpp on 4 x UHBR10, configurations matched
+against Linux's dc_dsc_compute_config on the host), lights on the lowest
+128b/132b setting its compressed bandwidth needs, and wide streams use two
+DSCs under ODM 2:1. The HPO stream marks the format compressed, enables sink
+decoding and sends the PPS through its VPG (GSP11, VBID[6]) before a VC
+payload sized for the compressed bandwidth; fallback keeps the PPS. DML21
+plans match Linux with DP2P0 encoders. UHBR DSC now carries audio, MST DSC
+stays unsupported, and HDMI FRL DSC remains open (EDID DSC caps, compressed
+FRL capacity, CVTEM PPS). Implementation and register models; no hardware run.
 
 Native 8b/10b DP MST now reaches the platform display monitor and KMS for one
 branch, beside every board port: KMS routes any connector (board port or end
@@ -862,8 +1002,11 @@ port-bound bandwidth queries. Existing payloads are added back before comparing
 capacity, avoiding relights caused by our own allocations. Capacity changes retire
 old streams before reprobe/re-admission. Every shared path hop constrains payload
 and dark-mode admission; zero PBN rejects new modes. Incomplete resource queries
-retain the session and refuse replay. MST DSC and more than one branch
-remain open; no physical validation.
+retain the session and refuse replay. Cascaded (daisy-chained) branches share
+one link's payload table, hop budgets and DSC fairness; a downstream change
+that keeps every lit route (a branch or device added or removed elsewhere) is
+adopted live without stopping streams, as Linux handles a CSN. MST on more
+than one DP port at a time remains open; no physical validation.
 The MST manager now also exposes bounded idle notification polling over
 DMUB AUX, retains fragmented messages across transaction/poll boundaries and
 applies queue backpressure. Connection notices drive topology reconciliation
@@ -983,6 +1126,11 @@ plus the active luma/chroma checksum. Input, command and output guards remain
 checked; failure/cancellation retains all backing and requested picture proofs
 repeat after recovery. Models test synthetic pixels, not JPEG decoding;
 physical picture execution and native JPEG clients remain open.
+Native JPEG clients now follow: `amdgpu.navi48_media` keeps JPEG0 running as
+`AMDGPU_HW_IP_VCN_JPEG` ring 4 with Linux-style kernel-copied VMID0 IBs (plus
+a stricter privileged-register filter), client decoder VMIDs on MMHUB engine 1,
+retained per-job copy slots, JPEG-only ring reset with innocent replay, and a
+fifth recovery owner retired before VCN restarts. Model-tested only.
 Fault recovery
 requires all four retirements and renewed owners, followed by a new media
 interrupt and session IB proof before ledger commit. Media restart cancels old codec

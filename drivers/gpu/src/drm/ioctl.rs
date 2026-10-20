@@ -51,6 +51,7 @@ pub enum IoctlCmd {
     ModeGetCrtc = 0xA1,
     ModeSetCrtc = 0xA2,
     ModeCursor = 0xA3,
+    ModeGetGamma = 0xA4,
     ModeSetGamma = 0xA5,
     ModeGetEncoder = 0xA6,
     ModeGetConnector = 0xA7,
@@ -67,6 +68,7 @@ pub enum IoctlCmd {
     ModeGetPropBlob = 0xAC,
     ModeGetPlaneRes = 0xB5,
     ModeGetPlane = 0xB6,
+    ModeSetPlane = 0xB7,
     ModeCursor2 = 0xBB,
     ModeAtomic = 0xBC,
     ModeCreatePropBlob = 0xBD,
@@ -101,6 +103,7 @@ impl IoctlCmd {
             0xA1 => IoctlCmd::ModeGetCrtc,
             0xA2 => IoctlCmd::ModeSetCrtc,
             0xA3 => IoctlCmd::ModeCursor,
+            0xA4 => IoctlCmd::ModeGetGamma,
             0xA5 => IoctlCmd::ModeSetGamma,
             0xA6 => IoctlCmd::ModeGetEncoder,
             0xA7 => IoctlCmd::ModeGetConnector,
@@ -111,6 +114,7 @@ impl IoctlCmd {
             0xBA => IoctlCmd::ModeObjSetProperty,
             0xAC => IoctlCmd::ModeGetPropBlob,
             0xB6 => IoctlCmd::ModeGetPlane,
+            0xB7 => IoctlCmd::ModeSetPlane,
             0xB0 => IoctlCmd::ModePageFlip,
             0xB2 => IoctlCmd::ModeCreateDumb,
             0xB3 => IoctlCmd::ModeMapDumb,
@@ -428,6 +432,7 @@ pub fn dispatch(
         | IoctlCmd::ModeSetCrtc
         | IoctlCmd::ModeGetCrtc
         | IoctlCmd::ModeGetEncoder
+        | IoctlCmd::ModeGetGamma
         | IoctlCmd::ModeSetGamma
         | IoctlCmd::SetMaster
         | IoctlCmd::DropMaster
@@ -438,6 +443,7 @@ pub fn dispatch(
         | IoctlCmd::ModeObjSetProperty
         | IoctlCmd::ModeGetPropBlob
         | IoctlCmd::ModeGetPlane
+        | IoctlCmd::ModeSetPlane
         | IoctlCmd::ModePageFlip
         | IoctlCmd::ModeCreateDumb
         | IoctlCmd::ModeMapDumb
@@ -562,17 +568,15 @@ fn handle_addfb2(card: &mut Card, arg: &[u8]) -> Result<DrmIoctlResult, DrmIoctl
     if arg.len() < 68 {
         return Err(DrmIoctlError::BadSize);
     }
-    // fb_id is at offset 0 (output) — skip; width at 4, height at 8.
-    let width = u32::from_le_bytes(arg[4..8].try_into().unwrap());
-    let height = u32::from_le_bytes(arg[8..12].try_into().unwrap());
-    let pixel_format = u32::from_le_bytes(arg[12..16].try_into().unwrap());
-    // flags at 16 (ignored for now).
-    // handles[0] at 20.
-    let gem_handle = u32::from_le_bytes(arg[20..24].try_into().unwrap());
-    // pitches[0] at 36.
-    let pitch = u32::from_le_bytes(arg[36..40].try_into().unwrap());
-
-    let fb_id = card.addfb2(width, height, pixel_format, pitch, gem_handle)?;
+    // fb_id at 0 (output); width, height, pixel_format, flags; handles[4]
+    // at 20, pitches[4] at 36, offsets[4] at 52, then (after 4 bytes of u64
+    // alignment padding) modifier[4] at 72. A struct too short for the
+    // modifiers cannot carry DRM_MODE_FB_MODIFIERS.
+    let cmd = crate::amdgpu_dm_modifiers::FbCmd::parse(arg).ok_or(DrmIoctlError::BadSize)?;
+    if cmd.flags & 2 != 0 && arg.len() < 104 {
+        return Err(DrmIoctlError::Card(CardError::UnknownFormat));
+    }
+    let fb_id = card.addfb2_cmd(&cmd)?;
     Ok(DrmIoctlResult::AddFb2(fb_id))
 }
 

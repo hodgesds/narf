@@ -4,11 +4,14 @@
 //! serves the Linux amdgpu hwmon ABI (amdgpu_pm.c `hwmon_attributes`) from the
 //! last sample. Fan control stays automatic: smu_v14_0_2_ppt.c provides no
 //! fan-mode or PWM setters, so `pwm1`/`pwm1_enable` are read-only as in Linux.
-//! Nothing here changes clocks, limits or protection.
+//! `power1_cap` is writable (amdgpu_hwmon_set_power_cap: microwatts to watts,
+//! checked against `power1_cap_{min,max}`); nothing else changes clocks,
+//! limits or protection.
 use crate::amdgpu_smu_navi48 as smu;
 use crate::amdgpu_smu_navi48_telemetry::{Limits, Telemetry, CRIT_HYST_MILLI, THROTTLERS};
 use alloc::{string::String, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
+use narf_filesystem::FsError;
 use narf_lib::sync::IrqSafeSpinLock;
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -178,7 +181,42 @@ async fn monitor(generation: u64) {
 /// Linux amdgpu hwmon attribute names, filtered as `hwmon_attributes_visible`
 /// does for a fan-equipped (or fanless) SMU14.0.2 dGPU (no RPM setters).
 pub(crate) fn attributes(fan: bool) -> Vec<&'static str> {
-    crate::amdgpu_hwmon::attributes(fan, false)
+    let mut names = crate::amdgpu_hwmon::attributes(fan, false);
+    names.extend_from_slice(&["power1_cap_min", "power1_cap_max"]);
+    names
+}
+
+/// A `power1_cap` write in microwatts, as amdgpu_hwmon_set_power_cap: the
+/// watt value must lie in the board's non-overdrive range (smu_set_ppt_limit
+/// -EINVAL otherwise; 0 there means the default only for the default limit
+/// type, which hwmon does not use).
+pub(crate) fn power_cap_request(limits: Option<Limits>, bytes: &[u8]) -> Result<u32, FsError> {
+    let microwatts = crate::amdgpu_hwmon::parse_u32(bytes).ok_or(FsError::InvalidData)?;
+    let watts = microwatts / 1_000_000;
+    let limits = limits.ok_or(FsError::NoDevice)?;
+    if watts < limits.ppt_min_w || watts > limits.ppt_max_w || watts == 0 {
+        return Err(FsError::InvalidData);
+    }
+    Ok(watts)
+}
+fn store(name: &'static str, bytes: &[u8]) -> Result<(), FsError> {
+    if name != "power1_cap" {
+        return Err(FsError::OperationNotPermitted);
+    }
+    let watts = power_cap_request(snapshot().and_then(|s| s.limits), bytes)?;
+    // sysfs stores run in a syscall; the SMU exchange needs the async
+    // platform owner, so apply on the executor and report through the next
+    // telemetry sample (power1_cap reads PMFW's GetPptLimit).
+    narf_scheduler::spawn(async move {
+        if let Err(e) = crate::amdgpu_navi48_platform::set_power_cap(watts).await {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi48 power1_cap {watts} W refused: {e:?}"
+            );
+        }
+    });
+    Ok(())
 }
 
 fn reading(snapshot: Option<&Snapshot>) -> crate::amdgpu_hwmon::Reading {
@@ -209,6 +247,8 @@ fn reading(snapshot: Option<&Snapshot>) -> crate::amdgpu_hwmon::Reading {
         power_average_w: m.map(|m| m.socket_power_w.into()),
         power_cap_w: t.map(|t| t.ppt_limit_w),
         power_cap_default_w: l.map(|l| l.ppt_default_w.into()),
+        power_cap_min_w: l.map(|l| l.ppt_min_w),
+        power_cap_max_w: l.map(|l| l.ppt_max_w),
         // sclk is METRICS_AVERAGE_GFXCLK, mclk METRICS_CURR_UCLK.
         sclk_mhz: m.map(|m| m.gfx_mhz.into()),
         mclk_mhz: m.map(|m| m.uclk_mhz),
@@ -223,9 +263,11 @@ pub(crate) fn show(snapshot: Option<&Snapshot>, name: &str) -> String {
 
 /// Publish `/sys/class/hwmon/hwmon<N>` (first free N) named `amdgpu`.
 pub(crate) fn publish(limits: Option<Limits>) {
-    crate::amdgpu_hwmon::publish(
+    crate::amdgpu_hwmon::publish_writable(
         attributes(limits.is_some_and(|l| l.fan_max_rpm.is_some())),
         |name| show(snapshot().as_ref(), name),
+        &["power1_cap"],
+        store,
     );
 }
 

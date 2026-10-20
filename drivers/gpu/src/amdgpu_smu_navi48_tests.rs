@@ -108,7 +108,7 @@ impl Io for Fake {
             0x1e if p >> 16 == 2 => 1258,
             0x1d => 500,
             0x1e => 3100,
-            0x36 | 6 | 0x19 | 0x1a | 0x2a..=0x2d => 0,
+            0x36 | 6 | 0x19 | 0x1a | 0x2a..=0x2d | 0x32 | 0x15..=0x17 => 0,
             8 => {
                 self.enabled |= p as u64;
                 0
@@ -189,6 +189,8 @@ fn fixture() -> (Pool, Engine<Fake>) {
             limits: None,
             protection: 0,
             gfx_level: GfxLevel::Auto,
+            baco: BacoState::Exit,
+            boot_enabled: 0,
         },
     )
 }
@@ -662,6 +664,9 @@ fn limits_board() -> Vec<u8> {
     let mut b = board();
     put16(&mut b, 43, 118); // software_shutdown_temp
     put16(&mut b, 4924, 304); // SocketPowerLimitAc[PPT0]
+    put16(&mut b, 3976, 340); // MsgLimits.Power[PPT0][AC]
+    put16(&mut b, 4124, (-10i16) as u16); // OverDriveLimitsBasicMin.Ppt
+    put16(&mut b, 4188, 1 << 3); // OverDriveLimitsBasicMax: PPT overdrive
     for (i, c) in [(0, 100u16), (1, 110), (4, 108)] {
         put16(&mut b, 4944 + 2 * i, c); // TemperatureLimit
     }
@@ -704,6 +709,9 @@ fn smu14_telemetry_decodes_metrics_limits_and_protection() -> TestResult {
             software_shutdown_offset_c: -10,
             fan_max_rpm: Some(3300),
             ppt_default_w: 304,
+            // min(304, 340) * (100 - 10) / 100 and max(304, 340).
+            ppt_min_w: 273,
+            ppt_max_w: 340,
         }
     );
     e.io.metrics = metrics(40, 30);
@@ -859,6 +867,36 @@ kernel_test_in!(
     smu14_gfx_levels_use_soft_limits_only
 );
 
+fn smu14_ppt_limit_is_one_set_ppt_limit_with_ppt_running() -> TestResult {
+    let (_, mut e) = powered();
+    assert_ne!(e.power.unwrap().enabled & 1 << 23, 0);
+    e.io.commands.clear();
+    run(e.set_ppt_limit(300)).unwrap();
+    assert_eq!(e.io.commands, [(0x32, 300)]);
+    assert_eq!(e.state, State::PowerReady);
+    e.io.commands.clear();
+    for bad in [0, 0x1_0000] {
+        assert_eq!(run(e.set_ppt_limit(bad)), Err(Error::Invalid));
+    }
+    assert!(e.io.commands.is_empty());
+    e.io.reject = Some(0x32);
+    assert_eq!(run(e.set_ppt_limit(290)), Err(Error::Rejected(0xfd)));
+    assert_eq!(e.state, State::PowerReady);
+    // Without the PPT feature (THROTTLERS) PMFW cannot take a new limit.
+    let (_, mut e) = powered();
+    if let Some(p) = e.power.as_mut() {
+        p.enabled &= !(1 << 23);
+    }
+    e.io.commands.clear();
+    assert_eq!(run(e.set_ppt_limit(300)), Err(Error::Unsupported));
+    assert!(e.io.commands.is_empty());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi48",
+    smu14_ppt_limit_is_one_set_ppt_limit_with_ppt_running
+);
+
 fn smu14_vcn_power_requires_current_static_policy_and_protection() -> TestResult {
     let (_, mut e) = powered();
     for (enabled, command) in [(true, 0x2a), (false, 0x2b)] {
@@ -996,4 +1034,157 @@ fn smu14_deep_sleep_is_gated_and_keeps_protection() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/smu-navi48",
     smu14_deep_sleep_is_gated_and_keeps_protection
+);
+
+/// A configured owner whose board table carries `caps` as platform_caps.
+fn baco_powered(caps: u32) -> (Pool, Engine<Fake>) {
+    let (pool, mut e) = fixture();
+    e.io.board = limits_board();
+    put(&mut e.io.board, PLATFORM_CAPS, caps);
+    run(e.verify()).unwrap();
+    run(e.read_board()).unwrap();
+    run(e.upload_board()).unwrap();
+    run(e.configure_power()).unwrap();
+    e.io.commands.clear();
+    (pool, e)
+}
+/// smu_v14_0_get_bamaco_support, smu_v14_0_baco_set_state and
+/// smu_v14_0_2_baco_enter/exit: EnterBaco(BACO_SEQ_BAMACO or BACO) and
+/// ExitBaco without audio, ArmD3(BAMACO by MACO circuitry) / ArmD3(ULPS)
+/// with it; repeated requests for the current state send nothing.
+fn smu14_baco_messages_follow_smu_v14_0_2() -> TestResult {
+    for (caps, want) in [
+        (0, 0),
+        (PLATFORM_CAP_MACO, 0),
+        (PLATFORM_CAP_BACO, BACO_SUPPORT),
+        (
+            PLATFORM_CAP_BACO | PLATFORM_CAP_MACO,
+            BACO_SUPPORT | MACO_SUPPORT,
+        ),
+    ] {
+        let (_, e) = baco_powered(caps);
+        if e.bamaco_support() != want {
+            return TestResult::Fail("BACO/MACO support from platform_caps");
+        }
+    }
+    // A board-supported BACO feature PMFW stopped running: no BACO.
+    let (_, mut e) = baco_powered(PLATFORM_CAP_BACO);
+    if e.boot_enabled & FEATURE_BACO == 0 || ALLOWED & FEATURE_BACO == 0 {
+        return TestResult::Fail("FEATURE_BACO not allowed at boot");
+    }
+    e.power.as_mut().unwrap().enabled &= !FEATURE_BACO;
+    if e.bamaco_support() != 0 {
+        return TestResult::Fail("BACO claimed with the feature disabled");
+    }
+    for (caps, bamaco, armd3, enter, exit, clear) in [
+        // EnterBaco carries the runtime mode's sequence.
+        (
+            PLATFORM_CAP_BACO | PLATFORM_CAP_MACO,
+            true,
+            false,
+            (0x15, 2),
+            (0x16, 0),
+            true,
+        ),
+        (
+            PLATFORM_CAP_BACO | PLATFORM_CAP_MACO,
+            false,
+            false,
+            (0x15, 0),
+            (0x16, 0),
+            true,
+        ),
+        // ArmD3 follows maco_support whatever the mode.
+        (
+            PLATFORM_CAP_BACO | PLATFORM_CAP_MACO,
+            false,
+            true,
+            (0x17, 2),
+            (0x17, 3),
+            false,
+        ),
+        (PLATFORM_CAP_BACO, true, true, (0x17, 0), (0x17, 3), false),
+    ] {
+        let (_, mut e) = baco_powered(caps);
+        if run(e.baco_enter(bamaco, armd3)).is_err()
+            || e.state != State::Baco
+            || e.baco != BacoState::Enter
+            || e.bamaco_support() & BACO_SUPPORT == 0
+        {
+            return TestResult::Fail("BACO entry");
+        }
+        // Telemetry/DPM are refused while the chip is off.
+        if run(e.set_gfx_level(GfxLevel::High)) != Err(Error::Busy) {
+            return TestResult::Fail("runtime command accepted in BACO");
+        }
+        if run(e.baco_exit(armd3)) != Ok(clear)
+            || e.state != State::BacoExited
+            || e.baco != BacoState::Exit
+            || e.io.commands != [enter, exit]
+        {
+            return TestResult::Fail("BACO message sequence");
+        }
+        // The exited owner is retired; a repeated exit sends nothing.
+        if !armd3 && (run(e.baco_exit(false)) != Ok(true) || e.io.commands.len() != 2) {
+            return TestResult::Fail("repeated ExitBaco sent a message");
+        }
+        if run(e.baco_enter(bamaco, armd3)) != Err(Error::Busy) {
+            return TestResult::Fail("retired owner re-entered BACO");
+        }
+    }
+    // Entry needs configured power.
+    let (_, mut e) = fixture();
+    run(e.verify()).unwrap();
+    if run(e.baco_enter(false, false)) != Err(Error::Busy) || e.io.commands.len() != 2 {
+        return TestResult::Fail("BACO entry before power configuration");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi48",
+    smu14_baco_messages_follow_smu_v14_0_2
+);
+
+/// A clean PMFW rejection of EnterBaco/ArmD3 leaves the owner powered and
+/// reusable; a stalled exit (cancelled) is terminal and never replayed.
+fn smu14_baco_rejection_and_cancellation() -> TestResult {
+    for (armd3, message) in [(false, 0x15), (true, 0x17)] {
+        let (_, mut e) = baco_powered(PLATFORM_CAP_BACO);
+        e.io.reject = Some(message);
+        if run(e.baco_enter(false, armd3)) != Err(Error::Rejected(0xfd))
+            || e.state != State::PowerReady
+            || e.baco != BacoState::Exit
+        {
+            return TestResult::Fail("rejected BACO entry must leave the owner powered");
+        }
+        e.io.reject = None;
+        if run(e.baco_enter(false, armd3)).is_err() || e.state != State::Baco {
+            return TestResult::Fail("BACO entry after a rejection");
+        }
+        if armd3 {
+            // ArmD3(ULPS) follows a 10 ms sleep; the stall case is ExitBaco.
+            continue;
+        }
+        e.io.stall = Some(0x16);
+        {
+            let f = e.baco_exit(armd3);
+            let mut f = core::pin::pin!(f);
+            for _ in 0..8 {
+                if f.as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_ready()
+                {
+                    return TestResult::Fail("stalled BACO exit completed");
+                }
+            }
+        }
+        if e.state != State::BacoTransition || run(e.baco_exit(armd3)) != Err(Error::Busy) {
+            return TestResult::Fail("cancelled BACO exit replayed");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi48",
+    smu14_baco_rejection_and_cancellation
 );

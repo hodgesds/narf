@@ -1,7 +1,7 @@
 //! DCN401 UHBR SST LPCM: dcn31 HPO stream encoder + APG, and Azalia.
 //! APG instance follows the HPO stream; its input mux chooses the endpoint.
 use super::*;
-use crate::amdgpu_dcn401_otg::dp_phy::training::uhbr::video::uhbr_payload;
+use crate::amdgpu_dcn401_otg::dp_phy::training::uhbr::video::{uhbr_dsc_payload, uhbr_payload};
 #[path = "amdgpu_dcn401_uhbr_audio_bw.rs"]
 mod bandwidth;
 
@@ -16,31 +16,67 @@ const PACKETS: u64 = 0x367c;
 /// Filter LPCM against the actual trained UHBR link and native blank budget;
 /// compressed SADs pass through as dce_aud_az_configure programs them. No
 /// surviving LPCM rate means silent video.
+#[cfg(feature = "kernel-test")]
 pub(crate) fn uhbr_audio_info(
     info: AudioInfo,
     timing: &Timing,
     bpc: u32,
     settings: UhbrSettings,
 ) -> Option<AudioInfo> {
+    uhbr_audio_info_with(info, timing, bpc, settings, None)
+}
+/// `uhbr_audio_info` for a stream compressed with `dsc`: the budget at its
+/// compressed bits per pixel and slices, against the blank width the
+/// compressed stream's payload programs (uhbr_dsc_payload), as
+/// build_audio_output passes dsc_cfg to check_audio_bandwidth_dp.
+pub(crate) fn uhbr_audio_info_with(
+    info: AudioInfo,
+    timing: &Timing,
+    bpc: u32,
+    settings: UhbrSettings,
+    dsc: Option<&crate::amdgpu_dsc::DscConfig>,
+) -> Option<AudioInfo> {
+    let audio_dsc = super::bandwidth::AudioDsc::of(dsc);
     // Validate before uhbr_payload's blank subtraction and fixed-point math.
-    bandwidth::rates(timing, bpc, settings, 0, 2, 0)?;
-    let payload = uhbr_payload(timing, bpc, settings)?;
+    bandwidth::rates(timing, bpc, settings, 0, 2, 0, audio_dsc)?;
+    let width = hblank_width(timing, bpc, settings, dsc)?;
     filtered_audio_info(info, |channels, rates| {
-        bandwidth::rates(
-            timing,
-            bpc,
-            settings,
-            payload.hblank_symbols,
-            channels,
-            rates,
-        )
+        bandwidth::rates(timing, bpc, settings, width, channels, rates, audio_dsc)
     })
+}
+/// The minimum blank symbol width the stream's payload programs.
+fn hblank_width(
+    timing: &Timing,
+    bpc: u32,
+    settings: UhbrSettings,
+    dsc: Option<&crate::amdgpu_dsc::DscConfig>,
+) -> Option<u16> {
+    match dsc {
+        Some(cfg) => uhbr_dsc_payload(timing, cfg, settings),
+        None => uhbr_payload(timing, bpc, settings),
+    }
+    .map(|p| p.hblank_symbols)
 }
 /// dce_aud_az_configure's HBR probe: 192-kHz eight-channel audio within the
 /// same blanking budget.
-fn uhbr_hbr(timing: &Timing, bpc: u32, settings: UhbrSettings) -> bool {
-    uhbr_payload(timing, bpc, settings)
-        .and_then(|p| bandwidth::rates(timing, bpc, settings, p.hblank_symbols, 8, 0x40))
+fn uhbr_hbr(
+    timing: &Timing,
+    bpc: u32,
+    settings: UhbrSettings,
+    dsc: Option<&crate::amdgpu_dsc::DscConfig>,
+) -> bool {
+    hblank_width(timing, bpc, settings, dsc)
+        .and_then(|w| {
+            bandwidth::rates(
+                timing,
+                bpc,
+                settings,
+                w,
+                8,
+                0x40,
+                super::bandwidth::AudioDsc::of(dsc),
+            )
+        })
         .is_some_and(|r| r & 0x40 != 0)
 }
 fn bpc(v: &UhbrVideoRunning) -> u32 {
@@ -172,7 +208,11 @@ impl<I: Io> Engine<I> {
             None => {}
         }
         let t = v.timing.blank.timing.request.timing;
-        let info = uhbr_audio_info(info, &t, bpc(&v), v.link.settings).ok_or(Error::Unsupported)?;
+        // A compressed stream's audio (Linux keeps it; build_audio_output
+        // passes the DSC config to the budget).
+        let dsc = v.timing.blank.timing.request.dsc;
+        let info = uhbr_audio_info_with(info, &t, bpc(&v), v.link.settings, dsc.as_ref())
+            .ok_or(Error::Unsupported)?;
         let (descriptors, ac3, _) = descriptors(&info, &t, None);
         let a = DisplayAudio {
             info,
@@ -180,7 +220,7 @@ impl<I: Io> Engine<I> {
             endpoint: v.stream,
             channels: 0xff,
             descriptors,
-            hbr: uhbr_hbr(&t, bpc(&v), v.link.settings),
+            hbr: uhbr_hbr(&t, bpc(&v), v.link.settings, dsc.as_ref()),
         };
         if !self.audio_endpoint_available(a.endpoint) {
             return Err(Error::Busy);

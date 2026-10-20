@@ -28,6 +28,24 @@
 #include "bounding_boxes/dcn4_soc_bb.h"
 #include "odm_pipes.h"
 
+/* PIXEL_BYTES=2|4|8 in the environment: the plane's dml2_444_16 (RGB565),
+ * dml2_444_32 (8888, 2101010; the default) or dml2_444_64 (FP16) format, as
+ * dml21_translation_helper maps the DC surface formats. */
+static enum dml2_source_format_class pixel_format(void)
+{
+	const char *b = getenv("PIXEL_BYTES");
+
+	if (b && b[0] == '2' && !b[1])
+		return dml2_444_16;
+	if (b && b[0] == '8' && !b[1])
+		return dml2_444_64;
+	if (b && !(b[0] == '4' && !b[1])) {
+		fprintf(stderr, "PIXEL_BYTES must be 2, 4 or 8\n");
+		exit(2);
+	}
+	return dml2_444_32;
+}
+
 static bool no_uclk_pstate(struct dml2_pmo_init_for_pstate_support_in_out *in_out)
 {
 	(void)in_out;
@@ -117,7 +135,7 @@ int main(int argc, char **argv)
 	s->overrides.hw.twait_budgeting.stutter_enter_exit = dml2_twait_budgeting_setting_if_needed;
 
 	struct dml2_plane_parameters *p = &cfg.plane_descriptors[0];
-	p->pixel_format = dml2_444_32;
+	p->pixel_format = pixel_format();
 	p->surface.tiling = dml2_sw_linear;
 	p->surface.plane0.pitch = a[18];
 	p->surface.plane0.width = a[1];

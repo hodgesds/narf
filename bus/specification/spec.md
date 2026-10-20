@@ -152,6 +152,33 @@ Writes one dword with the same offset rules. It exists for state that
 capability control words and extended capabilities such as Resizable
 BAR. Callers write zero into RW1C status halves sharing the dword.
 
+```rust
+pub const pci::PM_D3HOT_DELAY_MS: u64 = 10;
+pub enum pci::PciPowerState { D0, D1, D2, D3Hot }
+pub fn pci::power_state(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice)
+    -> Result<Option<PciPowerState>, PciError>;
+pub fn pci::set_power_state(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice,
+    state: PciPowerState) -> Result<(), PciError>;
+pub fn pci::bridge_bus_range(device: &BusDevice) -> Option<(u8, u8)>;
+pub fn pci::upstream_bridge(device: &BusDevice) -> Option<BusDevice>;
+pub fn pci::sibling_function(device: &BusDevice, function: u8) -> Option<BusDevice>;
+```
+
+`power_state` / `set_power_state` read and write the PMCSR PowerState of
+the PCI PM capability (`CapNotPresent` without one; `Ok(None)` for an
+all-ones read). The write preserves every other PMCSR field, writes 0 to
+the RW1C PME_Status bit and refuses D1/D2 the PMC register does not
+advertise. Neither waits: the caller sleeps `PM_D3HOT_DELAY_MS` after a
+D3hot entry or exit before the next config access, on the timer wheel
+(`power/` §3.5 runtime-PM PCI layer). `pm_d3hot_cycle` keeps its own
+bounded wait for the SDHCI reset quirk.
+
+`bridge_bus_range` reads a type-1 header's secondary/subordinate bus
+numbers. `upstream_bridge` (Linux `pci_upstream_bridge`) finds the
+registered bridge whose secondary bus is the function's bus, and
+`sibling_function` another function of the same slot; both read only
+the type-1 / registry data and need no capability.
+
 ### 3.5 Hot-plug
 
 ```rust
