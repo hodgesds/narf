@@ -181,6 +181,39 @@ fn smoke_rtnl_delroute_missing_is_esrch() -> TestResult {
 }
 kernel_test_in!("net/errno", smoke_rtnl_delroute_missing_is_esrch);
 
+/// Linux `fib_table_delete` (net/ipv4/fib_trie.c) matches a route of any
+/// scope when the request carries `rtm_scope = RT_SCOPE_NOWHERE` (255),
+/// which iproute2, libnl and NetworkManager send on RTM_DELROUTE; only
+/// `fib_create_info` rejects a scope above RT_SCOPE_HOST, and only for a new
+/// route. NetworkManager logged "do-delete-ip4-route ... failure 22" for
+/// every DHCP default route it retired while NARF validated the scope on
+/// delete too.
+fn smoke_rtnl_delroute_scope_nowhere_matches() -> TestResult {
+    let Some((admin, ifindex)) = rtnl_admin("errno-rt5", 6) else {
+        return TestResult::Fail("test interface has no rtnetlink ifindex");
+    };
+    let mut body = rtmsg(AF_INET, 24, Some(&[203, 0, 113, 0]), ifindex);
+    body[6] = 255;
+    let create = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
+    if rtnl(Some(&admin), &nlmsg(RTM_NEWROUTE, create, 12, &body)) != Some(e::EINVAL) {
+        return TestResult::Fail("RTM_NEWROUTE with RT_SCOPE_NOWHERE must be -EINVAL");
+    }
+    body[6] = 253;
+    if rtnl(Some(&admin), &nlmsg(RTM_NEWROUTE, create, 13, &body)) != Some(0) {
+        return TestResult::Fail("RTM_NEWROUTE of a link-scope route failed");
+    }
+    body[6] = 255;
+    let del = nlmsg(RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, 14, &body);
+    if rtnl(Some(&admin), &del) != Some(0) {
+        return TestResult::Fail("RTM_DELROUTE with RT_SCOPE_NOWHERE must match any scope");
+    }
+    if rtnl(Some(&admin), &del) != Some(e::ESRCH) {
+        return TestResult::Fail("the RT_SCOPE_NOWHERE delete left the route in place");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/errno", smoke_rtnl_delroute_scope_nowhere_matches);
+
 /// Linux `inet_rtm_deladdr` (net/ipv4/devinet.c): "ipv4: Address not
 /// found" → -EADDRNOTAVAIL; `inet6_addr_del` (net/ipv6/addrconf.c):
 /// "address not found" → -EADDRNOTAVAIL.
