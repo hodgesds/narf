@@ -20,12 +20,15 @@ pub const GITS_CREADR: usize = 0x0090;
 pub const GITS_BASER0: usize = 0x0100;
 
 pub const CTLR_ENABLE: u32 = 1 << 0;
-pub const CTLR_QUIESC: u32 = 1 << 1;
+/// `GITS_CTLR.Quiescent` is bit 31 (bit 1 is ImDe).
+pub const CTLR_QUIESC: u32 = 1 << 31;
 pub const CTLR_READY: u32 = 1 << 31;
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct GitsCaps {
+    /// EventID width.
     pub id_bits: u8,
+    /// DeviceID width.
     pub dev_bits: u8,
     pub hcc: u16,
     pub physical: bool,
@@ -63,12 +66,14 @@ pub unsafe fn read_caps(reg_base: usize) -> GitsCaps {
     decode_caps(typer)
 }
 
+/// `GITS_TYPER` (Arm IHI 0069H §12.19.17; Linux `GITS_TYPER_*`):
+/// Physical bit 0, EventID bits [12:8], Devbits [17:13], HCC [31:24].
 pub fn decode_caps(typer: u64) -> GitsCaps {
     GitsCaps {
-        id_bits: ((typer & 0x1F) + 1) as u8,
-        dev_bits: (((typer >> 8) & 0x1F) + 1) as u8,
-        hcc: ((typer >> 16) & 0xFFFF) as u16,
-        physical: typer & (1 << 32) != 0,
+        id_bits: (((typer >> 8) & 0x1F) + 1) as u8,
+        dev_bits: (((typer >> 13) & 0x1F) + 1) as u8,
+        hcc: ((typer >> 24) & 0xFF) as u16,
+        physical: typer & 1 != 0,
     }
 }
 

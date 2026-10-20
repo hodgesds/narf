@@ -2399,13 +2399,15 @@ kernel_test_in!("arch/cache_topology", smoke_x86_cache_levels_present);
 #[cfg(target_arch = "aarch64")]
 fn smoke_gits_caps_decode() -> TestResult {
     use crate::aarch64::gits;
-    // ID-bits = 16, Devbits = 8, HCC = 0xABCD, physical bit set.
-    let typer: u64 = (15)            // (id_bits - 1) = 15 → 16
-                   | ((7u64) << 8)   // (dev_bits - 1) = 7 → 8
-                   | ((0xABCDu64) << 16)
-                   | (1u64 << 32);
+    // GITS_TYPER: Physical [0], ITT_entry_size [7:4], IDbits [12:8],
+    // Devbits [17:13], HCC [31:24] (Arm IHI 0069H §12.19.17).
+    let typer: u64 = 1               // Physical
+                   | (7u64 << 4)     // 8-byte ITEs
+                   | (15u64 << 8)    // (id_bits - 1) = 15 → 16
+                   | (7u64 << 13)    // (dev_bits - 1) = 7 → 8
+                   | (0xABu64 << 24);
     let c = gits::decode_caps(typer);
-    if c.id_bits != 16 || c.dev_bits != 8 || c.hcc != 0xABCD || !c.physical {
+    if c.id_bits != 16 || c.dev_bits != 8 || c.hcc != 0xAB || !c.physical {
         return TestResult::Fail("ITS TYPER decode mismatch");
     }
     TestResult::Pass
