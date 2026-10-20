@@ -520,6 +520,7 @@ fn dcn401_frl_controls_bind_live_scanout() -> TestResult {
                 bytes_per_pixel: 4,
                 ycbcr420: false,
                 dsc: None,
+                planes: [None; dml::MAX_PLANES],
             },
         )
         .unwrap(),

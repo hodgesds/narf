@@ -62,6 +62,7 @@ fn live(pipe: u8) -> (Engine<Fake>, Request) {
                 bytes_per_pixel: 4,
                 ycbcr420: false,
                 dsc: None,
+                planes: [None; dml::MAX_PLANES],
             },
         )
         .unwrap(),

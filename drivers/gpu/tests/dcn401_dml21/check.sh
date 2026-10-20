@@ -2,7 +2,9 @@
 # Verify drivers/gpu/tests/dcn401_dml21/vectors.txt against Linux DML21.
 #   drivers/gpu/tests/dcn401_dml21/check.sh [linux-tree]   (default /usr/src/linux)
 # multi_vectors.txt is checked the same way with harness_multi.c, and
-# ycbcr420_vectors.txt with it on HDMI YCbCr 4:2:0 outputs.
+# ycbcr420_vectors.txt with it on HDMI YCbCr 4:2:0 outputs plane_vectors.txt
+# (scaled planes, several planes per stream) is checked with harness_planes.c,
+# whose inputs carry each plane's surface, viewport, ratios and taps.
 #
 # Builds the DCN4 DML21 sources twice on the host: as shipped ("plain"), and
 # "strict" with the Tpre > max(Turg, Ttrip) + Tex check that Linux compiles
@@ -81,6 +83,7 @@ others=$(ls "$work"/obj/*.o | grep -v '/dml2_core_dcn4_calcs\.o$')
 cc -O1 -w "${inc[@]}" "$here/harness.c" "$work/obj/dml2_core_dcn4_calcs.o" $others -lm -o "$work/plain"
 cc -O1 -w "${inc[@]}" "$here/harness.c" "$work/strict_calcs.o" $others -lm -o "$work/strict"
 cc -O1 -w "${inc[@]}" "$here/harness_multi.c" "$work/strict_calcs.o" $others -lm -o "$work/strict_multi"
+cc -O1 -w "${inc[@]}" "$here/harness_planes.c" "$work/strict_calcs.o" $others -lm -o "$work/strict_planes"
 
 # dsc_lines [env...]: classify "<slices> <bpp_x16> <multi-stream inputs>"
 # lines from stdin with Linux (harness_multi.c, DSC, the given environment).
@@ -313,7 +316,30 @@ check_multi() {
 	echo "dcn401 DML21 $(basename "$file" .txt)${envs[*]:+ (${envs[*]})}: $pass passed, $fail failed"
 	[ $fail -eq 0 ]
 }
+# check_planes <file>: plane_vectors.txt lines (harness_planes.c, RAISED):
+# "= <values>" is Linux's exact plan output, "! REJECT" its rejection.
+check_planes() {
+	local file=$1 pass=0 fail=0
+	while read -r line; do
+		case $line in ''|'#'*) continue ;; esac
+		local inputs=${line%% [=!] *}
+		local kind=${line:${#inputs}+1:1} result=${line:${#inputs}+3}
+		read -ra a <<< "$inputs"
+		strict=$(RAISED=1 "$work/strict_planes" "${a[@]}")
+		if { [ "$kind" = "=" ] && [ "$strict" = "PLAN $result" ]; } ||
+			{ [ "$kind" = "!" ] && [ "$result" = REJECT ] && [ "$strict" = REJECT ]; }; then
+			pass=$((pass + 1))
+		else
+			fail=$((fail + 1))
+			echo "MISMATCH: $line" >&2
+			echo "  strict: $strict" >&2
+		fi
+	done < "$file"
+	echo "dcn401 DML21 $(basename "$file" .txt): $pass passed, $fail failed"
+	[ $fail -eq 0 ]
+}
 mfail=0
+check_planes "$here/plane_vectors.txt" || mfail=1
 check_multi "$here/multi_vectors.txt" || mfail=1
 check_multi "$here/ycbcr420_vectors.txt" FMT420=1 || mfail=1
 check_multi "$here/dsc_vectors.txt" DSC || mfail=1

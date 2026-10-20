@@ -110,6 +110,84 @@ pub struct Mode {
     /// Display Stream Compression of a 4:4:4 DP output, as DC passes it
     /// (timing.dsc: enabled with the slice count and compressed bpp).
     pub dsc: Option<Dsc>,
+    /// The stream's planes, bottom (the primary) first, as
+    /// populate_dml21_plane_config_from_plane_state describes them; the
+    /// first `None` ends the list. With none at all the stream shows one
+    /// unscaled full-frame plane of `pitch` and `bytes_per_pixel`, and
+    /// those two fields describe it; otherwise the planes' own do.
+    pub planes: [Option<Plane>; MAX_PLANES],
+}
+
+/// Planes (DPP pipes before ODM) every admitted configuration shares.
+pub const MAX_PLANES: usize = 4;
+
+/// One linear RGB plane of a stream as DC passes DML21 a plane state after
+/// SPL: its surface, SPL's whole-plane viewport (DC hands DML the plane's
+/// scaler data as if no ODM split it), the scale ratios and taps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Plane {
+    pub surface_width: u32,
+    pub surface_height: u32,
+    /// Surface pitch in pixels.
+    pub pitch: u32,
+    /// 2, 4 or 8 (`dml2_444_16`, `dml2_444_32`, `dml2_444_64`).
+    pub bytes_per_pixel: u32,
+    pub viewport_width: u32,
+    pub viewport_height: u32,
+    /// Input over output in units of 2^-19 (SPL's U3.19 ratios, which DC
+    /// converts to the doubles DML takes exactly); `Plane::UNITY` is 1:1.
+    pub h_ratio: u32,
+    pub v_ratio: u32,
+    pub h_taps: u32,
+    pub v_taps: u32,
+}
+
+impl Plane {
+    pub const UNITY: u32 = 1 << 19;
+    /// The unscaled full-frame plane of `timing`.
+    pub fn full(timing: &Timing, pitch: u32, bytes_per_pixel: u32) -> Self {
+        Self {
+            surface_width: timing.h_active,
+            surface_height: timing.v_active,
+            pitch,
+            bytes_per_pixel,
+            viewport_width: timing.h_active,
+            viewport_height: timing.v_active,
+            h_ratio: Self::UNITY,
+            v_ratio: Self::UNITY,
+            h_taps: 1,
+            v_taps: 1,
+        }
+    }
+    /// scaler_info.enabled as dml21_translation_helper sets it with SPL: a
+    /// ratio other than 1, or more than one tap.
+    pub fn scaler_enabled(&self) -> bool {
+        self.h_ratio != Self::UNITY
+            || self.v_ratio != Self::UNITY
+            || self.h_taps > 1
+            || self.v_taps > 1
+    }
+}
+
+impl Mode {
+    /// One unscaled full-frame plane of `pitch` pixels on `timing`.
+    pub fn new(timing: Timing, pitch: u32, bytes_per_pixel: u32) -> Self {
+        Self {
+            timing,
+            pitch,
+            bytes_per_pixel,
+            ycbcr420: false,
+            dsc: None,
+            planes: [None; MAX_PLANES],
+        }
+    }
+    /// The planes DML sees, in order.
+    pub fn plane_list(&self) -> impl Iterator<Item = Plane> + '_ {
+        let full = self.planes[0]
+            .is_none()
+            .then(|| Plane::full(&self.timing, self.pitch, self.bytes_per_pixel));
+        full.into_iter().chain(self.planes.iter().map_while(|p| *p))
+    }
 }
 
 /// One stream's DSC as DML21 takes it.
@@ -234,6 +312,7 @@ pub fn dsc_pipes(timing: &Timing, slices: u32, dispclk_max_khz: u32) -> u32 {
         bytes_per_pixel: 4,
         ycbcr420: false,
         dsc: Some(Dsc { slices, bpp_x16: 0 }),
+        planes: [None; MAX_PLANES],
     };
     let ss = u64::from(dispclk_max_khz) * 10_000 / DOWNSPREAD_TENTHOUSANDTHS as u64;
     decide_odm(&mode, ss)
@@ -359,6 +438,24 @@ pub struct Plan {
     /// plan is `streams[stream]`. A plan is only valid in that configuration.
     pub streams: [Option<Mode>; MAX_STREAMS],
     pub stream: u8,
+    /// Each of the stream's planes (`Mode::plane_list` order): its own
+    /// DPPCLK, DLG, TTU, DET and second ODM pipe's blank end. The fields
+    /// above (`clocks.dppclk_khz`, `dlg`, `ttu`, `det_bytes`,
+    /// `odm_refcyc_h_blank_end`) are the first plane's.
+    pub planes: [Option<PlanePlan>; MAX_PLANES],
+}
+
+/// One plane's share of a stream's [`Plan`]: every one of its `Plan::pipes`
+/// pipes runs at `dppclk_khz` with `det_bytes` and this DLG/TTU, the second
+/// ODM pipe with its own blank end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlanePlan {
+    pub plane: Plane,
+    pub dppclk_khz: u32,
+    pub dlg: Dlg,
+    pub ttu: Ttu,
+    pub det_bytes: u32,
+    pub odm_refcyc_h_blank_end: u32,
 }
 
 /// Streams admitted together at most: one per pipe.
@@ -421,8 +518,17 @@ const MAX_LINE_BUFFER_LINES: i64 = 32;
 const LB_BITS_PER_PIXEL: i64 = 57;
 const MAX_LINEAR_SWATH: u32 = 15_360;
 const DISPCLK_RAMP_MARGIN_PERCENT: i64 = 1;
-/// dppclk_delay_subtotal + cnvc_formatter + scl_lb_only (scaler bypassed).
-const DPP_DELAY_CYCLES: i64 = 47 + 28 + 16;
+/// dppclk_delay_subtotal + cnvc_formatter, then scl (scaler enabled) or
+/// scl_lb_only (bypassed).
+const DPP_DELAY_CYCLES: i64 = 47 + 28;
+const DPP_DELAY_SCL: i64 = 50;
+const DPP_DELAY_SCL_LB_ONLY: i64 = 16;
+/// max_dchub_pscl_bw_pix_per_clk, max_pscl_lb_bw_pix_per_clk.
+const MAX_DCHUB_PSCL_BW: i64 = 4;
+const MAX_PSCL_LB_BW: i64 = 2;
+/// max_hscl_ratio = max_vscl_ratio, max_hscl_taps = max_vscl_taps.
+const MAX_SCL_RATIO: u32 = 6;
+const MAX_SCL_TAPS: u32 = 8;
 const DISPCLK_DELAY_CYCLES: i64 = 125;
 const MAX_INTER_DCN_TILE_REPEATERS: i64 = 8;
 const MAX_VSTARTUP: u32 = 1023;
@@ -443,9 +549,6 @@ pub const DET_KBYTES: u32 = 320;
 /// (CalculateBytePerPixelAndBlockSizes: BlockHeight256Bytes 1, BlockWidth
 /// 256 / BytePerPixel pixels per request).
 const REQUEST_BYTES: i64 = 256;
-/// `CalculatePrefetchSourceLines` for VRatio = VTaps = swath height = 1:
-/// VInitPreFill 1, one swath plus the mandatory partial swath.
-const PREFETCH_SOURCE_LINES: i64 = 2;
 /// Upper bound for any clock input: 10 GHz.
 const MAX_CLOCK_KHZ: u32 = 10_000_000;
 /// `DML2_MAX_FMT_420_BUFFER_WIDTH`: widest 4:2:0 output line per OPP.
@@ -568,9 +671,11 @@ fn latency(s: State, uclk_khz: u64) -> Latency {
     }
 }
 
-/// Mode quantities that no clock changes.
+/// One plane's quantities that no clock changes, with its stream's.
 #[derive(Clone, Copy)]
 struct Shape {
+    /// The plane's stream: its index among the admitted modes.
+    stream: usize,
     t: Timing,
     pclk: Fx,
     line: Fx,
@@ -588,6 +693,17 @@ struct Shape {
     dsc_delay: u32,
     /// BytePerPixelY (= BytePerPixelDETY for these formats).
     bpp: u32,
+    plane: Plane,
+    hratio: Fx,
+    vratio: Fx,
+    /// PrefetchSourceLinesY: CalculatePrefetchSourceLines for one-line
+    /// (linear) swaths, VInitPreFill plus the mandatory partial swath.
+    source_lines: i64,
+    /// PSCL_THROUGHPUT and RequiredDPPCLK (MHz), as Linux's doubles hold
+    /// them; whether DPPCLK is just the pixel clock over the pipes.
+    pscl: f64,
+    dpp: f64,
+    dpp_unit: bool,
 }
 
 /// DPPCLK, DISPCLK and deep-sleep DCFCLK one evaluation runs the pipe at.
@@ -625,7 +741,7 @@ struct Schedule {
 #[derive(Clone, Copy)]
 struct Evaluation {
     /// Each surface's prefetch schedule, in admission order.
-    planes: [Schedule; MAX_STREAMS],
+    planes: [Schedule; MAX_PLANES],
     extra: Fx,
     extra_sr: Fx,
     t_calc: Fx,
@@ -639,10 +755,76 @@ struct Evaluation {
     urgent_sdp: Fx,
 }
 
+/// DML's math_ceil2(x, 1) for a non-negative double.
+fn ceil_f(x: f64) -> f64 {
+    let i = x as i64 as f64;
+    if i < x {
+        i + 1.0
+    } else {
+        i
+    }
+}
+fn max_f(a: f64, b: f64) -> f64 {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
+fn min_f(a: f64, b: f64) -> f64 {
+    if a < b {
+        a
+    } else {
+        b
+    }
+}
+/// A 2^-19 ratio as DML's double.
+fn ratio_f(r: u32) -> f64 {
+    f64::from(r) / 524_288.0
+}
+/// A non-negative double as fixed point (truncated to 2^-24).
+fn fx_f(v: f64) -> Fx {
+    Fx::ratio((v * 16_777_216.0) as i64, 1 << 24)
+}
+
+impl Plane {
+    /// ScaleRatioAndTapsSupport, ViewportExceedsSurface and PitchSupport:
+    /// what DML refuses of a plane on its own.
+    fn validate(&self) -> Result<(), Error> {
+        let taps_ok = |t: u32| (1..=MAX_SCL_TAPS).contains(&t);
+        let ratio_ok = |r: u32, taps: u32| {
+            r != 0 && r <= MAX_SCL_RATIO * Self::UNITY && r <= taps * Self::UNITY
+        };
+        if self.surface_width == 0
+            || self.surface_height == 0
+            || self.surface_width > 0x3fff
+            || self.surface_height > 0x3fff
+            || self.viewport_width == 0
+            || self.viewport_height == 0
+            || self.viewport_width > self.surface_width
+            || self.viewport_height > self.surface_height
+            || self.pitch < self.surface_width
+            || !matches!(self.bytes_per_pixel, 2 | 4 | 8)
+            || !taps_ok(self.h_taps)
+            || !taps_ok(self.v_taps)
+            || (self.h_taps > 1 && self.h_taps % 2 == 1)
+            || !ratio_ok(self.h_ratio, self.h_taps)
+            || !ratio_ok(self.v_ratio, self.v_taps)
+        {
+            return Err(Error::Invalid);
+        }
+        // A 128-byte-aligned pitch changes the request width this omits.
+        if u64::from(self.pitch) * u64::from(self.bytes_per_pixel) % 256 != 0 {
+            return Err(Error::Unsupported);
+        }
+        Ok(())
+    }
+}
+
 impl Shape {
     /// `dispclk_ss_khz` is DML's `max_dispclk_freq_mhz`: the board maximum
     /// less downspread, which decides ODM combine.
-    fn new(mode: &Mode, dispclk_ss_khz: u64) -> Result<Self, Error> {
+    fn new(mode: &Mode, plane: Plane, stream: usize, dispclk_ss_khz: u64) -> Result<Self, Error> {
         let t = mode.timing;
         if t.pixel_clock_khz == 0
             || t.h_active == 0
@@ -655,16 +837,13 @@ impl Shape {
                 > u64::from(t.h_total - t.h_active)
             || u64::from(t.v_front_porch) + u64::from(t.v_sync_width)
                 > u64::from(t.v_total - t.v_active)
-            || mode.pitch < t.h_active
-            || !matches!(mode.bytes_per_pixel, 2 | 4 | 8)
         {
             return Err(Error::Invalid);
         }
-        // DML needs a blank line after VStartup for MIN_DST_Y_NEXT_START, and
-        // a 128-byte-aligned pitch changes the request width this omits.
+        plane.validate()?;
+        // DML needs a blank line after VStartup for MIN_DST_Y_NEXT_START.
         if t.v_total - t.v_active < 2
             || t.v_front_porch == 0
-            || u64::from(mode.pitch) * u64::from(mode.bytes_per_pixel) % 256 != 0
             || t.h_active > 0x3fff
             || t.v_active > 0x3fff
         {
@@ -715,14 +894,47 @@ impl Shape {
                 return Err(Error::PixelClock);
             }
         }
-        // CalculateSwathWidth: each pipe fetches its share of the line,
+        // CalculateSwathWidth: the viewport, or with ODM each pipe's share
+        // of the line in source pixels (math_round), at most the viewport;
         // rounded to whole requests within the surface.
-        let swath = t.h_active / odm;
-        let w = u64::from(t.h_active);
-        let bpp = mode.bytes_per_pixel;
+        let vp = plane.viewport_width;
+        let swath = if odm > 1 {
+            let share = (u64::from(t.h_active) * u64::from(plane.h_ratio)
+                + u64::from(Plane::UNITY))
+                / (2 * u64::from(Plane::UNITY));
+            vp.min(share as u32)
+        } else {
+            vp
+        };
+        let bpp = plane.bytes_per_pixel;
         let r = u64::from(request_pixels(bpp));
-        let swath_ub = ceil_to(w, r).min(ceil_to(u64::from(swath) - 1, r) + r) as u32;
+        let w = u64::from(plane.surface_width);
+        let swath_ub = ceil_to(w, r).min(ceil_to(u64::from(swath).saturating_sub(1), r) + r) as u32;
+        let ratio = |r: u32| q(i64::from(r), i64::from(Plane::UNITY));
+        let (hratio, vratio) = (ratio(plane.h_ratio), ratio(plane.v_ratio));
+        // CalculatePrefetchSourceLines: VInitPreFill =
+        // floor((VRatio + VTaps + 1) / 2), then one more line.
+        let vinit = (u64::from(plane.v_ratio)
+            + u64::from(plane.v_taps + 1) * u64::from(Plane::UNITY))
+            / (2 * u64::from(Plane::UNITY));
+        // CalculateSinglePipeDPPCLKAndSCLThroughput, then RequiredDPPCLK.
+        let (h, v) = (ratio_f(plane.h_ratio), ratio_f(plane.v_ratio));
+        let pscl = if h > 1.0 {
+            min_f(
+                MAX_DCHUB_PSCL_BW as f64,
+                MAX_PSCL_LB_BW as f64 * h / ceil_f(f64::from(plane.h_taps) / 6.0),
+            )
+        } else {
+            min_f(MAX_DCHUB_PSCL_BW as f64, MAX_PSCL_LB_BW as f64)
+        };
+        let pixel_mhz = f64::from(t.pixel_clock_khz) / 1000.0;
+        let vtaps_term = f64::from(plane.v_taps / 6) * min_f(1.0, h);
+        let mut single = pixel_mhz * max_f(max_f(vtaps_term, h * v / pscl), 1.0);
+        if (plane.h_taps > 6 || plane.v_taps > 6) && single < 2.0 * pixel_mhz {
+            single = 2.0 * pixel_mhz;
+        }
         Ok(Self {
+            stream,
             t,
             pclk: mhz(u64::from(t.pixel_clock_khz)),
             line: q(i64::from(t.h_total) * 1000, i64::from(t.pixel_clock_khz)),
@@ -731,22 +943,36 @@ impl Shape {
             swath_ub,
             det_bytes: DET_KBYTES * 1024,
             vactive_bw: q(
-                i64::from(t.h_active) * i64::from(bpp) * i64::from(t.pixel_clock_khz),
+                i64::from(vp) * i64::from(bpp) * i64::from(t.pixel_clock_khz),
                 i64::from(t.h_total) * 1000,
-            ),
+            )
+            .times(vratio),
             vblank: t.v_total - t.v_active,
             ycbcr420: mode.ycbcr420,
             dsc_delay: mode.dsc.map_or(0, |d| dsc_delay(&t, d, odm)),
             bpp,
+            plane,
+            hratio,
+            vratio,
+            source_lines: vinit as i64 + 1,
+            pscl,
+            dpp: single / f64::from(odm),
+            dpp_unit: single == pixel_mhz,
         })
     }
-    /// `CalculateSwathAndDETConfiguration` support and `PitchSupport`.
+    /// `CalculateSwathAndDETConfiguration` support: the swath fits half
+    /// the DET, the linear swath limit and the line buffer's
+    /// MaximumSwathWidthInLineBuffer for its taps and ratios.
     fn buffers(&self) -> Result<(), Error> {
         let full_swath = self.swath_ub * self.bpp;
-        let lb = LINE_BUFFER_BITS / LB_BITS_PER_PIXEL;
+        let p = &self.plane;
+        let unity = u128::from(Plane::UNITY);
+        let ceil_v = (u128::from(p.v_ratio) + unity - 1) / unity;
+        let lines = u128::from(p.v_taps) + ceil_v.saturating_sub(2);
+        let lb = LINE_BUFFER_BITS as u128 * u128::from(p.h_ratio).max(unity);
         if full_swath / 2 > self.det_bytes / 2
             || self.swath > MAX_LINEAR_SWATH
-            || i64::from(self.swath) > lb
+            || u128::from(self.swath) * LB_BITS_PER_PIXEL as u128 * lines * unity > lb
         {
             return Err(Error::Buffer);
         }
@@ -762,28 +988,50 @@ impl Shape {
         }
         Some(time.over(time.minus(urgent)))
     }
-    /// `CalculateDCFCLKDeepSleep`'s per-surface term with VRatio 1 and no
-    /// tdlut: a pipe delivers its swath in `odm` times its share of the line.
-    fn deep_sleep_surface(&self) -> Fx {
+    /// `CalculateDCFCLKDeepSleep`'s per-surface term with no tdlut: at
+    /// VRatio up to 1 a pipe delivers its swath in `odm` times its share of
+    /// the line at the scaled rate, above it at the scaler's throughput.
+    fn deep_sleep_surface(&self, dpp: Fx) -> Fx {
         let factor = q(DCFCLK_FACTOR_HUNDREDTHS, 100);
-        factor
-            .times(fx(i64::from(self.bpp)))
-            .over(fx(64))
-            .times(self.pclk)
-            .over(fx(i64::from(self.odm)))
-            .max(self.pclk.over(fx(16)))
+        let per_byte = factor.times(fx(i64::from(self.bpp))).over(fx(64));
+        let rate = if self.plane.v_ratio <= Plane::UNITY {
+            per_byte
+                .times(self.pclk)
+                .times(self.hratio)
+                .over(fx(i64::from(self.odm)))
+        } else {
+            per_byte.times(fx_f(self.pscl)).times(dpp)
+        };
+        rate.max(self.pclk.over(fx(16)))
     }
-    /// `RequiredDPPCLK` (and this surface's `RequiredDISPCLKPerSurface`): the
-    /// pixel clock over the pipes, in MHz.
+    /// `RequiredDPPCLK`: the pipe's DPPCLK, the pixel clock over the pipes
+    /// when unscaled, in MHz.
     fn dpp_mhz(&self) -> Fx {
+        if self.dpp_unit {
+            return q(
+                i64::from(self.t.pixel_clock_khz),
+                1000 * i64::from(self.odm),
+            );
+        }
+        fx_f(self.dpp)
+    }
+    /// The same as DML hands it to DPMM: truncated to kHz.
+    fn dpp_khz(&self) -> u32 {
+        if self.dpp_unit {
+            return self.t.pixel_clock_khz / self.odm;
+        }
+        (self.dpp * 1000.0) as u32
+    }
+    /// `RequiredDISPCLKPerSurface`: the pixel clock over the pipes, in kHz
+    /// as DPMM takes it.
+    fn disp_khz(&self) -> u32 {
+        self.t.pixel_clock_khz / self.odm
+    }
+    fn disp_mhz(&self) -> Fx {
         q(
             i64::from(self.t.pixel_clock_khz),
             1000 * i64::from(self.odm),
         )
-    }
-    /// The same as DML hands it to DPMM: truncated to kHz.
-    fn dpp_khz(&self) -> u32 {
-        self.t.pixel_clock_khz / self.odm
     }
 }
 
@@ -796,19 +1044,24 @@ fn deep_sleep(shapes: &[Shape]) -> Fx {
         .fold(Fx::ZERO, |sum, s| sum.plus(s.vactive_bw));
     shapes.iter().fold(
         fx(8).max(factor.times(read).over(fx(RETURN_BUS_BYTES))),
-        |ds, s| ds.max(s.deep_sleep_surface()),
+        |ds, s| ds.max(s.deep_sleep_surface(s.dpp_mhz())),
     )
 }
-/// [`deep_sleep`] as DPMM passes it on: truncated to kHz, computed exactly
-/// (over the product of the line totals) so a whole-kHz result does not lose
-/// a unit to rounding.
+/// [`deep_sleep`] as DPMM passes it on: truncated to kHz. Unscaled, it is
+/// computed exactly (over the product of the line totals) so a whole-kHz
+/// result does not lose a unit to rounding; with a scaled plane, in
+/// Linux's own doubles (CalculateDCFCLKDeepSleepTdlut, RequiredDPPCLK).
 fn deep_sleep_khz(shapes: &[Shape]) -> u32 {
+    let unscaled = |s: &Shape| s.plane.h_ratio == Plane::UNITY && s.plane.v_ratio == Plane::UNITY;
+    if !shapes.iter().all(unscaled) {
+        return deep_sleep_khz_f(shapes);
+    }
     let f = DCFCLK_FACTOR_HUNDREDTHS as u128;
     let den: u128 = shapes.iter().map(|s| u128::from(s.t.h_total)).product();
     let num: u128 = shapes
         .iter()
         .map(|s| {
-            u128::from(s.t.h_active * s.bpp) * u128::from(s.t.pixel_clock_khz) * den
+            u128::from(s.plane.viewport_width * s.bpp) * u128::from(s.t.pixel_clock_khz) * den
                 / u128::from(s.t.h_total)
         })
         .sum();
@@ -819,6 +1072,31 @@ fn deep_sleep_khz(shapes: &[Shape]) -> u32 {
             (f as u64 * u64::from(s.bpp) * pclk / (100 * 64 * u64::from(s.odm))).max(pclk / 16);
         ds.max(surface as u32)
     })
+}
+fn deep_sleep_khz_f(shapes: &[Shape]) -> u32 {
+    const FACTOR: f64 = 1.15;
+    let mut read = 0.0;
+    let mut ds_surface: [f64; MAX_PLANES] = [0.0; MAX_PLANES];
+    for (k, s) in shapes.iter().enumerate() {
+        let pixel_mhz = f64::from(s.t.pixel_clock_khz) / 1000.0;
+        let (h, v) = (ratio_f(s.plane.h_ratio), ratio_f(s.plane.v_ratio));
+        let swath = f64::from(s.swath);
+        let delivery = if v <= 1.0 {
+            swath * f64::from(s.odm) / h / pixel_mhz
+        } else {
+            swath / s.pscl / s.dpp
+        };
+        let per = FACTOR * swath * f64::from(s.bpp) / 64.0 / delivery;
+        ds_surface[k] = max_f(per, pixel_mhz / 16.0);
+        read += f64::from(s.plane.viewport_width) * f64::from(s.bpp)
+            / (f64::from(s.t.h_total) / pixel_mhz)
+            * v;
+    }
+    let mut ds = max_f(8.0, FACTOR * read / RETURN_BUS_BYTES as f64);
+    for &d in &ds_surface[..shapes.len()] {
+        ds = max_f(ds, d);
+    }
+    (ds * 1000.0) as u32
 }
 
 impl Shape {
@@ -876,17 +1154,27 @@ impl Shape {
         .over(self.pclk);
         let t_wait_p = t_wait.minus(trip);
         s.t_dmdl = t_wait_p.plus(extra_prefetch).plus(trip);
+        // DPPCycles: the scaler's delay, or the line buffer's alone.
+        let dpp_cycles = DPP_DELAY_CYCLES
+            + if self.plane.scaler_enabled() {
+                DPP_DELAY_SCL
+            } else {
+                DPP_DELAY_SCL_LB_ONLY
+            };
         let dst_x = round(
-            fx(DPP_DELAY_CYCLES)
+            fx(dpp_cycles)
                 .times(self.pclk)
                 .over(dppclk)
                 .plus(fx(DISPCLK_DELAY_CYCLES).times(self.pclk).over(dispclk))
                 .plus(fx(i64::from(self.dsc_delay))),
         ) as u32;
-        // ODM combine adds 18 pixels and every further pipe's recout width.
+        // ODM combine adds 18 pixels and every further pipe's recout width
+        // (DPP_RECOUT_WIDTH: the swath over the horizontal ratio, truncated).
+        let recout = (u64::from(self.swath) * u64::from(Plane::UNITY)
+            / u64::from(self.plane.h_ratio)) as u32;
         let dst_x = dst_x
             + if self.odm > 1 {
-                18 + (self.odm - 1) * self.swath
+                18 + (self.odm - 1) * recout
             } else {
                 0
             };
@@ -897,10 +1185,11 @@ impl Shape {
         s.dst_x = dst_x - s.dst_y * t.h_total;
 
         let quarter = l.over(fx(4));
-        let sw_bytes = fx(PREFETCH_SOURCE_LINES * i64::from(self.swath_ub * self.bpp));
+        let src = self.source_lines;
+        let sw_bytes = fx(src * i64::from(self.swath_ub * self.bpp));
         // One-to-one schedule, against this pipe's share of the surface's
         // active bandwidth.
-        let min_lsw_oto = q(PREFETCH_SOURCE_LINES, MAX_VRATIO_PRE_OTO).max(fx(2));
+        let min_lsw_oto = q(src, MAX_VRATIO_PRE_OTO).max(fx(2));
         let bw_oto = self
             .vactive_bw
             .over(fx(i64::from(self.odm)))
@@ -912,7 +1201,7 @@ impl Shape {
         let dst_oto = q(3, 4).plus(lsw_oto);
         // Equalized schedule.
         let lo = s.dst_y;
-        let min_lsw_equ = q(PREFETCH_SOURCE_LINES, MAX_VRATIO_PRE_EQU).max(fx(2));
+        let min_lsw_equ = q(src, MAX_VRATIO_PRE_EQU).max(fx(2));
         let mut equ = fx(i64::from(s.vstartup))
             .minus(
                 s.t_setup
@@ -948,8 +1237,8 @@ impl Shape {
             return s;
         }
         s.dst_y_prefetch = dst;
-        s.vratio_pre = fx(PREFETCH_SOURCE_LINES).over(lsw).max(Fx::ONE);
-        s.prefetch_bw = fx(PREFETCH_SOURCE_LINES)
+        s.vratio_pre = fx(src).over(lsw).max(Fx::ONE);
+        s.prefetch_bw = fx(src)
             .over(lsw)
             .times(fx(i64::from(self.bpp * self.swath_ub)))
             .over(l);
@@ -983,13 +1272,13 @@ fn evaluate(
     // Deep-sleep DCFCLK is global: every pipe carries the same value.
     let t_calc = fx(24).over(clk[0].deep_sleep);
     let t_wait = fx(reserved_us).plus(lat.urgent.max(lat.trip));
-    let mut planes = [Schedule::default(); MAX_STREAMS];
+    let mut planes = [Schedule::default(); MAX_PLANES];
     let (mut urgent, mut non_urgent) = (Fx::ZERO, Fx::ZERO);
     for (k, shape) in shapes.iter().enumerate() {
         let pre = shape.prefetch(clk[k], &lat, t_wait, extra, t_calc);
         // NotEnoughUrgentLatencyHiding for active fetch, then the schedule.
         let burst = shape
-            .burst(lat.urgent, Fx::ONE)
+            .burst(lat.urgent, shape.vratio)
             .ok_or(Error::UrgentLatencyHiding)?;
         if pre.no_time
             || pre.dst_y > 8
@@ -1049,16 +1338,35 @@ fn evaluate(
 impl Shape {
     /// CalculateWatermarksMALLUseAndDRAMSpeedChangeSupport: active latency
     /// hiding against the GDDR6 temperature-read watermark.
-    fn temp_read_ok(&self, e: &Evaluation, pre: &Schedule) -> bool {
-        let lb_lines = (LINE_BUFFER_BITS / LB_BITS_PER_PIXEL / i64::from(self.swath))
-            .min(MAX_LINE_BUFFER_LINES);
+    fn temp_read_ok(&self, e: &Evaluation, pre: &Schedule, surfaces: usize) -> bool {
+        // LBLatencyHidingSourceLinesY: the lines the line buffer holds of
+        // the swath in source pixels, less the extra vertical taps (an
+        // (unsigned int) of a double, so a negative count wraps).
+        let unity = i64::from(Plane::UNITY);
+        let h = i64::from(self.plane.h_ratio).max(unity);
+        let lb = (LINE_BUFFER_BITS / LB_BITS_PER_PIXEL * h / (i64::from(self.swath) * unity))
+            .min(MAX_LINE_BUFFER_LINES)
+            - (i64::from(self.plane.v_taps) - 1);
+        let lb_lines = i64::from(lb as u32);
         let det_lines = self.det_bytes / self.bpp / self.swath;
-        let hiding = fx(lb_lines + i64::from(det_lines)).times(self.line).minus(
-            fx(i64::from(pre.dst_x))
-                .over(fx(i64::from(self.t.h_total)))
-                .plus(fx(i64::from(pre.dst_y)))
-                .times(self.line),
-        );
+        let mut hiding = fx(lb_lines + i64::from(det_lines))
+            .times(self.line)
+            .over(self.vratio)
+            .minus(
+                fx(i64::from(pre.dst_x))
+                    .over(fx(i64::from(self.t.h_total)))
+                    .plus(fx(i64::from(pre.dst_y)))
+                    .times(self.line),
+            );
+        // Several surfaces each give up part of a swath.
+        if surfaces > 1 {
+            hiding = hiding.minus(
+                Fx::ONE
+                    .minus(q(1, surfaces as i64))
+                    .times(self.line)
+                    .over(self.vratio),
+            );
+        }
         let urgent_wm = e.lat.urgent.plus(e.extra);
         hiding.minus(e.lat.g6_temp_read.plus(urgent_wm)) >= Fx::ZERO
     }
@@ -1181,13 +1489,18 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
     }
     // DML's max_dispclk/dppclk_freq_mhz: the board maximums less downspread.
     let ss = |khz: u32| u64::from(khz) * 10_000 / DOWNSPREAD_TENTHOUSANDTHS as u64;
-    let mut shapes = Vec::with_capacity(modes.len());
-    for mode in modes {
-        let shape = Shape::new(mode, ss(soc.dispclk_max_khz))?;
-        shape.buffers()?;
-        shapes.push(shape);
+    let mut shapes = Vec::with_capacity(MAX_PLANES);
+    for (k, mode) in modes.iter().enumerate() {
+        for plane in mode.plane_list() {
+            if shapes.len() == MAX_PLANES {
+                return Err(Error::Pipes);
+            }
+            let shape = Shape::new(mode, plane, k, ss(soc.dispclk_max_khz))?;
+            shape.buffers()?;
+            shapes.push(shape);
+        }
     }
-    // TotalAvailablePipesSupport: one DPP and OPP per ODM segment.
+    // TotalAvailablePipesSupport: one DPP per plane and ODM segment.
     if shapes.iter().map(|s| s.odm).sum::<u32>() > MAX_PIPES {
         return Err(Error::Pipes);
     }
@@ -1204,17 +1517,24 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
         ..state
     };
     let uclk_khz = u64::from(soc.uclk_khz);
-    // Mode support: DISPCLK = DPPCLK = the pixel clock over the stream's
-    // pipes, checked against the downspread-limited maximums. DISPCLK is the
-    // fastest pipe's.
+    // Mode support: DISPCLK is the pixel clock over the stream's pipes,
+    // each plane's DPPCLK that or what its scaler needs; both are checked
+    // against the downspread-limited maximums. DISPCLK is the fastest
+    // stream's, DPPREFCLK the fastest plane's.
     for s in &shapes {
         let pclk = u64::from(s.t.pixel_clock_khz);
         let odm = u64::from(s.odm);
-        if pclk > odm * ss(soc.dispclk_max_khz) || pclk > odm * ss(soc.dppclk_max_khz) {
+        let dpp_over = if s.dpp_unit {
+            pclk > odm * ss(soc.dppclk_max_khz)
+        } else {
+            s.dpp > ss(soc.dppclk_max_khz) as f64 / 1000.0
+        };
+        if pclk > odm * ss(soc.dispclk_max_khz) || dpp_over {
             return Err(Error::PixelClock);
         }
     }
     let max_dpp_khz = shapes.iter().map(Shape::dpp_khz).max().unwrap_or(0);
+    let max_disp_khz = shapes.iter().map(Shape::disp_khz).max().unwrap_or(0);
     let ds = deep_sleep(&shapes);
     // Outstanding-request coverage at DML's DCF state.
     let lat = latency(state, uclk_khz);
@@ -1232,13 +1552,13 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
             return Err(Error::Bandwidth);
         }
     }
-    let max_dpp = shapes.iter().fold(Fx::ZERO, |max, s| max.max(s.dpp_mhz()));
+    let max_disp = shapes.iter().fold(Fx::ZERO, |max, s| max.max(s.disp_mhz()));
     let support = |reserved_us: i64| -> Result<Evaluation, Error> {
         let clk: Vec<PipeClocks> = shapes
             .iter()
             .map(|s| PipeClocks {
                 dpp: s.dpp_mhz(),
-                disp: max_dpp,
+                disp: max_disp,
                 deep_sleep: ds,
                 khz: None,
             })
@@ -1249,7 +1569,7 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
             return Err(Error::Latency);
         }
         for (shape, pre) in shapes.iter().zip(e.planes.iter()) {
-            if !shape.temp_read_ok(&e, pre) {
+            if !shape.temp_read_ok(&e, pre, shapes.len()) {
                 return Err(Error::TempRead);
             }
         }
@@ -1279,7 +1599,7 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
     // of the shared DPPREFCLK.
     let (sp, sp_den) = (DOWNSPREAD_TENTHOUSANDTHS as u128, 10_000u128);
     let (ramp, ramp_den) = ((100 + DISPCLK_RAMP_MARGIN_PERCENT) as u128, 100u128);
-    let req = u128::from(max_dpp_khz);
+    let req = u128::from(max_disp_khz);
     let disp_max = u128::from(soc.dispclk_max_khz);
     let (mut num, mut den) = (req * sp * ramp, sp_den * ramp_den);
     if num > disp_max * den {
@@ -1289,7 +1609,7 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
         (num, den) = (req * sp, sp_den);
     }
     let dispclk_khz = dfs(num, den, soc.dentist_vco_khz)?;
-    let dpp_ref = (req * sp / sp_den) as u32;
+    let dpp_ref = (u128::from(max_dpp_khz) * sp / sp_den) as u32;
     let dpprefclk_khz = dfs(u128::from(dpp_ref), 1, soc.dentist_vco_khz)?;
     if dispclk_khz > soc.dispclk_max_khz || dpprefclk_khz > soc.dppclk_max_khz {
         return Err(Error::PixelClock);
@@ -1372,7 +1692,9 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
         *slot = Some(*mode);
     }
 
-    let mut plans = Vec::with_capacity(modes.len());
+    // Each plane's DLG and TTU (rq_dlg_get_dlg_reg), then each stream's
+    // plan from its first plane.
+    let mut per_plane: Vec<(GlobalSync, PlanePlan)> = Vec::with_capacity(shapes.len());
     for (k, shape) in shapes.iter().enumerate() {
         let t = shape.t;
         let pre = e.planes[k];
@@ -1389,74 +1711,132 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
         let vready_after = i64::from(pre.vupdate_offset + pre.vupdate_width + pre.vready_offset)
             <= vready_lines * i64::from(t.h_total);
         let keepout = (dram_wm.over(l).ceil() as u32).min(t.v_total - 1);
-        // Delivery times are whole pixel counts over the pixel clock: exact.
-        // A pipe delivers its swath in its pipes' share of the line time.
-        let odm = i64::from(shape.odm);
-        let line_delivery = (i64::from(shape.swath_ub) * odm * ref_khz / pclk_i) as u32;
-        let refcyc_req =
-            (i64::from(request_pixels(shape.bpp)) * odm * 1024 * ref_khz / pclk_i) as u32;
+        // CalculatePixelDeliveryTimes: at a vertical ratio up to 1 a pipe
+        // delivers its swath in its pipes' share of the line time at the
+        // horizontal ratio (whole pixel counts over the pixel clock: exact);
+        // above it at the scaler's throughput, in Linux's doubles.
+        let odm = i128::from(shape.odm);
+        let unity = i128::from(Plane::UNITY);
+        let h = i128::from(shape.plane.h_ratio);
+        let ref_mhz = f64::from(soc.dchub_refclk_khz) / 1000.0;
+        let dpp_mhz = f64::from(dppclk_khz[k]) / 1000.0;
+        let swath_ub = i128::from(shape.swath_ub);
+        let req_per_swath = f64::from(shape.swath_ub / request_pixels(shape.bpp));
+        let scaled_line = || f64::from(shape.swath_ub) / shape.pscl / dpp_mhz;
+        let delivery = |above_one: bool| -> (u32, u32) {
+            if above_one {
+                let line = scaled_line();
+                (
+                    (line * ref_mhz) as u32,
+                    (line / req_per_swath * ref_mhz * 1024.0) as u32,
+                )
+            } else {
+                let den = h * i128::from(pclk_i);
+                (
+                    (swath_ub * odm * unity * i128::from(ref_khz) / den) as u32,
+                    (i128::from(request_pixels(shape.bpp))
+                        * odm
+                        * unity
+                        * 1024
+                        * i128::from(ref_khz)
+                        / den) as u32,
+                )
+            }
+        };
+        let (line_delivery, refcyc_req) = delivery(shape.plane.v_ratio > Plane::UNITY);
+        let (line_delivery_pre, refcyc_req_pre) = delivery(pre.vratio_pre > Fx::ONE);
         // rq_dlg_get_dlg_reg: each further ODM pipe's blank ends its share
         // of the active line later.
         let h_blank_end = |pipe: u32| {
             (i64::from(t.h_blank_end() + pipe * (t.h_active / shape.odm)) * ref_khz / pclk_i) as u32
         };
+        let sync = GlobalSync {
+            vstartup,
+            vupdate_offset: pre.vupdate_offset,
+            vupdate_width: pre.vupdate_width,
+            vready_offset: pre.vready_offset,
+            pstate_keepout: keepout,
+        };
+        per_plane.push((
+            sync,
+            PlanePlan {
+                plane: shape.plane,
+                dppclk_khz: dppclk_khz[k],
+                dlg: Dlg {
+                    refcyc_h_blank_end: h_blank_end(0),
+                    dlg_vblank_end: t.v_blank_end(),
+                    min_dst_y_next_start: (min_next.floor() as u32) * 4,
+                    refcyc_per_htotal: (i64::from(t.h_total) * ref_khz * 256 / pclk_i) as u32,
+                    refcyc_x_after_scaler: (i64::from(pre.dst_x) * ref_khz / pclk_i) as u32,
+                    dst_y_after_scaler: pre.dst_y,
+                    dst_y_prefetch: reg(pre.dst_y_prefetch.times(fx(4))),
+                    dst_y_per_vm_vblank: 1,
+                    dst_y_per_row_vblank: 1,
+                    ref_freq_to_pix_freq: ((ref_khz << 19) / pclk_i) as u32,
+                    vratio_prefetch: reg(pre.vratio_pre.times(fx(1 << 19))),
+                    vratio_prefetch_c: 1 << 19,
+                    refcyc_per_line_delivery_pre_l: line_delivery_pre,
+                    refcyc_per_line_delivery_l: line_delivery,
+                    vready_after_vcount0: vready_after,
+                    dst_y_delta_drq_limit: 0x7fff,
+                    dmdata_dl_delta: refcyc(pre.t_dmdl),
+                },
+                ttu: Ttu {
+                    qos_level_low_wm: 0,
+                    qos_level_high_wm: (4 * i64::from(t.h_total) * ref_khz / pclk_i) as u32,
+                    min_ttu_vblank: refcyc(min_ttu),
+                    qos_level_flip: 14,
+                    refcyc_per_req_delivery_l: refcyc_req,
+                    refcyc_per_req_delivery_pre_l: refcyc_req_pre,
+                    qos_level_fixed_l: 8,
+                    qos_level_fixed_c: 8,
+                },
+                det_bytes: shape.det_bytes,
+                odm_refcyc_h_blank_end: if shape.odm > 1 { h_blank_end(1) } else { 0 },
+            },
+        ));
+    }
+
+    let mut plans = Vec::with_capacity(modes.len());
+    for (k, mode) in modes.iter().enumerate() {
+        let mut planes = [None; MAX_PLANES];
+        let mine = shapes
+            .iter()
+            .zip(&per_plane)
+            .filter(|(s, _)| s.stream == k)
+            .map(|(_, p)| *p);
+        let mut first: Option<(GlobalSync, PlanePlan)> = None;
+        for (slot, (sync, p)) in planes.iter_mut().zip(mine) {
+            first.get_or_insert((sync, p));
+            *slot = Some(p);
+        }
+        let (sync, p0) = first.ok_or(Error::Invalid)?;
+        let odm = shapes.iter().find(|s| s.stream == k).map_or(1, |s| s.odm);
         let plan = Plan {
-            mode: modes[k],
+            mode: *mode,
             soc: *soc,
             clocks: Clocks {
                 dispclk_khz,
                 dpprefclk_khz,
-                dppclk_khz: dppclk_khz[k],
+                dppclk_khz: p0.dppclk_khz,
                 deep_sleep_dcfclk_khz: deep_sleep_khz,
                 dcfclk_khz: dcfclk_khz as u32,
                 fclk_khz: fclk_khz as u32,
                 uclk_khz: soc.uclk_khz,
                 socclk_khz: soc.socclk_khz,
             },
-            sync: GlobalSync {
-                vstartup,
-                vupdate_offset: pre.vupdate_offset,
-                vupdate_width: pre.vupdate_width,
-                vready_offset: pre.vready_offset,
-                pstate_keepout: keepout,
-            },
-            dlg: Dlg {
-                refcyc_h_blank_end: h_blank_end(0),
-                dlg_vblank_end: t.v_blank_end(),
-                min_dst_y_next_start: (min_next.floor() as u32) * 4,
-                refcyc_per_htotal: (i64::from(t.h_total) * ref_khz * 256 / pclk_i) as u32,
-                refcyc_x_after_scaler: (i64::from(pre.dst_x) * ref_khz / pclk_i) as u32,
-                dst_y_after_scaler: pre.dst_y,
-                dst_y_prefetch: reg(pre.dst_y_prefetch.times(fx(4))),
-                dst_y_per_vm_vblank: 1,
-                dst_y_per_row_vblank: 1,
-                ref_freq_to_pix_freq: ((ref_khz << 19) / pclk_i) as u32,
-                vratio_prefetch: reg(pre.vratio_pre.times(fx(1 << 19))),
-                vratio_prefetch_c: 1 << 19,
-                refcyc_per_line_delivery_pre_l: line_delivery,
-                refcyc_per_line_delivery_l: line_delivery,
-                vready_after_vcount0: vready_after,
-                dst_y_delta_drq_limit: 0x7fff,
-                dmdata_dl_delta: refcyc(pre.t_dmdl),
-            },
-            ttu: Ttu {
-                qos_level_low_wm: 0,
-                qos_level_high_wm: (4 * i64::from(t.h_total) * ref_khz / pclk_i) as u32,
-                min_ttu_vblank: refcyc(min_ttu),
-                qos_level_flip: 14,
-                refcyc_per_req_delivery_l: refcyc_req,
-                refcyc_per_req_delivery_pre_l: refcyc_req,
-                qos_level_fixed_l: 8,
-                qos_level_fixed_c: 8,
-            },
+            sync,
+            dlg: p0.dlg,
+            ttu: p0.ttu,
             watermarks,
             arbiter,
-            det_bytes: shape.det_bytes,
-            pipes: shape.odm as u8,
-            odm_refcyc_h_blank_end: if shape.odm > 1 { h_blank_end(1) } else { 0 },
+            det_bytes: p0.det_bytes,
+            pipes: odm as u8,
+            odm_refcyc_h_blank_end: p0.odm_refcyc_h_blank_end,
             stutter_reserved_us: reserved_us as u32,
             streams,
             stream: k as u8,
+            planes,
         };
         plan.check_ranges()?;
         plans.push(plan);
@@ -1468,14 +1848,23 @@ impl Plan {
     /// The DLG of the stream's pipe `pipe` (0-based, in ODM segment order,
     /// left to right), or `None` past the stream's pipes.
     pub fn pipe_dlg(&self, pipe: u8) -> Option<Dlg> {
+        self.plane_dlg(0, pipe)
+    }
+    /// The DLG of plane `plane`'s pipe `pipe` (as `pipe_dlg`).
+    pub fn plane_dlg(&self, plane: usize, pipe: u8) -> Option<Dlg> {
+        let p = self.planes.get(plane).copied().flatten()?;
         match pipe {
-            0 => Some(self.dlg),
+            0 => Some(p.dlg),
             1 if self.pipes == 2 => Some(Dlg {
-                refcyc_h_blank_end: self.odm_refcyc_h_blank_end,
-                ..self.dlg
+                refcyc_h_blank_end: p.odm_refcyc_h_blank_end,
+                ..p.dlg
             }),
             _ => None,
         }
+    }
+    /// Plane `plane`'s share of the plan.
+    pub fn plane(&self, plane: usize) -> Option<PlanePlan> {
+        self.planes.get(plane).copied().flatten()
     }
     /// The configuration this plan was admitted in.
     pub fn joint_modes(&self) -> Vec<Mode> {
@@ -1493,29 +1882,8 @@ impl Plan {
     /// only asserts these; a plan that cannot be programmed exactly is
     /// rejected here instead of being silently truncated.
     fn check_ranges(&self) -> Result<(), Error> {
-        let (d, t, w, a) = (&self.dlg, &self.ttu, &self.watermarks, &self.arbiter);
-        let limits = [
-            (d.refcyc_h_blank_end, 1 << 13),
-            (self.odm_refcyc_h_blank_end, 1 << 13),
-            (d.dlg_vblank_end, 1 << 15),
-            (d.min_dst_y_next_start, 1 << 18),
-            (d.refcyc_per_htotal, 1 << 21),
-            (d.refcyc_x_after_scaler, 1 << 13),
-            (d.dst_y_after_scaler, 8),
-            (d.dst_y_prefetch, 1 << 8),
-            (d.dst_y_per_vm_vblank, 1 << 7),
-            (d.dst_y_per_row_vblank, 1 << 6),
-            (d.ref_freq_to_pix_freq, 1 << 21),
-            (d.vratio_prefetch, 1 << 22),
-            (d.vratio_prefetch_c, 1 << 22),
-            (d.refcyc_per_line_delivery_pre_l, 1 << 13),
-            (d.refcyc_per_line_delivery_l, 1 << 13),
-            (t.qos_level_high_wm, 1 << 14),
-            (t.min_ttu_vblank, 1 << 24),
-            (t.qos_level_flip, 1 << 4),
-            (t.refcyc_per_req_delivery_pre_l, 1 << 23),
-            (t.refcyc_per_req_delivery_l, 1 << 23),
-            (t.qos_level_fixed_l, 1 << 4),
+        let (w, a) = (&self.watermarks, &self.arbiter);
+        let global = [
             (w.urgent, 1 << 14),
             (w.usr, 1 << 14),
             (w.refcyc_per_trip_to_mem, 1 << 14),
@@ -1531,7 +1899,34 @@ impl Plan {
             (a.sdpif_request_rate_limit, 1 << 12),
             (a.pstate_stall_threshold, 1 << 27),
         ];
-        if limits.iter().any(|&(v, limit)| v >= limit) {
+        let per_plane = |p: &PlanePlan| {
+            let (d, t) = (&p.dlg, &p.ttu);
+            [
+                (d.refcyc_h_blank_end, 1 << 13),
+                (p.odm_refcyc_h_blank_end, 1 << 13),
+                (d.dlg_vblank_end, 1 << 15),
+                (d.min_dst_y_next_start, 1 << 18),
+                (d.refcyc_per_htotal, 1 << 21),
+                (d.refcyc_x_after_scaler, 1 << 13),
+                (d.dst_y_after_scaler, 8),
+                (d.dst_y_prefetch, 1 << 8),
+                (d.dst_y_per_vm_vblank, 1 << 7),
+                (d.dst_y_per_row_vblank, 1 << 6),
+                (d.ref_freq_to_pix_freq, 1 << 21),
+                (d.vratio_prefetch, 1 << 22),
+                (d.vratio_prefetch_c, 1 << 22),
+                (d.refcyc_per_line_delivery_pre_l, 1 << 13),
+                (d.refcyc_per_line_delivery_l, 1 << 13),
+                (t.qos_level_high_wm, 1 << 14),
+                (t.min_ttu_vblank, 1 << 24),
+                (t.qos_level_flip, 1 << 4),
+                (t.refcyc_per_req_delivery_pre_l, 1 << 23),
+                (t.refcyc_per_req_delivery_l, 1 << 23),
+                (t.qos_level_fixed_l, 1 << 4),
+            ]
+        };
+        let over = |limits: &[(u32, u32)]| limits.iter().any(|&(v, limit)| v >= limit);
+        if over(&global) || self.planes.iter().flatten().any(|p| over(&per_plane(p))) {
             return Err(Error::Register);
         }
         Ok(())

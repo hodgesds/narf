@@ -411,6 +411,7 @@ fn dcn401_mst_audio_requires_matching_live_scanout_witnesses() -> TestResult {
                 bytes_per_pixel: 4,
                 ycbcr420: false,
                 dsc: None,
+                planes: [None; dml::MAX_PLANES],
             },
         )
         .unwrap(),

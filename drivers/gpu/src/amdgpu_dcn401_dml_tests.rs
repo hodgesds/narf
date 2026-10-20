@@ -41,6 +41,7 @@ fn inputs(f: &[u32]) -> (Soc, Mode) {
             bytes_per_pixel: 4,
             ycbcr420: false,
             dsc: None,
+            planes: [None; MAX_PLANES],
         },
     )
 }
@@ -648,6 +649,7 @@ fn dcn401_dml_bytes_per_pixel_domain() -> TestResult {
         bytes_per_pixel,
         ycbcr420: false,
         dsc: None,
+        planes: [None; MAX_PLANES],
     };
     for bad in [0, 1, 3, 6, 16] {
         if admit(&soc, &m(bad, 1920)) != Err(Error::Invalid) {
@@ -855,4 +857,143 @@ fn dcn401_dml_joint_plans_share_global_state() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-dml",
     dcn401_dml_joint_plans_share_global_state
+);
+
+/// Shared with tests/dcn401_dml21/check.sh (harness_planes.c, RAISED).
+const PLANE_VECTORS: &str = include_str!("../tests/dcn401_dml21/plane_vectors.txt");
+
+/// `plan` as plane `k` of its stream sees it: the plane's DPPCLK, DLG,
+/// TTU, DET and ODM blank end in the stream's plan.
+fn plane_view(plan: &Plan, k: usize) -> Option<Plan> {
+    let p = plan.plane(k)?;
+    Some(Plan {
+        clocks: Clocks {
+            dppclk_khz: p.dppclk_khz,
+            ..plan.clocks
+        },
+        dlg: p.dlg,
+        ttu: p.ttu,
+        det_bytes: p.det_bytes,
+        odm_refcyc_h_blank_end: p.odm_refcyc_h_blank_end,
+        planes: [Some(p), None, None, None],
+        ..*plan
+    })
+}
+
+/// plane_vectors.txt: every plane's plan values (as multi_vectors.txt's,
+/// planes in argument order), or the rejection.
+fn check_plane_vectors(vectors: &str) -> Result<(u32, u32, u32), &'static str> {
+    let (mut plans, mut rejects, mut overlays) = (0, 0, 0);
+    for line in vectors.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut words = line.split_whitespace().peekable();
+        let mut s = [0u32; 9];
+        if !parse(&mut words, &mut s) {
+            return Err("malformed plane SoC inputs");
+        }
+        let mut f = [0u32; 19];
+        f[9..18].copy_from_slice(&s);
+        let (soc, _) = inputs(&f);
+        let mut modes = Vec::new();
+        while words.peek().is_some_and(|w| *w != "=" && *w != "!") {
+            let mut t = [0u32; 10];
+            if !parse(&mut words, &mut t) || !(1..=4).contains(&t[9]) {
+                return Err("malformed plane stream");
+            }
+            let mut g = [0u32; 19];
+            g[..9].copy_from_slice(&t[..9]);
+            g[9..18].copy_from_slice(&s);
+            let (_, mut mode) = inputs(&g);
+            for slot in mode.planes.iter_mut().take(t[9] as usize) {
+                let mut p = [0u32; 10];
+                if !parse(&mut words, &mut p) {
+                    return Err("malformed plane");
+                }
+                *slot = Some(Plane {
+                    surface_width: p[0],
+                    surface_height: p[1],
+                    pitch: p[2],
+                    bytes_per_pixel: p[3],
+                    viewport_width: p[4],
+                    viewport_height: p[5],
+                    h_ratio: p[6],
+                    v_ratio: p[7],
+                    h_taps: p[8],
+                    v_taps: p[9],
+                });
+            }
+            mode.pitch = mode.planes[0].map_or(0, |p| p.pitch);
+            mode.bytes_per_pixel = mode.planes[0].map_or(0, |p| p.bytes_per_pixel);
+            modes.push(mode);
+        }
+        let result = admit_all(&soc, &modes);
+        match words.next() {
+            Some("=") => {
+                let Ok(got) = &result else {
+                    return Err("Linux-admitted plane configuration rejected");
+                };
+                let mut first = true;
+                for plan in got {
+                    for k in 0..MAX_PLANES {
+                        let Some(view) = plane_view(plan, k) else {
+                            break;
+                        };
+                        if !first && words.next() != Some("|") {
+                            return Err("malformed plane plan separator");
+                        }
+                        first = false;
+                        let mut want = [0u32; 62];
+                        if !parse(&mut words, &mut want) {
+                            return Err("malformed plane plan");
+                        }
+                        for (i, (&g, &w)) in values(&view).iter().zip(want.iter()).enumerate() {
+                            if g != w && !(TOLERATED.contains(&i) && g.abs_diff(w) == 1) {
+                                return Err("plane plan value differs from Linux DML21");
+                            }
+                        }
+                        if !pipes_match(&mut words, &view) {
+                            return Err("plane plan ODM pipes differ from Linux DML21");
+                        }
+                        overlays += u32::from(k > 0);
+                    }
+                    if !plan.readmits() {
+                        return Err("plane plan not reproducible");
+                    }
+                }
+                if words.next().is_some() {
+                    return Err("plane plan count");
+                }
+                plans += 1;
+            }
+            Some("!") => {
+                let (Some(name), Err(e)) = (words.next(), result) else {
+                    return Err("rejected plane configuration admitted");
+                };
+                if name != "REJECT" && error_name(e) != name {
+                    return Err("plane configuration rejected for a different reason");
+                }
+                rejects += 1;
+            }
+            _ => return Err("malformed plane vector kind"),
+        }
+    }
+    Ok((plans, rejects, overlays))
+}
+
+/// Scaled planes (SPL's viewport, ratios and taps: DPPCLK, scaler delay,
+/// prefetch source lines, line-buffer and DET hiding at the ratios) and
+/// several planes per stream (one DPP each, joint bandwidth, extra latency
+/// and deep sleep), as DML21 plans them.
+fn dcn401_dml_matches_linux_dml21_plane_vectors() -> TestResult {
+    match check_plane_vectors(PLANE_VECTORS) {
+        Ok((plans, _, overlays)) if plans >= 300 && overlays >= 300 => TestResult::Pass,
+        Ok(_) => TestResult::Fail("plane vector file lost coverage"),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_matches_linux_dml21_plane_vectors
 );

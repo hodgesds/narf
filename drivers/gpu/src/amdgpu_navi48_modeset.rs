@@ -1720,6 +1720,7 @@ pub fn plane_mode(timing: Timing, format: otg::SurfaceFormat) -> dml::Mode {
         bytes_per_pixel: format.bytes_per_pixel(),
         ycbcr420: false,
         dsc: None,
+        planes: [None; dml::MAX_PLANES],
     }
 }
 

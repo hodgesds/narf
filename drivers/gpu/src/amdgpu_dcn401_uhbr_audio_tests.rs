@@ -228,9 +228,9 @@ fn dcn401_uhbr_audio_programs_apg_endpoint_and_preserves_video() -> TestResult {
                 assert_eq!(e.io.az[&(stream, 0x54)], 0);
                 // HPO never programs legacy AFMT source or clocks.
                 for p in 0..4 {
-                    assert!(e.io.writes.iter().all(|&(at, _)| !(hdmi::dio(p, 0x2075)
-                        ..=hdmi::dio(p, 0x20ba))
-                        .contains(&at)));
+                    assert!(e.io.writes.iter().all(|&(at, _)| {
+                        !(hdmi::dio(p, 0x2075)..=hdmi::dio(p, 0x20ba)).contains(&at)
+                    }));
                 }
                 run(e.start_dp_audio(path(2), info())).unwrap();
                 run(e.stop_dp_audio(path(2))).unwrap();
@@ -479,6 +479,7 @@ fn dcn401_uhbr_audio_filters_capabilities_and_binds_scanout() -> TestResult {
             bytes_per_pixel: 4,
             ycbcr420: false,
             dsc: None,
+            planes: [None; dml::MAX_PLANES],
         },
     )
     .unwrap();

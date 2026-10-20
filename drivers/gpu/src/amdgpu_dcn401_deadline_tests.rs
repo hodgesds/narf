@@ -39,6 +39,7 @@ fn plan() -> dml::Plan {
             bytes_per_pixel: 4,
             ycbcr420: false,
             dsc: None,
+            planes: [None; dml::MAX_PLANES],
         },
     )
     .unwrap()
