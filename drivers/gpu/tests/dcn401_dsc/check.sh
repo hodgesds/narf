@@ -7,7 +7,13 @@
 #   drivers/gpu/tests/dcn401_dsc/check.sh [linux-tree]
 #   drivers/gpu/tests/dcn401_dsc/check.sh --generate [linux-tree] > vectors.txt
 #   drivers/gpu/tests/dcn401_dsc/check.sh --generate-frl [linux-tree] > frl_vectors.txt
-# amdgpu_dsc.rs must produce Linux's output for every line.
+#   drivers/gpu/tests/dcn401_dsc/check.sh --generate-cvtem [linux-tree] > cvtem_vectors.txt
+#   drivers/gpu/tests/dcn401_dsc/check.sh --generate-mst [linux-tree] > mst_vectors.txt
+# cvtem_vectors.txt replays hpo_enc401_hdmi_set_dsc_config's CVTEM packets
+# (cvtem_harness.c) for frl_vectors.txt's PPSes; mst_vectors.txt replays
+# amdgpu_dm's MST DSC fairness search (mst_harness.c).
+# amdgpu_dsc.rs, the HPO FRL encoder's CVTEM and amdgpu_mst_dsc.rs must
+# produce Linux's output for every line.
 set -euo pipefail
 here=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 generate=0
@@ -19,6 +25,9 @@ elif [ "${1:-}" = --generate-frl ]; then
 	shift
 elif [ "${1:-}" = --generate-cvtem ]; then
 	generate=3
+	shift
+elif [ "${1:-}" = --generate-mst ]; then
+	generate=4
 	shift
 fi
 linux=${1:-/usr/src/linux}
@@ -46,6 +55,15 @@ awk '/^void hpo_enc401_hdmi_set_dsc_config\(/ { on = 1 } on { print } on && /^}/
 grep -q 'emp_packet' "$work/set_dsc_config.c" ||
 	{ echo "hpo_enc401_hdmi_set_dsc_config not found" >&2; exit 1; }
 cc -O1 -w -I"$work" "$here/cvtem_harness.c" -o "$work/cvtem"
+# amdgpu_dm's MST DSC fairness functions, extracted from the Linux source
+# (mst_harness.c supplies the DRM side and replays the link computation).
+awk '/^struct dsc_mst_fairness_params \{/ { on = 1 }
+	/^static bool get_conv_frl_bw/ { exit }
+	on && !/^#if defined\(CONFIG_DRM_AMD_DC_FP\)/ { print }' \
+	"$d/amdgpu_dm/amdgpu_dm_mst_types.c" > "$work/mst_fair.c"
+grep -q 'try_disable_dsc' "$work/mst_fair.c" ||
+	{ echo "amdgpu_dm MST DSC fairness functions not found" >&2; exit 1; }
+cc "${flags[@]}" -I"$work" "$here/mst_harness.c" "$work"/*.o -lm "${alias[@]}" -o "$work/mst"
 # cvtem_vectors.txt: every compressed frl_vectors.txt line's timing, slices,
 # bpp and PPS, with a front porch and sync from its blanking.
 cvtem_inputs() {
@@ -55,6 +73,37 @@ cvtem_inputs() {
 		print ha, ht, int(b / 4), int(b / 8) < 4 ? 4 : int(b / 8), o[2], o[4], o[n]
 	}'
 }
+if [ $generate -eq 4 ]; then
+	echo "# Linux MST DSC fairness reference vectors; see check.sh and mst_harness.c."
+	# encoding link_kbps slots: 4 x HBR3, 4 x HBR2 and 2 x HBR3 with FEC;
+	# 4 x UHBR10, 4 x UHBR20, 2 x UHBR10.
+	links=("0 25142400 63" "0 16761600 63" "0 12571200 63" "1 38566400 64"
+		"1 77132800 64" "1 19283200 64")
+	# pix_clk_100hz h_active h_total v_active v_total: 4K144, 4K240 and 8K60
+	# CVT-RBv2, 4K60, 1440p240, 5K60, 1080p60.
+	modes=("12542820 3840 3920 2160 2222" "21515900 3840 3920 2160 2287"
+		"20397930 7680 7760 4320 4381" "5940000 3840 4400 2160 2250"
+		"9680000 2560 2720 1440 1481" "9384000 5120 5280 2880 2962"
+		"1485000 1920 2200 1080 1125")
+	# DSC 1.2 decoders: slices 1-12, 12-bit line buffer, block prediction,
+	# RGB/YCbCr, 8-12 bpc, 700 or 450 MP/s per slice, 5120-pixel slices,
+	# 1/16 or whole bpp increments; or none.
+	decoders=("01210b0f7f030100001f0e8810000000" "01210b0f7f030100001f0e8810000000"
+		"01210b0f7f030100001f0e3310000004" "01210b0f2b030100001f0e8810000000" "-")
+	RANDOM=6201
+	pick() { local -n a=$1; echo "${a[RANDOM % ${#a[@]}]}"; }
+	for _ in $(seq 1500); do
+		n=$((RANDOM % 10 == 0 ? 4 : 1 + RANDOM % 3))
+		shared=$((RANDOM % 8 == 0 ? 2000 + RANDOM % 3000 : 65535))
+		in="$(pick links) 2000000 $shared $n"
+		for _ in $(seq $n); do
+			port=$((RANDOM % 8 == 0 ? 1000 + RANDOM % 2000 : 65535))
+			in="$in $(pick decoders) $(pick modes) $port"
+		done
+		echo "$in = $(echo "$in" | "$work/mst")"
+	done
+	exit 0
+fi
 if [ $generate -eq 3 ]; then
 	echo "# Linux hpo_enc401_hdmi_set_dsc_config CVTEM packets; see check.sh and cvtem_harness.c."
 	cvtem_inputs | while read -r line; do
@@ -182,9 +231,16 @@ if ! diff -q "$work/want_cvtem" "$work/got_cvtem" >/dev/null; then
 	echo "cvtem_vectors.txt does not match Linux" >&2
 	exit 1
 fi
+grep -v '^#' "$here/mst_vectors.txt" | sed 's/ = .*//' | "$work/mst" > "$work/got_mst"
+grep -v '^#' "$here/mst_vectors.txt" | sed 's/.* = //' > "$work/want_mst"
+if ! diff -q "$work/want_mst" "$work/got_mst" >/dev/null; then
+	diff "$work/want_mst" "$work/got_mst" | head -20 >&2
+	echo "mst_vectors.txt does not match Linux" >&2
+	exit 1
+fi
 # Every cvtem_vectors.txt input comes from frl_vectors.txt's PPSes.
 if ! diff -q <(cvtem_inputs) <(grep -v '^#' "$here/cvtem_vectors.txt" | sed 's/ =.*//') >/dev/null; then
 	echo "cvtem_vectors.txt inputs no longer follow frl_vectors.txt" >&2
 	exit 1
 fi
-echo "$(cat "$work/want" "$work/want_frl" "$work/want_cvtem" | wc -l) ok"
+echo "$(cat "$work/want" "$work/want_frl" "$work/want_cvtem" "$work/want_mst" | wc -l) ok"

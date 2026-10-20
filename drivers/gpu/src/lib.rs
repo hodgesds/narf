@@ -212,6 +212,7 @@ pub mod amdgpu_dp_training;
 pub mod amdgpu_dp_tunnel;
 pub mod amdgpu_dpm;
 pub mod amdgpu_dsc;
+pub mod amdgpu_mst_dsc;
 #[path = "amdgpu_fence_navi22.rs"]
 pub mod amdgpu_rdna2_fence;
 /// Compatibility alias for the original Navi22 API.
