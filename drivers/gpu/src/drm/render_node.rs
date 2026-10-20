@@ -290,8 +290,8 @@ pub fn ioctl_flags(cmd: u32) -> Option<IoctlFlags> {
         0xA0 | 0xA7 | 0xB5 => Some(IoctlFlags::auth_only()),
         // SETCRTC / ADDFB2 / RMFB — DRM_MASTER (display authority).
         0xA2 | 0xB8 | 0xA8 => Some(IoctlFlags::master_only()),
-        // PAGE_FLIP — DRM_MASTER.
-        0xB0 => Some(IoctlFlags::master_only()),
+        // PAGE_FLIP and SETPLANE — DRM_MASTER.
+        0xB0 | 0xB7 => Some(IoctlFlags::master_only()),
         // ATOMIC commit — DRM_MASTER.
         0xBC => Some(IoctlFlags::master_only()),
         // User property blobs are primary-node KMS objects (Linux flags 0;

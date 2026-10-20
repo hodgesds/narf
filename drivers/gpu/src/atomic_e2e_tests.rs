@@ -282,6 +282,7 @@ fn smoke_atomic_plane_has_required_props() -> TestResult {
         src_w: 640,
         src_h: 480,
         in_fence_fd: None,
+        props: None,
     };
 
     if ps.fb_id != Some(7) {
@@ -399,6 +400,7 @@ fn smoke_atomic_add_plane_with_fb() -> TestResult {
         src_w: 1024,
         src_h: 768,
         in_fence_fd: None,
+        props: None,
     });
 
     if state.planes.len() != 1 {

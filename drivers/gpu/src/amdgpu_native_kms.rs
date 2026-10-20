@@ -115,6 +115,36 @@ pub fn present_frame(
         )
     }
 }
+/// DRM's planes on display `display`'s CRTC (Navi48 only: Navi22 exposes
+/// no overlays or plane placement).
+pub fn request_display_planes(display: u8, setup: crate::amdgpu_navi48_boot::PlaneSetup) -> bool {
+    !navi22() && crate::amdgpu_navi48_platform::request_display_planes(display, setup)
+}
+/// Whether display `display` can light the planes `setup` with its
+/// primary in `fourcc` (see `amdgpu_navi48_platform::display_admits_planes`).
+pub fn display_admits_planes(
+    display: u8,
+    connector: Option<u32>,
+    mode: Option<&DrmModeModeInfo>,
+    fourcc: u32,
+    setup: &crate::amdgpu_navi48_boot::PlaneSetup,
+) -> bool {
+    !navi22()
+        && crate::amdgpu_navi48_platform::display_admits_planes(
+            display, connector, mode, fourcc, setup,
+        )
+        .is_ok()
+}
+/// Present an atomic commit's planes on display `display` (Navi48).
+pub fn present_planes(
+    display: u8,
+    primary: Option<crate::amdgpu_navi48_platform::PlaneFrame>,
+    overlays: [Option<crate::amdgpu_navi48_platform::PlaneFrame>;
+        crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
+    ticket: Option<u64>,
+) -> bool {
+    !navi22() && crate::amdgpu_navi48_platform::present_planes(display, primary, overlays, ticket)
+}
 /// The display the console runs on.
 pub fn console_pipe() -> u8 {
     if navi22() {

@@ -3698,3 +3698,385 @@ kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_user_copies_version_strings
 );
+
+// ── amdgpu_dm's native overlay planes ─────────────────────────────────
+//
+// A card publishing native planes (the Navi48 card's shape) exposes each
+// CRTC's primary and DCN401's three overlays with amdgpu_dm's properties,
+// and runs amdgpu_dm's plane checks on ATOMIC (TEST_ONLY included) and
+// SETPLANE. DML admission and presentation are the native display's
+// (exercised by the navi48 tests); this card has none.
+fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
+    use crate::drm::card::DumbBacking;
+    use crate::drm_native_planes as planes;
+    const XR24: u32 = 0x3432_5258;
+    const AR24: u32 = 0x3432_5241;
+    const XR30: u32 = 0x3033_5258;
+    const OVERLAY: u32 = planes::OVERLAY_PLANE_ID_BASE;
+    let idx = register_test_card();
+    let Some(ms) = crate::drm_registry::mode_state(idx) else {
+        return TestResult::Fail("no mode state");
+    };
+    let (primary_fb, video_fb, big_fb, deep_fb) = {
+        let mut card = ms.lock();
+        card.native_atomic = true;
+        card.plane_formats = Some(&crate::amdgpu_navi48_kms::PLANE_FORMATS);
+        card.overlay_formats = Some(&planes::OVERLAY_FORMATS);
+        card.native_planes = planes::planes_for(&[], &[11, 12]);
+        let mut fb = |phys: u64, w: u32, h: u32, format: u32| {
+            let size = (w * h * 4) as usize;
+            let handle = card.gem.alloc(phys, size).unwrap();
+            card.dumb_backings.push(DumbBacking {
+                gem_handle: handle,
+                phys,
+                byte_len: size,
+                order: 0,
+                mmap_offset: (handle as u64) << 12,
+                refcount: 1,
+                dma_buf: Default::default(),
+            });
+            card.addfb2(w, h, format, w * 4, handle).unwrap()
+        };
+        let fbs = (
+            fb(0xBE10_0000, 64, 32, XR24),
+            fb(0xBE20_0000, 32, 16, AR24),
+            fb(0xBE30_0000, 256, 128, AR24),
+            fb(0xBE40_0000, 64, 32, XR30),
+        );
+        let crtc = card.crtc_mut(11).unwrap();
+        crtc.mode = Some(crate::Mode {
+            width: 64,
+            height: 32,
+            refresh_hz: 60,
+            bpp: 32,
+        });
+        crtc.enabled = true;
+        crtc.primary_fb = Some(fbs.0);
+        fbs
+    };
+    // GETPLANERESOURCES: both primaries, then the three overlays.
+    let mut ids = [0u32; 8];
+    let mut res = [0u8; 16];
+    res[0..8].copy_from_slice(&(ids.as_mut_ptr() as u64).to_le_bytes());
+    res[8..12].copy_from_slice(&8u32.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xB5, 16),
+        res.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+        || res[8..12] != 5u32.to_le_bytes()
+        || ids[..5] != [0x40, 0x41, OVERLAY, OVERLAY + 1, OVERLAY + 2]
+    {
+        return TestResult::Fail("plane resources");
+    }
+    // GETPLANE: an overlay goes on any CRTC and takes the overlay formats.
+    let getplane = |id: u32| {
+        let mut formats = [0u32; 16];
+        let mut gp = [0u8; 32];
+        gp[0..4].copy_from_slice(&id.to_le_bytes());
+        gp[20..24].copy_from_slice(&16u32.to_le_bytes());
+        gp[24..32].copy_from_slice(&(formats.as_mut_ptr() as u64).to_le_bytes());
+        let r = dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xB6, 32),
+            gp.as_mut_ptr() as usize,
+            false,
+        );
+        let word = |i: usize| u32::from_le_bytes(gp[i * 4..i * 4 + 4].try_into().unwrap());
+        (r, word(1), word(2), word(3), word(5), formats)
+    };
+    let (r, crtc, fb, possible, count, formats) = getplane(OVERLAY);
+    if r != Ok(0)
+        || (crtc, fb, possible) != (0, 0, 0xff)
+        || count != 5
+        || formats[..5] != planes::OVERLAY_FORMATS
+    {
+        return TestResult::Fail("overlay GETPLANE");
+    }
+    // OBJ_GETPROPERTIES: the core plane properties, then amdgpu_dm's.
+    let properties = |id: u32| {
+        let mut props = [0u32; 20];
+        let mut vals = [0u64; 20];
+        let mut og = [0u8; 32];
+        og[0..8].copy_from_slice(&(props.as_mut_ptr() as u64).to_le_bytes());
+        og[8..16].copy_from_slice(&(vals.as_mut_ptr() as u64).to_le_bytes());
+        og[16..20].copy_from_slice(&20u32.to_le_bytes());
+        og[20..24].copy_from_slice(&id.to_le_bytes());
+        og[24..28].copy_from_slice(&0xeeee_eeeeu32.to_le_bytes());
+        let r = dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xB9, 32),
+            og.as_mut_ptr() as usize,
+            false,
+        );
+        let n = u32::from_le_bytes(og[16..20].try_into().unwrap()) as usize;
+        (r, props[..n.min(20)].to_vec(), vals[..n.min(20)].to_vec())
+    };
+    let (r, props, vals) = properties(OVERLAY + 1);
+    if r != Ok(0)
+        || props.len() != 16
+        || vals[0] != 0
+        || props[12..]
+            != [
+                planes::ALPHA_PROP_ID,
+                planes::BLEND_PROP_ID,
+                planes::ZPOS_PROP_ID,
+                planes::ROTATION_PROP_ID,
+            ]
+        || vals[12..] != [0xffff, 0, 9, 1]
+    {
+        return TestResult::Fail("overlay properties");
+    }
+    let (r, props, vals) = properties(0x40);
+    if r != Ok(0)
+        || vals[0] != 1
+        || props[12..]
+            != [
+                planes::BLEND_PROP_ID,
+                planes::PRIMARY_ZPOS_PROP_ID,
+                planes::ROTATION_PROP_ID,
+            ]
+        || vals[13] != 3
+        || vals[9..11] != [64, 32]
+    {
+        return TestResult::Fail("primary properties");
+    }
+    // GETPROPERTY: the ranges (the primary's zpos immutable), the enum and
+    // the rotation bitmask with Linux's names.
+    let getproperty = |id: u32| {
+        let mut values = [0u64; 4];
+        let mut enums = [0u8; 4 * 40];
+        let mut gp = [0u8; 64];
+        gp[0..8].copy_from_slice(&(values.as_mut_ptr() as u64).to_le_bytes());
+        gp[8..16].copy_from_slice(&(enums.as_mut_ptr() as u64).to_le_bytes());
+        gp[16..20].copy_from_slice(&id.to_le_bytes());
+        gp[56..60].copy_from_slice(&4u32.to_le_bytes());
+        gp[60..64].copy_from_slice(&4u32.to_le_bytes());
+        let r = dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xAA, 64),
+            gp.as_mut_ptr() as usize,
+            false,
+        );
+        let flags = u32::from_le_bytes(gp[20..24].try_into().unwrap());
+        let name_end = gp[24..56].iter().position(|&b| b == 0).unwrap_or(32);
+        let name = alloc::vec::Vec::from(&gp[24..24 + name_end]);
+        let n = u32::from_le_bytes(gp[56..60].try_into().unwrap()) as usize;
+        (r, flags, name, values[..n.min(4)].to_vec(), enums)
+    };
+    let (r, flags, name, values, _) = getproperty(planes::PRIMARY_ZPOS_PROP_ID);
+    if r != Ok(0) || flags != 2 | 4 || name != b"zpos" || values != [3, 3] {
+        return TestResult::Fail("primary zpos property");
+    }
+    let (r, flags, name, values, _) = getproperty(planes::ALPHA_PROP_ID);
+    if r != Ok(0) || flags != 2 || name != b"alpha" || values != [0, 0xffff] {
+        return TestResult::Fail("alpha property");
+    }
+    let (r, flags, name, values, enums) = getproperty(planes::BLEND_PROP_ID);
+    if r != Ok(0)
+        || flags != 8
+        || name != b"pixel blend mode"
+        || values != [2, 0, 1]
+        || &enums[8..12] != b"None"
+        || &enums[48..62] != b"Pre-multiplied"
+    {
+        return TestResult::Fail("pixel blend mode property");
+    }
+    let (r, flags, name, values, enums) = getproperty(planes::ROTATION_PROP_ID);
+    if r != Ok(0)
+        || flags != 0x20
+        || name != b"rotation"
+        || values != [0, 1, 2, 3]
+        || &enums[128..138] != b"rotate-270"
+    {
+        return TestResult::Fail("rotation property");
+    }
+    // ATOMIC with amdgpu_dm's checks.
+    let atomic = |flags: u32, objects: &[(u32, &[(u32, u64)])]| {
+        let objs: alloc::vec::Vec<u32> = objects.iter().map(|o| o.0).collect();
+        let counts: alloc::vec::Vec<u32> = objects.iter().map(|o| o.1.len() as u32).collect();
+        let props: alloc::vec::Vec<u32> = objects
+            .iter()
+            .flat_map(|o| o.1.iter().map(|p| p.0))
+            .collect();
+        let values: alloc::vec::Vec<u64> = objects
+            .iter()
+            .flat_map(|o| o.1.iter().map(|p| p.1))
+            .collect();
+        let mut req = DrmModeAtomicUapi {
+            flags,
+            count_objs: objs.len() as u32,
+            objs_ptr: objs.as_ptr() as u64,
+            count_props_ptr: counts.as_ptr() as u64,
+            props_ptr: props.as_ptr() as u64,
+            prop_values_ptr: values.as_ptr() as u64,
+            ..Default::default()
+        };
+        dispatch_card(
+            idx,
+            DRM_IOCTL_MODE_ATOMIC,
+            &mut req as *mut _ as usize,
+            false,
+        )
+    };
+    const FB_ID: u32 = 0x55;
+    const CRTC_ID: u32 = 0x56;
+    let place = |fb: u32, src: (u64, u64), dst: (i64, i64, u64, u64)| {
+        [
+            (FB_ID, u64::from(fb)),
+            (CRTC_ID, 11),
+            (0x57, 0),
+            (0x58, 0),
+            (0x59, src.0 << 16),
+            (0x5a, src.1 << 16),
+            (0x5b, dst.0 as u64),
+            (0x5c, dst.1 as u64),
+            (0x5d, dst.2),
+            (0x5e, dst.3),
+        ]
+    };
+    let video = place(video_fb, (32, 16), (8, 8, 24, 12));
+    let with = |extra: &[(u32, u64)]| {
+        let mut v = alloc::vec::Vec::from(video);
+        v.extend_from_slice(extra);
+        v
+    };
+    let half = with(&[(planes::ALPHA_PROP_ID, 0x8000), (planes::BLEND_PROP_ID, 1)]);
+    if atomic(0x0100, &[(OVERLAY, &half)]) != Ok(0)
+        || ms.lock().native_plane(OVERLAY).unwrap().fb_id.is_some()
+    {
+        return TestResult::Fail("TEST_ONLY overlay");
+    }
+    let eighth = place(big_fb, (256, 128), (0, 0, 32, 16));
+    let refused: [(&str, alloc::vec::Vec<(u32, u64)>, u32); 7] = [
+        ("8:1 downscale", alloc::vec::Vec::from(eighth), OVERLAY),
+        ("rotate-90", with(&[(planes::ROTATION_PROP_ID, 2)]), OVERLAY),
+        (
+            "two rotations",
+            with(&[(planes::ROTATION_PROP_ID, 5)]),
+            OVERLAY,
+        ),
+        (
+            "alpha range",
+            with(&[(planes::ALPHA_PROP_ID, 0x1_0000)]),
+            OVERLAY,
+        ),
+        (
+            "viewport",
+            alloc::vec::Vec::from(place(video_fb, (32, 16), (8, 8, 20, 12))),
+            OVERLAY,
+        ),
+        (
+            "overlay format",
+            alloc::vec::Vec::from(place(deep_fb, (64, 32), (0, 0, 64, 32))),
+            OVERLAY,
+        ),
+        (
+            "primary zpos",
+            alloc::vec![(planes::PRIMARY_ZPOS_PROP_ID, 3)],
+            0x40,
+        ),
+    ];
+    for (why, props, plane) in &refused {
+        if atomic(0x0100, &[(*plane, props)]) != Err(FsError::InvalidData) {
+            return TestResult::Fail(why);
+        }
+    }
+    // An enabled CRTC needs its primary plane (dm_crtc_helper_atomic_check).
+    if atomic(0x0100, &[(0x40, &[(FB_ID, 0), (CRTC_ID, 0)])]) != Err(FsError::InvalidData) {
+        return TestResult::Fail("CRTC without its primary");
+    }
+    // A commit records the overlay's state; GETPLANE reports it.
+    if atomic(0, &[(OVERLAY, &half)]) != Ok(0) {
+        return TestResult::Fail("overlay commit");
+    }
+    {
+        let card = ms.lock();
+        let p = card.native_plane(OVERLAY).unwrap();
+        if (p.crtc_id, p.fb_id) != (Some(11), Some(video_fb))
+            || p.props.alpha != 0x8000
+            || p.props.blend != 1
+            || p.dst != (8, 8, 24, 12)
+            || card.crtc(11).unwrap().primary_fb != Some(primary_fb)
+        {
+            return TestResult::Fail("committed overlay state");
+        }
+    }
+    if getplane(OVERLAY).1 != 11 || getplane(OVERLAY).2 != video_fb {
+        return TestResult::Fail("GETPLANE of an enabled overlay");
+    }
+    // drm_atomic_plane_check: no direct move to another CRTC.
+    let mut moved = alloc::vec::Vec::from(video);
+    moved[1] = (CRTC_ID, 12);
+    if atomic(0x0100, &[(OVERLAY, &moved)]) != Err(FsError::InvalidData) {
+        return TestResult::Fail("overlay switched CRTC directly");
+    }
+    // SETPLANE: the plane alone, through the same checks.
+    let setplane =
+        |master: bool, plane: u32, fb: u32, dst: (i32, i32, u32, u32), src: (u32, u32)| {
+            let mut b = [0u8; 48];
+            let words: [u32; 12] = [
+                plane,
+                11,
+                fb,
+                0,
+                dst.0 as u32,
+                dst.1 as u32,
+                dst.2,
+                dst.3,
+                0,
+                0,
+                src.1 << 16,
+                src.0 << 16,
+            ];
+            for (i, w) in words.iter().enumerate() {
+                b[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            let id = if master {
+                SMOKE_MASTER_ID
+            } else {
+                SMOKE_MASTER_ID + 1
+            };
+            crate::drm_ioctl_bridge::dispatch_card(
+                idx,
+                id,
+                iowr(DRM_IOCTL_BASE, 0xB7, 48),
+                b.as_mut_ptr() as usize,
+                false,
+            )
+        };
+    if setplane(false, OVERLAY + 1, video_fb, (0, 0, 32, 16), (32, 16))
+        != Err(FsError::PermissionDenied)
+        || setplane(true, 0x99, video_fb, (0, 0, 32, 16), (32, 16)) != Err(FsError::NotFound)
+        || setplane(true, OVERLAY + 1, video_fb, (0, 0, 32, 16), (33, 16)) != Err(FsError::NoSpace)
+        || setplane(true, OVERLAY + 1, big_fb, (0, 0, 32, 16), (256, 128))
+            != Err(FsError::InvalidData)
+        || setplane(true, OVERLAY + 1, video_fb, (16, 8, 48, 24), (32, 16)) != Ok(0)
+    {
+        return TestResult::Fail("SETPLANE");
+    }
+    if ms.lock().native_plane(OVERLAY + 1).unwrap().dst != (16, 8, 48, 24)
+        || setplane(true, OVERLAY + 1, 0, (0, 0, 0, 0), (0, 0)) != Ok(0)
+        || ms.lock().native_plane(OVERLAY + 1).unwrap().fb_id.is_some()
+    {
+        return TestResult::Fail("SETPLANE state");
+    }
+    // Removing the overlay's framebuffer disables it.
+    let mut rm = video_fb.to_le_bytes();
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xA8, 4),
+        rm.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+        || ms.lock().native_plane(OVERLAY).unwrap().crtc_id.is_some()
+    {
+        return TestResult::Fail("RMFB of an overlay's framebuffer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_ioctl_native_overlay_planes
+);

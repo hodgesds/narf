@@ -321,6 +321,10 @@ pub fn apply_routed_vrr(
     // nothing lies below the primary).
     card.vblank_source = Some(crate::amdgpu_navi48_platform::crtc_vblank);
     card.plane_formats = Some(&PLANE_FORMATS);
+    // amdgpu_dm's planes: each CRTC's primary and DCN401's three overlays.
+    let crtc_ids: alloc::vec::Vec<u32> = card.crtcs.iter().map(|c| c.id).collect();
+    card.native_planes = crate::drm_native_planes::planes_for(&card.native_planes, &crtc_ids);
+    card.overlay_formats = Some(&crate::drm_native_planes::OVERLAY_FORMATS);
     card.native = native;
     // amdgpu is DRIVER_ATOMIC: the bridge's native atomic path validates
     // MODE_ID/format/route against this owner and commits through it.

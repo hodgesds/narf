@@ -159,6 +159,10 @@ pub struct PlaneState {
     /// records the fd for ABI completeness; the syscall layer owns fd
     /// validation.
     pub in_fence_fd: Option<i32>,
+    /// A native card plane's "alpha", "pixel blend mode", "zpos" and
+    /// "rotation" (its committed values unless the request sets them);
+    /// `None` on planes without them.
+    pub props: Option<super::card::PlaneProps>,
 }
 
 // ── AtomicState ────────────────────────────────────────────────────────
@@ -341,7 +345,15 @@ impl AtomicState {
         }
         // Planes — write primary plane FB into the bound CRTC's
         // primary_fb so the legacy CRTC fbs reflect the atomic commit.
+        // A native card's overlay planes keep their own state
+        // (`drm_native_planes::commit`).
         for ps in &self.planes {
+            if card
+                .native_plane(ps.id)
+                .is_some_and(|p| p.primary_of.is_none())
+            {
+                continue;
+            }
             if let (Some(crtc_id), Some(fb_id)) = (ps.crtc_id, ps.fb_id) {
                 let crtc = card
                     .crtcs

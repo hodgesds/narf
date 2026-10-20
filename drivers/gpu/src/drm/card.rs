@@ -766,6 +766,55 @@ pub struct Card {
     /// The CRTCs carrying color management properties. Empty on cards that
     /// do not expose them.
     pub crtc_color: Vec<CrtcColor>,
+    /// A native card's planes with amdgpu_dm's plane properties: every
+    /// CRTC's primary and the overlay planes. Empty on cards without them.
+    pub native_planes: Vec<NativePlane>,
+    /// The fourccs the native overlay planes take.
+    pub overlay_formats: Option<&'static [u32]>,
+}
+
+/// drm_plane_state's blending and orientation as amdgpu_dm attaches them:
+/// "alpha" (overlays; 0xffff opaque), "pixel blend mode"
+/// (DRM_MODE_BLEND_*), "zpos" and "rotation" (one DRM_MODE_ROTATE_* bit).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaneProps {
+    pub alpha: u16,
+    pub blend: u8,
+    pub zpos: u8,
+    pub rotation: u8,
+}
+impl PlaneProps {
+    /// DRM_MODE_BLEND_PREMULTI, DRM_MODE_BLEND_COVERAGE, DRM_MODE_BLEND_PIXEL_NONE.
+    pub const PREMULTI: u8 = 0;
+    pub const COVERAGE: u8 = 1;
+    pub const PIXEL_NONE: u8 = 2;
+    /// A plane's defaults: opaque, pre-multiplied, unrotated, at `zpos`.
+    pub const fn new(zpos: u8) -> Self {
+        Self {
+            alpha: 0xffff,
+            blend: Self::PREMULTI,
+            zpos,
+            rotation: 1,
+        }
+    }
+}
+
+/// One plane of a native card: its id, the CRTC whose primary it is (an
+/// overlay has none and may go on any), its committed CRTC and framebuffer
+/// (a primary's mirror its CRTC's `primary_fb`), source rectangle (whole
+/// pixels: amdgpu_dm ignores the 16.16 fraction) and CRTC rectangle, and
+/// its properties. A primary whose rectangles no atomic commit or SETPLANE
+/// set (`placed` false) shows the whole mode, as legacy SETCRTC sets it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativePlane {
+    pub id: u32,
+    pub primary_of: Option<u32>,
+    pub crtc_id: Option<u32>,
+    pub fb_id: Option<u32>,
+    pub src: (u32, u32, u32, u32),
+    pub dst: (i32, i32, u32, u32),
+    pub placed: bool,
+    pub props: PlaneProps,
 }
 
 /// A connector whose modes and EDID come from a real sink, published by a
@@ -862,7 +911,13 @@ impl Card {
             native_atomic: false,
             vrr_enabled: Vec::new(),
             crtc_color: Vec::new(),
+            native_planes: Vec::new(),
+            overlay_formats: None,
         }
+    }
+    /// The native plane `id`, if this card has one.
+    pub fn native_plane(&self, id: u32) -> Option<&NativePlane> {
+        self.native_planes.iter().find(|p| p.id == id)
     }
     /// Wire form of a CRTC mode: the exact native timing when a published
     /// connector carries this mode, otherwise the synthesized one.
@@ -1566,6 +1621,14 @@ impl Card {
             crtc.primary_fb = None;
             crtc.enabled = false;
             crtc.mode = None;
+        }
+        for p in self
+            .native_planes
+            .iter_mut()
+            .filter(|p| p.fb_id == Some(fb_id))
+        {
+            p.fb_id = None;
+            p.crtc_id = None;
         }
         let freed = self.remove_dumb_backing(fb.gem_handle);
         if freed.is_none() {
