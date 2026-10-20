@@ -205,6 +205,144 @@ impl MstLink {
     }
 }
 
+/// The same branch device in two probes: its GUID at the same route.
+fn same_branch(a: &dp_mst_mgr::Branch, b: &dp_mst_mgr::Branch) -> bool {
+    a.guid == b.guid && a.lct == b.lct && a.rad == b.rad
+}
+
+/// `new` renumbered so that every branch surviving from `old` (same GUID
+/// and route) keeps its index: the `Sink`s of live payloads and running
+/// selections stay valid, as Linux's drm_dp_mst_branch/port objects survive
+/// a downstream change. New branches take vacated indices, then append;
+/// unfilled vacancies become unreachable placeholders with no ports. None
+/// for another primary branch.
+fn keep_indices(old: &Topology, new: Topology) -> Option<Topology> {
+    let (old_root, new_root) = (old.branches.first()?, new.branches.first()?);
+    if !same_branch(old_root, new_root) {
+        return None;
+    }
+    let n = new.branches.len();
+    let mut map: Vec<Option<usize>> = alloc::vec![None; n];
+    let mut taken = alloc::vec![false; old.branches.len()];
+    for (j, b) in new.branches.iter().enumerate() {
+        let i = old.branches.iter().position(|o| same_branch(o, b));
+        if let Some(i) = i.filter(|&i| !taken[i]) {
+            map[j] = Some(i);
+            taken[i] = true;
+        }
+    }
+    let mut free = (0..old.branches.len()).filter(|&i| !taken[i]);
+    let mut next = old.branches.len();
+    for slot in map.iter_mut().filter(|m| m.is_none()) {
+        *slot = Some(free.next().unwrap_or_else(|| {
+            next += 1;
+            next - 1
+        }));
+    }
+    let len = next;
+    let mut branches: Vec<Option<dp_mst_mgr::Branch>> = alloc::vec![None; len];
+    for (j, mut b) in new.branches.into_iter().enumerate() {
+        for port in &mut b.ports {
+            port.branch = port.branch.and_then(|c| map.get(c).copied().flatten());
+        }
+        branches[map[j]?] = Some(b);
+    }
+    Some(Topology {
+        branches: branches
+            .into_iter()
+            .map(|b| {
+                b.unwrap_or(dp_mst_mgr::Branch {
+                    lct: 0,
+                    rad: [0; 8],
+                    guid: [0; 16],
+                    ports: Vec::new(),
+                })
+            })
+            .collect(),
+    })
+}
+
+impl MstLink {
+    /// A downstream change while streams run, as Linux handles a connection
+    /// notification (drm_dp_mst_handle_conn_stat, then the link-address
+    /// probe of new branches) without touching unaffected streams: probe
+    /// the tree again, keep the surviving branches' indices, add the
+    /// driver's own payloads back to each hop's reported free PBN, and
+    /// adopt the new topology only when every payload's end device is still
+    /// connected behind the same route with its PBN inside every hop's
+    /// budget. Then the outputs and their EDID/DSC are reconciled as a
+    /// fresh probe does and the session is clean (`Ok(true)`). Otherwise
+    /// the old topology, its routes and the dirty mark stay for the
+    /// stop/reprobe/relight path (`Ok(false)`). A failed or cancelled probe
+    /// retains the session as `prepare` does.
+    pub(super) async fn reprobe_live<A: MstAux>(
+        &mut self,
+        aux: &mut A,
+    ) -> Result<bool, MstFailure<A::Error>> {
+        self.require_transaction_idle()?;
+        if self.state != ProbeState::Ready || !self.dirty || !self.has_stream_resources() {
+            return Err(MstFailure::Invalid);
+        }
+        self.state = ProbeState::Probing;
+        let probed = self.manager.probe(aux).await?;
+        self.state = ProbeState::Ready;
+        let Some(mut topology) = keep_indices(&self.topology, probed) else {
+            return Ok(false);
+        };
+        let allocated: Vec<_> = self.payloads.iter().map(|p| (p.sink, p.pbn)).collect();
+        let ends = topology.sinks();
+        if allocated.iter().any(|(sink, _)| !ends.contains(sink)) {
+            return Ok(false);
+        }
+        // ENUM_PATH_RESOURCES reports what our own payloads left free.
+        let mut credited = topology.clone();
+        for (b, branch) in topology.branches.iter().enumerate() {
+            for (k, port) in branch.ports.iter().enumerate() {
+                let hop = dp_mst_mgr::Sink {
+                    branch: b,
+                    port: port.info.port,
+                };
+                let Some(used) = used_pbn(&topology, hop, &allocated) else {
+                    return Ok(false);
+                };
+                let available =
+                    (u32::from(port.available_pbn) + used).min(u32::from(port.full_pbn));
+                credited.branches[b].ports[k].available_pbn = available as u16;
+            }
+        }
+        topology = credited;
+        for (i, &(sink, pbn)) in allocated.iter().enumerate() {
+            let others: Vec<_> = allocated
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j != i)
+                .map(|(_, &a)| a)
+                .collect();
+            if path_budget(&topology, sink, &others).is_none_or(|free| pbn > free) {
+                return Ok(false);
+            }
+        }
+        // Every live route survives (a branch keeps its index only at its
+        // old GUID and route): the payload sinks stay valid as they are.
+        self.state = ProbeState::Probing;
+        let mut outputs = reconcile(&self.outputs, &topology);
+        for output in outputs.iter_mut().flatten() {
+            if let Some(sink) = output.sink {
+                output.edid = read_edid(&mut self.manager, aux, &topology, sink)
+                    .await
+                    .unwrap_or_default();
+                output.dsc = super::dsc::read_dsc(&mut self.manager, aux, &topology, sink).await;
+            }
+        }
+        self.topology = topology;
+        self.outputs = outputs;
+        self.resource_ports.clear();
+        self.dirty = false;
+        self.state = ProbeState::Ready;
+        Ok(true)
+    }
+}
+
 fn used_pbn(
     topology: &Topology,
     hop: dp_mst_mgr::Sink,
@@ -562,5 +700,175 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/dp-mst",
         navi48_mst_cancelled_probe_cannot_replay
+    );
+
+    /// Surviving branches keep their indices across a reprobe whose
+    /// depth-first order moved them; new ones fill vacated indices, then
+    /// append, and child references follow; another primary is refused.
+    fn navi48_mst_reprobe_keeps_branch_indices() -> TestResult {
+        let mut hub = Hub::new();
+        hub.grandchild_present = true;
+        let old = run(Manager::new().probe(&mut hub)).unwrap();
+        assert_eq!(old.branches.len(), 3);
+        // A new branch first in the walk, the grandchild's old place vacated.
+        let mut new = old.clone();
+        let mut extra = old.branches[1].clone();
+        extra.guid = [0x77; 16];
+        extra.rad[0] = 0x30;
+        extra.ports.truncate(2);
+        new.branches.remove(2);
+        new.branches.insert(1, extra.clone());
+        // Root port 2 points at the child, now index 2; its port 2 is gone.
+        new.branches[0].ports[2].branch = Some(2);
+        new.branches[2].ports[2].branch = None;
+        new.branches[2].ports[2].info.ddps = false;
+        let kept = keep_indices(&old, new).unwrap();
+        assert_eq!(kept.branches.len(), 3);
+        assert_eq!(kept.branches[0].guid, old.branches[0].guid);
+        assert_eq!(kept.branches[1].guid, old.branches[1].guid);
+        assert_eq!(kept.branches[2].guid, [0x77; 16]);
+        assert_eq!(kept.branches[0].ports[2].branch, Some(1));
+        let child_sink = dp_mst_mgr::Sink { branch: 1, port: 1 };
+        assert_eq!(kept.port(child_sink), old.port(child_sink));
+        assert!(kept.path(child_sink).is_some());
+        // Removal only: the vacancy is an unreachable placeholder.
+        let mut fewer = old.clone();
+        fewer.branches.truncate(2);
+        fewer.branches[1].ports[2].branch = None;
+        let kept = keep_indices(&old, fewer).unwrap();
+        assert_eq!(kept.branches.len(), 3);
+        assert!(kept.branches[2].ports.is_empty());
+        assert_eq!(kept.sinks().len(), 2);
+        let mut other = old.clone();
+        other.branches[0].guid = [0x99; 16];
+        assert!(keep_indices(&old, other).is_none());
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/dp-mst",
+        navi48_mst_reprobe_keeps_branch_indices
+    );
+
+    /// A downstream branch hot-plugged at the end of a daisy chain while
+    /// streams run on the root and child sinks: the live reprobe walks the
+    /// tree again (no payload-table reset), finds the grandchild at LCT 3,
+    /// keeps the running payloads and their sinks, credits their PBN back
+    /// to the hops they cross, and gives the new end device a connector
+    /// with its EDID. Unplugging that unlit branch is adopted the same way
+    /// (its connector reservation stays); losing the child, which carries a
+    /// stream, or the shared hop's capacity is not, and leaves the old
+    /// routes for the stop/reprobe/relight path.
+    fn navi48_mst_downstream_branch_hotplug_keeps_running_streams() -> TestResult {
+        let mut hub = Hub::new();
+        hub.dpcd.insert(0, 0x14);
+        hub.edid[126] = 0;
+        let mut link = MstLink::default();
+        run(link.prepare(&mut hub)).unwrap();
+        link.manager.events.clear();
+        let root_sink = dp_mst_mgr::Sink { branch: 0, port: 1 };
+        let child_sink = dp_mst_mgr::Sink { branch: 1, port: 1 };
+        link.owner = Some(0);
+        link.payloads.push(MstPayload {
+            sink: root_sink,
+            vcpi: 1,
+            start: 1,
+            slots: 20,
+            pbn: 900,
+            stream: 0,
+        });
+        link.payloads.push(MstPayload {
+            sink: child_sink,
+            vcpi: 2,
+            start: 21,
+            slots: 20,
+            pbn: 900,
+            stream: 1,
+        });
+        let payloads = link.payloads.clone();
+        let ids = link.outputs.each_ref().map(|o| o.as_ref().map(|o| o.id));
+        // Adoption needs a dirty session with streams.
+        assert_eq!(run(link.reprobe_live(&mut hub)), Err(MstFailure::Invalid));
+        hub.grandchild_present = true;
+        link.manager.events.push(notice([0x22; 16], 2));
+        link.consume_events();
+        assert!(link.dirty);
+        let sent = hub.requests.len();
+        assert_eq!(run(link.reprobe_live(&mut hub)), Ok(true));
+        assert!(!link.dirty);
+        assert_eq!(link.payloads, payloads);
+        assert_eq!(link.topology.branches.len(), 3);
+        let grand = dp_mst_mgr::Sink { branch: 2, port: 1 };
+        assert_eq!(link.topology.sinks(), [root_sink, child_sink, grand]);
+        let new_requests = &hub.requests[sent..];
+        assert!(new_requests
+            .iter()
+            .all(|r| r.2 != dp_mst::CLEAR_PAYLOAD_ID_TABLE));
+        assert!(new_requests
+            .iter()
+            .any(|r| (r.0, r.1[0], r.2) == (3, 0x22, dp_mst::LINK_ADDRESS)));
+        // The hub reports full - 10 free; our payloads are added back, so
+        // the root hop the child's stream crosses is at its full PBN.
+        assert_eq!(
+            link.topology
+                .port(dp_mst_mgr::Sink { branch: 0, port: 2 })
+                .unwrap()
+                .available_pbn,
+            2562
+        );
+        assert_eq!(
+            path_budget(
+                &link.topology,
+                grand,
+                &[(root_sink, 900), (child_sink, 900)]
+            ),
+            Some(2562 - 900)
+        );
+        for (k, id) in ids.iter().enumerate() {
+            if id.is_some() {
+                assert_eq!(link.outputs[k].as_ref().map(|o| o.id), *id);
+            }
+        }
+        let g = link
+            .outputs
+            .iter()
+            .flatten()
+            .find(|o| o.sink == Some(grand))
+            .unwrap();
+        assert_eq!((g.id.lct, g.id.rad[0], g.id.branch), (3, 0x22, [0x55; 16]));
+        assert_eq!(g.edid.len(), 128);
+        let g_id = g.id;
+        // The unlit grandchild leaves: adopted, its slot reserved.
+        hub.grandchild_present = false;
+        link.manager.events.push(notice([0x22; 16], 2));
+        link.consume_events();
+        assert_eq!(run(link.reprobe_live(&mut hub)), Ok(true));
+        assert_eq!(link.payloads, payloads);
+        let g = link
+            .outputs
+            .iter()
+            .flatten()
+            .find(|o| o.id == g_id)
+            .unwrap();
+        assert_eq!(g.sink, None);
+        // Not enough left on the shared hop for the child's stream.
+        hub.resources.insert((1, 2), (800, 0));
+        link.manager.events.push(notice([0x11; 16], 2));
+        link.consume_events();
+        let before = link.topology.clone();
+        assert_eq!(run(link.reprobe_live(&mut hub)), Ok(false));
+        assert!(link.dirty);
+        assert_eq!(link.topology, before);
+        hub.resources.clear();
+        // The child (carrying stream 1) leaves: its route is gone.
+        hub.child_present = false;
+        assert_eq!(run(link.reprobe_live(&mut hub)), Ok(false));
+        assert!(link.dirty);
+        assert_eq!(link.topology, before);
+        assert_eq!(link.payloads, payloads);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/dp-mst",
+        navi48_mst_downstream_branch_hotplug_keeps_running_streams
     );
 }

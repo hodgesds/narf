@@ -682,3 +682,107 @@ kernel_test_in!(
     "drivers/gpu/dp-mst",
     navi48_mst_audio_requires_completed_manager_payload
 );
+
+/// Three streams on one link through a daisy chain (primary, child and
+/// grandchild branch each with an end device) share its payload table as
+/// DRM's helpers fill it: VCPIs 1..3 at consecutive start slots, each
+/// ALLOCATE_PAYLOAD sent to the end device's own branch (LCT 1, 2 and 3,
+/// RAD 2 and 2.2), every add checked against every hop the chain shares.
+/// Removing the middle stream deallocates at the child and moves the
+/// grandchild's payload down, keeping the others.
+fn navi48_mst_daisy_chain_shares_one_payload_table() -> TestResult {
+    let hub = RefCell::new(Hub::new());
+    hub.borrow_mut().grandchild_present = true;
+    let mut aux = Aux(&hub);
+    let mut link = MstLink::default();
+    let mut dpcd = [0u8; 16];
+    dpcd[0] = 0x12;
+    run(link.manager.start(&mut aux, &dpcd)).unwrap();
+    link.topology = run(link.manager.probe(&mut aux)).unwrap();
+    let sinks = link.topology.sinks();
+    assert_eq!(sinks.len(), 3);
+    let mut source = Source {
+        hub: &hub,
+        events: Vec::new(),
+    };
+    let add = |link: &mut MstLink, aux: &mut Aux, source: &mut Source, k: usize, pbn| {
+        run(add_payload(
+            link,
+            aux,
+            source,
+            sinks[k],
+            k as u8,
+            pbn,
+            10,
+            (9, 1),
+        ))
+    };
+    let sent = hub.borrow().requests.len();
+    let mut starts = Vec::new();
+    for k in 0..2 {
+        let p = add(&mut link, &mut aux, &mut source, k, 600).unwrap();
+        starts.push((p.vcpi, p.start));
+    }
+    // The grandchild's stream crosses the root hop the child's already
+    // uses: more than what is left there is refused before any write.
+    let allocated: Vec<_> = link.payloads.iter().map(|p| (p.sink, p.pbn)).collect();
+    assert_eq!(
+        topology::path_budget(&link.topology, sinks[2], &allocated),
+        Some(2552 - 600)
+    );
+    let writes = hub.borrow().requests.len();
+    assert!(add(&mut link, &mut aux, &mut source, 2, 2000).is_err());
+    assert_eq!(hub.borrow().requests.len(), writes);
+    assert_eq!(link.payload_change(), None);
+    let p = add(&mut link, &mut aux, &mut source, 2, 600).unwrap();
+    starts.push((p.vcpi, p.start));
+    assert_eq!(starts, [(1, 1), (2, 11), (3, 21)]);
+    let allocs: Vec<(u8, u8, Vec<u8>)> = {
+        let h = hub.borrow();
+        h.requests[sent..]
+            .iter()
+            .zip(&h.bodies[sent..])
+            .map(|(r, b)| (r.0, r.1[0], b.clone()))
+            .collect()
+    };
+    assert_eq!(
+        allocs,
+        [
+            (1, 0x00, vec![0x11, 0x11, 1, 0x02, 0x58, 0]),
+            (2, 0x20, vec![0x11, 0x11, 2, 0x02, 0x58, 0]),
+            (3, 0x22, vec![0x11, 0x11, 3, 0x02, 0x58, 0]),
+        ]
+    );
+    // The source table lists all three in slot order.
+    assert_eq!(
+        source.events.iter().rev().find_map(|e| match e {
+            Event::Table(t, _) => Some(t.clone()),
+            _ => None,
+        }),
+        Some(vec![(0, 10), (1, 10), (2, 10)])
+    );
+    source.events.clear();
+    run(remove_payload(&mut link, &mut aux, &mut source, 1, true)).unwrap();
+    let h = hub.borrow();
+    let last = h
+        .requests
+        .iter()
+        .zip(&h.bodies)
+        .rev()
+        .find(|(r, _)| r.2 == dp_mst::ALLOCATE_PAYLOAD);
+    assert_eq!(
+        last.map(|(r, b)| (r.0, r.1[0], b.clone())),
+        Some((2, 0x20, vec![0x11, 0x11, 2, 0, 0, 0]))
+    );
+    let rows: Vec<_> = link
+        .payloads
+        .iter()
+        .map(|p| (p.stream, p.vcpi, p.start, p.sink))
+        .collect();
+    assert_eq!(rows, [(0, 1, 1, sinks[0]), (2, 3, 11, sinks[2])]);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    navi48_mst_daisy_chain_shares_one_payload_table
+);

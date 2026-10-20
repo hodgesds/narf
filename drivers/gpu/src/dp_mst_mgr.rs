@@ -304,7 +304,6 @@ impl Manager {
             return Ok(());
         }
         let rx = self.up.take().ok_or(MstError::Malformed)?;
-        let hdr = rx.initial;
         let kind = rx.msg[0] & 0x7f;
         // The raw codec deliberately mirrors Linux's permissive parser for
         // reference parity. The live manager must not synthesize fields
@@ -321,8 +320,10 @@ impl Manager {
         // ESI was acknowledged: retain the notification even if sending
         // its sideband ACK fails. The caller can drain it after the error.
         self.events.push(parsed);
-        // drm_dp_send_up_ack_reply to the requesting branch.
-        let ack = dp_mst::chunks(hdr.lct, &hdr.rad, false, &UpRequest::ack(kind));
+        // drm_dp_send_up_ack_reply(mgr, mst_primary, ...): the ACK goes to the
+        // primary branch whichever downstream branch sent the notification
+        // (a broadcast at LCT 1 for both notification kinds).
+        let ack = dp_mst::chunks(1, &[0; 8], false, &UpRequest::ack(kind));
         Self::send(aux, dp_mst::UP_REP_BASE, &ack).await?;
         Ok(())
     }

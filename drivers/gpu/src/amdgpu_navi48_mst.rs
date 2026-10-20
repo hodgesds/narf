@@ -412,8 +412,14 @@ impl ColdBoot {
     pub fn display_mst(&self, port: usize) -> Option<&MstLink> {
         self.mst.get(&port)
     }
-    /// Service downstream connection/resource changes, preserving the old
-    /// topology until the platform has retired its streams. Drain before and
+    /// Service downstream connection/resource changes. A change that leaves
+    /// every running stream's route intact (a downstream branch or device
+    /// added or removed elsewhere in the tree) is adopted at once, as Linux
+    /// keeps unaffected streams (`MstLink::reprobe_live`); dark outputs are
+    /// then readmitted beside the running streams. Otherwise the old
+    /// topology stays until the platform has retired its streams. Returns
+    /// whether the configuration must be relit: a route was lost, or a new
+    /// end device appeared for the routing to consider. Drain before and
     /// after polling so a full queue cannot block down-transaction progress.
     pub async fn service_display_mst(&mut self, port: usize) -> Result<bool, MstFailure> {
         self.mst
@@ -431,7 +437,61 @@ impl ColdBoot {
             instance,
         };
         link.refresh_resources(&mut aux).await?;
-        Ok(link.dirty)
+        if !link.dirty || !link.has_stream_resources() {
+            return Ok(link.dirty);
+        }
+        let present = |l: &MstLink| -> Vec<MstOutputId> {
+            l.outputs
+                .iter()
+                .flatten()
+                .filter(|o| o.sink.is_some())
+                .map(|o| o.id)
+                .collect()
+        };
+        let before = present(link);
+        if !link.reprobe_live(&mut aux).await? {
+            return Ok(true);
+        }
+        let added = present(link).iter().any(|id| !before.contains(id));
+        self.readmit_dark_mst_outputs(port);
+        Ok(added)
+    }
+    /// Admit each dark end device's timings beside the running displays
+    /// after a live topology change (as a configuration's last step does).
+    fn readmit_dark_mst_outputs(&mut self, port: usize) {
+        let running: Vec<Selection> = self
+            .display_modesets()
+            .into_iter()
+            .flatten()
+            .map(|m| m.selection)
+            .collect();
+        let Some(caps) = running
+            .iter()
+            .find(|s| s.port == port && s.mst.is_some())
+            .map(|s| s.caps)
+        else {
+            return;
+        };
+        let Ok(soc) = self.display_soc() else {
+            return;
+        };
+        let Some(link) = self.mst.get(&port) else {
+            return;
+        };
+        let devices: Vec<_> = link
+            .outputs
+            .iter()
+            .flatten()
+            .filter_map(|o| {
+                let sink = o.sink?;
+                Some((
+                    sink,
+                    o.edid.clone(),
+                    link.topology.port(sink).map_or(0, |p| p.available_pbn),
+                ))
+            })
+            .collect();
+        self.admit_dark_mst_outputs(port, &soc, caps, &devices, &running);
     }
     /// Forget a physically removed branch only after its last stream stops.
     /// No AUX access is made to the absent device.

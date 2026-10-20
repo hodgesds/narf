@@ -4561,7 +4561,22 @@ pub async unsafe fn monitor_displays(
             && boot.display_hpd(port) == Ok(true)
             && boot.display_mst(port).is_some()
         {
+            let shown = |boot: &boot::ColdBoot| {
+                boot.display_mst(port).map(|l| {
+                    l.outputs.each_ref().map(|o| {
+                        o.as_ref()
+                            .map(|o| (o.id, o.sink, o.edid.len(), o.modes.clone()))
+                    })
+                })
+            };
+            let before = shown(boot);
             relight |= boot.service_display_mst(port).await?;
+            // A change adopted beside the running streams shows its
+            // connectors at once.
+            if shown(boot) != before {
+                reconcile_mst_outputs(boot, port);
+                publish_outputs();
+            }
         }
     }
     for k in monitor_order(pending_mask) {

@@ -271,3 +271,79 @@ kernel_test_in!(
     "drivers/gpu/navi48-mst",
     navi48_mst_dsc_port_support_mode_like_amdgpu_dm
 );
+
+/// compute_mst_dsc_configs_for_link across a daisy chain: the child's and
+/// the grandchild's 4K144 decoders both sit behind the primary branch's
+/// port 2, so the fairness search admits them only while their joint PBN
+/// fits that hop (drm_dp_mst_atomic_check's per-port bandwidth, here the
+/// topology's path budget), beside an uncompressed 1080p60 on the
+/// primary's own sink. A tighter shared hop lowers both streams' bpp
+/// together and keeps them within one bpp of each other; one too small for
+/// both at the minimum bpp refuses the pair.
+fn navi48_mst_dsc_fairness_spans_cascaded_branches() -> TestResult {
+    use super::super::topology::path_budget;
+    let mut hub = Hub::new();
+    hub.grandchild_present = true;
+    let grand = Sink { branch: 2, port: 1 };
+    let solve = |hub: &mut Hub| {
+        let (_, topology) = probed(hub);
+        let fits = |alloc: &[(Sink, u16)]| {
+            alloc.iter().enumerate().all(|(i, &(sink, pbn))| {
+                let others: Vec<_> = alloc
+                    .iter()
+                    .enumerate()
+                    .filter(|&(j, _)| j != i)
+                    .map(|(_, &a)| a)
+                    .collect();
+                path_budget(&topology, sink, &others).is_some_and(|free| pbn <= free)
+            })
+        };
+        let streams = [
+            DscStream {
+                sink: ROOT_SINK,
+                timing: FHD60,
+                dsc: None,
+            },
+            DscStream {
+                sink: CHILD_SINK,
+                timing: UHD144,
+                dsc: caps(),
+            },
+            DscStream {
+                sink: grand,
+                timing: UHD144,
+                dsc: caps(),
+            },
+        ];
+        // 4 x UHBR10: two raw 4K144 streams do not fit, compressed they do.
+        let link = DscLink {
+            encoding: LinkEncoding::Dp128b132b,
+            kbps: 38_564_000,
+            slots: 64,
+            max_dispclk_khz: 2_000_000,
+        };
+        compute(&streams, &link, &fits)
+    };
+    hub.resources.insert((1, 2), (6000, 6000));
+    let wide = solve(&mut hub).expect("roomy shared hop");
+    hub.resources.insert((1, 2), (3300, 3300));
+    let tight = solve(&mut hub).expect("tight shared hop");
+    for p in [&wide, &tight] {
+        assert!(p[0].dsc.is_none(), "{p:?}");
+        let (Some(a), Some(b)) = (p[1].dsc, p[2].dsc) else {
+            panic!("both chained decoders compress {p:?}");
+        };
+        assert!(a.bpp_x16.abs_diff(b.bpp_x16) <= 16, "{p:?}");
+        assert!(p.iter().map(|p| u32::from(p.slots)).sum::<u32>() <= 64);
+    }
+    assert!(u32::from(tight[1].pbn) + u32::from(tight[2].pbn) <= 3300);
+    let bpp = |p: &[DscPayload]| p[1].dsc.unwrap().bpp_x16 + p[2].dsc.unwrap().bpp_x16;
+    assert!(bpp(&tight) < bpp(&wide), "{tight:?} vs {wide:?}");
+    hub.resources.insert((1, 2), (2000, 2000));
+    assert!(solve(&mut hub).is_none());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-mst",
+    navi48_mst_dsc_fairness_spans_cascaded_branches
+);

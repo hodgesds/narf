@@ -9,6 +9,8 @@ fn run<T>(f: impl Future<Output = T>) -> T {
 
 /// A two-level MST hub: the primary branch (port 0 input, 1 an SST sink,
 /// 2 a branch, 3 empty) and behind port 2 a branch with an SST sink on 1.
+/// With `grandchild_present` the child's port 2 cascades to a third branch
+/// (LCT 3, RAD 2.2) with its own SST sink on port 1: a daisy chain.
 pub(crate) struct Hub {
     pub(crate) dpcd: BTreeMap<u32, u8>,
     down: Vec<u8>,
@@ -23,6 +25,7 @@ pub(crate) struct Hub {
     pub(crate) edid: [u8; 256],
     pub(crate) root_sink_present: bool,
     pub(crate) child_present: bool,
+    pub(crate) grandchild_present: bool,
     pub(crate) require_power: bool,
     /// Per-(LCT, port) resource replies, including zero-bandwidth paths.
     pub(crate) resources: BTreeMap<(u8, u8), (u16, u16)>,
@@ -38,6 +41,7 @@ pub(crate) struct Hub {
 }
 const ROOT: [u8; 16] = [0x11; 16];
 const CHILD: [u8; 16] = [0x22; 16];
+pub(crate) const GRANDCHILD: [u8; 16] = [0x55; 16];
 impl Hub {
     pub(crate) fn new() -> Self {
         let mut dpcd = BTreeMap::new();
@@ -59,6 +63,7 @@ impl Hub {
             edid,
             root_sink_present: true,
             child_present: true,
+            grandchild_present: false,
             require_power: false,
             resources: BTreeMap::new(),
             resource_reply_port: None,
@@ -101,14 +106,28 @@ impl Hub {
     fn reply(&mut self, lct: u8, rad: [u8; 8], body: &[u8]) -> Vec<u8> {
         let kind = body[0] & 0x7f;
         let child = lct == 2 && rad[0] >> 4 == 2;
+        let grandchild = lct == 3 && rad[0] == 0x22;
         match kind {
+            LINK_ADDRESS_KIND if grandchild && !self.recursive => {
+                let mut r = vec![0x01];
+                r.extend_from_slice(&GRANDCHILD);
+                r.push(3);
+                r.extend(self.port(true, 2, 0, true, true, [0; 16]));
+                r.extend(self.port(false, 3, 1, false, true, [0x66; 16]));
+                r.extend(self.port(false, 0, 2, false, false, [0; 16]));
+                r
+            }
             LINK_ADDRESS_KIND if child && !self.recursive => {
                 let mut r = vec![0x01];
                 r.extend_from_slice(&CHILD);
                 r.push(3);
                 r.extend(self.port(true, 2, 0, true, true, [0; 16]));
                 r.extend(self.port(false, 3, 1, false, true, [0x33; 16]));
-                r.extend(self.port(false, 0, 2, false, false, [0; 16]));
+                if self.grandchild_present {
+                    r.extend(self.port(false, 2, 2, true, true, GRANDCHILD));
+                } else {
+                    r.extend(self.port(false, 0, 2, false, false, [0; 16]));
+                }
                 r
             }
             LINK_ADDRESS_KIND => {
@@ -123,7 +142,13 @@ impl Hub {
             }
             dp_mst::ENUM_PATH_RESOURCES => {
                 let port = body[1] >> 4;
-                let full = 2560 + u16::from(port) + if child { 100 } else { 0 };
+                let full = 2560
+                    + u16::from(port)
+                    + match (child, grandchild) {
+                        (true, _) => 100,
+                        (_, true) => 200,
+                        _ => 0,
+                    };
                 let (full, available) = self
                     .resources
                     .get(&(lct, port))
@@ -671,3 +696,122 @@ fn dp_mst_rejects_truncated_up_requests() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/dp-mst", dp_mst_rejects_truncated_up_requests);
+
+impl Hub {
+    /// A CONNECTION_STATUS_NOTIFY from branch `guid` about its `port`, sent
+    /// as a downstream branch sends it (broadcast).
+    pub(crate) fn notify_connection(&mut self, guid: [u8; 16], port: u8, plugged: bool, pdt: u8) {
+        let mut csn = vec![dp_mst::CONNECTION_STATUS_NOTIFY, port << 4];
+        csn.extend_from_slice(&guid);
+        let mcs = pdt == dp_mst::PEER_MST_BRANCHING;
+        csn.push(u8::from(plugged) << 5 | u8::from(mcs) << 4 | pdt);
+        self.up.extend(dp_mst::chunks(1, &[0; 8], false, &csn));
+        self.esi();
+    }
+}
+
+/// A daisy chain probed as drm_dp_mst_link_probe_work walks it: the
+/// primary branch, the child behind its port 2 (LCT 2, RAD 2) and the
+/// grandchild behind the child's port 2 (LCT 3, RAD 2.2), each found by a
+/// LINK_ADDRESS sent to its own route right after the ENUM_PATH_RESOURCES
+/// of the port it hangs from (depth first). The three end devices'
+/// paths climb through every upstream hop; EDID and remote DPCD go to the
+/// grandchild's own route.
+fn dp_mst_manager_probes_a_daisy_chain_like_linux() -> TestResult {
+    let mut hub = Hub::new();
+    hub.grandchild_present = true;
+    let mut mgr = Manager::new();
+    let topology = run(mgr.probe(&mut hub)).unwrap();
+    use dp_mst::{CLEAR_PAYLOAD_ID_TABLE as CLR, ENUM_PATH_RESOURCES as EPR, LINK_ADDRESS as LA};
+    let order: Vec<(u8, u8, u8)> = hub
+        .requests
+        .iter()
+        .map(|&(lct, rad, k)| (lct, rad[0], k))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            (1, 0, CLR),
+            (1, 0, LA),
+            (1, 0, EPR),
+            (1, 0, EPR),
+            (2, 0x20, LA),
+            (2, 0x20, EPR),
+            (2, 0x20, EPR),
+            (3, 0x22, LA),
+            (3, 0x22, EPR),
+        ]
+    );
+    assert_eq!(topology.branches.len(), 3);
+    let g = &topology.branches[2];
+    assert_eq!((g.lct, g.rad[0], g.guid), (3, 0x22, GRANDCHILD));
+    assert_eq!(topology.branches[1].ports[2].branch, Some(2));
+    assert_eq!(g.ports[1].full_pbn, 2761);
+    let grand = Sink { branch: 2, port: 1 };
+    assert_eq!(
+        topology.sinks(),
+        [
+            Sink { branch: 0, port: 1 },
+            Sink { branch: 1, port: 1 },
+            grand
+        ]
+    );
+    assert_eq!(
+        topology.path(grand),
+        Some(vec![
+            grand,
+            Sink { branch: 1, port: 2 },
+            Sink { branch: 0, port: 2 }
+        ])
+    );
+    run(mgr.read_edid_block(&mut hub, &topology, grand, 0)).unwrap();
+    assert_eq!(hub.requests.last().map(|r| (r.0, r.1[0])), Some((3, 0x22)));
+    let mut dpcd = BTreeMap::new();
+    dpcd.insert(0x60, 0x5a);
+    hub.remote.insert((3, 1), dpcd);
+    assert_eq!(
+        run(mgr.remote_dpcd_read(&mut hub, &topology, grand, 0x60, 1)),
+        Ok(vec![0x5a])
+    );
+    assert_eq!(hub.requests.last().map(|r| (r.0, r.1[0])), Some((3, 0x22)));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    dp_mst_manager_probes_a_daisy_chain_like_linux
+);
+
+/// A downstream branch's connection notification (the child reporting the
+/// grandchild branch on its port 2) is read, queued with the child's GUID,
+/// and acknowledged to the primary branch as drm_dp_mst_handle_up_req
+/// does (drm_dp_send_up_ack_reply to mst_primary: broadcast, LCT 1).
+fn dp_mst_downstream_notification_is_acked_to_the_primary() -> TestResult {
+    let mut hub = Hub::new();
+    let mut mgr = Manager::new();
+    hub.notify_connection(CHILD, 2, true, dp_mst::PEER_MST_BRANCHING);
+    assert_eq!(run(mgr.poll_up_requests(&mut hub)), Ok(1));
+    let Some(UpRequest::ConnectionStatus {
+        guid,
+        port: 2,
+        dp_plug: true,
+        message_capable: true,
+        input: false,
+        peer_device_type,
+        ..
+    }) = mgr.events.first().copied()
+    else {
+        panic!("downstream CSN {:?}", mgr.events);
+    };
+    assert_eq!(
+        (guid, peer_device_type),
+        (CHILD, dp_mst::PEER_MST_BRANCHING)
+    );
+    let (ack, _) = dp_mst::Header::decode(&hub.up_acks[0]).unwrap();
+    assert!(ack.broadcast && ack.lct == 1 && ack.lcr == 6);
+    assert_eq!(hub.up_acks[0][3], dp_mst::CONNECTION_STATUS_NOTIFY);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    dp_mst_downstream_notification_is_acked_to_the_primary
+);
