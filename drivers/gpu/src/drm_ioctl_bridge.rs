@@ -3002,6 +3002,8 @@ fn connector_edid(card: &crate::drm::card::Card, connector_id: u32) -> Option<[u
 }
 /// DRM_FORMAT_XRGB8888 — the one scanout format the pixman path uses.
 const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
+/// DRM_FORMAT_ARGB8888, which a CPU copy shows as XRGB8888.
+const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
 
 /// `(plane_id, crtc_index)` for the synthesised primary planes.
 fn synth_planes(card: &crate::drm::card::Card) -> alloc::vec::Vec<(u32, u32)> {
@@ -4137,6 +4139,37 @@ fn handle_atomic(
                     return Err(FsError::InvalidData);
                 }
             }
+            // Every native plane's format at its CRTC's mode after the
+            // commit, on the connector the CRTC then drives.
+            for plane in &state.planes {
+                let (Some(fb_id), Some(crtc_id)) = (plane.fb_id, plane.crtc_id) else {
+                    continue;
+                };
+                let Some(d) = crate::amdgpu_native_kms::crtc_display(crtc_id) else {
+                    continue;
+                };
+                let format = card
+                    .framebuffer(fb_id)
+                    .map_err(|_| FsError::NotFound)?
+                    .format;
+                let connector = state
+                    .connectors
+                    .iter()
+                    .find(|c| c.crtc_id == Some(crtc_id))
+                    .map(|c| c.id);
+                let wire = native_modes
+                    .iter()
+                    .find(|(id, _)| *id == crtc_id)
+                    .map(|(_, w)| w);
+                if !crate::amdgpu_native_kms::display_admits_format(
+                    d,
+                    connector,
+                    wire,
+                    format as u32,
+                ) {
+                    return Err(FsError::InvalidData);
+                }
+            }
         }
 
         // Linux reserves one event for every CRTC participating in the atomic
@@ -4204,6 +4237,18 @@ fn handle_atomic(
                             .find(|(id, _)| *id == crtc.id)
                             .map(|(_, w)| w);
                         crate::amdgpu_native_kms::request_display_mode(display, wire);
+                    }
+                }
+                // So is a plane format change (Linux: a full update).
+                for plane in &state.planes {
+                    let (Some(crtc_id), Some(fb_id)) = (plane.crtc_id, plane.fb_id) else {
+                        continue;
+                    };
+                    if let (Some(display), Ok(fb)) = (
+                        crate::amdgpu_native_kms::crtc_display(crtc_id),
+                        card.framebuffer(fb_id),
+                    ) {
+                        crate::amdgpu_native_kms::request_display_format(display, fb.format as u32);
                     }
                 }
             }
@@ -4280,9 +4325,7 @@ fn handle_atomic(
                         crtc_id,
                         card.virtgpu_import(gem_handle).cloned(),
                         card.dumb_backing(gem_handle).map(|backing| backing.phys),
-                        fb.pitch,
-                        fb.width,
-                        fb.height,
+                        (fb.pitch, fb.width, fb.height, fb.format as u32),
                         fb_id,
                         flip_tickets
                             .iter()
@@ -4309,7 +4352,7 @@ fn handle_atomic(
             presentation.as_ref().is_some_and(|p| !p.is_empty()),
         );
     }
-    for (crtc_id, resource, src_phys, pitch, width, height, fb_id, flip_ticket) in
+    for (crtc_id, resource, src_phys, (pitch, width, height, format), fb_id, flip_ticket) in
         presentation.into_iter().flatten()
     {
         if let Some(resource) = resource {
@@ -4318,10 +4361,7 @@ fn handle_atomic(
             present_frame(
                 card_index,
                 crtc_id,
-                src_phys,
-                pitch,
-                width,
-                height,
+                (src_phys, pitch, width, height, format),
                 flip_ticket,
             );
         } else {
@@ -4703,6 +4743,7 @@ fn handle_setcrtc(
     let src_pitch: u32;
     let src_w: u32;
     let src_h: u32;
+    let src_format: u32;
     // SETCRTC's single connector id, read before any card lock is held.
     let setcrtc_connector = if req.count_connectors == 1 && req.set_connectors_ptr != 0 {
         // SAFETY: a user pointer to count_connectors (one) u32 ids.
@@ -4776,6 +4817,21 @@ fn handle_setcrtc(
         if req.fb_id != 0 {
             let mode = requested.or_else(|| card.crtc(req.crtc_id).ok().and_then(|c| c.mode));
             check_native_plane(&card, req.fb_id, mode, (req.x, req.y), None)?;
+            // The native display must admit the plane's format at the mode.
+            if let Some(d) = native_display {
+                let format = card
+                    .framebuffer(req.fb_id)
+                    .map_err(|_| FsError::NotFound)?
+                    .format;
+                if !crate::amdgpu_native_kms::display_admits_format(
+                    d,
+                    native_connector,
+                    native_wire.as_ref(),
+                    format as u32,
+                ) {
+                    return Err(FsError::InvalidData);
+                }
+            }
         }
 
         // Record the mode and active fb on the crtc; switching it off
@@ -4801,6 +4857,9 @@ fn handle_setcrtc(
             if let Some(wire) = native_wire.as_ref() {
                 crate::amdgpu_native_kms::request_display_mode(display, Some(wire));
             }
+            if let Ok(fb) = card.framebuffer(req.fb_id) {
+                crate::amdgpu_native_kms::request_display_format(display, fb.format as u32);
+            }
             crate::amdgpu_native_kms::request_display_active(display, req.fb_id != 0);
         }
 
@@ -4814,6 +4873,7 @@ fn handle_setcrtc(
         src_pitch = fb.pitch;
         src_w = fb.width;
         src_h = fb.height;
+        src_format = fb.format as u32;
         let gem_handle = fb.gem_handle;
         src_phys = card.dumb_backing(gem_handle).map(|b| b.phys);
         virgl_resource = card.virtgpu_import(gem_handle).cloned();
@@ -4837,7 +4897,12 @@ fn handle_setcrtc(
     if let Some(resource) = virgl_resource {
         present_virgl_frame(&resource, src_w, src_h)?;
     } else if let Some(src) = src_phys {
-        present_frame(card_index, req.crtc_id, src, src_pitch, src_w, src_h, None);
+        present_frame(
+            card_index,
+            req.crtc_id,
+            (src, src_pitch, src_w, src_h, src_format),
+            None,
+        );
     } else {
         note_missing_backing("SETCRTC", req.fb_id);
     }
@@ -4895,6 +4960,7 @@ fn handle_page_flip(
     let src_pitch: u32;
     let src_w: u32;
     let src_h: u32;
+    let src_format: u32;
     let mut flip_ticket = None;
     {
         let mut card = mode_state.lock();
@@ -4923,6 +4989,7 @@ fn handle_page_flip(
         src_pitch = fb.pitch;
         src_w = fb.width;
         src_h = fb.height;
+        src_format = fb.format as u32;
         let gem_handle = fb.gem_handle;
         src_phys = card.dumb_backing(gem_handle).map(|b| b.phys);
         virgl_resource = card.virtgpu_import(gem_handle).cloned();
@@ -4984,10 +5051,7 @@ fn handle_page_flip(
         present_frame(
             card_index,
             req.crtc_id,
-            src,
-            src_pitch,
-            src_w,
-            src_h,
+            (src, src_pitch, src_w, src_h, src_format),
             flip_ticket,
         );
     } else {
@@ -5045,13 +5109,11 @@ fn hardware_flips(card_index: u32, crtc_id: u32) -> bool {
 
 /// `flip_ticket` is the ticket of a flip-complete event waiting for this
 /// frame's hardware flip; it is completed whichever way the frame goes.
+/// `src` is the framebuffer's dumb backing, pitch, size and fourcc.
 fn present_frame(
     card_index: u32,
     crtc_id: u32,
-    src_phys: u64,
-    src_pitch: u32,
-    src_w: u32,
-    src_h: u32,
+    (src_phys, src_pitch, src_w, src_h, src_format): (u64, u32, u32, u32, u32),
     flip_ticket: Option<u64>,
 ) {
     let driver = crate::drm_registry::driver_name(card_index);
@@ -5067,13 +5129,17 @@ fn present_frame(
                 src_w,
                 src_h,
                 flip_ticket,
+                src_format,
             );
             if native {
                 narf_console::fb_take_for_user();
                 return;
             }
-            // Only the console's display has a CPU front to copy onto.
-            if display != crate::amdgpu_native_kms::console_pipe() {
+            // Only the console's display has a CPU front to copy onto, and
+            // that copy takes 32-bit 8888 pixels.
+            if display != crate::amdgpu_native_kms::console_pipe()
+                || !matches!(src_format, DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888)
+            {
                 return;
             }
         }

@@ -74,6 +74,30 @@ pub fn native_present_ready(display: u8) -> bool {
         crate::amdgpu_navi48_platform::native_present_ready(display)
     }
 }
+/// The primary plane format (a DRM fourcc) DRM's framebuffer on display
+/// `display`'s CRTC holds. Navi48 lights the display again in it when it
+/// differs; Navi22's planes take only 32-bit 8888 frames, which its
+/// presentation copies, and keep their scanout.
+pub fn request_display_format(display: u8, format: u32) -> bool {
+    if navi22() {
+        true
+    } else {
+        crate::amdgpu_navi48_platform::request_display_format(display, format)
+    }
+}
+/// Whether display `display` can scan out a `format` plane in `mode` (its
+/// current one when None) on its routed connector, or `connector`.
+/// Navi22 has nothing to admit beyond its plane formats.
+pub fn display_admits_format(
+    display: u8,
+    connector: Option<u32>,
+    mode: Option<&DrmModeModeInfo>,
+    format: u32,
+) -> bool {
+    navi22()
+        || crate::amdgpu_navi48_platform::display_admits_format(display, connector, mode, format)
+}
+/// Present a frame in the framebuffer format `format` (a DRM fourcc).
 pub fn present_frame(
     display: u8,
     phys: u64,
@@ -81,11 +105,14 @@ pub fn present_frame(
     width: u32,
     height: u32,
     ticket: Option<u64>,
+    format: u32,
 ) -> bool {
     if navi22() {
         crate::amdgpu_navi22_platform::present_frame(display, phys, pitch, width, height, ticket)
     } else {
-        crate::amdgpu_navi48_platform::present_frame(display, phys, pitch, width, height, ticket)
+        crate::amdgpu_navi48_platform::present_frame(
+            display, phys, pitch, width, height, ticket, format,
+        )
     }
 }
 /// The display the console runs on.

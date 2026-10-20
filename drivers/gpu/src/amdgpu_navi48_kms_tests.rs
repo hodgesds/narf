@@ -493,6 +493,30 @@ kernel_test_in!(
     navi48_kms_publishes_an_output_per_port
 );
 
+/// The primary plane lists amdgpu_dm_plane_get_plane_formats' DCN4.0.1
+/// order (rgb_formats, then the FP16 formats) less RGBA8888, the 16-bit
+/// UNORM orders, NV12 and P010, and every card it publishes carries it.
+fn navi48_kms_plane_formats_follow_amdgpu_dm() -> TestResult {
+    let want = [
+        *b"XR24", *b"AR24", *b"XR30", *b"XB30", *b"AR30", *b"AB30", *b"XB24", *b"AB24", *b"RG16",
+        *b"XR4H", *b"AR4H", *b"XB4H", *b"AB4H",
+    ]
+    .map(u32::from_le_bytes);
+    if PLANE_FORMATS != want {
+        return TestResult::Fail("plane format list");
+    }
+    let mut card = Card::new("amdgpu", "AMD GPU", (3, 0, 0));
+    apply(&mut card, &[]);
+    if card.plane_formats != Some(&PLANE_FORMATS[..]) {
+        return TestResult::Fail("published plane formats");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-kms",
+    navi48_kms_plane_formats_follow_amdgpu_dm
+);
+
 /// Routed outputs: four CRTCs, one encoder per connector able to drive
 /// any CRTC, an MST end device's connector past the board ones. A
 /// connector shows its routed CRTC's sink; an unrouted one its discovered

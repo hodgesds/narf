@@ -145,13 +145,57 @@ pub struct Crtc {
 
 /// Colour encoding (pixel format).
 ///
-/// Subset of Linux's `DRM_FORMAT_*` (only what ADDFB2 needs).
+/// Subset of Linux's `DRM_FORMAT_*` (only what ADDFB2 needs): single-plane
+/// packed RGB. A card's `plane_formats` narrows what its ADDFB2 takes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum PixelFormat {
-    Xrgb8888 = 0x3432_5258, // "XR24" little-endian
-    Argb8888 = 0x3432_5241, // "AR24"
-    Rgb565 = 0x3631_4752,   // "RG16"
+    Xrgb8888 = 0x3432_5258,      // "XR24" little-endian
+    Argb8888 = 0x3432_5241,      // "AR24"
+    Xbgr8888 = 0x3432_4258,      // "XB24"
+    Abgr8888 = 0x3432_4241,      // "AB24"
+    Xrgb2101010 = 0x3033_5258,   // "XR30"
+    Argb2101010 = 0x3033_5241,   // "AR30"
+    Xbgr2101010 = 0x3033_4258,   // "XB30"
+    Abgr2101010 = 0x3033_4241,   // "AB30"
+    Rgb565 = 0x3631_4752,        // "RG16"
+    Xrgb16161616f = 0x4834_5258, // "XR4H"
+    Argb16161616f = 0x4834_5241, // "AR4H"
+    Xbgr16161616f = 0x4834_4258, // "XB4H"
+    Abgr16161616f = 0x4834_4241, // "AB4H"
+}
+impl PixelFormat {
+    /// The format of a DRM fourcc, if ADDFB2 knows it.
+    pub fn from_fourcc(fourcc: u32) -> Option<Self> {
+        [
+            Self::Xrgb8888,
+            Self::Argb8888,
+            Self::Xbgr8888,
+            Self::Abgr8888,
+            Self::Xrgb2101010,
+            Self::Argb2101010,
+            Self::Xbgr2101010,
+            Self::Abgr2101010,
+            Self::Rgb565,
+            Self::Xrgb16161616f,
+            Self::Argb16161616f,
+            Self::Xbgr16161616f,
+            Self::Abgr16161616f,
+        ]
+        .into_iter()
+        .find(|f| *f as u32 == fourcc)
+    }
+    /// Bytes per pixel (drm_format_info's cpp[0]).
+    pub const fn cpp(self) -> u32 {
+        match self {
+            Self::Rgb565 => 2,
+            Self::Xrgb16161616f
+            | Self::Argb16161616f
+            | Self::Xbgr16161616f
+            | Self::Abgr16161616f => 8,
+            _ => 4,
+        }
+    }
 }
 
 /// Kernel-side framebuffer descriptor (result of ADDFB2).
@@ -1354,12 +1398,28 @@ impl Card {
         {
             return Err(CardError::UnknownFormat);
         }
-        let format = match format {
-            0x3432_5258 => PixelFormat::Xrgb8888,
-            0x3432_5241 => PixelFormat::Argb8888,
-            0x3631_4752 => PixelFormat::Rgb565,
-            _ => return Err(CardError::UnknownFormat),
-        };
+        // A card without native planes keeps the formats it always took.
+        let legacy = matches!(format, 0x3432_5258 | 0x3432_5241 | 0x3631_4752);
+        if self.plane_formats.is_none() && !legacy {
+            return Err(CardError::UnknownFormat);
+        }
+        let format = PixelFormat::from_fourcc(format).ok_or(CardError::UnknownFormat)?;
+        // drm_framebuffer's framebuffer_check: the pitch holds a line of
+        // the format's pixels; drm_gem_fb_init_with_funcs: a dumb-backed
+        // object holds every line (EINVAL either way).
+        let line = u64::from(width) * u64::from(format.cpp());
+        if u64::from(pitch) < line {
+            return Err(CardError::InvalidDimensions);
+        }
+        if let Some(b) = self
+            .dumb_backings
+            .iter()
+            .find(|b| b.gem_handle == gem_handle)
+        {
+            if (b.byte_len as u64) < u64::from(height - 1) * u64::from(pitch) + line {
+                return Err(CardError::InvalidDimensions);
+            }
+        }
         if self.framebuffers.len() >= 4096 {
             return Err(CardError::TooManyFbs);
         }

@@ -36,8 +36,28 @@ const NVSYNC: u32 = 8;
 const PREFERRED_DRIVER: u32 = 0x8 | 0x40;
 const DRIVER: u32 = 0x40;
 
-/// DRM_FORMAT_XRGB8888 and ARGB8888: what the native scanout presents.
-const PLANE_FORMATS: [u32; 2] = [0x3432_5258, 0x3432_5241];
+/// The primary plane's formats: amdgpu_dm's DCN4.0.1 list
+/// (amdgpu_dm_plane_get_plane_formats: rgb_formats, then the FP16 ones)
+/// less those the native scanout does not program (RGBA8888, the 16-bit
+/// UNORM orders, NV12 and P010).
+pub const PLANE_FORMATS: [u32; 13] = {
+    use crate::amdgpu_dcn401_otg::SurfaceFormat as F;
+    [
+        F::Xrgb8888.fourcc(),
+        F::Argb8888.fourcc(),
+        F::Xrgb2101010.fourcc(),
+        F::Xbgr2101010.fourcc(),
+        F::Argb2101010.fourcc(),
+        F::Abgr2101010.fourcc(),
+        F::Xbgr8888.fourcc(),
+        F::Abgr8888.fourcc(),
+        F::Rgb565.fourcc(),
+        F::Xrgb16161616f.fourcc(),
+        F::Argb16161616f.fourcc(),
+        F::Xbgr16161616f.fourcc(),
+        F::Abgr16161616f.fourcc(),
+    ]
+};
 
 /// The display (and pipe) behind a native CRTC id.
 pub fn crtc_display(crtc_id: u32) -> Option<u8> {
@@ -295,7 +315,8 @@ pub fn apply_routed_vrr(
         });
     }
     // The CRTCs' vblanks are the displays' hardware ones, and their planes
-    // scan 32-bit RGB (alpha unused: nothing lies below the primary).
+    // scan packed RGB (an A format's alpha blends over the black background:
+    // nothing lies below the primary).
     card.vblank_source = Some(crate::amdgpu_navi48_platform::crtc_vblank);
     card.plane_formats = Some(&PLANE_FORMATS);
     card.native = native;

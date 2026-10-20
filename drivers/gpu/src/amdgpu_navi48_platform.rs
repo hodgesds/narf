@@ -1,5 +1,7 @@
 //! One retained Navi48 firmware owner, entered by the framebuffer boot handoff.
 //! Preparation is read-only; the caller stops CPU writers before entering it.
+use crate::amdgpu_dcn401_dml as dml;
+use crate::amdgpu_dcn401_otg::SurfaceFormat;
 use crate::amdgpu_navi48_display as display;
 use crate::{amdgpu, amdgpu_navi48_boot as boot, amdgpu_vram_boot as vram};
 use alloc::sync::Arc;
@@ -2066,7 +2068,8 @@ pub async unsafe fn prepare_display_surface(
     unsafe { boot.prepare_display_surface(request).await }
 }
 
-/// Upload a visible row segment of a staged, stopped framebuffer.
+/// Upload a visible row segment of a staged, stopped framebuffer: packed
+/// 32-bit words from pixel `x` (one per pixel at 4 bytes per pixel).
 /// # Safety
 /// Exclude firmware/FAMS and concurrent display/HDP/clock/power writers;
 /// retain the owner and inherited resources on every outcome.
@@ -2325,8 +2328,15 @@ struct CrtcState {
     retiring: bool,
     /// The mode DRM last set, or None for the sink's preferred mode.
     requested: Option<Timing>,
+    /// The primary plane format DRM's framebuffer holds (XRGB8888 until a
+    /// client sets another): the surface format of the next lighting.
+    format: SurfaceFormat,
     /// The lit sink: EDID, running timing and every offered timing.
     shown: Option<([u8; 128], Timing, Vec<Timing>)>,
+    /// The lit configuration's board inputs and this display's admitted
+    /// mode, for checking a plane format of another depth
+    /// (`display_admits_format`).
+    admitted: Option<(dml::Soc, dml::Mode)>,
     /// The connector this CRTC drives.
     route: Option<Target>,
     /// DRM chose `route` (including none): automatic routing leaves it.
@@ -2340,7 +2350,9 @@ impl CrtcState {
             active: true,
             retiring: false,
             requested: None,
+            format: SurfaceFormat::Xrgb8888,
             shown: None,
+            admitted: None,
             route: None,
             explicit: false,
             vrr: false,
@@ -2425,6 +2437,7 @@ impl Outputs {
         c.explicit = false;
         c.requested = None;
         c.shown = None;
+        c.admitted = None;
     }
     /// A connector's sink changed: requests for the old one are void; a
     /// new device in an MST slot also forgets the CRTC's off request.
@@ -2433,6 +2446,7 @@ impl Outputs {
             let c = &mut self.crtcs[k];
             c.requested = None;
             c.shown = None;
+            c.admitted = None;
             if reset {
                 c.active = true;
             }
@@ -2490,6 +2504,7 @@ impl Outputs {
             c.route = target;
             c.requested = None;
             c.shown = None;
+            c.admitted = None;
         }
         self.crtcs[k].explicit = true;
     }
@@ -2728,9 +2743,13 @@ async unsafe fn adopt(boot: &mut boot::ColdBoot, m: &Modeset) {
     // Its timing generator restarted: the vblank count continues.
     restart_vblank(pipe);
     let s = &m.selection;
+    present_slot(pipe)
+        .format
+        .store(s.format.fourcc(), Ordering::Release);
     let offered: Vec<Timing> = m.modes.iter().flatten().copied().collect();
     if let Some(c) = OUTPUTS.lock().crtcs.get_mut(usize::from(pipe)) {
         c.shown = Some((s.edid, s.timing, offered));
+        c.admitted = Some((m.plan.soc, m.plan.mode));
         c.retiring = false;
     }
 }
@@ -2834,6 +2853,13 @@ async unsafe fn light_displays(
             c.route.filter(|_| c.active)
         });
         let wants: [Option<Timing>; 4] = core::array::from_fn(|k| outputs.crtcs[k].requested);
+        // Display k lights on pipe k with its CRTC's plane format.
+        for (k, c) in outputs.crtcs.iter_mut().enumerate() {
+            crate::amdgpu_navi48_boot::set_plane_format(k as u8, c.format);
+            if c.active {
+                c.admitted = None;
+            }
+        }
         (routes, wants)
     };
     let crtc_of = |t: Target| routes.iter().position(|r| *r == Some(t));
@@ -2980,6 +3006,9 @@ async fn follow_flip(before: GenericFb, after: GenericFb) {
 struct PresentSlot {
     native: AtomicBool,
     presenting: AtomicBool,
+    /// The fourcc of the surface the display scans out: frames of another
+    /// format wait for the relight that switches it.
+    format: core::sync::atomic::AtomicU32,
     next: narf_lib::sync::IrqSafeSpinLock<Option<Frame>>,
 }
 impl PresentSlot {
@@ -2987,6 +3016,7 @@ impl PresentSlot {
         Self {
             native: AtomicBool::new(false),
             presenting: AtomicBool::new(false),
+            format: core::sync::atomic::AtomicU32::new(SurfaceFormat::Xrgb8888.fourcc()),
             next: narf_lib::sync::IrqSafeSpinLock::new(None),
         }
     }
@@ -2996,8 +3026,9 @@ fn present_slot(display: u8) -> &'static PresentSlot {
     &PRESENT[usize::from(display).min(PRESENT.len() - 1)]
 }
 
-/// A DRM client's XRGB8888 frame in a kernel-mapped dumb buffer, and the
-/// flip-complete ticket (see `drm::card::FlipLog`) its flip completes.
+/// A DRM client's frame (in the scanout's surface format) in a
+/// kernel-mapped dumb buffer, and the flip-complete ticket (see
+/// `drm::card::FlipLog`) its flip completes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Frame {
     phys: u64,
@@ -3005,6 +3036,8 @@ struct Frame {
     width: u32,
     height: u32,
     ticket: Option<u64>,
+    /// The framebuffer's fourcc.
+    format: u32,
 }
 
 /// Whether `present_frame` on `display` would present through a hardware
@@ -3159,6 +3192,12 @@ fn complete_flip(display: u8, ticket: Option<u64>, latched: Option<crate::drm::c
 /// DRM's buffer rules make the deferred read safe: a client leaves a
 /// submitted framebuffer untouched until its flip-complete event, which
 /// is not sent before the copy is done.
+///
+/// `format` is the framebuffer's fourcc: only frames in the format the
+/// display scans out are presented. A frame in the format DRM requested
+/// for the display (`request_display_format`) while it still scans another
+/// waits for the relight that switches it, and then presents (or, if the
+/// display does not light so, completes) after the display monitor's pass.
 pub fn present_frame(
     display: u8,
     phys: u64,
@@ -3166,11 +3205,23 @@ pub fn present_frame(
     width: u32,
     height: u32,
     ticket: Option<u64>,
+    format: u32,
 ) -> bool {
-    if !native_present_ready(display)
+    let fmt = SurfaceFormat::from_fourcc(format);
+    let bytes = fmt.map_or(0, SurfaceFormat::bytes_per_pixel);
+    let k = usize::from(display);
+    let shown = k < PRESENT.len() && present_slot(display).format.load(Ordering::Acquire) == format;
+    let switching = !shown
+        && fmt.is_some()
+        && OUTPUTS
+            .lock()
+            .crtcs
+            .get(k)
+            .is_some_and(|c| Some(c.format) == fmt);
+    if !(native_present_ready(display) && shown || switching)
         || width == 0
         || height == 0
-        || pitch < width.saturating_mul(4)
+        || u64::from(pitch) < u64::from(width) * u64::from(bytes)
     {
         complete_flip(display, ticket, None);
         return false;
@@ -3186,12 +3237,24 @@ pub fn present_frame(
             width,
             height,
             ticket,
+            format,
         });
     }
-    if !slot.presenting.swap(true, Ordering::AcqRel) {
+    if shown && !slot.presenting.swap(true, Ordering::AcqRel) {
         narf_scheduler::spawn(presenter(display));
     }
     true
+}
+
+/// Drain frames that waited for a relight (`present_frame`): each display's
+/// presenter shows them in its new format, or completes them.
+fn kick_presenters() {
+    for display in 0..PRESENT.len() as u8 {
+        let slot = present_slot(display);
+        if slot.next.lock().is_some() && !slot.presenting.swap(true, Ordering::AcqRel) {
+            narf_scheduler::spawn(presenter(display));
+        }
+    }
 }
 
 async fn presenter(display: u8) {
@@ -3213,6 +3276,11 @@ async fn presenter(display: u8) {
         }
         let result = {
             let mut owner = OWNER.lock().await;
+            // A relight in another format since the frame was queued.
+            if slot.format.load(Ordering::Acquire) != frame.format {
+                complete_flip(display, frame.ticket, None);
+                continue;
+            }
             match owner.as_mut() {
                 // SAFETY: the owner lock serializes display writers; the
                 // frame's dumb buffer stays valid under DRM's buffer rules.
@@ -3261,18 +3329,20 @@ async unsafe fn present_native(
     crate::scanout_access::wait_retired().await;
     let back = boot.display_back_framebuffer(pipe)?;
     let width = frame.width.min(back.width);
+    // The row's pixels as packed 32-bit words; an odd RGB565 row ends in a
+    // half word, read alone so the copy never reads past the row.
+    let bytes = width as usize * usize::from(back.bpp / 8);
+    let mut row = alloc::vec![0u32; bytes.div_ceil(4)];
     for y in 0..frame.height.min(back.height) {
         let at = frame.phys + u64::from(y) * u64::from(frame.pitch);
-        // SAFETY: a kernel-mapped dumb buffer row of at least `width` pixels
-        // (pitch >= 4 * width was checked when queued).
-        let row = unsafe {
-            core::slice::from_raw_parts(
-                narf_memory::PhysAddr::new(at).kernel_ptr::<u32>(),
-                width as usize,
-            )
-        };
+        // SAFETY: a kernel-mapped dumb buffer row of at least `bytes` bytes
+        // (pitch >= width * bytes per pixel was checked when queued).
+        unsafe {
+            let src = narf_memory::PhysAddr::new(at).kernel_ptr::<u8>();
+            core::ptr::copy_nonoverlapping(src, row.as_mut_ptr().cast::<u8>(), bytes);
+        }
         // SAFETY: serialized retained owner; caller excludes writers.
-        unsafe { boot.upload_display_back(pipe, 0, y, row) }?;
+        unsafe { boot.upload_display_back(pipe, 0, y, &row) }?;
         if y % 64 == 63 {
             narf_scheduler::yield_now().await;
         }
@@ -3513,6 +3583,97 @@ pub fn request_display_mode(
     }
 }
 
+/// Record the primary plane format DRM's framebuffer on display
+/// `display`'s CRTC holds (a DRM fourcc). A running display scanning
+/// another format is lit again with it, as a mode request is. False for a
+/// format the native plane does not scan out.
+pub fn request_display_format(display: u8, fourcc: u32) -> bool {
+    let Some(format) = SurfaceFormat::from_fourcc(fourcc) else {
+        return false;
+    };
+    match OUTPUTS.lock().crtcs.get_mut(usize::from(display)) {
+        Some(c) => {
+            c.format = format;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Whether display `display` can scan out a `fourcc` plane in `mode` (its
+/// current timing when None) on its routed connector, or on `connector`
+/// when the same request routes it there; the timing itself must be one
+/// the display offers (`display_offers`). Formats of the depth its offered
+/// timings were admitted at (the running plane's, else 4 bytes) need
+/// nothing more. Another depth is DML-admitted against the running
+/// configuration, which needs the display lit, on the same connector and
+/// timing: otherwise it is refused, never guessed.
+pub fn display_admits_format(
+    display: u8,
+    connector: Option<u32>,
+    mode: Option<&crate::drm::ioctl::DrmModeModeInfo>,
+    fourcc: u32,
+) -> bool {
+    let Some(format) = SurfaceFormat::from_fourcc(fourcc) else {
+        return false;
+    };
+    let k = usize::from(display);
+    let (joint, soc) = {
+        let outputs = OUTPUTS.lock();
+        let Some(c) = outputs.crtcs.get(k) else {
+            return false;
+        };
+        let current = c.admitted.map_or(4, |(_, m)| m.bytes_per_pixel);
+        if format.bytes_per_pixel() == current {
+            return true;
+        }
+        let (Some((soc, _)), Some((_, timing, _))) = (c.admitted, &c.shown) else {
+            return false;
+        };
+        let target = match connector {
+            Some(id) => outputs.target_of_id(id),
+            None => c.route,
+        };
+        let same_timing =
+            mode.is_none_or(|m| outputs.find_mode(k, None, m).as_ref() == Some(timing));
+        if target != c.route || !same_timing {
+            return false;
+        }
+        let joint: Vec<(usize, dml::Mode)> = outputs
+            .crtcs
+            .iter()
+            .enumerate()
+            .filter_map(|(n, c)| Some((n, c.admitted?.1)))
+            .collect();
+        (joint, soc)
+    };
+    admits_with_format(&soc, &joint, k, format)
+}
+
+/// DML admission of the lit configuration `joint` (display, admitted mode;
+/// in pipe order) with display `k`'s plane in `format`.
+fn admits_with_format(
+    soc: &dml::Soc,
+    joint: &[(usize, dml::Mode)],
+    k: usize,
+    format: SurfaceFormat,
+) -> bool {
+    let modes: Vec<dml::Mode> = joint
+        .iter()
+        .map(|&(n, m)| {
+            if n != k {
+                return m;
+            }
+            dml::Mode {
+                pitch: format.pitch_bytes(m.timing.h_active) / format.bytes_per_pixel(),
+                bytes_per_pixel: format.bytes_per_pixel(),
+                ..m
+            }
+        })
+        .collect();
+    joint.iter().any(|&(n, _)| n == k) && dml::admit_all(soc, &modes).is_ok()
+}
+
 /// Every display back to the console's defaults (on, preferred mode,
 /// automatic routing), as drm_fb_helper restores the console on lastclose.
 pub fn restore_displays() {
@@ -3520,6 +3681,7 @@ pub fn restore_displays() {
     for c in outputs.crtcs.iter_mut() {
         c.active = true;
         c.requested = None;
+        c.format = SurfaceFormat::Xrgb8888;
         c.explicit = false;
     }
     for x in outputs.connectors.iter_mut() {
@@ -3625,6 +3787,7 @@ async unsafe fn retire_monitored_display(
     {
         let mut outputs = OUTPUTS.lock();
         outputs.crtcs[usize::from(pipe)].shown = None;
+        outputs.crtcs[usize::from(pipe)].admitted = None;
         // A disable need not relight siblings. Retain the modes already
         // admitted beside them, without a CRTC mode; the next configuration
         // or reprobe recomputes independent admission.
@@ -3666,6 +3829,7 @@ pub async unsafe fn monitor_displays(
         displays.considered = 0;
         for c in &mut OUTPUTS.lock().crtcs {
             c.shown = None;
+            c.admitted = None;
             c.retiring = false;
         }
     }
@@ -3713,9 +3877,12 @@ pub async unsafe fn monitor_displays(
         }
     }
     let mst_port = OUTPUTS.lock().mst_port();
-    let wants: [(bool, Option<Timing>); 4] = {
+    let wants: [(bool, Option<Timing>, SurfaceFormat); 4] = {
         let outputs = OUTPUTS.lock();
-        core::array::from_fn(|k| (outputs.crtcs[k].active, outputs.crtcs[k].requested))
+        core::array::from_fn(|k| {
+            let c = &outputs.crtcs[k];
+            (c.active, c.requested, c.format)
+        })
     };
     let limited =
         crate::amdgpu_navi48_boot::limited_range(crate::amdgpu_navi48_boot::broadcast_rgb());
@@ -3773,6 +3940,7 @@ pub async unsafe fn monitor_displays(
         if rerouted
             || desired.is_some_and(|d| d != m.selection.timing)
             || limited != m.selection.limited
+            || wants[usize::from(k)].2 != m.selection.format
         {
             relight = true;
             continue;
@@ -3870,15 +4038,22 @@ pub async unsafe fn monitor_displays(
                 );
                 None
             }
-            Err(e) if wants.iter().any(|w| w.1.is_some()) && !pending_display_work(boot) => {
-                // A requested mode did not light: go back to the preferred
-                // modes rather than leave the sinks dark.
+            Err(e)
+                if wants
+                    .iter()
+                    .any(|w| w.1.is_some() || w.2 != SurfaceFormat::Xrgb8888)
+                    && !pending_display_work(boot) =>
+            {
+                // A requested mode or plane format did not light: go back
+                // to the preferred XRGB8888 modes rather than leave the
+                // sinks dark.
                 let _ = core::fmt::Write::write_fmt(
                     &mut narf_console::Writer,
                     format_args!("amdgpu: navi48 mode switch failed: {e:?}\n"),
                 );
                 for c in OUTPUTS.lock().crtcs.iter_mut() {
                     c.requested = None;
+                    c.format = SurfaceFormat::Xrgb8888;
                 }
                 // SAFETY: as above.
                 Some(unsafe { light_displays(boot, fill) }.await?)
@@ -3921,6 +4096,8 @@ pub async unsafe fn monitor_displays(
     }
     // VRR_ENABLED needs no relight: converge every live timing's DRR.
     converge_vrr(boot);
+    // Frames that waited for this pass's relight in a new plane format.
+    kick_presenters();
     Ok(steps)
 }
 
@@ -4678,20 +4855,21 @@ mod tests {
     /// its wrap and a relight into DRM's vblank count.
     fn navi48_present_completes_refused_flip_and_extends_vblanks() -> TestResult {
         use crate::drm::card::flips;
+        const XRGB8888: u32 = 0x3432_5258;
         // On every display: its own flip log, its own refusal.
         for display in 0..4 {
             let ticket = flips(display).lock().reserve();
             if native_present_ready(display) {
                 return TestResult::Fail("test kernel unexpectedly presents natively");
             }
-            if present_frame(display, 0x1000, 64, 16, 16, Some(ticket)) {
+            if present_frame(display, 0x1000, 64, 16, 16, Some(ticket), XRGB8888) {
                 return TestResult::Fail("frame taken without a native display");
             }
             if flips(display).lock().stamp(ticket).is_none() {
                 return TestResult::Fail("refused frame left its event waiting");
             }
         }
-        if native_present_ready(4) || present_frame(9, 0x1000, 64, 16, 16, None) {
+        if native_present_ready(4) || present_frame(9, 0x1000, 64, 16, 16, None, XRGB8888) {
             return TestResult::Fail("display out of range presents");
         }
         use crate::amdgpu_dcn401_otg::VblankPhase;
@@ -5046,5 +5224,128 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu/navi48",
         navi48_training_refuses_live_firmware_in_overwritten_prefix
+    );
+
+    /// A plane format request is recorded per CRTC and reset with the
+    /// console; restore and a failed relight return XRGB8888. A format of
+    /// the depth the display's offered timings were admitted at needs
+    /// nothing more; another is DML-admitted against the lit configuration:
+    /// two 3840x2160 533.25 MHz streams on a two-channel 456 MHz UCLK board
+    /// (a Linux DML21 multi_vectors.txt plan at 4 bytes) take RGB565 on one
+    /// of them but not FP16, by the port's DML21 admission (Linux rejects
+    /// both streams at FP16 in format_vectors.txt).
+    fn navi48_plane_formats_request_and_admit() -> TestResult {
+        const XR24: u32 = 0x3432_5258;
+        const XR30: u32 = 0x3033_5258;
+        const AB30: u32 = 0x3033_4241;
+        const RG16: u32 = 0x3631_4752;
+        const XR4H: u32 = 0x4834_5258;
+        const NV12: u32 = 0x3231_564e;
+        let saved: [_; 4] = {
+            let o = OUTPUTS.lock();
+            core::array::from_fn(|k| {
+                let c = &o.crtcs[k];
+                (c.format, c.admitted, c.shown.clone(), c.route)
+            })
+        };
+        let restore = || {
+            let mut o = OUTPUTS.lock();
+            for (c, (format, admitted, shown, route)) in o.crtcs.iter_mut().zip(saved.clone()) {
+                (c.format, c.admitted, c.shown, c.route) = (format, admitted, shown, route);
+            }
+        };
+        let result = (|| {
+            if !request_display_format(1, XR30)
+                || OUTPUTS.lock().crtcs[1].format != SurfaceFormat::Xrgb2101010
+                || request_display_format(4, XR24)
+                || request_display_format(1, NV12)
+                || OUTPUTS.lock().crtcs[1].format != SurfaceFormat::Xrgb2101010
+            {
+                return TestResult::Fail("format requests");
+            }
+            let soc = dml::Soc {
+                umc_channels: 2,
+                uclk_khz: 456_000,
+                fclk_khz: [300_000, 2_500_000],
+                dcfclk_khz: [200_000, 1_564_000],
+                socclk_khz: 300_000,
+                dispclk_max_khz: 2_000_000,
+                dppclk_max_khz: 2_000_000,
+                dentist_vco_khz: 4_500_000,
+                dchub_refclk_khz: 50_000,
+            };
+            let timing = Timing {
+                pixel_clock_khz: 533_250,
+                h_active: 3840,
+                h_total: 4000,
+                h_front_porch: 48,
+                h_sync_width: 32,
+                v_active: 2160,
+                v_total: 2222,
+                v_front_porch: 3,
+                v_sync_width: 5,
+                h_sync_positive: true,
+                v_sync_positive: true,
+            };
+            let mode = crate::amdgpu_navi48_boot::plane_mode(timing, SurfaceFormat::Xrgb8888);
+            {
+                let mut o = OUTPUTS.lock();
+                for c in o.crtcs.iter_mut() {
+                    (c.admitted, c.shown, c.route) = (None, None, None);
+                }
+            }
+            // Dark: only the 4-byte formats the offered timings assume.
+            if !display_admits_format(0, None, None, AB30)
+                || display_admits_format(0, None, None, RG16)
+                || display_admits_format(0, None, None, XR4H)
+                || display_admits_format(0, None, None, NV12)
+            {
+                return TestResult::Fail("dark display formats");
+            }
+            {
+                let mut o = OUTPUTS.lock();
+                for c in o.crtcs.iter_mut().take(2) {
+                    c.admitted = Some((soc, mode));
+                    c.shown = Some(([0; 128], timing, alloc::vec![timing]));
+                }
+            }
+            if !display_admits_format(0, None, None, XR30)
+                || !display_admits_format(0, None, None, RG16)
+                || display_admits_format(0, None, None, XR4H)
+                || display_admits_format(1, None, None, XR4H)
+            {
+                return TestResult::Fail("lit configuration admission");
+            }
+            // Another timing or connector at another depth is not guessed.
+            let wire = crate::amdgpu_navi48_kms::timing_wire(&timing);
+            if display_admits_format(0, None, Some(&wire), RG16) {
+                return TestResult::Fail("depth change with an unverified timing");
+            }
+            // The admitted mode of another depth: its pitch and bytes.
+            let joint = [(0, mode), (1, mode)];
+            if !admits_with_format(&soc, &joint, 1, SurfaceFormat::Rgb565)
+                || admits_with_format(&soc, &joint, 1, SurfaceFormat::Abgr16161616f)
+                || admits_with_format(&soc, &joint, 2, SurfaceFormat::Rgb565)
+                || !admits_with_format(&soc, &joint[..1], 0, SurfaceFormat::Xrgb16161616f)
+            {
+                return TestResult::Fail("joint admission per depth");
+            }
+            restore_displays();
+            if OUTPUTS
+                .lock()
+                .crtcs
+                .iter()
+                .any(|c| c.format != SurfaceFormat::Xrgb8888)
+            {
+                return TestResult::Fail("console restore keeps a plane format");
+            }
+            TestResult::Pass
+        })();
+        restore();
+        result
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi48-kms",
+        navi48_plane_formats_request_and_admit
     );
 }

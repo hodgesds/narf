@@ -1783,11 +1783,12 @@ fn smoke_drm_dumb_backing_survives_gem_close_while_fb_held() -> TestResult {
     use crate::drm::card::DumbBacking;
     let mut card = make_test_card();
     let fake_phys = 0xB00B_0000u64;
-    let handle = card.gem.alloc(fake_phys, 4096).unwrap();
+    // Room for the 64x64 XRGB8888 framebuffer (ADDFB2 checks the size).
+    let handle = card.gem.alloc(fake_phys, 64 * 64 * 4).unwrap();
     card.dumb_backings.push(DumbBacking {
         gem_handle: handle,
         phys: fake_phys,
-        byte_len: 4096,
+        byte_len: 64 * 64 * 4,
         order: 0,
         mmap_offset: (handle as u64) << 12,
         refcount: 1,
@@ -2789,6 +2790,183 @@ fn smoke_drm_native_planes_refuse_what_scanout_cannot_show() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_native_planes_refuse_what_scanout_cannot_show
+);
+
+/// The Navi48 primary plane's formats (amdgpu_dm's DCN4.0.1 list less
+/// what the native scanout cannot program): ADDFB2 takes each with a pitch
+/// of a line of its pixels on a GEM object holding every line (EINVAL
+/// otherwise, as framebuffer_check and drm_gem_fb_init_with_funcs refuse
+/// them), refuses the formats it leaves out, GETPLANE lists them, SETCRTC
+/// shows each full screen, PAGE_FLIP keeps the format (EINVAL across
+/// formats, as drm_mode_page_flip_ioctl) and the atomic plane check takes
+/// them. A card without native planes keeps its three legacy formats.
+fn smoke_drm_navi48_plane_formats_end_to_end() -> TestResult {
+    use crate::drm::atomic::{AtomicState, PlaneState};
+    use crate::drm::card::{CardError, DumbBacking, PixelFormat};
+    use crate::drm_uapi::{DrmModeCrtcUapi, DRM_IOCTL_MODE_SETCRTC};
+    const FORMATS: &[u32] = &crate::amdgpu_navi48_kms::PLANE_FORMATS;
+    let idx = register_test_card();
+    let Some(ms) = crate::drm_registry::mode_state(idx) else {
+        return TestResult::Fail("no mode state");
+    };
+    let dumb = |card: &mut crate::drm::card::Card, phys: u64, size: usize| {
+        let handle = card.gem.alloc(phys, size).unwrap();
+        card.dumb_backings.push(DumbBacking {
+            gem_handle: handle,
+            phys,
+            byte_len: size,
+            order: 0,
+            mmap_offset: (handle as u64) << 12,
+            refcount: 1,
+            dma_buf: Default::default(),
+        });
+        handle
+    };
+    let (big, small, legacy) = {
+        let mut card = ms.lock();
+        // Before the planes exist: only XR24, AR24 and RG16.
+        let legacy = dumb(&mut card, 0xBEE0_0000, 64 * 32 * 8);
+        if card.addfb2(64, 32, 0x3033_5258, 64 * 4, legacy) != Err(CardError::UnknownFormat)
+            || card.addfb2(64, 32, 0x3631_4752, 64 * 2, legacy).is_err()
+        {
+            return TestResult::Fail("formats of a card without native planes");
+        }
+        card.plane_formats = Some(FORMATS);
+        (
+            dumb(&mut card, 0xBEEF_0000, 64 * 32 * 8),
+            dumb(&mut card, 0xBEF0_0000, 64 * 32 * 4),
+            legacy,
+        )
+    };
+    let _ = legacy;
+    let addfb = |w: u32, h: u32, format: u32, pitch: u32, handle: u32| {
+        ms.lock().addfb2(w, h, format, pitch, handle)
+    };
+    let mut fbs = alloc::vec::Vec::new();
+    for &format in FORMATS {
+        let Some(cpp) = PixelFormat::from_fourcc(format).map(PixelFormat::cpp) else {
+            return TestResult::Fail("plane format unknown to ADDFB2");
+        };
+        if addfb(64, 32, format, 64 * cpp - 2, big) != Err(CardError::InvalidDimensions) {
+            return TestResult::Fail("pitch shorter than a line accepted");
+        }
+        // A 64x32 line of 8-byte pixels does not fit the 4-byte object.
+        if (cpp == 8)
+            != (addfb(64, 32, format, 64 * cpp, small) == Err(CardError::InvalidDimensions))
+        {
+            return TestResult::Fail("GEM object size check");
+        }
+        match addfb(64, 32, format, 64 * cpp, big) {
+            Ok(fb) => fbs.push((format, fb)),
+            Err(_) => return TestResult::Fail("plane format refused"),
+        }
+    }
+    // RGBA8888, XRGB16161616 (UNORM), NV12 and C8: Linux's other formats.
+    for format in [0x3432_4152, 0x3834_5258, 0x3231_564e, 0x2020_3843] {
+        if addfb(64, 32, format, 64 * 8, big) != Err(CardError::UnknownFormat) {
+            return TestResult::Fail("format the native plane leaves out accepted");
+        }
+    }
+    // GETPLANE lists exactly the plane's formats.
+    let mut ids = [0u32; 4];
+    let mut res = [0u8; 16];
+    res[0..8].copy_from_slice(&(ids.as_mut_ptr() as u64).to_le_bytes());
+    res[8..12].copy_from_slice(&4u32.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xB5, 16),
+        res.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+    {
+        return TestResult::Fail("GETPLANERESOURCES");
+    }
+    let mut listed = [0u32; 16];
+    let mut gp = [0u8; 32];
+    gp[0..4].copy_from_slice(&ids[0].to_le_bytes());
+    gp[20..24].copy_from_slice(&16u32.to_le_bytes());
+    gp[24..32].copy_from_slice(&(listed.as_mut_ptr() as u64).to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xB6, 32),
+        gp.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+        || gp[20..24] != (FORMATS.len() as u32).to_le_bytes()
+        || listed[..FORMATS.len()] != *FORMATS
+    {
+        return TestResult::Fail("plane formats");
+    }
+    // SETCRTC shows each full screen in a 64x32 mode.
+    let setcrtc = |fb_id: u32| {
+        let mut req = DrmModeCrtcUapi {
+            crtc_id: 11,
+            fb_id,
+            mode_valid: 1,
+            ..Default::default()
+        };
+        req.mode.hdisplay = 64;
+        req.mode.vdisplay = 32;
+        req.mode.vrefresh = 60;
+        dispatch_card(
+            idx,
+            DRM_IOCTL_MODE_SETCRTC,
+            &mut req as *mut _ as usize,
+            false,
+        )
+    };
+    for &(_, fb) in &fbs {
+        if setcrtc(fb) != Ok(0) {
+            return TestResult::Fail("full-screen plane of a native format");
+        }
+    }
+    // PAGE_FLIP keeps the format: FP16 to FP16 flips, FP16 to XRGB8888
+    // does not.
+    let (Some(&(_, last)), Some(&(_, xrgb))) = (fbs.last(), fbs.first()) else {
+        return TestResult::Fail("no framebuffers");
+    };
+    let Ok(again) = addfb(64, 32, *FORMATS.last().unwrap(), 64 * 8, big) else {
+        return TestResult::Fail("second FP16 framebuffer");
+    };
+    let flip = |fb: u32| {
+        let mut flip = [0u8; 24];
+        flip[0..4].copy_from_slice(&11u32.to_le_bytes());
+        flip[4..8].copy_from_slice(&fb.to_le_bytes());
+        dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xB0, 24),
+            flip.as_mut_ptr() as usize,
+            false,
+        )
+    };
+    if ms.lock().crtc(11).unwrap().primary_fb != Some(last)
+        || flip(xrgb) != Err(FsError::InvalidData)
+        || flip(again) != Ok(0)
+    {
+        return TestResult::Fail("PAGE_FLIP format rules");
+    }
+    // The atomic plane check takes every format unscaled and full screen.
+    for &(_, fb) in &fbs {
+        let mut state = AtomicState::default();
+        state.planes.push(PlaneState {
+            id: ids[0],
+            crtc_id: Some(11),
+            fb_id: Some(fb),
+            crtc_w: 64,
+            crtc_h: 32,
+            src_w: 64,
+            src_h: 32,
+            ..Default::default()
+        });
+        if crate::drm_ioctl_bridge::check_native_atomic(&ms.lock(), &state) != Ok(()) {
+            return TestResult::Fail("atomic plane of a native format");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_navi48_plane_formats_end_to_end
 );
 
 // ── User-copy range + fault checks (Linux access_ok / copy_*_user) ───────────
