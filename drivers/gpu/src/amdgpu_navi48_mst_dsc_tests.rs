@@ -198,6 +198,7 @@ fn navi48_mst_dsc_fairness_policy_matrix() -> TestResult {
         sink: Sink { branch: 0, port },
         timing,
         dsc,
+        bpc: 8,
     };
     let two = [s(1, UHD144, caps()), s(2, UHD144, caps())];
     let Some(p) = compute(&two, &HBR3X4, &fits) else {
@@ -250,19 +251,19 @@ fn navi48_mst_dsc_port_support_mode_like_amdgpu_dm() -> TestResult {
         end_link_kbps: 0,
         branch_oui: 0,
     };
-    if !port_supports_mode(&FHD60, &topology, ROOT_SINK, None, &HBR3X4)
-        || port_supports_mode(&UHD144, &topology, ROOT_SINK, None, &HBR3X4)
-        || !port_supports_mode(&UHD144, &topology, ROOT_SINK, Some(&dsc), &HBR3X4)
+    if !port_supports_mode(&FHD60, 8, &topology, ROOT_SINK, None, &HBR3X4)
+        || port_supports_mode(&UHD144, 8, &topology, ROOT_SINK, None, &HBR3X4)
+        || !port_supports_mode(&UHD144, 8, &topology, ROOT_SINK, Some(&dsc), &HBR3X4)
     {
         return TestResult::Fail("decoder admission");
     }
     // An HBR2 x4 last link cannot carry 4K144 raw.
     dsc.end_link_kbps = 5_400_000 * 4 / 10_000 * 7760;
-    if port_supports_mode(&UHD144, &topology, ROOT_SINK, Some(&dsc), &HBR3X4) {
+    if port_supports_mode(&UHD144, 8, &topology, ROOT_SINK, Some(&dsc), &HBR3X4) {
         return TestResult::Fail("slow last link");
     }
     dsc.branch_oui = OUI_SYNAPTICS;
-    if !port_supports_mode(&UHD144, &topology, ROOT_SINK, Some(&dsc), &HBR3X4) {
+    if !port_supports_mode(&UHD144, 8, &topology, ROOT_SINK, Some(&dsc), &HBR3X4) {
         return TestResult::Fail("Synaptics last link");
     }
     TestResult::Pass
@@ -303,16 +304,19 @@ fn navi48_mst_dsc_fairness_spans_cascaded_branches() -> TestResult {
                 sink: ROOT_SINK,
                 timing: FHD60,
                 dsc: None,
+                bpc: 8,
             },
             DscStream {
                 sink: CHILD_SINK,
                 timing: UHD144,
                 dsc: caps(),
+                bpc: 8,
             },
             DscStream {
                 sink: grand,
                 timing: UHD144,
                 dsc: caps(),
+                bpc: 8,
             },
         ];
         // 4 x UHBR10: two raw 4K144 streams do not fit, compressed they do.
@@ -346,4 +350,90 @@ fn navi48_mst_dsc_fairness_spans_cascaded_branches() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-mst",
     navi48_mst_dsc_fairness_spans_cascaded_branches
+);
+
+/// An EDID 1.4 block whose digital input declares `code` (3: 10 bpc) and
+/// whose detailed timing is 3840x2160@60 (594 MHz).
+fn uhd60_edid(code: u8) -> Vec<u8> {
+    let mut e = alloc::vec![0u8; 128];
+    e[..8].copy_from_slice(&[0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0]);
+    e[8..10].copy_from_slice(&[0x10, 0xac]);
+    (e[18], e[19], e[20]) = (1, 4, 0x80 | code << 4 | 5);
+    e[54..72].copy_from_slice(&[
+        0x08, 0xe8, 0x00, 0x30, 0xf2, 0x70, 0x5a, 0x80, 0xb0, 0x58, 0x8a, 0, 0, 0, 0, 0, 0, 0x1e,
+    ]);
+    e[127] = narf_edid::compute_checksum(&e);
+    e
+}
+
+/// An MST stream at its deepest depth, as amdgpu_dm validates each depth
+/// with dm_dp_mst_is_port_support_mode and the link's fairness search: a
+/// 10-bpc 4K60 sink behind a 2 x HBR2 branch link (8,380,800 kbps with
+/// FEC) is compressed from 10 bpc when max_bpc is 10, its PBN and DSC the
+/// fairness search's for a 10-bpc stream; at max_bpc 8, or with a decoder
+/// that takes only 8-bpc input, it is compressed from 8 bpc.
+fn navi48_mst_dsc_streams_take_the_deepest_depth() -> TestResult {
+    let mut hub = Hub::new();
+    let (_, topology) = probed(&mut hub);
+    let caps = modeset::DpCaps {
+        lanes: 2,
+        rate: crate::dp_link_training::LinkRate::Hbr2,
+        uhbr: 0,
+        fec: true,
+        dsc: None,
+    };
+    let devices = [(ROOT_SINK, uhd60_edid(3), u16::MAX)];
+    let budget = |_: Sink, _: &[(Sink, u16)]| u16::MAX;
+    let pick = |decoder: [u8; 16], max_bpc: u8| {
+        let mst = MstDsc {
+            caps: DscSinkCaps::parse(&decoder, &[0; 3]).unwrap(),
+            aux: DscAux::Port(ROOT_SINK),
+            passthrough: None,
+            end_link_kbps: 0,
+            branch_oui: 0,
+        };
+        let dsc_of = |s: Sink| (s == ROOT_SINK).then_some(mst);
+        let ctx = MstDscContext {
+            topology: &topology,
+            dsc_of: &dsc_of,
+            max_dispclk_khz: 2_000_000,
+            max_bpc,
+        };
+        super::super::select_mst_dsc(0, caps, &devices, &|_| None, &budget, &ctx)
+    };
+    let link = super::super::dsc_link(caps, 2_000_000).unwrap();
+    let want = |decoder: [u8; 16], bpc: u8| {
+        let stream = DscStream {
+            sink: ROOT_SINK,
+            timing: modeset::edid_timings(&devices[0].1)[0],
+            dsc: DscSinkCaps::parse(&decoder, &[0; 3]),
+            bpc,
+        };
+        compute(&[stream], &link, &|_| true).unwrap()[0]
+    };
+    let mut eight = DECODER;
+    eight[10] = 0x02;
+    for (decoder, max_bpc, bpc, depth) in [
+        (DECODER, 10, 10, otg::ColorDepth::Bpc10),
+        (DECODER, 8, 8, otg::ColorDepth::Bpc8),
+        (eight, 10, 8, otg::ColorDepth::Bpc8),
+    ] {
+        let s = pick(decoder, max_bpc);
+        let w = want(decoder, bpc);
+        let [s] = s.as_slice() else {
+            panic!("one stream at max_bpc {max_bpc}: {s:?}");
+        };
+        if s.depth != depth
+            || s.dsc.map(|c| c.bpc) != Some(bpc)
+            || s.dsc != w.dsc
+            || s.mst.map(|m| (m.pbn, m.slots)) != Some((w.pbn, w.slots))
+        {
+            panic!("{bpc}-bpc MST DSC: {s:?} want {w:?}");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-mst",
+    navi48_mst_dsc_streams_take_the_deepest_depth
 );

@@ -76,9 +76,10 @@ pub struct Selection {
     pub scdc: bool,
     /// Output depth: for DP SST the deepest depth up to the sink's EDID bpc
     /// and `max_bpc` a link carries, uncompressed or compressed
-    /// (`dp_sst_stream`; a compressed stream's `DscConfig::bpc`); 8 for
-    /// MST; for HDMI the deepest the sink, the link capacity and the
-    /// requested maximum allow.
+    /// (`dp_sst_stream`; a compressed stream's `DscConfig::bpc`); for MST
+    /// the deepest the port and the link's fairness search take when the
+    /// link has a DSC decoder, else 8; for HDMI the deepest the sink, the
+    /// link capacity and the requested maximum allow.
     pub depth: otg::ColorDepth,
     /// The sink's audio; FRL retains only supported LPCM modes.
     pub audio: Option<otg::AudioInfo>,
@@ -2043,7 +2044,7 @@ pub fn hdmi_stream(
 }
 
 /// The bits per component of an output depth.
-fn depth_bpc(depth: otg::ColorDepth) -> u8 {
+pub(super) fn depth_bpc(depth: otg::ColorDepth) -> u8 {
     match depth {
         otg::ColorDepth::Bpc8 => 8,
         otg::ColorDepth::Bpc10 => 10,

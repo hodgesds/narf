@@ -10,11 +10,14 @@
 #   drivers/gpu/tests/dcn401_dsc/check.sh --generate-cvtem [linux-tree] > cvtem_vectors.txt
 #   drivers/gpu/tests/dcn401_dsc/check.sh --generate-mst [linux-tree] > mst_vectors.txt
 #   drivers/gpu/tests/dcn401_dsc/check.sh --generate-depth [linux-tree] > depth_vectors.txt
+#   drivers/gpu/tests/dcn401_dsc/check.sh --generate-mst-depth [linux-tree] > mst_depth_vectors.txt
 # cvtem_vectors.txt replays hpo_enc401_hdmi_set_dsc_config's CVTEM packets
 # (cvtem_harness.c) for frl_vectors.txt's PPSes; mst_vectors.txt replays
 # amdgpu_dm's MST DSC fairness search (mst_harness.c); depth_vectors.txt
 # replays amdgpu_dm_create_validate_stream_for_sink's DP SST depth search
-# with DSC at every depth (depth_harness.c).
+# with DSC at every depth (depth_harness.c); mst_depth_vectors.txt the MST
+# fairness search with 8-, 10- and 12-bpc streams (mst_harness.c with
+# STREAM_BPC).
 # amdgpu_dsc.rs, the HPO FRL encoder's CVTEM and amdgpu_mst_dsc.rs must
 # produce Linux's output for every line.
 set -euo pipefail
@@ -34,6 +37,9 @@ elif [ "${1:-}" = --generate-mst ]; then
 	shift
 elif [ "${1:-}" = --generate-depth ]; then
 	generate=5
+	shift
+elif [ "${1:-}" = --generate-mst-depth ]; then
+	generate=6
 	shift
 fi
 linux=${1:-/usr/src/linux}
@@ -71,6 +77,8 @@ awk '/^struct dsc_mst_fairness_params \{/ { on = 1 }
 grep -q 'try_disable_dsc' "$work/mst_fair.c" ||
 	{ echo "amdgpu_dm MST DSC fairness functions not found" >&2; exit 1; }
 cc "${flags[@]}" -I"$work" "$here/mst_harness.c" "$work"/*.o -lm "${alias[@]}" -o "$work/mst"
+cc "${flags[@]}" -DSTREAM_BPC -I"$work" "$here/mst_harness.c" "$work"/*.o -lm "${alias[@]}" \
+	-o "$work/mst_depth"
 # cvtem_vectors.txt: every compressed frl_vectors.txt line's timing, slices,
 # bpp and PPS, with a front porch and sync from its blanking.
 cvtem_inputs() {
@@ -80,6 +88,41 @@ cvtem_inputs() {
 		print ha, ht, int(b / 4), int(b / 8) < 4 ? 4 : int(b / 8), o[2], o[4], o[n]
 	}'
 }
+if [ $generate -eq 6 ]; then
+	echo "# Linux MST DSC fairness reference vectors at 8, 10 and 12 bpc; see check.sh and mst_harness.c."
+	# As --generate-mst, each stream also at a depth its decoder takes:
+	# decoders with 8-12, 8-10 or 8-bpc-only input.
+	links=("0 25142400 63" "0 16761600 63" "0 12571200 63" "1 38566400 64"
+		"1 77132800 64" "1 19283200 64")
+	modes=("12542820 3840 3920 2160 2222" "21515900 3840 3920 2160 2287"
+		"20397930 7680 7760 4320 4381" "5940000 3840 4400 2160 2250"
+		"9680000 2560 2720 1440 1481" "9384000 5120 5280 2880 2962"
+		"1485000 1920 2200 1080 1125")
+	d12=("01210b0f7f030100001f0e8810000000" "01210b0f7f030100001f0e3310000004"
+		"01210b0f2b030100001f0e8810000000")
+	d10=("01210b0f7f030100001f068810000000" "${d12[@]}")
+	d8=("01210b0f7f030100001f028810000000" "${d10[@]}")
+	RANDOM=6202
+	pick() { local -n a=$1; echo "${a[RANDOM % ${#a[@]}]}"; }
+	for _ in $(seq 1200); do
+		n=$((RANDOM % 10 == 0 ? 4 : 1 + RANDOM % 3))
+		shared=$((RANDOM % 8 == 0 ? 2000 + RANDOM % 3000 : 65535))
+		in="$(pick links) 2000000 $shared $n"
+		for _ in $(seq $n); do
+			port=$((RANDOM % 8 == 0 ? 1000 + RANDOM % 2000 : 65535))
+			bpc=$(( (RANDOM % 3) * 2 + 8 ))
+			case $bpc in
+			12) dec=$(pick d12) ;;
+			10) dec=$(pick d10) ;;
+			*) dec=$(pick d8) ;;
+			esac
+			[ $((RANDOM % 6)) -eq 0 ] && dec=-
+			in="$in $dec $(pick modes) $port $bpc"
+		done
+		echo "$in = $(echo "$in" | "$work/mst_depth")"
+	done
+	exit 0
+fi
 if [ $generate -eq 5 ]; then
 	echo "# Linux DP SST depth search reference vectors (DCN401 encoder); see check.sh and depth_harness.c."
 	# pix_clk_100hz h_active h_total v_active v_total: 1080p60, 1440p165,
@@ -286,9 +329,17 @@ if ! diff -q "$work/want_depth" "$work/got_depth" >/dev/null; then
 	echo "depth_vectors.txt does not match Linux" >&2
 	exit 1
 fi
+grep -v '^#' "$here/mst_depth_vectors.txt" | sed 's/ = .*//' | "$work/mst_depth" > "$work/got_mst_depth"
+grep -v '^#' "$here/mst_depth_vectors.txt" | sed 's/.* = //' > "$work/want_mst_depth"
+if ! diff -q "$work/want_mst_depth" "$work/got_mst_depth" >/dev/null; then
+	diff "$work/want_mst_depth" "$work/got_mst_depth" | head -20 >&2
+	echo "mst_depth_vectors.txt does not match Linux" >&2
+	exit 1
+fi
 # Every cvtem_vectors.txt input comes from frl_vectors.txt's PPSes.
 if ! diff -q <(cvtem_inputs) <(grep -v '^#' "$here/cvtem_vectors.txt" | sed 's/ =.*//') >/dev/null; then
 	echo "cvtem_vectors.txt inputs no longer follow frl_vectors.txt" >&2
 	exit 1
 fi
-echo "$(cat "$work/want" "$work/want_frl" "$work/want_cvtem" "$work/want_mst" 	"$work/want_depth" | wc -l) ok"
+echo "$(cat "$work/want" "$work/want_frl" "$work/want_cvtem" "$work/want_mst" \
+	"$work/want_depth" "$work/want_mst_depth" | wc -l) ok"

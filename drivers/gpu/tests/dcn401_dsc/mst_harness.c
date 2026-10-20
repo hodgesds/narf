@@ -15,6 +15,8 @@
  *   <max_dispclk_khz> <shared hop PBN> <streams n>, then per stream
  *   <DPCD 0x060-0x06F as 32 hex digits, or - for no decoder>
  *   <pix_clk_100hz> <h_active> <h_total> <v_active> <v_total> <port PBN>
+ *   and, built with -DSTREAM_BPC, <bpc 8|10|12> (the stream's
+ *   display_color_depth; 8 otherwise)
  * prints "FAIL" or, per stream, "<pbn> <dsc 0|1> <bpp_x16> <slices_h>
  * <slices_v>" separated by " |". */
 #include "dc_dsc.h"
@@ -191,6 +193,16 @@ int main(void)
 				  &t->h_total, &t->v_addressable, &t->v_total, &port_limit[i]) != 7)
 				return 2;
 			t->display_color_depth = COLOR_DEPTH_888;
+#ifdef STREAM_BPC
+			{
+				unsigned int bpc;
+
+				if (scanf("%u", &bpc) != 1)
+					return 2;
+				t->display_color_depth = bpc == 12 ? COLOR_DEPTH_121212 :
+					bpc == 10 ? COLOR_DEPTH_101010 : COLOR_DEPTH_888;
+			}
+#endif
 			t->pixel_encoding = PIXEL_ENCODING_RGB;
 			sinks[i].ctx = &ctx;
 			if (hex[0] != '-') {

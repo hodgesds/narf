@@ -1486,20 +1486,28 @@ DP MST DSC follows amdgpu_dm and DRM on both encodings.
 `try_disable_dsc` and `set_dsc_configs_from_fairness_vars`: `peak_pbn`
 (`kbps_to_peak_pbn`, 1.006 peak, 1.031 8b/10b FEC), `kbps_from_pbn`,
 `DscLink { encoding, kbps, slots, max_dispclk_khz }`, `DscStream { sink,
-timing, dsc }` and `DscPayload { pbn, slots, dsc }`; `fits` is the topology's
+timing, dsc, bpc }` (the stream's depth: its uncompressed bandwidth and DSC
+input) and `DscPayload { pbn, slots, dsc }`; `fits` is the topology's
 per-hop PBN check and `native` the display pipeline's DSC shape (`dml::dsc_shape`: up to four
 ODM pipes of four slices). `tests/dcn401_dsc/check.sh` replays 1500
-mst_vectors.txt links through Linux's own fairness functions (mst_harness.c);
+mst_vectors.txt links through Linux's own fairness functions (mst_harness.c)
+and 1200 mst_depth_vectors.txt links of 8-, 10- and 12-bpc streams (built
+with `STREAM_BPC`);
 a configuration Linux leaves compressed at bpp 0 is refused. In
 `amdgpu_navi48_mst::dsc`, `dsc_aux_for_port` is
 `drm_dp_mst_dsc_aux_for_port` (end device, DP-to-DP virtual-DPCD peer with
 passthrough, DP-to-HDMI/virtual sink, `DSC_WITHOUT_VIRTUAL_DPCD` hubs),
 `read_dsc` is `validate_dsc_caps_on_connector` returning `MstDsc { caps, aux,
-passthrough, end_link_kbps, branch_oui }`, `port_supports_mode` is
-`dm_dp_mst_is_port_support_mode`, and `set_rx` is
+passthrough, end_link_kbps, branch_oui }`, `port_supports_mode(t, bpc, ..)` is
+`dm_dp_mst_is_port_support_mode` at the stream's depth, and `set_rx` is
 `dm_helpers_dp_write_dsc_enable` (passthrough 2 before decoder 1; disable
 reverse) through `dp_mst_mgr::Manager::remote_dpcd_read/write`. Selection
-and offered modes run the fairness search jointly across the branch; the
+and offered modes run the fairness search jointly across the branch, each
+end device at the deepest of its depths (`dp_depths` up to
+`MstDscContext::max_bpc`, create_validate_stream_for_sink's loop) that the
+port and the joint search take; such a stream leaves at that depth
+compressed or raw (VC rate, PBN and audio budget at it). A link without any
+decoder keeps 8-bpc streams; the
 payload PBN and VC rate come from the compressed bandwidth
 (`uhbr_mst_dsc_rate` on 128b/132b). The decoder is enabled before the
 payload, the PPS is sent per stream (DIO SDP or HPO GSP11) before unblank,

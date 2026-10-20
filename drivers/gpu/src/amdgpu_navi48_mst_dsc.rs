@@ -338,7 +338,8 @@ pub fn compute(streams: &[DscStream], link: &DscLink, fits: &Fits<'_>) -> Option
     compute_link(streams, link, fits, &|s| native_config(s, link))
 }
 
-/// dm_dp_mst_is_port_support_mode for `t` on end device `port` (8-bpc RGB):
+/// dm_dp_mst_is_port_support_mode for `t` on end device `port` (RGB at
+/// `bpc`, the stream's display_color_depth):
 /// carried uncompressed within the end-to-end bandwidth (the root link and
 /// the port's full PBN), or compressible within the path the compressed
 /// stream crosses: the whole route for a passthrough decoder; otherwise the
@@ -348,12 +349,13 @@ pub fn compute(streams: &[DscStream], link: &DscLink, fits: &Fits<'_>) -> Option
 /// throughput must hold the pixel rate.
 pub fn port_supports_mode(
     t: &Timing,
+    bpc: u8,
     topology: &Topology,
     port: Sink,
     dsc: Option<&MstDsc>,
     link: &DscLink,
 ) -> bool {
-    let dt = mst_dsc_timing(t);
+    let dt = mst_dsc_timing(t, bpc);
     let stream = amdgpu_dsc::stream_kbps(&dt, link.encoding);
     let Some(p) = topology.port(port) else {
         return false;

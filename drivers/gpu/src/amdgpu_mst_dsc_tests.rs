@@ -6,8 +6,9 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 const VECTORS: &str = include_str!("../tests/dcn401_dsc/mst_vectors.txt");
 
 /// One mst_harness.c line through `compute_link`, with dc_dsc_compute_config
-/// as the only shape check (the Linux harness has no pipeline limits).
-fn run_vector(input: &str) -> Option<String> {
+/// as the only shape check (the Linux harness has no pipeline limits). With
+/// `depth` each stream also gives its bpc (mst_depth_vectors.txt).
+fn run_vector(input: &str, depth: bool) -> Option<String> {
     let w: Vec<&str> = input.split_whitespace().collect();
     let num = |i: usize| w.get(i).and_then(|v| v.parse::<u32>().ok());
     let link = DscLink {
@@ -24,8 +25,9 @@ fn run_vector(input: &str) -> Option<String> {
     let n = num(5)? as usize;
     let mut streams = Vec::new();
     let mut limits = Vec::new();
+    let fields = if depth { 8 } else { 7 };
     for k in 0..n {
-        let b = 6 + 7 * k;
+        let b = 6 + fields * k;
         let caps = if *w.get(b)? == "-" {
             None
         } else {
@@ -54,6 +56,7 @@ fn run_vector(input: &str) -> Option<String> {
                 v_sync_positive: false,
             },
             dsc: caps,
+            bpc: if depth { num(b + 7)? as u8 } else { 8 },
         });
         limits.push(num(b + 6)?);
     }
@@ -91,32 +94,62 @@ fn run_vector(input: &str) -> Option<String> {
 /// a stream flagged compressed with bpp 0 (bpp_x16_from_pbn found no
 /// configuration for its fair share), the port refuses the configuration.
 fn mst_dsc_fairness_matches_linux_vectors() -> TestResult {
+    match fairness_vectors(VECTORS, false) {
+        Some((checked, compressed, refused))
+            if checked >= 1400 && compressed >= 300 && refused <= 20 =>
+        {
+            TestResult::Pass
+        }
+        Some(_) => TestResult::Fail("vector coverage"),
+        None => TestResult::Fail("vector input"),
+    }
+}
+kernel_test_in!("drivers/gpu/dsc", mst_dsc_fairness_matches_linux_vectors);
+
+const DEPTH_VECTORS: &str = include_str!("../tests/dcn401_dsc/mst_depth_vectors.txt");
+
+/// The fairness search with 8-, 10- and 12-bpc streams sharing a link
+/// (mst_harness.c built with STREAM_BPC): each stream's uncompressed
+/// bandwidth and DSC input are its own depth's.
+fn mst_dsc_fairness_matches_linux_at_every_depth() -> TestResult {
+    match fairness_vectors(DEPTH_VECTORS, true) {
+        Some((checked, compressed, refused))
+            if checked >= 1000 && compressed >= 200 && refused <= 20 =>
+        {
+            TestResult::Pass
+        }
+        Some(_) => TestResult::Fail("depth vector coverage"),
+        None => TestResult::Fail("depth vector input"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/dsc",
+    mst_dsc_fairness_matches_linux_at_every_depth
+);
+
+/// Every line of `vectors` through `run_vector`: (checked, compressed,
+/// refused) or None for a malformed line. Panics on a mismatch.
+fn fairness_vectors(vectors: &str, depth: bool) -> Option<(usize, usize, usize)> {
     let (mut checked, mut compressed, mut refused) = (0, 0, 0);
-    for line in VECTORS
+    for line in vectors
         .lines()
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
     {
-        let Some((input, want)) = line.split_once(" = ") else {
-            return TestResult::Fail("vector format");
-        };
+        let (input, want) = line.split_once(" = ")?;
         let bpp_zero = want
             .split(" | ")
             .any(|s| s.split(' ').nth(1) == Some("1") && s.split(' ').nth(2) == Some("0"));
         let want = if bpp_zero { "FAIL" } else { want };
         refused += usize::from(bpp_zero);
-        match run_vector(input) {
+        match run_vector(input, depth) {
             Some(got) if got == want => checked += 1,
             Some(got) => panic!("MST DSC vector {input}\n want {want}\n  got {got}"),
-            None => return TestResult::Fail("vector input"),
+            None => return None,
         }
         compressed += usize::from(want.contains(" 1 "));
     }
-    if checked < 1400 || compressed < 300 || refused > 20 {
-        return TestResult::Fail("vector coverage");
-    }
-    TestResult::Pass
+    Some((checked, compressed, refused))
 }
-kernel_test_in!("drivers/gpu/dsc", mst_dsc_fairness_matches_linux_vectors);
 
 /// kbps_to_peak_pbn and kbps_from_pbn: 1.006 peak margin, 8b/10b's 3.1% FEC
 /// PBN overhead.

@@ -34,15 +34,15 @@ pub fn kbps_from_pbn(pbn: u32) -> u32 {
     (u64::from(pbn) * (1_000_000 / PEAK_FACTOR_X1000) * 8 * 54 / 64) as u32
 }
 
-/// The DSC view of an MST stream: 8-bpc RGB.
-pub fn mst_dsc_timing(t: &Timing) -> DscTiming {
+/// The DSC view of an MST stream: RGB at `bpc` (its display_color_depth).
+pub fn mst_dsc_timing(t: &Timing, bpc: u8) -> DscTiming {
     DscTiming {
         pix_clk_100hz: t.pixel_clock_khz * 10,
         h_active: t.h_active,
         h_total: t.h_total,
         v_active: t.v_active,
         v_total: t.v_total,
-        bpc: 8,
+        bpc,
         encoding: amdgpu_dsc::Encoding::Rgb,
     }
 }
@@ -65,12 +65,15 @@ impl DscLink {
     }
 }
 
-/// One stream on the link: its end device, timing and decoder.
+/// One stream on the link: its end device, timing, depth and decoder.
 #[derive(Clone, Copy, Debug)]
 pub struct DscStream {
     pub sink: Sink,
     pub timing: Timing,
     pub dsc: Option<DscSinkCaps>,
+    /// The stream's depth (8, 10 or 12 bpc RGB): its uncompressed
+    /// bandwidth and the input its DSC compresses.
+    pub bpc: u8,
 }
 
 /// What `compute_link` gives a stream: its payload PBN and time slots and,
@@ -103,7 +106,7 @@ pub fn config(s: &DscStream, link: &DscLink) -> Option<DscConfig> {
         s.dsc.as_ref()?,
         link.max_dispclk_khz,
         0,
-        &mst_dsc_timing(&s.timing),
+        &mst_dsc_timing(&s.timing, s.bpc),
         link.encoding,
         false,
     )
@@ -120,7 +123,7 @@ fn bpp_x16_from_pbn(s: &DscStream, link: &DscLink, pbn: i32) -> u32 {
                 caps,
                 link.max_dispclk_khz,
                 kbps,
-                &mst_dsc_timing(&s.timing),
+                &mst_dsc_timing(&s.timing, s.bpc),
                 link.encoding,
                 false,
             )
@@ -170,7 +173,7 @@ pub fn compute_link(
     let params: Vec<Params> = streams
         .iter()
         .map(|s| {
-            let t = mst_dsc_timing(&s.timing);
+            let t = mst_dsc_timing(&s.timing, s.bpc);
             let (min, max) = amdgpu_dsc::policy_bpp_x16(&t, link.encoding);
             let possible = native(s).is_some();
             let range = s
