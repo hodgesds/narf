@@ -434,6 +434,26 @@ struct GrubImageArgs {
     /// root.
     #[arg(long, value_name = "TOKEN")]
     bootlog_token: Option<String>,
+
+    /// Extra kernel command-line arguments appended after the disk policy
+    /// (repeatable; each value may hold several whitespace-separated
+    /// arguments), e.g. `--cmdline-extra "systemd.unit=multi-user.target
+    /// fsck.mode=skip"` for a first trial of the installed root.
+    #[arg(long, value_name = "ARGS")]
+    cmdline_extra: Vec<String>,
+}
+
+/// The kernel build `grub-image` stages. A `--root-policy` bundle boots the
+/// installed distro's systemd as PID 1, so it gets the same feature set as
+/// every other systemd PID 1 path (`configure_systemd_pid1_build`): without
+/// `boot-init` the kernel never honours `systemd_pid1`, and without
+/// `cgroup-all` systemd refuses to start.
+fn grub_image_build_args(grub: &GrubImageArgs) -> BuildArgs {
+    let mut build = grub.build.clone();
+    if grub.root_policy.is_some() {
+        configure_systemd_pid1_build(&mut build, false);
+    }
+    build
 }
 
 /// `narf.bootlog=` token rules (`drivers/fs/fat/src/bootlog.rs::parse_config`).
@@ -508,7 +528,21 @@ fn canonical_fs_uuid(uuid: &str) -> Result<String> {
 /// [`cmdline_with_disk_policy`]. A root policy refuses a base line that
 /// already names a disk policy or a root, rather than emitting two.
 fn grub_image_cmdline(cmdline: &str, grub: &GrubImageArgs) -> Result<String> {
-    with_bootlog_token(grub_image_policy_cmdline(cmdline, grub)?, grub)
+    let mut line = with_bootlog_token(grub_image_policy_cmdline(cmdline, grub)?, grub)?;
+    for extra in grub.cmdline_extra.iter().flat_map(|e| e.split_whitespace()) {
+        if extra.starts_with("narf.disks=")
+            || extra.starts_with("root=")
+            || extra.starts_with("rootflags=")
+            || extra.starts_with("narf.bootlog=")
+        {
+            bail!("--cmdline-extra: `{extra}` has its own grub-image option");
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(extra);
+    }
+    Ok(line)
 }
 
 fn grub_image_policy_cmdline(cmdline: &str, grub: &GrubImageArgs) -> Result<String> {
@@ -747,6 +781,74 @@ mod disk_policy_tests {
             UUID
         ])
         .is_err());
+    }
+
+    #[test]
+    fn grub_image_root_policy_builds_the_systemd_pid1_kernel() {
+        const UUID: &str = "653602c3-cd42-420e-95ef-4c4033d17b56";
+        let ro = grub(&[
+            "--features",
+            "user-requested",
+            "--root-policy",
+            "root-ro",
+            "--root-uuid",
+            UUID,
+        ]);
+        let features = grub_image_build_args(&ro).features;
+        let features: Vec<&str> = features.split(',').collect();
+        for expected in [
+            "user-requested",
+            "boot-init",
+            "cgroup-all",
+            "firmware-allow-unsigned",
+            "container",
+        ] {
+            assert!(features.contains(&expected), "missing feature {expected}");
+        }
+        // The distro brings its own network up; the static QEMU autoconfig
+        // stays off.
+        assert!(!features.contains(&"qemu-net"));
+        // Without a root policy the build is exactly what was asked for.
+        assert_eq!(
+            grub_image_build_args(&grub(&["--features", "user-requested"])).features,
+            "user-requested"
+        );
+    }
+
+    #[test]
+    fn grub_image_cmdline_extra_follows_the_policy() {
+        const UUID: &str = "653602c3-cd42-420e-95ef-4c4033d17b56";
+        let ro = grub(&[
+            "--root-policy",
+            "root-ro",
+            "--root-uuid",
+            UUID,
+            "--bootlog-token",
+            "0123456789abcdef",
+            "--cmdline-extra",
+            "systemd.unit=multi-user.target  fsck.mode=skip",
+        ]);
+        assert_eq!(
+            grub_image_cmdline("", &ro).unwrap(),
+            format!(
+                "narf.disks=root-ro root=UUID={UUID} rootflags=subvol=/@ systemd_pid1 \
+                 narf.bootlog=0123456789abcdef systemd.unit=multi-user.target fsck.mode=skip"
+            )
+        );
+        let clash = grub(&[
+            "--root-policy",
+            "root-ro",
+            "--root-uuid",
+            UUID,
+            "--cmdline-extra",
+            "root=/dev/nvme0n1p2",
+        ]);
+        assert!(grub_image_cmdline("", &clash).is_err());
+        let plain = grub(&["--cmdline-extra", "quiet"]);
+        assert_eq!(
+            grub_image_cmdline("", &plain).unwrap(),
+            "narf.disks=boot-only quiet"
+        );
     }
 
     #[test]
@@ -11471,7 +11573,8 @@ interface_resolution: 1024x768
 /// only the original ELF relocation sections, preserving every PT_LOAD
 /// segment and NARF's own runtime KASLR support.
 fn grub_image_cmd(grub: &GrubImageArgs) -> Result<()> {
-    let args = &grub.build;
+    let build = grub_image_build_args(grub);
+    let args = &build;
     if matches!(args.arch, Arch::Aarch64) {
         bail!("direct GRUB Multiboot2 artifacts are currently x86_64-only");
     }

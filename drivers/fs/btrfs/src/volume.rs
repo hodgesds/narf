@@ -279,6 +279,24 @@ impl<B: BlockDevice> Drop for BtrfsVolume<B> {
 
 /// Accessors on the shared core.
 impl<B: BlockDevice> VolCore<B> {
+    /// The live [`MmapAnchor`] of inode `ino` in fs tree `tree`, created on
+    /// first use. Dead entries are pruned as the table grows.
+    pub(crate) fn mmap_anchor(&self, tree: u64, ino: u64) -> Arc<MmapAnchor> {
+        let mut anchors = self.mmap_anchors.lock();
+        if let Some(anchor) = anchors.get(&(tree, ino)).and_then(Weak::upgrade) {
+            return anchor;
+        }
+        if anchors.len() >= 256 && anchors.len().is_power_of_two() {
+            anchors.retain(|_, anchor| anchor.strong_count() != 0);
+        }
+        let anchor = Arc::new(MmapAnchor {
+            _tree: tree,
+            _ino: ino,
+        });
+        anchors.insert((tree, ino), Arc::downgrade(&anchor));
+        anchor
+    }
+
     /// The transaction accumulating operations that have not committed yet.
     pub(crate) fn fs_batch(&self) -> &Mutex<Option<crate::write::FsBatch>> {
         &self.fs_batch
@@ -309,11 +327,26 @@ impl<B: BlockDevice> VolCore<B> {
     }
 }
 
+/// One btrfs inode's `MAP_SHARED` identity. Every open of a btrfs file gets
+/// its own [`crate::node::BtrfsNode`], but `MAP_SHARED` mappings of the
+/// same inode must share pages across those opens (journald writes its
+/// journal through one mapping while `journalctl` reads it through
+/// another). The address of the single live anchor per `(fs tree, inode)`
+/// is what `FileOps::mmap_backing_identity` reports; every node of the
+/// inode holds it, so it cannot be reused while any mapping exists.
+#[derive(Debug)]
+pub(crate) struct MmapAnchor {
+    _tree: u64,
+    _ino: u64,
+}
+
 /// The filesystem-wide half of a mount (Linux `btrfs_fs_info`): devices,
 /// superblock, chunk map, node cache, the running transaction and its
 /// allocator, pinned extents, and the commit timer.
 #[derive(Debug)]
 pub struct VolCore<B: BlockDevice> {
+    /// Live [`MmapAnchor`]s by `(fs tree id, inode number)`.
+    mmap_anchors: IrqSafeSpinLock<BTreeMap<(u64, u64), Weak<MmapAnchor>>>,
     /// Source device passed first at mount. Retained for compatibility with
     /// single-device callers and tests; logical I/O routes through `devices`.
     pub device: Arc<B>,
@@ -1714,6 +1747,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         seed.map_logical(superblock.chunk_root)?;
 
         let core = Arc::new(VolCore {
+            mmap_anchors: IrqSafeSpinLock::new(BTreeMap::new()),
             device: source_device,
             magic: superblock.magic,
             nodesize: superblock.nodesize,

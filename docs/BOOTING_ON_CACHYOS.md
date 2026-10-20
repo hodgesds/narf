@@ -384,18 +384,35 @@ by a device name:
 
 ```sh
 # Read-only root, writable tmpfs overlay (nothing on any disk is written):
-cargo xtask grub-image --root-policy root-ro \
-  --root-uuid 653602c3-cd42-420e-95ef-4c4033d17b56
-# Real read-write to the btrfs root ONLY:
-cargo xtask grub-image --root-policy root-rw \
-  --root-uuid 653602c3-cd42-420e-95ef-4c4033d17b56
+cargo xtask grub-image --arch=x86_64 \
+  --initramfs-firmware "amdgpu/navy_flounder*" \
+  --root-policy root-ro --root-uuid 653602c3-cd42-420e-95ef-4c4033d17b56 \
+  --rootflags subvol=/@ --bootlog-token <token> \
+  --cmdline-extra "systemd.unit=multi-user.target fsck.mode=skip"
+# Real read-write to the btrfs root ONLY: the same, with --root-policy root-rw.
 ```
 
 Each command emits `narf.disks=<mode> root=UUID=<uuid> rootflags=subvol=/@
-systemd_pid1` (`--rootflags` changes the subvolume). Without `--root-policy`,
-grub-image still writes `boot-only`. `--bootlog-token <token>` adds
-`narf.bootlog=<token>` (8-64 characters of `[A-Za-z0-9_-]`) for the
-persistent boot log described below.
+systemd_pid1` (`--rootflags` changes the subvolume), then
+`narf.bootlog=<token>` and the `--cmdline-extra` arguments. Without
+`--root-policy`, grub-image still writes `boot-only`.
+
+- `--root-policy` builds the systemd PID 1 kernel by itself: it adds the
+  features `boot-init` (honours `systemd_pid1`), `cgroup-all` (a real
+  cgroup2 `/sys/fs/cgroup`, which systemd requires), `container` (namespaces
+  for unit sandboxing) and `firmware-allow-unsigned`, the same set
+  `systemd-pid1`, `cachyos-root-smoke` and `cachyos-gate` use. A bundle built
+  without them boots NARF's own userspace and ignores `systemd_pid1`. Passing
+  them explicitly with `--features boot-init,cgroup-all,container,firmware-allow-unsigned`
+  is equivalent.
+- `--initramfs-firmware "amdgpu/navy_flounder*"` puts the RX 6700 XT's
+  firmware in the initramfs, so the display comes up before the root mounts.
+- `--bootlog-token <token>` adds `narf.bootlog=<token>` (8-64 characters of
+  `[A-Za-z0-9_-]`) for the persistent boot log described below.
+- `--cmdline-extra` (repeatable) appends arguments. For the first trials use
+  `systemd.unit=multi-user.target` (the host defaults to `graphical.target`)
+  and `fsck.mode=skip`. Arguments that grub-image has its own option for
+  (`narf.disks=`, `root=`, `rootflags=`, `narf.bootlog=`) are refused there.
 
 - **Nothing is writable until the root is designated.** Root mounting
   matches `root=UUID=` and calls `designate_root` before the filesystem is
@@ -808,11 +825,13 @@ cargo xtask grub-image --features cgroup-all,container \
   --root-policy root-ro --root-uuid <image fsid>      # and --root-policy root-rw
 ```
 
-`--features cgroup-all,container` (plus the `boot-init` and
-`firmware-allow-unsigned` that `grub-image` always adds) is the systemd PID 1
-configuration that `systemd-pid1` uses. Build the hardware bundle the same
-way. The gate appends `narf.bootlog=<token>` to the staged `limine.conf`
-because `grub-image` has no option for it yet. The resulting command line is
+`--root-policy` makes `grub-image` add the systemd PID 1 features
+(`boot-init`, `cgroup-all`, `container`, `firmware-allow-unsigned`), the
+configuration `systemd-pid1` uses; `--features cgroup-all,container` is
+redundant but harmless. Build the hardware bundle the same way (the full
+command is under
+[Booting the installed root](#booting-the-installed-root-narfdisksroot-ro--root-rw)).
+The gate passes `--bootlog-token <token>`. The resulting command line is
 printed in the `topology` row, for example:
 
 ```
@@ -995,21 +1014,22 @@ means rebooting and taking the default entry.
 First trial, read-only:
 
 ```text
-root=UUID=653602c3-cd42-420e-95ef-4c4033d17b56 rootflags=subvol=/@ systemd_pid1 narf.disks=root-ro systemd.unit=multi-user.target
+narf.disks=root-ro root=UUID=653602c3-cd42-420e-95ef-4c4033d17b56 rootflags=subvol=/@ systemd_pid1 systemd.unit=multi-user.target fsck.mode=skip
 ```
 
 Read-write, after the root-ro trial worked:
 
 ```text
-root=UUID=653602c3-cd42-420e-95ef-4c4033d17b56 rootflags=subvol=/@ systemd_pid1 narf.disks=root-rw systemd.unit=multi-user.target
+narf.disks=root-rw root=UUID=653602c3-cd42-420e-95ef-4c4033d17b56 rootflags=subvol=/@ systemd_pid1 systemd.unit=multi-user.target fsck.mode=skip
 ```
 
-`cargo xtask grub-image --root-policy root-ro|root-rw --root-uuid <uuid>`
-writes the first four tokens (see
-[Booting the installed root](#booting-the-installed-root-narfdisksroot-ro--root-rw)).
-Add `systemd.unit=multi-user.target` yourself for the first trials: the host
-defaults to `graphical.target` (plasmalogin), and the KDE session is not part
-of this recipe. `rootflags=subvol=@` (no slash) and `rootflags=subvolid=256`
+`cargo xtask grub-image --root-policy root-ro|root-rw --root-uuid <uuid>
+--cmdline-extra "systemd.unit=multi-user.target fsck.mode=skip"` writes these
+lines (see
+[Booting the installed root](#booting-the-installed-root-narfdisksroot-ro--root-rw)
+for the full command). Use `systemd.unit=multi-user.target` for the first
+trials: the host defaults to `graphical.target` (plasmalogin), and the KDE
+session is not part of this recipe. `rootflags=subvol=@` (no slash) and `rootflags=subvolid=256`
 are accepted too. `ro` / `rw` on the command line follow Linux: the last one
 wins. Under `root-ro` the root is always read-only. Under `root-rw` it is
 mounted writable unless the command line says `ro`.

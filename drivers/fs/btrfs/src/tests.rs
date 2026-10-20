@@ -3320,6 +3320,44 @@ fn smoke_btrfs_cow_overwrite_roundtrip() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_cow_overwrite_roundtrip);
 
+/// Every open of a btrfs file is its own node, but `MAP_SHARED` pages are
+/// keyed by `mmap_backing_identity`: two opens of one inode must report the
+/// same identity (journald's writing mapping and journalctl's reading one
+/// share pages, as on Linux), and different inodes must not.
+fn smoke_btrfs_mmap_identity_is_per_inode() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let vol = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture failed to mount"),
+    };
+    let open = |name: &str| match poll_once(vol.root().lookup_async(name)) {
+        Some(Ok(f)) => Some(f),
+        _ => None,
+    };
+    let (Some(first), Some(second), Some(other)) =
+        (open("big.dat"), open("big.dat"), open("hello.txt"))
+    else {
+        return TestResult::Fail("fixture lookups failed");
+    };
+    if alloc::sync::Arc::ptr_eq(&first, &second) {
+        return TestResult::Fail("expected two distinct opens of big.dat");
+    }
+    if first.mmap_backing_identity() != second.mmap_backing_identity() {
+        return TestResult::Fail("two opens of one inode report different mmap identities");
+    }
+    if first.mmap_backing_identity() == other.mmap_backing_identity() {
+        return TestResult::Fail("two inodes share an mmap identity");
+    }
+    let identity = first.mmap_backing_identity();
+    drop(first);
+    if second.mmap_backing_identity() != identity {
+        return TestResult::Fail("the identity changed while an open of the inode was alive");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_mmap_identity_is_per_inode);
+
 fn smoke_btrfs_write_rejections() -> TestResult {
     use narf_filesystem::{FsError, FsInstance};
     let vol = match mount_fixture() {

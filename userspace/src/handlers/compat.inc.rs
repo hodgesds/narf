@@ -2059,8 +2059,8 @@ impl narf_filesystem::FileOps for CurrentTtyFile {
         self.inner.poll_readiness_at(offset)
     }
 
-    fn acknowledge_poll_readiness(&self, readiness: u32) {
-        self.inner.acknowledge_poll_readiness(readiness);
+    fn acknowledge_poll_readiness(&self, readiness: u32) -> u32 {
+        self.inner.acknowledge_poll_readiness(readiness)
     }
 
     fn tty_id(&self) -> Option<u32> {

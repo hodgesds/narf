@@ -144,7 +144,11 @@ pub fn mint_for(pid: u64, tid: u64, assume_alive: bool) -> Arc<PidFdState> {
         // screen). Orphan the stale row (its existing `Arc` holders — pidfds
         // opened against the OLD process — keep reporting that process's exit)
         // and fall through to mint a fresh, un-signalled row.
-        if !(assume_alive && existing.exited.load(Ordering::Acquire)) {
+        // An exited row recorded for THIS process (its leader TaskId, which
+        // is never recycled) is not stale: the process is a zombie and a
+        // pidfd opened on it now must be born readable.
+        let same_process = tid != 0 && existing.tid.load(Ordering::Acquire) == tid;
+        if !(assume_alive && existing.exited.load(Ordering::Acquire)) || same_process {
             return existing.clone();
         }
         // else: stale `exited=true` row for a recycled pid now assigned to a
@@ -205,6 +209,41 @@ pub fn notify_thread_exit(tid: u64) {
         st.readiness.set(POLL_IN, 0);
         narf_net::readiness::notify(0);
     }
+}
+
+/// A parented process exited and its reap entry is published: flip every
+/// pidfd minted on it, and, when none exists yet, record the exit so a
+/// `pidfd_open` that races it is born readable.
+///
+/// That race is how udev hung: systemd's `pidref_safe_fork` forks a RUN
+/// program and only then calls `pidfd_open(pid)`. `udevadm trigger` with no
+/// matches exits within milliseconds, so on SMP it can exit before the
+/// parent opens the pidfd. The pidfd was minted `exited = false` for a
+/// zombie, its EPOLLIN never fired, and the udev worker waited out its
+/// 180 s spawn timeout with the device's database still carrying
+/// `ID_PROCESSING=1`. systemd treats such a device as not ready, so the
+/// root's `/dev/disk/by-uuid` unit timed out and the boot fell back to
+/// emergency mode. Linux keeps the pid's exit state in `struct pid`, so its
+/// pidfd is readable however late it is opened.
+///
+/// `leader_tid` is the exiting process's leader TaskId; it is what
+/// `pidfd_open` matches the recorded row against. The row goes when the pid
+/// is released (`forget_pid`).
+pub fn notify_process_exit(pid: u64, leader_tid: u64) -> bool {
+    let record = (leader_tid != 0).then(|| PidFdState::new(pid, leader_tid, true));
+    {
+        let mut g = PIDFD_TABLE.lock();
+        let map = g.get_or_insert_with(BTreeMap::new);
+        if let alloc::collections::btree_map::Entry::Vacant(slot) = map.entry(pid) {
+            if let Some(record) = record {
+                slot.insert(record);
+            }
+            drop(g);
+            narf_net::readiness::notify(0);
+            return false;
+        }
+    }
+    notify_exit(pid)
 }
 
 pub fn notify_exit(pid: u64) -> bool {

@@ -94,12 +94,32 @@ const CHECK_COMMANDS: &[&str] = &[
     "/usr/lib/systemd/systemd-random-seed save 2>&1 | head -n 3 | sed 's/^/NARF-RANDOM-SEED /'",
     "ldconfig 2>&1 | head -n 3 | sed 's/^/NARF-LDCONFIG /'",
     "journalctl -b --no-pager -o cat _SYSTEMD_UNIT=systemd-sysusers.service | head -n 3 | sed 's/^/NARF-JOURNAL-UNIT /'",
+    "echo NARF-JOURNAL-U $(journalctl -q -b -o cat -u systemd-journald.service | wc -l)",
     "timeout 5 /usr/lib/systemd/systemd-oomd 2>&1 | head -n 5 | sed 's/^/NARF-OOMD /'",
     "journalctl -b --no-pager -p warning -o cat | tail -n 40",
     "sed 's/^/NARF-MI /' /proc/1/mountinfo",
     "journalctl -b --no-pager -o cat _PID=1 | grep -iE 'mountinfo|libmount|mount table|monitor' | tail -n 25 | sed 's/^/NARF-PID1 /'",
     "echo NARF-CACHYOS-ROOT-$((40+2))-DONE",
 ];
+
+/// systemd's verdict when a mount helper succeeded but PID 1 never saw the
+/// mount appear in `/proc/self/mountinfo` (a lost libmount change edge).
+const NO_MOUNT_MARKER: &str = "Mount process finished, but there is no mount";
+
+/// Power-off waited on a unit stop job: a scope whose cgroup emptied without
+/// systemd being told (the `cgroup.events` inotify edge) sits out its whole
+/// stop timeout.
+const STOP_JOB_MARKER: &str = "A stop job is running for";
+
+/// `NARF-JOURNAL-U <n>`: the lines `journalctl -u systemd-journald` printed,
+/// or `None` when the report has no such line (a mistyped command).
+fn journal_unit_lines(report: &str) -> Option<usize> {
+    report.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("NARF-JOURNAL-U ")
+            .and_then(|n| n.trim().parse().ok())
+    })
+}
 
 const PANIC_MARKERS: &[&str] = &[
     "*** KERNEL PANIC ***",
@@ -311,6 +331,14 @@ fn boot_and_login(args: &Args) -> Result<()> {
         }
         wait_for(&[DONE_MARKER], mark, 180, &mut serial)?;
         print_report(&serial[mark..]);
+        if serial.contains(NO_MOUNT_MARKER) {
+            bail!("systemd lost a mount: \"{NO_MOUNT_MARKER}\"");
+        }
+        // journald attributes each message to its unit; `journalctl -u`
+        // finding nothing means the journal's field index is unreadable.
+        if journal_unit_lines(&strip_escapes(&serial[mark..])) == Some(0) {
+            bail!("journalctl -u systemd-journald returned no entries");
+        }
         if args.no_poweroff {
             return Ok(());
         }
@@ -363,6 +391,9 @@ fn boot_and_login(args: &Args) -> Result<()> {
             .count();
         if !errors.is_empty() {
             bail!("unclean shutdown ({} error line(s))", errors.len());
+        }
+        if let Some(line) = shutdown.lines().find(|l| l.contains(STOP_JOB_MARKER)) {
+            bail!("power-off waited on a stop job: {}", line.trim());
         }
         if shn < 2 {
             bail!("only {shn} of 2 NVMe controllers completed CC.SHN");
@@ -521,6 +552,18 @@ mod tests {
             strip_escapes("\u{1b}]3008;start=x;type=shell\u{1b}\\NARF-VIRT kvm\r\n\u{1b}[?2004h"),
             "NARF-VIRT kvm\n"
         );
+    }
+
+    #[test]
+    fn journal_unit_count_is_read_from_the_report() {
+        assert_eq!(
+            journal_unit_lines("  NARF-STATE running\n  NARF-JOURNAL-U 12\n"),
+            Some(12)
+        );
+        assert_eq!(journal_unit_lines("NARF-JOURNAL-U 0"), Some(0));
+        // A mistyped command leaves no verdict rather than a false zero.
+        assert_eq!(journal_unit_lines("NARF-STATE running\n"), None);
+        assert_eq!(journal_unit_lines("NARF-JOURNAL-U \n"), None);
     }
 
     #[test]

@@ -134,7 +134,7 @@ impl FileOps for PidExtFile {
         ready
     }
 
-    fn acknowledge_poll_readiness(&self, readiness: u32) {
+    fn acknowledge_poll_readiness(&self, readiness: u32) -> u32 {
         if matches!(self.field, PidExtField::Mountinfo)
             && readiness & (crate::POLL_PRI | crate::POLL_ERR) != 0
         {
@@ -144,7 +144,9 @@ impl FileOps for PidExtFile {
             // leave the edge available for the monitor to drain.
             self.mountinfo_generation
                 .store(hook_ns_mountinfo_generation(self.pid), Ordering::Release);
+            return crate::POLL_PRI | crate::POLL_ERR;
         }
+        0
     }
 
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {

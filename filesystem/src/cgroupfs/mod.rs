@@ -379,6 +379,25 @@ impl Cgroup {
         self.events_gen.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// This cgroup's path inside the hierarchy: `""` for the root,
+    /// otherwise `/a/b`.
+    fn rel_path(&self) -> String {
+        let mut parts: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+        let mut cur = Some(self);
+        while let Some(c) = cur {
+            if !c.name.is_empty() {
+                parts.push(&c.name);
+            }
+            cur = c.parent.as_deref();
+        }
+        let mut path = String::new();
+        for seg in parts.iter().rev() {
+            path.push('/');
+            path.push_str(seg);
+        }
+        path
+    }
+
     /// Absolute path of this cgroup's directory under `/sys/fs/cgroup`.
     ///
     /// Built by walking to the root, since inotify watches are keyed by
@@ -429,9 +448,22 @@ impl Cgroup {
             //
             // Fired for ancestors too (this walks up), because systemd
             // watches each cgroup directory it manages, not just the leaf.
-            let mut path = self.abs_path();
-            path.push_str("/cgroup.events");
-            crate::notify_modify(&path);
+            //
+            // inotify watches are keyed by the watcher's host-view path, so
+            // the event goes out under EVERY place the hierarchy is mounted.
+            // An installed-root boot runs systemd chrooted at /mnt, where it
+            // watches /mnt/sys/fs/cgroup/<unit>/cgroup.events; an event
+            // published only under /sys/fs/cgroup never matched, so systemd
+            // missed every scope emptying and sat out the stop timeout
+            // (session-c1.scope: "A stop job is running ... (10s / 10s)" at
+            // every power-off, with its cgroup long empty).
+            let rel = self.rel_path();
+            for mount in cgroup_mount_points() {
+                let mut path = mount;
+                path.push_str(&rel);
+                path.push_str("/cgroup.events");
+                crate::notify_modify(&path);
+            }
             if CGEVT_TRACE.load(Ordering::Relaxed) {
                 use core::fmt::Write as _;
                 let _ = writeln!(
@@ -447,6 +479,28 @@ impl Cgroup {
             p.notify_events();
         }
     }
+}
+
+/// Every global mount point of the cgroup2 hierarchy (`/sys/fs/cgroup`,
+/// and e.g. `/mnt/sys/fs/cgroup` for a chrooted distro PID 1), or the
+/// canonical `/sys/fs/cgroup` when none is registered (early boot, model
+/// tests). There is one hierarchy, so every mount shows the same tree.
+fn cgroup_mount_points() -> alloc::vec::Vec<String> {
+    let mut points: alloc::vec::Vec<String> = crate::registry()
+        .list_with_names()
+        .into_iter()
+        .filter(|(_, name)| name == "cgroup2")
+        .map(|(path, _)| {
+            let trimmed = path.trim_end_matches('/');
+            String::from(trimmed)
+        })
+        .collect();
+    points.sort();
+    points.dedup();
+    if points.is_empty() {
+        points.push(String::from("/sys/fs/cgroup"));
+    }
+    points
 }
 
 // ── Global tree + reverse index ─────────────────────────────────────

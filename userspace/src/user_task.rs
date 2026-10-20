@@ -1550,6 +1550,19 @@ fn park_should_block(
             uc.console_read_pending.store(false, Ordering::Release);
             return false; // a byte is ready → re-execute the read
         }
+        // A tty read is interruptible: a signal ends the park and the
+        // return-to-user delivery runs it against the rewound (restart-
+        // pending) read — -EINTR without SA_RESTART, termination for a
+        // fatal default action. Parking only on input left a login shell
+        // that systemd SIGHUP/SIGTERMs at power-off (bash ignores neither
+        // while idle at its prompt) asleep until a keystroke, and its
+        // session scope sat out the whole stop timeout.
+        crate::handlers::register_signal_waker(task_id, waker.clone());
+        if crate::handlers::has_interrupting_signal(task_id) {
+            crate::handlers::drop_signal_waker(task_id);
+            uc.console_read_pending.store(false, Ordering::Release);
+            return false;
+        }
         // ALSO arm a ~1-tick wheel fallback: the serial/keyboard byte-waker is a
         // single non-Arc registry slot, so a dropped/overwritten byte-ring wake
         // would otherwise wedge the reader (e.g. getty/login at boot) forever.
@@ -2999,10 +3012,16 @@ impl core::future::Future for UserTaskFuture {
         // keystroke, so the executor can halt instead of busy-polling.
         if this.task.uctx.console_read_pending.load(Ordering::Acquire) {
             narf_input::register_byte_waker(cx.waker());
+            // A signal interrupts the tty read too (see `park_should_block`).
+            let signal_task = crate::handlers::current_task_id();
+            crate::handlers::register_signal_waker(signal_task, cx.waker().clone());
             // pending_input() (serial bytes + keyboard keys), not
             // pending_bytes() — the unified discipline drains both rings,
             // so a keystroke alone must un-park a blocked console read.
-            if narf_input::pending_input() > 0 {
+            if narf_input::pending_input() > 0
+                || crate::handlers::has_interrupting_signal(signal_task)
+            {
+                crate::handlers::drop_signal_waker(signal_task);
                 this.task
                     .uctx
                     .console_read_pending

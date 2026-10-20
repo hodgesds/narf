@@ -236,6 +236,9 @@ pub struct BtrfsNode<B: BlockDevice + 'static> {
     /// The file size as of this node's latest write: `inode` is the item as
     /// looked up, and `stat` has no tree access.
     live_size: core::sync::atomic::AtomicU64,
+    /// This inode's shared `MAP_SHARED` identity, taken on first use (see
+    /// [`crate::volume::MmapAnchor`]).
+    mmap_anchor: narf_lib::sync::OnceLock<Arc<crate::volume::MmapAnchor>>,
 }
 
 impl<B: BlockDevice + 'static> BtrfsNode<B> {
@@ -252,6 +255,7 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
             ino,
             live_size: core::sync::atomic::AtomicU64::new(inode.size),
             inode: narf_lib::sync::IrqSafeSpinLock::new(inode),
+            mmap_anchor: narf_lib::sync::OnceLock::new(),
         })
     }
 
@@ -269,6 +273,7 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
             ino,
             live_size: core::sync::atomic::AtomicU64::new(inode.size),
             inode: narf_lib::sync::IrqSafeSpinLock::new(inode),
+            mmap_anchor: narf_lib::sync::OnceLock::new(),
         })
     }
 
@@ -890,6 +895,20 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
 
     fn ino(&self) -> u64 {
         self.ino
+    }
+
+    /// One identity per inode, not per open: two opens of a journal file
+    /// (journald writing, `journalctl` reading) must map the same
+    /// `MAP_SHARED` pages, as they share one page cache on Linux.
+    fn mmap_backing_identity(&self) -> usize {
+        let Ok(vol) = self.volume() else {
+            return self as *const Self as *const () as usize;
+        };
+        let anchor = self.mmap_anchor.get_or_init(|| {
+            let tree = self.tree_id.unwrap_or_else(|| vol.fs_tree_id());
+            vol.mmap_anchor(tree, self.ino)
+        });
+        Arc::as_ptr(anchor) as *const () as usize
     }
 
     fn owners(&self) -> (u32, u32) {

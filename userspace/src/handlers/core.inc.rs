@@ -15953,7 +15953,10 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
     // one delivery then disarm — must find the entry when it calls
     // `waitid(P_PIDFD)`, or the oneshot is spent and never re-fires. Ordered
     // exactly like the SIGCHLD and wait4 wakes below (all post-push).
-    let _pidfd_found = crate::pidfd::notify_exit(child_pid);
+    let _pidfd_found = crate::pidfd::notify_process_exit(
+        child_pid,
+        pid_to_task_raw(child_pid).unwrap_or(child_tid),
+    );
     // Diagnostic: a `pidfd_found=false` for a comm systemd pidfd_spawn'd means
     // the pidfd was minted under a DIFFERENT pid than the exit reports (its
     // POLLIN-on-exit never fires; systemd supervises a ghost). Pairs with the

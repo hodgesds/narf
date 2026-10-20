@@ -1500,7 +1500,14 @@ pub trait FileOps: Send + Sync {
     /// epoll's poll method) must not call this: some procfs sources expose a
     /// per-open-file change edge which is consumed only by the monitor that
     /// receives the event.
-    fn acknowledge_poll_readiness(&self, _readiness: u32) {}
+    ///
+    /// Returns the readiness bits the acknowledgement consumed (the change
+    /// edge it retired), so an edge-triggered multiplexer records the
+    /// post-delivery mask: a later change raises those bits again and is a
+    /// fresh edge. Sources without a change edge return 0.
+    fn acknowledge_poll_readiness(&self, _readiness: u32) -> u32 {
+        0
+    }
 
     /// Absolute monotonic-ns instant at which this file will *next*
     /// become readable purely on its own timed schedule, if any.

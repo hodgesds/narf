@@ -1284,8 +1284,8 @@ impl FileOps for OverlayFile {
         self.active().poll_readiness_at(offset)
     }
 
-    fn acknowledge_poll_readiness(&self, readiness: u32) {
-        self.active().acknowledge_poll_readiness(readiness);
+    fn acknowledge_poll_readiness(&self, readiness: u32) -> u32 {
+        self.active().acknowledge_poll_readiness(readiness)
     }
 
     fn poll_deadline(&self) -> Option<u64> {
