@@ -4004,11 +4004,17 @@ pub unsafe fn spawn_display_monitor(config: crate::amdgpu_navi48_boot::Configura
                     }
                 }
                 Err(e) => {
-                    // The failed owner stays quarantined where it stopped.
+                    // The failed owner stays quarantined where it stopped;
+                    // only a whole-device reset can reconcile its hardware.
+                    // Recovery relights through a fresh monitor.
                     let _ = writeln!(
                         narf_console::Writer,
                         "amdgpu: navi48 display monitor stopped: {e:?}"
                     );
+                    let submitter = SUBMITTER.lock().clone();
+                    if let Some(submitter) = submitter {
+                        submitter.request_device_recovery("display owner quarantined");
+                    }
                     return;
                 }
             }

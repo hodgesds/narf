@@ -5508,7 +5508,8 @@ writer and exclude external PCI/firmware owners. As for RX 6000 (Linux
 `amdgpu.gpu_recovery` on a dGPU), `unsafe set_automatic_recovery(bool)`
 (enabled by the fb boot handoff unless `amdgpu.gpu_recovery=0`) lets the
 watchdog start it after a failed ring reset or a terminal fault (poison,
-lost interrupts, refused coordinated recovery), once per submitter
+lost interrupts, refused coordinated recovery) or after the display monitor
+stops with a quarantined display owner, once per submitter
 generation and at most `MAX_AUTOMATIC_RECOVERIES` (3) times per boot, since
 each recovery quarantines the old owners' VRAM. `set_recovery_console_hook`
 pauses kernel boot-framebuffer writers for the reset; a lost device leaves
