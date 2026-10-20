@@ -1215,8 +1215,8 @@ fn navi48_modeset_decides_uhbr_like_linux() -> TestResult {
     };
     if dp_link(&edge, DpCaps { fec: false, ..fec }) != Some((4, Legacy(LinkRate::Hbr2)))
         || dp_link(&edge, fec).is_some()
-        || !dp_fits(&timing(698_400, 3840), fec, 4, Legacy(LinkRate::Hbr2))
-        || dp_fits(&timing(698_401, 3840), fec, 4, Legacy(LinkRate::Hbr2))
+        || !dp_fits_bpc(&timing(698_400, 3840), fec, 4, Legacy(LinkRate::Hbr2), 8)
+        || dp_fits_bpc(&timing(698_401, 3840), fec, 4, Legacy(LinkRate::Hbr2), 8)
     {
         return TestResult::Fail("8b/10b FEC bandwidth");
     }

@@ -1249,11 +1249,8 @@ pub fn stream_kbps_bpc(timing: &Timing, uhbr: bool, bpc: u8) -> u64 {
     (kbps * bits.div_ceil(128) * 128).div_ceil(bits)
 }
 
-/// Whether `lanes` at `rate` carries `timing` on a link with `caps`.
-pub fn dp_fits(timing: &Timing, caps: DpCaps, lanes: u8, rate: DpRate) -> bool {
-    dp_fits_bpc(timing, caps, lanes, rate, 8)
-}
-/// `dp_fits` for RGB at `bpc`.
+/// Whether `lanes` at `rate` carries `timing` as RGB at `bpc` on a link
+/// with `caps`.
 pub fn dp_fits_bpc(timing: &Timing, caps: DpCaps, lanes: u8, rate: DpRate, bpc: u8) -> bool {
     let have = match rate {
         DpRate::Legacy(r) => legacy_kbps(lanes, r, caps.fec),
@@ -1262,14 +1259,16 @@ pub fn dp_fits_bpc(timing: &Timing, caps: DpCaps, lanes: u8, rate: DpRate, bpc: 
     stream_kbps_bpc(timing, caps.uhbr != 0, bpc) <= have
 }
 
-/// The link a DP mode lights on: the sink's maximum 8b/10b link when that
-/// carries it; otherwise 128b/132b only as Linux's decide_dp_link_settings
-/// reaches it, searching upward (lanes first, then rate) past every 8b/10b
-/// setting for the first UHBR setting that carries the mode.
+/// `dp_link_bpc` at 8 bpc.
+#[cfg(feature = "kernel-test")]
 pub fn dp_link(timing: &Timing, caps: DpCaps) -> Option<(u8, DpRate)> {
     dp_link_bpc(timing, caps, 8)
 }
-/// `dp_link` for RGB at `bpc`.
+/// The link a DP mode lights on as RGB at `bpc`: the sink's maximum 8b/10b
+/// link when that carries it; otherwise 128b/132b only as Linux's
+/// decide_dp_link_settings reaches it, searching upward (lanes first, then
+/// rate) past every 8b/10b setting for the first UHBR setting that carries
+/// the mode.
 pub fn dp_link_bpc(timing: &Timing, caps: DpCaps, bpc: u8) -> Option<(u8, DpRate)> {
     let legacy = DpRate::Legacy(caps.rate);
     if dp_fits_bpc(timing, caps, caps.lanes, legacy, bpc) {
@@ -1347,7 +1346,7 @@ fn dsc_fits(
 }
 
 /// The link a DSC stream lights on, as for an uncompressed one
-/// (`dp_link`) but for its compressed bandwidth, which Linux's
+/// (`dp_link_bpc`) but for its compressed bandwidth, which Linux's
 /// link_decide_link_settings takes from the DSC config: the sink's maximum
 /// 8b/10b link (with FEC) when that carries it, else the first 128b/132b
 /// setting upward, lanes before rate.
