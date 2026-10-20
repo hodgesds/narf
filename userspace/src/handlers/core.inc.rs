@@ -14080,6 +14080,17 @@ pub(crate) fn park_reexecute_on_io(ctx: &mut dyn TrapContext) -> bool {
     park_reexecute_on_io_until(ctx, deadline, false)
 }
 
+/// Whether this syscall can park its task and re-execute (the precondition
+/// [`park_reexecute_on_io_until`] checks): false in kernel-test and nested
+/// contexts, which have to wait in place instead.
+pub(crate) fn can_park_reexecute() -> bool {
+    crate::user_task::current_user_task().is_some()
+        && crate::epoll::can_park_with_task_context(
+            narf_scheduler::stackful::user_own_stack_enabled(),
+            crate::user_task::yield_hook().is_some(),
+        )
+}
+
 /// Common net-I/O park setup. A durable per-fd [`Readiness`] arm passes
 /// `u64::MAX` with `durable_io_wait`: its arm-vs-set lock closes the lost-wake
 /// window, so a periodic retry would only create timer interrupts and spurious

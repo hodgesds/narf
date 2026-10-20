@@ -187,6 +187,19 @@ pub(super) fn socket_block(
     timeo: Option<u64>,
     resumed: Option<u64>,
 ) {
+    socket_block_with(ctx, sock, interest, timeo, resumed, EAGAIN);
+}
+
+/// [`socket_block`] with the errno a timed-out wait returns: EAGAIN for the
+/// data waits, the state-switch err for `inet_wait_for_connect`.
+pub(super) fn socket_block_with(
+    ctx: &mut dyn TrapContext,
+    sock: &crate::socket::SocketFile,
+    interest: u32,
+    timeo: Option<u64>,
+    resumed: Option<u64>,
+    timeout_errno: i64,
+) {
     use core::sync::atomic::Ordering;
     let Some(timeo_ns) = crate::socket::timeo_ns(timeo) else {
         if park_reexecute_on_fd(ctx, sock, interest) {
@@ -200,7 +213,7 @@ pub(super) fn socket_block(
     let now = narf_scheduler::narf_time::monotonic_ns();
     let deadline = resumed.unwrap_or_else(|| now.saturating_add(timeo_ns));
     if timeo_ns == 0 || now >= deadline {
-        ctx.set_return(errno_ret(EAGAIN));
+        ctx.set_return(errno_ret(timeout_errno));
         return;
     }
     if has_interrupting_signal(current_task_id()) {
@@ -227,7 +240,7 @@ pub(super) fn socket_block(
         return;
     }
     let _ = sock_timeo_take(ctx, sock);
-    ctx.set_return(errno_ret(EAGAIN));
+    ctx.set_return(errno_ret(timeout_errno));
 }
 
 /// Bytes the same blocking stream call (same syscall return address and

@@ -884,6 +884,14 @@ pub struct SocketFile {
     /// O_NONBLOCK — flipped by sys_fcntl(F_SETFL). recv/send/accept/
     /// connect short-circuit to WouldBlock instead of yielding.
     nonblock: AtomicBool,
+    /// `sock->state == SS_CONNECTING`: a kernel-TCP `connect(2)` started the
+    /// handshake and no `connect(2)` has observed its outcome yet.
+    inet_connecting: AtomicBool,
+    /// What a blocking `connect(2)` parked on the handshake returns if
+    /// `SO_SNDTIMEO` runs out: EINPROGRESS for the call that started the
+    /// connect, EALREADY for one that joined it (`__inet_stream_connect`
+    /// keeps the err of its state switch). Kept across the re-executions.
+    connect_timeo_errno: core::sync::atomic::AtomicI32,
     /// Pending async error. connect/send/recv set on failure;
     /// getsockopt(SO_ERROR) consumes (returns + clears) it.
     pending_error: IrqSafeSpinLock<Option<SockError>>,
@@ -1972,6 +1980,8 @@ impl SocketFile {
             state: IrqSafeSpinLock::new(state),
             options: IrqSafeSpinLock::new(SockOptions::default()),
             nonblock: AtomicBool::new(false),
+            inet_connecting: AtomicBool::new(false),
+            connect_timeo_errno: core::sync::atomic::AtomicI32::new(0),
             pending_error: IrqSafeSpinLock::new(None),
             inet_err_queue: IrqSafeSpinLock::new(VecDeque::new()),
             inet_err_ancillary: IrqSafeSpinLock::new(BTreeMap::new()),
@@ -3245,10 +3255,11 @@ impl SocketFile {
                 ..
             } => Some(make_sockaddr_in(*peer_addr, *peer_port)),
             SocketState::InetWired {
+                tcb_id,
                 peer_addr,
                 peer_port,
-                ..
-            } => Some(make_sockaddr_in(*peer_addr, *peer_port)),
+            } => narf_net::tcp_stack::has_peer_name(*tcb_id)
+                .then(|| make_sockaddr_in(*peer_addr, *peer_port)),
             SocketState::InetDgram {
                 peer: Some((a, p)), ..
             } => Some(make_sockaddr_in(*a, *p)),
@@ -3277,10 +3288,11 @@ impl SocketFile {
                 ..
             } => Some(make_sockaddr_in6(*peer_addr, *peer_port)),
             SocketState::Inet6Wired {
+                tcb_id,
                 peer_addr,
                 peer_port,
-                ..
-            } => Some(make_sockaddr_in6(*peer_addr, *peer_port)),
+            } => narf_net::tcp_stack::has_peer_name(*tcb_id)
+                .then(|| make_sockaddr_in6(*peer_addr, *peer_port)),
             _ => None,
         }
     }
@@ -4477,6 +4489,16 @@ impl SocketFile {
                 }
                 if narf_net::tcp_stack::writable(*tcb_id) {
                     bits |= narf_filesystem::POLL_OUT;
+                }
+                // `tcp_poll`: EPOLLERR while an error is pending, EPOLLHUP
+                // once TCP_CLOSE — how a failed non-blocking connect(2)
+                // reports (with IN|OUT, as `tcp_done` shut both ways).
+                let (err, hup) = narf_net::tcp_stack::poll_err_hup(*tcb_id);
+                if err {
+                    bits |= narf_filesystem::POLL_ERR;
+                }
+                if hup {
+                    bits |= narf_filesystem::POLL_HUP;
                 }
                 // Reconcile the durable cell against this level so a socket the
                 // app just drained stops reporting readable in the cell (else a
@@ -7900,10 +7922,14 @@ impl SocketFile {
                     return SocketOpResult::Ok(0);
                 }
                 // The socket-state switch runs BEFORE `tcp_v4_connect` looks at
-                // the address: a connected socket is EISCONN, and so is a
-                // listener (`sk_state != TCP_CLOSE`). Checking state first also
-                // keeps a doomed connect from enqueueing a ghost server end on
-                // the target listener.
+                // the address: SS_CONNECTING reports the handshake, a
+                // connected socket is EISCONN, and so is a listener
+                // (`sk_state != TCP_CLOSE`). Checking state first also keeps a
+                // doomed connect from enqueueing a ghost server end on the
+                // target listener.
+                if let Some(r) = self.inet_connect_progress() {
+                    return r;
+                }
                 if !Self::inet_stream_connectable(&self.state.lock()) {
                     return SocketOpResult::Err(SockError::AlreadyConnected);
                 }
@@ -7940,26 +7966,27 @@ impl SocketFile {
                         if !is_loopback {
                             let ip_bytes = ip.to_be_bytes();
                             let syn_retries = self.options.lock().tcp_syncnt as u8;
-                            match narf_net::tcp_stack::connect_errno_with_options_in(
+                            // `tcp_v4_connect` sends the SYN and returns; the
+                            // handshake is waited for (or not) by the caller.
+                            match narf_net::tcp_stack::connect_start_in(
                                 self.net_ns_id(),
                                 ip_bytes,
                                 port,
                                 narf_net::tcp_stack::ConnectOptions { syn_retries },
                             ) {
                                 Ok(tcb_id) => {
-                                    self.apply_tcp_options_to_tcb(tcb_id);
-                                    let mut state = self.state.lock();
-                                    if Self::inet_stream_connectable(&state) {
-                                        *state = SocketState::InetWired {
+                                    let r = self.inet_connect_begun(
+                                        tcb_id,
+                                        SocketState::InetWired {
                                             tcb_id,
                                             peer_addr: ip,
                                             peer_port: port,
-                                        };
-                                        drop(state);
+                                        },
+                                    );
+                                    if matches!(r, SocketOpResult::Err(SockError::InProgress)) {
                                         self.inet_tcp_release_port();
-                                        return SocketOpResult::Ok(0);
                                     }
-                                    return SocketOpResult::Err(SockError::AlreadyConnected);
+                                    return r;
                                 }
                                 // ENETUNREACH / EHOSTUNREACH / ECONNREFUSED /
                                 // ETIMEDOUT / ICMP-derived, as Linux reports.
@@ -8089,6 +8116,86 @@ impl SocketFile {
         }
     }
 
+    /// `__inet_stream_connect`'s SS_CONNECTING case, for a kernel-TCP connect
+    /// already under way; `None` when the socket is not connecting. Still in
+    /// the handshake: EALREADY (a blocking caller then waits on it, see
+    /// `sys_socket_connect`). Established: SS_CONNECTED and 0 — the next
+    /// connect is EISCONN. TCP_CLOSE: `sock_error()` (or ECONNABORTED), and
+    /// the socket is unconnected again, free to connect anew.
+    pub(crate) fn inet_connect_progress(&self) -> Option<SocketOpResult> {
+        if !self.inet_connecting.load(Ordering::Acquire) {
+            return None;
+        }
+        let id = match &*self.state.lock() {
+            SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } => {
+                *tcb_id
+            }
+            _ => {
+                self.inet_connecting.store(false, Ordering::Release);
+                return None;
+            }
+        };
+        use narf_net::tcp_stack::ConnectStatus;
+        Some(match narf_net::tcp_stack::connect_status(id) {
+            ConnectStatus::InProgress => {
+                SocketOpResult::Err(SockError::Stack(errno::EALREADY as i32))
+            }
+            ConnectStatus::Connected => {
+                self.inet_connecting.store(false, Ordering::Release);
+                SocketOpResult::Ok(0)
+            }
+            ConnectStatus::Failed(e) => {
+                self.inet_connecting.store(false, Ordering::Release);
+                {
+                    let mut state = self.state.lock();
+                    if matches!(
+                        &*state,
+                        SocketState::InetWired { tcb_id, .. }
+                            | SocketState::Inet6Wired { tcb_id, .. } if *tcb_id == id
+                    ) {
+                        *state = SocketState::Fresh;
+                    }
+                }
+                // `sk->sk_prot->disconnect`: nothing of the dead attempt stays.
+                narf_net::tcp_stack::remove_tcb(id);
+                narf_net::tcp_stack::release(id);
+                SocketOpResult::Err(SockError::from_stack(e))
+            }
+        })
+    }
+
+    /// SS_CONNECTING (see [`Self::inet_connect_progress`]).
+    pub(crate) fn inet_connect_pending(&self) -> bool {
+        self.inet_connecting.load(Ordering::Acquire)
+    }
+
+    /// See the `connect_timeo_errno` field.
+    pub(crate) fn connect_timeo_errno(&self) -> &core::sync::atomic::AtomicI32 {
+        &self.connect_timeo_errno
+    }
+
+    /// TCP_SYNCNT as set on this socket.
+    pub(crate) fn tcp_syncnt(&self) -> u8 {
+        self.options.lock().tcp_syncnt as u8
+    }
+
+    /// Record a kernel-TCP connect that `connect_start_in` began: the socket
+    /// is SS_CONNECTING with its TCB, and this connect returns EINPROGRESS (a
+    /// blocking caller then waits). A socket that stopped being connectable
+    /// meanwhile keeps its state; the new TCB is aborted and it is EISCONN.
+    fn inet_connect_begun(&self, tcb_id: u32, wired: SocketState) -> SocketOpResult {
+        self.apply_tcp_options_to_tcb(tcb_id);
+        let mut state = self.state.lock();
+        if !Self::inet_stream_connectable(&state) {
+            drop(state);
+            let _ = narf_net::tcp_stack::close_linger(tcb_id, true);
+            return SocketOpResult::Err(SockError::AlreadyConnected);
+        }
+        *state = wired;
+        self.inet_connecting.store(true, Ordering::Release);
+        SocketOpResult::Err(SockError::InProgress)
+    }
+
     /// `__inet_stream_connect`'s SS_UNCONNECTED + TCP_CLOSE case: a fresh or
     /// merely-bound socket may connect; anything else is EISCONN.
     fn inet_stream_connectable(state: &SocketState) -> bool {
@@ -8128,6 +8235,7 @@ impl SocketFile {
     /// connect(AF_UNSPEC) on a stream socket — `tcp_disconnect`: drop an
     /// established association or stop listening, keeping any bound port.
     fn inet_stream_disconnect(self: &Arc<Self>) {
+        self.inet_connecting.store(false, Ordering::Release);
         let mut state = self.state.lock();
         match &*state {
             SocketState::InetConnected { tx, rx, .. }
@@ -8928,6 +9036,9 @@ impl SocketFile {
                     self.inet_stream_disconnect();
                     return SocketOpResult::Ok(0);
                 }
+                if let Some(r) = self.inet_connect_progress() {
+                    return r;
+                }
                 if !Self::inet_stream_connectable(&self.state.lock()) {
                     return SocketOpResult::Err(SockError::AlreadyConnected);
                 }
@@ -8950,26 +9061,25 @@ impl SocketFile {
                     Some(l) => l,
                     None => {
                         let syn_retries = self.options.lock().tcp_syncnt as u8;
-                        match narf_net::tcp_stack::connect6_errno_with_options_in(
+                        match narf_net::tcp_stack::connect6_start_in(
                             self.net_ns_id(),
                             ip,
                             port,
                             narf_net::tcp_stack::ConnectOptions { syn_retries },
                         ) {
                             Ok(tcb_id) => {
-                                self.apply_tcp_options_to_tcb(tcb_id);
-                                let mut state = self.state.lock();
-                                if Self::inet_stream_connectable(&state) {
-                                    *state = SocketState::Inet6Wired {
+                                let r = self.inet_connect_begun(
+                                    tcb_id,
+                                    SocketState::Inet6Wired {
                                         tcb_id,
                                         peer_addr: ip,
                                         peer_port: port,
-                                    };
-                                    drop(state);
+                                    },
+                                );
+                                if matches!(r, SocketOpResult::Err(SockError::InProgress)) {
                                     self.inet6_release_port();
-                                    return SocketOpResult::Ok(0);
                                 }
-                                return SocketOpResult::Err(SockError::AlreadyConnected);
+                                return r;
                             }
                             Err(errno) => {
                                 return SocketOpResult::Err(SockError::from_stack(errno));
