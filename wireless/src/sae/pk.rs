@@ -61,6 +61,137 @@ fn base32_value(c: u8) -> Option<u8> {
     BASE32.iter().position(|&a| a == c).map(|p| p as u8)
 }
 
+// Base-32 checksum tables (hostap sae_pk.c, verbatim): the station's
+// password check and the AP-side generator both use them.
+#[rustfmt::skip]
+const D_MULT_TABLE: [u8; 1024] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0,
+    17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 16,
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1,
+    18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 16, 17,
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2,
+    19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 16, 17, 18,
+    4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3,
+    20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 16, 17, 18, 19,
+    5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4,
+    21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 16, 17, 18, 19, 20,
+    6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5,
+    22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 16, 17, 18, 19, 20, 21,
+    7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6,
+    23, 24, 25, 26, 27, 28, 29, 30, 31, 16, 17, 18, 19, 20, 21, 22,
+    8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7,
+    24, 25, 26, 27, 28, 29, 30, 31, 16, 17, 18, 19, 20, 21, 22, 23,
+    9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8,
+    25, 26, 27, 28, 29, 30, 31, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+    10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+    26, 27, 28, 29, 30, 31, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+    11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+    27, 28, 29, 30, 31, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+    12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+    28, 29, 30, 31, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+    13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+    29, 30, 31, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+    14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+    30, 31, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+    15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+    31, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+    16, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17,
+    0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1,
+    17, 16, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18,
+    1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2,
+    18, 17, 16, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19,
+    2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3,
+    19, 18, 17, 16, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20,
+    3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4,
+    20, 19, 18, 17, 16, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21,
+    4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5,
+    21, 20, 19, 18, 17, 16, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22,
+    5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6,
+    22, 21, 20, 19, 18, 17, 16, 31, 30, 29, 28, 27, 26, 25, 24, 23,
+    6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7,
+    23, 22, 21, 20, 19, 18, 17, 16, 31, 30, 29, 28, 27, 26, 25, 24,
+    7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8,
+    24, 23, 22, 21, 20, 19, 18, 17, 16, 31, 30, 29, 28, 27, 26, 25,
+    8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9,
+    25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 31, 30, 29, 28, 27, 26,
+    9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10,
+    26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 31, 30, 29, 28, 27,
+    10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11,
+    27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 31, 30, 29, 28,
+    11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12,
+    28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 31, 30, 29,
+    12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13,
+    29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 31, 30,
+    13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14,
+    30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 31,
+    14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15,
+    31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16,
+    15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
+];
+const D_PERM_TABLE: [u8; 32] = [
+    7, 2, 1, 30, 16, 20, 27, 11, 31, 6, 8, 13, 29, 5, 10, 21, 22, 3, 24, 0, 23, 25, 12, 9, 28, 14,
+    4, 15, 17, 18, 19, 26,
+];
+
+fn d_permute(mut val: u8, iter: u32) -> u8 {
+    for _ in 0..iter {
+        val = D_PERM_TABLE[val as usize];
+    }
+    val
+}
+
+fn d_invert(val: u8) -> u8 {
+    if val > 0 && val < 16 {
+        16 - val
+    } else {
+        val
+    }
+}
+
+/// Damm checksum character over a (possibly hyphenated) base-32 string;
+/// hyphens are skipped, as in hostap `d_check_char`.
+fn d_check_char(s: &[u8]) -> u8 {
+    let mut val = 0u8;
+    let mut iter = 1u32;
+    for &ch in s.iter().rev() {
+        let Some(c) = base32_value(ch) else {
+            continue;
+        };
+        let p = d_permute(c, iter);
+        iter += 1;
+        val = D_MULT_TABLE[val as usize * 32 + p as usize];
+    }
+    BASE32[d_invert(val) as usize]
+}
+
+/// hostap `sae_pk_valid_password`: the format rules, then the checksum
+/// character, then the same Sec_1b bit at the start of every group. Only a
+/// password passing all three selects SAE-PK; any other WPA3 password,
+/// even one shaped like groups of four base32 characters, is ordinary SAE.
+fn sae_pk_valid_password(password: &str) -> bool {
+    let pw = password.as_bytes();
+    if pw.len() < 14 || pw.len() % 5 != 4 {
+        return false;
+    }
+    for (i, &c) in pw.iter().enumerate() {
+        if i % 5 == 4 {
+            if c != b'-' {
+                return false;
+            }
+        } else if base32_value(c).is_none() {
+            return false;
+        }
+    }
+    if pw[pw.len() - 1] != d_check_char(&pw[..pw.len() - 1]) {
+        return false;
+    }
+    let sec_1b = |c: u8| base32_value(c).is_some_and(|v| v & 0x10 != 0);
+    let first = sec_1b(pw[0]);
+    pw.iter().step_by(5).all(|&c| sec_1b(c) == first)
+}
+
 /// Decode a SAE-PK password (hyphen-separated groups of four base32 chars) into
 /// the raw bit buffer, packed MSB-first, plus the base32 character count.
 fn base32_decode(password: &str) -> Option<(Vec<u8>, usize)> {
@@ -161,11 +292,11 @@ fn fingerprint_matches(hash: &[u8], sec: usize, fingerprint: &[u8], fp_bits: usi
     (0..fp_bits).all(|i| read_bit(hash, 8 * sec + i) == read_bit(fingerprint, i))
 }
 
-/// Whether `password` parses as a well-formed SAE-PK password (length class,
-/// 4-character groups, base32 alphabet). The caller uses this to decide that
-/// the SAE-PK AP-authentication path applies.
+/// Whether `password` is a SAE-PK password (hostap `sae_pk_valid_password`:
+/// format, checksum character and Sec_1b) carrying a fingerprint. The caller
+/// uses this to decide that the SAE-PK AP-authentication path applies.
 pub fn is_sae_pk_password(password: &str) -> bool {
-    password_fingerprint(password).is_some()
+    sae_pk_valid_password(password) && password_fingerprint(password).is_some()
 }
 
 /// Validate that `password` is the SAE-PK fingerprint of the AP public key
@@ -394,112 +525,8 @@ pub mod gen {
     use narf_crypto::p256::point::{scalar_mul_base, AffinePoint};
     use narf_crypto::p256::scalar::Scalar;
 
-    // Base-32 Damm quasigroup tables (hostap sae_pk.c, verbatim).
-    #[rustfmt::skip]
-    const D_MULT_TABLE: [u8; 1024] = [
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0,
-        17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 16,
-        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1,
-        18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 16, 17,
-        3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2,
-        19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 16, 17, 18,
-        4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3,
-        20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 16, 17, 18, 19,
-        5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4,
-        21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 16, 17, 18, 19, 20,
-        6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5,
-        22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 16, 17, 18, 19, 20, 21,
-        7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6,
-        23, 24, 25, 26, 27, 28, 29, 30, 31, 16, 17, 18, 19, 20, 21, 22,
-        8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7,
-        24, 25, 26, 27, 28, 29, 30, 31, 16, 17, 18, 19, 20, 21, 22, 23,
-        9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8,
-        25, 26, 27, 28, 29, 30, 31, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-        10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
-        26, 27, 28, 29, 30, 31, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-        11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-        27, 28, 29, 30, 31, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-        12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
-        28, 29, 30, 31, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-        13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
-        29, 30, 31, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
-        14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
-        30, 31, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
-        15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
-        31, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
-        16, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17,
-        0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1,
-        17, 16, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18,
-        1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2,
-        18, 17, 16, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19,
-        2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3,
-        19, 18, 17, 16, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20,
-        3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4,
-        20, 19, 18, 17, 16, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21,
-        4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5,
-        21, 20, 19, 18, 17, 16, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22,
-        5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6,
-        22, 21, 20, 19, 18, 17, 16, 31, 30, 29, 28, 27, 26, 25, 24, 23,
-        6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7,
-        23, 22, 21, 20, 19, 18, 17, 16, 31, 30, 29, 28, 27, 26, 25, 24,
-        7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8,
-        24, 23, 22, 21, 20, 19, 18, 17, 16, 31, 30, 29, 28, 27, 26, 25,
-        8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9,
-        25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 31, 30, 29, 28, 27, 26,
-        9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10,
-        26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 31, 30, 29, 28, 27,
-        10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11,
-        27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 31, 30, 29, 28,
-        11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12,
-        28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 31, 30, 29,
-        12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13,
-        29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 31, 30,
-        13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14,
-        30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 31,
-        14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15,
-        31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16,
-        15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
-    ];
-    const D_PERM_TABLE: [u8; 32] = [
-        7, 2, 1, 30, 16, 20, 27, 11, 31, 6, 8, 13, 29, 5, 10, 21, 22, 3, 24, 0, 23, 25, 12, 9, 28,
-        14, 4, 15, 17, 18, 19, 26,
-    ];
-
-    fn d_permute(mut val: u8, iter: u32) -> u8 {
-        for _ in 0..iter {
-            val = D_PERM_TABLE[val as usize];
-        }
-        val
-    }
-
-    fn d_invert(val: u8) -> u8 {
-        if val > 0 && val < 16 {
-            16 - val
-        } else {
-            val
-        }
-    }
-
-    /// Damm checksum character over a (possibly hyphenated) base-32 string;
-    /// hyphens are skipped, as in hostap `d_check_char`.
-    fn d_check_char(s: &[u8]) -> u8 {
-        let mut val = 0u8;
-        let mut iter = 1u32;
-        for &ch in s.iter().rev() {
-            let Some(c) = base32_value(ch) else {
-                continue;
-            };
-            let p = d_permute(c, iter);
-            iter += 1;
-            val = D_MULT_TABLE[val as usize * 32 + p as usize];
-        }
-        BASE32[d_invert(val) as usize]
-    }
-
-    /// Validate a SAE-PK password's trailing Damm checksum character (the typo
-    /// guard skipped by the station-side decoder).
+    /// Validate a SAE-PK password's trailing checksum character alone (the
+    /// station applies it inside [`is_sae_pk_password`]).
     pub fn validate_checksum(password: &str) -> bool {
         let b = password.as_bytes();
         b.len() >= 2 && b[b.len() - 1] == d_check_char(&b[..b.len() - 1])
@@ -876,7 +903,9 @@ pub mod gen {
         fn smoke_sae_pk_session_end_to_end() -> TestResult {
             use crate::sae::{SaeSession, SaeState};
             let ssid = "narf-pk-net";
-            let password = "abcd-efgh-ijkl"; // SAE-PK password format
+            // A valid SAE-PK password: the checksum character verifies and the
+            // Sec_1b bits agree (hostap sae_pk_valid_password).
+            let password = "abcd-efgh-ijkx";
             let sta_mac = [2, 0, 0, 0, 0, 1];
             let ap_mac = [2, 0, 0, 0, 0, 2];
             let mut sta =
@@ -1043,6 +1072,32 @@ mod pk_tests {
         TestResult::Pass
     }
     kernel_test_in!("wireless/sae_pk", smoke_sae_pk_password_fingerprint);
+
+    fn smoke_sae_pk_password_validity_matches_hostap() -> TestResult {
+        // Valid: the checksum character verifies and every group's Sec_1b
+        // agrees (Sec 5, then Sec 3).
+        if !is_sae_pk_password("aaaa-aaaa-aaaj") || !is_sae_pk_password("qaaa-qaaa-qaa6") {
+            return TestResult::Fail("valid SAE-PK password rejected");
+        }
+        // Wrong checksum character.
+        if is_sae_pk_password("aaaa-aaaa-aaaa") || is_sae_pk_password("aaaa-aaaa-aaak") {
+            return TestResult::Fail("bad SAE-PK checksum accepted");
+        }
+        // Checksum valid but the groups disagree on Sec_1b.
+        if is_sae_pk_password("qaaa-aaaa-aaa4") {
+            return TestResult::Fail("mixed Sec_1b accepted");
+        }
+        // An ordinary WPA3 password that merely has the SAE-PK shape is
+        // plain SAE, as wpa_supplicant treats it.
+        if is_sae_pk_password("wpa3-narf-pass") {
+            return TestResult::Fail("ordinary SAE password taken for SAE-PK");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "wireless/sae_pk",
+        smoke_sae_pk_password_validity_matches_hostap
+    );
 
     fn smoke_sae_pk_fingerprint_matches() -> TestResult {
         // Hash with 3 leading zero octets then 0xAB: an 8-bit 0xAB fingerprint
