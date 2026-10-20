@@ -63,7 +63,8 @@ fn vready_after_vsync(plan: &dml::Plan) -> bool {
         .is_some_and(|lines| lines <= vblank_end)
 }
 /// Per-pipe DLG/TTU fields, `hubp401_program_deadline` then
-/// `hubp401_setup_interdependent` order. VM/PTE/meta/flip/chroma/cursor and
+/// `hubp401_setup_interdependent` order: a 4:2:0 plane's chroma line and
+/// request delivery beside luma's (zero for RGB). VM/PTE/meta/flip/cursor and
 /// 3D-LUT fields are explicitly zero: none is enabled in the admitted shape.
 fn hubp(t: dml::Ttu, d: dml::Dlg) -> [(u64, u32, u32); 31] {
     let zero23 = 0x7fffff;
@@ -86,7 +87,11 @@ fn hubp(t: dml::Ttu, d: dml::Dlg) -> [(u64, u32, u32); 31] {
         (0x64a, zero23, 0),  // REFCYC_PER_PTE_GROUP_NOM_L
         (0x64d, 0x1ffff, 0), // DST_Y_PER_META_ROW_NOM_L
         (0x64e, zero23, 0),  // REFCYC_PER_META_CHUNK_NOM_L
-        (PER_LINE, 0x1fff1fff, d.refcyc_per_line_delivery_l),
+        (
+            PER_LINE,
+            0x1fff1fff,
+            d.refcyc_per_line_delivery_l | d.refcyc_per_line_delivery_c << 16,
+        ),
         (0x643, zero23, 0),  // REFCYC_PER_PTE_GROUP_VBLANK_C
         (0x64b, 0x1ffff, 0), // DST_Y_PER_PTE_ROW_NOM_C
         (0x64c, zero23, 0),  // REFCYC_PER_PTE_GROUP_NOM_C
@@ -102,7 +107,11 @@ fn hubp(t: dml::Ttu, d: dml::Dlg) -> [(u64, u32, u32); 31] {
             0x1f7fffff,
             t.refcyc_per_req_delivery_l | t.qos_level_fixed_l << 24,
         ),
-        (SURF1_TTU0, 0x1f7fffff, t.qos_level_fixed_c << 24),
+        (
+            SURF1_TTU0,
+            0x1f7fffff,
+            t.refcyc_per_req_delivery_c | t.qos_level_fixed_c << 24,
+        ),
         (CUR0_TTU0, 0x1f7fffff, 0),
         (0x647, zero23, 0), // REFCYC_PER_PTE_GROUP_FLIP_L
         (LUT3D_DLG, zero23, 0),
@@ -122,7 +131,11 @@ fn hubp(t: dml::Ttu, d: dml::Dlg) -> [(u64, u32, u32); 31] {
         (0x644, zero23, 0), // REFCYC_PER_META_CHUNK_VBLANK_L
         (0x645, zero23, 0), // REFCYC_PER_META_CHUNK_VBLANK_C
         (0x648, zero23, 0), // REFCYC_PER_META_CHUNK_FLIP_L
-        (PER_LINE_PRE, 0x1fff1fff, d.refcyc_per_line_delivery_pre_l),
+        (
+            PER_LINE_PRE,
+            0x1fff1fff,
+            d.refcyc_per_line_delivery_pre_l | d.refcyc_per_line_delivery_pre_c << 16,
+        ),
     ]
 }
 /// The remaining interdependent TTU fields; the global TTU write preserves
@@ -130,7 +143,7 @@ fn hubp(t: dml::Ttu, d: dml::Dlg) -> [(u64, u32, u32); 31] {
 fn hubp_ttu(t: dml::Ttu) -> [(u64, u32, u32); 4] {
     [
         (SURF0_TTU1, 0x7fffff, t.refcyc_per_req_delivery_pre_l),
-        (SURF1_TTU1, 0x7fffff, 0),
+        (SURF1_TTU1, 0x7fffff, t.refcyc_per_req_delivery_pre_c),
         (CUR0_TTU1, 0x7fffff, 0),
         (
             GLOBAL_TTU,
