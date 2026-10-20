@@ -2368,8 +2368,17 @@ fn amdgpu_suspend_handler() -> Result<(), narf_power::device_pm::DeviceSuspendEr
     if CONTROLLER
         .lock()
         .as_ref()
-        .is_some_and(|gpu| gpu.chip.family == Family::Navi4 || !gpu.is_apu())
+        .is_some_and(|gpu| gpu.chip.family == Family::Navi4)
     {
+        // Navi48 suspends in the async system-PM phase (evict, quiesce, save
+        // PCI state); nothing is left for the interrupt-gated fan-out.
+        return if crate::amdgpu_navi48_platform::system_suspended() {
+            Ok(())
+        } else {
+            Err(narf_power::device_pm::DeviceSuspendError::NotImplemented)
+        };
+    }
+    if CONTROLLER.lock().as_ref().is_some_and(|gpu| !gpu.is_apu()) {
         // No discrete TMR teardown, training-cache restore or SMU resume yet.
         // Refuse before modifying PM state or sending an APU mailbox command.
         return Err(narf_power::device_pm::DeviceSuspendError::NotImplemented);

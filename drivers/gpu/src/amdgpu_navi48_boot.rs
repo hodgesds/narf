@@ -731,6 +731,33 @@ impl ColdBoot {
         );
         Ok(())
     }
+    /// Prepare system suspend: the same preflight as `prepare_reset`, with
+    /// a resume-mode reset owner (PCI restore, then post or mode1).
+    pub(crate) fn prepare_suspend(&mut self) -> Result<(), Error> {
+        self.prepare_reset()?;
+        let hw = &self.sequence.backend;
+        // SAFETY: preparation performs no I/O; the platform establishes
+        // exclusive access before saving PCI state.
+        self.reset = Some(
+            unsafe {
+                crate::amdgpu_reset_navi22::Reset::new_navi48_resume(&hw.gpu, hw.authority, hw.pci)
+            }
+            .map_err(Error::Reset)?,
+        );
+        Ok(())
+    }
+    /// # Safety
+    /// Every engine, IH and CPU accessor is quiesced (after the platform
+    /// withdrew them), immediately before the system enters S3.
+    pub(crate) unsafe fn save_for_suspend(&mut self) -> Result<(), Error> {
+        let reset = self.reset.as_mut().ok_or(Error::Invalid)?;
+        // SAFETY: forwarded contract.
+        unsafe { reset.save_for_resume() }.map_err(Error::Reset)
+    }
+    /// Abandon a prepared suspend whose PCI state was never saved.
+    pub(crate) fn cancel_suspend(&mut self) {
+        self.reset = None;
+    }
     /// # Safety
     /// Stop every external register/VRAM accessor, including IH and clock
     /// readers. Retain this owner on failure/cancellation; never retry it.

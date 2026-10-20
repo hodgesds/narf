@@ -190,6 +190,9 @@ pub struct Post {
 pub enum Method {
     Smu,
     Psp,
+    /// System resume found the card cold (power was removed): no reset ran,
+    /// only the saved PCI state restore and the post.
+    PowerCycle,
 }
 
 /// Evidence of one completed reset, retained for boot diagnostics.
@@ -523,6 +526,10 @@ pub enum Mode {
     OnInit,
     /// `amdgpu_device_gpu_recover` with AMD_RESET_METHOD_MODE1: always.
     Recovery,
+    /// `amdgpu_device_resume` after S3: restore the PCI state saved before
+    /// suspend, then post as `amdgpu_device_need_post` decides. A card whose
+    /// SOS still runs (power was never removed) takes the mode1 path.
+    Resume,
 }
 #[derive(Debug)]
 struct Engine<I: Io> {
@@ -955,9 +962,58 @@ impl<I: Io> Engine<I> {
         }
         Ok(post)
     }
+    /// Resume: PCI state back before any MMIO, the bootloader and MEMSIZE
+    /// awaited as after a reset, then post or (SOS alive) mode1 + post.
+    async fn resume(&mut self) -> Result<Report, Error> {
+        let authority = self.authority;
+        self.state = State::Resetting;
+        self.authority.check_live().map_err(|_| Error::Revoked)?;
+        self.io.restore(&authority)?;
+        self.wait_mp0(BOOTLOADER, BOOTLOADER_MS)
+            .await?
+            .map_err(|value| {
+                if value == u32::MAX {
+                    Error::DeviceGone
+                } else {
+                    Error::Timeout
+                }
+            })?;
+        let sos = self.access(|io| io.mp0(SOS))?;
+        if sos == u32::MAX {
+            return Err(Error::DeviceGone);
+        }
+        if sos != 0 {
+            let mut report = self.reset(sos).await?;
+            self.state = State::Posting;
+            report.post = self.post(true).await?;
+            return Ok(report);
+        }
+        let memsize = self.access(|io| io.memsize())?;
+        if memsize == u32::MAX {
+            return Err(Error::DeviceGone);
+        }
+        self.state = State::Posting;
+        let post = self.post(false).await?;
+        Ok(Report {
+            method: Method::PowerCycle,
+            smu_version: None,
+            sos_before: 0,
+            sos_after: self.access(|io| io.mp0(SOS))?,
+            memsize,
+            post,
+        })
+    }
     async fn run(&mut self) -> Result<Option<Report>, Error> {
         if self.state != State::Prepared {
             return Err(Error::Busy);
+        }
+        if self.mode == Mode::Resume {
+            let result = self.resume().await;
+            self.state = match result {
+                Ok(report) => State::Complete(report),
+                Err(_) => State::Failed,
+            };
+            return result.map(Some);
         }
         let sos = self.access(|io| io.mp0(SOS))?;
         if sos == u32::MAX {
@@ -1155,6 +1211,33 @@ impl Reset {
                 post: None,
             },
         })
+    }
+    /// Navi48 system resume (`Mode::Resume`). Constructs register windows
+    /// only; [`Self::save_for_resume`] captures PCI state before suspend and
+    /// `run` after resume restores it and posts the card.
+    /// # Safety
+    /// `new_navi48_recovery`'s contract.
+    pub unsafe fn new_navi48_resume(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        device: BusDevice,
+    ) -> Result<Self, Error> {
+        // SAFETY: forwarded contract.
+        let mut reset = unsafe { Self::new_navi48_recovery(gpu, authority, device) }?;
+        reset.engine.mode = Mode::Resume;
+        Ok(reset)
+    }
+    /// amdgpu_device_cache_pci_state + pci_clear_master before suspend:
+    /// BARs, ReBAR, PCIe controls, MSI/MSI-X with its table.
+    /// # Safety
+    /// Every engine is quiesced: no DMA may be in flight when bus mastering
+    /// is cleared, and nothing touches the device until `run`.
+    pub unsafe fn save_for_resume(&mut self) -> Result<(), Error> {
+        if self.engine.mode != Mode::Resume || self.engine.state != State::Prepared {
+            return Err(Error::Busy);
+        }
+        let authority = self.engine.authority;
+        self.engine.io.save_and_quiesce(&authority)
     }
     pub fn mode(&self) -> Mode {
         self.engine.mode

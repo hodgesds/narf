@@ -5513,6 +5513,25 @@ generation and at most `MAX_AUTOMATIC_RECOVERIES` (3) times per boot, since
 each recovery quarantines the old owners' VRAM. `set_recovery_console_hook`
 pauses kernel boot-framebuffer writers for the reset; a lost device leaves
 them paused. User CPU mappings of VRAM are not revoked, as in Linux.
+
+System suspend (S3) uses the async system-PM phase
+(`unsafe register_system_pm()`, installed by the fb boot handoff).
+`prepare_suspend` follows amdgpu_pmops_suspend for a dGPU: it unregisters
+the client VRAM heap and evicts every client VRAM buffer to system memory
+(`amdgpu_gem::evict_all`, as ttm_resource_manager_evict_all, widening each
+buffer's allowed domains with GTT for the move and waiting for its jobs),
+pauses kernel boot-framebuffer writers, then quiesces exactly as recovery
+does and saves PCI state with bus mastering cleared
+(`Reset::save_for_resume`). A refused eviction or preflight leaves the
+device running; a failed PCI save recovers immediately with mode1.
+`resume_from_suspend` (amdgpu_pmops_resume) restores PCI state before any
+MMIO, waits for the bootloader, posts the cold card with ATOM ASIC_Init as
+amdgpu_device_need_post decides (`Mode::Resume`, `Method::PowerCycle`;
+mode1 + post when SOS survived), replays GDDR6 training and brings up a
+fresh owner as recovery does, then restores the widened domains; buffers
+stay in system memory until validation promotes them. The interrupt-gated
+device-PM handler accepts Navi48 only while the async prepare holds it
+(`system_suspended()`). Hardware unvalidated.
 A finished GDDR6 trainer (`Ready`, `ResidentSos` or `Disabled`) moves to
 the new owner, which replays it before SOS with `Trainer::resume`
 (psp_v14_0_memory_training(PSP_MEM_TRAIN_RESUME): restore the cache to C2P

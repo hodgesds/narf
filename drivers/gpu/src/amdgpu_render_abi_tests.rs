@@ -937,3 +937,64 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     rdna2_hidden_readback_preserves_vm_and_rolls_back_failure
 );
+
+/// System suspend eviction (ttm_resource_manager_evict_all): every VRAM
+/// buffer of the card moves to system memory even when VRAM is its only
+/// allowed domain; restore_domains puts the original domains back.
+fn suspend_eviction_moves_vram_only_buffers_and_restores_domains() -> TestResult {
+    const CARD: u32 = 0xfee3;
+    let mut memory = alloc::vec![0u8; 4 * 4096];
+    let map = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(0xb100_0000),
+        virt: memory.as_mut_ptr() as u64,
+        len: memory.len() as u64,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    // SAFETY: this test exclusively owns memory until the heap and every
+    // object are dropped; no hardware accesses these mappings.
+    let pool = unsafe { crate::amdgpu_vram::Pool::from_owned_range(map, 0x8_0000_0000) }.unwrap();
+    register_vram_heap(
+        CARD,
+        VramHeap {
+            pool: pool.clone(),
+            fb_base: 0x8_0000_0000,
+            fb_offset: 0x9_0000_0000,
+            unmapped: None,
+        },
+    );
+    let state = GemState::for_card(CARD);
+    let vram_only = u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM);
+    let a = state.get(create(&state, 4096, vram_only)).unwrap();
+    let b = state
+        .get(create(
+            &state,
+            8192,
+            vram_only | u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT),
+        ))
+        .unwrap();
+    assert!(!a.system() && !b.system());
+    // VRAM-preferred buffers allow GTT as in Linux; make `a` VRAM-only, as
+    // a DISCARDABLE buffer is. Plain relocation refuses it.
+    a.allowed_domains.store(vram_only, Ordering::Release);
+    assert_eq!(a.relocate(false), Err(FsError::Busy));
+    let (touched, result) = narf_scheduler::block_on_spin(async {
+        let gate = lock_placement(CARD).await;
+        evict_all(&gate).await
+    });
+    assert_eq!(result, Ok(()));
+    assert!(a.system() && b.system());
+    assert_eq!(touched.len(), 2);
+    assert_eq!(pool.available(), 4 * 4096);
+    restore_domains(touched);
+    assert_eq!(a.allowed_domains.load(Ordering::Acquire), vram_only);
+    assert_ne!(
+        b.allowed_domains.load(Ordering::Acquire) & u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT),
+        0
+    );
+    unregister_vram_heap(CARD);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/render-abi",
+    suspend_eviction_moves_vram_only_buffers_and_restores_domains
+);

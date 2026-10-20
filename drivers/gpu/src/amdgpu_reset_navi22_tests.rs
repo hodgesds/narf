@@ -780,3 +780,71 @@ kernel_test_in!(
     "drivers/gpu/reset_navi22",
     navi48_mode1_cancellation_and_restore_failure_are_terminal
 );
+
+/// amdgpu_device_resume on a card that lost power in S3: the saved PCI state
+/// returns before any MMIO, the bootloader is awaited, and ASIC_Init posts the
+/// cold card without any reset.
+fn navi48_resume_restores_pci_then_posts_a_power_cycled_card() -> TestResult {
+    let mut io = Fake::posted();
+    io.decoding = false; // config space lost with power
+    io.reset = true; // SOS idle, bootloader starting
+    let mut e = engine(io);
+    e.navi48 = true;
+    e.mode = Mode::Resume;
+    let report = match run(e.run()) {
+        Ok(Some(report)) => report,
+        other => panic!("resume {other:?}"),
+    };
+    assert_eq!(report.method, Method::PowerCycle);
+    assert!(report.post.ran);
+    assert_eq!(e.io.events.first(), Some(&Event::Restore));
+    assert!(!e.io.events.iter().any(|e| matches!(e, Event::Mp1(..))));
+    let writes: Vec<_> =
+        e.io.events
+            .iter()
+            .filter(|e| matches!(e, Event::Reg(..)))
+            .copied()
+            .collect();
+    assert_eq!(writes, asic_init_writes());
+    assert_eq!(e.io.stray, 0);
+    assert!(matches!(e.state, State::Complete(_)));
+    assert_eq!(run(e.run()), Err(Error::Busy));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/reset_navi22",
+    navi48_resume_restores_pci_then_posts_a_power_cycled_card
+);
+
+/// A resume that finds SOS still running (power was never removed) resets
+/// with mode1 and posts unconditionally; a failed PCI restore is terminal.
+fn navi48_resume_with_live_sos_takes_mode1_and_restore_failure_is_terminal() -> TestResult {
+    let mut e = engine(Fake::posted());
+    e.navi48 = true;
+    e.mode = Mode::Resume;
+    match run(e.run()) {
+        Ok(Some(Report {
+            method: Method::Smu,
+            post: Post { ran: true, .. },
+            ..
+        })) => {}
+        other => panic!("live-SOS resume {other:?}"),
+    }
+    assert!(e.io.events.contains(&Event::Mp1(0x8b, 2)));
+    assert_eq!(e.io.stray, 0);
+    let mut io = Fake::posted();
+    io.decoding = false;
+    io.reset = true;
+    io.restore_error = true;
+    let mut e = engine(io);
+    e.navi48 = true;
+    e.mode = Mode::Resume;
+    assert_eq!(run(e.run()), Err(Error::Pci));
+    assert_eq!(e.state, State::Failed);
+    assert_eq!(e.io.stray, 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/reset_navi22",
+    navi48_resume_with_live_sos_takes_mode1_and_restore_failure_is_terminal
+);

@@ -410,12 +410,180 @@ impl Drop for RecoveryOwner {
 /// there). Hardware unvalidated.
 pub async unsafe fn recover() -> Result<boot::Report, boot::Error> {
     let mut owner = OWNER.lock().await;
+    // SAFETY: forwarded caller contract.
+    let quiesced = unsafe { quiesce(&mut owner, boot::ColdBoot::prepare_reset) }.await?;
+    // SAFETY: forwarded caller contract; every accessor was withdrawn.
+    unsafe { restart(&mut owner, quiesced) }.await
+}
+
+/// The owner withdrawn for S3 and the allowed domains eviction widened.
+struct Suspended {
+    quiesced: Quiesced,
+    domains: Vec<(Arc<crate::amdgpu_gem::GemObject>, u64)>,
+}
+// SAFETY: only moved between prepare_suspend and resume_from_suspend; the
+// retained owner is never polled while parked here.
+unsafe impl Send for Suspended {}
+static SUSPENDED: narf_lib::sync::IrqSafeSpinLock<Option<Suspended>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+/// Whether the async prepare parked this card for system suspend.
+pub fn system_suspended() -> bool {
+    SUSPENDED.lock().is_some()
+}
+/// Linux `amdgpu_pmops_suspend` for the dGPU: evict every client VRAM buffer
+/// to system memory (amdgpu_device_evict_resources, waiting for its jobs),
+/// pause kernel framebuffer writers, withdraw every engine user and the IH
+/// service as recovery does, then save PCI state and clear bus mastering.
+/// A refused eviction or preflight leaves the device running. After this,
+/// only [`resume_from_suspend`] may touch the card.
+///
+/// # Safety
+/// As [`recover`]: no external CPU mapping user, PCI or firmware owner may
+/// touch the card until resume. Runs from the async system-PM prepare phase.
+pub async unsafe fn prepare_suspend() -> Result<(), boot::Error> {
+    if SUSPENDED.lock().is_some() {
+        return Err(boot::Error::Busy);
+    }
+    let card = boot::ColdBoot::drm_card().ok_or(boot::Error::Invalid)?;
+    // No new VRAM placement while the old ones leave.
+    crate::amdgpu_gem::unregister_vram_heap(card);
+    let (domains, evicted) = {
+        let gate = crate::amdgpu_gem::lock_placement(card).await;
+        crate::amdgpu_gem::evict_all(&gate).await
+    };
+    let republish = || async {
+        if let Some(boot) = OWNER.lock().await.as_ref() {
+            boot.republish_client_vram();
+        }
+    };
+    if let Err(error) = evicted {
+        crate::amdgpu_gem::restore_domains(domains);
+        republish().await;
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: navi48 suspend refused: VRAM eviction {error:?}"
+        );
+        return Err(boot::Error::Busy);
+    }
+    console(true);
+    let mut owner = OWNER.lock().await;
+    // SAFETY: forwarded caller contract; client VRAM is empty.
+    let quiesced = match unsafe { quiesce(&mut owner, boot::ColdBoot::prepare_suspend) }.await {
+        Ok(q) => q,
+        Err(error) => {
+            drop(owner);
+            crate::amdgpu_gem::restore_domains(domains);
+            republish().await;
+            console(false);
+            return Err(error);
+        }
+    };
+    let mut quiesced = quiesced;
+    let boot = quiesced
+        .retained
+        .boot
+        .as_mut()
+        .ok_or(boot::Error::Invalid)?;
+    // SAFETY: quiesce withdrew every engine user, CPU view and IH.
+    if let Err(error) = unsafe { boot.save_for_suspend() } {
+        // Nothing can resume this owner without its PCI state: recover now.
+        boot.cancel_suspend();
+        let restarted = match boot.prepare_reset() {
+            // SAFETY: the same quiesced owner and exclusions.
+            Ok(()) => unsafe { restart(&mut owner, quiesced) }.await.map(|_| ()),
+            Err(e) => Err(e),
+        };
+        drop(owner);
+        crate::amdgpu_gem::restore_domains(domains);
+        console(restarted.is_err());
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: navi48 suspend refused: PCI state {error:?}; recovery {restarted:?}"
+        );
+        return Err(boot::Error::Busy);
+    }
+    *SUSPENDED.lock() = Some(Suspended { quiesced, domains });
+    Ok(())
+}
+/// Linux `amdgpu_pmops_resume`: restore PCI state, post the cold card
+/// (ATOM ASIC_Init, or mode1 + post when power was never removed), replay
+/// GDDR6 training, then bring up a fresh owner exactly as recovery does.
+/// Evicted buffers stay in system memory until validation promotes them.
+///
+/// # Safety
+/// As [`prepare_suspend`]; after system resume restored the bus.
+pub async unsafe fn resume_from_suspend() -> Result<boot::Report, boot::Error> {
+    let suspended = SUSPENDED.lock().take().ok_or(boot::Error::Busy)?;
+    let mut owner = OWNER.lock().await;
+    // SAFETY: forwarded contract; the parked owner was quiesced and saved.
+    let result = unsafe { restart(&mut owner, suspended.quiesced) }.await;
+    drop(owner);
+    crate::amdgpu_gem::restore_domains(suspended.domains);
+    use core::fmt::Write as _;
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: navi48 resume {:?}",
+        result.as_ref().map(|_| ())
+    );
+    // A lost device keeps the console quarantined, as a failed recovery does.
+    if result.is_ok() {
+        console(false);
+    }
+    result
+}
+struct SystemPm;
+impl narf_power::system_pm::AsyncSystemPm for SystemPm {
+    fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        alloc::boxed::Box::pin(async {
+            // SAFETY: register_system_pm's caller accepted the contract.
+            unsafe { prepare_suspend() }
+                .await
+                .map_err(|_| narf_power::device_pm::DeviceSuspendError::Busy)
+        })
+    }
+    fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        alloc::boxed::Box::pin(async {
+            // SAFETY: as above.
+            unsafe { resume_from_suspend() }
+                .await
+                .map(|_| ())
+                .map_err(|_| narf_power::device_pm::DeviceSuspendError::DriverError)
+        })
+    }
+}
+/// Register Navi48 S3 with the async system-PM phase.
+///
+/// # Safety
+/// The caller accepts [`prepare_suspend`]'s contract for every user, as
+/// [`set_automatic_recovery`] does for recovery.
+pub unsafe fn register_system_pm() {
+    narf_power::system_pm::register_async_system_pm("amdgpu-navi48", Arc::new(SystemPm));
+}
+
+/// A withdrawn owner between `quiesce` and `restart`.
+struct Quiesced {
+    retained: RecoveryOwner,
+    old_submitter: Option<Arc<Submitter>>,
+    restart_display: bool,
+}
+/// Run `prepare` (which may refuse with everything still running), then
+/// withdraw CS, client VRAM allocation, scanout, timestamps and the IH
+/// service from the owner, leaving it retained for `restart`.
+///
+/// # Safety
+/// As [`recover`].
+async unsafe fn quiesce(
+    owner: &mut Option<alloc::boxed::Box<boot::ColdBoot>>,
+    prepare: fn(&mut boot::ColdBoot) -> Result<(), boot::Error>,
+) -> Result<Quiesced, boot::Error> {
     if RECOVERY_STATE.load(Ordering::Acquire) & 1 != 0 {
         return Err(boot::Error::Busy);
     }
-    owner.as_mut().ok_or(boot::Error::Busy)?.prepare_reset()?;
+    prepare(owner.as_mut().ok_or(boot::Error::Busy)?)?;
     RECOVERY_STATE.store(1, Ordering::Release);
-    let mut retained = RecoveryOwner {
+    let retained = RecoveryOwner {
         boot: owner.take(),
         armed: true,
     };
@@ -444,6 +612,27 @@ pub async unsafe fn recover() -> Result<boot::Report, boot::Error> {
     crate::amdgpu_dcn_display::publish_external(None, None);
     crate::scanout_access::wait_retired().await;
     crate::amdgpu_navi48_interrupts::stop_for_reset().await;
+    Ok(Quiesced {
+        retained,
+        old_submitter,
+        restart_display,
+    })
+}
+/// Reset (or resume-post) the quiesced owner and bring a fresh one up:
+/// firmware, IH, queue proofs, media proofs, submitter, VRAM heap, power
+/// monitor and display monitor.
+///
+/// # Safety
+/// As [`recover`]; `q` came from `quiesce` on this same OWNER.
+async unsafe fn restart(
+    owner: &mut Option<alloc::boxed::Box<boot::ColdBoot>>,
+    q: Quiesced,
+) -> Result<boot::Report, boot::Error> {
+    let Quiesced {
+        mut retained,
+        old_submitter,
+        restart_display,
+    } = q;
     let old = retained.boot.as_mut().unwrap();
     // SAFETY: OWNER excludes async access; readers, IH and publication were
     // withdrawn. The caller excludes all external CPU mappings and PCI users.

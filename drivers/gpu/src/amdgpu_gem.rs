@@ -887,6 +887,48 @@ fn evict_visible(card: u32, pool: &crate::amdgpu_vram::Pool, bytes: u64, alignme
     }
 }
 
+/// System suspend (`ttm_resource_manager_evict_all`): move every VRAM buffer
+/// of `gate`'s card to system memory, waiting for its jobs, whatever its
+/// allowed domains (each gains GTT for the move). Returns every touched
+/// buffer with its original allowed domains, which the caller restores on
+/// resume or on failure ([`restore_domains`]); the first refusal stops the
+/// eviction and is returned with the list so far.
+pub(crate) async fn evict_all(
+    gate: &PlacementGuard,
+) -> (Vec<(Arc<GemObject>, u64)>, Result<(), FsError>) {
+    let card = gate.card();
+    let tables: Vec<_> = GEM_TABLES
+        .lock()
+        .iter()
+        .filter(|(c, _)| *c == card)
+        .filter_map(|(_, table)| table.upgrade())
+        .collect();
+    let mut touched = Vec::new();
+    for table in tables {
+        let objects: Vec<_> = table.lock().values().cloned().collect();
+        for object in objects {
+            if object.system() || touched.iter().any(|(o, _)| Arc::ptr_eq(o, &object)) {
+                continue;
+            }
+            let original = object
+                .allowed_domains
+                .fetch_or(u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT), Ordering::AcqRel);
+            touched.push((object.clone(), original));
+            if let Err(error) = crate::amdgpu_vm::relocate(gate, &object, false).await {
+                return (touched, Err(error));
+            }
+        }
+    }
+    (touched, Ok(()))
+}
+/// Put back the allowed domains [`evict_all`] widened. Buffers stay where
+/// they are until validation promotes them.
+pub(crate) fn restore_domains(touched: Vec<(Arc<GemObject>, u64)>) {
+    for (object, original) in touched {
+        object.allowed_domains.store(original, Ordering::Release);
+    }
+}
+
 /// A strict VRAM allocation may park to reclaim buffers mapped by idle VMs.
 /// The first create performs all ABI validation; a failure leaves its input
 /// union untouched. Ordinary allocations retain their immediate GTT fallback.

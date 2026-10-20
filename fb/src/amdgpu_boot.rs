@@ -118,6 +118,10 @@ pub(super) fn start() -> InitResult {
             // writer for the reset; user VRAM mappings follow Linux (not
             // revoked, contents lost).
             unsafe { navi48::set_automatic_recovery(options.gpu_recovery) };
+            // S3 through the async system-PM phase (evict VRAM, quiesce,
+            // save PCI state; resume posts and re-runs bring-up).
+            // SAFETY: same console hook and user-mapping policy as recovery.
+            unsafe { navi48::register_system_pm() };
         }
         result.is_ok()
     } else {
