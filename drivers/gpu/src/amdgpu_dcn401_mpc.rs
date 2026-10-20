@@ -24,10 +24,10 @@ impl Layout {
     fn mpc_out(self, pipe: u8, r: u64) -> u64 {
         self.mpc_base + (r + u64::from(pipe) * 4) * 4
     }
-    fn ogam(self, pipe: u8, r: u64) -> u64 {
+    pub(super) fn ogam(self, pipe: u8, r: u64) -> u64 {
         self.mpc_base + (r + u64::from(pipe) * 0x5e) * 4
     }
-    fn mcm(self, pipe: u8, r: u64) -> u64 {
+    pub(super) fn mcm(self, pipe: u8, r: u64) -> u64 {
         self.mpc_base + (r + u64::from(pipe) * 0xb0) * 4
     }
     fn ocsc(self, pipe: u8) -> u64 {
@@ -147,17 +147,40 @@ impl Layout {
 }
 impl<I: Io> Engine<I> {
     pub(super) fn verify_mpc(&mut self, a: MpcApplied) -> Result<u16, Error> {
-        for (at, mask, value) in self.layout.mpc_rgb(a) {
+        let l = self.layout;
+        for (at, mask, value) in l.mpc_rgb(a) {
+            // The OGAM and its gamut remap follow each pipe's color record
+            // (bypass when staged, the CRTC color once scanout programs it).
+            let colored = a.dpp.surface.request.segments().find_map(|(p, _, _)| {
+                let c = self.status.colors[usize::from(p)];
+                if at == l.ogam(p, 0x7e) {
+                    Some(c.ogam_control())
+                } else if at == l.ogam(p, 0xc9) {
+                    Some((3, c.gamut_mode()))
+                } else {
+                    None
+                }
+            });
+            let (mask, value) = colored.unwrap_or((mask, value));
             if self.read(at)? & mask != value {
                 return Err(Error::Readback(at));
             }
         }
         let mut pending = 0;
         for (p, _, _) in a.dpp.surface.request.segments() {
-            for (bit, (at, mask)) in self.layout.mpc_bypass(p).into_iter().enumerate() {
-                let ocsc = at == self.layout.ocsc(p);
+            let color = self.status.colors[usize::from(p)];
+            for (bit, (at, mask)) in l.mpc_bypass(p).into_iter().enumerate() {
+                let ocsc = at == l.ocsc(p);
                 let converting = Layout::ocsc_matrix(&a).is_some();
-                let want = if ocsc && converting { 1 << 7 } else { 0 };
+                let want = if ocsc && converting {
+                    1 << 7
+                } else if at == l.ogam(p, 0x7e) {
+                    color.ogam_current() & mask
+                } else if at == l.ogam(p, 0xc9) {
+                    color.gamut_mode() << 7
+                } else {
+                    0
+                };
                 if self.read(at)? & mask != want {
                     pending |= 1 << bit;
                 }
@@ -235,6 +258,12 @@ impl Surfaces {
         // No RAM or coefficient loads in bypass. Do not disturb LUT power,
         // banks, shared CSC coefficient format or any route selector.
         e.status.state = State::PreparingMpc(pipe);
+        // Staging writes the OGAM and gamut remap bypass.
+        for (p, _, _) in dpp.surface.request.segments() {
+            let c = &mut e.status.colors[usize::from(p)];
+            c.ogam = None;
+            c.gamut = None;
+        }
         e.status.requestor = None;
         e.status.deadlines = None;
         let result = (|| {

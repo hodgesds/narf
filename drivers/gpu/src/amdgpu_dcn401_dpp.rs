@@ -19,6 +19,7 @@ const SCALER_POWER: u64 = 0xd24;
 const SCALER_STATUS: u64 = 0xd25;
 const ISHARP_POWER: u64 = 0xd62;
 const CM_CONTROL: u64 = 0xd67;
+const PRE_DEGAM: u64 = 0xced;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DppApplied {
@@ -31,7 +32,7 @@ pub struct DppApplied {
     pub pending: u8,
 }
 impl Layout {
-    fn dpp(self, pipe: u8, reg: u64) -> u64 {
+    pub(super) fn dpp(self, pipe: u8, reg: u64) -> u64 {
         self.base + (reg + u64::from(pipe) * 0x16b) * 4
     }
 }
@@ -71,8 +72,8 @@ fn registers(a: DppApplied, width: u32) -> [(u64, u32, u32); 29] {
         (0xccf, 0x17f, format.cnvc_pixel_format()),
         (0xcd7, 0x33, 0), // color/luma keying disabled
         (0xcde, 0x11, 0),
-        (0xcee, 0x11, 0), // pre de/re-alpha off
-        (0xced, 0x73, 0), // pre-degamma bypass (encoded RGB passes through)
+        (0xcee, 0x11, 0),     // pre de/re-alpha off
+        (PRE_DEGAM, 0x73, 0), // pre-degamma bypass (encoded RGB passes through)
         (0xcd1, 0x7ffff, 0),
         (0xcd2, 0x7ffff, 0),
         (0xcd3, 0x7ffff, 0),
@@ -177,6 +178,13 @@ impl<I: Io> Engine<I> {
                 (ISHARP_POWER, 0x37, 4),
                 (0xd55, 0x0ffffa71, 0),
             ]) {
+                // PRE_DEGAM follows the pipe's color record (bypass when
+                // staged; legacy gamma's sRGB once scanout programs it).
+                let value = if r == PRE_DEGAM {
+                    self.status.colors[usize::from(p)].pre_degam()
+                } else {
+                    value
+                };
                 let at = self.layout.dpp(p, r);
                 if self.read(at)? & mask != value {
                     return Err(Error::Readback(at));
@@ -248,6 +256,10 @@ impl Surfaces {
             return Err(Error::Busy);
         }
         e.status.state = State::PreparingDpp(pipe);
+        // Staging writes the input transfer function's bypass.
+        for (p, _, _) in surface.applied.request.segments() {
+            e.status.colors[usize::from(p)].pre_degam_srgb = false;
+        }
         let result = e.program_dpp(applied).await.and_then(|()| {
             if owners()? != (clock, config) {
                 return Err(Error::Busy);

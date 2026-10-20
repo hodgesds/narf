@@ -28,6 +28,12 @@ fn mpcc(p: u8, r: u64) -> u64 {
 fn optc_input(p: u8) -> u64 {
     BASE + (0x1aca + u64::from(p) * 0x10) * 4
 }
+fn og(p: u8, r: u64) -> u64 {
+    MPC_BASE + (r + u64::from(p) * 0x5e) * 4
+}
+fn dpp_reg(p: u8, r: u64) -> u64 {
+    BASE + (r + u64::from(p) * 0x16b) * 4
+}
 const LOCK: u64 = 0x1b89;
 const LOCK_REQUEST: u32 = 1;
 const LOCK_STATUS: u32 = 0x100;
@@ -52,6 +58,9 @@ const TOP: u64 = 0;
 const GLOBAL_TIMER: u64 = 0x527;
 const TX_CLOCKS: u64 = 0x2931;
 const CRYSTAL_KHZ: u32 = 100_000;
+const OGAM_CONTROL: u64 = 0x7e;
+const GAMUT_MODE: u64 = 0xc9;
+const PRE_DEGAM: u64 = 0xced;
 
 /// The OTG master-update lock and the VUPDATE that follows its release:
 /// the lock is granted on request (unless withheld), and `latch_delay`
@@ -89,6 +98,15 @@ impl ScanIo {
         self.put(h(p, EARLIEST_INUSE_HIGH), high);
         let flip = self.get(h(p, FLIP)) & !FLIP_PENDING;
         self.put(h(p, FLIP), flip);
+        // The OGAM mode/RAM select and gamut remap set latch into their
+        // CURRENT fields.
+        let ogam = self.get(og(p, OGAM_CONTROL));
+        self.put(
+            og(p, OGAM_CONTROL),
+            (ogam & 0x7f) | (ogam & 3) << 7 | (ogam >> 2 & 1) << 9,
+        );
+        let gamut = self.get(og(p, GAMUT_MODE));
+        self.put(og(p, GAMUT_MODE), (gamut & 0x7f) | (gamut & 3) << 7);
         self.put(opp(p, DPG_PENDING), 0);
         let connected = self.get(mpcc(p, TOP)) & 0xf != 0xf;
         self.put(mpcc(p, MPC_STATUS), if connected { 2 } else { 5 });
@@ -864,4 +882,102 @@ fn dcn401_partial_activation_failure_keeps_native_quarantine() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-scanout",
     dcn401_partial_activation_failure_keeps_native_quarantine
+);
+
+/// A CRTC color with every block in use, whose PWL has `points` entries.
+fn color(points: u32, s3_12: bool) -> Arc<ColorProgram> {
+    let lut: alloc::vec::Vec<u32> = (0..points).map(|i| i * 0x100).collect();
+    Arc::new(ColorProgram {
+        pre_degam_srgb: true,
+        gamut: Some(GamutProgram {
+            coef: [0x2000, 0, 0x2000, 0, 0x2000, 0],
+            s3_12,
+        }),
+        ogam: Some(OgamProgram {
+            start: [1, 2, 3],
+            start_slope: [4, 5, 6],
+            end_base: [7, 8, 9],
+            end: [10, 11, 12],
+            regions: [0x4004; 17],
+            lut: [lut.clone(), lut.clone(), lut],
+        }),
+    })
+}
+
+/// dcn401_program_pipe's color at scanout start (under the start's lock,
+/// latching with the plane) and amdgpu_dm's non-modeset updates of a live
+/// scanout: alternate OGAM banks and gamut sets, bypass, the record across
+/// stop and restart, health checks against it, and cancellation.
+fn dcn401_scanout_chain_programs_crtc_color() -> TestResult {
+    for (t, s, p) in ROUTES {
+        let mut c = chain(t, s, p);
+        // Not scanning out: recorded only.
+        let first = color(195, false);
+        let writes = c.e.io.writes;
+        if run(c.e.set_color(p, Some(first.clone()))).is_err() || c.e.io.writes != writes {
+            return TestResult::Fail("dark display color");
+        }
+        if run(c.start()).is_err() {
+            return TestResult::Fail("start with color");
+        }
+        let latched = |c: &mut Chain, ogam: u32, gamut: u32, pre: u32| {
+            c.e.io.get(og(p, OGAM_CONTROL)) & 0x387 == ogam
+                && c.e.io.get(og(p, GAMUT_MODE)) & 0x183 == gamut
+                && c.e.io.get(dpp_reg(p, PRE_DEGAM)) & 0x73 == pre
+        };
+        // RAM A and gamut set A, latched with the plane.
+        if !latched(&mut c, 2 | 2 << 7, 1 | 1 << 7, 1)
+            || c.e.status.colors[usize::from(p)]
+                != (PipeColor {
+                    pre_degam_srgb: true,
+                    gamut: Some((1, false)),
+                    ogam: Some(0),
+                })
+            || run(c.check()).is_err()
+        {
+            return TestResult::Fail("color at start");
+        }
+        // A live update: the other bank and set, latched before return.
+        let second = color(195, true);
+        if run(c.e.set_color(p, Some(second))).is_err()
+            || c.e.status.state != State::ScanoutRunning(p)
+            || !latched(&mut c, 2 | 4 | 2 << 7 | 1 << 9, 2 | 2 << 7, 1)
+            || run(c.check()).is_err()
+        {
+            return TestResult::Fail("live color update");
+        }
+        // Back to bypass, live.
+        if run(c.e.set_color(p, None)).is_err()
+            || !latched(&mut c, 0, 0, 0)
+            || c.e.status.colors[usize::from(p)] != PipeColor::default()
+            || run(c.check()).is_err()
+        {
+            return TestResult::Fail("live bypass");
+        }
+        // The request survives stop and restart.
+        if run(c.stop()).is_err()
+            || run(c.e.set_color(p, Some(first.clone()))).is_err()
+            || run(c.start()).is_err()
+            || !latched(&mut c, 2 | 2 << 7, 1 | 1 << 7, 1)
+            || run(c.check()).is_err()
+        {
+            return TestResult::Fail("color across restart");
+        }
+        // Cancelled inside the update's lock: the pipe is quarantined.
+        c.e.io.grant = false;
+        c.e.io.pause_wait = true;
+        let requested = c.e.io.lock_requested.clone();
+        requested.store(false, Ordering::SeqCst);
+        cancel_at(c.e.set_color(p, Some(color(195, false))), || {
+            requested.load(Ordering::SeqCst)
+        });
+        if c.e.status.state != State::UpdatingStream(p) {
+            return TestResult::Fail("cancelled update not quarantined");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_chain_programs_crtc_color
 );

@@ -246,7 +246,7 @@ impl<I: Io> Engine<I> {
         }
         Ok(())
     }
-    async fn lock(&mut self, pipe: u8) -> Result<(), Error> {
+    pub(super) async fn lock(&mut self, pipe: u8) -> Result<(), Error> {
         let l = self.layout;
         self.update(
             l.otg(pipe, GLOBAL_CONTROL2),
@@ -257,6 +257,22 @@ impl<I: Io> Engine<I> {
         // Linux waits only 10 us and proceeds; here the lock must be held.
         self.wait(l.otg(pipe, LOCK), LOCK_STATUS, LOCK_STATUS, 1000)
             .await
+    }
+    /// The OTG's double-buffered registers latched after an unlocked update.
+    pub(super) async fn stream_latched(&mut self, p: Pipe) -> Result<(), Error> {
+        let l = self.layout;
+        self.latched(p, |e| {
+            for (at, mask) in [
+                (l.otg(p.pipe, DOUBLE_BUFFER), OTG_UPDATE_PENDING),
+                (l.otg(p.pipe, PIPE_UPDATE), PIPE_PENDING),
+            ] {
+                if e.read(at)? & mask != 0 {
+                    return Ok(Some(at));
+                }
+            }
+            Ok(None)
+        })
+        .await
     }
     async fn latched(
         &mut self,
@@ -383,6 +399,9 @@ impl<I: Io> Engine<I> {
         // dcn401_program_front_end_for_ctx forces P-state off across 0->1.
         self.update(hubbub(DRAM_STATE), PSTATE_FORCE, PSTATE_DISALLOWED)?;
         narf_time::SleepUntil::new(narf_time::Deadline::after_us(500).as_instant()).await;
+        // dcn401_program_pipe's color for an enabled pipe: CRTC color under
+        // the same lock, latching with the plane.
+        self.program_color(p).await?;
         // Each ODM segment's OPP, MPCC tree and HUBP under the one master
         // lock: they latch together at the combined timing's VUPDATE.
         for q in p.pipes() {

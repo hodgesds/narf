@@ -2093,6 +2093,25 @@ impl ColdBoot {
         // SAFETY: serialized retained owner; caller excludes writers.
         unsafe { self.otg.as_mut().map_err(|e| *e)?.set_drr(pipe, drr) }
     }
+    /// Set display `pipe`'s CRTC color: a live scanout is reprogrammed at
+    /// once (no modeset), otherwise its next scanout start programs it.
+    /// # Safety
+    /// As for `set_display_cursor`.
+    pub async unsafe fn set_display_color(
+        &mut self,
+        pipe: u8,
+        program: Option<alloc::sync::Arc<otg::ColorProgram>>,
+    ) -> Result<(), otg::Error> {
+        if self.state() != State::MemoryReady {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: serialized retained owner; caller excludes writers.
+        unsafe { self.otg.as_mut().map_err(|e| *e)?.set_color(pipe, program) }.await
+    }
+    /// The CRTC color display `pipe` was last given.
+    pub fn display_color(&self, pipe: u8) -> Option<alloc::sync::Arc<otg::ColorProgram>> {
+        self.otg.as_ref().ok().and_then(|o| o.color(pipe))
+    }
     /// HDP-flush CPU writes to the live scanout surface.
     pub fn flush_display_scanout(&mut self) -> Result<(), otg::Error> {
         if self.state() != State::MemoryReady {

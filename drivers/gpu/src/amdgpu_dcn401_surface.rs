@@ -24,10 +24,13 @@ pub use deadline::DeadlinesApplied;
 #[path = "amdgpu_dcn401_cursor.rs"]
 mod cursor;
 pub use cursor::{CursorApplied, CURSOR_MAX};
+#[path = "amdgpu_dcn401_color.rs"]
+mod color;
 #[path = "amdgpu_dcn401_flip.rs"]
 mod flip;
 #[path = "amdgpu_dcn401_scanout.rs"]
 mod scanout;
+pub use color::{ColorProgram, GamutProgram, OgamProgram, PipeColor};
 pub use flip::FlipDone;
 pub use scanout::{ScanoutPosition, ScanoutRunning, ScanoutUnderflow, VblankPhase};
 

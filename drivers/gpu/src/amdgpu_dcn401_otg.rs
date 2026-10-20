@@ -18,9 +18,10 @@ pub use opp::{BlankApplied, BlankRequest, BlankRunning, ColorDepth};
 #[path = "amdgpu_dcn401_fetch.rs"]
 mod fetch;
 pub use fetch::{
-    CursorApplied, DeadlinesApplied, DppApplied, FlipDone, HubpPower, MemoryApplied, MpcApplied,
-    PlanesRetired, RequestorApplied, ScanoutPosition, ScanoutRunning, ScanoutUnderflow,
-    SurfaceApplied, SurfaceFormat, SurfaceRequest, VblankPhase, CURSOR_MAX,
+    ColorProgram, CursorApplied, DeadlinesApplied, DppApplied, FlipDone, GamutProgram, HubpPower,
+    MemoryApplied, MpcApplied, OgamProgram, PipeColor, PlanesRetired, RequestorApplied,
+    ScanoutPosition, ScanoutRunning, ScanoutUnderflow, SurfaceApplied, SurfaceFormat,
+    SurfaceRequest, VblankPhase, CURSOR_MAX,
 };
 #[path = "amdgpu_dcn401_stream.rs"]
 mod stream;
@@ -220,6 +221,9 @@ pub enum State {
     ScanoutRunning(u8),
     StoppingScanout(u8),
     Flipping(u8),
+    /// A live scanout's non-modeset stream update (CRTC color, HDR
+    /// metadata) under its OTG lock; cancellation quarantines the pipe.
+    UpdatingStream(u8),
     Cursor(u8),
     Retiring(u8),
     Retired,
@@ -348,6 +352,8 @@ pub struct Status {
     pub dpps: [Option<DppApplied>; 4],
     /// Staged opaque RGB composition; selectors remain detached, not latched.
     pub mpcs: [Option<MpcApplied>; 4],
+    /// Each pipe's color blocks as last programmed (bypass when staged).
+    pub colors: [PipeColor; 4],
     /// Native single-pipe storage/request geometry. Not bandwidth admission.
     pub requestor: Option<RequestorApplied>,
     /// Admitted DLG/TTU/watermark programming for the staged requestor.
@@ -445,6 +451,7 @@ impl Status {
             memory: [None; 4],
             dpps: [None; 4],
             mpcs: [None; 4],
+            colors: [PipeColor::default(); 4],
             requestor: None,
             deadlines: None,
             scanout: None,
@@ -975,6 +982,9 @@ struct Displays {
     parked: Box<[Status]>,
     /// The other displays' resources, fixed while this one is selected.
     siblings: Siblings,
+    /// Each display's requested CRTC color, programmed at scanout start
+    /// and on a live update.
+    color: [Option<alloc::sync::Arc<ColorProgram>>; 4],
 }
 impl Displays {
     fn new() -> Box<Self> {
@@ -982,6 +992,7 @@ impl Displays {
             selected: 0,
             parked: alloc::vec![Status::new(); 4].into_boxed_slice(),
             siblings: Siblings::default(),
+            color: [const { None }; 4],
         })
     }
 }
