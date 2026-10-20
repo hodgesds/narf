@@ -408,7 +408,9 @@ pub fn apply_routed_native(
     connectors: &[RoutedConnector],
     props: &[ConnectorProps],
 ) {
-    let previous: alloc::vec::Vec<(u32, Option<u32>, Option<u32>, Option<u8>)> = card
+    /// A connector's committed Colorspace, HDR blob and max bpc.
+    type Committed = (u32, Option<u32>, Option<u32>, Option<u8>);
+    let previous: alloc::vec::Vec<Committed> = card
         .native
         .iter()
         .map(|n| (n.connector, n.colorspace, n.hdr_output_metadata, n.max_bpc))

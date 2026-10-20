@@ -1453,10 +1453,11 @@ fn smoke_drm_ioctl_connector_max_bpc() -> TestResult {
     }
     let props = color_props(idx, 31, COLOR_CONNECTOR);
     let at = |id: u32| props.iter().position(|&(p, _)| p == id);
-    if !props.contains(&(0x80, 16))
-        || !(at(0x61) < at(0x80) && at(0x80) < at(0x67))
-        || at(0x61).is_none()
-    {
+    let listed = props.contains(&(0x80, 16))
+        && at(0x61).is_some()
+        && at(0x61) < at(0x80)
+        && at(0x80) < at(0x67);
+    if !listed {
         return TestResult::Fail("max bpc listing");
     }
     // GETCONNECTOR lists the same properties and values.
