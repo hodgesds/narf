@@ -1969,11 +1969,10 @@ pub fn select_all(
             scdc: false,
             depth: otg::ColorDepth::Bpc8,
             // HPO exposes only LPCM rates fitting its blanking budget; a
-            // compressed HPO stream carries none (its PPS-sharing SDP path
-            // is not ported).
+            // compressed stream's at its DSC bits per pixel and slices, as
+            // build_audio_output hands dsc_cfg to check_audio_bandwidth_dp.
             audio: sink_audio_info(&sink.edid).and_then(|info| match rate {
-                DpRate::Uhbr(_) if dsc.is_some() => None,
-                DpRate::Uhbr(rate) => otg::uhbr_audio_info(
+                DpRate::Uhbr(rate) => otg::uhbr_audio_info_with(
                     info,
                     &timing,
                     8,
@@ -1982,6 +1981,7 @@ pub fn select_all(
                         rate,
                         mst: false,
                     },
+                    dsc.as_ref(),
                 ),
                 _ => Some(info),
             }),
@@ -3479,7 +3479,13 @@ impl ColdBoot {
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Scanout);
             selection.audio = selection.audio.and_then(|info| {
-                otg::uhbr_audio_info(info, &selection.timing, 8, video.link.settings)
+                otg::uhbr_audio_info_with(
+                    info,
+                    &selection.timing,
+                    8,
+                    video.link.settings,
+                    selection.dsc.as_ref(),
+                )
             });
             if let Some(info) = selection.audio {
                 self.start_display_audio(port, false, info).await?;

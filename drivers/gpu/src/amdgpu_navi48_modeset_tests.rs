@@ -2634,7 +2634,8 @@ kernel_test_in!(
 /// A one-lane UHBR10 sink (DSC decoder, board connector at UHBR10) and its
 /// EDID's 4K60 (14,256,000 kbps): neither 1 x HBR3 nor 1 x UHBR10
 /// (9,641,000 kbps) carries it, so select compresses it for 1 x UHBR10,
-/// on 1 x UHBR10, through HPO, without audio. refine_dsc redoes it with
+/// on 1 x UHBR10, through HPO, with its LPCM budgeted at the compressed
+/// bits per pixel (build_audio_output's dsc_cfg). refine_dsc redoes it with
 /// the board's DISPCLK, admission takes it, the timing request is HPO DP
 /// with the DSC, and fallback keeps the PPS: Linux's table through the
 /// 128b/132b settings that carry the compressed stream.
@@ -2675,10 +2676,19 @@ fn navi48_modeset_selects_dsc_over_uhbr() -> TestResult {
         || (s.lanes, s.rate) != (1, Uhbr(U10))
         || s.dsc.is_none()
         || s.dsc != want
-        || s.audio.is_some()
         || s.timing.pixel_clock_khz != 594_000
     {
         panic!("UHBR DSC selection {s:?}");
+    }
+    let settings = otg::UhbrSettings {
+        lanes: 1,
+        rate: U10,
+        mst: false,
+    };
+    let audio = sink_audio_info(&edid_uhbr())
+        .and_then(|a| otg::uhbr_audio_info_with(a, &s.timing, 8, settings, s.dsc.as_ref()));
+    if audio.is_none() || s.audio != audio {
+        panic!("UHBR DSC audio {:?} want {audio:?}", s.audio);
     }
     let soc = dml::Soc {
         umc_channels: 16,

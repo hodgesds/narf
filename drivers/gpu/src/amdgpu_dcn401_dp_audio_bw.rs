@@ -1,5 +1,7 @@
-//! Linux dce_audio's LPCM blanking budget for legacy MST and UHBR SST.
+//! Linux dce_audio's LPCM blanking budget for legacy MST and UHBR SST/MST.
 //! Fixed-point order/rounding and 1.1 margin follow check_audio_bandwidth_dp.
+//! A compressed stream budgets its DSC bits per pixel and loses four
+//! symbols per slice (EOC), as build_audio_output's dsc_cfg feeds it.
 use super::*;
 use crate::amdgpu_dsc::Fixed as F;
 
@@ -7,7 +9,29 @@ pub(super) enum AudioLink {
     Mst(DpPhySettings),
     Uhbr(UhbrSettings, u16),
 }
-pub(super) fn rates(t: &Timing, bpc: u32, link: AudioLink, channels: u8, rates: u8) -> Option<u8> {
+/// A compressed stream as build_audio_output describes it: dsc_cfg's
+/// bits_per_pixel (1/16 bpp) and num_slices_h.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AudioDsc {
+    pub bpp_x16: u32,
+    pub slices: u32,
+}
+impl AudioDsc {
+    pub(crate) fn of(cfg: Option<&crate::amdgpu_dsc::DscConfig>) -> Option<Self> {
+        cfg.map(|c| Self {
+            bpp_x16: c.bpp_x16,
+            slices: c.slices_h,
+        })
+    }
+}
+pub(super) fn rates(
+    t: &Timing,
+    bpc: u32,
+    link: AudioLink,
+    channels: u8,
+    rates: u8,
+    dsc: Option<AudioDsc>,
+) -> Option<u8> {
     let lanes = match link {
         AudioLink::Mst(s) => s.lanes,
         AudioLink::Uhbr(s, _) => s.lanes,
@@ -20,6 +44,7 @@ pub(super) fn rates(t: &Timing, bpc: u32, link: AudioLink, channels: u8, rates: 
         || !matches!(bpc, 8 | 10 | 12)
         || !matches!(lanes, 1 | 2 | 4)
         || !(1..=8).contains(&channels)
+        || dsc.is_some_and(|d| !(1..=1024).contains(&d.bpp_x16) || !(1..=64).contains(&d.slices))
     {
         return None;
     }
@@ -57,10 +82,16 @@ pub(super) fn rates(t: &Timing, bpc: u32, link: AudioLink, channels: u8, rates: 
         }
     };
     let hblank_ms = F::fraction(i64::from(blank), i64::from(t.pixel_clock_khz));
-    let peak = F::int(t.pixel_clock_khz as i32).mul_int((bpc * 3) as i32);
+    let peak = match dsc {
+        Some(d) => F::int(t.pixel_clock_khz as i32).mul(F::fraction(i64::from(d.bpp_x16), 16)),
+        None => F::int(t.pixel_clock_khz as i32).mul_int((bpc * 3) as i32),
+    };
     let frac = peak.div(F::int(link_kbps));
     let mut available =
         hblank_ms.mul_int(1000).mul(sym_mhz).mul(frac).floor() as u32 * u32::from(lanes);
+    // EOC overhead, in Linux's unsigned arithmetic (a wrap passes the
+    // minimum-width and main-link checks below exactly as it does there).
+    available = available.wrapping_sub(dsc.map_or(0, |d| d.slices * 4));
     if available < u32::from(hblank_symbols) {
         available = 4 * u32::from(hblank_symbols);
     }

@@ -14,6 +14,8 @@ import tempfile
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--generate', action='store_true')
 parser.add_argument('--mst', action='store_true', help='check legacy 8b/10b MST instead')
+parser.add_argument('--dsc', action='store_true',
+                    help='check the DSC vectors (compressed bpp, slices, explicit blank width)')
 parser.add_argument('linux', nargs='?', default='/usr/src/linux', type=Path)
 args = parser.parse_args()
 here = Path(__file__).resolve().parent
@@ -38,7 +40,7 @@ union audio_sample_rates { uint32_t all; struct { uint32_t RATE_32:1, RATE_44_1:
 '''
 main = r'''
 int main(int argc, char **argv) {
- if (argc != 8) return 2;
+ if (argc != 8 && argc != 11) return 2;
  struct audio_crtc_info t = {0}; struct audio_dp_link_info l = {0};
  t.requested_pixel_clock_100Hz = strtoul(argv[1], 0, 10) * 10;
  t.h_active = strtoul(argv[2], 0, 10); t.h_total = strtoul(argv[3], 0, 10);
@@ -52,6 +54,13 @@ int main(int argc, char **argv) {
  l.hblank_min_symbol_width = (uint64_t)(t.h_total - t.h_active) * kbps /
    (t.requested_pixel_clock_100Hz / 10 * 128ull);
  union audio_sample_rates r = {.all=127};
+ if (argc == 11) {
+   /* build_audio_output: dsc_cfg.bits_per_pixel and num_slices_h; the
+    * blank width the stream encoder was given for the compressed stream. */
+   t.dsc_bits_per_pixel = strtoul(argv[8], 0, 10);
+   t.dsc_num_slices = strtoul(argv[9], 0, 10);
+   l.hblank_min_symbol_width = strtoul(argv[10], 0, 10);
+ }
  check_audio_bandwidth_dp(&t, &l, atoi(argv[7]), &r);
  printf("%u\n", r.all); return 0;
 }
@@ -65,7 +74,8 @@ if args.mst:
  /* hwseq removes FEC overhead for this pessimistic blanking budget. */
  l.link_bandwidth_kbps = l.link_rate * 27000 * 8 * l.lane_count;
 ''' + main[end:]
-vectors = here.parent / 'dcn401_mst_audio/vectors.txt' if args.mst else here / 'vectors.txt'
+vectors = here.parent / 'dcn401_mst_audio' if args.mst else here
+vectors = vectors / ('dsc_vectors.txt' if args.dsc else 'vectors.txt')
 with tempfile.TemporaryDirectory(prefix='narf-uhbr-audio-') as tmp:
     work = Path(tmp)
     (work / 'harness.c').write_text(shim + helpers + main)
@@ -77,7 +87,8 @@ with tempfile.TemporaryDirectory(prefix='narf-uhbr-audio-') as tmp:
                     str(work / 'harness.c'), str(display / 'dc/basics/fixpt31_32.c'),
                     '-o', str(binary)], check=True)
     if args.generate:
-        print('# Linux check_audio_bandwidth_dp; see dcn401_uhbr_audio/check.py.')
+        print('# Linux check_audio_bandwidth_dp' + (' with DSC (bpp x16, slices, blank width)'
+              if args.dsc else '') + '; see dcn401_uhbr_audio/check.py.')
         # Normal timings and short blanking/low-clock boundaries that filter rates.
         modes = [(27000, 720, 858), (148500, 1920, 2200), (594000, 3840, 4400),
                  (1188000, 3840, 4400), (2376000, 7680, 9000), (1333000, 3840, 3920)]
@@ -86,6 +97,23 @@ with tempfile.TemporaryDirectory(prefix='narf-uhbr-audio-') as tmp:
         cases = [(*m, bpc, rate, lanes, channels) for m in modes
                  for bpc in [8, 10, 12] for rate in ([6, 10, 20, 30] if args.mst else [1000, 1350, 2000])
                  for lanes in [1, 2, 4] for channels in [2, 6, 8]]
+        if args.dsc:
+            # Compressed bpp (1/16), horizontal slices and the encoder's
+            # minimum blank width (zero on 8b/10b MST).
+            dsc_modes = [(148500, 1920, 2200), (594000, 3840, 4400), (1188000, 3840, 4400),
+                         (2376000, 7680, 9000), (1333000, 3840, 3920), (1066000, 3840, 3920)]
+            dsc_modes += [(clock, 3840, 3840 + blank) for clock in [594000, 1188000]
+                          for blank in [32, 64, 80, 160]]
+            cases = []
+            for m in dsc_modes:
+                for bpp in [96, 128, 192]:
+                    for slices in [1, 4, 16]:
+                        for rate in ([10, 20, 30] if args.mst else [1000, 1350, 2000]):
+                            for lanes in [1, 4]:
+                                for channels in [2, 8]:
+                                    widths = [0] if args.mst else [0, 3, (m[2] - m[1]) * bpp // 16 // 128]
+                                    for w in widths:
+                                        cases.append((*m, 8, rate, lanes, channels, bpp, slices, w))
         for case in cases:
             result = subprocess.check_output([str(binary), *map(str, case)], text=True).strip()
             print(*case, '=', result)

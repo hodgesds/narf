@@ -573,3 +573,69 @@ kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_uhbr_mst_audio_rides_a_completed_payload
 );
+
+/// A compressed 128b/132b SST stream keeps its LPCM as Linux does: rates
+/// budgeted at the DSC bits per pixel, the slices' EOC symbols and the
+/// blank width the compressed payload programmed; the APG rides the PPS's
+/// secondary data path and stopping audio leaves GSP11 sending.
+fn dcn401_uhbr_dsc_audio_rides_the_pps_sdp_path() -> TestResult {
+    let (p, stream, pipe) = (2, 1, 3);
+    let settings = UhbrSettings {
+        lanes: 4,
+        rate: UhbrRate::Uhbr10,
+        mst: false,
+    };
+    let cfg = super::hpo_dsc_config();
+    let (mut e, mut sink, req, c) = super::uhbr_dsc_fixture(p, stream, pipe, settings, cfg);
+    run(e.start_uhbr_video(&mut sink, path(p), stream, pipe, c)).unwrap();
+    let mut e = Engine {
+        io: AudioIo {
+            inner: e.io,
+            az: BTreeMap::new(),
+            index: [0; 4],
+            writes: Vec::new(),
+            drop_at: None,
+            drop_disable: false,
+            stall: 0,
+            pause: false,
+            drift: None,
+        },
+        authority: e.authority,
+        layout: e.layout,
+        status: e.status,
+        displays: e.displays,
+    };
+    let gsp11 = reg(&e, stream, 0x3677);
+    assert_eq!(gsp11 & 1, 1, "PPS sending before audio");
+    let v = e.status.uhbr_video_running.unwrap();
+    for _ in 0..2 {
+        let a = run(e.start_dp_audio(path(p), info())).unwrap();
+        assert_eq!(
+            Some(a.info),
+            uhbr_audio_info_with(info(), &req.timing, 8, settings, Some(&cfg))
+        );
+        // The compressed stream's own blank width, not the uncompressed one.
+        assert_eq!(reg(&e, stream, 0x366b), u32::from(v.payload.hblank_symbols));
+        assert_ne!(
+            Some(v.payload.hblank_symbols),
+            crate::amdgpu_dcn401_otg::dp_phy::training::uhbr::video::uhbr_payload(
+                &req.timing,
+                8,
+                settings
+            )
+            .map(|p| p.hblank_symbols)
+        );
+        assert_eq!(reg(&e, stream, 0x367c) & 7, 7);
+        assert_eq!(reg(&e, stream, 0x3677), gsp11);
+        run(e.stop_dp_audio(path(p))).unwrap();
+        assert_eq!(reg(&e, stream, 0x367b) & 1, 1, "SDP path kept for the PPS");
+        assert_eq!(reg(&e, stream, 0x3677), gsp11);
+        assert!(e.status.uhbr_audio.is_none());
+    }
+    run(e.stop_uhbr_video(&mut sink, path(p))).unwrap();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-uhbr-audio",
+    dcn401_uhbr_dsc_audio_rides_the_pps_sdp_path
+);

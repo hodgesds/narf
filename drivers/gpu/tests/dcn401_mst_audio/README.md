@@ -17,3 +17,6 @@ as stereo and 3..8 channels as the eight-channel layout. The vectors test
 arithmetic independently of video link admission, including over-link modes.
 Native startup separately requires the completed manager payload and fresh
 SAT/VC/transport witnesses. These checks provide no physical playback evidence.
+
+`python3 ../dcn401_uhbr_audio/check.py --mst --dsc` checks `dsc_vectors.txt`
+(1512 compressed MST cases: DSC bits per pixel, slices, zero blank width).

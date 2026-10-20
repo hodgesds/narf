@@ -14,7 +14,9 @@ for that explicit hardware-width input, not all of Linux's audio policy.
 NARF uses stereo layout for mono and the eight-channel layout for 3..8 channels.
 The vectors cover Linux's defined 2/6/8-channel layouts, all UHBR rates/lane
 counts and RGB 8/10/12 bpc, including narrow blanking and rate-filter boundaries.
-DSC and MST audio are outside this contract.
+`--dsc` checks `dsc_vectors.txt` (4536 cases): compressed streams as
+build_audio_output describes them (dsc_cfg bits per pixel in 1/16, slice
+count), with the encoder's minimum blank width as an explicit input.
 The same harness with `--mst` checks the separate legacy MST vectors in
 `../dcn401_mst_audio`; its default UHBR inputs remain unchanged.
 

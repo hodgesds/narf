@@ -735,7 +735,7 @@ fn mst_vc_rate_dsc(
 /// compute_mst_dsc_configs_for_link finds a configuration for every stream
 /// so far; a device nothing fits stays dark. Every stream's PBN, slots and
 /// DSC are that last search's (it may change earlier streams' bpp). A
-/// compressed stream carries no audio (the MST audio path is uncompressed).
+/// compressed stream keeps its audio, budgeted at its DSC bits per pixel.
 fn select_mst_dsc(
     port: usize,
     caps: modeset::DpCaps,
@@ -813,11 +813,7 @@ fn select_mst_dsc(
             hdmi: false,
             scdc: false,
             depth: otg::ColorDepth::Bpc8,
-            audio: if p.dsc.is_some() {
-                None
-            } else {
-                mst_audio(edid, &timing, lanes, rate, caps)
-            },
+            audio: mst_audio(edid, &timing, lanes, rate, caps, p.dsc.as_ref()),
             avi: otg::Avi::default(),
             limited: false,
             ycbcr420: false,
@@ -841,17 +837,19 @@ fn select_mst_dsc(
     out
 }
 
-/// LPCM rates an uncompressed MST stream's blanking carries: on 8b/10b its
-/// share of the MTP, on 128b/132b the whole link as for SST.
+/// LPCM rates an MST stream's blanking carries: on 8b/10b its share of the
+/// MTP, on 128b/132b the whole link as for SST. A compressed stream budgets
+/// its DSC bits per pixel and slices (build_audio_output's dsc_cfg).
 fn mst_audio(
     edid: &[u8],
     timing: &Timing,
     lanes: u8,
     rate: DpRate,
     caps: modeset::DpCaps,
+    dsc: Option<&crate::amdgpu_dsc::DscConfig>,
 ) -> Option<otg::AudioInfo> {
     modeset::sink_audio_info(edid).and_then(|info| match rate {
-        DpRate::Legacy(_) => otg::mst_audio_info(
+        DpRate::Legacy(_) => otg::mst_audio_info_with(
             info,
             timing,
             8,
@@ -860,8 +858,9 @@ fn mst_audio(
                 rate: caps.rate,
                 mst: true,
             },
+            dsc,
         ),
-        DpRate::Uhbr(rate) => otg::uhbr_audio_info(
+        DpRate::Uhbr(rate) => otg::uhbr_audio_info_with(
             info,
             timing,
             8,
@@ -870,6 +869,7 @@ fn mst_audio(
                 rate,
                 mst: true,
             },
+            dsc,
         ),
     })
 }
@@ -925,7 +925,7 @@ fn select_mst_with_budget(
             hdmi: false,
             scdc: false,
             depth: otg::ColorDepth::Bpc8,
-            audio: mst_audio(edid, &timing, lanes, rate, caps),
+            audio: mst_audio(edid, &timing, lanes, rate, caps, None),
             avi: otg::Avi::default(),
             limited: false,
             ycbcr420: false,
