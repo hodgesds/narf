@@ -622,6 +622,115 @@ pub struct PlanePlan {
     pub odm_refcyc_h_blank_end: u32,
     /// Every pipe's DCHUBP request configuration.
     pub rq: RqRegs,
+    /// A DCC plane's mcache allocation; `None` without DCC.
+    pub mcache: Option<McacheAllocation>,
+}
+
+/// A DCC plane's `dml2_mcache_surface_allocation` as DML21 leaves it in the
+/// plane programming: per surface (luma, chroma) the mcache count, the
+/// slice boundaries (the last one the surface width; an admitted plane has
+/// at most three slices) and the global mcache ids
+/// (dml2_top_mcache_assign_global_mcache_ids, in admission order; the entry
+/// after the last wraps to the first), and whether chroma's last slice
+/// shares luma's last mcache.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct McacheAllocation {
+    pub count: [u8; 2],
+    pub offsets: [[u16; 3]; 2],
+    pub ids: [[u8; 4]; 2],
+    pub shared: bool,
+}
+
+/// One surface's `dml2_display_mcache_regs` (MCACHEID_REG_READ_1H/2H and
+/// the split): the main and MALL-prefetch sets are equal without iMALL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct McacheRegs {
+    pub id_first: u32,
+    pub id_second: u32,
+    pub split_location: u32,
+}
+
+impl McacheRegs {
+    /// reset_mcache_allocations: no mcache and no split.
+    pub const UNASSIGNED: Self = Self {
+        id_first: 0xf,
+        id_second: 0xf,
+        split_location: 0xffff,
+    };
+}
+
+impl McacheAllocation {
+    /// dml2_top_soc15_build_mcache_programming for one pipe whose luma
+    /// viewport starts at `p0.0` and is `p0.1` wide (and chroma's `p1`, for
+    /// a 4:2:0 plane): each surface's first mcache, and the second with the
+    /// split before the next boundary when the viewport spans two. `None`
+    /// when it spans more (calculate_first_second_splitting fails).
+    pub fn pipe_regs(&self, p0: (u32, u32), p1: Option<(u32, u32)>) -> Option<[McacheRegs; 2]> {
+        let mut regs = [McacheRegs::UNASSIGNED; 2];
+        for (i, vp) in [Some(p0), p1].into_iter().enumerate() {
+            let Some((start, width)) = vp else {
+                continue;
+            };
+            let count = usize::from(self.count[i]);
+            let offsets = &self.offsets[i][..count.min(3)];
+            let (first, second) = first_second_splitting(
+                offsets,
+                i64::from(start),
+                i64::from(start) + i64::from(width) - 1,
+            )?;
+            regs[i].id_first = u32::from(*self.ids[i].get(first)?);
+            if let Some(second) = second {
+                regs[i].id_second = u32::from(*self.ids[i].get(second)?);
+                regs[i].split_location = u32::from(*self.offsets[i].get(first)?).wrapping_sub(1);
+            }
+        }
+        Some(regs)
+    }
+}
+
+/// calculate_first_second_splitting with no shift: the slice holding the
+/// viewport's first pixel, and the next slice if its last pixel lies there.
+fn first_second_splitting(
+    boundaries: &[u16],
+    start: i64,
+    end: i64,
+) -> Option<(usize, Option<usize>)> {
+    let n = boundaries.len();
+    if n <= 1 {
+        return Some((0, None));
+    }
+    let mut left = 0;
+    let mut range_start = 0i64;
+    while left < n {
+        let range_end = i64::from(boundaries[left]) - 1;
+        if range_start <= start && start <= range_end {
+            break;
+        }
+        range_start = range_end + 1;
+        left += 1;
+    }
+    let mut range_end = 0xff_ffffi64;
+    let mut right = n as i64 - 1;
+    while right >= -1 {
+        let range_start = if right >= 0 {
+            i64::from(boundaries[right as usize])
+        } else {
+            0
+        };
+        if range_start <= end && end <= range_end {
+            break;
+        }
+        range_end = range_start - 1;
+        right -= 1;
+    }
+    let right = ((right + 1) as usize) % n;
+    if right == left {
+        Some((left, None))
+    } else if right == (left + 1) % n {
+        Some((left, Some(right)))
+    } else {
+        None
+    }
 }
 
 /// Streams admitted together at most: one per pipe.
@@ -1144,6 +1253,8 @@ struct Shape {
     /// The DCC mcaches the plane takes (both surfaces, one less when they
     /// share the last); zero without DCC.
     mcaches: u32,
+    /// The DCC plane's allocation, its ids still zero.
+    mcache: Option<McacheAllocation>,
 }
 
 /// DPPCLK, DISPCLK and deep-sleep DCFCLK one evaluation runs the pipe at.
@@ -1578,6 +1689,7 @@ impl Shape {
         let mut dram_nom = [Fx::ONE; 2];
         let mut dram_pref = [Fx::ONE; 2];
         let mut mcache_count = 0;
+        let mut mcache_alloc = None;
         if plane.dcc {
             let mcaches = Mcache::of(
                 &plane,
@@ -1595,6 +1707,28 @@ impl Shape {
                 mcache_count += m.count;
             }
             mcache_count -= u32::from(mcaches[0].shared);
+            // core_dcn4_calculate_mcache_allocation: the last boundary is
+            // the surface's width. Global ids come with admission.
+            let widths = [plane.surface_width, c.surface_width];
+            let mut a = McacheAllocation {
+                shared: mcaches[0].shared,
+                ..McacheAllocation::default()
+            };
+            for (i, m) in mcaches
+                .iter()
+                .take(if plane.is_420() { 2 } else { 1 })
+                .enumerate()
+            {
+                let count = m.count.min(3) as usize;
+                a.count[i] = m.count.min(u32::from(u8::MAX)) as u8;
+                for n in 0..count.saturating_sub(1) {
+                    a.offsets[i][n] = m.offsets[n] as u16;
+                }
+                if count > 0 {
+                    a.offsets[i][count - 1] = widths[i];
+                }
+            }
+            mcache_alloc = Some(a);
             // Linux splits a plane whose mcaches its pipes cannot place
             // (MPC combine), which this port does not admit.
             if !Mcache::admissible(&mcaches, &plane, t.h_active, odm) {
@@ -1619,6 +1753,7 @@ impl Shape {
             dram_nom,
             dram_pref,
             mcaches: mcache_count,
+            mcache: mcache_alloc,
         })
     }
     /// The surfaces of the plane: luma, then a 4:2:0 plane's chroma.
@@ -2342,6 +2477,24 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
     if shapes.iter().map(|s| s.mcaches).sum::<u32>() > DCC_MCACHES {
         return Err(Error::Unsupported);
     }
+    // dml2_top_mcache_assign_global_mcache_ids: ascending over the DCC
+    // planes, luma then chroma; the pseudo-last slice wraps to the first,
+    // and a shared last chroma slice takes luma's last id.
+    let mut next_id = 0u8;
+    for a in shapes.iter_mut().filter_map(|s| s.mcache.as_mut()) {
+        for i in 0..2 {
+            let count = usize::from(a.count[i]).min(3);
+            for j in 0..count {
+                a.ids[i][j] = next_id;
+                next_id += 1;
+            }
+            a.ids[i][count] = a.ids[i][0];
+        }
+        let (c0, c1) = (usize::from(a.count[0]), usize::from(a.count[1]));
+        if a.shared && c0 > 0 && c1 > 0 {
+            a.ids[1][c1 - 1] = a.ids[0][c0 - 1];
+        }
+    }
     // UnboundedRequest: one DPP in all, tiled and without chroma. The
     // compressed buffer then takes the CRB beyond the DET
     // (CalculateDETBufferSize); otherwise DML's minimum.
@@ -2697,6 +2850,7 @@ pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
                 det_bytes: shape.det_bytes,
                 odm_refcyc_h_blank_end: if shape.odm > 1 { h_blank_end(1) } else { 0 },
                 rq,
+                mcache: shape.mcache,
             },
         ));
     }

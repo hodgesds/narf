@@ -1021,10 +1021,56 @@ kernel_test_in!(
 /// Shared with tests/dcn401_dml21/check.sh (harness_surfaces.c, RAISED).
 const SURFACE_VECTORS: &str = include_str!("../tests/dcn401_dml21/surface_vectors.txt");
 
-/// The 28 values harness_surfaces.c prints after a plane's 62: the chroma
+/// The 56 values harness_surfaces.c prints after a plane's 62: the chroma
 /// DLG/TTU delivery, both surfaces' rq_regs, the expansion modes, the DET's
-/// chroma base, unbounded requesting and the arbiter's hw_debug5.
-fn surface_values(plan: &Plan, p: &PlanePlan) -> [u32; 28] {
+/// chroma base, unbounded requesting, the arbiter's hw_debug5, the mcache
+/// allocation and two pipes' mcache registers.
+fn surface_values(plan: &Plan, k: usize, p: &PlanePlan) -> [u32; 56] {
+    let mut out = [0u32; 56];
+    out[..27].copy_from_slice(&surface_rq_values(plan, p)[..27]);
+    // The mcache allocation, then each of two pipes' mcache registers with
+    // pipe j of n taking the j-th n-th of each viewport (harness_surfaces.c).
+    let a = p.mcache.unwrap_or_default();
+    let mut v = alloc::vec::Vec::with_capacity(29);
+    v.extend(a.count.map(u32::from));
+    for i in 0..2 {
+        v.extend(a.offsets[i].map(u32::from));
+    }
+    for i in 0..2 {
+        v.extend(a.ids[i].map(u32::from));
+    }
+    v.push(u32::from(a.shared));
+    let plane = plan.mode.plane_list().nth(k).unwrap_or_default();
+    let n = u32::from(plan.pipes);
+    for j in 0..2u32 {
+        if j >= n {
+            v.extend([0; 6]);
+            continue;
+        }
+        let share = |w: u16| (j * (u32::from(w) / n), u32::from(w) / n);
+        let regs = match p.mcache {
+            None => Some([McacheRegs::UNASSIGNED; 2]),
+            Some(a) => a.pipe_regs(
+                share(plane.viewport_width),
+                plane.chroma.map(|c| share(c.viewport_width)),
+            ),
+        };
+        match regs {
+            Some(r) => {
+                for s in r {
+                    v.extend([s.id_first, s.id_second, s.split_location]);
+                }
+            }
+            None => v.extend([0; 6]),
+        }
+    }
+    out[27..].copy_from_slice(&v);
+    out
+}
+
+/// The chroma delivery, rq_regs, expansion modes, DET chroma base,
+/// unbounded requesting and hw_debug5 (28 with a zero pad).
+fn surface_rq_values(plan: &Plan, p: &PlanePlan) -> [u32; 28] {
     let (d, t, q) = (&p.dlg, &p.ttu, &p.rq);
     let rq = |r: &RqPlane| {
         [
@@ -1118,7 +1164,7 @@ fn surface_plane(p: &[u32; 23]) -> Option<Plane> {
     })
 }
 
-/// surface_vectors.txt: every plane's 62 plan values and 27 surface values
+/// surface_vectors.txt: every plane's 62 plan values and 56 surface values
 /// (planes in argument order), or the rejection ("! ClockState" for a plan
 /// whose DCF/fabric state DPMM raises). Returns the plans, rejections,
 /// 4:2:0 planes and tiled planes admitted.
@@ -1178,8 +1224,8 @@ fn check_surface_vectors(vectors: &str) -> Result<[u32; 4], &'static str> {
                         }
                         first = false;
                         let mut want = [0u32; 62];
-                        let mut want_s = [0u32; 28];
-                        if !parse(&mut words, &mut want) || !parse(&mut words, &mut want_s[..27]) {
+                        let mut want_s = [0u32; 56];
+                        if !parse(&mut words, &mut want) || !parse(&mut words, &mut want_s) {
                             return Err("malformed surface plan");
                         }
                         for (i, (&g, &w)) in values(&view).iter().zip(want.iter()).enumerate() {
@@ -1188,7 +1234,7 @@ fn check_surface_vectors(vectors: &str) -> Result<[u32; 4], &'static str> {
                             }
                         }
                         let p = plan.plane(k).ok_or("surface plan lost a plane")?;
-                        if surface_values(plan, &p) != want_s {
+                        if surface_values(plan, k, &p) != want_s {
                             return Err("surface rq/chroma value differs from Linux DML21");
                         }
                         if !pipes_match(&mut words, &view) {

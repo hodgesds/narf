@@ -16,14 +16,18 @@
  * 2, 4 or 8), 1 dml2_420_8, 2 dml2_420_10; swizzle 0 linear, 1 256B_2D,
  * 2 4KB_2D, 3 64KB_2D, 4 256KB_2D; dcc 0 off, 1 on with independent 64B
  * blocks, 2 on without; rotation 0-3 (dml2_rotation_angle).
- * Prints as harness_planes.c, each plane's 62 values followed by 28 more:
+ * Prints as harness_planes.c, each plane's 62 values followed by 56 more:
  * refcyc_per_line_delivery_pre_c refcyc_per_line_delivery_c
  * refcyc_per_req_delivery_pre_c refcyc_per_req_delivery_c, the rq_regs of
  * luma then chroma (chunk_size min_chunk_size meta_chunk_size
  * min_meta_chunk_size dpte_group_size mpte_group_size swath_height
  * pte_row_height_linear), drq/prq/mrq/crq_expansion_mode plane1_base_address
- * unbounded_request_enabled, and the arbiter's
- * allow_sdpif_rate_limit_when_cstate_req.
+ * unbounded_request_enabled, the arbiter's
+ * allow_sdpif_rate_limit_when_cstate_req, the plane's mcache allocation
+ * (num_mcaches_plane0/1, three x offsets and four global ids per plane,
+ * last_slice_sharing.plane0_plane1) and, for two pipes, the main mcache
+ * registers dml2_build_mcache_programming derives (p0 then p1: first id,
+ * second id, split location; zeros past the plane's pipes).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -235,6 +239,30 @@ int main(int argc, char **argv)
 	}
 	const struct dml2_core_internal_mode_program *m =
 		&init.dml2_instance->core_instance.clean_me_up.mode_lib.mp;
+	/* dml21_prepare_mcache_programming with each of a plane's n pipes
+	 * taking the n-th share of its luma and chroma viewport widths. */
+	static struct dml2_build_mcache_programming_in_out mc;
+	mc.dml2_instance = init.dml2_instance;
+	for (int k = 0; k < planes; k++) {
+		struct dml2_plane_mcache_configuration_descriptor *d = &mc.mcache_configurations[k];
+		const struct dml2_plane_parameters *p = &prog.display_config.plane_descriptors[k];
+		unsigned int n = prog.plane_programming[k].num_dpps_required;
+
+		d->plane_descriptor = p;
+		d->mcache_allocation = &prog.plane_programming[k].mcache_allocation;
+		d->num_pipes = (char)n;
+		for (unsigned int j = 0; j < n; j++) {
+			struct dml2_pipe_configuration_descriptor *c = &d->pipe_configurations[j];
+
+			c->plane0.viewport_width = p->composition.viewport.plane0.width / n;
+			c->plane0.viewport_x_start = j * c->plane0.viewport_width;
+			c->plane1.viewport_width = p->composition.viewport.plane1.width / n;
+			c->plane1.viewport_x_start = j * c->plane1.viewport_width;
+			c->plane1_enabled = p->pixel_format == dml2_420_8 || p->pixel_format == dml2_420_10;
+		}
+		mc.num_configurations++;
+	}
+	bool mcache_ok = dml2_build_mcache_programming(&mc);
 	printf("PLAN");
 	for (int k = 0; k < planes; k++) {
 		const struct dml2_dchub_per_pipe_register_set *r = prog.plane_programming[k].pipe_regs[0];
@@ -280,6 +308,32 @@ int main(int argc, char **argv)
 			printf(" |");
 		for (size_t i = 0; i < sizeof(v) / sizeof(v[0]); i++)
 			printf(" %lu", v[i]);
+		/* The mcache allocation: counts, boundaries, global ids, sharing;
+		 * then two pipes' main mcache registers (MALL must equal them). */
+		const struct dml2_mcache_surface_allocation *a = &prog.plane_programming[k].mcache_allocation;
+		printf(" %u %u", a->num_mcaches_plane0, a->num_mcaches_plane1);
+		for (int i = 0; i < 3; i++)
+			printf(" %d", a->mcache_x_offsets_plane0[i]);
+		for (int i = 0; i < 3; i++)
+			printf(" %d", a->mcache_x_offsets_plane1[i]);
+		for (int i = 0; i < 4; i++)
+			printf(" %d", a->global_mcache_ids_plane0[i]);
+		for (int i = 0; i < 4; i++)
+			printf(" %d", a->global_mcache_ids_plane1[i]);
+		printf(" %d", a->last_slice_sharing.plane0_plane1);
+		for (int j = 0; j < 2; j++) {
+			const struct dml2_hubp_pipe_mcache_regs *x = mc.per_plane_pipe_mcache_regs[k][j];
+
+			if (!mcache_ok || !x) {
+				printf(" 0 0 0 0 0 0");
+				continue;
+			}
+			if (memcmp(&x->main, &x->mall, sizeof(x->main)))
+				printf(" MALLDIFF");
+			printf(" %u %u %u %u %u %u", x->main.p0.mcache_id_first, x->main.p0.mcache_id_second,
+			       x->main.p0.split_location, x->main.p1.mcache_id_first,
+			       x->main.p1.mcache_id_second, x->main.p1.split_location);
+		}
 		print_odm_pipes(&prog.plane_programming[k]);
 	}
 	putchar('\n');
