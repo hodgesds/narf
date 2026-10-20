@@ -43,7 +43,7 @@ use crate::pkt::{
     IP_PROTO_UDP,
 };
 use crate::pkt_icmp_extra::{ICMP_DEST_UNREACHABLE, ICMP_PARAMETER_PROBLEM, ICMP_TIME_EXCEEDED};
-use crate::tcp_stack::{arp_resolve_in, nf_tx_filter_in};
+use crate::tcp_stack::nf_tx_filter_in;
 use crate::udp_sock::{deliver_icmp_error_in, SockError};
 
 // ── Global echo-ID counter ─────────────────────────────────────────
@@ -320,16 +320,20 @@ pub fn icmp_echo_send(
             return Err(IcmpError2::LocalMsgSize { info })
         }
     }
-    let dst_mac = if target == [255, 255, 255, 255] {
-        [0xFF; 6]
+    // The route's next hop, not the target — see `udp_sock.rs` and Linux's
+    // `ip_neigh_for_gw()`. Pinging anything off-link ARPed the remote address
+    // on the local link and failed. `ping_v4_sendmsg` never waits for the
+    // neighbour: an unresolved one gets the request queued on it below.
+    let (dst_mac, unresolved) = if target == [255, 255, 255, 255] {
+        ([0xFF; 6], None)
     } else {
-        // The route's next hop, not the target — see `udp_sock.rs` and Linux's
-        // `ip_neigh_for_gw()`. Pinging anything off-link ARPed the remote
-        // address on the local link and failed.
         let nexthop = crate::route::route_lookup_in(sock.net_ns_id, crate::ipv4::Ipv4Addr(target))
             .map(|r| r.nexthop.0)
             .unwrap_or(target);
-        arp_resolve_in(sock.net_ns_id, nexthop, 1000).map_err(|_| IcmpError2::NetworkUnreachable)?
+        match crate::tcp_stack::arp_cached_in(sock.net_ns_id, nexthop) {
+            Some(mac) => (mac, None),
+            None => ([0u8; 6], Some(nexthop)),
+        }
     };
 
     // Build: Eth + IPv4 + ICMP echo request.
@@ -391,6 +395,30 @@ pub fn icmp_echo_send(
         sock.sync_readiness(&pending);
     }
 
+    if let Some(nexthop) = unresolved {
+        let net_ns_id = sock.net_ns_id;
+        let ignore_df = crate::ip_output::ip_sk_ignore_df(pmtudisc);
+        let len = frame.len();
+        crate::tcp_stack::neigh_output_in(
+            net_ns_id,
+            nexthop,
+            len,
+            alloc::boxed::Box::new(move |mac| {
+                if let Some(mac) = mac {
+                    frame[..6].copy_from_slice(&mac);
+                    let _ = crate::ip_output::ip_finish_output(
+                        net_ns_id,
+                        &frame,
+                        ETH_HDR_LEN,
+                        mtu,
+                        ignore_df,
+                        |f| iface.xmit(f),
+                    );
+                }
+            }),
+        );
+        return Ok(());
+    }
     // `ip_finish_output`: fragments a request larger than the MTU.
     let sent = crate::ip_output::ip_finish_output(
         sock.net_ns_id,
@@ -607,25 +635,29 @@ fn handle_echo_request(net_ns_id: u64, src_ip: [u8; 4], dst_ip: [u8; 4], icmp_bo
     };
 
     // net.ipv4.icmp_echo_ignore_broadcasts — the Smurf-amplification guard,
-    // on by default. Checked before `arp_resolve_in` below, which blocks for
-    // up to a second and emits an ARP request: a dropped packet must cost
-    // nothing, or the drop becomes its own amplifier.
+    // on by default. Checked before the neighbour lookup below, which may
+    // emit an ARP request: a dropped packet must cost nothing, or the drop
+    // becomes its own amplifier.
     if sysctl::icmp_echo_ignore_broadcasts()
         && crate::ip_local::is_broadcast_or_multicast_on(&iface.name, dst_ip)
     {
         return;
     }
-    let dst_mac = match arp_resolve_in(net_ns_id, src_ip, 1000) {
-        Ok(m) => m,
-        Err(_) => return,
-    };
+    // `icmp_reply` runs in the RX path: an unresolved neighbour queues the
+    // reply rather than waiting for it.
+    let dst_mac = crate::tcp_stack::arp_cached_in(net_ns_id, src_ip);
 
     let icmp_len = 8 + payload.len();
     let ip_total = IPV4_HDR_LEN + icmp_len;
     let frame_len = ETH_HDR_LEN + ip_total;
     let mut frame = alloc::vec![0u8; frame_len];
 
-    write_eth_header(&mut frame, dst_mac, iface.mac, ETHERTYPE_IPV4);
+    write_eth_header(
+        &mut frame,
+        dst_mac.unwrap_or([0u8; 6]),
+        iface.mac,
+        ETHERTYPE_IPV4,
+    );
     write_ipv4_header(
         &mut frame[ETH_HDR_LEN..],
         ip_total as u16,
@@ -664,13 +696,36 @@ fn handle_echo_request(net_ns_id: u64, src_ip: [u8; 4], dst_ip: [u8; 4], icmp_bo
     frame[icmp_off + 2..icmp_off + 4].copy_from_slice(&cs.to_be_bytes());
 
     if nf_tx_filter_in(net_ns_id, &iface.name, &mut frame[ETH_HDR_LEN..])
-        == crate::netfilter::Verdict::Accept
+        != crate::netfilter::Verdict::Accept
     {
+        return;
+    }
+    if dst_mac.is_some() {
         let _ =
             crate::ip_output::ip_finish_output(net_ns_id, &frame, ETH_HDR_LEN, mtu, true, |f| {
                 iface.xmit(f)
             });
+        return;
     }
+    let len = frame.len();
+    crate::tcp_stack::neigh_output_in(
+        net_ns_id,
+        src_ip,
+        len,
+        alloc::boxed::Box::new(move |mac| {
+            if let Some(mac) = mac {
+                frame[..6].copy_from_slice(&mac);
+                let _ = crate::ip_output::ip_finish_output(
+                    net_ns_id,
+                    &frame,
+                    ETH_HDR_LEN,
+                    mtu,
+                    true,
+                    |f| iface.xmit(f),
+                );
+            }
+        }),
+    );
 }
 
 fn handle_echo_reply(net_ns_id: u64, _src_ip: [u8; 4], icmp_body: &[u8]) {

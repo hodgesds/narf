@@ -542,7 +542,6 @@ impl SocketFile {
                 destination,
                 buf,
                 &udp_options,
-                0,
                 inet_id,
             ) {
                 Ok(n) => SocketOpResult::Ok(n as u64),

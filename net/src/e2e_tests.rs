@@ -133,8 +133,8 @@ fn full_reset(iface_name: &'static str, local_ip: [u8; 4], gateway: [u8; 4]) {
     iface::set_iface_ipv4_fields(iface_name, local_ip, gateway);
     iface::add_addr(iface_name, local_ip, 24);
 
-    // Pre-seed the ARP cache so `arp_resolve` in `connect` / `listen`
-    // doesn't spin waiting for a real ARP reply. We insert the gateway
+    // Pre-seed the ARP cache so `connect` / `listen` frames go out at once
+    // instead of queueing on an unresolved neighbour. We insert the gateway
     // MAC and a direct-peer MAC (loopback destination).
     let gw_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
     crate::tcp_stack::__arp_insert_legacy(gateway, gw_mac);
@@ -676,7 +676,7 @@ fn smoke_e2e_routing_and_arp_resolution() -> TestResult {
     };
 
     // Inject SYN from 8.8.8.8:12345. ARP must resolve gateway for SYN-ACK.
-    // Seed 8.8.8.8 directly into the legacy ARP cache so arp_resolve succeeds.
+    // Seed 8.8.8.8 directly into the legacy ARP cache so it resolves at once.
     crate::tcp_stack::__arp_insert_legacy(REMOTE_IP, GW_MAC);
     arp_cache::insert(IFACE, REMOTE_IP, GW_MAC);
 
@@ -2788,7 +2788,6 @@ fn smoke_udp_first_datagram_flushes_after_arp_reply() -> TestResult {
         SocketAddrV4::new(DNS_IP, DST_PORT),
         payload,
         &UdpOptions::default(),
-        0,
         None,
     );
     if sent != Ok(payload.len()) {
@@ -2852,7 +2851,6 @@ fn smoke_udp_pending_datagram_dropped_on_iface_namespace_move() -> TestResult {
         SocketAddrV4::new([10, 24, 0, 3], 53),
         b"pending-before-move",
         &UdpOptions::default(),
-        0,
         None,
     );
     if sent != Ok(19) || crate::udp_sock::__pending_udp4_test_count(0) != 1 {

@@ -505,6 +505,23 @@ payload over `UDP_MAX_PAYLOAD` (65507) regardless of `SO_SNDBUF`, require
 `SO_BROADCAST` for exactly those broadcast destinations, drop an arriving
 datagram when the receive queue is full, and drop received datagrams whose
 length field is shorter than the header or longer than the segment.
+No IPv4 output path waits for ARP (Linux `neigh_output` /
+`__neigh_event_send`). `tcp_stack::neigh_output_in(ns, nexthop, len, cont)`
+runs the send continuation `cont` with the MAC at once on a cache hit; on a
+miss it queues `cont` on the neighbour (`arp_cache::queue_pending`, at most
+`arp_cache::UNRES_QLEN_BYTES` = 212992 bytes per neighbour, oldest dropped
+first and never run) and starts resolution; a neighbour already FAILED runs
+`cont(None)` at once. An ARP reply runs the queued continuations with the MAC
+(`neigh_resolved`); the neighbour timer `neigh_tick` (in the net timer pump)
+retransmits the request every `RETRANS_TIME` and, once the probes are spent,
+marks the neighbour FAILED and runs them with `None` (`arp_error_report`).
+`neigh_start_in` starts resolution without queuing, for paths with their own
+queue. TCP (a TCB starts with an all-zero `remote_mac` and its `nexthop`;
+`emit_tcb_frame` queues while unresolved, and a failure reaches the socket as
+an ICMP host unreachable — EHOSTUNREACH in SYN-SENT), forwarding, ICMP
+errors, ICMP echo requests and replies, and `ipv4::ipv4_send` all go through
+it; the former blocking `arp_resolve_in` / `arp::resolve_blocking` are gone,
+and `udp_sock::udp_send_from` no longer takes an ARP timeout.
 An IPv4 UDP send to an unresolved next hop retains the complete post-netfilter
 frame in a namespace/interface/neighbor-scoped bounded queue, starts ARP, and
 reports success without blocking. Learning the neighbor MAC patches and
@@ -512,7 +529,7 @@ transmits every matching queued frame after releasing the queue lock. The
 queue is bounded to 256 packets and 1 MiB; overflow is `UdpError::QueueFull`
 and the Linux socket ABI reports `ENOBUFS`. Interface unregister, interface
 movement between network namespaces, and network namespace teardown discard
-their pending frames.
+their pending frames; resolution giving up discards them too.
 ICMP errors quoting a UDP datagram reach sockets bound to the exact source
 address or to `INADDR_ANY` (`__udp4_lib_lookup`), and Parameter Problem is
 delivered like Destination Unreachable and Time Exceeded.

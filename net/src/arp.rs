@@ -21,14 +21,12 @@
 //! wired before this module existed; it continues to work. This module
 //! adds the new LRU cache required by the spec.
 //!
-//! ## Blocking resolver
+//! ## Resolution
 //!
-//! `resolve_blocking(iface, target_ip, timeout_ms)` sends an ARP
-//! request via `iface::send` and busy-waits (via
-//! `narf_scheduler::responsive_spin_until`) until either a reply lands
-//! in the cache or the deadline passes. The RX path in `tcp_stack`
-//! calls `arp_insert_from_rx` when it parses an ARP reply, populating
-//! this cache as well.
+//! Nothing here waits for a reply: senders queue on the neighbour through
+//! `tcp_stack::neigh_output_in` (Linux `neigh_output`). The RX path in
+//! `tcp_stack` calls `arp_insert_from_rx` when it parses an ARP reply,
+//! populating this cache as well.
 
 extern crate alloc;
 
@@ -37,10 +35,6 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use narf_lib::sync::IrqSafeSpinLock;
-use narf_scheduler::narf_time;
-
-use crate::iface;
-use crate::pkt;
 
 // ── Cache entry + ring buffer ───────────────────────────────────────
 
@@ -223,61 +217,6 @@ pub fn arp_insert_from_rx(iface_name: &str, ip: [u8; 4], mac: [u8; 6]) {
     // Also update the legacy BTreeMap in tcp_stack so existing code
     // that reads from there continues to work.
     crate::tcp_stack::__arp_insert_legacy(ip, mac);
-}
-
-// ── Blocking resolver ──────────────────────────────────────────────
-
-/// ARP resolution error.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum ArpError {
-    /// No interface with the given name is registered.
-    NoIface,
-    /// ARP reply not received within the timeout.
-    Timeout,
-}
-
-/// Resolve `target_ip` to a MAC on `iface_name`. First checks the LRU
-/// cache; on a miss, sends an ARP request and busy-waits up to
-/// `timeout_ms` milliseconds for a reply to land in the cache (pumped
-/// by `iface::drain_pump` on each iteration).
-///
-/// RFC 826 §2: the sender fills its sender hardware/protocol addresses,
-/// sets the target hardware address to zero, and broadcasts on the link.
-pub fn resolve_blocking(
-    iface_name: &str,
-    target_ip: [u8; 4],
-    timeout_ms: u64,
-) -> Result<[u8; 6], ArpError> {
-    // Fast path: cache hit.
-    if let Some(mac) = lookup(iface_name, target_ip) {
-        return Ok(mac);
-    }
-
-    // Build and send an ARP request.
-    let snap = iface::lookup(iface_name).ok_or(ArpError::NoIface)?;
-    {
-        let mut frame = [0u8; 60];
-        let n = pkt::build_arp_request(&mut frame, snap.mac, snap.ipv4, target_ip)
-            .ok_or(ArpError::NoIface)?;
-        let _ = snap.xmit(&frame[..n]);
-    }
-
-    // Busy-wait for the reply to land.
-    let deadline = narf_time::Deadline::after_ns(timeout_ms.saturating_mul(1_000_000));
-    let name = iface_name;
-    let mut result = None;
-    let _ = narf_scheduler::responsive_spin_until(
-        || {
-            while iface::drain_pump() {}
-            if let Some(mac) = lookup(name, target_ip) {
-                result = Some(mac);
-                return true;
-            }
-            false
-        },
-        deadline,
-    );
-    result.ok_or(ArpError::Timeout)
 }
 
 /// Test-only: flush all ARP caches.

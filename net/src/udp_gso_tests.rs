@@ -106,7 +106,7 @@ fn opts(pmtudisc: i32, gso_size: u16) -> UdpOptions {
 }
 
 fn send(payload: &[u8], o: &UdpOptions, dst: [u8; 4]) -> Result<usize, UdpError> {
-    udp_send_from(0, SPORT, SocketAddrV4::new(dst, DPORT), payload, o, 0, None)
+    udp_send_from(0, SPORT, SocketAddrV4::new(dst, DPORT), payload, o, None)
 }
 
 fn run(r: Result<(), &'static str>) -> TestResult {
@@ -381,7 +381,6 @@ fn smoke_udp_gso_v4_connected_ids() -> TestResult {
             SocketAddrV4::new(PEER, DPORT),
             &payload,
             &opts(IP_PMTUDISC_DO, 1200),
-            0,
             Some(&inet_id),
         );
         if sent != Ok(3600) {

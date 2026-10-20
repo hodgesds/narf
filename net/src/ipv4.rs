@@ -37,7 +37,6 @@ use core::fmt;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::arp;
 use crate::iface;
 use crate::pkt::{
     set_ipv4_checksum, write_eth_header, write_ipv4_header, ETHERTYPE_IPV4, ETH_HDR_LEN,
@@ -211,9 +210,11 @@ const FRAME_BUF: usize = 1514;
 /// - Otherwise the frame is sent to the configured default gateway.
 /// - Broadcast destinations are sent to the Ethernet broadcast MAC.
 ///
-/// ARP resolution uses `arp::resolve_blocking` with a 1 s timeout
-/// (same budget as `tcp_stack::arp_resolve`). If resolution fails the
-/// function returns `Err(SendError::ArpTimeout)`.
+/// An unresolved next hop does not block: the frame is queued on the
+/// neighbour (`tcp_stack::neigh_output_in`, Linux `neigh_output`) and sent
+/// when the ARP reply arrives, or dropped if resolution gives up.
+/// `Err(SendError::ArpTimeout)` means there is no next hop at all (off-link
+/// with no gateway).
 pub fn ipv4_send(
     iface_name: &str,
     dst: Ipv4Addr,
@@ -239,12 +240,9 @@ pub fn ipv4_send(
         binding.gateway.ok_or(SendError::ArpTimeout)?
     };
 
-    // Resolve next-hop to MAC. Broadcast maps directly.
-    let dst_mac: [u8; 6] = if dst == Ipv4Addr::BROADCAST || nexthop_ip == Ipv4Addr::BROADCAST {
-        [0xFF; 6]
-    } else {
-        arp::resolve_blocking(iface_name, nexthop_ip.0, 1000).map_err(|_| SendError::ArpTimeout)?
-    };
+    // Broadcast maps directly; anything else is filled in by the neighbour.
+    let broadcast = dst == Ipv4Addr::BROADCAST || nexthop_ip == Ipv4Addr::BROADCAST;
+    let dst_mac: [u8; 6] = if broadcast { [0xFF; 6] } else { [0u8; 6] };
 
     // Build the frame on the stack.
     let mut frame = [0u8; FRAME_BUF];
@@ -263,8 +261,24 @@ pub fn ipv4_send(
         .copy_from_slice(payload);
     set_ipv4_checksum(&mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN]);
 
-    snap.xmit(&frame[..total])
-        .map_err(|_| SendError::DriverError)
+    if broadcast {
+        return snap
+            .xmit(&frame[..total])
+            .map_err(|_| SendError::DriverError);
+    }
+    let mut owned = frame[..total].to_vec();
+    crate::tcp_stack::neigh_output_in(
+        0,
+        nexthop_ip.0,
+        total,
+        alloc::boxed::Box::new(move |mac| {
+            if let Some(mac) = mac {
+                owned[..6].copy_from_slice(&mac);
+                let _ = snap.xmit(&owned);
+            }
+        }),
+    );
+    Ok(())
 }
 
 /// Clear all bindings. For testing and interface reset.

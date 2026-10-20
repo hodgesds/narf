@@ -1094,8 +1094,7 @@ impl SocketFile {
             // (`ip_select_ident_segs` keys on `inet_daddr`).
             let inet_id = connected.map(|_| &self.inet_id);
             return match narf_net::udp_sock::udp_send_from(
-                ns, local_port, dst, buf, &udp_opts, // Never block a sendto on ARP.
-                0, inet_id,
+                ns, local_port, dst, buf, &udp_opts, inet_id,
             ) {
                 Ok(n) => SocketOpResult::Ok(n as u64),
                 Err(narf_net::udp_sock::UdpError::NoBroadcastPermission) => {
@@ -1340,7 +1339,7 @@ impl SocketFile {
         };
         let dst = narf_net::udp_sock::SocketAddrV4::new(dest.0.to_be_bytes(), dest.1);
         let inet_id = connected.map(|_| &self.inet_id);
-        match narf_net::udp_sock::udp_send_from(ns, local_port, dst, buf, &udp_opts, 0, inet_id) {
+        match narf_net::udp_sock::udp_send_from(ns, local_port, dst, buf, &udp_opts, inet_id) {
             Ok(n) => SocketOpResult::Ok(n as u64),
             Err(narf_net::udp_sock::UdpError::MsgTooLong) => {
                 SocketOpResult::Err(SockError::MsgSize)

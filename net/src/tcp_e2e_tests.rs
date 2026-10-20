@@ -384,6 +384,16 @@ fn live_ids() -> Vec<u32> {
 /// first; only if none is pending, fire the retransmit / persist timers.
 /// Returns `true` if any timer fired.
 fn advance_clock() -> bool {
+    // The neighbour timer first: ARP retransmits every second and gives up
+    // within seconds, long before a SYN's backed-off retries run out.
+    let waiting = crate::arp_cache::pending_neighbours();
+    if !waiting.is_empty() {
+        for (_, name, ip) in &waiting {
+            crate::arp_cache::__force_retrans_due(name, *ip);
+        }
+        crate::tcp_stack::neigh_tick();
+        return true;
+    }
     let ids = live_ids();
     let mut fired = false;
     for &id in &ids {

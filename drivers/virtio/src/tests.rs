@@ -814,7 +814,7 @@ fn smoke_virtio_net_pci_legacy_iface_registered() -> TestResult {
     // The TCP stack consumes from narf_net::iface (fn-pointer
     // registry), not the ring-based narf_net::registry. virtio-net
     // probe must hook itself into both so `tcp_stack::connect` /
-    // `arp_resolve` / `iface::send` actually reach the device.
+    // ARP requests / `iface::send` actually reach the device.
     use crate::net_pci;
     if !net_pci::is_probed() {
         return TestResult::Skip("virtio-net-pci not present in this QEMU config");

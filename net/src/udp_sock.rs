@@ -441,6 +441,31 @@ pub(crate) fn neighbor_resolved(net_ns_id: u64, iface_name: &str, neighbor: [u8;
     }
 }
 
+/// The neighbours UDP frames are waiting for, once each.
+pub(crate) fn pending_neighbours() -> Vec<(u64, String, [u8; 4])> {
+    let q = PENDING_UDP4.lock();
+    let mut out: Vec<(u64, String, [u8; 4])> = Vec::new();
+    for p in q.iter() {
+        if !out
+            .iter()
+            .any(|(ns, name, ip)| *ns == p.net_ns_id && name == &p.iface && *ip == p.neighbor)
+        {
+            out.push((p.net_ns_id, p.iface.clone(), p.neighbor));
+        }
+    }
+    out
+}
+
+/// Resolution of `neighbor` gave up: drop the UDP frames waiting for it, as
+/// `neigh_invalidate` frees the neighbour's queue.
+pub(crate) fn neighbor_failed(net_ns_id: u64, iface_name: &str, neighbor: [u8; 4]) {
+    PENDING_UDP4.lock().retain(|packet| {
+        !(packet.net_ns_id == net_ns_id
+            && packet.iface == iface_name
+            && packet.neighbor == neighbor)
+    });
+}
+
 pub(crate) fn remove_interface(iface_name: &str) {
     PENDING_UDP4
         .lock()
@@ -557,14 +582,12 @@ pub fn udp_send(
     // A connected socket's datagrams take its own `inet_id` sequence
     // (`ip_select_ident_segs` checks `inet_daddr`, not this send's address).
     let inet_id = connected.map(|_| &sock.inet_id);
-    // In-kernel senders (DHCP, DNS) keep the historical blocking resolve.
     udp_send_from(
         sock.net_ns_id,
         sock.local.port,
         dst,
         payload,
         &opts,
-        1000,
         inet_id,
     )
 }
@@ -586,18 +609,9 @@ pub fn udp_send_from(
     dst: SocketAddrV4,
     payload: &[u8],
     options: &UdpOptions,
-    arp_timeout_ms: u64,
     inet_id: Option<&AtomicU16>,
 ) -> Result<usize, UdpError> {
-    udp_send_inner(
-        net_ns_id,
-        src_port,
-        dst,
-        payload,
-        options,
-        arp_timeout_ms,
-        inet_id,
-    )
+    udp_send_inner(net_ns_id, src_port, dst, payload, options, inet_id)
 }
 
 fn udp_send_inner(
@@ -606,7 +620,6 @@ fn udp_send_inner(
     dst: SocketAddrV4,
     payload: &[u8],
     options: &UdpOptions,
-    arp_timeout_ms: u64,
     inet_id: Option<&AtomicU16>,
 ) -> Result<usize, UdpError> {
     // The largest datagram IPv4 can carry: `__ip_append_data`
@@ -705,25 +718,18 @@ fn udp_send_inner(
     let nexthop = crate::route::route_lookup_in(net_ns_id, crate::ipv4::Ipv4Addr(dst_ip))
         .map(|r| r.nexthop.0)
         .unwrap_or(dst_ip);
-    // `arp_timeout_ms == 0` is the userspace-send path: never block sendto on
-    // neighbor discovery. Build the complete frame with a placeholder MAC,
-    // queue it below, and let the ARP RX path patch + transmit it.
+    // `udp_sendmsg` never waits on neighbour discovery: build the complete
+    // frame with a placeholder MAC, queue it below, and let the ARP RX path
+    // patch + transmit it (`neigh_output`).
     let pending_neighbor = if is_broadcast {
         None
     } else if let Some(mac) = crate::tcp_stack::arp_cached_in(net_ns_id, nexthop) {
         Some(Ok(mac))
-    } else if arp_timeout_ms == 0 {
+    } else {
         if crate::arp_cache::resolution_failed(&iface.name, nexthop) {
             return Err(UdpError::NetworkUnreachable);
         }
         Some(Err(nexthop))
-    } else {
-        Some(Ok(crate::tcp_stack::arp_resolve_in(
-            net_ns_id,
-            nexthop,
-            arp_timeout_ms,
-        )
-        .map_err(|_| UdpError::NetworkUnreachable)?))
     };
     let dst_mac = match pending_neighbor {
         None => [0xFF; 6],
@@ -843,7 +849,7 @@ fn udp_send_inner(
         // Queue before starting ARP so an immediate reply cannot race past
         // the pending frame. If another sender resolved it between our cache
         // lookup and this call, flush synchronously with the returned MAC.
-        if let Ok(mac) = crate::tcp_stack::arp_resolve_in(net_ns_id, neighbor, 0) {
+        if let Some(mac) = crate::tcp_stack::neigh_start_in(net_ns_id, neighbor) {
             neighbor_resolved(net_ns_id, &iface.name, neighbor, mac);
         }
         return Ok(payload.len());

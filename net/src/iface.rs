@@ -724,6 +724,7 @@ pub fn unregister(name: &str) -> bool {
     drop(g);
     if removed {
         crate::udp_sock::remove_interface(name);
+        crate::arp_cache::remove_interface_pending(name);
     }
     removed
 }
@@ -1054,6 +1055,7 @@ pub(crate) fn set_net_ns(name: &str, net_ns_id: u64) -> bool {
         // resolved there because pending entries include the old namespace,
         // so retaining it would leak queue capacity until teardown.
         crate::udp_sock::remove_interface(name);
+        crate::arp_cache::remove_interface_pending(name);
         crate::raw_sock::netdev_unregister_moved(old_ns, &moved);
     }
     true
@@ -1770,8 +1772,8 @@ pub fn on_rx_frame(frame: &mut [u8]) {
 
 // ── RX drain hook ───────────────────────────────────────────────
 //
-// Kernel busy-wait paths in `tcp_stack::arp_resolve` / `connect`
-// run inside a syscall handler (i.e. inside `UserTaskFuture::poll`).
+// Kernel busy-wait paths (`tcp::core::connect_wait`, for in-kernel
+// callers that cannot park) run inside a handler (inside a task's poll).
 // While they're spinning, the executor cannot poll any other
 // task, so the spawned RX-pump task is frozen. This hook lets the
 // busy-waiter pull frames out of the NIC ring directly each
