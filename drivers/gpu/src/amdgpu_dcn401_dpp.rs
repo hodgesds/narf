@@ -38,10 +38,30 @@ pub struct DppApplied {
     pub line_buffer_config: u8,
     /// Each segment's SCL_COEF_RAM_SELECT after its coefficient load, in
     /// segment order; none for a segment that bypasses the scaler.
-    pub coef_ram: [Option<bool>; 4],
+    pub coef_ram: CoefRam,
     /// CNVC, scaler and CM pending bits, respectively. Timing is stopped, so
     /// staged programming may remain pending; zero is not presentation evidence.
     pub pending: u8,
+}
+/// Each segment's SCL_COEF_RAM_SELECT after its coefficient load (none
+/// for a segment that bypasses the scaler), for up to four segments in
+/// one byte: the record is copied with every display's status, which must
+/// stay small.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CoefRam(u8);
+impl CoefRam {
+    /// Segment `i`'s selection.
+    pub fn get(self, i: usize) -> Option<bool> {
+        let v = self.0.checked_shr(2 * i as u32).unwrap_or(0) & 3;
+        (v & 2 != 0).then_some(v & 1 != 0)
+    }
+    fn set(&mut self, i: usize, select: Option<bool>) {
+        if i >= 4 {
+            return;
+        }
+        let v = select.map_or(0, |s| 2 | u8::from(s));
+        self.0 = self.0 & !(3 << (2 * i)) | v << (2 * i);
+    }
 }
 impl Layout {
     pub(super) fn dpp(self, pipe: u8, reg: u64) -> u64 {
@@ -168,11 +188,12 @@ impl<I: Io> Engine<I> {
     }
     /// Program every segment's DPP; returns each segment's coefficient
     /// RAM selection.
-    async fn program_dpp(&mut self, applied: DppApplied) -> Result<[Option<bool>; 4], Error> {
-        let mut coef_ram = [None; 4];
+    async fn program_dpp(&mut self, applied: DppApplied) -> Result<CoefRam, Error> {
+        let mut coef_ram = CoefRam::default();
         let alpha = applied.surface.request.layout().blend.per_pixel_alpha;
         for (i, (p, scaler)) in applied.surface.request.scalers().enumerate() {
-            coef_ram[i] = self.program_segment_dpp(applied, p, &scaler, alpha).await?;
+            let select = self.program_segment_dpp(applied, p, &scaler, alpha).await?;
+            coef_ram.set(i, select);
         }
         Ok(coef_ram)
     }
@@ -246,13 +267,10 @@ impl<I: Io> Engine<I> {
     /// scaler are written and the coefficients loaded into the RAM not in
     /// use and selected (the selection latches with the update). Returns
     /// each segment's selection.
-    pub(super) async fn program_dpp_live(
-        &mut self,
-        applied: DppApplied,
-    ) -> Result<[Option<bool>; 4], Error> {
+    pub(super) async fn program_dpp_live(&mut self, applied: DppApplied) -> Result<CoefRam, Error> {
         let l = self.layout;
         let alpha = applied.surface.request.layout().blend.per_pixel_alpha;
-        let mut coef_ram = [None; 4];
+        let mut coef_ram = CoefRam::default();
         for (i, (p, scaler)) in applied.surface.request.scalers().enumerate() {
             if self.read(l.dpp(p, DPP_CLOCK))? & 0x10 == 0 {
                 return Err(Error::Busy);
@@ -296,9 +314,7 @@ impl<I: Io> Engine<I> {
                             dscl::COEF_RAM_SELECT | dscl::CHROMA_COEF_MODE,
                             u32::from(!current) << 8 | u32::from(chroma) << 16,
                         )?;
-                        if let Some(slot) = coef_ram.get_mut(i) {
-                            *slot = Some(!current);
-                        }
+                        coef_ram.set(i, Some(!current));
                     }
                 }
             }
@@ -309,7 +325,7 @@ impl<I: Io> Engine<I> {
         let alpha = applied.surface.request.layout().blend.per_pixel_alpha;
         for (i, (p, scaler)) in applied.surface.request.scalers().enumerate() {
             self.dpp_stopped(p, false)?;
-            let coef = applied.coef_ram[i].map(|select| {
+            let coef = applied.coef_ram.get(i).map(|select| {
                 (
                     dscl::SCL_MODE,
                     dscl::COEF_RAM_SELECT,
@@ -438,7 +454,7 @@ impl Surfaces {
             surface: surface.applied,
             timing: blank.timing,
             line_buffer_config: first.lb_memory_config(alpha) as u8,
-            coef_ram: [None; 4],
+            coef_ram: CoefRam::default(),
             pending: 0,
         };
         e.hubp_tree_stopped(Some(pipe))?;

@@ -742,7 +742,7 @@ impl Surfaces {
                 surface: s,
                 timing: blank.timing,
                 line_buffer_config: super::dpp::line_buffer_config(s.request)?,
-                coef_ram: [None; 4],
+                coef_ram: Default::default(),
                 pending: 0,
             };
             let at = usize::from(s.request.pipe);
