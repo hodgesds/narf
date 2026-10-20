@@ -5317,6 +5317,13 @@ paths; only the tables differ.
   to the buffer's KERNEL reservation and retains its source/destination
   until it leaves the ring; a refused, timed-out (5 s) or post-reset chunk
   fails the move without releasing either placement.
+- Foreign PRIME import on an amdgpu card (`amdgpu_gem_prime_import` with
+  `dma_buf_dynamic_attach`): another card's GTT amdgpu buffer or any card's
+  KMS dumb buffer becomes a GTT-only buffer over the exporter's RAM pages
+  (`GemState::import_foreign`), holding the exporter's placement or dumb
+  lease and sharing its reservation for implicit sync; it never moves.
+  Another card's VRAM (PCIe peer-to-peer) and other exporters are EINVAL.
+  A buffer of the same card stays the same object.
 - `GEM_USERPTR` (`amdgpu_gem_userptr_ioctl`): page-aligned non-empty
   ranges and known flags (else EINVAL); a writable range needs REGISTER
   (EACCES); ANONONLY refuses file-backed, shared and SysV ranges (EPERM).

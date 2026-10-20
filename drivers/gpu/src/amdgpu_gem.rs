@@ -328,6 +328,21 @@ enum Backing {
     },
     /// `GEM_USERPTR`: the caller's pinned pages, one per buffer page.
     User(Vec<narf_memory::address_space::UserPagePin>),
+    /// An imported foreign dma-buf's RAM pages, one per buffer page, kept
+    /// alive by the exporter's lease (its placement or dumb backing).
+    Foreign {
+        frames: Vec<u64>,
+        _lease: ForeignLease,
+    },
+}
+/// What keeps a foreign dma-buf's pages allocated.
+pub(crate) struct ForeignLease(
+    #[allow(dead_code, reason = "held for its drop")] pub(crate) Arc<dyn Send + Sync>,
+);
+impl core::fmt::Debug for ForeignLease {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("ForeignLease")
+    }
 }
 /// Internal BO flag (outside every AMDGPU_GEM_CREATE_* bit): GPU mappings
 /// of a READONLY userptr drop WRITEABLE. Never reported to userspace.
@@ -479,7 +494,10 @@ impl GemObject {
         };
         let mut placement = self.placement.lock();
         if self.allowed_domains.load(Ordering::Acquire) & target == 0
-            || matches!(placement.backing, Backing::User(_))
+            || matches!(
+                placement.backing,
+                Backing::User(_) | Backing::Foreign { .. }
+            )
         {
             return Err(FsError::Busy);
         }
@@ -750,6 +768,11 @@ impl GemPlacement {
                 let within = offset % PAGE_SIZE;
                 Some((page.phys().raw() + within, PAGE_SIZE - within))
             }
+            Backing::Foreign { frames, .. } => {
+                let page = frames.get((offset / PAGE_SIZE) as usize)?;
+                let within = offset % PAGE_SIZE;
+                Some((page + within, PAGE_SIZE - within))
+            }
             _ => Some((self.gpu + offset, self.byte_len - offset)),
         }
     }
@@ -767,7 +790,7 @@ impl GemPlacement {
             return None;
         }
         Some(match &self.backing {
-            Backing::System(_) | Backing::User(_) => {
+            Backing::System(_) | Backing::User(_) | Backing::Foreign { .. } => {
                 let (at, run) = self.locate(offset)?;
                 if run < 8 {
                     return None;
@@ -821,7 +844,7 @@ impl GemPlacement {
         }
         (0..len / PAGE_SIZE)
             .map(|i| match self.backing {
-                Backing::System(_) | Backing::User(_) => self
+                Backing::System(_) | Backing::User(_) | Backing::Foreign { .. } => self
                     .locate(offset + i * PAGE_SIZE)
                     .map(|(at, _)| at)
                     .ok_or(FsError::InvalidData),
@@ -1088,6 +1111,10 @@ impl GemState {
     /// `obj->dev == dev` (`amdgpu_gem_prime_import`; card indices are never
     /// reused, so the index is the device), and NARF has no attachment path
     /// for a foreign buffer.
+    /// The DRM card this open belongs to.
+    pub(crate) fn card(&self) -> Option<u32> {
+        self.card
+    }
     pub fn import(&self, object: &Arc<GemObject>) -> Result<u32, FsError> {
         if object.card.is_none() || object.card != self.card {
             return Err(FsError::InvalidData);
@@ -1102,6 +1129,50 @@ impl GemState {
             Some(handle) => Ok(handle),
             None => self.insert_shared(Arc::clone(object)),
         }
+    }
+
+    /// `amdgpu_gem_prime_import` of a foreign dma-buf (another device's,
+    /// attached as GTT): a GTT-only buffer over the exporter's RAM `frames`
+    /// (one per page), sharing its reservation for implicit sync and kept
+    /// alive by `lease`. Its placement never moves.
+    pub(crate) fn import_foreign(
+        &self,
+        frames: Vec<u64>,
+        lease: ForeignLease,
+        dma_buf: Arc<narf_filesystem::dma_buf::DmaBufObject>,
+    ) -> Result<u32, FsError> {
+        if self.card.is_none() || frames.is_empty() {
+            return Err(FsError::InvalidData);
+        }
+        for &frame in &frames {
+            if frame % PAGE_SIZE != 0 {
+                return Err(FsError::InvalidData);
+            }
+            crate::amdgpu_vm::make_pte(frame, 0)?;
+        }
+        let byte_len = frames.len() as u64 * PAGE_SIZE;
+        let first = frames[0];
+        let gtt = u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT);
+        self.insert(GemObject {
+            placement: IrqSafeSpinLock::new(Arc::new(GemPlacement {
+                phys: first,
+                gpu: first,
+                system: true,
+                byte_len,
+                backing: Backing::Foreign {
+                    frames,
+                    _lease: lease,
+                },
+            })),
+            byte_len,
+            alignment: PAGE_SIZE,
+            preferred_domains: AtomicU64::new(gtt),
+            allowed_domains: AtomicU64::new(gtt),
+            flags: 0,
+            metadata: IrqSafeSpinLock::new(Metadata::default()),
+            card: self.card,
+            dma_buf,
+        })
     }
 
     fn table(&self) -> Arc<GemTable> {

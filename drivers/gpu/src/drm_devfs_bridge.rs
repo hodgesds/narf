@@ -664,6 +664,9 @@ impl FileOps for DriCardFile {
     }
 
     fn drm_prime_import_file(&self, dmabuf: &Arc<dyn FileOps>) -> Result<u32, FsError> {
+        if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
+            return amdgpu_prime_import(&self.amdgpu_gem, dmabuf);
+        }
         if let Some(amdgpu) = dmabuf
             .as_any()
             .and_then(|any| any.downcast_ref::<AmdgpuDmaBufFile>())
@@ -929,6 +932,46 @@ pub(crate) struct AmdgpuDmaBufFile {
     object: Arc<crate::amdgpu_gem::GemObject>,
     /// This dma-buf's inode. See [`dma_buf_inode`].
     inode: narf_filesystem::inode_id::InodeId,
+}
+
+/// `amdgpu_gem_prime_import` on an amdgpu card: a buffer of this card is
+/// the same object; another card's GTT buffer or any card's dumb buffer is
+/// attached as GTT over the exporter's pages (`dma_buf_dynamic_attach` with
+/// the exporter pinned: the importer holds its placement or dumb lease and
+/// shares its reservation). Another card's VRAM would need PCIe peer-to-peer
+/// and is refused (EINVAL), as is any other exporter.
+pub(crate) fn amdgpu_prime_import(
+    gem: &crate::amdgpu_gem::GemState,
+    dmabuf: &Arc<dyn FileOps>,
+) -> Result<u32, FsError> {
+    use crate::amdgpu_gem::ForeignLease;
+    let any = dmabuf.as_any().ok_or(FsError::InvalidData)?;
+    if let Some(amdgpu) = any.downcast_ref::<AmdgpuDmaBufFile>() {
+        let exporter = amdgpu.object.card();
+        if exporter.is_none() || exporter == gem.card() {
+            return gem.import(&amdgpu.object);
+        }
+        let lease = amdgpu.object.placement();
+        if !lease.system || !lease.cpu_visible() {
+            return Err(FsError::InvalidData);
+        }
+        let frames = lease.frames(0, lease.byte_len as usize)?;
+        return gem.import_foreign(
+            frames,
+            ForeignLease(lease),
+            Arc::clone(amdgpu.object.dma_buf()),
+        );
+    }
+    if let Some(prime) = any.downcast_ref::<PrimeDmaBufFile>() {
+        let pages = (prime.byte_len as u64).div_ceil(4096);
+        let frames = (0..pages).map(|i| prime.phys + i * 4096).collect();
+        return gem.import_foreign(
+            frames,
+            ForeignLease(Arc::clone(&prime.backing) as Arc<dyn Send + Sync>),
+            Arc::clone(&prime.dma_buf),
+        );
+    }
+    Err(FsError::InvalidData)
 }
 
 /// A new dma-buf file exporting `object`. amdgpu_gem_prime_export refuses
@@ -1368,6 +1411,9 @@ impl FileOps for DriRenderFile {
     }
 
     fn drm_prime_import_file(&self, dmabuf: &Arc<dyn FileOps>) -> Result<u32, FsError> {
+        if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
+            return amdgpu_prime_import(&self.amdgpu_gem, dmabuf);
+        }
         if let Some(amdgpu) = dmabuf
             .as_any()
             .and_then(|any| any.downcast_ref::<AmdgpuDmaBufFile>())

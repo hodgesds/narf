@@ -1098,3 +1098,65 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/render-abi",
     userptr_backing_follows_pins_and_refuses_mmap_export_and_moves
 );
+
+/// amdgpu_gem_prime_import of another card's GTT buffer attaches it as GTT
+/// over the exporter's pages, sharing its reservation; the importer never
+/// moves it, and another card's VRAM buffer is refused (no PCIe P2P).
+fn prime_import_attaches_foreign_gtt_and_refuses_foreign_vram() -> TestResult {
+    const EXPORTER: u32 = 0xfee6;
+    const IMPORTER: u32 = 0xfee7;
+    let exporter = GemState::for_card(EXPORTER);
+    let importer = GemState::for_card(IMPORTER);
+    let gtt = u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT);
+    let source = exporter.get(create(&exporter, 2 * 4096, gtt)).unwrap();
+    assert!(source.system());
+    let file = crate::drm_devfs_bridge::amdgpu_dma_buf_file(source.clone()).unwrap();
+    let handle = crate::drm_devfs_bridge::amdgpu_prime_import(&importer, &file).unwrap();
+    let imported = importer.get(handle).unwrap();
+    assert!(!Arc::ptr_eq(&imported, &source));
+    assert_eq!(imported.frames(0, 8192), source.frames(0, 8192));
+    assert!(Arc::ptr_eq(imported.dma_buf(), source.dma_buf()));
+    assert_eq!(imported.card(), Some(IMPORTER));
+    assert_eq!(imported.relocate(true), Err(FsError::Busy));
+    // The same card's export is the same object.
+    let again = crate::drm_devfs_bridge::amdgpu_prime_import(&exporter, &file).unwrap();
+    assert!(Arc::ptr_eq(&exporter.get(again).unwrap(), &source));
+    // A foreign VRAM buffer would need peer-to-peer DMA.
+    let mut memory = alloc::vec![0u8; 2 * 4096];
+    let map = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(0xb200_0000),
+        virt: memory.as_mut_ptr() as u64,
+        len: memory.len() as u64,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    // SAFETY: test-owned memory; no hardware reaches it.
+    let pool = unsafe { crate::amdgpu_vram::Pool::from_owned_range(map, 0x8_0000_0000) }.unwrap();
+    register_vram_heap(
+        EXPORTER,
+        VramHeap {
+            pool,
+            fb_base: 0x8_0000_0000,
+            fb_offset: 0x9_0000_0000,
+            unmapped: None,
+        },
+    );
+    let vram = exporter
+        .get(create(
+            &exporter,
+            4096,
+            u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM),
+        ))
+        .unwrap();
+    assert!(!vram.system());
+    let file = crate::drm_devfs_bridge::amdgpu_dma_buf_file(vram).unwrap();
+    assert_eq!(
+        crate::drm_devfs_bridge::amdgpu_prime_import(&importer, &file),
+        Err(FsError::InvalidData)
+    );
+    unregister_vram_heap(EXPORTER);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/render-abi",
+    prime_import_attaches_foreign_gtt_and_refuses_foreign_vram
+);
