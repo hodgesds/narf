@@ -536,7 +536,9 @@ padding borrow bit-exact against Linux built on the host (2970 capacity, 3000
 configuration and 890 CVTEM vectors). Lighting programs the DSC engines, the
 HPO encoder's DSC mode and CVTEM PPS (generic packets 5-10), then the OPTC
 after training; teardown reverses it. 7680x4320@60 on a 4x12G DSC sink picks
-4x6G with 8 slices at 159/16 bpp. FRL DSC is 8-bpc RGB/4:2:0 only.
+4x6G with 8 slices at 159/16 bpp. FRL DSC compresses RGB from 12, 10 or 8 bpc
+(the deepest the HF-VSDB's DSC_10bpc/DSC_12bpc and amdgpu.max_bpc allow, as
+Linux tries each depth); compressed 4:2:0 is not native.
 DP MST DSC (model-tested, not hardware-validated) on 8b/10b and UHBR follows
 amdgpu_dm's fairness search (1500 link vectors through Linux's own functions),
 drm_dp_mst_dsc_aux_for_port (virtual DPCD, passthrough, Synaptics/Realtek
@@ -589,8 +591,12 @@ and MST streams (HPO VPG packets 0/3, GSP0/GSP3, MISC1), DIO MST streams and
 HDMI FRL (HPO FRL generic packet 4), with live metadata updates, and MST
 end-device connectors carry Colorspace/HDR_OUTPUT_METADATA. DP SST picks its
 output depth as amdgpu_dm does (EDID bpc bounded by max_bpc, stepping down
-until a link fits; 8 bpc by default). Gaps: 10-bpc DSC input and MST deep
-color. Model-tested only; not run on an RX 9070 XT.
+until a link fits; 8 bpc by default), and at each depth compresses when no
+link carries it raw (10- and 12-bpc DSC input, the PPS, rate control and DSC
+input depth at that depth; 2000 depth-search vectors against Linux's DSC code).
+MST streams on a link with a DSC decoder take the deepest depth the port and
+the joint fairness search accept (1200 deep-color fairness vectors); MST links
+without a decoder stay 8 bpc. Model-tested only; not run on an RX 9070 XT.
 Native legacy/HPO DisplayPort stream blanking now waits for actual video-stop
 acknowledgement before resetting or disabling FIFOs. It handles inherited
 disable-in-progress state, keeps timing and link clocks available for PHY
@@ -752,7 +758,8 @@ to the trained link; cancellation/failure retain ownership and block replay.
 The native frontend payload guard now accounts for DSC's compressed bits per
 pixel and slice overhead instead of rejecting it as uncompressed RGB. Actual
 trained rate/lanes and FEC's capacity reduction bound both kinds of stream;
-DSC requires the supported 8-bpc RGB/FEC path (SST or MST). A native regression exercises
+DSC requires the supported RGB/FEC path (SST or MST) at the blank depth its
+PPS codes. A native regression exercises
 DSC fitting one RBR lane when RGB does not, including the FEC capacity boundary.
 Legacy DSC training can now fall back among rate/lane settings that carry its
 unchanged admitted PPS and bpp. Alternative DP modes carry DSC into joint DML
