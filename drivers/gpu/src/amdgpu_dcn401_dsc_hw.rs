@@ -1,7 +1,7 @@
 //! Native DCN401 Display Stream Compression on a pipe's own DSC (DSC n on
 //! OPP n; with ODM 2:1 each segment's OPP feeds its own DSC, which
 //! compresses half the line with half the slices), as Linux's
-//! link_set_dsc_on_stream drives it for DP SST:
+//! link_set_dsc_on_stream drives it for DP SST (DIO or HPO):
 //! the DSC power domain (dcn32_dsc_pg_control), dsc_write_to_registers,
 //! dsc401_enable from the OPP, then optc2/3_set_dsc_config. Stop is the
 //! reverse: OPTC DSC off, dsc401_disconnect and dsc401_disable, the domain
@@ -41,12 +41,13 @@ pub(super) fn dsc_timing(t: &Timing) -> DscTiming {
 }
 
 /// dsc401_validate_stream plus this owner's shape: one DSC per ODM segment
-/// (at most four slices each, the slices split evenly) on an 8-bit RGB
-/// 8b/10b DP stream. These are the whole picture's registers: the PPS the
-/// sink receives and the OPTC's bytes per pixel and slice width.
+/// (at most four slices each, the slices split evenly) on an 8-bit RGB DP
+/// SST stream, 8b/10b (DIO) or 128b/132b (HPO). These are the whole
+/// picture's registers: the PPS the sink receives and the OPTC's bytes per
+/// pixel and slice width.
 pub(super) fn dsc_registers(request: &Request, cfg: &DscConfig) -> Result<DscRegisters, Error> {
     let segments = if request.odm.is_some() { 2 } else { 1 };
-    if request.signal != Signal::DisplayPort
+    if !matches!(request.signal, Signal::DisplayPort | Signal::HpoDisplayPort)
         || request.ycbcr420
         || cfg.slices_h % segments != 0
         || cfg.slices_h > 4 * segments

@@ -1,7 +1,11 @@
 //! Native DP 128b/132b SST video: the HPO stream encoder on a trained
 //! 128b/132b link, as Linux's dcn401_enable_stream, update_sst_payload and
 //! dcn31_hpo_dp_stream_enc_dp_unblank bring it up (RGB black from the
-//! running timing; scanout is a separate owner), and the reverse.
+//! running timing; scanout is a separate owner), and the reverse. A DSC
+//! stream (the pipe's DSC and OPTC already compress it, as
+//! link_set_dsc_on_stream leaves an HPO stream) is marked compressed in its
+//! pixel format, has the sink decode DSC and its PPS sent through the
+//! stream's VPG, and its VC payload sized for the compressed bandwidth.
 //!
 //! The DCCG half (DPSTREAMCLK from the pipe, SYMCLK32_SE from the PHY) is
 //! the clock owner's; this owner requires and rechecks it.
@@ -20,7 +24,16 @@ const PIXEL_FORMAT: u64 = 0x3661;
 const MSA: u64 = 0x3662;
 const HBLANK: u64 = 0x366b;
 const GSP: [u64; 4] = [0x366c, 0x366e, 0x366f, 0x3671];
+/// DP_SYM32_ENC_SDP_GSP_CONTROL11: the PPS SDP.
+const GSP11: u64 = 0x3677;
 const SDP: u64 = 0x367b;
+/// DP_SYM32_ENC_VID_VBID_CONTROL.
+const VBID: u64 = 0x3684;
+// The stream's VPG (VPG n+5, sharing the stride).
+const VPG_ACCESS: u64 = 0x3651;
+const VPG_DATA: u64 = 0x3652;
+const VPG_IMMEDIATE: u64 = 0x3654;
+const VPG_STATUS: u64 = 0x3655;
 const VID_STREAM: u64 = 0x3685;
 const VID_CRC: u64 = 0x3687;
 // HPO DP link encoder (stride 0xd4).
@@ -32,6 +45,8 @@ const DPSTREAMCLK_FROM_LE: u64 = (0x66 - 0x4a) * 4;
 const SYMCLK32_SE_FROM_LE: u64 = 4;
 const PAYLOAD_TABLE_STATUS: u32 = 0x2c0;
 const PAYLOAD_ALLOCATE: u32 = 0x1c0;
+/// DP_DSC_ENABLE.
+const DSC_ENABLE: u32 = 0x160;
 
 /// One SST stream's share of a 128b/132b link, as Linux's
 /// update_sst_payload computes it from the average time slots per MTP
@@ -55,6 +70,13 @@ fn stream_kbps(t: &crate::amdgpu_dml::Timing, bpc: u32) -> u128 {
     }
     kbps
 }
+/// dc_bandwidth_in_kbps_from_timing for a DSC stream:
+/// dc_dsc_stream_bandwidth_in_kbps (compressed bpp plus the slice
+/// overhead), without 128b/132b padding.
+fn dsc_stream_kbps(t: &crate::amdgpu_dml::Timing, cfg: &crate::amdgpu_dsc::DscConfig) -> u128 {
+    let dsc = crate::amdgpu_dcn401_otg::dsc_hw::dsc_timing(t);
+    u128::from(crate::amdgpu_dsc::dsc_kbps(&dsc, cfg.bpp_x16, cfg.slices_h))
+}
 /// dp_link_bandwidth_kbps for 128b/132b.
 fn link_kbps(settings: UhbrSettings) -> u128 {
     u128::from(settings.rate.link_rate()) * 10_000 * u128::from(settings.lanes) / 10_000 * 9641
@@ -65,8 +87,23 @@ pub(in crate::amdgpu_dcn401_otg) fn uhbr_payload(
     bpc: u32,
     settings: UhbrSettings,
 ) -> Option<UhbrPayload> {
+    payload_for(t, stream_kbps(t, bpc), settings)
+}
+/// update_sst_payload for a compressed stream: the same allocation, VC
+/// rate and blanking width from the DSC stream's bandwidth.
+pub(in crate::amdgpu_dcn401_otg) fn uhbr_dsc_payload(
+    t: &crate::amdgpu_dml::Timing,
+    cfg: &crate::amdgpu_dsc::DscConfig,
+    settings: UhbrSettings,
+) -> Option<UhbrPayload> {
+    payload_for(t, dsc_stream_kbps(t, cfg), settings)
+}
+fn payload_for(
+    t: &crate::amdgpu_dml::Timing,
+    kbps: u128,
+    settings: UhbrSettings,
+) -> Option<UhbrPayload> {
     let pixel_khz = u128::from(t.pixel_clock_khz);
-    let kbps = stream_kbps(t, bpc);
     let link = link_kbps(settings);
     if link == 0 || pixel_khz == 0 {
         return None;
@@ -156,6 +193,8 @@ fn stream_attributes(blank: BlankApplied) -> [(u64, u32); 10] {
         _ => (3, 0x60),
     };
     let misc0 = misc_depth | u32::from(blank.request.limited) << 3;
+    // PIXEL_ENCODING_TYPE: compressed for a DSC stream.
+    let compressed = u32::from(blank.timing.request.dsc.is_some());
     let freq = u64::from(t.pixel_clock_khz) * 1000;
     let f = |shift: u32| (freq >> shift & 0xff) as u32;
     let lanes = |b: [u32; 4]| b[0] | b[1] << 8 | b[2] << 16 | b[3] << 24;
@@ -164,7 +203,7 @@ fn stream_attributes(blank: BlankApplied) -> [(u64, u32); 10] {
     let hsp = if t.h_sync_positive { 0 } else { 0x80 };
     let vsp = if t.v_sync_positive { 0 } else { 0x80 };
     [
-        (PIXEL_FORMAT, field << 8),
+        (PIXEL_FORMAT, field << 8 | compressed),
         (MSA, lanes([0, 0, 0, f(40)])),
         (MSA + 1, lanes([0, 0, 0, f(32)])),
         (MSA + 2, lanes([0, 0, 0, f(24)])),
@@ -305,6 +344,84 @@ impl<I: Io> Engine<I> {
         self.uhbr_write(at(VC_RATE + u64::from(stream)), rate)?;
         self.wait(at(0x36b5), 0x1000, 0, 1000).await
     }
+    /// dcn31_hpo_dp_stream_enc_set_dsc_pps_info_packet(true, immediate):
+    /// GSP11 in 128-byte mode (payload size 3), the packed PPS in the
+    /// stream VPG's generic packets 11-14 (type 0x10, 127 bytes) as
+    /// vpg3_update_generic_info_packet writes them and latched immediately,
+    /// GSP11 on line 2 with VBID[6] on line 3 (SOF reference 0), then GSP11
+    /// and the secondary data path on.
+    async fn uhbr_pps(&mut self, stream: u8, request: &Request) -> Result<(), Error> {
+        let Some(cfg) = request.dsc else {
+            return Ok(());
+        };
+        let regs = crate::amdgpu_dcn401_otg::dsc_hw::dsc_registers(request, &cfg)?;
+        let pps = crate::amdgpu_dsc::pack_pps(&regs.pps);
+        let l = self.layout;
+        let at = |r| DpStream::Hpo(stream).at(l, r);
+        self.update(at(GSP11), 0x60, 3 << 5)?;
+        for (i, chunk) in pps.chunks_exact(32).enumerate() {
+            let index = 11 + i as u32;
+            self.wait(at(VPG_STATUS), 2, 0, 500).await?;
+            self.access(|io| {
+                // CONFLICT_CLR and the data port are commands, not state.
+                let status = checked(io.read(at(VPG_STATUS)))?;
+                io.write(at(VPG_STATUS), status | 0x10);
+                let access = checked(io.read(at(VPG_ACCESS)))?;
+                io.write(at(VPG_ACCESS), (access & !0xff) | (index * 9));
+                io.write(at(VPG_DATA), u32::from_le_bytes([0, 0x10, 127, 0]));
+                for word in chunk.chunks_exact(4) {
+                    io.write(
+                        at(VPG_DATA),
+                        u32::from_le_bytes([word[0], word[1], word[2], word[3]]),
+                    );
+                }
+                let immediate = checked(io.read(at(VPG_IMMEDIATE)))?;
+                io.write(at(VPG_IMMEDIATE), immediate | 1 << index);
+                Ok(())
+            })?;
+        }
+        self.update(at(GSP11), 0xffff_0000, 2 << 16)?;
+        self.update(at(VBID), 0xffff_0001, 3 << 16)?;
+        self.update(at(GSP11), 1, 1)?;
+        self.update(at(SDP), 1, 1)
+    }
+    /// The sink decodes DSC (dp_set_dsc_on_rx, read back), then the PPS:
+    /// link_set_dpms_on's order after enable_stream.
+    async fn uhbr_dsc_start(
+        &mut self,
+        io: &mut impl UhbrTransport,
+        path: Path,
+        stream: u8,
+        request: &Request,
+    ) -> Result<(), Error> {
+        if request.dsc.is_none() {
+            return Ok(());
+        }
+        write(io, path, DSC_ENABLE, &mut [1]).await?;
+        if read::<1>(io, path, DSC_ENABLE).await?[0] & 1 != 1 {
+            return Err(sink_readback(DSC_ENABLE));
+        }
+        self.uhbr_pps(stream, request).await
+    }
+    /// A running DSC stream's PPS SDP: GSP11 sending 128 bytes on line 2,
+    /// VBID[6] on line 3, the secondary data path on.
+    fn uhbr_pps_verify(&mut self, stream: u8, request: &Request) -> Result<(), Error> {
+        if request.dsc.is_none() {
+            return Ok(());
+        }
+        let l = self.layout;
+        let at = |r| DpStream::Hpo(stream).at(l, r);
+        for (reg, mask, value) in [
+            (GSP11, 0xffff_0061, 2 << 16 | 3 << 5 | 1),
+            (VBID, 0xffff_0001, 3 << 16),
+            (SDP, 1, 1),
+        ] {
+            if self.read(at(reg))? & mask != value {
+                return Err(Error::Readback(at(reg)));
+            }
+        }
+        Ok(())
+    }
     /// dcn31_hpo_dp_stream_enc_enable_stream: clock, reset handshake, then
     /// the encoder generating idle.
     async fn uhbr_stream_enable(&mut self, stream: u8) -> Result<(), Error> {
@@ -399,6 +516,9 @@ impl<I: Io> Engine<I> {
         let timing = self
             .uhbr_stream_prepare(&link, stream, blank, timeout)
             .await?;
+        self.uhbr_dsc_start(io, link.path, stream, &blank.timing.request)
+            .await?;
+        self.uhbr_video_verify(&link, stream, blank, true)?;
         let table = self
             .uhbr_payload_table(io, link.path, payload.slots)
             .await?;
@@ -442,7 +562,11 @@ impl<I: Io> Engine<I> {
             return Err(Error::Invalid);
         }
         let request = blank.timing.request;
-        if request.signal != Signal::HpoDisplayPort || request.ycbcr420 {
+        // MST DSC is not ported: an MST stream is uncompressed.
+        if request.signal != Signal::HpoDisplayPort
+            || request.ycbcr420
+            || (mst && request.dsc.is_some())
+        {
             return Err(Error::Unsupported);
         }
         request.validate_clock(clock)?;
@@ -455,6 +579,7 @@ impl<I: Io> Engine<I> {
             (VID_FIFO, 0x111),
             (SE_RAMP, 0x10_0011),
             (SDP, 1),
+            (GSP11, 1),
         ] {
             if self.read(at(reg))? & mask != 0 {
                 return Err(Error::Busy);
@@ -486,11 +611,15 @@ impl<I: Io> Engine<I> {
             return Err(Error::Busy);
         }
         let (link, blank) = self.uhbr_video_request(path, stream, pipe, clock, false)?;
-        let payload = uhbr_payload(
-            &blank.timing.request.timing,
-            depth_bpc(blank.request.depth),
-            link.settings,
-        )
+        let request = blank.timing.request;
+        let payload = match request.dsc {
+            Some(cfg) => uhbr_dsc_payload(&request.timing, &cfg, link.settings),
+            None => uhbr_payload(
+                &request.timing,
+                depth_bpc(blank.request.depth),
+                link.settings,
+            ),
+        }
         .ok_or(Error::Unsupported)?;
         self.status.state = State::StartingUhbrVideo(stream);
         match self
@@ -675,6 +804,7 @@ impl<I: Io> Engine<I> {
         if self.read(at(HBLANK))? & 0xffff != u32::from(v.payload.hblank_symbols) {
             return Err(Error::Readback(at(HBLANK)));
         }
+        self.uhbr_pps_verify(v.stream, &v.timing.blank.timing.request)?;
         let pipe = v.timing.blank.request.pipe;
         self.uhbr_verify_owned(&v.link, Some(v.stream), Some(pipe))?;
         self.uhbr_stream_clocks(v.stream, pipe, v.link.path.transmitter)
@@ -722,6 +852,15 @@ impl<I: Io> Engine<I> {
             }
             self.update(at(SYM32_CONTROL), 1, 0)?;
             self.update(at(SE_CLOCK), 1, 0)?;
+            // link_set_dsc_enable(false) after the stream: the sink stops
+            // decoding (unchecked, as Linux ignores it), then the PPS SDP
+            // (dp_set_dsc_pps_info_packet(false): GSP11 off, payload size
+            // 0). The DSC and OPTC keep compressing for a restart; retiring
+            // the timing turns them off.
+            if blank.timing.request.dsc.is_some() {
+                let _ = write(io, path, DSC_ENABLE, &mut [0]).await;
+                self.update(at(GSP11), 0x61, 0)?;
+            }
             self.disable(pipe).await?;
             // Restage the OPP route after master and busy are off, as DP
             // SST video stop does.

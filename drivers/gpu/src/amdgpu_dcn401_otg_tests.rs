@@ -231,6 +231,9 @@ impl Io for Fake {
                         || [
                             0x3624, 0x3656, 0x366c, 0x366e, 0x366f, 0x3671, 0x3687, 0x36b9,
                             0x36ba, 0x36bb, 0x36bc,
+                            // A DSC stream's PPS: VPG generic packets,
+                            // GSP11 and VBID[6].
+                            0x3651, 0x3652, 0x3654, 0x3655, 0x3677, 0x3684,
                         ]
                         .iter()
                         .any(|r| at == BASE + (r + p * 0xd4) * 4)
@@ -1435,11 +1438,11 @@ fn dcn401_dsc_follows_link_set_dsc_on_stream() -> TestResult {
     {
         return TestResult::Fail("DSC retirement");
     }
-    // One DSC on 8b/10b DP only.
+    // DP SST only (DIO or HPO), at most four slices per DSC.
     let mut e = engine();
     for bad in [
         Request {
-            signal: Signal::HpoDisplayPort,
+            signal: Signal::Tmds,
             ..req
         },
         Request {
