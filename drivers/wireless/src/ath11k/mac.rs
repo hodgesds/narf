@@ -2156,6 +2156,36 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         .await
     }
 
+    /// `ath11k_station_assoc`'s tail: "If single VHT/HE rate is configured
+    /// (by set_bitrate_mask()), peer_assoc will disable VHT/HE. This is now
+    /// enabled by a peer specific fixed param." Without a single-rate mask
+    /// an association sends no fixed-rate parameter at all; clearing it to
+    /// `WMI_FIXED_RATE_NONE` is only the bitrate-mask update's job.
+    #[allow(clippy::too_many_arguments)]
+    async fn program_peer_single_rate(
+        &mut self,
+        vdev_id: u32,
+        peer_mac: [u8; 6],
+        vht: bool,
+        he: bool,
+        ht: bool,
+        peer_nss: u32,
+        selection: Option<&TxBitrateBand>,
+    ) -> Result<(), MacError> {
+        let rate = peer::tx_bitrate_fixed_rate(selection, vht, he, ht, peer_nss)
+            .map_err(|_| MacError::new(step::BITRATE_MASK, 6, errno::EINVAL))?;
+        let Some(rate) = rate else {
+            return Ok(());
+        };
+        self.cmd(
+            peer_set_param_cmd(&peer_mac, vdev_id, peer_param::PARAM_FIXED_RATE, rate),
+            step::BITRATE_MASK,
+            7,
+            "bitrate peer fixed rate",
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn program_peer_fixed_rate(
         &mut self,
@@ -2498,6 +2528,9 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             self.authorize().await?;
             self.setup_ps().await;
         }
+        // Associated with its keys back in firmware: the panel shows the
+        // station connected again, as after the original join.
+        narf_memory::diag::set_wifi_stage(narf_memory::diag::WifiStage::Connected);
         Ok(())
     }
 
@@ -7620,7 +7653,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                 "AP peer assoc (no conf)",
             );
         }
-        self.program_peer_fixed_rate(
+        self.program_peer_single_rate(
             vdev_id,
             station.mac,
             sta.vht_cap.vht_supported,
@@ -10943,7 +10976,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                 "peer assoc (no conf)",
             );
         }
-        self.program_peer_fixed_rate(
+        self.program_peer_single_rate(
             vdev_id,
             bss.bssid,
             l.sta.vht_cap.vht_supported,

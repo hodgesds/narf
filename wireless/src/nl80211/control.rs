@@ -2693,7 +2693,7 @@ fn sme_command(
             let request = crate::MlmeAuthRequest {
                 peer,
                 ssid: ssid.to_vec(),
-                channel: frequency_mhz,
+                frequency_mhz,
                 auth_type,
                 auth_data: auth_data.unwrap_or(&[]).to_vec(),
                 ie: attr(attrs, 42).unwrap_or(&[]).to_vec(),
@@ -2759,7 +2759,7 @@ fn sme_command(
             let request = crate::MlmeAssocRequest {
                 peer,
                 ssid: ssid.to_vec(),
-                channel: freq,
+                frequency_mhz: freq,
                 ie: ie.to_vec(),
                 prev_bssid,
                 use_mfp,

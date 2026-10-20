@@ -1346,7 +1346,7 @@ fn smoke_nl80211_userspace_sme_mlme() -> TestResult {
         MlmeExec::Authenticate(crate::MlmeAuthRequest {
             peer: SME_PEER,
             ssid: b"sme-net".to_vec(),
-            channel: 0,
+            frequency_mhz: 0,
             auth_type: 0,
             auth_data: Vec::new(),
             ie: Vec::new(),
@@ -1364,7 +1364,7 @@ fn smoke_nl80211_userspace_sme_mlme() -> TestResult {
         MlmeExec::Associate(crate::MlmeAssocRequest {
             peer: SME_PEER,
             ssid: b"sme-net".to_vec(),
-            channel: 0,
+            frequency_mhz: 0,
             ie: Vec::new(),
             prev_bssid: None,
             use_mfp: true,
@@ -1387,7 +1387,7 @@ fn smoke_nl80211_userspace_sme_mlme() -> TestResult {
         MlmeExec::Associate(crate::MlmeAssocRequest {
             peer: SME_PEER,
             ssid: b"sme-net".to_vec(),
-            channel: 0,
+            frequency_mhz: 0,
             ie: Vec::new(),
             prev_bssid: None,
             use_mfp: true,

@@ -399,6 +399,9 @@ struct DevState {
     tcl_tx: Vec<TclTx>,
     /// Ethernet frames the AP side sends to the station.
     rx_queue: VecDeque<Vec<u8>>,
+    /// Frames the AP sends once the station transmits an Authentication
+    /// frame (the BSS peer exists; the station is not yet associated).
+    rx_on_auth: Vec<Vec<u8>>,
     rx_delivered: u32,
     reo_cmds: u32,
     dp_pending: u32,
@@ -444,6 +447,7 @@ impl Dev {
                 wmi: Vec::new(),
                 tcl_tx: Vec::new(),
                 rx_queue: VecDeque::new(),
+                rx_on_auth: Vec::new(),
                 rx_delivered: 0,
                 reo_cmds: 0,
                 dp_pending: 0,
@@ -493,6 +497,10 @@ impl Dev {
                     let pa = rd32(b, 16) as u64 | (rd32(b, 20) as u64) << 32;
                     let mut frame = vec![0u8; rd32(b, 24) as usize];
                     phys_read(pa, &mut frame);
+                    if frame.first() == Some(&(super::mac_frame::stype::AUTH as u8)) {
+                        let queued = core::mem::take(&mut st.rx_on_auth);
+                        st.rx_queue.extend(queued);
+                    }
                     st.world.on_mgmt_desc(&frame, desc);
                 }
                 wmi::WMI_PEER_CREATE_CMDID => {
@@ -1059,6 +1067,32 @@ fn connect(u: &Up) -> R {
     Ok(())
 }
 
+/// The in-kernel WPA2 join against a silent AP, with `frames` sent by the AP
+/// once the station transmits its first Authentication frame. They arrive
+/// while the BSS peer exists (ath11k creates it from
+/// `ieee80211_prep_connection`, sta_state NOTEXIST → NONE) but the station is
+/// not ASSOC, where mac80211's `ieee80211_rx_h_check` passes only the AP's
+/// control-port frames. The join then ends in AUTH_TIMEOUT.
+fn rx_while_authenticating(u: &Up, frames: Vec<Vec<u8>>) -> R {
+    scan6(u)?;
+    let ap_auth = |status: Option<u16>| {
+        let mut st = u.dev.st.borrow_mut();
+        let mut c = st.world.cfg();
+        c.auth_status = status;
+        st.world.cfg = Some(c);
+    };
+    ap_auth(None);
+    u.dev.st.borrow_mut().rx_on_auth = frames;
+    let (r, _, _, _) = latched(|| run(u.netdev.associate_kernel(wpa2_req())));
+    ap_auth(Some(0));
+    ensure!(r.is_err(), "the join to a silent AP times out");
+    ensure!(
+        u.dev.st.borrow().rx_on_auth.is_empty() && u.dev.st.borrow().rx_queue.is_empty(),
+        "the AP's frames were delivered during authentication"
+    );
+    Ok(())
+}
+
 /// An IPv4 / UDP frame from the station (DSCP `tos`).
 fn ipv4_frame(da: &[u8; 6], sa: &[u8; 6], tos: u8, payload: &[u8]) -> Vec<u8> {
     let mut f = da.to_vec();
@@ -1484,12 +1518,8 @@ kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_dp_poll_fallback);
 fn smoke_ath11k_int_unauthorized_and_disconnect() -> TestResult {
     check(|| {
         let u = up(wpa2_cfg())?;
-        u.dev
-            .st
-            .borrow_mut()
-            .rx_queue
-            .push_back(ipv4_frame(&OWN, &GW, 0, &[1]));
-        pump(&u, 3);
+        // Data from the AP while the station is still authenticating.
+        rx_while_authenticating(&u, vec![ipv4_frame(&OWN, &GW, 0, &[1])])?;
         ensure!(
             RX_SEEN.lock().is_empty(),
             "data before authorization dropped"
@@ -1547,44 +1577,33 @@ kernel_test_in!(
 /// `ieee80211_frame_allowed` for EAPOL: to our address or the PAE group
 /// address (01-80-C2-00-00-03) it reaches the supplicant queue,
 /// whatever the port state; to the broadcast or another group address it
-/// is dropped; unicast to another station is not ours at all. (Before
-/// the association the supplicant ignores what is queued.)
+/// is dropped; unicast to another station is not ours at all. The frames
+/// come from the AP peer while the station authenticates (a station entry
+/// that is not yet ASSOC), as frames without a station entry are dropped.
 fn smoke_ath11k_int_eapol_filter() -> TestResult {
     use super::mac_frame as frame;
     check(|| {
         let u = up(wpa2_cfg())?;
         let pdu = [0x02, 0x03, 0x00, 0x00];
-        let feed = |da: &[u8; 6]| {
-            u.dev
-                .st
-                .borrow_mut()
-                .rx_queue
-                .push_back(frame::eapol_eth(da, &BSSID, &pdu));
-            // Runtime passes only (no mac housekeeping, which would
-            // consume the supplicant queue).
-            for _ in 0..3 {
-                run(u.shared.take_rx());
-                run(u.shared.irq.wait(10));
-            }
-        };
+        let from_ap = |da: &[u8; 6]| frame::eapol_eth(da, &BSSID, &pdu);
         let other = [0x00, 0x03, 0x7F, 0x99, 0x99, 0x99];
-        feed(&[0xff; 6]);
-        feed(&[0x01, 0x00, 0x5e, 0x00, 0x00, 0x01]);
-        feed(&other);
-        {
-            let g = run(u.shared.lock());
-            ensure!(
-                g.stats.rx_dropped_eapol_da == 2 && g.stats.rx_dropped_not_ours == 1,
-                "group EAPOL dropped, foreign unicast not ours"
-            );
-            ensure!(
-                g.vdev(0).unwrap().link.eapol_rx.is_empty() && g.stats.rx_eapol == 0,
-                "nothing queued for the supplicant"
-            );
-        }
-        feed(&super::runtime::PAE_GROUP_ADDR);
-        feed(&OWN);
+        // From the AP peer while the station authenticates: the supplicant
+        // has not started, so the queue shows exactly what was admitted.
+        rx_while_authenticating(
+            &u,
+            vec![
+                from_ap(&[0xff; 6]),
+                from_ap(&[0x01, 0x00, 0x5e, 0x00, 0x00, 0x01]),
+                from_ap(&other),
+                from_ap(&super::runtime::PAE_GROUP_ADDR),
+                from_ap(&OWN),
+            ],
+        )?;
         let g = run(u.shared.lock());
+        ensure!(
+            g.stats.rx_dropped_eapol_da == 2 && g.stats.rx_dropped_not_ours == 1,
+            "group EAPOL dropped, foreign unicast not ours"
+        );
         ensure!(
             g.stats.rx_eapol == 2 && g.vdev(0).unwrap().link.eapol_rx.len() == 2,
             "PAE group and unicast EAPOL queued"
@@ -2169,7 +2188,14 @@ fn smoke_ath11k_int_disconnect_reason() -> TestResult {
             "deauth to another DA ignored"
         );
 
-        // Beacon loss: WMI_ROAM BEACON_MISS, no beacon for 3 s.
+        // Beacon loss: WMI_ROAM BEACON_MISS, no beacon for 3 s, and the AP
+        // is gone: the directed Null probes of ieee80211_mgd_probe_ap go
+        // unacknowledged (an ACK would keep the connection).
+        u.dev.st.borrow_mut().tx_rel = TxRel::Tqm {
+            reason: super::dp_ring::tqm::CMD_REMOVE_TX,
+            peer: AP_PEER_ID as u32,
+            tries: 1,
+        };
         let w = |v: u32| v.to_le_bytes();
         let mut roam = Vec::new();
         for v in [0u32, super::mac::WMI_ROAM_REASON_BEACON_MISS, 0] {
@@ -3875,7 +3901,9 @@ fn htt_types(u: &Up) -> Vec<u8> {
 /// cycle of the device model, QMI to FW_INIT_DONE), `restart_work` →
 /// `ath11k_core_reconfigure_on_crash` (DP / CE / HAL torn down after the
 /// reset, QMI firmware start, CE / HTC / WMI / DP again), the mac layer
-/// restarted, the 4-way handshake again and data through the new rings.
+/// restarted and the station replayed in place as `ieee80211_reconfig`
+/// does (keys re-enabled, no new 4-way handshake, the carrier never
+/// dropped), then data through the new rings.
 fn smoke_ath11k_int_crash_recover_reconnect() -> TestResult {
     check(|| {
         let mut u = up(wpa2_cfg())?;
@@ -3883,6 +3911,17 @@ fn smoke_ath11k_int_crash_recover_reconnect() -> TestResult {
         ensure!(u.netdev.link_up(), "connected before the crash");
         let rings = run(u.shared.lock()).core.hif.ce.hal.srng_ids();
         let htt_before = htt_types(&u);
+        let install_keys = |u: &Up| {
+            u.dev
+                .st
+                .borrow()
+                .wmi
+                .iter()
+                .filter(|c| c.cmd_id == wmi::WMI_VDEV_INSTALL_KEY_CMDID)
+                .count()
+        };
+        ensure!(install_keys(&u) == 2, "PTK + GTK from the 4-way");
+        let m4_before = u.dev.st.borrow().world.ap.m4_ok;
         LINK_SEEN.lock().clear();
         DISC_SEEN.lock().clear();
         crash(&u, FwNotice::Reset(MhiNotify::EeRddm));
@@ -3927,24 +3966,25 @@ fn smoke_ath11k_int_crash_recover_reconnect() -> TestResult {
                 && htt[htt_before.len()..].starts_with(&[0x0, 0xb, 0xb, 0xb, 0xb, 0xb, 0xb, 0xb]),
             "VERSION_REQ + 7 SRING_SETUP after the reset"
         );
-        // Carrier: off for the recovery, on after the reconnect.
-        ensure!(*LINK_SEEN.lock() == [false, true], "carrier off, then on");
-        ensure!(
-            *DISC_SEEN.lock() == [(1, false)],
-            "disconnect reported as a connection loss (reason 1)"
-        );
+        // ieee80211_reconfig keeps the association: no carrier change and
+        // no DISCONNECT for a station it can replay.
+        ensure!(LINK_SEEN.lock().is_empty(), "carrier stays on");
+        ensure!(DISC_SEEN.lock().is_empty(), "no disconnect reported");
         ensure!(
             u.netdev.link_up() && u.netdev.connected_bssid() == Some(BSSID),
-            "reconnected to the AP"
+            "still associated to the AP"
         );
         ensure!(
             u.netdev.stats.recovered.load(Ordering::Relaxed) == 1
-                && u.netdev.stats.reconnects.load(Ordering::Relaxed) == 1,
-            "netdev counters"
+                && u.netdev.stats.reconnects.load(Ordering::Relaxed) == 0,
+            "netdev counters: recovered, no reconnect"
         );
+        // ieee80211_reenable_keys: the same PTK and GTK installed again,
+        // with no new handshake.
+        ensure!(install_keys(&u) == 4, "PTK + GTK re-enabled");
         ensure!(
-            u.dev.st.borrow().world.ap.m4_ok,
-            "4-way handshake completed again"
+            u.dev.st.borrow().world.ap.m4_ok == m4_before,
+            "no new 4-way handshake"
         );
         // Data through the rebuilt DP rings.
         let before = u.dev.st.borrow().tcl_tx.len();

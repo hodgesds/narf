@@ -264,6 +264,8 @@ kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_htt_t2h_decode);
 fn smoke_ath11k_htt_ppdu_stats_decode() -> TestResult {
     // HTT PPDU header (type 0x1d, 116-byte TLV payload, pdev 0), then
     // COMMON(36), USR_RATE(28), USR_COMPLTN_COMMON(16), ACK_BA_STATUS(20).
+    // COMMON is `struct htt_ppdu_stats_common`: ppdu_id, sched_cmdid /
+    // ring_id / num_users, flags, chain_mask, then fes_duration_us at 16.
     let msg = words(&[
         0x0074_001d,
         0x0000_0088,
@@ -271,6 +273,7 @@ fn smoke_ath11k_htt_ppdu_stats_decode() -> TestResult {
         0,
         0x0002_4000,
         0x0000_0088,
+        0,
         0,
         0,
         0x0000_0123,
@@ -294,7 +297,7 @@ fn smoke_ath11k_htt_ppdu_stats_decode() -> TestResult {
         0x0001_4009,
         0x0000_0088,
         0x0000_0042,
-        0xa000_0e00,
+        0x0a00_0e00,
         0,
         1200,
     ]);
