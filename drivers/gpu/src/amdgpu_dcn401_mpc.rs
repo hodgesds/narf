@@ -211,8 +211,18 @@ impl<I: Io> Engine<I> {
                     None
                 }
             });
-            let (mask, value) = colored.unwrap_or((mask, value));
-            if self.read(at)? & mask != value {
+            let (mut mask, value) = colored.unwrap_or((mask, value));
+            // MPCC_MODE is the tree's (TOP_BOT_BLENDING above another plane
+            // once live): the staged and live witnesses check it.
+            if a.dpp
+                .surface
+                .request
+                .segments()
+                .any(|(p, _, _)| at == l.mpcc(p, 3))
+            {
+                mask &= !3;
+            }
+            if self.read(at)? & mask != value & mask {
                 return Err(Error::Readback(at));
             }
         }

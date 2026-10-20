@@ -38,7 +38,7 @@ pub struct DppApplied {
     pub line_buffer_config: u8,
     /// Each segment's SCL_COEF_RAM_SELECT after its coefficient load, in
     /// segment order; none for a segment that bypasses the scaler.
-    pub coef_ram: [Option<bool>; 2],
+    pub coef_ram: [Option<bool>; 4],
     /// CNVC, scaler and CM pending bits, respectively. Timing is stopped, so
     /// staged programming may remain pending; zero is not presentation evidence.
     pub pending: u8,
@@ -168,8 +168,8 @@ impl<I: Io> Engine<I> {
     }
     /// Program every segment's DPP; returns each segment's coefficient
     /// RAM selection.
-    async fn program_dpp(&mut self, applied: DppApplied) -> Result<[Option<bool>; 2], Error> {
-        let mut coef_ram = [None; 2];
+    async fn program_dpp(&mut self, applied: DppApplied) -> Result<[Option<bool>; 4], Error> {
+        let mut coef_ram = [None; 4];
         let alpha = applied.surface.request.layout().blend.per_pixel_alpha;
         for (i, (p, scaler)) in applied.surface.request.scalers().enumerate() {
             coef_ram[i] = self.program_segment_dpp(applied, p, &scaler, alpha).await?;
@@ -361,7 +361,7 @@ impl Surfaces {
             surface: surface.applied,
             timing: blank.timing,
             line_buffer_config: first.lb_memory_config(alpha) as u8,
-            coef_ram: [None; 2],
+            coef_ram: [None; 4],
             pending: 0,
         };
         e.hubp_tree_stopped(Some(pipe))?;
