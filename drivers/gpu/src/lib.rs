@@ -235,6 +235,7 @@ pub mod amdgpu_rdna2_gmc;
 /// Compatibility alias for the original Navi22 API.
 pub use amdgpu_rdna2_gmc as amdgpu_gmc_navi22;
 pub mod amdgpu_gmc_navi48;
+pub mod amdgpu_hdr;
 pub mod amdgpu_hdmi_audio;
 pub mod amdgpu_hpd;
 pub mod amdgpu_hwmon;
