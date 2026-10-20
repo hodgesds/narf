@@ -2405,12 +2405,54 @@ fn board_ports(boot: &boot::ColdBoot) -> Vec<usize> {
 
 /// Publish every connector and CRTC on the amdgpu card's KMS state; a
 /// shown sink whose CRTC DRM switched off stays connected with its CRTC off.
+static PUBLISHING: narf_lib::sync::IrqSafeSpinLock<()> = narf_lib::sync::IrqSafeSpinLock::new(());
 fn publish_outputs() {
-    let outputs = OUTPUTS.lock();
-    let crtcs: Vec<Option<crate::amdgpu_navi48_kms::Sink>> = (0..4)
-        .map(|k| {
-            outputs
-                .published(k)
+    // Snapshot under OUTPUTS, then publish with it released: SETCRTC holds
+    // the card lock while it asks OUTPUTS (display_offers, request_*), so
+    // taking the card lock under OUTPUTS here would invert that order.
+    struct Owned {
+        index: usize,
+        kind: ConnectorType,
+        edid: Option<[u8; 128]>,
+        offered: Vec<Timing>,
+        crtc: Option<usize>,
+        vrr_capable: bool,
+    }
+    // Serializes publishers so an older snapshot never lands after a newer
+    // one. Taken before OUTPUTS and never by the card-lock holders.
+    let _publishing = PUBLISHING.lock();
+    let (shown, owned, inactive) = {
+        let outputs = OUTPUTS.lock();
+        let shown: Vec<Option<([u8; 128], Timing, Vec<Timing>)>> =
+            (0..4).map(|k| outputs.published(k).cloned()).collect();
+        let owned: Vec<Owned> = outputs
+            .connectors
+            .iter()
+            .map(|c| Owned {
+                index: c.index,
+                kind: c.kind,
+                edid: c
+                    .present
+                    .then(|| c.edid.get(..128).and_then(|e| e.try_into().ok()))
+                    .flatten(),
+                offered: if c.present {
+                    c.modes.clone()
+                } else {
+                    Vec::new()
+                },
+                crtc: outputs.crtc_of(c.target),
+                vrr_capable: c.present && c.vrr_capable,
+            })
+            .collect();
+        let inactive: Vec<usize> = (0..4)
+            .filter(|&k| shown[k].is_some() && !outputs.crtcs[k].published_active())
+            .collect();
+        (shown, owned, inactive)
+    };
+    let crtcs: Vec<Option<crate::amdgpu_navi48_kms::Sink>> = shown
+        .iter()
+        .map(|s| {
+            s.as_ref()
                 .map(|(edid, timing, offered)| crate::amdgpu_navi48_kms::Sink {
                     edid,
                     timing,
@@ -2418,31 +2460,21 @@ fn publish_outputs() {
                 })
         })
         .collect();
-    let connectors: Vec<crate::amdgpu_navi48_kms::RoutedConnector> = outputs
-        .connectors
+    let connectors: Vec<crate::amdgpu_navi48_kms::RoutedConnector> = owned
         .iter()
         .map(|c| crate::amdgpu_navi48_kms::RoutedConnector {
             index: c.index,
             kind: c.kind,
-            edid: c
-                .present
-                .then(|| c.edid.get(..128).and_then(|e| e.try_into().ok()))
-                .flatten(),
-            offered: if c.present { &c.modes } else { &[] },
-            crtc: outputs.crtc_of(c.target),
+            edid: c.edid.as_ref(),
+            offered: &c.offered,
+            crtc: c.crtc,
             possible_crtcs: 0xf,
         })
         .collect();
-    let vrr_capable: Vec<bool> = outputs
-        .connectors
-        .iter()
-        .map(|c| c.present && c.vrr_capable)
-        .collect();
+    let vrr_capable: Vec<bool> = owned.iter().map(|c| c.vrr_capable).collect();
     crate::amdgpu_navi48_kms::publish_routed_vrr(&crtcs, &connectors, &vrr_capable);
-    for (k, sink) in crtcs.iter().enumerate() {
-        if sink.is_some() && !outputs.crtcs[k].published_active() {
-            crate::amdgpu_navi48_kms::set_active(k, false);
-        }
+    for k in inactive {
+        crate::amdgpu_navi48_kms::set_active(k, false);
     }
 }
 
