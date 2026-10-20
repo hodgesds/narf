@@ -2594,6 +2594,8 @@ fn board_ports(boot: &boot::ColdBoot) -> Vec<usize> {
 
 /// Publish every connector and CRTC on the amdgpu card's KMS state; a
 /// shown sink whose CRTC DRM switched off stays connected with its CRTC off.
+/// A published CRTC's sink EDID, scanned-out timing and offered modes.
+type Shown = ([u8; 128], Timing, Vec<Timing>);
 static PUBLISHING: narf_lib::sync::IrqSafeSpinLock<()> = narf_lib::sync::IrqSafeSpinLock::new(());
 fn publish_outputs() {
     // Snapshot under OUTPUTS, then publish with it released: SETCRTC holds
@@ -2612,8 +2614,7 @@ fn publish_outputs() {
     let _publishing = PUBLISHING.lock();
     let (shown, owned, inactive) = {
         let outputs = OUTPUTS.lock();
-        let shown: Vec<Option<([u8; 128], Timing, Vec<Timing>)>> =
-            (0..4).map(|k| outputs.published(k).cloned()).collect();
+        let shown: Vec<Option<Shown>> = (0..4).map(|k| outputs.published(k).cloned()).collect();
         let owned: Vec<Owned> = outputs
             .connectors
             .iter()
