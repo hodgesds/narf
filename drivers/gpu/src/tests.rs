@@ -6483,6 +6483,50 @@ fn smoke_drm_addfb2_rmfb_roundtrip() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/drm", smoke_drm_addfb2_rmfb_roundtrip);
 
+/// drm_mode_addfb2 with DRM_MODE_FB_MODIFIERS: modifier[0] (offset 72 in
+/// the 104-byte drm_mode_fb_cmd2) of DRM_FORMAT_MOD_LINEAR is accepted; any
+/// other modifier, or an unknown flag, is refused before a framebuffer is
+/// made.
+fn smoke_drm_addfb2_accepts_only_linear_modifier() -> TestResult {
+    use crate::drm::ioctl::{dispatch, DrmIoctlResult};
+    use crate::drm::render_node::DrmFileCtx;
+    let mut card = make_test_card_for_ioctl();
+    let ctx = DrmFileCtx::primary_master();
+    let gem_handle = card.gem.alloc(0x8000_0000, 64 * 64 * 4).unwrap();
+    let cmd = |flags: u32, modifier: u64| {
+        let mut arg = [0u8; 104];
+        arg[4..8].copy_from_slice(&64u32.to_le_bytes());
+        arg[8..12].copy_from_slice(&64u32.to_le_bytes());
+        arg[12..16].copy_from_slice(&0x3432_5258u32.to_le_bytes());
+        arg[16..20].copy_from_slice(&flags.to_le_bytes());
+        arg[20..24].copy_from_slice(&gem_handle.to_le_bytes());
+        arg[36..40].copy_from_slice(&256u32.to_le_bytes());
+        arg[72..80].copy_from_slice(&modifier.to_le_bytes());
+        arg
+    };
+    for (flags, modifier) in [(2, 1u64 << 56 | 1), (2, u64::MAX >> 8), (4, 0)] {
+        if dispatch(&mut card, 0xB8, &cmd(flags, modifier), &ctx).is_ok() {
+            return TestResult::Fail("non-linear modifier or unknown flag accepted");
+        }
+    }
+    if !card.framebuffers.is_empty() {
+        return TestResult::Fail("refused ADDFB2 left a framebuffer");
+    }
+    for flags in [0, 2] {
+        if !matches!(
+            dispatch(&mut card, 0xB8, &cmd(flags, 0), &ctx),
+            Ok(DrmIoctlResult::AddFb2(_))
+        ) {
+            return TestResult::Fail("LINEAR ADDFB2 refused");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm",
+    smoke_drm_addfb2_accepts_only_linear_modifier
+);
+
 fn smoke_drm_getcap_shape() -> TestResult {
     use crate::drm::ioctl::{dispatch, drm_cap, DrmIoctlResult};
     use crate::drm::render_node::DrmFileCtx;

@@ -1765,8 +1765,14 @@ fourcc: a frame in the scanned format is copied as packed words into the back
 buffer; one in the requested format waits for the relight and presents (or
 completes) after that monitor pass; others complete at once. The console and
 the CPU-copy fallback stay XRGB8888 only (`scanout_framebuffer` refuses
-other surfaces). No IN_FORMATS blob is published, so clients take the
-GETPLANE list; no hardware validation of these formats exists.
+other surfaces). Every native plane (primary and overlay) lists an immutable
+`IN_FORMATS` blob (`drm_native_planes::IN_FORMATS_PROP_ID`, blob id
+`in_formats_blob_id(plane)`, served by GETPROPBLOB): a version-1
+`drm_format_modifier_blob` with the card's plane formats and a single
+DRM_FORMAT_MOD_LINEAR entry covering all of them. amdgpu answers
+`DRM_CAP_ADDFB2_MODIFIERS` = 1; ADDFB2 with `DRM_MODE_FB_MODIFIERS` accepts
+only a LINEAR modifier[0], and an unknown flag or other modifier is EINVAL.
+No hardware validation of these formats exists.
 
 `platform::spawn_display_monitor` runs after the boot-time native modeset
 (`amdgpu.native_display`). It enables HPD on every routed DP port, then runs

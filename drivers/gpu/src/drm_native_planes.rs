@@ -37,6 +37,46 @@ pub const BLEND_PROP_ID: u32 = 0x6a;
 pub const PRIMARY_ZPOS_PROP_ID: u32 = 0x6b;
 pub const ZPOS_PROP_ID: u32 = 0x6c;
 pub const ROTATION_PROP_ID: u32 = 0x6d;
+/// "IN_FORMATS" (drm_plane_create_format_property / create_in_format_blob):
+/// an immutable blob of the plane's formats and modifiers.
+pub const IN_FORMATS_PROP_ID: u32 = 0x6e;
+/// Stable IN_FORMATS blob ids, one per plane, regenerated on GETPROPBLOB.
+const IN_FORMATS_BLOB: u32 = 0x2000;
+pub fn in_formats_blob_id(plane_id: u32) -> u32 {
+    IN_FORMATS_BLOB | (plane_id & 0xfff)
+}
+/// `drm_format_modifier_blob` for a native plane: every format the plane
+/// scans with the only modifier this scanout programs, DRM_FORMAT_MOD_LINEAR
+/// (formats at offset 24, the modifier list 8-byte aligned after them).
+pub fn in_formats_blob(card: &Card, blob_id: u32) -> Option<Vec<u8>> {
+    if blob_id & !0xfff != IN_FORMATS_BLOB {
+        return None;
+    }
+    let plane = blob_id & 0xfff;
+    card.native_plane(plane)?;
+    let formats = card.plane_formats?;
+    let n = formats.len();
+    if n == 0 || n > 64 {
+        return None;
+    }
+    let formats_offset = 24u32;
+    let modifiers_offset = (formats_offset + 4 * n as u32 + 7) & !7;
+    let mut out = Vec::with_capacity(modifiers_offset as usize + 24);
+    for word in [1, 0, n as u32, formats_offset, 1, modifiers_offset] {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    for &f in formats {
+        out.extend_from_slice(&f.to_le_bytes());
+    }
+    out.resize(modifiers_offset as usize, 0);
+    // struct drm_format_modifier { u64 formats; u32 offset; u32 pad; u64 modifier }
+    let mask = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
+    out.extend_from_slice(&mask.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u64.to_le_bytes());
+    Some(out)
+}
 
 /// drm_plane_create_blend_mode_property's entries.
 pub const BLEND_ENUMS: [(u64, &[u8]); 3] = [
@@ -238,6 +278,10 @@ pub fn object_properties(card: &Card, id: u32) -> Option<(Vec<u32>, Vec<u64>)> {
     values.push(u64::from(props.zpos));
     ids.push(ROTATION_PROP_ID);
     values.push(u64::from(props.rotation));
+    if card.plane_formats.is_some() {
+        ids.push(IN_FORMATS_PROP_ID);
+        values.push(u64::from(in_formats_blob_id(id)));
+    }
     Some((ids, values))
 }
 
@@ -725,14 +769,27 @@ mod tests {
         let Some((ids, values)) = object_properties(&card, OVERLAY_PLANE_ID_BASE) else {
             return TestResult::Fail("overlay properties");
         };
-        if ids != [ALPHA_PROP_ID, BLEND_PROP_ID, ZPOS_PROP_ID, ROTATION_PROP_ID]
-            || values != [0xffff, 0, 8, 1]
+        // IN_FORMATS follows whenever the card lists plane formats.
+        let tail = |mut v: alloc::vec::Vec<u32>| {
+            if card.plane_formats.is_some() {
+                v.push(IN_FORMATS_PROP_ID);
+            }
+            v
+        };
+        if ids
+            != tail(alloc::vec![
+                ALPHA_PROP_ID,
+                BLEND_PROP_ID,
+                ZPOS_PROP_ID,
+                ROTATION_PROP_ID
+            ])
+            || values[..4] != [0xffff, 0, 8, 1]
             || object_properties(&card, primary).map(|(i, _)| i)
-                != Some(alloc::vec![
+                != Some(tail(alloc::vec![
                     BLEND_PROP_ID,
                     PRIMARY_ZPOS_PROP_ID,
                     ROTATION_PROP_ID
-                ])
+                ]))
         {
             return TestResult::Fail("property lists");
         }
@@ -781,6 +838,38 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/drm",
         drm_native_planes_properties_follow_amdgpu_dm
+    );
+
+    /// create_in_format_blob: version 1, the plane's formats at offset 24,
+    /// one 8-byte-aligned modifier entry (LINEAR) covering every format;
+    /// other blob ids and planes are not IN_FORMATS blobs.
+    fn drm_native_planes_in_formats_blob_lists_linear_formats() -> TestResult {
+        let (mut card, _) = card();
+        static FORMATS: [u32; 3] = [0x3432_5258, 0x3432_5241, 0x3033_5258];
+        card.plane_formats = Some(&FORMATS);
+        let id = in_formats_blob_id(OVERLAY_PLANE_ID_BASE);
+        let blob = in_formats_blob(&card, id).unwrap();
+        let word = |at: usize| u32::from_le_bytes(blob[at..at + 4].try_into().unwrap());
+        assert_eq!(
+            [word(0), word(4), word(8), word(12), word(16), word(20)],
+            [1, 0, 3, 24, 1, 40]
+        );
+        assert_eq!([word(24), word(28), word(32)], FORMATS);
+        assert_eq!(blob.len(), 64);
+        assert_eq!(u64::from_le_bytes(blob[40..48].try_into().unwrap()), 0b111);
+        assert_eq!(&blob[48..64], &[0; 16]);
+        let (ids, values) = object_properties(&card, OVERLAY_PLANE_ID_BASE).unwrap();
+        assert_eq!(ids.last(), Some(&IN_FORMATS_PROP_ID));
+        assert_eq!(values.last(), Some(&u64::from(id)));
+        assert!(in_formats_blob(&card, 0x1000 | OVERLAY_PLANE_ID_BASE).is_none());
+        assert!(in_formats_blob(&card, in_formats_blob_id(0x7ff)).is_none());
+        card.plane_formats = None;
+        assert!(in_formats_blob(&card, id).is_none());
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/drm",
+        drm_native_planes_in_formats_blob_lists_linear_formats
     );
 
     /// drm_atomic_normalize_zpos and the plane setup DC gets: an overlay

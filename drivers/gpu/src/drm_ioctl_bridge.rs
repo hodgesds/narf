@@ -3186,10 +3186,14 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
     // The connector "EDID" property: an immutable blob. It carries no enum /
     // range values, so both counts stay 0; the bytes are fetched separately via
     // GETPROPBLOB using the blob id GETCONNECTOR reported as this prop's value.
-    if prop_id == EDID_PROP_ID {
+    if prop_id == EDID_PROP_ID || prop_id == crate::drm_native_planes::IN_FORMATS_PROP_ID {
         out[20..24].copy_from_slice(&(DRM_MODE_PROP_BLOB | DRM_MODE_PROP_IMMUTABLE).to_le_bytes());
         out[24..56].fill(0);
-        let name = b"EDID";
+        let name: &[u8] = if prop_id == EDID_PROP_ID {
+            b"EDID"
+        } else {
+            b"IN_FORMATS"
+        };
         out[24..24 + name.len()].copy_from_slice(name);
         out[56..60].copy_from_slice(&0u32.to_le_bytes()); // count_values
         out[60..64].copy_from_slice(&0u32.to_le_bytes()); // count_enum_blobs
@@ -3955,6 +3959,9 @@ fn handle_getpropblob(
         let card = mode_state.lock();
         match card.property_blob(blob_id) {
             Some(data) => data.to_vec(),
+            None if crate::drm_native_planes::in_formats_blob(&card, blob_id).is_some() => {
+                crate::drm_native_planes::in_formats_blob(&card, blob_id).unwrap()
+            }
             None => {
                 let connector_id =
                     connector_id_from_edid_blob(blob_id).ok_or(FsError::InvalidData)?;
@@ -6379,7 +6386,11 @@ pub fn without_kms(card_index: u32, cmd: u32, arg: usize) -> Option<Result<u64, 
 /// `DRM_IOCTL_GET_CAP` for amdgpu: the generic table, plus
 /// `DRM_CAP_SYNCOBJ_TIMELINE` = 1 (amdgpu has `DRIVER_SYNCOBJ_TIMELINE`).
 pub fn amdgpu_cap_value(cap: u64) -> u64 {
-    if cap == crate::drm::ioctl::drm_cap::SYNCOBJ_TIMELINE {
+    // amdgpu: DRIVER_SYNCOBJ_TIMELINE, and format modifiers are supported
+    // (!fb_modifiers_not_supported); only LINEAR scans out natively.
+    if cap == crate::drm::ioctl::drm_cap::SYNCOBJ_TIMELINE
+        || cap == crate::drm::ioctl::drm_cap::ADDFB2_MODIFIERS
+    {
         1
     } else {
         crate::drm::ioctl::cap_value(cap)
@@ -6399,7 +6410,9 @@ pub fn amdgpu_get_cap(cmd: u32, arg: usize) -> Option<Result<u64, FsError>> {
         Err(e) => return Some(Err(e)),
     };
     let cap = u64::from_le_bytes(b[0..8].try_into().unwrap());
-    if cap != crate::drm::ioctl::drm_cap::SYNCOBJ_TIMELINE {
+    if cap != crate::drm::ioctl::drm_cap::SYNCOBJ_TIMELINE
+        && cap != crate::drm::ioctl::drm_cap::ADDFB2_MODIFIERS
+    {
         return None;
     }
     b[8..16].copy_from_slice(&amdgpu_cap_value(cap).to_le_bytes());

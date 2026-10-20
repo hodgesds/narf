@@ -3814,8 +3814,9 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
         (r, props[..n.min(20)].to_vec(), vals[..n.min(20)].to_vec())
     };
     let (r, props, vals) = properties(OVERLAY + 1);
+    let blob = u64::from(planes::in_formats_blob_id(OVERLAY + 1));
     if r != Ok(0)
-        || props.len() != 16
+        || props.len() != 17
         || vals[0] != 0
         || props[12..]
             != [
@@ -3823,10 +3824,31 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
                 planes::BLEND_PROP_ID,
                 planes::ZPOS_PROP_ID,
                 planes::ROTATION_PROP_ID,
+                planes::IN_FORMATS_PROP_ID,
             ]
-        || vals[12..] != [0xffff, 0, 9, 1]
+        || vals[12..] != [0xffff, 0, 9, 1, blob]
     {
         return TestResult::Fail("overlay properties");
+    }
+    // IN_FORMATS through GETPROPBLOB: a version-1 drm_format_modifier_blob.
+    let mut data = [0u8; 256];
+    let mut gb = [0u8; 16];
+    gb[0..4].copy_from_slice(&(blob as u32).to_le_bytes());
+    gb[4..8].copy_from_slice(&256u32.to_le_bytes());
+    gb[8..16].copy_from_slice(&(data.as_mut_ptr() as u64).to_le_bytes());
+    let r = dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xAC, 16),
+        gb.as_mut_ptr() as usize,
+        false,
+    );
+    let len = u32::from_le_bytes(gb[4..8].try_into().unwrap()) as usize;
+    if r != Ok(0)
+        || len < 48
+        || data[0..4] != 1u32.to_le_bytes()
+        || data[16..20] != 1u32.to_le_bytes()
+    {
+        return TestResult::Fail("IN_FORMATS blob");
     }
     let (r, props, vals) = properties(0x40);
     if r != Ok(0)
@@ -3836,6 +3858,7 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
                 planes::BLEND_PROP_ID,
                 planes::PRIMARY_ZPOS_PROP_ID,
                 planes::ROTATION_PROP_ID,
+                planes::IN_FORMATS_PROP_ID,
             ]
         || vals[13] != 3
         || vals[9..11] != [64, 32]
