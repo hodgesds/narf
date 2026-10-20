@@ -536,7 +536,7 @@ impl FrlDscStream {
     }
 }
 
-/// frl_validate_mode_timing for a DSC stream (8-bpc RGB): Linux's
+/// frl_validate_mode_timing for a DSC stream (RGB at `cfg.bpc`): Linux's
 /// compressed capacity check (hpo_enc3_validate_hdmi_frl_output) with no
 /// raw bandwidth bound, at the sink's DSC_Max_FRL_Rate when `rate` is
 /// faster.
@@ -563,7 +563,9 @@ pub fn frl_dsc_carries(
         pixel_clock_100hz: t.pixel_clock_khz.checked_mul(10)?,
         h_active: t.h_active,
         h_blank,
-        bpc: 8,
+        // The compressed check reads no depth; the stream's, as Linux
+        // passes it.
+        bpc: dsc.cfg.bpc,
         encoding: FrlEncoding::Rgb444,
         audio,
         dsc: Some(FrlDsc {
@@ -636,9 +638,9 @@ pub fn frl_video_params(
     ))
 }
 
-/// The DSC view of an 8-bpc RGB HDMI FRL stream.
-fn frl_dsc_timing(t: &Timing) -> crate::amdgpu_dsc::DscTiming {
-    dsc_timing(t, 8)
+/// The DSC view of an RGB HDMI FRL stream at `bpc`.
+fn frl_dsc_timing(t: &Timing, bpc: u8) -> crate::amdgpu_dsc::DscTiming {
+    dsc_timing(t, bpc)
 }
 
 /// update_dsc_caps for an HDMI FRL sink: its HF DSC decoder
@@ -653,10 +655,12 @@ pub fn frl_dsc_caps(caps: HdmiCaps) -> Option<(crate::amdgpu_dsc::DscSinkCaps, u
     })
 }
 
-/// amdgpu_dm's HDMI FRL DSC policy for an 8-bpc RGB stream the verified FRL
-/// link `cap` cannot carry raw: dc_dsc_compute_config at the sink's DSC rate
-/// (`frl_dsc_caps`), within the pipes admission gives it (as `dp_dsc`),
-/// then the link for the compressed stream (`frl_dsc_link`).
+/// amdgpu_dm's HDMI FRL DSC policy for an RGB stream at `bpc` the verified
+/// FRL link `cap` cannot carry raw: dc_dsc_compute_config at the sink's DSC
+/// rate (`frl_dsc_caps`; the HF-VSDB's DSC_10bpc/DSC_12bpc decide the
+/// deeper inputs), within the pipes admission gives it (as `dp_dsc`), then
+/// the link for the compressed stream (`frl_dsc_link`).
+#[allow(clippy::too_many_arguments)]
 pub fn frl_dsc(
     t: &Timing,
     sink: &crate::amdgpu_dsc::DscSinkCaps,
@@ -665,12 +669,13 @@ pub fn frl_dsc(
     audio: crate::amdgpu_frl_cap::FrlAudio,
     max_dispclk_khz: u32,
     vic: crate::amdgpu_dsc::Vic,
+    bpc: u8,
 ) -> Option<(FrlRate, crate::amdgpu_dsc::DscConfig)> {
     let cfg = crate::amdgpu_dsc::compute_frl_config(
         sink,
         max_dispclk_khz,
         max_rate,
-        &frl_dsc_timing(t),
+        &frl_dsc_timing(t, bpc),
         vic,
     )?;
     dml::dsc_shape(t, cfg.slices_h, max_dispclk_khz)?;
@@ -1531,22 +1536,36 @@ pub fn refine_dsc(soc: &dml::Soc, selections: &mut [Selection]) -> Result<(), Mo
         }
         if let Some(d) = FrlDscStream::of(s) {
             // HDMI FRL: the same policy at the selected (lowest carrying)
-            // rate, which a compressed stream unchanged still fits.
+            // rate, which a compressed stream unchanged still fits, from the
+            // selected depth down: a depth the board's DSCs cannot take
+            // falls to the next compressed one (the raw FRL cap is not
+            // kept, so a shallower raw stream is not retried here).
             let (sink, link) = s.caps.dsc.zip(d.cfg.frl).ok_or(ModesetError::Link)?;
             let rate = s.frl.ok_or(ModesetError::Link)?;
             let audio = frl_audio(s.audio, s.timing.v_active);
-            let (rate, cfg) = frl_dsc(
-                &s.timing,
-                &sink,
-                link.max_rate,
-                rate,
-                audio,
-                soc.dispclk_max_khz,
-                d.vic,
-            )
-            .ok_or(ModesetError::Link)?;
+            let (rate, cfg) = [12, 10, 8]
+                .into_iter()
+                .filter(|&b| b <= d.cfg.bpc)
+                .find_map(|bpc| {
+                    frl_dsc(
+                        &s.timing,
+                        &sink,
+                        link.max_rate,
+                        rate,
+                        audio,
+                        soc.dispclk_max_khz,
+                        d.vic,
+                        bpc,
+                    )
+                })
+                .ok_or(ModesetError::Link)?;
             s.frl = Some(rate);
             s.dsc = Some(cfg);
+            s.depth = match cfg.bpc {
+                12 => otg::ColorDepth::Bpc12,
+                10 => otg::ColorDepth::Bpc10,
+                _ => otg::ColorDepth::Bpc8,
+            };
             continue;
         }
         // DP SST: the same depth search with the board's DISPCLK from the
@@ -1932,10 +1951,12 @@ pub struct HdmiStream {
 /// then 4:2:0 where declared, each from the deepest declared depth up to
 /// `max_bpc` down, as amdgpu_dm_create_validate_stream_for_sink tries them.
 /// At each, as apply_dsc_policy_for_stream does for SIGNAL_TYPE_HDMI_FRL,
-/// a stream whose raw bandwidth exceeds `frl_cap`'s is compressed for a
-/// sink with an HF DSC decoder (`frl_dsc`; the native DSC path takes 8-bpc
-/// RGB only, so deeper or 4:2:0 compressed streams are passed over), and
-/// any other is carried uncompressed at the lowest carrying rate. FRL
+/// a stream whose raw bandwidth exceeds `frl_cap`'s is compressed from
+/// that depth for a sink with an HF DSC decoder (`frl_dsc`, which needs
+/// DSC_10bpc or DSC_12bpc for the deeper inputs; the native DSC path takes
+/// RGB only, so 4:2:0 compressed streams are passed over), and any other is
+/// carried uncompressed at the lowest carrying rate. A depth DSC cannot
+/// form fails validation and the next is tried. FRL
 /// reserves bandwidth for the sink's supported LPCM modes (layout 0 at SD
 /// timings).
 pub fn hdmi_stream(
@@ -1991,10 +2012,10 @@ pub fn hdmi_stream(
             let raw = u64::from(t.pixel_clock_khz) * u64::from(bpc) * 3 / (1 + u64::from(ycbcr420));
             if raw > cap.kbps() {
                 if let Some((sink, max_rate)) = &dsc_caps {
-                    if bpc == 8 && !ycbcr420 {
+                    if !ycbcr420 {
                         let dispclk = max_dispclk_khz;
                         if let Some((rate, cfg)) =
-                            frl_dsc(t, sink, *max_rate, cap, audio, dispclk, stream_vic)
+                            frl_dsc(t, sink, *max_rate, cap, audio, dispclk, stream_vic, bpc)
                         {
                             return Some(HdmiStream {
                                 depth,

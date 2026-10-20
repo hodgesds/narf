@@ -3215,7 +3215,8 @@ fn dsc_soc() -> dml::Soc {
 /// amdgpu_dm's HDMI FRL DSC policy on DCN401: the HF DSC fields as DRM
 /// parses them; a stream compresses only when its raw bandwidth exceeds the
 /// verified FRL link's, at each encoding and depth Linux tries in turn
-/// (RGB before 4:2:0, 8-bpc RGB only natively), with dc_dsc_compute_config
+/// (RGB before 4:2:0, the deepest depth first, compressed RGB only
+/// natively), with dc_dsc_compute_config
 /// against the sink's DSC_Max_FRL_Rate and the lowest rate the compressed
 /// capacity check passes. The 8K60 CTA mode takes HDMI 2.1's eight slices
 /// and VIC 199's preset 159/16 bpp, and (as Linux's dml1 tables give it)
@@ -3281,9 +3282,17 @@ fn navi48_hdmi_frl_dsc_policy_matches_linux() -> TestResult {
     )
     .unwrap();
     let raw = stream(caps, &uhd120, 8, cap).unwrap();
-    // Deeper output compresses in Linux; the native path takes 8 bpc RGB,
-    // so a 10-bpc request compresses at 8 bpc.
+    // Deeper output compresses from 10 bpc (the decoder's DSC_10bpc), as
+    // Linux tries it before 8; without DSC_10bpc 10-bpc DSC cannot form
+    // and 8 bpc compresses.
     let deep = HdmiCaps { dc30: true, ..caps };
+    let deep_dsc8 = HdmiCaps {
+        dsc: Some(HdmiDscCaps {
+            bpc10: false,
+            ..want
+        }),
+        ..deep
+    };
     let no_rate = HdmiCaps {
         dsc: Some(HdmiDscCaps {
             max_frl_rate: 0,
@@ -3303,7 +3312,7 @@ fn navi48_hdmi_frl_dsc_policy_matches_linux() -> TestResult {
     let results = (
         raw.dsc,
         raw.frl.map(FrlRate::code),
-        stream(deep, &t, 10, cap).map(|s| (s.depth, s.dsc.is_some())),
+        stream(deep, &t, 10, cap).map(|s| (s.depth, s.dsc.map(|c| c.bpc), s.frl)),
         stream(no_rate, &t, 8, cap),
         stream(no_dsc, &t, 8, cap),
         stream(also_420, &t, 8, cap).map(|s| (s.ycbcr420, s.dsc.is_some())),
@@ -3319,12 +3328,30 @@ fn navi48_hdmi_frl_dsc_policy_matches_linux() -> TestResult {
         .map(|s| (s.ycbcr420, s.dsc.is_some(), s.frl.map(FrlRate::code))),
         stream(slow, &t, 8, frl_cap(slow)),
     );
+    let deep8 = stream(deep_dsc8, &t, 10, cap).map(|s| (s.depth, s.dsc.map(|c| c.bpc)));
     set_frl(false);
     let off = stream(caps, &t, 8, frl_cap(caps));
     set_frl(enabled);
     assert_eq!(results.0, None);
     assert_eq!(results.1, Some(4));
-    assert_eq!(results.2, Some((otg::ColorDepth::Bpc8, true)));
+    let deep10 = crate::amdgpu_dsc::compute_frl_config(
+        &crate::amdgpu_dsc::DscSinkCaps::from_hdmi(&want),
+        2_000_000,
+        6,
+        &frl_dsc_timing(&t, 10),
+        dsc.vic,
+    )
+    .unwrap();
+    assert_eq!(deep10.bpc, 10);
+    assert_eq!(
+        results.2,
+        Some((
+            otg::ColorDepth::Bpc10,
+            Some(10),
+            frl_dsc_link(&t, FrlDscStream { cfg: deep10, ..dsc }, cap.unwrap(), quiet)
+        ))
+    );
+    assert_eq!(deep8, Some((otg::ColorDepth::Bpc8, Some(8))));
     // No DSC rate (update_dsc_caps) or decoder: 8K60 RGB does not fit.
     assert_eq!(results.3, None);
     assert_eq!(results.4, None);

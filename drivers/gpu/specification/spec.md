@@ -1442,8 +1442,10 @@ stream depth, and the blank request's depth must equal it (the OPP feeds the
 DSC that depth; `Error::Invalid` otherwise).
 
 HDMI FRL DSC follows amdgpu_dm's FRL policy (`apply_dsc_policy_for_stream`,
-`create_validate_stream_for_sink`): a stream is compressed only when no
-uncompressed RGB/4:2:0 depth fits the sink's maximum FRL rate.
+`create_validate_stream_for_sink`): at each depth, deepest first, a stream
+is compressed from that depth only when it does not fit the sink's maximum
+FRL rate raw; a depth DSC cannot form (the HF-VSDB's DSC_10bpc/DSC_12bpc
+decide 10- and 12-bpc input) tries the next.
 `amdgpu_dsc::HdmiDscCaps::parse(flags, max_frl_rate, total_chunk)` reads the
 HF-VSDB DSC bytes as drm_edid does and `DscSinkCaps::from_hdmi` is
 `dc_dsc_parse_dsc_edid` (`is_frl`, `all_bpp`, `total_chunk_bytes`).
@@ -1463,8 +1465,10 @@ audio_packets_line, borrow, hc_active, hc_blank }`, and `dsc_borrow` is
 kept). `tests/dcn401_frl/check.sh` replays 3564 uncompressed and 2970
 compressed vectors against Linux built on the host; `tests/dcn401_dsc/
 check.sh` replays 3000 FRL DSC configurations and 890 CVTEM packet sets.
-`modeset::hdmi_stream` selects the stream (8-bpc RGB, then 4:2:0 DSC, as
-Linux orders encodings); `frl_video_params` gives the HPO FRL video request's
+`modeset::hdmi_stream` selects the stream (RGB at 12, 10 then 8 bpc, raw or
+compressed, then 4:2:0 raw, as Linux orders encodings and depths;
+`frl_dsc(.., bpc)` compresses at a depth); `refine_dsc` redoes the FRL DSC
+from the selected depth down with the board's DISPCLK; `frl_video_params` gives the HPO FRL video request's
 `FrlVideoRequest { audio_packets_line, borrow, hc_active, hc_blank }`.
 Lighting runs link_set_dsc_on_stream's FRL order after training: the pipe's
 DSC engines, then `hpo_enc401_hdmi_set_dsc_config` (`frl_dsc_start`:
