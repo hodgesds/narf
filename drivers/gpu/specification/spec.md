@@ -970,8 +970,9 @@ surface. ColdBoot/platform `prepare_display_dpp(pipe)` wrappers borrow the
 matching retained owners after the kernel engine proofs. It requires the same
 surface and DCN VM setup, current readback-checked clocks, matching stopped
 timing and prepared RGB black OPP, and a disconnected, blank, drained HUBP.
-Source and timing active dimensions must match; no scaling, crop, alpha blend
-or multi-pipe composition is accepted. The selected DPP clock must be disabled,
+A full-frame surface matches the timing's active size; a placed one is
+scaled through SPL (see "Navi 48 plane scaling and overlay planes"), on the
+display's own pipe or an overlay's. The selected DPP clock must be disabled,
 resets clear, its cursor disabled with no pending update, and inherited CNVC,
 scaler and CM updates complete. Test clocks and forced/manual line-buffer
 power policy are rejected before writes. Other DPP instances stay untouched.
@@ -988,13 +989,13 @@ amdgpu_dm's default plane color state, which is all FP16 needs too (its values
 pass unscaled and the output denormalization clamps them). The line buffer
 carries alpha (LB_DATA_FORMAT ALPHA_EN) exactly for the formats MPC
 preparation below blends per pixel; the partition count is the same either
-way. Scaler autocal is disabled, recout begins at zero,
-and recout/MPC dimensions match the surface. Native `SCALING_444_BYPASS` (mode 0)
-still configures a floating-point line buffer; mode 6 full bypass is not used.
-Line-buffer configurations 1, 2, then 0 are selected using native capacities
-970, 1290, 3430 and `ceil(width/6)` entries per row, requiring two rows for unity
-scaling. Widths above 10290 reject as unsupported on this single-pipe path.
-Adaptive filtering and iSHARP are disabled without programming coefficient RAM.
+way. The scaler is programmed from SPL's scaler data
+(`amdgpu_dcn401_dscl::program`): a unity segment in native
+`SCALING_444_BYPASS` (mode 0, still a floating-point line buffer; mode 6 full
+bypass is not used), a scaled one with its ratios, inits, taps, polyphase or
+EASF coefficients (loaded into the coefficient RAM not in use, then
+selected) and recout/MPC size. The line-buffer configuration is
+dpp401_dscl_find_lb_memory_config's on SPL's data. iSHARP stays disabled.
 
 Final checks require DPP clock-off, unchanged live owners/surface/timing/VM,
 stopped consumers and full DPP register readback. `DppApplied` records the
@@ -1089,9 +1090,10 @@ preparation API starts fetch or publishes an active framebuffer.
 `amdgpu_dcn401_dml::admit(&Soc, &Mode) -> Result<Plan, Error>` is the native
 scanout admission calculation: Linux DML21's DCN4 mode-support and
 mode-programming path, evaluated in fixed point with no hardware access. It
-admits only the shape the native path implements: one progressive DP SST
-timing and one unscaled, unrotated, full-frame linear RGB surface per pipe
-with the staged 320-KiB DET. `Mode::bytes_per_pixel` is DML's source format
+admits the shape the native path implements: progressive streams of linear
+RGB planes (`Mode::planes`: the primary, scaled or not, and overlays; see
+"Navi 48 plane scaling and overlay planes"), each pipe with the staged
+320-KiB DET. `Mode::bytes_per_pixel` is DML's source format
 (2 `dml2_444_16`, 4 `dml2_444_32`, 8 `dml2_444_64`; anything else is
 `Invalid`) and the pitch must be whole 256-byte requests at that depth; the
 request width, swath, DET lines, read bandwidth and deep-sleep DCFCLK follow
@@ -1742,7 +1744,9 @@ updates above), and flip events stay software-paced at the real refresh
 rate.
 
 The primary plane lists `amdgpu_navi48_kms::PLANE_FORMATS`: amdgpu_dm's
-DCN4.0.1 order less RGBA8888, the 16-bit UNORM orders, NV12 and P010.
+DCN4.0.1 order less RGBA8888, the 16-bit UNORM orders, NV12 and P010. The
+overlay planes, plane properties, placement and SETPLANE are described in
+"Navi 48 plane scaling and overlay planes".
 ADDFB2 takes a format on a card whose `plane_formats` list it, with Linux's
 pitch and dumb-object size checks (a card without native planes keeps
 XRGB8888/ARGB8888/RGB565); `drm::card::PixelFormat` knows the formats and
@@ -3562,7 +3566,9 @@ amdgpu_dm_update_plane_color_mgmt do: a 256-entry GAMMA_LUT is legacy gamma
 (sRGB-based regamma, the plane input linearized by the PRE_DEGAM sRGB ROM,
 whatever its values); a 4096-entry one regammas unless it is linear, which
 like no LUT bypasses the OGAM; any CTM is a gamut remap. On each of a
-display's pipes (both ODM halves), in dcn401_program_pipe's order:
+display's pipes (both ODM halves; with overlays, the gamut remap and regamma
+on each segment's top MPCC only and bypass below it, the input transfer
+function on every plane's DPP), in dcn401_program_pipe's order:
 dcn401_program_gamut_remap (MPCC_OGAM gamut remap in the set not current,
 then its mode and format; both MCM remaps bypassed), dcn32_set_input_transfer_func
 (dpp3_set_pre_degam sRGB or bypass, GAMCOR bypassed, CM on) and
@@ -3639,6 +3645,173 @@ above 8 bpc, plane color pipelines and AMD private properties. Model-tested
 only (`dcn-color`, `hdr`, `dcn401-color`, `dcn401-scanout`, `dcn401-otg`,
 `dcn401-mpc`, `navi48-modeset`, `navi48-kms`, `drm_ioctl`); not validated
 on hardware.
+
+### Navi 48 plane scaling and overlay planes
+
+**SPL and DSCL.** `amdgpu_dcn401_spl::calculate(&Input) -> Scaler` is the
+integer port of DC's SPL (dc/sspl `spl_calculate_scaler_params`) with
+DCN401's configuration: SPL on, EASF preferred, iSHARP off, linear-light
+scaling for RGB (EASF with six taps while the ceiling ratio is at most 2,
+polyphase otherwise), `max_downscale_src_width` 7680 and the 12-pixel
+`MIN_VIEWPORT_SIZE`. It computes the recout, MPC size, ratios, inits, taps,
+luma/chroma viewports, polyphase filters and EASF coefficients in dc_fixpt
+arithmetic (`amdgpu_dcn_color::Fixed31_32`), with the filter tables
+generated from Linux (`amdgpu_dcn401_spl_filters`). `Scaler::unity` is the
+bypassed full-frame segment. `amdgpu_dcn401_dscl::program(&Scaler, alpha)`
+returns dpp401_dscl_set_scaler_manual_scale's register sequence (SCL mode,
+ratios/inits/taps, coefficient RAM loads with the SCL_COEF_RAM_SELECT swap,
+EASF, the line buffer of dscl401_spl_calc_lb_num_partitions /
+dpp401_dscl_find_lb_memory_config), and `viewport()` returns
+hubp401_set_viewport's words (chroma equal to luma for RGB).
+`tests/dcn401_spl/check.sh` builds Linux's SPL on the host and compares
+every register word of 230 vectors (`vectors.txt`: scaled, cropped,
+positioned, ODM-sliced, rotated 180, alpha), which the
+`drivers/gpu/dcn401-spl` kernel tests replay.
+
+**Placed planes.** `otg::SurfaceRequest::plane: Option<PlaneLayout>`
+places a surface on its stream as amdgpu_dm_plane_fill_dc_scaling_info hands
+DC a plane: the source rectangle, the destination on the stream (the clip is
+the destination), the stream's size and 4:2:0 encoding, the rotation (0 or
+180; 90/270 is `Invalid`, as DML refuses a linear surface scanned vertically),
+the blending (`Blend`: per-pixel alpha, premultiplied, global alpha) and
+`underlay`. `None` is the unscaled full-frame primary (each ODM segment
+`Scaler::unity`). Each segment's SPL input is its ODM slice
+(resource_get_odm_slice_src_rect) and must succeed
+(resource_build_scaling_params), and some pixel must land on the stream,
+else `Unsupported` or `Invalid` (`SurfaceRequest::check`). The HUBP takes
+SPL's viewport and ROTATION_ANGLE, the DPP the DSCL program (the iSHARP LUT
+ends at Linux's final value), the cursor is placed in recout space
+(dcn401_set_cursor_position), and MPCC_CONTROL the blend
+(dcn401_update_mpcc_sequence: per-pixel alpha, per-pixel combined with the
+plane alpha as global gain, or global alpha; premultiplied unless Coverage).
+`SurfaceRequest::dml_plane()` is the plane as DC hands DML21 one after SPL
+(whole-stream viewport, ratios and taps). A restage reuses the buffers of
+the same pipe, size and format whatever the placement.
+
+**Overlays.** A display stacks up to `otg::MAX_OVERLAYS` (3, DCN401's
+`max_slave_planes`) overlay planes on free pipes, two each on an ODM 2:1
+stream, staged on the overlay pipe through `prepare_surface`,
+`prepare_memory`, `prepare_dpp` and `prepare_mpc` under the selected
+display's stream (`Engine::stream_pipe`). A memory restage keeps the other
+planes' records when the VMID0 context is unchanged, and staging checks
+tolerate the display's own pending staged addresses (`staged_planes`).
+`unsafe Otg::prepare_requestor_planes(.., pipe, overlays)` (ColdBoot
+`prepare_display_requestor_planes`; overlays bottom first, underlays before
+the others) gives every plane's HUBP the default DET and the primary's VTG
+and records `RequestorApplied::overlays`; it refuses an overlay on the
+primary's pipes, an unstaged pipe, a pipe used twice, another display's pipe
+(`Siblings::pipes`, which counts overlay pipes and DETs) or an underlay above
+an overlay (`Invalid`), and a fourth overlay (`Unsupported`). Deadlines
+program each plane's HUBPs its plan's DLG/TTU (`dml::Plan::plane_dlg`,
+`Plan::plane`) after binding the plan to the plane list (`deadline::bound`:
+each surface's `dml_plane`, stream size, ODM and DET); `Otg::prepare_deadlines`
+also checks each overlay pipe's DPP-only clock against its plane's DPPCLK.
+`start_scanout` builds each ODM segment's MPCC tree as mpc1_insert_plane does
+for planes programmed from the top down (each new MPCC at the bottom over the
+background, TOP_LAYER_ONLY; the one above it switched to TOP_BOT_BLENDING;
+the top MPCC on the OPP's OUT_MUX; an underlay below the primary, which still
+feeds its own OPP), all under the one OTG lock with every HUBP unblanked, and
+waits for every plane's EARLIEST_INUSE. `ScanoutRunning::overlays`
+(`OverlayScanout`) records them. The CRTC's gamut remap and regamma go on
+each segment's top MPCC only (dcn401_program_gamut_remap and
+dcn401_set_output_transfer_func's `is_top_pipe`), the input transfer
+function on every DPP. `unsafe Otg::flip_planes(.., pipe, mask, ..)`
+(ColdBoot `flip_display_planes`) re-addresses any set of planes (bit 0 the
+primary, bit k the k-th overlay) under one lock so they latch at one VUPDATE;
+`prepare_plane_back_buffer` and `upload_plane_back_buffer` serve the
+overlays' back buffers. `stop_scanout` detaches the overlays first (top
+down), returning every MPCC to TOP_LAYER_ONLY. Live checks (`LivePipe`:
+address, cursor, the five tree selectors and the MPCC mode) cover every
+plane, also another display's live pipes. `retire_planes` ends overlay
+staging (records on pipes with neither timing nor blank of their own) and
+returns their pipes and DETs. The cursor stays on the primary's pipes.
+
+**Admission.** `dml::Mode::planes` lists the stream's planes (`dml::Plane`:
+surface, pitch, depth, SPL viewport, ratios and taps; an empty `planes[0]` is
+the full-frame primary of `pitch` and `bytes_per_pixel`, overlays follow
+from `planes[1]`, `Mode::plane_list`); `admit_all` takes at most
+`dml::MAX_PLANES` (4) planes and four pipes in all (`Pipes`). Per plane it
+follows dml2_core_dcn4_calcs.c: DPPCLK from the PSCL throughput
+(CalculateSinglePipeDPPCLKAndSCLThroughput), DPPREFCLK from the fastest
+plane and DISPCLK from the fastest stream, the scaler's DPPCycles, prefetch
+source lines from the vertical ratio and taps, the swath and ODM recout width
+at the horizontal ratio, active burst at the vertical ratio, line-buffer
+hiding with the extra taps and the several-surface share, deep-sleep DCFCLK
+per plane, and per-plane DLG/TTU (`Plan::planes`, `PlanePlan`: DPPCLK, DLG,
+TTU, DET, ODM blank end; line and request delivery above a vertical ratio of
+1 at the scaler's throughput). The plan's top-level DLG/TTU are the
+primary's. `tests/dcn401_dml21/plane_vectors.txt` (654 configurations:
+scaled primaries, one to three overlays, ODM 2:1 streams with overlays, two
+streams) is answered by Linux DML21 (`harness_planes.c`), checked by
+`check.sh` and replayed by `dcn401_dml_matches_linux_dml21_plane_vectors`.
+
+**Modeset and platform.** `modeset::PlaneSetup` (the primary's
+`PlaneGeometry`: source origin and size, CRTC rectangle, rotation, blending;
+`OverlayPlane`s bottom first with format and `underlay`) is set per pipe
+(`set_plane_setup`, `plane_setup`, `Selection::planes`). `selection_mode` and
+`with_planes` give DML every plane (`plane_requests`/`stream_planes` build the
+surface requests); `overlay_pipes` takes free pipes from the top after every
+display's and ODM pipe, refusing `Admission(Pipes)`; `prepare_pipes` returns
+each display's `DisplayPipes` and gives the overlay pipes their DPP-only
+clocks; `light` powers, stages (every plane's memory before any plane's DPP)
+and requests every plane. The platform records each CRTC's planes
+(`request_display_planes`), relights a display whose planes changed (DC's
+full update; a failed relight returns every display to the full-frame
+XRGB8888 primary), and admits a configuration with
+`display_admits_planes(display, connector, mode, fourcc, setup) ->
+Result<(), PlanesRefused>`: the display lit on the same connector and timing
+(`NotLit` otherwise), DML21 with every lit display's admitted planes
+(`Bandwidth`, `Plane`), a free pipe for each overlay beside the other
+displays' (`Pipes`) and staging's checks (`Plane`).
+`present_planes(display, primary, overlays, ticket)` queues a commit's
+`PlaneFrame`s (merged per plane in the mailbox); the presenter copies each
+plane's framebuffer source rectangle into its back buffer and flips every
+changed plane together.
+
+**KMS.** `drm_native_planes` gives the Navi 48 card amdgpu_dm's planes
+(amdgpu_dm_initialize_drm_device, amdgpu_dm_plane_init): each CRTC's primary
+(id 0x40 + n) and three overlays (0x44-0x46, possible_crtcs 0xff, the
+supported subset of amdgpu_dm's overlay_formats: XRGB/ARGB/XBGR/ABGR8888 and
+RGB565, `OVERLAY_FORMATS`), listed by GETPLANERESOURCES and GETPLANE (an
+overlay's CRTC and framebuffer as committed). Properties
+(`Card::native_planes`, `PlaneProps`): "pixel blend mode" (None,
+Pre-multiplied, Coverage; default Pre-multiplied) on every plane, "alpha"
+(0..0xffff) on the overlays, "zpos" (the primary's immutable at 3; an
+overlay's 0..254, default 3 + 1 + its DRM plane index after the four
+primaries, 8-10) and the "rotation" bitmask (rotate-0/90/180/270, exactly
+one); a value outside its property or a write to the immutable zpos is
+EINVAL. ATOMIC (TEST_ONLY included) and DRM_IOCTL_MODE_SETPLANE (master;
+drm_mode_setplane's atomic path: fb 0 disables, unknown plane, CRTC or
+framebuffer ENOENT, a source outside the framebuffer ENOSPC) run
+`drm_native_planes::check`: drm_atomic_plane_check's CRTC rules (a plane
+moved straight to another CRTC, a primary off its own CRTC) and formats;
+amdgpu_dm_plane_helper_check_state (the 24x12 viewport left on the CRTC,
+drm_atomic_helper_check_plane_state with DCN401's 16x upscale and 6:1
+downscale caps) and amdgpu_dm_plane_fill_dc_scaling_info (non-empty
+rectangles, 167..16000 per mille); an enabled CRTC needs its primary
+(dm_crtc_helper_atomic_check); rotation 90/270 is refused (DML21 cannot scan
+a linear surface vertically); drm_atomic_normalize_zpos (zpos, then plane id)
+orders the stack, overlays below the primary being underlays; and the
+platform's admission. Every refusal is EINVAL (Linux's scale check returns
+-ERANGE, which FsError cannot express). A plane change needs no
+ALLOW_MODESET. A commit records the planes' state and requests each touched
+display's planes; the planes it updates present together (`present_planes`).
+PAGE_FLIP keeps a placed primary's placement (the new framebuffer must hold
+its source rectangle, ENOSPC otherwise), SETCRTC shows the framebuffer whole
+again (drm_atomic_helper_set_config) and RMFB disables the overlays scanning
+the removed framebuffer.
+
+Gaps: a plane configuration change relights the display (a visible blank)
+rather than DC's seamless full update; the cursor shows only on the
+primary's pipes, under opaque overlays above it; planes on an ODM 2:1 stream
+must reach both halves; no NV12/P010/RGBA8888 overlays, plane color or
+plane rotation 90/270; offered alternative modes are admitted without the
+display's overlays, and KMS admits planes only on the lit timing (a mode
+switch with overlays relights and falls back if they no longer fit);
+OBJ_SETPROPERTY does not set plane properties. Model-tested only
+(`dcn401-spl`, `dcn401-dml`, `dcn401-dpp`, `dcn401-mpc`, `dcn401-requestor`,
+`dcn401-deadline`, `dcn401-scanout`, `navi48-modeset`, `navi48-kms`, `drm`,
+`drm_ioctl`); not validated on hardware.
 
 ### Discrete RDNA2 PSP secure-OS bootstrap
 

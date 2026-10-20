@@ -851,6 +851,21 @@ format vector set, HUBP/DPP/MPC words as Linux programs them, premultiplied
 alpha per amdgpu_dm's default); a format change relights the display.
 Register models and QEMU only; no hardware run.
 
+Navi48 planes now scale and stack as amdgpu_dm exposes them on DCN 4.0.1:
+the primary is placed and scaled through a port of DC's SPL (viewport,
+recout, ratios, taps, polyphase/EASF filters; every register word matched
+against host-built Linux SPL on 230 vectors) and the DSCL program, and up to
+three overlay planes (possible on every CRTC, XRGB/ARGB/XBGR/ABGR8888 and
+RGB565) take free pipes, blended above or below the primary through MPCC
+trees built as mpc1_insert_plane does, with alpha, pixel blend mode, zpos
+and rotation (0/180; 90/270 refused) properties. DML21 admits the planes
+jointly (matched against Linux on 654 scaled and multi-plane
+configurations); the KMS checks follow amdgpu_dm's (24x12 viewport, 16x up,
+6:1 down, primary required, zpos normalization) on ATOMIC, TEST_ONLY and the
+new SETPLANE, configurations short of pipes are refused, a plane change
+relights the display and framebuffer updates of several planes flip at one
+VUPDATE. Register models and QEMU only; no hardware run.
+
 DP MST now also runs over 128b/132b links: a branch that codes UHBR trains
 MST at its best UHBR rate (as Linux's decide_mst_link_settings does), streams
 share the owner's HPO link encoder with all 64 slots from slot 0, and each
