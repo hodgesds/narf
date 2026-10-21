@@ -165,6 +165,25 @@ fn rdna4_per_die_policy_matches_linux() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/rdna4", rdna4_per_die_policy_matches_linux);
 
+/// The resource pool is per device: a new bind forgets the previous
+/// device's fuses until its own CC_DC_PIPE_DIS read publishes them.
+fn rdna4_pipe_pool_is_reset_per_bind() -> TestResult {
+    let (prior_chip, prior_pool) = (bound(), pipe_pool());
+    publish_pipe_pool(PipePool::from_fuses(0b1010));
+    publish(Some(Rdna4Chip::Navi44));
+    let fresh = pipe_pool() == PipePool::FULL && bound() == Some(Rdna4Chip::Navi44);
+    publish_pipe_pool(PipePool::from_fuses(0b0001));
+    publish(None);
+    let unbound = pipe_pool() == PipePool::FULL && bound().is_none();
+    publish(prior_chip);
+    publish_pipe_pool(prior_pool);
+    if !(fresh && unbound) {
+        return TestResult::Fail("previous device's pipe fuses survived a bind");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/rdna4", rdna4_pipe_pool_is_reset_per_bind);
+
 fn umc(instance: u8) -> IpBlock {
     IpBlock {
         hw_id: ip::HW_ID_UMC,

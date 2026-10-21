@@ -700,11 +700,15 @@ impl ColdBoot {
         // dcn401_resource_construct's pipe harvesting: the resource pool
         // every display owner below is built with (all four pipes when the
         // read is unavailable, which also leaves the rest of display
-        // bring-up to fail on its own).
-        // SAFETY: same exclusive register ownership; one read, no writes.
-        if let Some(pool) = unsafe { crate::amdgpu_rdna4::read_pipe_pool(gpu, &authority) } {
-            crate::amdgpu_rdna4::publish_pipe_pool(pool);
-        }
+        // bring-up to fail on its own). Every owner (cold boot and the one
+        // `after_reset` builds for recovery or resume) publishes its own
+        // read, so no earlier device's or boot's pool survives an
+        // unreadable fuse register.
+        crate::amdgpu_rdna4::publish_pipe_pool(
+            // SAFETY: same exclusive register ownership; one read, no writes.
+            unsafe { crate::amdgpu_rdna4::read_pipe_pool(gpu, &authority) }
+                .unwrap_or(crate::amdgpu_rdna4::PipePool::FULL),
+        );
         // Linux's DCN crystal (`dce_refclk_10khz`), the reference DDC and the
         // DCHUB global timer both divide.
         let crystal = gpu

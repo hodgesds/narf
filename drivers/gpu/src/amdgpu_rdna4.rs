@@ -547,12 +547,17 @@ static BOUND: AtomicU8 = AtomicU8::new(NONE);
 static FUSES: AtomicU8 = AtomicU8::new(0);
 
 /// Record the die the probe bound. Read by DC policy that has no `AmdGpu`.
+///
+/// A bind is a new device: its resource pool is unknown until that
+/// device's own `CC_DC_PIPE_DIS` read, so the previous device's fuses are
+/// dropped here (dcn401_resource_construct builds a fresh pool per device).
 pub(crate) fn publish(chip: Option<Rdna4Chip>) {
     let code = match chip {
         None => NONE,
         Some(Rdna4Chip::Navi48) => 1,
         Some(Rdna4Chip::Navi44) => 2,
     };
+    FUSES.store(0, Ordering::Release);
     BOUND.store(code, Ordering::Release);
 }
 /// The bound RDNA4 die, if any.

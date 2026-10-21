@@ -399,9 +399,12 @@ type and bus width are VBIOS `umc_info`; DML's channel count is DALSMC
 `GetNumUmcChannels`; DPM clocks, PPT limits, thermal limits and fan range are
 the PMFW board table. The DCN resource pool comes from `CC_DC_PIPE_DIS`
 (`dcn_4_1_0_offset.h` 0xca, BASE_IDX 2): `unsafe
-amdgpu_rdna4::read_pipe_pool` reads it once at cold boot and
-`publish_pipe_pool` records the `PipePool` (`pipe_pool()`) before any
-display owner is built. `PipePool` is `dcn401_resource_construct`'s packing:
+amdgpu_rdna4::read_pipe_pool` reads it in every boot owner's construction
+(cold boot and `after_reset`'s recovery/resume owner) and
+`publish_pipe_pool` records the `PipePool` (`pipe_pool()`, all four pipes
+if the read fails) before any display owner is built. The pool is per
+device: `amdgpu_rdna4::publish` at bind resets it to all four pipes, so no
+previous device's fuses survive (NARF binds one AMD GPU at a time). `PipePool` is `dcn401_resource_construct`'s packing:
 `count()` surviving pipes, pipe index `j` (`pipes()`, `all()`) backed by
 the `j`-th unfused instance (`hw(j)`, inverse `pipe(inst)`, `hw_mask` /
 `pipe_mask` by bit) for its HUBP, DPP, OPP, OTG and MPCC, and DSC `j`
