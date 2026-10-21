@@ -190,6 +190,23 @@ Peer CPU IPI handler:
   1. Apply the same arch-specific invalidation.
   2. ACK via a per-CPU shootdown counter.
 
+Lazy targets (x86_64). "Running with a stale view" is narrowed the way Linux
+narrows `mm_cpumask` with `tlb_gen`:
+
+  * **Process tags.** A CPU whose residency history holds the tag's bucket but
+    whose *current* bucket (published by `AddressSpace::activate` before the
+    CR3 write, narrowed after it) differs is not interrupted. The writer
+    publishes per-CPU flush debt for the bucket and re-reads the current
+    bucket. The loader widens its current bucket, then reads its debt, and
+    flushes every non-global entry before the CR3 write if any is owed. Both
+    pairs are SeqCst, so either the IPI or the flush happens.
+  * **Tag 0.** A tag-0 load flushes, so only CPUs whose live or announced root
+    is the owner can hold its entries; `shootdown_owned` targets exactly
+    those. It is used only while the entry assembly's PCIDE gate is clear,
+    because with it set the trap entry and `kernel_switch` can restore a
+    tag-0 root outside `activate`.
+  * Domain tags are always interrupted, never deferred.
+
 ### 4.2 API
 
 ```rust

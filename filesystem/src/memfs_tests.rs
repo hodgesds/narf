@@ -1730,7 +1730,7 @@ fn smoke_tmpfs_timestamps_are_three_distinct_stamps() -> TestResult {
         return TestResult::Fail("set_times failed");
     }
     let attrs = file.inode_attrs();
-    if attrs.atime_ns != SECOND || narf_time::cycles_to_ns(file.stat().mtime_cycles) != 2 * SECOND {
+    if attrs.atime_ns != SECOND || file.inode_attrs().mtime_ns != 2 * SECOND {
         return TestResult::Fail("set_times did not plant atime/mtime");
     }
     // Asserted RELATIVE to the inode's own creation stamp, never against an
@@ -1755,7 +1755,7 @@ fn smoke_tmpfs_timestamps_are_three_distinct_stamps() -> TestResult {
     if poll_once(file.set_perms(0o700)).map(|r| r.is_ok()) != Some(true) {
         return TestResult::Fail("chmod failed");
     }
-    if narf_time::cycles_to_ns(file.stat().mtime_cycles) != 2 * SECOND {
+    if file.inode_attrs().mtime_ns != 2 * SECOND {
         return TestResult::Fail("chmod moved mtime");
     }
     if file.inode_attrs().ctime_ns < attrs.ctime_ns {
@@ -1789,9 +1789,7 @@ fn smoke_tmpfs_timestamps_are_three_distinct_stamps() -> TestResult {
     if poll_once(file.write(0, b"x")).map(|r| r.is_ok()) != Some(true) {
         return TestResult::Fail("write failed");
     }
-    if narf_time::cycles_to_ns(file.stat().mtime_cycles) == 2 * SECOND
-        || file.inode_attrs().ctime_ns < before_write
-    {
+    if file.inode_attrs().mtime_ns == 2 * SECOND || file.inode_attrs().ctime_ns < before_write {
         return TestResult::Fail("a write did not move mtime and ctime together");
     }
     // A directory has real timestamps too, and a namespace change moves

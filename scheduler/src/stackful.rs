@@ -123,6 +123,148 @@ const STACK_CANARY_WORDS: usize = 8;
 /// Recognisable in raw memory dumps ("SAFE STACK" flavored).
 const STACK_CANARY: u64 = 0x5AFE_57AC_0F10_D511;
 
+/// Kernel-stack reuse cache. A `fork`/`exit` storm otherwise churns an order-3
+/// (32 KiB) block through the buddy per task, which both consumes AND fragments
+/// it until a later order-3 kernel-stack allocation finds no contiguous run and
+/// the infallible `vec![0u8; 32K]` in `with_stack_size` hits
+/// `handle_alloc_error` — an observed kernel panic ("memory allocation of 32768
+/// bytes failed") under a 16-worker stress-ng `fork` run. Recycling makes the
+/// steady state reuse the same frames (no buddy op, no new fragmentation).
+///
+/// Two tiers, mirroring the slab's per-CPU magazine + central list so the hot
+/// path takes no shared lock:
+///
+///   per-CPU magazine (lock-free under `without_interrupts`)
+///        ↕ overflow / refill
+///   global depot (bounded `IrqSafeSpinLock`)
+///        ↕
+///   buddy (fresh alloc / final free)
+///
+/// A stack is allocated on the forking CPU but recycled on whichever CPU runs
+/// its RCU reclaim, so the per-CPU tier wins the common same-CPU
+/// fork→exit→fork case while the depot absorbs cross-CPU drift and bounds total
+/// cached memory (a fork bomb cannot hoard through the cache).
+///
+/// SECURITY: a freed stack is zeroed BEFORE it enters either tier
+/// (`recycle_kernel_stack`), so no exiting task's kernel data lingers in the
+/// cache and a reused stack hands the next task only zeros + a freshly re-armed
+/// overflow canary. Recycling happens ONLY on the RCU-confirmed-dead path
+/// (`StackfulAdapter::drop` → `KernelTask::mark_stack_recyclable`); a
+/// `KernelTask` freed by any other path frees its stack straight to the buddy,
+/// so a still-referenced stack can never be handed back out.
+// Kept deliberately small: the cache holds whole 32 KiB stacks, and a
+// fork/exit storm already hovers near memory exhaustion, so a large cache would
+// sequester megabytes that the storm needs and tip it into OOM sooner (observed
+// — a 16 MiB cache OOM'd a sweep a 4 MiB one survived). A couple per CPU plus a
+// modest depot covers the hot working set (≈ live child count) without hoarding.
+const STACK_MAG_SIZE: usize = 2;
+const STACK_DEPOT_CAP: usize = 32;
+
+struct StackSlots<const N: usize> {
+    slots: [Option<alloc::boxed::Box<[u8]>>; N],
+    len: usize,
+}
+impl<const N: usize> StackSlots<N> {
+    const fn new() -> Self {
+        Self {
+            slots: [const { None }; N],
+            len: 0,
+        }
+    }
+    /// Store `stack`, or hand it back (`Some`) when full.
+    #[inline]
+    fn push(&mut self, stack: alloc::boxed::Box<[u8]>) -> Option<alloc::boxed::Box<[u8]>> {
+        if self.len >= N {
+            return Some(stack);
+        }
+        self.slots[self.len] = Some(stack);
+        self.len += 1;
+        None
+    }
+    #[inline]
+    fn pop(&mut self) -> Option<alloc::boxed::Box<[u8]>> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        self.slots[self.len].take()
+    }
+}
+
+#[repr(align(64))]
+struct CpuStackMag {
+    inner: UnsafeCell<StackSlots<STACK_MAG_SIZE>>,
+}
+impl CpuStackMag {
+    const fn new() -> Self {
+        Self {
+            inner: UnsafeCell::new(StackSlots::new()),
+        }
+    }
+}
+// SAFETY: each CPU touches only its own magazine, always under
+// `without_interrupts` (so no same-CPU IRQ re-enters it); no other CPU ever
+// dereferences the cell.
+unsafe impl Sync for CpuStackMag {}
+
+static STACK_MAGS: [CpuStackMag; narf_lib::percpu::MAX_CPUS] =
+    [const { CpuStackMag::new() }; narf_lib::percpu::MAX_CPUS];
+static STACK_DEPOT: narf_lib::sync::IrqSafeSpinLock<StackSlots<STACK_DEPOT_CAP>> =
+    narf_lib::sync::IrqSafeSpinLock::new(StackSlots::new());
+
+/// Obtain a `stack_bytes` kernel stack: this CPU's magazine first, then the
+/// global depot, then a fresh zeroed buddy allocation. Cached stacks were
+/// already zeroed at free, so there is no scrub here (off the hot path);
+/// `with_stack_size` re-arms the overflow canary either way. Non-default sizes
+/// always allocate fresh.
+fn acquire_kernel_stack(stack_bytes: usize) -> alloc::boxed::Box<[u8]> {
+    if stack_bytes == DEFAULT_KERNEL_STACK_BYTES {
+        // Tier 1: this CPU's magazine — no shared lock on the hot path.
+        let local = narf_lib::sync::without_interrupts(|| {
+            let cpu = narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
+            // SAFETY: per-CPU cell, IRQs masked → sole accessor on this CPU.
+            let mag = unsafe { &mut *STACK_MAGS[cpu].inner.get() };
+            mag.pop()
+        });
+        if let Some(stack) = local {
+            return stack;
+        }
+        // Tier 2: global depot.
+        if let Some(stack) = STACK_DEPOT.lock().pop() {
+            return stack;
+        }
+    }
+    // Tier 3: fresh (also the only path for non-default sizes).
+    alloc::vec![0u8; stack_bytes].into_boxed_slice()
+}
+
+/// Return a default-size kernel stack to the cache after zeroing it, or let it
+/// free to the buddy. Per-CPU magazine first, global depot on overflow, buddy
+/// when both are full (the final `Box` drop happens outside every lock). MUST
+/// only be called once the stack is provably unreferenced — i.e. from the RCU
+/// reclaim of a `KernelTask` marked recyclable (see `KernelTask::drop`).
+fn recycle_kernel_stack(mut stack: alloc::boxed::Box<[u8]>) {
+    if stack.len() != DEFAULT_KERNEL_STACK_BYTES {
+        return; // non-default: frees to the buddy here
+    }
+    stack.fill(0); // SECURITY: scrub before the stack enters any tier
+
+    // Tier 1: this CPU's magazine.
+    let overflow = narf_lib::sync::without_interrupts(|| {
+        let cpu = narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
+        // SAFETY: per-CPU cell, IRQs masked → sole accessor on this CPU.
+        let mag = unsafe { &mut *STACK_MAGS[cpu].inner.get() };
+        mag.push(stack)
+    });
+    let Some(stack) = overflow else {
+        return; // cached in this CPU's magazine
+    };
+    // Tier 2: global depot. The lock is released at the end of this statement;
+    // if the depot is full too, the handed-back `Box` drops below, freeing to
+    // the buddy outside the lock.
+    let _buddy = STACK_DEPOT.lock().push(stack);
+}
+
 /// One cache-line-isolated CPU-local value. Scheduler context transitions
 /// update these slots at handoff frequency, so adjacent CPUs must not share a
 /// coherence line even when the contained atomic is only one machine word.
@@ -1649,6 +1791,12 @@ pub struct KernelTask {
     /// Per-task kernel stack. Box<[u8]> for automatic drop. Size
     /// captured at `new()` time; phase 1b doesn't grow stacks.
     stack: Box<[u8]>,
+    /// Set only on the RCU-confirmed-dead reclaim path
+    /// (`StackfulAdapter::drop`). When set, `Drop` returns `stack` to the
+    /// per-CPU stack cache for reuse; when clear (a `KernelTask` freed by any
+    /// other path — a stack that may still be referenced), `Drop` frees `stack`
+    /// straight to the buddy. See the stack-cache security note.
+    recyclable_stack: AtomicBool,
     /// Saved register state. Initialised by `KernelContext::fresh`
     /// to land the first kernel_switch on `trampoline_entry`.
     ctx: KernelContext,
@@ -1864,8 +2012,10 @@ impl KernelTask {
 
         // Allocate the stack on the heap so it's stable across
         // moves (we're going to point r15 at the task itself, and
-        // rsp at this stack — both pointers must stay valid).
-        let mut stack: Box<[u8]> = alloc::vec![0u8; stack_bytes].into_boxed_slice();
+        // rsp at this stack — both pointers must stay valid). Reuses a
+        // recycled default-size stack when available (see STACK_CACHE) so a
+        // fork storm does not churn an order-3 buddy block per task.
+        let mut stack: Box<[u8]> = acquire_kernel_stack(stack_bytes);
 
         // Arm the overflow tripwire at the LOW end of the stack. See
         // STACK_CANARY: a stack overrunning its bottom pushes through
@@ -1879,6 +2029,10 @@ impl KernelTask {
         let mut me = Box::new(KernelTask {
             future: Box::pin(future),
             stack,
+            // Default: free the stack to the buddy on drop. Set true only on
+            // the RCU reclaim path, which is the sole point the stack is
+            // provably unreferenced and thus safe to recycle.
+            recyclable_stack: AtomicBool::new(false),
             // A fresh task has no scope open, so it reports FRAME.
             domain_byte: AtomicU8::new(narf_lib::id::DomainId::FRAME.raw()),
             // `KernelContext::default()` is a real register struct on x86_64
@@ -2421,6 +2575,13 @@ impl KernelTask {
         self.wake_cell_ptr.store(cell_ptr, Ordering::Release);
     }
 
+    /// Authorise `Drop` to recycle this task's stack into the per-CPU stack
+    /// cache. Only the RCU reclaim path (`StackfulAdapter::drop`) calls this,
+    /// after which the grace period guarantees the stack is unreferenced.
+    fn mark_stack_recyclable(&self) {
+        self.recyclable_stack.store(true, Ordering::Release);
+    }
+
     fn unbind_wake_cell(&self) {
         let me = self as *const KernelTask as *mut KernelTask;
         self.wake_cell_ptr
@@ -2492,6 +2653,20 @@ impl Drop for KernelTask {
         self.unbind_wake_cell();
         self.drop_active_poll_waker();
         self.clear_current_slots();
+        // Recycle the stack to the per-CPU cache instead of freeing its 8
+        // contiguous frames to the buddy — ONLY when this drop is the
+        // RCU-confirmed-dead reclaim (`recyclable_stack` set by
+        // `StackfulAdapter::drop`), the sole point the stack is provably
+        // unreferenced by any CPU. Any other free path (the backstop for a
+        // task freed without going through RCU) leaves the flag clear, so the
+        // stack drops here and frees to the buddy — never handed back out while
+        // a stale `rsp` might still point into it. `mem::take` leaves an empty,
+        // non-allocating placeholder so the field's own drop is a no-op.
+        let stack = core::mem::take(&mut self.stack);
+        if self.recyclable_stack.load(Ordering::Acquire) {
+            recycle_kernel_stack(stack);
+        }
+        // else: `stack` frees to the buddy as it drops here.
     }
 }
 
@@ -3955,6 +4130,12 @@ impl Drop for StackfulAdapter {
         let task = unsafe { core::mem::ManuallyDrop::take(&mut self.inner) };
         task.unbind_wake_cell();
         task.clear_current_slots();
+        // This is the RCU-deferred reclaim: after the grace period below the
+        // stack is provably unreferenced by any CPU, so authorise `Drop` to
+        // recycle it into the per-CPU stack cache instead of freeing it to the
+        // buddy. No other `KernelTask` free path sets this, so a stack can only
+        // re-enter the cache once it is safe.
+        task.mark_stack_recyclable();
         narf_rcu::retire_box(task);
     }
 }

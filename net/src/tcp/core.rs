@@ -1733,9 +1733,15 @@ pub fn connect_start_in(
     // it presents as "no SYN emitted" with the routing table and the peer's
     // ARP entry both perfectly correct — which is how it survived a test that
     // was fixed by giving the interface the gateway it expected instead.
+    // `tcp_v4_connect` -> `ip_route_connect`: no route is -ENETUNREACH
+    // before any packet is built. Falling back to the destination itself
+    // ARPed an off-link address on the local segment, which nothing answers,
+    // so a connect made while NetworkManager was between default routes
+    // failed only after six ARP retries (curl: "Failed to connect ... after
+    // 6060 ms") instead of at once.
     let nexthop = crate::route::route_lookup_in(net_ns_id, crate::ipv4::Ipv4Addr(remote_addr))
         .map(|r| r.nexthop.0)
-        .unwrap_or(remote_addr);
+        .ok_or(errno::ENETUNREACH as i32)?;
     // `tcp_v4_connect` does not wait for the neighbour: an unresolved next
     // hop leaves the MAC zero, and the SYN queues on it in `emit_tcb_frame`.
     // Resolution failing reaches the socket as EHOSTUNREACH (`tcp_v4_err`).
@@ -3210,7 +3216,7 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         if ok {
             t.rto_count = t.rto_count.saturating_add(1);
             let now = narf_scheduler::narf_time::now_cycles();
-            let cpn = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
+            let cpm = narf_scheduler::narf_time::ns_to_cycles(1_000_000).max(1);
             let flight = t.flightsize;
             // Split-borrow the guard: `cc` is `&Box<dyn …>` (immutable
             // self) while `cong` is the `&mut CcState` target. Going
@@ -3218,7 +3224,7 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
             // as disjoint borrows.
             {
                 let tcb: &mut Tcb = &mut t;
-                tcb.cc.on_rto(&mut tcb.cong, flight, now, cpn);
+                tcb.cc.on_rto(&mut tcb.cong, flight, now, cpm);
             }
             // Mark every outstanding segment as retransmitted —
             // Karn's algorithm.
@@ -4611,8 +4617,8 @@ fn handle_ack(
         let from_buf = t.send_buf.ack(ack);
         let bytes_acked = acked;
         let now = narf_scheduler::narf_time::now_cycles();
-        let cpn = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
-        t.cong.cycles_per_ns = cpn;
+        let cpm = narf_scheduler::narf_time::ns_to_cycles(1_000_000).max(1);
+        t.cong.cycles_per_ms = cpm;
         // RTT sample on the first non-retransmitted segment whose
         // entire range was just ack'd.
         // After a go-back-N rewind the queue also holds the re-sent copies
@@ -4662,7 +4668,7 @@ fn handle_ack(
         if fast_retransmit_now {
             // Fast retransmit + enter fast recovery.
             let now = narf_scheduler::narf_time::now_cycles();
-            let cpn = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
+            let cpm = narf_scheduler::narf_time::ns_to_cycles(1_000_000).max(1);
             let nxt = t.snd_nxt;
             {
                 let tcb: &mut Tcb = &mut t;
@@ -4671,7 +4677,7 @@ fn handle_ack(
                     LossEvent::FastRetransmit {
                         snd_nxt: nxt,
                         now_cycles: now,
-                        cycles_per_ns: cpn,
+                        cycles_per_ms: cpm,
                     },
                 );
             }

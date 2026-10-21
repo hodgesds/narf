@@ -4757,7 +4757,14 @@ fn emit_serial_tail(serial: &[u8]) {
     let start = serial.len().saturating_sub(MAX_DIAGNOSTIC_BYTES);
     let mut stderr = std::io::stderr().lock();
     if start != 0 {
-        let _ = writeln!(stderr, "[... {} serial bytes omitted ...]", start);
+        // Only the tail is replayed; the guest re-emits `── summary` and
+        // every `── failing tests ──` name right before it exits, so those
+        // always land inside it. Say where the rest is.
+        let _ = writeln!(
+            stderr,
+            "[... {} serial bytes omitted; XTASK_QEMU_SERIAL_LOG=<file> keeps the full stream ...]",
+            start
+        );
     }
     let _ = stderr.write_all(&serial[start..]);
     if serial.last().is_some_and(|byte| *byte != b'\n') {

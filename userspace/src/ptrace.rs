@@ -1171,11 +1171,17 @@ fn enter_ptrace_stopped_inner(
         unsafe {
             let uc = &*uctx;
             ctx.set_return(SyscallReturn::ok(preserve_rax.unwrap_or(0)));
-            uc.sleep_deadline_ns.store(u64::MAX, Ordering::Release);
+            // No second `sleep_deadline_ns = u64::MAX` here. The report is
+            // already published, so a tracer on another CPU may have consumed
+            // it and resumed us (PTRACE_SYSCALL/CONT zero the deadline) before
+            // we got this far; re-arming would erase that resume and leave the
+            // tracee parked until its tracer died, which is how `strace -p 1`
+            // froze PID 1 mid-syscall. The deadline was armed above, before the
+            // report.
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
             if narf_scheduler::stackful::user_own_stack_enabled() {
-                crate::handlers::own_stack_block(ctx);
+                crate::handlers::own_stack_block_ptrace_stop(ctx);
                 return;
             }
             hook(uctx);

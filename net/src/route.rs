@@ -104,6 +104,38 @@ pub struct Route {
     pub metric: u32,
     pub scope: Scope,
     pub table: u8,
+    /// `rtm_protocol`: who installed the route (`RTPROT_KERNEL` for the
+    /// kernel's own connected and local routes, `RTPROT_BOOT` for an
+    /// administrator's, `RTPROT_DHCP`, `RTPROT_RA`, ...). Reported back in
+    /// dumps exactly as installed; NetworkManager's platform cache matches
+    /// its routes by it.
+    pub protocol: u8,
+}
+
+/// `RTPROT_KERNEL`: a route the kernel installed itself.
+pub const RTPROT_KERNEL: u8 = 2;
+
+/// Which existing routes an `RTM_DELROUTE` names. `fib_table_delete`
+/// removes the first alias matching every attribute the request carried;
+/// an omitted attribute matches anything.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RouteMatch<'a> {
+    pub iface: Option<&'a str>,
+    pub metric: Option<u32>,
+    pub gateway: Option<Ipv4Addr>,
+    /// 0 (`RTPROT_UNSPEC`) matches any protocol.
+    pub protocol: u8,
+}
+
+impl RouteMatch<'_> {
+    fn matches(&self, route: &Route) -> bool {
+        self.iface.is_none_or(|iface| route.iface == iface)
+            && self.metric.is_none_or(|metric| route.metric == metric)
+            && self
+                .gateway
+                .is_none_or(|gateway| route.gateway == Some(gateway))
+            && (self.protocol == 0 || route.protocol == self.protocol)
+    }
 }
 
 /// Result of a successful route lookup.
@@ -135,12 +167,18 @@ static ROUTE_TABLE: IrqSafeSpinLock<Vec<Route>> = IrqSafeSpinLock::new(Vec::new(
 /// `route_lookup` always finds the longest match first.
 pub fn route_add(route: Route) {
     let mut g = ROUTE_TABLE.lock();
-    // Hard cutover: remove any exact-match (dst, iface, table).
+    // Replace only the same alias: Linux keys a FIB alias by (table, dst/len,
+    // tos, priority), so a default route at another metric is a separate
+    // route that must survive. NetworkManager installs a device's default at
+    // a temporary metric and then the final one before deleting the
+    // temporary: replacing across metrics made that delete remove the only
+    // default route.
     g.retain(|r| {
         !(r.net_ns_id == route.net_ns_id
             && r.dst == route.dst
             && r.iface == route.iface
-            && r.table == route.table)
+            && r.table == route.table
+            && r.metric == route.metric)
     });
     g.push(route);
     // Sort: longest prefix first; break ties by metric ascending.
@@ -158,11 +196,34 @@ pub fn route_delete(dst: Ipv4Net, iface_name: &str, table: u8) {
 }
 
 pub fn route_delete_in(net_ns_id: u64, dst: Ipv4Net, iface_name: &str, table: u8) {
+    let _ = route_delete_matching_in(
+        net_ns_id,
+        dst,
+        table,
+        RouteMatch {
+            iface: Some(iface_name),
+            ..RouteMatch::default()
+        },
+    );
+}
+
+/// `fib_table_delete`: remove the first route at `dst` in `table` whose
+/// attributes satisfy `m`. Returns whether one was removed (`-ESRCH` when not).
+pub fn route_delete_matching_in(
+    net_ns_id: u64,
+    dst: Ipv4Net,
+    table: u8,
+    m: RouteMatch<'_>,
+) -> bool {
     let mut g = ROUTE_TABLE.lock();
-    if let Some(pos) = g.iter().position(|r| {
-        r.net_ns_id == net_ns_id && r.dst == dst && r.iface == iface_name && r.table == table
-    }) {
+    if let Some(pos) = g
+        .iter()
+        .position(|r| r.net_ns_id == net_ns_id && r.dst == dst && r.table == table && m.matches(r))
+    {
         g.remove(pos);
+        true
+    } else {
+        false
     }
 }
 
@@ -319,6 +380,7 @@ pub fn install_connected_route(iface_name: &str, addr: Ipv4Addr, prefix_len: u8)
         metric: 0,
         scope: Scope::Link,
         table: TABLE_MAIN,
+        protocol: crate::route::RTPROT_KERNEL,
     });
 }
 
@@ -349,6 +411,7 @@ pub fn install_loopback_route() {
         metric: 0,
         scope: Scope::Host,
         table: TABLE_LOCAL,
+        protocol: crate::route::RTPROT_KERNEL,
     });
 }
 

@@ -25,10 +25,11 @@
 //! `tick_retransmit` — exactly the same technique as Smoke 5 and 6 in
 //! Wave 27's `e2e_tests.rs`.
 //!
-//! `cycles_per_ns()` is 1 in test builds (the wall calibration is
-//! skipped), so `deadline_cycles = 1` is always expired and
-//! `deadline_cycles = now_cycles() + N_ns * 1` arms a timer N
-//! nanoseconds out.
+//! The kernel-test boot calibrates the TSC like the real boot, so a
+//! duration in nanoseconds becomes cycles through `ns_to_cycles`, the same
+//! conversion the timers use: `deadline_cycles = 1` is always expired and
+//! `deadline_cycles = now_cycles() + ns_to_cycles(N)` arms a timer N
+//! nanoseconds out. Never scale by `cycles_per_ns()`, a truncated integer.
 //!
 //! ## Linux refs
 //!
@@ -720,7 +721,7 @@ fn smoke_ssthresh_halves_on_loss() -> TestResult {
         LossEvent::FastRetransmit {
             snd_nxt,
             now_cycles: 0,
-            cycles_per_ns: 1,
+            cycles_per_ms: 1_000_000,
         },
     );
 
@@ -754,20 +755,20 @@ fn smoke_cubic_curve_grows_after_loss() -> TestResult {
     let cc = Cubic;
     c.cwnd = 50 * mss;
     c.ssthresh = 25 * mss;
-    // Record a loss event at t=0 with cycles_per_ns=1.
+    // Record a loss event at t=0 with one cycle per ns (1e6 per ms).
     cc.on_loss(
         &mut c,
         LossEvent::FastRetransmit {
             snd_nxt: 200_000u32,
             now_cycles: 1_000_000,
-            cycles_per_ns: 1,
+            cycles_per_ms: 1_000_000,
         },
     );
     c.in_recovery = false; // manually exit recovery to test CA path
     c.cwnd = c.ssthresh;
 
     let mut prev_cwnd = c.cwnd;
-    // Advance time in 1-billion-cycle steps (= 1 second with cpn=1).
+    // Advance time in 1-billion-cycle steps (= 1 second at 1e6 cycles/ms).
     for i in 1..=5 {
         let now = (i as u64) * 1_000_000_000u64 + 1_000_000;
         cc.on_ack(&mut c, mss, now);
@@ -888,7 +889,7 @@ fn smoke_fast_recovery_exit_on_ack_above_recover_point() -> TestResult {
         LossEvent::FastRetransmit {
             snd_nxt: recover_snd_nxt,
             now_cycles: 0,
-            cycles_per_ns: 1,
+            cycles_per_ms: 1_000_000,
         },
     );
     if !c.in_recovery {
@@ -1161,13 +1162,12 @@ fn smoke_keepalive_after_two_hour_idle() -> TestResult {
 
     // Enable keepalive and set idle timeout to a manageable value.
     // tick_keepalive computes `elapsed = now_cycles().wrapping_sub(last_prog)`
-    // and fires when elapsed >= keepalive_idle_ns * cycles_per_ns. In test
-    // mode now_cycles() is small, so back-dating last_progress via wrapping
-    // subtraction is the only way to guarantee elapsed crosses the 2-hour
-    // threshold without changing the production threshold itself.
+    // and fires when elapsed >= ns_to_cycles(keepalive_idle_ns). now_cycles()
+    // is small this soon after boot, so back-dating last_progress via
+    // wrapping subtraction is the only way to guarantee elapsed crosses the
+    // 2-hour threshold without changing the production threshold itself.
     let now_cyc = narf_scheduler::narf_time::now_cycles();
-    let cpn = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
-    let two_hour_cycles = KEEPALIVE_IDLE_NS.saturating_mul(cpn);
+    let two_hour_cycles = narf_scheduler::narf_time::ns_to_cycles(KEEPALIVE_IDLE_NS);
     __with_tcb_mut(child_id, |t| {
         t.keepalive_enabled = true;
         t.keepalive_idle_ns = KEEPALIVE_IDLE_NS; // 2 hours

@@ -1401,6 +1401,14 @@ fn open_impl_reserved(
     // `InputEventFile::nonblock_read_eagain`.)
     let open_status_flags =
         (flags as u32) & (crate::fd::O_ACCMODE | crate::fd::O_SETFL_MASK | crate::fd::O_PATH);
+    // `FD_ADD(how->flags, ...)` → `get_unused_fd_flags(O_CLOEXEC)`: the
+    // descriptor's close-on-exec bit comes from the open flags whatever the
+    // object turns out to be (file, directory, device, O_PATH, ns file).
+    let open_fd_flags = if flags & crate::fd::O_CLOEXEC as u64 != 0 {
+        crate::fd::FD_CLOEXEC
+    } else {
+        0
+    };
     // O_RDONLY = 0, O_WRONLY = 1, O_RDWR = 2. Bits 0..1 of flags.
     let access_mode = flags & 0o3;
     let want_r = access_mode == 0 || access_mode == 2;
@@ -1616,7 +1624,7 @@ fn open_impl_reserved(
             let new_fd = reservation.install(crate::fd::FdEntry {
                     ops,
                     offset: 0,
-                    flags: 0,
+                    flags: open_fd_flags,
                     status_flags: open_status_flags,
                 });
             match new_fd {
@@ -1678,7 +1686,7 @@ fn open_impl_reserved(
                 let new_fd = reservation.install(crate::fd::FdEntry {
                         ops: node,
                         offset: 0,
-                        flags: 0,
+                        flags: open_fd_flags,
                         status_flags: open_status_flags,
                     });
                 match new_fd {
@@ -1779,7 +1787,7 @@ fn open_impl_reserved(
                 let new_fd = reservation.install(crate::fd::FdEntry {
                         ops: lops,
                         offset: 0,
-                        flags: 0,
+                        flags: open_fd_flags,
                         status_flags: open_status_flags,
                     });
                 match new_fd {
@@ -1866,7 +1874,7 @@ fn open_impl_reserved(
             let new_fd = reservation.install(crate::fd::FdEntry {
                     ops: alloc::sync::Arc::new(DirFdFile { dir: dirops }),
                     offset: 0,
-                    flags: 0,
+                    flags: open_fd_flags,
                     status_flags: open_status_flags,
                 });
             match new_fd {
@@ -2099,7 +2107,7 @@ fn open_impl_reserved(
         let new_fd = fd::install(task, crate::fd::FdEntry {
                 ops,
                 offset: 0,
-                flags: 0,
+                flags: open_fd_flags,
                 status_flags: open_status_flags,
             });
         match new_fd {
@@ -2402,6 +2410,7 @@ fn open_impl_reserved(
             fifo_uid,
             fifo_gid,
             open_status_flags,
+            open_fd_flags,
             path,
             reservation,
         );
@@ -2411,7 +2420,7 @@ fn open_impl_reserved(
     let new_fd = match reservation.install(crate::fd::FdEntry {
             ops,
             offset: 0,
-            flags: 0,
+            flags: open_fd_flags,
             status_flags: open_status_flags,
         }) {
         Some(n) => n,
@@ -2464,6 +2473,7 @@ fn open_fifo(
     uid: u32,
     gid: u32,
     status_flags: u32,
+    fd_flags: u32,
     _path: &str,
     reservation: fd::FdReservation,
 ) {
@@ -2498,7 +2508,7 @@ fn open_fifo(
     let new_fd = match reservation.install(crate::fd::FdEntry {
             ops: handle,
             offset: 0,
-            flags: 0,
+            flags: fd_flags,
             status_flags,
         }) {
         Some(n) => n,
@@ -8783,8 +8793,8 @@ pub(crate) fn shares_mm(a: u64, b: u64) -> bool {
         return true;
     }
     match (
-        narf_scheduler::address_space_of(narf_scheduler::TaskId(a)),
-        narf_scheduler::address_space_of(narf_scheduler::TaskId(b)),
+        narf_scheduler::address_space_of_live(narf_scheduler::TaskId(a)),
+        narf_scheduler::address_space_of_live(narf_scheduler::TaskId(b)),
     ) {
         (Some(x), Some(y)) => Arc::ptr_eq(&x, &y),
         _ => false,
@@ -14074,7 +14084,24 @@ fn own_stack_wait_child(ctx: &mut dyn TrapContext) {
 /// or returns the baked/reaped result.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(crate) fn own_stack_block(ctx: &mut dyn TrapContext) {
-    let is_wait = crate::user_task::current_user_task().is_some_and(|uctx| {
+    own_stack_block_routed(ctx, true);
+}
+
+/// [`own_stack_block`] for a ptrace stop. A stop is not a child-wait: it ends
+/// when the tracer resumes it (`PTRACE_CONT`/`SYSCALL` zero the park deadline
+/// and wake the task), which the wait-child loop never looks at. A
+/// `wait_child_pending` flag left set by a wait the stop interrupted would
+/// otherwise park the stopped tracee as a waiter that only a child event can
+/// wake, so `strace -p 1` froze PID 1 until strace exited. A syscall restarted
+/// after the stop re-arms its own wait state.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) fn own_stack_block_ptrace_stop(ctx: &mut dyn TrapContext) {
+    own_stack_block_routed(ctx, false);
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn own_stack_block_routed(ctx: &mut dyn TrapContext, allow_wait: bool) {
+    let is_wait = allow_wait && crate::user_task::current_user_task().is_some_and(|uctx| {
         // SAFETY: in-flight task's poller-pinned UserTaskCtx; single-CPU access.
         unsafe {
             // Every blocking park funnels through here — mark the syscall
@@ -14104,6 +14131,11 @@ pub(crate) fn own_stack_block(ctx: &mut dyn TrapContext) {
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) fn own_stack_block(_ctx: &mut dyn TrapContext) {
+    unreachable!("own-stack is not supported on this architecture");
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) fn own_stack_block_ptrace_stop(_ctx: &mut dyn TrapContext) {
     unreachable!("own-stack is not supported on this architecture");
 }
 

@@ -1116,9 +1116,21 @@ impl OverlayFile {
             let (uid, gid) = self.lower.owners();
             upper_file.set_owners(uid, gid).await?;
             upper_file.set_perms(stat.mode.perms).await?;
-            if stat.mtime_cycles != 0 {
-                let mtime_ns = narf_time::cycles_to_ns(stat.mtime_cycles);
-                upper_file.set_times(None, Some(mtime_ns))?;
+            // `ovl_set_timestamps` copies the lower inode's mtime exactly.
+            // Prefer the filesystem's own nanoseconds: `mtime_cycles` is a
+            // calibrated ns→cycles projection, and the mult/shift pair is
+            // not an exact inverse, so a round trip through it could move
+            // the copied mtime by a few nanoseconds.
+            let attrs = self.lower.inode_attrs();
+            let mtime_ns = if attrs.tracked && attrs.mtime_ns != 0 {
+                Some(attrs.mtime_ns)
+            } else if stat.mtime_cycles != 0 {
+                Some(narf_time::cycles_to_ns(stat.mtime_cycles))
+            } else {
+                None
+            };
+            if mtime_ns.is_some() {
+                upper_file.set_times(None, mtime_ns)?;
             }
             Self::copy_xattrs(self.lower.as_ref(), upper_file.as_ref()).await?;
             Ok(())

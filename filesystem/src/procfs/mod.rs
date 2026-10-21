@@ -3480,8 +3480,11 @@ fn render_cpu_list(mask: u64) -> String {
 }
 
 fn render_maps(info: &ProcTaskInfo) -> String {
-    // Linux /proc/[pid]/maps shape:
+    // Linux /proc/[pid]/maps shape (`show_vma_header_prefix`):
     //   start-end perms offset dev inode pathname
+    // Addresses and the offset are hex with a minimum width of 8
+    // (`seq_put_hex_ll(.., 8)`), not zero-padded to 16: on x86_64 user
+    // addresses print as `55e0c0a1b000`, not `000055e0c0a1b000`.
     // Unknown backing uses `00:00 0`. The inode MUST still be followed by a
     // space when the pathname is empty: Crashpad's DelimitedFileReader
     // consumes the inode with `GetDelim(' ')`, exactly as it does on Linux.
@@ -3508,7 +3511,7 @@ fn write_maps_line(s: &mut String, v: &ProcVma) {
     let _ = core::fmt::Write::write_fmt(
         s,
         format_args!(
-            "{:016x}-{:016x} {}{}{}{} {:08x} {:02x}:{:02x} {} ",
+            "{:08x}-{:08x} {}{}{}{} {:08x} {:02x}:{:02x} {} ",
             v.start, v.end, r, w, x, p, v.file_offset, device_major, device_minor, v.inode,
         ),
     );
@@ -3549,7 +3552,7 @@ fn smoke_maps_anonymous_inode_is_space_terminated() -> TestResult {
         return TestResult::Fail("maps line lacked a trailing newline");
     };
     let mut fields = line.splitn(6, ' ');
-    let valid = fields.next() == Some("0000000000001000-0000000000002000")
+    let valid = fields.next() == Some("00001000-00002000")
         && fields.next() == Some("r--p")
         && fields.next() == Some("00000000")
         && fields.next() == Some("00:00")
@@ -3587,7 +3590,7 @@ fn smoke_maps_file_backing_preserves_identity_offset_and_pathname() -> TestResul
         ..sample_task_info()
     };
     let maps = render_maps(&info);
-    if maps == "0000000000400000-0000000000401000 r-xp 00001000 08:13 42 /usr/bin/chromium\n" {
+    if maps == "00400000-00401000 r-xp 00001000 08:13 42 /usr/bin/chromium\n" {
         TestResult::Pass
     } else {
         TestResult::Fail("file-backed maps entry lost its identity, ELF offset, or pathname")
@@ -3613,9 +3616,7 @@ fn smoke_maps_pathname_newline_is_octal_escaped() -> TestResult {
         }],
         ..sample_task_info()
     };
-    if render_maps(&info)
-        == "0000000000400000-0000000000401000 r--p 00000000 08:13 42 /tmp/a\\012b\n"
-    {
+    if render_maps(&info) == "00400000-00401000 r--p 00000000 08:13 42 /tmp/a\\012b\n" {
         TestResult::Pass
     } else {
         TestResult::Fail("a newline in a mapped file's path was not rendered as \\012")
@@ -3719,7 +3720,7 @@ fn render_numa_maps(info: &ProcTaskInfo) -> String {
             6 => "weighted interleave",
             _ => "default",
         };
-        let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{:x} {policy}", v.start));
+        let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{:08x} {policy}", v.start));
         if matches!(v.numa_policy & 0x0fff, 1..=3 | 5..=6) && v.numa_nodemask != 0 {
             let _ = core::fmt::Write::write_fmt(
                 &mut s,
@@ -4393,7 +4394,7 @@ fn smoke_smaps_pss_is_sharer_weighted() -> TestResult {
     }
     // The block opens with the same header line `maps` emits, which is
     // what lets a consumer correlate the two files.
-    if !body.starts_with("0000000000001000-0000000000005000 rw-p") {
+    if !body.starts_with("00001000-00005000 rw-p") {
         return TestResult::Fail("smaps block does not open with the maps header line");
     }
     if !body.contains("Shared:                8 kB")
