@@ -1,0 +1,331 @@
+# drivers/gpu/tests/dcn401_pipes/check.sh --generate: Linux DC's DCN401
+# pipe acquisition over amdgpu_dm-shaped transactions (see harness.c).
+# One display lit, a second beside it, the first switched off and a third
+# lit beside the second: each new stream's OTG master is the lowest pipe
+# free in both states.
+pool 0
+begin
++stream 1 ok
++plane 1 10 ok
+map 1:1:1 ok
+commit s1p10 - - -
+begin
++stream 2 ok
++plane 2 20 ok
+map 1:1:1 2:1:1 ok
+commit s1p10 s2p20 - -
+begin
+-plane 1 10 ok
+-stream 1 ok
+map 2:1:1 ok
+commit - s2p20 - -
+begin
++stream 3 ok
++plane 3 30 ok
+map 2:1:1 3:1:1 ok
+commit s3p30 s2p20 - -
+# A full modeset of both: every plane and stream removed, the streams added
+# again (the OTG masters the current state used come back first, lowest
+# first), then a third stream on a pipe the current state left free.
+begin
+-plane 3 30 ok
+-plane 2 20 ok
+-stream 2 ok
+-stream 3 ok
++stream 3 ok
++stream 2 ok
++stream 4 ok
++plane 3 30 ok
++plane 2 20 ok
++plane 4 40 ok
+map 3:1:1 2:1:1 4:1:1 ok
+commit s3p30 s2p20 s4p40 -
+# Overlays: a second plane takes a pipe the current state does not use;
+# planes recreated (should_reset_plane) take their blending tree's pipes
+# back in order, so an overlay below a removed one moves up.
+pool 0
+begin
++stream 1 ok
++plane 1 10 ok
++plane 1 11 ok
++plane 1 12 ok
+map 1:1:1,1,1 ok
+commit s1p10b1 s1p11t0b2 s1p12t1 -
+begin
+-plane 1 12 ok
+-plane 1 11 ok
+-plane 1 10 ok
++plane 1 10 ok
++plane 1 12 ok
+map 1:1:1,1 ok
+commit s1p10b1 s1p12t0 - -
+begin
+-plane 1 12 ok
+-plane 1 10 ok
++plane 1 10 ok
++plane 1 11 ok
++plane 1 12 ok
+map 1:1:1,1,1 ok
+commit s1p10b1 s1p11t0b2 s1p12t1 -
+# MPC combine: a primary split over two DPPs, then an overlay added with
+# the planes recreated: the overlay takes the split's old pipe first and
+# the split moves to the next free one.
+pool 0
+begin
++stream 1 ok
++plane 1 10 ok
+map 1:1:2 ok
+commit s1p10b1 s1p10t0 - -
+begin
+-plane 1 10 ok
++plane 1 10 ok
++plane 1 11 ok
+map 1:1:2,1 ok
+commit s1p10b2 s1p11t2 s1p10t0b1 -
+begin
+-plane 1 11 ok
+-plane 1 10 ok
++plane 1 10 ok
+map 1:1:1 ok
+commit s1p10 - - -
+begin
++stream 2 ok
++plane 2 20 ok
+map 1:1:1 2:1:3 ok
+commit s1p10 s2p20b2 s2p20t1b3 s2p20t2
+# ODM: a stream on two OPP heads, an overlay on each slice, the slices
+# dropped and taken again.
+pool 0
+begin
++stream 1 ok
++plane 1 10 ok
+map 1:2:1 ok
+commit s1p10r1 s1p10l0 - -
+begin
+-plane 1 10 ok
++plane 1 10 ok
++plane 1 11 ok
+map 1:2:1,1 ok
+commit s1p10b2r1 s1p10b3l0 s1p11t0r3 s1p11t1l2
+begin
+-plane 1 11 ok
+-plane 1 10 ok
++plane 1 10 ok
++plane 1 11 ok
+map 1:1:1,1 ok
+commit s1p10b2 - s1p11t0 -
+begin
+-plane 1 11 ok
+-plane 1 10 ok
++plane 1 10 ok
+map 1:2:1 ok
+commit s1p10r1 s1p10l0 - -
+begin
+-plane 1 10 ok
+-stream 1 ok
++stream 1 ok
++plane 1 10 ok
+map 1:2:1 ok
+commit s1p10r1 s1p10l0 - -
+begin
++stream 2 ok
++plane 2 20 ok
+map 1:2:1 2:2:1 ok
+commit s1p10r1 s1p10l0 s2p20r3 s2p20l2
+# Four-to-one ODM, then two streams on two pipes each.
+begin
+-plane 1 10 ok
+-plane 2 20 ok
+-stream 1 ok
+-stream 2 ok
++stream 1 ok
++plane 1 10 ok
+map 1:4:1 ok
+commit s1p10r1 s1p10l0r2 s1p10l1r3 s1p10l2
+begin
+-plane 1 10 ok
+-stream 1 ok
++stream 2 ok
++stream 1 ok
++plane 2 20 ok
++plane 1 10 ok
+map 2:2:1 1:2:1 ok
+commit s2p20r2 s1p10r3 s2p20l0 s1p10l1
+# Every pipe in use: a new stream takes a pipe the current state used as a
+# secondary DPP (supporting more streams over MPO), or failing that steals
+# an MPC split (acquire_first_split_pipe); a fifth stream is refused.
+pool 0
+begin
++stream 1 ok
++stream 2 ok
++stream 3 ok
++plane 1 10 ok
++plane 1 11 ok
++plane 2 20 ok
++plane 3 30 ok
+map 1:1:1,1 2:1:1 3:1:1 ok
+commit s1p10b3 s2p20 s3p30 s1p11t0
+begin
+-plane 1 11 ok
+-plane 1 10 ok
++plane 1 10 ok
++stream 4 ok
++plane 4 40 ok
+map 1:1:1 2:1:1 3:1:1 4:1:1 ok
+commit s1p10 s2p20 s3p30 s4p40
+begin
++stream 5 fail
+commit s1p10 s2p20 s3p30 s4p40
+pool 0
+begin
++stream 1 ok
++stream 2 ok
++stream 3 ok
++plane 1 10 ok
++plane 2 20 ok
++plane 3 30 ok
+map 1:1:2 2:1:1 3:1:1 ok
+commit s1p10b3 s2p20 s3p30 s1p10t0
+begin
++stream 4 ok
++plane 4 40 ok
+map 1:1:1 2:1:1 3:1:1 4:1:1 ok
+commit s1p10 s2p20 s3p30 s4p40
+# Pipes free in the new state but all used in the current one: a new
+# stream prefers a pipe the current state left free, then a former
+# secondary DPP; a new overlay prefers a former MPC slice (pipe swaps
+# take a frame either way).
+pool 0
+begin
++stream 1 ok
++stream 2 ok
++plane 1 10 ok
++plane 1 11 ok
++plane 2 20 ok
+map 1:1:1,1 2:1:1 ok
+commit s1p10b2 s2p20 s1p11t0 -
+begin
+-plane 1 11 ok
+-plane 1 10 ok
++plane 1 10 ok
++stream 3 ok
++stream 4 ok
++plane 3 30 ok
++plane 4 40 ok
+map 1:1:1 2:1:1 3:1:1 4:1:1 ok
+commit s1p10 s2p20 s4p40 s3p30
+pool 0
+begin
++stream 1 ok
++stream 2 ok
++stream 3 ok
++plane 1 10 ok
++plane 2 20 ok
++plane 3 30 ok
+map 1:1:2 2:1:1 3:1:1 ok
+commit s1p10b3 s2p20 s3p30 s1p10t0
+begin
+-plane 1 10 ok
+-plane 2 20 ok
+-stream 2 ok
++plane 1 10 ok
+-plane 3 30 ok
++plane 3 30 ok
++plane 3 31 ok
+map 1:1:1 3:1:1,1 ok
+commit s1p10 - s3p30b3 s3p31t2
+# No free pipe for an overlay: dc_state_add_plane drops every MPC combine
+# (another stream's too), then the stream's ODM slices, and tries again.
+pool 0x1
+begin
++stream 1 ok
++stream 2 ok
++plane 1 10 ok
++plane 2 20 ok
+map 1:1:1 2:1:2 ok
+commit s1p10 s2p20b2 s2p20t1
+begin
+-plane 1 10 ok
++plane 1 10 ok
++plane 1 11 ok
+map 1:1:1,1 2:1:1 ok
+commit s1p10b2 s2p20 s1p11t0
+pool 0
+begin
++stream 1 ok
++plane 1 10 ok
+map 1:4:1 ok
+commit s1p10r1 s1p10l0r2 s1p10l1r3 s1p10l2
+begin
+-plane 1 10 ok
++plane 1 10 ok
++plane 1 11 ok
+map 1:2:1,1 ok
+commit s1p10b2r1 s1p10b3l0 s1p11t0r3 s1p11t1l2
+# Harvested pools (pipe 0 fused, pipes 1 and 2 fused, three fused): the
+# pool's pipe indices, the same rules, fewer pipes.
+pool 0x1
+begin
++stream 1 ok
++plane 1 10 ok
++plane 1 11 ok
+map 1:1:1,1 ok
+commit s1p10b1 s1p11t0 -
+begin
++stream 2 ok
++plane 2 20 ok
+map 1:1:1,1 2:1:1 ok
+commit s1p10b1 s1p11t0 s2p20
+begin
+-plane 1 11 ok
+-plane 1 10 ok
++plane 1 10 ok
++plane 1 11 ok
+map 1:1:1,1 2:1:1 ok
+commit s1p10b1 s1p11t0 s2p20
+begin
+-plane 1 11 ok
+-plane 1 10 ok
+-stream 1 ok
++stream 3 ok
++plane 3 30 ok
+map 2:1:1 3:2:1 ok
+commit s3p30r1 s3p30l0 s2p20
+begin
++stream 4 fail
+commit s3p30r1 s3p30l0 s2p20
+pool 0x6
+begin
++stream 1 ok
++plane 1 10 ok
+map 1:2:1 ok
+commit s1p10r1 s1p10l0
+begin
+-plane 1 10 ok
+-stream 1 ok
++stream 1 ok
++stream 2 ok
++plane 1 10 ok
++plane 2 20 ok
+map 1:1:1 2:1:1 ok
+commit s1p10 s2p20
+begin
++stream 3 fail
+commit s1p10 s2p20
+pool 0x7
+begin
++stream 1 ok
++plane 1 10 ok
+map 1:1:1 ok
+commit s1p10
+begin
++plane 1 11 fail
+map 1:1:1,1 ok
+commit s1p10
+begin
+-plane 1 10 ok
+-stream 1 ok
++stream 2 ok
++plane 2 20 ok
+map 2:1:1 ok
+commit s2p20

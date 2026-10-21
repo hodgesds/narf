@@ -181,6 +181,7 @@ pub mod amdgpu_dcn401_dccg;
 pub mod amdgpu_dcn401_dml;
 pub mod amdgpu_dcn401_dscl;
 pub mod amdgpu_dcn401_otg;
+pub mod amdgpu_dcn401_resource;
 pub mod amdgpu_dcn401_spl;
 pub mod amdgpu_dcn401_spl_filters;
 pub mod amdgpu_dcn_clk;

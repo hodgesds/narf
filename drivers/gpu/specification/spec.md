@@ -452,6 +452,35 @@ shows a full-board model to the harvested owner and panics on any fused
 instance or field naming one; `guard`/`guard_raw` refuse them for models
 addressed by the owner itself).
 
+**Pipe acquisition (DCN401).** `amdgpu_dcn401_resource::DcState` is DC's
+`dc_state` reduced to pipe acquisition: each pool pipe's `PipeCtx` (stream,
+plane, top/bottom and ODM links by pipe index) and the streams with their
+planes in `stream_status` order, on a pool of `pipe_count` pipes. Its
+methods are Linux's, with `self` the new state and `cur` the current:
+`add_stream` (dc_state_add_stream; the OTG master by
+acquire_otg_master_pipe_for_stream: a pipe the current state used as an
+OTG master, else one it left free, else one it used as a secondary DPP,
+else any free pipe, else an MPC split), `remove_stream`, `add_plane`
+(dc_state_add_plane: the first plane on the OPP heads, a further one on a
+secondary DPP per OPP head by dcn32_acquire_free_pipe_as_secondary_dpp_pipe
+(a free pipe of the current blending tree at that OPP head's index, else
+one the current state left free, else a current MPC slice, else any) and,
+short of pipes, every stream's MPC combine dropped, then the stream's ODM
+slices one by one), `remove_plane`,
+`update_pipes_for_stream_with_slice_count` (further OPP heads by
+dcn32_acquire_free_pipe_as_secondary_opp_head: the current OTG master's
+further OPP heads at that index first, then one the current state left
+free, then any) and `update_pipes_for_plane_with_slice_count`, and
+`map_pipes` (map_dc_pipes_with_callbacks with DML's per-stream `Target`:
+every reduction, then every increase, stream by stream). DSC needs no
+state: DCN401 has a DSC per OPP, dcn20_acquire_dsc's one-to-one branch.
+`tests/dcn401_pipes/check.sh` compiles those Linux functions verbatim
+around a fake pool (`shim.h`, `harness.c`) and replays amdgpu_dm-shaped
+transactions on full and harvested pools (`vectors.txt`: stream and plane
+adds and removals, planes recreated, MPC and ODM changes, pools out of
+pipes); `dcn401_pipe_acquisition_matches_linux` replays every line on
+`DcState`.
+
 **Audio.** Navi44 boards expose the same `1002:ab40` HDMI/DP audio function
 (Linux `hda_intel.c` lists only `ab40` for RDNA4); runtime PM finds it as PCI
 function 1 of the GPU without a device-id check.
