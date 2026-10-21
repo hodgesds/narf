@@ -4653,9 +4653,14 @@ default BT.709) and "COLOR_RANGE" (limited/full, default limited) as
 drm_plane_create_color_properties makes them (they only affect YCbCr; a
 value outside the enum is EINVAL). `drm_native_planes::plane_surface`
 gives each plane's `PlaneGeometry::surface` (fill_plane_color_attributes'
-color space) and `fb_size`; a tiled or 4:2:0 plane is staged as its whole
-framebuffer with the source rectangle placed in it
-(`PlaneGeometry::whole_framebuffer`), so such a primary is always placed; a
+color space) and `fb_size`; a tiled or 4:2:0 plane, and a plane showing an
+amdgpu GEM framebuffer in place whatever its layout (`PlaneGeometry::client`),
+is staged as its whole framebuffer with the source rectangle placed in it
+(`PlaneGeometry::whole_framebuffer`), as fill_plane_buffer_attributes hands
+DC the framebuffer's address and size with the crop in the viewport, so a
+linear GEM plane's crop at any byte shows; such a tiled or 4:2:0 primary
+is always placed (a linear client primary shown whole is still the
+full-frame one); a
 dumb framebuffer of it is copied whole, block row by block row
 (`copy_whole_plane`, `upload_display_plane_back_bytes`), a GEM one is
 scanned out in place (below); a frame of another tiling than shown waits
@@ -4722,8 +4727,10 @@ the pin; it waits up to 5 s for the buffer's WRITE fences
 (amdgpu_dm_commit_planes' dma_resv_wait_timeout) and flips the plane to the
 buffer's own GPU address with no copy (`PlaneFrame::external`: the pin's
 address plus offsets[0], pitches[0], the chroma plane at offsets[1] with
-pitches[1]; a linear RGB plane, whose surface is its source rectangle,
-starts at the rectangle; `place_plane`, `ColdBoot::flip_display_sources`).
+pitches[1], from the framebuffer's start, its plane staged whole; only a
+GEM frame reaching a plane still staged as a dumb buffer's source
+rectangle, until the plane update that restages it, starts at the
+rectangle; `place_plane`, `ColdBoot::flip_display_sources`).
 `otg::FlipSource` is `Back` (the staged back buffer the presenter copied a
 dumb framebuffer into) or `External(otg::ExternalSurface)`;
 `Surfaces::flip_sources` re-addresses every flipping plane under the one OTG

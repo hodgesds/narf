@@ -138,17 +138,25 @@ pub struct PlaneGeometry {
     pub blend: otg::Blend,
     /// The framebuffer's tiling, DCC and YCbCr color space.
     pub surface: otg::PlaneSurface,
-    /// The framebuffer's size: a tiled or 4:2:0 plane stages its whole
-    /// framebuffer (`whole_framebuffer`) and scans the source rectangle out
-    /// of it, as DC scans a framebuffer's viewport.
+    /// The framebuffer's size: a tiled, 4:2:0 or client plane stages its
+    /// whole framebuffer (`whole_framebuffer`) and scans the source
+    /// rectangle out of it, as DC scans a framebuffer's viewport.
     pub fb_size: (u32, u32),
+    /// The framebuffer is an amdgpu GEM buffer scanned out in place (a
+    /// client framebuffer), not a dumb buffer the presenter copies.
+    pub client: bool,
 }
 impl PlaneGeometry {
     /// Whether the plane's surface is its whole framebuffer: a tiled or
-    /// 4:2:0 one, which cannot be cropped by copying rows. A linear RGB
-    /// plane's surface is its source rectangle.
+    /// 4:2:0 one, which cannot be cropped by copying rows, and a client
+    /// framebuffer of any layout, which DC fetches from its start with the
+    /// source rectangle in the viewport (amdgpu_dm_plane_fill_plane_buffer_
+    /// attributes: the buffer's address plus offsets[0], the framebuffer's
+    /// size, and fill_dc_scaling_info's src_rect), so a crop at any byte
+    /// shows. A linear RGB dumb plane's surface is its source rectangle,
+    /// which the presenter copies.
     pub fn whole_framebuffer(&self, format: otg::SurfaceFormat) -> bool {
-        format.is_video() || self.surface.tiling != otg::Tiling::LINEAR
+        self.client || format.is_video() || self.surface.tiling != otg::Tiling::LINEAR
     }
 }
 
@@ -2576,6 +2584,7 @@ pub fn plane_mode(timing: Timing, format: otg::SurfaceFormat) -> dml::Mode {
                 blend: otg::Blend::default_for(format),
                 surface: otg::PlaneSurface::LINEAR,
                 fb_size: (timing.h_active, timing.v_active),
+                client: false,
             }),
             ..PlaneSetup::NONE
         };

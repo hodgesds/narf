@@ -2979,6 +2979,7 @@ fn navi48_planes_reach_admission_and_staging() -> TestResult {
         blend: otg::Blend::default_for(format),
         surface: otg::PlaneSurface::LINEAR,
         fb_size: (w, h),
+        client: false,
     };
     let video = OverlayPlane {
         geometry: geometry(
@@ -3131,6 +3132,7 @@ fn navi48_rotated_planes_reach_admission() -> TestResult {
         blend: otg::Blend::default_for(base.format),
         surface,
         fb_size: (1080, 1920),
+        client: false,
     };
     let full = Rect::new(0, 0, 1920, 1080);
     for rotation in [Rotation::R90, Rotation::R270] {
@@ -3458,9 +3460,10 @@ kernel_test_in!(
     navi48_hdmi_frl_dsc_selection_admits_on_two_pipes
 );
 
-/// A tiled or 4:2:0 plane's surface is its whole framebuffer with the
-/// source rectangle placed in it (DC scans the framebuffer's viewport); a
-/// linear RGB plane's is its source rectangle.
+/// A tiled, 4:2:0 or client (GEM, scanned out in place) plane's surface is
+/// its whole framebuffer with the source rectangle placed in it (DC scans
+/// the framebuffer's viewport); a linear RGB dumb plane's is its source
+/// rectangle.
 fn navi48_modeset_stages_whole_framebuffers_for_tiled_and_yuv_planes() -> TestResult {
     use crate::amdgpu_dcn401_spl::{Rect, Rotation};
     let timing = Timing {
@@ -3476,7 +3479,7 @@ fn navi48_modeset_stages_whole_framebuffers_for_tiled_and_yuv_planes() -> TestRe
         h_sync_positive: true,
         v_sync_positive: true,
     };
-    let geometry = |format: otg::SurfaceFormat, surface: otg::PlaneSurface| PlaneGeometry {
+    let geometry = |format: otg::SurfaceFormat, surface: otg::PlaneSurface, client| PlaneGeometry {
         src_x: 320,
         src_y: 180,
         width: 640,
@@ -3486,6 +3489,7 @@ fn navi48_modeset_stages_whole_framebuffers_for_tiled_and_yuv_planes() -> TestRe
         blend: otg::Blend::default_for(format),
         surface,
         fb_size: (1280, 720),
+        client,
     };
     let tiled = otg::PlaneSurface {
         tiling: otg::Tiling {
@@ -3494,19 +3498,34 @@ fn navi48_modeset_stages_whole_framebuffers_for_tiled_and_yuv_planes() -> TestRe
         },
         ..otg::PlaneSurface::LINEAR
     };
-    for (format, surface, whole) in [
-        (otg::SurfaceFormat::Nv12, otg::PlaneSurface::LINEAR, true),
-        (otg::SurfaceFormat::Xrgb8888, tiled, true),
+    for (format, surface, client, whole) in [
+        (
+            otg::SurfaceFormat::Nv12,
+            otg::PlaneSurface::LINEAR,
+            false,
+            true,
+        ),
+        (otg::SurfaceFormat::Xrgb8888, tiled, false, true),
         (
             otg::SurfaceFormat::Xrgb8888,
             otg::PlaneSurface::LINEAR,
             false,
+            false,
+        ),
+        // A linear GEM plane: the crop is in the viewport, so a source
+        // rectangle at any byte shows (amdgpu_dm_plane_fill_plane_buffer_
+        // attributes fetches from the buffer's start).
+        (
+            otg::SurfaceFormat::Xrgb8888,
+            otg::PlaneSurface::LINEAR,
+            true,
+            true,
         ),
     ] {
         let setup = PlaneSetup {
             overlays: [
                 Some(OverlayPlane {
-                    geometry: geometry(format, surface),
+                    geometry: geometry(format, surface, client),
                     format,
                     underlay: false,
                     plane: 0,
@@ -3892,6 +3911,7 @@ fn navi48_split_tiled_rotated_and_video_planes_reach_pipes() -> TestResult {
         blend: otg::Blend::default_for(format),
         surface,
         fb_size: (w, h),
+        client: false,
     };
     let tiled = surface(otg::Swizzle::S64K2D, None);
     let dcc = surface(otg::Swizzle::S256K2D, Some(otg::DccBlock::B64));
@@ -4143,6 +4163,7 @@ fn live_overlay(plane: u32, x: i32) -> OverlayPlane {
             blend: otg::Blend::default_for(otg::SurfaceFormat::Argb8888),
             surface: otg::PlaneSurface::LINEAR,
             fb_size: (640, 360),
+            client: false,
         },
         format: otg::SurfaceFormat::Argb8888,
         underlay: false,

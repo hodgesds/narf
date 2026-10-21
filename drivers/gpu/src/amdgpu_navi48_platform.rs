@@ -4482,10 +4482,12 @@ async unsafe fn present_native(
 
 /// What plane `plane_pipe` of display `display` (shown with geometry `g`;
 /// none: the full-frame primary) flips to for framebuffer `f`: a pinned
-/// GEM framebuffer in place, as DC fetches a framebuffer, from the source
-/// rectangle's origin when the plane's surface is that rectangle (linear
-/// RGB) and from the framebuffer's start when it is the whole framebuffer
-/// (tiled, DCC, 4:2:0: SPL's viewport places the rectangle); a dumb
+/// GEM framebuffer in place, as DC fetches a framebuffer, from the
+/// framebuffer's start, the plane's surface being the whole framebuffer
+/// (a client plane's always is, whatever its layout: SPL's viewport places
+/// the rectangle), or from the source rectangle's origin while a plane
+/// still staged as that rectangle (a linear RGB dumb one) waits for the
+/// plane update that restages it; a dumb
 /// framebuffer copied into the back buffer (`copy_plane`). None when a
 /// GEM framebuffer cannot be fetched there (another size than the whole-
 /// framebuffer surface, or a misaligned start), which keeps the plane's
@@ -7880,6 +7882,7 @@ mod tests {
                 blend: Blend::default_for(SurfaceFormat::Argb8888),
                 surface: PlaneSurface::LINEAR,
                 fb_size: (32, 32),
+                client: false,
             },
             format: SurfaceFormat::Argb8888,
             underlay: false,
@@ -8108,6 +8111,7 @@ mod tests {
                 blend: Blend::default_for(SurfaceFormat::Argb8888),
                 surface: crate::amdgpu_dcn401_otg::PlaneSurface::LINEAR,
                 fb_size: (w, h),
+                client: false,
             };
             let overlay = |w, h, dst| boot::OverlayPlane {
                 geometry: geometry(w, h, dst),
@@ -8260,6 +8264,7 @@ mod tests {
                 blend: Blend::default_for(SurfaceFormat::Argb8888),
                 surface: crate::amdgpu_dcn401_otg::PlaneSurface::LINEAR,
                 fb_size: (64, 64),
+                client: false,
             },
             format: SurfaceFormat::Argb8888,
             underlay,

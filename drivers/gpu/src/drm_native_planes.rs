@@ -967,6 +967,7 @@ fn display_planes(
             blend: blend(format, props, overlay),
             surface,
             fb_size: (fb.width, fb.height),
+            client: fb.bo.is_some(),
         })
     };
     let zpos = |p: &PlaneState| p.props.map_or(0, |r| r.zpos);
@@ -980,8 +981,9 @@ fn display_planes(
     let format = format_of(primary)?;
     let g = geometry(primary, format, false)?;
     // A tiled or 4:2:0 primary always goes to DC as a placed plane (its
-    // surface is its whole framebuffer).
-    let full = !g.whole_framebuffer(format)
+    // surface is its whole framebuffer); a linear client one shown whole
+    // is the full-frame primary still.
+    let full = !PlaneGeometry { client: false, ..g }.whole_framebuffer(format)
         && (g.src_x, g.src_y, g.width, g.height) == (0, 0, mode.0, mode.1)
         && g.dst == Rect::new(0, 0, mode.0 as i32, mode.1 as i32)
         && g.rotation == Rotation::R0
