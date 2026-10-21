@@ -1,7 +1,8 @@
 //! Orchestrated native Navi48 modeset on legacy DP SST and TMDS HDMI
 //! connectors: one display (the first answering DisplayPort sink, else the
 //! first HDMI sink), or every lightable sink as one configuration of up to
-//! four displays, display k on pipe k. Each sink takes its EDID preferred
+//! four displays, each on the head pipe and encoders it acquires as DC
+//! acquires them. Each sink takes its EDID preferred
 //! (or a requested) mode; the configuration is admitted jointly, its clocks
 //! programmed once, then each display runs the retained owners' preparations
 //! in their dependency order in its own records and its uploaded surface is
@@ -9,6 +10,7 @@
 //! clock owners refuse otherwise.
 use super::*;
 use crate::amdgpu_dcn401_dml as dml;
+pub use crate::amdgpu_dcn401_resource::{StreamEncoders, StreamOutput};
 use crate::amdgpu_dml::Timing;
 use crate::dp_link_training::LinkRate;
 
@@ -250,6 +252,9 @@ pub struct DisplayPipes {
     pub odm: otg::SplitPipes,
     pub mpc: otg::SplitPipes,
     pub overlays: OverlayPipes,
+    /// The encoders the stream's OTG master acquired on its output (all
+    /// zero for a stream only admitted).
+    pub encoders: StreamEncoders,
 }
 impl DisplayPipes {
     /// Every overlay pipe (all segments and slices), by bit.
@@ -969,11 +974,25 @@ pub struct Modeset {
     pub pipe: u8,
     /// The KMS CRTC whose stream this is (amdgpu_dm's acrtc).
     pub crtc: u8,
+    /// Its output and the encoders it acquired there, as DC acquires them
+    /// (`amdgpu_dcn401_resource::DcState::map_stream_encoders`), not by
+    /// pipe.
+    pub output: StreamOutput,
+    pub encoders: StreamEncoders,
     pub plan: dml::Plan,
     pub scanout: otg::ScanoutRunning,
     /// Every EDID timing this sink can be switched to on this link and
     /// pipe (the running one included), in EDID order: what KMS offers.
     pub modes: [Option<Timing>; MAX_MODES],
+}
+
+impl Modeset {
+    /// An MST stream's payload source (`MstPayload::stream`): the stream
+    /// encoder it acquired, DIO on 8b/10b and HPO DP on 128b/132b.
+    pub fn mst_stream_encoder(&self) -> Option<u8> {
+        self.selection.mst?;
+        super::mst::mst_source_encoder(self.selection.uhbr(), self.encoders)
+    }
 }
 
 /// Modes offered per sink.
@@ -2978,7 +2997,11 @@ impl ColdBoot {
         let soc = self.prepare_configuration(&[selection]).await?;
         refine_dsc(&soc, core::slice::from_mut(&mut selection))?;
         let plans = admit_displays(&soc, &[selection]).map_err(otg::Error::Admission)?;
-        let acquired = light_pipes(&current, &[StreamPipes::of(crtc, &selection, &plans[0])])?;
+        let output = self.stream_output(&selection)?;
+        let acquired = light_pipes(
+            &current,
+            &[StreamPipes::of(crtc, &selection, &plans[0]).on(output)],
+        )?;
         let (pipe, extra) = acquired[0];
         self.prepare_pipes(&[selection], &plans, &[pipe], &[extra])
             .await?;
@@ -3164,8 +3187,8 @@ impl ColdBoot {
             .iter()
             .zip(&plans)
             .zip(&crtcs)
-            .map(|((s, plan), &crtc)| StreamPipes::of(crtc, s, plan))
-            .collect();
+            .map(|((s, plan), &crtc)| Ok(StreamPipes::of(crtc, s, plan).on(self.stream_output(s)?)))
+            .collect::<Result<_, ModesetError>>()?;
         let (pipes, extra): (Vec<u8>, Vec<DisplayPipes>) =
             light_pipes(current, &streams)?.into_iter().unzip();
         self.prepare_pipes(&selections, &plans, &pipes, &extra)
@@ -3327,7 +3350,7 @@ impl ColdBoot {
     ) -> Result<Modeset, ModesetError> {
         self.select_display(pipe)?;
         self.teardowns
-            .begin_activation(pipe, pipes.odm, &selection)?;
+            .begin_activation(pipe, pipes.odm, &selection, pipes.encoders)?;
         // SAFETY: the caller owns this unpublished activation and every writer.
         match unsafe { self.light_inner(pipe, crtc, pipes, selection, plan, fill) }.await {
             Ok(m) => {
@@ -3425,11 +3448,16 @@ impl ColdBoot {
                 Ok(()) | Err(otg::Error::Unsupported) => {}
                 Err(e) => return Err(e.into()),
             }
-            let (selection, scanout) = self.start_link(selection, pipe).await?;
+            // The output the encoders were acquired on (its link settings were
+            // decided before acquisition, as dp_decide_link_settings).
+            let output = self.stream_output(&selection)?;
+            let (selection, scanout) = self.start_link(selection, pipe, pipes.encoders).await?;
             Ok(Modeset {
                 selection,
                 pipe,
                 crtc,
+                output,
+                encoders: pipes.encoders,
                 plan,
                 scanout,
                 modes: [None; MAX_MODES],
@@ -3513,13 +3541,14 @@ impl ColdBoot {
         &mut self,
         selection: Selection,
         pipe: u8,
+        encoders: StreamEncoders,
     ) -> Result<(Selection, otg::ScanoutRunning), ModesetError> {
         // SAFETY: the caller's obligations; each step checks its predecessor.
         unsafe {
             let port = selection.port;
             if let Some(stream) = selection.mst {
                 let scanout = self
-                    .start_mst_stream(port, stream, &selection, pipe)
+                    .start_mst_stream(port, stream, &selection, pipe, encoders)
                     .await?;
                 return Ok((selection, scanout));
             }
@@ -3536,7 +3565,7 @@ impl ColdBoot {
                 }
                 self.configure_scdc(&selection).await?;
                 let request = otg::HdmiLinkRequest {
-                    stream: pipe,
+                    stream: encoders.stream_enc,
                     pipe,
                     avi: selection.avi,
                     hdr: selection.hdr_packet(),
@@ -3557,7 +3586,7 @@ impl ColdBoot {
                 return Ok((selection, scanout));
             }
             if selection.uhbr() {
-                return self.start_uhbr_link(selection, pipe).await;
+                return self.start_uhbr_link(selection, pipe, encoders).await;
             }
             let mut selection = selection;
             let mut trained = false;
@@ -3611,7 +3640,7 @@ impl ColdBoot {
                 otg::DpFrontendRequest {
                     vsc_colorimetry: selection.vsc_colorimetry,
                     hdr: selection.hdr_packet(),
-                    ..otg::DpFrontendRequest::new(pipe, pipe)
+                    ..otg::DpFrontendRequest::new(encoders.stream_enc, pipe)
                 },
             )
             .await?;
@@ -3709,10 +3738,26 @@ impl ColdBoot {
         self.verified_links.retain(|v| v.path != link.path);
         self.verified_links.push(link);
     }
+    /// What encoder acquisition reads of `s`'s output: its board port as the
+    /// link, its transmitter's DIG as the preferred engine, and whether it
+    /// is a 128b/132b DP stream.
+    pub(super) fn stream_output(&self, s: &Selection) -> Result<StreamOutput, ModesetError> {
+        let path = self
+            .display_paths()
+            .map_err(|_| ModesetError::NoSink)?
+            .get(s.port)
+            .copied()
+            .ok_or(ModesetError::NoSink)?;
+        Ok(StreamOutput {
+            link: u8::try_from(s.port).map_err(|_| ModesetError::NoSink)?,
+            preferred_engine: path.transmitter,
+            hpo_dp: !s.hdmi && s.uhbr(),
+        })
+    }
     /// The 128b/132b half of `start_link`: train down Linux's fallback
-    /// table on HPO link encoder `pipe` (one display per pipe, as Linux's
-    /// first-free assignment gives in display order), then 128b/132b video
-    /// on HPO stream encoder `pipe` and scanout. Each setting gets
+    /// table on the HPO DP link encoder the stream's link acquired
+    /// (`encoders`), then 128b/132b video on its HPO DP stream encoder and
+    /// scanout. Each setting gets
     /// perform_link_training_with_retries' four attempts, the link stopped
     /// after each refusal and 50 ms more waited before each retry. LPCM
     /// capabilities are filtered again at the trained link before audio starts.
@@ -3722,8 +3767,14 @@ impl ColdBoot {
         &mut self,
         selection: Selection,
         pipe: u8,
+        encoders: StreamEncoders,
     ) -> Result<(Selection, otg::ScanoutRunning), ModesetError> {
         let port = selection.port;
+        let (Some(hpo_stream), Some(hpo_link)) =
+            (encoders.hpo_dp_stream_enc, encoders.hpo_dp_link_enc)
+        else {
+            return Err(ModesetError::Display(otg::Error::Invalid));
+        };
         let mut selection = selection;
         let mut refused = ModesetError::Link;
         let transmitter = self.display_paths().map_err(|_| ModesetError::NoSink)?[port].transmitter;
@@ -3746,7 +3797,7 @@ impl ColdBoot {
                         narf_time::SleepUntil::new(narf_time::Deadline::after_ms(ms).as_instant())
                             .await;
                     }
-                    match self.train_display_uhbr_link(port, settings, pipe).await {
+                    match self.train_display_uhbr_link(port, settings, hpo_link).await {
                         Ok(_) => {
                             (selection.lanes, selection.rate) = (lanes, link);
                             trained = true;
@@ -3772,7 +3823,7 @@ impl ColdBoot {
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Link);
             let video = self
-                .start_display_uhbr_video(port, pipe, pipe, selection.uhbr_sdp())
+                .start_display_uhbr_video(port, hpo_stream, pipe, selection.uhbr_sdp())
                 .await?;
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Video);
@@ -3946,7 +3997,7 @@ impl ColdBoot {
     /// # Safety
     /// As for `modeset_display`; exclude other AUX users of the port.
     pub async unsafe fn check_modeset(&mut self, m: &Modeset) -> Result<Health, ModesetError> {
-        // Display k runs on pipe k, in its own records.
+        // The display's records are its head pipe's.
         self.select_display(m.pipe)?;
         let port = m.selection.port;
         if !self.display_hpd(port)? {
@@ -3979,7 +4030,7 @@ impl ColdBoot {
         // dcn401_prepare_bandwidth: pinned before any configuration change.
         self.pin_display_uclk().await?;
         self.teardowns.check_idle()?;
-        // Display k runs on pipe k, in its own records.
+        // The display's records are its head pipe's.
         self.select_display(m.pipe)?;
         let port = m.selection.port;
         if m.selection.hdmi || m.selection.mst.is_some() {
@@ -4007,7 +4058,7 @@ impl ColdBoot {
             self.display_timing_status()?.state
         };
         // SAFETY: as above.
-        match unsafe { self.start_link(m.selection, m.pipe) }.await {
+        match unsafe { self.start_link(m.selection, m.pipe, m.encoders) }.await {
             Ok((selection, scanout)) => {
                 (m.selection, m.scanout) = (selection, scanout);
                 self.teardowns.finish_retrain(m.pipe, None);
@@ -4598,8 +4649,8 @@ impl ColdBoot {
         let streams: Vec<StreamPipes> = new
             .iter()
             .zip(&new_plans)
-            .map(|((s, crtc), plan)| StreamPipes::of(*crtc, s, plan))
-            .collect();
+            .map(|((s, crtc), plan)| Ok(StreamPipes::of(*crtc, s, plan).on(self.stream_output(s)?)))
+            .collect::<Result<_, ModesetError>>()?;
         let Some(acquired) = beside_pipes(&dc_state(&running), &streams, &running) else {
             return Ok(Err(BesideRefusal::Other));
         };

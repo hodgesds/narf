@@ -14,11 +14,15 @@
 //! Planes of different streams are added stream by stream, in CRTC order,
 //! not interleaved by DRM's zpos across CRTCs.
 use super::*;
-use crate::amdgpu_dcn401_resource::{DcState, ScalesAnywhere, Scaling, Target, MAX_SURFACES};
+use crate::amdgpu_dcn401_resource::{
+    DcState, ScalesAnywhere, Scaling, StreamOutput, Target, MAX_SURFACES,
+};
 
 /// One stream of a configuration as its pipes are acquired: its CRTC (the
 /// stream's id), which overlay slots of its planes are present (bottom
-/// first, as `PlaneSetup::overlays`) and DML's plan for it.
+/// first, as `PlaneSetup::overlays`), DML's plan for it and, for a stream
+/// that lights, its output, on which it acquires its encoders after its
+/// OTG master (resource_map_pool_resources).
 #[derive(Clone, Copy, Debug)]
 pub struct StreamPipes<'a> {
     pub crtc: u8,
@@ -27,6 +31,7 @@ pub struct StreamPipes<'a> {
     /// The stream's planes and timing, for their scaling on each pipe;
     /// `None` for admission's stand-in planes, which always scale.
     pub selection: Option<&'a Selection>,
+    pub output: Option<StreamOutput>,
 }
 impl<'a> StreamPipes<'a> {
     /// The stream of `selection`'s planes on CRTC `crtc` under `plan`.
@@ -36,6 +41,14 @@ impl<'a> StreamPipes<'a> {
             overlays: selection.planes.overlays.map(|o| o.is_some()),
             plan,
             selection: Some(selection),
+            output: None,
+        }
+    }
+    /// The stream lit on `output`.
+    pub fn on(self, output: StreamOutput) -> Self {
+        Self {
+            output: Some(output),
+            ..self
         }
     }
     /// The stream of the planes `plan` was admitted with (its overlays the
@@ -47,6 +60,7 @@ impl<'a> StreamPipes<'a> {
             overlays: core::array::from_fn(|k| k < n),
             plan,
             selection: None,
+            output: None,
         }
     }
     /// DML's pipe counts in DC plane order: the stream's ODM slices, each
@@ -161,11 +175,12 @@ fn refused() -> ModesetError {
 }
 
 /// The DC state of the running displays `running`, as their pipes record
-/// it: each stream (its CRTC) on its OTG master, every ODM slice's OPP head
-/// after it, and in each slice the blending tree of its planes in DC plane
-/// order with each plane's MPC slices together (acquire_dpp_pipe_and_add_
-/// mpc_slice puts a slice right after its plane's last), the slices of
-/// every plane linked across the ODM segments.
+/// it: each stream (its CRTC) on its OTG master with the encoders it holds
+/// on its output, every ODM slice's OPP head after it, and in each slice
+/// the blending tree of its planes in DC plane order with each plane's MPC
+/// slices together (acquire_dpp_pipe_and_add_mpc_slice puts a slice right
+/// after its plane's last), the slices of every plane linked across the
+/// ODM segments.
 pub fn dc_state(running: &[Modeset]) -> DcState {
     let mut state = DcState::new(crate::amdgpu_rdna4::pipe_pool().count());
     let mut streams: Vec<&Modeset> = running.iter().collect();
@@ -184,6 +199,7 @@ pub fn dc_state(running: &[Modeset]) -> DcState {
         }
         status.plane_count = n as u8;
         state.stream_count += 1;
+        state.adopt_stream_encoders(m.crtc, m.output, m.encoders);
         let segments = 1 + s.odm.len();
         // Each plane's pipe in each ODM slice (the first of its MPC slices).
         let column = |slot: usize, segment: usize| -> Option<u8> {
@@ -317,6 +333,12 @@ fn stream_pipes(
     let split = |p: &[u8]| otg::SplitPipes::new(p).ok_or_else(refused);
     let mut out = DisplayPipes {
         odm: split(&heads[1..segments])?,
+        encoders: state
+            .streams()
+            .iter()
+            .find(|s| s.stream == crtc)
+            .and_then(|s| s.encoders)
+            .unwrap_or_default(),
         ..DisplayPipes::default()
     };
     let planes = |slot: usize| state.dpp_pipes_for_plane(plane_id(crtc, slot));
@@ -365,10 +387,17 @@ pub fn head_pipes(current: &DcState, crtcs: &[u8]) -> Vec<u8> {
     heads
 }
 
+/// The encoders `s` acquires on its output in `new` right after its OTG
+/// master (none for a stream only admitted).
+fn map_encoders(new: &mut DcState, s: &StreamPipes) -> bool {
+    s.output
+        .is_none_or(|output| new.map_stream_encoders(s.crtc, output).is_some())
+}
+
 /// A configuration lit anew over `current` (every running stream and plane
 /// removed, as a full modeset of all of them): each stream of `streams` (in
-/// CRTC order) with its OTG master, its planes, then DML's counts. Each
-/// stream's head pipe and further pipes.
+/// CRTC order) with its OTG master and encoders, its planes, then DML's
+/// counts. Each stream's head pipe and further pipes (with its encoders).
 pub fn light_pipes(
     current: &DcState,
     streams: &[StreamPipes],
@@ -377,7 +406,7 @@ pub fn light_pipes(
     // Every running stream was removed: only these streams' planes scale.
     let sc = PlaneScaling::new(streams, &[]);
     for s in streams {
-        if !new.add_stream(current, s.crtc, &sc) {
+        if !new.add_stream(current, s.crtc, &sc) || !map_encoders(&mut new, s) {
             return Err(refused());
         }
     }
@@ -428,9 +457,9 @@ pub fn display_pipes(
 }
 
 /// New streams lit beside the running ones (`current`, which keep their
-/// streams and planes, `running`'s): each of `streams` added with its OTG
-/// master, its planes, then DML's counts for all (the running streams at
-/// theirs).
+/// streams, planes and encoders, `running`'s): each of `streams` added
+/// with its OTG master and the encoders the running ones leave, its
+/// planes, then DML's counts for all (the running streams at theirs).
 /// Each new stream's head pipe and further pipes, or None when they do
 /// not fit or would move a running stream's pipes (acquire_first_split_
 /// pipe, or dc_state_add_plane dropping another stream's MPC combine for a
@@ -443,7 +472,7 @@ pub fn beside_pipes(
     let mut new = *current;
     let sc = PlaneScaling::new(streams, running);
     for s in streams {
-        if !new.add_stream(current, s.crtc, &sc) {
+        if !new.add_stream(current, s.crtc, &sc) || !map_encoders(&mut new, s) {
             return None;
         }
     }

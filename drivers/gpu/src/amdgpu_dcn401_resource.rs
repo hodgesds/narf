@@ -15,6 +15,14 @@
 //! the same name with `self` the new state and `cur` the current
 //! (`dc->current_state`); `tests/dcn401_pipes` holds Linux's own code to
 //! vectors this module replays.
+//!
+//! The state also holds the stream encoders, as resource_map_pool_resources
+//! acquires them for a stream after its OTG master: a DIO stream encoder
+//! for every stream (dcn10_find_first_free_match_stream_enc_for_link), and
+//! for a 128b/132b DP stream an HPO DP stream encoder
+//! (find_first_free_match_hpo_dp_stream_enc_for_link) and its link's HPO DP
+//! link encoder, one per link shared by every stream on it and taken from
+//! the free pool (add_hpo_dp_link_enc_to_ctx).
 
 /// Pipe contexts per state (DCN401's pipes; Linux sizes them MAX_PIPES,
 /// the pipes past the pool staying clear).
@@ -23,6 +31,33 @@ pub const MAX_PIPES: usize = 4;
 pub const MAX_SURFACES: usize = 4;
 /// Streams per state: one per timing generator.
 pub const MAX_STREAMS: usize = MAX_PIPES;
+/// DIO stream encoders, DIGA-DIGD (res_cap_dcn4_01 num_stream_encoder).
+pub const STREAM_ENCODERS: usize = 4;
+/// HPO DP stream encoders (num_hpo_dp_stream_encoder).
+pub const HPO_DP_STREAM_ENCODERS: usize = 4;
+/// HPO DP link encoders (num_hpo_dp_link_encoder, MAX_HPO_DP2_LINK_ENCODERS).
+pub const HPO_DP_LINK_ENCODERS: usize = 4;
+
+/// What encoder acquisition reads of a stream's output.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StreamOutput {
+    /// Its dc_link's link_index (the board connector).
+    pub link: u8,
+    /// Its PHY link encoder's preferred_engine: the DIG of its transmitter
+    /// (dcn401_link_encoder_construct maps UNIPHY A-E to DIGA-DIGE).
+    pub preferred_engine: u8,
+    /// A 128b/132b DP stream (dp_get_encoding_format of its link settings).
+    pub hpo_dp: bool,
+}
+
+/// The encoders a stream's OTG master holds: stream_res.stream_enc,
+/// stream_res.hpo_dp_stream_enc and link_res.hpo_dp_link_enc, by instance.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StreamEncoders {
+    pub stream_enc: u8,
+    pub hpo_dp_stream_enc: Option<u8>,
+    pub hpo_dp_link_enc: Option<u8>,
+}
 
 /// One pipe's `pipe_ctx` as acquisition sees it. All `None` is a cleared
 /// (memset) pipe.
@@ -42,6 +77,9 @@ pub struct StreamStatus {
     pub stream: u8,
     pub planes: [u8; MAX_SURFACES],
     pub plane_count: u8,
+    /// The stream's output and the encoders it acquired on it.
+    pub output: StreamOutput,
+    pub encoders: Option<StreamEncoders>,
 }
 impl StreamStatus {
     pub fn planes(&self) -> &[u8] {
@@ -66,6 +104,13 @@ pub struct DcState {
     pub pipes: [PipeCtx; MAX_PIPES],
     pub streams: [StreamStatus; MAX_STREAMS],
     pub stream_count: u8,
+    /// res_ctx.is_stream_enc_acquired.
+    pub stream_enc_acquired: [bool; STREAM_ENCODERS],
+    /// res_ctx.is_hpo_dp_stream_enc_acquired.
+    pub hpo_dp_stream_enc_acquired: [bool; HPO_DP_STREAM_ENCODERS],
+    /// res_ctx.hpo_dp_link_enc_to_link_idx and hpo_dp_link_enc_ref_cnts.
+    pub hpo_dp_link_enc_link: [u8; HPO_DP_LINK_ENCODERS],
+    pub hpo_dp_link_enc_refs: [u8; HPO_DP_LINK_ENCODERS],
 }
 
 /// resource_build_scaling_params for `pipe` of `state`: whether SPL can
@@ -122,8 +167,18 @@ impl DcState {
                 stream: 0,
                 planes: [0; MAX_SURFACES],
                 plane_count: 0,
+                output: StreamOutput {
+                    link: 0,
+                    preferred_engine: 0,
+                    hpo_dp: false,
+                },
+                encoders: None,
             }; MAX_STREAMS],
             stream_count: 0,
+            stream_enc_acquired: [false; STREAM_ENCODERS],
+            hpo_dp_stream_enc_acquired: [false; HPO_DP_STREAM_ENCODERS],
+            hpo_dp_link_enc_link: [0; HPO_DP_LINK_ENCODERS],
+            hpo_dp_link_enc_refs: [0; HPO_DP_LINK_ENCODERS],
         }
     }
     pub fn streams(&self) -> &[StreamStatus] {
@@ -745,13 +800,20 @@ impl DcState {
         self.acquire_otg_master(cur, stream, sc);
         self.otg_master_for_stream(stream).is_some()
     }
-    /// dc_state_remove_stream: its ODM slices released, its OTG master
-    /// cleared, its status dropped.
+    /// dc_state_remove_stream: its ODM slices released, its encoders
+    /// released (resource_remove_otg_master_for_stream_output), its OTG
+    /// master cleared, its status dropped.
     pub fn remove_stream(&mut self, cur: &Self, stream: u8, sc: &dyn Scaling) -> bool {
         if self.otg_master_for_stream(stream).is_none() {
             return false;
         }
         self.update_pipes_for_stream_with_slice_count(cur, stream, 1, sc);
+        if let Some(i) = self.status_index(stream) {
+            if let Some(e) = self.streams[i].encoders.take() {
+                let link = self.streams[i].output.link;
+                self.release_stream_encoders(link, e);
+            }
+        }
         if let Some(otg) = self.otg_master_for_stream(stream) {
             *self.pm(otg) = PipeCtx::default();
         }
@@ -764,6 +826,123 @@ impl DcState {
         self.streams[usize::from(self.stream_count)] = StreamStatus::default();
         true
     }
+    /// dcn10_find_first_free_match_stream_enc_for_link: the free DIO stream
+    /// encoder of the link encoder's preferred engine, else the last free
+    /// one ("for CZ and later, we can allow DIG FE and BE to differ").
+    pub fn find_first_free_match_stream_enc_for_link(&self, output: StreamOutput) -> Option<u8> {
+        let mut j = None;
+        for i in 0..STREAM_ENCODERS as u8 {
+            if !self.stream_enc_acquired[usize::from(i)] {
+                j = Some(i);
+                if i == output.preferred_engine {
+                    return Some(i);
+                }
+            }
+        }
+        j
+    }
+    /// find_first_free_match_hpo_dp_stream_enc_for_link.
+    pub fn find_first_free_match_hpo_dp_stream_enc_for_link(&self) -> Option<u8> {
+        (0..HPO_DP_STREAM_ENCODERS as u8)
+            .find(|&i| !self.hpo_dp_stream_enc_acquired[usize::from(i)])
+    }
+    /// find_acquired_hpo_dp_link_enc_for_link.
+    pub fn find_acquired_hpo_dp_link_enc_for_link(&self, link: u8) -> Option<u8> {
+        (0..HPO_DP_LINK_ENCODERS as u8).find(|&i| {
+            self.hpo_dp_link_enc_refs[usize::from(i)] > 0
+                && self.hpo_dp_link_enc_link[usize::from(i)] == link
+        })
+    }
+    /// find_free_hpo_dp_link_enc.
+    fn find_free_hpo_dp_link_enc(&self) -> Option<u8> {
+        (0..HPO_DP_LINK_ENCODERS as u8).find(|&i| self.hpo_dp_link_enc_refs[usize::from(i)] == 0)
+    }
+    /// add_hpo_dp_link_enc_to_ctx: the link's acquired HPO DP link encoder
+    /// retained, else a free one acquired for it.
+    fn add_hpo_dp_link_enc_to_ctx(&mut self, link: u8) -> Option<u8> {
+        if let Some(i) = self.find_acquired_hpo_dp_link_enc_for_link(link) {
+            self.hpo_dp_link_enc_refs[usize::from(i)] += 1;
+            return Some(i);
+        }
+        let i = self.find_free_hpo_dp_link_enc()?;
+        self.hpo_dp_link_enc_link[usize::from(i)] = link;
+        self.hpo_dp_link_enc_refs[usize::from(i)] = 1;
+        Some(i)
+    }
+    /// The encoders `encoders` of a stream on `link` held in this state
+    /// (update_stream_engine_usage and update_hpo_dp_stream_engine_usage
+    /// with acquired set, add_hpo_dp_link_enc_to_ctx).
+    fn hold_stream_encoders(&mut self, link: u8, e: StreamEncoders) {
+        self.stream_enc_acquired[usize::from(e.stream_enc)] = true;
+        if let Some(h) = e.hpo_dp_stream_enc {
+            self.hpo_dp_stream_enc_acquired[usize::from(h)] = true;
+        }
+        if let Some(l) = e.hpo_dp_link_enc {
+            let refs = &mut self.hpo_dp_link_enc_refs[usize::from(l)];
+            if *refs == 0 {
+                self.hpo_dp_link_enc_link[usize::from(l)] = link;
+            }
+            *refs += 1;
+        }
+    }
+    /// resource_remove_otg_master_for_stream_output's encoder releases.
+    fn release_stream_encoders(&mut self, link: u8, e: StreamEncoders) {
+        self.stream_enc_acquired[usize::from(e.stream_enc)] = false;
+        if let Some(h) = e.hpo_dp_stream_enc {
+            self.hpo_dp_stream_enc_acquired[usize::from(h)] = false;
+        }
+        // remove_hpo_dp_link_enc_from_ctx: the link's encoder, by link.
+        if e.hpo_dp_link_enc.is_some() {
+            if let Some(i) = self.find_acquired_hpo_dp_link_enc_for_link(link) {
+                self.hpo_dp_link_enc_refs[usize::from(i)] -= 1;
+            }
+        }
+    }
+    /// resource_map_pool_resources' encoders for `stream`, which holds its
+    /// OTG master: the DIO stream encoder (DC_NO_STREAM_ENC_RESOURCE
+    /// without one), then on a 128b/132b DP output the first free HPO DP
+    /// stream encoder and the link's HPO DP link encoder
+    /// (DC_NO_LINK_ENC_RESOURCE without one). None refuses the state, as
+    /// Linux fails the commit.
+    pub fn map_stream_encoders(
+        &mut self,
+        stream: u8,
+        output: StreamOutput,
+    ) -> Option<StreamEncoders> {
+        let i = self.status_index(stream)?;
+        self.otg_master_for_stream(stream)?;
+        if self.streams[i].encoders.is_some() {
+            return None;
+        }
+        let stream_enc = self.find_first_free_match_stream_enc_for_link(output)?;
+        self.stream_enc_acquired[usize::from(stream_enc)] = true;
+        let mut e = StreamEncoders {
+            stream_enc,
+            hpo_dp_stream_enc: None,
+            hpo_dp_link_enc: None,
+        };
+        self.streams[i].output = output;
+        self.streams[i].encoders = Some(e);
+        if output.hpo_dp {
+            let h = self.find_first_free_match_hpo_dp_stream_enc_for_link()?;
+            self.hpo_dp_stream_enc_acquired[usize::from(h)] = true;
+            e.hpo_dp_stream_enc = Some(h);
+            self.streams[i].encoders = Some(e);
+            e.hpo_dp_link_enc = Some(self.add_hpo_dp_link_enc_to_ctx(output.link)?);
+            self.streams[i].encoders = Some(e);
+        }
+        Some(e)
+    }
+    /// A running stream's encoders, as the state it runs in records them.
+    pub fn adopt_stream_encoders(&mut self, stream: u8, output: StreamOutput, e: StreamEncoders) {
+        let Some(i) = self.status_index(stream) else {
+            return;
+        };
+        self.streams[i].output = output;
+        self.streams[i].encoders = Some(e);
+        self.hold_stream_encoders(output.link, e);
+    }
+
     /// dc_state_add_plane: the plane on the stream's OPP heads (its first)
     /// or on a secondary DPP per OPP head; short of pipes, every stream's
     /// MPC combine is dropped and it tries again, then the stream's ODM

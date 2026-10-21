@@ -235,3 +235,132 @@ kernel_test_in!(
     "drivers/gpu/dcn401-pipes",
     dcn401_pipe_acquisition_matches_linux
 );
+
+/// Linux DC's DCN401 stream-encoder acquisition over add/remove sequences
+/// (tests/dcn401_stream_enc: harness.c documents the format): each
+/// stream's DIO stream encoder, HPO DP stream encoder and its link's HPO
+/// DP link encoder after its OTG master, and their release.
+const ENCODER_VECTORS: &str = include_str!("../tests/dcn401_stream_enc/vectors.txt");
+
+fn dcn401_stream_encoder_acquisition_matches_linux() -> TestResult {
+    let cur = DcState::new(4);
+    let mut checked = 0;
+    for line in ENCODER_VECTORS.lines().filter(|l| !l.starts_with('#')) {
+        let Some((ops, results)) = line.strip_prefix("seq ").and_then(|l| l.split_once(" = "))
+        else {
+            return TestResult::Fail("vector line");
+        };
+        let mut state = DcState::new(4);
+        for (op, want) in ops.split(' ').zip(results.split(' ')) {
+            let got = if let Some(r) = op.strip_prefix('-') {
+                let Ok(s) = r.parse::<u8>() else {
+                    return TestResult::Fail("remove op");
+                };
+                if !state.remove_stream(&cur, s, &ScalesAnywhere) {
+                    return TestResult::Fail("remove a stream");
+                }
+                String::from("r")
+            } else {
+                let f: alloc::vec::Vec<u8> =
+                    op[1..].split('.').filter_map(|x| x.parse().ok()).collect();
+                let [s, link, engine, hpo] = f[..] else {
+                    return TestResult::Fail("add op");
+                };
+                if !state.add_stream(&cur, s, &ScalesAnywhere) {
+                    return TestResult::Fail("OTG master");
+                }
+                let output = StreamOutput {
+                    link,
+                    preferred_engine: engine,
+                    hpo_dp: hpo == 1,
+                };
+                let opt = |v: Option<u8>| v.map_or(String::from("-"), |v| alloc::format!("{v}"));
+                match state.map_stream_encoders(s, output) {
+                    Some(e) => alloc::format!(
+                        "{}.{}.{}",
+                        e.stream_enc,
+                        opt(e.hpo_dp_stream_enc),
+                        opt(e.hpo_dp_link_enc)
+                    ),
+                    None => String::from("E"),
+                }
+            };
+            checked += 1;
+            if got != want {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "dcn401 encoders: {line}: {op} gave {got}"
+                );
+                return TestResult::Fail("encoder acquisition differs from Linux");
+            }
+        }
+    }
+    if checked < 5000 {
+        return TestResult::Fail("vectors.txt lost its sequences");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-pipes",
+    dcn401_stream_encoder_acquisition_matches_linux
+);
+
+/// Two 128b/132b MST streams on one link share its HPO DP link encoder
+/// whatever pipes they run on; once the stream that trained the link
+/// leaves, the link keeps that encoder for the other, and a 128b/132b
+/// stream on another link takes a free one (not the departed stream's
+/// pipe's); its DIO and HPO DP stream encoders come from the free pools.
+fn dcn401_hpo_dp_link_encoder_follows_the_link() -> TestResult {
+    let cur = DcState::new(4);
+    let mut state = DcState::new(4);
+    let mst = |engine| StreamOutput {
+        link: 0,
+        preferred_engine: engine,
+        hpo_dp: true,
+    };
+    for s in [5, 6] {
+        if !state.add_stream(&cur, s, &ScalesAnywhere) {
+            return TestResult::Fail("OTG masters");
+        }
+    }
+    let a = state.map_stream_encoders(5, mst(0));
+    let b = state.map_stream_encoders(6, mst(0));
+    let want_b = StreamEncoders {
+        stream_enc: 3,
+        hpo_dp_stream_enc: Some(1),
+        hpo_dp_link_enc: Some(0),
+    };
+    if a.map(|e| e.hpo_dp_link_enc) != Some(Some(0)) || b != Some(want_b) {
+        return TestResult::Fail("one link encoder per link");
+    }
+    // The owner (on the first pipe) leaves; its link encoder stays the link's.
+    if !state.remove_stream(&cur, 5, &ScalesAnywhere)
+        || state.find_acquired_hpo_dp_link_enc_for_link(0) != Some(0)
+    {
+        return TestResult::Fail("the link keeps its encoder");
+    }
+    if !state.add_stream(&cur, 7, &ScalesAnywhere) {
+        return TestResult::Fail("third OTG master");
+    }
+    let sst = state.map_stream_encoders(
+        7,
+        StreamOutput {
+            link: 1,
+            preferred_engine: 1,
+            hpo_dp: true,
+        },
+    );
+    let want = StreamEncoders {
+        stream_enc: 1,
+        hpo_dp_stream_enc: Some(0),
+        hpo_dp_link_enc: Some(1),
+    };
+    if sst != Some(want) {
+        return TestResult::Fail("another link's encoder");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-pipes",
+    dcn401_hpo_dp_link_encoder_follows_the_link
+);

@@ -6096,12 +6096,15 @@ pub async unsafe fn monitor_displays(
                 Ok(boot::MstService::Relight) => relight = true,
                 // As Linux disables a departed connector's CRTC: only its
                 // stream retires, the others on the link run on.
-                Ok(boot::MstService::Lost(pipes)) => {
+                Ok(boot::MstService::Lost(streams)) => {
                     lost_mask |= displays
                         .lit
                         .iter()
                         .flatten()
-                        .filter(|m| pipes.contains(&m.pipe))
+                        .filter(|m| {
+                            m.selection.port == port
+                                && m.mst_stream_encoder().is_some_and(|s| streams.contains(&s))
+                        })
                         .fold(0, |acc, m| acc | 1 << m.crtc);
                     lost_ports.push(port);
                 }

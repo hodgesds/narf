@@ -2542,7 +2542,7 @@ impl ColdBoot {
     }
     /// The live scanout as a CPU framebuffer (bus-physical BAR address).
     /// Read-only: display `pipe`'s running timing generator frame count and
-    /// scanout position (display k scans out on pipe k).
+    /// scanout position (`pipe` is the display's head pipe).
     pub fn display_scanout_position(
         &mut self,
         pipe: u8,

@@ -21,6 +21,15 @@ fn completed_modeset(pipe: u8) -> Modeset {
         selection,
         pipe,
         crtc: pipe,
+        output: StreamOutput {
+            link: 0,
+            preferred_engine: pipe,
+            hpo_dp: false,
+        },
+        encoders: StreamEncoders {
+            stream_enc: pipe,
+            ..StreamEncoders::default()
+        },
         plan,
         scanout: otg::ScanoutRunning {
             pipe,
@@ -59,7 +68,12 @@ fn navi48_completed_modesets_survive_configuration_and_publication_cancellation(
                 }
                 if during_startup {
                     journal
-                        .begin_activation(3, otg::SplitPipes::NONE, &second.selection)
+                        .begin_activation(
+                            3,
+                            otg::SplitPipes::NONE,
+                            &second.selection,
+                            second.encoders,
+                        )
                         .unwrap();
                 }
                 // Later native startup, or asynchronous platform adoption.
@@ -3605,7 +3619,17 @@ fn navi48_split_pipes_follow_dml() -> TestResult {
         })
     };
     let got = |plans: &[dml::Plan], crtcs: &[u8]| plan_pipes(plans, crtcs).ok();
-    let d = |head, odm, mpc, overlays| (head, DisplayPipes { odm, mpc, overlays });
+    let d = |head, odm, mpc, overlays| {
+        (
+            head,
+            DisplayPipes {
+                odm,
+                mpc,
+                overlays,
+                encoders: StreamEncoders::default(),
+            },
+        )
+    };
     if got(&[mpc], &[0]) != Some(alloc::vec![d(0, none, s(&[1]), [None; 3])])
         || got(&[mpc, mpc], &[0, 1])
             != Some(alloc::vec![

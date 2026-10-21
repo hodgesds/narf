@@ -99,9 +99,9 @@ pub enum MstService {
     /// Every running stream's route survives (any new end device waits for
     /// its CRTC to light beside them).
     Kept,
-    /// The end devices of these stream encoders' (pipes') payloads left;
-    /// every other route survives. Retire those streams alone, then service
-    /// the port again to adopt the tree.
+    /// The end devices of these stream encoders' payloads left
+    /// (`Modeset::mst_stream_encoder`); every other route survives. Retire
+    /// those streams alone, then service the port again to adopt the tree.
     Lost(Vec<u8>),
     /// The topology changed under the running streams (another primary
     /// branch, a hop's capacity): stop them all and relight.
@@ -134,6 +134,9 @@ pub struct MstLink {
     /// stream runs.
     caps: Option<modeset::DpCaps>,
     payload_change: Option<MstPayloadChange>,
+    /// Each payload's stream encoder and the display (head pipe) whose
+    /// stream it carries.
+    displays: Vec<(u8, u8)>,
     /// Payload end devices a live reprobe found gone (`reprobe_live`): their
     /// streams retire alone. Their ports stay in the topology the payloads
     /// were allocated in, as Linux's drm_dp_mst_port outlives its sink.
@@ -217,6 +220,10 @@ impl MstLink {
                 })?;
         }
         None
+    }
+    /// The display (head pipe) whose stream stream encoder `stream` carries.
+    fn display_of(&self, stream: u8) -> Option<u8> {
+        self.displays.iter().find(|d| d.0 == stream).map(|d| d.1)
     }
     fn has_stream_resources(&self) -> bool {
         self.owner.is_some()
@@ -742,16 +749,19 @@ impl ColdBoot {
         };
         topology::read_edid(&mut link.manager, &mut aux, &link.topology, sink).await
     }
-    /// Add stream encoder `stream`'s payload for `sink` (`add_payload`).
+    /// Add stream encoder `stream`'s payload for `sink` (`add_payload`), the
+    /// stream of the display on head pipe `pipe`.
     /// Incomplete transactions retain their marker and refuse further changes.
     /// # Safety
     /// The selected display's frontend (DIO) or blank stream (HPO) on
     /// `stream` runs on the port's MST link, its video not yet started.
+    #[allow(clippy::too_many_arguments)]
     pub async unsafe fn add_display_mst_payload(
         &mut self,
         port: usize,
         sink: dp_mst_mgr::Sink,
         stream: u8,
+        pipe: u8,
         pbn: u16,
         slots: u8,
         rate: (u32, u32),
@@ -769,6 +779,10 @@ impl ColdBoot {
             transmitter,
             uhbr: link.uhbr,
         };
+        // The display is known from the first write on: a returned source
+        // error keeps the payload (and its display) for the teardown.
+        link.displays.retain(|d| d.0 != stream);
+        link.displays.push((stream, pipe));
         add_payload(link, &mut aux, &mut source, sink, stream, pbn, slots, rate).await
     }
     /// Remove stream encoder `stream`'s payload (`remove_payload`).
@@ -796,7 +810,11 @@ impl ColdBoot {
             transmitter,
             uhbr: link.uhbr,
         };
-        remove_payload(link, &mut aux, &mut source, stream, connected).await
+        let result = remove_payload(link, &mut aux, &mut source, stream, connected).await;
+        if !link.payloads.iter().any(|p| p.stream == stream) {
+            link.displays.retain(|d| d.0 != stream);
+        }
+        result
     }
     /// dm_helpers_dp_write_dsc_enable for an MST stream decoded by `dsc`:
     /// DP_DSC_ENABLE on its decoder (and passthrough peer) through the
@@ -845,6 +863,16 @@ impl ColdBoot {
             };
             link.manager.stop(&mut aux).await;
         }
+    }
+}
+
+/// The stream encoder an MST stream's payload is sourced from: its DIO
+/// stream encoder on 8b/10b, its HPO DP stream encoder on 128b/132b.
+pub(super) fn mst_source_encoder(uhbr: bool, e: modeset::StreamEncoders) -> Option<u8> {
+    if uhbr {
+        e.hpo_dp_stream_enc
+    } else {
+        Some(e.stream_enc)
     }
 }
 
@@ -2035,12 +2063,15 @@ impl ColdBoot {
             }
         }
     }
-    /// Start `selection`'s MST stream on staged `pipe` (stream encoder
-    /// `pipe`): the first stream trains the port's MST link at the selected
-    /// setting (no fallback: every payload was sized for it), later ones
-    /// attach to it; then the frontend, payload, video, scanout and LPCM
-    /// audio. On a 128b/132b link the HPO stream is prepared blank in place
-    /// of the frontend, and unblanked as its video.
+    /// Start `selection`'s MST stream on staged `pipe` with the encoders it
+    /// acquired (`encoders`: its DIO stream encoder on 8b/10b; its HPO DP
+    /// stream encoder and its link's HPO DP link encoder, shared by every
+    /// stream on the link, on 128b/132b): the first stream trains the
+    /// port's MST link at the selected setting (no fallback: every payload
+    /// was sized for it), later ones attach to it; then the frontend,
+    /// payload, video, scanout and LPCM audio. On a 128b/132b link the HPO
+    /// stream is prepared blank in place of the frontend, and unblanked as
+    /// its video.
     /// # Safety
     /// As for `start_link`.
     pub(super) async unsafe fn start_mst_stream(
@@ -2049,6 +2080,7 @@ impl ColdBoot {
         stream: modeset::MstStream,
         selection: &Selection,
         pipe: u8,
+        encoders: modeset::StreamEncoders,
     ) -> Result<otg::ScanoutRunning, ModesetError> {
         let link = self.mst.get(&port).ok_or(MstFailure::Invalid)?;
         link.require_transaction_idle()?;
@@ -2056,10 +2088,12 @@ impl ColdBoot {
         if link.owner.is_some() && link.uhbr != uhbr {
             return Err(ModesetError::Link);
         }
+        // The payload's stream encoder: DIO on 8b/10b, HPO on 128b/132b.
+        let source = mst_source_encoder(uhbr, encoders).ok_or(otg::Error::Invalid)?;
         // SAFETY: the caller's obligations; each step checks its predecessor.
         unsafe {
             if link.owner.is_none() {
-                self.train_mst_link(port, selection, pipe).await?;
+                self.train_mst_link(port, selection, encoders).await?;
                 if let Some(link) = self.mst.get_mut(&port) {
                     link.owner = Some(pipe);
                     link.uhbr = uhbr;
@@ -2072,7 +2106,7 @@ impl ColdBoot {
             if uhbr {
                 self.prepare_display_uhbr_mst_stream(
                     port,
-                    pipe,
+                    source,
                     pipe,
                     stream.slots,
                     selection.uhbr_sdp(),
@@ -2086,7 +2120,7 @@ impl ColdBoot {
                     otg::DpFrontendRequest {
                         vsc_colorimetry: selection.vsc_colorimetry,
                         hdr: selection.hdr_packet(),
-                        ..otg::DpFrontendRequest::new(pipe, pipe)
+                        ..otg::DpFrontendRequest::new(source, pipe)
                     },
                 )
                 .await?;
@@ -2108,6 +2142,7 @@ impl ColdBoot {
             self.add_display_mst_payload(
                 port,
                 stream.sink,
+                source,
                 pipe,
                 stream.pbn,
                 stream.slots,
@@ -2133,15 +2168,16 @@ impl ColdBoot {
         }
     }
     /// Train the port's MST link at `selection`'s setting for the selected
-    /// display: 8b/10b on the DIO, 128b/132b on HPO link encoder `pipe`
-    /// (the display's own, as for SST). A refused link is stopped again.
+    /// display: 8b/10b on the DIO, 128b/132b on the HPO DP link encoder the
+    /// link acquired (`encoders`, add_hpo_dp_link_enc_to_ctx: one per link,
+    /// whichever stream trains it). A refused link is stopped again.
     /// # Safety
     /// As for `start_link`.
     async unsafe fn train_mst_link(
         &mut self,
         port: usize,
         selection: &Selection,
-        pipe: u8,
+        encoders: modeset::StreamEncoders,
     ) -> Result<(), ModesetError> {
         let lanes = selection.lanes;
         // SAFETY: the caller's obligations.
@@ -2166,7 +2202,8 @@ impl ColdBoot {
                         mst: true,
                     };
                     let transmitter = self.dp_phy_path(port)?.transmitter;
-                    if let Err(e) = self.train_display_uhbr_link(port, settings, pipe).await {
+                    let hpo_link = encoders.hpo_dp_link_enc.ok_or(otg::Error::Invalid)?;
+                    if let Err(e) = self.train_display_uhbr_link(port, settings, hpo_link).await {
                         if self
                             .display_timing_status()
                             .is_ok_and(|s| s.state == otg::State::UhbrLinkRefused(transmitter))
@@ -2202,13 +2239,18 @@ impl ColdBoot {
             if !owner {
                 return Ok(self.detach_display_mst_link(port)?);
             }
-            // Display k runs on pipe k: the next owner is a remaining
-            // stream's pipe.
-            let next = self
-                .mst
-                .get(&port)
-                .and_then(|l| l.payloads.first())
-                .map(|p| p.stream);
+            // The next owner is a remaining stream's display (its head
+            // pipe, not its stream encoder); the link keeps its HPO DP link
+            // encoder, which the link and not any one stream holds.
+            let next = match self.mst.get(&port).and_then(|l| l.payloads.first()) {
+                Some(p) => Some(
+                    self.mst
+                        .get(&port)
+                        .and_then(|l| l.display_of(p.stream))
+                        .ok_or(otg::Error::Invalid)?,
+                ),
+                None => None,
+            };
             if let Some(to) = next {
                 let transmitter = self.dp_phy_path(port)?.transmitter;
                 self.otg

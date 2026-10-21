@@ -548,9 +548,39 @@ every stream's head and further pipes (`DisplayPipes`) back from it:
   heads or another display's pipes would move.
 Everything downstream follows the chosen pipes: the CRTC's head pipe for
 its timing, OPP, blank, DSC (the pipe index's), DCCG and pixel clocks,
-deadlines and DET, cursor, the DIG/HPO stream encoder (the head pipe's
-index) and MST link owner, its present, vblank and cursor tasks
-(`crtc_pipe`) and DisplayEvents (by pipe). Deviations from Linux: the
+deadlines and DET, cursor and MST link owner, its present, vblank and
+cursor tasks (`crtc_pipe`) and DisplayEvents (by pipe).
+
+**Stream encoders (Navi48 configurations).** The encoders are DC's choice
+too, made in the same `DcState` right after each new stream's OTG master,
+as resource_map_pool_resources makes it (`StreamPipes::on(StreamOutput)`:
+the stream's board port as its link, its transmitter's DIG as the link
+encoder's preferred engine, whether it codes 128b/132b;
+`DcState::map_stream_encoders`): a DIO stream encoder for every stream
+(dcn10_find_first_free_match_stream_enc_for_link: the free preferred DIG,
+else the last free one), and on a 128b/132b DP stream the first free HPO
+DP stream encoder and its link's HPO DP link encoder
+(add_hpo_dp_link_enc_to_ctx: the one the link holds, retained, else a
+free one; one per link however many MST streams ride it), refusing the
+state without one; `remove_stream` releases them as
+resource_remove_otg_master_for_stream_output does. `dc_state(running)`
+records each running stream's (`Modeset::{output, encoders}`), so streams
+lit beside it take what it leaves. The start paths program what was
+acquired (`DisplayPipes::encoders`): the DIO frontend and HDMI TMDS stream
+encoder, 128b/132b SST training on the HPO DP link encoder and video on
+the HPO DP stream encoder, and an MST stream's frontend or HPO stream,
+SAT row and VC rate on its stream encoder (`MstPayload::stream`,
+`Modeset::mst_stream_encoder`) with its link trained once on the link's
+HPO DP link encoder, which stays the link's when the training stream
+leaves and the link is handed to another stream's display
+(`MstLink::displays` maps each payload's stream encoder to its head pipe).
+FRL keeps its single HPO FRL encoder. `tests/dcn401_stream_enc/check.sh`
+compiles Linux's acquisition functions verbatim around the DCN 4.0.1 pool
+(four DIO, one virtual, four HPO DP stream and link encoders) and replays
+2000 add/remove sequences over four links
+(`dcn401_stream_encoder_acquisition_matches_linux`).
+
+Deviations from Linux: the
 primary takes the OTG master where amdgpu_dm's topmost plane does (the
 pipe sets match; within a stream an overlay above the primary and the
 primary trade pipes), planes of different CRTCs are added CRTC by CRTC
@@ -2750,10 +2780,11 @@ decide_mst_link_settings trains MST at the verified cap: the best UHBR rate
 on every lane. Selection then counts all 64 time slots (no MTP header slot,
 drm_dp_mst_update_slots) with dm_mst_get_pbn_divider of that link, and
 payloads start at slot 0 (`MstLink::uhbr`). The first stream trains the link
-with `UhbrSettings::mst` on its own HPO link encoder (training requires the
+with `UhbrSettings::mst` on the link's HPO DP link encoder (see "Stream
+encoders"; training requires the
 manager's MST_EN; stopping leaves the branch in D0); later streams attach to
 the owner's `UhbrLinkTrained` record, and handover/detach follow the 8b/10b
-rules. Each stream uses its own HPO stream encoder in Linux's order:
+rules. Each stream uses the HPO DP stream encoder it acquired, in Linux's order:
 `prepare_uhbr_mst_stream` enables and maps it with its timing running blank
 (`State::UhbrStreamReady`), the manager adds the payload through
 `update_uhbr_mst_allocation` (HPO SAT rows with ACT) and `set_uhbr_mst_vc_rate`
