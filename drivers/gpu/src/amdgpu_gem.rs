@@ -1246,23 +1246,65 @@ pub(crate) fn try_placement(card: u32) -> Option<PlacementGuard> {
     })
 }
 
-/// Reclaim idle client VRAM; address leases and unsignalled fences pin it.
-/// A shared handle or PRIME export alone does not pin placement.
-fn evict_visible(card: u32, fits: impl Fn() -> bool) {
+/// Every live buffer created on each card, whatever holds it (a handle, a
+/// framebuffer, a CPU mapping, a PRIME export): TTM's view of the device's
+/// buffers, which its LRU walk evicts from.
+static CARD_OBJECTS: IrqSafeSpinLock<Vec<(u32, Weak<GemObject>)>> =
+    IrqSafeSpinLock::new(Vec::new());
+/// The cards whose evictions walk every live buffer (`CARD_OBJECTS`) rather
+/// than the opens' handle tables.
+static LRU_CARDS: IrqSafeSpinLock<Vec<u32>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Make DRM card `card`'s evictions (suspend's `evict_all`, pressure's
+/// `evict_visible` and `reclaim_vram`) walk every live buffer of the card,
+/// as TTM walks its LRU, including one only a framebuffer holds (CREATE_DUMB,
+/// ADDFB2, then the handle closed). Otherwise they walk the opens' handle
+/// tables (a card that never sets it keeps that).
+pub fn set_lru_eviction(card: u32, on: bool) {
+    let mut cards = LRU_CARDS.lock();
+    cards.retain(|&c| c != card);
+    if on {
+        cards.push(card);
+    }
+}
+
+/// The buffers an eviction on card `card` considers, oldest first, each
+/// once: every live buffer of an LRU card (`set_lru_eviction`), else those
+/// its opens' handle tables hold.
+fn eviction_candidates(card: u32) -> Vec<Arc<GemObject>> {
+    if LRU_CARDS.lock().contains(&card) {
+        return CARD_OBJECTS
+            .lock()
+            .iter()
+            .filter(|(c, _)| *c == card)
+            .filter_map(|(_, o)| o.upgrade())
+            .collect();
+    }
     let tables: Vec<_> = GEM_TABLES
         .lock()
         .iter()
         .filter(|(c, _)| *c == card)
         .filter_map(|(_, table)| table.upgrade())
         .collect();
+    let mut objects: Vec<Arc<GemObject>> = Vec::new();
     for table in tables {
-        let objects: Vec<_> = table.lock().values().cloned().collect();
-        for object in objects {
-            if !object.system() && !object.pinned() {
-                let _ = object.relocate(false);
-                if fits() {
-                    return;
-                }
+        for object in table.lock().values() {
+            if !objects.iter().any(|o| Arc::ptr_eq(o, object)) {
+                objects.push(object.clone());
+            }
+        }
+    }
+    objects
+}
+
+/// Reclaim idle client VRAM; address leases and unsignalled fences pin it.
+/// A shared handle or PRIME export alone does not pin placement.
+fn evict_visible(card: u32, fits: impl Fn() -> bool) {
+    for object in eviction_candidates(card) {
+        if !object.system() && !object.pinned() {
+            let _ = object.relocate(false);
+            if fits() {
+                return;
             }
         }
     }
@@ -1280,29 +1322,20 @@ pub(crate) async fn evict_all(
     gate: &PlacementGuard,
 ) -> (Vec<(Arc<GemObject>, u64)>, Result<(), FsError>) {
     let card = gate.card();
-    let tables: Vec<_> = GEM_TABLES
-        .lock()
-        .iter()
-        .filter(|(c, _)| *c == card)
-        .filter_map(|(_, table)| table.upgrade())
-        .collect();
     let mut touched = Vec::new();
-    for table in tables {
-        let objects: Vec<_> = table.lock().values().cloned().collect();
-        for object in objects {
-            if object.system()
-                || object.pinned()
-                || touched.iter().any(|(o, _)| Arc::ptr_eq(o, &object))
-            {
-                continue;
-            }
-            let original = object
-                .allowed_domains
-                .fetch_or(u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT), Ordering::AcqRel);
-            touched.push((object.clone(), original));
-            if let Err(error) = crate::amdgpu_vm::relocate(gate, &object, false).await {
-                return (touched, Err(error));
-            }
+    for object in eviction_candidates(card) {
+        if object.system()
+            || object.pinned()
+            || touched.iter().any(|(o, _)| Arc::ptr_eq(o, &object))
+        {
+            continue;
+        }
+        let original = object
+            .allowed_domains
+            .fetch_or(u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT), Ordering::AcqRel);
+        touched.push((object.clone(), original));
+        if let Err(error) = crate::amdgpu_vm::relocate(gate, &object, false).await {
+            return (touched, Err(error));
         }
     }
     (touched, Ok(()))
@@ -1323,27 +1356,18 @@ pub(crate) fn restore_domains(touched: Vec<(Arc<GemObject>, u64)>) {
 async fn reclaim_vram(card: u32, heap: &VramHeap, size: u64, align: u64, flags: u64) -> bool {
     let no_cpu = flags & u64::from(uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0;
     let gate = lock_placement(card).await;
-    let tables: Vec<_> = GEM_TABLES
-        .lock()
-        .iter()
-        .filter(|(c, _)| *c == card)
-        .filter_map(|(_, table)| table.upgrade())
-        .collect();
-    for table in tables {
-        let objects: Vec<_> = table.lock().values().cloned().collect();
-        for object in objects {
-            if object.system() {
-                continue;
-            }
-            let _ = crate::amdgpu_vm::relocate(&gate, &object, false).await;
-            if reserve_visible(heap, Some(card), flags, size, align).is_ok()
-                || (no_cpu
-                    && heap.unmapped.as_ref().is_some_and(|u| {
-                        reserve_hidden(heap, u, Some(card), flags, size, align).is_ok()
-                    }))
-            {
-                return true;
-            }
+    for object in eviction_candidates(card) {
+        if object.system() {
+            continue;
+        }
+        let _ = crate::amdgpu_vm::relocate(&gate, &object, false).await;
+        if reserve_visible(heap, Some(card), flags, size, align).is_ok()
+            || (no_cpu
+                && heap.unmapped.as_ref().is_some_and(|u| {
+                    reserve_hidden(heap, u, Some(card), flags, size, align).is_ok()
+                }))
+        {
+            return true;
         }
     }
     false
@@ -1556,7 +1580,13 @@ impl GemState {
     }
 
     fn insert(&self, object: GemObject) -> Result<u32, FsError> {
-        self.insert_shared(Arc::new(object))
+        let object = Arc::new(object);
+        if let Some(card) = object.card {
+            let mut all = CARD_OBJECTS.lock();
+            all.retain(|(_, o)| o.strong_count() != 0);
+            all.push((card, Arc::downgrade(&object)));
+        }
+        self.insert_shared(object)
     }
 
     fn insert_shared(&self, object: Arc<GemObject>) -> Result<u32, FsError> {
@@ -2363,3 +2393,7 @@ mod render_abi_tests;
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_dcc_vram_tests.rs"]
 mod dcc_vram_tests;
+
+#[cfg(feature = "kernel-test")]
+#[path = "amdgpu_gem_eviction_tests.rs"]
+mod eviction_tests;

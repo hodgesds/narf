@@ -1359,6 +1359,9 @@ impl ColdBoot {
                 gc, tccs,
             ))),
         );
+        // Evictions see every buffer of the card, framebuffer-only ones
+        // included, as TTM's LRU does.
+        crate::amdgpu_gem::set_lru_eviction(card, true);
         crate::amdgpu_gem::register_vram_heap(card, heap.clone());
         self.client_heap = Some(heap);
         self.client_vram = Some(chunk);

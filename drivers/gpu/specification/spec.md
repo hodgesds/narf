@@ -7424,7 +7424,12 @@ quiesce. Then it unregisters
 the client VRAM heap and evicts every client VRAM buffer to system memory
 (`amdgpu_gem::evict_all`, as ttm_resource_manager_evict_all, widening each
 buffer's allowed domains with GTT for the move and waiting for its jobs;
-a buffer still pinned stays in VRAM, as it is not on TTM's LRU),
+a buffer still pinned stays in VRAM, as it is not on TTM's LRU; the card is
+an LRU card, `amdgpu_gem::set_lru_eviction` from `publish_client_vram`, so
+this walk, like pressure's `evict_visible` and `reclaim_vram`, covers
+every live buffer of the card, `CARD_OBJECTS`, including one only a
+framebuffer holds after CREATE_DUMB, ADDFB2 and closing the handle; other
+cards keep walking their opens' handle tables),
 pauses kernel boot-framebuffer writers, then quiesces exactly as recovery
 does and saves PCI state with bus mastering cleared
 (`Reset::save_for_resume`). A refused eviction or preflight leaves the
