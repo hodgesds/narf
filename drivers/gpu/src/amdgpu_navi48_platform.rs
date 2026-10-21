@@ -521,25 +521,71 @@ pub(crate) async fn pci_function() -> Option<(
 pub(crate) fn native_display_running() -> bool {
     DISPLAY_GENERATION.load(Ordering::Acquire) != 0
 }
+/// Whether DRM presentation is held off for a suspend: from dm_suspend's
+/// commit until resume (or a refused suspend), no frame is queued or
+/// presented, so no plane takes a client framebuffer (and its pin) back
+/// while VRAM is evicted, as Linux has userspace frozen meanwhile.
+static PRESENT_GATED: AtomicBool = AtomicBool::new(false);
+/// Hold DRM presentation off (`gate`) or let it run again. Holding it off
+/// completes every queued frame without showing it (its event fires; its
+/// framebuffers never show), as its commit is dropped.
+fn gate_presenters(gate: bool) {
+    PRESENT_GATED.store(gate, Ordering::Release);
+    if !gate {
+        kick_presenters();
+        return;
+    }
+    for display in 0..PRESENT.len() as u8 {
+        let frame = present_slot(display).next.lock().take();
+        if let Some(frame) = frame {
+            complete_flip(display, frame.ticket, None);
+        }
+    }
+}
 /// The S3 and runtime suspend shared by amdgpu_device_prepare and
-/// amdgpu_device_suspend; `baco` selects the runtime form.
+/// amdgpu_device_suspend; `baco` selects the runtime form. DRM
+/// presentation is held off (`gate_presenters`) from dm_suspend's commit
+/// on, and runs again if the suspend is refused.
 ///
 /// # Safety
 /// As [`prepare_suspend`].
 async unsafe fn suspend_device(baco: Option<Baco>) -> Result<(), boot::Error> {
+    if SUSPENDED.lock().is_some() || PRESENT_GATED.load(Ordering::Acquire) {
+        return Err(boot::Error::Busy);
+    }
+    gate_presenters(true);
+    // SAFETY: forwarded contract.
+    let result = unsafe { suspend_gated(baco) }.await;
+    if result.is_err() {
+        gate_presenters(false);
+    }
+    result
+}
+/// `suspend_device` with presentation held off.
+///
+/// # Safety
+/// As [`prepare_suspend`].
+async unsafe fn suspend_gated(baco: Option<Baco>) -> Result<(), boot::Error> {
     if SUSPENDED.lock().is_some() {
         return Err(boot::Error::Busy);
     }
     let card = boot::ColdBoot::drm_card().ok_or(boot::Error::Invalid)?;
     // dm_suspend's commit before amdgpu_device_evict_resources: no plane
     // keeps scanning out a client framebuffer, so cleanup_fb unpins them
-    // and the eviction moves them too. One a display cannot let go of
-    // stays pinned, and evict_all passes it by (as TTM's LRU walk does).
+    // and the eviction moves them too. A display that cannot let go fails
+    // the suspend, as dm_suspend's failed commit fails amdgpu_device_suspend.
     {
         let mut owner = OWNER.lock().await;
         if let Some(boot) = owner.as_mut() {
             // SAFETY: OWNER is held; the caller's suspend obligations.
-            let _ = unsafe { release_client_scanout(boot) }.await;
+            if !unsafe { release_client_scanout(boot) }.await {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: navi48 suspend refused: a display still scans out a client framebuffer"
+                );
+                return Err(boot::Error::Busy);
+            }
         }
     }
     // No new VRAM placement while the old ones leave.
@@ -691,6 +737,9 @@ async unsafe fn resume_device(runtime: bool) -> Result<boot::Report, boot::Error
     let result = unsafe { restart(&mut owner, suspended.quiesced) }.await;
     drop(owner);
     crate::amdgpu_gem::restore_domains(suspended.domains);
+    // Userspace thaws: DRM frames present again (or complete, on a lost
+    // device).
+    gate_presenters(false);
     use core::fmt::Write as _;
     let _ = writeln!(
         narf_console::Writer,
@@ -4167,6 +4216,12 @@ pub fn present_planes(
     overlays: [Option<PlaneFrame>; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
     ticket: Option<u64>,
 ) -> bool {
+    // Held off for a suspend: the frame completes unshown, and is not
+    // CPU-copied either.
+    if PRESENT_GATED.load(Ordering::Acquire) {
+        complete_flip(display, ticket, None);
+        return true;
+    }
     let fits = |f: &PlaneFrame| {
         let bytes = SurfaceFormat::from_fourcc(f.format).map_or(0, SurfaceFormat::bytes_per_pixel);
         f.width != 0 && f.height != 0 && u64::from(f.pitch) >= u64::from(f.width) * u64::from(bytes)
@@ -4272,6 +4327,12 @@ async fn presenter(display: u8) {
         wait_scanout_writes(&frame).await;
         let result = {
             let mut owner = OWNER.lock().await;
+            // Held off for a suspend (`gate_presenters`) since it was
+            // queued: dropped with its commit, its event completing.
+            if PRESENT_GATED.load(Ordering::Acquire) {
+                complete_flip(display, frame.ticket, None);
+                continue;
+            }
             // A relight in another format since the frame was queued.
             if frame
                 .primary

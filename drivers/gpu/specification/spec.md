@@ -4746,7 +4746,9 @@ each presenter flip, `flip_display`, and every display-monitor pass).
 `release_client_scanout` is dm_suspend's (and the lastclose restore's)
 commit: every plane still fetching a client framebuffer flips back to its
 back buffer and the pins retire, before system suspend evicts VRAM and
-after the last card close. A cursor plane's GEM framebuffer is pinned in
+after the last card close (a release that fails there keeps the pins until
+a later pass retires them: drm_fb_helper_lastclose ignores its restore
+commit's error). A cursor plane's GEM framebuffer is pinned in
 VRAM and copied for the hardware cursor (`GemPlacement::read_bytes`), as
 dumb ones are. Dumb buffers are such GEM buffers in VRAM (below) and take
 this path; only one of the card's own system-memory dumb buffers, made
@@ -7410,7 +7412,15 @@ System suspend (S3) uses the async system-PM phase
 `prepare_suspend` follows amdgpu_pmops_suspend for a dGPU: every plane
 still scanning a client framebuffer out in place flips back to its staged
 back buffer and the pins retire (`release_client_scanout`, as dm_suspend's
-commit makes cleanup_fb unpin them), then it unregisters
+commit makes cleanup_fb unpin them; a display that cannot let go fails the
+suspend with `Busy`, as dm_suspend's failed commit fails
+amdgpu_device_suspend). DRM presentation is held off from that commit
+until resume or a refused suspend (`gate_presenters`, standing in for
+Linux's frozen userspace): every queued frame (`PresentSlot::next`)
+completes unshown, a frame arriving meanwhile completes at once without a
+CPU copy, and a presenter that waited for the owner drops its frame, so no
+plane takes a client framebuffer's pin back before the eviction and
+quiesce. Then it unregisters
 the client VRAM heap and evicts every client VRAM buffer to system memory
 (`amdgpu_gem::evict_all`, as ttm_resource_manager_evict_all, widening each
 buffer's allowed domains with GTT for the move and waiting for its jobs;
