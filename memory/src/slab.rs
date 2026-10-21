@@ -1467,6 +1467,51 @@ fn slab_shrink(target_pages: usize) -> usize {
     freed
 }
 
+/// Per-CPU guard against re-entering direct reclaim. `slab_shrink`'s
+/// `free_frame` can re-enter the allocator (the cgroup charge hook allocates),
+/// and if THAT allocation also fails it would call back here on the same CPU;
+/// without the guard a failing cgroup-charge allocation mid-reclaim would
+/// recurse indefinitely. Cross-CPU reclaim stays allowed (desirable under load).
+static DIRECT_RECLAIM_ACTIVE: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// Direct reclaim for the frame allocator's failure path: return up to
+/// `target_pages` fully-empty slab frames to the buddy, then let the caller
+/// retry. Returns the number of frames actually freed.
+///
+/// Why this exists: the slab grows one size-class at a time and parks emptied
+/// frames in that class's own central free list — it does NOT hand them back
+/// to the buddy until a shrinker runs. A churny workload (a fork storm's
+/// COW/rmap/page-table allocations are ~1–4 KiB) can therefore sequester most
+/// of RAM inside one or two size classes, so a later buddy allocation (a page
+/// table, a kernel stack, a different-size kmalloc) fails even though the
+/// memory is free — just trapped in the slab. Measured: a 4-worker 3 s fork
+/// storm left ~440 MB parked in near-empty kmalloc-1024/2048/4096 classes that
+/// never returned to the buddy, and sustained pressure then panicked an
+/// infallible allocation. This mirrors Linux shrinking slab caches in direct
+/// reclaim before an allocation is allowed to fail.
+///
+/// Slab-only on purpose: it touches only slab class locks and the buddy, never
+/// the anon/address-space shrinkers, so it is safe to call from ANY allocation
+/// failure — including a page fault that already holds the region lock, and an
+/// IRQ-masked slab-grow (where `direct_compact` refuses to run).
+pub fn reclaim_empty_frames_to_buddy(target_pages: usize) -> usize {
+    if target_pages == 0 {
+        return 0;
+    }
+    // Mask IRQs so `current_cpu()` and the guard flag refer to the same CPU for
+    // the whole call (we may already be inside a `without_interrupts` grow; the
+    // nesting composes).
+    narf_lib::sync::without_interrupts(|| {
+        let cpu = current_cpu().min(MAX_CPUS - 1);
+        if DIRECT_RECLAIM_ACTIVE[cpu].swap(true, Ordering::AcqRel) {
+            return 0;
+        }
+        let freed = slab_shrink(target_pages);
+        DIRECT_RECLAIM_ACTIVE[cpu].store(false, Ordering::Release);
+        freed
+    })
+}
+
 /// Detach up to `max_pages` fully-free frames of class `c` into `frames`.
 /// The class lock is released before returning; no buddy/cgroup operation is
 /// performed while it is held. Returns a base-page count.

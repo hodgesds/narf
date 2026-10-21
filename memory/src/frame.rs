@@ -1486,6 +1486,13 @@ fn alloc_frame_on_inner(node: usize) -> Result<PhysFrame, FrameAllocError> {
     alloc_frame_on_inner_ctx(node, AllocContext::Kernel)
 }
 
+/// How many empty slab frames to reclaim back to the buddy when a frame
+/// allocation fails, before retrying. One frame would unstick the immediate
+/// allocation, but reclaiming a small batch amortises the (rare, failure-path)
+/// shrink across the next allocations and gives the buddy contiguous runs to
+/// coalesce for higher-order retries.
+const SLAB_DIRECT_RECLAIM_PAGES: usize = 512;
+
 /// Reserve-aware core of `alloc_frame` / `alloc_frame_on`. `User` allocations
 /// are refused (and the reclaimer woken) once they would breach the `min`
 /// watermark reserve; `Kernel` allocations may consume it.
@@ -1501,7 +1508,22 @@ fn alloc_frame_on_inner_ctx(node: usize, ctx: AllocContext) -> Result<PhysFrame,
     if !crate::cgroup_charge::try_charge(PAGE_SIZE) {
         return Err(FrameAllocError::Exhausted);
     }
-    let r = with_installed(|a| a.alloc_frame_on(node));
+    let mut r = with_installed(|a| a.alloc_frame_on(node));
+    if r.is_err() {
+        // The slab grows one size-class at a time and parks emptied frames in
+        // that class's own central free list instead of returning them to the
+        // buddy. A churny workload (e.g. a fork storm's COW/rmap/page-table
+        // allocations) can sequester most of RAM in one class, so this buddy
+        // allocation fails although the memory is free — just trapped in the
+        // slab. Pull empty slab frames back to the buddy and retry once before
+        // surfacing the failure. Slab-only (never the anon/address-space
+        // shrinkers), so it is safe from any context, including a page fault
+        // holding the region lock or an IRQ-masked slab-grow. Linux does the
+        // analogous direct reclaim of slab caches before failing an allocation.
+        if crate::slab::reclaim_empty_frames_to_buddy(SLAB_DIRECT_RECLAIM_PAGES) > 0 {
+            r = with_installed(|a| a.alloc_frame_on(node));
+        }
+    }
     #[cfg(feature = "cgroup")]
     if r.is_err() {
         // Allocation failed after charging — refund so accounting stays
@@ -1627,6 +1649,20 @@ pub fn alloc_pages_on_ctx(
         return Err(FrameAllocError::Exhausted);
     }
     let r = alloc_pages_on_inner(node, order, ctx.migrate_type());
+    // Return empty slab frames to the buddy before trying anything more
+    // expensive: the slab hoards emptied frames per size-class rather than
+    // freeing them to the buddy (see `slab::reclaim_empty_frames_to_buddy`), so
+    // a higher-order allocation can fail on a system that is mostly free. Unlike
+    // `direct_compact` below, this is safe under an IRQ mask, so it also unsticks
+    // the IRQ-masked slab-grow path. The freed frames additionally give
+    // compaction more room to coalesce.
+    let r = if r.is_err()
+        && crate::slab::reclaim_empty_frames_to_buddy(SLAB_DIRECT_RECLAIM_PAGES) > 0
+    {
+        alloc_pages_on_inner(node, order, ctx.migrate_type())
+    } else {
+        r
+    };
     // Direct compaction: a higher-order allocation that ran out of contiguous
     // blocks may succeed after migrating movable pages together. Compact this
     // node once and retry before giving up. `direct_compact` itself rejects
