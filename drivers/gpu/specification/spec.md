@@ -5237,7 +5237,10 @@ watermark, pipe or link change: `modeset_display`, `modeset_display_mode`,
 (after its validation, before the shared clocks rise and the other
 displays' plans move) and `update_live_display_planes`, and the teardowns
 `stop_modeset`, `unplug_modeset`, `abort_modeset_activation` and
-`remove_display_mst_payload`. A teardown pins best-effort
+`remove_display_mst_payload`. `retrain_modeset` pins although Linux's
+link-loss retraining (dp_handle_link_loss: dpms off, then on, on the
+running state) takes no prepare_bandwidth, a conservative extra; on a
+pinned or fresh owner that pin sends nothing. A teardown pins best-effort
 (`pin_display_uclk_for_teardown`): Linux's prepare_bandwidth is void, so a
 pin that fails (a failed clock owner) is logged and the stream is still
 disabled; every other entry point returns the failure before any change.
