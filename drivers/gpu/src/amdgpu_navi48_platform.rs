@@ -5595,7 +5595,7 @@ pub fn display_admits_planes(
     fourcc: u32,
     setup: &boot::PlaneSetup,
 ) -> Result<(), PlanesRefused> {
-    if *setup == boot::PlaneSetup::NONE {
+    if setup.is_full_frame() {
         return display_admits_format(display, connector, mode, fourcc)
             .then_some(())
             .ok_or(PlanesRefused::Bandwidth);
@@ -6340,7 +6340,7 @@ pub async unsafe fn monitor_displays(
             }
             Err(e)
                 if wants.iter().any(|w| {
-                    w.1.is_some() || w.2 != SurfaceFormat::Xrgb8888 || w.3 != boot::PlaneSetup::NONE
+                    w.1.is_some() || w.2 != SurfaceFormat::Xrgb8888 || !w.3.is_full_frame()
                 }) && !pending_display_work(boot) =>
             {
                 // A requested mode, plane format or plane configuration did
@@ -8125,10 +8125,12 @@ mod tests {
             let one = boot::PlaneSetup {
                 primary: None,
                 overlays: [Some(video), None, None],
+                ..boot::PlaneSetup::NONE
             };
             let three = boot::PlaneSetup {
                 primary: Some(geometry(1280, 720, Rect::new(0, 0, 1920, 1080))),
                 overlays: [Some(video); 3],
+                ..boot::PlaneSetup::NONE
             };
             if !request_display_planes(1, one)
                 || requested_display_planes(1) != one

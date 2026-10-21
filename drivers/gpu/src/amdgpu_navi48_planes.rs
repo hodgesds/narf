@@ -76,16 +76,30 @@ impl otg::PlaneContent for BySlot<'_> {
 
 /// should_reset_plane over a running display's planes going from `old`
 /// (primary in `old_format`) to `new`: amdgpu_dm removes and adds again
-/// every plane of the CRTC when any is added or removed, or changes its
-/// source or destination size, rotation, blending or alpha, color range or
-/// encoding, format, tiling or DCC (modifier) or zpos; planes only moved
-/// keep their pipes as they are.
+/// every plane of the CRTC when any (cursor aside) is added or removed, or
+/// changes its source or destination size (not position), rotation,
+/// "pixel blend mode", "alpha", COLOR_RANGE or COLOR_ENCODING, or its
+/// framebuffer's format or modifier; a plane whose normalized zpos changes
+/// is recreated too. Planes only moved keep their pipes as they are.
+///
+/// Both setups from DRM commits (`PlaneSetup::drm`) are compared exactly
+/// as Linux compares the DRM plane states. A setup not from DRM (the
+/// console's, a legacy SETCRTC's) has no plane states; it is compared by
+/// what DC is given instead.
 pub fn planes_reset(
     old_format: otg::SurfaceFormat,
     old: &PlaneSetup,
     new_format: otg::SurfaceFormat,
     new: &PlaneSetup,
 ) -> bool {
+    let states = |s: &PlaneSetup| {
+        let n = 1 + s.overlay_count();
+        let states: Vec<DrmPlaneState> = s.drm.iter().flatten().copied().collect();
+        (states.len() == n).then_some(states)
+    };
+    if let (Some(old), Some(new)) = (states(old), states(new)) {
+        return drm_planes_reset(&old, &new);
+    }
     let size = |g: &PlaneGeometry| {
         (
             g.width,
@@ -150,6 +164,28 @@ pub(super) fn moved_planes(
         }
     }
     moved
+}
+
+/// should_reset_plane's checks over one CRTC's non-cursor DRM planes.
+fn drm_planes_reset(old: &[DrmPlaneState], new: &[DrmPlaneState]) -> bool {
+    let find = |set: &[DrmPlaneState], id: u32| set.iter().find(|p| p.plane == id).copied();
+    // `old_other_state->crtc != new_other_state->crtc`: added or removed.
+    if old.iter().any(|o| find(new, o.plane).is_none())
+        || new.iter().any(|n| find(old, n.plane).is_none())
+    {
+        return true;
+    }
+    old.iter().any(|o| {
+        let n = find(new, o.plane).unwrap_or(*o);
+        o.normalized_zpos != n.normalized_zpos
+            || (o.src_w, o.src_h, o.crtc_w, o.crtc_h) != (n.src_w, n.src_h, n.crtc_w, n.crtc_h)
+            || o.rotation != n.rotation
+            || o.blend != n.blend
+            || o.alpha != n.alpha
+            || (o.color_range, o.color_encoding) != (n.color_range, n.color_encoding)
+            || o.fourcc != n.fourcc
+            || o.modifier != n.modifier
+    })
 }
 
 /// Every pipe of display `m`'s planes with its plane's DPPCLK under `plan`.

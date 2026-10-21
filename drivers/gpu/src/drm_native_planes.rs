@@ -25,7 +25,7 @@
 //! (amdgpu_dm_commit_cursors, a FAST update: nothing relights).
 use crate::amdgpu_dcn401_otg::{Blend, SurfaceFormat, Swizzle, MAX_OVERLAYS};
 use crate::amdgpu_dcn401_spl::{Rect, Rotation};
-use crate::amdgpu_navi48_boot::{OverlayPlane, PlaneGeometry, PlaneSetup};
+use crate::amdgpu_navi48_boot::{DrmPlaneState, OverlayPlane, PlaneGeometry, PlaneSetup};
 use crate::drm::atomic::{AtomicState, PlaneState};
 use crate::drm::card::{Card, NativePlane, PlaneProps};
 use alloc::vec::Vec;
@@ -988,10 +988,37 @@ fn display_planes(
         && g.dst == Rect::new(0, 0, mode.0 as i32, mode.1 as i32)
         && g.rotation == Rotation::R0
         && g.blend == Blend::default_for(format);
+    // What should_reset_plane compares, with each plane's normalized zpos.
+    let drm = |p: &PlaneState| -> Result<DrmPlaneState, FsError> {
+        let fb = card
+            .framebuffer(p.fb_id.ok_or(FsError::InvalidData)?)
+            .map_err(|_| FsError::NotFound)?;
+        let props = p.props.unwrap_or(PlaneProps::new(0));
+        Ok(DrmPlaneState {
+            plane: p.id,
+            src_w: p.src_w,
+            src_h: p.src_h,
+            crtc_w: p.crtc_w,
+            crtc_h: p.crtc_h,
+            rotation: props.rotation,
+            blend: props.blend,
+            alpha: props.alpha,
+            color_range: props.color_range,
+            color_encoding: props.color_encoding,
+            fourcc: fb.format as u32,
+            modifier: fb.modifier,
+            normalized_zpos: order
+                .iter()
+                .position(|q| q.id == p.id)
+                .ok_or(FsError::InvalidData)? as u8,
+        })
+    };
     let mut setup = PlaneSetup {
         primary: (!full).then_some(g),
         overlays: [None; MAX_OVERLAYS],
+        drm: [None; 1 + MAX_OVERLAYS],
     };
+    setup.drm[0] = Some(drm(primary)?);
     let mut ids = [None; MAX_OVERLAYS];
     for (k, p) in order.iter().filter(|p| p.id != primary.id).enumerate() {
         if k >= MAX_OVERLAYS {
@@ -1007,6 +1034,7 @@ fn display_planes(
                 .is_some_and(|i| i < primary_at),
             plane: p.id,
         });
+        setup.drm[k + 1] = Some(drm(p)?);
         ids[k] = Some(p.id);
     }
     Ok(DisplayPlanes {

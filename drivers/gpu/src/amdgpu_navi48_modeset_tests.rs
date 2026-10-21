@@ -3001,6 +3001,7 @@ fn navi48_planes_reach_admission_and_staging() -> TestResult {
                 base.format,
             )),
             overlays: [Some(video), None, None],
+            ..PlaneSetup::NONE
         },
         ..base
     };
@@ -4311,6 +4312,95 @@ fn navi48_live_plane_pipes_follow_dc() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_live_plane_pipes_follow_dc
+);
+
+/// `planes_reset` on DRM commits is amdgpu_dm's should_reset_plane: sizes
+/// (not positions), rotation, blend mode, alpha, color range/encoding,
+/// format, modifier, normalized zpos, a plane added or removed. What DC is
+/// given instead (a framebuffer's size, the 8-bit global alpha) does not
+/// decide it.
+fn navi48_planes_reset_is_should_reset_plane() -> TestResult {
+    let format = otg::SurfaceFormat::Xrgb8888;
+    let state = |plane: u32, zpos: u8| DrmPlaneState {
+        plane,
+        src_w: 640,
+        src_h: 360,
+        crtc_w: 640,
+        crtc_h: 360,
+        rotation: 1,
+        blend: 0,
+        alpha: 0xffff,
+        color_range: 0,
+        color_encoding: 1,
+        fourcc: 0x3432_5241,
+        modifier: 0,
+        normalized_zpos: zpos,
+    };
+    let setup = |overlay: OverlayPlane, primary: DrmPlaneState, o: DrmPlaneState| {
+        let mut s = live_setup(&[overlay]);
+        s.drm = [Some(primary), Some(o), None, None];
+        s
+    };
+    let a = live_overlay(0x44, 100);
+    let base = setup(a, state(0x30, 0), state(0x44, 1));
+    let changed = |f: fn(&mut DrmPlaneState)| {
+        let mut o = state(0x44, 1);
+        f(&mut o);
+        planes_reset_check(format, &base, &setup(a, state(0x30, 0), o))
+    };
+    // Moved, a larger framebuffer, an alpha DC sees as the same 8 bits.
+    let mut moved = live_overlay(0x44, 300);
+    moved.geometry.fb_size = (1280, 720);
+    let mut near = state(0x44, 1);
+    near.alpha = 0xfffe;
+    let mut nearer = state(0x44, 1);
+    nearer.alpha = 0xff00;
+    if planes_reset_check(format, &base, &setup(moved, state(0x30, 0), state(0x44, 1)))
+        || !planes_reset_check(
+            format,
+            &setup(a, state(0x30, 0), near),
+            &setup(a, state(0x30, 0), nearer),
+        )
+    {
+        return TestResult::Fail("position, fb size or 16-bit alpha");
+    }
+    let resets: [fn(&mut DrmPlaneState); 10] = [
+        |o| o.src_w = 320,
+        |o| o.crtc_h = 720,
+        |o| o.rotation = 4,
+        |o| o.blend = 2,
+        |o| o.alpha = 0x8000,
+        |o| o.color_range = 1,
+        |o| o.color_encoding = 0,
+        |o| o.fourcc = 0x3432_5258,
+        |o| o.modifier = 1,
+        |o| o.normalized_zpos = 0,
+    ];
+    if resets.iter().any(|&f| !changed(f)) {
+        return TestResult::Fail("a should_reset_plane change not reset");
+    }
+    // Another plane in its place, or one more.
+    let b = live_overlay(0x45, 100);
+    let mut two = live_setup(&[a, b]);
+    two.drm = [
+        Some(state(0x30, 0)),
+        Some(state(0x44, 1)),
+        Some(state(0x45, 2)),
+        None,
+    ];
+    if !planes_reset_check(format, &base, &setup(b, state(0x30, 0), state(0x45, 1)))
+        || !planes_reset_check(format, &base, &two)
+    {
+        return TestResult::Fail("plane added or removed");
+    }
+    TestResult::Pass
+}
+fn planes_reset_check(format: otg::SurfaceFormat, old: &PlaneSetup, new: &PlaneSetup) -> bool {
+    super::planes::planes_reset(format, old, format, new)
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_planes_reset_is_should_reset_plane
 );
 
 /// `live_pipes` beside a split primary and other displays: a primary

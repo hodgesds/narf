@@ -172,6 +172,28 @@ pub struct OverlayPlane {
     pub plane: u32,
 }
 
+/// One non-cursor plane's committed DRM state as amdgpu_dm's
+/// should_reset_plane compares it: the source and destination sizes (not
+/// positions), rotation, "pixel blend mode", "alpha", COLOR_RANGE and
+/// COLOR_ENCODING, the framebuffer's format and modifier, and the
+/// normalized zpos (drm_atomic_normalize_zpos).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DrmPlaneState {
+    pub plane: u32,
+    pub src_w: u32,
+    pub src_h: u32,
+    pub crtc_w: u32,
+    pub crtc_h: u32,
+    pub rotation: u8,
+    pub blend: u8,
+    pub alpha: u16,
+    pub color_range: u8,
+    pub color_encoding: u8,
+    pub fourcc: u32,
+    pub modifier: u64,
+    pub normalized_zpos: u8,
+}
+
 /// A display's planes: the primary's placement (None: the whole
 /// framebuffer unscaled at the mode's size, blended as its format's
 /// default) and up to three overlays, bottom first, each on a free pipe.
@@ -179,15 +201,25 @@ pub struct OverlayPlane {
 pub struct PlaneSetup {
     pub primary: Option<PlaneGeometry>,
     pub overlays: [Option<OverlayPlane>; otg::MAX_OVERLAYS],
+    /// The DRM plane states the setup was built from (the primary, then
+    /// the overlays in the same order); all `None` for a setup not from a
+    /// DRM commit (the console's, a legacy SETCRTC's).
+    pub drm: [Option<DrmPlaneState>; 1 + otg::MAX_OVERLAYS],
 }
 impl PlaneSetup {
     /// The full-frame unscaled primary alone.
     pub const NONE: Self = Self {
         primary: None,
         overlays: [None; otg::MAX_OVERLAYS],
+        drm: [None; 1 + otg::MAX_OVERLAYS],
     };
     pub fn overlay_count(&self) -> usize {
         self.overlays.iter().flatten().count()
+    }
+    /// The full-frame unscaled primary alone, whatever DRM plane states
+    /// the setup records.
+    pub fn is_full_frame(&self) -> bool {
+        self.primary.is_none() && self.overlay_count() == 0
     }
 }
 

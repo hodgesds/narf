@@ -515,9 +515,14 @@ stream's head and further pipes (`DisplayPipes`) back from it:
   `None` (a relight) when that would move a running stream's pipes.
 - `live_pipes(current, stream, reset)`: a running display's planes changed
   (`update_display_planes`): with `planes::planes_reset`
-  (should_reset_plane: any plane added or removed, or a size, rotation,
-  blending, alpha, color, format, tiling/DCC or zpos change; a plane only
-  moved keeps its pipes) every plane of the stream removed and added again
+  (should_reset_plane: any non-cursor plane added or removed, or a change
+  of its source/destination size (not position), rotation, pixel blend
+  mode, 16-bit alpha, COLOR_RANGE/COLOR_ENCODING, framebuffer format or
+  modifier, or normalized zpos; a plane only moved keeps its pipes;
+  compared on the DRM plane states `PlaneSetup::drm` (`DrmPlaneState`)
+  that `drm_native_planes` records, or for a setup not from DRM on what DC
+  is given; `PlaneSetup::is_full_frame` is the full-frame primary alone
+  whatever states it records) every plane of the stream removed and added again
   in DC plane order, then the counts; a recreated overlay takes the first
   free pipe of its OPP head's current blending tree, so it comes back to
   its pipe wherever it moved in the stack and a new plane takes a removed
