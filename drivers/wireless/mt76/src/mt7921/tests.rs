@@ -1,13 +1,10 @@
 //! MT7921 smoke tests — co-located per project convention.
 //!
-//! All smokes are pure-data: PCI match table presence, register
+//! Most smokes are pure-data: PCI match table presence, register
 //! constant sanity, L1 remap arithmetic, firmware-blob resolution.
-//! None of them touch live silicon, so they Pass on QEMU.
-//!
-//! A "real-silicon" smoke (probe-bound device + live chip-id read)
-//! is included so a future bare-metal test run lights up without
-//! changing the test list; it Skips cleanly on QEMU since no MT7921
-//! PCIe model is emulated.
+//! They Pass on QEMU. The live-silicon smokes at the bottom instead
+//! validate the bound device through retained firmware/radio state;
+//! QEMU skips them because it has no MT7921 PCIe model.
 
 #![cfg(target_arch = "x86_64")]
 
@@ -75,8 +72,8 @@ fn smoke_mt7921_name_for_known_ids() -> TestResult {
     if name_for(MTK_DEV_MT7921) != "mt7921-0608" {
         return TestResult::Fail("MT7921 (0608) name mismatch");
     }
-    if name_for(MTK_DEV_MT7921_ALT) != "mt7921-0616" {
-        return TestResult::Fail("MT7921 (0616) name mismatch");
+    if name_for(MTK_DEV_MT7921_ALT) != "mt7922-0616" {
+        return TestResult::Fail("MT7922 PCI alias (0616) name mismatch");
     }
     if name_for(MTK_DEV_MT7920) != "mt7921-7920" {
         return TestResult::Fail("MT7920 name mismatch");
@@ -472,16 +469,103 @@ fn smoke_mt7921_probe_bound_or_skip() -> TestResult {
     if !super::pci::is_probed() {
         return TestResult::Skip("mt7921: no MT7921/MT7922 bound (expected on QEMU)");
     }
-    let chip = match super::pci::with_controller(|d| d.chip_id) {
-        Some(c) => c,
-        None => return TestResult::Skip("mt7921: probed flag set but no controller borrowable"),
-    };
-    if chip == 0 || chip == 0xFFFF_FFFF {
-        return TestResult::Fail("mt7921: bound device reports sentinel chip-id");
+
+    // Before Stage::Late claims the device, the discovery record contains the
+    // raw ID.  Once firmware owns the BAR, `with_controller` deliberately
+    // returns None; that handoff is expected on real hardware, not a reason
+    // to skip the physical probe result.
+    if let Some(chip) = super::pci::with_controller(|d| d.chip_id) {
+        if chip == 0 || chip == 0xFFFF_FFFF {
+            return TestResult::Fail("mt7921: bound device reports sentinel chip-id");
+        }
+        return TestResult::Pass;
     }
-    TestResult::Pass
+
+    match super::firmware_transport::boot_status() {
+        super::firmware_transport::BootStatus::Retained(_) => TestResult::Pass,
+        super::firmware_transport::BootStatus::Absent => {
+            TestResult::Fail("mt7921: PCI device bound but firmware owner absent")
+        }
+        super::firmware_transport::BootStatus::Running => {
+            TestResult::Fail("mt7921: firmware startup still running after init")
+        }
+    }
 }
 kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_probe_bound_or_skip);
+
+/// A physical PCI bind alone proves only BAR ownership.  At the end of the
+/// normal boot-init sequence, firmware must also have supplied a usable
+/// unicast MAC and a registered scan-only wiphy/netdev.  Keep this as a
+/// separate smoke so a failed firmware stage is reported distinctly from a
+/// failed PCI probe.
+fn smoke_mt7921_firmware_radio_ready_or_skip() -> TestResult {
+    use super::firmware_transport::{boot_status, BootStatus, State};
+
+    if !super::pci::is_probed() {
+        return TestResult::Skip("mt7921: no MT7921/MT7922 bound (expected on QEMU)");
+    }
+
+    let info = match boot_status() {
+        BootStatus::Retained(State::RadioReady(info))
+        | BootStatus::Retained(State::ScanReady(info))
+        | BootStatus::Retained(State::Associated { info, .. }) => info,
+        BootStatus::Absent => {
+            return TestResult::Fail("mt7921: PCI device bound but firmware owner absent");
+        }
+        BootStatus::Running => {
+            return TestResult::Fail("mt7921: firmware startup still running after init");
+        }
+        BootStatus::Retained(State::Prepared) => {
+            return TestResult::Fail("mt7921: firmware transport never started");
+        }
+        BootStatus::Retained(State::Running(_)) => {
+            return TestResult::Fail("mt7921: firmware startup did not complete");
+        }
+        BootStatus::Retained(State::Ready(_)) => {
+            return TestResult::Fail(
+                "mt7921: firmware booted but radio initialization did not complete",
+            );
+        }
+        BootStatus::Retained(State::Failed { .. }) => {
+            return TestResult::Fail("mt7921: firmware or radio initialization failed");
+        }
+        BootStatus::Retained(State::Stopped) => {
+            return TestResult::Fail("mt7921: firmware transport stopped during initialization");
+        }
+    };
+
+    let mac = info.capabilities.mac;
+    if mac == [0; 6] || mac[0] & 1 != 0 {
+        return TestResult::Fail("mt7921: firmware returned an invalid radio MAC");
+    }
+    if info.capabilities.phy.bands & 1 == 0 {
+        return TestResult::Fail("mt7921: radio does not advertise required 2.4 GHz support");
+    }
+
+    let Some(iface) = narf_wireless::registry::list()
+        .into_iter()
+        .find(|iface| iface.mac() == mac)
+    else {
+        return TestResult::Fail(
+            "mt7921: radio-ready firmware did not register a wireless interface",
+        );
+    };
+    if !iface.name().starts_with("wlan") {
+        return TestResult::Fail("mt7921: registered wireless interface has an invalid name");
+    }
+    let iface_info = iface.get_wireless_info();
+    if iface_info.base_name != iface.name() || iface_info.base_mac != mac {
+        return TestResult::Fail(
+            "mt7921: registered wireless interface identity disagrees with firmware",
+        );
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921",
+    smoke_mt7921_firmware_radio_ready_or_skip
+);
 
 // ── Stage-4: DMA ring scaffolding ──────────────────────────────────
 

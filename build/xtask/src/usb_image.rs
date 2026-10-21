@@ -87,6 +87,29 @@ pub(crate) struct UsbImageArgs {
 /// Kernel argument restricting writes and automatic mounts to the stick.
 pub(crate) const BOOT_ONLY_ARG: &str = "narf.disks=boot-only";
 
+/// The consoles media for a real machine registers: the serial line and the
+/// VT, with the VT last so `/dev/console` (systemd's status output, init's
+/// fds 0-2) is the screen. Linux distributions boot with the same pair; the
+/// serial console still gets the kernel log and a `serial-getty@ttyS0`.
+/// Without `console=` NARF prefers `ttyS0`, which suits a headless VM.
+pub(crate) const DISPLAY_CONSOLE_ARGS: &str = "console=ttyS0 console=tty0";
+
+/// `cmdline` with [`DISPLAY_CONSOLE_ARGS`] appended unless it already names
+/// a console.
+pub(crate) fn with_display_console(cmdline: String) -> String {
+    if cmdline
+        .split_whitespace()
+        .any(|a| a.starts_with("console="))
+    {
+        return cmdline;
+    }
+    if cmdline.is_empty() {
+        DISPLAY_CONSOLE_ARGS.to_string()
+    } else {
+        format!("{cmdline} {DISPLAY_CONSOLE_ARGS}")
+    }
+}
+
 fn random_token() -> Result<String> {
     let mut bytes = [0u8; 8];
     std::fs::File::open("/dev/urandom")
@@ -260,7 +283,7 @@ pub(crate) fn usb_image_cmd(args: &UsbImageArgs) -> Result<()> {
         cmdline.push(' ');
         cmdline.push_str(extra);
     }
-    let cmdline = cmdline.trim().to_string();
+    let cmdline = with_display_console(cmdline.trim().to_string());
     let tmp = root.join("target").join("usb-image-staging");
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;

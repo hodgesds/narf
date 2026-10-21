@@ -129,16 +129,45 @@ pub trait VramTransfer: Send + Sync + core::fmt::Debug {
     }
 }
 
+/// Each card's engine for moves that must not be CPU copies (a GFX12 DCC
+/// buffer's, `moves_by_engine`), by card index. Unlike the heap it stays
+/// registered while suspend's evict_all runs with the heap withdrawn.
+static TRANSFERS: IrqSafeSpinLock<Vec<(u32, Arc<dyn VramTransfer>)>> =
+    IrqSafeSpinLock::new(Vec::new());
+
+/// Let DRM card `card` move buffers through `transfer` (None: no engine)
+/// when its heap has no transfer past the BAR, or while the heap is
+/// withdrawn.
+pub fn register_vram_transfer(card: u32, transfer: Option<Arc<dyn VramTransfer>>) {
+    let mut table = TRANSFERS.lock();
+    table.retain(|(c, _)| *c != card);
+    if let Some(transfer) = transfer {
+        table.push((card, transfer));
+    }
+}
+
+/// Card `card`'s transfer engine: its heap's past the BAR, else the one
+/// `register_vram_transfer` gave it.
+fn vram_transfer(card: u32) -> Option<Arc<dyn VramTransfer>> {
+    vram_heap(card)
+        .and_then(|heap| heap.unmapped)
+        .and_then(|heap| heap.transfer)
+        .or_else(|| {
+            TRANSFERS
+                .lock()
+                .iter()
+                .find(|(c, _)| *c == card)
+                .map(|(_, t)| t.clone())
+        })
+}
+
 pub(crate) async fn readback(
     gate: &PlacementGuard,
     object: &Arc<GemObject>,
     source: &Arc<GemPlacement>,
     destination: &mut GemPlacement,
 ) -> Result<(), FsError> {
-    let reader = vram_heap(gate.card())
-        .and_then(|heap| heap.unmapped)
-        .and_then(|heap| heap.transfer)
-        .ok_or(FsError::Unsupported)?;
+    let reader = vram_transfer(gate.card()).ok_or(FsError::Unsupported)?;
     reader
         .read(object.clone(), source.clone(), destination)
         .await
@@ -150,10 +179,7 @@ pub(crate) async fn upload(
     source: &Arc<GemPlacement>,
     destination: &Arc<GemPlacement>,
 ) -> Result<(), FsError> {
-    let writer = vram_heap(gate.card())
-        .and_then(|heap| heap.unmapped)
-        .and_then(|heap| heap.transfer)
-        .ok_or(FsError::Unsupported)?;
+    let writer = vram_transfer(gate.card()).ok_or(FsError::Unsupported)?;
     writer
         .write(object.clone(), source.clone(), destination.clone())
         .await
@@ -164,7 +190,7 @@ pub(crate) fn hidden_destination(card: u32, object: &GemObject) -> Result<GemPla
         return Err(FsError::Unsupported);
     }
     let heap = vram_heap(card).ok_or(FsError::NoDevice)?;
-    let hidden = heap.unmapped.ok_or(FsError::Unsupported)?;
+    let hidden = heap.unmapped.clone().ok_or(FsError::Unsupported)?;
     if hidden.transfer.is_none() {
         return Err(FsError::Unsupported);
     }
@@ -173,10 +199,15 @@ pub(crate) fn hidden_destination(card: u32, object: &GemObject) -> Result<GemPla
         .max(PAGE_SIZE)
         .checked_next_power_of_two()
         .ok_or(FsError::InvalidData)?;
-    let held = hidden
-        .pool
-        .reserve_aligned(object.byte_len, align)
-        .map_err(|_| FsError::NoSpace)?;
+    let held = reserve_hidden(
+        &heap,
+        &hidden,
+        object.card,
+        object.flags,
+        object.byte_len,
+        align,
+    )
+    .map_err(|_| FsError::NoSpace)?;
     let gpu = held
         .address()
         .checked_sub(heap.fb_base)
@@ -252,6 +283,154 @@ fn vram_heap(card: u32) -> Option<VramHeap> {
         .iter()
         .find(|(c, _)| *c == card)
         .map(|(_, h)| h.clone())
+}
+
+/// The GFX12 cards (whose GFX12_DCC buffers are compressed in VRAM) and
+/// each one's DCC VRAM alignment (`amdgpu_gmc_get_dcc_alignment`, maybe
+/// 0), by card index. Any other card treats the flag as Linux's
+/// pre-GFX12 parts do: no DCC placement, plain copies. Kept across heap
+/// withdrawal (suspend), so evict_all still knows what it moves.
+static DCC_ALIGNMENT: IrqSafeSpinLock<Vec<(u32, u64)>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Make DRM card `card` a GFX12 card whose GFX12_DCC buffers take VRAM
+/// alignment `alignment` ([`gmc_v12_dcc_alignment`]; None: not GFX12).
+/// Set before its heap is registered, so every DCC placement honours it.
+pub fn set_gfx12_dcc(card: u32, alignment: Option<u64>) {
+    let mut table = DCC_ALIGNMENT.lock();
+    table.retain(|(c, _)| *c != card);
+    if let Some(alignment) = alignment {
+        table.push((card, alignment));
+    }
+}
+
+/// Whether `object` is a GFX12_DCC buffer of a GFX12 card: VRAM holds it
+/// compressed, so moving it in or out of VRAM is a decompressing read or a
+/// compressing write of its engine (amdgpu_ttm_copy_mem_to_mem's
+/// READ_DECOMPRESSED / WRITE_COMPRESSED), never a CPU copy of its bytes.
+pub(crate) fn moves_by_engine(object: &GemObject) -> bool {
+    object.flags & u64::from(uapi::AMDGPU_GEM_CREATE_GFX12_DCC) != 0
+        && object
+            .card
+            .is_some_and(|card| DCC_ALIGNMENT.lock().iter().any(|(c, _)| *c == card))
+}
+
+/// amdgpu_ttm_copy_mem_to_mem's copy flags for one move of `object`: from
+/// VRAM (`from_vram`) READ_DECOMPRESSED for a GFX12_DCC buffer; into VRAM
+/// (`to_vram`) WRITE_COMPRESSED with its tiling flags' GFX12 DCC max
+/// compressed block, number type, data format and write-compress disable.
+/// No TMZ (NARF has no TMZ buffers).
+pub(crate) fn ttm_copy_flags(object: &GemObject, from_vram: bool, to_vram: bool) -> u32 {
+    use crate::amdgpu_sdma_navi48 as sdma;
+    if object.flags & u64::from(uapi::AMDGPU_GEM_CREATE_GFX12_DCC) == 0 {
+        return 0;
+    }
+    let mut flags = 0;
+    if from_vram {
+        flags |= sdma::AMDGPU_COPY_FLAGS_READ_DECOMPRESSED;
+    }
+    if to_vram {
+        let tiling = object.tiling_flags();
+        let get = |shift: u32, mask: u32| (tiling >> shift) as u32 & mask;
+        let max_com = get(
+            uapi::AMDGPU_TILING_GFX12_DCC_MAX_COMPRESSED_BLOCK_SHIFT,
+            uapi::AMDGPU_TILING_GFX12_DCC_MAX_COMPRESSED_BLOCK_MASK,
+        );
+        let num_type = get(
+            uapi::AMDGPU_TILING_GFX12_DCC_NUMBER_TYPE_SHIFT,
+            uapi::AMDGPU_TILING_GFX12_DCC_NUMBER_TYPE_MASK,
+        );
+        let data_format = get(
+            uapi::AMDGPU_TILING_GFX12_DCC_DATA_FORMAT_SHIFT,
+            uapi::AMDGPU_TILING_GFX12_DCC_DATA_FORMAT_MASK,
+        );
+        let write_compress_disable = get(
+            uapi::AMDGPU_TILING_GFX12_DCC_WRITE_COMPRESS_DISABLE_SHIFT,
+            uapi::AMDGPU_TILING_GFX12_DCC_WRITE_COMPRESS_DISABLE_MASK,
+        );
+        flags |= sdma::AMDGPU_COPY_FLAGS_WRITE_COMPRESSED
+            | (max_com & sdma::AMDGPU_COPY_FLAGS_MAX_COMPRESSED_MASK)
+                << sdma::AMDGPU_COPY_FLAGS_MAX_COMPRESSED_SHIFT
+            | (num_type & sdma::AMDGPU_COPY_FLAGS_NUMBER_TYPE_MASK)
+                << sdma::AMDGPU_COPY_FLAGS_NUMBER_TYPE_SHIFT
+            | (data_format & sdma::AMDGPU_COPY_FLAGS_DATA_FORMAT_MASK)
+                << sdma::AMDGPU_COPY_FLAGS_DATA_FORMAT_SHIFT
+            | (write_compress_disable & sdma::AMDGPU_COPY_FLAGS_WRITE_COMPRESS_DISABLE_MASK)
+                << sdma::AMDGPU_COPY_FLAGS_WRITE_COMPRESS_DISABLE_SHIFT;
+    }
+    flags
+}
+
+/// `gmc_v12_0_get_dcc_alignment` for GC `gc` with discovery's
+/// `max_texture_channel_caches` (gc_info's gc_num_gl2c / gc_num_tccs):
+/// TCCs / 4 (a power-of-two count) or the count rounded up to a power of
+/// two, times the count, KiB; 0 on any GC but 12.0.0 and 12.0.1. In
+/// unsigned int arithmetic, as Linux computes it.
+pub const fn gmc_v12_dcc_alignment(gc: (u8, u8, u8), max_texture_channel_caches: u32) -> u32 {
+    if !matches!(gc, (12, 0, 0) | (12, 0, 1)) {
+        return 0;
+    }
+    let n = max_texture_channel_caches;
+    let alignment = if n.is_power_of_two() {
+        n / 4
+    } else {
+        match n.checked_next_power_of_two() {
+            Some(a) => a,
+            None => 0,
+        }
+    };
+    alignment.wrapping_mul(n).wrapping_mul(1024)
+}
+
+/// amdgpu_vram_mgr_new's adjust_dcc_size for a buffer of `flags` on card
+/// `card`: the card's DCC alignment for a GFX12_DCC buffer, else 0. NARF
+/// places every VRAM buffer as one reservation, which is the
+/// VRAM_CONTIGUOUS path, so a DCC buffer takes the DCC placement wherever
+/// it lands in VRAM (create, every move back, and so the scanout pin, for
+/// which prepare_fb sets VRAM_CONTIGUOUS).
+fn dcc_adjust(card: Option<u32>, flags: u64) -> u64 {
+    if flags & u64::from(uapi::AMDGPU_GEM_CREATE_GFX12_DCC) == 0 {
+        return 0;
+    }
+    let Some(card) = card else {
+        return 0;
+    };
+    DCC_ALIGNMENT
+        .lock()
+        .iter()
+        .find(|(c, _)| *c == card)
+        .map_or(0, |(_, a)| *a)
+}
+
+/// Reserve `byte_len` bytes of `heap`'s visible VRAM for a buffer of
+/// `flags` on `card`: at `align` (the buffer's power-of-two alignment), or
+/// for a GFX12 DCC buffer as amdgpu_vram_mgr_new places one
+/// (`Pool::reserve_dcc`).
+fn reserve_visible(
+    heap: &VramHeap,
+    card: Option<u32>,
+    flags: u64,
+    byte_len: u64,
+    align: u64,
+) -> Result<crate::amdgpu_vram::Reservation, crate::amdgpu_vram::Error> {
+    match dcc_adjust(card, flags) {
+        0 => heap.pool.reserve_aligned(byte_len, align),
+        dcc => heap.pool.reserve_dcc(byte_len, dcc, heap.fb_base),
+    }
+}
+
+/// [`reserve_visible`] past the BAR.
+fn reserve_hidden(
+    heap: &VramHeap,
+    hidden: &UnmappedHeap,
+    card: Option<u32>,
+    flags: u64,
+    byte_len: u64,
+    align: u64,
+) -> Result<crate::amdgpu_vram::UnmappedReservation, crate::amdgpu_vram::Error> {
+    match dcc_adjust(card, flags) {
+        0 => hidden.pool.reserve_aligned(byte_len, align),
+        dcc => hidden.pool.reserve_dcc(byte_len, dcc, heap.fb_base),
+    }
 }
 
 /// `AMDGPU_GEM_DOMAIN_MASK`, from the mirror — it was hand-composed here
@@ -368,6 +547,9 @@ pub struct GemObject {
     /// The reservation and name every PRIME export of it shares, as Linux
     /// keeps one dma_buf per GEM object.
     dma_buf: Arc<narf_filesystem::dma_buf::DmaBufObject>,
+    /// `tbo.pin_count`: live [`ScanoutPin`]s. A pinned buffer never moves
+    /// (no eviction, demotion or suspend eviction) until the last unpin.
+    pin_count: AtomicU32,
 }
 
 /// One address-stable backing generation. Retain an Arc while raw CPU frames,
@@ -401,6 +583,50 @@ impl core::ops::Deref for GemMapping {
     type Target = GemPlacement;
     fn deref(&self) -> &Self::Target {
         &self.placement
+    }
+}
+
+/// A buffer pinned for scanout (`GemObject::pin_scanout`): it holds the
+/// buffer and its VRAM placement, which nothing moves, evicts or frees
+/// while any pin lives (amdgpu_bo_unpin on drop, which
+/// amdgpu_dm_plane_helper_cleanup_fb runs only after the flip that
+/// replaced the framebuffer).
+#[derive(Debug)]
+pub struct ScanoutPin {
+    object: Arc<GemObject>,
+    placement: Arc<GemPlacement>,
+    /// The placement's GPU (frame-buffer aperture) address, which display
+    /// fetch takes: amdgpu_bo_gpu_offset.
+    address: u64,
+    /// Not a GFX12 DCC buffer, or one placed at its card's DCC alignment.
+    dcc_aligned: bool,
+}
+impl ScanoutPin {
+    /// amdgpu_bo_gpu_offset: where display fetches byte 0.
+    pub fn address(&self) -> u64 {
+        self.address
+    }
+    pub fn object(&self) -> &Arc<GemObject> {
+        &self.object
+    }
+    /// The pinned placement's size.
+    pub fn byte_len(&self) -> u64 {
+        self.placement.byte_len
+    }
+    /// The pinned placement, for CPU copies of a buffer the CPU reaches.
+    pub fn placement(&self) -> &Arc<GemPlacement> {
+        &self.placement
+    }
+    /// Whether display may fetch the buffer with DCC: it is no GFX12 DCC
+    /// buffer, or amdgpu_vram_mgr_new's DCC placement put its VRAM at the
+    /// card's gmc_v12_0_get_dcc_alignment.
+    pub fn dcc_aligned(&self) -> bool {
+        self.dcc_aligned
+    }
+}
+impl Drop for ScanoutPin {
+    fn drop(&mut self) {
+        self.object.pin_count.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -447,16 +673,22 @@ impl GemObject {
                 != 0
         };
         if !allowed
+            || self.pinned()
             || !Arc::ptr_eq(&placement, source)
             || Arc::strong_count(&placement) != 2
             || Arc::weak_count(&placement) != 0
         {
             return Err(FsError::Busy);
         }
-        let readback = source.hidden_address().is_some() && destination.system;
+        // A GFX12 DCC buffer leaves and enters visible VRAM through its
+        // engine too (`moves_by_engine`).
+        let engine = moves_by_engine(self);
+        let readback = destination.system
+            && (source.hidden_address().is_some() || engine && source.vram_address().is_some());
         let upload = source.system
-            && destination.hidden_address().is_some()
-            && self.flags & u64::from(uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0;
+            && (destination.hidden_address().is_some()
+                && self.flags & u64::from(uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0
+                || engine && destination.vram_address().is_some());
         if (!readback && !upload) || destination.byte_len != self.byte_len {
             return Err(FsError::InvalidData);
         }
@@ -473,6 +705,73 @@ impl GemObject {
     }
     pub fn preferred_domains(&self) -> u64 {
         self.preferred_domains.load(Ordering::Acquire)
+    }
+    /// Whether a [`ScanoutPin`] holds the buffer where it is.
+    pub fn pinned(&self) -> bool {
+        self.pin_count.load(Ordering::Acquire) != 0
+    }
+    /// The tiling flags `GEM_METADATA` last set (amdgpu_bo_get_tiling_flags).
+    pub fn tiling_flags(&self) -> u64 {
+        self.metadata.lock().tiling
+    }
+    /// amdgpu_dm_plane_helper_prepare_fb's pin of a framebuffer's buffer:
+    /// `amdgpu_bo_pin(rbo, amdgpu_display_supported_domains(...))` with
+    /// AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS. On a dGPU (no gpu_vm_support) the
+    /// display domain is VRAM alone, so a GFX12 DCC buffer, like any other,
+    /// is scanned out of VRAM only. amdgpu_bo_pin's validation (the move
+    /// of a buffer in system memory back to VRAM) runs before, in the async
+    /// [`prepare_scanout`] (it may wait for jobs and copy the whole buffer,
+    /// which never happens under the caller's KMS lock), so a buffer still
+    /// outside VRAM here is refused with ttm_bo_validate's `-ENOMEM`
+    /// (`OutOfMemory`); a buffer VRAM is not allowed for or a foreign
+    /// dma-buf is `-EINVAL` (`InvalidData`), a userptr `-EPERM`
+    /// (`OperationNotPermitted`), as amdgpu_bo_pin answers them. Pinning
+    /// forces a CPU-accessible buffer into visible VRAM
+    /// (CPU_ACCESS_REQUIRED): NARF only ever places NO_CPU_ACCESS buffers
+    /// past the BAR, and one that is not is refused rather than scanned out
+    /// there. A VRAM placement is one reservation, so it is contiguous. The
+    /// pin keeps the buffer, and that placement, until it drops.
+    pub fn pin_scanout(self: &Arc<Self>) -> Result<ScanoutPin, FsError> {
+        if self.allowed_domains.load(Ordering::Acquire) & u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM)
+            == 0
+        {
+            return Err(FsError::InvalidData);
+        }
+        let placement = self.placement.lock();
+        let address = match &placement.backing {
+            Backing::Vram { _held } => _held.address(),
+            Backing::Unmapped { _held }
+                if self.flags & u64::from(uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0 =>
+            {
+                _held.address()
+            }
+            Backing::Unmapped { .. } => return Err(FsError::InvalidData),
+            Backing::User(_) => return Err(FsError::OperationNotPermitted),
+            Backing::Foreign { .. } => return Err(FsError::InvalidData),
+            Backing::System(_) => return Err(FsError::OutOfMemory),
+        };
+        // Every DCC placement is made at the card's DCC alignment
+        // (`reserve_visible`); one that is not is never scanned out.
+        let dcc_aligned = match dcc_adjust(self.card, self.flags) {
+            0 => true,
+            dcc => self
+                .card
+                .and_then(vram_heap)
+                .and_then(|heap| address.checked_sub(heap.fb_base))
+                .is_some_and(|offset| offset % dcc == 0),
+        };
+        if !dcc_aligned {
+            return Err(FsError::InvalidData);
+        }
+        // Under the placement lock: no move can start between the check and
+        // the count, and the pin's lease alone already stops one.
+        self.pin_count.fetch_add(1, Ordering::AcqRel);
+        Ok(ScanoutPin {
+            object: Arc::clone(self),
+            placement: Arc::clone(&placement),
+            address,
+            dcc_aligned,
+        })
     }
     /// Acquire an address lease before exposing physical frames or PTEs.
     pub fn placement(&self) -> Arc<GemPlacement> {
@@ -493,7 +792,11 @@ impl GemObject {
             u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT | uapi::AMDGPU_GEM_DOMAIN_CPU)
         };
         let mut placement = self.placement.lock();
+        // A CPU copy would move a GFX12 DCC buffer's compressed bytes
+        // without decompressing them (`moves_by_engine`).
         if self.allowed_domains.load(Ordering::Acquire) & target == 0
+            || self.pinned()
+            || moves_by_engine(self)
             || matches!(
                 placement.backing,
                 Backing::User(_) | Backing::Foreign { .. }
@@ -510,7 +813,7 @@ impl GemObject {
         {
             return Err(FsError::Busy);
         }
-        backing.relocate(to_vram, self.card, self.alignment)
+        backing.relocate(to_vram, self.card, self.alignment, self.flags)
     }
 
     pub fn phys(&self) -> u64 {
@@ -559,6 +862,15 @@ impl GemObject {
 impl GemPlacement {
     pub(crate) fn hidden_address(&self) -> Option<u64> {
         match &self.backing {
+            Backing::Unmapped { _held } => Some(_held.address()),
+            _ => None,
+        }
+    }
+    /// The frame-buffer aperture address of a VRAM placement (visible or
+    /// past the BAR), which a transfer engine reaches it at.
+    pub(crate) fn vram_address(&self) -> Option<u64> {
+        match &self.backing {
+            Backing::Vram { _held } => Some(_held.address()),
             Backing::Unmapped { _held } => Some(_held.address()),
             _ => None,
         }
@@ -660,6 +972,7 @@ impl GemPlacement {
         to_vram: bool,
         card: Option<u32>,
         alignment: u64,
+        flags: u64,
     ) -> Result<(), FsError> {
         if self.system != to_vram {
             return Ok(());
@@ -673,9 +986,7 @@ impl GemPlacement {
                 .max(PAGE_SIZE)
                 .checked_next_power_of_two()
                 .ok_or(FsError::InvalidData)?;
-            let reservation = heap
-                .pool
-                .reserve_aligned(self.byte_len, alignment)
+            let reservation = reserve_visible(&heap, card, flags, self.byte_len, alignment)
                 .map_err(|_| FsError::NoSpace)?;
             let gpu = reservation
                 .address()
@@ -802,6 +1113,45 @@ impl GemPlacement {
         })
     }
 
+    /// Copy `out.len()` bytes from byte `offset` of a buffer the CPU
+    /// reaches (system pages through the direct map, VRAM through its BAR
+    /// window); None past its end or for VRAM beyond the BAR.
+    pub fn read_bytes(&self, offset: u64, out: &mut [u8]) -> Option<()> {
+        let end = offset.checked_add(out.len() as u64)?;
+        if end > self.byte_len {
+            return None;
+        }
+        match &self.backing {
+            Backing::Unmapped { .. } => return None,
+            Backing::Vram { _held } => {
+                let at = _held.mapping().virt + offset;
+                // SAFETY: the reservation's BAR window covers `byte_len`
+                // bytes and lives while `self` does; bounds checked above.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(at as *const u8, out.as_mut_ptr(), out.len())
+                };
+            }
+            _ => {
+                let mut done = 0;
+                while done < out.len() {
+                    let (phys, run) = self.locate(offset + done as u64)?;
+                    let count = (run as usize).min(out.len() - done);
+                    // SAFETY: locate bounds the run inside this buffer's
+                    // retained frames, which the kernel maps.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>(),
+                            out.as_mut_ptr().add(done),
+                            count,
+                        );
+                    }
+                    done += count;
+                }
+            }
+        }
+        Some(())
+    }
+
     /// The 64-bit value at byte `offset`, read by the CPU.
     pub fn load_u64(&self, offset: u64) -> Option<u64> {
         let at = self.cpu_ptr(offset)?;
@@ -907,23 +1257,65 @@ pub(crate) fn try_placement(card: u32) -> Option<PlacementGuard> {
     })
 }
 
-/// Reclaim idle client VRAM; address leases and unsignalled fences pin it.
-/// A shared handle or PRIME export alone does not pin placement.
-fn evict_visible(card: u32, pool: &crate::amdgpu_vram::Pool, bytes: u64, alignment: u64) {
+/// Every live buffer created on each card, whatever holds it (a handle, a
+/// framebuffer, a CPU mapping, a PRIME export): TTM's view of the device's
+/// buffers, which its LRU walk evicts from.
+static CARD_OBJECTS: IrqSafeSpinLock<Vec<(u32, Weak<GemObject>)>> =
+    IrqSafeSpinLock::new(Vec::new());
+/// The cards whose evictions walk every live buffer (`CARD_OBJECTS`) rather
+/// than the opens' handle tables.
+static LRU_CARDS: IrqSafeSpinLock<Vec<u32>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Make DRM card `card`'s evictions (suspend's `evict_all`, pressure's
+/// `evict_visible` and `reclaim_vram`) walk every live buffer of the card,
+/// as TTM walks its LRU, including one only a framebuffer holds (CREATE_DUMB,
+/// ADDFB2, then the handle closed). Otherwise they walk the opens' handle
+/// tables (a card that never sets it keeps that).
+pub fn set_lru_eviction(card: u32, on: bool) {
+    let mut cards = LRU_CARDS.lock();
+    cards.retain(|&c| c != card);
+    if on {
+        cards.push(card);
+    }
+}
+
+/// The buffers an eviction on card `card` considers, oldest first, each
+/// once: every live buffer of an LRU card (`set_lru_eviction`), else those
+/// its opens' handle tables hold.
+fn eviction_candidates(card: u32) -> Vec<Arc<GemObject>> {
+    if LRU_CARDS.lock().contains(&card) {
+        return CARD_OBJECTS
+            .lock()
+            .iter()
+            .filter(|(c, _)| *c == card)
+            .filter_map(|(_, o)| o.upgrade())
+            .collect();
+    }
     let tables: Vec<_> = GEM_TABLES
         .lock()
         .iter()
         .filter(|(c, _)| *c == card)
         .filter_map(|(_, table)| table.upgrade())
         .collect();
+    let mut objects: Vec<Arc<GemObject>> = Vec::new();
     for table in tables {
-        let objects: Vec<_> = table.lock().values().cloned().collect();
-        for object in objects {
-            if !object.system() {
-                let _ = object.relocate(false);
-                if pool.reserve_aligned(bytes, alignment).is_ok() {
-                    return;
-                }
+        for object in table.lock().values() {
+            if !objects.iter().any(|o| Arc::ptr_eq(o, object)) {
+                objects.push(object.clone());
+            }
+        }
+    }
+    objects
+}
+
+/// Reclaim idle client VRAM; address leases and unsignalled fences pin it.
+/// A shared handle or PRIME export alone does not pin placement.
+fn evict_visible(card: u32, fits: impl Fn() -> bool) {
+    for object in eviction_candidates(card) {
+        if !object.system() && !object.pinned() {
+            let _ = object.relocate(false);
+            if fits() {
+                return;
             }
         }
     }
@@ -931,7 +1323,9 @@ fn evict_visible(card: u32, pool: &crate::amdgpu_vram::Pool, bytes: u64, alignme
 
 /// System suspend (`ttm_resource_manager_evict_all`): move every VRAM buffer
 /// of `gate`'s card to system memory, waiting for its jobs, whatever its
-/// allowed domains (each gains GTT for the move). Returns every touched
+/// allowed domains (each gains GTT for the move). A pinned buffer (a
+/// framebuffer still scanned out) is not on TTM's LRU and stays where it
+/// is, as `ttm_resource_manager_evict_all` leaves it. Returns every touched
 /// buffer with its original allowed domains, which the caller restores on
 /// resume or on failure ([`restore_domains`]); the first refusal stops the
 /// eviction and is returned with the list so far.
@@ -939,26 +1333,20 @@ pub(crate) async fn evict_all(
     gate: &PlacementGuard,
 ) -> (Vec<(Arc<GemObject>, u64)>, Result<(), FsError>) {
     let card = gate.card();
-    let tables: Vec<_> = GEM_TABLES
-        .lock()
-        .iter()
-        .filter(|(c, _)| *c == card)
-        .filter_map(|(_, table)| table.upgrade())
-        .collect();
     let mut touched = Vec::new();
-    for table in tables {
-        let objects: Vec<_> = table.lock().values().cloned().collect();
-        for object in objects {
-            if object.system() || touched.iter().any(|(o, _)| Arc::ptr_eq(o, &object)) {
-                continue;
-            }
-            let original = object
-                .allowed_domains
-                .fetch_or(u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT), Ordering::AcqRel);
-            touched.push((object.clone(), original));
-            if let Err(error) = crate::amdgpu_vm::relocate(gate, &object, false).await {
-                return (touched, Err(error));
-            }
+    for object in eviction_candidates(card) {
+        if object.system()
+            || object.pinned()
+            || touched.iter().any(|(o, _)| Arc::ptr_eq(o, &object))
+        {
+            continue;
+        }
+        let original = object
+            .allowed_domains
+            .fetch_or(u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT), Ordering::AcqRel);
+        touched.push((object.clone(), original));
+        if let Err(error) = crate::amdgpu_vm::relocate(gate, &object, false).await {
+            return (touched, Err(error));
         }
     }
     (touched, Ok(()))
@@ -970,6 +1358,92 @@ pub(crate) fn restore_domains(touched: Vec<(Arc<GemObject>, u64)>) {
         object.allowed_domains.store(original, Ordering::Release);
     }
 }
+
+/// TTM's eviction for an allocation that must land in VRAM: move card
+/// `card`'s idle, unpinned VRAM buffers to system memory one by one, CPU-
+/// mapped ones included (their mappings follow), until `size` bytes at
+/// `align` fit in the visible heap (or, for `no_cpu`, past the BAR). True
+/// once they do; the probe reservation is released again.
+async fn reclaim_vram(card: u32, heap: &VramHeap, size: u64, align: u64, flags: u64) -> bool {
+    let no_cpu = flags & u64::from(uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0;
+    let gate = lock_placement(card).await;
+    for object in eviction_candidates(card) {
+        if object.system() {
+            continue;
+        }
+        let _ = crate::amdgpu_vm::relocate(&gate, &object, false).await;
+        if reserve_visible(heap, Some(card), flags, size, align).is_ok()
+            || (no_cpu
+                && heap.unmapped.as_ref().is_some_and(|u| {
+                    reserve_hidden(heap, u, Some(card), flags, size, align).is_ok()
+                }))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// `amdgpu_gem_align_pitch(adev, width, cpp, false)`: a dumb buffer's line
+/// is a whole number of 256-byte units for 1-4 bytes per pixel (a pixel
+/// mask of 255, 127 or 63); other sizes are not padded. 0 when the padded
+/// line overflows 32 bits.
+pub const fn align_pitch(width: u32, cpp: u32) -> u32 {
+    let mask = match cpp {
+        1 => 255,
+        2 => 127,
+        3 | 4 => 63,
+        _ => 0,
+    };
+    let Some(aligned) = width.checked_add(mask) else {
+        return 0;
+    };
+    match (aligned & !mask).checked_mul(cpp) {
+        Some(pitch) => pitch,
+        None => 0,
+    }
+}
+
+/// A dumb buffer's `(pitch, size)`: drm_mode_create_dumb's checks (no zero
+/// dimension, no 32-bit overflow of the packed size or of its page
+/// rounding), then amdgpu_mode_dumb_create's: [`align_pitch`] (EINVAL at 0)
+/// and the pitch times the height rounded up to a page.
+pub fn dumb_layout(width: u32, height: u32, bpp: u32) -> Result<(u32, u64), FsError> {
+    if width == 0 || height == 0 || bpp == 0 || bpp > u32::MAX - 8 {
+        return Err(FsError::InvalidData);
+    }
+    let cpp = bpp.div_ceil(8);
+    if cpp > u32::MAX / width {
+        return Err(FsError::InvalidData);
+    }
+    let stride = cpp * width;
+    if height > u32::MAX / stride {
+        return Err(FsError::InvalidData);
+    }
+    // PAGE_ALIGN of the u32 size: it wraps to 0 past 0xffff_f000.
+    if (height * stride).wrapping_add(PAGE_SIZE as u32 - 1) & !(PAGE_SIZE as u32 - 1) == 0 {
+        return Err(FsError::InvalidData);
+    }
+    let pitch = align_pitch(width, cpp);
+    if pitch == 0 {
+        return Err(FsError::InvalidData);
+    }
+    let size = (u64::from(pitch) * u64::from(height)).next_multiple_of(PAGE_SIZE);
+    Ok((pitch, size))
+}
+
+/// amdgpu_mode_dumb_create's create flags: CPU access, USWC for a GTT
+/// placement, one contiguous VRAM range, and (the card's buffer functions
+/// running) cleared.
+pub const DUMB_CREATE_FLAGS: u64 = (uapi::AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED
+    | uapi::AMDGPU_GEM_CREATE_CPU_GTT_USWC
+    | uapi::AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS
+    | uapi::AMDGPU_GEM_CREATE_VRAM_CLEARED) as u64;
+
+/// amdgpu_bo_get_preferred_domain(amdgpu_display_supported_domains(adev,
+/// flags)) for a dumb buffer of a dGPU: without gpu_vm_support the display
+/// fetches VRAM only, USWC or not.
+pub const DUMB_DOMAIN: u64 = uapi::AMDGPU_GEM_DOMAIN_VRAM as u64;
 
 /// A strict VRAM allocation may park to reclaim buffers mapped by idle VMs.
 /// The first create performs all ABI validation; a failure leaves its input
@@ -1013,35 +1487,62 @@ pub async fn dispatch_async(
     else {
         return Some(Err(FsError::InvalidData));
     };
-    let gate = lock_placement(card).await;
-    let tables: Vec<_> = GEM_TABLES
-        .lock()
-        .iter()
-        .filter(|(c, _)| *c == card)
-        .filter_map(|(_, table)| table.upgrade())
-        .collect();
-    for table in tables {
-        let objects: Vec<_> = table.lock().values().cloned().collect();
-        for object in objects {
-            if object.system() {
-                continue;
-            }
-            let _ = crate::amdgpu_vm::relocate(&gate, &object, false).await;
-            let no_cpu = u64::from_le_bytes(bytes[24..32].try_into().unwrap())
-                & u64::from(uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS)
-                != 0;
-            if heap.pool.reserve_aligned(size, align).is_ok()
-                || (no_cpu
-                    && heap
-                        .unmapped
-                        .as_ref()
-                        .is_some_and(|u| u.pool.reserve_aligned(size, align).is_ok()))
-            {
-                return Some(create(state, arg));
-            }
-        }
+    let flags = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+    if reclaim_vram(card, &heap, size, align, flags).await {
+        return Some(create(state, arg));
     }
     Some(result)
+}
+
+/// [`GemState::create_dumb`] when visible VRAM is full: TTM evicts idle
+/// buffers, CPU-mapped ones included, before amdgpu_mode_dumb_create gives
+/// up with ENOMEM (it has no GTT fallback). `NoSpace` when even that leaves
+/// no room.
+pub async fn create_dumb_async(
+    state: &GemState,
+    width: u32,
+    height: u32,
+    bpp: u32,
+) -> Result<(u32, u32, u64), FsError> {
+    let result = state.create_dumb(width, height, bpp);
+    if result != Err(FsError::NoSpace) {
+        return result;
+    }
+    let (Some(card), Ok((_, size))) = (state.card, dumb_layout(width, height, bpp)) else {
+        return result;
+    };
+    let Some(heap) = vram_heap(card) else {
+        return result;
+    };
+    if reclaim_vram(card, &heap, size, PAGE_SIZE, DUMB_CREATE_FLAGS).await {
+        return state.create_dumb(width, height, bpp);
+    }
+    result
+}
+
+/// amdgpu_dm_plane_helper_prepare_fb's amdgpu_bo_pin validation, ahead of
+/// the commit that pins: each of `objects` that has left VRAM (suspend's
+/// evict_all, or eviction for another allocation) and is not pinned moves
+/// back, CPU mappings and all, so the commit's `pin_scanout` finds it in
+/// VRAM. A buffer that cannot move stays put and its pin is refused.
+pub async fn prepare_scanout(card: u32, objects: Vec<Arc<GemObject>>) {
+    let objects: Vec<_> = objects
+        .into_iter()
+        .filter(|o| {
+            o.system()
+                && !o.pinned()
+                && o.allowed_domains.load(Ordering::Acquire)
+                    & u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM)
+                    != 0
+        })
+        .collect();
+    if objects.is_empty() {
+        return;
+    }
+    let gate = lock_placement(card).await;
+    for object in objects {
+        let _ = crate::amdgpu_vm::relocate(&gate, &object, true).await;
+    }
 }
 
 /// Per-open GEM state. One of these per `/dev/dri/*` open on an amdgpu card.
@@ -1090,7 +1591,13 @@ impl GemState {
     }
 
     fn insert(&self, object: GemObject) -> Result<u32, FsError> {
-        self.insert_shared(Arc::new(object))
+        let object = Arc::new(object);
+        if let Some(card) = object.card {
+            let mut all = CARD_OBJECTS.lock();
+            all.retain(|(_, o)| o.strong_count() != 0);
+            all.push((card, Arc::downgrade(&object)));
+        }
+        self.insert_shared(object)
     }
 
     fn insert_shared(&self, object: Arc<GemObject>) -> Result<u32, FsError> {
@@ -1172,6 +1679,7 @@ impl GemState {
             metadata: IrqSafeSpinLock::new(Metadata::default()),
             card: self.card,
             dma_buf,
+            pin_count: AtomicU32::new(0),
         })
     }
 
@@ -1220,6 +1728,93 @@ impl GemState {
     /// an amdgpu handle from a dumb one without consulting both.
     pub fn owns(&self, handle: u32) -> bool {
         handle >= HANDLE_BASE && self.get(handle).is_some()
+    }
+
+    /// `amdgpu_mode_dumb_create` on a dGPU card with a VRAM heap: a buffer of
+    /// [`dumb_layout`]'s pitch and size in [`DUMB_DOMAIN`] (VRAM), created
+    /// with [`DUMB_CREATE_FLAGS`] as amdgpu_gem_object_create makes it
+    /// (VRAM_WIPE_ON_RELEASE added, the CPU_ACCESS_REQUIRED hint dropped
+    /// once placed). CPU_ACCESS_REQUIRED keeps it in the BAR-visible heap,
+    /// and VRAM_CONTIGUOUS is one reservation, zeroed through the BAR. When
+    /// visible VRAM is full, idle unmapped buffers are evicted first
+    /// (`evict_visible`; [`create_dumb_async`] also moves mapped ones);
+    /// there is no GTT fallback, so it is then `NoSpace` (ENOMEM). Returns
+    /// `(handle, pitch, size)`; the handle is in this open's table, as
+    /// drm_gem_handle_create puts it in the file's.
+    pub fn create_dumb(
+        &self,
+        width: u32,
+        height: u32,
+        bpp: u32,
+    ) -> Result<(u32, u32, u64), FsError> {
+        let (pitch, byte_len) = dumb_layout(width, height, bpp)?;
+        let card = self.card.ok_or(FsError::NoDevice)?;
+        let heap = vram_heap(card).ok_or(FsError::NoDevice)?;
+        let reservation = heap
+            .pool
+            .reserve_aligned(byte_len, PAGE_SIZE)
+            .or_else(|_| {
+                evict_visible(card, || {
+                    heap.pool.reserve_aligned(byte_len, PAGE_SIZE).is_ok()
+                });
+                heap.pool.reserve_aligned(byte_len, PAGE_SIZE)
+            })
+            .map_err(|_| FsError::NoSpace)?;
+        let gpu = reservation
+            .address()
+            .checked_sub(heap.fb_base)
+            .and_then(|a| a.checked_add(heap.fb_offset))
+            .ok_or(FsError::InvalidData)?;
+        let map = reservation.mapping();
+        // VRAM_CLEARED: zero it before userspace or the display sees it.
+        //
+        // SAFETY: the reservation is this buffer's alone and its CPU mapping
+        // covers `reservation.size()` bytes.
+        unsafe { core::ptr::write_bytes(map.virt as *mut u8, 0, reservation.size() as usize) };
+        let flags = (DUMB_CREATE_FLAGS | u64::from(uapi::AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE))
+            & !u64::from(uapi::AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED);
+        let handle = self.insert(GemObject {
+            placement: IrqSafeSpinLock::new(Arc::new(GemPlacement {
+                phys: map.phys.raw(),
+                gpu,
+                system: false,
+                byte_len,
+                backing: Backing::Vram { _held: reservation },
+            })),
+            byte_len,
+            // bp.byte_align 0: GEM_OP reports a page alignment of 0.
+            alignment: 0,
+            preferred_domains: AtomicU64::new(DUMB_DOMAIN),
+            allowed_domains: AtomicU64::new(initial_allowed_domains(DUMB_DOMAIN, flags)),
+            flags,
+            metadata: IrqSafeSpinLock::new(Metadata::default()),
+            card: self.card,
+            dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
+            pin_count: AtomicU32::new(0),
+        })?;
+        Ok((handle, pitch, byte_len))
+    }
+
+    /// `amdgpu_mode_dumb_mmap` (MAP_DUMB) for a handle of this table: the
+    /// same offset `GEM_MMAP` hands out, EPERM for a userptr or a
+    /// NO_CPU_ACCESS buffer. None for a handle this table does not hold.
+    pub fn map_dumb(&self, handle: u32) -> Option<Result<u64, FsError>> {
+        if !self.owns(handle) {
+            return None;
+        }
+        let object = self.get(handle)?;
+        if object.is_userptr()
+            || object.flags & u64::from(uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0
+        {
+            return Some(Err(FsError::OperationNotPermitted));
+        }
+        Some(Ok(u64::from(handle) << 12))
+    }
+
+    /// `drm_mode_destroy_dumb`'s drm_gem_handle_delete for a handle of this
+    /// table: false when it holds no such handle.
+    pub fn destroy_dumb(&self, handle: u32) -> bool {
+        handle >= HANDLE_BASE && self.remove(handle)
     }
 
     /// The object an `mmap` of `len` bytes at `offset` maps, which the
@@ -1408,7 +2003,8 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
         .filter(|_| flags & uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS as u64 != 0)
         .and_then(|heap| {
             let unmapped = heap.unmapped.as_ref()?;
-            let reservation = unmapped.pool.reserve_aligned(byte_len, align).ok()?;
+            let reservation =
+                reserve_hidden(heap, unmapped, state.card, flags, byte_len, align).ok()?;
             Some((heap, unmapped, reservation))
         });
     if let Some((heap, unmapped, reservation)) = unmapped {
@@ -1438,6 +2034,7 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
             metadata: IrqSafeSpinLock::new(Metadata::default()),
             card: state.card,
             dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
+            pin_count: AtomicU32::new(0),
         };
         object
             .dma_buf
@@ -1446,16 +2043,13 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
         return finish_create(state, arg, object);
     }
     let vram = heap.and_then(|heap| {
-        let reservation = heap
-            .pool
-            .reserve_aligned(byte_len, align)
+        let reserve = || reserve_visible(&heap, state.card, flags, byte_len, align);
+        let reservation = reserve()
             .or_else(|error| {
                 if let Some(card) = state.card {
-                    evict_visible(card, &heap.pool, byte_len, align);
+                    evict_visible(card, || reserve().is_ok());
                 }
-                heap.pool
-                    .reserve_aligned(byte_len, align)
-                    .map_err(|_| error)
+                reserve().map_err(|_| error)
             })
             .ok()?;
         Some((heap, reservation))
@@ -1490,6 +2084,7 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
                 metadata: IrqSafeSpinLock::new(Metadata::default()),
                 card: state.card,
                 dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
+                pin_count: AtomicU32::new(0),
             }
         }
         None if domains == u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM)
@@ -1519,6 +2114,7 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
                 metadata: IrqSafeSpinLock::new(Metadata::default()),
                 card: state.card,
                 dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
+                pin_count: AtomicU32::new(0),
             }
         }
     };
@@ -1607,6 +2203,7 @@ fn userptr(state: &GemState, arg: usize) -> Result<u64, FsError> {
         metadata: IrqSafeSpinLock::new(Metadata::default()),
         card: state.card,
         dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
+        pin_count: AtomicU32::new(0),
     };
     let handle = state.insert(object)?;
     // SAFETY: as above; `handle` is the struct's last field.
@@ -1803,3 +2400,11 @@ fn metadata(state: &GemState, arg: usize) -> Result<u64, FsError> {
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_render_abi_tests.rs"]
 mod render_abi_tests;
+
+#[cfg(feature = "kernel-test")]
+#[path = "amdgpu_dcc_vram_tests.rs"]
+mod dcc_vram_tests;
+
+#[cfg(feature = "kernel-test")]
+#[path = "amdgpu_gem_eviction_tests.rs"]
+mod eviction_tests;

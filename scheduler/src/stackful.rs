@@ -248,6 +248,7 @@ fn recycle_kernel_stack(mut stack: alloc::boxed::Box<[u8]>) {
         return; // non-default: frees to the buddy here
     }
     stack.fill(0); // SECURITY: scrub before the stack enters any tier
+
     // Tier 1: this CPU's magazine.
     let overflow = narf_lib::sync::without_interrupts(|| {
         let cpu = narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);

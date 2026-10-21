@@ -83,6 +83,8 @@ impl<F: FnOnce() -> T, T> CapOp<BusDeviceCap, Write> for Op<F> {
 }
 #[derive(Clone, Copy, Debug)]
 struct Layout {
+    /// Config dword 0 the bound function must still read: device << 16 | vendor.
+    id: u32,
     msi: u64,
     msix: Option<u64>,
     nbio: u64,
@@ -90,7 +92,7 @@ struct Layout {
     masks: bool,
 }
 fn check(io: &mut impl Io, l: Layout) -> Result<(), Error> {
-    if io.cfg32(0) != 0x75501002 {
+    if io.cfg32(0) != l.id {
         return Err(Error::DeviceGone);
     }
     if !(0x40..=0xfc).contains(&l.msi)
@@ -289,8 +291,7 @@ impl Route {
         pci: &BusDevice,
         authority: Cap<BusDeviceCap, Write>,
     ) -> Result<Self, Error> {
-        if gpu.chip.vid != crate::amdgpu::AMD_VENDOR
-            || gpu.chip.did != crate::amdgpu::NAVI48
+        if crate::amdgpu_rdna4::Rdna4Chip::of(gpu).is_none()
             || pci.id.vendor != gpu.chip.vid
             || pci.id.device != gpu.chip.did
         {
@@ -334,6 +335,7 @@ impl Route {
                     .map_err(|_| Error::Invalid)?;
                 let ctrl = io.cfg16(msi + 2);
                 let l = Layout {
+                    id: u32::from(gpu.chip.did) << 16 | u32::from(gpu.chip.vid),
                     msi,
                     msix,
                     nbio,

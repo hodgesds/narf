@@ -65,11 +65,25 @@ impl Io for Fake {
                 }
             }
             0xe => {
-                assert!((1..=4).contains(&arg));
+                // Zero once no display is left (enter_display_off).
+                assert!(arg <= 4);
                 0
             }
             0x1a => {
-                assert_eq!(arg, 0);
+                assert!(arg <= 1, "SetUclkPstateAllow takes 0 or 1");
+                0
+            }
+            // ActiveUclkFclk / IdleUclkFclk: the UCLK floor is what
+            // ReturnHardMinStatus then acknowledges.
+            0x18 | 0x19 => {
+                self.clock = 2;
+                0
+            }
+            // SetMinDeepSleepDcfclk, SetDalDramAddrHigh/Low,
+            // TransferTableDram2Smu.
+            0xd | 5 | 6 => 0,
+            8 => {
+                assert_eq!(arg, 2, "TABLE_WATERMARKS");
                 0
             }
             0xc => self.dc_limit[(arg >> 16) as usize],
@@ -96,11 +110,16 @@ fn engine() -> Engine<Fake> {
             dccg: 0x20000,
             dio: DIO,
             hpo: HPO,
+            pool: crate::amdgpu_rdna4::pipe_pool(),
+            // No die: idle DPM stays off, so UCLK takes a hard minimum.
+            chip: None,
         },
         status: Status {
             state: State::Prepared,
             levels: None,
             applied: None,
+            bandwidth: Bandwidth::INIT,
+            ignored: Ignored::default(),
         },
         io: Fake {
             regs: BTreeMap::from([(0x589d0, 1)]),
@@ -142,6 +161,7 @@ fn request() -> Request {
         display_khz: 600001,
         dpp_khz: 350999,
         dtb_khz: 600000,
+        deep_sleep_dcfclk_khz: 0,
     }
 }
 fn dcn401_dal_queries_native_ids_fine_grained_and_discrete_levels() -> TestResult {
@@ -436,6 +456,20 @@ fn dcn401_partial_failures_and_cancellation_never_replay_mailboxes() -> TestResu
     let mut ready = engine();
     start(&mut ready);
     let start_count = ready.io.commands.len();
+    // NumOfDisplays (the first message) and prepare's UCLK part of the
+    // bandwidth sequence (the UCLK hard minimum, its acknowledgement and
+    // SetUclkPstateAllow(0)): Linux ignores those results, so a refusal
+    // there is logged and prepare completes.
+    ready.io.commands.clear();
+    run(ready.prepare(request())).unwrap();
+    let sequence = ready.io.commands.clone();
+    assert_eq!(sequence[0], (0xe, 1));
+    let first = sequence.iter().position(|&(m, a)| m == 9 && a >> 16 == 2);
+    let last = sequence.iter().position(|&c| c == (0x1a, 0));
+    let ignored = |step: usize| match (first, last) {
+        (Some(f), Some(l)) => step == 1 || (f + 1..=l + 1).contains(&step),
+        _ => false,
+    };
     for starting in [true, false] {
         let n = if starting { start_count } else { 12 };
         for step in 1..=n {
@@ -473,6 +507,11 @@ fn dcn401_partial_failures_and_cancellation_never_replay_mailboxes() -> TestResu
                     } else {
                         run(e.prepare(request())).map(|_| ())
                     };
+                    if !starting && ignored(step) {
+                        assert_eq!(result, Ok(()));
+                        assert_eq!(e.status.state, State::Applied);
+                        continue;
+                    }
                     assert_eq!(result, Err(Error::Rejected(0xfd)));
                     assert_eq!(e.status.state, State::Failed(Error::Rejected(0xfd)));
                 }
@@ -578,7 +617,7 @@ fn dcn401_constructor_bounds_native_banks_and_live_authority() -> TestResult {
         let dc = mp + 1;
         match case {
             0 => g.chip.did = crate::amdgpu::NAVI22,
-            1 => g.ip_blocks[0].revision = 0,
+            1 => g.ip_blocks[0].revision = 2,
             2 => g.ip_blocks[mp].base_addrs[1] = 0x16000,
             3 => g.ip_blocks[mp].revision = 1,
             4 => g.ip_blocks[dc].minor = 2,
@@ -612,6 +651,7 @@ fn dcn401_fixed_clocks_do_not_issue_unsupported_dpm_commands() -> TestResult {
         display_khz: 1,
         dpp_khz: 1,
         dtb_khz: 1,
+        deep_sleep_dcfclk_khz: 0,
     }))
     .unwrap();
     assert_eq!(
@@ -720,6 +760,7 @@ fn dcn401_live_clock_updates_follow_dcn401_update_clocks() -> TestResult {
         display_khz: 900_000,
         dpp_khz: 700_000,
         dtb_khz: 600_000,
+        deep_sleep_dcfclk_khz: 0,
     };
     let (refused, refs) = live(&mut e, up, false, &|_| false);
     if refused != Err(Error::Busy) || !refs.is_empty() {
@@ -745,6 +786,7 @@ fn dcn401_live_clock_updates_follow_dcn401_update_clocks() -> TestResult {
         display_khz: 300_000,
         dpp_khz: 200_000,
         dtb_khz: 600_000,
+        deep_sleep_dcfclk_khz: 0,
     };
     let before = e.io.commands.len();
     let (kept, refs) = live(&mut e, down, false, &held);
@@ -784,4 +826,544 @@ fn dcn401_live_clock_updates_follow_dcn401_update_clocks() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-clk",
     dcn401_live_clock_updates_follow_dcn401_update_clocks
+);
+
+/// A started owner on a Navi48 die whose PMFW (0x684c00) trusts idle DPM,
+/// UCLK levels 96/456/772/1258 MHz and FCLK 300-2500 MHz.
+fn idle_dpm_engine() -> Engine<Fake> {
+    let mut e = engine();
+    e.layout.chip = Some(crate::amdgpu_rdna4::Rdna4Chip::Navi48);
+    e.io.flags[2] = 4;
+    e.io.levels[2] = [96, 456, 772, 1258, 0, 0, 0, 0];
+    e.io.levels[3] = [300, 2500, 0, 0, 0, 0, 0, 0];
+    start(&mut e);
+    e
+}
+/// DPMM's minimums for a 1080p60 vactive configuration at 96 MHz UCLK.
+fn pstate_bw() -> Bandwidth {
+    Bandwidth {
+        uclk_pstate: true,
+        fclk_pstate: true,
+        dramclk_khz: 96_000,
+        idle_dramclk_khz: 96_000,
+        fclk_khz: 300_000,
+        idle_fclk_khz: 300_000,
+        deep_sleep_dcfclk_khz: 10_673,
+    }
+}
+fn bw(
+    e: &mut Engine<Fake>,
+    b: Bandwidth,
+    lower: bool,
+) -> (Result<Applied, Error>, Vec<(u32, u32)>) {
+    let before = e.io.commands.len();
+    let held = |at: u64| at == DIO + 0x1b43 * 4;
+    let result = run(e.update_bandwidth(b, lower, &held));
+    (result, e.io.commands[before..].to_vec())
+}
+
+/// dcn401_update_clocks' bandwidth sequence with idle DPM (PMFW 0x681800 or
+/// later on Navi48): the pinned prepare floors UCLK and FCLK at their
+/// highest active and idle levels and disallows switching; optimize then
+/// allows it before lowering both floor pairs to DPMM's, and a later
+/// prepare raises them again before disallowing.
+fn dcn401_bandwidth_sequence_follows_idle_dpm() -> TestResult {
+    let mut e = idle_dpm_engine();
+    e.io.commands.clear();
+    let applied = run(e.prepare(request())).unwrap();
+    let (fmax, umax) = (2500u32, 1258u32);
+    if e.io.commands[..9]
+        != [
+            (0xe, 1),
+            (9, 9 << 16 | 1200),
+            (0x15, 0),
+            (0x18, fmax << 16 | umax),
+            (0x15, 0),
+            (0x19, fmax << 16 | umax),
+            (0x15, 0),
+            (0x1a, 0),
+            (9, 6 << 16 | 601),
+        ]
+        || applied.memory_floor_khz != 1_258_000
+        || applied.uclk_pstate
+        || hard_mins(&e.io.commands).iter().any(|&(c, _)| c == 2)
+    {
+        return TestResult::Fail("pinned prepare with idle DPM");
+    }
+    // A live display keeps running: prepare never gains P-state support.
+    e.io.regs.insert(DIO + 0x1b43 * 4, 1);
+    let (kept, sent) = bw(&mut e, pstate_bw(), false);
+    if sent != [(0xd, 11)] || kept.map(|a| a.uclk_pstate) != Ok(false) {
+        return TestResult::Fail("prepare allowed UCLK switching");
+    }
+    // A refused SetMinDeepSleepDcfclk is ignored like Linux's.
+    let refused = e.io.commands.len() + 1;
+    e.io.refuse = Some(refused);
+    let deeper = Bandwidth {
+        deep_sleep_dcfclk_khz: 20_000,
+        ..pstate_bw()
+    };
+    let (kept, sent) = bw(&mut e, deeper, false);
+    if sent != [(0xd, 20)]
+        || kept.is_err()
+        || e.status.ignored.last != Some((0xd, Error::Rejected(0xfd)))
+    {
+        return TestResult::Fail("refused deep-sleep DCFCLK");
+    }
+    // optimize: the deep-sleep DCFCLK lowered again, allow, then the
+    // active and idle floors.
+    let (low, sent) = bw(&mut e, pstate_bw(), true);
+    let low = low.unwrap();
+    if sent
+        != [
+            (0xd, 11),
+            (0x1a, 1),
+            (0x18, 300 << 16 | 96),
+            (0x15, 0),
+            (0x19, 300 << 16 | 96),
+            (0x15, 0),
+        ]
+        || !low.uclk_pstate
+        || low.memory_floor_khz != 96_000
+        || e.status.bandwidth != pstate_bw()
+    {
+        return TestResult::Fail("optimize lowered UCLK/FCLK");
+    }
+    // Nothing changed: nothing sent.
+    if !bw(&mut e, pstate_bw(), true).1.is_empty() {
+        return TestResult::Fail("unchanged bandwidth resent");
+    }
+    // Re-pin before an unsupported configuration: floors to the maximum,
+    // then switching disallowed.
+    let pinned = Bandwidth {
+        deep_sleep_dcfclk_khz: 10_673,
+        ..Bandwidth::pinned(&e.status.levels.unwrap())
+    };
+    let (high, sent) = bw(&mut e, pinned, false);
+    let high = high.unwrap();
+    if sent
+        != [
+            (0x18, fmax << 16 | umax),
+            (0x15, 0),
+            (0x19, fmax << 16 | umax),
+            (0x15, 0),
+            (0x1a, 0),
+        ]
+        || high.uclk_pstate
+        || high.memory_floor_khz != 1_258_000
+    {
+        return TestResult::Fail("re-pin order");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-clk",
+    dcn401_bandwidth_sequence_follows_idle_dpm
+);
+
+/// Without idle DPM (an unknown die or older PMFW) UCLK takes a hard
+/// minimum: the active DPMM level once switching is allowed, the maximum
+/// again before it is disallowed. FCLK follows DCFCLK, unsent.
+fn dcn401_bandwidth_sequence_without_idle_dpm_uses_uclk_hard_min() -> TestResult {
+    let mut e = engine();
+    e.io.flags[2] = 4;
+    e.io.levels[2] = [96, 456, 772, 1258, 0, 0, 0, 0];
+    start(&mut e);
+    run(e.prepare(request())).unwrap();
+    if hard_mins(&e.io.commands)
+        .contains(&(2, 1258))
+        .then_some(())
+        .is_none()
+        || !e.io.commands.contains(&(0x1a, 0))
+        || e.io.commands.iter().any(|&(m, _)| m == 0x18 || m == 0x19)
+    {
+        return TestResult::Fail("pinned prepare without idle DPM");
+    }
+    let (low, sent) = bw(&mut e, pstate_bw(), true);
+    if sent != [(0xd, 11), (0x1a, 1), (9, 2 << 16 | 96), (0x15, 0)]
+        || low.map(|a| (a.uclk_pstate, a.memory_floor_khz)) != Ok((true, 96_000))
+    {
+        return TestResult::Fail("UCLK hard minimum lowered");
+    }
+    // A higher DPMM level is raised in prepare while switching stays on.
+    let raised = Bandwidth {
+        dramclk_khz: 456_000,
+        idle_dramclk_khz: 456_000,
+        ..pstate_bw()
+    };
+    let (up, sent) = bw(&mut e, raised, false);
+    if sent != [(9, 2 << 16 | 456), (0x15, 0)]
+        || up.map(|a| (a.uclk_pstate, a.memory_floor_khz)) != Ok((true, 456_000))
+    {
+        return TestResult::Fail("UCLK raised in prepare");
+    }
+    // dcn401_smu_set_hard_min_by_freq's result is unread for UCLK: a refused
+    // floor is logged and the sequence goes on (SetUclkPstateAllow(0) still
+    // follows), the owner reusable.
+    e.io.refuse = Some(e.io.commands.len() + 1);
+    let pinned = Bandwidth::pinned(&e.status.levels.unwrap());
+    let (pinned_up, sent) = bw(&mut e, pinned, false);
+    if pinned_up.map(|a| a.uclk_pstate) != Ok(false)
+        || sent.first() != Some(&(9, 2 << 16 | 1258))
+        || sent.last() != Some(&(0x1a, 0))
+        || e.status.state != State::Applied
+        || e.status.ignored.count != 1
+        || e.status.ignored.last != Some((9, Error::Rejected(0xfd)))
+    {
+        return TestResult::Fail("refused UCLK floor ignored");
+    }
+    // A refused SetUclkPstateAllow is ignored as well.
+    e.io.refuse = Some(e.io.commands.len() + 1);
+    let (allowed, _) = bw(&mut e, pstate_bw(), true);
+    if allowed.map(|a| a.uclk_pstate) != Ok(true)
+        || e.status.ignored.last != Some((0x1a, Error::Rejected(0xfd)))
+        || e.status.state != State::Applied
+    {
+        return TestResult::Fail("refused SetUclkPstateAllow ignored");
+    }
+    // A floor PMFW never acknowledges (ReturnHardMinStatus without the
+    // UCLK bit for a second) is logged, not raised.
+    e.io.wrong_ack = true;
+    let (unacked, _) = bw(&mut e, pinned, false);
+    e.io.wrong_ack = false;
+    if unacked.is_err() || e.status.ignored.last != Some((9, Error::HardMinTimeout(Clock::Memory)))
+    {
+        return TestResult::Fail("unacknowledged UCLK floor ignored");
+    }
+    // Revocation is still a failure, and the owner is not reused.
+    e.io.revoke = Some((e.io.commands.len() + 1, e.authority));
+    let (failed, _) = bw(&mut e, pstate_bw(), true);
+    if failed != Err(Error::Revoked) || e.status.state != State::Failed(Error::Revoked) {
+        return TestResult::Fail("revoked bandwidth step");
+    }
+    if bw(&mut e, pinned, false).0 != Err(Error::Busy) {
+        return TestResult::Fail("failed owner reused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-clk",
+    dcn401_bandwidth_sequence_without_idle_dpm_uses_uclk_hard_min
+);
+
+/// dcn401_notify_wm_ranges: set A as a clock range and set 1A as the
+/// dummy P-state set, sent through the DAL table transfer.
+fn dcn401_watermark_ranges_reach_pmfw() -> TestResult {
+    let t = ClockManager::wm_range_table();
+    let mut golden = [0u8; WM_TABLE_BYTES];
+    golden[8] = 2;
+    golden[9] = 1;
+    if t != golden {
+        return TestResult::Fail("WatermarksExternal_t");
+    }
+    let mut e = engine();
+    if run(e.notify_wm_ranges(0x8_0040_1000)) != Err(Error::Busy) {
+        return TestResult::Fail("ranges before the DPM query");
+    }
+    start(&mut e);
+    e.io.commands.clear();
+    if run(e.notify_wm_ranges(0x8_0040_1000)).is_err()
+        || e.io.commands != [(5, 8), (6, 0x0040_1000), (8, 2)]
+    {
+        return TestResult::Fail("watermark table transfer");
+    }
+    // The dcn401_smu_* helpers return nothing: a refusal is logged and the
+    // remaining messages are sent.
+    e.io.commands.clear();
+    e.io.refuse = Some(2);
+    if run(e.notify_wm_ranges(0x8_0040_1000)).is_err()
+        || e.io.commands != [(5, 8), (6, 0x0040_1000), (8, 2)]
+        || e.status.ignored.last != Some((6, Error::Rejected(0xfd)))
+        || e.status.state != State::Ready
+    {
+        return TestResult::Fail("refused watermark message");
+    }
+    // The display still lights: the pre-modeset floors apply as before.
+    if run(e.prepare(request())).is_err() || e.status.state != State::Applied {
+        return TestResult::Fail("prepare after a refused watermark notify");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/dcn401-clk", dcn401_watermark_ranges_reach_pmfw);
+
+/// dcn401_smu_send_msg_with_param waits only for a nonzero DAL_RESP and
+/// then sends: a fresh owner sends over a refusal an earlier owner left
+/// there. A refused NumOfDisplays or SetMinDeepSleepDcfclk is ignored, as
+/// Linux never reads either result, and a message that was never sent is
+/// never counted as refused.
+fn dcn401_dal_sends_after_any_response_and_ignores_count_refusals() -> TestResult {
+    let mut e = engine();
+    e.io.regs.insert(0x589d0, 0xfd);
+    if run(e.start(core::future::ready(Ok(power())))).is_err()
+        || e.io.commands.first() != Some(&(2, 0))
+        || e.status.ignored.count != 0
+    {
+        return TestResult::Fail("fresh owner over a stale refusal");
+    }
+    e.io.commands.clear();
+    e.io.refuse = Some(1);
+    if run(e.prepare(request())).is_err()
+        || e.status.state != State::Applied
+        || e.io.commands.first() != Some(&(0xe, 1))
+        || e.status.ignored.last != Some((0xe, Error::Rejected(0xfd)))
+    {
+        return TestResult::Fail("refused NumOfDisplays in prepare");
+    }
+    for (k, message) in [(1, 0xe), (2, 0xd)] {
+        e.io.commands.clear();
+        e.io.refuse = Some(k);
+        let count = e.status.ignored.count;
+        let up = Request {
+            deep_sleep_dcfclk_khz: 20_000 + k as u32 * 1000,
+            ..request()
+        };
+        let (applied, _) = live(&mut e, up, false, &|_| false);
+        if applied.is_err()
+            || e.status.state != State::Applied
+            || e.io.commands.get(k - 1).map(|c| c.0) != Some(message)
+            || e.io.commands.len() != 2
+            || e.status.ignored.count != count + 1
+            || e.status.ignored.last != Some((message, Error::Rejected(0xfd)))
+        {
+            return TestResult::Fail("refused live count or deep-sleep DCFCLK");
+        }
+    }
+    // PMFW never answering before the write: nothing sent, nothing ignored.
+    e.io.commands.clear();
+    e.io.regs.insert(0x589d0, 0);
+    let count = e.status.ignored.count;
+    if run(e.command_ignored(0xd, 5)) != Err(Error::Timeout)
+        || !e.io.commands.is_empty()
+        || e.status.ignored.count != count
+    {
+        return TestResult::Fail("unsent message counted as refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-clk",
+    dcn401_dal_sends_after_any_response_and_ignores_count_refusals
+);
+
+/// The display owner's side of `bandwidth::pin_uclk` over a real clock
+/// owner: what `ColdBoot` does through `update_live_display_bandwidth` and
+/// `disable_display_fams2`, with each step recorded in order.
+struct PinOwner {
+    e: Engine<Fake>,
+    steps: Vec<&'static str>,
+}
+impl crate::amdgpu_navi48_boot::bandwidth::UclkPin for PinOwner {
+    fn clock_status(&self) -> Result<Status, crate::amdgpu_dcn401_otg::Error> {
+        Ok(self.e.status)
+    }
+    async fn raise_bandwidth(
+        &mut self,
+        bandwidth: Bandwidth,
+    ) -> Result<(), crate::amdgpu_dcn401_otg::Error> {
+        self.steps.push("clocks");
+        let held = |at: u64| at == DIO + 0x1b43 * 4;
+        self.e
+            .update_bandwidth(bandwidth, false, &held)
+            .await
+            .map(|_| ())
+            .map_err(crate::amdgpu_dcn401_otg::Error::Clocks)
+    }
+    async fn disable_fams2(&mut self) {
+        self.steps.push("fams2");
+    }
+}
+/// A pin's result, the DAL messages it sent and the owner steps it ran.
+type Pinned = (
+    Result<(), crate::amdgpu_dcn401_otg::Error>,
+    Vec<(u32, u32)>,
+    Vec<&'static str>,
+);
+/// `pin_uclk` from the owner and the DAL messages and steps it ran.
+fn pin(o: &mut PinOwner) -> Pinned {
+    let before = o.e.io.commands.len();
+    o.steps.clear();
+    let result = run(crate::amdgpu_navi48_boot::bandwidth::pin_uclk(o));
+    (
+        result,
+        o.e.io.commands[before..].to_vec(),
+        core::mem::take(&mut o.steps),
+    )
+}
+
+/// Every ColdBoot configuration change pins first. A fresh display owner,
+/// as cold boot, S3 resume and runtime resume each build one, has nothing
+/// to pin: dcn401_init_clocks' P-state support is DC's software state, not
+/// something PMFW was told. So retire_inherited_display (clocks not
+/// started), the first modeset (pinned before it starts and prepares the
+/// clocks) and a modeset after resume (a new owner, whatever the old one
+/// allowed) pin with no message, and the prepare that follows disallows
+/// switching itself. Only once a bandwidth sequence allowed switching does
+/// the pin run Linux's prepare_bandwidth: the clocks raised with switching
+/// disallowed, then FAMS2 disabled.
+fn dcn401_fresh_display_owners_pin_like_linux_prepare_bandwidth() -> TestResult {
+    let fresh = || PinOwner {
+        e: engine(),
+        steps: Vec::new(),
+    };
+    // retire_inherited_display on cold boot: the clocks not started.
+    let mut o = fresh();
+    if !o.e.status.bandwidth.uclk_pstate || o.e.status.levels.is_some() {
+        return TestResult::Fail("fresh owner state");
+    }
+    if pin(&mut o) != (Ok(()), Vec::new(), Vec::new()) {
+        return TestResult::Fail("retire_inherited_display on a fresh owner");
+    }
+    // The first modeset: pinned before prepare_configuration starts the
+    // clocks, and again (a retry) once they started but are not prepared.
+    if pin(&mut o) != (Ok(()), Vec::new(), Vec::new()) {
+        return TestResult::Fail("first modeset before the clocks start");
+    }
+    start(&mut o.e);
+    if o.e.status.state != State::Ready || pin(&mut o) != (Ok(()), Vec::new(), Vec::new()) {
+        return TestResult::Fail("first modeset on started clocks");
+    }
+    // prepare disallows switching itself (Linux's first prepare_bandwidth).
+    o.e.io.commands.clear();
+    run(o.e.prepare(request())).unwrap();
+    if !o.e.io.commands.contains(&(0x1a, 0)) || o.e.status.uclk_switching() {
+        return TestResult::Fail("prepare from dcn401_init_clocks' state");
+    }
+    // Lit and pinned: nothing to pin for the next change.
+    o.e.io.regs.insert(DIO + 0x1b43 * 4, 1);
+    if pin(&mut o) != (Ok(()), Vec::new(), Vec::new()) {
+        return TestResult::Fail("pinned owner pinned again");
+    }
+    // The display monitor's optimize allows switching: the next change
+    // raises and disallows, and only then disables FAMS2.
+    let (allowed, _) = bw(&mut o.e, pstate_bw(), true);
+    if allowed.map(|a| a.uclk_pstate) != Ok(true) || !o.e.status.uclk_switching() {
+        return TestResult::Fail("optimize allowed switching");
+    }
+    let (result, sent, steps) = pin(&mut o);
+    if result.is_err()
+        || steps != ["clocks", "fams2"]
+        || sent.last() != Some(&(0x1a, 0))
+        || hard_mins(&sent) != [(2, 1200)]
+        || o.e.status.uclk_switching()
+        || o.e.status.applied.map(|a| a.memory_floor_khz) != Some(1_200_000)
+    {
+        return TestResult::Fail("pin while switching");
+    }
+    // After S3 or runtime resume the new owner is fresh again, whatever the
+    // old one allowed: the relight's pins send nothing until its prepare.
+    let (allowed, _) = bw(&mut o.e, pstate_bw(), true);
+    if allowed.is_err() || !o.e.status.uclk_switching() {
+        return TestResult::Fail("old owner switching before suspend");
+    }
+    // A teardown on an owner that failed while switching: the pin cannot
+    // run (Busy, nothing sent), which a configuration change returns and a
+    // teardown only logs before it goes on.
+    o.e.status.state = State::Failed(Error::Timeout);
+    let before = o.e.io.commands.len();
+    let busy = Err(crate::amdgpu_dcn401_otg::Error::Clocks(Error::Busy));
+    if pin(&mut o).0 != busy
+        || run(crate::amdgpu_navi48_boot::bandwidth::pin_uclk_for_teardown(
+            &mut o,
+        )) != busy
+        || o.e.io.commands.len() != before
+    {
+        return TestResult::Fail("teardown pin on a failed owner");
+    }
+    let mut resumed = fresh();
+    if pin(&mut resumed) != (Ok(()), Vec::new(), Vec::new()) {
+        return TestResult::Fail("relight after resume, clocks not started");
+    }
+    start(&mut resumed.e);
+    if pin(&mut resumed) != (Ok(()), Vec::new(), Vec::new()) {
+        return TestResult::Fail("relight after resume, clocks started");
+    }
+    // A failed start leaves nothing applied either.
+    let mut failed = fresh();
+    failed.e.io.refuse = Some(1);
+    if run(failed.e.start(core::future::ready(Ok(power())))).is_ok()
+        || pin(&mut failed) != (Ok(()), Vec::new(), Vec::new())
+    {
+        return TestResult::Fail("failed start");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-clk",
+    dcn401_fresh_display_owners_pin_like_linux_prepare_bandwidth
+);
+
+/// dcn401_update_clocks' optimize once no stream is left (DML21's
+/// min-clock state): NumOfDisplays(0), DCFCLK at its lowest level, the
+/// deep-sleep DCFCLK zero, then switching allowed before the UCLK floor
+/// drops to its lowest level. Only with every consumer retired, once, and
+/// the next configuration's pin and prepare disallow switching again.
+fn dcn401_no_display_left_releases_like_dcn401_update_clocks() -> TestResult {
+    let mut e = engine();
+    if run(e.release()) != Err(Error::Busy) || !e.io.commands.is_empty() {
+        return TestResult::Fail("release before the clocks were prepared");
+    }
+    start(&mut e);
+    let lit = Request {
+        deep_sleep_dcfclk_khz: 10_673,
+        ..request()
+    };
+    let applied = run(e.prepare(lit)).unwrap();
+    // A display still lit: nothing is sent.
+    let busy = DIO + 0x1b43 * 4;
+    e.io.regs.insert(busy, 1);
+    e.io.commands.clear();
+    if run(e.release()) != Err(Error::Busy)
+        || !e.io.commands.is_empty()
+        || e.status.state != State::Applied
+    {
+        return TestResult::Fail("release under a lit display");
+    }
+    e.io.regs.insert(busy, 0);
+    let released = run(e.release());
+    if e.io.commands
+        != [
+            (0xe, 0),
+            (9, 9 << 16 | 100),
+            (0x15, 0),
+            (0xd, 0),
+            (0x1a, 1),
+            (9, 2 << 16 | 100),
+            (0x15, 0),
+        ]
+    {
+        return TestResult::Fail("no-display optimize sequence");
+    }
+    let Ok(released) = released else {
+        return TestResult::Fail("no-display optimize failed");
+    };
+    if released.request.displays != 0
+        || released.dcf_floor_khz != 100_000
+        || released.memory_floor_khz != 100_000
+        || !released.uclk_pstate
+        || !e.status.uclk_switching()
+        || !e.status.bandwidth.fclk_pstate
+        || e.status.bandwidth.deep_sleep_dcfclk_khz != 0
+        || (released.display_khz, released.dpp_khz, released.dtb_khz)
+            != (applied.display_khz, applied.dpp_khz, applied.dtb_khz)
+    {
+        return TestResult::Fail("no-display optimize state");
+    }
+    // Once only.
+    e.io.commands.clear();
+    if run(e.release()) != Ok(released) || !e.io.commands.is_empty() {
+        return TestResult::Fail("second release");
+    }
+    // The next modeset's prepare counts its display and disallows again.
+    run(e.prepare(request())).unwrap();
+    if e.io.commands.first() != Some(&(0xe, 1))
+        || !e.io.commands.contains(&(0x1a, 0))
+        || e.status.uclk_switching()
+    {
+        return TestResult::Fail("prepare after the release");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-clk",
+    dcn401_no_display_left_releases_like_dcn401_update_clocks
 );

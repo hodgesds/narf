@@ -3,7 +3,7 @@
 //! checked afterwards exactly as a scanout started with those planes,
 //! without its timing, OPP or link ever being touched.
 use super::*;
-use crate::amdgpu_dcn401_otg::{LivePlanes, PlanesUpdated, UpdateType};
+use crate::amdgpu_dcn401_otg::{LivePlanes, PlaneContent, PlanesUpdated, UpdateType};
 use crate::amdgpu_dcn401_spl::{Rect, Rotation};
 
 /// ROUTES[1]: the display runs on pipe 2; pipe 3 is free for an overlay.
@@ -97,14 +97,59 @@ fn update(
     live: &LivePlanes,
     plan: &dml::Plan,
 ) -> Result<alloc::boxed::Box<PlanesUpdated>, Error> {
+    update_with(c, live, plan, &mut crate::amdgpu_dcn401_otg::Cleared)
+}
+/// `update` with fresh surfaces' first content from `content`.
+#[inline(never)]
+fn update_with(
+    c: &mut Chain,
+    live: &LivePlanes,
+    plan: &dml::Plan,
+    content: &mut dyn PlaneContent,
+) -> Result<alloc::boxed::Box<PlanesUpdated>, Error> {
     let clock = c.clock;
     let p = c.pipe;
     c.e.io.inner.inner.writes.clear();
-    run(c
-        .surfaces
-        .update_live_planes(&mut c.e, &c.pool, p, live, plan, CRYSTAL_KHZ, || {
-            Ok((clock, config()))
-        }))
+    run(c.surfaces.update_live_planes(
+        &mut c.e,
+        &c.pool,
+        p,
+        live,
+        plan,
+        CRYSTAL_KHZ,
+        content,
+        || Ok((clock, config())),
+    ))
+}
+/// A first frame for pipe `q`'s fresh surface: row `y` of a 64-pixel-wide
+/// plane is 0xff00_yy00 | x. Each chunk notes how many register writes the
+/// update had made by then.
+struct Pattern {
+    q: u8,
+    writes: Arc<AtomicUsize>,
+    seen: Vec<usize>,
+    /// Hand back a chunk past the surface's end instead.
+    outside: bool,
+    /// Another plane than before lands on pipe `q`.
+    moved: bool,
+}
+impl PlaneContent for Pattern {
+    fn moved_to(&mut self, pipe: u8) -> bool {
+        self.moved && pipe == self.q
+    }
+    fn chunk(&mut self, a: &SurfaceApplied, index: u32, words: &mut Vec<u32>) -> Option<u64> {
+        if a.request.pipe != self.q || index >= a.request.height {
+            return None;
+        }
+        self.seen.push(self.writes.load(Ordering::SeqCst));
+        words.clear();
+        words.extend((0..a.request.width).map(|x| 0xff00_0000 | index << 8 | x));
+        Some(if self.outside {
+            a.bytes
+        } else {
+            u64::from(index) * u64::from(a.pitch_bytes)
+        })
+    }
 }
 /// optimize_bandwidth after an update: the plan's exact watermarks.
 #[inline(never)]
@@ -136,14 +181,15 @@ fn live(primary: SurfaceRequest, overlays: &[SurfaceRequest]) -> LivePlanes {
 /// No write of the last update touched the stream: its OTG enable and
 /// clock, timing, ODM/OPTC source, DPG (blank) or DSC.
 fn stream_untouched(c: &Chain) -> bool {
-    let l = c.e.layout;
+    // The model's (full-board) addresses, as the writes are recorded.
+    let odm = |q: u8, r: u64| BASE + (r + u64::from(q) * 0x10) * 4;
     c.e.io.inner.inner.writes.iter().all(|&(at, _)| {
         (0..4u8).all(|q| {
             at != otg(q, 0x1b43)
                 && at != otg(q, 0x1b84)
                 && !(otg(q, 0x1b2a)..=otg(q, 0x1b3a)).contains(&at)
-                && at != l.odm(q, SOURCE)
-                && at != l.odm(q, MEMORY)
+                && at != odm(q, SOURCE)
+                && at != odm(q, MEMORY)
                 && at != opp(q, DPG)
         })
     })
@@ -186,7 +232,12 @@ fn tree_regs(q: u8) -> [u64; 5] {
 /// mpcc does on a full update, and a check of the live scanout passes
 /// afterwards.
 fn dcn401_live_plane_update_scales_the_primary_in_place() -> TestResult {
-    let (t, s, p) = ROUTES[1];
+    dcn401_live_plane_update_scales_the_primary_in_place_on(ROUTES[1])
+}
+/// The test above with the display on route (t, s, p).
+pub(super) fn dcn401_live_plane_update_scales_the_primary_in_place_on(
+    (t, s, p): (u8, u8, u8),
+) -> TestResult {
     let mut c = chain(t, s, p);
     if run(c.start()).is_err() {
         return TestResult::Fail("start");
@@ -313,8 +364,14 @@ fn op_is_overwritten(scaler: &crate::amdgpu_dcn401_spl::Scaler, reg: u64) -> boo
 ///   lock; only after the update latched is it drained, blanked and gated,
 ///   and its surface released to the pool.
 fn dcn401_live_plane_update_adds_moves_and_removes_an_overlay() -> TestResult {
-    let (t, s, p) = ROUTES[1];
-    let q = OVERLAY_PIPE;
+    dcn401_live_plane_update_adds_moves_and_removes_an_overlay_on(ROUTES[1], OVERLAY_PIPE)
+}
+/// The test above with the display on route (t, s, p) and the overlay on
+/// pipe q.
+pub(super) fn dcn401_live_plane_update_adds_moves_and_removes_an_overlay_on(
+    (t, s, p): (u8, u8, u8),
+    q: u8,
+) -> TestResult {
     let mut c = chain(t, s, p);
     if run(c.start()).is_err() {
         return TestResult::Fail("start");
@@ -431,10 +488,40 @@ fn dcn401_live_plane_update_adds_moves_and_removes_an_overlay() -> TestResult {
         || c.e.io.get(MPC_BASE + (0x2f2 + u64::from(p) * 4) * 4) & 0xf != u32::from(p)
         || c.e.io.get(h(q, HUBP_CONTROL)) & 0x1007 != 3
         || !stream_untouched(&c)
-        || optimize(&mut c, &plan3).is_err()
-        || run(c.check()).is_err()
     {
         return TestResult::Fail("overlay removed");
+    }
+    // Its DET is released on this update (dcn401_program_front_end_for_ctx:
+    // program_det_segments(0) under the lock, before the disconnect), and
+    // the compressed buffer grows into it once the freed pipe is disabled
+    // (optimize_bandwidth's program_compbuf_segments).
+    let crb = |i: u64| BASE + (0x4ba + i) * 4;
+    let det_freed = written(&c, crb(u64::from(q) + 1), 0x1f, 0);
+    let compbuf = written(&c, crb(0), 0x1f, 16);
+    if det_freed.len() != 1
+        || !(lock..unlock).contains(&det_freed[0])
+        || disconnect.first().is_none_or(|&i| i < det_freed[0])
+        || compbuf.len() != 1
+        || gated.first().is_none_or(|&i| i > compbuf[0])
+        || c.e.io.get(crb(u64::from(q) + 1)) & 0x1f1f != 0
+        || c.e.io.get(crb(u64::from(p) + 1)) & 0x1f1f != 5 * 0x101
+        || c.e.io.get(crb(0)) & 0x1f1f != 16 * 0x101
+        || c.e.status.requestor.map(|r| r.compbuf_bytes) != Some(16 * 65536)
+    {
+        return TestResult::Fail("freed DET and compbuf");
+    }
+    if optimize(&mut c, &plan3).is_err() || run(c.check()).is_err() {
+        return TestResult::Fail("check after the removal");
+    }
+    // Added again: the DET comes back from the compressed buffer.
+    raise(&mut c, &plan);
+    if update(&mut c, &live(base, &[overlay]), &plan).is_err()
+        || c.e.io.get(crb(u64::from(q) + 1)) & 0x1f1f != 5 * 0x101
+        || c.e.io.get(crb(0)) & 0x1f1f != 11 * 0x101
+        || optimize(&mut c, &plan).is_err()
+        || run(c.check()).is_err()
+    {
+        return TestResult::Fail("overlay added again");
     }
     TestResult::Pass
 }
@@ -443,12 +530,208 @@ kernel_test_in!(
     dcn401_live_plane_update_adds_moves_and_removes_an_overlay
 );
 
+/// A plane added on a fresh surface shows its framebuffer from the update
+/// itself, as DC scans the new plane's address from the update that adds
+/// it: the first content is written into the cleared, unpublished surface
+/// before the update's first register write, so the VUPDATE that latches
+/// the unblanked overlay already fetches it. A chunk past the surface's
+/// end refuses the update before any register write.
+fn dcn401_live_plane_update_shows_the_first_frame_at_the_latch() -> TestResult {
+    dcn401_live_plane_update_shows_the_first_frame_at_the_latch_on(ROUTES[1], OVERLAY_PIPE)
+}
+/// The test above with the display on route (t, s, p) and the overlay on
+/// pipe q.
+pub(super) fn dcn401_live_plane_update_shows_the_first_frame_at_the_latch_on(
+    (t, s, p): (u8, u8, u8),
+    q: u8,
+) -> TestResult {
+    let mut c = chain(t, s, p);
+    if run(c.start()).is_err() {
+        return TestResult::Fail("start");
+    }
+    free_pipe(&mut c, q);
+    let base = primary(&c);
+    let overlay = overlay_at(q, 100, 100);
+    let plan = plan_for(base, &[overlay]);
+    raise(&mut c, &plan);
+    let mut content = Pattern {
+        q,
+        writes: c.e.io.inner.writes.clone(),
+        seen: Vec::new(),
+        outside: true,
+        moved: false,
+    };
+    if update_with(&mut c, &live(base, &[overlay]), &plan, &mut content) != Err(Error::Invalid)
+        || !c.e.io.inner.inner.writes.is_empty()
+        || c.e.status.state != State::ScanoutRunning(p)
+    {
+        return TestResult::Fail("a chunk outside the surface");
+    }
+    let start = c.e.io.inner.writes.load(Ordering::SeqCst);
+    content.outside = false;
+    content.seen.clear();
+    let Ok(u) = update_with(&mut c, &live(base, &[overlay]), &plan, &mut content) else {
+        return TestResult::Fail("add the overlay");
+    };
+    let Some(o) = u.scanout.overlays[0] else {
+        return TestResult::Fail("overlay scanout record");
+    };
+    if content.seen.len() != 64 || content.seen.iter().any(|&n| n != start) {
+        return TestResult::Fail("first content after a register write");
+    }
+    let Some(a) = c.e.status.surfaces[usize::from(q)] else {
+        return TestResult::Fail("overlay surface record");
+    };
+    for (x, y) in [(0u32, 0u32), (63, 0), (17, 31), (0, 63), (63, 63)] {
+        let at = u64::from(y) * u64::from(a.pitch_bytes) + u64::from(x) * 4;
+        if c.vram(o.address, at) != 0xff00_0000 | y << 8 | x {
+            return TestResult::Fail("first content in the surface");
+        }
+    }
+    if !stream_untouched(&c) || optimize(&mut c, &plan).is_err() || run(c.check()).is_err() {
+        return TestResult::Fail("check with the overlay");
+    }
+    // The same plane again keeps its surface and what it shows; another
+    // plane landing on the pipe (a recreated plane moved onto it) takes a
+    // fresh surface with its own first frame, however alike the old
+    // surface's allocation is.
+    content.seen.clear();
+    if update_with(&mut c, &live(base, &[overlay]), &plan, &mut content).is_err()
+        || !content.seen.is_empty()
+        || c.e.status.surfaces[usize::from(q)].map(|s| s.address) != Some(a.address)
+    {
+        return TestResult::Fail("the same plane's surface not kept");
+    }
+    content.moved = true;
+    let Ok(u) = update_with(&mut c, &live(base, &[overlay]), &plan, &mut content) else {
+        return TestResult::Fail("another plane onto the pipe");
+    };
+    let Some(moved) = u.scanout.overlays[0] else {
+        return TestResult::Fail("moved overlay scanout record");
+    };
+    if content.seen.len() != 64
+        || moved.address == o.address
+        || c.vram(moved.address, 0) != 0xff00_0000
+        || optimize(&mut c, &plan).is_err()
+        || run(c.check()).is_err()
+    {
+        return TestResult::Fail("a plane moved onto the pipe kept the other plane's surface");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-plane-update",
+    dcn401_live_plane_update_shows_the_first_frame_at_the_latch
+);
+
+/// A pinned client framebuffer as a new plane's first frame
+/// (`PlaneContent::external`): no chunk is copied.
+struct ClientFb {
+    q: u8,
+    x: ExternalSurface,
+}
+impl PlaneContent for ClientFb {
+    fn chunk(&mut self, _: &SurfaceApplied, _: u32, _: &mut Vec<u32>) -> Option<u64> {
+        panic!("a client framebuffer copied");
+    }
+    fn external(&mut self, a: &SurfaceApplied) -> Option<ExternalSurface> {
+        (a.request.pipe == self.q).then_some(self.x)
+    }
+}
+
+/// A plane added with a client framebuffer scanned out in place shows it
+/// from the update itself, as DC programs a new plane's framebuffer
+/// address in the update that adds it: the overlay's HUBP fetches the
+/// framebuffer's address with its pitch, nothing is copied (its fresh
+/// staged buffer stays cleared and unfetched), and the live scanout checks
+/// against that record. One outside the frame-buffer aperture refuses the
+/// update before any register write.
+fn dcn401_live_plane_update_scans_a_client_framebuffer_from_the_latch() -> TestResult {
+    dcn401_live_plane_update_scans_a_client_framebuffer_from_the_latch_on(ROUTES[1], OVERLAY_PIPE)
+}
+/// The test above with the display on route (t, s, p) and the overlay on
+/// pipe q.
+pub(super) fn dcn401_live_plane_update_scans_a_client_framebuffer_from_the_latch_on(
+    (t, s, p): (u8, u8, u8),
+    q: u8,
+) -> TestResult {
+    let mut c = chain(t, s, p);
+    if run(c.start()).is_err() {
+        return TestResult::Fail("start");
+    }
+    free_pipe(&mut c, q);
+    let base = primary(&c);
+    let overlay = overlay_at(q, 100, 100);
+    let plan = plan_for(base, &[overlay]);
+    raise(&mut c, &plan);
+    let client = 0x8_4000_0000u64;
+    let x = ExternalSurface {
+        address: client,
+        pitch_bytes: 512,
+        chroma: None,
+        last: client + 512 * 64 - 1,
+        dcc_aligned: true,
+    };
+    let mut outside = ClientFb {
+        q,
+        x: ExternalSurface {
+            address: 0xc_0000_0000,
+            last: 0xc_0000_0000 + 512 * 64 - 1,
+            ..x
+        },
+    };
+    if update_with(&mut c, &live(base, &[overlay]), &plan, &mut outside) != Err(Error::Invalid)
+        || !c.e.io.inner.inner.writes.is_empty()
+        || c.e.status.state != State::ScanoutRunning(p)
+    {
+        return TestResult::Fail("a client framebuffer outside the aperture");
+    }
+    let Ok(u) = update_with(
+        &mut c,
+        &live(base, &[overlay]),
+        &plan,
+        &mut ClientFb { q, x },
+    ) else {
+        return TestResult::Fail("add the overlay on a client framebuffer");
+    };
+    let Some(o) = u.scanout.overlays[0] else {
+        return TestResult::Fail("overlay scanout record");
+    };
+    let Some(a) = c.e.status.surfaces[usize::from(q)] else {
+        return TestResult::Fail("overlay surface record");
+    };
+    let staged = a.at_staged(0).request.bytes();
+    if o.address != client
+        || a.address != client
+        || a.pitch_bytes != 512
+        || staged.pitch_bytes != 256
+        || c.e.io.get(h(q, 0x60a)) != client as u32
+        || c.e.io.get(h(q, 0x607)) & 0xffff != 512 / 4 - 1
+    {
+        return TestResult::Fail("overlay not fetching the client framebuffer");
+    }
+    if !stream_untouched(&c) || optimize(&mut c, &plan).is_err() || run(c.check()).is_err() {
+        return TestResult::Fail("check with the client overlay");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-plane-update",
+    dcn401_live_plane_update_scans_a_client_framebuffer_from_the_latch
+);
+
 /// Refusals leave the scanout exactly as it ran, without a register
 /// write: a plane on the display's own pipe, a pipe another plane holds
 /// or one not free, a plan for other planes, a display not scanning out.
 fn dcn401_live_plane_update_refuses_before_any_write() -> TestResult {
-    let (t, s, p) = ROUTES[1];
-    let q = OVERLAY_PIPE;
+    dcn401_live_plane_update_refuses_before_any_write_on(ROUTES[1], OVERLAY_PIPE)
+}
+/// The test above with the display on route (t, s, p) and the overlay on
+/// pipe q.
+pub(super) fn dcn401_live_plane_update_refuses_before_any_write_on(
+    (t, s, p): (u8, u8, u8),
+    q: u8,
+) -> TestResult {
     let mut c = chain(t, s, p);
     if run(c.start()).is_err() {
         return TestResult::Fail("start");
@@ -503,8 +786,14 @@ kernel_test_in!(
 /// that pipe's recout space; with the overlay gone, on the primary's
 /// alone again.
 fn dcn401_live_plane_update_moves_the_cursor_with_the_planes() -> TestResult {
-    let (t, s, p) = ROUTES[1];
-    let q = OVERLAY_PIPE;
+    dcn401_live_plane_update_moves_the_cursor_with_the_planes_on(ROUTES[1], OVERLAY_PIPE)
+}
+/// The test above with the display on route (t, s, p) and the overlay on
+/// pipe q.
+pub(super) fn dcn401_live_plane_update_moves_the_cursor_with_the_planes_on(
+    (t, s, p): (u8, u8, u8),
+    q: u8,
+) -> TestResult {
     let mut c = chain(t, s, p);
     if run(c.start()).is_err() {
         return TestResult::Fail("start");
@@ -552,4 +841,59 @@ fn dcn401_live_plane_update_moves_the_cursor_with_the_planes() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-plane-update",
     dcn401_live_plane_update_moves_the_cursor_with_the_planes
+);
+
+/// A CRTC color change on a live display reprograms its cursor, as
+/// amdgpu_dm_atomic_check pulls the cursor plane into the commit: turning
+/// legacy gamma on sets CUR0_ROM_EN (ENABLE_CURSOR_DEGAMMA) and off clears
+/// it, the cursor staying where it was; an unchanged color leaves the
+/// cursor's registers alone.
+fn dcn401_crtc_color_change_reprograms_the_cursor() -> TestResult {
+    let (t, s, p) = ROUTES[1];
+    let mut c = chain(t, s, p);
+    if run(c.start()).is_err() {
+        return TestResult::Fail("start");
+    }
+    let image = alloc::vec![0x8000_0000u32; 32 * 32];
+    if c.surfaces
+        .set_cursor(&mut c.e, &c.pool, config(), p, (32, 32, &image), (110, 120))
+        .is_err()
+    {
+        return TestResult::Fail("cursor");
+    }
+    // CM_CUR0_CURSOR0_CONTROL's CUR0_ROM_EN (bit 3).
+    let cm_control = dpp_reg(p, 0xcf1);
+    for legacy in [true, false] {
+        let program = alloc::sync::Arc::new(ColorProgram {
+            pre_degam_srgb: legacy,
+            ..Default::default()
+        });
+        if run(c.surfaces.set_color(&mut c.e, p, Some(program))).is_err() {
+            return TestResult::Fail("color update");
+        }
+        let Some(cursor) = c.e.status.cursor else {
+            return TestResult::Fail("cursor record");
+        };
+        if cursor.degamma != legacy
+            || (c.e.io.get(cm_control) >> 3 & 1 != 0) != legacy
+            || (cursor.x, cursor.y) != (110, 120)
+            || run(c.check()).is_err()
+        {
+            return TestResult::Fail("cursor degamma after the color change");
+        }
+    }
+    let writes = c.e.io.inner.inner.writes.len();
+    let same = alloc::sync::Arc::new(ColorProgram::default());
+    if run(c.surfaces.set_color(&mut c.e, p, Some(same))).is_err()
+        || c.e.io.inner.inner.writes[writes..]
+            .iter()
+            .any(|&(at, _)| at == cm_control)
+    {
+        return TestResult::Fail("unchanged color reprogrammed the cursor");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-plane-update",
+    dcn401_crtc_color_change_reprograms_the_cursor
 );

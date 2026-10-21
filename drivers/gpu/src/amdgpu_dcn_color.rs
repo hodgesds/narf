@@ -7,8 +7,11 @@
 //!
 //! Only what amdgpu_dm's CRTC properties reach on DCN 4.0.1 is here: the
 //! post-blend GAMMA_LUT (a 4096-entry atomic LUT on a linear base, or a
-//! 256-entry legacy ramp on an sRGB base) and the CTM. DCN 4.0.1 exposes no
-//! CRTC DEGAMMA_LUT (amdgpu_dm_crtc.c), so no DPP GAMCOR curve is built.
+//! 256-entry legacy ramp on an sRGB base), the CTM, and legacy gamma's
+//! implicit BT.709 degamma of an NV12 plane (mod_color_calculate_degamma_params
+//! and cm3_helper_translate_curve_to_degamma_hw_format: the DPP GAMCOR
+//! curve). DCN 4.0.1 exposes no CRTC DEGAMMA_LUT (amdgpu_dm_crtc.c), so no
+//! other GAMCOR curve is built.
 //! Everything is pure integer arithmetic on the heap; nothing touches
 //! hardware. `drivers/gpu/tests/dcn401_color/check.sh` checks the outputs
 //! against Linux compiled on the host.
@@ -1053,6 +1056,185 @@ pub fn translate_curve_to_hw_format(tf: &TfPoints) -> Option<Box<Pwl>> {
         green_reg: regs(1),
         blue_reg: regs(2),
     }))
+}
+
+/// build_coefficients' BT.709 column (numerator01..05[1]) and
+/// translate_to_linear_space: the BT.709 OETF inverted.
+fn bt709_to_linear(arg: Fx) -> Fx {
+    let a0 = Fx::from_fraction(180_000, 10_000_000);
+    let a1 = Fx::from_fraction(4500, 1000);
+    let a2 = Fx::from_fraction(99, 1000);
+    let a3 = Fx::from_fraction(99, 1000);
+    let gamma = Fx::from_fraction(2222, 1000);
+    let a0 = a0.mul(a1);
+    if arg.le(a0.neg()) {
+        a2.sub(arg).div(Fx::ONE.add(a3)).pow(gamma).neg()
+    } else if a0.neg().le(arg) && arg.le(a0) {
+        arg.div(a1)
+    } else {
+        a2.add(arg).div(Fx::ONE.add(a3)).pow(gamma)
+    }
+}
+
+/// mod_color_calculate_degamma_params(caps, input_tf, NULL, false) for
+/// map_crtc_degamma_to_dc_plane's TF_TYPE_PREDEFINED BT.709 input (an NV12
+/// plane under legacy gamma), which DCN 4.0.1's DGAM ROM caps do not
+/// short-circuit: it becomes TF_TYPE_DISTRIBUTED_POINTS from build_degamma
+/// (zero below 2^-12, BT.709's inverse OETF to 2^0, one above) copied and
+/// clamped by map_regamma_hw_to_x_user (no user ramp).
+#[allow(
+    clippy::needless_range_loop,
+    reason = "indexes the coordinates and the curve together, as build_degamma"
+)]
+pub fn bt709_degamma_tf() -> TfPoints {
+    let x = coordinates_x();
+    let begin = 13 * NUM_PTS_IN_REGION;
+    let end = begin + 12 * NUM_PTS_IN_REGION;
+    let mut tf = TfPoints::new();
+    for i in 0..=MAX_HW_POINTS {
+        let y = if i < begin {
+            Fx::ZERO
+        } else if i < end {
+            bt709_to_linear(x[i])
+        } else {
+            Fx::ONE
+        };
+        tf.red[i] = y;
+        tf.green[i] = y;
+        tf.blue[i] = y;
+    }
+    clamp_curve(&mut tf, MAX_HW_POINTS);
+    tf
+}
+
+/// interp_tf_pts: point `i >> 4` of `channel` plus (i & 0xf)/16 of the step
+/// to the next.
+fn interp_tf_pts(channel: &[Fx], i: usize) -> Fx {
+    let t = (i & 0xf) as i32;
+    let (at, next) = (channel[i >> 4], channel[(i >> 4) + 1]);
+    at.add(next.sub(at).mul_int(t).shr(4))
+}
+
+/// cm3_helper_translate_curve_to_degamma_hw_format: NUM_DEGAMMA_REGIONS (9)
+/// regions from 2^-9 to 2^0 of 1, 1, 2, 4 .. 128 points (256 in all), the
+/// last the curve at 2^0; flat corner slopes; then made monotonic and
+/// cm3_helper_convert_to_custom_float(fixpoint = false). The PWL
+/// dpp3_program_gamcor_lut loads into the DPP's GAMCOR.
+#[allow(
+    clippy::needless_range_loop,
+    reason = "the monotonic clamp reads point i and writes point i + 1, as cm3_helper does"
+)]
+pub fn translate_curve_to_degamma_hw_format(tf: &TfPoints) -> Option<Box<Pwl>> {
+    const NUM_DEGAMMA_REGIONS: usize = 9;
+    let mut seg_distr = [UNUSED; MAX_REGIONS_NUMBER];
+    seg_distr[0] = 0;
+    for (k, s) in seg_distr
+        .iter_mut()
+        .enumerate()
+        .take(NUM_DEGAMMA_REGIONS)
+        .skip(1)
+    {
+        *s = k as u32 - 1;
+    }
+    let region_start: i32 = -(NUM_DEGAMMA_REGIONS as i32);
+    let region_end: i32 = 0;
+    let hw_points: usize = seg_distr
+        .iter()
+        .filter(|&&s| s != UNUSED)
+        .map(|&s| 1usize << s)
+        .sum();
+    // rgb_resulted[256 + 3], zeroed by the memset of lut_params.
+    let mut rgb = vec![[Fx::ZERO; 3]; 256 + 3];
+    let channels = [&tf.red, &tf.green, &tf.blue];
+    let mut j = 0;
+    for (k, &seg) in seg_distr[..(region_end - region_start) as usize]
+        .iter()
+        .enumerate()
+    {
+        let increment = (NUMBER_SW_SEGMENTS as usize) << 4 >> seg;
+        let start = ((region_start + k as i32 + MAX_LOW_POINT) * NUMBER_SW_SEGMENTS) as usize;
+        for i in ((start << 4)..((start + NUMBER_SW_SEGMENTS as usize) << 4)).step_by(increment) {
+            if j == hw_points - 1 {
+                break;
+            }
+            if (i >> 4) + 1 >= TRANSFER_FUNC_POINTS {
+                return None;
+            }
+            rgb[j] = core::array::from_fn(|c| interp_tf_pts(channels[c], i));
+            j += 1;
+        }
+    }
+    let last = ((region_end + MAX_LOW_POINT) * NUMBER_SW_SEGMENTS) as usize;
+    rgb[hw_points - 1] = core::array::from_fn(|c| channels[c][last]);
+    let x0 = Fx::from_int(2).pow(Fx::from_int(region_start));
+    let x1 = Fx::from_int(2).pow(Fx::from_int(region_end));
+    // The corners' y before the curve is made monotonic.
+    let y1 = rgb[hw_points - 1];
+    let mut arr_curve_points = [GammaCurve::default(); MAX_REGIONS_NUMBER];
+    let mut k = 0;
+    for i in 1..MAX_REGIONS_NUMBER {
+        if seg_distr[k] != UNUSED {
+            arr_curve_points[k].segments_num = seg_distr[k];
+            arr_curve_points[i].offset = arr_curve_points[k].offset + (1 << seg_distr[k]);
+        }
+        k += 1;
+    }
+    if seg_distr[k] != UNUSED {
+        arr_curve_points[k].segments_num = seg_distr[k];
+    }
+    for i in 0..hw_points {
+        for c in 0..3 {
+            if rgb[i + 1][c].lt(rgb[i][c]) {
+                rgb[i + 1][c] = rgb[i][c];
+            }
+        }
+    }
+    let m12 = CustomFloatFormat {
+        mantissa_bits: 12,
+        exponenta_bits: 6,
+        sign: false,
+    };
+    let m10 = CustomFloatFormat {
+        mantissa_bits: 10,
+        ..m12
+    };
+    // corner_points[0]'s slope and offset and [1]'s slope stay as the
+    // memset left them (zero); [0]'s y and [1]'s offset are never converted.
+    let corners = [
+        core::array::from_fn(|_| Corner {
+            custom_float_x: custom_float(x0, m12),
+            custom_float_y: 0,
+            custom_float_offset: custom_float(Fx::ZERO, m12),
+            custom_float_slope: custom_float(Fx::ZERO, m12),
+        }),
+        core::array::from_fn(|c| Corner {
+            custom_float_x: custom_float(x1, m10),
+            custom_float_y: custom_float(y1[c], m12),
+            custom_float_offset: 0,
+            custom_float_slope: custom_float(Fx::ZERO, m10),
+        }),
+    ];
+    let regs = |c: usize| {
+        rgb[..hw_points]
+            .iter()
+            .map(|p| custom_float(p[c], m12))
+            .collect()
+    };
+    Some(Box::new(Pwl {
+        corners,
+        arr_curve_points,
+        hw_points_num: hw_points as u32,
+        red_reg: regs(0),
+        green_reg: regs(1),
+        blue_reg: regs(2),
+    }))
+}
+
+/// The GAMCOR PWL dcn32_set_input_transfer_func programs for an NV12 plane
+/// under legacy gamma: bt709_degamma_tf, then
+/// translate_curve_to_degamma_hw_format.
+pub fn bt709_degamma_pwl() -> Option<Box<Pwl>> {
+    translate_curve_to_degamma_hw_format(&bt709_degamma_tf())
 }
 
 /// A GAMMA_LUT's MPC OGAM curve, as amdgpu_dm and dcn401_set_output_transfer_func

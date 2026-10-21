@@ -33,9 +33,17 @@ fn dcn401_flip_requires_live_scanout_and_consistent_reports() -> TestResult {
         address: 0x8_0000_0000,
         pitch_bytes: 7680,
         bytes: 7680 * 1080,
+        chroma: None,
     };
     e.status.surfaces[0] = Some(surface);
-    if e.retarget(0, surface, 0x8_0100_0000) != Err(Error::Invalid)
+    if e.retarget(
+        0,
+        surface,
+        SurfaceApplied {
+            address: 0x8_0100_0000,
+            ..surface
+        },
+    ) != Err(Error::Invalid)
         || e.status.surfaces[0] != Some(surface)
     {
         return TestResult::Fail("partial retarget");

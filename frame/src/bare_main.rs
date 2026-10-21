@@ -4481,10 +4481,13 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     // `kernel-test` feature is on. `run_all_and_exit` never returns.
     #[cfg(feature = "kernel-test")]
     {
+        // Give the tests the production timebase: the same HPET bring-up
+        // and TSC calibration the real boot runs, so `monotonic_ns` and every
+        // `Deadline` count nanoseconds rather than raw TSC cycles.
+        #[cfg(target_arch = "x86_64")]
+        init_hpet_and_calibrate_tsc();
         // Timestamp kernel log records with the kernel's monotonic clock
-        // (CLOCK_MONOTONIC's source). This path never runs the async demo's
-        // TSC calibration, so the units are the clock's uncalibrated ones —
-        // still the same clock CLOCK_MONOTONIC reads in this build.
+        // (CLOCK_MONOTONIC's source).
         console::klog::set_clock(narf_time::monotonic_ns);
         // `test_subsystem=a,b,c` selects those subsystems (prefix-matched:
         // `filesystem` selects `filesystem/page_cache` too). This is the
@@ -4534,6 +4537,122 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     run_async_demo()
 }
 
+/// Bring up the HPET and calibrate the TSC timebase (x86_64).
+///
+/// Shared by the real boot path and the kernel-test boot. The kernel-test
+/// harness used to skip it, so `monotonic_ns` there counted raw TSC cycles
+/// and every test `Deadline` scaled with the host TSC frequency (a "3 s"
+/// bound was ~0.64 s of real time at 4.7 GHz).
+#[cfg(all(
+    target_arch = "x86_64",
+    any(
+        feature = "kernel-test",
+        not(any(feature = "boot-smoke", feature = "idt-selftest"))
+    )
+))]
+fn init_hpet_and_calibrate_tsc() {
+    // ioremap the HPET register block and hand `narf_time` the VIRTUAL
+    // base. The driver dereferences whatever base it is given, and it
+    // used to be given the raw physical address -- fine only while every
+    // address space carried the low identity map. HPET sits in the
+    // legacy MMIO hole below 4 GiB, i.e. squarely in PML4[0], which is
+    // user space now; a timer write taken while a user CR3 was live
+    // #PF'd on 0xfed00xxx. `ioremap` puts it in the vmalloc window,
+    // which IS shared into every address space, and maps it Device
+    // (uncached) -- correct for MMIO, unlike the write-back direct map.
+    //
+    // 1 KiB covers the general block plus 32 comparators
+    // (0x100 + 0x20*32 = 0x500).
+    // SAFETY: HPET's ACPI-declared register block, owned by us.
+    match unsafe {
+        narf_memory::ioremap::ioremap(
+            narf_time::hpet::base_phys_for_ioremap(),
+            0x1000,
+            narf_memory::ioremap::MmioAttrs::Device,
+        )
+    } {
+        Ok(m) => narf_time::hpet::set_base_phys(m.virt),
+        Err(e) => {
+            let _ = writeln!(console::Writer, "  hpet: ioremap failed: {e:?}");
+        }
+    }
+    // SAFETY: BSP, single-threaded boot context.
+    match unsafe { narf_time::hpet::init() } {
+        Ok(()) => {
+            let hz = narf_time::hpet::frequency_hz();
+            let n = narf_time::hpet::num_comparators();
+            let _ = writeln!(
+                console::Writer,
+                "  hpet: enabled @ {} MHz, {} comparators",
+                hz / 1_000_000,
+                n,
+            );
+            // Per-comparator caps — surfaces whether MSI-FSB
+            // delivery and periodic mode are actually available
+            // on this chipset. Critical diagnostic for boot
+            // failures where 'hpet armed but probe fired 0 ticks'
+            // — tells us which path was tried.
+            for i in 0..n {
+                let periodic = narf_time::hpet::comparator_supports_periodic(i);
+                let fsb = narf_time::hpet::comparator_supports_fsb(i);
+                let route_cap = narf_time::hpet::timer_route_cap(i);
+                let _ = writeln!(
+                    console::Writer,
+                    "  hpet:   comp{} periodic={} fsb={} route_cap={:#010x}",
+                    i,
+                    periodic,
+                    fsb,
+                    route_cap,
+                );
+            }
+            // LAPIC MMIO base from IA32_APIC_BASE MSR — Linux
+            // honors BIOS relocation via this MSR rather than
+            // hardcoding 0xFEE0_0000. If our hardcoded base
+            // doesn't match, MMIO writes go nowhere and MSI
+            // delivery (targeted at 0xFEE0_0000) won't reach
+            // the LAPIC.
+            // SAFETY: `rdmsr` of IA32_APIC_BASE (0x1B) — an
+            // architectural MSR present on every long-mode CPU — at
+            // CPL0, so the privileged `rdmsr` is permitted here.
+            // SAFETY: Valid memory or trusted environment
+            let apic_base = unsafe { narf_arch::x86_64::msr::rdmsr(0x0000_001B) };
+            let lapic_phys = apic_base & 0x0000_000F_FFFF_F000;
+            let _ = writeln!(
+                console::Writer,
+                "  apic: IA32_APIC_BASE={:#018x} (LAPIC phys={:#010x}, en={}, extd={})",
+                apic_base,
+                lapic_phys,
+                (apic_base >> 11) & 1,
+                (apic_base >> 10) & 1,
+            );
+        }
+        Err(e) => {
+            let _ = writeln!(console::Writer, "  hpet: probe failed: {e:?}");
+        }
+    }
+    let (tsc_hz, tsc_src) = narf_time::calibrate_clocks_with_source();
+    if tsc_hz != 0 {
+        // Timestamp kernel log records from here on (Linux's records are
+        // `[    0.000000]` until `sched_clock` is up). Installing before
+        // calibration would stamp early records in raw TSC cycles, which
+        // are larger than — and so out of order with — the ns that
+        // follow.
+        console::klog::set_clock(narf_time::monotonic_ns);
+        let _ = writeln!(
+            console::Writer,
+            "  tsc: calibrated to {} MHz ({} cyc/ns) via {}",
+            tsc_hz / 1_000_000,
+            (tsc_hz / 1_000_000_000).max(1),
+            tsc_src.name(),
+        );
+    } else {
+        let _ = writeln!(
+            console::Writer,
+            "  tsc: calibration failed — running in raw-tick units"
+        );
+    }
+}
+
 #[cfg(not(any(
     feature = "kernel-test",
     feature = "boot-smoke",
@@ -4576,106 +4695,9 @@ fn run_async_demo() -> ! {
     // doesn't deliver, HPET never tried).
     #[cfg(target_arch = "x86_64")]
     {
-        // ioremap the HPET register block and hand `narf_time` the VIRTUAL
-        // base. The driver dereferences whatever base it is given, and it
-        // used to be given the raw physical address -- fine only while every
-        // address space carried the low identity map. HPET sits in the
-        // legacy MMIO hole below 4 GiB, i.e. squarely in PML4[0], which is
-        // user space now; a timer write taken while a user CR3 was live
-        // #PF'd on 0xfed00xxx. `ioremap` puts it in the vmalloc window,
-        // which IS shared into every address space, and maps it Device
-        // (uncached) -- correct for MMIO, unlike the write-back direct map.
-        //
-        // 1 KiB covers the general block plus 32 comparators
-        // (0x100 + 0x20*32 = 0x500).
-        // SAFETY: HPET's ACPI-declared register block, owned by us.
-        match unsafe {
-            narf_memory::ioremap::ioremap(
-                narf_time::hpet::base_phys_for_ioremap(),
-                0x1000,
-                narf_memory::ioremap::MmioAttrs::Device,
-            )
-        } {
-            Ok(m) => narf_time::hpet::set_base_phys(m.virt),
-            Err(e) => {
-                let _ = writeln!(console::Writer, "  hpet: ioremap failed: {e:?}");
-            }
-        }
-        // SAFETY: BSP, single-threaded boot context.
-        match unsafe { narf_time::hpet::init() } {
-            Ok(()) => {
-                let hz = narf_time::hpet::frequency_hz();
-                let n = narf_time::hpet::num_comparators();
-                let _ = writeln!(
-                    console::Writer,
-                    "  hpet: enabled @ {} MHz, {} comparators",
-                    hz / 1_000_000,
-                    n,
-                );
-                // Per-comparator caps — surfaces whether MSI-FSB
-                // delivery and periodic mode are actually available
-                // on this chipset. Critical diagnostic for boot
-                // failures where 'hpet armed but probe fired 0 ticks'
-                // — tells us which path was tried.
-                for i in 0..n {
-                    let periodic = narf_time::hpet::comparator_supports_periodic(i);
-                    let fsb = narf_time::hpet::comparator_supports_fsb(i);
-                    let route_cap = narf_time::hpet::timer_route_cap(i);
-                    let _ = writeln!(
-                        console::Writer,
-                        "  hpet:   comp{} periodic={} fsb={} route_cap={:#010x}",
-                        i,
-                        periodic,
-                        fsb,
-                        route_cap,
-                    );
-                }
-                // LAPIC MMIO base from IA32_APIC_BASE MSR — Linux
-                // honors BIOS relocation via this MSR rather than
-                // hardcoding 0xFEE0_0000. If our hardcoded base
-                // doesn't match, MMIO writes go nowhere and MSI
-                // delivery (targeted at 0xFEE0_0000) won't reach
-                // the LAPIC.
-                // SAFETY: `rdmsr` of IA32_APIC_BASE (0x1B) — an
-                // architectural MSR present on every long-mode CPU — at
-                // CPL0, so the privileged `rdmsr` is permitted here.
-                // SAFETY: Valid memory or trusted environment
-                let apic_base = unsafe { narf_arch::x86_64::msr::rdmsr(0x0000_001B) };
-                let lapic_phys = apic_base & 0x0000_000F_FFFF_F000;
-                let _ = writeln!(
-                    console::Writer,
-                    "  apic: IA32_APIC_BASE={:#018x} (LAPIC phys={:#010x}, en={}, extd={})",
-                    apic_base,
-                    lapic_phys,
-                    (apic_base >> 11) & 1,
-                    (apic_base >> 10) & 1,
-                );
-            }
-            Err(e) => {
-                let _ = writeln!(console::Writer, "  hpet: probe failed: {e:?}");
-            }
-        }
-        let (tsc_hz, tsc_src) = narf_time::calibrate_clocks_with_source();
-        if tsc_hz != 0 {
-            // Timestamp kernel log records from here on (Linux's records are
-            // `[    0.000000]` until `sched_clock` is up). Installing before
-            // calibration would stamp early records in raw TSC cycles, which
-            // are larger than — and so out of order with — the ns that
-            // follow.
-            console::klog::set_clock(narf_time::monotonic_ns);
-            let _ = writeln!(
-                console::Writer,
-                "  tsc: calibrated to {} MHz ({} cyc/ns) via {}",
-                tsc_hz / 1_000_000,
-                (tsc_hz / 1_000_000_000).max(1),
-                tsc_src.name(),
-            );
-        } else {
-            let _ = writeln!(
-                console::Writer,
-                "  tsc: calibration failed — running in raw-tick units"
-            );
-        }
+        // HPET bring-up and TSC calibration, shared with the kernel-test
+        // boot (see `init_hpet_and_calibrate_tsc`).
+        init_hpet_and_calibrate_tsc();
 
         // Anchor CLOCK_REALTIME to the CMOS RTC now that the TSC timebase is
         // calibrated (so `monotonic_ns()` is accurate). Linux does this in
@@ -5125,17 +5147,15 @@ fn boot_userspace_init() {
         narf_scheduler::address_space_of_live(narf_scheduler::TaskId(task))
     });
     install_address_space_lookup(|| {
-        // Prefer the executor-published "currently-polling AS" —
-        // address_space_of searches the run-queue, which doesn't
-        // include the popped-and-being-polled slot. The fallback
-        // is kept so kernel-side introspection paths that resolve
-        // by id (not currently-polling) still work for tasks that
-        // are sitting on the queue.
+        // Prefer the executor-published "currently-polling AS". The
+        // fallback resolves by id through the live registry, which also
+        // covers a task staged in a wake inbox or parked, not only one
+        // sitting on a ready queue.
         if let Some(a) = narf_scheduler::current_address_space() {
             return Some(a);
         }
         let id = narf_scheduler::current_task_id();
-        narf_scheduler::address_space_of(id)
+        narf_scheduler::address_space_of_live(id)
     });
     install_all_address_spaces_lookup(narf_scheduler::all_address_spaces);
     // Make `gettid` (and any handler that calls
@@ -5216,26 +5236,15 @@ fn boot_userspace_init() {
     // ~10-50 ms scheduler tick the pump rides.
     #[cfg(target_arch = "x86_64")]
     {
-        // The handler drains the same way the pump does — bounded
-        // at 16 bytes/IRQ to keep the ISR latency predictable
-        // for level-triggered IRQs that re-fire if the line stays
-        // asserted (which it would until the FIFO drains).
+        // The handler drains the FIFO into the byte ring, up to 256
+        // bytes per IRQ like Linux `serial8250_rx_chars`. Flow control:
+        // `fill_byte_ring` never pulls a byte the ring cannot hold, and
+        // checks room, reads and pushes under the ring lock so this
+        // handler and the reader's `refill_byte_ring` on another CPU
+        // cannot overfill it (which evicted a queued byte). Bytes left
+        // behind stay in the UART FIFO until the reader refills.
         fn serial_isr() {
-            for _ in 0..16 {
-                // Flow control: never pull a byte the ring cannot hold. It
-                // stays in the UART FIFO until the console reader refills
-                // the ring (`narf_input::refill_byte_ring`).
-                if !narf_input::byte_ring_has_room() {
-                    narf_input::note_byte_ring_full();
-                    break;
-                }
-                match narf_console::try_read_byte() {
-                    Some(b) => {
-                        let _ = narf_input::push_global(narf_input::InputEvent::AsciiByte(b));
-                    }
-                    None => break,
-                }
-            }
+            narf_input::fill_byte_ring(narf_console::try_read_byte, 256);
         }
         // ISA IRQ 4 → GSI (with ISO override resolution) →
         // IOAPIC. PC AT default for IRQ 4 is edge-triggered

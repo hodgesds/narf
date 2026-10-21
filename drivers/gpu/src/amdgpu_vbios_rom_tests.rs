@@ -245,7 +245,7 @@ fn navi48_rom_profile_and_snapshot_are_independent_of_navi22() -> TestResult {
         gpu.ip_blocks = good.clone();
         gpu.regs.len = 0x10000;
         match case {
-            0 => gpu.ip_blocks[0].revision = 0,
+            0 => gpu.ip_blocks[0].revision = 2,
             1 => gpu.ip_blocks[1].major = 3,
             2 => gpu.ip_blocks[2].major = 11,
             3 => gpu.ip_blocks[2].revision = 3,

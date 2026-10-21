@@ -4,7 +4,7 @@
 //! This requires initialized VRAM; it does not perform memory training,
 //! create a GPCOM ring, allocate a TMR, or load graphics/SMC firmware.
 use crate::{
-    amdgpu::{AmdGpu, AMD_VENDOR, NAVI48},
+    amdgpu::{AmdGpu, AMD_VENDOR},
     amdgpu_discovery as discovery,
     amdgpu_psp_firmware::{self as firmware, Component, Image, STAGING_SIZE},
     amdgpu_vram::{Pool, Reservation},
@@ -56,6 +56,9 @@ enum Target {
     Rdna2(&'static crate::amdgpu_rdna2::Profile),
     Psp14_0_2,
     Psp14_0_3,
+    /// MP0 14.0.3 on a kicker board (`amdgpu_is_kicker_fw`: AI PRO R9700
+    /// revision 0xC8), which loads `psp_14_0_3_sos_kicker.bin`.
+    Psp14_0_3Kicker,
 }
 impl Target {
     fn name(self) -> &'static str {
@@ -63,12 +66,13 @@ impl Target {
             Self::Rdna2(chip) => chip.firmware.sos,
             Self::Psp14_0_2 => firmware::PSP14_0_2_SOS,
             Self::Psp14_0_3 => firmware::PSP14_0_3_SOS,
+            Self::Psp14_0_3Kicker => firmware::PSP14_0_3_SOS_KICKER,
         }
     }
     fn parse(self, bytes: &[u8]) -> Result<Image<'_>, Error> {
         match self {
             Self::Rdna2(_) => Image::parse(bytes),
-            Self::Psp14_0_2 | Self::Psp14_0_3 => Image::parse_psp14(bytes),
+            Self::Psp14_0_2 | Self::Psp14_0_3 | Self::Psp14_0_3Kicker => Image::parse_psp14(bytes),
         }
         .map_err(Error::Image)
     }
@@ -127,8 +131,11 @@ fn profile(gpu: &AmdGpu) -> Result<(Target, u64), Error> {
         }
         rdna2_psp = [chip.psp_version];
         &rdna2_psp
-    } else if gpu.chip.did == NAVI48 && version == (12, 0, 1) {
-        &[(14, 0, 2), (14, 0, 3)]
+    } else if crate::amdgpu_rdna4::Rdna4Chip::from_gc(version).is_some()
+        && crate::amdgpu_rdna4::Rdna4Chip::of(gpu).is_some()
+    {
+        // psp_v14_0 serves MP0 14.0.2 and 14.0.3 alike, on either die.
+        crate::amdgpu_rdna4::MP_VERSIONS
     } else {
         return Err(Error::Unsupported);
     };
@@ -144,6 +151,9 @@ fn profile(gpu: &AmdGpu) -> Result<(Target, u64), Error> {
     let target = match (rdna2, mp0.major, mp0.minor, mp0.revision) {
         (Some(chip), 11, 0, _) => Target::Rdna2(chip),
         (None, 14, 0, 2) => Target::Psp14_0_2,
+        (None, 14, 0, 3) if crate::amdgpu_rdna4::is_kicker(gpu.chip.did, gpu.chip.revision) => {
+            Target::Psp14_0_3Kicker
+        }
         (None, 14, 0, 3) => Target::Psp14_0_3,
         _ => return Err(Error::Unsupported),
     };
@@ -163,7 +173,7 @@ impl Firmware {
     pub(crate) fn is_psp14(&self, revision: u8) -> bool {
         matches!(
             (self.target, revision),
-            (Target::Psp14_0_2, 2) | (Target::Psp14_0_3, 3)
+            (Target::Psp14_0_2, 2) | (Target::Psp14_0_3 | Target::Psp14_0_3Kicker, 3)
         )
     }
     pub(crate) fn is_navi22(&self) -> bool {

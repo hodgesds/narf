@@ -495,7 +495,7 @@ fn navi48_fault_monitor_constructor_checks_discovery_and_live_authority() -> Tes
         let mut bad = crate::amdgpu_gmc_navi48::tests::descriptor(&mut words);
         match case {
             0 => bad.chip.did = crate::amdgpu::NAVI22,
-            1 => bad.ip_blocks[0].revision = 0,
+            1 => bad.ip_blocks[0].revision = 2,
             2 => bad.ip_blocks[1].minor = 0,
             3 => bad.ip_blocks[0].base_addrs[0] = 0x20000 - 0x1e25,
             4 => bad.ip_blocks.push(bad.ip_blocks[1]),

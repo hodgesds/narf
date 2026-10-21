@@ -1169,3 +1169,49 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_inode_pidfd_one_inode_per_process_pos
 );
+
+// ── open(O_CLOEXEC) → FD_CLOEXEC on every open path ─────────────────
+//
+// `do_sys_openat2` installs with `FD_ADD(how->flags, ...)`, and
+// `get_unused_fd_flags(O_CLOEXEC)` sets close-on-exec whatever the object
+// turns out to be: regular file, directory, device node or O_PATH handle.
+// systemd's executor depends on it: `fdset_new_fill` keeps only fds without
+// FD_CLOEXEC, so a log fd opened O_CLOEXEC that read back as 0 was closed
+// out from under the logger and the next `safe_close` aborted the unit.
+
+fn smoke_abi_fdio2_open_cloexec_every_path_pos() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"hi")], || {
+        const F_GETFD: u64 = 1;
+        const O_DIRECTORY: u64 = 0o200000;
+        const O_PATH: u64 = 0o10000000;
+        let cloexec = crate::fd::O_CLOEXEC as u64;
+        let cases: [(&[u8], u64, &str); 4] = [
+            (b"/abi/f\0", 0, "regular file"),
+            (b"/abi\0", O_DIRECTORY, "directory"),
+            (b"/dev/null\0", 0, "device node"),
+            (b"/abi/f\0", O_PATH, "O_PATH handle"),
+        ];
+        for (path, extra, _what) in cases {
+            for (want, flag) in [(1i64, cloexec), (0i64, 0)] {
+                let fd = match call(
+                    Syscall::Openat.raw(),
+                    a3((-100_i64) as u64, path.as_ptr() as u64, extra | flag, 0),
+                ) {
+                    Some(fd) if fd >= 0 => fd as u64,
+                    _ => return Err("openat failed"),
+                };
+                let got = call(Syscall::Fcntl.raw(), a2(fd, F_GETFD, 0));
+                let _ = call(Syscall::Close.raw(), a0(fd));
+                if got != Some(want) {
+                    return Err(if want == 1 {
+                        "openat(O_CLOEXEC) did not set FD_CLOEXEC"
+                    } else {
+                        "openat without O_CLOEXEC set FD_CLOEXEC"
+                    });
+                }
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio2_open_cloexec_every_path_pos);

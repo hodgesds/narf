@@ -47,10 +47,16 @@ fn navi48_identity_and_memory_follow_discovery_and_bar_bounds() -> TestResult {
     if NAVI48 != 0x7550 || gpu.chip.family != Family::Navi4 || gpu.chip.is_apu() {
         return TestResult::Fail("Navi48 PCI identity inherited another family");
     }
-    if amdgpu::__test_chip_info_for_pci_id(0x10de, NAVI48).is_some()
-        || amdgpu::__test_chip_info_for_pci_id(AMD_VENDOR, 0x7551).is_some()
-    {
-        return TestResult::Fail("unrequested vendor or professional SKU admitted");
+    if amdgpu::__test_chip_info_for_pci_id(0x10de, NAVI48).is_some() {
+        return TestResult::Fail("foreign vendor admitted");
+    }
+    // Every listed RDNA4 board, including the AI PRO R9700 and Navi44.
+    for did in [0x7551, 0x7590] {
+        if amdgpu::__test_chip_info_for_pci_id(AMD_VENDOR, did).map(|c| c.family)
+            != Some(Family::Navi4)
+        {
+            return TestResult::Fail("listed RDNA4 board refused");
+        }
     }
     let mut regs = vec![0u32; 0x4000 / 4];
     regs[0xde3] = 16 * 1024;
@@ -110,10 +116,10 @@ fn navi48_identity_rejects_missing_mismatched_and_duplicate_gc() -> TestResult {
         let mut gpu = gpu();
         match case {
             0 => gpu.ip_blocks.clear(),
-            1 => gpu.ip_blocks[0].revision = 0, // Navi44, not Navi48.
+            1 => gpu.ip_blocks[0].revision = 2, // No RDNA4 die is GC 12.0.2.
             2 => gpu.ip_blocks.push(gpu.ip_blocks[0]),
             3 => gpu.gc_info = None,
-            _ => gpu.chip.did = 0x7551,
+            _ => gpu.chip.family = Family::Navi3,
         }
         if query_against(&Snapshot::from_gpu(&gpu), u::AMDGPU_INFO_DEV_INFO, [0; 4]).is_ok() {
             return TestResult::Fail("unverified Navi48 identity/topology reported");

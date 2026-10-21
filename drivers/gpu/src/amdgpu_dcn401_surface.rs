@@ -12,9 +12,9 @@ mod vm;
 pub use vm::MemoryApplied;
 #[path = "amdgpu_dcn401_dpp.rs"]
 mod dpp;
-#[cfg(feature = "kernel-test")]
-pub(in crate::amdgpu_dcn401_otg) use dpp::post_csc_words;
 pub use dpp::DppApplied;
+#[cfg(feature = "kernel-test")]
+pub(in crate::amdgpu_dcn401_otg) use dpp::{post_csc_set_b, post_csc_words, CURSOR_MATRIX_WORD};
 #[path = "amdgpu_dcn401_mpc.rs"]
 mod mpc;
 pub use mpc::MpcApplied;
@@ -35,10 +35,11 @@ mod flip;
 mod plane_update;
 #[path = "amdgpu_dcn401_scanout.rs"]
 mod scanout;
-pub use color::{ColorProgram, GamutProgram, OgamProgram, PipeColor};
-pub use flip::FlipDone;
+pub use color::{ColorProgram, GamutProgram, InputTf, OgamProgram, PipeColor, PreDegam};
+pub use flip::{ExternalSurface, FlipDone, FlipSource};
 pub use plane_update::{
-    plane_update_type, planes_update_type, LivePlanes, PlanesUpdated, UpdateType,
+    plane_update_type, planes_update_type, Cleared, LivePlanes, PlaneContent, PlanesUpdated,
+    UpdateType,
 };
 pub use scanout::{
     LivePipe, OverlayScanout, ScanoutPosition, ScanoutRunning, ScanoutUnderflow, VblankPhase,
@@ -375,6 +376,9 @@ pub struct PlaneLayout {
     /// primary's): it blends under the primary instead of above it.
     pub underlay: bool,
 }
+/// A viewport's first column and width, as dml2_pipe_configuration_descriptor
+/// carries it (viewport_x_start, viewport_width).
+pub type McacheSpan = (u32, u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SurfaceRequest {
     pub pipe: u8,
@@ -402,9 +406,18 @@ pub struct SurfaceApplied {
     pub request: SurfaceRequest,
     /// GPU framebuffer address, never a CPU BAR or translated physical address.
     pub address: u64,
+    /// The luma (or RGB) pitch HUBP fetches with: the staged buffers'
+    /// (`SurfaceRequest::bytes`), or a client framebuffer's scanned out in
+    /// place (fb->pitches[0], as amdgpu_dm_plane_fill_plane_buffer_attributes
+    /// hands DC its surface_pitch).
     pub pitch_bytes: u32,
-    /// Visible rows including pitch padding; the reservation is page-rounded.
+    /// The staged buffers' size: visible rows including pitch padding (the
+    /// reservation is page-rounded). A client framebuffer's never.
     pub bytes: u64,
+    /// A 4:2:0 surface's chroma plane: its offset from `address` and its
+    /// pitch in bytes (the staged layout, or a client framebuffer's
+    /// offsets[1] - offsets[0] and pitches[1]); none for RGB.
+    pub chroma: Option<(u64, u32)>,
 }
 impl SurfaceRequest {
     fn geometry(self) -> Result<(u32, u64), Error> {
@@ -612,6 +625,24 @@ impl SurfaceRequest {
                 (p, scaler)
             })
     }
+    /// dml21_get_pipe_mcache_config for pipe `p` of the request: the x and
+    /// width of the pipe's own SPL luma viewport, and of its chroma
+    /// viewport for a 4:2:0 surface (scl_data.viewport and viewport_c, also
+    /// when rotated). `None` for a pipe the request does not fetch on.
+    pub fn mcache_viewports(self, p: u8) -> Option<(McacheSpan, Option<McacheSpan>)> {
+        let (_, scaler) = self.scalers().find(|&(q, _)| q == p)?;
+        let span = |r: spl::Rect| (r.x.max(0) as u32, r.width.max(0) as u32);
+        let chroma = self.format.is_video().then(|| span(scaler.viewport_c));
+        Some((span(scaler.viewport), chroma))
+    }
+    /// resource_build_scaling_params for pipe `p` of the request: whether
+    /// SPL can scale the plane on that pipe's slice (`scalers`); true for
+    /// a pipe the request does not fetch on.
+    pub fn scales_on(self, p: u8) -> bool {
+        self.scalers()
+            .find(|&(q, _)| q == p)
+            .is_none_or(|(_, scaler)| scaler.ok)
+    }
     /// Each fetching pipe with its ODM segment's first stream column and
     /// width (resource_get_odm_slice_dst_rect: the line over the segment
     /// count, in whole pixel pairs for 4:2:0, the last segment the rest),
@@ -735,6 +766,26 @@ impl SurfaceRequest {
     }
 }
 impl SurfaceApplied {
+    /// The staged buffers' layout for `request` at `address`.
+    pub fn staged(request: SurfaceRequest, address: u64, pitch_bytes: u32, bytes: u64) -> Self {
+        Self {
+            request,
+            address,
+            pitch_bytes,
+            bytes,
+            chroma: request.chroma(),
+        }
+    }
+    /// The same plane fetching the staged buffer at `address` (a back
+    /// buffer or the front reservation): the staged pitch and chroma.
+    pub(in crate::amdgpu_dcn401_otg) fn at_staged(self, address: u64) -> Self {
+        Self {
+            address,
+            pitch_bytes: self.request.bytes().pitch_bytes,
+            chroma: self.request.chroma(),
+            ..self
+        }
+    }
     /// The byte offset of `count` packed 32-bit words written into row `y`
     /// from pixel `x`: they start on a word and end within the row's pixels
     /// rounded up to whole words (inside the 256-byte-aligned pitch).
@@ -755,12 +806,13 @@ impl SurfaceApplied {
         {
             return Err(Error::Invalid);
         }
-        Ok(u64::from(y) * u64::from(self.pitch_bytes) + first)
+        // The staged buffers' rows, whichever buffer the plane fetches.
+        Ok(u64::from(y) * u64::from(self.request.bytes().pitch_bytes) + first)
     }
     /// The chroma plane's address (DCSURF_PRIMARY_SURFACE_ADDRESS_C) for a
     /// surface at `address`; none for RGB.
     pub fn chroma_address(self, address: u64) -> Option<u64> {
-        self.request.chroma().map(|(offset, _)| address + offset)
+        self.chroma.map(|(offset, _)| address + offset)
     }
     /// One segment's HUBP surface registers, in hubp401_program_surface_config
     /// and hubp401_program_surface_flip_and_addr's terms: DCSURF_SURFACE_CONTROL
@@ -790,8 +842,7 @@ impl SurfaceApplied {
                 self.pitch_bytes / format.bytes_per_pixel() - 1,
             ),
         ];
-        let chroma = self.request.chroma();
-        if let Some((_, pitch_c)) = chroma {
+        if let Some((_, pitch_c)) = self.chroma {
             out.push((0x608, 0xffff, pitch_c / format.chroma_bytes_per_pixel() - 1));
         }
         out.extend([
@@ -850,6 +901,12 @@ impl Surfaces {
         request: SurfaceRequest,
     ) -> Result<SurfaceApplied, Error> {
         let (pitch_bytes, bytes) = request.geometry()?;
+        // Every fetching pipe is a pipe index of this pool (fused slots past
+        // `count` have no blocks).
+        let count = engine.layout.pool.count();
+        if request.segments().any(|(p, _, _)| p >= count) {
+            return Err(Error::Invalid);
+        }
         let slot = usize::from(request.pipe);
         // Restaging a torn-down pipe (a replug) is allowed only right after
         // plane retirement (and the HUBP power-up that follows it in a
@@ -909,12 +966,7 @@ impl Surfaces {
         {
             return Err(Error::Invalid);
         }
-        let applied = SurfaceApplied {
-            request,
-            address: memory.address(),
-            pitch_bytes,
-            bytes,
-        };
+        let applied = SurfaceApplied::staged(request, memory.address(), pitch_bytes, bytes);
         self.0[slot] = Some(Surface {
             memory,
             applied,

@@ -219,6 +219,73 @@ pub fn mhi_vector_cookie(
     }
 }
 
+/// Tear down the CPU-vector half of a partially constructed MSI setup.
+///
+/// `enable_msi` only discovers the capability and `program_msi` writes an
+/// address/data pair; delivery stays disabled until power-up.  The IDT
+/// vectors and their dispatch entries are nevertheless live as soon as
+/// [`alloc_msi`] installs them, so every later probe error must reclaim them
+/// before another driver can bind the function.
+pub(super) fn teardown_msi_vectors(
+    config: &hw::MsiConfig,
+    ep_base_data: u32,
+    n_vectors: u8,
+    base_irq: u8,
+) {
+    for i in 0..n_vectors {
+        let vector = base_irq + i;
+        // Stop delivery before touching the handler chain.  An interrupt
+        // already in flight is then drained before this vector is returned
+        // to the allocator.
+        narf_interrupts::disable_irq(vector);
+        match mhi_vector_cookie(config, ep_base_data, n_vectors, i) {
+            Some(cookie) => {
+                let _ = narf_interrupts::remove_handler(vector, "ath11k-mhi", cookie);
+            }
+            None => {
+                let _ = narf_interrupts::remove_handler(vector, "ath11k", i as u64);
+            }
+        }
+        narf_interrupts::dispatch::clear_all_wakers(vector);
+        narf_interrupts::synchronize_irq(vector);
+        let _ = narf_interrupts::vector::free(vector);
+    }
+}
+
+/// Keep a vector reserved when MSI delivery cannot be proven disabled.
+///
+/// Reusing a vector that a still-live PCI function can target is worse than
+/// leaking it: a later driver could receive the old device's interrupt.  The
+/// dispatch mask prevents it from running any handler while this function is
+/// left quarantined for the rest of the boot.
+fn quarantine_msi_vectors(n_vectors: u8, base_irq: u8) {
+    for i in 0..n_vectors {
+        let vector = base_irq + i;
+        narf_interrupts::disable_irq(vector);
+        narf_interrupts::dispatch::clear_all_wakers(vector);
+        narf_interrupts::synchronize_irq(vector);
+    }
+}
+
+/// Disable MSI delivery and return the interrupt resources owned by a failed
+/// ath11k probe.  This is deliberately usable before the controller has been
+/// published: no MHI DMA buffers exist yet, but the IRQ plumbing does.
+fn teardown_msi(state: &MsiState) {
+    // SAFETY: the caller still owns this function's cfg space.  If the cfg
+    // write fails (for example, a surprise-removed function), do not recycle
+    // its vector: its MSI source cannot be proven quiesced.
+    if unsafe { narf_bus::msi::disable(&state.bus_cfg) }.is_ok() {
+        teardown_msi_vectors(
+            state.config,
+            state.ep_base_data,
+            state.n_vectors,
+            state.base_irq,
+        );
+    } else {
+        quarantine_msi_vectors(state.n_vectors, state.base_irq);
+    }
+}
+
 /// Resolves when an MHI vector fires or the slice ends.
 struct MhiIrqWait {
     sleep: narf_time::SleepUntil,
@@ -595,18 +662,27 @@ async fn mhi_bring_up(s: MhiStart) -> Result<(MhiController<Bar0Mhi>, FwApi), Mh
     let (fw, api) = load_firmware(s.fw_dir).await?;
     let params = ControllerParams::ath11k(s.mmio.len.min(u32::MAX as u64) as u32, s.nr_irqs);
     let mut ctrl = MhiController::new(Bar0Mhi { mmio: s.mmio }, cfg, params)?;
-    ctrl.prepare_for_power_up()?;
-    let (bhi, bhie) = ctrl.bhi_offsets();
-    let _ = writeln!(
-        narf_console::Writer,
-        "  ath11k: mhi: BHI at {:#x}, BHIe at {:#x}, timeout {} ms",
-        bhi,
-        bhie,
-        params.timeout_ms
-    );
-    ctrl.set_firmware(fw);
-    ctrl.sync_power_up().await?;
-    ctrl.prepare_for_transfer("IPCR").await?;
+    let result: Result<(), MhiError> = async {
+        ctrl.prepare_for_power_up()?;
+        let (bhi, bhie) = ctrl.bhi_offsets();
+        let _ = writeln!(
+            narf_console::Writer,
+            "  ath11k: mhi: BHI at {:#x}, BHIe at {:#x}, timeout {} ms",
+            bhi,
+            bhie,
+            params.timeout_ms
+        );
+        ctrl.set_firmware(fw);
+        ctrl.sync_power_up().await?;
+        ctrl.prepare_for_transfer("IPCR").await
+    }
+    .await;
+    if let Err(e) = result {
+        // A failed MHI start can still have live BHIe/context DMA.  Reset the
+        // function before this owner drops those allocations.
+        abort_mhi_bring_up(&mut ctrl).await;
+        return Err(e);
+    }
     let st = ctrl.stats;
     let _ = writeln!(
         narf_console::Writer,
@@ -626,16 +702,46 @@ async fn mhi_bring_up(s: MhiStart) -> Result<(MhiController<Bar0Mhi>, FwApi), Mh
     Ok((ctrl, api))
 }
 
+/// Quiesce a failed MHI/WLFW initialisation before its owner is dropped.
+///
+/// The single physical radio has one MHI task, so an old IRQ bit or waker is
+/// never meaningful after that task gives up.  Clear both along with the
+/// public readiness state after the controller has reset the device.
+async fn abort_mhi_bring_up(ctrl: &mut MhiController<Bar0Mhi>) {
+    ctrl.abort_bring_up().await;
+    reset_mhi_task_state();
+}
+
+/// The firmware lookup and controller construction happen before an
+/// [`MhiController`] exists.  They can still fail after PCI power-up enabled
+/// MSI and disabled ASPM, so quiesce that PCI half here as well.
+fn abort_unowned_mhi_bring_up(s: MhiStart) {
+    Bar0Mhi { mmio: s.mmio }.hif_power(HifPower::Down);
+    reset_mhi_task_state();
+}
+
+fn reset_mhi_task_state() {
+    MHI_UP.store(false, Ordering::Release);
+    MHI_IRQ_PENDING.store(0, Ordering::Release);
+    *MHI_WAKER.lock() = None;
+}
+
 /// The MHI bring-up task spawned by probe: MHI to mission mode, then
 /// the WLFW handshake to FW_READY.
 pub async fn mhi_task(s: MhiStart) {
     use core::fmt::Write as _;
+    MHI_UP.store(false, Ordering::Release);
     match mhi_bring_up(s).await {
         Ok((ctrl, api)) => {
             MHI_UP.store(true, Ordering::Release);
             wlfw_bring_up(ctrl, s, api).await;
         }
         Err(e) => {
+            // `load_firmware` and `MhiController::new` can fail before an
+            // MHI owner exists, while PCI is already powered up.  Repeating
+            // this after a controller-owned failure is harmless and keeps
+            // the no-owner path equally safe.
+            abort_unowned_mhi_bring_up(s);
             diag::latch_wifi_error(e.step, e.detail);
             let _ = writeln!(
                 narf_console::Writer,
@@ -671,6 +777,8 @@ async fn wlfw_bring_up(ctrl: MhiController<Bar0Mhi>, s: MhiStart, api: FwApi) {
     use core::fmt::Write as _;
     diag::set_wifi_stage(WifiStage::Control);
     let Some(fw) = wlfw::NarfFirmware::new() else {
+        let mut ctrl = ctrl;
+        abort_mhi_bring_up(&mut ctrl).await;
         return wlfw_fail(wlfw::WlfwError::new(
             wlfw::step::NO_FW_AUTHORITY,
             0,
@@ -688,6 +796,8 @@ async fn wlfw_bring_up(ctrl: MhiController<Bar0Mhi>, s: MhiStart, api: FwApi) {
         pci_dev_name(s.pci_addr),
         super::board::check_smbios().bdf_ext,
     ) else {
+        let mut ctrl = ctrl;
+        abort_mhi_bring_up(&mut ctrl).await;
         return wlfw_fail(wlfw::WlfwError::new(
             wlfw::step::UNSUPPORTED,
             0,
@@ -726,7 +836,12 @@ async fn wlfw_bring_up(ctrl: MhiController<Bar0Mhi>, s: MhiStart, api: FwApi) {
             // Linux: ath11k_core_qmi_firmware_ready.
             super::core::pci_start(w).await;
         }
-        Err(e) => wlfw_fail(e),
+        Err(e) => {
+            // The QMI owner has handed target-memory DMA to firmware by this
+            // point on several failure paths.  Stop MHI before `w` drops it.
+            abort_mhi_bring_up(&mut w.client.pipe).await;
+            wlfw_fail(e);
+        }
     }
 }
 
@@ -777,12 +892,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // Enable MEM_SPACE + BUS_MASTER. The MHI controller will issue
     // DMA from inside the chip once running, so BUS_MASTER must be
     // set before BAR mapping completes.
-    narf_bus::pci::set_command(
-        &cap,
-        &device,
-        narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::BUS_MASTER,
-    )
-    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    let command_bits = narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::BUS_MASTER;
+    narf_bus::pci::set_command(&cap, &device, command_bits)
+        .map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
     // SAFETY: caller hands us exclusive BusDeviceCap authority for
     // this device's cfg + BARs.
@@ -790,6 +902,10 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     let dev = match result {
         Ok(d) => d,
         Err(e) => {
+            // No controller was published, so no later lifecycle path will
+            // revoke the command bits.  In particular, leaving BUS_MASTER
+            // set after a rejected probe would let an unbound function DMA.
+            let _ = narf_bus::pci::clear_command(&cap, &device, command_bits);
             let (code, detail) = e.diag_code();
             diag::latch_wifi_error(code, detail);
             let _ = writeln!(
@@ -947,7 +1063,21 @@ pub unsafe fn bring_up(
     )
     .ok();
     // SAFETY: caller owns cfg space exclusively.
-    unsafe { narf_bus::msi::enable(&msi.bus_cfg) }.map_err(|_| ProbeError::MsiUnavailable)?;
+    if unsafe { narf_bus::msi::enable(&msi.bus_cfg) }.is_err() {
+        // Keep the PCIe link as we found it before returning an error.  The
+        // probe caller clears MEM_SPACE/BUS_MASTER; this path owns the MSI
+        // vectors and dispatch handlers created above.
+        if let Some(link_ctl) = saved_link_ctl {
+            let _ = narf_bus::pci_express::clear_and_set_link_control(
+                cap,
+                device,
+                narf_bus::pci_express::LNKCTL_ASPMC,
+                link_ctl & narf_bus::pci_express::LNKCTL_ASPMC,
+            );
+        }
+        teardown_msi(&msi);
+        return Err(ProbeError::MsiUnavailable);
+    }
     diag::set_wifi_stage(WifiStage::PowerUp);
 
     Ok(Ath11kDevice {
@@ -1018,7 +1148,10 @@ unsafe fn alloc_msi(
         }
     }
     // SAFETY: caller owns cfg space exclusively.
-    unsafe { narf_bus::msi::disable(&state.bus_cfg) }.map_err(|_| ProbeError::MsiUnavailable)?;
+    if unsafe { narf_bus::msi::disable(&state.bus_cfg) }.is_err() {
+        teardown_msi(&state);
+        return Err(ProbeError::MsiUnavailable);
+    }
     Ok(state)
 }
 

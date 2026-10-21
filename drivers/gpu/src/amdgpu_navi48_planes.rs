@@ -2,8 +2,9 @@
 //! non-modeset plane commit (amdgpu_dm_commit_planes) through
 //! dc_update_planes_and_stream. DML admits the configuration again with
 //! the display's new planes (dc_validate_global_state on a full update),
-//! every plane DC keeps stays on its pipes, a new plane takes free pipes
-//! (resource_update_pipes_for_plane_with_slice_count), and the change runs
+//! the planes take their pipes as DC acquires them (`live_pipes`: planes
+//! amdgpu_dm recreates take their blending tree's pipes back first, new
+//! ones pipes the running state leaves free), and the change runs
 //! in dc_commit_updates_for_stream's order: prepare_bandwidth (shared clocks
 //! and the kept pipes' DPP DTOs raised, the new pipes' DPP-only clocks,
 //! the other displays to their new plans with raise-only watermarks), the
@@ -15,7 +16,7 @@ use super::*;
 
 /// A running display moved to new planes without relighting, with every
 /// running display's record (another display's plan may have moved too),
-/// in pipe order.
+/// in CRTC order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanesChange {
     pub pipe: u8,
@@ -23,107 +24,168 @@ pub struct PlanesChange {
     pub updated: alloc::boxed::Box<otg::PlanesUpdated>,
 }
 
-/// The first `want` pipes of `current`, then free ones for the rest.
-fn keep_split(
-    current: otg::SplitPipes,
-    want: usize,
-    free: &mut FreePipes,
-) -> Result<otg::SplitPipes, ModesetError> {
-    let mut pipes: Vec<u8> = current.iter().take(want).collect();
-    while pipes.len() < want {
-        pipes.push(free.take()?);
+/// The first framebuffer contents of the planes a seamless update shows on
+/// fresh surfaces (`otg::PlaneContent`), by plane slot: 0 the primary, k + 1
+/// the setup's overlay k.
+pub trait FirstFrames: Send {
+    fn chunk(
+        &mut self,
+        slot: usize,
+        a: &otg::SurfaceApplied,
+        index: u32,
+        words: &mut Vec<u32>,
+    ) -> Option<u64>;
+    /// A client framebuffer slot `slot` scans out in place instead
+    /// (`otg::PlaneContent::external`).
+    fn external(&mut self, _slot: usize, _a: &otg::SurfaceApplied) -> Option<otg::ExternalSurface> {
+        None
     }
-    otg::SplitPipes::new(&pipes).ok_or(ModesetError::Display(otg::Error::Invalid))
+}
+/// No first contents: fresh surfaces show cleared until the next flip.
+impl FirstFrames for otg::Cleared {
+    fn chunk(
+        &mut self,
+        _: usize,
+        _: &otg::SurfaceApplied,
+        _: u32,
+        _: &mut Vec<u32>,
+    ) -> Option<u64> {
+        None
+    }
+}
+/// `FirstFrames` addressed by the pipe each plane is staged on; `moved`
+/// the pipes (by bit) another plane than before lands on.
+struct BySlot<'a> {
+    pipes: [Option<u8>; 1 + otg::MAX_OVERLAYS],
+    moved: u8,
+    frames: &'a mut dyn FirstFrames,
+}
+impl otg::PlaneContent for BySlot<'_> {
+    fn moved_to(&mut self, pipe: u8) -> bool {
+        self.moved & 1u8.checked_shl(u32::from(pipe)).unwrap_or(0) != 0
+    }
+    fn chunk(&mut self, a: &otg::SurfaceApplied, index: u32, words: &mut Vec<u32>) -> Option<u64> {
+        let slot = self.pipes.iter().position(|&p| p == Some(a.request.pipe))?;
+        self.frames.chunk(slot, a, index, words)
+    }
+    fn external(&mut self, a: &otg::SurfaceApplied) -> Option<otg::ExternalSurface> {
+        let slot = self.pipes.iter().position(|&p| p == Some(a.request.pipe))?;
+        self.frames.external(slot, a)
+    }
 }
 
-/// The pipes running display `m`'s planes `setup` take under `plan`, the
-/// pipes `others` being other displays': the primary keeps its pipe and
-/// ODM pipes and as many of its MPC slices as `plan` keeps; an overlay DC
-/// keeps (the same DRM plane, or at the same position without one) keeps
-/// its pipes likewise; every further pipe comes from the free ones, from
-/// the top. `None` when the stream itself would change (another ODM
-/// split): a modeset.
-pub fn live_plane_pipes(
-    m: &Modeset,
-    plan: &dml::Plan,
-    setup: &PlaneSetup,
-    others: u8,
-) -> Result<Option<(otg::SplitPipes, OverlayPipes)>, ModesetError> {
-    if plan.pipes != m.plan.pipes {
-        return Ok(None);
+/// should_reset_plane over a running display's planes going from `old`
+/// (primary in `old_format`) to `new`: amdgpu_dm removes and adds again
+/// every plane of the CRTC when any (cursor aside) is added or removed, or
+/// changes its source or destination size (not position), rotation,
+/// "pixel blend mode", "alpha", COLOR_RANGE or COLOR_ENCODING, or its
+/// framebuffer's format or modifier; a plane whose normalized zpos changes
+/// is recreated too. Planes only moved keep their pipes as they are.
+///
+/// Both setups from DRM commits (`PlaneSetup::drm`) are compared exactly
+/// as Linux compares the DRM plane states. A setup not from DRM (the
+/// console's, a legacy SETCRTC's) has no plane states; it is compared by
+/// what DC is given instead.
+pub fn planes_reset(
+    old_format: otg::SurfaceFormat,
+    old: &PlaneSetup,
+    new_format: otg::SurfaceFormat,
+    new: &PlaneSetup,
+) -> bool {
+    let states = |s: &PlaneSetup| {
+        let n = 1 + s.overlay_count();
+        let states: Vec<DrmPlaneState> = s.drm.iter().flatten().copied().collect();
+        (states.len() == n).then_some(states)
+    };
+    if let (Some(old), Some(new)) = (states(old), states(new)) {
+        return drm_planes_reset(&old, &new);
     }
-    let odm = usize::from(plan.pipes.max(1)) - 1;
-    let s = &m.scanout;
-    let slices = |k: usize| plan.plane(k).map_or(1, |p| p.mpc_slices(plan.pipes)) as usize;
-    let primary_mpc = slices(0).max(1) - 1;
-    // Each new overlay's predecessor among the running ones.
-    let old = &m.selection.planes.overlays;
-    let mut matched = [None; otg::MAX_OVERLAYS];
-    let mut taken_old = [false; otg::MAX_OVERLAYS];
-    for (k, o) in setup.overlays.iter().enumerate() {
-        let Some(o) = o else { continue };
-        let found = (0..otg::MAX_OVERLAYS).find(|&j| {
-            !taken_old[j]
-                && s.overlays[j].is_some()
-                && old[j].is_some_and(|p| {
-                    if o.plane != 0 {
-                        p.plane == o.plane
-                    } else {
-                        p.plane == 0 && j == k
-                    }
-                })
-        });
-        if let Some(j) = found {
-            let pipes = s.overlays[j].ok_or(ModesetError::Display(otg::Error::Invalid))?;
-            if pipes.odm.len() == odm {
-                taken_old[j] = true;
-                matched[k] = Some(pipes);
+    let size = |g: &PlaneGeometry| {
+        (
+            g.width,
+            g.height,
+            g.dst.width,
+            g.dst.height,
+            g.rotation,
+            g.blend,
+            g.surface,
+            g.fb_size,
+        )
+    };
+    if old_format != new_format || old.primary.as_ref().map(size) != new.primary.as_ref().map(size)
+    {
+        return true;
+    }
+    old.overlays
+        .iter()
+        .zip(&new.overlays)
+        .any(|(a, b)| match (a, b) {
+            (None, None) => false,
+            (Some(a), Some(b)) => {
+                a.plane != b.plane
+                    || a.format != b.format
+                    || a.underlay != b.underlay
+                    || size(&a.geometry) != size(&b.geometry)
             }
-        }
-    }
-    // What stays: the stream's pipes, the primary's kept slices, every kept
-    // overlay's pipes and kept slices.
-    let mut stays = others | 1 << m.pipe | s.odm.mask();
-    stays |= s.mpc.iter().take(primary_mpc).fold(0, |a, q| a | 1 << q);
-    let mut position = 0;
-    for (k, o) in setup.overlays.iter().enumerate() {
-        if o.is_none() {
-            continue;
-        }
-        position += 1;
-        if let Some(p) = matched[k] {
-            let want = slices(position).max(1) - 1;
-            stays |= 1 << p.pipe | p.odm.mask();
-            stays |= p.mpc.iter().take(want).fold(0, |a, q| a | 1 << q);
-        }
-    }
-    let mut free = FreePipes(stays);
-    let mpc = keep_split(s.mpc, primary_mpc, &mut free)?;
-    let mut out: OverlayPipes = [None; otg::MAX_OVERLAYS];
-    let mut position = 0;
-    for (k, o) in setup.overlays.iter().enumerate() {
-        if o.is_none() {
-            continue;
-        }
-        position += 1;
-        let want = slices(position).max(1) - 1;
-        out[k] = Some(match matched[k] {
-            Some(p) => PlanePipes {
-                pipe: p.pipe,
-                odm: p.odm,
-                mpc: keep_split(p.mpc, want, &mut free)?,
-            },
-            None => {
-                let pipe = free.take()?;
-                PlanePipes {
-                    pipe,
-                    odm: free.split(odm)?,
-                    mpc: free.split(want)?,
-                }
+            _ => true,
+        })
+}
+
+/// The pipes (by bit) on which a plane of `new` (overlays on `new_pipes`)
+/// lands where another plane of `old` (overlays on `old_pipes`) was: the
+/// primary stays on the head pipe, an overlay is its DRM plane (by id, by
+/// slot when one is unknown).
+pub(super) fn moved_planes(
+    old: &PlaneSetup,
+    old_pipes: &[Option<u8>; otg::MAX_OVERLAYS],
+    new: &PlaneSetup,
+    new_pipes: &[Option<u8>; otg::MAX_OVERLAYS],
+) -> u8 {
+    let identity = |s: &PlaneSetup, k: usize| {
+        s.overlays[k].map(|o| {
+            if o.plane != 0 {
+                (o.plane, 0)
+            } else {
+                (0, k + 1)
             }
-        });
+        })
+    };
+    let mut moved = 0u8;
+    for (k, &pipe) in new_pipes.iter().enumerate() {
+        let (Some(pipe), Some(id)) = (pipe, identity(new, k)) else {
+            continue;
+        };
+        let before = old_pipes
+            .iter()
+            .position(|&p| p == Some(pipe))
+            .and_then(|j| identity(old, j));
+        if before.is_some_and(|b| b != id) {
+            moved |= 1u8.checked_shl(u32::from(pipe)).unwrap_or(0);
+        }
     }
-    Ok(Some((mpc, out)))
+    moved
+}
+
+/// should_reset_plane's checks over one CRTC's non-cursor DRM planes.
+fn drm_planes_reset(old: &[DrmPlaneState], new: &[DrmPlaneState]) -> bool {
+    let find = |set: &[DrmPlaneState], id: u32| set.iter().find(|p| p.plane == id).copied();
+    // `old_other_state->crtc != new_other_state->crtc`: added or removed.
+    if old.iter().any(|o| find(new, o.plane).is_none())
+        || new.iter().any(|n| find(old, n.plane).is_none())
+    {
+        return true;
+    }
+    old.iter().any(|o| {
+        let n = find(new, o.plane).unwrap_or(*o);
+        o.normalized_zpos != n.normalized_zpos
+            || (o.src_w, o.src_h, o.crtc_w, o.crtc_h) != (n.src_w, n.src_h, n.crtc_w, n.crtc_h)
+            || o.rotation != n.rotation
+            || o.blend != n.blend
+            || o.alpha != n.alpha
+            || (o.color_range, o.color_encoding) != (n.color_range, n.color_encoding)
+            || o.fourcc != n.fourcc
+            || o.modifier != n.modifier
+    })
 }
 
 /// Every pipe of display `m`'s planes with its plane's DPPCLK under `plan`.
@@ -135,7 +197,9 @@ impl ColdBoot {
     /// Show `format` and `setup` on running display `display` without
     /// relighting it (amdgpu_dm's plane commit without a modeset; DC's
     /// medium or full update). `reset` when amdgpu_dm would recreate a
-    /// plane (should_reset_plane: a zpos change). `None` when that needs a
+    /// plane (should_reset_plane: a zpos change). A plane on a fresh
+    /// surface shows `frames`' content from the update's own latch.
+    /// `None` when that needs a
     /// modeset, or is refused before any change, so the caller relights:
     /// an MST configuration, the display not running, DML not admitting
     /// the configuration, another ODM split, another display's pipes, or
@@ -150,13 +214,14 @@ impl ColdBoot {
         format: otg::SurfaceFormat,
         setup: PlaneSetup,
         reset: bool,
+        frames: &mut dyn FirstFrames,
     ) -> Result<Option<PlanesChange>, ModesetError> {
         // A teardown in flight is the relight's to finish.
         if self.teardowns.check_idle().is_err() {
             return Ok(None);
         }
         let mut running: Vec<Modeset> = self.display_modesets().into_iter().flatten().collect();
-        running.sort_by_key(|m| m.pipe);
+        running.sort_by_key(|m| m.crtc);
         if running.iter().any(|m| m.selection.mst.is_some()) {
             return Ok(None);
         }
@@ -182,27 +247,25 @@ impl ColdBoot {
             return Ok(None);
         };
         let plan = plans[i];
-        if running
-            .iter()
-            .zip(&plans)
-            .enumerate()
-            .any(|(j, (r, p))| j != i && !keeps_pipes(r, p))
+        // Another ODM split changes the stream itself: a modeset.
+        if plan.pipes != m.plan.pipes
+            || running
+                .iter()
+                .zip(&plans)
+                .enumerate()
+                .any(|(j, (r, p))| j != i && !keeps_pipes(r, p))
         {
             return Ok(None);
         }
-        let others = running
-            .iter()
-            .filter(|r| r.pipe != display)
-            .flat_map(|r| running_dpp_targets(r, &r.plan))
-            .fold(0u8, |acc, (q, _)| acc | 1 << q);
-        let Some((mpc, overlays)) = live_plane_pipes(&m, &plan, &setup, others)? else {
+        // DC's validation on the running state: the planes recreated when
+        // amdgpu_dm resets them, DML's counts mapped; a change that would
+        // move the stream or another display's pipes is a modeset.
+        let reset_pipes = planes_reset(m.selection.format, &m.selection.planes, format, &setup);
+        let stream = StreamPipes::of(m.crtc, &selection, &plan);
+        let Some(pipes) = live_pipes(&dc_state(&running), &stream, reset_pipes, &running) else {
             return Ok(None);
         };
-        let pipes = DisplayPipes {
-            odm: m.scanout.odm,
-            mpc,
-            overlays,
-        };
+        let (mpc, overlays) = (pipes.mpc, pipes.overlays);
         let (primary, overlay_requests) = plane_requests(&selection, display, &pipes);
         if primary.check().is_err()
             || overlay_requests
@@ -234,6 +297,10 @@ impl ColdBoot {
         let frl = running.iter().any(|r| r.selection.frl.is_some());
         let frl_dtb = if frl { Some(self.top_dtb_khz()?) } else { None };
         let request = configuration_clocks(&plans, frl_dtb);
+        // dcn401_prepare_bandwidth for this full update: pinned (Linux forces
+        // p_state_change_support false) before update_clocks and before any
+        // display's watermarks move, i.e. before the first change below.
+        self.pin_display_uclk().await?;
         // prepare_bandwidth: the shared clocks only raised, the DTOs of the
         // pipes that keep fetching raised where their plane needs more.
         let mut raise: Vec<(u8, u32)> = running
@@ -271,10 +338,25 @@ impl ColdBoot {
             overlays: overlay_requests,
             reset,
         };
+        let new_pipes = overlays.map(|p| p.map(|p| p.pipe));
+        let mut content = BySlot {
+            pipes: core::array::from_fn(|k| match k {
+                0 => Some(display),
+                k => new_pipes[k - 1],
+            }),
+            moved: moved_planes(
+                &m.selection.planes,
+                &m.scanout.overlays.map(|o| o.map(|o| o.pipe)),
+                &setup,
+                &new_pipes,
+            ),
+            frames,
+        };
         // SAFETY: the caller's obligations, CPU views of replaced surfaces
         // withdrawn.
-        let updated = match unsafe { self.update_live_display_planes(display, &live, &plan) }.await
-        {
+        let update =
+            unsafe { self.update_live_display_planes(display, &live, &plan, &mut content) };
+        let updated = match update.await {
             Ok(u) => u,
             // Refused before any register write: the scanout runs as it
             // was, under raised clocks; the caller relights.

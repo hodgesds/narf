@@ -27,8 +27,12 @@ impl<I: Io> Engine<I> {
     }
     pub(super) fn tmds_timing_links(&mut self) -> Result<Links, Error> {
         let l = self.layout;
-        for (at, mask) in l.idle {
-            let timing = (0..4).any(|p| at == l.otg(p, CONTROL) || at == l.otg(p, CLOCK));
+        // A fused OTG's witnesses are (0, 0): never read.
+        for (at, mask) in l.idle.into_iter().filter(|&(_, mask)| mask != 0) {
+            let timing = l
+                .pool
+                .pipes()
+                .any(|p| at == l.otg(p, CONTROL) || at == l.otg(p, CLOCK));
             if !timing && !self.tmds_retained_register(at) && self.read(at)? & mask != 0 {
                 return Err(Error::Busy);
             }
@@ -135,7 +139,7 @@ impl<I: Io> Engine<I> {
         &mut self,
         pipe: u8,
     ) -> Result<TmdsTimingRetired, Error> {
-        if pipe >= 4 {
+        if pipe >= self.layout.pool.count() {
             return Err(Error::Invalid);
         }
         if !(self.status.state.reusable() || self.status.state == State::RunningBlank(pipe)) {

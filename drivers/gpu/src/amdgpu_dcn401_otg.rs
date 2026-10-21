@@ -18,7 +18,10 @@ pub use opp::{BlankApplied, BlankRequest, BlankRunning, ColorDepth};
 #[path = "amdgpu_dcn401_fetch.rs"]
 mod fetch;
 pub use fetch::{cursor_mode, plane_scale, CursorMode, CursorUnder};
-pub use fetch::{plane_update_type, planes_update_type, LivePlanes, PlanesUpdated, UpdateType};
+pub use fetch::{
+    plane_update_type, planes_update_type, Cleared, LivePlanes, PlaneContent, PlanesUpdated,
+    UpdateType,
+};
 pub use fetch::{
     Blend, ColorProgram, CursorApplied, DeadlinesApplied, DppApplied, FlipDone, GamutProgram,
     HubpPower, LivePipe, MemoryApplied, MpcApplied, OgamProgram, OverlayScanout, PipeColor,
@@ -27,6 +30,7 @@ pub use fetch::{
     MAX_OVERLAYS,
 };
 pub use fetch::{DccBlock, PlaneSurface, SurfaceBytes, Swizzle, Tiling, YuvColor};
+pub use fetch::{ExternalSurface, FlipSource, InputTf, PreDegam};
 #[path = "amdgpu_dcn401_stream.rs"]
 mod stream;
 pub use stream::{DpBlanked, DpEncoderRetired, DpStream};
@@ -403,11 +407,12 @@ impl SplitPipes {
     pub const fn count(self) -> u32 {
         self.len as u32 + 1
     }
-    /// Well formed beside `first`: every pipe below four, none repeated
-    /// and none `first`.
+    /// Well formed beside `first`: every pipe an index of the pool, none
+    /// repeated and none `first`.
     pub fn valid_with(self, first: u8) -> bool {
+        let count = crate::amdgpu_rdna4::pipe_pool().count();
         let mask = self.mask() | bit(first);
-        first < 4 && self.iter().all(|p| p < 4) && mask.count_ones() == self.count()
+        first < count && self.iter().all(|p| p < count) && mask.count_ones() == self.count()
     }
 }
 impl IntoIterator for SplitPipes {
@@ -705,7 +710,7 @@ impl Plan {
             & 1)
             << 8
     }
-    /// The OPPs feeding this timing, left segment first.
+    /// The pipes whose OPPs feed this timing, left segment first.
     pub(crate) fn opps(self) -> impl Iterator<Item = u8> {
         core::iter::once(self.request.pipe).chain(self.request.odm)
     }
@@ -733,15 +738,16 @@ impl Plan {
         }
     }
     /// OPTC_DATA_SOURCE_SELECT (mask 0xffff0003): the segment count less
-    /// one (OPTC_NUM_OF_INPUT_SEGMENT) and each segment's OPP, unused
-    /// segments and every source when detached 0xf.
-    pub(crate) fn source(self, connected: bool) -> u32 {
+    /// one (OPTC_NUM_OF_INPUT_SEGMENT) and each segment's OPP instance
+    /// (optc401_set_odm_combine's opp_id[]), unused segments and every
+    /// source when detached 0xf.
+    pub(crate) fn source(self, pool: crate::amdgpu_rdna4::PipePool, connected: bool) -> u32 {
         let segments = self.request.odm.len() as u32;
         let mut sel = 0xffff_0000u32;
         if connected {
             for (k, o) in self.opps().enumerate() {
                 let shift = 16 + 4 * k as u32;
-                sel = sel & !(0xf << shift) | u32::from(o) << shift;
+                sel = sel & !(0xf << shift) | u32::from(pool.hw(o)) << shift;
             }
         }
         sel | segments
@@ -752,7 +758,8 @@ impl Plan {
     /// second-preferred one. Linux would go on to other OPPs' second-
     /// preferred memories, which another display's combine may need; `plan`
     /// refuses a line that would (more than 4096 pixels per segment).
-    pub(crate) fn memory(self) -> u32 {
+    /// The map has two bits per OPP instance (opp_id[]), not per pipe.
+    pub(crate) fn memory(self, pool: crate::amdgpu_rdna4::PipePool) -> u32 {
         if self.request.odm.is_none() {
             return 0;
         }
@@ -762,13 +769,13 @@ impl Plan {
         let mut allocated = 0;
         for o in self.opps() {
             if allocated < required {
-                first |= bit(o);
+                first |= bit(pool.hw(o));
                 allocated += 1;
             }
         }
         for o in self.opps() {
             if allocated < required {
-                second |= bit(o);
+                second |= bit(pool.hw(o));
                 allocated += 1;
             }
         }
@@ -781,7 +788,7 @@ impl Request {
     fn plan(self) -> Result<Plan, Error> {
         let t = self.timing;
         let s = self.sync;
-        if self.pipe >= 4
+        if self.pipe >= crate::amdgpu_rdna4::pipe_pool().count()
             || t.pixel_clock_khz == 0
             || t.h_active == 0
             || t.v_active == 0
@@ -890,7 +897,11 @@ struct Layout {
     mpc_base: u64,
     link_clock: u64,
     dio_clock: u64,
+    /// The idle witnesses; a fused OTG's are `(0, 0)` and never read.
     idle: [(u64, u32); clocks::IDLE_REG_COUNT],
+    /// The resource pool this owner was built with: pipe index to hardware
+    /// instance (`PipePool::hw`).
+    pool: crate::amdgpu_rdna4::PipePool,
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
@@ -935,16 +946,28 @@ impl Layout {
             )
             .map_err(|_| Error::Unsupported)?,
             idle: display.idle_registers(),
+            pool: crate::amdgpu_rdna4::pipe_pool(),
         })
     }
+    /// Pipe `pipe`'s blocks' hardware instance (its HUBP, DPP, OPP, OTG and
+    /// MPCC): every per-pipe register address below, and every instance
+    /// field (MPCC_TOP_SEL, OPP_ID, OPTC_SEG*_SRC_SEL, DIG/HPO OTG source,
+    /// DSC's OPP source...), takes it.
+    fn inst(self, pipe: u8) -> u8 {
+        self.pool.hw(pipe)
+    }
+    /// `inst` as a register field value.
+    fn inst_field(self, pipe: u8) -> u32 {
+        u32::from(self.inst(pipe))
+    }
     fn otg(self, pipe: u8, reg: u64) -> u64 {
-        self.base + (reg + u64::from(pipe) * 0x80) * 4
+        self.base + (reg + u64::from(self.inst(pipe)) * 0x80) * 4
     }
     fn odm(self, pipe: u8, reg: u64) -> u64 {
-        self.base + (reg + u64::from(pipe) * 0x10) * 4
+        self.base + (reg + u64::from(self.inst(pipe)) * 0x10) * 4
     }
     fn vtg(self, pipe: u8) -> u64 {
-        self.base + (0x530 + u64::from(pipe)) * 4
+        self.base + (0x530 + u64::from(self.inst(pipe))) * 4
     }
 }
 trait Io {
@@ -989,9 +1012,10 @@ fn checked(v: u32) -> Result<u32, Error> {
         Ok(v)
     }
 }
-/// What the displays other than the selected one hold, by instance bit:
-/// the registers each idle check must leave to them, and their live
-/// scanouts (pipe-indexed: surface address and cursor visibility), which are
+/// What the displays other than the selected one hold, by bit (pipes by
+/// pipe index, encoders and transmitters by their own instance): the
+/// registers each idle check must leave to them, and their live scanouts
+/// (pipe-indexed: surface address and cursor visibility), which are
 /// verified as live rather than stopped.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Siblings {
@@ -1014,7 +1038,7 @@ pub struct Siblings {
     /// Each live pipe as its display's scanout leaves it (pipe-indexed).
     pub live: [Option<LivePipe>; 4],
 }
-/// An instance's bit in a `Siblings` mask; none for an instance past 7.
+/// A pipe index's or instance's bit in a `Siblings` mask; none past 7.
 pub(crate) fn bit(instance: u8) -> u8 {
     1u8.checked_shl(u32::from(instance)).unwrap_or(0)
 }
@@ -1221,7 +1245,10 @@ impl<I: Io> Engine<I> {
     /// and recompute what the others hold. Only between operations, from a
     /// settled state.
     fn select_display(&mut self, display: u8) -> Result<(), Error> {
-        if display >= 4 {
+        // A display slot is its stream's head pipe (the OTG master DC
+        // acquired, `Modeset::pipe`), one per pipe of the pool; it is not a
+        // CRTC index (the platform maps CRTCs to head pipes).
+        if display >= self.layout.pool.count() {
             return Err(Error::Invalid);
         }
         if display == self.displays.selected {
@@ -1319,7 +1346,7 @@ impl<I: Io> Engine<I> {
         {
             return Err(Error::Busy);
         }
-        if pipe >= 4 {
+        if pipe >= self.layout.pool.count() {
             return Err(Error::Invalid);
         }
         // Another display's pipe is never this operation's to retire or
@@ -1328,8 +1355,12 @@ impl<I: Io> Engine<I> {
             return Err(Error::Busy);
         }
         let l = self.layout;
-        for (at, mask) in l.idle {
-            let timing = (0..4).any(|p| at == l.otg(p, CONTROL) || at == l.otg(p, CLOCK));
+        // A fused OTG's witnesses are (0, 0): never read.
+        for (at, mask) in l.idle.into_iter().filter(|&(_, mask)| mask != 0) {
+            let timing = l
+                .pool
+                .pipes()
+                .any(|p| at == l.otg(p, CONTROL) || at == l.otg(p, CLOCK));
             if !(self.sibling_register(at) || retire && timing) && self.read(at)? & mask != 0 {
                 return Err(Error::Busy);
             }
@@ -1384,7 +1415,7 @@ impl<I: Io> Engine<I> {
         // Combine (optc401_set_odm_combine): every segment's OPP, the
         // segment width (and for 3:1 the last segment's) and the line
         // memories the width needs.
-        self.update(odm(SOURCE), u32::MAX, plan.source(true))?;
+        self.update(odm(SOURCE), u32::MAX, plan.source(l.pool, true))?;
         if plan.request.odm.is_some() {
             self.update(odm(WIDTH), 0x1fff, plan.segment_width())?;
         }
@@ -1394,7 +1425,7 @@ impl<I: Io> Engine<I> {
         // Native HW may select divide-by-two automatically only if every
         // horizontal boundary is even. Odd timings require manual no-divide.
         self.update(otg(H_TIMING), 0x103, plan.h_divider())?;
-        self.update(odm(MEMORY), 0xffff, plan.memory())?;
+        self.update(odm(MEMORY), 0xffff, plan.memory(l.pool))?;
         // Fixed refresh; clear inherited DRR selectors before setting equal
         // total/min/max. No DMUB FAMS delegation is active under this owner.
         self.update(otg(V_CONTROL), 0xffff0013, 0)?;
@@ -1457,10 +1488,14 @@ impl<I: Io> Engine<I> {
     fn restage_source(&mut self, request: Request) -> Result<(), Error> {
         let plan = request.plan()?;
         let l = self.layout;
-        self.update(l.odm(request.pipe, SOURCE), 0xffff0003, plan.source(true))?;
+        self.update(
+            l.odm(request.pipe, SOURCE),
+            0xffff0003,
+            plan.source(l.pool, true),
+        )?;
         // Bypass uses no line memories; `disable` already cleared them.
         if request.odm.is_some() {
-            self.update(l.odm(request.pipe, MEMORY), 0xffff, plan.memory())?;
+            self.update(l.odm(request.pipe, MEMORY), 0xffff, plan.memory(l.pool))?;
         }
         Ok(())
     }
@@ -1476,7 +1511,7 @@ impl<I: Io> Engine<I> {
     }
     fn running_timing(&mut self) -> Result<u8, Error> {
         let mut running = 0;
-        for p in 0..4 {
+        for p in self.layout.pool.pipes() {
             if self.read(self.layout.otg(p, CONTROL))? & 0x10001 != 0 {
                 running |= 1 << p;
             }
@@ -1553,7 +1588,8 @@ impl Otg {
     pub fn status(&self) -> Status {
         *self.0.status
     }
-    /// Make `display` (0-3) the one every following operation addresses.
+    /// Make `display` (a pipe index of the pool) the one every following
+    /// operation addresses.
     /// Each display keeps its own records; the other displays' pipes,
     /// links and live scanouts are left to them by every idle check. Refused
     /// while the selected display is mid-operation or failed.

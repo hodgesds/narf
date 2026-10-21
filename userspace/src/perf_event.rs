@@ -1804,7 +1804,7 @@ impl PerfEventFile {
         }
         if sample_type & PERF_SAMPLE_CODE_PAGE_SIZE != 0 {
             let task = u64::from(tid);
-            let page_size = narf_scheduler::address_space_of(narf_scheduler::TaskId(task))
+            let page_size = narf_scheduler::address_space_of_live(narf_scheduler::TaskId(task))
                 .or_else(|| {
                     (task == current_task_id()).then(narf_scheduler::current_address_space)?
                 })

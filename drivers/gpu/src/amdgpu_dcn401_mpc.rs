@@ -42,17 +42,21 @@ pub(in crate::amdgpu_dcn401_otg) fn blend_control(a: MpcApplied) -> u32 {
     mode << 4 | u32::from(multiplied) << 6 | 4 << 8 | global << 16 | gain << 24
 }
 impl Layout {
+    /// MPC_OUT of the pipe's OPP.
     fn mpc_out(self, pipe: u8, r: u64) -> u64 {
-        self.mpc_base + (r + u64::from(pipe) * 4) * 4
+        self.mpc_base + (r + u64::from(self.inst(pipe)) * 4) * 4
     }
+    /// The pipe's MPCC's OGAM.
     pub(super) fn ogam(self, pipe: u8, r: u64) -> u64 {
-        self.mpc_base + (r + u64::from(pipe) * 0x5e) * 4
+        self.mpc_base + (r + u64::from(self.inst(pipe)) * 0x5e) * 4
     }
+    /// The pipe's MPCC's MCM.
     pub(super) fn mcm(self, pipe: u8, r: u64) -> u64 {
-        self.mpc_base + (r + u64::from(pipe) * 0xb0) * 4
+        self.mpc_base + (r + u64::from(self.inst(pipe)) * 0xb0) * 4
     }
+    /// The output CSC of the pipe's OPP.
     fn ocsc(self, pipe: u8) -> u64 {
-        self.mpc_base + (0x30b + u64::from(pipe) * 0xd) * 4
+        self.mpc_base + (0x30b + u64::from(self.inst(pipe)) * 0xd) * 4
     }
     /// The output CSC load of a converting stream, as mpc3_set_ocsc_default
     /// does it: fixed-point S2.13 coefficients (this pipe's
@@ -62,7 +66,7 @@ impl Layout {
         let coef = |r: u64| self.ocsc(pipe) + r * 4;
         let pair = |i: usize| m[i] | m[i + 1] << 16;
         [
-            (self.mpc_base + 0x30a * 4, 1 << pipe, 0),
+            (self.mpc_base + 0x30a * 4, 1 << self.inst(pipe), 0),
             (coef(1), u32::MAX, pair(0)),  // C11, C12
             (coef(2), u32::MAX, pair(2)),  // C13, C14
             (coef(3), u32::MAX, pair(4)),  // C21, C22

@@ -18,6 +18,9 @@ const ADDRESS_HIGH: u64 = 0x60b;
 /// DCSURF_PRIMARY_SURFACE_ADDRESS_C and _HIGH_C: a 4:2:0 plane's chroma.
 const ADDRESS_C: u64 = 0x60c;
 const ADDRESS_HIGH_C: u64 = 0x60d;
+/// DCSURF_SURFACE_PITCH and DCSURF_SURFACE_PITCH_C (PITCH, PITCH_C).
+const PITCH: u64 = 0x607;
+const PITCH_C: u64 = 0x608;
 const EARLIEST_INUSE: u64 = 0x61c;
 const EARLIEST_INUSE_HIGH: u64 = 0x61d;
 const FLIP_PENDING: u32 = 0x100;
@@ -346,15 +349,16 @@ pub struct ScanoutUnderflow {
 
 impl<I: Io> Engine<I> {
     pub(super) fn dpp_control(&self, pipe: u8) -> u64 {
-        self.layout.base + (DPP_CONTROL + u64::from(pipe) * 0x16b) * 4
+        self.layout.dpp(pipe, DPP_CONTROL)
     }
     fn optc_input(&self, pipe: u8) -> u64 {
-        self.layout.base + (OPTC_INPUT + u64::from(pipe) * 0x10) * 4
+        self.layout.odm(pipe, OPTC_INPUT)
     }
-    /// The only MPCC/DPP/OPP/OTG instance used for a pipe is the pipe itself.
+    /// A one-pipe tree: the pipe's MPCC (its DPP's instance) blends its DPP
+    /// into its own OPP, all the pipe's instance.
     pub(super) fn routes(&self, pipe: u8, connected: bool) -> [(u64, u32); 5] {
         let l = self.layout;
-        let p = u32::from(pipe);
+        let p = l.inst_field(pipe);
         let sel = |v: u32| if connected { v } else { 0xf };
         [
             (l.out_mux(pipe), sel(p)),
@@ -444,10 +448,11 @@ impl<I: Io> Engine<I> {
     }
     pub(super) async fn lock(&mut self, pipe: u8) -> Result<(), Error> {
         let l = self.layout;
+        // optc1_lock: OTG_MASTER_UPDATE_LOCK_SEL = optc->inst.
         self.update(
             l.otg(pipe, GLOBAL_CONTROL2),
             LOCK_SELECT,
-            u32::from(pipe) << 25,
+            l.inst_field(pipe) << 25,
         )?;
         self.update(l.otg(pipe, LOCK), LOCK_REQUEST, LOCK_REQUEST)?;
         // Linux waits only 10 us and proceeds; here the lock must be held.
@@ -568,16 +573,45 @@ impl<I: Io> Engine<I> {
     pub(super) async fn flip_to(&mut self, p: Pipe) -> Result<u32, Error> {
         self.flip_from(p, None).await
     }
-    /// The chroma plane's offset of the staged 4:2:0 surface HUBP `q`
-    /// fetches (its own or, as an ODM half, its pipe's); none for RGB.
-    fn chroma_offset(&self, q: u8) -> Option<u64> {
+    /// The surface HUBP `q` fetches (its own or, as an ODM segment's or
+    /// MPC slice's pipe, its plane's), as its records name it.
+    pub(super) fn fetched_surface(&self, q: u8) -> Option<SurfaceApplied> {
         self.status
             .surfaces
             .iter()
             .flatten()
             .find(|a| a.request.pipe_mask() & bit(q) != 0)
-            .and_then(|a| a.request.chroma())
+            .copied()
+    }
+    /// The chroma plane's offset of the 4:2:0 surface HUBP `q` fetches;
+    /// none for RGB.
+    fn chroma_offset(&self, q: u8) -> Option<u64> {
+        self.fetched_surface(q)
+            .and_then(|a| a.chroma)
             .map(|(offset, _)| offset)
+    }
+    /// hubp401_program_size for HUBP `q` when the surface its records name
+    /// fetches with another pitch than the one programmed: a flip between a
+    /// staged buffer and a client framebuffer of another pitch (DC's MED
+    /// plane_size update, programmed under the same lock as the address).
+    /// Nothing is written while the pitches agree (a FAST flip).
+    fn write_fetch_pitch(&mut self, q: u8) -> Result<(), Error> {
+        let Some(a) = self.fetched_surface(q) else {
+            return Ok(());
+        };
+        let l = self.layout;
+        let format = a.request.format;
+        let mut pitches = alloc::vec![(PITCH, a.pitch_bytes / format.bytes_per_pixel() - 1)];
+        if let Some((_, pitch_c)) = a.chroma {
+            pitches.push((PITCH_C, pitch_c / format.chroma_bytes_per_pixel() - 1));
+        }
+        for (r, value) in pitches {
+            let at = l.hubp(q, r);
+            if self.read(at)? & 0xffff != value {
+                self.update(at, 0xffff, value)?;
+            }
+        }
+        Ok(())
     }
     /// hubp401_program_surface_flip_and_addr's address writes for HUBP `q`
     /// fetching a surface at `address`: a 4:2:0 surface's chroma first, then
@@ -609,6 +643,7 @@ impl<I: Io> Engine<I> {
             {
                 continue;
             }
+            self.write_fetch_pitch(q)?;
             self.write_fetch_address(q, address)?;
         }
         self.update(l.otg(pipe, LOCK), LOCK_REQUEST, 0)?;
@@ -621,20 +656,22 @@ impl<I: Io> Engine<I> {
     /// for its planes inserted from the top down, each at the bottom: the
     /// new MPCC alone at the bottom over the background (TOP_LAYER_ONLY),
     /// the one above it then blending over it (TOP_BOT_BLENDING), the first
-    /// (top) one on the OPP's OUT_MUX.
+    /// (top) one on the OPP's OUT_MUX. `opp` and `tree` are pipe indices;
+    /// the selectors take instances (MPCC_TOP_SEL = dpp_id, MPCC_OPP_ID =
+    /// opp_id, MPC_OUT_MUX = mpcc_id = dpp->inst).
     fn insert_tree(&mut self, opp: u8, tree: &[u8]) -> Result<(), Error> {
         let l = self.layout;
         let mut above: Option<u8> = None;
         for &m in tree.iter().rev() {
             self.update(l.mpcc(m, BOTTOM), 0xf, 0xf)?;
             self.update(l.mpcc(m, MPCC_CONTROL), 3, MPCC_MODE_TOP_ONLY)?;
-            self.update(l.mpcc(m, TOP), 0xf, u32::from(m))?;
-            self.update(l.mpcc(m, OPP_ID), 0xf, u32::from(opp))?;
-            self.update(l.mpcc(m, UPDATE_LOCK), 0xf, u32::from(opp))?;
+            self.update(l.mpcc(m, TOP), 0xf, l.inst_field(m))?;
+            self.update(l.mpcc(m, OPP_ID), 0xf, l.inst_field(opp))?;
+            self.update(l.mpcc(m, UPDATE_LOCK), 0xf, l.inst_field(opp))?;
             match above {
-                None => self.update(l.out_mux(opp), 0xf, u32::from(m))?,
+                None => self.update(l.out_mux(opp), 0xf, l.inst_field(m))?,
                 Some(a) => {
-                    self.update(l.mpcc(a, BOTTOM), 0xf, u32::from(m))?;
+                    self.update(l.mpcc(a, BOTTOM), 0xf, l.inst_field(m))?;
                     self.update(l.mpcc(a, MPCC_CONTROL), 3, MPCC_MODE_TOP_BOT)?;
                 }
             }
@@ -839,7 +876,10 @@ impl<I: Io> Engine<I> {
     fn tree_routes(&mut self, live: LivePipe) -> Result<(), Error> {
         let l = self.layout;
         let q = live.pipe;
-        let [mux, top, bot, opp, lock] = live.routes.map(u32::from);
+        // `routes` names pipes; the selectors hold their instances.
+        let [mux, top, bot, opp, lock] =
+            live.routes
+                .map(|r| if r == 0xf { 0xf } else { l.inst_field(r) });
         for (at, value) in [
             (l.out_mux(q), mux),
             (l.mpcc(q, TOP), top),
@@ -1289,6 +1329,11 @@ impl Surfaces {
         if a.address != running.address || a.request.format != SurfaceFormat::Xrgb8888 {
             return Err(Error::Invalid);
         }
+        // A client framebuffer scanned out in place has no CPU view here:
+        // the console never draws into it.
+        if a.address != surface.memory.address() {
+            return Err(Error::Busy);
+        }
         Ok(GenericFb::new(
             surface.memory.mapping().phys.raw(),
             a.request.width,
@@ -1366,6 +1411,9 @@ impl Otg {
             .timing;
         let e = &mut self.0;
         let l = e.layout;
+        if pipe >= l.pool.count() {
+            return Err(Error::Invalid);
+        }
         if e.read(l.otg(pipe, CONTROL))? & 0x10001 != 0x10001 {
             return Err(Error::Busy); // not running
         }
@@ -1395,7 +1443,7 @@ impl Otg {
     /// Make CPU writes to the live surface visible to display fetch: the
     /// native HDP flush used by staged uploads.
     pub fn flush_scanout_writes(&mut self) -> Result<(), Error> {
-        let live = (0..4).any(|d| {
+        let live = self.0.layout.pool.pipes().any(|d| {
             self.display_status(d)
                 .is_some_and(|s| matches!(s.state, State::ScanoutRunning(_)))
         });

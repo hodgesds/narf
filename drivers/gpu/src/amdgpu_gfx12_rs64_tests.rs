@@ -181,7 +181,7 @@ fn gfx12_rs64_constructor_and_revocation_are_checked_before_mmio() -> TestResult
         }
     }
     gpu.regs.len = 0x10000;
-    gpu.ip_blocks[0].revision = 0;
+    gpu.ip_blocks[0].revision = 2;
     // SAFETY: construction validates metadata without accessing MMIO.
     if unsafe { Rs64::new(&gpu, cap, &firmware) }.is_ok() {
         return TestResult::Fail("foreign GC12 revision accepted");

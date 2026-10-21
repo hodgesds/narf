@@ -6,7 +6,14 @@
 
 #![cfg(target_arch = "x86_64")]
 
+use core::sync::atomic::Ordering;
+
+use narf_bus::{BarKind, MmioRegion};
 use narf_kernel_test::{kernel_test_in, TestResult};
+use narf_memory::PhysAddr;
+use narf_wireless::{
+    AssociateRequest, SecurityConfig, WirelessConfig, WirelessError, WirelessNetIface,
+};
 
 use super::btcoex::{
     encode_tdma, has_bt, pattern_for, BtState, TdmaPattern, WifiState, H2C_BT_TDMA,
@@ -837,4 +844,49 @@ fn smoke_rtlwifi_per_chip_feature_flags() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtlwifi",
     smoke_rtlwifi_per_chip_feature_flags
+);
+
+fn smoke_rtlwifi_unready_control_plane_fails_closed() -> TestResult {
+    let device = super::pci::RtlwifiDevice {
+        mmio_bar0: MmioRegion {
+            phys: PhysAddr::new(0),
+            virt: 0,
+            len: 0,
+            kind: BarKind::Mmio32 {
+                prefetchable: false,
+            },
+        },
+        mac: [0x00, 0xE0, 0x4C, 0x12, 0x34, 0x56],
+        device_id: RTL_DEV_8822BE,
+        link_up: core::sync::atomic::AtomicBool::new(false),
+        rx_ring: narf_lib::sync::IrqSafeSpinLock::new(None),
+        tx_ring: narf_lib::sync::IrqSafeSpinLock::new(None),
+    };
+    let request = AssociateRequest {
+        bssid: [0x02, 0, 0, 0, 0, 1],
+        ssid: alloc::vec![b't', b'e', b's', b't'],
+        frequency_mhz: 2412,
+        channel: 1,
+        security: SecurityConfig::Open,
+        ie: alloc::vec![],
+    };
+
+    if narf_scheduler::block_on(device.associate(request)) != Err(WirelessError::NotSupported) {
+        return TestResult::Fail("rtlwifi accepted association without firmware/data path");
+    }
+    if device.link_up.load(Ordering::Acquire) {
+        return TestResult::Fail("rtlwifi raised carrier after rejected association");
+    }
+    if narf_scheduler::block_on(device.set_config(WirelessConfig {
+        channel: 1,
+        tx_power_dbm: None,
+    })) != Err(WirelessError::NotSupported)
+    {
+        return TestResult::Fail("rtlwifi accepted configuration without firmware/data path");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtlwifi_unready_control_plane_fails_closed
 );

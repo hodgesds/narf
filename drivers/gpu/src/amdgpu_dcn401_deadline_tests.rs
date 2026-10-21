@@ -62,6 +62,7 @@ fn owners(plan: &dml::Plan, pipe: u8) -> (Request, RequestorApplied, dccg::Appli
         address: 0x8_0000_0000,
         pitch_bytes: 7680,
         bytes: 7680 * 1080,
+        chroma: None,
     };
     let timing = Request {
         pipe,
@@ -95,12 +96,14 @@ fn owners(plan: &dml::Plan, pipe: u8) -> (Request, RequestorApplied, dccg::Appli
                 display_khz: plan.clocks.dispclk_khz,
                 dpp_khz: plan.clocks.dpprefclk_khz,
                 dtb_khz: 600_000,
+                deep_sleep_dcfclk_khz: 0,
             },
             display_khz: plan.clocks.dispclk_khz,
             dpp_khz: plan.clocks.dpprefclk_khz,
             dtb_khz: 600_000,
             dcf_floor_khz: 1_564_000,
             memory_floor_khz: 1_250_000,
+            uclk_pstate: false,
         },
         dpp_phase: 0,
         reference_hz: 720_000_000,
@@ -225,6 +228,18 @@ fn dcn401_deadlines_bind_only_the_admitted_owners() -> TestResult {
     {
         return TestResult::Fail("plane depth binding");
     }
+    // A client framebuffer scanned out in place with a wider pitch keeps
+    // the plan DML admitted at the staged pitch (dc runs no DML for it).
+    let wider = RequestorApplied {
+        surface: SurfaceApplied {
+            pitch_bytes: 8192,
+            ..requestor.surface
+        },
+        ..requestor
+    };
+    if !bound(&plan, timing, wider, clock, 50_000) {
+        return TestResult::Fail("client framebuffer's wider pitch refused");
+    }
     let mut tampered = plan;
     tampered.watermarks.urgent += 1;
     let mut other_mode = plan;
@@ -278,9 +293,11 @@ fn dcn401_deadlines_bind_only_the_admitted_owners() -> TestResult {
         (
             plan,
             timing,
+            // A fetch pitch below the planned one (a client framebuffer may
+            // only be wider: below).
             RequestorApplied {
                 surface: SurfaceApplied {
-                    pitch_bytes: 8192,
+                    pitch_bytes: 4096,
                     ..requestor.surface
                 },
                 ..requestor
@@ -338,6 +355,7 @@ fn dcn401_deadlines_bind_only_the_admitted_owners() -> TestResult {
             dccg::Applied {
                 global: clocks::Applied {
                     memory_floor_khz: 1_000_000,
+                    uclk_pstate: false,
                     ..clock.global
                 },
                 ..clock
@@ -459,6 +477,7 @@ fn video_overlay(pipe: u8) -> SurfaceApplied {
         address: 0x8_1000_0000,
         pitch_bytes: 5120,
         bytes: 5120 * 720,
+        chroma: request.chroma(),
     }
 }
 /// The 1080p primary with `overlay` above it, as DML21 plans the pair.
@@ -619,4 +638,146 @@ fn dcn401_deadlines_bind_every_planned_plane() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-deadline",
     dcn401_deadlines_bind_every_planned_plane
+);
+
+/// A 7680x4320 XRGB8888 256KB_2D DCC primary scaled 2:1 onto a 4K stream
+/// on pipe 0, MPC-combined with pipe 3 (`mpc`).
+fn split_dcc_primary(mpc: SplitPipes) -> SurfaceApplied {
+    let request = SurfaceRequest {
+        surface: PlaneSurface {
+            tiling: Tiling {
+                swizzle: Swizzle::S256K2D,
+                dcc: Some(DccBlock::B64),
+            },
+            ..PlaneSurface::LINEAR
+        },
+        pipe: 0,
+        width: 7680,
+        height: 4320,
+        format: SurfaceFormat::Xrgb8888,
+        odm: SplitPipes::NONE,
+        mpc,
+        plane: Some(PlaneLayout {
+            src: crate::amdgpu_dcn401_spl::Rect::new(0, 0, 7680, 4320),
+            dst: crate::amdgpu_dcn401_spl::Rect::new(0, 0, 3840, 2160),
+            stream_width: 3840,
+            stream_height: 2160,
+            ycbcr420: false,
+            rotation: crate::amdgpu_dcn401_spl::Rotation::R0,
+            blend: Blend::default_for(SurfaceFormat::Xrgb8888),
+            underlay: false,
+        }),
+    };
+    let b = request.bytes();
+    SurfaceApplied {
+        request,
+        address: 0x8_0000_0000,
+        pitch_bytes: b.pitch_bytes,
+        bytes: b.bytes,
+        chroma: request.chroma(),
+    }
+}
+
+/// hubp401_program_mcache_id_and_split_coordinate on every pipe of a plane
+/// (dcn401_program_pipe's step 13): an MPC-combined DCC plane's two DPPs
+/// each take the mcaches their own viewport crosses, as
+/// dml2_top_soc15_build_mcache_programming assigns them from the pipe's
+/// scaler viewport (dml21_get_pipe_mcache_config). Linux DML21 plans this
+/// 2:1 primary (8 UMC channels) on two DPPs with two mcaches, the boundary
+/// at 3840. SPL's slices overlap it by their filter taps (columns 0-3841
+/// and 3838-7679), so each pipe reads mcache 0 and then mcache 1 past
+/// column 3839. A plane without DCC programs the unassigned ids (0xf) and
+/// split (0xffff); readback catches a change.
+fn dcn401_deadlines_program_each_split_pipe_its_mcaches() -> TestResult {
+    let s = split_dcc_primary(SplitPipes::one(3));
+    let soc = dml::Soc {
+        umc_channels: 8,
+        ..soc()
+    };
+    let plane = s.request.dml_plane();
+    let mode = dml::Mode {
+        timing: Timing {
+            pixel_clock_khz: 533_250,
+            h_active: 3840,
+            h_total: 4000,
+            h_front_porch: 48,
+            h_sync_width: 32,
+            v_active: 2160,
+            v_total: 2222,
+            v_front_porch: 3,
+            v_sync_width: 5,
+            h_sync_positive: true,
+            v_sync_positive: true,
+        },
+        pitch: u32::from(plane.pitch),
+        bytes_per_pixel: 4,
+        ycbcr420: false,
+        dsc: None,
+        planes: [Some(plane), None, None, None],
+    };
+    let Ok(plan) = dml::admit(&soc, &mode) else {
+        return TestResult::Fail("split DCC primary refused");
+    };
+    let Some(p) = plan.plane(0) else {
+        return TestResult::Fail("planned plane");
+    };
+    let Some(a) = p.mcache else {
+        return TestResult::Fail("DCC plane without an mcache allocation");
+    };
+    if plan.pipes != 1 || p.dpps != 2 || a.count[0] != 2 || a.offsets[0][..2] != [3840, 7680] {
+        return TestResult::Fail("MPC-combined DCC plane with two mcaches");
+    }
+    let (_, mut requestor, _) = owners(&plan, 0);
+    requestor.surface = s;
+    let mut e = engine();
+    e.status.surfaces[0] = Some(s);
+    e.status.requestor = Some(requestor);
+    if e.deadline_writes(0, &plan, false).is_err() || e.deadline_writes(0, &plan, true).is_err() {
+        return TestResult::Fail("program/verify both slices");
+    }
+    let reg = |e: &crate::amdgpu_dcn401_otg::tests::Fake, p: u8, r: u64| {
+        e.regs.get(&hubp_at(p, r)).copied().unwrap_or(0)
+    };
+    let viewports: alloc::vec::Vec<_> = s
+        .request
+        .scalers()
+        .map(|(q, sc)| (q, sc.viewport.x, sc.viewport.width))
+        .collect();
+    if viewports != [(0, 0, 3842), (3, 3838, 3842)] {
+        return TestResult::Fail("SPL slice viewports");
+    }
+    // Both slices read mcache 0, then mcache 1 past column 3839.
+    for q in [0u8, 3] {
+        if reg(&e.io, q, MCACHEID_CONFIG) != 0xff10_ff10
+            || reg(&e.io, q, MCACHE_SPLIT) != 0xffff_0000 | 3839
+        {
+            return TestResult::Fail("split pipe mcache registers");
+        }
+    }
+    // Pipes outside the plane are never written.
+    if e.io.writes.iter().any(|&(at, _)| {
+        [1u8, 2]
+            .iter()
+            .any(|&q| at == hubp_at(q, MCACHEID_CONFIG) || at == hubp_at(q, MCACHE_SPLIT))
+    }) {
+        return TestResult::Fail("unrelated pipe's mcaches programmed");
+    }
+    e.io.regs.insert(hubp_at(3, MCACHEID_CONFIG), 0);
+    if e.deadline_writes(0, &plan, true) != Err(Error::Readback(hubp_at(3, MCACHEID_CONFIG))) {
+        return TestResult::Fail("mcache readback");
+    }
+    // Without DCC: reset_mcache_allocations' unassigned registers.
+    let plan = self::plan();
+    let mut e = engine();
+    if e.deadline_writes(2, &plan, false).is_err()
+        || reg(&e.io, 2, MCACHEID_CONFIG) != u32::MAX
+        || reg(&e.io, 2, MCACHE_SPLIT) != u32::MAX
+    {
+        return TestResult::Fail("unassigned mcaches without DCC");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-deadline",
+    dcn401_deadlines_program_each_split_pipe_its_mcaches
 );

@@ -497,7 +497,7 @@ fn build_newroute(route: &crate::route::Route, ifindex: u32, seq: u32, pid: u32)
     body.push(0); // rtm_src_len
     body.push(0); // rtm_tos
     body.push(route.table); // rtm_table (all current table IDs fit in u8)
-    body.push(RTPROT_KERNEL); // rtm_protocol
+    body.push(route.protocol); // rtm_protocol, as installed
     body.push(route.scope as u8); // rtm_scope
     body.push(if route.table == crate::route::TABLE_LOCAL {
         RTN_LOCAL
@@ -1525,38 +1525,58 @@ fn apply_mutation(
                 None if prefix_len == 0 => [0; 4],
                 None => return Err(EINVAL),
             };
+            // `rtm_to_fib_config` + `fib_check_nh`: a zero RTA_GATEWAY is no
+            // gateway (NetworkManager sends 0.0.0.0 on its prefix routes),
+            // so the route is on-link and dumps without `via`.
+            let gateway: Option<[u8; 4]> = match find_attr(request, 12, RTA_GATEWAY) {
+                Some(raw) if raw.len() == 4 => {
+                    let gw: [u8; 4] = raw.try_into().map_err(|_| EINVAL)?;
+                    (gw != [0; 4]).then_some(gw)
+                }
+                Some(_) => return Err(EINVAL),
+                None => None,
+            };
+            let given_metric = match find_attr(request, 12, RTA_PRIORITY) {
+                Some(raw) if raw.len() == 4 => {
+                    Some(u32::from_ne_bytes(raw.try_into().map_err(|_| EINVAL)?))
+                }
+                Some(_) => return Err(EINVAL),
+                None => None,
+            };
+            let protocol = request[NLMSG_HDRLEN + 5];
+            if hdr.msg_type == RTM_DELROUTE {
+                // `fib_table_delete`: the first alias at dst/len whose
+                // priority, gateway, oif and protocol match every attribute
+                // the request carried; none → -ESRCH. Matching on dst/oif
+                // alone deleted whichever default route came first.
+                return match admin.del_ipv4_route_matching(
+                    dst,
+                    prefix_len,
+                    table,
+                    given_metric,
+                    gateway,
+                    protocol,
+                ) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err(ESRCH),
+                    Err(error) => Err(admin_errno(error)),
+                };
+            }
+            let metric = given_metric.unwrap_or(0);
+            // A FIB alias is (table, dst/len, tos, priority): another metric
+            // is another route, not a conflict.
             let exists = crate::route::route_list().iter().any(|route| {
                 route.iface == admin.iface_name()
                     && route.dst.addr.0 == dst
                     && route.dst.prefix_len == prefix_len
                     && route.table == table
+                    && route.metric == metric
             });
-            if hdr.msg_type == RTM_DELROUTE {
-                if !exists {
-                    // `fib_table_delete`: no matching alias → -ESRCH.
-                    return Err(ESRCH);
-                }
-                return admin
-                    .del_ipv4_route(dst, prefix_len, table)
-                    .map_err(admin_errno);
-            }
             validate_new_flags(exists, hdr.flags)?;
-            let gateway = match find_attr(request, 12, RTA_GATEWAY) {
-                Some(raw) if raw.len() == 4 => Some(raw.try_into().map_err(|_| EINVAL)?),
-                Some(_) => return Err(EINVAL),
-                None => None,
-            };
             let preferred_src = match find_attr(request, 12, RTA_PREFSRC) {
                 Some(raw) if raw.len() == 4 => Some(raw.try_into().map_err(|_| EINVAL)?),
                 Some(_) => return Err(EINVAL),
                 None => None,
-            };
-            let metric = match find_attr(request, 12, RTA_PRIORITY) {
-                Some(raw) if raw.len() == 4 => {
-                    u32::from_ne_bytes(raw.try_into().map_err(|_| EINVAL)?)
-                }
-                Some(_) => return Err(EINVAL),
-                None => 0,
             };
             // Only a new route's scope is validated (`fib_create_info`:
             // `fc_scope > RT_SCOPE_HOST` is -EINVAL). A delete never checks
@@ -1579,6 +1599,7 @@ fn apply_mutation(
                     metric,
                     scope,
                     table,
+                    protocol,
                 })
                 .map_err(admin_errno)
         }

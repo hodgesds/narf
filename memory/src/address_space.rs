@@ -7565,15 +7565,19 @@ impl AddressSpace {
                 return;
             }
             if pages > FULL_FLUSH_PAGE_CEILING {
-                crate::tlb_shootdown::shootdown(crate::tlb_shootdown::ShootdownRequest::for_tag(
-                    self.translation_tag(),
-                ));
+                crate::tlb_shootdown::shootdown_owned(
+                    self.root.as_u64(),
+                    crate::tlb_shootdown::ShootdownRequest::for_tag(self.translation_tag()),
+                );
             } else {
-                crate::tlb_shootdown::shootdown(crate::tlb_shootdown::ShootdownRequest::for_range(
-                    self.translation_tag(),
-                    base.as_u64(),
-                    pages,
-                ));
+                crate::tlb_shootdown::shootdown_owned(
+                    self.root.as_u64(),
+                    crate::tlb_shootdown::ShootdownRequest::for_range(
+                        self.translation_tag(),
+                        base.as_u64(),
+                        pages,
+                    ),
+                );
             }
         }
         // aarch64: `unmap_4kb`'s TLBI already covers the shareability
@@ -7595,15 +7599,19 @@ impl AddressSpace {
             return;
         }
         if pages > FULL_FLUSH_PAGE_CEILING {
-            crate::tlb_shootdown::shootdown(crate::tlb_shootdown::ShootdownRequest::for_tag(
-                self.translation_tag(),
-            ));
+            crate::tlb_shootdown::shootdown_owned(
+                self.root.as_u64(),
+                crate::tlb_shootdown::ShootdownRequest::for_tag(self.translation_tag()),
+            );
         } else {
-            crate::tlb_shootdown::shootdown(crate::tlb_shootdown::ShootdownRequest::for_range(
-                self.translation_tag(),
-                base.as_u64(),
-                pages,
-            ));
+            crate::tlb_shootdown::shootdown_owned(
+                self.root.as_u64(),
+                crate::tlb_shootdown::ShootdownRequest::for_range(
+                    self.translation_tag(),
+                    base.as_u64(),
+                    pages,
+                ),
+            );
         }
     }
 
@@ -7690,9 +7698,10 @@ impl AddressSpace {
         // deadlock.
         #[cfg(target_arch = "x86_64")]
         {
-            crate::tlb_shootdown::shootdown(crate::tlb_shootdown::ShootdownRequest::for_tag(
-                self.translation_tag(),
-            ));
+            crate::tlb_shootdown::shootdown_owned(
+                self.root.as_u64(),
+                crate::tlb_shootdown::ShootdownRequest::for_tag(self.translation_tag()),
+            );
         }
 
         // Pass 2: free the backing frames (allocation-free) and zero the
@@ -11087,17 +11096,21 @@ impl AddressSpace {
             }
             let region_pages = (r.len + 0xFFF) >> 12;
             if broadcast && !use_full_flush && region_pages > 0 {
-                crate::tlb_shootdown::shootdown(crate::tlb_shootdown::ShootdownRequest::for_range(
-                    self.translation_tag(),
-                    r.base.as_u64(),
-                    region_pages,
-                ));
+                crate::tlb_shootdown::shootdown_owned(
+                    self.root.as_u64(),
+                    crate::tlb_shootdown::ShootdownRequest::for_range(
+                        self.translation_tag(),
+                        r.base.as_u64(),
+                        region_pages,
+                    ),
+                );
             }
         }
         if use_full_flush {
-            crate::tlb_shootdown::shootdown(crate::tlb_shootdown::ShootdownRequest::for_tag(
-                self.translation_tag(),
-            ));
+            crate::tlb_shootdown::shootdown_owned(
+                self.root.as_u64(),
+                crate::tlb_shootdown::ShootdownRequest::for_tag(self.translation_tag()),
+            );
         }
     }
 
@@ -11227,11 +11240,14 @@ impl AddressSpace {
             // Per-run remote invalidation up to the ceiling; past it, the
             // single full flush after the walk covers every restricted leaf.
             if broadcast && changed != 0 && changed_pages <= FULL_FLUSH_PAGE_CEILING {
-                crate::tlb_shootdown::shootdown(crate::tlb_shootdown::ShootdownRequest::for_range(
-                    self.translation_tag(),
-                    base.as_u64(),
-                    pages,
-                ));
+                crate::tlb_shootdown::shootdown_owned(
+                    self.root.as_u64(),
+                    crate::tlb_shootdown::ShootdownRequest::for_range(
+                        self.translation_tag(),
+                        base.as_u64(),
+                        pages,
+                    ),
+                );
             }
             Ok::<(), AddressSpaceError>(())
         };
@@ -11335,9 +11351,10 @@ impl AddressSpace {
 
         #[cfg(target_arch = "x86_64")]
         if broadcast && changed_pages > FULL_FLUSH_PAGE_CEILING {
-            crate::tlb_shootdown::shootdown(crate::tlb_shootdown::ShootdownRequest::for_tag(
-                self.translation_tag(),
-            ));
+            crate::tlb_shootdown::shootdown_owned(
+                self.root.as_u64(),
+                crate::tlb_shootdown::ShootdownRequest::for_tag(self.translation_tag()),
+            );
         }
         Ok(())
     }
@@ -13317,32 +13334,40 @@ impl AddressSpace {
             // Publish logical-AS residency before loading the root. This uses
             // the allocated tag even on a CPU taking the PCID-0 fallback, so a
             // mixed-feature sibling remains a target of this AS's shootdowns.
-            crate::tlb_shootdown::set_active_as(
-                narf_lib::percpu::current_cpu() as u32,
-                self.context_tag.tag,
-            );
-            // SAFETY: `new_for_user` (the only safe path to a
-            // non-zero `root`) populated the kernel-half entries
-            // from the current PML4, so the next instruction fetch
-            // after the CR3 swap still resolves against a valid
-            // kernel mapping. Interrupt state is the caller's
-            // contract — the executor disables IRQs through the
-            // existing `IrqSafeSpinLock` on the ready queue.
-            // SAFETY: Valid memory or trusted environment
-            // Allocation returns a nonzero tag only after the post-SMP gate
-            // proved PCIDE+INVPCID on every online CPU. The tag therefore is
-            // the hot-path proof; do not execute CPUID on every switch.
-            let tagged = self.context_tag.tag != crate::asid_alloc::TAG_RESERVED;
-            let value = self.root.as_u64()
-                | if tagged {
-                    self.context_tag.tag as u64 | (1u64 << 63)
-                } else {
-                    0
-                };
-            // SAFETY: the live, aligned root contains the shared kernel half;
-            // a nonzero low tag is issued only after PCIDE is globally ready.
-            unsafe { narf_arch::x86_64::cr::write_cr3(value) };
-            Ok(())
+            //
+            // The begin/finish pair also implements lazy remote invalidation
+            // (see `tlb_shootdown`'s lazy-residency notes): a CPU that owes a
+            // deferred flush for this tag's bucket pays it here, before the
+            // CR3 write can expose a stale translation. Interrupts stay off
+            // so the CPU id, the claim and the CR3 write cannot be split.
+            let tag = self.context_tag.tag;
+            let root = self.root.as_u64();
+            narf_lib::sync::without_interrupts(|| {
+                let cpu = narf_lib::percpu::current_cpu() as u32;
+                if crate::tlb_shootdown::begin_context_load(cpu, tag, root) {
+                    // SAFETY: CPL=0 with interrupts disabled; dropping every
+                    // non-global entry is always a correct (over-)invalidation.
+                    unsafe { crate::x86_64::paging::flush_user_tlb_local() };
+                }
+                // Allocation returns a nonzero tag only after the post-SMP
+                // gate proved PCIDE+INVPCID on every online CPU. The tag
+                // therefore is the hot-path proof; do not execute CPUID on
+                // every switch.
+                let value = root
+                    | if tag != crate::asid_alloc::TAG_RESERVED {
+                        tag as u64 | (1u64 << 63)
+                    } else {
+                        0
+                    };
+                // SAFETY: `new_for_user` (the only safe path to a non-zero
+                // `root`) populated the kernel-half entries from the current
+                // PML4, so the next instruction fetch after the CR3 swap still
+                // resolves against a valid kernel mapping. A nonzero low tag
+                // is issued only after PCIDE is globally ready.
+                unsafe { narf_arch::x86_64::cr::write_cr3(value) };
+                crate::tlb_shootdown::finish_context_load(cpu, tag, root);
+                Ok(())
+            })
         }
         #[cfg(target_arch = "aarch64")]
         {

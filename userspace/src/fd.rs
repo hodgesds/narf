@@ -1355,12 +1355,30 @@ unsafe fn write_user_termios2(uptr: u64, src: [u8; 60]) -> Result<(), FsError> {
     Ok(())
 }
 
-/// The boot console behind fd 0/1/2. Stateless: the console is a
-/// singleton, so its terminal attributes (termios, winsize) and job-
-/// control foreground pgrp all live in `narf_filesystem::console_tty`,
-/// shared with `/dev/console` (`DevConsole`). A `tcsetpgrp` on fd 0 is
-/// therefore visible to the shell reading `/dev/console` and vice versa.
+/// The boot console behind fd 0/1/2: `/dev/console`, i.e. the tty the
+/// kernel command line's last `console=` names (`ttyS0` or the VT). Stateless:
+/// that tty's terminal attributes (termios, winsize) and job-control
+/// foreground pgrp live in its `narf_filesystem::console_tty` port, shared
+/// with `/dev/console` (`DevConsole`) and the port's own node. A `tcsetpgrp`
+/// on fd 0 is therefore visible to the shell reading `/dev/console` and vice
+/// versa.
 pub struct ConsoleFile;
+
+/// Whether a console read parked on tty `tty_id` should wake and re-run:
+/// that tty has input a read would consume (completed line-discipline input
+/// or bytes still queued by its device). An unknown id falls back to any
+/// console input.
+pub fn console_input_ready(tty_id: u32) -> bool {
+    match narf_filesystem::console_tty::port_by_id(tty_id) {
+        Some(port) => port.readable_bytes() > 0,
+        None => narf_input::pending_input() > 0,
+    }
+}
+
+/// The tty behind fd 0/1/2.
+fn console_port() -> &'static narf_filesystem::console_tty::TtyPort {
+    narf_filesystem::console_tty::console()
+}
 
 /// `/dev/console`'s device number, `MKDEV(TTYAUX_MAJOR, 1)` in Linux's
 /// `new_encode_dev` form.
@@ -1482,7 +1500,7 @@ pub struct Winsize {
 /// one `console_tty` winsize, so a TIOCSWINSZ through either is visible to
 /// both, and both follow the framebuffer console's text grid.
 pub fn console_winsize() -> Winsize {
-    let ws = narf_filesystem::console_tty::winsize();
+    let ws = console_port().winsize();
     Winsize {
         ws_row: ws.rows,
         ws_col: ws.cols,
@@ -1494,7 +1512,7 @@ pub fn console_winsize() -> Winsize {
 /// Set the console window size (TIOCSWINSZ); SIGWINCH to the foreground
 /// process group when it changed.
 pub fn set_console_winsize(ws: Winsize) {
-    narf_filesystem::console_tty::resize(narf_filesystem::devfs_pty::WinSize {
+    console_port().resize(narf_filesystem::devfs_pty::WinSize {
         rows: ws.ws_row,
         cols: ws.ws_col,
         xpixel: ws.ws_xpixel,
@@ -1531,15 +1549,8 @@ impl FileOps for ConsoleFile {
         // /dev/console see one console with one termios. Cooked mode
         // (the default) returns whole lines with echo + backspace;
         // a program that TCSETSes raw gets byte-at-a-time.
-        let n = narf_filesystem::console_tty::read_into(buf);
-        let would_block = n == 0 && narf_filesystem::console_tty::block_on_input();
-        Box::pin(async move {
-            if would_block {
-                Err(narf_filesystem::FsError::WouldBlock)
-            } else {
-                Ok(n)
-            }
-        })
+        let got = console_port().read(buf);
+        Box::pin(async move { got.ok_or(narf_filesystem::FsError::WouldBlock) })
     }
     /// Block an empty console read on the input waker (woken by the
     /// serial/keyboard IRQ) instead of returning a spurious 0. This is what
@@ -1548,7 +1559,7 @@ impl FileOps for ConsoleFile {
     /// path when this is true and the fd is blocking. Delegates to the
     /// shared discipline: park while no completed line/byte is buffered.
     fn block_on_input(&self) -> bool {
-        narf_filesystem::console_tty::block_on_input()
+        console_port().block_on_input()
     }
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         // fd 0/1/2 of the boot console are `/dev/console`, so a TIOCCONS
@@ -1556,13 +1567,10 @@ impl FileOps for ConsoleFile {
         if let Some(target) = narf_filesystem::console_tty::redirect() {
             return Box::pin(async move { target.write(0, buf).await });
         }
-        let n = buf.len();
+        // The tty write path of the console's port: OPOST, then that tty's
+        // device (the UART for `ttyS0`, the framebuffer console for the VT).
         // Eagerly write: the future just reports the count.
-        use core::fmt::Write as _;
-        let mut w = narf_console::Writer;
-        for &b in buf {
-            let _ = w.write_char(b as char);
-        }
+        let n = console_port().write_user(buf);
         Box::pin(async move { Ok(n) })
     }
     /// fds 0/1/2 are the boot console — a TTY, so they must `fstat` as
@@ -1593,22 +1601,22 @@ impl FileOps for ConsoleFile {
     /// as EOF and exits the moment the user gets to a prompt.
     fn poll_readiness(&self) -> u32 {
         let mut mask = narf_filesystem::POLL_OUT;
-        if narf_filesystem::console_tty::poll_readable() {
+        if console_port().poll_readable() {
             mask |= narf_filesystem::POLL_IN;
         }
         mask
     }
     /// Job control: the boot console's stable tty id.
     fn tty_id(&self) -> Option<u32> {
-        Some(narf_filesystem::TTY_ID_CONSOLE)
+        Some(console_port().tty_id())
     }
     /// Job control: the console's (singleton) foreground process group.
     fn tty_fg_pgrp(&self) -> Option<u64> {
-        Some(narf_filesystem::console_tty::fg_pgrp())
+        Some(console_port().fg_pgrp())
     }
     /// Job control: TOSTOP from the shared console termios.
     fn tty_tostop(&self) -> bool {
-        narf_filesystem::console_tty::tostop()
+        console_port().tostop()
     }
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
         // Terminal ioctls. All return Ok(0) on success; any
@@ -1621,7 +1629,7 @@ impl FileOps for ConsoleFile {
                 // (cooked default until a program TCSETS its own), so
                 // isatty(0) succeeds AND an interactive shell sees a real
                 // cooked tty (ICANON|ECHO). The discipline now enforces it.
-                let raw = narf_filesystem::console_tty::termios();
+                let raw = console_port().termios();
                 // SAFETY: `arg` is the user `struct termios *` from ioctl;
                 // write_user_termios range-validates + SMAP-brackets it.
                 unsafe { write_user_termios(arg as u64, raw)? };
@@ -1635,11 +1643,11 @@ impl FileOps for ConsoleFile {
                 // and /dev/console alike.
                 // SAFETY: `arg` is the validated user `struct termios *`.
                 let raw = unsafe { read_user_termios(arg as u64)? };
-                narf_filesystem::console_tty::set_termios(raw);
+                console_port().set_termios(raw);
                 Ok(0)
             }
             TCGETS2 => {
-                let raw = narf_filesystem::console_tty::termios();
+                let raw = console_port().termios();
                 // SAFETY: `arg` is the user `struct termios2 *` from ioctl.
                 unsafe { write_user_termios2(arg as u64, raw)? };
                 Ok(0)
@@ -1647,7 +1655,7 @@ impl FileOps for ConsoleFile {
             TCSETS2 | TCSETSW2 | TCSETSF2 => {
                 // SAFETY: `arg` is the validated user `struct termios2 *`.
                 let raw = unsafe { read_user_termios2(arg as u64)? };
-                narf_filesystem::console_tty::set_termios(raw);
+                console_port().set_termios(raw);
                 Ok(0)
             }
             TIOCSCTTY => {
@@ -1720,7 +1728,7 @@ impl FileOps for ConsoleFile {
             FIONREAD => {
                 // Best-effort: bytes immediately readable through the
                 // shared discipline (completed lines + queued raw input).
-                let n: i32 = narf_filesystem::console_tty::readable_bytes() as i32;
+                let n: i32 = console_port().readable_bytes() as i32;
                 let bytes = n.to_le_bytes();
                 // SAFETY: `copy_to_user` validates `arg` as a user address
                 // through the SMAP window; the length is the fixed 4-byte
@@ -1751,9 +1759,7 @@ impl FileOps for ConsoleFile {
                 // fg_pgrp is kept in task-id space internally; report it
                 // to userspace in the visible-pid space getpid/getpgrp use.
                 let pgrp = crate::handlers::pgid_to_user(
-                    narf_filesystem::console_tty::fg_pgrp_or_install(
-                        crate::handlers::current_task_pgid(),
-                    ),
+                    console_port().fg_pgrp_or_install(crate::handlers::current_task_pgid()),
                 );
                 let bytes = (pgrp as i32).to_le_bytes();
                 // SAFETY: `copy_to_user` validates `arg` as a user address
@@ -1782,7 +1788,7 @@ impl FileOps for ConsoleFile {
                 // task-id space (consistent with read_pgid / the SIGTTIN
                 // check), so translate before storing.
                 let pgrp = crate::handlers::pgid_from_user(pgrp as u64);
-                narf_filesystem::console_tty::set_fg_pgrp(pgrp);
+                console_port().set_fg_pgrp(pgrp);
                 Ok(0)
             }
             KDSIGACCEPT => {

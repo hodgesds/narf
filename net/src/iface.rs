@@ -1708,6 +1708,7 @@ pub fn set_gateway(iface_name: &str, gateway: [u8; 4]) {
         metric: 100,
         scope: Scope::Universe,
         table: TABLE_MAIN,
+        protocol: crate::route::RTPROT_KERNEL,
     });
 }
 

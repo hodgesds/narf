@@ -1745,9 +1745,29 @@ fn smoke_sysfs_tty_console_active() -> TestResult {
     crate::sysfs::populate_tty_class();
     let class_tty = crate::sysfs::class_register("tty");
     let console = crate::sysfs::class_device_register(class_tty, "console");
-    match attr_show_trimmed(&console, "active").as_deref() {
-        Some("tty0") => TestResult::Pass,
-        _ => TestResult::Fail("/sys/class/tty/console/active is not \"tty0\""),
+    // With no `console=`, both consoles are registered and `ttyS0`, the one
+    // `/dev/console` opens, is listed last (`show_cons_active`).
+    let saved =
+        crate::console_tty::__test_swap_config(Some(crate::console_tty::parse_console_config("")));
+    let active = attr_show_trimmed(&console, "active");
+    let _ = crate::console_tty::__test_swap_config(saved);
+    if active.as_deref() != Some("tty0 ttyS0") {
+        return TestResult::Fail("/sys/class/tty/console/active is not \"tty0 ttyS0\"");
+    }
+    // `ttyS0` is a device udev can coldplug: a canonical kobject with a
+    // `uevent` naming its dev_t, in the tty subsystem.
+    let root = crate::sysfs::get_root();
+    let ttys0 = root
+        .get_child("devices")
+        .and_then(|d| d.get_child("virtual"))
+        .and_then(|v| v.get_child("tty"))
+        .and_then(|t| t.get_child("ttyS0"));
+    match ttys0 {
+        Some(dev) if dev.has_attr("uevent") => match attr_show_trimmed(&dev, "uevent") {
+            Some(ev) if ev.contains("MAJOR=4") && ev.contains("MINOR=64") => TestResult::Pass,
+            _ => TestResult::Fail("ttyS0's uevent does not carry its dev_t"),
+        },
+        _ => TestResult::Fail("/sys/devices/virtual/tty/ttyS0 has no uevent"),
     }
 }
 kernel_test_in!("filesystem/sysfs", smoke_sysfs_tty_console_active);

@@ -198,8 +198,18 @@ const MASKED_CHUNK: usize = 16;
 /// work between chunks. Linux keeps these windows short the same way: the
 /// uart driver writes under its port lock a FIFO at a time, and fbcon draws
 /// under the sleeping `console_lock` with IRQs enabled.
-fn write_chunked(bytes: &[u8], mut uart: impl FnMut(&[u8])) {
-    let h = FB_HOOK.load(Ordering::Acquire);
+fn write_chunked(bytes: &[u8], uart: impl FnMut(&[u8])) {
+    write_chunked_sinks(bytes, uart, true);
+}
+
+/// [`write_chunked`] with the framebuffer fan-out optional: `fb == false`
+/// sends the chunks to `uart` only.
+fn write_chunked_sinks(bytes: &[u8], mut uart: impl FnMut(&[u8]), fb: bool) {
+    let h = if fb {
+        FB_HOOK.load(Ordering::Acquire)
+    } else {
+        0
+    };
     let mut rest = bytes;
     while !rest.is_empty() {
         let limit = rest.len().min(MASKED_CHUNK);
@@ -251,6 +261,39 @@ pub fn write_bytes_raw(bytes: &[u8]) {
             backend::write_bytes_opts(base, kind, chunk, false);
         }
     });
+}
+
+/// [`write_bytes_raw`] to the UART only: the `ttyS0` tty's write path
+/// (`uart_write`). A serial tty's output belongs to the serial line, not to
+/// the framebuffer console the VTs draw on, exactly as on Linux, where only
+/// the kernel log (printk) reaches every registered console.
+pub fn write_uart_raw(bytes: &[u8]) {
+    let _g = CONSOLE.lock.lock();
+    let kind = match CONSOLE.kind.get() {
+        Some(k) => *k,
+        None => return, // pre-init; silently drop
+    };
+    let base = CONSOLE.base.load(Ordering::Acquire) as usize;
+    write_chunked_sinks(
+        bytes,
+        |chunk| {
+            // SAFETY: `kind` + `base` were published via Release by
+            // `early_init` or `remap_to_virtual`, and we hold the coarse lock.
+            unsafe {
+                backend::write_bytes_opts(base, kind, chunk, false);
+            }
+        },
+        false,
+    );
+}
+
+/// [`write_bytes_raw`] to the framebuffer console only: the VT tty's write
+/// path (`con_write`). VT output is drawn on the screen and never copied to
+/// the UART, as on Linux. `CONSOLE.lock` still serializes it with printk,
+/// whose text the same framebuffer parser draws.
+pub fn write_fb_raw(bytes: &[u8]) {
+    let _g = CONSOLE.lock.lock();
+    write_chunked_sinks(bytes, |_| {}, true);
 }
 
 /// Enable RX-data-available IRQ on the active UART. After this

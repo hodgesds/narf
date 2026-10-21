@@ -197,7 +197,7 @@ fn pcie_discovery_reaches_vram_tail() -> TestResult {
     for aperture in [256 << 20, 16 << 30] {
         let mut io = Device::new(aperture);
         io.image = Some((size - 65536, blob.clone()));
-        let (blocks, _) = crate::amdgpu::read_discovery(&mut io, size);
+        let (blocks, _, _) = crate::amdgpu::read_discovery(&mut io, size);
         if d::find_ip(&blocks, d::HW_ID_GC, 0).map(|b| b.base_addrs[0]) != Some(gc)
             || d::find_ip(&blocks, d::HW_ID_MP0, 0).map(|b| b.base_addrs[0]) != Some(mp0)
             || io.reads.len() != 10240 / 4

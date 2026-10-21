@@ -11,7 +11,10 @@
 //! firmware API negotiation, and an MLD station control/data path are
 //! implemented in `runtime`, `device`, and `connection`. The current MLD
 //! command profile targets Sc/BE211 firmware. Unsupported command
-//! versions fail startup explicitly; Gen2 retains its older path.
+//! versions fail startup explicitly. Gen2 retains a diagnostic transport
+//! path, but keeps carrier down and rejects scan, configuration, and
+//! association until it has a complete firmware command and completion
+//! lifecycle.
 //!
 //! The station path supports 2.4/5 GHz legacy-rate Open or WPA2-PSK/CCMP
 //! networks. Firmware supplies channel/antenna data and enforces its
@@ -134,6 +137,17 @@ unsafe impl Send for IwlDevice {}
 unsafe impl Sync for IwlDevice {}
 
 impl IwlDevice {
+    /// The Gen2 transport can initialise diagnostic RX/TX rings, but it
+    /// does not yet own the firmware command, response, and completion
+    /// lifecycle needed to make wireless control-plane operations safe.
+    ///
+    /// Keeping this gate in one helper makes every exposed legacy operation
+    /// fail before it allocates DMA memory or writes a hardware doorbell.
+    /// It may change only when all three command lifecycles are implemented.
+    fn control_plane_ready() -> bool {
+        false
+    }
+
     /// Push an Open System Authentication request frame (seq=1) on
     /// the management TX queue. The AP responds with seq=2 via the RX
     /// path; we don't currently block on that response here — the
@@ -340,6 +354,10 @@ impl WirelessNetIface for IwlDevice {
     }
 
     async fn scan(&self, req: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
+        if !Self::control_plane_ready() {
+            return Err(WirelessError::NotSupported);
+        }
+
         if self.scan_in_progress.swap(true, Ordering::SeqCst) {
             return Err(WirelessError::Busy);
         }
@@ -460,6 +478,14 @@ impl WirelessNetIface for IwlDevice {
     }
 
     async fn associate(&self, req: AssociateRequest) -> Result<(), WirelessError> {
+        if !Self::control_plane_ready() {
+            // A management TX completion alone is insufficient: a usable link
+            // additionally requires authenticated and associated firmware state.
+            // The legacy transport observes none of those states, so it must
+            // not raise carrier simply because userspace requested association.
+            return Err(WirelessError::NotSupported);
+        }
+
         let _ = writeln!(
             narf_console::Writer,
             "  iwlwifi: associating to {:?}",
@@ -540,6 +566,10 @@ impl WirelessNetIface for IwlDevice {
     }
 
     async fn set_config(&self, _cfg: WirelessConfig) -> Result<(), WirelessError> {
+        if !Self::control_plane_ready() {
+            return Err(WirelessError::NotSupported);
+        }
+
         Ok(())
     }
 }
@@ -1851,6 +1881,15 @@ pub mod tests {
         TestResult::Pass
     }
 
+    /// Gen2's diagnostic transport must not become a usable wireless
+    /// interface until firmware command/response ownership is implemented.
+    fn smoke_iwlwifi_legacy_control_plane_stays_gated() -> TestResult {
+        if IwlDevice::control_plane_ready() {
+            return TestResult::Fail("legacy control plane must stay fail-closed");
+        }
+        TestResult::Pass
+    }
+
     /// AX200 ladder = exactly one filename
     /// (`iwlwifi-QuZ-a0-hr-b0-100.ucode`).
     fn smoke_iwlwifi_ax200_ladder_pinned_api_100() -> TestResult {
@@ -1976,6 +2015,10 @@ pub mod tests {
     kernel_test_in!(
         "drivers/wireless/iwlwifi",
         smoke_iwlwifi_chip_table_is_complete
+    );
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi",
+        smoke_iwlwifi_legacy_control_plane_stays_gated
     );
     kernel_test_in!(
         "drivers/wireless/iwlwifi",

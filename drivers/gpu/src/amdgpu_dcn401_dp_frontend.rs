@@ -238,7 +238,7 @@ impl<I: Io> Engine<I> {
         if self.status.state != State::DpLinkTrained(path.transmitter) {
             return Err(Error::Busy);
         }
-        if request.stream >= 4 || request.pipe >= 4 {
+        if request.stream >= 4 || request.pipe >= self.layout.pool.count() {
             return Err(Error::Invalid);
         }
         let link = self.status.dp_link_trained.ok_or(Error::Invalid)?;
@@ -371,10 +371,12 @@ impl<I: Io> Engine<I> {
             plan.request.vsc_colorimetry,
             plan.controls[7],
         );
-        // Source/stereo selection is the OTG, never the physical port index.
+        // Source/stereo selection is the OTG instance (dig_connect_to_otg:
+        // DIG_SOURCE_SELECT = tg->inst), never the physical port index.
+        let otg = self.layout.inst_field(plan.request.pipe);
         for (slot, mask, value) in [
-            (0, 7, u32::from(plan.request.pipe)),
-            (0, 0x70, u32::from(plan.request.pipe) << 4),
+            (0, 7, otg),
+            (0, 0x70, otg << 4),
             (0, 0x100, 0x100),
             // PIXEL_ENCODING_TYPE: compressed for a DSC stream (RGB, so
             // COMPRESSED_PIXEL_FORMAT 0), as enc401's stream attribute sets.

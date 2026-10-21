@@ -20,6 +20,16 @@ fn completed_modeset(pipe: u8) -> Modeset {
     Modeset {
         selection,
         pipe,
+        crtc: pipe,
+        output: StreamOutput {
+            link: 0,
+            preferred_engine: pipe,
+            hpo_dp: false,
+        },
+        encoders: StreamEncoders {
+            stream_enc: pipe,
+            ..StreamEncoders::default()
+        },
         plan,
         scanout: otg::ScanoutRunning {
             pipe,
@@ -58,7 +68,12 @@ fn navi48_completed_modesets_survive_configuration_and_publication_cancellation(
                 }
                 if during_startup {
                     journal
-                        .begin_activation(3, otg::SplitPipes::NONE, &second.selection)
+                        .begin_activation(
+                            3,
+                            otg::SplitPipes::NONE,
+                            &second.selection,
+                            second.encoders,
+                        )
                         .unwrap();
                 }
                 // Later native startup, or asynchronous platform adoption.
@@ -2278,28 +2293,37 @@ kernel_test_in!(
     navi48_dsc_link_verification_reselects_compressed_geometry
 );
 
-/// An n-pipe plan takes the n - 1 highest pipes no display of the
-/// configuration is on and no earlier ODM display took, left to right in
-/// that order; one-pipe plans take none, and a configuration short of
-/// pipes is refused.
-fn navi48_odm_plans_take_the_highest_free_pipes() -> TestResult {
+/// A configuration lit with no display running, as DC acquires its pipes:
+/// every stream's OTG master first, in CRTC order, the lowest free pipe
+/// (whatever the CRTC's index), then each n-pipe plan's n - 1 further OPP
+/// heads, the lowest pipes still free, left to right in that order;
+/// one-pipe plans take none, and a configuration short of pipes is refused.
+/// (Linux's acquire_otg_master_pipe_for_stream and dcn32_acquire_free_pipe_
+/// as_secondary_opp_head take pipes from the bottom; NARF used to take ODM
+/// pipes from the top.)
+fn navi48_odm_plans_take_pipes_as_dc_acquires_them() -> TestResult {
     let one = completed_modeset(0).plan;
     let two = dml::Plan { pipes: 2, ..one };
     let three = dml::Plan { pipes: 3, ..one };
     let four = dml::Plan { pipes: 4, ..one };
     let s = |p: &[u8]| otg::SplitPipes::new(p).unwrap();
     let none = otg::SplitPipes::NONE;
-    let got = |plans: &[dml::Plan], pipes: &[u8]| odm_pipes(plans, pipes).ok();
-    if got(&[two], &[0]) != Some(alloc::vec![s(&[3])])
-        || got(&[two], &[3]) != Some(alloc::vec![s(&[2])])
-        || got(&[one, two, one], &[0, 3, 1]) != Some(alloc::vec![none, s(&[2]), none])
-        || got(&[one, two, two], &[0, 3, 1]).is_some()
-        || got(&[two, two], &[0, 2]) != Some(alloc::vec![s(&[3]), s(&[1])])
-        || got(&[one, one], &[0, 1]) != Some(alloc::vec![none, none])
-        || got(&[three], &[0]) != Some(alloc::vec![s(&[3, 2])])
-        || got(&[four], &[1]) != Some(alloc::vec![s(&[3, 2, 0])])
-        || got(&[three, one], &[0, 1]) != Some(alloc::vec![s(&[3, 2]), none])
-        || got(&[three, one], &[2, 0]) != Some(alloc::vec![s(&[3, 1]), none])
+    let got = |plans: &[dml::Plan], crtcs: &[u8]| {
+        plan_pipes(plans, crtcs)
+            .ok()
+            .map(|d| d.iter().map(|&(head, d)| (head, d.odm)).collect::<Vec<_>>())
+    };
+    if got(&[two], &[0]) != Some(alloc::vec![(0, s(&[1]))])
+        || got(&[two], &[3]) != Some(alloc::vec![(0, s(&[1]))])
+        || got(&[one, two, one], &[0, 1, 3])
+            != Some(alloc::vec![(0, none), (1, s(&[3])), (2, none)])
+        || got(&[one, two, two], &[0, 1, 3]).is_some()
+        || got(&[two, two], &[0, 2]) != Some(alloc::vec![(0, s(&[2])), (1, s(&[3]))])
+        || got(&[one, one], &[0, 1]) != Some(alloc::vec![(0, none), (1, none)])
+        || got(&[three], &[0]) != Some(alloc::vec![(0, s(&[1, 2]))])
+        || got(&[four], &[1]) != Some(alloc::vec![(0, s(&[1, 2, 3]))])
+        || got(&[three, one], &[0, 1]) != Some(alloc::vec![(0, s(&[2, 3])), (1, none)])
+        || got(&[one, three], &[0, 2]) != Some(alloc::vec![(0, none), (1, s(&[2, 3]))])
         || got(&[four, one], &[0, 1]).is_some()
         || got(&[three, two], &[0, 1]).is_some()
     {
@@ -2309,7 +2333,7 @@ fn navi48_odm_plans_take_the_highest_free_pipes() -> TestResult {
 }
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
-    navi48_odm_plans_take_the_highest_free_pipes
+    navi48_odm_plans_take_pipes_as_dc_acquires_them
 );
 
 /// An MST branch that codes 128b/132b trains at its verified cap, the best
@@ -2969,6 +2993,7 @@ fn navi48_planes_reach_admission_and_staging() -> TestResult {
         blend: otg::Blend::default_for(format),
         surface: otg::PlaneSurface::LINEAR,
         fb_size: (w, h),
+        client: false,
     };
     let video = OverlayPlane {
         geometry: geometry(
@@ -2990,6 +3015,7 @@ fn navi48_planes_reach_admission_and_staging() -> TestResult {
                 base.format,
             )),
             overlays: [Some(video), None, None],
+            ..PlaneSetup::NONE
         },
         ..base
     };
@@ -3038,10 +3064,17 @@ fn navi48_planes_reach_admission_and_staging() -> TestResult {
         return TestResult::Fail("planned planes");
     }
     let two = dml::Plan { pipes: 2, ..one };
-    let got = |sel: &[Selection], plans: &[dml::Plan], pipes: &[u8], odm: &[Option<u8>]| {
-        let odm: alloc::vec::Vec<otg::SplitPipes> = odm.iter().map(|&q| q.into()).collect();
-        let mpc = alloc::vec![otg::SplitPipes::NONE; odm.len()];
-        overlay_pipes(sel, plans, pipes, (&odm, &mpc)).ok()
+    // As DC acquires them with no display running: the OTG masters, then
+    // each stream's planes in DC order (the primary on its OPP heads, the
+    // overlays top first, each on the lowest free pipe), then DML's ODM
+    // slices, which copy each slice's tree onto pipes still free. (NARF
+    // used to take overlay pipes from the top.)
+    let got = |sel: &[Selection], plans: &[dml::Plan], crtcs: &[u8]| {
+        display_pipes(sel, plans, crtcs).ok().map(|d| {
+            d.iter()
+                .map(|&(head, d)| (head, d.odm, d.overlays))
+                .collect::<alloc::vec::Vec<_>>()
+        })
     };
     let three = Selection {
         planes: PlaneSetup {
@@ -3050,16 +3083,22 @@ fn navi48_planes_reach_admission_and_staging() -> TestResult {
         },
         ..s
     };
-    if got(&[s, s], &[one, one], &[0, 1], &[None, None])
+    let none = otg::SplitPipes::NONE;
+    if got(&[s, s], &[one, one], &[0, 1])
         != Some(alloc::vec![
-            [pp(3, &[]), None, None],
-            [pp(2, &[]), None, None]
+            (0, none, [pp(2, &[]), None, None]),
+            (1, none, [pp(3, &[]), None, None])
         ])
-        || got(&[s], &[two], &[0], &[Some(3)]) != Some(alloc::vec![[pp(2, &[1]), None, None]])
-        || got(&[three], &[one], &[0], &[None])
-            != Some(alloc::vec![[pp(3, &[]), pp(2, &[]), pp(1, &[])]])
-        || got(&[three, base], &[one, one], &[0, 1], &[None, None]).is_some()
-        || got(&[s, s], &[two, one], &[0, 1], &[Some(3)]).is_some()
+        || got(&[s], &[two], &[0])
+            != Some(alloc::vec![(
+                0,
+                otg::SplitPipes::one(2),
+                [pp(1, &[3]), None, None]
+            )])
+        || got(&[three], &[one], &[0])
+            != Some(alloc::vec![(0, none, [pp(3, &[]), pp(2, &[]), pp(1, &[])])])
+        || got(&[three, base], &[one, one], &[0, 1]).is_some()
+        || got(&[s, s], &[two, one], &[0, 1]).is_some()
     {
         return TestResult::Fail("overlay pipes");
     }
@@ -3108,6 +3147,7 @@ fn navi48_rotated_planes_reach_admission() -> TestResult {
         blend: otg::Blend::default_for(base.format),
         surface,
         fb_size: (1080, 1920),
+        client: false,
     };
     let full = Rect::new(0, 0, 1920, 1080);
     for rotation in [Rotation::R90, Rotation::R270] {
@@ -3435,9 +3475,10 @@ kernel_test_in!(
     navi48_hdmi_frl_dsc_selection_admits_on_two_pipes
 );
 
-/// A tiled or 4:2:0 plane's surface is its whole framebuffer with the
-/// source rectangle placed in it (DC scans the framebuffer's viewport); a
-/// linear RGB plane's is its source rectangle.
+/// A tiled, 4:2:0 or client (GEM, scanned out in place) plane's surface is
+/// its whole framebuffer with the source rectangle placed in it (DC scans
+/// the framebuffer's viewport); a linear RGB dumb plane's is its source
+/// rectangle.
 fn navi48_modeset_stages_whole_framebuffers_for_tiled_and_yuv_planes() -> TestResult {
     use crate::amdgpu_dcn401_spl::{Rect, Rotation};
     let timing = Timing {
@@ -3453,7 +3494,7 @@ fn navi48_modeset_stages_whole_framebuffers_for_tiled_and_yuv_planes() -> TestRe
         h_sync_positive: true,
         v_sync_positive: true,
     };
-    let geometry = |format: otg::SurfaceFormat, surface: otg::PlaneSurface| PlaneGeometry {
+    let geometry = |format: otg::SurfaceFormat, surface: otg::PlaneSurface, client| PlaneGeometry {
         src_x: 320,
         src_y: 180,
         width: 640,
@@ -3463,6 +3504,7 @@ fn navi48_modeset_stages_whole_framebuffers_for_tiled_and_yuv_planes() -> TestRe
         blend: otg::Blend::default_for(format),
         surface,
         fb_size: (1280, 720),
+        client,
     };
     let tiled = otg::PlaneSurface {
         tiling: otg::Tiling {
@@ -3471,19 +3513,34 @@ fn navi48_modeset_stages_whole_framebuffers_for_tiled_and_yuv_planes() -> TestRe
         },
         ..otg::PlaneSurface::LINEAR
     };
-    for (format, surface, whole) in [
-        (otg::SurfaceFormat::Nv12, otg::PlaneSurface::LINEAR, true),
-        (otg::SurfaceFormat::Xrgb8888, tiled, true),
+    for (format, surface, client, whole) in [
+        (
+            otg::SurfaceFormat::Nv12,
+            otg::PlaneSurface::LINEAR,
+            false,
+            true,
+        ),
+        (otg::SurfaceFormat::Xrgb8888, tiled, false, true),
         (
             otg::SurfaceFormat::Xrgb8888,
             otg::PlaneSurface::LINEAR,
             false,
+            false,
+        ),
+        // A linear GEM plane: the crop is in the viewport, so a source
+        // rectangle at any byte shows (amdgpu_dm_plane_fill_plane_buffer_
+        // attributes fetches from the buffer's start).
+        (
+            otg::SurfaceFormat::Xrgb8888,
+            otg::PlaneSurface::LINEAR,
+            true,
+            true,
         ),
     ] {
         let setup = PlaneSetup {
             overlays: [
                 Some(OverlayPlane {
-                    geometry: geometry(format, surface),
+                    geometry: geometry(format, surface, client),
                     format,
                     underlay: false,
                     plane: 0,
@@ -3527,11 +3584,14 @@ kernel_test_in!(
     navi48_modeset_stages_whole_framebuffers_for_tiled_and_yuv_planes
 );
 
-/// Every further pipe DML's split needs, from the top of what the displays
-/// leave: each stream's ODM segments first, then each MPC-combined
-/// primary's second slice, then each overlay's pipe with its stream's
-/// segments or its own MPC slice. More than the four pipes is DML's
-/// `Pipes`; a configuration DML admits always fits.
+/// Every further pipe DML's split needs, as DC acquires it with no display
+/// running: the OTG masters in CRTC order, each stream's planes (an
+/// overlay on the lowest free pipe), then DML's counts stream by stream
+/// (map_dc_pipes_with_callbacks): each plane's MPC slices right after its
+/// own pipes in its tree, then the stream's ODM slices with a copy of the
+/// tree, each on the lowest free pipe. More than the four pipes is DML's
+/// `Pipes`; a configuration DML admits always fits. (NARF used to take
+/// every further pipe from the top, ODM segments first.)
 fn navi48_split_pipes_follow_dml() -> TestResult {
     let one = completed_modeset(0).plan;
     let s = |p: &[u8]| otg::SplitPipes::new(p).unwrap();
@@ -3558,29 +3618,407 @@ fn navi48_split_pipes_follow_dml() -> TestResult {
             mpc: s(mpc),
         })
     };
-    let got = |plans: &[dml::Plan], pipes: &[u8]| plan_pipes(plans, pipes).ok();
-    let d = |odm, mpc, overlays| DisplayPipes { odm, mpc, overlays };
-    if got(&[mpc], &[0]) != Some(alloc::vec![d(none, s(&[3]), [None; 3])])
-        || got(&[mpc, mpc], &[0, 1]) != Some(alloc::vec![d(none, s(&[3]), [None; 3]), d(none, s(&[2]), [None; 3])])
-        || got(&[ovl_mpc], &[1]) != Some(alloc::vec![d(none, none, [pp(3, &[], &[2]), None, None])])
-        || got(&[mpc, ovl], &[0, 1]) != Some(alloc::vec![d(none, s(&[3]), [None; 3]), d(none, none, [pp(2, &[], &[]), None, None])])
-        // ODM first: a 3:1 stream's segments, then its overlay's pipe and
-        // segments, which four pipes cannot hold.
+    let got = |plans: &[dml::Plan], crtcs: &[u8]| plan_pipes(plans, crtcs).ok();
+    let d = |head, odm, mpc, overlays| {
+        (
+            head,
+            DisplayPipes {
+                odm,
+                mpc,
+                overlays,
+                encoders: StreamEncoders::default(),
+            },
+        )
+    };
+    if got(&[mpc], &[0]) != Some(alloc::vec![d(0, none, s(&[1]), [None; 3])])
+        || got(&[mpc, mpc], &[0, 1])
+            != Some(alloc::vec![
+                d(0, none, s(&[2]), [None; 3]),
+                d(1, none, s(&[3]), [None; 3])
+            ])
+        // CRTC 1 alone takes pipe 0; its overlay's slice follows the
+        // overlay in the tree.
+        || got(&[ovl_mpc], &[1])
+            != Some(alloc::vec![d(0, none, none, [pp(1, &[], &[2]), None, None])])
+        || got(&[mpc, ovl], &[0, 1])
+            != Some(alloc::vec![
+                d(0, none, s(&[3]), [None; 3]),
+                d(1, none, none, [pp(2, &[], &[]), None, None])
+            ])
+        // A 3:1 stream's segments and its overlay's: four pipes cannot
+        // hold them.
         || got(&[three], &[0]).is_some()
+        // The overlay is added on one pipe, then the ODM slice copies the
+        // tree: the second OPP head, then the overlay's segment.
         || got(&[dml::Plan { pipes: 2, ..ovl }], &[0])
-            != Some(alloc::vec![d(s(&[3]), none, [pp(2, &[1], &[]), None, None])])
+            != Some(alloc::vec![d(0, s(&[2]), none, [pp(1, &[3], &[]), None, None])])
         || got(&[mpc, mpc, one], &[0, 1, 2]).is_some()
     {
         return TestResult::Fail("split pipe allocation");
     }
     // The same through the selections' overlays.
     let base = completed_modeset(0).selection;
-    if display_pipes(&[base], &[mpc], &[0]).ok() != Some(alloc::vec![d(none, s(&[3]), [None; 3])]) {
+    if display_pipes(&[base], &[mpc], &[0]).ok()
+        != Some(alloc::vec![d(0, none, s(&[1]), [None; 3])])
+    {
         return TestResult::Fail("display pipes");
     }
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/navi48-modeset", navi48_split_pipes_follow_dml);
+
+/// On harvested boards (pipe 0, pipe 1, pipes 1 and 2 fused) every plan
+/// takes pipe indices of the pool only (the pool's count is Linux's
+/// pipe_count and max_streams): OTG masters, ODM segments and MPC slices
+/// from the pool's lowest free pipe up whatever the CRTC, a split past the
+/// pool refused, a stream routed past the published CRTCs refused, and KMS
+/// publishing one CRTC per pool pipe. (NARF used to take the further pipes
+/// from the pool's top down, with CRTC k's stream on pipe k.)
+fn navi48_plans_take_only_the_pools_pipes_on_harvested_boards() -> TestResult {
+    use crate::amdgpu_rdna4::{self as rdna4, PipePool};
+    let one = completed_modeset(0).plan;
+    let two = dml::Plan { pipes: 2, ..one };
+    let three = dml::Plan { pipes: 3, ..one };
+    let four = dml::Plan { pipes: 4, ..one };
+    let mut mpc = one;
+    if let Some(p) = mpc.planes[0].as_mut() {
+        p.dpps = 2;
+    }
+    let s = |p: &[u8]| otg::SplitPipes::new(p).unwrap();
+    let none = otg::SplitPipes::NONE;
+    let mut result = TestResult::Pass;
+    for fuses in [0x1, 0x2, 0x6] {
+        rdna4::publish_pipe_pool(PipePool::from_fuses(fuses));
+        let count = rdna4::pipe_pool().count();
+        let top = count - 1;
+        let got = |plans: &[dml::Plan], crtcs: &[u8]| {
+            plan_pipes(plans, crtcs)
+                .ok()
+                .map(|d| d.iter().map(|&(head, d)| (head, d.odm)).collect::<Vec<_>>())
+        };
+        let mpc_got = plan_pipes(&[mpc], &[top])
+            .ok()
+            .map(|d| (d[0].0, d[0].1.mpc));
+        let selection = completed_modeset(0).selection;
+        let ok = got(&[two], &[0]) == Some(alloc::vec![(0, s(&[1]))])
+            && got(&[two], &[top]) == Some(alloc::vec![(0, s(&[1]))])
+            && got(&[one, one], &[0, top]) == Some(alloc::vec![(0, none), (1, none)])
+            && got(&[four], &[0]).is_none()
+            && (count < 3 || got(&[three], &[0]) == Some(alloc::vec![(0, s(&[1, 2]))]))
+            && (count > 2 || got(&[three], &[0]).is_none())
+            && mpc_got == Some((0, s(&[1])))
+            && route_streams(alloc::vec![(selection, count)], &[]).is_err()
+            && route_streams(alloc::vec![(selection, top)], &[]).is_ok()
+            && crate::amdgpu_navi48_kms::crtc_count() == usize::from(count)
+            && crate::amdgpu_navi48_kms::crtc_display(crate::amdgpu_navi48_kms::crtc_id(
+                usize::from(top),
+            )) == Some(top)
+            && crate::amdgpu_navi48_kms::crtc_display(crate::amdgpu_navi48_kms::crtc_id(
+                usize::from(count),
+            ))
+            .is_none();
+        if !ok {
+            result = TestResult::Fail("plans beyond the harvested pool");
+            break;
+        }
+    }
+    rdna4::publish_pipe_pool(PipePool::FULL);
+    result
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_plans_take_only_the_pools_pipes_on_harvested_boards
+);
+
+/// The streams of `plans` on `crtcs`, their planes those the plans were
+/// admitted with.
+fn streams_of<'a>(plans: &'a [dml::Plan], crtcs: &[u8]) -> Vec<StreamPipes<'a>> {
+    plans
+        .iter()
+        .zip(crtcs)
+        .map(|(plan, &crtc)| StreamPipes::of_plan(crtc, plan))
+        .collect()
+}
+
+/// The running displays a lighting of `plans` on `crtcs` with no display
+/// running leaves.
+fn lit_on(plans: &[dml::Plan], crtcs: &[u8]) -> Option<Vec<Modeset>> {
+    let got = plan_pipes(plans, crtcs).ok()?;
+    Some(
+        got.iter()
+            .zip(plans)
+            .zip(crtcs)
+            .map(|((&(head, d), plan), &crtc)| {
+                let mut m = completed_modeset(head);
+                m.crtc = crtc;
+                m.plan = *plan;
+                m.scanout.odm = d.odm;
+                m.scanout.mpc = d.mpc;
+                m.scanout.overlays = d.overlays.map(|o| {
+                    o.map(|o| otg::OverlayScanout {
+                        pipe: o.pipe,
+                        odm: o.odm,
+                        mpc: o.mpc,
+                        address: 0x8_1000_0000,
+                        underlay: false,
+                    })
+                });
+                m
+            })
+            .collect(),
+    )
+}
+
+/// The running state as DC left it (`dc_state` of the lit displays) holds
+/// each stream's pipes where the acquisition put them: lighting the same
+/// configuration again over it (a relight, one commit) gives every stream
+/// and plane its pipes back (former OTG masters first, then each slice's
+/// and tree's own pipes); CRTCs whose streams ran crosswise take the former
+/// OTG masters lowest first in CRTC order; a stream lit beside the running
+/// ones takes the lowest pipe they leave free and never a running split.
+/// Harvested pools acquire the same way over their own pipe indices.
+fn navi48_relight_and_beside_reacquire_dcs_pipes() -> TestResult {
+    // Plans are kilobytes: keep them on the heap (the aarch64 kernel-test
+    // stack is 64 KiB).
+    let one = completed_modeset(0).plan;
+    let none = otg::SplitPipes::NONE;
+    let mut base: Vec<dml::Plan> = alloc::vec![one; 4];
+    // A primary MPC-combined on two DPPs; a stream with one overlay; ODM 2:1.
+    let (mpc, ovl, odm) = (1, 2, 3);
+    if let Some(p) = base[mpc].planes[0].as_mut() {
+        p.dpps = 2;
+    }
+    let full = dml::Plane::full(&one.mode.timing, one.mode.pitch, 4);
+    base[ovl].mode.planes = [Some(full), Some(full), None, None];
+    base[ovl].planes[1] = base[ovl].planes[0];
+    base[odm].pipes = 2;
+    let pick = |ids: &[usize]| -> Vec<dml::Plan> { ids.iter().map(|&i| base[i]).collect() };
+    let configs: [(&[usize], &[u8]); 5] = [
+        (&[0, 0, 0], &[0, 1, 3]),
+        (&[mpc, ovl], &[0, 2]),
+        (&[odm, ovl], &[1, 3]),
+        (&[ovl, ovl], &[0, 1]),
+        (&[mpc, 0, 0], &[0, 1, 2]),
+    ];
+    for (ids, crtcs) in configs {
+        let plans = pick(ids);
+        let Some(running) = lit_on(&plans, crtcs) else {
+            return TestResult::Fail("configuration");
+        };
+        let first = plan_pipes(&plans, crtcs).ok();
+        let again = light_pipes(&dc_state(&running), &streams_of(&plans, crtcs)).ok();
+        if first.is_none() || again != first {
+            return TestResult::Fail("relight keeps every pipe");
+        }
+    }
+    // CRTC 0's stream ran on pipe 1 and CRTC 1's on pipe 0: relit together,
+    // CRTC 0 takes former OTG master 0, CRTC 1 former OTG master 1.
+    let mut a = completed_modeset(1);
+    a.crtc = 0;
+    let mut b = completed_modeset(0);
+    b.crtc = 1;
+    let relit = light_pipes(&dc_state(&[a, b]), &streams_of(&pick(&[0, 0]), &[0, 1]))
+        .ok()
+        .map(|d| d.iter().map(|&(h, _)| h).collect::<Vec<_>>());
+    if relit != Some(alloc::vec![0, 1]) {
+        return TestResult::Fail("former OTG masters in CRTC order");
+    }
+    // Beside: CRTC 0 runs on pipes 0 and 1 (ODM); CRTC 2 lit beside it
+    // takes pipe 2, its overlay pipe 3.
+    let Some(running) = lit_on(&pick(&[odm]), &[0]) else {
+        return TestResult::Fail("ODM display");
+    };
+    let overlay = PlanePipes {
+        pipe: 3,
+        odm: none,
+        mpc: none,
+    };
+    let beside = beside_pipes(
+        &dc_state(&running),
+        &streams_of(&pick(&[ovl]), &[2]),
+        &running,
+    );
+    if beside
+        != Some(alloc::vec![(
+            2,
+            DisplayPipes {
+                overlays: [Some(overlay), None, None],
+                ..DisplayPipes::default()
+            }
+        )])
+    {
+        return TestResult::Fail("beside the running display");
+    }
+    // A running stream's MPC split is not taken by a stream beside it:
+    // no pipe is left.
+    let Some(running) = lit_on(&pick(&[mpc, 0, 0]), &[0, 1, 2]) else {
+        return TestResult::Fail("split display");
+    };
+    if beside_pipes(
+        &dc_state(&running),
+        &streams_of(&pick(&[0]), &[3]),
+        &running,
+    )
+    .is_some()
+    {
+        return TestResult::Fail("a running split taken");
+    }
+    // Harvested pools: the pool's indices, the same rules.
+    use crate::amdgpu_rdna4::{self as rdna4, PipePool};
+    let mut result = TestResult::Pass;
+    for fuses in [0x1, 0x2, 0x6] {
+        rdna4::publish_pipe_pool(PipePool::from_fuses(fuses));
+        let count = rdna4::pipe_pool().count();
+        let beside = |running: &[Modeset]| {
+            beside_pipes(&dc_state(running), &streams_of(&pick(&[0]), &[0]), running)
+                .map(|d| d[0].0)
+        };
+        let ok = lit_on(&pick(&[odm]), &[count - 1]).is_some_and(|running| {
+            running[0].pipe == 0
+                && running[0].scanout.odm == otg::SplitPipes::one(1)
+                && if count > 2 {
+                    beside(&running) == Some(2)
+                } else {
+                    beside(&running).is_none()
+                }
+        });
+        if !ok {
+            result = TestResult::Fail("harvested pool");
+            break;
+        }
+    }
+    rdna4::publish_pipe_pool(PipePool::FULL);
+    result
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_relight_and_beside_reacquire_dcs_pipes
+);
+
+/// MPC combine of the surfaces Linux DML21 also splits, from amdgpu_dm's
+/// planes to the pipes: on a 4K CVT-RB stream (533.25 MHz, ODM bypass), an
+/// 8K framebuffer in 64KB tiles, a portrait 8K one in 256KB tiles with DCC
+/// turned 270 degrees, and portrait 8K NV12 (64KB tiles, turned 90) and
+/// P010 (256KB tiles, turned 270) frames, each scaled 2:1 as the primary,
+/// are admitted with the plane on two DPPs (no single DPP takes the swath:
+/// the tiled and vertical 4:2:0 limits), take the lowest free pipe as
+/// their second slice (DC's acquisition with no display running; NARF used
+/// to take the top one), and stage as a request naming it. A 4K tiled
+/// plane at 1:1 keeps one DPP.
+#[inline(never)]
+fn navi48_split_tiled_rotated_and_video_planes_reach_pipes() -> TestResult {
+    use crate::amdgpu_dcn401_spl::{Rect, Rotation};
+    let mut base = completed_modeset(0).selection;
+    base.timing = Timing {
+        pixel_clock_khz: 533_250,
+        h_active: 3840,
+        h_total: 4000,
+        h_front_porch: 48,
+        h_sync_width: 32,
+        v_active: 2160,
+        v_total: 2222,
+        v_front_porch: 3,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: false,
+    };
+    let soc = dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [300_000, 2_500_000],
+        dcfclk_khz: [200_000, 1_564_000],
+        socclk_khz: 300_000,
+        dispclk_max_khz: 2_000_000,
+        dppclk_max_khz: 2_000_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    let surface = |swizzle, dcc| otg::PlaneSurface {
+        tiling: otg::Tiling { swizzle, dcc },
+        ..otg::PlaneSurface::LINEAR
+    };
+    let geometry = |(w, h): (u32, u32), rotation, surface, format| PlaneGeometry {
+        src_x: 0,
+        src_y: 0,
+        width: w,
+        height: h,
+        dst: Rect::new(0, 0, 3840, 2160),
+        rotation,
+        blend: otg::Blend::default_for(format),
+        surface,
+        fb_size: (w, h),
+        client: false,
+    };
+    let tiled = surface(otg::Swizzle::S64K2D, None);
+    let dcc = surface(otg::Swizzle::S256K2D, Some(otg::DccBlock::B64));
+    let (rgb, nv12, p010) = (
+        otg::SurfaceFormat::Xrgb8888,
+        otg::SurfaceFormat::Nv12,
+        otg::SurfaceFormat::P010,
+    );
+    let cases = [
+        (rgb, geometry((7680, 4320), Rotation::R0, tiled, rgb), 2),
+        (rgb, geometry((4320, 7680), Rotation::R270, dcc, rgb), 2),
+        (nv12, geometry((4320, 7680), Rotation::R90, tiled, nv12), 2),
+        (
+            p010,
+            geometry(
+                (4320, 7680),
+                Rotation::R270,
+                surface(otg::Swizzle::S256K2D, None),
+                p010,
+            ),
+            2,
+        ),
+        (rgb, geometry((3840, 2160), Rotation::R0, tiled, rgb), 1),
+    ];
+    const NAMES: [&str; 5] = [
+        "8K tiled plane DPPs",
+        "turned 8K DCC plane DPPs",
+        "turned 8K NV12 plane DPPs",
+        "turned 8K P010 plane DPPs",
+        "1:1 tiled plane DPPs",
+    ];
+    for (k, (format, g, dpps)) in cases.into_iter().enumerate() {
+        let sel = Selection {
+            format,
+            planes: PlaneSetup {
+                primary: Some(g),
+                ..PlaneSetup::NONE
+            },
+            ..base
+        };
+        let Ok(plans) = admit_displays(&soc, &[sel]) else {
+            return TestResult::Fail("split plane refused");
+        };
+        if plans[0].pipes != 1 || plans[0].plane(0).map(|p| p.dpps) != Some(dpps) {
+            return TestResult::Fail(NAMES[k]);
+        }
+        let Ok(pipes) = display_pipes(&[sel], &plans, &[0]) else {
+            return TestResult::Fail("split plane pipes");
+        };
+        let want = if dpps == 2 {
+            otg::SplitPipes::one(1)
+        } else {
+            otg::SplitPipes::NONE
+        };
+        let (head, pipes) = pipes[0];
+        let (primary, _) = plane_requests(&sel, head, &pipes);
+        if head != 0
+            || pipes.mpc != want
+            || primary.mpc != want
+            || primary.check().is_err()
+            || Some(primary.dml_plane()) != plans[0].mode.planes[0]
+        {
+            return TestResult::Fail("split plane request");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_split_tiled_rotated_and_video_planes_reach_pipes
+);
 
 /// DP SST deep color as amdgpu_dm decides it: the sink's EDID 1.4 color
 /// depth (display_info.bpc, 8 when undefined) bounded by the requested
@@ -3733,15 +4171,9 @@ kernel_test_in!(
     navi48_modeset_connector_max_bpc_caps_its_stream
 );
 
-/// The pipes a running display's new planes take without a modeset
-/// (`planes::live_plane_pipes`): a new overlay takes the free pipe from
-/// the top, as resource_update_pipes_for_plane_with_slice_count does; an
-/// overlay DC keeps (the same DRM plane) keeps its pipe wherever it moves
-/// in the stack; a removed one frees its pipe for the next new one; other
-/// displays' pipes are never taken; another ODM split is a modeset.
-fn navi48_live_plane_pipes_keep_every_plane_dc_keeps() -> TestResult {
-    use crate::amdgpu_dcn401_spl::{Rect, Rotation};
-    let soc = dml::Soc {
+/// The board inputs of the live plane tests.
+fn live_soc() -> dml::Soc {
+    dml::Soc {
         umc_channels: 16,
         uclk_khz: 1_250_000,
         fclk_khz: [300_000, 2_500_000],
@@ -3751,8 +4183,12 @@ fn navi48_live_plane_pipes_keep_every_plane_dc_keeps() -> TestResult {
         dppclk_max_khz: 2_000_000,
         dentist_vco_khz: 4_500_000,
         dchub_refclk_khz: 50_000,
-    };
-    let overlay = |plane: u32, x: i32| OverlayPlane {
+    }
+}
+/// A 640x360 ARGB8888 overlay, DRM plane `plane`, at x.
+fn live_overlay(plane: u32, x: i32) -> OverlayPlane {
+    use crate::amdgpu_dcn401_spl::{Rect, Rotation};
+    OverlayPlane {
         geometry: PlaneGeometry {
             src_x: 0,
             src_y: 0,
@@ -3763,48 +4199,99 @@ fn navi48_live_plane_pipes_keep_every_plane_dc_keeps() -> TestResult {
             blend: otg::Blend::default_for(otg::SurfaceFormat::Argb8888),
             surface: otg::PlaneSurface::LINEAR,
             fb_size: (640, 360),
+            client: false,
         },
         format: otg::SurfaceFormat::Argb8888,
         underlay: false,
         plane,
-    };
-    let setup = |overlays: &[OverlayPlane]| {
-        let mut s = PlaneSetup::NONE;
-        for (o, p) in s.overlays.iter_mut().zip(overlays) {
-            *o = Some(*p);
-        }
-        s
-    };
-    let plan_for = |m: &Modeset, setup: &PlaneSetup| {
-        let mut s = m.selection;
-        s.planes = *setup;
-        admit_displays(&soc, &[s]).unwrap()[0]
-    };
-    let one = |pipe: u8| PlanePipes {
+    }
+}
+/// The full-frame primary with `overlays`, bottom first.
+fn live_setup(overlays: &[OverlayPlane]) -> PlaneSetup {
+    let mut s = PlaneSetup::NONE;
+    for (o, p) in s.overlays.iter_mut().zip(overlays) {
+        *o = Some(*p);
+    }
+    s
+}
+/// Display `m`'s plan with the planes `setup`, on the heap.
+#[inline(never)]
+fn live_plan(m: &Modeset, setup: &PlaneSetup) -> alloc::boxed::Box<dml::Plan> {
+    let mut s = m.selection;
+    s.planes = *setup;
+    alloc::boxed::Box::new(admit_displays(&live_soc(), &[s]).unwrap()[0])
+}
+/// `completed_modeset(pipe)` on the heap.
+#[inline(never)]
+fn live_modeset(pipe: u8) -> alloc::boxed::Box<Modeset> {
+    alloc::boxed::Box::new(completed_modeset(pipe))
+}
+/// Display `m`'s planes `setup` under `plan` beside `others`, the planes
+/// recreated when amdgpu_dm would (`live_pipes` on their `dc_state`).
+#[inline(never)]
+fn live_on(
+    m: &Modeset,
+    others: &[&Modeset],
+    setup: &PlaneSetup,
+    plan: &dml::Plan,
+) -> Option<DisplayPipes> {
+    let mut running: Vec<Modeset> = Vec::with_capacity(1 + others.len());
+    running.push(*m);
+    for o in others {
+        running.push(**o);
+    }
+    let mut s = m.selection;
+    s.planes = *setup;
+    let reset =
+        super::planes::planes_reset(m.selection.format, &m.selection.planes, s.format, setup);
+    live_pipes(
+        &dc_state(&running),
+        &StreamPipes::of(m.crtc, &s, plan),
+        reset,
+        &running,
+    )
+}
+fn live_one(pipe: u8) -> PlanePipes {
+    PlanePipes {
         pipe,
         odm: otg::SplitPipes::NONE,
         mpc: otg::SplitPipes::NONE,
-    };
-    let pipes =
-        |r: Option<(otg::SplitPipes, OverlayPipes)>| r.map(|(_, o)| o.map(|p| p.map(|p| p.pipe)));
-    let mut m = completed_modeset(0);
-    let a = overlay(0x44, 100);
-    let with_a = setup(&[a]);
-    let plan_a = plan_for(&m, &with_a);
-    // A new overlay: the top free pipe, or the next one past another
-    // display's.
-    if pipes(super::planes::live_plane_pipes(&m, &plan_a, &with_a, 0).unwrap())
-        != Some([Some(3), None, None])
-        || pipes(super::planes::live_plane_pipes(&m, &plan_a, &with_a, 1 << 3).unwrap())
+    }
+}
+fn live_overlay_pipes(r: Option<DisplayPipes>) -> Option<[Option<u8>; otg::MAX_OVERLAYS]> {
+    r.map(|d| d.overlays.map(|p| p.map(|p| p.pipe)))
+}
+
+/// The pipes a running display's new planes take without a modeset, as DC
+/// acquires them on the running state (`live_pipes`): a plane added or
+/// removed makes amdgpu_dm recreate every plane of the CRTC
+/// (should_reset_plane, `planes::planes_reset`), and each recreated overlay
+/// takes, top first, the first free pipe of its OPP head's current blending
+/// tree (dcn32_find_optimal_free_pipe_as_secondary_dpp_pipe), else one the
+/// running state leaves free, so a kept overlay comes back to its pipe
+/// wherever it moves in the stack and a new one takes a removed one's; a
+/// plane only moved keeps its pipes; another ODM split is a modeset. (NARF
+/// used to give a new overlay the top free pipe and keep every other
+/// plane's.)
+fn navi48_live_plane_pipes_follow_dc() -> TestResult {
+    let mut m = live_modeset(0);
+    let other1 = live_modeset(1);
+    let other3 = live_modeset(3);
+    let a = live_overlay(0x44, 100);
+    let with_a = live_setup(&[a]);
+    let plan_a = live_plan(&m, &with_a);
+    // A new overlay: the lowest free pipe, past another display's.
+    if live_overlay_pipes(live_on(&m, &[], &with_a, &plan_a)) != Some([Some(1), None, None])
+        || live_overlay_pipes(live_on(&m, &[&other1], &with_a, &plan_a))
             != Some([Some(2), None, None])
     {
         return TestResult::Fail("new overlay pipe");
     }
-    // Running with A on pipe 2 (another display holds 3): B is added below
-    // A, which stays on pipe 2 although its stack position moved; B takes
-    // pipe 1.
+    // Running with A on pipe 2 (another display on 3): B is added below A;
+    // A, recreated first (top first), takes its tree's pipe 2 back
+    // although its stack position moved, and B the free pipe 1.
     m.selection.planes = with_a;
-    m.plan = plan_a;
+    m.plan = *plan_a;
     m.scanout.overlays[0] = Some(otg::OverlayScanout {
         pipe: 2,
         odm: otg::SplitPipes::NONE,
@@ -3812,36 +4299,180 @@ fn navi48_live_plane_pipes_keep_every_plane_dc_keeps() -> TestResult {
         address: 0x8_1000_0000,
         underlay: false,
     });
-    let b = overlay(0x45, 900);
-    let with_ba = setup(&[b, a]);
-    let plan_ba = plan_for(&m, &with_ba);
-    let Ok(Some((mpc, got))) = super::planes::live_plane_pipes(&m, &plan_ba, &with_ba, 1 << 3)
-    else {
+    let b = live_overlay(0x45, 900);
+    let with_ba = live_setup(&[b, a]);
+    let plan_ba = live_plan(&m, &with_ba);
+    let Some(got) = live_on(&m, &[&other3], &with_ba, &plan_ba) else {
         return TestResult::Fail("two overlays");
     };
-    if mpc != otg::SplitPipes::NONE || got != [Some(one(1)), Some(one(2)), None] {
-        return TestResult::Fail("kept overlay keeps its pipe");
-    }
-    // A removed and C added: C may take A's freed pipe.
-    let c = overlay(0x46, 400);
-    let with_c = setup(&[c]);
-    let plan_c = plan_for(&m, &with_c);
-    if pipes(super::planes::live_plane_pipes(&m, &plan_c, &with_c, 1 << 3).unwrap())
-        != Some([Some(2), None, None])
+    if got.mpc != otg::SplitPipes::NONE
+        || got.overlays != [Some(live_one(1)), Some(live_one(2)), None]
     {
+        return TestResult::Fail("recreated overlay comes back to its pipe");
+    }
+    // A removed and C added: C takes the tree's pipe A held, and is
+    // another plane than the one there: it takes a fresh surface with its
+    // own first frame however alike A's surface is (`moved_planes`).
+    let with_c = live_setup(&[live_overlay(0x46, 400)]);
+    let plan_c = live_plan(&m, &with_c);
+    let pipes_c = live_overlay_pipes(live_on(&m, &[&other3], &with_c, &plan_c));
+    if pipes_c != Some([Some(2), None, None]) {
         return TestResult::Fail("freed pipe reused");
     }
-    // Another ODM split is a modeset.
+    let old_pipes = [Some(2), None, None];
+    if super::planes::moved_planes(&with_a, &old_pipes, &with_c, &old_pipes) != 1 << 2
+        || super::planes::moved_planes(&with_a, &old_pipes, &with_a, &old_pipes) != 0
+        || super::planes::moved_planes(&with_a, &old_pipes, &with_ba, &[Some(1), Some(2), None])
+            != 0
+    {
+        return TestResult::Fail("plane moved onto another's pipe");
+    }
+    // A only moved: no plane is recreated and it keeps its pipe.
+    let moved = live_setup(&[live_overlay(0x44, 300)]);
+    let format = m.selection.format;
+    if super::planes::planes_reset(format, &with_a, format, &moved)
+        || !super::planes::planes_reset(format, &with_a, format, &with_c)
+        || live_overlay_pipes(live_on(&m, &[&other3], &moved, &plan_a))
+            != Some([Some(2), None, None])
+    {
+        return TestResult::Fail("moved overlay");
+    }
+    // Another ODM split moves the stream: a modeset.
     let mut odm = plan_a;
     odm.pipes = 2;
-    if super::planes::live_plane_pipes(&m, &odm, &with_a, 0) != Ok(None) {
+    if live_on(&m, &[], &with_a, &odm).is_some() {
         return TestResult::Fail("ODM change");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
-    navi48_live_plane_pipes_keep_every_plane_dc_keeps
+    navi48_live_plane_pipes_follow_dc
+);
+
+/// `planes_reset` on DRM commits is amdgpu_dm's should_reset_plane: sizes
+/// (not positions), rotation, blend mode, alpha, color range/encoding,
+/// format, modifier, normalized zpos, a plane added or removed. What DC is
+/// given instead (a framebuffer's size, the 8-bit global alpha) does not
+/// decide it.
+fn navi48_planes_reset_is_should_reset_plane() -> TestResult {
+    let format = otg::SurfaceFormat::Xrgb8888;
+    let state = |plane: u32, zpos: u8| DrmPlaneState {
+        plane,
+        src_w: 640,
+        src_h: 360,
+        crtc_w: 640,
+        crtc_h: 360,
+        rotation: 1,
+        blend: 0,
+        alpha: 0xffff,
+        color_range: 0,
+        color_encoding: 1,
+        fourcc: 0x3432_5241,
+        modifier: 0,
+        normalized_zpos: zpos,
+    };
+    let setup = |overlay: OverlayPlane, primary: DrmPlaneState, o: DrmPlaneState| {
+        let mut s = live_setup(&[overlay]);
+        s.drm = [Some(primary), Some(o), None, None];
+        s
+    };
+    let a = live_overlay(0x44, 100);
+    let base = setup(a, state(0x30, 0), state(0x44, 1));
+    let changed = |f: fn(&mut DrmPlaneState)| {
+        let mut o = state(0x44, 1);
+        f(&mut o);
+        planes_reset_check(format, &base, &setup(a, state(0x30, 0), o))
+    };
+    // Moved, a larger framebuffer, an alpha DC sees as the same 8 bits.
+    let mut moved = live_overlay(0x44, 300);
+    moved.geometry.fb_size = (1280, 720);
+    let mut near = state(0x44, 1);
+    near.alpha = 0xfffe;
+    let mut nearer = state(0x44, 1);
+    nearer.alpha = 0xff00;
+    if planes_reset_check(format, &base, &setup(moved, state(0x30, 0), state(0x44, 1)))
+        || !planes_reset_check(
+            format,
+            &setup(a, state(0x30, 0), near),
+            &setup(a, state(0x30, 0), nearer),
+        )
+    {
+        return TestResult::Fail("position, fb size or 16-bit alpha");
+    }
+    let resets: [fn(&mut DrmPlaneState); 10] = [
+        |o| o.src_w = 320,
+        |o| o.crtc_h = 720,
+        |o| o.rotation = 4,
+        |o| o.blend = 2,
+        |o| o.alpha = 0x8000,
+        |o| o.color_range = 1,
+        |o| o.color_encoding = 0,
+        |o| o.fourcc = 0x3432_5258,
+        |o| o.modifier = 1,
+        |o| o.normalized_zpos = 0,
+    ];
+    if resets.iter().any(|&f| !changed(f)) {
+        return TestResult::Fail("a should_reset_plane change not reset");
+    }
+    // Another plane in its place, or one more.
+    let b = live_overlay(0x45, 100);
+    let mut two = live_setup(&[a, b]);
+    two.drm = [
+        Some(state(0x30, 0)),
+        Some(state(0x44, 1)),
+        Some(state(0x45, 2)),
+        None,
+    ];
+    if !planes_reset_check(format, &base, &setup(b, state(0x30, 0), state(0x45, 1)))
+        || !planes_reset_check(format, &base, &two)
+    {
+        return TestResult::Fail("plane added or removed");
+    }
+    TestResult::Pass
+}
+fn planes_reset_check(format: otg::SurfaceFormat, old: &PlaneSetup, new: &PlaneSetup) -> bool {
+    super::planes::planes_reset(format, old, format, new)
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_planes_reset_is_should_reset_plane
+);
+
+/// `live_pipes` beside a split primary and other displays: a primary
+/// MPC-combined on pipes 0 and 1 gaining an overlay gives the overlay the
+/// tree's first pipe (1) and moves its slice to the next free one (2), as
+/// Linux swaps them; with displays on pipes 1, 2 and 3 a new overlay has no
+/// pipe (another display's are never taken): a modeset.
+fn navi48_live_plane_pipes_swap_a_split_and_spare_other_displays() -> TestResult {
+    let with_a = live_setup(&[live_overlay(0x44, 100)]);
+    let mut split = live_modeset(0);
+    if let Some(p) = split.plan.planes[0].as_mut() {
+        p.dpps = 2;
+    }
+    split.scanout.mpc = otg::SplitPipes::one(1);
+    let mut plan_split = live_plan(&split, &with_a);
+    if let Some(p) = plan_split.planes[0].as_mut() {
+        p.dpps = 2;
+    }
+    let Some(got) = live_on(&split, &[], &with_a, &plan_split) else {
+        return TestResult::Fail("overlay beside a split primary");
+    };
+    if got.mpc != otg::SplitPipes::one(2) || got.overlays != [Some(live_one(1)), None, None] {
+        return TestResult::Fail("split primary's slice swapped");
+    }
+    drop(split);
+    let lone = live_modeset(0);
+    let plan_a = live_plan(&lone, &with_a);
+    let (o1, o2, o3) = (live_modeset(1), live_modeset(2), live_modeset(3));
+    if live_on(&lone, &[&o1, &o2, &o3], &with_a, &plan_a).is_some() {
+        return TestResult::Fail("other displays' pipes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_live_plane_pipes_swap_a_split_and_spare_other_displays
 );
 
 /// DSC at the deepest depth, as create_validate_stream_for_sink tries each
@@ -3918,4 +4549,177 @@ fn navi48_modeset_compresses_dp_sst_at_10_bpc_like_amdgpu_dm() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_modeset_compresses_dp_sst_at_10_bpc_like_amdgpu_dm
+);
+
+/// MST on two DP ports at once, as amdgpu_dm keeps a topology manager per
+/// DP connector: each port's end devices are selected against that port's
+/// own link (two 2160p streams of 54 slots each, which one 63-slot link
+/// could never carry together), each port's dark devices count only that
+/// port's slots, and the configuration joins both ports' streams in pipe
+/// order with joint DML admission; one pipe named on both ports is refused.
+fn navi48_mst_two_ports_select_on_their_own_links() -> TestResult {
+    use crate::dp_mst_mgr::Sink;
+    let caps = DpCaps {
+        lanes: 4,
+        rate: LinkRate::Hbr2,
+        uhbr: 0,
+        fec: false,
+        dsc: None,
+    };
+    let soc = dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [500_000, 2_000_000],
+        dcfclk_khz: [300_000, 1_200_000],
+        socclk_khz: 600_000,
+        dispclk_max_khz: 1_500_000,
+        dppclk_max_khz: 1_500_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    // Both branches report the same Sink indices: only the port tells
+    // their streams apart.
+    let sink = |port| Sink { branch: 0, port };
+    let devices = [
+        (sink(1), edid_2160p(), u16::MAX),
+        (sink(2), edid_three_modes(false), u16::MAX),
+    ];
+    let uhd = edid_timings(&edid_2160p())[0];
+    let budget = |_, _: &[(Sink, u16)]| u16::MAX;
+    let pick = |port, pipes: &[Option<u8>]| {
+        super::super::mst::select_mst_outputs(port, caps, &devices, &|_| Some(uhd), pipes, &budget)
+    };
+    let a = pick(0, &[Some(0), Some(2)]);
+    let b = pick(2, &[Some(1), Some(3)]);
+    let shape = |s: &[(Selection, u8)]| -> Vec<(usize, u32, u8, u8)> {
+        s.iter()
+            .map(|(s, p)| (s.port, s.timing.h_active, s.mst.unwrap().slots, *p))
+            .collect()
+    };
+    assert_eq!(shape(&a), [(0, 3840, 54, 0), (0, 1280, 7, 2)]);
+    assert_eq!(shape(&b), [(2, 3840, 54, 1), (2, 1280, 7, 3)]);
+    let streams = route_streams(Vec::new(), &[a.as_slice(), b.as_slice()]).unwrap();
+    assert_eq!(
+        streams
+            .iter()
+            .map(|(s, p)| (s.port, *p))
+            .collect::<Vec<_>>(),
+        [(0, 0), (2, 1), (0, 2), (2, 3)]
+    );
+    // The two 2160p streams together pass DML; four stay the pipes' limit.
+    let selections: Vec<Selection> = streams.iter().map(|(s, _)| *s).collect();
+    assert_eq!(
+        admit_displays(&soc, &selections[..2]).map(|p| p.len()),
+        Ok(2)
+    );
+    assert!(admit_displays(&soc, &selections).is_ok_and(|p| p.len() <= MAX_DISPLAYS));
+    // A pipe on both ports, or a board sink's pipe again, is refused.
+    let clash = pick(2, &[Some(0), None]);
+    assert!(route_streams(Vec::new(), &[a.as_slice(), clash.as_slice()]).is_err());
+    let mut board = a[1].0;
+    board.mst = None;
+    board.port = 1;
+    assert!(route_streams(alloc::vec![(board, 2)], &[a.as_slice()]).is_err());
+    assert!(route_streams(alloc::vec![(board, 1)], &[a.as_slice()]).is_ok());
+    // A dark device on port 0 sees port 0's 54 + 7 slots taken, not port
+    // 2's: only 720p could still be added there (9 slots left would not
+    // even carry 1080p), and with port 2's streams alone every mode fits
+    // port 0's slots.
+    let widths = |m: Vec<Timing>| m.iter().map(|t| t.h_active).collect::<Vec<_>>();
+    let edid = edid_three_modes(false);
+    let lit_b: Vec<Selection> = b.iter().map(|(s, _)| *s).collect();
+    let offered = |lit: &[Selection]| {
+        widths(super::super::mst::dark_mst_modes_with(
+            &soc,
+            0,
+            caps,
+            &edid,
+            u16::MAX,
+            lit,
+            None,
+        ))
+    };
+    assert_eq!(offered(&lit_b[..1]), [1920, 3840, 1280]);
+    assert_eq!(offered(&[a[0].0, lit_b[0]]), [1280]);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_mst_two_ports_select_on_their_own_links
+);
+
+/// A new end device beside a port's running MST stream on a link without
+/// DSC decoders: the running stream keeps its payload as Linux keeps it
+/// (drm_dp_atomic_find_time_slots runs only for the changed connector), so
+/// the new one takes what it leaves: 9 of 63 slots beside a 2160p stream
+/// (720p, not the 1080p the device would get alone), its hop PBN beside the
+/// running payload's, and no payload past amdgpu_dm's four per manager.
+/// The running device is never selected again.
+fn navi48_mst_selects_new_streams_beside_running_ones() -> TestResult {
+    use crate::dp_mst_mgr::Sink;
+    let caps = DpCaps {
+        lanes: 4,
+        rate: LinkRate::Hbr2,
+        uhbr: 0,
+        fec: false,
+        dsc: None,
+    };
+    let sink = |port| Sink { branch: 0, port };
+    let devices = [
+        (sink(1), edid_2160p(), u16::MAX),
+        (sink(2), edid_three_modes(false), u16::MAX),
+    ];
+    let unlimited = |_: Sink, _: &[(Sink, u16)]| u16::MAX;
+    let beside = |pipes: &[Option<u8>], lit: &[Selection], budget: &super::super::mst::Budget| {
+        super::super::mst::select_mst_outputs_beside(
+            0,
+            caps,
+            &devices,
+            &|_| None,
+            pipes,
+            budget,
+            None,
+            lit,
+        )
+    };
+    let lit: Vec<Selection> = beside(&[Some(0), None], &[], &unlimited)
+        .unwrap()
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect();
+    assert_eq!(lit[0].mst.unwrap().slots, 54);
+    let alone = beside(&[None, Some(1)], &[], &unlimited).unwrap();
+    assert_eq!(alone[0].0.timing.h_active, 1920);
+    let added = beside(&[Some(0), Some(1)], &lit, &unlimited).unwrap();
+    let shown: Vec<_> = added
+        .iter()
+        .map(|(s, p)| (s.timing.h_active, s.mst.unwrap().slots, *p))
+        .collect();
+    assert_eq!(shown, [(1280, 7, 1)]);
+    // A hop shared with the running payload: what it leaves bounds the new.
+    let pbn = lit[0].mst.unwrap().pbn;
+    let shared = |s: Sink, allocated: &[(Sink, u16)]| {
+        let used: u16 = allocated.iter().map(|a| a.1).sum();
+        if s == sink(2) {
+            (pbn + 100).saturating_sub(used)
+        } else {
+            u16::MAX
+        }
+    };
+    assert_eq!(beside(&[None, Some(1)], &lit, &shared), Ok(Vec::new()));
+    // Four payloads on the manager already: nothing more.
+    let mut four = lit.clone();
+    for k in 0..3 {
+        let mut s = lit[0];
+        s.mst.as_mut().unwrap().slots = 1;
+        s.mst.as_mut().unwrap().sink = sink(8 + k);
+        four.push(s);
+    }
+    four[0].mst.as_mut().unwrap().slots = 1;
+    assert_eq!(beside(&[None, Some(1)], &four, &unlimited), Ok(Vec::new()));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_mst_selects_new_streams_beside_running_ones
 );

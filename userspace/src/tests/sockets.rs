@@ -1398,6 +1398,7 @@ fn smoke_net_ns_loopback_delivery_and_final_teardown() -> TestResult {
         metric: 0,
         scope: narf_net::route::Scope::Host,
         table: narf_net::route::TABLE_MAIN,
+        protocol: narf_net::route::RTPROT_KERNEL,
     });
     crate::namespaces::release_task(task);
     if narf_net::route::route_list_in(namespace_id).is_empty() {

@@ -105,6 +105,7 @@ fn request(protocol: Protocol) -> Request {
         scdc: protocol == Protocol::Tmds,
         dsc: protocol == Protocol::Sst,
         mst_dsc: None,
+        mst_stream: matches!(protocol, Protocol::Mst | Protocol::UhbrMst).then_some(1),
         scanout: Some(ScanoutWitness {
             address: 0x8_0000_1000,
             stream: 2,

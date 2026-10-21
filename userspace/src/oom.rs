@@ -49,7 +49,7 @@ impl ProcessOomKiller {
             // Only user processes have an address space to reclaim; a kernel
             // task (or an already-reaped zombie off the ready queue) resolves
             // to None and is skipped.
-            let Some(address_space) = narf_scheduler::address_space_of(TaskId(tid)) else {
+            let Some(address_space) = narf_scheduler::address_space_of_live(TaskId(tid)) else {
                 continue;
             };
             // Badness must rank RESIDENT memory, not virtual reservations:

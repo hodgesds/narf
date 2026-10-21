@@ -58,7 +58,7 @@ impl<I: Io> Engine<I> {
         if c.hpo_stream & 0x8888 != 0 {
             return Err(Error::Busy);
         }
-        for p in 0..4 {
+        for p in 0..4u8 {
             if (c.hpo_link >> (4 * p)) & 15 == u32::from(phy) | 8 {
                 return Err(Error::Busy);
             }
@@ -67,7 +67,12 @@ impl<I: Io> Engine<I> {
                 return Err(Error::Busy);
             }
             c.frontend[usize::from(p)] = fe;
-            let pixel = self.read(bank1 + (0x80 + 4 * u64::from(p)) * 4)? & 0x1393;
+        }
+        // OTGs and their OTG<inst>_PIXEL_RATE_CNTL / DTBCLK_P<inst> are pipe
+        // resources: walk the pool's pipes at their hardware instances.
+        for p in l.pool.pipes() {
+            let inst = u64::from(l.inst(p));
+            let pixel = self.read(bank1 + (0x80 + 4 * inst) * 4)? & 0x1393;
             c.pixel[usize::from(p)] = pixel;
             if self.read(l.otg(p, OTG_CLOCK))? & 0x10 != 0
                 || self.read(l.otg(p, LOCK))? & 0x101 != 0
@@ -82,7 +87,7 @@ impl<I: Io> Engine<I> {
             // A live OTG must use an acknowledged DTO fed by DPREFCLK/DTBCLK,
             // not a PHY-fed TMDS pixel clock. Retain its timing/DTO unchanged.
             if (timing || pixel & 0x90 != 0)
-                && (pixel & 0x1390 != 0x1090 || !matches!((c.dto_sources >> (3 * p)) & 7, 4 | 6))
+                && (pixel & 0x1390 != 0x1090 || !matches!((c.dto_sources >> (3 * inst)) & 7, 4 | 6))
             {
                 return Err(Error::Busy);
             }

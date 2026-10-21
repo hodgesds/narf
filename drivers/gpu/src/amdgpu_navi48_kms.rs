@@ -1,5 +1,7 @@
 //! The native Navi48 displays as DRM KMS state on the amdgpu card: CRTC k is
-//! display (pipe) k, id 1 + 3k. Each connector (a board port, or an end
+//! display k, id 1 + 3k, whose stream runs on the head pipe DC acquires for
+//! it (amdgpu_dm's acrtc gets its OTG from the stream's OTG master pipe,
+//! not from its index). Each connector (a board port, or an end
 //! device behind an MST branch) has its own encoder (TMDS type, as amdgpu_dm
 //! reports DP) whose possible CRTCs the platform chooses, and carries its
 //! sink's EDID, the exact timing being scanned out by its routed CRTC and
@@ -17,8 +19,18 @@ use crate::Mode;
 const CRTC: u32 = 1;
 const ENCODER: u32 = 2;
 const CONNECTOR: u32 = 3;
-/// Outputs at most: one per pipe.
+/// Outputs at most: one per DCN401 pipe (the id scheme's bound; a fused
+/// pool publishes `crtc_count` of them).
 pub const MAX_OUTPUTS: usize = 4;
+/// The CRTCs published: amdgpu_dm's `dc->caps.max_streams`, the pool's
+/// `pipe_count` once `CC_DC_PIPE_DIS` removed the fused pipes.
+pub fn crtc_count() -> usize {
+    usize::from(crate::amdgpu_rdna4::pipe_pool().count()).min(MAX_OUTPUTS)
+}
+/// `possible` limited to the published CRTCs.
+fn published_crtcs(possible: u32) -> u32 {
+    possible & ((1u32 << crtc_count()) - 1)
+}
 pub fn crtc_id(output: usize) -> u32 {
     CRTC + 3 * output as u32
 }
@@ -62,10 +74,10 @@ pub const PLANE_FORMATS: [u32; 15] = {
     ]
 };
 
-/// The display (and pipe) behind a native CRTC id.
+/// The display behind a native CRTC id (its index; not a pipe).
 pub fn crtc_display(crtc_id: u32) -> Option<u8> {
     let k = crtc_id.checked_sub(CRTC)?;
-    (k % 3 == 0 && ((k / 3) as usize) < MAX_OUTPUTS).then_some((k / 3) as u8)
+    (k % 3 == 0 && ((k / 3) as usize) < crtc_count()).then_some((k / 3) as u8)
 }
 
 /// A lit sink as KMS shows it: its EDID, the timing scanned out and every
@@ -134,11 +146,11 @@ pub struct RoutedConnector<'a> {
     pub possible_crtcs: u32,
 }
 
-/// Set the card's outputs to `outputs` (at most `MAX_OUTPUTS`): output k
+/// Set the card's outputs to `outputs` (at most `crtc_count`): output k
 /// is connector k routed to CRTC k only, connected when it has an EDID,
 /// even without a lit sink.
 pub fn apply(card: &mut Card, outputs: &[Output]) {
-    let outputs = &outputs[..outputs.len().min(MAX_OUTPUTS)];
+    let outputs = &outputs[..outputs.len().min(crtc_count())];
     let crtcs: alloc::vec::Vec<Option<Sink>> = outputs.iter().map(|o| o.sink).collect();
     let connectors: alloc::vec::Vec<RoutedConnector> = outputs
         .iter()
@@ -176,14 +188,14 @@ pub fn apply_routed_vrr(
     connectors: &[RoutedConnector],
     vrr_capable: Option<&[bool]>,
 ) {
-    let crtcs = &crtcs[..crtcs.len().min(MAX_OUTPUTS)];
+    let crtcs = &crtcs[..crtcs.len().min(crtc_count())];
     let same = card.crtcs.len() == crtcs.len()
         && card.connectors.len() == connectors.len()
         && connectors.iter().zip(&card.connectors).all(|(c, have)| {
             have.id == connector_id(c.index)
                 && card
                     .encoder(encoder_id(c.index))
-                    .is_ok_and(|e| e.possible_crtcs == c.possible_crtcs)
+                    .is_ok_and(|e| e.possible_crtcs == published_crtcs(c.possible_crtcs))
         });
     if !same {
         card.crtcs.clear();
@@ -203,7 +215,7 @@ pub fn apply_routed_vrr(
             card.encoders.push(Encoder {
                 id: encoder_id(c.index),
                 encoder_type: EncoderType::Tmds,
-                possible_crtcs: c.possible_crtcs,
+                possible_crtcs: published_crtcs(c.possible_crtcs),
                 possible_clones: 0,
                 crtc_id: None,
             });
@@ -430,7 +442,7 @@ pub fn apply_routed_native(
             });
         }
     }
-    let crtcs = &crtcs[..crtcs.len().min(MAX_OUTPUTS)];
+    let crtcs = &crtcs[..crtcs.len().min(crtc_count())];
     card.crtc_color = (0..crtcs.len())
         .map(|k| {
             let id = crtc_id(k);

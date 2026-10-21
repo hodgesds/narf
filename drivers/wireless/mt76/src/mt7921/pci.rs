@@ -152,6 +152,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     let dev = match result {
         Ok(d) => d,
         Err(e) => {
+            // No controller was published, so no later lifecycle path will
+            // revoke the command bits. Leave the rejected function inert:
+            // bus mastering must remain off, and a failed probe does not need
+            // memory decoding left enabled either.
+            let _ = narf_bus::pci::clear_command(
+                &cap,
+                &device,
+                narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::BUS_MASTER,
+            );
             let _ = writeln!(
                 narf_console::Writer,
                 "  mt7921: bring-up failed ({:04x}:{:04x}): {:?}",
@@ -327,7 +336,9 @@ pub const fn name_for(did: u16) -> &'static str {
         MTK_DEV_MT7961 => "mt7921-7961",
         MTK_DEV_MT7922 => "mt7921-7922",
         MTK_DEV_MT7921 => "mt7921-0608",
-        MTK_DEV_MT7921_ALT => "mt7921-0616",
+        // 0616 is a PCI alias for MT7922, not an MT7921 variant. Keep the
+        // bound-driver/log label aligned with the firmware and raw chip ID.
+        MTK_DEV_MT7921_ALT => "mt7922-0616",
         MTK_DEV_MT7920 => "mt7921-7920",
         _ => "mt7921",
     }

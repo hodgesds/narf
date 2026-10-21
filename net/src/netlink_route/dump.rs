@@ -1239,6 +1239,7 @@ fn ipv4_routes(net_ns_id: u64) -> Vec<crate::route::Route> {
             metric: 0,
             scope: crate::route::Scope::Host,
             table: crate::route::TABLE_LOCAL,
+            protocol: crate::route::RTPROT_KERNEL,
         });
     }
     routes

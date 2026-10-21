@@ -7,7 +7,7 @@ fn d(p: u8, r: u64) -> u64 {
 }
 // Golden native unity RGB register values; offsets/masks are independently
 // asserted against AMD's headers by tests/dcn401_dpp.c.
-const RGB: [(u64, u32); 30] = [
+const RGB: [(u64, u32); 31] = [
     (0xcd0, 0x24000101),
     (0xccf, 8),
     (0xcd7, 0),
@@ -27,6 +27,7 @@ const RGB: [(u64, u32); 30] = [
     (0xd75, 0),
     (0xd76, 0),
     (0xdc1, 0x1f000),
+    (0xcf6, 0),
     (0xd19, 0),
     (0xd0a, 0),
     (0xd1e, 0),
@@ -241,7 +242,10 @@ fn dcn401_dpp_stages_native_rgb_and_unity_scaling_on_all_pipes() -> TestResult {
                 (if r == 0xd76 { 0 } else { 0x80000000 }) | value | pending
             );
         }
-        assert_eq!(e.fake().writes.len(), 35);
+        // The CNVC/CM, DSCL and coefficient writes, and hwseq's cursor
+        // matrix bypass after dpp_setup.
+        assert_eq!(e.fake().writes.len(), 36);
+        assert_eq!(e.fake().regs[&d(p, 0xcf6)] & 0x13, 0);
         assert_eq!(e.fake().regs[&h(p, 0x613)] & 0x100, 0x100);
         assert_eq!(
             e.fake().regs[&(MPC_BASE + (0x2f2 + u64::from(p) * 4) * 4)] & 0xf,
@@ -370,7 +374,7 @@ kernel_test_in!(
 
 fn dcn401_dpp_lost_writes_revocation_and_device_loss_quarantine() -> TestResult {
     for mode in 0..3 {
-        for n in 1..=35 {
+        for n in 1..=36 {
             let (_backing, pool, mut e, mut surfaces, clock) = ready(2);
             let authority = e.authority;
             match mode {
@@ -428,8 +432,9 @@ fn dcn401_dpp_ram_wake_timeout_cancellation_and_late_changes_fail_closed() -> Te
             ));
             assert_eq!(e.status.dpps, [None; 4]);
             // The scaler LUT wakes first; the iSHARP LUT inside the DSCL
-            // programming, after the 19 CNVC/CM and 11 DSCL writes.
-            assert_eq!(e.fake().writes.len(), [2, 32][stage]);
+            // programming, after the 20 CNVC/CM (the cursor matrix's
+            // included) and 11 DSCL writes.
+            assert_eq!(e.fake().writes.len(), [2, 33][stage]);
             assert_eq!(e.fake().regs[&d(1, 0xcc5)] & 0x10, 0x10); // no speculative rollback
             drop(surfaces);
             assert_eq!(pool.available(), 4096);
@@ -531,6 +536,192 @@ fn dcn401_dpp_input_conversion_matches_linux_vectors() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-dpp",
     dcn401_dpp_input_conversion_matches_linux_vectors
+);
+
+/// tests/dcn401_yuv/color_vectors.txt: Linux's input transfer function for
+/// every scanned format with and without the CRTC's legacy gamma
+/// (map_crtc_degamma_to_dc_plane through dcn32_set_input_transfer_func: the
+/// sRGB ROM for RGB and P010, the BT.709 GAMCOR points with the ROM
+/// bypassed for NV12; its PRE_DEGAM and GAMCOR fields and the FNV-1a of
+/// its writes from a bypassed GAMCOR), dpp3_program_post_csc's
+/// coefficient set against each CM_POST_CSC_MODE_CURRENT (the one not in
+/// use), dpp401_set_cursor_matrix's bypass and
+/// dpp401_set_cursor_attributes' CUR0_ROM_EN (amdgpu_dm's
+/// ENABLE_CURSOR_DEGAMMA under legacy gamma).
+fn dcn401_dpp_color_input_matches_linux_vectors() -> TestResult {
+    use crate::amdgpu_dcn401_otg::{InputTf, YuvColor};
+    use core::fmt::Write;
+    const VECTORS: &str = include_str!("../tests/dcn401_yuv/color_vectors.txt");
+    // CM_GAMCOR_MODE, CM_GAMCOR_SELECT and the FNV-1a 32 of each input
+    // transfer function's writes (dword offset, then value, as LE bytes;
+    // CM_GAMCOR_CONTROL's read-only current fields left out).
+    let trace = |tf: InputTf| -> (u32, u32, u32) {
+        let mut e = engine();
+        let _ = e.program_input_tf(0, tf);
+        let mut h: u32 = 0x811c_9dc5;
+        for &(at, value) in &e.io.writes {
+            let reg = ((at - BASE) / 4) as u32;
+            let value = if reg == 0xd77 { value & !0x70 } else { value };
+            for b in reg.to_le_bytes().into_iter().chain(value.to_le_bytes()) {
+                h = (h ^ u32::from(b)).wrapping_mul(0x0100_0193);
+            }
+        }
+        let control = e.io.regs.get(&d(0, 0xd77)).copied().unwrap_or(0);
+        (control & 3, (control >> 2) & 1, h)
+    };
+    let traces = [
+        trace(InputTf::Bypass),
+        trace(InputTf::Srgb),
+        trace(InputTf::Bt709),
+    ];
+    let mut n = 0;
+    for line in VECTORS.lines().filter(|l| !l.starts_with('#')) {
+        let (input, want) = line.split_once(" = ").unwrap();
+        let mut f = input.split_whitespace();
+        let code = f.next().unwrap().as_bytes();
+        let fourcc = u32::from_le_bytes([code[0], code[1], code[2], code[3]]);
+        let mut num = || f.next().unwrap().parse::<u32>().unwrap();
+        let (legacy, current, enc, range) = (num() != 0, num(), num(), num());
+        let format = SurfaceFormat::from_fourcc(fourcc).unwrap();
+        let refused = format.is_video() && YuvColor::from_props(enc as u8, range as u8).is_none();
+        let got = if refused {
+            alloc::string::String::from("-")
+        } else {
+            let tf = if legacy {
+                InputTf::implicit(format)
+            } else {
+                InputTf::Bypass
+            };
+            let degam = tf.pre_degam().word();
+            let (gamcor_mode, gamcor_select, hash) = traces[tf as usize];
+            let (mode, set) = match format.is_video() {
+                false => (0, "-"),
+                true if crate::amdgpu_dcn401_otg::fetch::post_csc_set_b(current) => (2, "B"),
+                true => (1, "A"),
+            };
+            // The cursor's ROM follows the CRTC's legacy gamma, as
+            // ColorProgram records it (cm_is_degamma_srgb).
+            let program = crate::amdgpu_dcn401_otg::ColorProgram {
+                pre_degam_srgb: legacy,
+                ..Default::default()
+            };
+            let mut out = alloc::string::String::new();
+            let _ = write!(
+                out,
+                "{} {} {mode} {set} {} {} {gamcor_mode} {gamcor_select} {hash:08x}",
+                degam & 3,
+                degam >> 4 & 7,
+                crate::amdgpu_dcn401_otg::fetch::CURSOR_MATRIX_WORD,
+                u32::from(program.pre_degam_srgb),
+            );
+            out
+        };
+        if got != want {
+            let _ = writeln!(
+                narf_console::Writer,
+                "dcn401_yuv color: {input}: got {got}, want {want}"
+            );
+            return TestResult::Fail("plane color input differs from Linux");
+        }
+        n += 1;
+    }
+    if n != 540 {
+        return TestResult::Fail("vector count");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dpp",
+    dcn401_dpp_color_input_matches_linux_vectors
+);
+
+/// dpp3_program_post_csc double-buffers the input CSC: on a DPP whose
+/// CM_POST_CSC_MODE_CURRENT reads set A (ICSC) an NV12 plane's matrix goes
+/// into set B (CM_POST_CSC_B_*) and COMA is selected, leaving A's words as
+/// they were; the record says B, which staging's verifier checked. The cursor
+/// matrix is bypassed by the same setup (dpp401_set_cursor_matrix).
+fn dcn401_dpp_input_csc_takes_the_set_not_in_use() -> TestResult {
+    use crate::amdgpu_dcn401_otg::{PlaneSurface, YuvColor};
+    let p = 1;
+    let mut mode = small(p);
+    mode.timing.timing.h_active = 64;
+    mode.timing.timing.v_active = 16;
+    mode.clock = clock(mode.timing);
+    mode.surface = SurfaceRequest {
+        width: 64,
+        height: 16,
+        format: SurfaceFormat::Nv12,
+        surface: PlaneSurface {
+            color: YuvColor::Bt709,
+            ..PlaneSurface::LINEAR
+        },
+        ..req(p)
+    };
+    let (_backing, _pool, mut e, mut surfaces, clock) = ready_with(p, ColorDepth::Bpc8, mode);
+    // Set A in use, holding stale words; the cursor matrix left on set A.
+    e.fake().regs.insert(d(p, 0xd68), 1 | 1 << 2);
+    e.fake().regs.insert(d(p, 0xd69), 0xdead_beef);
+    e.fake().regs.insert(d(p, 0xcf6), 1);
+    let Ok(applied) = run(surfaces.prepare_dpp(&mut e, p, || Ok((clock, config())))) else {
+        return TestResult::Fail("NV12 DPP staging");
+    };
+    let reg = |e: &mut Engine<DppIo>, r: u64| e.fake().regs[&d(p, r)] & !0x8000_0000;
+    let words =
+        crate::amdgpu_dcn401_otg::fetch::post_csc_words(SurfaceFormat::Nv12, YuvColor::Bt709)
+            .unwrap();
+    if !applied.post_csc_b.b(0)
+        || reg(&mut e, 0xd68) & 3 != 2
+        || reg(&mut e, 0xd69) != 0xdead_beef & !0x8000_0000
+        || (0..6).any(|i| reg(&mut e, 0xd6f + i) != words[i as usize] & !0x8000_0000)
+        || reg(&mut e, 0xcf6) & 0x13 != 0
+    {
+        return TestResult::Fail("input CSC not double-buffered into set B");
+    }
+    // prepare_dpp's own verify_dpp read the set B record back.
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dpp",
+    dcn401_dpp_input_csc_takes_the_set_not_in_use
+);
+
+/// dpp3_program_post_csc runs on each segment's own DPP and reads that
+/// DPP's CM_POST_CSC_MODE_CURRENT: an ODM-split NV12 plane whose first DPP
+/// uses set A and whose second uses set B loads B on the first and A on the
+/// second; an RGB plane takes A everywhere.
+fn dcn401_dpp_input_csc_set_is_chosen_per_dpp() -> TestResult {
+    use crate::amdgpu_dcn401_otg::SplitPipes;
+    let mut e = crate::amdgpu_dcn401_otg::tests::engine();
+    let request = |format| SurfaceRequest {
+        pipe: 0,
+        width: 64,
+        height: 32,
+        format,
+        odm: SplitPipes::one(1),
+        mpc: SplitPipes::NONE,
+        plane: None,
+        surface: Default::default(),
+    };
+    // CM_POST_CSC_MODE_CURRENT: ICSC (A) on DPP 0, COMA (B) on DPP 1.
+    e.io.regs.insert(d(0, 0xd68), 1 << 2);
+    e.io.regs.insert(d(1, 0xd68), 2 << 2);
+    let Ok(sets) = e.post_csc_choice(request(SurfaceFormat::Nv12)) else {
+        return TestResult::Fail("NV12 choice");
+    };
+    if !sets.b(0) || sets.b(1) {
+        return TestResult::Fail("NV12 segments share the first DPP's set");
+    }
+    let Ok(sets) = e.post_csc_choice(request(SurfaceFormat::Xrgb8888)) else {
+        return TestResult::Fail("RGB choice");
+    };
+    if sets.b(0) || sets.b(1) {
+        return TestResult::Fail("RGB loads set B");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dpp",
+    dcn401_dpp_input_csc_set_is_chosen_per_dpp
 );
 
 /// An NV12 plane stages dpp401_dpp_setup's VIDEO_420 CNVC format and the

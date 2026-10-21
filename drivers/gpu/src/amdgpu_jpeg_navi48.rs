@@ -112,8 +112,7 @@ struct Layout {
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
-        if gpu.chip.vid != crate::amdgpu::AMD_VENDOR
-            || gpu.chip.did != crate::amdgpu::NAVI48
+        if crate::amdgpu_rdna4::Rdna4Chip::of(gpu).is_none()
             || gpu.regs.len < 0x7f004
             || gpu
                 .ip_blocks
@@ -135,8 +134,14 @@ impl Layout {
                 .map_err(|_| Error::Unsupported)?,
             nbio: bank(gpu, ip::HW_ID_NBIF, &[(6, 3, 1)], 2, RANGE)
                 .map_err(|_| Error::Unsupported)?,
-            gc: bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 0, 0x263e)
-                .map_err(|_| Error::Unsupported)?,
+            gc: bank(
+                gpu,
+                ip::HW_ID_GC,
+                crate::amdgpu_rdna4::GC_VERSIONS,
+                0,
+                0x263e,
+            )
+            .map_err(|_| Error::Unsupported)?,
         })
     }
 }

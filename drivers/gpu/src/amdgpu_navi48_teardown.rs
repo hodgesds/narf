@@ -65,6 +65,8 @@ struct Request {
     dsc: bool,
     /// A compressed MST stream's decoder, told to stop after its stream.
     mst_dsc: Option<super::MstDsc>,
+    /// An MST stream's payload source: the stream encoder it acquired.
+    mst_stream: Option<u8>,
     // The original modeset witness, not the changing front address after flips.
     scanout: Option<ScanoutWitness>,
 }
@@ -76,10 +78,15 @@ impl Request {
                 stream: m.scanout.stream,
                 frames: (m.scanout.frame_before, m.scanout.frame_after),
             }),
-            ..Self::activation(m.pipe, m.scanout.odm, &m.selection)
+            ..Self::activation(m.pipe, m.scanout.odm, &m.selection, m.encoders)
         }
     }
-    fn activation(pipe: u8, odm: otg::SplitPipes, s: &Selection) -> Self {
+    fn activation(
+        pipe: u8,
+        odm: otg::SplitPipes,
+        s: &Selection,
+        encoders: super::modeset::StreamEncoders,
+    ) -> Self {
         Self {
             pipe,
             odm,
@@ -101,6 +108,9 @@ impl Request {
             scdc: s.scdc,
             dsc: s.dsc.is_some(),
             mst_dsc: s.mst.and_then(|m| m.dsc).filter(|_| s.dsc.is_some()),
+            mst_stream: s
+                .mst
+                .and_then(|_| super::mst::mst_source_encoder(s.uhbr(), encoders)),
             scanout: None,
         }
     }
@@ -187,8 +197,9 @@ impl Teardowns {
         pipe: u8,
         odm: otg::SplitPipes,
         selection: &Selection,
+        encoders: super::modeset::StreamEncoders,
     ) -> Result<(), ModesetError> {
-        self.start_activation(Request::activation(pipe, odm, selection))
+        self.start_activation(Request::activation(pipe, odm, selection, encoders))
     }
     /// Record the inverse of a completed startup phase, without a suspension
     /// between its native completion and this checkpoint. PreLinkScdc instead
@@ -395,7 +406,10 @@ impl Backend for ColdBoot {
                             .await;
                     }
                 }
-                Payload => self.remove_display_mst_payload(r.port, r.pipe).await?,
+                Payload => {
+                    let stream = r.mst_stream.ok_or(otg::Error::Invalid)?;
+                    self.remove_display_mst_payload(r.port, stream).await?
+                }
                 Frontend => {
                     if r.protocol == Protocol::UhbrMst {
                         self.stop_display_uhbr_mst_stream(r.port).await?
@@ -456,6 +470,8 @@ impl ColdBoot {
     /// writers and other engines; drain any views from earlier incarnations
     /// before activation, and retain exclusive ownership throughout the abort.
     pub async unsafe fn abort_modeset_activation(&mut self, pipe: u8) -> Result<(), ModesetError> {
+        // dcn401_prepare_bandwidth: pinned first, best-effort for a teardown.
+        self.pin_display_uclk_for_teardown().await;
         // SAFETY: caller supplies the unpublished activation's exclusions.
         unsafe { abort(self, pipe) }.await
     }

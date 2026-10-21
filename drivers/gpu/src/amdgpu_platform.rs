@@ -110,7 +110,7 @@ impl crate::amdgpu_psp_ring::RegWindow for VmWindow {
 /// unconditionally — and puts `regGCVM_CONTEXT0_CNTL` at 0x1688 on
 /// `_BASE_IDX 0`, running to `regGCVM_CONTEXT15_CNTL` 0x1697.
 const GFXHUB_WINDOWS: &[VmWindow] = &[
-    // gc_12_0_0_offset.h, GC12.0.1.
+    // gc_12_0_0_offset.h, GC12.0.1 (Navi48); GC12.0.0 (Navi44) is last.
     VmWindow {
         version: (12, 0, 1),
         base_idx: 0,
@@ -149,6 +149,12 @@ const GFXHUB_WINDOWS: &[VmWindow] = &[
         version: (10, 3, 2),
         base_idx: 0,
         ctx0_cntl: 0x15fc,
+    },
+    // Navi44: gc_12_0_0_offset.h serves both RDNA4 dies.
+    VmWindow {
+        version: (12, 0, 0),
+        base_idx: 0,
+        ctx0_cntl: 0x1624,
     },
 ];
 
@@ -1004,6 +1010,7 @@ mod tests {
         // `gc/gc_11_0_0_offset.h`: regGCVM_CONTEXT0_CNTL 0x1688 _BASE_IDX 0,
         // regGCVM_CONTEXT15_CNTL 0x1697. Both GC 11.0.x revisions use it.
         let gfxhub_expected = [
+            // gc_12_0_0_offset.h: regGCVM_CONTEXT0_CNTL 0x1624 _BASE_IDX 0.
             VmWindow {
                 version: (12, 0, 1),
                 base_idx: 0,
@@ -1038,6 +1045,12 @@ mod tests {
                 version: (10, 3, 2),
                 base_idx: 0,
                 ctx0_cntl: 0x15fc,
+            },
+            // gc_12_0_0_offset.h again, for GC 12.0.0.
+            VmWindow {
+                version: (12, 0, 0),
+                base_idx: 0,
+                ctx0_cntl: 0x1624,
             },
         ];
         if GFXHUB_WINDOWS != gfxhub_expected {

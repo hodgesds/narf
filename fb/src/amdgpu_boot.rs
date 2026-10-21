@@ -38,11 +38,13 @@ pub(super) fn start() -> InitResult {
     let options =
         narf_drivers_gpu::amdgpu_rdna2::options::BootOptions::parse(narf_boot::args().raw());
     let framebuffer = *super::BOOT_GENERIC.lock();
-    let navi48 = narf_drivers_gpu::amdgpu::with_controller(|g| {
-        g.chip.did == narf_drivers_gpu::amdgpu::NAVI48
-    })
-    .unwrap_or(false);
-    let generation = if navi48 { "navi48" } else { "navi22" };
+    // Any RDNA4 die (Navi48 or Navi44, by discovered GC) takes the
+    // `amdgpu_navi48_platform` path; the log names the die.
+    let rdna4 =
+        narf_drivers_gpu::amdgpu::with_controller(narf_drivers_gpu::amdgpu_rdna4::Rdna4Chip::of)
+            .flatten();
+    let navi48 = rdna4.is_some();
+    let generation = rdna4.map_or("navi22", |die| die.asic());
     // The pause exists for one hazard: CPU writers drawing into THIS GPU's
     // VRAM while training/reset owns it. A boot framebuffer provably outside
     // the GPU's VRAM aperture (the iGPU GOP console with the discrete card as

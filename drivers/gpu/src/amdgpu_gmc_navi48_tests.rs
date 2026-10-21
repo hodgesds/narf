@@ -412,7 +412,7 @@ fn gmc_navi48_constructor_checks_exact_banks_and_pool_before_allocation() -> Tes
         match case {
             0 => gpu.chip.did = crate::amdgpu::NAVI22,
             1 => gpu.regs.len = 0x7f000,
-            2 => gpu.ip_blocks[0].revision = 0,
+            2 => gpu.ip_blocks[0].revision = 2,
             3 => gpu.ip_blocks[1].minor = 0,
             4 => gpu.ip_blocks[2].num_bases = 2,
             5 => gpu.ip_blocks[0].base_addrs[0] = 0x20000 - 0x16d0,
@@ -745,4 +745,37 @@ fn gmc_navi48_client_setup_hands_off_to_the_native_fault_monitor() -> TestResult
 kernel_test_in!(
     "drivers/gpu/gmc-navi48",
     gmc_navi48_client_setup_hands_off_to_the_native_fault_monitor
+);
+
+/// GMC12/MMHUB4.1 ownership on every RDNA4 board: Navi44's GC 12.0.0 and a
+/// harvested Navi48 prepare the same banks without touching hardware.
+fn gmc_navi48_constructor_accepts_every_rdna4_profile() -> TestResult {
+    use crate::amdgpu_rdna4::tests::Profile;
+    let mut regs = vec![0; 0x80000 / 4];
+    let cap = Cap::bootstrap();
+    for profile in Profile::ALL {
+        let mut gpu = descriptor(&mut regs);
+        profile.apply(&mut gpu);
+        let map = MmioRegion {
+            phys: narf_memory::PhysAddr::new(0x90000000),
+            virt: 0x4000,
+            len: BYTES,
+            kind: gpu.fb_bar.kind,
+        };
+        // SAFETY: initialization is not called; only metadata/backing ownership.
+        let mapped = unsafe { Pool::from_owned_range(map, 0x8_0000_4000) }.unwrap();
+        let before = regs.clone();
+        // SAFETY: owned register fixture; construction performs only bounded reads.
+        let Ok(owner) = (unsafe { Gmc::new(&gpu, cap, &mapped) }) else {
+            return TestResult::Fail("GMC12 refused an RDNA4 profile");
+        };
+        if owner.state() != State::Prepared || regs != before {
+            return TestResult::Fail("GMC12 profile constructor programmed hardware");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gmc-navi48",
+    gmc_navi48_constructor_accepts_every_rdna4_profile
 );

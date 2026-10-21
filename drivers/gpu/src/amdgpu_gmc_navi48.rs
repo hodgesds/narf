@@ -74,10 +74,7 @@ struct Layout {
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
-        if gpu.chip.vid != crate::amdgpu::AMD_VENDOR
-            || gpu.chip.did != crate::amdgpu::NAVI48
-            || gpu.regs.len < 0x7f004
-        {
+        if crate::amdgpu_rdna4::Rdna4Chip::of(gpu).is_none() || gpu.regs.len < 0x7f004 {
             return Err(Error::Unsupported);
         }
         let reg = |id, versions: &[(u8, u8, u8)], index, last| {
@@ -86,7 +83,7 @@ impl Layout {
         Ok(Self {
             bases: [
                 // Include the final client VMID's page-table end high word.
-                reg(ip::HW_ID_GC, &[(12, 0, 1)], 0, 0x16ee)?,
+                reg(ip::HW_ID_GC, crate::amdgpu_rdna4::GC_VERSIONS, 0, 0x16ee)?,
                 reg(ip::HW_ID_MMHUB, &[(4, 1, 0)], 0, 0x62e)?,
             ],
             nbio: reg(ip::HW_ID_NBIF, &[(7, 7, 0), (7, 7, 1), (6, 3, 1)], 2, 0x12d)?,

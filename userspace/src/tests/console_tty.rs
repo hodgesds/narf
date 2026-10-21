@@ -402,7 +402,7 @@ fn smoke_console_ctrlc_signals_foreground_pgrp() -> TestResult {
     // Push ^C (0x03) and pump the discipline by reading.
     narf_input::push_global(narf_input::InputEvent::AsciiByte(0x03));
     let mut buf = [0u8; 8];
-    let n = narf_filesystem::console_tty::read_into(&mut buf);
+    let n = narf_filesystem::console_tty::SERIAL.read_into(&mut buf);
 
     let lead_pending = signal_pending_of(leader);
     let mem_pending = signal_pending_of(member);
@@ -451,8 +451,10 @@ fn smoke_tty_background_read_raises_sigttin() -> TestResult {
     };
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicU64, Ordering};
-    use narf_filesystem::{FileOps, FsFuture, Mode, Stat, TTY_ID_CONSOLE};
+    use narf_filesystem::{FileOps, FsFuture, Mode, Stat};
 
+    // The caller's controlling terminal is the boot console (no CTTY_TABLE
+    // entry): `/dev/console`'s tty.
     struct FakeTty {
         fg: u64,
     }
@@ -473,7 +475,7 @@ fn smoke_tty_background_read_raises_sigttin() -> TestResult {
             }
         }
         fn tty_id(&self) -> Option<u32> {
-            Some(TTY_ID_CONSOLE)
+            Some(narf_filesystem::console_tty::console().tty_id())
         }
         fn tty_fg_pgrp(&self) -> Option<u64> {
             Some(self.fg)
@@ -1504,7 +1506,7 @@ fn smoke_userspace_console_ctty_acquire_release_and_sid() -> TestResult {
     }
 
     // open(/dev/tty1) + ioctl(TIOCSCTTY) → the console-hook body.
-    set_controlling_tty_console(task);
+    crate::handlers::set_controlling_console_tty(task, crate::handlers::CTTY_CONSOLE);
     if task_ctty(task) != Some(crate::handlers::CTTY_CONSOLE) {
         __test_clear_global();
         return TestResult::Fail("TIOCSCTTY did not make the console the ctty");

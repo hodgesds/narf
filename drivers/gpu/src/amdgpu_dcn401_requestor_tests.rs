@@ -602,3 +602,34 @@ kernel_test_in!(
     "drivers/gpu/dcn401-requestor",
     dcn401_requestor_stages_overlays_on_free_pipes
 );
+
+/// dcn401_program_compbuf_segments: a DET or compbuf acknowledgement that
+/// does not arrive is logged by REG_WAIT, never an error. NARF skips the
+/// grow after a slow DET (so the compbuf never takes segments a DET may
+/// still hold) and keeps a grown compbuf whose CURRENT is slow.
+fn dcn401_slow_compbuf_or_det_ack_is_not_fatal() -> TestResult {
+    let (_backing, _pool, mut e, _surfaces, _clock) = ready_requests(2, [1, 5, 5, 5, 5]);
+    // DET2 freed: requested 0, CURRENT still 5 and stuck.
+    e.io.fake().regs.insert(crb(3), 0x4000_0000 | 5 << 8);
+    e.io.stall = 1 << 3;
+    let writes = e.io.fake().writes.len();
+    if run(e.increase_compbuf()) != Ok([1, 5, 5, 0, 5])
+        || e.io.fake().writes.len() != writes
+        || e.io.fake().regs[&crb(0)] & 0x1f1f != 0x101
+    {
+        return TestResult::Fail("slow DET ack fatal, or the compbuf grew over it");
+    }
+    // DET2 acknowledged; the compbuf's own CURRENT is slow.
+    e.io.fake().regs.insert(crb(3), 0x4000_0000);
+    e.io.stall = 1;
+    if run(e.increase_compbuf()) != Ok([6, 5, 5, 0, 5])
+        || e.io.fake().regs[&crb(0)] & 0x1f1f != 0x106
+    {
+        return TestResult::Fail("slow compbuf ack fatal or the grow not written");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-requestor",
+    dcn401_slow_compbuf_or_det_ack_is_not_fatal
+);

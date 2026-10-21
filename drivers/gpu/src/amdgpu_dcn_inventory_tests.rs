@@ -714,8 +714,19 @@ kernel_test_in!(
     inventory_routing_rejects_ambiguous_pins_bridges_and_truncation
 );
 
+/// Run on every RDNA4 board: DCN 4.0.1's routing is the same on Navi44.
 fn inventory_navi48_v15_routes_and_backend_stride() -> TestResult {
+    for profile in crate::amdgpu_rdna4::tests::Profile::ALL {
+        let result = inventory_dcn4_routes(profile);
+        if result != TestResult::Pass {
+            return result;
+        }
+    }
+    TestResult::Pass
+}
+fn inventory_dcn4_routes(profile: crate::amdgpu_rdna4::tests::Profile) -> TestResult {
     let mut gpu = crate::amdgpu_navi48_firmware::tests::gpu();
+    profile.apply(&mut gpu);
     let dcn = gpu.ip_blocks.last_mut().unwrap();
     dcn.num_bases = 3;
     dcn.base_addrs[2] = DCN_BASE;

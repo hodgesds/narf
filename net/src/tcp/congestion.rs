@@ -129,10 +129,11 @@ pub struct CcState {
     /// `narf_time::now_cycles()` at the start of the current
     /// CUBIC epoch (set on each loss event).
     pub epoch_start_cycles: u64,
-    /// `narf_time::cycles_per_ns()` at epoch start so we can
+    /// TSC cycles per millisecond (`narf_time::ns_to_cycles(1_000_000)`)
+    /// at epoch start, so we can
     /// translate `now - epoch_start` into milliseconds without
     /// re-reading the calibration each tick.
-    pub cycles_per_ns: u64,
+    pub cycles_per_ms: u64,
 }
 
 impl Default for CcState {
@@ -157,7 +158,7 @@ impl CcState {
             w_max: 0,
             k_ms: 0,
             epoch_start_cycles: 0,
-            cycles_per_ns: 1,
+            cycles_per_ms: 1_000_000,
         }
     }
 
@@ -213,7 +214,7 @@ impl CcState {
     /// don't use the CUBIC curve still keep this bookkeeping correct —
     /// `w_max` doubles as "cwnd at last loss" for any later swap to
     /// CUBIC.
-    pub fn note_loss_epoch(&mut self, now_cycles: u64, cycles_per_ns: u64) {
+    pub fn note_loss_epoch(&mut self, now_cycles: u64, cycles_per_ms: u64) {
         self.w_max = self.cwnd;
         // K = cbrt(W_max * (1 - beta_cubic) / C); beta_cubic = 0.7.
         // K_ms ≈ cbrt(W_max * 0.3 / 0.4) * 1000.
@@ -229,21 +230,15 @@ impl CcState {
         }
         self.k_ms = (x.saturating_mul(1000)).min(u32::MAX as u64) as u32;
         self.epoch_start_cycles = now_cycles;
-        self.cycles_per_ns = if cycles_per_ns == 0 { 1 } else { cycles_per_ns };
+        self.cycles_per_ms = cycles_per_ms.max(1);
     }
 
-    /// Translate a cycles delta into milliseconds. `cycles_per_ns`
-    /// is cached at epoch start; if it's zero (uncalibrated), the
-    /// fallback divisor leaves the curve flat which degrades to a
-    /// no-op increment — Reno still drives growth via the W_est
-    /// branch.
+    /// Translate a cycles delta into milliseconds. `cycles_per_ms` is
+    /// cached at epoch start from the calibrated mult/shift scale. It used
+    /// to be the truncated integer GHz (`cycles_per_ms()`), which read a
+    /// 4.69 GHz TSC as 4 cycles/ns and ran the CUBIC clock ~17 % fast.
     pub fn cycles_to_ms(&self, delta_cycles: u64) -> u64 {
-        let cpn = if self.cycles_per_ns == 0 {
-            1
-        } else {
-            self.cycles_per_ns
-        };
-        delta_cycles / cpn / 1_000_000
+        delta_cycles / self.cycles_per_ms.max(1)
     }
 }
 
@@ -262,8 +257,8 @@ pub enum LossEvent {
         snd_nxt: u32,
         /// Cycles at the moment of loss (for the CUBIC epoch).
         now_cycles: u64,
-        /// `narf_time::cycles_per_ns()` at the moment of loss.
-        cycles_per_ns: u64,
+        /// TSC cycles per millisecond at the moment of loss.
+        cycles_per_ms: u64,
     },
 }
 
@@ -293,7 +288,7 @@ pub trait CongestionControl: Send + Sync + 'static {
 
     /// RTO fired. Standard behaviour is `ssthresh ← max(in_flight/2, 2*MSS)`,
     /// `cwnd ← MSS`, exit recovery.
-    fn on_rto(&self, state: &mut CcState, in_flight: u32, now_cycles: u64, cycles_per_ns: u64);
+    fn on_rto(&self, state: &mut CcState, in_flight: u32, now_cycles: u64, cycles_per_ms: u64);
 
     /// Snapshot the current congestion window.
     fn cwnd(&self, state: &CcState) -> u32 {
@@ -348,9 +343,9 @@ impl CongestionControl for Reno {
             LossEvent::FastRetransmit {
                 snd_nxt,
                 now_cycles,
-                cycles_per_ns,
+                cycles_per_ms,
             } => {
-                state.note_loss_epoch(now_cycles, cycles_per_ns);
+                state.note_loss_epoch(now_cycles, cycles_per_ms);
                 state.ssthresh = core::cmp::max(state.cwnd / 2, 2 * state.mss);
                 state.cwnd = state.ssthresh.saturating_add(3 * state.mss);
                 state.in_recovery = true;
@@ -359,8 +354,8 @@ impl CongestionControl for Reno {
         }
     }
 
-    fn on_rto(&self, state: &mut CcState, in_flight: u32, now_cycles: u64, cycles_per_ns: u64) {
-        state.note_loss_epoch(now_cycles, cycles_per_ns);
+    fn on_rto(&self, state: &mut CcState, in_flight: u32, now_cycles: u64, cycles_per_ms: u64) {
+        state.note_loss_epoch(now_cycles, cycles_per_ms);
         state.ssthresh = core::cmp::max(in_flight / 2, 2 * state.mss);
         state.cwnd = state.mss;
         state.in_recovery = false;
@@ -431,9 +426,9 @@ impl CongestionControl for Cubic {
             LossEvent::FastRetransmit {
                 snd_nxt,
                 now_cycles,
-                cycles_per_ns,
+                cycles_per_ms,
             } => {
-                state.note_loss_epoch(now_cycles, cycles_per_ns);
+                state.note_loss_epoch(now_cycles, cycles_per_ms);
                 state.ssthresh = core::cmp::max(state.cwnd / 2, 2 * state.mss);
                 state.cwnd = state.ssthresh.saturating_add(3 * state.mss);
                 state.in_recovery = true;
@@ -442,8 +437,8 @@ impl CongestionControl for Cubic {
         }
     }
 
-    fn on_rto(&self, state: &mut CcState, in_flight: u32, now_cycles: u64, cycles_per_ns: u64) {
-        state.note_loss_epoch(now_cycles, cycles_per_ns);
+    fn on_rto(&self, state: &mut CcState, in_flight: u32, now_cycles: u64, cycles_per_ms: u64) {
+        state.note_loss_epoch(now_cycles, cycles_per_ms);
         state.ssthresh = core::cmp::max(in_flight / 2, 2 * state.mss);
         state.cwnd = state.mss;
         state.in_recovery = false;
@@ -532,7 +527,7 @@ mod tests {
             LossEvent::FastRetransmit {
                 snd_nxt: 50_000,
                 now_cycles: 0,
-                cycles_per_ns: 1,
+                cycles_per_ms: 1_000_000,
             },
         );
         narf_kernel_test::kt_assert_eq!(s.ssthresh, 5000);
@@ -572,7 +567,7 @@ mod tests {
             LossEvent::FastRetransmit {
                 snd_nxt: 100_000,
                 now_cycles: 0,
-                cycles_per_ns: 1,
+                cycles_per_ms: 1_000_000,
             },
         );
         s.in_recovery = false;

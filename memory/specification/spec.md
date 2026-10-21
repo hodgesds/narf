@@ -926,6 +926,10 @@ pub unsafe fn aarch64::paging::unmap_4kb_range(
 /// resident busy peers. Remote-only variants are used after batched paging
 /// helpers have already completed their local invalidation phase.
 pub fn tlb_shootdown::shootdown(req: ShootdownRequest);
+/// `shootdown` for the address space rooted at `owner_root`. A tag-0 request
+/// targets only CPUs whose live or announced CR3 root is the owner (while the
+/// entry assembly cannot restore a tag-0 root outside `activate`).
+pub fn tlb_shootdown::shootdown_owned(owner_root: u64, req: ShootdownRequest);
 pub fn tlb_shootdown::shootdown_remote(req: ShootdownRequest);
 pub fn tlb_shootdown::shootdown_remote_full_for_tag(tag: u16);
 /// Residency is published before a context load and cleared only after a
@@ -933,12 +937,21 @@ pub fn tlb_shootdown::shootdown_remote_full_for_tag(tag: u16);
 /// barrier pair. Idle debt is discharged before the next task dispatch.
 pub fn tlb_shootdown::set_active_as(cpu: u32, tag: u16);
 pub fn tlb_shootdown::clear_active_as(cpu: u32, tag: u16);
+/// The context-load protocol `AddressSpace::activate` runs with interrupts
+/// disabled: `begin` publishes residency, widens the CPU's current bucket and
+/// announced root, and returns `true` when deferred debt requires a full
+/// non-global flush before the CR3 write; `finish` narrows both after it.
+/// A sender interrupts only resident CPUs running the bucket and leaves the
+/// others a flush debt (Linux `mm_cpumask` + `tlb_gen` laziness).
+pub fn tlb_shootdown::begin_context_load(cpu: u32, tag: u16, root: u64) -> bool;
+pub fn tlb_shootdown::finish_context_load(cpu: u32, tag: u16, root: u64);
 pub fn tlb_shootdown::mark_idle(cpu: u32);
 pub fn tlb_shootdown::mark_busy(cpu: u32);
 /// Per-CPU observability. The invalidation path updates only the executing
 /// CPU's cache-line-isolated record; accessors aggregate across CPUs on demand.
 pub fn tlb_shootdown::{shootdown_count, local_only_count,
-    ipi_fanout_count, broadcast_budget, filtered_targets, lazy_flush_count}();
+    ipi_fanout_count, broadcast_budget, filtered_targets, lazy_flush_count,
+    stale_deferred_count}();
 
 Private-region teardown serializes only on the address space's region tables.
 Teardown that overlaps an externally owned `SHARED` alias additionally holds

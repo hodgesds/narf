@@ -3572,3 +3572,54 @@ kernel_test_in!(
     "userspace/mount",
     smoke_mount_registry_storage_discovery_and_missing_source
 );
+
+// ── Smoke: devices open writable on a read-only mount ───────────────
+// A device node opened for writing writes to the device, not the
+// filesystem: Linux `do_dentry_open` takes mount write access only for
+// `!special_file()`, and `sb_permission` refuses only S_ISREG/S_ISDIR/
+// S_ISLNK. systemd runs its generators with `/dev` read-only, and the getty
+// generator's `open("/dev/ttyS0", O_RDWR)` check failed with EROFS until
+// this held, so no serial getty was ever generated.
+fn smoke_open_device_rdwr_on_readonly_mount() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    set_task(0x71_f3);
+    crate::fd::__test_reset();
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+    const AT_FDCWD: u64 = 0xffff_ffff_ffff_ff9c;
+    const O_RDWR: u64 = 2;
+    const MS_RDONLY: u64 = 1;
+    let open_rdwr = |path: &[u8]| {
+        let mut op = StubCtx {
+            args: SyscallArgs {
+                arg0: AT_FDCWD,
+                arg1: path.as_ptr() as u64,
+                arg2: O_RDWR,
+                ..Default::default()
+            },
+            ret: None,
+        };
+        crate::handlers::sys_openat(&mut op);
+        op.ret.map(|r| r.value as i64)
+    };
+    let mut mnt = StubCtx {
+        args: mount_args(b"devtmpfs\0", b"/ro-devfs\0", b"devtmpfs\0", MS_RDONLY),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut mnt);
+    if !matches!(mnt.ret, Some(r) if r.value == 0) {
+        return TestResult::Fail("mount -o ro devtmpfs failed");
+    }
+    let null = open_rdwr(b"/ro-devfs/null\0");
+    let tty = open_rdwr(b"/ro-devfs/ttyS0\0");
+    let _ = unmount_for_test("/ro-devfs");
+    crate::fd::detach(0x71_f3);
+    match (null, tty) {
+        (Some(n), Some(t)) if n >= 0 && t >= 0 => TestResult::Pass,
+        (Some(-30), _) => {
+            TestResult::Fail("O_RDWR open of /dev/null on a read-only mount was EROFS")
+        }
+        _ => TestResult::Fail("O_RDWR open of a device on a read-only mount failed"),
+    }
+}
+kernel_test_in!("userspace/mount", smoke_open_device_rdwr_on_readonly_mount);
