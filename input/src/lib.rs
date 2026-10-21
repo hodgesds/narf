@@ -1168,6 +1168,11 @@ pub fn pending_bytes() -> usize {
     BYTE_RING.lock().as_ref().map(|r| r.len()).unwrap_or(0)
 }
 
+/// Queued keyboard events: the VT tty's input source.
+pub fn pending_keys() -> usize {
+    KEY_RING.lock().as_ref().map(|r| r.len()).unwrap_or(0)
+}
+
 /// Total console-input depth: queued serial bytes PLUS queued key
 /// events. The unified console line discipline drains both rings, so a
 /// parked `sys_read` must re-check both to decide whether new input has
