@@ -32,6 +32,10 @@
 //! - MSI / INTx IRQ routing.
 //! - Bluetooth co-existence (8723AE/BE).
 //!
+//! Until those firmware-backed paths exist, the registered diagnostic
+//! interface remains down: scan, association, and configuration return
+//! `WirelessError::NotSupported` rather than claiming a usable WLAN.
+//!
 //! ## References (all GPL-2.0; NARF is GPL-2.0-or-later)
 //!
 //! - `rtlwifi/pci.c` — probe, BAR mapping, queue init

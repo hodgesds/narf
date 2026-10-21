@@ -9,7 +9,14 @@
 
 #![cfg(target_arch = "x86_64")]
 
+use core::sync::atomic::Ordering;
+
+use narf_bus::{BarKind, MmioRegion};
 use narf_kernel_test::{kernel_test_in, TestResult};
+use narf_memory::PhysAddr;
+use narf_wireless::{
+    AssociateRequest, SecurityConfig, WirelessConfig, WirelessError, WirelessNetIface,
+};
 
 use super::efuse::{mac_is_valid, EfuseError};
 use super::pci::{name_for, register_pci_driver};
@@ -190,3 +197,49 @@ fn smoke_rtw88_probe_bound_or_skip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtw88", smoke_rtw88_probe_bound_or_skip);
+
+fn smoke_rtw88_unready_control_plane_fails_closed() -> TestResult {
+    let device = super::pci::Rtw88Device {
+        mmio_bar0: MmioRegion {
+            phys: PhysAddr::new(0),
+            virt: 0,
+            len: 0,
+            kind: BarKind::Mmio32 {
+                prefetchable: false,
+            },
+        },
+        mmio_bar2: None,
+        mac: [0x00, 0xE0, 0x4C, 0x68, 0x12, 0x34],
+        device_id: RTL_DEV_8822CE,
+        link_up: core::sync::atomic::AtomicBool::new(false),
+        rx_ring: narf_lib::sync::IrqSafeSpinLock::new(None),
+        tx_ring: narf_lib::sync::IrqSafeSpinLock::new(None),
+    };
+    let request = AssociateRequest {
+        bssid: [0x02, 0, 0, 0, 0, 1],
+        ssid: alloc::vec![b't', b'e', b's', b't'],
+        frequency_mhz: 2412,
+        channel: 1,
+        security: SecurityConfig::Open,
+        ie: alloc::vec![],
+    };
+
+    if narf_scheduler::block_on(device.associate(request)) != Err(WirelessError::NotSupported) {
+        return TestResult::Fail("rtw88 accepted association without firmware/data path");
+    }
+    if device.link_up.load(Ordering::Acquire) {
+        return TestResult::Fail("rtw88 raised carrier after rejected association");
+    }
+    if narf_scheduler::block_on(device.set_config(WirelessConfig {
+        channel: 1,
+        tx_power_dbm: None,
+    })) != Err(WirelessError::NotSupported)
+    {
+        return TestResult::Fail("rtw88 accepted configuration without firmware/data path");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtw88_unready_control_plane_fails_closed
+);

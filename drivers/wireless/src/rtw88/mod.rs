@@ -12,9 +12,9 @@
 //! 2. BAR0 (register) + BAR2 (data) MMIO mapping.
 //! 3. Baseline power-on sequence + chip-reset (CR.OPEN re-arm).
 //! 4. EFUSE read — MAC address from logical offset 0.
-//! 5. `HwNic` registry stub — `narf-net::iface::register` with a
-//!    send-fn that returns `Err(())` so the iface shows up but
-//!    can't actually transmit yet.
+//! 5. Hardware-identification registration with an offline `narf-net`
+//!    send function. The interface remains down and all wireless control
+//!    operations return `NotSupported` until firmware and packet rings land.
 //!
 //! Firmware load + RF/PHY init + TX/RX rings are explicitly **not**
 //! part of this baseline — they need the `narf-firmware` blob path

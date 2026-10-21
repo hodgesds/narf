@@ -89,8 +89,10 @@ impl WirelessNetIface for RtlwifiDevice {
     }
 
     async fn associate(&self, _req: AssociateRequest) -> Result<(), WirelessError> {
-        self.link_up.store(true, Ordering::Release);
-        Ok(())
+        // Firmware, management-frame exchange, and data rings are not live
+        // yet.  Never report carrier merely because userspace requested an
+        // association.
+        Err(WirelessError::NotSupported)
     }
 
     async fn disassociate(&self) -> Result<(), WirelessError> {
@@ -99,7 +101,9 @@ impl WirelessNetIface for RtlwifiDevice {
     }
 
     async fn set_config(&self, _cfg: WirelessConfig) -> Result<(), WirelessError> {
-        Ok(())
+        // Channel/power configuration belongs to the firmware-backed MAC
+        // path, which has not been implemented for this baseline.
+        Err(WirelessError::NotSupported)
     }
 }
 
