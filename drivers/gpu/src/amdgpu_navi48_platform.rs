@@ -2830,7 +2830,7 @@ fn connector_shape(
         .map(|(n, (port, kind))| (Target::Board(port), kind, n))
         .collect();
     if let Some(port) = mst {
-        for slot in 0..crate::amdgpu_navi48_kms::MAX_OUTPUTS as u8 {
+        for slot in 0..boot::MST_OUTPUTS as u8 {
             shape.push((
                 Target::Mst(port, slot),
                 ConnectorType::DisplayPort,
@@ -3260,7 +3260,7 @@ async unsafe fn light_displays(
     let crtc_of = |t: Target| routes.iter().position(|r| *r == Some(t));
     let pipe = |port: usize| crtc_of(Target::Board(port)).map(|k| k as u8);
     let want = |port: usize| crtc_of(Target::Board(port)).and_then(|k| wants[k]);
-    let mst_pipes: Vec<Option<u8>> = (0..crate::amdgpu_navi48_kms::MAX_OUTPUTS as u8)
+    let mst_pipes: Vec<Option<u8>> = (0..boot::MST_OUTPUTS as u8)
         .map(|slot| {
             mst.and_then(|port| crtc_of(Target::Mst(port, slot)))
                 .map(|k| k as u8)

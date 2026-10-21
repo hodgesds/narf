@@ -35,10 +35,24 @@ pub(super) enum ProbeState {
     Ready,
 }
 
+/// End-device connector slots one MST port keeps (`MstLink::outputs`).
+/// Linux bounds neither: drm_dp_mst adds a connector for every output port
+/// it finds. What it bounds is what lights: at most four streams (amdgpu_dm's
+/// CRTCs are dc->caps.max_streams, the smaller of DCN 4.0.1's four pipes and
+/// four stream encoders; `modeset::MAX_DISPLAYS`) and four payloads per
+/// manager (`MAX_PAYLOADS`). Sixteen fixed slots per port give KMS stable
+/// connector indices and every connector its own requests; past them a new
+/// device reclaims a disconnected reservation, else stays unpublished.
+pub const MST_OUTPUTS: usize = 16;
+
+/// A port's connector slots, boxed: sixteen outputs with EDIDs and DSC
+/// caps are kilobytes, too much for every holder's stack.
+pub type Outputs = alloc::boxed::Box<[Option<MstOutput>; MST_OUTPUTS]>;
+
 /// Reserve every surviving identity before admitting new ones. Disconnected
-/// slots remain reserved for replug until four slots are needed by other sinks.
-fn reconcile(previous: &[Option<MstOutput>; 4], topology: &Topology) -> [Option<MstOutput>; 4] {
-    let mut out = previous.clone();
+/// slots remain reserved for replug until every slot is needed by other sinks.
+fn reconcile(previous: &[Option<MstOutput>; MST_OUTPUTS], topology: &Topology) -> Outputs {
+    let mut out: Outputs = alloc::boxed::Box::new(previous.clone());
     for o in out.iter_mut().flatten() {
         o.sink = None;
         o.edid.clear();
@@ -404,7 +418,8 @@ mod tests {
         let mut hub = Hub::new();
         let topology = run(Manager::new().probe(&mut hub)).unwrap();
         let slots = reconcile(&Default::default(), &topology);
-        let ids = |s: &[Option<MstOutput>; 4]| s.each_ref().map(|o| o.as_ref().map(|o| o.id));
+        let ids =
+            |s: &[Option<MstOutput>; MST_OUTPUTS]| s.each_ref().map(|o| o.as_ref().map(|o| o.id));
         let original = ids(&slots);
         // A branch inserted ahead of the old child changes its Sink index.
         let mut reordered = topology.clone();
@@ -438,20 +453,34 @@ mod tests {
             assert_eq!(o.id.root, [0x99; 16]);
             assert!(!original.contains(&Some(o.id)));
         }
-        // At capacity, reclaim disconnected reservations, never a survivor.
+        // More end devices than four (the pipes) take slots of their own.
         let full = reconcile(&new, &reordered);
         let survivor = full.iter().flatten().find(|o| o.sink.is_some()).unwrap().id;
+        let mut wider = reordered.clone();
+        for k in 0..4 {
+            let mut b = wider.branches[1].clone();
+            b.guid = [0x60 + k; 16];
+            b.rad[0] = (4 + k) << 4;
+            wider.branches.push(b);
+        }
+        let wide = reconcile(&full, &wider);
+        assert_eq!(
+            wide.iter().flatten().filter(|o| o.sink.is_some()).count(),
+            wider.sinks().len()
+        );
+        assert!(wider.sinks().len() > 4);
+        // At capacity, reclaim disconnected reservations, never a survivor.
         let mut many = reordered.clone();
-        for k in 0..6 {
+        for k in 0..MST_OUTPUTS as u8 + 2 {
             let mut b = many.branches[1].clone();
             b.guid = [0x80 + k; 16];
-            b.rad[0] = (4 + k) << 4;
+            b.rad[0] = k;
             many.branches.push(b);
         }
         let full = reconcile(&full, &many);
         assert_eq!(
             full.iter().flatten().filter(|o| o.sink.is_some()).count(),
-            4
+            MST_OUTPUTS
         );
         assert!(full
             .iter()

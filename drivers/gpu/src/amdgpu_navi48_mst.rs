@@ -12,7 +12,7 @@ use crate::dp_mst_mgr::{self, Manager, MstAux, MstError, Topology};
 #[path = "amdgpu_navi48_mst_topology.rs"]
 mod topology;
 use topology::ProbeState;
-pub use topology::{MstOutput, MstOutputId};
+pub use topology::{MstOutput, MstOutputId, MST_OUTPUTS};
 #[path = "amdgpu_navi48_mst_dsc.rs"]
 pub(super) mod dsc;
 pub use dsc::{DscAux, MstDsc};
@@ -96,7 +96,7 @@ pub struct MstLink {
     pub topology: Topology,
     pub payloads: Vec<MstPayload>,
     /// Stable KMS slots, including reservations for disconnected sinks.
-    pub outputs: [Option<MstOutput>; 4],
+    pub outputs: topology::Outputs,
     payload_change: Option<MstPayloadChange>,
     resource_ports: Vec<dp_mst_mgr::Sink>,
     resource_query: bool,
@@ -780,7 +780,7 @@ fn mst_vc_rate(timing: &Timing, bpc: u8, lanes: u8, rate: DpRate, fec: bool) -> 
 
 /// The streams one MST port lights, as amdgpu_dm's MST atomic check
 /// admits them: each end device (in topology order, at most
-/// `MAX_DISPLAYS`) at the timing `want(k)` asks of device k where its EDID
+/// `MAX_PAYLOADS`) at the timing `want(k)` asks of device k where its EDID
 /// lists it and its payload fits, else the first of its EDID timings that
 /// does, at 8 bpc RGB on the port's MST link (`mst_link`). A payload fits
 /// the slots the earlier streams left of the link's and its port's available PBN
@@ -864,7 +864,7 @@ fn mst_vc_rate_dsc(
 
 /// The streams an MST link lights once one of its end devices has a DSC
 /// decoder, as amdgpu_dm admits them: each device (in topology order, at
-/// most `MAX_DISPLAYS`) at the timing `want(k)` asks, else its first EDID
+/// most `MAX_PAYLOADS`) at the timing `want(k)` asks, else its first EDID
 /// timing, at the deepest of its depths (`modeset::dp_depths` up to
 /// `ctx.max_bpc(sink)`, create_validate_stream_for_sink's loop) that
 /// dm_dp_mst_is_port_support_mode accepts and with which
@@ -900,7 +900,7 @@ fn select_mst_dsc(
     let mut chosen: Vec<(usize, dsc::DscStream)> = Vec::new();
     let mut payloads = Vec::new();
     for (k, (sink, edid, _)) in devices.iter().enumerate() {
-        if chosen.len() == modeset::MAX_DISPLAYS {
+        if chosen.len() == MAX_PAYLOADS {
             break;
         }
         if edid.len() < 128 {
@@ -1049,7 +1049,7 @@ fn select_mst_with_budget(
     let mut free = mst_total_slots(rate);
     let mut out = Vec::new();
     for (k, (sink, edid, available)) in devices.iter().enumerate() {
-        if out.len() == modeset::MAX_DISPLAYS {
+        if out.len() == MAX_PAYLOADS {
             break;
         }
         let Some(base) = edid.get(..128).and_then(|b| b.try_into().ok()) else {
@@ -1383,7 +1383,7 @@ impl ColdBoot {
     ) -> Result<(), ModesetError> {
         let pipes = route.pipes;
         if pipes.is_empty()
-            || pipes.len() > modeset::MAX_DISPLAYS
+            || pipes.len() > MST_OUTPUTS
             || pipes.iter().flatten().any(|&p| p >= 4)
             || pipes
                 .iter()

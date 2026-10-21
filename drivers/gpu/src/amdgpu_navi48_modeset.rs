@@ -780,7 +780,7 @@ pub const MIN_REQUESTED_BPC: u8 = 8;
 pub const MAX_REQUESTED_BPC: u8 = 16;
 /// Board ports and MST end devices per port the per-connector table holds.
 const REQUESTED_PORTS: usize = 8;
-const REQUESTED_SLOTS: usize = 4;
+const REQUESTED_SLOTS: usize = super::mst::MST_OUTPUTS;
 /// DRM's per-connector "max bpc" (max_requested_bpc) for the next
 /// selection: `[port][0]` board port `port`'s connector, `[port][1 + slot]`
 /// its MST end device `slot`'s (`MstLink::outputs`).

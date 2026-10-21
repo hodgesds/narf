@@ -2273,7 +2273,16 @@ reconciliation/reset; an empty source/payload list is not permission to discard
 them. Models inject faults before and after every AUX operation on both active
 and empty sessions.
 
-`MstLink::outputs` reserves four stable slots. `MstOutputId` includes root
+`MstLink::outputs` reserves `MST_OUTPUTS` (sixteen) stable slots per port.
+Linux bounds MST connectors only by the topology (drm_dp_mst adds one per
+output port); what it bounds is lighting: amdgpu_dm's CRTCs are
+dc->caps.max_streams, min(pipe_count, stream_enc_count), four on DCN 4.0.1
+(four OTGs, OPPs, DIO and HPO stream encoders in res_cap_dcn4_01), and each
+manager sources at most `MAX_PAYLOADS` = 4 payloads. Four lit streams across
+every port (`modeset::MAX_DISPLAYS`) is the real hardware limit; more end
+devices than that are published as connectors and stay dark until a CRTC is
+routed to them. Sixteen slots is NARF's fixed table bound (KMS indices and
+per-connector requests), not a Linux one. `MstOutputId` includes root
 GUID, branch GUID, LCT/RAD and output port; probe vector indices are never
 connector identities. Surviving identities claim their old slots before new
 devices are admitted. Disconnected slots retain their requests for replug;
@@ -2367,7 +2376,7 @@ selections. Failed transitions retain their owners and allocations.
 KMS routing follows Linux: there are four CRTCs (display/pipe k is CRTC id
 1 + 3k) and one connector per board DP/HDMI port (board ordinal n: encoder
 2 + 3n, connector 3 + 3n, all ports, not only four), plus four end-device
-connectors (index 32 + slot) while the first connected MST branch is in use;
+connectors (index 32 + slot, sixteen slots) while the first connected MST branch is in use;
 the root's own connector then reports disconnected. Every encoder may drive
 any CRTC (`possible_crtcs` 0xf; `amdgpu_navi48_kms::{RoutedConnector,
 apply_routed, publish_routed, connector_index}`). A CRTC drives at most one
@@ -2400,11 +2409,11 @@ Cascaded (daisy-chained) branches are one topology: each branch is probed by
 LINK_ADDRESS at its own LCT/RAD (`dp_mst_mgr::child_rad`), sideband
 transactions for an end device (ALLOCATE_PAYLOAD, REMOTE_I2C_READ, remote
 DPCD) go to that device's own branch, end devices across branches share the
-link's payload table and the four stable connector slots, and every hop of a
+link's payload table and the port's stable connector slots, and every hop of a
 device's path bounds its payload, dark-mode admission and the DSC fairness
 search jointly with the sibling streams crossing that hop. Only one DP port
-runs MST at a time (the first connected branch); end devices beyond the four
-slots are not published.
+runs MST at a time (the first connected branch); end devices beyond the
+sixteen slots are not published.
 
 An MST branch that codes 128b/132b runs UHBR MST, as Linux's
 decide_mst_link_settings trains MST at the verified cap: the best UHBR rate
