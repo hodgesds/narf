@@ -696,3 +696,30 @@ kernel_test_in!(
     "drivers/gpu/mes12",
     mes12_hw_detection_refuses_foreign_malformed_and_undrained_hangs
 );
+
+fn mes12_hw_layout_resolves_on_every_rdna4_profile() -> TestResult {
+    use crate::amdgpu_rdna4::tests::Profile;
+    let mut regs = vec![0; 0x80000 / 4];
+    for profile in Profile::ALL {
+        let mut gpu = crate::amdgpu_gmc_navi48::tests::descriptor(&mut regs);
+        gpu.ip_blocks[0].base_addrs[1] = 0x10000;
+        let mut ih = gpu.ip_blocks[0];
+        (ih.hw_id, ih.major, ih.minor, ih.revision) = (ip::HW_ID_OSSSYS, 7, 0, 0);
+        ih.num_bases = 1;
+        ih.base_addrs = [0x12000, 0, 0, 0, 0];
+        gpu.ip_blocks.push(ih);
+        profile.apply(&mut gpu);
+        if Layout::resolve(&gpu).is_err() {
+            return TestResult::Fail("MES12 refused an RDNA4 profile");
+        }
+        gpu.ip_blocks[0].revision = 2;
+        if Layout::resolve(&gpu).is_ok() {
+            return TestResult::Fail("MES12 accepted GC 12.0.2");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/mes12",
+    mes12_hw_layout_resolves_on_every_rdna4_profile
+);

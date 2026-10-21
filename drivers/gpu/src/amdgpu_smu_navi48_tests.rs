@@ -410,6 +410,16 @@ fn smu14_constructor_resolves_bank_one_and_validates_pool() -> TestResult {
         return TestResult::Fail("SMU14 used MP1 bank zero or wrote hardware at construction");
     }
     drop(smu);
+    // smu_v14_0_2_ppt serves MP1 14.0.2 (Navi44) and 14.0.3 (Navi48) alike.
+    for profile in crate::amdgpu_rdna4::tests::Profile::ALL {
+        profile.apply(&mut g);
+        // SAFETY: as above; construction only.
+        let smu = unsafe { Smu::after_upload(&g, Cap::bootstrap(), &pool) };
+        if !smu.is_ok_and(|s| s.engine.io.base == 0x44000 && s.state() == State::Prepared) {
+            return TestResult::Fail("SMU14 constructor refused an RDNA4 profile");
+        }
+    }
+    crate::amdgpu_rdna4::tests::Profile::Navi48.apply(&mut g);
     let cap = Cap::bootstrap();
     cap.revoke();
     if !matches!(

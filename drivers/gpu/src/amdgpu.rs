@@ -2693,6 +2693,22 @@ mod navi22_ownership_tests {
         if is_probed() {
             return TestResult::Skip("real controller owns the global slot");
         }
+        // Every RDNA4 board takes the same exclusive cold-boot claim.
+        for profile in crate::amdgpu_rdna4::tests::Profile::ALL {
+            let mut gpu = crate::amdgpu_navi48_firmware::tests::gpu();
+            profile.apply(&mut gpu);
+            let did = gpu.chip.did;
+            *CONTROLLER.lock() = Some(gpu);
+            let claimed = is_navi48()
+                && claim_navi22(|_| Ok::<_, ()>(())).is_none()
+                && claim_navi48(|_| Ok::<_, ()>(())) == Some(Ok(()))
+                && info_snapshot().is_some_and(|info| info.did == u32::from(did));
+            *CONTROLLER.lock() = None;
+            DISCRETE_OWNED.store(false, Ordering::Release);
+            if !claimed {
+                return TestResult::Fail("RDNA4 profile cold-boot claim");
+            }
+        }
         *CONTROLLER.lock() = Some(crate::amdgpu_navi48_firmware::tests::gpu());
         let prior_pm = PM_SUSPENDED.swap(false, Ordering::AcqRel);
         let wrong = claim_navi22(|_| Ok::<_, ()>(())).is_none();

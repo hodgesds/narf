@@ -320,3 +320,31 @@ kernel_test_in!(
     "drivers/gpu/gfx12",
     gfx12_setup_selects_revision_strap_by_nbio_generation
 );
+
+/// GC 12.0.0 and 12.0.1 share the bank layout and the golden sequence
+/// (gfx_v12_0_init_golden_registers has one case for both): every profile
+/// resolves the same banks, and the rev0 entries follow the NBIO strap, not
+/// the die.
+fn gfx12_setup_layout_and_golden_are_shared_by_both_dies() -> TestResult {
+    use crate::amdgpu_rdna4::tests::Profile;
+    let mut regs = vec![0; 0x80000 / 4];
+    for profile in Profile::ALL {
+        let mut gpu = crate::amdgpu_gmc_navi48::tests::descriptor(&mut regs);
+        gpu.ip_blocks[0].base_addrs[1] = 0x10000;
+        profile.apply(&mut gpu);
+        let Ok(layout) = Layout::resolve(&gpu) else {
+            return TestResult::Fail("GFX12 setup refused an RDNA4 profile");
+        };
+        if layout.gc != 0x4000 * 4 || layout.hyp != 0x10000 * 4 || layout.strap != 0x30054 {
+            return TestResult::Fail("GFX12 setup profile banks");
+        }
+    }
+    if GOLDEN != [(0, 0x13d2, 0x8000, 0x8000)] || GOLDEN_REV0.len() != 3 {
+        return TestResult::Fail("GC12 golden tables");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_setup_layout_and_golden_are_shared_by_both_dies
+);

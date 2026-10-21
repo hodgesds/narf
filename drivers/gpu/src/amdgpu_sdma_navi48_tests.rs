@@ -475,7 +475,13 @@ fn sdma_navi48_layout_rejects_wrong_versions_and_bank_bounds() -> TestResult {
     }
     let mut g = descriptor();
     g.ip_blocks[0].base_addrs[1] = 0x14000;
-    for rev in [0, 1] {
+    // Navi44 discovers SDMA 7.0.0 on GC 12.0.0, Navi48 7.0.1 on 12.0.1;
+    // both revisions on either GC resolve one layout.
+    for (rev, profile) in [0, 1]
+        .into_iter()
+        .flat_map(|rev| crate::amdgpu_rdna4::tests::Profile::ALL.map(move |p| (rev, p)))
+    {
+        profile.apply(&mut g);
         g.ip_blocks[5].revision = rev;
         let layout = Layout::resolve(&g).unwrap();
         if layout.gc != GC || layout.hyp != HYP {
