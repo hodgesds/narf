@@ -1183,7 +1183,7 @@ pub fn dispatch(
         return Err(FsError::Unsupported);
     }
     let _placement = match vm.card() {
-        Some(card) => Some(crate::amdgpu_gem::try_placement(card).ok_or(FsError::Busy)?),
+        Some(card) => Some(crate::amdgpu_gem::try_placement_live(card)?.ok_or(FsError::Busy)?),
         None => None,
     };
     dispatch_inner(cmd, arg, vm, gem)
@@ -1201,7 +1201,10 @@ pub async fn dispatch_async(
         return None;
     }
     let _placement = match vm.card() {
-        Some(card) => Some(crate::amdgpu_gem::lock_placement(card).await),
+        Some(card) => match crate::amdgpu_gem::lock_placement_live(card).await {
+            Ok(guard) => Some(guard),
+            Err(error) => return Some(Err(error)),
+        },
         None => None,
     };
     Some(dispatch_inner(cmd, arg, vm, gem))

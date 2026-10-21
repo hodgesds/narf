@@ -413,9 +413,23 @@ impl Drop for RecoveryOwner {
 /// after `set_automatic_recovery` accepted that contract for every user (see
 /// there). Hardware unvalidated.
 pub async unsafe fn recover() -> Result<boot::Report, boot::Error> {
+    let card = boot::ColdBoot::drm_card().ok_or(boot::Error::Invalid)?;
+    let placement = crate::amdgpu_gem::lock_placement_live(card)
+        .await
+        .map_err(|_| boot::Error::DeviceGone)?;
+    // SAFETY: forwarded caller contract; placement is held before OWNER.
+    unsafe { recover_placed(placement) }.await
+}
+/// Recovery with the caller's already-owned placement exclusion. Suspend
+/// uses this after a failed display retirement without reacquiring its gate.
+/// # Safety
+/// As recover, with the current card's placement guard.
+async unsafe fn recover_placed(
+    placement: crate::amdgpu_gem::PlacementGuard,
+) -> Result<boot::Report, boot::Error> {
     let mut owner = OWNER.lock().await;
     // SAFETY: forwarded caller contract.
-    let quiesced = unsafe { quiesce(&mut owner, boot::ColdBoot::prepare_reset) }.await?;
+    let quiesced = unsafe { quiesce(&mut owner, boot::ColdBoot::prepare_reset, placement) }.await?;
     // SAFETY: forwarded caller contract; every accessor was withdrawn.
     unsafe { restart(&mut owner, quiesced) }.await
 }
@@ -623,6 +637,18 @@ async unsafe fn suspend_gated(baco: Option<Baco>) -> Result<(), boot::Error> {
     if !drain_display_clients().await {
         return Err(boot::Error::Busy);
     }
+    // Match clients' order: placement before OWNER. Hold this through
+    // eviction, parked suspend and resume, so reset cannot race the final
+    // synchronous placement/PTE commit of a transfer or CS publication.
+    let placement = crate::amdgpu_gem::lock_placement_live(card)
+        .await
+        .map_err(|_| boot::Error::DeviceGone)?;
+    // The earlier runtime-idle sample preceded admission. With new CS
+    // publication excluded, drain all submitted client jobs, including GTT-
+    // only work that VRAM eviction would never visit. IRQs remain usable.
+    if !rings_idle(RING_DRAIN_MS).await {
+        return Err(boot::Error::Busy);
+    }
     // drm_atomic_helper_suspend's disable commit (dm_cache_state): stop
     // every stream, without exposing the presenter's old staged buffer.
     // Stop console writers before withdrawing/releasing their surfaces.
@@ -649,7 +675,7 @@ async unsafe fn suspend_gated(baco: Option<Baco>) -> Result<(), boot::Error> {
             // it. Recovery retains the old owner/pins if it also fails.
             drop(owner);
             // SAFETY: prepare_suspend's exclusions include recover's.
-            let recovered = unsafe { recover() }.await;
+            let recovered = unsafe { recover_placed(placement) }.await;
             if recovered.is_ok() && pause_console {
                 console(false);
             }
@@ -664,10 +690,7 @@ async unsafe fn suspend_gated(baco: Option<Baco>) -> Result<(), boot::Error> {
     }
     // No new VRAM placement while the old ones leave.
     crate::amdgpu_gem::unregister_vram_heap(card);
-    let (domains, evicted) = {
-        let gate = crate::amdgpu_gem::lock_placement(card).await;
-        crate::amdgpu_gem::evict_all(&gate).await
-    };
+    let (domains, evicted) = crate::amdgpu_gem::evict_all(&placement).await;
     let republish = || async {
         if let Some(boot) = OWNER.lock().await.as_ref() {
             boot.republish_client_vram();
@@ -698,18 +721,19 @@ async unsafe fn suspend_gated(baco: Option<Baco>) -> Result<(), boot::Error> {
     }
     let mut owner = OWNER.lock().await;
     // SAFETY: forwarded caller contract; client VRAM is empty.
-    let quiesced = match unsafe { quiesce(&mut owner, boot::ColdBoot::prepare_suspend) }.await {
-        Ok(q) => q,
-        Err(error) => {
-            drop(owner);
-            crate::amdgpu_gem::restore_domains(domains);
-            republish().await;
-            if pause_console {
-                console(false);
+    let quiesced =
+        match unsafe { quiesce(&mut owner, boot::ColdBoot::prepare_suspend, placement) }.await {
+            Ok(q) => q,
+            Err(error) => {
+                drop(owner);
+                crate::amdgpu_gem::restore_domains(domains);
+                republish().await;
+                if pause_console {
+                    console(false);
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
-    };
+        };
     let mut quiesced = quiesced;
     let boot = quiesced
         .retained
@@ -919,7 +943,74 @@ pub unsafe fn register_system_pm() {
 struct Quiesced {
     retained: RecoveryOwner,
     old_submitter: Option<Arc<Submitter>>,
+    old_clearer: ResetClearer,
+    placement: ResetPlacement,
     restart_display: bool,
+}
+/// Admission stays excluded through parked suspend and restart. Before a
+/// full-reset proof, abandonment makes the card terminal and quarantines
+/// its guard. Fallible client admission wakes with NoDevice, never waiting
+/// forever behind a retained, unknown hardware owner.
+struct ResetPlacement {
+    guard: Option<crate::amdgpu_gem::PlacementGuard>,
+    release_safe: bool,
+    restarted: bool,
+    quarantine: fn(crate::amdgpu_gem::PlacementGuard),
+}
+static QUARANTINED_PLACEMENTS: narf_lib::sync::IrqSafeSpinLock<
+    Vec<crate::amdgpu_gem::PlacementGuard>,
+> = narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+impl ResetPlacement {
+    /// # Safety
+    /// A whole-device reset completed; no old DMA can reach its resources.
+    unsafe fn stopped(&mut self) {
+        self.release_safe = true;
+    }
+}
+impl Drop for ResetPlacement {
+    fn drop(&mut self) {
+        if !self.restarted {
+            if let Some(guard) = &self.guard {
+                crate::amdgpu_gem::mark_placement_lost(guard.card());
+            }
+        }
+        if !self.release_safe {
+            if let Some(guard) = self.guard.take() {
+                (self.quarantine)(guard);
+            }
+        }
+    }
+}
+/// The old queue owns DMA leases independently of its registry entry.
+/// A cancelled/failed reset leaves it quarantined, as RecoveryOwner does
+/// for the corresponding ColdBoot. Never infer stop from lost progress.
+struct ResetClearer {
+    clearer: Option<VramClearer>,
+    quarantine: fn(VramClearer),
+}
+static QUARANTINED_CLEARERS: narf_lib::sync::IrqSafeSpinLock<Vec<VramClearer>> =
+    narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+impl ResetClearer {
+    /// # Safety
+    /// A whole-device reset completed; no old DMA can reach its resources.
+    unsafe fn stopped(&mut self) {
+        if let Some(clearer) = self.clearer.take() {
+            // Clear the shared state as well as our clone: a stale caller
+            // may still retain this queue, but cannot keep old DMA leases
+            // or report skipped work successful after the reset proof.
+            // SAFETY: this method's caller supplied the full-reset proof.
+            let retired = unsafe { clearer.0.state.lock().retire_after_reset() };
+            drop(retired);
+            drop(clearer);
+        }
+    }
+}
+impl Drop for ResetClearer {
+    fn drop(&mut self) {
+        if let Some(clearer) = self.clearer.take() {
+            (self.quarantine)(clearer);
+        }
+    }
 }
 /// Run `prepare` (which may refuse with everything still running), then
 /// withdraw CS, client VRAM allocation, scanout, timestamps and the IH
@@ -930,11 +1021,18 @@ struct Quiesced {
 async unsafe fn quiesce(
     owner: &mut Option<alloc::boxed::Box<boot::ColdBoot>>,
     prepare: fn(&mut boot::ColdBoot) -> Result<(), boot::Error>,
+    placement: crate::amdgpu_gem::PlacementGuard,
 ) -> Result<Quiesced, boot::Error> {
     if RECOVERY_STATE.load(Ordering::Acquire) & 1 != 0 {
         return Err(boot::Error::Busy);
     }
     prepare(owner.as_mut().ok_or(boot::Error::Busy)?)?;
+    let placement = ResetPlacement {
+        guard: Some(placement),
+        release_safe: false,
+        restarted: false,
+        quarantine: |guard| QUARANTINED_PLACEMENTS.lock().push(guard),
+    };
     RECOVERY_STATE.store(1, Ordering::Release);
     let retained = RecoveryOwner {
         boot: owner.take(),
@@ -950,13 +1048,22 @@ async unsafe fn quiesce(
         crate::amdgpu_cs::unregister_submitter(card);
         crate::amdgpu_gem::unregister_vram_heap(card);
     }
+    let old_clearer = ResetClearer {
+        clearer: CLEARER.lock().take(),
+        quarantine: |clearer| QUARANTINED_CLEARERS.lock().push(clearer),
+    };
     *READ_GENERATION.lock() += 1;
+    // Suspend's eviction used this engine while its heap was withdrawn.
+    // Now every old reader is invalid and no new move may find it. Any
+    // queued/inflight copy independently retains its stage and backings.
+    if let Some(card) = boot::ColdBoot::drm_card() {
+        crate::amdgpu_gem::register_vram_transfer(card, None);
+    }
     let restart_display = DISPLAY_GENERATION.load(Ordering::Acquire) != 0;
     if restart_display {
         DISPLAY_GENERATION.fetch_add(1, Ordering::AcqRel);
     }
     crate::amdgpu_navi48_power::stop();
-    *CLEARER.lock() = None;
     crate::amdgpu_info::withdraw_navi48_clock();
     crate::amdgpu_info::publish_navi48_video(0);
     for display in 0..4 {
@@ -968,6 +1075,8 @@ async unsafe fn quiesce(
     Ok(Quiesced {
         retained,
         old_submitter,
+        old_clearer,
+        placement,
         restart_display,
     })
 }
@@ -984,6 +1093,8 @@ async unsafe fn restart(
     let Quiesced {
         mut retained,
         old_submitter,
+        mut old_clearer,
+        mut placement,
         restart_display,
     } = q;
     let old = retained.boot.as_mut().unwrap();
@@ -993,6 +1104,13 @@ async unsafe fn restart(
     // SAFETY: OWNER excludes async access; readers, IH and publication were
     // withdrawn. The caller excludes all external CPU mappings and PCI users.
     unsafe { old.run_reset().await }?;
+    // SAFETY: the successful whole-device reset is the hardware-stop proof.
+    // Keep the actual guard through new-owner publication; on later failure
+    // the stopped old clients cannot reach the unpublished replacement.
+    unsafe { placement.stopped() };
+    // SAFETY: the successful full reset stopped every old queue. Later
+    // boot failure cannot make those old DMA requests execute again.
+    unsafe { old_clearer.stopped() };
     // SAFETY: full reset and ASIC_Init proved old hardware no longer executes.
     let new = alloc::boxed::Box::new(unsafe { old.after_reset() }?);
     let old = retained.boot.replace(new).unwrap();
@@ -1079,6 +1197,7 @@ async unsafe fn restart(
             })
         };
     }
+    placement.restarted = true;
     Ok(report)
 }
 
@@ -1886,6 +2005,7 @@ fn publish_clearer(boot: &mut boot::ColdBoot) {
 #[derive(Debug, Clone)]
 struct VramClearer(Arc<ClearQueue>);
 struct ClearQueue {
+    generation: u64,
     progress: SdmaProgress,
     state: narf_lib::sync::IrqSafeSpinLock<ClearState>,
 }
@@ -1900,14 +2020,47 @@ struct ClearState {
     draining: bool,
 }
 impl ClearState {
+    /// # Safety
+    /// All DMA of this generation stopped after a proven whole-device reset.
+    unsafe fn retire_after_reset(
+        &mut self,
+    ) -> (
+        alloc::collections::VecDeque<Clear>,
+        alloc::collections::VecDeque<Clear>,
+    ) {
+        let queued = self.refuse_queued();
+        let inflight = core::mem::take(&mut self.inflight);
+        for c in &inflight {
+            c.fence.gone.store(true, Ordering::Release);
+        }
+        (queued, inflight)
+    }
+    /// Reject only work that never entered hardware. Inflight requests
+    /// retain every resource until completion or a proven reset permits
+    /// their owner's retirement.
+    fn refuse_queued(&mut self) -> alloc::collections::VecDeque<Clear> {
+        let queued = core::mem::take(&mut self.queued);
+        for c in &queued {
+            c.fence.gone.store(true, Ordering::Release);
+        }
+        self.draining = false;
+        queued
+    }
+    /// Take exactly the requests proven complete. The caller drops their
+    /// backing leases outside the queue's state spinlock.
+    fn take_completed(&mut self, completed: u32) -> alloc::collections::VecDeque<Clear> {
+        let count = self
+            .inflight
+            .iter()
+            .take_while(|c| {
+                completed.wrapping_sub(c.fence.seq.load(Ordering::Acquire) as u32) as i32 >= 0
+            })
+            .count();
+        self.inflight.drain(..count).collect()
+    }
     /// Forget the clears on the ring that SDMA0 completed by `completed`.
     fn retire(&mut self, completed: u32) {
-        use core::sync::atomic::Ordering;
-        while self.inflight.front().is_some_and(|c| {
-            completed.wrapping_sub(c.fence.seq.load(Ordering::Acquire) as u32) as i32 >= 0
-        }) {
-            self.inflight.pop_front();
-        }
+        drop(self.take_completed(completed));
     }
     /// SDMA0's ring was reset at `completed`, skipping what it held past
     /// that: those clears never ran, so they go back to the front of the
@@ -2084,9 +2237,11 @@ impl narf_filesystem::DrmFence for ClearFence {
             return false;
         }
         let seq = self.seq.load(Ordering::Acquire);
-        // A device that stopped answering runs nothing any more.
+        // Unreadable progress is not hardware-stop or copy completion
+        // proof. Only an actual sequence or explicit proven retirement
+        // releases generic reservation/VM waiters.
         seq != u64::MAX
-            && (self.progress)().is_none_or(|done| done.wrapping_sub(seq as u32) as i32 >= 0)
+            && (self.progress)().is_some_and(|done| done.wrapping_sub(seq as u32) as i32 >= 0)
     }
     fn wait(&self, timeout_ms: u64) -> bool {
         let deadline =
@@ -2115,9 +2270,39 @@ impl core::fmt::Debug for ClearQueue {
 impl VramClearer {
     fn new(progress: SdmaProgress) -> Self {
         Self(Arc::new(ClearQueue {
+            generation: *READ_GENERATION.lock(),
             progress,
             state: narf_lib::sync::IrqSafeSpinLock::new(ClearState::default()),
         }))
+    }
+    fn current_generation(&self) -> bool {
+        self.0.generation == *READ_GENERATION.lock()
+    }
+    fn refuse_queued(&self) {
+        let queued = self.0.state.lock().refuse_queued();
+        // Backing/stage drops may take other allocator locks.
+        drop(queued);
+    }
+    /// Called under OWNER after the IRQ-service interlock. Check the
+    /// generation before any progress MMIO or CPU write into its stage.
+    fn live_progress(&self) -> Result<u32, narf_filesystem::FsError> {
+        if !self.current_generation() {
+            return Err(narf_filesystem::FsError::NoDevice);
+        }
+        (self.0.progress)().ok_or(narf_filesystem::FsError::NoDevice)
+    }
+    fn with_live_progress<T>(
+        &self,
+        stage: impl FnOnce() -> Result<T, narf_filesystem::FsError>,
+    ) -> Result<T, narf_filesystem::FsError> {
+        self.live_progress()?;
+        stage()
+    }
+    /// Under OWNER, using an actual same-generation sequence. No allocator
+    /// or backing drop occurs while the IRQ-safe queue lock is held.
+    fn retire_completed(&self, completed: u32) {
+        let retired = self.0.state.lock().take_completed(completed);
+        drop(retired);
     }
     /// Run queued clears until none is left.
     async fn drain(self) {
@@ -2127,15 +2312,11 @@ impl VramClearer {
             // The batch is taken and queued under OWNER, as an SDMA0 reset
             // requeues skipped clears at the queue's front under it too.
             let mut owner = OWNER.lock().await;
-            if crate::amdgpu_navi48_interrupts::failed() {
+            if !self.current_generation() || crate::amdgpu_navi48_interrupts::failed() {
                 // These requests have no live SDMA slot (including skipped
                 // clears requeued only after a proven reset). Published
                 // inflight requests remain retained and unsignalled.
-                let mut state = self.0.state.lock();
-                for c in state.queued.drain(..) {
-                    c.fence.gone.store(true, Ordering::Release);
-                }
-                state.draining = false;
+                self.refuse_queued();
                 return;
             }
             if crate::amdgpu_navi48_interrupts::blocked()
@@ -2148,19 +2329,40 @@ impl VramClearer {
                 narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
                 continue;
             }
+            let Ok(completed) = self.live_progress() else {
+                // A transient unreadable sample proves neither completion
+                // nor stop. Keep the independent collector alive for a
+                // cancelled waiter's last request, with no CPU staging.
+                drop(owner);
+                narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
+                continue;
+            };
+            self.retire_completed(completed);
             // The front clears that fit one job, left queued until they are
             // in the ring so a later request cannot overtake them.
-            let batch: Vec<Clear> = {
+            let batch: Option<Vec<Clear>> = {
                 let mut state = self.0.state.lock();
                 if state.queued.is_empty() {
-                    state.draining = false;
-                    return;
+                    if state.inflight.is_empty() {
+                        state.draining = false;
+                        return;
+                    }
+                    None
+                } else {
+                    let n = work_batch(state.queued.iter());
+                    Some(state.queued.iter().take(n).cloned().collect())
                 }
-                let n = work_batch(state.queued.iter());
-                state.queued.iter().take(n).cloned().collect()
+            };
+            let Some(batch) = batch else {
+                // Completion collection belongs to this queue task, not its
+                // optional mover waiter. Sleep with OWNER released; a final
+                // copy or fill retires even after every waiter is dropped.
+                drop(owner);
+                narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant()).await;
+                continue;
             };
             let ops: Vec<KernelOp> = batch.iter().map(|c| c.work.op()).collect();
-            let staged = match (owner.as_ref(), &batch[0].work) {
+            let staged = self.with_live_progress(|| match (owner.as_ref(), &batch[0].work) {
                 (
                     Some(boot),
                     Work::Copy {
@@ -2178,7 +2380,7 @@ impl VramClearer {
                     })
                 }
                 _ => Ok(()),
-            };
+            });
             let result = match owner.as_mut() {
                 Some(_) if staged.is_err() => Err(crate::amdgpu_sdma_navi48::Error::Invalid),
                 // SAFETY: OWNER serializes SDMA0's ring; each range is a
@@ -2202,13 +2404,9 @@ impl VramClearer {
                     for c in &batch {
                         c.fence.seq.store(u64::from(seq), Ordering::Release);
                     }
-                    let completed = (self.0.progress)();
                     let mut state = self.0.state.lock();
                     let ran: Vec<Clear> = state.queued.drain(..batch.len()).collect();
                     state.inflight.extend(ran);
-                    if let Some(completed) = completed {
-                        state.retire(completed);
-                    }
                 }
                 // `clear`/`enqueue` validated every request, so the device is
                 // gone (or the upload's source could not be staged).
@@ -5862,7 +6060,7 @@ fn admits_with_planes(
         .iter()
         .position(|&(n, _)| n == k)
         .ok_or(PlanesRefused::NotLit)?;
-    let plans = dml::admit_native(soc, &modes).map_err(|e| match e {
+    let plans = boot::admit_native_modes(soc, &modes).map_err(|e| match e {
         dml::Error::Pipes => PlanesRefused::Pipes,
         dml::Error::Unsupported | dml::Error::Invalid => PlanesRefused::Plane,
         _ => PlanesRefused::Bandwidth,
@@ -5959,7 +6157,7 @@ fn admits_with_format(
             }
         })
         .collect();
-    joint.iter().any(|&(n, _)| n == k) && dml::admit_native(soc, &modes).is_ok()
+    joint.iter().any(|&(n, _)| n == k) && boot::admit_native_modes(soc, &modes).is_ok()
 }
 
 /// Every display back to the console's defaults (on, preferred mode,
@@ -7949,7 +8147,7 @@ mod tests {
             return TestResult::Fail("clear validation");
         }
         // A fence follows SDMA0's own completed sequence (wrapping), and
-        // a vanished or refusing device signals it.
+        // unreadable progress stays pending; explicit refusal signals it.
         let done = Arc::new(core::sync::atomic::AtomicU64::new(u64::from(u32::MAX - 1)));
         let seen = done.clone();
         let fence = ClearFence::new(Arc::new(move || {
@@ -7969,7 +8167,7 @@ mod tests {
         let vanished = fence.is_signalled();
         let refused = ClearFence::new(Arc::new(|| Some(0)));
         refused.gone.store(true, Ordering::Release);
-        if early || before || !reached || !vanished || !refused.is_signalled() {
+        if early || before || !reached || vanished || !refused.is_signalled() {
             return TestResult::Fail("clear fence against SDMA0's sequence");
         }
         TestResult::Pass

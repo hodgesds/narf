@@ -1031,3 +1031,325 @@ kernel_test_in!(
     "drivers/gpu/navi48-mst",
     navi48_mst_dsc_affected_streams_like_amdgpu_dm
 );
+
+/// Full native admission follows a fresh whole-link fairness calculation at
+/// every depth. The wide stream works only after single-stream Vmin ODM2;
+/// beside an independent running stream it must retry 8-bpc raw, rather
+/// than publishing the deeper DSC payload or rejecting the timing early.
+fn navi48_mst_final_admission_retries_complete_link_candidates() -> TestResult {
+    let mut hub = Hub::new();
+    // The raw 900 MHz RGB8 fallback needs 21.6 Gbit/s. The generic Hub's
+    // 2561-PBN Root port is narrower than this HBR3 x4 link, so declare
+    // the roomy end-to-end path this depth-fallback scenario requires.
+    hub.resources.insert((1, 1), (6000, 6000));
+    let (_, topology) = probed(&mut hub);
+    let mut decoder = MstDsc {
+        caps: DscSinkCaps::parse(&DECODER, &[0; 3]).unwrap(),
+        aux: DscAux::Port(ROOT_SINK),
+        passthrough: None,
+        end_link_kbps: 0,
+        branch_oui: 0,
+    };
+    decoder.caps.max_slice_width = 2560;
+    let dsc_of = |s: Sink| (s == ROOT_SINK).then_some(decoder);
+    let ctx = MstDscContext {
+        topology: &topology,
+        dsc_of: &dsc_of,
+        max_dispclk_khz: 2_000_000,
+        max_bpc: &|_| 10,
+    };
+    let caps = modeset::DpCaps {
+        lanes: 4,
+        rate: crate::dp_link_training::LinkRate::Hbr3,
+        uhbr: 0,
+        fec: true,
+        dsc: None,
+    };
+    let devices = [(ROOT_SINK, uhd60_edid(3), u16::MAX)];
+    let mut chosen =
+        super::super::select_mst_dsc(0, caps, &devices, &|_| None, &|_, _| u16::MAX, &ctx, &[])
+            .unwrap()[0];
+    chosen.timing = crate::amdgpu_dml::Timing {
+        pixel_clock_khz: 900_000,
+        h_active: 5440,
+        h_total: 5600,
+        h_front_porch: 48,
+        h_sync_width: 32,
+        v_active: 3060,
+        v_total: 3200,
+        v_front_porch: 3,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: false,
+    };
+    let soc = crate::amdgpu_dcn401_dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [300_000, 2_500_000],
+        dcfclk_khz: [200_000, 1_564_000],
+        socclk_khz: 300_000,
+        dispclk_max_khz: 2_000_000,
+        dppclk_max_khz: 2_000_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    assert!(raw_supported(
+        &chosen.timing,
+        8,
+        topology.port(ROOT_SINK).unwrap().full_pbn,
+        &super::super::dsc_link(caps, soc.dispclk_max_khz).unwrap(),
+    ));
+    let normalize = |s: &mut [modeset::Selection]| {
+        super::super::refine_mst_link_payloads(&soc, 0, caps, &devices, &ctx, s, &[]).is_ok()
+    };
+    let (alone, plans) =
+        modeset::admit_selection_candidates_with(&soc, &[chosen], &[], true, &mut |s| normalize(s))
+            .unwrap();
+    assert_eq!(
+        (alone[0].depth, plans[0].pipes),
+        (otg::ColorDepth::Bpc10, 2)
+    );
+    assert_eq!(alone[0].dsc.map(|d| d.slices_h), Some(4));
+    let mut sibling = chosen;
+    sibling.port = 1;
+    sibling.mst = None;
+    sibling.dsc = None;
+    sibling.timing = modeset::edid_timings(&fhd60_edid())[0];
+    let (joint, plans) = modeset::admit_selection_candidates_with(
+        &soc,
+        &[sibling, chosen],
+        &[true, false],
+        true,
+        &mut |s| normalize(s),
+    )
+    .unwrap();
+    assert_eq!(joint[0], sibling);
+    assert_eq!(
+        (joint[1].depth, joint[1].dsc, plans[1].pipes),
+        (otg::ColorDepth::Bpc8, None, 1)
+    );
+    assert_ne!(joint[1].mst.unwrap().pbn, alone[0].mst.unwrap().pbn);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-mst",
+    navi48_mst_final_admission_retries_complete_link_candidates
+);
+
+fn dark_candidate_soc() -> crate::amdgpu_dcn401_dml::Soc {
+    crate::amdgpu_dcn401_dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [300_000, 2_500_000],
+        dcfclk_khz: [200_000, 1_564_000],
+        socclk_khz: 300_000,
+        dispclk_max_khz: 2_000_000,
+        dppclk_max_khz: 2_000_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    }
+}
+
+/// Stable KMS slots can outlive a topology reorder. Equal-slack streams
+/// share an odd number of free time slots differently in the two orders;
+/// a dark candidate must use the exact PPS the actual native search uses.
+fn navi48_mst_dark_fairness_keeps_stable_device_order() -> TestResult {
+    let mut hub = Hub::new();
+    hub.grandchild_present = true;
+    let (_, topology) = probed(&mut hub);
+    let grand = Sink { branch: 2, port: 1 };
+    let decoder = MstDsc {
+        caps: caps().unwrap(),
+        aux: DscAux::Port(CHILD_SINK),
+        passthrough: None,
+        end_link_kbps: 0,
+        branch_oui: 0,
+    };
+    let dsc_of = |s| (s == CHILD_SINK || s == grand).then_some(decoder);
+    let ctx = MstDscContext {
+        topology: &topology,
+        dsc_of: &dsc_of,
+        max_dispclk_khz: 2_000_000,
+        max_bpc: &|_| 8,
+    };
+    let caps = modeset::DpCaps {
+        lanes: 4,
+        rate: crate::dp_link_training::LinkRate::Hbr2,
+        uhbr: 0,
+        fec: true,
+        dsc: None,
+    };
+    let edid = uhd60_edid(2);
+    let old = super::super::select_mst_dsc(
+        0,
+        caps,
+        &[(CHILD_SINK, edid.clone(), u16::MAX)],
+        &|_| None,
+        &|_, _| u16::MAX,
+        &ctx,
+        &[],
+    )
+    .unwrap()[0];
+    let timing = old.timing;
+    let order = [grand, CHILD_SINK]; // Surviving KMS slots, reversed in the new probe.
+    let devices = [
+        (grand, edid.clone(), u16::MAX),
+        (CHILD_SINK, edid.clone(), u16::MAX),
+    ];
+    let mut joining = old;
+    joining.mst.as_mut().unwrap().sink = grand;
+    let soc = dark_candidate_soc();
+    let mut actual = [old, joining];
+    super::super::refine_mst_link_payloads(&soc, 0, caps, &devices, &ctx, &mut actual, &[])
+        .unwrap();
+    let joint = super::super::compressed_mst_joint_modes(
+        &soc,
+        0,
+        caps,
+        &timing,
+        &[old],
+        grand,
+        &ctx,
+        &order,
+        8,
+    )
+    .unwrap();
+    assert_eq!(
+        joint,
+        actual
+            .iter()
+            .map(modeset::selection_mode)
+            .collect::<Vec<_>>()
+    );
+    let reordered = super::super::compressed_mst_joint_modes(
+        &soc,
+        0,
+        caps,
+        &timing,
+        &[old],
+        grand,
+        &ctx,
+        &topology.sinks(),
+        8,
+    )
+    .unwrap();
+    assert_ne!(
+        joint[0].dsc, reordered[0].dsc,
+        "fixture must exercise fairness tie order"
+    );
+    let available = super::super::topology::path_budget(
+        &topology,
+        grand,
+        &[(CHILD_SINK, old.mst.unwrap().pbn)],
+    )
+    .unwrap();
+    assert!(super::super::dark_mst_modes_in_order(
+        &soc,
+        0,
+        caps,
+        &edid,
+        available,
+        &[old],
+        Some((grand, &ctx)),
+        &order
+    )
+    .contains(&timing));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-mst",
+    navi48_mst_dark_fairness_keeps_stable_device_order
+);
+
+/// A dark raw-only sink can fit after the running DSC stream gives back
+/// shared-hop PBN. The old leftover budget and the new sink's lack of a
+/// decoder must not veto full-link recomputation of this valid candidate.
+fn navi48_mst_dark_raw_sink_uses_recomputed_shared_budget() -> TestResult {
+    let mut hub = Hub::new();
+    hub.grandchild_present = true;
+    hub.resources.insert((1, 2), (1600, 1600));
+    let (_, topology) = probed(&mut hub);
+    let grand = Sink { branch: 2, port: 1 };
+    let decoder = MstDsc {
+        caps: caps().unwrap(),
+        aux: DscAux::Port(CHILD_SINK),
+        passthrough: None,
+        end_link_kbps: 0,
+        branch_oui: 0,
+    };
+    let dsc_of = |s| (s == CHILD_SINK).then_some(decoder);
+    let ctx = MstDscContext {
+        topology: &topology,
+        dsc_of: &dsc_of,
+        max_dispclk_khz: 2_000_000,
+        max_bpc: &|_| 8,
+    };
+    let caps = modeset::DpCaps {
+        lanes: 2,
+        rate: crate::dp_link_training::LinkRate::Hbr3,
+        uhbr: 0,
+        fec: true,
+        dsc: None,
+    };
+    let uhd = uhd60_edid(2);
+    let fhd = fhd60_edid();
+    let old = super::super::select_mst_dsc(
+        0,
+        caps,
+        &[(CHILD_SINK, uhd.clone(), u16::MAX)],
+        &|_| None,
+        &|s, a| super::super::topology::path_budget(&topology, s, a).unwrap_or(0),
+        &ctx,
+        &[],
+    )
+    .unwrap()[0];
+    assert!(old.dsc.is_some());
+    let timing = modeset::edid_timings(&fhd)[0];
+    let available = super::super::topology::path_budget(
+        &topology,
+        grand,
+        &[(CHILD_SINK, old.mst.unwrap().pbn)],
+    )
+    .unwrap();
+    let raw = super::super::raw_mst_stream(&timing, &fhd, caps, Some((grand, &ctx))).unwrap();
+    assert!(
+        raw.pbn > available,
+        "fixture must need released shared-hop PBN"
+    );
+    let mut joining = old;
+    joining.timing = timing;
+    joining.dsc = None;
+    joining.mst.as_mut().unwrap().sink = grand;
+    let soc = dark_candidate_soc();
+    let devices = [(CHILD_SINK, uhd, u16::MAX), (grand, fhd.clone(), u16::MAX)];
+    let mut actual = [old, joining];
+    super::super::refine_mst_link_payloads(&soc, 0, caps, &devices, &ctx, &mut actual, &[])
+        .unwrap();
+    assert!(actual[0].mst.unwrap().pbn < old.mst.unwrap().pbn);
+    assert!(actual[1].mst.unwrap().pbn > available);
+    assert!(actual[1].dsc.is_none());
+    modeset::admit_native_modes(
+        &soc,
+        &actual
+            .iter()
+            .map(modeset::selection_mode)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    assert!(super::super::dark_mst_modes_in_order(
+        &soc,
+        0,
+        caps,
+        &fhd,
+        available,
+        &[old],
+        Some((grand, &ctx)),
+        &[CHILD_SINK, grand]
+    )
+    .contains(&timing));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-mst",
+    navi48_mst_dark_raw_sink_uses_recomputed_shared_budget
+);

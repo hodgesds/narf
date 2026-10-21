@@ -346,8 +346,13 @@ sent-timeout policy with retained failure ownership. Suspend gates/drains
 presenter and cursor pins, retires all display streams, and retains incomplete
 transitions through caller cancellation and rollback. An opt-in
 `cargo xtask gpu-reference` command checks primary harnesses against an
-explicit clean Linux Git revision. Remaining memory-pressure, reset/registry,
-admission-aware DSC mode selection and physical board acceptance work stays open.
+explicit clean Linux Git revision. KMS preparation now snapshots exact targets,
+reclaims idle BOs without evicting another target, and rechecks master/identity
+before pinning. Per-card placement admission covers allocation, submission,
+transfer and reset; stale or cancelled transfers retain their staging/backing
+until actual completion or a proven reset. DSC depth/link fallback uses final
+native admission and complete MST payloads. Physical board acceptance and the
+GPU WC mapping follow-up after its separate TCB prerequisite remain open.
 
 Implemented: GDDR6 training; PSP14 SOS/GPCOM/TMR; mandatory graphics/media
 firmware parsing, upload and autoload; GC12 RS64 counter programming and pipe

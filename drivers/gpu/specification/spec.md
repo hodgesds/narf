@@ -115,10 +115,27 @@ stay fixed; TLB sequences advance before another submission can run.
 The card gate spans native queue publication, `note_job`, and reservation-fence
 attachment. Dependency waits precede gate acquisition. User GEM_VA ioctls park
 for this gate through `dispatch_async`; synchronous dispatch reports Busy on
-contention. Synchronous pressure eviction also takes this gate without
-waiting; while placement is protected, ordinary allocation can use its GTT
-fallback rather than move a protected buffer. `amdgpu_gem::dispatch_async` retries a strict VRAM create after
+contention. GEM_CREATE and native CREATE_DUMB take admission before even
+their fast allocation path: sync entry tries the gate (Busy on contention),
+and async entry parks, then borrows that one guard across heap lookup,
+reservation/zeroing, reclaim and CARD_OBJECTS/handle publication. Lookup's
+opportunistic promotion also requires a successful nonblocking live guard;
+an already-admitted VM/CS caller retains current backing until its coordinated
+move. No client can repopulate a heap after reset's eviction snapshot or
+continue allocating through a captured heap after it is withdrawn.
+`amdgpu_gem::dispatch_async` retries a strict VRAM create after
 reclaiming GPU-mapped buffers; ordinary allocations retain GTT fallback.
+Placement exclusion is one permanent mutex/readiness cell per append-only DRM
+card registration, published once under a short lookup lock. The cell and
+lookup slot are fallibly allocated on first admission and retained for the
+card's lifetime; permanent reset quarantine cannot block an unrelated card.
+Client paths use `lock_placement_live` (or synchronous `try_placement_live`):
+terminal `mark_placement_lost` wakes every already-queued client and refuses
+new placement, VA, allocation and KMS work with NoDevice, even when an unsafe
+reset must retain its guard forever. Cancellation removes both mutex and
+loss waiters. Temporary suspend retains exclusion without marking loss;
+successful resume releases it normally. Internal reset code may retain the
+infallible guard API; close and release do not require new placement admission.
 Unregistered VM mappings, deferred CPU user-fence writes and legacy raw
 address leases (`GemMapping`, `mmap_lifetime`) still pin backing. GEM and
 PRIME `mmap_backing` instead return a revocable `CpuMap` token
@@ -1518,9 +1535,13 @@ odm") is answered by Linux DML21 and replayed by
 the modeset, platform and MST admission call) also refuses (`Unsupported`)
 an ODM split whose other horizontal boundaries, segment widths
 (OPTC_SEGMENT_WIDTH) or segment memories the native OTG cannot take
-(`dml::odm_timing_ok`); Linux leaves them a TODO. `dml::dsc_shape(timing,
-slices, dispclk_max_khz) -> Option<pipes>` is the DSC policies' native
-shape check (up to four DSC401s of four slices and 5184 pixels each).
+(`dml::odm_timing_ok`); Linux leaves them a TODO. Native modeset, boot,
+platform and plane admission also validate DSC401's limits against the
+**final** `Plan::pipes`: at most four slices and 5184 pixels per DSC, slices
+split evenly, and twelve slices for ODM 3:1. DML's generic 5760-pixel limit
+alone is insufficient. `dml::dsc_shape(timing, slices, dispclk_max_khz)` is
+a conservative base-ODM diagnostic; candidate selection cannot use it to
+reject a stream before Vmin optimization or joint memory admission.
 
 MPC combine follows DML's auto `mpcc_combine_factor`, which DC leaves for
 DCN401 (`dml::Policy::NATIVE`; the older vector files replay with factor 1):
@@ -1825,19 +1846,25 @@ uncompressed setting carries the mode at `bpc`, and compresses with
 `dc_dsc_compute_config` against `dc_link_bandwidth_kbps` at the sink's
 maximum link: 4 lanes x the best UHBR rate (`uhbr_kbps`, 128b/132b
 encoding, FEC inherent, no FEC cap needed) when `DpCaps::uhbr` is nonzero,
-else the maximum 8b/10b link with FEC (FEC cap required). Its result must fit
-the pipes admission gives it (`dml::dsc_shape(timing, slices,
-dispclk_max_khz)`: DecideODMMode less downspread, up to ODM 4:1, twelve
-slices on three pipes), each DSC taking at most four slices of at most 5184
-pixels, so 8K takes two DSCs (four on a board whose DISPCLK two cannot cover).
+else the maximum 8b/10b link with FEC (FEC cap required). The result is a
+provisional link/decoder candidate; hardware shape is checked only after
+full admission chooses the actual ODM split. A 5440-pixel stream with four
+slices can therefore pass single-DP Vmin ODM 2:1 (2720 pixels per DSC) even
+though base ODM bypass exceeds DSC401's 5184 pixels. HDMI, multistream and
+memory-starved configurations must independently pass their actual plans.
 `dsc_link(timing, cfg, caps)` is the link for the compressed bandwidth
 (`dc_dsc_stream_bandwidth_in_kbps`, unpadded): the maximum 8b/10b link with
 FEC when it carries it, else the first 128b/132b setting upward, lanes before
 rate. A UHBR sink therefore never compresses onto 8b/10b (16 bpp is two
 thirds of 24 bpp, and 8b/10b with FEC carries less than two thirds of UHBR10
 at any lane count), and uncompressed UHBR always wins over DSC at the same
-depth. `refine_dsc` redoes both with the board's DISPCLK, from the selected
-depth down (a depth whose DSC shape the board cannot run falls to the next). A compressed UHBR stream carries no
+depth. Configuration admission regenerates candidates with the board's
+DISPCLK and searches complete configurations from the selected depth down.
+A final shape, pipe or memory-admission failure tries the next depth,
+including raw output when it fits. Fixed running streams retain their exact
+selection during beside admission. A leading-prefix fallback returns only
+its normalized selections and matching plans; a rejected stale suffix is
+never re-admitted by a later DML-only pass. A compressed UHBR stream carries no
 audio. Fallback keeps the admitted PPS (`selected_dp_candidates`): Linux's
 `dp_lt_fallbacks` through its 128b/132b settings that carry the compressed
 stream for a UHBR link, narf's 8b/10b ladder for an 8b/10b one. DML21
@@ -1889,8 +1916,12 @@ compressed vectors against Linux built on the host; `tests/dcn401_dsc/
 check.sh` replays 3000 FRL DSC configurations and 890 CVTEM packet sets.
 `modeset::hdmi_stream` selects the stream (RGB at 12, 10 then 8 bpc, raw or
 compressed, then 4:2:0 raw, as Linux orders encodings and depths;
-`frl_dsc(.., bpc)` compresses at a depth); `refine_dsc` redoes the FRL DSC
-from the selected depth down with the board's DISPCLK; `frl_video_params` gives the HPO FRL video request's
+`frl_dsc(.., bpc)` compresses at a depth). `Selection::frl_caps` retains the
+sink's HDMI decoder/depth/subsampling caps and verified raw FRL cap, alongside
+the chosen link rate. Final configuration admission retries those candidates
+from the selected depth down with the board's DISPCLK; a shallower raw
+candidate can use the retained cap even when the first DSC candidate chose
+a slower rate. `frl_video_params` gives the HPO FRL video request's
 `FrlVideoRequest { audio_packets_line, borrow, hc_active, hc_blank }`.
 Lighting runs link_set_dsc_on_stream's FRL order after training: the pipe's
 DSC engines, then `hpo_enc401_hdmi_set_dsc_config` (`frl_dsc_start`:
@@ -1910,8 +1941,14 @@ DP MST DSC follows amdgpu_dm and DRM on both encodings.
 `DscLink { encoding, kbps, slots, max_dispclk_khz }`, `DscStream { sink,
 timing, dsc, bpc }` (the stream's depth: its uncompressed bandwidth and DSC
 input) and `DscPayload { pbn, slots, dsc }`; `fits` is the topology's
-per-hop PBN check and `native` the display pipeline's DSC shape (`dml::dsc_shape`: up to four
-ODM pipes of four slices). `tests/dcn401_dsc/check.sh` replays 1500
+per-hop PBN check and `native` a provisional decoder configuration. At each
+complete depth combination, native selection recomputes whole-link fairness
+in stable device-slot order with the board's real DISPCLK, then admits every stream's
+resulting DSC and plane topology jointly. Actual final `Plan::pipes`
+determine the DSC401 shape; theoretical Vmin support grants no permission.
+A beside operation whose fairness changes a fixed stream's PBN, slots or
+DSC returns `BesideRefusal::DscFairness` for a relight. The no-decoder raw
+MST path keeps requested-depth PBN accounting. `tests/dcn401_dsc/check.sh` replays 1500
 mst_vectors.txt links through Linux's own fairness functions (mst_harness.c)
 and 1200 mst_depth_vectors.txt links of 8-, 10- and 12-bpc streams (built
 with `STREAM_BPC`);
@@ -1924,7 +1961,15 @@ passthrough, end_link_kbps, branch_oui }`, `port_supports_mode(t, bpc, ..)` is
 `dm_dp_mst_is_port_support_mode` at the stream's depth, and `set_rx` is
 `dm_helpers_dp_write_dsc_enable` (passthrough 2 before decoder 1; disable
 reverse) through `dp_mst_mgr::Manager::remote_dpcd_read/write`. Selection
-and offered modes run the fairness search jointly across the branch, each
+and offered modes run the fairness search jointly across the branch. Dark
+and lit MST alternatives validate all recomputed payloads against the other
+ports' streams; a joining payload is never checked beside stale earlier DSC
+configurations. Dark alternatives use the same stable device-slot order as
+actual selection, even after topology reordering. Complete recomputation uses
+each port's raw availability and the new other payloads; only additive raw
+admission uses the old remaining path budget. A raw-only joining sink can be
+admitted after existing DSC streams shrink. Every offered candidate retains
+the current plane geometry and overlays. Candidates are independent proposals, not reservations. Each
 end device at the deepest of its depths (`dp_depths` up to
 `MstDscContext::max_bpc`, create_validate_stream_for_sink's loop) that the
 port and the joint search take; such a stream leaves at that depth
@@ -4878,10 +4923,10 @@ that happened to land contiguous keeps its start); NARF's placements are
 all contiguous, so it applies from creation. The pin never moves a
 buffer: amdgpu_bo_pin's validation (a buffer in system memory moving back
 to VRAM, which waits for its jobs and copies it whole) runs before, in the
-async `drm_ioctl_bridge::amdgpu_prepare_scanout` (below), never under the
-KMS spinlock. `amdgpu_gem::prepare_scanout` returns a `ScanoutPreparation`
-guard retaining the card's placement exclusion, which `DriCardFile::ioctl_user`
-keeps through the synchronous KMS commit. It protects already-resident BOs
+async `drm_ioctl_bridge::amdgpu_kms_async` (below), never under the
+KMS spinlock. `amdgpu_gem::prepare_scanout` returns
+`Result<ScanoutPreparation, FsError>`; success retains the card's placement
+exclusion through the synchronous KMS commit. It protects already-resident BOs
 as well as promoted ones: asynchronous movers park, and synchronous pressure
 cannot evict between validation and `PreparedFbs::prepare` acquiring pins.
 Success, refusal and cancellation release the guard; successful KMS pins
@@ -4892,7 +4937,7 @@ CPU-accessible buffer is only ever placed in visible VRAM (amdgpu_bo_pin
 forces CPU_ACCESS_REQUIRED for one; NARF puts only NO_CPU_ACCESS buffers
 past the BAR), and the pin refuses one found past the BAR. `ScanoutPin` (amdgpu_bo_unpin on drop) keeps the
 buffer and its placement: while any pin lives `GemObject::pinned` stops
-`relocate`, `commit_transfer`, pressure eviction (`evict_visible`) and
+`relocate`, `commit_transfer`, pressure eviction (`evict_visible_locked`) and
 `amdgpu_vm::relocate`, and `evict_all` passes the buffer by (TTM's LRU walk
 does not see pinned buffers). The presenter frame (`PlaneFrame::bo`) carries
 the pin; it waits up to 5 s for the buffer's WRITE fences
@@ -4972,8 +5017,8 @@ GEM table (Linux's per-file handle space; the card's dumb table holds
 none). It is stored as amdgpu_bo_create leaves it: VRAM_WIPE_ON_RELEASE
 added, the CPU_ACCESS_REQUIRED hint dropped, alignment 0 (GEM_OP), allowed
 domains VRAM | GTT. Full visible VRAM first evicts idle unmapped buffers
-(`evict_visible`), and from a user open (`amdgpu_create_dumb_async`,
-`amdgpu_gem::create_dumb_async`) mapped ones too (`reclaim_vram`, shared
+(`evict_visible_locked`), and from a user open (`amdgpu_create_dumb_async`,
+`amdgpu_gem::create_dumb_async`) mapped ones too (`reclaim_vram_locked`, shared
 with GEM_CREATE's strict path); there is no GTT fallback, so it is then
 ENOMEM. MAP_DUMB and DESTROY_DUMB of one of an open's amdgpu GEM handles,
 on any amdgpu card, are amdgpu_mode_dumb_mmap (`GemState::map_dumb`: the
@@ -4982,15 +5027,46 @@ drm_gem_handle_delete (`destroy_dumb`); other handles fall through to the
 card's table. mmap of the offset is the revocable CPU-mapping backing
 (`cpu_mapping::backing`) over the buffer's BAR window, which follows the
 buffer when it moves. ADDFB2 of the handle is `amdgpu_addfb2_bo`, so
-showing it pins it and scans it out in place as above. Before a SETCRTC,
-PAGE_FLIP, SETPLANE or atomic commit, the open's framebuffer buffers that
-left VRAM (suspend's evict_all, eviction for another allocation) and are
-not pinned move back (`drm_ioctl_bridge::amdgpu_prepare_scanout`,
-`amdgpu_gem::prepare_scanout` through `amdgpu_vm::relocate`, CPU mappings
-following), as amdgpu_bo_pin's validation in prepare_fb migrates them, and
-so does a legacy CURSOR/CURSOR2's buffer (its handle in the ioctl); a
-buffer that cannot move is refused at the pin, failing the commit with
-ENOMEM. Legacy CURSOR/CURSOR2 with one of the open's GEM handles wraps that
+showing it pins it and scans it out in place as above. Native amdgpu user
+KMS requests go through `drm_ioctl_bridge::amdgpu_kms_async`: SETCRTC,
+PAGE_FLIP, SETPLANE, ATOMIC, SETPROPERTY/OBJ_SETPROPERTY and CURSOR/CURSOR2.
+The bridge checks DRM master before any guarded user copy, then copies the
+supported request once into owned storage before awaiting. ATOMIC retains
+the existing bounds (256 objects, 4096 properties) and guarded copies every
+nested array. Target resolution and commit use that same snapshot; no
+request header, property array, connector id or cursor handle is reread
+after migration. TEST_ONLY neither acquires placement admission nor migrates.
+SETCRTC/PAGE_FLIP/SETPLANE prepare only their named enabled framebuffer;
+atomic and plane-property requests prepare each touched plane's final
+enabled framebuffer after inheriting its current FB_ID/CRTC_ID. Disables
+prepare nothing. Framebuffer lookup is global, as the commit's lookup is:
+another open's framebuffer and a legacy cursor's internal framebuffer are
+valid targets for the current master; their owning open controls cleanup.
+A legacy cursor BO update captures only its own open's handle through
+`GemState::object_unvalidated` (no opportunistic promotion), while a
+MOVE-only request inherits the cursor plane's current framebuffer.
+
+Placement admission precedes the inherited-state snapshot, then the KMS
+spinlock is released before any wait or migration. Before migration, the
+owned request passes the commit's ordinary checks: atomic/property requests
+use a TEST_ONLY view, SETCRTC/PAGE_FLIP/SETPLANE stop at their existing pin
+boundary, and cursor requests validate own-open source/shape and native
+cursor checks. Invalid properties, objects, handles, geometry or flags do
+not move a valid BO or reclaim another. SETCRTC preserves the bridge's current
+behavior of presenting any nonzero fb_id even with mode_valid zero; SETPLANE
+disables only for fb_id zero. A nonzero FB with an absent CRTC is refused.
+Targets outside VRAM move
+through `amdgpu_vm::relocate`, with CPU mappings following. If necessary,
+`reclaim_vram_locked` evicts idle BOs under the same borrowed placement guard,
+excluding the complete target set (including BOs already promoted by this
+request), pinned scanout and busy jobs. Failure propagates before any KMS
+state, event or pin handoff changes. The actual commit rechecks current DRM
+master and every target's framebuffer id/BO identity under the Card lock;
+changed inherited state or identity is Busy, revoked master PermissionDenied.
+The guard remains through `PreparedFbs` pinning, including already-resident
+BOs, and releases on success, error or cancellation. Hotplug reuses the
+presenter's already-pinned `PlaneFrame`; it does not promote an open's idle
+framebuffers. Legacy CURSOR/CURSOR2 with one of the open's GEM handles wraps that
 buffer (`drm_ioctl_bridge::amdgpu_cursor_bo`, `Card::addfb2_bo` with no
 owning open, so drm_fb_release leaves it). `tests/amdgpu_dumb/check.sh`
 builds drm_mode_create_dumb, amdgpu_mode_dumb_create,
@@ -5000,10 +5076,8 @@ checks 1277 vectors, replayed by `amdgpu_dumb_layout_matches_linux_vectors`.
 Deviations: a user CPU mapping of VRAM is not write-combined (NARF's user
 page tables carry no caching attribute: x86_64 leaves it to the MTRRs,
 uncached for the BAR on real boards; aarch64 maps Normal), and a GTT
-placement is not USWC; the migration back to VRAM runs before the commit
-rather than inside the pin, and without evicting other buffers to make
-room, and only for the open's own framebuffers and a legacy cursor's
-buffer (a commit naming another open's evicted framebuffer fails ENOMEM);
+placement is not USWC; migration back to VRAM runs before the commit
+rather than inside the pin;
 DRM_MODE_CREATE_DUMB from the render node keeps the card's table.
 SETCRTC admits such a framebuffer as a placed primary
 (`drm_native_planes::setcrtc_planes`), PAGE_FLIP requests the display's
@@ -7437,15 +7511,53 @@ paths; only the tables differ.
   queued in the same FIFO as clears so no copy overtakes an earlier clear.
   A copy travels alone in its job; an upload stages its chunk under the
   platform owner just before queueing, followed by an HDP flush, so a
-  copy requeued by an SDMA0 reset re-stages. Each chunk's fence is added
-  to the buffer's KERNEL reservation and retains its source/destination
-  until it leaves the ring; a refused, timed-out (5 s) or post-reset chunk
-  fails the move without releasing either placement.
+  copy requeued by an SDMA0 reset re-stages. Each queued/inflight request
+  independently retains its source/destination, GEM identity and window
+  (`Arc<Stage>`), and its fence is added to the buffer's KERNEL reservation.
+  A refused, timed-out (5 s) or lost-generation chunk fails the move with
+  the original placement/PTEs intact; requests that hardware may still
+  reach retain their backing. A generic lost-device fence wakeup does not
+  prove a copy landed: migration returns `NoDevice`, and unreadable generic
+  clear/copy fences stay pending until a real completed sequence or explicit
+  retirement. CS propagates uncertain transfer/hardware errors before user
+  queue publication rather than treating them as allocation fallback.
+  Upload rechecks the live owner/generation after its final chunk/yield
+  before returning. Completion waits retire proven inflight leases under
+  the platform owner before placement commit, with backing drops outside
+  the state spinlock. The independent queue task also collects its final
+  inflight requests after a waiter is cancelled; bounded sleeps release the
+  owner, and unreadable progress keeps collecting without inferring stop.
+  The clearer records the owner generation. Under the same owner mutex
+  that excludes reset/power transitions, it validates that generation and
+  its live progress reader before CPU staging, then stages/flushes and
+  submits without an intervening await. Old-generation queues cannot
+  write their window or invoke stale progress MMIO. They refuse only
+  unsubmitted requests; inflight leases stay retained. Quiesce withdraws
+  the mover after suspend's eviction and reader invalidation, retaining
+  the old queue in `ResetClearer` until a completed whole-device reset
+  proves its DMA stopped. That proof explicitly retires the queue's shared
+  queued/inflight state and marks its fences failed even if stale callers
+  retain another queue clone; backing drops run outside its state spinlock.
+  Failed/cancelled reset quarantines that queue alongside its device owner;
+  registry removal cannot free its inflight resources. This applies even
+  with the whole VRAM BAR-visible.
+  Whole-device recovery and suspend acquire the card's live placement
+  admission before the platform owner, so no reset can interleave the final
+  upload validation with the coordinator's synchronous backing/PTE commit.
+  Suspend closes admission before draining submitted jobs and evicting,
+  and carries the same guard through quiesce, parked S3/BACO and resume.
+  The guard stays held through fresh-owner publication. Abandonment before
+  a full-reset proof quarantines it; abandonment after proof may release
+  it but marks that card terminal either way. Fallible client admission
+  wakes existing waiters with `NoDevice` and refuses new ones; CS checks
+  terminal loss during its pre-admission dependency waits too. A temporary
+  suspend does not mark loss. Gate acquisition never awaits under the
+  platform owner, including suspend's failed-retirement recovery path.
   GFX12 DCC buffers (AMDGPU_GEM_CREATE_GFX12_DCC on a card registered by
   `amdgpu_gem::set_gfx12_dcc`: VRAM holds them compressed) never move by
   CPU copy (`amdgpu_gem::moves_by_engine`): `GemObject::relocate` and the
   CPU-mapping move refuse them (Busy), and `amdgpu_vm::relocate` (evict_all,
-  reclaim_vram, prepare_scanout) moves them from any VRAM, visible or past
+  reclaim_vram_locked, prepare_scanout) moves them from any VRAM, visible or past
   the BAR, through the card's transfer engine with
   amdgpu_ttm_copy_mem_to_mem's copy flags (`amdgpu_gem::ttm_copy_flags`):
   READ_DECOMPRESSED out of VRAM, WRITE_COMPRESSED with the buffer's tiling
@@ -7454,7 +7566,9 @@ paths; only the tables differ.
   word (the stage stands in for the GTT side, so it takes neither flag).
   The platform registers that mover (`amdgpu_gem::register_vram_transfer`)
   whether or not the card has VRAM past the BAR, and it stays registered
-  while suspend withdraws the heap. Without an engine, or for a CPU-mapped
+  through suspend's eviction with the heap withdrawn; quiesce then removes
+  it, and a successfully restarted owner publishes a fresh mover. Without
+  an engine, or for a CPU-mapped
   DCC buffer (whose mapping would have to follow a frozen CPU copy), the
   move fails and the buffer stays; suspend then fails cleanly (Busy) rather
   than corrupt it. Deviation: Linux unmaps a CPU-mapped buffer and moves it
@@ -7696,7 +7810,7 @@ the client VRAM heap and evicts every client VRAM buffer to system memory
 buffer's allowed domains with GTT for the move and waiting for its jobs;
 a buffer still pinned stays in VRAM, as it is not on TTM's LRU; the card is
 an LRU card, `amdgpu_gem::set_lru_eviction` from `publish_client_vram`, so
-this walk, like pressure's `evict_visible` and `reclaim_vram`, covers
+this walk, like pressure's `evict_visible_locked` and `reclaim_vram_locked`, covers
 every live buffer of the card, `CARD_OBJECTS`, including one only a
 framebuffer holds after CREATE_DUMB, ADDFB2 and closing the handle; other
 cards keep walking their opens' handle tables),
@@ -7710,7 +7824,7 @@ mode1 + post when SOS survived), replays GDDR6 training and brings up a
 fresh owner as recovery does, then restores the widened domains; buffers
 stay in system memory until validation promotes them (a framebuffer's
 buffer, a dumb one included, at its next commit's
-`amdgpu_prepare_scanout`). The interrupt-gated
+`amdgpu_kms_async`). The interrupt-gated
 device-PM handler accepts the native RX 9000 owner only while async prepare
 holds it (`system_suspended()`). Suspend/resume transitions are serialized by
 `PM_TRANSITION`. Their pinned retained future is polled inline, including by

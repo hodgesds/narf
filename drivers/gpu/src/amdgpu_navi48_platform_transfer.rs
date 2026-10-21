@@ -9,10 +9,11 @@
 //! the buffer's tiling-flag DCC parameters (sdma_v7_0_emit_copy_buffer's
 //! DCC word), as Linux's move blit reads and writes it.
 use super::*;
-use narf_filesystem::{dma_buf::DmaResvUsage, DrmFence, FsError};
+use narf_filesystem::{dma_buf::DmaResvUsage, FsError};
 
-/// The kernel's CPU-mapped transfer window. Never recycled: a cancelled
-/// mover may leave SDMA0 reading or writing it until its fence passes.
+/// The kernel's CPU-mapped transfer window. Each queued/inflight request
+/// retains it independently of its mover or caller. Once its last owner
+/// drops, the published reservation stays retired until a proven reset.
 struct Stage {
     _window: crate::amdgpu_vram::Reservation,
     address: u64,
@@ -93,21 +94,49 @@ impl VramClearer {
     }
 }
 
-/// The chunk's fence, bounded like the RX 6000 mover. A refused job (device
-/// gone or unstageable source) is an error, never a completed copy.
-async fn await_done(done: &ClearFence) -> Result<(), FsError> {
-    use core::sync::atomic::Ordering;
+/// Transfer completion needs a same-generation hardware sequence. The
+/// generic fence's lost-device wakeup releases waiters but cannot prove
+/// that the copy landed. A blocked ring must not be sampled.
+fn completed(done: &ClearFence, blocked: bool) -> Result<bool, FsError> {
+    if done.gone.load(Ordering::Acquire) {
+        return Err(FsError::NoDevice);
+    }
+    if blocked {
+        return Ok(false);
+    }
+    let progress = (done.progress)().ok_or(FsError::NoDevice)?;
+    let seq = done.seq.load(Ordering::Acquire);
+    Ok(seq != u64::MAX && progress.wrapping_sub(seq as u32) as i32 >= 0)
+}
+
+/// The chunk's fence, bounded like the RX 6000 mover. A refused job or a
+/// lost generation is an error, never a completed copy.
+async fn await_done(clearer: &VramClearer, done: &ClearFence) -> Result<(), FsError> {
     let deadline = narf_time::monotonic_ns().saturating_add(5_000_000_000);
-    while !done.is_signalled() {
+    loop {
+        if completed(done, crate::amdgpu_navi48_interrupts::blocked())? {
+            let owner = OWNER.lock().await;
+            owner.as_ref().ok_or(FsError::NoDevice)?;
+            if crate::amdgpu_navi48_interrupts::blocked() {
+                return Err(FsError::NoDevice);
+            }
+            let progress = clearer.live_progress()?;
+            let seq = done.seq.load(Ordering::Acquire);
+            if done.gone.load(Ordering::Acquire) {
+                return Err(FsError::NoDevice);
+            }
+            // A partial-ring reset can requeue a previously sampled slot.
+            // Recheck its current sequence under OWNER before retirement.
+            if seq != u64::MAX && progress.wrapping_sub(seq as u32) as i32 >= 0 {
+                clearer.retire_completed(progress);
+                return Ok(());
+            }
+        }
         if narf_time::monotonic_ns() >= deadline {
             return Err(FsError::TimedOut);
         }
         narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant()).await;
     }
-    if done.gone.load(Ordering::Acquire) {
-        return Err(FsError::NoDevice);
-    }
-    Ok(())
 }
 
 impl Mover {
@@ -115,7 +144,7 @@ impl Mover {
     async fn settle(&self) -> Result<(), FsError> {
         let last = self.stage.last.lock().clone();
         if let Some(last) = last {
-            await_done(&last).await?;
+            await_done(&self.clearer, &last).await?;
         }
         Ok(())
     }
@@ -125,6 +154,7 @@ impl Mover {
         work: Work,
         held: Arc<dyn Send + Sync>,
     ) -> Result<Arc<ClearFence>, FsError> {
+        let held = Arc::new((held, self.stage.clone())) as Arc<dyn Send + Sync>;
         let done = self.clearer.enqueue(work, held)?;
         object
             .dma_buf()
@@ -156,7 +186,7 @@ impl Mover {
                 upload: None,
             };
             let done = self.queue(object, work, held)?;
-            await_done(&done).await?;
+            await_done(&self.clearer, &done).await?;
             {
                 let owner = OWNER.lock().await;
                 let boot = owner.as_ref().ok_or(FsError::NoDevice)?;
@@ -210,10 +240,20 @@ impl Mover {
                 upload: Some((source.clone(), offset, self.stage.virt)),
             };
             let done = self.queue(object, work, held)?;
-            await_done(&done).await?;
+            await_done(&self.clearer, &done).await?;
             offset += bytes;
             narf_scheduler::yield_now().await;
         }
+        // A reset may have happened after the final chunk signalled but
+        // before this task resumed. Validate under OWNER before relocation
+        // can publish the new placement/PTEs; the old source stays intact
+        // on a lost generation.
+        let owner = OWNER.lock().await;
+        owner.as_ref().ok_or(FsError::NoDevice)?;
+        if crate::amdgpu_navi48_interrupts::blocked() {
+            return Err(FsError::NoDevice);
+        }
+        self.clearer.with_live_progress(|| Ok(()))?;
         Ok(())
     }
 }
@@ -243,3 +283,7 @@ impl crate::amdgpu_gem::VramTransfer for Mover {
         )
     }
 }
+
+#[cfg(feature = "kernel-test")]
+#[path = "amdgpu_navi48_transfer_tests.rs"]
+mod tests;

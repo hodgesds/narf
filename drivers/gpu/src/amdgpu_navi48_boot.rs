@@ -2170,7 +2170,7 @@ impl ColdBoot {
         mode: &crate::amdgpu_dcn401_dml::Mode,
     ) -> Result<crate::amdgpu_dcn401_dml::Plan, otg::Error> {
         let soc = self.display_soc()?;
-        crate::amdgpu_dcn401_dml::admit_native(&soc, core::slice::from_ref(mode))
+        modeset::admit_native_modes(&soc, core::slice::from_ref(mode))
             .map(|plans| plans[0])
             .map_err(otg::Error::Admission)
     }
@@ -4066,6 +4066,7 @@ pub use mst::{
 };
 #[path = "amdgpu_navi48_modeset.rs"]
 mod modeset;
+pub(crate) use modeset::admit_native_modes;
 #[path = "amdgpu_navi48_teardown.rs"]
 mod teardown;
 pub use modeset::{

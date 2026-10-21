@@ -1145,10 +1145,16 @@ fn scanout_preparation_excludes_pressure_until_kms_pins() -> TestResult {
         narf_scheduler::block_on_spin(prepare_scanout(CARD, alloc::vec![a.clone(), b.clone()]));
     assert!(!a.system() && !b.system() && !a.pinned());
     assert_eq!(pool.available(), 0);
-    // The synchronous create normally evicts an unleased BO here.
-    // During preparation it must use GTT instead of invalidating KMS.
-    let c = state.get(create(&state, 4096, domains)).unwrap();
-    assert!(c.system() && !a.system() && !b.system());
+    // Even fast creation must observe the gate: a reset may already have
+    // captured the eviction list and be withdrawing this same heap.
+    let mut blocked = [0u8; 32];
+    blocked[..8].copy_from_slice(&4096u64.to_le_bytes());
+    blocked[16..24].copy_from_slice(&domains.to_le_bytes());
+    assert_eq!(
+        super::create(&state, blocked.as_mut_ptr() as usize),
+        Err(FsError::Busy)
+    );
+    assert!(!a.system() && !b.system());
     assert!(try_placement(CARD).is_none());
     // A competing move parks. Cancelling that waiter must not wedge the
     // admission lock when preparation hands protection over to a real pin.
@@ -1160,10 +1166,10 @@ fn scanout_preparation_excludes_pressure_until_kms_pins() -> TestResult {
     let pin = a.pin_scanout().unwrap();
     drop(preparation);
     assert!(try_placement(CARD).is_some());
-    evict_visible(CARD, || false);
+    evict_visible_locked(&try_placement(CARD).unwrap(), || false);
     assert!(!a.system() && b.system());
     drop(pin);
-    evict_visible(CARD, || false);
+    evict_visible_locked(&try_placement(CARD).unwrap(), || false);
     assert!(a.system() && pool.available() == memory.len() as u64);
     TestResult::Pass
 }

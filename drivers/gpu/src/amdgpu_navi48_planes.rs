@@ -244,7 +244,7 @@ impl ColdBoot {
                 }
             })
             .collect();
-        let Ok(plans) = dml::admit_native(&soc, &modes) else {
+        let Ok(plans) = admit_native_modes(&soc, &modes) else {
             return Ok(None);
         };
         let plan = plans[i];

@@ -1018,7 +1018,7 @@ pub(super) fn dsc_link(caps: modeset::DpCaps, max_dispclk_khz: u32) -> Option<ds
 
 /// The stream's VC rate for `kbps` (its dc_bandwidth_in_kbps_from_timing):
 /// a compressed one's compressed bandwidth.
-fn mst_vc_rate_dsc(
+pub(super) fn mst_vc_rate_dsc(
     timing: &Timing,
     cfg: &crate::amdgpu_dsc::DscConfig,
     lanes: u8,
@@ -1204,6 +1204,7 @@ fn select_mst_dsc(
             limited: false,
             ycbcr420: false,
             frl: None,
+            frl_caps: None,
             dsc: p.dsc,
             mst: Some(modeset::MstStream {
                 sink: *sink,
@@ -1340,6 +1341,7 @@ fn select_mst_with_budget(
             limited: false,
             ycbcr420: false,
             frl: None,
+            frl_caps: None,
             dsc: None,
             mst: Some(modeset::MstStream {
                 sink: *sink,
@@ -1592,6 +1594,7 @@ pub(super) fn dark_mst_modes(
 /// (compute_mst_dsc_configs_for_link) beside the running ones, so a mode
 /// that fits only compressed is offered when that search, the device's
 /// available PBN and DML admission of the compressed mode allow it.
+#[cfg(feature = "kernel-test")]
 pub(super) fn dark_mst_modes_with(
     soc: &crate::amdgpu_dcn401_dml::Soc,
     port: usize,
@@ -1601,50 +1604,41 @@ pub(super) fn dark_mst_modes_with(
     lit: &[Selection],
     dsc: Option<(dp_mst_mgr::Sink, &MstDscContext<'_>)>,
 ) -> Vec<Timing> {
-    let compressed = |t: &Timing| -> Option<crate::amdgpu_dcn401_dml::Mode> {
-        let (sink, ctx) = dsc?;
-        let decoder = (ctx.dsc_of)(sink)?;
-        let link = dsc_link(caps, soc.dispclk_max_khz)?;
-        let lit_streams: Vec<_> = lit
-            .iter()
-            .filter(|s| s.port == port)
-            .filter_map(|s| {
-                let m = s.mst?;
-                Some(dsc::DscStream {
-                    sink: m.sink,
-                    timing: s.timing,
-                    dsc: (ctx.dsc_of)(m.sink).map(|d| d.caps),
-                    bpc: modeset::depth_bpc(s.depth),
-                })
-            })
-            .collect();
-        let fits =
-            |alloc: &[(dp_mst_mgr::Sink, u16)]| alloc.last().is_some_and(|a| a.1 <= available);
-        // The deepest of the device's depths the port and the link's
-        // fairness search take, as for a lit stream (`select_mst_dsc`).
-        let payload = modeset::dp_depths(edid, (ctx.max_bpc)(sink))
+    let order = dsc.map_or_else(Vec::new, |(_, ctx)| ctx.topology.sinks());
+    dark_mst_modes_in_order(soc, port, caps, edid, available, lit, dsc, &order)
+}
+
+/// Production ordering is the stable device-slot order used by selection
+/// and final link normalization, which may differ from a reordered topology.
+#[allow(clippy::too_many_arguments)]
+fn dark_mst_modes_in_order(
+    soc: &crate::amdgpu_dcn401_dml::Soc,
+    port: usize,
+    caps: modeset::DpCaps,
+    edid: &[u8],
+    available: u16,
+    lit: &[Selection],
+    dsc: Option<(dp_mst_mgr::Sink, &MstDscContext<'_>)>,
+    order: &[dp_mst_mgr::Sink],
+) -> Vec<Timing> {
+    let compressed = |t: &Timing| -> bool {
+        let Some((sink, ctx)) = dsc else { return false };
+        modeset::dp_depths(edid, (ctx.max_bpc)(sink))
             .into_iter()
-            .find_map(|depth| {
-                let bpc = modeset::depth_bpc(depth);
-                if !dsc::port_supports_mode(t, bpc, ctx.topology, sink, Some(&decoder), &link) {
-                    return None;
-                }
-                let mut streams = lit_streams.clone();
-                streams.push(dsc::DscStream {
+            .any(|depth| {
+                compressed_mst_joint_modes(
+                    soc,
+                    port,
+                    caps,
+                    t,
+                    lit,
                     sink,
-                    timing: *t,
-                    dsc: Some(decoder.caps),
-                    bpc,
-                });
-                dsc::compute(&streams, &link, &fits)?.last().copied()
-            })?;
-        Some(crate::amdgpu_dcn401_dml::Mode {
-            dsc: payload.dsc.map(|c| crate::amdgpu_dcn401_dml::Dsc {
-                slices: c.slices_h,
-                bpp_x16: c.bpp_x16,
-            }),
-            ..modeset::mode(*t)
-        })
+                    ctx,
+                    order,
+                    modeset::depth_bpc(depth),
+                )
+                .is_some_and(|joint| modeset::admit_native_modes(soc, &joint).is_ok())
+            })
     };
     // Slots are the port's MST streams'; DML admission is every running
     // display's.
@@ -1663,22 +1657,204 @@ pub(super) fn dark_mst_modes_with(
         if offered.len() == modeset::MAX_MODES {
             break;
         }
-        let candidate = if raw_mst_stream(&t, edid, caps, dsc)
-            .is_some_and(|r| r.slots <= free && r.pbn <= available)
-        {
-            modeset::mode(t)
-        } else if let Some(m) = compressed(&t) {
-            m
-        } else {
-            continue;
-        };
-        joint.push(candidate);
-        if crate::amdgpu_dcn401_dml::admit_native(soc, &joint).is_ok() {
+        let raw = raw_mst_stream(&t, edid, caps, dsc)
+            .is_some_and(|r| r.slots <= free && r.pbn <= available);
+        joint.push(modeset::mode(t));
+        let raw_admitted = raw && modeset::admit_native_modes(soc, &joint).is_ok();
+        joint.pop();
+        if raw_admitted || compressed(&t) {
             offered.push(t);
         }
-        joint.pop();
     }
     offered
+}
+
+/// Recompute every payload in the native device order before joint DML.
+/// `available` after subtracting old allocations belongs only to additive
+/// raw admission: compressed fairness may release some of that old PBN.
+#[allow(clippy::too_many_arguments)]
+fn compressed_mst_joint_modes(
+    soc: &crate::amdgpu_dcn401_dml::Soc,
+    port: usize,
+    caps: modeset::DpCaps,
+    timing: &Timing,
+    lit: &[Selection],
+    sink: dp_mst_mgr::Sink,
+    ctx: &MstDscContext<'_>,
+    order: &[dp_mst_mgr::Sink],
+    bpc: u8,
+) -> Option<Vec<crate::amdgpu_dcn401_dml::Mode>> {
+    let decoder = (ctx.dsc_of)(sink);
+    let link = dsc_link(caps, soc.dispclk_max_khz)?;
+    if !dsc::port_supports_mode(timing, bpc, ctx.topology, sink, decoder.as_ref(), &link) {
+        return None;
+    }
+    let fits = |alloc: &[(dp_mst_mgr::Sink, u16)]| {
+        alloc.iter().enumerate().all(|(i, &(target, pbn))| {
+            let others: Vec<_> = alloc
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| i != j)
+                .map(|(_, &a)| a)
+                .collect();
+            let limit = ctx.topology.port(target).map_or(0, |p| p.available_pbn);
+            pbn <= limit.min(topology::path_budget(ctx.topology, target, &others).unwrap_or(0))
+        })
+    };
+    let mut streams: Vec<_> = lit
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.port == port)
+        .filter_map(|(k, s)| {
+            Some((
+                Some(k),
+                dsc::DscStream {
+                    sink: s.mst?.sink,
+                    timing: s.timing,
+                    dsc: (ctx.dsc_of)(s.mst?.sink).map(|d| d.caps),
+                    bpc: modeset::depth_bpc(s.depth),
+                },
+            ))
+        })
+        .collect();
+    streams.push((
+        None,
+        dsc::DscStream {
+            sink,
+            timing: *timing,
+            dsc: decoder.map(|d| d.caps),
+            bpc,
+        },
+    ));
+    if streams.iter().any(|(_, s)| !order.contains(&s.sink)) {
+        return None;
+    }
+    streams.sort_by_key(|(_, s)| order.iter().position(|&x| x == s.sink));
+    let input: Vec<_> = streams.iter().map(|(_, s)| *s).collect();
+    let payloads = dsc::compute(&input, &link, &fits)?;
+    let mut joint: Vec<_> = lit.iter().map(modeset::selection_mode).collect();
+    joint.push(modeset::mode(*timing));
+    for ((k, _), p) in streams.iter().zip(payloads) {
+        joint[k.unwrap_or(lit.len())].dsc = p.dsc.map(|c| crate::amdgpu_dcn401_dml::Dsc {
+            slices: c.slices_h,
+            bpp_x16: c.bpp_x16,
+        });
+    }
+    Some(joint)
+}
+
+/// Linux's complete topology-ordered link fairness for one depth combination.
+/// Native admission follows this normalization; an old reserved PBN is not a
+/// bound on a newly computed payload. Running beside streams retain ownership.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn refine_mst_link_payloads(
+    soc: &crate::amdgpu_dcn401_dml::Soc,
+    port: usize,
+    caps: modeset::DpCaps,
+    devices: &[(dp_mst_mgr::Sink, Vec<u8>, u16)],
+    ctx: &MstDscContext<'_>,
+    selections: &mut [Selection],
+    fixed: &[bool],
+) -> Result<(), BesideRefusal> {
+    let mut indices: Vec<_> = selections
+        .iter()
+        .enumerate()
+        .filter_map(|(k, s)| (s.port == port && s.mst.is_some()).then_some(k))
+        .collect();
+    if indices.is_empty() {
+        return Ok(());
+    }
+    if indices.iter().any(|&k| {
+        !devices
+            .iter()
+            .any(|d| Some(d.0) == selections[k].mst.map(|m| m.sink))
+    }) {
+        return Err(BesideRefusal::Other);
+    }
+    // Without a selected decoder Linux uses the raw MST allocation path:
+    // PBN stays sized for requested bpc even when the stream steps down.
+    if !indices
+        .iter()
+        .any(|&k| (ctx.dsc_of)(selections[k].mst.unwrap().sink).is_some())
+    {
+        return Ok(());
+    }
+    indices.sort_by_key(|&k| {
+        devices
+            .iter()
+            .position(|d| Some(d.0) == selections[k].mst.map(|m| m.sink))
+    });
+    let link = dsc_link(caps, soc.dispclk_max_khz).ok_or(BesideRefusal::Other)?;
+    let mut streams = Vec::new();
+    for &k in &indices {
+        let s = selections[k];
+        let m = s.mst.unwrap();
+        let dec = (ctx.dsc_of)(m.sink);
+        let bpc = modeset::depth_bpc(s.depth);
+        if !dsc::port_supports_mode(&s.timing, bpc, ctx.topology, m.sink, dec.as_ref(), &link) {
+            return Err(BesideRefusal::Other);
+        }
+        streams.push(dsc::DscStream {
+            sink: m.sink,
+            timing: s.timing,
+            dsc: dec.map(|d| d.caps),
+            bpc,
+        });
+    }
+    let fits = |alloc: &[(dp_mst_mgr::Sink, u16)]| {
+        alloc.iter().enumerate().all(|(i, &(sink, pbn))| {
+            let others: Vec<_> = alloc
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j != i)
+                .map(|(_, &a)| a)
+                .collect();
+            let available = devices.iter().find(|d| d.0 == sink).map_or(0, |d| d.2);
+            pbn <= available.min(topology::path_budget(ctx.topology, sink, &others).unwrap_or(0))
+        })
+    };
+    let payloads = dsc::compute(&streams, &link, &fits).ok_or(BesideRefusal::Other)?;
+    // Check all fixed owners before changing any provisional selection.
+    if indices.iter().zip(&payloads).any(|(&k, p)| {
+        fixed.get(k) == Some(&true)
+            && (selections[k]
+                .mst
+                .is_none_or(|m| (m.pbn, m.slots) != (p.pbn, p.slots))
+                || selections[k].dsc != p.dsc)
+    }) {
+        return Err(BesideRefusal::DscFairness);
+    }
+    for ((&k, stream), p) in indices.iter().zip(&streams).zip(payloads) {
+        if fixed.get(k) == Some(&true) {
+            continue;
+        }
+        let s = &mut selections[k];
+        let old = s.mst.unwrap();
+        let vc = match p.dsc {
+            Some(cfg) => mst_vc_rate_dsc(&s.timing, &cfg, s.lanes, s.rate, caps.fec),
+            None => mst_vc_rate(&s.timing, stream.bpc, s.lanes, s.rate, caps.fec),
+        }
+        .ok_or(BesideRefusal::Other)?;
+        s.dsc = p.dsc;
+        s.mst = Some(modeset::MstStream {
+            pbn: p.pbn,
+            slots: p.slots,
+            pbn_bpc: stream.bpc,
+            rate: vc,
+            dsc: p.dsc.and((ctx.dsc_of)(old.sink)),
+            ..old
+        });
+        s.audio = mst_audio(
+            &s.edid,
+            &s.timing,
+            stream.bpc,
+            s.lanes,
+            s.rate,
+            caps,
+            p.dsc.as_ref(),
+        );
+    }
+    Ok(())
 }
 
 /// A port's present end devices (sink, EDID, available PBN) and the
@@ -1803,6 +1979,66 @@ impl ColdBoot {
         }
         (devices, slots)
     }
+    /// A timing switch may recompute the whole MST link, then needs native
+    /// admission of all resulting payloads beside the other ports' streams.
+    pub(super) fn admits_mst_offered(
+        &self,
+        soc: &crate::amdgpu_dcn401_dml::Soc,
+        lit: &[modeset::Modeset],
+        k: usize,
+        timing: Timing,
+    ) -> bool {
+        let mut joint: Vec<_> = lit.iter().map(|m| m.selection).collect();
+        joint[k].timing = timing;
+        let fixed: Vec<_> = (0..joint.len()).map(|n| n != k).collect();
+        modeset::admit_selection_candidates_with(soc, &joint, &fixed, true, &mut |s| {
+            // A future modeset can relight affected streams at the same depth;
+            // final admission must use their recomputed DSC, not the old PPS.
+            self.refine_mst_payloads(soc, s, &[]).is_ok()
+        })
+        .is_some()
+    }
+
+    /// Normalize each port's full link before global native admission.
+    pub(super) fn refine_mst_payloads(
+        &self,
+        soc: &crate::amdgpu_dcn401_dml::Soc,
+        selections: &mut [Selection],
+        fixed: &[bool],
+    ) -> Result<(), BesideRefusal> {
+        let mut ports = Vec::new();
+        for s in selections.iter().filter(|s| s.mst.is_some()) {
+            if !ports.contains(&s.port) {
+                ports.push(s.port);
+            }
+        }
+        for port in ports {
+            let owner = self.mst.get(&port).ok_or(BesideRefusal::Other)?;
+            let (devices, _) = self.mst_devices(port);
+            let decoder = |sink| {
+                owner
+                    .outputs
+                    .iter()
+                    .flatten()
+                    .find(|o| o.sink == Some(sink))
+                    .and_then(|o| o.dsc)
+            };
+            let ctx = MstDscContext {
+                topology: &owner.topology,
+                dsc_of: &decoder,
+                max_dispclk_khz: soc.dispclk_max_khz,
+                max_bpc: &|_| 12,
+            };
+            let caps = selections
+                .iter()
+                .find(|s| s.port == port && s.mst.is_some())
+                .ok_or(BesideRefusal::Other)?
+                .caps;
+            refine_mst_link_payloads(soc, port, caps, &devices, &ctx, selections, fixed)?;
+        }
+        Ok(())
+    }
+
     /// The streams `select_mst_outputs_beside` gives port `port`'s end
     /// devices (`devices`, at `slots`) as CRTCs `crtc(slot)`'s at `want(slot)`
     /// over the root's `caps`, beside `lit`, the port's running streams.
@@ -2045,6 +2281,7 @@ impl ColdBoot {
                 max_dispclk_khz: soc.dispclk_max_khz,
                 max_bpc: &max_bpc,
             };
+            let order: Vec<_> = devices.iter().map(|d| d.0).collect();
             let mut modes = Vec::new();
             for output in link.outputs.iter().flatten() {
                 if own.iter().any(|s| s.mst.map(|m| m.sink) == output.sink) {
@@ -2055,7 +2292,16 @@ impl ColdBoot {
                 modes.push(found.map_or_else(Vec::new, |(sink, edid, _)| {
                     let available =
                         topology::path_budget(&link.topology, *sink, &allocated).unwrap_or(0);
-                    dark_mst_modes_with(soc, port, caps, edid, available, lit, Some((*sink, &ctx)))
+                    dark_mst_modes_in_order(
+                        soc,
+                        port,
+                        caps,
+                        edid,
+                        available,
+                        lit,
+                        Some((*sink, &ctx)),
+                        &order,
+                    )
                 }));
             }
             for (output, m) in link.outputs.iter_mut().flatten().zip(modes) {

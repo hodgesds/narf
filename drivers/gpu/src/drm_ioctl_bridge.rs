@@ -4035,6 +4035,7 @@ fn set_property_atomic(
         },
         None,
         None,
+        None,
     )
 }
 
@@ -4669,6 +4670,7 @@ fn handle_atomic(
         },
         events,
         out_fences,
+        None,
     )
 }
 
@@ -4693,6 +4695,7 @@ fn atomic_commit(
     req: AtomicRequest<'_>,
     events: Option<&narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>>,
     out_fences: Option<&narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(u64, u64)>>>,
+    admission: Option<&scanout_kms::CommitAdmission<'_>>,
 ) -> Result<u64, FsError> {
     const PAGE_FLIP_EVENT: u32 = 0x0001;
     const TEST_ONLY: u32 = 0x0100;
@@ -4726,6 +4729,9 @@ fn atomic_commit(
     let mut max_bpc_requests: Vec<(u32, u8)> = Vec::new();
     let presentation = {
         let mut card = mode_state.lock();
+        if let Some(a) = admission {
+            a.check(&card)?;
+        }
         // Linux's atomic state grows implicitly while properties are decoded:
         // drm_atomic_get_plane_state() adds the plane's old CRTC and
         // drm_atomic_set_crtc_for_plane() adds its new CRTC.  Keep the same
@@ -5484,6 +5490,7 @@ fn handle_cursor(
                 handle,
             },
             None,
+            None,
         );
     }
     // CURSOR2 reports the hotspot — the active point inside the BO. Our
@@ -5535,6 +5542,7 @@ fn cursor_universal(
     ctx: &DrmFileCtx,
     req: LegacyCursor,
     bo: Option<Arc<crate::amdgpu_gem::GemObject>>,
+    admission: Option<&scanout_kms::CommitAdmission<'_>>,
 ) -> Result<u64, FsError> {
     const DRM_MODE_CURSOR_BO: u32 = 0x01;
     const DRM_MODE_CURSOR_MOVE: u32 = 0x02;
@@ -5547,6 +5555,9 @@ fn cursor_universal(
     }
     let requests = {
         let mut card = mode_state.lock();
+        if let Some(a) = admission {
+            a.check(&card)?;
+        }
         card.crtc(req.crtc_id).map_err(|_| FsError::NotFound)?;
         let cursor =
             *crate::drm_native_planes::cursor_of(&card, req.crtc_id).ok_or(FsError::InvalidData)?;
@@ -5601,7 +5612,7 @@ fn cursor_universal(
             in_fence_fd: None,
             props: Some(cursor.props),
         };
-        match commit_cursor_plane(card_index, &mut card, plane) {
+        match commit_cursor_plane(card_index, &mut card, plane, false) {
             Ok(requests) => {
                 if let Some(p) = card.native_planes.iter_mut().find(|p| p.id == cursor.id) {
                     if wrapped.is_some() {
@@ -5652,6 +5663,7 @@ fn commit_cursor_plane(
     card_index: u32,
     card: &mut crate::drm::card::Card,
     plane: crate::drm::atomic::PlaneState,
+    validate_only: bool,
 ) -> Result<Vec<CursorRequest>, FsError> {
     let mut state = crate::drm::atomic::AtomicState::default();
     state.planes.push(plane);
@@ -5660,6 +5672,9 @@ fn commit_cursor_plane(
         return Err(FsError::InvalidData);
     }
     crate::drm_native_planes::check(card, &state, |c| card.crtc(c).ok().and_then(|c| c.mode))?;
+    if validate_only {
+        return Ok(Vec::new());
+    }
     // prepare_fb: a cursor's GEM buffer pinned in VRAM, or the update fails.
     let prepared = PreparedFbs::prepare(
         card,
@@ -6043,22 +6058,21 @@ fn handle_setcrtc(
     arg: usize,
     ctx: &DrmFileCtx,
 ) -> Result<u64, FsError> {
-    // SETCRTC is a DRM_MASTER op: only the open holding master may modeset.
-    // This rejects render nodes (never master) AND authenticated-but-non-master
-    // primary fds (e.g. a second compositor before it takes over) with EACCES,
-    // exactly as Linux's drm_ioctl_permit gates a DRM_MASTER ioctl.
     if !ctx.is_master {
         return Err(FsError::PermissionDenied);
     }
+    let (req, connector) = scanout_kms::copy_setcrtc(arg)?;
+    handle_setcrtc_decoded(card_index, mode_state, req, connector, None, false)
+}
 
-    // SAFETY: arg is the ioctl argument pointer.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    let bytes = unsafe { copy_in(arg, core::mem::size_of::<DrmModeCrtcUapi>())? };
-    let req: DrmModeCrtcUapi =
-        // SAFETY: #[repr(C)] POD of right size.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DrmModeCrtcUapi) };
-
+fn handle_setcrtc_decoded(
+    card_index: u32,
+    mode_state: &Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    req: DrmModeCrtcUapi,
+    setcrtc_connector: Option<u32>,
+    admission: Option<&scanout_kms::CommitAdmission<'_>>,
+    validate_only: bool,
+) -> Result<u64, FsError> {
     // Look up the framebuffer → GEM handle → dumb backing phys.
     let src_phys: Option<u64>;
     let virgl_resource: Option<Arc<VirtGpuResource>>;
@@ -6068,16 +6082,12 @@ fn handle_setcrtc(
     let src_frame: crate::amdgpu_navi48_platform::PlaneFrame;
     // A GEM framebuffer, pinned for scanout in place.
     let gem_frame: Option<crate::amdgpu_navi48_platform::PlaneFrame>;
-    // SETCRTC's single connector id, read before any card lock is held.
-    let setcrtc_connector = if req.count_connectors == 1 && req.set_connectors_ptr != 0 {
-        // SAFETY: a user pointer to count_connectors (one) u32 ids.
-        let ids = unsafe { copy_in(req.set_connectors_ptr as usize, 4)? };
-        Some(u32::from_le_bytes(ids[..4].try_into().unwrap()))
-    } else {
-        None
-    };
     {
         let mut card = mode_state.lock();
+        if let Some(a) = admission {
+            a.check(&card)?;
+        }
+        card.crtc(req.crtc_id).map_err(|_| FsError::NotFound)?;
 
         // The native display behind this CRTC, on the amdgpu card.
         let native_display = (crate::drm_registry::driver_name(card_index) == Some("amdgpu"))
@@ -6182,6 +6192,9 @@ fn handle_setcrtc(
 
         // amdgpu_dm_plane_helper_prepare_fb before the commit changes any
         // state: a GEM framebuffer that cannot be pinned fails SETCRTC.
+        if validate_only {
+            return Ok(0);
+        }
         let prepared = PreparedFbs::prepare(&card, (req.fb_id != 0).then_some(req.fb_id))?;
         // Record the mode and active fb on the crtc; switching it off
         // without a mode clears the mode (drm_mode_setcrtc).
@@ -6301,20 +6314,21 @@ fn handle_page_flip(
     ctx: &DrmFileCtx,
     events: Option<&narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>>,
 ) -> Result<u64, FsError> {
-    // Page flip is a DRM_MASTER op — only the master may flip (see
-    // handle_setcrtc). Rejects render nodes and non-master primary fds.
     if !ctx.is_master {
         return Err(FsError::PermissionDenied);
     }
+    let req = scanout_kms::copy_page_flip(arg)?;
+    handle_page_flip_decoded(card_index, mode_state, req, events, None, false)
+}
 
-    // SAFETY: arg is the ioctl argument pointer.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    let bytes = unsafe { copy_in(arg, core::mem::size_of::<DrmModePageFlipUapi>())? };
-    let req: DrmModePageFlipUapi =
-        // SAFETY: #[repr(C)] POD of right size.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DrmModePageFlipUapi) };
-
+fn handle_page_flip_decoded(
+    card_index: u32,
+    mode_state: &Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    req: DrmModePageFlipUapi,
+    events: Option<&narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>>,
+    admission: Option<&scanout_kms::CommitAdmission<'_>>,
+    validate_only: bool,
+) -> Result<u64, FsError> {
     // DRM_MODE_PAGE_FLIP_EVENT — queue a flip-complete event the client
     // reads off the DRM fd after poll/select (the compositor render loop).
     const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
@@ -6334,6 +6348,9 @@ fn handle_page_flip(
     let mut flip_ticket = None;
     {
         let mut card = mode_state.lock();
+        if let Some(a) = admission {
+            a.check(&card)?;
+        }
         // Linux resolves an unknown CRTC/fb as ENOENT and refuses a flip from
         // an unbound primary plane with EBUSY. Validate before mutating state.
         let old_fb_id = card
@@ -6370,6 +6387,16 @@ fn handle_page_flip(
         src_frame = fb_frame(fb, src_phys.unwrap_or(0));
         // prepare_fb before the flip changes any state: a GEM framebuffer
         // that cannot be pinned fails PAGE_FLIP (no event is queued).
+        if validate_only {
+            if req.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
+                events
+                    .ok_or(FsError::InvalidData)?
+                    .lock()
+                    .ensure_flip_event_space(1)
+                    .map_err(|_| FsError::OutOfMemory)?;
+            }
+            return Ok(0);
+        }
         let prepared = PreparedFbs::prepare(&card, [req.fb_id])?;
         let fb = card.framebuffer(req.fb_id).map_err(|_| FsError::NotFound)?;
         gem_frame = fb
@@ -6528,8 +6555,18 @@ fn handle_setplane(
     if !ctx.is_master {
         return Err(FsError::PermissionDenied);
     }
-    // SAFETY: `arg` is the validated 48-byte ioctl pointer.
+    // SAFETY: fixed-size UAPI, copied with guarded user access.
     let bytes = unsafe { copy_in(arg, 48)? };
+    handle_setplane_decoded(card_index, mode_state, &bytes, None, false)
+}
+
+fn handle_setplane_decoded(
+    card_index: u32,
+    mode_state: &Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    bytes: &[u8],
+    admission: Option<&scanout_kms::CommitAdmission<'_>>,
+    validate_only: bool,
+) -> Result<u64, FsError> {
     let word = |i: usize| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
     let (plane_id, crtc_id, fb_id) = (word(0), word(1), word(2));
     let (crtc_x, crtc_y, crtc_w, crtc_h) = (word(4) as i32, word(5) as i32, word(6), word(7));
@@ -6538,6 +6575,9 @@ fn handle_setplane(
     let mut cursor_requests = Vec::new();
     let presentation = {
         let mut card = mode_state.lock();
+        if let Some(a) = admission {
+            a.check(&card)?;
+        }
         if card.native_planes.is_empty() {
             return Err(FsError::Unsupported);
         }
@@ -6586,7 +6626,7 @@ fn handle_setplane(
         }
         if cursor {
             // drm_atomic_helper_update_plane: a legacy cursor update.
-            cursor_requests = commit_cursor_plane(card_index, &mut card, plane)?;
+            cursor_requests = commit_cursor_plane(card_index, &mut card, plane, validate_only)?;
             Vec::new()
         } else {
             let mut state = crate::drm::atomic::AtomicState::default();
@@ -6614,6 +6654,9 @@ fn handle_setplane(
                 }
             }
             // prepare_fb before the update changes any state.
+            if validate_only {
+                return Ok(0);
+            }
             let prepared = PreparedFbs::prepare(&card, state.planes[0].fb_id)?;
             if state.core_commit(&mut card).is_err() {
                 return Err(FsError::InvalidData);
@@ -6653,7 +6696,7 @@ fn handle_setplane(
 /// amdgpu_dm_plane_helper_prepare_fb for the framebuffers a commit shows,
 /// run under the KMS lock before the commit changes any state: each GEM
 /// framebuffer's buffer pinned in VRAM (`GemObject::pin_scanout`; the
-/// async `amdgpu_prepare_scanout` moved it back first). A pin that fails
+/// async `amdgpu_kms_async` moved it back first). A pin that fails
 /// fails the ioctl with its errno before anything changed, as a failed
 /// prepare_fb fails drm_atomic_helper_prepare_planes; dropping the set
 /// unpins them (cleanup_fb of the failed commit). A dumb framebuffer
@@ -7279,6 +7322,15 @@ fn amdgpu_vram_dumb(card_index: u32) -> bool {
         && crate::amdgpu_gem::vram_heap_usage(card_index).is_some()
 }
 
+fn amdgpu_dumb_live(card_index: u32) -> Result<(), FsError> {
+    let native =
+        crate::drm_registry::mode_state(card_index).is_some_and(|mode| mode.lock().gfx12_modifiers);
+    if native {
+        crate::amdgpu_gem::ensure_placement_live(card_index)?;
+    }
+    Ok(())
+}
+
 /// CREATE_DUMB's `struct drm_mode_create_dumb` at `arg`, filled in with the
 /// `(handle, pitch, size)` of `made` on success. `NoSpace` is ENOMEM, as
 /// amdgpu_mode_dumb_create returns it.
@@ -7288,7 +7340,7 @@ fn finish_amdgpu_dumb(
     made: Result<(u32, u32, u64), FsError>,
 ) -> Result<u64, FsError> {
     let (handle, pitch, size) = made.map_err(|e| match e {
-        FsError::NoSpace | FsError::NoDevice => FsError::OutOfMemory,
+        FsError::NoSpace => FsError::OutOfMemory,
         e => e,
     })?;
     let out = DrmModeCreateDumbUapi {
@@ -7329,6 +7381,11 @@ pub fn amdgpu_dumb(
     arg: usize,
     gem: &crate::amdgpu_gem::GemState,
 ) -> Option<Result<u64, FsError>> {
+    if cmd == drm_uapi::DRM_IOCTL_MODE_CREATE_DUMB {
+        if let Err(error) = amdgpu_dumb_live(card_index) {
+            return Some(Err(error));
+        }
+    }
     if arg == 0 {
         return None;
     }
@@ -7375,6 +7432,11 @@ pub async fn amdgpu_create_dumb_async(
     arg: usize,
     gem: &crate::amdgpu_gem::GemState,
 ) -> Option<Result<u64, FsError>> {
+    if cmd == drm_uapi::DRM_IOCTL_MODE_CREATE_DUMB {
+        if let Err(error) = amdgpu_dumb_live(card_index) {
+            return Some(Err(error));
+        }
+    }
     if cmd != drm_uapi::DRM_IOCTL_MODE_CREATE_DUMB || arg == 0 || !amdgpu_vram_dumb(card_index) {
         return None;
     }
@@ -7386,62 +7448,9 @@ pub async fn amdgpu_create_dumb_async(
     Some(finish_amdgpu_dumb(arg, req, made))
 }
 
-/// Before a SETCRTC, PAGE_FLIP, SETPLANE, atomic or legacy cursor commit
-/// on the Navi48 card from open `open_id`: amdgpu_dm_plane_helper_prepare_fb's
-/// pin validation for the GEM buffers of the open's framebuffers (and a
-/// legacy CURSOR/CURSOR2's buffer, its handle in `arg` in the open's `gem`
-/// table), which may sleep. Each that left VRAM (suspend's eviction, or
-/// eviction for another allocation) and is not pinned moves back, mapped or
-/// not (`amdgpu_gem::prepare_scanout`), so the commit's pin
-/// (`PreparedFbs`), which never moves a buffer itself, finds it in VRAM.
-/// Retain the returned placement guard until that synchronous commit
-/// finishes, closing the gap between validation and pin acquisition.
-pub async fn amdgpu_prepare_scanout(
-    card_index: u32,
-    open_id: u64,
-    cmd: u32,
-    arg: usize,
-    gem: &crate::amdgpu_gem::GemState,
-) -> Option<crate::amdgpu_gem::ScanoutPreparation> {
-    const DRM_MODE_CURSOR_BO: u32 = 0x01;
-    let nr = drm_uapi::ioc_nr(cmd);
-    if (cmd >> 8) & 0xff != u32::from(b'd')
-        || !matches!(nr, 0xA2 | 0xA3 | 0xB0 | 0xB7 | 0xBB | 0xBC)
-    {
-        return None;
-    }
-    let mode_state = crate::drm_registry::mode_state(card_index)?;
-    // drm_mode_cursor's flags at 0 and handle at 24.
-    let cursor = matches!(nr, 0xA3 | 0xBB)
-        .then(|| {
-            if arg == 0 {
-                return None;
-            }
-            // SAFETY: `arg` is the ioctl pointer; drm_mode_cursor is 28 bytes
-            // and copy_in bounds and SMAP-brackets the read.
-            let b = unsafe { copy_in(arg, 28) }.ok()?;
-            let word = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
-            let handle = word(24);
-            (word(0) & DRM_MODE_CURSOR_BO != 0 && handle != 0 && gem.owns(handle))
-                .then(|| gem.object(handle))
-                .flatten()
-        })
-        .flatten();
-    let objects: Vec<_> = {
-        let card = mode_state.lock();
-        if !card.gfx12_modifiers {
-            return None;
-        }
-        card.framebuffers
-            .iter()
-            .filter_map(|fb| fb.bo.as_ref())
-            .filter(|bo| bo.owner == open_id)
-            .map(|bo| Arc::clone(&bo.object))
-            .chain(cursor)
-            .collect()
-    };
-    Some(crate::amdgpu_gem::prepare_scanout(card_index, objects).await)
-}
+#[path = "amdgpu_scanout_kms.rs"]
+mod scanout_kms;
+pub(crate) use scanout_kms::dispatch as amdgpu_kms_async;
 
 /// DRM_IOCTL_MODE_CURSOR{,2} with DRM_MODE_CURSOR_BO on the Navi48 card
 /// naming one of open `open_id`'s amdgpu GEM handles (a dumb buffer from
@@ -7492,6 +7501,7 @@ pub fn amdgpu_cursor_bo(
             handle,
         },
         Some(object),
+        None,
     ))
 }
 

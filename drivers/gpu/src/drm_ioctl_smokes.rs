@@ -3980,14 +3980,19 @@ fn smoke_drm_navi48_gem_framebuffers_scan_out_in_place() -> TestResult {
     if refused != Some(FsError::OutOfMemory) || pinned {
         return TestResult::Fail("an evicted buffer pinned without prepare_fb");
     }
+    let target = {
+        ms.lock()
+            .framebuffer(fb_b)
+            .unwrap()
+            .bo
+            .as_ref()
+            .unwrap()
+            .object
+            .clone()
+    };
     let preparation =
-        narf_scheduler::block_on_spin(crate::drm_ioctl_bridge::amdgpu_prepare_scanout(
-            idx,
-            OWNER,
-            crate::drm_uapi::DRM_IOCTL_MODE_PAGE_FLIP,
-            0,
-            &gem,
-        ));
+        narf_scheduler::block_on_spin(crate::amdgpu_gem::prepare_scanout(idx, vec![target]))
+            .unwrap();
     let frame_b = {
         let card = ms.lock();
         crate::drm_ioctl_bridge::scanout_frame(&card, card.framebuffer(fb_b).unwrap())
@@ -4054,7 +4059,7 @@ fn smoke_drm_navi48_dumb_buffers_scan_out_of_vram() -> TestResult {
     use crate::amdgpu_gem::{GemState, VramHeap};
     use crate::drm_uapi::{
         DrmModeCreateDumbUapi, DRM_IOCTL_MODE_ADDFB2, DRM_IOCTL_MODE_CREATE_DUMB,
-        DRM_IOCTL_MODE_DESTROY_DUMB, DRM_IOCTL_MODE_MAP_DUMB, DRM_IOCTL_MODE_PAGE_FLIP,
+        DRM_IOCTL_MODE_DESTROY_DUMB, DRM_IOCTL_MODE_MAP_DUMB,
     };
     const OWNER: u64 = 0xd0b1;
     const BAR: u64 = 0xb500_0000;
@@ -4255,14 +4260,11 @@ fn smoke_drm_navi48_dumb_buffers_scan_out_of_vram() -> TestResult {
         return TestResult::Fail("evict_all of the dumb buffers");
     }
     crate::amdgpu_gem::restore_domains(touched);
-    let preparation =
-        narf_scheduler::block_on_spin(crate::drm_ioctl_bridge::amdgpu_prepare_scanout(
-            idx,
-            OWNER,
-            DRM_IOCTL_MODE_PAGE_FLIP,
-            0,
-            &gem,
-        ));
+    let preparation = narf_scheduler::block_on_spin(crate::amdgpu_gem::prepare_scanout(
+        idx,
+        vec![object_a.clone()],
+    ))
+    .unwrap();
     drop(preparation);
     back = [0; 4];
     if object_a.system()

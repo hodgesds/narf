@@ -531,7 +531,6 @@ impl FileOps for DriCardFile {
         Box::pin(async move {
             // amdgpu_drm_ioctl: pm_runtime_get_sync … put_autosuspend.
             let _rpm = crate::amdgpu_navi48_runtime_pm::ioctl_enter(self.index).await?;
-            let mut scanout_preparation = None;
             if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu")
                 && crate::drm_ioctl_bridge::is_virtgpu_wait_ioctl(cmd)
             {
@@ -608,16 +607,19 @@ impl FileOps for DriCardFile {
                 {
                     return result;
                 }
-                // Keep placement admission from prepare_fb's migration
-                // through the synchronous commit's pin acquisition.
-                scanout_preparation = crate::drm_ioctl_bridge::amdgpu_prepare_scanout(
+                if let Some(result) = crate::drm_ioctl_bridge::amdgpu_kms_async(
                     self.index,
                     self.open_id,
                     cmd,
                     arg as usize,
                     &self.amdgpu_gem,
+                    Some(&self.events),
+                    Some(&self.pending_out_fences),
                 )
-                .await;
+                .await
+                {
+                    return result;
+                }
                 if let Some(result) = crate::amdgpu_vm::dispatch_async(
                     cmd,
                     arg as usize,
@@ -646,9 +648,7 @@ impl FileOps for DriCardFile {
                     result => return result,
                 }
             }
-            let result = self.ioctl(cmd, arg as usize);
-            drop(scanout_preparation);
-            result
+            self.ioctl(cmd, arg as usize)
         })
     }
 

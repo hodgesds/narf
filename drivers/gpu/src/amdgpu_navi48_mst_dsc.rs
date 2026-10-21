@@ -326,14 +326,15 @@ async fn write_enable<A: MstAux>(
     }
 }
 
-/// `config` where the native DSCs take its shape: at most four slices per
-/// DSC on up to four (ODM) pipes, as `modeset::dp_dsc` requires.
+/// A provisional decoder configuration. Native shape is checked after
+/// whole-link fairness and full-configuration admission choose Plan.pipes.
 pub fn native_config(s: &DscStream, link: &DscLink) -> Option<DscConfig> {
     let cfg = config(s, link)?;
-    crate::amdgpu_dcn401_dml::dsc_shape(&s.timing, cfg.slices_h, link.max_dispclk_khz).map(|_| cfg)
+    Some(cfg)
 }
 
-/// `compute_link` with the native pipeline's DSC shapes.
+/// `compute_link` with provisional decoder configurations; final native
+/// shape and bandwidth acceptance belong to the complete configuration.
 pub fn compute(streams: &[DscStream], link: &DscLink, fits: &Fits<'_>) -> Option<Vec<DscPayload>> {
     compute_link(streams, link, fits, &|s| native_config(s, link))
 }

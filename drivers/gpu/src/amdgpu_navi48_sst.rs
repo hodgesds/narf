@@ -27,20 +27,20 @@ pub(super) fn dark_modes(
         if out.len() == MAX_MODES {
             break;
         }
-        let Ok(mut candidate) = select(paths, core::slice::from_ref(port), max_bpc, Some(timing))
+        let Ok(candidate) = select(paths, core::slice::from_ref(port), max_bpc, Some(timing))
         else {
             continue;
         };
         // select may fall back to preferred; admission must describe this mode.
         if candidate.timing != timing
             || (candidate.frl.is_some() && lit.iter().any(|s| s.frl.is_some()))
-            || refine_dsc(soc, core::slice::from_mut(&mut candidate)).is_err()
         {
             continue;
         }
-        let mut modes: Vec<_> = lit.iter().map(selection_mode).collect();
-        modes.push(selection_mode(&candidate));
-        if dml::admit_native(soc, &modes).is_ok() {
+        let mut joint = lit.to_vec();
+        joint.push(candidate);
+        let fixed: Vec<_> = (0..joint.len()).map(|k| k < lit.len()).collect();
+        if admit_selection_candidates(soc, &joint, &fixed).is_some() {
             out.push(timing);
         }
     }
