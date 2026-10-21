@@ -5077,7 +5077,12 @@ commit_planes_for_stream's order:
   off), and with a pipe freed optimize_bandwidth's compbuf increase
   (`Engine::increase_compbuf`, dcn401_program_compbuf_segments with
   safe_to_increase: every DET_SIZE_CURRENT acknowledged, then COMPBUF to
-  the CRB's remaining segments; the requestor record carries it). The records
+  the CRB's remaining segments; the requestor record carries it). A slow
+  acknowledgement is logged, never fatal, as REG_WAIT only logs: after a
+  slow DET the grow is skipped and the requested allocation kept
+  (deviation: Linux writes COMPBUF_SIZE anyway; NARF never grows into
+  segments a DET may still hold), and a grown compbuf whose CURRENT is slow
+  is kept (Linux does not wait for it). The records
   then name the new planes (surfaces, apertures, DPP/MPC, requestor,
   deadlines, scanout, cursor, the timing's sync) and pass the scanout's
   re-binding checks; the surfaces the update superseded (with their back

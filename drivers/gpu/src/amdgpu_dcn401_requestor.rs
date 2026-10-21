@@ -126,11 +126,30 @@ impl<I: Io> Engine<I> {
     /// rest of the CRB (DML's compbuf_size: CRB minus every DET). A
     /// compbuf already that size or larger is left (only increases here).
     /// Returns the allocation.
-    pub(super) async fn increase_compbuf(&mut self) -> Result<[u8; 5], Error> {
+    ///
+    /// A slow acknowledgement is not an error: Linux's REG_WAIT only logs
+    /// "REG_WAIT timeout". After a DET wait times out the grow is skipped
+    /// (Linux writes COMPBUF_SIZE anyway; NARF never grows the compbuf into
+    /// segments a DET may still hold) and the requested allocation is
+    /// returned. A grown compbuf whose COMPBUF_SIZE_CURRENT is slow is
+    /// logged and kept, as Linux, which does not wait for it at all.
+    pub(in crate::amdgpu_dcn401_otg) async fn increase_compbuf(
+        &mut self,
+    ) -> Result<[u8; 5], Error> {
+        let mut acked = true;
         for index in 1..5 {
             let at = self.layout.crb(index);
             let want = self.read(at)? & 0x1f;
-            self.wait(at, 0x1f00, want << 8, 100_000).await?;
+            if !self.slow_ack(at, want).await? {
+                acked = false;
+            }
+        }
+        if !acked {
+            let mut requested = [0; 5];
+            for (index, size) in requested.iter_mut().enumerate() {
+                *size = (self.read(self.layout.crb(index))? & 0x1f) as u8;
+            }
+            return Ok(requested);
         }
         let mut sizes = self.crb_stable()?;
         let dets: u32 = sizes[1..].iter().map(|&n| u32::from(n)).sum();
@@ -138,9 +157,28 @@ impl<I: Io> Engine<I> {
             .checked_sub(dets)
             .ok_or(Error::Invalid)? as u8;
         if target > sizes[0] {
-            self.resize_crb(&mut sizes, 0, target).await?;
+            let at = self.layout.crb(0);
+            self.update(at, 0x1f, u32::from(target))?;
+            self.slow_ack(at, u32::from(target)).await?;
+            sizes[0] = target;
         }
         Ok(sizes)
+    }
+    /// Wait for a CRB register's CURRENT field (bits 12:8) to reach `want`;
+    /// `false` after logging a timeout, as generic_reg_wait does.
+    async fn slow_ack(&mut self, at: u64, want: u32) -> Result<bool, Error> {
+        match self.wait(at, 0x1f00, want << 8, 100_000).await {
+            Ok(()) => Ok(true),
+            Err(Error::Timeout(_)) => {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: dcn401 REG_WAIT timeout: CRB {at:#x} CURRENT != {want}"
+                );
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
     }
     pub(super) fn requestor_errors(&mut self, pipe: u8) -> Result<(), Error> {
         self.requestor_faults(pipe, 0)
