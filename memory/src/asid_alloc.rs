@@ -91,7 +91,7 @@ static NEXT_TAG: AtomicU16 = AtomicU16::new(1);
 // remainder of the architectural namespace, so the two root classes can never
 // cache different translations under the same live tag.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-const PROCESS_CONTEXT_FIRST: u16 = N_DOMAINS as u16 + 1;
+pub(crate) const PROCESS_CONTEXT_FIRST: u16 = N_DOMAINS as u16 + 1;
 #[cfg(target_arch = "x86_64")]
 const PROCESS_CONTEXT_BITMAP_WORDS: usize = 64; // complete 12-bit PCID namespace
 #[cfg(target_arch = "aarch64")]

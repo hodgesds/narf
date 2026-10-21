@@ -137,7 +137,8 @@ struct ShootdownStats {
     broadcast_budget: AtomicU64,
     filtered_targets: AtomicU64,
     lazy_flush_count: AtomicU64,
-    _pad: [u8; 16],
+    stale_deferred: AtomicU64,
+    _pad: [u8; 8],
 }
 
 impl ShootdownStats {
@@ -149,7 +150,8 @@ impl ShootdownStats {
             broadcast_budget: AtomicU64::new(0),
             filtered_targets: AtomicU64::new(0),
             lazy_flush_count: AtomicU64::new(0),
-            _pad: [0; 16],
+            stale_deferred: AtomicU64::new(0),
+            _pad: [0; 8],
         }
     }
 }
@@ -311,6 +313,177 @@ pub fn lazy_flush_count() -> u64 {
     sum_stat(|stats| &stats.lazy_flush_count)
 }
 
+/// Number of remote targets whose invalidation was deferred to their next
+/// load of the affected tag bucket instead of being IPI'd.
+pub fn stale_deferred_count() -> u64 {
+    sum_stat(|stats| &stats.stale_deferred)
+}
+
+// ── Lazy residency: the bucket a CPU runs, and the debt it owes ─────────
+//
+// `ACTIVE_AS` is a residency *history*: a lifetime PCID keeps its entries
+// across CR3 switches (NOFLUSH), so a bucket bit can only be dropped after a
+// local flush, and in practice it never is. Interrupting every CPU in that
+// history on each invalidation is what made a forked systemd's COW faults
+// wait on CPUs that had not run it for seconds.
+//
+// Linux avoids that with `mm_cpumask` plus `tlb_gen`: only CPUs currently
+// running the mm are interrupted; a CPU that merely cached its ASID earlier
+// compares generations when it switches back and flushes then
+// (`switch_mm_irqs_off`, `flush_tlb_func`). NARF does the same per bucket:
+//
+// * `CURRENT_BUCKETS[cpu]` holds the bucket(s) of the process tag this CPU
+//   has loaded, or is about to load. It is widened *before* the CR3 write
+//   and narrowed only *after* it, so it always covers the live CR3.
+// * A sender that finds a resident CPU not running the bucket publishes
+//   `STALE_BUCKETS[cpu] |= bucket` instead of interrupting it, then
+//   re-reads `CURRENT_BUCKETS`. The loader widens `CURRENT_BUCKETS` and
+//   then reads `STALE_BUCKETS`. With both pairs SeqCst (Dekker), either the
+//   sender sees the load and sends the IPI, or the loader sees the debt and
+//   flushes every non-global entry before its CR3 write. Possibly both;
+//   never neither.
+//
+// A stale entry tagged with a PCID can only be used while CR3 carries that
+// PCID (Intel SDM Vol 3 §4.10.1), and every load of a process tag goes
+// through `AddressSpace::activate`, so a deferred CPU cannot consume a stale
+// translation before it pays the debt. Domain tags (1..=N_DOMAINS) are also
+// loaded by the trap/syscall entry assembly, which does not take part in
+// this protocol, so they are never deferred.
+
+static CURRENT_BUCKETS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static STALE_BUCKETS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+// Tag 0 (the flushing fallback: no PCIDE, or tag exhaustion) is different.
+// Every CR3 load of a tag-0 root drops that context's entries, so a CPU can
+// hold a tag-0 address space's translations only while that root is its
+// live CR3, exactly Linux's `mm_cpumask`. But all tag-0 address spaces share
+// bucket 0, so the bucket history above cannot tell them apart. For tag 0
+// the sender instead matches the owning root against each CPU's
+// `CURRENT_ROOT` (the root its CR3 holds) and `LOADING_ROOT` (a root it has
+// announced but may not have written yet). The loader stores `LOADING_ROOT`
+// (SeqCst) before its serialising CR3 write; the sender reads both after
+// its page-table writes and SeqCst fence. A sender that misses the
+// announcement is ordered before it, so the loader's fresh page walk sees
+// the new PTEs.
+static CURRENT_ROOT: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static LOADING_ROOT: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Whether invalidations of `tag` may be deferred to the next context load.
+#[inline]
+fn deferrable_tag(tag: u16) -> bool {
+    tag >= crate::asid_alloc::PROCESS_CONTEXT_FIRST
+}
+
+/// Begin loading process tag `tag` on `cpu`: publish residency, mark the
+/// bucket current, and claim any deferred debt. Returns `true` when the
+/// caller must flush every non-global local entry before writing CR3.
+///
+/// Must run on `cpu` with interrupts disabled until the matching
+/// [`finish_context_load`].
+pub fn begin_context_load(cpu: u32, tag: u16, root: u64) -> bool {
+    set_active_as(cpu, tag);
+    let i = (cpu as usize).min(MAX_CPUS - 1);
+    LOADING_ROOT[i].store(root, Ordering::SeqCst);
+    claim_stale_on_load(
+        1u64 << pcid_bucket(tag),
+        &CURRENT_BUCKETS[i],
+        &STALE_BUCKETS[i],
+    )
+}
+
+/// Finish loading `tag` on `cpu`: the CR3 write is done, so buckets of the
+/// previous context stop being current.
+pub fn finish_context_load(cpu: u32, tag: u16, root: u64) {
+    let i = (cpu as usize).min(MAX_CPUS - 1);
+    CURRENT_ROOT[i].store(root, Ordering::SeqCst);
+    LOADING_ROOT[i].store(0, Ordering::SeqCst);
+    CURRENT_BUCKETS[i].store(1u64 << pcid_bucket(tag), Ordering::SeqCst);
+}
+
+/// Whether every load of a tag-0 user root goes through
+/// [`begin_context_load`]. The trap/syscall entry and `kernel_switch`
+/// assembly displace a CR3 whose PCID is at most 16, which includes a tag-0
+/// user root, and later write it back without this protocol, but only when
+/// the entry-visible CR4 cache has PCIDE set. With that gate clear the only
+/// writer of a user root is `AddressSpace::activate`.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn tag0_roots_tracked() -> bool {
+    narf_arch::x86_64::cr::NARF_X86_CACHED_CR4.load(Ordering::Acquire)
+        & narf_arch::x86_64::cr::CR4_PCIDE
+        == 0
+}
+
+/// CPUs among `candidates` whose live or announced CR3 root is `root`.
+fn running_root_mask(
+    candidates: u64,
+    root: u64,
+    current: &[AtomicU64],
+    loading: &[AtomicU64],
+) -> u64 {
+    let mut out = 0u64;
+    let mut scan = candidates;
+    while scan != 0 {
+        let cpu = scan.trailing_zeros() as usize;
+        scan &= scan - 1;
+        let running = match (current.get(cpu), loading.get(cpu)) {
+            (Some(c), Some(l)) => {
+                c.load(Ordering::SeqCst) == root || l.load(Ordering::SeqCst) == root
+            }
+            // Outside the tracked range: stay conservative.
+            _ => true,
+        };
+        if running {
+            out |= 1u64 << cpu;
+        }
+    }
+    out
+}
+
+/// Loader half of the protocol over explicit state (tests drive it).
+fn claim_stale_on_load(bit: u64, current: &AtomicU64, stale: &AtomicU64) -> bool {
+    current.fetch_or(bit, Ordering::SeqCst);
+    if stale.load(Ordering::SeqCst) & bit == 0 {
+        return false;
+    }
+    // The caller's full non-global flush runs after this swap, so it also
+    // discharges any other bucket whose debt the swap consumes.
+    stale.swap(0, Ordering::SeqCst);
+    true
+}
+
+/// Sender half: split resident `candidates` into CPUs to interrupt now and
+/// CPUs that now owe a flush on their next load of `bit`'s bucket.
+fn split_current_targets(
+    candidates: u64,
+    bit: u64,
+    current: &[AtomicU64],
+    stale: &[AtomicU64],
+) -> (u64, u64) {
+    let mut ipi = 0u64;
+    let mut deferred = 0u64;
+    let mut scan = candidates;
+    while scan != 0 {
+        let cpu = scan.trailing_zeros() as usize;
+        scan &= scan - 1;
+        if cpu >= current.len() || cpu >= stale.len() {
+            ipi |= 1u64 << cpu;
+            continue;
+        }
+        if current[cpu].load(Ordering::SeqCst) & bit != 0 {
+            ipi |= 1u64 << cpu;
+            continue;
+        }
+        stale[cpu].fetch_or(bit, Ordering::SeqCst);
+        if current[cpu].load(Ordering::SeqCst) & bit != 0 {
+            ipi |= 1u64 << cpu;
+        } else {
+            deferred |= 1u64 << cpu;
+        }
+    }
+    (ipi, deferred)
+}
+
 fn residency_target_mask(req: ShootdownRequest) -> u64 {
     let online = narf_lib::smp::online_bitmap();
     let self_cpu = narf_lib::percpu::current_cpu();
@@ -415,7 +588,21 @@ pub fn shootdown(req: ShootdownRequest) {
         .shootdown_count
         .fetch_add(1, Ordering::Relaxed);
 
-    dispatch_remote(req, req);
+    dispatch_remote(req, req, None);
+    #[cfg(any(test, feature = "kernel-test"))]
+    notify_completion_for_test(req);
+}
+
+/// [`shootdown`] for an invalidation of the address space whose page-table
+/// root is `owner_root`. A tag-0 request then targets only CPUs running that
+/// root (see the tag-0 notes above); other tags behave as `shootdown`.
+pub fn shootdown_owned(owner_root: u64, req: ShootdownRequest) {
+    apply_local(req);
+    local_stats()
+        .shootdown_count
+        .fetch_add(1, Ordering::Relaxed);
+
+    dispatch_remote(req, req, Some(owner_root));
     #[cfg(any(test, feature = "kernel-test"))]
     notify_completion_for_test(req);
 }
@@ -461,7 +648,7 @@ pub fn shootdown_remote(req: ShootdownRequest) {
     local_stats()
         .shootdown_count
         .fetch_add(1, Ordering::Relaxed);
-    dispatch_remote(req, req);
+    dispatch_remote(req, req, None);
 }
 
 /// Remotely flush every non-global entry, but target only CPUs that may hold
@@ -474,10 +661,15 @@ pub fn shootdown_remote_full_for_tag(residency_tag: u16) {
     dispatch_remote(
         ShootdownRequest::full(),
         ShootdownRequest::for_tag(residency_tag),
+        None,
     );
 }
 
-fn dispatch_remote(payload: ShootdownRequest, residency: ShootdownRequest) {
+fn dispatch_remote(
+    payload: ShootdownRequest,
+    residency: ShootdownRequest,
+    owner_root: Option<u64>,
+) {
     // Pair the page-table writer's stores with a CPU's pre-context-load
     // residency publication. Without this StoreLoad barrier, both sides
     // could transiently miss one another on weakly ordered hardware (and on
@@ -507,6 +699,33 @@ fn dispatch_remote(payload: ShootdownRequest, residency: ShootdownRequest) {
     }
 
     let candidates = residency_target_mask(residency);
+    // Owner-root targeting is an x86 tag-0 refinement; aarch64 tagged TLBI
+    // returned above and its untagged requests stay broadcast.
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = owner_root;
+    #[cfg(target_arch = "x86_64")]
+    let candidates = match (residency.tag, owner_root) {
+        (Some(crate::asid_alloc::TAG_RESERVED), Some(root))
+            if root != 0 && tag0_roots_tracked() =>
+        {
+            running_root_mask(candidates, root, &CURRENT_ROOT, &LOADING_ROOT)
+        }
+        (Some(tag), _) if deferrable_tag(tag) => {
+            let (ipi, deferred) = split_current_targets(
+                candidates,
+                1u64 << pcid_bucket(tag),
+                &CURRENT_BUCKETS,
+                &STALE_BUCKETS,
+            );
+            if deferred != 0 {
+                local_stats()
+                    .stale_deferred
+                    .fetch_add(deferred.count_ones() as u64, Ordering::Relaxed);
+            }
+            ipi
+        }
+        _ => candidates,
+    };
     #[cfg(target_arch = "x86_64")]
     let targets = defer_idle_targets(candidates, &IDLE_MASK, &DEFERRED_FULL_FLUSH);
     #[cfg(not(target_arch = "x86_64"))]
@@ -871,4 +1090,119 @@ fn smoke_tlb_shootdown_local_only_count_advances() -> TestResult {
 kernel_test_in!(
     "memory/tlb_shootdown",
     smoke_tlb_shootdown_local_only_count_advances
+);
+
+fn smoke_tlb_lazy_residency_defers_and_claims() -> TestResult {
+    // Drive the protocol over local state; live per-CPU slots must never be
+    // forged (see the module's test notes).
+    let bit = 1u64 << pcid_bucket(0x125);
+    let other = 1u64 << pcid_bucket(0x126);
+    let current = [AtomicU64::new(bit), AtomicU64::new(other)];
+    let stale = [AtomicU64::new(0), AtomicU64::new(0)];
+
+    // CPU 0 runs the bucket: interrupt it. CPU 1 only cached it: defer.
+    let (ipi, deferred) = split_current_targets(0b11, bit, &current, &stale);
+    if ipi != 0b01 || deferred != 0b10 {
+        return TestResult::Fail("running CPU not interrupted or resident CPU not deferred");
+    }
+    if stale[0].load(Ordering::Acquire) != 0 || stale[1].load(Ordering::Acquire) != bit {
+        return TestResult::Fail("deferred CPU did not receive the bucket's flush debt");
+    }
+
+    // Loading an unrelated bucket neither flushes nor drops the debt.
+    if claim_stale_on_load(other, &current[1], &stale[1]) {
+        return TestResult::Fail("load of an unrelated bucket claimed foreign debt");
+    }
+    if stale[1].load(Ordering::Acquire) != bit {
+        return TestResult::Fail("unrelated load discarded pending debt");
+    }
+
+    // Loading the stale bucket must flush before CR3, exactly once.
+    if !claim_stale_on_load(bit, &current[1], &stale[1]) {
+        return TestResult::Fail("load of a stale bucket skipped its flush");
+    }
+    if stale[1].load(Ordering::Acquire) != 0 || current[1].load(Ordering::Acquire) & bit == 0 {
+        return TestResult::Fail("claim left debt behind or did not mark the bucket current");
+    }
+    if claim_stale_on_load(bit, &current[1], &stale[1]) {
+        return TestResult::Fail("discharged debt flushed twice");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "memory/tlb_shootdown",
+    smoke_tlb_lazy_residency_defers_and_claims
+);
+
+fn smoke_tlb_lazy_residency_racing_load_is_interrupted() -> TestResult {
+    // A loader that widened CURRENT before the sender's scan is a live
+    // resident: the sender must interrupt it rather than defer. A loader that
+    // widens after the sender published debt must observe that debt. Either
+    // side of the Dekker pair suffices; this checks both orders.
+    let bit = 1u64 << pcid_bucket(0x231);
+    let current = [AtomicU64::new(0)];
+    let stale = [AtomicU64::new(0)];
+
+    current[0].fetch_or(bit, Ordering::SeqCst);
+    let (ipi, deferred) = split_current_targets(0b1, bit, &current, &stale);
+    if ipi != 0b1 || deferred != 0 {
+        return TestResult::Fail("sender deferred a CPU that had announced the load");
+    }
+
+    let current = [AtomicU64::new(0)];
+    let stale = [AtomicU64::new(0)];
+    let (ipi, deferred) = split_current_targets(0b1, bit, &current, &stale);
+    if ipi != 0 || deferred != 0b1 {
+        return TestResult::Fail("idle-history CPU was not deferred");
+    }
+    if !claim_stale_on_load(bit, &current[0], &stale[0]) {
+        return TestResult::Fail("load after deferral missed the published debt");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "memory/tlb_shootdown",
+    smoke_tlb_lazy_residency_racing_load_is_interrupted
+);
+
+fn smoke_tlb_tag0_targets_cpus_running_the_root() -> TestResult {
+    const ROOT: u64 = 0x1234_5000;
+    const OTHER: u64 = 0x6789_a000;
+    let current = [
+        AtomicU64::new(ROOT),
+        AtomicU64::new(OTHER),
+        AtomicU64::new(OTHER),
+        AtomicU64::new(0),
+    ];
+    // CPU 2 has announced ROOT but not yet written CR3.
+    let loading = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(ROOT),
+        AtomicU64::new(0),
+    ];
+    if running_root_mask(0b1111, ROOT, &current, &loading) != 0b0101 {
+        return TestResult::Fail(
+            "tag-0 targets are not exactly the CPUs running or loading the root",
+        );
+    }
+    // A CPU outside the tracked arrays stays a target.
+    if running_root_mask(1u64 << 9, ROOT, &current, &loading) != 1u64 << 9 {
+        return TestResult::Fail("untracked CPU was dropped from tag-0 targets");
+    }
+    // Domain tags are loaded by entry assembly outside the protocol.
+    if deferrable_tag(0)
+        || deferrable_tag(crate::asid_alloc::N_DOMAINS as u16)
+        || !deferrable_tag(crate::asid_alloc::PROCESS_CONTEXT_FIRST)
+    {
+        return TestResult::Fail("deferral eligibility drifted from the process-tag range");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "memory/tlb_shootdown",
+    smoke_tlb_tag0_targets_cpus_running_the_root
 );
