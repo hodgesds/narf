@@ -532,8 +532,14 @@ kernel_test_in!(
 /// the unblanked overlay already fetches it. A chunk past the surface's
 /// end refuses the update before any register write.
 fn dcn401_live_plane_update_shows_the_first_frame_at_the_latch() -> TestResult {
-    let (t, s, p) = ROUTES[1];
-    let q = OVERLAY_PIPE;
+    dcn401_live_plane_update_shows_the_first_frame_at_the_latch_on(ROUTES[1], OVERLAY_PIPE)
+}
+/// The test above with the display on route (t, s, p) and the overlay on
+/// pipe q.
+pub(super) fn dcn401_live_plane_update_shows_the_first_frame_at_the_latch_on(
+    (t, s, p): (u8, u8, u8),
+    q: u8,
+) -> TestResult {
     let mut c = chain(t, s, p);
     if run(c.start()).is_err() {
         return TestResult::Fail("start");

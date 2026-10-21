@@ -1327,6 +1327,7 @@ fn dcn401_scanout_chain_runs_on_harvested_boards() -> TestResult {
             dcn401_live_plane_update_scales_the_primary_in_place_on(route),
             dcn401_live_plane_update_adds_moves_and_removes_an_overlay_on(route, 0),
             dcn401_live_plane_update_moves_the_cursor_with_the_planes_on(route, 0),
+            dcn401_live_plane_update_shows_the_first_frame_at_the_latch_on(route, 0),
         ] {
             if result != TestResult::Pass {
                 return result;
