@@ -245,10 +245,7 @@ pub const fn dcc_block_size(size: u64, alignment: u64) -> u64 {
 /// Where amdgpu_vram_mgr_new trims a DCC buffer's block starting at VRAM
 /// offset `block_start`: `roundup(block_start, alignment)`.
 pub const fn dcc_trim_start(block_start: u64, alignment: u64) -> Option<u64> {
-    match block_start.checked_next_multiple_of(alignment) {
-        Some(start) => Some(start),
-        None => None,
-    }
+    block_start.checked_next_multiple_of(alignment)
 }
 
 /// `place` of a GFX12 DCC buffer as amdgpu_vram_mgr_new places it: the

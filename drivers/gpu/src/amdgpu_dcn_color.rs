@@ -1082,6 +1082,10 @@ fn bt709_to_linear(arg: Fx) -> Fx {
 /// short-circuit: it becomes TF_TYPE_DISTRIBUTED_POINTS from build_degamma
 /// (zero below 2^-12, BT.709's inverse OETF to 2^0, one above) copied and
 /// clamped by map_regamma_hw_to_x_user (no user ramp).
+#[allow(
+    clippy::needless_range_loop,
+    reason = "indexes the coordinates and the curve together, as build_degamma"
+)]
 pub fn bt709_degamma_tf() -> TfPoints {
     let x = coordinates_x();
     let begin = 13 * NUM_PTS_IN_REGION;
@@ -1116,6 +1120,10 @@ fn interp_tf_pts(channel: &[Fx], i: usize) -> Fx {
 /// last the curve at 2^0; flat corner slopes; then made monotonic and
 /// cm3_helper_convert_to_custom_float(fixpoint = false). The PWL
 /// dpp3_program_gamcor_lut loads into the DPP's GAMCOR.
+#[allow(
+    clippy::needless_range_loop,
+    reason = "the monotonic clamp reads point i and writes point i + 1, as cm3_helper does"
+)]
 pub fn translate_curve_to_degamma_hw_format(tf: &TfPoints) -> Option<Box<Pwl>> {
     const NUM_DEGAMMA_REGIONS: usize = 9;
     let mut seg_distr = [UNUSED; MAX_REGIONS_NUMBER];
