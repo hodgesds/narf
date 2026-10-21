@@ -221,6 +221,10 @@ impl ColdBoot {
         let frl = running.iter().any(|r| r.selection.frl.is_some());
         let frl_dtb = if frl { Some(self.top_dtb_khz()?) } else { None };
         let request = configuration_clocks(&plans, frl_dtb);
+        // dcn401_prepare_bandwidth for this full update: pinned (Linux forces
+        // p_state_change_support false) before update_clocks and before any
+        // display's watermarks move, i.e. before the first change below.
+        self.pin_display_uclk().await?;
         // prepare_bandwidth: the shared clocks only raised, the DTOs of the
         // pipes that keep fetching raised where their plane needs more.
         let mut raise: Vec<(u8, u32)> = running

@@ -4823,9 +4823,10 @@ of the given type ENOENT. Non-atomic cards keep set_property_legacy. Model-teste
 
 A configuration change that keeps running displays lit follows
 dc_commit_state_no_check's prepare/optimize ordering with dcn401's clock
-sequence. Every change starts pinned (`ColdBoot::pin_display_uclk`, under
-"Navi 48 UCLK P-state switching"); switching is regained only by the display
-monitor's P-state step.
+sequence. Every change starts pinned (`ColdBoot::pin_display_uclk`, before
+its first clock or watermark change; see "Navi 48 UCLK P-state switching"
+for the entry points); switching is regained only by the display monitor's
+P-state step.
 
 `ColdBoot::modeset_beside(fill, want, crtc_of, mst: &[MstRoute])` lights
 new board sinks and new MST end devices beside the running displays (route
@@ -5007,12 +5008,14 @@ display's new planes (`dml::admit_native`), places them as DC acquires
 them on the running state (`modeset::live_pipes` with `planes_reset`, see
 "Pipe acquisition": recreated planes take their blending tree's pipes back
 top first, new ones pipes the running state leaves free, a plane only moved
-keeps its pipes), then: prepare_bandwidth (`update_live_display_clocks` raising the shared
+keeps its pipes), then: prepare_bandwidth (`pin_display_uclk` first, as
+dcn401_prepare_bandwidth forces UCLK P-state support off before
+update_clocks, then `update_live_display_clocks` raising the shared
 clocks and the DTOs of the pipes that keep fetching, the new pipes'
 DPP-only clocks, every other display whose plan moved through
 `update_live_display_plan(raise)`), the plane update, optimize_bandwidth
 (every display's exact watermarks, the clocks lowered). `None`, before any
-change but the clock raise, when it needs a modeset or is refused: an MST
+change but the pin and the clock raise, when it needs a modeset or is refused: an MST
 configuration, a teardown in flight, DML refusing the configuration, another
 ODM split for the display, another display's pipes or split changing, a
 request that does not stage, or the engine's refusal.
@@ -5219,11 +5222,23 @@ while `uclk_switching()`, UCLK and FCLK raised to their maxima with
 switching disallowed and then FAMS2 disabled, as prepare_bandwidth orders
 update_clocks before the FAMS2 update; nothing otherwise (Linux sends the
 disabled FAMS2 config on every prepare_bandwidth; the port only ever sends
-it disabled, so a pinned owner skips the repeat). Every configuration
-change (`modeset_*`, `modeset_beside`, `replan_displays`, `retrain_modeset`,
-`stop_modeset`, `unplug_modeset`, `start_frl`, `retire_inherited_display`,
-`abort_modeset_activation`, `modeset_mst_displays`, MST payload changes and
-`update_live_display_planes`) pins first; a P-state plan stays valid pinned.
+it disabled, so a pinned owner skips the repeat). Every configuration-change
+entry point pins in prepare_bandwidth's position, before its first clock,
+watermark, pipe or link change: `modeset_display`, `modeset_display_mode`,
+`modeset_displays`, `modeset_routed`, `modeset_beside`, `replan_displays`,
+`retrain_modeset`, `start_frl`, `retire_inherited_display`,
+`modeset_mst_displays`, `add_display_mst_payload`, `update_display_planes`
+(after its validation, before the shared clocks rise and the other
+displays' plans move) and `update_live_display_planes`, and the teardowns
+`stop_modeset`, `unplug_modeset`, `abort_modeset_activation` and
+`remove_display_mst_payload`. Flips, cursor, colour/HDR and DRR updates are
+DC fast or stream updates, which Linux commits without prepare_bandwidth,
+and do not pin (DRR is refused while switching). The step primitives those
+entry points are built from (`start_display_scanout`, `stop_display_scanout`,
+`update_live_display_plan`, `update_live_display_clocks`, the
+`prepare_display_*` and `retire_display_*` steps, ...) do not pin by
+themselves: a caller composing them must pin first. A P-state plan stays
+valid pinned.
 `deadline::bound` binds a pinned plan to the pinned UCLK floor with switching
 disallowed and a P-state plan to a floor of at least its UCLK level; `set_display_drr`
 refuses DRR while switching. `uclk_switching()` reports the policy.
