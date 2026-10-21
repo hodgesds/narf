@@ -525,7 +525,7 @@ pub fn build_replies_authorized(
     Ok(replies)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
 
@@ -538,23 +538,23 @@ mod tests {
         )
     }
 
-    #[test]
-    fn empty_conntrack_dump_terminates() {
+    fn empty_conntrack_dump_terminates() -> narf_kernel_test::TestResult {
         crate::netfilter::conntrack::__reset_for_test();
         let replies = build_replies(&request()).unwrap();
-        assert_eq!(replies.len(), 1);
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(replies.len(), 1);
+        narf_kernel_test::kt_assert_eq!(
             u16::from_ne_bytes(replies[0][4..6].try_into().unwrap()),
             NLMSG_DONE
         );
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/netlink_netfilter", empty_conntrack_dump_terminates);
 
-    #[test]
-    fn unsupported_subsystem_returns_error() {
+    fn unsupported_subsystem_returns_error() -> narf_kernel_test::TestResult {
         let mut request = request();
         request[4..6].copy_from_slice(&0x0201u16.to_ne_bytes());
         let replies = build_replies(&request).unwrap();
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(
             i32::from_ne_bytes(
                 replies[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
                     .try_into()
@@ -562,10 +562,11 @@ mod tests {
             ),
             -EOPNOTSUPP
         );
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/netlink_netfilter", unsupported_subsystem_returns_error);
 
-    #[test]
-    fn batched_requests_preserve_sequences_and_ack() {
+    fn batched_requests_preserve_sequences_and_ack() -> narf_kernel_test::TestResult {
         crate::netfilter::conntrack::__reset_for_test();
         let first = request();
         let mut second = request();
@@ -574,20 +575,20 @@ mod tests {
         let mut batch = first;
         batch.extend_from_slice(&second);
         let replies = build_replies(&batch).unwrap();
-        assert_eq!(replies.len(), 3);
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(replies.len(), 3);
+        narf_kernel_test::kt_assert_eq!(
             u32::from_ne_bytes(replies[0][8..12].try_into().unwrap()),
             55
         );
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(
             u32::from_ne_bytes(replies[1][8..12].try_into().unwrap()),
             56
         );
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(
             u16::from_ne_bytes(replies[2][4..6].try_into().unwrap()),
             NLMSG_ERROR
         );
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(
             i32::from_ne_bytes(
                 replies[2][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
                     .try_into()
@@ -595,10 +596,14 @@ mod tests {
             ),
             0
         );
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!(
+        "net/netlink_netfilter",
+        batched_requests_preserve_sequences_and_ack
+    );
 
-    #[test]
-    fn point_query_finds_canonical_tuple_and_omits_multi_flag() {
+    fn point_query_finds_canonical_tuple_and_omits_multi_flag() -> narf_kernel_test::TestResult {
         crate::netfilter::conntrack::__reset_for_test();
         let tracked = crate::netfilter::Tuple {
             src_ip: [192, 0, 2, 1],
@@ -625,19 +630,23 @@ mod tests {
             &body,
         );
         let replies = build_replies(&query).unwrap();
-        assert_eq!(replies.len(), 1);
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(replies.len(), 1);
+        narf_kernel_test::kt_assert_eq!(
             u16::from_ne_bytes(replies[0][4..6].try_into().unwrap()),
             (NFNL_SUBSYS_CTNETLINK << 8) | IPCTNL_MSG_CT_NEW
         );
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(
             u16::from_ne_bytes(replies[0][6..8].try_into().unwrap()) & NLM_F_MULTI,
             0
         );
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!(
+        "net/netlink_netfilter",
+        point_query_finds_canonical_tuple_and_omits_multi_flag
+    );
 
-    #[test]
-    fn missing_point_query_returns_enoent() {
+    fn missing_point_query_returns_enoent() -> narf_kernel_test::TestResult {
         crate::netfilter::conntrack::__reset_for_test();
         let mut body = alloc::vec![AF_INET, 0, 0, 0];
         push_attr(&mut body, CTA_ID, &99u32.to_be_bytes());
@@ -648,7 +657,7 @@ mod tests {
             &body,
         );
         let replies = build_replies(&query).unwrap();
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(
             i32::from_ne_bytes(
                 replies[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
                     .try_into()
@@ -656,5 +665,7 @@ mod tests {
             ),
             -ENOENT
         );
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/netlink_netfilter", missing_point_query_returns_enoent);
 }

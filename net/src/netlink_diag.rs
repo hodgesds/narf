@@ -367,7 +367,7 @@ pub fn build_replies_in_with(
     Ok(replies)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
 
@@ -383,19 +383,19 @@ mod tests {
         frame(SOCK_DIAG_BY_FAMILY, 1 | NLM_F_DUMP, 91, &body)
     }
 
-    #[test]
-    fn empty_tcp_dump_is_completed() {
+    fn empty_tcp_dump_is_completed() -> narf_kernel_test::TestResult {
         crate::tcp::core::__reset_for_test();
         let replies = build_replies(&request(IPPROTO_TCP)).unwrap();
-        assert_eq!(replies.len(), 1);
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(replies.len(), 1);
+        narf_kernel_test::kt_assert_eq!(
             u16::from_ne_bytes(replies[0][4..6].try_into().unwrap()),
             NLMSG_DONE
         );
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/netlink_diag", empty_tcp_dump_is_completed);
 
-    #[test]
-    fn diag_record_uses_network_order_ports_and_linux_layout() {
+    fn diag_record_uses_network_order_ports_and_linux_layout() -> narf_kernel_test::TestResult {
         let message = encode_record(
             DiagRecord {
                 family: AF_INET,
@@ -413,10 +413,10 @@ mod tests {
             7,
             true,
         );
-        assert_eq!(message.len(), NLMSG_HDRLEN + 72);
-        assert_eq!(&message[20..22], &8080u16.to_be_bytes());
-        assert_eq!(&message[24..28], &[127, 0, 0, 1]);
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(message.len(), NLMSG_HDRLEN + 72);
+        narf_kernel_test::kt_assert_eq!(&message[20..22], &8080u16.to_be_bytes());
+        narf_kernel_test::kt_assert_eq!(&message[24..28], &[127, 0, 0, 1]);
+        narf_kernel_test::kt_assert_eq!(
             u32::from_ne_bytes(
                 message[NLMSG_HDRLEN + 56..NLMSG_HDRLEN + 60]
                     .try_into()
@@ -424,10 +424,14 @@ mod tests {
             ),
             4
         );
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!(
+        "net/netlink_diag",
+        diag_record_uses_network_order_ports_and_linux_layout
+    );
 
-    #[test]
-    fn udp6_dump_encodes_family_and_full_addresses() {
+    fn udp6_dump_encodes_family_and_full_addresses() -> narf_kernel_test::TestResult {
         let local_addr = [0x20, 1, 0xdb, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         let rows = [UdpDiagRecord {
             state: 7,
@@ -445,24 +449,28 @@ mod tests {
             ..UserSockets::NONE
         };
         let replies = build_replies_in_with(4, &request_for(AF_INET6, IPPROTO_UDP), &user).unwrap();
-        assert_eq!(replies.len(), 2);
-        assert_eq!(replies[0][NLMSG_HDRLEN], AF_INET6);
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(replies.len(), 2);
+        narf_kernel_test::kt_assert_eq!(replies[0][NLMSG_HDRLEN], AF_INET6);
+        narf_kernel_test::kt_assert_eq!(
             &replies[0][NLMSG_HDRLEN + 8..NLMSG_HDRLEN + 24],
             &local_addr
         );
         // inet_diag_msg ends with idiag_uid, idiag_inode (offsets 64, 68):
         // what `ss -p` joins against /proc/<pid>/fd socket:[ino] links.
         let msg = &replies[0][NLMSG_HDRLEN..];
-        assert_eq!(u32::from_ne_bytes(msg[64..68].try_into().unwrap()), 1000);
-        assert_eq!(u32::from_ne_bytes(msg[68..72].try_into().unwrap()), 4242);
+        narf_kernel_test::kt_assert_eq!(u32::from_ne_bytes(msg[64..68].try_into().unwrap()), 1000);
+        narf_kernel_test::kt_assert_eq!(u32::from_ne_bytes(msg[68..72].try_into().unwrap()), 4242);
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!(
+        "net/netlink_diag",
+        udp6_dump_encodes_family_and_full_addresses
+    );
 
-    #[test]
-    fn unsupported_protocol_returns_enoent() {
+    fn unsupported_protocol_returns_enoent() -> narf_kernel_test::TestResult {
         // `inet_diag_lock_handler`: no handler for the protocol → -ENOENT.
         let replies = build_replies(&request(132)).unwrap();
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(
             i32::from_ne_bytes(
                 replies[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
                     .try_into()
@@ -470,10 +478,11 @@ mod tests {
             ),
             -ENOENT
         );
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/netlink_diag", unsupported_protocol_returns_enoent);
 
-    #[test]
-    fn batched_dumps_preserve_sequences_and_ack() {
+    fn batched_dumps_preserve_sequences_and_ack() -> narf_kernel_test::TestResult {
         crate::tcp::core::__reset_for_test();
         let mut first = request(IPPROTO_TCP);
         let mut second = request(IPPROTO_TCP);
@@ -483,16 +492,16 @@ mod tests {
         first.extend_from_slice(&second);
 
         let replies = build_replies(&first).unwrap();
-        assert_eq!(replies.len(), 3);
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(replies.len(), 3);
+        narf_kernel_test::kt_assert_eq!(
             u32::from_ne_bytes(replies[0][8..12].try_into().unwrap()),
             101
         );
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(
             u32::from_ne_bytes(replies[1][8..12].try_into().unwrap()),
             102
         );
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(
             i32::from_ne_bytes(
                 replies[2][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
                     .try_into()
@@ -500,14 +509,15 @@ mod tests {
             ),
             0
         );
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/netlink_diag", batched_dumps_preserve_sequences_and_ack);
 
-    #[test]
-    fn request_flag_is_required() {
+    fn request_flag_is_required() -> narf_kernel_test::TestResult {
         let mut message = request(IPPROTO_TCP);
         message[6..8].copy_from_slice(&NLM_F_DUMP.to_ne_bytes());
         let replies = build_replies(&message).unwrap();
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(
             i32::from_ne_bytes(
                 replies[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
                     .try_into()
@@ -515,5 +525,7 @@ mod tests {
             ),
             -EINVAL
         );
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/netlink_diag", request_flag_is_required);
 }

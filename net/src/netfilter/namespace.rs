@@ -121,19 +121,18 @@ pub(crate) fn remove(id: u64) {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "kernel-test"))]
 pub(crate) fn reset_all() {
     NAMESPACES.lock().clear();
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
     use crate::netfilter::rules::Match;
     use crate::netfilter::Verdict;
 
-    #[test]
-    fn namespace_rulesets_are_isolated() {
+    fn namespace_rulesets_are_isolated() -> narf_kernel_test::TestResult {
         reset_all();
         crate::netfilter::filter::nf_table_add_in(
             41,
@@ -142,24 +141,30 @@ mod tests {
             Match::any(),
             Verdict::Drop,
         );
-        assert_eq!(get(41).filter.snapshot().len(), 1);
-        assert!(get(42).filter.snapshot().is_empty());
+        narf_kernel_test::kt_assert_eq!(get(41).filter.snapshot().len(), 1);
+        narf_kernel_test::kt_assert!(get(42).filter.snapshot().is_empty());
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/netfilter/namespace", namespace_rulesets_are_isolated);
 
-    #[test]
-    fn authority_is_scoped_limited_and_revocable() {
+    fn authority_is_scoped_limited_and_revocable() -> narf_kernel_test::TestResult {
         let admin = NetfilterAdminHandle::mint(77, NetfilterRights::READ);
-        assert_eq!(admin.net_ns_id(), 77);
-        assert_eq!(admin.check(NetfilterRights::READ), Ok(()));
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(admin.net_ns_id(), 77);
+        narf_kernel_test::kt_assert_eq!(admin.check(NetfilterRights::READ), Ok(()));
+        narf_kernel_test::kt_assert_eq!(
             admin.check(NetfilterRights::RULESET),
             Err(NetfilterAuthorityError::RightsTooWeak)
         );
         let copy = admin.clone();
         admin.revoke();
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(
             copy.check(NetfilterRights::READ),
             Err(NetfilterAuthorityError::Revoked)
         );
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!(
+        "net/netfilter/namespace",
+        authority_is_scoped_limited_and_revocable
+    );
 }

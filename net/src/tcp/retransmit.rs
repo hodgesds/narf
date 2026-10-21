@@ -190,59 +190,72 @@ impl OutSeg {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
 
-    #[test]
-    fn first_sample_seeds_srtt_and_rttvar() {
+    fn first_sample_seeds_srtt_and_rttvar() -> narf_kernel_test::TestResult {
         let mut e = RttEstimator::new();
         e.sample(100_000_000); // 100 ms
-        assert!(e.valid);
-        assert_eq!(e.srtt_ns, 100_000_000);
-        assert_eq!(e.rttvar_ns, 50_000_000);
+        narf_kernel_test::kt_assert!(e.valid);
+        narf_kernel_test::kt_assert_eq!(e.srtt_ns, 100_000_000);
+        narf_kernel_test::kt_assert_eq!(e.rttvar_ns, 50_000_000);
         // RTO = SRTT + 4*RTTVAR = 100ms + 200ms = 300ms.
-        assert_eq!(e.current_rto(), 300_000_000);
+        narf_kernel_test::kt_assert_eq!(e.current_rto(), 300_000_000);
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/retransmit", first_sample_seeds_srtt_and_rttvar);
 
-    #[test]
-    fn second_sample_smooths_srtt() {
+    fn second_sample_smooths_srtt() -> narf_kernel_test::TestResult {
         let mut e = RttEstimator::new();
         e.sample(100_000_000);
         e.sample(200_000_000);
         // SRTT should move 1/8 of the way toward 200ms.
-        assert!(e.srtt_ns > 100_000_000 && e.srtt_ns < 200_000_000);
+        narf_kernel_test::kt_assert!(e.srtt_ns > 100_000_000 && e.srtt_ns < 200_000_000);
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/retransmit", second_sample_smooths_srtt);
 
-    #[test]
-    fn rto_clamp_min_and_max() {
+    fn rto_clamp_min_and_max() -> narf_kernel_test::TestResult {
         let mut e = RttEstimator::new();
         e.sample(1); // tiny RTT
-        assert!(e.current_rto() >= RTO_MIN_NS);
-        // Many back-offs: should saturate at RTO_MAX_NS.
+        narf_kernel_test::kt_assert!(e.current_rto() >= RTO_MIN_NS);
+        // Many back-offs: should saturate at RTO_MAX_NS. `back_off()` stops
+        // doubling after MAX_RETRANSMITS (200 ms << 7 = 25.6 s), so the clamp
+        // is reached through an unlimited retry budget.
         for _ in 0..20 {
-            let _ = e.back_off();
+            narf_kernel_test::kt_assert!(e.back_off_with_limit(u32::MAX, false));
         }
-        assert_eq!(e.current_rto(), RTO_MAX_NS);
+        narf_kernel_test::kt_assert_eq!(e.current_rto(), RTO_MAX_NS);
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/retransmit", rto_clamp_min_and_max);
 
-    #[test]
-    fn back_off_gives_up_after_max_retransmits() {
+    fn back_off_gives_up_after_max_retransmits() -> narf_kernel_test::TestResult {
         let mut e = RttEstimator::new();
         for i in 0..MAX_RETRANSMITS {
-            assert!(e.back_off(), "back_off {} should succeed", i);
+            narf_kernel_test::kt_assert!(e.back_off(), "back_off {} should succeed", i);
         }
         // One more should return false.
-        assert!(!e.back_off());
+        narf_kernel_test::kt_assert!(!e.back_off());
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!(
+        "net/tcp/retransmit",
+        back_off_gives_up_after_max_retransmits
+    );
 
-    #[test]
-    fn thin_linear_timeout_counts_without_exponential_backoff() {
+    fn thin_linear_timeout_counts_without_exponential_backoff() -> narf_kernel_test::TestResult {
         let mut e = RttEstimator::new();
         let initial = e.current_rto();
-        assert!(e.back_off_with_limit(2, true));
-        assert_eq!(e.current_rto(), initial);
-        assert!(e.back_off_with_limit(2, true));
-        assert!(!e.back_off_with_limit(2, true));
+        narf_kernel_test::kt_assert!(e.back_off_with_limit(2, true));
+        narf_kernel_test::kt_assert_eq!(e.current_rto(), initial);
+        narf_kernel_test::kt_assert!(e.back_off_with_limit(2, true));
+        narf_kernel_test::kt_assert!(!e.back_off_with_limit(2, true));
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!(
+        "net/tcp/retransmit",
+        thin_linear_timeout_counts_without_exponential_backoff
+    );
 }

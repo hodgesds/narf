@@ -126,3 +126,75 @@ macro_rules! kernel_test_in {
         };
     };
 }
+
+// ── panic-free assertions ───────────────────────────────────────────
+//
+// The test kernel cannot unwind: a panicking smoke takes the whole run down
+// and every test after it silently never runs (an `unwrap()` in one nl80211
+// smoke hid 25 failures that way). These return `TestResult::Fail` naming the
+// file, line and expression instead. Any trailing message arguments are
+// accepted for `assert!` compatibility and evaluated but not formatted
+// (`Fail` carries a `&'static str`).
+
+/// `assert!` for kernel tests: fail the smoke instead of panicking.
+#[macro_export]
+macro_rules! kt_assert {
+    ($cond:expr $(, $($arg:tt)*)?) => {
+        if !($cond) {
+            $(let _ = ($($arg)*,);)?
+            return $crate::TestResult::Fail(concat!(
+                file!(),
+                ":",
+                line!(),
+                ": assertion failed: ",
+                stringify!($cond)
+            ));
+        }
+    };
+}
+
+/// `assert_eq!` for kernel tests: fail the smoke instead of panicking.
+#[macro_export]
+macro_rules! kt_assert_eq {
+    ($left:expr, $right:expr $(, $($arg:tt)*)?) => {
+        match (&$left, &$right) {
+            (left, right) => {
+                if !(*left == *right) {
+                    $(let _ = ($($arg)*,);)?
+                    return $crate::TestResult::Fail(concat!(
+                        file!(),
+                        ":",
+                        line!(),
+                        ": ",
+                        stringify!($left),
+                        " != ",
+                        stringify!($right)
+                    ));
+                }
+            }
+        }
+    };
+}
+
+/// `assert_ne!` for kernel tests: fail the smoke instead of panicking.
+#[macro_export]
+macro_rules! kt_assert_ne {
+    ($left:expr, $right:expr $(, $($arg:tt)*)?) => {
+        match (&$left, &$right) {
+            (left, right) => {
+                if *left == *right {
+                    $(let _ = ($($arg)*,);)?
+                    return $crate::TestResult::Fail(concat!(
+                        file!(),
+                        ":",
+                        line!(),
+                        ": ",
+                        stringify!($left),
+                        " == ",
+                        stringify!($right)
+                    ));
+                }
+            }
+        }
+    };
+}

@@ -7612,36 +7612,17 @@ fn proc_wchan_of_frame(frame: Option<[u64; 9]>) -> Option<alloc::string::String>
 /// `/proc/<pid>/syscall` print "running": Linux fails the same way for a task
 /// still on a CPU, because the frame it would read is being written.
 ///
-/// The registers are the parked task's saved user state. Nothing extra is
-/// recorded at syscall entry to make this work — at a park, the syscall
-/// number is still in the register the ABI delivered it in (the return value
-/// has not been written yet), exactly as Linux's `pt_regs->orig_ax` holds it.
+/// The frame is decoded from where the task's entry path left its registers
+/// (`UserTaskCtx::blocked_syscall_frame`, Linux's `task_pt_regs()`). Reading
+/// `UserTaskCtx::state` instead, as this did, was wrong for any own-stack
+/// park: only a few park paths refresh that snapshot, so a task parked in
+/// `read`, `futex` or `wait4` showed an old trap's registers (`wchan` named
+/// `tkill`, `pkey_free`, ...).
 fn proc_task_syscall_frame(task: u64) -> Option<[u64; 9]> {
     if !crate::task::parked_in_syscall(task) {
         return None;
     }
-    crate::user_task::with_user_task_ctx(task, |uctx| {
-        // SAFETY: the task is parked, so its saved state is complete and no
-        // trap path is writing it — the same contract `get_tracee_regs` reads
-        // a stopped tracee's state under.
-        let state = unsafe { *uctx.state.get() };
-        #[cfg(target_arch = "x86_64")]
-        {
-            // syscall(2) ABI: nr in rax, args in rdi/rsi/rdx/r10/r8/r9.
-            [
-                state.rax, state.rdi, state.rsi, state.rdx, state.r10, state.r8, state.r9,
-                state.rsp, state.rip,
-            ]
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            // svc #0 ABI: nr in x8, args in x0..x5.
-            [
-                state.x[8], state.x[0], state.x[1], state.x[2], state.x[3], state.x[4], state.x[5],
-                state.sp, state.pc,
-            ]
-        }
-    })
+    crate::user_task::with_user_task_ctx(task, |uctx| uctx.blocked_syscall_frame()).flatten()
 }
 
 /// `/proc/<pid>/task/<tid>/comm` write hook — what `pthread_setname_np` uses.

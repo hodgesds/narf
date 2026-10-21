@@ -148,7 +148,7 @@ pub fn build_replies(datagram: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
     Ok(replies)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
 
@@ -156,22 +156,22 @@ mod tests {
         frame(kind, flags | NLM_F_REQUEST, seq, &[])
     }
 
-    #[test]
-    fn get_returns_disabled_status() {
+    fn get_returns_disabled_status() -> narf_kernel_test::TestResult {
         let replies = build_replies(&request(AUDIT_GET, 0, 7)).unwrap();
-        assert_eq!(replies.len(), 1);
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(replies.len(), 1);
+        narf_kernel_test::kt_assert_eq!(
             u16::from_ne_bytes(replies[0][4..6].try_into().unwrap()),
             AUDIT_GET
         );
-        assert_eq!(replies[0].len(), align(NLMSG_HDRLEN + 44));
-        assert!(replies[0][NLMSG_HDRLEN..].iter().all(|byte| *byte == 0));
+        narf_kernel_test::kt_assert_eq!(replies[0].len(), align(NLMSG_HDRLEN + 44));
+        narf_kernel_test::kt_assert!(replies[0][NLMSG_HDRLEN..].iter().all(|byte| *byte == 0));
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/netlink_audit", get_returns_disabled_status);
 
-    #[test]
-    fn set_requires_native_authority() {
+    fn set_requires_native_authority() -> narf_kernel_test::TestResult {
         let replies = build_replies(&request(AUDIT_SET, 0, 8)).unwrap();
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(
             i32::from_ne_bytes(
                 replies[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
                     .try_into()
@@ -179,17 +179,18 @@ mod tests {
             ),
             -EPERM
         );
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/netlink_audit", set_requires_native_authority);
 
-    #[test]
-    fn userspace_records_are_acknowledged_when_audit_is_disabled() {
+    fn userspace_records_are_acknowledged_when_audit_is_disabled() -> narf_kernel_test::TestResult {
         let replies = build_replies(&request(AUDIT_FIRST_USER_MSG, NLM_F_ACK, 9)).unwrap();
-        assert_eq!(replies.len(), 1);
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(replies.len(), 1);
+        narf_kernel_test::kt_assert_eq!(
             u16::from_ne_bytes(replies[0][4..6].try_into().unwrap()),
             NLMSG_ERROR
         );
-        assert_eq!(
+        narf_kernel_test::kt_assert_eq!(
             i32::from_ne_bytes(
                 replies[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
                     .try_into()
@@ -197,5 +198,10 @@ mod tests {
             ),
             0
         );
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!(
+        "net/netlink_audit",
+        userspace_records_are_acknowledged_when_audit_is_disabled
+    );
 }

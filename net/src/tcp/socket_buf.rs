@@ -459,76 +459,81 @@ fn segment_overlap_or_adjacent(la: u32, ra: u32, lb: u32, rb: u32) -> bool {
     overlap || adjacent
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
     extern crate alloc;
 
-    #[test]
-    fn send_buf_write_and_ack() {
+    fn send_buf_write_and_ack() -> narf_kernel_test::TestResult {
         let mut s = SendBuf::new(1024, 100);
         let n = s.write(b"hello world");
-        assert_eq!(n, 11);
-        assert_eq!(s.unsent_len(), 11);
+        narf_kernel_test::kt_assert_eq!(n, 11);
+        narf_kernel_test::kt_assert_eq!(s.unsent_len(), 11);
         s.mark_sent(5); // "hello"
-        assert_eq!(s.inflight_bytes(), 5);
-        assert_eq!(s.unsent_len(), 6);
+        narf_kernel_test::kt_assert_eq!(s.inflight_bytes(), 5);
+        narf_kernel_test::kt_assert_eq!(s.unsent_len(), 6);
         // Ack the first 3 bytes ("hel").
         let acked = s.ack(103);
-        assert_eq!(acked, 3);
-        assert_eq!(s.unacked_head_seq, 103);
-        assert_eq!(s.inflight_bytes(), 2);
+        narf_kernel_test::kt_assert_eq!(acked, 3);
+        narf_kernel_test::kt_assert_eq!(s.unacked_head_seq, 103);
+        narf_kernel_test::kt_assert_eq!(s.inflight_bytes(), 2);
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/socket_buf", send_buf_write_and_ack);
 
-    #[test]
-    fn recv_buf_in_order_reads_back() {
+    fn recv_buf_in_order_reads_back() -> narf_kernel_test::TestResult {
         let mut r = RecvBuf::new(1024);
         let mut rcv_nxt = 100;
         rcv_nxt = r.accept(100, b"AAAA", rcv_nxt);
-        assert_eq!(rcv_nxt, 104);
+        narf_kernel_test::kt_assert_eq!(rcv_nxt, 104);
         let mut buf = [0u8; 8];
         let n = r.read(&mut buf);
-        assert_eq!(n, 4);
-        assert_eq!(&buf[..4], b"AAAA");
+        narf_kernel_test::kt_assert_eq!(n, 4);
+        narf_kernel_test::kt_assert_eq!(&buf[..4], b"AAAA");
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/socket_buf", recv_buf_in_order_reads_back);
 
-    #[test]
-    fn recv_buf_out_of_order_stitches() {
+    fn recv_buf_out_of_order_stitches() -> narf_kernel_test::TestResult {
         let mut r = RecvBuf::new(1024);
         let mut rcv_nxt = 100;
         // Arrive out-of-order: 110..115 first, then 100..110.
         rcv_nxt = r.accept(110, b"DDDDD", rcv_nxt);
-        assert_eq!(rcv_nxt, 100, "out-of-order shouldn't advance rcv_nxt");
+        narf_kernel_test::kt_assert_eq!(rcv_nxt, 100, "out-of-order shouldn't advance rcv_nxt");
         rcv_nxt = r.accept(100, b"AAAAAAAAAA", rcv_nxt);
-        assert_eq!(rcv_nxt, 115, "in-order arrival should stitch the OO seg");
+        narf_kernel_test::kt_assert_eq!(rcv_nxt, 115, "in-order arrival should stitch the OO seg");
         let mut buf = [0u8; 32];
         let n = r.read(&mut buf);
-        assert_eq!(n, 15);
-        assert_eq!(&buf[..10], b"AAAAAAAAAA");
-        assert_eq!(&buf[10..15], b"DDDDD");
+        narf_kernel_test::kt_assert_eq!(n, 15);
+        narf_kernel_test::kt_assert_eq!(&buf[..10], b"AAAAAAAAAA");
+        narf_kernel_test::kt_assert_eq!(&buf[10..15], b"DDDDD");
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/socket_buf", recv_buf_out_of_order_stitches);
 
-    #[test]
-    fn recv_buf_sack_blocks_after_ooo() {
+    fn recv_buf_sack_blocks_after_ooo() -> narf_kernel_test::TestResult {
         let mut r = RecvBuf::new(1024);
         let mut rcv_nxt = 100;
         rcv_nxt = r.accept(200, b"E", rcv_nxt);
         rcv_nxt = r.accept(300, b"F", rcv_nxt);
         let blocks = r.sack_blocks();
-        assert_eq!(blocks.len(), 2);
+        narf_kernel_test::kt_assert_eq!(blocks.len(), 2);
         // MRU first.
-        assert_eq!(blocks[0].left, 300);
-        assert_eq!(blocks[1].left, 200);
+        narf_kernel_test::kt_assert_eq!(blocks[0].left, 300);
+        narf_kernel_test::kt_assert_eq!(blocks[1].left, 200);
         let _ = rcv_nxt;
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/socket_buf", recv_buf_sack_blocks_after_ooo);
 
-    #[test]
-    fn recv_buf_free_window_decreases() {
+    fn recv_buf_free_window_decreases() -> narf_kernel_test::TestResult {
         let mut r = RecvBuf::new(100);
         let initial = r.free_window();
         let _ = r.accept(0, &[0u8; 50], 0);
         let after = r.free_window();
-        assert!(after < initial);
-        assert_eq!(after, 50);
+        narf_kernel_test::kt_assert!(after < initial);
+        narf_kernel_test::kt_assert_eq!(after, 50);
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/tcp/socket_buf", recv_buf_free_window_decreases);
 }

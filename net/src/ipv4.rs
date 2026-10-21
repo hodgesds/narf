@@ -287,13 +287,14 @@ pub fn __reset_for_test() {
     BINDINGS.lock().clear();
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
 
-    #[test]
-    fn link_local_detection() {
-        assert!(Ipv4Addr([169, 254, 1, 1]).is_link_local());
-        assert!(!Ipv4Addr([10, 0, 2, 15]).is_link_local());
+    fn link_local_detection() -> narf_kernel_test::TestResult {
+        narf_kernel_test::kt_assert!(Ipv4Addr([169, 254, 1, 1]).is_link_local());
+        narf_kernel_test::kt_assert!(!Ipv4Addr([10, 0, 2, 15]).is_link_local());
+        narf_kernel_test::TestResult::Pass
     }
+    narf_kernel_test::kernel_test_in!("net/ipv4", link_local_detection);
 }
