@@ -184,8 +184,14 @@ Lock-free; only the owning CPU writes its cell.
 ### 3.6.1 Per-CPU telemetry counters
 
 ```rust
+pub fn read_each_cpu<T>(
+    cells: &[T],
+    read: impl FnMut(usize, &T),
+);
+
 pub struct PerCpuCounterBank<const N: usize>;
 pub struct PerCpuCounterSnapshot<const N: usize>;
+pub struct PerCpuCounterValues<'a, const N: usize>;
 
 impl<const N: usize> PerCpuCounterBank<N> {
     pub const fn new() -> Self;
@@ -193,6 +199,10 @@ impl<const N: usize> PerCpuCounterBank<N> {
     pub fn add(&self, counter: usize, value: u64);
     pub fn snapshot(&self) -> PerCpuCounterSnapshot<N>;
     pub fn snapshot_cpu(&self, cpu: usize) -> PerCpuCounterSnapshot<N>;
+    pub fn read_each_cpu(
+        &self,
+        read: impl FnMut(usize, PerCpuCounterValues<'_, N>),
+    );
 }
 impl<const N: usize> Default for PerCpuCounterBank<N> {
     fn default() -> Self;
@@ -201,6 +211,9 @@ impl<const N: usize> PerCpuCounterSnapshot<N> {
     pub fn get(&self, counter: usize) -> u64;
     pub fn delta_since(self, previous: Self) -> Self;
 }
+impl<const N: usize> PerCpuCounterValues<'_, N> {
+    pub fn get(&self, counter: usize) -> u64;
+}
 ```
 
 `PerCpuCounterBank` is the low-overhead telemetry primitive: the CPU that
@@ -208,6 +221,13 @@ records an event only writes its own cache-line-padded counter array with a
 relaxed load/store, avoiding locked RMW and cross-CPU cache-line bouncing.
 Snapshots are intentionally eventually consistent; callers measure an interval
 by taking two snapshots and applying wrapping `delta_since`.
+
+`read_each_cpu` is the CPU-major read API for a procfs/sysfs-style renderer
+that needs several values from each CPU. It calls the reader once per CPU row;
+the reader loads all desired fields before returning, avoiding a separate
+cross-CPU sweep for every rendered value. It preserves the same
+eventually-consistent contract as `snapshot`: it is never an accounting or
+admission-control primitive.
 
 ### 3.7 Durable readiness
 

@@ -11,7 +11,7 @@
 //! trip a layout-sensitive task-future/waker vtable corruption (the
 //! "marginal-buddy" flake), so profiling state must stay out of it.
 
-use crate::percpu::{current_cpu, MAX_CPUS};
+use crate::percpu::{current_cpu, read_each_cpu, MAX_CPUS};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Master gate. When `false` (the default — "not attached"), every
@@ -135,13 +135,13 @@ pub struct Snapshot {
 /// Sum every CPU's counters into one [`Snapshot`].
 pub fn snapshot() -> Snapshot {
     let mut s = Snapshot::default();
-    for p in COUNTERS.iter() {
+    read_each_cpu(&COUNTERS, |_, p| {
         s.ctx += p.ctx.load(Ordering::Relaxed);
         s.syscalls += p.syscalls.load(Ordering::Relaxed);
         s.page_faults += p.page_faults.load(Ordering::Relaxed);
         s.user_ticks += p.user_ticks.load(Ordering::Relaxed);
         s.kernel_ticks += p.kernel_ticks.load(Ordering::Relaxed);
-    }
+    });
     s
 }
 

@@ -62,6 +62,32 @@ fn smoke_irq_dispatch_fire_count() -> TestResult {
 }
 kernel_test_in!("interrupts", smoke_irq_dispatch_fire_count);
 
+/// `/proc/interrupts` consumes `snapshot_counters`, while driver-facing code
+/// can query the same per-CPU value through `fire_count_on_cpu`.  Keep those
+/// public observations identical as the collector's backing layout changes.
+fn smoke_irq_counter_snapshot_matches_per_cpu_accessor() -> TestResult {
+    const VECTOR: u8 = 102;
+    let cpu = narf_lib::percpu::current_cpu();
+    let before = crate::fire_count_on_cpu(VECTOR, cpu);
+    crate::on_irq(VECTOR);
+    let expected = before.wrapping_add(1);
+
+    let Some(snapshot) = crate::snapshot_counters()
+        .into_iter()
+        .find(|snapshot| snapshot.vector == VECTOR)
+    else {
+        return TestResult::Fail("counter snapshot omitted a fired vector");
+    };
+    if snapshot.per_cpu[cpu] != expected || crate::fire_count_on_cpu(VECTOR, cpu) != expected {
+        return TestResult::Fail("counter snapshot disagrees with per-CPU accessor");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "interrupts",
+    smoke_irq_counter_snapshot_matches_per_cpu_accessor
+);
+
 fn smoke_vector_alloc_unique() -> TestResult {
     use crate::vector::{alloc, free, is_allocated};
     let v0 = match alloc() {

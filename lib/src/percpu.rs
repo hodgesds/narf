@@ -124,6 +124,25 @@ pub fn current_cpu() -> usize {
     narf_arch_cpu_id_hook()
 }
 
+/// Visit one per-CPU cell at a time, in ascending CPU order.
+///
+/// This is the read-side companion for a layout in which each CPU owns one
+/// cache-line-isolated row.  A diagnostic reader that needs several values
+/// from each CPU should load all of a row's values inside `read` before moving
+/// to the next CPU.  That keeps a remotely owned row hot for the shortest
+/// possible interval, rather than revisiting it once per rendered value.
+///
+/// This does not create a coherent system-wide snapshot: each row may change
+/// while the callback runs.  Per-CPU telemetry is deliberately eventually
+/// consistent, so callers must not use it for admission control or any other
+/// correctness decision.
+#[inline]
+pub fn read_each_cpu<T>(cells: &[T], mut read: impl FnMut(usize, &T)) {
+    for (cpu, cell) in cells.iter().enumerate() {
+        read(cpu, cell);
+    }
+}
+
 /// Cache-line-padded, monotonically increasing counters with one bank per
 /// CPU.  The owner CPU updates only its own bank using relaxed load/store, so
 /// an increment does not issue a locked RMW or bounce a cache line between
@@ -192,13 +211,34 @@ impl<const N: usize> PerCpuCounterBank<N> {
     /// Aggregate a relaxed snapshot across every CPU's counter bank.
     pub fn snapshot(&self) -> PerCpuCounterSnapshot<N> {
         let mut snapshot = PerCpuCounterSnapshot::zero();
-        for cell in &self.cells {
+        read_each_cpu(&self.cells, |_, cell| {
             for (index, value) in cell.values.iter().enumerate() {
                 snapshot.values[index] =
                     snapshot.values[index].wrapping_add(value.load(Ordering::Relaxed));
             }
-        }
+        });
         snapshot
+    }
+
+    /// Read all values from one CPU at a time.
+    ///
+    /// Procfs/sysfs-style renderers that need more than one counter for each
+    /// CPU should make every load for a CPU from this callback before it
+    /// returns.  This preserves the bank's CPU-major access pattern and avoids
+    /// repeatedly acquiring the same remote cache line for separately rendered
+    /// values.
+    ///
+    /// Values are relaxed, eventually-consistent telemetry snapshots.  A
+    /// callback must not retain `values` beyond its invocation.
+    pub fn read_each_cpu(&self, mut read: impl FnMut(usize, PerCpuCounterValues<'_, N>)) {
+        read_each_cpu(&self.cells, |cpu, cell| {
+            read(
+                cpu,
+                PerCpuCounterValues {
+                    values: &cell.values,
+                },
+            );
+        });
     }
 
     /// Snapshot one CPU's counter bank without cross-CPU aggregation.  An
@@ -225,6 +265,34 @@ impl<const N: usize> core::fmt::Debug for PerCpuCounterBank<N> {
         f.debug_struct("PerCpuCounterBank")
             .field("counters_per_cpu", &N)
             .field("max_cpus", &MAX_CPUS)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Read-only view of one CPU's [`PerCpuCounterBank`] values.
+///
+/// Obtained only from [`PerCpuCounterBank::read_each_cpu`].  It deliberately
+/// exposes relaxed loads rather than references to the atomics, so callers
+/// keep the eventually-consistent telemetry contract explicit.
+pub struct PerCpuCounterValues<'a, const N: usize> {
+    values: &'a [AtomicU64; N],
+}
+
+impl<const N: usize> PerCpuCounterValues<'_, N> {
+    /// Value of one counter, or zero for an invalid index.
+    #[inline]
+    pub fn get(&self, counter: usize) -> u64 {
+        self.values
+            .get(counter)
+            .map(|value| value.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+}
+
+impl<const N: usize> core::fmt::Debug for PerCpuCounterValues<'_, N> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PerCpuCounterValues")
+            .field("counters", &N)
             .finish_non_exhaustive()
     }
 }
@@ -292,6 +360,39 @@ mod host_tests {
         assert_eq!(delta.get(0), 9);
         assert_eq!(delta.get(1), 0);
         assert_eq!(delta.get(2), 1);
+    }
+
+    #[test]
+    fn counter_bank_reads_all_values_before_advancing_cpu() {
+        let counters = PerCpuCounterBank::<2>::new();
+        for (cpu, cell) in counters.cells.iter().enumerate() {
+            cell.values[0].store(cpu as u64, Ordering::Relaxed);
+            cell.values[1].store((cpu as u64).wrapping_add(100), Ordering::Relaxed);
+        }
+
+        let mut next_cpu = 0;
+        counters.read_each_cpu(|cpu, values| {
+            assert_eq!(cpu, next_cpu);
+            assert_eq!(values.get(0), cpu as u64);
+            assert_eq!(values.get(1), (cpu as u64).wrapping_add(100));
+            next_cpu += 1;
+        });
+        assert_eq!(next_cpu, MAX_CPUS);
+    }
+
+    #[test]
+    fn read_each_cpu_visits_each_row_once_in_cpu_order() {
+        let rows: [u32; MAX_CPUS] = core::array::from_fn(|cpu| cpu as u32);
+        let mut next_cpu = 0;
+        let mut total = 0u64;
+        read_each_cpu(&rows, |cpu, value| {
+            assert_eq!(cpu, next_cpu);
+            assert_eq!(*value, cpu as u32);
+            total += *value as u64;
+            next_cpu += 1;
+        });
+        assert_eq!(next_cpu, MAX_CPUS);
+        assert_eq!(total, (MAX_CPUS as u64 * (MAX_CPUS as u64 - 1)) / 2);
     }
 }
 

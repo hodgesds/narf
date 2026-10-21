@@ -91,6 +91,28 @@ impl core::fmt::Debug for HandlerEntry {
 /// doesn't need the dep. Re-exported for `/proc/interrupts` rendering.
 pub const PERCPU_FIRES_MAX: usize = 64;
 
+/// All IRQ-fire counters owned by one CPU.
+///
+/// Counter storage is CPU-major rather than vector-major.  An IRQ updates only
+/// its local row, so CPUs taking the same vector do not contend for a shared
+/// cache line.  `/proc/interrupts` snapshots a complete row before moving to
+/// the next CPU through `narf_lib::percpu::read_each_cpu`.
+#[repr(align(64))]
+struct PerCpuFireCounters {
+    values: [AtomicU64; NUM_VECTORS],
+}
+
+impl PerCpuFireCounters {
+    const fn new() -> Self {
+        Self {
+            values: [const { AtomicU64::new(0) }; NUM_VECTORS],
+        }
+    }
+}
+
+static PERCPU_FIRES: [PerCpuFireCounters; PERCPU_FIRES_MAX] =
+    [const { PerCpuFireCounters::new() }; PERCPU_FIRES_MAX];
+
 // ── Re-entry guard ─────────────────────────────────────────────────
 //
 // Per-CPU "currently dispatching vector X" marker. `on_irq` sets
@@ -212,9 +234,6 @@ pub struct Slot {
     /// Total IRQs delivered on this vector since boot, across all
     /// CPUs. Never decreases.
     pub fired: AtomicU64,
-    /// Per-CPU fire counts. Diagnoses IRQ-steering issues — Linux's
-    /// `/proc/interrupts` shows the same shape.
-    pub per_cpu_fired: [AtomicU64; PERCPU_FIRES_MAX],
     /// Spurious-IRQ count: incremented when every installed handler
     /// returned `IrqStatus::None`. A nonzero value points at a
     /// driver that's not claiming a shared line correctly, OR (more
@@ -260,7 +279,6 @@ impl Slot {
     pub const fn new() -> Self {
         Self {
             fired: AtomicU64::new(0),
-            per_cpu_fired: [const { AtomicU64::new(0) }; PERCPU_FIRES_MAX],
             spurious: AtomicU64::new(0),
             in_flight: AtomicU32::new(0),
             masked: AtomicBool::new(false),
@@ -501,7 +519,7 @@ pub fn on_irq_with_user_state(
         }
         INTERRUPTED_USER_VALID[cpu].store(true, Ordering::Release);
     }
-    s.per_cpu_fired[cpu].fetch_add(1, Ordering::Release);
+    PERCPU_FIRES[cpu].values[vector as usize].fetch_add(1, Ordering::Release);
 
     // Publish the dispatch marker for the lifetime of the chain
     // walk + waker drain. Any mutator (install_handler_named,
@@ -646,17 +664,23 @@ pub fn snapshot_counters() -> alloc::vec::Vec<IrqCounterSnapshot> {
         if fired == 0 && handlers.is_empty() {
             continue;
         }
-        let mut per_cpu = [0u64; PERCPU_FIRES_MAX];
-        for (cpu, count) in per_cpu.iter_mut().enumerate() {
-            *count = slot.per_cpu_fired[cpu].load(Ordering::Acquire);
-        }
         out.push(IrqCounterSnapshot {
             vector: v as u8,
             total: fired,
-            per_cpu,
+            per_cpu: [0; PERCPU_FIRES_MAX],
             handler_names: handlers,
         });
     }
+
+    // Read all vectors needed for one CPU while that CPU's local counter row
+    // is resident, then advance to the next CPU.  The individual values stay
+    // eventually consistent just as they did in the vector-major layout.
+    narf_lib::percpu::read_each_cpu(&PERCPU_FIRES, |cpu, counters| {
+        for snapshot in &mut out {
+            snapshot.per_cpu[cpu] =
+                counters.values[snapshot.vector as usize].load(Ordering::Acquire);
+        }
+    });
     out
 }
 
@@ -685,7 +709,7 @@ pub fn fire_count_on_cpu(vector: u8, cpu: usize) -> u64 {
     if cpu >= PERCPU_FIRES_MAX {
         return 0;
     }
-    SLOTS[vector as usize].per_cpu_fired[cpu].load(Ordering::Acquire)
+    PERCPU_FIRES[cpu].values[vector as usize].load(Ordering::Acquire)
 }
 
 /// Snapshot of how many wake() / wake_by_ref() calls `on_irq`
