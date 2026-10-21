@@ -276,18 +276,8 @@ fn pipe_mcache(
         return Ok([dml::McacheRegs::UNASSIGNED; 2]);
     };
     let surface = surface.ok_or(Error::Invalid)?;
-    let (_, scaler) = surface
-        .request
-        .scalers()
-        .find(|&(q, _)| q == p)
-        .ok_or(Error::Invalid)?;
-    let span = |r: crate::amdgpu_dcn401_spl::Rect| (r.x.max(0) as u32, r.width.max(0) as u32);
-    let chroma = surface
-        .request
-        .format
-        .is_video()
-        .then(|| span(scaler.viewport_c));
-    Ok(a.pipe_regs(span(scaler.viewport), chroma)
+    let (luma, chroma) = surface.request.mcache_viewports(p).ok_or(Error::Invalid)?;
+    Ok(a.pipe_regs(luma, chroma)
         .unwrap_or([dml::McacheRegs::UNASSIGNED; 2]))
 }
 

@@ -53,7 +53,13 @@
 # harness_surfaces.c as plane_vectors.txt, each plan line exact; its
 # "! ClockState" lines are RAISED plans. A DCC plane whose mcaches one pipe
 # cannot place is split over two MPC-combined pipes ("/2" and the pipe-0
-# blank end) by pmo_dcn4_fams2_optimize_dcc_mcache whatever the factor.
+# blank end) by pmo_dcn4_fams2_optimize_dcc_mcache whatever the factor, or
+# on a single ODM stream gets one more ODM pipe. The harnesses run PMO as
+# DC does on DCN401 (disable_dyn_odm false), every stream's
+# disable_dynamic_odm set (NARF does not port the Vmin phase's dynamic ODM);
+# each plane's DET is the 320 KiB DCN4_01_DEFAULT_DET_SIZE NARF programs
+# (det_size_override_kb, which DC never sets: DC lets CalculateDETBufferSize
+# share the 1280 KiB with minimize_det_reallocation).
 # --regenerate-surfaces answers its inputs again.
 # surface_mpc_vectors.txt is as surface_vectors.txt, planned with MPC_AUTO
 # (DC's auto mpcc_combine_factor): tiled, DCC, rotated and 4:2:0 planes one
@@ -128,7 +134,22 @@ cc -O1 -w "${inc[@]}" "$here/harness.c" "$work/obj/dml2_core_dcn4_calcs.o" $othe
 cc -O1 -w "${inc[@]}" "$here/harness.c" "$work/strict_calcs.o" $others -lm -o "$work/strict"
 cc -O1 -w "${inc[@]}" "$here/harness_multi.c" "$work/strict_calcs.o" $others -lm -o "$work/strict_multi"
 cc -O1 -w "${inc[@]}" "$here/harness_planes.c" "$work/strict_calcs.o" $others -lm -o "$work/strict_planes"
-cc -O1 -w "${inc[@]}" "$here/harness_surfaces.c" "$work/strict_calcs.o" $others -lm -o "$work/strict_surfaces"
+# The mcache programming's per-pipe viewports come from SPL (dc/sspl), built
+# as tests/dcn401_spl builds it, in its own unit (spl_viewport.c).
+sspl=$linux/drivers/gpu/drm/amd/display/dc/sspl
+spl_inc=(-I"$here/../dcn401_spl/include" -I"$sspl" -I"$work" -I"$linux/drivers/gpu/drm/amd/include")
+awk '/^void dscl401_spl_calc_lb_num_partitions\(/ { on = 1 }
+	on { print }
+	on && /^}/ { exit }' "$linux/drivers/gpu/drm/amd/display/dc/dpp/dcn401/dcn401_dpp.c" \
+	> "$work/spl_lb.inc"
+[ -s "$work/spl_lb.inc" ] || { echo "dscl401_spl_calc_lb_num_partitions not found" >&2; exit 1; }
+mkdir -p "$work/spl"
+for f in dc_spl dc_spl_scl_filters dc_spl_scl_easf_filters dc_spl_isharp_filters \
+	dc_spl_filters spl_fixpt31_32 spl_custom_float; do
+	cc -c -O1 -w -Wno-error=incompatible-pointer-types "${spl_inc[@]}" "$sspl/$f.c" -o "$work/spl/$f.o"
+done
+cc -c -O1 -w "${spl_inc[@]}" "$here/spl_viewport.c" -o "$work/spl/spl_viewport.o"
+cc -O1 -w "${inc[@]}" "$here/harness_surfaces.c" "$work/strict_calcs.o" $others "$work"/spl/*.o -lm -o "$work/strict_surfaces"
 cc -O1 -w "${inc[@]}" "$here/harness_pstate.c" "$work/strict_calcs.o" $others -lm -o "$work/strict_pstate"
 
 # pstate_answer: answer pstate_vectors.txt inputs from stdin with Linux

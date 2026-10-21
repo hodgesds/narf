@@ -71,8 +71,13 @@ int main(int argc, char **argv)
 	init.options.project_id = dml2_project_dcn4x_stage2_auto_drr_svp;
 	struct dml2_pmo_options *o = &init.options.pmo_options;
 	o->disable_vblank = o->disable_svp = o->disable_drr_var = true;
-	o->disable_drr_clamped = o->disable_fams2 = o->disable_dyn_odm = true;
+	o->disable_drr_clamped = o->disable_fams2 = true;
 	o->disable_drr_var_when_var_active = o->disable_drr_clamped_when_var_active = true;
+	/* dml21_populate_pmo_options as DC runs DCN401
+	 * (minimize_dispclk_using_odm): dynamic ODM on for one stream, so
+	 * pmo_dcn4_fams2_optimize_dcc_mcache may raise a single ODM stream's
+	 * combine factor, off for several or with SubVP. */
+	o->disable_dyn_odm = false;
 	o->disable_dyn_odm_for_multi_stream = o->disable_dyn_odm_for_stream_with_svp = true;
 	init.soc_bb = dml2_socbb_dcn401;
 	init.soc_bb.qos_parameters = dml_dcn4_variant_a_soc_qos_params;
@@ -136,6 +141,10 @@ int main(int argc, char **argv)
 			t->dsc.dsc_compressed_bpp_x16 = bpp_x16;
 		}
 		s->overrides.odm_mode = dml2_odm_mode_auto;
+		/* DC clears this per stream for DCN401's single-display 2:1 ODM
+		 * policy (enable_single_display_2to1_odm_policy), which drives
+		 * the Vmin phase's dynamic ODM. NARF does not port that phase:
+		 * every stream keeps it set, so the Vmin phase leaves ODM alone. */
 		s->overrides.disable_dynamic_odm = true;
 		s->overrides.disable_subvp = true;
 		s->overrides.hw.twait_budgeting.fclk_pstate = dml2_twait_budgeting_setting_if_needed;

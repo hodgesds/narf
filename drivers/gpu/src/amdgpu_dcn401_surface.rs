@@ -622,6 +622,16 @@ impl SurfaceRequest {
                 (p, scaler)
             })
     }
+    /// dml21_get_pipe_mcache_config for pipe `p` of the request: the x and
+    /// width of the pipe's own SPL luma viewport, and of its chroma
+    /// viewport for a 4:2:0 surface (scl_data.viewport and viewport_c, also
+    /// when rotated). `None` for a pipe the request does not fetch on.
+    pub fn mcache_viewports(self, p: u8) -> Option<((u32, u32), Option<(u32, u32)>)> {
+        let (_, scaler) = self.scalers().find(|&(q, _)| q == p)?;
+        let span = |r: spl::Rect| (r.x.max(0) as u32, r.width.max(0) as u32);
+        let chroma = self.format.is_video().then(|| span(scaler.viewport_c));
+        Some((span(scaler.viewport), chroma))
+    }
     /// resource_build_scaling_params for pipe `p` of the request: whether
     /// SPL can scale the plane on that pipe's slice (`scalers`); true for
     /// a pipe the request does not fetch on.

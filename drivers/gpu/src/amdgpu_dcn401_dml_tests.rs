@@ -1170,17 +1170,17 @@ kernel_test_in!(
 /// Shared with tests/dcn401_dml21/check.sh (harness_surfaces.c, RAISED).
 const SURFACE_VECTORS: &str = include_str!("../tests/dcn401_dml21/surface_vectors.txt");
 
-/// The 56 values harness_surfaces.c prints after a plane's 62: the chroma
+/// The 90 values harness_surfaces.c prints after a plane's 62: the chroma
 /// DLG/TTU delivery, both surfaces' rq_regs, the expansion modes, the DET's
-/// chroma base, unbounded requesting, the arbiter's hw_debug5, the mcache
-/// allocation and two pipes' mcache registers.
-fn surface_values(plan: &Plan, k: usize, p: &PlanePlan) -> [u32; 56] {
-    let mut out = [0u32; 56];
+/// chroma base, unbounded requesting, the arbiter's hw_debug5, the whole
+/// mcache allocation and four pipes' mcache registers.
+const SURFACE_VALUES: usize = 27 + 2 + 4 * (MAX_MCACHES + 1) + 1 + 4 * 6;
+fn surface_values(plan: &Plan, k: usize, p: &PlanePlan, rotation: u32) -> [u32; SURFACE_VALUES] {
+    let mut out = [0u32; SURFACE_VALUES];
     out[..27].copy_from_slice(&surface_rq_values(plan, p)[..27]);
-    // The mcache allocation, then each of two pipes' mcache registers with
-    // pipe j of n taking the j-th n-th of each viewport (harness_surfaces.c).
+    // The mcache allocation, then each of four pipes' mcache registers.
     let a = p.mcache.unwrap_or_default();
-    let mut v = alloc::vec::Vec::with_capacity(29);
+    let mut v = alloc::vec::Vec::with_capacity(SURFACE_VALUES - 27);
     v.extend(a.count.map(u32::from));
     for i in 0..2 {
         v.extend(a.offsets[i].map(u32::from));
@@ -1190,20 +1190,23 @@ fn surface_values(plan: &Plan, k: usize, p: &PlanePlan) -> [u32; 56] {
     }
     v.push(u32::from(a.shared));
     let plane = plan.mode.plane_list().nth(k).unwrap_or_default();
-    // The plane's pipes: its stream's ODM segments or its MPC slices.
+    // The production path's viewports (`SurfaceRequest::mcache_viewports`,
+    // as `deadline::pipe_mcache` takes them): SPL on each pipe's ODM
+    // segment or MPC slice of the plane, its source the viewport at the
+    // surface origin and its destination the whole stream
+    // (harness_surfaces.c / spl_viewport.c).
+    let request = surface_request(plan, &plane, rotation, p.dpps);
     let n = u32::from(p.dpps);
-    for j in 0..2u32 {
+    for j in 0..4u32 {
         if j >= n {
             v.extend([0; 6]);
             continue;
         }
-        let share = |w: u16| (j * (u32::from(w) / n), u32::from(w) / n);
         let regs = match p.mcache {
             None => Some([McacheRegs::UNASSIGNED; 2]),
-            Some(a) => a.pipe_regs(
-                share(plane.viewport_width),
-                plane.chroma.map(|c| share(c.viewport_width)),
-            ),
+            Some(a) => request
+                .mcache_viewports(j as u8)
+                .and_then(|(luma, chroma)| a.pipe_regs(luma, chroma)),
         };
         match regs {
             Some(r) => {
@@ -1216,6 +1219,67 @@ fn surface_values(plan: &Plan, k: usize, p: &PlanePlan) -> [u32; 56] {
     }
     out[27..].copy_from_slice(&v);
     out
+}
+
+/// The plane on pipes 0..`dpps` as the scanout requests it: its stream's
+/// ODM segments, or its MPC slices in ODM bypass; its source the viewport
+/// at the surface origin, its destination the whole stream, rotated by
+/// `rotation` (dml2_rotation_angle), blended opaque.
+fn surface_request(
+    plan: &Plan,
+    plane: &Plane,
+    rotation: u32,
+    dpps: u8,
+) -> crate::amdgpu_dcn401_otg::SurfaceRequest {
+    use crate::amdgpu_dcn401_otg::{
+        Blend, PlaneLayout, PlaneSurface, SplitPipes, SurfaceFormat, SurfaceRequest,
+    };
+    use crate::amdgpu_dcn401_spl::{Rect, Rotation};
+    let t = plan.mode.timing;
+    let rest = SplitPipes::new(&[1, 2, 3][..usize::from(dpps.clamp(1, 4)) - 1]).unwrap_or_default();
+    let (odm, mpc) = if plan.pipes > 1 {
+        (rest, SplitPipes::NONE)
+    } else {
+        (SplitPipes::NONE, rest)
+    };
+    let format = match plane.source {
+        Source::Yuv420_8 => SurfaceFormat::Nv12,
+        Source::Yuv420_10 => SurfaceFormat::P010,
+        Source::Rgb => SurfaceFormat::Xrgb8888,
+    };
+    SurfaceRequest {
+        pipe: 0,
+        width: u32::from(plane.surface_width),
+        height: u32::from(plane.surface_height),
+        format,
+        odm,
+        mpc,
+        plane: Some(PlaneLayout {
+            src: Rect::new(
+                0,
+                0,
+                i32::from(plane.viewport_width),
+                i32::from(plane.viewport_height),
+            ),
+            dst: Rect::new(0, 0, t.h_active as i32, t.v_active as i32),
+            stream_width: t.h_active,
+            stream_height: t.v_active,
+            ycbcr420: plan.mode.ycbcr420,
+            rotation: match rotation {
+                1 => Rotation::R90,
+                2 => Rotation::R180,
+                3 => Rotation::R270,
+                _ => Rotation::R0,
+            },
+            blend: Blend {
+                per_pixel_alpha: false,
+                premultiplied: true,
+                global_alpha: None,
+            },
+            underlay: false,
+        }),
+        surface: PlaneSurface::LINEAR,
+    }
 }
 
 /// The chroma delivery, rq_regs, expansion modes, DET chroma base,
@@ -1314,7 +1378,7 @@ fn surface_plane(p: &[u32; 23]) -> Option<Plane> {
     })
 }
 
-/// surface_vectors.txt: every plane's 62 plan values and 56 surface values
+/// surface_vectors.txt: every plane's 62 plan values and 90 surface values
 /// (planes in argument order), or the rejection ("! ClockState" for a plan
 /// whose DCF/fabric state DPMM raises). Returns the plans, rejections,
 /// 4:2:0 planes and tiled planes admitted.
@@ -1339,6 +1403,8 @@ fn check_surface_vectors_policy(vectors: &str, policy: Policy) -> Result<[u32; 9
         f[9..18].copy_from_slice(&s);
         let (soc, _) = inputs(&f);
         let mut modes = Vec::new();
+        let mut rotations = [0u32; MAX_PLANES];
+        let mut planes = 0;
         let (mut yuv, mut tiled) = (0, 0);
         while words.peek().is_some_and(|w| *w != "=" && *w != "!") {
             let mut t = [0u32; 10];
@@ -1355,6 +1421,10 @@ fn check_surface_vectors_policy(vectors: &str, policy: Policy) -> Result<[u32; 9
                     return Err("malformed surface plane");
                 }
                 let plane = surface_plane(&p).ok_or("malformed surface plane fields")?;
+                if let Some(r) = rotations.get_mut(planes) {
+                    *r = p[13];
+                }
+                planes += 1;
                 yuv += u32::from(plane.is_420());
                 tiled += u32::from(plane.swizzle != Swizzle::Linear);
                 *slot = Some(plane);
@@ -1370,6 +1440,7 @@ fn check_surface_vectors_policy(vectors: &str, policy: Policy) -> Result<[u32; 9
                     return Err("Linux-admitted surface configuration rejected");
                 };
                 let mut first = true;
+                let mut index = 0;
                 for plan in got {
                     for k in 0..MAX_PLANES {
                         let Some(view) = plane_view(plan, k) else {
@@ -1380,7 +1451,7 @@ fn check_surface_vectors_policy(vectors: &str, policy: Policy) -> Result<[u32; 9
                         }
                         first = false;
                         let mut want = [0u32; 62];
-                        let mut want_s = [0u32; 56];
+                        let mut want_s = [0u32; SURFACE_VALUES];
                         if !parse(&mut words, &mut want) || !parse(&mut words, &mut want_s) {
                             return Err("malformed surface plan");
                         }
@@ -1390,7 +1461,9 @@ fn check_surface_vectors_policy(vectors: &str, policy: Policy) -> Result<[u32; 9
                             }
                         }
                         let p = plan.plane(k).ok_or("surface plan lost a plane")?;
-                        if surface_values(plan, k, &p) != want_s {
+                        let rotation = rotations.get(index).copied().unwrap_or(0);
+                        index += 1;
+                        if surface_values(plan, k, &p, rotation) != want_s {
                             return Err("surface rq/chroma value differs from Linux DML21");
                         }
                         if !pipes_match(&mut words, &view) {

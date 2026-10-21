@@ -1430,7 +1430,12 @@ mode-programming path, evaluated in fixed point with no hardware access. It
 admits the shape the native path implements: progressive streams of linear
 RGB planes (`Mode::planes`: the primary, scaled or not, and overlays; see
 "Navi 48 plane scaling and overlay planes"), each pipe with the staged
-320-KiB DET. `Mode::bytes_per_pixel` is DML's source format
+320-KiB DET (DCN4_01_DEFAULT_DET_SIZE). Deviation: DC never sets
+`det_size_override_kb` and lets CalculateDETBufferSize share the 1280-KiB
+pool (minimize_det_reallocation: per-stream budgets by pixel rate, then by
+bandwidth); NARF programs and plans the fixed 320 KiB, and the
+tests/dcn401_dml21 harnesses pass it as `det_size_override_kb` so every
+other value is compared. `Mode::bytes_per_pixel` is DML's source format
 (2 `dml2_444_16`, 4 `dml2_444_32`, 8 `dml2_444_64`; anything else is
 `Invalid`) and the pitch must be whole 256-byte requests at that depth; the
 request width, swath, DET lines, read bandwidth and deep-sleep DCFCLK follow
@@ -1442,8 +1447,11 @@ rounded up from their exact value. GPUVM/HostVM,
 DCC, MALL/SubVP, cursor, tdlut, dynamic metadata, writeback and immediate
 flip are excluded rather than approximated.
 
-ODM follows DML's `dml2_odm_mode_auto` with dynamic ODM off (DecideODMMode,
-CalculateODMConstraints, ValidateODMMode): a stream takes the fewest of one
+ODM follows DML's `dml2_odm_mode_auto` (DecideODMMode,
+CalculateODMConstraints, ValidateODMMode; deviation: the Vmin phase's
+dynamic ODM, which DC enables on DCN401 through
+enable_single_display_2to1_odm_policy, is not ported, as if every stream
+had `disable_dynamic_odm`): a stream takes the fewest of one
 to four pipes (DPP/OPP each and, with DSC, a DSC each) whose DISPCLK
 (CalculateRequiredDispclk: the pixel clock over the pipes, never below half
 of it for HDMI TMDS 4:2:0) fits the downspread-limited maximum, at least
@@ -1482,19 +1490,39 @@ linear or GFX12-tiled (the 6144-pixel tiled swath limit, 7680 for 4:2:0,
 (each DPP half the luma and chroma swath, the DET split per pipe), with or
 without DCC (each pipe's DCC overhead), scanned horizontally or rotated
 90/270. `admit_all_with` then runs dml2_top_soc15's mcache phase whatever the
-policy: a DCC plane of a supported configuration whose pipes cannot place its
-mcaches (dml2_top_mcache_validate_admissability: at most one boundary within
-a pipe's share of the surface width, no more boundaries than pipes) takes one
-more DPP from the free pipes (pmo_dcn4_fams2_optimize_dcc_mcache's
-optimize_dcc_mcache_no_odm, up to the limit) and mode support runs again; a
-failing plane on an ODM stream, at the limit or without a free pipe is
-`Unsupported`. `tests/dcn401_dml21/mpc_vectors.txt` (1512 plane
+policy, with PMO's dynamic ODM on as DC runs it
+(dml21_populate_pmo_options: `disable_dyn_odm = !minimize_dispclk_using_odm`,
+false on DCN401): a DCC plane of a supported configuration whose pipes cannot
+place its mcaches (dml2_top_mcache_validate_admissability: at most one
+boundary within a pipe's share of the surface width, no more boundaries than
+pipes; every surface holds up to DML2_MAX_MCACHES (8) mcaches,
+`dml::MAX_MCACHES`, and a count past it, which Linux writes beyond its
+arrays and which num_dcc_mcaches refuses anyway, is `Unsupported`) makes
+pmo_dcn4_fams2_optimize_dcc_mcache act and mode support run again. Several
+streams, or one stream in ODM bypass (optimize_dcc_mcache_no_odm): the plane
+takes one more DPP from the free pipes, up to the limit; a failing plane on an
+ODM stream, at the limit or without a free pipe is `Unsupported`. One stream
+on an ODM split: with a free pipe per plane of the stream,
+increase_odm_combine_factor raises the stream's ODM factor (from the plane's
+DPP count when auto, then one further: 2:1 to 3:1 to 4:1) and mode support
+runs on the forced factor (ValidateODMMode still applies); Linux indexes the
+stream descriptor by the failing plane's index, so only a failing first
+plane changes anything, and any other is `Unsupported`. `tests/dcn401_dml21/mpc_vectors.txt` (1512 plane
 configurations, 444 MPC-combined planes; harness_planes.c with MPC_AUTO) is
 replayed by `dcn401_dml_matches_linux_dml21_mpc_vectors`, and
 `surface_mpc_vectors.txt` (1116 tiled, DCC, rotated and NV12/P010
 configurations, 258 MPC-combined planes; harness_surfaces.c with MPC_AUTO)
 by `dcn401_dml_matches_linux_dml21_surface_mpc_vectors`, every plan value and
-both pipes' mcache registers exact.
+four pipes' mcache registers exact. The harnesses run PMO with DC's
+`disable_dyn_odm = false` (every stream `disable_dynamic_odm`, see above);
+surface_vectors.txt's single-stream ODM section (8K and 4K120 DCC planes of
+two to four mcaches) has Linux raise the ODM factor and fill allocations past
+three slices. Each harness_surfaces.c pipe's mcache viewports are SPL's on
+that pipe's ODM segment or MPC slice (`spl_viewport.c` on dc/sspl, as
+dml21_get_pipe_mcache_config takes scl_data's viewport), and the replay
+takes them from the production path (`SurfaceRequest::mcache_viewports`,
+which `deadline::pipe_mcache` programs), every slot of the allocation
+(`DML2_MAX_MCACHES + 1` offsets and ids per surface) compared.
 
 A multi-pipe plan is programmed as ODM 2:1, 3:1 or 4:1 (optc401_set_odm_combine). The
 modeset gives it the further OPP heads DC acquires (dcn32_acquire_free_pipe_

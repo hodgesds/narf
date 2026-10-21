@@ -24,10 +24,13 @@
  * pte_row_height_linear), drq/prq/mrq/crq_expansion_mode plane1_base_address
  * unbounded_request_enabled, the arbiter's
  * allow_sdpif_rate_limit_when_cstate_req, the plane's mcache allocation
- * (num_mcaches_plane0/1, three x offsets and four global ids per plane,
- * last_slice_sharing.plane0_plane1) and, for two pipes, the main mcache
+ * (num_mcaches_plane0/1, all DML2_MAX_MCACHES + 1 x offsets of plane 0 then
+ * plane 1, all DML2_MAX_MCACHES + 1 global ids of plane 0 then plane 1,
+ * last_slice_sharing.plane0_plane1) and, for four pipes, the main mcache
  * registers dml2_build_mcache_programming derives (p0 then p1: first id,
- * second id, split location; zeros past the plane's pipes).
+ * second id, split location; zeros past the plane's pipes), each pipe's
+ * viewports SPL's on that pipe's ODM or MPC slice (spl_viewport.c), as
+ * dml21_get_pipe_mcache_config takes them from its scaler data.
  * With MPC_AUTO set, every plane's mpcc_combine_factor is DC's auto (0):
  * a plane one DPP cannot carry takes two (MPC combine, "/2").
  */
@@ -37,6 +40,10 @@
 #include "dml2_internal_shared_types.h"
 #include "bounding_boxes/dcn4_soc_bb.h"
 #include "odm_pipes.h"
+
+int narf_spl_viewports(int src_w, int src_h, int dst_w, int dst_h, int stream_w, int stream_h,
+		       int odm_x, int odm_w, int mpc_index, int mpc_count, int rotation,
+		       int video, int vp[4], int vp_c[4]);
 
 static enum dml2_source_format_class format_of(unsigned long bytes)
 {
@@ -85,8 +92,13 @@ int main(int argc, char **argv)
 	init.options.project_id = dml2_project_dcn4x_stage2_auto_drr_svp;
 	struct dml2_pmo_options *o = &init.options.pmo_options;
 	o->disable_vblank = o->disable_svp = o->disable_drr_var = true;
-	o->disable_drr_clamped = o->disable_fams2 = o->disable_dyn_odm = true;
+	o->disable_drr_clamped = o->disable_fams2 = true;
 	o->disable_drr_var_when_var_active = o->disable_drr_clamped_when_var_active = true;
+	/* dml21_populate_pmo_options as DC runs DCN401
+	 * (minimize_dispclk_using_odm): dynamic ODM on for one stream, so
+	 * pmo_dcn4_fams2_optimize_dcc_mcache may raise a single ODM stream's
+	 * combine factor, off for several or with SubVP. */
+	o->disable_dyn_odm = false;
 	o->disable_dyn_odm_for_multi_stream = o->disable_dyn_odm_for_stream_with_svp = true;
 	init.soc_bb = dml2_socbb_dcn401;
 	init.soc_bb.qos_parameters = dml_dcn4_variant_a_soc_qos_params;
@@ -150,6 +162,10 @@ int main(int argc, char **argv)
 			t->dsc.dsc_compressed_bpp_x16 = bpp_x16;
 		}
 		s->overrides.odm_mode = dml2_odm_mode_auto;
+		/* DC clears this per stream for DCN401's single-display 2:1 ODM
+		 * policy (enable_single_display_2to1_odm_policy), which drives
+		 * the Vmin phase's dynamic ODM. NARF does not port that phase:
+		 * every stream keeps it set, so the Vmin phase leaves ODM alone. */
 		s->overrides.disable_dynamic_odm = true;
 		s->overrides.disable_subvp = true;
 		s->overrides.hw.twait_budgeting.fclk_pstate = dml2_twait_budgeting_setting_if_needed;
@@ -245,25 +261,57 @@ int main(int argc, char **argv)
 	}
 	const struct dml2_core_internal_mode_program *m =
 		&init.dml2_instance->core_instance.clean_me_up.mode_lib.mp;
-	/* dml21_prepare_mcache_programming with each of a plane's n pipes
-	 * taking the n-th share of its luma and chroma viewport widths. */
+	/* dml21_prepare_mcache_programming: each of a plane's n pipes (DC's
+	 * order: its first slice, then its ODM or MPC slices) with the
+	 * viewports SPL gives that pipe (dml21_get_pipe_mcache_config). The
+	 * plane's source is its viewport at the surface origin, its destination
+	 * the whole stream (rect_out_width, rect_out_height_spans_vactive);
+	 * an ODM slice is resource_get_odm_slice_src_rect's (a 4:2:0 output's
+	 * segments in whole pixel pairs, each after the first one pixel wider
+	 * to the left). */
 	static struct dml2_build_mcache_programming_in_out mc;
 	mc.dml2_instance = init.dml2_instance;
 	for (int k = 0; k < planes; k++) {
 		struct dml2_plane_mcache_configuration_descriptor *d = &mc.mcache_configurations[k];
 		const struct dml2_plane_parameters *p = &prog.display_config.plane_descriptors[k];
+		const struct dml2_timing_cfg *t = &cfg.stream_descriptors[p->stream_index].timing;
 		unsigned int n = prog.plane_programming[k].num_dpps_required;
+		int odms = prog.stream_programming[p->stream_index].num_odms_required;
+		bool fmt420 = cfg.stream_descriptors[p->stream_index].output.output_format == dml2_420;
+		int video = p->pixel_format == dml2_420_8 ? 1 : p->pixel_format == dml2_420_10 ? 2 : 0;
+		int w = (int)t->h_active, h = (int)t->v_active;
 
 		d->plane_descriptor = p;
 		d->mcache_allocation = &prog.plane_programming[k].mcache_allocation;
 		d->num_pipes = (char)n;
 		for (unsigned int j = 0; j < n; j++) {
 			struct dml2_pipe_configuration_descriptor *c = &d->pipe_configurations[j];
+			int odm_x = 0, odm_w = w, mpc_index = 0, mpc_count = 1;
+			int vp[4], vp_c[4];
 
-			c->plane0.viewport_width = p->composition.viewport.plane0.width / n;
-			c->plane0.viewport_x_start = j * c->plane0.viewport_width;
-			c->plane1.viewport_width = p->composition.viewport.plane1.width / n;
-			c->plane1.viewport_x_start = j * c->plane1.viewport_width;
+			if (odms > 1) {
+				int first = w / odms;
+
+				if ((first % 2) && fmt420)
+					first++;
+				odm_x = first * (int)j;
+				odm_w = (int)j + 1 == odms ? w - first * (odms - 1) : first;
+				if (j > 0 && fmt420) {
+					odm_x -= 1;
+					odm_w += 1;
+				}
+			} else {
+				mpc_index = (int)j;
+				mpc_count = (int)n;
+			}
+			narf_spl_viewports((int)p->composition.viewport.plane0.width,
+					   (int)p->composition.viewport.plane0.height, w, h, w, h,
+					   odm_x, odm_w, mpc_index, mpc_count,
+					   (int)p->composition.rotation_angle, video, vp, vp_c);
+			c->plane0.viewport_x_start = vp[0];
+			c->plane0.viewport_width = vp[2];
+			c->plane1.viewport_x_start = vp_c[0];
+			c->plane1.viewport_width = vp_c[2];
 			c->plane1_enabled = p->pixel_format == dml2_420_8 || p->pixel_format == dml2_420_10;
 		}
 		mc.num_configurations++;
@@ -315,19 +363,19 @@ int main(int argc, char **argv)
 		for (size_t i = 0; i < sizeof(v) / sizeof(v[0]); i++)
 			printf(" %lu", v[i]);
 		/* The mcache allocation: counts, boundaries, global ids, sharing;
-		 * then two pipes' main mcache registers (MALL must equal them). */
+		 * then four pipes' main mcache registers (MALL must equal them). */
 		const struct dml2_mcache_surface_allocation *a = &prog.plane_programming[k].mcache_allocation;
 		printf(" %u %u", a->num_mcaches_plane0, a->num_mcaches_plane1);
-		for (int i = 0; i < 3; i++)
+		for (int i = 0; i < DML2_MAX_MCACHES + 1; i++)
 			printf(" %d", a->mcache_x_offsets_plane0[i]);
-		for (int i = 0; i < 3; i++)
+		for (int i = 0; i < DML2_MAX_MCACHES + 1; i++)
 			printf(" %d", a->mcache_x_offsets_plane1[i]);
-		for (int i = 0; i < 4; i++)
+		for (int i = 0; i < DML2_MAX_MCACHES + 1; i++)
 			printf(" %d", a->global_mcache_ids_plane0[i]);
-		for (int i = 0; i < 4; i++)
+		for (int i = 0; i < DML2_MAX_MCACHES + 1; i++)
 			printf(" %d", a->global_mcache_ids_plane1[i]);
 		printf(" %d", a->last_slice_sharing.plane0_plane1);
-		for (int j = 0; j < 2; j++) {
+		for (int j = 0; j < 4; j++) {
 			const struct dml2_hubp_pipe_mcache_regs *x = mc.per_plane_pipe_mcache_regs[k][j];
 
 			if (!mcache_ok || !x) {

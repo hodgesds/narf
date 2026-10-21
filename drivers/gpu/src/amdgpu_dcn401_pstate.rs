@@ -981,7 +981,7 @@ pub(crate) fn admit_traced(
         return Err(Error::Invalid);
     }
     admit_native(soc, modes)?;
-    let mut shapes = shapes_for(soc, modes, Policy::NATIVE, &[false; MAX_PLANES])?;
+    let mut shapes = shapes_for(soc, modes, Policy::NATIVE, &[false; MAX_PLANES], None)?;
     if shapes.iter().any(|s| s.plane.dcc || !s.mcache_fits) {
         return Ok(Pstate::Pinned(Pinned::Port));
     }

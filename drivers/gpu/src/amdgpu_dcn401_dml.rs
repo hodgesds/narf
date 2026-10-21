@@ -16,7 +16,8 @@
 //! immediate flip are all off; a 4:4:4 DP stream may use DSC. One tiled RGB
 //! plane alone on one pipe requests unbounded.
 //!
-//! ODM is DML's `dml2_odm_mode_auto` with dynamic ODM off (DecideODMMode):
+//! ODM is DML's `dml2_odm_mode_auto` (DecideODMMode; the Vmin phase's
+//! dynamic ODM is not ported, as if every stream had disable_dynamic_odm):
 //! a stream takes two, three or four pipes (DPP + OPP each, one DSC each)
 //! when its pixel clock exceeds that many less one pipes' downspread-limited
 //! DISPCLK maximum, its DSC line is wider than 5760 pixels per DSC or has
@@ -36,7 +37,9 @@
 //! luma and chroma swath), with or without DCC, scanned horizontally or
 //! vertically. A DCC plane whose mcaches its pipes cannot place is split
 //! over two DPPs by the mcache phase whatever the factor
-//! (pmo_dcn4_fams2_optimize_dcc_mcache), and refused on an ODM stream.
+//! (pmo_dcn4_fams2_optimize_dcc_mcache); on the one stream of a
+//! single-stream ODM configuration that phase raises the stream's ODM
+//! combine factor instead, and on an ODM stream beside others it is refused.
 //!
 //! The default 320-KiB DET from the staged requestor is a fixed input for
 //! every pipe rather than DML's own allocation (four pipes fit the 1280-KiB
@@ -692,18 +695,22 @@ impl PlanePlan {
     }
 }
 
+/// `DML2_MAX_MCACHES`: the mcaches one surface may take
+/// (`mcache_x_offsets_plane0[DML2_MAX_MCACHES + 1]`).
+pub const MAX_MCACHES: usize = 8;
+
 /// A DCC plane's `dml2_mcache_surface_allocation` as DML21 leaves it in the
-/// plane programming: per surface (luma, chroma) the mcache count, the
-/// slice boundaries (the last one the surface width; an admitted plane has
-/// at most three slices) and the global mcache ids
-/// (dml2_top_mcache_assign_global_mcache_ids, in admission order; the entry
-/// after the last wraps to the first), and whether chroma's last slice
+/// plane programming: per surface (luma, chroma) the mcache count (at most
+/// `MAX_MCACHES`), the slice boundaries (the last one the surface width)
+/// and the global mcache ids (dml2_top_mcache_assign_global_mcache_ids, in
+/// admission order; the entry after the last wraps to the first), each
+/// `DML2_MAX_MCACHES + 1` long as Linux's, and whether chroma's last slice
 /// shares luma's last mcache.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct McacheAllocation {
     pub count: [u8; 2],
-    pub offsets: [[u16; 3]; 2],
-    pub ids: [[u8; 4]; 2],
+    pub offsets: [[u16; MAX_MCACHES + 1]; 2],
+    pub ids: [[u8; MAX_MCACHES + 1]; 2],
     pub shared: bool,
 }
 
@@ -738,7 +745,7 @@ impl McacheAllocation {
                 continue;
             };
             let count = usize::from(self.count[i]);
-            let offsets = &self.offsets[i][..count.min(3)];
+            let offsets = &self.offsets[i][..count.min(MAX_MCACHES)];
             let (first, second) = first_second_splitting(
                 offsets,
                 i64::from(start),
@@ -1157,12 +1164,12 @@ const DCC_MCACHES: u32 = 8;
 
 /// One DCC surface's calculate_mcache_row_bytes and calculate_mcache_setting
 /// results with GPUVM off and the viewport not stationary: the mcache count,
-/// its first two split offsets (a third only matters once admission has
-/// already failed) and the DRAM overhead factors.
+/// its split offsets (every boundary but the last, which is the surface
+/// width) and the DRAM overhead factors.
 #[derive(Clone, Copy)]
 struct Mcache {
     count: u32,
-    offsets: [u32; 2],
+    offsets: [u32; MAX_MCACHES],
     dram_nom: Fx,
     dram_pref: Fx,
     /// lc_comb_mcache (luma's entry): luma and chroma share the last one.
@@ -1184,7 +1191,7 @@ impl Mcache {
         let surfaces = if p.is_420() { 2 } else { 1 };
         let mut out = [Self {
             count: 0,
-            offsets: [0; 2],
+            offsets: [0; MAX_MCACHES],
             dram_nom: Fx::ONE,
             dram_pref: Fx::ONE,
             shared: false,
@@ -1239,7 +1246,9 @@ impl Mcache {
         for (i, m) in out.iter_mut().enumerate().take(surfaces) {
             let a = access(i);
             let avg = width_ub[i] / m.count.max(1);
-            for n in 0..m.count.saturating_sub(1).min(2) {
+            // A count past DML2_MAX_MCACHES is refused before its offsets
+            // (`Shape::with_pipes`); Linux writes past its arrays.
+            for n in 0..m.count.saturating_sub(1).min(MAX_MCACHES as u32 - 1) {
                 m.offsets[n as usize] = if lc_comb {
                     (n + 1) * (MCACHE_BYTES / meta_ub) * a
                 } else {
@@ -1273,7 +1282,10 @@ impl Mcache {
             span += if i == 0 { 12 } else { 6 };
             let boundaries = m[i].count.saturating_sub(1);
             if boundaries > dpps
-                || count_in_span(&m[i].offsets[..boundaries.min(2) as usize], span) > 1
+                || count_in_span(
+                    &m[i].offsets[..(boundaries as usize).min(MAX_MCACHES - 1)],
+                    span,
+                ) > 1
             {
                 return false;
             }
@@ -1567,12 +1579,17 @@ impl Shape {
     /// `dispclk_ss_khz` is DML's `max_dispclk_freq_mhz`: the board maximum
     /// less downspread, which decides ODM combine; `channels` the DRAM
     /// channel count calculate_mcache_row_bytes spreads DCC metadata over.
+    /// The plane on its stream's ODM split: DecideODMMode's for
+    /// `dml2_odm_mode_auto`, or `odm` where the stream's `odm_mode` is forced
+    /// (the mcache phase's increase_odm_combine_factor); ValidateODMMode
+    /// checks it either way.
     fn new(
         mode: &Mode,
         plane: Plane,
         stream: usize,
         dispclk_ss_khz: u64,
         channels: u32,
+        odm: Option<u32>,
     ) -> Result<Self, Error> {
         let t = mode.timing;
         if t.pixel_clock_khz == 0
@@ -1610,7 +1627,7 @@ impl Shape {
         if u64::from(t.pixel_clock_khz) > 4 * dispclk_ss_khz {
             return Err(Error::PixelClock);
         }
-        let odm = decide_odm(mode, dispclk_ss_khz);
+        let odm = odm.unwrap_or_else(|| decide_odm(mode, dispclk_ss_khz));
         // ValidateODMMode: DISPCLK within the maximum (an HDMI 4:2:0 output's
         // stays at half the pixel clock however wide the split); each pipe
         // takes an equal share of the line in whole pixel containers (a
@@ -1864,6 +1881,12 @@ impl Shape {
                 .take(if plane.is_420() { 2 } else { 1 })
                 .enumerate()
             {
+                // More mcaches than mcache_x_offsets_plane0/1 hold: Linux
+                // writes past its arrays, and their total is past
+                // num_dcc_mcaches, which refuses the mode anyway.
+                if m.count as usize > MAX_MCACHES {
+                    return Err(Error::Unsupported);
+                }
                 dram_nom[i] = m.dram_nom;
                 dram_pref[i] = m.dram_pref;
                 mcache_count += m.count;
@@ -1881,8 +1904,8 @@ impl Shape {
                 .take(if plane.is_420() { 2 } else { 1 })
                 .enumerate()
             {
-                let count = m.count.min(3) as usize;
-                a.count[i] = m.count.min(u32::from(u8::MAX)) as u8;
+                let count = m.count as usize;
+                a.count[i] = m.count as u8;
                 for n in 0..count.saturating_sub(1) {
                     a.offsets[i][n] = m.offsets[n] as u16;
                 }
@@ -2784,10 +2807,21 @@ fn ss_khz(khz: u32) -> u64 {
 /// support whatever the policy: when a supported configuration has a DCC
 /// plane whose pipes cannot place its mcaches
 /// (dml2_top_mcache_validate_admissability), pmo_dcn4_fams2_optimize_dcc_
-/// mcache (no dynamic ODM: optimize_dcc_mcache_no_odm) gives each such
-/// plane one more DPP from the free pipes, up to `mpc_combine_limit`, and
-/// mode support runs again with those planes MPC-combined. A failing plane
-/// on an ODM stream, at the limit or without a free pipe is rejected.
+/// mcache runs and mode support runs again on its result, until every
+/// plane fits or it gives up (rejected). DC runs PMO with dynamic ODM
+/// (dml21_populate_pmo_options: !minimize_dispclk_using_odm), so:
+/// - several streams, or one stream in ODM bypass
+///   (optimize_dcc_mcache_no_odm): each failing plane on a stream in ODM
+///   bypass takes one more DPP from the free pipes, up to
+///   `mpc_combine_limit`; a failing plane on an ODM stream, at the limit or
+///   without a free pipe is rejected;
+/// - one stream on an ODM split: with a free pipe per plane of the stream,
+///   the first failing plane's increase_odm_combine_factor raises the
+///   stream's ODM factor from its plane's DPP count by one (2:1 to 3:1 to
+///   4:1, then rejected). Linux indexes stream_descriptors by that plane's
+///   index, so a failing plane other than the first only bumps a stream
+///   descriptor past num_streams, which mode support never reads: the
+///   configuration cannot change and is rejected.
 pub fn admit_all_with(soc: &Soc, modes: &[Mode], policy: Policy) -> Result<Vec<Plan>, Error> {
     soc.validate()?;
     if modes.is_empty() || modes.len() > MAX_STREAMS {
@@ -2795,8 +2829,10 @@ pub fn admit_all_with(soc: &Soc, modes: &[Mode], policy: Policy) -> Result<Vec<P
     }
     // The planes the mcache phase has put on two DPPs (factor 2).
     let mut split = [false; MAX_PLANES];
+    // The single stream's odm_mode the mcache phase forced (None: auto).
+    let mut odm = None;
     loop {
-        let shapes = shapes_for(soc, modes, policy, &split)?;
+        let shapes = shapes_for(soc, modes, policy, &split, odm)?;
         if shapes.iter().all(|s| s.mcache_fits) {
             return plan_shapes(soc, modes, shapes, false);
         }
@@ -2808,6 +2844,21 @@ pub fn admit_all_with(soc: &Soc, modes: &[Mode], policy: Policy) -> Result<Vec<P
         let mut free = MAX_PIPES
             .min(crate::amdgpu_rdna4::available_pipes())
             .saturating_sub(used);
+        if modes.len() == 1 && shapes[0].odm > 1 {
+            // planes_on_stream: every plane is on stream 0.
+            if free < shapes.len() as u32 {
+                return Err(Error::Unsupported);
+            }
+            match shapes.iter().position(|s| !s.mcache_fits) {
+                // increase_odm_combine_factor: auto starts from the plane's
+                // dpps_used; a forced factor goes one further, to 4:1.
+                Some(0) if odm.unwrap_or(shapes[0].dpps) < 4 => {
+                    odm = Some(odm.unwrap_or(shapes[0].dpps) + 1);
+                }
+                _ => return Err(Error::Unsupported),
+            }
+            continue;
+        }
         for (k, s) in shapes.iter().enumerate() {
             if s.mcache_fits {
                 continue;
@@ -2821,13 +2872,15 @@ pub fn admit_all_with(soc: &Soc, modes: &[Mode], policy: Policy) -> Result<Vec<P
     }
 }
 
-/// Every plane's shape in admission order: its ODM split, then MPC combine
-/// as `policy` decides it or (`split`) the mcache phase forces it.
+/// Every plane's shape in admission order: its ODM split (stream 0's forced
+/// to `odm` when the mcache phase raised it), then MPC combine as `policy`
+/// decides it or (`split`) the mcache phase forces it.
 fn shapes_for(
     soc: &Soc,
     modes: &[Mode],
     policy: Policy,
     split: &[bool; MAX_PLANES],
+    odm: Option<u32>,
 ) -> Result<Vec<Shape>, Error> {
     let ss = ss_khz;
     let mut shapes = Vec::with_capacity(MAX_PLANES);
@@ -2836,7 +2889,15 @@ fn shapes_for(
             if shapes.len() == MAX_PLANES {
                 return Err(Error::Pipes);
             }
-            let mut shape = Shape::new(mode, plane, k, ss(soc.dispclk_max_khz), soc.umc_channels)?;
+            let forced = odm.filter(|_| k == 0);
+            let mut shape = Shape::new(
+                mode,
+                plane,
+                k,
+                ss(soc.dispclk_max_khz),
+                soc.umc_channels,
+                forced,
+            )?;
             if split[shapes.len()] && shape.odm == 1 {
                 shape = Shape::with_pipes(mode, plane, k, 1, MPC_COMBINE_LIMIT, soc.umc_channels)?;
             } else if policy.mpc_combine {
@@ -2969,7 +3030,7 @@ fn prepare(soc: &Soc, shapes: &mut [Shape]) -> Result<Prepared, Error> {
     let mut next_id = 0u8;
     for a in shapes.iter_mut().filter_map(|s| s.mcache.as_mut()) {
         for i in 0..2 {
-            let count = usize::from(a.count[i]).min(3);
+            let count = usize::from(a.count[i]);
             for j in 0..count {
                 a.ids[i][j] = next_id;
                 next_id += 1;
