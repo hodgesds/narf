@@ -55,10 +55,15 @@ fn dc_format(f: SurfaceFormat) -> (u32, u32) {
 /// fill_dc_plane_info_and_addr and fill_dc_scaling_info hand DC): the color
 /// space, per-pixel or global alpha and the pitch are medium changes, the
 /// rotation, format, bytes per pixel, tiling or DCC full ones; a source or
-/// destination of another size is full, one moved is medium.
+/// destination of another size is full, one moved is medium. A plane whose
+/// MPC split changes (DML combining it on other DPPs, or no longer) is a
+/// full update: dc only re-splits pipes in a full update's validation.
 pub fn plane_update_type(old: SurfaceRequest, new: SurfaceRequest) -> UpdateType {
     let mut t = UpdateType::Fast;
     let mut elevate = |u: UpdateType| t = t.max(u);
+    if old.mpc != new.mpc {
+        elevate(UpdateType::Full);
+    }
     let (lo, ln) = (old.layout(), new.layout());
     let color = |r: &SurfaceRequest| r.format.is_video().then_some(r.surface.color);
     if color(&old) != color(&new) {

@@ -31,6 +31,8 @@ const PER_LINE_PRE: u64 = 0x651;
 const PER_LINE: u64 = 0x652;
 const REF_FREQ: u64 = 0x654;
 const LUT3D_DLG: u64 = 0x68d;
+const MCACHE_SPLIT: u64 = 0x5ea; // DCSURF_VIEWPORT_MCACHE_SPLIT_COORDINATE
+const MCACHEID_CONFIG: u64 = 0x5fb; // DCHUBP_MCACHEID_CONFIG
 const VREADY_AFTER_VSYNC: u32 = 1 << 8; // DCHUBP_CNTL
                                         // DCHUBBUB, DCN bank 2.
 const SDPIF_RATE_LIMIT: u64 = 0x485;
@@ -240,6 +242,55 @@ fn requestor_writes(rq: &dml::RqRegs) -> [(u64, u32, u32); 5] {
     ]
 }
 
+/// hubp401_program_mcache_id_and_split_coordinate for one pipe's mcache
+/// registers (luma, then chroma): DCHUBP_MCACHEID_CONFIG's REG_READ ids,
+/// the MALL_PREF ids equal to them (no iMALL), and both split coordinates,
+/// each register set whole (REG_SET). Without DCC both are all ones.
+fn mcache_writes(regs: [dml::McacheRegs; 2]) -> [(u64, u32); 2] {
+    let [p0, p1] = regs;
+    let ids = (p0.id_first & 0xf)
+        | (p0.id_second & 0xf) << 4
+        | (p1.id_first & 0xf) << 8
+        | (p1.id_second & 0xf) << 12;
+    [
+        (MCACHEID_CONFIG, ids | ids << 16),
+        (
+            MCACHE_SPLIT,
+            (p0.split_location & 0xffff) | (p1.split_location & 0xffff) << 16,
+        ),
+    ]
+}
+
+/// dml2_top_soc15_build_mcache_programming for pipe `p` of a plane: with
+/// DCC, its mcaches and split from the pipe's own luma (and 4:2:0 chroma)
+/// viewport, as dml21_get_pipe_mcache_config takes them from its scaler
+/// data (viewport x and width, also when rotated); reset_mcache_allocations'
+/// unassigned ids without DCC, or where the viewport spans more than two
+/// mcaches (calculate_first_second_splitting fails before any is set).
+fn pipe_mcache(
+    mcache: Option<dml::McacheAllocation>,
+    surface: Option<SurfaceApplied>,
+    p: u8,
+) -> Result<[dml::McacheRegs; 2], Error> {
+    let Some(a) = mcache else {
+        return Ok([dml::McacheRegs::UNASSIGNED; 2]);
+    };
+    let surface = surface.ok_or(Error::Invalid)?;
+    let (_, scaler) = surface
+        .request
+        .scalers()
+        .find(|&(q, _)| q == p)
+        .ok_or(Error::Invalid)?;
+    let span = |r: crate::amdgpu_dcn401_spl::Rect| (r.x.max(0) as u32, r.width.max(0) as u32);
+    let chroma = surface
+        .request
+        .format
+        .is_video()
+        .then(|| span(scaler.viewport_c));
+    Ok(a.pipe_regs(span(scaler.viewport), chroma)
+        .unwrap_or([dml::McacheRegs::UNASSIGNED; 2]))
+}
+
 impl<I: Io> Engine<I> {
     pub(in crate::amdgpu_dcn401_otg) fn deadline_writes(
         &mut self,
@@ -289,9 +340,12 @@ impl<I: Io> Engine<I> {
         // (Plan::plane_dlg).
         let mut planes: alloc::vec::Vec<alloc::vec::Vec<u8>> =
             alloc::vec![self.fetch_pipes(pipe).collect()];
+        // Each plane's staged surface, for its pipes' viewports.
+        let mut surfaces = alloc::vec![self.status.surfaces[usize::from(pipe)]];
         if let Some(r) = self.status.requestor.filter(|r| r.pipe == pipe) {
             for o in r.overlays.iter().flatten() {
                 planes.push(o.request.segments().map(|(p, _, _)| p).collect());
+                surfaces.push(Some(*o));
             }
         }
         let segments = planes
@@ -337,6 +391,25 @@ impl<I: Io> Engine<I> {
                 0
             };
             each(self, l.hubp(p, HUBP_CONTROL), VREADY_AFTER_VSYNC, vready)?;
+            // dcn401_program_pipe's step 13 on every pipe: its mcaches.
+            let mcache = plan.plane(k).ok_or(Error::Invalid)?.mcache;
+            let regs = pipe_mcache(mcache, surfaces.get(k).copied().flatten(), p)?;
+            // Unassigned ids and splits make all-ones registers, which the
+            // checked accessors take for a lost device: write and compare
+            // them raw (any loss shows in the other registers).
+            for (r, value) in mcache_writes(regs) {
+                let at = l.hubp(p, r);
+                if verify {
+                    if self.access(|io| Ok(io.read(at)))? != value {
+                        return Err(Error::Readback(at));
+                    }
+                } else {
+                    self.access(|io| {
+                        io.write(at, value);
+                        Ok(())
+                    })?;
+                }
+            }
         }
         for set in [WM_A, WM_B] {
             for (r, mask, value) in watermark_set(set, &plan.watermarks) {

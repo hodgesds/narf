@@ -117,6 +117,70 @@ kernel_test_in!(
     dcn401_plane_update_types_follow_dc
 );
 
+/// A plane whose MPC split changes is a full update, whatever its surface:
+/// DML combining a tiled, turned, DCC or 4:2:0 plane on a second DPP (or
+/// no longer, or on another pipe) only happens in a full update's
+/// validation. A kept split with a moved plane stays medium.
+fn dcn401_plane_update_mpc_split_change_is_full() -> TestResult {
+    use crate::amdgpu_dcn401_otg::{DccBlock, Swizzle, Tiling};
+    use UpdateType::{Full, Med};
+    let src = Rect::new(0, 0, 1280, 720);
+    let dst = Rect::new(100, 100, 640, 360);
+    let rgb = placed(SurfaceFormat::Argb8888, src, dst);
+    let tiled = SurfaceRequest {
+        surface: PlaneSurface {
+            tiling: Tiling {
+                swizzle: Swizzle::S64K2D,
+                dcc: Some(DccBlock::B64),
+            },
+            ..PlaneSurface::LINEAR
+        },
+        ..rgb
+    };
+    let turned = SurfaceRequest {
+        plane: rgb.plane.map(|l| PlaneLayout {
+            rotation: Rotation::R90,
+            ..l
+        }),
+        ..tiled
+    };
+    let video = SurfaceRequest {
+        format: SurfaceFormat::P010,
+        ..tiled
+    };
+    for base in [rgb, tiled, turned, video] {
+        let split = SurfaceRequest {
+            mpc: SplitPipes::one(2),
+            ..base
+        };
+        let elsewhere = SurfaceRequest {
+            mpc: SplitPipes::one(1),
+            ..base
+        };
+        let moved = SurfaceRequest {
+            plane: split.plane.map(|l| PlaneLayout {
+                dst: Rect::new(400, 100, 640, 360),
+                ..l
+            }),
+            ..split
+        };
+        if plane_update_type(base, split) != Full
+            || plane_update_type(split, base) != Full
+            || plane_update_type(split, elsewhere) != Full
+            || plane_update_type(split, moved) != Med
+            || planes_update_type(&[rgb, split], &[rgb, moved], false) != Med
+            || planes_update_type(&[rgb, base], &[rgb, split], false) != Full
+        {
+            return TestResult::Fail("MPC split change update type");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-plane-update",
+    dcn401_plane_update_mpc_split_change_is_full
+);
+
 /// The register writes `f` makes to the MPCC tree selectors (low nibble)
 /// and MPCC_MODE (MPCC_CONTROL's low two bits) of every pipe, in order.
 fn tree_writes(

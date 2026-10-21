@@ -1279,8 +1279,18 @@ and a clear `HW_DEBUG[5]` follow Linux, and USR retraining is not forced.
 Self-refresh is force-disallowed in `DCHUBBUB_ARB_DRAM_STATE_CNTL` until
 stutter is validated, although the plan still budgets its blank. The DCHUB
 pstate force stays released: PMFW keeps UCLK switching disabled, and GDDR6
-temperature reads use the same allow path. Every field is read back after
-the owners are re-verified; `DeadlinesApplied` records the plan and enters
+temperature reads use the same allow path. Every pipe of every plane then
+gets hubp401_program_mcache_id_and_split_coordinate (dcn401_program_pipe's
+step 13): `DCHUBP_MCACHEID_CONFIG` (REG_READ and equal MALL_PREF ids, luma
+and chroma) and `DCSURF_VIEWPORT_MCACHE_SPLIT_COORDINATE`, from the plan's
+`McacheAllocation::pipe_regs` over that pipe's own SPL luma (and 4:2:0
+chroma) viewport x and width, as dml2_top_soc15_build_mcache_programming
+assigns them, so each ODM segment or MPC slice of a DCC plane reads the
+mcaches its viewport crosses; without DCC, or where a viewport spans more
+than two mcaches, reset_mcache_allocations' unassigned ids (0xf) and split
+(0xffff). Those registers are written whole and compared raw, since their
+all-ones value is legal. Every field is read back after the owners are
+re-verified; `DeadlinesApplied` records the plan and enters
 reusable `DeadlinesPrepared`. Requestor/timing/OPP/MPC/HUBP-power/VM changes
 invalidate it with the requestor report, and failure or cancellation is
 sticky as for the other preparation steps. `tests/dcn401_deadline.c` checks
@@ -4130,7 +4140,7 @@ dml2_core_dcn4_calcs.c for both surfaces (block and macro-tile sizes, luma
 and chroma swaths and requests, the DET split and chroma base, two-surface
 prefetch, bursts, deep sleep, DPPCLK and delivery, unbounded requesting,
 DCC's mcache allocation and overhead; a linear vertical scan is refused, a
-plane needing an MPC split for its mcaches is `Unsupported`). `PlanePlan`
+plane needing an MPC split for its mcaches takes two DPPs, see MPC combine). `PlanePlan`
 adds `rq` (`dml::RqRegs`: luma and chroma `RqPlane`, expansion modes, the
 DET plane-1 base, unbounded requesting), `mcache` and the chroma DLG/TTU
 delivery fields, which `deadline_writes` programs (the *_C halves of the
@@ -4357,7 +4367,12 @@ untouched.
 get_plane_info_update_type (color space, per-pixel or global alpha and the
 pitch medium; rotation, DC format (X/A twins are one), bytes per pixel,
 tiling and DCC full) and get_scaling_info_update_type (a source or
-destination of another size full, one moved medium).
+destination of another size full, one moved medium). A plane whose MPC split
+changes (`SurfaceRequest::mpc`: DML combining it on another DPP, no longer,
+or on another pipe) is full, whatever its surface: dc only re-splits pipes in
+a full update's validation. The pipes such a change takes or frees follow
+the rules below (full; another display's pipes or another ODM split
+relight).
 `planes_update_type(old, new, reset)` is check_update_surfaces_for_stream
 over the stream's planes: a plane count change (full_update_required_weak)
 or a plane amdgpu_dm recreates (`reset`, should_reset_plane on a zpos

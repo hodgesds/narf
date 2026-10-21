@@ -3582,6 +3582,127 @@ fn navi48_split_pipes_follow_dml() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/navi48-modeset", navi48_split_pipes_follow_dml);
 
+/// MPC combine of the surfaces Linux DML21 also splits, from amdgpu_dm's
+/// planes to the pipes: on a 4K CVT-RB stream (533.25 MHz, ODM bypass), an
+/// 8K framebuffer in 64KB tiles, a portrait 8K one in 256KB tiles with DCC
+/// turned 270 degrees, and portrait 8K NV12 (64KB tiles, turned 90) and
+/// P010 (256KB tiles, turned 270) frames, each scaled 2:1 as the primary,
+/// are admitted with the plane on two DPPs (no single DPP takes the swath:
+/// the tiled and vertical 4:2:0 limits), take the top free pipe as their
+/// second slice, and stage as a request naming it. A 4K tiled plane at 1:1
+/// keeps one DPP.
+#[inline(never)]
+fn navi48_split_tiled_rotated_and_video_planes_reach_pipes() -> TestResult {
+    use crate::amdgpu_dcn401_spl::{Rect, Rotation};
+    let mut base = completed_modeset(0).selection;
+    base.timing = Timing {
+        pixel_clock_khz: 533_250,
+        h_active: 3840,
+        h_total: 4000,
+        h_front_porch: 48,
+        h_sync_width: 32,
+        v_active: 2160,
+        v_total: 2222,
+        v_front_porch: 3,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: false,
+    };
+    let soc = dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [300_000, 2_500_000],
+        dcfclk_khz: [200_000, 1_564_000],
+        socclk_khz: 300_000,
+        dispclk_max_khz: 2_000_000,
+        dppclk_max_khz: 2_000_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    let surface = |swizzle, dcc| otg::PlaneSurface {
+        tiling: otg::Tiling { swizzle, dcc },
+        ..otg::PlaneSurface::LINEAR
+    };
+    let geometry = |(w, h): (u32, u32), rotation, surface, format| PlaneGeometry {
+        src_x: 0,
+        src_y: 0,
+        width: w,
+        height: h,
+        dst: Rect::new(0, 0, 3840, 2160),
+        rotation,
+        blend: otg::Blend::default_for(format),
+        surface,
+        fb_size: (w, h),
+    };
+    let tiled = surface(otg::Swizzle::S64K2D, None);
+    let dcc = surface(otg::Swizzle::S256K2D, Some(otg::DccBlock::B64));
+    let (rgb, nv12, p010) = (
+        otg::SurfaceFormat::Xrgb8888,
+        otg::SurfaceFormat::Nv12,
+        otg::SurfaceFormat::P010,
+    );
+    let cases = [
+        (rgb, geometry((7680, 4320), Rotation::R0, tiled, rgb), 2),
+        (rgb, geometry((4320, 7680), Rotation::R270, dcc, rgb), 2),
+        (nv12, geometry((4320, 7680), Rotation::R90, tiled, nv12), 2),
+        (
+            p010,
+            geometry(
+                (4320, 7680),
+                Rotation::R270,
+                surface(otg::Swizzle::S256K2D, None),
+                p010,
+            ),
+            2,
+        ),
+        (rgb, geometry((3840, 2160), Rotation::R0, tiled, rgb), 1),
+    ];
+    const NAMES: [&str; 5] = [
+        "8K tiled plane DPPs",
+        "turned 8K DCC plane DPPs",
+        "turned 8K NV12 plane DPPs",
+        "turned 8K P010 plane DPPs",
+        "1:1 tiled plane DPPs",
+    ];
+    for (k, (format, g, dpps)) in cases.into_iter().enumerate() {
+        let sel = Selection {
+            format,
+            planes: PlaneSetup {
+                primary: Some(g),
+                ..PlaneSetup::NONE
+            },
+            ..base
+        };
+        let Ok(plans) = admit_displays(&soc, &[sel]) else {
+            return TestResult::Fail("split plane refused");
+        };
+        if plans[0].pipes != 1 || plans[0].plane(0).map(|p| p.dpps) != Some(dpps) {
+            return TestResult::Fail(NAMES[k]);
+        }
+        let Ok(pipes) = display_pipes(&[sel], &plans, &[0]) else {
+            return TestResult::Fail("split plane pipes");
+        };
+        let want = if dpps == 2 {
+            otg::SplitPipes::one(3)
+        } else {
+            otg::SplitPipes::NONE
+        };
+        let (primary, _) = plane_requests(&sel, 0, &pipes[0]);
+        if pipes[0].mpc != want
+            || primary.mpc != want
+            || primary.check().is_err()
+            || Some(primary.dml_plane()) != plans[0].mode.planes[0]
+        {
+            return TestResult::Fail("split plane request");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_split_tiled_rotated_and_video_planes_reach_pipes
+);
+
 /// DP SST deep color as amdgpu_dm decides it: the sink's EDID 1.4 color
 /// depth (display_info.bpc, 8 when undefined) bounded by the requested
 /// maximum (max_requested_bpc, even), then create_validate_stream_for_sink's
