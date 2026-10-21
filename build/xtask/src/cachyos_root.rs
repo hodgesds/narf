@@ -139,6 +139,7 @@ const CHECK_COMMANDS: &[&str] = &[
     "ldconfig 2>&1 | head -n 3 | sed 's/^/NARF-LDCONFIG /'",
     "journalctl -b --no-pager -o cat _SYSTEMD_UNIT=systemd-sysusers.service | head -n 3 | sed 's/^/NARF-JOURNAL-UNIT /'",
     "echo NARF-JOURNAL-U $(journalctl -q -b -o cat -u systemd-journald.service | wc -l)",
+    "echo NARF-PID1-MAPS $(wc -l < /proc/1/maps)",
     "timeout 5 /usr/lib/systemd/systemd-oomd 2>&1 | head -n 5 | sed 's/^/NARF-OOMD /'",
     "journalctl -b --no-pager -p warning -o cat | tail -n 40",
     "sed 's/^/NARF-MI /' /proc/1/mountinfo",
@@ -180,6 +181,16 @@ fn stuck_start_job(serial: &str) -> Option<&str> {
         let elapsed = timer.split(" / ").next()?;
         let minutes: u32 = elapsed.split_once("min")?.0.parse().ok()?;
         (minutes >= STUCK_START_JOB_MIN).then_some(line)
+    })
+}
+
+/// `NARF-PID1-MAPS <n>`: the lines of `/proc/1/maps` the login shell (an
+/// unrelated process) read, or `None` when the report has no such line.
+fn pid1_maps_lines(report: &str) -> Option<usize> {
+    report.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("NARF-PID1-MAPS ")
+            .and_then(|n| n.trim().parse().ok())
     })
 }
 
@@ -498,6 +509,11 @@ fn boot_and_login(args: &Args) -> Result<()> {
         // finding nothing means the journal's field index is unreadable.
         if journal_unit_lines(&strip_escapes(&serial[mark..])) == Some(0) {
             bail!("journalctl -u systemd-journald returned no entries");
+        }
+        // systemd always has a text, heap and stack mapping. An empty
+        // /proc/1/maps means another process could not find PID 1's mm.
+        if pid1_maps_lines(&strip_escapes(&serial[mark..])) == Some(0) {
+            bail!("/proc/1/maps read back empty from the login shell");
         }
         if args.no_poweroff {
             return Ok(());
@@ -1033,6 +1049,9 @@ mod tests {
             Some(12)
         );
         assert_eq!(journal_unit_lines("NARF-JOURNAL-U 0"), Some(0));
+        assert_eq!(pid1_maps_lines("  NARF-PID1-MAPS 57\n"), Some(57));
+        assert_eq!(pid1_maps_lines("NARF-PID1-MAPS 0"), Some(0));
+        assert_eq!(pid1_maps_lines("NARF-STATE running\n"), None);
         // A mistyped command leaves no verdict rather than a false zero.
         assert_eq!(journal_unit_lines("NARF-STATE running\n"), None);
         assert_eq!(journal_unit_lines("NARF-JOURNAL-U \n"), None);
