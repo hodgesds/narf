@@ -342,9 +342,7 @@ fn destination(object: &GemObject, to_vram: bool) -> Result<GemPlacement, FsErro
         .max(PAGE_SIZE)
         .checked_next_power_of_two()
         .ok_or(FsError::InvalidData)?;
-    let held = heap
-        .pool
-        .reserve_aligned(object.byte_len, align)
+    let held = reserve_visible(&heap, object.card, object.flags, object.byte_len, align)
         .map_err(|_| FsError::NoSpace)?;
     let gpu = held
         .address()

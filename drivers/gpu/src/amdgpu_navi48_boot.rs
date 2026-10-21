@@ -1347,6 +1347,16 @@ impl ColdBoot {
             fb_offset: context.fb_offset,
             unmapped: None,
         };
+        // amdgpu_gmc_get_dcc_alignment from discovery's GC version and its
+        // gc_info TCC count (max_texture_channel_caches), before any client
+        // buffer is placed.
+        let gc = ip::find_ip(&hw.gpu.ip_blocks, ip::HW_ID_GC, 0)
+            .map_or((0, 0, 0), |gc| (gc.major, gc.minor, gc.revision));
+        let tccs = hw.gpu.gc_info.map_or(0, |info| info.num_tccs);
+        crate::amdgpu_gem::set_dcc_alignment(
+            card,
+            u64::from(crate::amdgpu_gem::gmc_v12_dcc_alignment(gc, tccs)),
+        );
         crate::amdgpu_gem::register_vram_heap(card, heap.clone());
         self.client_heap = Some(heap);
         self.client_vram = Some(chunk);

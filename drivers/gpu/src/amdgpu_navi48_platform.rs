@@ -3919,6 +3919,7 @@ impl PlaneFrame {
             pitch_bytes: self.pitch,
             chroma,
             last: pin.address() + pin.byte_len() - 1,
+            dcc_aligned: pin.dcc_aligned(),
         })
     }
 }

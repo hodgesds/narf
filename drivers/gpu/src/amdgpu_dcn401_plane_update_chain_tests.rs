@@ -638,6 +638,7 @@ pub(super) fn dcn401_live_plane_update_scans_a_client_framebuffer_from_the_latch
         pitch_bytes: 512,
         chroma: None,
         last: client + 512 * 64 - 1,
+        dcc_aligned: true,
     };
     let mut outside = ClientFb {
         q,

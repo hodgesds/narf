@@ -164,7 +164,7 @@ pub(crate) fn hidden_destination(card: u32, object: &GemObject) -> Result<GemPla
         return Err(FsError::Unsupported);
     }
     let heap = vram_heap(card).ok_or(FsError::NoDevice)?;
-    let hidden = heap.unmapped.ok_or(FsError::Unsupported)?;
+    let hidden = heap.unmapped.clone().ok_or(FsError::Unsupported)?;
     if hidden.transfer.is_none() {
         return Err(FsError::Unsupported);
     }
@@ -173,10 +173,15 @@ pub(crate) fn hidden_destination(card: u32, object: &GemObject) -> Result<GemPla
         .max(PAGE_SIZE)
         .checked_next_power_of_two()
         .ok_or(FsError::InvalidData)?;
-    let held = hidden
-        .pool
-        .reserve_aligned(object.byte_len, align)
-        .map_err(|_| FsError::NoSpace)?;
+    let held = reserve_hidden(
+        &heap,
+        &hidden,
+        object.card,
+        object.flags,
+        object.byte_len,
+        align,
+    )
+    .map_err(|_| FsError::NoSpace)?;
     let gpu = held
         .address()
         .checked_sub(heap.fb_base)
@@ -252,6 +257,95 @@ fn vram_heap(card: u32) -> Option<VramHeap> {
         .iter()
         .find(|(c, _)| *c == card)
         .map(|(_, h)| h.clone())
+}
+
+/// Each card's GFX12 DCC VRAM alignment (`amdgpu_gmc_get_dcc_alignment`),
+/// by card index; a card without one (any GC but 12.0.x) aligns DCC
+/// buffers like any other.
+static DCC_ALIGNMENT: IrqSafeSpinLock<Vec<(u32, u64)>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Give DRM card `card`'s GFX12_DCC buffers the VRAM alignment `bytes`
+/// ([`gmc_v12_dcc_alignment`]; 0 for none). Set before its heap is
+/// registered, so every DCC placement honours it.
+pub fn set_dcc_alignment(card: u32, bytes: u64) {
+    let mut table = DCC_ALIGNMENT.lock();
+    table.retain(|(c, _)| *c != card);
+    if bytes != 0 {
+        table.push((card, bytes));
+    }
+}
+
+/// `gmc_v12_0_get_dcc_alignment` for GC `gc` with discovery's
+/// `max_texture_channel_caches` (gc_info's gc_num_gl2c / gc_num_tccs):
+/// TCCs / 4 (a power-of-two count) or the count rounded up to a power of
+/// two, times the count, KiB; 0 on any GC but 12.0.0 and 12.0.1. In
+/// unsigned int arithmetic, as Linux computes it.
+pub const fn gmc_v12_dcc_alignment(gc: (u8, u8, u8), max_texture_channel_caches: u32) -> u32 {
+    if !matches!(gc, (12, 0, 0) | (12, 0, 1)) {
+        return 0;
+    }
+    let n = max_texture_channel_caches;
+    let alignment = if n.is_power_of_two() {
+        n / 4
+    } else {
+        match n.checked_next_power_of_two() {
+            Some(a) => a,
+            None => 0,
+        }
+    };
+    alignment.wrapping_mul(n).wrapping_mul(1024)
+}
+
+/// amdgpu_vram_mgr_new's adjust_dcc_size for a buffer of `flags` on card
+/// `card`: the card's DCC alignment for a GFX12_DCC buffer, else 0. NARF
+/// places every VRAM buffer as one reservation, which is the
+/// VRAM_CONTIGUOUS path, so a DCC buffer takes the DCC placement wherever
+/// it lands in VRAM (create, every move back, and so the scanout pin, for
+/// which prepare_fb sets VRAM_CONTIGUOUS).
+fn dcc_adjust(card: Option<u32>, flags: u64) -> u64 {
+    if flags & u64::from(uapi::AMDGPU_GEM_CREATE_GFX12_DCC) == 0 {
+        return 0;
+    }
+    let Some(card) = card else {
+        return 0;
+    };
+    DCC_ALIGNMENT
+        .lock()
+        .iter()
+        .find(|(c, _)| *c == card)
+        .map_or(0, |(_, a)| *a)
+}
+
+/// Reserve `byte_len` bytes of `heap`'s visible VRAM for a buffer of
+/// `flags` on `card`: at `align` (the buffer's power-of-two alignment), or
+/// for a GFX12 DCC buffer as amdgpu_vram_mgr_new places one
+/// (`Pool::reserve_dcc`).
+fn reserve_visible(
+    heap: &VramHeap,
+    card: Option<u32>,
+    flags: u64,
+    byte_len: u64,
+    align: u64,
+) -> Result<crate::amdgpu_vram::Reservation, crate::amdgpu_vram::Error> {
+    match dcc_adjust(card, flags) {
+        0 => heap.pool.reserve_aligned(byte_len, align),
+        dcc => heap.pool.reserve_dcc(byte_len, dcc, heap.fb_base),
+    }
+}
+
+/// [`reserve_visible`] past the BAR.
+fn reserve_hidden(
+    heap: &VramHeap,
+    hidden: &UnmappedHeap,
+    card: Option<u32>,
+    flags: u64,
+    byte_len: u64,
+    align: u64,
+) -> Result<crate::amdgpu_vram::UnmappedReservation, crate::amdgpu_vram::Error> {
+    match dcc_adjust(card, flags) {
+        0 => hidden.pool.reserve_aligned(byte_len, align),
+        dcc => hidden.pool.reserve_dcc(byte_len, dcc, heap.fb_base),
+    }
 }
 
 /// `AMDGPU_GEM_DOMAIN_MASK`, from the mirror — it was hand-composed here
@@ -419,6 +513,8 @@ pub struct ScanoutPin {
     /// The placement's GPU (frame-buffer aperture) address, which display
     /// fetch takes: amdgpu_bo_gpu_offset.
     address: u64,
+    /// Not a GFX12 DCC buffer, or one placed at its card's DCC alignment.
+    dcc_aligned: bool,
 }
 impl ScanoutPin {
     /// amdgpu_bo_gpu_offset: where display fetches byte 0.
@@ -435,6 +531,12 @@ impl ScanoutPin {
     /// The pinned placement, for CPU copies of a buffer the CPU reaches.
     pub fn placement(&self) -> &Arc<GemPlacement> {
         &self.placement
+    }
+    /// Whether display may fetch the buffer with DCC: it is no GFX12 DCC
+    /// buffer, or amdgpu_vram_mgr_new's DCC placement put its VRAM at the
+    /// card's gmc_v12_0_get_dcc_alignment.
+    pub fn dcc_aligned(&self) -> bool {
+        self.dcc_aligned
     }
 }
 impl Drop for ScanoutPin {
@@ -547,6 +649,19 @@ impl GemObject {
             Backing::Unmapped { _held } => _held.address(),
             _ => return Err(FsError::Busy),
         };
+        // Every DCC placement is made at the card's DCC alignment
+        // (`reserve_visible`); one that is not is never scanned out.
+        let dcc_aligned = match dcc_adjust(self.card, self.flags) {
+            0 => true,
+            dcc => self
+                .card
+                .and_then(vram_heap)
+                .and_then(|heap| address.checked_sub(heap.fb_base))
+                .is_some_and(|offset| offset % dcc == 0),
+        };
+        if !dcc_aligned {
+            return Err(FsError::InvalidData);
+        }
         // Under the placement lock: no move can start between the check and
         // the count, and the pin's lease alone already stops one.
         self.pin_count.fetch_add(1, Ordering::AcqRel);
@@ -554,6 +669,7 @@ impl GemObject {
             object: Arc::clone(self),
             placement: Arc::clone(&placement),
             address,
+            dcc_aligned,
         })
     }
     /// Acquire an address lease before exposing physical frames or PTEs.
@@ -593,7 +709,7 @@ impl GemObject {
         {
             return Err(FsError::Busy);
         }
-        backing.relocate(to_vram, self.card, self.alignment)
+        backing.relocate(to_vram, self.card, self.alignment, self.flags)
     }
 
     pub fn phys(&self) -> u64 {
@@ -743,6 +859,7 @@ impl GemPlacement {
         to_vram: bool,
         card: Option<u32>,
         alignment: u64,
+        flags: u64,
     ) -> Result<(), FsError> {
         if self.system != to_vram {
             return Ok(());
@@ -756,9 +873,7 @@ impl GemPlacement {
                 .max(PAGE_SIZE)
                 .checked_next_power_of_two()
                 .ok_or(FsError::InvalidData)?;
-            let reservation = heap
-                .pool
-                .reserve_aligned(self.byte_len, alignment)
+            let reservation = reserve_visible(&heap, card, flags, self.byte_len, alignment)
                 .map_err(|_| FsError::NoSpace)?;
             let gpu = reservation
                 .address()
@@ -1031,7 +1146,7 @@ pub(crate) fn try_placement(card: u32) -> Option<PlacementGuard> {
 
 /// Reclaim idle client VRAM; address leases and unsignalled fences pin it.
 /// A shared handle or PRIME export alone does not pin placement.
-fn evict_visible(card: u32, pool: &crate::amdgpu_vram::Pool, bytes: u64, alignment: u64) {
+fn evict_visible(card: u32, fits: impl Fn() -> bool) {
     let tables: Vec<_> = GEM_TABLES
         .lock()
         .iter()
@@ -1043,7 +1158,7 @@ fn evict_visible(card: u32, pool: &crate::amdgpu_vram::Pool, bytes: u64, alignme
         for object in objects {
             if !object.system() && !object.pinned() {
                 let _ = object.relocate(false);
-                if pool.reserve_aligned(bytes, alignment).is_ok() {
+                if fits() {
                     return;
                 }
             }
@@ -1103,7 +1218,8 @@ pub(crate) fn restore_domains(touched: Vec<(Arc<GemObject>, u64)>) {
 /// mapped ones included (their mappings follow), until `size` bytes at
 /// `align` fit in the visible heap (or, for `no_cpu`, past the BAR). True
 /// once they do; the probe reservation is released again.
-async fn reclaim_vram(card: u32, heap: &VramHeap, size: u64, align: u64, no_cpu: bool) -> bool {
+async fn reclaim_vram(card: u32, heap: &VramHeap, size: u64, align: u64, flags: u64) -> bool {
+    let no_cpu = flags & u64::from(uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0;
     let gate = lock_placement(card).await;
     let tables: Vec<_> = GEM_TABLES
         .lock()
@@ -1118,12 +1234,11 @@ async fn reclaim_vram(card: u32, heap: &VramHeap, size: u64, align: u64, no_cpu:
                 continue;
             }
             let _ = crate::amdgpu_vm::relocate(&gate, &object, false).await;
-            if heap.pool.reserve_aligned(size, align).is_ok()
+            if reserve_visible(heap, Some(card), flags, size, align).is_ok()
                 || (no_cpu
-                    && heap
-                        .unmapped
-                        .as_ref()
-                        .is_some_and(|u| u.pool.reserve_aligned(size, align).is_ok()))
+                    && heap.unmapped.as_ref().is_some_and(|u| {
+                        reserve_hidden(heap, u, Some(card), flags, size, align).is_ok()
+                    }))
             {
                 return true;
             }
@@ -1235,10 +1350,8 @@ pub async fn dispatch_async(
     else {
         return Some(Err(FsError::InvalidData));
     };
-    let no_cpu = u64::from_le_bytes(bytes[24..32].try_into().unwrap())
-        & u64::from(uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS)
-        != 0;
-    if reclaim_vram(card, &heap, size, align, no_cpu).await {
+    let flags = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+    if reclaim_vram(card, &heap, size, align, flags).await {
         return Some(create(state, arg));
     }
     Some(result)
@@ -1264,7 +1377,7 @@ pub async fn create_dumb_async(
     let Some(heap) = vram_heap(card) else {
         return result;
     };
-    if reclaim_vram(card, &heap, size, PAGE_SIZE, false).await {
+    if reclaim_vram(card, &heap, size, PAGE_SIZE, DUMB_CREATE_FLAGS).await {
         return state.create_dumb(width, height, bpp);
     }
     result
@@ -1498,7 +1611,9 @@ impl GemState {
             .pool
             .reserve_aligned(byte_len, PAGE_SIZE)
             .or_else(|_| {
-                evict_visible(card, &heap.pool, byte_len, PAGE_SIZE);
+                evict_visible(card, || {
+                    heap.pool.reserve_aligned(byte_len, PAGE_SIZE).is_ok()
+                });
                 heap.pool.reserve_aligned(byte_len, PAGE_SIZE)
             })
             .map_err(|_| FsError::NoSpace)?;
@@ -1745,7 +1860,8 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
         .filter(|_| flags & uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS as u64 != 0)
         .and_then(|heap| {
             let unmapped = heap.unmapped.as_ref()?;
-            let reservation = unmapped.pool.reserve_aligned(byte_len, align).ok()?;
+            let reservation =
+                reserve_hidden(heap, unmapped, state.card, flags, byte_len, align).ok()?;
             Some((heap, unmapped, reservation))
         });
     if let Some((heap, unmapped, reservation)) = unmapped {
@@ -1784,16 +1900,13 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
         return finish_create(state, arg, object);
     }
     let vram = heap.and_then(|heap| {
-        let reservation = heap
-            .pool
-            .reserve_aligned(byte_len, align)
+        let reserve = || reserve_visible(&heap, state.card, flags, byte_len, align);
+        let reservation = reserve()
             .or_else(|error| {
                 if let Some(card) = state.card {
-                    evict_visible(card, &heap.pool, byte_len, align);
+                    evict_visible(card, || reserve().is_ok());
                 }
-                heap.pool
-                    .reserve_aligned(byte_len, align)
-                    .map_err(|_| error)
+                reserve().map_err(|_| error)
             })
             .ok()?;
         Some((heap, reservation))
@@ -2144,3 +2257,7 @@ fn metadata(state: &GemState, arg: usize) -> Result<u64, FsError> {
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_render_abi_tests.rs"]
 mod render_abi_tests;
+
+#[cfg(feature = "kernel-test")]
+#[path = "amdgpu_dcc_vram_tests.rs"]
+mod dcc_vram_tests;

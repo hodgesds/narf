@@ -4676,7 +4676,29 @@ with RMFB or, at the open's close, by `Card::release_file_framebuffers`
 `GemObject::pin_scanout` pins the buffer with
 amdgpu_display_supported_domains' domain, which on this dGPU (no
 gpu_vm_support) is VRAM alone, DCC buffers included: a VRAM placement is
-one contiguous reservation; a buffer in system memory moves to VRAM first
+one contiguous reservation (amdgpu_vram_mgr_new's VRAM_CONTIGUOUS path, so
+an AMDGPU_GEM_CREATE_GFX12_DCC buffer is placed as that path places one
+wherever it lands in VRAM: GEM_CREATE, past the BAR, and every move back,
+`amdgpu_gem::reserve_visible` / `reserve_hidden`): the card's
+`amdgpu_gem::gmc_v12_dcc_alignment` (gmc_v12_0_get_dcc_alignment from
+discovery's GC version and gc_info TCC count, registered by
+`publish_client_vram` through `amdgpu_gem::set_dcc_alignment`; 64 KiB on
+Navi48's 16 TCCs, 0 off GC 12.0.x) rounds the request to the power-of-two
+block `amdgpu_vram::dcc_block_size` (roundup_pow_of_two(size + alignment),
+in Linux's 32-bit dcc_size), placed at its own alignment, then trimmed to
+the buffer's size from the block's first multiple of the alignment counted
+from VRAM offset 0 (`amdgpu_vram::dcc_trim_start`, `Pool::reserve_dcc`,
+`UnmappedPool::reserve_dcc`; the rest of the block is free again).
+`tests/amdgpu_dcc_vram/check.sh` builds gmc_v12_0_get_dcc_alignment and
+amdgpu_vram_mgr_new from the Linux tree over a stand-in buddy and checks
+1755 vectors, replayed by `dcc_vram_placement_matches_linux_vectors`. A
+pinned DCC buffer reports `ScanoutPin::dcc_aligned`, a DCC buffer whose
+placement misses the alignment is refused at the pin, and a DCC plane
+refuses an `otg::ExternalSurface` without `dcc_aligned`. Linux takes the
+DCC placement only once a buffer is allocated VRAM_CONTIGUOUS (prepare_fb
+sets the flag, so its first pin re-places a non-contiguous one; a buffer
+that happened to land contiguous keeps its start); NARF's placements are
+all contiguous, so it applies from creation. A buffer in system memory moves to VRAM first
 when nothing else leases it; one VRAM is not allowed for, a userptr or a
 foreign dma-buf is refused. `ScanoutPin` (amdgpu_bo_unpin on drop) keeps the
 buffer and its placement: while any pin lives `GemObject::pinned` stops

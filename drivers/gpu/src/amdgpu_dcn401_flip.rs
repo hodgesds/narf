@@ -36,6 +36,11 @@ pub struct ExternalSurface {
     /// The pinned buffer's last byte, which must lie in the frame-buffer
     /// aperture with every byte the plane fetches.
     pub last: u64,
+    /// The buffer is no GFX12 DCC buffer, or one amdgpu_vram_mgr_new's DCC
+    /// placement put at gmc_v12_0_get_dcc_alignment
+    /// (`amdgpu_gem::ScanoutPin::dcc_aligned`). A DCC plane fetches only
+    /// such a buffer.
+    pub dcc_aligned: bool,
 }
 
 /// What a flipping plane shows next: its staged back buffer (the copy the
@@ -50,8 +55,9 @@ impl ExternalSurface {
     /// The plane `from` fetching this framebuffer, if hubp401 can: a
     /// non-zero 256-byte-aligned address (and chroma address), a pitch of
     /// whole pixels at least the staged one and within PITCH's 14 bits
-    /// (likewise the chroma's), every fetched row inside the buffer, and
-    /// the chroma plane exactly when the plane is 4:2:0.
+    /// (likewise the chroma's), every fetched row inside the buffer, the
+    /// chroma plane exactly when the plane is 4:2:0, and for a DCC plane a
+    /// buffer at the DCC VRAM alignment.
     pub(in crate::amdgpu_dcn401_otg) fn applied(
         self,
         from: SurfaceApplied,
@@ -76,6 +82,7 @@ impl ExternalSurface {
                 format.bytes_per_pixel(),
             )
             || luma_end > self.last
+            || (r.surface.tiling.dcc.is_some() && !self.dcc_aligned)
         {
             return Err(Error::Invalid);
         }

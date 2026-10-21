@@ -928,6 +928,7 @@ fn scans_client_framebuffers_in_place(mut c: alloc::boxed::Box<Chain>) -> TestRe
         pitch_bytes: 4096,
         chroma: None,
         last: client + 4096 * 480 - 1,
+        dcc_aligned: true,
     };
     for bad in [
         ExternalSurface {

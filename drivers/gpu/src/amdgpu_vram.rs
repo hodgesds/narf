@@ -134,6 +134,32 @@ impl Pool {
             reusable: true,
         })
     }
+    /// amdgpu_vram_mgr_new's GFX12_DCC | VRAM_CONTIGUOUS placement
+    /// (`place_dcc`): `size` bytes starting at a multiple of `alignment`
+    /// (gmc_v12_0_get_dcc_alignment, counted from VRAM offset 0 at GPU
+    /// address `origin`) inside a [`dcc_block_size`] block at its own
+    /// alignment. Only the trimmed range is held.
+    pub fn reserve_dcc(
+        &self,
+        size: u64,
+        alignment: u64,
+        origin: u64,
+    ) -> Result<Reservation, Error> {
+        let mut used = self.0.used.lock();
+        let range = place_dcc(
+            &mut used,
+            self.0.address,
+            self.0.mapping.len,
+            size,
+            alignment,
+            origin,
+        )?;
+        Ok(Reservation {
+            pool: self.0.clone(),
+            range,
+            reusable: true,
+        })
+    }
     pub fn available(&self) -> u64 {
         self.0.mapping.len
             - self
@@ -202,6 +228,69 @@ fn place(
     Ok(start..end)
 }
 
+/// amdgpu_vram_mgr_new's block for a GFX12_DCC | VRAM_CONTIGUOUS buffer of
+/// `size` bytes at DCC alignment `alignment` (adjust_dcc_size):
+/// `roundup_pow_of_two(size + alignment)`, kept in the 32-bit `dcc_size`
+/// Linux stores it in (0 once it no longer fits, which Linux cannot place).
+pub const fn dcc_block_size(size: u64, alignment: u64) -> u64 {
+    match size.checked_add(alignment) {
+        Some(n) => match n.checked_next_power_of_two() {
+            Some(block) => block as u32 as u64,
+            None => 0,
+        },
+        None => 0,
+    }
+}
+
+/// Where amdgpu_vram_mgr_new trims a DCC buffer's block starting at VRAM
+/// offset `block_start`: `roundup(block_start, alignment)`.
+pub const fn dcc_trim_start(block_start: u64, alignment: u64) -> Option<u64> {
+    match block_start.checked_next_multiple_of(alignment) {
+        Some(start) => Some(start),
+        None => None,
+    }
+}
+
+/// `place` of a GFX12 DCC buffer as amdgpu_vram_mgr_new places it: the
+/// [`dcc_block_size`] block of `size` (pages) and `alignment` first, at its
+/// own (power-of-two) alignment as the buddy allocator hands one out, then
+/// trimmed (gpu_buddy_block_trim) to `size` bytes from the block's first
+/// multiple of `alignment` past `origin` (the GPU address of VRAM offset
+/// 0, which the buddy offsets count from). The rest of the block stays
+/// free, as the trim returns it.
+fn place_dcc(
+    used: &mut Vec<Range<u64>>,
+    address: u64,
+    len: u64,
+    size: u64,
+    alignment: u64,
+    origin: u64,
+) -> Result<Range<u64>, Error> {
+    let size = size.checked_add(4095).ok_or(Error::Invalid)? & !4095;
+    let block = dcc_block_size(size, alignment);
+    if size == 0 || alignment == 0 || alignment % 4096 != 0 || block < 4096 {
+        return Err(Error::Invalid);
+    }
+    let range = place(used, address, len, block, block)?;
+    let trimmed = address
+        .checked_add(range.start)
+        .and_then(|at| at.checked_sub(origin))
+        .and_then(|offset| dcc_trim_start(offset, alignment))
+        .and_then(|offset| offset.checked_add(origin))
+        .and_then(|at| at.checked_sub(address))
+        .filter(|&start| start.checked_add(size).is_some_and(|end| end <= range.end));
+    let index = used
+        .iter()
+        .position(|r| *r == range)
+        .ok_or(Error::Invalid)?;
+    let Some(start) = trimmed else {
+        used.remove(index);
+        return Err(Error::Invalid);
+    };
+    used[index] = start..start + size;
+    Ok(start..start + size)
+}
+
 /// Owned VRAM with no CPU mapping: what lies beyond a BAR that shows only a
 /// prefix of VRAM. Only the GPU can touch it, so whoever hands a range out
 /// must have the GPU clear it first.
@@ -267,6 +356,26 @@ impl UnmappedPool {
             self.0.len,
             size,
             alignment,
+        )?;
+        Ok(UnmappedReservation {
+            pool: self.0.clone(),
+            range,
+        })
+    }
+    /// [`Pool::reserve_dcc`] past the BAR.
+    pub fn reserve_dcc(
+        &self,
+        size: u64,
+        alignment: u64,
+        origin: u64,
+    ) -> Result<UnmappedReservation, Error> {
+        let range = place_dcc(
+            &mut self.0.used.lock(),
+            self.0.address,
+            self.0.len,
+            size,
+            alignment,
+            origin,
         )?;
         Ok(UnmappedReservation {
             pool: self.0.clone(),
