@@ -376,6 +376,9 @@ pub struct PlaneLayout {
     /// primary's): it blends under the primary instead of above it.
     pub underlay: bool,
 }
+/// A viewport's first column and width, as dml2_pipe_configuration_descriptor
+/// carries it (viewport_x_start, viewport_width).
+pub type McacheSpan = (u32, u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SurfaceRequest {
     pub pipe: u8,
@@ -626,7 +629,7 @@ impl SurfaceRequest {
     /// width of the pipe's own SPL luma viewport, and of its chroma
     /// viewport for a 4:2:0 surface (scl_data.viewport and viewport_c, also
     /// when rotated). `None` for a pipe the request does not fetch on.
-    pub fn mcache_viewports(self, p: u8) -> Option<((u32, u32), Option<(u32, u32)>)> {
+    pub fn mcache_viewports(self, p: u8) -> Option<(McacheSpan, Option<McacheSpan>)> {
         let (_, scaler) = self.scalers().find(|&(q, _)| q == p)?;
         let span = |r: spl::Rect| (r.x.max(0) as u32, r.width.max(0) as u32);
         let chroma = self.format.is_video().then(|| span(scaler.viewport_c));

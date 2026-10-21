@@ -689,9 +689,14 @@ mod tests {
             kind: narf_bus::BarKind::Mmio32 { prefetchable: true },
         };
         // SAFETY: bookkeeping-only model; no mapping access is performed.
-        let pool =
-            unsafe { Pool::from_owned_aperture(map, 0x1_0000_0000, &[14 * 4096..16 * 4096]) }
-                .unwrap();
+        let pool = unsafe {
+            Pool::from_owned_aperture(
+                map,
+                0x1_0000_0000,
+                core::slice::from_ref(&(14 * 4096..16 * 4096)),
+            )
+        }
+        .unwrap();
         let live = pool.reserve(4096).unwrap();
         let mut retired = pool.reserve(4096).unwrap();
         retired.publish();
