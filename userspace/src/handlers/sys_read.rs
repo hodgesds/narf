@@ -18,6 +18,10 @@ pub(super) fn park_blocking_read(
             // SAFETY: live per-task context, exclusively held in syscall.
             unsafe {
                 let uc = &*uctx;
+                uc.console_read_tty.store(
+                    ops.tty_id().unwrap_or(0),
+                    core::sync::atomic::Ordering::Release,
+                );
                 uc.console_read_pending
                     .store(true, core::sync::atomic::Ordering::Release);
                 // The rewound read is restart-pending, so a signal that

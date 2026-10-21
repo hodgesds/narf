@@ -1569,3 +1569,7 @@ argument = "The frame/ edit (bare_main.rs) replaces the ACPI power-button platfo
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The frame/ edit (bare_main.rs) only narrows two existing test-only Late initcalls, btrfs-disk-smoke and btrfs-write-smoke: besides the narf.btrfs_smoke boot argument they now skip any btrfs device whose fsid is not one of xtask's own disposable fixtures (narf_drivers_fs_btrfs::harness, an fsid allowlist plus the c4c405ee-0000-4a11-9e57- harness prefix) or whose fsid equals the root=UUID= on the command line, so a stray flag on a bare-metal host can no longer mutate a real btrfs filesystem. The check reads one superblock sector; it adds no authority, memory access, domain transition, trap-path code or TCB member, and it can only remove writes, never add one."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame/ change in bare_main.rs replaces the body of the IRQ-4 serial handler with one call to narf_input::fill_byte_ring(narf_console::try_read_byte, 256). The handler still only moves received UART bytes into the existing input ring under that ring's IRQ-safe lock; it gains no authority, mapping, capability, domain transition or scheduling state. The room check and push are now atomic with the reader's refill, so a full ring throttles the UART (bytes stay in the FIFO) instead of evicting queued input; the per-IRQ work stays bounded at 256 bytes."

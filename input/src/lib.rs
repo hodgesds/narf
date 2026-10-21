@@ -886,7 +886,23 @@ static BUTTON_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(No
 /// very briefly), so this waker lock must be acquired *after* the ring is
 /// released to avoid inversion. `push_global_ascii_and_wake` always takes
 /// the ring first, then the waker slot.
-static BYTE_RING_WAKER: IrqSafeSpinLock<Option<Waker>> = IrqSafeSpinLock::new(None);
+///
+/// A wait queue, not a single slot: with `ttyS0` and the VTs separate ttys,
+/// a reader of each can be parked at once (a serial shell and the getty on
+/// tty1), and a single slot let each overwrite the other's waker, so input
+/// for one could wake only the other. Like Linux's `tty->read_wait`, every
+/// parked reader is woken and re-checks its own tty.
+static BYTE_RING_WAKERS: IrqSafeSpinLock<alloc::vec::Vec<Waker>> =
+    IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+/// Wake every parked console reader (see [`BYTE_RING_WAKERS`]). Call with
+/// no ring lock held.
+fn wake_console_readers() {
+    let wakers = core::mem::take(&mut *BYTE_RING_WAKERS.lock());
+    if !wakers.is_empty() {
+        narf_lib::deferred_wake::push_pending(wakers.into_iter().map(Some));
+    }
+}
 
 fn ring_for(ev: &InputEvent) -> &'static IrqSafeSpinLock<Option<EventRing>> {
     match ev {
@@ -917,13 +933,25 @@ fn all_rings() -> [&'static IrqSafeSpinLock<Option<EventRing>>; 7] {
 /// existing rings rather than reconstructing.
 pub fn init_global_ring(capacity: usize) {
     for ring in all_rings() {
+        let cap = if core::ptr::eq(ring, &BYTE_RING) {
+            capacity.max(BYTE_RING_CAPACITY)
+        } else {
+            capacity
+        };
         let mut g = ring.lock();
         match g.as_ref() {
             Some(r) => r.__reset_for_test(),
-            None => *g = Some(EventRing::new(capacity)),
+            None => *g = Some(EventRing::new(cap)),
         }
     }
 }
+
+/// Serial receive buffering between the UART and the tty: the role of the
+/// 8250 port's tty flip buffers. Linux lets those grow to 64 KiB
+/// (`TTYB_DEFAULT_MEM_LIMIT`) ahead of n_tty's 4 KiB read buffer; 4 KiB here
+/// holds a full n_tty buffer's worth so a burst typed or pasted while the
+/// reader is busy waits in the ring instead of throttling the line at once.
+pub const BYTE_RING_CAPACITY: usize = 4096;
 
 /// Global modifier state tracked across all keyboard producers. A
 /// shift held on i8042 stays held when virtio-input fires a letter
@@ -1074,10 +1102,7 @@ pub fn push_global(ev: InputEvent) -> bool {
             // after the ring — this matches `WaitAsciiByteFuture::poll`.
             if is_ascii || is_key {
                 drop(g);
-                let maybe_waker = BYTE_RING_WAKER.lock().take();
-                if let Some(w) = maybe_waker {
-                    narf_lib::deferred_wake::push_pending(core::iter::once(Some(w)));
-                }
+                wake_console_readers();
                 return ok;
             }
         }
@@ -1144,20 +1169,57 @@ pub fn note_byte_ring_full() {
 
 /// Move bytes the producer left behind into the ring while it has room,
 /// pulling them with `read_byte`. A no-op unless a producer throttled.
-pub fn refill_byte_ring(mut read_byte: impl FnMut() -> Option<u8>) {
+pub fn refill_byte_ring(read_byte: impl FnMut() -> Option<u8>) {
     if !BYTE_RING_THROTTLED.swap(false, core::sync::atomic::Ordering::AcqRel) {
         return;
     }
-    while byte_ring_has_room() {
-        match read_byte() {
-            Some(b) => {
-                let _ = push_global(InputEvent::AsciiByte(b));
+    fill_byte_ring(read_byte, usize::MAX);
+}
+
+/// Drain up to `max` bytes from a serial device into the byte ring, pulling
+/// them with `read_byte`, and return how many were queued. The serial IRQ
+/// handler and [`refill_byte_ring`] both feed the ring through here.
+///
+/// The room check, the device read and the push happen under one hold of the
+/// ring lock, so two producers on two CPUs cannot both see the last free slot
+/// and push into it: [`EventRing::push`] would then evict the OLDEST queued
+/// byte, silently cutting a character out of the middle of the input. When
+/// the ring fills, or `max` is reached with the device possibly holding more,
+/// the producer stops and throttles ([`note_byte_ring_full`]); the bytes stay
+/// in the UART and the reader pulls them in once it has consumed input.
+/// Linux `serial8250_rx_chars` the same way moves bytes into the tty buffer
+/// until the FIFO is empty or its 256-byte budget is spent.
+pub fn fill_byte_ring(mut read_byte: impl FnMut() -> Option<u8>, max: usize) -> usize {
+    let mut queued = 0usize;
+    let mut throttle = false;
+    {
+        let g = BYTE_RING.lock();
+        let Some(r) = g.as_ref() else {
+            return 0;
+        };
+        loop {
+            if queued == max || r.len() >= r.capacity() {
+                throttle = true;
+                break;
             }
-            None => return,
+            match read_byte() {
+                Some(b) => {
+                    r.push(InputEvent::AsciiByte(b));
+                    ASCII_PUSH_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    queued += 1;
+                }
+                None => break,
+            }
         }
     }
-    // Still full: whatever is left stays in the device for the next read.
-    note_byte_ring_full();
+    if throttle {
+        note_byte_ring_full();
+    }
+    if queued > 0 {
+        // Same wake as `push_global`, with the ring lock already released.
+        wake_console_readers();
+    }
+    queued
 }
 
 /// Number of ASCII bytes currently queued in the BYTE_RING. Best-
@@ -1184,15 +1246,18 @@ pub fn pending_input() -> usize {
     bytes + keys
 }
 
-/// Register `waker` in the `BYTE_RING_WAKER` slot so the next
+/// Add `waker` to the console reader wait queue so the next
 /// `push_global(AsciiByte(_))` (from the serial/keyboard IRQ via
 /// `deferred_wake`) wakes the caller. Unlike `WaitAsciiByteFuture` this
 /// does NOT pop — the caller (a parked `sys_read` re-executing on wake)
-/// drains the ring itself. The console is single-reader, so the single
-/// slot is sufficient. Callers MUST re-check `pending_bytes()` after
+/// drains the ring itself. Every queued reader is woken, as on Linux's
+/// `tty->read_wait`; each re-checks its own tty. Callers MUST re-check after
 /// registering to close the arrive-between-check-and-register race.
 pub fn register_byte_waker(waker: &core::task::Waker) {
-    *BYTE_RING_WAKER.lock() = Some(waker.clone());
+    let mut q = BYTE_RING_WAKERS.lock();
+    if !q.iter().any(|w| w.will_wake(waker)) {
+        q.push(waker.clone());
+    }
 }
 
 /// Pop one raw byte from the AsciiByte stream.
@@ -1209,7 +1274,7 @@ pub fn pop_ascii_byte() -> Option<u8> {
 /// Return a future that resolves to the next byte from the ASCII/serial
 /// input ring, blocking the current task until one arrives.
 ///
-/// Uses the `BYTE_RING_WAKER` slot: on the first `Poll::Pending` the
+/// Uses the console reader wait queue: on the first `Poll::Pending` the
 /// future stores `cx.waker()` there. When `push_global(AsciiByte(_))`
 /// runs (from the serial IRQ handler via `deferred_wake`) the stored
 /// waker is queued for wake-up.
@@ -1242,15 +1307,13 @@ impl core::future::Future for WaitAsciiByteFuture {
             return core::task::Poll::Ready(b);
         }
         // No byte yet. Register our waker so the next push wakes us.
-        // Lock order: BYTE_RING_WAKER after BYTE_RING pop (already released
+        // Lock order: the wait queue after BYTE_RING pop (already released
         // above) — matches the producer's drop-ring-then-lock-waker order.
-        *BYTE_RING_WAKER.lock() = Some(cx.waker().clone());
+        register_byte_waker(cx.waker());
         // Re-check after registering the waker to close the window where
-        // a byte arrives between pop and register.
+        // a byte arrives between pop and register. The waker stays queued;
+        // a later wake of it is spurious and harmless.
         if let Some(b) = pop_ascii_byte() {
-            // Byte raced in. Clear the waker we just stored (no need to
-            // wake ourselves again).
-            BYTE_RING_WAKER.lock().take();
             return core::task::Poll::Ready(b);
         }
         core::task::Poll::Pending

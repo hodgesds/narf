@@ -1364,6 +1364,17 @@ unsafe fn write_user_termios2(uptr: u64, src: [u8; 60]) -> Result<(), FsError> {
 /// versa.
 pub struct ConsoleFile;
 
+/// Whether a console read parked on tty `tty_id` should wake and re-run:
+/// that tty has input a read would consume (completed line-discipline input
+/// or bytes still queued by its device). An unknown id falls back to any
+/// console input.
+pub fn console_input_ready(tty_id: u32) -> bool {
+    match narf_filesystem::console_tty::port_by_id(tty_id) {
+        Some(port) => port.readable_bytes() > 0,
+        None => narf_input::pending_input() > 0,
+    }
+}
+
 /// The tty behind fd 0/1/2.
 fn console_port() -> &'static narf_filesystem::console_tty::TtyPort {
     narf_filesystem::console_tty::console()

@@ -1021,3 +1021,99 @@ fn smoke_input_sysrq_state_is_per_device() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("input", smoke_input_sysrq_state_is_per_device);
+
+/// The serial producers' fill never overfills the byte ring: it stops at
+/// capacity and throttles, leaving the rest in the device, instead of letting
+/// `EventRing::push` evict the oldest queued byte. Without the atomic room
+/// check two producers (the UART IRQ and the reader's refill) could both push
+/// into the last slot and cut a character out of the middle of the input.
+fn smoke_input_fill_byte_ring_never_evicts() -> TestResult {
+    crate::init_global_ring(64);
+    crate::__reset_global_ring_for_test();
+    while crate::pop_ascii_byte().is_some() {}
+    let cap = crate::BYTE_RING_CAPACITY;
+    let mut next = 0usize;
+    let queued = crate::fill_byte_ring(
+        || {
+            next += 1;
+            Some((next % 251) as u8)
+        },
+        usize::MAX,
+    );
+    let pulled = next;
+    // A second producer finds no room and pulls nothing from its device.
+    let mut second = 0usize;
+    let queued2 = crate::fill_byte_ring(
+        || {
+            second += 1;
+            Some(0xff)
+        },
+        usize::MAX,
+    );
+    let first = crate::pop_ascii_byte();
+    let mut rest = 1usize;
+    while crate::pop_ascii_byte().is_some() {
+        rest += 1;
+    }
+    if queued != cap || pulled != cap {
+        return TestResult::Fail("fill_byte_ring did not stop at the ring's capacity");
+    }
+    if queued2 != 0 || second != 0 {
+        return TestResult::Fail("a fill of a full ring pulled a byte it could not queue");
+    }
+    if first != Some(1) || rest != cap {
+        return TestResult::Fail("a queued serial byte was evicted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("input", smoke_input_fill_byte_ring_never_evicts);
+
+/// Every parked console reader is woken by serial input, not just the last
+/// one to park. With `ttyS0` and the VTs separate ttys, a serial shell and the
+/// getty on tty1 park at the same time; a single waker slot let the VT reader
+/// overwrite the shell's waker, and the shell slept through its own input.
+fn smoke_input_console_input_wakes_every_reader() -> TestResult {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+
+    fn counter_waker(c: &Arc<AtomicUsize>) -> Waker {
+        unsafe fn clone(p: *const ()) -> RawWaker {
+            // SAFETY: `p` came from `Arc::into_raw` below.
+            unsafe { Arc::increment_strong_count(p as *const AtomicUsize) };
+            RawWaker::new(p, &VTABLE)
+        }
+        unsafe fn wake(p: *const ()) {
+            // SAFETY: consumes the reference `clone`/`into_raw` handed out.
+            let c = unsafe { Arc::from_raw(p as *const AtomicUsize) };
+            c.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe fn wake_by_ref(p: *const ()) {
+            // SAFETY: `p` is a live `Arc<AtomicUsize>` pointer.
+            unsafe { &*(p as *const AtomicUsize) }.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe fn drop(p: *const ()) {
+            // SAFETY: releases the reference this waker owned.
+            unsafe { Arc::decrement_strong_count(p as *const AtomicUsize) };
+        }
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+        let p = Arc::into_raw(c.clone()) as *const ();
+        // SAFETY: the vtable upholds the RawWaker contract for an Arc.
+        unsafe { Waker::from_raw(RawWaker::new(p, &VTABLE)) }
+    }
+
+    crate::init_global_ring(64);
+    crate::__reset_global_ring_for_test();
+    let serial_reader = Arc::new(AtomicUsize::new(0));
+    let vt_reader = Arc::new(AtomicUsize::new(0));
+    crate::register_byte_waker(&counter_waker(&serial_reader));
+    crate::register_byte_waker(&counter_waker(&vt_reader));
+    let _ = crate::push_global(crate::InputEvent::AsciiByte(b'x'));
+    narf_lib::deferred_wake::drain_and_wake();
+    while crate::pop_ascii_byte().is_some() {}
+    if serial_reader.load(Ordering::SeqCst) != 1 || vt_reader.load(Ordering::SeqCst) != 1 {
+        return TestResult::Fail("console input did not wake every parked reader");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("input", smoke_input_console_input_wakes_every_reader);
