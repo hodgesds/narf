@@ -336,7 +336,9 @@ pub const fn name_for(did: u16) -> &'static str {
         MTK_DEV_MT7961 => "mt7921-7961",
         MTK_DEV_MT7922 => "mt7921-7922",
         MTK_DEV_MT7921 => "mt7921-0608",
-        MTK_DEV_MT7921_ALT => "mt7921-0616",
+        // 0616 is a PCI alias for MT7922, not an MT7921 variant. Keep the
+        // bound-driver/log label aligned with the firmware and raw chip ID.
+        MTK_DEV_MT7921_ALT => "mt7922-0616",
         MTK_DEV_MT7920 => "mt7921-7920",
         _ => "mt7921",
     }
