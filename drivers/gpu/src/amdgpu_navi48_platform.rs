@@ -5125,15 +5125,27 @@ fn wanted_drr(m: &Modeset, vrr: bool) -> Option<crate::amdgpu_freesync::Drr> {
     vrr.then(|| m.selection.drr()).flatten()
 }
 
+/// Each CRTC's DRM "VRR_ENABLED" while it is published active.
+fn vrr_wants() -> [bool; 4] {
+    let outputs = OUTPUTS.lock();
+    core::array::from_fn(|k| outputs.crtcs[k].vrr && outputs.crtcs[k].published_active())
+}
+
+/// Whether a lit display should run DRR (`wanted_drr`).
+fn drr_wanted(boot: &boot::ColdBoot) -> bool {
+    let wants = vrr_wants();
+    boot.display_modesets()
+        .into_iter()
+        .flatten()
+        .any(|m| wanted_drr(&m, wants[usize::from(m.pipe)]).is_some())
+}
+
 /// Bring every live scanout's DRR to what DRM asked (amdgpu_dm's
 /// VRR_STATE_ACTIVE_VARIABLE or INACTIVE). Displays not scanning out are
 /// left alone (their timing is fixed); a refused change is reported and
 /// retried by the next pass.
 fn converge_vrr(boot: &mut boot::ColdBoot) {
-    let wants: [bool; 4] = {
-        let outputs = OUTPUTS.lock();
-        core::array::from_fn(|k| outputs.crtcs[k].vrr && outputs.crtcs[k].published_active())
-    };
+    let wants = vrr_wants();
     for m in boot.display_modesets().into_iter().flatten() {
         let k = usize::from(m.pipe);
         let Ok(Some(status)) = boot.display_status(m.pipe) else {
@@ -5143,7 +5155,8 @@ fn converge_vrr(boot: &mut boot::ColdBoot) {
             continue;
         }
         let want = wanted_drr(&m, wants[k]);
-        if status.drr.map(|a| a.drr) == want {
+        // While PMFW may switch UCLK, the monitor pass pins it first.
+        if status.drr.map(|a| a.drr) == want || (want.is_some() && boot.uclk_switching()) {
             continue;
         }
         // SAFETY: OWNER is held; the platform excludes other timing writers.
@@ -6108,6 +6121,22 @@ pub async unsafe fn monitor_displays(
     }
     if !steps.is_empty() {
         publish_outputs();
+    }
+    // UCLK P-state switching for the configuration now running (pinned
+    // first when a display should run DRR, which the port only runs pinned).
+    // SAFETY: the caller's obligations; OWNER is held.
+    match unsafe { boot.converge_uclk_pstate(drr_wanted(boot)) }.await {
+        Ok(moved) => {
+            for m in moved {
+                displays.lit[usize::from(m.pipe)] = Some(m);
+            }
+        }
+        Err(e) => {
+            let _ = core::fmt::Write::write_fmt(
+                &mut narf_console::Writer,
+                format_args!("amdgpu: navi48 UCLK P-state not converged: {e:?}\n"),
+            );
+        }
     }
     // VRR_ENABLED needs no relight: converge every live timing's DRR.
     converge_vrr(boot);

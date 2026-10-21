@@ -651,6 +651,8 @@ impl ColdBoot {
         slots: u8,
         rate: (u32, u32),
     ) -> Result<MstPayload, MstFailure> {
+        // dcn401_prepare_bandwidth: pinned before any configuration change.
+        self.pin_display_uclk().await.map_err(MstFailure::Display)?;
         let (instance, transmitter) = self.mst_path(port)?;
         let link = self.mst.get_mut(&port).ok_or(MstFailure::Invalid)?;
         let mut aux = DmubAux {
@@ -675,6 +677,8 @@ impl ColdBoot {
         port: usize,
         stream: u8,
     ) -> Result<(), MstFailure> {
+        // dcn401_prepare_bandwidth: pinned before any configuration change.
+        self.pin_display_uclk().await.map_err(MstFailure::Display)?;
         let connected = self.display_hpd(port) != Ok(false);
         let (instance, transmitter) = self.mst_path(port)?;
         let link = self.mst.get_mut(&port).ok_or(MstFailure::Invalid)?;
@@ -1569,6 +1573,8 @@ impl ColdBoot {
         want: impl Fn(usize) -> Option<Timing> + Sync,
         pipes: &[Option<u8>],
     ) -> Result<Configuration, ModesetError> {
+        // dcn401_prepare_bandwidth: pinned before any configuration change.
+        self.pin_display_uclk().await?;
         let route = modeset::MstRoute {
             port,
             pipes,

@@ -96,12 +96,14 @@ fn owners(plan: &dml::Plan, pipe: u8) -> (Request, RequestorApplied, dccg::Appli
                 display_khz: plan.clocks.dispclk_khz,
                 dpp_khz: plan.clocks.dpprefclk_khz,
                 dtb_khz: 600_000,
+                deep_sleep_dcfclk_khz: 0,
             },
             display_khz: plan.clocks.dispclk_khz,
             dpp_khz: plan.clocks.dpprefclk_khz,
             dtb_khz: 600_000,
             dcf_floor_khz: 1_564_000,
             memory_floor_khz: 1_250_000,
+            uclk_pstate: false,
         },
         dpp_phase: 0,
         reference_hz: 720_000_000,
@@ -353,6 +355,7 @@ fn dcn401_deadlines_bind_only_the_admitted_owners() -> TestResult {
             dccg::Applied {
                 global: clocks::Applied {
                     memory_floor_khz: 1_000_000,
+                    uclk_pstate: false,
                     ..clock.global
                 },
                 ..clock

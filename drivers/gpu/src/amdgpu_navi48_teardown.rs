@@ -456,6 +456,8 @@ impl ColdBoot {
     /// writers and other engines; drain any views from earlier incarnations
     /// before activation, and retain exclusive ownership throughout the abort.
     pub async unsafe fn abort_modeset_activation(&mut self, pipe: u8) -> Result<(), ModesetError> {
+        // dcn401_prepare_bandwidth: pinned before any configuration change.
+        self.pin_display_uclk().await?;
         // SAFETY: caller supplies the unpublished activation's exclusions.
         unsafe { abort(self, pipe) }.await
     }

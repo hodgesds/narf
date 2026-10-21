@@ -1038,8 +1038,9 @@ impl Smu {
     pub async unsafe fn baco_exit(&mut self, armd3: bool) -> Result<bool, Error> {
         self.engine.baco_exit(armd3).await
     }
-    /// Let PMFW enter one deep-sleep group. Disabled policy: nothing in narf
-    /// calls this yet. Every failure is terminal.
+    /// Let PMFW enter one deep-sleep group: the display owner calls it for
+    /// both once it installed the watermark ranges, where Linux's
+    /// COMPLETE_INIT does. Every failure is terminal.
     ///
     /// # Safety
     /// All kernel engines are idle and their owners tolerate GFXCLK deep sleep
@@ -1047,7 +1048,6 @@ impl Smu {
     /// recalculated admission and watermarks for deep-sleep clock floors and
     /// exit latencies and installed PMFW watermark ranges; the pinned DCN401
     /// floors alone do not account for deep-sleep exit latency.
-    #[allow(dead_code, reason = "disabled-by-default policy hook")]
     pub(crate) async unsafe fn allow_deep_sleep(
         &mut self,
         group: DeepSleep,

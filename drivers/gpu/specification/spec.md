@@ -704,12 +704,15 @@ policy, following `smu_v14_0_deep_sleep_control`: it extends the allowed mask
 with one board-supported group (DS_GFXCLK+GFX_ULV, or SOCCLK/FCLK/LCLK/DCFCLK/
 UCLK deep sleep after the display power transition), sends
 `EnableSmuFeaturesLow/High` and requires every recorded protection and display
-DPM bit to stay running. Every failure is terminal. It is disabled policy:
-nothing calls it. Memory/fabric deep sleep first needs the display owner to
-recalculate DML admission and watermarks for deep-sleep floors and exit
-latency and to install PMFW watermark ranges through the DAL mailbox; none of
-that exists yet. Layout and message constants are checked against the Linux
-headers by `tests/smu14_metrics.c`; everything is model-tested only.
+DPM bit to stay running. Every failure is terminal. The display owner calls
+it for both groups once, where Linux's COMPLETE_INIT
+(`smu_v14_0_2_set_power_profile_mode`) enables deep sleep: right after the
+DCN4 clock owner started (display power) and installed PMFW's watermark
+ranges (`ColdBoot::start_display_clocks`, below). Every plan's watermarks
+carry DML's self-refresh exit latencies, and the bandwidth sequence sends
+the configuration's deep-sleep DCFCLK. Layout and message constants are
+checked against the Linux headers by `tests/smu14_metrics.c`; everything is
+model-tested only.
 
 After a successful retained boot, `amdgpu_navi48_platform::run` starts
 `amdgpu_navi48_power`. Through the shared `amdgpu_hwmon` it publishes `/sys/class/hwmon/hwmon<N>` (first free N)
@@ -764,7 +767,9 @@ issuing unsupported DPM-floor or UCLK-switch commands.
 `prepare(Request).await` accepts 1–4 displays and bounded, nonzero DISP/DPP/DTB
 rates in kHz. Every consumer must remain retired. It reports the display count,
 pins DCFCLK and UCLK to the reported maxima, disables UCLK switching, and sets
-the requested display clocks, rounding mailbox requests up to MHz. Each floor
+the requested display clocks, rounding mailbox requests up to MHz.
+`Request::deep_sleep_dcfclk_khz` (DPMM's deep-sleep DCFCLK, zero for none)
+is sent as SetMinDeepSleepDcfclk (0xd) when DCFCLK has DPM. Each floor
 requires both mailbox acceptance and the corresponding bit from
 `ReturnHardMinStatus`; its one-second deadline includes nested mailbox waits.
 DISP/DPP/DTB replies are actual kHz, checked against the requested floor and
@@ -782,6 +787,30 @@ DPP DTOs set for the new reference (`dto`) before the reference falls and
 again for the actual one after, a raised one is raised before the DTOs are
 updated. DENTIST stays PMFW's. A failed `dto` step is `Error::Dto`; failure
 or cancellation leaves the owner failed.
+
+`update_bandwidth(regs, Bandwidth, safe_to_lower, held).await` is
+dcn401_build_update_bandwidth_clocks_sequence while displays run. `Bandwidth
+{ uclk_pstate, fclk_pstate, dramclk_khz, idle_dramclk_khz, fclk_khz,
+idle_fclk_khz, deep_sleep_dcfclk_khz }` is DC's `clk` state
+(`Bandwidth::pinned(&Levels)`: no switching, UCLK and FCLK at their maxima;
+`Status::bandwidth` the running one, dcn401_init_clocks' P-state support
+set before the first prepare). In Linux's order: SetUclkPstateAllow(1)
+(0x1a) before the floors when switching is gained, which only
+optimize_bandwidth may do (`should_update_pstate_support`); with idle DPM
+(`Layout::chip` Navi48, PMFW 0x681800 or later, UCLK and FCLK with more than
+one level) the active and idle UCLK/FCLK floor pairs (0x18, 0x19), otherwise
+the UCLK hard minimum; SetUclkPstateAllow(0) after the floors when
+switching is lost; the deep-sleep DCFCLK last. Each floor obeys
+`should_set_clock`; FCLK has no switch message on this ASIC. `prepare`
+routes its UCLK step through the same sequence with `Bandwidth::pinned`.
+`Applied::uclk_pstate` and `memory_floor_khz` (the active UCLK floor) are
+what display deadlines bind against. Failure leaves the owner failed.
+
+`notify_wm_ranges(regs, address).await` is dcn401_notify_wm_ranges:
+SetDalDramAddrHigh/Low (5, 6) with the GPU address of
+`ClockManager::wm_range_table()` (`WatermarksExternal_t`, 112 bytes: set A
+`WATERMARKS_CLOCK_RANGE`, set 1A `WATERMARKS_DUMMY_PSTATE`), then
+TransferTableDram2Smu (8) of TABLE_WATERMARKS (2).
 
 `Starting`/`Applying` are set before awaits. Failure records `Failed(Error)`;
 cancellation leaves the in-flight state. Both prevent mailbox replay, and
@@ -4620,8 +4649,9 @@ of the given type ENOENT. Non-atomic cards keep set_property_legacy. Model-teste
 
 A configuration change that keeps running displays lit follows
 dc_commit_state_no_check's prepare/optimize ordering with dcn401's clock
-sequence (FAMS2/firmware-assisted P-state is out of scope: UCLK switching
-stays disabled).
+sequence. Every change starts pinned (`ColdBoot::pin_display_uclk`, under
+"Navi 48 UCLK P-state switching"); switching is regained only by the display
+monitor's P-state step.
 
 `ColdBoot::modeset_beside(fill, want, pipe_of, mst: &[MstRoute])` lights
 new board sinks and new MST end devices beside the running displays (route
@@ -4987,6 +5017,36 @@ candidate list, the chosen strategy, level and DPMM clocks, every plane's
 plan values and every stream's FAMS2 state exactly (Linux's ±1 tolerances),
 or the documented firmware pin. `pstate_strategies.txt` holds PMO's
 expanded lists (`dcn401_pstate_strategy_lists_match_linux`).
+
+The display owner applies the answer as dcn401_prepare/optimize_bandwidth.
+`ColdBoot::start_display_clocks`, once the clock owner started, writes
+`wm_range_table` to a 4-KiB VRAM range kept out of reuse, sends
+`notify_wm_ranges` and enables SMU deep sleep (`allow_deep_sleep`, both
+groups). `ColdBoot::converge_uclk_pstate(drr)`, from every display monitor
+pass before DRR converges, searches the running configuration (every
+display scanning out without DRR, their plans one admission on the current
+`Soc`, the clock owner's UCLK levels, `display_fams2()`); a configuration
+found pinned is remembered and not searched again. Supported: FAMS2 disabled
+(`disable_display_fams2`: HW lock, the disabled FAMS2_CONFIG, release; only
+with FAMS 2.1 firmware), `update_live_display_bandwidth(bandwidth, false)`,
+every display moved to its P-state plan with raise-only and then exact
+watermarks (`update_live_display_plan`), `update_live_display_bandwidth(
+bandwidth, true)` allowing switching with UCLK/FCLK at DPMM's active and idle
+minimums, and FAMS2 disabled again; it returns the displays whose plans
+moved. Otherwise, or with `drr` (a display that should run DRR: the port
+plans DRR only pinned), `pin_display_uclk`: FAMS2 disabled, then UCLK and
+FCLK raised to their maxima and switching disallowed. Every configuration
+change (`modeset_*`, `modeset_beside`, `replan_displays`, `retrain_modeset`,
+`stop_modeset`, `unplug_modeset`, `start_frl`, `retire_inherited_display`,
+`abort_modeset_activation`, `modeset_mst_displays`, MST payload changes and
+`update_live_display_planes`) pins first; a P-state plan stays valid pinned.
+`deadline::bound` binds a pinned plan to the pinned UCLK floor with switching
+disallowed and a P-state plan to a floor of at least its UCLK level; `set_display_drr`
+refuses DRR while switching. `uclk_switching()` reports the policy.
+`dcn401_scanout_chain_runs_a_uclk_pstate_plan` moves a live display to its
+P-state plan and back on the harvested models; `dcn401-clk` and `dmub-navi48`
+test the bandwidth sequence, the watermark table and the FAMS2 commands.
+Hardware switching under a lit display is unvalidated.
 
 ### Discrete RDNA2 PSP secure-OS bootstrap
 
@@ -5963,7 +6023,19 @@ It requires `GET_FW_VERSION` GPINT acknowledgement within 100 ms and a version
 matching the prepared image metadata. It sends `QUERY_FEATURE_CAPS` through
 inbox1 and reports `Status { firmware_version, boot_status, inbox, outbox,
 capabilities: Option<FeatureCaps> }`. `FeatureCaps` retains the packed 14-byte
-Linux ABI without enabling any advertised feature. As in Linux's
+Linux ABI without enabling any advertised feature; `fams_version()` is
+`fw_assisted_mclk_switch_ver`, and `Dmub::fams2()` reports whether DC keeps
+FAMS2 on (version 0x41, FAMS 2.1; `None` before the query answered).
+`Dmub::hw_lock(lock)` is dcn401_dmub_hw_control_lock's inbox0 HW lock
+(HW_LOCK command code 1 with the lock or release bit; SCRATCH17 cleared,
+INBOX0_WPTR written, a 100-ms acknowledgement). `fams2_config_commands(enable,
+&Fams2Global, &[Fams2StreamConfig])` lays out
+dc_dmub_srv_rb_based_fams2_update_config's FAMS2_CONFIG list (type 76,
+sub-type 4: the global command, then every stream's base and sub-state,
+`multi_cmd_pending` on all but the last; disabled, the global command
+alone), checked against the DMUB headers by `tests/dcn401_fams2.c`;
+`Dmub::fams2_update_config` posts a single command and refuses a chain,
+which the shared mailbox does not post. As in Linux's
 `dc_dmub_srv_query_caps_cmd`, firmware must clear the request's `ret_status`
 bit to acknowledge this query; an unchanged bit leaves capabilities absent.
 This does not initialize a native mode.

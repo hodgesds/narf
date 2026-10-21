@@ -100,12 +100,14 @@ fn clocks() -> clocks::Applied {
             display_khz: 600_001,
             dpp_khz: 350_999,
             dtb_khz: 600_000,
+            deep_sleep_dcfclk_khz: 0,
         },
         display_khz: 601_000,
         dpp_khz: 351_000,
         dtb_khz: 600_000,
         dcf_floor_khz: 1_200_000,
         memory_floor_khz: 1_200_000,
+        uclk_pstate: false,
     }
 }
 fn request(pipe: u8) -> Request {

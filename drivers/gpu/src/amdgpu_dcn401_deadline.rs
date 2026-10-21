@@ -454,8 +454,10 @@ fn plane_bound(
 /// a plan is only valid for exactly this timing, sync, DP SST or TMDS signal,
 /// these planes (the primary's surface and placement, then each overlay's),
 /// DET and DCHUB reference, and for at least its clocks with the pinned
-/// UCLK/DCFCLK floors it assumed. The plan is also re-admitted, so a value
-/// built or edited outside admission is refused.
+/// DCFCLK floor it assumed. A pinned plan needs the pinned UCLK floor with
+/// switching disallowed; a UCLK P-state plan a floor of at least its UCLK
+/// level, switching or not. The plan is also re-admitted, so a value built
+/// or edited outside admission is refused.
 pub(super) fn bound(
     plan: &dml::Plan,
     timing: Request,
@@ -466,7 +468,7 @@ pub(super) fn bound(
     let t = plan.mode.timing;
     let surfaces = core::iter::once(a.surface).chain(a.overlays.iter().flatten().copied());
     let planes: alloc::vec::Vec<dml::Plane> = plan.mode.plane_list().collect();
-    plan.readmits()
+    readmits(plan)
         && timing.pipe == a.pipe
         && timing.timing == t
         && timing.sync == plan.sync
@@ -492,9 +494,47 @@ pub(super) fn bound(
         && clock.global.display_khz >= plan.clocks.dispclk_khz
         && clock.global.dpp_khz >= plan.clocks.dpprefclk_khz
         && clock.request.dpp_khz >= plan.clocks.dppclk_khz
-        && clock.global.memory_floor_khz == plan.soc.uclk_khz
+        && if plan.pstate.is_some() {
+            clock.global.memory_floor_khz >= plan.clocks.uclk_khz
+        } else {
+            clock.global.memory_floor_khz == plan.soc.uclk_khz && !clock.global.uclk_pstate
+        }
         && clock.global.dcf_floor_khz == plan.soc.dcfclk_khz[1]
         && dchub_refclk_khz == plan.soc.dchub_refclk_khz
+}
+/// The last UCLK P-state configuration re-admitted: its inputs and plans.
+type PstateAdmitted = (
+    dml::Soc,
+    dml::pstate::UclkLevels,
+    bool,
+    alloc::vec::Vec<dml::Mode>,
+    alloc::vec::Vec<dml::Plan>,
+);
+static PSTATE_ADMITTED: narf_lib::sync::IrqSafeSpinLock<Option<PstateAdmitted>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+/// [`dml::Plan::readmits`], remembering the last P-state configuration's
+/// search: every flip binds the running plan again, and the P-state search
+/// runs mode support once per candidate and level. The search is a pure
+/// function of its inputs, so its remembered result is the result.
+fn readmits(plan: &dml::Plan) -> bool {
+    let Some(p) = plan.pstate else {
+        return plan.readmits();
+    };
+    let modes = plan.joint_modes();
+    let stream = usize::from(plan.stream);
+    if let Some((soc, uclk, fams2, m, plans)) = PSTATE_ADMITTED.lock().as_ref() {
+        if *soc == plan.soc && *uclk == p.uclk && *fams2 == p.fams2 && *m == modes {
+            return plans.get(stream) == Some(plan);
+        }
+    }
+    match dml::pstate::admit(&plan.soc, &p.uclk, &modes, p.fams2) {
+        Ok(dml::pstate::Pstate::Supported(s)) => {
+            let ok = s.plans.get(stream) == Some(plan);
+            *PSTATE_ADMITTED.lock() = Some((plan.soc, p.uclk, p.fams2, modes, s.plans));
+            ok
+        }
+        _ => false,
+    }
 }
 impl Surfaces {
     fn bind_deadlines<I: Io>(

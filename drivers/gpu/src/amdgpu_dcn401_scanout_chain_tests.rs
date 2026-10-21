@@ -1536,3 +1536,101 @@ kernel_test_in!(
     "drivers/gpu/dcn401-scanout",
     dcn401_scanout_chain_runs_on_harvested_boards
 );
+
+/// UCLK P-state switching on a live display (dcn401_prepare/optimize
+/// bandwidth around DML21's answer): the running 640x480 display moves to
+/// its vactive P-state plan with raise-only and then exact watermarks
+/// while UCLK is still pinned, and keeps scanning out once PMFW may switch
+/// UCLK down to the plan's level. While switching, a pinned plan is refused
+/// without a write, and so is a UCLK floor below the plan's; re-pinned,
+/// both the P-state plan and the pinned plan run again.
+fn dcn401_scanout_chain_runs_a_uclk_pstate_plan() -> TestResult {
+    let (t, s, p) = ROUTES[2];
+    pstate_plan(chain(t, s, p), p)
+}
+#[inline(never)]
+fn pstate_plan(mut c: alloc::boxed::Box<Chain>, p: u8) -> TestResult {
+    use crate::amdgpu_dcn401_otg::WatermarkUpdate;
+    use dml::pstate::{admit, Method, Pstate, UclkLevels};
+    if run(c.start()).is_err() {
+        return TestResult::Fail("start");
+    }
+    let pinned = plan();
+    let uclk = UclkLevels::new(&[96_000, 456_000, 772_000, 1_250_000]).unwrap();
+    let Ok(Pstate::Supported(s)) =
+        run_boxed(|| async { admit(&soc(), &uclk, &[pinned.mode], false) })
+    else {
+        return TestResult::Fail("640x480 P-state support");
+    };
+    let pstate = s.plans[0];
+    if s.methods[0] != Method::Vactive
+        || pstate.clocks.uclk_khz != 96_000
+        || pstate.pstate.is_none()
+        || pstate.mode != pinned.mode
+    {
+        return TestResult::Fail("vactive plan");
+    }
+    let update = |c: &mut Chain, plan: &dml::Plan, wm| {
+        let clock = c.clock;
+        run(c
+            .surfaces
+            .update_live_plan(&mut c.e, p, plan, wm, CRYSTAL_KHZ, || Ok((clock, config()))))
+    };
+    let rebind = |c: &mut Chain, f: &dyn Fn(&mut dccg::Applied)| {
+        let mut clock = c.clock;
+        f(&mut clock);
+        c.e.status.rebind_timing(p, |a| a.clock = clock);
+        c.clock = clock;
+    };
+    // prepare_bandwidth: whatever the P-state plan needs is raised first.
+    rebind(&mut c, &|k| {
+        k.global.display_khz = k.global.display_khz.max(pstate.clocks.dispclk_khz);
+        k.global.dpp_khz = k.global.dpp_khz.max(pstate.clocks.dpprefclk_khz);
+        k.global.request.display_khz = k.global.display_khz;
+        k.global.request.dpp_khz = k.global.dpp_khz;
+        k.request.dpp_khz = k.request.dpp_khz.max(pstate.clocks.dppclk_khz);
+    });
+    if update(&mut c, &pstate, WatermarkUpdate::Raise).is_err()
+        || update(&mut c, &pstate, WatermarkUpdate::Exact).is_err()
+        || c.e.status.deadlines.map(|d| d.plan) != Some(pstate)
+        || run(c.check()).is_err()
+    {
+        return TestResult::Fail("P-state plan while pinned");
+    }
+    // optimize_bandwidth: UCLK switching allowed, floor at the plan's level.
+    rebind(&mut c, &|k| {
+        k.global.uclk_pstate = true;
+        k.global.memory_floor_khz = 96_000;
+    });
+    if run(c.check()).is_err() {
+        return TestResult::Fail("P-state plan while switching");
+    }
+    let writes = c.e.io.writes;
+    if update(&mut c, &pinned, WatermarkUpdate::Raise) != Err(Error::Invalid)
+        || c.e.io.writes != writes
+    {
+        return TestResult::Fail("pinned plan while switching");
+    }
+    rebind(&mut c, &|k| k.global.memory_floor_khz = 48_000);
+    if run(c.check()) != Err(Error::Invalid) {
+        return TestResult::Fail("UCLK floor below the plan");
+    }
+    // Re-pinned (prepare_bandwidth before an unsupported configuration).
+    rebind(&mut c, &|k| {
+        k.global.uclk_pstate = false;
+        k.global.memory_floor_khz = 1_250_000;
+    });
+    if run(c.check()).is_err()
+        || update(&mut c, &pinned, WatermarkUpdate::Raise).is_err()
+        || update(&mut c, &pinned, WatermarkUpdate::Exact).is_err()
+        || c.e.status.deadlines.map(|d| d.plan) != Some(pinned)
+        || run(c.check()).is_err()
+    {
+        return TestResult::Fail("pinned again");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_chain_runs_a_uclk_pstate_plan
+);

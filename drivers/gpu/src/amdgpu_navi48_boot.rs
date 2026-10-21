@@ -523,6 +523,30 @@ pub struct ColdBoot {
     /// The inventory's VRAM past the BAR, all of it for clients.
     unmapped_vram: Option<crate::amdgpu_vram::UnmappedPool>,
 }
+/// Rebind every clock record and every display's timing records from the
+/// global clocks `old` to `new`, which are now running.
+fn rebind_display_clocks(
+    otg: &mut otg::Otg,
+    dccg: &mut dccg::Dccg,
+    old: clocks::Applied,
+    new: clocks::Applied,
+) -> Result<(), otg::Error> {
+    dccg.rebind_global(old, new);
+    let records = dccg.status().pipes;
+    // Displays are pipe indices; a fused instance is no display.
+    for display in crate::amdgpu_rdna4::pipe_pool().pipes() {
+        let Some(status) = otg.display_status(display) else {
+            continue;
+        };
+        let Some(timing) = status.pipes[usize::from(display)] else {
+            continue;
+        };
+        if let Some(clock) = records[usize::from(timing.request.pipe)] {
+            otg.rebind_clock(display, clock)?;
+        }
+    }
+    Ok(())
+}
 /// What the driver keeps of `available` free CPU-visible VRAM for its own
 /// later owners (scanout surfaces, display and queue memory): half of a
 /// small BAR's worth, at most 512 MiB — so a resizable BAR that shows all
@@ -1487,15 +1511,71 @@ impl ColdBoot {
             .smu
             .as_mut()
             .ok_or(clocks::Error::Invalid)?;
-        if clocks.status().state == clocks::State::Prepared {
+        let starting = clocks.status().state == clocks::State::Prepared;
+        if starting {
             // SAFETY: retained matching SMU and drained owned engines. The
             // clock owner checks every display consumer before changing DPM.
             unsafe { clocks.start(smu).await }?;
         }
-        match clocks.status().state {
-            clocks::State::Ready | clocks::State::Applied => Ok(()),
-            _ => Err(clocks::Error::Busy),
+        if !matches!(
+            clocks.status().state,
+            clocks::State::Ready | clocks::State::Applied
+        ) {
+            return Err(clocks::Error::Busy);
         }
+        if starting {
+            self.install_display_power_policy().await?;
+        }
+        Ok(())
+    }
+    /// What Linux does once DC knows the clocks, and then at COMPLETE_INIT:
+    /// dcn401_init_hw's dcn401_notify_wm_ranges hands PMFW the watermark
+    /// range table (set A, and set 1A for the dummy P-state), and
+    /// smu_v14_0_2_set_power_profile_mode's smu_v14_0_deep_sleep_control
+    /// (true) lets PMFW enter every deep-sleep state the board supports.
+    /// The table stays excluded from reuse.
+    async fn install_display_power_policy(&mut self) -> Result<(), clocks::Error> {
+        let mut table = self
+            .sequence
+            .backend
+            .pool
+            .reserve(4096)
+            .map_err(|_| clocks::Error::Invalid)?;
+        let bytes = clocks::ClockManager::wm_range_table();
+        let virt = table.mapping().virt;
+        self.access_vram(|| {
+            for (k, b) in bytes.iter().enumerate() {
+                // SAFETY: a fresh, privately reserved, mapped 4 KiB range no
+                // engine reads before the notify below; HDP is flushed after.
+                unsafe { core::ptr::write_volatile((virt as *mut u8).add(k), *b) };
+            }
+            Ok(())
+        })
+        .map_err(|_| clocks::Error::DeviceGone)?;
+        // PMFW may read the table at any later time: never recycle it.
+        table.publish();
+        let address = table.address();
+        drop(table);
+        let regs = self.sequence.backend.gpu.regs;
+        let clocks = self.clocks.as_mut().map_err(|e| *e)?;
+        clocks.notify_wm_ranges(regs, address).await?;
+        let smu = self
+            .sequence
+            .backend
+            .smu
+            .as_mut()
+            .ok_or(clocks::Error::Invalid)?;
+        for group in [smu::DeepSleep::Graphics, smu::DeepSleep::MemoryFabric] {
+            // SAFETY: the kernel engines are drained (start_display_clocks'
+            // queue and SDMA checks) and, like Linux's, tolerate GFXCLK deep
+            // sleep; no display runs yet, every later plan's watermarks
+            // carry DML's self-refresh exit latencies and SetMinDeepSleepDcfclk
+            // floor, and the watermark ranges were installed above.
+            unsafe { smu.allow_deep_sleep(group) }
+                .await
+                .map_err(clocks::Error::Power)?;
+        }
+        Ok(())
     }
     pub fn display_pipe_clock_status(&self) -> Result<dccg::Status, dccg::Error> {
         self.dccg.as_ref().map(dccg::Dccg::status).map_err(|e| *e)
@@ -2078,6 +2158,8 @@ impl ColdBoot {
         plan: &crate::amdgpu_dcn401_dml::Plan,
         content: &mut dyn otg::PlaneContent,
     ) -> Result<alloc::boxed::Box<otg::PlanesUpdated>, otg::Error> {
+        // dcn401_prepare_bandwidth: pinned before any configuration change.
+        self.pin_display_uclk().await?;
         if self.display_retirement_busy() {
             return Err(otg::Error::Busy);
         }
@@ -2151,21 +2233,83 @@ impl ColdBoot {
             .update_live(regs, request, safe_to_lower, &held, &mut dto)
             .await
             .map_err(otg::Error::Clocks)?;
-        dccg.rebind_global(old, new);
-        let records = dccg.status().pipes;
-        // Displays are pipe indices; a fused instance is no display.
-        for display in crate::amdgpu_rdna4::pipe_pool().pipes() {
-            let Some(status) = otg.display_status(display) else {
-                continue;
-            };
-            let Some(timing) = status.pipes[usize::from(display)] else {
-                continue;
-            };
-            if let Some(clock) = records[usize::from(timing.request.pipe)] {
-                otg.rebind_clock(display, clock)?;
-            }
-        }
+        rebind_display_clocks(otg, dccg, old, new)?;
         Ok(new)
+    }
+    /// Whether PMFW may switch UCLK under the running displays now.
+    pub fn uclk_switching(&self) -> bool {
+        self.clocks
+            .as_ref()
+            .is_ok_and(|c| c.status().bandwidth.uclk_pstate)
+    }
+    /// dcn401_update_clocks' bandwidth part on the running configuration:
+    /// the UCLK/FCLK P-state policy and floors and the deep-sleep DCFCLK
+    /// moved to `bandwidth` (`safe_to_lower` false raises and disallows,
+    /// true lowers and allows), every display's clock records then rebound.
+    /// Failure leaves the clock owner failed.
+    pub async fn update_live_display_bandwidth(
+        &mut self,
+        bandwidth: clocks::Bandwidth,
+        safe_to_lower: bool,
+    ) -> Result<clocks::Applied, otg::Error> {
+        if self.display_retirement_busy() {
+            return Err(otg::Error::Busy);
+        }
+        let otg = self.otg.as_mut().map_err(|e| *e)?;
+        let held = otg.all_held();
+        let clocks = self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?;
+        let dccg = self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?;
+        let regs = self.sequence.backend.gpu.regs;
+        let old = clocks
+            .retained_pipe_clocks(regs)
+            .map_err(otg::Error::Clocks)?;
+        let new = clocks
+            .update_bandwidth(regs, bandwidth, safe_to_lower, &held)
+            .await
+            .map_err(otg::Error::Clocks)?;
+        rebind_display_clocks(otg, dccg, old, new)?;
+        Ok(new)
+    }
+    /// Whether DC keeps FAMS2 on for the running DMCUB firmware (FAMS 2.1).
+    pub fn display_fams2(&self) -> bool {
+        self.sequence.backend.dmub.fams2() == Some(true)
+    }
+    /// dcn401_prepare/optimize_bandwidth's FAMS2 step for a configuration
+    /// that needs no firmware method (fams2_required false): under the
+    /// driver's inbox0 HW lock, FAMS2_CONFIG with FAMS2 disabled. Only with
+    /// FAMS 2.1 firmware, as DC clears fams2_config.enable otherwise.
+    pub async fn disable_display_fams2(&mut self) -> Result<(), otg::Error> {
+        if !self.display_fams2() {
+            return Ok(());
+        }
+        let commands = dmub::fams2_config_commands(false, &dmub::Fams2Global::default(), &[]);
+        let dmub = &mut self.sequence.backend.dmub;
+        dmub.hw_lock(true).await.map_err(otg::Error::Firmware)?;
+        let sent = dmub.fams2_update_config(&commands).await;
+        // dcn401_fams2_global_control_lock(false) whatever the update did.
+        let released = dmub.hw_lock(false).await;
+        sent.map_err(otg::Error::Firmware)?;
+        released.map_err(otg::Error::Firmware)
+    }
+    /// dcn401_prepare_bandwidth before a configuration change: when PMFW
+    /// may switch UCLK, FAMS2 disabled and then UCLK and FCLK raised to
+    /// their highest levels and switching disallowed, so that every plan
+    /// (pinned or not) runs again. Nothing when already pinned.
+    pub async fn pin_display_uclk(&mut self) -> Result<(), otg::Error> {
+        if !self.uclk_switching() {
+            return Ok(());
+        }
+        self.disable_display_fams2().await?;
+        let levels = self
+            .clocks
+            .as_ref()
+            .map_err(|e| otg::Error::Clocks(*e))?
+            .status()
+            .levels
+            .ok_or(otg::Error::Busy)?;
+        self.update_live_display_bandwidth(clocks::Bandwidth::pinned(&levels), false)
+            .await?;
+        Ok(())
     }
     /// Program `request`'s pipe clock for the selected display while the
     /// others run (their consumers left to them).
@@ -2501,7 +2645,8 @@ impl ColdBoot {
                 .move_cursor(pipe, position)
         }
     }
-    /// Run (`Some`) or stop (`None`) DRR on a live pipe's timing.
+    /// Run (`Some`) or stop (`None`) DRR on a live pipe's timing; `Busy`
+    /// for DRR while PMFW may switch UCLK (pin it first).
     /// # Safety
     /// As for `set_display_cursor`.
     pub unsafe fn set_display_drr(
@@ -2509,7 +2654,8 @@ impl ColdBoot {
         pipe: u8,
         drr: Option<crate::amdgpu_freesync::Drr>,
     ) -> Result<Option<otg::DrrApplied>, otg::Error> {
-        if self.state() != State::MemoryReady {
+        // DRR runs only pinned: the port has no UCLK P-state plan for it.
+        if self.state() != State::MemoryReady || (drr.is_some() && self.uclk_switching()) {
             return Err(otg::Error::Busy);
         }
         // SAFETY: serialized retained owner; caller excludes writers.

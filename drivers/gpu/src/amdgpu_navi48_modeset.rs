@@ -980,6 +980,12 @@ impl ColdBoot {
     }
 }
 
+/// The last configuration DML21's search left pinned: its board inputs,
+/// UCLK levels, FAMS2 and modes. The search is a pure function of them.
+type PinnedSearch = (dml::Soc, dml::pstate::UclkLevels, bool, Vec<dml::Mode>);
+static PINNED_SEARCH: narf_lib::sync::IrqSafeSpinLock<Option<PinnedSearch>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
 /// A selected sink's whole scanned EDID (extensions included).
 fn edid_of(ports: &[display::Port], paths: &[inventory::Path], s: &Selection) -> Vec<u8> {
     ports
@@ -2793,6 +2799,7 @@ pub fn clock_request(plan: &dml::Plan) -> clocks::Request {
         display_khz: plan.clocks.dispclk_khz,
         dpp_khz: plan.clocks.dpprefclk_khz,
         dtb_khz: 1, // legacy DIO: lowest DTB level
+        deep_sleep_dcfclk_khz: plan.clocks.deep_sleep_dcfclk_khz,
     }
 }
 
@@ -2888,6 +2895,8 @@ impl ColdBoot {
     pub async unsafe fn retire_inherited_display(
         &mut self,
     ) -> Result<InheritedRetired, ModesetError> {
+        // dcn401_prepare_bandwidth: pinned before any configuration change.
+        self.pin_display_uclk().await?;
         let mut found = InheritedRetired {
             active_streams: 0,
             running_timing: 0,
@@ -2984,6 +2993,8 @@ impl ColdBoot {
         mut fill: impl FnMut(u32, &mut [u32]),
         want: Option<Timing>,
     ) -> Result<Modeset, ModesetError> {
+        // dcn401_prepare_bandwidth: pinned before any configuration change.
+        self.pin_display_uclk().await?;
         // A link verified below the sink's caps selects and admits again
         // (new DSC geometry included); each round lowers that link.
         for _ in 0..VERIFY_ROUNDS {
@@ -3054,6 +3065,8 @@ impl ColdBoot {
         want: impl Fn(usize) -> Option<Timing>,
         pipe_of: impl Fn(usize) -> Option<u8>,
     ) -> Result<Configuration, ModesetError> {
+        // dcn401_prepare_bandwidth: pinned before any configuration change.
+        self.pin_display_uclk().await?;
         // SAFETY: the caller's obligations.
         unsafe { self.modeset_routed(fill, want, pipe_of, &[]) }.await
     }
@@ -3077,6 +3090,8 @@ impl ColdBoot {
         pipe_of: impl Fn(usize) -> Option<u8>,
         mst: &[MstRoute<'_>],
     ) -> Result<Configuration, ModesetError> {
+        // dcn401_prepare_bandwidth: pinned before any configuration change.
+        self.pin_display_uclk().await?;
         // As `modeset_display_mode`: when the first display's link verifies
         // lower, nothing is lit yet and the configuration is chosen again.
         // A later display's reduction is returned in `failed`.
@@ -3235,6 +3250,7 @@ impl ColdBoot {
             display_khz: 1,
             dpp_khz: 1,
             dtb_khz: 1,
+            deep_sleep_dcfclk_khz: 0,
         };
         self.prepare_display_clocks(floor)
             .await
@@ -3907,6 +3923,8 @@ impl ColdBoot {
         rate: FrlRate,
         audio: crate::amdgpu_frl_cap::FrlAudio,
     ) -> Result<FrlRate, ModesetError> {
+        // dcn401_prepare_bandwidth: pinned before any configuration change.
+        self.pin_display_uclk().await?;
         use crate::amdgpu_frl_training::{poll_start, train_with_retries, FrlTraining};
         let mut code = rate.code();
         // SAFETY: the caller's obligations; each step checks its predecessor.
@@ -3973,6 +3991,8 @@ impl ColdBoot {
     /// # Safety
     /// As for `modeset_display`; stop every CPU writer of the surface first.
     pub async unsafe fn retrain_modeset(&mut self, m: &mut Modeset) -> Result<(), ModesetError> {
+        // dcn401_prepare_bandwidth: pinned before any configuration change.
+        self.pin_display_uclk().await?;
         self.teardowns.check_idle()?;
         // Display k runs on pipe k, in its own records.
         self.select_display(m.pipe)?;
@@ -4044,6 +4064,8 @@ impl ColdBoot {
     /// # Safety
     /// As for `stop_modeset`.
     pub async unsafe fn unplug_modeset(&mut self, m: &Modeset) -> Result<(), ModesetError> {
+        // dcn401_prepare_bandwidth: pinned before any configuration change.
+        self.pin_display_uclk().await?;
         // SAFETY: caller has withdrawn CPU writers and retains exclusive owners.
         unsafe { self.teardown_modeset(m, true) }.await?;
         self.modesets.stopped(m.pipe);
@@ -4056,6 +4078,8 @@ impl ColdBoot {
     /// # Safety
     /// As for `modeset_display`; stop every CPU writer of the surface first.
     pub async unsafe fn stop_modeset(&mut self, m: &Modeset) -> Result<(), ModesetError> {
+        // dcn401_prepare_bandwidth: pinned before any configuration change.
+        self.pin_display_uclk().await?;
         // SAFETY: caller has withdrawn CPU writers and retains exclusive owners.
         unsafe { self.teardown_modeset(m, false) }.await?;
         self.modesets.stopped(m.pipe);
@@ -4211,6 +4235,148 @@ impl ColdBoot {
             .await?;
         Ok(())
     }
+    /// DML21's UCLK P-state answer for the running configuration, when it
+    /// is one this port switches UCLK under: every display scanning out at
+    /// fixed refresh (`drr` false: none wanted), their plans one admitted
+    /// configuration on the current board inputs. `None` keeps it pinned.
+    fn running_pstate(
+        &mut self,
+        running: &[Modeset],
+        drr: bool,
+    ) -> Result<Option<dml::pstate::Supported>, ModesetError> {
+        let Some(first) = running.first() else {
+            return Ok(None);
+        };
+        for m in running {
+            match self.display_status(m.pipe) {
+                Ok(Some(st))
+                    if st.state == otg::State::ScanoutRunning(m.pipe) && st.drr.is_none() => {}
+                _ => return Ok(None),
+            }
+        }
+        let modes = first.plan.joint_modes();
+        let streams = running.iter().fold(0u8, |acc, m| acc | 1 << m.plan.stream);
+        if drr
+            || running.len() != modes.len()
+            || streams.count_ones() as usize != modes.len()
+            || running
+                .iter()
+                .any(|m| m.plan.soc != first.plan.soc || m.plan.joint_modes() != modes)
+            || self.display_soc()? != first.plan.soc
+        {
+            return Ok(None);
+        }
+        let levels = self
+            .clocks
+            .as_ref()
+            .map_err(|e| ModesetError::Clocks(*e))?
+            .status()
+            .levels
+            .ok_or(otg::Error::Busy)?;
+        let khz: Vec<u32> = levels
+            .range(clocks::Clock::Memory)
+            .mhz()
+            .iter()
+            .map(|&m| u32::from(m) * 1000)
+            .collect();
+        let Ok(uclk) = dml::pstate::UclkLevels::new(&khz) else {
+            return Ok(None);
+        };
+        let fams2 = self.display_fams2();
+        // Every monitor pass asks again: answer a configuration already
+        // running its P-state plans, or already found pinned, from memory.
+        let key = (first.plan.soc, uclk, fams2, modes);
+        if PINNED_SEARCH.lock().as_ref() == Some(&key) {
+            return Ok(None);
+        }
+        let (soc, uclk, fams2, modes) = &key;
+        match dml::pstate::admit(soc, uclk, modes, *fams2) {
+            Ok(dml::pstate::Pstate::Supported(s)) => Ok(Some(s)),
+            _ => {
+                *PINNED_SEARCH.lock() = Some(key);
+                Ok(None)
+            }
+        }
+    }
+    /// dcn401_prepare/optimize_bandwidth for the running configuration's
+    /// UCLK P-state support, with no stream or plane changing. Supported
+    /// (DML21's search on the running modes and the board's UCLK levels):
+    /// FAMS2 disabled, clocks raised only, every display moved to its
+    /// P-state plan with raise-only watermarks, then the exact watermarks
+    /// and UCLK switching allowed with UCLK and FCLK lowered to DPMM's
+    /// minimums, and FAMS2 disabled again (no firmware method is in use).
+    /// Not supported, or `drr` (a display that should run DRR): pinned.
+    /// Returns the displays whose plans moved, in pipe order.
+    /// # Safety
+    /// As for `transition_running`.
+    pub async unsafe fn converge_uclk_pstate(
+        &mut self,
+        drr: bool,
+    ) -> Result<Vec<Modeset>, ModesetError> {
+        let mut running: Vec<Modeset> = self.display_modesets().into_iter().flatten().collect();
+        if running.is_empty() || self.teardowns.check_idle().is_err() {
+            return Ok(Vec::new());
+        }
+        // Already switching under this configuration's P-state plans.
+        if !drr
+            && self.uclk_switching()
+            && running.iter().all(|m| {
+                m.plan.pstate.is_some()
+                    && self.display_status(m.pipe).is_ok_and(|s| {
+                        s.is_some_and(|s| {
+                            s.state == otg::State::ScanoutRunning(m.pipe) && s.drr.is_none()
+                        })
+                    })
+            })
+        {
+            return Ok(Vec::new());
+        }
+        let Some(s) = self.running_pstate(&running, drr)? else {
+            self.pin_display_uclk().await?;
+            return Ok(Vec::new());
+        };
+        let plans: Vec<dml::Plan> = running
+            .iter()
+            .map(|m| s.plans[usize::from(m.plan.stream)])
+            .collect();
+        let bandwidth = clocks::Bandwidth {
+            uclk_pstate: true,
+            fclk_pstate: s.fclk_pstate,
+            dramclk_khz: s.active.uclk_khz,
+            idle_dramclk_khz: s.idle.uclk_khz,
+            fclk_khz: s.active.fclk_khz,
+            idle_fclk_khz: s.idle.fclk_khz,
+            deep_sleep_dcfclk_khz: plans
+                .iter()
+                .map(|p| p.clocks.deep_sleep_dcfclk_khz)
+                .max()
+                .unwrap_or(0),
+        };
+        let current = self.display_clock_status().map_err(ModesetError::Clocks)?;
+        if current.bandwidth == bandwidth && running.iter().zip(&plans).all(|(m, p)| m.plan == *p) {
+            return Ok(Vec::new());
+        }
+        // prepare_bandwidth: FAMS2 off, clocks only raised, watermarks the
+        // larger of both plans'.
+        self.disable_display_fams2().await?;
+        self.update_live_display_bandwidth(bandwidth, false).await?;
+        for (m, plan) in running.iter().zip(&plans) {
+            // SAFETY: the caller's obligations; the scanout stays live.
+            unsafe { self.update_live_display_plan(m.pipe, plan, true) }.await?;
+        }
+        // optimize_bandwidth: exact watermarks, then the clocks lowered and
+        // UCLK switching allowed.
+        for (m, plan) in running.iter_mut().zip(&plans) {
+            // SAFETY: the caller's obligations; the scanout stays live.
+            let d = unsafe { self.update_live_display_plan(m.pipe, plan, false) }.await?;
+            m.plan = d.plan;
+            m.scanout.plan = d.plan;
+            self.modesets.retain(*m);
+        }
+        self.update_live_display_bandwidth(bandwidth, true).await?;
+        self.disable_display_fams2().await?;
+        Ok(running)
+    }
     /// Light every new lightable board sink and every new end device of
     /// the MST branches `mst` names beside the running displays, which stay
     /// lit, as dc_commit_streams adds streams without touching the others:
@@ -4241,6 +4407,8 @@ impl ColdBoot {
         pipe_of: impl Fn(usize) -> Option<u8>,
         mst: &[MstRoute<'_>],
     ) -> Result<Option<Configuration>, ModesetError> {
+        // dcn401_prepare_bandwidth: pinned before any configuration change.
+        self.pin_display_uclk().await?;
         self.teardowns.check_idle()?;
         let mut running: Vec<Modeset> = self.display_modesets().into_iter().flatten().collect();
         if running.is_empty() {
@@ -4533,6 +4701,8 @@ impl ColdBoot {
     /// # Safety
     /// As for `modeset_displays`, except that the running displays stay lit.
     pub async unsafe fn replan_displays(&mut self) -> Result<Vec<Modeset>, ModesetError> {
+        // dcn401_prepare_bandwidth: pinned before any configuration change.
+        self.pin_display_uclk().await?;
         self.teardowns.check_idle()?;
         let mut running: Vec<Modeset> = self.display_modesets().into_iter().flatten().collect();
         if running.is_empty() {
