@@ -318,6 +318,13 @@ leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,
 separate physical/CPU-visible VRAM accounting and SMUIO14 ROM access. Legacy
 APU/engine/display paths refuse this generation before touching hardware.
+The same paths now cover the whole RX 9000 family: any AMD display function
+whose discovery reports GC 12.0.1 (Navi48: 9070/9070 XT/9070 GRE, AI PRO
+R9700) or GC 12.0.0 (Navi44: 9060 XT/9060) binds by discovery, with Linux's
+per-die firmware (including kicker boards), external revision, RAS, DCC-width
+and pipe-harvesting differences (`amdgpu_rdna4`, checked against Linux by
+`drivers/gpu/tests/rdna4_family/check.sh`). Model-tested on Navi44 and
+harvested Navi48 profiles only; no Navi44 board has run it.
 
 Implemented: GDDR6 training; PSP14 SOS/GPCOM/TMR; mandatory graphics/media
 firmware parsing, upload and autoload; GC12 RS64 counter programming and pipe

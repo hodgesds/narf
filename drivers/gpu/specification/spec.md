@@ -319,6 +319,101 @@ interleave GB_ADDR_CONFIG, zero CUs/RBs, or GC dimensions beyond the GFX10
 DRM layout are refused; only device loss or revoked authority fails the
 cold-boot stage.
 
+### RDNA4 family: Navi48 and Navi44 (RX 9000)
+
+Every "Navi 48" section below applies to both RDNA4 dies. The `navi48`
+module, function and test-subsystem names predate Navi44 and are kept; what
+selects a die is `amdgpu_rdna4::Rdna4Chip`.
+
+**Identification.** Linux binds RDNA4 through `amdgpu_drv.c`'s generic AMD
+`PCI_CLASS_DISPLAY_VGA` / `_OTHER` entries (`CHIP_IP_DISCOVERY`) and decides
+everything from the discovery blob. NARF does the same: the class-match
+backstop reaches `probe` for any AMD display function; `AmdGpu::bring_up`
+reads discovery even for an unlisted device id, and binds it as
+`Family::Navi4` when exactly one GC0 is 12.0.0 or 12.0.1 (other unlisted ids
+still return `UnknownAsic`). `Rdna4Chip::of(gpu)` is the only RDNA4 gate:
+AMD vendor, `Family::Navi4`, a device id the PCI table does not give another
+family, and one GC0 of 12.0.1 (`Navi48`) or 12.0.0 (`Navi44`).
+`ChipInfo::asic` follows the discovered die (`"navi48"` / `"navi44"`), and
+`ChipInfo::revision` holds the PCI revision (config 0x08) read at probe.
+`amdgpu_rdna4::KNOWN_DEVICES` is the one RDNA4 PCI id list — 1002:7550
+(RX 9070 / 9070 XT / 9070 GRE), 1002:7551 (Radeon AI PRO R9700),
+1002:7590 (RX 9060 XT) — used only for exact bus matches, the probe log's
+`pci.ids` name and tests; the RX 9060 and OEM ids bind by discovery alone.
+`amdgpu::NAVI48` remains a named constant, not a gate. `is_navi48()` /
+`claim_navi48()` match any RDNA4 die. Register banks accept
+`amdgpu_rdna4::GC_VERSIONS` (12.0.0, 12.0.1: one `gc_12_0_0_offset.h`) and
+`MP_VERSIONS` (14.0.2, 14.0.3: one `psp_v14_0` / `smu_v14_0_2_ppt`).
+
+**Linux differences, and what NARF does with each.** Everything not listed is
+one shared code path in Linux (one `case` for both versions):
+`soc24_common` cg flags, `gfx_v12_0` (golden sequence, queue/MEC counts,
+`max_hw_contexts` 8, cleaner shader and per-queue reset firmware minimums,
+GFXOFF, clock gating), `imu_v12_0`, `mes_v12_0`, `gmc_v12_0` (GFXHUB 12.0,
+48-bit 4-level VM, UMC 8.14 RAS functions, `amdgpu_atomfirmware_get_umc_info`
+for VRAM type/width), `sdma_v7_0`, `ih_v7_0`, `vcn_v5_0_0`, `jpeg_v5_0_0`,
+`psp_v14_0` (SOS + TA, `sup_ifwi_up`, mode-1 reset in `soc24_asic_reset_method`,
+no FW attestation), `smu_v14_0_2_ppt` (one driver interface 0x2E, one
+`smu14_driver_if_v14_0.h` / `smu_v14_0_2_pptable.h`, PMFW-owned feature
+handling on suspend/unload), DC's `DCN_VERSION_4_01` resource with
+`res_cap_dcn4_01` (four pipes, DMUB `dcn_4_0_1_dmcub.bin`) and one DML2.1
+SoC bounding box (`dml2_socbb_dcn401` + `dml_dcn4_variant_a_soc_qos_params`,
+then overwritten from the SMU clock table, VBIOS `vram_info` channels and
+DCHUB reference — there is no per-SKU bounding box).
+
+| Linux site | GC 12.0.1 / MP 14.0.3 (Navi48) | GC 12.0.0 / MP 14.0.2 (Navi44) | NARF |
+| --- | --- | --- | --- |
+| `soc24_common_early_init` `external_rev_id` | `rev_id + 0x50` | `rev_id + 0x40` | `Rdna4Chip::external_rev`; DEV_INFO `chip_rev`/`external_rev` once the probe publishes the PCI revision |
+| `soc24_common_early_init` pg_flags | VCN, JPEG, VCN_DPG, **JPEG_DPG** | VCN, JPEG, VCN_DPG | `jpeg_dpg()` recorded; both start JPEG/VCN statically (no DPG) |
+| `kfd_device.c` gfx_target_version | 120001 (gfx1201) | 120000 (gfx1200) | `gfx_target_version()`; no KFD |
+| `gfx_v12_0`, `imu_v12_0`, `mes_v12_0` firmware | `gc_12_0_1_{pfp,me,mec,rlc,imu,mes,mes1,uni_mes,toc}` + RLC/IMU kicker | `gc_12_0_0_*`, no kicker | `GC_12_0_1_FW` / `GC_12_0_0_FW` (TOC is RLC-backdoor only, never loaded) |
+| `psp_v14_0`, `smu_v14_0` firmware | `psp_14_0_3_{sos,ta}`, `smu_14_0_3`, + kicker builds | `psp_14_0_2_{sos,ta}`, `smu_14_0_2` | `MP_14_0_3_FW` / `MP_14_0_2_FW`, chosen by the discovered MP revision |
+| `sdma_v7_0` firmware | `sdma_7_0_1` | `sdma_7_0_0` | chosen by discovered SDMA0 revision |
+| `amdgpu_is_kicker_fw` | 1002:7551 rev 0xC8 → `_kicker` SOS/TA/SMU/RLC/IMU | — | `is_kicker`; `FirmwareSet`, `Target::Psp14_0_3Kicker` |
+| `amdgpu_ras_asic_supported` | MP0 14.0.3 listed | not listed: `ras_hw_enabled = 0` | `amdgpu_navi48_ras::asic_supported`; Navi44 arms no RAS source |
+| `psp_update_fw_reservation` | SOS ≥ 0x3a0e14 | SOS ≥ 0x3b0e0d | not implemented on either die |
+| `smu_v14_0_2_enable_gfx_features` | `-EOPNOTSUPP` | `EnableAllSmuFeatures(FEATURE_PWR_GFX)` | mode-2-reset hook only; no NARF path uses it |
+| `smu_v14_0_2_get_gpu_metrics` energy accumulator | PMFW ≥ 0x685000 | never | not exported |
+| `dcn401_calc_num_avail_chans_for_mall` clamp | 16 channels | 8 channels | `mall_channel_limit`, `mall_bytes` (4 MiB/channel) |
+| `dcn401_resource_construct` `dcc_plane_width_limit` | none | 7680 | `dcc_capable` reads the bound die |
+| `dcn401_is_ppclk_idle_dpm_enabled` | PMFW ≥ 0x681800 | PMFW ≥ 0x661300 | recorded; UCLK/FCLK stay pinned |
+| `dcn401_is_df_throttle_opt_enabled` | never | PMFW ≥ 0x663500 | recorded; no SubVP |
+| `gmc_v12_0_sw_init` ECC IRQ client | `SOC_V1_0_IH_CLIENTID_DF` | `SOC21_IH_CLIENTID_DF` | both 0x17: no difference |
+
+DAL's `dal_asic_id.h` names its ranges the other way round
+(`GC_12_0_0_A0 = 0x50` is IP GC 12.0.1; `GC_12_0_1_A0 = 0x40` is GC 12.0.0);
+the table and `Rdna4Chip` are by IP version. `tests/rdna4_family/check.sh`
+regenerates `policy.txt` (every row above that has a value, plus the GC12
+golden sequences and the SMU driver interface) and `firmware.txt` (every
+RDNA4 `MODULE_FIRMWARE`) from the Linux tree, mapping DAL's macros back
+through soc24's offsets, and compiles `layout.c` against the GC12/DCN4.1
+register and SMU14 PMFW headers; the kernel test
+`rdna4_tables_match_linux_policy_and_firmware` holds the Rust tables to both
+files.
+
+**Board values from hardware, not Navi48 constants.** Shader engines,
+arrays and CUs come from discovery's GC table (maxima) and GC12's
+fused/user disable registers (`amdgpu_gfx12_topology`), so a 9070 GRE or
+9060 XT reports its own CU, RB and bitmap. VRAM size is `RCC_CONFIG_MEMSIZE`;
+type and bus width are VBIOS `umc_info`; DML's channel count is DALSMC
+`GetNumUmcChannels`; DPM clocks, PPT limits, thermal limits and fan range are
+the PMFW board table. The usable DCN pipe count is `CC_DC_PIPE_DIS`
+(`dcn_4_1_0_offset.h` 0xca, BASE_IDX 2): `unsafe
+amdgpu_rdna4::read_display_pipes` reads it once at cold boot and
+`publish_pipes` caps DML's TotalAvailablePipesSupport
+(`available_pipes()`). Linux compacts surviving pipes into indices; NARF
+addresses pipes by hardware instance, so it uses the unbroken run of working
+pipes from instance 0 (`usable_pipes`), refusing display if pipe 0 is fused.
+
+**Audio.** Navi44 boards expose the same `1002:ab40` HDMI/DP audio function
+(Linux `hda_intel.c` lists only `ab40` for RDNA4); runtime PM finds it as PCI
+function 1 of the GPU without a device-id check.
+
+**Not yet verified.** No Navi44, 9070 GRE or AI PRO R9700 board has run any
+of this; Navi44's discovery is assumed to match Navi48 apart from the versions
+above (one VCN5.0.0, DCN 4.0.1, MMHUB 4.1.0, OSSSYS 7.0.0, NBIF/NBIO, SMUIO
+14.0.2, HDP 6.x), and any other discovered version fails closed.
+
 ### Navi 48 PCIe probe (RX 9070 XT)
 
 The next discrete target is Navi48, selected from the September 2026
@@ -327,10 +422,11 @@ RX 9070 XT is the leading named AMD card at 1.42%. The larger generic
 "AMD Radeon Graphics" entry does not identify a chip. This selection is a
 dated snapshot, not a permanent popularity claim.
 
-`1002:7550` binds as `Family::Navi4`, `asic="navi48"`. This ID also covers
-RX 9070/GRE; neither SKU nor enabled CU count is inferred from it. Probe uses
+`1002:7550` binds as `Family::Navi4`, `asic="navi48"` (any RDNA4 board binds as
+above). This ID also covers RX 9070/GRE; neither SKU nor enabled CU count is
+inferred from it. Probe uses
 the existing bounded PCIe discovery reader and total/visible VRAM accounting.
-`DEV_INFO` requires exactly one GC0 12.0.1 discovery record and a GC topology
+`DEV_INFO` requires exactly one GC0 12.0.0 or 12.0.1 discovery record and a GC topology
 table, then reports `AMDGPU_FAMILY_GC_12_0_0` (152), eight hardware contexts,
 and GMC12's 48-bit VA geometry. Shader geometry describes discovered maxima;
 the active CU count, CU bitmap and enabled render-backend mask remain zero
@@ -361,7 +457,7 @@ and `channel_num << channel_width` (bytes 64, 65); 0 elsewhere. On Navi48,
 upper half moved), published at the topology stage; elsewhere EINVAL.
 
 `unsafe amdgpu_gfx12_topology::read` requires exclusive GRBM selector ownership
-and ready firmware/power. It validates GC12.0.1 banks and discovery dimensions,
+and ready firmware/power. It validates GC12.0.0/12.0.1 banks and discovery dimensions,
 combines fused and inherited software SA/WGP/RB disable masks, and restores
 the previous GRBM selector on success and failure within one capability
 invocation. It never changes harvesting masks. `Topology` reports active CUs,
@@ -370,7 +466,7 @@ shader arrays, enabled RBs and Linux's 4×4 CU bitmap packing (SE4–7 in column
 setup; it does not advertise queues or acceleration.
 
 When VFCT has no image, VBIOS acquisition supports the SMUIO14.0.2 ROM read
-ports (`0xe4/0xe5`, base index zero) only with matching GC12.0.1 and NBIO7.7.0
+ports (`0xe4/0xe5`, base index zero) only with matching GC12.0.0/12.0.1 and NBIO7.7.0
 or 7.7.1 discovery. The read preserves ROM_INDEX, checks PCI authority per
 chunk and validates the image's PCI identity and ATOM directory. Duplicate,
 unsupported or truncated banks are rejected before MMIO. Probe does not enable
@@ -386,9 +482,10 @@ GMC12/SDMA7 and DCN4 owners are still required for engine startup/modesetting.
 ### Navi 48 PSP14 secure-OS bootstrap
 
 `amdgpu_psp_boot::Firmware::open` and `unsafe Bootloader::new` also accept
-Navi48 with exactly one GC0 12.0.1 and MP0 14.0.2 or 14.0.3. Discovery selects
-`amdgpu/psp_14_0_2_sos.bin` or `amdgpu/psp_14_0_3_sos.bin`; no revision fallback
-or professional-SKU kicker firmware is used. `Firmware` and `Bootloader`
+RDNA4 with exactly one GC0 12.0.0 or 12.0.1 and MP0 14.0.2 or 14.0.3. Discovery
+selects `amdgpu/psp_14_0_2_sos.bin` or `amdgpu/psp_14_0_3_sos.bin`, and a kicker
+board (`amdgpu_rdna4::is_kicker`) MP0 14.0.3's `psp_14_0_3_sos_kicker.bin`;
+there is no revision fallback. `Firmware` and `Bootloader`
 retain that target, rejecting a cross-target load before MMIO or state changes.
 
 `amdgpu_psp_firmware::Image::parse_psp14` accepts the PSP14 v2.0 container:
@@ -413,7 +510,7 @@ enable graphics/display engines. Those remain separate bring-up stages.
 ### Navi 48 PSP ring and GDDR6 training
 
 `unsafe amdgpu_psp_ring::Psp::new_navi48` claims the physical GPU's PSP14
-GPCOM ring after SOS and VRAM training. It requires GC12.0.1, MP0 14.0.2/3,
+GPCOM ring after SOS and VRAM training. It requires GC12.0.0/12.0.1, MP0 14.0.2/3,
 NBIO7.7.0/7.7.1 or NBIF6.3.1 and HDP6.0.0/6.0.1/6.1.0/6.1.1/6.4.0.
 Every bank is unique and bounded before device access. GMC12's bank-zero
 `0x1614/0x1615/0x15a7` fields validate GPU addresses against the BAR0-backed
@@ -442,9 +539,10 @@ reservations, while automatic cold boot still requires a coordinated owner.
 
 `amdgpu_navi48_firmware::Firmware::open(gpu, registry, MesMode)` prepares the
 complete mandatory SMU14, SDMA7, GC12 PFP/ME/MEC, MES, IMU, RLC, VCN5 and DCN4
-set through live registry/blob invocations. MP1 14.0.2/3 and SDMA7.0.0/1 select
-revision-specific names. GC12.0.1, one VCN5.0.0 and DCN4.0.1 (including raw
-4.1.0 discovery encoding) are required. Separate and unified MES images are
+set through live registry/blob invocations. Names come from
+`amdgpu_rdna4::FirmwareSet`: GC12.0.0/12.0.1, MP1 14.0.2/3 and SDMA7.0.0/1 each
+select their own images, and a kicker board its RLC/IMU/SMU kicker builds. One
+VCN5.0.0 and DCN4.0.1 (including raw 4.1.0 discovery encoding) are required. Separate and unified MES images are
 explicit choices; missing or invalid files never fall back to another GPU.
 
 `amdgpu_navi48_ucode::Image::parse` validates each IP/header version, complete
@@ -3151,7 +3249,7 @@ ring, EOP and pointer ranges must be aligned, disjoint and within 48 bits;
 resources never delegate VMID0 to the scheduler. `tests/mes12_layout.c` checks
 these offsets against installed Linux headers.
 
-`unsafe amdgpu_mes12_hw::Mes::new` requires exact Navi48 GC12.0.1, MMHUB4.1,
+`unsafe amdgpu_mes12_hw::Mes::new` requires exact RDNA4 GC12.0.0/12.0.1, MMHUB4.1,
 OSSSYS7 and NBIO7.7/NBIF6.3.1 discovery, matching **unified** MES firmware,
 exclusive GRBM/queue ownership and a permanently mapped, uncached BAR2.
 It reserves 40 KiB of inventoried VRAM for two rings, native descriptors, EOPs,
@@ -3255,7 +3353,7 @@ diagnostic does not enable Mesa acceleration or prove draw/render state or
 application-context execution.
 
 The read-only `amdgpu_dcn_inventory` routing functions support Navi48 with
-GC12.0.1 and DCN4.0.1 (including raw discovery 4.1.0). ATOM display-object
+GC12.0.0/12.0.1 and DCN4.0.1 (including raw discovery 4.1.0). ATOM display-object
 tables v1.4/v1.5 supply independently resolved transmitter, AUX and HPD
 identities; v1.5's reserved USB-C word is not treated as an external encoder.
 DCN4 exposes four native AUX/transmitter/frontend instances and no DPIA route
@@ -3280,7 +3378,7 @@ substituted for another. Both DP and HDMI routes participate in ambiguity checks
 
 `unsafe amdgpu_ddc_navi48::Ddc::new(gpu, authority, crystal_khz)` prepares a
 retained owner of DCN4's shared native-I2C arbitrator/buffer and all four DDC
-pin pairs. Exact GC12.0.1 and DCN4.0.1/raw-4.1.0 banks are required; the
+pin pairs. Exact GC12.0.0/12.0.1 and DCN4.0.1/raw-4.1.0 banks are required; the
 crystal comes from ATOM DCE-info. Preparation performs no device writes.
 `edid(channel).await` refuses inherited SW/DMCU ownership, active hardware
 transactions and autonomous EDID polling before writing. It wakes I2C SRAM,
@@ -3309,7 +3407,7 @@ is refused while a scan/DDC transaction is incomplete or failed, including
 after cancellation, so AUX cannot reuse pins owned by a partial HDMI read.
 This discovery API does not train a link or program a scanout mode.
 
-`unsafe amdgpu_gmc_navi48::Gmc::new` validates GC12.0.1/MMHUB4.1/NBIO banks
+`unsafe amdgpu_gmc_navi48::Gmc::new` validates GC12.0.0/12.0.1/MMHUB4.1/NBIO banks
 and the pool's BAR0/GPU mapping. `initialize().await` requires retained
 firmware and trained VRAM with both hubs idle. It creates a flat VMID0 table
 mapping only two owned VRAM pages in a 2 MiB aperture above physical VRAM.
@@ -3419,7 +3517,7 @@ run on both architectures. Fatal draining disables/masks CPU delivery without
 recycling a possibly in-flight vector.
 
 `amdgpu_navi48_faults` describes VM and command fault diagnostics. The internal
-retained monitor validates exact GC12.0.1/MMHUB4.1 banks without writes during
+retained monitor validates exact GC12.0.0/12.0.1/MMHUB4.1 banks without writes during
 boot preparation. Service handoff retains all three owners before enabling
 sources. It requires active, nonretrying VMID0 in both hubs and the matching
 GMC owner in `ClientsReady`. `Gmc::fault_contexts` verifies the exact permanent
@@ -3667,7 +3765,7 @@ route. On the card, a working MSI route shows `irq` advancing with
 `watchdog_found` staying zero; these counters and the dispatch per-owner
 watchdog completions are the evidence the physical test must collect.
 
-`unsafe amdgpu_sdma_navi48::Sdma::new` selects SDMA7.0.0/1 on GC12.0.1,
+`unsafe amdgpu_sdma_navi48::Sdma::new` selects SDMA7.0.0/1 on GC12.0.0/12.0.1,
 with queue registers in GC bank zero and MCU control in bank one. Its owned
 VRAM ring/writeback allocation is validated against BAR0. `initialize(gmc)`
 requires the same GPU's ready GMC owner and rejects all eight inherited
@@ -4258,7 +4356,8 @@ drm_framebuffer.c, drm_fourcc.c), builds them with an RX 9070 XT stand-in
 and checks 2454 vectors (modifier/format lists, blobs, support, tiling
 flags, ADDFB2), replayed by `amd_modifiers_match_linux_vectors`.
 DCC capability is hubbub401_get_dcc_compression_cap as amdgpu_dm calls it
-(`dcc_capable`: every scanned format; GC 12.0.1 has no DCC width limit).
+(`dcc_capable`: every scanned format; GC 12.0.1 has no DCC width limit, GC
+12.0.0 refuses DCC above 7680 pixels, from the bound `amdgpu_rdna4` die).
 
 **Tiled, DCC and 4:2:0 surfaces.** `otg::SurfaceRequest::surface`
 (`PlaneSurface`: `Tiling` and a `YuvColor`) and `SurfaceFormat::{Nv12,
@@ -6969,7 +7068,7 @@ The opt-in `amdgpu.jpeg_proof` adds a retained JPEG5.0.0 static-power
 transport cycle while VCN holds the shared NBIO media doorbell range. Public
 `amdgpu_jpeg_navi48::{Jpeg,State,Proof,Error}` provides unsafe `new`, `start`,
 `prove` and `stop` with state/result snapshots. JPEG accepts exactly one
-VCN5 discovery instance, the matching NBIF6.3.1/GC12.0.1/MMHUB4.1 layout and a validated
+VCN5 discovery instance, the matching NBIF6.3.1/GC12.0.0/12.0.1/MMHUB4.1 layout and a validated
 GMC/VRAM pool. Its owned doorbell is `0x311`. It never programs or disables
 NBIO's shared range, and VCN refuses start/teardown under an enabled JPEG
 doorbell. The coordinator excludes shared-register and PM writers.
