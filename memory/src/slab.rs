@@ -1430,8 +1430,7 @@ pub fn drain_over_watermark() {
         return;
     }
     let mut still_over = false;
-    for c in 0..N_CLASSES {
-        let class = &CLASSES[c];
+    for (c, class) in CLASSES.iter().enumerate() {
         let bpf = blocks_per_frame(c);
         let high = SLAB_RETAIN_FRAMES_HIGH.saturating_mul(bpf);
         let low = SLAB_RETAIN_FRAMES_LOW.saturating_mul(bpf);
