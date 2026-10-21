@@ -107,6 +107,41 @@ impl<I: Io> Engine<I> {
         *sizes = next;
         Ok(())
     }
+    /// dcn401_program_det_segments: request `segments` of DET for pipe
+    /// `q`'s HUBP (DET{n} is HUBP instance n's). It takes effect when the
+    /// hardware acknowledges it (DET_SIZE_CURRENT), which this does not
+    /// wait for: Linux writes a freed pipe's 0 under the OTG lock, before
+    /// its MPCC leaves the tree.
+    pub(super) fn program_det_segments(&mut self, q: u8, segments: u8) -> Result<(), Error> {
+        let l = self.layout;
+        if q >= l.pool.count() || segments > SEGMENTS {
+            return Err(Error::Invalid);
+        }
+        self.update(l.crb(usize::from(l.inst(q)) + 1), 0x1f, u32::from(segments))
+    }
+    /// dcn401_program_compbuf_segments(safe_to_increase = true), as
+    /// optimize_bandwidth runs it: wait until every DET's DET_SIZE_CURRENT
+    /// equals its request (each wait bounded like
+    /// dcn401_wait_for_det_update), then grow the compressed buffer to the
+    /// rest of the CRB (DML's compbuf_size: CRB minus every DET). A
+    /// compbuf already that size or larger is left (only increases here).
+    /// Returns the allocation.
+    pub(super) async fn increase_compbuf(&mut self) -> Result<[u8; 5], Error> {
+        for index in 1..5 {
+            let at = self.layout.crb(index);
+            let want = self.read(at)? & 0x1f;
+            self.wait(at, 0x1f00, want << 8, 100_000).await?;
+        }
+        let mut sizes = self.crb_stable()?;
+        let dets: u32 = sizes[1..].iter().map(|&n| u32::from(n)).sum();
+        let target = u32::from(SEGMENTS)
+            .checked_sub(dets)
+            .ok_or(Error::Invalid)? as u8;
+        if target > sizes[0] {
+            self.resize_crb(&mut sizes, 0, target).await?;
+        }
+        Ok(sizes)
+    }
     pub(super) fn requestor_errors(&mut self, pipe: u8) -> Result<(), Error> {
         self.requestor_faults(pipe, 0)
     }

@@ -4622,8 +4622,10 @@ commit_planes_for_stream's order:
   requestor on the stream's VTG and the DPP clock; its default DET from the
   compressed buffer (shrunk first).
 - Under dcn401_interdependent_update_lock (the OTG master lock): the global
-  sync if the plan's differs; plane_atomic_disconnect of every freed pipe
-  (mpc1_remove_mpcc) with its cursor off; each changed or new plane's DPP
+  sync if the plan's differs; for every freed pipe its DET released
+  (`Engine::program_det_segments(q, 0)`, dcn401_program_det_segments, no
+  wait) and then its plane_atomic_disconnect (mpc1_remove_mpcc) with its
+  cursor off, as dcn401_program_front_end_for_ctx orders them; each changed or new plane's DPP
   (dpp401_dpp_setup and the DSCL with the coefficient RAM swap,
   `program_dpp_live`); on a full update every segment's MPCC tree from its
   top pipe down as dcn20_update_mpcc does (each MPCC removed, inserted at
@@ -4636,8 +4638,11 @@ commit_planes_for_stream's order:
 - Unlocked (dcn401_post_unlock_program_front_end): every plane's HUBP
   reports its surface in use, the OTG's double-buffered state latched, the
   new MPCCs connected and the freed ones idle; then dcn20_disable_plane on
-  each freed pipe (no outstanding request, blank, fetch and DPP clocks off;
-  its DET stays allocated until a configuration repartitions). The records
+  each freed pipe (no outstanding request, blank, fetch and DPP clocks
+  off), and with a pipe freed optimize_bandwidth's compbuf increase
+  (`Engine::increase_compbuf`, dcn401_program_compbuf_segments with
+  safe_to_increase: every DET_SIZE_CURRENT acknowledged, then COMPBUF to
+  the CRB's remaining segments; the requestor record carries it). The records
   then name the new planes (surfaces, apertures, DPP/MPC, requestor,
   deadlines, scanout, cursor, the timing's sync) and pass the scanout's
   re-binding checks; the surfaces the update superseded (with their back
@@ -4686,8 +4691,7 @@ Gaps: the commit's new framebuffer contents reach a plane's surface by the
 presenter's copy after the update latched (a new or reallocated surface
 shows cleared for that frame or two), not at the update's own VUPDATE; a
 change of the stream's ODM split (or another display's pipes) still
-relights; MST displays relight; DET of freed pipes is not returned to the
-compressed buffer until a relight repartitions; no DCC/compbuf or MALL/SubVP
+relights; MST displays relight; no DCC/compbuf or MALL/SubVP
 reprogramming beyond the default DET; the cursor matrix of a YCbCr plane is
 not programmed (its cursor colors pass unconverted). DRM cursor planes are
 described in "Navi 48 DRM cursor planes".

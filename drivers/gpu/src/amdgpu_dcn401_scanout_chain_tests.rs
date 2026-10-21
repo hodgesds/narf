@@ -209,6 +209,11 @@ impl Io for ScanIo {
         if at == optc_input(p) && value & OPTC_UNDERFLOW_CLEAR != 0 {
             value &= !(OPTC_UNDERFLOW | OPTC_UNDERFLOW_CLEAR);
         }
+        // The CRB's DET and COMPBUF requests are acknowledged at once
+        // (their CURRENT fields follow).
+        if (BASE + 0x4ba * 4..=BASE + 0x4be * 4).contains(&at) {
+            value = (value & !0x1f00) | (value & 0x1f) << 8;
+        }
         self.inner.write(at, value);
         if self.underflow_after == Some(self.writes) {
             let control = self.get(h(p, HUBP_CONTROL)) | HUBP_UNDERFLOW;

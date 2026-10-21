@@ -6,15 +6,18 @@
 //! get_scaling_info_update_type; full_update_required_weak for a plane
 //! count change), then commit_planes_for_stream's sequence for a medium or
 //! full update: dcn401_interdependent_update_lock (the OTG master lock),
-//! dcn401_program_front_end_for_ctx (plane_atomic_disconnect of the freed
-//! pipes, then every MPCC tree from its top pipe down: dcn20_enable_plane
+//! dcn401_program_front_end_for_ctx (each freed pipe's DET released by
+//! program_det_segments(0), then its plane_atomic_disconnect, then every
+//! MPCC tree from its top pipe down: dcn20_enable_plane
 //! for a new pipe, dcn20_update_dchubp_dpp with dcn20_update_mpcc's
 //! remove-and-insert at the bottom on a full update, the HUBP surface,
 //! viewport and DLG/TTU, the cursor), the unlock, and
 //! dcn401_post_unlock_program_front_end (the new surfaces in use, then
 //! dcn20_disable_plane on the freed pipes). The caller brackets it with
 //! prepare_bandwidth (clocks raised, watermarks raise-only) and
-//! optimize_bandwidth (exact watermarks, clocks lowered).
+//! optimize_bandwidth (exact watermarks, clocks lowered); the compressed
+//! buffer, this display's to size, grows into freed DETs at the end of the
+//! update as optimize_bandwidth's program_compbuf_segments does.
 use super::scanout::Pipe;
 use super::*;
 use crate::amdgpu_dcn401_dml as dml;
@@ -361,8 +364,9 @@ impl<I: Io> Engine<I> {
     /// lock, dcn401_program_front_end_for_ctx, the unlock and
     /// dcn401_post_unlock_program_front_end), the timing running throughout:
     /// under the OTG master lock the global sync if it changed, the freed
-    /// pipes' MPCCs out of their trees and their cursors off, each changed
-    /// or new plane's DPP, on a full update every tree rebuilt from its top
+    /// pipes' DETs released, their MPCCs out of their trees and their
+    /// cursors off, each changed or new plane's DPP, on a full update every
+    /// tree rebuilt from its top
     /// pipe down (each MPCC removed and inserted at the bottom, then its
     /// blending), on a medium one the changed planes' blending, each changed
     /// or new plane's HUBP surface, viewport and address, every plane's
@@ -387,9 +391,11 @@ impl<I: Io> Engine<I> {
                 list: t.into_iter().rev().collect(),
             })
             .collect();
-        // plane_atomic_disconnect of every freed pipe, by pipe index; its
-        // cursor goes with it.
+        // dcn401_program_front_end_for_ctx for every freed pipe, by pipe
+        // index: its DET released (program_det_segments(hubp->inst, 0)),
+        // then plane_atomic_disconnect; its cursor goes with it.
         for q in l.pool.pipes().filter(|&q| c.disabled & bit(q) != 0) {
+            self.program_det_segments(q, 0)?;
             for t in trees.iter_mut() {
                 self.mpc_remove(t, q)?;
             }
@@ -866,6 +872,13 @@ impl Surfaces {
             }
             for q in pipes.clone().filter(|&q| disabled & bit(q) != 0) {
                 e.verify_freed(q)?;
+            }
+            // optimize_bandwidth's compbuf increase into the freed DETs
+            // (dcn401_program_compbuf_segments with safe_to_increase, after
+            // every DET_SIZE_CURRENT acknowledged its request).
+            if disabled != 0 {
+                let crb = e.increase_compbuf().await?;
+                e.status.requestor = Some(requestor(applied[0], new_overlays, crb[0]));
             }
             // Every record of the timing carries the new sync.
             e.status.rebind_timing(pipe, |t| t.request.sync = plan.sync);

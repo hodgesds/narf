@@ -443,10 +443,40 @@ pub(super) fn dcn401_live_plane_update_adds_moves_and_removes_an_overlay_on(
         || c.e.io.get(MPC_BASE + (0x2f2 + u64::from(p) * 4) * 4) & 0xf != u32::from(p)
         || c.e.io.get(h(q, HUBP_CONTROL)) & 0x1007 != 3
         || !stream_untouched(&c)
-        || optimize(&mut c, &plan3).is_err()
-        || run(c.check()).is_err()
     {
         return TestResult::Fail("overlay removed");
+    }
+    // Its DET is released on this update (dcn401_program_front_end_for_ctx:
+    // program_det_segments(0) under the lock, before the disconnect), and
+    // the compressed buffer grows into it once the freed pipe is disabled
+    // (optimize_bandwidth's program_compbuf_segments).
+    let crb = |i: u64| BASE + (0x4ba + i) * 4;
+    let det_freed = written(&c, crb(u64::from(q) + 1), 0x1f, 0);
+    let compbuf = written(&c, crb(0), 0x1f, 16);
+    if det_freed.len() != 1
+        || !(lock..unlock).contains(&det_freed[0])
+        || disconnect.first().is_none_or(|&i| i < det_freed[0])
+        || compbuf.len() != 1
+        || gated.first().is_none_or(|&i| i > compbuf[0])
+        || c.e.io.get(crb(u64::from(q) + 1)) & 0x1f1f != 0
+        || c.e.io.get(crb(u64::from(p) + 1)) & 0x1f1f != 5 * 0x101
+        || c.e.io.get(crb(0)) & 0x1f1f != 16 * 0x101
+        || c.e.status.requestor.map(|r| r.compbuf_bytes) != Some(16 * 65536)
+    {
+        return TestResult::Fail("freed DET and compbuf");
+    }
+    if optimize(&mut c, &plan3).is_err() || run(c.check()).is_err() {
+        return TestResult::Fail("check after the removal");
+    }
+    // Added again: the DET comes back from the compressed buffer.
+    raise(&mut c, &plan);
+    if update(&mut c, &live(base, &[overlay]), &plan).is_err()
+        || c.e.io.get(crb(u64::from(q) + 1)) & 0x1f1f != 5 * 0x101
+        || c.e.io.get(crb(0)) & 0x1f1f != 11 * 0x101
+        || optimize(&mut c, &plan).is_err()
+        || run(c.check()).is_err()
+    {
+        return TestResult::Fail("overlay added again");
     }
     TestResult::Pass
 }
