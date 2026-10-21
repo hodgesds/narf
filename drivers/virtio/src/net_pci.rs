@@ -111,9 +111,16 @@ pub const VIRTIO_NET_PCI_DEVICE: u16 = 0x1041;
 // virtio-net feature bits (VirtIO 1.2 §5.1.3). We negotiate the
 // subset the kernel actually reads from device-cfg / drives via
 // the control queue.
-const VIRTIO_NET_F_CSUM: u64 = 0; // device handles packet checksums
+/// The device completes a partial transport checksum supplied by the driver.
+const VIRTIO_NET_F_CSUM: u64 = 0;
 const VIRTIO_NET_F_MTU: u64 = 3;
 const VIRTIO_NET_F_MAC: u64 = 5;
+/// The device can segment a driver-supplied IPv4/TCP GSO packet.
+///
+/// "HOST" is from the virtio specification's host/device viewpoint: this is
+/// the feature a guest driver negotiates before placing a TCPv4 GSO packet on
+/// its transmit queue.
+const VIRTIO_NET_F_HOST_TSO4: u64 = 11;
 const VIRTIO_NET_F_STATUS: u64 = 16;
 const VIRTIO_NET_F_CTRL_VQ: u64 = 17;
 /// VirtIO 1.2 §5.1.3.1 — VIRTIO_NET_F_CTRL_MAC_ADDR (bit 23).
@@ -189,9 +196,26 @@ pub struct VirtioNetHdr {
     pub num_buffers: u16,
 }
 
-/// Maximum frame we'll accept on RX. Standard MTU + Ethernet
-/// header + virtio-net header headroom.
-pub const MAX_FRAME: usize = 1518 + 16;
+const VIRTIO_NET_HDR_LEN: usize = core::mem::size_of::<VirtioNetHdr>();
+const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
+const VIRTIO_NET_HDR_GSO_NONE: u8 = 0;
+const VIRTIO_NET_HDR_GSO_TCPV4: u8 = 1;
+const ETH_HDR_LEN: usize = 14;
+const IPV4_MIN_HDR_LEN: usize = 20;
+const TCP_MIN_HDR_LEN: usize = 20;
+const TCP_CSUM_OFFSET: usize = 16;
+const IP_PROTO_TCP: u8 = 6;
+const TCP_ECE_OR_CWR: u8 = 0xc0;
+
+/// Maximum frame we'll accept on RX. Standard MTU + Ethernet header + the
+/// virtio-net header. RX GSO is deliberately not negotiated yet.
+pub const MAX_RX_FRAME: usize = 1518 + VIRTIO_NET_HDR_LEN;
+
+/// Largest complete Ethernet frame accepted by the bounded virtio TX GSO
+/// profile. It is deliberately the same 64 KiB order used by the TCP stack's
+/// existing e1000 profile, while still fitting one contiguous DMA buffer.
+const MAX_TX_TSO_FRAME: usize = 64 * 1024;
+const TX_BUF_LEN: usize = VIRTIO_NET_HDR_LEN + MAX_TX_TSO_FRAME;
 
 /// Per-pair RX/TX virtqueue + descriptor-id → buffer slot table.
 /// With VIRTIO_NET_F_MQ the device exposes N of these as virtqueues
@@ -236,11 +260,13 @@ struct QueuePair {
     tx_notify_off: u16,
 }
 
-/// Cap on each queue pair's recycled TX DMA-buffer free-list.
-/// Matches a standard full virtio TX ring, so a completion burst has enough
-/// recycler capacity to keep the queue supplied. Overflow drops (frees)
-/// rather than growing unbounded.
-const TX_POOL_CAP: usize = 256;
+/// Cap on each queue pair's recycled TX DMA-buffer free-list. A 64 KiB GSO
+/// buffer per entry bounds the per-pair reservation and maximum queued
+/// super-frame payload at 2 MiB. This retains 32 descriptors worth of 64 KiB
+/// frames without multiplying the original 4 KiB-pool footprint by sixteen
+/// on multi-queue VMs. Overflow drops (frees) rather than growing
+/// unbounded.
+const TX_POOL_CAP: usize = 32;
 
 /// Cap on each queue pair's recycled RX DMA-buffer free-list (the RX
 /// `skb`/frame pool).
@@ -312,6 +338,11 @@ pub struct VirtioNetPci {
     /// True when `VIRTIO_NET_F_STATUS` was negotiated. Without it
     /// the spec says treat link as always up.
     has_status: bool,
+    /// TX offloads actually negotiated with this device. The legacy interface
+    /// advertises exactly this profile to TCP after registration; no caller can
+    /// request a partial checksum or GSO packet the transport did not accept.
+    tx_checksum: bool,
+    tx_tso4: bool,
     /// Runtime control-queue index (VirtIO 1.2 §5.1.2): with F_MQ
     /// negotiated and pairs > 1 the controlq sits at
     /// `2 * num_pairs`; without F_MQ it sits at fixed index 2.
@@ -377,6 +408,227 @@ impl core::fmt::Debug for VirtioNetPci {
     }
 }
 
+/// The subset of the negotiated virtio-net feature word that changes the TX
+/// packet format. Kept separate from [`VirtioNetPci`] so the header encoder is
+/// directly testable without MMIO or DMA fixtures.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TxOffloadProfile {
+    pub checksum: bool,
+    pub tso4: bool,
+}
+
+impl TxOffloadProfile {
+    /// Virtio's TCPv4 GSO format always carries a partial checksum. Keep this
+    /// implication explicit even though probe constructs only valid profiles,
+    /// so a future feature-negotiation refactor cannot advertise TSO alone.
+    const fn tso4_enabled(self) -> bool {
+        self.checksum && self.tso4
+    }
+
+    const fn advertised(self) -> narf_net::OffloadCapabilities {
+        narf_net::OffloadCapabilities {
+            tx_checksum: self.checksum,
+            rx_checksum: false,
+            max_tso_bytes: if self.tso4_enabled() {
+                MAX_TX_TSO_FRAME as u32
+            } else {
+                0
+            },
+            vlan_insert: false,
+        }
+    }
+}
+
+/// Encode a native Rust representation of a virtio-net header into its packed
+/// wire representation. The multi-byte fields are pre-converted to little
+/// endian by [`tx_header_for_frame`]; `to_ne_bytes` therefore preserves the
+/// intended byte sequence on both supported architectures without relying on
+/// a packed-struct pointer cast.
+fn write_tx_header(dst: &mut [u8], hdr: VirtioNetHdr) {
+    debug_assert!(dst.len() >= VIRTIO_NET_HDR_LEN);
+    dst[0] = hdr.flags;
+    dst[1] = hdr.gso_type;
+    dst[2..4].copy_from_slice(&hdr.hdr_len.to_ne_bytes());
+    dst[4..6].copy_from_slice(&hdr.gso_size.to_ne_bytes());
+    dst[6..8].copy_from_slice(&hdr.csum_start.to_ne_bytes());
+    dst[8..10].copy_from_slice(&hdr.csum_offset.to_ne_bytes());
+    dst[10..12].copy_from_slice(&hdr.num_buffers.to_ne_bytes());
+}
+
+fn malformed_tx() -> VirtioPciError {
+    // The PCI transport has no packet-format error because this path used to
+    // accept only plain MTU-sized frames. QueueTooSmall is its established
+    // input-validation error and keeps the rejection local to this driver.
+    VirtioPciError::QueueTooSmall
+}
+
+/// Validate an ordinary Ethernet/IP TCP or UDP frame and return the start of
+/// its L4 header plus the checksum field offset within that header. Virtio's
+/// checksum fields are packet-relative, so accepting arbitrary offsets here
+/// would let a malformed `TxMeta` make the device write elsewhere in the DMA
+/// buffer.
+fn l4_checksum_layout(
+    frame: &[u8],
+    kind: narf_net::L4CsumKind,
+) -> Result<(usize, usize), VirtioPciError> {
+    if frame.len() < ETH_HDR_LEN + IPV4_MIN_HDR_LEN {
+        return Err(malformed_tx());
+    }
+    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    match ethertype {
+        0x0800 => {
+            let ip = ETH_HDR_LEN;
+            if frame[ip] >> 4 != 4 {
+                return Err(malformed_tx());
+            }
+            let ip_hlen = usize::from(frame[ip] & 0x0f) * 4;
+            if !(IPV4_MIN_HDR_LEN..=60).contains(&ip_hlen)
+                || frame.len() < ip + ip_hlen
+                || u16::from_be_bytes([frame[ip + 6], frame[ip + 7]]) & 0x3fff != 0
+            {
+                return Err(malformed_tx());
+            }
+            let ip_len = usize::from(u16::from_be_bytes([frame[ip + 2], frame[ip + 3]]));
+            if ip_len < ip_hlen || ip + ip_len != frame.len() {
+                return Err(malformed_tx());
+            }
+            let l4 = ip + ip_hlen;
+            match kind {
+                narf_net::L4CsumKind::Tcp
+                    if frame[ip + 9] == IP_PROTO_TCP
+                        && ip_len >= ip_hlen + TCP_MIN_HDR_LEN
+                        && usize::from(frame[l4 + 12] >> 4) * 4 >= TCP_MIN_HDR_LEN
+                        && l4 + usize::from(frame[l4 + 12] >> 4) * 4 <= frame.len() =>
+                {
+                    Ok((l4, TCP_CSUM_OFFSET))
+                }
+                narf_net::L4CsumKind::Udp
+                    if frame[ip + 9] == 17
+                        && ip_len >= ip_hlen + 8
+                        && usize::from(u16::from_be_bytes([frame[l4 + 4], frame[l4 + 5]]))
+                            == ip_len - ip_hlen =>
+                {
+                    Ok((l4, 6))
+                }
+                _ => Err(malformed_tx()),
+            }
+        }
+        0x86dd => {
+            const IPV6_HDR_LEN: usize = 40;
+            if frame.len() < ETH_HDR_LEN + IPV6_HDR_LEN || frame[ETH_HDR_LEN] >> 4 != 6 {
+                return Err(malformed_tx());
+            }
+            let payload_len = usize::from(u16::from_be_bytes([
+                frame[ETH_HDR_LEN + 4],
+                frame[ETH_HDR_LEN + 5],
+            ]));
+            if ETH_HDR_LEN + IPV6_HDR_LEN + payload_len != frame.len() {
+                return Err(malformed_tx());
+            }
+            let l4 = ETH_HDR_LEN + IPV6_HDR_LEN;
+            match kind {
+                narf_net::L4CsumKind::Tcp
+                    if frame[ETH_HDR_LEN + 6] == IP_PROTO_TCP
+                        && payload_len >= TCP_MIN_HDR_LEN
+                        && usize::from(frame[l4 + 12] >> 4) * 4 >= TCP_MIN_HDR_LEN
+                        && l4 + usize::from(frame[l4 + 12] >> 4) * 4 <= frame.len() =>
+                {
+                    Ok((l4, TCP_CSUM_OFFSET))
+                }
+                narf_net::L4CsumKind::Udp
+                    if frame[ETH_HDR_LEN + 6] == 17
+                        && payload_len >= 8
+                        && usize::from(u16::from_be_bytes([frame[l4 + 4], frame[l4 + 5]]))
+                            == payload_len =>
+                {
+                    Ok((l4, 6))
+                }
+                _ => Err(malformed_tx()),
+            }
+        }
+        _ => Err(malformed_tx()),
+    }
+}
+
+/// Prepare the virtio-net header for one transmit. This is deliberately
+/// feature-gated: a frame carrying partial checksum data or GSO metadata must
+/// never reach a device that did not negotiate the matching virtio feature.
+pub(crate) fn tx_header_for_frame(
+    frame: &mut [u8],
+    meta: narf_net::TxMeta,
+    profile: TxOffloadProfile,
+) -> Result<VirtioNetHdr, VirtioPciError> {
+    if frame.is_empty() || meta.vlan_tag.is_some() {
+        return Err(malformed_tx());
+    }
+
+    match (meta.tso_mss, meta.csum_l4) {
+        (Some(_), Some(narf_net::L4CsumKind::Tcp)) => {
+            if !profile.tso4_enabled() || frame.len() > MAX_TX_TSO_FRAME {
+                return Err(malformed_tx());
+            }
+            let (l4, csum_offset) = l4_checksum_layout(frame, narf_net::L4CsumKind::Tcp)?;
+            let ip = ETH_HDR_LEN;
+            // ECN GSO needs the separately negotiated HOST_ECN feature. NARF
+            // does not advertise ECN today, so reject instead of emitting an
+            // invalid TCPv4 GSO header if a future caller requests it.
+            if frame[l4 + 13] & TCP_ECE_OR_CWR != 0 {
+                return Err(malformed_tx());
+            }
+            let tcp_hlen = usize::from(frame[l4 + 12] >> 4) * 4;
+            let header_len = l4 + tcp_hlen;
+            let mss = meta.tso_mss.expect("matched Some TCP TSO metadata");
+            if mss == 0 || frame.len() <= header_len {
+                return Err(malformed_tx());
+            }
+            // For TCP GSO the partial checksum is the pseudo-header with a
+            // zero TCP length. The device fills each segment's length before
+            // completing the checksum, matching the 8254x TSO preparation.
+            let src = [
+                frame[ip + 12],
+                frame[ip + 13],
+                frame[ip + 14],
+                frame[ip + 15],
+            ];
+            let dst = [
+                frame[ip + 16],
+                frame[ip + 17],
+                frame[ip + 18],
+                frame[ip + 19],
+            ];
+            let seed = narf_net::pkt_tcp::ipv4_tcp_pseudo_seed(src, dst, 0);
+            frame[l4 + csum_offset..l4 + csum_offset + 2].copy_from_slice(&seed.to_be_bytes());
+            Ok(VirtioNetHdr {
+                flags: VIRTIO_NET_HDR_F_NEEDS_CSUM,
+                gso_type: VIRTIO_NET_HDR_GSO_TCPV4,
+                hdr_len: (header_len as u16).to_le(),
+                gso_size: mss.to_le(),
+                csum_start: (l4 as u16).to_le(),
+                csum_offset: (csum_offset as u16).to_le(),
+                num_buffers: 0,
+            })
+        }
+        (Some(_), _) => Err(malformed_tx()),
+        (None, Some(kind)) => {
+            if !profile.checksum || frame.len() > MAX_RX_FRAME - VIRTIO_NET_HDR_LEN {
+                return Err(malformed_tx());
+            }
+            let (l4, csum_offset) = l4_checksum_layout(frame, kind)?;
+            Ok(VirtioNetHdr {
+                flags: VIRTIO_NET_HDR_F_NEEDS_CSUM,
+                gso_type: VIRTIO_NET_HDR_GSO_NONE,
+                csum_start: (l4 as u16).to_le(),
+                csum_offset: (csum_offset as u16).to_le(),
+                ..VirtioNetHdr::default()
+            })
+        }
+        (None, None) if frame.len() <= MAX_RX_FRAME - VIRTIO_NET_HDR_LEN => {
+            Ok(VirtioNetHdr::default())
+        }
+        (None, None) => Err(malformed_tx()),
+    }
+}
+
 impl VirtioNetPci {
     /// Bring up the device with RX + TX virtqueues. RX is pre-
     /// populated with `RX_POOL_LEN` empty buffers.
@@ -425,18 +677,18 @@ impl VirtioNetPci {
         if feats & (1u64 << VIRTIO_F_VERSION_1) == 0 {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
-        // Opportunistic negotiation: take F_MAC / F_STATUS / F_MTU
-        // / F_CSUM when the device offers them. Each is a "device
-        // tells us something" feature — accepting it just unlocks
-        // the corresponding device-cfg field. We don't yet drive
-        // the offload paths F_CSUM enables (we only checksum on
-        // RX inspection), so guests built with strict feature
-        // checks still accept the negotiation. F_MQ stays off —
-        // we use the single-queue path.
+        // Opportunistic negotiation: take F_MAC / F_STATUS / F_MTU and the
+        // checksum/GSO profile when the device offers it. HOST_TSO4 depends
+        // on CSUM: a GSO packet must carry VIRTIO_NET_HDR_F_NEEDS_CSUM, and
+        // accepting either feature means the matching TX header is emitted
+        // below. Do not acknowledge an offload feature merely to inspect it;
+        // that would permit a partial packet to reach a device that was never
+        // told how to complete it.
         let want_mac = feats & (1u64 << VIRTIO_NET_F_MAC) != 0;
         let want_status = feats & (1u64 << VIRTIO_NET_F_STATUS) != 0;
         let want_mtu = feats & (1u64 << VIRTIO_NET_F_MTU) != 0;
         let want_csum = feats & (1u64 << VIRTIO_NET_F_CSUM) != 0;
+        let want_tso4 = want_csum && feats & (1u64 << VIRTIO_NET_F_HOST_TSO4) != 0;
         let want_ctrl_vq = feats & (1u64 << VIRTIO_NET_F_CTRL_VQ) != 0;
         // F_MQ requires F_CTRL_VQ (we can only command the device to
         // enable a pair count through the control queue). Reject MQ
@@ -454,6 +706,7 @@ impl VirtioNetPci {
         let drv_lo = ((1u32 << VIRTIO_NET_F_MAC) * (want_mac as u32))
             | ((1u32 << VIRTIO_NET_F_MTU) * (want_mtu as u32))
             | ((1u32 << VIRTIO_NET_F_CSUM) * (want_csum as u32))
+            | ((1u32 << VIRTIO_NET_F_HOST_TSO4) * (want_tso4 as u32))
             | ((1u32 << VIRTIO_NET_F_STATUS) * (want_status as u32))
             | ((1u32 << VIRTIO_NET_F_CTRL_VQ) * (want_ctrl_vq as u32))
             | ((1u32 << VIRTIO_NET_F_MQ) * (want_mq as u32))
@@ -631,7 +884,7 @@ impl VirtioNetPci {
                 let phys = buf.dma_addr().raw();
                 let descs = [VirtqDesc {
                     addr: phys,
-                    len: MAX_FRAME as u32,
+                    len: MAX_RX_FRAME as u32,
                     flags: VIRTQ_DESC_F_WRITE,
                     next: 0,
                 }];
@@ -656,7 +909,7 @@ impl VirtioNetPci {
             // One fixed-capacity recycler per hardware queue pair. Preparation
             // and allocation happen before the queues are exposed; RX/TX and
             // completion paths only pop/push their own queue-local pool.
-            let tx_pool = Arc::new(DmaPool::new(4096, DomainId::DRIVER_0, TX_POOL_CAP));
+            let tx_pool = Arc::new(DmaPool::new(TX_BUF_LEN, DomainId::DRIVER_0, TX_POOL_CAP));
             let rx_pool = DmaPool::new(4096, DomainId::DRIVER_0, RX_POOL_CAP);
 
             pairs.push(QueuePair {
@@ -743,6 +996,8 @@ impl VirtioNetPci {
             has_ctrl_mac_addr: want_ctrl_mac_addr,
             mtu,
             has_status: want_status,
+            tx_checksum: want_csum,
+            tx_tso4: want_tso4,
             ctrl_qidx,
             ctrl,
             cfg_phys,
@@ -897,6 +1152,13 @@ impl VirtioNetPci {
         self.pairs.len()
     }
 
+    fn tx_offload_profile(&self) -> TxOffloadProfile {
+        TxOffloadProfile {
+            checksum: self.tx_checksum,
+            tso4: self.tx_tso4,
+        }
+    }
+
     /// Round-robin TX-pair pick. `tx_dma` calls this to spread
     /// outbound frames across pairs without callers having to know
     /// the pair count. Wraps via modulo — safe on overflow because
@@ -935,30 +1197,7 @@ impl VirtioNetPci {
         flow_tx_pair(frame, npairs).unwrap_or_else(|| self.next_tx_pair())
     }
 
-    /// Transmit a frame backed by a caller-owned `DmaBuffer`,
-    /// fire-and-forget (Linux-style). Takes the buffer BY VALUE: the
-    /// device DMAs the frame body directly out of `buf`, so the
-    /// buffer must stay alive until the device has read it. We keep
-    /// it alive by parking it in the per-pair `tx_buffers` slot keyed
-    /// on its descriptor head; it's dropped lazily when a later
-    /// transmit observes its used-ring completion. This function
-    /// NEVER waits on the device — it submits, kicks the notify
-    /// register, and returns immediately.
-    ///
-    /// Buffer layout contract: the 12-byte virtio-net header lives at
-    /// offset 0 of `buf` (written here, all-zero), and the frame body
-    /// occupies `buf[12 .. 12 + frame_len]`. Callers must therefore
-    /// leave 12 bytes of headroom and place the frame at offset 12.
-    /// A SINGLE device-readable descriptor `[buf_phys, 12 + frame_len]`
-    /// is submitted — no shared per-pair header scratch, so any number
-    /// of transmits can be in flight concurrently without racing on a
-    /// shared header region.
-    ///
-    /// Picks a TX pair via the round-robin selector. With
-    /// VIRTIO_NET_F_MQ negotiated and >1 pairs active, parallel
-    /// callers fan out across the device's TX virtqueues; with a
-    /// single pair the round-robin degenerates to "always pair 0".
-    /// Take a prepared 4 KiB TX DMA buffer from one queue pair, or return
+    /// Take a prepared 64 KiB TX DMA buffer from one queue pair, or return
     /// `None` for backpressure. Pairs with `tx_buf_release_on`; never
     /// allocates in the packet path.
     fn tx_buf_acquire_on(&self, pair_idx: usize) -> Option<DmaBuffer> {
@@ -1001,17 +1240,23 @@ impl VirtioNetPci {
         self.rx_buf_release_on(0, buf);
     }
 
+    /// Transmit a plain frame backed by a caller-owned `DmaBuffer`,
+    /// fire-and-forget (Linux-style). The virtio-net header occupies
+    /// `buf[..VIRTIO_NET_HDR_LEN]`; the frame starts immediately after it.
+    /// The function takes the buffer by value and parks it in the selected
+    /// queue's in-flight table until completion, so it never waits for device
+    /// DMA and callers must not retain the buffer.
     pub fn tx_dma(&self, buf: DmaBuffer, frame_len: u32) -> Result<(), VirtioPciError> {
         // Flow-affine TX (hash the 4-tuple → sticky queue/forwarder/CPU, see
         // `tx_pair_for_frame`) ONLY when `flow_affine` (forwarders own
         // dedicated cores). Validated +19% over round-robin at Q=4 CONNS=64
         // with per-queue MSI-X. Otherwise round-robin: cheaper (no per-TX hash)
         // and better-balanced for shared-core / single-threaded servers —
-        // exactly pre-RSS behaviour, zero added cost. Frame body at
-        // buf[12..12+frame_len] (after the virtio header).
+        // exactly pre-RSS behaviour, zero added cost. Frame body begins just
+        // after the virtio header.
         let pair_idx = if self.flow_affine {
-            let end = (12 + frame_len as usize).min(buf.len());
-            let frame = buf.as_slice().get(12..end).unwrap_or(&[]);
+            let end = (VIRTIO_NET_HDR_LEN + frame_len as usize).min(buf.len());
+            let frame = buf.as_slice().get(VIRTIO_NET_HDR_LEN..end).unwrap_or(&[]);
             self.tx_pair_for_frame(frame)
         } else {
             self.next_tx_pair()
@@ -1029,25 +1274,44 @@ impl VirtioNetPci {
     pub fn tx_dma_on(
         &self,
         pair_idx: usize,
+        buf: DmaBuffer,
+        frame_len: u32,
+    ) -> Result<(), VirtioPciError> {
+        self.tx_dma_on_with_meta(pair_idx, buf, frame_len, narf_net::TxMeta::plain())
+    }
+
+    /// Submit one frame with the offload metadata supplied by the stack. The
+    /// legacy public `tx_dma_on` wrapper above remains plain-frame-only for
+    /// callers that do not participate in the frame-ring contract.
+    fn tx_dma_on_with_meta(
+        &self,
+        pair_idx: usize,
         mut buf: DmaBuffer,
         frame_len: u32,
+        meta: narf_net::TxMeta,
     ) -> Result<(), VirtioPciError> {
         let pair = self.pairs.get(pair_idx).ok_or(VirtioPciError::NoQueues)?;
         let frame_len = frame_len as usize;
-        if frame_len == 0 || frame_len > MAX_FRAME - 12 {
+        if frame_len == 0 || frame_len > MAX_TX_TSO_FRAME {
             return Err(VirtioPciError::QueueTooSmall);
         }
-        // Total device-readable region: 12-byte header + frame body.
-        let total_len = 12 + frame_len;
+        // Total device-readable region: virtio header + frame body.
+        let total_len = VIRTIO_NET_HDR_LEN + frame_len;
         if total_len > buf.len() {
             return Err(VirtioPciError::QueueTooSmall);
         }
-        // Prepend the 12-byte (all-zero) virtio-net header into the
-        // payload buffer itself. No shared scratch → no header race
-        // even with many in-flight transmits.
+        // Prepend a per-packet virtio-net header into the payload buffer
+        // itself. No shared scratch → no header race even with many in-flight
+        // transmits. `tx_header_for_frame` rejects unsupported metadata before
+        // publishing anything to the device.
         {
             let slice = buf.as_mut_slice();
-            slice[..12].fill(0);
+            let header = tx_header_for_frame(
+                &mut slice[VIRTIO_NET_HDR_LEN..total_len],
+                meta,
+                self.tx_offload_profile(),
+            )?;
+            write_tx_header(&mut slice[..VIRTIO_NET_HDR_LEN], header);
         }
         let buf_phys = buf.dma_addr().raw();
 
@@ -1135,9 +1399,17 @@ impl VirtioNetPci {
             // `0..tx_qsize`, exactly the range of `tx_buffers`. Publish before
             // another sender can reclaim the descriptor.
             bufs[head as usize] = Some(buf);
-            // EVENT_IDX suppression by default; latency-first policy forces the
-            // kick so a lone frame isn't stranded until the host next polls.
-            q.needs_kick() || TX_ALWAYS_KICK.load(Ordering::Relaxed)
+            // `TxMeta::more` is Linux's xmit_more hint: defer the expensive
+            // notify VM-exit until the ordered burst ends, but force it before
+            // the descriptor ring fills so a preempted producer cannot leave
+            // unpublished work behind its own backpressure. Once a flush is
+            // required, `needs_kick` remains the virtio EVENT_IDX authority.
+            let ring_full = q.diagnostic_snapshot().3 == 0;
+            if !meta.more || ring_full {
+                q.needs_kick() || (TX_ALWAYS_KICK.load(Ordering::Relaxed) && !meta.more)
+            } else {
+                false
+            }
         };
 
         if needs_kick {
@@ -1413,7 +1685,7 @@ impl VirtioNetPci {
             q.free_chain(head);
             let descs = [VirtqDesc {
                 addr: rep_phys,
-                len: MAX_FRAME as u32,
+                len: MAX_RX_FRAME as u32,
                 flags: VIRTQ_DESC_F_WRITE,
                 next: 0,
             }];
@@ -1609,13 +1881,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
     use narf_net::{Frame, RX_RING_N, TX_RING_N};
 
-    let (mac, mtu, link_up, rx_irq_vectors, num_pairs) = match with_at(idx, |c| {
+    let (mac, mtu, link_up, rx_irq_vectors, num_pairs, offloads) = match with_at(idx, |c| {
         (
             c.mac(),
             c.mtu(),
             c.link_up(),
             c.rx_irq_vectors.clone(),
             c.num_pairs(),
+            c.tx_offload_profile().advertised(),
         )
     }) {
         Some(t) => t,
@@ -1629,6 +1902,11 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
         let name = narf_net::iface::register_static("eth%d", mac, vnet0_send_fn);
         // `virtnet_get_drvinfo`: driver "virtio_net", VIRTNET_DRIVER_VERSION.
         narf_net::iface::set_driver_info(name, "virtio_net", Some("1.0.0"), bus_info);
+        // Advertise only the feature-gated profile negotiated during probe.
+        // TCP consults this snapshot before it creates partial checksums or a
+        // GSO super-frame, and `tx_header_for_frame` validates it again at the
+        // hardware boundary.
+        narf_net::iface::set_offloads(name, offloads);
         // The primary RX forwarder drains complete bursts and calls
         // `gro_flush` before it parks, so this interface can safely opt into
         // the stack's per-interface software GRO path.
@@ -1636,8 +1914,8 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
         *PRIMARY_IFNAME.lock() = Some(name);
         // Opt into zero-copy TX with one recycler per TX pair. `tx_acquire`
         // records its selected queue in the frame, and the reaper returns the
-        // buffer to that same pair. 12-byte head-room is for the virtio-net
-        // header `tx_dma_on` writes in front.
+        // buffer to that same pair. `VIRTIO_NET_HDR_LEN` bytes of head-room
+        // are for the virtio-net header `tx_dma_on` writes in front.
         if let Some((pools, flow_affine)) = with_at(idx, |c| {
             (
                 c.pairs
@@ -1651,7 +1929,7 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
                 name,
                 vnet0_send_frame_zc,
                 pools,
-                12,
+                VIRTIO_NET_HDR_LEN,
                 flow_affine,
             );
         }
@@ -1982,8 +2260,8 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
     // and selects one of the N TX virtqueues before it acquires that
     // queue's recycler buffer, so completion returns to the same pool.
     //
-    // tx_dma is fire-and-forget and requires the frame body at
-    // offset 12 (12-byte header headroom at offset 0), taking the
+    // tx_dma is fire-and-forget and requires the frame body after the
+    // virtio header headroom at offset 0, taking the
     // DmaBuffer BY VALUE. Channel-pushed Frames carry their payload
     // at an arbitrary `offset` (0 for Frame::new), so we relocate
     // into a prepared recycler buffer with the required header room.
@@ -1994,7 +2272,8 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
         while let Ok(frame) = tx_cons.recv().await {
             let payload = frame.payload();
             let plen = payload.len();
-            if plen == 0 || plen > MAX_FRAME - 12 {
+            let meta = frame.tx_meta();
+            if plen == 0 || plen > MAX_TX_TSO_FRAME {
                 continue; // bad frame; drop it
             }
             let (pair_idx, mut buf) = match with_at(idx, |c| {
@@ -2008,14 +2287,16 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
             };
             {
                 let slice = buf.as_mut_slice();
-                if slice.len() < 12 + plen {
+                if slice.len() < VIRTIO_NET_HDR_LEN + plen {
                     continue;
                 }
-                slice[12..12 + plen].copy_from_slice(payload);
+                slice[VIRTIO_NET_HDR_LEN..VIRTIO_NET_HDR_LEN + plen].copy_from_slice(payload);
             }
             // tx_dma takes ownership of `buf` and keeps it alive until
             // the device completes; never wait, never drop early.
-            let _ = with_at(idx, |c| c.tx_dma_on(pair_idx, buf, plen as u32));
+            let _ = with_at(idx, |c| {
+                c.tx_dma_on_with_meta(pair_idx, buf, plen as u32, meta)
+            });
             // `frame` (and its DmaBuffer) drops at end of scope.
         }
     });
@@ -2030,13 +2311,13 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
 
 /// `iface::SendFn` for the primary virtio-net controller. The TCP
 /// stack invokes this with a full Ethernet frame; we allocate a
-/// fresh DmaBuffer, leave 12 bytes of virtio-net-header headroom at
-/// the front, memcpy the frame in at offset 12, and submit through
+/// fresh DmaBuffer, leave virtio-net-header headroom at the front, memcpy the
+/// frame after it, and submit through
 /// the fire-and-forget tx_dma path. tx_dma takes the buffer BY VALUE
 /// and keeps it alive (in the per-pair in-flight table) until the
 /// device completes the transmit, so we must NOT drop it here.
-fn vnet0_send_fn(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
-    if frame.is_empty() || frame.len() > MAX_FRAME - 12 {
+fn vnet0_send_fn(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    if frame.is_empty() || frame.len() > MAX_TX_TSO_FRAME {
         return Err(());
     }
     // Take a prepared TX buffer. An empty pool is backpressure; the send fails
@@ -2049,15 +2330,15 @@ fn vnet0_send_fn(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     .ok_or(())?;
     {
         let slice = buf.as_mut_slice();
-        if slice.len() < 12 + frame.len() {
+        if slice.len() < VIRTIO_NET_HDR_LEN + frame.len() {
             return Err(());
         }
-        // Frame body at offset 12; tx_dma writes the 12-byte header.
-        slice[12..12 + frame.len()].copy_from_slice(frame);
+        // Frame body follows the virtio header, which tx_dma writes here.
+        slice[VIRTIO_NET_HDR_LEN..VIRTIO_NET_HDR_LEN + frame.len()].copy_from_slice(frame);
     }
     // Move `buf` into its selected queue — it owns the buffer until the device
     // finishes DMAing the frame out of it.
-    let res = with_controller(|c| c.tx_dma_on(pair_idx, buf, frame.len() as u32));
+    let res = with_controller(|c| c.tx_dma_on_with_meta(pair_idx, buf, frame.len() as u32, meta));
     match res {
         Some(Ok(())) => Ok(()),
         // `tx_dma` consumed `buf` (the closure moved it in). On the
@@ -2069,22 +2350,21 @@ fn vnet0_send_fn(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
 
 /// Zero-copy `iface::SendFrameFn` (P-F). The stack built the Ethernet frame
 /// directly into a buffer drawn from one selected queue's TX pool, at the
-/// 12-byte head-room `enable_zero_copy_tx_pools` requested — exactly the
-/// layout `tx_dma_on` expects (body at offset 12, header space in front). So
+/// virtio-header head-room `enable_zero_copy_tx_pools` requested — exactly
+/// the layout `tx_dma_on` expects (body after the header space). So
 /// hand the buffer straight to that queue with no copy; the TX reaper recycles
 /// it back into the same queue-local pool on completion. Replaces the
-/// slice-into-`buf[12..]` memcpy `vnet0_send_fn` does.
-fn vnet0_send_frame_zc(frame: narf_net::Frame, _meta: narf_net::TxMeta) -> Result<(), ()> {
+/// slice-into-`buf[VIRTIO_NET_HDR_LEN..]` memcpy `vnet0_send_fn` does.
+fn vnet0_send_frame_zc(frame: narf_net::Frame, meta: narf_net::TxMeta) -> Result<(), ()> {
     let len = frame.len() as usize;
-    if len == 0 || len > MAX_FRAME - 12 {
+    if len == 0 || len > MAX_TX_TSO_FRAME {
         return Err(());
     }
-    // `tx_acquire` built this via `Frame::with_offset_on_queue(buf, 12, len,
-    // queue)`, so the
-    // body is at `buf[12..12 + len]` and `buf[0..12]` is the header space.
+    // `tx_acquire` built this with `VIRTIO_NET_HDR_LEN` bytes of headroom, so
+    // the body follows the header space at the front of `buf`.
     // Discard the offset/len view and give `tx_dma` the whole buffer.
     let (buf, _off, _len, queue) = frame.into_parts_with_offset_and_queue();
-    match with_controller(|c| c.tx_dma_on(queue as usize, buf, len as u32)) {
+    match with_controller(|c| c.tx_dma_on_with_meta(queue as usize, buf, len as u32, meta)) {
         Some(Ok(())) => Ok(()),
         _ => Err(()),
     }

@@ -44,6 +44,13 @@ blk/net/console/rng.
   zero-copy TX frame records its selected pair before its buffer is acquired.
   No packet/completion path reaches the general allocator or an interface-wide
   recycler shared by independent queues.
+- The primary virtio-net interface advertises TX checksum offload only after
+  negotiating `VIRTIO_NET_F_CSUM`, and IPv4/TCP TSO only after additionally
+  negotiating `VIRTIO_NET_F_HOST_TSO4`. A requested offload that was not
+  negotiated, is malformed, needs VLAN insertion, or exceeds the bounded
+  64-KiB TX DMA frame is rejected before descriptor publication. The driver
+  honors the frame-ring `TxMeta::more` batching hint while forcing a notify at
+  a full TX ring or an explicit flush boundary.
 - The primary virtio-net interface opts into the kernel stack's
   per-interface software GRO stage. Every RX forwarder flushes the current
   CPU's held flows after its queue drains and before it parks; secondary

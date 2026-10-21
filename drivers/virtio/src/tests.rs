@@ -634,6 +634,116 @@ kernel_test_in!(
     smoke_virtio_net_fast_poll_quantum_is_bounded
 );
 
+/// Construct the ordinary Ethernet/IPv4/TCP layout emitted by the TCP stack.
+/// The offload-header tests keep this tiny fixture local so they exercise the
+/// driver encoder without needing PCI, DMA, or a live QEMU NIC.
+fn virtio_test_ipv4_tcp_frame(frame: &mut [u8]) {
+    const ETH: usize = 14;
+    const IP: usize = 20;
+    const TCP: usize = 20;
+    assert!(frame.len() >= ETH + IP + TCP);
+    let ip_len = (frame.len() - ETH) as u16;
+    frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+    frame[ETH] = 0x45;
+    frame[ETH + 2..ETH + 4].copy_from_slice(&ip_len.to_be_bytes());
+    frame[ETH + 8] = 64;
+    frame[ETH + 9] = 6;
+    frame[ETH + 12..ETH + 16].copy_from_slice(&[192, 0, 2, 10]);
+    frame[ETH + 16..ETH + 20].copy_from_slice(&[198, 51, 100, 20]);
+    let tcp = ETH + IP;
+    frame[tcp..tcp + 2].copy_from_slice(&1234u16.to_be_bytes());
+    frame[tcp + 2..tcp + 4].copy_from_slice(&443u16.to_be_bytes());
+    frame[tcp + 12] = (TCP as u8 / 4) << 4;
+    frame[tcp + 13] = 0x18; // PSH | ACK, deliberately not ECN.
+}
+
+fn smoke_virtio_net_tx_tso_header_is_feature_gated_and_well_formed() -> TestResult {
+    use crate::net_pci::{tx_header_for_frame, TxOffloadProfile};
+    use narf_net::TxMeta;
+
+    let mut frame = [0u8; 1514];
+    virtio_test_ipv4_tcp_frame(&mut frame);
+    let hdr = match tx_header_for_frame(
+        &mut frame,
+        TxMeta::with_tso(1200),
+        TxOffloadProfile {
+            checksum: true,
+            tso4: true,
+        },
+    ) {
+        Ok(hdr) => hdr,
+        Err(_) => return TestResult::Fail("virtio-net rejected negotiated TCPv4 TSO"),
+    };
+    if hdr.flags != 1
+        || hdr.gso_type != 1
+        || u16::from_le(hdr.hdr_len) != 54
+        || u16::from_le(hdr.gso_size) != 1200
+        || u16::from_le(hdr.csum_start) != 34
+        || u16::from_le(hdr.csum_offset) != 16
+    {
+        return TestResult::Fail("virtio-net TSO header has wrong offsets or GSO fields");
+    }
+    let expected_seed =
+        narf_net::pkt_tcp::ipv4_tcp_pseudo_seed([192, 0, 2, 10], [198, 51, 100, 20], 0);
+    if frame[50..52] != expected_seed.to_be_bytes() {
+        return TestResult::Fail("virtio-net TSO did not prepare zero-length pseudo-header seed");
+    }
+    if tx_header_for_frame(
+        &mut frame,
+        TxMeta::with_tso(1200),
+        TxOffloadProfile::default(),
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("virtio-net accepted TSO without negotiated feature");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/net-pci",
+    smoke_virtio_net_tx_tso_header_is_feature_gated_and_well_formed
+);
+
+fn smoke_virtio_net_tx_checksum_header_is_feature_gated() -> TestResult {
+    use crate::net_pci::{tx_header_for_frame, TxOffloadProfile};
+    use narf_net::{L4CsumKind, TxMeta};
+
+    let mut frame = [0u8; 74];
+    virtio_test_ipv4_tcp_frame(&mut frame);
+    let hdr = match tx_header_for_frame(
+        &mut frame,
+        TxMeta::with_csum(L4CsumKind::Tcp),
+        TxOffloadProfile {
+            checksum: true,
+            tso4: false,
+        },
+    ) {
+        Ok(hdr) => hdr,
+        Err(_) => return TestResult::Fail("virtio-net rejected negotiated TCP checksum offload"),
+    };
+    if hdr.flags != 1
+        || hdr.gso_type != 0
+        || u16::from_le(hdr.csum_start) != 34
+        || u16::from_le(hdr.csum_offset) != 16
+    {
+        return TestResult::Fail("virtio-net checksum header has wrong offsets");
+    }
+    if tx_header_for_frame(
+        &mut frame,
+        TxMeta::with_csum(L4CsumKind::Tcp),
+        TxOffloadProfile::default(),
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("virtio-net accepted checksum offload without negotiated feature");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/net-pci",
+    smoke_virtio_net_tx_checksum_header_is_feature_gated
+);
+
 fn smoke_virtio_net_pci_tx() -> TestResult {
     use crate::net_pci;
     use narf_bus::driver_match::__reset_for_test;

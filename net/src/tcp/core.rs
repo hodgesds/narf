@@ -375,6 +375,27 @@ fn offload_meta(dev: &iface::NetIfaceSnapshot, tso_mss: Option<u16>, more: bool)
     meta.with_more(more)
 }
 
+/// Resolve and cache the immutable egress selection before the sender chooses
+/// its first segment size. `pump_send` needs that ordering: choosing chunks
+/// while `Tcb::egress` is still `None` makes the first congestion window use
+/// MSS-sized software segments even when the selected NIC supports TSO.
+fn cached_egress_for_tcb(arc: &Arc<IrqSafeSpinLock<Tcb>>) -> Option<CachedEgress> {
+    if let Some(egress) = arc.lock().egress.clone() {
+        return Some(egress);
+    }
+    let snapshot = {
+        let t = arc.lock();
+        iface_for_tcb(&t)?
+    };
+    let resolved = CachedEgress {
+        name: Arc::from(snapshot.name.as_str()),
+        mac: snapshot.mac,
+        dev: snapshot,
+    };
+    let mut t = arc.lock();
+    Some(t.egress.get_or_insert(resolved).clone())
+}
+
 /// An egress frame the stack built, either as a plain `Vec` (classic copy TX)
 /// or directly in a DMA buffer from the iface's TX pool (zero-copy TX, P-F).
 /// `emit_tcb_frame` dispatches each to the matching driver hand-off.
@@ -2986,24 +3007,9 @@ fn send_data(
     // Egress (NIC src MAC + emit fn): use the per-connection memoized cache;
     // resolve `iface::for_dst` (global ROUTE_TABLE + IFACES locks) only on
     // the first segment, then reuse — keeping those locks off the hot path.
-    let egress = {
-        let cached = arc.lock().egress.clone();
-        match cached {
-            Some(e) => e,
-            None => {
-                let snap = match iface_for_tcb(&arc.lock()) {
-                    Some(i) => i,
-                    None => return,
-                };
-                let e = CachedEgress {
-                    name: Arc::from(snap.name.as_str()),
-                    mac: snap.mac,
-                    dev: snap.clone(),
-                };
-                arc.lock().egress = Some(e.clone());
-                e
-            }
-        }
+    let egress = match cached_egress_for_tcb(arc) {
+        Some(egress) => egress,
+        None => return,
     };
     let (ack, window, opt_bytes) = {
         let mut t = arc.lock();
@@ -3467,6 +3473,12 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         let t = arc.lock();
         (t.id, t.user_can_write())
     };
+    // Cache the selected interface before segment sizing below. Otherwise the
+    // first call to `send_data` resolves it only after this loop chose MSS
+    // chunks, delaying TSO until a later ACK-driven pump.
+    if cached_egress_for_tcb(arc).is_none() {
+        return;
+    }
     loop {
         let (chunks, seq, fin_flag, tso_arg, drained_all) = {
             let mut t = arc.lock();
