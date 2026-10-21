@@ -2460,8 +2460,10 @@ no stream left on it) drops its connectors and their routes. Shared-link loss st
 of invoking the SST retrain path. A downstream change that keeps every lit
 route is adopted live (`reprobe_live`, above) and republishes the
 connectors; a newly appeared end device lights beside the running streams
-and a departed one retires only its own stream; an MST stream a DSC
-fairness change touches is modeset alone. A changed primary branch or
+and a departed one retires only its own stream. A branch plugged into a
+board port with no display starts there and its devices light beside the
+running displays (see "Navi 48 seamless shared-clock changes"); an MST
+stream a DSC fairness change touches is modeset alone. A changed primary branch or
 lost hop capacity uses the whole-link stop/reprobe/relight sequence, so
 other streams briefly blank. KMS can publish
 a newly discovered EDID and independently admitted timings as connected with
@@ -4578,6 +4580,16 @@ running streams the new end devices change are torn down and lit again,
 with them, beside the displays left running; after an MST stream left, the
 streams its departure changes are torn down and lit again beside the
 others. Only a search that fits nothing relights everything.
+
+A board HPD rising on a port with no display lit (`hpd_rise`) lights only
+the new connector: an SST sink, or a branch whose session starts there
+(`start_display_mst` after DPCD MSTM_CAP, its end devices' connectors added
+and the root's emptied, as a lighting starts it) and whose devices then
+light beside the running displays, the new port's link trained on its own.
+A rising HPD on a port whose display runs (its sink replaced without HPD
+seen low) still relights. The board sinks are probed beside the running
+displays even when the plugged port's CRTC is off (`light_beside`'s
+`reprobe`), refreshing its connector.
 
 Gaps: mode or color changes of a running display and FRL retraining still
 relight (plane changes no longer do: see below); a lost hop capacity or a

@@ -5402,6 +5402,10 @@ pub async unsafe fn monitor_displays(
     let mut relight = false;
     // Displays whose planes or plane format DRM changed.
     let mut plane_updates = 0u8;
+    // Board ports whose sink appeared with no display lit on them: as
+    // Linux's hotplug handling lights only the new connector, they are
+    // probed (a new MST branch started) and lit beside the running displays.
+    let mut plugged: Vec<usize> = Vec::new();
     for port in board_ports(boot) {
         if mst_ports.contains(&port) {
             continue;
@@ -5411,7 +5415,33 @@ pub async unsafe fn monitor_displays(
             // A disabled port still needs a new EDID/admission snapshot
             // when HPD rises. Physical removal needs no AUX transaction.
             if let Some(x) = outputs.connector_mut(Target::Board(port)) {
-                relight |= x.observe_sst_hpd(present);
+                if x.observe_sst_hpd(present) {
+                    let lit_here = displays
+                        .lit
+                        .iter()
+                        .flatten()
+                        .any(|m| m.selection.port == port);
+                    match hpd_rise(lit_here) {
+                        HpdRise::Relight => relight = true,
+                        HpdRise::Beside => plugged.push(port),
+                    }
+                }
+            }
+        }
+    }
+    for &port in &plugged {
+        // A branch on a port with no stream: its end devices' connectors
+        // appear now (dm_helpers_dp_mst_start_top_mgr), the root's own
+        // connector carrying no sink, as a lighting would start it.
+        // SAFETY: as above; no stream runs on the port.
+        if unsafe { start_plugged_mst(boot, port) }.await? {
+            let mut ports = OUTPUTS.lock().mst_ports();
+            ports.push(port);
+            ports.sort_unstable();
+            set_connector_shape(boot, &ports);
+            reconcile_mst_outputs(boot, port);
+            if let Some(root) = OUTPUTS.lock().connector_mut(Target::Board(port)) {
+                root.reconcile_sst(None);
             }
         }
     }
@@ -5614,8 +5644,12 @@ pub async unsafe fn monitor_displays(
         .enumerate()
         .filter(|(_, m)| m.is_some())
         .fold(0u8, |acc, (k, _)| acc | 1 << k);
+    // A sink plugged into a port with no display: probed beside the
+    // running displays even when its CRTC is off (its connector's EDID and
+    // modes), never a relight of the others.
+    let reprobe = !plugged.is_empty() && !relight;
     let (mut relit, mut lit_beside) = (false, false);
-    if needs_relight(relight, wanted, lit_mask, &mut displays.considered) {
+    if needs_relight(relight, wanted, lit_mask, &mut displays.considered) || reprobe {
         relit = true;
         // Only new sinks (nothing a running display asked for changed):
         // light them beside the running displays, which stay lit through
@@ -5623,7 +5657,7 @@ pub async unsafe fn monitor_displays(
         let beside = if !relight && lit_mask != 0 {
             let fill = |_: u8, _: u32, row: &mut [u32]| row.fill(0);
             // SAFETY: as above; the running displays stay lit and published.
-            let mut beside = unsafe { light_beside(boot, &displays.lit, fill) }.await?;
+            let mut beside = unsafe { light_beside(boot, &displays.lit, fill, reprobe) }.await?;
             // Refused: when the new streams' DSC fairness search changes
             // running MST streams, Linux modesets just those (torn down
             // here) and lights them with the new streams beside the rest.
@@ -5637,7 +5671,7 @@ pub async unsafe fn monitor_displays(
                 unsafe { modeset_affected(boot, displays, affected, &mut steps) }.await?;
                 if displays.lit.iter().any(Option::is_some) {
                     // SAFETY: as above.
-                    beside = unsafe { light_beside(boot, &displays.lit, fill) }.await?;
+                    beside = unsafe { light_beside(boot, &displays.lit, fill, reprobe) }.await?;
                 }
             }
             beside
@@ -7133,6 +7167,26 @@ mod tests {
         navi48_plane_formats_request_and_admit
     );
 
+    /// A rising board HPD lights only the new connector beside the running
+    /// displays when no display runs on that port (an SST sink, or a branch
+    /// whose devices then appear), and relights only when one does (its
+    /// sink was replaced without HPD being seen low). Lighting beside them
+    /// does not wait for a CRTC to want the port: a probe refreshes its
+    /// connector, and nothing that runs is considered again.
+    fn navi48_board_hotplug_lights_beside() -> TestResult {
+        if hpd_rise(false) != HpdRise::Beside || hpd_rise(true) != HpdRise::Relight {
+            return TestResult::Fail("HPD rise");
+        }
+        // Two displays lit (0, 1), a new sink routed to CRTC 2: a lighting
+        // beside them, not a relight.
+        let mut considered = 0b0011;
+        if !needs_relight(false, 0b0111, 0b0011, &mut considered) || considered != 0b0011 {
+            return TestResult::Fail("new sink");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/navi48-kms", navi48_board_hotplug_lights_beside);
+
     /// The commit's frame fills the fresh surfaces of a seamless plane
     /// update (`CommitFrames`): the full-frame primary row by row from its
     /// framebuffer, an overlay's source rectangle from its origin, each
@@ -7560,6 +7614,46 @@ mod tests {
     );
 }
 
+/// What a rising board HPD needs: a port with a display lit on it relights
+/// (its sink was replaced unseen); a port with none is probed and lit
+/// beside the running displays, as Linux lights only the new connector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HpdRise {
+    Relight,
+    Beside,
+}
+fn hpd_rise(lit_here: bool) -> HpdRise {
+    if lit_here {
+        HpdRise::Relight
+    } else {
+        HpdRise::Beside
+    }
+}
+
+/// Start the MST branch on board `port` when its sink is one (DPCD 1.2
+/// and MSTM_CAP), as a lighting does before it selects the port's
+/// streams. Whether it did.
+/// # Safety
+/// As for `monitor_displays`, with OWNER held.
+async unsafe fn start_plugged_mst(
+    boot: &mut boot::ColdBoot,
+    port: usize,
+) -> Result<bool, ModesetError> {
+    let dp = boot
+        .display_paths()
+        .ok()
+        .and_then(|p| p.get(port))
+        .is_some_and(|p| p.connector == crate::amdgpu_dcn_inventory::Connector::DisplayPort);
+    if !dp
+        || boot.display_hpd(port) != Ok(true)
+        || !(boot.display_mst(port).is_some() || boot.display_mst_capable(port).await)
+    {
+        return Ok(false);
+    }
+    boot.start_display_mst(port).await?;
+    Ok(true)
+}
+
 /// Tear down the running displays `affected` (by pipe) for the modeset an
 /// MST link's DSC fairness search makes of their streams; their CRTCs stay
 /// on, so the next lighting beside the others lights them again with the
@@ -7618,8 +7712,10 @@ fn beside_affected(boot: &boot::ColdBoot, lit_mask: u8) -> Option<u8> {
 /// after, the running displays moved to their new plans in place). `None`
 /// when it is refused before any change (an MST configuration, the running
 /// displays no longer fitting as they are), for the caller to relight
-/// instead. Publishes the new displays as `light_displays` does and the
-/// running ones' new admission.
+/// instead. With `reprobe` the board sinks are probed again even when no
+/// CRTC waits to light (a sink plugged into a port whose CRTC is off).
+/// Publishes the new displays as `light_displays` does and the running
+/// ones' new admission.
 /// # Safety
 /// As for `light_displays`, except that the running displays stay lit and
 /// published.
@@ -7627,6 +7723,7 @@ async unsafe fn light_beside(
     boot: &mut boot::ColdBoot,
     lit: &[Option<Modeset>; 4],
     fill: impl FnMut(u8, u32, &mut [u32]),
+    reprobe: bool,
 ) -> Result<Option<crate::amdgpu_navi48_boot::Configuration>, ModesetError> {
     let lit_mask = lit.iter().flatten().fold(0u8, |acc, m| acc | 1 << m.pipe);
     let (routes, wants, mst) = {
@@ -7649,7 +7746,7 @@ async unsafe fn light_beside(
         outputs.stage_requested_bpc(|k| routes[k].is_some());
         (routes, wants, outputs.mst_ports())
     };
-    if routes.iter().all(Option::is_none) {
+    if routes.iter().all(Option::is_none) && !reprobe {
         return Ok(None);
     }
     let crtc_of = |t: Target| routes.iter().position(|r| *r == Some(t));
