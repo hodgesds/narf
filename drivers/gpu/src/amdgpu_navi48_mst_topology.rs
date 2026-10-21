@@ -549,6 +549,7 @@ mod tests {
             slots: 10,
             pbn: 100,
             stream: 1,
+            allocation: PayloadAllocation::Remote,
         });
         hub.child_present = false;
         link.manager.events.push(notice([0x11; 16], 2));
@@ -624,6 +625,7 @@ mod tests {
             slots: 20,
             pbn: 900,
             stream: 1,
+            allocation: PayloadAllocation::Remote,
         });
         // Root output 2 carries the child stream. An old/duplicated notice is
         // only a hint; query its current free capacity and add our 900 back.
@@ -829,6 +831,7 @@ mod tests {
             slots: 20,
             pbn: 900,
             stream: 0,
+            allocation: PayloadAllocation::Remote,
         });
         link.payloads.push(MstPayload {
             sink: child_sink,
@@ -837,6 +840,7 @@ mod tests {
             slots: 20,
             pbn: 900,
             stream: 1,
+            allocation: PayloadAllocation::Remote,
         });
         let payloads = link.payloads.clone();
         let ids = link.outputs.each_ref().map(|o| o.as_ref().map(|o| o.id));

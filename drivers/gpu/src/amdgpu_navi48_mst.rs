@@ -74,6 +74,23 @@ pub struct MstPayload {
     pub pbn: u16,
     /// The stream encoder carrying it: DIO on 8b/10b, HPO on 128b/132b.
     pub stream: u8,
+    /// How far the add got at the sink side.
+    pub allocation: PayloadAllocation,
+}
+
+/// drm_dp_mst_atomic_payload's payload_allocation_status: the sink-side
+/// steps of an add that succeeded. The source always carries a recorded
+/// payload; removal undoes only what was allocated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PayloadAllocation {
+    /// Slots accounted only: the payload-table write failed
+    /// (DRM_DP_MST_PAYLOAD_ALLOCATION_LOCAL).
+    Local,
+    /// In the first branch's payload table; ALLOCATE_PAYLOAD failed
+    /// (DRM_DP_MST_PAYLOAD_ALLOCATION_DFP).
+    Dfp,
+    /// Allocated along the path (DRM_DP_MST_PAYLOAD_ALLOCATION_REMOTE).
+    Remote,
 }
 
 /// What `ColdBoot::service_display_mst` found.
@@ -329,7 +346,13 @@ fn table(payloads: &[MstPayload]) -> Vec<otg::MstAllocation> {
 /// free VCPI at the next start slot in the sink's payload table
 /// (drm_dp_add_payload_part1), the source table with ACT, ACT handled,
 /// ALLOCATE_PAYLOAD to the sink's branch (drm_dp_add_payload_part2), then
-/// the stream's VC rate.
+/// the stream's VC rate. The sink-side steps are best effort as Linux's:
+/// the payload is recorded and its slots kept whatever they return (the
+/// table write "is OK to fail", an ACT that is not handled still sends
+/// ALLOCATE_PAYLOAD, part 2 is skipped after a failed part 1, and a part 2
+/// failure is only logged); `MstPayload::allocation` records how far it
+/// got. Only a source step's error, or cancellation, leaves the
+/// transaction marked.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn add_payload<A: MstAux, S: MstSource>(
     link: &mut MstLink,
@@ -361,38 +384,61 @@ pub(crate) async fn add_payload<A: MstAux, S: MstSource>(
     }
     let (vcpi, start) = allocate_slots(&link.payloads, link.uhbr, u32::from(slots))
         .map_err(|_| MstFailure::Invalid)?;
-    let payload = MstPayload {
+    let mut payload = MstPayload {
         sink,
         vcpi,
         start,
         slots,
         pbn,
         stream,
+        allocation: PayloadAllocation::Local,
     };
-    // Persist before the first remote write, even before payloads.push. An
-    // error or dropped future may leave the receiver ahead of our bookkeeping.
+    // Persist before the first remote write, even before payloads.push. A
+    // dropped future may leave the receiver ahead of our bookkeeping.
     link.payload_change = Some(MstPayloadChange::Adding(stream));
-    dp_mst_mgr::write_payload(aux, vcpi, payload.start, slots).await?;
+    // drm_dp_add_payload_part1: the slots are the payload's either way.
+    match dp_mst_mgr::write_payload(aux, vcpi, payload.start, slots).await {
+        Ok(()) => payload.allocation = PayloadAllocation::Dfp,
+        Err(_) => log_payload("payload table write for VCPI", vcpi),
+    }
     link.payloads.push(payload);
     source.allocation(&table(&link.payloads)).await?;
-    act_handled(aux).await?;
-    let request = Request::AllocatePayload {
-        port: info.port,
-        vcpi,
-        pbn,
-        sdp_stream_sinks: (0..info.sdp_streams).collect(),
-    };
-    match link
-        .manager
-        .transact(aux, branch.lct, &branch.rad, &request)
-        .await?
-    {
-        Reply::AllocatePayload { .. } => {}
-        _ => return Err(MstFailure::Mst(MstError::Malformed)),
+    // dm_helpers_dp_mst_poll_for_allocation_change_trigger: ACT_FAILED
+    // still sends the payload allocation.
+    if act_handled(aux).await.is_err() {
+        log_payload("ACT handled wait adding VCPI", vcpi);
+    }
+    // drm_dp_add_payload_part2, skipped when part 1 failed.
+    if payload.allocation == PayloadAllocation::Dfp {
+        let request = Request::AllocatePayload {
+            port: info.port,
+            vcpi,
+            pbn,
+            sdp_stream_sinks: (0..info.sdp_streams).collect(),
+        };
+        match link
+            .manager
+            .transact(aux, branch.lct, &branch.rad, &request)
+            .await
+        {
+            Ok(Reply::AllocatePayload { .. }) => payload.allocation = PayloadAllocation::Remote,
+            Ok(_) | Err(_) => log_payload("ALLOCATE_PAYLOAD for VCPI", vcpi),
+        }
+        if let Some(p) = link.payloads.iter_mut().find(|p| p.stream == stream) {
+            p.allocation = payload.allocation;
+        }
     }
     source.vc_rate(stream, rate).await?;
     link.payload_change = None;
     Ok(payload)
+}
+
+/// A sink-side payload step Linux tolerates (drm_dbg_kms/drm_err only).
+fn log_payload(what: &str, vcpi: u8) {
+    let _ = core::fmt::Write::write_fmt(
+        &mut narf_console::Writer,
+        format_args!("amdgpu: navi48 MST {what} {vcpi} failed\n"),
+    );
 }
 
 /// deallocate_mst_payload for stream encoder `stream`: VC rate zero, the remote and
@@ -429,8 +475,12 @@ pub(crate) async fn remove_payload<A: MstAux, S: MstSource>(
     let target = link
         .payload_target(payload.sink)
         .and_then(|(b, p)| Some((link.topology.branches.get(b)?.clone(), p)));
-    if let (true, Some((branch, to)), Some(port)) = (
+    // drm_dp_destroy_payload_at_remote_and_dfp: each step undone only if
+    // the add made it ("it's okay for these to fail").
+    let mut allocation = payload.allocation;
+    if let (true, PayloadAllocation::Remote, Some((branch, to)), Some(port)) = (
         downstream,
+        allocation,
         target,
         link.topology.port(payload.sink).copied(),
     ) {
@@ -444,8 +494,9 @@ pub(crate) async fn remove_payload<A: MstAux, S: MstSource>(
             .manager
             .transact(aux, branch.lct, &branch.rad, &request)
             .await;
+        allocation = PayloadAllocation::Dfp;
     }
-    if downstream {
+    if downstream && allocation == PayloadAllocation::Dfp {
         let _ = dp_mst_mgr::write_payload(aux, payload.vcpi, payload.start, 0).await;
     }
     let removed = link.payloads.remove(index);

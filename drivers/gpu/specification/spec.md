@@ -2619,6 +2619,18 @@ Add orders the DPCD payload table, source SAT/ACT, ACT handled,
 ALLOCATE_PAYLOAD and stream VC rate before video. Remove zeroes the VC rate,
 deallocates remotely, updates SAT/ACT and compacts later payload slots. Physical
 root removal skips all remote AUX transactions and waits during removal.
+The sink-side steps are best effort as allocate_mst_payload /
+deallocate_mst_payload and amdgpu_dm's helpers run them: the payload is
+recorded with its VCPI and slots whatever they return. A failed
+payload-table write leaves it `PayloadAllocation::Local` and skips
+ALLOCATE_PAYLOAD (drm_dp_add_payload_part1 "is OK to fail", part 2 skips a
+failed part 1); an ACT that is not handled still sends ALLOCATE_PAYLOAD
+(ACT_FAILED is not ACT_LINK_LOST); a failed or NAKed ALLOCATE_PAYLOAD leaves
+it `Dfp` (part 2 only logs); each failure is a console line. The VC rate is
+set and the add completes. Removal undoes only what was allocated
+(drm_dp_destroy_payload_at_remote_and_dfp): ALLOCATE_PAYLOAD(PBN 0) for a
+`Remote` payload, the payload-table row for `Remote` or `Dfp`, both results
+ignored, ACT unchecked.
 The bookkeeping is DRM's: `mst::allocate_slots(payloads, uhbr, slots)` is
 drm_dp_mst_atomic_check_payload_alloc_limits (63 or 64 time slots, at most
 `mst::MAX_PAYLOADS` = 4 payloads per manager as amdgpu_dm initializes it, the
@@ -2633,20 +2645,23 @@ refusals, VCPIs, start slots, payload-table rows and ALLOCATE_PAYLOAD PBNs.
 `MstLink::payload_change()` reports `Option<MstPayloadChange>`, whose Adding and
 Removing variants carry the DIO stream index. The marker is recorded before the
 first AUX/source side effect and cleared only after all required steps complete,
-without a suspension between completion and clearing. Returned failures and
-dropped futures retain it, including before an add reaches `payloads.push` or
-after a removal empties that list. It is historical uncertainty, never a retry
+without a suspension between completion and clearing. A sink-side failure is
+not one (see above): only a source step's returned error (SAT or VC rate,
+which Linux's void hwss calls cannot report) and dropped futures retain it,
+including before an add reaches `payloads.push` or after a removal empties
+that list. It is historical uncertainty, never a retry
 or ownership proof. Another add/remove, startup, modeset teardown (including its
 link handover/detach), clean/dirty topology preparation, notification polling and
 remote EDID reads are refused with Busy while it remains. Session shutdown and
 physical removal cannot discard it merely because source-owner/payload lists are empty.
 Static request rejection before the transaction starts (such as duplicate stream
-or missing payload) leaves it clear and permits a corrected request. The existing
-best-effort remote-removal/ACT-status policy is unchanged; source completion is
-still required. No reconciliation or reset of uncertain payload state is provided.
-Models inject returned errors and deterministic cancellation on both sides of
-every AUX/source operation, checking retained state, no replay or sibling
-mutation, topology/session retention and successful slot compaction.
+or missing payload) leaves it clear and permits a corrected request. Source
+completion is still required. No reconciliation or reset of uncertain payload
+state is provided. Models inject returned errors and deterministic cancellation
+on both sides of every AUX/source operation, checking retained state after
+source failures and cancellation, completed best-effort transactions after
+sink failures, no replay or sibling mutation, topology/session retention and
+successful slot compaction.
 
 The first display trains the link; the others attach and own their own
 DIG_FE_MODE=5 frontend selections. When the link owner stops its frontend,

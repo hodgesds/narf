@@ -248,6 +248,7 @@ fn navi48_mst_unplug_removes_payload_without_aux() -> TestResult {
         slots: 10,
         pbn: 100,
         stream: 3,
+        allocation: PayloadAllocation::Remote,
     });
     let mut source = Source {
         hub: &hub,
@@ -518,6 +519,164 @@ fn navi48_mst_payload_cancellation_retains_even_empty_bookkeeping() -> TestResul
 kernel_test_in!(
     "drivers/gpu/dp-mst",
     navi48_mst_payload_cancellation_retains_even_empty_bookkeeping
+);
+
+/// An access: its address and whether it writes.
+type Access = (u32, bool);
+/// Which accesses an AUX channel refuses: `refuse(access, previous)`.
+type Refuse = fn(Access, Access) -> bool;
+/// An AUX channel that refuses the accesses `refuse(access, previous)` picks.
+struct Refusing<'a> {
+    inner: Aux<'a>,
+    refuse: core::cell::Cell<Refuse>,
+    last: Access,
+}
+impl MstAux for Refusing<'_> {
+    type Error = ();
+    async fn read(&mut self, address: u32, buf: &mut [u8]) -> Result<(), ()> {
+        let last = core::mem::replace(&mut self.last, (address, false));
+        if (self.refuse.get())((address, false), last) {
+            return Err(());
+        }
+        self.inner.read(address, buf).await
+    }
+    async fn write(&mut self, address: u32, data: &[u8]) -> Result<(), ()> {
+        let last = core::mem::replace(&mut self.last, (address, true));
+        if (self.refuse.get())((address, true), last) {
+            return Err(());
+        }
+        self.inner.write(address, data).await
+    }
+    async fn delay(&mut self, us: u64) {
+        self.inner.delay(us).await;
+    }
+}
+
+/// allocate_mst_payload and deallocate_mst_payload are best effort at the
+/// sink as Linux's: a failed payload-table write (drm_dp_add_payload_part1
+/// "is OK to fail") keeps the payload's slots, skips ALLOCATE_PAYLOAD and
+/// leaves it LOCAL; an ACT that is never handled still sends
+/// ALLOCATE_PAYLOAD; a failed ALLOCATE_PAYLOAD only leaves it DFP. Each add
+/// completes (the stream's VC rate set, no transaction left marked), and
+/// the removal undoes just what was allocated
+/// (drm_dp_destroy_payload_at_remote_and_dfp), so the port's later
+/// transactions run on.
+fn navi48_mst_payload_sink_failures_are_best_effort() -> TestResult {
+    use dp_mst_mgr::PAYLOAD_TABLE_UPDATE_STATUS as STATUS;
+    fn table_write(a: Access, _: Access) -> bool {
+        a == (dp_mst_mgr::PAYLOAD_ALLOCATE_SET, true)
+    }
+    // ACT handled polls the status again after the payload-table write
+    // read it updated.
+    fn act_status(a: Access, last: Access) -> bool {
+        a == (STATUS, false) && last == (STATUS, false)
+    }
+    fn sideband(a: Access, _: Access) -> bool {
+        a.1 && (dp_mst::DOWN_REQ_BASE..dp_mst::DOWN_REQ_BASE + 48).contains(&a.0)
+    }
+    fn none(_: Access, _: Access) -> bool {
+        false
+    }
+    let cases: [(Refuse, PayloadAllocation); 3] = [
+        (table_write, PayloadAllocation::Local),
+        (act_status, PayloadAllocation::Remote),
+        (sideband, PayloadAllocation::Dfp),
+    ];
+    for (refuse, allocation) in cases {
+        let hub = RefCell::new(Hub::new());
+        let mut link = started_link(&hub);
+        link.owner = Some(0);
+        let sinks = link.topology.sinks();
+        let mut aux = Refusing {
+            inner: Aux(&hub),
+            refuse: core::cell::Cell::new(refuse),
+            last: (0, false),
+        };
+        let mut source = Source {
+            hub: &hub,
+            events: Vec::new(),
+        };
+        let sent = hub.borrow().requests.len();
+        let p = run(alloc::boxed::Box::pin(add_payload(
+            &mut link,
+            &mut aux,
+            &mut source,
+            sinks[0],
+            1,
+            900,
+            12,
+            (11, 7),
+        )))
+        .unwrap();
+        assert_eq!(p.allocation, allocation);
+        assert_eq!(link.payloads, [p]);
+        assert_eq!(link.payload_change(), None);
+        assert_eq!(link.audio_slots(1), Ok(12));
+        assert_eq!(source.events.last(), Some(&Event::Rate(1, (11, 7))));
+        // ALLOCATE_PAYLOAD reached the hub unless part 1 failed or the
+        // sideband write was refused.
+        let sent_now = hub.borrow().requests.len();
+        assert_eq!(
+            sent_now - sent,
+            usize::from(allocation == PayloadAllocation::Remote)
+        );
+        aux.refuse.set(none);
+        let (row, sent) = {
+            let h = hub.borrow();
+            let row: Vec<u8> = (0..3)
+                .map(|i| h.dpcd[&(dp_mst_mgr::PAYLOAD_ALLOCATE_SET + i)])
+                .collect();
+            (row, h.requests.len())
+        };
+        source.events.clear();
+        run(alloc::boxed::Box::pin(remove_payload(
+            &mut link,
+            &mut aux,
+            &mut source,
+            1,
+            true,
+        )))
+        .unwrap();
+        {
+            let h = hub.borrow();
+            let after: Vec<u8> = (0..3)
+                .map(|i| h.dpcd[&(dp_mst_mgr::PAYLOAD_ALLOCATE_SET + i)])
+                .collect();
+            let expect = match allocation {
+                PayloadAllocation::Local => (sent, row),
+                PayloadAllocation::Dfp => (sent, vec![1, 1, 0]),
+                PayloadAllocation::Remote => (sent + 1, vec![1, 1, 0]),
+            };
+            assert_eq!((h.requests.len(), after), expect);
+            assert_eq!(
+                source.events,
+                [
+                    Event::Rate(1, (0, 0)),
+                    Event::Table(Vec::new(), h.requests.len())
+                ]
+            );
+        }
+        assert!(link.payloads.is_empty() && link.payload_change().is_none());
+        // The port's next transaction is not refused as busy.
+        let again = run(alloc::boxed::Box::pin(add_payload(
+            &mut link,
+            &mut aux,
+            &mut source,
+            sinks[1],
+            3,
+            500,
+            7,
+            (6, 9),
+        )))
+        .unwrap();
+        assert_eq!((again.vcpi, again.start), (1, 1));
+        assert_eq!(again.allocation, PayloadAllocation::Remote);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    navi48_mst_payload_sink_failures_are_best_effort
 );
 
 fn navi48_mst_payload_preflight_rejection_leaves_transaction_reusable() -> TestResult {
@@ -823,6 +982,7 @@ fn replay_payload_vector(line: &str) -> Option<alloc::string::String> {
                         slots: slots as u8,
                         pbn: value as u16,
                         stream: vcpi,
+                        allocation: PayloadAllocation::Remote,
                     });
                 }
             }
