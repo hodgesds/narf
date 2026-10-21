@@ -1167,9 +1167,8 @@ impl crate::amdgpu_navi48_boot::bandwidth::UclkPin for PinOwner {
             .map(|_| ())
             .map_err(crate::amdgpu_dcn401_otg::Error::Clocks)
     }
-    async fn disable_fams2(&mut self) -> Result<(), crate::amdgpu_dcn401_otg::Error> {
+    async fn disable_fams2(&mut self) {
         self.steps.push("fams2");
-        Ok(())
     }
 }
 /// A pin's result, the DAL messages it sent and the owner steps it ran.
@@ -1254,6 +1253,20 @@ fn dcn401_fresh_display_owners_pin_like_linux_prepare_bandwidth() -> TestResult 
     let (allowed, _) = bw(&mut o.e, pstate_bw(), true);
     if allowed.is_err() || !o.e.status.uclk_switching() {
         return TestResult::Fail("old owner switching before suspend");
+    }
+    // A teardown on an owner that failed while switching: the pin cannot
+    // run (Busy, nothing sent), which a configuration change returns and a
+    // teardown only logs before it goes on.
+    o.e.status.state = State::Failed(Error::Timeout);
+    let before = o.e.io.commands.len();
+    let busy = Err(crate::amdgpu_dcn401_otg::Error::Clocks(Error::Busy));
+    if pin(&mut o).0 != busy
+        || run(crate::amdgpu_navi48_boot::bandwidth::pin_uclk_for_teardown(
+            &mut o,
+        )) != busy
+        || o.e.io.commands.len() != before
+    {
+        return TestResult::Fail("teardown pin on a failed owner");
     }
     let mut resumed = fresh();
     if pin(&mut resumed) != (Ok(()), Vec::new(), Vec::new()) {

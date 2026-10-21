@@ -1109,10 +1109,25 @@ impl<I: Io> Engine<I> {
     }
     /// dmub_hw_lock_mgr_inbox0_cmd: clear the inbox0 acknowledgement
     /// (DMCUB_SCRATCH17), post the command to DMCUB_INBOX0_WPTR and wait
-    /// up to 100 ms (MAX_WAIT_US) for firmware to acknowledge it.
-    async fn inbox0(&mut self, command: u32) -> Result<(), Error> {
+    /// up to 100 ms (MAX_WAIT_US) for firmware to acknowledge it. As
+    /// dc_dmub_srv_wait_for_inbox0_ack, a missing acknowledgement is logged
+    /// ("Error waiting for INBOX0 HW Lock Ack", without DMU recovery, which
+    /// DC leaves off) and the caller goes on: `Ok(false)`, the mailbox left
+    /// usable, since inbox0 is a register handshake beside the ring.
+    async fn inbox0(&mut self, command: u32) -> Result<bool, Error> {
         self.begin_mailbox()?;
-        let result = self.inbox0_inner(command).await;
+        let result = match self.inbox0_inner(command).await {
+            Err(Error::CommandTimeout) => {
+                let _ = core::fmt::Write::write_fmt(
+                    &mut narf_console::Writer,
+                    format_args!(
+                        "amdgpu: navi48 DMUB inbox0 command {command:#x} not acknowledged\n"
+                    ),
+                );
+                Ok(false)
+            }
+            r => r.map(|()| true),
+        };
         self.finish_mailbox(result)
     }
     async fn inbox0_inner(&mut self, command: u32) -> Result<(), Error> {
@@ -1342,8 +1357,9 @@ impl Dmub {
             .map(|c| c.fams2())
     }
     /// dcn401_dmub_hw_control_lock: the driver's inbox0 HW lock, taken
-    /// (`lock`) or released.
-    pub(crate) async fn hw_lock(&mut self, lock: bool) -> Result<(), Error> {
+    /// (`lock`) or released. `Ok(false)`: firmware never acknowledged it,
+    /// which Linux logs and goes on from.
+    pub(crate) async fn hw_lock(&mut self, lock: bool) -> Result<bool, Error> {
         let command = HW_LOCK | if lock { HW_LOCK_LOCK } else { HW_LOCK_RELEASE };
         self.engine.inbox0(command).await
     }

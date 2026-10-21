@@ -677,8 +677,8 @@ impl ColdBoot {
         port: usize,
         stream: u8,
     ) -> Result<(), MstFailure> {
-        // dcn401_prepare_bandwidth: pinned before any configuration change.
-        self.pin_display_uclk().await.map_err(MstFailure::Display)?;
+        // dcn401_prepare_bandwidth: pinned first, best-effort for a teardown.
+        self.pin_display_uclk_for_teardown().await;
         let connected = self.display_hpd(port) != Ok(false);
         let (instance, transmitter) = self.mst_path(port)?;
         let link = self.mst.get_mut(&port).ok_or(MstFailure::Invalid)?;

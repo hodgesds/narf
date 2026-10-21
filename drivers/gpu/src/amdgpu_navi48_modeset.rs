@@ -3987,8 +3987,8 @@ impl ColdBoot {
     /// # Safety
     /// As for `stop_modeset`.
     pub async unsafe fn unplug_modeset(&mut self, m: &Modeset) -> Result<(), ModesetError> {
-        // dcn401_prepare_bandwidth: pinned before any configuration change.
-        self.pin_display_uclk().await?;
+        // dcn401_prepare_bandwidth: pinned first, best-effort for a teardown.
+        self.pin_display_uclk_for_teardown().await;
         // SAFETY: caller has withdrawn CPU writers and retains exclusive owners.
         unsafe { self.teardown_modeset(m, true) }.await?;
         self.modesets.stopped(m.pipe);
@@ -4001,8 +4001,8 @@ impl ColdBoot {
     /// # Safety
     /// As for `modeset_display`; stop every CPU writer of the surface first.
     pub async unsafe fn stop_modeset(&mut self, m: &Modeset) -> Result<(), ModesetError> {
-        // dcn401_prepare_bandwidth: pinned before any configuration change.
-        self.pin_display_uclk().await?;
+        // dcn401_prepare_bandwidth: pinned first, best-effort for a teardown.
+        self.pin_display_uclk_for_teardown().await;
         // SAFETY: caller has withdrawn CPU writers and retains exclusive owners.
         unsafe { self.teardown_modeset(m, false) }.await?;
         self.modesets.stopped(m.pipe);
@@ -4292,11 +4292,11 @@ impl ColdBoot {
             // SAFETY: the caller's obligations; the scanout stays live.
             unsafe { self.update_live_display_plan(m.pipe, plan, true) }.await?;
         }
-        self.disable_display_fams2().await?;
+        self.disable_display_fams2().await;
         // dcn401_optimize_bandwidth: FAMS2 off (no firmware method is
         // required), the exact watermarks, then the clocks lowered and UCLK
         // switching allowed.
-        self.disable_display_fams2().await?;
+        self.disable_display_fams2().await;
         for (m, plan) in running.iter_mut().zip(&plans) {
             // SAFETY: the caller's obligations; the scanout stays live.
             let d = unsafe { self.update_live_display_plan(m.pipe, plan, false) }.await?;

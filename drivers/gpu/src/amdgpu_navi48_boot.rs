@@ -2318,19 +2318,30 @@ impl ColdBoot {
     /// dcn401_prepare/optimize_bandwidth's FAMS2 step for a configuration
     /// that needs no firmware method (fams2_required false): under the
     /// driver's inbox0 HW lock, FAMS2_CONFIG with FAMS2 disabled. Only with
-    /// FAMS 2.1 firmware, as DC clears fams2_config.enable otherwise.
-    pub async fn disable_display_fams2(&mut self) -> Result<(), otg::Error> {
+    /// FAMS 2.1 firmware, as DC clears fams2_config.enable otherwise. As in
+    /// Linux, where dcn401_dmub_hw_control_lock and
+    /// dc_dmub_srv_fams2_update_config return nothing (an unacknowledged
+    /// lock or a failed command is only logged), nothing here fails the
+    /// caller: each step is tried in turn, the lock released whatever the
+    /// update did, and a failure is logged. The port never enables FAMS2,
+    /// so firmware only ever holds it disabled.
+    pub async fn disable_display_fams2(&mut self) {
         if !self.display_fams2() {
-            return Ok(());
+            return;
         }
         let commands = dmub::fams2_config_commands(false, &dmub::Fams2Global::default(), &[]);
         let dmub = &mut self.sequence.backend.dmub;
-        dmub.hw_lock(true).await.map_err(otg::Error::Firmware)?;
+        let locked = dmub.hw_lock(true).await;
         let sent = dmub.fams2_update_config(&commands).await;
-        // dcn401_fams2_global_control_lock(false) whatever the update did.
         let released = dmub.hw_lock(false).await;
-        sent.map_err(otg::Error::Firmware)?;
-        released.map_err(otg::Error::Firmware)
+        if locked.is_err() || sent.is_err() || released.is_err() {
+            let _ = core::fmt::Write::write_fmt(
+                &mut narf_console::Writer,
+                format_args!(
+                    "amdgpu: navi48 FAMS2 disable: lock {locked:?}, config {sent:?}, release {released:?}\n"
+                ),
+            );
+        }
     }
     /// dcn401_prepare_bandwidth before a configuration change
     /// (`bandwidth::pin_uclk`): when PMFW may switch UCLK, UCLK and FCLK
@@ -2340,6 +2351,12 @@ impl ColdBoot {
     /// resume, before the display clocks are prepared) or one already pinned.
     pub async fn pin_display_uclk(&mut self) -> Result<(), otg::Error> {
         bandwidth::pin_uclk(self).await
+    }
+    /// `pin_display_uclk` before a teardown: best-effort, as Linux's void
+    /// prepare_bandwidth never stops a stream from being disabled (a
+    /// failure is logged and the teardown goes on).
+    pub(crate) async fn pin_display_uclk_for_teardown(&mut self) {
+        let _ = bandwidth::pin_uclk_for_teardown(self).await;
     }
     /// Program `request`'s pipe clock for the selected display while the
     /// others run (their consumers left to them).
@@ -3888,7 +3905,7 @@ impl bandwidth::UclkPin for ColdBoot {
             .await
             .map(|_| ())
     }
-    async fn disable_fams2(&mut self) -> Result<(), otg::Error> {
+    async fn disable_fams2(&mut self) {
         self.disable_display_fams2().await
     }
 }

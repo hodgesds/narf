@@ -5231,7 +5231,14 @@ watermark, pipe or link change: `modeset_display`, `modeset_display_mode`,
 (after its validation, before the shared clocks rise and the other
 displays' plans move) and `update_live_display_planes`, and the teardowns
 `stop_modeset`, `unplug_modeset`, `abort_modeset_activation` and
-`remove_display_mst_payload`. Flips, cursor, colour/HDR and DRR updates are
+`remove_display_mst_payload`. A teardown pins best-effort
+(`pin_display_uclk_for_teardown`): Linux's prepare_bandwidth is void, so a
+pin that fails (a failed clock owner) is logged and the stream is still
+disabled; every other entry point returns the failure before any change.
+`disable_display_fams2` never fails its caller either, as
+dcn401_dmub_hw_control_lock and the FAMS2 update return nothing in Linux:
+lock, disabled config and release are each tried (the release whatever the
+update did) and a failure is logged. Flips, cursor, colour/HDR and DRR updates are
 DC fast or stream updates, which Linux commits without prepare_bandwidth,
 and do not pin (DRR is refused while switching). The step primitives those
 entry points are built from (`start_display_scanout`, `stop_display_scanout`,
@@ -6231,7 +6238,10 @@ Linux ABI without enabling any advertised feature; `fams_version()` is
 FAMS2 on (version 0x41, FAMS 2.1; `None` before the query answered).
 `Dmub::hw_lock(lock)` is dcn401_dmub_hw_control_lock's inbox0 HW lock
 (HW_LOCK command code 1 with the lock or release bit; SCRATCH17 cleared,
-INBOX0_WPTR written, a 100-ms acknowledgement). `fams2_config_commands(enable,
+INBOX0_WPTR written, a 100-ms acknowledgement). As
+dc_dmub_srv_wait_for_inbox0_ack, a missing acknowledgement is logged and
+the caller goes on: `Ok(false)`, the mailbox left usable (DC's DMU recovery
+on that timeout is off by default). `fams2_config_commands(enable,
 &Fams2Global, &[Fams2StreamConfig])` lays out
 dc_dmub_srv_rb_based_fams2_update_config's FAMS2_CONFIG list (type 76,
 sub-type 4: the global command, then every stream's base and sub-state,

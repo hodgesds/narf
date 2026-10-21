@@ -1127,7 +1127,7 @@ fn dmub_navi48_hw_lock_posts_inbox0_and_waits_for_the_ack() -> TestResult {
         } else {
             HW_LOCK | HW_LOCK_RELEASE
         };
-        if run(e.inbox0(command)).is_err() {
+        if run(e.inbox0(command)) != Ok(true) {
             return TestResult::Fail("inbox0 command");
         }
         // The stale acknowledgement is cleared before the command is posted.
@@ -1140,12 +1140,17 @@ fn dmub_navi48_hw_lock_posts_inbox0_and_waits_for_the_ack() -> TestResult {
             return TestResult::Fail("inbox0 lock sequence");
         }
     }
-    // Firmware that never acknowledges times out and fails the mailbox.
+    // Firmware that never acknowledges: dc_dmub_srv_wait_for_inbox0_ack
+    // logs it and DC goes on, so the lock reports no acknowledgement and
+    // the ring mailbox stays usable (the disabled FAMS2 config still posts).
     e.io.inbox0 = false;
-    if run(e.inbox0(HW_LOCK | HW_LOCK_LOCK)) != Err(Error::CommandTimeout)
-        || e.mailbox.state != MailboxState::Failed
+    if run(e.inbox0(HW_LOCK | HW_LOCK_LOCK)) != Ok(false) || e.mailbox.state != MailboxState::Ready
     {
         return TestResult::Fail("inbox0 timeout");
+    }
+    let off = fams2_config_commands(false, &Fams2Global::default(), &[]);
+    if run(e.fams2_update_config(&off)).is_err() || e.mailbox.state != MailboxState::Ready {
+        return TestResult::Fail("ring command after an unacknowledged lock");
     }
     TestResult::Pass
 }

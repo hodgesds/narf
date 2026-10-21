@@ -12,8 +12,9 @@ pub(crate) trait UclkPin {
     /// towards `bandwidth` while the displays run.
     async fn raise_bandwidth(&mut self, bandwidth: clocks::Bandwidth) -> Result<(), otg::Error>;
     /// dcn401_dmub_hw_control_lock(true), dcn401_fams2_update_config with
-    /// FAMS2 disabled, dcn401_dmub_hw_control_lock(false).
-    async fn disable_fams2(&mut self) -> Result<(), otg::Error>;
+    /// FAMS2 disabled, dcn401_dmub_hw_control_lock(false): void, as in
+    /// Linux.
+    async fn disable_fams2(&mut self);
 }
 
 /// dcn401_prepare_bandwidth for a configuration change while PMFW may switch
@@ -34,5 +35,20 @@ pub(crate) async fn pin_uclk<P: UclkPin>(owner: &mut P) -> Result<(), otg::Error
     owner
         .raise_bandwidth(clocks::Bandwidth::pinned(&levels))
         .await?;
-    owner.disable_fams2().await
+    owner.disable_fams2().await;
+    Ok(())
+}
+
+/// `pin_uclk` before a teardown. dcn401_prepare_bandwidth is void in Linux:
+/// nothing in it can stop a stream from being disabled. A pin that fails
+/// (a failed clock owner) is logged and returned, and the teardown goes on.
+pub(crate) async fn pin_uclk_for_teardown<P: UclkPin>(owner: &mut P) -> Result<(), otg::Error> {
+    let result = pin_uclk(owner).await;
+    if let Err(e) = result {
+        let _ = core::fmt::Write::write_fmt(
+            &mut narf_console::Writer,
+            format_args!("amdgpu: navi48 teardown goes on unpinned: {e:?}\n"),
+        );
+    }
+    result
 }
