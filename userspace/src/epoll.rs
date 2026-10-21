@@ -198,9 +198,19 @@ struct EpollInner {
     ready: BTreeMap<i32, u64>,
     /// Source of `ready` listing numbers; bumped on every (re)listing.
     ready_seq: u64,
-    /// The currently-parked poller's waker, woken when a per-fd waker lists a
-    /// ready fd. Set at park, cleared on return.
-    parked_waker: Option<core::task::Waker>,
+    /// Wakers of every task currently parked in `epoll_wait` on THIS instance,
+    /// keyed by task id, woken when a per-fd waker lists a ready fd. Keyed (not
+    /// a single `Option`) because Linux `epoll` supports many waiters on one
+    /// epoll fd — the common server pattern perf bench exercises: N threads all
+    /// blocked in `epoll_wait(epfd)` on a shared epoll. A single slot let each
+    /// parker clobber the previous one's waker, so only the last got woken and
+    /// the other N-1 stranded until a coarse re-poll. Each parker inserts its
+    /// own entry at park and removes it on return, so re-parking replaces only
+    /// its own slot. `push_ready` wakes ALL of them; the per-waiter
+    /// `collect_ready` delivery decision (owner-aware for EPOLLEXCLUSIVE) then
+    /// hands each event to exactly one, the rest re-park — matching Linux's
+    /// wait-queue wake + ready-list claim.
+    parked_wakers: BTreeMap<u64, core::task::Waker>,
     /// collect_ready call counter for the periodic full-scan floor. The
     /// ready-list can under-report a cell-backed fd that became ready while the
     /// poller was between waits (the Readiness cell removes a waiter when `arm`
@@ -296,13 +306,17 @@ impl EpollInstance {
     /// List `fd` as ready (its per-fd waker fired) and wake the parked poller.
     /// No-op if `fd` left the interest set.
     fn push_ready(&self, fd: i32) {
-        let waker = {
+        let wakers: Vec<core::task::Waker> = {
             let mut g = self.inner.lock();
             if !g.interest.contains_key(&fd) {
                 return;
             }
             g.list_ready(fd);
-            g.parked_waker.clone()
+            // Wake EVERY parked waiter: any of them may be the one whose
+            // `collect_ready` will claim this fd (and for a level-triggered or
+            // multi-event edge, several can each take a distinct ready fd). The
+            // losers re-park. Cloned out so `wake()` runs outside `self.inner`.
+            g.parked_wakers.values().cloned().collect()
         };
         // Chain the wake UP to a parent epoll / poll(2) that watches THIS
         // instance as a nested fd: fire our own cell so its persistent per-fd
@@ -322,7 +336,7 @@ impl EpollInstance {
             self.self_readiness.set(narf_filesystem::POLL_IN, 0);
             self.self_readiness.notify(narf_filesystem::POLL_IN);
         }
-        if let Some(w) = waker {
+        for w in wakers {
             w.wake();
         }
     }
@@ -334,7 +348,7 @@ impl EpollInstance {
                 scan_after: None,
                 ready: BTreeMap::new(),
                 ready_seq: 0,
-                parked_waker: None,
+                parked_wakers: BTreeMap::new(),
                 scan_ctr: 0,
             }),
             self_readiness: narf_lib::readiness::Readiness::new(0),
@@ -557,15 +571,18 @@ impl EpollInstance {
     /// NOT per-wait — so an event listing a fd on the ready-list is captured even
     /// between non-parking (`timeout==0`) waits, and there is no per-wait O(n)
     /// re-arm on the hot path.
-    fn set_parked_waker(&self, waker: &core::task::Waker) {
-        self.inner.lock().parked_waker = Some(waker.clone());
+    fn set_parked_waker(&self, task_id: u64, waker: &core::task::Waker) {
+        self.inner
+            .lock()
+            .parked_wakers
+            .insert(task_id, waker.clone());
     }
 
     /// End-of-wait cleanup: drop the parked-waker publication. The persistent
     /// per-fd cell wakers stay armed (Linux `eppoll_entry`), disarmed only by
     /// CTL_MOD/DEL or this instance's drop.
-    fn disarm_readiness_cells(&self, _task_id: u64) {
-        self.inner.lock().parked_waker = None;
+    fn disarm_readiness_cells(&self, task_id: u64) {
+        self.inner.lock().parked_wakers.remove(&task_id);
     }
 
     /// Two-tier delivery: a fast O(ready) pass over the ready-list (+ non-cell
@@ -1910,7 +1927,7 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                         // are already armed for the fd's lifetime, so this is O(1),
                         // not a per-wait O(n) re-arm.
                         if let Some(w) = narf_scheduler::stackful::current_stackful_waker() {
-                            instance.set_parked_waker(&w);
+                            instance.set_parked_waker(task, &w);
                             // Register-then-recheck — closes the collect_ready ->
                             // park lost-wake window. A fd whose persistent waker
                             // fired push_ready AFTER the top collect_ready but
@@ -2173,6 +2190,90 @@ mod tests {
     kernel_test_in!(
         "userspace/epoll",
         smoke_epoll_has_deliverable_matches_collect_ready
+    );
+
+    // Test waker: its data pointer is an index into `TEST_WOKE`; `wake` sets
+    // that slot. `clone` preserves the index (so `push_ready`'s `.cloned()` +
+    // `wake()` still records the right waiter), drop is a no-op (the "resource"
+    // is just an integer).
+    static TEST_WOKE: [core::sync::atomic::AtomicBool; 4] =
+        [const { core::sync::atomic::AtomicBool::new(false) }; 4];
+    unsafe fn tw_clone(p: *const ()) -> core::task::RawWaker {
+        core::task::RawWaker::new(p, &TEST_WAKER_VTABLE)
+    }
+    unsafe fn tw_wake(p: *const ()) {
+        let i = p as usize;
+        if i < TEST_WOKE.len() {
+            TEST_WOKE[i].store(true, Ordering::Relaxed);
+        }
+    }
+    unsafe fn tw_drop(_p: *const ()) {}
+    static TEST_WAKER_VTABLE: core::task::RawWakerVTable =
+        core::task::RawWakerVTable::new(tw_clone, tw_wake, tw_wake, tw_drop);
+    fn test_waker(i: usize) -> core::task::Waker {
+        // SAFETY: `i` is a small integer sentinel, never dereferenced; the
+        // vtable only ever reads it back as `p as usize`.
+        unsafe {
+            core::task::Waker::from_raw(core::task::RawWaker::new(
+                i as *const (),
+                &TEST_WAKER_VTABLE,
+            ))
+        }
+    }
+
+    /// A readiness event must wake EVERY task parked in `epoll_wait` on a shared
+    /// epoll instance, not just one. Linux `epoll` supports many waiters on one
+    /// epoll fd (the common N-threads-one-epoll server pattern); NARF kept a
+    /// single `parked_waker` slot, so every new parker clobbered the previous
+    /// one and `push_ready` woke only the last — the others stranded. This pins
+    /// the wake-queue: all registered waiters fire, and `disarm` removes only
+    /// its own task's waker without disturbing the rest.
+    fn smoke_epoll_push_ready_wakes_all_parked_waiters() -> TestResult {
+        __test_reset();
+        let reset = || {
+            for w in &TEST_WOKE {
+                w.store(false, Ordering::Relaxed);
+            }
+        };
+        reset();
+        // One readable fd, three tasks parked on the SAME instance.
+        let (ep, _f) = one_fd(EPOLLIN, POLL_IN, 0, false, false);
+        ep.set_parked_waker(0xA0, &test_waker(0));
+        ep.set_parked_waker(0xA1, &test_waker(1));
+        ep.set_parked_waker(0xA2, &test_waker(2));
+
+        ep.push_ready(FD);
+        if !(TEST_WOKE[0].load(Ordering::Relaxed)
+            && TEST_WOKE[1].load(Ordering::Relaxed)
+            && TEST_WOKE[2].load(Ordering::Relaxed))
+        {
+            return TestResult::Fail(
+                "push_ready must wake ALL parked waiters on a shared epoll instance",
+            );
+        }
+
+        // Re-parking a task replaces only its own slot (not a new entry).
+        ep.set_parked_waker(0xA0, &test_waker(0));
+        if ep.inner.lock().parked_wakers.len() != 3 {
+            return TestResult::Fail("re-park must replace the task's own waker, not grow the map");
+        }
+
+        // Disarm one waiter: the next event wakes the OTHER two, not it.
+        ep.disarm_readiness_cells(0xA1);
+        reset();
+        ep.push_ready(FD);
+        if TEST_WOKE[1].load(Ordering::Relaxed) {
+            return TestResult::Fail("a disarmed waiter must not be woken");
+        }
+        if !(TEST_WOKE[0].load(Ordering::Relaxed) && TEST_WOKE[2].load(Ordering::Relaxed)) {
+            return TestResult::Fail("remaining waiters must still wake after one disarm");
+        }
+        __test_reset();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace/epoll",
+        smoke_epoll_push_ready_wakes_all_parked_waiters
     );
 
     /// The scheduler's park recheck calls `epoll_fd_has_ready(task, epfd)` — it
