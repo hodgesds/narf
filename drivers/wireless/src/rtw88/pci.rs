@@ -99,8 +99,10 @@ impl WirelessNetIface for Rtw88Device {
     }
 
     async fn associate(&self, _req: AssociateRequest) -> Result<(), WirelessError> {
-        self.link_up.store(true, Ordering::Release);
-        Ok(())
+        // Firmware, management-frame exchange, and data rings are not live
+        // yet.  Reporting success here used to raise carrier despite the
+        // device being incapable of transmitting a single frame.
+        Err(WirelessError::NotSupported)
     }
 
     async fn disassociate(&self) -> Result<(), WirelessError> {
@@ -109,7 +111,9 @@ impl WirelessNetIface for Rtw88Device {
     }
 
     async fn set_config(&self, _cfg: WirelessConfig) -> Result<(), WirelessError> {
-        Ok(())
+        // There is no firmware-owned channel or power configuration path in
+        // this baseline.  Keep control-plane state aligned with the hardware.
+        Err(WirelessError::NotSupported)
     }
 }
 
