@@ -1088,3 +1088,175 @@ fn dmub_navi48_dp_mst_uses_digmode_5() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/dmub-navi48", dmub_navi48_dp_mst_uses_digmode_5);
+
+/// ready() with the caps query reporting FAMS version `fams`.
+fn ready_fams(fams: u8) -> (Pool, Engine<Fake>) {
+    let (pool, mut engine) = fixture();
+    engine.io.fams_version = fams;
+    run(engine.quiesce()).unwrap();
+    run(engine.start(tmr())).unwrap();
+    run(engine.initialize_mailbox()).unwrap();
+    (pool, engine)
+}
+fn dmub_navi48_fams2_follows_the_firmware_version() -> TestResult {
+    // FAMS 1.1 firmware: DC turns FAMS2 off; 2.1 keeps it.
+    let (_pool, e) = ready();
+    let caps = e.status.unwrap().capabilities.unwrap();
+    if caps.fams_version() != 0x21 || caps.fams2() {
+        return TestResult::Fail("FAMS 1.1 firmware kept FAMS2");
+    }
+    let (_pool, e) = ready_fams(0x41);
+    let caps = e.status.unwrap().capabilities.unwrap();
+    if caps.fams_version() != FAMS_VERSION || !caps.fams2() {
+        return TestResult::Fail("FAMS 2.1 firmware");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi48",
+    dmub_navi48_fams2_follows_the_firmware_version
+);
+
+fn dmub_navi48_hw_lock_posts_inbox0_and_waits_for_the_ack() -> TestResult {
+    let (_pool, mut e) = ready();
+    for (lock, word) in [(true, 0x0080_0001u32), (false, 0x0100_0001)] {
+        e.io.writes.clear();
+        e.io.regs.insert(DCN + 0x1f4 * 4, 7);
+        let command = if lock {
+            HW_LOCK | HW_LOCK_LOCK
+        } else {
+            HW_LOCK | HW_LOCK_RELEASE
+        };
+        if run(e.inbox0(command)).is_err() {
+            return TestResult::Fail("inbox0 command");
+        }
+        // The stale acknowledgement is cleared before the command is posted.
+        let ack = e.io.writes.iter().position(|w| *w == (DCN + 0x1f4 * 4, 0));
+        let post =
+            e.io.writes
+                .iter()
+                .position(|w| *w == (DCN + 0x1d2 * 4, word));
+        if ack.is_none() || post.is_none() || ack > post || e.mailbox.state != MailboxState::Ready {
+            return TestResult::Fail("inbox0 lock sequence");
+        }
+    }
+    // Firmware that never acknowledges times out and fails the mailbox.
+    e.io.inbox0 = false;
+    if run(e.inbox0(HW_LOCK | HW_LOCK_LOCK)) != Err(Error::CommandTimeout)
+        || e.mailbox.state != MailboxState::Failed
+    {
+        return TestResult::Fail("inbox0 timeout");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi48",
+    dmub_navi48_hw_lock_posts_inbox0_and_waits_for_the_ack
+);
+
+fn fams2_stream() -> Fams2StreamConfig {
+    Fams2StreamConfig {
+        base: crate::amdgpu_dcn401_dml::pstate::Fams2Stream {
+            kind: 2,
+            otg_vline_time_ns: 14814,
+            htotal: 2200,
+            vtotal: 1125,
+            vblank_start: 1121,
+            vblank_end: 41,
+            max_vtotal: 1125,
+            allow_start_otg_vline: 1092,
+            allow_end_otg_vline: 1094,
+            drr_keepout_otg_vline: 1118,
+            scheduling_delay_otg_vlines: 38,
+            contention_delay_otg_vlines: 17,
+            vline_int_ack_delay_otg_vlines: 3,
+            allow_to_target_delay_otg_vlines: 5,
+            is_drr: false,
+            clamp_vtotal_min: true,
+            min_ttu_vblank_usable: true,
+            vactive_det_fill_delay_otg_vlines: 27,
+        },
+        otg_inst: 2,
+        pipe_mask: 0b0110,
+        num_planes: 1,
+        plane_pipe_masks: [0b0110, 0, 0, 0, 0, 0],
+    }
+}
+
+fn dmub_navi48_fams2_config_matches_dmub_cmd_layout() -> TestResult {
+    // Disabled (what the hardware-exclusive methods send): the global
+    // command alone, every field zero.
+    let global = Fams2Global {
+        max_allow_delay_us: 100_000,
+        lock_wait_time_us: 5000,
+        num_streams: 2,
+        features: Fams2Features {
+            enable: true,
+            enable_stall_recovery: true,
+            enable_offload_flip: true,
+            allow_delay_check_mode: 1,
+            ..Fams2Features::default()
+        },
+        recovery_timeout_us: 5000,
+        hwfq_flip_programming_delay_us: 300,
+        max_allow_to_target_delta_us: 0,
+    };
+    let off = fams2_config_commands(false, &global, &[fams2_stream()]);
+    let mut golden = [0u8; 64];
+    golden[..4].copy_from_slice(&[76, 4, 0, 60]);
+    if off != [golden] {
+        return TestResult::Fail("disabled FAMS2 config");
+    }
+    // Enabled with two streams: global, both bases, both sub-states, every
+    // command but the last chained.
+    let streams = [fams2_stream(), fams2_stream()];
+    let on = fams2_config_commands(true, &global, &streams);
+    if on.len() != 5
+        || on[..4].iter().any(|c| c[2] != 2)
+        || on[4][2] != 0
+        || on.iter().any(|c| c[..2] != [76, 4] || c[3] != 60)
+    {
+        return TestResult::Fail("FAMS2 command chain");
+    }
+    let word = |c: &[u8; 64], at: usize| u32::from_le_bytes(c[4 + at..8 + at].try_into().unwrap());
+    let half = |c: &[u8; 64], at: usize| u16::from_le_bytes(c[4 + at..6 + at].try_into().unwrap());
+    // dmub_cmd_fams2_global_config: features bit 0 enable, 2 stall
+    // recovery, 4 offload flip, 6-7 allow delay check mode.
+    if [0, 4, 8, 12, 16, 20, 24].map(|at| word(&on[0], at))
+        != [100_000, 5000, 2, 1 | 1 << 2 | 1 << 4 | 1 << 6, 5000, 300, 0]
+    {
+        return TestResult::Fail("FAMS2 global layout");
+    }
+    let b = &on[1];
+    if word(b, 0) != 2
+        || word(b, 4) != 14814
+        || word(b, 8) != 0
+        || [12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34].map(|at| half(b, at))
+            != [2200, 1125, 1121, 41, 1125, 1092, 1094, 1118, 38, 17, 3, 5]
+        || b[4 + 36..4 + 46] != [0b110, 2, 0b0110, 1, 0b0110, 0, 0, 0, 0, 0]
+    {
+        return TestResult::Fail("FAMS2 base layout");
+    }
+    if half(&on[3], 0) != 27 || on[3][4 + 2..].iter().any(|&x| x != 0) {
+        return TestResult::Fail("FAMS2 legacy sub-state");
+    }
+    // The owner posts the single disabled command, and refuses a chain it
+    // cannot mark pending.
+    let (_pool, mut e) = ready_fams(0x41);
+    let offset = e.io.mailbox + e.io.regs[&(DCN + 0x1d6 * 4)] as usize;
+    if run(e.fams2_update_config(&off)).is_err() || e.io.slot(offset) != golden {
+        return TestResult::Fail("FAMS2 disable posted");
+    }
+    let next = e.io.regs[&(DCN + 0x1d6 * 4)];
+    if run(e.fams2_update_config(&on)) != Err(Error::Unsupported)
+        || e.io.regs[&(DCN + 0x1d6 * 4)] != next
+        || e.mailbox.state != MailboxState::Ready
+    {
+        return TestResult::Fail("FAMS2 chain posted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi48",
+    dmub_navi48_fams2_config_matches_dmub_cmd_layout
+);
