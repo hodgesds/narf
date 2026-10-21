@@ -3192,6 +3192,145 @@ kernel_test_in!(
     smoke_abi_proc2_maps_preserve_loader_image_provenance
 );
 
+/// A scheduler-spawned user task with `count` one-page anonymous VMAs, each
+/// followed by a one-page hole so no two merge. `/proc/<pid>/maps` reads
+/// this task's mm from the scheduler's live registry, the production path,
+/// not the test harness's current-mm lookup.
+fn with_live_maps_task(
+    pid: u64,
+    count: u64,
+    body: impl FnOnce(&str, u64) -> Result<(), &'static str>,
+) -> TestResult {
+    const BASE_VA: u64 = 0x0000_0073_0000_0000;
+    // SAFETY: kernel tests run after paging is enabled. `new_for_user` creates
+    // an inactive user root inheriting only the kernel half.
+    let mm = match unsafe { narf_memory::AddressSpace::new_for_user() } {
+        Ok(mm) => alloc::sync::Arc::new(mm),
+        Err(_) => return TestResult::Fail("AddressSpace::new_for_user failed"),
+    };
+    for i in 0..count {
+        let mapped = mm.map_region(narf_memory::Region {
+            base: narf_memory::VirtAddr::new(BASE_VA + i * 0x2000),
+            len: 0x1000,
+            perms: narf_memory::RegionPerms::READ
+                | narf_memory::RegionPerms::WRITE
+                | narf_memory::RegionPerms::ANON_MERGEABLE,
+            phys: alloc::vec::Vec::new().into(),
+        });
+        if mapped.is_err() {
+            return TestResult::Fail("live-task fixture map_region failed");
+        }
+    }
+    narf_scheduler::__reset_queues_for_test();
+    narf_scheduler::spawn_user(
+        narf_scheduler::TaskId(pid),
+        core::future::pending::<()>(),
+        narf_scheduler::TaskSpec::unthrottled(),
+        mm,
+    );
+    let outcome = with_procfs(pid, "livemaps", &["livemaps"], 1, |base| {
+        // An UNRELATED reader: never the target, never in its thread group,
+        // so the harness's current-mm fallback cannot answer for it.
+        set_task(FAKE_TASK);
+        body(base, BASE_VA)
+    });
+    // Dropping the slot unregisters the live mm.
+    narf_scheduler::__reset_queues_for_test();
+    crate::task::release_task(pid);
+    outcome
+}
+
+/// `/proc/<pid>/maps` of another live process renders that process's mm
+/// (`proc_mem_open` -> `task->mm`). It used to come from a ready-queue scan,
+/// which misses a task while a CPU polls it, while it is staged in a remote
+/// wake inbox, and right after an exec during a poll; each rendered an empty
+/// file, e.g. `cat /proc/1/maps` under systemd.
+fn smoke_abi_proc2_maps_of_live_unrelated_task() -> TestResult {
+    with_live_maps_task(0x5A70, 2, |base, va| {
+        let maps = tg_read(&alloc::format!("{}/{}/maps", base, 0x5A70))?;
+        // Linux width: `seq_put_hex_ll(.., 8)`, a minimum, not 16.
+        let first = alloc::format!("{:08x}-{:08x} rw-p 00000000 00:00 0 \n", va, va + 0x1000);
+        let second = alloc::format!(
+            "{:08x}-{:08x} rw-p 00000000 00:00 0 \n",
+            va + 0x2000,
+            va + 0x3000
+        );
+        if maps.is_empty() {
+            return Err("/proc/<pid>/maps of a live task read back empty");
+        }
+        if !maps.contains(&first) || !maps.contains(&second) {
+            return Err("/proc/<pid>/maps lacked the live task's VMAs");
+        }
+        if maps.find(&first) > maps.find(&second) {
+            return Err("/proc/<pid>/maps not sorted by address");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_maps_of_live_unrelated_task);
+
+/// A maps file larger than one read: successive small `read()`s continue
+/// exactly where the previous one stopped (seq_file `m->index`), across page
+/// boundaries, and end with a zero-length read. Their concatenation is the
+/// whole file, one line per VMA in address order.
+fn smoke_abi_proc2_maps_many_vmas_read_in_pieces() -> TestResult {
+    const PID: u64 = 0x5A71;
+    const COUNT: u64 = 300;
+    with_live_maps_task(PID, COUNT, |base, va| {
+        let path = alloc::format!("{}/{}/maps\0", base, PID);
+        let fd = match call_open(path.as_ptr() as u64, 0) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open of /proc/<pid>/maps failed"),
+        };
+        let mut whole = alloc::vec::Vec::new();
+        let mut chunk = [0u8; 97];
+        let result = loop {
+            match call(
+                Syscall::Read.raw(),
+                a2(fd, chunk.as_mut_ptr() as u64, chunk.len() as u64),
+            ) {
+                Some(0) => break Ok(()),
+                Some(n) if n > 0 => whole.extend_from_slice(&chunk[..n as usize]),
+                _ => break Err("read of /proc/<pid>/maps failed"),
+            }
+            if whole.len() > 256 * 1024 {
+                break Err("/proc/<pid>/maps reads never reached EOF");
+            }
+        };
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        result?;
+        let text = core::str::from_utf8(&whole).map_err(|_| "maps not utf-8")?;
+        if text.len() <= 4096 {
+            return Err("fixture too small to cross a page of maps output");
+        }
+        let mut seen = 0u64;
+        let mut last: Option<u64> = None;
+        for line in text.lines() {
+            let start = line
+                .split('-')
+                .next()
+                .and_then(|h| u64::from_str_radix(h, 16).ok())
+                .ok_or("maps line without a hex start address")?;
+            if last.is_some_and(|prev| start <= prev) {
+                return Err("maps lines out of address order across reads");
+            }
+            last = Some(start);
+            let end = start + 0x1000;
+            if (va..va + COUNT * 0x2000).contains(&start) {
+                if line != alloc::format!("{:08x}-{:08x} rw-p 00000000 00:00 0 ", start, end) {
+                    return Err("a maps line was split or corrupted across reads");
+                }
+                seen += 1;
+            }
+        }
+        if seen != COUNT {
+            return Err("piecewise reads lost or duplicated maps lines");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_maps_many_vmas_read_in_pieces);
+
 const MAPS_FILE_DIR: &[u8] = b"/abi-mapsfile\0";
 const MAPS_FILE: &[u8] = b"/abi-mapsfile/libmaps.so\0";
 const MAPS_FILE_PATH: &str = "/abi-mapsfile/libmaps.so";
