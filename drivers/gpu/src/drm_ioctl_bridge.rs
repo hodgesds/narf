@@ -3050,6 +3050,10 @@ const EDID_PROP_ID: u32 = 0x51;
 const DRM_MODE_OBJECT_CONNECTOR: u32 = 0xc0c0_c0c0;
 const DRM_MODE_OBJECT_CRTC: u32 = 0xcccc_cccc;
 const DRM_MODE_OBJECT_PLANE: u32 = 0xeeee_eeee;
+const DRM_MODE_OBJECT_ENCODER: u32 = 0xe0e0_e0e0;
+const DRM_MODE_OBJECT_FB: u32 = 0xfbfb_fbfb;
+const DRM_MODE_OBJECT_BLOB: u32 = 0xbbbb_bbbb;
+const DRM_MODE_OBJECT_ANY: u32 = 0;
 
 /// Stable blob id carrying a connector's EDID. One blob per connector, derived
 /// from the connector id so GETPROPBLOB can regenerate it statelessly.
@@ -3856,6 +3860,39 @@ fn apply_broadcast_rgb(
     }
 }
 
+/// drm_mode_obj_set_property_ioctl's lookup: `drm_mode_object_find(obj_id,
+/// obj_type)` finds the object by id, of `obj_type` or of any type for
+/// `DRM_MODE_OBJECT_ANY`, else ENOENT (an unknown type matches nothing);
+/// one without properties (an encoder, framebuffer or blob) is EINVAL.
+/// Returns the found object's type: a connector, CRTC or plane.
+fn set_property_object(
+    card: &crate::drm::card::Card,
+    obj_id: u32,
+    obj_type: u32,
+) -> Result<u32, FsError> {
+    let plane = || {
+        crate::drm_native_planes::plane_state(card, obj_id).is_some()
+            || synth_planes(card).iter().any(|(id, _)| *id == obj_id)
+    };
+    let found = [
+        (DRM_MODE_OBJECT_CONNECTOR, card.connector(obj_id).is_ok()),
+        (DRM_MODE_OBJECT_CRTC, card.crtc(obj_id).is_ok()),
+        (DRM_MODE_OBJECT_PLANE, plane()),
+        (DRM_MODE_OBJECT_ENCODER, card.encoder(obj_id).is_ok()),
+        (DRM_MODE_OBJECT_FB, card.framebuffer(obj_id).is_ok()),
+        (DRM_MODE_OBJECT_BLOB, card.property_blob(obj_id).is_some()),
+    ]
+    .into_iter()
+    .find(|&(kind, present)| present && (obj_type == DRM_MODE_OBJECT_ANY || obj_type == kind))
+    .map(|(kind, _)| kind)
+    .ok_or(FsError::NotFound)?;
+    match found {
+        DRM_MODE_OBJECT_CONNECTOR | DRM_MODE_OBJECT_CRTC | DRM_MODE_OBJECT_PLANE => Ok(found),
+        // `!arg_obj->properties`.
+        _ => Err(FsError::InvalidData),
+    }
+}
+
 /// DRM_IOCTL_MODE_SETPROPERTY (`struct drm_mode_connector_set_property`:
 /// value@0, prop_id@8, connector_id@12) and DRM_IOCTL_MODE_OBJ_SETPROPERTY
 /// (`struct drm_mode_obj_set_property`: value@0, prop_id@8, obj_id@12,
@@ -3890,22 +3927,9 @@ fn handle_set_property(
     } else {
         DRM_MODE_OBJECT_CONNECTOR
     };
-    {
+    let obj_type = {
         let card = mode_state.lock();
-        // drm_mode_object_find(obj_id, obj_type): ENOENT for an object
-        // that is not of that type.
-        let known = match obj_type {
-            DRM_MODE_OBJECT_CONNECTOR => card.connector(obj_id).is_ok(),
-            DRM_MODE_OBJECT_CRTC => card.crtc(obj_id).is_ok(),
-            DRM_MODE_OBJECT_PLANE => {
-                crate::drm_native_planes::plane_state(&card, obj_id).is_some()
-                    || synth_planes(&card).iter().any(|(id, _)| *id == obj_id)
-            }
-            _ => return Err(FsError::InvalidData),
-        };
-        if !known {
-            return Err(FsError::NotFound);
-        }
+        let obj_type = set_property_object(&card, obj_id, obj_type)?;
         if atomic_card(&card) {
             drop(card);
             return set_property_atomic(card_index, mode_state, obj_type, obj_id, prop_id, value);
@@ -3914,7 +3938,8 @@ fn handle_set_property(
         if obj_type == DRM_MODE_OBJECT_PLANE {
             return Err(FsError::InvalidData);
         }
-    }
+        obj_type
+    };
     if obj_type == DRM_MODE_OBJECT_CRTC {
         let mut card = mode_state.lock();
         card.crtc(obj_id).map_err(|_| FsError::NotFound)?;

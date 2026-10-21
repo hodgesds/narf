@@ -789,6 +789,21 @@ fn smoke_drm_ioctl_vrr_properties() -> TestResult {
     {
         return TestResult::Fail("invalid VRR set accepted");
     }
+    // drm_mode_object_find: DRM_MODE_OBJECT_ANY finds by id alone; a type
+    // the object is not, or no such type, is ENOENT; an object without
+    // properties (the encoder) is EINVAL.
+    const ENCODER: u32 = 0xe0e0_e0e0;
+    if obj_set(idx, 0, 0x63, 12, 0) != Ok(0)
+        || read(idx, 12, CRTC).and_then(|l| l.last().copied()) != Some((0x63, 0))
+        || obj_set(idx, 1, 0x63, 99, 0) != Err(FsError::NotFound)
+        || obj_set(idx, 1, 0x63, 12, ENCODER) != Err(FsError::NotFound)
+        || obj_set(idx, 1, 0x63, 12, 0x1234) != Err(FsError::NotFound)
+        || obj_set(idx, 1, 0x63, 21, 0) != Err(FsError::InvalidData)
+        || obj_set(idx, 1, 0x63, 21, ENCODER) != Err(FsError::InvalidData)
+        || obj_set(idx, 1, 0x63, 12, 0) != Ok(0)
+    {
+        return TestResult::Fail("OBJ_SETPROPERTY object lookup");
+    }
     // Legacy connector SETPROPERTY never reaches a CRTC property.
     let mut b = [0u8; 16];
     b[0..8].copy_from_slice(&0u64.to_le_bytes());

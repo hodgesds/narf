@@ -4180,7 +4180,11 @@ VRR_ENABLED is set by DRM_MASTER through OBJ_SETPROPERTY on a CRTC (an
 atomic driver's legacy path; connector SETPROPERTY never reaches it) or an
 atomic commit (no ALLOW_MODESET needed; TEST_ONLY applies nothing). Values
 above 1 and CRTCs without the property are EINVAL, vrr_capable is
-immutable (EINVAL), unknown objects ENOENT. As in Linux, enabling VRR on a
+immutable (EINVAL), unknown objects ENOENT. OBJ_SETPROPERTY finds its
+object as drm_mode_object_find does: by id, of the given type or of any type
+for `DRM_MODE_OBJECT_ANY` (0); a type the object is not, or no such type,
+is ENOENT, and an object without properties (encoder, framebuffer, blob)
+EINVAL. As in Linux, enabling VRR on a
 sink or mode that cannot vary is accepted and the display stays fixed.
 A committed value goes to `amdgpu_native_kms::request_vrr_enabled` after the
 card lock is released (Navi22 ignores it), then
