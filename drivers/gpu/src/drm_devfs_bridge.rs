@@ -448,6 +448,22 @@ impl FileOps for DriCardFile {
             {
                 return result;
             }
+            // Dumb buffers in this open's GEM table (VRAM ones on Navi48).
+            if let Some(result) =
+                crate::drm_ioctl_bridge::amdgpu_dumb(self.index, cmd, arg, &self.amdgpu_gem)
+            {
+                return result;
+            }
+            // A legacy cursor of one of them.
+            if let Some(result) = crate::drm_ioctl_bridge::amdgpu_cursor_bo(
+                self.index,
+                self.open_id,
+                cmd,
+                arg,
+                &self.amdgpu_gem,
+            ) {
+                return result;
+            }
             // A framebuffer of one of this open's amdgpu GEM buffers.
             if let Some(result) = crate::drm_ioctl_bridge::amdgpu_addfb2_bo(
                 self.index,
@@ -581,6 +597,19 @@ impl FileOps for DriCardFile {
                 {
                     return result;
                 }
+                if let Some(result) = crate::drm_ioctl_bridge::amdgpu_create_dumb_async(
+                    self.index,
+                    cmd,
+                    arg as usize,
+                    &self.amdgpu_gem,
+                )
+                .await
+                {
+                    return result;
+                }
+                // prepare_fb's migration back to VRAM, before the commit pins.
+                crate::drm_ioctl_bridge::amdgpu_prepare_scanout(self.index, self.open_id, cmd)
+                    .await;
                 if let Some(result) = crate::amdgpu_vm::dispatch_async(
                     cmd,
                     arg as usize,

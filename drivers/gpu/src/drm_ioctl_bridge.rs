@@ -5447,6 +5447,7 @@ fn handle_cursor(
                 size: (rd_u32(16), rd_u32(20)),
                 handle,
             },
+            None,
         );
     }
     // CURSOR2 reports the hotspot — the active point inside the BO. Our
@@ -5489,11 +5490,15 @@ struct LegacyCursor {
 /// wrapped around the BO (drm_internal_framebuffer_create: ARGB8888, pitch
 /// width * 4) at the new position or the CRTC's last legacy one, or goes
 /// off, through the cursor plane's atomic checks (`__setplane_atomic`).
+/// `bo` is the amdgpu GEM buffer `req.handle` names in the caller's own
+/// table (`amdgpu_cursor_bo`), wrapped by `Card::addfb2_bo`; without it the
+/// handle is one of the card's dumb buffers.
 fn cursor_universal(
     card_index: u32,
     mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
     ctx: &DrmFileCtx,
     req: LegacyCursor,
+    bo: Option<Arc<crate::amdgpu_gem::GemObject>>,
 ) -> Result<u64, FsError> {
     const DRM_MODE_CURSOR_BO: u32 = 0x01;
     const DRM_MODE_CURSOR_MOVE: u32 = 0x02;
@@ -5523,7 +5528,14 @@ fn cursor_universal(
             };
             cmd.handles[0] = req.handle;
             cmd.pitches[0] = req.size.0.wrapping_mul(4);
-            let id = card.addfb2_cmd(&cmd).map_err(|e| match e {
+            // An internal framebuffer: no open's drm_fb_release removes it.
+            let id = match bo {
+                Some(object) => {
+                    card.addfb2_bo(&cmd, object, crate::drm_devfs_bridge::NO_MASTER_OPEN_ID)
+                }
+                None => card.addfb2_cmd(&cmd),
+            }
+            .map_err(|e| match e {
                 crate::drm::card::CardError::BadGemHandle => FsError::NotFound,
                 _ => FsError::InvalidData,
             })?;
@@ -5692,18 +5704,13 @@ fn handle_create_dumb(
     // The native amdgpu card pads lines as amdgpu_mode_dumb_create does
     // (amdgpu_gem_align_pitch: a 256-byte multiple for 1-4 bytes per pixel),
     // which its ADDFB2's LINEAR pitch check (amdgpu_display_verify_sizes)
-    // requires; other cards keep packed lines.
+    // requires; other cards keep packed lines. (With its VRAM heap up, that
+    // card's opens make VRAM buffers instead: `amdgpu_dumb`.)
     let pitch = if mode_state.lock().gfx12_modifiers {
-        let mask = match bpp_bytes {
-            1 => 255,
-            2 => 127,
-            3 | 4 => 63,
-            _ => 0,
-        };
-        req.width
-            .checked_add(mask)
-            .and_then(|w| (w & !mask).checked_mul(bpp_bytes))
-            .ok_or(FsError::InvalidData)?
+        match crate::amdgpu_gem::align_pitch(req.width, bpp_bytes) {
+            0 => return Err(FsError::InvalidData),
+            pitch => pitch,
+        }
     } else {
         req.width * bpp_bytes
     };
@@ -7147,6 +7154,206 @@ pub fn amdgpu_addfb2_bo(
         // SAFETY: as above; fb_id is the struct's first u32.
         unsafe { copy_out(arg, &id.to_le_bytes()) }.map(|()| 0)
     }))
+}
+
+/// Whether CREATE_DUMB on DRM card `card_index` makes an amdgpu GEM buffer
+/// in VRAM (`amdgpu_mode_dumb_create`): the native Navi48 card, once its
+/// client VRAM heap is up. Other cards, and the Navi48 card without a heap
+/// (before bring-up, while suspended or recovering), keep the card's
+/// system-memory dumb buffers.
+fn amdgpu_vram_dumb(card_index: u32) -> bool {
+    crate::drm_registry::mode_state(card_index).is_some_and(|m| m.lock().gfx12_modifiers)
+        && crate::amdgpu_gem::vram_heap_usage(card_index).is_some()
+}
+
+/// CREATE_DUMB's `struct drm_mode_create_dumb` at `arg`, filled in with the
+/// `(handle, pitch, size)` of `made` on success. `NoSpace` is ENOMEM, as
+/// amdgpu_mode_dumb_create returns it.
+fn finish_amdgpu_dumb(
+    arg: usize,
+    req: DrmModeCreateDumbUapi,
+    made: Result<(u32, u32, u64), FsError>,
+) -> Result<u64, FsError> {
+    let (handle, pitch, size) = made.map_err(|e| match e {
+        FsError::NoSpace | FsError::NoDevice => FsError::OutOfMemory,
+        e => e,
+    })?;
+    let out = DrmModeCreateDumbUapi {
+        handle,
+        pitch,
+        size,
+        ..req
+    };
+    // SAFETY: DrmModeCreateDumbUapi is #[repr(C)] POD of 32 bytes.
+    let bytes: [u8; 32] = unsafe { core::mem::transmute(out) };
+    // SAFETY: `arg` is the ioctl pointer, 32 bytes as copied in.
+    unsafe { copy_out(arg, &bytes) }.map(|()| 0)
+}
+
+/// `struct drm_mode_create_dumb` at `arg`.
+fn read_create_dumb(arg: usize) -> Result<DrmModeCreateDumbUapi, FsError> {
+    // SAFETY: `arg` is the ioctl pointer; copy_in bounds-checks.
+    let bytes = unsafe { copy_in(arg, core::mem::size_of::<DrmModeCreateDumbUapi>())? };
+    // SAFETY: `bytes` holds exactly one repr(C) POD struct.
+    Ok(unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DrmModeCreateDumbUapi) })
+}
+
+/// The dumb-buffer ioctls of an amdgpu card open whose GEM table is `gem`
+/// (drm_mode_create_dumb / drm_mode_mmap_dumb_ioctl / drm_mode_destroy_dumb
+/// on Linux's one per-file handle space):
+/// - CREATE_DUMB on the Navi48 card ([`amdgpu_vram_dumb`]) is
+///   `GemState::create_dumb`: a VRAM buffer in the open's own table, which
+///   ADDFB2 then scans out in place (`amdgpu_addfb2_bo`);
+/// - MAP_DUMB and DESTROY_DUMB of one of the open's amdgpu GEM handles, on
+///   any amdgpu card, are amdgpu_mode_dumb_mmap (the GEM_MMAP offset) and
+///   drm_gem_handle_delete.
+///
+/// `None` for another ioctl, another card, or a handle the open's table
+/// does not hold: the card's dumb-buffer table answers those as before.
+pub fn amdgpu_dumb(
+    card_index: u32,
+    cmd: u32,
+    arg: usize,
+    gem: &crate::amdgpu_gem::GemState,
+) -> Option<Result<u64, FsError>> {
+    if arg == 0 {
+        return None;
+    }
+    match cmd {
+        drm_uapi::DRM_IOCTL_MODE_CREATE_DUMB if amdgpu_vram_dumb(card_index) => {
+            Some(read_create_dumb(arg).and_then(|req| {
+                finish_amdgpu_dumb(arg, req, gem.create_dumb(req.width, req.height, req.bpp))
+            }))
+        }
+        drm_uapi::DRM_IOCTL_MODE_MAP_DUMB => {
+            // SAFETY: `arg` is the ioctl pointer; drm_mode_map_dumb is 16 bytes.
+            let mut b = match unsafe { copy_in(arg, 16) } {
+                Ok(b) => b,
+                Err(e) => return Some(Err(e)),
+            };
+            let handle = u32::from_le_bytes(b[0..4].try_into().unwrap());
+            let offset = match gem.map_dumb(handle)? {
+                Ok(offset) => offset,
+                Err(e) => return Some(Err(e)),
+            };
+            b[8..16].copy_from_slice(&offset.to_le_bytes());
+            // SAFETY: as above.
+            Some(unsafe { copy_out(arg, &b) }.map(|()| 0))
+        }
+        drm_uapi::DRM_IOCTL_MODE_DESTROY_DUMB => {
+            // SAFETY: `arg` is the ioctl pointer; drm_mode_destroy_dumb is 4 bytes.
+            let b = match unsafe { copy_in(arg, 4) } {
+                Ok(b) => b,
+                Err(e) => return Some(Err(e)),
+            };
+            gem.destroy_dumb(u32::from_le_bytes(b[0..4].try_into().unwrap()))
+                .then_some(Ok(0))
+        }
+        _ => None,
+    }
+}
+
+/// CREATE_DUMB from a user open of the Navi48 card, which may sleep: when
+/// visible VRAM is full, TTM's eviction (`amdgpu_gem::create_dumb_async`)
+/// before ENOMEM. `None` where [`amdgpu_dumb`] answers `None`.
+pub async fn amdgpu_create_dumb_async(
+    card_index: u32,
+    cmd: u32,
+    arg: usize,
+    gem: &crate::amdgpu_gem::GemState,
+) -> Option<Result<u64, FsError>> {
+    if cmd != drm_uapi::DRM_IOCTL_MODE_CREATE_DUMB || arg == 0 || !amdgpu_vram_dumb(card_index) {
+        return None;
+    }
+    let req = match read_create_dumb(arg) {
+        Ok(req) => req,
+        Err(e) => return Some(Err(e)),
+    };
+    let made = crate::amdgpu_gem::create_dumb_async(gem, req.width, req.height, req.bpp).await;
+    Some(finish_amdgpu_dumb(arg, req, made))
+}
+
+/// Before a SETCRTC, PAGE_FLIP, SETPLANE or atomic commit on the Navi48
+/// card from open `open_id`: amdgpu_dm_plane_helper_prepare_fb's pin
+/// validation for the GEM buffers of the open's framebuffers, which may
+/// sleep. Each that left VRAM (suspend's eviction, or eviction for another
+/// allocation) and is not pinned moves back, mapped or not
+/// (`amdgpu_gem::prepare_scanout`), so the commit's pin finds it in VRAM
+/// and scans it out in place.
+pub async fn amdgpu_prepare_scanout(card_index: u32, open_id: u64, cmd: u32) {
+    if (cmd >> 8) & 0xff != u32::from(b'd')
+        || !matches!(drm_uapi::ioc_nr(cmd), 0xA2 | 0xB0 | 0xB7 | 0xBC)
+    {
+        return;
+    }
+    let Some(mode_state) = crate::drm_registry::mode_state(card_index) else {
+        return;
+    };
+    let objects: Vec<_> = {
+        let card = mode_state.lock();
+        if !card.gfx12_modifiers {
+            return;
+        }
+        card.framebuffers
+            .iter()
+            .filter_map(|fb| fb.bo.as_ref())
+            .filter(|bo| bo.owner == open_id && bo.object.system())
+            .map(|bo| Arc::clone(&bo.object))
+            .collect()
+    };
+    crate::amdgpu_gem::prepare_scanout(card_index, objects).await;
+}
+
+/// DRM_IOCTL_MODE_CURSOR{,2} with DRM_MODE_CURSOR_BO on the Navi48 card
+/// naming one of open `open_id`'s amdgpu GEM handles (a dumb buffer from
+/// CREATE_DUMB, say): drm_mode_cursor_universal wraps the buffer itself
+/// (drm_internal_framebuffer_create's lookup in the file's table), as
+/// `Card::addfb2_bo`. `None` for another ioctl, card or handle.
+pub fn amdgpu_cursor_bo(
+    card_index: u32,
+    open_id: u64,
+    cmd: u32,
+    arg: usize,
+    gem: &crate::amdgpu_gem::GemState,
+) -> Option<Result<u64, FsError>> {
+    const DRM_MODE_CURSOR_BO: u32 = 0x01;
+    let nr = drm_uapi::ioc_nr(cmd);
+    if (cmd >> 8) & 0xff != u32::from(b'd') || !matches!(nr, 0xA3 | 0xBB) || arg == 0 {
+        return None;
+    }
+    let mode_state = crate::drm_registry::mode_state(card_index)?;
+    {
+        let card = mode_state.lock();
+        if !card.gfx12_modifiers || card.native_planes.is_empty() {
+            return None;
+        }
+    }
+    let want = if nr == 0xBB { 36 } else { 28 };
+    // SAFETY: `arg` is the ioctl pointer; copy_in bounds-checks `want`.
+    let bytes = match unsafe { copy_in(arg, want) } {
+        Ok(b) => b,
+        Err(e) => return Some(Err(e)),
+    };
+    let rd = |off: usize| u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+    let (flags, handle) = (rd(0), rd(24));
+    if flags & DRM_MODE_CURSOR_BO == 0 || handle == 0 || !gem.owns(handle) {
+        return None;
+    }
+    let object = gem.object(handle)?;
+    let ctx = DrmFileCtx::primary(mode_state.lock().is_master(open_id));
+    Some(cursor_universal(
+        card_index,
+        &mode_state,
+        &ctx,
+        LegacyCursor {
+            flags,
+            crtc_id: rd(4),
+            position: (rd(8) as i32, rd(12) as i32),
+            size: (rd(16), rd(20)),
+            handle,
+        },
+        Some(object),
+    ))
 }
 
 /// `struct drm_version` for the amdgpu driver: `amdgpu`, `20150101`,

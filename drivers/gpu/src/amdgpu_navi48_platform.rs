@@ -3802,12 +3802,14 @@ fn present_slot(display: u8) -> &'static PresentSlot {
 /// fourcc, each plane's offset (a 4:2:0 framebuffer's chroma plane at
 /// `offsets[1]` with `chroma_pitch`) and its modifier. A pinned buffer is
 /// scanned out in place (`external`), as amdgpu_dm hands DC the
-/// framebuffer's address: no copy. A dumb buffer lives in system memory,
-/// which display fetch on this dGPU never reads
-/// (amdgpu_display_supported_domains is VRAM alone), so the presenter
-/// copies it into the plane's staged VRAM back buffer, as amdgpu_bo_pin
-/// would migrate it: a linear RGB plane's source rectangle, a tiled or
-/// 4:2:0 one whole.
+/// framebuffer's address: no copy. Dumb buffers are such GEM buffers in
+/// VRAM once the card's client heap is up (amdgpu_mode_dumb_create:
+/// `drm_ioctl_bridge::amdgpu_dumb`). A dumb buffer of the card's own table
+/// (`phys`, made while no heap was up) lives in system memory, which
+/// display fetch on this dGPU never reads (amdgpu_display_supported_domains
+/// is VRAM alone), so the presenter copies it into the plane's staged VRAM
+/// back buffer, as amdgpu_bo_pin would migrate it: a linear RGB plane's
+/// source rectangle, a tiled or 4:2:0 one whole.
 #[derive(Clone, Debug)]
 pub struct PlaneFrame {
     pub phys: u64,
