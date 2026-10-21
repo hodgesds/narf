@@ -837,7 +837,7 @@ impl Surfaces {
                 line_buffer_config: super::dpp::line_buffer_config(s.request)?,
                 coef_ram: Default::default(),
                 pending: 0,
-                post_csc_b: false,
+                post_csc_b: Default::default(),
             };
             let at = usize::from(s.request.pipe);
             live.push(LivePlane {

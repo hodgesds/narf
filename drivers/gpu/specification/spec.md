@@ -4637,8 +4637,9 @@ for 4:2:0, CM_POST_CSC with the color space's dpp_input_csc_matrix
 cm_helper_program_color_matrices' packing), double-buffered as
 dpp3_program_post_csc does it: the matrix goes into the coefficient set not
 in use (B, CM_POST_CSC_B_* with COMA selected, when
-CM_POST_CSC_MODE_CURRENT reads A; A otherwise: `dpp::post_csc_set_b`),
-recorded in `DppApplied::post_csc_b`, so a live color-space change latches
+that DPP's own CM_POST_CSC_MODE_CURRENT reads A; A otherwise:
+`dpp::post_csc_set_b`, chosen per segment DPP as each runs its own setup),
+recorded per segment in `DppApplied::post_csc_b` (`dpp::PostCscSets`), so a live color-space change latches
 whole at VUPDATE. SPL takes `spl::Video`
 (SPL_PIXEL_FORMAT_420BPP8/10): chroma ratios/viewports/inits/taps, the 420
 SCL modes, chroma coefficient loads, EASF's video rules, LB config 3; a 4:2:0

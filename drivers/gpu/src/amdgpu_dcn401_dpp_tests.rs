@@ -669,7 +669,7 @@ fn dcn401_dpp_input_csc_takes_the_set_not_in_use() -> TestResult {
     let words =
         crate::amdgpu_dcn401_otg::fetch::post_csc_words(SurfaceFormat::Nv12, YuvColor::Bt709)
             .unwrap();
-    if !applied.post_csc_b
+    if !applied.post_csc_b.b(0)
         || reg(&mut e, 0xd68) & 3 != 2
         || reg(&mut e, 0xd69) != 0xdead_beef & !0x8000_0000
         || (0..6).any(|i| reg(&mut e, 0xd6f + i) != words[i as usize] & !0x8000_0000)
@@ -683,6 +683,45 @@ fn dcn401_dpp_input_csc_takes_the_set_not_in_use() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-dpp",
     dcn401_dpp_input_csc_takes_the_set_not_in_use
+);
+
+/// dpp3_program_post_csc runs on each segment's own DPP and reads that
+/// DPP's CM_POST_CSC_MODE_CURRENT: an ODM-split NV12 plane whose first DPP
+/// uses set A and whose second uses set B loads B on the first and A on the
+/// second; an RGB plane takes A everywhere.
+fn dcn401_dpp_input_csc_set_is_chosen_per_dpp() -> TestResult {
+    use crate::amdgpu_dcn401_otg::SplitPipes;
+    let mut e = crate::amdgpu_dcn401_otg::tests::engine();
+    let request = |format| SurfaceRequest {
+        pipe: 0,
+        width: 64,
+        height: 32,
+        format,
+        odm: SplitPipes::one(1),
+        mpc: SplitPipes::NONE,
+        plane: None,
+        surface: Default::default(),
+    };
+    // CM_POST_CSC_MODE_CURRENT: ICSC (A) on DPP 0, COMA (B) on DPP 1.
+    e.io.regs.insert(d(0, 0xd68), 1 << 2);
+    e.io.regs.insert(d(1, 0xd68), 2 << 2);
+    let Ok(sets) = e.post_csc_choice(request(SurfaceFormat::Nv12)) else {
+        return TestResult::Fail("NV12 choice");
+    };
+    if !sets.b(0) || sets.b(1) {
+        return TestResult::Fail("NV12 segments share the first DPP's set");
+    }
+    let Ok(sets) = e.post_csc_choice(request(SurfaceFormat::Xrgb8888)) else {
+        return TestResult::Fail("RGB choice");
+    };
+    if sets.b(0) || sets.b(1) {
+        return TestResult::Fail("RGB loads set B");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dpp",
+    dcn401_dpp_input_csc_set_is_chosen_per_dpp
 );
 
 /// An NV12 plane stages dpp401_dpp_setup's VIDEO_420 CNVC format and the

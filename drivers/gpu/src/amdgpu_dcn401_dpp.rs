@@ -49,10 +49,26 @@ pub struct DppApplied {
     /// CNVC, scaler and CM pending bits, respectively. Timing is stopped, so
     /// staged programming may remain pending; zero is not presentation evidence.
     pub pending: u8,
-    /// A YCbCr plane's input CSC is in coefficient set B
-    /// (INPUT_CSC_SELECT_COMA, CM_POST_CSC_B_*), not A (ICSC): the set that
-    /// was not in use when the DPP was last set up.
-    pub post_csc_b: bool,
+    /// Per segment, whether a YCbCr plane's input CSC is in coefficient
+    /// set B (INPUT_CSC_SELECT_COMA, CM_POST_CSC_B_*), not A (ICSC): the set
+    /// that segment's DPP was not using when it was last set up.
+    pub post_csc_b: PostCscSets,
+}
+/// Each segment DPP's input CSC coefficient set (bit `i`: segment `i` in
+/// set B), as dpp3_program_post_csc chooses it from that DPP's own
+/// CM_POST_CSC_MODE_CURRENT.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PostCscSets(u8);
+impl PostCscSets {
+    /// Whether segment `i` loads set B.
+    pub fn b(self, i: usize) -> bool {
+        self.0.checked_shr(i as u32).unwrap_or(0) & 1 != 0
+    }
+    fn set(&mut self, i: usize, b: bool) {
+        if i < 8 {
+            self.0 = self.0 & !(1 << i) | u8::from(b) << i;
+        }
+    }
 }
 /// Each segment's SCL_COEF_RAM_SELECT after its coefficient load (none
 /// for a segment that bypasses the scaler), for up to four segments in
@@ -115,16 +131,16 @@ pub(in crate::amdgpu_dcn401_otg) const fn post_csc_set_b(current: u32) -> bool {
 /// CUR_MATRIX_BYPASS (the whole register 0), for RGB and YCbCr planes
 /// alike. The cursor over a YCbCr plane takes no matrix on DCN 4.0.1.
 pub(in crate::amdgpu_dcn401_otg) const CURSOR_MATRIX_WORD: u32 = 0;
-/// The CNVC and CM state of `format`: dpp401_dpp_setup's crossbar and
-/// pixel format, and every color block in bypass but a 4:2:0 plane's post
-/// CSC: dpp3_program_post_csc loads its color space's matrix into the set
-/// not in use (A on a pipe staged from bypass) as
+/// The CNVC and CM state of `format` on segment `i`'s DPP: dpp401_dpp_setup's
+/// crossbar and pixel format, and every color block in bypass but a 4:2:0
+/// plane's post CSC: dpp3_program_post_csc loads its color space's matrix
+/// into the set that DPP is not using (A on a pipe staged from bypass) as
 /// cm_helper_program_color_matrices packs it (C11 low, C12 high, ...) and
-/// selects it (CM_POST_CSC_MODE 1, INPUT_CSC_SELECT_ICSC).
-fn cnvc_cm(a: DppApplied) -> alloc::vec::Vec<(u64, u32, u32)> {
+/// selects it (CM_POST_CSC_MODE 1, INPUT_CSC_SELECT_ICSC, or 2, COMA).
+fn cnvc_cm(a: DppApplied, i: usize) -> alloc::vec::Vec<(u64, u32, u32)> {
     let format = a.surface.request.format;
     let csc = post_csc_words(format, a.surface.request.surface.color);
-    let (base, select) = if a.post_csc_b {
+    let (base, select) = if a.post_csc_b.b(i) {
         (POST_CSC_B_C11_C12, 2)
     } else {
         (POST_CSC_C11_C12, 1)
@@ -230,7 +246,9 @@ impl<I: Io> Engine<I> {
         let mut coef_ram = CoefRam::default();
         let alpha = applied.surface.request.layout().blend.per_pixel_alpha;
         for (i, (p, scaler)) in applied.surface.request.scalers().enumerate() {
-            let select = self.program_segment_dpp(applied, p, &scaler, alpha).await?;
+            let select = self
+                .program_segment_dpp(applied, i, p, &scaler, alpha)
+                .await?;
             coef_ram.set(i, select);
         }
         Ok(coef_ram)
@@ -238,6 +256,7 @@ impl<I: Io> Engine<I> {
     async fn program_segment_dpp(
         &mut self,
         applied: DppApplied,
+        i: usize,
         p: u8,
         scaler: &spl::Scaler,
         alpha: bool,
@@ -249,7 +268,7 @@ impl<I: Io> Engine<I> {
         self.wait(l.dpp(p, SCALER_STATUS), 3, 0, 1000).await?;
         self.hubp_tree_stopped(Some(p))?;
         self.dpp_stopped(p, true)?;
-        for (r, mask, value) in cnvc_cm(applied) {
+        for (r, mask, value) in cnvc_cm(applied, i) {
             self.update(l.dpp(p, r), mask, value)?;
         }
         let mut coef_ram = None;
@@ -320,7 +339,7 @@ impl<I: Io> Engine<I> {
             }
             self.update(l.dpp(p, SCALER_POWER), 7, 4)?;
             self.wait(l.dpp(p, SCALER_STATUS), 3, 0, 1000).await?;
-            for (r, mask, value) in cnvc_cm(applied) {
+            for (r, mask, value) in cnvc_cm(applied, i) {
                 self.update(l.dpp(p, r), mask, value)?;
             }
             for op in dscl::program(&scaler, alpha) {
@@ -365,16 +384,22 @@ impl<I: Io> Engine<I> {
         Ok(coef_ram)
     }
     /// The coefficient set dpp3_program_post_csc loads a plane's input CSC
-    /// into: the one its first segment's DPP is not using (every segment
-    /// is set up together, so they agree). Always A for RGB, whose CSC is
-    /// bypassed.
-    fn post_csc_choice(&mut self, surface: SurfaceRequest) -> Result<bool, Error> {
+    /// into on each segment: the one that segment's own DPP is not using
+    /// (each DPP reads its CM_POST_CSC_MODE_CURRENT). Always A for RGB, whose
+    /// CSC is bypassed.
+    pub(in crate::amdgpu_dcn401_otg) fn post_csc_choice(
+        &mut self,
+        surface: SurfaceRequest,
+    ) -> Result<PostCscSets, Error> {
+        let mut sets = PostCscSets::default();
         if !surface.format.is_video() {
-            return Ok(false);
+            return Ok(sets);
         }
-        let (p, _, _) = surface.segments().next().ok_or(Error::Invalid)?;
-        let current = (self.read(self.layout.dpp(p, POST_CSC))? & POST_CSC_CURRENT) >> 2;
-        Ok(post_csc_set_b(current))
+        for (i, (p, _, _)) in surface.segments().enumerate() {
+            let current = (self.read(self.layout.dpp(p, POST_CSC))? & POST_CSC_CURRENT) >> 2;
+            sets.set(i, post_csc_set_b(current));
+        }
+        Ok(sets)
     }
     pub(super) fn verify_dpp(&mut self, applied: DppApplied) -> Result<(), Error> {
         let alpha = applied.surface.request.layout().blend.per_pixel_alpha;
@@ -387,7 +412,7 @@ impl<I: Io> Engine<I> {
                     u32::from(select) << 8,
                 )
             });
-            for (r, mask, value) in cnvc_cm(applied)
+            for (r, mask, value) in cnvc_cm(applied, i)
                 .into_iter()
                 .chain(dscl_state(&scaler, alpha))
                 .chain(coef)
@@ -512,7 +537,7 @@ impl Surfaces {
             line_buffer_config: first.lb_memory_config(alpha) as u8,
             coef_ram: CoefRam::default(),
             pending: 0,
-            post_csc_b: false,
+            post_csc_b: Default::default(),
         };
         e.hubp_tree_stopped(Some(pipe))?;
         e.verify_surface(surface.applied)?;
