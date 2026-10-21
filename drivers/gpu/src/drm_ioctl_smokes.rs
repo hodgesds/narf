@@ -948,6 +948,19 @@ fn color_obj_set(idx: u32, value: u64, prop: u32, obj: u32, kind: u32) -> Result
         false,
     )
 }
+/// The legacy connector-only DRM_IOCTL_MODE_SETPROPERTY.
+fn legacy_set(idx: u32, value: u64, prop: u32, connector: u32) -> Result<u64, FsError> {
+    let mut b = [0u8; 16];
+    b[0..8].copy_from_slice(&value.to_le_bytes());
+    b[8..12].copy_from_slice(&prop.to_le_bytes());
+    b[12..16].copy_from_slice(&connector.to_le_bytes());
+    dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xAB, 16),
+        b.as_mut_ptr() as usize,
+        false,
+    )
+}
 fn color_blob(idx: u32, data: &[u8]) -> u32 {
     let mut b = [0u8; 16];
     b[0..8].copy_from_slice(&(data.as_ptr() as u64).to_le_bytes());
@@ -1318,8 +1331,9 @@ kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_legacy_gamma);
 
 /// Connector Colorspace and HDR_OUTPUT_METADATA: listed with the
 /// connector, values validated, a Colorspace change or entering/leaving
-/// HDR on a driven connector needs ALLOW_MODESET (EINVAL through the legacy
-/// setters), a metadata change while in HDR does not, and only blobs of
+/// HDR on a driven connector needs ALLOW_MODESET in an atomic request
+/// while OBJ_SETPROPERTY commits it (set_property_atomic allows modesets),
+/// a metadata change while in HDR is no modeset, and only blobs of
 /// sizeof(struct hdr_output_metadata) are taken.
 fn smoke_drm_ioctl_connector_hdr_properties() -> TestResult {
     let Some(idx) = color_card() else {
@@ -1352,11 +1366,16 @@ fn smoke_drm_ioctl_connector_hdr_properties() -> TestResult {
     // Colorspace: enum values only; a modeset on the driven connector.
     if atomic(ALLOW_MODESET, &[0x67], &[1]) != Err(FsError::InvalidData)
         || atomic(0, &[0x67], &[9]) != Err(FsError::InvalidData)
-        || color_obj_set(idx, 9, 0x67, 31, COLOR_CONNECTOR) != Err(FsError::InvalidData)
+        || color_obj_set(idx, 1, 0x67, 31, COLOR_CONNECTOR) != Err(FsError::InvalidData)
         || atomic(ALLOW_MODESET, &[0x67], &[9]) != Ok(0)
         || color_prop(idx, 31, COLOR_CONNECTOR, 0x67) != Some(9)
         // Unchanged is no modeset.
         || atomic(0, &[0x67], &[9]) != Ok(0)
+        // OBJ_SETPROPERTY and SETPROPERTY make the modeset.
+        || color_obj_set(idx, 0, 0x67, 31, COLOR_CONNECTOR) != Ok(0)
+        || color_prop(idx, 31, COLOR_CONNECTOR, 0x67) != Some(0)
+        || legacy_set(idx, 9, 0x67, 31) != Ok(0)
+        || color_prop(idx, 31, COLOR_CONNECTOR, 0x67) != Some(9)
     {
         return TestResult::Fail("Colorspace");
     }
@@ -1373,9 +1392,15 @@ fn smoke_drm_ioctl_connector_hdr_properties() -> TestResult {
     let other_type = color_blob(idx, &hdr);
     let short = color_blob(idx, &hdr[..30]);
     if atomic(ALLOW_MODESET, &[0x68], &[u64::from(short)]) != Err(FsError::InvalidData)
+        || color_obj_set(idx, u64::from(short), 0x68, 31, COLOR_CONNECTOR)
+            != Err(FsError::InvalidData)
         || atomic(0, &[0x68], &[u64::from(pq)]) != Err(FsError::InvalidData)
-        || color_obj_set(idx, u64::from(pq), 0x68, 31, COLOR_CONNECTOR) != Err(FsError::InvalidData)
         || atomic(ALLOW_MODESET, &[0x68], &[u64::from(pq)]) != Ok(0)
+        || color_prop(idx, 31, COLOR_CONNECTOR, 0x68) != Some(u64::from(pq))
+        // Leaving and re-entering HDR through OBJ_SETPROPERTY: modesets.
+        || color_obj_set(idx, 0, 0x68, 31, COLOR_CONNECTOR) != Ok(0)
+        || color_prop(idx, 31, COLOR_CONNECTOR, 0x68) != Some(0)
+        || color_obj_set(idx, u64::from(pq), 0x68, 31, COLOR_CONNECTOR) != Ok(0)
         || color_prop(idx, 31, COLOR_CONNECTOR, 0x68) != Some(u64::from(pq))
     {
         return TestResult::Fail("entering HDR");
@@ -1558,6 +1583,53 @@ fn smoke_drm_ioctl_connector_max_bpc() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_connector_max_bpc);
+
+/// OBJ_SETPROPERTY on an atomic card is set_property_atomic for every
+/// property an object carries, modesets allowed: CRTC ACTIVE turns a CRTC
+/// on and off, a connector's CRTC_ID routes it, and an OUT_FENCE_PTR gets
+/// -1 (drm_atomic_crtc_set_property) with no fence; an object of another
+/// type is ENOENT. A legacy card has none of these settable (EINVAL).
+fn smoke_drm_ioctl_obj_setproperty_modesets() -> TestResult {
+    let idx = register_test_virtio_card();
+    let Some(ms) = crate::drm_registry::mode_state(idx) else {
+        return TestResult::Fail("no mode state");
+    };
+    if color_obj_set(idx, 1, 0x52, 11, COLOR_CRTC) != Ok(0) || !ms.lock().crtcs[0].enabled {
+        return TestResult::Fail("ACTIVE on");
+    }
+    if color_obj_set(idx, 0, 0x52, 11, COLOR_CRTC) != Ok(0) || ms.lock().crtcs[0].enabled {
+        return TestResult::Fail("ACTIVE off");
+    }
+    if color_obj_set(idx, 2, 0x52, 11, COLOR_CRTC) != Err(FsError::InvalidData)
+        || color_obj_set(idx, 1, 0x52, 31, COLOR_CRTC) != Err(FsError::NotFound)
+        || color_obj_set(idx, 1, 0x52, 11, COLOR_CONNECTOR) != Err(FsError::NotFound)
+    {
+        return TestResult::Fail("ACTIVE refusals");
+    }
+    let mut fence = 0i32;
+    if color_obj_set(idx, &mut fence as *mut i32 as u64, 0x60, 11, COLOR_CRTC) != Ok(0)
+        || fence != -1
+    {
+        return TestResult::Fail("OUT_FENCE_PTR");
+    }
+    if color_obj_set(idx, 12, 0x54, 31, COLOR_CONNECTOR) != Ok(0)
+        || legacy_set(idx, 0, 0x54, 31) != Ok(0)
+    {
+        return TestResult::Fail("connector CRTC_ID");
+    }
+    // set_property_legacy on a bochs card: no ACTIVE, CRTC_ID or plane.
+    let legacy = register_test_card();
+    if color_obj_set(legacy, 1, 0x52, 11, COLOR_CRTC) != Err(FsError::InvalidData)
+        || color_obj_set(legacy, 12, 0x54, 31, COLOR_CONNECTOR) != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("legacy card");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_ioctl_obj_setproperty_modesets
+);
 
 // ── 6. Render-node fd rejects SETCRTC with PermissionDenied ────────────
 

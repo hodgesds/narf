@@ -3859,17 +3859,17 @@ fn apply_broadcast_rgb(
 /// DRM_IOCTL_MODE_SETPROPERTY (`struct drm_mode_connector_set_property`:
 /// value@0, prop_id@8, connector_id@12) and DRM_IOCTL_MODE_OBJ_SETPROPERTY
 /// (`struct drm_mode_obj_set_property`: value@0, prop_id@8, obj_id@12,
-/// obj_type@16). Settable this way: a connector's "Broadcast RGB", "max
-/// bpc" (a modeset when it changes on a driven connector, which
-/// set_property_atomic allows: drm_atomic_commit_init sets allow_modeset)
-/// and,
-/// through OBJ_SETPROPERTY only (SETPROPERTY is connector-only), a CRTC's
-/// "VRR_ENABLED" and color properties, and any property of a plane on an
-/// atomic card (committed through [`atomic_commit`] as one-property atomic
-/// state, as set_property_atomic does), which Linux commits atomically for
-/// an atomic driver. Like
-/// drm_mode_obj_set_property_ioctl, an unknown object is ENOENT and a
-/// property the object lacks is EINVAL. Master only.
+/// obj_type@16). Like drm_mode_obj_set_property_ioctl, an unknown object
+/// is ENOENT and a property the object lacks is EINVAL. On an atomic card
+/// every property of a connector, CRTC or plane goes through
+/// set_property_atomic: a blocking one-property [`atomic_commit`] with
+/// modesets allowed (drm_atomic_commit_init sets allow_modeset), so a
+/// Colorspace or HDR_OUTPUT_METADATA change on a driven connector, a "max
+/// bpc" change, a CRTC's ACTIVE/MODE_ID or a plane change that needs a
+/// modeset all commit. Other cards keep set_property_legacy: a connector's
+/// "Broadcast RGB", "max bpc", Colorspace and HDR_OUTPUT_METADATA (no
+/// modeset) and a CRTC's "VRR_ENABLED" and color properties (SETPROPERTY
+/// is connector-only). Master only.
 fn handle_set_property(
     card_index: u32,
     mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
@@ -3890,10 +3890,34 @@ fn handle_set_property(
     } else {
         DRM_MODE_OBJECT_CONNECTOR
     };
+    {
+        let card = mode_state.lock();
+        // drm_mode_object_find(obj_id, obj_type): ENOENT for an object
+        // that is not of that type.
+        let known = match obj_type {
+            DRM_MODE_OBJECT_CONNECTOR => card.connector(obj_id).is_ok(),
+            DRM_MODE_OBJECT_CRTC => card.crtc(obj_id).is_ok(),
+            DRM_MODE_OBJECT_PLANE => {
+                crate::drm_native_planes::plane_state(&card, obj_id).is_some()
+                    || synth_planes(&card).iter().any(|(id, _)| *id == obj_id)
+            }
+            _ => return Err(FsError::InvalidData),
+        };
+        if !known {
+            return Err(FsError::NotFound);
+        }
+        if atomic_card(&card) {
+            drop(card);
+            return set_property_atomic(card_index, mode_state, obj_type, obj_id, prop_id, value);
+        }
+        // set_property_legacy: a plane has no legacy-settable property.
+        if obj_type == DRM_MODE_OBJECT_PLANE {
+            return Err(FsError::InvalidData);
+        }
+    }
     if obj_type == DRM_MODE_OBJECT_CRTC {
         let mut card = mode_state.lock();
         card.crtc(obj_id).map_err(|_| FsError::NotFound)?;
-        // set_property_atomic: a one-property commit (no modeset needed).
         let mut color = CrtcColorChange::default();
         if crtc_color_property(&card, obj_id, prop_id, value, &mut color)? {
             let request = apply_crtc_color(card_index, &mut card, obj_id, color);
@@ -3914,39 +3938,6 @@ fn handle_set_property(
         }
         return Ok(0);
     }
-    if obj_type == DRM_MODE_OBJECT_PLANE {
-        // set_property_atomic: a blocking one-property commit without
-        // ALLOW_MODESET, through the same decode, checks and commit as
-        // DRM_IOCTL_MODE_ATOMIC.
-        {
-            let card = mode_state.lock();
-            let known = crate::drm_native_planes::plane_state(&card, obj_id).is_some()
-                || synth_planes(&card).iter().any(|(id, _)| *id == obj_id);
-            if !known {
-                return Err(FsError::NotFound);
-            }
-            if !atomic_card(&card) {
-                return Err(FsError::InvalidData);
-            }
-        }
-        return atomic_commit(
-            card_index,
-            mode_state,
-            AtomicRequest {
-                flags: 0,
-                user_data: 0,
-                objects: &[obj_id],
-                prop_counts: &[1],
-                props: &[prop_id],
-                values: &[value],
-            },
-            None,
-            None,
-        );
-    }
-    if obj_type != DRM_MODE_OBJECT_CONNECTOR {
-        return Err(FsError::InvalidData);
-    }
     let mut card = mode_state.lock();
     let crtc = card
         .connector(obj_id)
@@ -3956,8 +3947,8 @@ fn handle_set_property(
         .and_then(|encoder| encoder.crtc_id);
     let mut color = ConnectorColorChange::default();
     if connector_color_property(&card, obj_id, prop_id, value, &mut color)? {
-        // set_property_atomic never allows a modeset: a Colorspace change
-        // or entering/leaving HDR on a driven connector is EINVAL.
+        // set_property_legacy has no modeset: a Colorspace change or
+        // entering/leaving HDR on a driven connector is EINVAL.
         let native = crate::drm_registry::driver_name(card_index) == Some("amdgpu");
         if connector_color_check(&card, native, obj_id, crtc, color)? {
             return Err(FsError::InvalidData);
@@ -3984,6 +3975,42 @@ fn handle_set_property(
     let value = broadcast_rgb_value(&card, obj_id, value)?;
     apply_broadcast_rgb(card_index, &mut card, obj_id, value);
     Ok(0)
+}
+
+/// set_property_atomic: one property of one object as a blocking atomic
+/// commit through the same decode, checks and commit as
+/// DRM_IOCTL_MODE_ATOMIC, with modesets allowed (drm_atomic_commit_init
+/// sets allow_modeset; the ioctl clears it only without ALLOW_MODESET) and
+/// no event. A CRTC's OUT_FENCE_PTR takes -1, as
+/// drm_atomic_crtc_set_property writes it; no fence follows, since only
+/// the atomic ioctl prepares signaling.
+fn set_property_atomic(
+    card_index: u32,
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    obj_type: u32,
+    obj_id: u32,
+    prop_id: u32,
+    value: u64,
+) -> Result<u64, FsError> {
+    const ALLOW_MODESET: u32 = 0x0400;
+    if obj_type == DRM_MODE_OBJECT_CRTC && prop_id == CRTC_OUT_FENCE_PTR_PROP_ID && value != 0 {
+        // SAFETY: a user pointer to an s32; copy_out faults cleanly.
+        unsafe { copy_out(value as usize, &(-1i32).to_le_bytes())? };
+    }
+    atomic_commit(
+        card_index,
+        mode_state,
+        AtomicRequest {
+            flags: ALLOW_MODESET,
+            user_data: 0,
+            objects: &[obj_id],
+            prop_counts: &[1],
+            props: &[prop_id],
+            values: &[value],
+        },
+        None,
+        None,
+    )
 }
 
 /// DRM_IOCTL_MODE_SETGAMMA (`set`) and DRM_IOCTL_MODE_GETGAMMA on

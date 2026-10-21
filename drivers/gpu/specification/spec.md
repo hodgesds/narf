@@ -4110,8 +4110,11 @@ by `tests/dcn401_hdr/check.sh` against code cut from Linux (3323 vectors with th
 MST end-device connectors carry both properties too (dm_dp_add_mst_connector
 attaches the root's Colorspace property; amdgpu_dm_connector_init_helper the
 HDR metadata property). A new Colorspace or entering/leaving HDR on a driven
-connector needs ALLOW_MODESET (EINVAL through the legacy setters), as
-amdgpu_dm_connector_atomic_check makes it a modeset; new metadata while
+connector needs ALLOW_MODESET in an atomic request, as
+amdgpu_dm_connector_atomic_check makes it a modeset, while OBJ_SETPROPERTY
+and SETPROPERTY on an atomic card commit it (set_property_atomic allows
+modesets; only a non-atomic card's set_property_legacy refuses it with
+EINVAL); new metadata while
 HDR stays on does not. Every native transport signals both, so no lit
 stream refuses them.
 
@@ -4493,11 +4496,16 @@ owned surface (so written uncompressed) and the post CSC always loads set
 A; the cursor matrix of a YCbCr primary is not programmed; offered alternative modes are admitted without the
 display's overlays, and KMS admits planes only on the lit timing (a mode
 switch with overlays relights and falls back if they no longer fit).
-OBJ_SETPROPERTY on a plane of an atomic card is set_property_atomic: a
-blocking one-property commit without ALLOW_MODESET through the atomic
-decode/check/commit (`drm_ioctl_bridge::atomic_commit`, shared with
-DRM_IOCTL_MODE_ATOMIC); out-of-range, immutable or absent properties are
-EINVAL and an unknown plane ENOENT. Model-tested only
+OBJ_SETPROPERTY (and the connector-only SETPROPERTY) on any connector,
+CRTC or plane of an atomic card is set_property_atomic
+(`drm_ioctl_bridge::set_property_atomic`): a blocking one-property commit
+with modesets allowed (drm_atomic_commit_init sets allow_modeset) and no
+event, through the atomic decode/check/commit
+(`drm_ioctl_bridge::atomic_commit`, shared with DRM_IOCTL_MODE_ATOMIC), so
+every atomic property an object carries is settable (CRTC ACTIVE/MODE_ID,
+connector CRTC_ID, a CRTC's OUT_FENCE_PTR, which gets -1 and no fence);
+out-of-range, immutable or absent properties are EINVAL and an object not
+of the given type ENOENT. Non-atomic cards keep set_property_legacy. Model-tested only
 (`dcn401-spl`, `dcn401-dml`, `dcn401-dpp`, `dcn401-mpc`, `dcn401-requestor`,
 `dcn401-deadline`, `dcn401-scanout`, `navi48-modeset`, `navi48-kms`, `drm`,
 `drm_ioctl`); not validated on hardware.
