@@ -12,14 +12,16 @@
 # six taps when scaled and one at 1:1; a 4:2:0 luma one tap at 1:1 and six
 # when scaled, its chroma four at half the luma ratio (the DET-limit lines
 # use four taps throughout). Results: each plane's 62 plane_vectors.txt
-# values, then 56 more: the chroma DLG/TTU delivery, luma and chroma
+# values, then 90 more: the chroma DLG/TTU delivery, luma and chroma
 # rq_regs, expansion modes, plane1_base_address, unbounded_request_enabled,
 # allow_sdpif_rate_limit_when_cstate_req, the DCC mcache allocation (counts,
-# boundaries, global ids, last-slice sharing) and two pipes' mcache
-# registers with each of a plane's n pipes taking the n-th share of each
-# viewport width; or "! REJECT" or "! ClockState" where DPMM would raise
-# DCFCLK/FCLK. A DCC plane whose mcaches one pipe cannot place is planned on
-# two MPC-combined pipes ("/2" and the pipe-0 blank end).
+# all DML2_MAX_MCACHES + 1 boundaries and global ids of each surface,
+# last-slice sharing) and four pipes' mcache registers, each pipe's
+# viewports SPL's on its ODM segment or MPC slice (spl_viewport.c); or
+# "! REJECT" or "! ClockState" where DPMM would raise DCFCLK/FCLK. A DCC
+# plane whose mcaches one pipe cannot place is planned on two MPC-combined
+# pipes ("/2" and the pipe-0 blank end), or on a single ODM stream gets one
+# more ODM pipe (PMO's dynamic ODM, as DC runs it).
 1564000 1564000 2500000 2500000 1250000 2000000 2000000 1200000 16 148500 1920 2200 88 44 1080 1125 4 5 1 1920 1080 1920 2 1920 1080 524288 524288 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 = 151260 150000 149411 9281 950000 1250000 1250000 1200000 44 550 276 370 28 64 41 4488 189629 71 0 11 1 1 176527 524288 524288 646 646 0 32767 2822 0 2962 2951 14 44131 44131 8 8 119 2795 2145 20119 119 369 119 119 119 4 4 4 512 512 60 16 1 192 32 5000000 15 10 5 54 0 0 0 0 3 3 0 0 0 0 0 0 3 3 0 0 0 0 0 0 2 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 15 15 65535 15 15 65535 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
 1564000 1564000 2500000 2500000 1250000 2000000 2000000 1200000 16 148500 1920 2200 88 44 1080 1125 4 5 1 1920 1080 1920 2 1920 1080 524288 524288 1 1 0 1 0 0 0 0 0 0 0 0 0 0 0 = 151260 150000 149411 9281 950000 1250000 1250000 1200000 44 550 276 370 28 64 41 4488 189629 71 0 63 1 1 176527 524288 524288 646 646 0 32767 2822 0 2962 2951 14 5516 5516 8 8 119 2795 2145 20119 119 369 119 119 119 4 4 4 512 512 60 16 16 192 32 5000000 15 10 5 54 0 0 0 0 3 3 0 0 0 0 3 0 3 3 0 0 0 0 0 0 2 1 1 1 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 15 15 65535 15 15 65535 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
 1564000 1564000 2500000 2500000 1250000 2000000 2000000 1200000 16 148500 1920 2200 88 44 1080 1125 4 5 1 1920 1080 1920 2 1920 1080 524288 524288 1 1 0 1 1 0 0 0 0 0 0 0 0 0 0 = 151260 150000 149411 9281 950000 1250000 1250000 1200000 44 550 276 370 28 64 41 4488 189629 71 0 63 1 1 176527 524288 524288 646 646 0 32767 2822 0 2962 2951 14 5516 5516 8 8 119 2795 2145 20119 119 369 119 119 119 4 4 4 512 512 60 16 16 192 32 5000000 15 10 5 54 0 0 0 0 3 3 0 0 0 0 3 0 3 3 0 0 0 0 0 0 2 1 1 1 0 1 0 1 0 1920 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 15 65535 15 15 65535 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
