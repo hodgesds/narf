@@ -1458,12 +1458,6 @@ fn apply_mutation(
                 }
                 return Err(EINVAL);
             }
-            let scope = match request[NLMSG_HDRLEN + 6] {
-                0 => crate::route::Scope::Universe,
-                253 => crate::route::Scope::Link,
-                254 => crate::route::Scope::Host,
-                _ => return Err(EINVAL),
-            };
             let table = if let Some(raw) = find_attr(request, 12, RTA_TABLE) {
                 if raw.len() != 4 {
                     return Err(EINVAL);
@@ -1563,6 +1557,18 @@ fn apply_mutation(
                 }
                 Some(_) => return Err(EINVAL),
                 None => 0,
+            };
+            // Only a new route's scope is validated (`fib_create_info`:
+            // `fc_scope > RT_SCOPE_HOST` is -EINVAL). A delete never checks
+            // it: `fib_table_delete` treats RT_SCOPE_NOWHERE (255), which
+            // iproute2, libnl and NetworkManager send on RTM_DELROUTE, as
+            // "any scope".
+            // LINUX-GAP: RT_SCOPE_SITE (200) and the other user scopes.
+            let scope = match request[NLMSG_HDRLEN + 6] {
+                0 => crate::route::Scope::Universe,
+                253 => crate::route::Scope::Link,
+                254 => crate::route::Scope::Host,
+                _ => return Err(EINVAL),
             };
             admin
                 .add_ipv4_route(crate::AdminIpv4Route {

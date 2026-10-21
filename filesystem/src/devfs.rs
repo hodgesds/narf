@@ -1179,6 +1179,12 @@ enum ConsoleNodeKind {
     Console,
     CurrentTty,
     Virtual(u32),
+    /// `/dev/ttyS<n>` (char 4:64+n): the 8250 UART. NARF has one console
+    /// tty fed by both the serial port and the keyboard, so the UART's node
+    /// is that tty under its serial name, as `/dev/console` is on a Linux
+    /// boot with `console=ttyS0`. Writes go to the console sinks and are not
+    /// subject to a TIOCCONS redirect, which applies to `/dev/console` only.
+    Serial(u32),
 }
 
 struct DevConsole {
@@ -1352,6 +1358,9 @@ impl FileOps for DevConsole {
             ConsoleNodeKind::Console => 0o600,
             ConsoleNodeKind::CurrentTty => 0o666,
             ConsoleNodeKind::Virtual(_) => 0o620,
+            // devtmpfs creates a UART node 0600 and udev's
+            // 50-udev-default.rules makes it 0660 group uucp.
+            ConsoleNodeKind::Serial(_) => 0o660,
         };
         Stat {
             size: 0,
@@ -1369,6 +1378,7 @@ impl FileOps for DevConsole {
             ConsoleNodeKind::Console => linux_makedev(5, 1),
             ConsoleNodeKind::CurrentTty => linux_makedev(5, 0),
             ConsoleNodeKind::Virtual(index) => linux_makedev(4, index),
+            ConsoleNodeKind::Serial(index) => linux_makedev(4, 64 + index),
         }
     }
 
@@ -1442,6 +1452,27 @@ impl FileOps for DevConsole {
             ConsoleNodeKind::Virtual(n) if n >= 1 => n,
             _ => crate::vt::active_vt(),
         };
+        // The VT and KD ioctls are `vt_ioctl`'s, installed on VT ttys only; a
+        // UART answers them -ENOTTY (`tty_ioctl` -> `-ENOIOCTLCMD`).
+        if matches!(self.kind, ConsoleNodeKind::Serial(_))
+            && matches!(
+                cmd,
+                KDGETMODE
+                    | KDGKBMODE
+                    | KDSETMODE
+                    | KDSIGACCEPT
+                    | KDSKBMODE
+                    | VT_ACTIVATE
+                    | VT_GETMODE
+                    | VT_GETSTATE
+                    | VT_OPENQRY
+                    | VT_RELDISP
+                    | VT_SETMODE
+                    | VT_WAITACTIVE
+            )
+        {
+            return Err(crate::FsError::Unsupported);
+        }
         match cmd {
             TCGETS => {
                 let raw = crate::console_tty::termios();
@@ -2591,6 +2622,39 @@ fn smoke_dev_console_vt_fchmod_accepted() -> TestResult {
 }
 kernel_test_in!("filesystem/devfs", smoke_dev_console_vt_fchmod_accepted);
 
+/// `/dev/ttyS0` is the UART's tty: NARF's single console tty under its serial
+/// name (`systemd.debug_shell=/dev/ttyS0`, `agetty ttyS0`). It shares the
+/// console's tty identity and termios, and refuses the VT/KD ioctls with
+/// -ENOTTY as a Linux UART does.
+fn smoke_dev_ttys0_is_the_console_tty() -> TestResult {
+    let dir = DevDir;
+    let Some(node) = dir.lookup("ttyS0") else {
+        return TestResult::Fail("/dev/ttyS0 missing");
+    };
+    if node.tty_id() != Some(crate::TTY_ID_CONSOLE) {
+        return TestResult::Fail("/dev/ttyS0 must be the console tty");
+    }
+    let mut termios = [0u8; 60];
+    if node.ioctl(crate::devfs_pty::TCGETS, termios.as_mut_ptr() as usize) != Ok(0) {
+        return TestResult::Fail("TCGETS on /dev/ttyS0 must succeed");
+    }
+    let mut mode = 0i32;
+    if node.ioctl(crate::devfs_pty::KDGETMODE, &mut mode as *mut i32 as usize)
+        != Err(crate::FsError::Unsupported)
+    {
+        return TestResult::Fail("KDGETMODE on /dev/ttyS0 must be -ENOTTY");
+    }
+    if !dir
+        .enumerate(0, usize::MAX)
+        .iter()
+        .any(|(name, _)| name.as_str() == "ttyS0")
+    {
+        return TestResult::Fail("/dev/ttyS0 missing from the /dev listing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/devfs", smoke_dev_ttys0_is_the_console_tty);
+
 /// Linux devtmpfs keeps char/block identity, `st_rdev`, ownership, mode, and
 /// inode identity on dynamically-created device nodes. It also applies the
 /// usual single-directory rename/unlink rules atomically.
@@ -2704,6 +2768,7 @@ fn smoke_dev_static_linux_metadata() -> TestResult {
         ("kmsg", linux_makedev(1, 11), 0o600),
         ("console", linux_makedev(5, 1), 0o600),
         ("tty", linux_makedev(5, 0), 0o666),
+        ("ttyS0", linux_makedev(4, 64), 0o660),
         ("uinput", linux_makedev(10, 223), 0o660),
         ("fuse", linux_makedev(10, 229), 0o666),
     ];

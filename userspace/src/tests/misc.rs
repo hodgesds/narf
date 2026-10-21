@@ -2052,6 +2052,50 @@ kernel_test_in!(
     smoke_userspace_futex_timeout_unpark_unqueues_waiter
 );
 
+/// A `CLONE_VFORK` parent sleeps `TASK_KILLABLE` (`wait_for_vfork_done`):
+/// a pending non-fatal signal must not end the park, only the child's
+/// exec/exit release (or SIGKILL) does. The park loop used to apply its
+/// interruptible rule, so with SIGCHLD pending every park returned at once
+/// and systemd's PID 1 busy-spun in clone3 on its CPU for seconds, starving
+/// the child it was waiting for.
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_vfork_wait_ignores_sigchld() -> TestResult {
+    use crate::user_task::{UserTaskCtx, __test_park_should_block};
+    use core::sync::atomic::Ordering;
+
+    const CHILD: u64 = 0x7ffe_0001;
+    const SIGCHLD: u32 = 17;
+    let waker = core::task::Waker::noop().clone();
+    let uc = UserTaskCtx::new();
+    let tid = crate::handlers::current_task_id();
+    crate::handlers::vfork_wait_register(CHILD, tid);
+    uc.vfork_wait_child.store(CHILD, Ordering::Release);
+    uc.sleep_deadline_ns.store(u64::MAX, Ordering::Release);
+    let mut sleep_handle = None;
+
+    crate::handlers::raise_signal_pending(tid, SIGCHLD);
+    let parked_with_sigchld = __test_park_should_block(&uc, &waker, &mut sleep_handle);
+    crate::handlers::clear_signal_pending(tid, SIGCHLD);
+    crate::handlers::vfork_child_release(CHILD);
+    let parked_after_release = __test_park_should_block(&uc, &waker, &mut sleep_handle);
+    crate::handlers::drop_signal_waker(tid);
+    if let Some(h) = sleep_handle.take() {
+        narf_scheduler::narf_time::timer_wheel::cancel(h);
+    }
+    if !parked_with_sigchld {
+        return TestResult::Fail("a pending SIGCHLD ended the TASK_KILLABLE vfork park");
+    }
+    if parked_after_release {
+        return TestResult::Fail("the vfork park did not end on the child's release");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace/futex",
+    smoke_userspace_vfork_wait_ignores_sigchld
+);
+
 /// The CLONE_CHILD_CLEARTID exit wake must reach a SHARED-namespace waiter.
 /// Linux fires it WITHOUT `FUTEX_PRIVATE_FLAG` — kernel/fork.c `mm_release`:
 /// `put_user(0, tsk->clear_child_tid); do_futex(tsk->clear_child_tid,
