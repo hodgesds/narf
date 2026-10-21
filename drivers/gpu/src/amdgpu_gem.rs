@@ -1098,6 +1098,101 @@ pub(crate) fn restore_domains(touched: Vec<(Arc<GemObject>, u64)>) {
     }
 }
 
+/// TTM's eviction for an allocation that must land in VRAM: move card
+/// `card`'s idle, unpinned VRAM buffers to system memory one by one, CPU-
+/// mapped ones included (their mappings follow), until `size` bytes at
+/// `align` fit in the visible heap (or, for `no_cpu`, past the BAR). True
+/// once they do; the probe reservation is released again.
+async fn reclaim_vram(card: u32, heap: &VramHeap, size: u64, align: u64, no_cpu: bool) -> bool {
+    let gate = lock_placement(card).await;
+    let tables: Vec<_> = GEM_TABLES
+        .lock()
+        .iter()
+        .filter(|(c, _)| *c == card)
+        .filter_map(|(_, table)| table.upgrade())
+        .collect();
+    for table in tables {
+        let objects: Vec<_> = table.lock().values().cloned().collect();
+        for object in objects {
+            if object.system() {
+                continue;
+            }
+            let _ = crate::amdgpu_vm::relocate(&gate, &object, false).await;
+            if heap.pool.reserve_aligned(size, align).is_ok()
+                || (no_cpu
+                    && heap
+                        .unmapped
+                        .as_ref()
+                        .is_some_and(|u| u.pool.reserve_aligned(size, align).is_ok()))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `amdgpu_gem_align_pitch(adev, width, cpp, false)`: a dumb buffer's line
+/// is a whole number of 256-byte units for 1-4 bytes per pixel (a pixel
+/// mask of 255, 127 or 63); other sizes are not padded. 0 when the padded
+/// line overflows 32 bits.
+pub const fn align_pitch(width: u32, cpp: u32) -> u32 {
+    let mask = match cpp {
+        1 => 255,
+        2 => 127,
+        3 | 4 => 63,
+        _ => 0,
+    };
+    let Some(aligned) = width.checked_add(mask) else {
+        return 0;
+    };
+    match (aligned & !mask).checked_mul(cpp) {
+        Some(pitch) => pitch,
+        None => 0,
+    }
+}
+
+/// A dumb buffer's `(pitch, size)`: drm_mode_create_dumb's checks (no zero
+/// dimension, no 32-bit overflow of the packed size or of its page
+/// rounding), then amdgpu_mode_dumb_create's: [`align_pitch`] (EINVAL at 0)
+/// and the pitch times the height rounded up to a page.
+pub fn dumb_layout(width: u32, height: u32, bpp: u32) -> Result<(u32, u64), FsError> {
+    if width == 0 || height == 0 || bpp == 0 || bpp > u32::MAX - 8 {
+        return Err(FsError::InvalidData);
+    }
+    let cpp = bpp.div_ceil(8);
+    if cpp > u32::MAX / width {
+        return Err(FsError::InvalidData);
+    }
+    let stride = cpp * width;
+    if height > u32::MAX / stride {
+        return Err(FsError::InvalidData);
+    }
+    // PAGE_ALIGN of the u32 size: it wraps to 0 past 0xffff_f000.
+    if (height * stride).wrapping_add(PAGE_SIZE as u32 - 1) & !(PAGE_SIZE as u32 - 1) == 0 {
+        return Err(FsError::InvalidData);
+    }
+    let pitch = align_pitch(width, cpp);
+    if pitch == 0 {
+        return Err(FsError::InvalidData);
+    }
+    let size = (u64::from(pitch) * u64::from(height)).next_multiple_of(PAGE_SIZE);
+    Ok((pitch, size))
+}
+
+/// amdgpu_mode_dumb_create's create flags: CPU access, USWC for a GTT
+/// placement, one contiguous VRAM range, and (the card's buffer functions
+/// running) cleared.
+pub const DUMB_CREATE_FLAGS: u64 = (uapi::AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED
+    | uapi::AMDGPU_GEM_CREATE_CPU_GTT_USWC
+    | uapi::AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS
+    | uapi::AMDGPU_GEM_CREATE_VRAM_CLEARED) as u64;
+
+/// amdgpu_bo_get_preferred_domain(amdgpu_display_supported_domains(adev,
+/// flags)) for a dumb buffer of a dGPU: without gpu_vm_support the display
+/// fetches VRAM only, USWC or not.
+pub const DUMB_DOMAIN: u64 = uapi::AMDGPU_GEM_DOMAIN_VRAM as u64;
+
 /// A strict VRAM allocation may park to reclaim buffers mapped by idle VMs.
 /// The first create performs all ABI validation; a failure leaves its input
 /// union untouched. Ordinary allocations retain their immediate GTT fallback.
@@ -1140,35 +1235,64 @@ pub async fn dispatch_async(
     else {
         return Some(Err(FsError::InvalidData));
     };
-    let gate = lock_placement(card).await;
-    let tables: Vec<_> = GEM_TABLES
-        .lock()
-        .iter()
-        .filter(|(c, _)| *c == card)
-        .filter_map(|(_, table)| table.upgrade())
-        .collect();
-    for table in tables {
-        let objects: Vec<_> = table.lock().values().cloned().collect();
-        for object in objects {
-            if object.system() {
-                continue;
-            }
-            let _ = crate::amdgpu_vm::relocate(&gate, &object, false).await;
-            let no_cpu = u64::from_le_bytes(bytes[24..32].try_into().unwrap())
-                & u64::from(uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS)
-                != 0;
-            if heap.pool.reserve_aligned(size, align).is_ok()
-                || (no_cpu
-                    && heap
-                        .unmapped
-                        .as_ref()
-                        .is_some_and(|u| u.pool.reserve_aligned(size, align).is_ok()))
-            {
-                return Some(create(state, arg));
-            }
-        }
+    let no_cpu = u64::from_le_bytes(bytes[24..32].try_into().unwrap())
+        & u64::from(uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS)
+        != 0;
+    if reclaim_vram(card, &heap, size, align, no_cpu).await {
+        return Some(create(state, arg));
     }
     Some(result)
+}
+
+/// [`GemState::create_dumb`] when visible VRAM is full: TTM evicts idle
+/// buffers, CPU-mapped ones included, before amdgpu_mode_dumb_create gives
+/// up with ENOMEM (it has no GTT fallback). `NoSpace` when even that leaves
+/// no room.
+pub async fn create_dumb_async(
+    state: &GemState,
+    width: u32,
+    height: u32,
+    bpp: u32,
+) -> Result<(u32, u32, u64), FsError> {
+    let result = state.create_dumb(width, height, bpp);
+    if result != Err(FsError::NoSpace) {
+        return result;
+    }
+    let (Some(card), Ok((_, size))) = (state.card, dumb_layout(width, height, bpp)) else {
+        return result;
+    };
+    let Some(heap) = vram_heap(card) else {
+        return result;
+    };
+    if reclaim_vram(card, &heap, size, PAGE_SIZE, false).await {
+        return state.create_dumb(width, height, bpp);
+    }
+    result
+}
+
+/// amdgpu_dm_plane_helper_prepare_fb's amdgpu_bo_pin validation, ahead of
+/// the commit that pins: each of `objects` that has left VRAM (suspend's
+/// evict_all, or eviction for another allocation) and is not pinned moves
+/// back, CPU mappings and all, so the commit's `pin_scanout` finds it in
+/// VRAM. A buffer that cannot move stays put and its pin is refused.
+pub async fn prepare_scanout(card: u32, objects: Vec<Arc<GemObject>>) {
+    let objects: Vec<_> = objects
+        .into_iter()
+        .filter(|o| {
+            o.system()
+                && !o.pinned()
+                && o.allowed_domains.load(Ordering::Acquire)
+                    & u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM)
+                    != 0
+        })
+        .collect();
+    if objects.is_empty() {
+        return;
+    }
+    let gate = lock_placement(card).await;
+    for object in objects {
+        let _ = crate::amdgpu_vm::relocate(&gate, &object, true).await;
+    }
 }
 
 /// Per-open GEM state. One of these per `/dev/dri/*` open on an amdgpu card.
@@ -1348,6 +1472,91 @@ impl GemState {
     /// an amdgpu handle from a dumb one without consulting both.
     pub fn owns(&self, handle: u32) -> bool {
         handle >= HANDLE_BASE && self.get(handle).is_some()
+    }
+
+    /// `amdgpu_mode_dumb_create` on a dGPU card with a VRAM heap: a buffer of
+    /// [`dumb_layout`]'s pitch and size in [`DUMB_DOMAIN`] (VRAM), created
+    /// with [`DUMB_CREATE_FLAGS`] as amdgpu_gem_object_create makes it
+    /// (VRAM_WIPE_ON_RELEASE added, the CPU_ACCESS_REQUIRED hint dropped
+    /// once placed). CPU_ACCESS_REQUIRED keeps it in the BAR-visible heap,
+    /// and VRAM_CONTIGUOUS is one reservation, zeroed through the BAR. When
+    /// visible VRAM is full, idle unmapped buffers are evicted first
+    /// (`evict_visible`; [`create_dumb_async`] also moves mapped ones);
+    /// there is no GTT fallback, so it is then `NoSpace` (ENOMEM). Returns
+    /// `(handle, pitch, size)`; the handle is in this open's table, as
+    /// drm_gem_handle_create puts it in the file's.
+    pub fn create_dumb(
+        &self,
+        width: u32,
+        height: u32,
+        bpp: u32,
+    ) -> Result<(u32, u32, u64), FsError> {
+        let (pitch, byte_len) = dumb_layout(width, height, bpp)?;
+        let card = self.card.ok_or(FsError::NoDevice)?;
+        let heap = vram_heap(card).ok_or(FsError::NoDevice)?;
+        let reservation = heap
+            .pool
+            .reserve_aligned(byte_len, PAGE_SIZE)
+            .or_else(|_| {
+                evict_visible(card, &heap.pool, byte_len, PAGE_SIZE);
+                heap.pool.reserve_aligned(byte_len, PAGE_SIZE)
+            })
+            .map_err(|_| FsError::NoSpace)?;
+        let gpu = reservation
+            .address()
+            .checked_sub(heap.fb_base)
+            .and_then(|a| a.checked_add(heap.fb_offset))
+            .ok_or(FsError::InvalidData)?;
+        let map = reservation.mapping();
+        // VRAM_CLEARED: zero it before userspace or the display sees it.
+        //
+        // SAFETY: the reservation is this buffer's alone and its CPU mapping
+        // covers `reservation.size()` bytes.
+        unsafe { core::ptr::write_bytes(map.virt as *mut u8, 0, reservation.size() as usize) };
+        let flags = (DUMB_CREATE_FLAGS | u64::from(uapi::AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE))
+            & !u64::from(uapi::AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED);
+        let handle = self.insert(GemObject {
+            placement: IrqSafeSpinLock::new(Arc::new(GemPlacement {
+                phys: map.phys.raw(),
+                gpu,
+                system: false,
+                byte_len,
+                backing: Backing::Vram { _held: reservation },
+            })),
+            byte_len,
+            // bp.byte_align 0: GEM_OP reports a page alignment of 0.
+            alignment: 0,
+            preferred_domains: AtomicU64::new(DUMB_DOMAIN),
+            allowed_domains: AtomicU64::new(initial_allowed_domains(DUMB_DOMAIN, flags)),
+            flags,
+            metadata: IrqSafeSpinLock::new(Metadata::default()),
+            card: self.card,
+            dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
+            pin_count: AtomicU32::new(0),
+        })?;
+        Ok((handle, pitch, byte_len))
+    }
+
+    /// `amdgpu_mode_dumb_mmap` (MAP_DUMB) for a handle of this table: the
+    /// same offset `GEM_MMAP` hands out, EPERM for a userptr or a
+    /// NO_CPU_ACCESS buffer. None for a handle this table does not hold.
+    pub fn map_dumb(&self, handle: u32) -> Option<Result<u64, FsError>> {
+        if !self.owns(handle) {
+            return None;
+        }
+        let object = self.get(handle)?;
+        if object.is_userptr()
+            || object.flags & u64::from(uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0
+        {
+            return Some(Err(FsError::OperationNotPermitted));
+        }
+        Some(Ok(u64::from(handle) << 12))
+    }
+
+    /// `drm_mode_destroy_dumb`'s drm_gem_handle_delete for a handle of this
+    /// table: false when it holds no such handle.
+    pub fn destroy_dumb(&self, handle: u32) -> bool {
+        handle >= HANDLE_BASE && self.remove(handle)
     }
 
     /// The object an `mmap` of `len` bytes at `offset` maps, which the
