@@ -4503,6 +4503,10 @@ pub enum MonitorStep {
     /// The display moved to DRM's new planes or plane format while it
     /// scanned out (DC's medium or full update, no relight).
     PlanesUpdated(u8),
+    /// The MST link's DSC fairness search changes this display's stream:
+    /// it was torn down for the modeset that lights it again beside the
+    /// displays the change leaves running.
+    Reconfigured(u8),
 }
 
 /// Record DRM's CRTC on/off request for display `display`. Level-triggered:
@@ -5581,6 +5585,25 @@ pub async unsafe fn monitor_displays(
             break;
         }
     }
+    let retired_now = steps
+        .iter()
+        .any(|s| matches!(s, MonitorStep::Unplugged(_) | MonitorStep::Disabled(_)));
+    // A stream left an MST link whose end devices decode DSC: amdgpu_dm
+    // recomputes the remaining streams' fairness search and modesets those
+    // whose configuration it changes (torn down here, lit again below
+    // beside the others); the others ran on through the removal (its
+    // payload alone was deallocated).
+    if retired_now && !relight {
+        for &port in &left_ports {
+            match boot.mst_affected_streams(port, &[], &|_| None) {
+                // SAFETY: as above.
+                Some(affected) => unsafe {
+                    modeset_affected(boot, displays, affected, &mut steps).await?
+                },
+                None => relight = true,
+            }
+        }
+    }
     // Sinks to light: a plugged connector, routed (automatically for a new
     // sink) to a CRTC DRM has not switched off.
     OUTPUTS.lock().assign_routes();
@@ -5591,16 +5614,6 @@ pub async unsafe fn monitor_displays(
         .enumerate()
         .filter(|(_, m)| m.is_some())
         .fold(0u8, |acc, (k, _)| acc | 1 << k);
-    let retired_now = steps
-        .iter()
-        .any(|s| matches!(s, MonitorStep::Unplugged(_) | MonitorStep::Disabled(_)));
-    // A stream left an MST link whose end devices decode DSC: amdgpu_dm
-    // recomputes the remaining streams' fairness search and modesets any
-    // whose configuration it changes; the others ran on through the
-    // removal (its payload alone was deallocated).
-    if retired_now && lit_mask != 0 && !boot.mst_streams_kept(&left_ports) {
-        relight = true;
-    }
     let (mut relit, mut lit_beside) = (false, false);
     if needs_relight(relight, wanted, lit_mask, &mut displays.considered) {
         relit = true;
@@ -5610,7 +5623,24 @@ pub async unsafe fn monitor_displays(
         let beside = if !relight && lit_mask != 0 {
             let fill = |_: u8, _: u32, row: &mut [u32]| row.fill(0);
             // SAFETY: as above; the running displays stay lit and published.
-            unsafe { light_beside(boot, &displays.lit, fill) }.await?
+            let mut beside = unsafe { light_beside(boot, &displays.lit, fill) }.await?;
+            // Refused: when the new streams' DSC fairness search changes
+            // running MST streams, Linux modesets just those (torn down
+            // here) and lights them with the new streams beside the rest.
+            let affected = if beside.is_none() {
+                beside_affected(boot, lit_mask)
+            } else {
+                None
+            };
+            if let Some(affected) = affected.filter(|&a| a != 0) {
+                // SAFETY: as above.
+                unsafe { modeset_affected(boot, displays, affected, &mut steps) }.await?;
+                if displays.lit.iter().any(Option::is_some) {
+                    // SAFETY: as above.
+                    beside = unsafe { light_beside(boot, &displays.lit, fill) }.await?;
+                }
+            }
+            beside
         } else {
             None
         };
@@ -7528,6 +7558,58 @@ mod tests {
         "drivers/gpu/navi48-kms",
         navi48_drm_cursor_converges_like_handle_cursor_update
     );
+}
+
+/// Tear down the running displays `affected` (by pipe) for the modeset an
+/// MST link's DSC fairness search makes of their streams; their CRTCs stay
+/// on, so the next lighting beside the others lights them again with the
+/// configuration the search gives them.
+/// # Safety
+/// As for `monitor_displays`, with OWNER held.
+async unsafe fn modeset_affected(
+    boot: &mut boot::ColdBoot,
+    displays: &mut Displays,
+    affected: u8,
+    steps: &mut Vec<MonitorStep>,
+) -> Result<(), ModesetError> {
+    for k in (0..4u8).filter(|&k| affected & 1 << k != 0) {
+        if displays.lit[usize::from(k)].is_none() {
+            continue;
+        }
+        // SAFETY: the caller's obligations.
+        unsafe { retire_monitored_display(boot, displays, k, false) }.await?;
+        steps.push(MonitorStep::Reconfigured(k));
+    }
+    Ok(())
+}
+
+/// The running MST streams (by pipe) the end devices waiting on unlit
+/// CRTCs would change through their links' DSC fairness search
+/// (`ColdBoot::mst_affected_streams`), lit displays being `lit_mask`. None
+/// when a search fits them no longer.
+fn beside_affected(boot: &boot::ColdBoot, lit_mask: u8) -> Option<u8> {
+    let (routes, wants, mst) = {
+        let outputs = OUTPUTS.lock();
+        let routes: [Option<Target>; 4] = core::array::from_fn(|k| {
+            let c = &outputs.crtcs[k];
+            c.route.filter(|_| c.active && lit_mask & 1 << k == 0)
+        });
+        let wants: [Option<Timing>; 4] = core::array::from_fn(|k| outputs.crtcs[k].requested);
+        (routes, wants, outputs.mst_ports())
+    };
+    let crtc_of = |t: Target| routes.iter().position(|r| *r == Some(t));
+    let mut affected = 0;
+    for port in mst {
+        let pipes: Vec<Option<u8>> = (0..boot::MST_OUTPUTS as u8)
+            .map(|slot| crtc_of(Target::Mst(port, slot)).map(|k| k as u8))
+            .collect();
+        if pipes.iter().all(Option::is_none) {
+            continue;
+        }
+        let want = |slot: usize| crtc_of(Target::Mst(port, slot as u8)).and_then(|k| wants[k]);
+        affected |= boot.mst_affected_streams(port, &pipes, &want)?;
+    }
+    Some(affected)
 }
 
 /// Light the plugged board sinks DRM wants beside the displays that run

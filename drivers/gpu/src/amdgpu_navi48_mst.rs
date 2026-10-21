@@ -1369,6 +1369,60 @@ pub(super) fn select_mst_outputs_beside(
     )
 }
 
+/// The running streams `running` (each with its pipe) of a port whose
+/// configuration the link's fairness search changes once the devices on
+/// `joining` (device k's new pipe) join and the others leave, as
+/// amdgpu_dm finds the streams it modesets: drm_dp_mst_add_affected_dsc_crtcs
+/// puts every stream of the topology in the commit, pre_validate_dsc
+/// recomputes them all (compute_mst_dsc_configs_for_link over the link's
+/// streams, each running one at its timing through
+/// create_validate_stream_for_sink's depth loop) and keeps running
+/// (mode_changed cleared) each whose timing, depth and DSC
+/// (dc_is_timing_changed) and payload stay. By bit of pipe; none on a link
+/// without DSC decoders, whose running payloads stay as they are
+/// (drm_dp_atomic_find_time_slots runs only for the changed connectors);
+/// None when the search runs on no link.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn affected_mst_streams(
+    port: usize,
+    caps: modeset::DpCaps,
+    devices: &[(dp_mst_mgr::Sink, Vec<u8>, u16)],
+    running: &[(Selection, u8)],
+    joining: &[Option<u8>],
+    want: &dyn Fn(usize) -> Option<Timing>,
+    budget: &Budget<'_>,
+    dsc: Option<&MstDscContext<'_>>,
+) -> Option<u8> {
+    if dsc.is_none_or(|c| !devices.iter().any(|d| (c.dsc_of)(d.0).is_some())) {
+        return Some(0);
+    }
+    let stream_of = |k: usize| {
+        running
+            .iter()
+            .find(|(s, _)| s.mst.map(|m| m.sink) == Some(devices[k].0))
+    };
+    let pipes: Vec<Option<u8>> = (0..devices.len())
+        .map(|k| {
+            stream_of(k)
+                .map(|&(_, p)| p)
+                .or_else(|| joining.get(k).copied().flatten())
+        })
+        .collect();
+    let at = |k: usize| stream_of(k).map(|(s, _)| s.timing).or_else(|| want(k));
+    let all = select_mst_outputs_beside(port, caps, devices, &at, &pipes, budget, dsc, &[])?;
+    let mut affected = 0u8;
+    for (s, pipe) in running {
+        let kept = all.iter().any(|(n, _)| {
+            n.mst.map(|m| (m.sink, m.pbn, m.slots)) == s.mst.map(|m| (m.sink, m.pbn, m.slots))
+                && (n.timing, n.depth, n.dsc) == (s.timing, s.depth, s.dsc)
+        });
+        if !kept {
+            affected |= 1 << pipe;
+        }
+    }
+    Some(affected)
+}
+
 /// Timings a dark connector could add beside the running streams. Each
 /// candidate is independent: advertising a mode reserves neither a payload
 /// nor a pipe, and enabling multiple connectors still needs joint admission.
@@ -1711,30 +1765,62 @@ impl ColdBoot {
             selections,
         }))
     }
-    /// Whether the running MST streams of `ports` (those a stream just
-    /// left) keep their configurations as the streams now running on each
-    /// link: after a stream on a link whose end devices decode DSC leaves,
-    /// amdgpu_dm recomputes the remaining streams' fairness search
-    /// (is_dsc_need_re_compute) and modesets any it changes. False when
-    /// that would change one, so the caller relights; links without
-    /// decoders keep their payloads.
-    pub fn mst_streams_kept(&self, ports: &[usize]) -> bool {
-        let running: Vec<Selection> = self
+    /// The running streams on DP `port` (by bit of pipe) that a commit
+    /// lighting the end devices on `joining` (slot k's new pipe) at
+    /// `want(slot)` beside them must modeset because the link's DSC
+    /// fairness search changes them (`affected_mst_streams`); with nothing
+    /// joining, those a stream that just left changes. Linux modesets only
+    /// those and keeps every other stream running. Some(0) for a port
+    /// without running streams; None when the search fits them no longer.
+    pub fn mst_affected_streams(
+        &self,
+        port: usize,
+        joining: &[Option<u8>],
+        want: &dyn Fn(usize) -> Option<Timing>,
+    ) -> Option<u8> {
+        let running: Vec<(Selection, u8)> = self
             .display_modesets()
             .into_iter()
             .flatten()
-            .map(|m| m.selection)
-            .filter(|s| s.mst.is_some())
+            .filter(|m| m.selection.port == port && m.selection.mst.is_some())
+            .map(|m| (m.selection, m.pipe))
             .collect();
-        ports.iter().all(|&port| {
-            let lit: Vec<Selection> = running.iter().filter(|s| s.port == port).copied().collect();
-            let Some(caps) = lit.first().map(|s| s.caps) else {
-                return true;
-            };
-            let (devices, slots) = self.mst_devices(port);
-            self.select_on_link(port, caps, &devices, &slots, &|_| None, &|_| None, &lit)
-                .is_some()
-        })
+        let Some(caps) = running.first().map(|r| r.0.caps) else {
+            return Some(0);
+        };
+        let link = self.mst.get(&port)?;
+        let (devices, slots) = self.mst_devices(port);
+        let budget = |sink, allocated: &[(dp_mst_mgr::Sink, u16)]| {
+            topology::path_budget(&link.topology, sink, allocated).unwrap_or(0)
+        };
+        let decoders: Vec<_> = link
+            .outputs
+            .iter()
+            .flatten()
+            .filter_map(|o| Some((o.sink?, o.dsc?)))
+            .collect();
+        let dsc_of = |sink| decoders.iter().find(|d| d.0 == sink).map(|d| d.1);
+        let max_bpc = |sink| link.max_bpc(port, sink);
+        let ctx = MstDscContext {
+            topology: &link.topology,
+            dsc_of: &dsc_of,
+            max_dispclk_khz: modeset::NOMINAL_DISPCLK_KHZ,
+            max_bpc: &max_bpc,
+        };
+        let joining: Vec<Option<u8>> = slots
+            .iter()
+            .map(|&k| joining.get(k).copied().flatten())
+            .collect();
+        affected_mst_streams(
+            port,
+            caps,
+            &devices,
+            &running,
+            &joining,
+            &|k| want(slots[k]),
+            &budget,
+            Some(&ctx),
+        )
     }
     /// Admit each dark end device's timings beside every running display.
     pub(super) fn finish_mst_plan(

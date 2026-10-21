@@ -728,3 +728,118 @@ kernel_test_in!(
     "drivers/gpu/navi48-mst",
     navi48_mst_dsc_beside_running_streams_like_amdgpu_dm
 );
+
+/// The streams a change on a DSC link modesets, as amdgpu_dm finds them
+/// (drm_dp_mst_add_affected_dsc_crtcs puts the topology's streams in the
+/// commit, pre_validate_dsc keeps each the search leaves unchanged): a
+/// 1080p60 beside an uncompressed 4K60 on 4 x HBR3 affects nothing; a
+/// second 4K60 on 4 x HBR2 compresses the running one, so only that one
+/// is modeset, and lighting both from the full search then keeps the
+/// result (the running set is what the search picks for it); removing one
+/// of two compressed 4K60 streams modesets the other. A link without
+/// decoders never modesets running streams.
+fn navi48_mst_dsc_affected_streams_like_amdgpu_dm() -> TestResult {
+    let mut hub = Hub::new();
+    let (_, topology) = probed(&mut hub);
+    let mst = MstDsc {
+        caps: DscSinkCaps::parse(&DECODER, &[0; 3]).unwrap(),
+        aux: DscAux::Port(ROOT_SINK),
+        passthrough: None,
+        end_link_kbps: 0,
+        branch_oui: 0,
+    };
+    let dsc_of = |s: Sink| (s == ROOT_SINK || s == CHILD_SINK).then_some(mst);
+    let none = |_: Sink| None;
+    let max_bpc = |_: Sink| 8;
+    let ctx = MstDscContext {
+        topology: &topology,
+        dsc_of: &dsc_of,
+        max_dispclk_khz: 2_000_000,
+        max_bpc: &max_bpc,
+    };
+    let plain = MstDscContext {
+        dsc_of: &none,
+        ..ctx
+    };
+    let budget = |_: Sink, _: &[(Sink, u16)]| u16::MAX;
+    let caps = |rate| modeset::DpCaps {
+        lanes: 4,
+        rate,
+        uhbr: 0,
+        fec: true,
+        dsc: None,
+    };
+    let select = |caps, devices: &[(Sink, Vec<u8>, u16)], pipes: &[Option<u8>]| {
+        super::super::select_mst_outputs_beside(
+            0,
+            caps,
+            devices,
+            &|_| None,
+            pipes,
+            &budget,
+            Some(&ctx),
+            &[],
+        )
+        .unwrap()
+    };
+    let affected = |caps,
+                    devices: &[(Sink, Vec<u8>, u16)],
+                    running: &[(modeset::Selection, u8)],
+                    joining: &[Option<u8>],
+                    ctx: &MstDscContext| {
+        super::super::affected_mst_streams(
+            0,
+            caps,
+            devices,
+            running,
+            joining,
+            &|_| None,
+            &budget,
+            Some(ctx),
+        )
+    };
+    use crate::dp_link_training::LinkRate::{Hbr2, Hbr3};
+    let small = [
+        (ROOT_SINK, uhd60_edid(3), u16::MAX),
+        (CHILD_SINK, fhd60_edid(), u16::MAX),
+    ];
+    let lit = select(caps(Hbr3), &small, &[Some(0), None]);
+    if affected(caps(Hbr3), &small, &lit, &[None, Some(1)], &ctx) != Some(0) {
+        return TestResult::Fail("1080p beside an uncompressed 4K");
+    }
+    let big = [
+        (ROOT_SINK, uhd60_edid(3), u16::MAX),
+        (CHILD_SINK, uhd60_edid(3), u16::MAX),
+    ];
+    // The running 4K60 on pipe 2 runs uncompressed alone.
+    let alone: Vec<_> = select(caps(Hbr2), &big, &[Some(2), None]);
+    if alone.len() != 1 || alone[0].0.dsc.is_some() || alone[0].1 != 2 {
+        return TestResult::Fail("one 4K alone");
+    }
+    if affected(caps(Hbr2), &big, &alone, &[None, Some(1)], &ctx) != Some(1 << 2) {
+        return TestResult::Fail("a second 4K compresses the running one");
+    }
+    // Both lit from the search: nothing changes; one leaving modesets the
+    // other (it would run uncompressed alone).
+    let joint = select(caps(Hbr2), &big, &[Some(2), Some(1)]);
+    if joint.len() != 2 || joint.iter().any(|(s, _)| s.dsc.is_none()) {
+        return TestResult::Fail("both compressed");
+    }
+    if affected(caps(Hbr2), &big, &joint, &[None, None], &ctx) != Some(0) {
+        return TestResult::Fail("both running");
+    }
+    let left: Vec<_> = joint.iter().copied().filter(|&(_, p)| p == 2).collect();
+    if affected(caps(Hbr2), &big, &left, &[None, None], &ctx) != Some(1 << 2) {
+        return TestResult::Fail("one leaving");
+    }
+    // No decoder on the link: running payloads stay (only the changed
+    // connectors' time slots are found again).
+    if affected(caps(Hbr2), &big, &alone, &[None, Some(1)], &plain) != Some(0) {
+        return TestResult::Fail("a link without decoders");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-mst",
+    navi48_mst_dsc_affected_streams_like_amdgpu_dm
+);

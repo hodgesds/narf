@@ -2460,7 +2460,8 @@ no stream left on it) drops its connectors and their routes. Shared-link loss st
 of invoking the SST retrain path. A downstream change that keeps every lit
 route is adopted live (`reprobe_live`, above) and republishes the
 connectors; a newly appeared end device lights beside the running streams
-and a departed one retires only its own stream. A changed primary branch or
+and a departed one retires only its own stream; an MST stream a DSC
+fairness change touches is modeset alone. A changed primary branch or
 lost hop capacity uses the whole-link stop/reprobe/relight sequence, so
 other streams briefly blank. KMS can publish
 a newly discovered EDID and independently admitted timings as connected with
@@ -4531,9 +4532,9 @@ connectors) and the new stream takes the slots, hop PBN and payload count
 (`MAX_PAYLOADS`) it leaves; with decoders the link's fairness search reruns
 over the running streams first (topology order), then the new ones
 (is_dsc_need_re_compute, compute_mst_dsc_configs_for_link), and a change to
-any running stream's PBN, slots or DSC returns `None`: Linux modesets those
-streams (drm_dp_mst_add_affected_dsc_crtcs; dc_is_stream_unchanged keeps the
-rest), NARF relights. `None` too for an MST session with an uncertain
+any running stream's PBN, slots or DSC returns `None`; Linux modesets those
+streams (drm_dp_mst_add_affected_dsc_crtcs; pre_validate_dsc keeps the rest),
+and so does the platform below. `None` too for an MST session with an uncertain
 transaction or a dirty topology under streams, or a root whose rescanned link
 caps no longer match the running streams'. The new stream lights as in a
 full configuration (`start_mst_stream`): on a link that runs it attaches and
@@ -4561,16 +4562,31 @@ VC rate zero, ALLOCATE_PAYLOAD with PBN 0, its payload-table row cleared, SAT
 without it with ACT, later payloads compacted). The platform monitor lights
 a new sink or end device beside the running displays when nothing they
 asked for changed (`MonitorStep::LitBeside`) and replans after a display
-left (`MonitorStep::Replanned`), relighting everything only when refused or
-when a departed MST stream changes the DSC fairness of the streams left on
-its link (`ColdBoot::mst_streams_kept`, Linux's recomputation on removal).
+left (`MonitorStep::Replanned`), relighting everything only when refused.
+
+`ColdBoot::mst_affected_streams(port, joining, want) -> Option<u8>` (by
+pipe; `mst::affected_mst_streams`) gives the running streams on `port` a
+commit must modeset, as amdgpu_dm finds them: every stream of the topology
+in the commit (drm_dp_mst_add_affected_dsc_crtcs), the link's fairness
+search run over them all with the devices `joining` lights (each running
+stream at its timing, through the depth loop), and every stream whose
+timing, depth, DSC (dc_is_timing_changed) or payload that changes kept in
+the commit, the others not (pre_validate_dsc). A link without decoders
+never modesets running streams. The monitor uses it both ways
+(`MonitorStep::Reconfigured`): when a beside lighting is refused, the
+running streams the new end devices change are torn down and lit again,
+with them, beside the displays left running; after an MST stream left, the
+streams its departure changes are torn down and lit again beside the
+others. Only a search that fits nothing relights everything.
 
 Gaps: mode or color changes of a running display and FRL retraining still
-relight (plane changes no longer do: see below); where Linux modesets just
-the MST streams a DSC fairness change touches, NARF relights every display; a
-running display whose new plan needs other pipes refuses the seamless
-change; scanning for the new sinks reads every port (AUX/DDC) while the
-others run. Model-tested only (`dcn401-clk`, `dcn401-dccg`,
+relight (plane changes no longer do: see below); a lost hop capacity or a
+changed primary branch on an MST link still relights; a running display
+whose new plan needs other pipes refuses the seamless change; scanning for
+the new sinks reads every port (AUX/DDC) while the others run; an affected
+MST stream lit again is selected beside the unaffected ones (seeded
+search), so a search whose result depends on the order falls back to a
+relight. Model-tested only (`dcn401-clk`, `dcn401-dccg`,
 `dcn401-scanout`, `navi48-modeset`); not validated on hardware.
 
 ### Navi 48 seamless plane updates
