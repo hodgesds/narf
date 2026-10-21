@@ -11356,6 +11356,10 @@ pub(crate) fn vfork_parent_wait(ctx: &mut dyn TrapContext, child_pid: u64, paren
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
         }
+        // TASK_KILLABLE: `park_should_block` sleeps on this, not on the
+        // interruptible signal rule (see `UserTaskCtx::vfork_wait_child`).
+        uc.vfork_wait_child
+            .store(child_pid, core::sync::atomic::Ordering::Release);
         loop {
             // Arm before inspecting the row: vfork_child_release removes the
             // row before waking us, so this closes the final check-to-sleep
@@ -11376,6 +11380,8 @@ pub(crate) fn vfork_parent_wait(ctx: &mut dyn TrapContext, child_pid: u64, paren
             }
             crate::user_task::own_stack_park();
         }
+        uc.vfork_wait_child
+            .store(0, core::sync::atomic::Ordering::Release);
         uc.sleep_deadline_ns
             .store(0, core::sync::atomic::Ordering::Release);
     }

@@ -122,6 +122,14 @@ pub struct UserTaskCtx {
     /// terminal status before sleeping, so migration and wake-before-register
     /// races do not require a polling deadline.
     pub sem_wait_pending: AtomicBool,
+    /// Visible pid of the `CLONE_VFORK` child this task is suspended on in
+    /// `clone`/`clone3`/`vfork`, or 0. Linux `wait_for_vfork_done` sleeps
+    /// `TASK_KILLABLE`: only the child's exec/exit or a fatal signal ends
+    /// the wait. The park loop honours that instead of its interruptible
+    /// rule, under which a pending SIGCHLD made every park return at once
+    /// and the parent busy-spun on its CPU, starving the child that had to
+    /// run to release it.
+    pub(crate) vfork_wait_child: AtomicU64,
     /// A retained SysV semaphore operation exists in the wait registry.
     /// Unlike `sem_wait_pending`, this remains set after the scheduler observes
     /// a ready completion and is cleared only when the rewound syscall removes
@@ -730,6 +738,7 @@ impl UserTaskCtx {
             net_io_wait: AtomicBool::new(false),
             durable_io_wait: AtomicBool::new(false),
             sem_wait_pending: AtomicBool::new(false),
+            vfork_wait_child: AtomicU64::new(0),
             sem_wait_record: AtomicBool::new(false),
             sem_wait_ipc_ns: AtomicU64::new(0),
             sem_wait_id: AtomicU64::new(0),
@@ -1122,6 +1131,27 @@ fn park_should_block(
     // Watchdog liveness signal: this task's park loop ran (see
     // `UserTaskCtx::dbg_park_checks`).
     uc.dbg_park_checks.fetch_add(1, Ordering::Relaxed);
+
+    // CLONE_VFORK parent (`wait_for_vfork_done`, TASK_KILLABLE): sleep until
+    // the child releases the row on exec/exit or SIGKILL is pending; any other
+    // signal stays pending without ending the sleep. Both the release and a
+    // SIGKILL raise `wake_signal` this task, so arm its signal waker first and
+    // then recheck, closing the check-to-sleep window.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        let vfork_child = uc.vfork_wait_child.load(Ordering::Acquire);
+        if vfork_child != 0 {
+            crate::handlers::register_signal_waker(task_id, waker.clone());
+            if !crate::handlers::vfork_is_pending(vfork_child)
+                || (crate::handlers::signal_pending_bits(task_id) & crate::handlers::sig_bit(9))
+                    != 0
+            {
+                crate::handlers::drop_signal_waker(task_id);
+                return false;
+            }
+            return true;
+        }
+    }
 
     // Job-control stop (SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU): stay parked until
     // SIGCONT clears the stopped flag; a pending SIGKILL still breaks through.
