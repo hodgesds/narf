@@ -40,6 +40,7 @@ mod cachyos_root;
 mod ci_clippy;
 mod composition;
 mod crate_release;
+mod gpu_reference;
 mod http3_smoke;
 /// The `affected` subcommand: crate reverse-dependency closure → the set
 /// of CI jobs/subsystems a diff can affect. Its pure core is unit-tested.
@@ -69,6 +70,8 @@ struct RelocsArgs {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Check native GPU reference harnesses against an explicit Linux commit.
+    GpuReference(gpu_reference::Args),
     /// Run the fast, hardware-independent unit-test suite on the host.
     ///
     /// This intentionally names an allowlist: crates that require the
@@ -13558,6 +13561,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::HostTest => host_test_cmd(),
+        Cmd::GpuReference(args) => gpu_reference::run(&args, &workspace_root()?),
         Cmd::Passthrough(args) => passthrough_cmd(&args),
         Cmd::Relocs(args) => {
             let table = if args.patch {

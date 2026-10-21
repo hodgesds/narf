@@ -83,6 +83,12 @@ and CI compiler-cache integration.
   than the legacy VGA text console. Headless 2D and full-profile 2D fixtures
   retain their legacy display coverage.
 - `cargo xtask test --arch=aarch64` — boot + run all kernel tests.
+- `cargo xtask gpu-reference --linux-tree PATH --linux-revision FULL_SHA`
+  runs the GPU primary-source `*/check.sh` harnesses against that explicit
+  Linux Git commit. The tree must be clean, including untracked and ignored
+  files, and remain at that revision throughout the run. It never downloads
+  or modifies Linux. This opt-in command is separate from checked-in vector
+  replay, which needs no host Linux source checkout.
 - `cargo xtask test --arch=x86_64 --subsystem userspace` — run that subsystem
   and its `/`-delimited children, then perform the normal whole-kernel boot
   smoke. Comma-separated filters select the union of those subtrees.
