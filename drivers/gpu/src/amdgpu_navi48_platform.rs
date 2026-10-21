@@ -728,6 +728,8 @@ async unsafe fn resume_device(runtime: bool) -> Result<boot::Report, boot::Error
                 narf_console::Writer,
                 "amdgpu: navi48 BACO exit {error:?}; device lost"
             );
+            // Frames complete again (the lost device shows none).
+            gate_presenters(false);
             // Dropping the retained owner quarantines it and marks it lost.
             return Err(error);
         }
