@@ -64,8 +64,9 @@ pub struct CursorApplied {
     /// (ENABLE_CURSOR_DEGAMMA) under the CRTC's legacy gamma
     /// (cm_is_degamma_srgb, with DCN401's dpp gamma_corr cap) and
     /// dpp401_set_cursor_attributes sets for a premultiplied cursor. Taken
-    /// from the CRTC color with every attribute update (a move too); a
-    /// color change alone leaves it, as it leaves Linux's.
+    /// from the CRTC color with every attribute update: a move, and a CRTC
+    /// color change, whose commit amdgpu_dm_atomic_check extends to the
+    /// CRTC's cursor plane (`Otg::set_color`).
     pub degamma: bool,
 }
 impl CursorApplied {

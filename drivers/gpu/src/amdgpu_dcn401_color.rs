@@ -536,11 +536,7 @@ impl<I: Io> Engine<I> {
         program: Option<Arc<ColorProgram>>,
     ) -> Result<(), Error> {
         let slot = usize::from(pipe);
-        let unchanged = match (&self.displays.color[slot], &program) {
-            (Some(a), Some(b)) => Arc::ptr_eq(a, b) || **a == **b,
-            (None, None) => true,
-            _ => false,
-        };
+        let unchanged = same_color(&self.displays.color[slot], &program);
         self.displays.color[slot] = program;
         if self.status.state != State::ScanoutRunning(pipe) || unchanged {
             return Ok(());
@@ -585,10 +581,49 @@ impl<I: Io> Engine<I> {
     }
 }
 
+/// Whether two CRTC color records program the same.
+fn same_color(a: &Option<Arc<ColorProgram>>, b: &Option<Arc<ColorProgram>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b) || **a == **b,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+impl Surfaces {
+    /// `Engine::set_color`, then, for a changed color on a live scanout,
+    /// the display's cursor again: amdgpu_dm_atomic_check adds every plane
+    /// of a CRTC whose color_mgmt_changed (drm_atomic_add_affected_planes),
+    /// its cursor plane included, so the commit's
+    /// amdgpu_dm_plane_handle_cursor_update sets the cursor's attributes
+    /// (ENABLE_CURSOR_DEGAMMA, so CUR0_ROM_EN, following the new legacy
+    /// gamma) and position again.
+    pub(in crate::amdgpu_dcn401_otg) async fn set_color<I: Io>(
+        &self,
+        e: &mut Engine<I>,
+        pipe: u8,
+        program: Option<Arc<ColorProgram>>,
+    ) -> Result<(), Error> {
+        let changed = !same_color(
+            e.displays.color.get(usize::from(pipe)).unwrap_or(&None),
+            &program,
+        );
+        e.set_color(pipe, program).await?;
+        let cursor = e.status.cursor.filter(|c| c.pipe == pipe);
+        if changed && e.status.state == State::ScanoutRunning(pipe) {
+            if let Some(c) = cursor {
+                self.move_cursor(e, pipe, (c.x, c.y))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Otg {
     /// Set display `pipe`'s CRTC color (`None`: bypass). A live scanout is
-    /// reprogrammed at once; otherwise the next scanout start programs it.
-    /// A failure on a live scanout leaves `Failed`.
+    /// reprogrammed at once, its cursor too when the color changed
+    /// (`Surfaces::set_color`); otherwise the next scanout start programs
+    /// it. A failure on a live scanout leaves `Failed`.
     /// # Safety
     /// Exclude firmware/FAMS and concurrent display writers.
     pub async unsafe fn set_color(
@@ -598,7 +633,7 @@ impl Otg {
     ) -> Result<(), Error> {
         // Display k scans out on pipe k: address that display's records.
         self.0.select_display(pipe)?;
-        self.0.set_color(pipe, program).await
+        self.1.set_color(&mut self.0, pipe, program).await
     }
     /// The color display `pipe` was last asked for.
     pub fn color(&self, pipe: u8) -> Option<Arc<ColorProgram>> {

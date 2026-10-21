@@ -4869,7 +4869,10 @@ cursor's attributes carry amdgpu_dm's ENABLE_CURSOR_DEGAMMA under legacy
 gamma (DCN401's dpp gamma_corr cap), which dpp401_set_cursor_attributes
 makes CUR0_ROM_EN for the premultiplied cursor
 (`CursorApplied::degamma`, from the CRTC with every attribute update, a
-move included). `tests/dcn401_yuv/check.sh` also checks 540 vectors
+move included; a changed CRTC color on a live display reprograms the
+cursor's attributes and position too (`Surfaces::set_color`, under
+`Otg::set_color`), as amdgpu_dm_atomic_check adds the CRTC's cursor plane
+to a commit whose color_mgmt_changed). `tests/dcn401_yuv/check.sh` also checks 540 vectors
 (`color_vectors.txt`: format, legacy gamma, CM_POST_CSC_MODE_CURRENT,
 encoding, range; the input transfer function's PRE_DEGAM, GAMCOR mode and
 select and the FNV-1a of its writes) of those Linux functions compiled

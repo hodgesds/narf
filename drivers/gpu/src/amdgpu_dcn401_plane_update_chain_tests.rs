@@ -842,3 +842,58 @@ kernel_test_in!(
     "drivers/gpu/dcn401-plane-update",
     dcn401_live_plane_update_moves_the_cursor_with_the_planes
 );
+
+/// A CRTC color change on a live display reprograms its cursor, as
+/// amdgpu_dm_atomic_check pulls the cursor plane into the commit: turning
+/// legacy gamma on sets CUR0_ROM_EN (ENABLE_CURSOR_DEGAMMA) and off clears
+/// it, the cursor staying where it was; an unchanged color leaves the
+/// cursor's registers alone.
+fn dcn401_crtc_color_change_reprograms_the_cursor() -> TestResult {
+    let (t, s, p) = ROUTES[1];
+    let mut c = chain(t, s, p);
+    if run(c.start()).is_err() {
+        return TestResult::Fail("start");
+    }
+    let image = alloc::vec![0x8000_0000u32; 32 * 32];
+    if c.surfaces
+        .set_cursor(&mut c.e, &c.pool, config(), p, (32, 32, &image), (110, 120))
+        .is_err()
+    {
+        return TestResult::Fail("cursor");
+    }
+    // CM_CUR0_CURSOR0_CONTROL's CUR0_ROM_EN (bit 3).
+    let cm_control = dpp_reg(p, 0xcf1);
+    for legacy in [true, false] {
+        let program = alloc::sync::Arc::new(ColorProgram {
+            pre_degam_srgb: legacy,
+            ..Default::default()
+        });
+        if run(c.surfaces.set_color(&mut c.e, p, Some(program))).is_err() {
+            return TestResult::Fail("color update");
+        }
+        let Some(cursor) = c.e.status.cursor else {
+            return TestResult::Fail("cursor record");
+        };
+        if cursor.degamma != legacy
+            || (c.e.io.get(cm_control) >> 3 & 1 != 0) != legacy
+            || (cursor.x, cursor.y) != (110, 120)
+            || run(c.check()).is_err()
+        {
+            return TestResult::Fail("cursor degamma after the color change");
+        }
+    }
+    let writes = c.e.io.inner.inner.writes.len();
+    let same = alloc::sync::Arc::new(ColorProgram::default());
+    if run(c.surfaces.set_color(&mut c.e, p, Some(same))).is_err()
+        || c.e.io.inner.inner.writes[writes..]
+            .iter()
+            .any(|&(at, _)| at == cm_control)
+    {
+        return TestResult::Fail("unchanged color reprogrammed the cursor");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-plane-update",
+    dcn401_crtc_color_change_reprograms_the_cursor
+);
