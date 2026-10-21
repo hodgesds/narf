@@ -6734,6 +6734,78 @@ impl AddressSpace {
         Ok(region)
     }
 
+    /// Retire every user mapping of an address space whose final process is
+    /// exiting, while leaving the root table and lifetime translation tag
+    /// alive for the scheduler's pending switch back to its kernel root.
+    /// Returns the number of base pages removed.
+    ///
+    /// This is intentionally stronger than the OOM reaper: it removes VMA
+    /// metadata, shared/locked backing, huge mappings, and empty intermediate
+    /// page tables through the ordinary unmap paths. The later final `Drop`
+    /// sees empty region tables and releases only the root, tag, and remaining
+    /// address-space-wide owner metadata, so repeated calls are harmless.
+    ///
+    /// A `CLONE_VM` address space is refused even if its process's last thread
+    /// is exiting. A distinct process may still use that mm, and this layer
+    /// cannot prove otherwise from `Arc` counts because observers and
+    /// introspection also retain `Arc`s.
+    ///
+    /// # Safety
+    /// The caller must prove that no task can execute user code in this
+    /// address space again and that all exit-time user-memory accesses have
+    /// completed. Kernel execution may continue briefly: the architecture
+    /// root and its lifetime PCID/ASID remain owned until final `Drop`.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    pub unsafe fn reclaim_unshared_on_exit(&self) -> usize {
+        if self.root.as_u64() == 0 || self.is_vm_shared() {
+            return 0;
+        }
+
+        // A deferred-unmap quarantine owns regions and detached table frames
+        // which are absent from the live region tables. Drain it first so this
+        // exit pass returns those frames as well.
+        self.flush_deferred();
+
+        let mut pages = 0usize;
+        loop {
+            let next = self.huge_regions.lock().first().map(|region| {
+                let page_bytes = region.frames.first().map_or(0, |frame| frame.size_bytes());
+                let resident = region
+                    .frames
+                    .len()
+                    .saturating_mul((page_bytes >> 12) as usize);
+                (region.base, resident)
+            });
+            let Some((base, resident)) = next else {
+                break;
+            };
+            if self.unmap_huge_region(base).is_err() {
+                break;
+            }
+            pages = pages.saturating_add(resident);
+        }
+
+        loop {
+            let next = self.regions.lock().iter().next().map(|region| region.base);
+            let Some(base) = next else {
+                break;
+            };
+            let Ok(region) = self.unmap_region(base) else {
+                // Swap transitions are the only expected obstruction. Leave
+                // this and later regions for final Drop instead of spinning.
+                break;
+            };
+            pages = pages.saturating_add(((region.len + 0xFFF) >> 12) as usize);
+        }
+
+        pages
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub unsafe fn reclaim_unshared_on_exit(&self) -> usize {
+        0
+    }
+
     /// MAP_FIXED "punch": drop the `[base, base+len)` sub-range from any
     /// overlapping region — unmapping + freeing ONLY those pages — while
     /// preserving the rest of each region (prefix `[rb, base)` and suffix

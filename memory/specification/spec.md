@@ -603,6 +603,14 @@ impl AddressSpace {
     /// Remove an exact huge mapping and return its backing to the pool.
     pub fn unmap_huge_region(&self, base: VirtAddr)
         -> Result<(), AddressSpaceError>;
+    /// Final-process exit teardown for an address space which was never shared
+    /// with CLONE_VM. Retires every user mapping and empty intermediate page
+    /// table while retaining the root and PCID/ASID until final Drop. Refuses a
+    /// vm-shared address space and is idempotent.
+    ///
+    /// Safety: no task may execute user code in this address space again, and
+    /// all exit-time user-memory accesses must already be complete.
+    pub unsafe fn reclaim_unshared_on_exit(&self) -> usize;
     /// Test membership across both base-page and hardware huge-page regions.
     pub fn contains_address(&self, vaddr: VirtAddr) -> bool;
     /// Return the registered hardware leaf size (4 KiB, 2 MiB, or 1 GiB).

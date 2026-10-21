@@ -5134,13 +5134,15 @@ fn boot_userspace_init() {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    // The handlers reach `current_task_id()` then look up its
-    // address space — this lookup goes through the scheduler's
-    // ready-queue scan.
+    // The handlers reach `current_task_id()` then look up its address space.
     // The by-task-id resolver, for syscalls that act on a target named by a
     // pidfd rather than on the caller. No `current_address_space()`
     // short-circuit here: that would answer for the CALLER whenever the
     // target happened not to be on the run queue.
+    // Use the lifetime registry, not only the ready-queue scan: a task is
+    // absent from every ready queue while an executor is polling it. In
+    // particular, process-exit observers run in that window and must still be
+    // able to retire the dying task's mappings before waking its parent.
     narf_userspace::install_address_space_for_task_lookup(|task| {
         narf_scheduler::address_space_of_live(narf_scheduler::TaskId(task))
     });

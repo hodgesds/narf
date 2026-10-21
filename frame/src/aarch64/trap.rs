@@ -300,7 +300,20 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
         // instruction abort, to the instruction that could not be fetched.
         match try_heal_user_abort(esr, far, true) {
             HealOutcome::Healed => return,
-            outcome => el0_bus = outcome == HealOutcome::Bus,
+            outcome => {
+                // A fatal signal can wake a task parked in demand-fault
+                // reclaim. Consume it before routing the allocation failure as
+                // a new synchronous SIGSEGV/SIGBUS; standard SIGKILL is
+                // coalesced, so the reclaim wake is the task's one guaranteed
+                // chance to leave the wait.
+                if narf_userspace::handlers::current_task_fatal_signal_pending() {
+                    let mut ctx = Aarch64TrapContext::from_svc(frame);
+                    if let Some(hook) = narf_userspace::handlers::signal_delivery_hook() {
+                        hook(&mut ctx, narf_userspace::handlers::SYSCALL_NUM_NONE);
+                    }
+                }
+                el0_bus = outcome == HealOutcome::Bus;
+            }
         }
         el0_far = far;
     } else if ec == EC_PC_ALIGN {

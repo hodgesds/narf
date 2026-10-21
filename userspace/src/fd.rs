@@ -2059,15 +2059,29 @@ pub fn detach(task_id: u64) {
     // `exit_files` → `put_files_struct`: the last thread sharing the table
     // closes every descriptor in it, exactly like close(2) would.
     if let Some(table) = table {
-        if Arc::strong_count(&table) == 1 {
-            let closed: Vec<Arc<dyn FileOps>> = table
-                .lock()
-                .slots
-                .iter_mut()
-                .filter_map(|slot| slot.take().map(|entry| entry.ops))
-                .collect();
-            drop(table);
-            release_closed(task_id, closed);
+        if let Ok(table) = Arc::try_unwrap(table) {
+            // Consume the unique table directly instead of collecting its
+            // entries into a temporary Vec. Exit is a memory-release path and
+            // must keep making progress when the heap is exhausted; the old
+            // collect could panic on even a 128-byte allocation during a fork
+            // storm, before any of these descriptor references were dropped.
+            let FdTable {
+                slots,
+                descriptions,
+                reserved,
+                ..
+            } = table.into_inner();
+            // Preserve the old ordering: dropping the table released open-file
+            // descriptions and reservations before socket registrations were
+            // examined by `release_closed`.
+            drop(descriptions);
+            drop(reserved);
+            release_closed(
+                task_id,
+                slots
+                    .into_iter()
+                    .filter_map(|slot| slot.map(|entry| entry.ops)),
+            );
         }
     }
     // Drop any advisory POSIX locks the task held so its peers can

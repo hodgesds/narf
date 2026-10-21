@@ -9488,6 +9488,56 @@ fn forget_sole_as(arc: alloc::sync::Arc<crate::AddressSpace>) {
     }
 }
 
+/// Final-process teardown removes VMA metadata as well as resident backing,
+/// detaches now-empty page tables, and is idempotent. An address space ever
+/// shared with CLONE_VM is refused because a different process may remain live.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_exit_reclaim_retires_unshared_mappings_only() -> TestResult {
+    use crate::{address_space::AddressSpaceMemoryStats, VirtAddr};
+
+    let vbase = 0x0000_0080_0F00_0000u64;
+    let pages = 5usize;
+    let Some(as_arc) = build_reapable_as(vbase, pages) else {
+        return TestResult::Skip("could not build exit-reclaim AS");
+    };
+
+    // SAFETY: this private test address space was never scheduler-visible and
+    // no task can execute through it or perform an exit-time user access.
+    let reclaimed = unsafe { as_arc.reclaim_unshared_on_exit() };
+    if reclaimed != pages {
+        return TestResult::Fail("exit reclaim did not retire every mapped page");
+    }
+    if as_arc.region_count() != 0 || as_arc.memory_stats() != AddressSpaceMemoryStats::default() {
+        return TestResult::Fail("exit reclaim retained VMA metadata");
+    }
+    // SAFETY: the root remains live through final AddressSpace::drop.
+    if unsafe { translate_arch(as_arc.root, VirtAddr::new(vbase)) }.is_some() {
+        return TestResult::Fail("exit-reclaimed page still translates");
+    }
+    // SAFETY: same dead, private test address space; idempotency is the point.
+    if unsafe { as_arc.reclaim_unshared_on_exit() } != 0 {
+        return TestResult::Fail("second exit reclaim was not idempotent");
+    }
+    drop(as_arc);
+
+    let Some(shared) = build_reapable_as(vbase + 0x20_0000, 1) else {
+        return TestResult::Skip("could not build vm-shared exit-reclaim AS");
+    };
+    shared.mark_vm_shared();
+    // SAFETY: no task uses the test AS. The call must nevertheless refuse it
+    // because production cannot prove a CLONE_VM process is the final owner.
+    if unsafe { shared.reclaim_unshared_on_exit() } != 0 || shared.region_count() != 1 {
+        return TestResult::Fail("exit reclaim accepted a vm-shared address space");
+    }
+    drop(shared);
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "memory",
+    smoke_memory_exit_reclaim_retires_unshared_mappings_only
+);
+
 /// A victim whose region lock is transiently held is REQUEUED (not dropped) by
 /// `reap_all`, then reaped once the lock is released — proving a transient
 /// `try_lock` failure never strands the victim's frames.

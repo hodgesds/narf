@@ -1549,6 +1549,16 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                 if r.is_ok() {
                     return;
                 }
+                // SIGKILL may have arrived while `demand_page` was parked on
+                // reclaim. Its scheduler kick is deliberately enough to end
+                // that wait; honour the pending fatal signal before this failed
+                // allocation is misclassified as a fresh synchronous SIGSEGV.
+                if from_user && narf_userspace::handlers::current_task_fatal_signal_pending() {
+                    let mut ctx = X86TrapContext::from_int80(frame);
+                    if let Some(hook) = narf_userspace::handlers::signal_delivery_hook() {
+                        hook(&mut ctx, narf_userspace::handlers::SYSCALL_NUM_NONE);
+                    }
+                }
                 file_fault_bus = r == Err(narf_memory::AddressSpaceError::Bus);
                 // A guard marker is a final SIGSEGV, never a stack grow.
                 let guard_fault = r == Err(narf_memory::AddressSpaceError::GuardPage);
