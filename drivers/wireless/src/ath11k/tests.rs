@@ -193,6 +193,32 @@ kernel_test_in!(
     smoke_ath11k_window_constants_consistent
 );
 
+fn smoke_ath11k_msi_probe_unwind_releases_handlers_and_vector() -> TestResult {
+    let vector = match narf_interrupts::vector::alloc() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("ath11k: could not allocate test MSI vector"),
+    };
+    // The single-vector fallback assigns every MHI IRQ entry to vector 0,
+    // represented by the combined cookie below.  Install precisely what
+    // `alloc_msi` installs, then exercise its error-unwind helper.
+    narf_interrupts::install_handler_named(vector, "ath11k-mhi", 0b111, |_| {
+        narf_interrupts::IrqStatus::Handled
+    });
+    super::pci::teardown_msi_vectors(&MSI_CONFIG_ONE, vector as u32, 1, vector);
+
+    if narf_interrupts::vector::is_allocated(vector) {
+        return TestResult::Fail("ath11k: failed probe leaked its MSI vector");
+    }
+    if !narf_interrupts::installed_handler_names(vector).is_empty() {
+        return TestResult::Fail("ath11k: failed probe left an MSI handler installed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_msi_probe_unwind_releases_handlers_and_vector
+);
+
 // MHI protocol + host tests live in `mhi_tests.rs`.
 
 // ── Live-silicon smoke ─────────────────────────────────────────────
