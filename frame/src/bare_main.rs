@@ -5142,20 +5142,18 @@ fn boot_userspace_init() {
     // short-circuit here: that would answer for the CALLER whenever the
     // target happened not to be on the run queue.
     narf_userspace::install_address_space_for_task_lookup(|task| {
-        narf_scheduler::address_space_of(narf_scheduler::TaskId(task))
+        narf_scheduler::address_space_of_live(narf_scheduler::TaskId(task))
     });
     install_address_space_lookup(|| {
-        // Prefer the executor-published "currently-polling AS" —
-        // address_space_of searches the run-queue, which doesn't
-        // include the popped-and-being-polled slot. The fallback
-        // is kept so kernel-side introspection paths that resolve
-        // by id (not currently-polling) still work for tasks that
-        // are sitting on the queue.
+        // Prefer the executor-published "currently-polling AS". The
+        // fallback resolves by id through the live registry, which also
+        // covers a task staged in a wake inbox or parked, not only one
+        // sitting on a ready queue.
         if let Some(a) = narf_scheduler::current_address_space() {
             return Some(a);
         }
         let id = narf_scheduler::current_task_id();
-        narf_scheduler::address_space_of(id)
+        narf_scheduler::address_space_of_live(id)
     });
     install_all_address_spaces_lookup(narf_scheduler::all_address_spaces);
     // Make `gettid` (and any handler that calls

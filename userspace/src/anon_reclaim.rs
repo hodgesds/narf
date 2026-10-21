@@ -34,7 +34,7 @@ impl AnonReclaimer for TaskAnonReclaimer {
             }
             // Only user processes have an address space; a kernel task or an
             // already-reaped zombie resolves to None and is skipped.
-            let Some(aspace) = narf_scheduler::address_space_of(TaskId(tid)) else {
+            let Some(aspace) = narf_scheduler::address_space_of_live(TaskId(tid)) else {
                 continue;
             };
             // Tier zero: drain this space's deferred-flush quarantine — the

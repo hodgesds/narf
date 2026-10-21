@@ -8769,8 +8769,8 @@ pub(crate) fn shares_mm(a: u64, b: u64) -> bool {
         return true;
     }
     match (
-        narf_scheduler::address_space_of(narf_scheduler::TaskId(a)),
-        narf_scheduler::address_space_of(narf_scheduler::TaskId(b)),
+        narf_scheduler::address_space_of_live(narf_scheduler::TaskId(a)),
+        narf_scheduler::address_space_of_live(narf_scheduler::TaskId(b)),
     ) {
         (Some(x), Some(y)) => Arc::ptr_eq(&x, &y),
         _ => false,
