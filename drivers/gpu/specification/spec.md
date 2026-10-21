@@ -5021,23 +5021,33 @@ P-state step.
 
 `ColdBoot::modeset_beside(fill, want, crtc_of, mst: &[MstRoute])` lights
 new board sinks and new MST end devices beside the running displays (route
-CRTCs already lit are ignored): DML admits every running display's mode with
-as many new ones as fit (`dml::admit_native`, CRTC order), each running
-display keeping its pipes (`modeset::keeps_pipes`: the same mode, ODM
-segments and MPC slices; otherwise `None`, as for no free slot or a
-running configuration that no longer fits, before any change). A new end
+CRTCs already lit are ignored), returning
+`Result<Configuration, BesideRefusal>` within its error: DML admits every
+running display's mode with as many new ones as fit (`dml::admit_native`,
+CRTC order), each running display keeping its pipes (`modeset::keeps_pipes`:
+the same mode, ODM segments and MPC slices; otherwise
+`BesideRefusal::Other`, as for no free slot or a running configuration that
+no longer fits, before any change). A new end
 device is selected beside its port's running streams
 (`mst::select_mst_outputs_beside`): without DSC decoders a running payload
 stays as it is (Linux runs drm_dp_atomic_find_time_slots only for changed
 connectors) and the new stream takes the slots, hop PBN and payload count
 (`MAX_PAYLOADS`) it leaves; with decoders the link's fairness search reruns
-over the running streams first (topology order), then the new ones
-(is_dsc_need_re_compute, compute_mst_dsc_configs_for_link), and a change to
-any running stream's PBN, slots or DSC returns `None`; Linux modesets those
-streams (drm_dp_mst_add_affected_dsc_crtcs; pre_validate_dsc keeps the rest),
-and so does the platform below. `None` too for an MST session with an uncertain
-transaction or a dirty topology under streams, or a root whose rescanned link
-caps no longer match the running streams'. The new stream lights as in a
+over the link's streams in topology order, each running one at its place
+with its timing and depth and each new one through the depth loop
+(is_dsc_need_re_compute, compute_mst_dsc_configs_for_link), and a change
+to (or a search that no longer fits) any running stream's PBN, slots or DSC
+returns `BesideRefusal::DscFairness`; Linux modesets those streams
+(drm_dp_mst_add_affected_dsc_crtcs; pre_validate_dsc keeps the rest), and
+so does the platform below. Documented deviation: amdgpu_dm searches in
+dc_state order (the order the streams were added); NARF searches in
+topology order, which the affected-stream search below shares, so that a
+partial relight lights the affected streams back with the configuration
+that search found and keeps the others (with the running streams first,
+some topologies refused that relight every time and fell back to a full
+one). `BesideRefusal::Other` for an MST session with an uncertain
+transaction or a dirty topology under streams, or a root whose rescanned
+link caps no longer match the running streams'. The new stream lights as in a
 full configuration (`start_mst_stream`): on a link that runs it attaches and
 adds only its own payload — payload-table row, SAT rows for every stream
 with ACT, ACT handled, ALLOCATE_PAYLOAD for its VCPI, its VC rate — while
@@ -5069,13 +5079,16 @@ left (`MonitorStep::Replanned`), relighting everything only when refused.
 CRTC; `mst::affected_mst_streams`) gives the running streams on `port` a
 commit must modeset, as amdgpu_dm finds them: every stream of the topology
 in the commit (drm_dp_mst_add_affected_dsc_crtcs), the link's fairness
-search run over them all with the devices `joining` lights (each running
-stream at its timing, through the depth loop), and every stream whose
+search run over them all with the devices `joining` lights in topology
+order (each running stream at its timing, through the depth loop), and
+every stream whose
 timing, depth, DSC (dc_is_timing_changed) or payload that changes kept in
 the commit, the others not (pre_validate_dsc). A link without decoders
 never modesets running streams. The monitor uses it both ways
-(`MonitorStep::Reconfigured`): when a beside lighting is refused, the
-running streams the new end devices change are torn down and lit again,
+(`MonitorStep::Reconfigured`): when a beside lighting is refused for DSC
+fairness (`BesideRefusal::DscFairness`; any other refusal relights
+everything), the running streams the new end devices change are torn down
+and lit again,
 with them, beside the displays left running; after an MST stream left, the
 streams its departure changes are torn down and lit again beside the
 others. Only a search that fits nothing relights everything.

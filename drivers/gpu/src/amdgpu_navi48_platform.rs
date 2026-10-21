@@ -6292,10 +6292,11 @@ pub async unsafe fn monitor_displays(
             let fill = |_: u8, _: u32, row: &mut [u32]| row.fill(0);
             // SAFETY: as above; the running displays stay lit and published.
             let mut beside = unsafe { light_beside(boot, &displays.lit, fill, reprobe) }.await?;
-            // Refused: when the new streams' DSC fairness search changes
-            // running MST streams, Linux modesets just those (torn down
+            // Refused because the new streams' DSC fairness search changes
+            // running MST streams: Linux modesets just those (torn down
             // here) and lights them with the new streams beside the rest.
-            let affected = if beside.is_none() {
+            // Any other refusal is a full relight.
+            let affected = if beside == Err(boot::BesideRefusal::DscFairness) {
                 beside_affected(boot, lit_mask)
             } else {
                 None
@@ -6308,7 +6309,7 @@ pub async unsafe fn monitor_displays(
                     beside = unsafe { light_beside(boot, &displays.lit, fill, reprobe) }.await?;
                 }
             }
-            beside
+            beside.ok()
         } else {
             None
         };
@@ -8506,10 +8507,11 @@ fn beside_affected(boot: &boot::ColdBoot, lit_mask: u8) -> Option<u8> {
 /// (each CRTC's stream on the head pipe it acquires), which stay lit:
 /// `ColdBoot::modeset_beside`'s
 /// seamless configuration change (shared clocks raised before and lowered
-/// after, the running displays moved to their new plans in place). `None`
-/// when it is refused before any change (an MST configuration, the running
-/// displays no longer fitting as they are), for the caller to relight
-/// instead. With `reprobe` the board sinks are probed again even when no
+/// after, the running displays moved to their new plans in place). A
+/// `BesideRefusal` when it is refused before any change (nothing to light,
+/// an MST link's DSC fairness changing a running stream, the running
+/// displays no longer fitting as they are), for the caller to modeset the
+/// affected streams or relight instead. With `reprobe` the board sinks are probed again even when no
 /// CRTC waits to light (a sink plugged into a port whose CRTC is off).
 /// Publishes the new displays as `light_displays` does and the running
 /// ones' new admission.
@@ -8521,7 +8523,7 @@ async unsafe fn light_beside(
     lit: &[Option<Modeset>; 4],
     fill: impl FnMut(u8, u32, &mut [u32]),
     reprobe: bool,
-) -> Result<Option<crate::amdgpu_navi48_boot::Configuration>, ModesetError> {
+) -> Result<Result<crate::amdgpu_navi48_boot::Configuration, boot::BesideRefusal>, ModesetError> {
     let lit_mask = lit.iter().flatten().fold(0u8, |acc, m| acc | 1 << m.crtc);
     let (routes, wants, mst) = {
         let mut outputs = OUTPUTS.lock();
@@ -8545,7 +8547,7 @@ async unsafe fn light_beside(
         (routes, wants, outputs.mst_ports())
     };
     if routes.iter().all(Option::is_none) && !reprobe {
-        return Ok(None);
+        return Ok(Err(boot::BesideRefusal::Other));
     }
     let crtc_of = |t: Target| routes.iter().position(|r| *r == Some(t));
     let crtc = |port: usize| crtc_of(Target::Board(port)).map(|k| k as u8);
@@ -8574,8 +8576,9 @@ async unsafe fn light_beside(
         .map(|((&port, crtcs), want)| boot::MstRoute { port, crtcs, want })
         .collect();
     // SAFETY: the caller's obligations.
-    let Some(config) = unsafe { boot.modeset_beside(fill, want, crtc, &mst_routes) }.await? else {
-        return Ok(None);
+    let config = match unsafe { boot.modeset_beside(fill, want, crtc, &mst_routes) }.await? {
+        Ok(config) => config,
+        Err(refusal) => return Ok(Err(refusal)),
     };
     {
         let mut outputs = OUTPUTS.lock();
@@ -8621,5 +8624,5 @@ async unsafe fn light_beside(
         unsafe { adopt(boot, m) }.await;
     }
     publish_outputs();
-    Ok(Some(config))
+    Ok(Ok(config))
 }

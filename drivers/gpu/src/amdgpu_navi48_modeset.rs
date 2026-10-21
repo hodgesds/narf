@@ -979,6 +979,20 @@ pub struct Modeset {
 /// Modes offered per sink.
 pub const MAX_MODES: usize = 16;
 
+/// Why `modeset_beside` lit nothing new beside the running displays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BesideRefusal {
+    /// An MST link's DSC fairness search changes a running stream's
+    /// configuration (or no longer fits it as it runs): Linux modesets
+    /// those streams with the new ones (drm_dp_mst_add_affected_dsc_crtcs),
+    /// the platform tears them down and lights again beside the rest.
+    DscFairness,
+    /// Anything else (nothing running, no free pipe, an MST session busy
+    /// or dirty under streams, a root whose link changed, DML or the pipes
+    /// refusing the running displays as they are): a full modeset.
+    Other,
+}
+
 /// What `modeset_displays` lit: each CRTC's stream on its head pipe, and
 /// the failure that stopped lighting early, if one did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3081,7 +3095,7 @@ impl ColdBoot {
             // A branch that did not start lights nothing; its root is still
             // no board SST sink.
             let plan = if started {
-                self.plan_mst_route(route, &ports, &[])?
+                self.plan_mst_route(route, &ports, &[])?.ok()
             } else {
                 None
             };
@@ -4377,12 +4391,14 @@ impl ColdBoot {
     /// payload table row, SAT with ACT, ACT handled, ALLOCATE_PAYLOAD, VC
     /// rate), taking what the running payloads leave of the link
     /// (`plan_mst_route` beside them); one on a port with no stream trains
-    /// that port's link. Route CRTCs already lit are ignored. `None` when it
-    /// is refused before any change (none running, no free display slot, an
-    /// MST session that is not clean and idle, a root whose link changed, a
-    /// DSC fairness search that would change a running stream, the running
-    /// displays no longer admitted together or not on their pipes), so the
-    /// caller relights instead, as Linux takes a full modeset for those.
+    /// that port's link. Route CRTCs already lit are ignored. A
+    /// `BesideRefusal` when it is refused before any change:
+    /// `DscFairness` when an MST link's DSC fairness search would change a
+    /// running stream (the caller modesets just those), `Other` for the
+    /// rest (none running, no free display slot, an MST session that is not
+    /// clean and idle, a root whose link changed, the running displays no
+    /// longer admitted together or not on their pipes), so the caller
+    /// relights instead, as Linux takes a full modeset for those.
     /// Returns every display lit, in CRTC order.
     /// # Safety
     /// As for `modeset_displays`, except that the running displays stay
@@ -4393,13 +4409,13 @@ impl ColdBoot {
         want: impl Fn(usize) -> Option<Timing>,
         crtc_of: impl Fn(usize) -> Option<u8>,
         mst: &[MstRoute<'_>],
-    ) -> Result<Option<Configuration>, ModesetError> {
+    ) -> Result<Result<Configuration, BesideRefusal>, ModesetError> {
         // dcn401_prepare_bandwidth: pinned before any configuration change.
         self.pin_display_uclk().await?;
         self.teardowns.check_idle()?;
         let mut running: Vec<Modeset> = self.display_modesets().into_iter().flatten().collect();
         if running.is_empty() {
-            return Ok(None);
+            return Ok(Err(BesideRefusal::Other));
         }
         let used = running.iter().fold(0u8, |acc, m| acc | 1 << m.pipe);
         // The CRTCs whose streams run.
@@ -4408,7 +4424,7 @@ impl ColdBoot {
         let pool = crate::amdgpu_rdna4::pipe_pool();
         // Scan from an idle display slot (a pool pipe).
         let Some(idle) = pool.pipes().find(|p| used & 1 << p == 0) else {
-            return Ok(None);
+            return Ok(Err(BesideRefusal::Other));
         };
         if mst
             .iter()
@@ -4428,7 +4444,7 @@ impl ColdBoot {
                     || (l.dirty() && (l.owner.is_some() || !l.payloads.is_empty()))
             });
             if busy {
-                return Ok(None);
+                return Ok(Err(BesideRefusal::Other));
             }
             let unlit: Vec<Option<u8>> = route
                 .crtcs
@@ -4491,10 +4507,10 @@ impl ColdBoot {
                 .map(|m| m.selection)
                 .filter(|s| s.port == route.port && s.mst.is_some())
                 .collect();
-            let Some(plan) = self.plan_mst_route(&route, &ports, &lit)? else {
-                return Ok(None);
-            };
-            mst_plans.push(plan);
+            match self.plan_mst_route(&route, &ports, &lit)? {
+                Ok(plan) => mst_plans.push(plan),
+                Err(refusal) => return Ok(Err(refusal)),
+            }
         }
         let mst_streams: Vec<_> = mst_plans.iter().map(|p| p.selections.as_slice()).collect();
         let mut new = route_streams(sst, &mst_streams)?;
@@ -4530,7 +4546,7 @@ impl ColdBoot {
             let modes: Vec<dml::Mode> = joint.iter().map(|&(m, _, _)| m).collect();
             match dml::admit_native(&soc, &modes) {
                 Ok(plans) => break (plans, joint),
-                Err(_) if n == 0 => return Ok(None),
+                Err(_) if n == 0 => return Ok(Err(BesideRefusal::Other)),
                 Err(_) => n -= 1,
             }
         };
@@ -4542,7 +4558,7 @@ impl ColdBoot {
             for plan in &mst_plans {
                 self.finish_mst_plan(plan, &soc, &selections);
             }
-            return Ok(Some(Configuration {
+            return Ok(Ok(Configuration {
                 displays: running,
                 failed: None,
             }));
@@ -4573,7 +4589,7 @@ impl ColdBoot {
             .zip(&running_plans)
             .any(|(m, p)| !keeps_pipes(m, p))
         {
-            return Ok(None);
+            return Ok(Err(BesideRefusal::Other));
         }
         // The new streams added to the running state (dc_commit_streams'
         // context, the running streams and planes kept): their OTG masters,
@@ -4585,7 +4601,7 @@ impl ColdBoot {
             .map(|((s, crtc), plan)| StreamPipes::of(*crtc, s, plan))
             .collect();
         let Some(acquired) = beside_pipes(&dc_state(&running), &streams, &running) else {
-            return Ok(None);
+            return Ok(Err(BesideRefusal::Other));
         };
         let (new_pipes, extra): (Vec<u8>, Vec<DisplayPipes>) = acquired.into_iter().unzip();
         // SAFETY: the caller's obligations; the running displays stay lit.
@@ -4689,7 +4705,7 @@ impl ColdBoot {
                 self.finish_mst_plan(plan, &soc, &selections);
             }
         }
-        Ok(Some(Configuration { displays, failed }))
+        Ok(Ok(Configuration { displays, failed }))
     }
     /// After a display left: DML admits the running displays' modes again
     /// and, if each keeps its pipes, the configuration moves to the new

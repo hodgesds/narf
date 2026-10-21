@@ -4682,7 +4682,7 @@ fn navi48_mst_selects_new_streams_beside_running_ones() -> TestResult {
             u16::MAX
         }
     };
-    assert_eq!(beside(&[None, Some(1)], &lit, &shared), Some(Vec::new()));
+    assert_eq!(beside(&[None, Some(1)], &lit, &shared), Ok(Vec::new()));
     // Four payloads on the manager already: nothing more.
     let mut four = lit.clone();
     for k in 0..3 {
@@ -4692,10 +4692,7 @@ fn navi48_mst_selects_new_streams_beside_running_ones() -> TestResult {
         four.push(s);
     }
     four[0].mst.as_mut().unwrap().slots = 1;
-    assert_eq!(
-        beside(&[None, Some(1)], &four, &unlimited),
-        Some(Vec::new())
-    );
+    assert_eq!(beside(&[None, Some(1)], &four, &unlimited), Ok(Vec::new()));
     TestResult::Pass
 }
 kernel_test_in!(
