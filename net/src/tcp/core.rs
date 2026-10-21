@@ -3210,7 +3210,7 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         if ok {
             t.rto_count = t.rto_count.saturating_add(1);
             let now = narf_scheduler::narf_time::now_cycles();
-            let cpn = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
+            let cpm = narf_scheduler::narf_time::ns_to_cycles(1_000_000).max(1);
             let flight = t.flightsize;
             // Split-borrow the guard: `cc` is `&Box<dyn …>` (immutable
             // self) while `cong` is the `&mut CcState` target. Going
@@ -3218,7 +3218,7 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
             // as disjoint borrows.
             {
                 let tcb: &mut Tcb = &mut t;
-                tcb.cc.on_rto(&mut tcb.cong, flight, now, cpn);
+                tcb.cc.on_rto(&mut tcb.cong, flight, now, cpm);
             }
             // Mark every outstanding segment as retransmitted —
             // Karn's algorithm.
@@ -4611,8 +4611,8 @@ fn handle_ack(
         let from_buf = t.send_buf.ack(ack);
         let bytes_acked = acked;
         let now = narf_scheduler::narf_time::now_cycles();
-        let cpn = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
-        t.cong.cycles_per_ns = cpn;
+        let cpm = narf_scheduler::narf_time::ns_to_cycles(1_000_000).max(1);
+        t.cong.cycles_per_ms = cpm;
         // RTT sample on the first non-retransmitted segment whose
         // entire range was just ack'd.
         // After a go-back-N rewind the queue also holds the re-sent copies
@@ -4662,7 +4662,7 @@ fn handle_ack(
         if fast_retransmit_now {
             // Fast retransmit + enter fast recovery.
             let now = narf_scheduler::narf_time::now_cycles();
-            let cpn = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
+            let cpm = narf_scheduler::narf_time::ns_to_cycles(1_000_000).max(1);
             let nxt = t.snd_nxt;
             {
                 let tcb: &mut Tcb = &mut t;
@@ -4671,7 +4671,7 @@ fn handle_ack(
                     LossEvent::FastRetransmit {
                         snd_nxt: nxt,
                         now_cycles: now,
-                        cycles_per_ns: cpn,
+                        cycles_per_ms: cpm,
                     },
                 );
             }

@@ -6907,7 +6907,7 @@ fn smoke_tcp_cong_fast_recovery_halves_cwnd() -> TestResult {
         LossEvent::FastRetransmit {
             snd_nxt: 50_000,
             now_cycles: 0,
-            cycles_per_ns: 1,
+            cycles_per_ms: 1_000_000,
         },
     );
     if c.ssthresh != 5000 {
@@ -6965,7 +6965,7 @@ fn smoke_tcp_cubic_grows_after_loss() -> TestResult {
         LossEvent::FastRetransmit {
             snd_nxt: 100_000,
             now_cycles: 0,
-            cycles_per_ns: 1,
+            cycles_per_ms: 1_000_000,
         },
     );
     c.in_recovery = false;
@@ -7022,7 +7022,7 @@ fn smoke_pluggable_tcp_cc() -> TestResult {
         LossEvent::FastRetransmit {
             snd_nxt: 50_000,
             now_cycles: 0,
-            cycles_per_ns: 1,
+            cycles_per_ms: 1_000_000,
         },
     );
     if s.ssthresh != 5_000 {
