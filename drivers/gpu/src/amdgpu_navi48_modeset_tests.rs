@@ -4040,3 +4040,100 @@ kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_modeset_compresses_dp_sst_at_10_bpc_like_amdgpu_dm
 );
+
+/// MST on two DP ports at once, as amdgpu_dm keeps a topology manager per
+/// DP connector: each port's end devices are selected against that port's
+/// own link (two 2160p streams of 54 slots each, which one 63-slot link
+/// could never carry together), each port's dark devices count only that
+/// port's slots, and the configuration joins both ports' streams in pipe
+/// order with joint DML admission; one pipe named on both ports is refused.
+fn navi48_mst_two_ports_select_on_their_own_links() -> TestResult {
+    use crate::dp_mst_mgr::Sink;
+    let caps = DpCaps {
+        lanes: 4,
+        rate: LinkRate::Hbr2,
+        uhbr: 0,
+        fec: false,
+        dsc: None,
+    };
+    let soc = dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [500_000, 2_000_000],
+        dcfclk_khz: [300_000, 1_200_000],
+        socclk_khz: 600_000,
+        dispclk_max_khz: 1_500_000,
+        dppclk_max_khz: 1_500_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    // Both branches report the same Sink indices: only the port tells
+    // their streams apart.
+    let sink = |port| Sink { branch: 0, port };
+    let devices = [
+        (sink(1), edid_2160p(), u16::MAX),
+        (sink(2), edid_three_modes(false), u16::MAX),
+    ];
+    let uhd = edid_timings(&edid_2160p())[0];
+    let budget = |_, _: &[(Sink, u16)]| u16::MAX;
+    let pick = |port, pipes: &[Option<u8>]| {
+        super::super::mst::select_mst_outputs(port, caps, &devices, &|_| Some(uhd), pipes, &budget)
+    };
+    let a = pick(0, &[Some(0), Some(2)]);
+    let b = pick(2, &[Some(1), Some(3)]);
+    let shape = |s: &[(Selection, u8)]| -> Vec<(usize, u32, u8, u8)> {
+        s.iter()
+            .map(|(s, p)| (s.port, s.timing.h_active, s.mst.unwrap().slots, *p))
+            .collect()
+    };
+    assert_eq!(shape(&a), [(0, 3840, 54, 0), (0, 1280, 7, 2)]);
+    assert_eq!(shape(&b), [(2, 3840, 54, 1), (2, 1280, 7, 3)]);
+    let streams = route_streams(Vec::new(), &[a.as_slice(), b.as_slice()]).unwrap();
+    assert_eq!(
+        streams
+            .iter()
+            .map(|(s, p)| (s.port, *p))
+            .collect::<Vec<_>>(),
+        [(0, 0), (2, 1), (0, 2), (2, 3)]
+    );
+    // The two 2160p streams together pass DML; four stay the pipes' limit.
+    let selections: Vec<Selection> = streams.iter().map(|(s, _)| *s).collect();
+    assert_eq!(
+        admit_displays(&soc, &selections[..2]).map(|p| p.len()),
+        Ok(2)
+    );
+    assert!(admit_displays(&soc, &selections).is_ok_and(|p| p.len() <= MAX_DISPLAYS));
+    // A pipe on both ports, or a board sink's pipe again, is refused.
+    let clash = pick(2, &[Some(0), None]);
+    assert!(route_streams(Vec::new(), &[a.as_slice(), clash.as_slice()]).is_err());
+    let mut board = a[1].0;
+    board.mst = None;
+    board.port = 1;
+    assert!(route_streams(alloc::vec![(board, 2)], &[a.as_slice()]).is_err());
+    assert!(route_streams(alloc::vec![(board, 1)], &[a.as_slice()]).is_ok());
+    // A dark device on port 0 sees port 0's 54 + 7 slots taken, not port
+    // 2's: only 720p could still be added there (9 slots left would not
+    // even carry 1080p), and with port 2's streams alone every mode fits
+    // port 0's slots.
+    let widths = |m: Vec<Timing>| m.iter().map(|t| t.h_active).collect::<Vec<_>>();
+    let edid = edid_three_modes(false);
+    let lit_b: Vec<Selection> = b.iter().map(|(s, _)| *s).collect();
+    let offered = |lit: &[Selection]| {
+        widths(super::super::mst::dark_mst_modes_with(
+            &soc,
+            0,
+            caps,
+            &edid,
+            u16::MAX,
+            lit,
+            None,
+        ))
+    };
+    assert_eq!(offered(&lit_b[..1]), [1920, 3840, 1280]);
+    assert_eq!(offered(&[a[0].0, lit_b[0]]), [1280]);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_mst_two_ports_select_on_their_own_links
+);

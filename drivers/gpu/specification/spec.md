@@ -2300,18 +2300,23 @@ branch queries the board's DPM limits (starting display power if needed), but
 does not request an active-display count, clock floors, pipe clocks, payloads
 or scanout allocations. Startup failures do not publish new dark-output modes.
 
-`unsafe ColdBoot::modeset_routed(fill, want, pipe_of, mst: Option<MstRoute>)`
-lights board SST/HDMI sinks and one DP port's MST branch as one configuration.
-`MstRoute { port, pipes, want }` names the branch's root port, each end
+`unsafe ColdBoot::modeset_routed(fill, want, pipe_of, mst: &[MstRoute])`
+lights board SST/HDMI sinks and the MST branches of any number of DP ports as
+one configuration. Each port has its own `MstLink` (manager, topology, payload
+table, owner), as amdgpu_dm initializes an mst_mgr per DP connector.
+`MstRoute { port, pipes, want }` names a branch's root port, each end
 device's pipe (`pipes[k]` for `MstLink::outputs[k]`, None dark) and timing
-request. The round validates the route and starts the branch, scans once,
-selects board sinks with the MST root excluded (`select_all`; board port p on
-`pipe_of(p)` at `want(p)`) and the branch's devices, refuses duplicate pipes,
-orders every stream by pipe (admission truncates trailing streams), and runs one
+request; routes name distinct ports. The round validates and starts every
+branch, scans once, selects board sinks with every MST root excluded
+(`select_all`; board port p on `pipe_of(p)` at `want(p)`) and each branch's
+devices against its own link (its time slots, PBN hops and DSC fairness),
+then `route_streams` joins them in pipe order, refusing a pipe named twice on
+one port or across ports (admission truncates trailing streams), and runs one
 clock request, `refine_dsc`, joint `admit_displays`, `prepare_pipes` and `light`
-per stream. SST connector inventory (`display_sst_outputs`) excludes the MST
-root; dark end devices are admitted beside every running stream, MST slots
-counted only for MST payloads. `modeset_displays` is `modeset_routed` without a
+per stream over every port together. SST connector inventory
+(`display_sst_outputs`) excludes the MST roots; dark end devices are admitted
+beside every running stream, slots, hop PBN and DSC fairness counted only for
+their own port's payloads. `modeset_displays` is `modeset_routed` without a
 route. Each round is retried as described for `LinkReduced`.
 
 `unsafe ColdBoot::modeset_mst_displays(port, fill, want, pipes)` is
@@ -2375,9 +2380,11 @@ selections. Failed transitions retain their owners and allocations.
 
 KMS routing follows Linux: there are four CRTCs (display/pipe k is CRTC id
 1 + 3k) and one connector per board DP/HDMI port (board ordinal n: encoder
-2 + 3n, connector 3 + 3n, all ports, not only four), plus four end-device
-connectors (index 32 + slot, sixteen slots) while the first connected MST branch is in use;
-the root's own connector then reports disconnected. Every encoder may drive
+2 + 3n, connector 3 + 3n, all ports, not only four), plus, for every DP port
+whose connected sink is an MST branch, a connector for each of its end-device
+slots that has held a device (index 32 + 16 port + slot), as drm_dp_mst adds
+one per end device it finds; the root's own connector then reports
+disconnected. Every encoder may drive
 any CRTC (`possible_crtcs` 0xf; `amdgpu_navi48_kms::{RoutedConnector,
 apply_routed, publish_routed, connector_index}`). A CRTC drives at most one
 connector: SETCRTC's single connector (more than one is EINVAL; none keeps the
@@ -2411,9 +2418,10 @@ transactions for an end device (ALLOCATE_PAYLOAD, REMOTE_I2C_READ, remote
 DPCD) go to that device's own branch, end devices across branches share the
 link's payload table and the port's stable connector slots, and every hop of a
 device's path bounds its payload, dark-mode admission and the DSC fairness
-search jointly with the sibling streams crossing that hop. Only one DP port
-runs MST at a time (the first connected branch); end devices beyond the
-sixteen slots are not published.
+search jointly with the sibling streams crossing that hop. Every connected DP
+port whose sink is an MST branch runs MST at the same time, each on its own
+link and payload table; their streams share the four pipes, the clocks and
+DML admission. End devices beyond a port's sixteen slots are not published.
 
 An MST branch that codes 128b/132b runs UHBR MST, as Linux's
 decide_mst_link_settings trains MST at the verified cap: the best UHBR rate

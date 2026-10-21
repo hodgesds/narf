@@ -873,3 +873,100 @@ kernel_test_in!(
     "drivers/gpu/dp-mst",
     navi48_mst_payload_table_matches_linux_vectors
 );
+
+/// A started link on its own hub model, probed.
+fn started_link(hub: &RefCell<Hub>) -> MstLink {
+    let mut aux = Aux(hub);
+    let mut link = MstLink::default();
+    let mut dpcd = [0u8; 16];
+    dpcd[0] = 0x12;
+    run(link.manager.start(&mut aux, &dpcd)).unwrap();
+    link.topology = run(link.manager.probe(&mut aux)).unwrap();
+    link
+}
+
+/// Two DP ports each running MST, each with its own topology manager and
+/// payload table (amdgpu_dm's per-connector mst_mgr): each link's first
+/// payload is VCPI 1 at its first slot, every DPCD row, ACT and
+/// ALLOCATE_PAYLOAD goes to that port's branch alone, and removing a
+/// stream on one port leaves the other port's table and branch untouched.
+fn navi48_mst_two_ports_keep_their_own_payload_tables() -> TestResult {
+    let (hub_a, hub_b) = (RefCell::new(Hub::new()), RefCell::new(Hub::new()));
+    let mut link_a = started_link(&hub_a);
+    let mut link_b = started_link(&hub_b);
+    link_b.uhbr = true;
+    let (sinks_a, sinks_b) = (link_a.topology.sinks(), link_b.topology.sinks());
+    let mut source_a = Source {
+        hub: &hub_a,
+        events: Vec::new(),
+    };
+    let mut source_b = Source {
+        hub: &hub_b,
+        events: Vec::new(),
+    };
+    let rows = |h: &RefCell<Hub>| {
+        let h = h.borrow();
+        (0..3)
+            .map(|i| h.dpcd[&(dp_mst_mgr::PAYLOAD_ALLOCATE_SET + i)])
+            .collect::<Vec<_>>()
+    };
+    let add = |link: &mut MstLink, hub, source: &mut Source, sink, stream, slots| {
+        run(alloc::boxed::Box::pin(add_payload(
+            link,
+            &mut Aux(hub),
+            source,
+            sink,
+            stream,
+            600,
+            slots,
+            (9, 1),
+        )))
+        .unwrap()
+    };
+    let a0 = add(&mut link_a, &hub_a, &mut source_a, sinks_a[0], 0, 40);
+    let sent_a = hub_a.borrow().requests.len();
+    let b1 = add(&mut link_b, &hub_b, &mut source_b, sinks_b[0], 1, 40);
+    let b3 = add(&mut link_b, &hub_b, &mut source_b, sinks_b[1], 3, 20);
+    // 40 + 40 + 20 slots: more than one link's 63, each port's own table.
+    assert_eq!((a0.vcpi, a0.start), (1, 1));
+    assert_eq!((b1.vcpi, b1.start, b3.vcpi, b3.start), (1, 0, 2, 40));
+    assert_eq!(hub_a.borrow().requests.len(), sent_a);
+    assert_eq!(rows(&hub_a), [1, 1, 40]);
+    assert_eq!(rows(&hub_b), [2, 40, 20]);
+    let tables = |s: &Source| -> Vec<Vec<(u8, u8)>> {
+        s.events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Table(t, _) => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(tables(&source_a), [vec![(0, 40)]]);
+    assert_eq!(tables(&source_b), [vec![(1, 40)], vec![(1, 40), (3, 20)]]);
+    // Port B's first stream leaves: its table compacts, port A's stays.
+    let (before_a, writes_a) = (link_a.payloads.clone(), hub_a.borrow().requests.len());
+    run(alloc::boxed::Box::pin(remove_payload(
+        &mut link_b,
+        &mut Aux(&hub_b),
+        &mut source_b,
+        1,
+        true,
+    )))
+    .unwrap();
+    assert_eq!(link_a.payloads, before_a);
+    assert_eq!(hub_a.borrow().requests.len(), writes_a);
+    assert_eq!(rows(&hub_a), [1, 1, 40]);
+    assert_eq!(rows(&hub_b), [1, 0, 0]);
+    let left: Vec<_> = link_b
+        .payloads
+        .iter()
+        .map(|p| (p.stream, p.vcpi, p.start, p.slots))
+        .collect();
+    assert_eq!(left, [(3, 2, 0, 20)]);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    navi48_mst_two_ports_keep_their_own_payload_tables
+);

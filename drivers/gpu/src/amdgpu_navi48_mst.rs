@@ -1243,10 +1243,12 @@ pub(super) fn dark_mst_modes(
     available: u16,
     lit: &[Selection],
 ) -> Vec<Timing> {
-    dark_mst_modes_with(soc, caps, edid, available, lit, None)
+    dark_mst_modes_with(soc, 0, caps, edid, available, lit, None)
 }
 
-/// `dark_mst_modes` for end device `sink` of a link with a DSC context:
+/// `dark_mst_modes` for end device `sink` behind DP `port` (only that
+/// port's streams share its time slots and DSC fairness; every running
+/// stream shares DML admission) of a link with a DSC context:
 /// on such a link amdgpu_dm validates a mode with
 /// dm_dp_mst_is_port_support_mode and recomputes every stream's DSC
 /// (compute_mst_dsc_configs_for_link) beside the running ones, so a mode
@@ -1254,6 +1256,7 @@ pub(super) fn dark_mst_modes(
 /// available PBN and DML admission of the compressed mode allow it.
 pub(super) fn dark_mst_modes_with(
     soc: &crate::amdgpu_dcn401_dml::Soc,
+    port: usize,
     caps: modeset::DpCaps,
     edid: &[u8],
     available: u16,
@@ -1266,6 +1269,7 @@ pub(super) fn dark_mst_modes_with(
         let link = dsc_link(caps, soc.dispclk_max_khz)?;
         let lit_streams: Vec<_> = lit
             .iter()
+            .filter(|s| s.port == port)
             .filter_map(|s| {
                 let m = s.mst?;
                 Some(dsc::DscStream {
@@ -1304,9 +1308,11 @@ pub(super) fn dark_mst_modes_with(
             ..modeset::mode(*t)
         })
     };
-    // Slots are the MST streams'; DML admission is every running display's.
+    // Slots are the port's MST streams'; DML admission is every running
+    // display's.
     let used = lit
         .iter()
+        .filter(|s| s.port == port)
         .filter_map(|s| s.mst)
         .try_fold(0u8, |n, m| n.checked_add(m.slots));
     let (_, rate) = mst_link(caps);
@@ -1373,7 +1379,7 @@ impl ColdBoot {
             want: &want,
         };
         // SAFETY: the caller's obligations.
-        unsafe { self.modeset_routed(fill, |_| None, |_| None, Some(route)) }.await
+        unsafe { self.modeset_routed(fill, |_| None, |_| None, &[route]) }.await
     }
     /// Validate an MST route and start its branch: MST enabled and the
     /// topology probed, before the configuration scans the board.
@@ -1522,7 +1528,9 @@ impl ColdBoot {
         lit: &[Selection],
     ) {
         if let Some(link) = self.mst.get_mut(&port) {
-            let allocated = allocations(lit);
+            // Only this port's payloads cross its topology's hops.
+            let own: Vec<Selection> = lit.iter().filter(|s| s.port == port).copied().collect();
+            let allocated = allocations(&own);
             let decoders: Vec<_> = link
                 .outputs
                 .iter()
@@ -1550,7 +1558,7 @@ impl ColdBoot {
             };
             let mut modes = Vec::new();
             for output in link.outputs.iter().flatten() {
-                if lit.iter().any(|s| s.mst.map(|m| m.sink) == output.sink) {
+                if own.iter().any(|s| s.mst.map(|m| m.sink) == output.sink) {
                     modes.push(Vec::new());
                     continue;
                 }
@@ -1558,7 +1566,7 @@ impl ColdBoot {
                 modes.push(found.map_or_else(Vec::new, |(sink, edid, _)| {
                     let available =
                         topology::path_budget(&link.topology, *sink, &allocated).unwrap_or(0);
-                    dark_mst_modes_with(soc, caps, edid, available, lit, Some((*sink, &ctx)))
+                    dark_mst_modes_with(soc, port, caps, edid, available, lit, Some((*sink, &ctx)))
                 }));
             }
             for (output, m) in link.outputs.iter_mut().flatten().zip(modes) {

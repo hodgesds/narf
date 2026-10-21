@@ -1665,6 +1665,24 @@ pub fn refine_dsc(soc: &dml::Soc, selections: &mut [Selection]) -> Result<(), Mo
     Ok(())
 }
 
+/// A configuration's streams: the board sinks' on their pipes and every MST
+/// port's (each selected against its own link), in pipe order, which
+/// admission truncates (who stays dark). A pipe named twice, on one port or
+/// across ports, is refused: there are four pipes for every port together.
+pub fn route_streams(
+    mut routed: Vec<(Selection, u8)>,
+    mst: &[&[(Selection, u8)]],
+) -> Result<Vec<(Selection, u8)>, ModesetError> {
+    for streams in mst {
+        routed.extend(streams.iter().copied());
+    }
+    routed.sort_by_key(|&(_, pipe)| pipe);
+    if routed.windows(2).any(|w| w[0].1 == w[1].1) || routed.iter().any(|&(_, p)| p >= 4) {
+        return Err(ModesetError::Display(otg::Error::Invalid));
+    }
+    Ok(routed)
+}
+
 /// One DP port's MST branch in a configuration: end device k (its
 /// `MstLink::outputs` slot) lit on `pipes[k]` at `want(k)`, None dark.
 pub struct MstRoute<'a> {
@@ -3030,14 +3048,17 @@ impl ColdBoot {
         pipe_of: impl Fn(usize) -> Option<u8>,
     ) -> Result<Configuration, ModesetError> {
         // SAFETY: the caller's obligations.
-        unsafe { self.modeset_routed(fill, want, pipe_of, None) }.await
+        unsafe { self.modeset_routed(fill, want, pipe_of, &[]) }.await
     }
-    /// `modeset_displays` with one DP port's MST branch beside the board's
-    /// SST/HDMI sinks, all one configuration: the branch started and probed,
-    /// board sinks (that root excluded) and end devices selected, then
-    /// clocks and joint DML admission for every stream, and each display lit
-    /// on its pipe. Board port p is lit on `pipe_of(p)` at `want(p)`; end
-    /// device k on `mst.pipes[k]` at `mst.want(k)`. Pipes must be distinct.
+    /// `modeset_displays` with the MST branches of the DP ports `mst` names
+    /// (each its own topology manager and payload table, as amdgpu_dm keeps
+    /// one per DP connector) beside the board's SST/HDMI sinks, all one
+    /// configuration: each branch started and probed, board sinks (those
+    /// roots excluded) and every branch's end devices selected (each link's
+    /// time slots and PBN its own), then clocks and joint DML admission for
+    /// every stream on every port, and each display lit on its pipe. Board
+    /// port p is lit on `pipe_of(p)` at `want(p)`; end device k behind route
+    /// r on `r.pipes[k]` at `r.want(k)`. Ports and pipes must be distinct.
     /// Admission truncates in pipe order. Dark board sinks and end devices
     /// are admitted beside every running stream.
     /// # Safety
@@ -3047,16 +3068,14 @@ impl ColdBoot {
         mut fill: impl FnMut(u8, u32, &mut [u32]),
         want: impl Fn(usize) -> Option<Timing>,
         pipe_of: impl Fn(usize) -> Option<u8>,
-        mst: Option<MstRoute<'_>>,
+        mst: &[MstRoute<'_>],
     ) -> Result<Configuration, ModesetError> {
         // As `modeset_display_mode`: when the first display's link verifies
         // lower, nothing is lit yet and the configuration is chosen again.
         // A later display's reduction is returned in `failed`.
         for _ in 0..VERIFY_ROUNDS {
             // SAFETY: the caller's obligations.
-            match unsafe { self.modeset_displays_once(&mut fill, &want, &pipe_of, mst.as_ref()) }
-                .await
-            {
+            match unsafe { self.modeset_displays_once(&mut fill, &want, &pipe_of, mst) }.await {
                 Err(ModesetError::LinkReduced) => continue,
                 result => return result,
             }
@@ -3071,12 +3090,19 @@ impl ColdBoot {
         mut fill: impl FnMut(u8, u32, &mut [u32]),
         want: impl Fn(usize) -> Option<Timing>,
         pipe_of: impl Fn(usize) -> Option<u8>,
-        mst: Option<&MstRoute<'_>>,
+        mst: &[MstRoute<'_>],
     ) -> Result<Configuration, ModesetError> {
         self.teardowns.check_idle()?;
         self.modesets.check_stopped()?;
+        if mst
+            .iter()
+            .enumerate()
+            .any(|(i, r)| mst[..i].iter().any(|q| q.port == r.port))
+        {
+            return Err(ModesetError::Display(otg::Error::Invalid));
+        }
         self.sst_outputs.clear();
-        if let Some(route) = mst {
+        for route in mst {
             self.start_mst_route(route).await?;
         }
         let ports = self.scan_display().await.map_err(ModesetError::Boot)?;
@@ -3084,19 +3110,22 @@ impl ColdBoot {
             .display_paths()
             .map_err(|_| ModesetError::NoSink)?
             .to_vec();
-        let plan = match mst {
-            Some(route) => Some(self.plan_mst_route(route, &ports)?),
-            None => None,
-        };
-        // The MST root is the branch's, never a board SST sink.
-        let root = mst.and_then(|r| paths.get(r.port).copied());
+        let mst_plans = mst
+            .iter()
+            .map(|route| self.plan_mst_route(route, &ports))
+            .collect::<Result<Vec<_>, _>>()?;
+        // An MST root is its branch's, never a board SST sink.
+        let roots: Vec<_> = mst
+            .iter()
+            .filter_map(|r| paths.get(r.port).copied())
+            .collect();
         let board: Vec<display::Port> = ports
             .iter()
-            .filter(|p| Some(p.path) != root)
+            .filter(|p| !roots.contains(&p.path))
             .cloned()
             .collect();
         self.update_sst_outputs(None, &paths, &board, &[]);
-        let mut routed: Vec<(Selection, u8)> = match select_all(&paths, &board, max_bpc(), &want) {
+        let routed: Vec<(Selection, u8)> = match select_all(&paths, &board, max_bpc(), &want) {
             Ok(selections) => selections,
             // A connected sink without a carrying preferred mode can still
             // offer other modes; an all-off configuration has no stream work.
@@ -3106,14 +3135,8 @@ impl ColdBoot {
         .into_iter()
         .filter_map(|s| Some((s, pipe_of(s.port).filter(|&p| p < 4)?)))
         .collect();
-        if let Some(plan) = &plan {
-            routed.extend(plan.selections.iter().copied());
-        }
-        // Admission keeps a leading set: pipe order decides who stays dark.
-        routed.sort_by_key(|&(_, pipe)| pipe);
-        if routed.windows(2).any(|w| w[0].1 == w[1].1) {
-            return Err(ModesetError::Display(otg::Error::Invalid));
-        }
+        let mst_streams: Vec<_> = mst_plans.iter().map(|p| p.selections.as_slice()).collect();
+        let routed = route_streams(routed, &mst_streams)?;
         let (mut selections, pipes): (Vec<Selection>, Vec<u8>) = routed.into_iter().unzip();
         // "Broadcast RGB" is RGB's: YCbCr is limited range by itself.
         let limited = limited_range(broadcast_rgb());
@@ -3127,7 +3150,7 @@ impl ColdBoot {
         let soc = self.prepare_configuration(&selections).await?;
         self.update_sst_outputs(Some(&soc), &paths, &board, &[]);
         if selections.is_empty() {
-            if let Some(plan) = &plan {
+            for plan in &mst_plans {
                 self.finish_mst_plan(plan, &soc, &[]);
             }
             return Ok(Configuration {
@@ -3157,7 +3180,7 @@ impl ColdBoot {
         }
         for k in 0..lit.len() {
             let s = lit[k].selection;
-            let edid = match (&plan, s.mst) {
+            let edid = match (mst_plans.iter().find(|p| p.port == s.port), s.mst) {
                 (Some(plan), Some(_)) => Self::mst_plan_edid(plan, &s).unwrap_or_default(),
                 _ => edid_of(&ports, &paths, &s),
             };
@@ -3165,9 +3188,11 @@ impl ColdBoot {
             self.modesets.retain(lit[k]);
         }
         self.update_sst_outputs(Some(&soc), &paths, &board, &lit);
-        if let (Some(plan), None) = (&plan, failed) {
+        if failed.is_none() {
             let running: Vec<_> = lit.iter().map(|m| m.selection).collect();
-            self.finish_mst_plan(plan, &soc, &running);
+            for plan in &mst_plans {
+                self.finish_mst_plan(plan, &soc, &running);
+            }
         }
         Ok(Configuration {
             displays: lit,

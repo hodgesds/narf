@@ -2390,9 +2390,10 @@ pub async unsafe fn retire_inherited_display(
 // ── Native displays ──────────────────────────────────────────────────
 //
 // Connectors: every lightable board port (DisplayPort or HDMI) in board
-// order and, while a DP port's MST branch is in use, that branch's four
-// end-device slots (the root's own connector then reports nothing, as
-// amdgpu_dm's MST root). Display k is pipe k, its owner slot and CRTC k.
+// order and, for each DP port whose MST branch is in use (any number of
+// them, each its own topology manager as amdgpu_dm keeps one per DP
+// connector), every end-device slot that branch has given a device (the
+// root's own connector then reports nothing, as amdgpu_dm's MST root). Display k is pipe k, its owner slot and CRTC k.
 // Each CRTC is routed to at most one connector: as DRM set it (SETCRTC's
 // connector, an atomic connector CRTC_ID), else automatically to plugged
 // connectors in connector order. The console runs on the first lit
@@ -2422,15 +2423,19 @@ enum Target {
     Mst(usize, u8),
 }
 
-/// KMS index of an MST end device's connector: past any board port.
+/// KMS index of an MST end device's connector: past any board port, then
+/// `boot::MST_OUTPUTS` per root port.
 const MST_INDEX: usize = 32;
+fn mst_index(port: usize, slot: u8) -> usize {
+    MST_INDEX + port * boot::MST_OUTPUTS + usize::from(slot)
+}
 
 /// One connector and its sink as last discovered.
 #[derive(Debug)]
 struct ConnectorState {
     target: Target,
     kind: ConnectorType,
-    /// KMS object index: board ordinal, or `MST_INDEX` + slot.
+    /// KMS object index: board ordinal, or `mst_index(port, slot)`.
     index: usize,
     present: bool,
     /// DRM detached it from its CRTC: automatic routing leaves it dark.
@@ -2598,13 +2603,21 @@ impl CrtcState {
 struct Outputs {
     connectors: Vec<ConnectorState>,
     crtcs: [CrtcState; 4],
+    /// The DP ports whose MST branches are in use, in board order.
+    mst: Vec<usize>,
 }
 impl Outputs {
     const fn new() -> Self {
         Self {
             connectors: Vec::new(),
             crtcs: [const { CrtcState::new() }; 4],
+            mst: Vec::new(),
         }
+    }
+    /// `reshape` for the connector set of MST root ports `mst`.
+    fn reshape_mst(&mut self, shape: &[(Target, ConnectorType, usize)], mst: &[usize]) {
+        self.mst = mst.to_vec();
+        self.reshape(shape);
     }
     fn connector(&self, target: Target) -> Option<&ConnectorState> {
         self.connectors.iter().find(|c| c.target == target)
@@ -2797,23 +2810,18 @@ impl Outputs {
         let lit = self.crtcs[k].lit_bpc;
         lit.is_some() && self.routed(k).map(|c| c.max_bpc) != lit
     }
-    /// The MST root port, while its branch's connectors exist.
-    fn mst_port(&self) -> Option<usize> {
-        self.connectors.iter().find_map(|c| match c.target {
-            Target::Mst(port, _) => Some(port),
-            Target::Board(_) => None,
-        })
+    /// The MST root ports, while their branches' connectors exist.
+    fn mst_ports(&self) -> Vec<usize> {
+        self.mst.clone()
     }
 }
 static OUTPUTS: narf_lib::sync::IrqSafeSpinLock<Outputs> =
     narf_lib::sync::IrqSafeSpinLock::new(Outputs::new());
 
-/// The connector set: every lightable board port, then `mst`'s four
-/// end-device slots.
-fn connector_shape(
-    boot: &boot::ColdBoot,
-    mst: Option<usize>,
-) -> Vec<(Target, ConnectorType, usize)> {
+/// The connector set: every lightable board port, then each `mst` root's
+/// end-device slots that hold a device (drm_dp_mst adds a connector per
+/// end device found, not per pipe).
+fn connector_shape(boot: &boot::ColdBoot, mst: &[usize]) -> Vec<(Target, ConnectorType, usize)> {
     use crate::amdgpu_dcn_inventory::Connector;
     let Ok(paths) = boot.display_paths() else {
         return Vec::new();
@@ -2829,21 +2837,31 @@ fn connector_shape(
         .enumerate()
         .map(|(n, (port, kind))| (Target::Board(port), kind, n))
         .collect();
-    if let Some(port) = mst {
-        for slot in 0..boot::MST_OUTPUTS as u8 {
+    for &port in mst {
+        let Some(link) = boot.display_mst(port) else {
+            continue;
+        };
+        for (slot, _) in link.outputs.iter().enumerate().filter(|(_, o)| o.is_some()) {
+            let slot = slot as u8;
             shape.push((
                 Target::Mst(port, slot),
                 ConnectorType::DisplayPort,
-                MST_INDEX + usize::from(slot),
+                mst_index(port, slot),
             ));
         }
     }
     shape
 }
 
+/// Replace the connector set for MST roots `mst`.
+fn set_connector_shape(boot: &boot::ColdBoot, mst: &[usize]) {
+    let shape = connector_shape(boot, mst);
+    OUTPUTS.lock().reshape_mst(&shape, mst);
+}
+
 /// The board DP/HDMI ports.
 fn board_ports(boot: &boot::ColdBoot) -> Vec<usize> {
-    connector_shape(boot, None)
+    connector_shape(boot, &[])
         .into_iter()
         .filter_map(|(t, _, _)| match t {
             Target::Board(port) => Some(port),
@@ -3184,9 +3202,9 @@ async unsafe fn light_displays(
     if pending_display_work(boot) {
         return Err(crate::amdgpu_dcn401_otg::Error::Busy.into());
     }
-    // The first plugged DP port whose sink is an MST branch adds its end
+    // Every plugged DP port whose sink is an MST branch adds its end
     // devices' connectors; every other board port stays a connector too.
-    let mut mst = None;
+    let mut mst = Vec::new();
     for port in board_ports(boot) {
         if boot
             .display_paths()
@@ -3207,15 +3225,15 @@ async unsafe fn light_displays(
         if boot.display_hpd(port) == Ok(true)
             && (boot.display_mst(port).is_some() || boot.display_mst_capable(port).await)
         {
-            mst = Some(port);
-            break;
+            mst.push(port);
         }
     }
-    let shape = connector_shape(boot, mst);
-    OUTPUTS.lock().reshape(&shape);
-    if let Some(port) = mst {
+    set_connector_shape(boot, &mst);
+    for &port in &mst {
         boot.start_display_mst(port).await?;
         reconcile_mst_outputs(boot, port);
+    }
+    if !mst.is_empty() {
         // Clear old CRTC/framebuffer bindings for removed/reassigned monitors
         // before a newly lit sink can inherit the slot's DRM framebuffer.
         publish_outputs();
@@ -3223,7 +3241,7 @@ async unsafe fn light_displays(
     // Routes and requests as this lighting sees them.
     let (routes, wants) = {
         let mut outputs = OUTPUTS.lock();
-        if let Some(port) = mst {
+        for &port in &mst {
             // The MST root's own connector carries no sink meanwhile.
             if let Some(root) = outputs.connector_mut(Target::Board(port)) {
                 root.reconcile_sst(None);
@@ -3260,25 +3278,30 @@ async unsafe fn light_displays(
     let crtc_of = |t: Target| routes.iter().position(|r| *r == Some(t));
     let pipe = |port: usize| crtc_of(Target::Board(port)).map(|k| k as u8);
     let want = |port: usize| crtc_of(Target::Board(port)).and_then(|k| wants[k]);
-    let mst_pipes: Vec<Option<u8>> = (0..boot::MST_OUTPUTS as u8)
-        .map(|slot| {
-            mst.and_then(|port| crtc_of(Target::Mst(port, slot)))
-                .map(|k| k as u8)
+    // End device k stays on its connector, including gaps for disabled or
+    // unreadable devices: compacting would move another monitor.
+    let mst_pipes: Vec<Vec<Option<u8>>> = mst
+        .iter()
+        .map(|&port| {
+            (0..boot::MST_OUTPUTS as u8)
+                .map(|slot| crtc_of(Target::Mst(port, slot)).map(|k| k as u8))
+                .collect()
         })
         .collect();
-    let mst_want = |slot: usize| {
-        mst.and_then(|port| crtc_of(Target::Mst(port, slot as u8)))
-            .and_then(|k| wants[k])
-    };
-    let route = mst.map(|port| boot::MstRoute {
-        port,
-        // End device k stays on its connector, including gaps for disabled
-        // or unreadable devices: compacting would move another monitor.
-        pipes: &mst_pipes,
-        want: &mst_want,
-    });
+    let mst_wants: Vec<_> = mst
+        .iter()
+        .map(|&port| {
+            move |slot: usize| crtc_of(Target::Mst(port, slot as u8)).and_then(|k| wants[k])
+        })
+        .collect();
+    let routes: Vec<boot::MstRoute> = mst
+        .iter()
+        .zip(&mst_pipes)
+        .zip(&mst_wants)
+        .map(|((&port, pipes), want)| boot::MstRoute { port, pipes, want })
+        .collect();
     // SAFETY: the caller's obligations.
-    let result = unsafe { boot.modeset_routed(fill, want, pipe, route) }.await;
+    let result = unsafe { boot.modeset_routed(fill, want, pipe, &routes) }.await;
     {
         let mut outputs = OUTPUTS.lock();
         for c in &mut outputs.crtcs {
@@ -3291,7 +3314,7 @@ async unsafe fn light_displays(
             let Some(x) = outputs.connector_mut(Target::Board(port)) else {
                 continue;
             };
-            let changed = if Some(port) == mst {
+            let changed = if mst.contains(&port) {
                 x.reconcile_sst(None)
             } else {
                 x.reconcile_sst(sst)
@@ -3302,7 +3325,7 @@ async unsafe fn light_displays(
             }
         }
     }
-    if let Some(port) = mst {
+    for &port in &mst {
         reconcile_mst_outputs(boot, port);
     }
     // Even a failed preferred-mode activation leaves a valid connector
@@ -3318,11 +3341,14 @@ async unsafe fn light_displays(
     Ok(config)
 }
 
-/// Bring the branch's end-device connectors up to date.
+/// Bring the branch's end-device connectors up to date: a device in a new
+/// slot adds its connector first.
 fn reconcile_mst_outputs(boot: &boot::ColdBoot, port: usize) {
     let Some(link) = boot.display_mst(port) else {
         return;
     };
+    let mst = OUTPUTS.lock().mst_ports();
+    set_connector_shape(boot, &mst);
     let mut outputs = OUTPUTS.lock();
     for (slot, output) in link.outputs.iter().enumerate() {
         let target = Target::Mst(port, slot as u8);
@@ -5033,7 +5059,7 @@ fn pending_display_work(boot: &boot::ColdBoot) -> bool {
 fn routed_present(boot: &mut boot::ColdBoot, outputs: &Outputs, k: usize) -> bool {
     match outputs.crtcs[k].route {
         Some(Target::Board(port)) => {
-            boot.display_hpd(port) == Ok(true) && outputs.mst_port() != Some(port)
+            boot.display_hpd(port) == Ok(true) && !outputs.mst.contains(&port)
         }
         Some(Target::Mst(port, slot)) => {
             boot.display_hpd(port) == Ok(true)
@@ -5163,8 +5189,10 @@ pub async unsafe fn monitor_displays(
     // Keep a connected branch's connectors and DRM requests even when its
     // CRTCs are off. Only the root's physical removal drops them, once no
     // stream on that branch remains.
-    let mst_port = OUTPUTS.lock().mst_port();
-    if let Some(port) = mst_port.filter(|&p| boot.display_hpd(p) == Ok(false)) {
+    for port in OUTPUTS.lock().mst_ports() {
+        if boot.display_hpd(port) != Ok(false) {
+            continue;
+        }
         let streaming = displays
             .lit
             .iter()
@@ -5172,13 +5200,14 @@ pub async unsafe fn monitor_displays(
             .any(|m| m.selection.port == port && m.selection.mst.is_some());
         if !streaming {
             boot.forget_unplugged_display_mst(port)?;
-            let shape = connector_shape(boot, None);
-            OUTPUTS.lock().reshape(&shape);
+            let mut left = OUTPUTS.lock().mst_ports();
+            left.retain(|&p| p != port);
+            set_connector_shape(boot, &left);
             displays.considered = 0;
             publish_outputs();
         }
     }
-    let mst_port = OUTPUTS.lock().mst_port();
+    let mst_ports = OUTPUTS.lock().mst_ports();
     let wants: [(bool, Option<Timing>, SurfaceFormat, boot::PlaneSetup); 4] = {
         let outputs = OUTPUTS.lock();
         core::array::from_fn(|k| {
@@ -5211,7 +5240,7 @@ pub async unsafe fn monitor_displays(
     // Displays whose planes or plane format DRM changed.
     let mut plane_updates = 0u8;
     for port in board_ports(boot) {
-        if Some(port) == mst_port {
+        if mst_ports.contains(&port) {
             continue;
         }
         if let Ok(present) = boot.display_hpd(port) {
@@ -5224,7 +5253,7 @@ pub async unsafe fn monitor_displays(
         }
     }
     publish_outputs();
-    if let Some(port) = mst_port {
+    for &port in &mst_ports {
         if pending_mask == 0
             && boot.display_hpd(port) == Ok(true)
             && boot.display_mst(port).is_some()
@@ -6307,7 +6336,7 @@ mod tests {
             (Target::Mst(0, 2), ConnectorType::DisplayPort, MST_INDEX + 2),
         ];
         let mut o = Outputs::new();
-        o.reshape(&shape);
+        o.reshape_mst(&shape, &[0]);
         for t in [Target::Board(1), Target::Mst(0, 0), Target::Mst(0, 2)] {
             o.connector_mut(t).unwrap().present = true;
         }
@@ -6360,12 +6389,12 @@ mod tests {
         assert_eq!(o.crtcs[1].route, None);
         assert_eq!(o.crtcs[3].route, Some(Target::Board(1)));
         // The branch leaves: its connectors and routes go.
-        o.reshape(&shape[..2]);
+        o.reshape_mst(&shape[..2], &[]);
         assert!(o
             .crtcs
             .iter()
             .all(|c| !matches!(c.route, Some(Target::Mst(..)))));
-        assert_eq!(o.mst_port(), None);
+        assert!(o.mst_ports().is_empty());
         // Console restore: automatic routing again.
         for c in o.crtcs.iter_mut() {
             c.explicit = false;
@@ -7192,7 +7221,7 @@ async unsafe fn light_beside(
     let lit_mask = lit.iter().flatten().fold(0u8, |acc, m| acc | 1 << m.pipe);
     let (routes, wants) = {
         let mut outputs = OUTPUTS.lock();
-        if outputs.mst_port().is_some() {
+        if !outputs.mst.is_empty() {
             return Ok(None);
         }
         outputs.assign_routes();
