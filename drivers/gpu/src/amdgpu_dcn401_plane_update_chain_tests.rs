@@ -136,14 +136,15 @@ fn live(primary: SurfaceRequest, overlays: &[SurfaceRequest]) -> LivePlanes {
 /// No write of the last update touched the stream: its OTG enable and
 /// clock, timing, ODM/OPTC source, DPG (blank) or DSC.
 fn stream_untouched(c: &Chain) -> bool {
-    let l = c.e.layout;
+    // The model's (full-board) addresses, as the writes are recorded.
+    let odm = |q: u8, r: u64| BASE + (r + u64::from(q) * 0x10) * 4;
     c.e.io.inner.inner.writes.iter().all(|&(at, _)| {
         (0..4u8).all(|q| {
             at != otg(q, 0x1b43)
                 && at != otg(q, 0x1b84)
                 && !(otg(q, 0x1b2a)..=otg(q, 0x1b3a)).contains(&at)
-                && at != l.odm(q, SOURCE)
-                && at != l.odm(q, MEMORY)
+                && at != odm(q, SOURCE)
+                && at != odm(q, MEMORY)
                 && at != opp(q, DPG)
         })
     })
@@ -186,7 +187,12 @@ fn tree_regs(q: u8) -> [u64; 5] {
 /// mpcc does on a full update, and a check of the live scanout passes
 /// afterwards.
 fn dcn401_live_plane_update_scales_the_primary_in_place() -> TestResult {
-    let (t, s, p) = ROUTES[1];
+    dcn401_live_plane_update_scales_the_primary_in_place_on(ROUTES[1])
+}
+/// The test above with the display on route (t, s, p).
+pub(super) fn dcn401_live_plane_update_scales_the_primary_in_place_on(
+    (t, s, p): (u8, u8, u8),
+) -> TestResult {
     let mut c = chain(t, s, p);
     if run(c.start()).is_err() {
         return TestResult::Fail("start");
@@ -313,8 +319,14 @@ fn op_is_overwritten(scaler: &crate::amdgpu_dcn401_spl::Scaler, reg: u64) -> boo
 ///   lock; only after the update latched is it drained, blanked and gated,
 ///   and its surface released to the pool.
 fn dcn401_live_plane_update_adds_moves_and_removes_an_overlay() -> TestResult {
-    let (t, s, p) = ROUTES[1];
-    let q = OVERLAY_PIPE;
+    dcn401_live_plane_update_adds_moves_and_removes_an_overlay_on(ROUTES[1], OVERLAY_PIPE)
+}
+/// The test above with the display on route (t, s, p) and the overlay on
+/// pipe q.
+pub(super) fn dcn401_live_plane_update_adds_moves_and_removes_an_overlay_on(
+    (t, s, p): (u8, u8, u8),
+    q: u8,
+) -> TestResult {
     let mut c = chain(t, s, p);
     if run(c.start()).is_err() {
         return TestResult::Fail("start");
@@ -447,8 +459,14 @@ kernel_test_in!(
 /// write: a plane on the display's own pipe, a pipe another plane holds
 /// or one not free, a plan for other planes, a display not scanning out.
 fn dcn401_live_plane_update_refuses_before_any_write() -> TestResult {
-    let (t, s, p) = ROUTES[1];
-    let q = OVERLAY_PIPE;
+    dcn401_live_plane_update_refuses_before_any_write_on(ROUTES[1], OVERLAY_PIPE)
+}
+/// The test above with the display on route (t, s, p) and the overlay on
+/// pipe q.
+pub(super) fn dcn401_live_plane_update_refuses_before_any_write_on(
+    (t, s, p): (u8, u8, u8),
+    q: u8,
+) -> TestResult {
     let mut c = chain(t, s, p);
     if run(c.start()).is_err() {
         return TestResult::Fail("start");
@@ -503,8 +521,14 @@ kernel_test_in!(
 /// that pipe's recout space; with the overlay gone, on the primary's
 /// alone again.
 fn dcn401_live_plane_update_moves_the_cursor_with_the_planes() -> TestResult {
-    let (t, s, p) = ROUTES[1];
-    let q = OVERLAY_PIPE;
+    dcn401_live_plane_update_moves_the_cursor_with_the_planes_on(ROUTES[1], OVERLAY_PIPE)
+}
+/// The test above with the display on route (t, s, p) and the overlay on
+/// pipe q.
+pub(super) fn dcn401_live_plane_update_moves_the_cursor_with_the_planes_on(
+    (t, s, p): (u8, u8, u8),
+    q: u8,
+) -> TestResult {
     let mut c = chain(t, s, p);
     if run(c.start()).is_err() {
         return TestResult::Fail("start");

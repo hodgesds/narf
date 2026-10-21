@@ -3582,6 +3582,62 @@ fn navi48_split_pipes_follow_dml() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/navi48-modeset", navi48_split_pipes_follow_dml);
 
+/// On harvested boards (pipe 0, pipe 1, pipes 1 and 2 fused) every plan
+/// takes pipe indices of the pool only (CRTC k is pipe index k; the pool's
+/// count is Linux's pipe_count and max_streams): ODM segments and MPC
+/// slices from the pool's top pipe down, a split past the pool refused,
+/// a stream routed past it refused, and KMS publishing one CRTC per pool
+/// pipe.
+fn navi48_plans_take_only_the_pools_pipes_on_harvested_boards() -> TestResult {
+    use crate::amdgpu_rdna4::{self as rdna4, PipePool};
+    let one = completed_modeset(0).plan;
+    let two = dml::Plan { pipes: 2, ..one };
+    let three = dml::Plan { pipes: 3, ..one };
+    let four = dml::Plan { pipes: 4, ..one };
+    let mut mpc = one;
+    if let Some(p) = mpc.planes[0].as_mut() {
+        p.dpps = 2;
+    }
+    let s = |p: &[u8]| otg::SplitPipes::new(p).unwrap();
+    let none = otg::SplitPipes::NONE;
+    let mut result = TestResult::Pass;
+    for fuses in [0x1, 0x2, 0x6] {
+        rdna4::publish_pipe_pool(PipePool::from_fuses(fuses));
+        let count = rdna4::pipe_pool().count();
+        let top = count - 1;
+        let got = |plans: &[dml::Plan], pipes: &[u8]| odm_pipes(plans, pipes).ok();
+        let mpc_got = plan_pipes(&[mpc], &[0]).ok().map(|d| d[0].mpc);
+        let selection = completed_modeset(0).selection;
+        let ok = got(&[two], &[0]) == Some(alloc::vec![s(&[top])])
+            && got(&[two], &[top]) == Some(alloc::vec![s(&[top - 1])])
+            && got(&[one, one], &[0, top]) == Some(alloc::vec![none, none])
+            && got(&[four], &[0]).is_none()
+            && (count < 3 || got(&[three], &[0]) == Some(alloc::vec![s(&[2, 1])]))
+            && (count > 2 || got(&[three], &[0]).is_none())
+            && mpc_got == Some(s(&[top]))
+            && route_streams(alloc::vec![(selection, count)], &[]).is_err()
+            && route_streams(alloc::vec![(selection, top)], &[]).is_ok()
+            && crate::amdgpu_navi48_kms::crtc_count() == usize::from(count)
+            && crate::amdgpu_navi48_kms::crtc_display(crate::amdgpu_navi48_kms::crtc_id(
+                usize::from(top),
+            )) == Some(top)
+            && crate::amdgpu_navi48_kms::crtc_display(crate::amdgpu_navi48_kms::crtc_id(
+                usize::from(count),
+            ))
+            .is_none();
+        if !ok {
+            result = TestResult::Fail("plans beyond the harvested pool");
+            break;
+        }
+    }
+    rdna4::publish_pipe_pool(PipePool::FULL);
+    result
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_plans_take_only_the_pools_pipes_on_harvested_boards
+);
+
 /// MPC combine of the surfaces Linux DML21 also splits, from amdgpu_dm's
 /// planes to the pipes: on a 4K CVT-RB stream (533.25 MHz, ODM bypass), an
 /// 8K framebuffer in 64KB tiles, a portrait 8K one in 256KB tiles with DCC

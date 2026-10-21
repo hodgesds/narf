@@ -9,6 +9,7 @@
 //! PHY/stream/pipe routing.
 use super::*;
 use crate::amdgpu_dcn401_dml as dml;
+use crate::amdgpu_dcn401_otg::tests::harvest::{self, Renamed};
 use crate::amdgpu_dcn401_otg::tests::hdmi_link::{dio, path, phy, resync, Firmware, TmdsIo};
 use alloc::sync::Arc;
 use core::future::Future;
@@ -302,7 +303,7 @@ fn hdmi_mode(pipe: u8, plan: &dml::Plan) -> Mode {
 struct Chain {
     backing: Vec<u32>,
     pool: Pool,
-    e: Engine<ScanIo>,
+    e: Engine<Renamed<ScanIo>>,
     surfaces: Surfaces,
     clock: dccg::Applied,
     address: u64,
@@ -325,8 +326,12 @@ struct Staged {
 #[inline(never)]
 fn chain(phy_index: u8, stream: u8, pipe: u8) -> alloc::boxed::Box<Chain> {
     let plan = boxed_plan();
-    let mut s = staged(pipe, &plan);
-    let address = stage_deadlines(&mut s, pipe, &plan);
+    // The staging fixtures model the full board (see hdmi_engine).
+    let (s, address) = harvest::on_full_pool(|| {
+        let mut s = staged(pipe, &plan);
+        let address = stage_deadlines(&mut s, pipe, &plan);
+        (s, address)
+    });
     let mut c = hdmi_chain(s, phy_index, stream, pipe, address);
     let clock = c.clock;
     start_hdmi(&mut c.e, phy_index, stream, pipe, clock);
@@ -397,7 +402,12 @@ fn stage_deadlines(s: &mut Staged, pipe: u8, plan: &dml::Plan) -> u64 {
 }
 /// The staged engine under the HDMI transmitter and lock/latch models.
 #[inline(never)]
-fn hdmi_engine(e: Engine<RequestIo>, phy_index: u8, stream: u8, pipe: u8) -> Engine<ScanIo> {
+fn hdmi_engine(
+    e: Engine<RequestIo>,
+    phy_index: u8,
+    stream: u8,
+    pipe: u8,
+) -> Engine<Renamed<ScanIo>> {
     // The plane wrappers' staging handshakes are done; keep their register
     // file under the HDMI transmitter model, as fixture_with arranges it.
     let mut fake = e.io.inner.surface.inner;
@@ -410,35 +420,41 @@ fn hdmi_engine(e: Engine<RequestIo>, phy_index: u8, stream: u8, pipe: u8) -> Eng
     // Plane retirement is over: MPCC status is the lock/latch model's now.
     fake.disconnecting = false;
     fake.writes.clear();
-    Engine {
-        io: ScanIo {
-            inner: TmdsIo {
-                inner: fake,
-                phy: phy_index,
-                stream,
-                event: Arc::new(AtomicU8::new(0)),
-                writes: Arc::new(AtomicUsize::new(0)),
-                on: false,
-                dead: false,
-                az: alloc::collections::BTreeMap::new(),
-                az_index: [0; 4],
-            },
-            pipe,
-            armed: false,
-            pause_wait: false,
-            grant: true,
-            latch_delay: 0,
-            pending_latch: None,
-            frozen: false,
-            frame: 7,
-            drop: None,
-            underflow_after: None,
-            writes: 0,
-            lock_requested: Arc::new(AtomicBool::new(false)),
-            extra: 0,
+    // Behind Renamed from here: its addresses are the full board's.
+    fake.guarded = false;
+    // Staged for the full board; from here the owner runs on the published
+    // pool, the model behind it renamed to that board.
+    let layout = harvest::harvested_layout(e.layout);
+    let io = ScanIo {
+        inner: TmdsIo {
+            inner: fake,
+            phy: phy_index,
+            stream,
+            event: Arc::new(AtomicU8::new(0)),
+            writes: Arc::new(AtomicUsize::new(0)),
+            on: false,
+            dead: false,
+            az: alloc::collections::BTreeMap::new(),
+            az_index: [0; 4],
         },
+        pipe,
+        armed: false,
+        pause_wait: false,
+        grant: true,
+        latch_delay: 0,
+        pending_latch: None,
+        frozen: false,
+        frame: 7,
+        drop: None,
+        underflow_after: None,
+        writes: 0,
+        lock_requested: Arc::new(AtomicBool::new(false)),
+        extra: 0,
+    };
+    Engine {
+        io: Renamed::new(io, layout),
         authority: e.authority,
-        layout: e.layout,
+        layout,
         status: e.status,
         displays: e.displays,
     }
@@ -446,7 +462,13 @@ fn hdmi_engine(e: Engine<RequestIo>, phy_index: u8, stream: u8, pipe: u8) -> Eng
 /// The TMDS link and its black video on the staged pipe, then arm the
 /// lock/latch model.
 #[inline(never)]
-fn start_hdmi(e: &mut Engine<ScanIo>, phy_index: u8, stream: u8, pipe: u8, clock: dccg::Applied) {
+fn start_hdmi(
+    e: &mut Engine<Renamed<ScanIo>>,
+    phy_index: u8,
+    stream: u8,
+    pipe: u8,
+    clock: dccg::Applied,
+) {
     let mut fw = Firmware {
         ready: true,
         commands: Vec::new(),
@@ -1274,3 +1296,68 @@ kernel_test_in!(
 
 #[path = "amdgpu_dcn401_plane_update_chain_tests.rs"]
 mod plane_update;
+
+/// The chain on harvested boards (pipe 0, pipe 1, and pipes 1 and 2 fused):
+/// the same owners on the pool's pipes, the staged full-board model behind
+/// `harvest::Renamed`, so every access and instance field the owners make
+/// must name the pool's instance of the pipe the model expects, and none a
+/// fused one. Each case runs on the pipes the pool has.
+fn dcn401_scanout_chain_runs_on_harvested_boards() -> TestResult {
+    harvest::harvested(2, || {
+        let count = crate::amdgpu_rdna4::pipe_pool().count();
+        let top = count - 1;
+        if let Err(why) = harvested_chain(count) {
+            return TestResult::Fail(why);
+        }
+        for stage in 0..4 {
+            unwind_stage(&mut chain(0, 0, 0), stage);
+        }
+        let route = (2, 1, top);
+        let moved = move_to_new_plan(chain_on(route), top);
+        if moved != TestResult::Pass {
+            return moved;
+        }
+        use plane_update::*;
+        for result in [
+            dcn401_live_plane_update_scales_the_primary_in_place_on(route),
+            dcn401_live_plane_update_adds_moves_and_removes_an_overlay_on(route, 0),
+            dcn401_live_plane_update_moves_the_cursor_with_the_planes_on(route, 0),
+        ] {
+            if result != TestResult::Pass {
+                return result;
+            }
+        }
+        if count > 2 {
+            // Its refused plan names a third pipe (1).
+            return dcn401_live_plane_update_refuses_before_any_write_on((1, 3, 2), 0);
+        }
+        TestResult::Pass
+    })
+}
+/// The routed cases of the test above on a pool of `count` pipes.
+#[inline(never)]
+fn harvested_chain(count: u8) -> Result<(), &'static str> {
+    let top = count - 1;
+    for route in ROUTES.into_iter().filter(|r| r.2 < count) {
+        every_pipe(&mut chain_on(route), route)?;
+        crtc_color(&mut chain_on(route), route.2)?;
+    }
+    owner_change_during_stop(&mut chain(0, 0, 0))?;
+    cancelled_start(&mut chain(3, 2, 1))?;
+    if count > 2 {
+        owner_change_during_start(&mut chain(1, 3, 2))?;
+        second_display(&mut chain_on((1, 3, 2)), (1, 3, 2))?;
+    }
+    // A lost write on the top pipe's MPCC (the model's) is caught by its
+    // readback, at the pipe's MPCC instance (the owner's).
+    let mut c = chain(2, 1, top);
+    c.e.io.drop = Some(mpcc(top, TOP));
+    if run(c.start()) != Err(Error::Readback(c.e.io.owner_addr(mpcc(top, TOP)))) {
+        return Err("lost MPCC write on the top pipe");
+    }
+    Ok(())
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_chain_runs_on_harvested_boards
+);

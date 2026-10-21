@@ -485,6 +485,72 @@ kernel_test_in!(
     dcn401_cursor_programs_every_pipe_under_each_segment_lock
 );
 
+/// On harvested boards (pipe 0, pipe 1, pipes 1 and 2 fused) the cursor of
+/// an ODM 2:1 stream on pipes 0 and the top pipe is programmed on both
+/// pipes' HUBP/DPP instances inside the cursor locks of both pipes' OPP
+/// instances (mpc1_cursor_lock(opp->inst)), and no write reaches or names
+/// a fused instance.
+fn dcn401_cursor_locks_each_segment_opp_instance_on_harvested_boards() -> TestResult {
+    crate::amdgpu_dcn401_otg::tests::harvest::harvested(2, || {
+        let top = crate::amdgpu_rdna4::pipe_pool().count() - 1;
+        let mut e = engine();
+        let l = e.layout;
+        let primary = plane(
+            0,
+            (SplitPipes::one(top), SplitPipes::NONE),
+            (3840, 2160),
+            None,
+        );
+        e.status.surfaces[0] = Some(primary);
+        let a = CursorApplied {
+            pipe: 0,
+            address: 0x8_00f0_0000,
+            width: 64,
+            height: 64,
+            x: 1890,
+            y: 600,
+            visible: false,
+            shown: 0,
+        };
+        let segments = placements(a, primary, &[None, None, None], (50_000, 594_000));
+        let a = shown(a, &segments);
+        if a.shown != 1 | 1 << top {
+            return TestResult::Fail("cursor over both segments");
+        }
+        e.io.writes.clear();
+        if e.program_cursor(a, &segments).is_err() || e.verify_cursor(a, &segments).is_err() {
+            return TestResult::Fail("program");
+        }
+        for &(at, value) in &e.io.writes {
+            crate::amdgpu_dcn401_otg::tests::harvest::guard(l, at, Some(value));
+        }
+        let lock = |inst: u8| l.mpc_base + (0x2c5 + u64::from(inst) * 5) * 4;
+        let locked: alloc::vec::Vec<u8> = (0..4u8)
+            .filter(|&i| {
+                e.io.writes
+                    .iter()
+                    .any(|&(at, v)| at == lock(i) && v & 1 == 1)
+            })
+            .collect();
+        let mut want = alloc::vec![l.inst(0), l.inst(top)];
+        want.sort();
+        if locked != want {
+            return TestResult::Fail("locks of the segments' OPP instances");
+        }
+        for p in [0, top] {
+            let at = e.layout.base + (0x679 + u64::from(l.inst(p)) * 0xdc) * 4;
+            if e.io.regs.get(&at).copied().unwrap_or(0) & 1 != 1 {
+                return TestResult::Fail("cursor enabled on the segment's HUBP instance");
+            }
+        }
+        TestResult::Pass
+    })
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-cursor",
+    dcn401_cursor_locks_each_segment_opp_instance_on_harvested_boards
+);
+
 /// amdgpu_dm_crtc_get_cursor_mode: DCN 4.0.1 (and 4.2.x, or a disabled
 /// CRTC) always takes the native cursor, whatever lies under it; other DCN
 /// take the overlay cursor over a YCbCr plane, a plane scaled unlike the

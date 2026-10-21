@@ -1,5 +1,5 @@
 use super::*;
-use crate::amdgpu_dcn401_otg::tests::{engine, run};
+use crate::amdgpu_dcn401_otg::tests::{engine, harvest, run};
 use alloc::collections::BTreeMap;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
@@ -70,6 +70,7 @@ impl Io for Hw {
         Some(16)
     }
     fn read(&mut self, at: u64) -> u32 {
+        harvest::guard(self.layout, at, None);
         if at == self.layout.otg(self.pipe, FRAME_COUNT) {
             self.frame = self.frame.wrapping_add(1);
             return self.frame & FRAME_MASK;
@@ -77,6 +78,7 @@ impl Io for Hw {
         self.get(at)
     }
     fn write(&mut self, at: u64, value: u32) {
+        harvest::guard(self.layout, at, Some(value));
         self.writes += 1;
         self.log.push((at, value));
         let (l, p) = (self.layout, self.pipe);
@@ -158,7 +160,7 @@ fn staged_planes(pipe: u8, odm: Option<u8>, overlays: &[u8]) -> Engine<Hw> {
         .chain(overlays.iter().copied())
     {
         for (at, value) in [
-            (l.hubp(q, HUBP_CONTROL), 3 | u32::from(pipe) << 4),
+            (l.hubp(q, HUBP_CONTROL), 3 | l.inst_field(pipe) << 4),
             (l.hubp(q, CURSOR), CURSOR_REQ_MODE),
             (l.hubp(q, ADDRESS), ADDR as u32),
             (l.hubp(q, ADDRESS_HIGH), (ADDR >> 32) as u32),
@@ -186,7 +188,10 @@ fn staged_planes(pipe: u8, odm: Option<u8>, overlays: &[u8]) -> Engine<Hw> {
 /// in use; a flip re-addresses both; an underflow on the right half is the
 /// scanout's; stop returns both to staged black.
 fn dcn401_scanout_odm_drives_both_halves_under_one_lock() -> TestResult {
-    let (pipe, q) = (1u8, 3u8);
+    odm_on(1, 3)
+}
+/// The test above on pipes (pipe, q).
+fn odm_on(pipe: u8, q: u8) -> TestResult {
     let mut e = staged_odm(pipe, Some(q));
     let surface = SurfaceApplied {
         request: SurfaceRequest {
@@ -213,9 +218,9 @@ fn dcn401_scanout_odm_drives_both_halves_under_one_lock() -> TestResult {
     }
     let l = e.layout;
     for s in [pipe, q] {
-        if e.io.get(l.mpcc(s, TOP)) & 0xf != u32::from(s)
-            || e.io.get(l.mpcc(s, OPP_ID)) & 0xf != u32::from(s)
-            || e.io.get(l.out_mux(s)) & 0xf != u32::from(s)
+        if e.io.get(l.mpcc(s, TOP)) & 0xf != l.inst_field(s)
+            || e.io.get(l.mpcc(s, OPP_ID)) & 0xf != l.inst_field(s)
+            || e.io.get(l.out_mux(s)) & 0xf != l.inst_field(s)
             || e.io.get(l.opp(s, DPG)) & DPG_FIELDS != 0
             || e.io.get(l.hubp(s, HUBP_CONTROL)) & BLANK_EN != 0
         {
@@ -271,7 +276,7 @@ fn target(pipe: u8) -> Pipe {
 }
 
 fn dcn401_scanout_starts_and_stops_under_one_lock_with_hardware_evidence() -> TestResult {
-    for pipe in 0..4 {
+    for pipe in crate::amdgpu_rdna4::pipe_pool().pipes() {
         let mut e = staged(pipe);
         let p = target(pipe);
         if e.quiet(pipe).is_err() || e.staged(p).is_err() {
@@ -494,7 +499,7 @@ kernel_test_in!(
 
 fn dcn401_scanout_flip_latches_new_address_under_the_lock() -> TestResult {
     const BACK: u64 = 0x8_0090_0000;
-    for pipe in 0..4 {
+    for pipe in crate::amdgpu_rdna4::pipe_pool().pipes() {
         let mut e = staged(pipe);
         let p = target(pipe);
         if run(e.start_fetch(p)).is_err() || e.flip_quiet(pipe).is_err() {
@@ -589,7 +594,7 @@ kernel_test_in!(
 );
 
 fn dcn401_scanout_cursor_programs_under_its_lock_and_stops_with_fetch() -> TestResult {
-    for pipe in 0..4 {
+    for pipe in crate::amdgpu_rdna4::pipe_pool().pipes() {
         let mut e = staged(pipe);
         let p = target(pipe);
         if run(e.start_fetch(p)).is_err() {
@@ -613,7 +618,7 @@ fn dcn401_scanout_cursor_programs_under_its_lock_and_stops_with_fetch() -> TestR
             return TestResult::Fail("program cursor");
         }
         let l = e.layout;
-        let lock = l.mpc_base + (0x2c5 + u64::from(pipe) * 5) * 4;
+        let lock = l.mpc_base + (0x2c5 + u64::from(l.inst(pipe)) * 5) * 4;
         if e.io.get(lock) != 0
             || e.io.get(l.hubp(pipe, 0x679)) != 3 << 24 | 2 << 8 | 4 | 1
             || e.io.get(l.hubp(pipe, 0x67c)) != 64 << 16 | 48
@@ -719,7 +724,10 @@ fn stage_records(e: &mut Engine<Hw>, pipe: u8, odm: Option<u8>, overlays: &[(u8,
 /// only the primary's OPP leaves the DPG. The CRTC color (gamut remap)
 /// goes on the top MPCC only, the input transfer function on every DPP.
 fn dcn401_scanout_overlays_blend_in_linux_mpcc_order() -> TestResult {
-    let (pipe, a, b) = (0u8, 2u8, 3u8);
+    overlays_on(0, 2, 3)
+}
+/// The test above with the primary on pipe and the overlays on a and b.
+fn overlays_on(pipe: u8, a: u8, b: u8) -> TestResult {
     let mut e = staged_planes(pipe, None, &[a, b]);
     let l = e.layout;
     stage_records(&mut e, pipe, None, &[(a, None), (b, None)]);
@@ -749,25 +757,25 @@ fn dcn401_scanout_overlays_blend_in_linux_mpcc_order() -> TestResult {
         // The top overlay alone on the OPP's output.
         w(b, BOTTOM, 0xf),
         c(b, 2),
-        w(b, TOP, u32::from(b)),
-        w(b, OPP_ID, u32::from(pipe)),
-        w(b, UPDATE_LOCK, u32::from(pipe)),
-        (l.out_mux(pipe), u32::from(b)),
+        w(b, TOP, l.inst_field(b)),
+        w(b, OPP_ID, l.inst_field(pipe)),
+        w(b, UPDATE_LOCK, l.inst_field(pipe)),
+        (l.out_mux(pipe), l.inst_field(b)),
         // The lower overlay inserted at the bottom.
         w(a, BOTTOM, 0xf),
         c(a, 2),
-        w(a, TOP, u32::from(a)),
-        w(a, OPP_ID, u32::from(pipe)),
-        w(a, UPDATE_LOCK, u32::from(pipe)),
-        w(b, BOTTOM, u32::from(a)),
+        w(a, TOP, l.inst_field(a)),
+        w(a, OPP_ID, l.inst_field(pipe)),
+        w(a, UPDATE_LOCK, l.inst_field(pipe)),
+        w(b, BOTTOM, l.inst_field(a)),
         c(b, 3),
         // The primary at the very bottom.
         w(pipe, BOTTOM, 0xf),
         c(pipe, 2),
-        w(pipe, TOP, u32::from(pipe)),
-        w(pipe, OPP_ID, u32::from(pipe)),
-        w(pipe, UPDATE_LOCK, u32::from(pipe)),
-        w(a, BOTTOM, u32::from(pipe)),
+        w(pipe, TOP, l.inst_field(pipe)),
+        w(pipe, OPP_ID, l.inst_field(pipe)),
+        w(pipe, UPDATE_LOCK, l.inst_field(pipe)),
+        w(a, BOTTOM, l.inst_field(pipe)),
         c(a, 3),
     ];
     if tree_writes(l, &e.io.log, &[pipe, a, b]) != want {
@@ -875,9 +883,9 @@ fn dcn401_scanout_odm_overlay_builds_a_tree_per_segment() -> TestResult {
         return TestResult::Fail("ODM start with overlay");
     }
     for (opp, top) in [(pipe, o), (q, o2)] {
-        if e.io.get(l.out_mux(opp)) & 0xf != u32::from(top)
-            || e.io.get(l.mpcc(top, BOTTOM)) & 0xf != u32::from(opp)
-            || e.io.get(l.mpcc(top, OPP_ID)) & 0xf != u32::from(opp)
+        if e.io.get(l.out_mux(opp)) & 0xf != l.inst_field(top)
+            || e.io.get(l.mpcc(top, BOTTOM)) & 0xf != l.inst_field(opp)
+            || e.io.get(l.mpcc(top, OPP_ID)) & 0xf != l.inst_field(opp)
             || e.io.get(l.mpcc(top, MPCC_CONTROL)) & 3 != 3
             || e.io.get(l.mpcc(opp, MPCC_CONTROL)) & 3 != 2
             || e.io.get(l.mpcc(opp, BOTTOM)) & 0xf != 0xf
@@ -905,7 +913,10 @@ kernel_test_in!(
 /// bottom of the tree: the primary blends over it and still feeds its own
 /// OPP, the overlay above both; the stream's color goes on the top.
 fn dcn401_scanout_underlay_goes_below_the_primary() -> TestResult {
-    let (pipe, under, over) = (1u8, 3u8, 0u8);
+    underlay_on(1, 3, 0)
+}
+/// The test above on pipes (pipe, under, over).
+fn underlay_on(pipe: u8, under: u8, over: u8) -> TestResult {
     let mut e = staged_planes(pipe, None, &[under, over]);
     let l = e.layout;
     stage_records(&mut e, pipe, None, &[(under, None), (over, None)]);
@@ -928,13 +939,13 @@ fn dcn401_scanout_underlay_goes_below_the_primary() -> TestResult {
     }
     let sel = |q: u8, r| e.io.get(l.mpcc(q, r)) & 0xf;
     let mode = |q: u8| e.io.get(l.mpcc(q, MPCC_CONTROL)) & 3;
-    if e.io.get(l.out_mux(pipe)) & 0xf != u32::from(over)
-        || sel(over, BOTTOM) != u32::from(pipe)
-        || sel(pipe, BOTTOM) != u32::from(under)
+    if e.io.get(l.out_mux(pipe)) & 0xf != l.inst_field(over)
+        || sel(over, BOTTOM) != l.inst_field(pipe)
+        || sel(pipe, BOTTOM) != l.inst_field(under)
         || sel(under, BOTTOM) != 0xf
         || [under, pipe, over]
             .iter()
-            .any(|&q| sel(q, OPP_ID) != u32::from(pipe))
+            .any(|&q| sel(q, OPP_ID) != l.inst_field(pipe))
         || (mode(under), mode(pipe), mode(over)) != (2, 3, 3)
         || e.io.get(l.opp(pipe, DPG)) & DPG_FIELDS != 0
     {
@@ -990,9 +1001,9 @@ fn dcn401_scanout_odm_four_segments_under_one_lock() -> TestResult {
     }
     let l = e.layout;
     for s in [0u8, 3, 2, 1] {
-        if e.io.get(l.mpcc(s, TOP)) & 0xf != u32::from(s)
-            || e.io.get(l.mpcc(s, OPP_ID)) & 0xf != u32::from(s)
-            || e.io.get(l.out_mux(s)) & 0xf != u32::from(s)
+        if e.io.get(l.mpcc(s, TOP)) & 0xf != l.inst_field(s)
+            || e.io.get(l.mpcc(s, OPP_ID)) & 0xf != l.inst_field(s)
+            || e.io.get(l.out_mux(s)) & 0xf != l.inst_field(s)
             || e.io.get(l.opp(s, DPG)) & DPG_FIELDS != 0
             || e.io.get(l.hubp(s, HUBP_CONTROL)) & BLANK_EN != 0
         {
@@ -1067,17 +1078,17 @@ fn dcn401_scanout_mpc_slices_blend_in_one_tree() -> TestResult {
         [
             w(q, BOTTOM, 0xf),
             c(q, 2),
-            w(q, TOP, u32::from(q)),
-            w(q, OPP_ID, u32::from(pipe)),
-            w(q, UPDATE_LOCK, u32::from(pipe)),
+            w(q, TOP, l.inst_field(q)),
+            w(q, OPP_ID, l.inst_field(pipe)),
+            w(q, UPDATE_LOCK, l.inst_field(pipe)),
         ]
     };
     let mut want = alloc::vec::Vec::new();
     want.extend(insert(o));
-    want.push((l.out_mux(pipe), u32::from(o)));
+    want.push((l.out_mux(pipe), l.inst_field(o)));
     for (q, above) in [(o_slice, o), (pipe, o_slice), (slice, pipe)] {
         want.extend(insert(q));
-        want.extend([w(above, BOTTOM, u32::from(q)), c(above, 3)]);
+        want.extend([w(above, BOTTOM, l.inst_field(q)), c(above, 3)]);
     }
     if tree_writes(l, &e.io.log, &[pipe, slice, o, o_slice]) != want {
         return TestResult::Fail("mpc1_insert_plane order with MPC slices");
@@ -1120,4 +1131,42 @@ fn dcn401_scanout_mpc_slices_blend_in_one_tree() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-scanout",
     dcn401_scanout_mpc_slices_blend_in_one_tree
+);
+
+/// ODM, overlays, underlays, flips, cursors and the start/stop evidence on
+/// harvested boards (pipe 0, pipe 1, pipes 1 and 2 fused): the model
+/// addresses the pool's instances through the owner's layout and refuses
+/// any fused one (harvest::guard), and every tree selector, OPP source and
+/// VTG is checked as the pipe's instance.
+fn dcn401_scanout_runs_on_harvested_boards() -> TestResult {
+    harvest::harvested(2, || {
+        let count = crate::amdgpu_rdna4::pipe_pool().count();
+        let top = count - 1;
+        let mut cases: alloc::vec::Vec<TestResult> = alloc::vec![
+            dcn401_scanout_starts_and_stops_under_one_lock_with_hardware_evidence(),
+            dcn401_scanout_requires_lock_latch_and_no_underflow(),
+            dcn401_scanout_entry_requires_running_black_video_and_deadlines(),
+            dcn401_scanout_framebuffer_requires_live_owned_scanout(),
+            dcn401_scanout_cursor_programs_under_its_lock_and_stops_with_fetch(),
+            odm_on(0, top),
+            odm_on(top, 0),
+        ];
+        if count > 2 {
+            cases.extend([
+                dcn401_scanout_live_fetch_is_recognised_exactly(),
+                dcn401_scanout_flip_latches_new_address_under_the_lock(),
+                overlays_on(0, 1, 2),
+                overlays_on(2, 0, 1),
+                underlay_on(1, 2, 0),
+            ]);
+        }
+        cases
+            .into_iter()
+            .find(|r| *r != TestResult::Pass)
+            .unwrap_or(TestResult::Pass)
+    })
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_runs_on_harvested_boards
 );

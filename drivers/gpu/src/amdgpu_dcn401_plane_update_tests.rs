@@ -189,7 +189,7 @@ fn tree_writes(
 ) -> Vec<(u64, u32)> {
     let l = e.layout;
     let mut regs = Vec::new();
-    for q in 0..4u8 {
+    for q in l.pool.pipes() {
         for r in [TOP, BOTTOM, OPP_ID, UPDATE_LOCK] {
             regs.push((l.mpcc(q, r), 0xf));
         }
@@ -198,6 +198,10 @@ fn tree_writes(
     }
     e.io.writes.clear();
     f(e);
+    // No write reaches a fused instance or names one.
+    for &(at, value) in &e.io.writes {
+        crate::amdgpu_dcn401_otg::tests::harvest::guard(l, at, Some(value));
+    }
     e.io.writes
         .iter()
         .filter_map(|&(at, v)| {
@@ -215,15 +219,25 @@ fn tree_writes(
 /// neighbours; every removed MPCC's muxes and update lock go to 0xf;
 /// inserting at the bottom makes the old bottom blend over the new one.
 fn dcn401_plane_update_mpc_tree_follows_mpc1() -> TestResult {
+    mpc_tree_on([3, 1, 0], 2)
+}
+/// The test above for OPP `tree[2]`'s tree `tree` (top first), `new`
+/// inserted once the tree is down to its top MPCC: every selector names
+/// the MPCC/OPP instance of the pipe it means (mpcc_id = dpp->inst,
+/// opp_id = opp->inst), so on a harvested board the instances, not the
+/// pipe indices.
+fn mpc_tree_on(tree: [u8; 3], new: u8) -> TestResult {
     let mut e = engine();
     let l = e.layout;
+    let i = |q: u8| l.inst_field(q);
     let w = |q: u8, r: u64, v: u32| (l.mpcc(q, r), v);
     let c = |q: u8, v: u32| (l.mpcc(q, MPCC_CONTROL), v);
-    let mux = |o: u8, v: u32| (l.out_mux(o), v);
-    // OPP 0's tree, top first: 3 over 1 over 0.
+    let [top, mid, bottom] = tree;
+    let opp = bottom;
+    let mux = |v: u32| (l.out_mux(opp), v);
     let mut t = MpcTree {
-        opp: 0,
-        list: alloc::vec![3, 1, 0],
+        opp,
+        list: alloc::vec![top, mid, bottom],
     };
     let off = |q: u8| {
         [
@@ -233,56 +247,57 @@ fn dcn401_plane_update_mpc_tree_follows_mpc1() -> TestResult {
             w(q, UPDATE_LOCK, 0xf),
         ]
     };
-    let got = tree_writes(&mut e, |e| e.mpc_remove(&mut t, 1).unwrap());
-    let mut want = alloc::vec![w(3, BOTTOM, 0)];
-    want.extend(off(1));
-    if got != want || t.list != [3, 0] {
+    let got = tree_writes(&mut e, |e| e.mpc_remove(&mut t, mid).unwrap());
+    let mut want = alloc::vec![w(top, BOTTOM, i(bottom))];
+    want.extend(off(mid));
+    if got != want || t.list != [top, bottom] {
         return TestResult::Fail("remove a middle MPCC");
     }
-    let got = tree_writes(&mut e, |e| e.mpc_remove(&mut t, 0).unwrap());
-    let mut want = alloc::vec![w(3, BOTTOM, 0xf), c(3, MODE_PASSTHROUGH)];
-    want.extend(off(0));
-    if got != want || t.list != [3] {
+    let got = tree_writes(&mut e, |e| e.mpc_remove(&mut t, bottom).unwrap());
+    let mut want = alloc::vec![w(top, BOTTOM, 0xf), c(top, MODE_PASSTHROUGH)];
+    want.extend(off(bottom));
+    if got != want || t.list != [top] {
         return TestResult::Fail("remove the bottom MPCC");
     }
-    let got = tree_writes(&mut e, |e| e.mpc_insert_bottom(&mut t, 2).unwrap());
+    let got = tree_writes(&mut e, |e| e.mpc_insert_bottom(&mut t, new).unwrap());
     let want = [
-        w(2, BOTTOM, 0xf),
-        c(2, MODE_TOP_ONLY),
-        w(2, TOP, 2),
-        w(2, OPP_ID, 0),
-        w(2, UPDATE_LOCK, 0),
-        w(3, BOTTOM, 2),
-        c(3, MODE_TOP_BOT),
+        w(new, BOTTOM, 0xf),
+        c(new, MODE_TOP_ONLY),
+        w(new, TOP, i(new)),
+        w(new, OPP_ID, i(opp)),
+        w(new, UPDATE_LOCK, i(opp)),
+        w(top, BOTTOM, i(new)),
+        c(top, MODE_TOP_BOT),
     ];
-    if got != want || t.list != [3, 2] {
+    if got != want || t.list != [top, new] {
         return TestResult::Fail("insert at the bottom");
     }
-    let got = tree_writes(&mut e, |e| e.mpc_remove(&mut t, 3).unwrap());
-    let mut want = alloc::vec![mux(0, 2)];
-    want.extend(off(3));
-    if got != want || t.list != [2] {
+    let got = tree_writes(&mut e, |e| e.mpc_remove(&mut t, top).unwrap());
+    let mut want = alloc::vec![mux(i(new))];
+    want.extend(off(top));
+    if got != want || t.list != [new] {
         return TestResult::Fail("remove the top MPCC");
     }
     let got = tree_writes(&mut e, |e| {
-        e.mpc_remove(&mut t, 2).unwrap();
-        e.mpc_insert_bottom(&mut t, 2).unwrap();
+        e.mpc_remove(&mut t, new).unwrap();
+        e.mpc_insert_bottom(&mut t, new).unwrap();
     });
-    let mut want = alloc::vec![mux(0, 0xf)];
-    want.extend(off(2));
+    let mut want = alloc::vec![mux(0xf)];
+    want.extend(off(new));
     want.extend([
-        w(2, BOTTOM, 0xf),
-        c(2, MODE_TOP_ONLY),
-        w(2, TOP, 2),
-        w(2, OPP_ID, 0),
-        w(2, UPDATE_LOCK, 0),
-        mux(0, 2),
+        w(new, BOTTOM, 0xf),
+        c(new, MODE_TOP_ONLY),
+        w(new, TOP, i(new)),
+        w(new, OPP_ID, i(opp)),
+        w(new, UPDATE_LOCK, i(opp)),
+        mux(i(new)),
     ]);
-    if got != want || t.list != [2] {
+    if got != want || t.list != [new] {
         return TestResult::Fail("re-insert the only MPCC");
     }
     // An MPCC in no tree is left alone.
-    if !tree_writes(&mut e, |e| e.mpc_remove(&mut t, 1).unwrap()).is_empty() {
+    let absent = [top, mid, bottom].into_iter().find(|&q| q != new).unwrap();
+    if !tree_writes(&mut e, |e| e.mpc_remove(&mut t, absent).unwrap()).is_empty() {
         return TestResult::Fail("remove an absent MPCC");
     }
     TestResult::Pass
@@ -290,4 +305,14 @@ fn dcn401_plane_update_mpc_tree_follows_mpc1() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-plane-update",
     dcn401_plane_update_mpc_tree_follows_mpc1
+);
+
+/// The MPC tree on harvested boards with three pipes (pipe 0 fused, pipe 1
+/// fused): the pipes' MPCC and OPP instances in every selector.
+fn dcn401_plane_update_mpc_tree_names_instances_on_harvested_boards() -> TestResult {
+    crate::amdgpu_dcn401_otg::tests::harvest::harvested(3, || mpc_tree_on([2, 1, 0], 1))
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-plane-update",
+    dcn401_plane_update_mpc_tree_names_instances_on_harvested_boards
 );
