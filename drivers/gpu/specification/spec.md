@@ -4047,9 +4047,12 @@ dpp401_dscl_find_lb_memory_config), and `viewport()` returns
 hubp401_set_viewport's words (chroma equal to luma for RGB).
 `tests/dcn401_spl/check.sh` builds Linux's SPL on the host and compares
 every register word of 248 vectors (`vectors.txt`: scaled, cropped,
-positioned, ODM-sliced, rotated 90/180/270, alpha) and 210 MPC slices
+positioned, ODM-sliced, rotated 90/180/270, alpha), 290 MPC slices
 (`mpc_vectors.txt`: two to four slices of scaled, windowed and rotated
-planes; harness.c with MPC set), which the
+planes, 80 of them turned 90/270 and split along the source's vertical
+axis; harness.c with MPC set) and 80 NV12/P010 MPC slices
+(`video_mpc_vectors.txt`, upright and turned, each chroma viewport on the
+chroma grid; harness.c video with MPC set), which the
 `drivers/gpu/dcn401-spl` kernel tests replay.
 
 **Placed planes.** `otg::SurfaceRequest::plane: Option<PlaneLayout>`
@@ -4297,11 +4300,9 @@ SETCRTC admits such a framebuffer as a placed primary
 planes so a tiling change is a plane update.
 
 Gaps: planes on an ODM stream
-must reach every segment; only linear, unrotated RGB planes without DCC
-are MPC-combined (any other plane one DPP cannot carry is refused); no
+must reach every segment; no
 RGBA8888 or 16-bit UNORM planes, no NV21 (not
-on DCN4's universal planes), no plane degamma/CTM, no MPC combine of a
-rotated plane (Linux splits one that a single DPP cannot carry); DCC data is CPU-copied into the
+on DCN4's universal planes), no plane degamma/CTM; DCC data is CPU-copied into the
 owned surface (so written uncompressed) and the post CSC always loads set
 A; the cursor matrix of a YCbCr primary is not programmed; offered alternative modes are admitted without the
 display's overlays, and KMS admits planes only on the lit timing (a mode
