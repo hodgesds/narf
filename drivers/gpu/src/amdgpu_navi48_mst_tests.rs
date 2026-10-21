@@ -970,3 +970,70 @@ kernel_test_in!(
     "drivers/gpu/dp-mst",
     navi48_mst_two_ports_keep_their_own_payload_tables
 );
+
+/// A stream whose end device left (a live reprobe recorded its sink in
+/// `lost`) is removed as drm_dp_remove_payload_part1 does for a port no
+/// longer downstream of the primary branch: no ALLOCATE_PAYLOAD and no
+/// payload-table row for it, while the source still drops it from the SAT
+/// with ACT and the stream beside it moves down and keeps running.
+fn navi48_mst_lost_end_device_payload_leaves_without_addressing_it() -> TestResult {
+    let hub = RefCell::new(Hub::new());
+    let mut link = started_link(&hub);
+    let sinks = link.topology.sinks();
+    let mut source = Source {
+        hub: &hub,
+        events: Vec::new(),
+    };
+    for (k, stream) in [(0, 0u8), (1, 2)] {
+        run(alloc::boxed::Box::pin(add_payload(
+            &mut link,
+            &mut Aux(&hub),
+            &mut source,
+            sinks[k],
+            stream,
+            600,
+            15,
+            (14, 1),
+        )))
+        .unwrap();
+    }
+    link.lost.push(sinks[0]);
+    let (sent, row) = {
+        let h = hub.borrow();
+        let row: Vec<u8> = (0..3)
+            .map(|i| h.dpcd[&(dp_mst_mgr::PAYLOAD_ALLOCATE_SET + i)])
+            .collect();
+        (h.requests.len(), row)
+    };
+    source.events.clear();
+    run(alloc::boxed::Box::pin(remove_payload(
+        &mut link,
+        &mut Aux(&hub),
+        &mut source,
+        0,
+        true,
+    )))
+    .unwrap();
+    let h = hub.borrow();
+    assert_eq!(h.requests.len(), sent);
+    let after: Vec<u8> = (0..3)
+        .map(|i| h.dpcd[&(dp_mst_mgr::PAYLOAD_ALLOCATE_SET + i)])
+        .collect();
+    assert_eq!(after, row);
+    assert_eq!(
+        source.events,
+        [Event::Rate(0, (0, 0)), Event::Table(vec![(2, 15)], sent)]
+    );
+    let left: Vec<_> = link
+        .payloads
+        .iter()
+        .map(|p| (p.stream, p.vcpi, p.start))
+        .collect();
+    assert_eq!(left, [(2, 2, 1)]);
+    assert_eq!(link.payload_change(), None);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    navi48_mst_lost_end_device_payload_leaves_without_addressing_it
+);

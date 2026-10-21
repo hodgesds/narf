@@ -3110,10 +3110,16 @@ impl ColdBoot {
             .display_paths()
             .map_err(|_| ModesetError::NoSink)?
             .to_vec();
-        let mst_plans = mst
-            .iter()
-            .map(|route| self.plan_mst_route(route, &ports))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut mst_plans = Vec::with_capacity(mst.len());
+        for route in mst {
+            let plan = self.plan_mst_route(route, &ports, &[])?;
+            mst_plans.push(plan.unwrap_or(super::mst::MstPlan {
+                port: route.port,
+                caps: None,
+                devices: Vec::new(),
+                selections: Vec::new(),
+            }));
+        }
         // An MST root is its branch's, never a board SST sink.
         let roots: Vec<_> = mst
             .iter()
@@ -4195,16 +4201,26 @@ impl ColdBoot {
             .await?;
         Ok(())
     }
-    /// Light every new lightable board sink beside the running displays,
-    /// which stay lit: DML admits the running displays' modes with the new
-    /// ones (as many of the new ones as fit, in pipe order; every running
-    /// display must keep its pipes), and the change follows dcn401's
-    /// prepare/optimize ordering (`transition_running`) around lighting the
-    /// new displays on their pipes, whose pipe clocks are programmed beside
-    /// the running ones. `None` when it is refused before any change (an
-    /// MST display or none running, no free display slot, the running
+    /// Light every new lightable board sink and every new end device of
+    /// the MST branches `mst` names beside the running displays, which stay
+    /// lit, as dc_commit_streams adds streams without touching the others:
+    /// DML admits the running displays' modes with the new ones (as many of
+    /// the new ones as fit, in pipe order; every running display must keep
+    /// its pipes), and the change follows dcn401's prepare/optimize ordering
+    /// (`transition_running`) around lighting the new displays on their
+    /// pipes, whose pipe clocks are programmed beside the running ones. A
+    /// new end device behind a port whose link already runs attaches to it
+    /// and adds only its own payload (link_set_dpms_on for that stream:
+    /// payload table row, SAT with ACT, ACT handled, ALLOCATE_PAYLOAD, VC
+    /// rate), taking what the running payloads leave of the link
+    /// (`plan_mst_route` beside them); one on a port with no stream trains
+    /// that port's link. Route pipes already lit are ignored. `None` when it
+    /// is refused before any change (none running, no free display slot, an
+    /// MST session that is not clean and idle, a root whose link changed, a
+    /// DSC fairness search that would change a running stream, the running
     /// displays no longer admitted together or not on their pipes), so the
-    /// caller relights instead. Returns every display lit, in pipe order.
+    /// caller relights instead, as Linux takes a full modeset for those.
+    /// Returns every display lit, in pipe order.
     /// # Safety
     /// As for `modeset_displays`, except that the running displays stay
     /// lit and must stay published as they are.
@@ -4213,10 +4229,11 @@ impl ColdBoot {
         mut fill: impl FnMut(u8, u32, &mut [u32]),
         want: impl Fn(usize) -> Option<Timing>,
         pipe_of: impl Fn(usize) -> Option<u8>,
+        mst: &[MstRoute<'_>],
     ) -> Result<Option<Configuration>, ModesetError> {
         self.teardowns.check_idle()?;
         let mut running: Vec<Modeset> = self.display_modesets().into_iter().flatten().collect();
-        if running.is_empty() || running.iter().any(|m| m.selection.mst.is_some()) {
+        if running.is_empty() {
             return Ok(None);
         }
         let used = running.iter().fold(0u8, |acc, m| acc | 1 << m.pipe);
@@ -4225,16 +4242,53 @@ impl ColdBoot {
         let Some(idle) = (0..4u8).find(|p| used & 1 << p == 0) else {
             return Ok(None);
         };
+        if mst
+            .iter()
+            .enumerate()
+            .any(|(i, r)| mst[..i].iter().any(|q| q.port == r.port))
+        {
+            return Err(ModesetError::Display(otg::Error::Invalid));
+        }
+        // Every branch's session clean and idle; a port without streams may
+        // start or reprobe here, one with streams only adds beside them.
+        for route in mst {
+            let busy = self.mst.get(&route.port).is_some_and(|l| {
+                l.payload_change().is_some()
+                    || l.resource_query_pending()
+                    || (l.dirty() && (l.owner.is_some() || !l.payloads.is_empty()))
+            });
+            if busy {
+                return Ok(None);
+            }
+            let unlit: Vec<Option<u8>> = route
+                .pipes
+                .iter()
+                .map(|p| p.filter(|&p| p < 4 && used & 1 << p == 0))
+                .collect();
+            let route = MstRoute {
+                pipes: &unlit,
+                ..*route
+            };
+            self.start_mst_route_beside(&route).await?;
+        }
         self.select_display(idle)?;
         let ports = self.scan_display().await.map_err(ModesetError::Boot)?;
         let paths = self
             .display_paths()
             .map_err(|_| ModesetError::NoSink)?
             .to_vec();
-        if !self.mst.is_empty() {
-            return Ok(None);
-        }
-        let mut new: Vec<(Selection, u8)> = match select_all(&paths, &ports, max_bpc(), &want) {
+        // An MST root is its branch's, never a board SST sink.
+        let roots: Vec<_> = self
+            .mst
+            .keys()
+            .filter_map(|&port| paths.get(port).copied())
+            .collect();
+        let board: Vec<display::Port> = ports
+            .iter()
+            .filter(|p| !roots.contains(&p.path))
+            .cloned()
+            .collect();
+        let sst: Vec<(Selection, u8)> = match select_all(&paths, &board, max_bpc(), &want) {
             Ok(selections) => selections,
             Err(ModesetError::NoSink | ModesetError::Link) => Vec::new(),
             Err(e) => return Err(e),
@@ -4243,10 +4297,29 @@ impl ColdBoot {
         .filter(|s| !ports_used.contains(&s.port))
         .filter_map(|s| Some((s, pipe_of(s.port).filter(|&p| p < 4 && used & 1 << p == 0)?)))
         .collect();
-        new.sort_by_key(|&(_, pipe)| pipe);
-        if new.windows(2).any(|w| w[0].1 == w[1].1) {
-            return Err(ModesetError::Display(otg::Error::Invalid));
+        let mut mst_plans = Vec::with_capacity(mst.len());
+        for route in mst {
+            let unlit: Vec<Option<u8>> = route
+                .pipes
+                .iter()
+                .map(|p| p.filter(|&p| p < 4 && used & 1 << p == 0))
+                .collect();
+            let route = MstRoute {
+                pipes: &unlit,
+                ..*route
+            };
+            let lit: Vec<Selection> = running
+                .iter()
+                .map(|m| m.selection)
+                .filter(|s| s.port == route.port && s.mst.is_some())
+                .collect();
+            let Some(plan) = self.plan_mst_route(&route, &ports, &lit)? else {
+                return Ok(None);
+            };
+            mst_plans.push(plan);
         }
+        let mst_streams: Vec<_> = mst_plans.iter().map(|p| p.selections.as_slice()).collect();
+        let mut new = route_streams(sst, &mst_streams)?;
         let limited = limited_range(broadcast_rgb());
         for (s, pipe) in new.iter_mut() {
             s.limited = limited && !s.ycbcr420;
@@ -4286,7 +4359,11 @@ impl ColdBoot {
         new.truncate(n);
         if new.is_empty() {
             running.sort_by_key(|m| m.pipe);
-            self.update_sst_outputs(Some(&soc), &paths, &ports, &running);
+            self.update_sst_outputs(Some(&soc), &paths, &board, &running);
+            let selections: Vec<_> = running.iter().map(|m| m.selection).collect();
+            for plan in &mst_plans {
+                self.finish_mst_plan(plan, &soc, &selections);
+            }
             return Ok(Some(Configuration {
                 displays: running,
                 failed: None,
@@ -4414,23 +4491,35 @@ impl ColdBoot {
         // computes them.
         let all = displays.clone();
         for (k, display) in displays.iter_mut().enumerate() {
-            let edid = edid_of(&ports, &paths, &display.selection);
+            let s = &display.selection;
+            let edid = match s.mst {
+                Some(m) => self.mst_edid(s.port, m.sink),
+                None => edid_of(&ports, &paths, s),
+            };
             display.modes = self.offered_modes(&soc, &all, k, &edid);
             self.modesets.retain(*display);
         }
-        self.update_sst_outputs(Some(&soc), &paths, &ports, &displays);
+        self.update_sst_outputs(Some(&soc), &paths, &board, &displays);
+        if failed.is_none() {
+            let selections: Vec<_> = displays.iter().map(|m| m.selection).collect();
+            for plan in &mst_plans {
+                self.finish_mst_plan(plan, &soc, &selections);
+            }
+        }
         Ok(Some(Configuration { displays, failed }))
     }
     /// After a display left: DML admits the running displays' modes again
     /// and, if each keeps its pipes, the configuration moves to the new
     /// plans in dcn401's prepare/optimize order (the clocks the departed
-    /// display needed lowered last). Returns the updated displays.
+    /// display needed lowered last). Returns the updated displays. MST
+    /// streams move like any other: their payloads and links are not
+    /// touched (the departed stream's payload left with its teardown).
     /// # Safety
     /// As for `modeset_displays`, except that the running displays stay lit.
     pub async unsafe fn replan_displays(&mut self) -> Result<Vec<Modeset>, ModesetError> {
         self.teardowns.check_idle()?;
         let mut running: Vec<Modeset> = self.display_modesets().into_iter().flatten().collect();
-        if running.is_empty() || running.iter().any(|m| m.selection.mst.is_some()) {
+        if running.is_empty() {
             return Ok(running);
         }
         running.sort_by_key(|m| m.pipe);

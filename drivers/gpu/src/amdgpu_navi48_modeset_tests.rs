@@ -4137,3 +4137,82 @@ kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_mst_two_ports_select_on_their_own_links
 );
+
+/// A new end device beside a port's running MST stream on a link without
+/// DSC decoders: the running stream keeps its payload as Linux keeps it
+/// (drm_dp_atomic_find_time_slots runs only for the changed connector), so
+/// the new one takes what it leaves: 9 of 63 slots beside a 2160p stream
+/// (720p, not the 1080p the device would get alone), its hop PBN beside the
+/// running payload's, and no payload past amdgpu_dm's four per manager.
+/// The running device is never selected again.
+fn navi48_mst_selects_new_streams_beside_running_ones() -> TestResult {
+    use crate::dp_mst_mgr::Sink;
+    let caps = DpCaps {
+        lanes: 4,
+        rate: LinkRate::Hbr2,
+        uhbr: 0,
+        fec: false,
+        dsc: None,
+    };
+    let sink = |port| Sink { branch: 0, port };
+    let devices = [
+        (sink(1), edid_2160p(), u16::MAX),
+        (sink(2), edid_three_modes(false), u16::MAX),
+    ];
+    let unlimited = |_: Sink, _: &[(Sink, u16)]| u16::MAX;
+    let beside = |pipes: &[Option<u8>], lit: &[Selection], budget: &super::super::mst::Budget| {
+        super::super::mst::select_mst_outputs_beside(
+            0,
+            caps,
+            &devices,
+            &|_| None,
+            pipes,
+            budget,
+            None,
+            lit,
+        )
+    };
+    let lit: Vec<Selection> = beside(&[Some(0), None], &[], &unlimited)
+        .unwrap()
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect();
+    assert_eq!(lit[0].mst.unwrap().slots, 54);
+    let alone = beside(&[None, Some(1)], &[], &unlimited).unwrap();
+    assert_eq!(alone[0].0.timing.h_active, 1920);
+    let added = beside(&[Some(0), Some(1)], &lit, &unlimited).unwrap();
+    let shown: Vec<_> = added
+        .iter()
+        .map(|(s, p)| (s.timing.h_active, s.mst.unwrap().slots, *p))
+        .collect();
+    assert_eq!(shown, [(1280, 7, 1)]);
+    // A hop shared with the running payload: what it leaves bounds the new.
+    let pbn = lit[0].mst.unwrap().pbn;
+    let shared = |s: Sink, allocated: &[(Sink, u16)]| {
+        let used: u16 = allocated.iter().map(|a| a.1).sum();
+        if s == sink(2) {
+            (pbn + 100).saturating_sub(used)
+        } else {
+            u16::MAX
+        }
+    };
+    assert_eq!(beside(&[None, Some(1)], &lit, &shared), Some(Vec::new()));
+    // Four payloads on the manager already: nothing more.
+    let mut four = lit.clone();
+    for k in 0..3 {
+        let mut s = lit[0];
+        s.mst.as_mut().unwrap().slots = 1;
+        s.mst.as_mut().unwrap().sink = sink(8 + k);
+        four.push(s);
+    }
+    four[0].mst.as_mut().unwrap().slots = 1;
+    assert_eq!(
+        beside(&[None, Some(1)], &four, &unlimited),
+        Some(Vec::new())
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_mst_selects_new_streams_beside_running_ones
+);

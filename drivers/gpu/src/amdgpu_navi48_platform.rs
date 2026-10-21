@@ -5253,6 +5253,10 @@ pub async unsafe fn monitor_displays(
         }
     }
     publish_outputs();
+    // MST streams whose end devices left (their pipes), on these ports.
+    let (mut lost_mask, mut lost_ports) = (0u8, Vec::new());
+    // Ports an MST stream retires from in this pass.
+    let mut left_ports: Vec<usize> = Vec::new();
     for &port in &mst_ports {
         if pending_mask == 0
             && boot.display_hpd(port) == Ok(true)
@@ -5267,7 +5271,16 @@ pub async unsafe fn monitor_displays(
                 })
             };
             let before = shown(boot);
-            relight |= boot.service_display_mst(port).await?;
+            match boot.service_display_mst(port).await? {
+                boot::MstService::Kept => {}
+                boot::MstService::Relight => relight = true,
+                // As Linux disables a departed connector's CRTC: only its
+                // stream retires, the others on the link run on.
+                boot::MstService::Lost(pipes) => {
+                    lost_mask |= pipes.iter().fold(0, |acc, &p| acc | 1 << p);
+                    lost_ports.push(port);
+                }
+            }
             // A change adopted beside the running streams shows its
             // connectors at once.
             if shown(boot) != before {
@@ -5283,11 +5296,17 @@ pub async unsafe fn monitor_displays(
         let pending = boot.display_teardown_status(k);
         let unplugged =
             boot.display_hpd(m.selection.port) == Ok(false) || pending.is_some_and(|p| p.unplugged);
-        if unplugged || !wants[usize::from(k)].0 || pending.is_some() {
+        // An MST end device gone behind a connected root: its stream
+        // retires addressing the root, never the departed device.
+        let lost = lost_mask & 1 << k != 0;
+        if unplugged || lost || !wants[usize::from(k)].0 || pending.is_some() {
             // Finish a recorded teardown even when DRM has since requested on.
             // SAFETY: OWNER and the caller's exclusions cover the whole resume.
             unsafe { retire_monitored_display(boot, displays, k, unplugged) }.await?;
-            steps.push(if unplugged {
+            if m.selection.mst.is_some() && !left_ports.contains(&m.selection.port) {
+                left_ports.push(m.selection.port);
+            }
+            steps.push(if unplugged || lost {
                 MonitorStep::Unplugged(k)
             } else {
                 MonitorStep::Disabled(k)
@@ -5378,6 +5397,15 @@ pub async unsafe fn monitor_displays(
             }
         }
     }
+    // With the departed devices' streams retired, adopt their ports' trees
+    // beside the streams still running; anything else relights.
+    for &port in &lost_ports {
+        if boot.service_display_mst(port).await? != boot::MstService::Kept {
+            relight = true;
+        }
+        reconcile_mst_outputs(boot, port);
+        publish_outputs();
+    }
     // New planes on displays that otherwise run on: DC's plane update with
     // the stream running, unless a relight is due anyway or the update
     // needs a modeset.
@@ -5407,6 +5435,13 @@ pub async unsafe fn monitor_displays(
     let retired_now = steps
         .iter()
         .any(|s| matches!(s, MonitorStep::Unplugged(_) | MonitorStep::Disabled(_)));
+    // A stream left an MST link whose end devices decode DSC: amdgpu_dm
+    // recomputes the remaining streams' fairness search and modesets any
+    // whose configuration it changes; the others ran on through the
+    // removal (its payload alone was deallocated).
+    if retired_now && lit_mask != 0 && !boot.mst_streams_kept(&left_ports) {
+        relight = true;
+    }
     let (mut relit, mut lit_beside) = (false, false);
     if needs_relight(relight, wanted, lit_mask, &mut displays.considered) {
         relit = true;
@@ -7219,11 +7254,8 @@ async unsafe fn light_beside(
     fill: impl FnMut(u8, u32, &mut [u32]),
 ) -> Result<Option<crate::amdgpu_navi48_boot::Configuration>, ModesetError> {
     let lit_mask = lit.iter().flatten().fold(0u8, |acc, m| acc | 1 << m.pipe);
-    let (routes, wants) = {
+    let (routes, wants, mst) = {
         let mut outputs = OUTPUTS.lock();
-        if !outputs.mst.is_empty() {
-            return Ok(None);
-        }
         outputs.assign_routes();
         let routes: [Option<Target>; 4] = core::array::from_fn(|k| {
             let c = &outputs.crtcs[k];
@@ -7238,16 +7270,39 @@ async unsafe fn light_beside(
             crate::amdgpu_navi48_boot::set_plane_setup(k as u8, c.planes);
         }
         outputs.stage_requested_bpc(|k| routes[k].is_some());
-        (routes, wants)
+        (routes, wants, outputs.mst_ports())
     };
-    if routes.iter().all(|r| !matches!(r, Some(Target::Board(_)))) {
+    if routes.iter().all(Option::is_none) {
         return Ok(None);
     }
     let crtc_of = |t: Target| routes.iter().position(|r| *r == Some(t));
     let pipe = |port: usize| crtc_of(Target::Board(port)).map(|k| k as u8);
     let want = |port: usize| crtc_of(Target::Board(port)).and_then(|k| wants[k]);
+    // Every branch, its new end devices on the CRTCs routed to them (the
+    // lit ones' are not in `routes`): each adds its payload beside the
+    // streams already on its link.
+    let mst_pipes: Vec<Vec<Option<u8>>> = mst
+        .iter()
+        .map(|&port| {
+            (0..boot::MST_OUTPUTS as u8)
+                .map(|slot| crtc_of(Target::Mst(port, slot)).map(|k| k as u8))
+                .collect()
+        })
+        .collect();
+    let mst_wants: Vec<_> = mst
+        .iter()
+        .map(|&port| {
+            move |slot: usize| crtc_of(Target::Mst(port, slot as u8)).and_then(|k| wants[k])
+        })
+        .collect();
+    let mst_routes: Vec<boot::MstRoute> = mst
+        .iter()
+        .zip(&mst_pipes)
+        .zip(&mst_wants)
+        .map(|((&port, pipes), want)| boot::MstRoute { port, pipes, want })
+        .collect();
     // SAFETY: the caller's obligations.
-    let Some(config) = unsafe { boot.modeset_beside(fill, want, pipe) }.await? else {
+    let Some(config) = unsafe { boot.modeset_beside(fill, want, pipe, &mst_routes) }.await? else {
         return Ok(None);
     };
     {
@@ -7264,6 +7319,12 @@ async unsafe fn light_beside(
                 outputs.invalidate(Target::Board(port), false);
             }
         }
+        drop(outputs);
+        // The branches' dark devices, admitted beside the new configuration.
+        for &port in &mst {
+            reconcile_mst_outputs(boot, port);
+        }
+        let mut outputs = OUTPUTS.lock();
         // The running displays' new admission and offered modes.
         for m in config
             .displays

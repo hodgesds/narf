@@ -76,6 +76,21 @@ pub struct MstPayload {
     pub stream: u8,
 }
 
+/// What `ColdBoot::service_display_mst` found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MstService {
+    /// Every running stream's route survives (any new end device waits for
+    /// its CRTC to light beside them).
+    Kept,
+    /// The end devices of these stream encoders' (pipes') payloads left;
+    /// every other route survives. Retire those streams alone, then service
+    /// the port again to adopt the tree.
+    Lost(Vec<u8>),
+    /// The topology changed under the running streams (another primary
+    /// branch, a hop's capacity): stop them all and relight.
+    Relight,
+}
+
 /// A payload transaction started but has not completed its required steps.
 /// Retained after errors or cancellation; it is not permission to replay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,7 +112,13 @@ pub struct MstLink {
     pub payloads: Vec<MstPayload>,
     /// Stable KMS slots, including reservations for disconnected sinks.
     pub outputs: topology::Outputs,
+    /// The root's link caps when the port was last planned: the link its
+    /// payloads are sized for, which dark-device admission uses while no
+    /// stream runs.
+    caps: Option<modeset::DpCaps>,
     payload_change: Option<MstPayloadChange>,
+    /// Payload end devices a live reprobe found gone (`reprobe_live`).
+    lost: Vec<dp_mst_mgr::Sink>,
     resource_ports: Vec<dp_mst_mgr::Sink>,
     resource_query: bool,
     state: ProbeState,
@@ -137,6 +158,10 @@ impl MstLink {
             return Err(otg::Error::Invalid);
         }
         Ok(p.slots)
+    }
+    /// A downstream change awaits a reprobe.
+    pub fn dirty(&self) -> bool {
+        self.dirty
     }
     pub(super) fn require_transaction_idle<E>(&self) -> Result<(), MstFailure<E>> {
         if self.payload_change.is_some() || self.resource_query {
@@ -340,9 +365,10 @@ pub(crate) async fn add_payload<A: MstAux, S: MstSource>(
 
 /// deallocate_mst_payload for stream encoder `stream`: VC rate zero, the remote and
 /// DPCD allocations removed (drm_dp_remove_payload_part1, failures
-/// tolerated as Linux does), the source table without it and ACT handled
-/// (unchecked), then later payloads' start slots moved down
-/// (drm_dp_remove_payload_part2).
+/// tolerated as Linux does, and skipped for an end device the topology
+/// lost, which is no longer downstream of the primary branch), the source
+/// table without it and ACT handled (unchecked), then later payloads'
+/// start slots moved down (drm_dp_remove_payload_part2).
 pub(crate) async fn remove_payload<A: MstAux, S: MstSource>(
     link: &mut MstLink,
     aux: &mut A,
@@ -359,8 +385,9 @@ pub(crate) async fn remove_payload<A: MstAux, S: MstSource>(
     let payload = link.payloads[index];
     link.payload_change = Some(MstPayloadChange::Removing(stream));
     source.vc_rate(stream, (0, 0)).await?;
+    let downstream = connected && !link.lost.contains(&payload.sink);
     if let (true, Some(branch), Some(port)) = (
-        connected,
+        downstream,
         link.topology.branches.get(payload.sink.branch).cloned(),
         link.topology.port(payload.sink).copied(),
     ) {
@@ -375,7 +402,7 @@ pub(crate) async fn remove_payload<A: MstAux, S: MstSource>(
             .transact(aux, branch.lct, &branch.rad, &request)
             .await;
     }
-    if connected {
+    if downstream {
         let _ = dp_mst_mgr::write_payload(aux, payload.vcpi, payload.start, 0).await;
     }
     let removed = link.payloads.remove(index);
@@ -467,13 +494,16 @@ impl ColdBoot {
     /// Service downstream connection/resource changes. A change that leaves
     /// every running stream's route intact (a downstream branch or device
     /// added or removed elsewhere in the tree) is adopted at once, as Linux
-    /// keeps unaffected streams (`MstLink::reprobe_live`); dark outputs are
-    /// then readmitted beside the running streams. Otherwise the old
-    /// topology stays until the platform has retired its streams. Returns
-    /// whether the configuration must be relit: a route was lost, or a new
-    /// end device appeared for the routing to consider. Drain before and
+    /// keeps unaffected streams (`MstLink::reprobe_live`); a port carrying
+    /// no stream simply reprobes (`MstLink::prepare`), as Linux's probe work
+    /// does. Dark outputs are then readmitted beside the running streams,
+    /// and a new end device waits for its CRTC like any connector: lighting
+    /// it is a commit beside the running streams (`modeset_beside`), not a
+    /// relight. Otherwise the old topology stays until the platform has
+    /// retired its streams. Returns whether the configuration must be
+    /// relit: a lit route (or its hops' capacity) was lost. Drain before and
     /// after polling so a full queue cannot block down-transaction progress.
-    pub async fn service_display_mst(&mut self, port: usize) -> Result<bool, MstFailure> {
+    pub async fn service_display_mst(&mut self, port: usize) -> Result<MstService, MstFailure> {
         self.mst
             .get_mut(&port)
             .ok_or(MstFailure::Invalid)?
@@ -489,24 +519,28 @@ impl ColdBoot {
             instance,
         };
         link.refresh_resources(&mut aux).await?;
-        if !link.dirty || !link.has_stream_resources() {
-            return Ok(link.dirty);
+        if !link.dirty {
+            return Ok(MstService::Kept);
         }
-        let present = |l: &MstLink| -> Vec<MstOutputId> {
-            l.outputs
-                .iter()
-                .flatten()
-                .filter(|o| o.sink.is_some())
-                .map(|o| o.id)
-                .collect()
-        };
-        let before = present(link);
-        if !link.reprobe_live(&mut aux).await? {
-            return Ok(true);
+        if link.has_stream_resources() {
+            if !link.reprobe_live(&mut aux).await? {
+                let lost: Vec<u8> = link
+                    .payloads
+                    .iter()
+                    .filter(|p| link.lost.contains(&p.sink))
+                    .map(|p| p.stream)
+                    .collect();
+                return Ok(if lost.is_empty() {
+                    MstService::Relight
+                } else {
+                    MstService::Lost(lost)
+                });
+            }
+        } else {
+            link.prepare(&mut aux).await?;
         }
-        let added = present(link).iter().any(|id| !before.contains(id));
         self.readmit_dark_mst_outputs(port);
-        Ok(added)
+        Ok(MstService::Kept)
     }
     /// Admit each dark end device's timings beside the running displays
     /// after a live topology change (as a configuration's last step does).
@@ -517,10 +551,13 @@ impl ColdBoot {
             .flatten()
             .map(|m| m.selection)
             .collect();
+        // The running link's caps, else those the port was last planned
+        // with (a branch whose streams are all off).
         let Some(caps) = running
             .iter()
             .find(|s| s.port == port && s.mst.is_some())
             .map(|s| s.caps)
+            .or_else(|| self.mst.get(&port).and_then(|l| l.caps))
         else {
             return;
         };
@@ -664,6 +701,10 @@ impl ColdBoot {
         let (instance, _) = self.mst_path(port)?;
         let link = self.mst.get_mut(&port).ok_or(MstFailure::Invalid)?;
         link.require_transaction_idle()?;
+        // A decoder the topology lost is not addressed again.
+        if !enable && matches!(dsc.aux, DscAux::Port(s) if link.lost.contains(&s)) {
+            return Ok(());
+        }
         let mut aux = DmubAux {
             dmub: &mut self.sequence.backend.dmub,
             instance,
@@ -793,7 +834,8 @@ pub fn select_mst(
     devices: &[(dp_mst_mgr::Sink, Vec<u8>, u16)],
     want: &dyn Fn(usize) -> Option<Timing>,
 ) -> Vec<Selection> {
-    select_mst_with_budget(port, caps, devices, want, &|_, _| u16::MAX, None)
+    select_mst_with_budget(port, caps, devices, want, &|_, _| u16::MAX, None, &[])
+        .unwrap_or_default()
 }
 
 /// What MST depth and DSC selection need beyond the selection's inputs:
@@ -873,6 +915,16 @@ fn mst_vc_rate_dsc(
 /// DSC are that last search's (it may change earlier streams' bpp); each
 /// stream, compressed or not, leaves at its depth. A compressed stream
 /// keeps its audio, budgeted at its DSC bits per pixel.
+///
+/// Beside `lit`, the port's running streams (their devices among
+/// `devices`), the search is amdgpu_dm's for a commit that adds streams
+/// (is_dsc_need_re_compute): over the link's streams in dc_state order,
+/// the running ones first (in topology order), then each new device's.
+/// Linux gives every stream whose configuration that changes a full
+/// modeset (drm_dp_mst_add_affected_dsc_crtcs, then dc_is_stream_unchanged
+/// keeps the others running): None when it changes a running stream's
+/// PBN, slots or DSC, which the caller relights. With no new device this
+/// is the recomputation a removal triggers.
 fn select_mst_dsc(
     port: usize,
     caps: modeset::DpCaps,
@@ -880,11 +932,35 @@ fn select_mst_dsc(
     want: &dyn Fn(usize) -> Option<Timing>,
     budget: &Budget<'_>,
     ctx: &MstDscContext<'_>,
-) -> Vec<Selection> {
+    lit: &[Selection],
+) -> Option<Vec<Selection>> {
     let (lanes, rate) = mst_link(caps);
-    let Some(link) = dsc_link(caps, ctx.max_dispclk_khz) else {
-        return Vec::new();
-    };
+    let link = dsc_link(caps, ctx.max_dispclk_khz)?;
+    // The running streams in topology order, as their configurations
+    // were found.
+    let mut running: Vec<(usize, &Selection)> = lit
+        .iter()
+        .map(|s| {
+            let sink = s.mst?.sink;
+            Some((devices.iter().position(|d| d.0 == sink)?, s))
+        })
+        .collect::<Option<_>>()?;
+    running.sort_by_key(|r| r.0);
+    let seeded: Vec<dsc::DscStream> = running
+        .iter()
+        .map(|&(_, s)| {
+            let sink = s
+                .mst
+                .map(|m| m.sink)
+                .unwrap_or(dp_mst_mgr::Sink { branch: 0, port: 0 });
+            dsc::DscStream {
+                sink,
+                timing: s.timing,
+                dsc: (ctx.dsc_of)(sink).map(|d| d.caps),
+                bpc: modeset::depth_bpc(s.depth),
+            }
+        })
+        .collect();
     let fits = |alloc: &[(dp_mst_mgr::Sink, u16)]| {
         alloc.iter().enumerate().all(|(i, &(sink, pbn))| {
             let others: Vec<_> = alloc
@@ -898,12 +974,16 @@ fn select_mst_dsc(
         })
     };
     let mut chosen: Vec<(usize, dsc::DscStream)> = Vec::new();
-    let mut payloads = Vec::new();
+    let mut payloads = if seeded.is_empty() {
+        Vec::new()
+    } else {
+        dsc::compute(&seeded, &link, &fits)?
+    };
     for (k, (sink, edid, _)) in devices.iter().enumerate() {
-        if chosen.len() == MAX_PAYLOADS {
+        if seeded.len() + chosen.len() >= MAX_PAYLOADS {
             break;
         }
-        if edid.len() < 128 {
+        if edid.len() < 128 || seeded.iter().any(|s| s.sink == *sink) {
             continue;
         }
         let decoder = (ctx.dsc_of)(*sink);
@@ -926,7 +1006,8 @@ fn select_mst_dsc(
                     ) {
                         return None;
                     }
-                    let mut streams: Vec<_> = chosen.iter().map(|c| c.1).collect();
+                    let mut streams = seeded.clone();
+                    streams.extend(chosen.iter().map(|c| c.1));
                     streams.push(dsc::DscStream {
                         sink: *sink,
                         timing: t,
@@ -942,8 +1023,15 @@ fn select_mst_dsc(
             payloads = p;
         }
     }
+    // A running stream keeps its configuration, or the change relights.
+    let kept = running.iter().zip(&payloads).all(|(&(_, s), p)| {
+        s.mst.is_some_and(|m| (m.pbn, m.slots) == (p.pbn, p.slots)) && s.dsc == p.dsc
+    });
+    if !kept || payloads.len() != seeded.len() + chosen.len() {
+        return None;
+    }
     let mut out = Vec::new();
-    for ((k, stream), p) in chosen.iter().zip(&payloads) {
+    for ((k, stream), p) in chosen.iter().zip(&payloads[seeded.len()..]) {
         let (sink, edid, _) = &devices[*k];
         let Some(base) = edid.get(..128).and_then(|b| b.try_into().ok()) else {
             continue;
@@ -955,7 +1043,7 @@ fn select_mst_dsc(
             None => mst_vc_rate(&timing, stream.bpc, lanes, rate, caps.fec),
         };
         let Some(vc) = vc else {
-            return Vec::new();
+            return Some(Vec::new());
         };
         out.push(Selection {
             port,
@@ -989,7 +1077,7 @@ fn select_mst_dsc(
             vsc_colorimetry: false,
         });
     }
-    out
+    Some(out)
 }
 
 /// LPCM rates an MST stream's blanking carries at `bpc`: on 8b/10b its
@@ -1031,6 +1119,15 @@ fn mst_audio(
     })
 }
 
+/// The port's streams for `devices` (`select_mst`) beside `lit`, the
+/// port's running MST streams on the same link, whose devices are among
+/// `devices` but are not selected again. Without DSC decoders a running
+/// stream keeps its payload as Linux keeps it (drm_dp_atomic_find_time_slots
+/// runs only for the connectors that change): new devices take what the
+/// running payloads leave of the link's time slots, every hop's PBN and
+/// the manager's `MAX_PAYLOADS`. With decoders the link's fairness search
+/// runs over every stream (`select_mst_dsc`), None when it would change a
+/// running one.
 fn select_mst_with_budget(
     port: usize,
     caps: modeset::DpCaps,
@@ -1038,24 +1135,34 @@ fn select_mst_with_budget(
     want: &dyn Fn(usize) -> Option<Timing>,
     budget: &Budget<'_>,
     dsc: Option<&MstDscContext<'_>>,
-) -> Vec<Selection> {
+    lit: &[Selection],
+) -> Option<Vec<Selection>> {
     // compute_mst_dsc_configs_for_state recomputes a link only when one of
     // its streams' sinks has a decoder; otherwise each payload keeps
     // drm_dp_calc_pbn_mode's PBN.
     if let Some(ctx) = dsc.filter(|c| devices.iter().any(|d| (c.dsc_of)(d.0).is_some())) {
-        return select_mst_dsc(port, caps, devices, want, budget, ctx);
+        return select_mst_dsc(port, caps, devices, want, budget, ctx, lit);
     }
     let (lanes, rate) = mst_link(caps);
-    let mut free = mst_total_slots(rate);
+    let lit_slots = lit
+        .iter()
+        .try_fold(0u8, |n, s| n.checked_add(s.mst?.slots))?;
+    let mut free = mst_total_slots(rate).checked_sub(lit_slots)?;
+    let lit_sinks: Vec<_> = lit.iter().filter_map(|s| s.mst.map(|m| m.sink)).collect();
     let mut out = Vec::new();
     for (k, (sink, edid, available)) in devices.iter().enumerate() {
-        if out.len() == MAX_PAYLOADS {
+        if lit.len() + out.len() >= MAX_PAYLOADS {
             break;
+        }
+        if lit_sinks.contains(sink) {
+            continue;
         }
         let Some(base) = edid.get(..128).and_then(|b| b.try_into().ok()) else {
             continue;
         };
-        let available = (*available).min(budget(*sink, &allocations(&out)));
+        let mut payloads = allocations(lit);
+        payloads.extend(allocations(&out));
+        let available = (*available).min(budget(*sink, &payloads));
         let fits = |t: &Timing| {
             raw_mst_stream(t, edid, caps, dsc.map(|c| (*sink, c)))
                 .filter(|r| r.slots <= free && r.pbn <= available)
@@ -1109,7 +1216,7 @@ fn select_mst_with_budget(
         };
         out.push(s);
     }
-    out
+    Some(out)
 }
 
 /// The native depth of `bpc` (8, 10 or 12).
@@ -1207,6 +1314,7 @@ pub(super) fn select_mst_outputs(
 }
 
 /// `select_mst_outputs` with the link's DSC context (`select_mst_dsc`).
+#[cfg(feature = "kernel-test")]
 pub(super) fn select_mst_outputs_with(
     port: usize,
     caps: modeset::DpCaps,
@@ -1216,19 +1324,49 @@ pub(super) fn select_mst_outputs_with(
     budget: &Budget<'_>,
     dsc: Option<&MstDscContext<'_>>,
 ) -> Vec<(Selection, u8)> {
+    select_mst_outputs_beside(port, caps, devices, want, pipes, budget, dsc, &[])
+        .unwrap_or_default()
+}
+
+/// `select_mst_outputs_with` beside `lit`, the port's running MST streams
+/// (`select_mst_with_budget`): the new streams on their pipes, or None when
+/// the link's DSC fairness would change a running stream.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn select_mst_outputs_beside(
+    port: usize,
+    caps: modeset::DpCaps,
+    devices: &[(dp_mst_mgr::Sink, Vec<u8>, u16)],
+    want: &dyn Fn(usize) -> Option<Timing>,
+    pipes: &[Option<u8>],
+    budget: &Budget<'_>,
+    dsc: Option<&MstDscContext<'_>>,
+    lit: &[Selection],
+) -> Option<Vec<(Selection, u8)>> {
+    let lit_sinks: Vec<_> = lit.iter().filter_map(|s| s.mst.map(|m| m.sink)).collect();
     let enabled: Vec<usize> = (0..devices.len())
-        .filter(|&k| pipes.get(k).is_some_and(Option::is_some))
+        .filter(|&k| pipes.get(k).is_some_and(Option::is_some) || lit_sinks.contains(&devices[k].0))
         .collect();
     let selected: Vec<_> = enabled.iter().map(|&k| devices[k].clone()).collect();
-    select_mst_with_budget(port, caps, &selected, &|k| want(enabled[k]), budget, dsc)
-        .into_iter()
-        .filter_map(|s| {
-            let k = devices
-                .iter()
-                .position(|d| Some(d.0) == s.mst.map(|m| m.sink))?;
-            Some((s, pipes[k]?))
-        })
-        .collect()
+    let streams = select_mst_with_budget(
+        port,
+        caps,
+        &selected,
+        &|k| want(enabled[k]),
+        budget,
+        dsc,
+        lit,
+    )?;
+    Some(
+        streams
+            .into_iter()
+            .filter_map(|s| {
+                let k = devices
+                    .iter()
+                    .position(|d| Some(d.0) == s.mst.map(|m| m.sink))?;
+                Some((s, pipes[k]?))
+            })
+            .collect(),
+    )
 }
 
 /// Timings a dark connector could add beside the running streams. Each
@@ -1343,6 +1481,10 @@ pub(super) fn dark_mst_modes_with(
     offered
 }
 
+/// A port's present end devices (sink, EDID, available PBN) and the
+/// `MstLink::outputs` slot of each.
+type MstDevices = (Vec<(dp_mst_mgr::Sink, Vec<u8>, u16)>, Vec<usize>);
+
 /// An MST route's planned streams for one configuration.
 #[derive(Debug)]
 pub(super) struct MstPlan {
@@ -1387,6 +1529,17 @@ impl ColdBoot {
         &mut self,
         route: &modeset::MstRoute<'_>,
     ) -> Result<(), ModesetError> {
+        if self.mst.get(&route.port).is_some_and(|l| l.owner.is_some()) {
+            return Err(ModesetError::Display(otg::Error::Invalid));
+        }
+        self.start_mst_route_beside(route).await
+    }
+    /// `start_mst_route` for a branch whose link may already carry
+    /// streams: a clean running session is used as it is.
+    pub(super) async fn start_mst_route_beside(
+        &mut self,
+        route: &modeset::MstRoute<'_>,
+    ) -> Result<(), ModesetError> {
         let pipes = route.pipes;
         if pipes.is_empty()
             || pipes.len() > MST_OUTPUTS
@@ -1395,69 +1548,58 @@ impl ColdBoot {
                 .iter()
                 .enumerate()
                 .any(|(k, p)| p.is_some() && pipes[..k].contains(p))
-            || self.mst.get(&route.port).is_some_and(|l| l.owner.is_some())
         {
             return Err(ModesetError::Display(otg::Error::Invalid));
         }
         self.start_display_mst(route.port).await?;
         Ok(())
     }
-    /// The route's end devices (EDID, available PBN) and the streams
-    /// selected for them with their pipes, against the scanned root caps.
-    /// Old dark-output admission is discarded before any async startup.
-    pub(super) fn plan_mst_route(
-        &mut self,
-        route: &modeset::MstRoute<'_>,
-        ports: &[display::Port],
-    ) -> Result<MstPlan, ModesetError> {
-        let port = route.port;
-        let link = self.mst.get(&port).ok_or(MstFailure::Invalid)?;
+    /// End device `sink`'s EDID behind `port`, from its connector slot.
+    pub(super) fn mst_edid(&self, port: usize, sink: dp_mst_mgr::Sink) -> Vec<u8> {
+        self.mst
+            .get(&port)
+            .and_then(|l| {
+                l.outputs
+                    .iter()
+                    .flatten()
+                    .find(|o| o.sink == Some(sink))
+                    .map(|o| o.edid.clone())
+            })
+            .unwrap_or_default()
+    }
+    /// The port's present end devices (sink, EDID, available PBN) in
+    /// topology order, and the `MstLink::outputs` slot of each.
+    fn mst_devices(&self, port: usize) -> MstDevices {
         let mut devices = Vec::new();
         let mut slots = Vec::new();
-        for (k, output) in link.outputs.iter().enumerate() {
-            if let Some(o) = output {
-                if let Some(sink) = o.sink {
-                    devices.push((
-                        sink,
-                        o.edid.clone(),
-                        link.topology.port(sink).map_or(0, |p| p.available_pbn),
-                    ));
+        if let Some(link) = self.mst.get(&port) {
+            for (k, output) in link.outputs.iter().enumerate() {
+                if let Some(sink) = output.as_ref().and_then(|o| o.sink) {
+                    let edid = output.as_ref().map_or_else(Vec::new, |o| o.edid.clone());
+                    let available = link.topology.port(sink).map_or(0, |p| p.available_pbn);
+                    devices.push((sink, edid, available));
                     slots.push(k);
                 }
             }
         }
-        if devices.is_empty() {
-            return Ok(MstPlan {
-                port,
-                caps: None,
-                devices,
-                selections: Vec::new(),
-            });
-        }
-        let path = *self
-            .display_paths()
-            .map_err(|_| ModesetError::NoSink)?
-            .get(port)
-            .ok_or(ModesetError::NoSink)?;
-        let root = ports
-            .iter()
-            .find(|p| p.path == path)
-            .and_then(|p| p.sink.as_ref().ok());
-        let caps = root
-            .and_then(|sink| modeset::dp_caps(&path, sink))
-            .ok_or(ModesetError::NoSink)?;
-        // create_stream_for_sink's use_vsc_sdp_for_colorimetry reads the
-        // stream's link (the root branch's DPCD), MST or not.
-        let vsc_colorimetry = root.is_some_and(|sink| {
-            sink.dpcd.as_ref().is_some_and(|d| {
-                crate::amdgpu_hdr::use_vsc_sdp_for_colorimetry(d[0], sink.dprx_feature)
-            })
-        });
-        let assigned: Vec<_> = slots
-            .iter()
-            .map(|&k| route.pipes.get(k).copied().flatten())
-            .collect();
-        let link = self.mst.get(&port).ok_or(MstFailure::Invalid)?;
+        (devices, slots)
+    }
+    /// The streams `select_mst_outputs_beside` gives port `port`'s end
+    /// devices (`devices`, at `slots`) on pipes `pipe(slot)` at `want(slot)`
+    /// over the root's `caps`, beside `lit`, the port's running streams.
+    #[allow(clippy::too_many_arguments)]
+    fn select_on_link(
+        &self,
+        port: usize,
+        caps: modeset::DpCaps,
+        devices: &[(dp_mst_mgr::Sink, Vec<u8>, u16)],
+        slots: &[usize],
+        pipe: &dyn Fn(usize) -> Option<u8>,
+        want: &dyn Fn(usize) -> Option<Timing>,
+        lit: &[Selection],
+    ) -> Option<Vec<(Selection, u8)>> {
+        let link = self.mst.get(&port)?;
+        let assigned: Vec<_> = slots.iter().map(|&k| pipe(k)).collect();
         let budget = |sink, allocated: &[(dp_mst_mgr::Sink, u16)]| {
             topology::path_budget(&link.topology, sink, allocated).unwrap_or(0)
         };
@@ -1477,28 +1619,118 @@ impl ColdBoot {
             max_dispclk_khz: modeset::NOMINAL_DISPCLK_KHZ,
             max_bpc: &max_bpc,
         };
-        let mut selections = select_mst_outputs_with(
+        select_mst_outputs_beside(
             port,
             caps,
-            &devices,
-            &|k| (route.want)(slots[k]),
+            devices,
+            &|k| want(slots[k]),
             &assigned,
             &budget,
             Some(&ctx),
-        );
+            lit,
+        )
+    }
+    /// The route's end devices (EDID, available PBN) and the streams
+    /// selected for them with their pipes, against the scanned root caps,
+    /// beside `lit`, the port's running streams (none for a configuration
+    /// of stopped displays). None when the new streams cannot ride the
+    /// running link as it is: its root's caps (and so the link a payload
+    /// is sized for) changed, or the link's DSC fairness would change a
+    /// running stream (`select_mst_with_budget`). Old dark-output admission
+    /// is discarded before any async startup.
+    pub(super) fn plan_mst_route(
+        &mut self,
+        route: &modeset::MstRoute<'_>,
+        ports: &[display::Port],
+        lit: &[Selection],
+    ) -> Result<Option<MstPlan>, ModesetError> {
+        let port = route.port;
+        self.mst.get(&port).ok_or(MstFailure::Invalid)?;
+        let (devices, slots) = self.mst_devices(port);
+        if devices.is_empty() {
+            return Ok(lit.is_empty().then_some(MstPlan {
+                port,
+                caps: None,
+                devices,
+                selections: Vec::new(),
+            }));
+        }
+        let path = *self
+            .display_paths()
+            .map_err(|_| ModesetError::NoSink)?
+            .get(port)
+            .ok_or(ModesetError::NoSink)?;
+        let root = ports
+            .iter()
+            .find(|p| p.path == path)
+            .and_then(|p| p.sink.as_ref().ok());
+        let caps = root
+            .and_then(|sink| modeset::dp_caps(&path, sink))
+            .ok_or(ModesetError::NoSink)?;
+        if lit
+            .iter()
+            .any(|s| s.caps != caps || (s.lanes, s.rate) != mst_link(caps))
+        {
+            return Ok(None);
+        }
+        // create_stream_for_sink's use_vsc_sdp_for_colorimetry reads the
+        // stream's link (the root branch's DPCD), MST or not.
+        let vsc_colorimetry = root.is_some_and(|sink| {
+            sink.dpcd.as_ref().is_some_and(|d| {
+                crate::amdgpu_hdr::use_vsc_sdp_for_colorimetry(d[0], sink.dprx_feature)
+            })
+        });
+        let pipe = |k: usize| route.pipes.get(k).copied().flatten();
+        // A link no new stream joins is not searched again (Linux's
+        // is_dsc_need_re_compute finds no change on it).
+        let joins = slots.iter().any(|&k| pipe(k).is_some());
+        let selected = if joins || lit.is_empty() {
+            self.select_on_link(port, caps, &devices, &slots, &pipe, route.want, lit)
+        } else {
+            Some(Vec::new())
+        };
+        let Some(mut selections) = selected else {
+            return Ok(None);
+        };
         for (s, _) in selections.iter_mut() {
             s.vsc_colorimetry = vsc_colorimetry;
         }
         if let Some(link) = self.mst.get_mut(&port) {
+            link.caps = Some(caps);
             for output in link.outputs.iter_mut().flatten() {
                 output.modes.clear();
             }
         }
-        Ok(MstPlan {
+        Ok(Some(MstPlan {
             port,
             caps: Some(caps),
             devices,
             selections,
+        }))
+    }
+    /// Whether the running MST streams of `ports` (those a stream just
+    /// left) keep their configurations as the streams now running on each
+    /// link: after a stream on a link whose end devices decode DSC leaves,
+    /// amdgpu_dm recomputes the remaining streams' fairness search
+    /// (is_dsc_need_re_compute) and modesets any it changes. False when
+    /// that would change one, so the caller relights; links without
+    /// decoders keep their payloads.
+    pub fn mst_streams_kept(&self, ports: &[usize]) -> bool {
+        let running: Vec<Selection> = self
+            .display_modesets()
+            .into_iter()
+            .flatten()
+            .map(|m| m.selection)
+            .filter(|s| s.mst.is_some())
+            .collect();
+        ports.iter().all(|&port| {
+            let lit: Vec<Selection> = running.iter().filter(|s| s.port == port).copied().collect();
+            let Some(caps) = lit.first().map(|s| s.caps) else {
+                return true;
+            };
+            let (devices, slots) = self.mst_devices(port);
+            self.select_on_link(port, caps, &devices, &slots, &|_| None, &|_| None, &lit)
+                .is_some()
         })
     }
     /// Admit each dark end device's timings beside every running display.

@@ -3669,7 +3669,7 @@ mod media_transport;
 mod mst;
 pub use mst::{
     select_mst, DscAux, MstDsc, MstFailure, MstLink, MstOutput, MstOutputId, MstPayload,
-    MstPayloadChange, MST_OUTPUTS,
+    MstPayloadChange, MstService, MST_OUTPUTS,
 };
 #[path = "amdgpu_navi48_modeset.rs"]
 mod modeset;

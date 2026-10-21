@@ -400,7 +400,7 @@ fn navi48_mst_dsc_streams_take_the_deepest_depth() -> TestResult {
             max_dispclk_khz: 2_000_000,
             max_bpc: &max_bpc,
         };
-        super::super::select_mst_dsc(0, caps, &devices, &|_| None, &budget, &ctx)
+        super::super::select_mst_dsc(0, caps, &devices, &|_| None, &budget, &ctx, &[]).unwrap()
     };
     let link = super::super::dsc_link(caps, 2_000_000).unwrap();
     let want = |decoder: [u8; 16], bpc: u8| {
@@ -611,4 +611,120 @@ fn navi48_mst_raw_depth_matches_linux_vectors() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-mst",
     navi48_mst_raw_depth_matches_linux_vectors
+);
+
+/// `uhd60_edid` with a 1920x1080@60 (148.5 MHz) detailed timing instead.
+fn fhd60_edid() -> Vec<u8> {
+    let mut e = uhd60_edid(3);
+    e[54..72].copy_from_slice(&[
+        0x02, 0x3a, 0x80, 0x18, 0x71, 0x38, 0x2d, 0x40, 0x58, 0x2c, 0x45, 0, 0, 0, 0, 0, 0, 0x1e,
+    ]);
+    e[127] = 0;
+    e[127] = narf_edid::compute_checksum(&e);
+    e
+}
+
+/// A stream added or removed on a link whose end devices decode DSC, as
+/// amdgpu_dm handles it: the link's fairness search runs again over every
+/// stream, the running ones first (is_dsc_need_re_compute,
+/// compute_mst_dsc_configs_for_link), and Linux modesets each stream whose
+/// configuration that changes. A 1080p60 beside an uncompressed 4K60 on 4
+/// x HBR3 leaves the 4K stream as it runs: the new stream is selected
+/// alone. A second 4K60 on 4 x HBR2 would compress the running one: the
+/// addition is refused for a relight. Removing one of two compressed 4K
+/// streams changes the other (it would run uncompressed alone), so the
+/// removal relights; with both still running nothing changes.
+fn navi48_mst_dsc_beside_running_streams_like_amdgpu_dm() -> TestResult {
+    let mut hub = Hub::new();
+    let (_, topology) = probed(&mut hub);
+    let mst = MstDsc {
+        caps: DscSinkCaps::parse(&DECODER, &[0; 3]).unwrap(),
+        aux: DscAux::Port(ROOT_SINK),
+        passthrough: None,
+        end_link_kbps: 0,
+        branch_oui: 0,
+    };
+    let dsc_of = |s: Sink| (s == ROOT_SINK || s == CHILD_SINK).then_some(mst);
+    let max_bpc = |_: Sink| 8;
+    let ctx = MstDscContext {
+        topology: &topology,
+        dsc_of: &dsc_of,
+        max_dispclk_khz: 2_000_000,
+        max_bpc: &max_bpc,
+    };
+    let budget = |_: Sink, _: &[(Sink, u16)]| u16::MAX;
+    let caps = |rate| modeset::DpCaps {
+        lanes: 4,
+        rate,
+        uhbr: 0,
+        fec: true,
+        dsc: None,
+    };
+    let select = |caps,
+                  devices: &[(Sink, Vec<u8>, u16)],
+                  pipes: &[Option<u8>],
+                  lit: &[modeset::Selection]| {
+        super::super::select_mst_outputs_beside(
+            0,
+            caps,
+            devices,
+            &|_| None,
+            pipes,
+            &budget,
+            Some(&ctx),
+            lit,
+        )
+    };
+    use crate::dp_link_training::LinkRate::{Hbr2, Hbr3};
+    // 4 x HBR3: the 4K60 runs uncompressed; a 1080p60 fits beside it.
+    let small = [
+        (ROOT_SINK, uhd60_edid(3), u16::MAX),
+        (CHILD_SINK, fhd60_edid(), u16::MAX),
+    ];
+    let lit: Vec<modeset::Selection> = select(caps(Hbr3), &small, &[Some(0), None], &[])
+        .unwrap()
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect();
+    assert!(lit.len() == 1 && lit[0].dsc.is_none(), "{lit:?}");
+    let added = select(caps(Hbr3), &small, &[None, Some(1)], &lit).expect("kept");
+    let [(b, 1)] = added.as_slice() else {
+        panic!("one new stream {added:?}");
+    };
+    assert_eq!(b.mst.map(|m| m.sink), Some(CHILD_SINK));
+    assert!(b.dsc.is_none());
+    // The running stream is not selected again, even when asked.
+    let again = select(caps(Hbr3), &small, &[Some(0), Some(1)], &lit).unwrap();
+    assert_eq!(again.iter().map(|a| a.1).collect::<Vec<_>>(), [1]);
+    // 4 x HBR2: two 4K60 streams fit only compressed.
+    let big = [
+        (ROOT_SINK, uhd60_edid(3), u16::MAX),
+        (CHILD_SINK, uhd60_edid(3), u16::MAX),
+    ];
+    let alone: Vec<modeset::Selection> = select(caps(Hbr2), &big, &[Some(0), None], &[])
+        .unwrap()
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect();
+    assert!(alone.len() == 1 && alone[0].dsc.is_none(), "{alone:?}");
+    assert_eq!(select(caps(Hbr2), &big, &[None, Some(1)], &alone), None);
+    let joint: Vec<modeset::Selection> = select(caps(Hbr2), &big, &[Some(0), Some(1)], &[])
+        .unwrap()
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect();
+    assert!(
+        joint.len() == 2 && joint.iter().all(|s| s.dsc.is_some()),
+        "{joint:?}"
+    );
+    assert_eq!(
+        select(caps(Hbr2), &big, &[None, None], &joint),
+        Some(Vec::new())
+    );
+    assert_eq!(select(caps(Hbr2), &big, &[None, None], &joint[..1]), None);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-mst",
+    navi48_mst_dsc_beside_running_streams_like_amdgpu_dm
 );

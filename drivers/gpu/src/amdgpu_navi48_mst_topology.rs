@@ -213,6 +213,7 @@ impl MstLink {
         self.topology = topology;
         self.outputs = outputs;
         self.resource_ports.clear();
+        self.lost.clear();
         self.dirty = false;
         self.state = ProbeState::Ready;
         Ok(())
@@ -287,8 +288,12 @@ impl MstLink {
     /// budget. Then the outputs and their EDID/DSC are reconciled as a
     /// fresh probe does and the session is clean (`Ok(true)`). Otherwise
     /// the old topology, its routes and the dirty mark stay for the
-    /// stop/reprobe/relight path (`Ok(false)`). A failed or cancelled probe
-    /// retains the session as `prepare` does.
+    /// stop/reprobe/relight path (`Ok(false)`); when what failed is only
+    /// that some payloads' end devices left, those sinks are recorded in
+    /// `lost` so their streams alone can be retired (Linux disables the
+    /// departed connectors' CRTCs and keeps the rest), after which the next
+    /// reprobe adopts the tree. A failed or cancelled probe retains the
+    /// session as `prepare` does.
     pub(super) async fn reprobe_live<A: MstAux>(
         &mut self,
         aux: &mut A,
@@ -305,7 +310,13 @@ impl MstLink {
         };
         let allocated: Vec<_> = self.payloads.iter().map(|p| (p.sink, p.pbn)).collect();
         let ends = topology.sinks();
-        if allocated.iter().any(|(sink, _)| !ends.contains(sink)) {
+        let lost: Vec<_> = allocated
+            .iter()
+            .map(|a| a.0)
+            .filter(|sink| !ends.contains(sink))
+            .collect();
+        if !lost.is_empty() {
+            self.lost = lost;
             return Ok(false);
         }
         // ENUM_PATH_RESOURCES reports what our own payloads left free.
@@ -351,6 +362,7 @@ impl MstLink {
         self.topology = topology;
         self.outputs = outputs;
         self.resource_ports.clear();
+        self.lost.clear();
         self.dirty = false;
         self.state = ProbeState::Ready;
         Ok(true)
@@ -888,12 +900,21 @@ mod tests {
         assert!(link.dirty);
         assert_eq!(link.topology, before);
         hub.resources.clear();
-        // The child (carrying stream 1) leaves: its route is gone.
+        assert!(link.lost.is_empty());
+        // The child (carrying stream 1) leaves: its route is gone, and only
+        // its stream is to retire.
         hub.child_present = false;
         assert_eq!(run(link.reprobe_live(&mut hub)), Ok(false));
         assert!(link.dirty);
         assert_eq!(link.topology, before);
         assert_eq!(link.payloads, payloads);
+        assert_eq!(link.lost, [child_sink]);
+        // Once that payload is gone the tree is adopted with the root's
+        // stream still running.
+        link.payloads.retain(|p| p.sink != child_sink);
+        assert_eq!(run(link.reprobe_live(&mut hub)), Ok(true));
+        assert!(!link.dirty && link.lost.is_empty());
+        assert_eq!(link.payloads, payloads[..1]);
         TestResult::Pass
     }
     kernel_test_in!(

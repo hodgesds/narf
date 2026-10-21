@@ -2256,10 +2256,19 @@ free PBN is credited with the driver's own payloads, and the new topology is
 adopted only if every payload's end device is still connected and its PBN
 fits every hop beside the others. Adoption reconciles outputs, rereads
 EDID/DSC, readmits dark outputs' modes beside the running displays and
-clears the dirty mark; the monitor republishes the connectors and relights
-only when a new end device appeared. Otherwise (a lit route or its hop
-capacity lost) the old topology and routes stay and the monitor stops all
-streams using their old routes, reprobes, then relights enabled outputs.
+clears the dirty mark; the monitor republishes the connectors, and a new
+end device's connector takes a CRTC and lights beside the running streams
+(`modeset_beside`), as a Linux commit adds its stream. A port with no
+stream reprobes in place (`MstLink::prepare`) the same way. When only some
+payloads' end devices left (`MstLink::lost`, `MstService::Lost(pipes)`),
+the monitor retires just those streams — their payloads removed without
+ALLOCATE_PAYLOAD or a payload-table row for the departed device, as
+drm_dp_remove_payload_part1 skips a port no longer downstream of the
+primary, its DSC decoder not addressed — then services the port again to
+adopt the tree beside the streams still running. Otherwise (another primary
+branch, a hop's capacity lost: `MstService::Relight`) the old topology and
+routes stay and the monitor stops all streams using their old routes,
+reprobes, then relights enabled outputs.
 A failed or cancelled live probe retains the session like `prepare`.
 Notifications received during queries/reprobe remain queued for the next pass. Unknown branch/port, input-port and disconnected
 resource notices are ignored.
@@ -2401,10 +2410,11 @@ automatic routing. An all-off DRM configuration keeps connector identities
 and requests while the branch remains connected; removing the branch (with
 no stream left on it) drops its connectors and their routes. Shared-link loss stops and relights the whole configuration instead
 of invoking the SST retrain path. A downstream change that keeps every lit
-route is adopted live (`reprobe_live`, above) and only republishes the
-connectors, relighting just for a newly appeared end device; one that loses
-a lit route or its hop capacity uses the same whole-link stop/reprobe/relight
-sequence, so other streams briefly blank. KMS can publish
+route is adopted live (`reprobe_live`, above) and republishes the
+connectors; a newly appeared end device lights beside the running streams
+and a departed one retires only its own stream. A changed primary branch or
+lost hop capacity uses the whole-link stop/reprobe/relight sequence, so
+other streams briefly blank. KMS can publish
 a newly discovered EDID and independently admitted timings as connected with
 its CRTC off (`amdgpu_navi48_kms::Output::{edid, offered}`). These timings reach
 GETCONNECTOR and the platform's mode-request gate without setting a CRTC mode
@@ -4449,12 +4459,30 @@ dc_commit_state_no_check's prepare/optimize ordering with dcn401's clock
 sequence (FAMS2/firmware-assisted P-state is out of scope: UCLK switching
 stays disabled).
 
-`ColdBoot::modeset_beside(fill, want, pipe_of)` lights new board sinks
-beside the running displays: DML admits every running display's mode with
+`ColdBoot::modeset_beside(fill, want, pipe_of, mst: &[MstRoute])` lights
+new board sinks and new MST end devices beside the running displays (route
+pipes already lit are ignored): DML admits every running display's mode with
 as many new ones as fit (`dml::admit_native`, pipe order), each running
 display keeping its pipes (`modeset::keeps_pipes`: the same mode, ODM
-segments and MPC slices; otherwise `None`, as for MST, no free slot or a
-running configuration that no longer fits, before any change). Then:
+segments and MPC slices; otherwise `None`, as for no free slot or a
+running configuration that no longer fits, before any change). A new end
+device is selected beside its port's running streams
+(`mst::select_mst_outputs_beside`): without DSC decoders a running payload
+stays as it is (Linux runs drm_dp_atomic_find_time_slots only for changed
+connectors) and the new stream takes the slots, hop PBN and payload count
+(`MAX_PAYLOADS`) it leaves; with decoders the link's fairness search reruns
+over the running streams first (topology order), then the new ones
+(is_dsc_need_re_compute, compute_mst_dsc_configs_for_link), and a change to
+any running stream's PBN, slots or DSC returns `None`: Linux modesets those
+streams (drm_dp_mst_add_affected_dsc_crtcs; dc_is_stream_unchanged keeps the
+rest), NARF relights. `None` too for an MST session with an uncertain
+transaction or a dirty topology under streams, or a root whose rescanned link
+caps no longer match the running streams'. The new stream lights as in a
+full configuration (`start_mst_stream`): on a link that runs it attaches and
+adds only its own payload — payload-table row, SAT rows for every stream
+with ACT, ACT handled, ALLOCATE_PAYLOAD for its VCPI, its VC rate — while
+the other streams' timing, OPTC, VTG, DIG and VC rate are not written; on a
+port with no stream it trains that port's link. Then:
 prepare_bandwidth — `update_live_display_clocks(request, targets, false)`
 (the clock owner's `update_live` with every display's registers held, the
 running pipes' DPP DTOs raised where needed, every DCCG record and every
@@ -4469,13 +4497,19 @@ the running ones (`prepare_display_pipe_clocks_beside`) and their usual
 lighting; optimize_bandwidth — each running display's exact watermarks,
 then `update_live_display_clocks(request, all targets, true)` lowering what
 the configuration no longer needs. `replan_displays()` does the same for the
-displays left after one leaves. The platform monitor lights a new sink
-beside the running displays when nothing they asked for changed
-(`MonitorStep::LitBeside`) and replans after a display left
-(`MonitorStep::Replanned`), relighting everything only when refused.
+displays left after one leaves, MST streams included (their payloads and
+links untouched; a departed MST stream's own teardown removed its payload:
+VC rate zero, ALLOCATE_PAYLOAD with PBN 0, its payload-table row cleared, SAT
+without it with ACT, later payloads compacted). The platform monitor lights
+a new sink or end device beside the running displays when nothing they
+asked for changed (`MonitorStep::LitBeside`) and replans after a display
+left (`MonitorStep::Replanned`), relighting everything only when refused or
+when a departed MST stream changes the DSC fairness of the streams left on
+its link (`ColdBoot::mst_streams_kept`, Linux's recomputation on removal).
 
-Gaps: MST configurations, mode or color changes of a running display and
-FRL retraining still relight (plane changes no longer do: see below); a
+Gaps: mode or color changes of a running display and FRL retraining still
+relight (plane changes no longer do: see below); where Linux modesets just
+the MST streams a DSC fairness change touches, NARF relights every display; a
 running display whose new plan needs other pipes refuses the seamless
 change; scanning for the new sinks reads every port (AUX/DDC) while the
 others run. Model-tested only (`dcn401-clk`, `dcn401-dccg`,
