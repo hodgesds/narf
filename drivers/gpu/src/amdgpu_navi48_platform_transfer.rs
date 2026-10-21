@@ -3,6 +3,11 @@
 //! SDMA0 copies each chunk through a CPU-visible stage. Copies share the
 //! clear FIFO, so one never overtakes an earlier clear of the same range,
 //! and an SDMA0 reset requeues (and re-stages) them like skipped clears.
+//! GFX12 DCC buffers move the same way from any VRAM (visible or past the
+//! BAR), with amdgpu_ttm_copy_mem_to_mem's copy flags: SDMA0 reads VRAM
+//! decompressed into the stage, and writes VRAM compressed from it with
+//! the buffer's tiling-flag DCC parameters (sdma_v7_0_emit_copy_buffer's
+//! DCC word), as Linux's move blit reads and writes it.
 use super::*;
 use narf_filesystem::{dma_buf::DmaResvUsage, DrmFence, FsError};
 
@@ -134,7 +139,9 @@ impl Mover {
         source: &Arc<crate::amdgpu_gem::GemPlacement>,
         destination: &mut crate::amdgpu_gem::GemPlacement,
     ) -> Result<(), FsError> {
-        let address = source.hidden_address().ok_or(FsError::InvalidData)?;
+        let address = source.vram_address().ok_or(FsError::InvalidData)?;
+        // VRAM to system memory: the stage stands in for the GTT side.
+        let flags = crate::amdgpu_gem::ttm_copy_flags(object, true, false);
         let _stage = self.stage.access.lock().await;
         self.settle().await?;
         let mut offset = 0;
@@ -145,6 +152,7 @@ impl Mover {
                 src: address + offset,
                 dst: self.stage.address,
                 bytes,
+                flags,
                 upload: None,
             };
             let done = self.queue(object, work, held)?;
@@ -184,7 +192,9 @@ impl Mover {
         source: &Arc<crate::amdgpu_gem::GemPlacement>,
         destination: &Arc<crate::amdgpu_gem::GemPlacement>,
     ) -> Result<(), FsError> {
-        let address = destination.hidden_address().ok_or(FsError::InvalidData)?;
+        let address = destination.vram_address().ok_or(FsError::InvalidData)?;
+        // System memory to VRAM: the stage stands in for the GTT side.
+        let flags = crate::amdgpu_gem::ttm_copy_flags(object, false, true);
         let _stage = self.stage.access.lock().await;
         self.settle().await?;
         let mut offset = 0;
@@ -196,6 +206,7 @@ impl Mover {
                 src: self.stage.address,
                 dst: address + offset,
                 bytes,
+                flags,
                 upload: Some((source.clone(), offset, self.stage.virt)),
             };
             let done = self.queue(object, work, held)?;

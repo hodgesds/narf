@@ -943,6 +943,7 @@ fn sdma_navi48_kernel_jobs_fill_and_copy() -> TestResult {
             src: 0x8_0000_0000,
             dst: 0x9_0000_0000,
             bytes: (1 << 30) + 8,
+            flags: 0,
         },
     ];
     let Ok(words) = kernel_words(&ops, fence, 9) else {
@@ -992,6 +993,7 @@ fn sdma_navi48_kernel_jobs_fill_and_copy() -> TestResult {
             src: 0x1000,
             dst: 0x1800,
             bytes: 0x1000,
+            flags: 0,
         }],
         &[fill(0x1000, 4); 51],
     ] {

@@ -75,7 +75,7 @@ fn gfx12_dcc_buffers_take_the_dcc_placement() -> TestResult {
     impl Drop for Registered {
         fn drop(&mut self) {
             unregister_vram_heap(CARD);
-            set_dcc_alignment(CARD, 0);
+            set_gfx12_dcc(CARD, None);
         }
     }
     let mut memory = alloc::vec![0u8; 4 << 20];
@@ -98,7 +98,7 @@ fn gfx12_dcc_buffers_take_the_dcc_placement() -> TestResult {
         VramHeap {
             pool: pool.clone(),
             fb_base,
-            fb_offset: 0,
+            fb_offset: fb_base,
             unmapped: None,
         },
     );
@@ -122,7 +122,7 @@ fn gfx12_dcc_buffers_take_the_dcc_placement() -> TestResult {
     if alignment != 196_608 || gmc_v12_dcc_alignment((12, 0, 1), 16) != 65_536 {
         return TestResult::Fail("gmc_v12_0_get_dcc_alignment");
     }
-    set_dcc_alignment(CARD, u64::from(alignment));
+    set_gfx12_dcc(CARD, Some(u64::from(alignment)));
     let before = pool.available();
     let Ok(dcc) = make(uapi::AMDGPU_GEM_CREATE_GFX12_DCC) else {
         return TestResult::Fail("DCC buffer");
@@ -150,4 +150,180 @@ fn gfx12_dcc_buffers_take_the_dcc_placement() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/render-abi",
     gfx12_dcc_buffers_take_the_dcc_placement
+);
+
+/// amdgpu_ttm_copy_mem_to_mem's copy flags and sdma_v7_0_emit_copy_buffer's
+/// DCC word for a GFX12 DCC buffer: READ_DECOMPRESSED leaving VRAM,
+/// WRITE_COMPRESSED with the tiling flags' DCC fields entering it; none
+/// for another buffer. A GFX12 card's DCC buffer then never moves by CPU
+/// copy (`GemObject::relocate`, the CPU-mapping move): `amdgpu_vm::relocate`
+/// moves it from visible VRAM to system memory and back through the card's
+/// transfer engine (registered apart from the heap), and without one the
+/// move fails and the buffer stays where it is.
+fn gfx12_dcc_buffers_move_through_the_engine() -> TestResult {
+    use crate::amdgpu_sdma_navi48 as sdma;
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::AtomicUsize;
+    const CARD: u32 = 0xdcc1;
+    const P: u64 = 4096;
+    #[derive(Debug, Default)]
+    struct Engine {
+        reads: AtomicUsize,
+        writes: AtomicUsize,
+        flags: AtomicU32,
+    }
+    impl VramTransfer for Engine {
+        fn read<'a>(
+            &'a self,
+            object: Arc<GemObject>,
+            source: Arc<GemPlacement>,
+            destination: &'a mut GemPlacement,
+        ) -> Pin<alloc::boxed::Box<dyn Future<Output = Result<(), FsError>> + Send + 'a>> {
+            alloc::boxed::Box::pin(async move {
+                if source.vram_address().is_none() || !destination.system {
+                    return Err(FsError::InvalidData);
+                }
+                self.flags
+                    .store(ttm_copy_flags(&object, true, false), Ordering::Release);
+                self.reads.fetch_add(1, Ordering::AcqRel);
+                // The "decompressed" contents.
+                let bytes = alloc::vec![0x5au8; source.byte_len as usize];
+                // SAFETY: the destination is the mover's private, newly
+                // allocated system backing of this size.
+                unsafe { destination.read_staging(0, bytes.as_ptr(), bytes.len()) }
+            })
+        }
+        fn write<'a>(
+            &'a self,
+            object: Arc<GemObject>,
+            source: Arc<GemPlacement>,
+            destination: Arc<GemPlacement>,
+        ) -> Pin<alloc::boxed::Box<dyn Future<Output = Result<(), FsError>> + Send + 'a>> {
+            alloc::boxed::Box::pin(async move {
+                if !source.system || destination.vram_address().is_none() {
+                    return Err(FsError::InvalidData);
+                }
+                self.flags
+                    .store(ttm_copy_flags(&object, false, true), Ordering::Release);
+                self.writes.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            })
+        }
+    }
+    struct Registered;
+    impl Drop for Registered {
+        fn drop(&mut self) {
+            unregister_vram_heap(CARD);
+            register_vram_transfer(CARD, None);
+            set_gfx12_dcc(CARD, None);
+        }
+    }
+    let mut memory = alloc::vec![0u8; 1 << 20];
+    let map = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(0xb800_0000),
+        virt: memory.as_mut_ptr() as u64,
+        len: memory.len() as u64,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    let fb_base = 0x8_0000_0000u64;
+    // SAFETY: this test exclusively owns memory until the registered heap and
+    // every object have been dropped; no hardware accesses these mappings.
+    let pool = unsafe { crate::amdgpu_vram::Pool::from_owned_range(map, fb_base) }.unwrap();
+    let _registered = Registered;
+    set_gfx12_dcc(CARD, Some(65_536));
+    register_vram_heap(
+        CARD,
+        VramHeap {
+            pool: pool.clone(),
+            fb_base,
+            fb_offset: fb_base,
+            unmapped: None,
+        },
+    );
+    let state = GemState::for_card(CARD);
+    let make = |flags: u32| {
+        let mut b = [0u64; 4];
+        b[0] = P;
+        b[2] = u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM);
+        b[3] = u64::from(flags);
+        create(&state, b.as_mut_ptr() as usize).map(|_| state.get(b[0] as u32).unwrap())
+    };
+    let (Ok(dcc), Ok(plain)) = (make(uapi::AMDGPU_GEM_CREATE_GFX12_DCC), make(0)) else {
+        return TestResult::Fail("buffers");
+    };
+    // max compressed block 2, number type 3, data format 5, write
+    // compress disable.
+    dcc.metadata.lock().tiling = 2 << 3 | 3 << 5 | 5 << 8 | 1 << 14;
+    let read = ttm_copy_flags(&dcc, true, false);
+    let write = ttm_copy_flags(&dcc, false, true);
+    if read != sdma::AMDGPU_COPY_FLAGS_READ_DECOMPRESSED
+        || write != sdma::AMDGPU_COPY_FLAGS_WRITE_COMPRESSED | 2 << 3 | 3 << 5 | 5 << 8 | 1 << 14
+        || ttm_copy_flags(&plain, true, true) != 0
+    {
+        return TestResult::Fail("amdgpu_ttm_copy_mem_to_mem's copy flags");
+    }
+    if sdma::copy_dcc_word(read) != 2 << 16 | 1 << 26
+        || sdma::copy_dcc_word(write) != 5 | 3 << 9 | 2 << 18 | 2 << 24 | 1 << 26
+        || sdma::copy_dcc_word(write & !(1 << 14)) != 5 | 3 << 9 | 1 << 18 | 2 << 24 | 1 << 26
+        || sdma::copy_dcc_word(0) != 0
+    {
+        return TestResult::Fail("sdma_v7_0_emit_copy_buffer's DCC word");
+    }
+    if !moves_by_engine(&dcc) || moves_by_engine(&plain) {
+        return TestResult::Fail("engine moves");
+    }
+    // No CPU copy of the compressed bytes.
+    dcc.allowed_domains
+        .fetch_or(u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT), Ordering::AcqRel);
+    if dcc.relocate(false) != Err(FsError::Busy)
+        || cpu_mapping::relocate(&dcc, false) != Err(FsError::Busy)
+        || dcc.system()
+    {
+        return TestResult::Fail("DCC buffer CPU-copied");
+    }
+    let relocate = |to_vram| {
+        narf_scheduler::block_on_spin(async {
+            let gate = lock_placement(CARD).await;
+            crate::amdgpu_vm::relocate(&gate, &dcc, to_vram).await
+        })
+    };
+    // No engine: the move fails, the buffer stays.
+    if relocate(false) != Err(FsError::Unsupported) || dcc.system() {
+        return TestResult::Fail("DCC eviction without an engine");
+    }
+    let engine = Arc::new(Engine::default());
+    register_vram_transfer(CARD, Some(engine.clone()));
+    // Out (the heap may be withdrawn meanwhile, as suspend does).
+    unregister_vram_heap(CARD);
+    if relocate(false).is_err()
+        || !dcc.system()
+        || engine.reads.load(Ordering::Acquire) != 1
+        || engine.flags.load(Ordering::Acquire) != read
+        || dcc.load_u64(0) != Some(0x5a5a_5a5a_5a5a_5a5a)
+    {
+        return TestResult::Fail("DCC eviction through the engine");
+    }
+    register_vram_heap(
+        CARD,
+        VramHeap {
+            pool: pool.clone(),
+            fb_base,
+            fb_offset: fb_base,
+            unmapped: None,
+        },
+    );
+    if relocate(true).is_err()
+        || dcc.system()
+        || engine.writes.load(Ordering::Acquire) != 1
+        || engine.flags.load(Ordering::Acquire) != write
+        || (dcc.gpu() - fb_base) % 65_536 != 0
+    {
+        return TestResult::Fail("DCC restore through the engine");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/render-abi",
+    gfx12_dcc_buffers_move_through_the_engine
 );

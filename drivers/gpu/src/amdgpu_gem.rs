@@ -129,16 +129,45 @@ pub trait VramTransfer: Send + Sync + core::fmt::Debug {
     }
 }
 
+/// Each card's engine for moves that must not be CPU copies (a GFX12 DCC
+/// buffer's, `moves_by_engine`), by card index. Unlike the heap it stays
+/// registered while suspend's evict_all runs with the heap withdrawn.
+static TRANSFERS: IrqSafeSpinLock<Vec<(u32, Arc<dyn VramTransfer>)>> =
+    IrqSafeSpinLock::new(Vec::new());
+
+/// Let DRM card `card` move buffers through `transfer` (None: no engine)
+/// when its heap has no transfer past the BAR, or while the heap is
+/// withdrawn.
+pub fn register_vram_transfer(card: u32, transfer: Option<Arc<dyn VramTransfer>>) {
+    let mut table = TRANSFERS.lock();
+    table.retain(|(c, _)| *c != card);
+    if let Some(transfer) = transfer {
+        table.push((card, transfer));
+    }
+}
+
+/// Card `card`'s transfer engine: its heap's past the BAR, else the one
+/// `register_vram_transfer` gave it.
+fn vram_transfer(card: u32) -> Option<Arc<dyn VramTransfer>> {
+    vram_heap(card)
+        .and_then(|heap| heap.unmapped)
+        .and_then(|heap| heap.transfer)
+        .or_else(|| {
+            TRANSFERS
+                .lock()
+                .iter()
+                .find(|(c, _)| *c == card)
+                .map(|(_, t)| t.clone())
+        })
+}
+
 pub(crate) async fn readback(
     gate: &PlacementGuard,
     object: &Arc<GemObject>,
     source: &Arc<GemPlacement>,
     destination: &mut GemPlacement,
 ) -> Result<(), FsError> {
-    let reader = vram_heap(gate.card())
-        .and_then(|heap| heap.unmapped)
-        .and_then(|heap| heap.transfer)
-        .ok_or(FsError::Unsupported)?;
+    let reader = vram_transfer(gate.card()).ok_or(FsError::Unsupported)?;
     reader
         .read(object.clone(), source.clone(), destination)
         .await
@@ -150,10 +179,7 @@ pub(crate) async fn upload(
     source: &Arc<GemPlacement>,
     destination: &Arc<GemPlacement>,
 ) -> Result<(), FsError> {
-    let writer = vram_heap(gate.card())
-        .and_then(|heap| heap.unmapped)
-        .and_then(|heap| heap.transfer)
-        .ok_or(FsError::Unsupported)?;
+    let writer = vram_transfer(gate.card()).ok_or(FsError::Unsupported)?;
     writer
         .write(object.clone(), source.clone(), destination.clone())
         .await
@@ -259,20 +285,79 @@ fn vram_heap(card: u32) -> Option<VramHeap> {
         .map(|(_, h)| h.clone())
 }
 
-/// Each card's GFX12 DCC VRAM alignment (`amdgpu_gmc_get_dcc_alignment`),
-/// by card index; a card without one (any GC but 12.0.x) aligns DCC
-/// buffers like any other.
+/// The GFX12 cards (whose GFX12_DCC buffers are compressed in VRAM) and
+/// each one's DCC VRAM alignment (`amdgpu_gmc_get_dcc_alignment`, maybe
+/// 0), by card index. Any other card treats the flag as Linux's
+/// pre-GFX12 parts do: no DCC placement, plain copies. Kept across heap
+/// withdrawal (suspend), so evict_all still knows what it moves.
 static DCC_ALIGNMENT: IrqSafeSpinLock<Vec<(u32, u64)>> = IrqSafeSpinLock::new(Vec::new());
 
-/// Give DRM card `card`'s GFX12_DCC buffers the VRAM alignment `bytes`
-/// ([`gmc_v12_dcc_alignment`]; 0 for none). Set before its heap is
-/// registered, so every DCC placement honours it.
-pub fn set_dcc_alignment(card: u32, bytes: u64) {
+/// Make DRM card `card` a GFX12 card whose GFX12_DCC buffers take VRAM
+/// alignment `alignment` ([`gmc_v12_dcc_alignment`]; None: not GFX12).
+/// Set before its heap is registered, so every DCC placement honours it.
+pub fn set_gfx12_dcc(card: u32, alignment: Option<u64>) {
     let mut table = DCC_ALIGNMENT.lock();
     table.retain(|(c, _)| *c != card);
-    if bytes != 0 {
-        table.push((card, bytes));
+    if let Some(alignment) = alignment {
+        table.push((card, alignment));
     }
+}
+
+/// Whether `object` is a GFX12_DCC buffer of a GFX12 card: VRAM holds it
+/// compressed, so moving it in or out of VRAM is a decompressing read or a
+/// compressing write of its engine (amdgpu_ttm_copy_mem_to_mem's
+/// READ_DECOMPRESSED / WRITE_COMPRESSED), never a CPU copy of its bytes.
+pub(crate) fn moves_by_engine(object: &GemObject) -> bool {
+    object.flags & u64::from(uapi::AMDGPU_GEM_CREATE_GFX12_DCC) != 0
+        && object
+            .card
+            .is_some_and(|card| DCC_ALIGNMENT.lock().iter().any(|(c, _)| *c == card))
+}
+
+/// amdgpu_ttm_copy_mem_to_mem's copy flags for one move of `object`: from
+/// VRAM (`from_vram`) READ_DECOMPRESSED for a GFX12_DCC buffer; into VRAM
+/// (`to_vram`) WRITE_COMPRESSED with its tiling flags' GFX12 DCC max
+/// compressed block, number type, data format and write-compress disable.
+/// No TMZ (NARF has no TMZ buffers).
+pub(crate) fn ttm_copy_flags(object: &GemObject, from_vram: bool, to_vram: bool) -> u32 {
+    use crate::amdgpu_sdma_navi48 as sdma;
+    if object.flags & u64::from(uapi::AMDGPU_GEM_CREATE_GFX12_DCC) == 0 {
+        return 0;
+    }
+    let mut flags = 0;
+    if from_vram {
+        flags |= sdma::AMDGPU_COPY_FLAGS_READ_DECOMPRESSED;
+    }
+    if to_vram {
+        let tiling = object.tiling_flags();
+        let get = |shift: u32, mask: u32| (tiling >> shift) as u32 & mask;
+        let max_com = get(
+            uapi::AMDGPU_TILING_GFX12_DCC_MAX_COMPRESSED_BLOCK_SHIFT,
+            uapi::AMDGPU_TILING_GFX12_DCC_MAX_COMPRESSED_BLOCK_MASK,
+        );
+        let num_type = get(
+            uapi::AMDGPU_TILING_GFX12_DCC_NUMBER_TYPE_SHIFT,
+            uapi::AMDGPU_TILING_GFX12_DCC_NUMBER_TYPE_MASK,
+        );
+        let data_format = get(
+            uapi::AMDGPU_TILING_GFX12_DCC_DATA_FORMAT_SHIFT,
+            uapi::AMDGPU_TILING_GFX12_DCC_DATA_FORMAT_MASK,
+        );
+        let write_compress_disable = get(
+            uapi::AMDGPU_TILING_GFX12_DCC_WRITE_COMPRESS_DISABLE_SHIFT,
+            uapi::AMDGPU_TILING_GFX12_DCC_WRITE_COMPRESS_DISABLE_MASK,
+        );
+        flags |= sdma::AMDGPU_COPY_FLAGS_WRITE_COMPRESSED
+            | (max_com & sdma::AMDGPU_COPY_FLAGS_MAX_COMPRESSED_MASK)
+                << sdma::AMDGPU_COPY_FLAGS_MAX_COMPRESSED_SHIFT
+            | (num_type & sdma::AMDGPU_COPY_FLAGS_NUMBER_TYPE_MASK)
+                << sdma::AMDGPU_COPY_FLAGS_NUMBER_TYPE_SHIFT
+            | (data_format & sdma::AMDGPU_COPY_FLAGS_DATA_FORMAT_MASK)
+                << sdma::AMDGPU_COPY_FLAGS_DATA_FORMAT_SHIFT
+            | (write_compress_disable & sdma::AMDGPU_COPY_FLAGS_WRITE_COMPRESS_DISABLE_MASK)
+                << sdma::AMDGPU_COPY_FLAGS_WRITE_COMPRESS_DISABLE_SHIFT;
+    }
+    flags
 }
 
 /// `gmc_v12_0_get_dcc_alignment` for GC `gc` with discovery's
@@ -595,10 +680,15 @@ impl GemObject {
         {
             return Err(FsError::Busy);
         }
-        let readback = source.hidden_address().is_some() && destination.system;
+        // A GFX12 DCC buffer leaves and enters visible VRAM through its
+        // engine too (`moves_by_engine`).
+        let engine = moves_by_engine(self);
+        let readback = destination.system
+            && (source.hidden_address().is_some() || engine && source.vram_address().is_some());
         let upload = source.system
-            && destination.hidden_address().is_some()
-            && self.flags & u64::from(uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0;
+            && (destination.hidden_address().is_some()
+                && self.flags & u64::from(uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0
+                || engine && destination.vram_address().is_some());
         if (!readback && !upload) || destination.byte_len != self.byte_len {
             return Err(FsError::InvalidData);
         }
@@ -691,8 +781,11 @@ impl GemObject {
             u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT | uapi::AMDGPU_GEM_DOMAIN_CPU)
         };
         let mut placement = self.placement.lock();
+        // A CPU copy would move a GFX12 DCC buffer's compressed bytes
+        // without decompressing them (`moves_by_engine`).
         if self.allowed_domains.load(Ordering::Acquire) & target == 0
             || self.pinned()
+            || moves_by_engine(self)
             || matches!(
                 placement.backing,
                 Backing::User(_) | Backing::Foreign { .. }
@@ -758,6 +851,15 @@ impl GemObject {
 impl GemPlacement {
     pub(crate) fn hidden_address(&self) -> Option<u64> {
         match &self.backing {
+            Backing::Unmapped { _held } => Some(_held.address()),
+            _ => None,
+        }
+    }
+    /// The frame-buffer aperture address of a VRAM placement (visible or
+    /// past the BAR), which a transfer engine reaches it at.
+    pub(crate) fn vram_address(&self) -> Option<u64> {
+        match &self.backing {
+            Backing::Vram { _held } => Some(_held.address()),
             Backing::Unmapped { _held } => Some(_held.address()),
             _ => None,
         }

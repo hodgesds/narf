@@ -4682,7 +4682,7 @@ wherever it lands in VRAM: GEM_CREATE, past the BAR, and every move back,
 `amdgpu_gem::reserve_visible` / `reserve_hidden`): the card's
 `amdgpu_gem::gmc_v12_dcc_alignment` (gmc_v12_0_get_dcc_alignment from
 discovery's GC version and gc_info TCC count, registered by
-`publish_client_vram` through `amdgpu_gem::set_dcc_alignment`; 64 KiB on
+`publish_client_vram` through `amdgpu_gem::set_gfx12_dcc`; 64 KiB on
 Navi48's 16 TCCs, 0 off GC 12.0.x) rounds the request to the power-of-two
 block `amdgpu_vram::dcc_block_size` (roundup_pow_of_two(size + alignment),
 in Linux's 32-bit dcc_size), placed at its own alignment, then trimmed to
@@ -7171,6 +7171,24 @@ paths; only the tables differ.
   to the buffer's KERNEL reservation and retains its source/destination
   until it leaves the ring; a refused, timed-out (5 s) or post-reset chunk
   fails the move without releasing either placement.
+  GFX12 DCC buffers (AMDGPU_GEM_CREATE_GFX12_DCC on a card registered by
+  `amdgpu_gem::set_gfx12_dcc`: VRAM holds them compressed) never move by
+  CPU copy (`amdgpu_gem::moves_by_engine`): `GemObject::relocate` and the
+  CPU-mapping move refuse them (Busy), and `amdgpu_vm::relocate` (evict_all,
+  reclaim_vram, prepare_scanout) moves them from any VRAM, visible or past
+  the BAR, through the card's transfer engine with
+  amdgpu_ttm_copy_mem_to_mem's copy flags (`amdgpu_gem::ttm_copy_flags`):
+  READ_DECOMPRESSED out of VRAM, WRITE_COMPRESSED with the buffer's tiling
+  flags' GFX12_DCC max compressed block, number type, data format and
+  write-compress disable into it, carried by `Work::Copy` to SDMA0's DCC
+  word (the stage stands in for the GTT side, so it takes neither flag).
+  The platform registers that mover (`amdgpu_gem::register_vram_transfer`)
+  whether or not the card has VRAM past the BAR, and it stays registered
+  while suspend withdraws the heap. Without an engine, or for a CPU-mapped
+  DCC buffer (whose mapping would have to follow a frozen CPU copy), the
+  move fails and the buffer stays; suspend then fails cleanly (Busy) rather
+  than corrupt it. Deviation: Linux unmaps a CPU-mapped buffer and moves it
+  anyway (the next fault maps the new placement).
 - Foreign PRIME import on an amdgpu card (`amdgpu_gem_prime_import` with
   `dma_buf_dynamic_attach`): another card's GTT amdgpu buffer or any card's
   KMS dumb buffer becomes a GTT-only buffer over the exporter's RAM pages
@@ -7588,9 +7606,12 @@ completion is polled through `FenceReader`). The ring is started with
 (framebuffer-aperture) addresses in the same ring, sequence and fence:
 `KernelOp::Fill` as sdma_v7_0_emit_fill_buffer (CONSTANT_FILL, COMPRESS,
 dword fill; dword-aligned, a multiple of 4 bytes) and `KernelOp::Copy` as
-sdma_v7_0_emit_copy_buffer (COPY_LINEAR with CPV, no DCC; non-overlapping),
-split into 1 GiB packets; a job that overflows its 256-dword slot is
-refused.
+sdma_v7_0_emit_copy_buffer (COPY_LINEAR with CPV and TMZ from its
+`flags`, amdgpu_copy_buffer's `AMDGPU_COPY_FLAGS_*`; its last dword the
+DCC word `copy_dcc_word`: SDMA_DCC_DATA_FORMAT / NUM_TYPE / READ_CM(2) /
+WRITE_CM(1, or 2 with WRITE_COMPRESS_DISABLE) / MAX_COM / MAX_UCOM(1) with
+READ_DECOMPRESSED or WRITE_COMPRESSED, else 0; non-overlapping), split
+into 1 GiB packets; a job that overflows its 256-dword slot is refused.
 
 `amdgpu_vcn_navi48::Vcn` owns Navi48's VCN5.0.0 instance 0 static-power
 VCPU and unified ring on NBIF6.3.1. Unsafe `new` reserves separate owned

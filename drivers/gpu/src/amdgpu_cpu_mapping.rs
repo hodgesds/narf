@@ -207,6 +207,12 @@ pub(crate) fn published(lifetime: Option<&Arc<dyn narf_filesystem::MmapLifetime>
 /// Prepare allocations before entering the CPU VM freeze. Registered GPU
 /// leases have already been released by Rebind, and the card gate is held.
 pub(crate) fn relocate(object: &Arc<GemObject>, to_vram: bool) -> Result<(), FsError> {
+    // The frozen commit is a CPU copy, which cannot move a GFX12 DCC
+    // buffer's compressed bytes (amdgpu_vm::relocate moves an unmapped one
+    // through its engine; a CPU-mapped one stays put).
+    if moves_by_engine(object) {
+        return Err(FsError::Busy);
+    }
     let backing = BACKINGS
         .lock()
         .iter()
@@ -332,7 +338,7 @@ pub(crate) fn relocate(object: &Arc<GemObject>, to_vram: bool) -> Result<(), FsE
     result
 }
 
-fn destination(object: &GemObject, to_vram: bool) -> Result<GemPlacement, FsError> {
+pub(crate) fn destination(object: &GemObject, to_vram: bool) -> Result<GemPlacement, FsError> {
     if !to_vram {
         return GemPlacement::new_system(object.byte_len);
     }

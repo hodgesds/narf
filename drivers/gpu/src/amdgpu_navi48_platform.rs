@@ -1685,6 +1685,11 @@ fn publish_clearer(boot: &mut boot::ColdBoot) {
             .reserve_transfer_stage()
             .ok()
             .map(|stage| transfer::mover(clearer.clone(), stage));
+        // GFX12 DCC buffers move through SDMA0 whether or not the card has
+        // VRAM past the BAR (and while suspend withdraws the heap).
+        if let Some(card) = boot::ColdBoot::drm_card() {
+            crate::amdgpu_gem::register_vram_transfer(card, mover.clone());
+        }
         let _ = match boot.publish_unmapped_vram(Arc::new(clearer), mover) {
             Ok(bytes) => writeln!(
                 narf_console::Writer,
@@ -1784,11 +1789,13 @@ enum Work {
     },
     /// `upload` stages `bytes` of the source at its offset into the CPU
     /// window (at `virt`) under OWNER right before the job is queued, so a
-    /// requeued copy re-stages after an SDMA0 reset.
+    /// requeued copy re-stages after an SDMA0 reset. `flags` are the
+    /// move's amdgpu_copy_buffer copy flags (`amdgpu_gem::ttm_copy_flags`).
     Copy {
         src: u64,
         dst: u64,
         bytes: u64,
+        flags: u32,
         upload: Option<(Arc<crate::amdgpu_gem::GemPlacement>, u64, usize)>,
     },
 }
@@ -1800,10 +1807,11 @@ impl core::fmt::Debug for Work {
                 src,
                 dst,
                 bytes,
+                flags,
                 upload,
             } => write!(
                 f,
-                "Copy({src:#x} -> {dst:#x}, {bytes:#x}, upload={})",
+                "Copy({src:#x} -> {dst:#x}, {bytes:#x}, flags={flags:#x}, upload={})",
                 upload.is_some()
             ),
         }
@@ -1819,8 +1827,17 @@ impl Work {
                 value: 0,
             },
             Work::Copy {
-                src, dst, bytes, ..
-            } => KernelOp::Copy { src, dst, bytes },
+                src,
+                dst,
+                bytes,
+                flags,
+                ..
+            } => KernelOp::Copy {
+                src,
+                dst,
+                bytes,
+                flags,
+            },
         }
     }
 }
@@ -7276,6 +7293,7 @@ mod tests {
                         src: address,
                         dst: 0x9000,
                         bytes: 4096,
+                        flags: 0,
                         upload: None,
                     }
                 } else {
@@ -7382,6 +7400,7 @@ mod tests {
                 src: 0x10,
                 dst: 0x9000,
                 bytes: 4096,
+                flags: 0,
                 upload: None,
             })
         };
@@ -7393,6 +7412,7 @@ mod tests {
                     src: 0x10,
                     dst: 0x9000,
                     bytes: 4096,
+                    flags: 0,
                 })
         {
             return TestResult::Fail("copy batching");
