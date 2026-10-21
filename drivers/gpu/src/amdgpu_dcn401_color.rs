@@ -187,7 +187,7 @@ impl OgamProgram {
 }
 
 impl<I: Io> Engine<I> {
-    /// dcn401_program_gamut_remap on MPCC `q`: the stream's remap on its
+    /// dcn401_program_gamut_remap on pipe `q`'s MPCC: the stream's remap on its
     /// segment's top layer, bypass (`None`) below. Returns the coefficient
     /// set now selected.
     fn program_gamut(
@@ -214,7 +214,7 @@ impl<I: Io> Engine<I> {
         self.update(l.ogam(q, GAMUT_COEF_FORMAT), 1, u32::from(g.s3_12))?;
         Ok(Some((set as u8, g.s3_12)))
     }
-    /// dcn32_set_input_transfer_func on DPP `q` for a plane without its
+    /// dcn32_set_input_transfer_func on pipe `q`'s DPP for a plane without its
     /// own color: dpp3_set_pre_degam, then dpp3_program_gamcor_lut(NULL).
     fn program_input_tf(&mut self, q: u8, srgb: bool) -> Result<(), Error> {
         let l = self.layout;
@@ -222,7 +222,7 @@ impl<I: Io> Engine<I> {
         self.update(l.dpp(q, CM_CONTROL), 1, 0)?;
         self.update(l.dpp(q, GAMCOR_CONTROL), 0xf, 0)
     }
-    /// mpc3_set_output_gamma on MPCC `q`. Returns the RAM bank now selected.
+    /// mpc3_set_output_gamma on pipe `q`'s MPCC. Returns the RAM bank now selected.
     async fn program_ogam(
         &mut self,
         q: u8,

@@ -668,12 +668,12 @@ impl Dmub {
     pub(crate) async fn set_tmds_pixel_clock(
         &mut self,
         path: crate::amdgpu_dcn_inventory::Path,
-        pipe: u8,
+        otg: u8,
         pixel_khz: u32,
         depth: TmdsDepth,
     ) -> Result<(), Error> {
         self.engine
-            .set_tmds_pixel_clock(path, pipe, pixel_khz, depth)
+            .set_tmds_pixel_clock(path, otg, pixel_khz, depth)
             .await
     }
     pub(crate) async fn setup_hdmi_stream(
@@ -1009,22 +1009,23 @@ impl<I: Io> Engine<I> {
         let result = self.command(request).await.map(|_| ());
         self.finish_mailbox(result)
     }
-    /// Program the transmitter's PHY PLL for an RGB TMDS stream timed by
-    /// `pipe`. Linux dcn401_program_pix_clk -> set_pixel_clock_v7, after the
-    /// DP DTO is disabled: the deep-colour-scaled clock, PLL from
+    /// Program the transmitter's PHY PLL for an RGB TMDS stream timed by OTG
+    /// instance `otg` (controller_id = CONTROLLER_ID_D0 + tg->inst). Linux
+    /// dcn401_program_pix_clk -> set_pixel_clock_v7, after the DP DTO is
+    /// disabled: the deep-colour-scaled clock, PLL from
     /// find_matching_pll (COMBO_PHY_PLL0 + PHY), the UNIPHY pair's encoder
     /// object id, HDMI encoder mode, XTALIN reference (miscinfo 0) and the
     /// deep-colour ratio.
     async fn set_tmds_pixel_clock(
         &mut self,
         path: crate::amdgpu_dcn_inventory::Path,
-        pipe: u8,
+        otg: u8,
         pixel_khz: u32,
         depth: TmdsDepth,
     ) -> Result<(), Error> {
         Self::hdmi_path(path)?;
         let clock = depth.character_100hz(pixel_khz);
-        if pipe >= 4 || clock == 0 || clock > u64::from(TMDS_MAX_KHZ) * 10 {
+        if otg >= 4 || clock == 0 || clock > u64::from(TMDS_MAX_KHZ) * 10 {
             return Err(Error::Invalid);
         }
         let mut request = [0; 64];
@@ -1034,7 +1035,7 @@ impl<I: Io> Engine<I> {
                                             // ObjectID.h ENCODER_OBJECT_ID_INTERNAL_UNIPHY / UNIPHY1.
         request[9] = [0x1e, 0x20][usize::from(path.transmitter / 2)];
         request[10] = 3; // ATOM_ENCODER_MODE_HDMI
-        request[12] = pipe; // ATOM_CRTC1 + controller
+        request[12] = otg; // ATOM_CRTC1 + controller
         request[13] = depth.code(); // PIXEL_CLOCK_V7_DEEPCOLOR_RATIO_*
         self.send(request).await
     }

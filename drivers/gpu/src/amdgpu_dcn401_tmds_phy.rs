@@ -39,8 +39,9 @@ impl<I: Io> Engine<I> {
         let l = self.layout;
         // Conservative until per-OTG PHY clock routing has an owner: every
         // timing generator and input clock must be off, including inherited
-        // clock requests and late busy/ON acknowledgements.
-        for p in 0..4 {
+        // clock requests and late busy/ON acknowledgements. Pipe indices:
+        // a fused OTG has no registers.
+        for p in l.pool.pipes() {
             for (reg, mask) in [
                 (l.otg(p, CONTROL), 0x10001),
                 (l.otg(p, CLOCK), 0x10113),

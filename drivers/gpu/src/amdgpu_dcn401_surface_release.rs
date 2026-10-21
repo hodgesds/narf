@@ -4,7 +4,7 @@ use super::*;
 
 impl<I: Io> Engine<I> {
     fn surface_release_preflight(&mut self, pipe: u8) -> Result<(), Error> {
-        if pipe >= 4 {
+        if pipe >= self.layout.pool.count() {
             return Err(Error::Invalid);
         }
         if self.status.state != State::PlanesRetired
@@ -24,7 +24,9 @@ impl<I: Io> Engine<I> {
         if self.read(self.layout.nbio + 0x12d * 4)? != 0x7f000 {
             return Err(Error::Busy);
         }
-        if self.read(self.layout.mpc_base + (0x2c5 + u64::from(pipe) * 5) * 4)? & 1 != 0 {
+        // CUR_VUPDATE_LOCK_SET of the pipe's OPP instance (mpc1_cursor_lock).
+        let lock = self.layout.mpc_base + (0x2c5 + u64::from(self.layout.inst(pipe)) * 5) * 4;
+        if self.read(lock)? & 1 != 0 {
             return Err(Error::Busy);
         }
         if self.hubp_powered(pipe)?
@@ -102,7 +104,7 @@ impl Surfaces {
             });
         let preflight = |engine: &mut Engine<I>| {
             engine.surface_release_preflight(pipe)?;
-            for q in (0..4).filter(|&q| odm & bit(q) != 0) {
+            for q in engine.layout.pool.pipes().filter(|&q| odm & bit(q) != 0) {
                 engine.surface_release_preflight(q)?;
             }
             Ok(())

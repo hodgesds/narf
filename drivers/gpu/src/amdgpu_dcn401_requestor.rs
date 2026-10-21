@@ -28,19 +28,21 @@ pub struct RequestorApplied {
     pub pixel_chunk_bytes: u32,
     pub minimum_chunk_bytes: u32,
 }
-/// dcn401_program_det_segments/compbuf_segments for the pipes in `det`:
-/// each the default DET, the rest of the CRB compressed buffer (with four
-/// pipes, DML's one-segment minimum).
+/// dcn401_program_det_segments/compbuf_segments for the HUBP instances in
+/// `det` (DCHUBBUB_DET{hubp->inst}_CTRL, so a pipe mask goes through
+/// `PipePool::hw_mask`): each the default DET, the rest of the CRB
+/// compressed buffer (with four pipes, DML's one-segment minimum).
 fn allocation(det: u8) -> [u8; 5] {
     let mut sizes = [SEGMENTS, 0, 0, 0, 0];
-    for p in (0..4).filter(|p| det & 1 << p != 0) {
-        sizes[p + 1] = DET_SEGMENTS;
+    for i in (0..4).filter(|i| det & 1 << i != 0) {
+        sizes[i + 1] = DET_SEGMENTS;
         sizes[0] -= DET_SEGMENTS;
     }
     sizes
 }
-/// One HUBP's requestor, its VTG the timing's own OTG `vtg` (an ODM
-/// pipe's or overlay's HUBP follows the stream's timing).
+/// One HUBP's requestor, its VTG the timing's own OTG instance `vtg`
+/// (HUBP_VTG_SEL = tg->inst; an ODM pipe's or overlay's HUBP follows the
+/// stream's timing).
 pub(super) fn requestor(vtg: u8) -> [(u64, u32, u32); 7] {
     [
         (0x66d, 0x7ff0, 0),  // packed RGB: no second plane in DET
@@ -55,6 +57,7 @@ pub(super) fn requestor(vtg: u8) -> [(u64, u32, u32); 7] {
     ]
 }
 impl Layout {
+    /// DCHUBBUB_COMPBUF_CTRL (0), then DET0-3_CTRL by HUBP instance.
     fn crb(self, index: usize) -> u64 {
         self.base + (0x4ba + index as u64) * 4
     }
@@ -156,7 +159,7 @@ impl<I: Io> Engine<I> {
         // that left while this one ran keeps its (unused) allocation until
         // the next configuration repartitions, and compbuf is unused.
         let sizes = self.crb_stable()?;
-        let want = allocation(self.det_pipes(pipe));
+        let want = allocation(self.layout.pool.hw_mask(self.det_pipes(pipe)));
         if (1..5).any(|i| want[i] != 0 && sizes[i] != want[i]) {
             return Err(Error::Busy);
         }
@@ -173,7 +176,7 @@ impl<I: Io> Engine<I> {
                     && (a.request.format.is_video()
                         || a.request.surface.tiling != crate::amdgpu_dcn401_otg::Tiling::LINEAR)
             });
-            for (r, mut mask, value) in requestor(pipe) {
+            for (r, mut mask, value) in requestor(self.layout.inst(pipe)) {
                 if planned {
                     if matches!(r, 0x66d | 0x620 | 0x5f2 | 0x5f3) {
                         continue;
@@ -278,7 +281,7 @@ impl Surfaces {
         let det = stack.iter().flatten().fold(e.det_pipes(pipe), |m, o| {
             m | o.dpp.surface.request.pipe_mask()
         });
-        let target = allocation(det);
+        let target = allocation(e.layout.pool.hw_mask(det));
         let surface = a.dpp.surface;
         // Linear RGB stores one row per swath; leave room for at least two.
         let surfaces =
@@ -320,7 +323,7 @@ impl Surfaces {
                 e.wait(e.layout.hubp(p, HUBP_CONTROL), 0x1007, 3, 100_000)
                     .await?;
                 e.hubp_faults(p, 0)?;
-                for (r, mask, value) in requestor(pipe) {
+                for (r, mask, value) in requestor(e.layout.inst(pipe)) {
                     e.update(e.layout.hubp(p, r), mask, value)?;
                 }
                 e.update(e.layout.hubp(p, HUBP_CLOCK), 1, 0)?;

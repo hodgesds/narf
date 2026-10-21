@@ -96,6 +96,7 @@ fn engine() -> Engine<Fake> {
             dccg: 0x20000,
             dio: DIO,
             hpo: HPO,
+            pool: crate::amdgpu_rdna4::pipe_pool(),
         },
         status: Status {
             state: State::Prepared,

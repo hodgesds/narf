@@ -850,6 +850,12 @@ impl Surfaces {
         request: SurfaceRequest,
     ) -> Result<SurfaceApplied, Error> {
         let (pitch_bytes, bytes) = request.geometry()?;
+        // Every fetching pipe is a pipe index of this pool (fused slots past
+        // `count` have no blocks).
+        let count = engine.layout.pool.count();
+        if request.segments().any(|(p, _, _)| p >= count) {
+            return Err(Error::Invalid);
+        }
         let slot = usize::from(request.pipe);
         // Restaging a torn-down pipe (a replug) is allowed only right after
         // plane retirement (and the HUBP power-up that follows it in a

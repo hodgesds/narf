@@ -120,7 +120,7 @@ pub(super) trait Firmware {
     fn pixel_clock(
         &mut self,
         path: Path,
-        pipe: u8,
+        otg: u8, // the pipe's OTG instance
         khz: u32,
         depth: dmub::TmdsDepth,
     ) -> impl Future<Output = Result<(), dmub::Error>> + Send;
@@ -143,11 +143,11 @@ impl Firmware for dmub::Dmub {
     async fn pixel_clock(
         &mut self,
         path: Path,
-        pipe: u8,
+        otg: u8,
         khz: u32,
         depth: dmub::TmdsDepth,
     ) -> Result<(), dmub::Error> {
-        self.set_tmds_pixel_clock(path, pipe, khz, depth).await
+        self.set_tmds_pixel_clock(path, otg, khz, depth).await
     }
     async fn stream_setup(&mut self, stream: u8, khz: u32) -> Result<(), dmub::Error> {
         self.setup_hdmi_stream(stream, khz).await
@@ -295,6 +295,9 @@ impl<I: Io> Engine<I> {
                 self.dp_encoder_quiet(DpStream::Dio(p))?;
             }
             self.dp_encoder_quiet(DpStream::Hpo(p))?;
+        }
+        // OTGs are pipe resources: only the pool's pipes exist.
+        for p in l.pool.pipes() {
             if self.read(l.otg(p, LOCK))? & 0x101 != 0 || self.read(l.otg(p, CLOCK))? & 0x10 != 0 {
                 return Err(Error::Busy);
             }
@@ -349,7 +352,9 @@ impl<I: Io> Engine<I> {
         if self.read(route)? & 0x711 != plan.clock_route {
             return Err(Error::Readback(route));
         }
-        let pixel = (l.dio_clock - 0xa0 * 4) + (0x80 + 4 * u64::from(plan.request.pipe)) * 4;
+        // OTG<inst>_PIXEL_RATE_CNTL of the pipe's OTG.
+        let pixel =
+            (l.dio_clock - 0xa0 * 4) + (0x80 + 4 * u64::from(l.inst(plan.request.pipe))) * 4;
         if self.read(pixel)? & 0x1010 != 0 {
             return Err(Error::Readback(pixel)); // DP DTO must stay off for TMDS
         }
@@ -539,7 +544,7 @@ impl<I: Io> Engine<I> {
         if path.transmitter >= 4
             || !(1..=4).contains(&path.hpd)
             || request.stream >= 4
-            || request.pipe >= 4
+            || request.pipe >= self.layout.pool.count()
         {
             return Err(Error::Invalid);
         }
@@ -632,8 +637,9 @@ impl<I: Io> Engine<I> {
         // dcn401_program_pix_clk: PHY PLL from the pixel clock and depth,
         // then dce112_program_pixel_clk_resync's DCCG_DEEP_COLOR_CNTL.
         self.hdmi_link_verify(*plan, false)?;
+        // pixel_clk_params->controller_id = tg->inst + 1.
         firmware
-            .pixel_clock(path, pipe, plan.pixel_khz, plan.depth)
+            .pixel_clock(path, self.layout.inst(pipe), plan.pixel_khz, plan.depth)
             .await
             .map_err(Error::Firmware)?;
         self.hdmi_update(plan, 5, 0x30, deep << 4)?;
@@ -654,11 +660,12 @@ impl<I: Io> Engine<I> {
             .stream_setup(stream, khz)
             .await
             .map_err(Error::Firmware)?;
+        let otg = self.layout.inst_field(pipe);
         for (slot, mask, value) in [
-            (6, 7, u32::from(pipe)),         // dig_connect_to_otg
-            (6, 0x70, u32::from(pipe) << 4), // stereo sync source
-            (6, 0x100, 0x100),               // stereo sync gate (stereo off)
-            (11, 0x7000, 0),                 // RGB pixel encoding and colour format
+            (6, 7, otg),         // dig_connect_to_otg(tg->inst)
+            (6, 0x70, otg << 4), // stereo sync source (tg->inst)
+            (6, 0x100, 0x100),   // stereo sync gate (stereo off)
+            (11, 0x7000, 0),     // RGB pixel encoding and colour format
             // GEN v1, keepout, no extra NULL; above 340 MHz the data
             // scrambler and the 1/4-rate clock channel (HDMI_CLOCK_CHANNEL_RATE).
             (11, 0x0100001f, 0x19 | if plan.scrambled { 0x6 } else { 0 }),

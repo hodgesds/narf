@@ -2663,7 +2663,11 @@ pub fn admit_all_with(soc: &Soc, modes: &[Mode], policy: Policy) -> Result<Vec<P
         // The mcache phase starts from a configuration mode support takes.
         plan_shapes(soc, modes, shapes.clone(), true)?;
         let used = shapes.iter().map(|s| s.dpps).sum::<u32>();
-        let mut free = MAX_PIPES.saturating_sub(used);
+        // The pool's pipes (Linux's pmo keeps the unharvested ip_caps
+        // pipe_count; mode support here already counts the pool's).
+        let mut free = MAX_PIPES
+            .min(crate::amdgpu_rdna4::available_pipes())
+            .saturating_sub(used);
         for (k, s) in shapes.iter().enumerate() {
             if s.mcache_fits {
                 continue;

@@ -448,10 +448,11 @@ pub(super) fn stream_cursor_pipes(
 
 impl<I: Io> Engine<I> {
     pub(super) fn cm(&self, pipe: u8, reg: u64) -> u64 {
-        self.layout.base + (reg + u64::from(pipe) * 0x16b) * 4
+        self.layout.base + (reg + u64::from(self.layout.inst(pipe)) * 0x16b) * 4
     }
+    /// The cursor lock of the MPCC tree of pipe `opp`'s OPP.
     fn cursor_lock_at(&self, opp: u8) -> u64 {
-        self.layout.mpc_base + (LOCK_SET + u64::from(opp) * 5) * 4
+        self.layout.mpc_base + (LOCK_SET + u64::from(self.layout.inst(opp)) * 5) * 4
     }
     /// The OPP of every ODM segment of `pipe`'s stream: each MPCC tree's.
     fn stream_opps(&self, pipe: u8) -> alloc::vec::Vec<u8> {

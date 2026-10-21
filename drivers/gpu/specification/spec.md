@@ -410,7 +410,47 @@ the `j`-th unfused instance (`hw(j)`, inverse `pipe(inst)`, `hw_mask` /
 creation, `max_streams` and `dcn20_acquire_dsc` around `pipe_pool.c` and
 prints every fuse value's pool (`pipe_pool.txt`);
 `rdna4_pipe_pool_matches_linux_harvesting` holds `PipePool` to it.
-`available_pipes()` caps DML's TotalAvailablePipesSupport.
+`available_pipes()` (the pool's count) caps DML's TotalAvailablePipesSupport
+and the mcache phase's free pipes.
+
+**Pipe harvesting (DCN401 pipe index vs. instance).** As in DC, every
+`u8` pipe in the display stack is a pipe index (`pipe_ctx->pipe_idx`):
+`otg::Request::pipe`, `SplitPipes`, the per-pipe `Status` and sibling
+records, `dccg::Request::pipe`, the selected display, DRM CRTC k, the
+modeset planners. Each owner snapshots the published pool in its layout
+(`otg` `Layout::pool`, `dccg` and `clk` likewise) and every per-pipe
+register is addressed at the index's instance: OTG/ODM/VTG, OPP, DPP/CM,
+HUBP (and its cursor), DOMAIN0-3 power gating, the MPCC (its DPP's
+instance) with its OGAM/MCM, MPC_OUT and the per-OPP cursor lock,
+DCHUBBUB_DET{hubp->inst}, DPPCLK{dpp->inst}, OTG{tg->inst}_PIXEL_RATE,
+DP_DTO, DTBCLK_P and PIXEL_RATE_DIV and their gates. Every field naming an
+instance carries the instance: MPCC_TOP_SEL/BOT_SEL/OPP_ID/UPDATE_LOCK_SEL,
+MPC_OUT_MUX, OPTC_SEGn_SRC_SEL and the ODM line memories,
+OTG_MASTER_UPDATE_LOCK_SEL, HUBP_VTG_SEL, the DIG frontend's OTG and stereo
+sync source, the HPO DP and FRL stream encoders' pixel source,
+DPSTREAMCLK/HDMISTREAMCLK sources, DCCG_AUDIO_DTO0_SOURCE_SEL, the DSC's
+OPP source and the DMUB TMDS pixel-clock controller id. The DSC is the
+pipe index's (`PipePool::dsc`, DSC registers, DOMAIN16-19 and DSCCLK
+untranslated). Stream and link encoders, PHYs and audio endpoints are not
+pipe resources: fusing leaves them, and the DIO/HPO stream encoder a
+display uses, unchanged. Every whole-hardware sweep (plane retirement,
+idle and power checks, running timing, DET grants) walks `pool.pipes()`;
+the clock owner's idle witnesses of a fused OTG are `(0, 0)` and never
+read. The only fused-instance registers ever read are DCHUBBUB's DET sizes
+(all four, as dcn401_init_crb and dcn401_program_compbuf_segments read
+them); none is written. OTG/HUBP interrupt sources name instances and count
+for `pool.pipe(inst)` (`DisplayEvents` by pipe; a fused instance's event is
+unhandled). Planners and the platform take only pool pipes: `FreePipes`
+takes from the pool's top pipe down, `route_streams` and the CRTC routes
+refuse pipes past the pool, and KMS publishes `amdgpu_navi48_kms::
+crtc_count()` (Linux's `max_streams`, the pool's count) CRTCs with
+`possible_crtcs` limited to them. Model tests run the scanout chain, ODM,
+overlay/underlay/MPC trees, plane updates, cursor locks, timing, DSC, DCCG,
+interrupt mapping and planning on pipe-0-fused, pipe-1-fused and
+pipes-1-and-2-fused boards (`amdgpu_dcn401_harvest_tests.rs`: `Renamed`
+shows a full-board model to the harvested owner and panics on any fused
+instance or field naming one; `guard`/`guard_raw` refuse them for models
+addressed by the owner itself).
 
 **Audio.** Navi44 boards expose the same `1002:ab40` HDMI/DP audio function
 (Linux `hda_intel.c` lists only `ab40` for RDNA4); runtime PM finds it as PCI
@@ -1238,7 +1278,8 @@ one per started 5760 DSC pixels or 4096 4:2:0 pixels, two for more than four
 slices, three for more than eight and four for a three-pipe split whose
 slices are not twelve. 3:1 and 4:1 lines divide by four (OTG_H_TIMING_DIV_BY4),
 3:1 may split unevenly without DSC, and with DSC the slices split evenly
-(all twelve on three). More than four pipes in all is `Pipes`. `Plan::pipes`
+(all twelve on three). More than the pool's pipes (four unfused) in all is
+`Pipes`. `Plan::pipes`
 (1 to 4) reports the decision; every pipe shares every programmed value
 except the DLG blank end, which each further pipe moves by the segments
 before it (`Plan::odm_refcyc_h_blank_end: [u32; 3]`, `Plan::pipe_dlg`).
@@ -2394,14 +2435,14 @@ payload transaction.
 Source verification accepts sibling routes being released while still rejecting unowned frontend
 selections. Failed transitions retain their owners and allocations.
 
-KMS routing follows Linux: there are four CRTCs (display/pipe k is CRTC id
-1 + 3k) and one connector per board DP/HDMI port (board ordinal n: encoder
+KMS routing follows Linux: there are `crtc_count()` CRTCs, four unless
+pipes are fused (display/pipe index k is CRTC id 1 + 3k) and one connector per board DP/HDMI port (board ordinal n: encoder
 2 + 3n, connector 3 + 3n, all ports, not only four), plus, for every DP port
 whose connected sink is an MST branch, a connector for each of its end-device
 slots that has held a device (index 32 + 16 port + slot), as drm_dp_mst adds
 one per end device it finds; the root's own connector then reports
 disconnected. Every encoder may drive
-any CRTC (`possible_crtcs` 0xf; `amdgpu_navi48_kms::{RoutedConnector,
+any CRTC (`possible_crtcs` the pool's pipes, 0xf unfused; `amdgpu_navi48_kms::{RoutedConnector,
 apply_routed, publish_routed, connector_index}`). A CRTC drives at most one
 connector: SETCRTC's single connector (more than one is EINVAL; none keeps the
 routing) or an atomic connector CRTC_ID routes it explicitly
@@ -2437,7 +2478,7 @@ link's payload table and the port's stable connector slots, and every hop of a
 device's path bounds its payload, dark-mode admission and the DSC fairness
 search jointly with the sibling streams crossing that hop. Every connected DP
 port whose sink is an MST branch runs MST at the same time, each on its own
-link and payload table; their streams share the four pipes, the clocks and
+link and payload table; their streams share the pool's pipes, the clocks and
 DML admission. End devices beyond a port's sixteen slots are not published.
 
 An MST branch that codes 128b/132b runs UHBR MST, as Linux's
@@ -3793,7 +3834,9 @@ fault re-arming are described below; late contained faults remain evidence.
 Everything here is model-tested (fake vectors and a local table driven
 through pending waits); none of it has run on the card.
 
-Display events are counted per DCN401 instance in `DisplayEvents` and are
+Display events are counted in `DisplayEvents`, HPD by connector and OTG/
+HUBP events by the pipe index their instance backs (`PipePool::pipe`; a
+fused instance's event is unhandled), and are
 never acknowledged by the dispatcher, because the DCN registers belong to the
 display owner (amdgpu_dm acknowledges in `dc_interrupt_ack`). `wait_display`
 takes an interest mask (hot-plug, flip, VUPDATE, vblank, VLINE0, DMUB outbox)
@@ -4261,7 +4304,7 @@ overlaps (see the cursor below).
 surface, pitch, depth, SPL viewport, ratios and taps; an empty `planes[0]` is
 the full-frame primary of `pitch` and `bytes_per_pixel`, overlays follow
 from `planes[1]`, `Mode::plane_list`); `admit_all` takes at most
-`dml::MAX_PLANES` (4) planes and four pipes in all (`Pipes`). Per plane it
+`dml::MAX_PLANES` (4) planes and the pool's pipes in all (`Pipes`). Per plane it
 follows dml2_core_dcn4_calcs.c: DPPCLK from the PSCL throughput
 (CalculateSinglePipeDPPCLKAndSCLThroughput), DPPREFCLK from the fastest
 plane and DISPCLK from the fastest stream, the scaler's DPPCycles, prefetch

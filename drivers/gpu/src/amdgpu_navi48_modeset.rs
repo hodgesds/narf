@@ -1668,7 +1668,8 @@ pub fn refine_dsc(soc: &dml::Soc, selections: &mut [Selection]) -> Result<(), Mo
 /// A configuration's streams: the board sinks' on their pipes and every MST
 /// port's (each selected against its own link), in pipe order, which
 /// admission truncates (who stays dark). A pipe named twice, on one port or
-/// across ports, is refused: there are four pipes for every port together.
+/// across ports, or past the pool's `pipe_count`, is refused: the pool's
+/// pipes serve every port together.
 pub fn route_streams(
     mut routed: Vec<(Selection, u8)>,
     mst: &[&[(Selection, u8)]],
@@ -1677,7 +1678,11 @@ pub fn route_streams(
         routed.extend(streams.iter().copied());
     }
     routed.sort_by_key(|&(_, pipe)| pipe);
-    if routed.windows(2).any(|w| w[0].1 == w[1].1) || routed.iter().any(|&(_, p)| p >= 4) {
+    if routed.windows(2).any(|w| w[0].1 == w[1].1)
+        || routed
+            .iter()
+            .any(|&(_, p)| p >= crate::amdgpu_rdna4::pipe_pool().count())
+    {
         return Err(ModesetError::Display(otg::Error::Invalid));
     }
     Ok(routed)
@@ -2648,12 +2653,14 @@ pub fn with_planes(
 }
 
 /// The free pipes of a configuration lit on `used` (by bit), taken from
-/// the top: none left is DML's `Pipes` (DML counts every DPP, so a
-/// configuration it admits always has them; this assigns them).
+/// the top of the pool (resource_find_any_free_pipe's `i < pool->pipe_count`):
+/// none left is DML's `Pipes` (DML counts every DPP, so a configuration it
+/// admits always has them; this assigns them).
 struct FreePipes(u8);
 impl FreePipes {
     fn take(&mut self) -> Result<u8, ModesetError> {
-        let q = (0..4u8)
+        let q = crate::amdgpu_rdna4::pipe_pool()
+            .pipes()
             .rev()
             .find(|&q| self.0 & 1 << q == 0)
             .ok_or(ModesetError::Display(otg::Error::Admission(
@@ -2937,7 +2944,7 @@ impl ColdBoot {
             // Only running generators: an idle (or soft-reset) OTG needs none.
             let running = self.display_running_timing()?;
             found.running_timing = running;
-            for pipe in 0..4 {
+            for pipe in crate::amdgpu_rdna4::pipe_pool().pipes() {
                 if running & 1 << pipe != 0 {
                     self.retire_display_timing(pipe).await?;
                 }
@@ -2999,7 +3006,7 @@ impl ColdBoot {
     ) -> Result<Modeset, ModesetError> {
         self.teardowns.check_idle()?;
         self.modesets.check_stopped()?;
-        if pipe >= 4 {
+        if pipe >= crate::amdgpu_rdna4::pipe_pool().count() {
             return Err(ModesetError::Display(otg::Error::Invalid));
         }
         let ports = self.scan_display().await.map_err(ModesetError::Boot)?;
@@ -3139,7 +3146,10 @@ impl ColdBoot {
             Err(e) => return Err(e),
         }
         .into_iter()
-        .filter_map(|s| Some((s, pipe_of(s.port).filter(|&p| p < 4)?)))
+        .filter_map(|s| {
+            let count = crate::amdgpu_rdna4::pipe_pool().count();
+            Some((s, pipe_of(s.port).filter(|&p| p < count)?))
+        })
         .collect();
         let mst_streams: Vec<_> = mst_plans.iter().map(|p| p.selections.as_slice()).collect();
         let routed = route_streams(routed, &mst_streams)?;
@@ -4238,8 +4248,9 @@ impl ColdBoot {
         }
         let used = running.iter().fold(0u8, |acc, m| acc | 1 << m.pipe);
         let ports_used: Vec<usize> = running.iter().map(|m| m.selection.port).collect();
-        // Scan from an idle display slot.
-        let Some(idle) = (0..4u8).find(|p| used & 1 << p == 0) else {
+        let pool = crate::amdgpu_rdna4::pipe_pool();
+        // Scan from an idle display slot (a pool pipe).
+        let Some(idle) = pool.pipes().find(|p| used & 1 << p == 0) else {
             return Ok(None);
         };
         if mst
@@ -4263,7 +4274,7 @@ impl ColdBoot {
             let unlit: Vec<Option<u8>> = route
                 .pipes
                 .iter()
-                .map(|p| p.filter(|&p| p < 4 && used & 1 << p == 0))
+                .map(|p| p.filter(|&p| p < pool.count() && used & 1 << p == 0))
                 .collect();
             let route = MstRoute {
                 pipes: &unlit,
@@ -4295,14 +4306,19 @@ impl ColdBoot {
         }
         .into_iter()
         .filter(|s| !ports_used.contains(&s.port))
-        .filter_map(|s| Some((s, pipe_of(s.port).filter(|&p| p < 4 && used & 1 << p == 0)?)))
+        .filter_map(|s| {
+            Some((
+                s,
+                pipe_of(s.port).filter(|&p| p < pool.count() && used & 1 << p == 0)?,
+            ))
+        })
         .collect();
         let mut mst_plans = Vec::with_capacity(mst.len());
         for route in mst {
             let unlit: Vec<Option<u8>> = route
                 .pipes
                 .iter()
-                .map(|p| p.filter(|&p| p < 4 && used & 1 << p == 0))
+                .map(|p| p.filter(|&p| p < pool.count() && used & 1 << p == 0))
                 .collect();
             let route = MstRoute {
                 pipes: &unlit,
@@ -4555,6 +4571,10 @@ pub fn display_pipes_beside(
 ) -> Result<Vec<DisplayPipes>, ModesetError> {
     // Only the pipes named matter to the allocation, not their order.
     let mut taken: Vec<u8> = pipes.to_vec();
-    taken.extend((0..4u8).filter(|p| used & 1 << p != 0 && !pipes.contains(p)));
+    taken.extend(
+        crate::amdgpu_rdna4::pipe_pool()
+            .pipes()
+            .filter(|p| used & 1 << p != 0 && !pipes.contains(p)),
+    );
     display_pipes(selections, plans, &taken)
 }

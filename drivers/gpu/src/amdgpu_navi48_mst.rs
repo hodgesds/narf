@@ -1543,7 +1543,10 @@ impl ColdBoot {
         let pipes = route.pipes;
         if pipes.is_empty()
             || pipes.len() > MST_OUTPUTS
-            || pipes.iter().flatten().any(|&p| p >= 4)
+            || pipes
+                .iter()
+                .flatten()
+                .any(|&p| p >= crate::amdgpu_rdna4::pipe_pool().count())
             || pipes
                 .iter()
                 .enumerate()

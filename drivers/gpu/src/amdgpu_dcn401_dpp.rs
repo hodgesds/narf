@@ -65,7 +65,7 @@ impl CoefRam {
 }
 impl Layout {
     pub(super) fn dpp(self, pipe: u8, reg: u64) -> u64 {
-        self.base + (reg + u64::from(pipe) * 0x16b) * 4
+        self.base + (reg + u64::from(self.inst(pipe)) * 0x16b) * 4
     }
 }
 /// The CM_POST_CSC_C11_C12..C33_C34 words of a plane in `format`: none

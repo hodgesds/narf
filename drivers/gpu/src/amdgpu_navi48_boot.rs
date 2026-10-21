@@ -2150,7 +2150,8 @@ impl ColdBoot {
             .map_err(otg::Error::Clocks)?;
         dccg.rebind_global(old, new);
         let records = dccg.status().pipes;
-        for display in 0..4u8 {
+        // Displays are pipe indices; a fused instance is no display.
+        for display in crate::amdgpu_rdna4::pipe_pool().pipes() {
             let Some(status) = otg.display_status(display) else {
                 continue;
             };

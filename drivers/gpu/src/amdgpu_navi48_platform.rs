@@ -2599,6 +2599,11 @@ impl CrtcState {
     }
 }
 
+// The CRTCs KMS publishes (one per pipe of the pool; CRTC k drives pipe
+// index k). `Outputs::crtcs` keeps four slots; those past the count are
+// never routed, lit or published.
+use crate::amdgpu_navi48_kms::crtc_count;
+
 /// The connectors and CRTCs, under one lock.
 #[derive(Debug)]
 struct Outputs {
@@ -2631,7 +2636,9 @@ impl Outputs {
     }
     /// The CRTC routed to `target`.
     fn crtc_of(&self, target: Target) -> Option<usize> {
-        self.crtcs.iter().position(|c| c.route == Some(target))
+        self.crtcs[..crtc_count()]
+            .iter()
+            .position(|c| c.route == Some(target))
     }
     /// Replace the connector set, keeping the discovery of every connector
     /// that remains. Routes to vanished connectors are dropped.
@@ -2663,7 +2670,7 @@ impl Outputs {
                     )
             })
             .collect();
-        for k in 0..4 {
+        for k in 0..crtc_count() {
             if self.crtcs[k]
                 .route
                 .is_some_and(|t| self.connector(t).is_none())
@@ -2697,7 +2704,8 @@ impl Outputs {
     /// sink left; each plugged, unparked connector without a CRTC takes the
     /// first such free CRTC. Running displays keep their CRTCs.
     fn assign_routes(&mut self) {
-        for k in 0..4 {
+        let count = crtc_count();
+        for k in 0..count {
             let c = &self.crtcs[k];
             if c.explicit {
                 continue;
@@ -2714,8 +2722,7 @@ impl Outputs {
                 continue;
             }
             let target = x.target;
-            if let Some(c) = self
-                .crtcs
+            if let Some(c) = self.crtcs[..count]
                 .iter_mut()
                 .find(|c| c.route.is_none() && !c.explicit)
             {
@@ -2801,7 +2808,7 @@ impl Outputs {
             let (port, slot) = c.requested_key();
             crate::amdgpu_navi48_boot::set_requested_bpc(port, slot, c.max_bpc);
         }
-        for k in (0..4).filter(|&k| lighting(k)) {
+        for k in (0..crtc_count()).filter(|&k| lighting(k)) {
             self.crtcs[k].lit_bpc = self.routed(k).map(|c| c.max_bpc);
         }
     }
@@ -2896,7 +2903,10 @@ fn publish_outputs() {
     let publishing = PUBLISHING.lock();
     let (shown, owned, inactive) = {
         let outputs = OUTPUTS.lock();
-        let shown: Vec<Option<Shown>> = (0..4).map(|k| outputs.published(k).cloned()).collect();
+        // One KMS CRTC per pool pipe.
+        let shown: Vec<Option<Shown>> = (0..crtc_count())
+            .map(|k| outputs.published(k).cloned())
+            .collect();
         let owned: Vec<Owned> = outputs
             .connectors
             .iter()
@@ -2919,7 +2929,7 @@ fn publish_outputs() {
                 max_bpc: max_bpc_connector(c.target),
             })
             .collect();
-        let inactive: Vec<usize> = (0..4)
+        let inactive: Vec<usize> = (0..shown.len())
             .filter(|&k| shown[k].is_some() && !outputs.crtcs[k].published_active())
             .collect();
         (shown, owned, inactive)
@@ -2943,7 +2953,8 @@ fn publish_outputs() {
             edid: c.edid.as_ref(),
             offered: &c.offered,
             crtc: c.crtc,
-            possible_crtcs: 0xf,
+            // Any encoder drives any CRTC, of the pool's.
+            possible_crtcs: u32::from(crate::amdgpu_rdna4::pipe_pool().all()),
         })
         .collect();
     let props: Vec<crate::amdgpu_navi48_kms::ConnectorProps> = owned
@@ -2958,7 +2969,7 @@ fn publish_outputs() {
     // amdgpu_dm_atomic_commit_tail: a runtime-PM reference per enabled
     // CRTC, dropped (put_autosuspend) when it is disabled. The delta is
     // taken in publication order; references move after the lock.
-    let lit = (0..4)
+    let lit = (0..shown.len())
         .filter(|&k| shown[k].is_some() && !inactive.contains(&k))
         .fold(0u8, |m, k| m | 1 << k);
     let delta =
@@ -3254,20 +3265,21 @@ async unsafe fn light_displays(
         for c in outputs.crtcs.iter_mut().filter(|c| c.active) {
             c.shown = None;
         }
+        let count = crtc_count();
         let routes: [Option<Target>; 4] = core::array::from_fn(|k| {
             let c = &outputs.crtcs[k];
-            c.route.filter(|_| c.active)
+            c.route.filter(|_| c.active && k < count)
         });
         let wants: [Option<Timing>; 4] = core::array::from_fn(|k| outputs.crtcs[k].requested);
         // ... and its connector's Colorspace and HDR metadata, and every
         // connector's "max bpc".
-        for k in 0..4 {
+        for k in 0..count {
             let (colorspace, hdr) = connector_color(&outputs, k);
             crate::amdgpu_navi48_boot::set_output_color(k as u8, colorspace, hdr);
         }
         outputs.stage_requested_bpc(|k| routes[k].is_some());
         // Display k lights on pipe k with its CRTC's plane format and planes.
-        for (k, c) in outputs.crtcs.iter_mut().enumerate() {
+        for (k, c) in outputs.crtcs[..count].iter_mut().enumerate() {
             crate::amdgpu_navi48_boot::set_plane_format(k as u8, c.format);
             crate::amdgpu_navi48_boot::set_plane_setup(k as u8, c.planes);
             if c.active {
@@ -4367,7 +4379,7 @@ pub fn request_display_active(display: u8, active: bool) {
 pub fn request_display_route(display: u8, connector: Option<u32>) -> bool {
     let mut outputs = OUTPUTS.lock();
     let k = usize::from(display);
-    if k >= 4 {
+    if k >= crtc_count() {
         return false;
     }
     let target = match connector {
@@ -4710,7 +4722,7 @@ pub fn display_offers(
 ) -> bool {
     let outputs = OUTPUTS.lock();
     let k = usize::from(display);
-    if k >= 4 {
+    if k >= crtc_count() {
         return false;
     }
     let target = match connector {
@@ -4733,7 +4745,7 @@ pub fn request_display_mode(
 ) -> bool {
     let mut outputs = OUTPUTS.lock();
     let k = usize::from(display);
-    if k >= 4 {
+    if k >= crtc_count() {
         return false;
     }
     let Some(m) = mode else {
@@ -5040,15 +5052,16 @@ fn needs_relight(changed: bool, wanted: u8, lit: u8, considered: &mut u8) -> boo
     changed || wanted & !*considered & !lit != 0
 }
 
-fn monitor_order(pending: u8) -> impl Iterator<Item = u8> {
-    (0..4u8)
+/// The `count` pipes, those in `pending` first.
+fn monitor_order(pending: u8, count: u8) -> impl Iterator<Item = u8> {
+    (0..count)
         .filter(move |p| pending & (1 << p) != 0)
-        .chain((0..4u8).filter(move |p| pending & (1 << p) == 0))
+        .chain((0..count).filter(move |p| pending & (1 << p) == 0))
 }
 
 fn pending_display_work(boot: &boot::ColdBoot) -> bool {
     boot.display_modesets().iter().any(Option::is_some)
-        || (0..4).any(|p| {
+        || crate::amdgpu_rdna4::pipe_pool().pipes().any(|p| {
             boot.display_teardown_status(p)
                 .is_some_and(|s| s.next != boot::TeardownStep::Complete)
         })
@@ -5078,7 +5091,7 @@ fn routed_present(boot: &mut boot::ColdBoot, outputs: &Outputs, k: usize) -> boo
 /// CRTCs DRM wants on whose connectors have sinks.
 fn wanted_mask(boot: &mut boot::ColdBoot) -> u8 {
     let outputs = OUTPUTS.lock();
-    (0..4)
+    (0..crtc_count())
         .filter(|&k| outputs.crtcs[k].active && routed_present(boot, &outputs, k))
         .fold(0, |acc, k| acc | 1 << k)
 }
@@ -5166,14 +5179,15 @@ pub async unsafe fn monitor_displays(
     // pipe startup or asynchronous adoption. Restore actual completed witnesses
     // and retire them through the usual CPU withdrawal and native journal.
     let recovered = boot.restore_modesets(&mut displays.lit)?;
-    for pipe in (0..4u8).filter(|p| recovered & (1 << p) != 0) {
+    let pipes = crate::amdgpu_rdna4::pipe_pool().pipes();
+    for pipe in pipes.clone().filter(|p| recovered & (1 << p) != 0) {
         let m = displays.lit[usize::from(pipe)].unwrap();
         let unplugged = boot.display_hpd(m.selection.port) == Ok(false);
         boot.begin_modeset_teardown(&m, unplugged)?;
     }
     // Failed activations have no Modeset in Displays. Finish their recorded
     // abort before topology service or selecting an already-lit sibling.
-    for pipe in 0..4 {
+    for pipe in pipes.clone() {
         if boot
             .display_teardown_status(pipe)
             .is_some_and(|s| s.activation)
@@ -5232,7 +5246,8 @@ pub async unsafe fn monitor_displays(
     };
     let limited =
         crate::amdgpu_navi48_boot::limited_range(crate::amdgpu_navi48_boot::broadcast_rgb());
-    let pending_mask = (0..4u8)
+    let pending_mask = pipes
+        .clone()
         .filter(|&p| {
             displays.lit[usize::from(p)].is_some() && boot.display_teardown_status(p).is_some()
         })
@@ -5290,7 +5305,7 @@ pub async unsafe fn monitor_displays(
             }
         }
     }
-    for k in monitor_order(pending_mask) {
+    for k in monitor_order(pending_mask, pipes.end) {
         let Some(m) = displays.lit[usize::from(k)] else {
             continue;
         };
@@ -5413,7 +5428,7 @@ pub async unsafe fn monitor_displays(
     if relight {
         plane_updates = 0;
     }
-    for k in (0..4u8).filter(|&k| plane_updates & 1 << k != 0) {
+    for k in pipes.clone().filter(|&k| plane_updates & 1 << k != 0) {
         let (format, setup) = (wants[usize::from(k)].2, wants[usize::from(k)].3);
         // SAFETY: as above; the display stays lit and published.
         if unsafe { update_lit_planes(boot, displays, k, format, setup) }.await? {
@@ -5475,7 +5490,7 @@ pub async unsafe fn monitor_displays(
     }
     if relit && !lit_beside {
         // Withdraw every writer, stop every display, light them again.
-        for k in (0..4u8).rev() {
+        for k in pipes.clone().rev() {
             let Some(m) = displays.lit[usize::from(k)] else {
                 continue;
             };
@@ -6665,9 +6680,9 @@ mod tests {
         assert!(output.published_active());
         // Resume a higher-numbered interrupted pipe before health checks can
         // select another owner or a shared-link notification can start a relight.
-        assert_eq!(monitor_order(0b1000).collect::<Vec<_>>(), [3, 0, 1, 2]);
-        assert_eq!(monitor_order(0b1010).collect::<Vec<_>>(), [1, 3, 0, 2]);
-        assert_eq!(monitor_order(0).collect::<Vec<_>>(), [0, 1, 2, 3]);
+        assert_eq!(monitor_order(0b1000, 4).collect::<Vec<_>>(), [3, 0, 1, 2]);
+        assert_eq!(monitor_order(0b1010, 4).collect::<Vec<_>>(), [1, 3, 0, 2]);
+        assert_eq!(monitor_order(0, 4).collect::<Vec<_>>(), [0, 1, 2, 3]);
         TestResult::Pass
     }
     kernel_test_in!(
@@ -7258,12 +7273,14 @@ async unsafe fn light_beside(
     let (routes, wants, mst) = {
         let mut outputs = OUTPUTS.lock();
         outputs.assign_routes();
+        let count = crtc_count();
         let routes: [Option<Target>; 4] = core::array::from_fn(|k| {
             let c = &outputs.crtcs[k];
-            c.route.filter(|_| c.active && lit_mask & 1 << k == 0)
+            c.route
+                .filter(|_| c.active && lit_mask & 1 << k == 0 && k < count)
         });
         let wants: [Option<Timing>; 4] = core::array::from_fn(|k| outputs.crtcs[k].requested);
-        for k in (0..4).filter(|&k| lit_mask & 1 << k == 0) {
+        for k in (0..count).filter(|&k| lit_mask & 1 << k == 0) {
             let (colorspace, hdr) = connector_color(&outputs, k);
             crate::amdgpu_navi48_boot::set_output_color(k as u8, colorspace, hdr);
             let c = &outputs.crtcs[k];

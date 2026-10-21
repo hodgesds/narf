@@ -166,6 +166,8 @@ pub(crate) struct Layout {
     dccg: u64,
     dio: u64,
     hpo: u64,
+    /// The display resource pool: a fused pipe's OTG is no idle witness.
+    pool: crate::amdgpu_rdna4::PipePool,
 }
 impl Layout {
     pub(crate) fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
@@ -195,6 +197,7 @@ impl Layout {
                 .map_err(|_| Error::Unsupported)?,
             hpo: bank(gpu, ip::HW_ID_DCN, &[(4, 0, 1), (4, 1, 0)], 3, 0x95c)
                 .map_err(|_| Error::Unsupported)?,
+            pool: crate::amdgpu_rdna4::pipe_pool(),
         })
     }
     pub(crate) fn hpo_link_clock(self) -> u64 {
@@ -226,6 +229,12 @@ impl Layout {
             .enumerate()
             {
                 regs[i * 17 + j] = (self.dio + (reg + i as u64 * stride) * 4, mask);
+            }
+            // The OTG witnesses (the first two) of a fused pipe: Linux never
+            // reads a fused timing generator. Every consumer skips mask 0.
+            if self.pool.pipe(i as u8).is_none() {
+                regs[i * 17] = (0, 0);
+                regs[i * 17 + 1] = (0, 0);
             }
         }
         // The single FRL stream lives in DCN bank 3, unlike HPO DP's bank 2.
@@ -293,7 +302,7 @@ impl<I: Io> Engine<I> {
         let regs = self.layout.idle_registers();
         self.access(|io| {
             for (at, mask) in regs {
-                if !held(at) && checked(io.read(at))? & mask != 0 {
+                if mask != 0 && !held(at) && checked(io.read(at))? & mask != 0 {
                     return Err(Error::Busy);
                 }
             }

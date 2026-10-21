@@ -6,8 +6,9 @@
 //! off), dpp401_dscl_set_scl_filter / dpp401_dscl_set_scaler_filter and
 //! dpp401_dscl_program_easf, then hubp401_set_viewport.
 //!
-//! Register numbers are pipe 0's (DSCL0, HUBP0); every write names the
-//! fields Linux's REG_SET/REG_UPDATE call sets, so its mask is theirs.
+//! Register numbers are instance 0's (DSCL0, HUBP0; the callers' `dpp` and
+//! `hubp` add the pipe's hardware instance); every write names the fields
+//! Linux's REG_SET/REG_UPDATE call sets, so its mask is theirs.
 //! A first programming after the pipe was stopped always loads the
 //! coefficient RAM (Linux skips the load when the DPP still holds the same
 //! filter; reloading it is equivalent). Pure: nothing here touches hardware.
@@ -353,7 +354,7 @@ pub fn program(s: &Scaler, alpha: bool) -> Vec<Op> {
     ops
 }
 
-/// hubp401_set_viewport: (register, mask, value) for pipe 0.
+/// hubp401_set_viewport: (register, mask, value) for instance 0.
 pub fn viewport(s: &Scaler) -> [(u64, u32, u32); 8] {
     let (v, c) = (s.viewport, s.viewport_c);
     [

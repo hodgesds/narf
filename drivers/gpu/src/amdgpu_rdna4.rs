@@ -534,10 +534,9 @@ pub(crate) fn publish_pipe_pool(pool: PipePool) {
 pub fn pipe_pool() -> PipePool {
     PipePool::from_fuses(u32::from(FUSES.load(Ordering::Acquire)))
 }
-/// DCN pipes DML may assign. Display still addresses pipes by hardware
-/// instance, so this is the unbroken run of unfused instances from 0.
+/// DCN pipes DML may assign: the pool's `pipe_count`.
 pub fn available_pipes() -> u32 {
-    pipe_pool().fuses().trailing_zeros().min(DCN401_PIPES)
+    u32::from(pipe_pool().count())
 }
 
 #[cfg(feature = "kernel-test")]

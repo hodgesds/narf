@@ -428,8 +428,10 @@ impl<I: Io> Engine<I> {
         let bank1 = self.layout.dio_clock - 0xa0 * 4;
         let at = |r: u64| bank1 + r * 4;
         if let Some((pipe, Some(pixel_khz), _)) = hdmi {
-            // Source and DTO select before modulo and phase.
-            self.update(at(AUDIO_DTO_SOURCE), 0x37, u32::from(pipe))?;
+            // Source and DTO select before modulo and phase. The source is
+            // the pipe's OTG instance (translate_to_dto_source(tg->inst + 1)).
+            let otg = self.layout.inst_field(pipe);
+            self.update(at(AUDIO_DTO_SOURCE), 0x37, otg)?;
             self.update(at(AUDIO_DTO0_MODULE), u32::MAX, pixel_khz * 10)?;
             self.update(at(AUDIO_DTO0_PHASE), u32::MAX, 24 * 10_000)
         } else if let Some(reference_hz) = hdmi

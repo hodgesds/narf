@@ -1576,12 +1576,23 @@ fn dcn401_dml_admits_every_rdna4_profile_and_fused_pipes() -> TestResult {
     if admit_all(&base, &four).is_err() {
         return TestResult::Fail("four 1080p streams on four pipes");
     }
-    rdna4::publish_pipe_pool(rdna4::PipePool::from_fuses(8));
-    let fused = admit_all(&base, &four).err();
-    let three = admit_all(&base, &four[..3]).is_ok();
+    // Any one pipe fused, pipe 0 or a middle one included, leaves three
+    // (the pool's count, wherever the fused instance is); two leave two.
+    for fuses in [0x8, 0x1, 0x2] {
+        rdna4::publish_pipe_pool(rdna4::PipePool::from_fuses(fuses));
+        let fused = admit_all(&base, &four).err();
+        let three = admit_all(&base, &four[..3]).is_ok();
+        rdna4::publish_pipe_pool(rdna4::PipePool::FULL);
+        if fused != Some(Error::Pipes) || !three {
+            return TestResult::Fail("fused DCN pipe admitted or remaining pipes refused");
+        }
+    }
+    rdna4::publish_pipe_pool(rdna4::PipePool::from_fuses(0x6));
+    let fused = admit_all(&base, &four[..3]).err();
+    let two = admit_all(&base, &four[..2]).is_ok();
     rdna4::publish_pipe_pool(rdna4::PipePool::FULL);
-    if fused != Some(Error::Pipes) || !three {
-        return TestResult::Fail("fused DCN pipe admitted or remaining pipes refused");
+    if fused != Some(Error::Pipes) || !two {
+        return TestResult::Fail("two fused DCN pipes");
     }
     TestResult::Pass
 }

@@ -104,22 +104,26 @@ pub const VUPDATE: u32 = 4;
 pub const VBLANK: u32 = 8;
 pub const VLINE: u32 = 16;
 pub const DMUB: u32 = 32;
-/// Per-instance DCN401 event counts. `lost` counts IH overflows (and the
-/// terminal transition), after which a consumer must re-read hardware state.
+const PIPES: usize = crate::amdgpu_rdna4::DCN401_PIPES as usize;
+/// DCN401 event counts: HPD/HPD-RX by connector (HPD) instance; OTG and HUBP
+/// events by PIPE INDEX (CRTC k), translated from the hardware instance the
+/// source names (amdgpu_dm_get_crtc_by_otg_inst). `lost` counts IH overflows
+/// (and the terminal transition), after which a consumer must re-read
+/// hardware state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DisplayEvents {
     pub hpd: [u64; 6],
     pub hpd_rx: [u64; 6],
-    pub vblank: [u64; 6],
-    pub vline0: [u64; 6],
-    pub flip: [u64; 6],
-    pub vupdate: [u64; 6],
+    pub vblank: [u64; PIPES],
+    pub vline0: [u64; PIPES],
+    pub flip: [u64; PIPES],
+    pub vupdate: [u64; PIPES],
     pub dmub: u64,
     pub lost: u64,
 }
 impl DisplayEvents {
     fn version(&self, mask: u32) -> u64 {
-        let sum = |a: &[u64; 6]| a.iter().fold(0u64, |s, v| s.wrapping_add(*v));
+        let sum = |a: &[u64]| a.iter().fold(0u64, |s, v| s.wrapping_add(*v));
         let mut v = self.lost;
         for (bit, count) in [
             (HOTPLUG, sum(&self.hpd).wrapping_add(sum(&self.hpd_rx))),
@@ -282,10 +286,10 @@ impl Table {
             display: DisplayEvents {
                 hpd: [0; 6],
                 hpd_rx: [0; 6],
-                vblank: [0; 6],
-                vline0: [0; 6],
-                flip: [0; 6],
-                vupdate: [0; 6],
+                vblank: [0; PIPES],
+                vline0: [0; PIPES],
+                flip: [0; PIPES],
+                vupdate: [0; PIPES],
                 dmub: 0,
                 lost: 0,
             },
@@ -506,15 +510,31 @@ impl Table {
         }
         Delivery::Faulted(hit)
     }
-    fn display(&mut self, d: src::Display) -> Delivery {
+    fn display(&mut self, event: &ih::Event, d: src::Display) -> Delivery {
+        // OTG/HUBP sources name a hardware instance; CRTC k is pipe index k
+        // (dm_vupdate_high_irq / dm_pflip_high_irq: get_crtc_by_otg_inst(
+        // irq_src - IRQ_TYPE_*)). A fused or nonexistent instance has no
+        // CRTC, so Linux drops it: count it as evidence, wake nobody.
+        let pool = crate::amdgpu_rdna4::pipe_pool();
+        let Some(pipe) = (match d {
+            src::Display::Vblank(n)
+            | src::Display::Vline0(n)
+            | src::Display::Flip(n)
+            | src::Display::Vupdate(n) => pool.pipe(n),
+            _ => Some(0),
+        }) else {
+            return self.unhandled(event);
+        };
+        let p = pipe as usize;
         let e = &mut self.display;
         let (count, bit) = match d {
+            // HPD is per connector/link, not a pipe resource.
             src::Display::Hpd(n) => (&mut e.hpd[n as usize % 6], HOTPLUG),
             src::Display::HpdRx(n) => (&mut e.hpd_rx[n as usize % 6], HOTPLUG),
-            src::Display::Vblank(n) => (&mut e.vblank[n as usize % 6], VBLANK),
-            src::Display::Vline0(n) => (&mut e.vline0[n as usize % 6], VLINE),
-            src::Display::Flip(n) => (&mut e.flip[n as usize % 6], FLIP),
-            src::Display::Vupdate(n) => (&mut e.vupdate[n as usize % 6], VUPDATE),
+            src::Display::Vblank(_) => (&mut e.vblank[p], VBLANK),
+            src::Display::Vline0(_) => (&mut e.vline0[p], VLINE),
+            src::Display::Flip(_) => (&mut e.flip[p], FLIP),
+            src::Display::Vupdate(_) => (&mut e.vupdate[p], VUPDATE),
             src::Display::DmubOutbox => (&mut e.dmub, DMUB),
         };
         *count = count.wrapping_add(1);
@@ -575,7 +595,7 @@ impl Table {
                 self.counters.poison = self.counters.poison.saturating_add(1);
                 Delivery::Ignored
             }
-            src::Class::Display(d) => self.display(d),
+            src::Class::Display(d) => self.display(event, d),
             src::Class::Media(media) => {
                 self.counters.media = self.counters.media.saturating_add(1);
                 match media {

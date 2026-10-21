@@ -189,7 +189,8 @@ struct Change {
 impl<I: Io> Engine<I> {
     /// mpc1_remove_mpcc: `m` leaves its tree (the MPCC above it or the
     /// OPP's OUT_MUX takes the one below; a new bottom passes its top layer
-    /// through) and its muxes and update lock are released.
+    /// through) and its muxes and update lock are released. `t` names
+    /// pipes; the muxes take their MPCC instances (mpcc_id = dpp->inst).
     fn mpc_remove(&mut self, t: &mut MpcTree, m: u8) -> Result<(), Error> {
         let l = self.layout;
         let Some(i) = t.list.iter().position(|&x| x == m) else {
@@ -197,11 +198,15 @@ impl<I: Io> Engine<I> {
         };
         let below = t.list.get(i + 1).copied();
         if i == 0 {
-            self.update(l.out_mux(t.opp), 0xf, below.map_or(0xf, u32::from))?;
+            self.update(
+                l.out_mux(t.opp),
+                0xf,
+                below.map_or(0xf, |b| l.inst_field(b)),
+            )?;
         } else {
             let above = t.list[i - 1];
             match below {
-                Some(b) => self.update(l.mpcc(above, BOTTOM), 0xf, u32::from(b))?,
+                Some(b) => self.update(l.mpcc(above, BOTTOM), 0xf, l.inst_field(b))?,
                 None => {
                     self.update(l.mpcc(above, BOTTOM), 0xf, 0xf)?;
                     self.update(l.mpcc(above, MPCC_CONTROL), 3, MODE_PASSTHROUGH)?;
@@ -215,18 +220,20 @@ impl<I: Io> Engine<I> {
         Ok(())
     }
     /// mpc1_insert_plane at the bottom of `t` (no insert_above_mpcc), as
-    /// dcn20_update_mpcc inserts each pipe of a tree programmed top down.
+    /// dcn20_update_mpcc inserts each pipe of a tree programmed top down:
+    /// MPCC_TOP_SEL = dpp_id, MPCC_OPP_ID = opp_id, MPC_OUT_MUX and
+    /// MPCC_BOT_SEL = mpcc_id, all instances of the pipes `t` and `m` name.
     fn mpc_insert_bottom(&mut self, t: &mut MpcTree, m: u8) -> Result<(), Error> {
         let l = self.layout;
         self.update(l.mpcc(m, BOTTOM), 0xf, 0xf)?;
         self.update(l.mpcc(m, MPCC_CONTROL), 3, MODE_TOP_ONLY)?;
-        self.update(l.mpcc(m, TOP), 0xf, u32::from(m))?;
-        self.update(l.mpcc(m, OPP_ID), 0xf, u32::from(t.opp))?;
-        self.update(l.mpcc(m, UPDATE_LOCK), 0xf, u32::from(t.opp))?;
+        self.update(l.mpcc(m, TOP), 0xf, l.inst_field(m))?;
+        self.update(l.mpcc(m, OPP_ID), 0xf, l.inst_field(t.opp))?;
+        self.update(l.mpcc(m, UPDATE_LOCK), 0xf, l.inst_field(t.opp))?;
         match t.list.last().copied() {
-            None => self.update(l.out_mux(t.opp), 0xf, u32::from(m))?,
+            None => self.update(l.out_mux(t.opp), 0xf, l.inst_field(m))?,
             Some(a) => {
-                self.update(l.mpcc(a, BOTTOM), 0xf, u32::from(m))?;
+                self.update(l.mpcc(a, BOTTOM), 0xf, l.inst_field(m))?;
                 self.update(l.mpcc(a, MPCC_CONTROL), 3, MODE_TOP_BOT)?;
             }
         }
@@ -238,10 +245,10 @@ impl<I: Io> Engine<I> {
     /// and, powered, its HUBP blank, drained and clock-gated without any
     /// transaction and its DPP stopped. Returns whether it is powered.
     fn free_pipe(&mut self, q: u8) -> Result<bool, Error> {
-        if q >= 4 || self.displays.siblings.pipes & bit(q) != 0 {
+        let l = self.layout;
+        if q >= l.pool.count() || self.displays.siblings.pipes & bit(q) != 0 {
             return Err(Error::Busy);
         }
-        let l = self.layout;
         if self.read(l.otg(q, LOCK))? & 0x101 != 0
             || self.read(l.otg(q, CLOCK))? & 0x10 != 0
             || self.read(l.otg(q, GSL))? & 0x8000_000f != 0
@@ -298,7 +305,8 @@ impl<I: Io> Engine<I> {
                 return Err(Error::Readback(at));
             }
         }
-        for (r, mask, value) in super::requestor::requestor(vtg) {
+        // hubp_vtg_sel(tg->inst): the stream's OTG instance.
+        for (r, mask, value) in super::requestor::requestor(l.inst(vtg)) {
             self.update(l.hubp(q, r), mask, value)?;
         }
         self.update(self.dpp_control(q), DPP_CLOCK_ENABLE, DPP_CLOCK_ENABLE)
@@ -309,8 +317,10 @@ impl<I: Io> Engine<I> {
         use super::requestor::{DET_SEGMENTS, SEGMENTS};
         let mut sizes = self.crb_stable()?;
         let mut target = sizes;
-        for p in (0..4).filter(|&p| pipes & bit(p) != 0) {
-            target[usize::from(p) + 1] = DET_SEGMENTS;
+        // DET{n} is HUBP n's (program_det_segments(hubp->inst)).
+        let l = self.layout;
+        for p in l.pool.pipes().filter(|&p| pipes & bit(p) != 0) {
+            target[usize::from(l.inst(p)) + 1] = DET_SEGMENTS;
         }
         let dets: u32 = target[1..].iter().map(|&n| u32::from(n)).sum();
         let room = u32::from(SEGMENTS)
@@ -379,7 +389,7 @@ impl<I: Io> Engine<I> {
             .collect();
         // plane_atomic_disconnect of every freed pipe, by pipe index; its
         // cursor goes with it.
-        for q in (0..4u8).filter(|&q| c.disabled & bit(q) != 0) {
+        for q in l.pool.pipes().filter(|&q| c.disabled & bit(q) != 0) {
             for t in trees.iter_mut() {
                 self.mpc_remove(t, q)?;
             }
@@ -446,7 +456,7 @@ impl<I: Io> Engine<I> {
                 self.update(at, mask, value)?;
             }
         }
-        for q in (0..4u8).filter(|&q| c.enabled & bit(q) != 0) {
+        for q in l.pool.pipes().filter(|&q| c.enabled & bit(q) != 0) {
             self.update(l.hubp(q, HUBP_CONTROL), BLANK_EN | TTU_DISABLE, 0)?;
         }
         self.update(l.otg(pipe, LOCK), LOCK_REQUEST, 0)?;
@@ -471,7 +481,7 @@ impl<I: Io> Engine<I> {
                     return Ok(Some(at));
                 }
             }
-            for q in (0..4u8).filter(|&q| disabled & bit(q) != 0) {
+            for q in l.pool.pipes().filter(|&q| disabled & bit(q) != 0) {
                 // mpc2_assert_idle_mpcc: DISABLED, or IDLE and not BUSY.
                 let at = l.mpcc(q, MPC_STATUS);
                 let status = e.read(at)?;
@@ -484,7 +494,7 @@ impl<I: Io> Engine<I> {
         .await?;
         // dcn20_disable_plane: hubp2_set_blank once nothing is outstanding,
         // then the fetch and DPP clocks off.
-        for q in (0..4u8).filter(|&q| disabled & bit(q) != 0) {
+        for q in l.pool.pipes().filter(|&q| disabled & bit(q) != 0) {
             self.wait(
                 l.hubp(q, HUBP_CONTROL),
                 NO_OUTSTANDING,
@@ -659,7 +669,10 @@ impl Surfaces {
         let enabled = used & !old_mask;
         let disabled = old_mask & !used;
         let mut powered = 0u8;
-        for q in (0..4u8).filter(|&q| enabled & bit(q) != 0) {
+        // Every bit of `enabled`: one past the pool (or fused) is refused by
+        // free_pipe; the later loops then see pool pipes only.
+        let pipes = e.layout.pool.pipes();
+        for q in (0..u8::BITS as u8).filter(|&q| enabled & bit(q) != 0) {
             if e.free_pipe(q)? {
                 powered |= bit(q);
             }
@@ -800,7 +813,7 @@ impl Surfaces {
         e.status.state = State::UpdatingPlanes(pipe);
         let mut superseded: Vec<Surface> = Vec::new();
         let result = async {
-            for q in (0..4u8).filter(|&q| enabled & bit(q) != 0) {
+            for q in pipes.clone().filter(|&q| enabled & bit(q) != 0) {
                 if powered & bit(q) == 0 {
                     let on = HubpPower {
                         pipe: q,
@@ -851,7 +864,7 @@ impl Surfaces {
             if owners()? != current {
                 return Err(Error::Busy);
             }
-            for q in (0..4u8).filter(|&q| disabled & bit(q) != 0) {
+            for q in pipes.clone().filter(|&q| disabled & bit(q) != 0) {
                 e.verify_freed(q)?;
             }
             // Every record of the timing carries the new sync.
@@ -886,7 +899,11 @@ impl Surfaces {
                     }
                 }
             }
-            for k in (0..4usize).filter(|&k| disabled & bit(k as u8) != 0) {
+            for k in pipes
+                .clone()
+                .filter(|&q| disabled & bit(q) != 0)
+                .map(usize::from)
+            {
                 let named = applied.iter().any(|s| usize::from(s.request.pipe) == k);
                 if !named {
                     if let Some(old) = self.0[k].take() {

@@ -346,15 +346,16 @@ pub struct ScanoutUnderflow {
 
 impl<I: Io> Engine<I> {
     pub(super) fn dpp_control(&self, pipe: u8) -> u64 {
-        self.layout.base + (DPP_CONTROL + u64::from(pipe) * 0x16b) * 4
+        self.layout.dpp(pipe, DPP_CONTROL)
     }
     fn optc_input(&self, pipe: u8) -> u64 {
-        self.layout.base + (OPTC_INPUT + u64::from(pipe) * 0x10) * 4
+        self.layout.odm(pipe, OPTC_INPUT)
     }
-    /// The only MPCC/DPP/OPP/OTG instance used for a pipe is the pipe itself.
+    /// A one-pipe tree: the pipe's MPCC (its DPP's instance) blends its DPP
+    /// into its own OPP, all the pipe's instance.
     pub(super) fn routes(&self, pipe: u8, connected: bool) -> [(u64, u32); 5] {
         let l = self.layout;
-        let p = u32::from(pipe);
+        let p = l.inst_field(pipe);
         let sel = |v: u32| if connected { v } else { 0xf };
         [
             (l.out_mux(pipe), sel(p)),
@@ -444,10 +445,11 @@ impl<I: Io> Engine<I> {
     }
     pub(super) async fn lock(&mut self, pipe: u8) -> Result<(), Error> {
         let l = self.layout;
+        // optc1_lock: OTG_MASTER_UPDATE_LOCK_SEL = optc->inst.
         self.update(
             l.otg(pipe, GLOBAL_CONTROL2),
             LOCK_SELECT,
-            u32::from(pipe) << 25,
+            l.inst_field(pipe) << 25,
         )?;
         self.update(l.otg(pipe, LOCK), LOCK_REQUEST, LOCK_REQUEST)?;
         // Linux waits only 10 us and proceeds; here the lock must be held.
@@ -621,20 +623,22 @@ impl<I: Io> Engine<I> {
     /// for its planes inserted from the top down, each at the bottom: the
     /// new MPCC alone at the bottom over the background (TOP_LAYER_ONLY),
     /// the one above it then blending over it (TOP_BOT_BLENDING), the first
-    /// (top) one on the OPP's OUT_MUX.
+    /// (top) one on the OPP's OUT_MUX. `opp` and `tree` are pipe indices;
+    /// the selectors take instances (MPCC_TOP_SEL = dpp_id, MPCC_OPP_ID =
+    /// opp_id, MPC_OUT_MUX = mpcc_id = dpp->inst).
     fn insert_tree(&mut self, opp: u8, tree: &[u8]) -> Result<(), Error> {
         let l = self.layout;
         let mut above: Option<u8> = None;
         for &m in tree.iter().rev() {
             self.update(l.mpcc(m, BOTTOM), 0xf, 0xf)?;
             self.update(l.mpcc(m, MPCC_CONTROL), 3, MPCC_MODE_TOP_ONLY)?;
-            self.update(l.mpcc(m, TOP), 0xf, u32::from(m))?;
-            self.update(l.mpcc(m, OPP_ID), 0xf, u32::from(opp))?;
-            self.update(l.mpcc(m, UPDATE_LOCK), 0xf, u32::from(opp))?;
+            self.update(l.mpcc(m, TOP), 0xf, l.inst_field(m))?;
+            self.update(l.mpcc(m, OPP_ID), 0xf, l.inst_field(opp))?;
+            self.update(l.mpcc(m, UPDATE_LOCK), 0xf, l.inst_field(opp))?;
             match above {
-                None => self.update(l.out_mux(opp), 0xf, u32::from(m))?,
+                None => self.update(l.out_mux(opp), 0xf, l.inst_field(m))?,
                 Some(a) => {
-                    self.update(l.mpcc(a, BOTTOM), 0xf, u32::from(m))?;
+                    self.update(l.mpcc(a, BOTTOM), 0xf, l.inst_field(m))?;
                     self.update(l.mpcc(a, MPCC_CONTROL), 3, MPCC_MODE_TOP_BOT)?;
                 }
             }
@@ -839,7 +843,10 @@ impl<I: Io> Engine<I> {
     fn tree_routes(&mut self, live: LivePipe) -> Result<(), Error> {
         let l = self.layout;
         let q = live.pipe;
-        let [mux, top, bot, opp, lock] = live.routes.map(u32::from);
+        // `routes` names pipes; the selectors hold their instances.
+        let [mux, top, bot, opp, lock] =
+            live.routes
+                .map(|r| if r == 0xf { 0xf } else { l.inst_field(r) });
         for (at, value) in [
             (l.out_mux(q), mux),
             (l.mpcc(q, TOP), top),
@@ -1366,6 +1373,9 @@ impl Otg {
             .timing;
         let e = &mut self.0;
         let l = e.layout;
+        if pipe >= l.pool.count() {
+            return Err(Error::Invalid);
+        }
         if e.read(l.otg(pipe, CONTROL))? & 0x10001 != 0x10001 {
             return Err(Error::Busy); // not running
         }
@@ -1395,7 +1405,7 @@ impl Otg {
     /// Make CPU writes to the live surface visible to display fetch: the
     /// native HDP flush used by staged uploads.
     pub fn flush_scanout_writes(&mut self) -> Result<(), Error> {
-        let live = (0..4).any(|d| {
+        let live = self.0.layout.pool.pipes().any(|d| {
             self.display_status(d)
                 .is_some_and(|s| matches!(s.state, State::ScanoutRunning(_)))
         });

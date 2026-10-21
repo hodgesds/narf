@@ -117,6 +117,9 @@ struct Layout {
     base: u64,
     dio: u64,
     idle: [(u64, u32); clocks::IDLE_REG_COUNT],
+    /// The resource pool: a pipe's DPPCLK DTO is its DPP's instance, its
+    /// pixel DTO, DTBCLK_P and dividers its OTG's (dccg401_set_dp_dto).
+    pool: crate::amdgpu_rdna4::PipePool,
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
@@ -142,10 +145,15 @@ impl Layout {
             )
             .map_err(|_| Error::Unsupported)?,
             idle: display.idle_registers(),
+            pool: crate::amdgpu_rdna4::pipe_pool(),
         })
     }
     fn reg(self, index: u64) -> u64 {
         self.base + index * 4
+    }
+    /// Pipe `pipe`'s DPP and OTG instance (`dpp->inst` == `tg->inst`).
+    fn inst(self, pipe: u8) -> u8 {
+        self.pool.hw(pipe)
     }
 }
 trait Io {
@@ -209,8 +217,12 @@ fn dpref_hz(pll: u32, did: u32) -> Result<u32, Error> {
     Ok(hz)
 }
 impl Request {
-    fn validate(self, global: clocks::Applied) -> Result<(), Error> {
-        if self.pipe >= 4 || self.dpp_khz > global.dpp_khz {
+    fn validate(
+        self,
+        global: clocks::Applied,
+        pool: crate::amdgpu_rdna4::PipePool,
+    ) -> Result<(), Error> {
+        if self.pipe >= pool.count() || self.dpp_khz > global.dpp_khz {
             return Err(Error::Invalid);
         }
         if (self.pixel == PixelClock::Disabled) != (self.dpp_khz == 0) {
@@ -224,8 +236,13 @@ impl Request {
         }
         Ok(())
     }
-    fn plan(self, global: clocks::Applied, reference_hz: u32) -> Result<Applied, Error> {
-        self.validate(global)?;
+    fn plan(
+        self,
+        global: clocks::Applied,
+        reference_hz: u32,
+        pool: crate::amdgpu_rdna4::PipePool,
+    ) -> Result<Applied, Error> {
+        self.validate(global, pool)?;
         let dpp_phase = if self.dpp_khz == 0 {
             0
         } else {
@@ -292,7 +309,8 @@ impl<I: Io> Engine<I> {
     }
     fn idle_except(&mut self, held: &dyn Fn(u64) -> bool) -> Result<(), Error> {
         for (at, mask) in self.layout.idle {
-            if !held(at) && self.read(at)? & mask != 0 {
+            // A fused OTG's witnesses are (0, 0): never read.
+            if mask != 0 && !held(at) && self.read(at)? & mask != 0 {
                 return Err(Error::Busy);
             }
         }
@@ -312,7 +330,9 @@ impl<I: Io> Engine<I> {
                 let gates = 3 << (6 + 2 * i);
                 self.update(GATE5, gates, gates)?;
             }
-            self.update_at(at, 15 << shift, (8 | u32::from(pipe)) << shift)?;
+            // DPSTREAMCLK/HDMISTREAMCLK source: the OTG instance.
+            let inst = self.layout.inst(pipe);
+            self.update_at(at, 15 << shift, (8 | u32::from(inst)) << shift)?;
         } else {
             self.update_at(at, 8 << shift, 0)?;
             if let Stream::HpoDp(i) = route.stream {
@@ -327,15 +347,18 @@ impl<I: Io> Engine<I> {
         // history. Do not leave any stream clock fed by a changing pixel DTO.
         let dp = self.read(self.layout.reg(DP_STREAM))?;
         let hdmi = self.read(self.layout.dio + HDMI_STREAM * 4)?;
+        // The muxes name the pipe's OTG instance; HPO stream encoders are
+        // not pipe resources, so all four are checked.
+        let source = 8 | u32::from(self.layout.inst(pipe));
         for i in 0..4 {
-            if (dp >> (4 * i)) & 15 == 8 | u32::from(pipe) {
+            if (dp >> (4 * i)) & 15 == source {
                 self.program_route(StreamRoute {
                     stream: Stream::HpoDp(i),
                     pipe: None,
                 })?;
             }
         }
-        if hdmi & 15 == 8 | u32::from(pipe) {
+        if hdmi & 15 == source {
             self.program_route(StreamRoute {
                 stream: Stream::HdmiFrl,
                 pipe: None,
@@ -344,7 +367,7 @@ impl<I: Io> Engine<I> {
         Ok(())
     }
     fn verify_pipe(&mut self, plan: Applied) -> Result<(), Error> {
-        let pipe = plan.request.pipe;
+        let pipe = self.layout.inst(plan.request.pipe);
         let pixel = PIXEL + 4 * u64::from(pipe);
         let source = if matches!(plan.request.pixel, PixelClock::HdmiFrl { .. }) {
             6
@@ -500,7 +523,9 @@ impl<I: Io> Engine<I> {
                 return Err(Error::Busy);
             }
         }
-        self.update(DP_STREAM, 15 << shift, (8 | u32::from(pipe)) << shift)?;
+        // dccg401_enable_dpstreamclk(otg_inst, dp_hpo_inst).
+        let inst = self.layout.inst(pipe);
+        self.update(DP_STREAM, 15 << shift, (8 | u32::from(inst)) << shift)?;
         self.update(SYMCLK32_SE, 15 << shift, (8 | u32::from(phy)) << shift)?;
         self.status.routes[usize::from(stream)] = Some(StreamRoute {
             stream: Stream::HpoDp(stream),
@@ -562,12 +587,14 @@ impl<I: Io> Engine<I> {
                 continue;
             }
             let phase = (255 * u64::from(dpp_khz)).div_ceil(u64::from(ref_khz)) as u8;
+            // dccg401_update_dpp_dto(dpp_inst).
+            let inst = self.layout.inst(pipe);
             self.update(
-                DPP_PARAM + u64::from(pipe),
+                DPP_PARAM + u64::from(inst),
                 u32::MAX,
                 u32::from(phase) | 0xff << 16,
             )?;
-            self.update(DPP_ENABLE, 1 << (3 * pipe), 1 << (3 * pipe))?;
+            self.update(DPP_ENABLE, 1 << (3 * inst), 1 << (3 * inst))?;
             if let Some(p) = self.status.pipes[usize::from(pipe)].as_mut() {
                 p.dpp_phase = phase;
                 p.request.dpp_khz = dpp_khz;
@@ -605,7 +632,8 @@ impl<I: Io> Engine<I> {
         if self.read(at)? & 8 != 0 {
             return Err(Error::Busy);
         }
-        self.update_at(at, 15, 8 | u32::from(pipe))?;
+        // dccg401_set_hdmistreamclk: the source is the OTG instance.
+        self.update_at(at, 15, 8 | u32::from(self.layout.inst(pipe)))?;
         self.status.routes[4] = Some(StreamRoute {
             stream: Stream::HdmiFrl,
             pipe: Some(pipe),
@@ -637,8 +665,9 @@ impl<I: Io> Engine<I> {
         });
         Ok(())
     }
-    async fn tmds_divider(&mut self, pipe: u8, divider: TmdsDivider) -> Result<(), Error> {
-        let mask = 1 << (5 * pipe);
+    /// `inst` is the OTG instance (dccg401_set_pixel_rate_div(otg_inst)).
+    async fn tmds_divider(&mut self, inst: u8, divider: TmdsDivider) -> Result<(), Error> {
+        let mask = 1 << (5 * inst);
         let value = if divider == TmdsDivider::By4 { mask } else { 0 };
         if self.read(self.layout.reg(PIXEL_DIV))? & mask == value {
             return Ok(());
@@ -664,9 +693,10 @@ impl<I: Io> Engine<I> {
         }
     }
     async fn program(&mut self, plan: Applied) -> Result<(), Error> {
-        let pipe = plan.request.pipe;
+        self.park_pipe_routes(plan.request.pipe)?;
+        // Every register below is per DPP/OTG instance.
+        let pipe = self.layout.inst(plan.request.pipe);
         let pixel = PIXEL + 4 * u64::from(pipe);
-        self.park_pipe_routes(pipe)?;
         if plan.dpp_phase != 0 {
             self.update(
                 DPP_PARAM + u64::from(pipe),
@@ -729,14 +759,14 @@ impl<I: Io> Engine<I> {
         if !matches!(self.status.state, State::Ready | State::Applied) {
             return Err(Error::Busy);
         }
-        request.validate(global)?;
+        request.validate(global, self.layout.pool)?;
         self.idle_except(held)?;
         let reference = match request.pixel {
             PixelClock::DisplayPort { .. } => dpref_hz(self.read(PLL)?, self.read(DPREF)?)?,
             PixelClock::HdmiFrl { .. } => global.dtb_khz.checked_mul(1000).ok_or(Error::Invalid)?,
             _ => 0,
         };
-        let plan = request.plan(global, reference)?;
+        let plan = request.plan(global, reference, self.layout.pool)?;
         self.status.state = State::Applying;
         let result = self.program(plan).await;
         self.status.state = match result {
