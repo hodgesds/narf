@@ -2233,16 +2233,32 @@ fn open_impl_reserved(
     //     ...
     //     error = mnt_want_write(path->mnt);   /* for write intent */
     //
-    // A write-intent open of anything on a read-only mount is EROFS, and a
-    // device node on a `nodev` mount cannot be opened at all. Both are
-    // properties of the MOUNT, so they hold even for root — which is the
-    // point: a sandbox mounts `nodev` precisely so a privileged process
-    // inside it still cannot reach a device.
+    // A write-intent open of a regular file, directory or symlink on a
+    // read-only mount is EROFS, and a device node on a `nodev` mount cannot
+    // be opened at all. Both are properties of the MOUNT, so they hold even
+    // for root — which is the point: a sandbox mounts `nodev` precisely so a
+    // privileged process inside it still cannot reach a device.
+    //
+    // A device, FIFO or socket opened for writing writes to the device, not
+    // to the filesystem: `do_dentry_open` takes mount write access only for
+    // `!special_file(inode->i_mode)`, and `sb_permission` refuses only
+    // S_ISREG/S_ISDIR/S_ISLNK. systemd runs its generators with `/dev`
+    // read-only, and the getty generator's `open("/dev/ttyS0", O_RDWR)`
+    // (like any sandboxed `open("/dev/null", O_RDWR)`) must still work.
     if narf_filesystem::any_restricted_mounts() {
         let mnt = current_mount_flags_at(path);
         if may_write && mnt & narf_filesystem::mnt_flags::READONLY != 0 {
-            ctx.set_return(errno_ret(EROFS)); // -EROFS
-            return;
+            let special = matches!(
+                ops.stat().mode.file_type,
+                narf_filesystem::FileType::Special
+                    | narf_filesystem::FileType::Block
+                    | narf_filesystem::FileType::Socket
+                    | narf_filesystem::FileType::Fifo
+            );
+            if !special {
+                ctx.set_return(errno_ret(EROFS)); // -EROFS
+                return;
+            }
         }
         if mnt & narf_filesystem::mnt_flags::NODEV != 0 {
             let kind = ops.stat().mode.file_type;
