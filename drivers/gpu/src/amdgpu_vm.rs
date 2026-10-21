@@ -611,6 +611,10 @@ pub(crate) async fn relocate(
     if object.system() != to_vram {
         return Ok(());
     }
+    // amdgpu_bo_pin: a pinned buffer (a framebuffer scanned out) never moves.
+    if object.pinned() {
+        return Err(FsError::Busy);
+    }
     let vms: Vec<_> = VMS
         .lock()
         .iter()

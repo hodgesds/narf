@@ -999,6 +999,105 @@ kernel_test_in!(
     suspend_eviction_moves_vram_only_buffers_and_restores_domains
 );
 
+/// amdgpu_dm_plane_helper_prepare_fb's amdgpu_bo_pin on a dGPU: a scanout
+/// buffer is pinned in VRAM (a system one moves there first), the pin's
+/// GPU address is its VRAM reservation's, and while any pin lives the
+/// buffer moves for nothing: no demotion, no pressure eviction, and
+/// suspend's evict_all passes it by (ttm_resource_manager_evict_all only
+/// walks the LRU). The last unpin lets every one of them move it again.
+fn scanout_pin_holds_vram_placement_until_unpinned() -> TestResult {
+    const CARD: u32 = 0xfee6;
+    let mut memory = alloc::vec![0u8; 8 * 4096];
+    let map = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(0xb200_0000),
+        virt: memory.as_mut_ptr() as u64,
+        len: memory.len() as u64,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    // SAFETY: this test exclusively owns memory until the heap and every
+    // object are dropped; no hardware accesses these mappings.
+    let pool = unsafe { crate::amdgpu_vram::Pool::from_owned_range(map, 0x8_0000_0000) }.unwrap();
+    register_vram_heap(
+        CARD,
+        VramHeap {
+            pool: pool.clone(),
+            fb_base: 0x8_0000_0000,
+            fb_offset: 0x9_0000_0000,
+            unmapped: None,
+        },
+    );
+    let state = GemState::for_card(CARD);
+    let vram = u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM);
+    let gtt = u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT);
+    let dcc = {
+        let mut b = [0u8; 32];
+        b[0..8].copy_from_slice(&8192u64.to_le_bytes());
+        b[16..24].copy_from_slice(&vram.to_le_bytes());
+        b[24..32].copy_from_slice(&u64::from(uapi::AMDGPU_GEM_CREATE_GFX12_DCC).to_le_bytes());
+        dispatch(
+            amd(uapi::DRM_AMDGPU_GEM_CREATE),
+            b.as_mut_ptr() as usize,
+            &state,
+        )
+        .unwrap();
+        state
+            .get(u32::from_le_bytes(b[0..4].try_into().unwrap()))
+            .unwrap()
+    };
+    assert!(!dcc.system() && !dcc.pinned());
+    let pin = dcc.pin_scanout().unwrap();
+    // amdgpu_bo_gpu_offset: the VRAM reservation's aperture address.
+    let address = pin.address();
+    assert!((0x8_0000_0000..0x8_0000_8000).contains(&address));
+    assert_eq!(pin.byte_len(), 8192);
+    assert!(dcc.pinned());
+    // Pinned twice (the old and the new commit's plane state), unpinned
+    // only by the last.
+    let again = dcc.pin_scanout().unwrap();
+    assert_eq!(again.address(), address);
+    assert_eq!(dcc.relocate(false), Err(FsError::Busy));
+    let (touched, result) = narf_scheduler::block_on_spin(async {
+        let gate = lock_placement(CARD).await;
+        evict_all(&gate).await
+    });
+    assert_eq!(result, Ok(()));
+    assert!(touched.is_empty() && !dcc.system());
+    restore_domains(touched);
+    let moved = narf_scheduler::block_on_spin(async {
+        let gate = lock_placement(CARD).await;
+        crate::amdgpu_vm::relocate(&gate, &dcc, false).await
+    });
+    assert_eq!(moved, Err(FsError::Busy));
+    drop(again);
+    assert!(dcc.pinned() && dcc.gpu_at(0).is_some());
+    drop(pin);
+    assert!(!dcc.pinned());
+    // A buffer in system memory moves to VRAM to be pinned there.
+    let both = state.get(create(&state, 4096, vram | gtt)).unwrap();
+    assert_eq!(both.relocate(false), Ok(()));
+    assert!(both.system());
+    let pin = both.pin_scanout().unwrap();
+    assert!(!both.system() && pin.address() >= 0x8_0000_0000);
+    drop(pin);
+    // One VRAM is not allowed for is refused.
+    let system_only = state.get(create(&state, 4096, gtt)).unwrap();
+    assert_eq!(system_only.pin_scanout().err(), Some(FsError::InvalidData));
+    // Unpinned, evict_all moves them all again.
+    let (touched, result) = narf_scheduler::block_on_spin(async {
+        let gate = lock_placement(CARD).await;
+        evict_all(&gate).await
+    });
+    assert_eq!(result, Ok(()));
+    assert!(dcc.system() && both.system());
+    restore_domains(touched);
+    unregister_vram_heap(CARD);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/render-abi",
+    scanout_pin_holds_vram_placement_until_unpinned
+);
+
 /// amdgpu_gem_userptr_ioctl argument checks, which run before any page is
 /// touched: alignment and flags EINVAL, a writable range without REGISTER
 /// EACCES; a kernel task (no user address space) faults.
@@ -1075,6 +1174,7 @@ fn userptr_backing_follows_pins_and_refuses_mmap_export_and_moves() -> TestResul
         metadata: IrqSafeSpinLock::new(Metadata::default()),
         card: Some(0xfee5),
         dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
+        pin_count: AtomicU32::new(0),
     });
     assert!(object.is_userptr());
     assert_eq!(object.frames(0, 2 * 4096).unwrap(), [a, b]);

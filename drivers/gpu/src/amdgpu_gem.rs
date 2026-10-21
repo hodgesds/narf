@@ -368,6 +368,9 @@ pub struct GemObject {
     /// The reservation and name every PRIME export of it shares, as Linux
     /// keeps one dma_buf per GEM object.
     dma_buf: Arc<narf_filesystem::dma_buf::DmaBufObject>,
+    /// `tbo.pin_count`: live [`ScanoutPin`]s. A pinned buffer never moves
+    /// (no eviction, demotion or suspend eviction) until the last unpin.
+    pin_count: AtomicU32,
 }
 
 /// One address-stable backing generation. Retain an Arc while raw CPU frames,
@@ -401,6 +404,42 @@ impl core::ops::Deref for GemMapping {
     type Target = GemPlacement;
     fn deref(&self) -> &Self::Target {
         &self.placement
+    }
+}
+
+/// A buffer pinned for scanout (`GemObject::pin_scanout`): it holds the
+/// buffer and its VRAM placement, which nothing moves, evicts or frees
+/// while any pin lives (amdgpu_bo_unpin on drop, which
+/// amdgpu_dm_plane_helper_cleanup_fb runs only after the flip that
+/// replaced the framebuffer).
+#[derive(Debug)]
+pub struct ScanoutPin {
+    object: Arc<GemObject>,
+    placement: Arc<GemPlacement>,
+    /// The placement's GPU (frame-buffer aperture) address, which display
+    /// fetch takes: amdgpu_bo_gpu_offset.
+    address: u64,
+}
+impl ScanoutPin {
+    /// amdgpu_bo_gpu_offset: where display fetches byte 0.
+    pub fn address(&self) -> u64 {
+        self.address
+    }
+    pub fn object(&self) -> &Arc<GemObject> {
+        &self.object
+    }
+    /// The pinned placement's size.
+    pub fn byte_len(&self) -> u64 {
+        self.placement.byte_len
+    }
+    /// The pinned placement, for CPU copies of a buffer the CPU reaches.
+    pub fn placement(&self) -> &Arc<GemPlacement> {
+        &self.placement
+    }
+}
+impl Drop for ScanoutPin {
+    fn drop(&mut self) {
+        self.object.pin_count.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -447,6 +486,7 @@ impl GemObject {
                 != 0
         };
         if !allowed
+            || self.pinned()
             || !Arc::ptr_eq(&placement, source)
             || Arc::strong_count(&placement) != 2
             || Arc::weak_count(&placement) != 0
@@ -474,6 +514,48 @@ impl GemObject {
     pub fn preferred_domains(&self) -> u64 {
         self.preferred_domains.load(Ordering::Acquire)
     }
+    /// Whether a [`ScanoutPin`] holds the buffer where it is.
+    pub fn pinned(&self) -> bool {
+        self.pin_count.load(Ordering::Acquire) != 0
+    }
+    /// The tiling flags `GEM_METADATA` last set (amdgpu_bo_get_tiling_flags).
+    pub fn tiling_flags(&self) -> u64 {
+        self.metadata.lock().tiling
+    }
+    /// amdgpu_dm_plane_helper_prepare_fb's pin of a framebuffer's buffer:
+    /// `amdgpu_bo_pin(rbo, amdgpu_display_supported_domains(...))` with
+    /// AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS. On a dGPU (no gpu_vm_support) the
+    /// display domain is VRAM alone, so a GFX12 DCC buffer, like any other,
+    /// is scanned out of VRAM only: a buffer in system memory moves to VRAM
+    /// first (amdgpu_bo_pin's validation), which needs it unshared by any
+    /// other address lease and idle; a buffer VRAM is not allowed for, a
+    /// userptr or a foreign dma-buf is refused (as amdgpu_bo_pin refuses a
+    /// userptr). A VRAM placement is one reservation, so it is contiguous.
+    /// The pin keeps the buffer, and that placement, until it drops.
+    pub fn pin_scanout(self: &Arc<Self>) -> Result<ScanoutPin, FsError> {
+        if self.allowed_domains.load(Ordering::Acquire) & u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM)
+            == 0
+        {
+            return Err(FsError::InvalidData);
+        }
+        if self.system() && !self.pinned() {
+            self.relocate(true)?;
+        }
+        let placement = self.placement.lock();
+        let address = match &placement.backing {
+            Backing::Vram { _held } => _held.address(),
+            Backing::Unmapped { _held } => _held.address(),
+            _ => return Err(FsError::Busy),
+        };
+        // Under the placement lock: no move can start between the check and
+        // the count, and the pin's lease alone already stops one.
+        self.pin_count.fetch_add(1, Ordering::AcqRel);
+        Ok(ScanoutPin {
+            object: Arc::clone(self),
+            placement: Arc::clone(&placement),
+            address,
+        })
+    }
     /// Acquire an address lease before exposing physical frames or PTEs.
     pub fn placement(&self) -> Arc<GemPlacement> {
         Arc::clone(&self.placement.lock())
@@ -494,6 +576,7 @@ impl GemObject {
         };
         let mut placement = self.placement.lock();
         if self.allowed_domains.load(Ordering::Acquire) & target == 0
+            || self.pinned()
             || matches!(
                 placement.backing,
                 Backing::User(_) | Backing::Foreign { .. }
@@ -802,6 +885,45 @@ impl GemPlacement {
         })
     }
 
+    /// Copy `out.len()` bytes from byte `offset` of a buffer the CPU
+    /// reaches (system pages through the direct map, VRAM through its BAR
+    /// window); None past its end or for VRAM beyond the BAR.
+    pub fn read_bytes(&self, offset: u64, out: &mut [u8]) -> Option<()> {
+        let end = offset.checked_add(out.len() as u64)?;
+        if end > self.byte_len {
+            return None;
+        }
+        match &self.backing {
+            Backing::Unmapped { .. } => return None,
+            Backing::Vram { _held } => {
+                let at = _held.mapping().virt + offset;
+                // SAFETY: the reservation's BAR window covers `byte_len`
+                // bytes and lives while `self` does; bounds checked above.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(at as *const u8, out.as_mut_ptr(), out.len())
+                };
+            }
+            _ => {
+                let mut done = 0;
+                while done < out.len() {
+                    let (phys, run) = self.locate(offset + done as u64)?;
+                    let count = (run as usize).min(out.len() - done);
+                    // SAFETY: locate bounds the run inside this buffer's
+                    // retained frames, which the kernel maps.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>(),
+                            out.as_mut_ptr().add(done),
+                            count,
+                        );
+                    }
+                    done += count;
+                }
+            }
+        }
+        Some(())
+    }
+
     /// The 64-bit value at byte `offset`, read by the CPU.
     pub fn load_u64(&self, offset: u64) -> Option<u64> {
         let at = self.cpu_ptr(offset)?;
@@ -919,7 +1041,7 @@ fn evict_visible(card: u32, pool: &crate::amdgpu_vram::Pool, bytes: u64, alignme
     for table in tables {
         let objects: Vec<_> = table.lock().values().cloned().collect();
         for object in objects {
-            if !object.system() {
+            if !object.system() && !object.pinned() {
                 let _ = object.relocate(false);
                 if pool.reserve_aligned(bytes, alignment).is_ok() {
                     return;
@@ -931,7 +1053,9 @@ fn evict_visible(card: u32, pool: &crate::amdgpu_vram::Pool, bytes: u64, alignme
 
 /// System suspend (`ttm_resource_manager_evict_all`): move every VRAM buffer
 /// of `gate`'s card to system memory, waiting for its jobs, whatever its
-/// allowed domains (each gains GTT for the move). Returns every touched
+/// allowed domains (each gains GTT for the move). A pinned buffer (a
+/// framebuffer still scanned out) is not on TTM's LRU and stays where it
+/// is, as `ttm_resource_manager_evict_all` leaves it. Returns every touched
 /// buffer with its original allowed domains, which the caller restores on
 /// resume or on failure ([`restore_domains`]); the first refusal stops the
 /// eviction and is returned with the list so far.
@@ -949,7 +1073,10 @@ pub(crate) async fn evict_all(
     for table in tables {
         let objects: Vec<_> = table.lock().values().cloned().collect();
         for object in objects {
-            if object.system() || touched.iter().any(|(o, _)| Arc::ptr_eq(o, &object)) {
+            if object.system()
+                || object.pinned()
+                || touched.iter().any(|(o, _)| Arc::ptr_eq(o, &object))
+            {
                 continue;
             }
             let original = object
@@ -1172,6 +1299,7 @@ impl GemState {
             metadata: IrqSafeSpinLock::new(Metadata::default()),
             card: self.card,
             dma_buf,
+            pin_count: AtomicU32::new(0),
         })
     }
 
@@ -1438,6 +1566,7 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
             metadata: IrqSafeSpinLock::new(Metadata::default()),
             card: state.card,
             dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
+            pin_count: AtomicU32::new(0),
         };
         object
             .dma_buf
@@ -1490,6 +1619,7 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
                 metadata: IrqSafeSpinLock::new(Metadata::default()),
                 card: state.card,
                 dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
+                pin_count: AtomicU32::new(0),
             }
         }
         None if domains == u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM)
@@ -1519,6 +1649,7 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
                 metadata: IrqSafeSpinLock::new(Metadata::default()),
                 card: state.card,
                 dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
+                pin_count: AtomicU32::new(0),
             }
         }
     };
@@ -1607,6 +1738,7 @@ fn userptr(state: &GemState, arg: usize) -> Result<u64, FsError> {
         metadata: IrqSafeSpinLock::new(Metadata::default()),
         card: state.card,
         dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
+        pin_count: AtomicU32::new(0),
     };
     let handle = state.insert(object)?;
     // SAFETY: as above; `handle` is the struct's last field.
