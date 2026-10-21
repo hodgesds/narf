@@ -4054,8 +4054,9 @@ reach them on DCN 4.0.1.
 Option<OgamProgram> }` is what a CRTC programs. `ColorProgram::from_crtc(ctm,
 gamma_lut)` maps blobs as amdgpu_dm_update_crtc_color_mgmt and
 amdgpu_dm_update_plane_color_mgmt do: a 256-entry GAMMA_LUT is legacy gamma
-(sRGB-based regamma, the plane input linearized by the PRE_DEGAM sRGB ROM,
-whatever its values); a 4096-entry one regammas unless it is linear, which
+(sRGB-based regamma, the plane input linearized by the PRE_DEGAM ROM of
+its format's implicit degamma, sRGB or an NV12 plane's BT.709, see "Plane
+input color", whatever its values); a 4096-entry one regammas unless it is linear, which
 like no LUT bypasses the OGAM; any CTM is a gamut remap. On each of a
 display's pipes (both ODM halves; with overlays, the gamut remap and regamma
 on each segment's top MPCC only and bypass below it, the input transfer
@@ -4465,9 +4466,14 @@ SW_MODE the swizzle (hubp401_program_tiling), PITCH and PITCH_C
 viewport, and the chroma address before the luma's
 (hubp401_program_surface_flip_and_addr), also on flips and at scanout start
 (`Engine::write_fetch_address`). DPP: CNVC_SURFACE_PIXEL_FORMAT 64/66 and,
-for 4:2:0, CM_POST_CSC set A with the color space's dpp_input_csc_matrix
+for 4:2:0, CM_POST_CSC with the color space's dpp_input_csc_matrix
 (dpp401_dpp_setup's INPUT_CSC_SELECT_ICSC, dpp3_program_post_csc,
-cm_helper_program_color_matrices' packing). SPL takes `spl::Video`
+cm_helper_program_color_matrices' packing), double-buffered as
+dpp3_program_post_csc does it: the matrix goes into the coefficient set not
+in use (B, CM_POST_CSC_B_* with COMA selected, when
+CM_POST_CSC_MODE_CURRENT reads A; A otherwise: `dpp::post_csc_set_b`),
+recorded in `DppApplied::post_csc_b`, so a live color-space change latches
+whole at VUPDATE. SPL takes `spl::Video`
 (SPL_PIXEL_FORMAT_420BPP8/10): chroma ratios/viewports/inits/taps, the 420
 SCL modes, chroma coefficient loads, EASF's video rules, LB config 3; a 4:2:0
 plane always goes through `spl::calculate` (its chroma is upscaled even
@@ -4483,20 +4489,116 @@ value outside the enum is EINVAL). `drm_native_planes::plane_surface`
 gives each plane's `PlaneGeometry::surface` (fill_plane_color_attributes'
 color space) and `fb_size`; a tiled or 4:2:0 plane is staged as its whole
 framebuffer with the source rectangle placed in it
-(`PlaneGeometry::whole_framebuffer`), so such a primary is always placed,
-and the presenter copies it whole, block row by block row
-(`copy_whole_plane`, `upload_display_plane_back_bytes`); a frame of another
-tiling than shown waits for the plane update its plane change requested.
+(`PlaneGeometry::whole_framebuffer`), so such a primary is always placed; a
+dumb framebuffer of it is copied whole, block row by block row
+(`copy_whole_plane`, `upload_display_plane_back_bytes`), a GEM one is
+scanned out in place (below); a frame of another tiling than shown waits
+for the plane update its plane change requested.
+
+**Client framebuffers scanned out in place.** On the native card ADDFB2
+also takes one of the calling open's amdgpu GEM handles
+(amdgpu_display_user_framebuffer_create's drm_gem_object_lookup in the
+file's table: `drm_ioctl_bridge::amdgpu_addfb2_bo`, dispatched by
+`DriCardFile` before the card's ADDFB2, then `Card::addfb2_bo`), checked as
+a dumb one is but against the buffer's own size, its `GEM_METADATA` tiling
+flags (`GemObject::tiling_flags`) and AMDGPU_GEM_CREATE_GFX12_DCC
+(amdgpu_display_get_fb_info). `Framebuffer::bo` (`FbBo`: the
+`GemObject`, which the framebuffer holds, and the owning open) is removed
+with RMFB or, at the open's close, by `Card::release_file_framebuffers`
+(drm_fb_release). Showing it (atomic, SETCRTC, PAGE_FLIP, SETPLANE:
+`drm_ioctl_bridge::scanout_frame`) is amdgpu_dm_plane_helper_prepare_fb:
+`GemObject::pin_scanout` pins the buffer with
+amdgpu_display_supported_domains' domain, which on this dGPU (no
+gpu_vm_support) is VRAM alone, DCC buffers included: a VRAM placement is
+one contiguous reservation; a buffer in system memory moves to VRAM first
+when nothing else leases it; one VRAM is not allowed for, a userptr or a
+foreign dma-buf is refused. `ScanoutPin` (amdgpu_bo_unpin on drop) keeps the
+buffer and its placement: while any pin lives `GemObject::pinned` stops
+`relocate`, `commit_transfer`, pressure eviction (`evict_visible`) and
+`amdgpu_vm::relocate`, and `evict_all` passes the buffer by (TTM's LRU walk
+does not see pinned buffers). The presenter frame (`PlaneFrame::bo`) carries
+the pin; it waits up to 5 s for the buffer's WRITE fences
+(amdgpu_dm_commit_planes' dma_resv_wait_timeout) and flips the plane to the
+buffer's own GPU address with no copy (`PlaneFrame::external`: the pin's
+address plus offsets[0], pitches[0], the chroma plane at offsets[1] with
+pitches[1]; a linear RGB plane, whose surface is its source rectangle,
+starts at the rectangle; `place_plane`, `ColdBoot::flip_display_sources`).
+`otg::FlipSource` is `Back` (the staged back buffer the presenter copied a
+dumb framebuffer into) or `External(otg::ExternalSurface)`;
+`Surfaces::flip_sources` re-addresses every flipping plane under the one OTG
+lock and, when a client framebuffer's pitch differs from the plane's
+programmed one, writes DCSURF_SURFACE_PITCH/PITCH_C under the same lock
+(DC's MED plane_size update; `write_fetch_pitch`), DML keeping the staged
+pitch it admitted. A client framebuffer must lie in the frame-buffer
+aperture, start 256-byte aligned, hold every fetched row at a pitch of
+whole pixels no narrower than the staged one, and have a chroma plane
+exactly when the plane is 4:2:0; otherwise the flip is refused before any
+register changes and the display keeps scanning what it showed.
+`SurfaceApplied::chroma` carries the chroma offset and pitch HUBP fetches
+with (`SurfaceApplied::staged` / `at_staged` for the staged buffers); a
+plane flipped to a client framebuffer keeps both staged buffers unfetched,
+a flip back to its back buffer swaps them as before; a seamless plane
+update keeps a kept plane's client framebuffer with its pitch, and one that
+puts a plane on fresh surfaces scans the commit's GEM framebuffer in place
+from the update itself (`otg::PlaneContent::external` through
+`boot::FirstFrames::external` and the platform's `CommitFrames`: the update
+programs its address and pitches under the lock, copies no chunk, leaves the
+fresh staged buffers cleared, and the pin joins the display's), as DC
+programs a new plane's address in the update that adds it; a restage
+returns to the staged buffers. `scanout_framebuffer` has no CPU view of a
+client framebuffer, so the console leaves a display that scans one
+(`follow_flip`). Unpinning is amdgpu_dm_plane_helper_cleanup_fb after the
+flip that replaced it: the display's `PresentSlot` keeps every pin it may
+fetch and `retire_scanout_pins` drops one only when
+`ColdBoot::display_fetched_addresses` (`Otg::fetched_addresses`: each
+plane's latched address while scanning out, none at rest, unknown while a
+change is in flight or after a failure) shows no plane fetching it (after
+each presenter flip, `flip_display`, and every display-monitor pass).
+`release_client_scanout` is dm_suspend's (and the lastclose restore's)
+commit: every plane still fetching a client framebuffer flips back to its
+back buffer and the pins retire, before system suspend evicts VRAM and
+after the last card close. A cursor plane's GEM framebuffer is pinned in
+VRAM and copied for the hardware cursor (`GemPlacement::read_bytes`), as
+dumb ones are. Dumb buffers stay in system memory, which a dGPU display
+never fetches (Linux would migrate them to VRAM to pin them), so they keep
+the CPU copy.
 SETCRTC admits such a framebuffer as a placed primary
 (`drm_native_planes::setcrtc_planes`), PAGE_FLIP requests the display's
 planes so a tiling change is a plane update.
 
+**Plane input color.** amdgpu_dm exposes no plane color property on DCN
+4.0.1 by default: the plane DEGAMMA/HDR multiplier/CTM/shaper/3D/blend LUT
+properties are AMD_PRIVATE_COLOR only, and the COLOR_PIPELINE (drm_colorop)
+property only reaches clients with DRM_CLIENT_CAP_PLANE_COLOR_PIPELINE,
+which NARF does not implement. amdgpu_dm_update_plane_color_mgmt then
+bypasses the input transfer function unless the CRTC's legacy (256-entry)
+gamma sets cm_is_degamma_srgb, when map_crtc_degamma_to_dc_plane gives each
+plane a predefined degamma by format (`otg::PreDegam::implicit`): BT.709
+for NV12 (DC's VIDEO_420_YCrCb; "no transfer function for BT601"), sRGB for
+RGB and P010 (VIDEO_420_10bpc_YCrCb is not in its switch).
+dcn32_set_input_transfer_func hands it to dpp3_set_pre_degam (PRE_DEGAM
+mode 1, select 0 sRGB, 4 BT.709; `PipeColor::pre_degam`, programmed per
+fetching DPP by `Engine::input_tf`). Every DPP setup also programs the
+cursor matrix as dcn401's hwseq does after dpp_setup:
+dpp401_set_cursor_matrix forces COLOR_SPACE_UNKNOWN, so CUR0_MATRIX_MODE is
+bypass over RGB and YCbCr planes alike (`dpp::CURSOR_MATRIX_WORD`). The
+cursor's attributes carry amdgpu_dm's ENABLE_CURSOR_DEGAMMA under legacy
+gamma (DCN401's dpp gamma_corr cap), which dpp401_set_cursor_attributes
+makes CUR0_ROM_EN for the premultiplied cursor
+(`CursorApplied::degamma`, from the CRTC with every attribute update, a
+move included). `tests/dcn401_yuv/check.sh` also checks 540 vectors
+(`color_vectors.txt`: format, legacy gamma, CM_POST_CSC_MODE_CURRENT,
+encoding, range) of those Linux functions compiled verbatim, replayed by
+`dcn401_dpp_color_input_matches_linux_vectors`.
+
 Gaps: planes on an ODM stream
 must reach every segment; no
 RGBA8888 or 16-bit UNORM planes, no NV21 (not
-on DCN4's universal planes), no plane degamma/CTM; DCC data is CPU-copied into the
-owned surface (so written uncompressed) and the post CSC always loads set
-A; the cursor matrix of a YCbCr primary is not programmed; offered alternative modes are admitted without the
+on DCN4's universal planes), no COLOR_PIPELINE plane color (nor Linux's
+AMD_PRIVATE_COLOR properties); DML admits a client framebuffer at the
+staged (minimum) pitch; a linear RGB GEM framebuffer whose source rectangle
+starts off a 256-byte boundary is not shown (DC offsets the viewport); the
+cursor image is still copied out of its buffer; offered alternative modes are admitted without the
 display's overlays, and KMS admits planes only on the lit timing (a mode
 switch with overlays relights and falls back if they no longer fit).
 OBJ_SETPROPERTY (and the connector-only SETPROPERTY) on any connector,
@@ -4734,8 +4836,9 @@ VUPDATE, and the commit's flip event completes with that flip; a frame
 queued after the update copied the planes shows from that flip too; a
 change of the stream's ODM split (or another display's pipes) still
 relights; MST displays relight; no DCC/compbuf or MALL/SubVP
-reprogramming beyond the default DET; the cursor matrix of a YCbCr plane is
-not programmed (its cursor colors pass unconverted). DRM cursor planes are
+reprogramming beyond the default DET. The cursor matrix stays bypassed over
+YCbCr planes as dcn401 leaves it (dpp401_set_cursor_matrix), its degamma ROM
+following legacy gamma ("Plane input color"). DRM cursor planes are
 described in "Navi 48 DRM cursor planes".
 Model-tested only (`dcn401-plane-update`, `dcn401-cursor`,
 `dcn401-scanout`, `navi48-modeset`, `navi48-kms`); not validated on
@@ -6876,10 +6979,14 @@ them paused. User CPU mappings of VRAM are not revoked, as in Linux.
 
 System suspend (S3) uses the async system-PM phase
 (`unsafe register_system_pm()`, installed by the fb boot handoff).
-`prepare_suspend` follows amdgpu_pmops_suspend for a dGPU: it unregisters
+`prepare_suspend` follows amdgpu_pmops_suspend for a dGPU: every plane
+still scanning a client framebuffer out in place flips back to its staged
+back buffer and the pins retire (`release_client_scanout`, as dm_suspend's
+commit makes cleanup_fb unpin them), then it unregisters
 the client VRAM heap and evicts every client VRAM buffer to system memory
 (`amdgpu_gem::evict_all`, as ttm_resource_manager_evict_all, widening each
-buffer's allowed domains with GTT for the move and waiting for its jobs),
+buffer's allowed domains with GTT for the move and waiting for its jobs;
+a buffer still pinned stays in VRAM, as it is not on TTM's LRU),
 pauses kernel boot-framebuffer writers, then quiesces exactly as recovery
 does and saves PCI state with bus mastering cleared
 (`Reset::save_for_resume`). A refused eviction or preflight leaves the
