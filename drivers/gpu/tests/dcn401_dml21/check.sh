@@ -51,10 +51,20 @@
 # "! PixelClock dfs" lines are as vectors.txt's.
 # surface_vectors.txt (GFX12 tiled, DCC and 4:2:0 planes) is checked with
 # harness_surfaces.c as plane_vectors.txt, each plan line exact; its
-# "! ClockState" lines are RAISED plans and its "! Unsupported" lines plans
-# that split a DCC plane over two MPC-combined pipes (its mcaches do not fit
-# one), which the port does not admit. --regenerate-surfaces answers its
-# inputs again.
+# "! ClockState" lines are RAISED plans. A DCC plane whose mcaches one pipe
+# cannot place is split over two MPC-combined pipes ("/2" and the pipe-0
+# blank end) by pmo_dcn4_fams2_optimize_dcc_mcache whatever the factor, or
+# on a single ODM stream gets one more ODM pipe. The harnesses run PMO as
+# DC does on DCN401 (disable_dyn_odm false), every stream's
+# disable_dynamic_odm set (NARF does not port the Vmin phase's dynamic ODM);
+# each plane's DET is the 320 KiB DCN4_01_DEFAULT_DET_SIZE NARF programs
+# (det_size_override_kb, which DC never sets: DC lets CalculateDETBufferSize
+# share the 1280 KiB with minimize_det_reallocation).
+# --regenerate-surfaces answers its inputs again.
+# surface_mpc_vectors.txt is as surface_vectors.txt, planned with MPC_AUTO
+# (DC's auto mpcc_combine_factor): tiled, DCC, rotated and 4:2:0 planes one
+# DPP cannot carry take two. --regenerate-surface-mpc answers its inputs
+# again.
 # odm34_vectors.txt lines are "<bytes per pixel> <DSC slices> <DSC bpp_x16>
 # <4:2:0>" then a multi_vectors.txt line, each stream's plane at that depth,
 # compressed so unless the slices are 0 and leaving as HDMI 4:2:0 if the
@@ -66,9 +76,14 @@
 # mpc_vectors.txt is as plane_vectors.txt, planned with MPC_AUTO (DC's auto
 # mpcc_combine_factor, where every other file forces 1): planes one DPP
 # cannot carry take two ("/2"). --regenerate-mpc answers its inputs again.
+# pstate_vectors.txt is checked with harness_pstate.c: DCN401's PMO left on
+# (the UCLK P-state strategy search, with or without FAMS2 firmware) over a
+# board's whole UCLK DPM table; each line is Linux's chosen strategy, latency
+# level, DPMM minimums, plans, FAMS2 stream states and candidate list.
+# --regenerate-pstate answers its inputs again.
 set -euo pipefail
 case ${1:-} in
---regenerate-odm34 | --regenerate-mpc)
+--regenerate-odm34 | --regenerate-mpc | --regenerate-surface-mpc | --regenerate-pstate)
 	regenerate=$1
 	shift ;;
 *) regenerate= ;;
@@ -119,27 +134,55 @@ cc -O1 -w "${inc[@]}" "$here/harness.c" "$work/obj/dml2_core_dcn4_calcs.o" $othe
 cc -O1 -w "${inc[@]}" "$here/harness.c" "$work/strict_calcs.o" $others -lm -o "$work/strict"
 cc -O1 -w "${inc[@]}" "$here/harness_multi.c" "$work/strict_calcs.o" $others -lm -o "$work/strict_multi"
 cc -O1 -w "${inc[@]}" "$here/harness_planes.c" "$work/strict_calcs.o" $others -lm -o "$work/strict_planes"
-cc -O1 -w "${inc[@]}" "$here/harness_surfaces.c" "$work/strict_calcs.o" $others -lm -o "$work/strict_surfaces"
+# The mcache programming's per-pipe viewports come from SPL (dc/sspl), built
+# as tests/dcn401_spl builds it, in its own unit (spl_viewport.c).
+sspl=$linux/drivers/gpu/drm/amd/display/dc/sspl
+spl_inc=(-I"$here/../dcn401_spl/include" -I"$sspl" -I"$work" -I"$linux/drivers/gpu/drm/amd/include")
+awk '/^void dscl401_spl_calc_lb_num_partitions\(/ { on = 1 }
+	on { print }
+	on && /^}/ { exit }' "$linux/drivers/gpu/drm/amd/display/dc/dpp/dcn401/dcn401_dpp.c" \
+	> "$work/spl_lb.inc"
+[ -s "$work/spl_lb.inc" ] || { echo "dscl401_spl_calc_lb_num_partitions not found" >&2; exit 1; }
+mkdir -p "$work/spl"
+for f in dc_spl dc_spl_scl_filters dc_spl_scl_easf_filters dc_spl_isharp_filters \
+	dc_spl_filters spl_fixpt31_32 spl_custom_float; do
+	cc -c -O1 -w -Wno-error=incompatible-pointer-types "${spl_inc[@]}" "$sspl/$f.c" -o "$work/spl/$f.o"
+done
+cc -c -O1 -w "${spl_inc[@]}" "$here/spl_viewport.c" -o "$work/spl/spl_viewport.o"
+cc -O1 -w "${inc[@]}" "$here/harness_surfaces.c" "$work/strict_calcs.o" $others "$work"/spl/*.o -lm -o "$work/strict_surfaces"
+cc -O1 -w "${inc[@]}" "$here/harness_pstate.c" "$work/strict_calcs.o" $others -lm -o "$work/strict_pstate"
+
+# pstate_answer: answer pstate_vectors.txt inputs from stdin with Linux
+# (harness_pstate.c).
+pstate_answer() {
+	local line out a
+	while read -r line; do
+		read -ra a <<< "$line"
+		out=$("$work/strict_pstate" "${a[@]}")
+		case $out in
+		PSTATE*) echo "$line = ${out#PSTATE }" ;;
+		*) echo "$line ! REJECT" ;;
+		esac
+	done
+}
 
 # surface_answer <inputs> <strict_surfaces output>: the surface_vectors.txt
-# result. A plane on two pipes with the pipe-0 blank end is MPC combine.
+# (and surface_mpc_vectors.txt) result.
 surface_answer() {
 	case $2 in
-	PLAN*)
-		if echo "${2#PLAN }" | awk '{ f = 0
-			for (i = 1; i <= NF; i++) {
-				if ($i == "|") { f = 0; continue }
-				if ($i == "/2") { if ($(i + 1) == end) mpc = 1; i++; continue }
-				if (f == 13) end = $i
-				f++ } }
-			END { exit !mpc }'; then
-			echo "$1 ! Unsupported"
-		else
-			echo "$1 = ${2#PLAN }"
-		fi ;;
+	PLAN*) echo "$1 = ${2#PLAN }" ;;
 	RAISED) echo "$1 ! ClockState" ;;
 	*) echo "$1 ! REJECT" ;;
 	esac
+}
+# surface_mpc_answer: answer surface_mpc_vectors.txt inputs from stdin with
+# Linux (harness_surfaces.c, RAISED, MPC_AUTO).
+surface_mpc_answer() {
+	local line a
+	while read -r line; do
+		read -ra a <<< "$line"
+		surface_answer "$line" "$(RAISED=1 MPC_AUTO=1 "$work/strict_surfaces" "${a[@]}")"
+	done
 }
 if [ $generate_surfaces -eq 1 ]; then
 	while IFS= read -r line; do
@@ -223,6 +266,12 @@ if [ "$regenerate" = --regenerate-odm34 ]; then
 	exit 0
 elif [ "$regenerate" = --regenerate-mpc ]; then
 	regenerate_file "$here/mpc_vectors.txt" mpc_answer
+	exit 0
+elif [ "$regenerate" = --regenerate-surface-mpc ]; then
+	regenerate_file "$here/surface_mpc_vectors.txt" surface_mpc_answer
+	exit 0
+elif [ "$regenerate" = --regenerate-pstate ]; then
+	regenerate_file "$here/pstate_vectors.txt" pstate_answer
 	exit 0
 fi
 
@@ -561,4 +610,13 @@ check_answered() {
 check_surfaces "$here/surface_vectors.txt" || mfail=1
 check_answered "$here/odm34_vectors.txt" odm34_answer || mfail=1
 check_answered "$here/mpc_vectors.txt" mpc_answer || mfail=1
+check_answered "$here/surface_mpc_vectors.txt" surface_mpc_answer || mfail=1
+check_answered "$here/pstate_vectors.txt" pstate_answer || mfail=1
+# pstate_strategies.txt: PMO's expanded strategy list per display count.
+if "$work/strict_pstate" --strategies | cmp -s - "$here/pstate_strategies.txt"; then
+	echo "dcn401 DML21 pstate_strategies: lists match"
+else
+	echo "MISMATCH: pstate_strategies.txt" >&2
+	mfail=1
+fi
 [ $fail -eq 0 ] && [ $mfail -eq 0 ]

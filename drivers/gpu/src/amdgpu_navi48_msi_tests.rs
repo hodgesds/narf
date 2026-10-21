@@ -66,6 +66,7 @@ fn fixture(address64: bool, masks: bool) -> (Fake, Layout) {
     (
         io,
         Layout {
+            id: 0x75501002,
             msi: 0x80,
             msix: Some(0xa0),
             nbio: 0x603c4,

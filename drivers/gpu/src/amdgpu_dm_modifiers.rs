@@ -576,9 +576,11 @@ pub fn check_amdgpu_fb(
 }
 
 /// DCN401's dc caps `dcc_plane_width_limit`: set only for a GC 12.0.0
-/// (external revision 0x40..0x50) part. The RX 9070 XT is GC 12.0.1, whose
-/// external revision is rev_id + 0x50, so it has none.
-const DCC_PLANE_WIDTH_LIMIT: u32 = 0;
+/// (external revision 0x40..0x50, Navi44) part, 7680. Navi48 is GC 12.0.1,
+/// whose external revision is rev_id + 0x50, so it has none.
+fn dcc_plane_width_limit() -> u32 {
+    crate::amdgpu_rdna4::bound().map_or(0, |die| die.dcc_plane_width_limit())
+}
 
 /// amdgpu_dm_plane_validate_dcc for a DCC modifier on DCN401: DC's
 /// hubbub401_get_dcc_compression_cap. amdgpu_dm hands it only the format,
@@ -589,7 +591,8 @@ const DCC_PLANE_WIDTH_LIMIT: u32 = 0;
 /// limit. It never sets `independent_64b_blks`, so any max compressed block
 /// passes.
 pub fn dcc_capable(fourcc: u32, width: u32) -> bool {
-    if DCC_PLANE_WIDTH_LIMIT != 0 && width > DCC_PLANE_WIDTH_LIMIT {
+    let limit = dcc_plane_width_limit();
+    if limit != 0 && width > limit {
         return false;
     }
     // hubbub401_dcc_support_pixel_format: every format DCN4 planes list

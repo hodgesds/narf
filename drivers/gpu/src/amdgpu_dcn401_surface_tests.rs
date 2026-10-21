@@ -953,3 +953,118 @@ kernel_test_in!(
     "drivers/gpu/dcn401-surface",
     dcn401_surface_stages_rotated_tiled_planes
 );
+
+/// MPC combine of a GFX12-tiled DCC plane turned 90 degrees and of a tiled
+/// DCC NV12 frame (resource_build_scaling_params on each slice's pipe):
+/// both pipes take the plane's tiling, DCC, rotation, pitch and addresses,
+/// and each its own slice's viewport (hubp401_set_viewport). The turned
+/// plane's slices split the stream's line, so they are bands along the
+/// source's vertical axis (the same columns, other rows); the NV12 slices
+/// split the luma columns, and their chroma viewports the chroma columns.
+fn dcn401_surface_stages_split_rotated_and_video_planes() -> TestResult {
+    use crate::amdgpu_dcn401_otg::{DccBlock, PlaneLayout, PlaneSurface, Swizzle, Tiling};
+    use crate::amdgpu_dcn401_spl::{Rect, Rotation};
+    let (p, slice) = (1u8, 3u8);
+    let tiled = |dcc| PlaneSurface {
+        tiling: Tiling {
+            swizzle: Swizzle::S64K2D,
+            dcc: Some(dcc),
+        },
+        ..PlaneSurface::LINEAR
+    };
+    let layout = |src: Rect, dst: Rect, rotation, format| PlaneLayout {
+        src,
+        dst,
+        stream_width: dst.width as u32,
+        stream_height: dst.height as u32,
+        ycbcr420: false,
+        rotation,
+        blend: Blend::default_for(format),
+        underlay: false,
+    };
+    let turned = SurfaceRequest {
+        width: 256,
+        height: 512,
+        surface: tiled(DccBlock::B128),
+        mpc: SplitPipes::one(slice),
+        plane: Some(layout(
+            Rect::new(0, 0, 256, 512),
+            Rect::new(0, 0, 512, 256),
+            Rotation::R90,
+            SurfaceFormat::Xrgb8888,
+        )),
+        ..req(p)
+    };
+    let video = SurfaceRequest {
+        width: 1024,
+        height: 512,
+        format: SurfaceFormat::Nv12,
+        surface: tiled(DccBlock::B64),
+        mpc: SplitPipes::one(slice),
+        plane: Some(layout(
+            Rect::new(0, 0, 1024, 512),
+            Rect::new(0, 0, 1024, 512),
+            Rotation::R0,
+            SurfaceFormat::Nv12,
+        )),
+        ..req(p)
+    };
+    for r in [turned, video] {
+        if r.check().is_err() {
+            return TestResult::Fail("split plane refused");
+        }
+        let scalers: Vec<(u8, crate::amdgpu_dcn401_spl::Scaler)> = r.scalers().collect();
+        let [(p0, s0), (p1, s1)] = scalers[..] else {
+            return TestResult::Fail("two slices");
+        };
+        let (v0, v1) = (s0.viewport, s1.viewport);
+        if (p0, p1) != (p, slice) || s0.recout.width + s1.recout.width != r.layout().dst.width {
+            return TestResult::Fail("slice pipes and recouts");
+        }
+        if r.format.is_video() {
+            let (c0, c1) = (s0.viewport_c, s1.viewport_c);
+            if v0.y != v1.y
+                || v1.x <= v0.x
+                || v0.height != 512
+                || c0.y != c1.y
+                || c1.x <= c0.x
+                || c0.height != 256
+            {
+                return TestResult::Fail("4:2:0 slices split luma and chroma columns");
+            }
+        } else if v0.x != v1.x || v0.width != 256 || v1.width != 256 || v0.y == v1.y {
+            return TestResult::Fail("turned slices are row bands of the source");
+        }
+        let bytes = r.bytes().bytes as usize;
+        let (_backing, pool, mut e, mut surfaces) = fixture_pipes(p, 1 << slice, bytes + 8192);
+        let Ok(applied) = run(surfaces.prepare(&mut e, &pool, r)) else {
+            return TestResult::Fail("split plane not staged");
+        };
+        let reg = |q: u8, at: u64| e.io.inner.regs.get(&h(q, at)).copied().unwrap_or(0);
+        let angle = if r.format.is_video() { 0 } else { 1 };
+        for (q, s) in [(p0, s0), (p1, s1)] {
+            for (at, mask, value) in crate::amdgpu_dcn401_dscl::viewport(&s) {
+                if reg(q, at) & mask != value & mask {
+                    return TestResult::Fail("slice viewport registers");
+                }
+            }
+            if reg(q, 0x5e5) & 0xf00 != angle << 8
+                || reg(q, 0x5e7) & 7 != Swizzle::S64K2D as u32
+                || reg(q, 0x612) & 0x202 != 0x202
+                || reg(q, 0x607) & 0xffff != reg(p0, 0x607) & 0xffff
+                || reg(q, 0x60a) != applied.address as u32
+                || applied
+                    .chroma_address(applied.address)
+                    .is_some_and(|c| reg(q, 0x60c) != c as u32)
+            {
+                return TestResult::Fail("slice surface registers");
+            }
+        }
+        drop(surfaces);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-surface",
+    dcn401_surface_stages_split_rotated_and_video_planes
+);

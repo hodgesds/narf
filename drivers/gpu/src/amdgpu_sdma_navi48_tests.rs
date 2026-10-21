@@ -461,7 +461,7 @@ fn sdma_navi48_layout_rejects_wrong_versions_and_bank_bounds() -> TestResult {
         let mut g = descriptor();
         match case {
             0 => g.ip_blocks[5].revision = 2,
-            1 => g.ip_blocks[0].revision = 0,
+            1 => g.ip_blocks[0].revision = 2,
             2 => g.ip_blocks[0].num_bases = 1,
             3 => g.ip_blocks[2].num_bases = 2,
             4 => g.ip_blocks[0].base_addrs[0] = 0x20000 - 0x1615,
@@ -475,7 +475,13 @@ fn sdma_navi48_layout_rejects_wrong_versions_and_bank_bounds() -> TestResult {
     }
     let mut g = descriptor();
     g.ip_blocks[0].base_addrs[1] = 0x14000;
-    for rev in [0, 1] {
+    // Navi44 discovers SDMA 7.0.0 on GC 12.0.0, Navi48 7.0.1 on 12.0.1;
+    // both revisions on either GC resolve one layout.
+    for (rev, profile) in [0, 1]
+        .into_iter()
+        .flat_map(|rev| crate::amdgpu_rdna4::tests::Profile::ALL.map(move |p| (rev, p)))
+    {
+        profile.apply(&mut g);
         g.ip_blocks[5].revision = rev;
         let layout = Layout::resolve(&g).unwrap();
         if layout.gc != GC || layout.hyp != HYP {
@@ -937,6 +943,7 @@ fn sdma_navi48_kernel_jobs_fill_and_copy() -> TestResult {
             src: 0x8_0000_0000,
             dst: 0x9_0000_0000,
             bytes: (1 << 30) + 8,
+            flags: 0,
         },
     ];
     let Ok(words) = kernel_words(&ops, fence, 9) else {
@@ -986,6 +993,7 @@ fn sdma_navi48_kernel_jobs_fill_and_copy() -> TestResult {
             src: 0x1000,
             dst: 0x1800,
             bytes: 0x1000,
+            flags: 0,
         }],
         &[fill(0x1000, 4); 51],
     ] {

@@ -50,11 +50,17 @@ const ALLOWED: u64 = REQUIRED
 // FAN_ABNORMAL. Linux never disables these at runtime; neither does narf.
 const PROTECTION: u64 =
     (1 << 23) | (1 << 25) | (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29) | (1 << 57);
-// Linux smu_v14_0_deep_sleep_control/gfx_ulv_control feature groups:
-// DS_GFXCLK and GFX_ULV, then DS_SOCCLK/FCLK/LCLK/DCFCLK/UCLK, which feed or
-// follow display memory bandwidth.
-const DEEP_SLEEP_GRAPHICS: u64 = (1 << 10) | (1 << 16);
-const DEEP_SLEEP_MEMORY_FABRIC: u64 = (1 << 11) | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 15);
+// smu_v14_0_deep_sleep_control's walk as smu_v14_0_2_ppt.c maps it, in its
+// order: DS_GFXCLK, DS_UCLK, DS_FCLK, DS_SOCCLK, DS_LCLK (then DS_VCN, left
+// out: the static media policy requires it off; DS_MP0CLK and DS_MP1CLK have
+// no SMU 14.0.2 bit).
+const DEEP_SLEEP_WALK: [(u64, &str); 5] = [
+    (1 << 10, "GFXCLK"),
+    (1 << 15, "UCLK"),
+    (1 << 12, "FCLK"),
+    (1 << 11, "SOCCLK"),
+    (1 << 13, "LCLK"),
+];
 const PPCLK_GFXCLK: u32 = 0;
 const PPCLK_UCLK: u32 = 2;
 const FEATURE_DPM_UCLK: u64 = 1 << 3;
@@ -135,13 +141,20 @@ pub enum GfxLevel {
     Low,
     High,
 }
-/// Runtime deep-sleep groups PMFW may enter once enabled.
+/// The deep-sleep feature PMFW refused, where the walk stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeepSleep {
-    /// GFXCLK deep sleep and GFX ULV; graphics core only.
-    Graphics,
-    /// SOCCLK/FCLK/LCLK/DCFCLK/UCLK deep sleep. Changes display bandwidth.
-    MemoryFabric,
+pub struct DeepSleepRefused {
+    /// Linux's name for it ("GFXCLK", "UCLK", ...).
+    pub feature: &'static str,
+    pub error: Error,
+}
+/// What `deep_sleep_control` left running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeepSleep {
+    pub power: PowerStatus,
+    /// The first refusal, which ended the walk (Linux logs and returns it;
+    /// its caller ignores it).
+    pub refused: Option<DeepSleepRefused>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Versions {
@@ -789,51 +802,93 @@ impl<I: Io> Engine<I> {
         self.end_runtime(resume, &result);
         result
     }
-    /// Linux `smu_v14_0_deep_sleep_control(true)` for one board-supported
-    /// group: extend the allowed mask, EnableSmuFeaturesLow/High and verify
-    /// that every protection and display DPM feature is still running.
-    async fn allow_deep_sleep(&mut self, group: DeepSleep) -> Result<PowerStatus, Error> {
+    /// Linux `smu_v14_0_deep_sleep_control(true)`: for every DS feature of
+    /// the walk the board supports (its FeaturesToRun), in Linux's order,
+    /// EnableSmuFeaturesLow/High of that bit, stopping at the first PMFW
+    /// refusal, which is reported in `DeepSleep::refused` and leaves the
+    /// owner reusable. PMFW was allowed only the restricted boot mask, so the
+    /// walk's bits are added to the allowed mask first. Afterwards every
+    /// protection and display DPM feature must still run. Transport failures
+    /// (timeout, revocation, device loss, cancellation) are terminal, as for
+    /// every runtime command.
+    async fn deep_sleep_control(&mut self) -> Result<DeepSleep, Error> {
         let previous = self.power.ok_or(Error::Invalid)?;
-        let bits = match group {
-            DeepSleep::Graphics => DEEP_SLEEP_GRAPHICS,
-            DeepSleep::MemoryFabric if self.state == State::DisplayPowerReady => {
-                DEEP_SLEEP_MEMORY_FABRIC
-            }
-            DeepSleep::MemoryFabric => return Err(Error::Busy),
-        } & self.features;
-        if bits & !previous.enabled == 0 {
+        // UCLK/FCLK/SOCCLK deep sleep only once display DPM runs.
+        if self.state != State::DisplayPowerReady {
+            return Err(Error::Busy);
+        }
+        let walk: alloc::vec::Vec<(u64, &'static str)> = DEEP_SLEEP_WALK
+            .iter()
+            .copied()
+            .filter(|(bit, _)| bit & self.features != 0)
+            .collect();
+        let bits = walk.iter().fold(0, |m, (bit, _)| m | bit);
+        if bits == 0 {
             self.access(|_| ())?;
-            return Ok(previous);
+            return Ok(DeepSleep {
+                power: previous,
+                refused: None,
+            });
         }
         let required = REQUIRED | self.protection | (previous.enabled & DISPLAY);
         let resume = self.begin_runtime()?;
         let result = async {
             self.access(|io| io.check_policy())??;
-            let allowed = previous.allowed | bits;
-            self.command(5, (allowed >> 32) as u32).await?;
-            self.command(4, allowed as u32).await?;
-            self.command(8, bits as u32).await?;
-            self.command(9, (bits >> 32) as u32).await?;
+            let mut allowed = previous.allowed;
+            let mut refused = None;
+            if bits & !allowed != 0 {
+                let wanted = allowed | bits;
+                let set = async {
+                    self.command(5, (wanted >> 32) as u32).await?;
+                    self.command(4, wanted as u32).await
+                }
+                .await;
+                match set {
+                    Ok(_) => allowed = wanted,
+                    Err(error @ Error::Rejected(_)) => {
+                        refused = Some(DeepSleepRefused {
+                            feature: "allowed mask",
+                            error,
+                        })
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            if refused.is_none() {
+                for (bit, feature) in walk {
+                    let sent = async {
+                        self.command(8, bit as u32).await?;
+                        self.command(9, (bit >> 32) as u32).await
+                    }
+                    .await;
+                    match sent {
+                        Ok(_) => {}
+                        Err(error @ Error::Rejected(_)) => {
+                            refused = Some(DeepSleepRefused { feature, error });
+                            break;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
             let enabled = self.running().await?;
-            if enabled & (required | bits) != required | bits || enabled & !allowed != 0 {
+            // Nothing outside the allowed mask and the walk may run.
+            if enabled & required != required || enabled & !(allowed | bits) != 0 {
                 return Err(Error::Features(enabled));
             }
-            Ok(PowerStatus {
-                allowed,
-                enabled,
-                ..previous
+            Ok(DeepSleep {
+                power: PowerStatus {
+                    allowed,
+                    enabled,
+                    ..previous
+                },
+                refused,
             })
         }
         .await;
-        // A rejected feature-mask command may have partially applied, so
-        // every failure here is terminal rather than a clean rejection.
-        self.state = if result.is_ok() {
-            resume
-        } else {
-            State::Failed
-        };
-        if let Ok(power) = result {
-            self.power = Some(power);
+        self.end_runtime(resume, &result);
+        if let Ok(d) = result {
+            self.power = Some(d.power);
         }
         result
     }
@@ -890,7 +945,7 @@ impl Smu {
         let base = crate::amdgpu_psp_ring::bank(
             gpu,
             ip::HW_ID_MP1,
-            &[(14, 0, 2), (14, 0, 3)],
+            crate::amdgpu_rdna4::MP_VERSIONS,
             1,
             RESPONSE,
         )
@@ -1038,21 +1093,16 @@ impl Smu {
     pub async unsafe fn baco_exit(&mut self, armd3: bool) -> Result<bool, Error> {
         self.engine.baco_exit(armd3).await
     }
-    /// Let PMFW enter one deep-sleep group. Disabled policy: nothing in narf
-    /// calls this yet. Every failure is terminal.
+    /// `smu_v14_0_deep_sleep_control(true)` as the default (non-compute)
+    /// power profile runs it; see `Engine::deep_sleep_control`. A refusal is
+    /// reported, not an error.
     ///
     /// # Safety
-    /// All kernel engines are idle and their owners tolerate GFXCLK deep sleep
-    /// and ULV. For `MemoryFabric`, the exclusive display owner has already
-    /// recalculated admission and watermarks for deep-sleep clock floors and
-    /// exit latencies and installed PMFW watermark ranges; the pinned DCN401
-    /// floors alone do not account for deep-sleep exit latency.
-    #[allow(dead_code, reason = "disabled-by-default policy hook")]
-    pub(crate) async unsafe fn allow_deep_sleep(
-        &mut self,
-        group: DeepSleep,
-    ) -> Result<PowerStatus, Error> {
-        self.engine.allow_deep_sleep(group).await
+    /// The kernel engines' owners tolerate GFXCLK deep sleep, and the
+    /// exclusive display owner has installed PMFW's watermark ranges and
+    /// plans with DML's self-refresh exit latencies.
+    pub(crate) async unsafe fn deep_sleep_control(&mut self) -> Result<DeepSleep, Error> {
+        self.engine.deep_sleep_control().await
     }
 }
 

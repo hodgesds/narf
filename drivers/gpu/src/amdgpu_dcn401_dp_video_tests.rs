@@ -1453,3 +1453,228 @@ kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_dp_video_sends_vsc_and_hdr_sdps_like_linux
 );
+
+/// Whether a register write belongs to the lit display on pipe `p` with
+/// DIO stream `s`: its timing generator, OPTC, VTG or the stream's DIG.
+fn lit_display_register(at: u64, p: u8, s: u8) -> bool {
+    let (p, s) = (u64::from(p), u64::from(s));
+    let within = |from: u64, len: u64| (BASE + from * 4..BASE + (from + len) * 4).contains(&at);
+    within(0x1b2a + p * 0x80, 0x80)
+        || within(0x1acb + p * 0x10, 0x10)
+        || within(0x530 + p, 1)
+        || within(0x2060 + s * 0x124, 0x124)
+}
+
+/// The source half of display 1's payload on MST link `t` beside display
+/// 0's 20-slot stream `s0`: SAT rows for both with ACT, its own VC rate,
+/// then its video.
+fn join_beside(
+    e: &mut Engine<VideoIo>,
+    io: &mut Link,
+    (t, s0, s1): (u8, u8, u8),
+    slots: u8,
+    rate: (u32, u32),
+    c1: dccg::Applied,
+) {
+    use super::super::mst::MstAllocation;
+    let both = [
+        MstAllocation {
+            stream: s0,
+            slots: 20,
+        },
+        MstAllocation { stream: s1, slots },
+    ];
+    run(e.update_mst_allocation(t, &both)).unwrap();
+    run(e.set_mst_vc_rate(t, s1, rate)).unwrap();
+    start(e, io, c1);
+}
+
+/// An MST stream added and removed beside a running one, as Linux's
+/// dc_commit_streams adds a stream without touching the others
+/// (link_set_dpms_on for the new stream only): display 0 runs its stream
+/// on the trained MST link; display 1 stages its timing, attaches, starts
+/// its own frontend, then the source half of its payload (SAT rows for
+/// both streams with ACT, its own VC rate) and its video. No write in the
+/// whole addition lands on display 0's timing generator, OPTC, VTG or DIG
+/// stream; display 0's VC rate and video stay as they were. Removing
+/// display 1 again (video off, VC rate zero, SAT without it, frontend
+/// off, detach) leaves display 0 untouched too.
+fn dcn401_mst_stream_added_and_removed_beside_a_lit_stream() -> TestResult {
+    use super::super::mst::MstAllocation;
+    let (t, s0, p0, s1, p1) = (2u8, 1u8, 1u8, 3u8, 2u8);
+    let (mut e, mut io, c) = fixture_mst(t, s0, p0);
+    start(&mut e, &mut io, c);
+    let first = [MstAllocation {
+        stream: s0,
+        slots: 20,
+    }];
+    run(e.update_mst_allocation(t, &first)).unwrap();
+    run(e.set_mst_vc_rate(t, s0, (19, 7))).unwrap();
+    let rate0 = e.io.fake().regs[&dio(s0, 0x214d)];
+    let from = e.io.fake().writes.len();
+    // Display 1 joins the running link.
+    e.select_display(1).unwrap();
+    let mut req = request(p1);
+    req.signal = Signal::DisplayPort;
+    let c1 = clock(req);
+    run(e.prepare(req, c1)).unwrap();
+    run(e.prepare_blank(
+        BlankRequest {
+            pipe: p1,
+            depth: ColorDepth::Bpc8,
+            limited: false,
+            ycbcr420: false,
+            colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(false, false),
+        },
+        c1,
+    ))
+    .unwrap();
+    let bank1 = e.layout.dio_clock - 0xa0 * 4;
+    e.io.fake()
+        .regs
+        .insert(bank1 + (0x80 + 4 * u64::from(p1)) * 4, 0x1090);
+    let sources =
+        e.io.fake()
+            .regs
+            .get(&(bank1 + 0x68 * 4))
+            .copied()
+            .unwrap_or(0);
+    e.io.fake()
+        .regs
+        .insert(bank1 + 0x68 * 4, sources | 4 << (p1 * 3));
+    e.attach_mst_link(t).unwrap();
+    (e.io.inner.stream, e.io.pipe) = (s1, p1);
+    run(e.prepare_dp_frontend(&mut io, path(t), super::req(s1, p1), c1)).unwrap();
+    join_beside(&mut e, &mut io, (t, s0, s1), 10, (9, 3), c1);
+    let sat = e.io.fake().regs[&dio(t, 0x2150)];
+    if sat != (u32::from(s0) | 20 << 8 | (u32::from(s1) | 10 << 8) << 16) {
+        return TestResult::Fail("SAT rows for both streams");
+    }
+    let touched: Vec<u64> = e.io.fake().writes[from..]
+        .iter()
+        .map(|w| w.0)
+        .filter(|&at| lit_display_register(at, p0, s0))
+        .collect();
+    if !touched.is_empty() {
+        panic!("addition wrote the lit display's registers {touched:x?}");
+    }
+    if e.io.fake().regs[&dio(s0, 0x214d)] != rate0 || e.io.fake().regs[&dio(s0, 0x2122)] & 1 == 0 {
+        return TestResult::Fail("lit stream's rate and video");
+    }
+    // Display 1 leaves again.
+    let from = e.io.fake().writes.len();
+    run(e.stop_dp_video(&mut io, path(t))).unwrap();
+    run(e.set_mst_vc_rate(t, s1, (0, 0))).unwrap();
+    run(e.update_mst_allocation(t, &first)).unwrap();
+    run(e.stop_dp_frontend(path(t))).unwrap();
+    e.detach_mst_link(t).unwrap();
+    let touched: Vec<u64> = e.io.fake().writes[from..]
+        .iter()
+        .map(|w| w.0)
+        .filter(|&at| lit_display_register(at, p0, s0))
+        .collect();
+    if !touched.is_empty() {
+        panic!("removal wrote the lit display's registers {touched:x?}");
+    }
+    if e.io.fake().regs[&dio(t, 0x2150)] & 0xffff_0000 != 0
+        || e.io.fake().regs[&dio(s0, 0x214d)] != rate0
+        || e.io.fake().regs[&dio(s0, 0x2122)] & 1 == 0
+    {
+        return TestResult::Fail("lit stream after the removal");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_mst_stream_added_and_removed_beside_a_lit_stream
+);
+
+/// A running MST stream the link's DSC fairness search changes is
+/// modeset beside another that it leaves as it runs, as amdgpu_dm keeps
+/// every stream pre_validate_dsc finds unchanged: display 1's stream goes
+/// (video off, VC rate zero, SAT without it, frontend off, detach) and
+/// comes back with another payload and VC rate (its timing staged afresh,
+/// attach, frontend, SAT rows for both with ACT, video). No write in the
+/// whole modeset lands on display 0's timing generator, OPTC, VTG or DIG
+/// stream; its VC rate, SAT row and video stay as they were.
+fn dcn401_mst_affected_stream_modesets_beside_a_lit_stream() -> TestResult {
+    use super::super::mst::MstAllocation;
+    let (t, s0, p0, s1, p1) = (2u8, 1u8, 1u8, 3u8, 2u8);
+    let (mut e, mut io, c) = fixture_mst(t, s0, p0);
+    start(&mut e, &mut io, c);
+    let first = [MstAllocation {
+        stream: s0,
+        slots: 20,
+    }];
+    run(e.update_mst_allocation(t, &first)).unwrap();
+    run(e.set_mst_vc_rate(t, s0, (19, 7))).unwrap();
+    let rate0 = e.io.fake().regs[&dio(s0, 0x214d)];
+    let mut req = request(p1);
+    req.signal = Signal::DisplayPort;
+    let c1 = clock(req);
+    let bank1 = e.layout.dio_clock - 0xa0 * 4;
+    // Display 1 lights (or lights again) on the running link.
+    let light = |e: &mut Engine<VideoIo>, io: &mut Link, slots: u8, rate: (u32, u32)| {
+        e.select_display(1).unwrap();
+        run(e.prepare(req, c1)).unwrap();
+        run(e.prepare_blank(
+            BlankRequest {
+                pipe: p1,
+                depth: ColorDepth::Bpc8,
+                limited: false,
+                ycbcr420: false,
+                colorspace: BlankRequest::default_colorspace(false, false),
+            },
+            c1,
+        ))
+        .unwrap();
+        e.io.fake()
+            .regs
+            .insert(bank1 + (0x80 + 4 * u64::from(p1)) * 4, 0x1090);
+        let sources =
+            e.io.fake()
+                .regs
+                .get(&(bank1 + 0x68 * 4))
+                .copied()
+                .unwrap_or(0);
+        e.io.fake()
+            .regs
+            .insert(bank1 + 0x68 * 4, sources | 4 << (p1 * 3));
+        e.attach_mst_link(t).unwrap();
+        (e.io.inner.stream, e.io.pipe) = (s1, p1);
+        run(e.prepare_dp_frontend(io, path(t), super::req(s1, p1), c1)).unwrap();
+        join_beside(e, io, (t, s0, s1), slots, rate, c1);
+    };
+    light(&mut e, &mut io, 10, (9, 3));
+    let from = e.io.fake().writes.len();
+    // The fairness search gives display 1's stream 14 slots: its modeset.
+    run(e.stop_dp_video(&mut io, path(t))).unwrap();
+    run(e.set_mst_vc_rate(t, s1, (0, 0))).unwrap();
+    run(e.update_mst_allocation(t, &first)).unwrap();
+    run(e.stop_dp_frontend(path(t))).unwrap();
+    e.detach_mst_link(t).unwrap();
+    run(e.retire(p1)).unwrap();
+    light(&mut e, &mut io, 14, (13, 5));
+    let sat = e.io.fake().regs[&dio(t, 0x2150)];
+    if sat != (u32::from(s0) | 20 << 8 | (u32::from(s1) | 14 << 8) << 16)
+        || e.io.fake().regs[&dio(s1, 0x214d)] == 0
+    {
+        return TestResult::Fail("display 1's new payload");
+    }
+    let touched: Vec<u64> = e.io.fake().writes[from..]
+        .iter()
+        .map(|w| w.0)
+        .filter(|&at| lit_display_register(at, p0, s0))
+        .collect();
+    if !touched.is_empty() {
+        panic!("the modeset wrote the kept display's registers {touched:x?}");
+    }
+    if e.io.fake().regs[&dio(s0, 0x214d)] != rate0 || e.io.fake().regs[&dio(s0, 0x2122)] & 1 == 0 {
+        return TestResult::Fail("kept stream's rate and video");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_mst_affected_stream_modesets_beside_a_lit_stream
+);

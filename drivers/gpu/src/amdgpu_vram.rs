@@ -12,12 +12,18 @@ use narf_lib::sync::IrqSafeSpinLock;
 pub enum Error {
     Invalid,
     Exhausted,
+    /// [`Pool::claim`]: a reservation already holds part of the range.
+    Busy,
 }
 #[derive(Debug)]
 struct Inner {
     mapping: MmioRegion,
     address: u64,
     used: IrqSafeSpinLock<Vec<Range<u64>>>,
+    /// The entries of `used` that are permanent exclusions (the bootstrap
+    /// inventory and [`Pool::claim`]s), never reservations. Locked after
+    /// `used`.
+    protected: IrqSafeSpinLock<Vec<Range<u64>>>,
     /// Published ranges whose reservation was dropped: still excluded
     /// (hardware may reach them) until a proven power cycle reclaims them.
     retired: IrqSafeSpinLock<Vec<Range<u64>>>,
@@ -82,10 +88,16 @@ impl Pool {
             }
         }
         used.truncate(count);
+        let mut protected = Vec::new();
+        protected
+            .try_reserve_exact(used.len())
+            .map_err(|_| Error::Exhausted)?;
+        protected.extend(used.iter().cloned());
         Ok(Self(Arc::new(Inner {
             mapping,
             address,
             used: IrqSafeSpinLock::new(used),
+            protected: IrqSafeSpinLock::new(protected),
             retired: IrqSafeSpinLock::new(Vec::new()),
         })))
     }
@@ -134,6 +146,32 @@ impl Pool {
             reusable: true,
         })
     }
+    /// amdgpu_vram_mgr_new's GFX12_DCC | VRAM_CONTIGUOUS placement
+    /// (`place_dcc`): `size` bytes starting at a multiple of `alignment`
+    /// (gmc_v12_0_get_dcc_alignment, counted from VRAM offset 0 at GPU
+    /// address `origin`) inside a [`dcc_block_size`] block at its own
+    /// alignment. Only the trimmed range is held.
+    pub fn reserve_dcc(
+        &self,
+        size: u64,
+        alignment: u64,
+        origin: u64,
+    ) -> Result<Reservation, Error> {
+        let mut used = self.0.used.lock();
+        let range = place_dcc(
+            &mut used,
+            self.0.address,
+            self.0.mapping.len,
+            size,
+            alignment,
+            origin,
+        )?;
+        Ok(Reservation {
+            pool: self.0.clone(),
+            range,
+            reusable: true,
+        })
+    }
     pub fn available(&self) -> u64 {
         self.0.mapping.len
             - self
@@ -147,6 +185,19 @@ impl Pool {
     /// The whole aperture, protected ranges included.
     pub fn size(&self) -> u64 {
         self.0.mapping.len
+    }
+    /// Permanently exclude the aperture-relative `range` (rounded out to
+    /// pages), as `amdgpu_bo_create_kernel_at` pins a firmware-owned range
+    /// at a fixed offset: it may overlap existing protected ranges, which
+    /// it merges with, but `Busy` if any reservation (live or retired)
+    /// already holds part of it, and `Invalid` past the aperture.
+    pub fn claim(&self, range: Range<u64>) -> Result<(), Error> {
+        claim(
+            &mut self.0.used.lock(),
+            &mut self.0.protected.lock(),
+            self.0.mapping.len,
+            range,
+        )
     }
     pub(crate) fn mapping(&self) -> MmioRegion {
         self.0.mapping
@@ -202,6 +253,100 @@ fn place(
     Ok(start..end)
 }
 
+/// amdgpu_vram_mgr_new's block for a GFX12_DCC | VRAM_CONTIGUOUS buffer of
+/// `size` bytes at DCC alignment `alignment` (adjust_dcc_size):
+/// `roundup_pow_of_two(size + alignment)`, kept in the 32-bit `dcc_size`
+/// Linux stores it in (0 once it no longer fits, which Linux cannot place).
+pub const fn dcc_block_size(size: u64, alignment: u64) -> u64 {
+    match size.checked_add(alignment) {
+        Some(n) => match n.checked_next_power_of_two() {
+            Some(block) => block as u32 as u64,
+            None => 0,
+        },
+        None => 0,
+    }
+}
+
+/// Where amdgpu_vram_mgr_new trims a DCC buffer's block starting at VRAM
+/// offset `block_start`: `roundup(block_start, alignment)`.
+pub const fn dcc_trim_start(block_start: u64, alignment: u64) -> Option<u64> {
+    block_start.checked_next_multiple_of(alignment)
+}
+
+/// `place` of a GFX12 DCC buffer as amdgpu_vram_mgr_new places it: the
+/// [`dcc_block_size`] block of `size` (pages) and `alignment` first, at its
+/// own (power-of-two) alignment as the buddy allocator hands one out, then
+/// trimmed (gpu_buddy_block_trim) to `size` bytes from the block's first
+/// multiple of `alignment` past `origin` (the GPU address of VRAM offset
+/// 0, which the buddy offsets count from). The rest of the block stays
+/// free, as the trim returns it.
+fn place_dcc(
+    used: &mut Vec<Range<u64>>,
+    address: u64,
+    len: u64,
+    size: u64,
+    alignment: u64,
+    origin: u64,
+) -> Result<Range<u64>, Error> {
+    let size = size.checked_add(4095).ok_or(Error::Invalid)? & !4095;
+    let block = dcc_block_size(size, alignment);
+    if size == 0 || alignment == 0 || alignment % 4096 != 0 || block < 4096 {
+        return Err(Error::Invalid);
+    }
+    let range = place(used, address, len, block, block)?;
+    let trimmed = address
+        .checked_add(range.start)
+        .and_then(|at| at.checked_sub(origin))
+        .and_then(|offset| dcc_trim_start(offset, alignment))
+        .and_then(|offset| offset.checked_add(origin))
+        .and_then(|at| at.checked_sub(address))
+        .filter(|&start| start.checked_add(size).is_some_and(|end| end <= range.end));
+    let index = used
+        .iter()
+        .position(|r| *r == range)
+        .ok_or(Error::Invalid)?;
+    let Some(start) = trimmed else {
+        used.remove(index);
+        return Err(Error::Invalid);
+    };
+    used[index] = start..start + size;
+    Ok(start..start + size)
+}
+
+/// Merge `range` into both the sorted `used` list and its `protected`
+/// subset, refusing to cover any `used` entry that is not protected.
+fn claim(
+    used: &mut Vec<Range<u64>>,
+    protected: &mut Vec<Range<u64>>,
+    len: u64,
+    range: Range<u64>,
+) -> Result<(), Error> {
+    let start = range.start & !4095;
+    let end = range.end.checked_add(4095).ok_or(Error::Invalid)? & !4095;
+    if start >= end || end > len {
+        return Err(Error::Invalid);
+    }
+    let overlapping = |r: &Range<u64>| r.start < end && start < r.end;
+    if used
+        .iter()
+        .any(|r| overlapping(r) && !protected.contains(r))
+    {
+        return Err(Error::Busy);
+    }
+    let merged = used
+        .iter()
+        .filter(|r| overlapping(r))
+        .fold(start..end, |m, r| m.start.min(r.start)..m.end.max(r.end));
+    used.try_reserve(1).map_err(|_| Error::Exhausted)?;
+    protected.try_reserve(1).map_err(|_| Error::Exhausted)?;
+    used.retain(|r| !overlapping(r));
+    protected.retain(|r| !overlapping(r));
+    let at = used.partition_point(|r| r.start < merged.start);
+    used.insert(at, merged.clone());
+    protected.push(merged);
+    Ok(())
+}
+
 /// Owned VRAM with no CPU mapping: what lies beyond a BAR that shows only a
 /// prefix of VRAM. Only the GPU can touch it, so whoever hands a range out
 /// must have the GPU clear it first.
@@ -210,6 +355,8 @@ struct Unmapped {
     address: u64,
     len: u64,
     used: IrqSafeSpinLock<Vec<Range<u64>>>,
+    /// As `Inner::protected`.
+    protected: IrqSafeSpinLock<Vec<Range<u64>>>,
 }
 #[derive(Clone, Debug)]
 pub struct UnmappedPool(Arc<Unmapped>);
@@ -253,10 +400,16 @@ impl UnmappedPool {
                 _ => merged.push(range),
             }
         }
+        let mut protected = Vec::new();
+        protected
+            .try_reserve_exact(merged.len())
+            .map_err(|_| Error::Exhausted)?;
+        protected.extend(merged.iter().cloned());
         Ok(Self(Arc::new(Unmapped {
             address,
             len,
             used: IrqSafeSpinLock::new(merged),
+            protected: IrqSafeSpinLock::new(protected),
         })))
     }
     /// Reserve `size` bytes at a power-of-two GPU-address `alignment`.
@@ -267,6 +420,26 @@ impl UnmappedPool {
             self.0.len,
             size,
             alignment,
+        )?;
+        Ok(UnmappedReservation {
+            pool: self.0.clone(),
+            range,
+        })
+    }
+    /// [`Pool::reserve_dcc`] past the BAR.
+    pub fn reserve_dcc(
+        &self,
+        size: u64,
+        alignment: u64,
+        origin: u64,
+    ) -> Result<UnmappedReservation, Error> {
+        let range = place_dcc(
+            &mut self.0.used.lock(),
+            self.0.address,
+            self.0.len,
+            size,
+            alignment,
+            origin,
         )?;
         Ok(UnmappedReservation {
             pool: self.0.clone(),
@@ -288,6 +461,15 @@ impl UnmappedPool {
     }
     pub fn size(&self) -> u64 {
         self.0.len
+    }
+    /// As [`Pool::claim`], for a pool-relative range.
+    pub fn claim(&self, range: Range<u64>) -> Result<(), Error> {
+        claim(
+            &mut self.0.used.lock(),
+            &mut self.0.protected.lock(),
+            self.0.len,
+            range,
+        )
     }
 }
 /// A range of an [`UnmappedPool`], returned to it on drop: its holder must
@@ -496,5 +678,63 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu-dmub",
         vram_unmapped_pool_keeps_protected_ranges
+    );
+    /// `claim` pins a fixed range as amdgpu_bo_create_kernel_at does: over
+    /// protected ranges (merging), never over a live or retired reservation.
+    fn vram_claim_pins_fixed_ranges_over_protection_only() -> TestResult {
+        let map = MmioRegion {
+            phys: narf_memory::PhysAddr::new(0),
+            virt: 0,
+            len: 16 * 4096,
+            kind: narf_bus::BarKind::Mmio32 { prefetchable: true },
+        };
+        // SAFETY: bookkeeping-only model; no mapping access is performed.
+        let pool = unsafe {
+            Pool::from_owned_aperture(
+                map,
+                0x1_0000_0000,
+                core::slice::from_ref(&(14 * 4096..16 * 4096)),
+            )
+        }
+        .unwrap();
+        let live = pool.reserve(4096).unwrap();
+        let mut retired = pool.reserve(4096).unwrap();
+        retired.publish();
+        drop(retired);
+        if pool.claim(0..4096) != Err(Error::Busy)
+            || pool.claim(4096..8192) != Err(Error::Busy)
+            || pool.claim(15 * 4096..17 * 4096) != Err(Error::Invalid)
+            || pool.claim(4096..4096) != Err(Error::Invalid)
+        {
+            return TestResult::Fail("claim over a reservation or past the aperture");
+        }
+        // Overlapping and extending the protected tail, unaligned.
+        if pool.claim(12 * 4096 + 1..15 * 4096).is_err() || pool.available() != 10 * 4096 {
+            return TestResult::Fail("claim over protection not merged");
+        }
+        // The pin is permanent and a second claim over it is idempotent.
+        if pool.claim(12 * 4096..13 * 4096).is_err() || pool.available() != 10 * 4096 {
+            return TestResult::Fail("claim over a claim");
+        }
+        let rest = pool.reserve(10 * 4096).unwrap();
+        if rest.address() != 0x1_0000_2000 || pool.reserve(1).is_ok() {
+            return TestResult::Fail("claimed range handed out");
+        }
+        drop((live, rest));
+        // SAFETY: bookkeeping-only model.
+        let unmapped = unsafe { UnmappedPool::from_owned(0x2_0000_0000, 8 * 4096, &[]) }.unwrap();
+        let held = unmapped.reserve_aligned(4096, 4096).unwrap();
+        if unmapped.claim(0..4096) != Err(Error::Busy)
+            || unmapped.claim(4096..8 * 4096).is_err()
+            || unmapped.available() != 0
+        {
+            return TestResult::Fail("unmapped claim");
+        }
+        drop(held);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu-dmub",
+        vram_claim_pins_fixed_ranges_over_protection_only
     );
 }

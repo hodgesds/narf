@@ -115,7 +115,7 @@ impl Plan {
         boot_framebuffer: Option<Range<u64>>,
         other_clients: &[Range<u64>],
     ) -> Result<Self, Error> {
-        if gpu.chip.did != crate::amdgpu::NAVI48 {
+        if crate::amdgpu_rdna4::Rdna4Chip::of(gpu).is_none() {
             return Err(Error::Unsupported);
         }
         // SAFETY: caller supplies the complete exclusive GPU/client contract.
@@ -133,11 +133,12 @@ impl Plan {
         }
         let rdna2 = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did);
         let navi22 = rdna2.is_some();
+        let rdna4 = crate::amdgpu_rdna4::Rdna4Chip::of(gpu);
         // GC MC_VM_FB_LOCATION_BASE/TOP and MC_VM_FB_OFFSET, then DCN's copy
         // DCN_VM_FB_LOCATION_BASE/TOP and DCN_VM_FB_OFFSET (BASE_IDX 2):
         // dcn_3_0_0_offset.h places them at 0x493..0x495, while DCN3.1+ and
         // DCN4 (dcn_4_1_0_offset.h) moved them to 0x475..0x477.
-        let (gc_version, dcn_versions, fb_regs, dcn_fb): (_, &[_], _, u32) = match gpu.chip.did {
+        let (gc_version, dcn_versions, fb_regs, dcn_fb): (_, &[_], _, u32) = match rdna4 {
             _ if rdna2.is_some() => {
                 let p = rdna2.unwrap();
                 (
@@ -148,8 +149,9 @@ impl Plan {
                     0x493, // linux-lit: 0x493=mmDCN_VM_FB_LOCATION_BASE@dcn
                 )
             }
-            amdgpu::NAVI48 => (
-                (12, 0, 1),
+            // gc_12_0_0_offset.h serves both RDNA4 dies.
+            Some(die) => (
+                die.gc_version(),
                 &[(4, 0, 1), (4, 1, 0)],
                 [0x1614, 0x1615, 0x15a7],
                 0x475,
@@ -204,7 +206,7 @@ impl Plan {
                     other_clients,
                     SnapshotLayout {
                         fields,
-                        region6: gpu.chip.did == amdgpu::NAVI48,
+                        region6: rdna4.is_some(),
                         dcn30: navi22,
                         // amdgpu_gmc_vram_location: fb_end = fb_start +
                         // mc_vram_size - 1, mc_vram_size from MEMSIZE.

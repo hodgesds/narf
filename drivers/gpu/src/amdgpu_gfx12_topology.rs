@@ -161,13 +161,25 @@ pub(crate) fn validate(gpu: &AmdGpu) -> Result<(), Error> {
     layout(gpu).map(|_| ())
 }
 fn layout(gpu: &AmdGpu) -> Result<(Limits, [u64; 2]), Error> {
-    if gpu.chip.vid != crate::amdgpu::AMD_VENDOR || gpu.chip.did != crate::amdgpu::NAVI48 {
+    if crate::amdgpu_rdna4::Rdna4Chip::of(gpu).is_none() {
         return Err(Error::Unsupported);
     }
     let limits = Limits::from_gc(gpu.gc_info.ok_or(Error::Invalid)?)?;
     let bases = [
-        bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 0, 0x13de),
-        bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 1, 0x5b94),
+        bank(
+            gpu,
+            ip::HW_ID_GC,
+            crate::amdgpu_rdna4::GC_VERSIONS,
+            0,
+            0x13de,
+        ),
+        bank(
+            gpu,
+            ip::HW_ID_GC,
+            crate::amdgpu_rdna4::GC_VERSIONS,
+            1,
+            0x5b94,
+        ),
     ]
     .map(|b| b.map_err(|_| Error::Unsupported));
     let bases = [bases[0]?, bases[1]?];
@@ -321,5 +333,48 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/gfx12",
         gfx12_topology_errors_restore_selector_and_validate_dimensions
+    );
+    /// Discovery gives each die's maxima; the fuse registers give the SKU.
+    /// Navi44 (2 SE) and a GRE-like Navi48 with two arrays fused off take
+    /// their CU counts from the same read, never from a Navi48 constant.
+    fn gfx12_topology_follows_each_rdna4_profile() -> TestResult {
+        use crate::amdgpu_rdna4::tests::Profile;
+        for profile in Profile::ALL {
+            let mut g = crate::amdgpu_navi48_firmware::tests::gpu();
+            g.ip_blocks[0].num_bases = 2;
+            g.regs.len = 0x20000;
+            g.gc_info = Some(ip::GcInfo {
+                num_rb_per_se: 4,
+                ..Default::default()
+            });
+            profile.apply(&mut g);
+            let Ok((limits, _)) = layout(&g) else {
+                return TestResult::Fail("RDNA4 profile topology layout refused");
+            };
+            let mut f = fake();
+            if profile == Profile::Navi48Gre {
+                // CC_GC_SA_UNIT_DISABLE: arrays 6 and 7 (SE3) fused off.
+                f.arrays = [0xc0 << 8, 0];
+            }
+            let Ok(t) = sample(&mut f, [0x10000, 0x10000], limits) else {
+                return TestResult::Fail("RDNA4 profile topology sample failed");
+            };
+            let expected = match profile {
+                Profile::Navi48 => 64,
+                Profile::Navi48Gre => 48,
+                Profile::Navi44 => 32,
+            };
+            if limits.engines != profile.shader_engines()
+                || t.active_cus != expected
+                || t.enabled_rb_mask.count_ones() != expected / 4
+            {
+                return TestResult::Fail("RDNA4 profile CU/RB count not from discovery and fuses");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/gfx12",
+        gfx12_topology_follows_each_rdna4_profile
     );
 }

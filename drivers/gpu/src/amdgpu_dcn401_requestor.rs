@@ -28,19 +28,21 @@ pub struct RequestorApplied {
     pub pixel_chunk_bytes: u32,
     pub minimum_chunk_bytes: u32,
 }
-/// dcn401_program_det_segments/compbuf_segments for the pipes in `det`:
-/// each the default DET, the rest of the CRB compressed buffer (with four
-/// pipes, DML's one-segment minimum).
+/// dcn401_program_det_segments/compbuf_segments for the HUBP instances in
+/// `det` (DCHUBBUB_DET{hubp->inst}_CTRL, so a pipe mask goes through
+/// `PipePool::hw_mask`): each the default DET, the rest of the CRB
+/// compressed buffer (with four pipes, DML's one-segment minimum).
 fn allocation(det: u8) -> [u8; 5] {
     let mut sizes = [SEGMENTS, 0, 0, 0, 0];
-    for p in (0..4).filter(|p| det & 1 << p != 0) {
-        sizes[p + 1] = DET_SEGMENTS;
+    for i in (0..4).filter(|i| det & 1 << i != 0) {
+        sizes[i + 1] = DET_SEGMENTS;
         sizes[0] -= DET_SEGMENTS;
     }
     sizes
 }
-/// One HUBP's requestor, its VTG the timing's own OTG `vtg` (an ODM
-/// pipe's or overlay's HUBP follows the stream's timing).
+/// One HUBP's requestor, its VTG the timing's own OTG instance `vtg`
+/// (HUBP_VTG_SEL = tg->inst; an ODM pipe's or overlay's HUBP follows the
+/// stream's timing).
 pub(super) fn requestor(vtg: u8) -> [(u64, u32, u32); 7] {
     [
         (0x66d, 0x7ff0, 0),  // packed RGB: no second plane in DET
@@ -55,6 +57,7 @@ pub(super) fn requestor(vtg: u8) -> [(u64, u32, u32); 7] {
     ]
 }
 impl Layout {
+    /// DCHUBBUB_COMPBUF_CTRL (0), then DET0-3_CTRL by HUBP instance.
     fn crb(self, index: usize) -> u64 {
         self.base + (0x4ba + index as u64) * 4
     }
@@ -103,6 +106,79 @@ impl<I: Io> Engine<I> {
         }
         *sizes = next;
         Ok(())
+    }
+    /// dcn401_program_det_segments: request `segments` of DET for pipe
+    /// `q`'s HUBP (DET{n} is HUBP instance n's). It takes effect when the
+    /// hardware acknowledges it (DET_SIZE_CURRENT), which this does not
+    /// wait for: Linux writes a freed pipe's 0 under the OTG lock, before
+    /// its MPCC leaves the tree.
+    pub(super) fn program_det_segments(&mut self, q: u8, segments: u8) -> Result<(), Error> {
+        let l = self.layout;
+        if q >= l.pool.count() || segments > SEGMENTS {
+            return Err(Error::Invalid);
+        }
+        self.update(l.crb(usize::from(l.inst(q)) + 1), 0x1f, u32::from(segments))
+    }
+    /// dcn401_program_compbuf_segments(safe_to_increase = true), as
+    /// optimize_bandwidth runs it: wait until every DET's DET_SIZE_CURRENT
+    /// equals its request (each wait bounded like
+    /// dcn401_wait_for_det_update), then grow the compressed buffer to the
+    /// rest of the CRB (DML's compbuf_size: CRB minus every DET). A
+    /// compbuf already that size or larger is left (only increases here).
+    /// Returns the allocation.
+    ///
+    /// A slow acknowledgement is not an error: Linux's REG_WAIT only logs
+    /// "REG_WAIT timeout". After a DET wait times out the grow is skipped
+    /// (Linux writes COMPBUF_SIZE anyway; NARF never grows the compbuf into
+    /// segments a DET may still hold) and the requested allocation is
+    /// returned. A grown compbuf whose COMPBUF_SIZE_CURRENT is slow is
+    /// logged and kept, as Linux, which does not wait for it at all.
+    pub(in crate::amdgpu_dcn401_otg) async fn increase_compbuf(
+        &mut self,
+    ) -> Result<[u8; 5], Error> {
+        let mut acked = true;
+        for index in 1..5 {
+            let at = self.layout.crb(index);
+            let want = self.read(at)? & 0x1f;
+            if !self.slow_ack(at, want).await? {
+                acked = false;
+            }
+        }
+        if !acked {
+            let mut requested = [0; 5];
+            for (index, size) in requested.iter_mut().enumerate() {
+                *size = (self.read(self.layout.crb(index))? & 0x1f) as u8;
+            }
+            return Ok(requested);
+        }
+        let mut sizes = self.crb_stable()?;
+        let dets: u32 = sizes[1..].iter().map(|&n| u32::from(n)).sum();
+        let target = u32::from(SEGMENTS)
+            .checked_sub(dets)
+            .ok_or(Error::Invalid)? as u8;
+        if target > sizes[0] {
+            let at = self.layout.crb(0);
+            self.update(at, 0x1f, u32::from(target))?;
+            self.slow_ack(at, u32::from(target)).await?;
+            sizes[0] = target;
+        }
+        Ok(sizes)
+    }
+    /// Wait for a CRB register's CURRENT field (bits 12:8) to reach `want`;
+    /// `false` after logging a timeout, as generic_reg_wait does.
+    async fn slow_ack(&mut self, at: u64, want: u32) -> Result<bool, Error> {
+        match self.wait(at, 0x1f00, want << 8, 100_000).await {
+            Ok(()) => Ok(true),
+            Err(Error::Timeout(_)) => {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: dcn401 REG_WAIT timeout: CRB {at:#x} CURRENT != {want}"
+                );
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
     }
     pub(super) fn requestor_errors(&mut self, pipe: u8) -> Result<(), Error> {
         self.requestor_faults(pipe, 0)
@@ -156,7 +232,7 @@ impl<I: Io> Engine<I> {
         // that left while this one ran keeps its (unused) allocation until
         // the next configuration repartitions, and compbuf is unused.
         let sizes = self.crb_stable()?;
-        let want = allocation(self.det_pipes(pipe));
+        let want = allocation(self.layout.pool.hw_mask(self.det_pipes(pipe)));
         if (1..5).any(|i| want[i] != 0 && sizes[i] != want[i]) {
             return Err(Error::Busy);
         }
@@ -173,7 +249,7 @@ impl<I: Io> Engine<I> {
                     && (a.request.format.is_video()
                         || a.request.surface.tiling != crate::amdgpu_dcn401_otg::Tiling::LINEAR)
             });
-            for (r, mut mask, value) in requestor(pipe) {
+            for (r, mut mask, value) in requestor(self.layout.inst(pipe)) {
                 if planned {
                     if matches!(r, 0x66d | 0x620 | 0x5f2 | 0x5f3) {
                         continue;
@@ -278,7 +354,7 @@ impl Surfaces {
         let det = stack.iter().flatten().fold(e.det_pipes(pipe), |m, o| {
             m | o.dpp.surface.request.pipe_mask()
         });
-        let target = allocation(det);
+        let target = allocation(e.layout.pool.hw_mask(det));
         let surface = a.dpp.surface;
         // Linear RGB stores one row per swath; leave room for at least two.
         let surfaces =
@@ -320,7 +396,7 @@ impl Surfaces {
                 e.wait(e.layout.hubp(p, HUBP_CONTROL), 0x1007, 3, 100_000)
                     .await?;
                 e.hubp_faults(p, 0)?;
-                for (r, mask, value) in requestor(pipe) {
+                for (r, mask, value) in requestor(e.layout.inst(pipe)) {
                     e.update(e.layout.hubp(p, r), mask, value)?;
                 }
                 e.update(e.layout.hubp(p, HUBP_CLOCK), 1, 0)?;

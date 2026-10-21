@@ -87,7 +87,13 @@ impl Surfaces {
             framebuffer_offset: config.fb_offset,
             page_table_base: config.root,
         };
-        for i in (0..4).filter(|&i| kept[i]) {
+        for i in engine
+            .layout
+            .pool
+            .pipes()
+            .map(usize::from)
+            .filter(|&i| kept[i])
+        {
             // Fresh evidence for the kept pipes too.
             if engine.verify_memory(i as u8, config).is_ok() {
                 engine.status.memory[i] = saved.0[i];

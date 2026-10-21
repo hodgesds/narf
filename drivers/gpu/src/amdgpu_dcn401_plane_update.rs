@@ -6,15 +6,18 @@
 //! get_scaling_info_update_type; full_update_required_weak for a plane
 //! count change), then commit_planes_for_stream's sequence for a medium or
 //! full update: dcn401_interdependent_update_lock (the OTG master lock),
-//! dcn401_program_front_end_for_ctx (plane_atomic_disconnect of the freed
-//! pipes, then every MPCC tree from its top pipe down: dcn20_enable_plane
+//! dcn401_program_front_end_for_ctx (each freed pipe's DET released by
+//! program_det_segments(0), then its plane_atomic_disconnect, then every
+//! MPCC tree from its top pipe down: dcn20_enable_plane
 //! for a new pipe, dcn20_update_dchubp_dpp with dcn20_update_mpcc's
 //! remove-and-insert at the bottom on a full update, the HUBP surface,
 //! viewport and DLG/TTU, the cursor), the unlock, and
 //! dcn401_post_unlock_program_front_end (the new surfaces in use, then
 //! dcn20_disable_plane on the freed pipes). The caller brackets it with
 //! prepare_bandwidth (clocks raised, watermarks raise-only) and
-//! optimize_bandwidth (exact watermarks, clocks lowered).
+//! optimize_bandwidth (exact watermarks, clocks lowered); the compressed
+//! buffer, this display's to size, grows into freed DETs at the end of the
+//! update as optimize_bandwidth's program_compbuf_segments does.
 use super::scanout::Pipe;
 use super::*;
 use crate::amdgpu_dcn401_dml as dml;
@@ -55,10 +58,15 @@ fn dc_format(f: SurfaceFormat) -> (u32, u32) {
 /// fill_dc_plane_info_and_addr and fill_dc_scaling_info hand DC): the color
 /// space, per-pixel or global alpha and the pitch are medium changes, the
 /// rotation, format, bytes per pixel, tiling or DCC full ones; a source or
-/// destination of another size is full, one moved is medium.
+/// destination of another size is full, one moved is medium. A plane whose
+/// MPC split changes (DML combining it on other DPPs, or no longer) is a
+/// full update: dc only re-splits pipes in a full update's validation.
 pub fn plane_update_type(old: SurfaceRequest, new: SurfaceRequest) -> UpdateType {
     let mut t = UpdateType::Fast;
     let mut elevate = |u: UpdateType| t = t.max(u);
+    if old.mpc != new.mpc {
+        elevate(UpdateType::Full);
+    }
     let (lo, ln) = (old.layout(), new.layout());
     let color = |r: &SurfaceRequest| r.format.is_video().then_some(r.surface.color);
     if color(&old) != color(&new) {
@@ -152,6 +160,46 @@ pub struct PlanesUpdated {
     pub released: u64,
 }
 
+/// The first content of a plane surface a live update allocates afresh (a
+/// new plane, or one of another allocation), written into it once cleared
+/// and before the update programs it, so the frame the update latches
+/// already shows the plane's framebuffer, as DC scans a new plane's address
+/// from the update that adds it. `chunk(a, index, words)` fills `words`
+/// with chunk `index` (from 0) of surface `a`'s bytes as packed 32-bit
+/// words and returns the byte offset they go to, or None when there is no
+/// more (none at all leaves the surface cleared). A chunk outside the
+/// surface refuses the update before any register write.
+pub trait PlaneContent: Send {
+    fn chunk(&mut self, a: &SurfaceApplied, index: u32, words: &mut Vec<u32>) -> Option<u64>;
+    /// A client framebuffer the plane on fresh surface `a` scans out in
+    /// place instead of a copy (DC programs a new plane's framebuffer
+    /// address in the update that adds it): the update programs its
+    /// address and pitches, its staged buffers left cleared and unfetched,
+    /// and no `chunk` is asked for. One the plane cannot fetch refuses the
+    /// update before any register write. The caller keeps it pinned until
+    /// a later flip or stop shows it no longer fetched.
+    fn external(&mut self, _a: &SurfaceApplied) -> Option<ExternalSurface> {
+        None
+    }
+    /// Whether the plane the update puts on pipe `pipe` is another plane
+    /// than the one there before (a recreated plane moved onto it): it then
+    /// takes a fresh surface with this content even where the old surface
+    /// has its allocation, so the update never latches with the other
+    /// plane's image on it (DC programs a recreated plane's framebuffer
+    /// address in the update that adds it).
+    fn moved_to(&mut self, _pipe: u8) -> bool {
+        false
+    }
+}
+/// No first content: fresh surfaces stay cleared until the next flip.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Cleared;
+impl PlaneContent for Cleared {
+    fn chunk(&mut self, _: &SurfaceApplied, _: u32, _: &mut Vec<u32>) -> Option<u64> {
+        None
+    }
+}
+
 /// One MPCC tree as mpc1's software list keeps it: its OPP and its MPCCs,
 /// top first.
 struct MpcTree {
@@ -184,7 +232,8 @@ struct Change {
 impl<I: Io> Engine<I> {
     /// mpc1_remove_mpcc: `m` leaves its tree (the MPCC above it or the
     /// OPP's OUT_MUX takes the one below; a new bottom passes its top layer
-    /// through) and its muxes and update lock are released.
+    /// through) and its muxes and update lock are released. `t` names
+    /// pipes; the muxes take their MPCC instances (mpcc_id = dpp->inst).
     fn mpc_remove(&mut self, t: &mut MpcTree, m: u8) -> Result<(), Error> {
         let l = self.layout;
         let Some(i) = t.list.iter().position(|&x| x == m) else {
@@ -192,11 +241,15 @@ impl<I: Io> Engine<I> {
         };
         let below = t.list.get(i + 1).copied();
         if i == 0 {
-            self.update(l.out_mux(t.opp), 0xf, below.map_or(0xf, u32::from))?;
+            self.update(
+                l.out_mux(t.opp),
+                0xf,
+                below.map_or(0xf, |b| l.inst_field(b)),
+            )?;
         } else {
             let above = t.list[i - 1];
             match below {
-                Some(b) => self.update(l.mpcc(above, BOTTOM), 0xf, u32::from(b))?,
+                Some(b) => self.update(l.mpcc(above, BOTTOM), 0xf, l.inst_field(b))?,
                 None => {
                     self.update(l.mpcc(above, BOTTOM), 0xf, 0xf)?;
                     self.update(l.mpcc(above, MPCC_CONTROL), 3, MODE_PASSTHROUGH)?;
@@ -210,18 +263,20 @@ impl<I: Io> Engine<I> {
         Ok(())
     }
     /// mpc1_insert_plane at the bottom of `t` (no insert_above_mpcc), as
-    /// dcn20_update_mpcc inserts each pipe of a tree programmed top down.
+    /// dcn20_update_mpcc inserts each pipe of a tree programmed top down:
+    /// MPCC_TOP_SEL = dpp_id, MPCC_OPP_ID = opp_id, MPC_OUT_MUX and
+    /// MPCC_BOT_SEL = mpcc_id, all instances of the pipes `t` and `m` name.
     fn mpc_insert_bottom(&mut self, t: &mut MpcTree, m: u8) -> Result<(), Error> {
         let l = self.layout;
         self.update(l.mpcc(m, BOTTOM), 0xf, 0xf)?;
         self.update(l.mpcc(m, MPCC_CONTROL), 3, MODE_TOP_ONLY)?;
-        self.update(l.mpcc(m, TOP), 0xf, u32::from(m))?;
-        self.update(l.mpcc(m, OPP_ID), 0xf, u32::from(t.opp))?;
-        self.update(l.mpcc(m, UPDATE_LOCK), 0xf, u32::from(t.opp))?;
+        self.update(l.mpcc(m, TOP), 0xf, l.inst_field(m))?;
+        self.update(l.mpcc(m, OPP_ID), 0xf, l.inst_field(t.opp))?;
+        self.update(l.mpcc(m, UPDATE_LOCK), 0xf, l.inst_field(t.opp))?;
         match t.list.last().copied() {
-            None => self.update(l.out_mux(t.opp), 0xf, u32::from(m))?,
+            None => self.update(l.out_mux(t.opp), 0xf, l.inst_field(m))?,
             Some(a) => {
-                self.update(l.mpcc(a, BOTTOM), 0xf, u32::from(m))?;
+                self.update(l.mpcc(a, BOTTOM), 0xf, l.inst_field(m))?;
                 self.update(l.mpcc(a, MPCC_CONTROL), 3, MODE_TOP_BOT)?;
             }
         }
@@ -233,10 +288,10 @@ impl<I: Io> Engine<I> {
     /// and, powered, its HUBP blank, drained and clock-gated without any
     /// transaction and its DPP stopped. Returns whether it is powered.
     fn free_pipe(&mut self, q: u8) -> Result<bool, Error> {
-        if q >= 4 || self.displays.siblings.pipes & bit(q) != 0 {
+        let l = self.layout;
+        if q >= l.pool.count() || self.displays.siblings.pipes & bit(q) != 0 {
             return Err(Error::Busy);
         }
-        let l = self.layout;
         if self.read(l.otg(q, LOCK))? & 0x101 != 0
             || self.read(l.otg(q, CLOCK))? & 0x10 != 0
             || self.read(l.otg(q, GSL))? & 0x8000_000f != 0
@@ -293,7 +348,8 @@ impl<I: Io> Engine<I> {
                 return Err(Error::Readback(at));
             }
         }
-        for (r, mask, value) in super::requestor::requestor(vtg) {
+        // hubp_vtg_sel(tg->inst): the stream's OTG instance.
+        for (r, mask, value) in super::requestor::requestor(l.inst(vtg)) {
             self.update(l.hubp(q, r), mask, value)?;
         }
         self.update(self.dpp_control(q), DPP_CLOCK_ENABLE, DPP_CLOCK_ENABLE)
@@ -304,8 +360,10 @@ impl<I: Io> Engine<I> {
         use super::requestor::{DET_SEGMENTS, SEGMENTS};
         let mut sizes = self.crb_stable()?;
         let mut target = sizes;
-        for p in (0..4).filter(|&p| pipes & bit(p) != 0) {
-            target[usize::from(p) + 1] = DET_SEGMENTS;
+        // DET{n} is HUBP n's (program_det_segments(hubp->inst)).
+        let l = self.layout;
+        for p in l.pool.pipes().filter(|&p| pipes & bit(p) != 0) {
+            target[usize::from(l.inst(p)) + 1] = DET_SEGMENTS;
         }
         let dets: u32 = target[1..].iter().map(|&n| u32::from(n)).sum();
         let room = u32::from(SEGMENTS)
@@ -346,8 +404,9 @@ impl<I: Io> Engine<I> {
     /// lock, dcn401_program_front_end_for_ctx, the unlock and
     /// dcn401_post_unlock_program_front_end), the timing running throughout:
     /// under the OTG master lock the global sync if it changed, the freed
-    /// pipes' MPCCs out of their trees and their cursors off, each changed
-    /// or new plane's DPP, on a full update every tree rebuilt from its top
+    /// pipes' DETs released, their MPCCs out of their trees and their
+    /// cursors off, each changed or new plane's DPP, on a full update every
+    /// tree rebuilt from its top
     /// pipe down (each MPCC removed and inserted at the bottom, then its
     /// blending), on a medium one the changed planes' blending, each changed
     /// or new plane's HUBP surface, viewport and address, every plane's
@@ -372,9 +431,11 @@ impl<I: Io> Engine<I> {
                 list: t.into_iter().rev().collect(),
             })
             .collect();
-        // plane_atomic_disconnect of every freed pipe, by pipe index; its
-        // cursor goes with it.
-        for q in (0..4u8).filter(|&q| c.disabled & bit(q) != 0) {
+        // dcn401_program_front_end_for_ctx for every freed pipe, by pipe
+        // index: its DET released (program_det_segments(hubp->inst, 0)),
+        // then plane_atomic_disconnect; its cursor goes with it.
+        for q in l.pool.pipes().filter(|&q| c.disabled & bit(q) != 0) {
+            self.program_det_segments(q, 0)?;
             for t in trees.iter_mut() {
                 self.mpc_remove(t, q)?;
             }
@@ -384,8 +445,9 @@ impl<I: Io> Engine<I> {
         for k in 0..c.planes.len() {
             let p = &c.planes[k];
             if p.changed {
-                let coef_ram = self.program_dpp_live(p.dpp).await?;
-                c.planes[k].dpp.coef_ram = coef_ram;
+                let mut dpp = p.dpp;
+                let coef_ram = self.program_dpp_live(&mut dpp).await?;
+                c.planes[k].dpp = DppApplied { coef_ram, ..dpp };
                 c.planes[k].mpc.dpp = c.planes[k].dpp;
             }
         }
@@ -441,7 +503,7 @@ impl<I: Io> Engine<I> {
                 self.update(at, mask, value)?;
             }
         }
-        for q in (0..4u8).filter(|&q| c.enabled & bit(q) != 0) {
+        for q in l.pool.pipes().filter(|&q| c.enabled & bit(q) != 0) {
             self.update(l.hubp(q, HUBP_CONTROL), BLANK_EN | TTU_DISABLE, 0)?;
         }
         self.update(l.otg(pipe, LOCK), LOCK_REQUEST, 0)?;
@@ -466,7 +528,7 @@ impl<I: Io> Engine<I> {
                     return Ok(Some(at));
                 }
             }
-            for q in (0..4u8).filter(|&q| disabled & bit(q) != 0) {
+            for q in l.pool.pipes().filter(|&q| disabled & bit(q) != 0) {
                 // mpc2_assert_idle_mpcc: DISABLED, or IDLE and not BUSY.
                 let at = l.mpcc(q, MPC_STATUS);
                 let status = e.read(at)?;
@@ -479,7 +541,7 @@ impl<I: Io> Engine<I> {
         .await?;
         // dcn20_disable_plane: hubp2_set_blank once nothing is outstanding,
         // then the fetch and DPP clocks off.
-        for q in (0..4u8).filter(|&q| disabled & bit(q) != 0) {
+        for q in l.pool.pipes().filter(|&q| disabled & bit(q) != 0) {
             self.wait(
                 l.hubp(q, HUBP_CONTROL),
                 NO_OUTSTANDING,
@@ -525,8 +587,8 @@ impl Surfaces {
     /// on the pipes the planes keep, take (free pipes, enabled off-tree
     /// first) or free (retired after the update latched). A plane of the
     /// same allocation keeps its buffers and content; any other gets a
-    /// cleared one, and the buffers it supersedes are released once nothing
-    /// fetches them. Refusals before the first register write leave the
+    /// cleared one holding `content`'s first frame, and the buffers it
+    /// supersedes are released once nothing fetches them. Refusals before the first register write leave the
     /// scanout as it was; later failure or cancellation quarantines it.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::amdgpu_dcn401_otg) async fn update_live_planes<I: Io>(
@@ -537,6 +599,7 @@ impl Surfaces {
         request: &LivePlanes,
         plan: &dml::Plan,
         crystal_khz: u32,
+        content: &mut dyn PlaneContent,
         mut owners: impl FnMut() -> Result<(dccg::Applied, DisplayContext), Error>,
     ) -> Result<alloc::boxed::Box<PlanesUpdated>, Error> {
         let slot = usize::from(pipe);
@@ -613,12 +676,8 @@ impl Surfaces {
             ..timing.request
         };
         let new_timing = new_request.plan()?;
-        let provisional = |k: usize| SurfaceApplied {
-            request: planes[k],
-            address: 0,
-            pitch_bytes: geometry[k].0,
-            bytes: geometry[k].1,
-        };
+        let provisional =
+            |k: usize| SurfaceApplied::staged(planes[k], 0, geometry[k].0, geometry[k].1);
         let mut provisional_overlays = [None; MAX_OVERLAYS];
         for (k, o) in provisional_overlays
             .iter_mut()
@@ -654,7 +713,10 @@ impl Surfaces {
         let enabled = used & !old_mask;
         let disabled = old_mask & !used;
         let mut powered = 0u8;
-        for q in (0..4u8).filter(|&q| enabled & bit(q) != 0) {
+        // Every bit of `enabled`: one past the pool (or fused) is refused by
+        // free_pipe; the later loops then see pool pipes only.
+        let pipes = e.layout.pool.pipes();
+        for q in (0..u8::BITS as u8).filter(|&q| enabled & bit(q) != 0) {
             if e.free_pipe(q)? {
                 powered |= bit(q);
             }
@@ -669,9 +731,10 @@ impl Surfaces {
         } else {
             UpdateType::Fast
         });
-        // Each plane's buffers: the same allocation on the same pipes keeps
-        // the surface (and what it shows), any other takes a fresh, cleared
-        // one, unpublished until the hardware is told of it.
+        // Each plane's buffers: the same plane with the same allocation on
+        // the same pipes keeps the surface (and what it shows), any other
+        // (another plane moved onto the pipe included) takes a fresh,
+        // cleared one, unpublished until the hardware is told of it.
         let mut applied: Vec<SurfaceApplied> = Vec::with_capacity(planes.len());
         let mut fresh: Vec<Surface> = Vec::new();
         for (k, s) in planes.iter().enumerate() {
@@ -684,14 +747,12 @@ impl Surfaces {
                         && x.applied.request.same_allocation(*s)
                         && e.status.surfaces[at] == Some(x.applied)
                 })
-                .map(|x| x.applied.address);
-            if let Some(address) = kept {
-                applied.push(SurfaceApplied {
-                    request: *s,
-                    address,
-                    pitch_bytes,
-                    bytes,
-                });
+                .filter(|_| !content.moved_to(s.pipe))
+                .map(|x| x.applied);
+            if let Some(x) = kept {
+                // The plane keeps fetching what it shows, a client
+                // framebuffer scanned out in place too, with its pitch.
+                applied.push(SurfaceApplied { request: *s, ..x });
                 continue;
             }
             let memory = pool.reserve(bytes).map_err(|_| Error::Allocation)?;
@@ -717,12 +778,44 @@ impl Surfaces {
                     narf_scheduler::yield_now().await;
                 }
             }
-            let a = SurfaceApplied {
-                request: *s,
-                address: memory.address(),
-                pitch_bytes,
-                bytes,
-            };
+            let mut a = SurfaceApplied::staged(*s, memory.address(), pitch_bytes, bytes);
+            // A client framebuffer scanned out in place from the update
+            // itself; its staged buffers stay cleared.
+            let external = content.external(&a);
+            if let Some(x) = external {
+                if x.address < config.fb_base || x.last > config.fb_top || x.last >= 1 << 48 {
+                    return Err(Error::Invalid);
+                }
+                a = x.applied(a)?;
+            }
+            // Otherwise its first content, before the hardware hears of it:
+            // the update latches with the plane's framebuffer shown.
+            let mut words = Vec::new();
+            let mut index = 0u32;
+            while let Some(offset) = external
+                .is_none()
+                .then(|| content.chunk(&a, index, &mut words))
+                .flatten()
+            {
+                let end = (words.len() as u64)
+                    .checked_mul(4)
+                    .and_then(|n| n.checked_add(offset));
+                if words.is_empty() || offset % 4 != 0 || end.is_none_or(|end| end > bytes) {
+                    return Err(Error::Invalid);
+                }
+                e.access(|_| {
+                    for (i, &word) in words.iter().enumerate() {
+                        // SAFETY: live authority, checked bounds within an
+                        // owned, unpublished VRAM mapping.
+                        unsafe { map.write32(offset + i as u64 * 4, word) };
+                    }
+                    Ok(())
+                })?;
+                index += 1;
+                if index % 16 == 0 {
+                    narf_scheduler::yield_now().await;
+                }
+            }
             applied.push(a);
             fresh.push(Surface {
                 memory,
@@ -744,6 +837,7 @@ impl Surfaces {
                 line_buffer_config: super::dpp::line_buffer_config(s.request)?,
                 coef_ram: Default::default(),
                 pending: 0,
+                post_csc_b: Default::default(),
             };
             let at = usize::from(s.request.pipe);
             live.push(LivePlane {
@@ -795,7 +889,7 @@ impl Surfaces {
         e.status.state = State::UpdatingPlanes(pipe);
         let mut superseded: Vec<Surface> = Vec::new();
         let result = async {
-            for q in (0..4u8).filter(|&q| enabled & bit(q) != 0) {
+            for q in pipes.clone().filter(|&q| enabled & bit(q) != 0) {
                 if powered & bit(q) == 0 {
                     let on = HubpPower {
                         pipe: q,
@@ -846,8 +940,15 @@ impl Surfaces {
             if owners()? != current {
                 return Err(Error::Busy);
             }
-            for q in (0..4u8).filter(|&q| disabled & bit(q) != 0) {
+            for q in pipes.clone().filter(|&q| disabled & bit(q) != 0) {
                 e.verify_freed(q)?;
+            }
+            // optimize_bandwidth's compbuf increase into the freed DETs
+            // (dcn401_program_compbuf_segments with safe_to_increase, after
+            // every DET_SIZE_CURRENT acknowledged its request).
+            if disabled != 0 {
+                let crb = e.increase_compbuf().await?;
+                e.status.requestor = Some(requestor(applied[0], new_overlays, crb[0]));
             }
             // Every record of the timing carries the new sync.
             e.status.rebind_timing(pipe, |t| t.request.sync = plan.sync);
@@ -881,7 +982,11 @@ impl Surfaces {
                     }
                 }
             }
-            for k in (0..4usize).filter(|&k| disabled & bit(k as u8) != 0) {
+            for k in pipes
+                .clone()
+                .filter(|&q| disabled & bit(q) != 0)
+                .map(usize::from)
+            {
                 let named = applied.iter().any(|s| usize::from(s.request.pipe) == k);
                 if !named {
                     if let Some(old) = self.0[k].take() {
@@ -983,6 +1088,7 @@ impl Otg {
         request: &LivePlanes,
         plan: &dml::Plan,
         crystal_khz: u32,
+        content: &mut dyn PlaneContent,
     ) -> Result<alloc::boxed::Box<PlanesUpdated>, Error> {
         self.0.select_display(pipe)?;
         let regs = self.0.io.0;
@@ -1007,13 +1113,22 @@ impl Otg {
             }
         }
         self.1
-            .update_live_planes(&mut self.0, pool, pipe, request, plan, crystal_khz, || {
-                Ok((
-                    dccg.retained_timing_clock(regs, clocks, pipe)
-                        .map_err(Error::PipeClocks)?,
-                    gmc.display_context(regs).map_err(Error::Memory)?,
-                ))
-            })
+            .update_live_planes(
+                &mut self.0,
+                pool,
+                pipe,
+                request,
+                plan,
+                crystal_khz,
+                content,
+                || {
+                    Ok((
+                        dccg.retained_timing_clock(regs, clocks, pipe)
+                            .map_err(Error::PipeClocks)?,
+                        gmc.display_context(regs).map_err(Error::Memory)?,
+                    ))
+                },
+            )
             .await
     }
 }

@@ -211,6 +211,7 @@ fn plane(
         address: 0x8_0010_0000,
         pitch_bytes: width * 4,
         bytes: u64::from(width * 4 * height),
+        chroma: None,
     }
 }
 /// The pipes `stream_cursor_pipes` derives from planes (through SPL) are
@@ -389,6 +390,7 @@ fn dcn401_cursor_programs_every_pipe_under_each_segment_lock() -> TestResult {
         y: 600,
         visible: false,
         shown: 0,
+        degamma: false,
     };
     let clocks = (50_000, 594_000);
     let segments = placements(a, odm_primary, &[Some(straddle), None, None], clocks);
@@ -485,6 +487,73 @@ kernel_test_in!(
     dcn401_cursor_programs_every_pipe_under_each_segment_lock
 );
 
+/// On harvested boards (pipe 0, pipe 1, pipes 1 and 2 fused) the cursor of
+/// an ODM 2:1 stream on pipes 0 and the top pipe is programmed on both
+/// pipes' HUBP/DPP instances inside the cursor locks of both pipes' OPP
+/// instances (mpc1_cursor_lock(opp->inst)), and no write reaches or names
+/// a fused instance.
+fn dcn401_cursor_locks_each_segment_opp_instance_on_harvested_boards() -> TestResult {
+    crate::amdgpu_dcn401_otg::tests::harvest::harvested(2, || {
+        let top = crate::amdgpu_rdna4::pipe_pool().count() - 1;
+        let mut e = engine();
+        let l = e.layout;
+        let primary = plane(
+            0,
+            (SplitPipes::one(top), SplitPipes::NONE),
+            (3840, 2160),
+            None,
+        );
+        e.status.surfaces[0] = Some(primary);
+        let a = CursorApplied {
+            pipe: 0,
+            address: 0x8_00f0_0000,
+            width: 64,
+            height: 64,
+            x: 1890,
+            y: 600,
+            visible: false,
+            shown: 0,
+            degamma: false,
+        };
+        let segments = placements(a, primary, &[None, None, None], (50_000, 594_000));
+        let a = shown(a, &segments);
+        if a.shown != 1 | 1 << top {
+            return TestResult::Fail("cursor over both segments");
+        }
+        e.io.writes.clear();
+        if e.program_cursor(a, &segments).is_err() || e.verify_cursor(a, &segments).is_err() {
+            return TestResult::Fail("program");
+        }
+        for &(at, value) in &e.io.writes {
+            crate::amdgpu_dcn401_otg::tests::harvest::guard(l, at, Some(value));
+        }
+        let lock = |inst: u8| l.mpc_base + (0x2c5 + u64::from(inst) * 5) * 4;
+        let locked: alloc::vec::Vec<u8> = (0..4u8)
+            .filter(|&i| {
+                e.io.writes
+                    .iter()
+                    .any(|&(at, v)| at == lock(i) && v & 1 == 1)
+            })
+            .collect();
+        let mut want = alloc::vec![l.inst(0), l.inst(top)];
+        want.sort();
+        if locked != want {
+            return TestResult::Fail("locks of the segments' OPP instances");
+        }
+        for p in [0, top] {
+            let at = e.layout.base + (0x679 + u64::from(l.inst(p)) * 0xdc) * 4;
+            if e.io.regs.get(&at).copied().unwrap_or(0) & 1 != 1 {
+                return TestResult::Fail("cursor enabled on the segment's HUBP instance");
+            }
+        }
+        TestResult::Pass
+    })
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-cursor",
+    dcn401_cursor_locks_each_segment_opp_instance_on_harvested_boards
+);
+
 /// amdgpu_dm_crtc_get_cursor_mode: DCN 4.0.1 (and 4.2.x, or a disabled
 /// CRTC) always takes the native cursor, whatever lies under it; other DCN
 /// take the overlay cursor over a YCbCr plane, a plane scaled unlike the
@@ -543,4 +612,58 @@ fn dcn401_cursor_mode_follows_amdgpu_dm() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-cursor",
     dcn401_cursor_mode_follows_amdgpu_dm
+);
+
+/// amdgpu_dm_plane_handle_cursor_update asks for ENABLE_CURSOR_DEGAMMA
+/// under the CRTC's legacy gamma (DCN401 has the dpp gamma_corr cap) and
+/// dpp401_set_cursor_attributes turns it into CUR0_ROM_EN for the
+/// premultiplied cursor; the cursor matrix stays bypassed
+/// (dpp401_set_cursor_matrix) over every plane, YCbCr ones too. The ROM
+/// follows the CRTC with each attribute update and is what the verifier
+/// expects from the record.
+fn dcn401_cursor_degamma_follows_legacy_gamma() -> TestResult {
+    let mut e = engine();
+    for legacy in [false, true] {
+        e.displays.color[0] = Some(alloc::sync::Arc::new(ColorProgram {
+            pre_degam_srgb: legacy,
+            ..Default::default()
+        }));
+        if e.cursor_degamma(0) != legacy {
+            return TestResult::Fail("ENABLE_CURSOR_DEGAMMA");
+        }
+        let a = CursorApplied {
+            pipe: 0,
+            address: 0x8_00f0_0000,
+            width: 64,
+            height: 64,
+            x: 0,
+            y: 0,
+            visible: true,
+            shown: 1,
+            degamma: legacy,
+        };
+        let control = e.cm(0, CM_CONTROL);
+        let matrix = e.cm(0, CM_MATRIX);
+        let attributes = e.cursor_attributes(a, 0);
+        let find = |at: u64| attributes.iter().find(|w| w.0 == at).copied();
+        if find(control)
+            != Some((
+                control,
+                CM_FIELDS & !ENABLE,
+                2 << 4 | u32::from(legacy) << 3,
+            ))
+            || find(matrix) != Some((matrix, 3, 0))
+        {
+            return TestResult::Fail("cursor ROM and matrix words");
+        }
+    }
+    e.displays.color[0] = None;
+    if e.cursor_degamma(0) {
+        return TestResult::Fail("no CRTC color asked for the ROM");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-cursor",
+    dcn401_cursor_degamma_follows_legacy_gamma
 );

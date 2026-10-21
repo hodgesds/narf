@@ -248,6 +248,7 @@ fn navi48_mst_unplug_removes_payload_without_aux() -> TestResult {
         slots: 10,
         pbn: 100,
         stream: 3,
+        allocation: PayloadAllocation::Remote,
     });
     let mut source = Source {
         hub: &hub,
@@ -520,6 +521,164 @@ kernel_test_in!(
     navi48_mst_payload_cancellation_retains_even_empty_bookkeeping
 );
 
+/// An access: its address and whether it writes.
+type Access = (u32, bool);
+/// Which accesses an AUX channel refuses: `refuse(access, previous)`.
+type Refuse = fn(Access, Access) -> bool;
+/// An AUX channel that refuses the accesses `refuse(access, previous)` picks.
+struct Refusing<'a> {
+    inner: Aux<'a>,
+    refuse: core::cell::Cell<Refuse>,
+    last: Access,
+}
+impl MstAux for Refusing<'_> {
+    type Error = ();
+    async fn read(&mut self, address: u32, buf: &mut [u8]) -> Result<(), ()> {
+        let last = core::mem::replace(&mut self.last, (address, false));
+        if (self.refuse.get())((address, false), last) {
+            return Err(());
+        }
+        self.inner.read(address, buf).await
+    }
+    async fn write(&mut self, address: u32, data: &[u8]) -> Result<(), ()> {
+        let last = core::mem::replace(&mut self.last, (address, true));
+        if (self.refuse.get())((address, true), last) {
+            return Err(());
+        }
+        self.inner.write(address, data).await
+    }
+    async fn delay(&mut self, us: u64) {
+        self.inner.delay(us).await;
+    }
+}
+
+/// allocate_mst_payload and deallocate_mst_payload are best effort at the
+/// sink as Linux's: a failed payload-table write (drm_dp_add_payload_part1
+/// "is OK to fail") keeps the payload's slots, skips ALLOCATE_PAYLOAD and
+/// leaves it LOCAL; an ACT that is never handled still sends
+/// ALLOCATE_PAYLOAD; a failed ALLOCATE_PAYLOAD only leaves it DFP. Each add
+/// completes (the stream's VC rate set, no transaction left marked), and
+/// the removal undoes just what was allocated
+/// (drm_dp_destroy_payload_at_remote_and_dfp), so the port's later
+/// transactions run on.
+fn navi48_mst_payload_sink_failures_are_best_effort() -> TestResult {
+    use dp_mst_mgr::PAYLOAD_TABLE_UPDATE_STATUS as STATUS;
+    fn table_write(a: Access, _: Access) -> bool {
+        a == (dp_mst_mgr::PAYLOAD_ALLOCATE_SET, true)
+    }
+    // ACT handled polls the status again after the payload-table write
+    // read it updated.
+    fn act_status(a: Access, last: Access) -> bool {
+        a == (STATUS, false) && last == (STATUS, false)
+    }
+    fn sideband(a: Access, _: Access) -> bool {
+        a.1 && (dp_mst::DOWN_REQ_BASE..dp_mst::DOWN_REQ_BASE + 48).contains(&a.0)
+    }
+    fn none(_: Access, _: Access) -> bool {
+        false
+    }
+    let cases: [(Refuse, PayloadAllocation); 3] = [
+        (table_write, PayloadAllocation::Local),
+        (act_status, PayloadAllocation::Remote),
+        (sideband, PayloadAllocation::Dfp),
+    ];
+    for (refuse, allocation) in cases {
+        let hub = RefCell::new(Hub::new());
+        let mut link = started_link(&hub);
+        link.owner = Some(0);
+        let sinks = link.topology.sinks();
+        let mut aux = Refusing {
+            inner: Aux(&hub),
+            refuse: core::cell::Cell::new(refuse),
+            last: (0, false),
+        };
+        let mut source = Source {
+            hub: &hub,
+            events: Vec::new(),
+        };
+        let sent = hub.borrow().requests.len();
+        let p = run(alloc::boxed::Box::pin(add_payload(
+            &mut link,
+            &mut aux,
+            &mut source,
+            sinks[0],
+            1,
+            900,
+            12,
+            (11, 7),
+        )))
+        .unwrap();
+        assert_eq!(p.allocation, allocation);
+        assert_eq!(link.payloads, [p]);
+        assert_eq!(link.payload_change(), None);
+        assert_eq!(link.audio_slots(1), Ok(12));
+        assert_eq!(source.events.last(), Some(&Event::Rate(1, (11, 7))));
+        // ALLOCATE_PAYLOAD reached the hub unless part 1 failed or the
+        // sideband write was refused.
+        let sent_now = hub.borrow().requests.len();
+        assert_eq!(
+            sent_now - sent,
+            usize::from(allocation == PayloadAllocation::Remote)
+        );
+        aux.refuse.set(none);
+        let (row, sent) = {
+            let h = hub.borrow();
+            let row: Vec<u8> = (0..3)
+                .map(|i| h.dpcd[&(dp_mst_mgr::PAYLOAD_ALLOCATE_SET + i)])
+                .collect();
+            (row, h.requests.len())
+        };
+        source.events.clear();
+        run(alloc::boxed::Box::pin(remove_payload(
+            &mut link,
+            &mut aux,
+            &mut source,
+            1,
+            true,
+        )))
+        .unwrap();
+        {
+            let h = hub.borrow();
+            let after: Vec<u8> = (0..3)
+                .map(|i| h.dpcd[&(dp_mst_mgr::PAYLOAD_ALLOCATE_SET + i)])
+                .collect();
+            let expect = match allocation {
+                PayloadAllocation::Local => (sent, row),
+                PayloadAllocation::Dfp => (sent, vec![1, 1, 0]),
+                PayloadAllocation::Remote => (sent + 1, vec![1, 1, 0]),
+            };
+            assert_eq!((h.requests.len(), after), expect);
+            assert_eq!(
+                source.events,
+                [
+                    Event::Rate(1, (0, 0)),
+                    Event::Table(Vec::new(), h.requests.len())
+                ]
+            );
+        }
+        assert!(link.payloads.is_empty() && link.payload_change().is_none());
+        // The port's next transaction is not refused as busy.
+        let again = run(alloc::boxed::Box::pin(add_payload(
+            &mut link,
+            &mut aux,
+            &mut source,
+            sinks[1],
+            3,
+            500,
+            7,
+            (6, 9),
+        )))
+        .unwrap();
+        assert_eq!((again.vcpi, again.start), (1, 1));
+        assert_eq!(again.allocation, PayloadAllocation::Remote);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    navi48_mst_payload_sink_failures_are_best_effort
+);
+
 fn navi48_mst_payload_preflight_rejection_leaves_transaction_reusable() -> TestResult {
     let (hub, mut link) = payload_fixture(true);
     let mut aux = Aux(&hub);
@@ -785,4 +944,430 @@ fn navi48_mst_daisy_chain_shares_one_payload_table() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dp-mst",
     navi48_mst_daisy_chain_shares_one_payload_table
+);
+
+const PAYLOAD_VECTORS: &str = include_str!("../tests/dcn401_mst_payload/vectors.txt");
+
+/// One `tests/dcn401_mst_payload` sequence replayed: each addition's time
+/// slots (drm_dp_atomic_find_time_slots), its refusal or VCPI and start
+/// slot with the payload-table row and ALLOCATE_PAYLOAD `add_payload`
+/// sends, each removal's (`remove_payload`), and the final table.
+fn replay_payload_vector(line: &str) -> Option<alloc::string::String> {
+    use alloc::format;
+    use alloc::string::String;
+    let (ops, _) = line.split_once(" = ")?;
+    let mut words = ops.split(' ');
+    let (_, enc, kbps) = (words.next()?, words.next()?, words.next()?);
+    let uhbr = enc == "u";
+    let div = dp_mst::pbn_div(kbps.parse().ok()?);
+    let mut payloads: Vec<MstPayload> = Vec::new();
+    let mut out = String::new();
+    for op in words {
+        let (kind, value) = op.split_at(1);
+        let value: u32 = value.parse().ok()?;
+        if kind == "a" {
+            let slots = dp_mst::time_slots(value, div);
+            match allocate_slots(&payloads, uhbr, slots) {
+                Err(SlotRefusal::NoSpace) => out += &format!(" {slots}=E28"),
+                Err(SlotRefusal::TooMany) => out += &format!(" {slots}=E22"),
+                Ok((vcpi, start)) => {
+                    out += &format!(" {slots}=w{vcpi}.{start}.{slots}m{vcpi}.{value}");
+                    payloads.push(MstPayload {
+                        sink: dp_mst_mgr::Sink {
+                            branch: 0,
+                            port: vcpi,
+                        },
+                        vcpi,
+                        start,
+                        slots: slots as u8,
+                        pbn: value as u16,
+                        stream: vcpi,
+                        allocation: PayloadAllocation::Remote,
+                    });
+                }
+            }
+        } else {
+            let i = payloads.iter().position(|p| u32::from(p.vcpi) == value)?;
+            let removed = payloads.remove(i);
+            out += &format!(" m{}.0w{}.{}.0", removed.vcpi, removed.vcpi, removed.start);
+            release_slots(&mut payloads, &removed);
+        }
+    }
+    out += " |";
+    let mut rows = payloads.clone();
+    rows.sort_by_key(|p| p.start);
+    if rows.is_empty() {
+        out += " -";
+    }
+    for (k, p) in rows.iter().enumerate() {
+        out += &format!(
+            "{}{}@{}+{}",
+            if k == 0 { " " } else { "," },
+            p.vcpi,
+            p.start,
+            p.slots
+        );
+    }
+    Some(format!("{ops} ={out}"))
+}
+
+/// The payload table bookkeeping against DRM's helpers (3000 Linux
+/// sequences of stream additions and removals on one manager, both
+/// channel codings): time-slot and payload-count refusals, VCPIs, start
+/// slots, compaction after a removal, and what each step writes.
+fn navi48_mst_payload_table_matches_linux_vectors() -> TestResult {
+    let mut n = 0;
+    for line in PAYLOAD_VECTORS.lines().filter(|l| !l.starts_with('#')) {
+        let got = replay_payload_vector(line);
+        if got.as_deref() != Some(line) {
+            panic!("payload vector\n  want {line}\n  got  {got:?}");
+        }
+        n += 1;
+    }
+    if n != 3000 {
+        return TestResult::Fail("vector count");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    navi48_mst_payload_table_matches_linux_vectors
+);
+
+/// A started link on its own hub model, probed.
+fn started_link(hub: &RefCell<Hub>) -> MstLink {
+    let mut aux = Aux(hub);
+    let mut link = MstLink::default();
+    let mut dpcd = [0u8; 16];
+    dpcd[0] = 0x12;
+    run(link.manager.start(&mut aux, &dpcd)).unwrap();
+    link.topology = run(link.manager.probe(&mut aux)).unwrap();
+    link
+}
+
+/// Two DP ports each running MST, each with its own topology manager and
+/// payload table (amdgpu_dm's per-connector mst_mgr): each link's first
+/// payload is VCPI 1 at its first slot, every DPCD row, ACT and
+/// ALLOCATE_PAYLOAD goes to that port's branch alone, and removing a
+/// stream on one port leaves the other port's table and branch untouched.
+fn navi48_mst_two_ports_keep_their_own_payload_tables() -> TestResult {
+    let (hub_a, hub_b) = (RefCell::new(Hub::new()), RefCell::new(Hub::new()));
+    let mut link_a = started_link(&hub_a);
+    let mut link_b = started_link(&hub_b);
+    link_b.uhbr = true;
+    let (sinks_a, sinks_b) = (link_a.topology.sinks(), link_b.topology.sinks());
+    let mut source_a = Source {
+        hub: &hub_a,
+        events: Vec::new(),
+    };
+    let mut source_b = Source {
+        hub: &hub_b,
+        events: Vec::new(),
+    };
+    let rows = |h: &RefCell<Hub>| {
+        let h = h.borrow();
+        (0..3)
+            .map(|i| h.dpcd[&(dp_mst_mgr::PAYLOAD_ALLOCATE_SET + i)])
+            .collect::<Vec<_>>()
+    };
+    let add = |link: &mut MstLink, hub, source: &mut Source, sink, stream, slots| {
+        run(alloc::boxed::Box::pin(add_payload(
+            link,
+            &mut Aux(hub),
+            source,
+            sink,
+            stream,
+            600,
+            slots,
+            (9, 1),
+        )))
+        .unwrap()
+    };
+    let a0 = add(&mut link_a, &hub_a, &mut source_a, sinks_a[0], 0, 40);
+    let sent_a = hub_a.borrow().requests.len();
+    let b1 = add(&mut link_b, &hub_b, &mut source_b, sinks_b[0], 1, 40);
+    let b3 = add(&mut link_b, &hub_b, &mut source_b, sinks_b[1], 3, 20);
+    // 40 + 40 + 20 slots: more than one link's 63, each port's own table.
+    assert_eq!((a0.vcpi, a0.start), (1, 1));
+    assert_eq!((b1.vcpi, b1.start, b3.vcpi, b3.start), (1, 0, 2, 40));
+    assert_eq!(hub_a.borrow().requests.len(), sent_a);
+    assert_eq!(rows(&hub_a), [1, 1, 40]);
+    assert_eq!(rows(&hub_b), [2, 40, 20]);
+    let tables = |s: &Source| -> Vec<Vec<(u8, u8)>> {
+        s.events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Table(t, _) => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(tables(&source_a), [vec![(0, 40)]]);
+    assert_eq!(tables(&source_b), [vec![(1, 40)], vec![(1, 40), (3, 20)]]);
+    // Port B's first stream leaves: its table compacts, port A's stays.
+    let (before_a, writes_a) = (link_a.payloads.clone(), hub_a.borrow().requests.len());
+    run(alloc::boxed::Box::pin(remove_payload(
+        &mut link_b,
+        &mut Aux(&hub_b),
+        &mut source_b,
+        1,
+        true,
+    )))
+    .unwrap();
+    assert_eq!(link_a.payloads, before_a);
+    assert_eq!(hub_a.borrow().requests.len(), writes_a);
+    assert_eq!(rows(&hub_a), [1, 1, 40]);
+    assert_eq!(rows(&hub_b), [1, 0, 0]);
+    let left: Vec<_> = link_b
+        .payloads
+        .iter()
+        .map(|p| (p.stream, p.vcpi, p.start, p.slots))
+        .collect();
+    assert_eq!(left, [(3, 2, 0, 20)]);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    navi48_mst_two_ports_keep_their_own_payload_tables
+);
+
+/// The branch's VC payload ID table as the DP spec keeps it (2.6.5): a
+/// PAYLOAD_ALLOCATE_SET row with slots allocates that VCPI at its start
+/// slot; one with zero slots deletes the VCPI and moves every later
+/// payload down by its slots. The hub fake keeps only the last row.
+struct TableAux<'a> {
+    inner: Aux<'a>,
+    table: Vec<(u8, u8, u8)>,
+}
+impl MstAux for TableAux<'_> {
+    type Error = ();
+    async fn read(&mut self, address: u32, buf: &mut [u8]) -> Result<(), ()> {
+        self.inner.read(address, buf).await
+    }
+    async fn write(&mut self, address: u32, data: &[u8]) -> Result<(), ()> {
+        self.inner.write(address, data).await?;
+        if address == dp_mst_mgr::PAYLOAD_ALLOCATE_SET && data.len() == 3 {
+            let (vcpi, start, slots) = (data[0], data[1], data[2]);
+            if slots == 0 {
+                if let Some(i) = self.table.iter().position(|r| r.0 == vcpi) {
+                    let gone = self.table.remove(i);
+                    for r in self.table.iter_mut().filter(|r| r.1 > gone.1) {
+                        r.1 -= gone.2;
+                    }
+                }
+            } else if vcpi != 0 {
+                self.table.retain(|r| r.0 != vcpi);
+                self.table.push((vcpi, start, slots));
+            }
+        }
+        Ok(())
+    }
+    async fn delay(&mut self, us: u64) {
+        self.inner.delay(us).await;
+    }
+}
+
+/// A on VCPI 1 and B on VCPI 2, then A's monitor is unplugged from its
+/// still-present hub port (a live reprobe recorded A's sink in `lost`).
+/// As drm_dp_remove_payload_part1 does for any port still downstream of
+/// the primary branch (drm_dp_mst_port_downstream_of_branch walks the
+/// port's parents, which an unplugged port keeps), A's removal sends
+/// ALLOCATE_PAYLOAD with PBN 0 and clears its payload-table row, ignoring
+/// their results; the branch's table compacts as the source's does, so B
+/// sits at slot 1 for 15 slots in both and keeps running.
+fn navi48_mst_unplugged_monitor_payload_leaves_both_tables_compacted() -> TestResult {
+    let hub = RefCell::new(Hub::new());
+    let mut link = started_link(&hub);
+    let sinks = link.topology.sinks();
+    let mut aux = TableAux {
+        inner: Aux(&hub),
+        table: Vec::new(),
+    };
+    let mut source = Source {
+        hub: &hub,
+        events: Vec::new(),
+    };
+    for (k, stream) in [(0, 0u8), (1, 2)] {
+        run(alloc::boxed::Box::pin(add_payload(
+            &mut link,
+            &mut aux,
+            &mut source,
+            sinks[k],
+            stream,
+            600,
+            15,
+            (14, 1),
+        )))
+        .unwrap();
+    }
+    assert_eq!(aux.table, [(1, 1, 15), (2, 16, 15)]);
+    hub.borrow_mut().root_sink_present = false;
+    link.lost.push(sinks[0]);
+    let sent = hub.borrow().requests.len();
+    source.events.clear();
+    run(alloc::boxed::Box::pin(remove_payload(
+        &mut link,
+        &mut aux,
+        &mut source,
+        0,
+        true,
+    )))
+    .unwrap();
+    let h = hub.borrow();
+    // ALLOCATE_PAYLOAD (port 1, VCPI 1, PBN 0) to the primary branch.
+    assert_eq!(h.requests.len(), sent + 1);
+    assert_eq!(h.requests[sent].2, dp_mst::ALLOCATE_PAYLOAD);
+    assert_eq!(h.bodies.last(), Some(&vec![0x11, 0x11, 1, 0, 0, 0]));
+    assert_eq!(aux.table, [(2, 1, 15)]);
+    assert_eq!(
+        source.events,
+        [
+            Event::Rate(0, (0, 0)),
+            Event::Table(vec![(2, 15)], sent + 1)
+        ]
+    );
+    let left: Vec<_> = link
+        .payloads
+        .iter()
+        .map(|p| (p.stream, p.vcpi, p.start, p.slots))
+        .collect();
+    assert_eq!(left, [(2, 2, 1, 15)]);
+    assert_eq!(link.payload_change(), None);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    navi48_mst_unplugged_monitor_payload_leaves_both_tables_compacted
+);
+
+/// A stream behind a downstream hub that is unplugged: the child branch
+/// left with its end device, so ALLOCATE_PAYLOAD(PBN 0) goes to the last
+/// connected ancestor, the primary, at the port the hub hung off (root
+/// port 2), as drm_dp_payload_send_msg falls back to
+/// drm_dp_get_last_connected_port_and_mstb; the payload-table row is
+/// cleared and the root's stream keeps its slots in both tables.
+fn navi48_mst_departed_hub_payload_leaves_at_its_last_connected_branch() -> TestResult {
+    let mut hub = Hub::new();
+    hub.dpcd.insert(0, 0x14);
+    hub.edid[126] = 0;
+    let mut link = MstLink::default();
+    run(link.prepare(&mut hub)).unwrap();
+    link.manager.events.clear();
+    let hub = RefCell::new(hub);
+    let root_sink = dp_mst_mgr::Sink { branch: 0, port: 1 };
+    let child_sink = dp_mst_mgr::Sink { branch: 1, port: 1 };
+    let mut aux = TableAux {
+        inner: Aux(&hub),
+        table: Vec::new(),
+    };
+    let mut source = Source {
+        hub: &hub,
+        events: Vec::new(),
+    };
+    for (sink, stream) in [(child_sink, 1u8), (root_sink, 0)] {
+        run(alloc::boxed::Box::pin(add_payload(
+            &mut link,
+            &mut aux,
+            &mut source,
+            sink,
+            stream,
+            600,
+            15,
+            (14, 1),
+        )))
+        .unwrap();
+    }
+    link.owner = Some(0);
+    hub.borrow_mut().child_present = false;
+    link.dirty = true;
+    assert_eq!(run(link.reprobe_live(&mut aux)), Ok(false));
+    assert_eq!(link.lost, [child_sink]);
+    let sent = hub.borrow().requests.len();
+    run(alloc::boxed::Box::pin(remove_payload(
+        &mut link,
+        &mut aux,
+        &mut source,
+        1,
+        true,
+    )))
+    .unwrap();
+    let h = hub.borrow();
+    assert_eq!(h.requests.len(), sent + 1);
+    assert_eq!(
+        (h.requests[sent].0, h.requests[sent].2),
+        (1, dp_mst::ALLOCATE_PAYLOAD)
+    );
+    assert_eq!(h.bodies.last(), Some(&vec![0x11, 0x21, 1, 0, 0, 0]));
+    assert_eq!(aux.table, [(2, 1, 15)]);
+    let left: Vec<_> = link
+        .payloads
+        .iter()
+        .map(|p| (p.stream, p.vcpi, p.start))
+        .collect();
+    assert_eq!(left, [(0, 2, 1)]);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    navi48_mst_departed_hub_payload_leaves_at_its_last_connected_branch
+);
+
+/// Only a payload whose port is no longer downstream of the primary
+/// branch (here: a live reprobe found another primary) leaves without
+/// ALLOCATE_PAYLOAD or a payload-table row, as drm_dp_remove_payload_part1
+/// logs "not in topology"; the source still drops it with ACT.
+fn navi48_mst_payload_off_the_primary_leaves_without_addressing_it() -> TestResult {
+    let hub = RefCell::new(Hub::new());
+    let mut link = started_link(&hub);
+    let sinks = link.topology.sinks();
+    let mut source = Source {
+        hub: &hub,
+        events: Vec::new(),
+    };
+    for (k, stream) in [(0, 0u8), (1, 2)] {
+        run(alloc::boxed::Box::pin(add_payload(
+            &mut link,
+            &mut Aux(&hub),
+            &mut source,
+            sinks[k],
+            stream,
+            600,
+            15,
+            (14, 1),
+        )))
+        .unwrap();
+    }
+    link.primary_replaced = true;
+    let (sent, row) = {
+        let h = hub.borrow();
+        let row: Vec<u8> = (0..3)
+            .map(|i| h.dpcd[&(dp_mst_mgr::PAYLOAD_ALLOCATE_SET + i)])
+            .collect();
+        (h.requests.len(), row)
+    };
+    source.events.clear();
+    run(alloc::boxed::Box::pin(remove_payload(
+        &mut link,
+        &mut Aux(&hub),
+        &mut source,
+        0,
+        true,
+    )))
+    .unwrap();
+    let h = hub.borrow();
+    assert_eq!(h.requests.len(), sent);
+    let after: Vec<u8> = (0..3)
+        .map(|i| h.dpcd[&(dp_mst_mgr::PAYLOAD_ALLOCATE_SET + i)])
+        .collect();
+    assert_eq!(after, row);
+    assert_eq!(
+        source.events,
+        [Event::Rate(0, (0, 0)), Event::Table(vec![(2, 15)], sent)]
+    );
+    assert_eq!(link.payload_change(), None);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    navi48_mst_payload_off_the_primary_leaves_without_addressing_it
 );

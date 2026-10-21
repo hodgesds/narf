@@ -11,7 +11,13 @@
 //! 1.0) and the unity HDR multiplier. RGB is sRGB (post CSC bypass); a
 //! 4:2:0 plane's YCbCr goes through the post CSC with the
 //! `dpp_input_csc_matrix` of its COLOR_ENCODING / COLOR_RANGE color space
-//! (dpp401_dpp_setup's INPUT_CSC_SELECT_ICSC, dpp3_program_post_csc).
+//! (dpp401_dpp_setup's INPUT_CSC_SELECT_ICSC, dpp3_program_post_csc),
+//! double-buffered as dpp3_program_post_csc does it: the set not in use
+//! (A unless CM_POST_CSC_MODE_CURRENT reads A, then B) takes the matrix and
+//! is selected, so a color-space change latches whole at VUPDATE. Every
+//! DPP setup also programs the cursor matrix as dcn401's hwseq does after
+//! it (dpp401_set_cursor_matrix: bypass, whatever the plane's color
+//! space).
 //! FP16 needs nothing more: its values pass through and the output
 //! denormalization clamps them, as on Linux without color properties.
 use super::*;
@@ -28,6 +34,7 @@ const SCALER_POWER: u64 = 0xd24;
 const SCALER_STATUS: u64 = 0xd25;
 const CM_CONTROL: u64 = 0xd67;
 const PRE_DEGAM: u64 = 0xced;
+const GAMCOR_CONTROL: u64 = 0xd77;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DppApplied {
@@ -42,6 +49,26 @@ pub struct DppApplied {
     /// CNVC, scaler and CM pending bits, respectively. Timing is stopped, so
     /// staged programming may remain pending; zero is not presentation evidence.
     pub pending: u8,
+    /// Per segment, whether a YCbCr plane's input CSC is in coefficient
+    /// set B (INPUT_CSC_SELECT_COMA, CM_POST_CSC_B_*), not A (ICSC): the set
+    /// that segment's DPP was not using when it was last set up.
+    pub post_csc_b: PostCscSets,
+}
+/// Each segment DPP's input CSC coefficient set (bit `i`: segment `i` in
+/// set B), as dpp3_program_post_csc chooses it from that DPP's own
+/// CM_POST_CSC_MODE_CURRENT.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PostCscSets(u8);
+impl PostCscSets {
+    /// Whether segment `i` loads set B.
+    pub fn b(self, i: usize) -> bool {
+        self.0.checked_shr(i as u32).unwrap_or(0) & 1 != 0
+    }
+    fn set(&mut self, i: usize, b: bool) {
+        if i < 8 {
+            self.0 = self.0 & !(1 << i) | u8::from(b) << i;
+        }
+    }
 }
 /// Each segment's SCL_COEF_RAM_SELECT after its coefficient load (none
 /// for a segment that bypasses the scaler), for up to four segments in
@@ -65,7 +92,7 @@ impl CoefRam {
 }
 impl Layout {
     pub(super) fn dpp(self, pipe: u8, reg: u64) -> u64 {
-        self.base + (reg + u64::from(pipe) * 0x16b) * 4
+        self.base + (reg + u64::from(self.inst(pipe)) * 0x16b) * 4
     }
 }
 /// The CM_POST_CSC_C11_C12..C33_C34 words of a plane in `format`: none
@@ -84,18 +111,40 @@ pub(in crate::amdgpu_dcn401_otg) fn post_csc_words(
         u32::from(m[2 * i]) | u32::from(m[2 * i + 1]) << 16
     }))
 }
-/// CM_POST_CSC_CONTROL and its coefficient set A (CM_POST_CSC_C11_C12).
+/// CM_POST_CSC_CONTROL and its coefficient sets A (CM_POST_CSC_C11_C12)
+/// and B (CM_POST_CSC_B_C11_C12).
 const POST_CSC: u64 = 0xd68;
 const POST_CSC_C11_C12: u64 = 0xd69;
-/// The CNVC and CM state of `format`: dpp401_dpp_setup's crossbar and
-/// pixel format, and every color block in bypass but a 4:2:0 plane's post
-/// CSC: dpp3_program_post_csc loads its color space's matrix into the set
-/// not in use (A on a pipe staged from bypass) as
+const POST_CSC_B_C11_C12: u64 = 0xd6f;
+/// CM_POST_CSC_MODE_CURRENT.
+const POST_CSC_CURRENT: u32 = 0xc;
+/// CM_CUR0_CUR0_MATRIX_MODE: CUR0_MATRIX_MODE and CUR0_MATRIX_COEF_FORMAT.
+const CURSOR_MATRIX: u64 = 0xcf6;
+/// dpp3_program_post_csc's choice of coefficient set: B (COMA) when A
+/// (ICSC) is the one in use (`current`, CM_POST_CSC_MODE_CURRENT), else A.
+pub(in crate::amdgpu_dcn401_otg) const fn post_csc_set_b(current: u32) -> bool {
+    current == 1
+}
+/// dpp401_set_cursor_matrix: dpp401_program_cursor_csc with
+/// COLOR_SPACE_UNKNOWN ("we don't have cursor matrix information"), which
+/// is below COLOR_SPACE_YCBCR601 and so REG_SETs CUR0_MATRIX_MODE to
+/// CUR_MATRIX_BYPASS (the whole register 0), for RGB and YCbCr planes
+/// alike. The cursor over a YCbCr plane takes no matrix on DCN 4.0.1.
+pub(in crate::amdgpu_dcn401_otg) const CURSOR_MATRIX_WORD: u32 = 0;
+/// The CNVC and CM state of `format` on segment `i`'s DPP: dpp401_dpp_setup's
+/// crossbar and pixel format, and every color block in bypass but a 4:2:0
+/// plane's post CSC: dpp3_program_post_csc loads its color space's matrix
+/// into the set that DPP is not using (A on a pipe staged from bypass) as
 /// cm_helper_program_color_matrices packs it (C11 low, C12 high, ...) and
-/// selects it (CM_POST_CSC_MODE 1, INPUT_CSC_SELECT_ICSC).
-fn cnvc_cm(a: DppApplied) -> alloc::vec::Vec<(u64, u32, u32)> {
+/// selects it (CM_POST_CSC_MODE 1, INPUT_CSC_SELECT_ICSC, or 2, COMA).
+fn cnvc_cm(a: DppApplied, i: usize) -> alloc::vec::Vec<(u64, u32, u32)> {
     let format = a.surface.request.format;
     let csc = post_csc_words(format, a.surface.request.surface.color);
+    let (base, select) = if a.post_csc_b.b(i) {
+        (POST_CSC_B_C11_C12, 2)
+    } else {
+        (POST_CSC_C11_C12, 1)
+    };
     let mut out = alloc::vec![
         // RGB crossbar; EXPANSION_MODE_ZERO = 1; ALPHA_EN unless RGB565.
         (
@@ -119,13 +168,16 @@ fn cnvc_cm(a: DppApplied) -> alloc::vec::Vec<(u64, u32, u32)> {
     ];
     if let Some(words) = csc {
         for (i, word) in words.into_iter().enumerate() {
-            out.push((POST_CSC_C11_C12 + i as u64, u32::MAX, word));
+            out.push((base + i as u64, u32::MAX, word));
         }
     }
     out.extend([
-        (POST_CSC, 3, u32::from(csc.is_some())), // ICSC for YCbCr, else bypass
-        (0xd77, 0xf, 0),                         // gamma correction bypass
-        (0xdc5, 3, 0),                           // CM de-alpha off
+        // ICSC (set A) or COMA (set B) for YCbCr, else bypass.
+        (POST_CSC, 3, if csc.is_some() { select } else { 0 }),
+        // hwseq's step 8 after dpp_setup: the cursor matrix bypassed.
+        (CURSOR_MATRIX, 0x13, CURSOR_MATRIX_WORD),
+        (GAMCOR_CONTROL, 0xf, 0), // gamma correction bypass
+        (0xdc5, 3, 0),            // CM de-alpha off
         (0xd75, 0xffff, 0),
         (0xd76, u32::MAX, 0),
         (0xdc1, 0x7ffff, 0x1f000), // unity HDR multiplier
@@ -188,11 +240,15 @@ impl<I: Io> Engine<I> {
     }
     /// Program every segment's DPP; returns each segment's coefficient
     /// RAM selection.
-    async fn program_dpp(&mut self, applied: DppApplied) -> Result<CoefRam, Error> {
+    async fn program_dpp(&mut self, applied: &mut DppApplied) -> Result<CoefRam, Error> {
+        applied.post_csc_b = self.post_csc_choice(applied.surface.request)?;
+        let applied = *applied;
         let mut coef_ram = CoefRam::default();
         let alpha = applied.surface.request.layout().blend.per_pixel_alpha;
         for (i, (p, scaler)) in applied.surface.request.scalers().enumerate() {
-            let select = self.program_segment_dpp(applied, p, &scaler, alpha).await?;
+            let select = self
+                .program_segment_dpp(applied, i, p, &scaler, alpha)
+                .await?;
             coef_ram.set(i, select);
         }
         Ok(coef_ram)
@@ -200,6 +256,7 @@ impl<I: Io> Engine<I> {
     async fn program_segment_dpp(
         &mut self,
         applied: DppApplied,
+        i: usize,
         p: u8,
         scaler: &spl::Scaler,
         alpha: bool,
@@ -211,7 +268,7 @@ impl<I: Io> Engine<I> {
         self.wait(l.dpp(p, SCALER_STATUS), 3, 0, 1000).await?;
         self.hubp_tree_stopped(Some(p))?;
         self.dpp_stopped(p, true)?;
-        for (r, mask, value) in cnvc_cm(applied) {
+        for (r, mask, value) in cnvc_cm(applied, i) {
             self.update(l.dpp(p, r), mask, value)?;
         }
         let mut coef_ram = None;
@@ -267,8 +324,13 @@ impl<I: Io> Engine<I> {
     /// scaler are written and the coefficients loaded into the RAM not in
     /// use and selected (the selection latches with the update). Returns
     /// each segment's selection.
-    pub(super) async fn program_dpp_live(&mut self, applied: DppApplied) -> Result<CoefRam, Error> {
+    pub(super) async fn program_dpp_live(
+        &mut self,
+        applied: &mut DppApplied,
+    ) -> Result<CoefRam, Error> {
         let l = self.layout;
+        applied.post_csc_b = self.post_csc_choice(applied.surface.request)?;
+        let applied = *applied;
         let alpha = applied.surface.request.layout().blend.per_pixel_alpha;
         let mut coef_ram = CoefRam::default();
         for (i, (p, scaler)) in applied.surface.request.scalers().enumerate() {
@@ -277,7 +339,7 @@ impl<I: Io> Engine<I> {
             }
             self.update(l.dpp(p, SCALER_POWER), 7, 4)?;
             self.wait(l.dpp(p, SCALER_STATUS), 3, 0, 1000).await?;
-            for (r, mask, value) in cnvc_cm(applied) {
+            for (r, mask, value) in cnvc_cm(applied, i) {
                 self.update(l.dpp(p, r), mask, value)?;
             }
             for op in dscl::program(&scaler, alpha) {
@@ -321,6 +383,24 @@ impl<I: Io> Engine<I> {
         }
         Ok(coef_ram)
     }
+    /// The coefficient set dpp3_program_post_csc loads a plane's input CSC
+    /// into on each segment: the one that segment's own DPP is not using
+    /// (each DPP reads its CM_POST_CSC_MODE_CURRENT). Always A for RGB, whose
+    /// CSC is bypassed.
+    pub(in crate::amdgpu_dcn401_otg) fn post_csc_choice(
+        &mut self,
+        surface: SurfaceRequest,
+    ) -> Result<PostCscSets, Error> {
+        let mut sets = PostCscSets::default();
+        if !surface.format.is_video() {
+            return Ok(sets);
+        }
+        for (i, (p, _, _)) in surface.segments().enumerate() {
+            let current = (self.read(self.layout.dpp(p, POST_CSC))? & POST_CSC_CURRENT) >> 2;
+            sets.set(i, post_csc_set_b(current));
+        }
+        Ok(sets)
+    }
     pub(super) fn verify_dpp(&mut self, applied: DppApplied) -> Result<(), Error> {
         let alpha = applied.surface.request.layout().blend.per_pixel_alpha;
         for (i, (p, scaler)) in applied.surface.request.scalers().enumerate() {
@@ -332,18 +412,19 @@ impl<I: Io> Engine<I> {
                     u32::from(select) << 8,
                 )
             });
-            for (r, mask, value) in cnvc_cm(applied)
+            for (r, mask, value) in cnvc_cm(applied, i)
                 .into_iter()
                 .chain(dscl_state(&scaler, alpha))
                 .chain(coef)
                 .chain([(SCALER_POWER, 7, 4), (SCALER_STATUS, 3, 0)])
             {
-                // PRE_DEGAM follows the pipe's color record (bypass when
-                // staged; legacy gamma's sRGB once scanout programs it).
-                let value = if r == PRE_DEGAM {
-                    self.status.colors[usize::from(p)].pre_degam()
-                } else {
-                    value
+                // PRE_DEGAM and the GAMCOR follow the pipe's color record
+                // (bypass when staged; legacy gamma's implicit degamma once
+                // scanout programs it).
+                let value = match r {
+                    PRE_DEGAM => self.status.colors[usize::from(p)].pre_degam(),
+                    GAMCOR_CONTROL => self.status.colors[usize::from(p)].gamcor_control(),
+                    _ => value,
                 };
                 let at = self.layout.dpp(p, r);
                 if self.read(at)? & mask != value {
@@ -456,6 +537,7 @@ impl Surfaces {
             line_buffer_config: first.lb_memory_config(alpha) as u8,
             coef_ram: CoefRam::default(),
             pending: 0,
+            post_csc_b: Default::default(),
         };
         e.hubp_tree_stopped(Some(pipe))?;
         e.verify_surface(surface.applied)?;
@@ -470,10 +552,12 @@ impl Surfaces {
         e.status.state = State::PreparingDpp(pipe);
         // Staging writes the input transfer function's bypass.
         for (p, _, _) in surface.applied.request.segments() {
-            e.status.colors[usize::from(p)].pre_degam_srgb = false;
+            let color = &mut e.status.colors[usize::from(p)];
+            color.pre_degam = Default::default();
+            color.gamcor = None;
         }
         let result = async {
-            applied.coef_ram = e.program_dpp(applied).await?;
+            applied.coef_ram = e.program_dpp(&mut applied).await?;
             if owners()? != (clock, config) {
                 return Err(Error::Busy);
             }

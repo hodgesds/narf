@@ -88,10 +88,7 @@ struct Layout {
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
-        if gpu.chip.vid != crate::amdgpu::AMD_VENDOR
-            || gpu.chip.did != crate::amdgpu::NAVI48
-            || gpu.regs.len < 0x7f004
-        {
+        if crate::amdgpu_rdna4::Rdna4Chip::of(gpu).is_none() || gpu.regs.len < 0x7f004 {
             return Err(Error::Unsupported);
         }
         let mut blocks = gpu
@@ -109,9 +106,9 @@ impl Layout {
         };
         Ok(Self {
             // SDMA0 is in GC bank zero, NOT the standalone discovery SDMA bank.
-            gc: resolve(ip::HW_ID_GC, &[(12, 0, 1)], 0, 0x1615)?,
+            gc: resolve(ip::HW_ID_GC, crate::amdgpu_rdna4::GC_VERSIONS, 0, 0x1615)?,
             nbio: resolve(ip::HW_ID_NBIF, &[(7, 7, 0), (7, 7, 1), (6, 3, 1)], 2, 0x12d)?,
-            hyp: resolve(ip::HW_ID_GC, &[(12, 0, 1)], 1, MCU_CNTL)?,
+            hyp: resolve(ip::HW_ID_GC, crate::amdgpu_rdna4::GC_VERSIONS, 1, MCU_CNTL)?,
             oss: resolve(ip::HW_ID_OSSSYS, &[(7, 0, 0)], 0, 0x1f)?,
         })
     }
@@ -290,15 +287,80 @@ impl Slot {
 pub enum KernelOp {
     /// Fill `bytes` (a multiple of 4) at dword-aligned `dst` with `value`.
     Fill { dst: u64, bytes: u64, value: u32 },
-    /// Copy `bytes` from `src` to `dst`, non-overlapping.
-    Copy { src: u64, dst: u64, bytes: u64 },
+    /// Copy `bytes` from `src` to `dst`, non-overlapping, with
+    /// amdgpu_copy_buffer's `copy_flags` (`AMDGPU_COPY_FLAGS_*`: 0, or
+    /// READ_DECOMPRESSED / WRITE_COMPRESSED and the destination's DCC
+    /// parameters for a GFX12 DCC buffer, `copy_dcc_word`).
+    Copy {
+        src: u64,
+        dst: u64,
+        bytes: u64,
+        flags: u32,
+    },
+}
+/// amdgpu_ttm.h's AMDGPU_COPY_FLAGS_*.
+pub const AMDGPU_COPY_FLAGS_TMZ: u32 = 1 << 0;
+pub const AMDGPU_COPY_FLAGS_READ_DECOMPRESSED: u32 = 1 << 1;
+pub const AMDGPU_COPY_FLAGS_WRITE_COMPRESSED: u32 = 1 << 2;
+pub const AMDGPU_COPY_FLAGS_MAX_COMPRESSED_SHIFT: u32 = 3;
+pub const AMDGPU_COPY_FLAGS_MAX_COMPRESSED_MASK: u32 = 0x03;
+pub const AMDGPU_COPY_FLAGS_NUMBER_TYPE_SHIFT: u32 = 5;
+pub const AMDGPU_COPY_FLAGS_NUMBER_TYPE_MASK: u32 = 0x07;
+pub const AMDGPU_COPY_FLAGS_DATA_FORMAT_SHIFT: u32 = 8;
+pub const AMDGPU_COPY_FLAGS_DATA_FORMAT_MASK: u32 = 0x3f;
+pub const AMDGPU_COPY_FLAGS_WRITE_COMPRESS_DISABLE_SHIFT: u32 = 14;
+pub const AMDGPU_COPY_FLAGS_WRITE_COMPRESS_DISABLE_MASK: u32 = 0x1;
+/// sdma_v7_0_emit_copy_buffer's last COPY_LINEAR dword for `copy_flags`:
+/// with READ_DECOMPRESSED or WRITE_COMPRESSED, SDMA_DCC_DATA_FORMAT,
+/// NUM_TYPE, READ_CM(2) when reading decompressed, WRITE_CM (2 with
+/// WRITE_COMPRESS_DISABLE, else 1) when writing compressed, MAX_COM and
+/// MAX_UCOM(1) (sdma_v6_0_0_pkt_open.h's SDMA_DCC_* fields, which sdma_v7_0 includes); else 0.
+pub fn copy_dcc_word(copy_flags: u32) -> u32 {
+    let get = |shift: u32, mask: u32| (copy_flags >> shift) & mask;
+    let max_com = get(
+        AMDGPU_COPY_FLAGS_MAX_COMPRESSED_SHIFT,
+        AMDGPU_COPY_FLAGS_MAX_COMPRESSED_MASK,
+    );
+    let data_format = get(
+        AMDGPU_COPY_FLAGS_DATA_FORMAT_SHIFT,
+        AMDGPU_COPY_FLAGS_DATA_FORMAT_MASK,
+    );
+    let num_type = get(
+        AMDGPU_COPY_FLAGS_NUMBER_TYPE_SHIFT,
+        AMDGPU_COPY_FLAGS_NUMBER_TYPE_MASK,
+    );
+    let write_cm = if get(
+        AMDGPU_COPY_FLAGS_WRITE_COMPRESS_DISABLE_SHIFT,
+        AMDGPU_COPY_FLAGS_WRITE_COMPRESS_DISABLE_MASK,
+    ) != 0
+    {
+        2
+    } else {
+        1
+    };
+    if copy_flags & (AMDGPU_COPY_FLAGS_READ_DECOMPRESSED | AMDGPU_COPY_FLAGS_WRITE_COMPRESSED) == 0
+    {
+        return 0;
+    }
+    let read_cm = if copy_flags & AMDGPU_COPY_FLAGS_READ_DECOMPRESSED != 0 {
+        (2 & 0x3) << 16
+    } else {
+        0
+    };
+    let write = if copy_flags & AMDGPU_COPY_FLAGS_WRITE_COMPRESSED != 0 {
+        (write_cm & 0x3) << 18
+    } else {
+        0
+    };
+    (data_format & 0x3f) | (num_type & 0x7) << 9 | read_cm | write | (max_com & 0x3) << 24 | 1 << 26
 }
 /// Bytes one SDMA7 fill or copy packet moves (`fill_max_bytes`,
 /// `copy_max_bytes`).
 pub const MAX_PACKET_BYTES: u64 = 1 << 30;
 /// A kernel job's slot: each op as sdma_v7_0_emit_fill_buffer (CONSTANT_FILL
 /// with COMPRESS, dword fill) or sdma_v7_0_emit_copy_buffer (COPY_LINEAR
-/// with CPV, no DCC) in packets of at most 1 GiB, then the uncached fence.
+/// with CPV, TMZ from its copy flags, its DCC word `copy_dcc_word`) in
+/// packets of at most 1 GiB, then the uncached fence.
 /// Refused (`Invalid`) when an op is empty or misaligned or the packets
 /// overflow the slot.
 fn kernel_words(
@@ -330,23 +392,29 @@ fn kernel_words(
                     done += n;
                 }
             }
-            KernelOp::Copy { src, dst, bytes } => {
+            KernelOp::Copy {
+                src,
+                dst,
+                bytes,
+                flags,
+            } => {
                 if bytes == 0 || src.max(dst) - src.min(dst) < bytes {
                     return Err(Error::Invalid);
                 }
+                let tmz = u32::from(flags & AMDGPU_COPY_FLAGS_TMZ != 0) << 18;
                 let mut done = 0;
                 while done < bytes {
                     let n = (bytes - done).min(MAX_PACKET_BYTES);
                     let (from, to) = (src + done, dst + done);
                     slot.push(&[
-                        1 | 1 << 19,
+                        1 | tmz | 1 << 19,
                         (n - 1) as u32,
                         0,
                         from as u32,
                         (from >> 32) as u32,
                         to as u32,
                         (to >> 32) as u32,
-                        0,
+                        copy_dcc_word(flags),
                     ])?;
                     done += n;
                 }

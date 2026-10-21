@@ -415,3 +415,20 @@ kernel_test_in!(
     "drivers/gpu/navi48-ras",
     navi48_ras_layout_uses_umc_discovery_and_nbif_631
 );
+
+fn rdna4_ras_is_navi48_only_as_linux_asic_supported() -> TestResult {
+    use crate::amdgpu_rdna4::{tests::Profile, Rdna4Chip};
+    let mut words = vec![0; 0x80000 / 4];
+    for profile in Profile::ALL {
+        let mut gpu = crate::amdgpu_gmc_navi48::tests::descriptor(&mut words);
+        profile.apply(&mut gpu);
+        if asic_supported(&gpu) != (profile.chip() == Rdna4Chip::Navi48) {
+            return TestResult::Fail("RAS ASIC support not keyed on MP0 14.0.3");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-ras",
+    rdna4_ras_is_navi48_only_as_linux_asic_supported
+);

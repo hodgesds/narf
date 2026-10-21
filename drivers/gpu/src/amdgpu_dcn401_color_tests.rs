@@ -238,20 +238,26 @@ kernel_test_in!(
     dcn401_color_gamut_remap_alternates_sets
 );
 
-/// dpp3_set_pre_degam's sRGB ROM for legacy gamma (mode 1, select 0) or
-/// bypass; the GAMCOR stays bypassed with CM enabled.
+/// dpp3_set_pre_degam's sRGB ROM for an RGB plane under legacy gamma
+/// (mode 1, select 0) or bypass, the GAMCOR bypassed; the BT.709 points of
+/// an NV12 plane bypass the ROM and select the GAMCOR RAM they were loaded
+/// into (B from bypass); CM enabled throughout.
 fn dcn401_color_input_tf_selects_the_srgb_rom() -> TestResult {
-    for srgb in [true, false] {
+    for (tf, word, gamcor, bank) in [
+        (InputTf::Srgb, 1, 0, None),
+        (InputTf::Bypass, 0, 0, None),
+        (InputTf::Bt709, 0, 2 | 4, Some(1)),
+    ] {
         let mut e = engine();
         e.io.regs.insert(dpp(0, 0xced), 0x52);
         e.io.regs.insert(dpp(0, 0xd77), 0xa);
         e.io.regs.insert(dpp(0, 0xd67), 1);
-        if e.program_input_tf(0, srgb).is_err()
-            || e.io.regs[&dpp(0, 0xced)] & 0x73 != u32::from(srgb)
-            || e.io.regs[&dpp(0, 0xd77)] & 0xf != 0
+        if e.program_input_tf(0, tf) != Ok(bank)
+            || e.io.regs[&dpp(0, 0xced)] & 0x73 != word
+            || e.io.regs[&dpp(0, 0xd77)] & 0xf != gamcor
             || e.io.regs[&dpp(0, 0xd67)] & 1 != 0
         {
-            return TestResult::Fail("pre-degamma");
+            return TestResult::Fail("input transfer function");
         }
     }
     TestResult::Pass
@@ -259,6 +265,57 @@ fn dcn401_color_input_tf_selects_the_srgb_rom() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-color",
     dcn401_color_input_tf_selects_the_srgb_rom
+);
+
+/// tests/dcn401_yuv/gamcor_vectors.txt: every register write Linux's
+/// dcn32_set_input_transfer_func makes for each format under legacy gamma
+/// (map_crtc_degamma_to_dc_plane through mod_color_calculate_degamma_params,
+/// dpp3_set_pre_degam, cm3_helper_translate_curve_to_degamma_hw_format and
+/// dpp3_program_gamcor_lut), from a DPP whose GAMCOR is bypassed, on RAM A
+/// or on RAM B, in order and with its values (CM_GAMCOR_CONTROL's read-only
+/// MODE/SELECT_CURRENT left out).
+fn dcn401_color_input_tf_matches_linux_gamcor_vectors() -> TestResult {
+    use core::fmt::Write;
+    const VECTORS: &str = include_str!("../tests/dcn401_yuv/gamcor_vectors.txt");
+    let mut n = 0;
+    for line in VECTORS.lines().filter(|l| !l.starts_with('#')) {
+        let (input, want) = line.split_once(" = ").unwrap();
+        let (code, control) = input.split_once(' ').unwrap();
+        let code = code.as_bytes();
+        let fourcc = u32::from_le_bytes([code[0], code[1], code[2], code[3]]);
+        let control = u32::from_str_radix(control, 16).unwrap();
+        let format = SurfaceFormat::from_fourcc(fourcc).unwrap();
+        let mut e = engine();
+        e.io.regs.insert(dpp(0, 0xd77), control);
+        if e.program_input_tf(0, InputTf::implicit(format)).is_err() {
+            return TestResult::Fail("input transfer function refused");
+        }
+        let mut got = alloc::string::String::new();
+        let _ = write!(got, "{}", e.io.writes.len());
+        for &(at, value) in &e.io.writes {
+            let reg = (at - BASE) / 4;
+            let value = if reg == 0xd77 { value & !0x70 } else { value };
+            let _ = write!(got, " {reg:x}:{value:x}");
+        }
+        if got != want {
+            let _ = writeln!(
+                narf_console::Writer,
+                "dcn401_yuv gamcor: {input}: got {}, want {}",
+                &got[..got.len().min(160)],
+                &want[..want.len().min(160)]
+            );
+            return TestResult::Fail("input transfer function differs from Linux");
+        }
+        n += 1;
+    }
+    if n != 15 {
+        return TestResult::Fail("vector count");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-color",
+    dcn401_color_input_tf_matches_linux_gamcor_vectors
 );
 
 /// A dark display only records its color; the record drives programming
@@ -281,7 +338,8 @@ fn dcn401_color_records_without_live_scanout() -> TestResult {
     }
     // The verifier reads what the record says.
     e.status.colors[1] = PipeColor {
-        pre_degam_srgb: true,
+        pre_degam: PreDegam::Srgb,
+        gamcor: None,
         gamut: Some((2, false)),
         ogam: Some(1),
     };
@@ -364,4 +422,61 @@ fn dcn401_color_maps_crtc_blobs_like_amdgpu_dm() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-color",
     dcn401_color_maps_crtc_blobs_like_amdgpu_dm
+);
+
+/// amdgpu_dm_update_plane_color_mgmt on DCN 4.0.1 (no plane color
+/// property): a plane's input transfer function is bypassed unless the
+/// CRTC's legacy gamma asks for map_crtc_degamma_to_dc_plane's implicit
+/// degamma, which is BT.709 for an NV12 plane (VIDEO_420_YCrCb) and sRGB
+/// for an RGB or P010 (VIDEO_420_10bpc_YCrCb) one; each HUBP/DPP takes the
+/// one of the plane it fetches, ODM segments included.
+fn dcn401_color_input_tf_follows_the_planes_format() -> TestResult {
+    use crate::amdgpu_dcn401_otg::{SplitPipes, SurfaceRequest};
+    let plane = |pipe: u8, odm: SplitPipes, format: SurfaceFormat| {
+        let request = SurfaceRequest {
+            pipe,
+            width: 64,
+            height: 32,
+            format,
+            odm,
+            mpc: SplitPipes::NONE,
+            plane: None,
+            surface: Default::default(),
+        };
+        let b = request.bytes();
+        SurfaceApplied::staged(request, 0x8_0000_0000, b.pitch_bytes, b.bytes)
+    };
+    for (format, want) in [
+        (SurfaceFormat::Nv12, InputTf::Bt709),
+        (SurfaceFormat::P010, InputTf::Srgb),
+        (SurfaceFormat::Xrgb8888, InputTf::Srgb),
+        (SurfaceFormat::Abgr16161616f, InputTf::Srgb),
+    ] {
+        for legacy in [false, true] {
+            let mut e = engine();
+            e.status.surfaces[0] = Some(plane(0, SplitPipes::one(1), format));
+            e.status.surfaces[2] = Some(plane(2, SplitPipes::NONE, SurfaceFormat::Nv12));
+            e.displays.color[0] = Some(Arc::new(ColorProgram {
+                pre_degam_srgb: legacy,
+                ..Default::default()
+            }));
+            let want = if legacy { want } else { InputTf::Bypass };
+            if e.input_tf(0, 0) != want || e.input_tf(0, 1) != want {
+                return TestResult::Fail("plane's implicit degamma");
+            }
+            let overlay = if legacy {
+                InputTf::Bt709
+            } else {
+                InputTf::Bypass
+            };
+            if e.input_tf(0, 2) != overlay {
+                return TestResult::Fail("overlay's implicit degamma");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-color",
+    dcn401_color_input_tf_follows_the_planes_format
 );

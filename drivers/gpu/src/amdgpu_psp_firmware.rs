@@ -6,6 +6,8 @@
 pub const NAVI22_SOS: &str = crate::amdgpu_rdna2::NAVI22.firmware.sos;
 pub const PSP14_0_2_SOS: &str = "amdgpu/psp_14_0_2_sos.bin";
 pub const PSP14_0_3_SOS: &str = "amdgpu/psp_14_0_3_sos.bin";
+/// `psp_init_sos_microcode` on an `amdgpu_is_kicker_fw` board.
+pub const PSP14_0_3_SOS_KICKER: &str = "amdgpu/psp_14_0_3_sos_kicker.bin";
 pub const STAGING_SIZE: usize = 1024 * 1024; // linux: PSP_1_MEG
 const MAX_CONTAINER: usize = 8 * STAGING_SIZE; // linux: n/a (NARF bound)
 
@@ -47,6 +49,7 @@ impl Component {
 pub struct Image<'a> {
     components: [Option<(Component, &'a [u8])>; 9],
     version: u32,
+    sos_version: u32,
     toc: Option<&'a [u8]>,
 }
 fn word(bytes: &[u8], offset: usize) -> u32 {
@@ -143,6 +146,9 @@ impl<'a> Image<'a> {
             ],
             // linux-lit: 16=offsetof(struct common_firmware_header, ucode_version)
             version: word(bytes, 16),
+            // psp_init_sos_base_fw: sos.fw_version = header.ucode_version.
+            // linux-lit: 16=offsetof(struct common_firmware_header, ucode_version)
+            sos_version: word(bytes, 16),
             toc: (toc_size != 0).then(|| &payload[toc_offset..toc_offset + toc_size]),
         })
     }
@@ -172,8 +178,15 @@ impl<'a> Image<'a> {
         let payload = bytes.get(start..end).ok_or(Error::Invalid)?;
         let mut parts = [None; 12];
         let mut ranges = [(0usize, 0usize); 12];
+        let mut sos_version = 0;
         for descriptor in bytes[36..36 + count * 16].chunks_exact(16) {
             let kind = word(descriptor, 0) as usize;
+            if kind == 1 {
+                // parse_sos_bin_descriptor, PSP_FW_TYPE_PSP_SOS:
+                // sos.fw_version = desc->fw_version.
+                // linux-lit: 4=offsetof(struct psp_fw_bin_desc, fw_version)
+                sos_version = word(descriptor, 4);
+            }
             if !(1..=11).contains(&kind) {
                 return Err(Error::Unsupported);
             }
@@ -211,11 +224,18 @@ impl<'a> Image<'a> {
                 part(1, Component::SecureOs),
             ],
             version: word(bytes, 16),
+            sos_version,
             toc: parts[4],
         })
     }
     pub fn version(&self) -> u32 {
         self.version
+    }
+    /// `psp->sos.fw_version`: the common header's `ucode_version` for a v1
+    /// container (`psp_init_sos_base_fw`), the SOS descriptor's
+    /// `fw_version` for PSP14's v2.0 (`parse_sos_bin_descriptor`).
+    pub fn sos_version(&self) -> u32 {
+        self.sos_version
     }
     /// Payload of the optional embedded TOC used by GPCOM LOAD_TOC. v1.0 and
     /// v1.2 have no TOC; their TMR uses the PSP11 default size instead.

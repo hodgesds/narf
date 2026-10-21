@@ -1,6 +1,8 @@
-//! Native DCN401 Display Stream Compression on a pipe's own DSC (DSC n on
-//! OPP n; with ODM 2:1, 3:1 or 4:1 each segment's OPP feeds its own DSC,
-//! which compresses its segment of the line with its share of the slices),
+//! Native DCN401 Display Stream Compression on a pipe's own DSC (pipe n's
+//! DSC is DSC n, dcn20_acquire_dsc by pipe index, fed from pipe n's OPP
+//! instance; with ODM 2:1, 3:1 or 4:1 each segment's pipe's OPP feeds that
+//! pipe's DSC, which compresses its segment of the line with its share of
+//! the slices),
 //! as Linux's
 //! link_set_dsc_on_stream drives it for DP SST (DIO or HPO) and HDMI FRL:
 //! the DSC power domain (dcn32_dsc_pg_control), dsc_write_to_registers,
@@ -195,13 +197,20 @@ impl<I: Io> Engine<I> {
     fn dsc_forward_at(&self, dsc: u8) -> u64 {
         self.layout.base + (FORWARD + u64::from(dsc)) * 4
     }
-    /// DSC `dsc` neither clocked nor forwarding, and no other DSC fed by
-    /// OPP `dsc`.
-    pub(super) fn dsc_idle(&mut self, dsc: u8) -> Result<(), Error> {
+    /// DSCRM_DSC_FORWARD_CONFIG as dsc401_enable(dsc, opp_pipe) leaves it
+    /// for pipe `pipe`: forwarding, from the pipe's OPP instance.
+    fn dsc_forward(&self, pipe: u8) -> u32 {
+        1 | self.layout.inst_field(pipe) << 4
+    }
+    /// Pipe `pipe`'s DSC neither clocked nor forwarding, and no other DSC
+    /// (all four are checked) fed by the pipe's OPP instance.
+    pub(super) fn dsc_idle(&mut self, pipe: u8) -> Result<(), Error> {
+        let dsc = self.layout.pool.dsc(pipe);
+        let opp = self.layout.inst_field(pipe);
         for k in 0..4u8 {
             let forward = self.read(self.dsc_forward_at(k))?;
             let mine = k == dsc;
-            if forward & 1 != 0 && (mine || (forward >> 4) & 7 == u32::from(dsc)) {
+            if forward & 1 != 0 && (mine || (forward >> 4) & 7 == opp) {
                 return Err(Error::Busy);
             }
         }
@@ -254,8 +263,9 @@ impl<I: Io> Engine<I> {
         let pipe = request.pipe;
         // Each segment's DSC from its own OPP, the left one (this pipe's)
         // first, as dcn401_add_dsc_sequence_for_odm_change orders them.
-        for dsc in core::iter::once(pipe).chain(request.odm) {
-            self.dsc_idle(dsc)?;
+        for p in core::iter::once(pipe).chain(request.odm) {
+            self.dsc_idle(p)?;
+            let dsc = self.layout.pool.dsc(p);
             if !self.dsc_powered(dsc)? {
                 self.dsc_power(dsc, true).await?;
             }
@@ -270,7 +280,7 @@ impl<I: Io> Engine<I> {
                 }
             }
             self.update(self.dsc_at(dsc, TOP_CONTROL), 1, 1)?;
-            self.update(self.dsc_forward_at(dsc), 0x71, 1 | u32::from(dsc) << 4)?;
+            self.update(self.dsc_forward_at(dsc), 0x71, self.dsc_forward(p))?;
         }
         Ok(())
     }
@@ -309,7 +319,8 @@ impl<I: Io> Engine<I> {
         let regs = dsc_registers(request, cfg)?;
         let segment = segment_registers(request, cfg)?;
         let pipe = request.pipe;
-        for dsc in core::iter::once(pipe).chain(request.odm) {
+        for p in core::iter::once(pipe).chain(request.odm) {
+            let dsc = self.layout.pool.dsc(p);
             for (reg, value) in dsc_values(&segment) {
                 let at = self.dsc_at(dsc, reg);
                 if self.read(at)? != value {
@@ -318,7 +329,7 @@ impl<I: Io> Engine<I> {
             }
             for (at, mask, value) in [
                 (self.dsc_at(dsc, TOP_CONTROL), 1, 1),
-                (self.dsc_forward_at(dsc), 0x71, 1 | u32::from(dsc) << 4),
+                (self.dsc_forward_at(dsc), 0x71, self.dsc_forward(p)),
             ] {
                 if self.read(at)? & mask != value {
                     return Err(Error::Readback(at));
@@ -362,12 +373,13 @@ impl<I: Io> Engine<I> {
     /// is.
     pub(super) async fn stop_dsc(&mut self, pipe: u8) -> Result<(), Error> {
         let l = self.layout;
-        let forward = self.read(self.dsc_forward_at(pipe))?;
-        if forward & 1 != 0 && (forward >> 4) & 7 != u32::from(pipe) {
+        let dsc = l.pool.dsc(pipe);
+        let forward = self.read(self.dsc_forward_at(dsc))?;
+        if forward & 1 != 0 && (forward >> 4) & 7 != l.inst_field(pipe) {
             return Err(Error::Busy);
         }
-        let powered = self.dsc_powered(pipe)?;
-        let clocked = powered && self.read(self.dsc_at(pipe, TOP_CONTROL))? & 1 != 0;
+        let powered = self.dsc_powered(dsc)?;
+        let clocked = powered && self.read(self.dsc_at(dsc, TOP_CONTROL))? & 1 != 0;
         if self.read(l.odm(pipe, FORMAT))? & 0x30 != 0 {
             self.update(l.odm(pipe, FORMAT), 0x30, 0)?;
             self.update(l.odm(pipe, BYTES_PER_PIXEL), 0x7fff_ffff, 0)?;
@@ -383,10 +395,10 @@ impl<I: Io> Engine<I> {
         if forward & 1 == 0 && !clocked {
             return Ok(());
         }
-        self.update(self.dsc_forward_at(pipe), 1, 0)?;
-        self.update(self.dsc_at(pipe, TOP_CONTROL), 1, 0)?;
+        self.update(self.dsc_forward_at(dsc), 1, 0)?;
+        self.update(self.dsc_at(dsc, TOP_CONTROL), 1, 0)?;
         if powered {
-            self.dsc_power(pipe, false).await?;
+            self.dsc_power(dsc, false).await?;
         }
         Ok(())
     }
@@ -405,10 +417,12 @@ impl Otg {
     }
     /// DSC `pipe`'s DSCCLK back on REFCLK; its DSC must be off.
     pub(crate) fn stop_dscclk(&mut self, dccg: &mut dccg::Dccg, pipe: u8) -> Result<(), Error> {
-        if pipe >= 4 {
+        if pipe >= self.0.layout.pool.count() {
             return Err(Error::Invalid);
         }
-        let forward = self.0.read(self.0.dsc_forward_at(pipe))?;
+        let forward = self
+            .0
+            .read(self.0.dsc_forward_at(self.0.layout.pool.dsc(pipe)))?;
         if forward & 1 != 0 {
             return Err(Error::Busy);
         }

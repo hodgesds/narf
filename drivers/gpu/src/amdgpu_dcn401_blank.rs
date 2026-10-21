@@ -77,8 +77,8 @@ impl<I: Io> Engine<I> {
             (l.otg(p, V_CONTROL), 0xffff0013, 0),
             (l.otg(p, CLOCK), 0x113, 0x103),
             (l.odm(p, INPUT_CLOCK), 7, 7),
-            (l.odm(p, SOURCE), 0xffff0003, plan.source(connected)),
-            (l.odm(p, MEMORY), 0xffff, plan.memory()),
+            (l.odm(p, SOURCE), 0xffff0003, plan.source(l.pool, connected)),
+            (l.odm(p, MEMORY), 0xffff, plan.memory(l.pool)),
             (
                 l.odm(p, FORMAT),
                 0x33,
@@ -115,9 +115,9 @@ impl<I: Io> Engine<I> {
         let p = blank.request.pipe;
         // Native DCN401 workaround requires VTG before master enable.
         let plan = blank.timing.request.plan()?;
-        self.update(l.odm(p, SOURCE), 0xffff0003, plan.source(true))?;
+        self.update(l.odm(p, SOURCE), 0xffff0003, plan.source(l.pool, true))?;
         if plan.request.odm.is_some() {
-            self.update(l.odm(p, MEMORY), 0xffff, plan.memory())?;
+            self.update(l.odm(p, MEMORY), 0xffff, plan.memory(l.pool))?;
         }
         self.update(l.vtg(p), 0x80000000, 0x80000000)?;
         self.update(l.otg(p, CONTROL), 0x301, 0x201)?;
@@ -206,7 +206,9 @@ impl<I: Io> Engine<I> {
             let running = self.enable_blank(blank, timeout_us).await?;
             let l = self.layout;
             for (at, mask) in l.idle {
-                if at != l.otg(pipe, CONTROL)
+                // A fused OTG's witnesses are (0, 0): never read.
+                if mask != 0
+                    && at != l.otg(pipe, CONTROL)
                     && at != l.otg(pipe, CLOCK)
                     && !self.sibling_register(at)
                     && self.read(at)? & mask != 0
@@ -249,7 +251,7 @@ impl Otg {
         if !self.0.status.state.reusable() {
             return Err(Error::Busy);
         }
-        if pipe >= 4 {
+        if pipe >= self.0.layout.pool.count() {
             return Err(Error::Invalid);
         }
         let (held, layout) = self.0.held();

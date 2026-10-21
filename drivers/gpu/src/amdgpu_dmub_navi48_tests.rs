@@ -33,6 +33,10 @@ struct Fake {
     corrupt: Option<(usize, u8)>,
     aux_corrupt: Option<(usize, u8)>,
     complete_pointer: Option<u32>,
+    /// Firmware acknowledges inbox0 commands (DMCUB_SCRATCH17).
+    inbox0: bool,
+    /// dmub_feature_caps.fw_assisted_mclk_switch_ver the caps query reports.
+    fams_version: u8,
 }
 impl Fake {
     fn slot(&self, offset: usize) -> [u8; 64] {
@@ -64,7 +68,7 @@ impl Fake {
                 assert_eq!(&request[..4], &[6, 0, 1, 14]);
                 request[2] = 0;
                 request[4] = 1;
-                request[5] = 0x21;
+                request[5] = self.fams_version;
                 request[16] = 1;
             }
             82 => {
@@ -127,6 +131,14 @@ impl Io for Fake {
         if address == 0x7f000 {
             self.dirty = false;
             self.invalidated = true;
+        }
+        if address == DCN + 0x1d2 * 4 && self.inbox0 {
+            assert_eq!(
+                self.regs.get(&(DCN + 0x1f4 * 4)),
+                Some(&0),
+                "stale inbox0 ack"
+            );
+            self.regs.insert(DCN + 0x1f4 * 4, 1);
         }
         if address == DCN + 0x1f8 * 4 && value == 0x10010000 && self.gpint {
             self.regs.insert(address, 0x10000);
@@ -240,6 +252,8 @@ fn fixture() -> (Pool, Engine<Fake>) {
             corrupt: None,
             aux_corrupt: None,
             complete_pointer: None,
+            inbox0: true,
+            fams_version: 0x21,
         },
         authority: Cap::bootstrap(),
         layout: Layout {

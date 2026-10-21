@@ -142,6 +142,9 @@ pub struct Request {
     pub display_khz: u32,
     pub dpp_khz: u32,
     pub dtb_khz: u32,
+    /// The configuration's deep-sleep DCFCLK (DPMM's deepsleep_dcfclk_khz):
+    /// PMFW's SetMinDeepSleepDcfclk floor. Zero leaves it as it is.
+    pub deep_sleep_dcfclk_khz: u32,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Applied {
@@ -152,13 +155,105 @@ pub struct Applied {
     pub dtb_khz: u32,
     /// Acknowledged requested floors, not measurements of instantaneous clocks.
     pub dcf_floor_khz: u32,
+    /// The active UCLK floor: the highest level while UCLK switching is
+    /// disallowed, else the configuration's DPMM UCLK.
     pub memory_floor_khz: u32,
+    /// SetUclkPstateAllow(1) is in force: PMFW may switch UCLK between the
+    /// floor and its maximum while displays run.
+    pub uclk_pstate: bool,
+}
+
+/// The memory and fabric part of DC's `dc_clocks` that dcn401_update_clocks'
+/// bandwidth sequence programs (bw_ctx.bw.dcn.clk as
+/// dml21_copy_clocks_to_dc_state fills it from DML21), in kHz.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Bandwidth {
+    /// p_state_change_support (DML's uclk_pstate_supported).
+    pub uclk_pstate: bool,
+    /// fclk_p_state_change_support.
+    pub fclk_pstate: bool,
+    /// dramclk_khz / idle_dramclk_khz: DPMM's active and idle UCLK.
+    pub dramclk_khz: u32,
+    pub idle_dramclk_khz: u32,
+    /// fclk_khz / idle_fclk_khz.
+    pub fclk_khz: u32,
+    pub idle_fclk_khz: u32,
+    /// dcfclk_deep_sleep_khz.
+    pub deep_sleep_dcfclk_khz: u32,
+}
+
+impl Bandwidth {
+    /// dcn401_init_clocks: P-state support set, every clock zero.
+    const INIT: Self = Self {
+        uclk_pstate: true,
+        fclk_pstate: false,
+        dramclk_khz: 0,
+        idle_dramclk_khz: 0,
+        fclk_khz: 0,
+        idle_fclk_khz: 0,
+        deep_sleep_dcfclk_khz: 0,
+    };
+    /// A configuration without UCLK or FCLK P-state support: both at the
+    /// highest level. `deep_sleep_dcfclk_khz` is left to the caller.
+    pub fn pinned(levels: &Levels) -> Self {
+        let uclk = levels.range(Clock::Memory).max_khz();
+        let fclk = levels.range(Clock::Fabric).max_khz();
+        Self {
+            uclk_pstate: false,
+            fclk_pstate: false,
+            dramclk_khz: uclk,
+            idle_dramclk_khz: uclk,
+            fclk_khz: fclk,
+            idle_fclk_khz: fclk,
+            deep_sleep_dcfclk_khz: 0,
+        }
+    }
+}
+
+/// khz_to_mhz_ceil.
+fn mhz_ceil(khz: u32) -> u32 {
+    khz.div_ceil(1000)
+}
+/// should_set_clock.
+fn should_set(safe_to_lower: bool, new: u32, cur: u32) -> bool {
+    (safe_to_lower && new < cur) || new > cur
+}
+/// should_update_pstate_support: support is gained only when lowering
+/// clocks is safe, and lost only before programming.
+fn should_update_pstate(safe_to_lower: bool, new: bool, cur: bool) -> bool {
+    cur != new && ((new && safe_to_lower) || (!new && !safe_to_lower))
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Status {
     pub state: State,
     pub levels: Option<Levels>,
     pub applied: Option<Applied>,
+    /// What the bandwidth sequence last programmed (clk_mgr's `clks`).
+    pub bandwidth: Bandwidth,
+    /// DAL messages PMFW refused whose result Linux ignores.
+    pub ignored: Ignored,
+}
+impl Status {
+    /// Whether PMFW may switch UCLK under running displays: a bandwidth
+    /// sequence this owner ran since its first `prepare` allowed it. Before
+    /// that nothing was programmed (`Bandwidth::INIT`'s P-state support is
+    /// dcn401_init_clocks' software state, not something PMFW was told), so
+    /// a configuration change has nothing to pin, as Linux's first
+    /// prepare_bandwidth has nothing to fail on.
+    pub fn uclk_switching(&self) -> bool {
+        self.applied.is_some() && self.bandwidth.uclk_pstate
+    }
+}
+/// The bandwidth sequence's, NumOfDisplays' and the watermark notify's DAL
+/// messages are dcn401_smu_* helpers whose result dcn401's clock manager
+/// never reads: PMFW's refusal of a sent message (or an unacknowledged
+/// ActiveUclkFclk/IdleUclkFclk/UCLK floor) is logged and counted here, and
+/// the sequence goes on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ignored {
+    pub count: u32,
+    /// The last one: its message and why.
+    pub last: Option<(u32, Error)>,
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Layout {
@@ -166,15 +261,27 @@ pub(crate) struct Layout {
     dccg: u64,
     dio: u64,
     hpo: u64,
+    /// The display resource pool: a fused pipe's OTG is no idle witness.
+    pool: crate::amdgpu_rdna4::PipePool,
+    /// The die, for dcn401_is_ppclk_idle_dpm_enabled's PMFW versions.
+    chip: Option<crate::amdgpu_rdna4::Rdna4Chip>,
 }
 impl Layout {
     pub(crate) fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
-        if gpu.chip.vid != crate::amdgpu::AMD_VENDOR || gpu.chip.did != crate::amdgpu::NAVI48 {
+        let chip = crate::amdgpu_rdna4::Rdna4Chip::of(gpu);
+        if chip.is_none() {
             return Err(Error::Unsupported);
         }
-        bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 0, 0).map_err(|_| Error::Unsupported)?;
-        let mp1 = bank(gpu, ip::HW_ID_MP1, &[(14, 0, 2), (14, 0, 3)], 1, MESSAGE)
+        bank(gpu, ip::HW_ID_GC, crate::amdgpu_rdna4::GC_VERSIONS, 0, 0)
             .map_err(|_| Error::Unsupported)?;
+        let mp1 = bank(
+            gpu,
+            ip::HW_ID_MP1,
+            crate::amdgpu_rdna4::MP_VERSIONS,
+            1,
+            MESSAGE,
+        )
+        .map_err(|_| Error::Unsupported)?;
         // Linux DAL uses absolute DWORD addresses 0x1628a/0x16273/0x16274.
         // Require discovery to agree rather than borrowing another MP1 bank.
         if mp1 != 0x16200 * 4 {
@@ -188,6 +295,8 @@ impl Layout {
                 .map_err(|_| Error::Unsupported)?,
             hpo: bank(gpu, ip::HW_ID_DCN, &[(4, 0, 1), (4, 1, 0)], 3, 0x95c)
                 .map_err(|_| Error::Unsupported)?,
+            pool: crate::amdgpu_rdna4::pipe_pool(),
+            chip,
         })
     }
     pub(crate) fn hpo_link_clock(self) -> u64 {
@@ -219,6 +328,12 @@ impl Layout {
             .enumerate()
             {
                 regs[i * 17 + j] = (self.dio + (reg + i as u64 * stride) * 4, mask);
+            }
+            // The OTG witnesses (the first two) of a fused pipe: Linux never
+            // reads a fused timing generator. Every consumer skips mask 0.
+            if self.pool.pipe(i as u8).is_none() {
+                regs[i * 17] = (0, 0);
+                regs[i * 17 + 1] = (0, 0);
             }
         }
         // The single FRL stream lives in DCN bank 3, unlike HPO DP's bank 2.
@@ -286,7 +401,7 @@ impl<I: Io> Engine<I> {
         let regs = self.layout.idle_registers();
         self.access(|io| {
             for (at, mask) in regs {
-                if !held(at) && checked(io.read(at))? & mask != 0 {
+                if mask != 0 && !held(at) && checked(io.read(at))? & mask != 0 {
                     return Err(Error::Busy);
                 }
             }
@@ -312,10 +427,12 @@ impl<I: Io> Engine<I> {
         parameter: u32,
         deadline: narf_time::Deadline,
     ) -> Result<u32, Error> {
-        let ready = self.settled(deadline).await?;
-        if ready != 1 {
-            return Err(Error::Rejected(ready));
-        }
+        // dcn401_smu_send_msg_with_param only waits for a nonzero response
+        // (whatever an earlier message, this owner's or not, left there, a
+        // refusal included) and then sends. Unlike Linux, which sends anyway
+        // after two seconds, a register still zero at the deadline fails
+        // before any write.
+        self.settled(deadline).await?;
         if deadline.expired() {
             return Err(Error::Timeout);
         }
@@ -481,6 +598,316 @@ impl<I: Io> Engine<I> {
         }
         Ok(actual)
     }
+    /// dcn401_is_ppclk_idle_dpm_enabled for both UCLK and FCLK, with their
+    /// DPM (more than one level): PMFW then takes separate active and idle
+    /// UCLK/FCLK floors (ActiveUclkFclk, IdleUclkFclk) instead of a UCLK
+    /// hard minimum.
+    fn idle_dpm(&self, levels: &Levels) -> bool {
+        let dpm = |c: Clock| levels.range(c).count > 1;
+        dpm(Clock::Memory)
+            && dpm(Clock::Fabric)
+            && self
+                .layout
+                .chip
+                .is_some_and(|chip| levels.firmware >= chip.idle_dpm_min_smu())
+    }
+    /// dcn401_smu_send_msg_with_param where the caller ignores the result:
+    /// PMFW's refusal of the sent message is recorded (`Status::ignored`)
+    /// and logged; a transport failure (nothing sent, or no answer) still
+    /// fails. `command_until` reports `Rejected` only after its write, so
+    /// an unsent message is never counted as refused.
+    async fn command_ignored(&mut self, message: u32, parameter: u32) -> Result<(), Error> {
+        match self.command(message, parameter).await {
+            Ok(_) => Ok(()),
+            Err(e @ Error::Rejected(_)) => {
+                self.ignore(message, e);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+    fn ignore(&mut self, message: u32, error: Error) {
+        let i = &mut self.status.ignored;
+        i.count = i.count.saturating_add(1);
+        i.last = Some((message, error));
+        let _ = core::fmt::Write::write_fmt(
+            &mut narf_console::Writer,
+            format_args!("amdgpu: dcn401 DAL message {message:#x} not honoured: {error:?}\n"),
+        );
+    }
+    /// dcn401_smu_wait_hard_min_status after a floor whose result Linux
+    /// ignores: ReturnHardMinStatus until `clock` is acknowledged, for at
+    /// most one second (a refused status reads as no bits); no
+    /// acknowledgement is recorded and logged as ignored.
+    async fn hard_min_settled_ignored(&mut self, message: u32, clock: Clock) -> Result<(), Error> {
+        let deadline = narf_time::Deadline::after_ms(1000);
+        loop {
+            let bits = match self.command(0x15, 0).await {
+                Ok(bits) => bits,
+                Err(Error::Rejected(_)) => 0,
+                Err(e) => return Err(e),
+            };
+            if bits & (1 << clock as u32) != 0 {
+                return Ok(());
+            }
+            if deadline.expired() {
+                self.ignore(message, Error::HardMinTimeout(clock));
+                return Ok(());
+            }
+            delay().await;
+        }
+    }
+    /// The UCLK/FCLK and deep-sleep DCFCLK steps of
+    /// dcn401_build_update_bandwidth_clocks_sequence towards `new`, from
+    /// the last programmed `status.bandwidth` (`planes`: the configuration
+    /// scans planes out). With no firmware-assisted method in use, FAMS
+    /// (SetAlwaysWaitDmcubResp, IndicateDrrStatus) and the SubVP/CAB
+    /// steps never run. Returns what is now programmed and the active UCLK
+    /// floor in kHz; `status.bandwidth` is the caller's to store.
+    async fn bandwidth(
+        &mut self,
+        new: Bandwidth,
+        safe_to_lower: bool,
+        planes: bool,
+    ) -> Result<(Bandwidth, u32), Error> {
+        let levels = self.status.levels.ok_or(Error::Invalid)?;
+        let dpm = |c: Clock| levels.range(c).count > 1;
+        let idle_dpm = self.idle_dpm(&levels);
+        let cur = self.status.bandwidth;
+        let mut next = cur;
+        let mut active_uclk = mhz_ceil(cur.dramclk_khz);
+        let mut active_fclk = mhz_ceil(cur.fclk_khz);
+        let mut idle_uclk = mhz_ceil(cur.idle_dramclk_khz);
+        let mut idle_fclk = mhz_ceil(cur.idle_fclk_khz);
+        let (mut uclk_active, mut uclk_idle) = (false, false);
+        let (mut fclk_active, mut fclk_idle) = (false, false);
+        // FCLK P-state support: DCN401 has no FCLK switch message.
+        let fclk = new.fclk_pstate || !planes;
+        if should_update_pstate(safe_to_lower, fclk, cur.fclk_pstate) {
+            next.fclk_pstate = fclk;
+            fclk_active = true;
+            fclk_idle = true;
+        }
+        if !next.fclk_pstate && dpm(Clock::Fabric) {
+            active_fclk = levels.range(Clock::Fabric).max_khz() / 1000;
+            idle_fclk = active_fclk;
+        }
+        // CLK_MGR401_UPDATE_DEEP_SLEEP_DCFCLK (zero: no plan says it, except
+        // for a configuration without planes, whose DML21 minimum is zero).
+        if (new.deep_sleep_dcfclk_khz != 0 || !planes)
+            && should_set(
+                safe_to_lower,
+                new.deep_sleep_dcfclk_khz,
+                cur.deep_sleep_dcfclk_khz,
+            )
+        {
+            next.deep_sleep_dcfclk_khz = new.deep_sleep_dcfclk_khz;
+            if dpm(Clock::Dcf) {
+                self.command_ignored(0xd, mhz_ceil(next.deep_sleep_dcfclk_khz))
+                    .await?;
+            }
+        }
+        // UCLK P-state support: allowed before the new floors, disallowed
+        // after them.
+        let uclk = new.uclk_pstate || !planes;
+        let disallow = !uclk && should_update_pstate(safe_to_lower, uclk, cur.uclk_pstate);
+        if should_update_pstate(safe_to_lower, uclk, cur.uclk_pstate) {
+            next.uclk_pstate = uclk;
+            uclk_active = true;
+            uclk_idle = true;
+            if next.uclk_pstate && dpm(Clock::Memory) {
+                self.command_ignored(0x1a, 1).await?;
+            }
+        }
+        if !next.uclk_pstate && dpm(Clock::Memory) {
+            active_uclk = levels.range(Clock::Memory).max_khz() / 1000;
+            idle_uclk = active_uclk;
+        }
+        if should_set(safe_to_lower, new.dramclk_khz, cur.dramclk_khz) {
+            next.dramclk_khz = new.dramclk_khz;
+            if next.uclk_pstate {
+                uclk_active = true;
+                active_uclk = mhz_ceil(next.dramclk_khz);
+            }
+        }
+        if should_set(safe_to_lower, new.idle_dramclk_khz, cur.idle_dramclk_khz) {
+            next.idle_dramclk_khz = new.idle_dramclk_khz;
+            if next.uclk_pstate {
+                uclk_idle = true;
+                idle_uclk = mhz_ceil(next.idle_dramclk_khz);
+            }
+        }
+        if should_set(safe_to_lower, new.fclk_khz, cur.fclk_khz) {
+            next.fclk_khz = new.fclk_khz;
+            if next.fclk_pstate {
+                fclk_active = true;
+                active_fclk = mhz_ceil(next.fclk_khz);
+            }
+        }
+        if should_set(safe_to_lower, new.idle_fclk_khz, cur.idle_fclk_khz) {
+            next.idle_fclk_khz = new.idle_fclk_khz;
+            if next.fclk_pstate {
+                fclk_idle = true;
+                idle_fclk = mhz_ceil(next.idle_fclk_khz);
+            }
+        }
+        let pair = |uclk: u32, fclk: u32| -> Result<u32, Error> {
+            if uclk > u32::from(u16::MAX) || fclk > u32::from(u16::MAX) {
+                return Err(Error::Invalid);
+            }
+            Ok(fclk << 16 | uclk)
+        };
+        // CLK_MGR401_UPDATE_ACTIVE_HARDMINS / _IDLE_HARDMINS, each waiting
+        // for the UCLK floor's acknowledgement.
+        if (uclk_active || fclk_active) && idle_dpm {
+            self.command_ignored(0x18, pair(active_uclk, active_fclk)?)
+                .await?;
+            self.hard_min_settled_ignored(0x18, Clock::Memory).await?;
+        }
+        if (uclk_idle || fclk_idle) && idle_dpm {
+            self.command_ignored(0x19, pair(idle_uclk, idle_fclk)?)
+                .await?;
+            self.hard_min_settled_ignored(0x19, Clock::Memory).await?;
+        }
+        if uclk_active || uclk_idle {
+            // CLK_MGR401_UPDATE_HARDMIN_PPCLK for UCLK, its response unread.
+            if !idle_dpm && dpm(Clock::Memory) {
+                if active_uclk == 0 || active_uclk > u32::from(u16::MAX) {
+                    return Err(Error::Invalid);
+                }
+                self.command_ignored(9, (Clock::Memory as u32) << 16 | active_uclk)
+                    .await?;
+                self.hard_min_settled_ignored(9, Clock::Memory).await?;
+            }
+            if disallow && dpm(Clock::Memory) {
+                self.command_ignored(0x1a, 0).await?;
+            }
+        }
+        let floor = if next.uclk_pstate {
+            mhz_ceil(next.dramclk_khz) * 1000
+        } else {
+            levels.range(Clock::Memory).max_khz()
+        };
+        Ok((next, floor))
+    }
+    /// The bandwidth sequence towards `new` while the display owner's
+    /// displays run (their consumer registers `held`): prepare_bandwidth
+    /// (`safe_to_lower` false) only raises floors and disallows UCLK
+    /// switching, optimize_bandwidth (true) lowers them and allows it.
+    async fn update_bandwidth(
+        &mut self,
+        new: Bandwidth,
+        safe_to_lower: bool,
+        held: &(dyn Fn(u64) -> bool + Sync),
+    ) -> Result<Applied, Error> {
+        if self.status.state != State::Applied {
+            return Err(Error::Busy);
+        }
+        let current = self.status.applied.ok_or(Error::Invalid)?;
+        self.idle_except(held)?;
+        self.status.state = State::Applying;
+        let result = self.bandwidth(new, safe_to_lower, true).await;
+        match result {
+            Ok((bandwidth, floor)) => {
+                self.status.bandwidth = bandwidth;
+                let applied = Applied {
+                    memory_floor_khz: floor,
+                    uclk_pstate: bandwidth.uclk_pstate,
+                    ..current
+                };
+                self.status.applied = Some(applied);
+                self.status.state = State::Applied;
+                Ok(applied)
+            }
+            Err(e) => {
+                self.status.state = State::Failed(e);
+                Err(e)
+            }
+        }
+    }
+    /// dcn401_update_clocks in optimize_bandwidth (`safe_to_lower`) once no
+    /// stream is left (dc_commit_streams with none, as the last CRTC's
+    /// disable and dm_suspend's commit run it), towards the clocks
+    /// dml21_init_min_clocks_for_dc_state gives a context without streams:
+    /// NumOfDisplays(0) (enter_display_off, sent only when safe to lower),
+    /// the DCFCLK hard minimum at its lowest level, then the bandwidth
+    /// sequence without planes (UCLK and FCLK P-state support set, as
+    /// total_plane_count == 0 forces: the deep-sleep DCFCLK zero, switching
+    /// allowed, the active UCLK/FCLK floors at their lowest levels and the
+    /// idle ones zero). Every result is unread, as in Linux. DISPCLK, DPPCLK
+    /// and DTBCLK keep their floors, which the next `prepare` sets again.
+    /// Every consumer must be retired. Nothing when nothing was applied or
+    /// it already ran.
+    async fn release(&mut self) -> Result<Applied, Error> {
+        let current = match (self.status.state, self.status.applied) {
+            (State::Applied, Some(a)) => a,
+            (State::Applied, None) => return Err(Error::Invalid),
+            _ => return Err(Error::Busy),
+        };
+        if current.request.displays == 0 {
+            return Ok(current);
+        }
+        let levels = self.status.levels.ok_or(Error::Invalid)?;
+        self.idle()?;
+        self.status.state = State::Applying;
+        let result = async {
+            self.command_ignored(0xe, 0).await?;
+            let dcf = levels.range(Clock::Dcf);
+            if should_set(true, dcf.min_khz(), current.dcf_floor_khz) && dcf.count > 1 {
+                let mhz = mhz_ceil(dcf.min_khz());
+                self.command_ignored(9, (Clock::Dcf as u32) << 16 | mhz)
+                    .await?;
+                self.hard_min_settled_ignored(9, Clock::Dcf).await?;
+            }
+            let memory = levels.range(Clock::Memory);
+            let fabric = levels.range(Clock::Fabric);
+            let none = Bandwidth {
+                uclk_pstate: true,
+                fclk_pstate: true,
+                dramclk_khz: memory.min_khz(),
+                idle_dramclk_khz: 0,
+                fclk_khz: fabric.min_khz(),
+                idle_fclk_khz: 0,
+                deep_sleep_dcfclk_khz: 0,
+            };
+            let (bandwidth, floor) = self.bandwidth(none, true, false).await?;
+            self.status.bandwidth = bandwidth;
+            Ok(Applied {
+                request: Request {
+                    displays: 0,
+                    deep_sleep_dcfclk_khz: 0,
+                    ..current.request
+                },
+                dcf_floor_khz: dcf.min_khz().min(current.dcf_floor_khz),
+                memory_floor_khz: floor,
+                uclk_pstate: bandwidth.uclk_pstate,
+                ..current
+            })
+        }
+        .await;
+        match result {
+            Ok(applied) => {
+                self.status.applied = Some(applied);
+                self.status.state = State::Applied;
+            }
+            Err(e) => self.status.state = State::Failed(e),
+        }
+        result
+    }
+    /// dcn401_notify_wm_ranges: tell PMFW where the WatermarksExternal_t
+    /// table is (SetDalDramAddrHigh/Low) and have it read it
+    /// (TransferTableDram2Smu, TABLE_WATERMARKS).
+    async fn notify_wm_ranges(&mut self, address: u64) -> Result<(), Error> {
+        if !matches!(self.status.state, State::Ready | State::Applied) {
+            return Err(Error::Busy);
+        }
+        // dcn401_smu_set_dram_addr_high/low and
+        // dcn401_smu_transfer_wm_table_dram_2_smu return nothing.
+        self.command_ignored(5, (address >> 32) as u32).await?;
+        self.command_ignored(6, address as u32).await?;
+        self.command_ignored(8, 2).await?;
+        Ok(())
+    }
     async fn prepare(&mut self, request: Request) -> Result<Applied, Error> {
         if !matches!(self.status.state, State::Ready | State::Applied) {
             return Err(Error::Busy);
@@ -495,16 +922,20 @@ impl<I: Io> Engine<I> {
         self.idle()?;
         self.status.state = State::Applying;
         let result = async {
-            self.command(0xe, u32::from(request.displays)).await?;
+            // dcn401_smu_set_num_of_displays: its result is never read.
+            self.command_ignored(0xe, u32::from(request.displays))
+                .await?;
             let dcf = levels.range(Clock::Dcf).max_khz();
-            let memory = levels.range(Clock::Memory).max_khz();
             self.hard_min(Clock::Dcf, dcf).await?;
-            self.hard_min(Clock::Memory, memory).await?;
-            if levels.range(Clock::Memory).count > 1 {
-                self.command(0x1a, 0).await?; // no UCLK switching during scanout
-            }
-            // FCLK follows DCFCLK on DCN401; Linux explicitly avoids issuing
-            // SetFclkSwitchAllow or an independent FCLK floor on this ASIC.
+            // The bandwidth sequence's UCLK and FCLK part for a pinned
+            // configuration: both at their highest level and UCLK
+            // switching disallowed (prepare_bandwidth before any scanout).
+            let pinned = Bandwidth {
+                deep_sleep_dcfclk_khz: request.deep_sleep_dcfclk_khz,
+                ..Bandwidth::pinned(&levels)
+            };
+            let (bandwidth, memory) = self.bandwidth(pinned, false, true).await?;
+            self.status.bandwidth = bandwidth;
             let display_khz = self.hard_min(Clock::Display, display).await?;
             let dpp_khz = self.hard_min(Clock::Dpp, dpp).await?;
             let dtb_khz = self.hard_min(Clock::Dtb, dtb).await?;
@@ -515,6 +946,7 @@ impl<I: Io> Engine<I> {
                 dtb_khz,
                 dcf_floor_khz: dcf,
                 memory_floor_khz: memory,
+                uclk_pstate: bandwidth.uclk_pstate,
             })
         }
         .await;
@@ -562,8 +994,22 @@ impl<I: Io> Engine<I> {
             // CLK_MGR401_UPDATE_NUM_DISPLAYS: sent in prepare while any
             // display stays on.
             if !safe_to_lower {
-                self.command(0xe, u32::from(request.displays)).await?;
+                self.command_ignored(0xe, u32::from(request.displays))
+                    .await?;
                 next.request.displays = request.displays;
+            }
+            // CLK_MGR401_UPDATE_DEEP_SLEEP_DCFCLK (a zero request keeps it).
+            let ds = self.status.bandwidth.deep_sleep_dcfclk_khz;
+            if request.deep_sleep_dcfclk_khz != 0
+                && should_set(safe_to_lower, request.deep_sleep_dcfclk_khz, ds)
+            {
+                if levels.range(Clock::Dcf).count > 1 {
+                    // dcn401_smu_set_min_deep_sleep_dcef_clk returns nothing.
+                    self.command_ignored(0xd, mhz_ceil(request.deep_sleep_dcfclk_khz))
+                        .await?;
+                }
+                self.status.bandwidth.deep_sleep_dcfclk_khz = request.deep_sleep_dcfclk_khz;
+                next.request.deep_sleep_dcfclk_khz = request.deep_sleep_dcfclk_khz;
             }
             if set(dtb, current.request.dtb_khz) {
                 next.dtb_khz = self.hard_min(Clock::Dtb, dtb).await?;
@@ -620,6 +1066,8 @@ impl ClockManager {
                 state: State::Prepared,
                 levels: None,
                 applied: None,
+                bandwidth: Bandwidth::INIT,
+                ignored: Ignored::default(),
             },
         }))
     }
@@ -690,7 +1138,64 @@ impl ClockManager {
         }
         self.0.update_live(request, safe_to_lower, held, dto).await
     }
+    /// Move the UCLK/FCLK P-state policy and floors (and the deep-sleep
+    /// DCFCLK) to `bandwidth` while the display owner's displays run, as
+    /// dcn401_update_clocks' bandwidth sequence: `safe_to_lower` false
+    /// (prepare_bandwidth) raises and disallows, true (optimize_bandwidth)
+    /// lowers and allows. Display clocks are unchanged. Failure or
+    /// cancellation leaves the owner failed.
+    pub(crate) async fn update_bandwidth(
+        &mut self,
+        regs: MmioRegion,
+        bandwidth: Bandwidth,
+        safe_to_lower: bool,
+        held: &(dyn Fn(u64) -> bool + Sync),
+    ) -> Result<Applied, Error> {
+        if regs.phys != self.0.io.0.phys || regs.len != self.0.io.0.len {
+            return Err(Error::Invalid);
+        }
+        self.0
+            .update_bandwidth(bandwidth, safe_to_lower, held)
+            .await
+    }
+    /// dcn401_update_clocks' optimize once no stream is left (`Engine::
+    /// release`): NumOfDisplays(0), DCFCLK at its lowest level, UCLK
+    /// switching allowed with UCLK and FCLK at their lowest. Every consumer
+    /// must be retired. Failure or cancellation leaves the owner failed.
+    pub(crate) async fn release(&mut self, regs: MmioRegion) -> Result<Applied, Error> {
+        if regs.phys != self.0.io.0.phys || regs.len != self.0.io.0.len {
+            return Err(Error::Invalid);
+        }
+        self.0.release().await
+    }
+    /// dcn401_build_wm_range_table as PMFW's `WatermarksExternal_t`: set A
+    /// (WATERMARKS_CLOCK_RANGE) and set 1A, the dummy P-state set
+    /// (WATERMARKS_DUMMY_PSTATE); sets B and 1B are unused on DCN4.
+    pub fn wm_range_table() -> [u8; WM_TABLE_BYTES] {
+        let mut t = [0u8; WM_TABLE_BYTES];
+        // WatermarkRow[WM_A] = { WmSetting 0, Flags CLOCK_RANGE }, and
+        // WatermarkRow[WM_1A] = { WmSetting 2, Flags DUMMY_PSTATE }.
+        t[8] = 2;
+        t[9] = 1;
+        t
+    }
+    /// Send the watermark range table PMFW reads at `address` (the GPU
+    /// address of [`Self::wm_range_table`]'s bytes, written and flushed by
+    /// the caller), as dcn401_init_hw does once the clocks are known.
+    pub(crate) async fn notify_wm_ranges(
+        &mut self,
+        regs: MmioRegion,
+        address: u64,
+    ) -> Result<(), Error> {
+        if regs.phys != self.0.io.0.phys || regs.len != self.0.io.0.len {
+            return Err(Error::Invalid);
+        }
+        self.0.notify_wm_ranges(address).await
+    }
 }
+
+/// sizeof(WatermarksExternal_t).
+pub const WM_TABLE_BYTES: usize = 112;
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_dcn401_clk_tests.rs"]
 mod tests;

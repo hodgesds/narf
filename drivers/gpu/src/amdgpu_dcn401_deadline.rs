@@ -31,6 +31,8 @@ const PER_LINE_PRE: u64 = 0x651;
 const PER_LINE: u64 = 0x652;
 const REF_FREQ: u64 = 0x654;
 const LUT3D_DLG: u64 = 0x68d;
+const MCACHE_SPLIT: u64 = 0x5ea; // DCSURF_VIEWPORT_MCACHE_SPLIT_COORDINATE
+const MCACHEID_CONFIG: u64 = 0x5fb; // DCHUBP_MCACHEID_CONFIG
 const VREADY_AFTER_VSYNC: u32 = 1 << 8; // DCHUBP_CNTL
                                         // DCHUBBUB, DCN bank 2.
 const SDPIF_RATE_LIMIT: u64 = 0x485;
@@ -240,6 +242,45 @@ fn requestor_writes(rq: &dml::RqRegs) -> [(u64, u32, u32); 5] {
     ]
 }
 
+/// hubp401_program_mcache_id_and_split_coordinate for one pipe's mcache
+/// registers (luma, then chroma): DCHUBP_MCACHEID_CONFIG's REG_READ ids,
+/// the MALL_PREF ids equal to them (no iMALL), and both split coordinates,
+/// each register set whole (REG_SET). Without DCC both are all ones.
+fn mcache_writes(regs: [dml::McacheRegs; 2]) -> [(u64, u32); 2] {
+    let [p0, p1] = regs;
+    let ids = (p0.id_first & 0xf)
+        | (p0.id_second & 0xf) << 4
+        | (p1.id_first & 0xf) << 8
+        | (p1.id_second & 0xf) << 12;
+    [
+        (MCACHEID_CONFIG, ids | ids << 16),
+        (
+            MCACHE_SPLIT,
+            (p0.split_location & 0xffff) | (p1.split_location & 0xffff) << 16,
+        ),
+    ]
+}
+
+/// dml2_top_soc15_build_mcache_programming for pipe `p` of a plane: with
+/// DCC, its mcaches and split from the pipe's own luma (and 4:2:0 chroma)
+/// viewport, as dml21_get_pipe_mcache_config takes them from its scaler
+/// data (viewport x and width, also when rotated); reset_mcache_allocations'
+/// unassigned ids without DCC, or where the viewport spans more than two
+/// mcaches (calculate_first_second_splitting fails before any is set).
+fn pipe_mcache(
+    mcache: Option<dml::McacheAllocation>,
+    surface: Option<SurfaceApplied>,
+    p: u8,
+) -> Result<[dml::McacheRegs; 2], Error> {
+    let Some(a) = mcache else {
+        return Ok([dml::McacheRegs::UNASSIGNED; 2]);
+    };
+    let surface = surface.ok_or(Error::Invalid)?;
+    let (luma, chroma) = surface.request.mcache_viewports(p).ok_or(Error::Invalid)?;
+    Ok(a.pipe_regs(luma, chroma)
+        .unwrap_or([dml::McacheRegs::UNASSIGNED; 2]))
+}
+
 impl<I: Io> Engine<I> {
     pub(in crate::amdgpu_dcn401_otg) fn deadline_writes(
         &mut self,
@@ -289,9 +330,12 @@ impl<I: Io> Engine<I> {
         // (Plan::plane_dlg).
         let mut planes: alloc::vec::Vec<alloc::vec::Vec<u8>> =
             alloc::vec![self.fetch_pipes(pipe).collect()];
+        // Each plane's staged surface, for its pipes' viewports.
+        let mut surfaces = alloc::vec![self.status.surfaces[usize::from(pipe)]];
         if let Some(r) = self.status.requestor.filter(|r| r.pipe == pipe) {
             for o in r.overlays.iter().flatten() {
                 planes.push(o.request.segments().map(|(p, _, _)| p).collect());
+                surfaces.push(Some(*o));
             }
         }
         let segments = planes
@@ -337,6 +381,25 @@ impl<I: Io> Engine<I> {
                 0
             };
             each(self, l.hubp(p, HUBP_CONTROL), VREADY_AFTER_VSYNC, vready)?;
+            // dcn401_program_pipe's step 13 on every pipe: its mcaches.
+            let mcache = plan.plane(k).ok_or(Error::Invalid)?.mcache;
+            let regs = pipe_mcache(mcache, surfaces.get(k).copied().flatten(), p)?;
+            // Unassigned ids and splits make all-ones registers, which the
+            // checked accessors take for a lost device: write and compare
+            // them raw (any loss shows in the other registers).
+            for (r, value) in mcache_writes(regs) {
+                let at = l.hubp(p, r);
+                if verify {
+                    if self.access(|io| Ok(io.read(at)))? != value {
+                        return Err(Error::Readback(at));
+                    }
+                } else {
+                    self.access(|io| {
+                        io.write(at, value);
+                        Ok(())
+                    })?;
+                }
+            }
         }
         for set in [WM_A, WM_B] {
             for (r, mask, value) in watermark_set(set, &plan.watermarks) {
@@ -369,15 +432,22 @@ fn plane_bound(
         && surface.request.odm == timing.odm
         && surface.request.mpc.count() == u32::from(dpps.max(1))
         && surface.request.dml_plane() == planned
-        && u64::from(surface.pitch_bytes)
+        // DML planned the staged pitch; a client framebuffer scanned out in
+        // place may fetch with a wider one of whole pixels (a MED update:
+        // dc runs no DML), never a narrower one.
+        && u64::from(surface.request.bytes().pitch_bytes)
             == u64::from(planned.pitch) * u64::from(planned.bytes_per_pixel)
+        && surface.pitch_bytes >= surface.request.bytes().pitch_bytes
+        && surface.pitch_bytes % u32::from(planned.bytes_per_pixel.max(1)) == 0
 }
 /// Every owner the plan was admitted against must still be the one in place:
 /// a plan is only valid for exactly this timing, sync, DP SST or TMDS signal,
 /// these planes (the primary's surface and placement, then each overlay's),
 /// DET and DCHUB reference, and for at least its clocks with the pinned
-/// UCLK/DCFCLK floors it assumed. The plan is also re-admitted, so a value
-/// built or edited outside admission is refused.
+/// DCFCLK floor it assumed. A pinned plan needs the pinned UCLK floor with
+/// switching disallowed; a UCLK P-state plan a floor of at least its UCLK
+/// level, switching or not. The plan is also re-admitted, so a value built
+/// or edited outside admission is refused.
 pub(super) fn bound(
     plan: &dml::Plan,
     timing: Request,
@@ -388,7 +458,7 @@ pub(super) fn bound(
     let t = plan.mode.timing;
     let surfaces = core::iter::once(a.surface).chain(a.overlays.iter().flatten().copied());
     let planes: alloc::vec::Vec<dml::Plane> = plan.mode.plane_list().collect();
-    plan.readmits()
+    readmits(plan)
         && timing.pipe == a.pipe
         && timing.timing == t
         && timing.sync == plan.sync
@@ -414,9 +484,47 @@ pub(super) fn bound(
         && clock.global.display_khz >= plan.clocks.dispclk_khz
         && clock.global.dpp_khz >= plan.clocks.dpprefclk_khz
         && clock.request.dpp_khz >= plan.clocks.dppclk_khz
-        && clock.global.memory_floor_khz == plan.soc.uclk_khz
+        && if plan.pstate.is_some() {
+            clock.global.memory_floor_khz >= plan.clocks.uclk_khz
+        } else {
+            clock.global.memory_floor_khz == plan.soc.uclk_khz && !clock.global.uclk_pstate
+        }
         && clock.global.dcf_floor_khz == plan.soc.dcfclk_khz[1]
         && dchub_refclk_khz == plan.soc.dchub_refclk_khz
+}
+/// The last UCLK P-state configuration re-admitted: its inputs and plans.
+type PstateAdmitted = (
+    dml::Soc,
+    dml::pstate::UclkLevels,
+    bool,
+    alloc::vec::Vec<dml::Mode>,
+    alloc::vec::Vec<dml::Plan>,
+);
+static PSTATE_ADMITTED: narf_lib::sync::IrqSafeSpinLock<Option<PstateAdmitted>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+/// [`dml::Plan::readmits`], remembering the last P-state configuration's
+/// search: every flip binds the running plan again, and the P-state search
+/// runs mode support once per candidate and level. The search is a pure
+/// function of its inputs, so its remembered result is the result.
+fn readmits(plan: &dml::Plan) -> bool {
+    let Some(p) = plan.pstate else {
+        return plan.readmits();
+    };
+    let modes = plan.joint_modes();
+    let stream = usize::from(plan.stream);
+    if let Some((soc, uclk, fams2, m, plans)) = PSTATE_ADMITTED.lock().as_ref() {
+        if *soc == plan.soc && *uclk == p.uclk && *fams2 == p.fams2 && *m == modes {
+            return plans.get(stream) == Some(plan);
+        }
+    }
+    match dml::pstate::admit(&plan.soc, &p.uclk, &modes, p.fams2) {
+        Ok(dml::pstate::Pstate::Supported(s)) => {
+            let ok = s.plans.get(stream) == Some(plan);
+            *PSTATE_ADMITTED.lock() = Some((plan.soc, p.uclk, p.fams2, modes, s.plans));
+            ok
+        }
+        _ => false,
+    }
 }
 impl Surfaces {
     fn bind_deadlines<I: Io>(

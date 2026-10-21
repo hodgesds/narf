@@ -541,6 +541,31 @@ kernel_test_in!(
     navi48_dispatch_display_events_wake_only_matching_interest
 );
 
+/// OTG and HUBP sources name hardware instances; their events count for
+/// the pipe (CRTC) the instance backs, as amdgpu_dm's handlers look the
+/// CRTC up by otg_inst, and a fused instance's event has no CRTC.
+fn navi48_dispatch_display_events_follow_the_harvested_pool() -> TestResult {
+    use crate::amdgpu_rdna4::{self as rdna4, PipePool};
+    // Pipe 1 fused: pipes 0, 1, 2 are instances 0, 2, 3.
+    rdna4::publish_pipe_pool(PipePool::from_fuses(0x2));
+    let t = IrqSafeSpinLock::new(Table::new());
+    let delivered = [0x3c + 2, 0x4f + 3, 0x57].map(|s| route(&t, iv(CLIENT_DCN, s, 0, 0, 0, 0)));
+    let fused = route(&t, iv(CLIENT_DCN, 0x3c + 1, 0, 0, 0, 0));
+    rdna4::publish_pipe_pool(PipePool::FULL);
+    let e = t.lock().summary().display;
+    if delivered != [Delivery::Display; 3]
+        || fused == Delivery::Display
+        || (e.vblank, e.flip, e.vupdate) != ([0, 1, 0, 0], [0, 0, 1, 0], [1, 0, 0, 0])
+    {
+        return TestResult::Fail("display events by pipe of the pool");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-interrupts",
+    navi48_dispatch_display_events_follow_the_harvested_pool
+);
+
 fn navi48_dispatch_hotplug_wait_wakes_early_rate_limits_and_survives_terminal() -> TestResult {
     let t = IrqSafeSpinLock::new(Table::new());
     let mut since = None;

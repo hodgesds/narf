@@ -124,7 +124,9 @@ pub enum Fault {
     },
 }
 /// DCN401 interrupt sources (to_dal_irq_source_dcn401). Instance numbers are
-/// zero-based OTG/HUBP/HPD indices; HPD context IDs come from source data 0.
+/// zero-based HARDWARE OTG/HUBP/HPD instances, not pipe indices: a consumer
+/// maps an OTG/HUBP instance to its pipe with `PipePool::pipe` (None: fused,
+/// no CRTC). HPD context IDs come from source data 0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Display {
     Hpd(u8),

@@ -8,11 +8,14 @@ mod power;
 pub use power::HubpPower;
 #[path = "amdgpu_dcn401_surface.rs"]
 mod surface;
-#[cfg(feature = "kernel-test")]
-pub(super) use surface::post_csc_words;
 pub(super) use surface::Surfaces;
 pub use surface::{cursor_mode, plane_scale, CursorMode, CursorUnder};
-pub use surface::{plane_update_type, planes_update_type, LivePlanes, PlanesUpdated, UpdateType};
+pub use surface::{
+    plane_update_type, planes_update_type, Cleared, LivePlanes, PlaneContent, PlanesUpdated,
+    UpdateType,
+};
+#[cfg(feature = "kernel-test")]
+pub(super) use surface::{post_csc_set_b, post_csc_words, CURSOR_MATRIX_WORD};
 pub use surface::{
     Blend, ColorProgram, CursorApplied, DeadlinesApplied, DppApplied, FlipDone, GamutProgram,
     LivePipe, MemoryApplied, MpcApplied, OgamProgram, OverlayScanout, PipeColor, PlaneLayout,
@@ -20,6 +23,7 @@ pub use surface::{
     SurfaceFormat, SurfaceRequest, VblankPhase, CURSOR_MAX, MAX_OVERLAYS,
 };
 pub use surface::{DccBlock, PlaneSurface, SurfaceBytes, Swizzle, Tiling, YuvColor};
+pub use surface::{ExternalSurface, FlipSource, InputTf, PreDegam};
 
 const HUBP_CONTROL: u64 = 0x5f4;
 const HUBP_CLOCK: u64 = 0x5f5;
@@ -46,16 +50,19 @@ pub struct PlanesRetired {
 }
 impl Layout {
     fn hubp(self, pipe: u8, reg: u64) -> u64 {
-        self.base + (reg + u64::from(pipe) * 0xdc) * 4
+        self.base + (reg + u64::from(self.inst(pipe)) * 0xdc) * 4
     }
+    /// DOMAIN0-3_PG_CONFIG/STATUS: the pipe's HUBP/DPP power domain.
     fn pg(self, pipe: u8, status: bool) -> u64 {
-        self.base + (0x80 + u64::from(pipe) * 2 + u64::from(status)) * 4
+        self.base + (0x80 + u64::from(self.inst(pipe)) * 2 + u64::from(status)) * 4
     }
+    /// The pipe's MPCC (its DPP's instance, as mpcc_inst = dpp->inst).
     fn mpcc(self, pipe: u8, reg: u64) -> u64 {
-        self.mpc_base + (reg + u64::from(pipe) * 0x15) * 4
+        self.mpc_base + (reg + u64::from(self.inst(pipe)) * 0x15) * 4
     }
+    /// MPC_OUT_MUX of the pipe's OPP.
     fn out_mux(self, pipe: u8) -> u64 {
-        self.mpc_base + (0x2f2 + u64::from(pipe) * 4) * 4
+        self.mpc_base + (0x2f2 + u64::from(self.inst(pipe)) * 4) * 4
     }
 }
 impl<I: Io> Engine<I> {
@@ -89,7 +96,7 @@ impl<I: Io> Engine<I> {
     ) -> Result<(), Error> {
         let l = self.layout;
         let mine = live.map_or_else(alloc::vec::Vec::new, |s| s.live_pipes(self.status.cursor));
-        for pipe in 0..4 {
+        for pipe in l.pool.pipes() {
             // The owned live scanout's pipes (every plane, both ODM halves),
             // and another display's, must be exactly that.
             let theirs = self.displays.siblings.live[usize::from(pipe)];
@@ -123,7 +130,7 @@ impl<I: Io> Engine<I> {
         let l = self.layout;
         let mut powered_off = 0;
         let kept = self.displays.siblings.pipes;
-        for p in 0..4 {
+        for p in l.pool.pipes() {
             // Other displays' planes are theirs: neither checked nor retired.
             if kept & 1 << p != 0 {
                 continue;
@@ -143,8 +150,10 @@ impl<I: Io> Engine<I> {
                 l.mpcc(p, OPP_ID),
                 l.mpcc(p, UPDATE_LOCK),
             ] {
+                // Each selector names a pipe-block instance (DPP, MPCC or
+                // OPP); one past 3 or fused is foreign.
                 let select = self.read(at)? & 0xf;
-                if select > 3 && select != 0xf {
+                if select != 0xf && l.pool.pipe(select as u8).is_none() {
                     return Err(Error::Unsupported);
                 }
             }
@@ -161,7 +170,7 @@ impl<I: Io> Engine<I> {
             }
         }
         Ok(PlanesRetired {
-            blanked: 0xf & !powered_off & !kept,
+            blanked: l.pool.all() & !powered_off & !kept,
             powered_off,
         })
     }
@@ -175,7 +184,7 @@ impl<I: Io> Engine<I> {
         let kept = self.displays.siblings.pipes;
         loop {
             let mut blocked = None;
-            for p in (0..4).filter(|p| kept & 1 << p == 0) {
+            for p in l.pool.pipes().filter(|p| kept & 1 << p == 0) {
                 let at = l.mpcc(p, MPC_STATUS);
                 let status = self.read(at)?;
                 // Native Linux accepts DISABLED, or waits for IDLE. Also
@@ -211,7 +220,7 @@ impl<I: Io> Engine<I> {
         let l = self.layout;
         let deadline = narf_time::Deadline::after_us(100_000);
         let kept = self.displays.siblings.pipes;
-        let ours: alloc::vec::Vec<u8> = (0..4u8).filter(|p| kept & 1 << p == 0).collect();
+        let ours: alloc::vec::Vec<u8> = l.pool.pipes().filter(|p| kept & 1 << p == 0).collect();
         // Retire the whole display tree but other displays' pipes, including
         // inherited cross-routes. Disconnect outputs before each MPCC's
         // top/bottom/OPP/update-lock mux.
@@ -223,14 +232,14 @@ impl<I: Io> Engine<I> {
                 self.update(l.mpcc(p, r), 0xf, 0xf)?;
             }
         }
-        for p in 0..4 {
+        for p in l.pool.pipes() {
             if plan.blanked & (1 << p) != 0 {
                 self.update(l.hubp(p, CURSOR), 1, 0)?;
             }
         }
         // Keep clocks running until all MPCCs and HUBPs acknowledge drain.
         self.wait_plane_drain(plan, false, deadline).await?;
-        for p in 0..4 {
+        for p in l.pool.pipes() {
             if plan.blanked & (1 << p) != 0 {
                 self.update(l.hubp(p, HUBP_CONTROL), 0x1001, 1)?;
                 self.update(l.hubp(p, MALL), 0x1f, 8)?;
@@ -238,7 +247,7 @@ impl<I: Io> Engine<I> {
             }
         }
         self.wait_plane_drain(plan, true, deadline).await?;
-        for p in 0..4 {
+        for p in l.pool.pipes() {
             if plan.blanked & (1 << p) != 0 {
                 self.update(l.hubp(p, HUBP_CLOCK), 1, 0)?;
             }
@@ -264,8 +273,12 @@ impl<I: Io> Engine<I> {
                 return Err(Error::Busy);
             }
         }
-        for (at, mask) in l.idle {
-            let timing = (0..4).any(|p| at == l.otg(p, CONTROL) || at == l.otg(p, CLOCK));
+        // A fused OTG's witnesses are (0, 0): never read.
+        for (at, mask) in l.idle.into_iter().filter(|&(_, mask)| mask != 0) {
+            let timing = l
+                .pool
+                .pipes()
+                .any(|p| at == l.otg(p, CONTROL) || at == l.otg(p, CLOCK));
             if !timing && !self.sibling_register(at) && self.read(at)? & mask != 0 {
                 return Err(Error::Busy);
             }
@@ -279,10 +292,11 @@ impl<I: Io> Engine<I> {
     /// own overlays.
     pub(in crate::amdgpu_dcn401_otg) fn drop_overlays(&mut self) {
         let own = usize::from(self.displays.selected);
+        let pipes = self.layout.pool.pipes();
         let s = &mut self.status;
         let overlay =
             |s: &Status, i: usize| i != own && s.pipes[i].is_none() && s.blanks[i].is_none();
-        for i in 0..4 {
+        for i in pipes.map(usize::from) {
             if !overlay(s, i) {
                 continue;
             }
@@ -316,7 +330,7 @@ impl<I: Io> Engine<I> {
     }
 }
 impl Otg {
-    /// Disconnect all four native MPC outputs/MPCCs and drain powered HUBPs
+    /// Disconnect every pipe's MPC output/MPCC and drain powered HUBPs
     /// before blanking and stopping their fetch clocks. Timing can keep running
     /// for disconnect latching; every external stream must already be stopped.
     /// Leaves DPP clocks, power domains, timing and all allocations retained.

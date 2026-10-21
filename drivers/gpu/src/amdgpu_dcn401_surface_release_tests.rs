@@ -63,6 +63,7 @@ fn buffers(pool: &Pool, pipe: u8, height: u32) -> Surface {
             address: memory.address(),
             pitch_bytes: 256,
             bytes: u64::from(height) * 256,
+            chroma: request.chroma(),
         },
         memory,
         back: Some(reserve(4096)),

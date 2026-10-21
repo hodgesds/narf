@@ -171,7 +171,7 @@ pub struct BlankApplied {
 }
 impl Layout {
     pub(super) fn opp(self, pipe: u8, reg: u64) -> u64 {
-        self.base + (reg + u64::from(pipe) * 0x5a) * 4
+        self.base + (reg + u64::from(self.inst(pipe)) * 0x5a) * 4
     }
 }
 impl<I: Io> Engine<I> {
@@ -293,7 +293,7 @@ impl Otg {
         if !self.0.status.state.reusable() {
             return Err(Error::Busy);
         }
-        if request.pipe >= 4 {
+        if request.pipe >= self.0.layout.pool.count() {
             return Err(Error::Invalid);
         }
         let (held, layout) = self.0.held();

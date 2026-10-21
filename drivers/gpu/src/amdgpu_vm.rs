@@ -611,6 +611,10 @@ pub(crate) async fn relocate(
     if object.system() != to_vram {
         return Ok(());
     }
+    // amdgpu_bo_pin: a pinned buffer (a framebuffer scanned out) never moves.
+    if object.pinned() {
+        return Err(FsError::Busy);
+    }
     let vms: Vec<_> = VMS
         .lock()
         .iter()
@@ -672,9 +676,13 @@ pub(crate) async fn relocate(
         .collect();
     leases.sort_unstable();
     leases.dedup();
+    // A GFX12 DCC buffer moves through the card's engine whatever its VRAM
+    // (amdgpu_ttm_copy_mem_to_mem's decompressing read and compressing
+    // write), as an above-BAR one does; never by CPU copy.
+    let engine = crate::amdgpu_gem::moves_by_engine(object);
     let staged = if !to_vram {
         let source = object.placement();
-        if source.hidden_address().is_some() {
+        if source.hidden_address().is_some() || engine {
             object.check_transfer_source(&source, leases.len())?;
             if !object.allows_system() {
                 return Err(FsError::Busy);
@@ -692,6 +700,14 @@ pub(crate) async fn relocate(
                 Ok(destination) => {
                     object.check_transfer_source(&source, leases.len())?;
                     let destination = alloc::sync::Arc::new(destination);
+                    crate::amdgpu_gem::upload(gate, object, &source, &destination).await?;
+                    Some((source, destination))
+                }
+                Err(FsError::Unsupported | FsError::NoSpace) if engine => {
+                    object.check_transfer_source(&source, leases.len())?;
+                    let destination = alloc::sync::Arc::new(
+                        crate::amdgpu_gem::cpu_mapping::destination(object, true)?,
+                    );
                     crate::amdgpu_gem::upload(gate, object, &source, &destination).await?;
                     Some((source, destination))
                 }

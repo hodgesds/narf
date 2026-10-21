@@ -25,7 +25,7 @@
 //! (amdgpu_dm_commit_cursors, a FAST update: nothing relights).
 use crate::amdgpu_dcn401_otg::{Blend, SurfaceFormat, Swizzle, MAX_OVERLAYS};
 use crate::amdgpu_dcn401_spl::{Rect, Rotation};
-use crate::amdgpu_navi48_boot::{OverlayPlane, PlaneGeometry, PlaneSetup};
+use crate::amdgpu_navi48_boot::{DrmPlaneState, OverlayPlane, PlaneGeometry, PlaneSetup};
 use crate::drm::atomic::{AtomicState, PlaneState};
 use crate::drm::card::{Card, NativePlane, PlaneProps};
 use alloc::vec::Vec;
@@ -852,22 +852,54 @@ pub fn cursor_changes(card: &Card, state: &AtomicState) -> Vec<CursorChange> {
 }
 
 /// A cursor framebuffer's premultiplied ARGB8888 pixels, row by row, read
-/// out of its dumb buffer (the hardware cursor scans a copy). None when it
-/// has no dumb backing holding its rows.
+/// out of its dumb buffer (`cursor_content`). None for a GEM framebuffer
+/// or when no dumb buffer holds its rows.
 pub fn cursor_image(card: &Card, fb_id: u32) -> Option<crate::amdgpu_navi48_platform::CursorImage> {
+    match cursor_content(card, fb_id, None)? {
+        crate::amdgpu_navi48_platform::CursorContent::Image(image) => Some(image),
+        crate::amdgpu_navi48_platform::CursorContent::Gem(_) => None,
+    }
+}
+
+/// What a cursor framebuffer shows the hardware cursor (which scans a
+/// copy): its dumb buffer's rows, read now, or its amdgpu GEM buffer with
+/// the pin amdgpu_dm_plane_helper_prepare_fb took on it (`pin`), whose
+/// rows the cursor task reads once the buffer's WRITE fences signalled
+/// (drm_gem_plane_helper_prepare_fb's fence, which the commit waits for).
+/// None when neither holds its rows.
+pub fn cursor_content(
+    card: &Card,
+    fb_id: u32,
+    pin: Option<alloc::sync::Arc<crate::amdgpu_gem::ScanoutPin>>,
+) -> Option<crate::amdgpu_navi48_platform::CursorContent> {
     let fb = card.framebuffer(fb_id).ok()?;
-    let backing = card.dumb_backing(fb.gem_handle)?;
     let (w, h) = (fb.width, fb.height);
     if w == 0 || h == 0 || w > MAX_CURSOR_SIZE || h > MAX_CURSOR_SIZE {
         return None;
     }
     let row = u64::from(w) * 4;
     let end = u64::from(fb.offsets[0]) + u64::from(h - 1) * u64::from(fb.pitch) + row;
+    let mut pixels = Vec::with_capacity((w * h) as usize);
+    let mut line = [0u8; MAX_CURSOR_SIZE as usize * 4];
+    if fb.bo.is_some() {
+        let pin = pin?;
+        if end > pin.byte_len() {
+            return None;
+        }
+        return Some(crate::amdgpu_navi48_platform::CursorContent::Gem(
+            crate::amdgpu_navi48_platform::GemCursor {
+                pin,
+                offset: fb.offsets[0],
+                pitch: fb.pitch,
+                width: w,
+                height: h,
+            },
+        ));
+    }
+    let backing = card.dumb_backing(fb.gem_handle)?;
     if end > backing.byte_len as u64 {
         return None;
     }
-    let mut pixels = Vec::with_capacity((w * h) as usize);
-    let mut line = [0u8; MAX_CURSOR_SIZE as usize * 4];
     for y in 0..h {
         let at = backing.phys + u64::from(fb.offsets[0]) + u64::from(y) * u64::from(fb.pitch);
         // SAFETY: the dumb buffer's frames are kernel-owned and mapped; the
@@ -885,11 +917,13 @@ pub fn cursor_image(card: &Card, fb_id: u32) -> Option<crate::amdgpu_navi48_plat
                 .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
         );
     }
-    Some(crate::amdgpu_navi48_platform::CursorImage {
-        width: w,
-        height: h,
-        pixels,
-    })
+    Some(crate::amdgpu_navi48_platform::CursorContent::Image(
+        crate::amdgpu_navi48_platform::CursorImage {
+            width: w,
+            height: h,
+            pixels,
+        },
+    ))
 }
 
 /// drm_atomic_normalize_zpos on one CRTC's planes, then the plane setup
@@ -933,6 +967,7 @@ fn display_planes(
             blend: blend(format, props, overlay),
             surface,
             fb_size: (fb.width, fb.height),
+            client: fb.bo.is_some(),
         })
     };
     let zpos = |p: &PlaneState| p.props.map_or(0, |r| r.zpos);
@@ -946,16 +981,44 @@ fn display_planes(
     let format = format_of(primary)?;
     let g = geometry(primary, format, false)?;
     // A tiled or 4:2:0 primary always goes to DC as a placed plane (its
-    // surface is its whole framebuffer).
-    let full = !g.whole_framebuffer(format)
+    // surface is its whole framebuffer); a linear client one shown whole
+    // is the full-frame primary still.
+    let full = !PlaneGeometry { client: false, ..g }.whole_framebuffer(format)
         && (g.src_x, g.src_y, g.width, g.height) == (0, 0, mode.0, mode.1)
         && g.dst == Rect::new(0, 0, mode.0 as i32, mode.1 as i32)
         && g.rotation == Rotation::R0
         && g.blend == Blend::default_for(format);
+    // What should_reset_plane compares, with each plane's normalized zpos.
+    let drm = |p: &PlaneState| -> Result<DrmPlaneState, FsError> {
+        let fb = card
+            .framebuffer(p.fb_id.ok_or(FsError::InvalidData)?)
+            .map_err(|_| FsError::NotFound)?;
+        let props = p.props.unwrap_or(PlaneProps::new(0));
+        Ok(DrmPlaneState {
+            plane: p.id,
+            src_w: p.src_w,
+            src_h: p.src_h,
+            crtc_w: p.crtc_w,
+            crtc_h: p.crtc_h,
+            rotation: props.rotation,
+            blend: props.blend,
+            alpha: props.alpha,
+            color_range: props.color_range,
+            color_encoding: props.color_encoding,
+            fourcc: fb.format as u32,
+            modifier: fb.modifier,
+            normalized_zpos: order
+                .iter()
+                .position(|q| q.id == p.id)
+                .ok_or(FsError::InvalidData)? as u8,
+        })
+    };
     let mut setup = PlaneSetup {
         primary: (!full).then_some(g),
         overlays: [None; MAX_OVERLAYS],
+        drm: [None; 1 + MAX_OVERLAYS],
     };
+    setup.drm[0] = Some(drm(primary)?);
     let mut ids = [None; MAX_OVERLAYS];
     for (k, p) in order.iter().filter(|p| p.id != primary.id).enumerate() {
         if k >= MAX_OVERLAYS {
@@ -971,6 +1034,7 @@ fn display_planes(
                 .is_some_and(|i| i < primary_at),
             plane: p.id,
         });
+        setup.drm[k + 1] = Some(drm(p)?);
         ids[k] = Some(p.id);
     }
     Ok(DisplayPlanes {

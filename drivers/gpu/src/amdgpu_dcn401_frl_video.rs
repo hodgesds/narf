@@ -142,7 +142,7 @@ impl<I: Io> Engine<I> {
         }
         self.frl_link_witnesses(link)?;
         let route = self.layout.base + STREAM_CLOCK * 4;
-        if self.read(route)? & 15 != 8 | u32::from(blank.request.pipe) {
+        if self.read(route)? & 15 != 8 | self.layout.inst_field(blank.request.pipe) {
             return Err(Error::Readback(route));
         }
         let plan = blank.timing.request.plan()?;
@@ -384,7 +384,8 @@ impl<I: Io> Engine<I> {
         self.update(self.frl_at(FIFO), 0x10100, 0)?;
         self.update(self.frl_at(PIXEL_FORMAT), 0x300_0000, 0)
     }
-    /// hpo_enc401_enable from OTG `pipe`.
+    /// hpo_enc401_enable from pipe `pipe`'s OTG instance
+    /// (HDMI_STREAM_ENC_INPUT_MUX_SOURCE_SEL = otg_inst).
     async fn frl_stream_enable(&mut self, pipe: u8) -> Result<(), Error> {
         self.update(self.frl_at(CLOCK), 1, 1)?;
         self.update(self.frl_at(CONTROL), 0x11, 0x10)?;
@@ -392,7 +393,7 @@ impl<I: Io> Engine<I> {
         self.update(self.frl_at(CONTROL), 0x10, 0)?;
         self.update(self.frl_at(CRC), 3, 3)?;
         self.update(self.frl_at(DB), 0x1000, 0x1000)?;
-        self.update(self.frl_at(SOURCE), 7, u32::from(pipe))
+        self.update(self.frl_at(SOURCE), 7, self.layout.inst_field(pipe))
     }
     /// hpo_enc401_unblank.
     async fn frl_unblank(&mut self) -> Result<(), Error> {
@@ -447,7 +448,7 @@ impl<I: Io> Engine<I> {
         let link = self.status.frl_link.ok_or(Error::Invalid)?;
         let pipe = request.pipe;
         if link.path != path
-            || pipe >= 4
+            || pipe >= self.layout.pool.count()
             || request.audio_packets_line > 0x1f
             || request.hc_active > 0x7fff
             || request.hc_blank > 0x7fff
@@ -512,7 +513,7 @@ impl<I: Io> Engine<I> {
             (CLOCK, 1, 1),
             (FIFO, 1, 1),
             (CONTROL, 1, 1),
-            (SOURCE, 7, u32::from(v.request.pipe)),
+            (SOURCE, 7, self.layout.inst_field(v.request.pipe)),
         ] {
             if self.read(self.frl_at(reg))? & mask != value {
                 return Err(Error::Readback(self.frl_at(reg)));
@@ -525,7 +526,7 @@ impl<I: Io> Engine<I> {
         self.frl_verify_format(v.timing.blank)?;
         self.frl_verify_hdr(&v.request)?;
         let route = self.layout.base + STREAM_CLOCK * 4;
-        if self.read(route)? & 15 != 8 | u32::from(v.request.pipe) {
+        if self.read(route)? & 15 != 8 | self.layout.inst_field(v.request.pipe) {
             return Err(Error::Readback(route));
         }
         if let Some(a) = self.status.frl_audio {

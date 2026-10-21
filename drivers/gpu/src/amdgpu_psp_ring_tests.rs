@@ -27,6 +27,9 @@ struct Fake {
     gfx_reads: usize,
     media_address: Option<u64>,
     tmr_address: u64,
+    /// `(resp.status, resp.uresp.fw_reserve_info)` for FB_FW_RESERV_ADDR
+    /// and FB_FW_RESERV_EXT_ADDR.
+    fw_reserve: [(u32, [u32; 3]); 2],
 }
 impl Io for Fake {
     fn read(&mut self, reg: u32) -> u32 {
@@ -70,6 +73,12 @@ impl Io for Fake {
                         0
                     };
                 self.memory[(COMMAND / 4) as usize + 220] = self.tmr_size;
+                if matches!(id, 0x50 | 0x51) {
+                    let (status, info) = self.fw_reserve[(id - 0x50) as usize];
+                    self.memory[(COMMAND / 4) as usize + 216] = status;
+                    let uresp = (COMMAND / 4) as usize + 232;
+                    self.memory[uresp..uresp + 3].copy_from_slice(&info);
+                }
                 if id == 6 && matches!(kind, 13 | 51 | 58) {
                     let offset = match kind {
                         13 => 0x1000,
@@ -145,6 +154,7 @@ fn fixture() -> (Pool, Engine<Fake>) {
         gfx_reads: 0,
         media_address: None,
         tmr_address: 0,
+        fw_reserve: [(0x100, [0; 3]); 2],
     };
     io.regs[CTRL as usize] = RESPONSE;
     io.regs[SOS as usize] = 1;
@@ -302,6 +312,81 @@ fn psp_tmr_gpu_alignment_and_padding() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/psp-ring", psp_tmr_gpu_alignment_and_padding);
+
+/// psp_update_fw_reservation: the SOS gates per MP0, the two queries in
+/// order, PSP_ERR_UNKNOWN_COMMAND as an empty answer, the top-of-VRAM
+/// validity check, 1 MiB rounding, and a lost fence failing the call.
+fn psp_fw_reservation_follows_psp_update_fw_reservation() -> TestResult {
+    const VRAM: u64 = 16 << 30;
+    let top = VRAM - (12 << 20);
+    let info = |address: u64, size: u32| [(address >> 32) as u32, address as u32, size];
+    for (revision, sos) in [(3, 0x3a0e13), (2, 0x3b0e0c), (4, u32::MAX), (0, u32::MAX)] {
+        let (_, mut engine) = fixture();
+        run(engine.start()).unwrap();
+        engine.io.fw_reserve[0] = (0, info(top, 12 << 20));
+        if run(engine.update_fw_reservation(revision, sos, VRAM)) != Ok(None)
+            || !engine.io.submissions.is_empty()
+        {
+            return TestResult::Fail("reservation queried below the SOS gate or off 14.0.2/3");
+        }
+    }
+    for (revision, sos) in [(3, 0x3a0e14), (2, 0x3b0e0d)] {
+        let (_, mut engine) = fixture();
+        run(engine.start()).unwrap();
+        engine.io.fw_reserve = [
+            (0, info(top, 12 << 20)),
+            (0, info(0x1_2340_0000, 0x18_0001)),
+        ];
+        let got = run(engine.update_fw_reservation(revision, sos, VRAM));
+        let ids: Vec<_> = engine.io.submissions.iter().map(|c| c[2]).collect();
+        if got
+            != Ok(Some(FwReservation {
+                fw: top..VRAM,
+                ext: 0x1_2340_0000..0x1_2360_0000,
+            }))
+            || ids != [0x50, 0x51]
+            || engine
+                .io
+                .submissions
+                .iter()
+                .any(|c| c[7..].iter().any(|v| *v != 0))
+        {
+            return TestResult::Fail("FW_RESERV queries, decoding or 1 MiB rounding");
+        }
+    }
+    let (_, mut engine) = fixture();
+    run(engine.start()).unwrap();
+    // An SOS without the commands answers PSP_ERR_UNKNOWN_COMMAND: (0, 0),
+    // which is not a region ending at the top of VRAM.
+    if run(engine.update_fw_reservation(3, 0x3a0e14, VRAM)) != Ok(None) {
+        return TestResult::Fail("unknown command not treated as no reservation");
+    }
+    // Any other status is only warned about; the answer is used.
+    engine.io.fw_reserve = [(0x7, info(top, 12 << 20)), (0x100, [0xff; 3])];
+    if run(engine.update_fw_reservation(3, 0x3a0e14, VRAM))
+        != Ok(Some(FwReservation {
+            fw: top..VRAM,
+            ext: 0..0,
+        }))
+    {
+        return TestResult::Fail("nonzero status or empty extension");
+    }
+    // A region that does not end at the top of VRAM is not reserved.
+    engine.io.fw_reserve = [(0, info(top - 4096, 12 << 20)), (0, [0; 3])];
+    if run(engine.update_fw_reservation(3, 0x3a0e14, VRAM)) != Ok(None) {
+        return TestResult::Fail("invalid fw region reserved");
+    }
+    engine.io.fw_reserve = [(0, info(top, 12 << 20)), (0, [0; 3])];
+    engine.io.stall_command = Some(0x51);
+    if run(engine.update_fw_reservation(3, 0x3a0e14, VRAM)) != Err(Error::Timeout) {
+        return TestResult::Fail("lost reservation fence not fatal");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/psp-ring",
+    psp_fw_reservation_follows_psp_update_fw_reservation
+);
 
 #[path = "amdgpu_psp_navi22_tests.rs"]
 mod navi22;

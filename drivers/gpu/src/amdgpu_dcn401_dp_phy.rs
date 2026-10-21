@@ -198,6 +198,9 @@ impl<I: Io> Engine<I> {
         let bank1 = l.link_clock - 0x66 * 4;
         let sources = self.read(bank1 + 0x68 * 4)?;
         let siblings = self.displays.siblings;
+        // `p` is a DIO/HPO stream encoder (all four exist whatever the pipe
+        // fuses) and, below `pool.count()`, also a pipe index whose OTG,
+        // OTG{inst}_PIXEL_RATE_CNTL and DTBCLK_P{inst} take its instance.
         for p in 0..4 {
             // Another display's stream and clock route are its own.
             let other = |mask: u8| mask & 1 << p != 0;
@@ -207,12 +210,17 @@ impl<I: Io> Engine<I> {
             if stream != Some(p) && !other(siblings.hpo) {
                 self.dp_encoder_quiet(DpStream::Hpo(p))?;
             }
-            if (frontend != Some(p)
+            // SYMCLK{A..}_FE_EN: per DIG frontend.
+            if frontend != Some(p)
                 && !other(siblings.streams)
-                && self.read(l.dio_clock + u64::from(p) * 4)? & 0x10 != 0)
-                || self.read(l.otg(p, LOCK))? & 0x101 != 0
-                || self.read(l.otg(p, CLOCK))? & 0x10 != 0
+                && self.read(l.dio_clock + u64::from(p) * 4)? & 0x10 != 0
             {
+                return Err(Error::Busy);
+            }
+            if p >= l.pool.count() {
+                continue; // fused pipes: no OTG to read
+            }
+            if self.read(l.otg(p, LOCK))? & 0x101 != 0 || self.read(l.otg(p, CLOCK))? & 0x10 != 0 {
                 return Err(Error::Busy);
             }
             // Another display's running timing has its own pixel source
@@ -222,12 +230,13 @@ impl<I: Io> Engine<I> {
             }
             // Prepared, stopped timing may retain clocks only from a live
             // DPREF/DTB DTO. Never start or stop a PHY feeding TMDS timing.
-            let pixel = self.read(bank1 + (0x80 + 4 * u64::from(p)) * 4)? & 0x1393;
+            let inst = u64::from(l.inst(p));
+            let pixel = self.read(bank1 + (0x80 + 4 * inst) * 4)? & 0x1393;
             let timing = self.read(l.otg(p, CLOCK))? & 0x10103 != 0
                 || self.read(l.odm(p, INPUT_CLOCK))? & 7 != 0
                 || self.read(l.vtg(p))? & 0x80000000 != 0;
             if (timing || pixel & 0x90 != 0)
-                && (pixel & 0x1390 != 0x1090 || !matches!((sources >> (3 * p)) & 7, 4 | 6))
+                && (pixel & 0x1390 != 0x1090 || !matches!((sources >> (3 * inst)) & 7, 4 | 6))
             {
                 return Err(Error::Busy);
             }

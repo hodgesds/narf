@@ -1,0 +1,38 @@
+# Every MODULE_FIRMWARE / FIRMWARE_* image Linux declares for the RDNA4 IP
+# versions (GC 12.0.0/12.0.1, MP 14.0.2/14.0.3, SDMA 7.0.0/7.0.1, VCN 5.0.0,
+# DCN 4.0.1). check.sh regenerates this list from the Linux tree and fails on
+# any difference; amdgpu_rdna4_tests.rs requires amdgpu_rdna4's tables to name
+# exactly these (the RLC-backdoor-autoload *_toc.bin images aside).
+amdgpu/dcn_4_0_1_dmcub.bin
+amdgpu/gc_12_0_0_imu.bin
+amdgpu/gc_12_0_0_me.bin
+amdgpu/gc_12_0_0_mec.bin
+amdgpu/gc_12_0_0_mes.bin
+amdgpu/gc_12_0_0_mes1.bin
+amdgpu/gc_12_0_0_pfp.bin
+amdgpu/gc_12_0_0_rlc.bin
+amdgpu/gc_12_0_0_toc.bin
+amdgpu/gc_12_0_0_uni_mes.bin
+amdgpu/gc_12_0_1_imu.bin
+amdgpu/gc_12_0_1_imu_kicker.bin
+amdgpu/gc_12_0_1_me.bin
+amdgpu/gc_12_0_1_mec.bin
+amdgpu/gc_12_0_1_mes.bin
+amdgpu/gc_12_0_1_mes1.bin
+amdgpu/gc_12_0_1_pfp.bin
+amdgpu/gc_12_0_1_rlc.bin
+amdgpu/gc_12_0_1_rlc_kicker.bin
+amdgpu/gc_12_0_1_toc.bin
+amdgpu/gc_12_0_1_uni_mes.bin
+amdgpu/psp_14_0_2_sos.bin
+amdgpu/psp_14_0_2_ta.bin
+amdgpu/psp_14_0_3_sos.bin
+amdgpu/psp_14_0_3_sos_kicker.bin
+amdgpu/psp_14_0_3_ta.bin
+amdgpu/psp_14_0_3_ta_kicker.bin
+amdgpu/sdma_7_0_0.bin
+amdgpu/sdma_7_0_1.bin
+amdgpu/smu_14_0_2.bin
+amdgpu/smu_14_0_3.bin
+amdgpu/smu_14_0_3_kicker.bin
+amdgpu/vcn_5_0_0.bin

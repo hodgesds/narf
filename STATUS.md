@@ -318,6 +318,13 @@ leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,
 separate physical/CPU-visible VRAM accounting and SMUIO14 ROM access. Legacy
 APU/engine/display paths refuse this generation before touching hardware.
+The same paths now cover the whole RX 9000 family: any AMD display function
+whose discovery reports GC 12.0.1 (Navi48: 9070/9070 XT/9070 GRE, AI PRO
+R9700) or GC 12.0.0 (Navi44: 9060 XT/9060) binds by discovery, with Linux's
+per-die firmware (including kicker boards), external revision, RAS, DCC-width
+and pipe-harvesting differences (`amdgpu_rdna4`, checked against Linux by
+`drivers/gpu/tests/rdna4_family/check.sh`). Model-tested on Navi44 and
+harvested Navi48 profiles only; no Navi44 board has run it.
 
 Implemented: GDDR6 training; PSP14 SOS/GPCOM/TMR; mandatory graphics/media
 firmware parsing, upload and autoload; GC12 RS64 counter programming and pipe
@@ -1005,8 +1012,16 @@ and dark-mode admission; zero PBN rejects new modes. Incomplete resource queries
 retain the session and refuse replay. Cascaded (daisy-chained) branches share
 one link's payload table, hop budgets and DSC fairness; a downstream change
 that keeps every lit route (a branch or device added or removed elsewhere) is
-adopted live without stopping streams, as Linux handles a CSN. MST on more
-than one DP port at a time remains open; no physical validation.
+adopted live without stopping streams, as Linux handles a CSN. MST now runs
+on several DP ports at once, each with its own manager and payload table and
+joint DML admission across them; each port keeps sixteen end-device
+connectors (lighting stays bounded by DCN 4.0.1's four pipes and stream
+encoders, amdgpu_dm's max_streams, and four payloads per manager); a new end
+device lights beside the running streams (its payload alone: row, SAT with
+ACT, ALLOCATE_PAYLOAD, VC rate) and a departed or disabled one retires alone,
+relighting only when Linux would modeset the others (DSC fairness changes,
+lost hop capacity). The payload table bookkeeping matches DRM's helpers on
+3000 Linux sequences (`tests/dcn401_mst_payload`). No physical validation.
 The MST manager now also exposes bounded idle notification polling over
 DMUB AUX, retains fragmented messages across transaction/poll boundaries and
 applies queue backpressure. Connection notices drive topology reconciliation

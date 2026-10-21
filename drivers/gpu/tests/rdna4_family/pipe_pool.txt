@@ -1,0 +1,18 @@
+# drivers/gpu/tests/rdna4_family/check.sh --generate, third section: Linux's
+# DCN401 resource pool for every CC_DC_PIPE_DIS value (see pipe_pool.c).
+0 pipes=4 mpccs=4 streams=4 hubp=0,1,2,3 dpp=0,1,2,3 opp=0,1,2,3 tg=0,1,2,3 abm=0,1,2,3 mpcc=0,1,2,3 dsc=0,1,2,3
+0x1 pipes=3 mpccs=4 streams=3 hubp=1,2,3 dpp=1,2,3 opp=1,2,3 tg=1,2,3 abm=1,2,3 mpcc=1,2,3 dsc=0,1,2
+0x2 pipes=3 mpccs=4 streams=3 hubp=0,2,3 dpp=0,2,3 opp=0,2,3 tg=0,2,3 abm=0,2,3 mpcc=0,2,3 dsc=0,1,2
+0x3 pipes=2 mpccs=4 streams=2 hubp=2,3 dpp=2,3 opp=2,3 tg=2,3 abm=2,3 mpcc=2,3 dsc=0,1
+0x4 pipes=3 mpccs=4 streams=3 hubp=0,1,3 dpp=0,1,3 opp=0,1,3 tg=0,1,3 abm=0,1,3 mpcc=0,1,3 dsc=0,1,2
+0x5 pipes=2 mpccs=4 streams=2 hubp=1,3 dpp=1,3 opp=1,3 tg=1,3 abm=1,3 mpcc=1,3 dsc=0,1
+0x6 pipes=2 mpccs=4 streams=2 hubp=0,3 dpp=0,3 opp=0,3 tg=0,3 abm=0,3 mpcc=0,3 dsc=0,1
+0x7 pipes=1 mpccs=4 streams=1 hubp=3 dpp=3 opp=3 tg=3 abm=3 mpcc=3 dsc=0
+0x8 pipes=3 mpccs=4 streams=3 hubp=0,1,2 dpp=0,1,2 opp=0,1,2 tg=0,1,2 abm=0,1,2 mpcc=0,1,2 dsc=0,1,2
+0x9 pipes=2 mpccs=4 streams=2 hubp=1,2 dpp=1,2 opp=1,2 tg=1,2 abm=1,2 mpcc=1,2 dsc=0,1
+0xa pipes=2 mpccs=4 streams=2 hubp=0,2 dpp=0,2 opp=0,2 tg=0,2 abm=0,2 mpcc=0,2 dsc=0,1
+0xb pipes=1 mpccs=4 streams=1 hubp=2 dpp=2 opp=2 tg=2 abm=2 mpcc=2 dsc=0
+0xc pipes=2 mpccs=4 streams=2 hubp=0,1 dpp=0,1 opp=0,1 tg=0,1 abm=0,1 mpcc=0,1 dsc=0,1
+0xd pipes=1 mpccs=4 streams=1 hubp=1 dpp=1 opp=1 tg=1 abm=1 mpcc=1 dsc=0
+0xe pipes=1 mpccs=4 streams=1 hubp=0 dpp=0 opp=0 tg=0 abm=0 mpcc=0 dsc=0
+0xf pipes=0 mpccs=4 streams=0 hubp= dpp= opp= tg= abm= mpcc= dsc=

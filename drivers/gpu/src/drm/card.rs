@@ -232,6 +232,19 @@ pub struct Framebuffer {
     /// native amdgpu card (passed with DRM_MODE_FB_MODIFIERS or converted
     /// from the BO's tiling flags).
     pub modifier: u64,
+    /// On the native amdgpu card, the amdgpu GEM buffer behind a
+    /// framebuffer made from one of an open's GEM handles (none for a dumb
+    /// or imported buffer): `drm_framebuffer.obj[0]`, which the
+    /// framebuffer holds.
+    pub bo: Option<FbBo>,
+}
+
+/// An amdgpu GEM buffer a framebuffer holds, and the open that made it:
+/// drm_fb_release removes an open's framebuffers when it closes.
+#[derive(Clone, Debug)]
+pub struct FbBo {
+    pub object: Arc<crate::amdgpu_gem::GemObject>,
+    pub owner: u64,
 }
 
 // ── Card ───────────────────────────────────────────────────────────────
@@ -1718,8 +1731,76 @@ impl Card {
             offsets,
             chroma_pitch,
             modifier,
+            bo: None,
         });
         Ok(id)
+    }
+
+    /// ADDFB2 on the native amdgpu card naming one of open `owner`'s amdgpu
+    /// GEM handles (amdgpu_display_user_framebuffer_create's
+    /// drm_gem_object_lookup): amdgpu's checks as for a dumb buffer, with
+    /// the buffer's own size, `GEM_METADATA` tiling flags and
+    /// AMDGPU_GEM_CREATE_GFX12_DCC (amdgpu_display_get_fb_info). The
+    /// framebuffer holds the buffer until it is removed. Other cards have
+    /// no amdgpu GEM handles (`BadGemHandle`).
+    pub fn addfb2_bo(
+        &mut self,
+        cmd: &crate::amdgpu_dm_modifiers::FbCmd,
+        object: Arc<crate::amdgpu_gem::GemObject>,
+        owner: u64,
+    ) -> Result<u32, CardError> {
+        use crate::amdgpu_dm_modifiers as m;
+        if !self.gfx12_modifiers {
+            return Err(CardError::BadGemHandle);
+        }
+        let info = m::check_fb_cmd(cmd).map_err(|_| CardError::InvalidDimensions)?;
+        let dcc = object.flags & u64::from(crate::amdgpu_uapi::AMDGPU_GEM_CREATE_GFX12_DCC) != 0;
+        let formats = self.plane_formats.unwrap_or(&[]);
+        let modifier = m::check_amdgpu_fb(
+            cmd,
+            &info,
+            formats,
+            object.tiling_flags(),
+            dcc,
+            object.byte_len,
+        )
+        .map_err(|_| CardError::UnknownFormat)?;
+        let format = PixelFormat::from_fourcc(cmd.pixel_format).ok_or(CardError::UnknownFormat)?;
+        if self.framebuffers.len() >= 4096 {
+            return Err(CardError::TooManyFbs);
+        }
+        let two = info.num_planes == 2;
+        let id = self.next_fb_id;
+        self.next_fb_id = self.next_fb_id.wrapping_add(1).max(1);
+        self.framebuffers.push(Framebuffer {
+            id,
+            width: cmd.width,
+            height: cmd.height,
+            format,
+            pitch: cmd.pitches[0],
+            gem_handle: cmd.handles[0],
+            offsets: [cmd.offsets[0], if two { cmd.offsets[1] } else { 0 }],
+            chroma_pitch: if two { cmd.pitches[1] } else { 0 },
+            modifier,
+            bo: Some(FbBo { object, owner }),
+        });
+        Ok(id)
+    }
+
+    /// drm_fb_release for open `owner`: remove every framebuffer it made
+    /// from an amdgpu GEM handle (as RMFB does, turning off what shows
+    /// it). Returns how many went.
+    pub fn release_file_framebuffers(&mut self, owner: u64) -> usize {
+        let ids: Vec<u32> = self
+            .framebuffers
+            .iter()
+            .filter(|fb| fb.bo.as_ref().is_some_and(|b| b.owner == owner))
+            .map(|fb| fb.id)
+            .collect();
+        for &id in &ids {
+            let _ = self.rmfb(id);
+        }
+        ids.len()
     }
 
     /// `AMDGPU_GEM_METADATA` SET on a dumb BO of this card: record its
@@ -1770,6 +1851,11 @@ impl Card {
         {
             p.fb_id = None;
             p.crtc_id = None;
+        }
+        // A GEM buffer's reference goes with the framebuffer; a scanout pin
+        // (amdgpu_dm_plane_helper_prepare_fb's) keeps it while fetched.
+        if fb.bo.is_some() {
+            return Ok(None);
         }
         let freed = self.remove_dumb_backing(fb.gem_handle);
         if freed.is_none() {

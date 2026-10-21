@@ -993,11 +993,32 @@ fn dcn401_hdmi_link_starts_beside_another_display() -> TestResult {
     let (mut e, mut fw, c) = fixture(1, 2, 3);
     running(&mut e);
     e.displays.siblings = theirs;
+    let from = e.io.inner.writes.len();
     if run(e.prepare_hdmi_link(&mut fw, path(1), link(2, 3), c)).is_err()
         || run(e.start_hdmi_video(path(1), c)).is_err()
         || e.status.state != State::HdmiVideoRunning(2)
     {
         return TestResult::Fail("link beside another display");
+    }
+    // A sink lit beside the running display (Linux's hotplug lights only
+    // the new connector): no write lands on its timing generator, OPTC,
+    // VTG, DIG stream or transmitter.
+    let theirs_at = |at: u64| {
+        let within = |from: u64, len: u64| (BASE + from * 4..BASE + (from + len) * 4).contains(&at);
+        within(0x1b2a + 0x80, 0x80)
+            || within(0x1acb + 0x10, 0x10)
+            || within(0x530 + 1, 1)
+            || within(0x2060, 0x124)
+            || at == phy(0, 0x2943)
+            || at == phy(0, 0x2931)
+    };
+    let touched: Vec<u64> = e.io.inner.writes[from..]
+        .iter()
+        .map(|w| w.0)
+        .filter(|&at| theirs_at(at))
+        .collect();
+    if !touched.is_empty() {
+        panic!("lighting beside wrote the running display's registers {touched:x?}");
     }
     let (mut e, mut fw, c) = fixture(1, 0, 3);
     e.displays.siblings = theirs;

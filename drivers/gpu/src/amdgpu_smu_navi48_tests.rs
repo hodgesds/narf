@@ -36,6 +36,8 @@ struct Fake {
     commands: Vec<(u32, u32)>,
     stall: Option<u32>,
     reject: Option<u32>,
+    /// Refuse only this message with this argument.
+    reject_arg: Option<(u32, u32)>,
     interface: u32,
     enabled: u64,
     reported: Option<u64>,
@@ -61,7 +63,7 @@ impl Io for Fake {
         if self.stall == Some(value) {
             return;
         }
-        if self.reject == Some(value) {
+        if self.reject == Some(value) || self.reject_arg == Some((value, p)) {
             self.regs[RESPONSE as usize] = 0xfd;
             return;
         }
@@ -168,6 +170,7 @@ fn fixture() -> (Pool, Engine<Fake>) {
                 commands: Vec::new(),
                 stall: None,
                 reject: None,
+                reject_arg: None,
                 interface: DRIVER_INTERFACE,
                 enabled: 0,
                 reported: None,
@@ -410,6 +413,16 @@ fn smu14_constructor_resolves_bank_one_and_validates_pool() -> TestResult {
         return TestResult::Fail("SMU14 used MP1 bank zero or wrote hardware at construction");
     }
     drop(smu);
+    // smu_v14_0_2_ppt serves MP1 14.0.2 (Navi44) and 14.0.3 (Navi48) alike.
+    for profile in crate::amdgpu_rdna4::tests::Profile::ALL {
+        profile.apply(&mut g);
+        // SAFETY: as above; construction only.
+        let smu = unsafe { Smu::after_upload(&g, Cap::bootstrap(), &pool) };
+        if !smu.is_ok_and(|s| s.engine.io.base == 0x44000 && s.state() == State::Prepared) {
+            return TestResult::Fail("SMU14 constructor refused an RDNA4 profile");
+        }
+    }
+    crate::amdgpu_rdna4::tests::Profile::Navi48.apply(&mut g);
     let cap = Cap::bootstrap();
     cap.revoke();
     if !matches!(
@@ -689,7 +702,7 @@ fn displayed() -> (Pool, Engine<Fake>) {
     let (pool, mut e) = display_engine();
     e.protection = ALLOWED & PROTECTION;
     run(e.enable_display_power()).unwrap();
-    e.features |= DEEP_SLEEP_GRAPHICS | DEEP_SLEEP_MEMORY_FABRIC;
+    e.features |= WALK;
     e.io.commands.clear();
     (pool, e)
 }
@@ -971,69 +984,129 @@ kernel_test_in!(
     smu14_jpeg_power_requires_current_static_policy_and_protection
 );
 
-fn smu14_deep_sleep_is_gated_and_keeps_protection() -> TestResult {
+/// Every DS bit of smu_v14_0_deep_sleep_control's 14.0.2 walk.
+const WALK: u64 = (1 << 10) | (1 << 15) | (1 << 12) | (1 << 11) | (1 << 13);
+/// EnableSmuFeaturesLow/High per supported bit, in Linux's order.
+fn walk_commands(bits: &[u64]) -> Vec<(u32, u32)> {
+    bits.iter()
+        .flat_map(|&b| [(8, b as u32), (9, (b >> 32) as u32)])
+        .collect()
+}
+
+/// smu_v14_0_deep_sleep_control(true): only after the display power
+/// transition; the walk's supported bits allowed, then each enabled in
+/// Linux's order (GFXCLK, UCLK, FCLK, SOCCLK, LCLK), the running mask
+/// checked for every protection and display DPM bit.
+fn smu14_deep_sleep_walks_linux_order_and_keeps_protection() -> TestResult {
     let (_, mut e) = powered();
-    assert_eq!(
-        run(e.allow_deep_sleep(DeepSleep::MemoryFabric)),
-        Err(Error::Busy)
-    );
+    assert_eq!(run(e.deep_sleep_control()), Err(Error::Busy));
     assert!(e.io.commands.is_empty());
-    let p = run(e.allow_deep_sleep(DeepSleep::Graphics)).unwrap();
-    let allowed = ALLOWED | DEEP_SLEEP_GRAPHICS;
-    assert_eq!(
-        e.io.commands,
-        [
-            (5, (allowed >> 32) as u32),
-            (4, allowed as u32),
-            (8, DEEP_SLEEP_GRAPHICS as u32),
-            (9, 0),
-            (0xc, 0),
-            (0xd, 0)
-        ]
-    );
-    assert_eq!((p.allowed, p.enabled), (allowed, allowed));
-    assert_eq!((e.state, e.power), (State::PowerReady, Some(p)));
-    // Already running: no commands.
-    e.io.commands.clear();
-    assert_eq!(run(e.allow_deep_sleep(DeepSleep::Graphics)), Ok(p));
-    assert!(e.io.commands.is_empty());
-    // Memory/fabric deep sleep only after the display power transition.
     let (_, mut e) = displayed();
-    let p = run(e.allow_deep_sleep(DeepSleep::MemoryFabric)).unwrap();
+    let before = e.power.unwrap();
+    let allowed = before.allowed | WALK;
+    let d = run(e.deep_sleep_control()).unwrap();
+    let mut expected = vec![(5, (allowed >> 32) as u32), (4, allowed as u32)];
+    expected.extend(walk_commands(&[
+        1 << 10,
+        1 << 15,
+        1 << 12,
+        1 << 11,
+        1 << 13,
+    ]));
+    expected.extend([(0xc, 0), (0xd, 0)]);
+    assert_eq!(e.io.commands, expected);
+    assert_eq!(d.refused, None);
+    assert_eq!(d.power.allowed, allowed);
+    assert_eq!(d.power.enabled & WALK, WALK);
     assert_eq!(
-        p.enabled & DEEP_SLEEP_MEMORY_FABRIC,
-        DEEP_SLEEP_MEMORY_FABRIC
+        (e.state, e.power),
+        (State::DisplayPowerReady, Some(d.power))
     );
-    assert_eq!(e.state, State::DisplayPowerReady);
-    // Unsupported board bits send nothing.
-    let (_, mut e) = powered();
-    e.features &= !DEEP_SLEEP_GRAPHICS;
-    assert!(run(e.allow_deep_sleep(DeepSleep::Graphics)).is_ok());
+    // Run again: Linux sends every supported bit again; allowed already.
+    e.io.commands.clear();
+    assert!(run(e.deep_sleep_control()).unwrap().refused.is_none());
+    let mut again = walk_commands(&[1 << 10, 1 << 15, 1 << 12, 1 << 11, 1 << 13]);
+    again.extend([(0xc, 0), (0xd, 0)]);
+    assert_eq!(e.io.commands, again);
+    // Bits the board does not support are not sent.
+    let (_, mut e) = displayed();
+    e.features &= !((1 << 15) | (1 << 11));
+    run(e.deep_sleep_control()).unwrap();
+    assert!(!e.io.commands.contains(&(8, 1 << 15)));
+    assert!(!e.io.commands.contains(&(8, 1 << 11)));
+    assert!(e.io.commands.contains(&(8, 1 << 12)));
+    // No supported bit: nothing at all.
+    let (_, mut e) = displayed();
+    e.features &= !WALK;
+    assert!(run(e.deep_sleep_control()).is_ok());
     assert!(e.io.commands.is_empty());
     // Losing any protection or display DPM bit is terminal.
     for lost in [1u64 << 28, 1 << 29, 1 << 3] {
         let (_, mut e) = displayed();
-        e.io.reported = Some((ALLOWED | DISPLAY | DEEP_SLEEP_GRAPHICS) & !lost);
+        e.io.reported = Some((ALLOWED | DISPLAY | WALK) & !lost);
         assert!(matches!(
-            run(e.allow_deep_sleep(DeepSleep::Graphics)),
+            run(e.deep_sleep_control()),
             Err(Error::Features(_))
         ));
         assert_eq!(e.state, State::Failed);
         assert_eq!(run(e.read_telemetry()), Err(Error::Busy));
     }
-    // A rejected feature command may have partially applied: terminal too.
-    let (_, mut e) = powered();
-    e.io.reject = Some(9);
-    assert_eq!(
-        run(e.allow_deep_sleep(DeepSleep::Graphics)),
-        Err(Error::Rejected(0xfd))
-    );
-    assert_eq!(e.state, State::Failed);
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/smu-navi48",
-    smu14_deep_sleep_is_gated_and_keeps_protection
+    smu14_deep_sleep_walks_linux_order_and_keeps_protection
+);
+
+/// A PMFW refusal stops the walk at that feature, as Linux's "Failed to
+/// enable FCLK DS" return does, and is reported, not raised: the owner
+/// stays reusable and the features enabled before it keep running.
+fn smu14_deep_sleep_refusal_stops_the_walk_and_is_not_terminal() -> TestResult {
+    let (_, mut e) = displayed();
+    e.io.reject_arg = Some((8, 1 << 12));
+    let d = run(e.deep_sleep_control()).unwrap();
+    assert_eq!(
+        d.refused,
+        Some(DeepSleepRefused {
+            feature: "FCLK",
+            error: Error::Rejected(0xfd)
+        })
+    );
+    let sent: Vec<(u32, u32)> = e.io.commands[2..].to_vec();
+    let mut expected = walk_commands(&[1 << 10, 1 << 15]);
+    expected.extend([(8, 1 << 12), (0xc, 0), (0xd, 0)]);
+    assert_eq!(sent, expected);
+    assert_eq!(e.state, State::DisplayPowerReady);
+    assert!(run(e.read_telemetry()).is_ok());
+    // The high half refused on the first bit: nothing after GFXCLK.
+    let (_, mut e) = displayed();
+    e.io.reject = Some(9);
+    let d = run(e.deep_sleep_control()).unwrap();
+    assert_eq!(d.refused.map(|r| r.feature), Some("GFXCLK"));
+    assert_eq!(e.state, State::DisplayPowerReady);
+    // The narf-only allowed-mask step refused: no feature is enabled.
+    let (_, mut e) = displayed();
+    e.io.reject = Some(5);
+    let d = run(e.deep_sleep_control()).unwrap();
+    assert_eq!(d.refused.map(|r| r.feature), Some("allowed mask"));
+    assert!(!e.io.commands.iter().any(|&(m, _)| m == 8));
+    assert_eq!(e.state, State::DisplayPowerReady);
+    // A transport failure stays terminal, as for every runtime command.
+    let (_, mut e) = displayed();
+    e.io.stall = Some(8);
+    {
+        let mut future = core::pin::pin!(e.deep_sleep_control());
+        assert!(future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+    }
+    assert_eq!(e.state, State::Runtime);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi48",
+    smu14_deep_sleep_refusal_stops_the_walk_and_is_not_terminal
 );
 
 /// A configured owner whose board table carries `caps` as platform_caps.

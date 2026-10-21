@@ -305,7 +305,8 @@ pub(crate) unsafe fn discover(
         .map_err(|_| Error::Revoked)?;
     match vfct {
         Err(Error::NotFound)
-            if matches!(gpu.chip.did, crate::amdgpu::NAVI22 | crate::amdgpu::NAVI48) =>
+            if gpu.chip.did == crate::amdgpu::NAVI22
+                || crate::amdgpu_rdna4::Rdna4Chip::of(gpu).is_some() =>
         {
             // SAFETY: probe owns this device, BAR5 and the ROM index latch.
             unsafe { rom::read_discrete(gpu, device, cap) }

@@ -393,3 +393,32 @@ kernel_test_in!(
     "drivers/gpu/ih7",
     ih7_host_delivery_arms_last_and_preserves_ring_configuration
 );
+
+fn ih7_layout_resolves_on_every_rdna4_profile() -> TestResult {
+    use crate::amdgpu_rdna4::tests::Profile;
+    let mut regs = vec![0; 0x80000 / 4];
+    for profile in Profile::ALL {
+        let mut gpu = crate::amdgpu_gmc_navi48::tests::descriptor(&mut regs);
+        let mut oss = gpu.ip_blocks[0];
+        (oss.hw_id, oss.major, oss.minor, oss.revision) = (ip::HW_ID_OSSSYS, 7, 0, 0);
+        oss.base_addrs[0] = 0x14000;
+        gpu.ip_blocks.push(oss);
+        profile.apply(&mut gpu);
+        let Ok(layout) = Layout::resolve(&gpu) else {
+            return TestResult::Fail("IH7 refused an RDNA4 profile");
+        };
+        // OSSSYS 7.0 and GC12's FB window are one layout on both dies.
+        if layout.oss != 0x14000 * 4 || layout.gc != 0x4000 * 4 {
+            return TestResult::Fail("IH7 profile banks");
+        }
+        gpu.ip_blocks[0].revision = 2;
+        if Layout::resolve(&gpu).is_ok() {
+            return TestResult::Fail("IH7 accepted GC 12.0.2");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/ih7",
+    ih7_layout_resolves_on_every_rdna4_profile
+);

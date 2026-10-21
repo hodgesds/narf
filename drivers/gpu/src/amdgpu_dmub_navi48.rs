@@ -173,10 +173,7 @@ struct Layout {
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
-        if gpu.chip.vid != crate::amdgpu::AMD_VENDOR
-            || gpu.chip.did != crate::amdgpu::NAVI48
-            || gpu.regs.len < 0x7f004
-        {
+        if crate::amdgpu_rdna4::Rdna4Chip::of(gpu).is_none() || gpu.regs.len < 0x7f004 {
             return Err(Error::Unsupported);
         }
         Ok(Self {
@@ -671,12 +668,12 @@ impl Dmub {
     pub(crate) async fn set_tmds_pixel_clock(
         &mut self,
         path: crate::amdgpu_dcn_inventory::Path,
-        pipe: u8,
+        otg: u8,
         pixel_khz: u32,
         depth: TmdsDepth,
     ) -> Result<(), Error> {
         self.engine
-            .set_tmds_pixel_clock(path, pipe, pixel_khz, depth)
+            .set_tmds_pixel_clock(path, otg, pixel_khz, depth)
             .await
     }
     pub(crate) async fn setup_hdmi_stream(
@@ -1012,22 +1009,23 @@ impl<I: Io> Engine<I> {
         let result = self.command(request).await.map(|_| ());
         self.finish_mailbox(result)
     }
-    /// Program the transmitter's PHY PLL for an RGB TMDS stream timed by
-    /// `pipe`. Linux dcn401_program_pix_clk -> set_pixel_clock_v7, after the
-    /// DP DTO is disabled: the deep-colour-scaled clock, PLL from
+    /// Program the transmitter's PHY PLL for an RGB TMDS stream timed by OTG
+    /// instance `otg` (controller_id = CONTROLLER_ID_D0 + tg->inst). Linux
+    /// dcn401_program_pix_clk -> set_pixel_clock_v7, after the DP DTO is
+    /// disabled: the deep-colour-scaled clock, PLL from
     /// find_matching_pll (COMBO_PHY_PLL0 + PHY), the UNIPHY pair's encoder
     /// object id, HDMI encoder mode, XTALIN reference (miscinfo 0) and the
     /// deep-colour ratio.
     async fn set_tmds_pixel_clock(
         &mut self,
         path: crate::amdgpu_dcn_inventory::Path,
-        pipe: u8,
+        otg: u8,
         pixel_khz: u32,
         depth: TmdsDepth,
     ) -> Result<(), Error> {
         Self::hdmi_path(path)?;
         let clock = depth.character_100hz(pixel_khz);
-        if pipe >= 4 || clock == 0 || clock > u64::from(TMDS_MAX_KHZ) * 10 {
+        if otg >= 4 || clock == 0 || clock > u64::from(TMDS_MAX_KHZ) * 10 {
             return Err(Error::Invalid);
         }
         let mut request = [0; 64];
@@ -1037,7 +1035,7 @@ impl<I: Io> Engine<I> {
                                             // ObjectID.h ENCODER_OBJECT_ID_INTERNAL_UNIPHY / UNIPHY1.
         request[9] = [0x1e, 0x20][usize::from(path.transmitter / 2)];
         request[10] = 3; // ATOM_ENCODER_MODE_HDMI
-        request[12] = pipe; // ATOM_CRTC1 + controller
+        request[12] = otg; // ATOM_CRTC1 + controller
         request[13] = depth.code(); // PIXEL_CLOCK_V7_DEEPCOLOR_RATIO_*
         self.send(request).await
     }
@@ -1109,7 +1107,269 @@ impl<I: Io> Engine<I> {
         let result = self.command(request).await.map(|_| ());
         self.finish_mailbox(result)
     }
+    /// dmub_hw_lock_mgr_inbox0_cmd: clear the inbox0 acknowledgement
+    /// (DMCUB_SCRATCH17), post the command to DMCUB_INBOX0_WPTR and wait
+    /// up to 100 ms (MAX_WAIT_US) for firmware to acknowledge it. As
+    /// dc_dmub_srv_wait_for_inbox0_ack, a missing acknowledgement is logged
+    /// ("Error waiting for INBOX0 HW Lock Ack", without DMU recovery, which
+    /// DC leaves off) and the caller goes on: `Ok(false)`, the mailbox left
+    /// usable, since inbox0 is a register handshake beside the ring.
+    async fn inbox0(&mut self, command: u32) -> Result<bool, Error> {
+        self.begin_mailbox()?;
+        let result = match self.inbox0_inner(command).await {
+            Err(Error::CommandTimeout) => {
+                let _ = core::fmt::Write::write_fmt(
+                    &mut narf_console::Writer,
+                    format_args!(
+                        "amdgpu: navi48 DMUB inbox0 command {command:#x} not acknowledged\n"
+                    ),
+                );
+                Ok(false)
+            }
+            r => r.map(|()| true),
+        };
+        self.finish_mailbox(result)
+    }
+    async fn inbox0_inner(&mut self, command: u32) -> Result<(), Error> {
+        let (base, layout) = (self.layout.dcn, self.layout);
+        self.access(|io| {
+            if !is_running(io, layout)? {
+                return Err(Error::Protocol);
+            }
+            io.write(base + u64::from(INBOX0_ACK) * 4, 0);
+            io.write(base + u64::from(INBOX0_WPTR) * 4, command);
+            Ok(())
+        })?;
+        let deadline = narf_time::Deadline::after_ms(100);
+        loop {
+            if self.access(|io| read(io, base, INBOX0_ACK))? != 0 {
+                return Ok(());
+            }
+            if deadline.expired() {
+                return Err(Error::CommandTimeout);
+            }
+            tick().await;
+        }
+    }
 }
+
+/// DMCUB_INBOX0_WPTR and DMCUB_SCRATCH17, the inbox0 acknowledgement
+/// (dmub_dcn401_send_inbox0_cmd / _read_inbox0_ack_register).
+const INBOX0_WPTR: u32 = 0x1d2;
+const INBOX0_ACK: u32 = 0x1f4;
+/// `union dmub_inbox0_cmd_lock_hw`: DMUB_INBOX0_CMD__HW_LOCK from
+/// HW_LOCK_CLIENT_DRIVER with no instance or lock flags, then the lock
+/// (bit 23) or the release (should_release, bit 24).
+const HW_LOCK: u32 = 1;
+const HW_LOCK_LOCK: u32 = 1 << 23;
+const HW_LOCK_RELEASE: u32 = 1 << 24;
+/// DMUB_CMD__FW_ASSISTED_MCLK_SWITCH / DMUB_CMD__FAMS2_CONFIG.
+const FW_ASSISTED_MCLK_SWITCH: u8 = 76;
+const FAMS2_CONFIG: u8 = 4;
+/// sizeof(struct dmub_rb_cmd_fams2) less its header.
+const FAMS2_PAYLOAD: u8 = 60;
+
+/// `union fw_assisted_mclk_switch_version` DCN401 runs FAMS2 with
+/// (dc->debug.fams_version 2.1: minor 1, major 2).
+pub const FAMS_VERSION: u8 = 2 << 5 | 1;
+
+impl FeatureCaps {
+    /// dmub_feature_caps.fw_assisted_mclk_switch_ver.
+    pub fn fams_version(&self) -> u8 {
+        self.0[1]
+    }
+    /// dcn401_init_hw: FAMS2 stays enabled only when firmware reports the
+    /// driver's FAMS version.
+    pub fn fams2(&self) -> bool {
+        self.fams_version() == FAMS_VERSION
+    }
+}
+
+/// `union dmub_fams2_global_feature_config` bits DC sets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Fams2Features {
+    pub enable: bool,
+    pub enable_ppt_check: bool,
+    pub enable_stall_recovery: bool,
+    pub enable_debug: bool,
+    pub enable_offload_flip: bool,
+    pub enable_visual_confirm: bool,
+    /// enum dmub_fams2_allow_delay_check_mode (two bits).
+    pub allow_delay_check_mode: u8,
+    pub legacy_method_no_fams2: bool,
+}
+
+impl Fams2Features {
+    fn bits(self) -> u32 {
+        u32::from(self.enable)
+            | u32::from(self.enable_ppt_check) << 1
+            | u32::from(self.enable_stall_recovery) << 2
+            | u32::from(self.enable_debug) << 3
+            | u32::from(self.enable_offload_flip) << 4
+            | u32::from(self.enable_visual_confirm) << 5
+            | u32::from(self.allow_delay_check_mode & 3) << 6
+            | u32::from(self.legacy_method_no_fams2) << 8
+    }
+}
+
+/// `struct dmub_cmd_fams2_global_config`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Fams2Global {
+    pub max_allow_delay_us: u32,
+    pub lock_wait_time_us: u32,
+    pub num_streams: u32,
+    pub features: Fams2Features,
+    pub recovery_timeout_us: u32,
+    pub hwfq_flip_programming_delay_us: u32,
+    pub max_allow_to_target_delta_us: u32,
+}
+
+/// One stream's FAMS2 v1 static base state with DC's OTG and pipe masks
+/// (`struct dmub_fams2_cmd_stream_static_base_state`), and its legacy
+/// sub-state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Fams2StreamConfig {
+    pub base: crate::amdgpu_dcn401_dml::pstate::Fams2Stream,
+    pub otg_inst: u8,
+    pub pipe_mask: u8,
+    pub num_planes: u8,
+    pub plane_pipe_masks: [u8; 6],
+}
+
+/// dc_dmub_srv_rb_based_fams2_update_config's command list for `global`
+/// (DC's static feature overrides already applied) and `streams`: the
+/// global command, then every stream's base, then every stream's sub-state,
+/// all but the last marked multi_cmd_pending. Disabled (`enable` false) it
+/// is the global command alone with only the dynamic feature bits.
+pub fn fams2_config_commands(
+    enable: bool,
+    global: &Fams2Global,
+    streams: &[Fams2StreamConfig],
+) -> Vec<[u8; 64]> {
+    let header = |pending: bool| {
+        let mut c = [0u8; 64];
+        c[0] = FW_ASSISTED_MCLK_SWITCH;
+        c[1] = FAMS2_CONFIG;
+        c[2] = u8::from(pending) << 1;
+        c[3] = FAMS2_PAYLOAD;
+        c
+    };
+    let mut first = header(false);
+    let features = Fams2Features {
+        // dc_dmub_srv_rb_based_fams2_update_config: visual confirm and the
+        // PPT check from DC's debug defaults (off), enable only when both
+        // asked and the configuration requires it.
+        enable: enable && global.features.enable,
+        enable_ppt_check: false,
+        enable_visual_confirm: false,
+        ..if enable {
+            global.features
+        } else {
+            Fams2Features::default()
+        }
+    };
+    let put = |c: &mut [u8; 64], at: usize, v: u32| c[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    if enable {
+        for (i, v) in [
+            global.max_allow_delay_us,
+            global.lock_wait_time_us,
+            global.num_streams,
+            0,
+            global.recovery_timeout_us,
+            global.hwfq_flip_programming_delay_us,
+            global.max_allow_to_target_delta_us,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            put(&mut first, 4 + 4 * i, v);
+        }
+    }
+    put(&mut first, 4 + 12, features.bits());
+    let mut out = Vec::with_capacity(1 + 2 * streams.len());
+    if !enable || streams.is_empty() {
+        out.push(first);
+        return out;
+    }
+    first[2] |= 2;
+    out.push(first);
+    for s in streams {
+        let b = &s.base;
+        let mut c = header(true);
+        let put16 = |c: &mut [u8; 64], at: usize, v: u16| {
+            c[4 + at..4 + at + 2].copy_from_slice(&v.to_le_bytes())
+        };
+        c[4..8].copy_from_slice(&u32::from(b.kind).to_le_bytes());
+        c[8..12].copy_from_slice(&b.otg_vline_time_ns.to_le_bytes());
+        put16(&mut c, 12, b.htotal);
+        put16(&mut c, 14, b.vtotal);
+        put16(&mut c, 16, b.vblank_start);
+        put16(&mut c, 18, b.vblank_end);
+        put16(&mut c, 20, b.max_vtotal);
+        put16(&mut c, 22, b.allow_start_otg_vline);
+        put16(&mut c, 24, b.allow_end_otg_vline);
+        put16(&mut c, 26, b.drr_keepout_otg_vline);
+        put16(&mut c, 28, b.scheduling_delay_otg_vlines);
+        put16(&mut c, 30, b.contention_delay_otg_vlines);
+        put16(&mut c, 32, b.vline_int_ack_delay_otg_vlines);
+        put16(&mut c, 34, b.allow_to_target_delay_otg_vlines);
+        c[4 + 36] = u8::from(b.is_drr)
+            | u8::from(b.clamp_vtotal_min) << 1
+            | u8::from(b.min_ttu_vblank_usable) << 2;
+        c[4 + 37] = s.otg_inst;
+        c[4 + 38] = s.pipe_mask;
+        c[4 + 39] = s.num_planes;
+        c[4 + 40..4 + 46].copy_from_slice(&s.plane_pipe_masks);
+        out.push(c);
+    }
+    for s in streams {
+        // The legacy sub-state (dmub_fams2_cmd_legacy_stream_static_state):
+        // the vactive fill delay; a vblank stream leaves it zero.
+        let mut c = header(true);
+        c[4..6].copy_from_slice(&s.base.vactive_det_fill_delay_otg_vlines.to_le_bytes());
+        out.push(c);
+    }
+    if let Some(last) = out.last_mut() {
+        last[2] &= !2;
+    }
+    out
+}
+
+impl<I: Io> Engine<I> {
+    /// dcn401_fams2_update_config for the hardware-exclusive methods: the
+    /// single global FAMS2_CONFIG command. A configuration with streams
+    /// needs a chained command list, which this owner does not post.
+    async fn fams2_update_config(&mut self, commands: &[[u8; 64]]) -> Result<(), Error> {
+        let [command] = commands else {
+            return Err(Error::Unsupported);
+        };
+        self.send(*command).await
+    }
+}
+
+impl Dmub {
+    /// Whether DC keeps FAMS2 enabled for this firmware (dcn401_init_hw's
+    /// FAMS version check): `None` until QUERY_FEATURE_CAPS answered.
+    pub fn fams2(&self) -> Option<bool> {
+        self.engine
+            .status
+            .and_then(|s| s.capabilities)
+            .map(|c| c.fams2())
+    }
+    /// dcn401_dmub_hw_control_lock: the driver's inbox0 HW lock, taken
+    /// (`lock`) or released. `Ok(false)`: firmware never acknowledged it,
+    /// which Linux logs and goes on from.
+    pub(crate) async fn hw_lock(&mut self, lock: bool) -> Result<bool, Error> {
+        let command = HW_LOCK | if lock { HW_LOCK_LOCK } else { HW_LOCK_RELEASE };
+        self.engine.inbox0(command).await
+    }
+    /// Post dc_dmub_srv_fams2_update_config's commands
+    /// ([`fams2_config_commands`]).
+    pub(crate) async fn fams2_update_config(&mut self, commands: &[[u8; 64]]) -> Result<(), Error> {
+        self.engine.fams2_update_config(commands).await
+    }
+}
+
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_dmub_navi48_tests.rs"]
 mod tests;

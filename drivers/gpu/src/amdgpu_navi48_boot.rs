@@ -141,7 +141,8 @@ impl Firmware {
         let prepared = dmub::Prepared::new(
             gfx.dmcub_bytes(),
             bios.bytes(),
-            sos.image().map_err(Error::Sos)?.version(),
+            // dm_dmub_hw_init: hw_params.psp_version = psp.sos.fw_version.
+            sos.image().map_err(Error::Sos)?.sos_version(),
         )
         .map_err(Error::Dmub)?;
         Ok(Self {
@@ -179,12 +180,48 @@ impl<B: Backend> Sequence<B> {
         Ok(report)
     }
 }
+/// Pin the VRAM-offset `range` in whichever pools it falls in, as
+/// amdgpu_bo_create_kernel_at pins a fixed range: refused (`Allocation`)
+/// if it runs past VRAM, past the BAR with no unmapped pool, or over a
+/// range something already allocated.
+fn pin_vram(
+    pool: &Pool,
+    unmapped: Option<&crate::amdgpu_vram::UnmappedPool>,
+    vram_size: u64,
+    range: core::ops::Range<u64>,
+) -> Result<(), Error> {
+    if range.is_empty() {
+        return Ok(());
+    }
+    if range.end > vram_size {
+        return Err(Error::Allocation);
+    }
+    let visible = pool.size();
+    if range.start < visible {
+        pool.claim(range.start..range.end.min(visible))
+            .map_err(|_| Error::Allocation)?;
+    }
+    if range.end > visible {
+        unmapped
+            .ok_or(Error::Allocation)?
+            .claim(range.start.max(visible) - visible..range.end - visible)
+            .map_err(|_| Error::Allocation)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct Hardware {
     gpu: AmdGpu,
     pci: narf_bus::BusDevice,
     authority: Cap<BusDeviceCap, Write>,
     pool: Pool,
+    /// The VRAM past the BAR, if any; `pool` is the CPU-visible prefix.
+    unmapped: Option<crate::amdgpu_vram::UnmappedPool>,
+    /// psp_hw_start runs psp_update_fw_reservation only when neither in
+    /// reset nor in suspend: a cold boot, not the owner `after_reset` makes
+    /// for recovery or S3/runtime resume (whose pools keep the pin).
+    update_fw_reservation: bool,
     firmware: Firmware,
     dmub: dmub::Dmub,
     trainer: Option<training::Trainer>,
@@ -264,6 +301,28 @@ impl Backend for Hardware {
                     .start()
                     .await
                     .map_err(Error::Psp)?;
+                if self.update_fw_reservation {
+                    let sos = self.firmware.sos.image().map_err(Error::Sos)?.sos_version();
+                    let reservation = self
+                        .psp
+                        .as_mut()
+                        .unwrap()
+                        .update_fw_reservation_navi48(sos, self.gpu.vram.size)
+                        .await
+                        .map_err(Error::Psp)?;
+                    if let Some(r) = reservation {
+                        // amdgpu_ttm_mark_vram_reserved for AMDGPU_RESV_FW
+                        // then AMDGPU_RESV_FW_EXTEND; either failing fails
+                        // psp_hw_start.
+                        pin_vram(&self.pool, self.unmapped.as_ref(), self.gpu.vram.size, r.fw)?;
+                        pin_vram(
+                            &self.pool,
+                            self.unmapped.as_ref(),
+                            self.gpu.vram.size,
+                            r.ext,
+                        )?;
+                    }
+                }
             }
             Stage::TrustedMemory => self
                 .psp
@@ -522,6 +581,45 @@ pub struct ColdBoot {
     client_heap: Option<crate::amdgpu_gem::VramHeap>,
     /// The inventory's VRAM past the BAR, all of it for clients.
     unmapped_vram: Option<crate::amdgpu_vram::UnmappedPool>,
+    /// The display power policy's outcome, once the display clocks started.
+    display_power_policy: Option<DisplayPowerPolicy>,
+}
+/// What the display power policy did (`ColdBoot::display_power_policy`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayPowerPolicy {
+    pub wm_ranges: Result<(), clocks::Error>,
+    /// `None` without an SMU owner.
+    pub deep_sleep: Option<Result<smu::DeepSleep, smu::Error>>,
+}
+fn log_policy(args: core::fmt::Arguments<'_>) {
+    let _ = core::fmt::Write::write_fmt(
+        &mut narf_console::Writer,
+        format_args!("amdgpu: navi48 display power policy: {args}\n"),
+    );
+}
+/// Rebind every clock record and every display's timing records from the
+/// global clocks `old` to `new`, which are now running.
+fn rebind_display_clocks(
+    otg: &mut otg::Otg,
+    dccg: &mut dccg::Dccg,
+    old: clocks::Applied,
+    new: clocks::Applied,
+) -> Result<(), otg::Error> {
+    dccg.rebind_global(old, new);
+    let records = dccg.status().pipes;
+    // Displays are pipe indices; a fused instance is no display.
+    for display in crate::amdgpu_rdna4::pipe_pool().pipes() {
+        let Some(status) = otg.display_status(display) else {
+            continue;
+        };
+        let Some(timing) = status.pipes[usize::from(display)] else {
+            continue;
+        };
+        if let Some(clock) = records[usize::from(timing.request.pipe)] {
+            otg.rebind_clock(display, clock)?;
+        }
+    }
+    Ok(())
 }
 /// What the driver keeps of `available` free CPU-visible VRAM for its own
 /// later owners (scanout surfaces, display and queue memory): half of a
@@ -582,7 +680,14 @@ impl ColdBoot {
         if target != firmware.gfx.target() || !firmware.sos.is_psp14(mp0.revision) {
             return Err(Error::Unsupported);
         }
-        psp::bank(gpu, ip::HW_ID_MP1, &[(14, 0, 2), (14, 0, 3)], 1, 0x9a).map_err(Error::Psp)?;
+        psp::bank(
+            gpu,
+            ip::HW_ID_MP1,
+            crate::amdgpu_rdna4::MP_VERSIONS,
+            1,
+            0x9a,
+        )
+        .map_err(Error::Psp)?;
         // Record a display inventory error without blocking non-display engine
         // bring-up. This immutable board copy survives the legacy-owner handoff.
         let display = gpu
@@ -592,6 +697,18 @@ impl ColdBoot {
             .and_then(|bios| inventory::display_paths(gpu, bios.bytes()))
             .map_err(display::Error::Inventory)
             .and_then(display::Probe::new);
+        // dcn401_resource_construct's pipe harvesting: the resource pool
+        // every display owner below is built with (all four pipes when the
+        // read is unavailable, which also leaves the rest of display
+        // bring-up to fail on its own). Every owner (cold boot and the one
+        // `after_reset` builds for recovery or resume) publishes its own
+        // read, so no earlier device's or boot's pool survives an
+        // unreadable fuse register.
+        crate::amdgpu_rdna4::publish_pipe_pool(
+            // SAFETY: same exclusive register ownership; one read, no writes.
+            unsafe { crate::amdgpu_rdna4::read_pipe_pool(gpu, &authority) }
+                .unwrap_or(crate::amdgpu_rdna4::PipePool::FULL),
+        );
         // Linux's DCN crystal (`dce_refclk_10khz`), the reference DDC and the
         // DCHUB global timer both divide.
         let crystal = gpu
@@ -668,7 +785,8 @@ impl ColdBoot {
             scanned_sinks: Vec::new(),
             client_vram: None,
             client_heap: None,
-            unmapped_vram: unmapped,
+            unmapped_vram: unmapped.clone(),
+            display_power_policy: None,
             reset: None,
             baco_exited: false,
             sequence: alloc::boxed::Box::new(Sequence {
@@ -677,6 +795,8 @@ impl ColdBoot {
                     pci,
                     authority,
                     pool: pool.clone(),
+                    unmapped,
+                    update_fw_reservation: true,
                     firmware,
                     dmub,
                     trainer,
@@ -824,6 +944,7 @@ impl ColdBoot {
             new.sequence.backend.training_resume = true;
         }
         new.client_vram = self.client_vram.take();
+        new.sequence.backend.update_fw_reservation = false;
         // Only a BACO exit that needed no reset keeps PMFW resident; a
         // mode1 on resume (SOS survived) reloads it as recovery does.
         new.sequence.backend.smu_resident =
@@ -1157,11 +1278,18 @@ impl ColdBoot {
             .map(queues::Queues::fence_reader)
     }
 
-    /// This GPU's DRM card: the registered Navi48.
+    /// This GPU's DRM card: the registered RDNA4 board, by the probed PCI
+    /// id (any listed RDNA4 id before a probe, as in the register models).
     pub(crate) fn drm_card() -> Option<u32> {
+        let probed = crate::amdgpu::pci_device().map(|d| (d.id.vendor, d.id.device));
         (0..crate::drm_registry::count() as u32).find(|&i| {
-            crate::drm_registry::pci_id(i)
-                == Some((crate::amdgpu::AMD_VENDOR, crate::amdgpu::NAVI48))
+            crate::drm_registry::pci_id(i).is_some_and(|(vid, did)| match probed {
+                Some(id) => id == (vid, did),
+                None => {
+                    vid == crate::amdgpu::AMD_VENDOR
+                        && crate::amdgpu_rdna4::known_device(did).is_some()
+                }
+            })
         })
     }
     pub(crate) async unsafe fn prove_queue_interrupts(
@@ -1285,6 +1413,21 @@ impl ColdBoot {
             fb_offset: context.fb_offset,
             unmapped: None,
         };
+        // amdgpu_gmc_get_dcc_alignment from discovery's GC version and its
+        // gc_info TCC count (max_texture_channel_caches), before any client
+        // buffer is placed.
+        let gc = ip::find_ip(&hw.gpu.ip_blocks, ip::HW_ID_GC, 0)
+            .map_or((0, 0, 0), |gc| (gc.major, gc.minor, gc.revision));
+        let tccs = hw.gpu.gc_info.map_or(0, |info| info.num_tccs);
+        crate::amdgpu_gem::set_gfx12_dcc(
+            card,
+            Some(u64::from(crate::amdgpu_gem::gmc_v12_dcc_alignment(
+                gc, tccs,
+            ))),
+        );
+        // Evictions see every buffer of the card, framebuffer-only ones
+        // included, as TTM's LRU does.
+        crate::amdgpu_gem::set_lru_eviction(card, true);
         crate::amdgpu_gem::register_vram_heap(card, heap.clone());
         self.client_heap = Some(heap);
         self.client_vram = Some(chunk);
@@ -1465,15 +1608,94 @@ impl ColdBoot {
             .smu
             .as_mut()
             .ok_or(clocks::Error::Invalid)?;
-        if clocks.status().state == clocks::State::Prepared {
+        let starting = clocks.status().state == clocks::State::Prepared;
+        if starting {
             // SAFETY: retained matching SMU and drained owned engines. The
             // clock owner checks every display consumer before changing DPM.
             unsafe { clocks.start(smu).await }?;
         }
-        match clocks.status().state {
-            clocks::State::Ready | clocks::State::Applied => Ok(()),
-            _ => Err(clocks::Error::Busy),
+        if !matches!(
+            clocks.status().state,
+            clocks::State::Ready | clocks::State::Applied
+        ) {
+            return Err(clocks::Error::Busy);
         }
+        if starting {
+            self.install_display_power_policy().await;
+        }
+        Ok(())
+    }
+    /// What Linux does once DC knows the clocks, and then at COMPLETE_INIT:
+    /// dcn401_init_hw's dcn401_notify_wm_ranges hands PMFW the watermark
+    /// range table (set A, and set 1A for the dummy P-state), and
+    /// smu_bump_power_profile_mode's smu_v14_0_2_set_power_profile_mode runs
+    /// smu_v14_0_deep_sleep_control(true) for the default workload (narf has
+    /// no power-profile or compute-profile path on Navi48, so the bootup
+    /// default profile, which is not COMPUTE, is the only one). As in Linux,
+    /// nothing here fails display bring-up: a table that cannot be placed
+    /// is skipped, and refusals are logged and recorded
+    /// (`display_power_policy`). The table stays excluded from reuse.
+    async fn install_display_power_policy(&mut self) {
+        let wm_ranges = self.notify_display_wm_ranges().await;
+        if let Err(e) = wm_ranges {
+            log_policy(format_args!("watermark ranges not sent: {e:?}"));
+        }
+        let deep_sleep = match self.sequence.backend.smu.as_mut() {
+            // SAFETY: the kernel engines' owners tolerate GFXCLK deep sleep
+            // as Linux's do; every plan's watermarks carry DML's
+            // self-refresh exit latencies and the deep-sleep DCFCLK floor,
+            // and the watermark ranges were offered to PMFW above.
+            Some(smu) => Some(unsafe { smu.deep_sleep_control() }.await),
+            None => None,
+        };
+        match deep_sleep {
+            Some(Ok(smu::DeepSleep {
+                refused: Some(r), ..
+            })) => log_policy(format_args!(
+                "failed to enable {} DS: {:?}",
+                r.feature, r.error
+            )),
+            Some(Err(e)) => log_policy(format_args!("deep sleep not enabled: {e:?}")),
+            _ => {}
+        }
+        self.display_power_policy = Some(DisplayPowerPolicy {
+            wm_ranges,
+            deep_sleep,
+        });
+    }
+    /// dcn401_notify_wm_ranges with a table in a 4-KiB VRAM range kept out
+    /// of reuse (Linux's wm_range_table, which is skipped when it could
+    /// not be allocated).
+    async fn notify_display_wm_ranges(&mut self) -> Result<(), clocks::Error> {
+        let mut table = self
+            .sequence
+            .backend
+            .pool
+            .reserve(4096)
+            .map_err(|_| clocks::Error::Invalid)?;
+        let bytes = clocks::ClockManager::wm_range_table();
+        let virt = table.mapping().virt;
+        self.access_vram(|| {
+            for (k, b) in bytes.iter().enumerate() {
+                // SAFETY: a fresh, privately reserved, mapped 4 KiB range no
+                // engine reads before the notify below; HDP is flushed after.
+                unsafe { core::ptr::write_volatile((virt as *mut u8).add(k), *b) };
+            }
+            Ok(())
+        })
+        .map_err(|_| clocks::Error::DeviceGone)?;
+        // PMFW may read the table at any later time: never recycle it.
+        table.publish();
+        let address = table.address();
+        drop(table);
+        let regs = self.sequence.backend.gpu.regs;
+        let clocks = self.clocks.as_mut().map_err(|e| *e)?;
+        clocks.notify_wm_ranges(regs, address).await
+    }
+    /// What the display power policy did once the display clocks started:
+    /// the watermark-range notify and the deep-sleep walk.
+    pub fn display_power_policy(&self) -> Option<DisplayPowerPolicy> {
+        self.display_power_policy
     }
     pub fn display_pipe_clock_status(&self) -> Result<dccg::Status, dccg::Error> {
         self.dccg.as_ref().map(dccg::Dccg::status).map_err(|e| *e)
@@ -2044,7 +2266,8 @@ impl ColdBoot {
     /// Move display `pipe`'s live scanout to the planes `request` under
     /// `plan` without relighting it (`Otg::update_live_planes`: DC's medium
     /// or full plane update under the OTG lock, new pipes enabled off-tree
-    /// first, freed ones retired after the update latched).
+    /// first, freed ones retired after the update latched), fresh surfaces
+    /// holding `content`'s first frame.
     /// # Safety
     /// As for `prepare_display_deadlines`; the scanout stays live. Every CPU
     /// view of a surface the update replaces must be withdrawn.
@@ -2053,7 +2276,10 @@ impl ColdBoot {
         pipe: u8,
         request: &otg::LivePlanes,
         plan: &crate::amdgpu_dcn401_dml::Plan,
+        content: &mut dyn otg::PlaneContent,
     ) -> Result<alloc::boxed::Box<otg::PlanesUpdated>, otg::Error> {
+        // dcn401_prepare_bandwidth: pinned before any configuration change.
+        self.pin_display_uclk().await?;
         if self.display_retirement_busy() {
             return Err(otg::Error::Busy);
         }
@@ -2073,6 +2299,7 @@ impl ColdBoot {
                     request,
                     plan,
                     crystal,
+                    content,
                 )
                 .await
         }
@@ -2126,20 +2353,122 @@ impl ColdBoot {
             .update_live(regs, request, safe_to_lower, &held, &mut dto)
             .await
             .map_err(otg::Error::Clocks)?;
-        dccg.rebind_global(old, new);
-        let records = dccg.status().pipes;
-        for display in 0..4u8 {
-            let Some(status) = otg.display_status(display) else {
-                continue;
-            };
-            let Some(timing) = status.pipes[usize::from(display)] else {
-                continue;
-            };
-            if let Some(clock) = records[usize::from(timing.request.pipe)] {
-                otg.rebind_clock(display, clock)?;
-            }
-        }
+        rebind_display_clocks(otg, dccg, old, new)?;
         Ok(new)
+    }
+    /// Whether PMFW may switch UCLK under the running displays now
+    /// (`clocks::Status::uclk_switching`: a bandwidth sequence this owner
+    /// ran allowed it).
+    pub fn uclk_switching(&self) -> bool {
+        self.clocks
+            .as_ref()
+            .is_ok_and(|c| c.status().uclk_switching())
+    }
+    /// dcn401_update_clocks' bandwidth part on the running configuration:
+    /// the UCLK/FCLK P-state policy and floors and the deep-sleep DCFCLK
+    /// moved to `bandwidth` (`safe_to_lower` false raises and disallows,
+    /// true lowers and allows), every display's clock records then rebound.
+    /// Failure leaves the clock owner failed.
+    pub async fn update_live_display_bandwidth(
+        &mut self,
+        bandwidth: clocks::Bandwidth,
+        safe_to_lower: bool,
+    ) -> Result<clocks::Applied, otg::Error> {
+        if self.display_retirement_busy() {
+            return Err(otg::Error::Busy);
+        }
+        let otg = self.otg.as_mut().map_err(|e| *e)?;
+        let held = otg.all_held();
+        let clocks = self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?;
+        let dccg = self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?;
+        let regs = self.sequence.backend.gpu.regs;
+        let old = clocks
+            .retained_pipe_clocks(regs)
+            .map_err(otg::Error::Clocks)?;
+        let new = clocks
+            .update_bandwidth(regs, bandwidth, safe_to_lower, &held)
+            .await
+            .map_err(otg::Error::Clocks)?;
+        rebind_display_clocks(otg, dccg, old, new)?;
+        Ok(new)
+    }
+    /// dcn401_optimize_bandwidth once no display is left (dc_commit_streams
+    /// with no stream, as the last CRTC's disable and dm_suspend commit
+    /// it): FAMS2 disabled (`disable_display_fams2`), then
+    /// `clocks::ClockManager::release` (NumOfDisplays 0, DCFCLK, UCLK and
+    /// FCLK at their lowest levels, UCLK switching allowed), every clock
+    /// record rebound. Nothing before the display clocks were prepared, or
+    /// when it already ran. Busy while a display or teardown remains.
+    pub async fn release_display_bandwidth(&mut self) -> Result<(), otg::Error> {
+        if self.display_retirement_busy()
+            || self.teardowns.check_idle().is_err()
+            || self.display_modesets().iter().any(Option::is_some)
+        {
+            return Err(otg::Error::Busy);
+        }
+        // Only an applied configuration that still counts displays.
+        if !self.display_clock_status().is_ok_and(|s| {
+            s.state == clocks::State::Applied && s.applied.is_some_and(|a| a.request.displays != 0)
+        }) {
+            return Ok(());
+        }
+        self.disable_display_fams2().await;
+        let otg = self.otg.as_mut().map_err(|e| *e)?;
+        let clocks = self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?;
+        let dccg = self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?;
+        let regs = self.sequence.backend.gpu.regs;
+        let old = clocks
+            .retained_pipe_clocks(regs)
+            .map_err(otg::Error::Clocks)?;
+        let new = clocks.release(regs).await.map_err(otg::Error::Clocks)?;
+        rebind_display_clocks(otg, dccg, old, new)
+    }
+    /// Whether DC keeps FAMS2 on for the running DMCUB firmware (FAMS 2.1).
+    pub fn display_fams2(&self) -> bool {
+        self.sequence.backend.dmub.fams2() == Some(true)
+    }
+    /// dcn401_prepare/optimize_bandwidth's FAMS2 step for a configuration
+    /// that needs no firmware method (fams2_required false): under the
+    /// driver's inbox0 HW lock, FAMS2_CONFIG with FAMS2 disabled. Only with
+    /// FAMS 2.1 firmware, as DC clears fams2_config.enable otherwise. As in
+    /// Linux, where dcn401_dmub_hw_control_lock and
+    /// dc_dmub_srv_fams2_update_config return nothing (an unacknowledged
+    /// lock or a failed command is only logged), nothing here fails the
+    /// caller: each step is tried in turn, the lock released whatever the
+    /// update did, and a failure is logged. The port never enables FAMS2,
+    /// so firmware only ever holds it disabled.
+    pub async fn disable_display_fams2(&mut self) {
+        if !self.display_fams2() {
+            return;
+        }
+        let commands = dmub::fams2_config_commands(false, &dmub::Fams2Global::default(), &[]);
+        let dmub = &mut self.sequence.backend.dmub;
+        let locked = dmub.hw_lock(true).await;
+        let sent = dmub.fams2_update_config(&commands).await;
+        let released = dmub.hw_lock(false).await;
+        if locked.is_err() || sent.is_err() || released.is_err() {
+            let _ = core::fmt::Write::write_fmt(
+                &mut narf_console::Writer,
+                format_args!(
+                    "amdgpu: navi48 FAMS2 disable: lock {locked:?}, config {sent:?}, release {released:?}\n"
+                ),
+            );
+        }
+    }
+    /// dcn401_prepare_bandwidth before a configuration change
+    /// (`bandwidth::pin_uclk`): when PMFW may switch UCLK, UCLK and FCLK
+    /// raised to their highest levels with switching disallowed, then FAMS2
+    /// disabled, so that every plan (pinned or not) runs again. Nothing when
+    /// nothing allowed switching: a fresh owner (cold boot, S3 or runtime
+    /// resume, before the display clocks are prepared) or one already pinned.
+    pub async fn pin_display_uclk(&mut self) -> Result<(), otg::Error> {
+        bandwidth::pin_uclk(self).await
+    }
+    /// `pin_display_uclk` before a teardown: best-effort, as Linux's void
+    /// prepare_bandwidth never stops a stream from being disabled (a
+    /// failure is logged and the teardown goes on).
+    pub(crate) async fn pin_display_uclk_for_teardown(&mut self) {
+        let _ = bandwidth::pin_uclk_for_teardown(self).await;
     }
     /// Program `request`'s pipe clock for the selected display while the
     /// others run (their consumers left to them).
@@ -2213,7 +2542,7 @@ impl ColdBoot {
     }
     /// The live scanout as a CPU framebuffer (bus-physical BAR address).
     /// Read-only: display `pipe`'s running timing generator frame count and
-    /// scanout position (display k scans out on pipe k).
+    /// scanout position (`pipe` is the display's head pipe).
     pub fn display_scanout_position(
         &mut self,
         pipe: u8,
@@ -2342,6 +2671,44 @@ impl ColdBoot {
                 .await
         }
     }
+    /// `flip_display_planes` with each plane's source: its back buffer or a
+    /// client framebuffer scanned out in place (`otg::FlipSource`).
+    /// # Safety
+    /// As for `flip_display_planes`; every client framebuffer stays pinned
+    /// in VRAM until a later flip or stop shows it no longer fetched
+    /// (`display_fetched_addresses`).
+    pub async unsafe fn flip_display_sources(
+        &mut self,
+        pipe: u8,
+        sources: [Option<otg::FlipSource>; 1 + otg::MAX_OVERLAYS],
+    ) -> Result<[Option<otg::FlipDone>; 1 + otg::MAX_OVERLAYS], otg::Error> {
+        let crystal = *self.crystal.as_ref().map_err(|_| otg::Error::Unsupported)?;
+        let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
+        // SAFETY: matching retained owners are serialized; caller excludes
+        // writers and keeps every client framebuffer pinned.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .flip_sources(
+                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                    gmc,
+                    pipe,
+                    sources,
+                    crystal,
+                )
+                .await
+        }
+    }
+    /// What display `pipe`'s HUBPs fetch, when known (`Otg::fetched_addresses`);
+    /// none without a display owner.
+    pub fn display_fetched_addresses(
+        &self,
+        pipe: u8,
+    ) -> Option<[Option<u64>; 1 + otg::MAX_OVERLAYS]> {
+        self.otg.as_ref().ok()?.fetched_addresses(pipe)
+    }
     /// The back buffer as a CPU framebuffer (bus-physical BAR address).
     pub fn display_back_framebuffer(
         &self,
@@ -2437,7 +2804,8 @@ impl ColdBoot {
                 .move_cursor(pipe, position)
         }
     }
-    /// Run (`Some`) or stop (`None`) DRR on a live pipe's timing.
+    /// Run (`Some`) or stop (`None`) DRR on a live pipe's timing; `Busy`
+    /// for DRR while PMFW may switch UCLK (pin it first).
     /// # Safety
     /// As for `set_display_cursor`.
     pub unsafe fn set_display_drr(
@@ -2445,7 +2813,8 @@ impl ColdBoot {
         pipe: u8,
         drr: Option<crate::amdgpu_freesync::Drr>,
     ) -> Result<Option<otg::DrrApplied>, otg::Error> {
-        if self.state() != State::MemoryReady {
+        // DRR runs only pinned: the port has no UCLK P-state plan for it.
+        if self.state() != State::MemoryReady || (drr.is_some() && self.uclk_switching()) {
             return Err(otg::Error::Busy);
         }
         // SAFETY: serialized retained owner; caller excludes writers.
@@ -3639,6 +4008,22 @@ impl ColdBoot {
     }
 }
 
+impl bandwidth::UclkPin for ColdBoot {
+    fn clock_status(&self) -> Result<clocks::Status, otg::Error> {
+        self.display_clock_status().map_err(otg::Error::Clocks)
+    }
+    async fn raise_bandwidth(&mut self, bandwidth: clocks::Bandwidth) -> Result<(), otg::Error> {
+        self.update_live_display_bandwidth(bandwidth, false)
+            .await
+            .map(|_| ())
+    }
+    async fn disable_fams2(&mut self) {
+        self.disable_display_fams2().await
+    }
+}
+
+#[path = "amdgpu_navi48_bandwidth.rs"]
+pub(crate) mod bandwidth;
 #[path = "amdgpu_navi48_boot_media_clients.rs"]
 mod media_clients;
 #[path = "amdgpu_navi48_boot_media.rs"]
@@ -3648,22 +4033,23 @@ mod media_transport;
 mod mst;
 pub use mst::{
     select_mst, DscAux, MstDsc, MstFailure, MstLink, MstOutput, MstOutputId, MstPayload,
-    MstPayloadChange,
+    MstPayloadChange, MstService, PayloadAllocation, MST_OUTPUTS,
 };
 #[path = "amdgpu_navi48_modeset.rs"]
 mod modeset;
 #[path = "amdgpu_navi48_teardown.rs"]
 mod teardown;
 pub use modeset::{
-    broadcast_rgb, connector_max_bpc, display_pipes, edid_timings, frl_audio, frl_cap, frl_carries,
-    frl_dsc, frl_dsc_caps, frl_dsc_carries, frl_dsc_link, frl_enabled, frl_link, frl_video_params,
-    hdmi_avi, hdmi_caps, hdmi_stream, limited_range, max_bpc, mpc_pipes, odm_pipes, output_color,
-    overlay_pipes, plan_pipes, plane_format, plane_mode, plane_requests, plane_setup,
-    requested_bpc, selection_mode, set_broadcast_rgb, set_frl, set_max_bpc, set_output_color,
-    set_plane_format, set_plane_setup, set_requested_bpc, sink_audio_info, stream_planes,
-    with_planes, Configuration, DisplayPipes, FrlDscStream, FrlRate, HdmiCaps, HdmiStream, Health,
+    beside_pipes, broadcast_rgb, connector_max_bpc, dc_state, display_pipes, edid_timings,
+    frl_audio, frl_cap, frl_carries, frl_dsc, frl_dsc_caps, frl_dsc_carries, frl_dsc_link,
+    frl_enabled, frl_link, frl_video_params, hdmi_avi, hdmi_caps, hdmi_stream, head_pipes,
+    light_pipes, limited_range, live_pipes, max_bpc, output_color, plan_pipes, plane_format,
+    plane_mode, plane_requests, plane_setup, requested_bpc, selection_mode, set_broadcast_rgb,
+    set_crtc_color, set_frl, set_max_bpc, set_output_color, set_plane_format, set_plane_setup,
+    set_requested_bpc, sink_audio_info, stream_planes, with_planes, BesideRefusal, Configuration,
+    DisplayPipes, DrmPlaneState, FirstFrames, FrlDscStream, FrlRate, HdmiCaps, HdmiStream, Health,
     InheritedRetired, Modeset, ModesetError, MstRoute, MstStream, OverlayPlane, PlaneGeometry,
-    PlanePipes, PlaneSetup, PlanesChange, Selection, SstOutput, BROADCAST_RGB_AUTO,
+    PlanePipes, PlaneSetup, PlanesChange, Selection, SstOutput, StreamPipes, BROADCAST_RGB_AUTO,
     BROADCAST_RGB_FULL, BROADCAST_RGB_LIMITED, MAX_REQUESTED_BPC, MIN_REQUESTED_BPC,
 };
 pub use teardown::{TeardownStatus, TeardownStep};

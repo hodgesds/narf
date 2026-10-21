@@ -100,12 +100,14 @@ fn clocks() -> clocks::Applied {
             display_khz: 600_001,
             dpp_khz: 350_999,
             dtb_khz: 600_000,
+            deep_sleep_dcfclk_khz: 0,
         },
         display_khz: 601_000,
         dpp_khz: 351_000,
         dtb_khz: 600_000,
         dcf_floor_khz: 1_200_000,
         memory_floor_khz: 1_200_000,
+        uclk_pstate: false,
     }
 }
 fn request(pipe: u8) -> Request {
@@ -996,4 +998,80 @@ fn dcn401_dccg_live_dpp_dtos_follow_dcn401_update_clocks() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-dccg",
     dcn401_dccg_live_dpp_dtos_follow_dcn401_update_clocks
+);
+
+/// Harvested boards (pipe 0, pipe 1, pipes 1 and 2 fused): pipe `p`'s
+/// DPPCLK DTO and enable, pixel rate control, DP DTO, DTBCLK_P source,
+/// divider and gates are its DPP/OTG instance's (dccg401_update_dpp_dto(
+/// dpp->inst), dccg401_set_dp_dto(tg->inst)); the HPO stream clock source
+/// names that OTG instance; DSCCLK is the DSC of the pipe index
+/// (dcn20_acquire_dsc). Nothing of a fused instance is written.
+fn dcn401_dccg_programs_pool_instances_on_harvested_boards() -> TestResult {
+    use crate::amdgpu_rdna4::{self as rdna4, PipePool};
+    let mut result = TestResult::Pass;
+    for fuses in [0x1, 0x2, 0x6] {
+        rdna4::publish_pipe_pool(PipePool::from_fuses(fuses));
+        let pool = rdna4::pipe_pool();
+        for pipe in pool.pipes() {
+            let inst = pool.hw(pipe);
+            let i = u64::from(inst);
+            let mut e = engine();
+            for r in [0x68, 0x69, 0x6f, 0xa8, 0xb6, 0x80 + 4 * i] {
+                e.io.regs.insert(BASE + r * 4, 0x4000_0000);
+            }
+            e.io.regs.insert(0x10000 + 0x5a * 4, 0x4000_0000);
+            if run(e.prepare(request(pipe), clocks())).is_err() {
+                result = TestResult::Fail("prepare on a pool pipe");
+                break;
+            }
+            let want = [
+                (BASE + (0x99 + i) * 4, 0xff006c),
+                (BASE + 0xa8 * 4, 0x4000_0000 | 1 << (3 * inst)),
+                (BASE + 0x69 * 4, 0x4000_0000 | 1 << inst),
+                (
+                    0x10000 + 0x5a * 4,
+                    0x4000_0000 | 3 << (8 + 2 * inst) | 3 << (20 + 2 * inst),
+                ),
+                (BASE + 0x68 * 4, 0x4000_0000 | 4 << (3 * inst)),
+                (BASE + (0x81 + 4 * i) * 4, 148_500_000),
+                (BASE + (0x82 + 4 * i) * 4, 720_000_000),
+                (BASE + 0x6f * 4, 0x4000_0000),
+                (BASE + (0x80 + 4 * i) * 4, 0x4000_1010),
+            ];
+            if e.io.writes != want || e.status.pipes[usize::from(pipe)].is_none() {
+                result = TestResult::Fail("DPP/OTG instance clocks");
+                break;
+            }
+            // The HPO stream clock from this pipe names its OTG instance.
+            e.io.writes.clear();
+            if e.route_hpo_stream(1, pipe, 3, clocks()).is_err()
+                || e.io.writes.first() != Some(&(BASE + 0x4a * 4, (8 | u32::from(inst)) << 4))
+            {
+                result = TestResult::Fail("DPSTREAMCLK source");
+                break;
+            }
+            // DSCCLK: the pipe index's DSC, whatever its instance.
+            let param = [0x6c, 0x6d, 0x6e, 0x45][usize::from(pipe)];
+            if e.start_dscclk(pipe, clocks()) != Ok(true)
+                || e.io.regs[&(BASE + param * 4)] & 0xff_00ff != 0x1_0001
+                || e.io.regs[&(BASE + 0xa7 * 4)] & 0xf != 1 << pipe
+            {
+                result = TestResult::Fail("DSCCLK of the pipe index");
+                break;
+            }
+        }
+        // A pipe index past the pool has no blocks.
+        if run(engine().prepare(request(pool.count()), clocks())) != Err(Error::Invalid) {
+            result = TestResult::Fail("pipe past the pool");
+        }
+        if result != TestResult::Pass {
+            break;
+        }
+    }
+    rdna4::publish_pipe_pool(PipePool::FULL);
+    result
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dccg",
+    dcn401_dccg_programs_pool_instances_on_harvested_boards
 );

@@ -33,12 +33,18 @@ pub(super) struct Fake {
     encoder_written: u8,
     encoder_delay: [u8; 8],
     encoder_stall: u8,
+    /// Accesses are the owner's own (not renamed): refuse a fused
+    /// instance's (harvest::guard_raw).
+    pub(super) guarded: bool,
 }
 impl Io for Fake {
     fn wait_poll_limit(&self) -> Option<u32> {
         self.poll_limit
     }
     fn read(&mut self, at: u64) -> u32 {
+        if self.guarded {
+            harvest::guard_raw(at, None);
+        }
         if self.gone == Some(self.writes.len()) {
             return u32::MAX;
         }
@@ -164,6 +170,9 @@ impl Io for Fake {
         *self.regs.get(&at).unwrap_or(&0)
     }
     fn write(&mut self, at: u64, value: u32) {
+        if self.guarded {
+            harvest::guard_raw(at, Some(value));
+        }
         assert!(
             (BASE + 0x475 * 4..=BASE + 0x47a * 4).contains(&at)
                 || (BASE + 0x530 * 4..=BASE + 0x1d1f * 4).contains(&at)
@@ -387,9 +396,10 @@ pub(super) fn engine() -> Engine<Fake> {
             encoder_written: 0,
             encoder_delay: [0; 8],
             encoder_stall: 0,
+            guarded: true,
         },
         authority: Cap::bootstrap(),
-        layout: Layout::resolve(&gpu).unwrap(),
+        layout: harvest::note_layout(Layout::resolve(&gpu).unwrap()),
         status: Box::new(Status::new()),
         displays: Displays::new(),
     }
@@ -446,12 +456,14 @@ pub(super) fn clock(request: Request) -> dccg::Applied {
                 display_khz: 600_000,
                 dpp_khz: 300_000,
                 dtb_khz: 600_000,
+                deep_sleep_dcfclk_khz: 0,
             },
             display_khz: 600_000,
             dpp_khz: 300_000,
             dtb_khz: 600_000,
             dcf_floor_khz: 1_200_000,
             memory_floor_khz: 1_200_000,
+            uclk_pstate: false,
         },
         dpp_phase: 127,
         reference_hz: 720_000_000,
@@ -482,7 +494,9 @@ fn reg(e: &Engine<Fake>, index: u64) -> u32 {
 }
 
 fn dcn401_otg_native_timing_all_pipes_and_signal_muxes() -> TestResult {
-    for pipe in 0..4 {
+    // Every pipe of the pool, at its OTG/ODM/VTG instance.
+    let pool = crate::amdgpu_rdna4::pipe_pool();
+    for pipe in pool.pipes() {
         for (signal, control) in [
             (Signal::DisplayPort, 0x1000),
             (Signal::HpoDisplayPort, 0x201000),
@@ -493,7 +507,7 @@ fn dcn401_otg_native_timing_all_pipes_and_signal_muxes() -> TestResult {
             let mut req = request(pipe);
             req.signal = signal;
             let c = clock(req);
-            let p = u64::from(pipe);
+            let p = u64::from(pool.hw(pipe));
             let o = |r| BASE + (r + 0x80 * p) * 4;
             let d = |r| BASE + (r + 0x10 * p) * 4;
             // Preserve independent PSTATE bits and clear inherited DSC/DRR.
@@ -507,7 +521,7 @@ fn dcn401_otg_native_timing_all_pipes_and_signal_muxes() -> TestResult {
                     (d(0x1ad0), 3),
                     (o(0x1b84), 3),
                     (BASE + (0x530 + p) * 4, 0),
-                    (d(0x1acb), 0xfff00000 | u32::from(pipe) << 16),
+                    (d(0x1acb), 0xfff00000 | (p as u32) << 16),
                     (o(0x1b2e), 0),
                     (d(0x1ad1), 0),
                     (o(0x1b33), 0),
@@ -1144,6 +1158,9 @@ kernel_test_in!(
     dcn401_opp_partial_failures_and_cancellation_block_clock_reuse
 );
 
+#[path = "amdgpu_dcn401_harvest_tests.rs"]
+pub(crate) mod harvest;
+
 #[path = "amdgpu_dcn401_blank_tests.rs"]
 mod blank;
 
@@ -1590,8 +1607,13 @@ kernel_test_in!(
 /// past two memories are refused. A 4:2:0 right half's OPP takes one extra
 /// left-edge pixel for its chroma filter.
 fn dcn401_odm_combines_two_opps_with_split_dsc() -> TestResult {
+    odm_split_dsc_on(0, 3)
+}
+/// The test above on pipes (pipe, odm): the OPTC segments and line
+/// memories name both pipes' OPP instances, each segment's DSC is its
+/// pipe's (dcn20_acquire_dsc) fed from that pipe's OPP instance.
+fn odm_split_dsc_on(pipe: u8, odm: u8) -> TestResult {
     use crate::amdgpu_dsc::DscConfig;
-    let (pipe, odm) = (0u8, 3u8);
     let mut req = Request {
         signal: Signal::DisplayPort,
         odm: SplitPipes::one(odm),
@@ -1629,7 +1651,7 @@ fn dcn401_odm_combines_two_opps_with_split_dsc() -> TestResult {
     };
     odm_clock.global.display_khz = 1_000_000;
     let mut e = engine();
-    for k in [0u64, 3] {
+    for k in [u64::from(pipe), u64::from(odm)] {
         e.io.regs.insert(BASE + (0x89 + 2 * k) * 4, 1); // DSC domains gated
     }
     let mut bypass = odm_clock;
@@ -1650,21 +1672,22 @@ fn dcn401_odm_combines_two_opps_with_split_dsc() -> TestResult {
     }
     let l = e.layout;
     let r = |e: &Engine<Fake>, at: u64| e.io.regs.get(&at).copied().unwrap_or(0);
-    if r(&e, l.odm(pipe, SOURCE)) != 0xff30_0001
+    if r(&e, l.odm(pipe, SOURCE))
+        != 0xff00_0001 | l.inst_field(pipe) << 16 | l.inst_field(odm) << 20
         || r(&e, l.odm(pipe, WIDTH)) & 0x1fff != 3840
-        || r(&e, l.odm(pipe, MEMORY)) & 0xffff != 0xc3
+        || r(&e, l.odm(pipe, MEMORY)) & 0xffff != 3 << (2 * l.inst(pipe)) | 3 << (2 * l.inst(odm))
         || r(&e, l.otg(pipe, H_TIMING)) & 0x103 != 1
     {
         return TestResult::Fail("ODM source, segment width, memories and divide");
     }
     // Each half's DSC: 3840 wide, four slices of 960, from its own OPP.
     let dsc = |e: &Engine<Fake>, k: u64, reg: u64| r(e, BASE + (0x3000 + k * 0x5c + reg) * 4);
-    for k in [0u64, 3] {
+    for k in [u64::from(pipe), u64::from(odm)] {
         if dsc(&e, k, 0x14) & 0xffff != 3840
             || dsc(&e, k, 0x15) & 0xffff != 960
             || dsc(&e, k, 0xa) >> 4 & 3 != 3
             || dsc(&e, k, 0) & 1 != 1
-            || r(&e, BASE + (0x1a64 + k) * 4) & 0x71 != (1 | (k as u32) << 4)
+            || r(&e, BASE + (0x1a64 + k) * 4) & 0x71 != (1 | l.inst_field(k as u8) << 4)
         {
             return TestResult::Fail("segment DSC");
         }
@@ -1678,7 +1701,7 @@ fn dcn401_odm_combines_two_opps_with_split_dsc() -> TestResult {
     e.io.writes.clear();
     let a = run(e.prepare_blank(blank_request(pipe), odm_clock)).unwrap();
     for (o, x) in [(pipe, 0u32), (odm, 3840)] {
-        let at = |reg: u64| BASE + (reg + 0x5a * u64::from(o)) * 4;
+        let at = |reg: u64| BASE + (reg + 0x5a * u64::from(l.inst(o))) * 4;
         if r(&e, at(0x188c)) & 1 != 1
             || r(&e, at(0x1856)) != (3840 << 16 | 4320)
             || r(&e, at(0x185a)) != x
@@ -1691,7 +1714,7 @@ fn dcn401_odm_combines_two_opps_with_split_dsc() -> TestResult {
     // Retirement turns both segment DSCs off.
     e.io.retiring = [true; 4];
     run(e.retire(pipe)).unwrap();
-    for k in [0u64, 3] {
+    for k in [u64::from(pipe), u64::from(odm)] {
         if r(&e, BASE + (0x1a64 + k) * 4) & 1 != 0 || dsc(&e, k, 0) & 1 != 0 {
             return TestResult::Fail("segment DSC retirement");
         }
@@ -1703,7 +1726,9 @@ fn dcn401_odm_combines_two_opps_with_split_dsc() -> TestResult {
     narrow.timing.h_total = 4000;
     let mut e = engine();
     run(e.prepare(narrow, clock(narrow))).unwrap();
-    if r(&e, e.layout.odm(pipe, MEMORY)) & 0xffff != 0x41 {
+    if r(&e, e.layout.odm(pipe, MEMORY)) & 0xffff
+        != 1 << (2 * l.inst(pipe)) | 1 << (2 * l.inst(odm))
+    {
         return TestResult::Fail("two memories");
     }
     // 4:2:0 wider than one formatter: the right OPP filters across the seam.
@@ -1719,7 +1744,8 @@ fn dcn401_odm_combines_two_opps_with_split_dsc() -> TestResult {
         ..blank_request(pipe)
     };
     run(e.prepare_blank(blank420, clock(wide420))).unwrap();
-    let edge = |e: &Engine<Fake>, o: u8| r(e, BASE + (0x1849 + 0x5a * u64::from(o)) * 4) & 1;
+    let edge =
+        |e: &Engine<Fake>, o: u8| r(e, BASE + (0x1849 + 0x5a * u64::from(l.inst(o))) * 4) & 1;
     if edge(&e, pipe) != 0 || edge(&e, odm) != 1 {
         return TestResult::Fail("4:2:0 left edge pixel");
     }

@@ -999,6 +999,110 @@ kernel_test_in!(
     suspend_eviction_moves_vram_only_buffers_and_restores_domains
 );
 
+/// amdgpu_dm_plane_helper_prepare_fb's amdgpu_bo_pin on a dGPU: a scanout
+/// buffer is pinned in VRAM (a system one is refused with ENOMEM until the
+/// async `prepare_scanout` has moved it back), the pin's
+/// GPU address is its VRAM reservation's, and while any pin lives the
+/// buffer moves for nothing: no demotion, no pressure eviction, and
+/// suspend's evict_all passes it by (ttm_resource_manager_evict_all only
+/// walks the LRU). The last unpin lets every one of them move it again.
+fn scanout_pin_holds_vram_placement_until_unpinned() -> TestResult {
+    const CARD: u32 = 0xfee6;
+    let mut memory = alloc::vec![0u8; 8 * 4096];
+    let map = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(0xb200_0000),
+        virt: memory.as_mut_ptr() as u64,
+        len: memory.len() as u64,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    // SAFETY: this test exclusively owns memory until the heap and every
+    // object are dropped; no hardware accesses these mappings.
+    let pool = unsafe { crate::amdgpu_vram::Pool::from_owned_range(map, 0x8_0000_0000) }.unwrap();
+    register_vram_heap(
+        CARD,
+        VramHeap {
+            pool: pool.clone(),
+            fb_base: 0x8_0000_0000,
+            fb_offset: 0x9_0000_0000,
+            unmapped: None,
+        },
+    );
+    let state = GemState::for_card(CARD);
+    let vram = u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM);
+    let gtt = u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT);
+    let dcc = {
+        let mut b = [0u8; 32];
+        b[0..8].copy_from_slice(&8192u64.to_le_bytes());
+        b[16..24].copy_from_slice(&vram.to_le_bytes());
+        b[24..32].copy_from_slice(&u64::from(uapi::AMDGPU_GEM_CREATE_GFX12_DCC).to_le_bytes());
+        dispatch(
+            amd(uapi::DRM_AMDGPU_GEM_CREATE),
+            b.as_mut_ptr() as usize,
+            &state,
+        )
+        .unwrap();
+        state
+            .get(u32::from_le_bytes(b[0..4].try_into().unwrap()))
+            .unwrap()
+    };
+    assert!(!dcc.system() && !dcc.pinned());
+    let pin = dcc.pin_scanout().unwrap();
+    // amdgpu_bo_gpu_offset: the VRAM reservation's aperture address.
+    let address = pin.address();
+    assert!((0x8_0000_0000..0x8_0000_8000).contains(&address));
+    assert_eq!(pin.byte_len(), 8192);
+    assert!(dcc.pinned());
+    // Pinned twice (the old and the new commit's plane state), unpinned
+    // only by the last.
+    let again = dcc.pin_scanout().unwrap();
+    assert_eq!(again.address(), address);
+    assert_eq!(dcc.relocate(false), Err(FsError::Busy));
+    let (touched, result) = narf_scheduler::block_on_spin(async {
+        let gate = lock_placement(CARD).await;
+        evict_all(&gate).await
+    });
+    assert_eq!(result, Ok(()));
+    assert!(touched.is_empty() && !dcc.system());
+    restore_domains(touched);
+    let moved = narf_scheduler::block_on_spin(async {
+        let gate = lock_placement(CARD).await;
+        crate::amdgpu_vm::relocate(&gate, &dcc, false).await
+    });
+    assert_eq!(moved, Err(FsError::Busy));
+    drop(again);
+    assert!(dcc.pinned() && dcc.gpu_at(0).is_some());
+    drop(pin);
+    assert!(!dcc.pinned());
+    // A buffer in system memory is not moved by the pin (no copy under the
+    // KMS lock): ENOMEM until prepare_scanout moved it back to VRAM.
+    let both = state.get(create(&state, 4096, vram | gtt)).unwrap();
+    assert_eq!(both.relocate(false), Ok(()));
+    assert!(both.system());
+    assert_eq!(both.pin_scanout().err(), Some(FsError::OutOfMemory));
+    assert!(both.system() && !both.pinned());
+    narf_scheduler::block_on_spin(prepare_scanout(CARD, alloc::vec![both.clone()]));
+    let pin = both.pin_scanout().unwrap();
+    assert!(!both.system() && pin.address() >= 0x8_0000_0000);
+    drop(pin);
+    // One VRAM is not allowed for is refused.
+    let system_only = state.get(create(&state, 4096, gtt)).unwrap();
+    assert_eq!(system_only.pin_scanout().err(), Some(FsError::InvalidData));
+    // Unpinned, evict_all moves them all again.
+    let (touched, result) = narf_scheduler::block_on_spin(async {
+        let gate = lock_placement(CARD).await;
+        evict_all(&gate).await
+    });
+    assert_eq!(result, Ok(()));
+    assert!(dcc.system() && both.system());
+    restore_domains(touched);
+    unregister_vram_heap(CARD);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/render-abi",
+    scanout_pin_holds_vram_placement_until_unpinned
+);
+
 /// amdgpu_gem_userptr_ioctl argument checks, which run before any page is
 /// touched: alignment and flags EINVAL, a writable range without REGISTER
 /// EACCES; a kernel task (no user address space) faults.
@@ -1075,6 +1179,7 @@ fn userptr_backing_follows_pins_and_refuses_mmap_export_and_moves() -> TestResul
         metadata: IrqSafeSpinLock::new(Metadata::default()),
         card: Some(0xfee5),
         dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
+        pin_count: AtomicU32::new(0),
     });
     assert!(object.is_userptr());
     assert_eq!(object.frames(0, 2 * 4096).unwrap(), [a, b]);
@@ -1159,4 +1264,195 @@ fn prime_import_attaches_foreign_gtt_and_refuses_foreign_vram() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/render-abi",
     prime_import_attaches_foreign_gtt_and_refuses_foreign_vram
+);
+
+/// `dumb_layout`, `DUMB_DOMAIN` and `DUMB_CREATE_FLAGS` give Linux's
+/// CREATE_DUMB answer for every line of tests/amdgpu_dumb/vectors.txt
+/// (drm_mode_create_dumb and amdgpu_mode_dumb_create compiled verbatim on a
+/// dGPU; see check.sh there).
+fn amdgpu_dumb_layout_matches_linux_vectors() -> TestResult {
+    use core::fmt::Write as _;
+    const VECTORS: &str = include_str!("../tests/amdgpu_dumb/vectors.txt");
+    let mut lines = 0;
+    let mut got = alloc::string::String::new();
+    for line in VECTORS.lines().filter(|l| !l.starts_with('#')) {
+        let Some((input, want)) = line.split_once(" = ") else {
+            return TestResult::Fail("malformed vector");
+        };
+        let mut f = input
+            .split_whitespace()
+            .skip(1)
+            .map(|v| v.parse::<u32>().unwrap_or(0));
+        let (w, h, bpp) = (
+            f.next().unwrap_or(0),
+            f.next().unwrap_or(0),
+            f.next().unwrap_or(0),
+        );
+        got.clear();
+        match dumb_layout(w, h, bpp) {
+            Ok((pitch, size)) => {
+                let _ = write!(
+                    got,
+                    "0 {pitch} {size} {DUMB_DOMAIN:x} {DUMB_CREATE_FLAGS:x}"
+                );
+            }
+            Err(FsError::InvalidData) => got.push_str("-22"),
+            Err(_) => got.push('?'),
+        }
+        if got != want {
+            return TestResult::Fail("dumb layout differs from Linux");
+        }
+        lines += 1;
+    }
+    if lines < 1000 {
+        return TestResult::Fail("vectors missing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/render-abi",
+    amdgpu_dumb_layout_matches_linux_vectors
+);
+
+/// amdgpu_mode_dumb_create on a dGPU card: the buffer is in the open's own
+/// table, in BAR-visible VRAM (one zeroed reservation), with Linux's pitch,
+/// size, domain and flags (GEM_OP reports the create flags less the
+/// CPU_ACCESS_REQUIRED hint, plus VRAM_WIPE_ON_RELEASE, and alignment 0);
+/// MAP_DUMB is the GEM_MMAP offset, refused for NO_CPU_ACCESS; visible
+/// VRAM pressure evicts an idle unmapped buffer, never a pinned or mapped
+/// one, and there is no GTT fallback (ENOMEM); DESTROY_DUMB drops the
+/// handle while a pin keeps the buffer.
+fn amdgpu_dumb_buffers_live_in_visible_vram() -> TestResult {
+    const CARD: u32 = 0xd0b0;
+    struct Registered;
+    impl Drop for Registered {
+        fn drop(&mut self) {
+            unregister_vram_heap(CARD);
+        }
+    }
+    let mut memory = alloc::vec![0xa5u8; 8 * 4096];
+    let map = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(0xb800_0000),
+        virt: memory.as_mut_ptr() as u64,
+        len: memory.len() as u64,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    // SAFETY: this test exclusively owns memory until the registered heap and
+    // every object have been dropped; no hardware accesses these mappings.
+    let pool = unsafe { crate::amdgpu_vram::Pool::from_owned_range(map, 0x8_0000_0000) }.unwrap();
+    // No heap: no VRAM dumb buffer (the card's own table answers then).
+    let state = GemState::for_card(CARD);
+    if state.create_dumb(64, 1, 32) != Err(FsError::NoDevice) {
+        return TestResult::Fail("dumb buffer without a VRAM heap");
+    }
+    register_vram_heap(
+        CARD,
+        VramHeap {
+            pool: pool.clone(),
+            fb_base: 0x8_0000_0000,
+            fb_offset: 0x9_0000_0000,
+            unmapped: None,
+        },
+    );
+    let _registered = Registered;
+    let full = pool.available();
+    let gtt = gtt_used();
+    if state.create_dumb(0, 1, 32) != Err(FsError::InvalidData) {
+        return TestResult::Fail("zero-width dumb buffer");
+    }
+    // 100 XRGB8888 pixels pad to 128 (512 bytes); ten lines round to 2 pages.
+    let Ok((a, pitch, size)) = state.create_dumb(100, 10, 32) else {
+        return TestResult::Fail("CREATE_DUMB in VRAM");
+    };
+    let object = state.get(a).unwrap();
+    if pitch != 512
+        || size != 8192
+        || object.system()
+        || object.domain() != uapi::AMDGPU_GEM_DOMAIN_VRAM
+        || !(0x9_0000_0000..0x9_0000_8000).contains(&object.gpu())
+        || !(0xb800_0000..0xb800_8000).contains(&object.phys())
+        || pool.available() != full - 8192
+        || gtt_used() != gtt
+        || object.load_u64(4096) != Some(0)
+    {
+        return TestResult::Fail("dumb buffer placement");
+    }
+    let mut info = [0u64; 4];
+    let mut req = [0u8; 24];
+    req[0..4].copy_from_slice(&a.to_le_bytes());
+    req[4..8].copy_from_slice(&uapi::AMDGPU_GEM_OP_GET_GEM_CREATE_INFO.to_le_bytes());
+    req[8..16].copy_from_slice(&(info.as_mut_ptr() as u64).to_le_bytes());
+    let want = u64::from(
+        uapi::AMDGPU_GEM_CREATE_CPU_GTT_USWC
+            | uapi::AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS
+            | uapi::AMDGPU_GEM_CREATE_VRAM_CLEARED
+            | uapi::AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE,
+    );
+    if op(&state, req.as_mut_ptr() as usize).is_err() || info != [8192, 0, DUMB_DOMAIN, want] {
+        return TestResult::Fail("GEM_OP of a dumb buffer");
+    }
+    // MAP_DUMB: the GEM_MMAP offset, whose frames are the BAR window.
+    if state.map_dumb(a) != Some(Ok(u64::from(a) << 12))
+        || state.map_dumb(a + 1000).is_some()
+        || state.mmap_frames(u64::from(a) << 12, 8192).ok()
+            != Some(alloc::vec![object.phys(), object.phys() + 4096])
+    {
+        return TestResult::Fail("MAP_DUMB of a dumb buffer");
+    }
+    // A NO_CPU_ACCESS buffer has no CPU mapping (amdgpu_mode_dumb_mmap).
+    let mut hidden = [0u64; 4];
+    hidden[0] = 4096;
+    hidden[2] = u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT);
+    hidden[3] = u64::from(uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS);
+    if super::create(&state, hidden.as_mut_ptr() as usize).is_err()
+        || state.map_dumb(hidden[0] as u32) != Some(Err(FsError::OperationNotPermitted))
+    {
+        return TestResult::Fail("MAP_DUMB of a NO_CPU_ACCESS buffer");
+    }
+    state.remove(hidden[0] as u32);
+    // Scanned out: pinned. Fill the rest with an idle unmapped GEM buffer;
+    // the next dumb buffer evicts it (TTM's eviction) rather than falling
+    // back to GTT itself.
+    let pin = object.pin_scanout().unwrap();
+    let other = create(&state, 6 * 4096, u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM));
+    if state.get(other).unwrap().system() || pool.available() != 0 {
+        return TestResult::Fail("filler not in VRAM");
+    }
+    let Ok((b, _, _)) = state.create_dumb(256, 16, 32) else {
+        return TestResult::Fail("eviction for a dumb buffer");
+    };
+    if !state.get(other).unwrap().system() || state.get(b).unwrap().system() || object.system() {
+        return TestResult::Fail("dumb buffer did not evict the idle buffer");
+    }
+    // The pinned and the mapped buffer stay: no room, and no fallback.
+    let mapping = state.mapping_object(u64::from(b) << 12, 4096).unwrap();
+    let before = gtt_used();
+    if state.create_dumb(512, 16, 32) != Err(FsError::NoSpace)
+        || gtt_used() != before
+        || object.system()
+        || state.get(b).unwrap().system()
+    {
+        return TestResult::Fail("dumb buffer fell back to GTT or moved a pinned buffer");
+    }
+    // DESTROY_DUMB drops the handle; the pin keeps the buffer.
+    if !state.destroy_dumb(a) || state.destroy_dumb(a) || state.owns(a) {
+        return TestResult::Fail("DESTROY_DUMB");
+    }
+    drop(object);
+    let held = pool.available();
+    drop(pin);
+    if pool.available() != held + 8192 {
+        return TestResult::Fail("the last pin did not free the dumb buffer");
+    }
+    drop(mapping);
+    state.remove(b);
+    state.remove(other);
+    if pool.available() != full {
+        return TestResult::Fail("VRAM not returned");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/render-abi",
+    amdgpu_dumb_buffers_live_in_visible_vram
 );

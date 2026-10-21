@@ -789,6 +789,21 @@ fn smoke_drm_ioctl_vrr_properties() -> TestResult {
     {
         return TestResult::Fail("invalid VRR set accepted");
     }
+    // drm_mode_object_find: DRM_MODE_OBJECT_ANY finds by id alone; a type
+    // the object is not, or no such type, is ENOENT; an object without
+    // properties (the encoder) is EINVAL.
+    const ENCODER: u32 = 0xe0e0_e0e0;
+    if obj_set(idx, 0, 0x63, 12, 0) != Ok(0)
+        || read(idx, 12, CRTC).and_then(|l| l.last().copied()) != Some((0x63, 0))
+        || obj_set(idx, 1, 0x63, 99, 0) != Err(FsError::NotFound)
+        || obj_set(idx, 1, 0x63, 12, ENCODER) != Err(FsError::NotFound)
+        || obj_set(idx, 1, 0x63, 12, 0x1234) != Err(FsError::NotFound)
+        || obj_set(idx, 1, 0x63, 21, 0) != Err(FsError::InvalidData)
+        || obj_set(idx, 1, 0x63, 21, ENCODER) != Err(FsError::InvalidData)
+        || obj_set(idx, 1, 0x63, 12, 0) != Ok(0)
+    {
+        return TestResult::Fail("OBJ_SETPROPERTY object lookup");
+    }
     // Legacy connector SETPROPERTY never reaches a CRTC property.
     let mut b = [0u8; 16];
     b[0..8].copy_from_slice(&0u64.to_le_bytes());
@@ -944,6 +959,19 @@ fn color_obj_set(idx: u32, value: u64, prop: u32, obj: u32, kind: u32) -> Result
     dispatch_card(
         idx,
         iowr(DRM_IOCTL_BASE, 0xBA, 24),
+        b.as_mut_ptr() as usize,
+        false,
+    )
+}
+/// The legacy connector-only DRM_IOCTL_MODE_SETPROPERTY.
+fn legacy_set(idx: u32, value: u64, prop: u32, connector: u32) -> Result<u64, FsError> {
+    let mut b = [0u8; 16];
+    b[0..8].copy_from_slice(&value.to_le_bytes());
+    b[8..12].copy_from_slice(&prop.to_le_bytes());
+    b[12..16].copy_from_slice(&connector.to_le_bytes());
+    dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xAB, 16),
         b.as_mut_ptr() as usize,
         false,
     )
@@ -1318,8 +1346,9 @@ kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_legacy_gamma);
 
 /// Connector Colorspace and HDR_OUTPUT_METADATA: listed with the
 /// connector, values validated, a Colorspace change or entering/leaving
-/// HDR on a driven connector needs ALLOW_MODESET (EINVAL through the legacy
-/// setters), a metadata change while in HDR does not, and only blobs of
+/// HDR on a driven connector needs ALLOW_MODESET in an atomic request
+/// while OBJ_SETPROPERTY commits it (set_property_atomic allows modesets),
+/// a metadata change while in HDR is no modeset, and only blobs of
 /// sizeof(struct hdr_output_metadata) are taken.
 fn smoke_drm_ioctl_connector_hdr_properties() -> TestResult {
     let Some(idx) = color_card() else {
@@ -1352,11 +1381,16 @@ fn smoke_drm_ioctl_connector_hdr_properties() -> TestResult {
     // Colorspace: enum values only; a modeset on the driven connector.
     if atomic(ALLOW_MODESET, &[0x67], &[1]) != Err(FsError::InvalidData)
         || atomic(0, &[0x67], &[9]) != Err(FsError::InvalidData)
-        || color_obj_set(idx, 9, 0x67, 31, COLOR_CONNECTOR) != Err(FsError::InvalidData)
+        || color_obj_set(idx, 1, 0x67, 31, COLOR_CONNECTOR) != Err(FsError::InvalidData)
         || atomic(ALLOW_MODESET, &[0x67], &[9]) != Ok(0)
         || color_prop(idx, 31, COLOR_CONNECTOR, 0x67) != Some(9)
         // Unchanged is no modeset.
         || atomic(0, &[0x67], &[9]) != Ok(0)
+        // OBJ_SETPROPERTY and SETPROPERTY make the modeset.
+        || color_obj_set(idx, 0, 0x67, 31, COLOR_CONNECTOR) != Ok(0)
+        || color_prop(idx, 31, COLOR_CONNECTOR, 0x67) != Some(0)
+        || legacy_set(idx, 9, 0x67, 31) != Ok(0)
+        || color_prop(idx, 31, COLOR_CONNECTOR, 0x67) != Some(9)
     {
         return TestResult::Fail("Colorspace");
     }
@@ -1373,9 +1407,15 @@ fn smoke_drm_ioctl_connector_hdr_properties() -> TestResult {
     let other_type = color_blob(idx, &hdr);
     let short = color_blob(idx, &hdr[..30]);
     if atomic(ALLOW_MODESET, &[0x68], &[u64::from(short)]) != Err(FsError::InvalidData)
+        || color_obj_set(idx, u64::from(short), 0x68, 31, COLOR_CONNECTOR)
+            != Err(FsError::InvalidData)
         || atomic(0, &[0x68], &[u64::from(pq)]) != Err(FsError::InvalidData)
-        || color_obj_set(idx, u64::from(pq), 0x68, 31, COLOR_CONNECTOR) != Err(FsError::InvalidData)
         || atomic(ALLOW_MODESET, &[0x68], &[u64::from(pq)]) != Ok(0)
+        || color_prop(idx, 31, COLOR_CONNECTOR, 0x68) != Some(u64::from(pq))
+        // Leaving and re-entering HDR through OBJ_SETPROPERTY: modesets.
+        || color_obj_set(idx, 0, 0x68, 31, COLOR_CONNECTOR) != Ok(0)
+        || color_prop(idx, 31, COLOR_CONNECTOR, 0x68) != Some(0)
+        || color_obj_set(idx, u64::from(pq), 0x68, 31, COLOR_CONNECTOR) != Ok(0)
         || color_prop(idx, 31, COLOR_CONNECTOR, 0x68) != Some(u64::from(pq))
     {
         return TestResult::Fail("entering HDR");
@@ -1558,6 +1598,53 @@ fn smoke_drm_ioctl_connector_max_bpc() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_connector_max_bpc);
+
+/// OBJ_SETPROPERTY on an atomic card is set_property_atomic for every
+/// property an object carries, modesets allowed: CRTC ACTIVE turns a CRTC
+/// on and off, a connector's CRTC_ID routes it, and an OUT_FENCE_PTR gets
+/// -1 (drm_atomic_crtc_set_property) with no fence; an object of another
+/// type is ENOENT. A legacy card has none of these settable (EINVAL).
+fn smoke_drm_ioctl_obj_setproperty_modesets() -> TestResult {
+    let idx = register_test_virtio_card();
+    let Some(ms) = crate::drm_registry::mode_state(idx) else {
+        return TestResult::Fail("no mode state");
+    };
+    if color_obj_set(idx, 1, 0x52, 11, COLOR_CRTC) != Ok(0) || !ms.lock().crtcs[0].enabled {
+        return TestResult::Fail("ACTIVE on");
+    }
+    if color_obj_set(idx, 0, 0x52, 11, COLOR_CRTC) != Ok(0) || ms.lock().crtcs[0].enabled {
+        return TestResult::Fail("ACTIVE off");
+    }
+    if color_obj_set(idx, 2, 0x52, 11, COLOR_CRTC) != Err(FsError::InvalidData)
+        || color_obj_set(idx, 1, 0x52, 31, COLOR_CRTC) != Err(FsError::NotFound)
+        || color_obj_set(idx, 1, 0x52, 11, COLOR_CONNECTOR) != Err(FsError::NotFound)
+    {
+        return TestResult::Fail("ACTIVE refusals");
+    }
+    let mut fence = 0i32;
+    if color_obj_set(idx, &mut fence as *mut i32 as u64, 0x60, 11, COLOR_CRTC) != Ok(0)
+        || fence != -1
+    {
+        return TestResult::Fail("OUT_FENCE_PTR");
+    }
+    if color_obj_set(idx, 12, 0x54, 31, COLOR_CONNECTOR) != Ok(0)
+        || legacy_set(idx, 0, 0x54, 31) != Ok(0)
+    {
+        return TestResult::Fail("connector CRTC_ID");
+    }
+    // set_property_legacy on a bochs card: no ACTIVE, CRTC_ID or plane.
+    let legacy = register_test_card();
+    if color_obj_set(legacy, 1, 0x52, 11, COLOR_CRTC) != Err(FsError::InvalidData)
+        || color_obj_set(legacy, 12, 0x54, 31, COLOR_CONNECTOR) != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("legacy card");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_ioctl_obj_setproperty_modesets
+);
 
 // ── 6. Render-node fd rejects SETCRTC with PermissionDenied ────────────
 
@@ -3714,6 +3801,490 @@ fn smoke_drm_navi48_plane_formats_end_to_end() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_navi48_plane_formats_end_to_end
+);
+
+// ── Navi48 GEM framebuffers scanned out in place ────────────────────────
+
+/// amdgpu_display_user_framebuffer_create, prepare_fb and cleanup_fb on the
+/// native amdgpu card: ADDFB2 takes one of the open's own amdgpu GEM
+/// handles (with its GFX12 DCC modifier, checked against the buffer's own
+/// size and AMDGPU_GEM_CREATE_GFX12_DCC) and the framebuffer holds the
+/// buffer; showing it pins the buffer in VRAM and hands the plane its GPU
+/// address (no CPU copy source: the plane fetches it in place); a pinned
+/// buffer is never evicted, outlives RMFB and GEM_CLOSE, and is unpinned
+/// (and freed) only once the HUBPs report the flip that replaced it
+/// latched; drm_fb_release removes an open's GEM framebuffers on close.
+fn smoke_drm_navi48_gem_framebuffers_scan_out_in_place() -> TestResult {
+    use crate::amdgpu_dm_modifiers::{DccBlock, Swizzle, Tiling};
+    use crate::amdgpu_gem::{GemState, VramHeap};
+    use crate::amdgpu_uapi as u;
+    const OWNER: u64 = 0x5ca9;
+    let idx = register_test_card();
+    let Some(ms) = crate::drm_registry::mode_state(idx) else {
+        return TestResult::Fail("no mode state");
+    };
+    {
+        let mut card = ms.lock();
+        card.plane_formats = Some(&crate::amdgpu_navi48_kms::PLANE_FORMATS);
+        card.gfx12_modifiers = true;
+    }
+    let mut memory = vec![0u8; 1 << 20];
+    let map = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(0xb400_0000),
+        virt: memory.as_mut_ptr() as u64,
+        len: memory.len() as u64,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    // SAFETY: the test owns `memory` until the heap and every buffer are
+    // dropped; no hardware reaches it.
+    let pool = unsafe { crate::amdgpu_vram::Pool::from_owned_range(map, 0x8_2000_0000) }.unwrap();
+    crate::amdgpu_gem::register_vram_heap(
+        idx,
+        VramHeap {
+            pool: pool.clone(),
+            fb_base: 0x8_0000_0000,
+            fb_offset: 0x9_0000_0000,
+            unmapped: None,
+        },
+    );
+    let gem = GemState::for_card(idx);
+    let full = pool.available();
+    // A 256x128 XRGB8888 framebuffer in 64K_2D blocks with DCC.
+    let tiling = Tiling {
+        swizzle: Swizzle::S64K2D,
+        dcc: Some(DccBlock::B64),
+    };
+    let (bw, bh) = tiling.swizzle.block(4);
+    let pitch = 256u32.div_ceil(bw) * bw * 4;
+    let size = u64::from(pitch / (bw * 4))
+        * (1 << tiling.swizzle.block_log2())
+        * u64::from(128u32.div_ceil(bh));
+    let create = |gem: &GemState| {
+        let mut b = [0u8; 32];
+        b[0..8].copy_from_slice(&size.to_le_bytes());
+        b[16..24].copy_from_slice(&u64::from(u::AMDGPU_GEM_DOMAIN_VRAM).to_le_bytes());
+        b[24..32].copy_from_slice(&u64::from(u::AMDGPU_GEM_CREATE_GFX12_DCC).to_le_bytes());
+        let nr = 0xc000_0000 | (0x64 << 8) | (0x40 + u::DRM_AMDGPU_GEM_CREATE);
+        crate::amdgpu_gem::dispatch(nr, b.as_mut_ptr() as usize, gem).ok()?;
+        Some(u32::from_le_bytes(b[0..4].try_into().unwrap()))
+    };
+    let (Some(a), Some(b)) = (create(&gem), create(&gem)) else {
+        return TestResult::Fail("GEM_CREATE in VRAM");
+    };
+    // What each buffer's VRAM reservation takes.
+    let size = (full - pool.available()) / 2;
+    let addfb = |handle: u32, modifier: u64, pitch: u32| {
+        let mut arg = [0u8; 104];
+        arg[4..8].copy_from_slice(&256u32.to_le_bytes());
+        arg[8..12].copy_from_slice(&128u32.to_le_bytes());
+        arg[12..16].copy_from_slice(&0x3432_5258u32.to_le_bytes());
+        arg[16..20].copy_from_slice(&2u32.to_le_bytes());
+        arg[20..24].copy_from_slice(&handle.to_le_bytes());
+        arg[36..40].copy_from_slice(&pitch.to_le_bytes());
+        arg[72..80].copy_from_slice(&modifier.to_le_bytes());
+        let r = crate::drm_ioctl_bridge::amdgpu_addfb2_bo(
+            idx,
+            OWNER,
+            crate::drm_uapi::DRM_IOCTL_MODE_ADDFB2,
+            arg.as_mut_ptr() as usize,
+            &gem,
+        );
+        (r, u32::from_le_bytes(arg[0..4].try_into().unwrap()))
+    };
+    // A handle the open does not hold is the card's ADDFB2's to answer.
+    if addfb(a + 100, tiling.modifier(), pitch).0.is_some() {
+        return TestResult::Fail("ADDFB2 took a handle the open does not hold");
+    }
+    // A pitch the 64K_2D blocks cannot hold is refused.
+    if addfb(a, tiling.modifier(), pitch - 4).0 != Some(Err(FsError::InvalidData)) {
+        return TestResult::Fail("ADDFB2 took a misfit pitch");
+    }
+    let (Some(Ok(0)), fa) = addfb(a, tiling.modifier(), pitch) else {
+        return TestResult::Fail("ADDFB2 of a DCC GEM buffer");
+    };
+    let (Some(Ok(0)), fb_b) = addfb(b, tiling.modifier(), pitch) else {
+        return TestResult::Fail("ADDFB2 of a second GEM buffer");
+    };
+    let object_a = gem.object(a).unwrap();
+    let frame_a = {
+        let card = ms.lock();
+        let fb = card.framebuffer(fa).unwrap();
+        if fb.modifier != tiling.modifier() || fb.bo.as_ref().map(|b| b.owner) != Some(OWNER) {
+            return TestResult::Fail("framebuffer does not hold the GEM buffer");
+        }
+        crate::drm_ioctl_bridge::scanout_frame(&card, fb)
+    };
+    // prepare_fb: pinned in VRAM, scanned out at its GPU address: no copy
+    // source for the presenter.
+    let Some(frame_a) = frame_a else {
+        return TestResult::Fail("GEM framebuffer not pinned for scanout");
+    };
+    let Some(pin_a) = frame_a.bo.clone() else {
+        return TestResult::Fail("frame carries no pin");
+    };
+    let Some(x) = frame_a.external((0, 0)) else {
+        return TestResult::Fail("pinned framebuffer has no in-place surface");
+    };
+    if frame_a.phys != 0
+        || !object_a.pinned()
+        || x.address != pin_a.address()
+        || x.pitch_bytes != pitch
+        || x.last != pin_a.address() + pin_a.byte_len() - 1
+        || !(0x8_2000_0000..0x8_2010_0000).contains(&x.address)
+    {
+        return TestResult::Fail("in-place surface of the pinned framebuffer");
+    }
+    // Pinned: suspend's eviction passes it by, and moves only B.
+    let (touched, evicted) = narf_scheduler::block_on_spin(async {
+        let gate = crate::amdgpu_gem::lock_placement(idx).await;
+        crate::amdgpu_gem::evict_all(&gate).await
+    });
+    if evicted.is_err() || object_a.system() || touched.len() != 1 {
+        return TestResult::Fail("evict_all moved a pinned scanout buffer");
+    }
+    crate::amdgpu_gem::restore_domains(touched);
+    if pool.available() != full - size {
+        return TestResult::Fail("evict_all left the unpinned buffer in VRAM");
+    }
+    // RMFB and GEM_CLOSE while it is shown: the pin keeps the buffer.
+    drop(frame_a);
+    drop(object_a);
+    if ms.lock().rmfb(fa).is_err() {
+        return TestResult::Fail("RMFB");
+    }
+    let close = |handle: u32| {
+        let mut c = [0u8; 8];
+        c[0..4].copy_from_slice(&handle.to_le_bytes());
+        crate::amdgpu_gem::dispatch(0x4008_6409, c.as_mut_ptr() as usize, &gem)
+    };
+    if close(a).is_err() {
+        return TestResult::Fail("GEM_CLOSE");
+    }
+    if gem.owns(a) || pool.available() != full - size {
+        return TestResult::Fail("a shown buffer was freed by RMFB / GEM_CLOSE");
+    }
+    // The next frame's buffer, pinned too; until its flip latches nothing
+    // is released. The pin itself never moves it (no copy under the KMS
+    // lock): prepare_fb's async migration brings it back to VRAM from where
+    // the eviction put it first.
+    // A commit naming it before then fails with prepare_fb's ENOMEM, before
+    // any state changes, and keeps no pin.
+    let (refused, pinned) = {
+        let card = ms.lock();
+        let fb = card.framebuffer(fb_b).unwrap();
+        (
+            crate::drm_ioctl_bridge::PreparedFbs::prepare(&card, [fb_b]).err(),
+            fb.bo.as_ref().is_some_and(|bo| bo.object.pinned()),
+        )
+    };
+    if refused != Some(FsError::OutOfMemory) || pinned {
+        return TestResult::Fail("an evicted buffer pinned without prepare_fb");
+    }
+    narf_scheduler::block_on_spin(crate::drm_ioctl_bridge::amdgpu_prepare_scanout(
+        idx,
+        OWNER,
+        crate::drm_uapi::DRM_IOCTL_MODE_PAGE_FLIP,
+        0,
+        &gem,
+    ));
+    let frame_b = {
+        let card = ms.lock();
+        crate::drm_ioctl_bridge::scanout_frame(&card, card.framebuffer(fb_b).unwrap())
+    };
+    let Some(pin_b) = frame_b.and_then(|f| f.bo) else {
+        return TestResult::Fail("second framebuffer not pinned");
+    };
+    if pin_b.object().system() || pool.available() != full - 2 * size {
+        return TestResult::Fail("pinning did not bring the buffer back to VRAM");
+    }
+    // The display's pins hold A while the HUBP still reports it in use
+    // (the flip to B in flight: its frame holds B's pin).
+    let mut pins = vec![pin_a];
+    let a_at = pins[0].address();
+    let in_flight = crate::amdgpu_navi48_platform::retire_unfetched(&mut pins, &[Some(a_at)]);
+    if !in_flight.is_empty() || pins.len() != 1 {
+        return TestResult::Fail("a buffer was released before the flip latched");
+    }
+    // The flip latched: B joins the display's pins, the HUBP reports B; A
+    // is unpinned, then freed.
+    pins.push(pin_b.clone());
+    let retired =
+        crate::amdgpu_navi48_platform::retire_unfetched(&mut pins, &[Some(pin_b.address()), None]);
+    if retired.len() != 1 || pins.len() != 1 || retired[0].address() != a_at {
+        return TestResult::Fail("the replaced buffer was not retired");
+    }
+    drop(retired);
+    if pool.available() != full - size {
+        return TestResult::Fail("the retired buffer was not freed");
+    }
+    // drm_fb_release on close: B's framebuffer goes, its pin keeps it.
+    if ms.lock().release_file_framebuffers(OWNER) != 1 || ms.lock().framebuffer(fb_b).is_ok() {
+        return TestResult::Fail("drm_fb_release");
+    }
+    drop(gem);
+    if pool.available() != full - size || !pin_b.object().pinned() {
+        return TestResult::Fail("a fetched buffer was freed with its framebuffer");
+    }
+    drop(pin_b);
+    drop(pins);
+    if pool.available() != full {
+        return TestResult::Fail("the last pin did not free the buffer");
+    }
+    crate::amdgpu_gem::unregister_vram_heap(idx);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_navi48_gem_framebuffers_scan_out_in_place
+);
+
+/// Dumb buffers on the Navi48 card, as amdgpu_mode_dumb_create makes them:
+/// CREATE_DUMB puts a VRAM buffer with Linux's padded pitch in the open's
+/// own GEM table (none in the card's system-memory dumb table), MAP_DUMB's
+/// offset maps its BAR window (a write there lands in the buffer), ADDFB2
+/// of the handle makes a framebuffer holding the buffer, and showing it
+/// pins it in VRAM and flips the plane to its own address with no copy
+/// source; the pin goes once the flip that replaced it latched. Suspend's
+/// eviction moves an unpinned dumb buffer to system memory and the next
+/// flip's prepare_fb brings it back. Before the card's VRAM heap is up the
+/// card keeps its system-memory dumb buffers.
+fn smoke_drm_navi48_dumb_buffers_scan_out_of_vram() -> TestResult {
+    use crate::amdgpu_gem::{GemState, VramHeap};
+    use crate::drm_uapi::{
+        DrmModeCreateDumbUapi, DRM_IOCTL_MODE_ADDFB2, DRM_IOCTL_MODE_CREATE_DUMB,
+        DRM_IOCTL_MODE_DESTROY_DUMB, DRM_IOCTL_MODE_MAP_DUMB, DRM_IOCTL_MODE_PAGE_FLIP,
+    };
+    const OWNER: u64 = 0xd0b1;
+    const BAR: u64 = 0xb500_0000;
+    let idx = register_test_card();
+    let Some(ms) = crate::drm_registry::mode_state(idx) else {
+        return TestResult::Fail("no mode state");
+    };
+    {
+        let mut card = ms.lock();
+        card.plane_formats = Some(&crate::amdgpu_navi48_kms::PLANE_FORMATS);
+        card.gfx12_modifiers = true;
+    }
+    let gem = GemState::for_card(idx);
+    let create = |gem: &GemState, width: u32, height: u32| {
+        let mut req = DrmModeCreateDumbUapi {
+            width,
+            height,
+            bpp: 32,
+            ..Default::default()
+        };
+        let r = crate::drm_ioctl_bridge::amdgpu_dumb(
+            idx,
+            DRM_IOCTL_MODE_CREATE_DUMB,
+            &mut req as *mut _ as usize,
+            gem,
+        );
+        (r, req)
+    };
+    // No VRAM heap yet: the card's own dumb buffers answer.
+    if create(&gem, 200, 100).0.is_some() {
+        return TestResult::Fail("VRAM dumb buffer without a heap");
+    }
+    let mut memory = vec![0u8; 1 << 20];
+    let map = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(BAR),
+        virt: memory.as_mut_ptr() as u64,
+        len: memory.len() as u64,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    // SAFETY: the test owns `memory` until the heap and every buffer are
+    // dropped; no hardware reaches it.
+    let pool = unsafe { crate::amdgpu_vram::Pool::from_owned_range(map, 0x8_2000_0000) }.unwrap();
+    crate::amdgpu_gem::register_vram_heap(
+        idx,
+        VramHeap {
+            pool: pool.clone(),
+            fb_base: 0x8_0000_0000,
+            fb_offset: 0x9_0000_0000,
+            unmapped: None,
+        },
+    );
+    let full = pool.available();
+    // 200 XRGB8888 pixels pad to 256 (amdgpu_gem_align_pitch): 1024 bytes,
+    // 100 lines in 25 pages.
+    let (Some(Ok(0)), a) = create(&gem, 200, 100) else {
+        return TestResult::Fail("CREATE_DUMB on the Navi48 card");
+    };
+    let (Some(Ok(0)), b) = create(&gem, 200, 100) else {
+        return TestResult::Fail("second CREATE_DUMB");
+    };
+    let Some(object_a) = gem.object(a.handle) else {
+        return TestResult::Fail("dumb handle not in the open's GEM table");
+    };
+    if a.pitch != 1024
+        || a.size != 102_400
+        || object_a.system()
+        || object_a.domain() != crate::amdgpu_uapi::AMDGPU_GEM_DOMAIN_VRAM
+        || ms.lock().dumb_backing(a.handle).is_some()
+        || pool.available() != full - 2 * 102_400
+    {
+        return TestResult::Fail("dumb buffer not a VRAM BO with Linux's pitch");
+    }
+    // MAP_DUMB: the offset maps the buffer's BAR window.
+    let mut m = [0u8; 16];
+    m[0..4].copy_from_slice(&a.handle.to_le_bytes());
+    if crate::drm_ioctl_bridge::amdgpu_dumb(
+        idx,
+        DRM_IOCTL_MODE_MAP_DUMB,
+        m.as_mut_ptr() as usize,
+        &gem,
+    ) != Some(Ok(0))
+    {
+        return TestResult::Fail("MAP_DUMB");
+    }
+    let offset = u64::from_le_bytes(m[8..16].try_into().unwrap());
+    let Ok(backing) = gem.mmap_backing(offset, a.size as usize) else {
+        return TestResult::Fail("mmap of the MAP_DUMB offset");
+    };
+    if backing.frames.len() != 25
+        || backing.frames[0] != object_a.phys()
+        || backing
+            .frames
+            .iter()
+            .any(|&f| !(BAR..BAR + (1 << 20)).contains(&f))
+    {
+        return TestResult::Fail("dumb mapping is not the BAR window");
+    }
+    // A CPU write through the mapping (the BAR, here the test's memory)
+    // lands in the buffer.
+    let at = (backing.frames[3] - BAR) as usize + 0x123;
+    memory[at..at + 4].copy_from_slice(&0x00c0_ffeeu32.to_le_bytes());
+    let mut back = [0u8; 4];
+    if object_a
+        .placement()
+        .read_bytes(3 * 4096 + 0x123, &mut back)
+        .is_none()
+        || back != 0x00c0_ffeeu32.to_le_bytes()
+    {
+        return TestResult::Fail("a write through MAP_DUMB missed the buffer");
+    }
+    drop(backing);
+    // ADDFB2 of the dumb handle: a framebuffer holding the buffer.
+    let addfb = |handle: u32| {
+        let mut arg = [0u8; 104];
+        arg[4..8].copy_from_slice(&200u32.to_le_bytes());
+        arg[8..12].copy_from_slice(&100u32.to_le_bytes());
+        arg[12..16].copy_from_slice(&0x3432_5258u32.to_le_bytes());
+        arg[20..24].copy_from_slice(&handle.to_le_bytes());
+        arg[36..40].copy_from_slice(&1024u32.to_le_bytes());
+        let r = crate::drm_ioctl_bridge::amdgpu_addfb2_bo(
+            idx,
+            OWNER,
+            DRM_IOCTL_MODE_ADDFB2,
+            arg.as_mut_ptr() as usize,
+            &gem,
+        );
+        (r, u32::from_le_bytes(arg[0..4].try_into().unwrap()))
+    };
+    let (Some(Ok(0)), fa) = addfb(a.handle) else {
+        return TestResult::Fail("ADDFB2 of a dumb handle");
+    };
+    let (Some(Ok(0)), fb_b) = addfb(b.handle) else {
+        return TestResult::Fail("ADDFB2 of the second dumb handle");
+    };
+    let show = |fb: u32| {
+        let card = ms.lock();
+        let fb = card.framebuffer(fb).ok()?;
+        fb.bo.as_ref()?;
+        crate::drm_ioctl_bridge::scanout_frame(&card, fb)
+    };
+    // prepare_fb: pinned in VRAM and fetched in place, no copy source.
+    let Some(frame_a) = show(fa) else {
+        return TestResult::Fail("dumb framebuffer not pinned for scanout");
+    };
+    let (Some(pin_a), Some(x)) = (frame_a.bo.clone(), frame_a.external((0, 0))) else {
+        return TestResult::Fail("dumb framebuffer has no in-place surface");
+    };
+    if frame_a.phys != 0
+        || !object_a.pinned()
+        || x.address != pin_a.address()
+        || x.address != object_a.placement().gpu - 0x9_0000_0000 + 0x8_0000_0000
+        || x.pitch_bytes != 1024
+        || x.last != pin_a.address() + 102_400 - 1
+    {
+        return TestResult::Fail("in-place surface of the dumb framebuffer");
+    }
+    drop(frame_a);
+    // DESTROY_DUMB while shown: the framebuffer and the pin keep it.
+    let mut d = b.handle.to_le_bytes();
+    if crate::drm_ioctl_bridge::amdgpu_dumb(
+        idx,
+        DRM_IOCTL_MODE_DESTROY_DUMB,
+        d.as_mut_ptr() as usize,
+        &gem,
+    ) != Some(Ok(0))
+        || gem.owns(b.handle)
+        || pool.available() != full - 2 * 102_400
+    {
+        return TestResult::Fail("DESTROY_DUMB of a framebuffer's buffer");
+    }
+    // The flip to B: until it latches A stays pinned; then A's pin goes.
+    let Some(pin_b) = show(fb_b).and_then(|f| f.bo) else {
+        return TestResult::Fail("second dumb framebuffer not pinned");
+    };
+    let mut pins = vec![pin_a];
+    let a_at = pins[0].address();
+    if !crate::amdgpu_navi48_platform::retire_unfetched(&mut pins, &[Some(a_at)]).is_empty() {
+        return TestResult::Fail("the shown dumb buffer was unpinned before the flip latched");
+    }
+    pins.push(pin_b.clone());
+    let retired =
+        crate::amdgpu_navi48_platform::retire_unfetched(&mut pins, &[Some(pin_b.address())]);
+    if retired.len() != 1 || retired[0].address() != a_at {
+        return TestResult::Fail("the replaced dumb buffer was not retired");
+    }
+    drop(retired);
+    if object_a.pinned() || !pin_b.object().pinned() {
+        return TestResult::Fail("pin not released after the latch");
+    }
+    // Suspend's evict_all: the unpinned A goes to system memory (its bytes
+    // with it), the scanned-out B stays; the next flip's prepare_fb brings
+    // A back to VRAM before its pin.
+    let (touched, evicted) = narf_scheduler::block_on_spin(async {
+        let gate = crate::amdgpu_gem::lock_placement(idx).await;
+        crate::amdgpu_gem::evict_all(&gate).await
+    });
+    if evicted.is_err() || !object_a.system() || pin_b.object().system() {
+        return TestResult::Fail("evict_all of the dumb buffers");
+    }
+    crate::amdgpu_gem::restore_domains(touched);
+    narf_scheduler::block_on_spin(crate::drm_ioctl_bridge::amdgpu_prepare_scanout(
+        idx,
+        OWNER,
+        DRM_IOCTL_MODE_PAGE_FLIP,
+        0,
+        &gem,
+    ));
+    back = [0; 4];
+    if object_a.system()
+        || object_a
+            .placement()
+            .read_bytes(3 * 4096 + 0x123, &mut back)
+            .is_none()
+        || back != 0x00c0_ffeeu32.to_le_bytes()
+    {
+        return TestResult::Fail("prepare_fb did not bring the dumb buffer back to VRAM");
+    }
+    // drm_fb_release, the last pin and the open's close free both.
+    ms.lock().release_file_framebuffers(OWNER);
+    drop(object_a);
+    drop(pins);
+    drop(pin_b);
+    drop(gem);
+    crate::amdgpu_gem::unregister_vram_heap(idx);
+    if pool.available() != full {
+        return TestResult::Fail("dumb buffers not freed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_navi48_dumb_buffers_scan_out_of_vram
 );
 
 // ── User-copy range + fault checks (Linux access_ok / copy_*_user) ───────────

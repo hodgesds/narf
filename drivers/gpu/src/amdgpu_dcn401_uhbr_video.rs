@@ -304,13 +304,14 @@ impl<I: Io> Engine<I> {
     fn stream_mapper(&self, stream: u8) -> u64 {
         self.layout.mpc_base + (0xe56 + u64::from(stream)) * 4
     }
-    /// The DCCG's stream clocks for `stream`: DPSTREAMCLK from `pipe`,
-    /// SYMCLK32_SE from the link's PHY.
+    /// The DCCG's stream clocks for `stream`: DPSTREAMCLK from `pipe`'s OTG
+    /// instance (dccg401_set_dpstreamclk: SRC_SEL = otg_inst), SYMCLK32_SE
+    /// from the link's PHY.
     fn uhbr_stream_clocks(&mut self, stream: u8, pipe: u8, phy: u8) -> Result<(), Error> {
         let l = self.layout;
         let shift = 4 * u32::from(stream);
         for (at, value) in [
-            (l.link_clock - DPSTREAMCLK_FROM_LE, 8 | u32::from(pipe)),
+            (l.link_clock - DPSTREAMCLK_FROM_LE, 8 | l.inst_field(pipe)),
             (l.link_clock - SYMCLK32_SE_FROM_LE, 8 | u32::from(phy)),
         ] {
             if self.read(at)? >> shift & 0xf != value {
@@ -582,11 +583,12 @@ impl<I: Io> Engine<I> {
         self.wait(at(SYM32_CONTROL), 0x100, 0, 1000).await?;
         self.update(at(SYM32_CONTROL), 1, 1)
     }
-    /// dcn31_hpo_dp_stream_enc_dp_unblank from OTG `pipe`.
+    /// dcn31_hpo_dp_stream_enc_dp_unblank from `pipe`'s OTG (its
+    /// PIXEL_STREAM_SOURCE_SEL is the OTG instance).
     async fn uhbr_unblank(&mut self, stream: u8, pipe: u8) -> Result<(), Error> {
         let l = self.layout;
         let at = |r| DpStream::Hpo(stream).at(l, r);
-        self.update(at(SE_INPUT_MUX), 7, u32::from(pipe))?;
+        self.update(at(SE_INPUT_MUX), 7, l.inst_field(pipe))?;
         self.update(at(VID_STREAM), 1, 1)?;
         for (reg, reset, done) in [(VID_FIFO, 0x10, 0x100), (SE_RAMP, 0x10, 0x10_0000)] {
             self.update(at(reg), reset, reset)?;
@@ -700,7 +702,11 @@ impl<I: Io> Engine<I> {
             return Err(Error::Busy);
         }
         let link = self.status.uhbr_link.ok_or(Error::Invalid)?;
-        if link.path != path || stream >= 4 || pipe >= 4 || link.settings.mst != mst {
+        if link.path != path
+            || stream >= 4
+            || pipe >= self.layout.pool.count()
+            || link.settings.mst != mst
+        {
             return Err(Error::Invalid);
         }
         let blank = self.status.blanks[usize::from(pipe)].ok_or(Error::Invalid)?;
@@ -970,7 +976,7 @@ impl<I: Io> Engine<I> {
             (VID_STREAM, 1, 1),
             (VID_FIFO, 1, 1),
             (SE_RAMP, 1, 1),
-            (SE_INPUT_MUX, 7, u32::from(v.timing.blank.request.pipe)),
+            (SE_INPUT_MUX, 7, l.inst_field(v.timing.blank.request.pipe)),
         ] {
             if self.read(at(reg))? & mask != value {
                 return Err(Error::Readback(at(reg)));

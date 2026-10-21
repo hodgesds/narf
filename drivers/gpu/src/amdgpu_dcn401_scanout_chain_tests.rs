@@ -9,6 +9,7 @@
 //! PHY/stream/pipe routing.
 use super::*;
 use crate::amdgpu_dcn401_dml as dml;
+use crate::amdgpu_dcn401_otg::tests::harvest::{self, Renamed};
 use crate::amdgpu_dcn401_otg::tests::hdmi_link::{dio, path, phy, resync, Firmware, TmdsIo};
 use alloc::sync::Arc;
 use core::future::Future;
@@ -208,6 +209,11 @@ impl Io for ScanIo {
         if at == optc_input(p) && value & OPTC_UNDERFLOW_CLEAR != 0 {
             value &= !(OPTC_UNDERFLOW | OPTC_UNDERFLOW_CLEAR);
         }
+        // The CRB's DET and COMPBUF requests are acknowledged at once
+        // (their CURRENT fields follow).
+        if (BASE + 0x4ba * 4..=BASE + 0x4be * 4).contains(&at) {
+            value = (value & !0x1f00) | (value & 0x1f) << 8;
+        }
         self.inner.write(at, value);
         if self.underflow_after == Some(self.writes) {
             let control = self.get(h(p, HUBP_CONTROL)) | HUBP_UNDERFLOW;
@@ -302,7 +308,7 @@ fn hdmi_mode(pipe: u8, plan: &dml::Plan) -> Mode {
 struct Chain {
     backing: Vec<u32>,
     pool: Pool,
-    e: Engine<ScanIo>,
+    e: Engine<Renamed<ScanIo>>,
     surfaces: Surfaces,
     clock: dccg::Applied,
     address: u64,
@@ -325,8 +331,12 @@ struct Staged {
 #[inline(never)]
 fn chain(phy_index: u8, stream: u8, pipe: u8) -> alloc::boxed::Box<Chain> {
     let plan = boxed_plan();
-    let mut s = staged(pipe, &plan);
-    let address = stage_deadlines(&mut s, pipe, &plan);
+    // The staging fixtures model the full board (see hdmi_engine).
+    let (s, address) = harvest::on_full_pool(|| {
+        let mut s = staged(pipe, &plan);
+        let address = stage_deadlines(&mut s, pipe, &plan);
+        (s, address)
+    });
     let mut c = hdmi_chain(s, phy_index, stream, pipe, address);
     let clock = c.clock;
     start_hdmi(&mut c.e, phy_index, stream, pipe, clock);
@@ -397,7 +407,12 @@ fn stage_deadlines(s: &mut Staged, pipe: u8, plan: &dml::Plan) -> u64 {
 }
 /// The staged engine under the HDMI transmitter and lock/latch models.
 #[inline(never)]
-fn hdmi_engine(e: Engine<RequestIo>, phy_index: u8, stream: u8, pipe: u8) -> Engine<ScanIo> {
+fn hdmi_engine(
+    e: Engine<RequestIo>,
+    phy_index: u8,
+    stream: u8,
+    pipe: u8,
+) -> Engine<Renamed<ScanIo>> {
     // The plane wrappers' staging handshakes are done; keep their register
     // file under the HDMI transmitter model, as fixture_with arranges it.
     let mut fake = e.io.inner.surface.inner;
@@ -410,35 +425,41 @@ fn hdmi_engine(e: Engine<RequestIo>, phy_index: u8, stream: u8, pipe: u8) -> Eng
     // Plane retirement is over: MPCC status is the lock/latch model's now.
     fake.disconnecting = false;
     fake.writes.clear();
-    Engine {
-        io: ScanIo {
-            inner: TmdsIo {
-                inner: fake,
-                phy: phy_index,
-                stream,
-                event: Arc::new(AtomicU8::new(0)),
-                writes: Arc::new(AtomicUsize::new(0)),
-                on: false,
-                dead: false,
-                az: alloc::collections::BTreeMap::new(),
-                az_index: [0; 4],
-            },
-            pipe,
-            armed: false,
-            pause_wait: false,
-            grant: true,
-            latch_delay: 0,
-            pending_latch: None,
-            frozen: false,
-            frame: 7,
-            drop: None,
-            underflow_after: None,
-            writes: 0,
-            lock_requested: Arc::new(AtomicBool::new(false)),
-            extra: 0,
+    // Behind Renamed from here: its addresses are the full board's.
+    fake.guarded = false;
+    // Staged for the full board; from here the owner runs on the published
+    // pool, the model behind it renamed to that board.
+    let layout = harvest::harvested_layout(e.layout);
+    let io = ScanIo {
+        inner: TmdsIo {
+            inner: fake,
+            phy: phy_index,
+            stream,
+            event: Arc::new(AtomicU8::new(0)),
+            writes: Arc::new(AtomicUsize::new(0)),
+            on: false,
+            dead: false,
+            az: alloc::collections::BTreeMap::new(),
+            az_index: [0; 4],
         },
+        pipe,
+        armed: false,
+        pause_wait: false,
+        grant: true,
+        latch_delay: 0,
+        pending_latch: None,
+        frozen: false,
+        frame: 7,
+        drop: None,
+        underflow_after: None,
+        writes: 0,
+        lock_requested: Arc::new(AtomicBool::new(false)),
+        extra: 0,
+    };
+    Engine {
+        io: Renamed::new(io, layout),
         authority: e.authority,
-        layout: e.layout,
+        layout,
         status: e.status,
         displays: e.displays,
     }
@@ -446,7 +467,13 @@ fn hdmi_engine(e: Engine<RequestIo>, phy_index: u8, stream: u8, pipe: u8) -> Eng
 /// The TMDS link and its black video on the staged pipe, then arm the
 /// lock/latch model.
 #[inline(never)]
-fn start_hdmi(e: &mut Engine<ScanIo>, phy_index: u8, stream: u8, pipe: u8, clock: dccg::Applied) {
+fn start_hdmi(
+    e: &mut Engine<Renamed<ScanIo>>,
+    phy_index: u8,
+    stream: u8,
+    pipe: u8,
+    clock: dccg::Applied,
+) {
     let mut fw = Firmware {
         ready: true,
         commands: Vec::new(),
@@ -842,6 +869,174 @@ kernel_test_in!(
     dcn401_scanout_chain_live_updates_go_through_the_back_buffer
 );
 
+impl Chain {
+    #[inline(never)]
+    fn flip_to(
+        &mut self,
+        source: FlipSource,
+    ) -> core::future::Ready<Result<[Option<FlipDone>; 1 + MAX_OVERLAYS], Error>> {
+        let c = self.clock;
+        let mut sources = [None; 1 + MAX_OVERLAYS];
+        sources[0] = Some(source);
+        core::future::ready(run_boxed(|| {
+            self.surfaces
+                .flip_sources(&mut self.e, self.pipe, sources, CRYSTAL_KHZ, move || {
+                    Ok((c, config()))
+                })
+        }))
+    }
+    fn hubp(&mut self, r: u64) -> u32 {
+        let at = h(self.pipe, r);
+        self.e.io.get(at)
+    }
+}
+
+/// amdgpu_dm hands DC the client framebuffer's own address
+/// (amdgpu_dm_plane_fill_plane_buffer_attributes): a flip to a pinned
+/// buffer re-addresses the HUBP (and, for another pitch, its
+/// DCSURF_SURFACE_PITCH under the same lock) without copying a byte into
+/// either staged buffer; the buffer it replaces is reported no longer
+/// fetched only after the new address latched; a flip back to the back
+/// buffer restores the staged pitch. A buffer the plane cannot fetch
+/// (misaligned, outside the frame-buffer aperture, a pitch below the
+/// staged one, rows past its end, one of the plane's own staged buffers)
+/// is refused with the scanout untouched.
+fn dcn401_scanout_chain_scans_client_framebuffers_in_place() -> TestResult {
+    scans_client_framebuffers_in_place(chain(0, 0, 0))
+}
+/// The test above on chain `c`.
+fn scans_client_framebuffers_in_place(mut c: alloc::boxed::Box<Chain>) -> TestResult {
+    let p = c.pipe;
+    if run(c.start()).is_err() {
+        return TestResult::Fail("start");
+    }
+    let Ok(back) = run(c.surfaces.prepare_back(&mut c.e, &c.pool, p, config())) else {
+        return TestResult::Fail("back buffer");
+    };
+    let front = c.address;
+    // Mark both staged buffers: nothing may write either.
+    if c.surfaces
+        .upload_back(&mut c.e, p, 0, 0, &[0x1234_5678])
+        .is_err()
+    {
+        return TestResult::Fail("back-buffer marker");
+    }
+    let (front_word, back_word) = (c.vram(front, 0), c.vram(back, 0));
+    let client = 0x8_4000_0000u64;
+    let x = ExternalSurface {
+        address: client,
+        pitch_bytes: 4096,
+        chroma: None,
+        last: client + 4096 * 480 - 1,
+        dcc_aligned: true,
+    };
+    for bad in [
+        ExternalSurface {
+            address: client + 64,
+            last: x.last + 64,
+            ..x
+        },
+        ExternalSurface {
+            address: 0xc_0000_0000,
+            last: 0xc_0000_0000 + (x.last - client),
+            ..x
+        },
+        ExternalSurface {
+            pitch_bytes: 2048,
+            ..x
+        },
+        ExternalSurface {
+            pitch_bytes: 4098,
+            ..x
+        },
+        ExternalSurface {
+            last: x.last - 1,
+            ..x
+        },
+        ExternalSurface {
+            chroma: Some((4096 * 480, 4096)),
+            ..x
+        },
+        ExternalSurface {
+            address: back,
+            last: back + 4096 * 480,
+            ..x
+        },
+    ] {
+        if run(c.flip_to(FlipSource::External(bad))) != Err(Error::Invalid)
+            || c.e.status.state != State::ScanoutRunning(p)
+            || c.hubp(0x60a) != front as u32
+        {
+            return TestResult::Fail("unfetchable client framebuffer accepted");
+        }
+    }
+    let writes = c.e.io.writes;
+    let Ok(done) = run(c.flip_to(FlipSource::External(x))) else {
+        return TestResult::Fail("flip to a client framebuffer");
+    };
+    let done = done[0].unwrap();
+    if done.front != client || done.back != front {
+        return TestResult::Fail("client flip report");
+    }
+    if c.hubp(0x60a) != client as u32 || c.hubp(0x60b) & 0xffff != (client >> 32) as u32 {
+        return TestResult::Fail("HUBP not addressing the client framebuffer");
+    }
+    if c.hubp(0x61c) != client as u32 {
+        return TestResult::Fail("client framebuffer not reported in use");
+    }
+    if c.hubp(0x607) & 0xffff != 4096 / 4 - 1 {
+        return TestResult::Fail("client framebuffer's pitch not programmed");
+    }
+    // No copy: neither staged buffer changed, and a flip is a handful of
+    // register writes, not a frame's worth.
+    if c.vram(front, 0) != front_word || c.vram(back, 0) != back_word || c.e.io.writes - writes > 64
+    {
+        return TestResult::Fail("client flip copied pixels");
+    }
+    let mut status = c.e.status.scanout.unwrap();
+    if status.address != client || c.e.status.surfaces[usize::from(p)].unwrap().pitch_bytes != 4096
+    {
+        return TestResult::Fail("records do not name the client framebuffer");
+    }
+    // Another client buffer of the same pitch: only the address moves.
+    let next = ExternalSurface {
+        address: client + 0x20_0000,
+        last: x.last + 0x20_0000,
+        ..x
+    };
+    let Ok(done) = run(c.flip_to(FlipSource::External(next))) else {
+        return TestResult::Fail("client to client flip");
+    };
+    if done[0].unwrap().back != client || c.hubp(0x60a) != next.address as u32 {
+        return TestResult::Fail("client to client report");
+    }
+    // Back to the staged back buffer (the presenter's copy path): its
+    // staged pitch returns, the client buffer is released by the report.
+    let Ok(done) = run(c.flip_to(FlipSource::Back)) else {
+        return TestResult::Fail("flip back to the staged buffer");
+    };
+    let done = done[0].unwrap();
+    if done.front != back || done.back != next.address || c.hubp(0x607) & 0xffff != 640 - 1 {
+        return TestResult::Fail("back-buffer flip after a client one");
+    }
+    status = c.e.status.scanout.unwrap();
+    if status.address != back
+        || c.vram(back, 0) != back_word
+        || c.surfaces.upload_back(&mut c.e, p, 0, 0, &[7]).is_err()
+        || c.vram(front, 0) != 7
+    {
+        return TestResult::Fail("staged buffers after the client flips");
+    }
+    if run(c.stop()).is_err() {
+        return TestResult::Fail("stop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_chain_scans_client_framebuffers_in_place
+);
+
 /// A second display selected next to a live one sees exactly the first
 /// one's resources as siblings, may retire planes and stage timing on its
 /// own pipes without disturbing the live scanout, and may not take the
@@ -1102,7 +1297,8 @@ fn crtc_color(c: &mut Chain, p: u8) -> Result<(), &'static str> {
     if !latched(c, 2 | 2 << 7, 1 | 1 << 7, 1)
         || c.e.status.colors[usize::from(p)]
             != (PipeColor {
-                pre_degam_srgb: true,
+                pre_degam: PreDegam::Srgb,
+                gamcor: None,
                 gamut: Some((1, false)),
                 ogam: Some(0),
             })
@@ -1274,3 +1470,169 @@ kernel_test_in!(
 
 #[path = "amdgpu_dcn401_plane_update_chain_tests.rs"]
 mod plane_update;
+
+/// The chain on harvested boards (pipe 0, pipe 1, and pipes 1 and 2 fused):
+/// the same owners on the pool's pipes, the staged full-board model behind
+/// `harvest::Renamed`, so every access and instance field the owners make
+/// must name the pool's instance of the pipe the model expects, and none a
+/// fused one. Each case runs on the pipes the pool has.
+fn dcn401_scanout_chain_runs_on_harvested_boards() -> TestResult {
+    harvest::harvested(2, || {
+        let count = crate::amdgpu_rdna4::pipe_pool().count();
+        let top = count - 1;
+        if let Err(why) = harvested_chain(count) {
+            return TestResult::Fail(why);
+        }
+        for stage in 0..4 {
+            unwind_stage(&mut chain(0, 0, 0), stage);
+        }
+        let route = (2, 1, top);
+        let moved = move_to_new_plan(chain_on(route), top);
+        if moved != TestResult::Pass {
+            return moved;
+        }
+        use plane_update::*;
+        for result in [
+            dcn401_live_plane_update_scales_the_primary_in_place_on(route),
+            dcn401_live_plane_update_adds_moves_and_removes_an_overlay_on(route, 0),
+            dcn401_live_plane_update_moves_the_cursor_with_the_planes_on(route, 0),
+            dcn401_live_plane_update_shows_the_first_frame_at_the_latch_on(route, 0),
+            dcn401_live_plane_update_scans_a_client_framebuffer_from_the_latch_on(route, 0),
+            scans_client_framebuffers_in_place(chain_on(route)),
+        ] {
+            if result != TestResult::Pass {
+                return result;
+            }
+        }
+        if count > 2 {
+            // Its refused plan names a third pipe (1).
+            return dcn401_live_plane_update_refuses_before_any_write_on((1, 3, 2), 0);
+        }
+        TestResult::Pass
+    })
+}
+/// The routed cases of the test above on a pool of `count` pipes.
+#[inline(never)]
+fn harvested_chain(count: u8) -> Result<(), &'static str> {
+    let top = count - 1;
+    for route in ROUTES.into_iter().filter(|r| r.2 < count) {
+        every_pipe(&mut chain_on(route), route)?;
+        crtc_color(&mut chain_on(route), route.2)?;
+    }
+    owner_change_during_stop(&mut chain(0, 0, 0))?;
+    cancelled_start(&mut chain(3, 2, 1))?;
+    if count > 2 {
+        owner_change_during_start(&mut chain(1, 3, 2))?;
+        second_display(&mut chain_on((1, 3, 2)), (1, 3, 2))?;
+    }
+    // A lost write on the top pipe's MPCC (the model's) is caught by its
+    // readback, at the pipe's MPCC instance (the owner's).
+    let mut c = chain(2, 1, top);
+    c.e.io.drop = Some(mpcc(top, TOP));
+    if run(c.start()) != Err(Error::Readback(c.e.io.owner_addr(mpcc(top, TOP)))) {
+        return Err("lost MPCC write on the top pipe");
+    }
+    Ok(())
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_chain_runs_on_harvested_boards
+);
+
+/// UCLK P-state switching on a live display (dcn401_prepare/optimize
+/// bandwidth around DML21's answer): the running 640x480 display moves to
+/// its vactive P-state plan with raise-only and then exact watermarks
+/// while UCLK is still pinned, and keeps scanning out once PMFW may switch
+/// UCLK down to the plan's level. While switching, a pinned plan is refused
+/// without a write, and so is a UCLK floor below the plan's; re-pinned,
+/// both the P-state plan and the pinned plan run again.
+fn dcn401_scanout_chain_runs_a_uclk_pstate_plan() -> TestResult {
+    let (t, s, p) = ROUTES[2];
+    pstate_plan(chain(t, s, p), p)
+}
+#[inline(never)]
+fn pstate_plan(mut c: alloc::boxed::Box<Chain>, p: u8) -> TestResult {
+    use crate::amdgpu_dcn401_otg::WatermarkUpdate;
+    use dml::pstate::{admit, Method, Pstate, UclkLevels};
+    if run(c.start()).is_err() {
+        return TestResult::Fail("start");
+    }
+    let pinned = plan();
+    let uclk = UclkLevels::new(&[96_000, 456_000, 772_000, 1_250_000]).unwrap();
+    let Ok(Pstate::Supported(s)) =
+        run_boxed(|| async { admit(&soc(), &uclk, &[pinned.mode], false) })
+    else {
+        return TestResult::Fail("640x480 P-state support");
+    };
+    let pstate = s.plans[0];
+    if s.methods[0] != Method::Vactive
+        || pstate.clocks.uclk_khz != 96_000
+        || pstate.pstate.is_none()
+        || pstate.mode != pinned.mode
+    {
+        return TestResult::Fail("vactive plan");
+    }
+    let update = |c: &mut Chain, plan: &dml::Plan, wm| {
+        let clock = c.clock;
+        run(c
+            .surfaces
+            .update_live_plan(&mut c.e, p, plan, wm, CRYSTAL_KHZ, || Ok((clock, config()))))
+    };
+    let rebind = |c: &mut Chain, f: &dyn Fn(&mut dccg::Applied)| {
+        let mut clock = c.clock;
+        f(&mut clock);
+        c.e.status.rebind_timing(p, |a| a.clock = clock);
+        c.clock = clock;
+    };
+    // prepare_bandwidth: whatever the P-state plan needs is raised first.
+    rebind(&mut c, &|k| {
+        k.global.display_khz = k.global.display_khz.max(pstate.clocks.dispclk_khz);
+        k.global.dpp_khz = k.global.dpp_khz.max(pstate.clocks.dpprefclk_khz);
+        k.global.request.display_khz = k.global.display_khz;
+        k.global.request.dpp_khz = k.global.dpp_khz;
+        k.request.dpp_khz = k.request.dpp_khz.max(pstate.clocks.dppclk_khz);
+    });
+    if update(&mut c, &pstate, WatermarkUpdate::Raise).is_err()
+        || update(&mut c, &pstate, WatermarkUpdate::Exact).is_err()
+        || c.e.status.deadlines.map(|d| d.plan) != Some(pstate)
+        || run(c.check()).is_err()
+    {
+        return TestResult::Fail("P-state plan while pinned");
+    }
+    // optimize_bandwidth: UCLK switching allowed, floor at the plan's level.
+    rebind(&mut c, &|k| {
+        k.global.uclk_pstate = true;
+        k.global.memory_floor_khz = 96_000;
+    });
+    if run(c.check()).is_err() {
+        return TestResult::Fail("P-state plan while switching");
+    }
+    let writes = c.e.io.writes;
+    if update(&mut c, &pinned, WatermarkUpdate::Raise) != Err(Error::Invalid)
+        || c.e.io.writes != writes
+    {
+        return TestResult::Fail("pinned plan while switching");
+    }
+    rebind(&mut c, &|k| k.global.memory_floor_khz = 48_000);
+    if run(c.check()) != Err(Error::Invalid) {
+        return TestResult::Fail("UCLK floor below the plan");
+    }
+    // Re-pinned (prepare_bandwidth before an unsupported configuration).
+    rebind(&mut c, &|k| {
+        k.global.uclk_pstate = false;
+        k.global.memory_floor_khz = 1_250_000;
+    });
+    if run(c.check()).is_err()
+        || update(&mut c, &pinned, WatermarkUpdate::Raise).is_err()
+        || update(&mut c, &pinned, WatermarkUpdate::Exact).is_err()
+        || c.e.status.deadlines.map(|d| d.plan) != Some(pinned)
+        || run(c.check()).is_err()
+    {
+        return TestResult::Fail("pinned again");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_chain_runs_a_uclk_pstate_plan
+);
