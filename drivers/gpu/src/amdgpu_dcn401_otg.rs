@@ -1219,6 +1219,9 @@ struct Displays {
     /// Each display's requested CRTC color, programmed at scanout start
     /// and on a live update.
     color: [Option<alloc::sync::Arc<ColorProgram>>; 4],
+    /// A compbuf grow (dcn401_program_compbuf_segments) deferred because a
+    /// DET had not acknowledged its request; the hub's, not a display's.
+    compbuf_pending: bool,
 }
 impl Displays {
     fn new() -> Box<Self> {
@@ -1227,6 +1230,7 @@ impl Displays {
             parked: alloc::vec![Status::new(); 4].into_boxed_slice(),
             siblings: Siblings::default(),
             color: [const { None }; 4],
+            compbuf_pending: false,
         })
     }
 }

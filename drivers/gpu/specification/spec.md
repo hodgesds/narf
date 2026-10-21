@@ -555,14 +555,19 @@ cursor tasks (`crtc_pipe`) and DisplayEvents (by pipe).
 too, made in the same `DcState` right after each new stream's OTG master,
 as resource_map_pool_resources makes it (`StreamPipes::on(StreamOutput)`:
 the stream's board port as its link, its transmitter's DIG as the link
-encoder's preferred engine, whether it codes 128b/132b;
+encoder's preferred engine, whether it codes 128b/132b and has sink audio;
 `DcState::map_stream_encoders`): a DIO stream encoder for every stream
 (dcn10_find_first_free_match_stream_enc_for_link: the free preferred DIG,
 else the last free one), and on a 128b/132b DP stream the first free HPO
 DP stream encoder and its link's HPO DP link encoder
 (add_hpo_dp_link_enc_to_ctx: the one the link holds, retained, else a
 free one; one per link however many MST streams ride it), refusing the
-state without one; `remove_stream` releases them as
+state without one. Audio-capable streams also acquire an Azalia endpoint
+with Linux's `find_first_free_audio`, using the DIO stream encoder's engine
+for every transport: the matching free endpoint, otherwise the first free
+endpoint. No free endpoint leaves video enabled without audio. The state
+retains this assignment in `StreamEncoders::audio` and excludes it from
+later streams until removal; `remove_stream` releases these resources as
 resource_remove_otg_master_for_stream_output does. `dc_state(running)`
 records each running stream's (`Modeset::{output, encoders}`), so streams
 lit beside it take what it leaves. The start paths program what was
@@ -576,8 +581,9 @@ leaves and the link is handed to another stream's display
 (`MstLink::displays` maps each payload's stream encoder to its head pipe).
 FRL keeps its single HPO FRL encoder. `tests/dcn401_stream_enc/check.sh`
 compiles Linux's acquisition functions verbatim around the DCN 4.0.1 pool
-(four DIO, one virtual, four HPO DP stream and link encoders) and replays
-2000 add/remove sequences over four links
+(four DIO, one virtual, four HPO DP stream and link encoders, four audio
+endpoints) and replays 2000 add/remove sequences over four links plus
+1280 endpoint selections covering every encoder/endpoint acquisition mask
 (`dcn401_stream_encoder_acquisition_matches_linux`).
 
 Deviations from Linux: the
@@ -3075,7 +3081,7 @@ format full-range RGB, which is what is sent. No Audio InfoFrame or AFMT audio
 clock is enabled and no DCCG frontend symclk route is programmed, as
 `dcn401_enable_stream` does for TMDS.
 
-`start_display_audio(port, true, AudioInfo)` (`Otg::start_hdmi_audio`)
+`start_display_audio(port, true, AudioInfo, endpoint)` (`Otg::start_hdmi_audio`)
 programs the display half of HDMI audio on running video or live scanout.
 For TMDS, in Linux's order: the DCCG audio DTO0 (source = OTG, module = pixel
 clock in 100 Hz, phase 24 MHz; DCN401 has no audio DTBCLK DTO), the stream's AFMT audio
@@ -3089,7 +3095,8 @@ rates limited by `check_audio_bandwidth_hdmi`, AC-3 stream formats, HBR
 capability, lipsync, vendor/product, Linux's default port ids, the monitor
 name), the Audio InfoFrame on line 2 (built by hardware from the codec's
 channel allocation), `az_enable` and unmuted samples. The endpoint is the
-stream's own; a sink without LPCM is `Unsupported`. `stop_display_audio(port, true)`
+stream's acquired `StreamEncoders::audio`, independent of its pipe or HPO
+encoder index; a sink without LPCM is `Unsupported`. `stop_display_audio(port, true)`
 mutes, stops the AFMT clock and Audio InfoFrame and disables the endpoint; HDMI
 video cannot stop while audio runs. Modeset builds `AudioInfo` as
 amdgpu_dm does (`hdmi_audio_info`: SADs at CTA revision 3+, the first 3-byte
@@ -3100,7 +3107,7 @@ The HD-Audio controller and codec that stream samples are separate.
 The same HDMI audio entry points dispatch to native FRL when its video is owned.
 FRL programs AFMT4 (no DIO AFMT clock or APG), IEC 60958 channel status, source
 and channels, the lane-character-clock N/CTS table and automatic hardware ACR,
-then the pipe's Azalia HDMI endpoint and sample enable. Only LPCM is advertised;
+then the acquired Azalia HDMI endpoint and sample enable. Only LPCM is advertised;
 HBR is disabled, and SD timings clamp to two channels. The video must already
 reserve exactly the audio packets-per-line and borrow mode that its retained
 LPCM capabilities require. Inherited samples/ACR or an occupied endpoint reject
@@ -3133,10 +3140,11 @@ existing LPCM path; the endpoint also advertises the sink's compressed SADs
 and HBR, as for SST DP without DSC.
 Register/protocol models are not physical image or audible-output acceptance.
 
-`start_display_audio(port, false, AudioInfo)` / `Otg::start_dp_audio` also dispatch
+`start_display_audio(port, false, AudioInfo, endpoint)` / `Otg::start_dp_audio` also dispatch
 on owned UHBR SST video or its matching scanout. `Status::uhbr_audio` retains
-the APG/Azalia owner. APG instance and endpoint follow the HPO stream, independent
-of OTG/PHY; the input mux selects that endpoint. Startup programs stream ID 0,
+the APG/Azalia owner. The APG instance follows the HPO stream; its input mux
+selects the acquired Azalia endpoint independently of HPO, OTG and PHY indices.
+Startup programs stream ID 0,
 pair-mode channel enables 0xff, APG memory power, a DP ELD (rate-filtered LPCM,
 compressed SADs unfiltered, HBR from the 8-channel 192-kHz probe),
 ASP/ATP/AIP and SDP master. APG reset assertion and deassertion each wait up to
@@ -5217,15 +5225,23 @@ commit_planes_for_stream's order:
   reports its surface in use, the OTG's double-buffered state latched, the
   new MPCCs connected and the freed ones idle; then dcn20_disable_plane on
   each freed pipe (no outstanding request, blank, fetch and DPP clocks
-  off), and with a pipe freed optimize_bandwidth's compbuf increase
+  off), and then on every update optimize_bandwidth's compbuf increase
   (`Engine::increase_compbuf`, dcn401_program_compbuf_segments with
-  safe_to_increase: every DET_SIZE_CURRENT acknowledged, then COMPBUF to
-  the CRB's remaining segments; the requestor record carries it). A slow
-  acknowledgement is logged, never fatal, as REG_WAIT only logs: after a
-  slow DET the grow is skipped and the requested allocation kept
-  (deviation: Linux writes COMPBUF_SIZE anyway; NARF never grows into
-  segments a DET may still hold), and a grown compbuf whose CURRENT is slow
-  is kept (Linux does not wait for it). The records
+  safe_to_increase: when COMPBUF must grow to the CRB's remaining segments
+  (CRB minus every requested DET, independent of the default DET size),
+  every DET_SIZE_CURRENT is waited for as Linux's REG_WAIT(…, 1, 100),
+  about 100 µs each, then COMPBUF grows; with no grow nothing is waited
+  for; the requestor record carries it). A slow acknowledgement is logged,
+  never fatal, as REG_WAIT only logs: after a slow DET the grow is deferred
+  and the requested allocation kept (deviation: Linux writes COMPBUF_SIZE
+  anyway, an overlap its own ASSERT calls an erroneous configuration; NARF
+  never grows into segments a DET may still hold). The deferred grow stays
+  pending (`Otg::compbuf_pending`) and is retried on the next optimize pass
+  (`Otg::retry_compbuf` from `ColdBoot::retry_display_compbuf`, run by
+  every monitor pass's `converge_uclk_pstate`; a hub mid-transaction is
+  tried on the next pass), every display's requestor record then carrying
+  the grown size. A grown compbuf whose CURRENT is slow is kept (Linux does
+  not wait for it). The records
   then name the new planes (surfaces, apertures, DPP/MPC, requestor,
   deadlines, scanout, cursor, the timing's sync) and pass the scanout's
   re-binding checks; the surfaces the update superseded (with their back

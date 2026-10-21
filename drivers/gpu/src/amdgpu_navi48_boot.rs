@@ -2263,6 +2263,22 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Retry a compbuf grow a slow DET acknowledgement deferred
+    /// (`Otg::retry_compbuf`), as Linux's next optimize_bandwidth programs
+    /// the compbuf again. `None` with nothing pending.
+    /// # Safety
+    /// As for `update_live_display_plan`.
+    pub async unsafe fn retry_display_compbuf(&mut self) -> Result<Option<[u8; 5]>, otg::Error> {
+        if self.display_retirement_busy() {
+            return Err(otg::Error::Busy);
+        }
+        let otg = self.otg.as_mut().map_err(|e| *e)?;
+        if !otg.compbuf_pending() {
+            return Ok(None);
+        }
+        // SAFETY: the caller's obligations.
+        unsafe { otg.retry_compbuf() }.await
+    }
     /// Move display `pipe`'s live scanout to the planes `request` under
     /// `plan` without relighting it (`Otg::update_live_planes`: DC's medium
     /// or full plane update under the OTG lock, new pipes enabled off-tree
@@ -3443,7 +3459,8 @@ impl ColdBoot {
                 .await
         }
     }
-    /// Start audio on the port's running HDMI or DP video.
+    /// Start audio on the port's running HDMI or DP video, on the Azalia
+    /// `endpoint` its stream acquired (`StreamEncoders::audio`).
     /// # Safety
     /// Fulfil `Otg::start_hdmi_audio` or `Otg::start_dp_audio` obligations.
     /// For MST also exclude payload changes; the retained manager allocation
@@ -3453,6 +3470,7 @@ impl ColdBoot {
         port: usize,
         hdmi: bool,
         info: otg::AudioInfo,
+        endpoint: u8,
     ) -> Result<otg::DisplayAudio, otg::Error> {
         let path = self.dp_phy_path(port)?;
         let otg = self.otg.as_mut().map_err(|e| *e)?;
@@ -3478,11 +3496,11 @@ impl ColdBoot {
         // SAFETY: matching retained board path/owners; caller's obligations.
         unsafe {
             if hdmi {
-                otg.start_hdmi_audio(path, info).await
+                otg.start_hdmi_audio(path, info, endpoint).await
             } else if let Some(slots) = mst_slots {
-                otg.start_mst_audio(path, info, slots).await
+                otg.start_mst_audio(path, info, slots, endpoint).await
             } else {
-                otg.start_dp_audio(path, info).await
+                otg.start_dp_audio(path, info, endpoint).await
             }
         }
     }

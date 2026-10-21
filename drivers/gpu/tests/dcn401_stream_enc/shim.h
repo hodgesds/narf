@@ -1,6 +1,6 @@
 /* The DC types the stream-encoder acquisition functions cut out of
  * dc_resource.c and dcn10_resource.c read, reduced to their used fields
- * (core_types.h, dc_types.h, grph_object_id.h, hw_shared.h). */
+ * (core_types.h, dc_types.h, grph_object_id.h, hw_shared.h, audio.h). */
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -12,6 +12,7 @@
 #define MAX_PIPES 6
 #define MAX_HPO_DP2_ENCODERS 4
 #define MAX_HPO_DP2_LINK_ENCODERS 4
+#define MAX_AUDIOS 7
 
 enum engine_id {
 	ENGINE_ID_DIGA,
@@ -50,6 +51,12 @@ struct hpo_dp_stream_encoder {
 struct hpo_dp_link_encoder {
 	int inst;
 };
+struct audio {
+	unsigned int inst;
+};
+enum dce_version {
+	DCN_VERSION_4_01 = 0
+};
 struct link_encoder {
 	enum engine_id preferred_engine;
 };
@@ -67,6 +74,7 @@ struct resource_context {
 	bool is_hpo_dp_stream_enc_acquired[MAX_HPO_DP2_ENCODERS];
 	unsigned int hpo_dp_link_enc_to_link_idx[MAX_HPO_DP2_LINK_ENCODERS];
 	int hpo_dp_link_enc_ref_cnts[MAX_HPO_DP2_LINK_ENCODERS];
+	bool is_audio_acquired[MAX_PIPES];
 };
 struct resource_pool {
 	struct stream_encoder *stream_enc[MAX_PIPES * 2];
@@ -75,6 +83,8 @@ struct resource_pool {
 	unsigned int hpo_dp_stream_enc_count;
 	struct hpo_dp_link_encoder *hpo_dp_link_enc[MAX_HPO_DP2_LINK_ENCODERS];
 	unsigned int hpo_dp_link_enc_count;
+	struct audio *audios[MAX_AUDIOS];
+	unsigned int audio_count;
 };
 struct link_resource {
 	struct hpo_dp_link_encoder *hpo_dp_link_enc;

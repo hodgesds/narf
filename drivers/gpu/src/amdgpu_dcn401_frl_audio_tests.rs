@@ -121,8 +121,9 @@ fn dcn401_frl_audio_programs_afmt4_acr_endpoint_and_retires() -> TestResult {
         ] {
             let (mut e, mut fw) = fixture(code, y420, depth);
             let v = e.status.frl_video_running.unwrap();
-            let a = run(e.start_hdmi_audio(path(2), info())).unwrap();
-            assert_eq!(a.endpoint, v.request.pipe);
+            let endpoint = (v.request.pipe + 1) % 4;
+            let a = run(e.start_hdmi_audio(path(2), info(), endpoint)).unwrap();
+            assert_eq!(a.endpoint, endpoint);
             // 8-channel 192-kHz LPCM fits, so the HBR probe passes too.
             assert!(!a.dp && a.hbr);
             assert_eq!(a.info.mode_count, 2);
@@ -152,7 +153,7 @@ fn dcn401_frl_audio_programs_afmt4_acr_endpoint_and_retires() -> TestResult {
                 (0x921, 0x00f0_0000, 0x0020_0000),
                 (0x927, 0xffffff, 0x876543),
                 (0x92a, 0x0400_0001, 0x0400_0001),
-                (0x92d, 7, 1),
+                (0x92d, 7, u32::from(endpoint)),
                 (0x92f, 0x30, 0),
                 (0x8e3, 0x7fff_7000, 2 << 16 | 0x1000),
             ] {
@@ -193,7 +194,7 @@ kernel_test_in!(
 fn dcn401_frl_audio_refuses_unreserved_or_inherited_work() -> TestResult {
     let (mut e, _fw) = fixture(6, false, ColorDepth::Bpc8);
     assert_eq!(
-        run(e.start_hdmi_audio(path(1), info())),
+        run(e.start_hdmi_audio(path(1), info(), e.test_audio_endpoint())),
         Err(Error::Invalid)
     );
     assert!(e.io.writes.is_empty());
@@ -204,20 +205,26 @@ fn dcn401_frl_audio_refuses_unreserved_or_inherited_work() -> TestResult {
         .request
         .audio_packets_line = 1;
     assert_eq!(
-        run(e.start_hdmi_audio(path(2), info())),
+        run(e.start_hdmi_audio(path(2), info(), e.test_audio_endpoint())),
         Err(Error::Invalid)
     );
     assert!(e.io.writes.is_empty());
     for r in [0x92a, 0x8e2] {
         let (mut e, _fw) = fixture(6, false, ColorDepth::Bpc8);
         e.io.inner.inner.regs.insert(frl(r), 1);
-        assert_eq!(run(e.start_hdmi_audio(path(2), info())), Err(Error::Busy));
+        assert_eq!(
+            run(e.start_hdmi_audio(path(2), info(), e.test_audio_endpoint())),
+            Err(Error::Busy)
+        );
         assert!(e.io.writes.is_empty());
         assert!(e.status.frl_audio.is_none());
     }
     let (mut e, _fw) = fixture(6, false, ColorDepth::Bpc8);
     e.io.az.insert((1, 0x54), 0x8000_0000);
-    assert_eq!(run(e.start_hdmi_audio(path(2), info())), Err(Error::Busy));
+    assert_eq!(
+        run(e.start_hdmi_audio(path(2), info(), e.test_audio_endpoint())),
+        Err(Error::Busy)
+    );
     assert_eq!(e.io.writes, [(az(1), 0x54)]);
     assert!(e.status.frl_audio.is_none());
     TestResult::Pass
@@ -232,16 +239,19 @@ fn dcn401_frl_audio_partial_writes_and_late_drift_retain_owners() -> TestResult 
         let (mut e, _fw) = fixture(6, false, ColorDepth::Bpc8);
         e.io.drop_at = Some(frl(r));
         let v = e.status.frl_video_running;
-        assert!(run(e.start_hdmi_audio(path(2), info())).is_err());
+        assert!(run(e.start_hdmi_audio(path(2), info(), e.test_audio_endpoint())).is_err());
         assert!(matches!(e.status.state, State::Failed(_)));
         assert!(e.status.frl_audio.is_some());
         assert_eq!(e.status.frl_video_running, v);
-        assert_eq!(run(e.start_hdmi_audio(path(2), info())), Err(Error::Busy));
+        assert_eq!(
+            run(e.start_hdmi_audio(path(2), info(), e.test_audio_endpoint())),
+            Err(Error::Busy)
+        );
         assert_eq!(run(e.stop_frl_video(path(2))), Err(Error::Busy));
     }
     for r in [0x8f2, 0x92d, 0x91d, 0x8e1] {
         let (mut e, mut fw) = fixture(6, false, ColorDepth::Bpc8);
-        run(e.start_hdmi_audio(path(2), info())).unwrap();
+        run(e.start_hdmi_audio(path(2), info(), e.test_audio_endpoint())).unwrap();
         *e.io.inner.inner.regs.get_mut(&frl(r)).unwrap() ^= if r == 0x91d {
             0x100
         } else if r == 0x8f2 {
@@ -263,7 +273,7 @@ fn dcn401_frl_audio_partial_writes_and_late_drift_retain_owners() -> TestResult 
     }
     for endpoint in [false, true] {
         let (mut e, _fw) = fixture(6, false, ColorDepth::Bpc8);
-        let a = run(e.start_hdmi_audio(path(2), info())).unwrap();
+        let a = run(e.start_hdmi_audio(path(2), info(), e.test_audio_endpoint())).unwrap();
         if endpoint {
             e.io.drop_disable = true;
         } else {
@@ -285,11 +295,11 @@ fn dcn401_frl_audio_shares_wall_clock_and_excludes_endpoint_collisions() -> Test
     let (mut h, mut fw, hc) = hdmi::fixture(0, 0, 0);
     run(h.prepare_hdmi_link(&mut fw, hdmi::path(0), hdmi::link(0, 0), hc)).unwrap();
     run(h.start_hdmi_video(hdmi::path(0), hc)).unwrap();
-    run(h.start_hdmi_audio(hdmi::path(0), hdmi::audio_info())).unwrap();
+    run(h.start_hdmi_audio(hdmi::path(0), hdmi::audio_info(), h.test_audio_endpoint())).unwrap();
     let (mut e, _fw) = fixture(6, false, ColorDepth::Bpc8);
     e.displays.selected = 1;
     e.displays.parked[0] = *h.status;
-    let a = run(e.start_hdmi_audio(path(2), info())).unwrap();
+    let a = run(e.start_hdmi_audio(path(2), info(), e.test_audio_endpoint())).unwrap();
     let bank = e.layout.dio_clock - 0xa0 * 4;
     assert_eq!(e.io.inner.inner.regs[&(bank + 0xab * 4)] & 0x37, 0);
     assert_eq!(e.io.inner.inner.regs[&(bank + 0xad * 4)], 1_485_000);
@@ -305,13 +315,16 @@ fn dcn401_frl_audio_shares_wall_clock_and_excludes_endpoint_collisions() -> Test
         .request
         .pipe = 3;
     e.displays.parked[0] = sibling;
-    run(e.start_hdmi_audio(path(2), info())).unwrap();
+    run(e.start_hdmi_audio(path(2), info(), e.test_audio_endpoint())).unwrap();
     assert_eq!(e.io.inner.inner.regs[&(bank + 0xab * 4)] & 0x30, 0x10);
     run(e.stop_hdmi_audio(path(2))).unwrap();
     assert_eq!(e.io.inner.inner.regs[&(bank + 0xab * 4)] & 0x37, 3);
     e.displays.parked[0].hdmi_audio = Some(a); // endpoint already owned
     let before = e.io.writes.len();
-    assert_eq!(run(e.start_hdmi_audio(path(2), info())), Err(Error::Busy));
+    assert_eq!(
+        run(e.start_hdmi_audio(path(2), info(), e.test_audio_endpoint())),
+        Err(Error::Busy)
+    );
     assert_eq!(e.io.writes.len(), before);
     TestResult::Pass
 }
@@ -352,7 +365,10 @@ fn dcn401_frl_audio_limits_sd_layout_and_rejects_invalid_lpcm() -> TestResult {
             _ => a.modes[0].byte2 = 0xf8,
         }
         let (mut e, _fw) = fixture(6, false, ColorDepth::Bpc8);
-        assert_eq!(run(e.start_hdmi_audio(path(2), a)), Err(Error::Unsupported));
+        assert_eq!(
+            run(e.start_hdmi_audio(path(2), a, e.test_audio_endpoint())),
+            Err(Error::Unsupported)
+        );
         assert!(e.io.writes.is_empty());
         assert!(e.status.frl_audio.is_none());
     }
@@ -393,7 +409,10 @@ fn dcn401_frl_audio_limits_sd_layout_and_rejects_invalid_lpcm() -> TestResult {
     // Scanout state without its retained fetch witness cannot authorize audio.
     let (mut e, _fw) = fixture(6, false, ColorDepth::Bpc8);
     e.status.state = State::ScanoutRunning(1);
-    assert_eq!(run(e.start_hdmi_audio(path(2), raw)), Err(Error::Invalid));
+    assert_eq!(
+        run(e.start_hdmi_audio(path(2), raw, e.test_audio_endpoint())),
+        Err(Error::Invalid)
+    );
     assert!(e.io.writes.is_empty());
     TestResult::Pass
 }

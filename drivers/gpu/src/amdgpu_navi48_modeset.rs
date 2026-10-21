@@ -3547,13 +3547,14 @@ impl ColdBoot {
         unsafe {
             let port = selection.port;
             if let Some(stream) = selection.mst {
+                let mut selection = selection;
                 let scanout = self
-                    .start_mst_stream(port, stream, &selection, pipe, encoders)
+                    .start_mst_stream(port, stream, &mut selection, pipe, encoders)
                     .await?;
                 return Ok((selection, scanout));
             }
             if let Some(rate) = selection.frl {
-                return self.start_frl_link(selection, rate, pipe).await;
+                return self.start_frl_link(selection, rate, pipe, encoders).await;
             }
             if selection.hdmi {
                 if selection.scdc {
@@ -3580,9 +3581,9 @@ impl ColdBoot {
                 self.teardowns
                     .checkpoint_activation(pipe, super::TeardownStep::Scanout);
                 // As Linux's post-enable: audio after the stream runs.
-                if let Some(info) = selection.audio {
-                    self.start_display_audio(port, true, info).await?;
-                }
+                let mut selection = selection;
+                self.start_stream_audio(&mut selection, true, encoders)
+                    .await?;
                 return Ok((selection, scanout));
             }
             if selection.uhbr() {
@@ -3657,10 +3658,44 @@ impl ColdBoot {
             let scanout = self.start_display_scanout(pipe).await?;
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Scanout);
-            if let Some(info) = selection.audio {
-                self.start_display_audio(port, false, info).await?;
-            }
+            self.start_stream_audio(&mut selection, false, encoders)
+                .await?;
             Ok((selection, scanout))
+        }
+    }
+    /// Audio on a stream once it runs (Linux's post-enable), on the Azalia
+    /// endpoint it acquired (`encoders.audio`, find_first_free_audio of its
+    /// DIO stream encoder). A stream that acquired none, or whose sink's
+    /// modes leave nothing the endpoint can carry (refused before any
+    /// write), lights without audio, as Linux lights a stream without
+    /// stream_res.audio; `selection.audio` then records none, so teardown
+    /// stops no audio.
+    /// # Safety
+    /// As for `start_display_audio`.
+    pub(super) async unsafe fn start_stream_audio(
+        &mut self,
+        selection: &mut Selection,
+        hdmi: bool,
+        encoders: StreamEncoders,
+    ) -> Result<(), ModesetError> {
+        let Some(info) = selection.audio else {
+            return Ok(());
+        };
+        let Some(endpoint) = encoders.audio else {
+            selection.audio = None;
+            return Ok(());
+        };
+        // SAFETY: the caller's obligations.
+        match unsafe {
+            self.start_display_audio(selection.port, hdmi, info, endpoint)
+                .await
+        } {
+            Ok(_) => Ok(()),
+            Err(otg::Error::Unsupported) => {
+                selection.audio = None;
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
         }
     }
     /// dp_verify_link_cap after every carrying setting was refused: train
@@ -3739,8 +3774,9 @@ impl ColdBoot {
         self.verified_links.push(link);
     }
     /// What encoder acquisition reads of `s`'s output: its board port as the
-    /// link, its transmitter's DIG as the preferred engine, and whether it
-    /// is a 128b/132b DP stream.
+    /// link, its transmitter's DIG as the preferred engine, whether it is a
+    /// 128b/132b DP stream, and whether it carries audio (every DP and HDMI
+    /// signal is audio capable; the sink declared audio modes).
     pub(super) fn stream_output(&self, s: &Selection) -> Result<StreamOutput, ModesetError> {
         let path = self
             .display_paths()
@@ -3752,6 +3788,7 @@ impl ColdBoot {
             link: u8::try_from(s.port).map_err(|_| ModesetError::NoSink)?,
             preferred_engine: path.transmitter,
             hpo_dp: !s.hdmi && s.uhbr(),
+            audio: s.audio.is_some(),
         })
     }
     /// The 128b/132b half of `start_link`: train down Linux's fallback
@@ -3843,9 +3880,8 @@ impl ColdBoot {
                     selection.dsc.as_ref(),
                 )
             });
-            if let Some(info) = selection.audio {
-                self.start_display_audio(port, false, info).await?;
-            }
+            self.start_stream_audio(&mut selection, false, encoders)
+                .await?;
             Ok((selection, scanout))
         }
     }
@@ -3859,6 +3895,7 @@ impl ColdBoot {
         selection: Selection,
         rate: FrlRate,
         pipe: u8,
+        encoders: StreamEncoders,
     ) -> Result<(Selection, otg::ScanoutRunning), ModesetError> {
         let port = selection.port;
         let bpc = depth_bpc(selection.depth);
@@ -3892,16 +3929,13 @@ impl ColdBoot {
             let scanout = self.start_display_scanout(pipe).await?;
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Scanout);
-            if let Some(info) = selection.audio {
-                self.start_display_audio(port, true, info).await?;
-            }
-            Ok((
-                Selection {
-                    frl: Some(trained),
-                    ..selection
-                },
-                scanout,
-            ))
+            let mut selection = Selection {
+                frl: Some(trained),
+                ..selection
+            };
+            self.start_stream_audio(&mut selection, true, encoders)
+                .await?;
+            Ok((selection, scanout))
         }
     }
     /// Return an FRL sink to legacy TMDS after video stopped: rate/update
@@ -4355,6 +4389,13 @@ impl ColdBoot {
         let mut running: Vec<Modeset> = self.display_modesets().into_iter().flatten().collect();
         if self.teardowns.check_idle().is_err() {
             return Ok(Vec::new());
+        }
+        // optimize_bandwidth's compbuf grow a slow DET deferred (best
+        // effort: a hub mid-transaction is tried on the next pass).
+        // SAFETY: the caller's obligations.
+        match unsafe { self.retry_display_compbuf() }.await {
+            Ok(_) | Err(otg::Error::Busy) => {}
+            Err(e) => return Err(e.into()),
         }
         if running.is_empty() {
             // The last display left: dc_commit_streams with no stream,

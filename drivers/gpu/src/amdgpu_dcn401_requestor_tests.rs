@@ -11,6 +11,7 @@ struct RequestIo {
     delay: [u8; 5],
     stall: u8,
     pipe: u8,
+    reads: u32,
 }
 impl RequestIo {
     fn fake(&mut self) -> &mut Fake {
@@ -19,6 +20,7 @@ impl RequestIo {
 }
 impl Io for RequestIo {
     fn read(&mut self, at: u64) -> u32 {
+        self.reads += 1;
         for index in 0..5 {
             if at == crb(index) && self.stall & (1 << index) == 0 {
                 if let Some(size) = self.pending[index] {
@@ -120,6 +122,7 @@ fn ready_requests_with(
             delay: [2; 5],
             stall: 0,
             pipe: p,
+            reads: 0,
         },
         authority: e.authority,
         layout: e.layout,
@@ -517,6 +520,7 @@ fn overlay_chain(overlays: &[u8]) -> (Vec<u32>, Pool, Engine<RequestIo>, Surface
             delay: [1; 5],
             stall: 0,
             pipe: 0,
+            reads: 0,
         },
         authority: e.authority,
         layout: e.layout,
@@ -604,9 +608,10 @@ kernel_test_in!(
 );
 
 /// dcn401_program_compbuf_segments: a DET or compbuf acknowledgement that
-/// does not arrive is logged by REG_WAIT, never an error. NARF skips the
+/// does not arrive is logged by REG_WAIT, never an error. NARF defers the
 /// grow after a slow DET (so the compbuf never takes segments a DET may
-/// still hold) and keeps a grown compbuf whose CURRENT is slow.
+/// still hold), keeps it pending for the next optimize pass, and keeps a
+/// grown compbuf whose CURRENT is slow. With no grow nothing is waited for.
 fn dcn401_slow_compbuf_or_det_ack_is_not_fatal() -> TestResult {
     let (_backing, _pool, mut e, _surfaces, _clock) = ready_requests(2, [1, 5, 5, 5, 5]);
     // DET2 freed: requested 0, CURRENT still 5 and stuck.
@@ -619,13 +624,52 @@ fn dcn401_slow_compbuf_or_det_ack_is_not_fatal() -> TestResult {
     {
         return TestResult::Fail("slow DET ack fatal, or the compbuf grew over it");
     }
-    // DET2 acknowledged; the compbuf's own CURRENT is slow.
+    if !e.displays.compbuf_pending {
+        return TestResult::Fail("a deferred grow is not left pending");
+    }
+    // Still slow: the retry keeps it pending and writes nothing.
+    if run(e.retry_compbuf()) != Ok(Some([1, 5, 5, 0, 5]))
+        || e.io.fake().writes.len() != writes
+        || !e.displays.compbuf_pending
+    {
+        return TestResult::Fail("a retry grew over a held DET");
+    }
+    // DET2 acknowledged; the next optimize pass grows the compbuf, whose
+    // own CURRENT is slow.
     e.io.fake().regs.insert(crb(3), 0x4000_0000);
     e.io.stall = 1;
-    if run(e.increase_compbuf()) != Ok([6, 5, 5, 0, 5])
+    e.status.requestor = Some(RequestorApplied {
+        pipe: 2,
+        surface: e.status.surfaces[2].expect("staged surface"),
+        overlays: [None; MAX_OVERLAYS],
+        det_bytes: 5 << 16,
+        compbuf_bytes: 1 << 16,
+        pixel_chunk_bytes: 8192,
+        minimum_chunk_bytes: 1024,
+    });
+    if run(e.retry_compbuf()) != Ok(Some([6, 5, 5, 0, 5]))
         || e.io.fake().regs[&crb(0)] & 0x1f1f != 0x106
+        || e.displays.compbuf_pending
     {
-        return TestResult::Fail("slow compbuf ack fatal or the grow not written");
+        return TestResult::Fail("slow compbuf ack fatal or the retried grow not written");
+    }
+    if e.status.requestor.map(|r| r.compbuf_bytes) != Some(6 << 16) {
+        return TestResult::Fail("the grown compbuf is not recorded");
+    }
+    if run(e.retry_compbuf()) != Ok(None) {
+        return TestResult::Fail("a retry with nothing pending");
+    }
+    // No grow needed: a DET whose CURRENT is slow is not waited for (Linux
+    // waits only when growing) and nothing is pending.
+    e.io.fake().regs.insert(crb(0), 0x4000_0000 | 6 << 8 | 6);
+    e.io.fake().regs.insert(crb(4), 0x4000_0000 | 5);
+    e.io.stall = 1 << 4;
+    let reads = e.io.reads;
+    if run(e.increase_compbuf()) != Ok([6, 5, 5, 0, 5])
+        || e.displays.compbuf_pending
+        || e.io.reads - reads != 5
+    {
+        return TestResult::Fail("waited for a DET with no compbuf grow");
     }
     TestResult::Pass
 }

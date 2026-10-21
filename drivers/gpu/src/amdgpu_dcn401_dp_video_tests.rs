@@ -789,6 +789,8 @@ impl Io for AudioIo {
 /// packets to audio; video cannot stop under it; stop clears it all.
 fn dcn401_dp_audio_programs_dto1_secondary_packets_and_endpoint_like_linux() -> TestResult {
     let (p, stream, pipe) = (1, 2, 3);
+    // The acquired endpoint can differ from the PHY, DIO encoder and OTG.
+    let endpoint = 0;
     let (mut e, mut io, c) = fixture(p, stream, pipe, ColorDepth::Bpc8);
     start(&mut e, &mut io, c);
     let mut e = Engine {
@@ -846,7 +848,7 @@ fn dcn401_dp_audio_programs_dto1_secondary_packets_and_endpoint_like_linux() -> 
         frame_after: 0,
     };
     let before = e.dp_video_verify_scanout(live);
-    let a = run(e.start_dp_audio(path(p), info)).unwrap();
+    let a = run(e.start_dp_audio(path(p), info, endpoint)).unwrap();
     let r = |e: &mut Engine<AudioIo>, at| e.io.inner.fake().regs.get(&at).copied().unwrap_or(0);
     let bank1 = |reg: u64| (0x16200 + reg) * 4;
     // DTO1 = DPREFCLK (720 MHz) in 100 Hz, phase 24 MHz; DTO select 1.
@@ -857,15 +859,15 @@ fn dcn401_dp_audio_programs_dto1_secondary_packets_and_endpoint_like_linux() -> 
         return TestResult::Fail("DP audio DTO1");
     }
     for (reg, mask, value) in [
-        (0x2141, 0x1ff1_1111, 0x1111),         // ASP, ATP, AIP, stream enable
-        (0x2147, u32::MAX, 0x8000),            // audio N default
-        (0x214b, u32::MAX, 1),                 // auto-calculated timestamps
-        (0x20ba, 1, 1),                        // AFMT audio clock
-        (0x2085, u32::MAX, u32::from(stream)), // endpoint = stream
-        (0x2075, 0x1000_ff01, 0x3700),         // FL FR LFE RL RR enabled
-        (0x2078, 0x3000_0000, 0),              // clock accuracy level II
-        (0x2082, 0x0400_0001, 0x0400_0001),    // CS update, samples sent
-        (0x2083, 0x80, 0x80),                  // AUDIO_INFO latched
+        (0x2141, 0x1ff1_1111, 0x1111),           // ASP, ATP, AIP, stream enable
+        (0x2147, u32::MAX, 0x8000),              // audio N default
+        (0x214b, u32::MAX, 1),                   // auto-calculated timestamps
+        (0x20ba, 1, 1),                          // AFMT audio clock
+        (0x2085, u32::MAX, u32::from(endpoint)), // acquired audio source
+        (0x2075, 0x1000_ff01, 0x3700),           // FL FR LFE RL RR enabled
+        (0x2078, 0x3000_0000, 0),                // clock accuracy level II
+        (0x2082, 0x0400_0001, 0x0400_0001),      // CS update, samples sent
+        (0x2083, 0x80, 0x80),                    // AUDIO_INFO latched
         (0x2087, 0x30, 0),
         (0x20a3, 0x30, 0),   // no HDMI Audio InfoFrame
         (0x20a1, 0x1000, 0), // no HDMI ACR
@@ -874,14 +876,14 @@ fn dcn401_dp_audio_programs_dto1_secondary_packets_and_endpoint_like_linux() -> 
             return TestResult::Fail("DP encoder audio");
         }
     }
-    let az = |e: &Engine<AudioIo>, i: u32| e.io.az.get(&(stream, i)).copied();
+    let az = |e: &Engine<AudioIo>, i: u32| e.io.az.get(&(endpoint, i)).copied();
     if az(&e, 0x54) != Some(0x8000_0000)
         || az(&e, 0x25).map(|v| v & 0x37f7f) != Some(0x2_000b)
         || az(&e, 0x28) != Some(1 | 0x700 | 0x7 << 16 | 0x07 << 24)
         || az(&e, 0x38).map(|v| v & 1) != Some(1)
         || az(&e, 0x3a) != Some(0x0f99_4c2d)
         || !a.dp
-        || a.endpoint != stream
+        || a.endpoint != endpoint
     {
         return TestResult::Fail("DP Azalia endpoint");
     }
@@ -895,7 +897,10 @@ fn dcn401_dp_audio_programs_dto1_secondary_packets_and_endpoint_like_linux() -> 
         return TestResult::Fail("foreign secondary packets accepted");
     }
     e.status.dp_audio = owner;
-    assert_eq!(run(e.start_dp_audio(path(p), info)), Err(Error::Busy));
+    assert_eq!(
+        run(e.start_dp_audio(path(p), info, e.test_audio_endpoint())),
+        Err(Error::Busy)
+    );
     if r(&mut e, dio(stream, 0x2141)) & 0x1111 != 0x1111 {
         return TestResult::Fail("second start disturbed audio");
     }
@@ -934,7 +939,10 @@ fn dcn401_dp_video_stops_only_after_its_audio() -> TestResult {
     assert_eq!(run(e.stop_dp_video(&mut io, path(p))), Err(Error::Busy));
     e.status.dp_audio = None;
     run(e.stop_dp_video(&mut io, path(p))).unwrap();
-    assert_eq!(run(e.start_dp_audio(path(p), info)), Err(Error::Busy));
+    assert_eq!(
+        run(e.start_dp_audio(path(p), info, e.test_audio_endpoint())),
+        Err(Error::Busy)
+    );
     TestResult::Pass
 }
 kernel_test_in!(
@@ -953,7 +961,7 @@ fn hdmi_audio_display() -> alloc::boxed::Box<Status> {
     let (mut h, mut fw, hc) = hdmi::fixture(0, 0, 0);
     run(h.prepare_hdmi_link(&mut fw, hdmi::path(0), hdmi::link(0, 0), hc)).unwrap();
     run(h.start_hdmi_video(hdmi::path(0), hc)).unwrap();
-    run(h.start_hdmi_audio(hdmi::path(0), hdmi::audio_info())).unwrap();
+    run(h.start_hdmi_audio(hdmi::path(0), hdmi::audio_info(), h.test_audio_endpoint())).unwrap();
     alloc::boxed::Box::new(*h.status)
 }
 fn dcn401_dp_audio_leaves_the_wall_clock_to_hdmi_audio() -> TestResult {
@@ -980,7 +988,7 @@ fn dcn401_dp_audio_leaves_the_wall_clock_to_hdmi_audio() -> TestResult {
         e.io.inner.fake().regs.insert(bank1(reg), value);
     }
     let r = |e: &mut Engine<AudioIo>, at| e.io.inner.fake().regs.get(&at).copied().unwrap_or(0);
-    run(e.start_dp_audio(path(p), hdmi::audio_info())).unwrap();
+    run(e.start_dp_audio(path(p), hdmi::audio_info(), e.test_audio_endpoint())).unwrap();
     // DTO0 from the HDMI stream's 148.5 MHz, sourced by pipe 0; DTO1 untouched.
     if r(&mut e, bank1(0xab)) & 0x10_0037 != 0
         || r(&mut e, bank1(0xad)) != 1_485_000
@@ -996,7 +1004,7 @@ fn dcn401_dp_audio_leaves_the_wall_clock_to_hdmi_audio() -> TestResult {
     if r(&mut e, bank1(0xad)) != 1_485_000 {
         return TestResult::Fail("idle wall clock reprogrammed");
     }
-    run(e.start_dp_audio(path(p), hdmi::audio_info())).unwrap();
+    run(e.start_dp_audio(path(p), hdmi::audio_info(), e.test_audio_endpoint())).unwrap();
     if r(&mut e, bank1(0xab)) & 0x10_0030 != 0x10_0010 || r(&mut e, bank1(0xaf)) != 7_200_000 {
         return TestResult::Fail("DP audio alone uses DTO1");
     }
@@ -1115,7 +1123,7 @@ fn dcn401_dp_audio_shares_dsc_pps_without_stopping_its_packets() -> TestResult {
         let before = packet_state(&mut e);
         e.io.inner.fake().writes.clear();
         for _ in 0..2 {
-            let audio = run(e.start_dp_audio(path(2), info)).unwrap();
+            let audio = run(e.start_dp_audio(path(2), info, e.test_audio_endpoint())).unwrap();
             assert!(audio.dp);
             assert_eq!(packet_state(&mut e), before);
             assert_eq!(run(e.stop_dp_video(&mut io, path(2))), Err(Error::Busy));
@@ -1168,7 +1176,7 @@ fn dcn401_dp_audio_requires_fresh_pps_witnesses_and_quiet_audio() -> TestResult 
         e.io.inner.fake().regs.insert(at, saved & !mask);
         let writes = e.io.inner.fake().writes.len();
         assert_eq!(
-            run(e.start_dp_audio(path(2), info)),
+            run(e.start_dp_audio(path(2), info, e.test_audio_endpoint())),
             Err(Error::Readback(at))
         );
         assert_eq!(e.io.inner.fake().writes.len(), writes);
@@ -1180,12 +1188,15 @@ fn dcn401_dp_audio_requires_fresh_pps_witnesses_and_quiet_audio() -> TestResult 
         let saved = e.io.inner.fake().regs.get(&at).copied().unwrap_or(0);
         e.io.inner.fake().regs.insert(at, saved | mask);
         let writes = e.io.inner.fake().writes.len();
-        assert_eq!(run(e.start_dp_audio(path(2), info)), Err(Error::Busy));
+        assert_eq!(
+            run(e.start_dp_audio(path(2), info, e.test_audio_endpoint())),
+            Err(Error::Busy)
+        );
         assert_eq!(e.io.inner.fake().writes.len(), writes);
         assert!(e.status.dp_audio.is_none());
         e.io.inner.fake().regs.insert(at, saved);
     }
-    run(e.start_dp_audio(path(2), info)).unwrap();
+    run(e.start_dp_audio(path(2), info, e.test_audio_endpoint())).unwrap();
     let at = dio(1, 0x2177);
     let saved = e.io.inner.fake().regs[&at];
     e.io.inner.fake().regs.insert(at, saved & !0x10);

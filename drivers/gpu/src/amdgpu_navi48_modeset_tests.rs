@@ -25,6 +25,7 @@ fn completed_modeset(pipe: u8) -> Modeset {
             link: 0,
             preferred_engine: pipe,
             hpo_dp: false,
+            audio: false,
         },
         encoders: StreamEncoders {
             stream_enc: pipe,

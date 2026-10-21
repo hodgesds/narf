@@ -11,6 +11,9 @@ const HUBP_UNDERFLOW_STATUS: u32 = 0x7000_0000;
 pub(super) const SEGMENTS: u8 = 21; // DCN4_01_CRB_SIZE_KB / DCN4_01_CRB_SEGMENT_SIZE_KB
 pub(super) const DET_SEGMENTS: u8 = 5; // DCN4_01_DEFAULT_DET_SIZE = 320 KiB
 pub(super) const SEGMENT_BYTES: u32 = 65536;
+/// dcn401_program_compbuf_segments' DET waits before a compbuf grow:
+/// REG_WAIT(DET{n}_SIZE_CURRENT, 1, 100), 100 polls 1 us apart.
+const DET_GROW_WAIT_US: u64 = 100;
 
 /// Overlay planes one display may stack above its primary: DCN401's
 /// max_slave_planes, as amdgpu_dm creates its overlay planes.
@@ -120,54 +123,90 @@ impl<I: Io> Engine<I> {
         self.update(l.crb(usize::from(l.inst(q)) + 1), 0x1f, u32::from(segments))
     }
     /// dcn401_program_compbuf_segments(safe_to_increase = true), as
-    /// optimize_bandwidth runs it: wait until every DET's DET_SIZE_CURRENT
-    /// equals its request (each wait bounded like
-    /// dcn401_wait_for_det_update), then grow the compressed buffer to the
-    /// rest of the CRB (DML's compbuf_size: CRB minus every DET). A
-    /// compbuf already that size or larger is left (only increases here).
+    /// optimize_bandwidth runs it: the compressed buffer grows to the rest
+    /// of the CRB (DML's compbuf_size: CRB minus every requested DET). A
+    /// compbuf already that size or larger is left (only increases here),
+    /// with no wait, as Linux, whose DET waits run only for a grow.
+    /// Before a grow every DET's DET_SIZE_CURRENT must equal its request,
+    /// each wait bounded as Linux's REG_WAIT(DET{n}_SIZE_CURRENT, 1, 100).
     /// Returns the allocation.
     ///
     /// A slow acknowledgement is not an error: Linux's REG_WAIT only logs
-    /// "REG_WAIT timeout". After a DET wait times out the grow is skipped
-    /// (Linux writes COMPBUF_SIZE anyway; NARF never grows the compbuf into
-    /// segments a DET may still hold) and the requested allocation is
-    /// returned. A grown compbuf whose COMPBUF_SIZE_CURRENT is slow is
+    /// "REG_WAIT timeout". After a DET wait times out the grow is deferred:
+    /// Linux writes COMPBUF_SIZE anyway, an overlap its own ASSERT calls an
+    /// erroneous configuration, so NARF never grows the compbuf into
+    /// segments a DET may still hold. The grow stays pending
+    /// (`compbuf_pending`) and `retry_compbuf` tries it again on the next
+    /// optimize pass. A grown compbuf whose COMPBUF_SIZE_CURRENT is slow is
     /// logged and kept, as Linux, which does not wait for it at all.
     pub(in crate::amdgpu_dcn401_otg) async fn increase_compbuf(
         &mut self,
     ) -> Result<[u8; 5], Error> {
+        let mut requested = [0; 5];
+        for (index, size) in requested.iter_mut().enumerate() {
+            *size = (self.read(self.layout.crb(index))? & 0x1f) as u8;
+        }
+        let dets: u32 = requested[1..].iter().map(|&n| u32::from(n)).sum();
+        let target = u32::from(SEGMENTS)
+            .checked_sub(dets)
+            .ok_or(Error::Invalid)? as u8;
+        if target <= requested[0] {
+            self.displays.compbuf_pending = false;
+            return Ok(requested);
+        }
         let mut acked = true;
-        for index in 1..5 {
+        for (index, &segments) in requested.iter().enumerate().skip(1) {
             let at = self.layout.crb(index);
-            let want = self.read(at)? & 0x1f;
-            if !self.slow_ack(at, want).await? {
+            if !self
+                .slow_ack(at, u32::from(segments), DET_GROW_WAIT_US)
+                .await?
+            {
                 acked = false;
             }
         }
         if !acked {
-            let mut requested = [0; 5];
-            for (index, size) in requested.iter_mut().enumerate() {
-                *size = (self.read(self.layout.crb(index))? & 0x1f) as u8;
-            }
+            self.displays.compbuf_pending = true;
             return Ok(requested);
         }
         let mut sizes = self.crb_stable()?;
-        let dets: u32 = sizes[1..].iter().map(|&n| u32::from(n)).sum();
-        let target = u32::from(SEGMENTS)
-            .checked_sub(dets)
-            .ok_or(Error::Invalid)? as u8;
-        if target > sizes[0] {
-            let at = self.layout.crb(0);
-            self.update(at, 0x1f, u32::from(target))?;
-            self.slow_ack(at, u32::from(target)).await?;
-            sizes[0] = target;
+        if sizes[1..] != requested[1..] {
+            self.displays.compbuf_pending = true;
+            return Ok(requested);
         }
+        let at = self.layout.crb(0);
+        self.update(at, 0x1f, u32::from(target))?;
+        self.slow_ack(at, u32::from(target), 100_000).await?;
+        sizes[0] = target;
+        self.displays.compbuf_pending = false;
         Ok(sizes)
     }
-    /// Wait for a CRB register's CURRENT field (bits 12:8) to reach `want`;
-    /// `false` after logging a timeout, as generic_reg_wait does.
-    async fn slow_ack(&mut self, at: u64, want: u32) -> Result<bool, Error> {
-        match self.wait(at, 0x1f00, want << 8, 100_000).await {
+    /// The compbuf grow a slow DET acknowledgement deferred, tried again
+    /// (`increase_compbuf`): Linux's next optimize_bandwidth programs the
+    /// compbuf again. On a grow every display's requestor record carries
+    /// the new size. `None` when no grow was pending.
+    pub(in crate::amdgpu_dcn401_otg) async fn retry_compbuf(
+        &mut self,
+    ) -> Result<Option<[u8; 5]>, Error> {
+        if !self.displays.compbuf_pending {
+            return Ok(None);
+        }
+        let crb = self.increase_compbuf().await?;
+        if !self.displays.compbuf_pending {
+            let bytes = u32::from(crb[0]) * SEGMENT_BYTES;
+            let selected = &mut *self.status;
+            for st in core::iter::once(selected).chain(self.displays.parked.iter_mut()) {
+                if let Some(r) = st.requestor.as_mut() {
+                    r.compbuf_bytes = bytes;
+                }
+            }
+        }
+        Ok(Some(crb))
+    }
+    /// Wait for a CRB register's CURRENT field (bits 12:8) to reach `want`
+    /// for up to `us`; `false` after logging a timeout, as generic_reg_wait
+    /// does.
+    async fn slow_ack(&mut self, at: u64, want: u32, us: u64) -> Result<bool, Error> {
+        match self.wait(at, 0x1f00, want << 8, us).await {
             Ok(()) => Ok(true),
             Err(Error::Timeout(_)) => {
                 use core::fmt::Write as _;
@@ -438,6 +477,21 @@ impl Surfaces {
     }
 }
 impl Otg {
+    /// Whether a compbuf grow a slow DET acknowledgement deferred is still
+    /// pending (`retry_compbuf`).
+    pub fn compbuf_pending(&self) -> bool {
+        self.0.displays.compbuf_pending
+    }
+    /// The next optimize pass's dcn401_program_compbuf_segments for a grow
+    /// a slow DET acknowledgement deferred: once every DET acknowledged its
+    /// request the compbuf takes the rest of the CRB. `None` with nothing
+    /// pending; the allocation otherwise (the grow still pending while a
+    /// DET is slow).
+    /// # Safety
+    /// As for `prepare_requestor`, between display operations.
+    pub async unsafe fn retry_compbuf(&mut self) -> Result<Option<[u8; 5]>, Error> {
+        self.0.retry_compbuf().await
+    }
     /// Stage bounded physical-RGB requests and native default DET/compbuf sizes
     /// for one pipe. Deadlines and watermarks are still required before fetching.
     /// # Safety

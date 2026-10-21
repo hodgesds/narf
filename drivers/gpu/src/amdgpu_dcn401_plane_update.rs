@@ -945,11 +945,11 @@ impl Surfaces {
             }
             // optimize_bandwidth's compbuf increase into the freed DETs
             // (dcn401_program_compbuf_segments with safe_to_increase, after
-            // every DET_SIZE_CURRENT acknowledged its request).
-            if disabled != 0 {
-                let crb = e.increase_compbuf().await?;
-                e.status.requestor = Some(requestor(applied[0], new_overlays, crb[0]));
-            }
+            // every DET_SIZE_CURRENT acknowledged its request), run on every
+            // update as Linux; a grow a slow DET deferred is retried here
+            // and by `retry_compbuf`.
+            let crb = e.increase_compbuf().await?;
+            e.status.requestor = Some(requestor(applied[0], new_overlays, crb[0]));
             // Every record of the timing carries the new sync.
             e.status.rebind_timing(pipe, |t| t.request.sync = plan.sync);
             let deadlines = DeadlinesApplied {

@@ -2078,7 +2078,7 @@ impl ColdBoot {
         &mut self,
         port: usize,
         stream: modeset::MstStream,
-        selection: &Selection,
+        selection: &mut Selection,
         pipe: u8,
         encoders: modeset::StreamEncoders,
     ) -> Result<otg::ScanoutRunning, ModesetError> {
@@ -2161,9 +2161,7 @@ impl ColdBoot {
             let scanout = self.start_display_scanout(pipe).await?;
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Scanout);
-            if let Some(info) = selection.audio {
-                self.start_display_audio(port, false, info).await?;
-            }
+            self.start_stream_audio(selection, false, encoders).await?;
             Ok(scanout)
         }
     }

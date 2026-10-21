@@ -1179,7 +1179,9 @@ fn unwind_stage(c: &mut Chain, stage: u32) {
             info.modes[0].format = 2; // AC3 only, no supported LPCM
             info.mode_count = 1;
             assert_eq!(
-                run(c.e.start_hdmi_audio(path(0), info)),
+                run(c
+                    .e
+                    .start_hdmi_audio(path(0), info, c.e.test_audio_endpoint())),
                 Err(Error::Unsupported)
             );
             assert_eq!(c.e.status.state, State::ScanoutRunning(0));

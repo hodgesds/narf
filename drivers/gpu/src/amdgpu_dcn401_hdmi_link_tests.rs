@@ -800,15 +800,17 @@ pub(in crate::amdgpu_dcn401_otg::tests) fn audio_info() -> AudioInfo {
 
 fn dcn401_hdmi_audio_programs_dto_acr_afmt_and_the_endpoint_like_linux() -> TestResult {
     let (p, stream, pipe) = (1, 2, 3);
+    // The acquired endpoint can differ from the PHY, DIO encoder and OTG.
+    let endpoint = 0;
     let (mut e, mut fw, c) = fixture(p, stream, pipe);
     run(e.prepare_hdmi_link(&mut fw, path(p), link(stream, pipe), c)).unwrap();
     // Audio follows running video, as Linux's post-enable does.
     assert_eq!(
-        run(e.start_hdmi_audio(path(p), audio_info())),
+        run(e.start_hdmi_audio(path(p), audio_info(), e.test_audio_endpoint())),
         Err(Error::Busy)
     );
     run(e.start_hdmi_video(path(p), c)).unwrap();
-    let a = run(e.start_hdmi_audio(path(p), audio_info())).unwrap();
+    let a = run(e.start_hdmi_audio(path(p), audio_info(), endpoint)).unwrap();
     let r = |e: &Engine<TmdsIo>, at| e.io.inner.regs.get(&at).copied().unwrap_or(0);
     let bank1 = |reg: u64| (0x16200 + reg) * 4;
     // DTO0 from the pixel clock, phase 24 MHz, sourced by this OTG.
@@ -832,11 +834,11 @@ fn dcn401_hdmi_audio_programs_dto_acr_afmt_and_the_endpoint_like_linux() -> Test
         }
     }
     for (reg, mask, value) in [
-        (0x20ba, 1, 1),                        // AFMT audio clock
-        (0x20a1, 0x8000_1100, 0x1000),         // ACR auto, HW CTS
-        (0x20a0, 0x30, 0x10),                  // audio delay
-        (0x2085, u32::MAX, u32::from(stream)), // endpoint = stream
-        (0x2075, 0x1000_ff01, 0x3700),         // FL FR LFE RL RR enabled
+        (0x20ba, 1, 1),                          // AFMT audio clock
+        (0x20a1, 0x8000_1100, 0x1000),           // ACR auto, HW CTS
+        (0x20a0, 0x30, 0x10),                    // audio delay
+        (0x2085, u32::MAX, u32::from(endpoint)), // acquired audio source
+        (0x2075, 0x1000_ff01, 0x3700),           // FL FR LFE RL RR enabled
         (0x2078, 0x30f0_0000, 0x0010_0000),
         (0x2079, 0x00f0_0000, 0x0020_0000),
         (0x207f, 0x00ff_ffff, 0x0087_6543),
@@ -849,7 +851,7 @@ fn dcn401_hdmi_audio_programs_dto_acr_afmt_and_the_endpoint_like_linux() -> Test
             return TestResult::Fail("encoder audio");
         }
     }
-    let az = |e: &Engine<TmdsIo>, i: u32| e.io.az.get(&(stream, i)).copied();
+    let az = |e: &Engine<TmdsIo>, i: u32| e.io.az.get(&(endpoint, i)).copied();
     if az(&e, 0x54) != Some(0x8000_0000)
         || az(&e, 0x25).map(|v| v & 0x37f7f) != Some(0x1_000b)
         || az(&e, 0x28) != Some(1 | 0x700 | 0x7 << 16 | 0x07 << 24)
@@ -862,7 +864,7 @@ fn dcn401_hdmi_audio_programs_dto_acr_afmt_and_the_endpoint_like_linux() -> Test
         || az(&e, 0x3c) != Some(0x5558_859e)
         || az(&e, 0x3e) != Some(u32::from_le_bytes(*b"TV\0\0"))
         || r(&e, BASE + 0x40c * 4) != 5 // AC-3 present
-        || a.endpoint != stream
+        || a.endpoint != endpoint
     {
         return TestResult::Fail("Azalia endpoint");
     }
@@ -876,7 +878,7 @@ fn dcn401_hdmi_audio_programs_dto_acr_afmt_and_the_endpoint_like_linux() -> Test
     }
     e.io.inner.regs.insert(fe, v);
     assert_eq!(
-        run(e.start_hdmi_audio(path(p), audio_info())),
+        run(e.start_hdmi_audio(path(p), audio_info(), e.test_audio_endpoint())),
         Err(Error::Busy)
     );
     assert_eq!(run(e.stop_hdmi_video(path(p))), Err(Error::Busy));
@@ -937,11 +939,14 @@ fn dcn401_hdmi_audio_tables_bandwidth_and_refusals() -> TestResult {
     info.modes[0] = info.modes[1];
     info.mode_count = 1;
     assert_eq!(
-        run(e.start_hdmi_audio(path(0), info)),
+        run(e.start_hdmi_audio(path(0), info, e.test_audio_endpoint())),
         Err(Error::Unsupported)
     );
     info.mode_count = 0;
-    assert_eq!(run(e.start_hdmi_audio(path(0), info)), Err(Error::Invalid));
+    assert_eq!(
+        run(e.start_hdmi_audio(path(0), info, e.test_audio_endpoint())),
+        Err(Error::Invalid)
+    );
     if e.status.hdmi_audio.is_some() || e.status.state != State::HdmiVideoRunning(0) {
         return TestResult::Fail("refusal changed state");
     }

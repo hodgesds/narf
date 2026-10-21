@@ -326,6 +326,15 @@ and pipe-harvesting differences (`amdgpu_rdna4`, checked against Linux by
 `drivers/gpu/tests/rdna4_family/check.sh`). Model-tested on Navi44 and
 harvested Navi48 profiles only; no Navi44 board has run it.
 
+RX 9000 follow-ups now retain an acquired Azalia audio endpoint per stream
+across TMDS, FRL, legacy DP and UHBR, including MST, independently of pipe
+and HPO encoder indices. Allocation follows Linux's `find_first_free_audio`;
+models cover mixed transports and the full endpoint acquisition masks.
+A delayed DET acknowledgment defers compressed-buffer growth for retry on
+the next display-monitor pass, retaining the current allocation until the
+freed segments are acknowledged. DML DET sizing/Vmin ODM, memory-pressure
+and suspend findings, and physical board acceptance remain open.
+
 Implemented: GDDR6 training; PSP14 SOS/GPCOM/TMR; mandatory graphics/media
 firmware parsing, upload and autoload; GC12 RS64 counter programming and pipe
 reset with inherited-queue exclusion; SMU14 board-table transfer and initial
