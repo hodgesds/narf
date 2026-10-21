@@ -310,8 +310,6 @@ impl ColdBoot {
             overlays: overlay_requests,
             reset,
         };
-        // SAFETY: the caller's obligations, CPU views of replaced surfaces
-        // withdrawn.
         let mut content = BySlot {
             pipes: core::array::from_fn(|k| match k {
                 0 => Some(display),
@@ -319,24 +317,25 @@ impl ColdBoot {
             }),
             frames,
         };
-        let updated =
-            match unsafe { self.update_live_display_planes(display, &live, &plan, &mut content) }
-                .await
+        // SAFETY: the caller's obligations, CPU views of replaced surfaces
+        // withdrawn.
+        let update =
+            unsafe { self.update_live_display_planes(display, &live, &plan, &mut content) };
+        let updated = match update.await {
+            Ok(u) => u,
+            // Refused before any register write: the scanout runs as it
+            // was, under raised clocks; the caller relights.
+            Err(_)
+                if self
+                    .display_status(display)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|s| s.state == otg::State::ScanoutRunning(display)) =>
             {
-                Ok(u) => u,
-                // Refused before any register write: the scanout runs as it
-                // was, under raised clocks; the caller relights.
-                Err(_)
-                    if self
-                        .display_status(display)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|s| s.state == otg::State::ScanoutRunning(display)) =>
-                {
-                    return Ok(None);
-                }
-                Err(e) => return Err(e.into()),
-            };
+                return Ok(None);
+            }
+            Err(e) => return Err(e.into()),
+        };
         next.scanout = updated.scanout;
         running[i] = next;
         self.modesets.retain(next);
