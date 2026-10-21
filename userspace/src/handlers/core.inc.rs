@@ -14060,7 +14060,24 @@ fn own_stack_wait_child(ctx: &mut dyn TrapContext) {
 /// or returns the baked/reaped result.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(crate) fn own_stack_block(ctx: &mut dyn TrapContext) {
-    let is_wait = crate::user_task::current_user_task().is_some_and(|uctx| {
+    own_stack_block_routed(ctx, true);
+}
+
+/// [`own_stack_block`] for a ptrace stop. A stop is not a child-wait: it ends
+/// when the tracer resumes it (`PTRACE_CONT`/`SYSCALL` zero the park deadline
+/// and wake the task), which the wait-child loop never looks at. A
+/// `wait_child_pending` flag left set by a wait the stop interrupted would
+/// otherwise park the stopped tracee as a waiter that only a child event can
+/// wake, so `strace -p 1` froze PID 1 until strace exited. A syscall restarted
+/// after the stop re-arms its own wait state.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) fn own_stack_block_ptrace_stop(ctx: &mut dyn TrapContext) {
+    own_stack_block_routed(ctx, false);
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn own_stack_block_routed(ctx: &mut dyn TrapContext, allow_wait: bool) {
+    let is_wait = allow_wait && crate::user_task::current_user_task().is_some_and(|uctx| {
         // SAFETY: in-flight task's poller-pinned UserTaskCtx; single-CPU access.
         unsafe {
             // Every blocking park funnels through here — mark the syscall
@@ -14090,6 +14107,11 @@ pub(crate) fn own_stack_block(ctx: &mut dyn TrapContext) {
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) fn own_stack_block(_ctx: &mut dyn TrapContext) {
+    unreachable!("own-stack is not supported on this architecture");
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) fn own_stack_block_ptrace_stop(_ctx: &mut dyn TrapContext) {
     unreachable!("own-stack is not supported on this architecture");
 }
 
