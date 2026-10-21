@@ -202,6 +202,60 @@ async fn act_handled<A: MstAux>(aux: &mut A) -> Result<(), MstFailure<A::Error>>
     Err(MstFailure::Mst(MstError::Timeout))
 }
 
+/// The payloads one topology manager sources at most: amdgpu_dm's
+/// drm_dp_mst_topology_mgr_init max_payloads (4, the DCN 4.0.1 stream
+/// encoders and timing generators one link could ever carry).
+pub const MAX_PAYLOADS: usize = 4;
+
+/// Why drm_dp_mst_atomic_check_payload_alloc_limits refuses a payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotRefusal {
+    /// -ENOSPC: the link's time slots are exhausted.
+    NoSpace,
+    /// -EINVAL: more than `MAX_PAYLOADS` payloads.
+    TooMany,
+}
+
+/// A new payload of `slots` time slots beside the link's `payloads` (in
+/// the order they were added): drm_dp_mst_atomic_check_payload_alloc_limits
+/// over the state's payload list (the new one at its head, then the
+/// newest first, so a refusal is the error Linux reports) against the
+/// link's total time slots (drm_dp_mst_update_slots: 63 on 8b/10b, 64 on
+/// 128b/132b) and `MAX_PAYLOADS`, the lowest free VCPI (ffz of the payload
+/// mask), and drm_dp_add_payload_part1's start slot: the next after every
+/// payload, from slot 1 on 8b/10b (the MTP header) and 0 on 128b/132b.
+pub fn allocate_slots(
+    payloads: &[MstPayload],
+    uhbr: bool,
+    slots: u32,
+) -> Result<(u8, u8), SlotRefusal> {
+    let total = if uhbr { 64 } else { 63 };
+    let mut avail = i64::from(total);
+    let order = core::iter::once(slots).chain(payloads.iter().rev().map(|p| u32::from(p.slots)));
+    for (count, s) in order.enumerate() {
+        avail -= i64::from(s);
+        if avail < 0 {
+            return Err(SlotRefusal::NoSpace);
+        }
+        if count + 1 > MAX_PAYLOADS {
+            return Err(SlotRefusal::TooMany);
+        }
+    }
+    let vcpi = (1..=63u8)
+        .find(|v| payloads.iter().all(|p| p.vcpi != *v))
+        .ok_or(SlotRefusal::TooMany)?;
+    let used: u32 = payloads.iter().map(|p| u32::from(p.slots)).sum();
+    Ok((vcpi, (u32::from(!uhbr) + used) as u8))
+}
+
+/// drm_dp_remove_payload_part2 after `removed` left `payloads`: every
+/// later payload's start slot moves down by its time slots.
+pub fn release_slots(payloads: &mut [MstPayload], removed: &MstPayload) {
+    for p in payloads.iter_mut().filter(|p| p.start > removed.start) {
+        p.start -= removed.slots;
+    }
+}
+
 /// The source's allocation table: every payload by start slot.
 fn table(payloads: &[MstPayload]) -> Vec<otg::MstAllocation> {
     let mut p: Vec<&MstPayload> = payloads.iter().collect();
@@ -248,23 +302,12 @@ pub(crate) async fn add_payload<A: MstAux, S: MstSource>(
     {
         return Err(MstFailure::Invalid);
     }
-    let vcpi = (1..=63u8)
-        .find(|v| link.payloads.iter().all(|p| p.vcpi != *v))
-        .ok_or(MstFailure::Invalid)?;
-    let first = u32::from(!link.uhbr);
-    let start = first
-        + link
-            .payloads
-            .iter()
-            .map(|p| u32::from(p.slots))
-            .sum::<u32>();
-    if start + u32::from(slots) > 64 {
-        return Err(MstFailure::Invalid);
-    }
+    let (vcpi, start) = allocate_slots(&link.payloads, link.uhbr, u32::from(slots))
+        .map_err(|_| MstFailure::Invalid)?;
     let payload = MstPayload {
         sink,
         vcpi,
-        start: start as u8,
+        start,
         slots,
         pbn,
         stream,
@@ -335,14 +378,12 @@ pub(crate) async fn remove_payload<A: MstAux, S: MstSource>(
     if connected {
         let _ = dp_mst_mgr::write_payload(aux, payload.vcpi, payload.start, 0).await;
     }
-    link.payloads.remove(index);
+    let removed = link.payloads.remove(index);
     source.allocation(&table(&link.payloads)).await?;
     if connected {
         let _ = act_handled(aux).await;
     }
-    for p in link.payloads.iter_mut().filter(|p| p.start > payload.start) {
-        p.start -= payload.slots;
-    }
+    release_slots(&mut link.payloads, &removed);
     link.payload_change = None;
     Ok(())
 }

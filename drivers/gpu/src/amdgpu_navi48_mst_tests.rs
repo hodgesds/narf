@@ -786,3 +786,90 @@ kernel_test_in!(
     "drivers/gpu/dp-mst",
     navi48_mst_daisy_chain_shares_one_payload_table
 );
+
+const PAYLOAD_VECTORS: &str = include_str!("../tests/dcn401_mst_payload/vectors.txt");
+
+/// One `tests/dcn401_mst_payload` sequence replayed: each addition's time
+/// slots (drm_dp_atomic_find_time_slots), its refusal or VCPI and start
+/// slot with the payload-table row and ALLOCATE_PAYLOAD `add_payload`
+/// sends, each removal's (`remove_payload`), and the final table.
+fn replay_payload_vector(line: &str) -> Option<alloc::string::String> {
+    use alloc::format;
+    use alloc::string::String;
+    let (ops, _) = line.split_once(" = ")?;
+    let mut words = ops.split(' ');
+    let (_, enc, kbps) = (words.next()?, words.next()?, words.next()?);
+    let uhbr = enc == "u";
+    let div = dp_mst::pbn_div(kbps.parse().ok()?);
+    let mut payloads: Vec<MstPayload> = Vec::new();
+    let mut out = String::new();
+    for op in words {
+        let (kind, value) = op.split_at(1);
+        let value: u32 = value.parse().ok()?;
+        if kind == "a" {
+            let slots = dp_mst::time_slots(value, div);
+            match allocate_slots(&payloads, uhbr, slots) {
+                Err(SlotRefusal::NoSpace) => out += &format!(" {slots}=E28"),
+                Err(SlotRefusal::TooMany) => out += &format!(" {slots}=E22"),
+                Ok((vcpi, start)) => {
+                    out += &format!(" {slots}=w{vcpi}.{start}.{slots}m{vcpi}.{value}");
+                    payloads.push(MstPayload {
+                        sink: dp_mst_mgr::Sink {
+                            branch: 0,
+                            port: vcpi,
+                        },
+                        vcpi,
+                        start,
+                        slots: slots as u8,
+                        pbn: value as u16,
+                        stream: vcpi,
+                    });
+                }
+            }
+        } else {
+            let i = payloads.iter().position(|p| u32::from(p.vcpi) == value)?;
+            let removed = payloads.remove(i);
+            out += &format!(" m{}.0w{}.{}.0", removed.vcpi, removed.vcpi, removed.start);
+            release_slots(&mut payloads, &removed);
+        }
+    }
+    out += " |";
+    let mut rows = payloads.clone();
+    rows.sort_by_key(|p| p.start);
+    if rows.is_empty() {
+        out += " -";
+    }
+    for (k, p) in rows.iter().enumerate() {
+        out += &format!(
+            "{}{}@{}+{}",
+            if k == 0 { " " } else { "," },
+            p.vcpi,
+            p.start,
+            p.slots
+        );
+    }
+    Some(format!("{ops} ={out}"))
+}
+
+/// The payload table bookkeeping against DRM's helpers (3000 Linux
+/// sequences of stream additions and removals on one manager, both
+/// channel codings): time-slot and payload-count refusals, VCPIs, start
+/// slots, compaction after a removal, and what each step writes.
+fn navi48_mst_payload_table_matches_linux_vectors() -> TestResult {
+    let mut n = 0;
+    for line in PAYLOAD_VECTORS.lines().filter(|l| !l.starts_with('#')) {
+        let got = replay_payload_vector(line);
+        if got.as_deref() != Some(line) {
+            panic!("payload vector\n  want {line}\n  got  {got:?}");
+        }
+        n += 1;
+    }
+    if n != 3000 {
+        return TestResult::Fail("vector count");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    navi48_mst_payload_table_matches_linux_vectors
+);

@@ -2323,6 +2323,16 @@ Add orders the DPCD payload table, source SAT/ACT, ACT handled,
 ALLOCATE_PAYLOAD and stream VC rate before video. Remove zeroes the VC rate,
 deallocates remotely, updates SAT/ACT and compacts later payload slots. Physical
 root removal skips all remote AUX transactions and waits during removal.
+The bookkeeping is DRM's: `mst::allocate_slots(payloads, uhbr, slots)` is
+drm_dp_mst_atomic_check_payload_alloc_limits (63 or 64 time slots, at most
+`mst::MAX_PAYLOADS` = 4 payloads per manager as amdgpu_dm initializes it, the
+new payload checked first and then the newest, so `SlotRefusal::{NoSpace,
+TooMany}` is Linux's -ENOSPC/-EINVAL) with the lowest free VCPI and
+drm_dp_add_payload_part1's next start slot; `release_slots` is
+drm_dp_remove_payload_part2's compaction. 3000 Linux sequences of additions and
+removals (`tests/dcn401_mst_payload`, the extracted helpers including
+drm_dp_dpcd_write_payload and dm_mst_get_pbn_divider) fix the time slots,
+refusals, VCPIs, start slots, payload-table rows and ALLOCATE_PAYLOAD PBNs.
 
 `MstLink::payload_change()` reports `Option<MstPayloadChange>`, whose Adding and
 Removing variants carry the DIO stream index. The marker is recorded before the
