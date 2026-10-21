@@ -1398,6 +1398,14 @@ fn open_impl_reserved(
     // `InputEventFile::nonblock_read_eagain`.)
     let open_status_flags =
         (flags as u32) & (crate::fd::O_ACCMODE | crate::fd::O_SETFL_MASK | crate::fd::O_PATH);
+    // `FD_ADD(how->flags, ...)` → `get_unused_fd_flags(O_CLOEXEC)`: the
+    // descriptor's close-on-exec bit comes from the open flags whatever the
+    // object turns out to be (file, directory, device, O_PATH, ns file).
+    let open_fd_flags = if flags & crate::fd::O_CLOEXEC as u64 != 0 {
+        crate::fd::FD_CLOEXEC
+    } else {
+        0
+    };
     // O_RDONLY = 0, O_WRONLY = 1, O_RDWR = 2. Bits 0..1 of flags.
     let access_mode = flags & 0o3;
     let want_r = access_mode == 0 || access_mode == 2;
@@ -1613,7 +1621,7 @@ fn open_impl_reserved(
             let new_fd = reservation.install(crate::fd::FdEntry {
                     ops,
                     offset: 0,
-                    flags: 0,
+                    flags: open_fd_flags,
                     status_flags: open_status_flags,
                 });
             match new_fd {
@@ -1675,7 +1683,7 @@ fn open_impl_reserved(
                 let new_fd = reservation.install(crate::fd::FdEntry {
                         ops: node,
                         offset: 0,
-                        flags: 0,
+                        flags: open_fd_flags,
                         status_flags: open_status_flags,
                     });
                 match new_fd {
@@ -1776,7 +1784,7 @@ fn open_impl_reserved(
                 let new_fd = reservation.install(crate::fd::FdEntry {
                         ops: lops,
                         offset: 0,
-                        flags: 0,
+                        flags: open_fd_flags,
                         status_flags: open_status_flags,
                     });
                 match new_fd {
@@ -1863,7 +1871,7 @@ fn open_impl_reserved(
             let new_fd = reservation.install(crate::fd::FdEntry {
                     ops: alloc::sync::Arc::new(DirFdFile { dir: dirops }),
                     offset: 0,
-                    flags: 0,
+                    flags: open_fd_flags,
                     status_flags: open_status_flags,
                 });
             match new_fd {
@@ -2096,7 +2104,7 @@ fn open_impl_reserved(
         let new_fd = fd::install(task, crate::fd::FdEntry {
                 ops,
                 offset: 0,
-                flags: 0,
+                flags: open_fd_flags,
                 status_flags: open_status_flags,
             });
         match new_fd {
@@ -2378,6 +2386,7 @@ fn open_impl_reserved(
             fifo_uid,
             fifo_gid,
             open_status_flags,
+            open_fd_flags,
             path,
             reservation,
         );
@@ -2387,7 +2396,7 @@ fn open_impl_reserved(
     let new_fd = match reservation.install(crate::fd::FdEntry {
             ops,
             offset: 0,
-            flags: 0,
+            flags: open_fd_flags,
             status_flags: open_status_flags,
         }) {
         Some(n) => n,
@@ -2440,6 +2449,7 @@ fn open_fifo(
     uid: u32,
     gid: u32,
     status_flags: u32,
+    fd_flags: u32,
     _path: &str,
     reservation: fd::FdReservation,
 ) {
@@ -2474,7 +2484,7 @@ fn open_fifo(
     let new_fd = match reservation.install(crate::fd::FdEntry {
             ops: handle,
             offset: 0,
-            flags: 0,
+            flags: fd_flags,
             status_flags,
         }) {
         Some(n) => n,
