@@ -1556,6 +1556,9 @@ argument = "The frame/ edit registers one Late initcall (btrfs-rootrw-interop) t
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The frame/ edit only chooses the environment handed to the distro PID 1 that boot-init already spawns: under narf.disks=root-ro or root-rw (an installed system booted from its own root) it omits container=narf, so systemd runs in host mode instead of container mode. The argv, root, pid, address space and loader call are unchanged. It adds no authority, memory access, domain transition, trap-path code or TCB member, and every other systemd_pid1 boot keeps container=narf."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
 argument = "The frame/ edit registers one Late initcall (root-mount-settled), right after root-mount-auto, that only stores an atomic flag in narf_block::disk_policy recording that boot-time root mounting finished; the boot log waits on it under narf.disks=root-ro/root-rw before probing its USB stick. It adds no authority, memory access, domain transition, trap-path code or TCB member, and grants no write permission."
 
 [[invariants_preserved]]
@@ -1569,3 +1572,11 @@ argument = "The frame/ edit (bare_main.rs) replaces the ACPI power-button platfo
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The frame/ edit (bare_main.rs) only narrows two existing test-only Late initcalls, btrfs-disk-smoke and btrfs-write-smoke: besides the narf.btrfs_smoke boot argument they now skip any btrfs device whose fsid is not one of xtask's own disposable fixtures (narf_drivers_fs_btrfs::harness, an fsid allowlist plus the c4c405ee-0000-4a11-9e57- harness prefix) or whose fsid equals the root=UUID= on the command line, so a stray flag on a bare-metal host can no longer mutate a real btrfs filesystem. The check reads one superblock sector; it adds no authority, memory access, domain transition, trap-path code or TCB member, and it can only remove writes, never add one."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame trap changes only prioritize delivery of an already-pending fatal signal after a reclaim-pressure wait wakes: they do not synthesize a signal, alter signal authority, or change the trap's domain transition. The x86_64 and aarch64 paths remain in DomainId::FRAME and invoke the existing signal-delivery hook before classifying the failed page heal as a new synchronous fault. The boot-time address-space resolver now uses the scheduler's existing lifetime registry so a currently-polled task remains resolvable during its own exit observer; the resolver only clones the address-space Arc already owned by that live task and grants no new access."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "AddressSpace::reclaim_unshared_on_exit is callable only under an unsafe contract after the last process thread has completed robust-futex, clear-child-tid, and rusage user-memory accesses and can never return to userspace. It refuses every address space ever shared through CLONE_VM, retains the root and lifetime PCID/ASID until final Drop, and retires mappings through the ordinary unmap paths, which remove reverse-map/shared-owner state and invalidate cached translations before returning backing or page-table frames for reuse. Repeated calls see empty mapping tables and are harmless. No capability, domain tag, domain transition, mapping authority, or user-access window is added."

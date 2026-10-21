@@ -179,6 +179,7 @@ fn try_demand_page(aspace: &AddressSpace, vaddr: VirtAddr) -> Result<(), Address
 fn retry_after_pressure(
     mut attempt: impl FnMut() -> Result<(), AddressSpaceError>,
     mut wait: impl FnMut(ReclaimTicket) -> bool,
+    mut fatal_signal_pending: impl FnMut() -> bool,
     may_wait: bool,
 ) -> Result<(), AddressSpaceError> {
     let mut result = attempt();
@@ -190,7 +191,13 @@ fn retry_after_pressure(
         let Err(AddressSpaceError::ReclaimPressure(ticket)) = result else {
             return result;
         };
-        if !wait(ticket) {
+        // A fatal signal (notably SIGKILL from stress-ng's timeout/OOM parent)
+        // must break a task out of reclaim backpressure. The signal path kicks
+        // the scheduler slot, so `yield_current_stackful` below resumes, but a
+        // standard signal is coalesced and therefore provides only that ONE
+        // wake. Retrying and parking on a fresh ticket here strands the task
+        // until kswapd happens to complete every remaining retry.
+        if fatal_signal_pending() || !wait(ticket) || fatal_signal_pending() {
             return result;
         }
         result = attempt();
@@ -202,7 +209,12 @@ fn retry_after_pressure(
 /// retrying after completed reclaim cycles with Linux's bounded retry count.
 /// No-stackful/full-table paths terminate immediately; none busy-yield.
 pub(crate) fn demand_page(aspace: &AddressSpace, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
-    retry_after_pressure(|| try_demand_page(aspace, vaddr), park_until_reclaim, true)
+    retry_after_pressure(
+        || try_demand_page(aspace, vaddr),
+        park_until_reclaim,
+        narf_userspace::handlers::current_task_fatal_signal_pending,
+        true,
+    )
 }
 
 /// Resolve one demand fault without entering the reclaim wait path.
@@ -218,6 +230,7 @@ pub(crate) fn demand_page_no_wait(
     retry_after_pressure(
         || try_demand_page(aspace, vaddr),
         |_| unreachable!("no-wait demand fault entered reclaim parking"),
+        || false,
         false,
     )
 }
@@ -315,6 +328,7 @@ mod tests {
                 waits += 1;
                 true
             },
+            || false,
             true,
         );
         if result != Err(AddressSpaceError::ReclaimPressure(ticket))
@@ -335,6 +349,7 @@ mod tests {
                 waited = true;
                 true
             },
+            || false,
             true,
         );
         if result != Err(AddressSpaceError::Unmapped) || nonpressure_attempts != 1 || waited {
@@ -343,6 +358,40 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("frame", smoke_reclaim_wait_retry_is_bounded);
+
+    fn smoke_reclaim_wait_fatal_signal_aborts_after_single_wake() -> TestResult {
+        let ticket = ReclaimTicket {
+            node: 0,
+            sequence: 1,
+        };
+        let fatal = core::cell::Cell::new(false);
+        let mut attempts = 0usize;
+        let mut waits = 0usize;
+        let result = retry_after_pressure(
+            || {
+                attempts += 1;
+                Err(AddressSpaceError::ReclaimPressure(ticket))
+            },
+            |_| {
+                waits += 1;
+                // Model SIGKILL waking the parked stackful continuation.
+                fatal.set(true);
+                true
+            },
+            || fatal.get(),
+            true,
+        );
+        if result == Err(AddressSpaceError::ReclaimPressure(ticket)) && attempts == 1 && waits == 1
+        {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("fatal signal retried reclaim after its one wake")
+        }
+    }
+    kernel_test_in!(
+        "frame",
+        smoke_reclaim_wait_fatal_signal_aborts_after_single_wake
+    );
 
     fn smoke_reclaim_no_wait_never_parks_or_retries() -> TestResult {
         let ticket = ReclaimTicket {
@@ -360,6 +409,7 @@ mod tests {
                 waited = true;
                 true
             },
+            || false,
             false,
         );
         if result == Err(AddressSpaceError::ReclaimPressure(ticket)) && attempts == 1 && !waited {

@@ -13571,6 +13571,7 @@ pub fn wait_init() {
     crate::user_task::register_process_exit_observer(crate::perf_event::on_process_exit);
     crate::user_task::register_process_exit_observer(shm_process_exit);
     crate::user_task::register_process_exit_observer(shared_pending_process_exit);
+    crate::user_task::register_process_exit_observer(reclaim_exiting_process_memory);
     crate::user_task::register_process_exit_observer(on_child_exit);
     crate::user_task::register_wait_child_check(wait_child_check_fn);
     crate::user_task::wait_child_waker_init();
@@ -15085,6 +15086,33 @@ fn task_tables_exit_observer(_pid: u64, tid: u64) {
 /// `on_child_exit`, which may release the pid of an orphan.
 fn shared_pending_process_exit(pid: u64, tid: u64) {
     release_shared_pending(pid_to_task_raw(pid).unwrap_or(tid));
+}
+
+/// Return a dying process's mappings before notifying its parent. The task
+/// registry deliberately retains a zombie until wait reaps it, and the
+/// scheduler/RCU path can retain its `AddressSpace` longer still; leaving VMA
+/// and page-table storage attached until final `Drop` lets a fork storm consume
+/// nearly all RAM even though every child has already exited.
+///
+/// `notify_task_exited` invokes process observers only after the last thread's
+/// robust-futex, clear-child-tid and rusage user-memory accesses have finished.
+/// The memory exit-reclaimer is idempotent, invalidates every cached
+/// translation before returning backing frames, keeps the root alive for the
+/// scheduler's imminent switch, and refuses an address space that was ever
+/// shared with `CLONE_VM`. We intentionally retain that conservative refusal:
+/// the task lookup itself holds an extra `Arc`, so an exit observer cannot
+/// prove sole ownership from `Arc::strong_count`.
+/// Register this after SysV/process signal cleanup but before `on_child_exit`,
+/// so a parent woken to launch its next child observes the reclaimed memory.
+fn reclaim_exiting_process_memory(_pid: u64, tid: u64) {
+    if let Some(address_space) = address_space_of_task(tid) {
+        // SAFETY: process observers run only for the last thread, after every
+        // exit-time user-memory access. This task exits through the stackful
+        // scheduler immediately after the observer fan-out and cannot return
+        // to userspace; the callee independently refuses CLONE_VM address
+        // spaces whose ownership this layer cannot prove exclusive.
+        let _ = unsafe { address_space.reclaim_unshared_on_exit() };
+    }
 }
 
 /// Test-only: run the AIO-context exit sweep for `tid` (the
