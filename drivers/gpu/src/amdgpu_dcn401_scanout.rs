@@ -575,7 +575,7 @@ impl<I: Io> Engine<I> {
     }
     /// The surface HUBP `q` fetches (its own or, as an ODM segment's or
     /// MPC slice's pipe, its plane's), as its records name it.
-    fn fetched_surface(&self, q: u8) -> Option<SurfaceApplied> {
+    pub(super) fn fetched_surface(&self, q: u8) -> Option<SurfaceApplied> {
         self.status
             .surfaces
             .iter()

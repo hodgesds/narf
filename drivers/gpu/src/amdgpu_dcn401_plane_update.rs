@@ -436,8 +436,9 @@ impl<I: Io> Engine<I> {
         for k in 0..c.planes.len() {
             let p = &c.planes[k];
             if p.changed {
-                let coef_ram = self.program_dpp_live(p.dpp).await?;
-                c.planes[k].dpp.coef_ram = coef_ram;
+                let mut dpp = p.dpp;
+                let coef_ram = self.program_dpp_live(&mut dpp).await?;
+                c.planes[k].dpp = DppApplied { coef_ram, ..dpp };
                 c.planes[k].mpc.dpp = c.planes[k].dpp;
             }
         }
@@ -825,6 +826,7 @@ impl Surfaces {
                 line_buffer_config: super::dpp::line_buffer_config(s.request)?,
                 coef_ram: Default::default(),
                 pending: 0,
+                post_csc_b: false,
             };
             let at = usize::from(s.request.pipe);
             live.push(LivePlane {

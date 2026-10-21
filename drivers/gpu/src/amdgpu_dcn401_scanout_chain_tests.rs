@@ -1296,7 +1296,7 @@ fn crtc_color(c: &mut Chain, p: u8) -> Result<(), &'static str> {
     if !latched(c, 2 | 2 << 7, 1 | 1 << 7, 1)
         || c.e.status.colors[usize::from(p)]
             != (PipeColor {
-                pre_degam_srgb: true,
+                pre_degam: PreDegam::Srgb,
                 gamut: Some((1, false)),
                 ogam: Some(0),
             })

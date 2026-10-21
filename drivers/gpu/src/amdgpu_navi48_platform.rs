@@ -7982,6 +7982,7 @@ mod tests {
             y: 20,
             visible: true,
             shown: 0b10,
+            degamma: false,
         };
         let hidden = CursorApplied {
             x: CURSOR_OFF.0,

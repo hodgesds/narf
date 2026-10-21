@@ -8,14 +8,14 @@ mod power;
 pub use power::HubpPower;
 #[path = "amdgpu_dcn401_surface.rs"]
 mod surface;
-#[cfg(feature = "kernel-test")]
-pub(super) use surface::post_csc_words;
 pub(super) use surface::Surfaces;
 pub use surface::{cursor_mode, plane_scale, CursorMode, CursorUnder};
 pub use surface::{
     plane_update_type, planes_update_type, Cleared, LivePlanes, PlaneContent, PlanesUpdated,
     UpdateType,
 };
+#[cfg(feature = "kernel-test")]
+pub(super) use surface::{post_csc_set_b, post_csc_words, CURSOR_MATRIX_WORD};
 pub use surface::{
     Blend, ColorProgram, CursorApplied, DeadlinesApplied, DppApplied, FlipDone, GamutProgram,
     LivePipe, MemoryApplied, MpcApplied, OgamProgram, OverlayScanout, PipeColor, PlaneLayout,
@@ -23,7 +23,7 @@ pub use surface::{
     SurfaceFormat, SurfaceRequest, VblankPhase, CURSOR_MAX, MAX_OVERLAYS,
 };
 pub use surface::{DccBlock, PlaneSurface, SurfaceBytes, Swizzle, Tiling, YuvColor};
-pub use surface::{ExternalSurface, FlipSource};
+pub use surface::{ExternalSurface, FlipSource, PreDegam};
 
 const HUBP_CONTROL: u64 = 0x5f4;
 const HUBP_CLOCK: u64 = 0x5f5;

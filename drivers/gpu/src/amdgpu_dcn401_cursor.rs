@@ -59,6 +59,14 @@ pub struct CursorApplied {
     /// overlaps and no plane above covers (dcn401_set_cursor_position per
     /// pipe).
     pub shown: u8,
+    /// CUR0_ROM_EN: the cursor's sRGB degamma ROM, which
+    /// amdgpu_dm_plane_handle_cursor_update asks for
+    /// (ENABLE_CURSOR_DEGAMMA) under the CRTC's legacy gamma
+    /// (cm_is_degamma_srgb, with DCN401's dpp gamma_corr cap) and
+    /// dpp401_set_cursor_attributes sets for a premultiplied cursor. Taken
+    /// from the CRTC color with every attribute update (a move too); a
+    /// color change alone leaves it, as it leaves Linux's.
+    pub degamma: bool,
 }
 impl CursorApplied {
     pub(in crate::amdgpu_dcn401_otg) fn shown_on(self, pipe: u8) -> bool {
@@ -523,6 +531,15 @@ impl<I: Io> Engine<I> {
             clocks_of(&deadlines.plan),
         ))
     }
+    /// ENABLE_CURSOR_DEGAMMA for display `pipe`'s cursor: its CRTC's legacy
+    /// gamma (cm_is_degamma_srgb); DCN401 has the dpp gamma_corr cap.
+    pub(super) fn cursor_degamma(&self, pipe: u8) -> bool {
+        self.displays
+            .color
+            .get(usize::from(pipe))
+            .and_then(Option::as_deref)
+            .is_some_and(|c| c.pre_degam_srgb)
+    }
     pub(super) fn cursor_attributes(&mut self, a: CursorApplied, p: u8) -> [(u64, u32, u32); 9] {
         let l = self.layout;
         [
@@ -539,7 +556,7 @@ impl<I: Io> Engine<I> {
             (
                 self.cm(p, CM_CONTROL),
                 CM_FIELDS & !ENABLE,
-                PRE_MULTIPLIED << 4,
+                PRE_MULTIPLIED << 4 | u32::from(a.degamma) << 3,
             ),
             (self.cm(p, CM_SCALE_G_Y), u32::MAX, FP16_ONE),
             (self.cm(p, CM_SCALE_RB), u32::MAX, FP16_ONE),
@@ -732,6 +749,7 @@ impl Surfaces {
             y,
             visible: false,
             shown: 0,
+            degamma: e.cursor_degamma(pipe),
         };
         self.place_cursor(e, applied)
     }
@@ -746,7 +764,16 @@ impl Surfaces {
         if current.pipe != pipe || e.status.state != State::ScanoutRunning(pipe) {
             return Err(Error::Busy);
         }
-        self.place_cursor(e, CursorApplied { x, y, ..current })
+        let degamma = e.cursor_degamma(pipe);
+        self.place_cursor(
+            e,
+            CursorApplied {
+                x,
+                y,
+                degamma,
+                ..current
+            },
+        )
     }
     fn place_cursor<I: Io>(
         &self,

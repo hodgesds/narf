@@ -4,9 +4,19 @@
 //! - dcn401_program_gamut_remap: the CTM in MPCC_OGAM_GAMUT_REMAP
 //!   (mpc401_set_gamut_remap: the coefficient set not in use, then that set
 //!   and the coefficient format); both MCM gamut remaps bypassed.
-//! - dcn32_set_input_transfer_func: legacy gamma's implicit sRGB input
-//!   (dpp3_set_pre_degam's ROM), else bypass; GAMCOR always bypassed
+//! - dcn32_set_input_transfer_func: legacy gamma's implicit degamma
+//!   (map_crtc_degamma_to_dc_plane's TF_TYPE_PREDEFINED input: BT.709 for
+//!   an NV12 plane, sRGB for any other, P010 included, through
+//!   dpp3_set_pre_degam's ROM), else bypass; GAMCOR always bypassed
 //!   (dpp3_program_gamcor_lut with no PWL), CM enabled.
+//!
+//! amdgpu_dm exposes no plane color property on DCN 4.0.1 by default: the
+//! plane's DEGAMMA/HDR multiplier/CTM/shaper/3D/blend LUTs are
+//! AMD_PRIVATE_COLOR only, and its COLOR_PIPELINE (drm_colorop) is offered
+//! only to clients that set DRM_CLIENT_CAP_PLANE_COLOR_PIPELINE, which NARF
+//! does not implement. Without either, amdgpu_dm_update_plane_color_mgmt
+//! leaves the input transfer function bypassed unless the CRTC's legacy
+//! gamma asks for the implicit degamma above.
 //! - dcn401_set_output_transfer_func -> mpc3_set_output_gamma: GAMMA_LUT's
 //!   PWL into the OGAM RAM bank not in use (mpc3_program_luta/b and
 //!   mpc3_program_ogam_pwl), then that bank selected; bypass without one.
@@ -83,20 +93,56 @@ pub struct ColorProgram {
     pub gamut: Option<GamutProgram>,
     pub ogam: Option<OgamProgram>,
 }
+/// dpp3_set_pre_degam's choice: the DPP's predefined degamma ROM for a
+/// TF_TYPE_PREDEFINED input transfer function, or bypass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PreDegam {
+    /// TRANSFER_FUNCTION_LINEAR / UNITY (and any unlisted function).
+    #[default]
+    Bypass,
+    /// TRANSFER_FUNCTION_SRGB: PRE_DEGAM_SELECT 0.
+    Srgb,
+    /// TRANSFER_FUNCTION_BT709: PRE_DEGAM_SELECT 4.
+    Bt709,
+}
+impl PreDegam {
+    /// map_crtc_degamma_to_dc_plane's implicit degamma for a plane in
+    /// `format` under legacy gamma: TRANSFER_FUNCTION_BT709 for
+    /// SURFACE_PIXEL_FORMAT_VIDEO_420_YCbCr and _YCrCb (amdgpu_dm's NV21
+    /// and NV12; "DC doesn't have a transfer function for BT601
+    /// specifically"), sRGB for every other format, P010's
+    /// VIDEO_420_10bpc_YCrCb included.
+    pub const fn implicit(format: SurfaceFormat) -> Self {
+        match format {
+            SurfaceFormat::Nv12 => Self::Bt709,
+            _ => Self::Srgb,
+        }
+    }
+    /// CNVC_CFG PRE_DEGAM (mask 0x73): PRE_DEGAM_MODE 1 with the ROM's
+    /// PRE_DEGAM_SELECT, or 0 for bypass (dpp3_set_pre_degam's REG_SET_2).
+    pub const fn word(self) -> u32 {
+        match self {
+            Self::Bypass => 0,
+            Self::Srgb => 1,
+            Self::Bt709 => 1 | 4 << 4,
+        }
+    }
+}
+
 /// What one pipe's color blocks were last set to: the PRE_DEGAM ROM, the
 /// OGAM gamut remap set (1 = A, 2 = B) with its S3.12 format, and the OGAM
 /// RAM bank (0 = A, 1 = B). Default is bypass, which every staged DPP and
 /// MPC preparation writes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PipeColor {
-    pub pre_degam_srgb: bool,
+    pub pre_degam: PreDegam,
     pub gamut: Option<(u8, bool)>,
     pub ogam: Option<u8>,
 }
 impl PipeColor {
-    /// PRE_DEGAM (mask 0x73): mode 1 with the sRGB select (0), or bypass.
+    /// PRE_DEGAM (mask 0x73).
     pub(super) fn pre_degam(self) -> u32 {
-        u32::from(self.pre_degam_srgb)
+        self.pre_degam.word()
     }
     /// MPCC_OGAM_CONTROL MODE (mask 3) and SELECT (mask 4).
     pub(super) fn ogam_control(self) -> (u32, u32) {
@@ -216,9 +262,9 @@ impl<I: Io> Engine<I> {
     }
     /// dcn32_set_input_transfer_func on pipe `q`'s DPP for a plane without its
     /// own color: dpp3_set_pre_degam, then dpp3_program_gamcor_lut(NULL).
-    fn program_input_tf(&mut self, q: u8, srgb: bool) -> Result<(), Error> {
+    fn program_input_tf(&mut self, q: u8, degam: PreDegam) -> Result<(), Error> {
         let l = self.layout;
-        self.update(l.dpp(q, PRE_DEGAM), 0x73, u32::from(srgb))?;
+        self.update(l.dpp(q, PRE_DEGAM), 0x73, degam.word())?;
         self.update(l.dpp(q, CM_CONTROL), 1, 0)?;
         self.update(l.dpp(q, GAMCOR_CONTROL), 0xf, 0)
     }
@@ -290,28 +336,42 @@ impl<I: Io> Engine<I> {
             Ok(())
         })
     }
+    /// The input transfer function amdgpu_dm gives the plane HUBP/DPP `q`
+    /// fetches under display `pipe`'s CRTC color: the implicit degamma of
+    /// its format under legacy gamma (cm_is_degamma_srgb), else bypass.
+    fn input_tf(&self, pipe: u8, q: u8) -> PreDegam {
+        let legacy = self.displays.color[usize::from(pipe)]
+            .as_deref()
+            .is_some_and(|c| c.pre_degam_srgb);
+        match self.fetched_surface(q) {
+            Some(a) if legacy => PreDegam::implicit(a.request.format),
+            None if legacy => PreDegam::Srgb,
+            _ => PreDegam::Bypass,
+        }
+    }
     /// Program display `p.pipe`'s requested color on each of its pipes, in
     /// dcn401_program_pipe's order (gamut remap, input then output transfer
     /// function). Every plane takes the input transfer function amdgpu_dm
-    /// derives from the CRTC; the stream's gamut remap and regamma go on
-    /// each segment's top MPCC only (dcn401_program_gamut_remap and
-    /// dcn401_set_output_transfer_func's is_top_pipe), the MPCCs below it
-    /// in bypass. The caller holds the OTG master lock.
+    /// derives from the CRTC for its format (`input_tf`); the stream's gamut
+    /// remap and regamma go on each segment's top MPCC only
+    /// (dcn401_program_gamut_remap and dcn401_set_output_transfer_func's
+    /// is_top_pipe), the MPCCs below it in bypass. The caller holds the OTG
+    /// master lock.
     pub(super) async fn program_color(&mut self, p: Pipe) -> Result<(), Error> {
         let program = self.displays.color[usize::from(p.pipe)].clone();
         let program = program.as_deref();
-        let pre_degam_srgb = program.is_some_and(|c| c.pre_degam_srgb);
         for tree in p.trees() {
             let top = tree.last().copied();
             for &q in &tree {
                 let stream = program.filter(|_| Some(q) == top);
                 let gamut = self.program_gamut(q, stream.and_then(|c| c.gamut.as_ref()))?;
-                self.program_input_tf(q, pre_degam_srgb)?;
+                let pre_degam = self.input_tf(p.pipe, q);
+                self.program_input_tf(q, pre_degam)?;
                 let ogam = self
                     .program_ogam(q, stream.and_then(|c| c.ogam.as_ref()))
                     .await?;
                 self.status.colors[usize::from(q)] = PipeColor {
-                    pre_degam_srgb,
+                    pre_degam,
                     gamut,
                     ogam,
                 };

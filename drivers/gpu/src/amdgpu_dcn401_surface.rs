@@ -12,9 +12,9 @@ mod vm;
 pub use vm::MemoryApplied;
 #[path = "amdgpu_dcn401_dpp.rs"]
 mod dpp;
-#[cfg(feature = "kernel-test")]
-pub(in crate::amdgpu_dcn401_otg) use dpp::post_csc_words;
 pub use dpp::DppApplied;
+#[cfg(feature = "kernel-test")]
+pub(in crate::amdgpu_dcn401_otg) use dpp::{post_csc_set_b, post_csc_words, CURSOR_MATRIX_WORD};
 #[path = "amdgpu_dcn401_mpc.rs"]
 mod mpc;
 pub use mpc::MpcApplied;
@@ -35,7 +35,7 @@ mod flip;
 mod plane_update;
 #[path = "amdgpu_dcn401_scanout.rs"]
 mod scanout;
-pub use color::{ColorProgram, GamutProgram, OgamProgram, PipeColor};
+pub use color::{ColorProgram, GamutProgram, OgamProgram, PipeColor, PreDegam};
 pub use flip::{ExternalSurface, FlipDone, FlipSource};
 pub use plane_update::{
     plane_update_type, planes_update_type, Cleared, LivePlanes, PlaneContent, PlanesUpdated,

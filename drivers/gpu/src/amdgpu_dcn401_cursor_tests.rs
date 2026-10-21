@@ -390,6 +390,7 @@ fn dcn401_cursor_programs_every_pipe_under_each_segment_lock() -> TestResult {
         y: 600,
         visible: false,
         shown: 0,
+        degamma: false,
     };
     let clocks = (50_000, 594_000);
     let segments = placements(a, odm_primary, &[Some(straddle), None, None], clocks);
@@ -512,6 +513,7 @@ fn dcn401_cursor_locks_each_segment_opp_instance_on_harvested_boards() -> TestRe
             y: 600,
             visible: false,
             shown: 0,
+            degamma: false,
         };
         let segments = placements(a, primary, &[None, None, None], (50_000, 594_000));
         let a = shown(a, &segments);
@@ -610,4 +612,58 @@ fn dcn401_cursor_mode_follows_amdgpu_dm() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-cursor",
     dcn401_cursor_mode_follows_amdgpu_dm
+);
+
+/// amdgpu_dm_plane_handle_cursor_update asks for ENABLE_CURSOR_DEGAMMA
+/// under the CRTC's legacy gamma (DCN401 has the dpp gamma_corr cap) and
+/// dpp401_set_cursor_attributes turns it into CUR0_ROM_EN for the
+/// premultiplied cursor; the cursor matrix stays bypassed
+/// (dpp401_set_cursor_matrix) over every plane, YCbCr ones too. The ROM
+/// follows the CRTC with each attribute update and is what the verifier
+/// expects from the record.
+fn dcn401_cursor_degamma_follows_legacy_gamma() -> TestResult {
+    let mut e = engine();
+    for legacy in [false, true] {
+        e.displays.color[0] = Some(alloc::sync::Arc::new(ColorProgram {
+            pre_degam_srgb: legacy,
+            ..Default::default()
+        }));
+        if e.cursor_degamma(0) != legacy {
+            return TestResult::Fail("ENABLE_CURSOR_DEGAMMA");
+        }
+        let a = CursorApplied {
+            pipe: 0,
+            address: 0x8_00f0_0000,
+            width: 64,
+            height: 64,
+            x: 0,
+            y: 0,
+            visible: true,
+            shown: 1,
+            degamma: legacy,
+        };
+        let control = e.cm(0, CM_CONTROL);
+        let matrix = e.cm(0, CM_MATRIX);
+        let attributes = e.cursor_attributes(a, 0);
+        let find = |at: u64| attributes.iter().find(|w| w.0 == at).copied();
+        if find(control)
+            != Some((
+                control,
+                CM_FIELDS & !ENABLE,
+                2 << 4 | u32::from(legacy) << 3,
+            ))
+            || find(matrix) != Some((matrix, 3, 0))
+        {
+            return TestResult::Fail("cursor ROM and matrix words");
+        }
+    }
+    e.displays.color[0] = None;
+    if e.cursor_degamma(0) {
+        return TestResult::Fail("no CRTC color asked for the ROM");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-cursor",
+    dcn401_cursor_degamma_follows_legacy_gamma
 );

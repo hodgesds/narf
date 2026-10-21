@@ -610,6 +610,7 @@ fn dcn401_scanout_cursor_programs_under_its_lock_and_stops_with_fetch() -> TestR
             y: 20,
             visible: true,
             shown: 1 << pipe,
+            degamma: false,
         };
         let at = [(
             pipe,

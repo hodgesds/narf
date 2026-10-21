@@ -238,16 +238,21 @@ kernel_test_in!(
     dcn401_color_gamut_remap_alternates_sets
 );
 
-/// dpp3_set_pre_degam's sRGB ROM for legacy gamma (mode 1, select 0) or
-/// bypass; the GAMCOR stays bypassed with CM enabled.
+/// dpp3_set_pre_degam's ROM for legacy gamma (mode 1 with select 0 for
+/// sRGB, 4 for BT.709) or bypass; the GAMCOR stays bypassed with CM
+/// enabled.
 fn dcn401_color_input_tf_selects_the_srgb_rom() -> TestResult {
-    for srgb in [true, false] {
+    for (degam, word) in [
+        (PreDegam::Srgb, 1),
+        (PreDegam::Bypass, 0),
+        (PreDegam::Bt709, 0x41),
+    ] {
         let mut e = engine();
         e.io.regs.insert(dpp(0, 0xced), 0x52);
         e.io.regs.insert(dpp(0, 0xd77), 0xa);
         e.io.regs.insert(dpp(0, 0xd67), 1);
-        if e.program_input_tf(0, srgb).is_err()
-            || e.io.regs[&dpp(0, 0xced)] & 0x73 != u32::from(srgb)
+        if e.program_input_tf(0, degam).is_err()
+            || e.io.regs[&dpp(0, 0xced)] & 0x73 != word
             || e.io.regs[&dpp(0, 0xd77)] & 0xf != 0
             || e.io.regs[&dpp(0, 0xd67)] & 1 != 0
         {
@@ -281,7 +286,7 @@ fn dcn401_color_records_without_live_scanout() -> TestResult {
     }
     // The verifier reads what the record says.
     e.status.colors[1] = PipeColor {
-        pre_degam_srgb: true,
+        pre_degam: PreDegam::Srgb,
         gamut: Some((2, false)),
         ogam: Some(1),
     };
@@ -364,4 +369,61 @@ fn dcn401_color_maps_crtc_blobs_like_amdgpu_dm() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-color",
     dcn401_color_maps_crtc_blobs_like_amdgpu_dm
+);
+
+/// amdgpu_dm_update_plane_color_mgmt on DCN 4.0.1 (no plane color
+/// property): a plane's input transfer function is bypassed unless the
+/// CRTC's legacy gamma asks for map_crtc_degamma_to_dc_plane's implicit
+/// degamma, which is BT.709 for an NV12 plane (VIDEO_420_YCrCb) and sRGB
+/// for an RGB or P010 (VIDEO_420_10bpc_YCrCb) one; each HUBP/DPP takes the
+/// one of the plane it fetches, ODM segments included.
+fn dcn401_color_input_tf_follows_the_planes_format() -> TestResult {
+    use crate::amdgpu_dcn401_otg::{PreDegam, SplitPipes, SurfaceRequest};
+    let plane = |pipe: u8, odm: SplitPipes, format: SurfaceFormat| {
+        let request = SurfaceRequest {
+            pipe,
+            width: 64,
+            height: 32,
+            format,
+            odm,
+            mpc: SplitPipes::NONE,
+            plane: None,
+            surface: Default::default(),
+        };
+        let b = request.bytes();
+        SurfaceApplied::staged(request, 0x8_0000_0000, b.pitch_bytes, b.bytes)
+    };
+    for (format, want) in [
+        (SurfaceFormat::Nv12, PreDegam::Bt709),
+        (SurfaceFormat::P010, PreDegam::Srgb),
+        (SurfaceFormat::Xrgb8888, PreDegam::Srgb),
+        (SurfaceFormat::Abgr16161616f, PreDegam::Srgb),
+    ] {
+        for legacy in [false, true] {
+            let mut e = engine();
+            e.status.surfaces[0] = Some(plane(0, SplitPipes::one(1), format));
+            e.status.surfaces[2] = Some(plane(2, SplitPipes::NONE, SurfaceFormat::Nv12));
+            e.displays.color[0] = Some(Arc::new(ColorProgram {
+                pre_degam_srgb: legacy,
+                ..Default::default()
+            }));
+            let want = if legacy { want } else { PreDegam::Bypass };
+            if e.input_tf(0, 0) != want || e.input_tf(0, 1) != want {
+                return TestResult::Fail("plane's implicit degamma");
+            }
+            let overlay = if legacy {
+                PreDegam::Bt709
+            } else {
+                PreDegam::Bypass
+            };
+            if e.input_tf(0, 2) != overlay {
+                return TestResult::Fail("overlay's implicit degamma");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-color",
+    dcn401_color_input_tf_follows_the_planes_format
 );
