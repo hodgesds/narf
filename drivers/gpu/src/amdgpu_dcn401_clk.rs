@@ -233,18 +233,16 @@ pub struct Status {
     /// DAL messages PMFW refused whose result Linux ignores.
     pub ignored: Ignored,
 }
-/// The bandwidth sequence's and watermark notify's DAL messages are
-/// dcn401_smu_* helpers whose result dcn401's clock manager never reads: a
-/// PMFW refusal (or an unacknowledged ActiveUclkFclk/IdleUclkFclk/UCLK
-/// floor) is logged and counted here, and the sequence goes on.
+/// The bandwidth sequence's, NumOfDisplays' and the watermark notify's DAL
+/// messages are dcn401_smu_* helpers whose result dcn401's clock manager
+/// never reads: PMFW's refusal of a sent message (or an unacknowledged
+/// ActiveUclkFclk/IdleUclkFclk/UCLK floor) is logged and counted here, and
+/// the sequence goes on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Ignored {
     pub count: u32,
     /// The last one: its message and why.
     pub last: Option<(u32, Error)>,
-    /// The refusal code the last refused message left in the response
-    /// register, which the next message may follow.
-    pub stale_response: Option<u32>,
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Layout {
@@ -418,12 +416,12 @@ impl<I: Io> Engine<I> {
         parameter: u32,
         deadline: narf_time::Deadline,
     ) -> Result<u32, Error> {
-        let ready = self.settled(deadline).await?;
-        // The refusal this owner last read may still sit in the response
-        // register: Linux's next message only waits for it to be nonzero.
-        if ready != 1 && Some(ready) != self.status.ignored.stale_response {
-            return Err(Error::Rejected(ready));
-        }
+        // dcn401_smu_send_msg_with_param only waits for a nonzero response
+        // (whatever an earlier message, this owner's or not, left there, a
+        // refusal included) and then sends. Unlike Linux, which sends anyway
+        // after two seconds, a register still zero at the deadline fails
+        // before any write.
+        self.settled(deadline).await?;
         if deadline.expired() {
             return Err(Error::Timeout);
         }
@@ -436,10 +434,8 @@ impl<I: Io> Engine<I> {
         })?;
         let result = self.settled(deadline).await?;
         if result != 1 {
-            self.status.ignored.stale_response = Some(result);
             return Err(Error::Rejected(result));
         }
-        self.status.ignored.stale_response = None;
         self.access(|io| checked(io.read(base + u64::from(ARGUMENT) * 4)))
     }
     async fn command(&mut self, message: u32, parameter: u32) -> Result<u32, Error> {
@@ -605,8 +601,10 @@ impl<I: Io> Engine<I> {
                 .is_some_and(|chip| levels.firmware >= chip.idle_dpm_min_smu())
     }
     /// dcn401_smu_send_msg_with_param where the caller ignores the result:
-    /// a PMFW refusal is recorded (`Status::ignored`) and logged; a
-    /// transport failure still fails.
+    /// PMFW's refusal of the sent message is recorded (`Status::ignored`)
+    /// and logged; a transport failure (nothing sent, or no answer) still
+    /// fails. `command_until` reports `Rejected` only after its write, so
+    /// an unsent message is never counted as refused.
     async fn command_ignored(&mut self, message: u32, parameter: u32) -> Result<(), Error> {
         match self.command(message, parameter).await {
             Ok(_) => Ok(()),
@@ -843,7 +841,9 @@ impl<I: Io> Engine<I> {
         self.idle()?;
         self.status.state = State::Applying;
         let result = async {
-            self.command(0xe, u32::from(request.displays)).await?;
+            // dcn401_smu_set_num_of_displays: its result is never read.
+            self.command_ignored(0xe, u32::from(request.displays))
+                .await?;
             let dcf = levels.range(Clock::Dcf).max_khz();
             self.hard_min(Clock::Dcf, dcf).await?;
             // The bandwidth sequence's UCLK and FCLK part for a pinned
@@ -913,7 +913,8 @@ impl<I: Io> Engine<I> {
             // CLK_MGR401_UPDATE_NUM_DISPLAYS: sent in prepare while any
             // display stays on.
             if !safe_to_lower {
-                self.command(0xe, u32::from(request.displays)).await?;
+                self.command_ignored(0xe, u32::from(request.displays))
+                    .await?;
                 next.request.displays = request.displays;
             }
             // CLK_MGR401_UPDATE_DEEP_SLEEP_DCFCLK (a zero request keeps it).
@@ -922,7 +923,8 @@ impl<I: Io> Engine<I> {
                 && should_set(safe_to_lower, request.deep_sleep_dcfclk_khz, ds)
             {
                 if levels.range(Clock::Dcf).count > 1 {
-                    self.command(0xd, mhz_ceil(request.deep_sleep_dcfclk_khz))
+                    // dcn401_smu_set_min_deep_sleep_dcef_clk returns nothing.
+                    self.command_ignored(0xd, mhz_ceil(request.deep_sleep_dcfclk_khz))
                         .await?;
                 }
                 self.status.bandwidth.deep_sleep_dcfclk_khz = request.deep_sleep_dcfclk_khz;

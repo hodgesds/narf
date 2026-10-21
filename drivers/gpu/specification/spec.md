@@ -857,8 +857,8 @@ One-level ranges describe fixed clocks; they satisfy admitted requests without
 issuing unsupported DPM-floor or UCLK-switch commands.
 
 `prepare(Request).await` accepts 1–4 displays and bounded, nonzero DISP/DPP/DTB
-rates in kHz. Every consumer must remain retired. It reports the display count,
-pins DCFCLK and UCLK to the reported maxima, disables UCLK switching, and sets
+rates in kHz. Every consumer must remain retired. It reports the display count
+(a refusal ignored, below), pins DCFCLK and UCLK to the reported maxima, disables UCLK switching, and sets
 the requested display clocks, rounding mailbox requests up to MHz.
 `Request::deep_sleep_dcfclk_khz` (DPMM's deep-sleep DCFCLK, zero for none)
 is sent as SetMinDeepSleepDcfclk (0xd) when DCFCLK has DPM. Each floor
@@ -899,10 +899,18 @@ routes its UCLK step through the same sequence with `Bandwidth::pinned`.
 what display deadlines bind against. As in Linux, whose dcn401_smu_* helpers
 return nothing the clock manager reads, a PMFW refusal of any of these
 messages, or a UCLK floor ReturnHardMinStatus does not acknowledge within a
-second, is logged and counted in `Status::ignored` (`Ignored { count, last,
-stale_response }`; the next message may follow the refusal left in the
-response register) and the sequence goes on. Timeout, revocation, device
-loss or cancellation still leave the owner failed.
+second, is logged and counted in `Status::ignored` (`Ignored { count, last
+}`) and the sequence goes on. NumOfDisplays (0xe) and SetMinDeepSleepDcfclk
+(0xd), in `prepare` and `update_live` as in the bandwidth sequence, are
+ignored the same way (dcn401_smu_set_num_of_displays and
+dcn401_smu_set_min_deep_sleep_dcef_clk return nothing). Every message, as
+dcn401_smu_send_msg_with_param, first waits only for DAL_RESP to be nonzero
+(any value: an OK, or a refusal this or an earlier owner left there) and
+then sends; only PMFW's answer to the message sent can be a refusal, so a
+message never sent is never counted. Unlike Linux, which sends anyway after
+its two-second wait, a response register still zero at the deadline fails
+with `Timeout` before any write. Timeout, revocation, device loss or
+cancellation still leave the owner failed.
 
 `notify_wm_ranges(regs, address).await` is dcn401_notify_wm_ranges:
 SetDalDramAddrHigh/Low (5, 6) with the GPU address of

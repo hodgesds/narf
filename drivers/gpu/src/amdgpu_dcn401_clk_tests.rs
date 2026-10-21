@@ -455,16 +455,18 @@ fn dcn401_partial_failures_and_cancellation_never_replay_mailboxes() -> TestResu
     let mut ready = engine();
     start(&mut ready);
     let start_count = ready.io.commands.len();
-    // prepare's UCLK part of the bandwidth sequence (the UCLK hard minimum,
-    // its acknowledgement and SetUclkPstateAllow(0)): Linux ignores those
-    // results, so a refusal there is logged and prepare completes.
+    // NumOfDisplays (the first message) and prepare's UCLK part of the
+    // bandwidth sequence (the UCLK hard minimum, its acknowledgement and
+    // SetUclkPstateAllow(0)): Linux ignores those results, so a refusal
+    // there is logged and prepare completes.
     ready.io.commands.clear();
     run(ready.prepare(request())).unwrap();
     let sequence = ready.io.commands.clone();
+    assert_eq!(sequence[0], (0xe, 1));
     let first = sequence.iter().position(|&(m, a)| m == 9 && a >> 16 == 2);
     let last = sequence.iter().position(|&c| c == (0x1a, 0));
     let ignored = |step: usize| match (first, last) {
-        (Some(f), Some(l)) => (f + 1..=l + 1).contains(&step),
+        (Some(f), Some(l)) => step == 1 || (f + 1..=l + 1).contains(&step),
         _ => false,
     };
     for starting in [true, false] {
@@ -1082,3 +1084,62 @@ fn dcn401_watermark_ranges_reach_pmfw() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/dcn401-clk", dcn401_watermark_ranges_reach_pmfw);
+
+/// dcn401_smu_send_msg_with_param waits only for a nonzero DAL_RESP and
+/// then sends: a fresh owner sends over a refusal an earlier owner left
+/// there. A refused NumOfDisplays or SetMinDeepSleepDcfclk is ignored, as
+/// Linux never reads either result, and a message that was never sent is
+/// never counted as refused.
+fn dcn401_dal_sends_after_any_response_and_ignores_count_refusals() -> TestResult {
+    let mut e = engine();
+    e.io.regs.insert(0x589d0, 0xfd);
+    if run(e.start(core::future::ready(Ok(power())))).is_err()
+        || e.io.commands.first() != Some(&(2, 0))
+        || e.status.ignored.count != 0
+    {
+        return TestResult::Fail("fresh owner over a stale refusal");
+    }
+    e.io.commands.clear();
+    e.io.refuse = Some(1);
+    if run(e.prepare(request())).is_err()
+        || e.status.state != State::Applied
+        || e.io.commands.first() != Some(&(0xe, 1))
+        || e.status.ignored.last != Some((0xe, Error::Rejected(0xfd)))
+    {
+        return TestResult::Fail("refused NumOfDisplays in prepare");
+    }
+    for (k, message) in [(1, 0xe), (2, 0xd)] {
+        e.io.commands.clear();
+        e.io.refuse = Some(k);
+        let count = e.status.ignored.count;
+        let up = Request {
+            deep_sleep_dcfclk_khz: 20_000 + k as u32 * 1000,
+            ..request()
+        };
+        let (applied, _) = live(&mut e, up, false, &|_| false);
+        if applied.is_err()
+            || e.status.state != State::Applied
+            || e.io.commands.get(k - 1).map(|c| c.0) != Some(message)
+            || e.io.commands.len() != 2
+            || e.status.ignored.count != count + 1
+            || e.status.ignored.last != Some((message, Error::Rejected(0xfd)))
+        {
+            return TestResult::Fail("refused live count or deep-sleep DCFCLK");
+        }
+    }
+    // PMFW never answering before the write: nothing sent, nothing ignored.
+    e.io.commands.clear();
+    e.io.regs.insert(0x589d0, 0);
+    let count = e.status.ignored.count;
+    if run(e.command_ignored(0xd, 5)) != Err(Error::Timeout)
+        || !e.io.commands.is_empty()
+        || e.status.ignored.count != count
+    {
+        return TestResult::Fail("unsent message counted as refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-clk",
+    dcn401_dal_sends_after_any_response_and_ignores_count_refusals
+);
