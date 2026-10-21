@@ -394,8 +394,8 @@ pub const DCN401_PIPES: u32 = 4;
 /// i++) { if (pipe_fuses & 1 << i) continue; ... j++; }`) packs the
 /// surviving instances into pool slots 0..`pipe_count`: slot `j`'s HUBP,
 /// DPP, OPP, timing generator and ABM are all instance `i`, the `j`-th
-/// unfused one. A pipe index (`pipe_ctx->pipe_idx`, the CRTC here) is a
-/// slot; every block programmed for it is addressed by the slot's instance
+/// unfused one. A pipe index (`pipe_ctx->pipe_idx`; not a CRTC, whose
+/// stream's head pipe DC acquires) is a slot; every block programmed for it is addressed by the slot's instance
 /// (`hubps[j]->inst`, `dpps[j]->inst`, `opps[j]->inst`, `tg->inst`), and its
 /// MPCC is its DPP's (`plane_res.mpcc_inst = dpps[j]->inst`). The MPC keeps
 /// all four MPCCs and the pool all four DSCs (`res_cap->num_dsc`), unfused;

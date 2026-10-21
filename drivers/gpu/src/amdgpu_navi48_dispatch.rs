@@ -106,8 +106,11 @@ pub const VLINE: u32 = 16;
 pub const DMUB: u32 = 32;
 const PIPES: usize = crate::amdgpu_rdna4::DCN401_PIPES as usize;
 /// DCN401 event counts: HPD/HPD-RX by connector (HPD) instance; OTG and HUBP
-/// events by PIPE INDEX (CRTC k), translated from the hardware instance the
-/// source names (amdgpu_dm_get_crtc_by_otg_inst). `lost` counts IH overflows
+/// events by PIPE INDEX, translated from the hardware instance the source
+/// names (`PipePool::pipe`). The CRTC they belong to is the one whose
+/// stream's OTG master DC acquired on that pipe (amdgpu_dm_get_crtc_by_otg_inst
+/// on acrtc->otg_inst; the platform's `pipe_crtc`), not CRTC k for pipe k.
+/// `lost` counts IH overflows
 /// (and the terminal transition), after which a consumer must re-read
 /// hardware state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -511,10 +514,12 @@ impl Table {
         Delivery::Faulted(hit)
     }
     fn display(&mut self, event: &ih::Event, d: src::Display) -> Delivery {
-        // OTG/HUBP sources name a hardware instance; CRTC k is pipe index k
-        // (dm_vupdate_high_irq / dm_pflip_high_irq: get_crtc_by_otg_inst(
-        // irq_src - IRQ_TYPE_*)). A fused or nonexistent instance has no
-        // CRTC, so Linux drops it: count it as evidence, wake nobody.
+        // OTG/HUBP sources name a hardware instance, counted by the pipe
+        // index it backs; the waiter maps that pipe to the CRTC whose stream
+        // runs on it (dm_vupdate_high_irq / dm_pflip_high_irq:
+        // get_crtc_by_otg_inst(irq_src - IRQ_TYPE_*)). A fused or
+        // nonexistent instance has no pipe, so no CRTC, and Linux drops it:
+        // count it as evidence, wake nobody.
         let pool = crate::amdgpu_rdna4::pipe_pool();
         let Some(pipe) = (match d {
             src::Display::Vblank(n)

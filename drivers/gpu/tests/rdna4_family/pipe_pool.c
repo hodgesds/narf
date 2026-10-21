@@ -31,7 +31,7 @@
 #define BREAK_TO_DEBUGGER() ((void)0)
 #define dm_error(...) ((void)0)
 #define min(a, b) ((a) < (b) ? (a) : (b))
-#define CC_DC_PIPE_DIS__DC_FULL_DIS_MASK 0x00000100U
+#define CC_DC_PIPE_DIS__DC_FULL_DIS_MASK 0x00001000U
 #define NO_UNDERLAY_PIPE ((unsigned int)-1)
 
 struct resource_caps {

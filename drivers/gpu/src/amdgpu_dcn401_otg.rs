@@ -1245,7 +1245,9 @@ impl<I: Io> Engine<I> {
     /// and recompute what the others hold. Only between operations, from a
     /// settled state.
     fn select_display(&mut self, display: u8) -> Result<(), Error> {
-        // Display k scans out on pipe k: one per pipe of the pool.
+        // A display slot is its stream's head pipe (the OTG master DC
+        // acquired, `Modeset::pipe`), one per pipe of the pool; it is not a
+        // CRTC index (the platform maps CRTCs to head pipes).
         if display >= self.layout.pool.count() {
             return Err(Error::Invalid);
         }
