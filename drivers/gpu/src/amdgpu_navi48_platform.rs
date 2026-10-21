@@ -2393,7 +2393,8 @@ pub async unsafe fn retire_inherited_display(
 // order and, for each DP port whose MST branch is in use (any number of
 // them, each its own topology manager as amdgpu_dm keeps one per DP
 // connector), every end-device slot that branch has given a device (the
-// root's own connector then reports nothing, as amdgpu_dm's MST root). Display k is pipe k, its owner slot and CRTC k.
+// root's own connector then reports nothing, as amdgpu_dm's MST root).
+// Display k is pipe k, its owner slot and CRTC k.
 // Each CRTC is routed to at most one connector: as DRM set it (SETCRTC's
 // connector, an atomic connector CRTC_ID), else automatically to plugged
 // connectors in connector order. The console runs on the first lit

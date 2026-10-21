@@ -1012,8 +1012,16 @@ and dark-mode admission; zero PBN rejects new modes. Incomplete resource queries
 retain the session and refuse replay. Cascaded (daisy-chained) branches share
 one link's payload table, hop budgets and DSC fairness; a downstream change
 that keeps every lit route (a branch or device added or removed elsewhere) is
-adopted live without stopping streams, as Linux handles a CSN. MST on more
-than one DP port at a time remains open; no physical validation.
+adopted live without stopping streams, as Linux handles a CSN. MST now runs
+on several DP ports at once, each with its own manager and payload table and
+joint DML admission across them; each port keeps sixteen end-device
+connectors (lighting stays bounded by DCN 4.0.1's four pipes and stream
+encoders, amdgpu_dm's max_streams, and four payloads per manager); a new end
+device lights beside the running streams (its payload alone: row, SAT with
+ACT, ALLOCATE_PAYLOAD, VC rate) and a departed or disabled one retires alone,
+relighting only when Linux would modeset the others (DSC fairness changes,
+lost hop capacity). The payload table bookkeeping matches DRM's helpers on
+3000 Linux sequences (`tests/dcn401_mst_payload`). No physical validation.
 The MST manager now also exposes bounded idle notification polling over
 DMUB AUX, retains fragmented messages across transaction/poll boundaries and
 applies queue backpressure. Connection notices drive topology reconciliation
