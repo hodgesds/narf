@@ -4715,7 +4715,8 @@ returns to the staged buffers. `scanout_framebuffer` has no CPU view of a
 client framebuffer, so the console leaves a display that scans one
 (`follow_flip`). Unpinning is amdgpu_dm_plane_helper_cleanup_fb after the
 flip that replaced it: the display's `PresentSlot` keeps every pin it may
-fetch and `retire_scanout_pins` drops one only when
+fetch (taken before the flip or plane update that programs the address, so
+one that fails after programming it leaves the buffer pinned) and `retire_scanout_pins` drops one only when
 `ColdBoot::display_fetched_addresses` (`Otg::fetched_addresses`: each
 plane's latched address while scanning out, none at rest, unknown while a
 change is in flight or after a failure) shows no plane fetching it (after

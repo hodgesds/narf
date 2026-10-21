@@ -4387,11 +4387,16 @@ async unsafe fn present_native(
         return Ok(None);
     }
     let before = boot.display_scanout_framebuffer(pipe).ok();
+    // The client framebuffers are held by the slot before the flip programs
+    // their addresses: a flip that fails after programming one may leave a
+    // HUBP fetching it, and amdgpu_dm_plane_helper_cleanup_fb only unpins
+    // the old state's framebuffers once the new state is shown. Only a
+    // successful flip's latch retires pins.
+    present_slot(display).pins.lock().extend(pins);
     // SAFETY: the back buffers hold the complete frame; no other writer
     // touches them until the next flip (the owner lock is held); the client
-    // framebuffers stay pinned (`pins`, then the slot's) until retired.
+    // framebuffers stay pinned (the slot's) until retired.
     unsafe { boot.flip_display_sources(pipe, sources).await }?;
-    present_slot(display).pins.lock().extend(pins);
     retire_scanout_pins(boot, display);
     Ok(Some((before, boot.display_scanout_framebuffer(pipe).ok())))
 }
