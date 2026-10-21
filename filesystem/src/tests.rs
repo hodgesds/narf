@@ -1219,14 +1219,16 @@ fn smoke_filesystem_devfs_console_keystrokes() -> TestResult {
     // returns Busy in that case and we ignore — the existing mount
     // is what we want.
     let _ = registry().mount(&auth, "/dev/console-test-mount", DevFs::new());
+    // Key presses are the VT's input (the UART feeds `ttyS0`), so read the
+    // VT tty, `/dev/tty1`.
     let console = registry()
-        .resolve_absolute("/dev/console-test-mount/console", |fs, rel| {
+        .resolve_absolute("/dev/console-test-mount/tty1", |fs, rel| {
             crate::resolve(fs.root(), rel).ok()
         })
         .flatten();
     let console = match console {
         Some(c) => c,
-        None => return TestResult::Fail("resolve /dev/console failed"),
+        None => return TestResult::Fail("resolve /dev/tty1 failed"),
     };
 
     // Push: 'h', 'I' (shift held), '1', '\n', release of 'h'.
@@ -1261,7 +1263,7 @@ fn smoke_filesystem_devfs_console_keystrokes() -> TestResult {
     let mut buf = [0u8; 16];
     let n = match poll_once(console.read(0, &mut buf)) {
         Some(Ok(n)) => n,
-        _ => return TestResult::Fail("/dev/console read returned Pending or Err"),
+        _ => return TestResult::Fail("/dev/tty1 read returned Pending or Err"),
     };
     if n != 4 {
         return TestResult::Fail("expected 4 translated bytes (h, I, 1, \\n)");
@@ -1323,7 +1325,7 @@ fn smoke_filesystem_devfs_console_poll_matches_read() -> TestResult {
         return TestResult::Fail("a completed line did not poll readable");
     }
     let mut buf = [0u8; 8];
-    let n = crate::console_tty::read_into(&mut buf);
+    let n = crate::console_tty::VT.read_into(&mut buf);
     if &buf[..n] != b"h\n" {
         return TestResult::Fail("the completed line read back wrong");
     }
@@ -6260,7 +6262,7 @@ fn smoke_console_winsize_follows_fb_text_grid() -> TestResult {
     let saved_grid = narf_console::text_grid();
     narf_console::set_text_grid_hook(crate::console_tty::grid_changed);
     narf_console::set_text_grid(480, 266);
-    let seen: alloc::vec::Vec<Option<(u16, u16)>> = ["console", "tty1", "tty0"]
+    let seen: alloc::vec::Vec<Option<(u16, u16)>> = ["tty1", "tty0", "ttyS0"]
         .into_iter()
         .map(|name| {
             let node = open_dev_node_for_test(name)?;
@@ -6274,8 +6276,12 @@ fn smoke_console_winsize_follows_fb_text_grid() -> TestResult {
     if seen.iter().any(Option::is_none) {
         return TestResult::Fail("TIOCGWINSZ on a console node failed");
     }
-    if seen.iter().any(|ws| *ws != Some((266, 480))) {
-        return TestResult::Fail("console winsize does not follow the fb text grid");
+    if seen[..2].iter().any(|ws| *ws != Some((266, 480))) {
+        return TestResult::Fail("VT winsize does not follow the fb text grid");
+    }
+    // The serial line is not the framebuffer console: its size is its own.
+    if seen[2] != Some((24, 80)) {
+        return TestResult::Fail("the fb text grid resized ttyS0");
     }
     TestResult::Pass
 }
@@ -6300,7 +6306,7 @@ fn smoke_console_resize_raises_sigwinch_once() -> TestResult {
     CALLS.store(0, Ordering::Release);
     LAST.store(0, Ordering::Release);
     install_pty_signal_hook(hook);
-    crate::console_tty::set_fg_pgrp(4242);
+    crate::console_tty::VT.set_fg_pgrp(4242);
 
     crate::console_tty::grid_changed(160, 50);
     let after_grid = CALLS.load(Ordering::Acquire);

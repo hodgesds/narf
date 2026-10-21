@@ -569,7 +569,7 @@ fn grub_image_cmdline(cmdline: &str, grub: &GrubImageArgs) -> Result<String> {
         }
         line.push_str(extra);
     }
-    Ok(line)
+    Ok(usb_image::with_display_console(line))
 }
 
 /// zram-generator's documented opt-out. NARF has no zram block device (and
@@ -751,13 +751,13 @@ mod disk_policy_tests {
         assert_eq!(
             grub_image_cmdline("", &rw).unwrap(),
             format!(
-                "narf.disks=root-rw root=UUID={UUID} rootflags=subvol=/@ systemd_pid1 systemd.zram=0 narf.bootlog={tok}"
+                "narf.disks=root-rw root=UUID={UUID} rootflags=subvol=/@ systemd_pid1 systemd.zram=0 narf.bootlog={tok} console=ttyS0 console=tty0"
             )
         );
         let plain = grub(&["--bootlog-token", tok]);
         assert_eq!(
             grub_image_cmdline("", &plain).unwrap(),
-            format!("narf.disks=boot-only narf.bootlog={tok}")
+            format!("narf.disks=boot-only narf.bootlog={tok} console=ttyS0 console=tty0")
         );
         assert!(grub_image_cmdline(&format!("narf.bootlog={tok}"), &plain).is_err());
         assert!(grub_image_cmdline("", &grub(&["--bootlog-token", "short"])).is_err());
@@ -779,7 +779,10 @@ mod disk_policy_tests {
         let rw = grub(&["--root-policy", "root-rw", "--root-uuid", UUID]);
         assert_eq!(
             grub_image_cmdline("", &rw).unwrap(),
-            format!("narf.disks=root-rw root=UUID={UUID} rootflags=subvol=/@ systemd_pid1 systemd.zram=0")
+            format!(
+                "narf.disks=root-rw root=UUID={UUID} rootflags=subvol=/@ systemd_pid1 systemd.zram=0 \
+                 console=ttyS0 console=tty0"
+            )
         );
         let ro = grub(&[
             "--root-policy",
@@ -793,13 +796,18 @@ mod disk_policy_tests {
             grub_image_cmdline("amdgpu.native_display=1", &ro).unwrap(),
             format!(
                 "amdgpu.native_display=1 narf.disks=root-ro root=UUID={UUID} \
-                 rootflags=subvol=/@,noatime systemd_pid1 systemd.zram=0"
+                 rootflags=subvol=/@,noatime systemd_pid1 systemd.zram=0 console=ttyS0 console=tty0"
             )
         );
         // No default change: without --root-policy the boot-only line stays.
         assert_eq!(
             grub_image_cmdline("", &grub(&[])).unwrap(),
-            "narf.disks=boot-only"
+            "narf.disks=boot-only console=ttyS0 console=tty0"
+        );
+        // A console= the caller chose replaces the display-first pair.
+        assert_eq!(
+            grub_image_cmdline("console=ttyS0", &grub(&[])).unwrap(),
+            "console=ttyS0 narf.disks=boot-only"
         );
         // A clash or a malformed UUID is an error, not a second policy.
         assert!(grub_image_cmdline("narf.disks=all", &rw).is_err());
@@ -875,7 +883,8 @@ mod disk_policy_tests {
             grub_image_cmdline("", &ro).unwrap(),
             format!(
                 "narf.disks=root-ro root=UUID={UUID} rootflags=subvol=/@ systemd_pid1 \
-                 systemd.zram=0 narf.bootlog=0123456789abcdef systemd.unit=multi-user.target fsck.mode=skip"
+                 systemd.zram=0 narf.bootlog=0123456789abcdef systemd.unit=multi-user.target fsck.mode=skip \
+                 console=ttyS0 console=tty0"
             )
         );
         let clash = grub(&[
@@ -897,11 +906,11 @@ mod disk_policy_tests {
             "systemd.zram=1",
         ]);
         let line = grub_image_cmdline("", &zram).unwrap();
-        assert!(line.ends_with(" systemd_pid1 systemd.zram=1"), "{line}");
+        assert!(line.contains(" systemd_pid1 systemd.zram=1"), "{line}");
         let plain = grub(&["--cmdline-extra", "quiet"]);
         assert_eq!(
             grub_image_cmdline("", &plain).unwrap(),
-            "narf.disks=boot-only quiet"
+            "narf.disks=boot-only quiet console=ttyS0 console=tty0"
         );
     }
 

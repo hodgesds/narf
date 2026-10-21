@@ -2170,7 +2170,11 @@ fn stage_bundle(
         root_uuid: Some(uuid.to_string()),
         rootflags: "subvol=/@".to_string(),
         bootlog_token: Some(token.to_string()),
-        cmdline_extra: Vec::new(),
+        // The same two consoles the host bundle registers, but with the
+        // serial line last, so `/dev/console` is `ttyS0`: systemd's status
+        // output and the failure markers this gate watches for (a device
+        // timeout, emergency mode) reach the serial log instead of the VT.
+        cmdline_extra: vec!["console=tty0 console=ttyS0".to_string()],
     };
     super::grub_image_cmd(&grub)?;
     let bundle = root.join("target/grub-x86_64");

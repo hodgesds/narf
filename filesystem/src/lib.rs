@@ -2133,11 +2133,23 @@ pub fn fs_inode_can_poll(file_type: FileType) -> bool {
 
 // ── Controlling-tty ids ─────────────────────────────────────────
 
-/// Stable [`FileOps::tty_id`] for the boot console (`/dev/console`,
-/// stdin/out/err). A reserved high value so it never collides with a
-/// `/dev/pts/<N>` PTY index (those count up from 0). The userspace
-/// controlling-tty table uses the same value (`handlers::CTTY_CONSOLE`).
+/// Stable [`FileOps::tty_id`] for the VT console tty (`/dev/tty0`,
+/// `/dev/ttyN`, and `/dev/console` when the console is a VT). A reserved
+/// high value so it never collides with a `/dev/pts/<N>` PTY index (those
+/// count up from 0). The userspace controlling-tty table uses the same value
+/// (`handlers::CTTY_CONSOLE`).
 pub const TTY_ID_CONSOLE: u32 = 0xFFFF_FFFE;
+
+/// Stable [`FileOps::tty_id`] for the 8250 UART's tty, `/dev/ttyS0` (and
+/// `/dev/console` when the console is `ttyS0`). Its own tty, separate from
+/// the VTs: own termios, input, session and foreground group, as on Linux.
+pub const TTY_ID_SERIAL0: u32 = 0xFFFF_FFFD;
+
+/// True for the kernel console ttys (the VT tty and the UART's tty), as
+/// opposed to PTYs.
+pub const fn is_console_tty_id(id: u32) -> bool {
+    id == TTY_ID_CONSOLE || id == TTY_ID_SERIAL0
+}
 
 // ── POSIX poll(2) event bits ────────────────────────────────────
 

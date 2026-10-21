@@ -2321,7 +2321,7 @@ fn smoke_abi_proc_stat_tty_fields_from_ctty() -> TestResult {
         const T_PID: u64 = 0x7400_1000;
         const LEADER_TASK: u64 = 0x7400_0101; // console fg pgrp (task-space)
         const LEADER_PID: u64 = 0x7400_1101;
-        const CONSOLE_DEV: u64 = (5 << 8) | 1;
+        const CONSOLE_DEV: u64 = (4 << 8) | 1;
 
         for (t, p) in [(T_TASK, T_PID), (LEADER_TASK, LEADER_PID)] {
             crate::task::release_task(t);
@@ -2329,19 +2329,20 @@ fn smoke_abi_proc_stat_tty_fields_from_ctty() -> TestResult {
             crate::handlers::register_task_to_pid(t, p);
             crate::handlers::register_pid_task_mapping(p, t);
         }
-        let saved_fg = narf_filesystem::console_tty::fg_pgrp();
+        let port = &narf_filesystem::console_tty::VT;
+        let saved_fg = port.fg_pgrp();
         let result = (|| {
             set_task(T_TASK);
-            // T's controlling terminal is the console; its fg pgrp is LEADER.
-            crate::handlers::set_controlling_tty_console(T_TASK);
-            narf_filesystem::console_tty::set_fg_pgrp(LEADER_TASK);
+            // T's controlling terminal is the VT tty; its fg pgrp is LEADER.
+            crate::handlers::set_controlling_console_tty(T_TASK, crate::handlers::CTTY_CONSOLE);
+            port.set_fg_pgrp(LEADER_TASK);
             let info = crate::handlers::proc_task_info(
                 T_PID,
                 narf_filesystem::procfs::TaskInfoQuery::Basic,
             )
             .ok_or("proc_task_info returned None for a live task")?;
             if info.tty_nr != CONSOLE_DEV {
-                return Err("tty_nr was not the console device (5,1) for a console-ctty task");
+                return Err("tty_nr was not tty1 (4,1) for a VT-ctty task");
             }
             // tpgid is the fg pgrp rendered in the reader's ns (root ns here →
             // the leader's outer pid), NOT the raw task-space id or 0.
@@ -2361,7 +2362,7 @@ fn smoke_abi_proc_stat_tty_fields_from_ctty() -> TestResult {
             Ok(())
         })();
         set_task(FAKE_TASK);
-        narf_filesystem::console_tty::set_fg_pgrp(saved_fg);
+        port.set_fg_pgrp(saved_fg);
         for t in [T_TASK, LEADER_TASK] {
             crate::task::release_task(t);
         }

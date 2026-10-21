@@ -1179,16 +1179,40 @@ enum ConsoleNodeKind {
     Console,
     CurrentTty,
     Virtual(u32),
-    /// `/dev/ttyS<n>` (char 4:64+n): the 8250 UART. NARF has one console
-    /// tty fed by both the serial port and the keyboard, so the UART's node
-    /// is that tty under its serial name, as `/dev/console` is on a Linux
-    /// boot with `console=ttyS0`. Writes go to the console sinks and are not
-    /// subject to a TIOCCONS redirect, which applies to `/dev/console` only.
+    /// `/dev/ttyS<n>` (char 4:64+n): the 8250 UART's own tty
+    /// ([`crate::console_tty::SERIAL`]), separate from the VTs. Writes go to
+    /// the UART and are not subject to a TIOCCONS redirect, which applies to
+    /// `/dev/console` only.
     Serial(u32),
 }
 
 struct DevConsole {
     kind: ConsoleNodeKind,
+}
+
+impl DevConsole {
+    /// The tty this node opens: `/dev/console` (and `/dev/tty` reached
+    /// without a controlling-terminal lookup) is the preferred `console=`;
+    /// `/dev/tty0` and `/dev/ttyN` are the VT tty; `/dev/ttyS0` the UART's.
+    fn port(&self) -> &'static crate::console_tty::TtyPort {
+        match self.kind {
+            ConsoleNodeKind::Console | ConsoleNodeKind::CurrentTty => crate::console_tty::console(),
+            ConsoleNodeKind::Virtual(_) => &crate::console_tty::VT,
+            ConsoleNodeKind::Serial(_) => &crate::console_tty::SERIAL,
+        }
+    }
+}
+
+/// The devfs node of a console tty id (`/dev/tty1` for the VT tty,
+/// `/dev/ttyS0` for the UART's): what `/dev/tty` opens for a process whose
+/// controlling terminal is that tty.
+pub fn console_tty_node(id: u32) -> Option<Arc<dyn FileOps>> {
+    let kind = match id {
+        crate::TTY_ID_CONSOLE => ConsoleNodeKind::Virtual(1),
+        crate::TTY_ID_SERIAL0 => ConsoleNodeKind::Serial(0),
+        _ => return None,
+    };
+    Some(Arc::new(DevConsole { kind }))
 }
 
 /// Install the console's signal-character hook. Compatibility shim —
@@ -1277,15 +1301,8 @@ impl FileOps for DevConsole {
         // the ^C/^\/^Z signal hook and drains both input rings (serial
         // bytes + translated keys). fd 0/1/2's `ConsoleFile` reads the
         // exact same stream, so there is one console, one termios.
-        let written = crate::console_tty::read_into(buf);
-        let would_block = written == 0 && crate::console_tty::block_on_input();
-        Box::pin(async move {
-            if would_block {
-                Err(FsError::WouldBlock)
-            } else {
-                Ok(written)
-            }
-        })
+        let got = self.port().read(buf);
+        Box::pin(async move { got.ok_or(FsError::WouldBlock) })
     }
 
     /// `poll(2)` readiness: writable always, readable only when a read would
@@ -1294,7 +1311,7 @@ impl FileOps for DevConsole {
     /// returned, wedging every console writer behind it.
     fn poll_readiness(&self) -> u32 {
         let mut mask = crate::POLL_OUT;
-        if crate::console_tty::poll_readable() {
+        if self.port().poll_readable() {
             mask |= crate::POLL_IN;
         }
         mask
@@ -1304,21 +1321,21 @@ impl FileOps for DevConsole {
     /// returning a spurious 0 (EOF). Mirrors fd-0 `ConsoleFile`; true
     /// when the line discipline has no completed input buffered.
     fn block_on_input(&self) -> bool {
-        crate::console_tty::block_on_input()
+        self.port().block_on_input()
     }
 
-    /// Job control: `/dev/console` is the boot console — same tty id,
-    /// foreground pgrp, and TOSTOP as fd 0 (all singleton `console_tty`
-    /// state), so a background process reading `/dev/console` is sent
-    /// SIGTTIN just like one reading fd 0.
+    /// Job control: a console node is its port's tty — same tty id,
+    /// foreground pgrp, and TOSTOP as every other front-end of that port
+    /// (fd 0 when the port is `/dev/console`), so a background process
+    /// reading it is sent SIGTTIN just like one reading fd 0.
     fn tty_id(&self) -> Option<u32> {
-        Some(crate::TTY_ID_CONSOLE)
+        Some(self.port().tty_id())
     }
     fn tty_fg_pgrp(&self) -> Option<u64> {
-        Some(crate::console_tty::fg_pgrp())
+        Some(self.port().fg_pgrp())
     }
     fn tty_tostop(&self) -> bool {
-        crate::console_tty::tostop()
+        self.port().tostop()
     }
 
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
@@ -1329,17 +1346,15 @@ impl FileOps for DevConsole {
                 return Box::pin(async move { target.write(0, buf).await });
             }
         }
-        // Same path as `sys_write` to fd 1/2: forward to the kernel
-        // console (UART + framebuffer hook if installed). Treat
-        // non-UTF-8 input as best-effort lossy by way of
-        // `from_utf8_lossy` — `write_str` is the only public sink.
+        // The tty write path, same as `sys_write` to fd 1/2: OPOST runs in
+        // the node's port, and the bytes reach its device (the UART for
+        // `ttyS0`, the framebuffer console for the VT) verbatim afterwards.
+        // Using `write_str` (the printk path) instead would skip `c_oflag`,
+        // hardcode a CR the line discipline had not asked for, and copy VT
+        // output to the serial line.
         let n = buf.len();
-        // The tty write path: OPOST runs here, and the bytes reach the UART
-        // verbatim afterwards. Using `write_str` (the printk path) instead
-        // both skipped `c_oflag` and hardcoded a CR the line discipline had
-        // not asked for.
         if core::str::from_utf8(buf).is_ok() {
-            crate::console_tty::write_user(buf);
+            self.port().write_user(buf);
         } else {
             // Slow path: emit bytes one-by-one as `?` substitutes
             // for invalid UTF-8 — matches the standard library's
@@ -1347,7 +1362,7 @@ impl FileOps for DevConsole {
             // write path, so still through OPOST.
             for &b in buf {
                 let sub = if b.is_ascii() { b } else { b'?' };
-                crate::console_tty::write_user(core::slice::from_ref(&sub));
+                self.port().write_user(core::slice::from_ref(&sub));
             }
         }
         Box::pin(async move { Ok(n) })
@@ -1440,9 +1455,10 @@ impl FileOps for DevConsole {
             TIOCGSID, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP, TIOCSWINSZ, VT_ACTIVATE,
             VT_GETMODE, VT_GETSTATE, VT_OPENQRY, VT_RELDISP, VT_SETMODE, VT_WAITACTIVE,
         };
-        // Termios + winsize + foreground pgrp are owned by the unified
-        // `console_tty` so a TCSETS / tcsetpgrp on /dev/console is visible
-        // to fd 0 and vice versa.
+        // Termios + winsize + foreground pgrp are owned by the node's
+        // `console_tty` port, so a TCSETS / tcsetpgrp on /dev/console is
+        // visible to fd 0 (and to /dev/ttyS0 or /dev/tty1, whichever the
+        // console is) and vice versa.
         //
         // The VT a per-fd VT ioctl (VT_GETMODE / VT_SETMODE) applies to: this
         // node's own VT for `/dev/ttyN` (N >= 1), else the currently active VT
@@ -1453,8 +1469,9 @@ impl FileOps for DevConsole {
             _ => crate::vt::active_vt(),
         };
         // The VT and KD ioctls are `vt_ioctl`'s, installed on VT ttys only; a
-        // UART answers them -ENOTTY (`tty_ioctl` -> `-ENOIOCTLCMD`).
-        if matches!(self.kind, ConsoleNodeKind::Serial(_))
+        // UART answers them -ENOTTY (`tty_ioctl` -> `-ENOIOCTLCMD`), also
+        // through `/dev/console` when the console is `ttyS0`.
+        if self.port().kind() == crate::console_tty::PortKind::Serial
             && matches!(
                 cmd,
                 KDGETMODE
@@ -1475,7 +1492,7 @@ impl FileOps for DevConsole {
         }
         match cmd {
             TCGETS => {
-                let raw = crate::console_tty::termios();
+                let raw = self.port().termios();
                 // SAFETY: `arg` is the user `struct termios *` the ioctl
                 // syscall path validated before dispatch.
                 unsafe { write_user_termios(arg, &raw)? };
@@ -1484,11 +1501,11 @@ impl FileOps for DevConsole {
             TCSETS | TCSETSW | TCSETSF => {
                 // SAFETY: `arg` is the validated user `struct termios *`.
                 let raw = unsafe { read_user_termios(arg)? };
-                crate::console_tty::set_termios(raw);
+                self.port().set_termios(raw);
                 Ok(0)
             }
             TCGETS2 => {
-                let raw = crate::console_tty::termios();
+                let raw = self.port().termios();
                 // SAFETY: `arg` is the validated user `struct termios2 *`.
                 unsafe { write_user_termios2(arg, &raw)? };
                 Ok(0)
@@ -1496,11 +1513,11 @@ impl FileOps for DevConsole {
             TCSETS2 | TCSETSW2 | TCSETSF2 => {
                 // SAFETY: `arg` is the validated user `struct termios2 *`.
                 let raw = unsafe { read_user_termios2(arg)? };
-                crate::console_tty::set_termios(raw);
+                self.port().set_termios(raw);
                 Ok(0)
             }
             TIOCGWINSZ => {
-                let cur = crate::console_tty::winsize();
+                let cur = self.port().winsize();
                 let ws = WireWinsize {
                     ws_row: cur.rows,
                     ws_col: cur.cols,
@@ -1514,7 +1531,7 @@ impl FileOps for DevConsole {
             TIOCSWINSZ => {
                 // SAFETY: `arg` is the validated user `struct winsize *`.
                 let ws = unsafe { read_user_winsize(arg)? };
-                crate::console_tty::resize(crate::devfs_pty::WinSize {
+                self.port().resize(crate::devfs_pty::WinSize {
                     rows: ws.ws_row,
                     cols: ws.ws_col,
                     xpixel: ws.ws_xpixel,
@@ -1527,7 +1544,7 @@ impl FileOps for DevConsole {
                 // auto-install here (the caller's pgrp isn't reachable from
                 // this crate); fd 0's TIOCGPGRP handles that fallback, and
                 // getty sets the fg pgrp explicitly via tcsetpgrp.
-                let pgrp = crate::console_tty::fg_pgrp() as i32;
+                let pgrp = self.port().fg_pgrp() as i32;
                 // SAFETY: `arg` is the validated user `pid_t *`.
                 unsafe { write_user_i32(arg, pgrp)? };
                 Ok(0)
@@ -1538,7 +1555,7 @@ impl FileOps for DevConsole {
                 if pgrp < 0 {
                     return Err(crate::FsError::InvalidData);
                 }
-                crate::console_tty::set_fg_pgrp(pgrp as u64);
+                self.port().set_fg_pgrp(pgrp as u64);
                 Ok(0)
             }
             TIOCSCTTY => {
@@ -1546,7 +1563,7 @@ impl FileOps for DevConsole {
                 // per-task ctty table lives in userspace; reach it via the
                 // hook installed at boot (see `install_ctty_hooks`).
                 let _ = arg;
-                crate::console_tty::tiocsctty();
+                crate::console_tty::tiocsctty(self.port());
                 Ok(0)
             }
             TIOCNOTTY => {
@@ -1563,7 +1580,7 @@ impl FileOps for DevConsole {
                 Ok(0)
             }
             FIONREAD => {
-                let n = crate::console_tty::readable_bytes() as i32;
+                let n = self.port().readable_bytes() as i32;
                 // SAFETY: `arg` is the validated user `int *`.
                 unsafe { write_user_i32(arg, n)? };
                 Ok(0)
@@ -2622,17 +2639,46 @@ fn smoke_dev_console_vt_fchmod_accepted() -> TestResult {
 }
 kernel_test_in!("filesystem/devfs", smoke_dev_console_vt_fchmod_accepted);
 
-/// `/dev/ttyS0` is the UART's tty: NARF's single console tty under its serial
-/// name (`systemd.debug_shell=/dev/ttyS0`, `agetty ttyS0`). It shares the
-/// console's tty identity and termios, and refuses the VT/KD ioctls with
-/// -ENOTTY as a Linux UART does.
-fn smoke_dev_ttys0_is_the_console_tty() -> TestResult {
+/// `^D` on an empty canonical line ends a read of a console tty node with
+/// EOF (0), then the next read blocks again (`n_tty_read` returning 0 on
+/// the EOF mark). The node used to consume the EOF latch and then report
+/// "would block", so `cat` on the console never ended on `^D`.
+fn smoke_dev_ttys0_ctrl_d_reads_eof() -> TestResult {
     let dir = DevDir;
     let Some(node) = dir.lookup("ttyS0") else {
         return TestResult::Fail("/dev/ttyS0 missing");
     };
-    if node.tty_id() != Some(crate::TTY_ID_CONSOLE) {
-        return TestResult::Fail("/dev/ttyS0 must be the console tty");
+    narf_input::init_global_ring(256);
+    narf_input::__reset_global_ring_for_test();
+    crate::console_tty::__test_reset_cooked();
+    let _ = narf_input::push_global(narf_input::InputEvent::AsciiByte(0x04));
+    let mut buf = [0u8; 16];
+    let first = poll_once_devfs(node.read(0, &mut buf));
+    let second = poll_once_devfs(node.read(0, &mut buf));
+    crate::console_tty::__test_reset_cooked();
+    if !matches!(first, Some(Ok(0))) {
+        return TestResult::Fail("^D on an empty line did not read as EOF");
+    }
+    if !matches!(second, Some(Err(FsError::WouldBlock))) {
+        return TestResult::Fail("the read after EOF did not block");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/devfs", smoke_dev_ttys0_ctrl_d_reads_eof);
+
+/// `/dev/ttyS0` is the UART's own tty (`systemd.debug_shell=/dev/ttyS0`,
+/// `agetty ttyS0`): a tty identity distinct from the VTs', and the VT/KD
+/// ioctls answer -ENOTTY as on a Linux UART.
+fn smoke_dev_ttys0_is_the_uart_tty() -> TestResult {
+    let dir = DevDir;
+    let Some(node) = dir.lookup("ttyS0") else {
+        return TestResult::Fail("/dev/ttyS0 missing");
+    };
+    if node.tty_id() != Some(crate::TTY_ID_SERIAL0) {
+        return TestResult::Fail("/dev/ttyS0 must be the UART's tty");
+    }
+    if dir.lookup("tty1").and_then(|n| n.tty_id()) != Some(crate::TTY_ID_CONSOLE) {
+        return TestResult::Fail("/dev/tty1 must be the VT tty");
     }
     let mut termios = [0u8; 60];
     if node.ioctl(crate::devfs_pty::TCGETS, termios.as_mut_ptr() as usize) != Ok(0) {
@@ -2653,7 +2699,7 @@ fn smoke_dev_ttys0_is_the_console_tty() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("filesystem/devfs", smoke_dev_ttys0_is_the_console_tty);
+kernel_test_in!("filesystem/devfs", smoke_dev_ttys0_is_the_uart_tty);
 
 /// Linux devtmpfs keeps char/block identity, `st_rdev`, ownership, mode, and
 /// inode identity on dynamically-created device nodes. It also applies the

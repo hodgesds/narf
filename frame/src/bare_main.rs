@@ -5234,26 +5234,15 @@ fn boot_userspace_init() {
     // ~10-50 ms scheduler tick the pump rides.
     #[cfg(target_arch = "x86_64")]
     {
-        // The handler drains the same way the pump does — bounded
-        // at 16 bytes/IRQ to keep the ISR latency predictable
-        // for level-triggered IRQs that re-fire if the line stays
-        // asserted (which it would until the FIFO drains).
+        // The handler drains the FIFO into the byte ring, up to 256
+        // bytes per IRQ like Linux `serial8250_rx_chars`. Flow control:
+        // `fill_byte_ring` never pulls a byte the ring cannot hold, and
+        // checks room, reads and pushes under the ring lock so this
+        // handler and the reader's `refill_byte_ring` on another CPU
+        // cannot overfill it (which evicted a queued byte). Bytes left
+        // behind stay in the UART FIFO until the reader refills.
         fn serial_isr() {
-            for _ in 0..16 {
-                // Flow control: never pull a byte the ring cannot hold. It
-                // stays in the UART FIFO until the console reader refills
-                // the ring (`narf_input::refill_byte_ring`).
-                if !narf_input::byte_ring_has_room() {
-                    narf_input::note_byte_ring_full();
-                    break;
-                }
-                match narf_console::try_read_byte() {
-                    Some(b) => {
-                        let _ = narf_input::push_global(narf_input::InputEvent::AsciiByte(b));
-                    }
-                    None => break,
-                }
-            }
+            narf_input::fill_byte_ring(narf_console::try_read_byte, 256);
         }
         // ISA IRQ 4 → GSI (with ISO override resolution) →
         // IOAPIC. PC AT default for IRQ 4 is edge-triggered

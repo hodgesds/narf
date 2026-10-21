@@ -371,6 +371,12 @@ pub struct UserTaskCtx {
     /// bytes are available, and the read re-executes (RIP was rewound).
     pub console_read_pending: AtomicBool,
 
+    /// The tty id (`FileOps::tty_id`) of the console fd that set
+    /// `console_read_pending`, 0 when unknown. The park re-checks only that
+    /// tty's input, so a VT reader does not spin on queued serial bytes
+    /// meant for `ttyS0`, nor a `ttyS0` reader on key presses.
+    pub console_read_tty: AtomicU32,
+
     /// Absolute monotonic-ns deadline of an *in-flight* `epoll_wait`/`poll`
     /// call, or `0` when no such call is parked. `u64::MAX` is never stored
     /// (infinite-timeout waits leave this `0`).
@@ -770,6 +776,7 @@ impl UserTaskCtx {
             wait_child_is_waitid: AtomicBool::new(false),
             wait_child_options: AtomicU32::new(0),
             console_read_pending: AtomicBool::new(false),
+            console_read_tty: AtomicU32::new(0),
             blocking_deadline_ns: AtomicU64::new(0),
             sock_timeo_deadline_ns: AtomicU64::new(0),
             sock_timeo_key: AtomicU64::new(0),
@@ -1590,7 +1597,7 @@ fn park_should_block(
         // Non-sigwait park — release the sticky waiter reservation (see above).
         uc.sigwait_reserve.store(0, Ordering::Release);
         narf_input::register_byte_waker(waker);
-        if narf_input::pending_input() > 0 {
+        if crate::fd::console_input_ready(uc.console_read_tty.load(Ordering::Acquire)) {
             uc.console_read_pending.store(false, Ordering::Release);
             return false; // a byte is ready → re-execute the read
         }
@@ -3062,8 +3069,9 @@ impl core::future::Future for UserTaskFuture {
             // pending_input() (serial bytes + keyboard keys), not
             // pending_bytes() — the unified discipline drains both rings,
             // so a keystroke alone must un-park a blocked console read.
-            if narf_input::pending_input() > 0
-                || crate::handlers::has_interrupting_signal(signal_task)
+            if crate::fd::console_input_ready(
+                this.task.uctx.console_read_tty.load(Ordering::Acquire),
+            ) || crate::handlers::has_interrupting_signal(signal_task)
             {
                 crate::handlers::drop_signal_waker(signal_task);
                 this.task
