@@ -416,8 +416,9 @@ and the mcache phase's free pipes.
 **Pipe harvesting (DCN401 pipe index vs. instance).** As in DC, every
 `u8` pipe in the display stack is a pipe index (`pipe_ctx->pipe_idx`):
 `otg::Request::pipe`, `SplitPipes`, the per-pipe `Status` and sibling
-records, `dccg::Request::pipe`, the selected display, DRM CRTC k, the
-modeset planners. Each owner snapshots the published pool in its layout
+records, `dccg::Request::pipe`, the selected display, `Modeset::pipe`, the
+modeset planners (a DRM CRTC is not a pipe: its stream's head pipe is
+acquired). Each owner snapshots the published pool in its layout
 (`otg` `Layout::pool`, `dccg` and `clk` likewise) and every per-pipe
 register is addressed at the index's instance: OTG/ODM/VTG, OPP, DPP/CM,
 HUBP (and its cursor), DOMAIN0-3 power gating, the MPCC (its DPP's
@@ -442,7 +443,7 @@ them); none is written. OTG/HUBP interrupt sources name instances and count
 for `pool.pipe(inst)` (`DisplayEvents` by pipe; a fused instance's event is
 unhandled). Planners and the platform take only pool pipes: `FreePipes`
 takes from the pool's top pipe down, `route_streams` and the CRTC routes
-refuse pipes past the pool, and KMS publishes `amdgpu_navi48_kms::
+refuse CRTCs past the pool, and KMS publishes `amdgpu_navi48_kms::
 crtc_count()` (Linux's `max_streams`, the pool's count) CRTCs with
 `possible_crtcs` limited to them. Model tests run the scanout chain, ODM,
 overlay/underlay/MPC trees, plane updates, cursor locks, timing, DSC, DCCG,
@@ -2435,31 +2436,38 @@ branch queries the board's DPM limits (starting display power if needed), but
 does not request an active-display count, clock floors, pipe clocks, payloads
 or scanout allocations. Startup failures do not publish new dark-output modes.
 
-`unsafe ColdBoot::modeset_routed(fill, want, pipe_of, mst: &[MstRoute])`
+`unsafe ColdBoot::modeset_routed(fill, want, crtc_of, mst: &[MstRoute])`
 lights board SST/HDMI sinks and the MST branches of any number of DP ports as
 one configuration. Each port has its own `MstLink` (manager, topology, payload
 table, owner), as amdgpu_dm initializes an mst_mgr per DP connector.
-`MstRoute { port, pipes, want }` names a branch's root port, each end
-device's pipe (`pipes[k]` for `MstLink::outputs[k]`, None dark) and timing
-request; routes name distinct ports. The round validates and starts every
+`MstRoute { port, crtcs, want }` names a branch's root port, each end
+device's CRTC (`crtcs[k]` for `MstLink::outputs[k]`, None dark) and timing
+request; routes name distinct ports. Streams are named by CRTC, never by
+pipe: each runs on the head pipe it acquires (`Modeset::pipe`, its owner
+slot) and records its CRTC (`Modeset::crtc`); the plane format, planes,
+Colorspace/HDR and CRTC color a lighting uses are the CRTC's
+(`set_plane_format`, `set_plane_setup`, `set_output_color`,
+`set_crtc_color`, by CRTC), the CRTC color recorded on the head pipe before
+its scanout starts. The round validates and starts every
 branch, scans once, selects board sinks with every MST root excluded
-(`select_all`; board port p on `pipe_of(p)` at `want(p)`) and each branch's
-devices against its own link (its time slots, PBN hops and DSC fairness),
-then `route_streams` joins them in pipe order, refusing a pipe named twice on
-one port or across ports (admission truncates trailing streams), and runs one
-clock request, `refine_dsc`, joint `admit_displays`, `prepare_pipes` and `light`
-per stream over every port together. SST connector inventory
+(`select_all`; board port p as CRTC `crtc_of(p)`'s stream at `want(p)`)
+and each branch's devices against its own link (its time slots, PBN hops
+and DSC fairness), then `route_streams` joins them in CRTC order, refusing
+a CRTC named twice on one port or across ports (admission truncates
+trailing streams), and runs one clock request, `refine_dsc`, joint
+`admit_displays`, `prepare_pipes` and `light` per stream over every port
+together. SST connector inventory
 (`display_sst_outputs`) excludes the MST roots; dark end devices are admitted
 beside every running stream, slots, hop PBN and DSC fairness counted only for
 their own port's payloads. `modeset_displays` is `modeset_routed` without a
 route. Each round is retried as described for `LinkReduced`.
 
-`unsafe ColdBoot::modeset_mst_displays(port, fill, want, pipes)` is
-`modeset_routed` with that route and no board pipes. It lights one
+`unsafe ColdBoot::modeset_mst_displays(port, fill, want, crtcs)` is
+`modeset_routed` with that route and no board CRTCs. It lights one
 branch's sinks with joint DML admission, RGB at each end device's depth (see
 "Navi 48 connector max bpc") and the maximum supported link.
-`pipes[k]: Option<u8>` assigns stable output k to a distinct display/pipe,
-or disables it. Disabled, unreadable and unadmitted devices
+`crtcs[k]: Option<u8>` assigns stable output k to a distinct CRTC, or
+disables it. Disabled, unreadable and unadmitted devices
 leave gaps; their successors never inherit their CRTC or requested mode.
 Each payload must fit the remaining 63 slots and the available PBN of every
 connected hop from the sink to the root, after subtracting selected sibling
@@ -2514,7 +2522,11 @@ Source verification accepts sibling routes being released while still rejecting 
 selections. Failed transitions retain their owners and allocations.
 
 KMS routing follows Linux: there are `crtc_count()` CRTCs, four unless
-pipes are fused (display/pipe index k is CRTC id 1 + 3k) and one connector per board DP/HDMI port (board ordinal n: encoder
+pipes are fused (display k is CRTC id 1 + 3k; its stream runs on the head
+pipe it acquires, as amdgpu_dm takes acrtc->otg_inst from the stream's
+primary_otg_inst: the platform's display k is CRTC k for KMS state,
+requests, presentation, vblank clocks and DRM cursors, and `crtc_pipe(k)`
+names its head pipe while lit) and one connector per board DP/HDMI port (board ordinal n: encoder
 2 + 3n, connector 3 + 3n, all ports, not only four), plus, for every DP port
 whose connected sink is an MST branch, a connector for each of its end-device
 slots that has held a device (index 32 + 16 port + slot), as drm_dp_mst adds
@@ -4747,10 +4759,10 @@ sequence. Every change starts pinned (`ColdBoot::pin_display_uclk`, under
 "Navi 48 UCLK P-state switching"); switching is regained only by the display
 monitor's P-state step.
 
-`ColdBoot::modeset_beside(fill, want, pipe_of, mst: &[MstRoute])` lights
+`ColdBoot::modeset_beside(fill, want, crtc_of, mst: &[MstRoute])` lights
 new board sinks and new MST end devices beside the running displays (route
-pipes already lit are ignored): DML admits every running display's mode with
-as many new ones as fit (`dml::admit_native`, pipe order), each running
+CRTCs already lit are ignored): DML admits every running display's mode with
+as many new ones as fit (`dml::admit_native`, CRTC order), each running
 display keeping its pipes (`modeset::keeps_pipes`: the same mode, ODM
 segments and MPC slices; otherwise `None`, as for no free slot or a
 running configuration that no longer fits, before any change). A new end
@@ -4794,7 +4806,7 @@ asked for changed (`MonitorStep::LitBeside`) and replans after a display
 left (`MonitorStep::Replanned`), relighting everything only when refused.
 
 `ColdBoot::mst_affected_streams(port, joining, want) -> Option<u8>` (by
-pipe; `mst::affected_mst_streams`) gives the running streams on `port` a
+CRTC; `mst::affected_mst_streams`) gives the running streams on `port` a
 commit must modeset, as amdgpu_dm finds them: every stream of the topology
 in the commit (drm_dp_mst_add_affected_dsc_crtcs), the link's fairness
 search run over them all with the devices `joining` lights (each running

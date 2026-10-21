@@ -20,6 +20,7 @@ fn completed_modeset(pipe: u8) -> Modeset {
     Modeset {
         selection,
         pipe,
+        crtc: pipe,
         plan,
         scanout: otg::ScanoutRunning {
             pipe,

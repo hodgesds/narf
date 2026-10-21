@@ -787,8 +787,8 @@ async unsafe fn quiesce(
     *CLEARER.lock() = None;
     crate::amdgpu_info::withdraw_navi48_clock();
     crate::amdgpu_info::publish_navi48_video(0);
-    for pipe in 0..4 {
-        present_slot(pipe).native.store(false, Ordering::Release);
+    for display in 0..4 {
+        present_slot(display).native.store(false, Ordering::Release);
     }
     crate::amdgpu_dcn_display::publish_external(None, None);
     crate::scanout_access::wait_retired().await;
@@ -2405,10 +2405,12 @@ pub async unsafe fn retire_inherited_display(
 // them, each its own topology manager as amdgpu_dm keeps one per DP
 // connector), every end-device slot that branch has given a device (the
 // root's own connector then reports nothing, as amdgpu_dm's MST root).
-// Display k is pipe k, its owner slot and CRTC k.
-// Each CRTC is routed to at most one connector: as DRM set it (SETCRTC's
-// connector, an atomic connector CRTC_ID), else automatically to plugged
-// connectors in connector order. The console runs on the first lit
+// Display k is CRTC k: its KMS state, requests, presentation, vblank clock
+// and DRM cursor. Its stream runs on the head pipe DC acquired for it
+// (`Modeset::pipe`, the owner's slot), not on pipe k; `crtc_pipe` maps a
+// lit display to it. Each CRTC is routed to at most one connector: as DRM
+// set it (SETCRTC's connector, an atomic connector CRTC_ID), else
+// automatically to plugged connectors in connector order. The console runs on the first lit
 // display; DRM clients present per display.
 
 type Timing = crate::amdgpu_dml::Timing;
@@ -2421,9 +2423,31 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 static CURSOR_PIPE: AtomicU8 = AtomicU8::new(0);
 static DISPLAY_GENERATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// The pipe (display) the console runs on.
+/// No head pipe: the display is dark.
+const NO_PIPE: u8 = u8::MAX;
+/// Each display's (CRTC's) head pipe while it is lit.
+static CRTC_PIPES: [AtomicU8; 4] = [const { AtomicU8::new(NO_PIPE) }; 4];
+/// The head pipe display `display` scans out on, while it is lit.
+fn crtc_pipe(display: u8) -> Option<u8> {
+    let pipe = CRTC_PIPES
+        .get(usize::from(display))?
+        .load(Ordering::Acquire);
+    (pipe != NO_PIPE).then_some(pipe)
+}
+/// The display (CRTC) whose stream runs on head pipe `pipe`.
+fn pipe_crtc(pipe: u8) -> Option<u8> {
+    (0..CRTC_PIPES.len() as u8).find(|&k| crtc_pipe(k) == Some(pipe))
+}
+/// Record display `display`'s head pipe (None: dark).
+fn set_crtc_pipe(display: u8, pipe: Option<u8>) {
+    if let Some(slot) = CRTC_PIPES.get(usize::from(display)) {
+        slot.store(pipe.unwrap_or(NO_PIPE), Ordering::Release);
+    }
+}
+
+/// The display (CRTC) the console runs on (`u8::MAX` without one).
 pub fn console_pipe() -> u8 {
-    CURSOR_PIPE.load(Ordering::Acquire)
+    pipe_crtc(CURSOR_PIPE.load(Ordering::Acquire)).unwrap_or(u8::MAX)
 }
 
 /// What a connector drives.
@@ -2610,9 +2634,9 @@ impl CrtcState {
     }
 }
 
-// The CRTCs KMS publishes (one per pipe of the pool; CRTC k drives pipe
-// index k). `Outputs::crtcs` keeps four slots; those past the count are
-// never routed, lit or published.
+// The CRTCs KMS publishes (as many as the pool has pipes; CRTC k's stream
+// runs on the head pipe it acquires). `Outputs::crtcs` keeps four slots;
+// those past the count are never routed, lit or published.
 use crate::amdgpu_navi48_kms::crtc_count;
 
 /// The connectors and CRTCs, under one lock.
@@ -2996,8 +3020,10 @@ fn publish_outputs() {
 /// move; hide with an off-screen move. Never waits for the owner.
 fn scanout_cursor(image: (u32, u32, &[u32]), position: Option<(i32, i32)>) -> bool {
     let pipe = CURSOR_PIPE.load(Ordering::Acquire);
+    // The console's display (CRTC), whose bits the DRM cursor state keeps.
+    let bit = pipe_crtc(pipe).map_or(0, |d| 1u8 << (d & 7));
     // A DRM cursor plane drives this display's cursor.
-    if drm_owns_cursor(pipe) {
+    if DRM_CURSOR_OWNED.load(Ordering::Acquire) & bit != 0 {
         return true;
     }
     let Some(mut owner) = OWNER.try_lock() else {
@@ -3009,7 +3035,7 @@ fn scanout_cursor(image: (u32, u32, &[u32]), position: Option<(i32, i32)>) -> bo
     let (w, h, _) = image;
     // After DRM let go of the cursor the pipe holds DRM's image, whatever
     // its size: upload the pointer again.
-    let stale = CONSOLE_CURSOR_STALE.load(Ordering::Acquire) & (1u8 << (pipe & 7)) != 0;
+    let stale = CONSOLE_CURSOR_STALE.load(Ordering::Acquire) & bit != 0;
     let shown = !stale
         && boot
             .display_status(pipe)
@@ -3028,7 +3054,7 @@ fn scanout_cursor(image: (u32, u32, &[u32]), position: Option<(i32, i32)>) -> bo
         (false, Some(at)) => {
             // SAFETY: as above.
             if unsafe { boot.set_display_cursor(pipe, image, at) }.is_ok() {
-                CONSOLE_CURSOR_STALE.fetch_and(!(1u8 << (pipe & 7)), Ordering::AcqRel);
+                CONSOLE_CURSOR_STALE.fetch_and(!bit, Ordering::AcqRel);
             }
         }
     }
@@ -3047,20 +3073,20 @@ fn publish_console(boot: &boot::ColdBoot, pipe: Option<u8>) {
     }
 }
 
-/// Make `m` presentable: its back buffer (reused across relights of the
-/// same geometry) for tear-free DRM frames, its vblank count continued, its
-/// sink published as shown.
+/// Make `m` presentable on its CRTC: its head pipe recorded, its back
+/// buffer (reused across relights of the same geometry) for tear-free DRM
+/// frames, its vblank count continued, its sink published as shown.
 /// # Safety
 /// As for `modeset_displays`.
 async unsafe fn adopt(boot: &mut boot::ColdBoot, m: &Modeset) {
-    let pipe = m.pipe;
+    set_crtc_pipe(m.crtc, Some(m.pipe));
     // SAFETY: the caller's obligations.
     unsafe { adopt_planes(boot, m) }.await;
     // Its timing generator restarted: the vblank count continues.
-    restart_vblank(pipe);
+    restart_vblank(m.crtc);
     let s = &m.selection;
     let offered: Vec<Timing> = m.modes.iter().flatten().copied().collect();
-    if let Some(c) = OUTPUTS.lock().crtcs.get_mut(usize::from(pipe)) {
+    if let Some(c) = OUTPUTS.lock().crtcs.get_mut(usize::from(m.crtc)) {
         c.shown = Some((s.edid, s.timing, offered));
         c.admitted = Some((m.plan.soc, m.plan.mode));
         c.retiring = false;
@@ -3087,13 +3113,13 @@ async unsafe fn adopt_planes(boot: &mut boot::ColdBoot, m: &Modeset) {
         let _ = unsafe { boot.prepare_display_plane_back_buffer(pipe, q).await };
         backed &= boot.display_back_framebuffer(q).is_ok();
     }
-    *present_slot(pipe).shown.lock() = PlanesShown {
+    let slot = present_slot(m.crtc);
+    *slot.shown.lock() = PlanesShown {
         planes: m.selection.planes,
         overlay_pipes,
     };
-    present_slot(pipe).native.store(backed, Ordering::Release);
-    present_slot(pipe)
-        .format
+    slot.native.store(backed, Ordering::Release);
+    slot.format
         .store(m.selection.format.fourcc(), Ordering::Release);
 }
 
@@ -3127,12 +3153,13 @@ async unsafe fn update_lit_planes(
     let Some(m) = displays.lit[usize::from(k)] else {
         return Ok(false);
     };
+    let pipe = m.pipe;
     let reset = planes_reordered(&m.selection.planes, &setup);
     // A format or size change replaces the primary's surface, which the
     // console may draw into: withdraw it across the update.
-    let console = CURSOR_PIPE.load(Ordering::Acquire) == k
+    let console = CURSOR_PIPE.load(Ordering::Acquire) == pipe
         && crate::amdgpu_dcn_display::active_scanout().is_some_and(|fb| {
-            boot.display_scanout_framebuffer(k)
+            boot.display_scanout_framebuffer(pipe)
                 .is_ok_and(|f| f.addr == fb.addr)
         });
     if console {
@@ -3149,7 +3176,8 @@ async unsafe fn update_lit_planes(
         pins: Vec::new(),
     };
     // SAFETY: the caller's obligations; the console no longer draws.
-    let result = unsafe { boot.update_display_planes(k, format, setup, reset, &mut frames) }.await;
+    let result =
+        unsafe { boot.update_display_planes(pipe, format, setup, reset, &mut frames) }.await;
     // The client framebuffers the update scans out in place: held from the
     // update on (whatever its outcome: a failed one may fetch them), until
     // a flip or stop shows them no longer fetched.
@@ -3164,9 +3192,9 @@ async unsafe fn update_lit_planes(
                 // follow the new plans.
                 let mut outputs = OUTPUTS.lock();
                 for d in &change.displays {
-                    if let Some(c) = outputs.crtcs.get_mut(usize::from(d.pipe)) {
+                    if let Some(c) = outputs.crtcs.get_mut(usize::from(d.crtc)) {
                         c.admitted = Some((d.plan.soc, d.plan.mode));
-                        if d.pipe == k {
+                        if d.crtc == k {
                             c.format = d.selection.format;
                             c.planes = d.selection.planes;
                         }
@@ -3174,7 +3202,7 @@ async unsafe fn update_lit_planes(
                 }
             }
             for d in change.displays {
-                displays.lit[usize::from(d.pipe)] = Some(d);
+                displays.lit[usize::from(d.crtc)] = Some(d);
             }
             if let Some(m) = displays.lit[usize::from(k)] {
                 // SAFETY: as above.
@@ -3185,13 +3213,13 @@ async unsafe fn update_lit_planes(
         Ok(None) => false,
         Err(e) => {
             if console {
-                publish_console(boot, Some(k));
+                publish_console(boot, Some(pipe));
             }
             return Err(e);
         }
     };
     if console {
-        publish_console(boot, Some(k));
+        publish_console(boot, Some(pipe));
     }
     Ok(changed)
 }
@@ -3389,10 +3417,11 @@ unsafe fn frame_chunk(
     Some(u64::from(index) * u64::from(a.pitch_bytes))
 }
 
-/// Stop presenting on `pipe` and, when it carried the console, move the
-/// console to another lit display (or withdraw it).
-async fn withdraw(boot: &boot::ColdBoot, pipe: u8, lit: &[Option<Modeset>; 4]) {
-    present_slot(pipe).native.store(false, Ordering::Release);
+/// Stop presenting on `m`'s display and, when it carried the console, move
+/// the console to another lit display (or withdraw it).
+async fn withdraw(boot: &boot::ColdBoot, m: &Modeset, lit: &[Option<Modeset>; 4]) {
+    let pipe = m.pipe;
+    present_slot(m.crtc).native.store(false, Ordering::Release);
     if CURSOR_PIPE.load(Ordering::Acquire) == pipe {
         let next = lit
             .iter()
@@ -3405,8 +3434,9 @@ async fn withdraw(boot: &boot::ColdBoot, pipe: u8, lit: &[Option<Modeset>; 4]) {
 }
 
 /// Light every plugged sink whose CRTC DRM has not switched off, as one
-/// configuration (output k on pipe k), filling rows with `fill(pipe, y,
-/// row)` before each fetch starts, then publish them: the console on the
+/// configuration (each CRTC's stream on the head pipe it acquires),
+/// filling rows with `fill(pipe, y, row)` before each fetch starts, then
+/// publish them: the console on the
 /// first display, every output on KMS. Every display must be stopped.
 /// # Safety
 /// Inherited display consumers must be retired; withdraw and drain any CPU
@@ -3496,10 +3526,11 @@ async unsafe fn light_displays(
             crate::amdgpu_navi48_boot::set_output_color(k as u8, colorspace, hdr);
         }
         outputs.stage_requested_bpc(|k| routes[k].is_some());
-        // Display k lights on pipe k with its CRTC's plane format and planes.
+        // CRTC k lights with its plane format, planes and CRTC color.
         for (k, c) in outputs.crtcs[..count].iter_mut().enumerate() {
             crate::amdgpu_navi48_boot::set_plane_format(k as u8, c.format);
             crate::amdgpu_navi48_boot::set_plane_setup(k as u8, c.planes);
+            crate::amdgpu_navi48_boot::set_crtc_color(k as u8, c.color.clone());
             if c.active {
                 c.admitted = None;
             }
@@ -3507,11 +3538,11 @@ async unsafe fn light_displays(
         (routes, wants)
     };
     let crtc_of = |t: Target| routes.iter().position(|r| *r == Some(t));
-    let pipe = |port: usize| crtc_of(Target::Board(port)).map(|k| k as u8);
+    let crtc = |port: usize| crtc_of(Target::Board(port)).map(|k| k as u8);
     let want = |port: usize| crtc_of(Target::Board(port)).and_then(|k| wants[k]);
     // End device k stays on its connector, including gaps for disabled or
     // unreadable devices: compacting would move another monitor.
-    let mst_pipes: Vec<Vec<Option<u8>>> = mst
+    let mst_crtcs: Vec<Vec<Option<u8>>> = mst
         .iter()
         .map(|&port| {
             (0..boot::MST_OUTPUTS as u8)
@@ -3527,12 +3558,12 @@ async unsafe fn light_displays(
         .collect();
     let routes: Vec<boot::MstRoute> = mst
         .iter()
-        .zip(&mst_pipes)
+        .zip(&mst_crtcs)
         .zip(&mst_wants)
-        .map(|((&port, pipes), want)| boot::MstRoute { port, pipes, want })
+        .map(|((&port, crtcs), want)| boot::MstRoute { port, crtcs, want })
         .collect();
     // SAFETY: the caller's obligations.
-    let result = unsafe { boot.modeset_routed(fill, want, pipe, &routes) }.await;
+    let result = unsafe { boot.modeset_routed(fill, want, crtc, &routes) }.await;
     {
         let mut outputs = OUTPUTS.lock();
         for c in &mut outputs.crtcs {
@@ -3670,8 +3701,13 @@ async fn follow_flip(before: Option<GenericFb>, after: Option<GenericFb>) {
 /// the display stopped). While a change is in flight or after a failure
 /// every pin stays: the buffer may still be fetched.
 fn retire_scanout_pins(boot: &boot::ColdBoot, display: u8) {
-    let Some(fetched) = boot.display_fetched_addresses(display) else {
-        return;
+    // A dark display's HUBPs fetch nothing (its head pipe was released).
+    let fetched = match crtc_pipe(display) {
+        Some(pipe) => match boot.display_fetched_addresses(pipe) {
+            Some(fetched) => fetched.to_vec(),
+            None => return,
+        },
+        None => Vec::new(),
     };
     let slot = present_slot(display);
     let retired = retire_unfetched(&mut slot.pins.lock(), &fetched);
@@ -3725,7 +3761,11 @@ async unsafe fn release_client_scanout(boot: &mut boot::ColdBoot) -> bool {
         if !scans_client_buffers(display) {
             continue;
         }
-        let Some(fetched) = boot.display_fetched_addresses(display) else {
+        let Some(pipe) = crtc_pipe(display) else {
+            released = false;
+            continue;
+        };
+        let Some(fetched) = boot.display_fetched_addresses(pipe) else {
             released = false;
             continue;
         };
@@ -3743,18 +3783,18 @@ async unsafe fn release_client_scanout(boot: &mut boot::ColdBoot) -> bool {
         }
         // SAFETY: the caller's obligations; the back buffers hold what the
         // presenter last copied and no CPU writer touches them.
-        if unsafe { boot.flip_display_sources(display, sources).await }.is_err() {
+        if unsafe { boot.flip_display_sources(pipe, sources).await }.is_err() {
             released = false;
             continue;
         }
         retire_scanout_pins(boot, display);
         released &= !scans_client_buffers(display);
         // The console followed the display off the client's buffer.
-        if CURSOR_PIPE.load(Ordering::Acquire) == display
+        if CURSOR_PIPE.load(Ordering::Acquire) == pipe
             && crate::amdgpu_dcn_display::active_scanout().is_none()
             && !narf_console::fb_user_owned()
         {
-            publish_console(boot, Some(display));
+            publish_console(boot, Some(pipe));
         }
     }
     released
@@ -3986,11 +4026,11 @@ fn extrapolate_vblank(clock: VblankClock, now: u64) -> Option<crate::drm::card::
     })
 }
 
-/// Read display `display`'s vblank clock from the hardware (display k
-/// scans out on pipe k). None while its timing does not run.
+/// Read display `display`'s vblank clock from the hardware (its head
+/// pipe's timing generator). None while its timing does not run.
 fn read_vblank(boot: &mut boot::ColdBoot, display: u8) -> Option<crate::drm::card::VblankTime> {
     let slot = VBLANK_CLOCKS.get(usize::from(display))?;
-    let position = boot.display_scanout_position(display).ok()?;
+    let position = boot.display_scanout_position(crtc_pipe(display)?).ok()?;
     let read_ns = narf_time::wall::monotonic_ns();
     let phase = position.phase()?;
     let mut clock = slot.lock();
@@ -4232,7 +4272,12 @@ async fn presenter(display: u8) {
                     // Refused before any register changed (a client
                     // framebuffer the plane cannot fetch): the display still
                     // scans out what it showed.
-                    Err(_) if boot.display_fetched_addresses(display).is_some() => Ok(None),
+                    Err(_)
+                        if crtc_pipe(display)
+                            .is_some_and(|p| boot.display_fetched_addresses(p).is_some()) =>
+                    {
+                        Ok(None)
+                    }
                     Err(e) => Err(e),
                 },
                 None => Err(crate::amdgpu_dcn401_otg::Error::Busy),
@@ -4273,24 +4318,26 @@ async fn wait_scanout_writes(frame: &Frame) {
     }
 }
 
-/// Show each plane of `frame` on display `pipe`'s live scanout, then flip
-/// those planes together: a pinned GEM framebuffer in place (no copy, its
-/// pin kept until a later flip latches past it), a dumb one copied into
-/// the plane's back buffer first. Returns the published front's CPU view
-/// before and after (none for a client framebuffer, which has none), or
-/// None when the frame updates no plane the display shows.
+/// Show each plane of `frame` on display `display`'s live scanout (on its
+/// head pipe), then flip those planes together: a pinned GEM framebuffer
+/// in place (no copy, its pin kept until a later flip latches past it), a
+/// dumb one copied into the plane's back buffer first. Returns the
+/// published front's CPU view before and after (none for a client
+/// framebuffer, which has none), or None when the frame updates no plane
+/// the display shows.
 /// # Safety
 /// The caller holds the owner lock; `frame` names mapped dumb buffers or
 /// pinned GEM buffers.
 async unsafe fn present_native(
     boot: &mut boot::ColdBoot,
-    pipe: u8,
+    display: u8,
     frame: &Frame,
 ) -> Result<Option<(Option<GenericFb>, Option<GenericFb>)>, crate::amdgpu_dcn401_otg::Error> {
     // A previous presenter may have been cancelled while draining the old
     // front after a successful flip. Finish that barrier before reusing it.
     crate::scanout_access::wait_retired().await;
-    let shown = *present_slot(pipe).shown.lock();
+    let pipe = crtc_pipe(display).ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    let shown = *present_slot(display).shown.lock();
     let mut sources = [None; 1 + crate::amdgpu_dcn401_otg::MAX_OVERLAYS];
     let mut pins = Vec::new();
     // A frame of another tiling than the plane shows waits for the relight
@@ -4337,8 +4384,8 @@ async unsafe fn present_native(
     // touches them until the next flip (the owner lock is held); the client
     // framebuffers stay pinned (`pins`, then the slot's) until retired.
     unsafe { boot.flip_display_sources(pipe, sources).await }?;
-    present_slot(pipe).pins.lock().extend(pins);
-    retire_scanout_pins(boot, pipe);
+    present_slot(display).pins.lock().extend(pins);
+    retire_scanout_pins(boot, display);
     Ok(Some((before, boot.display_scanout_framebuffer(pipe).ok())))
 }
 
@@ -4544,8 +4591,8 @@ pub unsafe fn try_move_display_cursor(
 // ── DRM cursor planes ────────────────────────────────────────────────
 //
 // A DRM commit of display k's cursor plane (amdgpu_dm_commit_cursors /
-// handle_cursor_update) sets what pipe k's hardware cursor shows; a task
-// converges the hardware to it under OWNER, as do monitor passes (after a
+// handle_cursor_update) sets what its head pipe's hardware cursor shows;
+// a task converges the hardware to it under OWNER, as do monitor passes (after a
 // relight, as amdgpu_dm programs the cursor after the planes). It is a FAST
 // update: the cursor's attributes and position on every pipe of the
 // stream, nothing relit. While DRM drives a display's cursor the console's
@@ -4648,9 +4695,9 @@ fn release_drm_cursors() {
     }
 }
 
-/// Whether DRM drives display `pipe`'s cursor.
-fn drm_owns_cursor(pipe: u8) -> bool {
-    DRM_CURSOR_OWNED.load(Ordering::Acquire) & (1u8 << (pipe & 7)) != 0
+/// Whether DRM drives display `display`'s cursor.
+fn drm_owns_cursor(display: u8) -> bool {
+    DRM_CURSOR_OWNED.load(Ordering::Acquire) & (1u8 << (display & 7)) != 0
 }
 
 async fn drm_cursor_task(display: u8) {
@@ -4685,9 +4732,10 @@ unsafe fn converge_drm_cursors(boot: &mut boot::ColdBoot) {
     }
 }
 
-/// What display `display`'s hardware cursor needs to show its DRM cursor
-/// plane, and doing it: handle_cursor_update's attributes (a new image, or
-/// none on the pipe) and position, or the cursor off.
+/// What display `display`'s hardware cursor (its head pipe's) needs to
+/// show its DRM cursor plane, and doing it: handle_cursor_update's
+/// attributes (a new image, or none on the pipe) and position, or the
+/// cursor off.
 /// # Safety
 /// Serialized retained owner; exclude other display writers.
 unsafe fn converge_drm_cursor(boot: &mut boot::ColdBoot, display: u8) {
@@ -4698,28 +4746,13 @@ unsafe fn converge_drm_cursor(boot: &mut boot::ColdBoot, display: u8) {
         c.upload = false;
         snapshot
     };
-    let current = boot
-        .display_status(display)
-        .ok()
-        .flatten()
-        .and_then(|s| s.cursor)
-        .filter(|c| c.pipe == display);
-    let size = image.as_deref().map(|i| (i.width, i.height));
-    // A failure quarantines the pipe in the owner; the cursor just stops.
-    let result = match drm_cursor_step(current, size, upload, position) {
-        CursorStep::Keep => Ok(()),
+    let result = match crtc_pipe(display) {
         // SAFETY: the caller's obligations.
-        CursorStep::Hide => unsafe { boot.move_display_cursor(display, CURSOR_OFF) }.map(drop),
-        // SAFETY: as above.
-        CursorStep::Move => unsafe { boot.move_display_cursor(display, position) }.map(drop),
-        CursorStep::Upload => match image.as_deref() {
-            // SAFETY: as above.
-            Some(i) => unsafe {
-                boot.set_display_cursor(display, (i.width, i.height, &i.pixels), position)
-            }
-            .map(drop),
-            None => Ok(()),
+        Some(pipe) => unsafe {
+            converge_pipe_cursor(boot, pipe, image.as_deref(), upload, position)
         },
+        // A dark display: shown once it lights.
+        None => Err(crate::amdgpu_dcn401_otg::Error::Busy),
     };
     if result.is_err() && upload {
         // Not shown (the pipe not scanning out yet): the next converge
@@ -4728,6 +4761,41 @@ unsafe fn converge_drm_cursor(boot: &mut boot::ColdBoot, display: u8) {
     }
     if !drm_owns_cursor(display) {
         CONSOLE_CURSOR_STALE.fetch_or(1 << display, Ordering::AcqRel);
+    }
+}
+
+/// `converge_drm_cursor` on head pipe `pipe`.
+/// # Safety
+/// As for `converge_drm_cursor`.
+unsafe fn converge_pipe_cursor(
+    boot: &mut boot::ColdBoot,
+    pipe: u8,
+    image: Option<&CursorImage>,
+    upload: bool,
+    position: (i32, i32),
+) -> Result<(), crate::amdgpu_dcn401_otg::Error> {
+    let current = boot
+        .display_status(pipe)
+        .ok()
+        .flatten()
+        .and_then(|s| s.cursor)
+        .filter(|c| c.pipe == pipe);
+    let size = image.map(|i| (i.width, i.height));
+    // A failure quarantines the pipe in the owner; the cursor just stops.
+    match drm_cursor_step(current, size, upload, position) {
+        CursorStep::Keep => Ok(()),
+        // SAFETY: the caller's obligations.
+        CursorStep::Hide => unsafe { boot.move_display_cursor(pipe, CURSOR_OFF) }.map(drop),
+        // SAFETY: as above.
+        CursorStep::Move => unsafe { boot.move_display_cursor(pipe, position) }.map(drop),
+        CursorStep::Upload => match image {
+            Some(i) => {
+                // SAFETY: as above.
+                unsafe { boot.set_display_cursor(pipe, (i.width, i.height, &i.pixels), position) }
+                    .map(drop)
+            }
+            None => Ok(()),
+        },
     }
 }
 
@@ -5042,9 +5110,10 @@ async fn stream_updater() {
 }
 
 /// Bring every display's CRTC color to what DRM committed: recorded for a
-/// dark display's next lighting, reprogrammed on a live one (amdgpu_dm's
-/// non-modeset update). A refused change is reported and retried by the
-/// display monitor's next pass.
+/// dark display's next lighting (on whichever head pipe it acquires),
+/// reprogrammed on a live one's head pipe (amdgpu_dm's non-modeset
+/// update). A refused change is reported and retried by the display
+/// monitor's next pass.
 async fn converge_streams(boot: &mut boot::ColdBoot) {
     let wants: [Option<Arc<crate::amdgpu_dcn401_otg::ColorProgram>>; 4] = {
         let outputs = OUTPUTS.lock();
@@ -5057,7 +5126,7 @@ async fn converge_streams(boot: &mut boot::ColdBoot) {
         core::array::from_fn(|k| connector_color(&outputs, k))
     };
     for m in boot.display_modesets().into_iter().flatten() {
-        let k = usize::from(m.pipe);
+        let k = usize::from(m.crtc);
         let (colorspace, Some(metadata)) = colors[k] else {
             continue;
         };
@@ -5080,8 +5149,13 @@ async fn converge_streams(boot: &mut boot::ColdBoot) {
             );
         }
     }
-    for (k, want) in wants.into_iter().enumerate() {
-        let have = boot.display_color(k as u8);
+    for (k, want) in wants.iter().enumerate() {
+        crate::amdgpu_navi48_boot::set_crtc_color(k as u8, want.clone());
+    }
+    for m in boot.display_modesets().into_iter().flatten() {
+        let k = usize::from(m.crtc);
+        let want = wants[k].clone();
+        let have = boot.display_color(m.pipe);
         let same = match (&have, &want) {
             (Some(a), Some(b)) => Arc::ptr_eq(a, b),
             (None, None) => true,
@@ -5091,7 +5165,7 @@ async fn converge_streams(boot: &mut boot::ColdBoot) {
             continue;
         }
         // SAFETY: OWNER is held; the platform excludes other display writers.
-        if let Err(e) = unsafe { boot.set_display_color(k as u8, want) }.await {
+        if let Err(e) = unsafe { boot.set_display_color(m.pipe, want) }.await {
             let _ = core::fmt::Write::write_fmt(
                 &mut narf_console::Writer,
                 format_args!("amdgpu: navi48 display {k} color not applied: {e:?}\n"),
@@ -5121,7 +5195,7 @@ pub fn request_vrr_enabled(display: u8, enabled: bool) {
     }
 }
 
-/// What DRR display `pipe`'s lit modeset should run: its mode's totals
+/// What DRR lit modeset `m` should run: its mode's totals
 /// while DRM enabled VRR on its CRTC and the mode is VRR-supported.
 fn wanted_drr(m: &Modeset, vrr: bool) -> Option<crate::amdgpu_freesync::Drr> {
     vrr.then(|| m.selection.drr()).flatten()
@@ -5139,7 +5213,7 @@ fn drr_wanted(boot: &boot::ColdBoot) -> bool {
     boot.display_modesets()
         .into_iter()
         .flatten()
-        .any(|m| wanted_drr(&m, wants[usize::from(m.pipe)]).is_some())
+        .any(|m| wanted_drr(&m, wants[usize::from(m.crtc)]).is_some())
 }
 
 /// Bring every live scanout's DRR to what DRM asked (amdgpu_dm's
@@ -5149,7 +5223,7 @@ fn drr_wanted(boot: &boot::ColdBoot) -> bool {
 fn converge_vrr(boot: &mut boot::ColdBoot) {
     let wants = vrr_wants();
     for m in boot.display_modesets().into_iter().flatten() {
-        let k = usize::from(m.pipe);
+        let k = usize::from(m.crtc);
         let Ok(Some(status)) = boot.display_status(m.pipe) else {
             continue;
         };
@@ -5504,7 +5578,7 @@ pub fn restore_displays() {
     }
 }
 
-/// The monitor's view of the configuration: each pipe's running modeset,
+/// The monitor's view of the configuration: each CRTC's running modeset,
 /// and the outputs whose plugged sinks the last lighting already considered
 /// (lit or left dark), so only a new sink or a returned CRTC relights.
 #[derive(Debug)]
@@ -5526,7 +5600,7 @@ fn needs_relight(changed: bool, wanted: u8, lit: u8, considered: &mut u8) -> boo
     changed || wanted & !*considered & !lit != 0
 }
 
-/// The `count` pipes, those in `pending` first.
+/// The `count` displays (CRTCs), those in `pending` first.
 fn monitor_order(pending: u8, count: u8) -> impl Iterator<Item = u8> {
     (0..count)
         .filter(move |p| pending & (1 << p) != 0)
@@ -5577,16 +5651,17 @@ fn wanted_mask(boot: &mut boot::ColdBoot) -> u8 {
 async unsafe fn retire_monitored_display(
     boot: &mut boot::ColdBoot,
     displays: &mut Displays,
-    pipe: u8,
+    k: u8,
     unplugged: bool,
 ) -> Result<(), ModesetError> {
-    let m = displays.lit[usize::from(pipe)].ok_or(crate::amdgpu_dcn401_otg::Error::Invalid)?;
+    let m = displays.lit[usize::from(k)].ok_or(crate::amdgpu_dcn401_otg::Error::Invalid)?;
+    let pipe = m.pipe;
     // Before teardown can change the branch's payload records.
     let target = target_of(boot, &m);
     boot.begin_modeset_teardown(&m, unplugged)?;
-    OUTPUTS.lock().crtcs[usize::from(pipe)].retiring = true;
+    OUTPUTS.lock().crtcs[usize::from(k)].retiring = true;
     publish_outputs();
-    withdraw(boot, pipe, &displays.lit).await;
+    withdraw(boot, &m, &displays.lit).await;
     // SAFETY: CPU views drained and OWNER excludes native producers. The
     // retained journal skips successes; the unfinished native step checks itself.
     unsafe {
@@ -5597,13 +5672,14 @@ async unsafe fn retire_monitored_display(
         }
         boot.release_display_surfaces(pipe)?;
     }
-    displays.lit[usize::from(pipe)] = None;
+    displays.lit[usize::from(k)] = None;
+    set_crtc_pipe(k, None);
     // A request to reactivate during withdrawal is a new lighting attempt.
-    displays.considered &= !(1 << pipe);
+    displays.considered &= !(1 << k);
     {
         let mut outputs = OUTPUTS.lock();
-        outputs.crtcs[usize::from(pipe)].shown = None;
-        outputs.crtcs[usize::from(pipe)].admitted = None;
+        outputs.crtcs[usize::from(k)].shown = None;
+        outputs.crtcs[usize::from(k)].admitted = None;
         // A disable need not relight siblings. Retain the modes already
         // admitted beside them, without a CRTC mode; the next configuration
         // or reprobe recomputes independent admission.
@@ -5642,6 +5718,9 @@ pub async unsafe fn monitor_displays(
     if displays.epoch != recoveries() {
         displays.epoch = recoveries();
         displays.lit = [None; 4];
+        for k in 0..4 {
+            set_crtc_pipe(k, None);
+        }
         displays.considered = 0;
         for c in &mut OUTPUTS.lock().crtcs {
             c.shown = None;
@@ -5652,10 +5731,12 @@ pub async unsafe fn monitor_displays(
     // Cancellation may have lost the caller's configuration during a later
     // pipe startup or asynchronous adoption. Restore actual completed witnesses
     // and retire them through the usual CPU withdrawal and native journal.
+    // Recovered by CRTC.
     let recovered = boot.restore_modesets(&mut displays.lit)?;
     let pipes = crate::amdgpu_rdna4::pipe_pool().pipes();
-    for pipe in pipes.clone().filter(|p| recovered & (1 << p) != 0) {
-        let m = displays.lit[usize::from(pipe)].unwrap();
+    let count = crtc_count() as u8;
+    for k in (0..count).filter(|k| recovered & (1 << k) != 0) {
+        let m = displays.lit[usize::from(k)].unwrap();
         let unplugged = boot.display_hpd(m.selection.port) == Ok(false);
         boot.begin_modeset_teardown(&m, unplugged)?;
     }
@@ -5666,13 +5747,18 @@ pub async unsafe fn monitor_displays(
             .display_teardown_status(pipe)
             .is_some_and(|s| s.activation)
         {
-            if displays.lit[usize::from(pipe)].is_some() {
+            if displays.lit.iter().flatten().any(|m| m.pipe == pipe) {
                 return Err(crate::amdgpu_dcn401_otg::Error::Busy.into());
             }
             // SAFETY: this activation never published a CPU scanout; OWNER
             // and the caller's exclusions retain every native resource.
             unsafe { boot.abort_modeset_activation(pipe) }.await?;
-            displays.considered &= !(1 << pipe);
+            // Its CRTC (whichever acquired the pipe) is a new attempt.
+            displays.considered &= displays
+                .lit
+                .iter()
+                .flatten()
+                .fold(0, |acc, m| acc | 1 << m.crtc);
         }
     }
     // Keep a connected branch's connectors and DRM requests even when its
@@ -5720,12 +5806,13 @@ pub async unsafe fn monitor_displays(
     };
     let limited =
         crate::amdgpu_navi48_boot::limited_range(crate::amdgpu_navi48_boot::broadcast_rgb());
-    let pending_mask = pipes
-        .clone()
-        .filter(|&p| {
-            displays.lit[usize::from(p)].is_some() && boot.display_teardown_status(p).is_some()
-        })
-        .fold(0u8, |mask, p| mask | (1 << p));
+    // Lit displays (CRTCs) with a teardown recorded on their head pipe.
+    let pending_mask = displays
+        .lit
+        .iter()
+        .flatten()
+        .filter(|m| boot.display_teardown_status(m.pipe).is_some())
+        .fold(0u8, |mask, m| mask | (1 << m.crtc));
     let mut relight = false;
     // Displays whose planes or plane format DRM changed.
     let mut plane_updates = 0u8;
@@ -5773,7 +5860,7 @@ pub async unsafe fn monitor_displays(
         }
     }
     publish_outputs();
-    // MST streams whose end devices left (their pipes), on these ports.
+    // MST streams whose end devices left (their CRTCs), on these ports.
     let (mut lost_mask, mut lost_ports) = (0u8, Vec::new());
     // Ports an MST stream retires from in this pass.
     let mut left_ports: Vec<usize> = Vec::new();
@@ -5797,7 +5884,12 @@ pub async unsafe fn monitor_displays(
                 // As Linux disables a departed connector's CRTC: only its
                 // stream retires, the others on the link run on.
                 boot::MstService::Lost(pipes) => {
-                    lost_mask |= pipes.iter().fold(0, |acc, &p| acc | 1 << p);
+                    lost_mask |= displays
+                        .lit
+                        .iter()
+                        .flatten()
+                        .filter(|m| pipes.contains(&m.pipe))
+                        .fold(0, |acc, m| acc | 1 << m.crtc);
                     lost_ports.push(port);
                 }
             }
@@ -5809,11 +5901,11 @@ pub async unsafe fn monitor_displays(
             }
         }
     }
-    for k in monitor_order(pending_mask, pipes.end) {
+    for k in monitor_order(pending_mask, count) {
         let Some(m) = displays.lit[usize::from(k)] else {
             continue;
         };
-        let pending = boot.display_teardown_status(k);
+        let pending = boot.display_teardown_status(m.pipe);
         let unplugged =
             boot.display_hpd(m.selection.port) == Ok(false) || pending.is_some_and(|p| p.unplugged);
         // An MST end device gone behind a connected root: its stream
@@ -5880,7 +5972,7 @@ pub async unsafe fn monitor_displays(
                     // teardown from timing on: retire it (writers, planes,
                     // surfaces) and light again, against the verified link.
                     let handed_over = boot
-                        .display_teardown_status(k)
+                        .display_teardown_status(m.pipe)
                         .is_some_and(|s| !s.in_flight && s.next == boot::TeardownStep::Timing);
                     if !handed_over {
                         return Err(e);
@@ -5932,7 +6024,7 @@ pub async unsafe fn monitor_displays(
     if relight {
         plane_updates = 0;
     }
-    for k in pipes.clone().filter(|&k| plane_updates & 1 << k != 0) {
+    for k in (0..count).filter(|&k| plane_updates & 1 << k != 0) {
         let (format, setup) = (wants[usize::from(k)].2, wants[usize::from(k)].3);
         // SAFETY: as above; the display stays lit and published.
         if unsafe { update_lit_planes(boot, displays, k, format, setup) }.await? {
@@ -6014,8 +6106,8 @@ pub async unsafe fn monitor_displays(
             }
             let mut count = 0;
             for m in config.displays {
-                count += u8::from(lit_mask & 1 << m.pipe == 0);
-                displays.lit[usize::from(m.pipe)] = Some(m);
+                count += u8::from(lit_mask & 1 << m.crtc == 0);
+                displays.lit[usize::from(m.crtc)] = Some(m);
             }
             displays.considered = wanted_mask(boot);
             steps.push(MonitorStep::LitBeside(count));
@@ -6024,7 +6116,7 @@ pub async unsafe fn monitor_displays(
     }
     if relit && !lit_beside {
         // Withdraw every writer, stop every display, light them again.
-        for k in pipes.clone().rev() {
+        for k in (0..count).rev() {
             let Some(m) = displays.lit[usize::from(k)] else {
                 continue;
             };
@@ -6082,7 +6174,7 @@ pub async unsafe fn monitor_displays(
                 );
             }
             for m in config.displays {
-                displays.lit[usize::from(m.pipe)] = Some(m);
+                displays.lit[usize::from(m.crtc)] = Some(m);
                 count += 1;
             }
         }
@@ -6106,14 +6198,14 @@ pub async unsafe fn monitor_displays(
             Ok(running) => {
                 let mut outputs = OUTPUTS.lock();
                 for m in &running {
-                    if let Some(c) = outputs.crtcs.get_mut(usize::from(m.pipe)) {
+                    if let Some(c) = outputs.crtcs.get_mut(usize::from(m.crtc)) {
                         c.admitted = Some((m.plan.soc, m.plan.mode));
                     }
                 }
                 drop(outputs);
                 let count = running.len() as u8;
                 for m in running {
-                    displays.lit[usize::from(m.pipe)] = Some(m);
+                    displays.lit[usize::from(m.crtc)] = Some(m);
                 }
                 steps.push(MonitorStep::Replanned(count));
             }
@@ -6130,7 +6222,7 @@ pub async unsafe fn monitor_displays(
     match unsafe { boot.converge_uclk_pstate(drr_wanted(boot)) }.await {
         Ok(moved) => {
             for m in moved {
-                displays.lit[usize::from(m.pipe)] = Some(m);
+                displays.lit[usize::from(m.crtc)] = Some(m);
             }
         }
         Err(e) => {
@@ -6173,8 +6265,8 @@ pub unsafe fn spawn_display_monitor(config: crate::amdgpu_navi48_boot::Configura
             considered: 0,
         };
         for m in config.displays {
-            if let Some(slot) = displays.lit.get_mut(usize::from(m.pipe)) {
-                displays.considered |= 1 << m.pipe;
+            if let Some(slot) = displays.lit.get_mut(usize::from(m.crtc)) {
+                displays.considered |= 1 << m.crtc;
                 *slot = Some(m);
             }
         }
@@ -8116,7 +8208,7 @@ async unsafe fn start_plugged_mst(
     Ok(true)
 }
 
-/// Tear down the running displays `affected` (by pipe) for the modeset an
+/// Tear down the running displays `affected` (by CRTC) for the modeset an
 /// MST link's DSC fairness search makes of their streams; their CRTCs stay
 /// on, so the next lighting beside the others lights them again with the
 /// configuration the search gives them.
@@ -8139,10 +8231,10 @@ async unsafe fn modeset_affected(
     Ok(())
 }
 
-/// The running MST streams (by pipe) the end devices waiting on unlit
+/// The running MST streams (by CRTC) the end devices waiting on unlit
 /// CRTCs would change through their links' DSC fairness search
-/// (`ColdBoot::mst_affected_streams`), lit displays being `lit_mask`. None
-/// when a search fits them no longer.
+/// (`ColdBoot::mst_affected_streams`), lit displays (CRTCs) being
+/// `lit_mask`. None when a search fits them no longer.
 fn beside_affected(boot: &boot::ColdBoot, lit_mask: u8) -> Option<u8> {
     let (routes, wants, mst) = {
         let outputs = OUTPUTS.lock();
@@ -8156,20 +8248,21 @@ fn beside_affected(boot: &boot::ColdBoot, lit_mask: u8) -> Option<u8> {
     let crtc_of = |t: Target| routes.iter().position(|r| *r == Some(t));
     let mut affected = 0;
     for port in mst {
-        let pipes: Vec<Option<u8>> = (0..boot::MST_OUTPUTS as u8)
+        let crtcs: Vec<Option<u8>> = (0..boot::MST_OUTPUTS as u8)
             .map(|slot| crtc_of(Target::Mst(port, slot)).map(|k| k as u8))
             .collect();
-        if pipes.iter().all(Option::is_none) {
+        if crtcs.iter().all(Option::is_none) {
             continue;
         }
         let want = |slot: usize| crtc_of(Target::Mst(port, slot as u8)).and_then(|k| wants[k]);
-        affected |= boot.mst_affected_streams(port, &pipes, &want)?;
+        affected |= boot.mst_affected_streams(port, &crtcs, &want)?;
     }
     Some(affected)
 }
 
 /// Light the plugged board sinks DRM wants beside the displays that run
-/// (output k on pipe k), which stay lit: `ColdBoot::modeset_beside`'s
+/// (each CRTC's stream on the head pipe it acquires), which stay lit:
+/// `ColdBoot::modeset_beside`'s
 /// seamless configuration change (shared clocks raised before and lowered
 /// after, the running displays moved to their new plans in place). `None`
 /// when it is refused before any change (an MST configuration, the running
@@ -8187,7 +8280,7 @@ async unsafe fn light_beside(
     fill: impl FnMut(u8, u32, &mut [u32]),
     reprobe: bool,
 ) -> Result<Option<crate::amdgpu_navi48_boot::Configuration>, ModesetError> {
-    let lit_mask = lit.iter().flatten().fold(0u8, |acc, m| acc | 1 << m.pipe);
+    let lit_mask = lit.iter().flatten().fold(0u8, |acc, m| acc | 1 << m.crtc);
     let (routes, wants, mst) = {
         let mut outputs = OUTPUTS.lock();
         outputs.assign_routes();
@@ -8204,6 +8297,7 @@ async unsafe fn light_beside(
             let c = &outputs.crtcs[k];
             crate::amdgpu_navi48_boot::set_plane_format(k as u8, c.format);
             crate::amdgpu_navi48_boot::set_plane_setup(k as u8, c.planes);
+            crate::amdgpu_navi48_boot::set_crtc_color(k as u8, c.color.clone());
         }
         outputs.stage_requested_bpc(|k| routes[k].is_some());
         (routes, wants, outputs.mst_ports())
@@ -8212,12 +8306,12 @@ async unsafe fn light_beside(
         return Ok(None);
     }
     let crtc_of = |t: Target| routes.iter().position(|r| *r == Some(t));
-    let pipe = |port: usize| crtc_of(Target::Board(port)).map(|k| k as u8);
+    let crtc = |port: usize| crtc_of(Target::Board(port)).map(|k| k as u8);
     let want = |port: usize| crtc_of(Target::Board(port)).and_then(|k| wants[k]);
     // Every branch, its new end devices on the CRTCs routed to them (the
     // lit ones' are not in `routes`): each adds its payload beside the
     // streams already on its link.
-    let mst_pipes: Vec<Vec<Option<u8>>> = mst
+    let mst_crtcs: Vec<Vec<Option<u8>>> = mst
         .iter()
         .map(|&port| {
             (0..boot::MST_OUTPUTS as u8)
@@ -8233,12 +8327,12 @@ async unsafe fn light_beside(
         .collect();
     let mst_routes: Vec<boot::MstRoute> = mst
         .iter()
-        .zip(&mst_pipes)
+        .zip(&mst_crtcs)
         .zip(&mst_wants)
-        .map(|((&port, pipes), want)| boot::MstRoute { port, pipes, want })
+        .map(|((&port, crtcs), want)| boot::MstRoute { port, crtcs, want })
         .collect();
     // SAFETY: the caller's obligations.
-    let Some(config) = unsafe { boot.modeset_beside(fill, want, pipe, &mst_routes) }.await? else {
+    let Some(config) = unsafe { boot.modeset_beside(fill, want, crtc, &mst_routes) }.await? else {
         return Ok(None);
     };
     {
@@ -8265,9 +8359,9 @@ async unsafe fn light_beside(
         for m in config
             .displays
             .iter()
-            .filter(|m| lit_mask & 1 << m.pipe != 0)
+            .filter(|m| lit_mask & 1 << m.crtc != 0)
         {
-            if let Some(c) = outputs.crtcs.get_mut(usize::from(m.pipe)) {
+            if let Some(c) = outputs.crtcs.get_mut(usize::from(m.crtc)) {
                 c.admitted = Some((m.plan.soc, m.plan.mode));
                 if let Some(shown) = c.shown.as_mut() {
                     shown.2 = m.modes.iter().flatten().copied().collect();
@@ -8279,7 +8373,7 @@ async unsafe fn light_beside(
     for m in config
         .displays
         .iter()
-        .filter(|m| lit_mask & 1 << m.pipe == 0)
+        .filter(|m| lit_mask & 1 << m.crtc == 0)
     {
         // SAFETY: as above.
         unsafe { adopt(boot, m) }.await;

@@ -1,5 +1,7 @@
 //! The native Navi48 displays as DRM KMS state on the amdgpu card: CRTC k is
-//! display (pipe) k, id 1 + 3k. Each connector (a board port, or an end
+//! display k, id 1 + 3k, whose stream runs on the head pipe DC acquires for
+//! it (amdgpu_dm's acrtc gets its OTG from the stream's OTG master pipe,
+//! not from its index). Each connector (a board port, or an end
 //! device behind an MST branch) has its own encoder (TMDS type, as amdgpu_dm
 //! reports DP) whose possible CRTCs the platform chooses, and carries its
 //! sink's EDID, the exact timing being scanned out by its routed CRTC and
@@ -21,8 +23,7 @@ const CONNECTOR: u32 = 3;
 /// pool publishes `crtc_count` of them).
 pub const MAX_OUTPUTS: usize = 4;
 /// The CRTCs published: amdgpu_dm's `dc->caps.max_streams`, the pool's
-/// `pipe_count` once `CC_DC_PIPE_DIS` removed the fused pipes (CRTC k is
-/// pipe index k).
+/// `pipe_count` once `CC_DC_PIPE_DIS` removed the fused pipes.
 pub fn crtc_count() -> usize {
     usize::from(crate::amdgpu_rdna4::pipe_pool().count()).min(MAX_OUTPUTS)
 }
@@ -73,7 +74,7 @@ pub const PLANE_FORMATS: [u32; 15] = {
     ]
 };
 
-/// The display (and pipe) behind a native CRTC id.
+/// The display behind a native CRTC id (its index; not a pipe).
 pub fn crtc_display(crtc_id: u32) -> Option<u8> {
     let k = crtc_id.checked_sub(CRTC)?;
     (k % 3 == 0 && ((k / 3) as usize) < crtc_count()).then_some((k / 3) as u8)

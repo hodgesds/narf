@@ -835,15 +835,15 @@ pub fn broadcast_rgb() -> u8 {
     BROADCAST_RGB.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// The surface format each pipe's next lighting scans out, as an index
+/// The surface format each CRTC's next lighting scans out, as an index
 /// into `otg::SurfaceFormat::ALL` (0: XRGB8888).
 static PLANE_FORMATS: [core::sync::atomic::AtomicU8; 4] =
     [const { core::sync::atomic::AtomicU8::new(0) }; 4];
-/// Scan out `format` on pipe `pipe` from its next lighting on (DRM's
-/// framebuffer format on that CRTC). Other pipes are ignored.
-pub fn set_plane_format(pipe: u8, format: otg::SurfaceFormat) {
+/// Scan out `format` on CRTC `crtc` from its next lighting on (DRM's
+/// framebuffer format on that CRTC). Other CRTCs are ignored.
+pub fn set_plane_format(crtc: u8, format: otg::SurfaceFormat) {
     if let (Some(slot), Some(index)) = (
-        PLANE_FORMATS.get(usize::from(pipe)),
+        PLANE_FORMATS.get(usize::from(crtc)),
         otg::SurfaceFormat::ALL.iter().position(|&f| f == format),
     ) {
         slot.store(index as u8, core::sync::atomic::Ordering::Relaxed);
@@ -853,41 +853,56 @@ static OUTPUT_COLOR: [narf_lib::sync::IrqSafeSpinLock<(
     u32,
     Option<crate::amdgpu_hdr::HdrOutputMetadata>,
 )>; 4] = [const { narf_lib::sync::IrqSafeSpinLock::new((0, None)) }; 4];
-/// Light pipe `pipe` with DRM's Colorspace `colorspace` and HDR metadata
+/// Light CRTC `crtc` with DRM's Colorspace `colorspace` and HDR metadata
 /// `hdr` (its connector's) from its next lighting on.
 pub fn set_output_color(
-    pipe: u8,
+    crtc: u8,
     colorspace: u32,
     hdr: Option<crate::amdgpu_hdr::HdrOutputMetadata>,
 ) {
-    if let Some(slot) = OUTPUT_COLOR.get(usize::from(pipe)) {
+    if let Some(slot) = OUTPUT_COLOR.get(usize::from(crtc)) {
         *slot.lock() = (colorspace, hdr);
     }
 }
-/// The Colorspace and HDR metadata pipe `pipe` lights with.
-pub fn output_color(pipe: u8) -> (u32, Option<crate::amdgpu_hdr::HdrOutputMetadata>) {
+/// The Colorspace and HDR metadata CRTC `crtc` lights with.
+pub fn output_color(crtc: u8) -> (u32, Option<crate::amdgpu_hdr::HdrOutputMetadata>) {
     OUTPUT_COLOR
-        .get(usize::from(pipe))
+        .get(usize::from(crtc))
         .map_or((0, None), |slot| *slot.lock())
 }
 static PLANE_SETUPS: [narf_lib::sync::IrqSafeSpinLock<PlaneSetup>; 4] =
     [const { narf_lib::sync::IrqSafeSpinLock::new(PlaneSetup::NONE) }; 4];
-/// Light pipe `pipe` with DRM's planes `setup` from its next lighting on.
-pub fn set_plane_setup(pipe: u8, setup: PlaneSetup) {
-    if let Some(slot) = PLANE_SETUPS.get(usize::from(pipe)) {
+/// Light CRTC `crtc` with DRM's planes `setup` from its next lighting on.
+pub fn set_plane_setup(crtc: u8, setup: PlaneSetup) {
+    if let Some(slot) = PLANE_SETUPS.get(usize::from(crtc)) {
         *slot.lock() = setup;
     }
 }
-/// The planes pipe `pipe` lights with.
-pub fn plane_setup(pipe: u8) -> PlaneSetup {
+/// The planes CRTC `crtc` lights with.
+pub fn plane_setup(crtc: u8) -> PlaneSetup {
     PLANE_SETUPS
-        .get(usize::from(pipe))
+        .get(usize::from(crtc))
         .map_or(PlaneSetup::NONE, |slot| *slot.lock())
 }
-/// The surface format pipe `pipe` lights with.
-pub fn plane_format(pipe: u8) -> otg::SurfaceFormat {
+type CrtcColor = narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<otg::ColorProgram>>>;
+static CRTC_COLORS: [CrtcColor; 4] = [const { narf_lib::sync::IrqSafeSpinLock::new(None) }; 4];
+/// Light CRTC `crtc` with DRM's CRTC color `program` (its CTM and
+/// GAMMA_LUT; None: bypass), on whichever head pipe its stream acquires.
+pub fn set_crtc_color(crtc: u8, program: Option<alloc::sync::Arc<otg::ColorProgram>>) {
+    if let Some(slot) = CRTC_COLORS.get(usize::from(crtc)) {
+        *slot.lock() = program;
+    }
+}
+/// The CRTC color CRTC `crtc` lights with.
+pub fn crtc_color(crtc: u8) -> Option<alloc::sync::Arc<otg::ColorProgram>> {
+    CRTC_COLORS
+        .get(usize::from(crtc))
+        .and_then(|slot| slot.lock().clone())
+}
+/// The surface format CRTC `crtc` lights with.
+pub fn plane_format(crtc: u8) -> otg::SurfaceFormat {
     PLANE_FORMATS
-        .get(usize::from(pipe))
+        .get(usize::from(crtc))
         .map(|slot| slot.load(core::sync::atomic::Ordering::Relaxed))
         .and_then(|index| otg::SurfaceFormat::ALL.get(usize::from(index)).copied())
         .unwrap_or(otg::SurfaceFormat::Xrgb8888)
@@ -903,7 +918,11 @@ pub fn limited_range(broadcast_rgb: u8) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Modeset {
     pub selection: Selection,
+    /// The stream's OTG master: its head pipe (and display slot), acquired
+    /// as DC acquires it, not the CRTC's index.
     pub pipe: u8,
+    /// The KMS CRTC whose stream this is (amdgpu_dm's acrtc).
+    pub crtc: u8,
     pub plan: dml::Plan,
     pub scanout: otg::ScanoutRunning,
     /// Every EDID timing this sink can be switched to on this link and
@@ -914,8 +933,8 @@ pub struct Modeset {
 /// Modes offered per sink.
 pub const MAX_MODES: usize = 16;
 
-/// What `modeset_displays` lit: display k on pipe k, and the failure that
-/// stopped lighting early, if one did.
+/// What `modeset_displays` lit: each CRTC's stream on its head pipe, and
+/// the failure that stopped lighting early, if one did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Configuration {
     pub displays: Vec<Modeset>,
@@ -946,18 +965,22 @@ impl RetainedModesets {
         }
         Ok(())
     }
+    /// Into the caller's records by CRTC (`to[m.crtc]`); the CRTCs
+    /// recovered, by bit.
     fn restore(&self, to: &mut [Option<Modeset>; 4]) -> Result<u8, ModesetError> {
         // Validate the whole transfer before changing any caller's records.
-        for (old, retained) in to.iter().zip(self.0.iter()) {
-            if old.is_some() && retained.is_some() && old != retained {
+        for retained in self.0.iter().flatten() {
+            let old = to.get(usize::from(retained.crtc)).ok_or(otg::Error::Busy)?;
+            if old.is_some_and(|o| o != *retained) {
                 return Err(otg::Error::Busy.into());
             }
         }
         let mut recovered = 0;
-        for (pipe, (old, retained)) in to.iter_mut().zip(self.0.iter()).enumerate() {
-            if old.is_none() && retained.is_some() {
-                *old = *retained;
-                recovered |= 1 << pipe;
+        for retained in self.0.iter().flatten() {
+            let old = &mut to[usize::from(retained.crtc)];
+            if old.is_none() {
+                *old = Some(*retained);
+                recovered |= 1 << retained.crtc;
             }
         }
         Ok(recovered)
@@ -1671,11 +1694,12 @@ pub fn refine_dsc(soc: &dml::Soc, selections: &mut [Selection]) -> Result<(), Mo
     Ok(())
 }
 
-/// A configuration's streams: the board sinks' on their pipes and every MST
-/// port's (each selected against its own link), in pipe order, which
-/// admission truncates (who stays dark). A pipe named twice, on one port or
-/// across ports, or past the pool's `pipe_count`, is refused: the pool's
-/// pipes serve every port together.
+/// A configuration's streams: the board sinks' on their CRTCs and every MST
+/// port's (each selected against its own link), in CRTC order (amdgpu_dm
+/// adds the enabled CRTCs' streams in CRTC order), which admission
+/// truncates (who stays dark). A CRTC named twice, on one port or across
+/// ports, or past the published CRTCs (the pool's `pipe_count`), is
+/// refused: the pool's pipes serve every port together.
 pub fn route_streams(
     mut routed: Vec<(Selection, u8)>,
     mst: &[&[(Selection, u8)]],
@@ -1683,29 +1707,36 @@ pub fn route_streams(
     for streams in mst {
         routed.extend(streams.iter().copied());
     }
-    routed.sort_by_key(|&(_, pipe)| pipe);
+    routed.sort_by_key(|&(_, crtc)| crtc);
     if routed.windows(2).any(|w| w[0].1 == w[1].1)
         || routed
             .iter()
-            .any(|&(_, p)| p >= crate::amdgpu_rdna4::pipe_pool().count())
+            .any(|&(_, c)| c >= crate::amdgpu_rdna4::pipe_pool().count())
     {
         return Err(ModesetError::Display(otg::Error::Invalid));
     }
     Ok(routed)
 }
 
+/// The head pipe of each stream of `crtcs` (in CRTC order): CRTC k's
+/// stream on pipe k.
+fn head_pipes(crtcs: &[u8]) -> Vec<u8> {
+    crtcs.to_vec()
+}
+
 /// One DP port's MST branch in a configuration: end device k (its
-/// `MstLink::outputs` slot) lit on `pipes[k]` at `want(k)`, None dark.
+/// `MstLink::outputs` slot) lit as CRTC `crtcs[k]`'s stream at `want(k)`,
+/// None dark.
 pub struct MstRoute<'a> {
     pub port: usize,
-    pub pipes: &'a [Option<u8>],
+    pub crtcs: &'a [Option<u8>],
     pub want: &'a (dyn Fn(usize) -> Option<Timing> + Sync),
 }
 impl core::fmt::Debug for MstRoute<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("MstRoute")
             .field("port", &self.port)
-            .field("pipes", &self.pipes)
+            .field("crtcs", &self.crtcs)
             .finish_non_exhaustive()
     }
 }
@@ -3037,9 +3068,14 @@ impl ColdBoot {
         let pipes = self.prepare_pipes(&[selection], &plans, &[pipe]).await?;
         // SAFETY: the caller's obligations.
         let mut lit = unsafe {
-            self.light(pipe, pipes[0], selection, plans[0], &mut |_, y, row| {
-                fill(y, row)
-            })
+            self.light(
+                pipe,
+                pipe,
+                pipes[0],
+                selection,
+                plans[0],
+                &mut |_, y, row| fill(y, row),
+            )
         }
         .await?;
         lit.modes = self.offered_modes(&soc, &[lit], 0, &edid_of(&ports, &paths, &selection));
@@ -3047,8 +3083,9 @@ impl ColdBoot {
         Ok(lit)
     }
     /// Light every lightable sink (`select_all`) as one configuration, each
-    /// on the pipe `pipe_of` gives its port (its display slot too): sinks on
-    /// ports without a pipe stay dark. The largest leading set the pipeline
+    /// the stream of the CRTC `crtc_of` gives its port, on the head pipe
+    /// that stream acquires (its display slot too): sinks on ports without
+    /// a CRTC stay dark. The largest leading set the pipeline
     /// admits together (`admit_displays`) is lit, its clocks programmed once
     /// for all of them, then each display through the same steps as one
     /// display alone, next to the ones already lit. `want(port)` is the
@@ -3063,12 +3100,12 @@ impl ColdBoot {
         &mut self,
         fill: impl FnMut(u8, u32, &mut [u32]),
         want: impl Fn(usize) -> Option<Timing>,
-        pipe_of: impl Fn(usize) -> Option<u8>,
+        crtc_of: impl Fn(usize) -> Option<u8>,
     ) -> Result<Configuration, ModesetError> {
         // dcn401_prepare_bandwidth: pinned before any configuration change.
         self.pin_display_uclk().await?;
         // SAFETY: the caller's obligations.
-        unsafe { self.modeset_routed(fill, want, pipe_of, &[]) }.await
+        unsafe { self.modeset_routed(fill, want, crtc_of, &[]) }.await
     }
     /// `modeset_displays` with the MST branches of the DP ports `mst` names
     /// (each its own topology manager and payload table, as amdgpu_dm keeps
@@ -3076,18 +3113,18 @@ impl ColdBoot {
     /// configuration: each branch started and probed, board sinks (those
     /// roots excluded) and every branch's end devices selected (each link's
     /// time slots and PBN its own), then clocks and joint DML admission for
-    /// every stream on every port, and each display lit on its pipe. Board
-    /// port p is lit on `pipe_of(p)` at `want(p)`; end device k behind route
-    /// r on `r.pipes[k]` at `r.want(k)`. Ports and pipes must be distinct.
-    /// Admission truncates in pipe order. Dark board sinks and end devices
-    /// are admitted beside every running stream.
+    /// every stream on every port, and each display lit on its head pipe.
+    /// Board port p is CRTC `crtc_of(p)`'s stream at `want(p)`; end device
+    /// k behind route r CRTC `r.crtcs[k]`'s at `r.want(k)`. Ports and CRTCs
+    /// must be distinct. Admission truncates in CRTC order. Dark board sinks
+    /// and end devices are admitted beside every running stream.
     /// # Safety
     /// As for `modeset_displays`.
     pub async unsafe fn modeset_routed(
         &mut self,
         mut fill: impl FnMut(u8, u32, &mut [u32]),
         want: impl Fn(usize) -> Option<Timing>,
-        pipe_of: impl Fn(usize) -> Option<u8>,
+        crtc_of: impl Fn(usize) -> Option<u8>,
         mst: &[MstRoute<'_>],
     ) -> Result<Configuration, ModesetError> {
         // dcn401_prepare_bandwidth: pinned before any configuration change.
@@ -3097,7 +3134,7 @@ impl ColdBoot {
         // A later display's reduction is returned in `failed`.
         for _ in 0..VERIFY_ROUNDS {
             // SAFETY: the caller's obligations.
-            match unsafe { self.modeset_displays_once(&mut fill, &want, &pipe_of, mst) }.await {
+            match unsafe { self.modeset_displays_once(&mut fill, &want, &crtc_of, mst) }.await {
                 Err(ModesetError::LinkReduced) => continue,
                 result => return result,
             }
@@ -3111,7 +3148,7 @@ impl ColdBoot {
         &mut self,
         mut fill: impl FnMut(u8, u32, &mut [u32]),
         want: impl Fn(usize) -> Option<Timing>,
-        pipe_of: impl Fn(usize) -> Option<u8>,
+        crtc_of: impl Fn(usize) -> Option<u8>,
         mst: &[MstRoute<'_>],
     ) -> Result<Configuration, ModesetError> {
         self.teardowns.check_idle()?;
@@ -3163,20 +3200,21 @@ impl ColdBoot {
         .into_iter()
         .filter_map(|s| {
             let count = crate::amdgpu_rdna4::pipe_pool().count();
-            Some((s, pipe_of(s.port).filter(|&p| p < count)?))
+            Some((s, crtc_of(s.port).filter(|&c| c < count)?))
         })
         .collect();
         let mst_streams: Vec<_> = mst_plans.iter().map(|p| p.selections.as_slice()).collect();
         let routed = route_streams(routed, &mst_streams)?;
-        let (mut selections, pipes): (Vec<Selection>, Vec<u8>) = routed.into_iter().unzip();
+        let (mut selections, crtcs): (Vec<Selection>, Vec<u8>) = routed.into_iter().unzip();
         // "Broadcast RGB" is RGB's: YCbCr is limited range by itself.
         let limited = limited_range(broadcast_rgb());
-        for (s, &pipe) in selections.iter_mut().zip(&pipes) {
+        for (s, &crtc) in selections.iter_mut().zip(&crtcs) {
             s.limited = limited && !s.ycbcr420;
-            s.format = plane_format(pipe);
-            s.planes = plane_setup(pipe);
-            (s.colorspace, s.hdr) = output_color(pipe);
+            s.format = plane_format(crtc);
+            s.planes = plane_setup(crtc);
+            (s.colorspace, s.hdr) = output_color(crtc);
         }
+        let pipes = head_pipes(&crtcs);
         self.select_display(pipes.first().copied().unwrap_or(0))?;
         let soc = self.prepare_configuration(&selections).await?;
         self.update_sst_outputs(Some(&soc), &paths, &board, &[]);
@@ -3195,12 +3233,16 @@ impl ColdBoot {
         let extra = self.prepare_pipes(&selections, &plans, &pipes).await?;
         let mut lit = Vec::with_capacity(selections.len());
         let mut failed = None;
-        for (((selection, plan), &pipe), &extra) in
-            selections.iter().zip(&plans).zip(&pipes).zip(&extra)
+        for ((((selection, plan), &pipe), &crtc), &extra) in selections
+            .iter()
+            .zip(&plans)
+            .zip(&pipes)
+            .zip(&crtcs)
+            .zip(&extra)
         {
             // SAFETY: the caller's obligations; every earlier display is lit
             // in its own slot and left to it by each step.
-            match unsafe { self.light(pipe, extra, *selection, *plan, &mut fill) }.await {
+            match unsafe { self.light(pipe, crtc, extra, *selection, *plan, &mut fill) }.await {
                 Ok(m) => lit.push(m),
                 Err(e) if lit.is_empty() => return Err(e),
                 Err(e) => {
@@ -3330,15 +3372,16 @@ impl ColdBoot {
         }
         Ok(extra)
     }
-    /// Light one admitted display on `pipe` (its display slot too), with its
-    /// clocks prepared: surface, timing, OPP, DPP, MPC, requestor and
-    /// deadlines, then its link, video and scanout.
+    /// Light CRTC `crtc`'s admitted stream on head pipe `pipe` (its display
+    /// slot too), with its clocks prepared: surface, timing, OPP, DPP, MPC,
+    /// requestor and deadlines, then its link, video and scanout.
     /// # Safety
     /// As for `modeset_display`, except that other displays of this owner
     /// may be lit in their own slots.
     pub(super) async unsafe fn light(
         &mut self,
         pipe: u8,
+        crtc: u8,
         pipes: DisplayPipes,
         selection: Selection,
         plan: dml::Plan,
@@ -3348,7 +3391,7 @@ impl ColdBoot {
         self.teardowns
             .begin_activation(pipe, pipes.odm, &selection)?;
         // SAFETY: the caller owns this unpublished activation and every writer.
-        match unsafe { self.light_inner(pipe, pipes, selection, plan, fill) }.await {
+        match unsafe { self.light_inner(pipe, crtc, pipes, selection, plan, fill) }.await {
             Ok(m) => {
                 // No await between native completion and retained ownership.
                 // A later pipe or platform adoption can suspend or be dropped.
@@ -3372,6 +3415,7 @@ impl ColdBoot {
     async unsafe fn light_inner(
         &mut self,
         pipe: u8,
+        crtc: u8,
         pipes: DisplayPipes,
         selection: Selection,
         plan: dml::Plan,
@@ -3386,6 +3430,8 @@ impl ColdBoot {
         // SAFETY: the caller's exclusion and retention obligations cover each
         // retained owner below; every step validates its own preconditions.
         unsafe {
+            // The CRTC's color, for its head pipe's scanout start.
+            self.set_display_color(pipe, crtc_color(crtc)).await?;
             self.retire_display_planes().await?;
             self.set_display_hubp_power(pipe, true).await?;
             for q in odm.into_iter().chain(pipes.mpc) {
@@ -3445,6 +3491,7 @@ impl ColdBoot {
             Ok(Modeset {
                 selection,
                 pipe,
+                crtc,
                 plan,
                 scanout,
                 modes: [None; MAX_MODES],
@@ -4381,7 +4428,7 @@ impl ColdBoot {
     /// the MST branches `mst` names beside the running displays, which stay
     /// lit, as dc_commit_streams adds streams without touching the others:
     /// DML admits the running displays' modes with the new ones (as many of
-    /// the new ones as fit, in pipe order; every running display must keep
+    /// the new ones as fit, in CRTC order; every running display must keep
     /// its pipes), and the change follows dcn401's prepare/optimize ordering
     /// (`transition_running`) around lighting the new displays on their
     /// pipes, whose pipe clocks are programmed beside the running ones. A
@@ -4390,13 +4437,13 @@ impl ColdBoot {
     /// payload table row, SAT with ACT, ACT handled, ALLOCATE_PAYLOAD, VC
     /// rate), taking what the running payloads leave of the link
     /// (`plan_mst_route` beside them); one on a port with no stream trains
-    /// that port's link. Route pipes already lit are ignored. `None` when it
+    /// that port's link. Route CRTCs already lit are ignored. `None` when it
     /// is refused before any change (none running, no free display slot, an
     /// MST session that is not clean and idle, a root whose link changed, a
     /// DSC fairness search that would change a running stream, the running
     /// displays no longer admitted together or not on their pipes), so the
     /// caller relights instead, as Linux takes a full modeset for those.
-    /// Returns every display lit, in pipe order.
+    /// Returns every display lit, in CRTC order.
     /// # Safety
     /// As for `modeset_displays`, except that the running displays stay
     /// lit and must stay published as they are.
@@ -4404,7 +4451,7 @@ impl ColdBoot {
         &mut self,
         mut fill: impl FnMut(u8, u32, &mut [u32]),
         want: impl Fn(usize) -> Option<Timing>,
-        pipe_of: impl Fn(usize) -> Option<u8>,
+        crtc_of: impl Fn(usize) -> Option<u8>,
         mst: &[MstRoute<'_>],
     ) -> Result<Option<Configuration>, ModesetError> {
         // dcn401_prepare_bandwidth: pinned before any configuration change.
@@ -4415,6 +4462,8 @@ impl ColdBoot {
             return Ok(None);
         }
         let used = running.iter().fold(0u8, |acc, m| acc | 1 << m.pipe);
+        // The CRTCs whose streams run.
+        let lit_crtcs = running.iter().fold(0u8, |acc, m| acc | 1 << m.crtc);
         let ports_used: Vec<usize> = running.iter().map(|m| m.selection.port).collect();
         let pool = crate::amdgpu_rdna4::pipe_pool();
         // Scan from an idle display slot (a pool pipe).
@@ -4440,12 +4489,12 @@ impl ColdBoot {
                 return Ok(None);
             }
             let unlit: Vec<Option<u8>> = route
-                .pipes
+                .crtcs
                 .iter()
-                .map(|p| p.filter(|&p| p < pool.count() && used & 1 << p == 0))
+                .map(|c| c.filter(|&c| c < pool.count() && lit_crtcs & 1 << c == 0))
                 .collect();
             let route = MstRoute {
-                pipes: &unlit,
+                crtcs: &unlit,
                 ..*route
             };
             self.start_mst_route_beside(&route).await?;
@@ -4477,19 +4526,19 @@ impl ColdBoot {
         .filter_map(|s| {
             Some((
                 s,
-                pipe_of(s.port).filter(|&p| p < pool.count() && used & 1 << p == 0)?,
+                crtc_of(s.port).filter(|&c| c < pool.count() && lit_crtcs & 1 << c == 0)?,
             ))
         })
         .collect();
         let mut mst_plans = Vec::with_capacity(mst.len());
         for route in mst {
             let unlit: Vec<Option<u8>> = route
-                .pipes
+                .crtcs
                 .iter()
-                .map(|p| p.filter(|&p| p < pool.count() && used & 1 << p == 0))
+                .map(|c| c.filter(|&c| c < pool.count() && lit_crtcs & 1 << c == 0))
                 .collect();
             let route = MstRoute {
-                pipes: &unlit,
+                crtcs: &unlit,
                 ..*route
             };
             let lit: Vec<Selection> = running
@@ -4505,11 +4554,11 @@ impl ColdBoot {
         let mst_streams: Vec<_> = mst_plans.iter().map(|p| p.selections.as_slice()).collect();
         let mut new = route_streams(sst, &mst_streams)?;
         let limited = limited_range(broadcast_rgb());
-        for (s, pipe) in new.iter_mut() {
+        for (s, crtc) in new.iter_mut() {
             s.limited = limited && !s.ycbcr420;
-            s.format = plane_format(*pipe);
-            s.planes = plane_setup(*pipe);
-            (s.colorspace, s.hdr) = output_color(*pipe);
+            s.format = plane_format(*crtc);
+            s.planes = plane_setup(*crtc);
+            (s.colorspace, s.hdr) = output_color(*crtc);
         }
         let soc = self.display_soc()?;
         {
@@ -4519,20 +4568,20 @@ impl ColdBoot {
                 *s = r;
             }
         }
-        // The running displays with as many new ones as fit, in pipe order.
+        // The running displays with as many new ones as fit, in CRTC order.
         let mut n = new.len();
         let (plans, order) = loop {
             let mut joint: Vec<(dml::Mode, Option<usize>, u8)> = running
                 .iter()
-                .map(|m| (m.plan.mode, None, m.pipe))
+                .map(|m| (m.plan.mode, None, m.crtc))
                 .chain(
                     new[..n]
                         .iter()
                         .enumerate()
-                        .map(|(i, &(s, p))| (selection_mode(&s), Some(i), p)),
+                        .map(|(i, &(s, c))| (selection_mode(&s), Some(i), c)),
                 )
                 .collect();
-            joint.sort_by_key(|&(_, _, p)| p);
+            joint.sort_by_key(|&(_, _, c)| c);
             let modes: Vec<dml::Mode> = joint.iter().map(|&(m, _, _)| m).collect();
             match dml::admit_native(&soc, &modes) {
                 Ok(plans) => break (plans, joint),
@@ -4542,7 +4591,7 @@ impl ColdBoot {
         };
         new.truncate(n);
         if new.is_empty() {
-            running.sort_by_key(|m| m.pipe);
+            running.sort_by_key(|m| m.crtc);
             self.update_sst_outputs(Some(&soc), &paths, &board, &running);
             let selections: Vec<_> = running.iter().map(|m| m.selection).collect();
             for plan in &mst_plans {
@@ -4554,20 +4603,20 @@ impl ColdBoot {
             }));
         }
         // Each running display's plan, in `running` order; the new ones'.
-        let plan_of = |pipe: u8| {
+        let plan_of = |crtc: u8| {
             order
                 .iter()
-                .position(|&(_, _, p)| p == pipe)
+                .position(|&(_, _, c)| c == crtc)
                 .map(|i| plans[i])
         };
         let running_plans: Vec<dml::Plan> = running
             .iter()
-            .map(|m| plan_of(m.pipe))
+            .map(|m| plan_of(m.crtc))
             .collect::<Option<_>>()
             .ok_or(otg::Error::Invalid)?;
         let new_plans: Vec<dml::Plan> = new
             .iter()
-            .map(|&(_, p)| plan_of(p))
+            .map(|&(_, c)| plan_of(c))
             .collect::<Option<_>>()
             .ok_or(otg::Error::Invalid)?;
         let frl = running.iter().any(|m| m.selection.frl.is_some())
@@ -4582,7 +4631,8 @@ impl ColdBoot {
                     .fold(0, |a, &(p, _)| a | 1 << p)
         });
         let new_selections: Vec<Selection> = new.iter().map(|&(s, _)| s).collect();
-        let new_pipes: Vec<u8> = new.iter().map(|&(_, p)| p).collect();
+        let new_crtcs: Vec<u8> = new.iter().map(|&(_, c)| c).collect();
+        let new_pipes = head_pipes(&new_crtcs);
         let extra = display_pipes_beside(&new_selections, &new_plans, &new_pipes, running_mask)?;
         if running
             .iter()
@@ -4595,7 +4645,9 @@ impl ColdBoot {
         unsafe { self.transition_running(&mut running, &running_plans, request) }.await?;
         let mut lit = Vec::with_capacity(new.len());
         let mut failed = None;
-        for ((&(selection, pipe), plan), d) in new.iter().zip(&new_plans).zip(&extra) {
+        for (((&(selection, crtc), &pipe), plan), d) in
+            new.iter().zip(&new_pipes).zip(&new_plans).zip(&extra)
+        {
             self.select_display(pipe)?;
             let clocks = async {
                 self.prepare_display_pipe_clocks_beside(pipe_clock_request(pipe, plan, &selection))
@@ -4646,7 +4698,7 @@ impl ColdBoot {
             .await;
             let result = match clocks {
                 // SAFETY: the caller's obligations; earlier displays stay lit.
-                Ok(()) => unsafe { self.light(pipe, *d, selection, *plan, &mut fill) }.await,
+                Ok(()) => unsafe { self.light(pipe, crtc, *d, selection, *plan, &mut fill) }.await,
                 Err(e) => Err(e),
             };
             match result {
@@ -4670,7 +4722,7 @@ impl ColdBoot {
         unsafe { self.optimize_running(&mut running, request, &targets) }.await?;
         let mut displays = running;
         displays.extend(lit);
-        displays.sort_by_key(|m| m.pipe);
+        displays.sort_by_key(|m| m.crtc);
         // Every display's offered modes beside the others, as lighting
         // computes them.
         let all = displays.clone();
@@ -4708,7 +4760,7 @@ impl ColdBoot {
         if running.is_empty() {
             return Ok(running);
         }
-        running.sort_by_key(|m| m.pipe);
+        running.sort_by_key(|m| m.crtc);
         let soc = self.display_soc()?;
         let modes: Vec<dml::Mode> = running.iter().map(|m| m.plan.mode).collect();
         let plans = dml::admit_native(&soc, &modes).map_err(otg::Error::Admission)?;

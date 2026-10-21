@@ -15,7 +15,7 @@ use super::*;
 
 /// A running display moved to new planes without relighting, with every
 /// running display's record (another display's plan may have moved too),
-/// in pipe order.
+/// in CRTC order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanesChange {
     pub pipe: u8,
@@ -204,7 +204,7 @@ impl ColdBoot {
             return Ok(None);
         }
         let mut running: Vec<Modeset> = self.display_modesets().into_iter().flatten().collect();
-        running.sort_by_key(|m| m.pipe);
+        running.sort_by_key(|m| m.crtc);
         if running.iter().any(|m| m.selection.mst.is_some()) {
             return Ok(None);
         }

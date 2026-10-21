@@ -1303,7 +1303,7 @@ pub(super) fn raw_mst_choice(
 pub(super) type Budget<'a> = dyn Fn(dp_mst_mgr::Sink, &[(dp_mst_mgr::Sink, u16)]) -> u16 + 'a;
 
 /// Keep a sink's output assignment even when an earlier sink is disabled,
-/// has an unreadable EDID, or cannot fit. `pipes[k]` belongs to device k.
+/// has an unreadable EDID, or cannot fit. `crtcs[k]` (its CRTC) belongs to device k.
 /// (The DSC-less form the model tests drive.)
 #[cfg(feature = "kernel-test")]
 pub(super) fn select_mst_outputs(
@@ -1311,10 +1311,10 @@ pub(super) fn select_mst_outputs(
     caps: modeset::DpCaps,
     devices: &[(dp_mst_mgr::Sink, Vec<u8>, u16)],
     want: &dyn Fn(usize) -> Option<Timing>,
-    pipes: &[Option<u8>],
+    crtcs: &[Option<u8>],
     budget: &Budget<'_>,
 ) -> Vec<(Selection, u8)> {
-    select_mst_outputs_with(port, caps, devices, want, pipes, budget, None)
+    select_mst_outputs_with(port, caps, devices, want, crtcs, budget, None)
 }
 
 /// `select_mst_outputs` with the link's DSC context (`select_mst_dsc`).
@@ -1324,16 +1324,16 @@ pub(super) fn select_mst_outputs_with(
     caps: modeset::DpCaps,
     devices: &[(dp_mst_mgr::Sink, Vec<u8>, u16)],
     want: &dyn Fn(usize) -> Option<Timing>,
-    pipes: &[Option<u8>],
+    crtcs: &[Option<u8>],
     budget: &Budget<'_>,
     dsc: Option<&MstDscContext<'_>>,
 ) -> Vec<(Selection, u8)> {
-    select_mst_outputs_beside(port, caps, devices, want, pipes, budget, dsc, &[])
+    select_mst_outputs_beside(port, caps, devices, want, crtcs, budget, dsc, &[])
         .unwrap_or_default()
 }
 
 /// `select_mst_outputs_with` beside `lit`, the port's running MST streams
-/// (`select_mst_with_budget`): the new streams on their pipes, or None when
+/// (`select_mst_with_budget`): the new streams with their CRTCs, or None when
 /// the link's DSC fairness would change a running stream.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn select_mst_outputs_beside(
@@ -1341,14 +1341,14 @@ pub(super) fn select_mst_outputs_beside(
     caps: modeset::DpCaps,
     devices: &[(dp_mst_mgr::Sink, Vec<u8>, u16)],
     want: &dyn Fn(usize) -> Option<Timing>,
-    pipes: &[Option<u8>],
+    crtcs: &[Option<u8>],
     budget: &Budget<'_>,
     dsc: Option<&MstDscContext<'_>>,
     lit: &[Selection],
 ) -> Option<Vec<(Selection, u8)>> {
     let lit_sinks: Vec<_> = lit.iter().filter_map(|s| s.mst.map(|m| m.sink)).collect();
     let enabled: Vec<usize> = (0..devices.len())
-        .filter(|&k| pipes.get(k).is_some_and(Option::is_some) || lit_sinks.contains(&devices[k].0))
+        .filter(|&k| crtcs.get(k).is_some_and(Option::is_some) || lit_sinks.contains(&devices[k].0))
         .collect();
     let selected: Vec<_> = enabled.iter().map(|&k| devices[k].clone()).collect();
     let streams = select_mst_with_budget(
@@ -1367,22 +1367,22 @@ pub(super) fn select_mst_outputs_beside(
                 let k = devices
                     .iter()
                     .position(|d| Some(d.0) == s.mst.map(|m| m.sink))?;
-                Some((s, pipes[k]?))
+                Some((s, crtcs[k]?))
             })
             .collect(),
     )
 }
 
-/// The running streams `running` (each with its pipe) of a port whose
+/// The running streams `running` (each with its CRTC) of a port whose
 /// configuration the link's fairness search changes once the devices on
-/// `joining` (device k's new pipe) join and the others leave, as
+/// `joining` (device k's new CRTC) join and the others leave, as
 /// amdgpu_dm finds the streams it modesets: drm_dp_mst_add_affected_dsc_crtcs
 /// puts every stream of the topology in the commit, pre_validate_dsc
 /// recomputes them all (compute_mst_dsc_configs_for_link over the link's
 /// streams, each running one at its timing through
 /// create_validate_stream_for_sink's depth loop) and keeps running
 /// (mode_changed cleared) each whose timing, depth and DSC
-/// (dc_is_timing_changed) and payload stay. By bit of pipe; none on a link
+/// (dc_is_timing_changed) and payload stay. By bit of CRTC; none on a link
 /// without DSC decoders, whose running payloads stay as they are
 /// (drm_dp_atomic_find_time_slots runs only for the changed connectors);
 /// None when the search runs on no link.
@@ -1405,23 +1405,23 @@ pub(super) fn affected_mst_streams(
             .iter()
             .find(|(s, _)| s.mst.map(|m| m.sink) == Some(devices[k].0))
     };
-    let pipes: Vec<Option<u8>> = (0..devices.len())
+    let crtcs: Vec<Option<u8>> = (0..devices.len())
         .map(|k| {
             stream_of(k)
-                .map(|&(_, p)| p)
+                .map(|&(_, c)| c)
                 .or_else(|| joining.get(k).copied().flatten())
         })
         .collect();
     let at = |k: usize| stream_of(k).map(|(s, _)| s.timing).or_else(|| want(k));
-    let all = select_mst_outputs_beside(port, caps, devices, &at, &pipes, budget, dsc, &[])?;
+    let all = select_mst_outputs_beside(port, caps, devices, &at, &crtcs, budget, dsc, &[])?;
     let mut affected = 0u8;
-    for (s, pipe) in running {
+    for (s, crtc) in running {
         let kept = all.iter().any(|(n, _)| {
             n.mst.map(|m| (m.sink, m.pbn, m.slots)) == s.mst.map(|m| (m.sink, m.pbn, m.slots))
                 && (n.timing, n.depth, n.dsc) == (s.timing, s.depth, s.dsc)
         });
         if !kept {
-            affected |= 1 << pipe;
+            affected |= 1 << crtc;
         }
     }
     Some(affected)
@@ -1555,7 +1555,7 @@ pub(super) struct MstPlan {
 
 impl ColdBoot {
     /// Light the end devices behind DP `port`'s MST branch (`select_mst`),
-    /// stable output k on `pipes[k]` (its display slot too), skipping None, as one
+    /// stable output k as CRTC `crtcs[k]`'s stream, skipping None, as one
     /// configuration like `modeset_displays`: MST started and the topology
     /// probed, each device's EDID read, the admitted streams' clocks
     /// programmed, then each stream lit: the first trains the port's MST
@@ -1563,7 +1563,7 @@ impl ColdBoot {
     /// video starts. `want(k)` is the timing asked of output k. An empty
     /// configuration keeps the manager enabled for downstream hotplug.
     /// On success, dark outputs carry independently admitted `MstOutput::modes`
-    /// beside the lit streams, including when every requested pipe is None.
+    /// beside the lit streams, including when every requested CRTC is None.
     /// # Safety
     /// As for `modeset_displays`.
     pub async unsafe fn modeset_mst_displays(
@@ -1571,13 +1571,13 @@ impl ColdBoot {
         port: usize,
         fill: impl FnMut(u8, u32, &mut [u32]),
         want: impl Fn(usize) -> Option<Timing> + Sync,
-        pipes: &[Option<u8>],
+        crtcs: &[Option<u8>],
     ) -> Result<Configuration, ModesetError> {
         // dcn401_prepare_bandwidth: pinned before any configuration change.
         self.pin_display_uclk().await?;
         let route = modeset::MstRoute {
             port,
-            pipes,
+            crtcs,
             want: &want,
         };
         // SAFETY: the caller's obligations.
@@ -1600,17 +1600,17 @@ impl ColdBoot {
         &mut self,
         route: &modeset::MstRoute<'_>,
     ) -> Result<(), ModesetError> {
-        let pipes = route.pipes;
-        if pipes.is_empty()
-            || pipes.len() > MST_OUTPUTS
-            || pipes
+        let crtcs = route.crtcs;
+        if crtcs.is_empty()
+            || crtcs.len() > MST_OUTPUTS
+            || crtcs
                 .iter()
                 .flatten()
-                .any(|&p| p >= crate::amdgpu_rdna4::pipe_pool().count())
-            || pipes
+                .any(|&c| c >= crate::amdgpu_rdna4::pipe_pool().count())
+            || crtcs
                 .iter()
                 .enumerate()
-                .any(|(k, p)| p.is_some() && pipes[..k].contains(p))
+                .any(|(k, c)| c.is_some() && crtcs[..k].contains(c))
         {
             return Err(ModesetError::Display(otg::Error::Invalid));
         }
@@ -1648,7 +1648,7 @@ impl ColdBoot {
         (devices, slots)
     }
     /// The streams `select_mst_outputs_beside` gives port `port`'s end
-    /// devices (`devices`, at `slots`) on pipes `pipe(slot)` at `want(slot)`
+    /// devices (`devices`, at `slots`) as CRTCs `crtc(slot)`'s at `want(slot)`
     /// over the root's `caps`, beside `lit`, the port's running streams.
     #[allow(clippy::too_many_arguments)]
     fn select_on_link(
@@ -1657,12 +1657,12 @@ impl ColdBoot {
         caps: modeset::DpCaps,
         devices: &[(dp_mst_mgr::Sink, Vec<u8>, u16)],
         slots: &[usize],
-        pipe: &dyn Fn(usize) -> Option<u8>,
+        crtc: &dyn Fn(usize) -> Option<u8>,
         want: &dyn Fn(usize) -> Option<Timing>,
         lit: &[Selection],
     ) -> Option<Vec<(Selection, u8)>> {
         let link = self.mst.get(&port)?;
-        let assigned: Vec<_> = slots.iter().map(|&k| pipe(k)).collect();
+        let assigned: Vec<_> = slots.iter().map(|&k| crtc(k)).collect();
         let budget = |sink, allocated: &[(dp_mst_mgr::Sink, u16)]| {
             topology::path_budget(&link.topology, sink, allocated).unwrap_or(0)
         };
@@ -1694,7 +1694,7 @@ impl ColdBoot {
         )
     }
     /// The route's end devices (EDID, available PBN) and the streams
-    /// selected for them with their pipes, against the scanned root caps,
+    /// selected for them with their CRTCs, against the scanned root caps,
     /// beside `lit`, the port's running streams (none for a configuration
     /// of stopped displays). None when the new streams cannot ride the
     /// running link as it is: its root's caps (and so the link a payload
@@ -1743,12 +1743,12 @@ impl ColdBoot {
                 crate::amdgpu_hdr::use_vsc_sdp_for_colorimetry(d[0], sink.dprx_feature)
             })
         });
-        let pipe = |k: usize| route.pipes.get(k).copied().flatten();
+        let crtc = |k: usize| route.crtcs.get(k).copied().flatten();
         // A link no new stream joins is not searched again (Linux's
         // is_dsc_need_re_compute finds no change on it).
-        let joins = slots.iter().any(|&k| pipe(k).is_some());
+        let joins = slots.iter().any(|&k| crtc(k).is_some());
         let selected = if joins || lit.is_empty() {
-            self.select_on_link(port, caps, &devices, &slots, &pipe, route.want, lit)
+            self.select_on_link(port, caps, &devices, &slots, &crtc, route.want, lit)
         } else {
             Some(Vec::new())
         };
@@ -1771,8 +1771,8 @@ impl ColdBoot {
             selections,
         }))
     }
-    /// The running streams on DP `port` (by bit of pipe) that a commit
-    /// lighting the end devices on `joining` (slot k's new pipe) at
+    /// The running streams on DP `port` (by bit of CRTC) that a commit
+    /// lighting the end devices on `joining` (slot k's new CRTC) at
     /// `want(slot)` beside them must modeset because the link's DSC
     /// fairness search changes them (`affected_mst_streams`); with nothing
     /// joining, those a stream that just left changes. Linux modesets only
@@ -1789,7 +1789,7 @@ impl ColdBoot {
             .into_iter()
             .flatten()
             .filter(|m| m.selection.port == port && m.selection.mst.is_some())
-            .map(|m| (m.selection, m.pipe))
+            .map(|m| (m.selection, m.crtc))
             .collect();
         let Some(caps) = running.first().map(|r| r.0.caps) else {
             return Some(0);
