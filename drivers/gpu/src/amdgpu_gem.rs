@@ -718,26 +718,37 @@ impl GemObject {
     /// `amdgpu_bo_pin(rbo, amdgpu_display_supported_domains(...))` with
     /// AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS. On a dGPU (no gpu_vm_support) the
     /// display domain is VRAM alone, so a GFX12 DCC buffer, like any other,
-    /// is scanned out of VRAM only: a buffer in system memory moves to VRAM
-    /// first (amdgpu_bo_pin's validation), which needs it unshared by any
-    /// other address lease and idle; a buffer VRAM is not allowed for, a
-    /// userptr or a foreign dma-buf is refused (as amdgpu_bo_pin refuses a
-    /// userptr). A VRAM placement is one reservation, so it is contiguous.
-    /// The pin keeps the buffer, and that placement, until it drops.
+    /// is scanned out of VRAM only. amdgpu_bo_pin's validation (the move
+    /// of a buffer in system memory back to VRAM) runs before, in the async
+    /// [`prepare_scanout`] (it may wait for jobs and copy the whole buffer,
+    /// which never happens under the caller's KMS lock), so a buffer still
+    /// outside VRAM here is refused with ttm_bo_validate's `-ENOMEM`
+    /// (`OutOfMemory`); a buffer VRAM is not allowed for or a foreign
+    /// dma-buf is `-EINVAL` (`InvalidData`), a userptr `-EPERM`
+    /// (`OperationNotPermitted`), as amdgpu_bo_pin answers them. Pinning
+    /// forces a CPU-accessible buffer into visible VRAM
+    /// (CPU_ACCESS_REQUIRED): NARF only ever places NO_CPU_ACCESS buffers
+    /// past the BAR, and one that is not is refused rather than scanned out
+    /// there. A VRAM placement is one reservation, so it is contiguous. The
+    /// pin keeps the buffer, and that placement, until it drops.
     pub fn pin_scanout(self: &Arc<Self>) -> Result<ScanoutPin, FsError> {
         if self.allowed_domains.load(Ordering::Acquire) & u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM)
             == 0
         {
             return Err(FsError::InvalidData);
         }
-        if self.system() && !self.pinned() {
-            self.relocate(true)?;
-        }
         let placement = self.placement.lock();
         let address = match &placement.backing {
             Backing::Vram { _held } => _held.address(),
-            Backing::Unmapped { _held } => _held.address(),
-            _ => return Err(FsError::Busy),
+            Backing::Unmapped { _held }
+                if self.flags & u64::from(uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0 =>
+            {
+                _held.address()
+            }
+            Backing::Unmapped { .. } => return Err(FsError::InvalidData),
+            Backing::User(_) => return Err(FsError::OperationNotPermitted),
+            Backing::Foreign { .. } => return Err(FsError::InvalidData),
+            Backing::System(_) => return Err(FsError::OutOfMemory),
         };
         // Every DCC placement is made at the card's DCC alignment
         // (`reserve_visible`); one that is not is never scanned out.

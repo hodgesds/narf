@@ -608,8 +608,14 @@ impl FileOps for DriCardFile {
                     return result;
                 }
                 // prepare_fb's migration back to VRAM, before the commit pins.
-                crate::drm_ioctl_bridge::amdgpu_prepare_scanout(self.index, self.open_id, cmd)
-                    .await;
+                crate::drm_ioctl_bridge::amdgpu_prepare_scanout(
+                    self.index,
+                    self.open_id,
+                    cmd,
+                    arg as usize,
+                    &self.amdgpu_gem,
+                )
+                .await;
                 if let Some(result) = crate::amdgpu_vm::dispatch_async(
                     cmd,
                     arg as usize,

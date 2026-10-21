@@ -3948,8 +3948,30 @@ fn smoke_drm_navi48_gem_framebuffers_scan_out_in_place() -> TestResult {
     if gem.owns(a) || pool.available() != full - size {
         return TestResult::Fail("a shown buffer was freed by RMFB / GEM_CLOSE");
     }
-    // The next frame's buffer, pinned too (back into VRAM from where the
-    // eviction put it); until its flip latches nothing is released.
+    // The next frame's buffer, pinned too; until its flip latches nothing
+    // is released. The pin itself never moves it (no copy under the KMS
+    // lock): prepare_fb's async migration brings it back to VRAM from where
+    // the eviction put it first.
+    // A commit naming it before then fails with prepare_fb's ENOMEM, before
+    // any state changes, and keeps no pin.
+    let (refused, pinned) = {
+        let card = ms.lock();
+        let fb = card.framebuffer(fb_b).unwrap();
+        (
+            crate::drm_ioctl_bridge::PreparedFbs::prepare(&card, [fb_b]).err(),
+            fb.bo.as_ref().is_some_and(|bo| bo.object.pinned()),
+        )
+    };
+    if refused != Some(FsError::OutOfMemory) || pinned {
+        return TestResult::Fail("an evicted buffer pinned without prepare_fb");
+    }
+    narf_scheduler::block_on_spin(crate::drm_ioctl_bridge::amdgpu_prepare_scanout(
+        idx,
+        OWNER,
+        crate::drm_uapi::DRM_IOCTL_MODE_PAGE_FLIP,
+        0,
+        &gem,
+    ));
     let frame_b = {
         let card = ms.lock();
         crate::drm_ioctl_bridge::scanout_frame(&card, card.framebuffer(fb_b).unwrap())
@@ -4220,6 +4242,8 @@ fn smoke_drm_navi48_dumb_buffers_scan_out_of_vram() -> TestResult {
         idx,
         OWNER,
         DRM_IOCTL_MODE_PAGE_FLIP,
+        0,
+        &gem,
     ));
     back = [0; 4];
     if object_a.system()

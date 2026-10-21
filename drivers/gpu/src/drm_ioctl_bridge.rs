@@ -5138,6 +5138,17 @@ fn atomic_commit(
         if test_only {
             None
         } else {
+            // drm_atomic_helper_prepare_planes (amdgpu_dm's prepare_fb) for
+            // every plane the commit shows, before any state changes: a pin
+            // that fails fails the commit with its errno.
+            let prepared = PreparedFbs::prepare(
+                &card,
+                state
+                    .planes
+                    .iter()
+                    .filter(|p| p.crtc_id.is_some())
+                    .filter_map(|p| p.fb_id),
+            )?;
             let cursors = crate::drm_native_planes::cursor_changes(&card, &state);
             if let Err(error) = state.core_commit(&mut card) {
                 let _ = writeln!(
@@ -5147,7 +5158,7 @@ fn atomic_commit(
                 return Err(FsError::InvalidData);
             }
             crate::drm_native_planes::commit(&mut card, &state);
-            cursor_requests = native_cursor_requests(card_index, &mut card, &cursors);
+            cursor_requests = native_cursor_requests(card_index, &mut card, &cursors, &prepared);
             for &(connector, value) in &broadcast_rgb {
                 apply_broadcast_rgb(card_index, &mut card, connector, value);
             }
@@ -5298,7 +5309,7 @@ fn atomic_commit(
             // A display with native planes presents every plane this
             // commit updates together (`drm_native_planes`).
             let native_frame = |card: &crate::drm::card::Card, id: u32| {
-                native_plane_frame(card, state.planes.iter().find(|p| p.id == id)?)
+                native_plane_frame(card, state.planes.iter().find(|p| p.id == id)?, &prepared)
             };
             let native_presentations: Vec<_> = native_displays
                 .iter()
@@ -5590,10 +5601,12 @@ fn cursor_universal(
     Ok(0)
 }
 
-/// One native cursor plane's commit for the CRTC's hardware cursor.
+/// One native cursor plane's commit for the CRTC's hardware cursor: what
+/// it shows (a dumb buffer's image, or a pinned GEM buffer whose rows the
+/// cursor task reads once its writes landed) and where.
 struct CursorRequest {
     crtc_id: u32,
-    image: Option<crate::amdgpu_navi48_platform::CursorImage>,
+    image: Option<crate::amdgpu_navi48_platform::CursorContent>,
     position: (i32, i32),
 }
 
@@ -5622,12 +5635,23 @@ fn commit_cursor_plane(
         return Err(FsError::InvalidData);
     }
     crate::drm_native_planes::check(card, &state, |c| card.crtc(c).ok().and_then(|c| c.mode))?;
+    // prepare_fb: a cursor's GEM buffer pinned in VRAM, or the update fails.
+    let prepared = PreparedFbs::prepare(
+        card,
+        state
+            .planes
+            .iter()
+            .filter(|p| p.crtc_id.is_some())
+            .filter_map(|p| p.fb_id),
+    )?;
     let cursors = crate::drm_native_planes::cursor_changes(card, &state);
     if state.core_commit(card).is_err() {
         return Err(FsError::InvalidData);
     }
     crate::drm_native_planes::commit(card, &state);
-    Ok(native_cursor_requests(card_index, card, &cursors))
+    Ok(native_cursor_requests(
+        card_index, card, &cursors, &prepared,
+    ))
 }
 
 /// amdgpu_dm_commit_cursors for committed cursor plane changes: each
@@ -5638,6 +5662,7 @@ fn native_cursor_requests(
     card_index: u32,
     card: &mut crate::drm::card::Card,
     changes: &[crate::drm_native_planes::CursorChange],
+    prepared: &PreparedFbs,
 ) -> Vec<CursorRequest> {
     for c in changes {
         if let Some(fb) = c.released_fb {
@@ -5651,9 +5676,9 @@ fn native_cursor_requests(
         .iter()
         .map(|c| CursorRequest {
             crtc_id: c.crtc_id,
-            image: c
-                .fb_id
-                .and_then(|fb| crate::drm_native_planes::cursor_image(card, fb)),
+            image: c.fb_id.and_then(|fb| {
+                crate::drm_native_planes::cursor_content(card, fb, prepared.pin(fb))
+            }),
             position: c.position,
         })
         .collect()
@@ -6130,6 +6155,9 @@ fn handle_setcrtc(
             }
         }
 
+        // amdgpu_dm_plane_helper_prepare_fb before the commit changes any
+        // state: a GEM framebuffer that cannot be pinned fails SETCRTC.
+        let prepared = PreparedFbs::prepare(&card, (req.fb_id != 0).then_some(req.fb_id))?;
         // Record the mode and active fb on the crtc; switching it off
         // without a mode clears the mode (drm_mode_setcrtc).
         if let Ok(crtc) = card.crtc_mut(req.crtc_id) {
@@ -6182,7 +6210,11 @@ fn handle_setcrtc(
         let gem_handle = fb.gem_handle;
         src_phys = card.dumb_backing(gem_handle).map(|b| b.phys);
         src_frame = fb_frame(fb, src_phys.unwrap_or(0));
-        gem_frame = fb.bo.is_some().then(|| scanout_frame(&card, fb)).flatten();
+        gem_frame = fb
+            .bo
+            .is_some()
+            .then(|| prepared_frame(&card, fb, &prepared))
+            .flatten();
         virgl_resource = card.virtgpu_import(gem_handle).cloned();
     }
 
@@ -6311,7 +6343,15 @@ fn handle_page_flip(
         let gem_handle = fb.gem_handle;
         src_phys = card.dumb_backing(gem_handle).map(|b| b.phys);
         src_frame = fb_frame(fb, src_phys.unwrap_or(0));
-        gem_frame = fb.bo.is_some().then(|| scanout_frame(&card, fb)).flatten();
+        // prepare_fb before the flip changes any state: a GEM framebuffer
+        // that cannot be pinned fails PAGE_FLIP (no event is queued).
+        let prepared = PreparedFbs::prepare(&card, [req.fb_id])?;
+        let fb = card.framebuffer(req.fb_id).map_err(|_| FsError::NotFound)?;
+        gem_frame = fb
+            .bo
+            .is_some()
+            .then(|| prepared_frame(&card, fb, &prepared))
+            .flatten();
         virgl_resource = card.virtgpu_import(gem_handle).cloned();
 
         // Reserve Linux's per-file event space before changing the CRTC, so an
@@ -6548,6 +6588,8 @@ fn handle_setplane(
                     }
                 }
             }
+            // prepare_fb before the update changes any state.
+            let prepared = PreparedFbs::prepare(&card, state.planes[0].fb_id)?;
             if state.core_commit(&mut card).is_err() {
                 return Err(FsError::InvalidData);
             }
@@ -6562,14 +6604,14 @@ fn handle_setplane(
                 crate::amdgpu_native_kms::request_display_planes(display, dp.setup);
                 let primary = (card.native_plane(plane_id).and_then(|p| p.primary_of)
                     == Some(dp.crtc_id))
-                .then(|| native_plane_frame(&card, &state.planes[0]))
+                .then(|| native_plane_frame(&card, &state.planes[0], &prepared))
                 .flatten();
                 if let Some(f) = &primary {
                     crate::amdgpu_native_kms::request_display_format(display, f.format);
                 }
                 let overlays = dp.overlays.map(|id| {
                     id.filter(|&id| id == plane_id)
-                        .and_then(|_| native_plane_frame(&card, &state.planes[0]))
+                        .and_then(|_| native_plane_frame(&card, &state.planes[0], &prepared))
                 });
                 frames.push((dp.crtc_id, primary, overlays));
             }
@@ -6583,43 +6625,89 @@ fn handle_setplane(
     Ok(0)
 }
 
+/// amdgpu_dm_plane_helper_prepare_fb for the framebuffers a commit shows,
+/// run under the KMS lock before the commit changes any state: each GEM
+/// framebuffer's buffer pinned in VRAM (`GemObject::pin_scanout`; the
+/// async `amdgpu_prepare_scanout` moved it back first). A pin that fails
+/// fails the ioctl with its errno before anything changed, as a failed
+/// prepare_fb fails drm_atomic_helper_prepare_planes; dropping the set
+/// unpins them (cleanup_fb of the failed commit). A dumb framebuffer
+/// needs no pin.
+#[derive(Default)]
+pub(crate) struct PreparedFbs(Vec<(u32, Arc<crate::amdgpu_gem::ScanoutPin>)>);
+impl PreparedFbs {
+    pub(crate) fn prepare(
+        card: &crate::drm::card::Card,
+        fb_ids: impl IntoIterator<Item = u32>,
+    ) -> Result<Self, FsError> {
+        let mut pins: Vec<(u32, Arc<crate::amdgpu_gem::ScanoutPin>)> = Vec::new();
+        for id in fb_ids {
+            if pins.iter().any(|(f, _)| *f == id) {
+                continue;
+            }
+            let Some(bo) = card.framebuffer(id).ok().and_then(|fb| fb.bo.as_ref()) else {
+                continue;
+            };
+            match bo.object.pin_scanout() {
+                Ok(pin) => pins.push((id, Arc::new(pin))),
+                Err(e) => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  drm: fb {id} not pinned for scanout: {e:?}"
+                    );
+                    return Err(e);
+                }
+            }
+        }
+        Ok(Self(pins))
+    }
+    /// The pin prepare took on framebuffer `fb_id`'s GEM buffer.
+    pub(crate) fn pin(&self, fb_id: u32) -> Option<Arc<crate::amdgpu_gem::ScanoutPin>> {
+        self.0
+            .iter()
+            .find(|(f, _)| *f == fb_id)
+            .map(|(_, p)| p.clone())
+    }
+}
+
 /// A native plane's framebuffer as the presenter shows it: its dumb
 /// backing (which the presenter copies), or its amdgpu GEM buffer pinned
-/// for scanout in place (`scanout_frame`); pitch, size and fourcc.
+/// for scanout in place (`prepared_frame`); pitch, size and fourcc.
 fn native_plane_frame(
     card: &crate::drm::card::Card,
     plane: &crate::drm::atomic::PlaneState,
+    prepared: &PreparedFbs,
 ) -> Option<crate::amdgpu_navi48_platform::PlaneFrame> {
-    scanout_frame(card, card.framebuffer(plane.fb_id?).ok()?)
+    prepared_frame(card, card.framebuffer(plane.fb_id?).ok()?, prepared)
 }
 
 /// Framebuffer `fb` as the presenter shows it: a dumb buffer's backing, or
-/// (amdgpu_dm_plane_helper_prepare_fb) its GEM buffer pinned in VRAM, which
-/// a plane scans out in place until a later flip latches past it. None
-/// without either (or when the buffer cannot be pinned in VRAM).
-pub(crate) fn scanout_frame(
+/// its GEM buffer with the pin `prepared` took on it, which a plane scans
+/// out in place until a later flip latches past it. None without either.
+fn prepared_frame(
     card: &crate::drm::card::Card,
     fb: &crate::drm::card::Framebuffer,
+    prepared: &PreparedFbs,
 ) -> Option<crate::amdgpu_navi48_platform::PlaneFrame> {
-    if let Some(bo) = &fb.bo {
-        let pin = match bo.object.pin_scanout() {
-            Ok(pin) => pin,
-            Err(e) => {
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "  drm: fb {} not pinned for scanout: {e:?}",
-                    fb.id
-                );
-                return None;
-            }
-        };
+    if fb.bo.is_some() {
         return Some(crate::amdgpu_navi48_platform::PlaneFrame {
-            bo: Some(Arc::new(pin)),
+            bo: Some(prepared.pin(fb.id)?),
             ..fb_frame(fb, 0)
         });
     }
     let phys = card.dumb_backing(fb.gem_handle)?.phys;
     Some(fb_frame(fb, phys))
+}
+
+/// `prepared_frame` of framebuffer `fb` after preparing it alone (None
+/// when its GEM buffer cannot be pinned).
+#[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+pub(crate) fn scanout_frame(
+    card: &crate::drm::card::Card,
+    fb: &crate::drm::card::Framebuffer,
+) -> Option<crate::amdgpu_navi48_platform::PlaneFrame> {
+    let prepared = PreparedFbs::prepare(card, [fb.id]).ok()?;
+    prepared_frame(card, fb, &prepared)
 }
 
 /// Framebuffer `fb` (backed at `phys`) as the presenter copies it.
@@ -7273,22 +7361,47 @@ pub async fn amdgpu_create_dumb_async(
     Some(finish_amdgpu_dumb(arg, req, made))
 }
 
-/// Before a SETCRTC, PAGE_FLIP, SETPLANE or atomic commit on the Navi48
-/// card from open `open_id`: amdgpu_dm_plane_helper_prepare_fb's pin
-/// validation for the GEM buffers of the open's framebuffers, which may
-/// sleep. Each that left VRAM (suspend's eviction, or eviction for another
-/// allocation) and is not pinned moves back, mapped or not
-/// (`amdgpu_gem::prepare_scanout`), so the commit's pin finds it in VRAM
-/// and scans it out in place.
-pub async fn amdgpu_prepare_scanout(card_index: u32, open_id: u64, cmd: u32) {
+/// Before a SETCRTC, PAGE_FLIP, SETPLANE, atomic or legacy cursor commit
+/// on the Navi48 card from open `open_id`: amdgpu_dm_plane_helper_prepare_fb's
+/// pin validation for the GEM buffers of the open's framebuffers (and a
+/// legacy CURSOR/CURSOR2's buffer, its handle in `arg` in the open's `gem`
+/// table), which may sleep. Each that left VRAM (suspend's eviction, or
+/// eviction for another allocation) and is not pinned moves back, mapped or
+/// not (`amdgpu_gem::prepare_scanout`), so the commit's pin
+/// (`PreparedFbs`), which never moves a buffer itself, finds it in VRAM.
+pub async fn amdgpu_prepare_scanout(
+    card_index: u32,
+    open_id: u64,
+    cmd: u32,
+    arg: usize,
+    gem: &crate::amdgpu_gem::GemState,
+) {
+    const DRM_MODE_CURSOR_BO: u32 = 0x01;
+    let nr = drm_uapi::ioc_nr(cmd);
     if (cmd >> 8) & 0xff != u32::from(b'd')
-        || !matches!(drm_uapi::ioc_nr(cmd), 0xA2 | 0xB0 | 0xB7 | 0xBC)
+        || !matches!(nr, 0xA2 | 0xA3 | 0xB0 | 0xB7 | 0xBB | 0xBC)
     {
         return;
     }
     let Some(mode_state) = crate::drm_registry::mode_state(card_index) else {
         return;
     };
+    // drm_mode_cursor's flags at 0 and handle at 24.
+    let cursor = matches!(nr, 0xA3 | 0xBB)
+        .then(|| {
+            if arg == 0 {
+                return None;
+            }
+            // SAFETY: `arg` is the ioctl pointer; drm_mode_cursor is 28 bytes
+            // and copy_in bounds and SMAP-brackets the read.
+            let b = unsafe { copy_in(arg, 28) }.ok()?;
+            let word = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
+            let handle = word(24);
+            (word(0) & DRM_MODE_CURSOR_BO != 0 && handle != 0 && gem.owns(handle))
+                .then(|| gem.object(handle))
+                .flatten()
+        })
+        .flatten();
     let objects: Vec<_> = {
         let card = mode_state.lock();
         if !card.gfx12_modifiers {
@@ -7299,6 +7412,7 @@ pub async fn amdgpu_prepare_scanout(card_index: u32, open_id: u64, cmd: u32) {
             .filter_map(|fb| fb.bo.as_ref())
             .filter(|bo| bo.owner == open_id && bo.object.system())
             .map(|bo| Arc::clone(&bo.object))
+            .chain(cursor.filter(|o| o.system()))
             .collect()
     };
     crate::amdgpu_gem::prepare_scanout(card_index, objects).await;

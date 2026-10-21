@@ -4671,9 +4671,15 @@ flags (`GemObject::tiling_flags`) and AMDGPU_GEM_CREATE_GFX12_DCC
 (amdgpu_display_get_fb_info). `Framebuffer::bo` (`FbBo`: the
 `GemObject`, which the framebuffer holds, and the owning open) is removed
 with RMFB or, at the open's close, by `Card::release_file_framebuffers`
-(drm_fb_release). Showing it (atomic, SETCRTC, PAGE_FLIP, SETPLANE:
-`drm_ioctl_bridge::scanout_frame`) is amdgpu_dm_plane_helper_prepare_fb:
-`GemObject::pin_scanout` pins the buffer with
+(drm_fb_release). Showing it (atomic, SETCRTC, PAGE_FLIP, SETPLANE, a
+cursor plane or legacy CURSOR) is amdgpu_dm_plane_helper_prepare_fb,
+run as drm_atomic_helper_prepare_planes runs it: under the KMS lock
+before the commit changes any state (`drm_ioctl_bridge::PreparedFbs::prepare`
+for every framebuffer the commit shows; the presenter frames and cursor
+requests take its pins). A pin that fails fails the ioctl with its errno
+before any CRTC, plane or event changes, and the pins already taken drop
+with it (cleanup_fb of the failed commit). `GemObject::pin_scanout` pins the
+buffer with
 amdgpu_display_supported_domains' domain, which on this dGPU (no
 gpu_vm_support) is VRAM alone, DCC buffers included: a VRAM placement is
 one contiguous reservation (amdgpu_vram_mgr_new's VRAM_CONTIGUOUS path, so
@@ -4698,9 +4704,16 @@ refuses an `otg::ExternalSurface` without `dcc_aligned`. Linux takes the
 DCC placement only once a buffer is allocated VRAM_CONTIGUOUS (prepare_fb
 sets the flag, so its first pin re-places a non-contiguous one; a buffer
 that happened to land contiguous keeps its start); NARF's placements are
-all contiguous, so it applies from creation. A buffer in system memory moves to VRAM first
-when nothing else leases it; one VRAM is not allowed for, a userptr or a
-foreign dma-buf is refused. `ScanoutPin` (amdgpu_bo_unpin on drop) keeps the
+all contiguous, so it applies from creation. The pin never moves a
+buffer: amdgpu_bo_pin's validation (a buffer in system memory moving back
+to VRAM, which waits for its jobs and copies it whole) runs before, in the
+async `drm_ioctl_bridge::amdgpu_prepare_scanout` (below), never under the
+KMS spinlock, so a buffer still outside VRAM is ENOMEM (`OutOfMemory`, as
+ttm_bo_validate reports no room); one VRAM is not allowed for or a foreign
+dma-buf is EINVAL and a userptr EPERM, as amdgpu_bo_pin answers. A
+CPU-accessible buffer is only ever placed in visible VRAM (amdgpu_bo_pin
+forces CPU_ACCESS_REQUIRED for one; NARF puts only NO_CPU_ACCESS buffers
+past the BAR), and the pin refuses one found past the BAR. `ScanoutPin` (amdgpu_bo_unpin on drop) keeps the
 buffer and its placement: while any pin lives `GemObject::pinned` stops
 `relocate`, `commit_transfer`, pressure eviction (`evict_visible`) and
 `amdgpu_vm::relocate`, and `evict_all` passes the buffer by (TTM's LRU walk
@@ -4748,9 +4761,16 @@ commit: every plane still fetching a client framebuffer flips back to its
 back buffer and the pins retire, before system suspend evicts VRAM and
 after the last card close (a release that fails there keeps the pins until
 a later pass retires them: drm_fb_helper_lastclose ignores its restore
-commit's error). A cursor plane's GEM framebuffer is pinned in
-VRAM and copied for the hardware cursor (`GemPlacement::read_bytes`), as
-dumb ones are. Dumb buffers are such GEM buffers in VRAM (below) and take
+commit's error). A cursor plane's GEM framebuffer is pinned in VRAM by the
+commit's prepare and handed to the display's cursor task
+(`amdgpu_navi48_platform::CursorContent::Gem`, `GemCursor`), which waits
+for the buffer's WRITE fences (the plane fence drm_gem_plane_helper_prepare_fb
+takes and drm_atomic_helper_wait_for_fences waits for; NARF bounds the
+wait at 10 s, Linux does not) before it copies the rows for the hardware
+cursor (`GemPlacement::read_bytes`) and shows them at the commit's
+position; the cursor keeps its previous image and position until then,
+and a newer commit supersedes a pending one. A dumb cursor's rows are
+copied at the commit. Dumb buffers are such GEM buffers in VRAM (below) and take
 this path; only one of the card's own system-memory dumb buffers, made
 while no VRAM heap was up, is still CPU-copied.
 
@@ -4782,9 +4802,10 @@ PAGE_FLIP, SETPLANE or atomic commit, the open's framebuffer buffers that
 left VRAM (suspend's evict_all, eviction for another allocation) and are
 not pinned move back (`drm_ioctl_bridge::amdgpu_prepare_scanout`,
 `amdgpu_gem::prepare_scanout` through `amdgpu_vm::relocate`, CPU mappings
-following), as amdgpu_bo_pin's validation in prepare_fb migrates them; a
-buffer that cannot move is refused at the pin and the plane keeps what it
-showed. Legacy CURSOR/CURSOR2 with one of the open's GEM handles wraps that
+following), as amdgpu_bo_pin's validation in prepare_fb migrates them, and
+so does a legacy CURSOR/CURSOR2's buffer (its handle in the ioctl); a
+buffer that cannot move is refused at the pin, failing the commit with
+ENOMEM. Legacy CURSOR/CURSOR2 with one of the open's GEM handles wraps that
 buffer (`drm_ioctl_bridge::amdgpu_cursor_bo`, `Card::addfb2_bo` with no
 owning open, so drm_fb_release leaves it). `tests/amdgpu_dumb/check.sh`
 builds drm_mode_create_dumb, amdgpu_mode_dumb_create,
@@ -4796,7 +4817,9 @@ page tables carry no caching attribute: x86_64 leaves it to the MTRRs,
 uncached for the BAR on real boards; aarch64 maps Normal), and a GTT
 placement is not USWC; the migration back to VRAM runs before the commit
 rather than inside the pin, and without evicting other buffers to make
-room; DRM_MODE_CREATE_DUMB from the render node keeps the card's table.
+room, and only for the open's own framebuffers and a legacy cursor's
+buffer (a commit naming another open's evicted framebuffer fails ENOMEM);
+DRM_MODE_CREATE_DUMB from the render node keeps the card's table.
 SETCRTC admits such a framebuffer as a placed primary
 (`drm_native_planes::setcrtc_planes`), PAGE_FLIP requests the display's
 planes so a tiling change is a plane update.

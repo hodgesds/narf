@@ -1000,7 +1000,8 @@ kernel_test_in!(
 );
 
 /// amdgpu_dm_plane_helper_prepare_fb's amdgpu_bo_pin on a dGPU: a scanout
-/// buffer is pinned in VRAM (a system one moves there first), the pin's
+/// buffer is pinned in VRAM (a system one is refused with ENOMEM until the
+/// async `prepare_scanout` has moved it back), the pin's
 /// GPU address is its VRAM reservation's, and while any pin lives the
 /// buffer moves for nothing: no demotion, no pressure eviction, and
 /// suspend's evict_all passes it by (ttm_resource_manager_evict_all only
@@ -1072,10 +1073,14 @@ fn scanout_pin_holds_vram_placement_until_unpinned() -> TestResult {
     assert!(dcc.pinned() && dcc.gpu_at(0).is_some());
     drop(pin);
     assert!(!dcc.pinned());
-    // A buffer in system memory moves to VRAM to be pinned there.
+    // A buffer in system memory is not moved by the pin (no copy under the
+    // KMS lock): ENOMEM until prepare_scanout moved it back to VRAM.
     let both = state.get(create(&state, 4096, vram | gtt)).unwrap();
     assert_eq!(both.relocate(false), Ok(()));
     assert!(both.system());
+    assert_eq!(both.pin_scanout().err(), Some(FsError::OutOfMemory));
+    assert!(both.system() && !both.pinned());
+    narf_scheduler::block_on_spin(prepare_scanout(CARD, alloc::vec![both.clone()]));
     let pin = both.pin_scanout().unwrap();
     assert!(!both.system() && pin.address() >= 0x8_0000_0000);
     drop(pin);

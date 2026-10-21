@@ -852,10 +852,26 @@ pub fn cursor_changes(card: &Card, state: &AtomicState) -> Vec<CursorChange> {
 }
 
 /// A cursor framebuffer's premultiplied ARGB8888 pixels, row by row, read
-/// out of its dumb buffer, or out of its amdgpu GEM buffer pinned in VRAM
-/// as amdgpu_dm_plane_helper_prepare_fb pins a cursor's (the hardware
-/// cursor scans a copy). None when neither holds its rows.
+/// out of its dumb buffer (`cursor_content`). None for a GEM framebuffer
+/// or when no dumb buffer holds its rows.
 pub fn cursor_image(card: &Card, fb_id: u32) -> Option<crate::amdgpu_navi48_platform::CursorImage> {
+    match cursor_content(card, fb_id, None)? {
+        crate::amdgpu_navi48_platform::CursorContent::Image(image) => Some(image),
+        crate::amdgpu_navi48_platform::CursorContent::Gem(_) => None,
+    }
+}
+
+/// What a cursor framebuffer shows the hardware cursor (which scans a
+/// copy): its dumb buffer's rows, read now, or its amdgpu GEM buffer with
+/// the pin amdgpu_dm_plane_helper_prepare_fb took on it (`pin`), whose
+/// rows the cursor task reads once the buffer's WRITE fences signalled
+/// (drm_gem_plane_helper_prepare_fb's fence, which the commit waits for).
+/// None when neither holds its rows.
+pub fn cursor_content(
+    card: &Card,
+    fb_id: u32,
+    pin: Option<alloc::sync::Arc<crate::amdgpu_gem::ScanoutPin>>,
+) -> Option<crate::amdgpu_navi48_platform::CursorContent> {
     let fb = card.framebuffer(fb_id).ok()?;
     let (w, h) = (fb.width, fb.height);
     if w == 0 || h == 0 || w > MAX_CURSOR_SIZE || h > MAX_CURSOR_SIZE {
@@ -865,22 +881,20 @@ pub fn cursor_image(card: &Card, fb_id: u32) -> Option<crate::amdgpu_navi48_plat
     let end = u64::from(fb.offsets[0]) + u64::from(h - 1) * u64::from(fb.pitch) + row;
     let mut pixels = Vec::with_capacity((w * h) as usize);
     let mut line = [0u8; MAX_CURSOR_SIZE as usize * 4];
-    if let Some(bo) = &fb.bo {
-        let pin = bo.object.pin_scanout().ok()?;
-        for y in 0..h {
-            let at = u64::from(fb.offsets[0]) + u64::from(y) * u64::from(fb.pitch);
-            pin.placement().read_bytes(at, &mut line[..row as usize])?;
-            pixels.extend(
-                line[..row as usize]
-                    .chunks_exact(4)
-                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
-            );
+    if fb.bo.is_some() {
+        let pin = pin?;
+        if end > pin.byte_len() {
+            return None;
         }
-        return Some(crate::amdgpu_navi48_platform::CursorImage {
-            width: w,
-            height: h,
-            pixels,
-        });
+        return Some(crate::amdgpu_navi48_platform::CursorContent::Gem(
+            crate::amdgpu_navi48_platform::GemCursor {
+                pin,
+                offset: fb.offsets[0],
+                pitch: fb.pitch,
+                width: w,
+                height: h,
+            },
+        ));
     }
     let backing = card.dumb_backing(fb.gem_handle)?;
     if end > backing.byte_len as u64 {
@@ -903,11 +917,13 @@ pub fn cursor_image(card: &Card, fb_id: u32) -> Option<crate::amdgpu_navi48_plat
                 .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
         );
     }
-    Some(crate::amdgpu_navi48_platform::CursorImage {
-        width: w,
-        height: h,
-        pixels,
-    })
+    Some(crate::amdgpu_navi48_platform::CursorContent::Image(
+        crate::amdgpu_navi48_platform::CursorImage {
+            width: w,
+            height: h,
+            pixels,
+        },
+    ))
 }
 
 /// drm_atomic_normalize_zpos on one CRTC's planes, then the plane setup

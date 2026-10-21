@@ -4699,10 +4699,64 @@ pub struct CursorImage {
     pub pixels: Vec<u32>,
 }
 
+/// What a DRM cursor plane shows: an image already read (a dumb buffer's),
+/// or a pinned GEM framebuffer's rows (`GemCursor`).
+#[derive(Debug)]
+pub enum CursorContent {
+    Image(CursorImage),
+    Gem(GemCursor),
+}
+/// A GEM cursor framebuffer: the pin prepare_fb took on its buffer, its
+/// rows' offset and pitch and its size. The cursor task waits for the
+/// buffer's WRITE fences (the plane-state fence
+/// drm_gem_plane_helper_prepare_fb takes, which
+/// drm_atomic_helper_wait_for_fences waits for before the commit
+/// programs the cursor), then copies the rows for the hardware cursor.
+#[derive(Clone, Debug)]
+pub struct GemCursor {
+    pub pin: Arc<crate::amdgpu_gem::ScanoutPin>,
+    pub offset: u32,
+    pub pitch: u32,
+    pub width: u32,
+    pub height: u32,
+}
+impl GemCursor {
+    /// The rows as premultiplied ARGB8888 pixels.
+    fn read(&self) -> Option<CursorImage> {
+        let row = self.width as usize * 4;
+        let mut line = alloc::vec![0u8; row];
+        let mut pixels = Vec::with_capacity((self.width * self.height) as usize);
+        for y in 0..self.height {
+            let at = u64::from(self.offset) + u64::from(y) * u64::from(self.pitch);
+            self.pin.placement().read_bytes(at, &mut line)?;
+            pixels.extend(
+                line.chunks_exact(4)
+                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+            );
+        }
+        Some(CursorImage {
+            width: self.width,
+            height: self.height,
+            pixels,
+        })
+    }
+    /// The same commit's content: the same pin.
+    fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.pin, &other.pin)
+    }
+}
+/// How long the cursor task waits for a GEM cursor's writes before it
+/// copies the rows anyway (Linux waits without a bound; NARF bounds it at
+/// the GFX job timeout, as a hung writer would be reset by then).
+const CURSOR_FENCE_WAIT_MS: u64 = 10_000;
+
 /// One display's DRM cursor plane as last committed.
 struct DrmCursor {
     /// The image it shows; None while the plane is off.
     image: Option<Arc<CursorImage>>,
+    /// A committed GEM cursor (and its position) whose writes are still
+    /// awaited: the image and position it brings replace these once read.
+    pending: Option<(GemCursor, (i32, i32))>,
     /// The image is not uploaded yet.
     upload: bool,
     /// CRTC_X/Y: the image's top-left on the CRTC (negative moves into the
@@ -4715,6 +4769,7 @@ struct DrmCursor {
 impl DrmCursor {
     const OFF: Self = Self {
         image: None,
+        pending: None,
         upload: false,
         position: (0, 0),
         dirty: false,
@@ -4743,6 +4798,18 @@ pub fn request_display_cursor(
     image: Option<CursorImage>,
     position: (i32, i32),
 ) -> bool {
+    request_display_cursor_content(display, image.map(CursorContent::Image), position)
+}
+/// `request_display_cursor` with the plane's content: an image, or a GEM
+/// framebuffer whose image and position the cursor task takes once the
+/// buffer's writes landed (the display keeps showing the previous cursor
+/// until then, as Linux's commit waits for the plane's fence before it
+/// programs any of it).
+pub fn request_display_cursor_content(
+    display: u8,
+    content: Option<CursorContent>,
+    position: (i32, i32),
+) -> bool {
     let Some(slot) = DRM_CURSORS.get(usize::from(display)) else {
         return false;
     };
@@ -4750,16 +4817,22 @@ pub fn request_display_cursor(
     CONSOLE_CURSOR_STALE.fetch_and(!(1 << display), Ordering::AcqRel);
     let spawn = {
         let mut c = slot.lock();
-        match image {
-            Some(image) => {
+        match content {
+            Some(CursorContent::Gem(gem)) => c.pending = Some((gem, position)),
+            Some(CursorContent::Image(image)) => {
+                c.pending = None;
                 if c.image.as_deref() != Some(&image) {
                     c.image = Some(Arc::new(image));
                     c.upload = true;
                 }
+                c.position = position;
             }
-            None => c.image = None,
+            None => {
+                c.pending = None;
+                c.image = None;
+                c.position = position;
+            }
         }
-        c.position = position;
         c.dirty = true;
         !core::mem::replace(&mut c.running, true)
     };
@@ -4794,13 +4867,43 @@ fn drm_owns_cursor(display: u8) -> bool {
 async fn drm_cursor_task(display: u8) {
     let slot = &DRM_CURSORS[usize::from(display)];
     loop {
-        {
+        let pending = {
             let mut c = slot.lock();
             if !c.dirty {
                 c.running = false;
                 return;
             }
             c.dirty = false;
+            c.pending.clone()
+        };
+        // A GEM cursor: its writes land first (the commit's fence wait),
+        // then its rows become the image, unless a newer commit replaced it
+        // meanwhile (which set `dirty` again).
+        if let Some((gem, position)) = pending {
+            let deadline = narf_time::Deadline::after_ms(CURSOR_FENCE_WAIT_MS);
+            let resv = &gem.pin.object().dma_buf().resv;
+            while !resv
+                .fences(narf_filesystem::dma_buf::DmaResvUsage::Write)
+                .is_empty()
+                && !deadline.expired()
+            {
+                narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
+            }
+            let image = gem.read();
+            let mut c = slot.lock();
+            if c.pending.as_ref().is_some_and(|(p, _)| p.same(&gem)) {
+                c.pending = None;
+                match image {
+                    Some(image) => {
+                        if c.image.as_deref() != Some(&image) {
+                            c.image = Some(Arc::new(image));
+                            c.upload = true;
+                        }
+                    }
+                    None => c.image = None,
+                }
+                c.position = position;
+            }
         }
         let mut owner = OWNER.lock().await;
         if let Some(boot) = owner.as_mut() {

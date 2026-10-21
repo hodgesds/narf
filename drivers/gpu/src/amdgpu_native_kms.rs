@@ -200,8 +200,9 @@ pub fn hdr_metadata_valid(blob: &[u8]) -> bool {
 /// keep driving the console's pointer).
 pub fn request_display_cursor(
     display: u8,
-    image: Option<crate::amdgpu_navi48_platform::CursorImage>,
+    image: Option<crate::amdgpu_navi48_platform::CursorContent>,
     position: (i32, i32),
 ) -> bool {
-    !navi22() && crate::amdgpu_navi48_platform::request_display_cursor(display, image, position)
+    !navi22()
+        && crate::amdgpu_navi48_platform::request_display_cursor_content(display, image, position)
 }
