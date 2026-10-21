@@ -1168,7 +1168,16 @@ unsafe fn dealloc_class(c: usize, ptr: NonNull<u8>) {
         class.magazines[cpu]
             .available
             .store(mag.top, Ordering::Relaxed);
-        class.central_free.fetch_add(flush, Ordering::Relaxed);
+        let central_free = class.central_free.fetch_add(flush, Ordering::Relaxed) + flush;
+        // Proactive watermark: if this class has parked more than
+        // SLAB_RETAIN_FRAMES_HIGH frames of free blocks, flag the executor to
+        // shed empties back to the buddy at its next maintenance tick. Only a
+        // flag here — the actual buddy release (`free_frame`) must not run on
+        // the dealloc path, which may be nested under an arbitrary caller lock
+        // (including the buddy's own zone lock). See `drain_over_watermark`.
+        if central_free > SLAB_RETAIN_FRAMES_HIGH.saturating_mul(blocks_per_frame(c)) {
+            SLAB_WANTS_DRAIN.store(true, Ordering::Relaxed);
+        }
     });
 }
 
@@ -1369,6 +1378,97 @@ pub fn magazine_stats() -> MagazineStats {
 /// make another bounded pass; reclaim never allocates its own work storage.
 const SLAB_RECLAIM_BATCH_FRAMES: usize = 64;
 
+/// Proactive empty-frame watermark (in frames, per size class). When a class's
+/// central free list grows past `_HIGH` frames' worth of blocks, the next
+/// executor maintenance tick ([`drain_over_watermark`]) sheds fully-empty
+/// frames back to the buddy until the class is down to `_LOW`. This bounds how
+/// much a churny class can sequester from the buddy — the background shrinker
+/// otherwise only fires under the global memory low-watermark, which never
+/// trips while a fork storm's freed-but-parked frames keep "free" memory
+/// high. ~`_HIGH * N_CLASSES` frames (here ~18 MiB) is the steady-state
+/// per-class cache ceiling; large hoarder classes (1–4 KiB objects, few blocks
+/// per frame) are exactly the ones a high `central_free` makes reclaimable.
+const SLAB_RETAIN_FRAMES_HIGH: usize = 512;
+const SLAB_RETAIN_FRAMES_LOW: usize = 128;
+/// Per-class pages shed in one [`drain_over_watermark`] visit; a big hoard
+/// drains across successive ticks so one tick can't monopolise the executor.
+/// `reclaim_class_frames` detaches at most `SLAB_RECLAIM_BATCH_FRAMES` per call,
+/// so the drain loops a few of those per class per tick up to this budget.
+const SLAB_DRAIN_FRAMES_PER_TICK: usize = 256;
+
+/// Set when a dealloc flush pushes some class past `SLAB_RETAIN_FRAMES_HIGH`.
+/// Read-and-cleared by [`drain_over_watermark`]. A plain bool so the hot
+/// dealloc path pays only one relaxed store on the (rare) over-watermark spill,
+/// and the common maintenance tick pays one relaxed load.
+static SLAB_WANTS_DRAIN: AtomicBool = AtomicBool::new(false);
+
+/// Blocks that fit in one page for class `c` (its central-free → frames ratio).
+#[inline]
+const fn blocks_per_frame(c: usize) -> usize {
+    let s = class_size(c);
+    if s == 0 {
+        1
+    } else {
+        PAGE_SIZE_USIZE / s
+    }
+}
+
+/// Executor maintenance hook: if a size class has parked more than
+/// `SLAB_RETAIN_FRAMES_HIGH` frames of free blocks, return fully-empty frames
+/// to the buddy until it is back near `SLAB_RETAIN_FRAMES_LOW`. This is the
+/// proactive counterpart to the failure-path direct reclaim in
+/// `frame::alloc_frame_on_inner_ctx`: it keeps the slab from ever hoarding
+/// enough to starve the buddy in the first place.
+///
+/// MUST be called from a sleepable, lock-free context — the scheduler's
+/// between-dispatch maintenance point, where it already drains RCU and frees
+/// retired memory. It calls the buddy (`free_frame`), so it must NOT run from
+/// the dealloc hot path (which may be nested under an arbitrary caller lock) —
+/// hence the flag-then-drain split.
+pub fn drain_over_watermark() {
+    if !SLAB_WANTS_DRAIN.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let mut still_over = false;
+    for (c, class) in CLASSES.iter().enumerate() {
+        let bpf = blocks_per_frame(c);
+        let high = SLAB_RETAIN_FRAMES_HIGH.saturating_mul(bpf);
+        let low = SLAB_RETAIN_FRAMES_LOW.saturating_mul(bpf);
+        // Shed this class toward `low` in `reclaim_class_frames`-sized batches,
+        // capped at `SLAB_DRAIN_FRAMES_PER_TICK` so one tick can't monopolise
+        // the executor. If the whole per-tick budget was spent and the class is
+        // still over `high`, re-arm so the next tick continues; stop early on a
+        // short/zero batch (remaining free blocks too fragmented to form empty
+        // frames) and wait for the next dealloc flush to re-flag us rather than
+        // re-walking the list fruitlessly.
+        let mut shed = 0usize;
+        loop {
+            let cf = class.central_free.load(Ordering::Relaxed);
+            if cf <= high {
+                break;
+            }
+            let want = cf.saturating_sub(low) / bpf;
+            let target = want
+                .min(SLAB_RECLAIM_BATCH_FRAMES)
+                .min(SLAB_DRAIN_FRAMES_PER_TICK - shed);
+            if target == 0 {
+                still_over = true;
+                break;
+            }
+            // SAFETY: `c < N_CLASSES`; the central list holds only class `c`'s
+            // blocks. Called from the sleepable maintenance context per the doc.
+            let freed = unsafe { reclaim_class_frames(c, target) };
+            shed += freed;
+            if freed < target {
+                break;
+            }
+        }
+    }
+    if still_over {
+        SLAB_WANTS_DRAIN.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Registered-once guard for the slab shrinker.
 static SLAB_SHRINKER_REGISTERED: AtomicBool = AtomicBool::new(false);
 
@@ -1465,6 +1565,51 @@ fn slab_shrink(target_pages: usize) -> usize {
         }
     }
     freed
+}
+
+/// Per-CPU guard against re-entering direct reclaim. `slab_shrink`'s
+/// `free_frame` can re-enter the allocator (the cgroup charge hook allocates),
+/// and if THAT allocation also fails it would call back here on the same CPU;
+/// without the guard a failing cgroup-charge allocation mid-reclaim would
+/// recurse indefinitely. Cross-CPU reclaim stays allowed (desirable under load).
+static DIRECT_RECLAIM_ACTIVE: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// Direct reclaim for the frame allocator's failure path: return up to
+/// `target_pages` fully-empty slab frames to the buddy, then let the caller
+/// retry. Returns the number of frames actually freed.
+///
+/// Why this exists: the slab grows one size-class at a time and parks emptied
+/// frames in that class's own central free list — it does NOT hand them back
+/// to the buddy until a shrinker runs. A churny workload (a fork storm's
+/// COW/rmap/page-table allocations are ~1–4 KiB) can therefore sequester most
+/// of RAM inside one or two size classes, so a later buddy allocation (a page
+/// table, a kernel stack, a different-size kmalloc) fails even though the
+/// memory is free — just trapped in the slab. Measured: a 4-worker 3 s fork
+/// storm left ~440 MB parked in near-empty kmalloc-1024/2048/4096 classes that
+/// never returned to the buddy, and sustained pressure then panicked an
+/// infallible allocation. This mirrors Linux shrinking slab caches in direct
+/// reclaim before an allocation is allowed to fail.
+///
+/// Slab-only on purpose: it touches only slab class locks and the buddy, never
+/// the anon/address-space shrinkers, so it is safe to call from ANY allocation
+/// failure — including a page fault that already holds the region lock, and an
+/// IRQ-masked slab-grow (where `direct_compact` refuses to run).
+pub fn reclaim_empty_frames_to_buddy(target_pages: usize) -> usize {
+    if target_pages == 0 {
+        return 0;
+    }
+    // Mask IRQs so `current_cpu()` and the guard flag refer to the same CPU for
+    // the whole call (we may already be inside a `without_interrupts` grow; the
+    // nesting composes).
+    narf_lib::sync::without_interrupts(|| {
+        let cpu = current_cpu().min(MAX_CPUS - 1);
+        if DIRECT_RECLAIM_ACTIVE[cpu].swap(true, Ordering::AcqRel) {
+            return 0;
+        }
+        let freed = slab_shrink(target_pages);
+        DIRECT_RECLAIM_ACTIVE[cpu].store(false, Ordering::Release);
+        freed
+    })
 }
 
 /// Detach up to `max_pages` fully-free frames of class `c` into `frames`.

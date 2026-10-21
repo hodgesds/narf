@@ -5306,6 +5306,14 @@ pub fn run_until_empty() {
         // can actually release them. Near-free when nothing is pending.
         narf_rcu::advance_epoch_if_pending();
 
+        // Slab maintenance: if a churny workload has parked more free frames in
+        // a size class than its watermark allows, return the empties to the
+        // buddy here — a sleepable, lock-free point (same place RCU frees
+        // retired memory). The dealloc path only sets a flag; the buddy release
+        // must not run there. Near-free (one relaxed load) when nothing is
+        // flagged. Keeps the slab from hoarding enough to starve the buddy.
+        narf_memory::slab::drain_over_watermark();
+
         // Local queue done for this round. If empty, try to steal one
         // task from another CPU's queue; if that fails, we have
         // nothing to do — return so the caller decides whether to

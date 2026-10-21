@@ -250,6 +250,18 @@ enum Cmd {
     /// stressor set). Not a test: it gates nothing and asserts
     /// nothing. It answers "where does NARF stand".
     StressBench(BuildArgs),
+    /// `perf bench` PERFORMANCE sweep with a Linux baseline. Same shape
+    /// as [`Cmd::StressBench`] but drives the upstream `perf bench`
+    /// micro-benchmarks (`/perfbench.sh`, baked by
+    /// `REGEN_stress_rootfs.sh`): sched-pipe (ping-pong wakeup+switch),
+    /// syscall-basic, the futex family (hash/wake/requeue/lock-pi),
+    /// epoll-wait, and a memcpy-bandwidth sanity. Boots NARF and a stock
+    /// Linux kernel under the SAME QEMU config against a `-snapshot` of
+    /// the SAME rootfs image, then prints a per-benchmark table with
+    /// direction-aware NARF/Linux ratios (>1x always = NARF faster) and
+    /// the geometric mean. Knobs: `XTASK_PERF_THREADS` (thread/parallel
+    /// scale, default = guest vCPUs), `XTASK_STRESS_TIMEOUT_SECS`.
+    PerfBench(BuildArgs),
     /// Multi-queue / RSS throughput+latency benchmark. Boots NARF with
     /// the `mt-echo` feature (a multithreaded SO_REUSEPORT echo server:
     /// one Listen TCB per worker thread, distinct flows steered to
@@ -9869,6 +9881,42 @@ fn boot_linux_stress(
     list: &str,
     timeout_secs: u64,
 ) -> Result<String> {
+    let sweep_args = if list.is_empty() {
+        format!("{dur} {workers}")
+    } else {
+        format!("{dur} {workers} {list}")
+    };
+    boot_linux_guest_script(
+        rootfs,
+        &format!("/bin/busybox sh /sweep.sh {sweep_args}"),
+        "SWEEP-DONE",
+        timeout_secs,
+    )
+}
+
+/// Linux baseline for the `perf bench` sweep: same QEMU shape and rootfs
+/// as [`boot_linux_stress`], running `/perfbench.sh <threads>`.
+fn boot_linux_perf(rootfs: &Path, threads: &str, timeout_secs: u64) -> Result<String> {
+    boot_linux_guest_script(
+        rootfs,
+        &format!("/bin/busybox sh /perfbench.sh {threads}"),
+        "PERFBENCH-DONE",
+        timeout_secs,
+    )
+}
+
+/// Boot a stock Linux kernel under the SAME QEMU shape `Arch::qemu_args`
+/// gives NARF (machine, -cpu, -smp + 2-node HMAT/NUMA when `NARF_QEMU_SMP`
+/// is unset, RAM, accelerator) against a `-snapshot` view of the SAME
+/// rootfs image, and run `chroot_cmd` inside a busybox-initramfs chroot
+/// that mirrors `chroot_run` on the NARF side (bind /dev, fresh tmpfs
+/// /tmp + /dev/shm). Returns the captured serial once `expect` appears.
+fn boot_linux_guest_script(
+    rootfs: &Path,
+    chroot_cmd: &str,
+    expect: &str,
+    timeout_secs: u64,
+) -> Result<String> {
     use std::io::{Read, Write};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -9887,8 +9935,8 @@ fn boot_linux_stress(
     let kernel = host_linux_kernel().context("Linux baseline")?;
 
     // Stage the initramfs: busybox + an /init that reproduces the NARF
-    // side's chroot environment around /sweep.sh. `lo` comes up in the
-    // initramfs netns (chroot shares it) so the `sock` stressor has a
+    // side's chroot environment around the guest script. `lo` comes up in
+    // the initramfs netns (chroot shares it) so a loopback workload has a
     // loopback to talk over, matching NARF's always-up lo0.
     let stage = std::env::temp_dir().join("narf-linux-stress");
     let _ = std::fs::remove_dir_all(&stage);
@@ -9896,11 +9944,6 @@ fn boot_linux_stress(
         std::fs::create_dir_all(stage.join(d))?;
     }
     std::fs::copy(&busybox, stage.join("bin/busybox"))?;
-    let sweep_args = if list.is_empty() {
-        format!("{dur} {workers}")
-    } else {
-        format!("{dur} {workers} {list}")
-    };
     let init = format!(
         "#!/bin/busybox sh\n\
          /bin/busybox mount -t proc proc /proc\n\
@@ -9919,7 +9962,7 @@ fn boot_linux_stress(
          /bin/busybox mount -t sysfs sysfs /mnt/sys 2>/dev/null\n\
          echo LINUX-SWEEP-BOOT\n\
          PATH=/bin:/usr/bin:/sbin:/usr/sbin LD_LIBRARY_PATH=/usr/lib:/lib \
-         /bin/busybox chroot /mnt /bin/busybox sh /sweep.sh {sweep_args}\n\
+         /bin/busybox chroot /mnt {chroot_cmd}\n\
          /bin/busybox poweroff -f\n"
     );
     std::fs::write(stage.join("init"), init)?;
@@ -10047,7 +10090,8 @@ fn boot_linux_stress(
     let mut done = false;
     while start.elapsed() < Duration::from_secs(timeout_secs) {
         if let Ok(g) = captured.lock() {
-            if g.windows(b"SWEEP-DONE".len()).any(|w| w == b"SWEEP-DONE") {
+            let needle = expect.as_bytes();
+            if g.windows(needle.len()).any(|w| w == needle) {
                 done = true;
             }
         }
@@ -10077,9 +10121,255 @@ fn boot_linux_stress(
             .chars()
             .rev()
             .collect();
-        bail!("Linux baseline: no SWEEP-DONE within {timeout_secs}s. Serial tail:\n{tail}");
+        bail!("Linux baseline: no {expect} within {timeout_secs}s. Serial tail:\n{tail}");
     }
     Ok(transcript)
+}
+
+/// One `perf bench` result: `PBMETRIC name=<n> value=<v> dir=<higher|lower>`.
+struct PerfMetric {
+    name: String,
+    value: f64,
+    higher_better: bool,
+}
+
+/// Pull the normalized `PBMETRIC` rows `/perfbench.sh` prints out of a
+/// serial transcript. Later rows win on a repeated name (parity with
+/// [`parse_stress_metrics`]).
+fn parse_perf_metrics(serial: &str) -> Vec<PerfMetric> {
+    let mut out: Vec<PerfMetric> = Vec::new();
+    for line in serial.lines() {
+        let Some(pos) = line.find("PBMETRIC") else {
+            continue;
+        };
+        let (mut name, mut value, mut higher) = (None, None, None);
+        for tok in line[pos..].split_whitespace() {
+            if let Some(v) = tok.strip_prefix("name=") {
+                name = Some(v.to_string());
+            } else if let Some(v) = tok.strip_prefix("value=") {
+                value = v.parse::<f64>().ok();
+            } else if let Some(v) = tok.strip_prefix("dir=") {
+                higher = Some(v == "higher");
+            }
+        }
+        let (Some(name), Some(value), Some(higher_better)) = (name, value, higher) else {
+            continue;
+        };
+        match out.iter_mut().find(|m| m.name == name) {
+            Some(prev) => {
+                prev.value = value;
+                prev.higher_better = higher_better;
+            }
+            None => out.push(PerfMetric {
+                name,
+                value,
+                higher_better,
+            }),
+        }
+    }
+    out
+}
+
+/// See [`Cmd::PerfBench`]. Same NARF-vs-Linux boot shape as
+/// [`stress_bench_cmd`], driving `/perfbench.sh` instead of `/sweep.sh`.
+fn perf_bench_cmd(args: &BuildArgs) -> Result<()> {
+    if !matches!(args.arch, Arch::X86_64) {
+        bail!("xtask perf-bench: only x86_64 is wired");
+    }
+    let root = workspace_root()?;
+    let disk = virtio_blk_image_path();
+    if !disk.exists() {
+        bail!(
+            "xtask perf-bench: no rootfs at {} — run \
+             `sh verification/data/musl-demo/REGEN_stress_rootfs.sh` first",
+            disk.display()
+        );
+    }
+
+    // Thread/parallel scale for the futex/epoll benchmarks. Default to the
+    // guest vCPU count (leading number of NARF_QEMU_SMP, else 16) so the
+    // scheduler actually has to place and migrate work.
+    let threads = std::env::var("XTASK_PERF_THREADS").unwrap_or_else(|_| {
+        std::env::var("NARF_QEMU_SMP")
+            .ok()
+            .and_then(|s| s.split(',').next().and_then(|n| n.parse::<u32>().ok()))
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "16".into())
+    });
+    let timeout_secs: u64 = std::env::var("XTASK_STRESS_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(900);
+
+    std::env::set_var("XTASK_QEMU_SNAPSHOT", "1");
+    if std::env::var_os("XTASK_RI_ECHO_TIMEOUT_SECS").is_none() {
+        std::env::set_var("XTASK_RI_ECHO_TIMEOUT_SECS", timeout_secs.to_string());
+    }
+
+    println!(
+        "xtask perf-bench: perf-bench sweep, {threads}-thread scale\n\
+         both guests: same rootfs (snapshot), same -cpu/-smp/RAM/topology, accel={}\n",
+        bench_accel_label()
+    );
+
+    // 1. NARF under QEMU.
+    println!("── NARF (microkernel) under QEMU ──");
+    let typed = format!("chroot_run /bin/busybox sh /perfbench.sh {threads}");
+    let narf_serial = boot_narf_guest_script(args, &root, &typed, "PERFBENCH-DONE")?;
+    let narf = parse_perf_metrics(&narf_serial);
+    if narf.is_empty() {
+        bail!(
+            "xtask perf-bench: no `PBMETRIC` rows in the NARF transcript — \
+             is /perfbench.sh in the rootfs? (re-run REGEN_stress_rootfs.sh)"
+        );
+    }
+
+    // 2. Stock Linux kernel, same QEMU shape, same image, same script.
+    println!("\n── Linux (stock kernel) under QEMU ──");
+    let linux = match boot_linux_perf(&disk, &threads, timeout_secs) {
+        Ok(serial) => {
+            let m = parse_perf_metrics(&serial);
+            if m.is_empty() {
+                println!("  Linux baseline: transcript had no PBMETRIC rows");
+                None
+            } else {
+                Some(m)
+            }
+        }
+        Err(e) => {
+            println!("  Linux baseline unavailable: {e:#}");
+            None
+        }
+    };
+
+    // 3. Report. Direction-aware ratio: >1x always means NARF is faster.
+    println!("\n┌─ perf bench sweep (same Alpine perf binary, {threads}-thread scale) ─");
+    println!(
+        "│ {:<26} {:>16} {:>16} {:>12}",
+        "benchmark", "NARF", "Linux", "NARF/Linux"
+    );
+    let mut log_ratio_sum = 0f64;
+    let mut ratio_count = 0usize;
+    for m in &narf {
+        let lm = linux
+            .as_ref()
+            .and_then(|l| l.iter().find(|x| x.name == m.name));
+        let unit_hint = if m.higher_better { "↑" } else { "↓" };
+        match lm {
+            Some(l) if l.value > 0.0 && m.value > 0.0 => {
+                // Higher-is-better: NARF/Linux. Lower-is-better (latency):
+                // Linux/NARF. Either way >1x == NARF faster.
+                let ratio = if m.higher_better {
+                    m.value / l.value
+                } else {
+                    l.value / m.value
+                };
+                log_ratio_sum += ratio.ln();
+                ratio_count += 1;
+                println!(
+                    "│ {:<26} {:>16.1} {:>16.1} {:>11.2}x",
+                    format!("{} {}", m.name, unit_hint),
+                    m.value,
+                    l.value,
+                    ratio
+                );
+            }
+            Some(l) => println!(
+                "│ {:<26} {:>16.1} {:>16.1} {:>12}",
+                format!("{} {}", m.name, unit_hint),
+                m.value,
+                l.value,
+                "n/a"
+            ),
+            None => println!(
+                "│ {:<26} {:>16.1} {:>16} {:>12}",
+                format!("{} {}", m.name, unit_hint),
+                m.value,
+                "n/a",
+                "n/a"
+            ),
+        }
+    }
+    if let Some(l) = &linux {
+        for m in l {
+            if !narf.iter().any(|n| n.name == m.name) {
+                let unit_hint = if m.higher_better { "↑" } else { "↓" };
+                println!(
+                    "│ {:<26} {:>16} {:>16.1} {:>12}",
+                    format!("{} {}", m.name, unit_hint),
+                    "n/a",
+                    m.value,
+                    "n/a"
+                );
+            }
+        }
+    }
+    if ratio_count > 0 {
+        println!(
+            "│ geometric mean NARF/Linux over {ratio_count} benchmarks: {:.2}x",
+            (log_ratio_sum / ratio_count as f64).exp()
+        );
+    }
+    println!("└────────────────────────────────────────────────────────────");
+    // A value of 0 almost always means /perfbench.sh's awk extraction did
+    // not match this perf build's output shape (empty capture → `${V:-0}`),
+    // not a real zero. Call those out — otherwise a benchmark that silently
+    // failed to parse folds into an n/a row and a wholly broken sweep still
+    // prints "ok". Mirrors stress_bench_cmd's zero-bogo-ops note.
+    for (side, metrics) in [("NARF", Some(&narf)), ("Linux", linux.as_ref())] {
+        let Some(metrics) = metrics else { continue };
+        for m in metrics {
+            if m.value == 0.0 {
+                println!(
+                    "  note: {side} `{}` extracted 0 — /perfbench.sh awk likely did not match perf output",
+                    m.name
+                );
+            }
+        }
+    }
+    println!("\nxtask perf-bench: ok");
+    Ok(())
+}
+
+/// Build NARF with the benchmark rootfs features (`boot-init` +
+/// `firmware-allow-unsigned`), stage its firmware CPIO, and boot it under
+/// QEMU typing `typed` at the shell prompt; return the serial transcript
+/// once `expect` appears. The NARF-side counterpart of
+/// [`boot_linux_guest_script`], shared by `stress-bench` and `perf-bench`
+/// so both sweeps boot an identically-configured kernel (any change to how
+/// the benchmark kernel is built/launched now lands in one place).
+fn boot_narf_guest_script(
+    args: &BuildArgs,
+    root: &Path,
+    typed: &str,
+    expect: &str,
+) -> Result<String> {
+    let mut build = args.clone();
+    ensure_feature(&mut build.features, "boot-init");
+    ensure_feature(&mut build.features, "firmware-allow-unsigned");
+    let out_dir = cargo_build(&build, root)?;
+    let kernel = out_dir.join(&build.package);
+    if !kernel.exists() {
+        bail!(
+            "expected kernel binary at {} — did `cargo build` succeed?",
+            kernel.display()
+        );
+    }
+    let fw_dir = root.join("target").join("firmware");
+    let (fw_initramfs, _) = collect_firmware_blobs(&fw_dir, &build.initramfs_firmware)?;
+    let mut cpio_path = None;
+    if !fw_initramfs.is_empty() {
+        let cpio_entries: Vec<(&str, &[u8])> = fw_initramfs
+            .iter()
+            .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
+            .collect();
+        let cpio = encode_cpio_newc(&cpio_entries);
+        let p = out_dir.join("initramfs.cpio");
+        std::fs::write(&p, &cpio)
+            .with_context(|| format!("writing initramfs CPIO to {}", p.display()))?;
+        cpio_path = Some(p);
+    }
+    run_interactive_boot(&kernel, cpio_path.as_ref(), &build, typed, expect)
 }
 
 /// See [`Cmd::StressBench`].
@@ -10122,38 +10412,12 @@ fn stress_bench_cmd(args: &BuildArgs) -> Result<()> {
 
     // 1. NARF under QEMU.
     println!("── NARF (microkernel) under QEMU ──");
-    let mut build = args.clone();
-    ensure_feature(&mut build.features, "boot-init");
-    ensure_feature(&mut build.features, "firmware-allow-unsigned");
-    let out_dir = cargo_build(&build, &root)?;
-    let kernel = out_dir.join(&build.package);
-    if !kernel.exists() {
-        bail!(
-            "expected kernel binary at {} — did `cargo build` succeed?",
-            kernel.display()
-        );
-    }
-    let fw_dir = root.join("target").join("firmware");
-    let (fw_initramfs, _) = collect_firmware_blobs(&fw_dir, &build.initramfs_firmware)?;
-    let mut cpio_path = None;
-    if !fw_initramfs.is_empty() {
-        let cpio_entries: Vec<(&str, &[u8])> = fw_initramfs
-            .iter()
-            .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
-            .collect();
-        let cpio = encode_cpio_newc(&cpio_entries);
-        let p = out_dir.join("initramfs.cpio");
-        std::fs::write(&p, &cpio)
-            .with_context(|| format!("writing initramfs CPIO to {}", p.display()))?;
-        cpio_path = Some(p);
-    }
     let typed = if list.is_empty() {
         format!("chroot_run /bin/busybox sh /sweep.sh {dur} {workers}")
     } else {
         format!("chroot_run /bin/busybox sh /sweep.sh {dur} {workers} {list}")
     };
-    let narf_serial =
-        run_interactive_boot(&kernel, cpio_path.as_ref(), &build, &typed, "SWEEP-DONE")?;
+    let narf_serial = boot_narf_guest_script(args, &root, &typed, "SWEEP-DONE")?;
     let narf = parse_stress_metrics(&narf_serial);
     if narf.is_empty() {
         bail!(
@@ -13403,6 +13667,7 @@ fn main() -> Result<()> {
         Cmd::RedisSmoke(args) => redis_smoke_cmd(&args),
         Cmd::RedisBench(args) => redis_bench_cmd(&args),
         Cmd::StressBench(args) => stress_bench_cmd(&args),
+        Cmd::PerfBench(args) => perf_bench_cmd(&args),
         Cmd::MtEchoBench(args) => mt_echo_bench_cmd(&args),
         Cmd::MuslDemo(args) => musl_demo_cmd(&args),
         Cmd::BpfBench(args) => bpf_bench::bpf_bench_cmd(&args),
