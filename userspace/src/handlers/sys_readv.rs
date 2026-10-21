@@ -150,7 +150,11 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
         }
         return;
     }
-    if endpoint.ops.tty_id() == Some(narf_filesystem::TTY_ID_CONSOLE) {
+    if endpoint
+        .ops
+        .tty_id()
+        .is_some_and(narf_filesystem::is_console_tty_id)
+    {
         note_console_reader(task);
     }
 

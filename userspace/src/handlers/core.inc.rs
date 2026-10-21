@@ -1049,6 +1049,9 @@ pub fn init_per_task_state() {
             console_tiocnotty,
             console_tiocgsid,
         );
+        // ISIG characters on a console tty raise their signal at that tty's
+        // own foreground process group (Linux `isig` -> `kill_pgrp`).
+        narf_filesystem::console_tty::install_signal_pgrp_hook(console_isig_to_pgrp);
         // The console tty's winsize follows the framebuffer console's text
         // grid (Linux `vc_do_resize` → `tty_do_resize`); applied at once if
         // the framebuffer console is already up.
@@ -2115,7 +2118,12 @@ fn open_impl_reserved(
     // TIOCSCTTY. A session with no controlling terminal gets Linux ENXIO.
     let ops = if mnt_len == 0 && chroot_path_matches(task, path, "/dev/tty", false) {
         let selected: Arc<dyn narf_filesystem::FileOps> = match task_ctty(task) {
-            Some(CTTY_CONSOLE) => ops.clone(),
+            Some(id) if narf_filesystem::is_console_tty_id(id) => {
+                match narf_filesystem::devfs::console_tty_node(id) {
+                    Some(node) => node,
+                    None => ops.clone(),
+                }
+            }
             Some(id) => match narf_filesystem::devfs_pty::pty_by_id(id) {
                 Some(pty) => Arc::new(narf_filesystem::devfs_pty::PtySlave::new(pty)),
                 None => {
@@ -16277,6 +16285,9 @@ static CTTY_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
 /// small `/dev/pts/<N>` index, which never collides with this.
 pub const CTTY_CONSOLE: u32 = narf_filesystem::TTY_ID_CONSOLE;
 
+/// CTTY_TABLE value for `/dev/ttyS0`, the UART's tty.
+pub const CTTY_SERIAL0: u32 = narf_filesystem::TTY_ID_SERIAL0;
+
 /// CTTY_TABLE sentinel: explicitly no controlling tty (a session leader
 /// detached via setsid). Distinct from an absent entry, which means "the
 /// boot-console default".
@@ -16294,7 +16305,7 @@ pub fn task_ctty(task: u64) -> Option<u32> {
         .as_ref()
         .and_then(|m| m.get(&task).copied())
     {
-        None => Some(CTTY_CONSOLE),
+        None => Some(narf_filesystem::console_tty::console().tty_id()),
         Some(CTTY_DETACHED) => None,
         Some(v) => Some(v),
     }
@@ -16303,9 +16314,15 @@ pub fn task_ctty(task: u64) -> Option<u32> {
 /// Record the boot console as `task`'s controlling terminal — the console
 /// `TIOCSCTTY` path (mirrors `set_controlling_tty` for PTY slaves).
 pub fn set_controlling_tty_console(task: u64) {
+    set_controlling_console_tty(task, narf_filesystem::console_tty::console().tty_id());
+}
+
+/// Record the console tty `tty_id` (the VT tty or `ttyS0`) as `task`'s
+/// controlling terminal — the `TIOCSCTTY` path of those ttys' nodes.
+pub fn set_controlling_console_tty(task: u64, tty_id: u32) {
     let task = process_state_key(task);
     if let Some(m) = CTTY_TABLE.lock().as_mut() {
-        m.insert(task, CTTY_CONSOLE);
+        m.insert(task, tty_id);
     }
 }
 
@@ -16416,9 +16433,9 @@ pub fn set_controlling_tty(
 
 /// `TIOCSCTTY`-on-console hook (installed in `boot_init`): record the boot
 /// console as the calling task's controlling terminal.
-fn console_tiocsctty() {
+fn console_tiocsctty(tty_id: u32) {
     let task = current_task_id();
-    set_controlling_tty_console(task);
+    set_controlling_console_tty(task, tty_id);
     // `tiocsctty` -> `__proc_set_tty`: `tty->pgrp = task_pgrp(current)`.
     // The new controlling session's process group becomes the console's
     // foreground group. Without this the console kept whatever foreground
@@ -16427,9 +16444,25 @@ fn console_tiocsctty() {
     // tty) was a *background* reader: its first read raised SIGTTIN, it
     // stopped at "login:" and no keystroke ever reached it.
     let pgrp = read_pgid(task);
-    if pgrp != 0 {
-        narf_filesystem::console_tty::set_fg_pgrp(pgrp);
+    if let (true, Some(port)) = (
+        pgrp != 0,
+        narf_filesystem::console_tty::port_by_id(tty_id),
+    ) {
+        port.set_fg_pgrp(pgrp);
     }
+}
+
+/// A console tty's ISIG character: ^C → SIGINT, ^\ → SIGQUIT, ^Z → SIGTSTP
+/// to that tty's foreground process group. False when `byte` raises nothing
+/// or no member of `pgrp` was found (the caller then falls back).
+fn console_isig_to_pgrp(pgrp: u64, byte: u8) -> bool {
+    let signum = match byte {
+        0x03 => 2,
+        0x1C => 3,
+        0x1A => 20,
+        _ => return false,
+    };
+    deliver_signal_to_pgrp(pgrp, signum)
 }
 
 /// `TIOCNOTTY`-on-console hook: detach the calling task's controlling tty.

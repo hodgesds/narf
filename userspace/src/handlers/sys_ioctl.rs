@@ -1277,7 +1277,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         let master_id = ops.as_pty_master_id();
         let slave_id = ops
             .tty_id()
-            .filter(|&id| id != crate::handlers::CTTY_CONSOLE);
+            .filter(|&id| !narf_filesystem::is_console_tty_id(id));
         if let Some(pty_id) = master_id.or(slave_id) {
             match cmd {
                 TIOCSCTTY => {
@@ -1373,7 +1373,10 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
     // /dev/tty1 (`tcsetpgrp(0, getpid())`) became a background reader of its
     // own terminal: SIGTTIN stopped it at "login:". Translate both directions
     // at the syscall boundary, exactly as `ConsoleFile` does.
-    if ops.tty_id() == Some(crate::handlers::CTTY_CONSOLE) && ops.as_pty_master_id().is_none() {
+    let console_port = ops
+        .tty_id()
+        .and_then(narf_filesystem::console_tty::port_by_id);
+    if let (Some(port), None) = (console_port, ops.as_pty_master_id()) {
         use narf_filesystem::devfs_pty::{TIOCGPGRP, TIOCSPGRP};
         if cmd == TIOCSPGRP {
             let mut raw = [0u8; core::mem::size_of::<i32>()];
@@ -1387,12 +1390,12 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 ctx.set_return(errno_ret(EINVAL));
                 return;
             }
-            narf_filesystem::console_tty::set_fg_pgrp(pgid_from_user(visible as u64));
+            port.set_fg_pgrp(pgid_from_user(visible as u64));
             ctx.set_return(SyscallReturn::ok(0));
             return;
         }
         if cmd == TIOCGPGRP {
-            let fg = narf_filesystem::console_tty::fg_pgrp_or_install(current_task_pgid());
+            let fg = port.fg_pgrp_or_install(current_task_pgid());
             let visible = pgid_to_user(fg) as i32;
             // SAFETY: copy_to_user validates the user pid_t.
             if unsafe { copy_to_user(arg as u64, &visible.to_ne_bytes()) }.is_err() {

@@ -8093,12 +8093,13 @@ pub fn proc_task_info(
     // process group (tpgid). `task_ctty` resolves the boot-console default and
     // the setsid-detached state; the fg pgrp is TASK-space, rendered in the
     // reader's namespace like pgrp/session. No ctty → tty_nr 0, tpgid -1
-    // (Linux). Linux dev_t = (major << 8) | minor: console (5,1); pts/N (136,N).
+    // (Linux). Linux dev_t = (major << 8) | minor: tty1 (4,1); ttyS0 (4,64); pts/N
+    // (136,N).
     let (tty_nr, tpgid): (u64, i64) = match task_ctty(tid) {
         None => (0, -1),
         Some(ctty) => {
-            let (tty_nr, fg) = if ctty == CTTY_CONSOLE {
-                ((5u64 << 8) | 1, narf_filesystem::console_tty::fg_pgrp())
+            let (tty_nr, fg) = if let Some(port) = narf_filesystem::console_tty::port_by_id(ctty) {
+                (port.rdev(), port.fg_pgrp())
             } else {
                 // `tty_devnum`: new_encode_dev(MKDEV(136, index)) — the
                 // controlling-tty key is the pty's system-wide id, so map it

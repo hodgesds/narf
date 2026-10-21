@@ -970,21 +970,37 @@ pub fn populate_tty_class() {
     let class_tty = class_register("tty");
     let tty0 = class_device_register(class_tty.clone(), "tty0");
     kobject_add_attr(&tty0, "active", crate::vt::active_sysfs);
-    // `/sys/class/tty/console/active`: the console devices behind
-    // `/dev/console`, the one `/dev/console` opens last (`show_cons_active`).
-    // systemd's getty generator starts a serial getty for every serial name
-    // listed, and plymouth picks its terminals from it. NARF's console is the
-    // VT console (`tty0`). Its UART is `/dev/ttyS0`, but that node is the
-    // same tty under its serial name (one console fed by both the serial
-    // port and the keyboard), so listing it would start a second getty
-    // reading the input the `tty1` getty already reads.
-    let console = class_device_register(class_tty, "console");
+    // `/sys/class/tty/console/active`: the registered consoles, the one
+    // `/dev/console` opens last (`show_cons_active`). systemd's getty
+    // generator starts a serial getty for every serial name listed, and
+    // plymouth takes its console from the last. See `console_tty::active_sysfs`.
+    let console = class_device_register(class_tty.clone(), "console");
     kobject_add_attr(&console, "active", console_active_sysfs);
+
+    // `ttyS0`, the 8250 UART's own tty (char 4:64). Its device carries a
+    // writable `uevent` so `udevadm trigger` coldplugs it: udev tags it for
+    // systemd (`99-systemd.rules`, SUBSYSTEM=="tty"), which then has the
+    // `dev-ttyS0.device` that `serial-getty@ttyS0.service` binds to. Linux
+    // parents it under the UART's platform/pnp device; a virtual parent
+    // gives udev the same SUBSYSTEM, KERNEL and DEVNAME.
+    let root = get_root();
+    let devices = get_or_create_child(&root, "devices");
+    let virtual_devices = get_or_create_child(&devices, "virtual");
+    let virtual_tty = get_or_create_child(&virtual_devices, "tty");
+    let ttys0 = get_or_create_child(&virtual_tty, "ttyS0");
+    kobject_add_attr(&ttys0, "dev", || String::from("4:64\n"));
+    add_writable_uevent(&ttys0, String::from("MAJOR=4\nMINOR=64\nDEVNAME=ttyS0\n"));
+    ttys0.add_symlink("subsystem", "../../../../class/tty");
+    class_tty.add_symlink("ttyS0", "../../devices/virtual/tty/ttyS0");
+    let dev_dir = get_or_create_child(&root, "dev");
+    let dev_char = get_or_create_child(&dev_dir, "char");
+    let _dev_block = get_or_create_child(&dev_dir, "block");
+    dev_char.add_symlink("4:64", "../../devices/virtual/tty/ttyS0");
 }
 
 /// Contents of `/sys/class/tty/console/active`.
 pub fn console_active_sysfs() -> String {
-    String::from("tty0\n")
+    crate::console_tty::active_sysfs()
 }
 
 pub fn populate_block_class() {
