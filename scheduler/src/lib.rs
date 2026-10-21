@@ -4764,8 +4764,10 @@ pub fn poll_one_round() -> usize {
 /// the price of an undependable tick, paid only where TSC-deadline is
 /// unavailable. `narf_time::set_tick_reliable` publishes which case we're in.
 /// Per-CPU accumulated idle time (ns) — the real data behind
-/// /proc/stat's per-cpu idle column. Folded around `idle_wait`'s
-/// actual sleep (HLT or the tick-unreliable pump slice); the adaptive
+/// /proc/stat's per-cpu idle column. Folded around every actual
+/// sleep: `idle_wait`'s halt/pump slice and the production idle
+/// halts in `run_until_empty`, `run_forever` and
+/// `park_for_cpu_lifecycle` (via `credit_idle_since`). The adaptive
 /// halt-poll spin windows (bounded ~60µs, see run_until_empty) are
 /// deliberately NOT counted — they're latency polling, and at their
 /// scale the distinction is noise for a 100Hz-tick consumer.
@@ -4780,15 +4782,24 @@ pub fn cpu_idle_ns(cpu: usize) -> u64 {
         .unwrap_or(0)
 }
 
-fn idle_wait(next_deadline: Option<u64>) {
-    let t0 = narf_time::now_cycles();
-    idle_wait_inner(next_deadline);
-    let dt_cycles = narf_time::now_cycles().wrapping_sub(t0);
+/// Fold the interval since `t0_cycles` (a `narf_time::now_cycles`
+/// stamp taken just before a halt) into `cpu`'s accumulated idle
+/// time. Every production halt site must bracket its halt with a
+/// stamp + this fold: before it landed, `busy = elapsed − idle` in
+/// /proc/stat charged the halted interval to `user`, so an idle
+/// guest read as 100% busy to interval-sampling monitors (btop).
+fn credit_idle_since(cpu: usize, t0_cycles: u64) {
+    let dt_cycles = narf_time::now_cycles().wrapping_sub(t0_cycles);
     let ns = narf_time::cycles_to_ns(dt_cycles);
-    let cpu = narf_lib::percpu::current_cpu();
     if let Some(slot) = PERCPU_IDLE_NS.get(cpu) {
         slot.fetch_add(ns, Ordering::Relaxed);
     }
+}
+
+fn idle_wait(next_deadline: Option<u64>) {
+    let t0 = narf_time::now_cycles();
+    idle_wait_inner(next_deadline);
+    credit_idle_since(narf_lib::percpu::current_cpu(), t0);
 }
 
 #[inline]
@@ -5722,11 +5733,13 @@ pub fn run_until_empty() {
                     // IRQs masked so it can't fire-and-be-consumed before
                     // the sti;hlt below.
                     arm_idle_backstop_ms(2);
+                    let idle_t0 = narf_time::now_cycles();
                     // SAFETY: CPL=0, IF=0 on entry (we masked above); the
                     // arch primitive is the Linux safe_halt sti;hlt;cli.
                     unsafe {
                         narf_arch::idle_halt_then_disable();
                     }
+                    credit_idle_since(cpu, idle_t0);
                     // Instrument: a real HLT just completed on this CPU. A
                     // wake→dispatch that spans this bump ran despite the CPU
                     // idling = lost-wakeup (vs pure round-robin ordering).
@@ -6212,10 +6225,17 @@ fn park_for_cpu_lifecycle(cpu: usize) -> bool {
     }
 
     if interrupts_were_enabled {
+        // Fold the parked halt into idle accounting like the other
+        // production halts: the CPU is genuinely halted, and if it
+        // later returns to service the parked interval must not be
+        // charged to busy. The spin fallback below is active
+        // polling, not a halt, so it stays uncredited.
+        let idle_t0 = narf_time::now_cycles();
         // SAFETY: IRQs were disabled above. This is the architecture's atomic
         // enable/halt/disable sequence, so a bring-up IPI cannot be lost in
         // the final state-check-to-halt window.
         unsafe { narf_arch::idle_halt_then_disable() };
+        credit_idle_since(cpu, idle_t0);
     } else {
         core::hint::spin_loop();
     }
@@ -6327,12 +6347,14 @@ pub fn run_forever() -> ! {
             continue;
         }
         if race_free_halt {
+            let idle_t0 = narf_time::now_cycles();
             // SAFETY: CPL=0, IF=0 on entry (masked above); the arch
             // primitive is the Linux safe_halt sti;hlt;cli, so an IPI (or
             // any IRQ) that raced into the commit window still wakes it.
             unsafe {
                 narf_arch::idle_halt_then_disable();
             }
+            credit_idle_since(cpu, idle_t0);
             CPU_HALTED[cpu].store(false, Ordering::SeqCst);
             narf_memory::tlb_shootdown::mark_busy(cpu as u32);
             // SAFETY: restore the enabled state this idle path runs with.
@@ -6342,8 +6364,13 @@ pub fn run_forever() -> ! {
         } else {
             // Unreliable-tick / IF=0 contexts (kernel-test, InitialCount
             // fallback): the bounded `halt_until_irq` (spin when IF=0)
-            // keeps the pre-existing behaviour.
+            // keeps the pre-existing behaviour. Fold it into idle
+            // accounting too: with IRQs enabled it is a real HLT, and
+            // masked it degrades to a single spin hint whose folded
+            // delta is negligible.
+            let idle_t0 = narf_time::now_cycles();
             narf_arch::halt_until_irq();
+            credit_idle_since(cpu, idle_t0);
             CPU_HALTED[cpu].store(false, Ordering::SeqCst);
             narf_memory::tlb_shootdown::mark_busy(cpu as u32);
         }

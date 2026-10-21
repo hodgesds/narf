@@ -3170,9 +3170,12 @@ fn gen_filesystems() -> String {
 }
 
 /// `/proc/stat` — system-wide kernel/scheduler stats. `top`, `uptime`,
-/// `vmstat` and most monitors read this. NARF doesn't account per-task CPU
-/// time, so the busy fields are 0 and the elapsed time is reported as idle
-/// (the TCG system is mostly idle); the structure is what tools parse.
+/// `vmstat` and most monitors read this. Per-CPU idle is real: the
+/// scheduler folds each CPU's halted time into its idle counter, and
+/// busy is derived per CPU as elapsed − idle in the `user` column.
+/// NARF doesn't account per-task CPU time and has no
+/// user/system/irq split, so the remaining columns are 0; the
+/// structure is what tools parse.
 fn gen_stat() -> String {
     use core::fmt::Write as _;
     use narf_interrupts::snapshot_counters;
