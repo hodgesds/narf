@@ -3099,7 +3099,7 @@ fn tg_check_task_entries(v: &TgView) -> Result<(), &'static str> {
 /// byte-identical to what the leader reads.
 fn tg_check_maps(v: &TgView) -> Result<(), &'static str> {
     let maps = alloc::format!("{}/self/maps", v.base);
-    let needle = alloc::format!("{:016x}-{:016x} rw-p", v.region, v.region + TG_REGION_LEN);
+    let needle = alloc::format!("{:08x}-{:08x} rw-p", v.region, v.region + TG_REGION_LEN);
     set_task(TG_THREAD_TASK);
     let from_thread = tg_read(&maps)?;
     set_task(TG_LEADER_TASK);
@@ -3141,7 +3141,7 @@ fn smoke_abi_proc2_self_maps_from_sibling_thread() -> TestResult {
         // falls back to the reader's own mm would wrongly show the VMA here.
         set_task(TG_OTHER_TASK);
         let foreign = tg_read(&alloc::format!("{}/{}/maps", v.base, v.pid))?;
-        if foreign.contains(&alloc::format!("{:016x}-", v.region)) {
+        if foreign.contains(&alloc::format!("{:08x}-", v.region)) {
             return Err("an unrelated reader's own mm was rendered as /proc/<tgid>/maps");
         }
         Ok(())
@@ -3173,7 +3173,7 @@ fn smoke_abi_proc2_maps_preserve_loader_image_provenance() -> TestResult {
             set_task(TG_THREAD_TASK);
             let maps = tg_read(&alloc::format!("{}/self/maps", v.base))?;
             let expected = alloc::format!(
-                "{:016x}-{:016x} rw-p 00003000 08:13 42 /usr/bin/narf-maps-test",
+                "{:08x}-{:08x} rw-p 00003000 08:13 42 /usr/bin/narf-maps-test",
                 v.region,
                 v.region + TG_REGION_LEN,
             );
@@ -3298,7 +3298,7 @@ fn smoke_abi_proc2_maps_file_mmap_reports_provenance() -> TestResult {
             set_task(TG_THREAD_TASK);
             let maps = tg_read(&alloc::format!("{}/self/maps", v.base))?;
             let expected = alloc::format!(
-                "{:016x}-{:016x} r--p 00001000 {} {} {}\n",
+                "{:08x}-{:08x} r--p 00001000 {} {} {}\n",
                 base,
                 base + 0x3000,
                 maps_dev_text(dev),
@@ -3341,7 +3341,7 @@ fn smoke_abi_proc2_maps_memfd_mmap_names_the_memfd() -> TestResult {
             let maps = tg_read(&alloc::format!("{}/self/maps", v.base));
             set_task(FAKE_TASK);
             let _ = call(Syscall::Munmap.raw(), a1(base, 0x1000));
-            let prefix = alloc::format!("{:016x}-{:016x} r--p 00000000 ", base, base + 0x1000);
+            let prefix = alloc::format!("{:08x}-{:08x} r--p 00000000 ", base, base + 0x1000);
             let line = maps?
                 .lines()
                 .find(|l| l.starts_with(&prefix))
@@ -3375,7 +3375,7 @@ fn smoke_abi_proc2_maps_file_mmap_split_keeps_offsets() -> TestResult {
             set_task(TG_THREAD_TASK);
             let maps = tg_read(&alloc::format!("{}/self/maps", v.base))?;
             let head = alloc::format!(
-                "{:016x}-{:016x} r--p 00001000 {} {} {}\n",
+                "{:08x}-{:08x} r--p 00001000 {} {} {}\n",
                 base,
                 base + 0x1000,
                 maps_dev_text(dev),
@@ -3383,7 +3383,7 @@ fn smoke_abi_proc2_maps_file_mmap_split_keeps_offsets() -> TestResult {
                 MAPS_FILE_PATH,
             );
             let tail = alloc::format!(
-                "{:016x}-{:016x} r--p 00003000 {} {} {}\n",
+                "{:08x}-{:08x} r--p 00003000 {} {} {}\n",
                 base + 0x2000,
                 base + 0x3000,
                 maps_dev_text(dev),
@@ -3418,7 +3418,7 @@ fn smoke_abi_proc2_maps_anonymous_mmap_has_no_provenance() -> TestResult {
             set_task(TG_THREAD_TASK);
             let maps = tg_read(&alloc::format!("{}/self/maps", v.base))?;
             let anonymous = alloc::format!(
-                "{:016x}-{:016x} rw-p 00000000 00:00 0 \n",
+                "{:08x}-{:08x} rw-p 00000000 00:00 0 \n",
                 v.region,
                 v.region + TG_REGION_LEN,
             );
