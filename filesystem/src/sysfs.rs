@@ -974,8 +974,10 @@ pub fn populate_tty_class() {
     // `/dev/console`, the one `/dev/console` opens last (`show_cons_active`).
     // systemd's getty generator starts a serial getty for every serial name
     // listed, and plymouth picks its terminals from it. NARF's console is the
-    // VT console (`tty0`); its UART mirror has no `/dev/ttyS*` node, so
-    // listing it would start a getty on a device that does not exist.
+    // VT console (`tty0`). Its UART is `/dev/ttyS0`, but that node is the
+    // same tty under its serial name (one console fed by both the serial
+    // port and the keyboard), so listing it would start a second getty
+    // reading the input the `tty1` getty already reads.
     let console = class_device_register(class_tty, "console");
     kobject_add_attr(&console, "active", console_active_sysfs);
 }

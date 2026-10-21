@@ -164,6 +164,17 @@ pub(super) const ENTRIES: &[Entry] = &[
         visible: || true,
     },
     Entry {
+        name: "ttyS0",
+        file_type: FileType::Special,
+        file: || {
+            Some(Arc::new(DevConsole {
+                kind: ConsoleNodeKind::Serial(0),
+            }))
+        },
+        directory: || None,
+        visible: || true,
+    },
+    Entry {
         name: "ptmx",
         file_type: FileType::Special,
         file: || Some(Arc::new(crate::devfs_pty::DevTmpfsPtmx)),
