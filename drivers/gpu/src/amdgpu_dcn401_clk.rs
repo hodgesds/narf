@@ -692,8 +692,9 @@ impl<I: Io> Engine<I> {
             active_fclk = levels.range(Clock::Fabric).max_khz() / 1000;
             idle_fclk = active_fclk;
         }
-        // CLK_MGR401_UPDATE_DEEP_SLEEP_DCFCLK (zero: no plan says it).
-        if new.deep_sleep_dcfclk_khz != 0
+        // CLK_MGR401_UPDATE_DEEP_SLEEP_DCFCLK (zero: no plan says it, except
+        // for a configuration without planes, whose DML21 minimum is zero).
+        if (new.deep_sleep_dcfclk_khz != 0 || !planes)
             && should_set(
                 safe_to_lower,
                 new.deep_sleep_dcfclk_khz,
@@ -823,6 +824,75 @@ impl<I: Io> Engine<I> {
                 Err(e)
             }
         }
+    }
+    /// dcn401_update_clocks in optimize_bandwidth (`safe_to_lower`) once no
+    /// stream is left (dc_commit_streams with none, as the last CRTC's
+    /// disable and dm_suspend's commit run it), towards the clocks
+    /// dml21_init_min_clocks_for_dc_state gives a context without streams:
+    /// NumOfDisplays(0) (enter_display_off, sent only when safe to lower),
+    /// the DCFCLK hard minimum at its lowest level, then the bandwidth
+    /// sequence without planes (UCLK and FCLK P-state support set, as
+    /// total_plane_count == 0 forces: the deep-sleep DCFCLK zero, switching
+    /// allowed, the active UCLK/FCLK floors at their lowest levels and the
+    /// idle ones zero). Every result is unread, as in Linux. DISPCLK, DPPCLK
+    /// and DTBCLK keep their floors, which the next `prepare` sets again.
+    /// Every consumer must be retired. Nothing when nothing was applied or
+    /// it already ran.
+    async fn release(&mut self) -> Result<Applied, Error> {
+        let current = match (self.status.state, self.status.applied) {
+            (State::Applied, Some(a)) => a,
+            (State::Applied, None) => return Err(Error::Invalid),
+            _ => return Err(Error::Busy),
+        };
+        if current.request.displays == 0 {
+            return Ok(current);
+        }
+        let levels = self.status.levels.ok_or(Error::Invalid)?;
+        self.idle()?;
+        self.status.state = State::Applying;
+        let result = async {
+            self.command_ignored(0xe, 0).await?;
+            let dcf = levels.range(Clock::Dcf);
+            if should_set(true, dcf.min_khz(), current.dcf_floor_khz) && dcf.count > 1 {
+                let mhz = mhz_ceil(dcf.min_khz());
+                self.command_ignored(9, (Clock::Dcf as u32) << 16 | mhz)
+                    .await?;
+                self.hard_min_settled_ignored(9, Clock::Dcf).await?;
+            }
+            let memory = levels.range(Clock::Memory);
+            let fabric = levels.range(Clock::Fabric);
+            let none = Bandwidth {
+                uclk_pstate: true,
+                fclk_pstate: true,
+                dramclk_khz: memory.min_khz(),
+                idle_dramclk_khz: 0,
+                fclk_khz: fabric.min_khz(),
+                idle_fclk_khz: 0,
+                deep_sleep_dcfclk_khz: 0,
+            };
+            let (bandwidth, floor) = self.bandwidth(none, true, false).await?;
+            self.status.bandwidth = bandwidth;
+            Ok(Applied {
+                request: Request {
+                    displays: 0,
+                    deep_sleep_dcfclk_khz: 0,
+                    ..current.request
+                },
+                dcf_floor_khz: dcf.min_khz().min(current.dcf_floor_khz),
+                memory_floor_khz: floor,
+                uclk_pstate: bandwidth.uclk_pstate,
+                ..current
+            })
+        }
+        .await;
+        match result {
+            Ok(applied) => {
+                self.status.applied = Some(applied);
+                self.status.state = State::Applied;
+            }
+            Err(e) => self.status.state = State::Failed(e),
+        }
+        result
     }
     /// dcn401_notify_wm_ranges: tell PMFW where the WatermarksExternal_t
     /// table is (SetDalDramAddrHigh/Low) and have it read it
@@ -1087,6 +1157,16 @@ impl ClockManager {
         self.0
             .update_bandwidth(bandwidth, safe_to_lower, held)
             .await
+    }
+    /// dcn401_update_clocks' optimize once no stream is left (`Engine::
+    /// release`): NumOfDisplays(0), DCFCLK at its lowest level, UCLK
+    /// switching allowed with UCLK and FCLK at their lowest. Every consumer
+    /// must be retired. Failure or cancellation leaves the owner failed.
+    pub(crate) async fn release(&mut self, regs: MmioRegion) -> Result<Applied, Error> {
+        if regs.phys != self.0.io.0.phys || regs.len != self.0.io.0.len {
+            return Err(Error::Invalid);
+        }
+        self.0.release().await
     }
     /// dcn401_build_wm_range_table as PMFW's `WatermarksExternal_t`: set A
     /// (WATERMARKS_CLOCK_RANGE) and set 1A, the dummy P-state set

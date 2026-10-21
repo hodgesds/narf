@@ -65,7 +65,8 @@ impl Io for Fake {
                 }
             }
             0xe => {
-                assert!((1..=4).contains(&arg));
+                // Zero once no display is left (enter_display_off).
+                assert!(arg <= 4);
                 0
             }
             0x1a => {
@@ -1289,4 +1290,80 @@ fn dcn401_fresh_display_owners_pin_like_linux_prepare_bandwidth() -> TestResult 
 kernel_test_in!(
     "drivers/gpu/dcn401-clk",
     dcn401_fresh_display_owners_pin_like_linux_prepare_bandwidth
+);
+
+/// dcn401_update_clocks' optimize once no stream is left (DML21's
+/// min-clock state): NumOfDisplays(0), DCFCLK at its lowest level, the
+/// deep-sleep DCFCLK zero, then switching allowed before the UCLK floor
+/// drops to its lowest level. Only with every consumer retired, once, and
+/// the next configuration's pin and prepare disallow switching again.
+fn dcn401_no_display_left_releases_like_dcn401_update_clocks() -> TestResult {
+    let mut e = engine();
+    if run(e.release()) != Err(Error::Busy) || !e.io.commands.is_empty() {
+        return TestResult::Fail("release before the clocks were prepared");
+    }
+    start(&mut e);
+    let lit = Request {
+        deep_sleep_dcfclk_khz: 10_673,
+        ..request()
+    };
+    let applied = run(e.prepare(lit)).unwrap();
+    // A display still lit: nothing is sent.
+    let busy = DIO + 0x1b43 * 4;
+    e.io.regs.insert(busy, 1);
+    e.io.commands.clear();
+    if run(e.release()) != Err(Error::Busy)
+        || !e.io.commands.is_empty()
+        || e.status.state != State::Applied
+    {
+        return TestResult::Fail("release under a lit display");
+    }
+    e.io.regs.insert(busy, 0);
+    let released = run(e.release());
+    if e.io.commands
+        != [
+            (0xe, 0),
+            (9, 9 << 16 | 100),
+            (0x15, 0),
+            (0xd, 0),
+            (0x1a, 1),
+            (9, 2 << 16 | 100),
+            (0x15, 0),
+        ]
+    {
+        return TestResult::Fail("no-display optimize sequence");
+    }
+    let Ok(released) = released else {
+        return TestResult::Fail("no-display optimize failed");
+    };
+    if released.request.displays != 0
+        || released.dcf_floor_khz != 100_000
+        || released.memory_floor_khz != 100_000
+        || !released.uclk_pstate
+        || !e.status.uclk_switching()
+        || !e.status.bandwidth.fclk_pstate
+        || e.status.bandwidth.deep_sleep_dcfclk_khz != 0
+        || (released.display_khz, released.dpp_khz, released.dtb_khz)
+            != (applied.display_khz, applied.dpp_khz, applied.dtb_khz)
+    {
+        return TestResult::Fail("no-display optimize state");
+    }
+    // Once only.
+    e.io.commands.clear();
+    if run(e.release()) != Ok(released) || !e.io.commands.is_empty() {
+        return TestResult::Fail("second release");
+    }
+    // The next modeset's prepare counts its display and disallows again.
+    run(e.prepare(request())).unwrap();
+    if e.io.commands.first() != Some(&(0xe, 1))
+        || !e.io.commands.contains(&(0x1a, 0))
+        || e.status.uclk_switching()
+    {
+        return TestResult::Fail("prepare after the release");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-clk",
+    dcn401_no_display_left_releases_like_dcn401_update_clocks
 );

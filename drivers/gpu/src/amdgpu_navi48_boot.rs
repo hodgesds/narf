@@ -2311,6 +2311,37 @@ impl ColdBoot {
         rebind_display_clocks(otg, dccg, old, new)?;
         Ok(new)
     }
+    /// dcn401_optimize_bandwidth once no display is left (dc_commit_streams
+    /// with no stream, as the last CRTC's disable and dm_suspend commit
+    /// it): FAMS2 disabled (`disable_display_fams2`), then
+    /// `clocks::ClockManager::release` (NumOfDisplays 0, DCFCLK, UCLK and
+    /// FCLK at their lowest levels, UCLK switching allowed), every clock
+    /// record rebound. Nothing before the display clocks were prepared, or
+    /// when it already ran. Busy while a display or teardown remains.
+    pub async fn release_display_bandwidth(&mut self) -> Result<(), otg::Error> {
+        if self.display_retirement_busy()
+            || self.teardowns.check_idle().is_err()
+            || self.display_modesets().iter().any(Option::is_some)
+        {
+            return Err(otg::Error::Busy);
+        }
+        // Only an applied configuration that still counts displays.
+        if !self.display_clock_status().is_ok_and(|s| {
+            s.state == clocks::State::Applied && s.applied.is_some_and(|a| a.request.displays != 0)
+        }) {
+            return Ok(());
+        }
+        self.disable_display_fams2().await;
+        let otg = self.otg.as_mut().map_err(|e| *e)?;
+        let clocks = self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?;
+        let dccg = self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?;
+        let regs = self.sequence.backend.gpu.regs;
+        let old = clocks
+            .retained_pipe_clocks(regs)
+            .map_err(otg::Error::Clocks)?;
+        let new = clocks.release(regs).await.map_err(otg::Error::Clocks)?;
+        rebind_display_clocks(otg, dccg, old, new)
+    }
     /// Whether DC keeps FAMS2 on for the running DMCUB firmware (FAMS 2.1).
     pub fn display_fams2(&self) -> bool {
         self.sequence.backend.dmub.fams2() == Some(true)

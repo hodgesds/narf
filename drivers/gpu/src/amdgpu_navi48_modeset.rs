@@ -4230,6 +4230,8 @@ impl ColdBoot {
     /// the exact watermarks, and UCLK switching allowed with UCLK and FCLK
     /// lowered to DPMM's minimums.
     /// Not supported, or `drr` (a display that should run DRR): pinned.
+    /// No display left (and no teardown in flight): the no-stream optimize
+    /// (`release_display_bandwidth`), once.
     /// Returns the displays whose plans moved, in pipe order.
     /// # Safety
     /// As for `transition_running`.
@@ -4238,7 +4240,14 @@ impl ColdBoot {
         drr: bool,
     ) -> Result<Vec<Modeset>, ModesetError> {
         let mut running: Vec<Modeset> = self.display_modesets().into_iter().flatten().collect();
-        if running.is_empty() || self.teardowns.check_idle().is_err() {
+        if self.teardowns.check_idle().is_err() {
+            return Ok(Vec::new());
+        }
+        if running.is_empty() {
+            // The last display left: dc_commit_streams with no stream,
+            // whose optimize_bandwidth tells PMFW no display is left and
+            // lowers UCLK and FCLK with switching allowed.
+            self.release_display_bandwidth().await?;
             return Ok(Vec::new());
         }
         // Already switching under this configuration's P-state plans.

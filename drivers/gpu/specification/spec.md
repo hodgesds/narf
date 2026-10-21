@@ -925,6 +925,12 @@ SetDalDramAddrHigh/Low (5, 6) with the GPU address of
 TransferTableDram2Smu (8) of TABLE_WATERMARKS (2), each refusal ignored and
 logged the same way.
 
+`release(regs).await` is dcn401_update_clocks' optimize once no stream is
+left (NumOfDisplays 0, DCFCLK, UCLK and FCLK at their lowest levels, UCLK
+switching allowed; see "No display left" under Navi 48 UCLK P-state
+switching). It needs an `Applied` owner with every consumer retired and
+runs once per configuration.
+
 `Starting`/`Applying` are set before awaits. Failure records `Failed(Error)`;
 cancellation leaves the in-flight state. Both prevent mailbox replay, and
 partial floors are not rolled back. Historical successful levels/applied state
@@ -5257,6 +5263,30 @@ test the bandwidth sequence, the watermark table and the FAMS2 commands, and
 `retire_inherited_display`, the first modeset and a relight after resume
 start from.
 Hardware switching under a lit display is unvalidated.
+
+**No display left.** `converge_uclk_pstate` with no display and no
+teardown in flight runs `ColdBoot::release_display_bandwidth` once: Linux
+commits a context without streams (the last CRTC's disable, and dm_suspend's
+commit before S3 or runtime suspend), whose dcn401_optimize_bandwidth runs
+over dml21_init_min_clocks_for_dc_state's clocks. FAMS2 is disabled, then
+`ClockManager::release(regs)` sends NumOfDisplays(0) (enter_display_off,
+only when safe to lower), the DCFCLK hard minimum at its lowest level, the
+deep-sleep DCFCLK zero, SetUclkPstateAllow(1) (total_plane_count == 0 sets
+both P-state supports) and the active UCLK/FCLK floors at their lowest
+levels with the idle ones zero, every result unread; every consumer must be
+retired, and `Applied::request.displays` becomes 0. `uclk_switching()` then
+reports true, so the next configuration change pins and its `prepare`
+counts its displays and disallows switching again. Deviations: DISPCLK,
+DPPCLK and DTBCLK keep their floors (Linux lowers them to their first levels
+as well; the next `prepare` sets them again). Runtime suspend needs every
+display dark, which the monitor pass that darkened the last one follows
+with this release. S3 is entered with the displays lit: the port does not
+commit zero streams as dm_suspend does, so NumOfDisplays and the UCLK/FCLK
+policy stay the running configuration's into S3, and the resume post (power
+cycle or mode1) restarts PMFW for a fresh owner. dcn401_hardware_release
+(FAMS2 off, P-state support forced on) is not ported: its only caller,
+dc_hardware_release, has no caller in Linux (7.3), so Linux never runs it
+before BACO or S3.
 
 ### Discrete RDNA2 PSP secure-OS bootstrap
 
