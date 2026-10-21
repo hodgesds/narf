@@ -207,6 +207,7 @@ fn odm_on(pipe: u8, q: u8) -> TestResult {
         address: ADDR,
         pitch_bytes: 7680 * 4,
         bytes: 7680 * 4 * 4320,
+        chroma: None,
     };
     e.status.surfaces[usize::from(pipe)] = Some(surface);
     let p = Pipe {
@@ -697,6 +698,7 @@ fn stage_records(e: &mut Engine<Hw>, pipe: u8, odm: Option<u8>, overlays: &[(u8,
         address,
         pitch_bytes: 7680,
         bytes: 7680 * 1080,
+        chroma: None,
     };
     let primary = surface(pipe, odm, ADDR);
     e.status.surfaces[usize::from(pipe)] = Some(primary);
@@ -988,6 +990,7 @@ fn dcn401_scanout_odm_four_segments_under_one_lock() -> TestResult {
         address: ADDR,
         pitch_bytes: 7680 * 4,
         bytes: 7680 * 4 * 4320,
+        chroma: None,
     });
     let p = Pipe {
         odm,

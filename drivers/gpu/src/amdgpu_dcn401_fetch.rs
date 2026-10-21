@@ -23,6 +23,7 @@ pub use surface::{
     SurfaceFormat, SurfaceRequest, VblankPhase, CURSOR_MAX, MAX_OVERLAYS,
 };
 pub use surface::{DccBlock, PlaneSurface, SurfaceBytes, Swizzle, Tiling, YuvColor};
+pub use surface::{ExternalSurface, FlipSource};
 
 const HUBP_CONTROL: u64 = 0x5f4;
 const HUBP_CLOCK: u64 = 0x5f5;

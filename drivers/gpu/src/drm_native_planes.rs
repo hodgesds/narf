@@ -852,22 +852,40 @@ pub fn cursor_changes(card: &Card, state: &AtomicState) -> Vec<CursorChange> {
 }
 
 /// A cursor framebuffer's premultiplied ARGB8888 pixels, row by row, read
-/// out of its dumb buffer (the hardware cursor scans a copy). None when it
-/// has no dumb backing holding its rows.
+/// out of its dumb buffer, or out of its amdgpu GEM buffer pinned in VRAM
+/// as amdgpu_dm_plane_helper_prepare_fb pins a cursor's (the hardware
+/// cursor scans a copy). None when neither holds its rows.
 pub fn cursor_image(card: &Card, fb_id: u32) -> Option<crate::amdgpu_navi48_platform::CursorImage> {
     let fb = card.framebuffer(fb_id).ok()?;
-    let backing = card.dumb_backing(fb.gem_handle)?;
     let (w, h) = (fb.width, fb.height);
     if w == 0 || h == 0 || w > MAX_CURSOR_SIZE || h > MAX_CURSOR_SIZE {
         return None;
     }
     let row = u64::from(w) * 4;
     let end = u64::from(fb.offsets[0]) + u64::from(h - 1) * u64::from(fb.pitch) + row;
+    let mut pixels = Vec::with_capacity((w * h) as usize);
+    let mut line = [0u8; MAX_CURSOR_SIZE as usize * 4];
+    if let Some(bo) = &fb.bo {
+        let pin = bo.object.pin_scanout().ok()?;
+        for y in 0..h {
+            let at = u64::from(fb.offsets[0]) + u64::from(y) * u64::from(fb.pitch);
+            pin.placement().read_bytes(at, &mut line[..row as usize])?;
+            pixels.extend(
+                line[..row as usize]
+                    .chunks_exact(4)
+                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+            );
+        }
+        return Some(crate::amdgpu_navi48_platform::CursorImage {
+            width: w,
+            height: h,
+            pixels,
+        });
+    }
+    let backing = card.dumb_backing(fb.gem_handle)?;
     if end > backing.byte_len as u64 {
         return None;
     }
-    let mut pixels = Vec::with_capacity((w * h) as usize);
-    let mut line = [0u8; MAX_CURSOR_SIZE as usize * 4];
     for y in 0..h {
         let at = backing.phys + u64::from(fb.offsets[0]) + u64::from(y) * u64::from(fb.pitch);
         // SAFETY: the dumb buffer's frames are kernel-owned and mapped; the

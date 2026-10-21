@@ -171,6 +171,16 @@ pub struct PlanesUpdated {
 /// surface refuses the update before any register write.
 pub trait PlaneContent: Send {
     fn chunk(&mut self, a: &SurfaceApplied, index: u32, words: &mut Vec<u32>) -> Option<u64>;
+    /// A client framebuffer the plane on fresh surface `a` scans out in
+    /// place instead of a copy (DC programs a new plane's framebuffer
+    /// address in the update that adds it): the update programs its
+    /// address and pitches, its staged buffers left cleared and unfetched,
+    /// and no `chunk` is asked for. One the plane cannot fetch refuses the
+    /// update before any register write. The caller keeps it pinned until
+    /// a later flip or stop shows it no longer fetched.
+    fn external(&mut self, _a: &SurfaceApplied) -> Option<ExternalSurface> {
+        None
+    }
 }
 /// No first content: fresh surfaces stay cleared until the next flip.
 #[derive(Clone, Copy, Debug, Default)]
@@ -656,12 +666,8 @@ impl Surfaces {
             ..timing.request
         };
         let new_timing = new_request.plan()?;
-        let provisional = |k: usize| SurfaceApplied {
-            request: planes[k],
-            address: 0,
-            pitch_bytes: geometry[k].0,
-            bytes: geometry[k].1,
-        };
+        let provisional =
+            |k: usize| SurfaceApplied::staged(planes[k], 0, geometry[k].0, geometry[k].1);
         let mut provisional_overlays = [None; MAX_OVERLAYS];
         for (k, o) in provisional_overlays
             .iter_mut()
@@ -730,14 +736,11 @@ impl Surfaces {
                         && x.applied.request.same_allocation(*s)
                         && e.status.surfaces[at] == Some(x.applied)
                 })
-                .map(|x| x.applied.address);
-            if let Some(address) = kept {
-                applied.push(SurfaceApplied {
-                    request: *s,
-                    address,
-                    pitch_bytes,
-                    bytes,
-                });
+                .map(|x| x.applied);
+            if let Some(x) = kept {
+                // The plane keeps fetching what it shows, a client
+                // framebuffer scanned out in place too, with its pitch.
+                applied.push(SurfaceApplied { request: *s, ..x });
                 continue;
             }
             let memory = pool.reserve(bytes).map_err(|_| Error::Allocation)?;
@@ -763,17 +766,25 @@ impl Surfaces {
                     narf_scheduler::yield_now().await;
                 }
             }
-            let a = SurfaceApplied {
-                request: *s,
-                address: memory.address(),
-                pitch_bytes,
-                bytes,
-            };
-            // Its first content, before the hardware hears of it: the
-            // update latches with the plane's framebuffer shown.
+            let mut a = SurfaceApplied::staged(*s, memory.address(), pitch_bytes, bytes);
+            // A client framebuffer scanned out in place from the update
+            // itself; its staged buffers stay cleared.
+            let external = content.external(&a);
+            if let Some(x) = external {
+                if x.address < config.fb_base || x.last > config.fb_top || x.last >= 1 << 48 {
+                    return Err(Error::Invalid);
+                }
+                a = x.applied(a)?;
+            }
+            // Otherwise its first content, before the hardware hears of it:
+            // the update latches with the plane's framebuffer shown.
             let mut words = Vec::new();
             let mut index = 0u32;
-            while let Some(offset) = content.chunk(&a, index, &mut words) {
+            while let Some(offset) = external
+                .is_none()
+                .then(|| content.chunk(&a, index, &mut words))
+                .flatten()
+            {
                 let end = (words.len() as u64)
                     .checked_mul(4)
                     .and_then(|n| n.checked_add(offset));

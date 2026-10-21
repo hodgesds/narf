@@ -228,6 +228,8 @@ impl Drop for DriCardFile {
         // is free for the next session's SET_MASTER (greeter→user handoff).
         if let Some(ms) = crate::drm_registry::mode_state(self.index) {
             let mut ms = ms.lock();
+            // drm_fb_release: the framebuffers it made of its GEM buffers.
+            ms.release_file_framebuffers(self.open_id);
             ms.master_release(self.open_id);
             ms.magic_release(self.open_id);
         }
@@ -444,6 +446,16 @@ impl FileOps for DriCardFile {
             if let Some(result) =
                 crate::drm_ioctl_bridge::amdgpu_dumb_metadata(self.index, cmd, arg)
             {
+                return result;
+            }
+            // A framebuffer of one of this open's amdgpu GEM buffers.
+            if let Some(result) = crate::drm_ioctl_bridge::amdgpu_addfb2_bo(
+                self.index,
+                self.open_id,
+                cmd,
+                arg,
+                &self.amdgpu_gem,
+            ) {
                 return result;
             }
             match crate::amdgpu_gem::dispatch(cmd, arg, &self.amdgpu_gem) {

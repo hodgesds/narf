@@ -62,6 +62,7 @@ fn owners(plan: &dml::Plan, pipe: u8) -> (Request, RequestorApplied, dccg::Appli
         address: 0x8_0000_0000,
         pitch_bytes: 7680,
         bytes: 7680 * 1080,
+        chroma: None,
     };
     let timing = Request {
         pipe,
@@ -225,6 +226,18 @@ fn dcn401_deadlines_bind_only_the_admitted_owners() -> TestResult {
     {
         return TestResult::Fail("plane depth binding");
     }
+    // A client framebuffer scanned out in place with a wider pitch keeps
+    // the plan DML admitted at the staged pitch (dc runs no DML for it).
+    let wider = RequestorApplied {
+        surface: SurfaceApplied {
+            pitch_bytes: 8192,
+            ..requestor.surface
+        },
+        ..requestor
+    };
+    if !bound(&plan, timing, wider, clock, 50_000) {
+        return TestResult::Fail("client framebuffer's wider pitch refused");
+    }
     let mut tampered = plan;
     tampered.watermarks.urgent += 1;
     let mut other_mode = plan;
@@ -278,9 +291,11 @@ fn dcn401_deadlines_bind_only_the_admitted_owners() -> TestResult {
         (
             plan,
             timing,
+            // A fetch pitch below the planned one (a client framebuffer may
+            // only be wider: below).
             RequestorApplied {
                 surface: SurfaceApplied {
-                    pitch_bytes: 8192,
+                    pitch_bytes: 4096,
                     ..requestor.surface
                 },
                 ..requestor
@@ -459,6 +474,7 @@ fn video_overlay(pipe: u8) -> SurfaceApplied {
         address: 0x8_1000_0000,
         pitch_bytes: 5120,
         bytes: 5120 * 720,
+        chroma: request.chroma(),
     }
 }
 /// The 1080p primary with `overlay` above it, as DML21 plans the pair.
@@ -655,6 +671,7 @@ fn split_dcc_primary(mpc: SplitPipes) -> SurfaceApplied {
         address: 0x8_0000_0000,
         pitch_bytes: b.pitch_bytes,
         bytes: b.bytes,
+        chroma: request.chroma(),
     }
 }
 

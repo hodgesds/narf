@@ -442,8 +442,13 @@ fn plane_bound(
         && surface.request.odm == timing.odm
         && surface.request.mpc.count() == u32::from(dpps.max(1))
         && surface.request.dml_plane() == planned
-        && u64::from(surface.pitch_bytes)
+        // DML planned the staged pitch; a client framebuffer scanned out in
+        // place may fetch with a wider one of whole pixels (a MED update:
+        // dc runs no DML), never a narrower one.
+        && u64::from(surface.request.bytes().pitch_bytes)
             == u64::from(planned.pitch) * u64::from(planned.bytes_per_pixel)
+        && surface.pitch_bytes >= surface.request.bytes().pitch_bytes
+        && surface.pitch_bytes % u32::from(planned.bytes_per_pixel.max(1)) == 0
 }
 /// Every owner the plan was admitted against must still be the one in place:
 /// a plan is only valid for exactly this timing, sync, DP SST or TMDS signal,

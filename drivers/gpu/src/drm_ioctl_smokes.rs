@@ -3788,6 +3788,219 @@ kernel_test_in!(
     smoke_drm_navi48_plane_formats_end_to_end
 );
 
+// ── Navi48 GEM framebuffers scanned out in place ────────────────────────
+
+/// amdgpu_display_user_framebuffer_create, prepare_fb and cleanup_fb on the
+/// native amdgpu card: ADDFB2 takes one of the open's own amdgpu GEM
+/// handles (with its GFX12 DCC modifier, checked against the buffer's own
+/// size and AMDGPU_GEM_CREATE_GFX12_DCC) and the framebuffer holds the
+/// buffer; showing it pins the buffer in VRAM and hands the plane its GPU
+/// address (no CPU copy source: the plane fetches it in place); a pinned
+/// buffer is never evicted, outlives RMFB and GEM_CLOSE, and is unpinned
+/// (and freed) only once the HUBPs report the flip that replaced it
+/// latched; drm_fb_release removes an open's GEM framebuffers on close.
+fn smoke_drm_navi48_gem_framebuffers_scan_out_in_place() -> TestResult {
+    use crate::amdgpu_dm_modifiers::{DccBlock, Swizzle, Tiling};
+    use crate::amdgpu_gem::{GemState, VramHeap};
+    use crate::amdgpu_uapi as u;
+    const OWNER: u64 = 0x5ca9;
+    let idx = register_test_card();
+    let Some(ms) = crate::drm_registry::mode_state(idx) else {
+        return TestResult::Fail("no mode state");
+    };
+    {
+        let mut card = ms.lock();
+        card.plane_formats = Some(&crate::amdgpu_navi48_kms::PLANE_FORMATS);
+        card.gfx12_modifiers = true;
+    }
+    let mut memory = vec![0u8; 1 << 20];
+    let map = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(0xb400_0000),
+        virt: memory.as_mut_ptr() as u64,
+        len: memory.len() as u64,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    // SAFETY: the test owns `memory` until the heap and every buffer are
+    // dropped; no hardware reaches it.
+    let pool = unsafe { crate::amdgpu_vram::Pool::from_owned_range(map, 0x8_2000_0000) }.unwrap();
+    crate::amdgpu_gem::register_vram_heap(
+        idx,
+        VramHeap {
+            pool: pool.clone(),
+            fb_base: 0x8_0000_0000,
+            fb_offset: 0x9_0000_0000,
+            unmapped: None,
+        },
+    );
+    let gem = GemState::for_card(idx);
+    let full = pool.available();
+    // A 256x128 XRGB8888 framebuffer in 64K_2D blocks with DCC.
+    let tiling = Tiling {
+        swizzle: Swizzle::S64K2D,
+        dcc: Some(DccBlock::B64),
+    };
+    let (bw, bh) = tiling.swizzle.block(4);
+    let pitch = 256u32.div_ceil(bw) * bw * 4;
+    let size = u64::from(pitch / (bw * 4))
+        * (1 << tiling.swizzle.block_log2())
+        * u64::from(128u32.div_ceil(bh));
+    let create = |gem: &GemState| {
+        let mut b = [0u8; 32];
+        b[0..8].copy_from_slice(&size.to_le_bytes());
+        b[16..24].copy_from_slice(&u64::from(u::AMDGPU_GEM_DOMAIN_VRAM).to_le_bytes());
+        b[24..32].copy_from_slice(&u64::from(u::AMDGPU_GEM_CREATE_GFX12_DCC).to_le_bytes());
+        let nr = 0xc000_0000 | (0x64 << 8) | (0x40 + u::DRM_AMDGPU_GEM_CREATE);
+        crate::amdgpu_gem::dispatch(nr, b.as_mut_ptr() as usize, gem).ok()?;
+        Some(u32::from_le_bytes(b[0..4].try_into().unwrap()))
+    };
+    let (Some(a), Some(b)) = (create(&gem), create(&gem)) else {
+        return TestResult::Fail("GEM_CREATE in VRAM");
+    };
+    // What each buffer's VRAM reservation takes.
+    let size = (full - pool.available()) / 2;
+    let addfb = |handle: u32, modifier: u64, pitch: u32| {
+        let mut arg = [0u8; 104];
+        arg[4..8].copy_from_slice(&256u32.to_le_bytes());
+        arg[8..12].copy_from_slice(&128u32.to_le_bytes());
+        arg[12..16].copy_from_slice(&0x3432_5258u32.to_le_bytes());
+        arg[16..20].copy_from_slice(&2u32.to_le_bytes());
+        arg[20..24].copy_from_slice(&handle.to_le_bytes());
+        arg[36..40].copy_from_slice(&pitch.to_le_bytes());
+        arg[72..80].copy_from_slice(&modifier.to_le_bytes());
+        let r = crate::drm_ioctl_bridge::amdgpu_addfb2_bo(
+            idx,
+            OWNER,
+            crate::drm_uapi::DRM_IOCTL_MODE_ADDFB2,
+            arg.as_mut_ptr() as usize,
+            &gem,
+        );
+        (r, u32::from_le_bytes(arg[0..4].try_into().unwrap()))
+    };
+    // A handle the open does not hold is the card's ADDFB2's to answer.
+    if addfb(a + 100, tiling.modifier(), pitch).0.is_some() {
+        return TestResult::Fail("ADDFB2 took a handle the open does not hold");
+    }
+    // A pitch the 64K_2D blocks cannot hold is refused.
+    if addfb(a, tiling.modifier(), pitch - 4).0 != Some(Err(FsError::InvalidData)) {
+        return TestResult::Fail("ADDFB2 took a misfit pitch");
+    }
+    let (Some(Ok(0)), fa) = addfb(a, tiling.modifier(), pitch) else {
+        return TestResult::Fail("ADDFB2 of a DCC GEM buffer");
+    };
+    let (Some(Ok(0)), fb_b) = addfb(b, tiling.modifier(), pitch) else {
+        return TestResult::Fail("ADDFB2 of a second GEM buffer");
+    };
+    let object_a = gem.object(a).unwrap();
+    let frame_a = {
+        let card = ms.lock();
+        let fb = card.framebuffer(fa).unwrap();
+        if fb.modifier != tiling.modifier() || fb.bo.as_ref().map(|b| b.owner) != Some(OWNER) {
+            return TestResult::Fail("framebuffer does not hold the GEM buffer");
+        }
+        crate::drm_ioctl_bridge::scanout_frame(&card, fb)
+    };
+    // prepare_fb: pinned in VRAM, scanned out at its GPU address: no copy
+    // source for the presenter.
+    let Some(frame_a) = frame_a else {
+        return TestResult::Fail("GEM framebuffer not pinned for scanout");
+    };
+    let Some(pin_a) = frame_a.bo.clone() else {
+        return TestResult::Fail("frame carries no pin");
+    };
+    let Some(x) = frame_a.external((0, 0)) else {
+        return TestResult::Fail("pinned framebuffer has no in-place surface");
+    };
+    if frame_a.phys != 0
+        || !object_a.pinned()
+        || x.address != pin_a.address()
+        || x.pitch_bytes != pitch
+        || x.last != pin_a.address() + pin_a.byte_len() - 1
+        || !(0x8_2000_0000..0x8_2010_0000).contains(&x.address)
+    {
+        return TestResult::Fail("in-place surface of the pinned framebuffer");
+    }
+    // Pinned: suspend's eviction passes it by, and moves only B.
+    let (touched, evicted) = narf_scheduler::block_on_spin(async {
+        let gate = crate::amdgpu_gem::lock_placement(idx).await;
+        crate::amdgpu_gem::evict_all(&gate).await
+    });
+    if evicted.is_err() || object_a.system() || touched.len() != 1 {
+        return TestResult::Fail("evict_all moved a pinned scanout buffer");
+    }
+    crate::amdgpu_gem::restore_domains(touched);
+    if pool.available() != full - size {
+        return TestResult::Fail("evict_all left the unpinned buffer in VRAM");
+    }
+    // RMFB and GEM_CLOSE while it is shown: the pin keeps the buffer.
+    drop(frame_a);
+    drop(object_a);
+    if ms.lock().rmfb(fa).is_err() {
+        return TestResult::Fail("RMFB");
+    }
+    let close = |handle: u32| {
+        let mut c = [0u8; 8];
+        c[0..4].copy_from_slice(&handle.to_le_bytes());
+        crate::amdgpu_gem::dispatch(0x4008_6409, c.as_mut_ptr() as usize, &gem)
+    };
+    if close(a).is_err() {
+        return TestResult::Fail("GEM_CLOSE");
+    }
+    if gem.owns(a) || pool.available() != full - size {
+        return TestResult::Fail("a shown buffer was freed by RMFB / GEM_CLOSE");
+    }
+    // The next frame's buffer, pinned too (back into VRAM from where the
+    // eviction put it); until its flip latches nothing is released.
+    let frame_b = {
+        let card = ms.lock();
+        crate::drm_ioctl_bridge::scanout_frame(&card, card.framebuffer(fb_b).unwrap())
+    };
+    let Some(pin_b) = frame_b.and_then(|f| f.bo) else {
+        return TestResult::Fail("second framebuffer not pinned");
+    };
+    if pin_b.object().system() || pool.available() != full - 2 * size {
+        return TestResult::Fail("pinning did not bring the buffer back to VRAM");
+    }
+    // The display's pins hold A while the HUBP still reports it in use
+    // (the flip to B in flight: its frame holds B's pin).
+    let mut pins = vec![pin_a];
+    let a_at = pins[0].address();
+    let in_flight = crate::amdgpu_navi48_platform::retire_unfetched(&mut pins, &[Some(a_at)]);
+    if !in_flight.is_empty() || pins.len() != 1 {
+        return TestResult::Fail("a buffer was released before the flip latched");
+    }
+    // The flip latched: B joins the display's pins, the HUBP reports B; A
+    // is unpinned, then freed.
+    pins.push(pin_b.clone());
+    let retired =
+        crate::amdgpu_navi48_platform::retire_unfetched(&mut pins, &[Some(pin_b.address()), None]);
+    if retired.len() != 1 || pins.len() != 1 || retired[0].address() != a_at {
+        return TestResult::Fail("the replaced buffer was not retired");
+    }
+    drop(retired);
+    if pool.available() != full - size {
+        return TestResult::Fail("the retired buffer was not freed");
+    }
+    // drm_fb_release on close: B's framebuffer goes, its pin keeps it.
+    if ms.lock().release_file_framebuffers(OWNER) != 1 || ms.lock().framebuffer(fb_b).is_ok() {
+        return TestResult::Fail("drm_fb_release");
+    }
+    drop(gem);
+    if pool.available() != full - size || !pin_b.object().pinned() {
+        return TestResult::Fail("a fetched buffer was freed with its framebuffer");
+    }
+    drop(pin_b);
+    drop(pins);
+    if pool.available() != full {
+        return TestResult::Fail("the last pin did not free the buffer");
+    }
+    crate::amdgpu_gem::unregister_vram_heap(idx);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_navi48_gem_framebuffers_scan_out_in_place
+);
+
 // ── User-copy range + fault checks (Linux access_ok / copy_*_user) ───────────
 
 /// Last byte of the user half, and the first canonical kernel address.

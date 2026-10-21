@@ -592,6 +592,101 @@ kernel_test_in!(
     dcn401_live_plane_update_shows_the_first_frame_at_the_latch
 );
 
+/// A pinned client framebuffer as a new plane's first frame
+/// (`PlaneContent::external`): no chunk is copied.
+struct ClientFb {
+    q: u8,
+    x: ExternalSurface,
+}
+impl PlaneContent for ClientFb {
+    fn chunk(&mut self, _: &SurfaceApplied, _: u32, _: &mut Vec<u32>) -> Option<u64> {
+        panic!("a client framebuffer copied");
+    }
+    fn external(&mut self, a: &SurfaceApplied) -> Option<ExternalSurface> {
+        (a.request.pipe == self.q).then_some(self.x)
+    }
+}
+
+/// A plane added with a client framebuffer scanned out in place shows it
+/// from the update itself, as DC programs a new plane's framebuffer
+/// address in the update that adds it: the overlay's HUBP fetches the
+/// framebuffer's address with its pitch, nothing is copied (its fresh
+/// staged buffer stays cleared and unfetched), and the live scanout checks
+/// against that record. One outside the frame-buffer aperture refuses the
+/// update before any register write.
+fn dcn401_live_plane_update_scans_a_client_framebuffer_from_the_latch() -> TestResult {
+    dcn401_live_plane_update_scans_a_client_framebuffer_from_the_latch_on(ROUTES[1], OVERLAY_PIPE)
+}
+/// The test above with the display on route (t, s, p) and the overlay on
+/// pipe q.
+pub(super) fn dcn401_live_plane_update_scans_a_client_framebuffer_from_the_latch_on(
+    (t, s, p): (u8, u8, u8),
+    q: u8,
+) -> TestResult {
+    let mut c = chain(t, s, p);
+    if run(c.start()).is_err() {
+        return TestResult::Fail("start");
+    }
+    free_pipe(&mut c, q);
+    let base = primary(&c);
+    let overlay = overlay_at(q, 100, 100);
+    let plan = plan_for(base, &[overlay]);
+    raise(&mut c, &plan);
+    let client = 0x8_4000_0000u64;
+    let x = ExternalSurface {
+        address: client,
+        pitch_bytes: 512,
+        chroma: None,
+        last: client + 512 * 64 - 1,
+    };
+    let mut outside = ClientFb {
+        q,
+        x: ExternalSurface {
+            address: 0xc_0000_0000,
+            last: 0xc_0000_0000 + 512 * 64 - 1,
+            ..x
+        },
+    };
+    if update_with(&mut c, &live(base, &[overlay]), &plan, &mut outside) != Err(Error::Invalid)
+        || !c.e.io.inner.inner.writes.is_empty()
+        || c.e.status.state != State::ScanoutRunning(p)
+    {
+        return TestResult::Fail("a client framebuffer outside the aperture");
+    }
+    let Ok(u) = update_with(
+        &mut c,
+        &live(base, &[overlay]),
+        &plan,
+        &mut ClientFb { q, x },
+    ) else {
+        return TestResult::Fail("add the overlay on a client framebuffer");
+    };
+    let Some(o) = u.scanout.overlays[0] else {
+        return TestResult::Fail("overlay scanout record");
+    };
+    let Some(a) = c.e.status.surfaces[usize::from(q)] else {
+        return TestResult::Fail("overlay surface record");
+    };
+    let staged = a.at_staged(0).request.bytes();
+    if o.address != client
+        || a.address != client
+        || a.pitch_bytes != 512
+        || staged.pitch_bytes != 256
+        || c.e.io.get(h(q, 0x60a)) != client as u32
+        || c.e.io.get(h(q, 0x607)) & 0xffff != 512 / 4 - 1
+    {
+        return TestResult::Fail("overlay not fetching the client framebuffer");
+    }
+    if !stream_untouched(&c) || optimize(&mut c, &plan).is_err() || run(c.check()).is_err() {
+        return TestResult::Fail("check with the client overlay");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-plane-update",
+    dcn401_live_plane_update_scans_a_client_framebuffer_from_the_latch
+);
+
 /// Refusals leave the scanout exactly as it ran, without a register
 /// write: a plane on the display's own pipe, a pipe another plane holds
 /// or one not free, a plan for other planes, a display not scanning out.

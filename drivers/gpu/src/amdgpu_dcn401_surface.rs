@@ -36,7 +36,7 @@ mod plane_update;
 #[path = "amdgpu_dcn401_scanout.rs"]
 mod scanout;
 pub use color::{ColorProgram, GamutProgram, OgamProgram, PipeColor};
-pub use flip::FlipDone;
+pub use flip::{ExternalSurface, FlipDone, FlipSource};
 pub use plane_update::{
     plane_update_type, planes_update_type, Cleared, LivePlanes, PlaneContent, PlanesUpdated,
     UpdateType,
@@ -403,9 +403,18 @@ pub struct SurfaceApplied {
     pub request: SurfaceRequest,
     /// GPU framebuffer address, never a CPU BAR or translated physical address.
     pub address: u64,
+    /// The luma (or RGB) pitch HUBP fetches with: the staged buffers'
+    /// (`SurfaceRequest::bytes`), or a client framebuffer's scanned out in
+    /// place (fb->pitches[0], as amdgpu_dm_plane_fill_plane_buffer_attributes
+    /// hands DC its surface_pitch).
     pub pitch_bytes: u32,
-    /// Visible rows including pitch padding; the reservation is page-rounded.
+    /// The staged buffers' size: visible rows including pitch padding (the
+    /// reservation is page-rounded). A client framebuffer's never.
     pub bytes: u64,
+    /// A 4:2:0 surface's chroma plane: its offset from `address` and its
+    /// pitch in bytes (the staged layout, or a client framebuffer's
+    /// offsets[1] - offsets[0] and pitches[1]); none for RGB.
+    pub chroma: Option<(u64, u32)>,
 }
 impl SurfaceRequest {
     fn geometry(self) -> Result<(u32, u64), Error> {
@@ -736,6 +745,26 @@ impl SurfaceRequest {
     }
 }
 impl SurfaceApplied {
+    /// The staged buffers' layout for `request` at `address`.
+    pub fn staged(request: SurfaceRequest, address: u64, pitch_bytes: u32, bytes: u64) -> Self {
+        Self {
+            request,
+            address,
+            pitch_bytes,
+            bytes,
+            chroma: request.chroma(),
+        }
+    }
+    /// The same plane fetching the staged buffer at `address` (a back
+    /// buffer or the front reservation): the staged pitch and chroma.
+    pub(in crate::amdgpu_dcn401_otg) fn at_staged(self, address: u64) -> Self {
+        Self {
+            address,
+            pitch_bytes: self.request.bytes().pitch_bytes,
+            chroma: self.request.chroma(),
+            ..self
+        }
+    }
     /// The byte offset of `count` packed 32-bit words written into row `y`
     /// from pixel `x`: they start on a word and end within the row's pixels
     /// rounded up to whole words (inside the 256-byte-aligned pitch).
@@ -756,12 +785,13 @@ impl SurfaceApplied {
         {
             return Err(Error::Invalid);
         }
-        Ok(u64::from(y) * u64::from(self.pitch_bytes) + first)
+        // The staged buffers' rows, whichever buffer the plane fetches.
+        Ok(u64::from(y) * u64::from(self.request.bytes().pitch_bytes) + first)
     }
     /// The chroma plane's address (DCSURF_PRIMARY_SURFACE_ADDRESS_C) for a
     /// surface at `address`; none for RGB.
     pub fn chroma_address(self, address: u64) -> Option<u64> {
-        self.request.chroma().map(|(offset, _)| address + offset)
+        self.chroma.map(|(offset, _)| address + offset)
     }
     /// One segment's HUBP surface registers, in hubp401_program_surface_config
     /// and hubp401_program_surface_flip_and_addr's terms: DCSURF_SURFACE_CONTROL
@@ -791,8 +821,7 @@ impl SurfaceApplied {
                 self.pitch_bytes / format.bytes_per_pixel() - 1,
             ),
         ];
-        let chroma = self.request.chroma();
-        if let Some((_, pitch_c)) = chroma {
+        if let Some((_, pitch_c)) = self.chroma {
             out.push((0x608, 0xffff, pitch_c / format.chroma_bytes_per_pixel() - 1));
         }
         out.extend([
@@ -916,12 +945,7 @@ impl Surfaces {
         {
             return Err(Error::Invalid);
         }
-        let applied = SurfaceApplied {
-            request,
-            address: memory.address(),
-            pitch_bytes,
-            bytes,
-        };
+        let applied = SurfaceApplied::staged(request, memory.address(), pitch_bytes, bytes);
         self.0[slot] = Some(Surface {
             memory,
             applied,

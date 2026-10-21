@@ -34,6 +34,11 @@ pub trait FirstFrames: Send {
         index: u32,
         words: &mut Vec<u32>,
     ) -> Option<u64>;
+    /// A client framebuffer slot `slot` scans out in place instead
+    /// (`otg::PlaneContent::external`).
+    fn external(&mut self, _slot: usize, _a: &otg::SurfaceApplied) -> Option<otg::ExternalSurface> {
+        None
+    }
 }
 /// No first contents: fresh surfaces show cleared until the next flip.
 impl FirstFrames for otg::Cleared {
@@ -56,6 +61,10 @@ impl otg::PlaneContent for BySlot<'_> {
     fn chunk(&mut self, a: &otg::SurfaceApplied, index: u32, words: &mut Vec<u32>) -> Option<u64> {
         let slot = self.pipes.iter().position(|&p| p == Some(a.request.pipe))?;
         self.frames.chunk(slot, a, index, words)
+    }
+    fn external(&mut self, a: &otg::SurfaceApplied) -> Option<otg::ExternalSurface> {
+        let slot = self.pipes.iter().position(|&p| p == Some(a.request.pipe))?;
+        self.frames.external(slot, a)
     }
 }
 

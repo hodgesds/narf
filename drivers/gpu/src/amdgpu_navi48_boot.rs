@@ -2368,6 +2368,44 @@ impl ColdBoot {
                 .await
         }
     }
+    /// `flip_display_planes` with each plane's source: its back buffer or a
+    /// client framebuffer scanned out in place (`otg::FlipSource`).
+    /// # Safety
+    /// As for `flip_display_planes`; every client framebuffer stays pinned
+    /// in VRAM until a later flip or stop shows it no longer fetched
+    /// (`display_fetched_addresses`).
+    pub async unsafe fn flip_display_sources(
+        &mut self,
+        pipe: u8,
+        sources: [Option<otg::FlipSource>; 1 + otg::MAX_OVERLAYS],
+    ) -> Result<[Option<otg::FlipDone>; 1 + otg::MAX_OVERLAYS], otg::Error> {
+        let crystal = *self.crystal.as_ref().map_err(|_| otg::Error::Unsupported)?;
+        let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
+        // SAFETY: matching retained owners are serialized; caller excludes
+        // writers and keeps every client framebuffer pinned.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .flip_sources(
+                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                    gmc,
+                    pipe,
+                    sources,
+                    crystal,
+                )
+                .await
+        }
+    }
+    /// What display `pipe`'s HUBPs fetch, when known (`Otg::fetched_addresses`);
+    /// none without a display owner.
+    pub fn display_fetched_addresses(
+        &self,
+        pipe: u8,
+    ) -> Option<[Option<u64>; 1 + otg::MAX_OVERLAYS]> {
+        self.otg.as_ref().ok()?.fetched_addresses(pipe)
+    }
     /// The back buffer as a CPU framebuffer (bus-physical BAR address).
     pub fn display_back_framebuffer(
         &self,

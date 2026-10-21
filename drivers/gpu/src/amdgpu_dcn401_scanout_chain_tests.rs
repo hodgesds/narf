@@ -869,6 +869,173 @@ kernel_test_in!(
     dcn401_scanout_chain_live_updates_go_through_the_back_buffer
 );
 
+impl Chain {
+    #[inline(never)]
+    fn flip_to(
+        &mut self,
+        source: FlipSource,
+    ) -> core::future::Ready<Result<[Option<FlipDone>; 1 + MAX_OVERLAYS], Error>> {
+        let c = self.clock;
+        let mut sources = [None; 1 + MAX_OVERLAYS];
+        sources[0] = Some(source);
+        core::future::ready(run_boxed(|| {
+            self.surfaces
+                .flip_sources(&mut self.e, self.pipe, sources, CRYSTAL_KHZ, move || {
+                    Ok((c, config()))
+                })
+        }))
+    }
+    fn hubp(&mut self, r: u64) -> u32 {
+        let at = h(self.pipe, r);
+        self.e.io.get(at)
+    }
+}
+
+/// amdgpu_dm hands DC the client framebuffer's own address
+/// (amdgpu_dm_plane_fill_plane_buffer_attributes): a flip to a pinned
+/// buffer re-addresses the HUBP (and, for another pitch, its
+/// DCSURF_SURFACE_PITCH under the same lock) without copying a byte into
+/// either staged buffer; the buffer it replaces is reported no longer
+/// fetched only after the new address latched; a flip back to the back
+/// buffer restores the staged pitch. A buffer the plane cannot fetch
+/// (misaligned, outside the frame-buffer aperture, a pitch below the
+/// staged one, rows past its end, one of the plane's own staged buffers)
+/// is refused with the scanout untouched.
+fn dcn401_scanout_chain_scans_client_framebuffers_in_place() -> TestResult {
+    scans_client_framebuffers_in_place(chain(0, 0, 0))
+}
+/// The test above on chain `c`.
+fn scans_client_framebuffers_in_place(mut c: alloc::boxed::Box<Chain>) -> TestResult {
+    let p = c.pipe;
+    if run(c.start()).is_err() {
+        return TestResult::Fail("start");
+    }
+    let Ok(back) = run(c.surfaces.prepare_back(&mut c.e, &c.pool, p, config())) else {
+        return TestResult::Fail("back buffer");
+    };
+    let front = c.address;
+    // Mark both staged buffers: nothing may write either.
+    if c.surfaces
+        .upload_back(&mut c.e, p, 0, 0, &[0x1234_5678])
+        .is_err()
+    {
+        return TestResult::Fail("back-buffer marker");
+    }
+    let (front_word, back_word) = (c.vram(front, 0), c.vram(back, 0));
+    let client = 0x8_4000_0000u64;
+    let x = ExternalSurface {
+        address: client,
+        pitch_bytes: 4096,
+        chroma: None,
+        last: client + 4096 * 480 - 1,
+    };
+    for bad in [
+        ExternalSurface {
+            address: client + 64,
+            last: x.last + 64,
+            ..x
+        },
+        ExternalSurface {
+            address: 0xc_0000_0000,
+            last: 0xc_0000_0000 + (x.last - client),
+            ..x
+        },
+        ExternalSurface {
+            pitch_bytes: 2048,
+            ..x
+        },
+        ExternalSurface {
+            pitch_bytes: 4098,
+            ..x
+        },
+        ExternalSurface {
+            last: x.last - 1,
+            ..x
+        },
+        ExternalSurface {
+            chroma: Some((4096 * 480, 4096)),
+            ..x
+        },
+        ExternalSurface {
+            address: back,
+            last: back + 4096 * 480,
+            ..x
+        },
+    ] {
+        if run(c.flip_to(FlipSource::External(bad))) != Err(Error::Invalid)
+            || c.e.status.state != State::ScanoutRunning(p)
+            || c.hubp(0x60a) != front as u32
+        {
+            return TestResult::Fail("unfetchable client framebuffer accepted");
+        }
+    }
+    let writes = c.e.io.writes;
+    let Ok(done) = run(c.flip_to(FlipSource::External(x))) else {
+        return TestResult::Fail("flip to a client framebuffer");
+    };
+    let done = done[0].unwrap();
+    if done.front != client || done.back != front {
+        return TestResult::Fail("client flip report");
+    }
+    if c.hubp(0x60a) != client as u32 || c.hubp(0x60b) & 0xffff != (client >> 32) as u32 {
+        return TestResult::Fail("HUBP not addressing the client framebuffer");
+    }
+    if c.hubp(0x61c) != client as u32 {
+        return TestResult::Fail("client framebuffer not reported in use");
+    }
+    if c.hubp(0x607) & 0xffff != 4096 / 4 - 1 {
+        return TestResult::Fail("client framebuffer's pitch not programmed");
+    }
+    // No copy: neither staged buffer changed, and a flip is a handful of
+    // register writes, not a frame's worth.
+    if c.vram(front, 0) != front_word || c.vram(back, 0) != back_word || c.e.io.writes - writes > 64
+    {
+        return TestResult::Fail("client flip copied pixels");
+    }
+    let mut status = c.e.status.scanout.unwrap();
+    if status.address != client || c.e.status.surfaces[usize::from(p)].unwrap().pitch_bytes != 4096
+    {
+        return TestResult::Fail("records do not name the client framebuffer");
+    }
+    // Another client buffer of the same pitch: only the address moves.
+    let next = ExternalSurface {
+        address: client + 0x20_0000,
+        last: x.last + 0x20_0000,
+        ..x
+    };
+    let Ok(done) = run(c.flip_to(FlipSource::External(next))) else {
+        return TestResult::Fail("client to client flip");
+    };
+    if done[0].unwrap().back != client || c.hubp(0x60a) != next.address as u32 {
+        return TestResult::Fail("client to client report");
+    }
+    // Back to the staged back buffer (the presenter's copy path): its
+    // staged pitch returns, the client buffer is released by the report.
+    let Ok(done) = run(c.flip_to(FlipSource::Back)) else {
+        return TestResult::Fail("flip back to the staged buffer");
+    };
+    let done = done[0].unwrap();
+    if done.front != back || done.back != next.address || c.hubp(0x607) & 0xffff != 640 - 1 {
+        return TestResult::Fail("back-buffer flip after a client one");
+    }
+    status = c.e.status.scanout.unwrap();
+    if status.address != back
+        || c.vram(back, 0) != back_word
+        || c.surfaces.upload_back(&mut c.e, p, 0, 0, &[7]).is_err()
+        || c.vram(front, 0) != 7
+    {
+        return TestResult::Fail("staged buffers after the client flips");
+    }
+    if run(c.stop()).is_err() {
+        return TestResult::Fail("stop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_chain_scans_client_framebuffers_in_place
+);
+
 /// A second display selected next to a live one sees exactly the first
 /// one's resources as siblings, may retire planes and stage timing on its
 /// own pipes without disturbing the live scanout, and may not take the
@@ -1328,6 +1495,8 @@ fn dcn401_scanout_chain_runs_on_harvested_boards() -> TestResult {
             dcn401_live_plane_update_adds_moves_and_removes_an_overlay_on(route, 0),
             dcn401_live_plane_update_moves_the_cursor_with_the_planes_on(route, 0),
             dcn401_live_plane_update_shows_the_first_frame_at_the_latch_on(route, 0),
+            dcn401_live_plane_update_scans_a_client_framebuffer_from_the_latch_on(route, 0),
+            scans_client_framebuffers_in_place(chain_on(route)),
         ] {
             if result != TestResult::Pass {
                 return result;

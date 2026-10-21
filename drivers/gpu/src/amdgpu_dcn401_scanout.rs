@@ -18,6 +18,9 @@ const ADDRESS_HIGH: u64 = 0x60b;
 /// DCSURF_PRIMARY_SURFACE_ADDRESS_C and _HIGH_C: a 4:2:0 plane's chroma.
 const ADDRESS_C: u64 = 0x60c;
 const ADDRESS_HIGH_C: u64 = 0x60d;
+/// DCSURF_SURFACE_PITCH and DCSURF_SURFACE_PITCH_C (PITCH, PITCH_C).
+const PITCH: u64 = 0x607;
+const PITCH_C: u64 = 0x608;
 const EARLIEST_INUSE: u64 = 0x61c;
 const EARLIEST_INUSE_HIGH: u64 = 0x61d;
 const FLIP_PENDING: u32 = 0x100;
@@ -570,16 +573,45 @@ impl<I: Io> Engine<I> {
     pub(super) async fn flip_to(&mut self, p: Pipe) -> Result<u32, Error> {
         self.flip_from(p, None).await
     }
-    /// The chroma plane's offset of the staged 4:2:0 surface HUBP `q`
-    /// fetches (its own or, as an ODM half, its pipe's); none for RGB.
-    fn chroma_offset(&self, q: u8) -> Option<u64> {
+    /// The surface HUBP `q` fetches (its own or, as an ODM segment's or
+    /// MPC slice's pipe, its plane's), as its records name it.
+    fn fetched_surface(&self, q: u8) -> Option<SurfaceApplied> {
         self.status
             .surfaces
             .iter()
             .flatten()
             .find(|a| a.request.pipe_mask() & bit(q) != 0)
-            .and_then(|a| a.request.chroma())
+            .copied()
+    }
+    /// The chroma plane's offset of the 4:2:0 surface HUBP `q` fetches;
+    /// none for RGB.
+    fn chroma_offset(&self, q: u8) -> Option<u64> {
+        self.fetched_surface(q)
+            .and_then(|a| a.chroma)
             .map(|(offset, _)| offset)
+    }
+    /// hubp401_program_size for HUBP `q` when the surface its records name
+    /// fetches with another pitch than the one programmed: a flip between a
+    /// staged buffer and a client framebuffer of another pitch (DC's MED
+    /// plane_size update, programmed under the same lock as the address).
+    /// Nothing is written while the pitches agree (a FAST flip).
+    fn write_fetch_pitch(&mut self, q: u8) -> Result<(), Error> {
+        let Some(a) = self.fetched_surface(q) else {
+            return Ok(());
+        };
+        let l = self.layout;
+        let format = a.request.format;
+        let mut pitches = alloc::vec![(PITCH, a.pitch_bytes / format.bytes_per_pixel() - 1)];
+        if let Some((_, pitch_c)) = a.chroma {
+            pitches.push((PITCH_C, pitch_c / format.chroma_bytes_per_pixel() - 1));
+        }
+        for (r, value) in pitches {
+            let at = l.hubp(q, r);
+            if self.read(at)? & 0xffff != value {
+                self.update(at, 0xffff, value)?;
+            }
+        }
+        Ok(())
     }
     /// hubp401_program_surface_flip_and_addr's address writes for HUBP `q`
     /// fetching a surface at `address`: a 4:2:0 surface's chroma first, then
@@ -611,6 +643,7 @@ impl<I: Io> Engine<I> {
             {
                 continue;
             }
+            self.write_fetch_pitch(q)?;
             self.write_fetch_address(q, address)?;
         }
         self.update(l.otg(pipe, LOCK), LOCK_REQUEST, 0)?;
@@ -1295,6 +1328,11 @@ impl Surfaces {
         let a = surface.applied;
         if a.address != running.address || a.request.format != SurfaceFormat::Xrgb8888 {
             return Err(Error::Invalid);
+        }
+        // A client framebuffer scanned out in place has no CPU view here:
+        // the console never draws into it.
+        if a.address != surface.memory.address() {
+            return Err(Error::Busy);
         }
         Ok(GenericFb::new(
             surface.memory.mapping().phys.raw(),

@@ -5260,9 +5260,10 @@ fn atomic_commit(
                 .iter()
                 .filter(|&&(crtc_id, _)| hardware_flips(card_index, crtc_id))
                 .filter_map(|&(crtc_id, fb_id)| {
-                    let gem_handle = card.framebuffer(fb_id).ok()?.gem_handle;
+                    let fb = card.framebuffer(fb_id).ok()?;
+                    let gem_handle = fb.gem_handle;
                     (card.virtgpu_import(gem_handle).is_none()
-                        && card.dumb_backing(gem_handle).is_some())
+                        && (card.dumb_backing(gem_handle).is_some() || fb.bo.is_some()))
                     .then_some(crtc_id)
                 })
                 .collect();
@@ -6008,6 +6009,8 @@ fn handle_setcrtc(
     let src_w: u32;
     let src_h: u32;
     let src_frame: crate::amdgpu_navi48_platform::PlaneFrame;
+    // A GEM framebuffer, pinned for scanout in place.
+    let gem_frame: Option<crate::amdgpu_navi48_platform::PlaneFrame>;
     // SETCRTC's single connector id, read before any card lock is held.
     let setcrtc_connector = if req.count_connectors == 1 && req.set_connectors_ptr != 0 {
         // SAFETY: a user pointer to count_connectors (one) u32 ids.
@@ -6172,6 +6175,7 @@ fn handle_setcrtc(
         let gem_handle = fb.gem_handle;
         src_phys = card.dumb_backing(gem_handle).map(|b| b.phys);
         src_frame = fb_frame(fb, src_phys.unwrap_or(0));
+        gem_frame = fb.bo.is_some().then(|| scanout_frame(&card, fb)).flatten();
         virgl_resource = card.virtgpu_import(gem_handle).cloned();
     }
 
@@ -6192,6 +6196,8 @@ fn handle_setcrtc(
     // Perform the blit if we have a valid source and a live scanout.
     if let Some(resource) = virgl_resource {
         present_virgl_frame(&resource, src_w, src_h)?;
+    } else if let Some(f) = gem_frame {
+        present_frame(card_index, req.crtc_id, f, None);
     } else if let Some(src) = src_phys {
         present_frame(
             card_index,
@@ -6259,6 +6265,8 @@ fn handle_page_flip(
     let src_w: u32;
     let src_h: u32;
     let src_frame: crate::amdgpu_navi48_platform::PlaneFrame;
+    // A GEM framebuffer, pinned for scanout in place.
+    let gem_frame: Option<crate::amdgpu_navi48_platform::PlaneFrame>;
     let mut flip_ticket = None;
     {
         let mut card = mode_state.lock();
@@ -6296,6 +6304,7 @@ fn handle_page_flip(
         let gem_handle = fb.gem_handle;
         src_phys = card.dumb_backing(gem_handle).map(|b| b.phys);
         src_frame = fb_frame(fb, src_phys.unwrap_or(0));
+        gem_frame = fb.bo.is_some().then(|| scanout_frame(&card, fb)).flatten();
         virgl_resource = card.virtgpu_import(gem_handle).cloned();
 
         // Reserve Linux's per-file event space before changing the CRTC, so an
@@ -6329,7 +6338,7 @@ fn handle_page_flip(
 
         if let Some(queue) = event_queue.as_mut() {
             let hardware = (virgl_resource.is_none()
-                && src_phys.is_some()
+                && (src_phys.is_some() || gem_frame.is_some())
                 && hardware_flips(card_index, req.crtc_id))
             .then(|| crate::amdgpu_native_kms::crtc_display(req.crtc_id))
             .flatten();
@@ -6364,6 +6373,8 @@ fn handle_page_flip(
 
     if let Some(resource) = virgl_resource {
         present_virgl_frame(&resource, src_w, src_h)?;
+    } else if let Some(f) = gem_frame {
+        present_frame(card_index, req.crtc_id, f, flip_ticket);
     } else if let Some(src) = src_phys {
         present_frame(
             card_index,
@@ -6546,7 +6557,7 @@ fn handle_setplane(
                     == Some(dp.crtc_id))
                 .then(|| native_plane_frame(&card, &state.planes[0]))
                 .flatten();
-                if let Some(f) = primary {
+                if let Some(f) = &primary {
                     crate::amdgpu_native_kms::request_display_format(display, f.format);
                 }
                 let overlays = dp.overlays.map(|id| {
@@ -6565,13 +6576,41 @@ fn handle_setplane(
     Ok(0)
 }
 
-/// A native plane's framebuffer as the presenter copies it: its dumb
-/// backing, pitch, size and fourcc.
+/// A native plane's framebuffer as the presenter shows it: its dumb
+/// backing (which the presenter copies), or its amdgpu GEM buffer pinned
+/// for scanout in place (`scanout_frame`); pitch, size and fourcc.
 fn native_plane_frame(
     card: &crate::drm::card::Card,
     plane: &crate::drm::atomic::PlaneState,
 ) -> Option<crate::amdgpu_navi48_platform::PlaneFrame> {
-    let fb = card.framebuffer(plane.fb_id?).ok()?;
+    scanout_frame(card, card.framebuffer(plane.fb_id?).ok()?)
+}
+
+/// Framebuffer `fb` as the presenter shows it: a dumb buffer's backing, or
+/// (amdgpu_dm_plane_helper_prepare_fb) its GEM buffer pinned in VRAM, which
+/// a plane scans out in place until a later flip latches past it. None
+/// without either (or when the buffer cannot be pinned in VRAM).
+pub(crate) fn scanout_frame(
+    card: &crate::drm::card::Card,
+    fb: &crate::drm::card::Framebuffer,
+) -> Option<crate::amdgpu_navi48_platform::PlaneFrame> {
+    if let Some(bo) = &fb.bo {
+        let pin = match bo.object.pin_scanout() {
+            Ok(pin) => pin,
+            Err(e) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  drm: fb {} not pinned for scanout: {e:?}",
+                    fb.id
+                );
+                return None;
+            }
+        };
+        return Some(crate::amdgpu_navi48_platform::PlaneFrame {
+            bo: Some(Arc::new(pin)),
+            ..fb_frame(fb, 0)
+        });
+    }
     let phys = card.dumb_backing(fb.gem_handle)?.phys;
     Some(fb_frame(fb, phys))
 }
@@ -6590,6 +6629,7 @@ fn fb_frame(
         offsets: fb.offsets,
         chroma_pitch: fb.chroma_pitch,
         modifier: fb.modifier,
+        bo: None,
     }
 }
 
@@ -6614,11 +6654,13 @@ fn present_native_planes(
         }
         return;
     }
+    // A client framebuffer scanned out in place has no CPU fallback.
+    let fallback = primary.clone().filter(|f| f.bo.is_none());
     if crate::amdgpu_native_kms::present_planes(display, primary, overlays, ticket) {
         narf_console::fb_take_for_user();
         return;
     }
-    if let Some(f) = primary {
+    if let Some(f) = fallback {
         present_frame(card_index, crtc_id, f, None);
     }
 }
@@ -6643,7 +6685,9 @@ fn present_frame(
             // A refused frame completes its ticket at once. A tiled or 4:2:0
             // framebuffer (only the Navi 48 card takes them) goes as its
             // primary plane's frame.
-            let linear = f.modifier == 0 && f.offsets == [0; 2] && f.chroma_pitch == 0;
+            let linear =
+                f.bo.is_none() && f.modifier == 0 && f.offsets == [0; 2] && f.chroma_pitch == 0;
+            let gem = f.bo.is_some();
             let native = if linear {
                 crate::amdgpu_native_kms::present_frame(
                     display,
@@ -6658,12 +6702,16 @@ fn present_frame(
                 crate::amdgpu_native_kms::present_planes(
                     display,
                     Some(f),
-                    [None; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
+                    core::array::from_fn(|_| None),
                     flip_ticket,
                 )
             };
             if native {
                 narf_console::fb_take_for_user();
+                return;
+            }
+            // A GEM framebuffer is scanned out in place or not at all.
+            if gem {
                 return;
             }
             // Only the console's display has a CPU front to copy onto, and
@@ -7056,6 +7104,49 @@ pub fn amdgpu_dumb_metadata(card_index: u32, cmd: u32, arg: usize) -> Option<Res
         }
         _ => Some(Ok(0)),
     }
+}
+
+/// `DRM_IOCTL_MODE_ADDFB2` on the native amdgpu card naming an amdgpu GEM
+/// handle of the calling open (`gem`, owner `open_id`):
+/// amdgpu_display_user_framebuffer_create's drm_gem_object_lookup in the
+/// file's own handle table, then `Card::addfb2_bo`. `None` for another
+/// ioctl, another card, or a handle that is not one of the open's amdgpu
+/// GEM buffers (the card's ADDFB2 then answers it as before).
+pub fn amdgpu_addfb2_bo(
+    card_index: u32,
+    open_id: u64,
+    cmd: u32,
+    arg: usize,
+    gem: &crate::amdgpu_gem::GemState,
+) -> Option<Result<u64, FsError>> {
+    if cmd != drm_uapi::DRM_IOCTL_MODE_ADDFB2 || arg == 0 {
+        return None;
+    }
+    let mode_state = crate::drm_registry::mode_state(card_index)?;
+    if !mode_state.lock().gfx12_modifiers {
+        return None;
+    }
+    // SAFETY: `arg` is the ioctl pointer; drm_mode_fb_cmd2 is 104 bytes.
+    let b = match unsafe { copy_in(arg, 104) } {
+        Ok(b) => b,
+        Err(e) => return Some(Err(e)),
+    };
+    let fb = crate::amdgpu_dm_modifiers::FbCmd::parse(&b)?;
+    if !gem.owns(fb.handles[0]) {
+        return None;
+    }
+    let object = gem.object(fb.handles[0])?;
+    let id = mode_state
+        .lock()
+        .addfb2_bo(&fb, object, open_id)
+        .map_err(|e| match e {
+            crate::drm::card::CardError::BadGemHandle => FsError::NotFound,
+            _ => FsError::InvalidData,
+        });
+    Some(id.and_then(|id| {
+        // SAFETY: as above; fb_id is the struct's first u32.
+        unsafe { copy_out(arg, &id.to_le_bytes()) }.map(|()| 0)
+    }))
 }
 
 /// `struct drm_version` for the amdgpu driver: `amdgpu`, `20150101`,

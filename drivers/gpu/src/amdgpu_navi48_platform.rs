@@ -531,6 +531,17 @@ async unsafe fn suspend_device(baco: Option<Baco>) -> Result<(), boot::Error> {
         return Err(boot::Error::Busy);
     }
     let card = boot::ColdBoot::drm_card().ok_or(boot::Error::Invalid)?;
+    // dm_suspend's commit before amdgpu_device_evict_resources: no plane
+    // keeps scanning out a client framebuffer, so cleanup_fb unpins them
+    // and the eviction moves them too. One a display cannot let go of
+    // stays pinned, and evict_all passes it by (as TTM's LRU walk does).
+    {
+        let mut owner = OWNER.lock().await;
+        if let Some(boot) = owner.as_mut() {
+            // SAFETY: OWNER is held; the caller's suspend obligations.
+            let _ = unsafe { release_client_scanout(boot) }.await;
+        }
+    }
     // No new VRAM placement while the old ones leave.
     crate::amdgpu_gem::unregister_vram_heap(card);
     let (domains, evicted) = {
@@ -3135,9 +3146,15 @@ async unsafe fn update_lit_planes(
         frame: None,
         format,
         setup,
+        pins: Vec::new(),
     };
     // SAFETY: the caller's obligations; the console no longer draws.
     let result = unsafe { boot.update_display_planes(k, format, setup, reset, &mut frames) }.await;
+    // The client framebuffers the update scans out in place: held from the
+    // update on (whatever its outcome: a failed one may fetch them), until
+    // a flip or stop shows them no longer fetched.
+    present_slot(k).pins.lock().append(&mut frames.pins);
+    retire_scanout_pins(boot, k);
     let changed = match result {
         Ok(Some(change)) => {
             {
@@ -3192,24 +3209,30 @@ struct CommitFrames {
     frame: Option<Option<Frame>>,
     format: SurfaceFormat,
     setup: boot::PlaneSetup,
+    /// The pins of the client framebuffers the update scans out in place.
+    pins: Vec<Arc<crate::amdgpu_gem::ScanoutPin>>,
 }
-impl boot::FirstFrames for CommitFrames {
-    fn chunk(
+impl CommitFrames {
+    /// Slot `slot`'s framebuffer in the waiting frame, its format and its
+    /// geometry, when it is in the format and tiling the plane is shown in.
+    fn plane(
         &mut self,
         slot: usize,
-        a: &crate::amdgpu_dcn401_otg::SurfaceApplied,
-        index: u32,
-        words: &mut Vec<u32>,
-    ) -> Option<u64> {
+    ) -> Option<(PlaneFrame, SurfaceFormat, Option<boot::PlaneGeometry>)> {
         let display = self.display;
-        let frame = (*self
+        let frame = self
             .frame
-            .get_or_insert_with(|| *present_slot(display).next.lock()))?;
+            .get_or_insert_with(|| present_slot(display).next.lock().clone())
+            .as_ref()?;
         let (f, format, g) = if slot == 0 {
-            (frame.primary?, self.format, self.setup.primary)
+            (frame.primary.clone()?, self.format, self.setup.primary)
         } else {
             let o = self.setup.overlays.get(slot - 1).copied().flatten()?;
-            (frame.overlays[slot - 1]?, o.format, Some(o.geometry))
+            (
+                frame.overlays[slot - 1].clone()?,
+                o.format,
+                Some(o.geometry),
+            )
         };
         let surface = g.map_or(crate::amdgpu_dcn401_otg::PlaneSurface::LINEAR, |g| {
             g.surface
@@ -3219,10 +3242,62 @@ impl boot::FirstFrames for CommitFrames {
         {
             return None;
         }
+        Some((f, format, g))
+    }
+}
+impl boot::FirstFrames for CommitFrames {
+    fn chunk(
+        &mut self,
+        slot: usize,
+        a: &crate::amdgpu_dcn401_otg::SurfaceApplied,
+        index: u32,
+        words: &mut Vec<u32>,
+    ) -> Option<u64> {
+        let (f, format, g) = self.plane(slot)?;
+        // A GEM framebuffer is scanned out in place (`external`), never
+        // copied.
+        if f.bo.is_some() {
+            return None;
+        }
         // SAFETY: a frame waiting in the mailbox names mapped dumb buffers
         // its client leaves untouched until the flip-complete event.
-        unsafe { frame_chunk(f, format, g, a, index, words) }
+        unsafe { frame_chunk(&f, format, g, a, index, words) }
     }
+    fn external(
+        &mut self,
+        slot: usize,
+        a: &crate::amdgpu_dcn401_otg::SurfaceApplied,
+    ) -> Option<crate::amdgpu_dcn401_otg::ExternalSurface> {
+        let (f, format, g) = self.plane(slot)?;
+        let x = external_source(&f, format, g)?;
+        // The staged surface it replaces has the framebuffer's geometry.
+        if a.request.format != format {
+            return None;
+        }
+        self.pins.extend(f.bo.clone());
+        Some(x)
+    }
+}
+
+/// Where plane geometry `g` (none: the full-frame primary) fetches pinned
+/// GEM framebuffer `f` in place, as `place_plane` flips to it.
+fn external_source(
+    f: &PlaneFrame,
+    format: SurfaceFormat,
+    g: Option<boot::PlaneGeometry>,
+) -> Option<crate::amdgpu_dcn401_otg::ExternalSurface> {
+    f.bo.as_ref()?;
+    let origin = match g {
+        Some(g) if g.whole_framebuffer(format) => {
+            if (f.width, f.height) != g.fb_size {
+                return None;
+            }
+            (0, 0)
+        }
+        Some(g) => (g.src_x, g.src_y),
+        None => (0, 0),
+    };
+    f.external(origin)
 }
 
 /// Chunk `index` of framebuffer `f` on surface `a` (shown with geometry
@@ -3233,7 +3308,7 @@ impl boot::FirstFrames for CommitFrames {
 /// # Safety
 /// `f` names a kernel-mapped dumb buffer whose planes ADDFB2 checked.
 unsafe fn frame_chunk(
-    f: PlaneFrame,
+    f: &PlaneFrame,
     format: SurfaceFormat,
     g: Option<boot::PlaneGeometry>,
     a: &crate::amdgpu_dcn401_otg::SurfaceApplied,
@@ -3560,21 +3635,129 @@ pub async unsafe fn flip_display(
     let boot = owner
         .as_mut()
         .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
-    let before = boot.display_scanout_framebuffer(pipe)?;
+    let before = boot.display_scanout_framebuffer(pipe).ok();
     // SAFETY: serialized retained owners; caller excludes external writers.
     let done = unsafe { boot.flip_display(pipe).await }?;
-    follow_flip(before, boot.display_scanout_framebuffer(pipe)?).await;
+    follow_flip(before, boot.display_scanout_framebuffer(pipe).ok()).await;
+    retire_scanout_pins(boot, pipe);
     Ok(done)
 }
 
 /// Follow a flip while still holding OWNER. Retired CPU views must finish
 /// before another presenter can overwrite the former front as its back buffer.
-async fn follow_flip(before: GenericFb, after: GenericFb) {
-    if crate::amdgpu_dcn_display::active_scanout().is_some_and(|fb| fb.addr == before.addr) {
-        crate::amdgpu_dcn_display::publish_external(Some(after), Some(flush_scanout));
-        crate::amdgpu_dcn_display::publish_external_cursor(Some(scanout_cursor));
+/// A front with no CPU view (a client framebuffer scanned out in place)
+/// takes the console off the display: it never draws into a client's
+/// buffer.
+async fn follow_flip(before: Option<GenericFb>, after: Option<GenericFb>) {
+    let followed = before.is_some_and(|before| {
+        crate::amdgpu_dcn_display::active_scanout().is_some_and(|fb| fb.addr == before.addr)
+    });
+    if followed {
+        match after {
+            Some(after) => {
+                crate::amdgpu_dcn_display::publish_external(Some(after), Some(flush_scanout));
+                crate::amdgpu_dcn_display::publish_external_cursor(Some(scanout_cursor));
+            }
+            None => crate::amdgpu_dcn_display::publish_external(None, None),
+        }
     }
     crate::scanout_access::wait_retired().await;
+}
+
+/// amdgpu_dm_plane_helper_cleanup_fb for display `display`: drop the pins
+/// of client framebuffers its HUBPs no longer fetch, once that is known
+/// (a flip latched past them, a plane update or relight replaced them, or
+/// the display stopped). While a change is in flight or after a failure
+/// every pin stays: the buffer may still be fetched.
+fn retire_scanout_pins(boot: &boot::ColdBoot, display: u8) {
+    let Some(fetched) = boot.display_fetched_addresses(display) else {
+        return;
+    };
+    let slot = present_slot(display);
+    let retired = retire_unfetched(&mut slot.pins.lock(), &fetched);
+    // Unpinned (and maybe freed) outside the slot's lock.
+    drop(retired);
+}
+
+/// The pins of `pins` whose buffers none of the `fetched` addresses lies
+/// in, taken out (the others stay): what cleanup_fb may unpin once the
+/// HUBPs report those addresses in use.
+pub(crate) fn retire_unfetched(
+    pins: &mut Vec<Arc<crate::amdgpu_gem::ScanoutPin>>,
+    fetched: &[Option<u64>],
+) -> Vec<Arc<crate::amdgpu_gem::ScanoutPin>> {
+    let (keep, retired) = core::mem::take(pins).into_iter().partition(|pin| {
+        let (start, len) = (pin.address(), pin.byte_len());
+        fetched
+            .iter()
+            .flatten()
+            .any(|&a| a >= start && a - start < len)
+    });
+    *pins = keep;
+    retired
+}
+
+/// `retire_scanout_pins` on every display.
+fn retire_all_scanout_pins(boot: &boot::ColdBoot) {
+    for display in 0..PRESENT.len() as u8 {
+        retire_scanout_pins(boot, display);
+    }
+}
+
+/// Whether display `display` may still fetch a pinned client framebuffer.
+fn scans_client_buffers(display: u8) -> bool {
+    !present_slot(display).pins.lock().is_empty()
+}
+
+/// What dm_suspend's (and drm_fb_helper's lastclose) commit does to a
+/// framebuffer scanned out in place: the plane stops showing it, so
+/// cleanup_fb unpins it. Every display still fetching a pinned client
+/// framebuffer flips those planes back to their staged back buffers
+/// (what the presenter last copied, or cleared memory) and the pins are
+/// retired; a display whose console followed it gets the console back.
+/// False when a display could not let go (it then keeps its pins).
+/// # Safety
+/// The caller holds OWNER and excludes other display writers.
+async unsafe fn release_client_scanout(boot: &mut boot::ColdBoot) -> bool {
+    let mut released = true;
+    for display in 0..PRESENT.len() as u8 {
+        retire_scanout_pins(boot, display);
+        if !scans_client_buffers(display) {
+            continue;
+        }
+        let Some(fetched) = boot.display_fetched_addresses(display) else {
+            released = false;
+            continue;
+        };
+        let pins = present_slot(display).pins.lock().clone();
+        let external = |a: u64| {
+            pins.iter()
+                .any(|p| a >= p.address() && a - p.address() < p.byte_len())
+        };
+        let sources = fetched.map(|a| {
+            a.is_some_and(external)
+                .then_some(crate::amdgpu_dcn401_otg::FlipSource::Back)
+        });
+        if sources.iter().all(Option::is_none) {
+            continue;
+        }
+        // SAFETY: the caller's obligations; the back buffers hold what the
+        // presenter last copied and no CPU writer touches them.
+        if unsafe { boot.flip_display_sources(display, sources).await }.is_err() {
+            released = false;
+            continue;
+        }
+        retire_scanout_pins(boot, display);
+        released &= !scans_client_buffers(display);
+        // The console followed the display off the client's buffer.
+        if CURSOR_PIPE.load(Ordering::Acquire) == display
+            && crate::amdgpu_dcn_display::active_scanout().is_none()
+            && !narf_console::fb_user_owned()
+        {
+            publish_console(boot, Some(display));
+        }
+    }
+    released
 }
 
 /// One display's DRM presentation: whether frames go through its back
@@ -3589,6 +3772,10 @@ struct PresentSlot {
     /// The planes it shows.
     shown: narf_lib::sync::IrqSafeSpinLock<PlanesShown>,
     next: narf_lib::sync::IrqSafeSpinLock<Option<Frame>>,
+    /// The pinned client framebuffers its HUBPs may fetch: the planes
+    /// scanned out in place, until `retire_scanout_pins` sees them no
+    /// longer fetched.
+    pins: narf_lib::sync::IrqSafeSpinLock<Vec<Arc<crate::amdgpu_gem::ScanoutPin>>>,
 }
 impl PresentSlot {
     const fn new() -> Self {
@@ -3601,6 +3788,7 @@ impl PresentSlot {
                 overlay_pipes: [None; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
             }),
             next: narf_lib::sync::IrqSafeSpinLock::new(None),
+            pins: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
         }
     }
 }
@@ -3609,12 +3797,18 @@ fn present_slot(display: u8) -> &'static PresentSlot {
     &PRESENT[usize::from(display).min(PRESENT.len() - 1)]
 }
 
-/// One plane's DRM framebuffer: a kernel-mapped dumb buffer, its pitch,
-/// size and fourcc, each plane's offset (a 4:2:0 framebuffer's chroma
-/// plane at `offsets[1]` with `chroma_pitch`) and its modifier. A linear
-/// RGB plane's source rectangle (the shown planes') is what the presenter
-/// copies out of it; a tiled or 4:2:0 one is copied whole.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// One plane's DRM framebuffer: a kernel-mapped dumb buffer, or (`bo`) an
+/// amdgpu GEM buffer pinned in VRAM for scanout; its pitch, size and
+/// fourcc, each plane's offset (a 4:2:0 framebuffer's chroma plane at
+/// `offsets[1]` with `chroma_pitch`) and its modifier. A pinned buffer is
+/// scanned out in place (`external`), as amdgpu_dm hands DC the
+/// framebuffer's address: no copy. A dumb buffer lives in system memory,
+/// which display fetch on this dGPU never reads
+/// (amdgpu_display_supported_domains is VRAM alone), so the presenter
+/// copies it into the plane's staged VRAM back buffer, as amdgpu_bo_pin
+/// would migrate it: a linear RGB plane's source rectangle, a tiled or
+/// 4:2:0 one whole.
+#[derive(Clone, Debug)]
 pub struct PlaneFrame {
     pub phys: u64,
     pub pitch: u32,
@@ -3624,6 +3818,9 @@ pub struct PlaneFrame {
     pub offsets: [u32; 2],
     pub chroma_pitch: u32,
     pub modifier: u64,
+    /// The pin amdgpu_dm_plane_helper_prepare_fb took on the framebuffer's
+    /// GEM buffer; it lasts until a flip latches past it.
+    pub bo: Option<Arc<crate::amdgpu_gem::ScanoutPin>>,
 }
 impl PlaneFrame {
     /// A linear single-plane framebuffer at `phys`.
@@ -3637,18 +3834,50 @@ impl PlaneFrame {
             offsets: [0; 2],
             chroma_pitch: 0,
             modifier: 0,
+            bo: None,
         }
     }
     /// The framebuffer's tiling, if one the planes list.
     fn tiling(&self) -> Option<crate::amdgpu_dcn401_otg::Tiling> {
         crate::amdgpu_dcn401_otg::Tiling::from_modifier(self.modifier)
     }
+    /// The pinned framebuffer as a plane fetches it in place, its source
+    /// rectangle's origin at `origin` (amdgpu_dm_plane_fill_plane_buffer_
+    /// attributes: the buffer's GPU offset plus offsets[0], the chroma at
+    /// offsets[1], pitches[0] and [1]). A plane whose staged surface is its
+    /// source rectangle (linear RGB) starts at the rectangle, as DC's
+    /// viewport does; a 256-byte-misaligned start (or a chroma plane before
+    /// the luma) none.
+    pub(crate) fn external(
+        &self,
+        origin: (u32, u32),
+    ) -> Option<crate::amdgpu_dcn401_otg::ExternalSurface> {
+        let pin = self.bo.as_ref()?;
+        let cpp = SurfaceFormat::from_fourcc(self.format)?.bytes_per_pixel();
+        let base = pin.address().checked_add(u64::from(self.offsets[0]))?;
+        let address = base
+            .checked_add(u64::from(origin.1) * u64::from(self.pitch))?
+            .checked_add(u64::from(origin.0) * u64::from(cpp))?;
+        let chroma = match self.chroma_pitch {
+            0 => None,
+            pitch => Some((
+                u64::from(self.offsets[1].checked_sub(self.offsets[0])?),
+                pitch,
+            )),
+        };
+        (address % 256 == 0).then_some(crate::amdgpu_dcn401_otg::ExternalSurface {
+            address,
+            pitch_bytes: self.pitch,
+            chroma,
+            last: pin.address() + pin.byte_len() - 1,
+        })
+    }
 }
 
 /// A DRM client's frame: a framebuffer for each plane it updates (the
 /// primary, the overlays bottom first; None keeps a plane's content), and
 /// the flip-complete ticket (see `drm::card::FlipLog`) its flip completes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct Frame {
     primary: Option<PlaneFrame>,
     overlays: [Option<PlaneFrame>; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
@@ -3662,7 +3891,9 @@ impl Frame {
     fn merged(self, next: Self) -> Self {
         let mut overlays = self.overlays;
         for (o, n) in overlays.iter_mut().zip(next.overlays) {
-            *o = n.or(*o);
+            if n.is_some() {
+                *o = n;
+            }
         }
         Self {
             primary: next.primary.or(self.primary),
@@ -3852,7 +4083,7 @@ pub fn present_frame(
     present_planes(
         display,
         Some(primary),
-        [None; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
+        core::array::from_fn(|_| None),
         ticket,
     )
 }
@@ -3874,7 +4105,7 @@ pub fn present_planes(
         f.width != 0 && f.height != 0 && u64::from(f.pitch) >= u64::from(f.width) * u64::from(bytes)
     };
     let k = usize::from(display);
-    let format = primary.map(|f| f.format);
+    let format = primary.as_ref().map(|f| f.format);
     let fmt = format.and_then(SurfaceFormat::from_fourcc);
     let shown = k < PRESENT.len()
         && format.is_none_or(|f| present_slot(display).format.load(Ordering::Acquire) == f);
@@ -3886,7 +4117,7 @@ pub fn present_planes(
             .get(k)
             .is_some_and(|c| Some(c.format) == fmt);
     if !(native_present_ready(display) && shown || switching)
-        || primary.is_some_and(|f| !fits(&f))
+        || primary.as_ref().is_some_and(|f| !fits(f))
         || overlays.iter().flatten().any(|f| !fits(f))
         || (primary.is_none() && overlays.iter().all(Option::is_none))
     {
@@ -3902,8 +4133,9 @@ pub fn present_planes(
             ticket,
             queued_ns: narf_time::wall::monotonic_ns(),
         };
-        // A replaced frame's event completes with the frame replacing it.
-        *next = Some(match *next {
+        // A replaced frame's event completes with the frame replacing it
+        // (and its pins go: that commit's framebuffers never show).
+        *next = Some(match next.take() {
             Some(old) => old.merged(frame),
             None => frame,
         });
@@ -3955,7 +4187,7 @@ async fn presenter(display: u8) {
         if planes_pending(display) && waited < PLANES_WAIT_NS {
             {
                 let mut next = slot.next.lock();
-                *next = Some(match *next {
+                *next = Some(match next.take() {
                     Some(newer) => frame.merged(newer),
                     None => frame,
                 });
@@ -3968,11 +4200,15 @@ async fn presenter(display: u8) {
             }
             return;
         }
+        // amdgpu_dm_commit_planes: the GPU's writes to a framebuffer scanned
+        // out in place land before its flip (its WRITE fences, 5 s).
+        wait_scanout_writes(&frame).await;
         let result = {
             let mut owner = OWNER.lock().await;
             // A relight in another format since the frame was queued.
             if frame
                 .primary
+                .as_ref()
                 .is_some_and(|f| slot.format.load(Ordering::Acquire) != f.format)
             {
                 complete_flip(display, frame.ticket, None);
@@ -3980,8 +4216,9 @@ async fn presenter(display: u8) {
             }
             match owner.as_mut() {
                 // SAFETY: the owner lock serializes display writers; the
-                // frame's dumb buffers stay valid under DRM's buffer rules.
-                Some(boot) => match unsafe { present_native(boot, display, frame).await } {
+                // frame's dumb buffers stay valid under DRM's buffer rules,
+                // its GEM buffers under their pins.
+                Some(boot) => match unsafe { present_native(boot, display, &frame).await } {
                     // The vblank the flip latched in, as DRM counts it.
                     Ok(Some((before, after))) => {
                         let latched = read_vblank(boot, display);
@@ -3990,6 +4227,10 @@ async fn presenter(display: u8) {
                     }
                     // Nothing this lighting shows: complete in place.
                     Ok(None) => Ok(None),
+                    // Refused before any register changed (a client
+                    // framebuffer the plane cannot fetch): the display still
+                    // scans out what it showed.
+                    Err(_) if boot.display_fetched_addresses(display).is_some() => Ok(None),
                     Err(e) => Err(e),
                 },
                 None => Err(crate::amdgpu_dcn401_otg::Error::Busy),
@@ -4011,22 +4252,45 @@ async fn presenter(display: u8) {
     }
 }
 
-/// Copy each plane of `frame` into its back buffer on display `pipe`'s
-/// live scanout, then flip those planes together. Returns the published
-/// front before and after, or None when the frame updates no plane the
-/// display shows.
+/// GPU writes still landing in a frame's client framebuffers: wait (up to
+/// amdgpu_dm_commit_planes' 5 s, polling) for each pinned buffer's WRITE
+/// fences, as dma_resv_wait_timeout(DMA_RESV_USAGE_WRITE) does before the
+/// flip. A timed-out wait flips anyway, as Linux does after its error.
+async fn wait_scanout_writes(frame: &Frame) {
+    let deadline = narf_time::Deadline::after_ms(5_000);
+    let planes = frame.primary.iter().chain(frame.overlays.iter().flatten());
+    for pin in planes.filter_map(|f| f.bo.as_ref()) {
+        let resv = &pin.object().dma_buf().resv;
+        while !resv
+            .fences(narf_filesystem::dma_buf::DmaResvUsage::Write)
+            .is_empty()
+            && !deadline.expired()
+        {
+            narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
+        }
+    }
+}
+
+/// Show each plane of `frame` on display `pipe`'s live scanout, then flip
+/// those planes together: a pinned GEM framebuffer in place (no copy, its
+/// pin kept until a later flip latches past it), a dumb one copied into
+/// the plane's back buffer first. Returns the published front's CPU view
+/// before and after (none for a client framebuffer, which has none), or
+/// None when the frame updates no plane the display shows.
 /// # Safety
-/// The caller holds the owner lock; `frame` names mapped dumb buffers.
+/// The caller holds the owner lock; `frame` names mapped dumb buffers or
+/// pinned GEM buffers.
 async unsafe fn present_native(
     boot: &mut boot::ColdBoot,
     pipe: u8,
-    frame: Frame,
-) -> Result<Option<(GenericFb, GenericFb)>, crate::amdgpu_dcn401_otg::Error> {
+    frame: &Frame,
+) -> Result<Option<(Option<GenericFb>, Option<GenericFb>)>, crate::amdgpu_dcn401_otg::Error> {
     // A previous presenter may have been cancelled while draining the old
     // front after a successful flip. Finish that barrier before reusing it.
     crate::scanout_access::wait_retired().await;
     let shown = *present_slot(pipe).shown.lock();
-    let mut planes = 0u8;
+    let mut sources = [None; 1 + crate::amdgpu_dcn401_otg::MAX_OVERLAYS];
+    let mut pins = Vec::new();
     // A frame of another tiling than the plane shows waits for the relight
     // that switches it, as one of another format does.
     let surface_of = |g: Option<boot::PlaneGeometry>| {
@@ -4034,12 +4298,11 @@ async unsafe fn present_native(
             g.surface
         })
     };
-    if let Some(f) = frame.primary {
+    if let Some(f) = &frame.primary {
         let g = shown.planes.primary;
         if f.tiling() == Some(surface_of(g).tiling) {
             // SAFETY: the caller's obligations.
-            unsafe { copy_plane(boot, pipe, pipe, f, g) }.await?;
-            planes |= 1;
+            sources[0] = unsafe { place_plane(boot, pipe, pipe, f, g) }.await?;
         }
     }
     for (k, f) in frame.overlays.iter().enumerate() {
@@ -4054,17 +4317,57 @@ async unsafe fn present_native(
             continue;
         }
         // SAFETY: the caller's obligations.
-        unsafe { copy_plane(boot, pipe, q, *f, Some(o.geometry)) }.await?;
-        planes |= 1 << (k + 1);
+        sources[k + 1] = unsafe { place_plane(boot, pipe, q, f, Some(o.geometry)) }.await?;
     }
-    if planes == 0 {
+    for (source, f) in sources
+        .iter()
+        .zip(core::iter::once(&frame.primary).chain(frame.overlays.iter()))
+    {
+        if let (Some(crate::amdgpu_dcn401_otg::FlipSource::External(_)), Some(f)) = (source, f) {
+            pins.extend(f.bo.clone());
+        }
+    }
+    if sources.iter().all(Option::is_none) {
         return Ok(None);
     }
-    let before = boot.display_scanout_framebuffer(pipe)?;
+    let before = boot.display_scanout_framebuffer(pipe).ok();
     // SAFETY: the back buffers hold the complete frame; no other writer
-    // touches them until the next flip (the owner lock is held).
-    unsafe { boot.flip_display_planes(pipe, planes).await }?;
-    Ok(Some((before, boot.display_scanout_framebuffer(pipe)?)))
+    // touches them until the next flip (the owner lock is held); the client
+    // framebuffers stay pinned (`pins`, then the slot's) until retired.
+    unsafe { boot.flip_display_sources(pipe, sources).await }?;
+    present_slot(pipe).pins.lock().extend(pins);
+    retire_scanout_pins(boot, pipe);
+    Ok(Some((before, boot.display_scanout_framebuffer(pipe).ok())))
+}
+
+/// What plane `plane_pipe` of display `display` (shown with geometry `g`;
+/// none: the full-frame primary) flips to for framebuffer `f`: a pinned
+/// GEM framebuffer in place, as DC fetches a framebuffer, from the source
+/// rectangle's origin when the plane's surface is that rectangle (linear
+/// RGB) and from the framebuffer's start when it is the whole framebuffer
+/// (tiled, DCC, 4:2:0: SPL's viewport places the rectangle); a dumb
+/// framebuffer copied into the back buffer (`copy_plane`). None when a
+/// GEM framebuffer cannot be fetched there (another size than the whole-
+/// framebuffer surface, or a misaligned start), which keeps the plane's
+/// content.
+/// # Safety
+/// As for `present_native`.
+async unsafe fn place_plane(
+    boot: &mut boot::ColdBoot,
+    display: u8,
+    plane_pipe: u8,
+    f: &PlaneFrame,
+    g: Option<boot::PlaneGeometry>,
+) -> Result<Option<crate::amdgpu_dcn401_otg::FlipSource>, crate::amdgpu_dcn401_otg::Error> {
+    use crate::amdgpu_dcn401_otg::FlipSource;
+    if f.bo.is_none() {
+        // SAFETY: the caller's obligations.
+        unsafe { copy_plane(boot, display, plane_pipe, f, g) }.await?;
+        return Ok(Some(FlipSource::Back));
+    }
+    let format =
+        SurfaceFormat::from_fourcc(f.format).ok_or(crate::amdgpu_dcn401_otg::Error::Invalid)?;
+    Ok(external_source(f, format, g).map(FlipSource::External))
 }
 
 /// Copy framebuffer `f` into the back buffer of display `display`'s plane
@@ -4078,7 +4381,7 @@ async unsafe fn copy_plane(
     boot: &mut boot::ColdBoot,
     display: u8,
     plane_pipe: u8,
-    f: PlaneFrame,
+    f: &PlaneFrame,
     g: Option<boot::PlaneGeometry>,
 ) -> Result<(), crate::amdgpu_dcn401_otg::Error> {
     let format =
@@ -4132,7 +4435,7 @@ async unsafe fn copy_whole_plane(
     boot: &mut boot::ColdBoot,
     display: u8,
     plane_pipe: u8,
-    f: PlaneFrame,
+    f: &PlaneFrame,
     format: SurfaceFormat,
     g: boot::PlaneGeometry,
 ) -> Result<(), crate::amdgpu_dcn401_otg::Error> {
@@ -5164,6 +5467,15 @@ fn admits_with_format(
 /// automatic routing), as drm_fb_helper restores the console on lastclose.
 pub fn restore_displays() {
     release_drm_cursors();
+    // drm_fb_helper's restore commit takes every plane off the closed
+    // clients' framebuffers (their pins go after it latches).
+    narf_scheduler::spawn(async {
+        let mut owner = OWNER.lock().await;
+        if let Some(boot) = owner.as_mut() {
+            // SAFETY: OWNER serializes display writers.
+            let _ = unsafe { release_client_scanout(boot) }.await;
+        }
+    });
     let mut outputs = OUTPUTS.lock();
     for c in outputs.crtcs.iter_mut() {
         c.active = true;
@@ -5801,6 +6113,8 @@ pub async unsafe fn monitor_displays(
     converge_vrr(boot);
     // Nor do CRTC color and HDR metadata changes.
     converge_streams(boot).await;
+    // Client framebuffers a relight, plane update or stop let go of.
+    retire_all_scanout_pins(boot);
     // Frames that waited for this pass's relight in a new plane format.
     kick_presenters();
     // DRM cursors on the pipes this pass lit (amdgpu_dm commits the cursor
@@ -7229,6 +7543,7 @@ mod tests {
             address: 0x8_0000_0000,
             pitch_bytes: 256,
             bytes: 256 * u64::from(height),
+            chroma: None,
         };
         let overlay = boot::OverlayPlane {
             geometry: boot::PlaneGeometry {
@@ -7248,7 +7563,8 @@ mod tests {
         };
         let mut setup = boot::PlaneSetup::NONE;
         setup.overlays[1] = Some(overlay);
-        let mut overlays = [None; crate::amdgpu_dcn401_otg::MAX_OVERLAYS];
+        let mut overlays: [Option<PlaneFrame>; crate::amdgpu_dcn401_otg::MAX_OVERLAYS] =
+            core::array::from_fn(|_| None);
         overlays[1] = Some(fb(AR24));
         let mut frames = CommitFrames {
             display: 0,
@@ -7260,6 +7576,7 @@ mod tests {
             })),
             format: SurfaceFormat::Xrgb8888,
             setup,
+            pins: Vec::new(),
         };
         let mut words = Vec::new();
         let primary = surface(0, 32, 32, SurfaceFormat::Xrgb8888);
@@ -7319,6 +7636,119 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/navi48-kms",
         navi48_commit_frames_fill_fresh_surfaces
+    );
+
+    /// A commit frame's pinned GEM framebuffer is a fresh plane's first
+    /// frame in place (`CommitFrames::external`): the update gets its GPU
+    /// address and pitch, no chunk is copied (its CPU source is nothing the
+    /// presenter may read), and the pin is kept for the display once the
+    /// update programs it.
+    fn navi48_commit_frames_scan_gem_framebuffers_in_place() -> TestResult {
+        use crate::amdgpu_dcn401_otg::{PlaneSurface, SplitPipes, SurfaceApplied, SurfaceRequest};
+        use crate::amdgpu_gem::{GemState, VramHeap};
+        use crate::amdgpu_uapi as u;
+        use boot::FirstFrames;
+        const CARD: u32 = 0xfee9;
+        const XR24: u32 = 0x3432_5258;
+        let mut memory = alloc::vec![0u8; 64 * 4096];
+        let map = narf_bus::MmioRegion {
+            phys: narf_memory::PhysAddr::new(0xb500_0000),
+            virt: memory.as_mut_ptr() as u64,
+            len: memory.len() as u64,
+            kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+        };
+        // SAFETY: the test owns `memory` until the heap and buffer drop.
+        let pool =
+            unsafe { crate::amdgpu_vram::Pool::from_owned_range(map, 0x8_3000_0000) }.unwrap();
+        crate::amdgpu_gem::register_vram_heap(
+            CARD,
+            VramHeap {
+                pool,
+                fb_base: 0x8_0000_0000,
+                fb_offset: 0x9_0000_0000,
+                unmapped: None,
+            },
+        );
+        let gem = GemState::for_card(CARD);
+        let mut b = [0u8; 32];
+        b[0..8].copy_from_slice(&(128u64 * 64 * 4).to_le_bytes());
+        b[16..24].copy_from_slice(&u64::from(u::AMDGPU_GEM_DOMAIN_VRAM).to_le_bytes());
+        let nr = 0xc000_0000 | (0x64 << 8) | (0x40 + u::DRM_AMDGPU_GEM_CREATE);
+        let result = (|| {
+            crate::amdgpu_gem::dispatch(nr, b.as_mut_ptr() as usize, &gem)
+                .map_err(|_| "GEM_CREATE")?;
+            let object = gem
+                .object(u32::from_le_bytes(b[0..4].try_into().unwrap()))
+                .ok_or("GEM object")?;
+            let pin = Arc::new(object.pin_scanout().map_err(|_| "pin")?);
+            // A 64x64 full-frame primary from a 128-pixel-pitch buffer.
+            let f = PlaneFrame {
+                bo: Some(pin.clone()),
+                ..PlaneFrame::linear(0, 512, 64, 64, XR24)
+            };
+            let mut frames = CommitFrames {
+                display: 0,
+                frame: Some(Some(Frame {
+                    primary: Some(f),
+                    overlays: core::array::from_fn(|_| None),
+                    ticket: None,
+                    queued_ns: 0,
+                })),
+                format: SurfaceFormat::Xrgb8888,
+                setup: boot::PlaneSetup::NONE,
+                pins: Vec::new(),
+            };
+            let request = SurfaceRequest {
+                pipe: 0,
+                width: 64,
+                height: 64,
+                format: SurfaceFormat::Xrgb8888,
+                odm: SplitPipes::NONE,
+                mpc: SplitPipes::NONE,
+                plane: None,
+                surface: PlaneSurface::LINEAR,
+            };
+            let a = SurfaceApplied::staged(request, 0x8_0000_0000, 256, 256 * 64);
+            let mut words = Vec::new();
+            if frames.chunk(0, &a, 0, &mut words).is_some() {
+                return Err("a GEM framebuffer copied");
+            }
+            let x = frames.external(0, &a).ok_or("no in-place surface")?;
+            if x.address != pin.address()
+                || x.pitch_bytes != 512
+                || x.chroma.is_some()
+                || frames.pins.len() != 1
+                || !Arc::ptr_eq(&frames.pins[0], &pin)
+            {
+                return Err("in-place surface or its pin");
+            }
+            // A dumb frame has no in-place surface.
+            frames.frame = Some(Some(Frame {
+                primary: Some(PlaneFrame::linear(0x1000, 256, 64, 64, XR24)),
+                overlays: core::array::from_fn(|_| None),
+                ticket: None,
+                queued_ns: 0,
+            }));
+            if frames.external(0, &a).is_some() {
+                return Err("a dumb framebuffer scanned in place");
+            }
+            drop(frames);
+            drop(pin);
+            if object.pinned() {
+                return Err("pin outlived its holders");
+            }
+            Ok(())
+        })();
+        drop(gem);
+        crate::amdgpu_gem::unregister_vram_heap(CARD);
+        match result {
+            Ok(()) => TestResult::Pass,
+            Err(why) => TestResult::Fail(why),
+        }
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi48-kms",
+        navi48_commit_frames_scan_gem_framebuffers_in_place
     );
 
     /// Plane configurations are requested per display and admitted against

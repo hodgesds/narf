@@ -211,6 +211,7 @@ fn plane(
         address: 0x8_0010_0000,
         pitch_bytes: width * 4,
         bytes: u64::from(width * 4 * height),
+        chroma: None,
     }
 }
 /// The pipes `stream_cursor_pipes` derives from planes (through SPL) are
