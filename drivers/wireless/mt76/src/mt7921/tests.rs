@@ -72,8 +72,8 @@ fn smoke_mt7921_name_for_known_ids() -> TestResult {
     if name_for(MTK_DEV_MT7921) != "mt7921-0608" {
         return TestResult::Fail("MT7921 (0608) name mismatch");
     }
-    if name_for(MTK_DEV_MT7921_ALT) != "mt7921-0616" {
-        return TestResult::Fail("MT7921 (0616) name mismatch");
+    if name_for(MTK_DEV_MT7921_ALT) != "mt7922-0616" {
+        return TestResult::Fail("MT7922 PCI alias (0616) name mismatch");
     }
     if name_for(MTK_DEV_MT7920) != "mt7921-7920" {
         return TestResult::Fail("MT7920 name mismatch");
