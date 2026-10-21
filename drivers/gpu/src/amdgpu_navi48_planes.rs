@@ -53,12 +53,17 @@ impl FirstFrames for otg::Cleared {
         None
     }
 }
-/// `FirstFrames` addressed by the pipe each plane is staged on.
+/// `FirstFrames` addressed by the pipe each plane is staged on; `moved`
+/// the pipes (by bit) another plane than before lands on.
 struct BySlot<'a> {
     pipes: [Option<u8>; 1 + otg::MAX_OVERLAYS],
+    moved: u8,
     frames: &'a mut dyn FirstFrames,
 }
 impl otg::PlaneContent for BySlot<'_> {
+    fn moved_to(&mut self, pipe: u8) -> bool {
+        self.moved & 1u8.checked_shl(u32::from(pipe)).unwrap_or(0) != 0
+    }
     fn chunk(&mut self, a: &otg::SurfaceApplied, index: u32, words: &mut Vec<u32>) -> Option<u64> {
         let slot = self.pipes.iter().position(|&p| p == Some(a.request.pipe))?;
         self.frames.chunk(slot, a, index, words)
@@ -110,6 +115,41 @@ pub fn planes_reset(
             }
             _ => true,
         })
+}
+
+/// The pipes (by bit) on which a plane of `new` (overlays on `new_pipes`)
+/// lands where another plane of `old` (overlays on `old_pipes`) was: the
+/// primary stays on the head pipe, an overlay is its DRM plane (by id, by
+/// slot when one is unknown).
+pub(super) fn moved_planes(
+    old: &PlaneSetup,
+    old_pipes: &[Option<u8>; otg::MAX_OVERLAYS],
+    new: &PlaneSetup,
+    new_pipes: &[Option<u8>; otg::MAX_OVERLAYS],
+) -> u8 {
+    let identity = |s: &PlaneSetup, k: usize| {
+        s.overlays[k].map(|o| {
+            if o.plane != 0 {
+                (o.plane, 0)
+            } else {
+                (0, k + 1)
+            }
+        })
+    };
+    let mut moved = 0u8;
+    for (k, &pipe) in new_pipes.iter().enumerate() {
+        let (Some(pipe), Some(id)) = (pipe, identity(new, k)) else {
+            continue;
+        };
+        let before = old_pipes
+            .iter()
+            .position(|&p| p == Some(pipe))
+            .and_then(|j| identity(old, j));
+        if before.is_some_and(|b| b != id) {
+            moved |= 1u8.checked_shl(u32::from(pipe)).unwrap_or(0);
+        }
+    }
+    moved
 }
 
 /// Every pipe of display `m`'s planes with its plane's DPPCLK under `plan`.
@@ -262,11 +302,18 @@ impl ColdBoot {
             overlays: overlay_requests,
             reset,
         };
+        let new_pipes = overlays.map(|p| p.map(|p| p.pipe));
         let mut content = BySlot {
             pipes: core::array::from_fn(|k| match k {
                 0 => Some(display),
-                k => overlays[k - 1].map(|p| p.pipe),
+                k => new_pipes[k - 1],
             }),
+            moved: moved_planes(
+                &m.selection.planes,
+                &m.scanout.overlays.map(|o| o.map(|o| o.pipe)),
+                &setup,
+                &new_pipes,
+            ),
             frames,
         };
         // SAFETY: the caller's obligations, CPU views of replaced surfaces

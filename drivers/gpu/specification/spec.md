@@ -4746,7 +4746,12 @@ register changes and the display keeps scanning what it showed.
 with (`SurfaceApplied::staged` / `at_staged` for the staged buffers); a
 plane flipped to a client framebuffer keeps both staged buffers unfetched,
 a flip back to its back buffer swaps them as before; a seamless plane
-update keeps a kept plane's client framebuffer with its pitch, and one that
+update keeps a kept plane's client framebuffer with its pitch (only the
+same plane keeps a surface: another plane that lands on the pipe, a
+recreated one taking the pipe a removed one held, gets a fresh surface
+with its first frame however alike the old allocation is,
+`otg::PlaneContent::moved_to` from `planes::moved_planes` by DRM plane id,
+so it never latches showing the other plane's image), and one that
 puts a plane on fresh surfaces scans the commit's GEM framebuffer in place
 from the update itself (`otg::PlaneContent::external` through
 `boot::FirstFrames::external` and the platform's `CommitFrames`: the update

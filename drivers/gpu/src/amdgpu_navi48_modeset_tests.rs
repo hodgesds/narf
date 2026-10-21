@@ -4273,12 +4273,22 @@ fn navi48_live_plane_pipes_follow_dc() -> TestResult {
     {
         return TestResult::Fail("recreated overlay comes back to its pipe");
     }
-    // A removed and C added: C takes the tree's pipe A held.
+    // A removed and C added: C takes the tree's pipe A held, and is
+    // another plane than the one there: it takes a fresh surface with its
+    // own first frame however alike A's surface is (`moved_planes`).
     let with_c = live_setup(&[live_overlay(0x46, 400)]);
     let plan_c = live_plan(&m, &with_c);
-    if live_overlay_pipes(live_on(&m, &[&other3], &with_c, &plan_c)) != Some([Some(2), None, None])
-    {
+    let pipes_c = live_overlay_pipes(live_on(&m, &[&other3], &with_c, &plan_c));
+    if pipes_c != Some([Some(2), None, None]) {
         return TestResult::Fail("freed pipe reused");
+    }
+    let old_pipes = [Some(2), None, None];
+    if super::planes::moved_planes(&with_a, &old_pipes, &with_c, &old_pipes) != 1 << 2
+        || super::planes::moved_planes(&with_a, &old_pipes, &with_a, &old_pipes) != 0
+        || super::planes::moved_planes(&with_a, &old_pipes, &with_ba, &[Some(1), Some(2), None])
+            != 0
+    {
+        return TestResult::Fail("plane moved onto another's pipe");
     }
     // A only moved: no plane is recreated and it keeps its pipe.
     let moved = live_setup(&[live_overlay(0x44, 300)]);

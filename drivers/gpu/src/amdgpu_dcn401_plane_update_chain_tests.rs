@@ -130,8 +130,13 @@ struct Pattern {
     seen: Vec<usize>,
     /// Hand back a chunk past the surface's end instead.
     outside: bool,
+    /// Another plane than before lands on pipe `q`.
+    moved: bool,
 }
 impl PlaneContent for Pattern {
+    fn moved_to(&mut self, pipe: u8) -> bool {
+        self.moved && pipe == self.q
+    }
     fn chunk(&mut self, a: &SurfaceApplied, index: u32, words: &mut Vec<u32>) -> Option<u64> {
         if a.request.pipe != self.q || index >= a.request.height {
             return None;
@@ -554,6 +559,7 @@ pub(super) fn dcn401_live_plane_update_shows_the_first_frame_at_the_latch_on(
         writes: c.e.io.inner.writes.clone(),
         seen: Vec::new(),
         outside: true,
+        moved: false,
     };
     if update_with(&mut c, &live(base, &[overlay]), &plan, &mut content) != Err(Error::Invalid)
         || !c.e.io.inner.inner.writes.is_empty()
@@ -584,6 +590,32 @@ pub(super) fn dcn401_live_plane_update_shows_the_first_frame_at_the_latch_on(
     }
     if !stream_untouched(&c) || optimize(&mut c, &plan).is_err() || run(c.check()).is_err() {
         return TestResult::Fail("check with the overlay");
+    }
+    // The same plane again keeps its surface and what it shows; another
+    // plane landing on the pipe (a recreated plane moved onto it) takes a
+    // fresh surface with its own first frame, however alike the old
+    // surface's allocation is.
+    content.seen.clear();
+    if update_with(&mut c, &live(base, &[overlay]), &plan, &mut content).is_err()
+        || !content.seen.is_empty()
+        || c.e.status.surfaces[usize::from(q)].map(|s| s.address) != Some(a.address)
+    {
+        return TestResult::Fail("the same plane's surface not kept");
+    }
+    content.moved = true;
+    let Ok(u) = update_with(&mut c, &live(base, &[overlay]), &plan, &mut content) else {
+        return TestResult::Fail("another plane onto the pipe");
+    };
+    let Some(moved) = u.scanout.overlays[0] else {
+        return TestResult::Fail("moved overlay scanout record");
+    };
+    if content.seen.len() != 64
+        || moved.address == o.address
+        || c.vram(moved.address, 0) != 0xff00_0000
+        || optimize(&mut c, &plan).is_err()
+        || run(c.check()).is_err()
+    {
+        return TestResult::Fail("a plane moved onto the pipe kept the other plane's surface");
     }
     TestResult::Pass
 }

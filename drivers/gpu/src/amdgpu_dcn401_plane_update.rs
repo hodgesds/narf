@@ -181,6 +181,15 @@ pub trait PlaneContent: Send {
     fn external(&mut self, _a: &SurfaceApplied) -> Option<ExternalSurface> {
         None
     }
+    /// Whether the plane the update puts on pipe `pipe` is another plane
+    /// than the one there before (a recreated plane moved onto it): it then
+    /// takes a fresh surface with this content even where the old surface
+    /// has its allocation, so the update never latches with the other
+    /// plane's image on it (DC programs a recreated plane's framebuffer
+    /// address in the update that adds it).
+    fn moved_to(&mut self, _pipe: u8) -> bool {
+        false
+    }
 }
 /// No first content: fresh surfaces stay cleared until the next flip.
 #[derive(Clone, Copy, Debug, Default)]
@@ -722,9 +731,10 @@ impl Surfaces {
         } else {
             UpdateType::Fast
         });
-        // Each plane's buffers: the same allocation on the same pipes keeps
-        // the surface (and what it shows), any other takes a fresh, cleared
-        // one, unpublished until the hardware is told of it.
+        // Each plane's buffers: the same plane with the same allocation on
+        // the same pipes keeps the surface (and what it shows), any other
+        // (another plane moved onto the pipe included) takes a fresh,
+        // cleared one, unpublished until the hardware is told of it.
         let mut applied: Vec<SurfaceApplied> = Vec::with_capacity(planes.len());
         let mut fresh: Vec<Surface> = Vec::new();
         for (k, s) in planes.iter().enumerate() {
@@ -737,6 +747,7 @@ impl Surfaces {
                         && x.applied.request.same_allocation(*s)
                         && e.status.surfaces[at] == Some(x.applied)
                 })
+                .filter(|_| !content.moved_to(s.pipe))
                 .map(|x| x.applied);
             if let Some(x) = kept {
                 // The plane keeps fetching what it shows, a client
