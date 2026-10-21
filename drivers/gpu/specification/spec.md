@@ -397,13 +397,20 @@ fused/user disable registers (`amdgpu_gfx12_topology`), so a 9070 GRE or
 9060 XT reports its own CU, RB and bitmap. VRAM size is `RCC_CONFIG_MEMSIZE`;
 type and bus width are VBIOS `umc_info`; DML's channel count is DALSMC
 `GetNumUmcChannels`; DPM clocks, PPT limits, thermal limits and fan range are
-the PMFW board table. The usable DCN pipe count is `CC_DC_PIPE_DIS`
+the PMFW board table. The DCN resource pool comes from `CC_DC_PIPE_DIS`
 (`dcn_4_1_0_offset.h` 0xca, BASE_IDX 2): `unsafe
-amdgpu_rdna4::read_display_pipes` reads it once at cold boot and
-`publish_pipes` caps DML's TotalAvailablePipesSupport
-(`available_pipes()`). Linux compacts surviving pipes into indices; NARF
-addresses pipes by hardware instance, so it uses the unbroken run of working
-pipes from instance 0 (`usable_pipes`), refusing display if pipe 0 is fused.
+amdgpu_rdna4::read_pipe_pool` reads it once at cold boot and
+`publish_pipe_pool` records the `PipePool` (`pipe_pool()`) before any
+display owner is built. `PipePool` is `dcn401_resource_construct`'s packing:
+`count()` surviving pipes, pipe index `j` (`pipes()`, `all()`) backed by
+the `j`-th unfused instance (`hw(j)`, inverse `pipe(inst)`, `hw_mask` /
+`pipe_mask` by bit) for its HUBP, DPP, OPP, OTG and MPCC, and DSC `j`
+(`dsc(j)`, dcn20_acquire_dsc's one-to-one map; all four DSCs survive).
+`tests/rdna4_family/check.sh` compiles Linux's construct loop, MPC/DSC
+creation, `max_streams` and `dcn20_acquire_dsc` around `pipe_pool.c` and
+prints every fuse value's pool (`pipe_pool.txt`);
+`rdna4_pipe_pool_matches_linux_harvesting` holds `PipePool` to it.
+`available_pipes()` caps DML's TotalAvailablePipesSupport.
 
 **Audio.** Navi44 boards expose the same `1002:ab40` HDMI/DP audio function
 (Linux `hda_intel.c` lists only `ab40` for RDNA4); runtime PM finds it as PCI

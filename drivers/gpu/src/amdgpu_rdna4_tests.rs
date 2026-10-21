@@ -154,19 +154,12 @@ fn rdna4_per_die_policy_matches_linux() -> TestResult {
     {
         return TestResult::Fail("MALL channel arithmetic");
     }
-    if usable_pipes(0) != Some(4)
-        || usable_pipes(0x8) != Some(3)
-        || usable_pipes(0xc) != Some(2)
-        || usable_pipes(0xe) != Some(1)
-        || usable_pipes(0xf).is_some()
-        || usable_pipes(0x1).is_some()
-        // A fused middle pipe stops the run at instance 1.
-        || usable_pipes(0x2) != Some(1)
-        || usable_pipes(0x4) != Some(2)
-        // Bits above DCN401's four are ignored, as read_pipe_fuses masks them.
-        || usable_pipes(0x1_1000) != Some(4)
+    // Bits above DCN401's four are ignored, as read_pipe_fuses masks them
+    // (DC_FULL_DIS included: Linux's check of it after the mask never fires).
+    if PipePool::from_fuses(0x1_1100) != PipePool::FULL
+        || PipePool::from_fuses(0x12) != PipePool::from_fuses(2)
     {
-        return TestResult::Fail("CC_DC_PIPE_DIS harvesting");
+        return TestResult::Fail("CC_DC_PIPE_DIS bits above the four pipes");
     }
     TestResult::Pass
 }
@@ -222,6 +215,78 @@ kernel_test_in!(
 /// Linux tree.
 const POLICY: &str = include_str!("../tests/rdna4_family/policy.txt");
 const FIRMWARE: &str = include_str!("../tests/rdna4_family/firmware.txt");
+/// Linux's resource pool per CC_DC_PIPE_DIS value (pipe_pool.c).
+const PIPE_POOL: &str = include_str!("../tests/rdna4_family/pipe_pool.txt");
+
+/// The pool line pipe_pool.c prints for `fuses`.
+fn pool_line(fuses: u32) -> alloc::string::String {
+    use alloc::{format, string::String, vec::Vec};
+    let pool = PipePool::from_fuses(fuses);
+    let list = |f: &dyn Fn(u8) -> u8| {
+        pool.pipes()
+            .map(|p| format!("{}", f(p)))
+            .collect::<Vec<String>>()
+            .join(",")
+    };
+    let hw = list(&|p| pool.hw(p));
+    let fuses = if fuses == 0 {
+        String::from("0")
+    } else {
+        format!("{fuses:#x}")
+    };
+    format!(
+        "{fuses} pipes={n} mpccs={mpccs} streams={n} hubp={hw} dpp={hw} opp={hw} tg={hw} abm={hw} \
+         mpcc={hw} dsc={dsc}",
+        n = pool.count(),
+        mpccs = DCN401_PIPES,
+        dsc = list(&|p| pool.dsc(p)),
+    )
+}
+
+fn rdna4_pipe_pool_matches_linux_harvesting() -> TestResult {
+    let lines: alloc::vec::Vec<&str> = PIPE_POOL
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+        .collect();
+    if lines.len() != 16 {
+        return TestResult::Fail("pipe_pool.txt lists every CC_DC_PIPE_DIS value");
+    }
+    for (fuses, line) in (0..16u32).zip(lines) {
+        if pool_line(fuses) != line {
+            return TestResult::Fail("PipePool differs from Linux's resource pool");
+        }
+        // The inverse map: every surviving instance names its pipe index,
+        // and no fused one does.
+        let pool = PipePool::from_fuses(fuses);
+        for inst in 0..4u8 {
+            let fused = fuses & 1 << inst != 0;
+            match pool.pipe(inst) {
+                Some(p) if !fused && pool.hw(p) == inst => {}
+                None if fused => {}
+                _ => return TestResult::Fail("PipePool::pipe is not hw's inverse"),
+            }
+        }
+        if pool.hw_mask(pool.all()) != 0xf & !(fuses as u8)
+            || pool.pipe_mask(0xf) != pool.all()
+            || pool.pipe_mask(fuses as u8) != 0
+        {
+            return TestResult::Fail("PipePool masks");
+        }
+        // Pipe indices past the pool continue over the fused instances.
+        let mut seen = 0u8;
+        for p in 0..4u8 {
+            seen |= 1 << pool.hw(p);
+        }
+        if seen != 0xf {
+            return TestResult::Fail("PipePool::hw is not a permutation");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/rdna4",
+    rdna4_pipe_pool_matches_linux_harvesting
+);
 
 fn rdna4_tables_match_linux_policy_and_firmware() -> TestResult {
     use alloc::{format, string::String, vec::Vec};

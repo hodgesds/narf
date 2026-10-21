@@ -347,16 +347,117 @@ pub const CC_DC_PIPE_DIS: u32 = 0x00ca;
 /// `res_cap_dcn4_01.num_timing_generator`.
 pub const DCN401_PIPES: u32 = 4;
 
-/// `dcn401_resource_construct`'s pipe harvesting: `read_pipe_fuses` keeps
-/// the four DCN401 bits of `CC_DC_PIPE_DIS`; each set bit removes one pipe.
-/// Linux then compacts the surviving pipes into indices 0..n. This driver
-/// addresses pipes by their hardware instance, so it uses the unbroken run
-/// of working pipes from instance 0: equal to Linux's count when the top
-/// pipes are fused, fewer when a middle one is. Pipe 0 fused (Linux asserts)
-/// leaves no display.
-pub fn usable_pipes(cc_dc_pipe_dis: u32) -> Option<u32> {
-    let pipes = (cc_dc_pipe_dis & 0xf).trailing_zeros().min(DCN401_PIPES);
-    (pipes > 0).then_some(pipes)
+/// `dcn401_resource_construct`'s resource pool: which hardware instance
+/// backs each of DC's pipe indices once `CC_DC_PIPE_DIS` has removed the
+/// fused pipes.
+///
+/// `read_pipe_fuses` keeps the four DCN401 bits; each set bit removes that
+/// pipe. The construct loop (`for (i = 0, j = 0; i < num_timing_generator;
+/// i++) { if (pipe_fuses & 1 << i) continue; ... j++; }`) packs the
+/// surviving instances into pool slots 0..`pipe_count`: slot `j`'s HUBP,
+/// DPP, OPP, timing generator and ABM are all instance `i`, the `j`-th
+/// unfused one. A pipe index (`pipe_ctx->pipe_idx`, the CRTC here) is a
+/// slot; every block programmed for it is addressed by the slot's instance
+/// (`hubps[j]->inst`, `dpps[j]->inst`, `opps[j]->inst`, `tg->inst`), and its
+/// MPCC is its DPP's (`plane_res.mpcc_inst = dpps[j]->inst`). The MPC keeps
+/// all four MPCCs and the pool all four DSCs (`res_cap->num_dsc`), unfused;
+/// `dcn20_acquire_dsc` gives pipe index `j` DSC `j` (one to one, as num_dsc
+/// equals res_cap's num_opp), so a DSC follows the pipe index while its OPP
+/// source is the slot's OPP instance. Pipe 0 fused (Linux asserts and
+/// continues) leaves instances 1-3 in slots 0-2; all four fused leave no
+/// pipe and no display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PipePool {
+    fuses: u8,
+}
+impl PipePool {
+    /// No pipe fused: every slot its own instance.
+    pub const FULL: Self = Self { fuses: 0 };
+    /// The pool `read_pipe_fuses` builds from a `CC_DC_PIPE_DIS` value.
+    pub const fn from_fuses(cc_dc_pipe_dis: u32) -> Self {
+        Self {
+            fuses: (cc_dc_pipe_dis & 0xf) as u8,
+        }
+    }
+    /// The fused instances, by bit.
+    pub const fn fuses(self) -> u8 {
+        self.fuses
+    }
+    /// `pool->base.pipe_count` (also its timing generator and MPCC counts).
+    pub const fn count(self) -> u8 {
+        DCN401_PIPES as u8 - self.fuses.count_ones() as u8
+    }
+    /// The pipe indices, 0..`count`.
+    pub fn pipes(self) -> core::ops::Range<u8> {
+        0..self.count()
+    }
+    /// Every pipe index, by bit.
+    pub const fn all(self) -> u8 {
+        ((1u16 << self.count()) - 1) as u8
+    }
+    /// The hardware instance of pipe `pipe`'s HUBP, DPP, OPP, OTG and MPCC.
+    /// Indices past `count` continue over the fused instances in order, so
+    /// the map is a permutation of 0..4 (the identity from 4 up); nothing
+    /// programs such a pipe.
+    pub const fn hw(self, pipe: u8) -> u8 {
+        if pipe >= DCN401_PIPES as u8 {
+            return pipe;
+        }
+        let fused = pipe >= self.count();
+        let want = if fused { pipe - self.count() } else { pipe };
+        let mut seen = 0u8;
+        let mut inst = 0u8;
+        while inst < DCN401_PIPES as u8 {
+            if (self.fuses >> inst & 1 != 0) == fused {
+                if seen == want {
+                    return inst;
+                }
+                seen += 1;
+            }
+            inst += 1;
+        }
+        pipe
+    }
+    /// The pipe index whose blocks are hardware instance `inst`; `None` for
+    /// a fused (or nonexistent) instance.
+    pub const fn pipe(self, inst: u8) -> Option<u8> {
+        if inst >= DCN401_PIPES as u8 || self.fuses >> inst & 1 != 0 {
+            return None;
+        }
+        Some(inst - (self.fuses & ((1 << inst) - 1)).count_ones() as u8)
+    }
+    /// The instances of the pipes in `pipes` (by bit), by bit.
+    pub const fn hw_mask(self, pipes: u8) -> u8 {
+        let mut out = 0u8;
+        let mut p = 0u8;
+        while p < DCN401_PIPES as u8 {
+            if pipes >> p & 1 != 0 {
+                out |= 1 << self.hw(p);
+            }
+            p += 1;
+        }
+        out
+    }
+    /// The pipes whose instances are in `insts` (by bit), by bit; fused
+    /// instances drop out.
+    pub const fn pipe_mask(self, insts: u8) -> u8 {
+        let mut out = 0u8;
+        let mut i = 0u8;
+        while i < DCN401_PIPES as u8 {
+            if insts >> i & 1 != 0 {
+                if let Some(p) = self.pipe(i) {
+                    out |= 1 << p;
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+    /// The DSC `dcn20_acquire_dsc` gives pipe `pipe`: its own index, the
+    /// pool keeping all four DSCs.
+    pub const fn dsc(self, pipe: u8) -> u8 {
+        pipe
+    }
 }
 
 struct ReadOp<F>(F);
@@ -372,15 +473,15 @@ impl<F: FnOnce() -> T, T> narf_capabilities::CapOp<narf_bus::BusDeviceCap, narf_
     }
 }
 
-/// Read `CC_DC_PIPE_DIS` and return the usable DCN pipe count, or `None`
-/// when the DCN bank is absent, the device is gone, or pipe 0 is fused.
+/// Read `CC_DC_PIPE_DIS` and return the resource pool it leaves, or `None`
+/// when the DCN bank is absent or the device is gone.
 ///
 /// # Safety
 /// The caller owns this GPU's register mapping; the read has no side effect.
-pub(crate) unsafe fn read_display_pipes(
+pub(crate) unsafe fn read_pipe_pool(
     gpu: &AmdGpu,
     authority: &narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
-) -> Option<u32> {
+) -> Option<PipePool> {
     Rdna4Chip::of(gpu)?;
     let base = crate::amdgpu_psp_ring::bank(
         gpu,
@@ -400,12 +501,12 @@ pub(crate) unsafe fn read_display_pipes(
     if value == u32::MAX {
         return None;
     }
-    usable_pipes(value)
+    Some(PipePool::from_fuses(value))
 }
 
 const NONE: u8 = 0;
 static BOUND: AtomicU8 = AtomicU8::new(NONE);
-static PIPES: AtomicU8 = AtomicU8::new(DCN401_PIPES as u8);
+static FUSES: AtomicU8 = AtomicU8::new(0);
 
 /// Record the die the probe bound. Read by DC policy that has no `AmdGpu`.
 pub(crate) fn publish(chip: Option<Rdna4Chip>) {
@@ -424,13 +525,19 @@ pub fn bound() -> Option<Rdna4Chip> {
         _ => None,
     }
 }
-/// Record `CC_DC_PIPE_DIS`'s usable DCN pipe count.
-pub(crate) fn publish_pipes(pipes: u32) {
-    PIPES.store(pipes.clamp(1, DCN401_PIPES) as u8, Ordering::Release);
+/// Record the resource pool `CC_DC_PIPE_DIS` leaves, before any display
+/// owner is constructed (each keeps the pool it was built with).
+pub(crate) fn publish_pipe_pool(pool: PipePool) {
+    FUSES.store(pool.fuses(), Ordering::Release);
 }
-/// DCN pipes DML may assign; all four until the fuse read says otherwise.
+/// The display resource pool: every pipe until the fuse read says otherwise.
+pub fn pipe_pool() -> PipePool {
+    PipePool::from_fuses(u32::from(FUSES.load(Ordering::Acquire)))
+}
+/// DCN pipes DML may assign. Display still addresses pipes by hardware
+/// instance, so this is the unbroken run of unfused instances from 0.
 pub fn available_pipes() -> u32 {
-    u32::from(PIPES.load(Ordering::Acquire))
+    pipe_pool().fuses().trailing_zeros().min(DCN401_PIPES)
 }
 
 #[cfg(feature = "kernel-test")]

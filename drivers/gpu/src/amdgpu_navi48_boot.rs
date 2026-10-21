@@ -599,12 +599,13 @@ impl ColdBoot {
             .and_then(|bios| inventory::display_paths(gpu, bios.bytes()))
             .map_err(display::Error::Inventory)
             .and_then(display::Probe::new);
-        // dcn401_resource_construct's pipe harvesting: DML admits at most
-        // the unfused pipes (all four when the read is unavailable, which
-        // also leaves the rest of display bring-up to fail on its own).
+        // dcn401_resource_construct's pipe harvesting: the resource pool
+        // every display owner below is built with (all four pipes when the
+        // read is unavailable, which also leaves the rest of display
+        // bring-up to fail on its own).
         // SAFETY: same exclusive register ownership; one read, no writes.
-        if let Some(pipes) = unsafe { crate::amdgpu_rdna4::read_display_pipes(gpu, &authority) } {
-            crate::amdgpu_rdna4::publish_pipes(pipes);
+        if let Some(pool) = unsafe { crate::amdgpu_rdna4::read_pipe_pool(gpu, &authority) } {
+            crate::amdgpu_rdna4::publish_pipe_pool(pool);
         }
         // Linux's DCN crystal (`dce_refclk_10khz`), the reference DDC and the
         // DCHUB global timer both divide.

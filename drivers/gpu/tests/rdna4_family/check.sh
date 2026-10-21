@@ -2,11 +2,12 @@
 # Verify amdgpu_rdna4's per-die tables against the Linux tree:
 #   drivers/gpu/tests/rdna4_family/check.sh [linux-tree]
 #   drivers/gpu/tests/rdna4_family/check.sh --generate [linux-tree]
-# --generate prints policy.txt and firmware.txt (separated by a marker) from
-# Linux; the default mode diffs them against the checked-in copies and
-# compiles layout.c against the Linux register/PMFW headers. The kernel test
-# rdna4_tables_match_linux_policy_and_firmware (amdgpu_rdna4_tests.rs) holds
-# the Rust tables to the same two files.
+# --generate prints policy.txt, firmware.txt and pipe_pool.txt (separated by
+# markers) from Linux; the default mode diffs them against the checked-in
+# copies and compiles layout.c against the Linux register/PMFW headers. The
+# kernel tests rdna4_tables_match_linux_policy_and_firmware and
+# rdna4_pipe_pool_matches_linux_harvesting (amdgpu_rdna4_tests.rs) hold the
+# Rust tables to the same files.
 #
 # DAL names the external-revision ranges the other way round from the IP
 # versions (dal_asic_id.h: GC_12_0_0_A0 = 0x50, GC_12_0_1_A0 = 0x40), so
@@ -154,12 +155,46 @@ done > "$work/golden"
 } | grep -E '/(gc_12_0_[01]|psp_14_0_[23]|smu_14_0_[23]|sdma_7_0_[01]|vcn_5_0_0|dcn_4_0_1)[_.]' \
 	| sort -u > "$work/firmware"
 
+# Pipe harvesting: pipe_pool.c compiled around Linux's own resource-pool
+# construction and DSC acquisition (see its header for the pieces).
+res=$amd/display/dc/resource/dcn401/dcn401_resource.c
+awk '/^static const struct resource_caps res_cap_dcn4_01 = \{/ { on = 1; print "{"; next }
+	on && /^\};/ { print "}"; on = 0 } on' "$res" > "$work/res_cap.inc"
+awk '/^static uint32_t read_pipe_fuses\(/ { on = 1; next } on && /^\{/ { next }
+	on && /^\}/ { on = 0 } on' "$res" > "$work/fuses_read.inc"
+awk '/^static bool dcn401_resource_construct\(/ { fn = 1 }
+	fn && /max number of pipes for ASIC before checking for pipe fuses/ { on = 1 }
+	on && !/pool->base.funcs = / { print }
+	on && /pool->base.mpcc_count = num_pipes;/ { exit }' "$res" > "$work/fuses.inc"
+awk '/^static bool dcn401_resource_construct\(/ { fn = 1 }
+	fn && /\/\* HUBPs, DPPs, OPPs, TGs, ABMs \*\// { on = 1 }
+	on && /\/\* PSR \*\// { exit } on' "$res" > "$work/pipes.inc"
+awk '/^static bool dcn401_resource_construct\(/ { fn = 1 }
+	fn && /pool->base.mpc = dcn401_mpc_create\(/ { print; exit }' "$res" > "$work/mpc.inc"
+awk '/^static bool dcn401_resource_construct\(/ { fn = 1 }
+	fn && /\/\* DSCs \*\// { on = 1 }
+	on && /\/\* DWB \*\// { exit } on' "$res" > "$work/dscs.inc"
+awk '/full_pipe_count = dc->res_pool->pipe_count;/ { on = 1 }
+	on { print } on && /dc->res_pool->stream_enc_count\);/ { exit }' \
+	"$amd/display/dc/core/dc.c" > "$work/max_streams.inc"
+awk '/^void dcn20_acquire_dsc\(/ { on = 1; sub(/^void/, "static void") }
+	on { print } on && /^\}/ { exit }' \
+	"$amd/display/dc/resource/dcn20/dcn20_resource.c" > "$work/acquire_dsc.inc"
+for f in res_cap fuses_read fuses pipes mpc dscs max_streams acquire_dsc; do
+	[ -s "$work/$f.inc" ] || fail "$f not found in Linux"
+done
+cc -Wall -Wextra -Werror -Wno-unused-label -I"$work" "$here/pipe_pool.c" -o "$work/pipe_pool"
+"$work/pipe_pool" > "$work/pipes"
+
 if [ "$generate" = 1 ]; then
 	cat "$work/policy"
 	echo "----"
 	cat "$work/firmware"
+	echo "----"
+	cat "$work/pipes"
 	exit 0
 fi
+diff -u <(grep -v '^#' "$here/pipe_pool.txt") "$work/pipes" || fail "pipe_pool.txt differs from Linux"
 diff -u <(grep -v '^#' "$here/policy.txt") "$work/policy" || fail "policy.txt differs from Linux"
 diff -u <(grep -v '^#' "$here/firmware.txt") "$work/firmware" || fail "firmware.txt differs from Linux"
 
@@ -168,4 +203,4 @@ cc -Wall -Wextra -Werror '-D__counted_by(x)=' \
 	-I"$amd/pm/swsmu/inc/pmfw_if" -I"$amd/pm/swsmu/inc" \
 	"$here/layout.c" -o "$work/layout"
 "$work/layout"
-echo "rdna4_family: policy, firmware and layout match $linux"
+echo "rdna4_family: policy, firmware, pipe pool and layout match $linux"
