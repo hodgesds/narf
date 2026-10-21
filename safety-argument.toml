@@ -1583,3 +1583,11 @@ argument = "frame/src/bare_main.rs moves the existing x86_64 HPET ioremap/init a
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The frame boot wiring now installs narf_scheduler::address_space_of_live instead of the ready-queue-only address_space_of as the by-task-id and current-task fallback address-space resolvers. Both return an Arc to the address space the scheduler already associates with that live task (its lifetime registry, then the ready queues, then the running publication), the same object Linux reaches through task->mm; the change only stops a running, parked or wake-inbox-staged target from resolving to None. Callers keep their existing permission checks (ptrace/pidfd access, CAP checks), and no mapping, capability, domain or TCB-membership authority changes."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The scheduler change is inside the executor core, already a member of the TCB set defined here; it moves no boundary and adds no TCB member. It only folds elapsed cycle deltas around the existing production idle halts (run_until_empty, run_forever, park_for_cpu_lifecycle) into the pre-existing per-CPU idle counter that /proc/stat already reads, via a shared credit_idle_since helper that idle_wait also uses. The deliberately uncredited adaptive halt-poll spin windows stay uncredited."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The change performs no kernel-side data access beyond reading the current CPU's cycle counter and atomically adding the delta to that same CPU's idle-ns slot. It invokes no capability, changes no domain tag, mapping, or task state, and neither weakens nor bypasses the capability-and-domain rule; the filesystem change is a doc comment correcting gen_stat's description to match the code."
