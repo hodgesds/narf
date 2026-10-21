@@ -2514,14 +2514,23 @@ end device's connector takes a CRTC and lights beside the running streams
 (`modeset_beside`), as a Linux commit adds its stream. A port with no
 stream reprobes in place (`MstLink::prepare`) the same way. When only some
 payloads' end devices left (`MstLink::lost`, `MstService::Lost(pipes)`),
-the monitor retires just those streams — their payloads removed without
-ALLOCATE_PAYLOAD or a payload-table row for the departed device, as
-drm_dp_remove_payload_part1 skips a port no longer downstream of the
-primary, its DSC decoder not addressed — then services the port again to
-adopt the tree beside the streams still running. Otherwise (another primary
-branch, a hop's capacity lost: `MstService::Relight`) the old topology and
-routes stay and the monitor stops all streams using their old routes,
-reprobes, then relights enabled outputs.
+the monitor retires just those streams — each payload removed as
+drm_dp_remove_payload_part1 removes it: ALLOCATE_PAYLOAD with PBN 0 to the
+departed device's branch and its payload-table row cleared, both results
+ignored, because the device's branch port is still downstream of the
+primary (drm_dp_mst_port_downstream_of_branch walks the port's parents,
+which a drm_dp_mst_port keeps for its whole lifetime), so the branch's VC
+payload table compacts with the source's and the streams beside it keep
+their slots; its DSC decoder is not addressed (amdgpu_dm clears the
+disconnected connector's dsc_aux) — then services the port again to
+adopt the tree beside the streams still running. Only a payload whose
+port is off the primary skips part 1 ("not in topology"): the root's HPD
+is low (dm_helpers_dp_mst_stop_top_mgr cleared mst_primary) or a live
+reprobe found another primary branch (`MstLink::primary_replaced`).
+Otherwise (another primary branch, a hop's capacity lost:
+`MstService::Relight`) the old topology and routes stay and the monitor
+stops all streams using their old routes, reprobes, then relights enabled
+outputs.
 A failed or cancelled live probe retains the session like `prepare`.
 Notifications received during queries/reprobe remain queued for the next pass. Unknown branch/port, input-port and disconnected
 resource notices are ignored.

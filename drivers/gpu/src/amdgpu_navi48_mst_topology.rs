@@ -214,6 +214,7 @@ impl MstLink {
         self.outputs = outputs;
         self.resource_ports.clear();
         self.lost.clear();
+        self.primary_replaced = false;
         self.dirty = false;
         self.state = ProbeState::Ready;
         Ok(())
@@ -306,6 +307,7 @@ impl MstLink {
         let probed = self.manager.probe(aux).await?;
         self.state = ProbeState::Ready;
         let Some(mut topology) = keep_indices(&self.topology, probed) else {
+            self.primary_replaced = true;
             return Ok(false);
         };
         let allocated: Vec<_> = self.payloads.iter().map(|p| (p.sink, p.pbn)).collect();

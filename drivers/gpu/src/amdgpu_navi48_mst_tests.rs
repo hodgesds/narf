@@ -971,12 +971,120 @@ kernel_test_in!(
     navi48_mst_two_ports_keep_their_own_payload_tables
 );
 
-/// A stream whose end device left (a live reprobe recorded its sink in
-/// `lost`) is removed as drm_dp_remove_payload_part1 does for a port no
-/// longer downstream of the primary branch: no ALLOCATE_PAYLOAD and no
-/// payload-table row for it, while the source still drops it from the SAT
-/// with ACT and the stream beside it moves down and keeps running.
-fn navi48_mst_lost_end_device_payload_leaves_without_addressing_it() -> TestResult {
+/// The branch's VC payload ID table as the DP spec keeps it (2.6.5): a
+/// PAYLOAD_ALLOCATE_SET row with slots allocates that VCPI at its start
+/// slot; one with zero slots deletes the VCPI and moves every later
+/// payload down by its slots. The hub fake keeps only the last row.
+struct TableAux<'a> {
+    inner: Aux<'a>,
+    table: Vec<(u8, u8, u8)>,
+}
+impl MstAux for TableAux<'_> {
+    type Error = ();
+    async fn read(&mut self, address: u32, buf: &mut [u8]) -> Result<(), ()> {
+        self.inner.read(address, buf).await
+    }
+    async fn write(&mut self, address: u32, data: &[u8]) -> Result<(), ()> {
+        self.inner.write(address, data).await?;
+        if address == dp_mst_mgr::PAYLOAD_ALLOCATE_SET && data.len() == 3 {
+            let (vcpi, start, slots) = (data[0], data[1], data[2]);
+            if slots == 0 {
+                if let Some(i) = self.table.iter().position(|r| r.0 == vcpi) {
+                    let gone = self.table.remove(i);
+                    for r in self.table.iter_mut().filter(|r| r.1 > gone.1) {
+                        r.1 -= gone.2;
+                    }
+                }
+            } else if vcpi != 0 {
+                self.table.retain(|r| r.0 != vcpi);
+                self.table.push((vcpi, start, slots));
+            }
+        }
+        Ok(())
+    }
+    async fn delay(&mut self, us: u64) {
+        self.inner.delay(us).await;
+    }
+}
+
+/// A on VCPI 1 and B on VCPI 2, then A's monitor is unplugged from its
+/// still-present hub port (a live reprobe recorded A's sink in `lost`).
+/// As drm_dp_remove_payload_part1 does for any port still downstream of
+/// the primary branch (drm_dp_mst_port_downstream_of_branch walks the
+/// port's parents, which an unplugged port keeps), A's removal sends
+/// ALLOCATE_PAYLOAD with PBN 0 and clears its payload-table row, ignoring
+/// their results; the branch's table compacts as the source's does, so B
+/// sits at slot 1 for 15 slots in both and keeps running.
+fn navi48_mst_unplugged_monitor_payload_leaves_both_tables_compacted() -> TestResult {
+    let hub = RefCell::new(Hub::new());
+    let mut link = started_link(&hub);
+    let sinks = link.topology.sinks();
+    let mut aux = TableAux {
+        inner: Aux(&hub),
+        table: Vec::new(),
+    };
+    let mut source = Source {
+        hub: &hub,
+        events: Vec::new(),
+    };
+    for (k, stream) in [(0, 0u8), (1, 2)] {
+        run(alloc::boxed::Box::pin(add_payload(
+            &mut link,
+            &mut aux,
+            &mut source,
+            sinks[k],
+            stream,
+            600,
+            15,
+            (14, 1),
+        )))
+        .unwrap();
+    }
+    assert_eq!(aux.table, [(1, 1, 15), (2, 16, 15)]);
+    hub.borrow_mut().root_sink_present = false;
+    link.lost.push(sinks[0]);
+    let sent = hub.borrow().requests.len();
+    source.events.clear();
+    run(alloc::boxed::Box::pin(remove_payload(
+        &mut link,
+        &mut aux,
+        &mut source,
+        0,
+        true,
+    )))
+    .unwrap();
+    let h = hub.borrow();
+    // ALLOCATE_PAYLOAD (port 1, VCPI 1, PBN 0) to the primary branch.
+    assert_eq!(h.requests.len(), sent + 1);
+    assert_eq!(h.requests[sent].2, dp_mst::ALLOCATE_PAYLOAD);
+    assert_eq!(h.bodies.last(), Some(&vec![0x11, 0x11, 1, 0, 0, 0]));
+    assert_eq!(aux.table, [(2, 1, 15)]);
+    assert_eq!(
+        source.events,
+        [
+            Event::Rate(0, (0, 0)),
+            Event::Table(vec![(2, 15)], sent + 1)
+        ]
+    );
+    let left: Vec<_> = link
+        .payloads
+        .iter()
+        .map(|p| (p.stream, p.vcpi, p.start, p.slots))
+        .collect();
+    assert_eq!(left, [(2, 2, 1, 15)]);
+    assert_eq!(link.payload_change(), None);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    navi48_mst_unplugged_monitor_payload_leaves_both_tables_compacted
+);
+
+/// Only a payload whose port is no longer downstream of the primary
+/// branch (here: a live reprobe found another primary) leaves without
+/// ALLOCATE_PAYLOAD or a payload-table row, as drm_dp_remove_payload_part1
+/// logs "not in topology"; the source still drops it with ACT.
+fn navi48_mst_payload_off_the_primary_leaves_without_addressing_it() -> TestResult {
     let hub = RefCell::new(Hub::new());
     let mut link = started_link(&hub);
     let sinks = link.topology.sinks();
@@ -997,7 +1105,7 @@ fn navi48_mst_lost_end_device_payload_leaves_without_addressing_it() -> TestResu
         )))
         .unwrap();
     }
-    link.lost.push(sinks[0]);
+    link.primary_replaced = true;
     let (sent, row) = {
         let h = hub.borrow();
         let row: Vec<u8> = (0..3)
@@ -1024,16 +1132,10 @@ fn navi48_mst_lost_end_device_payload_leaves_without_addressing_it() -> TestResu
         source.events,
         [Event::Rate(0, (0, 0)), Event::Table(vec![(2, 15)], sent)]
     );
-    let left: Vec<_> = link
-        .payloads
-        .iter()
-        .map(|p| (p.stream, p.vcpi, p.start))
-        .collect();
-    assert_eq!(left, [(2, 2, 1)]);
     assert_eq!(link.payload_change(), None);
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/dp-mst",
-    navi48_mst_lost_end_device_payload_leaves_without_addressing_it
+    navi48_mst_payload_off_the_primary_leaves_without_addressing_it
 );

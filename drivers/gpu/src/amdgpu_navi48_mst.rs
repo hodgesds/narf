@@ -117,8 +117,14 @@ pub struct MstLink {
     /// stream runs.
     caps: Option<modeset::DpCaps>,
     payload_change: Option<MstPayloadChange>,
-    /// Payload end devices a live reprobe found gone (`reprobe_live`).
+    /// Payload end devices a live reprobe found gone (`reprobe_live`): their
+    /// streams retire alone. Their ports stay in the topology the payloads
+    /// were allocated in, as Linux's drm_dp_mst_port outlives its sink.
     lost: Vec<dp_mst_mgr::Sink>,
+    /// A live reprobe found another primary branch: the running payloads'
+    /// ports are no longer downstream of the primary (Linux reaches such a
+    /// state only through a new mgr->mst_primary).
+    primary_replaced: bool,
     resource_ports: Vec<dp_mst_mgr::Sink>,
     resource_query: bool,
     state: ProbeState,
@@ -365,10 +371,16 @@ pub(crate) async fn add_payload<A: MstAux, S: MstSource>(
 
 /// deallocate_mst_payload for stream encoder `stream`: VC rate zero, the remote and
 /// DPCD allocations removed (drm_dp_remove_payload_part1, failures
-/// tolerated as Linux does, and skipped for an end device the topology
-/// lost, which is no longer downstream of the primary branch), the source
-/// table without it and ACT handled (unchecked), then later payloads'
-/// start slots moved down (drm_dp_remove_payload_part2).
+/// tolerated as Linux does), the source table without it and ACT handled
+/// (unchecked), then later payloads' start slots moved down
+/// (drm_dp_remove_payload_part2). Part 1 is skipped only when the payload's
+/// port is not downstream of the primary branch
+/// (drm_dp_mst_port_downstream_of_branch): the root is gone (`connected`
+/// false, Linux's dm_helpers_dp_mst_stop_top_mgr cleared mst_primary) or
+/// another primary replaced it. An end device that left a still-present
+/// branch port (`MstLink::lost`) is still downstream: Linux's port keeps its
+/// parent for its whole lifetime, so both writes go out and their errors are
+/// ignored, and the branch's payload table compacts with the source's.
 pub(crate) async fn remove_payload<A: MstAux, S: MstSource>(
     link: &mut MstLink,
     aux: &mut A,
@@ -385,7 +397,7 @@ pub(crate) async fn remove_payload<A: MstAux, S: MstSource>(
     let payload = link.payloads[index];
     link.payload_change = Some(MstPayloadChange::Removing(stream));
     source.vc_rate(stream, (0, 0)).await?;
-    let downstream = connected && !link.lost.contains(&payload.sink);
+    let downstream = connected && !link.primary_replaced;
     if let (true, Some(branch), Some(port)) = (
         downstream,
         link.topology.branches.get(payload.sink.branch).cloned(),
