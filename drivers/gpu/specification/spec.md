@@ -363,7 +363,7 @@ DCHUB reference — there is no per-SKU bounding box).
 
 | Linux site | GC 12.0.1 / MP 14.0.3 (Navi48) | GC 12.0.0 / MP 14.0.2 (Navi44) | NARF |
 | --- | --- | --- | --- |
-| `soc24_common_early_init` `external_rev_id` | `rev_id + 0x50` | `rev_id + 0x40` | `Rdna4Chip::external_rev`; DEV_INFO `chip_rev`/`external_rev` once the probe publishes the PCI revision |
+| `soc24_common_early_init` `external_rev_id` | `rev_id + 0x50` | `rev_id + 0x40` | `Rdna4Chip::external_rev` on `rev_id`, the NBIO `STRAP_ATI_REV_ID` strap (`amdgpu_rdna4::rev_id_strap`: `nbif_v6_3_1_get_rev_id` / `nbio_v7_7_get_rev_id`, BASE_IDX 2), read by the probe — never the PCI revision; DEV_INFO `chip_rev`/`external_rev`, plus `pci_rev` (`pdev->revision`) and `mall_size` (`amdgpu_discovery::mall_size`, MALL_INFO less harvested UMCs) once the probe publishes `Rdna4Identity`. Every 4-bit strap lands in Mesa's `AMDGPU_GFX1200_RANGE` [0x40, 0x50) / `AMDGPU_GFX1201_RANGE` [0x50, 0xFF) (`mesa_external_rev_range`). An unreadable PCI revision or strap fails the RDNA4 probe (Linux never enumerates such a function) |
 | `soc24_common_early_init` pg_flags | VCN, JPEG, VCN_DPG, **JPEG_DPG** | VCN, JPEG, VCN_DPG | `jpeg_dpg()` recorded; both start JPEG/VCN statically (no DPG) |
 | `kfd_device.c` gfx_target_version | 120001 (gfx1201) | 120000 (gfx1200) | `gfx_target_version()`; no KFD |
 | `gfx_v12_0`, `imu_v12_0`, `mes_v12_0` firmware | `gc_12_0_1_{pfp,me,mec,rlc,imu,mes,mes1,uni_mes,toc}` + RLC/IMU kicker | `gc_12_0_0_*`, no kicker | `GC_12_0_1_FW` / `GC_12_0_0_FW` (TOC is RLC-backdoor only, never loaded) |

@@ -402,9 +402,17 @@ pub struct ChipInfo {
     /// `smu_*` IP versions.
     pub fw_list: &'static [FwEntry],
     /// PCI revision ID (`pdev->revision`, config offset 0x08), read at
-    /// probe. Linux keys the kicker firmware list and `external_rev_id` on
-    /// it; 0 until the probe reads it.
+    /// probe. Linux keys the kicker firmware list on it and reports it as
+    /// DEV_INFO `pci_rev`; 0 until the probe reads it.
     pub revision: u8,
+    /// `adev->rev_id`: the NBIO `STRAP_ATI_REV_ID` strap
+    /// (`amdgpu_device_get_rev_id`), the base of `external_rev_id`. Read
+    /// by the probe on RDNA4 only; 0 elsewhere.
+    pub rev_id: u8,
+    /// `adev->gmc.mall_size` from the discovery MALL_INFO table
+    /// (`amdgpu_discovery_get_mall_info`). Read by the probe on RDNA4 only;
+    /// 0 elsewhere.
+    pub mall_size: u64,
 }
 
 impl ChipInfo {
@@ -648,6 +656,8 @@ fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
             fw_name: profile.firmware.sos,
             fw_list: UNAUDITED_FW,
             revision: 0,
+            rev_id: 0,
+            mall_size: 0,
         });
     }
     if let Some(known) = crate::amdgpu_rdna4::known_device(did) {
@@ -713,6 +723,8 @@ fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
         fw_name,
         fw_list,
         revision: 0,
+        rev_id: 0,
+        mall_size: 0,
     })
 }
 
@@ -728,6 +740,8 @@ fn rdna4_chip_info(did: u16, chip: crate::amdgpu_rdna4::Rdna4Chip) -> ChipInfo {
         fw_name: "",
         fw_list: UNAUDITED_FW,
         revision: 0,
+        rev_id: 0,
+        mall_size: 0,
     }
 }
 
@@ -922,7 +936,7 @@ impl AmdGpu {
         // continue using the hardcoded `Family::mp0_base()`
         // table.
         //
-        let (ip_blocks, gc_info) = cap
+        let (ip_blocks, gc_info, mall_size) = cap
             .invoke(ProbeOp(|| {
                 // SAFETY: current PCI authority; probe exclusively owns both
                 // mappings and the shared index latch for the whole read.
@@ -943,8 +957,35 @@ impl AmdGpu {
             (None, Some(die)) => rdna4_chip_info(device.id.device, die),
             (None, None) => return Err(AmdgpuError::UnknownAsic),
         };
-        // pdev->revision: the kicker-firmware and external_rev_id key.
-        chip.revision = narf_bus::pci::read_config32(cap, device, 0x08).map_or(0, |v| v as u8);
+        let rdna4 = chip.family == Family::Navi4 && die.is_some();
+        // pdev->revision, the kicker-firmware key and DEV_INFO `pci_rev`.
+        // Linux caches it in `pci_setup_device`, and a function whose config
+        // header cannot be read is never enumerated, so never probed: RDNA4
+        // fails closed. Other families keep their historical 0 fallback.
+        chip.revision = match narf_bus::pci::read_config32(cap, device, 0x08) {
+            Ok(v) => v as u8,
+            Err(_) if rdna4 => return Err(AmdgpuError::DeviceGone),
+            Err(_) => 0,
+        };
+        if rdna4 {
+            // soc24_common_early_init: `adev->rev_id =
+            // amdgpu_device_get_rev_id(adev)`, NBIO's ATI_REV_ID strap,
+            // which DEV_INFO publishes as `chip_rev` and offsets into
+            // `external_rev`. It is not the PCI revision.
+            let at = crate::amdgpu_rdna4::rev_id_strap(&ip_blocks)
+                .filter(|at| at.checked_add(4).is_some_and(|end| end <= regs.len))
+                .ok_or(AmdgpuError::UnknownAsic)?;
+            // SAFETY: bounded above inside the exclusively owned BAR5
+            // mapping; a strap register read has no side effects.
+            let strap = cap
+                .invoke(ProbeOp(|| unsafe { regs.read32(at) }))
+                .map_err(|_| AmdgpuError::DeviceGone)?;
+            if strap == 0xFFFF_FFFF {
+                return Err(AmdgpuError::DeviceGone);
+            }
+            chip.rev_id = crate::amdgpu_rdna4::rev_id(strap);
+            chip.mall_size = mall_size;
+        }
 
         // Cross-check the pre-discovery identity. The actual BAR mapping,
         // rather than APU identity, always bounds CPU-visible VRAM.
@@ -2131,13 +2172,13 @@ pub(crate) unsafe fn read_vram_info(regs: &MmioRegion, fb_bar: &MmioRegion) -> V
 pub(crate) fn read_discovery(
     io: &mut impl crate::amdgpu_vram_access::ReadIo,
     vram_size: u64,
-) -> (Vec<IpBlock>, Option<crate::amdgpu_discovery::GcInfo>) {
+) -> (Vec<IpBlock>, Option<crate::amdgpu_discovery::GcInfo>, u64) {
     let Some(offset) = vram_size.checked_sub(amdgpu_discovery::DISCOVERY_TMR_OFFSET) else {
-        return (Vec::new(), None);
+        return (Vec::new(), None, 0);
     };
     let mut buf = alloc::vec![0u8; amdgpu_discovery::DISCOVERY_TMR_SIZE];
     if crate::amdgpu_vram_access::read(io, vram_size, offset, &mut buf).is_err() {
-        return (Vec::new(), None);
+        return (Vec::new(), None, 0);
     }
     // The GC table is parsed from the same bytes. Its absence is ordinary
     // (QEMU, pre-discovery silicon) and is not worth reporting; a blob that
@@ -2155,10 +2196,10 @@ pub(crate) fn read_discovery(
             None
         }
     };
-    (
-        amdgpu_discovery::parse_discovery(&buf).unwrap_or_default(),
-        gc_info,
-    )
+    let ip_blocks = amdgpu_discovery::parse_discovery(&buf).unwrap_or_default();
+    // amdgpu_discovery_get_mall_info, after harvest_ip has trimmed num_umc.
+    let mall_size = amdgpu_discovery::mall_size(&buf, &ip_blocks);
+    (ip_blocks, gc_info, mall_size)
 }
 
 // ── VBIOS image acquisition ────────────────────────────────────────────────
@@ -2335,10 +2376,19 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     let vbios_version = dev.vbios.as_ref().and_then(|bios| bios.version());
     let is_apu = dev.is_apu();
     // Captured before the move into CONTROLLER; both are Copy.
-    let (bound_asic, bound_family, revision) = (dev.chip.asic, dev.chip.family, dev.chip.revision);
+    let (bound_asic, bound_family, revision, rev_id) = (
+        dev.chip.asic,
+        dev.chip.family,
+        dev.chip.revision,
+        dev.chip.rev_id,
+    );
     crate::amdgpu_rdna4::publish(rdna4);
     if rdna4.is_some() {
-        crate::amdgpu_info::publish_rdna4_revision(revision);
+        crate::amdgpu_info::publish_rdna4_identity(crate::amdgpu_info::Rdna4Identity {
+            rev_id,
+            pci_rev: revision,
+            mall_size: dev.chip.mall_size,
+        });
     }
     *PCI_AUTHORITY.lock() = Some(cap);
     *PCI_DEVICE.lock() = Some(device);
@@ -2363,10 +2413,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                 .map_or("unlisted board id", |d| d.name);
             let _ = writeln!(
                 narf_console::Writer,
-                "amdgpu: RDNA4 {} GC {:?} rev {revision:#04x} external_rev {:#04x}: {name}",
+                "amdgpu: RDNA4 {} GC {:?} pci_rev {revision:#04x} rev_id {rev_id:#x} \
+                 external_rev {:#04x}: {name}",
                 die.asic(),
                 die.gc_version(),
-                die.external_rev(revision),
+                die.external_rev(rev_id),
             );
         }
     }

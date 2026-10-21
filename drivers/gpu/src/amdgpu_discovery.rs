@@ -544,6 +544,93 @@ pub fn parse_vcn_harvest(blob: &[u8]) -> Result<u8, DiscoveryError> {
     Ok(mask)
 }
 
+/// `UMC_HWID` entries `amdgpu_discovery_read_from_harvest_table` counts as
+/// harvested: list entries before the first zero `hw_id` whose instance is
+/// below 32. `None` when the table fails the init-time signature/checksum
+/// check (`amdgpu_discovery_table_check`), which Linux treats as a failed
+/// discovery.
+fn umc_harvest_count(blob: &[u8]) -> Option<u32> {
+    let entry = 12 + TABLE_HARVEST_INFO * 8;
+    let offset = u16_at(blob, entry).ok()? as usize;
+    let checksum = u16_at(blob, entry + 2).ok()?;
+    if offset == 0 {
+        // "invalid harvest table offset": logged, nothing harvested.
+        return Some(0);
+    }
+    let table = blob.get(offset..offset + HARVEST_TABLE_SIZE)?;
+    if u32_at(table, 0).ok()? != HARVEST_TABLE_SIGNATURE || sum_bytes(table) != checksum {
+        return None;
+    }
+    let mut count = 0;
+    for i in 0..32 {
+        let at = 8 + i * 4;
+        let hw_id = u16_at(table, at).ok()?;
+        if hw_id == 0 {
+            break;
+        }
+        // "bogus harvest instance" entries are skipped.
+        if table[at + 2] < 32 && hw_id == HW_ID_UMC {
+            count += 1;
+        }
+    }
+    Some(count)
+}
+
+/// `adev->gmc.mall_size` (`amdgpu_discovery_get_mall_info`), which DEV_INFO
+/// reports as `mall_size`.
+///
+/// `num_umc` is the discovered UMC instance count less the harvested ones
+/// (`amdgpu_discovery_harvest_ip`, which subtracts only when fewer are
+/// harvested than exist). A zero table offset leaves the size 0; v1 sums
+/// `mall_size_per_m` per UMC (doubled where `m_s_present`, halved where
+/// `m_half_use`); v2 is `mall_size_per_umc * num_umc`; any other major
+/// version is "Unhandled MALL info table" and leaves it 0. Linux checks
+/// neither this table's id nor its checksum (`check_table = false`). A blob
+/// that fails the outer or harvest checks would have failed discovery, so
+/// it reports 0 as well.
+pub fn mall_size(blob: &[u8], blocks: &[IpBlock]) -> u64 {
+    mall_size_inner(blob, blocks).unwrap_or(0)
+}
+fn mall_size_inner(blob: &[u8], blocks: &[IpBlock]) -> Option<u64> {
+    if blob.len() < BINARY_HEADER_SIZE || u32_at(blob, 0).ok()? != BINARY_SIGNATURE {
+        return None;
+    }
+    let mut num_umc = blocks.iter().filter(|b| b.hw_id == HW_ID_UMC).count() as u32;
+    let harvested = umc_harvest_count(blob)?;
+    if harvested < num_umc {
+        num_umc -= harvested;
+    }
+    let offset = u16_at(blob, 12 + TABLE_MALL_INFO * 8).ok()? as usize;
+    if offset == 0 {
+        return Some(0);
+    }
+    // `struct mall_info_header`: table_id u32, version_major u16,
+    // version_minor u16, size_bytes u32; the body starts at byte 12.
+    match u16_at(blob, offset + 4).ok()? {
+        1 => {
+            let per = u32_at(blob, offset + 12).ok()?;
+            let present = u32_at(blob, offset + 16).ok()?;
+            let half = u32_at(blob, offset + 20).ok()?;
+            let mut size = 0u64;
+            for u in 0..num_umc {
+                let bit = 1u32.checked_shl(u).unwrap_or(0);
+                // `mall_size_per_umc * 2` is u32 arithmetic in Linux before
+                // the u64 accumulation.
+                size += u64::from(if present & bit != 0 {
+                    per.wrapping_mul(2)
+                } else if half & bit != 0 {
+                    per / 2
+                } else {
+                    per
+                });
+            }
+            Some(size)
+        }
+        2 => Some(u64::from(u32_at(blob, offset + 12).ok()?) * u64::from(num_umc)),
+        _ => Some(0),
+    }
+}
+
 // ── GC info table ───────────────────────────────────────────────────
 
 /// `union gc_info` (`discovery.h`) — the graphics-core topology, read from

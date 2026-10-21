@@ -165,6 +165,129 @@ fn rdna4_per_die_policy_matches_linux() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/rdna4", rdna4_per_die_policy_matches_linux);
 
+fn umc(instance: u8) -> IpBlock {
+    IpBlock {
+        hw_id: ip::HW_ID_UMC,
+        instance,
+        major: 8,
+        minor: 14,
+        revision: 0,
+        sub_revision: 0,
+        variant: 0,
+        base_addrs: [0; ip::MAX_BASE_ADDRS],
+        num_bases: 1,
+    }
+}
+/// A discovery blob carrying a harvest table (listing `harvested` UMC
+/// instances) and a MALL_INFO table of `version` with `words` after its
+/// header.
+fn mall_blob(version: u16, words: &[u32], harvested: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut blob = alloc::vec![0u8; 1024];
+    blob[..4].copy_from_slice(&ip::BINARY_SIGNATURE.to_le_bytes());
+    let harvest = 512usize;
+    blob[harvest..harvest + 4].copy_from_slice(&ip::HARVEST_TABLE_SIGNATURE.to_le_bytes());
+    for (k, &instance) in harvested.iter().enumerate() {
+        let at = harvest + 8 + k * 4;
+        blob[at..at + 2].copy_from_slice(&ip::HW_ID_UMC.to_le_bytes());
+        blob[at + 2] = instance;
+    }
+    let sum = blob[harvest..harvest + 136]
+        .iter()
+        .fold(0u16, |s, &b| s.wrapping_add(u16::from(b)));
+    let entry = 12 + ip::TABLE_HARVEST_INFO * 8;
+    blob[entry..entry + 2].copy_from_slice(&(harvest as u16).to_le_bytes());
+    blob[entry + 2..entry + 4].copy_from_slice(&sum.to_le_bytes());
+    let mall = 768usize;
+    let entry = 12 + ip::TABLE_MALL_INFO * 8;
+    blob[entry..entry + 2].copy_from_slice(&(mall as u16).to_le_bytes());
+    blob[mall..mall + 4].copy_from_slice(&0x4C4C_414Du32.to_le_bytes());
+    blob[mall + 4..mall + 6].copy_from_slice(&version.to_le_bytes());
+    for (k, w) in words.iter().enumerate() {
+        let at = mall + 12 + k * 4;
+        blob[at..at + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    blob
+}
+/// `nbif_v6_3_1_get_rev_id` / `nbio_v7_7_get_rev_id` and
+/// `amdgpu_discovery_get_mall_info`: DEV_INFO's `chip_rev` comes from the
+/// NBIO strap, never the PCI revision, and `mall_size` from discovery.
+fn rdna4_rev_id_strap_and_mall_info_match_linux() -> TestResult {
+    let gpu = crate::amdgpu_navi48_firmware::tests::gpu();
+    let mut blocks = gpu.ip_blocks.clone();
+    let mut nbio = umc(0);
+    (nbio.hw_id, nbio.major, nbio.minor, nbio.revision) = (ip::HW_ID_NBIF, 6, 3, 1);
+    nbio.base_addrs = [0, 0x14, 0xd20, 0, 0];
+    nbio.num_bases = 3;
+    blocks.push(nbio);
+    for (version, reg) in [
+        ((6, 3, 1), 0x1c),
+        ((7, 11, 4), 0x21),
+        ((7, 11, 5), 0x21),
+        ((7, 7, 0), 0x15),
+        ((7, 7, 1), 0x15),
+    ] {
+        let last = blocks.last_mut().unwrap();
+        (last.major, last.minor, last.revision) = version;
+        if rev_id_strap(&blocks) != Some((0xd20 + reg) * 4) {
+            return TestResult::Fail("RCC_DEV0_EPF0_STRAP0 per NBIO version");
+        }
+    }
+    let last = blocks.last_mut().unwrap();
+    (last.major, last.minor, last.revision) = (4, 3, 0);
+    if rev_id_strap(&blocks).is_some() {
+        return TestResult::Fail("strap read on an NBIO without nbif_v6_3_1/nbio_v7_7");
+    }
+    let last = blocks.last_mut().unwrap();
+    (last.major, last.minor, last.revision, last.num_bases) = (6, 3, 1, 2);
+    if rev_id_strap(&blocks).is_some() {
+        return TestResult::Fail("strap read without BASE_IDX 2");
+    }
+    // Bits 27:24 only: a 0xc8 PCI revision can never be the strap value.
+    if rev_id(0x0300_0000) != 3 || rev_id(0xF1FF_FFFF) != 1 || rev_id(0x00c8) != 0 {
+        return TestResult::Fail("STRAP_ATI_REV_ID field");
+    }
+
+    let umcs: alloc::vec::Vec<_> = (0..16).map(umc).collect();
+    let mib = |m: u64| m << 20;
+    // v2: mall_size_per_umc * num_umc, with harvested UMCs removed.
+    if ip::mall_size(&mall_blob(2, &[4 << 20], &[]), &umcs) != mib(64)
+        || ip::mall_size(&mall_blob(2, &[4 << 20], &[12, 13, 14, 15]), &umcs) != mib(48)
+        // A harvest count not below num_umc leaves num_umc alone.
+        || ip::mall_size(&mall_blob(2, &[4 << 20], &[0, 1]), &umcs[..2]) != mib(8)
+        // Instances >= 32 are "bogus" and not counted.
+        || ip::mall_size(&mall_blob(2, &[4 << 20], &[40]), &umcs) != mib(64)
+    {
+        return TestResult::Fail("MALL_INFO v2 size");
+    }
+    // v1: per-UMC, doubled where m_s_present, halved where m_half_use.
+    if ip::mall_size(&mall_blob(1, &[4 << 20, 0b01, 0b10], &[]), &umcs[..4])
+        != mib(4 * 2 + 2 + 4 + 4)
+    {
+        return TestResult::Fail("MALL_INFO v1 size");
+    }
+    // Unhandled major version, no table, no blob: 0.
+    let mut absent = mall_blob(2, &[4 << 20], &[]);
+    let entry = 12 + ip::TABLE_MALL_INFO * 8;
+    absent[entry..entry + 2].copy_from_slice(&0u16.to_le_bytes());
+    if ip::mall_size(&mall_blob(3, &[4 << 20], &[]), &umcs) != 0
+        || ip::mall_size(&absent, &umcs) != 0
+        || ip::mall_size(&[0; 64], &umcs) != 0
+    {
+        return TestResult::Fail("MALL_INFO absent or unhandled");
+    }
+    // A corrupt harvest table fails discovery in Linux: no size.
+    let mut corrupt = mall_blob(2, &[4 << 20], &[]);
+    corrupt[512 + 8] ^= 1;
+    if ip::mall_size(&corrupt, &umcs) != 0 {
+        return TestResult::Fail("MALL size from a blob that fails discovery");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/rdna4",
+    rdna4_rev_id_strap_and_mall_info_match_linux
+);
+
 fn rdna4_firmware_table_selects_by_discovery_and_kicker() -> TestResult {
     let n48 = FirmwareSet::select((12, 0, 1), 3, 1, false).unwrap();
     let n44 = FirmwareSet::select((12, 0, 0), 2, 0, false).unwrap();

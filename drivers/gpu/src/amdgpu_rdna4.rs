@@ -137,6 +137,17 @@ impl Rdna4Chip {
                 Self::Navi44 => 0x40,
             }
     }
+    /// Mesa's `AMDGPU_GFX1200_RANGE` (0x40..0x50) and
+    /// `AMDGPU_GFX1201_RANGE` (0x50..0xFF), `amdgpu_asic_addr.h`: the
+    /// half-open `external_rev` window `ac_query_gpu_info`'s
+    /// `identify_chip` accepts for this die. Anything else leaves Mesa
+    /// without a chip and the device unusable.
+    pub const fn mesa_external_rev_range(self) -> core::ops::Range<u32> {
+        match self {
+            Self::Navi48 => 0x50..0xFF,
+            Self::Navi44 => 0x40..0x50,
+        }
+    }
     /// `kfd_device.c` `gfx_target_version` (gfx1201 / gfx1200).
     pub const fn gfx_target_version(self) -> u32 {
         match self {
@@ -321,6 +332,33 @@ impl FirmwareSet {
             _ => normal,
         }
     }
+}
+
+/// `amdgpu_device_get_rev_id`'s register: the byte offset of
+/// `RCC_DEV0_EPF0_STRAP0` in the register BAR for the discovered NBIO.
+///
+/// `nbif_v6_3_1_get_rev_id` (NBIO 6.3.1, 7.11.4, 7.11.5) and
+/// `nbio_v7_7_get_rev_id` (7.7.0, 7.7.1), the NBIO versions
+/// `amdgpu_discovery_set_ip_blocks` gives those functions: 0x1c for 6.3.1,
+/// 0x21 for the `_nbif_4_10` (7.11.4) and `RCC_STRAP1 ... _nbio_7_11_5`
+/// (7.11.5) variants, 0x15 for 7.7.x, all `BASE_IDX` 2. `None` for any
+/// other NBIO, for which Linux would have no `get_rev_id` at all.
+pub fn rev_id_strap(blocks: &[IpBlock]) -> Option<u64> {
+    let nbio = ip::find_ip(blocks, ip::HW_ID_NBIF, 0)?;
+    let reg = match (nbio.major, nbio.minor, nbio.revision) {
+        (6, 3, 1) => 0x1c,
+        (7, 11, 4) | (7, 11, 5) => 0x21,
+        (7, 7, 0) | (7, 7, 1) => 0x15,
+        _ => return None,
+    };
+    if nbio.num_bases <= 2 {
+        return None;
+    }
+    Some((u64::from(nbio.base_addrs[2]) + reg) * 4)
+}
+/// `STRAP_ATI_REV_ID_DEV0_F0`, bits 27:24 of `RCC_DEV0_EPF0_STRAP0`.
+pub const fn rev_id(strap: u32) -> u8 {
+    ((strap & 0x0F00_0000) >> 24) as u8
 }
 
 /// `dcn401_calc_num_avail_chans_for_mall` × `mall_size_per_mem_channel`
