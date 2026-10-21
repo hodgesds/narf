@@ -141,7 +141,8 @@ impl Firmware {
         let prepared = dmub::Prepared::new(
             gfx.dmcub_bytes(),
             bios.bytes(),
-            sos.image().map_err(Error::Sos)?.version(),
+            // dm_dmub_hw_init: hw_params.psp_version = psp.sos.fw_version.
+            sos.image().map_err(Error::Sos)?.sos_version(),
         )
         .map_err(Error::Dmub)?;
         Ok(Self {
@@ -179,12 +180,48 @@ impl<B: Backend> Sequence<B> {
         Ok(report)
     }
 }
+/// Pin the VRAM-offset `range` in whichever pools it falls in, as
+/// amdgpu_bo_create_kernel_at pins a fixed range: refused (`Allocation`)
+/// if it runs past VRAM, past the BAR with no unmapped pool, or over a
+/// range something already allocated.
+fn pin_vram(
+    pool: &Pool,
+    unmapped: Option<&crate::amdgpu_vram::UnmappedPool>,
+    vram_size: u64,
+    range: core::ops::Range<u64>,
+) -> Result<(), Error> {
+    if range.is_empty() {
+        return Ok(());
+    }
+    if range.end > vram_size {
+        return Err(Error::Allocation);
+    }
+    let visible = pool.size();
+    if range.start < visible {
+        pool.claim(range.start..range.end.min(visible))
+            .map_err(|_| Error::Allocation)?;
+    }
+    if range.end > visible {
+        unmapped
+            .ok_or(Error::Allocation)?
+            .claim(range.start.max(visible) - visible..range.end - visible)
+            .map_err(|_| Error::Allocation)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct Hardware {
     gpu: AmdGpu,
     pci: narf_bus::BusDevice,
     authority: Cap<BusDeviceCap, Write>,
     pool: Pool,
+    /// The VRAM past the BAR, if any; `pool` is the CPU-visible prefix.
+    unmapped: Option<crate::amdgpu_vram::UnmappedPool>,
+    /// psp_hw_start runs psp_update_fw_reservation only when neither in
+    /// reset nor in suspend: a cold boot, not the owner `after_reset` makes
+    /// for recovery or S3/runtime resume (whose pools keep the pin).
+    update_fw_reservation: bool,
     firmware: Firmware,
     dmub: dmub::Dmub,
     trainer: Option<training::Trainer>,
@@ -264,6 +301,28 @@ impl Backend for Hardware {
                     .start()
                     .await
                     .map_err(Error::Psp)?;
+                if self.update_fw_reservation {
+                    let sos = self.firmware.sos.image().map_err(Error::Sos)?.sos_version();
+                    let reservation = self
+                        .psp
+                        .as_mut()
+                        .unwrap()
+                        .update_fw_reservation_navi48(sos, self.gpu.vram.size)
+                        .await
+                        .map_err(Error::Psp)?;
+                    if let Some(r) = reservation {
+                        // amdgpu_ttm_mark_vram_reserved for AMDGPU_RESV_FW
+                        // then AMDGPU_RESV_FW_EXTEND; either failing fails
+                        // psp_hw_start.
+                        pin_vram(&self.pool, self.unmapped.as_ref(), self.gpu.vram.size, r.fw)?;
+                        pin_vram(
+                            &self.pool,
+                            self.unmapped.as_ref(),
+                            self.gpu.vram.size,
+                            r.ext,
+                        )?;
+                    }
+                }
             }
             Stage::TrustedMemory => self
                 .psp
@@ -722,7 +781,7 @@ impl ColdBoot {
             scanned_sinks: Vec::new(),
             client_vram: None,
             client_heap: None,
-            unmapped_vram: unmapped,
+            unmapped_vram: unmapped.clone(),
             display_power_policy: None,
             reset: None,
             baco_exited: false,
@@ -732,6 +791,8 @@ impl ColdBoot {
                     pci,
                     authority,
                     pool: pool.clone(),
+                    unmapped,
+                    update_fw_reservation: true,
                     firmware,
                     dmub,
                     trainer,
@@ -879,6 +940,7 @@ impl ColdBoot {
             new.sequence.backend.training_resume = true;
         }
         new.client_vram = self.client_vram.take();
+        new.sequence.backend.update_fw_reservation = false;
         // Only a BACO exit that needed no reset keeps PMFW resident; a
         // mode1 on resume (SOS survived) reloads it as recovery does.
         new.sequence.backend.smu_resident =

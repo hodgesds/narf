@@ -196,6 +196,19 @@ struct Engine<I: Io> {
 // linux: n/a (NARF bound for psp_cmd_submit_buf's psp_timeout polls)
 const FENCE_TIMEOUT_MS: u64 = 2000;
 const GFX_CMD_ID_DESTROY_TMR: u32 = 7; // linux: GFX_CMD_ID_DESTROY_TMR
+const GFX_CMD_ID_FB_FW_RESERV_ADDR: u32 = 0x50; // linux: GFX_CMD_ID_FB_FW_RESERV_ADDR
+const GFX_CMD_ID_FB_FW_RESERV_EXT_ADDR: u32 = 0x51; // linux: GFX_CMD_ID_FB_FW_RESERV_EXT_ADDR
+const PSP_ERR_UNKNOWN_COMMAND: u32 = 0x100; // linux: PSP_ERR_UNKNOWN_COMMAND
+
+/// What `psp_update_fw_reservation` asks TTM to pin: the PSP firmware
+/// region at the top of VRAM (`AMDGPU_RESV_FW`, replacing the VBIOS-sized
+/// one) and its extension (`AMDGPU_RESV_FW_EXTEND`), as VRAM offsets with
+/// sizes rounded up to 1 MiB. A zero-size extension reserves nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FwReservation {
+    pub fw: core::ops::Range<u64>,
+    pub ext: core::ops::Range<u64>,
+}
 async fn delay(ms: u64) {
     narf_time::SleepUntil::new(narf_time::Deadline::after_ms(ms).as_instant()).await;
 }
@@ -275,6 +288,24 @@ impl<I: Io> Engine<I> {
         result
     }
     async fn submit(&mut self, words: &[u32; 256]) -> Result<Reply, Error> {
+        let (status, reply, _) = self.submit_raw(words).await?;
+        if status != 0 {
+            if !self.lenient || words[2] == GFX_CMD_ID_DESTROY_TMR {
+                return Err(Error::Rejected(status));
+            }
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: psp gfx command {:#x} response status {status:#x}",
+                words[2]
+            );
+        }
+        Ok(reply)
+    }
+    /// psp_cmd_submit_buf's fence wait, returning `resp.status`, the fixed
+    /// response words and the first three `resp.uresp` words without
+    /// judging the status: a timeout is the only failure after submission.
+    async fn submit_raw(&mut self, words: &[u32; 256]) -> Result<(u32, Reply, [u32; 3]), Error> {
         if self.state != State::Ready {
             return Err(Error::Busy);
         }
@@ -324,7 +355,7 @@ impl<I: Io> Engine<I> {
             }
             delay(1).await;
         }
-        let (status, reply) = self.access(|io| {
+        let (status, reply, uresp) = self.access(|io| {
             io.invalidate();
             (
                 // linux-lit: 864=offsetof(struct psp_gfx_cmd_resp, resp.status)
@@ -337,21 +368,68 @@ impl<I: Io> Engine<I> {
                     // linux-lit: 880=offsetof(struct psp_gfx_cmd_resp, resp.tmr_size)
                     tmr_size: io.read_mem(COMMAND + 880),
                 },
+                // linux-lit: 928=offsetof(struct psp_gfx_cmd_resp, resp.uresp)
+                [0, 4, 8].map(|at| io.read_mem(COMMAND + 928 + at)),
             )
         })?;
         self.state = State::Ready;
-        if status != 0 {
-            if !self.lenient || words[2] == GFX_CMD_ID_DESTROY_TMR {
-                return Err(Error::Rejected(status));
-            }
+        Ok((status, reply, uresp))
+    }
+    /// psp_update_fw_reservation for MP0 14.0.`mp0_revision`; see
+    /// [`Psp::update_fw_reservation_navi48`].
+    async fn update_fw_reservation(
+        &mut self,
+        mp0_revision: u8,
+        sos_version: u32,
+        vram_size: u64,
+    ) -> Result<Option<FwReservation>, Error> {
+        let minimum = match mp0_revision {
+            2 => 0x3b0e0d,
+            3 => 0x3a0e14,
+            _ => return Ok(None),
+        };
+        if sos_version < minimum {
+            return Ok(None);
+        }
+        let (address, size) = self
+            .fw_reservation_info(GFX_CMD_ID_FB_FW_RESERV_ADDR)
+            .await?;
+        let (ext_address, ext_size) = self
+            .fw_reservation_info(GFX_CMD_ID_FB_FW_RESERV_EXT_ADDR)
+            .await?;
+        if vram_size.checked_sub(size as u64) != Some(address) {
             use core::fmt::Write;
             let _ = writeln!(
                 narf_console::Writer,
-                "amdgpu: psp gfx command {:#x} response status {status:#x}",
-                words[2]
+                "amdgpu: reserve fw region is not valid! ({address:#x}+{size:#x})"
+            );
+            return Ok(None);
+        }
+        // roundup(reserv_size, SZ_1M), each.
+        let mib = |size: u32| (size as u64).div_ceil(1 << 20) << 20;
+        let end = |start: u64, size: u32| start.checked_add(mib(size)).ok_or(Error::Invalid);
+        Ok(Some(FwReservation {
+            fw: address..end(address, size)?,
+            ext: ext_address..end(ext_address, ext_size)?,
+        }))
+    }
+    /// psp_get_fw_reservation_info: `(address, size)` from
+    /// `resp.uresp.fw_reserve_info`, or `(0, 0)` when SOS answers
+    /// `PSP_ERR_UNKNOWN_COMMAND`. Any other nonzero status is only warned
+    /// about by psp_cmd_submit_buf, and the response is used as returned.
+    async fn fw_reservation_info(&mut self, id: u32) -> Result<(u64, u32), Error> {
+        let (status, _, [hi, lo, size]) = self.submit_raw(&command(id, &[])).await?;
+        if status == PSP_ERR_UNKNOWN_COMMAND {
+            return Ok((0, 0));
+        }
+        if status != 0 {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: psp gfx command {id:#x} response status {status:#x}"
             );
         }
-        Ok(reply)
+        Ok(((hi as u64) << 32 | lo as u64, size))
     }
     async fn stop(&mut self) -> Result<(), Error> {
         if matches!(self.state, State::Prepared | State::Stopped) {
@@ -956,6 +1034,26 @@ impl Psp {
         let image = firmware.image().map_err(|_| Error::Invalid)?;
         let toc = image.toc().ok_or(Error::Invalid)?;
         self.session.setup_tmr_payload(Some(toc)).await
+    }
+    /// psp_update_fw_reservation's PSP half, run right after the KM ring is
+    /// created and before the TMR (psp_hw_start). `None` when Linux returns
+    /// early: an MP0 other than 14.0.2/14.0.3, an SOS older than 0x3b0e0d
+    /// (14.0.2) / 0x3a0e14 (14.0.3), or a firmware region that does not end
+    /// at `vram_size` ("reserve fw region is not valid!"). A failed query
+    /// fails the call, as it fails psp_hw_start. The caller pins the result
+    /// in both VRAM pools before the TMR or any later client allocates.
+    pub async fn update_fw_reservation_navi48(
+        &mut self,
+        sos_version: u32,
+        vram_size: u64,
+    ) -> Result<Option<FwReservation>, Error> {
+        let Kind::Navi48(revision) = self.kind else {
+            return Err(Error::Unsupported);
+        };
+        self.session
+            .engine
+            .update_fw_reservation(revision, sos_version, vram_size)
+            .await
     }
     /// Load signed DMUB instructions through PSP (GFX_FW_TYPE_DMUB = 51).
     /// The DCN314 loader is the currently audited consumer of this operation.

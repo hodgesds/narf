@@ -12,12 +12,18 @@ use narf_lib::sync::IrqSafeSpinLock;
 pub enum Error {
     Invalid,
     Exhausted,
+    /// [`Pool::claim`]: a reservation already holds part of the range.
+    Busy,
 }
 #[derive(Debug)]
 struct Inner {
     mapping: MmioRegion,
     address: u64,
     used: IrqSafeSpinLock<Vec<Range<u64>>>,
+    /// The entries of `used` that are permanent exclusions (the bootstrap
+    /// inventory and [`Pool::claim`]s), never reservations. Locked after
+    /// `used`.
+    protected: IrqSafeSpinLock<Vec<Range<u64>>>,
     /// Published ranges whose reservation was dropped: still excluded
     /// (hardware may reach them) until a proven power cycle reclaims them.
     retired: IrqSafeSpinLock<Vec<Range<u64>>>,
@@ -82,10 +88,16 @@ impl Pool {
             }
         }
         used.truncate(count);
+        let mut protected = Vec::new();
+        protected
+            .try_reserve_exact(used.len())
+            .map_err(|_| Error::Exhausted)?;
+        protected.extend(used.iter().cloned());
         Ok(Self(Arc::new(Inner {
             mapping,
             address,
             used: IrqSafeSpinLock::new(used),
+            protected: IrqSafeSpinLock::new(protected),
             retired: IrqSafeSpinLock::new(Vec::new()),
         })))
     }
@@ -173,6 +185,19 @@ impl Pool {
     /// The whole aperture, protected ranges included.
     pub fn size(&self) -> u64 {
         self.0.mapping.len
+    }
+    /// Permanently exclude the aperture-relative `range` (rounded out to
+    /// pages), as `amdgpu_bo_create_kernel_at` pins a firmware-owned range
+    /// at a fixed offset: it may overlap existing protected ranges, which
+    /// it merges with, but `Busy` if any reservation (live or retired)
+    /// already holds part of it, and `Invalid` past the aperture.
+    pub fn claim(&self, range: Range<u64>) -> Result<(), Error> {
+        claim(
+            &mut self.0.used.lock(),
+            &mut self.0.protected.lock(),
+            self.0.mapping.len,
+            range,
+        )
     }
     pub(crate) fn mapping(&self) -> MmioRegion {
         self.0.mapping
@@ -288,6 +313,40 @@ fn place_dcc(
     Ok(start..start + size)
 }
 
+/// Merge `range` into both the sorted `used` list and its `protected`
+/// subset, refusing to cover any `used` entry that is not protected.
+fn claim(
+    used: &mut Vec<Range<u64>>,
+    protected: &mut Vec<Range<u64>>,
+    len: u64,
+    range: Range<u64>,
+) -> Result<(), Error> {
+    let start = range.start & !4095;
+    let end = range.end.checked_add(4095).ok_or(Error::Invalid)? & !4095;
+    if start >= end || end > len {
+        return Err(Error::Invalid);
+    }
+    let overlapping = |r: &Range<u64>| r.start < end && start < r.end;
+    if used
+        .iter()
+        .any(|r| overlapping(r) && !protected.contains(r))
+    {
+        return Err(Error::Busy);
+    }
+    let merged = used
+        .iter()
+        .filter(|r| overlapping(r))
+        .fold(start..end, |m, r| m.start.min(r.start)..m.end.max(r.end));
+    used.try_reserve(1).map_err(|_| Error::Exhausted)?;
+    protected.try_reserve(1).map_err(|_| Error::Exhausted)?;
+    used.retain(|r| !overlapping(r));
+    protected.retain(|r| !overlapping(r));
+    let at = used.partition_point(|r| r.start < merged.start);
+    used.insert(at, merged.clone());
+    protected.push(merged);
+    Ok(())
+}
+
 /// Owned VRAM with no CPU mapping: what lies beyond a BAR that shows only a
 /// prefix of VRAM. Only the GPU can touch it, so whoever hands a range out
 /// must have the GPU clear it first.
@@ -296,6 +355,8 @@ struct Unmapped {
     address: u64,
     len: u64,
     used: IrqSafeSpinLock<Vec<Range<u64>>>,
+    /// As `Inner::protected`.
+    protected: IrqSafeSpinLock<Vec<Range<u64>>>,
 }
 #[derive(Clone, Debug)]
 pub struct UnmappedPool(Arc<Unmapped>);
@@ -339,10 +400,16 @@ impl UnmappedPool {
                 _ => merged.push(range),
             }
         }
+        let mut protected = Vec::new();
+        protected
+            .try_reserve_exact(merged.len())
+            .map_err(|_| Error::Exhausted)?;
+        protected.extend(merged.iter().cloned());
         Ok(Self(Arc::new(Unmapped {
             address,
             len,
             used: IrqSafeSpinLock::new(merged),
+            protected: IrqSafeSpinLock::new(protected),
         })))
     }
     /// Reserve `size` bytes at a power-of-two GPU-address `alignment`.
@@ -394,6 +461,15 @@ impl UnmappedPool {
     }
     pub fn size(&self) -> u64 {
         self.0.len
+    }
+    /// As [`Pool::claim`], for a pool-relative range.
+    pub fn claim(&self, range: Range<u64>) -> Result<(), Error> {
+        claim(
+            &mut self.0.used.lock(),
+            &mut self.0.protected.lock(),
+            self.0.len,
+            range,
+        )
     }
 }
 /// A range of an [`UnmappedPool`], returned to it on drop: its holder must
@@ -602,5 +678,58 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu-dmub",
         vram_unmapped_pool_keeps_protected_ranges
+    );
+    /// `claim` pins a fixed range as amdgpu_bo_create_kernel_at does: over
+    /// protected ranges (merging), never over a live or retired reservation.
+    fn vram_claim_pins_fixed_ranges_over_protection_only() -> TestResult {
+        let map = MmioRegion {
+            phys: narf_memory::PhysAddr::new(0),
+            virt: 0,
+            len: 16 * 4096,
+            kind: narf_bus::BarKind::Mmio32 { prefetchable: true },
+        };
+        // SAFETY: bookkeeping-only model; no mapping access is performed.
+        let pool =
+            unsafe { Pool::from_owned_aperture(map, 0x1_0000_0000, &[14 * 4096..16 * 4096]) }
+                .unwrap();
+        let live = pool.reserve(4096).unwrap();
+        let mut retired = pool.reserve(4096).unwrap();
+        retired.publish();
+        drop(retired);
+        if pool.claim(0..4096) != Err(Error::Busy)
+            || pool.claim(4096..8192) != Err(Error::Busy)
+            || pool.claim(15 * 4096..17 * 4096) != Err(Error::Invalid)
+            || pool.claim(4096..4096) != Err(Error::Invalid)
+        {
+            return TestResult::Fail("claim over a reservation or past the aperture");
+        }
+        // Overlapping and extending the protected tail, unaligned.
+        if pool.claim(12 * 4096 + 1..15 * 4096).is_err() || pool.available() != 10 * 4096 {
+            return TestResult::Fail("claim over protection not merged");
+        }
+        // The pin is permanent and a second claim over it is idempotent.
+        if pool.claim(12 * 4096..13 * 4096).is_err() || pool.available() != 10 * 4096 {
+            return TestResult::Fail("claim over a claim");
+        }
+        let rest = pool.reserve(10 * 4096).unwrap();
+        if rest.address() != 0x1_0000_2000 || pool.reserve(1).is_ok() {
+            return TestResult::Fail("claimed range handed out");
+        }
+        drop((live, rest));
+        // SAFETY: bookkeeping-only model.
+        let unmapped = unsafe { UnmappedPool::from_owned(0x2_0000_0000, 8 * 4096, &[]) }.unwrap();
+        let held = unmapped.reserve_aligned(4096, 4096).unwrap();
+        if unmapped.claim(0..4096) != Err(Error::Busy)
+            || unmapped.claim(4096..8 * 4096).is_err()
+            || unmapped.available() != 0
+        {
+            return TestResult::Fail("unmapped claim");
+        }
+        drop(held);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu-dmub",
+        vram_claim_pins_fixed_ranges_over_protection_only
     );
 }

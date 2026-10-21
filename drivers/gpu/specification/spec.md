@@ -371,7 +371,7 @@ DCHUB reference — there is no per-SKU bounding box).
 | `sdma_v7_0` firmware | `sdma_7_0_1` | `sdma_7_0_0` | chosen by discovered SDMA0 revision |
 | `amdgpu_is_kicker_fw` | 1002:7551 rev 0xC8 → `_kicker` SOS/TA/SMU/RLC/IMU | — | `is_kicker`; `FirmwareSet`, `Target::Psp14_0_3Kicker` |
 | `amdgpu_ras_asic_supported` | MP0 14.0.3 listed | not listed: `ras_hw_enabled = 0` | `amdgpu_navi48_ras::asic_supported`; Navi44 arms no RAS source |
-| `psp_update_fw_reservation` | SOS ≥ 0x3a0e14 | SOS ≥ 0x3b0e0d | not implemented on either die |
+| `psp_update_fw_reservation` | SOS ≥ 0x3a0e14 | SOS ≥ 0x3b0e0d | `Psp::update_fw_reservation_navi48` on the SOS descriptor's `fw_version` (`Image::sos_version`), in the cold boot's `Ring` stage after the KM ring and before the TMR (skipped by the `after_reset` owner, as Linux skips it in reset/suspend); `FB_FW_RESERV_ADDR` then `_EXT_ADDR`, `PSP_ERR_UNKNOWN_COMMAND` = none, other statuses only warned, a region not ending at VRAM's top skipped; both pinned (1 MiB-rounded) in the BAR pool and the unmapped pool by `claim`; a lost fence, a range past VRAM or one overlapping a live allocation fails the boot. Deviation: the VBIOS-sized `FirmwareTail` stays protected (NARF never returns protected VRAM), so a smaller PSP region does not free the difference |
 | `smu_v14_0_2_enable_gfx_features` | `-EOPNOTSUPP` | `EnableAllSmuFeatures(FEATURE_PWR_GFX)` | mode-2-reset hook only; no NARF path uses it |
 | `smu_v14_0_2_get_gpu_metrics` energy accumulator | PMFW ≥ 0x685000 | never | not exported |
 | `dcn401_calc_num_avail_chans_for_mall` clamp | 16 channels | 8 channels | `mall_channel_limit`, `mall_bytes` (4 MiB/channel) |
@@ -8055,6 +8055,10 @@ same allocator for VRAM no CPU mapping reaches: `reserve_aligned` hands out
 `UnmappedReservation`s (GPU address and size only), returned on drop, so
 their holder keeps them until the GPU can no longer reach them and has the
 GPU clear them before a client sees them.
+`Pool::claim(range)` / `UnmappedPool::claim(range)` pin a fixed,
+pool-relative range permanently, as `amdgpu_bo_create_kernel_at` pins a
+firmware range: it may cover protected ranges (merged with them) but is
+`Busy` over any live or retired reservation and `Invalid` past the pool.
 
 `amdgpu_vram_boot::Plan::read` snapshots the DCN314 FB base/top/offset through
 live PCI authority and builds a read-only VRAM inventory. It requires the

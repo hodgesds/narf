@@ -192,3 +192,43 @@ kernel_test_in!(
     "drivers/gpu/navi48_boot",
     navi48_boot_recovery_owner_has_bounded_stack_payload
 );
+
+/// psp_update_fw_reservation's pins land in the CPU-visible pool, the pool
+/// past the BAR, or both, and fail closed as amdgpu_bo_create_kernel_at.
+fn navi48_fw_reservation_pins_both_pools() -> TestResult {
+    let map = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(0),
+        virt: 0,
+        len: 1 << 20,
+        kind: narf_bus::BarKind::Mmio32 { prefetchable: true },
+    };
+    let vram = 4 << 20;
+    // SAFETY: bookkeeping-only pools; no mapping access is performed.
+    let (pool, unmapped) = unsafe {
+        (
+            Pool::from_owned_range(map, 0x8_0000_0000).unwrap(),
+            crate::amdgpu_vram::UnmappedPool::from_owned(0x8_0010_0000, 3 << 20, &[]).unwrap(),
+        )
+    };
+    let held = pool.reserve(4096).unwrap();
+    if pin_vram(&pool, Some(&unmapped), vram, 0..0).is_err()
+        || pin_vram(&pool, Some(&unmapped), vram, 3 << 20..5 << 20) != Err(Error::Allocation)
+        || pin_vram(&pool, None, vram, 3 << 20..4 << 20) != Err(Error::Allocation)
+        || pin_vram(&pool, Some(&unmapped), vram, 0..4096) != Err(Error::Allocation)
+    {
+        return TestResult::Fail("fw reservation pinned where Linux fails");
+    }
+    if pin_vram(&pool, Some(&unmapped), vram, (1 << 20) - 8192..2 << 20).is_err()
+        || pin_vram(&pool, Some(&unmapped), vram, 3 << 20..4 << 20).is_err()
+        || pool.available() != (1 << 20) - 3 * 4096
+        || unmapped.available() != 1 << 20
+    {
+        return TestResult::Fail("fw reservation split across the BAR");
+    }
+    drop(held);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48_boot",
+    navi48_fw_reservation_pins_both_pools
+);

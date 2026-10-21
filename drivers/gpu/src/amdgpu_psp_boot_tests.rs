@@ -133,6 +133,14 @@ fn psp14_container_descriptors_and_boot_order_are_bounded() -> TestResult {
             return TestResult::Fail("PSP14 payload offsets or Linux boot order");
         }
     }
+    // psp->sos.fw_version is the SOS descriptor's (type 1, the third
+    // descriptor here), not the common header's ucode_version.
+    let mut versioned = bytes.clone();
+    put(&mut versioned, 36 + 16 * 2 + 4, 0x3a0e14);
+    let versioned = Image::parse_psp14(&versioned).unwrap();
+    if versioned.sos_version() != 0x3a0e14 || versioned.version() != 0x3a1014 {
+        return TestResult::Fail("PSP14 SOS descriptor version");
+    }
     for end in 0..bytes.len() {
         if Image::parse_psp14(&bytes[..end]).is_ok() {
             return TestResult::Fail("truncated PSP14 container admitted");
