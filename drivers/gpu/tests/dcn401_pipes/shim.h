@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "dc_spl.h"
 
 #define MAX_PIPES 6
 #define MAX_SURFACES 4
@@ -22,20 +23,40 @@ enum dc_status {
 };
 enum pipe_type { OTG_MASTER, OPP_HEAD, DPP_PIPE, FREE_PIPE };
 
-struct timing_generator { int inst; };
+struct dc_crtc_timing;
+struct timing_generator_funcs {
+	bool (*is_two_pixels_per_container)(const struct dc_crtc_timing *timing);
+};
+struct timing_generator { int inst; const struct timing_generator_funcs *funcs; };
 struct mem_input { int inst; };
 struct hubp { int inst; };
 struct input_pixel_processor { int inst; };
 struct transform { int inst; };
 struct dpp { int inst; };
-struct output_pixel_processor { int inst; };
+enum dc_pixel_encoding { PIXEL_ENCODING_RGB, PIXEL_ENCODING_YCBCR422, PIXEL_ENCODING_YCBCR444,
+	PIXEL_ENCODING_YCBCR420 };
+struct output_pixel_processor;
+struct opp_funcs {
+	uint32_t (*opp_get_left_edge_extra_pixel_count)(struct output_pixel_processor *opp,
+			enum dc_pixel_encoding encoding, bool is_primary);
+};
+struct output_pixel_processor { int inst; const struct opp_funcs *funcs; };
 struct display_stream_compressor { int inst; };
-struct dsc_padding_params { int h_padding; };
+struct dsc_padding_params { int h_padding; int dsc_hactive_padding; };
 struct logger { int unused; };
 
-struct dc_plane_state { int id; };
+struct rect { int x, y, width, height; };
+/* A plane's DC rectangles (amdgpu_dm_plane_fill_dc_scaling_info): its
+ * source in the surface and destination on the stream. A zero-width source
+ * is a plane the script gave no geometry. */
+struct dc_plane_state { int id; struct rect src_rect, dst_rect; };
 struct dc_crtc_timing_flags { uint32_t DSC; };
-struct dc_crtc_timing { struct dc_crtc_timing_flags flags; };
+struct dc_crtc_timing {
+	struct dc_crtc_timing_flags flags;
+	uint32_t h_addressable, v_addressable;
+	uint32_t h_border_left, h_border_right, v_border_top, v_border_bottom;
+	enum dc_pixel_encoding pixel_encoding;
+};
 struct dc;
 struct dc_context { struct dc *dc; struct logger *logger; };
 struct dc_stream_state {
@@ -156,12 +177,10 @@ struct dml2_context {
 	struct dml2_pipe_combine_scratch pipe_combine_scratch;
 };
 
-/* What the extracted code calls outside the pipe acquisition. */
-static bool resource_build_scaling_params(struct pipe_ctx *pipe_ctx)
-{
-	(void)pipe_ctx;
-	return true;
-}
+/* What the extracted code calls outside the pipe acquisition.
+ * resource_build_scaling_params runs SPL on the pipe's slice of its plane
+ * (harness.c). */
+static bool resource_build_scaling_params(struct pipe_ctx *pipe_ctx);
 static void resource_build_test_pattern_params(struct resource_context *res_ctx,
 		struct pipe_ctx *otg_master)
 {
@@ -198,6 +217,10 @@ int resource_get_dpp_pipes_for_plane(const struct dc_plane_state *plane,
 		struct resource_context *res_ctx, struct pipe_ctx *dpp_pipes[MAX_PIPES]);
 struct pipe_ctx *resource_get_otg_master(const struct pipe_ctx *pipe_ctx);
 struct pipe_ctx *resource_get_opp_head(const struct pipe_ctx *pipe_ctx);
+int resource_get_odm_slice_index(const struct pipe_ctx *pipe_ctx);
+int resource_get_odm_slice_dst_width(struct pipe_ctx *otg_master, bool is_last_segment);
+struct rect resource_get_odm_slice_dst_rect(struct pipe_ctx *pipe_ctx);
+struct rect resource_get_odm_slice_src_rect(struct pipe_ctx *pipe_ctx);
 int resource_get_mpc_slice_index(const struct pipe_ctx *pipe_ctx);
 int resource_get_mpc_slice_count(const struct pipe_ctx *pipe);
 int resource_get_odm_slice_count(const struct pipe_ctx *pipe);

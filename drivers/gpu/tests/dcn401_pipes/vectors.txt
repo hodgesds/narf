@@ -329,3 +329,34 @@ begin
 +plane 2 20 ok
 map 2:1:1 ok
 commit s2p20
+# resource_build_scaling_params: a plane whose 9000-pixel source SPL cannot
+# scale on one pipe (wider than max_downscale_src_width) is removed again
+# by resource_append_dpp_pipes_for_plane_composition, and
+# dc_state_add_plane's fallbacks (dropping another plane's MPC combine,
+# then the stream's ODM slices) cannot make it fit either.
+pool 0
+geom 100 9000 2160 0 0 3840 2160
+begin
++stream 10 ok
++plane 10 100 fail
++plane 10 101 ok
+map 10:1:2 ok
+commit s10p101b1 s10p101t0 - -
+begin
++plane 10 100 fail
+map 10:1:1 ok
+commit s10p101 - - -
+# A 15000-pixel source scales on each half of an ODM 2:1 stream but not on
+# one pipe: the plane is added on both OPP heads, and taking the stream
+# back to one slice fails in update_pipe_params_after_odm_slice_count_change
+# (the slice stays released, as in DC).
+pool 0
+geom 102 15000 2160 0 0 3840 2160
+begin
++stream 11 ok
+map 11:2:1 ok
++plane 11 102 ok
+commit s11p102r1 s11p102l0 - -
+begin
+map 11:1:1 fail
+commit s11p102 - - -

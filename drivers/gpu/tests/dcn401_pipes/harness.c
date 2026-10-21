@@ -21,6 +21,18 @@
  *                           for each stream and MPC count for each of its
  *                           planes (stream_status order)
  *   commit                  current = new
+ *   timing <s> <w> <h>      stream s's addressable timing (3840x2160 until
+ *                           given)
+ *   geom <p> <src_w> <src_h> <dst_x> <dst_y> <dst_w> <dst_h>
+ *                           plane p's source (at 0,0 in its surface) and
+ *                           destination on its stream; a plane without one
+ *                           always scales
+ * resource_build_scaling_params runs spl_calculate_scaler_params on each
+ * pipe whose plane has a geometry, with the spl_in
+ * translate_SPL_in_params_from_pipe_ctx builds for an RGB plane on DCN401
+ * (as tests/dcn401_spl): the pipe's resource_get_odm_slice_src_rect and its
+ * MPC slice index and count. A slice change whose plane cannot scale is
+ * rolled back or fails as DC's.
  * Output echoes each line; operations end in " ok" or " fail" (their
  * result) and a commit is followed by the current pipes, one field per
  * pool pipe: "-" for a cleared pipe_ctx, else s<stream>, then p<plane>,
@@ -35,6 +47,71 @@
  * releases encoders, audio and clock sources before clearing the OTG
  * master's pipe_ctx; only the clearing is kept.
  */
+
+int narf_spl_warnings;
+
+/* dscl401_spl_calc_lb_num_partitions, copied from dcn401_dpp.c by check.sh. */
+#include "spl_lb.inc"
+
+static bool resource_build_scaling_params(struct pipe_ctx *pipe_ctx)
+{
+	const struct dc_plane_state *plane = pipe_ctx->plane_state;
+	const struct dc_crtc_timing *t = &pipe_ctx->stream->timing;
+	struct rect odm = resource_get_odm_slice_src_rect(pipe_ctx);
+	static struct spl_in in;
+	static struct spl_out out;
+	static struct dscl_prog_data p;
+
+	if (!plane || !plane->src_rect.width)
+		return true;
+	memset(&in, 0, sizeof(in));
+	memset(&out, 0, sizeof(out));
+	memset(&p, 0, sizeof(p));
+	in.callbacks.spl_calc_lb_num_partitions = dscl401_spl_calc_lb_num_partitions;
+	in.basic_in.format = SPL_PIXEL_FORMAT_ARGB8888;
+	in.basic_out.view_format = SPL_VIEW_3D_NONE;
+	in.basic_in.src_rect = (struct spl_rect){ plane->src_rect.x, plane->src_rect.y,
+		plane->src_rect.width, plane->src_rect.height };
+	in.basic_in.dst_rect = (struct spl_rect){ plane->dst_rect.x, plane->dst_rect.y,
+		plane->dst_rect.width, plane->dst_rect.height };
+	in.basic_in.clip_rect = in.basic_in.dst_rect;
+	in.basic_out.src_rect = (struct spl_rect){ 0, 0, (int)t->h_addressable, (int)t->v_addressable };
+	in.basic_out.dst_rect = in.basic_out.src_rect;
+	in.basic_in.rotation = SPL_ROTATION_ANGLE_0;
+	in.basic_in.num_h_slices_recout_width_align.use_recout_width_aligned = false;
+	in.basic_in.num_h_slices_recout_width_align.num_slices_recout_width.mpc_num_h_slices =
+		resource_get_mpc_slice_count(pipe_ctx);
+	in.basic_in.mpc_h_slice_index = resource_get_mpc_slice_index(pipe_ctx);
+	in.basic_out.odm_slice_rect = (struct spl_rect){ odm.x, odm.y, odm.width, odm.height };
+	in.basic_out.odm_combine_factor = 0;
+	in.odm_slice_index = resource_get_odm_slice_index(pipe_ctx);
+	in.basic_out.output_size.width = (int)t->h_addressable;
+	in.basic_out.output_size.height = (int)t->v_addressable;
+	in.basic_out.max_downscale_src_width = 7680;
+	in.basic_out.always_scale = false;
+	in.basic_out.alpha_en = false;
+	in.basic_out.use_two_pixels_per_container = false;
+	in.prefer_easf = true;
+	in.disable_easf = false;
+	in.adaptive_sharpness.enable = false;
+	in.lls_pref = LLS_PREF_DONT_CARE;
+	in.upsp_mode = UPSP_BYPASS;
+	in.basic_in.cositing = CHROMA_COSITING_NONE;
+	in.h_active = odm.width;
+	in.v_active = odm.height;
+	out.dscl_prog_data = &p;
+	return spl_calculate_scaler_params(&in, &out);
+}
+
+static bool no_two_pixels(const struct dc_crtc_timing *timing)
+{
+	(void)timing;
+	return false;
+}
+static const struct timing_generator_funcs tg_funcs = {
+	.is_two_pixels_per_container = no_two_pixels,
+};
+static const struct opp_funcs opp_funcs;
 
 static int targets_odm[256];
 static int targets_mpc[256][MAX_SURFACES];
@@ -165,6 +242,8 @@ static void new_pool(unsigned int fuses)
 	pool.res_cap = &caps;
 	pool.funcs = &funcs;
 	for (unsigned int j = 0; j < pool.pipe_count; j++) {
+		tgs[j].funcs = &tg_funcs;
+		opps[j].funcs = &opp_funcs;
 		pool.timing_generators[j] = &tgs[j];
 		pool.mis[j] = &mis[j];
 		pool.hubps[j] = &hubps[j];
@@ -181,8 +260,12 @@ static void new_pool(unsigned int fuses)
 	the_dc.res_pool = &pool;
 	the_dc.config.enable_windowed_mpo_odm = true;
 	for (int i = 0; i < 256; i++) {
+		memset(&streams[i], 0, sizeof(streams[i]));
+		memset(&planes[i], 0, sizeof(planes[i]));
 		streams[i].ctx = &dc_ctx;
 		streams[i].stream_id = (uint32_t)i;
+		streams[i].timing.h_addressable = 3840;
+		streams[i].timing.v_addressable = 2160;
 		planes[i].id = i;
 	}
 }
@@ -241,6 +324,25 @@ int main(void)
 		if (!strcmp(op, "pool")) {
 			sscanf(line, "pool %x", &a);
 			new_pool(a);
+			printf("%s\n", line);
+			continue;
+		}
+		if (!strcmp(op, "timing")) {
+			unsigned int s, w, h;
+
+			sscanf(line, "timing %u %u %u", &s, &w, &h);
+			streams[s].timing.h_addressable = w;
+			streams[s].timing.v_addressable = h;
+			printf("%s\n", line);
+			continue;
+		}
+		if (!strcmp(op, "geom")) {
+			unsigned int p;
+			int sw, sh, dx, dy, dw, dh;
+
+			sscanf(line, "geom %u %d %d %d %d %d %d", &p, &sw, &sh, &dx, &dy, &dw, &dh);
+			planes[p].src_rect = (struct rect){ 0, 0, sw, sh };
+			planes[p].dst_rect = (struct rect){ dx, dy, dw, dh };
 			printf("%s\n", line);
 			continue;
 		}

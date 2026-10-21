@@ -478,12 +478,24 @@ free, then any) and `update_pipes_for_plane_with_slice_count`, and
 `map_pipes` (map_dc_pipes_with_callbacks with DML's per-stream `Target`:
 every reduction, then every increase, stream by stream). DSC needs no
 state: DCN401 has a DSC per OPP, dcn20_acquire_dsc's one-to-one branch.
+Every mutating method takes a `Scaling` (resource_build_scaling_params on
+one pipe of the state): a plane appended
+(resource_append_dpp_pipes_for_plane_composition) that cannot scale on
+one of its pipes is removed again, and a slice count change
+(update_pipe_params_after_{odm,mpc}_slice_count_change, run when the count
+changes) fails when one cannot scale, the change itself standing, as in
+DC; acquire_first_split_pipe rescales the pipe above, its result unchecked.
+`ScalesAnywhere` always scales.
 `tests/dcn401_pipes/check.sh` compiles those Linux functions verbatim
-around a fake pool (`shim.h`, `harness.c`) and replays amdgpu_dm-shaped
-transactions on full and harvested pools (`vectors.txt`: stream and plane
-adds and removals, planes recreated, MPC and ODM changes, pools out of
-pipes); `dcn401_pipe_acquisition_matches_linux` replays every line on
-`DcState`.
+around a fake pool (`shim.h`, `harness.c`), with an SPL-backed
+resource_build_scaling_params (the real dc/sspl on the spl_in
+translate_SPL_in_params_from_pipe_ctx builds for an RGB plane at the
+script's `geom`/`timing`, on the pipe's resource_get_odm_slice_src_rect and
+MPC slice), and replays amdgpu_dm-shaped transactions on full and harvested
+pools (`vectors.txt`: stream and plane adds and removals, planes recreated,
+MPC and ODM changes, pools out of pipes, planes SPL cannot scale on one
+pipe); `dcn401_pipe_acquisition_matches_linux` replays every line on
+`DcState` with the same scaling through `amdgpu_dcn401_spl::calculate`.
 
 **Pipe acquisition (Navi48 configurations).** Every pipe a configuration
 takes is DC's choice over `DcState` (`modeset::{light_pipes, beside_pipes,
@@ -496,8 +508,13 @@ slices together and every plane's slices linked across the segments, as
 DC's own acquisition leaves them. A stream's DC plane order is its primary
 first (NARF scans the primary out on the OTG master and its OPP heads),
 then the overlays top first (amdgpu_dm's descending zpos). Each flow
-builds the new state as amdgpu_dm's atomic check does and reads every
-stream's head and further pipes (`DisplayPipes`) back from it:
+builds the new state as amdgpu_dm's atomic check does, every plane's
+scaling on each pipe being the scanout's own SPL on that pipe's slice
+(`PlaneScaling`: `stream_planes` and `SurfaceRequest::scales_on` over the
+configured streams' `StreamPipes::selection` and, for `beside_pipes` and
+`live_pipes(current, s, reset, running)`, the running displays'; an
+admission stand-in from `StreamPipes::of_plan` always scales), and reads
+every stream's head and further pipes (`DisplayPipes`) back from it:
 - `light_pipes(current, streams)`: a configuration lit anew
   (`modeset_routed`; the platform passes the displays it stopped for the
   relight as `current`, one commit as amdgpu_dm modesets them together; a
@@ -509,11 +526,11 @@ stream's head and further pipes (`DisplayPipes`) back from it:
   one on an ODM stream). `head_pipes` is the OTG masters alone;
   `plan_pipes`/`display_pipes` are it over no running display (stand-in
   pipes for admission checks, `display_admits_planes`).
-- `beside_pipes(current, streams)`: new streams beside the running ones
+- `beside_pipes(current, streams, running)`: new streams beside the running ones
   (`modeset_beside`; the running streams and planes kept): their OTG
   masters (a pipe the running state leaves free first), planes and counts;
   `None` (a relight) when that would move a running stream's pipes.
-- `live_pipes(current, stream, reset)`: a running display's planes changed
+- `live_pipes(current, stream, reset, running)`: a running display's planes changed
   (`update_display_planes`): with `planes::planes_reset`
   (should_reset_plane: any non-cursor plane added or removed, or a change
   of its source/destination size (not position), rotation, pixel blend

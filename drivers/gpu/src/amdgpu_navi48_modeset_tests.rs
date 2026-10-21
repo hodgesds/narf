@@ -3809,7 +3809,11 @@ fn navi48_relight_and_beside_reacquire_dcs_pipes() -> TestResult {
         odm: none,
         mpc: none,
     };
-    let beside = beside_pipes(&dc_state(&running), &streams_of(&pick(&[ovl]), &[2]));
+    let beside = beside_pipes(
+        &dc_state(&running),
+        &streams_of(&pick(&[ovl]), &[2]),
+        &running,
+    );
     if beside
         != Some(alloc::vec![(
             2,
@@ -3826,7 +3830,13 @@ fn navi48_relight_and_beside_reacquire_dcs_pipes() -> TestResult {
     let Some(running) = lit_on(&pick(&[mpc, 0, 0]), &[0, 1, 2]) else {
         return TestResult::Fail("split display");
     };
-    if beside_pipes(&dc_state(&running), &streams_of(&pick(&[0]), &[3])).is_some() {
+    if beside_pipes(
+        &dc_state(&running),
+        &streams_of(&pick(&[0]), &[3]),
+        &running,
+    )
+    .is_some()
+    {
         return TestResult::Fail("a running split taken");
     }
     // Harvested pools: the pool's indices, the same rules.
@@ -3836,7 +3846,8 @@ fn navi48_relight_and_beside_reacquire_dcs_pipes() -> TestResult {
         rdna4::publish_pipe_pool(PipePool::from_fuses(fuses));
         let count = rdna4::pipe_pool().count();
         let beside = |running: &[Modeset]| {
-            beside_pipes(&dc_state(running), &streams_of(&pick(&[0]), &[0])).map(|d| d[0].0)
+            beside_pipes(&dc_state(running), &streams_of(&pick(&[0]), &[0]), running)
+                .map(|d| d[0].0)
         };
         let ok = lit_on(&pick(&[odm]), &[count - 1]).is_some_and(|running| {
             running[0].pipe == 0
@@ -4213,6 +4224,7 @@ fn live_on(
         &dc_state(&running),
         &StreamPipes::of(m.crtc, &s, plan),
         reset,
+        &running,
     )
 }
 fn live_one(pipe: u8) -> PlanePipes {

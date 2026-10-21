@@ -622,6 +622,14 @@ impl SurfaceRequest {
                 (p, scaler)
             })
     }
+    /// resource_build_scaling_params for pipe `p` of the request: whether
+    /// SPL can scale the plane on that pipe's slice (`scalers`); true for
+    /// a pipe the request does not fetch on.
+    pub fn scales_on(self, p: u8) -> bool {
+        self.scalers()
+            .find(|&(q, _)| q == p)
+            .is_none_or(|(_, scaler)| scaler.ok)
+    }
     /// Each fetching pipe with its ODM segment's first stream column and
     /// width (resource_get_odm_slice_dst_rect: the line over the segment
     /// count, in whole pixel pairs for 4:2:0, the last segment the rest),

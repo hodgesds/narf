@@ -57,6 +57,8 @@ extract() {
 		resource_get_otg_master_for_stream resource_get_opp_heads_for_otg_master \
 		resource_get_dpp_pipes_for_plane resource_get_otg_master resource_get_opp_head \
 		resource_get_mpc_slice_index resource_get_mpc_slice_count resource_get_odm_slice_count \
+		resource_get_odm_slice_index resource_get_odm_slice_dst_width \
+		resource_get_odm_slice_dst_rect resource_get_odm_slice_src_rect \
 		resource_find_free_pipe_used_as_sec_opp_head_by_cur_otg_master \
 		resource_find_free_pipe_used_in_cur_mpc_blending_tree \
 		recource_find_free_pipe_not_used_in_cur_res_ctx \
@@ -100,8 +102,21 @@ grep -q 'enable_windowed_mpo_odm = true' "$dc/resource/dcn401/dcn401_resource.c"
 	|| { echo "dcn401 no longer sets enable_windowed_mpo_odm" >&2; exit 1; }
 grep -q 'map_dc_pipes_with_callbacks = true' "$dc/resource/dcn401/dcn401_resource.c" \
 	|| { echo "dcn401 no longer maps pipes with callbacks" >&2; exit 1; }
+# resource_build_scaling_params on SPL (dc/sspl), built as tests/dcn401_spl
+# builds it: the planes' scaling decides whether a slice change stands.
+sspl=$dc/sspl
+spl_inc=(-I"$here/../dcn401_spl/include" -I"$sspl" -I"$work" -I"$linux/drivers/gpu/drm/amd/include")
+awk '/^void dscl401_spl_calc_lb_num_partitions\(/ { on = 1 }
+	on { print }
+	on && /^}/ { exit }' "$dc/dpp/dcn401/dcn401_dpp.c" > "$work/spl_lb.inc"
+[ -s "$work/spl_lb.inc" ] || { echo "dscl401_spl_calc_lb_num_partitions not found" >&2; exit 1; }
+for f in dc_spl dc_spl_scl_filters dc_spl_scl_easf_filters dc_spl_isharp_filters \
+	dc_spl_filters spl_fixpt31_32 spl_custom_float; do
+	cc -c -O1 -w -Wno-error=incompatible-pointer-types "${spl_inc[@]}" "$sspl/$f.c" -o "$work/$f.o"
+done
 cc -O1 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-sign-compare \
-	-Wno-missing-field-initializers "$work/pipes.c" -o "$work/pipes"
+	-Wno-missing-field-initializers "${spl_inc[@]}" "$work/pipes.c" "$work"/dc_spl*.o \
+	"$work"/spl_*.o -o "$work/pipes"
 
 # The script vectors.txt spells: its lines without their results.
 sed -e 's/ \(ok\|fail\)$//' -e 's/^commit .*/commit/' "$here/vectors.txt" >"$work/script"

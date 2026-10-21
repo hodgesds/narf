@@ -50,12 +50,70 @@ fn targets(args: &str) -> Option<[(u8, Target); MAX_STREAMS]> {
     Some(out)
 }
 
+/// harness.c's resource_build_scaling_params: SPL on the pipe's slice of
+/// its plane (an RGB plane at its geometry, the slice its
+/// resource_get_odm_slice_src_rect and MPC slice), or true for a plane the
+/// script gave no geometry.
+struct Geometry {
+    timing: alloc::collections::BTreeMap<u8, (i32, i32)>,
+    planes: alloc::collections::BTreeMap<u8, ([i32; 2], crate::amdgpu_dcn401_spl::Rect)>,
+}
+impl Scaling for Geometry {
+    fn build(&self, s: &DcState, pipe: u8) -> bool {
+        use crate::amdgpu_dcn401_spl as spl;
+        let p = s.pipes[usize::from(pipe)];
+        let (Some(plane), Some(stream)) = (p.plane, p.stream) else {
+            return true;
+        };
+        let Some(&([sw, sh], dst)) = self.planes.get(&plane) else {
+            return true;
+        };
+        let (w, h) = self.timing.get(&stream).copied().unwrap_or((3840, 2160));
+        // resource_get_odm_slice_dst_width/_rect: h_active over the count,
+        // the last slice the rest.
+        let count = s.odm_slice_count(pipe) as i32;
+        let index = s.odm_slice_index(pipe) as i32;
+        let width = w / count;
+        let odm_slice = spl::Rect::new(
+            width * index,
+            0,
+            if index + 1 == count {
+                w - width * (count - 1)
+            } else {
+                width
+            },
+            h,
+        );
+        spl::calculate(&spl::Input {
+            src: spl::Rect::new(0, 0, sw, sh),
+            dst,
+            clip: dst,
+            stream_width: w,
+            stream_height: h,
+            odm_slice,
+            mpc_slice: (
+                s.mpc_slice_index(pipe) as i32,
+                s.mpc_slice_count(pipe) as i32,
+            ),
+            rotation: spl::Rotation::R0,
+            horizontal_mirror: false,
+            alpha: false,
+            video: None,
+        })
+        .ok
+    }
+}
+
 /// Every transaction of the vectors on `DcState`: each operation's result
 /// and every committed state's pipes as Linux's.
 fn dcn401_pipe_acquisition_matches_linux() -> TestResult {
     let mut cur = DcState::new(0);
     let mut next = cur;
     let (mut commits, mut ops) = (0, 0);
+    let mut sc = Geometry {
+        timing: alloc::collections::BTreeMap::new(),
+        planes: alloc::collections::BTreeMap::new(),
+    };
     for line in VECTORS.lines() {
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -65,6 +123,33 @@ fn dcn401_pipe_acquisition_matches_linux() -> TestResult {
             let count = crate::amdgpu_rdna4::PipePool::from_fuses(fuses).count();
             cur = DcState::new(count);
             next = cur;
+            sc.timing.clear();
+            sc.planes.clear();
+            continue;
+        }
+        let words: alloc::vec::Vec<i32> = line
+            .split_whitespace()
+            .skip(1)
+            .filter_map(|v| v.parse().ok())
+            .collect();
+        if line.starts_with("timing ") {
+            let [s, w, h] = words[..] else {
+                return TestResult::Fail("timing");
+            };
+            sc.timing.insert(s as u8, (w, h));
+            continue;
+        }
+        if line.starts_with("geom ") {
+            let [p, sw, sh, dx, dy, dw, dh] = words[..] else {
+                return TestResult::Fail("geom");
+            };
+            sc.planes.insert(
+                p as u8,
+                (
+                    [sw, sh],
+                    crate::amdgpu_dcn401_spl::Rect::new(dx, dy, dw, dh),
+                ),
+            );
             continue;
         }
         if line == "begin" {
@@ -97,20 +182,20 @@ fn dcn401_pipe_acquisition_matches_linux() -> TestResult {
                 let Some(s) = arg() else {
                     return TestResult::Fail("stream");
                 };
-                next.add_stream(&cur, s)
+                next.add_stream(&cur, s, &sc)
             }
             "-stream" => {
                 let Some(s) = arg() else {
                     return TestResult::Fail("stream");
                 };
-                next.remove_stream(&cur, s)
+                next.remove_stream(&cur, s, &sc)
             }
             "+plane" | "-plane" => {
                 let (Some(s), Some(p)) = (arg(), arg()) else {
                     return TestResult::Fail("plane");
                 };
                 if name == "+plane" {
-                    next.add_plane(&cur, s, p)
+                    next.add_plane(&cur, s, p, &sc)
                 } else {
                     next.remove_plane(s, p)
                 }
@@ -119,15 +204,19 @@ fn dcn401_pipe_acquisition_matches_linux() -> TestResult {
                 let Some(t) = targets(&op[4..]) else {
                     return TestResult::Fail("map targets");
                 };
-                next.map_pipes(&cur, |s| {
-                    t.iter().find(|(id, _)| *id == s).map_or(
-                        Target {
-                            odm: 1,
-                            mpc: [1; MAX_SURFACES],
-                        },
-                        |&(_, t)| t,
-                    )
-                })
+                next.map_pipes(
+                    &cur,
+                    |s| {
+                        t.iter().find(|(id, _)| *id == s).map_or(
+                            Target {
+                                odm: 1,
+                                mpc: [1; MAX_SURFACES],
+                            },
+                            |&(_, t)| t,
+                        )
+                    },
+                    &sc,
+                )
             }
             _ => return TestResult::Fail("unknown operation"),
         };

@@ -68,6 +68,29 @@ pub struct DcState {
     pub stream_count: u8,
 }
 
+/// resource_build_scaling_params for `pipe` of `state`: whether SPL can
+/// scale the pipe's plane on the pipe's ODM and MPC slice. DC runs it on
+/// every pipe of a plane whose MPC slices or stream's ODM slices change
+/// (update_pipe_params_after_{mpc,odm}_slice_count_change) and rolls the
+/// change back, or fails it, when one cannot scale.
+pub trait Scaling {
+    fn build(&self, state: &DcState, pipe: u8) -> bool;
+}
+impl<F: Fn(&DcState, u8) -> bool> Scaling for F {
+    fn build(&self, state: &DcState, pipe: u8) -> bool {
+        self(state, pipe)
+    }
+}
+/// Every plane scales on any slice: for planes no SPL input describes
+/// (stand-in planes of admission checks).
+#[derive(Clone, Copy, Debug)]
+pub struct ScalesAnywhere;
+impl Scaling for ScalesAnywhere {
+    fn build(&self, _: &DcState, _: u8) -> bool {
+        true
+    }
+}
+
 /// resource_is_pipe_type's types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PipeType {
@@ -180,6 +203,17 @@ impl DcState {
             }
         }
         (out, n)
+    }
+    /// resource_get_odm_slice_index: the pipe's OPP head's position among
+    /// its stream's ODM slices.
+    pub fn odm_slice_index(&self, pipe: u8) -> usize {
+        let mut head = self.opp_head(pipe);
+        let mut index = 0;
+        while let Some(prev) = self.p(head).prev_odm {
+            index += 1;
+            head = prev;
+        }
+        index
     }
     /// resource_get_otg_master.
     pub fn otg_master(&self, pipe: u8) -> u8 {
@@ -332,7 +366,7 @@ impl DcState {
     /// else one the current state does not use (no pipe swap), else one it
     /// used as a secondary DPP (more streams before MPO planes), else any
     /// free pipe, else an MPC split (acquire_first_split_pipe).
-    fn acquire_otg_master(&mut self, cur: &Self, stream: u8) -> Option<u8> {
+    fn acquire_otg_master(&mut self, cur: &Self, stream: u8, sc: &dyn Scaling) -> Option<u8> {
         let found = self
             .free_used_as_otg_master_in_cur(cur)
             .or_else(|| self.free_not_used_in_cur(cur))
@@ -346,12 +380,13 @@ impl DcState {
                 };
                 Some(i)
             }
-            None => self.acquire_first_split_pipe(stream),
+            None => self.acquire_first_split_pipe(stream, sc),
         }
     }
     /// acquire_first_split_pipe: the first pipe MPC-combined with the one
-    /// above it leaves that tree for the stream.
-    fn acquire_first_split_pipe(&mut self, stream: u8) -> Option<u8> {
+    /// above it leaves that tree for the stream; the pipe above scales its
+    /// plane again (its result unchecked, as in Linux).
+    fn acquire_first_split_pipe(&mut self, stream: u8, sc: &dyn Scaling) -> Option<u8> {
         for i in self.pool() {
             let p = *self.p(i);
             let Some(top) = p.top else { continue };
@@ -361,6 +396,9 @@ impl DcState {
             self.pm(top).bottom = p.bottom;
             if let Some(b) = p.bottom {
                 self.pm(b).top = p.top;
+            }
+            if self.p(top).plane.is_some() {
+                sc.build(self, top);
             }
             *self.pm(i) = PipeCtx {
                 stream: Some(stream),
@@ -453,13 +491,49 @@ impl DcState {
         }
         true
     }
-    /// resource_append_dpp_pipes_for_plane_composition.
-    fn append_dpp_pipes_for_plane(&mut self, cur: &Self, otg_master: u8, plane: u8) -> bool {
-        if self.p(otg_master).plane.is_none() {
+    /// resource_append_dpp_pipes_for_plane_composition: the plane on the
+    /// OPP heads or a secondary DPP per head, then its scaling on each of
+    /// its pipes (its MPC slice count went from 0 to 1); a plane that
+    /// cannot scale is removed again.
+    fn append_dpp_pipes_for_plane(
+        &mut self,
+        cur: &Self,
+        otg_master: u8,
+        plane: u8,
+        sc: &dyn Scaling,
+    ) -> bool {
+        let mut success = if self.p(otg_master).plane.is_none() {
             self.add_plane_to_opp_heads(otg_master, plane)
         } else {
             self.acquire_secondary_dpps_and_add_plane(cur, otg_master, plane)
+        };
+        if success {
+            success = self.update_pipe_params_after_mpc_slice_count_change(plane, sc);
+            if !success {
+                self.remove_dpp_pipes_for_plane(plane);
+            }
         }
+        success
+    }
+    /// update_pipe_params_after_odm_slice_count_change: every planed pipe
+    /// of the OTG master's stream scales on its slice, in pipe order until
+    /// one cannot.
+    fn update_pipe_params_after_odm_slice_count_change(
+        &self,
+        otg_master: u8,
+        sc: &dyn Scaling,
+    ) -> bool {
+        let stream = self.p(otg_master).stream;
+        self.pool().all(|i| {
+            let p = self.p(i);
+            p.stream != stream || p.plane.is_none() || sc.build(self, i)
+        })
+    }
+    /// update_pipe_params_after_mpc_slice_count_change: every pipe of the
+    /// plane scales on its slice, in pipe order until one cannot.
+    fn update_pipe_params_after_mpc_slice_count_change(&self, plane: u8, sc: &dyn Scaling) -> bool {
+        self.pool()
+            .all(|i| self.p(i).plane != Some(plane) || sc.build(self, i))
     }
     /// resource_remove_dpp_pipes_for_plane_composition: from the last pool
     /// pipe down, each of the plane's pipes leaves its tree; an OPP head
@@ -583,11 +657,15 @@ impl DcState {
         cur: &Self,
         stream: u8,
         slices: usize,
+        sc: &dyn Scaling,
     ) -> bool {
         let Some(otg) = self.otg_master_for_stream(stream) else {
             return false;
         };
         let have = self.odm_slice_count(otg);
+        if slices == have {
+            return true;
+        }
         let mut result = true;
         if slices > have {
             for _ in 0..slices - have {
@@ -604,6 +682,9 @@ impl DcState {
                 result = self.release_pipes_and_remove_odm_slice(otg);
             }
         }
+        if result {
+            result = self.update_pipe_params_after_odm_slice_count_change(otg, sc);
+        }
         result
     }
     /// resource_update_pipes_for_plane_with_slice_count.
@@ -612,12 +693,16 @@ impl DcState {
         cur: &Self,
         plane: u8,
         slices: usize,
+        sc: &dyn Scaling,
     ) -> bool {
         let (dpp, n) = self.dpp_pipes_for_plane(plane);
         if n == 0 {
             return false;
         }
         let have = self.mpc_slice_count(dpp[0]);
+        if slices == have {
+            return true;
+        }
         let mut result = true;
         if slices > have {
             for _ in 0..slices - have {
@@ -634,6 +719,10 @@ impl DcState {
                 result = self.release_dpp_pipe_and_remove_mpc_slice(dpp[0]);
             }
         }
+        if result {
+            // dpp_pipes[0]->plane_state: the plane.
+            result = self.update_pipe_params_after_mpc_slice_count_change(plane, sc);
+        }
         result
     }
 
@@ -644,7 +733,7 @@ impl DcState {
     /// dc_state_add_stream: one stream per timing generator; its OTG master
     /// (resource_map_pool_resources's acquisition). A stream without one is
     /// still in the state (DC_NO_CONTROLLER_RESOURCE fails the commit).
-    pub fn add_stream(&mut self, cur: &Self, stream: u8) -> bool {
+    pub fn add_stream(&mut self, cur: &Self, stream: u8, sc: &dyn Scaling) -> bool {
         if self.stream_count >= self.pipe_count {
             return false;
         }
@@ -653,16 +742,16 @@ impl DcState {
             ..StreamStatus::default()
         };
         self.stream_count += 1;
-        self.acquire_otg_master(cur, stream);
+        self.acquire_otg_master(cur, stream, sc);
         self.otg_master_for_stream(stream).is_some()
     }
     /// dc_state_remove_stream: its ODM slices released, its OTG master
     /// cleared, its status dropped.
-    pub fn remove_stream(&mut self, cur: &Self, stream: u8) -> bool {
+    pub fn remove_stream(&mut self, cur: &Self, stream: u8, sc: &dyn Scaling) -> bool {
         if self.otg_master_for_stream(stream).is_none() {
             return false;
         }
-        self.update_pipes_for_stream_with_slice_count(cur, stream, 1);
+        self.update_pipes_for_stream_with_slice_count(cur, stream, 1, sc);
         if let Some(otg) = self.otg_master_for_stream(stream) {
             *self.pm(otg) = PipeCtx::default();
         }
@@ -679,7 +768,7 @@ impl DcState {
     /// or on a secondary DPP per OPP head; short of pipes, every stream's
     /// MPC combine is dropped and it tries again, then the stream's ODM
     /// slices one by one.
-    pub fn add_plane(&mut self, cur: &Self, stream: u8, plane: u8) -> bool {
+    pub fn add_plane(&mut self, cur: &Self, stream: u8, plane: u8, sc: &dyn Scaling) -> bool {
         let Some(si) = self.status_index(stream) else {
             return false;
         };
@@ -689,22 +778,22 @@ impl DcState {
         let Some(otg) = self.otg_master_for_stream(stream) else {
             return false;
         };
-        let mut added = self.append_dpp_pipes_for_plane(cur, otg, plane);
+        let mut added = self.append_dpp_pipes_for_plane(cur, otg, plane, sc);
         if !added {
             // remove_mpc_combine_for_stream on every stream.
             for i in 0..usize::from(self.stream_count) {
                 let s = self.streams[i];
                 for &p in s.planes() {
-                    self.update_pipes_for_plane_with_slice_count(cur, p, 1);
+                    self.update_pipes_for_plane_with_slice_count(cur, p, 1, sc);
                 }
             }
-            added = self.append_dpp_pipes_for_plane(cur, otg, plane);
+            added = self.append_dpp_pipes_for_plane(cur, otg, plane, sc);
         }
         if !added {
             let slices = self.odm_slice_count(otg);
             for i in (1..slices).rev() {
-                self.update_pipes_for_stream_with_slice_count(cur, stream, i);
-                added = self.append_dpp_pipes_for_plane(cur, otg, plane);
+                self.update_pipes_for_stream_with_slice_count(cur, stream, i, sc);
+                added = self.append_dpp_pipes_for_plane(cur, otg, plane, sc);
                 if added {
                     break;
                 }
@@ -738,7 +827,12 @@ impl DcState {
     /// source counts from this state and `target(stream)`'s (an MPC target
     /// of 1 on an ODM stream); every reduction first (a stream's planes,
     /// then its ODM), then every increase, stream by stream.
-    pub fn map_pipes(&mut self, cur: &Self, target: impl Fn(u8) -> Target) -> bool {
+    pub fn map_pipes(
+        &mut self,
+        cur: &Self,
+        target: impl Fn(u8) -> Target,
+        sc: &dyn Scaling,
+    ) -> bool {
         #[derive(Clone, Copy, Default)]
         struct Factor {
             source: usize,
@@ -782,12 +876,12 @@ impl DcState {
             for (k, &p) in s.planes().iter().enumerate() {
                 if mpc[i][k].target < mpc[i][k].source {
                     result &=
-                        self.update_pipes_for_plane_with_slice_count(cur, p, mpc[i][k].target);
+                        self.update_pipes_for_plane_with_slice_count(cur, p, mpc[i][k].target, sc);
                 }
             }
             if odm[i].target < odm[i].source {
                 result &=
-                    self.update_pipes_for_stream_with_slice_count(cur, s.stream, odm[i].target);
+                    self.update_pipes_for_stream_with_slice_count(cur, s.stream, odm[i].target, sc);
             }
         }
         for i in 0..n {
@@ -795,12 +889,12 @@ impl DcState {
             for (k, &p) in s.planes().iter().enumerate() {
                 if mpc[i][k].target > mpc[i][k].source {
                     result &=
-                        self.update_pipes_for_plane_with_slice_count(cur, p, mpc[i][k].target);
+                        self.update_pipes_for_plane_with_slice_count(cur, p, mpc[i][k].target, sc);
                 }
             }
             if odm[i].target > odm[i].source {
                 result &=
-                    self.update_pipes_for_stream_with_slice_count(cur, s.stream, odm[i].target);
+                    self.update_pipes_for_stream_with_slice_count(cur, s.stream, odm[i].target, sc);
             }
         }
         result

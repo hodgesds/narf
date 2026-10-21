@@ -14,7 +14,7 @@
 //! Planes of different streams are added stream by stream, in CRTC order,
 //! not interleaved by DRM's zpos across CRTCs.
 use super::*;
-use crate::amdgpu_dcn401_resource::{DcState, Target, MAX_SURFACES};
+use crate::amdgpu_dcn401_resource::{DcState, ScalesAnywhere, Scaling, Target, MAX_SURFACES};
 
 /// One stream of a configuration as its pipes are acquired: its CRTC (the
 /// stream's id), which overlay slots of its planes are present (bottom
@@ -24,14 +24,18 @@ pub struct StreamPipes<'a> {
     pub crtc: u8,
     pub overlays: [bool; otg::MAX_OVERLAYS],
     pub plan: &'a dml::Plan,
+    /// The stream's planes and timing, for their scaling on each pipe;
+    /// `None` for admission's stand-in planes, which always scale.
+    pub selection: Option<&'a Selection>,
 }
 impl<'a> StreamPipes<'a> {
     /// The stream of `selection`'s planes on CRTC `crtc` under `plan`.
-    pub fn of(crtc: u8, selection: &Selection, plan: &'a dml::Plan) -> Self {
+    pub fn of(crtc: u8, selection: &'a Selection, plan: &'a dml::Plan) -> Self {
         Self {
             crtc,
             overlays: selection.planes.overlays.map(|o| o.is_some()),
             plan,
+            selection: Some(selection),
         }
     }
     /// The stream of the planes `plan` was admitted with (its overlays the
@@ -42,6 +46,7 @@ impl<'a> StreamPipes<'a> {
             crtc,
             overlays: core::array::from_fn(|k| k < n),
             plan,
+            selection: None,
         }
     }
     /// DML's pipe counts in DC plane order: the stream's ODM slices, each
@@ -83,6 +88,72 @@ fn dc_slots(overlays: [bool; otg::MAX_OVERLAYS]) -> ([usize; SLOTS], usize) {
         n += 1;
     }
     (out, n)
+}
+
+/// resource_build_scaling_params on the pipes DC acquires for a
+/// configuration: SPL on the pipe's ODM and MPC slice of its plane, as the
+/// scanout programs it (`stream_planes`, `SurfaceRequest::scalers`). A plane
+/// of a stream whose selection this does not know (admission's stand-ins)
+/// scales.
+struct PlaneScaling<'a> {
+    /// The streams' selections by CRTC, the configured ones first.
+    displays: Vec<(u8, &'a Selection)>,
+}
+impl<'a> PlaneScaling<'a> {
+    fn new(streams: &[StreamPipes<'a>], running: &'a [Modeset]) -> Self {
+        let mut displays: Vec<(u8, &'a Selection)> = streams
+            .iter()
+            .filter_map(|s| s.selection.map(|sel| (s.crtc, sel)))
+            .collect();
+        displays.extend(running.iter().map(|m| (m.crtc, &m.selection)));
+        Self { displays }
+    }
+}
+impl Scaling for PlaneScaling<'_> {
+    fn build(&self, s: &DcState, pipe: u8) -> bool {
+        let p = s.pipes[usize::from(pipe)];
+        let (Some(crtc), Some(plane)) = (p.stream, p.plane) else {
+            return true;
+        };
+        let Some(&(_, sel)) = self.displays.iter().find(|(c, _)| *c == crtc) else {
+            return true;
+        };
+        let slot = usize::from(plane.wrapping_sub(plane_id(crtc, 0)));
+        let (dpp, n) = s.dpp_pipes_for_plane(plane);
+        let Some(rest) = otg::SplitPipes::new(&dpp[1..n.max(1)]) else {
+            return true;
+        };
+        if n == 0 || slot >= SLOTS {
+            return true;
+        }
+        let (odm, mpc) = if s.odm_slice_count(dpp[0]) > 1 {
+            (rest, otg::SplitPipes::NONE)
+        } else {
+            (otg::SplitPipes::NONE, rest)
+        };
+        let mut overlays: OverlayPipes = [None; otg::MAX_OVERLAYS];
+        if slot > 0 {
+            overlays[slot - 1] = Some(PlanePipes {
+                pipe: dpp[0],
+                odm,
+                mpc,
+            });
+        }
+        let (primary, others) = stream_planes(
+            &sel.timing,
+            sel.ycbcr420,
+            sel.format,
+            &sel.planes,
+            (dpp[0], odm, mpc),
+            &overlays,
+        );
+        let request = if slot == 0 {
+            Some(primary)
+        } else {
+            others[slot - 1]
+        };
+        request.is_none_or(|r| r.scales_on(pipe))
+    }
 }
 
 fn refused() -> ModesetError {
@@ -193,10 +264,15 @@ fn current_target(state: &DcState, stream: u8) -> Target {
 }
 
 /// Add `s`'s planes to its stream in DC plane order (dc_state_add_plane).
-fn add_planes(new: &mut DcState, cur: &DcState, s: &StreamPipes) -> Result<(), ModesetError> {
+fn add_planes(
+    new: &mut DcState,
+    cur: &DcState,
+    s: &StreamPipes,
+    sc: &dyn Scaling,
+) -> Result<(), ModesetError> {
     let (slots, n) = dc_slots(s.overlays);
     for &slot in &slots[..n] {
-        if !new.add_plane(cur, s.crtc, plane_id(s.crtc, slot)) {
+        if !new.add_plane(cur, s.crtc, plane_id(s.crtc, slot), sc) {
             return Err(refused());
         }
     }
@@ -206,13 +282,22 @@ fn add_planes(new: &mut DcState, cur: &DcState, s: &StreamPipes) -> Result<(), M
 /// DML's counts mapped onto `new` (map_dc_pipes_with_callbacks): the
 /// streams `streams` at their plans, every other stream as it runs in
 /// `cur`.
-fn map(new: &mut DcState, cur: &DcState, streams: &[StreamPipes]) -> Result<(), ModesetError> {
-    let ok = new.map_pipes(cur, |stream| {
-        streams
-            .iter()
-            .find(|s| s.crtc == stream)
-            .map_or_else(|| current_target(cur, stream), StreamPipes::target)
-    });
+fn map(
+    new: &mut DcState,
+    cur: &DcState,
+    streams: &[StreamPipes],
+    sc: &dyn Scaling,
+) -> Result<(), ModesetError> {
+    let ok = new.map_pipes(
+        cur,
+        |stream| {
+            streams
+                .iter()
+                .find(|s| s.crtc == stream)
+                .map_or_else(|| current_target(cur, stream), StreamPipes::target)
+        },
+        sc,
+    );
     if ok {
         Ok(())
     } else {
@@ -272,7 +357,7 @@ pub fn head_pipes(current: &DcState, crtcs: &[u8]) -> Vec<u8> {
     let mut new = DcState::new(current.pipe_count);
     let mut heads = Vec::with_capacity(crtcs.len());
     for &crtc in crtcs {
-        if !new.add_stream(current, crtc) {
+        if !new.add_stream(current, crtc, &ScalesAnywhere) {
             break;
         }
         heads.extend(new.otg_master_for_stream(crtc));
@@ -289,15 +374,17 @@ pub fn light_pipes(
     streams: &[StreamPipes],
 ) -> Result<Vec<(u8, DisplayPipes)>, ModesetError> {
     let mut new = DcState::new(current.pipe_count);
+    // Every running stream was removed: only these streams' planes scale.
+    let sc = PlaneScaling::new(streams, &[]);
     for s in streams {
-        if !new.add_stream(current, s.crtc) {
+        if !new.add_stream(current, s.crtc, &sc) {
             return Err(refused());
         }
     }
     for s in streams {
-        add_planes(&mut new, current, s)?;
+        add_planes(&mut new, current, s, &sc)?;
     }
-    map(&mut new, current, streams)?;
+    map(&mut new, current, streams, &sc)?;
     streams
         .iter()
         .map(|s| stream_pipes(&new, s.crtc, s.overlays))
@@ -341,23 +428,29 @@ pub fn display_pipes(
 }
 
 /// New streams lit beside the running ones (`current`, which keep their
-/// streams and planes): each of `streams` added with its OTG master, its
-/// planes, then DML's counts for all (the running streams at theirs).
+/// streams and planes, `running`'s): each of `streams` added with its OTG
+/// master, its planes, then DML's counts for all (the running streams at
+/// theirs).
 /// Each new stream's head pipe and further pipes, or None when they do
 /// not fit or would move a running stream's pipes (acquire_first_split_
 /// pipe, or dc_state_add_plane dropping another stream's MPC combine for a
 /// plane short of pipes): a modeset of them.
-pub fn beside_pipes(current: &DcState, streams: &[StreamPipes]) -> Option<Vec<(u8, DisplayPipes)>> {
+pub fn beside_pipes(
+    current: &DcState,
+    streams: &[StreamPipes],
+    running: &[Modeset],
+) -> Option<Vec<(u8, DisplayPipes)>> {
     let mut new = *current;
+    let sc = PlaneScaling::new(streams, running);
     for s in streams {
-        if !new.add_stream(current, s.crtc) {
+        if !new.add_stream(current, s.crtc, &sc) {
             return None;
         }
     }
     for s in streams {
-        add_planes(&mut new, current, s).ok()?;
+        add_planes(&mut new, current, s, &sc).ok()?;
     }
-    map(&mut new, current, streams).ok()?;
+    map(&mut new, current, streams, &sc).ok()?;
     if !keeps_running(current, &new, streams) {
         return None;
     }
@@ -379,13 +472,20 @@ fn keeps_running(current: &DcState, new: &DcState, streams: &[StreamPipes]) -> b
 }
 
 /// Running stream `s`'s planes changed in place (amdgpu_dm's plane commit
-/// without a modeset): with `reset` (should_reset_plane) every plane of
+/// without a modeset; `running` the running displays `current` records):
+/// with `reset` (should_reset_plane) every plane of
 /// the stream removed and added again in DC plane order, then DML's counts
 /// for all (the other streams at theirs). The stream's further pipes, or
 /// None when they do not fit, another stream's pipes would move or the
 /// stream itself would (another OTG master or ODM split): a modeset.
-pub fn live_pipes(current: &DcState, s: &StreamPipes, reset: bool) -> Option<DisplayPipes> {
+pub fn live_pipes(
+    current: &DcState,
+    s: &StreamPipes,
+    reset: bool,
+    running: &[Modeset],
+) -> Option<DisplayPipes> {
     let mut new = *current;
+    let sc = PlaneScaling::new(core::slice::from_ref(s), running);
     let status = current
         .streams()
         .iter()
@@ -396,7 +496,7 @@ pub fn live_pipes(current: &DcState, s: &StreamPipes, reset: bool) -> Option<Dis
         for &p in status.planes().iter().rev() {
             new.remove_plane(s.crtc, p);
         }
-        add_planes(&mut new, current, s).ok()?;
+        add_planes(&mut new, current, s, &sc).ok()?;
     } else {
         let (slots, n) = dc_slots(s.overlays);
         let same = status.planes().len() == n
@@ -409,7 +509,7 @@ pub fn live_pipes(current: &DcState, s: &StreamPipes, reset: bool) -> Option<Dis
             return None;
         }
     }
-    map(&mut new, current, core::slice::from_ref(s)).ok()?;
+    map(&mut new, current, core::slice::from_ref(s), &sc).ok()?;
     let old = current.otg_master_for_stream(s.crtc)?;
     let head = new.otg_master_for_stream(s.crtc)?;
     if old != head

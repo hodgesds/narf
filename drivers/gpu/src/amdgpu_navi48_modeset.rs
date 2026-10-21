@@ -4570,9 +4570,9 @@ impl ColdBoot {
         let streams: Vec<StreamPipes> = new
             .iter()
             .zip(&new_plans)
-            .map(|(&(s, crtc), plan)| StreamPipes::of(crtc, &s, plan))
+            .map(|((s, crtc), plan)| StreamPipes::of(*crtc, s, plan))
             .collect();
-        let Some(acquired) = beside_pipes(&dc_state(&running), &streams) else {
+        let Some(acquired) = beside_pipes(&dc_state(&running), &streams, &running) else {
             return Ok(None);
         };
         let (new_pipes, extra): (Vec<u8>, Vec<DisplayPipes>) = acquired.into_iter().unzip();

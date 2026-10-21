@@ -262,7 +262,7 @@ impl ColdBoot {
         // move the stream or another display's pipes is a modeset.
         let reset_pipes = planes_reset(m.selection.format, &m.selection.planes, format, &setup);
         let stream = StreamPipes::of(m.crtc, &selection, &plan);
-        let Some(pipes) = live_pipes(&dc_state(&running), &stream, reset_pipes) else {
+        let Some(pipes) = live_pipes(&dc_state(&running), &stream, reset_pipes, &running) else {
             return Ok(None);
         };
         let (mpc, overlays) = (pipes.mpc, pipes.overlays);
