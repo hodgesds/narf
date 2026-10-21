@@ -160,6 +160,27 @@ pub struct PlanesUpdated {
     pub released: u64,
 }
 
+/// The first content of a plane surface a live update allocates afresh (a
+/// new plane, or one of another allocation), written into it once cleared
+/// and before the update programs it, so the frame the update latches
+/// already shows the plane's framebuffer, as DC scans a new plane's address
+/// from the update that adds it. `chunk(a, index, words)` fills `words`
+/// with chunk `index` (from 0) of surface `a`'s bytes as packed 32-bit
+/// words and returns the byte offset they go to, or None when there is no
+/// more (none at all leaves the surface cleared). A chunk outside the
+/// surface refuses the update before any register write.
+pub trait PlaneContent: Send {
+    fn chunk(&mut self, a: &SurfaceApplied, index: u32, words: &mut Vec<u32>) -> Option<u64>;
+}
+/// No first content: fresh surfaces stay cleared until the next flip.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Cleared;
+impl PlaneContent for Cleared {
+    fn chunk(&mut self, _: &SurfaceApplied, _: u32, _: &mut Vec<u32>) -> Option<u64> {
+        None
+    }
+}
+
 /// One MPCC tree as mpc1's software list keeps it: its OPP and its MPCCs,
 /// top first.
 struct MpcTree {
@@ -546,8 +567,8 @@ impl Surfaces {
     /// on the pipes the planes keep, take (free pipes, enabled off-tree
     /// first) or free (retired after the update latched). A plane of the
     /// same allocation keeps its buffers and content; any other gets a
-    /// cleared one, and the buffers it supersedes are released once nothing
-    /// fetches them. Refusals before the first register write leave the
+    /// cleared one holding `content`'s first frame, and the buffers it
+    /// supersedes are released once nothing fetches them. Refusals before the first register write leave the
     /// scanout as it was; later failure or cancellation quarantines it.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::amdgpu_dcn401_otg) async fn update_live_planes<I: Io>(
@@ -558,6 +579,7 @@ impl Surfaces {
         request: &LivePlanes,
         plan: &dml::Plan,
         crystal_khz: u32,
+        content: &mut dyn PlaneContent,
         mut owners: impl FnMut() -> Result<(dccg::Applied, DisplayContext), Error>,
     ) -> Result<alloc::boxed::Box<PlanesUpdated>, Error> {
         let slot = usize::from(pipe);
@@ -747,6 +769,30 @@ impl Surfaces {
                 pitch_bytes,
                 bytes,
             };
+            // Its first content, before the hardware hears of it: the
+            // update latches with the plane's framebuffer shown.
+            let mut words = Vec::new();
+            let mut index = 0u32;
+            while let Some(offset) = content.chunk(&a, index, &mut words) {
+                let end = (words.len() as u64)
+                    .checked_mul(4)
+                    .and_then(|n| n.checked_add(offset));
+                if words.is_empty() || offset % 4 != 0 || end.is_none_or(|end| end > bytes) {
+                    return Err(Error::Invalid);
+                }
+                e.access(|_| {
+                    for (i, &word) in words.iter().enumerate() {
+                        // SAFETY: live authority, checked bounds within an
+                        // owned, unpublished VRAM mapping.
+                        unsafe { map.write32(offset + i as u64 * 4, word) };
+                    }
+                    Ok(())
+                })?;
+                index += 1;
+                if index % 16 == 0 {
+                    narf_scheduler::yield_now().await;
+                }
+            }
             applied.push(a);
             fresh.push(Surface {
                 memory,
@@ -1018,6 +1064,7 @@ impl Otg {
         request: &LivePlanes,
         plan: &dml::Plan,
         crystal_khz: u32,
+        content: &mut dyn PlaneContent,
     ) -> Result<alloc::boxed::Box<PlanesUpdated>, Error> {
         self.0.select_display(pipe)?;
         let regs = self.0.io.0;
@@ -1042,13 +1089,22 @@ impl Otg {
             }
         }
         self.1
-            .update_live_planes(&mut self.0, pool, pipe, request, plan, crystal_khz, || {
-                Ok((
-                    dccg.retained_timing_clock(regs, clocks, pipe)
-                        .map_err(Error::PipeClocks)?,
-                    gmc.display_context(regs).map_err(Error::Memory)?,
-                ))
-            })
+            .update_live_planes(
+                &mut self.0,
+                pool,
+                pipe,
+                request,
+                plan,
+                crystal_khz,
+                content,
+                || {
+                    Ok((
+                        dccg.retained_timing_clock(regs, clocks, pipe)
+                            .map_err(Error::PipeClocks)?,
+                        gmc.display_context(regs).map_err(Error::Memory)?,
+                    ))
+                },
+            )
             .await
     }
 }

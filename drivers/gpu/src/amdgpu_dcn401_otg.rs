@@ -18,7 +18,10 @@ pub use opp::{BlankApplied, BlankRequest, BlankRunning, ColorDepth};
 #[path = "amdgpu_dcn401_fetch.rs"]
 mod fetch;
 pub use fetch::{cursor_mode, plane_scale, CursorMode, CursorUnder};
-pub use fetch::{plane_update_type, planes_update_type, LivePlanes, PlanesUpdated, UpdateType};
+pub use fetch::{
+    plane_update_type, planes_update_type, Cleared, LivePlanes, PlaneContent, PlanesUpdated,
+    UpdateType,
+};
 pub use fetch::{
     Blend, ColorProgram, CursorApplied, DeadlinesApplied, DppApplied, FlipDone, GamutProgram,
     HubpPower, LivePipe, MemoryApplied, MpcApplied, OgamProgram, OverlayScanout, PipeColor,

@@ -38,7 +38,8 @@ mod scanout;
 pub use color::{ColorProgram, GamutProgram, OgamProgram, PipeColor};
 pub use flip::FlipDone;
 pub use plane_update::{
-    plane_update_type, planes_update_type, LivePlanes, PlanesUpdated, UpdateType,
+    plane_update_type, planes_update_type, Cleared, LivePlanes, PlaneContent, PlanesUpdated,
+    UpdateType,
 };
 pub use scanout::{
     LivePipe, OverlayScanout, ScanoutPosition, ScanoutRunning, ScanoutUnderflow, VblankPhase,

@@ -2066,7 +2066,8 @@ impl ColdBoot {
     /// Move display `pipe`'s live scanout to the planes `request` under
     /// `plan` without relighting it (`Otg::update_live_planes`: DC's medium
     /// or full plane update under the OTG lock, new pipes enabled off-tree
-    /// first, freed ones retired after the update latched).
+    /// first, freed ones retired after the update latched), fresh surfaces
+    /// holding `content`'s first frame.
     /// # Safety
     /// As for `prepare_display_deadlines`; the scanout stays live. Every CPU
     /// view of a surface the update replaces must be withdrawn.
@@ -2075,6 +2076,7 @@ impl ColdBoot {
         pipe: u8,
         request: &otg::LivePlanes,
         plan: &crate::amdgpu_dcn401_dml::Plan,
+        content: &mut dyn otg::PlaneContent,
     ) -> Result<alloc::boxed::Box<otg::PlanesUpdated>, otg::Error> {
         if self.display_retirement_busy() {
             return Err(otg::Error::Busy);
@@ -2095,6 +2097,7 @@ impl ColdBoot {
                     request,
                     plan,
                     crystal,
+                    content,
                 )
                 .await
         }
@@ -3684,9 +3687,9 @@ pub use modeset::{
     overlay_pipes, plan_pipes, plane_format, plane_mode, plane_requests, plane_setup,
     requested_bpc, selection_mode, set_broadcast_rgb, set_frl, set_max_bpc, set_output_color,
     set_plane_format, set_plane_setup, set_requested_bpc, sink_audio_info, stream_planes,
-    with_planes, Configuration, DisplayPipes, FrlDscStream, FrlRate, HdmiCaps, HdmiStream, Health,
-    InheritedRetired, Modeset, ModesetError, MstRoute, MstStream, OverlayPlane, PlaneGeometry,
-    PlanePipes, PlaneSetup, PlanesChange, Selection, SstOutput, BROADCAST_RGB_AUTO,
+    with_planes, Configuration, DisplayPipes, FirstFrames, FrlDscStream, FrlRate, HdmiCaps,
+    HdmiStream, Health, InheritedRetired, Modeset, ModesetError, MstRoute, MstStream, OverlayPlane,
+    PlaneGeometry, PlanePipes, PlaneSetup, PlanesChange, Selection, SstOutput, BROADCAST_RGB_AUTO,
     BROADCAST_RGB_FULL, BROADCAST_RGB_LIMITED, MAX_REQUESTED_BPC, MIN_REQUESTED_BPC,
 };
 pub use teardown::{TeardownStatus, TeardownStep};

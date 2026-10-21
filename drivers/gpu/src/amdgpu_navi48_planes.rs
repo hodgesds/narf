@@ -23,6 +23,42 @@ pub struct PlanesChange {
     pub updated: alloc::boxed::Box<otg::PlanesUpdated>,
 }
 
+/// The first framebuffer contents of the planes a seamless update shows on
+/// fresh surfaces (`otg::PlaneContent`), by plane slot: 0 the primary, k + 1
+/// the setup's overlay k.
+pub trait FirstFrames: Send {
+    fn chunk(
+        &mut self,
+        slot: usize,
+        a: &otg::SurfaceApplied,
+        index: u32,
+        words: &mut Vec<u32>,
+    ) -> Option<u64>;
+}
+/// No first contents: fresh surfaces show cleared until the next flip.
+impl FirstFrames for otg::Cleared {
+    fn chunk(
+        &mut self,
+        _: usize,
+        _: &otg::SurfaceApplied,
+        _: u32,
+        _: &mut Vec<u32>,
+    ) -> Option<u64> {
+        None
+    }
+}
+/// `FirstFrames` addressed by the pipe each plane is staged on.
+struct BySlot<'a> {
+    pipes: [Option<u8>; 1 + otg::MAX_OVERLAYS],
+    frames: &'a mut dyn FirstFrames,
+}
+impl otg::PlaneContent for BySlot<'_> {
+    fn chunk(&mut self, a: &otg::SurfaceApplied, index: u32, words: &mut Vec<u32>) -> Option<u64> {
+        let slot = self.pipes.iter().position(|&p| p == Some(a.request.pipe))?;
+        self.frames.chunk(slot, a, index, words)
+    }
+}
+
 /// The first `want` pipes of `current`, then free ones for the rest.
 fn keep_split(
     current: otg::SplitPipes,
@@ -135,7 +171,9 @@ impl ColdBoot {
     /// Show `format` and `setup` on running display `display` without
     /// relighting it (amdgpu_dm's plane commit without a modeset; DC's
     /// medium or full update). `reset` when amdgpu_dm would recreate a
-    /// plane (should_reset_plane: a zpos change). `None` when that needs a
+    /// plane (should_reset_plane: a zpos change). A plane on a fresh
+    /// surface shows `frames`' content from the update's own latch.
+    /// `None` when that needs a
     /// modeset, or is refused before any change, so the caller relights:
     /// an MST configuration, the display not running, DML not admitting
     /// the configuration, another ODM split, another display's pipes, or
@@ -150,6 +188,7 @@ impl ColdBoot {
         format: otg::SurfaceFormat,
         setup: PlaneSetup,
         reset: bool,
+        frames: &mut dyn FirstFrames,
     ) -> Result<Option<PlanesChange>, ModesetError> {
         // A teardown in flight is the relight's to finish.
         if self.teardowns.check_idle().is_err() {
@@ -273,22 +312,31 @@ impl ColdBoot {
         };
         // SAFETY: the caller's obligations, CPU views of replaced surfaces
         // withdrawn.
-        let updated = match unsafe { self.update_live_display_planes(display, &live, &plan) }.await
-        {
-            Ok(u) => u,
-            // Refused before any register write: the scanout runs as it
-            // was, under raised clocks; the caller relights.
-            Err(_)
-                if self
-                    .display_status(display)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|s| s.state == otg::State::ScanoutRunning(display)) =>
-            {
-                return Ok(None);
-            }
-            Err(e) => return Err(e.into()),
+        let mut content = BySlot {
+            pipes: core::array::from_fn(|k| match k {
+                0 => Some(display),
+                k => overlays[k - 1].map(|p| p.pipe),
+            }),
+            frames,
         };
+        let updated =
+            match unsafe { self.update_live_display_planes(display, &live, &plan, &mut content) }
+                .await
+            {
+                Ok(u) => u,
+                // Refused before any register write: the scanout runs as it
+                // was, under raised clocks; the caller relights.
+                Err(_)
+                    if self
+                        .display_status(display)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|s| s.state == otg::State::ScanoutRunning(display)) =>
+                {
+                    return Ok(None);
+                }
+                Err(e) => return Err(e.into()),
+            };
         next.scanout = updated.scanout;
         running[i] = next;
         self.modesets.retain(next);

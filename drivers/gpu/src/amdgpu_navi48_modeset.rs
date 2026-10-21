@@ -17,7 +17,7 @@ mod sst;
 pub use sst::SstOutput;
 #[path = "amdgpu_navi48_planes.rs"]
 mod planes;
-pub use planes::PlanesChange;
+pub use planes::{FirstFrames, PlanesChange};
 
 /// The DIO stream and pipe are independent of the PHY; the first native
 /// scanout uses one index for both.

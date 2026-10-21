@@ -4599,8 +4599,9 @@ change: an overlay both setups show moved across the primary or past
 another) is full. An update that takes or frees pipes is full.
 
 **Engine.** `unsafe Otg::update_live_planes(pool, clocks, dccg, gmc, pipe,
-&LivePlanes { primary, overlays, reset }, plan, crystal_khz) ->
-PlanesUpdated` (ColdBoot `update_live_display_planes`) moves display
+&LivePlanes { primary, overlays, reset }, plan, crystal_khz, content: &mut
+dyn PlaneContent) -> PlanesUpdated` (ColdBoot `update_live_display_planes`,
+same `content`) moves display
 `pipe`'s live scanout to the surface requests (the primary on its own pipe
 and ODM pipes, MPC slices free to change; overlays bottom first on pipes of
 their own) under `plan`, its stream's own timing admitted with them, in
@@ -4616,7 +4617,13 @@ commit_planes_for_stream's order:
   its DPP stopped). Every further pipe's DPP-only clock must cover its
   plane's DPPCLK. A plane of the same allocation on the same pipes keeps
   its surface (and content); any other takes a fresh, cleared one
-  (unpublished until the hardware hears of it).
+  (unpublished until the hardware hears of it) holding its first content:
+  `PlaneContent::chunk(a, index, words) -> Option<u64>` hands chunk `index`
+  of surface `a`'s bytes and its offset (`otg::Cleared` hands none), written
+  before the update's first register write, so the VUPDATE that latches the
+  new plane already shows its framebuffer, as DC scans a new plane's address
+  from the update that adds it. A chunk outside the surface refuses the
+  update (no register written).
 - Before the lock (dcn20_enable_plane): each new pipe powered up if gated
   (dcn32_hubp_pg_control), its fetch clock, the VMID0 aperture, the
   requestor on the stream's VTG and the DPP clock; its default DET from the
@@ -4657,8 +4664,10 @@ kept, the scanout (its plan the deadlines') and the bytes released (boxed).
 pipe's DPP-only clock while every display (the selected one's too) runs.
 
 **Configuration.** `unsafe ColdBoot::update_display_planes(display,
-format, setup, reset) -> Option<PlanesChange>` (`PlanesChange { pipe,
-displays, updated }`) admits every running display again with the
+format, setup, reset, frames: &mut dyn FirstFrames) -> Option<PlanesChange>`
+(`PlanesChange { pipe, displays, updated }`; `FirstFrames::chunk(slot, a,
+index, words)` is `PlaneContent` by plane slot, 0 the primary and k + 1
+the setup's overlay k) admits every running display again with the
 display's new planes (`dml::admit_native`), places them
 (`modeset::planes::live_plane_pipes`: the primary keeps its pipe and ODM
 pipes and the MPC slices the plan keeps; an overlay DC keeps, the same DRM
@@ -4684,12 +4693,17 @@ overlay pipes, the planes and format shown, the CRTC's admission); it
 relights only when that returns `None` or a modeset is due anyway. A frame
 of a commit whose planes are not shown yet waits in the mailbox for the
 update (at most 2 s, then presents on what is shown), so a commit's new
-planes and framebuffers show from the same update. `drm_native_planes`
+planes and framebuffers show from the same update: the update takes the
+waiting frame as the first content of every plane it puts on a fresh
+surface (`CommitFrames`, each plane copied as the presenter copies it when
+it is in the format and tiling the plane is shown in), and the presenter
+then flips that frame, completing its event. `drm_native_planes`
 records each overlay's DRM plane id in `OverlayPlane::plane`.
 
-Gaps: the commit's new framebuffer contents reach a plane's surface by the
-presenter's copy after the update latched (a new or reallocated surface
-shows cleared for that frame or two), not at the update's own VUPDATE; a
+Gaps: a plane that keeps its surface shows a commit's new framebuffer from
+the presenter's flip after the update latched, not at the update's own
+VUPDATE, and the commit's flip event completes with that flip; a frame
+queued after the update copied the planes shows from that flip too; a
 change of the stream's ODM split (or another display's pipes) still
 relights; MST displays relight; no DCC/compbuf or MALL/SubVP
 reprogramming beyond the default DET; the cursor matrix of a YCbCr plane is

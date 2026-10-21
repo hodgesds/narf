@@ -3,7 +3,7 @@
 //! checked afterwards exactly as a scanout started with those planes,
 //! without its timing, OPP or link ever being touched.
 use super::*;
-use crate::amdgpu_dcn401_otg::{LivePlanes, PlanesUpdated, UpdateType};
+use crate::amdgpu_dcn401_otg::{LivePlanes, PlaneContent, PlanesUpdated, UpdateType};
 use crate::amdgpu_dcn401_spl::{Rect, Rotation};
 
 /// ROUTES[1]: the display runs on pipe 2; pipe 3 is free for an overlay.
@@ -97,14 +97,54 @@ fn update(
     live: &LivePlanes,
     plan: &dml::Plan,
 ) -> Result<alloc::boxed::Box<PlanesUpdated>, Error> {
+    update_with(c, live, plan, &mut crate::amdgpu_dcn401_otg::Cleared)
+}
+/// `update` with fresh surfaces' first content from `content`.
+#[inline(never)]
+fn update_with(
+    c: &mut Chain,
+    live: &LivePlanes,
+    plan: &dml::Plan,
+    content: &mut dyn PlaneContent,
+) -> Result<alloc::boxed::Box<PlanesUpdated>, Error> {
     let clock = c.clock;
     let p = c.pipe;
     c.e.io.inner.inner.writes.clear();
-    run(c
-        .surfaces
-        .update_live_planes(&mut c.e, &c.pool, p, live, plan, CRYSTAL_KHZ, || {
-            Ok((clock, config()))
-        }))
+    run(c.surfaces.update_live_planes(
+        &mut c.e,
+        &c.pool,
+        p,
+        live,
+        plan,
+        CRYSTAL_KHZ,
+        content,
+        || Ok((clock, config())),
+    ))
+}
+/// A first frame for pipe `q`'s fresh surface: row `y` of a 64-pixel-wide
+/// plane is 0xff00_yy00 | x. Each chunk notes how many register writes the
+/// update had made by then.
+struct Pattern {
+    q: u8,
+    writes: Arc<AtomicUsize>,
+    seen: Vec<usize>,
+    /// Hand back a chunk past the surface's end instead.
+    outside: bool,
+}
+impl PlaneContent for Pattern {
+    fn chunk(&mut self, a: &SurfaceApplied, index: u32, words: &mut Vec<u32>) -> Option<u64> {
+        if a.request.pipe != self.q || index >= a.request.height {
+            return None;
+        }
+        self.seen.push(self.writes.load(Ordering::SeqCst));
+        words.clear();
+        words.extend((0..a.request.width).map(|x| 0xff00_0000 | index << 8 | x));
+        Some(if self.outside {
+            a.bytes
+        } else {
+            u64::from(index) * u64::from(a.pitch_bytes)
+        })
+    }
 }
 /// optimize_bandwidth after an update: the plan's exact watermarks.
 #[inline(never)]
@@ -483,6 +523,67 @@ pub(super) fn dcn401_live_plane_update_adds_moves_and_removes_an_overlay_on(
 kernel_test_in!(
     "drivers/gpu/dcn401-plane-update",
     dcn401_live_plane_update_adds_moves_and_removes_an_overlay
+);
+
+/// A plane added on a fresh surface shows its framebuffer from the update
+/// itself, as DC scans the new plane's address from the update that adds
+/// it: the first content is written into the cleared, unpublished surface
+/// before the update's first register write, so the VUPDATE that latches
+/// the unblanked overlay already fetches it. A chunk past the surface's
+/// end refuses the update before any register write.
+fn dcn401_live_plane_update_shows_the_first_frame_at_the_latch() -> TestResult {
+    let (t, s, p) = ROUTES[1];
+    let q = OVERLAY_PIPE;
+    let mut c = chain(t, s, p);
+    if run(c.start()).is_err() {
+        return TestResult::Fail("start");
+    }
+    free_pipe(&mut c, q);
+    let base = primary(&c);
+    let overlay = overlay_at(q, 100, 100);
+    let plan = plan_for(base, &[overlay]);
+    raise(&mut c, &plan);
+    let mut content = Pattern {
+        q,
+        writes: c.e.io.inner.writes.clone(),
+        seen: Vec::new(),
+        outside: true,
+    };
+    if update_with(&mut c, &live(base, &[overlay]), &plan, &mut content) != Err(Error::Invalid)
+        || !c.e.io.inner.inner.writes.is_empty()
+        || c.e.status.state != State::ScanoutRunning(p)
+    {
+        return TestResult::Fail("a chunk outside the surface");
+    }
+    let start = c.e.io.inner.writes.load(Ordering::SeqCst);
+    content.outside = false;
+    content.seen.clear();
+    let Ok(u) = update_with(&mut c, &live(base, &[overlay]), &plan, &mut content) else {
+        return TestResult::Fail("add the overlay");
+    };
+    let Some(o) = u.scanout.overlays[0] else {
+        return TestResult::Fail("overlay scanout record");
+    };
+    if content.seen.len() != 64 || content.seen.iter().any(|&n| n != start) {
+        return TestResult::Fail("first content after a register write");
+    }
+    let Some(a) = c.e.status.surfaces[usize::from(q)] else {
+        return TestResult::Fail("overlay surface record");
+    };
+    for (x, y) in [(0u32, 0u32), (63, 0), (17, 31), (0, 63), (63, 63)] {
+        let at = u64::from(y) * u64::from(a.pitch_bytes) + u64::from(x) * 4;
+        if c.vram(o.address, at) != 0xff00_0000 | y << 8 | x {
+            return TestResult::Fail("first content in the surface");
+        }
+    }
+    if !stream_untouched(&c) || optimize(&mut c, &plan).is_err() || run(c.check()).is_err() {
+        return TestResult::Fail("check with the overlay");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-plane-update",
+    dcn401_live_plane_update_shows_the_first_frame_at_the_latch
 );
 
 /// Refusals leave the scanout exactly as it ran, without a register

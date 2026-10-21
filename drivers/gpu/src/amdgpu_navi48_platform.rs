@@ -3128,8 +3128,16 @@ async unsafe fn update_lit_planes(
         crate::amdgpu_dcn_display::publish_external(None, None);
     }
     crate::scanout_access::wait_retired().await;
+    // The commit's frame (waiting in the mailbox for these planes) is the
+    // first content of every plane the update puts on a fresh surface.
+    let mut frames = CommitFrames {
+        display: k,
+        frame: None,
+        format,
+        setup,
+    };
     // SAFETY: the caller's obligations; the console no longer draws.
-    let result = unsafe { boot.update_display_planes(k, format, setup, reset) }.await;
+    let result = unsafe { boot.update_display_planes(k, format, setup, reset, &mut frames) }.await;
     let changed = match result {
         Ok(Some(change)) => {
             {
@@ -3169,6 +3177,141 @@ async unsafe fn update_lit_planes(
         publish_console(boot, Some(k));
     }
     Ok(changed)
+}
+
+/// A commit's frame as the first content of the planes a seamless plane
+/// update shows on fresh surfaces (`boot::FirstFrames`), so the update
+/// latches with the commit's framebuffers shown, as DC shows a new plane's
+/// framebuffer from the update itself: the newest frame waiting on the
+/// display (read at the first chunk), each plane's framebuffer copied as
+/// the presenter copies it, when it is in the format and tiling that plane
+/// is shown in. The presenter still flips the frame afterwards, which
+/// completes its event.
+struct CommitFrames {
+    display: u8,
+    frame: Option<Option<Frame>>,
+    format: SurfaceFormat,
+    setup: boot::PlaneSetup,
+}
+impl boot::FirstFrames for CommitFrames {
+    fn chunk(
+        &mut self,
+        slot: usize,
+        a: &crate::amdgpu_dcn401_otg::SurfaceApplied,
+        index: u32,
+        words: &mut Vec<u32>,
+    ) -> Option<u64> {
+        let display = self.display;
+        let frame = (*self
+            .frame
+            .get_or_insert_with(|| *present_slot(display).next.lock()))?;
+        let (f, format, g) = if slot == 0 {
+            (frame.primary?, self.format, self.setup.primary)
+        } else {
+            let o = self.setup.overlays.get(slot - 1).copied().flatten()?;
+            (frame.overlays[slot - 1]?, o.format, Some(o.geometry))
+        };
+        let surface = g.map_or(crate::amdgpu_dcn401_otg::PlaneSurface::LINEAR, |g| {
+            g.surface
+        });
+        if SurfaceFormat::from_fourcc(f.format) != Some(format)
+            || f.tiling() != Some(surface.tiling)
+        {
+            return None;
+        }
+        // SAFETY: a frame waiting in the mailbox names mapped dumb buffers
+        // its client leaves untouched until the flip-complete event.
+        unsafe { frame_chunk(f, format, g, a, index, words) }
+    }
+}
+
+/// Chunk `index` of framebuffer `f` on surface `a` (shown with geometry
+/// `g`; none: the full-frame primary), its byte offset in the surface:
+/// row `index` of a linear RGB plane's source rectangle, or a tiled or
+/// 4:2:0 plane's block row `index` (the luma's, then the chroma's), as
+/// `copy_plane` and `copy_whole_plane` copy them.
+/// # Safety
+/// `f` names a kernel-mapped dumb buffer whose planes ADDFB2 checked.
+unsafe fn frame_chunk(
+    f: PlaneFrame,
+    format: SurfaceFormat,
+    g: Option<boot::PlaneGeometry>,
+    a: &crate::amdgpu_dcn401_otg::SurfaceApplied,
+    index: u32,
+    words: &mut Vec<u32>,
+) -> Option<u64> {
+    let copy = |at: u64, bytes: usize, words: &mut Vec<u32>| {
+        words.clear();
+        words.resize(bytes.div_ceil(4), 0);
+        // SAFETY: the caller's obligations; `at` and `bytes` lie within
+        // the framebuffer as the presenter's copies read it.
+        unsafe {
+            let src = narf_memory::PhysAddr::new(at).kernel_ptr::<u8>();
+            core::ptr::copy_nonoverlapping(src, words.as_mut_ptr().cast::<u8>(), bytes);
+        }
+    };
+    if let Some(g) = g.filter(|g| g.whole_framebuffer(format)) {
+        let (width, height) = g.fb_size;
+        if (f.width, f.height) != (width, height) {
+            return None;
+        }
+        let layout = crate::amdgpu_dcn401_otg::SurfaceRequest {
+            pipe: a.request.pipe,
+            width,
+            height,
+            format,
+            odm: crate::amdgpu_dcn401_otg::SplitPipes::NONE,
+            mpc: crate::amdgpu_dcn401_otg::SplitPipes::NONE,
+            plane: None,
+            surface: g.surface,
+        }
+        .bytes();
+        let mut planes = alloc::vec![(
+            0u64,
+            layout.pitch_bytes,
+            f.offsets[0],
+            f.pitch,
+            format.bytes_per_pixel(),
+            height
+        )];
+        if let Some((offset, pitch)) = layout.chroma {
+            planes.push((
+                offset,
+                pitch,
+                f.offsets[1],
+                f.chroma_pitch,
+                format.chroma_bytes_per_pixel(),
+                height / 2,
+            ));
+        }
+        let mut index = index;
+        for (at, pitch, from, fb_pitch, cpp, rows) in planes {
+            let (_, block_height) = g.surface.tiling.swizzle.block(cpp);
+            if fb_pitch < pitch {
+                return None;
+            }
+            let count = rows.div_ceil(block_height);
+            if index < count {
+                let bytes = (pitch * block_height) as usize;
+                let src = f.phys
+                    + u64::from(from)
+                    + u64::from(index) * u64::from(fb_pitch) * u64::from(block_height);
+                copy(src, bytes, words);
+                return Some(at + u64::from(index) * bytes as u64);
+            }
+            index -= count;
+        }
+        return None;
+    }
+    let (sx, sy) = g.map_or((0, 0), |g| (g.src_x, g.src_y));
+    let cpp = format.bytes_per_pixel();
+    let width = f.width.saturating_sub(sx).min(a.request.width);
+    if index >= f.height.saturating_sub(sy).min(a.request.height) || width == 0 {
+        return None;
+    }
+    let at = f.phys + u64::from(sy + index) * u64::from(f.pitch) + u64::from(sx * cpp);
+    copy(at, (width * cpp) as usize, words);
+    Some(u64::from(index) * u64::from(a.pitch_bytes))
 }
 
 /// Stop presenting on `pipe` and, when it carried the console, move the
@@ -6958,6 +7101,140 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/navi48-kms",
         navi48_plane_formats_request_and_admit
+    );
+
+    /// The commit's frame fills the fresh surfaces of a seamless plane
+    /// update (`CommitFrames`): the full-frame primary row by row from its
+    /// framebuffer, an overlay's source rectangle from its origin, each
+    /// chunk at its row in the surface; a plane in another format or
+    /// tiling, a plane the frame leaves alone, or rows past the frame's
+    /// end have none.
+    fn navi48_commit_frames_fill_fresh_surfaces() -> TestResult {
+        use crate::amdgpu_dcn401_otg::{
+            Blend, PlaneSurface, SplitPipes, SurfaceApplied, SurfaceRequest,
+        };
+        use crate::amdgpu_dcn401_spl::{Rect, Rotation};
+        use boot::FirstFrames;
+        const XR24: u32 = 0x3432_5258;
+        const AR24: u32 = 0x3432_5241;
+        // One page: a 32x32 XRGB8888 framebuffer, pitch 128, pixel (x, y)
+        // = y << 8 | x.
+        let Ok(page) = narf_memory::frame::alloc_pages_on(0, 0) else {
+            return TestResult::Fail("page");
+        };
+        let phys = page.start_address().raw();
+        let base = narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u32>();
+        for y in 0..32u32 {
+            for x in 0..32u32 {
+                // SAFETY: inside the page just allocated.
+                unsafe { base.add((y * 32 + x) as usize).write(y << 8 | x) };
+            }
+        }
+        let fb = |format| PlaneFrame::linear(phys, 128, 32, 32, format);
+        let surface = |pipe: u8, width: u32, height: u32, format| SurfaceApplied {
+            request: SurfaceRequest {
+                pipe,
+                width,
+                height,
+                format,
+                odm: SplitPipes::NONE,
+                mpc: SplitPipes::NONE,
+                plane: None,
+                surface: PlaneSurface::LINEAR,
+            },
+            address: 0x8_0000_0000,
+            pitch_bytes: 256,
+            bytes: 256 * u64::from(height),
+        };
+        let overlay = boot::OverlayPlane {
+            geometry: boot::PlaneGeometry {
+                src_x: 8,
+                src_y: 4,
+                width: 16,
+                height: 16,
+                dst: Rect::new(0, 0, 16, 16),
+                rotation: Rotation::R0,
+                blend: Blend::default_for(SurfaceFormat::Argb8888),
+                surface: PlaneSurface::LINEAR,
+                fb_size: (32, 32),
+            },
+            format: SurfaceFormat::Argb8888,
+            underlay: false,
+            plane: 0,
+        };
+        let mut setup = boot::PlaneSetup::NONE;
+        setup.overlays[1] = Some(overlay);
+        let mut overlays = [None; crate::amdgpu_dcn401_otg::MAX_OVERLAYS];
+        overlays[1] = Some(fb(AR24));
+        let mut frames = CommitFrames {
+            display: 0,
+            frame: Some(Some(Frame {
+                primary: Some(fb(XR24)),
+                overlays,
+                ticket: None,
+                queued_ns: 0,
+            })),
+            format: SurfaceFormat::Xrgb8888,
+            setup,
+        };
+        let mut words = Vec::new();
+        let primary = surface(0, 32, 32, SurfaceFormat::Xrgb8888);
+        let result = (|| {
+            for y in [0u32, 17, 31] {
+                if frames.chunk(0, &primary, y, &mut words) != Some(u64::from(y) * 256)
+                    || words.len() != 32
+                    || (0..32).any(|x| words[x as usize] != y << 8 | x)
+                {
+                    return Err("primary rows");
+                }
+            }
+            if frames.chunk(0, &primary, 32, &mut words).is_some() {
+                return Err("past the primary's rows");
+            }
+            let o = surface(2, 16, 16, SurfaceFormat::Argb8888);
+            for y in [0u32, 15] {
+                if frames.chunk(2, &o, y, &mut words) != Some(u64::from(y) * 256)
+                    || words.len() != 16
+                    || (0..16).any(|x| words[x as usize] != (y + 4) << 8 | (x + 8))
+                {
+                    return Err("overlay source rectangle");
+                }
+            }
+            if frames.chunk(2, &o, 16, &mut words).is_some()
+                || frames.chunk(1, &o, 0, &mut words).is_some()
+            {
+                return Err("rows or planes the frame has not");
+            }
+            // Another format, another tiling: left cleared.
+            frames.format = SurfaceFormat::Argb8888;
+            if frames.chunk(0, &primary, 0, &mut words).is_some() {
+                return Err("primary in another format");
+            }
+            frames.format = SurfaceFormat::Xrgb8888;
+            if let Some(Some(f)) = frames.frame.as_mut() {
+                if let Some(p) = f.primary.as_mut() {
+                    p.modifier = u64::MAX;
+                }
+            }
+            if frames.chunk(0, &primary, 0, &mut words).is_some() {
+                return Err("primary in another tiling");
+            }
+            // No frame waiting: nothing.
+            frames.frame = Some(None);
+            if frames.chunk(2, &o, 0, &mut words).is_some() {
+                return Err("no frame");
+            }
+            Ok(())
+        })();
+        narf_memory::frame::free_pages(page, 0);
+        match result {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi48-kms",
+        navi48_commit_frames_fill_fresh_surfaces
     );
 
     /// Plane configurations are requested per display and admitted against
