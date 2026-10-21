@@ -554,6 +554,10 @@ impl ColdBoot {
     }
     /// Start once, or reprobe a dirty session after its streams stop. Clean
     /// sessions retain their topology and connector slots without AUX traffic.
+    /// A start that fails before MST is enabled shuts the streamless session
+    /// down again (MSTM_CTRL cleared, the session dropped), as Linux leaves
+    /// the link SST when dm_helpers_dp_mst_start_top_mgr fails; a failed
+    /// probe keeps the started session dirty for the next pass.
     pub async fn start_display_mst(&mut self, port: usize) -> Result<Topology, MstFailure> {
         let (instance, _) = self.mst_path(port)?;
         // Keep the session in its owner across every await, including failure
@@ -563,8 +567,15 @@ impl ColdBoot {
             dmub: &mut self.sequence.backend.dmub,
             instance,
         };
-        link.prepare(&mut aux).await?;
-        Ok(link.topology.clone())
+        match link.prepare(&mut aux).await {
+            Ok(()) => Ok(link.topology.clone()),
+            Err(e) => {
+                if link.state == ProbeState::New {
+                    self.stop_display_mst(port).await;
+                }
+                Err(e)
+            }
+        }
     }
     /// Whether DP `port`'s sink is an MST branch (DPCD 1.2 and MSTM_CAP),
     /// which Linux drives in MST mode (dc_connection_mst_branch).
@@ -1684,18 +1695,21 @@ impl ColdBoot {
     pub(super) async fn start_mst_route(
         &mut self,
         route: &modeset::MstRoute<'_>,
-    ) -> Result<(), ModesetError> {
+    ) -> Result<bool, ModesetError> {
         if self.mst.get(&route.port).is_some_and(|l| l.owner.is_some()) {
             return Err(ModesetError::Display(otg::Error::Invalid));
         }
         self.start_mst_route_beside(route).await
     }
     /// `start_mst_route` for a branch whose link may already carry
-    /// streams: a clean running session is used as it is.
+    /// streams: a clean running session is used as it is. Whether the
+    /// branch started: a start or probe that fails (`start_display_mst`) is
+    /// logged and its route lights nothing, as Linux only logs a failed
+    /// dm_helpers_dp_mst_start_top_mgr or probe.
     pub(super) async fn start_mst_route_beside(
         &mut self,
         route: &modeset::MstRoute<'_>,
-    ) -> Result<(), ModesetError> {
+    ) -> Result<bool, ModesetError> {
         let crtcs = route.crtcs;
         if crtcs.is_empty()
             || crtcs.len() > MST_OUTPUTS
@@ -1710,8 +1724,17 @@ impl ColdBoot {
         {
             return Err(ModesetError::Display(otg::Error::Invalid));
         }
-        self.start_display_mst(route.port).await?;
-        Ok(())
+        if let Err(e) = self.start_display_mst(route.port).await {
+            let _ = core::fmt::Write::write_fmt(
+                &mut narf_console::Writer,
+                format_args!(
+                    "amdgpu: navi48 DP port {} MST not started: {e:?}\n",
+                    route.port
+                ),
+            );
+            return Ok(false);
+        }
+        Ok(true)
     }
     /// End device `sink`'s EDID behind `port`, from its connector slot.
     pub(super) fn mst_edid(&self, port: usize, sink: dp_mst_mgr::Sink) -> Vec<u8> {
@@ -2057,9 +2080,15 @@ impl ColdBoot {
                 .checkpoint_activation(pipe, super::TeardownStep::Frontend);
             // A compressed stream's decoder after enable_stream and before
             // its payload (dp_set_dsc_on_rx); the PPS follows with the
-            // video, after the payload.
+            // video, after the payload. link_set_dpms_on ignores
+            // dp_set_dsc_on_rx's result: a refused write is logged only.
             if let Some(d) = stream.dsc {
-                self.set_display_mst_dsc(port, &d, true).await?;
+                if let Err(e) = self.set_display_mst_dsc(port, &d, true).await {
+                    let _ = core::fmt::Write::write_fmt(
+                        &mut narf_console::Writer,
+                        format_args!("amdgpu: navi48 MST DSC enable on RX failed: {e:?}\n"),
+                    );
+                }
             }
             self.add_display_mst_payload(
                 port,

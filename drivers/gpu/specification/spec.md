@@ -2475,9 +2475,25 @@ once, then probes LINK_ADDRESS/ENUM_PATH_RESOURCES depth first;
 probe uses an explicit stack so its future can run in the display monitor,
 bounded to 15 route levels and 64 branches. Clean sessions reuse the snapshot;
 dirty sessions can reprobe only after every source owner and payload retires.
-The previous snapshot remains available until probe/EDID completion. An
-incomplete or cancelled probe retains the session and refuses replay until
-physical removal or explicit streamless manager shutdown.
+The previous snapshot remains available until probe/EDID completion. A
+cancelled probe retains the session and refuses replay until physical removal
+or explicit streamless manager shutdown. A returned error is no uncertainty:
+one before MST is enabled (D0, MSTM_CTRL, the payload-table reset: Linux's
+drm_dp_mst_topology_mgr_set_mst failing) shuts the streamless session down
+(MSTM_CTRL cleared, the session dropped) and the port stays an SST board
+port, as link detection falls back to dc_connection_sst_branch when
+dm_helpers_dp_mst_start_top_mgr fails; one in the probe keeps the started
+session ready and dirty with its previous snapshot, for the next pass to probe
+again, as Linux's probe work only logs. Neither escalates: the platform's
+hotplug start (`start_plugged_mst`), a lighting's start (`light_displays`),
+`start_mst_route`/`start_mst_route_beside` (whose `Ok(false)` route lights
+nothing) and the monitor's `service_display_mst` (an up-request poll,
+resource query or live probe) log the failure and go on; the streams on the
+port run on. Nor does a refused DSC enable on an MST stream's decoder
+(link_set_dpms_on ignores dp_set_dsc_on_rx's result). What reaches
+`monitor_displays`' error, and so device recovery, are local display state
+failures: source programming (SAT, VC rate, encoders, link handover),
+teardown journal faults and transactions left uncertain by cancellation.
 
 `Manager::poll_up_requests` reads at most eight ready up-request chunks per
 call without waiting for a new notification. It acknowledges only
@@ -2535,7 +2551,8 @@ Otherwise (another primary branch, a hop's capacity lost:
 `MstService::Relight`) the old topology and routes stay and the monitor
 stops all streams using their old routes, reprobes, then relights enabled
 outputs.
-A failed or cancelled live probe retains the session like `prepare`.
+A cancelled live probe retains the session like `prepare`; a failed one
+leaves the old topology, its routes and the dirty mark for the next pass.
 Notifications received during queries/reprobe remain queued for the next pass. Unknown branch/port, input-port and disconnected
 resource notices are ignored.
 

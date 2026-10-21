@@ -3563,9 +3563,19 @@ async unsafe fn light_displays(
             mst.push(port);
         }
     }
+    // A branch that does not start is logged and left SST
+    // (dm_helpers_dp_mst_start_top_mgr), one whose probe failed stays MST.
+    for &port in &mst {
+        if let Err(e) = boot.start_display_mst(port).await {
+            let _ = core::fmt::Write::write_fmt(
+                &mut narf_console::Writer,
+                format_args!("amdgpu: navi48 DP port {port} MST not started: {e:?}\n"),
+            );
+        }
+    }
+    mst.retain(|&port| boot.display_mst(port).is_some());
     set_connector_shape(boot, &mst);
     for &port in &mst {
-        boot.start_display_mst(port).await?;
         reconcile_mst_outputs(boot, port);
     }
     if !mst.is_empty() {
@@ -6077,12 +6087,16 @@ pub async unsafe fn monitor_displays(
                 })
             };
             let before = shown(boot);
-            match boot.service_display_mst(port).await? {
-                boot::MstService::Kept => {}
-                boot::MstService::Relight => relight = true,
+            match boot.service_display_mst(port).await {
+                Ok(boot::MstService::Kept) => {}
+                // A failed up-request poll, resource query or probe is
+                // logged, as Linux's MST handlers log it; the streams run
+                // on and the next pass services the port again.
+                Err(e) => log_mst_service(port, e),
+                Ok(boot::MstService::Relight) => relight = true,
                 // As Linux disables a departed connector's CRTC: only its
                 // stream retires, the others on the link run on.
-                boot::MstService::Lost(pipes) => {
+                Ok(boot::MstService::Lost(pipes)) => {
                     lost_mask |= displays
                         .lit
                         .iter()
@@ -6211,8 +6225,10 @@ pub async unsafe fn monitor_displays(
     // With the departed devices' streams retired, adopt their ports' trees
     // beside the streams still running; anything else relights.
     for &port in &lost_ports {
-        if boot.service_display_mst(port).await? != boot::MstService::Kept {
-            relight = true;
+        match boot.service_display_mst(port).await {
+            Ok(boot::MstService::Kept) => {}
+            Ok(_) => relight = true,
+            Err(e) => log_mst_service(port, e),
         }
         reconcile_mst_outputs(boot, port);
         publish_outputs();
@@ -8394,6 +8410,14 @@ fn hpd_rise(lit_here: bool) -> HpdRise {
     }
 }
 
+/// A failed `service_display_mst`, logged.
+fn log_mst_service(port: usize, e: boot::MstFailure) {
+    let _ = core::fmt::Write::write_fmt(
+        &mut narf_console::Writer,
+        format_args!("amdgpu: navi48 DP port {port} MST service failed: {e:?}\n"),
+    );
+}
+
 /// Start the MST branch on board `port` when its sink is one (DPCD 1.2
 /// and MSTM_CAP), as a lighting does before it selects the port's
 /// streams. Whether it did.
@@ -8414,8 +8438,16 @@ async unsafe fn start_plugged_mst(
     {
         return Ok(false);
     }
-    boot.start_display_mst(port).await?;
-    Ok(true)
+    // A failed dm_helpers_dp_mst_start_top_mgr leaves the link SST and is
+    // only logged; a branch whose probe failed stays started for the next
+    // pass to probe again.
+    if let Err(e) = boot.start_display_mst(port).await {
+        let _ = core::fmt::Write::write_fmt(
+            &mut narf_console::Writer,
+            format_args!("amdgpu: navi48 DP port {port} MST not started: {e:?}\n"),
+        );
+    }
+    Ok(boot.display_mst(port).is_some())
 }
 
 /// Tear down the running displays `affected` (by CRTC) for the modeset an

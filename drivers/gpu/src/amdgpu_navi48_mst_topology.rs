@@ -170,7 +170,12 @@ impl MstLink {
 
     /// Initialize once, or replace a dirty topology only after all source and
     /// remote payload owners have been retired. Retain the old snapshot until
-    /// the complete probe/EDID pass succeeds.
+    /// the complete probe/EDID pass succeeds. A returned error is no
+    /// uncertainty: one before MST is enabled leaves the session new (Linux's
+    /// drm_dp_mst_topology_mgr_set_mst failing, after which the link is
+    /// SST), one in the probe leaves it ready and dirty with the old
+    /// snapshot, for the next pass to probe again (Linux's probe work only
+    /// logs). Only cancellation leaves it probing.
     pub(super) async fn prepare<A: MstAux>(
         &mut self,
         aux: &mut A,
@@ -185,21 +190,19 @@ impl MstLink {
         let start = self.state == ProbeState::New;
         self.state = ProbeState::Probing;
         if start {
-            let mut dpcd = [0; 16];
-            aux.read(0, &mut dpcd).await.map_err(MstError::Aux)?;
-            // Even an initially empty branch needs D0: no stream will train
-            // its link (and power its receiver) until a downstream sink arrives.
-            // Power it before enabling MST and clearing the payload table.
-            aux.write(0x600, &[1]).await.map_err(MstError::Aux)?;
-            aux.delay(1000).await;
-            let mut power = [0];
-            aux.read(0x600, &mut power).await.map_err(MstError::Aux)?;
-            if power[0] & 7 != 1 {
-                return Err(MstFailure::Mst(MstError::Malformed));
+            if let Err(e) = self.start_manager(aux).await {
+                self.state = ProbeState::New;
+                return Err(e);
             }
-            self.manager.start(aux, &dpcd).await?;
         }
-        let topology = self.manager.probe(aux).await?;
+        let topology = match self.manager.probe(aux).await {
+            Ok(t) => t,
+            Err(e) => {
+                self.dirty = true;
+                self.state = ProbeState::Ready;
+                return Err(e.into());
+            }
+        };
         let mut outputs = reconcile(&self.outputs, &topology);
         for output in outputs.iter_mut().flatten() {
             if let Some(sink) = output.sink {
@@ -218,6 +221,27 @@ impl MstLink {
         self.primary_replaced = false;
         self.dirty = false;
         self.state = ProbeState::Ready;
+        Ok(())
+    }
+}
+
+impl MstLink {
+    /// Receiver D0, then MST enabled with up requests and the payload table
+    /// cleared (drm_dp_mst_topology_mgr_set_mst(true)).
+    async fn start_manager<A: MstAux>(&mut self, aux: &mut A) -> Result<(), MstFailure<A::Error>> {
+        let mut dpcd = [0; 16];
+        aux.read(0, &mut dpcd).await.map_err(MstError::Aux)?;
+        // Even an initially empty branch needs D0: no stream will train
+        // its link (and power its receiver) until a downstream sink arrives.
+        // Power it before enabling MST and clearing the payload table.
+        aux.write(0x600, &[1]).await.map_err(MstError::Aux)?;
+        aux.delay(1000).await;
+        let mut power = [0];
+        aux.read(0x600, &mut power).await.map_err(MstError::Aux)?;
+        if power[0] & 7 != 1 {
+            return Err(MstFailure::Mst(MstError::Malformed));
+        }
+        self.manager.start(aux, &dpcd).await?;
         Ok(())
     }
 }
@@ -305,8 +329,11 @@ impl MstLink {
             return Err(MstFailure::Invalid);
         }
         self.state = ProbeState::Probing;
-        let probed = self.manager.probe(aux).await?;
+        // A returned error leaves the old topology and the dirty mark for
+        // the next pass, as Linux's probe work only logs.
+        let probed = self.manager.probe(aux).await;
         self.state = ProbeState::Ready;
+        let probed = probed?;
         let departed: Vec<usize> = (0..self.topology.branches.len())
             .filter(|&i| {
                 !probed
@@ -757,6 +784,80 @@ mod tests {
         "drivers/gpu/dp-mst",
         navi48_mst_cancelled_probe_cannot_replay
     );
+
+    /// The hub, refusing the accesses `refuse(address, write)` picks.
+    struct Refusing<'a> {
+        hub: &'a mut Hub,
+        refuse: fn(u32, bool) -> bool,
+    }
+    impl MstAux for Refusing<'_> {
+        type Error = ();
+        async fn read(&mut self, address: u32, buf: &mut [u8]) -> Result<(), ()> {
+            if (self.refuse)(address, false) {
+                return Err(());
+            }
+            self.hub.read(address, buf).await
+        }
+        async fn write(&mut self, address: u32, data: &[u8]) -> Result<(), ()> {
+            if (self.refuse)(address, true) {
+                return Err(());
+            }
+            self.hub.write(address, data).await
+        }
+        async fn delay(&mut self, _: u64) {}
+    }
+    /// A returned start or probe error leaves no uncertainty: a start that
+    /// fails before MST is enabled leaves the session new (Linux falls back
+    /// to SST and starts again at the next detection), a probe that fails
+    /// keeps the started session ready and dirty with its old snapshot, and
+    /// the next pass probes again; a live probe's failure keeps the old
+    /// routes and the dirty mark the same way.
+    fn navi48_mst_returned_probe_errors_retry() -> TestResult {
+        fn dpcd_caps(a: u32, w: bool) -> bool {
+            !w && a == 0
+        }
+        fn sideband(a: u32, w: bool) -> bool {
+            w && (dp_mst::DOWN_REQ_BASE..dp_mst::DOWN_REQ_BASE + 48).contains(&a)
+        }
+        let mut hub = Hub::new();
+        hub.dpcd.insert(0, 0x14);
+        hub.edid[126] = 0;
+        let mut link = MstLink::default();
+        let mut aux = Refusing {
+            hub: &mut hub,
+            refuse: dpcd_caps,
+        };
+        assert!(run(link.prepare(&mut aux)).is_err());
+        assert_eq!(link.state, ProbeState::New);
+        aux.refuse = sideband;
+        assert!(run(link.prepare(&mut aux)).is_err());
+        assert_eq!(link.state, ProbeState::Ready);
+        assert!(link.dirty && link.topology.branches.is_empty());
+        aux.refuse = |_, _| false;
+        run(link.prepare(&mut aux)).unwrap();
+        assert!(!link.dirty && link.topology.branches.len() == 2);
+        // The retry did not start MST again: Linux's probe work marks the
+        // payload ID table cleared before sending CLEAR_PAYLOAD_ID_TABLE and
+        // never resends it, so the refused one is not repeated either.
+        assert!(aux
+            .hub
+            .bodies
+            .iter()
+            .all(|b| b[0] != dp_mst::CLEAR_PAYLOAD_ID_TABLE));
+        // A live reprobe that fails keeps the routes for the next pass.
+        let before = link.topology.clone();
+        link.owner = Some(0);
+        link.dirty = true;
+        aux.refuse = sideband;
+        assert!(run(link.reprobe_live(&mut aux)).is_err());
+        assert_eq!(link.state, ProbeState::Ready);
+        assert!(link.dirty);
+        assert_eq!(link.topology, before);
+        aux.refuse = |_, _| false;
+        assert_eq!(run(link.reprobe_live(&mut aux)), Ok(true));
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/dp-mst", navi48_mst_returned_probe_errors_retry);
 
     /// Surviving branches keep their indices across a reprobe whose
     /// depth-first order moved them; new ones fill vacated indices, then

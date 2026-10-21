@@ -3067,8 +3067,9 @@ impl ColdBoot {
             return Err(ModesetError::Display(otg::Error::Invalid));
         }
         self.sst_outputs.clear();
+        let mut started = Vec::with_capacity(mst.len());
         for route in mst {
-            self.start_mst_route(route).await?;
+            started.push(self.start_mst_route(route).await?);
         }
         let ports = self.scan_display().await.map_err(ModesetError::Boot)?;
         let paths = self
@@ -3076,8 +3077,14 @@ impl ColdBoot {
             .map_err(|_| ModesetError::NoSink)?
             .to_vec();
         let mut mst_plans = Vec::with_capacity(mst.len());
-        for route in mst {
-            let plan = self.plan_mst_route(route, &ports, &[])?;
+        for (route, &started) in mst.iter().zip(&started) {
+            // A branch that did not start lights nothing; its root is still
+            // no board SST sink.
+            let plan = if started {
+                self.plan_mst_route(route, &ports, &[])?
+            } else {
+                None
+            };
             mst_plans.push(plan.unwrap_or(super::mst::MstPlan {
                 port: route.port,
                 caps: None,
@@ -4411,7 +4418,9 @@ impl ColdBoot {
             return Err(ModesetError::Display(otg::Error::Invalid));
         }
         // Every branch's session clean and idle; a port without streams may
-        // start or reprobe here, one with streams only adds beside them.
+        // start or reprobe here, one with streams only adds beside them. A
+        // branch that does not start lights nothing (`start_mst_route_beside`).
+        let mut started = Vec::with_capacity(mst.len());
         for route in mst {
             let busy = self.mst.get(&route.port).is_some_and(|l| {
                 l.payload_change().is_some()
@@ -4426,12 +4435,15 @@ impl ColdBoot {
                 .iter()
                 .map(|c| c.filter(|&c| c < pool.count() && lit_crtcs & 1 << c == 0))
                 .collect();
-            let route = MstRoute {
+            let unlit_route = MstRoute {
                 crtcs: &unlit,
                 ..*route
             };
-            self.start_mst_route_beside(&route).await?;
+            if self.start_mst_route_beside(&unlit_route).await? {
+                started.push(MstRoute { ..*route });
+            }
         }
+        let mst = &started[..];
         self.select_display(idle)?;
         let ports = self.scan_display().await.map_err(ModesetError::Boot)?;
         let paths = self
