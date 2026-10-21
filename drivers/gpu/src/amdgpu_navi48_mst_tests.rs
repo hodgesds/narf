@@ -1080,6 +1080,78 @@ kernel_test_in!(
     navi48_mst_unplugged_monitor_payload_leaves_both_tables_compacted
 );
 
+/// A stream behind a downstream hub that is unplugged: the child branch
+/// left with its end device, so ALLOCATE_PAYLOAD(PBN 0) goes to the last
+/// connected ancestor, the primary, at the port the hub hung off (root
+/// port 2), as drm_dp_payload_send_msg falls back to
+/// drm_dp_get_last_connected_port_and_mstb; the payload-table row is
+/// cleared and the root's stream keeps its slots in both tables.
+fn navi48_mst_departed_hub_payload_leaves_at_its_last_connected_branch() -> TestResult {
+    let mut hub = Hub::new();
+    hub.dpcd.insert(0, 0x14);
+    hub.edid[126] = 0;
+    let mut link = MstLink::default();
+    run(link.prepare(&mut hub)).unwrap();
+    link.manager.events.clear();
+    let hub = RefCell::new(hub);
+    let root_sink = dp_mst_mgr::Sink { branch: 0, port: 1 };
+    let child_sink = dp_mst_mgr::Sink { branch: 1, port: 1 };
+    let mut aux = TableAux {
+        inner: Aux(&hub),
+        table: Vec::new(),
+    };
+    let mut source = Source {
+        hub: &hub,
+        events: Vec::new(),
+    };
+    for (sink, stream) in [(child_sink, 1u8), (root_sink, 0)] {
+        run(alloc::boxed::Box::pin(add_payload(
+            &mut link,
+            &mut aux,
+            &mut source,
+            sink,
+            stream,
+            600,
+            15,
+            (14, 1),
+        )))
+        .unwrap();
+    }
+    link.owner = Some(0);
+    hub.borrow_mut().child_present = false;
+    link.dirty = true;
+    assert_eq!(run(link.reprobe_live(&mut aux)), Ok(false));
+    assert_eq!(link.lost, [child_sink]);
+    let sent = hub.borrow().requests.len();
+    run(alloc::boxed::Box::pin(remove_payload(
+        &mut link,
+        &mut aux,
+        &mut source,
+        1,
+        true,
+    )))
+    .unwrap();
+    let h = hub.borrow();
+    assert_eq!(h.requests.len(), sent + 1);
+    assert_eq!(
+        (h.requests[sent].0, h.requests[sent].2),
+        (1, dp_mst::ALLOCATE_PAYLOAD)
+    );
+    assert_eq!(h.bodies.last(), Some(&vec![0x11, 0x21, 1, 0, 0, 0]));
+    assert_eq!(aux.table, [(2, 1, 15)]);
+    let left: Vec<_> = link
+        .payloads
+        .iter()
+        .map(|p| (p.stream, p.vcpi, p.start))
+        .collect();
+    assert_eq!(left, [(0, 2, 1)]);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dp-mst",
+    navi48_mst_departed_hub_payload_leaves_at_its_last_connected_branch
+);
+
 /// Only a payload whose port is no longer downstream of the primary
 /// branch (here: a live reprobe found another primary) leaves without
 /// ALLOCATE_PAYLOAD or a payload-table row, as drm_dp_remove_payload_part1

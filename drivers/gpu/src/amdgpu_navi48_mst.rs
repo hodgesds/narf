@@ -125,6 +125,10 @@ pub struct MstLink {
     /// ports are no longer downstream of the primary (Linux reaches such a
     /// state only through a new mgr->mst_primary).
     primary_replaced: bool,
+    /// Branches (old `topology` indices) a live reprobe found gone while
+    /// payloads' end devices left: ALLOCATE_PAYLOAD for a payload behind
+    /// one goes to its last connected ancestor (`payload_target`).
+    departed: Vec<usize>,
     resource_ports: Vec<dp_mst_mgr::Sink>,
     resource_query: bool,
     state: ProbeState,
@@ -174,6 +178,28 @@ impl MstLink {
             return Err(otg::Error::Busy.into());
         }
         Ok(())
+    }
+    /// Where drm_dp_payload_send_msg sends ALLOCATE_PAYLOAD for end device
+    /// `sink`: its branch while that is in the topology, else
+    /// (drm_dp_get_last_connected_port_and_mstb) the nearest ancestor still
+    /// connected, addressed at the port the departed branch hung off.
+    fn payload_target(&self, sink: dp_mst_mgr::Sink) -> Option<(usize, u8)> {
+        let (mut branch, mut port) = (sink.branch, sink.port);
+        for _ in 0..self.topology.branches.len() {
+            if !self.departed.contains(&branch) {
+                return Some((branch, port));
+            }
+            (branch, port) = self
+                .topology
+                .branches
+                .iter()
+                .enumerate()
+                .find_map(|(b, x)| {
+                    let p = x.ports.iter().find(|p| p.branch == Some(branch))?;
+                    Some((b, p.info.port))
+                })?;
+        }
+        None
     }
     fn has_stream_resources(&self) -> bool {
         self.owner.is_some()
@@ -381,6 +407,8 @@ pub(crate) async fn add_payload<A: MstAux, S: MstSource>(
 /// branch port (`MstLink::lost`) is still downstream: Linux's port keeps its
 /// parent for its whole lifetime, so both writes go out and their errors are
 /// ignored, and the branch's payload table compacts with the source's.
+/// A payload behind a branch that left goes to its last connected ancestor
+/// (`MstLink::payload_target`), as drm_dp_payload_send_msg sends it.
 pub(crate) async fn remove_payload<A: MstAux, S: MstSource>(
     link: &mut MstLink,
     aux: &mut A,
@@ -398,13 +426,16 @@ pub(crate) async fn remove_payload<A: MstAux, S: MstSource>(
     link.payload_change = Some(MstPayloadChange::Removing(stream));
     source.vc_rate(stream, (0, 0)).await?;
     let downstream = connected && !link.primary_replaced;
-    if let (true, Some(branch), Some(port)) = (
+    let target = link
+        .payload_target(payload.sink)
+        .and_then(|(b, p)| Some((link.topology.branches.get(b)?.clone(), p)));
+    if let (true, Some((branch, to)), Some(port)) = (
         downstream,
-        link.topology.branches.get(payload.sink.branch).cloned(),
+        target,
         link.topology.port(payload.sink).copied(),
     ) {
         let request = Request::AllocatePayload {
-            port: port.info.port,
+            port: to,
             vcpi: payload.vcpi,
             pbn: 0,
             sdp_stream_sinks: (0..port.info.sdp_streams).collect(),

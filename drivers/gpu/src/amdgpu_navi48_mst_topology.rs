@@ -214,6 +214,7 @@ impl MstLink {
         self.outputs = outputs;
         self.resource_ports.clear();
         self.lost.clear();
+        self.departed.clear();
         self.primary_replaced = false;
         self.dirty = false;
         self.state = ProbeState::Ready;
@@ -306,6 +307,14 @@ impl MstLink {
         self.state = ProbeState::Probing;
         let probed = self.manager.probe(aux).await?;
         self.state = ProbeState::Ready;
+        let departed: Vec<usize> = (0..self.topology.branches.len())
+            .filter(|&i| {
+                !probed
+                    .branches
+                    .iter()
+                    .any(|b| same_branch(&self.topology.branches[i], b))
+            })
+            .collect();
         let Some(mut topology) = keep_indices(&self.topology, probed) else {
             self.primary_replaced = true;
             return Ok(false);
@@ -319,6 +328,7 @@ impl MstLink {
             .collect();
         if !lost.is_empty() {
             self.lost = lost;
+            self.departed = departed;
             return Ok(false);
         }
         // ENUM_PATH_RESOURCES reports what our own payloads left free.
@@ -365,6 +375,7 @@ impl MstLink {
         self.outputs = outputs;
         self.resource_ports.clear();
         self.lost.clear();
+        self.departed.clear();
         self.dirty = false;
         self.state = ProbeState::Ready;
         Ok(true)

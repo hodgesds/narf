@@ -2522,7 +2522,11 @@ primary (drm_dp_mst_port_downstream_of_branch walks the port's parents,
 which a drm_dp_mst_port keeps for its whole lifetime), so the branch's VC
 payload table compacts with the source's and the streams beside it keep
 their slots; its DSC decoder is not addressed (amdgpu_dm clears the
-disconnected connector's dsc_aux) — then services the port again to
+disconnected connector's dsc_aux). A payload behind a branch the reprobe
+found gone (`MstLink::departed`) has its ALLOCATE_PAYLOAD sent to the
+nearest ancestor still connected, at the port the departed branch hung
+off, as drm_dp_payload_send_msg falls back to
+drm_dp_get_last_connected_port_and_mstb — then services the port again to
 adopt the tree beside the streams still running. Only a payload whose
 port is off the primary skips part 1 ("not in topology"): the root's HPD
 is low (dm_helpers_dp_mst_stop_top_mgr cleared mst_primary) or a live
