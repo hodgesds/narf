@@ -6276,7 +6276,15 @@ on that timeout is off by default). `fams2_config_commands(enable,
 dc_dmub_srv_rb_based_fams2_update_config's FAMS2_CONFIG list (type 76,
 sub-type 4: the global command, then every stream's base and sub-state,
 `multi_cmd_pending` on all but the last; disabled, the global command
-alone), checked against the DMUB headers by `tests/dcn401_fams2.c`;
+alone; `global` carries DC's static feature overrides, which the caller
+applies: dcn401's debug defaults turn stall recovery and offload flip on and
+debug off). `tests/dcn401_fams2/check.sh` checks the layouts against the
+DMUB, DALSMC and DCN 4.1 headers (`layout.c`) and extracts
+dc_dmub_srv_rb_based_fams2_update_config verbatim from dc_dmub_srv.c to
+answer `harness.c`'s 48 cases (disabled, zero to six streams, a legacy
+configuration without FAMS2, features unlike DC's defaults, and random
+fields) into `vectors.txt`, which
+`dmub_navi48_fams2_config_replays_linux_vectors` replays byte for byte;
 `Dmub::fams2_update_config` posts a single command and refuses a chain,
 which the shared mailbox does not post. As in Linux's
 `dc_dmub_srv_query_caps_cmd`, firmware must clear the request's `ret_status`

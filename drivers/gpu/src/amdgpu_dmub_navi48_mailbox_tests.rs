@@ -1265,3 +1265,94 @@ kernel_test_in!(
     "drivers/gpu/dmub-navi48",
     dmub_navi48_fams2_config_matches_dmub_cmd_layout
 );
+
+/// The command lists Linux's dc_dmub_srv_rb_based_fams2_update_config posts
+/// (tests/dcn401_fams2/check.sh, built on the DMUB headers): one line per
+/// case, its inputs, " = ", then each 64-byte command in hex.
+const FAMS2_VECTORS: &str = include_str!("../tests/dcn401_fams2/vectors.txt");
+
+fn dmub_navi48_fams2_config_replays_linux_vectors() -> TestResult {
+    let mut cases = 0;
+    for line in FAMS2_VECTORS.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((inputs, want)) = line.split_once(" = ") else {
+            return TestResult::Fail("vector line");
+        };
+        let v: Vec<u32> = inputs.split(' ').map(|t| t.parse().unwrap()).collect();
+        let bit = |f: u32, b: u32| f >> b & 1 != 0;
+        let f = v[4];
+        let global = Fams2Global {
+            max_allow_delay_us: v[1],
+            lock_wait_time_us: v[2],
+            num_streams: v[3],
+            features: Fams2Features {
+                enable: bit(f, 0),
+                enable_ppt_check: bit(f, 1),
+                // DC's static overrides (dcn401_resource.c's debug
+                // defaults), which the caller applies to DML's features.
+                enable_stall_recovery: true,
+                enable_debug: false,
+                enable_offload_flip: true,
+                enable_visual_confirm: bit(f, 5),
+                allow_delay_check_mode: (f >> 6 & 3) as u8,
+                legacy_method_no_fams2: bit(f, 8),
+            },
+            recovery_timeout_us: v[5],
+            hwfq_flip_programming_delay_us: v[6],
+            max_allow_to_target_delta_us: v[7],
+        };
+        if (v.len() - 8) % 25 != 0 || (v.len() - 8) / 25 != v[3] as usize {
+            return TestResult::Fail("vector stream count");
+        }
+        let half = |x: u32| x as u16;
+        let streams: Vec<Fams2StreamConfig> = v[8..]
+            .chunks(25)
+            .map(|s| Fams2StreamConfig {
+                base: crate::amdgpu_dcn401_dml::pstate::Fams2Stream {
+                    kind: s[0] as u8,
+                    otg_vline_time_ns: s[1],
+                    htotal: half(s[2]),
+                    vtotal: half(s[3]),
+                    vblank_start: half(s[4]),
+                    vblank_end: half(s[5]),
+                    max_vtotal: half(s[6]),
+                    allow_start_otg_vline: half(s[7]),
+                    allow_end_otg_vline: half(s[8]),
+                    drr_keepout_otg_vline: half(s[9]),
+                    scheduling_delay_otg_vlines: half(s[10]),
+                    contention_delay_otg_vlines: half(s[11]),
+                    vline_int_ack_delay_otg_vlines: half(s[12]),
+                    allow_to_target_delay_otg_vlines: half(s[13]),
+                    is_drr: bit(s[14], 0),
+                    clamp_vtotal_min: bit(s[14], 1),
+                    min_ttu_vblank_usable: bit(s[14], 2),
+                    vactive_det_fill_delay_otg_vlines: half(s[24]),
+                },
+                otg_inst: s[15] as u8,
+                pipe_mask: s[16] as u8,
+                num_planes: s[17] as u8,
+                plane_pipe_masks: core::array::from_fn(|k| s[18 + k] as u8),
+            })
+            .collect();
+        let want: Vec<[u8; 64]> = want
+            .split(' ')
+            .map(|h| {
+                core::array::from_fn(|k| u8::from_str_radix(&h[2 * k..2 * k + 2], 16).unwrap())
+            })
+            .collect();
+        if fams2_config_commands(v[0] != 0, &global, &streams) != want {
+            return TestResult::Fail("FAMS2_CONFIG bytes differ from Linux");
+        }
+        cases += 1;
+    }
+    if cases != 48 {
+        return TestResult::Fail("vector count");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi48",
+    dmub_navi48_fams2_config_replays_linux_vectors
+);

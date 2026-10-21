@@ -1,11 +1,8 @@
 /* Independent Linux DCN401 FAMS2, DMUB inbox0 lock and DALSMC P-state checks
- * for amdgpu_dmub_navi48.rs and amdgpu_dcn401_clk.rs.
- * cc -Wall -Wextra -Werror -std=gnu11 \
- * -Idrivers/gpu/tests/dcn401_dml21/include \
- * -I/usr/src/linux/drivers/gpu/drm/amd/display/dmub/inc \
- * -I/usr/src/linux/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn401 \
- * -I/usr/src/linux/drivers/gpu/drm/amd/include \
- * drivers/gpu/tests/dcn401_fams2.c -o /tmp/narf-dcn401-fams2
+ * for amdgpu_dmub_navi48.rs and amdgpu_dcn401_clk.rs: the layouts as static
+ * asserts against the DMUB, DALSMC and DCN 4.1 headers, the inbox0 lock words
+ * and feature bits at run time. check.sh builds and runs it; harness.c
+ * checks the FAMS2_CONFIG bytes themselves.
  */
 #include <stdint.h>
 #include <stdbool.h>
