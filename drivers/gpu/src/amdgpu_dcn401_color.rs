@@ -5,10 +5,12 @@
 //!   (mpc401_set_gamut_remap: the coefficient set not in use, then that set
 //!   and the coefficient format); both MCM gamut remaps bypassed.
 //! - dcn32_set_input_transfer_func: legacy gamma's implicit degamma
-//!   (map_crtc_degamma_to_dc_plane's TF_TYPE_PREDEFINED input: BT.709 for
-//!   an NV12 plane, sRGB for any other, P010 included, through
-//!   dpp3_set_pre_degam's ROM), else bypass; GAMCOR always bypassed
-//!   (dpp3_program_gamcor_lut with no PWL), CM enabled.
+//!   (map_crtc_degamma_to_dc_plane's TF_TYPE_PREDEFINED input: sRGB for an
+//!   RGB or P010 plane, through dpp3_set_pre_degam's ROM with the GAMCOR
+//!   bypassed; BT.709 for an NV12 plane, which
+//!   mod_color_calculate_degamma_params turns into distributed points, so
+//!   the ROM is bypassed and dpp3_program_gamcor_lut loads the curve into
+//!   the GAMCOR RAM not in use), else bypass; CM enabled.
 //!
 //! amdgpu_dm exposes no plane color property on DCN 4.0.1 by default: the
 //! plane's DEGAMMA/HDR multiplier/CTM/shaper/3D/blend LUTs are
@@ -32,6 +34,16 @@ use alloc::sync::Arc;
 const PRE_DEGAM: u64 = 0xced;
 const CM_CONTROL: u64 = 0xd67;
 const GAMCOR_CONTROL: u64 = 0xd77;
+/// CM_GAMCOR_LUT_INDEX, _LUT_DATA, _LUT_CONTROL, the RAMA and RAMB banks
+/// (laid out as the OGAM's: START_CNTL_B/G/R, START_SLOPE_CNTL_B/G/R,
+/// START_BASE_CNTL_B/G/R, END_CNTL1/2_B, _G, _R, OFFSET_B/G/R, then
+/// REGION_0_1..REGION_32_33) and CM_MEM_PWR_CTRL.
+const GAMCOR_LUT_INDEX: u64 = 0xd78;
+const GAMCOR_LUT_DATA: u64 = 0xd79;
+const GAMCOR_LUT_CONTROL: u64 = 0xd7a;
+const GAMCOR_RAMA: u64 = 0xd7b;
+const GAMCOR_RAMB: u64 = 0xd9e;
+const CM_MEM_PWR_CTRL: u64 = 0xdc2;
 /// MPCC_MEM_PWR_CTRL (MPCC stride 0x15): MPCC_OGAM_MEM_PWR_DIS and _STATE.
 const MPCC_MEM_PWR: u64 = 0xd;
 const OGAM_MEM_PWR_DIS: u32 = 4;
@@ -94,7 +106,8 @@ pub struct ColorProgram {
     pub ogam: Option<OgamProgram>,
 }
 /// dpp3_set_pre_degam's choice: the DPP's predefined degamma ROM for a
-/// TF_TYPE_PREDEFINED input transfer function, or bypass.
+/// TF_TYPE_PREDEFINED input transfer function, or bypass (also for any
+/// other type: dcn32_set_input_transfer_func then passes UNITY).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PreDegam {
     /// TRANSFER_FUNCTION_LINEAR / UNITY (and any unlisted function).
@@ -105,12 +118,28 @@ pub enum PreDegam {
     /// TRANSFER_FUNCTION_BT709: PRE_DEGAM_SELECT 4.
     Bt709,
 }
-impl PreDegam {
+/// A plane's input transfer function as amdgpu_dm gives it on DCN 4.0.1
+/// (no plane color property) and dcn32_set_input_transfer_func programs it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InputTf {
+    /// TF_TYPE_BYPASS: PRE_DEGAM and GAMCOR bypassed.
+    #[default]
+    Bypass,
+    /// TF_TYPE_PREDEFINED sRGB: the PRE_DEGAM sRGB ROM, GAMCOR bypassed.
+    Srgb,
+    /// TRANSFER_FUNCTION_BT709 as mod_color_calculate_degamma_params leaves
+    /// it, TF_TYPE_DISTRIBUTED_POINTS: PRE_DEGAM bypassed and the BT.709
+    /// degamma PWL (`bt709_degamma`) in the GAMCOR.
+    Bt709,
+}
+impl InputTf {
     /// map_crtc_degamma_to_dc_plane's implicit degamma for a plane in
     /// `format` under legacy gamma: TRANSFER_FUNCTION_BT709 for
     /// SURFACE_PIXEL_FORMAT_VIDEO_420_YCbCr and _YCrCb (amdgpu_dm's NV21
     /// and NV12; "DC doesn't have a transfer function for BT601
-    /// specifically"), sRGB for every other format, P010's
+    /// specifically"), which mod_color_calculate_degamma_params makes
+    /// distributed points (only sRGB and linear keep the predefined ROM on
+    /// DCN 4.0.1); sRGB for every other format, P010's
     /// VIDEO_420_10bpc_YCrCb included.
     pub const fn implicit(format: SurfaceFormat) -> Self {
         match format {
@@ -118,6 +147,29 @@ impl PreDegam {
             _ => Self::Srgb,
         }
     }
+    /// What dcn32_set_input_transfer_func hands dpp3_set_pre_degam: the
+    /// predefined function, else TRANSFER_FUNCTION_UNITY (bypass).
+    pub const fn pre_degam(self) -> PreDegam {
+        match self {
+            Self::Srgb => PreDegam::Srgb,
+            Self::Bypass | Self::Bt709 => PreDegam::Bypass,
+        }
+    }
+}
+/// The BT.709 degamma GAMCOR program (`amdgpu_dcn_color::bt709_degamma_pwl`
+/// as dpp3_program_gamcor_lut writes it), computed once.
+pub fn bt709_degamma() -> Option<Arc<OgamProgram>> {
+    static CACHE: narf_lib::sync::IrqSafeSpinLock<Option<Arc<OgamProgram>>> =
+        narf_lib::sync::IrqSafeSpinLock::new(None);
+    if let Some(p) = CACHE.lock().clone() {
+        return Some(p);
+    }
+    let pwl = crate::amdgpu_dcn_color::bt709_degamma_pwl()?;
+    let program = Arc::new(OgamProgram::from_pwl(&pwl));
+    *CACHE.lock() = Some(program.clone());
+    Some(program)
+}
+impl PreDegam {
     /// CNVC_CFG PRE_DEGAM (mask 0x73): PRE_DEGAM_MODE 1 with the ROM's
     /// PRE_DEGAM_SELECT, or 0 for bypass (dpp3_set_pre_degam's REG_SET_2).
     pub const fn word(self) -> u32 {
@@ -130,12 +182,13 @@ impl PreDegam {
 }
 
 /// What one pipe's color blocks were last set to: the PRE_DEGAM ROM, the
-/// OGAM gamut remap set (1 = A, 2 = B) with its S3.12 format, and the OGAM
-/// RAM bank (0 = A, 1 = B). Default is bypass, which every staged DPP and
-/// MPC preparation writes.
+/// GAMCOR RAM bank (0 = A, 1 = B), the OGAM gamut remap set (1 = A, 2 = B)
+/// with its S3.12 format, and the OGAM RAM bank (0 = A, 1 = B). Default is
+/// bypass, which every staged DPP and MPC preparation writes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PipeColor {
     pub pre_degam: PreDegam,
+    pub gamcor: Option<u8>,
     pub gamut: Option<(u8, bool)>,
     pub ogam: Option<u8>,
 }
@@ -143,6 +196,11 @@ impl PipeColor {
     /// PRE_DEGAM (mask 0x73).
     pub(super) fn pre_degam(self) -> u32 {
         self.pre_degam.word()
+    }
+    /// CM_GAMCOR_CONTROL MODE (mask 3) and SELECT (mask 4); PWL_DISABLE
+    /// (mask 8) stays clear.
+    pub(super) fn gamcor_control(self) -> u32 {
+        self.gamcor.map_or(0, |bank| 2 | u32::from(bank) << 2)
     }
     /// MPCC_OGAM_CONTROL MODE (mask 3) and SELECT (mask 4).
     pub(super) fn ogam_control(self) -> (u32, u32) {
@@ -196,6 +254,11 @@ impl ColorProgram {
                     cm::MAX_COLOR_LUT_ENTRIES => false,
                     _ => return None,
                 };
+                if legacy {
+                    // Computed here, outside the display locks, for an NV12
+                    // plane's implicit degamma.
+                    bt709_degamma()?;
+                }
                 if !legacy && cm::is_lut_linear(&lut) {
                     (false, None)
                 } else {
@@ -261,12 +324,77 @@ impl<I: Io> Engine<I> {
         Ok(Some((set as u8, g.s3_12)))
     }
     /// dcn32_set_input_transfer_func on pipe `q`'s DPP for a plane without its
-    /// own color: dpp3_set_pre_degam, then dpp3_program_gamcor_lut(NULL).
-    fn program_input_tf(&mut self, q: u8, degam: PreDegam) -> Result<(), Error> {
+    /// own color: dpp3_set_pre_degam, then dpp3_program_gamcor_lut with the
+    /// distributed points' PWL (or none). Returns the GAMCOR RAM bank now
+    /// selected.
+    pub(in crate::amdgpu_dcn401_otg) fn program_input_tf(
+        &mut self,
+        q: u8,
+        tf: InputTf,
+    ) -> Result<Option<u8>, Error> {
         let l = self.layout;
-        self.update(l.dpp(q, PRE_DEGAM), 0x73, degam.word())?;
+        self.update(l.dpp(q, PRE_DEGAM), 0x73, tf.pre_degam().word())?;
+        let pwl = match tf {
+            InputTf::Bt709 => Some(bt709_degamma().ok_or(Error::Invalid)?),
+            InputTf::Bypass | InputTf::Srgb => None,
+        };
+        // dpp3_enable_cm_block (no cm_in_bypass debug option).
         self.update(l.dpp(q, CM_CONTROL), 1, 0)?;
-        self.update(l.dpp(q, GAMCOR_CONTROL), 0xf, 0)
+        let Some(o) = pwl else {
+            self.update(l.dpp(q, GAMCOR_CONTROL), 0xf, 0)?;
+            return Ok(None);
+        };
+        // dpp3_power_on_gamcor_lut without enable_mem_low_power.bits.cm
+        // (dcn401_resource): GAMCOR_MEM_PWR_DIS 0 in a REG_SET.
+        self.update(l.dpp(q, CM_MEM_PWR_CTRL), 7, 0)?;
+        self.update(l.dpp(q, GAMCOR_CONTROL), 0xf, 2)?;
+        // dpp30_get_gamcor_current: RAM A or B only when MODE_CURRENT is RAM;
+        // from bypass or A the next is B, from B it is A.
+        let control = self.read(l.dpp(q, GAMCOR_CONTROL))?;
+        let ram_a = (control >> 4) & 3 == 2 && (control >> 6) & 1 == 1;
+        self.update(l.dpp(q, CM_MEM_PWR_CTRL), 7, 0)?;
+        // dpp3_configure_gamcor_lut: all channels, host access to the bank.
+        self.update(l.dpp(q, GAMCOR_LUT_CONTROL), 7, 7)?;
+        self.update(l.dpp(q, GAMCOR_LUT_CONTROL), 0x40, u32::from(!ram_a) << 6)?;
+        self.update(l.dpp(q, GAMCOR_LUT_INDEX), 0x1ff, 0)?;
+        let ram = if ram_a { GAMCOR_RAMA } else { GAMCOR_RAMB };
+        let at = |r: u64| l.dpp(q, ram + r);
+        // cm_helper_program_gamcor_xfer_func's order.
+        for (c, &start) in o.start.iter().enumerate() {
+            self.update(at(c as u64), u32::MAX, start)?;
+        }
+        for (c, &slope) in o.start_slope.iter().enumerate() {
+            self.update(at(RAM_START_SLOPE + c as u64), u32::MAX, slope)?;
+        }
+        for (c, &base) in o.end_base.iter().enumerate() {
+            self.update(at(RAM_END + 2 * c as u64), u32::MAX, base)?;
+        }
+        for (c, &end) in o.end.iter().enumerate() {
+            self.update(at(RAM_END + 2 * c as u64 + 1), u32::MAX, end)?;
+        }
+        for (i, &region) in o.regions.iter().enumerate() {
+            self.update(at(RAM_REGIONS + i as u64), u32::MAX, region)?;
+        }
+        // dpp3_program_gammcor_lut: every base value, then the last one
+        // again (rgb[num - 1].red_reg plus its delta_red_reg, which the
+        // degamma translation leaves zero); one pass when the channels
+        // agree, else red, green and blue under their write masks.
+        let data = l.dpp(q, GAMCOR_LUT_DATA);
+        let with_last =
+            |v: &[u32]| -> alloc::vec::Vec<u32> { v.iter().chain(v.last()).copied().collect() };
+        if o.lut[0] == o.lut[1] && o.lut[1] == o.lut[2] {
+            self.lut_words(data, &with_last(&o.lut[0]))?;
+        } else {
+            for (c, mask) in [4u32, 2, 1].into_iter().enumerate() {
+                if c > 0 {
+                    self.update(l.dpp(q, GAMCOR_LUT_INDEX), 0x1ff, 0)?;
+                }
+                self.update(l.dpp(q, GAMCOR_LUT_CONTROL), 7, mask)?;
+                self.lut_words(data, &with_last(&o.lut[c]))?;
+            }
+        }
+        self.update(l.dpp(q, GAMCOR_CONTROL), 4, u32::from(!ram_a) << 2)?;
+        Ok(Some(u8::from(!ram_a)))
     }
     /// mpc3_set_output_gamma on pipe `q`'s MPCC. Returns the RAM bank now selected.
     async fn program_ogam(
@@ -339,14 +467,14 @@ impl<I: Io> Engine<I> {
     /// The input transfer function amdgpu_dm gives the plane HUBP/DPP `q`
     /// fetches under display `pipe`'s CRTC color: the implicit degamma of
     /// its format under legacy gamma (cm_is_degamma_srgb), else bypass.
-    fn input_tf(&self, pipe: u8, q: u8) -> PreDegam {
+    fn input_tf(&self, pipe: u8, q: u8) -> InputTf {
         let legacy = self.displays.color[usize::from(pipe)]
             .as_deref()
             .is_some_and(|c| c.pre_degam_srgb);
         match self.fetched_surface(q) {
-            Some(a) if legacy => PreDegam::implicit(a.request.format),
-            None if legacy => PreDegam::Srgb,
-            _ => PreDegam::Bypass,
+            Some(a) if legacy => InputTf::implicit(a.request.format),
+            None if legacy => InputTf::Srgb,
+            _ => InputTf::Bypass,
         }
     }
     /// Program display `p.pipe`'s requested color on each of its pipes, in
@@ -365,13 +493,14 @@ impl<I: Io> Engine<I> {
             for &q in &tree {
                 let stream = program.filter(|_| Some(q) == top);
                 let gamut = self.program_gamut(q, stream.and_then(|c| c.gamut.as_ref()))?;
-                let pre_degam = self.input_tf(p.pipe, q);
-                self.program_input_tf(q, pre_degam)?;
+                let tf = self.input_tf(p.pipe, q);
+                let gamcor = self.program_input_tf(q, tf)?;
                 let ogam = self
                     .program_ogam(q, stream.and_then(|c| c.ogam.as_ref()))
                     .await?;
                 self.status.colors[usize::from(q)] = PipeColor {
-                    pre_degam,
+                    pre_degam: tf.pre_degam(),
+                    gamcor,
                     gamut,
                     ogam,
                 };
@@ -387,6 +516,7 @@ impl<I: Io> Engine<I> {
         let (ogam_mask, ogam) = c.ogam_control();
         for (at, mask, value) in [
             (l.dpp(q, PRE_DEGAM), 0x73, c.pre_degam()),
+            (l.dpp(q, GAMCOR_CONTROL), 7, c.gamcor_control()),
             (l.ogam(q, OGAM_CONTROL), ogam_mask, ogam),
             (l.ogam(q, GAMUT_MODE), 3, c.gamut_mode()),
         ] {

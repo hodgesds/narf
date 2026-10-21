@@ -2,24 +2,33 @@
  * coefficient set and cursor color; see check.sh.
  *
  * check.sh extracts, verbatim: enum surface_pixel_format and enum
- * dc_color_space (dc_hw_types.h), enum dc_transfer_func_predefined (dc.h),
+ * dc_color_space (dc_hw_types.h),
  * enum cursor_matrix_mode and enum dc_cursor_color_format (dc_hw_types.h),
  * enum dcn10_input_csc_select, dpp_input_csc_matrix (dc/inc/hw/dpp.h),
  * fill_dc_plane_info_and_addr's DRM-to-DC format switch and
  * fill_plane_color_attributes (amdgpu_dm.c), dpp401_dpp_setup's format
- * switch, map_crtc_degamma_to_dc_plane's implicit-degamma format switch
- * (amdgpu_dm_color.c), dpp3_set_pre_degam and dpp3_program_post_csc
- * (dcn30_dpp.c), dpp401_program_cursor_csc and dpp401_set_cursor_matrix
+ * switch, dpp3_program_post_csc (dcn30_dpp.c), dpp401_program_cursor_csc
+ * and dpp401_set_cursor_matrix
  * (dcn401_dpp_cm.c), dpp401_set_cursor_attributes, and the
  * ENABLE_CURSOR_DEGAMMA condition of amdgpu_dm_plane_handle_cursor_update
  * with dcn401_resource's dpp gamma_corr cap. The register macros below
- * record what those functions write.
+ * record what those functions write. The plane's input transfer function
+ * is input_tf.c's: Linux's map_crtc_degamma_to_dc_plane (through
+ * mod_color_calculate_degamma_params) and dcn32_set_input_transfer_func
+ * (dpp3_set_pre_degam, cm3_helper_translate_curve_to_degamma_hw_format,
+ * dpp3_program_gamcor_lut).
  *
  * Input lines: <fourcc> <legacy gamma 0|1> <CM_POST_CSC_MODE_CURRENT>
  *   <COLOR_ENCODING> <COLOR_RANGE>
  * Output: "-" when amdgpu_dm refuses the plane, else PRE_DEGAM_MODE,
  *   PRE_DEGAM_SELECT, CM_POST_CSC_MODE, the coefficient set written ("A",
- *   "B" or "-" for bypass), CUR0_MATRIX_MODE and CUR0_ROM_EN.
+ *   "B" or "-" for bypass), CUR0_MATRIX_MODE, CUR0_ROM_EN, then
+ *   CM_GAMCOR_MODE, CM_GAMCOR_SELECT and the FNV-1a 32 (hex) of the input
+ *   transfer function's register writes on a DPP whose GAMCOR is bypassed
+ *   (see input_tf.c).
+ * With --gamcor, input lines are <fourcc> <CM_GAMCOR_CONTROL> (its
+ *   MODE_CURRENT/SELECT_CURRENT) under legacy gamma, and the output is the
+ *   write count then every write as <dword offset>:<value> in hex.
  */
 #include <errno.h>
 #include <stdbool.h>
@@ -102,16 +111,10 @@ static void dpp_setup(enum surface_pixel_format format, enum dc_color_space inpu
 	*out_select = select;
 }
 
-/* map_crtc_degamma_to_dc_plane's implicit degamma for the plane's format. */
-static enum dc_transfer_func_predefined implicit_tf(enum surface_pixel_format format)
-{
-	struct { enum surface_pixel_format format; } plane_, *dc_plane_state = &plane_;
-	enum dc_transfer_func_predefined tf = TRANSFER_FUNCTION_SRGB;
-
-	dc_plane_state->format = format;
-#include "degamma_tf.inc"
-	return tf;
-}
+/* input_tf.c */
+int linux_input_tf(unsigned format, bool legacy, uint32_t gamcor_control);
+int linux_input_tf_writes(const uint32_t **reg, const uint32_t **val);
+void linux_input_tf_result(uint32_t out[5]);
 
 /* The register model the DPP functions write through. */
 enum {
@@ -130,7 +133,6 @@ enum {
 	REG_CURSOR0_COLOR0,
 	REG_CURSOR0_COLOR1,
 };
-static uint32_t pre_degam_mode, pre_degam_select;
 static uint32_t post_csc_mode, post_csc_current;
 static int post_csc_set; /* -1 none, 0 A, 1 B */
 static uint32_t cur_matrix_mode;
@@ -138,7 +140,6 @@ static uint32_t rec_rom_en, rec_cur_mode;
 
 #define REG(r) REG_##r
 #define REG_SET(reg, init, field, value) reg_set(REG_##reg, (value))
-#define REG_SET_2(reg, init, f1, v1, f2, v2) (pre_degam_mode = (v1), pre_degam_select = (v2))
 #define REG_GET(reg, field, out) (*(out) = reg_get(REG_##reg))
 #define REG_UPDATE(reg, field, value) ((void)0)
 #define REG_UPDATE_3(reg, f1, v1, f2, v2, f3, v3) (rec_cur_mode = (v1), rec_rom_en = (v3))
@@ -203,7 +204,33 @@ struct dcn401_dpp {
 
 #include "dpp_fns.inc"
 
-int main(void)
+/* --gamcor: the input transfer function's full write log under legacy
+ * gamma, from a DPP whose CM_GAMCOR_CONTROL reads `control`. */
+static int gamcor_dump(void)
+{
+	char fourcc[8];
+	unsigned control;
+
+	while (scanf("%4s %x", fourcc, &control) == 2) {
+		uint32_t f = DRM_FORMAT(fourcc[0], fourcc[1], fourcc[2], fourcc[3]);
+		enum surface_pixel_format format;
+		const uint32_t *reg, *val;
+		int n;
+
+		if (dm_format(f, &format) || linux_input_tf(format, true, control)) {
+			printf("-\n");
+			continue;
+		}
+		n = linux_input_tf_writes(&reg, &val);
+		printf("%d", n);
+		for (int i = 0; i < n; i++)
+			printf(" %x:%x", reg[i], val[i]);
+		printf("\n");
+	}
+	return 0;
+}
+
+int main(int argc, char **argv)
 {
 	static const struct tf_fields fields;
 	struct dcn401_dpp dpp = { .tf_shift = &fields, .tf_mask = &fields };
@@ -211,6 +238,8 @@ int main(void)
 	char fourcc[8];
 	unsigned legacy, current, enc, range;
 
+	if (argc > 1 && !strcmp(argv[1], "--gamcor"))
+		return gamcor_dump();
 	while (scanf("%4s %u %u %u %u", fourcc, &legacy, &current, &enc, &range) == 5) {
 		uint32_t f = DRM_FORMAT(fourcc[0], fourcc[1], fourcc[2], fourcc[3]);
 		enum surface_pixel_format format;
@@ -227,10 +256,15 @@ int main(void)
 			printf("-\n");
 			continue;
 		}
-		/* amdgpu_dm_update_plane_color_mgmt: bypass, or under legacy gamma
-		 * map_crtc_degamma_to_dc_plane's TF_TYPE_PREDEFINED input, which
-		 * dcn32_set_input_transfer_func hands dpp3_set_pre_degam. */
-		dpp3_set_pre_degam(dpp_base, legacy ? implicit_tf(format) : TRANSFER_FUNCTION_LINEAR);
+		/* amdgpu_dm_update_plane_color_mgmt's input transfer function, as
+		 * dcn32_set_input_transfer_func programs it (input_tf.c). */
+		uint32_t tf[5];
+
+		if (linux_input_tf(format, legacy, 0)) {
+			printf("-\n");
+			continue;
+		}
+		linux_input_tf_result(tf);
 		/* dpp401_dpp_setup's post CSC from a pipe whose
 		 * CM_POST_CSC_MODE_CURRENT reads `current`. */
 		dpp_setup(format, cs, &used, &select);
@@ -242,8 +276,9 @@ int main(void)
 		dpp401_set_cursor_matrix(dpp_base, used, (struct dc_csc_transform){ 0 });
 #include "cursor_degamma.inc"
 		dpp401_set_cursor_attributes(dpp_base, &cursor);
-		printf("%u %u %u %s %u %u\n", pre_degam_mode, pre_degam_select, post_csc_mode,
-		       post_csc_set < 0 ? "-" : post_csc_set ? "B" : "A", cur_matrix_mode, rec_rom_en);
+		printf("%u %u %u %s %u %u %u %u %08x\n", tf[0], tf[1], post_csc_mode,
+		       post_csc_set < 0 ? "-" : post_csc_set ? "B" : "A", cur_matrix_mode, rec_rom_en,
+		       tf[2], tf[3], tf[4]);
 	}
 	return 0;
 }

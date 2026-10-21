@@ -540,16 +540,40 @@ kernel_test_in!(
 
 /// tests/dcn401_yuv/color_vectors.txt: Linux's input transfer function for
 /// every scanned format with and without the CRTC's legacy gamma
-/// (map_crtc_degamma_to_dc_plane through dpp3_set_pre_degam: BT.709 ROM
-/// for NV12, sRGB for the rest, P010 included), dpp3_program_post_csc's
+/// (map_crtc_degamma_to_dc_plane through dcn32_set_input_transfer_func: the
+/// sRGB ROM for RGB and P010, the BT.709 GAMCOR points with the ROM
+/// bypassed for NV12; its PRE_DEGAM and GAMCOR fields and the FNV-1a of
+/// its writes from a bypassed GAMCOR), dpp3_program_post_csc's
 /// coefficient set against each CM_POST_CSC_MODE_CURRENT (the one not in
 /// use), dpp401_set_cursor_matrix's bypass and
 /// dpp401_set_cursor_attributes' CUR0_ROM_EN (amdgpu_dm's
 /// ENABLE_CURSOR_DEGAMMA under legacy gamma).
 fn dcn401_dpp_color_input_matches_linux_vectors() -> TestResult {
-    use crate::amdgpu_dcn401_otg::{PreDegam, YuvColor};
+    use crate::amdgpu_dcn401_otg::{InputTf, YuvColor};
     use core::fmt::Write;
     const VECTORS: &str = include_str!("../tests/dcn401_yuv/color_vectors.txt");
+    // CM_GAMCOR_MODE, CM_GAMCOR_SELECT and the FNV-1a 32 of each input
+    // transfer function's writes (dword offset, then value, as LE bytes;
+    // CM_GAMCOR_CONTROL's read-only current fields left out).
+    let trace = |tf: InputTf| -> (u32, u32, u32) {
+        let mut e = engine();
+        let _ = e.program_input_tf(0, tf);
+        let mut h: u32 = 0x811c_9dc5;
+        for &(at, value) in &e.io.writes {
+            let reg = ((at - BASE) / 4) as u32;
+            let value = if reg == 0xd77 { value & !0x70 } else { value };
+            for b in reg.to_le_bytes().into_iter().chain(value.to_le_bytes()) {
+                h = (h ^ u32::from(b)).wrapping_mul(0x0100_0193);
+            }
+        }
+        let control = e.io.regs.get(&d(0, 0xd77)).copied().unwrap_or(0);
+        (control & 3, (control >> 2) & 1, h)
+    };
+    let traces = [
+        trace(InputTf::Bypass),
+        trace(InputTf::Srgb),
+        trace(InputTf::Bt709),
+    ];
     let mut n = 0;
     for line in VECTORS.lines().filter(|l| !l.starts_with('#')) {
         let (input, want) = line.split_once(" = ").unwrap();
@@ -563,12 +587,13 @@ fn dcn401_dpp_color_input_matches_linux_vectors() -> TestResult {
         let got = if refused {
             alloc::string::String::from("-")
         } else {
-            let degam = if legacy {
-                PreDegam::implicit(format)
+            let tf = if legacy {
+                InputTf::implicit(format)
             } else {
-                PreDegam::Bypass
-            }
-            .word();
+                InputTf::Bypass
+            };
+            let degam = tf.pre_degam().word();
+            let (gamcor_mode, gamcor_select, hash) = traces[tf as usize];
             let (mode, set) = match format.is_video() {
                 false => (0, "-"),
                 true if crate::amdgpu_dcn401_otg::fetch::post_csc_set_b(current) => (2, "B"),
@@ -583,7 +608,7 @@ fn dcn401_dpp_color_input_matches_linux_vectors() -> TestResult {
             let mut out = alloc::string::String::new();
             let _ = write!(
                 out,
-                "{} {} {mode} {set} {} {}",
+                "{} {} {mode} {set} {} {} {gamcor_mode} {gamcor_select} {hash:08x}",
                 degam & 3,
                 degam >> 4 & 7,
                 crate::amdgpu_dcn401_otg::fetch::CURSOR_MATRIX_WORD,

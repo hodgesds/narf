@@ -34,6 +34,7 @@ const SCALER_POWER: u64 = 0xd24;
 const SCALER_STATUS: u64 = 0xd25;
 const CM_CONTROL: u64 = 0xd67;
 const PRE_DEGAM: u64 = 0xced;
+const GAMCOR_CONTROL: u64 = 0xd77;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DppApplied {
@@ -159,8 +160,8 @@ fn cnvc_cm(a: DppApplied) -> alloc::vec::Vec<(u64, u32, u32)> {
         (POST_CSC, 3, if csc.is_some() { select } else { 0 }),
         // hwseq's step 8 after dpp_setup: the cursor matrix bypassed.
         (CURSOR_MATRIX, 0x13, CURSOR_MATRIX_WORD),
-        (0xd77, 0xf, 0), // gamma correction bypass
-        (0xdc5, 3, 0),   // CM de-alpha off
+        (GAMCOR_CONTROL, 0xf, 0), // gamma correction bypass
+        (0xdc5, 3, 0),            // CM de-alpha off
         (0xd75, 0xffff, 0),
         (0xd76, u32::MAX, 0),
         (0xdc1, 0x7ffff, 0x1f000), // unity HDR multiplier
@@ -392,12 +393,13 @@ impl<I: Io> Engine<I> {
                 .chain(coef)
                 .chain([(SCALER_POWER, 7, 4), (SCALER_STATUS, 3, 0)])
             {
-                // PRE_DEGAM follows the pipe's color record (bypass when
-                // staged; legacy gamma's sRGB once scanout programs it).
-                let value = if r == PRE_DEGAM {
-                    self.status.colors[usize::from(p)].pre_degam()
-                } else {
-                    value
+                // PRE_DEGAM and the GAMCOR follow the pipe's color record
+                // (bypass when staged; legacy gamma's implicit degamma once
+                // scanout programs it).
+                let value = match r {
+                    PRE_DEGAM => self.status.colors[usize::from(p)].pre_degam(),
+                    GAMCOR_CONTROL => self.status.colors[usize::from(p)].gamcor_control(),
+                    _ => value,
                 };
                 let at = self.layout.dpp(p, r);
                 if self.read(at)? & mask != value {
@@ -525,7 +527,9 @@ impl Surfaces {
         e.status.state = State::PreparingDpp(pipe);
         // Staging writes the input transfer function's bypass.
         for (p, _, _) in surface.applied.request.segments() {
-            e.status.colors[usize::from(p)].pre_degam = Default::default();
+            let color = &mut e.status.colors[usize::from(p)];
+            color.pre_degam = Default::default();
+            color.gamcor = None;
         }
         let result = async {
             applied.coef_ram = e.program_dpp(&mut applied).await?;

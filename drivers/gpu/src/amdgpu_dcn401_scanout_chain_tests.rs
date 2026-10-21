@@ -1298,6 +1298,7 @@ fn crtc_color(c: &mut Chain, p: u8) -> Result<(), &'static str> {
         || c.e.status.colors[usize::from(p)]
             != (PipeColor {
                 pre_degam: PreDegam::Srgb,
+                gamcor: None,
                 gamut: Some((1, false)),
                 ogam: Some(0),
             })

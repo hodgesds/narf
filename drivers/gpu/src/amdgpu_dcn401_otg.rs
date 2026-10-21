@@ -30,7 +30,7 @@ pub use fetch::{
     MAX_OVERLAYS,
 };
 pub use fetch::{DccBlock, PlaneSurface, SurfaceBytes, Swizzle, Tiling, YuvColor};
-pub use fetch::{ExternalSurface, FlipSource, PreDegam};
+pub use fetch::{ExternalSurface, FlipSource, InputTf, PreDegam};
 #[path = "amdgpu_dcn401_stream.rs"]
 mod stream;
 pub use stream::{DpBlanked, DpEncoderRetired, DpStream};

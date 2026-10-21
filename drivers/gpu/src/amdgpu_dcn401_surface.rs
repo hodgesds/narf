@@ -35,7 +35,7 @@ mod flip;
 mod plane_update;
 #[path = "amdgpu_dcn401_scanout.rs"]
 mod scanout;
-pub use color::{ColorProgram, GamutProgram, OgamProgram, PipeColor, PreDegam};
+pub use color::{ColorProgram, GamutProgram, InputTf, OgamProgram, PipeColor, PreDegam};
 pub use flip::{ExternalSurface, FlipDone, FlipSource};
 pub use plane_update::{
     plane_update_type, planes_update_type, Cleared, LivePlanes, PlaneContent, PlanesUpdated,

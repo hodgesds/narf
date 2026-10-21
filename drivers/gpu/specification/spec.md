@@ -4843,12 +4843,24 @@ property only reaches clients with DRM_CLIENT_CAP_PLANE_COLOR_PIPELINE,
 which NARF does not implement. amdgpu_dm_update_plane_color_mgmt then
 bypasses the input transfer function unless the CRTC's legacy (256-entry)
 gamma sets cm_is_degamma_srgb, when map_crtc_degamma_to_dc_plane gives each
-plane a predefined degamma by format (`otg::PreDegam::implicit`): BT.709
+plane a predefined degamma by format (`otg::InputTf::implicit`): BT.709
 for NV12 (DC's VIDEO_420_YCrCb; "no transfer function for BT601"), sRGB for
-RGB and P010 (VIDEO_420_10bpc_YCrCb is not in its switch).
-dcn32_set_input_transfer_func hands it to dpp3_set_pre_degam (PRE_DEGAM
-mode 1, select 0 sRGB, 4 BT.709; `PipeColor::pre_degam`, programmed per
-fetching DPP by `Engine::input_tf`). Every DPP setup also programs the
+RGB and P010 (VIDEO_420_10bpc_YCrCb is not in its switch). sRGB stays
+TF_TYPE_PREDEFINED, which dcn32_set_input_transfer_func hands to
+dpp3_set_pre_degam (PRE_DEGAM mode 1, select 0) with the GAMCOR bypassed;
+BT.709 is not a ROM mod_color_calculate_degamma_params keeps on DCN 4.0.1,
+so it becomes TF_TYPE_DISTRIBUTED_POINTS (build_degamma's inverse BT.709
+OETF from 2^-12 to 2^0, clamped: `amdgpu_dcn_color::bt709_degamma_tf`),
+PRE_DEGAM is bypassed (UNITY) and dpp3_program_gamcor_lut loads
+cm3_helper_translate_curve_to_degamma_hw_format's 256-point PWL
+(`amdgpu_dcn_color::translate_curve_to_degamma_hw_format`,
+`otg::bt709_degamma`, computed once) into the CM_GAMCOR RAM not in use
+(B from bypass or A, A from B: power on, MODE 2, host select, the RAM's
+control words, the LUT with its last value repeated, then SELECT). The
+choice is `InputTf::pre_degam` and `PipeColor::{pre_degam, gamcor}`,
+programmed per fetching DPP by `Engine::input_tf` and
+`Engine::program_input_tf`; staging and the verifiers follow that record
+(CM_GAMCOR_CONTROL MODE/SELECT included). Every DPP setup also programs the
 cursor matrix as dcn401's hwseq does after dpp_setup:
 dpp401_set_cursor_matrix forces COLOR_SPACE_UNKNOWN, so CUR0_MATRIX_MODE is
 bypass over RGB and YCbCr planes alike (`dpp::CURSOR_MATRIX_WORD`). The
@@ -4858,8 +4870,15 @@ makes CUR0_ROM_EN for the premultiplied cursor
 (`CursorApplied::degamma`, from the CRTC with every attribute update, a
 move included). `tests/dcn401_yuv/check.sh` also checks 540 vectors
 (`color_vectors.txt`: format, legacy gamma, CM_POST_CSC_MODE_CURRENT,
-encoding, range) of those Linux functions compiled verbatim, replayed by
-`dcn401_dpp_color_input_matches_linux_vectors`.
+encoding, range; the input transfer function's PRE_DEGAM, GAMCOR mode and
+select and the FNV-1a of its writes) of those Linux functions compiled
+verbatim, replayed by `dcn401_dpp_color_input_matches_linux_vectors`, and
+15 (`gamcor_vectors.txt`: every write of the input transfer function for
+five formats under legacy gamma from a bypassed GAMCOR, RAM A and RAM B)
+from Linux's map_crtc_degamma_to_dc_plane, mod_color_calculate_degamma_params
+(color_gamma.c), dcn32_set_input_transfer_func and dpp3_program_gamcor_lut
+with its helpers (`input_tf.c`, linked against tests/dcn401_color's host
+build), replayed by `dcn401_color_input_tf_matches_linux_gamcor_vectors`.
 
 Gaps: planes on an ODM stream
 must reach every segment; no
