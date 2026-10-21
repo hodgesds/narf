@@ -76,6 +76,19 @@ pub fn __test_swap_lock_spin_hook(new: Option<fn()>) -> Option<fn()> {
     (prev != 0).then(|| unsafe { core::mem::transmute::<usize, fn()>(prev) })
 }
 
+/// Service the work a CPU with IRQs masked would otherwise strand: pending
+/// TLB-shootdown requests (the installed spin-wait hook) and `membarrier(2)`
+/// rendezvous. For a holder of an `IrqSafeSpinLock` that runs a long
+/// operation, the counterpart of what the lock's own spin loop does for its
+/// waiters: a peer waiting on this CPU's acknowledgement is answered between
+/// the operation's steps instead of after all of them. Call from CPL=0 with
+/// IRQs masked, at a point where servicing a shootdown is safe (no page
+/// table of the current address space half-edited).
+#[inline]
+pub fn service_masked_work() {
+    run_lock_spin_hook();
+}
+
 /// Run the installed spin-wait hook if any. Tiny by design — one acquire load
 /// and an early return when nothing is wired (kernel-test, pre-boot, or the
 /// xAPIC fallback where shootdowns aren't broadcast).

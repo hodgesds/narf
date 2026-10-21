@@ -172,20 +172,55 @@ fn write_console_level(level: u32, s: &str) {
         None => return, // pre-init; silently drop
     };
     let base = CONSOLE.base.load(Ordering::Acquire) as usize;
-    // SAFETY: `kind` + `base` were published via Release by `early_init`
-    // or `remap_to_virtual`, and we hold the coarse lock; the backend
-    // methods themselves uphold the compiler_fence discipline.
-    // SAFETY: Valid memory or trusted environment
-    unsafe {
-        backend::write_bytes(base, kind, s.as_bytes());
-    }
+    write_chunked(s.as_bytes(), |chunk| {
+        // SAFETY: `kind` + `base` were published via Release by `early_init`
+        // or `remap_to_virtual`, and we hold the coarse lock; the backend
+        // methods themselves uphold the compiler_fence discipline.
+        // SAFETY: Valid memory or trusted environment
+        unsafe {
+            backend::write_bytes(base, kind, chunk);
+        }
+    });
+}
 
-    // Fan out to the framebuffer-console hook when installed.
+mod chunk_tests;
+
+/// Longest run of bytes written to the UART and the framebuffer between two
+/// [`narf_lib::sync::service_masked_work`] calls. `CONSOLE.lock` masks IRQs,
+/// so a CPU writing the console cannot take a TLB-shootdown or membarrier
+/// IPI, and the peer that sent it waits for its acknowledgement. 16 bytes is
+/// ~1.4 ms of polled output at 115200 baud.
+const MASKED_CHUNK: usize = 16;
+
+/// Send `bytes` to the UART (through `uart`) and the framebuffer hook in
+/// chunks of at most [`MASKED_CHUNK`] bytes, each ending early after a line
+/// feed (a framebuffer scroll is the costliest step), and service masked
+/// work between chunks. Linux keeps these windows short the same way: the
+/// uart driver writes under its port lock a FIFO at a time, and fbcon draws
+/// under the sleeping `console_lock` with IRQs enabled.
+fn write_chunked(bytes: &[u8], mut uart: impl FnMut(&[u8])) {
     let h = FB_HOOK.load(Ordering::Acquire);
-    if h != 0 {
-        // SAFETY: stored as `FbHook as usize` in `set_fb_hook`.
-        let f: FbHook = unsafe { core::mem::transmute(h) };
-        f(s.as_bytes());
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let limit = rest.len().min(MASKED_CHUNK);
+        let end = rest[..limit]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(limit, |i| i + 1);
+        let (chunk, tail) = rest.split_at(end);
+        uart(chunk);
+        // Fan out to the framebuffer-console hook when installed. It parses
+        // the stream byte by byte with persistent state, so chunking is
+        // invisible to it.
+        if h != 0 {
+            // SAFETY: stored as `FbHook as usize` in `set_fb_hook`.
+            let f: FbHook = unsafe { core::mem::transmute(h) };
+            f(chunk);
+        }
+        rest = tail;
+        if !rest.is_empty() {
+            narf_lib::sync::service_masked_work();
+        }
     }
 }
 
@@ -208,20 +243,14 @@ pub fn write_bytes_raw(bytes: &[u8]) {
         None => return, // pre-init; silently drop
     };
     let base = CONSOLE.base.load(Ordering::Acquire) as usize;
-    // SAFETY: `kind` + `base` were published via Release by `early_init`
-    // or `remap_to_virtual`, and we hold the coarse lock.
-    // SAFETY: Valid memory or trusted environment
-    unsafe {
-        backend::write_bytes_opts(base, kind, bytes, false);
-    }
-
-    // Fan out to the framebuffer-console hook when installed.
-    let h = FB_HOOK.load(Ordering::Acquire);
-    if h != 0 {
-        // SAFETY: stored as `FbHook as usize` in `set_fb_hook`.
-        let f: FbHook = unsafe { core::mem::transmute(h) };
-        f(bytes);
-    }
+    write_chunked(bytes, |chunk| {
+        // SAFETY: `kind` + `base` were published via Release by `early_init`
+        // or `remap_to_virtual`, and we hold the coarse lock.
+        // SAFETY: Valid memory or trusted environment
+        unsafe {
+            backend::write_bytes_opts(base, kind, chunk, false);
+        }
+    });
 }
 
 /// Enable RX-data-available IRQ on the active UART. After this
