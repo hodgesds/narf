@@ -4796,6 +4796,66 @@ fn credit_idle_since(cpu: usize, t0_cycles: u64) {
     }
 }
 
+/// Per-CPU accumulated steal time (ns) — the real data behind
+/// /proc/stat's per-cpu steal column on KVM guests. The host publishes
+/// a *cumulative* stolen-ns counter per vCPU in the steal-time area
+/// (`narf_memory::kvm_pv::steal_time_ns`); `PERCPU_STEAL_LAST_NS` holds
+/// the last raw value folded into `PERCPU_STEAL_NS`.
+///
+/// Sampling is deliberately on-read (from [`cpu_steal_ns`], i.e. when
+/// /proc/stat is generated) rather than per-tick like Linux's
+/// `account_steal_time`: the KVM counter is cumulative, so no steal is
+/// ever lost between samples — the sampling instant cannot change the
+/// total, unlike idle time, which exists only as halt brackets and
+/// must be folded at the halt. The only consumer is the stats path, so
+/// a per-tick read of the versioned host struct would add preempt-path
+/// work for no extra accuracy (and the scheduler's tick hook does not
+/// even fire for idle CPUs, so it could never be the sole sampler).
+static PERCPU_STEAL_NS: [core::sync::atomic::AtomicU64; narf_lib::percpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
+static PERCPU_STEAL_LAST_NS: [core::sync::atomic::AtomicU64; narf_lib::percpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
+
+/// Fold the steal accrued by `cpu` since the previous sample into
+/// `PERCPU_STEAL_NS`. The `swap` on the last-sample slot claims the
+/// interval (prev, now] for exactly one sampler even when several
+/// CPUs generate stats concurrently; each interval is folded once.
+fn sample_steal_ns(cpu: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let (Some(last_slot), Some(acc_slot)) =
+            (PERCPU_STEAL_LAST_NS.get(cpu), PERCPU_STEAL_NS.get(cpu))
+        else {
+            return;
+        };
+        if let Some(now) = narf_memory::kvm_pv::steal_time_ns(cpu) {
+            let prev = last_slot.swap(now, Ordering::Relaxed);
+            let delta = narf_memory::kvm_pv::steal_counter_delta(prev, now);
+            if delta != 0 {
+                acc_slot.fetch_add(delta, Ordering::Relaxed);
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // aarch64 has no PV stolen-time reader yet (ARM DEN0057A
+        // PV_TIME_ST is a follow-up); steal stays 0 there, as before.
+        let _ = cpu;
+    }
+}
+
+/// Accumulated steal ns for `cpu` since boot (0 for an out-of-range id,
+/// and always 0 off KVM guests — bare metal, TCG, other hypervisors —
+/// where no steal counter exists). Sampling on read; see
+/// `PERCPU_STEAL_NS` for why that loses nothing.
+pub fn cpu_steal_ns(cpu: usize) -> u64 {
+    sample_steal_ns(cpu);
+    PERCPU_STEAL_NS
+        .get(cpu)
+        .map(|a| a.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
 fn idle_wait(next_deadline: Option<u64>) {
     let t0 = narf_time::now_cycles();
     idle_wait_inner(next_deadline);

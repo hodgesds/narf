@@ -1599,3 +1599,9 @@ argument = "The scheduler change is inside the executor core, already a member o
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The change performs no kernel-side data access beyond reading the current CPU's cycle counter and atomically adding the delta to that same CPU's idle-ns slot. It invokes no capability, changes no domain tag, mapping, or task state, and neither weakens nor bypasses the capability-and-domain rule; the filesystem change is a doc comment correcting gen_stat's description to match the code."
+
+argument = "The steal-accounting change stays inside existing TCB members (memory/'s kvm_pv module and the scheduler executor core) and the filesystem stats reader; it adds no TCB member and moves no boundary. The new memory/ code only reads the current guest's own already-registered KVM steal-time area through width-matched atomics under the ABI's version protocol; the scheduler only folds the resulting cumulative-counter deltas into a pre-existing-style per-CPU atomic accumulator, and filesystem/ only prints the accumulated value in /proc/stat's steal column."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The change performs no kernel-side data access beyond reading the guest's own host-published steal-time struct (data the hypervisor writes for this guest alone; it carries no other guest's or host's secrets and grants no authority) and atomically updating the scheduler's own per-CPU counters. It invokes no capability, changes no domain tag, mapping, or task state, and neither weakens nor bypasses the capability-and-domain rule. Where no KVM steal counter exists (bare metal, TCG, other hypervisors, aarch64) the reader returns None/0 and /proc/stat output is byte-identical to before."

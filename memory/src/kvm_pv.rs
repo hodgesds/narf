@@ -19,12 +19,17 @@
 //! its `try_cmpxchg` — losing the race to the host's sched-in path means the
 //! vCPU is (about to be) running again and must be IPI'd normally.
 //!
+//! The same registered area's `steal` counter (offset 0) backs steal-time
+//! accounting: [`steal_time_ns`] snapshots it under the struct's version
+//! protocol so the scheduler can charge host-stolen time to the `steal`
+//! column of `/proc/stat` instead of to busy time (issue #660).
+//!
 //! Detection is BSP-only ([`detect`]); each CPU — BSP and APs — then calls
 //! [`register_steal_time_current_cpu`] during its own bring-up. The
 //! hypercall instruction is vendor-specific (`vmmcall` on AMD, `vmcall` on
 //! Intel); using the wrong one raises #UD, so [`detect`] records the vendor.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 const MAX_CPUS: usize = narf_lib::percpu::MAX_CPUS;
 
@@ -47,6 +52,8 @@ const KVM_HC_SEND_IPI: u64 = 10;
 
 /// `struct kvm_steal_time` field offsets (uapi/asm/kvm_para.h): steal u64,
 /// version u32, flags u32, preempted u8 at offset 16.
+const STEAL_TIME_STEAL_OFFSET: usize = 0;
+const STEAL_TIME_VERSION_OFFSET: usize = 8;
 const STEAL_TIME_PREEMPTED_OFFSET: usize = 16;
 const KVM_VCPU_PREEMPTED: u8 = 1 << 0;
 const KVM_VCPU_FLUSH_TLB: u8 = 1 << 1;
@@ -244,5 +251,120 @@ pub fn try_flush_preempted(cpu: usize) -> bool {
             Ok(_) => return true,
             Err(actual) => state = actual,
         }
+    }
+}
+
+/// Validate one steal-counter snapshot against the version word read
+/// around it (the KVM steal-time ABI, Documentation/virt/kvm/msr.rst):
+/// the host bumps `version` to an odd value before updating the struct
+/// and to the next even value after, so a snapshot is usable only when
+/// the bracketing versions are equal and even. Pure — host-testable
+/// without a hypervisor.
+pub fn validate_steal_snapshot(
+    version_before: u32,
+    steal_ns: u64,
+    version_after: u32,
+) -> Option<u64> {
+    if version_before & 1 != 0 || version_before != version_after {
+        return None;
+    }
+    Some(steal_ns)
+}
+
+/// Delta between two reads of the cumulative steal counter. The counter
+/// is nanoseconds since the area was registered and monotonic in
+/// practice (a u64 ns counter wraps after ~585 years); a read that goes
+/// backwards means the host reset the counter (area re-registration,
+/// migration quirk), so the interval is unmeasurable — report 0 and let
+/// the caller resync its last-sample to the new value rather than
+/// fabricating a near-2^64 delta.
+pub fn steal_counter_delta(last_ns: u64, now_ns: u64) -> u64 {
+    now_ns.saturating_sub(last_ns)
+}
+
+/// Cumulative stolen nanoseconds for `cpu` since its steal-time area was
+/// registered, or `None` when steal time is unavailable for that CPU
+/// (feature not advertised — bare metal / TCG / other hypervisor — or the
+/// area not registered yet, or no stable snapshot within the retry
+/// bound). The counter itself is cumulative, so callers derive deltas
+/// with [`steal_counter_delta`] and never lose time between samples.
+pub fn steal_time_ns(cpu: usize) -> Option<u64> {
+    if !STEAL_TIME_FEATURE.load(Ordering::Acquire) || cpu >= MAX_CPUS {
+        return None;
+    }
+    let va = STEAL_TIME_VA[cpu].load(Ordering::Acquire);
+    if va == 0 {
+        return None;
+    }
+    // SAFETY: `va` is the direct-map address of a never-freed frame
+    // holding this CPU's 64-byte steal-time struct; the field is read
+    // through an atomic of its ABI width, and the version protocol in
+    // `validate_steal_snapshot` rejects any snapshot torn by a host
+    // update in progress.
+    let steal = unsafe { &*((va as usize + STEAL_TIME_STEAL_OFFSET) as *const AtomicU64) };
+    // SAFETY: same frame and argument as the `steal` read above; the
+    // version word is read through an atomic of its ABI width.
+    let version = unsafe { &*((va as usize + STEAL_TIME_VERSION_OFFSET) as *const AtomicU32) };
+    // Bounded retry: a host update is a handful of stores, so a stable
+    // even version appears almost immediately; the bound only guards
+    // against a host that updates pathologically (or a torn mapping),
+    // where reporting "unavailable" beats spinning in a stats reader.
+    for _ in 0..128 {
+        let version_before = version.load(Ordering::Acquire);
+        if version_before & 1 != 0 {
+            core::hint::spin_loop();
+            continue;
+        }
+        let raw = steal.load(Ordering::Relaxed);
+        core::sync::atomic::fence(Ordering::SeqCst);
+        let version_after = version.load(Ordering::Acquire);
+        if let Some(ns) = validate_steal_snapshot(version_before, raw, version_after) {
+            return Some(ns);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{steal_counter_delta, validate_steal_snapshot};
+
+    #[test]
+    fn snapshot_stable_even_version_is_valid() {
+        assert_eq!(validate_steal_snapshot(4, 123_456, 4), Some(123_456));
+        assert_eq!(validate_steal_snapshot(0, 0, 0), Some(0));
+    }
+
+    #[test]
+    fn snapshot_odd_version_is_invalid() {
+        // Host update in progress at first read: reject even if the
+        // second read lands on the same odd value.
+        assert_eq!(validate_steal_snapshot(5, 123, 5), None);
+        assert_eq!(validate_steal_snapshot(5, 123, 6), None);
+    }
+
+    #[test]
+    fn snapshot_version_change_is_invalid() {
+        // Update completed (or another began) mid-read: torn sample.
+        assert_eq!(validate_steal_snapshot(4, 123, 6), None);
+        assert_eq!(validate_steal_snapshot(4, 123, 5), None);
+    }
+
+    #[test]
+    fn delta_counts_forward_progress() {
+        assert_eq!(steal_counter_delta(1_000, 1_750), 750);
+        assert_eq!(steal_counter_delta(0, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn delta_no_progress_is_zero() {
+        assert_eq!(steal_counter_delta(42, 42), 0);
+    }
+
+    #[test]
+    fn delta_backwards_or_wrapped_is_zero_not_huge() {
+        // Counter reset / re-registration: resync, don't fabricate.
+        assert_eq!(steal_counter_delta(1_000_000, 17), 0);
+        assert_eq!(steal_counter_delta(u64::MAX - 5, 10), 0);
     }
 }

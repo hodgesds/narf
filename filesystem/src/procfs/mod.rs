@@ -3190,18 +3190,36 @@ fn gen_stat() -> String {
     // (`narf_scheduler::cpu_idle_ns`) — and busy derived as
     // elapsed − idle in the `user` column (NARF has no per-cpu
     // user/system/irq split). htop-class per-core bars are real now.
+    // On KVM guests the host-stolen share (`cpu_steal_ns`, 0 elsewhere)
+    // is reported in the steal column and excluded from busy, so a
+    // preempted vCPU no longer inflates `user` (issue #660).
     // Columns: user nice system idle iowait irq softirq steal guest gnice.
     let mut busy_sum: u64 = 0;
     let mut idle_sum: u64 = 0;
+    let mut steal_sum: u64 = 0;
     let mut cpu_lines = String::new();
     for (cpu, _) in &depths {
         let idle = (narf_scheduler::cpu_idle_ns(*cpu as usize) / 10_000_000).min(elapsed);
-        let busy = elapsed.saturating_sub(idle);
+        // Clamp steal to what idle does not already cover so
+        // busy = elapsed − idle − steal can never go negative even if
+        // the two counters are sampled at slightly different instants.
+        let steal = (narf_scheduler::cpu_steal_ns(*cpu as usize) / 10_000_000)
+            .min(elapsed.saturating_sub(idle));
+        let busy = elapsed - idle - steal;
         busy_sum += busy;
         idle_sum += idle;
-        let _ = writeln!(cpu_lines, "cpu{} {} 0 0 {} 0 0 0 0 0 0", cpu, busy, idle);
+        steal_sum += steal;
+        let _ = writeln!(
+            cpu_lines,
+            "cpu{} {} 0 0 {} 0 0 0 {} 0 0",
+            cpu, busy, idle, steal
+        );
     }
-    let _ = writeln!(s, "cpu  {} 0 0 {} 0 0 0 0 0 0", busy_sum, idle_sum);
+    let _ = writeln!(
+        s,
+        "cpu  {} 0 0 {} 0 0 0 {} 0 0",
+        busy_sum, idle_sum, steal_sum
+    );
     s.push_str(&cpu_lines);
     let irq_snapshots = snapshot_counters();
     let total_intr: u64 = irq_snapshots.iter().map(|snapshot| snapshot.total).sum();
