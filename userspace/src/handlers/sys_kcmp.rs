@@ -47,8 +47,8 @@ pub(crate) fn sys_kcmp(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok(0));
             return;
         }
-        let a1 = narf_scheduler::address_space_of(narf_scheduler::TaskId(t1));
-        let a2 = narf_scheduler::address_space_of(narf_scheduler::TaskId(t2));
+        let a1 = narf_scheduler::address_space_of_live(narf_scheduler::TaskId(t1));
+        let a2 = narf_scheduler::address_space_of_live(narf_scheduler::TaskId(t2));
         match (a1, a2) {
             (Some(x), Some(y)) if Arc::ptr_eq(&x, &y) => 0,
             _ => {

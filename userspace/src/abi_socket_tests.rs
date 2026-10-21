@@ -7463,6 +7463,7 @@ fn smoke_abi_netlink_route_point_lookup() -> TestResult {
             metric: 0,
             scope: narf_net::route::Scope::Universe,
             table: narf_net::route::TABLE_MAIN,
+            protocol: narf_net::route::RTPROT_KERNEL,
         });
 
         let fd = open_netlink(NETLINK_ROUTE)?;

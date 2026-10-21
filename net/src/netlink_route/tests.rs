@@ -263,6 +263,7 @@ fn getroute_point_query_uses_longest_prefix_match() -> narf_kernel_test::TestRes
             metric: 0,
             scope: crate::route::Scope::Universe,
             table: crate::route::TABLE_MAIN,
+            protocol: crate::route::RTPROT_KERNEL,
         });
     }
 

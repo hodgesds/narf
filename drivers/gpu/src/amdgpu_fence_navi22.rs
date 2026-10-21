@@ -109,7 +109,7 @@ pub fn notify(engine: Engine) {
     for (_, waker) in CHANGE_WAITERS.lock().iter() {
         waker.wake_by_ref();
     }
-    INTERRUPTS[engine as usize].fetch_add(1, Ordering::Relaxed);
+    INTERRUPTS[engine as usize].fetch_add(1, Ordering::AcqRel);
     if let Some(waker) = WAKERS[engine as usize].lock().as_ref() {
         waker.wake_by_ref();
     }
@@ -143,20 +143,45 @@ pub fn signaled(current: u32, target: u32) -> bool {
 
 /// Resolves on the next poll after either the poll interval elapses or the
 /// engine is notified. Every wake leads to a fresh memory sample.
+/// One poll interval: ready when the engine's interrupt fires or `sleep`
+/// elapses, whichever is first. A re-poll that neither event caused (a
+/// spinning executor such as `block_on_spin`, or a sibling future's wake)
+/// keeps waiting; treating every second poll as a wake turned the interval
+/// into a busy loop whose sample count scaled with the CPU and the timeout.
 struct Tick {
     engine: Engine,
     sleep: narf_time::SleepUntil,
-    armed: bool,
+    /// `INTERRUPTS[engine]` when the tick was armed.
+    seen: Option<u64>,
 }
 impl Future for Tick {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.armed {
+        let interrupts = &INTERRUPTS[self.engine as usize];
+        let seen = match self.seen {
+            Some(seen) => seen,
+            None => {
+                // Snapshot before publishing the waker: an interrupt between
+                // the two still changes the counter checked below.
+                let seen = interrupts.load(Ordering::Acquire);
+                self.seen = Some(seen);
+                seen
+            }
+        };
+        {
+            // Replacing (and dropping) the previous waker happens in task
+            // context.
+            let mut slot = WAKERS[self.engine as usize].lock();
+            if !slot
+                .as_ref()
+                .is_some_and(|waker| waker.will_wake(cx.waker()))
+            {
+                *slot = Some(cx.waker().clone());
+            }
+        }
+        if interrupts.load(Ordering::Acquire) != seen {
             return Poll::Ready(());
         }
-        self.armed = true;
-        // Replacing (and dropping) the previous waker happens in task context.
-        *WAKERS[self.engine as usize].lock() = Some(cx.waker().clone());
         Pin::new(&mut self.sleep).poll(cx)
     }
 }
@@ -183,7 +208,7 @@ pub(crate) async fn wait<T, E>(
         Tick {
             engine,
             sleep: narf_time::SleepUntil::new(narf_time::Deadline::after_us(POLL_US).as_instant()),
-            armed: false,
+            seen: None,
         }
         .await;
     }

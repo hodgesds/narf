@@ -275,7 +275,7 @@ pub fn write_coredump(task: u64, _signum: u32, state: &UserState) {
     }
 
     // Resolve address space
-    let as_ref = match narf_scheduler::address_space_of(narf_scheduler::TaskId(task)) {
+    let as_ref = match narf_scheduler::address_space_of_live(narf_scheduler::TaskId(task)) {
         Some(a) => a,
         None => return,
     };

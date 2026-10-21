@@ -359,12 +359,17 @@ fn smoke_hpet_arm_oneshot_rejects_when_uninitialised() -> TestResult {
     // Stash + reset so we don't clobber a real boot-initialised
     // HPET. `__reset_for_test` is the canonical reset hook.
     let was_present = hpet::is_present();
+    // The boot hands the driver an ioremapped (vmalloc-window) base; the
+    // reset clears it, and re-probing the raw physical default would map
+    // HPET through the low half, which a user CR3 does not carry.
+    let base = hpet::base_phys_for_ioremap();
     hpet::__reset_for_test();
     // SAFETY: HPET singleton is empty.
     let r = unsafe { hpet::arm_oneshot(0, 16, 0) };
     let pass = matches!(r, Err(hpet::ArmError::NotPresent));
     if was_present {
-        // Best-effort restore: re-init from the default base.
+        // Restore the boot's HPET, at the base it was given.
+        hpet::set_base_phys(base);
         // SAFETY: single-threaded test boot.
         let _ = unsafe { hpet::init() };
     }
@@ -1245,3 +1250,29 @@ fn smoke_time_elapsed_is_distinct_unit_struct() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("time", smoke_time_elapsed_is_distinct_unit_struct);
+
+/// The kernel-test boot runs the production timebase bring-up (HPET +
+/// TSC calibration), so `monotonic_ns` counts nanoseconds. Before it did,
+/// the clock ran in raw TSC cycles and every test `Deadline` scaled with
+/// the host's TSC frequency.
+#[cfg(target_arch = "x86_64")]
+fn smoke_kernel_test_timebase_is_calibrated() -> TestResult {
+    let hz = narf_arch::x86_64::tsc::frequency_hz();
+    if hz == 0 {
+        return TestResult::Fail("kernel-test boot left the TSC uncalibrated");
+    }
+    // A 20 ms busy wait must read as 20 ms (± scheduling slop), not as the
+    // ~20 M raw cycles an uncalibrated clock would report as 20 ms.
+    let t0 = crate::monotonic_ns();
+    let c0 = narf_arch::x86_64::tsc::rdtsc();
+    while narf_arch::x86_64::tsc::rdtsc().wrapping_sub(c0) < hz / 50 {
+        core::hint::spin_loop();
+    }
+    let elapsed = crate::monotonic_ns() - t0;
+    if !(15_000_000..=60_000_000).contains(&elapsed) {
+        return TestResult::Fail("monotonic_ns does not track calibrated time");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("time", smoke_kernel_test_timebase_is_calibrated);

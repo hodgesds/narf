@@ -27,7 +27,7 @@ impl AddressSpaceResolver for TaskAddressSpaceResolver {
             if pid == 0 {
                 continue;
             }
-            if let Some(aspace) = narf_scheduler::address_space_of(TaskId(tid)) {
+            if let Some(aspace) = narf_scheduler::address_space_of_live(TaskId(tid)) {
                 if aspace.root == root {
                     return Some(aspace);
                 }
