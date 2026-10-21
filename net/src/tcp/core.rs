@@ -1733,9 +1733,15 @@ pub fn connect_start_in(
     // it presents as "no SYN emitted" with the routing table and the peer's
     // ARP entry both perfectly correct — which is how it survived a test that
     // was fixed by giving the interface the gateway it expected instead.
+    // `tcp_v4_connect` -> `ip_route_connect`: no route is -ENETUNREACH
+    // before any packet is built. Falling back to the destination itself
+    // ARPed an off-link address on the local segment, which nothing answers,
+    // so a connect made while NetworkManager was between default routes
+    // failed only after six ARP retries (curl: "Failed to connect ... after
+    // 6060 ms") instead of at once.
     let nexthop = crate::route::route_lookup_in(net_ns_id, crate::ipv4::Ipv4Addr(remote_addr))
         .map(|r| r.nexthop.0)
-        .unwrap_or(remote_addr);
+        .ok_or(errno::ENETUNREACH as i32)?;
     // `tcp_v4_connect` does not wait for the neighbour: an unresolved next
     // hop leaves the MAC zero, and the SYN queues on it in `emit_tcb_frame`.
     // Resolution failing reaches the socket as EHOSTUNREACH (`tcp_v4_err`).

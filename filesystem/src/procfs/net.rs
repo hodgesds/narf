@@ -1179,7 +1179,9 @@ impl ProcFile for SnmpFile {
             m.tcp_rto_algorithm,
             m.tcp_rto_min,
             m.tcp_rto_max,
-            m.tcp_max_conn,
+            // `snmp_seq_show_tcp_udp` prints MaxConn signed: RFC 2012's
+            // "dynamic" is -1, not 18446744073709551615.
+            m.tcp_max_conn as i64,
             m.tcp_active_opens,
             m.tcp_passive_opens,
             m.tcp_attempt_fails,

@@ -129,6 +129,8 @@ pub struct AdminIpv4Route {
     pub metric: u32,
     pub scope: crate::route::Scope,
     pub table: u8,
+    /// `rtm_protocol` of the request.
+    pub protocol: u8,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -312,6 +314,7 @@ impl AdminHandle {
             metric: route.metric,
             scope: route.scope,
             table: route.table,
+            protocol: route.protocol,
         });
         Ok(())
     }
@@ -322,19 +325,41 @@ impl AdminHandle {
         prefix_len: u8,
         table: u8,
     ) -> Result<(), AdminError> {
+        self.del_ipv4_route_matching(dst, prefix_len, table, None, None, 0)
+            .map(|_| ())
+    }
+
+    /// `fib_table_delete` on this interface: remove the first route at
+    /// `dst/prefix_len` in `table` whose metric, gateway and protocol match
+    /// those given (`None`/0 match anything). `Ok(false)` when none did.
+    pub fn del_ipv4_route_matching(
+        &self,
+        dst: [u8; 4],
+        prefix_len: u8,
+        table: u8,
+        metric: Option<u32>,
+        gateway: Option<[u8; 4]>,
+        protocol: u8,
+    ) -> Result<bool, AdminError> {
         self.check_live()?;
         if prefix_len > 32 {
             return Err(AdminError::InvalidPrefix);
         }
-        crate::route::route_delete(
+        let iface = crate::iface::lookup(&self.iface_name).ok_or(AdminError::NoIface)?;
+        Ok(crate::route::route_delete_matching_in(
+            iface.net_ns_id,
             crate::route::Ipv4Net {
                 addr: crate::ipv4::Ipv4Addr(dst),
                 prefix_len,
             },
-            &self.iface_name,
             table,
-        );
-        Ok(())
+            crate::route::RouteMatch {
+                iface: Some(&self.iface_name),
+                metric,
+                gateway: gateway.map(crate::ipv4::Ipv4Addr),
+                protocol,
+            },
+        ))
     }
 
     pub fn add_ipv6_route(&self, route: AdminIpv6Route) -> Result<(), AdminError> {

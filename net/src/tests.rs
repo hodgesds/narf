@@ -110,6 +110,7 @@ fn smoke_network_namespace_fib_isolation() -> TestResult {
         metric: 0,
         scope: Scope::Link,
         table: TABLE_MAIN,
+        protocol: crate::route::RTPROT_KERNEL,
     });
     let dst = Ipv4Addr([203, 0, 113, 9]);
     if crate::route::route_lookup_raw_in(501, dst).is_none() {
@@ -6431,6 +6432,7 @@ fn smoke_route_lpm_specific_wins() -> TestResult {
         metric: 100,
         scope: Scope::Universe,
         table: TABLE_MAIN,
+        protocol: crate::route::RTPROT_KERNEL,
     });
     route_add(Route {
         net_ns_id: 0,
@@ -6444,6 +6446,7 @@ fn smoke_route_lpm_specific_wins() -> TestResult {
         metric: 0,
         scope: Scope::Link,
         table: TABLE_MAIN,
+        protocol: crate::route::RTPROT_KERNEL,
     });
     route_add(Route {
         net_ns_id: 0,
@@ -6457,6 +6460,7 @@ fn smoke_route_lpm_specific_wins() -> TestResult {
         metric: 0,
         scope: Scope::Host,
         table: TABLE_MAIN,
+        protocol: crate::route::RTPROT_KERNEL,
     });
 
     let r = match crate::route::route_lookup_raw(Ipv4Addr([192, 168, 1, 1])) {
@@ -6496,6 +6500,7 @@ fn smoke_route_default_fallback() -> TestResult {
         metric: 100,
         scope: Scope::Universe,
         table: TABLE_MAIN,
+        protocol: crate::route::RTPROT_KERNEL,
     });
 
     let r = match route_lookup_raw(Ipv4Addr([8, 8, 8, 8])) {
@@ -6595,6 +6600,7 @@ fn smoke_src_selection_via_gateway() -> TestResult {
         metric: 100,
         scope: Scope::Universe,
         table: TABLE_MAIN,
+        protocol: crate::route::RTPROT_KERNEL,
     });
 
     let (iface, src, gw) = match src_for(Ipv4Addr([8, 8, 8, 8])) {
@@ -9428,3 +9434,63 @@ fn smoke_iface_open_stop_hook() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net", smoke_iface_open_stop_hook);
+
+/// FIB aliases are keyed by priority: a default route at another metric is
+/// another route (NetworkManager installs a temporary-metric default, then
+/// the final one, then deletes the temporary), a delete naming a metric
+/// removes only that alias, and `rtm_protocol` reads back as installed.
+fn smoke_route_metric_aliases_and_protocol() -> TestResult {
+    use crate::ipv4::Ipv4Addr;
+    use crate::route::{
+        route_add, route_delete_matching_in, route_list_in, Ipv4Net, Route, RouteMatch, Scope,
+        TABLE_MAIN,
+    };
+    const NS: u64 = 0x5eed_0007_0000_0001;
+    const RTPROT_DHCP: u8 = 16;
+    let default = Ipv4Net {
+        addr: Ipv4Addr([0; 4]),
+        prefix_len: 0,
+    };
+    let route = |metric: u32| Route {
+        net_ns_id: NS,
+        dst: default,
+        gateway: Some(Ipv4Addr([10, 0, 2, 2])),
+        iface: alloc::string::String::from("fib-alias-t0"),
+        src_hint: None,
+        metric,
+        scope: Scope::Universe,
+        table: TABLE_MAIN,
+        protocol: RTPROT_DHCP,
+    };
+    route_add(route(20_100));
+    route_add(route(100));
+    let metrics = |ns| {
+        let mut m: alloc::vec::Vec<u32> = route_list_in(ns).iter().map(|r| r.metric).collect();
+        m.sort_unstable();
+        m
+    };
+    if metrics(NS) != [100, 20_100] {
+        return TestResult::Fail("a default route at a second metric replaced the first");
+    }
+    let by_metric = |metric| RouteMatch {
+        iface: Some("fib-alias-t0"),
+        metric: Some(metric),
+        ..RouteMatch::default()
+    };
+    if !route_delete_matching_in(NS, default, TABLE_MAIN, by_metric(20_100)) || metrics(NS) != [100]
+    {
+        return TestResult::Fail("deleting the temporary metric removed the wrong default");
+    }
+    if route_list_in(NS).iter().any(|r| r.protocol != RTPROT_DHCP) {
+        return TestResult::Fail("rtm_protocol did not read back as installed");
+    }
+    if route_delete_matching_in(NS, default, TABLE_MAIN, by_metric(20_100)) {
+        return TestResult::Fail("a delete matched an alias that no longer exists");
+    }
+    let _ = route_delete_matching_in(NS, default, TABLE_MAIN, by_metric(100));
+    if !route_list_in(NS).is_empty() {
+        return TestResult::Fail("test routes leaked");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net", smoke_route_metric_aliases_and_protocol);
