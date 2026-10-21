@@ -152,6 +152,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     let dev = match result {
         Ok(d) => d,
         Err(e) => {
+            // No controller was published, so no later lifecycle path will
+            // revoke the command bits. Leave the rejected function inert:
+            // bus mastering must remain off, and a failed probe does not need
+            // memory decoding left enabled either.
+            let _ = narf_bus::pci::clear_command(
+                &cap,
+                &device,
+                narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::BUS_MASTER,
+            );
             let _ = writeln!(
                 narf_console::Writer,
                 "  mt7921: bring-up failed ({:04x}:{:04x}): {:?}",
