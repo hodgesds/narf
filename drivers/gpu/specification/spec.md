@@ -4473,7 +4473,9 @@ refusal is EINVAL (FsError has no ERANGE). `Framebuffer` records
 `offsets`, `chroma_pitch` and `modifier`. `AMDGPU_GEM_METADATA` on one of
 the card's dumb BOs (`drm_ioctl_bridge::amdgpu_dumb_metadata`) sets/gets its
 tiling flags (`Card::set_bo_tiling`); CREATE_DUMB pads the pitch as
-amdgpu_mode_dumb_create does (amdgpu_gem_align_pitch). Other cards keep
+amdgpu_mode_dumb_create does (`amdgpu_gem::align_pitch`, amdgpu_gem_align_pitch;
+once the card's client VRAM heap is up its dumb buffers are amdgpu GEM
+buffers in VRAM instead, see "Dumb buffers in VRAM"). Other cards keep
 LINEAR-only ADDFB2. `tests/amd_modifiers/check.sh` extracts Linux's
 functions (amdgpu_dm_plane.c, amdgpu_display.c, drm_plane.c,
 drm_framebuffer.c, drm_fourcc.c), builds them with an RX 9070 XT stand-in
@@ -4589,9 +4591,53 @@ commit: every plane still fetching a client framebuffer flips back to its
 back buffer and the pins retire, before system suspend evicts VRAM and
 after the last card close. A cursor plane's GEM framebuffer is pinned in
 VRAM and copied for the hardware cursor (`GemPlacement::read_bytes`), as
-dumb ones are. Dumb buffers stay in system memory, which a dGPU display
-never fetches (Linux would migrate them to VRAM to pin them), so they keep
-the CPU copy.
+dumb ones are. Dumb buffers are such GEM buffers in VRAM (below) and take
+this path; only one of the card's own system-memory dumb buffers, made
+while no VRAM heap was up, is still CPU-copied.
+
+**Dumb buffers in VRAM.** On the native card, once its client VRAM heap is
+registered (`drm_ioctl_bridge::amdgpu_vram_dumb`), `DriCardFile` answers
+CREATE_DUMB as amdgpu_mode_dumb_create (`drm_ioctl_bridge::amdgpu_dumb`,
+`GemState::create_dumb`): drm_mode_create_dumb's checks, the pitch of
+`amdgpu_gem::align_pitch` and the page-rounded size (`dumb_layout`), in
+`DUMB_DOMAIN` (amdgpu_display_supported_domains on a dGPU without
+gpu_vm_support: VRAM) with `DUMB_CREATE_FLAGS` (CPU_ACCESS_REQUIRED |
+CPU_GTT_USWC | VRAM_CONTIGUOUS | VRAM_CLEARED). The buffer is one zeroed
+reservation in the BAR-visible heap and its handle is in the open's own
+GEM table (Linux's per-file handle space; the card's dumb table holds
+none). It is stored as amdgpu_bo_create leaves it: VRAM_WIPE_ON_RELEASE
+added, the CPU_ACCESS_REQUIRED hint dropped, alignment 0 (GEM_OP), allowed
+domains VRAM | GTT. Full visible VRAM first evicts idle unmapped buffers
+(`evict_visible`), and from a user open (`amdgpu_create_dumb_async`,
+`amdgpu_gem::create_dumb_async`) mapped ones too (`reclaim_vram`, shared
+with GEM_CREATE's strict path); there is no GTT fallback, so it is then
+ENOMEM. MAP_DUMB and DESTROY_DUMB of one of an open's amdgpu GEM handles,
+on any amdgpu card, are amdgpu_mode_dumb_mmap (`GemState::map_dumb`: the
+GEM_MMAP offset, EPERM for a userptr or NO_CPU_ACCESS buffer) and
+drm_gem_handle_delete (`destroy_dumb`); other handles fall through to the
+card's table. mmap of the offset is the revocable CPU-mapping backing
+(`cpu_mapping::backing`) over the buffer's BAR window, which follows the
+buffer when it moves. ADDFB2 of the handle is `amdgpu_addfb2_bo`, so
+showing it pins it and scans it out in place as above. Before a SETCRTC,
+PAGE_FLIP, SETPLANE or atomic commit, the open's framebuffer buffers that
+left VRAM (suspend's evict_all, eviction for another allocation) and are
+not pinned move back (`drm_ioctl_bridge::amdgpu_prepare_scanout`,
+`amdgpu_gem::prepare_scanout` through `amdgpu_vm::relocate`, CPU mappings
+following), as amdgpu_bo_pin's validation in prepare_fb migrates them; a
+buffer that cannot move is refused at the pin and the plane keeps what it
+showed. Legacy CURSOR/CURSOR2 with one of the open's GEM handles wraps that
+buffer (`drm_ioctl_bridge::amdgpu_cursor_bo`, `Card::addfb2_bo` with no
+owning open, so drm_fb_release leaves it). `tests/amdgpu_dumb/check.sh`
+builds drm_mode_create_dumb, amdgpu_mode_dumb_create,
+amdgpu_gem_align_pitch, amdgpu_display_supported_domains and
+amdgpu_bo_get_preferred_domain from the Linux tree for an RX 9070 XT and
+checks 1277 vectors, replayed by `amdgpu_dumb_layout_matches_linux_vectors`.
+Deviations: a user CPU mapping of VRAM is not write-combined (NARF's user
+page tables carry no caching attribute: x86_64 leaves it to the MTRRs,
+uncached for the BAR on real boards; aarch64 maps Normal), and a GTT
+placement is not USWC; the migration back to VRAM runs before the commit
+rather than inside the pin, and without evicting other buffers to make
+room; DRM_MODE_CREATE_DUMB from the render node keeps the card's table.
 SETCRTC admits such a framebuffer as a placed primary
 (`drm_native_planes::setcrtc_planes`), PAGE_FLIP requests the display's
 planes so a tiling change is a plane update.
@@ -7129,7 +7175,9 @@ MMIO, waits for the bootloader, posts the cold card with ATOM ASIC_Init as
 amdgpu_device_need_post decides (`Mode::Resume`, `Method::PowerCycle`;
 mode1 + post when SOS survived), replays GDDR6 training and brings up a
 fresh owner as recovery does, then restores the widened domains; buffers
-stay in system memory until validation promotes them. The interrupt-gated
+stay in system memory until validation promotes them (a framebuffer's
+buffer, a dumb one included, at its next commit's
+`amdgpu_prepare_scanout`). The interrupt-gated
 device-PM handler accepts Navi48 only while the async prepare holds it
 (`system_suspended()`). Hardware unvalidated.
 S3 (and runtime) resume start from a clean quiesce (`Mode::Resume`), so
