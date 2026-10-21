@@ -1,0 +1,25 @@
+# Linux's per-die RDNA4 differences, keyed by GC IP version (12.0.0 Navi44,
+# 12.0.1 Navi48). check.sh regenerates this from soc24.c, dal_asic_id.h,
+# dcn401_resource.c, dcn401_clk_mgr.c, kfd_device.c, amdgpu_ucode.c,
+# gfx_v12_0.c (+ gc_12_0_0_offset.h) and smu_v14_0_2_ppt.c; the kernel test
+# rdna4_tables_match_linux_policy_and_firmware holds amdgpu_rdna4 to it.
+# golden lines are <table>.<BASE_IDX>.<offset>=<mask>,<value>.
+external_rev_offset.12.0.0=0x40
+external_rev_offset.12.0.1=0x50
+jpeg_dpg.12.0.0=0
+jpeg_dpg.12.0.1=1
+dcc_plane_width_limit.12.0.0=7680
+df_throttle_min_smu.12.0.0=0x663500
+idle_dpm_min_smu.12.0.0=0x661300
+idle_dpm_min_smu.12.0.1=0x681800
+mall_channel_limit.12.0.0=8
+mall_channel_limit.12.0.1=16
+gfx_target_version.12.0.0=120000
+gfx_target_version.12.0.1=120001
+kicker=0x744b,0x00
+kicker=0x7551,0xc8
+gc_12_0.0.0x13d2=0x8000,0x8000
+gc_12_0_rev0.0.0x13d2=0xf,0xf
+gc_12_0_rev0.0.0x1425=0x3000000,0x3000000
+gc_12_0_rev0.1.0x2e19=0x70,0x20
+smu_driver_if=0x2e

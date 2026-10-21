@@ -81,13 +81,63 @@ fn navi48_firmware_rejects_wrong_or_duplicate_ips() -> TestResult {
     if Target::resolve(&g).is_err() {
         return TestResult::Fail("normalized DCN4.0.1 rejected");
     }
+    // The AI PRO R9700 is Navi48: ordinary images, unless it is the 0xC8
+    // kicker revision (amdgpu_is_kicker_fw), whose RLC/IMU/SMU differ.
     g.chip.did = 0x7551;
+    let plain = Target::resolve(&g).unwrap();
+    g.chip.revision = 0xc8;
+    let kicker = Target::resolve(&g).unwrap();
+    if Source::Rlc.name(plain, MesMode::Unified) != "amdgpu/gc_12_0_1_rlc.bin"
+        || Source::Rlc.name(kicker, MesMode::Unified) != "amdgpu/gc_12_0_1_rlc_kicker.bin"
+        || Source::Imu.name(kicker, MesMode::Unified) != "amdgpu/gc_12_0_1_imu_kicker.bin"
+        || Source::Smc.name(kicker, MesMode::Unified) != "amdgpu/smu_14_0_3_kicker.bin"
+        || Source::Pfp.name(kicker, MesMode::Unified) != "amdgpu/gc_12_0_1_pfp.bin"
+    {
+        return TestResult::Fail("AI PRO R9700 firmware or kicker selection");
+    }
+    // A kicker revision on MP1 14.0.2 has no kicker SMU image to load.
+    g.ip_blocks[1].revision = 2;
     if Target::resolve(&g).is_ok() {
-        return TestResult::Fail("professional kicker target admitted");
+        return TestResult::Fail("kicker set without kicker images admitted");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/navi48",
     navi48_firmware_rejects_wrong_or_duplicate_ips
+);
+fn rdna4_profiles_select_their_die_firmware_set() -> TestResult {
+    use crate::amdgpu_rdna4::{tests::Profile, Rdna4Chip};
+    for profile in Profile::ALL {
+        let mut g = gpu();
+        profile.apply(&mut g);
+        let Ok(target) = Target::resolve(&g) else {
+            return TestResult::Fail("RDNA4 profile firmware target refused");
+        };
+        let (gc, smu, sdma) = match profile.chip() {
+            Rdna4Chip::Navi48 => ("gc_12_0_1", "smu_14_0_3", "sdma_7_0_1"),
+            Rdna4Chip::Navi44 => ("gc_12_0_0", "smu_14_0_2", "sdma_7_0_0"),
+        };
+        for source in Source::ALL {
+            let name = source.name(target, MesMode::Unified);
+            let expected_prefix = match source {
+                Source::Smc => smu,
+                Source::Sdma => sdma,
+                Source::Vcn => "vcn_5_0_0",
+                Source::Dmcub => "dcn_4_0_1",
+                _ => gc,
+            };
+            if !name
+                .strip_prefix("amdgpu/")
+                .is_some_and(|n| n.starts_with(expected_prefix))
+            {
+                return TestResult::Fail("profile firmware image from the wrong IP version");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48",
+    rdna4_profiles_select_their_die_firmware_set
 );

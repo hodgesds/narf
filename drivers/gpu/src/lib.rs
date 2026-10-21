@@ -376,6 +376,7 @@ mod amdgpu_rdna2_mmr;
 #[path = "amdgpu_reset_navi22.rs"]
 pub mod amdgpu_rdna2_reset;
 mod amdgpu_rdna2_vram;
+pub mod amdgpu_rdna4;
 mod amdgpu_reg_window;
 pub mod amdgpu_reset;
 /// Compatibility alias for the original Navi22 API.

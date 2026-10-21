@@ -2716,8 +2716,9 @@ fn plan_shapes(
     let ss = ss_khz;
     // TotalAvailablePipesSupport: one DPP per plane and ODM segment or MPC
     // slice.
+    // dcn401_resource_construct removes CC_DC_PIPE_DIS-fused pipes.
     let dpps = shapes.iter().map(|s| s.dpps).sum::<u32>();
-    if dpps > MAX_PIPES {
+    if dpps > MAX_PIPES.min(crate::amdgpu_rdna4::available_pipes()) {
         return Err(Error::Pipes);
     }
     // dml2_top_mcache_calc_mcache_count_and_offsets: every DCC plane's

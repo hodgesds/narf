@@ -88,10 +88,7 @@ struct Layout {
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
-        if gpu.chip.vid != crate::amdgpu::AMD_VENDOR
-            || gpu.chip.did != crate::amdgpu::NAVI48
-            || gpu.regs.len < 0x7f004
-        {
+        if crate::amdgpu_rdna4::Rdna4Chip::of(gpu).is_none() || gpu.regs.len < 0x7f004 {
             return Err(Error::Unsupported);
         }
         let mut blocks = gpu
@@ -109,9 +106,9 @@ impl Layout {
         };
         Ok(Self {
             // SDMA0 is in GC bank zero, NOT the standalone discovery SDMA bank.
-            gc: resolve(ip::HW_ID_GC, &[(12, 0, 1)], 0, 0x1615)?,
+            gc: resolve(ip::HW_ID_GC, crate::amdgpu_rdna4::GC_VERSIONS, 0, 0x1615)?,
             nbio: resolve(ip::HW_ID_NBIF, &[(7, 7, 0), (7, 7, 1), (6, 3, 1)], 2, 0x12d)?,
-            hyp: resolve(ip::HW_ID_GC, &[(12, 0, 1)], 1, MCU_CNTL)?,
+            hyp: resolve(ip::HW_ID_GC, crate::amdgpu_rdna4::GC_VERSIONS, 1, MCU_CNTL)?,
             oss: resolve(ip::HW_ID_OSSSYS, &[(7, 0, 0)], 0, 0x1f)?,
         })
     }

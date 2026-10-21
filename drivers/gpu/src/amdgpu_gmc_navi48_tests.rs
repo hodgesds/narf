@@ -412,7 +412,7 @@ fn gmc_navi48_constructor_checks_exact_banks_and_pool_before_allocation() -> Tes
         match case {
             0 => gpu.chip.did = crate::amdgpu::NAVI22,
             1 => gpu.regs.len = 0x7f000,
-            2 => gpu.ip_blocks[0].revision = 0,
+            2 => gpu.ip_blocks[0].revision = 2,
             3 => gpu.ip_blocks[1].minor = 0,
             4 => gpu.ip_blocks[2].num_bases = 2,
             5 => gpu.ip_blocks[0].base_addrs[0] = 0x20000 - 0x16d0,

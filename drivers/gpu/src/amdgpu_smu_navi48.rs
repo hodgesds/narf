@@ -890,7 +890,7 @@ impl Smu {
         let base = crate::amdgpu_psp_ring::bank(
             gpu,
             ip::HW_ID_MP1,
-            &[(14, 0, 2), (14, 0, 3)],
+            crate::amdgpu_rdna4::MP_VERSIONS,
             1,
             RESPONSE,
         )

@@ -1546,3 +1546,46 @@ kernel_test_in!(
     "drivers/gpu/dcn401-dml",
     dcn401_dml_matches_linux_dml21_odm34_vectors
 );
+
+/// Navi44's 8 and the GRE's 12 UMC channels against Navi48's 16, and a
+/// CC_DC_PIPE_DIS-fused board: one admission, inputs from the board.
+fn dcn401_dml_admits_every_rdna4_profile_and_fused_pipes() -> TestResult {
+    use crate::amdgpu_rdna4::{self as rdna4, tests::Profile};
+    let (base, hd) = reference_1080p();
+    let mut sdpif = alloc::vec::Vec::new();
+    for profile in Profile::ALL {
+        let soc = Soc {
+            umc_channels: profile.umc_channels(),
+            ..base
+        };
+        let Ok(p) = admit(&soc, &hd) else {
+            return TestResult::Fail("1080p60 rejected on an RDNA4 profile");
+        };
+        sdpif.push(p.arbiter.sdpif_request_rate_limit);
+        if rdna4::mall_bytes(profile.chip(), profile.umc_channels()) == 0 {
+            return TestResult::Fail("profile without MALL");
+        }
+    }
+    // dcn401's SDPIF limit scales with the board's channels (96 floor):
+    // Navi48 16, GRE 12, Navi44 8, in that order.
+    if sdpif.windows(2).any(|w| w[0] < w[1]) {
+        return TestResult::Fail("SDPIF limit not monotonic in UMC channels");
+    }
+    // Four single-pipe streams need four unfused pipes.
+    let four = [hd, hd, hd, hd];
+    if admit_all(&base, &four).is_err() {
+        return TestResult::Fail("four 1080p streams on four pipes");
+    }
+    rdna4::publish_pipes(3);
+    let fused = admit_all(&base, &four).err();
+    let three = admit_all(&base, &four[..3]).is_ok();
+    rdna4::publish_pipes(rdna4::DCN401_PIPES);
+    if fused != Some(Error::Pipes) || !three {
+        return TestResult::Fail("fused DCN pipe admitted or remaining pipes refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_admits_every_rdna4_profile_and_fused_pipes
+);

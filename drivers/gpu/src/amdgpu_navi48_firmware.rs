@@ -1,5 +1,7 @@
-//! Navi48's complete signed IP firmware set. Linux amdgpu_ucode.{h,c},
+//! An RDNA4 die's complete signed IP firmware set. Linux amdgpu_ucode.{h,c},
 //! amdgpu_mes.c, gfx_v12_0.c, sdma_v7_0.c and psp_gfx_if.h define these layouts.
+//! Names come from the per-IP table in `amdgpu_rdna4` (GC 12.0.0 / 12.0.1,
+//! MP 14.0.2 / 14.0.3, SDMA 7.0.0 / 7.0.1, kicker boards).
 //! Registry capabilities authorize the immutable copy; PSP authenticates it.
 use crate::{amdgpu::AmdGpu, amdgpu_discovery as ip, amdgpu_psp_ring::bank};
 use alloc::vec::Vec;
@@ -13,21 +15,20 @@ pub enum MesMode {
 pub use crate::amdgpu_navi48_ucode::{Image, Source};
 impl Source {
     fn name(self, target: Target, mes: MesMode) -> &'static str {
+        let set = &target.set;
         match self {
-            Self::Smc if target.smu == 2 => "amdgpu/smu_14_0_2.bin",
-            Self::Smc => "amdgpu/smu_14_0_3.bin",
-            Self::Sdma if target.sdma == 0 => "amdgpu/sdma_7_0_0.bin",
-            Self::Sdma => "amdgpu/sdma_7_0_1.bin",
-            Self::Pfp => "amdgpu/gc_12_0_1_pfp.bin",
-            Self::Me => "amdgpu/gc_12_0_1_me.bin",
-            Self::Mec => "amdgpu/gc_12_0_1_mec.bin",
-            Self::Mes | Self::Mes1 if mes == MesMode::Unified => "amdgpu/gc_12_0_1_uni_mes.bin",
-            Self::Mes => "amdgpu/gc_12_0_1_mes.bin",
-            Self::Mes1 => "amdgpu/gc_12_0_1_mes1.bin",
-            Self::Imu => "amdgpu/gc_12_0_1_imu.bin",
-            Self::Rlc => "amdgpu/gc_12_0_1_rlc.bin",
-            Self::Vcn => "amdgpu/vcn_5_0_0.bin",
-            Self::Dmcub => "amdgpu/dcn_4_0_1_dmcub.bin",
+            Self::Smc => set.smu(),
+            Self::Sdma => set.sdma,
+            Self::Pfp => set.gc.pfp,
+            Self::Me => set.gc.me,
+            Self::Mec => set.gc.mec,
+            Self::Mes | Self::Mes1 if mes == MesMode::Unified => set.gc.uni_mes,
+            Self::Mes => set.gc.mes,
+            Self::Mes1 => set.gc.mes1,
+            Self::Imu => set.imu(),
+            Self::Rlc => set.rlc(),
+            Self::Vcn => crate::amdgpu_rdna4::VCN_5_0_0_FW,
+            Self::Dmcub => crate::amdgpu_rdna4::DCN_4_0_1_DMCUB_FW,
         }
     }
 }
@@ -42,17 +43,14 @@ pub enum Error {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Target {
-    smu: u8,
-    sdma: u8,
+    set: crate::amdgpu_rdna4::FirmwareSet,
 }
 impl Target {
     pub(crate) fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
-        if gpu.chip.vid != crate::amdgpu::AMD_VENDOR || gpu.chip.did != crate::amdgpu::NAVI48 {
-            return Err(Error::Unsupported);
-        }
+        let die = crate::amdgpu_rdna4::Rdna4Chip::of(gpu).ok_or(Error::Unsupported)?;
         for (id, versions) in [
-            (ip::HW_ID_GC, &[(12, 0, 1)][..]),
-            (ip::HW_ID_MP1, &[(14, 0, 2), (14, 0, 3)][..]),
+            (ip::HW_ID_GC, crate::amdgpu_rdna4::GC_VERSIONS),
+            (ip::HW_ID_MP1, crate::amdgpu_rdna4::MP_VERSIONS),
             (ip::HW_ID_SDMA0, &[(7, 0, 0), (7, 0, 1)][..]),
             (ip::HW_ID_VCN, &[(5, 0, 0)][..]),
             // Linux normalizes the discovery 4.1.0 encoding to DCN4.0.1.
@@ -70,14 +68,16 @@ impl Target {
         {
             return Err(Error::Unsupported);
         }
-        Ok(Self {
-            smu: ip::find_ip(&gpu.ip_blocks, ip::HW_ID_MP1, 0)
-                .unwrap()
-                .revision,
-            sdma: ip::find_ip(&gpu.ip_blocks, ip::HW_ID_SDMA0, 0)
-                .unwrap()
-                .revision,
-        })
+        let revision = |id| ip::find_ip(&gpu.ip_blocks, id, 0).map_or(u8::MAX, |b| b.revision);
+        // amdgpu_ucode_ip_version_decode: each prefix from its own IP.
+        let set = crate::amdgpu_rdna4::FirmwareSet::select(
+            die.gc_version(),
+            revision(ip::HW_ID_MP1),
+            revision(ip::HW_ID_SDMA0),
+            crate::amdgpu_rdna4::is_kicker(gpu.chip.did, gpu.chip.revision),
+        )
+        .ok_or(Error::Unsupported)?;
+        Ok(Self { set })
     }
 }
 #[derive(Debug)]
@@ -166,7 +166,9 @@ impl Firmware {
 pub(crate) fn fixture() -> Firmware {
     Firmware {
         bytes: Source::ALL.map(crate::amdgpu_navi48_ucode::tests::container),
-        target: Target { smu: 3, sdma: 1 },
+        target: Target {
+            set: crate::amdgpu_rdna4::FirmwareSet::select((12, 0, 1), 3, 1, false).unwrap(),
+        },
         mes: MesMode::Separate,
     }
 }

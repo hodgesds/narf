@@ -418,6 +418,7 @@ fn vram_boot_revalidates_pci_authority_before_mmio() -> TestResult {
             asic: "phoenix",
             fw_name: "",
             fw_list: &[],
+            revision: 0,
         },
         vram: Default::default(),
         mode: None,
@@ -482,6 +483,7 @@ fn navi22_vram_checks_gmc_dcn_size_and_authority() -> TestResult {
             asic: "navi22",
             fw_name: "",
             fw_list: &[],
+            revision: 0,
         },
         vram: VramInfo {
             base: BAR_BASE,
@@ -680,6 +682,7 @@ fn vram_boot_loader_construction_does_not_modify_hardware() -> TestResult {
             asic: "phoenix",
             fw_name: "",
             fw_list: &[],
+            revision: 0,
         },
         vram: Default::default(),
         mode: None,
@@ -762,6 +765,7 @@ fn navi48_vram_checks_gmc12_dcn4_and_training() -> TestResult {
             asic: "navi48",
             fw_name: "",
             fw_list: &[],
+            revision: 0,
         },
         vram: VramInfo {
             base: BAR_BASE,

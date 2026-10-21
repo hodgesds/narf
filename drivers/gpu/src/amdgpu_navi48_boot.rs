@@ -582,7 +582,14 @@ impl ColdBoot {
         if target != firmware.gfx.target() || !firmware.sos.is_psp14(mp0.revision) {
             return Err(Error::Unsupported);
         }
-        psp::bank(gpu, ip::HW_ID_MP1, &[(14, 0, 2), (14, 0, 3)], 1, 0x9a).map_err(Error::Psp)?;
+        psp::bank(
+            gpu,
+            ip::HW_ID_MP1,
+            crate::amdgpu_rdna4::MP_VERSIONS,
+            1,
+            0x9a,
+        )
+        .map_err(Error::Psp)?;
         // Record a display inventory error without blocking non-display engine
         // bring-up. This immutable board copy survives the legacy-owner handoff.
         let display = gpu
@@ -592,6 +599,13 @@ impl ColdBoot {
             .and_then(|bios| inventory::display_paths(gpu, bios.bytes()))
             .map_err(display::Error::Inventory)
             .and_then(display::Probe::new);
+        // dcn401_resource_construct's pipe harvesting: DML admits at most
+        // the unfused pipes (all four when the read is unavailable, which
+        // also leaves the rest of display bring-up to fail on its own).
+        // SAFETY: same exclusive register ownership; one read, no writes.
+        if let Some(pipes) = unsafe { crate::amdgpu_rdna4::read_display_pipes(gpu, &authority) } {
+            crate::amdgpu_rdna4::publish_pipes(pipes);
+        }
         // Linux's DCN crystal (`dce_refclk_10khz`), the reference DDC and the
         // DCHUB global timer both divide.
         let crystal = gpu
@@ -1157,11 +1171,18 @@ impl ColdBoot {
             .map(queues::Queues::fence_reader)
     }
 
-    /// This GPU's DRM card: the registered Navi48.
+    /// This GPU's DRM card: the registered RDNA4 board, by the probed PCI
+    /// id (any listed RDNA4 id before a probe, as in the register models).
     pub(crate) fn drm_card() -> Option<u32> {
+        let probed = crate::amdgpu::pci_device().map(|d| (d.id.vendor, d.id.device));
         (0..crate::drm_registry::count() as u32).find(|&i| {
-            crate::drm_registry::pci_id(i)
-                == Some((crate::amdgpu::AMD_VENDOR, crate::amdgpu::NAVI48))
+            crate::drm_registry::pci_id(i).is_some_and(|(vid, did)| match probed {
+                Some(id) => id == (vid, did),
+                None => {
+                    vid == crate::amdgpu::AMD_VENDOR
+                        && crate::amdgpu_rdna4::known_device(did).is_some()
+                }
+            })
         })
     }
     pub(crate) async unsafe fn prove_queue_interrupts(

@@ -578,7 +578,7 @@ fn dcn401_constructor_bounds_native_banks_and_live_authority() -> TestResult {
         let dc = mp + 1;
         match case {
             0 => g.chip.did = crate::amdgpu::NAVI22,
-            1 => g.ip_blocks[0].revision = 0,
+            1 => g.ip_blocks[0].revision = 2,
             2 => g.ip_blocks[mp].base_addrs[1] = 0x16000,
             3 => g.ip_blocks[mp].revision = 1,
             4 => g.ip_blocks[dc].minor = 2,

@@ -173,10 +173,7 @@ struct Layout {
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
-        if gpu.chip.vid != crate::amdgpu::AMD_VENDOR
-            || gpu.chip.did != crate::amdgpu::NAVI48
-            || gpu.regs.len < 0x7f004
-        {
+        if crate::amdgpu_rdna4::Rdna4Chip::of(gpu).is_none() || gpu.regs.len < 0x7f004 {
             return Err(Error::Unsupported);
         }
         Ok(Self {

@@ -77,19 +77,37 @@ fn family_id(snap: &Snapshot) -> Option<u32> {
             (blocks.next().is_none() && (gc.major, gc.minor, gc.revision) == profile.gc_version)
                 .then_some(uapi::AMDGPU_FAMILY_NV)
         }
-        Family::Navi4 if snap.did == u32::from(crate::amdgpu::NAVI48) => {
-            let mut blocks = snap
-                .ip_blocks
-                .iter()
-                .filter(|b| b.hw_id == amdgpu_discovery::HW_ID_GC && b.instance == 0);
-            let gc = blocks.next()?;
-            (blocks.next().is_none() && (gc.major, gc.minor, gc.revision) == (12, 0, 1))
-                .then_some(uapi::AMDGPU_FAMILY_GC_12_0_0)
-        }
+        // Both RDNA4 dies are AMDGPU_FAMILY_GC_12_0_0 (amdgpu_discovery.c's
+        // GC 12.0.0 / 12.0.1 case); Mesa tells them apart by external_rev.
+        Family::Navi4 => rdna4(snap).map(|_| uapi::AMDGPU_FAMILY_GC_12_0_0),
         // Anything else has had no bring-up; refusing is better than naming a
         // family whose userspace path we have not exercised.
         _ => None,
     }
+}
+
+/// The RDNA4 die a snapshot describes, by its single discovered GC.
+fn rdna4(snap: &Snapshot) -> Option<crate::amdgpu_rdna4::Rdna4Chip> {
+    // As `Rdna4Chip::of`: an id the PCI table gives another family is not
+    // RDNA4 whatever discovery says.
+    let did = u16::try_from(snap.did).ok()?;
+    if snap.family != Family::Navi4
+        || crate::amdgpu::family_for_pci_id(crate::amdgpu::AMD_VENDOR, did)
+            .is_some_and(|f| f != Family::Navi4)
+    {
+        return None;
+    }
+    crate::amdgpu_rdna4::Rdna4Chip::from_ip_blocks(&snap.ip_blocks)
+}
+
+/// The bound RDNA4 board's PCI revision (`adev->rev_id`), published by the
+/// probe; `u16::MAX` until then. DEV_INFO derives `external_rev` from it.
+static RDNA4_REVISION: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(u16::MAX);
+pub(crate) fn publish_rdna4_revision(revision: u8) {
+    RDNA4_REVISION.store(u16::from(revision), core::sync::atomic::Ordering::Release);
+}
+fn rdna4_revision() -> Option<u8> {
+    u8::try_from(RDNA4_REVISION.load(core::sync::atomic::Ordering::Acquire)).ok()
 }
 
 /// What `with_controller` can tell us, lifted out of the lock so the reply
@@ -366,7 +384,7 @@ fn firmware_version(
     fw_type: u32,
 ) -> Result<Vec<u8>, FsError> {
     let (_, ver, feature) = firmware
-        .filter(|_| snap.did == u32::from(crate::amdgpu::NAVI48))
+        .filter(|_| rdna4(snap).is_some())
         .and_then(|f| f.into_iter().find(|(t, ..)| *t == fw_type))
         .ok_or(FsError::InvalidData)?;
     Ok(as_bytes(&uapi::DrmAmdgpuInfoFirmware { ver, feature }))
@@ -382,7 +400,7 @@ fn read_mmr_reg(
     payload: [u32; 4],
 ) -> Result<Vec<u8>, FsError> {
     let [offset, count, instance, _flags] = payload;
-    if snap.did != u32::from(crate::amdgpu::NAVI48) {
+    if rdna4(snap).is_none() {
         return Err(FsError::InvalidData);
     }
     let se =
@@ -430,7 +448,7 @@ pub(crate) fn publish_navi48_video(proven: u8) {
 }
 /// `AMDGPU_INFO_VIDEO_CAPS` (`soc24_query_video_codecs`) for Navi48.
 fn video_caps(snap: &Snapshot, kind: u32, proven: u8) -> Result<Vec<u8>, FsError> {
-    if snap.did != u32::from(crate::amdgpu::NAVI48) {
+    if rdna4(snap).is_none() {
         return Err(FsError::InvalidData);
     }
     let vcn = amdgpu_discovery::find_ip(&snap.ip_blocks, amdgpu_discovery::HW_ID_VCN, 0)
@@ -454,7 +472,7 @@ fn timestamp(
     clock: Option<crate::amdgpu_smuio14::ClockReader>,
 ) -> Result<Vec<u8>, FsError> {
     clock
-        .filter(|_| snap.did == u32::from(crate::amdgpu::NAVI48))
+        .filter(|_| rdna4(snap).is_some())
         .and_then(|c| c.read())
         .map(|t| t.to_le_bytes().to_vec())
         .ok_or(FsError::InvalidData)
@@ -462,14 +480,16 @@ fn timestamp(
 fn dev_info(snap: &Snapshot) -> Result<Vec<u8>, FsError> {
     let topology = *NAVI48_TOPOLOGY.lock();
     let clocks = *NAVI48_CLOCKS.lock();
-    dev_info_topology(snap, topology, clocks)
+    dev_info_topology(snap, topology, clocks, rdna4_revision())
 }
 fn dev_info_topology(
     snap: &Snapshot,
     topology: Option<crate::amdgpu_gfx12_topology::Topology>,
     clocks: Option<[u32; 4]>,
+    revision: Option<u8>,
 ) -> Result<Vec<u8>, FsError> {
-    let navi48 = snap.family == Family::Navi4 && snap.did == u32::from(crate::amdgpu::NAVI48);
+    let die = rdna4(snap);
+    let navi48 = die.is_some();
     let topology = topology.filter(|_| navi48);
     // amdgpu_info_ioctl's dpm_enabled arm; 0 until the SMU owner publishes.
     let [min_engine, max_engine, min_memory, max_memory] =
@@ -486,6 +506,13 @@ fn dev_info_topology(
 
     let info = uapi::DrmAmdgpuInfoDevice {
         device_id: snap.did,
+        // amdgpu_info_ioctl: chip_rev = rev_id, external_rev = external_rev_id
+        // (soc24_common_early_init's per-GC offset). Zero until the probe
+        // publishes the PCI revision, as Navi22's unread revision is.
+        chip_rev: revision.filter(|_| navi48).map_or(0, u32::from),
+        external_rev: die
+            .zip(revision)
+            .map_or(0, |(die, rev)| die.external_rev(rev)),
         family,
         num_shader_engines: gc.num_se,
         num_shader_arrays_per_engine: gc.num_sa_per_se,
@@ -909,7 +936,7 @@ mod topology_tests {
             ..Default::default()
         });
         let snap = Snapshot::from_gpu(&gpu);
-        let unknown = decode(&dev_info_topology(&snap, None, None).unwrap());
+        let unknown = decode(&dev_info_topology(&snap, None, None, None).unwrap());
         let topology = crate::amdgpu_gfx12_topology::Topology {
             active_cus: 56,
             active_arrays: 0x7f,
@@ -927,6 +954,7 @@ mod topology_tests {
                 &snap,
                 Some(topology),
                 Some([500_000, 3_100_000, 1_258_000, 1_258_000]),
+                None,
             )
             .unwrap(),
         );
@@ -946,10 +974,12 @@ mod topology_tests {
         }
         let mut apu = snap;
         apu.family = Family::Phoenix;
-        let apu_info = decode(&dev_info_topology(&apu, Some(topology), Some([1; 4])).unwrap());
+        let apu_info =
+            decode(&dev_info_topology(&apu, Some(topology), Some([1; 4]), Some(0xc0)).unwrap());
         if apu_info.cu_active_number != 64
             || apu_info.enabled_rb_pipes_mask != 0
             || apu_info.max_engine_clock != 0
+            || apu_info.external_rev != 0
         {
             return TestResult::Fail("discrete topology leaked into an APU query");
         }
@@ -958,6 +988,72 @@ mod topology_tests {
     kernel_test_in!(
         "drivers/gpu/gfx12",
         gfx12_dev_info_uses_harvesting_without_claiming_acceleration
+    );
+
+    /// DEV_INFO for each RDNA4 board: one family, the board's own id,
+    /// soc24's per-GC external revision (Mesa's GFX1200/GFX1201 key) and the
+    /// harvested topology; MEMORY from the probed VRAM size.
+    fn rdna4_dev_info_reports_each_die_and_board() -> TestResult {
+        use crate::amdgpu_rdna4::tests::Profile;
+        for profile in Profile::ALL {
+            let mut gpu = crate::amdgpu_navi48_firmware::tests::gpu();
+            gpu.gc_info = Some(GcInfo {
+                num_rb_per_se: 4,
+                ..Default::default()
+            });
+            profile.apply(&mut gpu);
+            gpu.vram.size = profile.vram_bytes();
+            gpu.vram.visible_size = 256 << 20;
+            let snap = Snapshot::from_gpu(&gpu);
+            let cus = profile.shader_engines() * 16 - u32::from(profile == Profile::Navi48Gre) * 16;
+            let topology = crate::amdgpu_gfx12_topology::Topology {
+                active_cus: cus,
+                active_arrays: 0,
+                cu_bitmap: [[0; 4]; 4],
+                enabled_rb_mask: (1 << (cus / 4)) - 1,
+                gb_addr_config: 0,
+            };
+            let Ok(bytes) = dev_info_topology(&snap, Some(topology), None, Some(0xc1)) else {
+                return TestResult::Fail("RDNA4 profile DEV_INFO refused");
+            };
+            let d = decode(&bytes);
+            let external = match profile.chip() {
+                crate::amdgpu_rdna4::Rdna4Chip::Navi48 => 0xc1 + 0x50,
+                crate::amdgpu_rdna4::Rdna4Chip::Navi44 => 0xc1 + 0x40,
+            };
+            if d.family != uapi::AMDGPU_FAMILY_GC_12_0_0
+                || d.device_id != u32::from(profile.did())
+                || d.chip_rev != 0xc1
+                || d.external_rev != external
+                || d.cu_active_number != cus
+                || d.num_shader_engines != profile.shader_engines()
+                || d.enabled_rb_pipes_mask.count_ones() != cus / 4
+            {
+                return TestResult::Fail("RDNA4 profile DEV_INFO identity or topology");
+            }
+            let Ok(unpublished) = dev_info_topology(&snap, None, None, None) else {
+                return TestResult::Fail("RDNA4 DEV_INFO before revision publication");
+            };
+            if decode(&unpublished).external_rev != 0 {
+                return TestResult::Fail("external_rev invented before the PCI revision");
+            }
+            // SAFETY: complete POD UAPI reply; its alignment is not assumed.
+            let memory = unsafe {
+                core::ptr::read_unaligned(
+                    memory_info(&snap)
+                        .as_ptr()
+                        .cast::<uapi::DrmAmdgpuMemoryInfo>(),
+                )
+            };
+            if memory.vram.total_heap_size != profile.vram_bytes() {
+                return TestResult::Fail("RDNA4 profile VRAM size not the probed size");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/gfx12",
+        rdna4_dev_info_reports_each_die_and_board
     );
 
     /// MEMORY and VRAM_GTT for a card with a client heap: hardware totals,

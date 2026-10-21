@@ -6,6 +6,8 @@
 pub const NAVI22_SOS: &str = crate::amdgpu_rdna2::NAVI22.firmware.sos;
 pub const PSP14_0_2_SOS: &str = "amdgpu/psp_14_0_2_sos.bin";
 pub const PSP14_0_3_SOS: &str = "amdgpu/psp_14_0_3_sos.bin";
+/// `psp_init_sos_microcode` on an `amdgpu_is_kicker_fw` board.
+pub const PSP14_0_3_SOS_KICKER: &str = "amdgpu/psp_14_0_3_sos_kicker.bin";
 pub const STAGING_SIZE: usize = 1024 * 1024; // linux: PSP_1_MEG
 const MAX_CONTAINER: usize = 8 * STAGING_SIZE; // linux: n/a (NARF bound)
 

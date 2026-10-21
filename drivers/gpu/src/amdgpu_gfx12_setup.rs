@@ -1,4 +1,5 @@
-//! GC12.0.1 cold-start constants, RLC clear-state storage and RS64 execution.
+//! GC12.0.x (Navi48 12.0.1, Navi44 12.0.0) cold-start constants, RLC
+//! clear-state storage and RS64 execution.
 //! Sources: Linux gfx_v12_0.c, GC12 headers and NBIO7.7/NBIF6.3.1 headers.
 use crate::{
     amdgpu::AmdGpu,
@@ -46,16 +47,25 @@ struct Layout {
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
-        if gpu.chip.vid != crate::amdgpu::AMD_VENDOR
-            || gpu.chip.did != crate::amdgpu::NAVI48
-            || gpu.regs.len < 0x7f004
-        {
+        if crate::amdgpu_rdna4::Rdna4Chip::of(gpu).is_none() || gpu.regs.len < 0x7f004 {
             return Err(Error::Unsupported);
         }
-        let gc =
-            bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 0, 0x1fab).map_err(|_| Error::Unsupported)?;
-        let hyp =
-            bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 1, 0x4c80).map_err(|_| Error::Unsupported)?;
+        let gc = bank(
+            gpu,
+            ip::HW_ID_GC,
+            crate::amdgpu_rdna4::GC_VERSIONS,
+            0,
+            0x1fab,
+        )
+        .map_err(|_| Error::Unsupported)?;
+        let hyp = bank(
+            gpu,
+            ip::HW_ID_GC,
+            crate::amdgpu_rdna4::GC_VERSIONS,
+            1,
+            0x4c80,
+        )
+        .map_err(|_| Error::Unsupported)?;
         let nbio = bank(
             gpu,
             ip::HW_ID_NBIF,
@@ -160,16 +170,26 @@ fn preflight(io: &mut impl Io, l: Layout) -> Result<u8, Error> {
     })?;
     Ok(((checked(io.read(l.strap))? >> 24) & 15) as u8)
 }
+/// `golden_settings_gc_12_0` and, at NBIO strap revision 0,
+/// `golden_settings_gc_12_0_rev0` (gfx_v12_0.c): one sequence for both GC
+/// 12.0.0 (Navi44) and 12.0.1 (Navi48), as gfx_v12_0_init_golden_registers
+/// runs it. `(GC BASE_IDX, offset, mask, value)`; tests/rdna4_family/check.sh
+/// regenerates them from Linux.
+pub(crate) const GOLDEN: [(u8, u32, u32, u32); 1] = [(0, 0x13d2, 0x8000, 0x8000)]; // regDB_MEM_CONFIG
+pub(crate) const GOLDEN_REV0: [(u8, u32, u32, u32); 3] = [
+    (0, 0x13d2, 0xf, 0xf),                 // regDB_MEM_CONFIG
+    (0, 0x1425, 0x0300_0000, 0x0300_0000), // regCB_HW_CONTROL_1
+    (1, 0x2e19, 0x70, 0x20),               // regGL2C_CTRL5
+];
 fn constants(io: &mut impl Io, l: Layout, revision: u8) -> Result<(), Error> {
     let selector = l.hyp + 0x2200 * 4;
     let prior = checked(io.read(selector))?;
     let result = (|| {
         write(io, selector, 0xe0000000)?;
-        update(io, l.gc + 0x13d2 * 4, 0x8000, 0x8000)?;
-        if revision == 0 {
-            update(io, l.gc + 0x13d2 * 4, 15, 15)?;
-            update(io, l.gc + 0x1425 * 4, 0x03000000, 0x03000000)?;
-            update(io, l.hyp + 0x2e19 * 4, 0x70, 0x20)?;
+        let rev0: &[_] = if revision == 0 { &GOLDEN_REV0 } else { &[] };
+        for &(index, reg, mask, value) in GOLDEN.iter().chain(rev0) {
+            let base = if index == 0 { l.gc } else { l.hyp };
+            update(io, base + u64::from(reg) * 4, mask, value)?;
         }
         update(io, l.gc + 0xda0 * 4, 0xfff, 0xff)?;
         // One graphics pipe.

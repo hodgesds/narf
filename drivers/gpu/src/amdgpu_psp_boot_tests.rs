@@ -1,5 +1,5 @@
 use super::*;
-use crate::amdgpu::NAVI22;
+use crate::amdgpu::{NAVI22, NAVI48};
 use alloc::{vec, vec::Vec};
 use core::{
     future::Future,
@@ -244,7 +244,7 @@ kernel_test_in!(
     psp14_boot_uploads_all_components_and_quarantines_cancellation
 );
 
-fn psp14_profile_pins_firmware_revision_and_refuses_cross_target_loads() -> TestResult {
+fn psp14_gpu() -> crate::amdgpu::AmdGpu {
     use crate::amdgpu_discovery as ip;
     let mut gpu = crate::amdgpu_navi22_boot::tests::gpu();
     gpu.chip = crate::amdgpu::__test_chip_info_for_pci_id(AMD_VENDOR, NAVI48).unwrap();
@@ -260,6 +260,11 @@ fn psp14_profile_pins_firmware_revision_and_refuses_cross_target_loads() -> Test
             b.revision = 3;
         }
     }
+    gpu
+}
+fn psp14_profile_pins_firmware_revision_and_refuses_cross_target_loads() -> TestResult {
+    use crate::amdgpu_discovery as ip;
+    let mut gpu = psp14_gpu();
     let (target, base) = profile(&gpu).unwrap();
     if target != Target::Psp14_0_3 || base != 0 || target.name() != "amdgpu/psp_14_0_3_sos.bin" {
         return TestResult::Fail("PSP14 firmware selection or mailbox base index");
@@ -272,6 +277,36 @@ fn psp14_profile_pins_firmware_revision_and_refuses_cross_target_loads() -> Test
     gpu.ip_blocks[mp0].revision = 2;
     if profile(&gpu).unwrap().0.name() != "amdgpu/psp_14_0_2_sos.bin" {
         return TestResult::Fail("PSP14.0.2 inherited 14.0.3 container");
+    }
+    // Navi44 (GC 12.0.0, MP0 14.0.2) and Navi48 boards: psp_v14_0 for both,
+    // container by MP0 revision; the AI PRO R9700 C8 kicker by PCI id/rev.
+    for profile_ in crate::amdgpu_rdna4::tests::Profile::ALL {
+        let mut g = psp14_gpu();
+        profile_.apply(&mut g);
+        let expected = match profile_.chip() {
+            crate::amdgpu_rdna4::Rdna4Chip::Navi48 => "amdgpu/psp_14_0_3_sos.bin",
+            crate::amdgpu_rdna4::Rdna4Chip::Navi44 => "amdgpu/psp_14_0_2_sos.bin",
+        };
+        if profile(&g).map(|(t, b)| (t.name(), b)) != Ok((expected, 0)) {
+            return TestResult::Fail("RDNA4 profile PSP14 container or mailbox bank");
+        }
+    }
+    let mut kicker = psp14_gpu();
+    (kicker.chip.did, kicker.chip.revision) = (0x7551, 0xc8);
+    let (kicked, _) = profile(&kicker).unwrap();
+    if kicked != Target::Psp14_0_3Kicker
+        || kicked.name() != "amdgpu/psp_14_0_3_sos_kicker.bin"
+        || !(Firmware {
+            target: kicked,
+            bytes: Vec::new(),
+        })
+        .is_psp14(3)
+    {
+        return TestResult::Fail("kicker board did not select the kicker SOS");
+    }
+    kicker.chip.revision = 0xc0;
+    if profile(&kicker).unwrap().0 != Target::Psp14_0_3 {
+        return TestResult::Fail("non-kicker R9700 revision selected the kicker SOS");
     }
     gpu.ip_blocks[mp0].revision = 3;
     gpu.fb_bar = map();
@@ -309,15 +344,21 @@ fn psp14_profile_pins_firmware_revision_and_refuses_cross_target_loads() -> Test
         return TestResult::Fail("PSP14 registry capability bypassed");
     }
     let good = gpu.ip_blocks.clone();
-    for case in 0..5 {
+    for case in 0..6 {
         gpu.ip_blocks = good.clone();
         gpu.regs.len = 0x80000;
+        gpu.chip.family = crate::amdgpu::Family::Navi4;
         match case {
             0 => gpu.ip_blocks[mp0].revision = 1,
             1 => gpu.ip_blocks.push(gpu.ip_blocks[mp0]),
             2 => gpu.ip_blocks[mp0].num_bases = 0,
             3 => gpu.regs.len = 0x91 * 4 + 3,
-            _ => gpu.chip.did = NAVI22,
+            // GC 12.0.2 is no RDNA4 die Linux knows.
+            4 => {
+                let gc = gpu.ip_blocks.iter().position(|b| b.hw_id == ip::HW_ID_GC);
+                gpu.ip_blocks[gc.unwrap()].revision = 2;
+            }
+            _ => gpu.chip.family = crate::amdgpu::Family::Navi3,
         }
         if profile(&gpu).is_ok() || Firmware::open(&gpu, &firmware).err() == Some(Error::Revoked) {
             return TestResult::Fail("unsupported PSP14 profile reached the registry");

@@ -1207,8 +1207,18 @@ impl Reset {
             engine: Engine {
                 io: Mmio {
                     regs: gpu.regs,
-                    mp0: bank(discovery::HW_ID_MP0, &[(14, 0, 2), (14, 0, 3)], 0, SOS)?,
-                    mp1: bank(discovery::HW_ID_MP1, &[(14, 0, 2), (14, 0, 3)], 1, 0x9a)?,
+                    mp0: bank(
+                        discovery::HW_ID_MP0,
+                        crate::amdgpu_rdna4::MP_VERSIONS,
+                        0,
+                        SOS,
+                    )?,
+                    mp1: bank(
+                        discovery::HW_ID_MP1,
+                        crate::amdgpu_rdna4::MP_VERSIONS,
+                        1,
+                        0x9a,
+                    )?,
                     pcie: (pcie + PCIE_INDEX2, pcie + PCIE_DATA2),
                     memsize: bank(discovery::HW_ID_NBIF, nbif, 2, MEMSIZE)?,
                     device,

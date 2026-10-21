@@ -1,6 +1,10 @@
 //! Linux amdgpu_ras as it applies to Navi48 (MP0 14.0.3, GC 12.0.1, UMC 8.14,
 //! NBIF 6.3.1, VCN/JPEG 5.0.0) on bare metal, nothing more.
 //!
+//! Navi44 (MP0 14.0.2) is not in amdgpu_ras_asic_supported's list, so
+//! amdgpu_ras_check_supported returns with `ras_hw_enabled == 0` before it
+//! reads any VBIOS capability: no RAS block, poison or ECC source at all.
+//!
 //! amdgpu_ras_asic_supported accepts MP0 14.0.3, PSP14 has no
 //! get_ras_capability, so amdgpu_ras_check_supported takes its block mask
 //! from the VBIOS (amdgpu_ras_query_ras_capablity_from_vbios): umc_info's
@@ -144,6 +148,12 @@ impl Caps {
         };
         Self::from_tables(tables.table_slice(4), tables.table_slice(24))
     }
+}
+/// `amdgpu_ras_asic_supported` on bare metal: of RDNA4's PSP14 parts only
+/// MP0 14.0.3 (Navi48) is listed.
+pub(crate) fn asic_supported(gpu: &AmdGpu) -> bool {
+    ip::find_ip(&gpu.ip_blocks, ip::HW_ID_MP0, 0)
+        .is_some_and(|mp0| (mp0.major, mp0.minor, mp0.revision) == (14, 0, 3))
 }
 /// amdgpu_ras_check_supported's `ras_hw_enabled` for bare-metal Navi48
 /// (not CPU-attached, no XGMI, VCN 5.0.0), before the module-parameter mask.
@@ -537,10 +547,13 @@ impl Monitor {
         gpu: &AmdGpu,
         authority: Cap<BusDeviceCap, Write>,
     ) -> Result<Self, Error> {
-        let caps = gpu
-            .vbios
-            .as_ref()
-            .map_or(Caps::default(), |v| Caps::from_vbios(v.bytes()));
+        let caps = if asic_supported(gpu) {
+            gpu.vbios
+                .as_ref()
+                .map_or(Caps::default(), |v| Caps::from_vbios(v.bytes()))
+        } else {
+            Caps::default()
+        };
         let version = |id| {
             let mut blocks = gpu.ip_blocks.iter().filter(|b| b.hw_id == id).peekable();
             let first = blocks.peek().map(|b| (b.major, b.minor, b.revision));

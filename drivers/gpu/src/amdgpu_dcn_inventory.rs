@@ -101,11 +101,11 @@ impl From<Profile> for Routing {
 }
 impl Routing {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
-        if gpu.chip.vid == crate::amdgpu::AMD_VENDOR && gpu.chip.did == crate::amdgpu::NAVI48 {
+        if crate::amdgpu_rdna4::Rdna4Chip::of(gpu).is_some() {
             crate::amdgpu_psp_ring::bank(
                 gpu,
                 crate::amdgpu_discovery::HW_ID_GC,
-                &[(12, 0, 1)],
+                crate::amdgpu_rdna4::GC_VERSIONS,
                 0,
                 0,
             )

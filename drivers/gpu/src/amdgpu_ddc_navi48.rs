@@ -40,10 +40,11 @@ struct Layout {
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
-        if gpu.chip.vid != crate::amdgpu::AMD_VENDOR || gpu.chip.did != crate::amdgpu::NAVI48 {
+        if crate::amdgpu_rdna4::Rdna4Chip::of(gpu).is_none() {
             return Err(Error::Unsupported);
         }
-        bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 0, 0).map_err(|_| Error::Unsupported)?;
+        bank(gpu, ip::HW_ID_GC, crate::amdgpu_rdna4::GC_VERSIONS, 0, 0)
+            .map_err(|_| Error::Unsupported)?;
         Ok(Self {
             clock: bank(gpu, ip::HW_ID_DCN, &[(4, 0, 1), (4, 1, 0)], 1, 0x7b)
                 .map_err(|_| Error::Unsupported)?,

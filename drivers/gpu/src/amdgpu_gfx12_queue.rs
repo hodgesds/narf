@@ -304,17 +304,26 @@ struct Layout {
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
-        if gpu.chip.vid != crate::amdgpu::AMD_VENDOR
-            || gpu.chip.did != crate::amdgpu::NAVI48
-            || gpu.regs.len < 0x7f004
-        {
+        if crate::amdgpu_rdna4::Rdna4Chip::of(gpu).is_none() || gpu.regs.len < 0x7f004 {
             return Err(Error::Unsupported);
         }
         Ok(Self {
-            gc: bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 0, DEQUEUE_REQUEST as u32)
-                .map_err(|_| Error::Unsupported)?,
-            hyp: bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 1, RLC_CNTL as u32)
-                .map_err(|_| Error::Unsupported)?,
+            gc: bank(
+                gpu,
+                ip::HW_ID_GC,
+                crate::amdgpu_rdna4::GC_VERSIONS,
+                0,
+                DEQUEUE_REQUEST as u32,
+            )
+            .map_err(|_| Error::Unsupported)?,
+            hyp: bank(
+                gpu,
+                ip::HW_ID_GC,
+                crate::amdgpu_rdna4::GC_VERSIONS,
+                1,
+                RLC_CNTL as u32,
+            )
+            .map_err(|_| Error::Unsupported)?,
             oss: bank(gpu, ip::HW_ID_OSSSYS, &[(7, 0, 0)], 0, 0x1f)
                 .map_err(|_| Error::Unsupported)?,
             nbio: bank(

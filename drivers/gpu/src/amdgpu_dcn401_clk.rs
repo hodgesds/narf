@@ -169,12 +169,19 @@ pub(crate) struct Layout {
 }
 impl Layout {
     pub(crate) fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
-        if gpu.chip.vid != crate::amdgpu::AMD_VENDOR || gpu.chip.did != crate::amdgpu::NAVI48 {
+        if crate::amdgpu_rdna4::Rdna4Chip::of(gpu).is_none() {
             return Err(Error::Unsupported);
         }
-        bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 0, 0).map_err(|_| Error::Unsupported)?;
-        let mp1 = bank(gpu, ip::HW_ID_MP1, &[(14, 0, 2), (14, 0, 3)], 1, MESSAGE)
+        bank(gpu, ip::HW_ID_GC, crate::amdgpu_rdna4::GC_VERSIONS, 0, 0)
             .map_err(|_| Error::Unsupported)?;
+        let mp1 = bank(
+            gpu,
+            ip::HW_ID_MP1,
+            crate::amdgpu_rdna4::MP_VERSIONS,
+            1,
+            MESSAGE,
+        )
+        .map_err(|_| Error::Unsupported)?;
         // Linux DAL uses absolute DWORD addresses 0x1628a/0x16273/0x16274.
         // Require discovery to agree rather than borrowing another MP1 bank.
         if mp1 != 0x16200 * 4 {

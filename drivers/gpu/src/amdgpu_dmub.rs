@@ -511,6 +511,7 @@ pub(crate) mod tests {
                 asic: "phoenix",
                 fw_name: "amdgpu/unused.bin",
                 fw_list: &[],
+                revision: 0,
             },
             vram: Default::default(),
             mode: None,

@@ -92,8 +92,9 @@ fn bank(gpu: &AmdGpu, device: &BusDevice) -> Result<u64, Error> {
     {
         return Err(Error::Unsupported);
     }
-    if gpu.chip.did == amdgpu::NAVI48 {
-        bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 0, 0).map_err(|_| Error::Unsupported)?;
+    if crate::amdgpu_rdna4::Rdna4Chip::of(gpu).is_some() {
+        bank(gpu, ip::HW_ID_GC, crate::amdgpu_rdna4::GC_VERSIONS, 0, 0)
+            .map_err(|_| Error::Unsupported)?;
         // nbio_v7_7 has no get_rom_offset override. SMUIO14.0.2 uses the
         // same two port offsets, at base index zero; no other SMUIO14
         // revision is admitted by this profile.

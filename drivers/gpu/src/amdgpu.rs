@@ -34,7 +34,13 @@
 //! | 1002:1638 | Renoir             | Ryzen 4000 iGPU |
 //! | 1002:73DF | Navi 22 (RX 6750)  | RDNA2 desktop |
 //! | 1002:744C | Navi 31 (RX 7900)  | RDNA3 desktop |
-//! | 1002:7550 | Navi 48 (RX 9070)  | RDNA4 desktop, discovery only |
+//! | 1002:7550 | Navi 48 (RX 9070 / 9070 XT / 9070 GRE) | RDNA4 desktop |
+//! | 1002:7551 | Navi 48 (Radeon AI PRO R9700) | RDNA4 workstation |
+//! | 1002:7590 | Navi 44 (RX 9060 XT) | RDNA4 desktop |
+//!
+//! The RDNA4 rows come from `amdgpu_rdna4::KNOWN_DEVICES`; any other AMD
+//! display function whose discovery reports GC 12.0.x (RX 9060, OEM ids) is
+//! bound too, as Linux's `CHIP_IP_DISCOVERY` class entries bind it.
 //!
 //! Plus a class-match backstop (`MatchKind::Class { 0x03 }`) that
 //! fires for every PCI VGA controller; the probe checks `vendor ==
@@ -139,6 +145,9 @@ pub const NAVI31: u16 = 0x744C;
 /// Navi 48 (RX 9070 / 9070 XT / 9070 GRE). The PCI ID does not identify
 /// the SKU's enabled topology; discovery supplies maximum geometry, while
 /// enabled CU counts require GFX12's harvested-WGP register inventory.
+///
+/// Not an RDNA4 gate: `amdgpu_rdna4::Rdna4Chip::of` identifies the die from
+/// discovery, and `amdgpu_rdna4::KNOWN_DEVICES` lists every RDNA4 board id.
 pub const NAVI48: u16 = 0x7550;
 
 /// PCI class triple for a VGA-compatible display controller. The
@@ -392,6 +401,10 @@ pub struct ChipInfo {
     /// the matching `gc_*`, `dcn_*`, `psp_*`, `sdma_*`, `vcn_*`,
     /// `smu_*` IP versions.
     pub fw_list: &'static [FwEntry],
+    /// PCI revision ID (`pdev->revision`, config offset 0x08), read at
+    /// probe. Linux keys the kicker firmware list and `external_rev_id` on
+    /// it; 0 until the probe reads it.
+    pub revision: u8,
 }
 
 impl ChipInfo {
@@ -634,7 +647,11 @@ fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
             asic: profile.asic,
             fw_name: profile.firmware.sos,
             fw_list: UNAUDITED_FW,
+            revision: 0,
         });
+    }
+    if let Some(known) = crate::amdgpu_rdna4::known_device(did) {
+        return Some(rdna4_chip_info(did, known.chip));
     }
     let (family, asic, fw_name, fw_list) = match did {
         // Phoenix1 / Phoenix2 / HawkPoint are RDNA3: GFX 11.0.1 with
@@ -686,9 +703,6 @@ fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
         ),
         RENOIR => (Family::Renoir, "renoir", "amdgpu/renoir.bin", RENOIR_FW),
         NAVI31 => (Family::Navi3, "navi31", "amdgpu/navi31.bin", UNAUDITED_FW),
-        // PSP14 selects its SOS container by the discovered MP0 revision.
-        // No single legacy image/load command describes this device.
-        NAVI48 => (Family::Navi4, "navi48", "", UNAUDITED_FW),
         _ => return None,
     };
     Some(ChipInfo {
@@ -698,7 +712,23 @@ fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
         asic,
         fw_name,
         fw_list,
+        revision: 0,
     })
+}
+
+/// An RDNA4 board, listed or found by discovery alone. PSP14 selects its SOS
+/// container by the discovered MP0 revision, so no single legacy image/load
+/// command describes it.
+fn rdna4_chip_info(did: u16, chip: crate::amdgpu_rdna4::Rdna4Chip) -> ChipInfo {
+    ChipInfo {
+        vid: AMD_VENDOR,
+        did,
+        family: Family::Navi4,
+        asic: chip.asic(),
+        fw_name: "",
+        fw_list: UNAUDITED_FW,
+        revision: 0,
+    }
 }
 
 // ── Errors ─────────────────────────────────────────────────────────
@@ -827,8 +857,13 @@ impl AmdGpu {
         device: &BusDevice,
         cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, AmdgpuError> {
-        let chip = chip_info_for_pci_id(device.id.vendor, device.id.device)
-            .ok_or(AmdgpuError::UnknownAsic)?;
+        // Linux binds an unlisted AMD display function as CHIP_IP_DISCOVERY
+        // and identifies it from the discovery blob; only RDNA4 is admitted
+        // that way here (see `amdgpu_rdna4`). Everything else stays listed.
+        let listed = chip_info_for_pci_id(device.id.vendor, device.id.device);
+        if listed.is_none() && device.id.vendor != AMD_VENDOR {
+            return Err(AmdgpuError::UnknownAsic);
+        }
         // SAFETY: caller-authority over BAR0 + BAR5.
         let fb_bar = unsafe { map_bar(device, BAR_FB) }.map_err(|_| AmdgpuError::BarMapFailed)?;
         // SAFETY: caller-authority over BAR0 + BAR5 (the `bring_up` contract);
@@ -896,6 +931,20 @@ impl AmdGpu {
                 read_discovery(&mut reader, vram.size)
             }))
             .map_err(|_| AmdgpuError::DeviceGone)?;
+
+        let die = crate::amdgpu_rdna4::Rdna4Chip::from_ip_blocks(&ip_blocks);
+        let mut chip = match (listed, die) {
+            // A listed RDNA4 id is named by its discovered die, not its id.
+            (Some(c), Some(die)) if c.family == Family::Navi4 => ChipInfo {
+                asic: die.asic(),
+                ..c
+            },
+            (Some(c), _) => c,
+            (None, Some(die)) => rdna4_chip_info(device.id.device, die),
+            (None, None) => return Err(AmdgpuError::UnknownAsic),
+        };
+        // pdev->revision: the kicker-firmware and external_rev_id key.
+        chip.revision = narf_bus::pci::read_config32(cap, device, 0x08).map_or(0, |v| v as u8);
 
         // Cross-check the pre-discovery identity. The actual BAR mapping,
         // rather than APU identity, always bounds CPU-visible VRAM.
@@ -2258,8 +2307,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     };
     // SAFETY: probe owns the GPU mappings; boot ACPI tables remain mapped.
     let vbios = unsafe { crate::amdgpu_vbios::discover(&dev, &device, &cap) };
+    let rdna4 = crate::amdgpu_rdna4::Rdna4Chip::of(&dev);
     if crate::amdgpu_rdna2::for_pci_id(device.id.vendor, device.id.device).is_some()
-        || device.id.device == NAVI48
+        || rdna4.is_some()
     {
         use core::fmt::Write as _;
         match &vbios {
@@ -2285,7 +2335,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     let vbios_version = dev.vbios.as_ref().and_then(|bios| bios.version());
     let is_apu = dev.is_apu();
     // Captured before the move into CONTROLLER; both are Copy.
-    let (bound_asic, bound_family) = (dev.chip.asic, dev.chip.family);
+    let (bound_asic, bound_family, revision) = (dev.chip.asic, dev.chip.family, dev.chip.revision);
+    crate::amdgpu_rdna4::publish(rdna4);
+    if rdna4.is_some() {
+        crate::amdgpu_info::publish_rdna4_revision(revision);
+    }
     *PCI_AUTHORITY.lock() = Some(cap);
     *PCI_DEVICE.lock() = Some(device);
     *CONTROLLER.lock() = Some(dev);
@@ -2304,6 +2358,17 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             bound_family,
             vbios_version.as_deref().unwrap_or("<none>"),
         );
+        if let Some(die) = rdna4 {
+            let name = crate::amdgpu_rdna4::known_device(device.id.device)
+                .map_or("unlisted board id", |d| d.name);
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: RDNA4 {} GC {:?} rev {revision:#04x} external_rev {:#04x}: {name}",
+                die.asic(),
+                die.gc_version(),
+                die.external_rev(revision),
+            );
+        }
     }
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("amdgpu"),
@@ -2317,7 +2382,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     let vbios_version: Option<alloc::string::String> = if vbios_version.is_some()
         || is_apu
         || (crate::amdgpu_rdna2::for_pci_id(device.id.vendor, device.id.device).is_some()
-            || device.id.device == NAVI48)
+            || rdna4.is_some())
     {
         vbios_version
     } else {
@@ -2484,7 +2549,6 @@ pub fn register_pci_driver() {
         ("amdgpu-cezanne", AMD_VENDOR, CEZANNE),
         ("amdgpu-renoir", AMD_VENDOR, RENOIR),
         ("amdgpu-navi31", AMD_VENDOR, NAVI31),
-        ("amdgpu-navi48", AMD_VENDOR, NAVI48),
     ];
     for (name, v, d) in exact.iter().copied() {
         narf_bus::register_pci_driver(narf_bus::PciMatch {
@@ -2492,6 +2556,21 @@ pub fn register_pci_driver() {
             kind: narf_bus::MatchKind::VendorDevice {
                 vendor: v,
                 device: d,
+            },
+            probe,
+        });
+    }
+    // Listed RDNA4 boards; unlisted ones reach `probe` through the class match
+    // and are identified by discovery.
+    for known in crate::amdgpu_rdna4::KNOWN_DEVICES {
+        narf_bus::register_pci_driver(narf_bus::PciMatch {
+            name: match known.chip {
+                crate::amdgpu_rdna4::Rdna4Chip::Navi48 => "amdgpu-navi48",
+                crate::amdgpu_rdna4::Rdna4Chip::Navi44 => "amdgpu-navi44",
+            },
+            kind: narf_bus::MatchKind::VendorDevice {
+                vendor: AMD_VENDOR,
+                device: known.did,
             },
             probe,
         });
@@ -2543,22 +2622,22 @@ pub(crate) fn claim_navi22<R, E>(
     )
 }
 
+/// Whether the bound GPU is an RDNA4 die (Navi48 or Navi44, by discovered
+/// GC). The `navi48` names predate Navi44 and cover the whole family.
 pub(crate) fn is_navi48() -> bool {
     CONTROLLER
         .lock()
         .as_ref()
-        .is_some_and(|gpu| gpu.chip.did == NAVI48)
+        .is_some_and(|gpu| crate::amdgpu_rdna4::Rdna4Chip::of(gpu).is_some())
 }
+/// `claim_navi22`'s counterpart for any RDNA4 die.
 pub(crate) fn claim_navi48<R, E>(
     prepare: impl FnOnce(&AmdGpu) -> Result<R, E>,
 ) -> Option<Result<R, E>> {
-    claim_discrete(NAVI48, prepare)
-}
-fn claim_discrete<R, E>(
-    did: u16,
-    prepare: impl FnOnce(&AmdGpu) -> Result<R, E>,
-) -> Option<Result<R, E>> {
-    claim_matching(|gpu| gpu.chip.did == did, prepare)
+    claim_matching(
+        |gpu| crate::amdgpu_rdna4::Rdna4Chip::of(gpu).is_some(),
+        prepare,
+    )
 }
 fn claim_matching<R, E>(
     matches: impl FnOnce(&AmdGpu) -> bool,

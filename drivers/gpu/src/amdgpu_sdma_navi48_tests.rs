@@ -461,7 +461,7 @@ fn sdma_navi48_layout_rejects_wrong_versions_and_bank_bounds() -> TestResult {
         let mut g = descriptor();
         match case {
             0 => g.ip_blocks[5].revision = 2,
-            1 => g.ip_blocks[0].revision = 0,
+            1 => g.ip_blocks[0].revision = 2,
             2 => g.ip_blocks[0].num_bases = 1,
             3 => g.ip_blocks[2].num_bases = 2,
             4 => g.ip_blocks[0].base_addrs[0] = 0x20000 - 0x1615,

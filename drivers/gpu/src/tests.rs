@@ -215,6 +215,14 @@ fn smoke_amdgpu_pci_matches_registered() -> TestResult {
             }
         }
     }
+    // Every listed RDNA4 board (the 9070 family, AI PRO R9700, 9060 XT).
+    for known in crate::amdgpu_rdna4::KNOWN_DEVICES {
+        if !regs.iter().any(|m| {
+            matches!(m.kind, MatchKind::VendorDevice { vendor: 0x1002, device } if device == known.did)
+        }) {
+            return TestResult::Fail("missing RDNA4 PCI match");
+        }
+    }
     let class_match = regs.iter().any(|m| {
         matches!(
             m.kind,

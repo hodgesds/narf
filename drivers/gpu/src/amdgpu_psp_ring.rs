@@ -509,10 +509,7 @@ impl Layout {
             return Err(Error::Invalid);
         }
         if let Kind::Navi48(revision) = kind {
-            if gpu.chip.vid != crate::amdgpu::AMD_VENDOR
-                || gpu.chip.did != crate::amdgpu::NAVI48
-                || !matches!(revision, 2 | 3)
-            {
+            if crate::amdgpu_rdna4::Rdna4Chip::of(gpu).is_none() || !matches!(revision, 2 | 3) {
                 return Err(Error::Unsupported);
             }
             let mp0 = bank(gpu, discovery::HW_ID_MP0, &[(14, 0, revision)], 0, SOS)?;
@@ -532,8 +529,20 @@ impl Layout {
                 0,
                 0,
             )?;
-            let gc = bank(gpu, discovery::HW_ID_GC, &[(12, 0, 1)], 0, 0x1615)?;
-            let rlc = bank(gpu, discovery::HW_ID_GC, &[(12, 0, 1)], 1, 0x4e7c)?;
+            let gc = bank(
+                gpu,
+                discovery::HW_ID_GC,
+                crate::amdgpu_rdna4::GC_VERSIONS,
+                0,
+                0x1615,
+            )?;
+            let rlc = bank(
+                gpu,
+                discovery::HW_ID_GC,
+                crate::amdgpu_rdna4::GC_VERSIONS,
+                1,
+                0x4e7c,
+            )?;
             return Ok(Self {
                 mp0,
                 nbio,

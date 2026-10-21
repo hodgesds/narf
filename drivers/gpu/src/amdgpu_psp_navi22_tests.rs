@@ -789,7 +789,7 @@ fn psp_navi48_rejects_incompatible_or_ambiguous_discovery() -> TestResult {
             2 => gpu.ip_blocks[0].revision = 5,
             3 => gpu.ip_blocks[1].major = 3,
             4 => gpu.ip_blocks[2].major = 5,
-            5 => gpu.ip_blocks[3].revision = 0,
+            5 => gpu.ip_blocks[3].revision = 2, // GC 12.0.2: no RDNA4 die
             6 => gpu.ip_blocks.push(gpu.ip_blocks[0]),
             7 => gpu.ip_blocks[1].num_bases = 2,
             _ => gpu.regs.len = 0x70000,
