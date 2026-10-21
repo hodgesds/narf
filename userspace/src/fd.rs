@@ -1549,15 +1549,8 @@ impl FileOps for ConsoleFile {
         // /dev/console see one console with one termios. Cooked mode
         // (the default) returns whole lines with echo + backspace;
         // a program that TCSETSes raw gets byte-at-a-time.
-        let n = console_port().read_into(buf);
-        let would_block = n == 0 && console_port().block_on_input();
-        Box::pin(async move {
-            if would_block {
-                Err(narf_filesystem::FsError::WouldBlock)
-            } else {
-                Ok(n)
-            }
-        })
+        let got = console_port().read(buf);
+        Box::pin(async move { got.ok_or(narf_filesystem::FsError::WouldBlock) })
     }
     /// Block an empty console read on the input waker (woken by the
     /// serial/keyboard IRQ) instead of returning a spurious 0. This is what

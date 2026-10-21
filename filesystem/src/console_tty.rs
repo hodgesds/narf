@@ -283,33 +283,86 @@ impl TtyPort {
     }
 
     /// Drain the device's input through the n_tty discipline into `state`.
-    fn pump(&self, state: &mut LineState) {
+    ///
+    /// The discipline holds at most [`ntty::N_TTY_BUF_SIZE`] - 1 bytes, as
+    /// n_tty's `receive_room` allows. Past that it stops taking input, which
+    /// stays queued in the device's ring (and from there in the UART), until
+    /// a read makes room: backpressure, never loss. The one exception is
+    /// n_tty's: a canonical line that fills the buffer with no line end
+    /// would never complete, so it keeps reading and discards everything but
+    /// a line terminator, which then ends the line.
+    ///
+    /// Input is processed only as far as the current read needs it: `want`
+    /// bytes in non-canonical mode, one completed line (or an EOF) in
+    /// canonical mode. n_tty processes each byte when it arrives, under the
+    /// termios in force at that moment; NARF processes queued input when it
+    /// is consumed, so taking more than the read needs would run typeahead
+    /// through the CURRENT reader's termios. A shell in readline's raw mode
+    /// would then swallow the next program's input, `^D` and all, as literal
+    /// bytes. Bytes left queued are processed under whatever termios is in
+    /// force when they are read.
+    fn pump(&self, state: &mut LineState, want: usize) {
         let t = *self.termios.lock().get_or_insert_with(Termios::default);
         // Bound the loop so a fast producer can't wedge us; whatever's left
         // is picked up on the next read.
         let mut budget = 1024usize;
         while budget > 0 {
             budget -= 1;
+            let enough = if t.icanon() {
+                !state.ready.is_empty()
+            } else {
+                state.ready.len() >= want.max(1)
+            };
+            if state.eof || enough {
+                break;
+            }
+            let full = state.held() >= ntty::N_TTY_BUF_SIZE - 1;
+            if full && !(t.icanon() && state.ready.is_empty()) {
+                break;
+            }
             let b = match self.next_input_byte() {
                 Some(b) => b,
                 None => break,
             };
+            if full && !ends_canonical_line(&t, b) {
+                continue;
+            }
             ntty::feed_byte(state, &t, b, &mut |c| self.echo_byte(c), &mut |x| {
                 self.raise_signal(x)
             });
         }
     }
 
+    /// A `read(2)` of the tty: `Some(n)` with the bytes produced, `Some(0)`
+    /// at an EOF (a `^D` on an empty canonical line), `None` when nothing is
+    /// ready and the caller should park. The EOF latch is consumed by the
+    /// read that reports it, so the caller must not ask [`Self::block_on_input`]
+    /// afterwards to tell EOF from "no input": with the latch gone that says
+    /// "block", and the EOF was lost (`cat` never ended on `^D`).
+    pub fn read(&self, buf: &mut [u8]) -> Option<usize> {
+        if buf.is_empty() {
+            return Some(0);
+        }
+        self.refill();
+        let mut state = self.discipline.lock();
+        self.pump(&mut state, buf.len());
+        self.refill();
+        if state.readable() == 0 {
+            return state.take_eof().then_some(0);
+        }
+        Some(state.drain_into(buf))
+    }
+
     /// Read input through the line discipline into `buf`. Returns the number
-    /// of bytes produced — 0 when nothing is ready yet (the caller parks via
-    /// `block_on_input`) or at a freshly-raised EOF.
+    /// of bytes produced — 0 when nothing is ready yet or at a freshly-raised
+    /// EOF; [`Self::read`] tells the two apart.
     pub fn read_into(&self, buf: &mut [u8]) -> usize {
         if buf.is_empty() {
             return 0;
         }
         self.refill();
         let mut state = self.discipline.lock();
-        self.pump(&mut state);
+        self.pump(&mut state, buf.len());
         self.refill();
         if state.readable() == 0 {
             // Distinguish a pending EOF (^D) from "no input yet": consume the
@@ -337,7 +390,7 @@ impl TtyPort {
     pub fn poll_readable(&self) -> bool {
         self.refill();
         let mut state = self.discipline.lock();
-        self.pump(&mut state);
+        self.pump(&mut state, 1);
         !state.would_block()
     }
 
@@ -368,6 +421,17 @@ impl TtyPort {
         t.raw[12..16].copy_from_slice(&lf.to_ne_bytes());
         *self.termios.lock() = Some(t);
     }
+}
+
+/// Whether `b` ends a canonical line: NL, CR under ICRNL, VEOF, VEOL or
+/// VEOL2.
+fn ends_canonical_line(t: &Termios, b: u8) -> bool {
+    use crate::devfs_pty::{VEOF, VEOL, VEOL2};
+    b == b'\n'
+        || (b == b'\r' && t.icrnl() && !t.igncr())
+        || [VEOF, VEOL, VEOL2]
+            .into_iter()
+            .any(|i| t.cc(i) != 0 && t.cc(i) == b)
 }
 
 /// The VT tty (`/dev/tty0`, `/dev/ttyN`).
@@ -746,6 +810,99 @@ fn smoke_console_serial_and_vt_are_separate_ttys() -> narf_kernel_test::TestResu
 narf_kernel_test::kernel_test_in!(
     "filesystem/console",
     smoke_console_serial_and_vt_are_separate_ttys
+);
+
+/// More input than n_tty's 4 KiB buffer is held back, not lost: the line
+/// discipline stops at `N_TTY_BUF_SIZE` - 1 bytes and the rest waits in the
+/// device's ring until reads make room (`receive_room` / `tty_throttle`).
+fn smoke_console_ldisc_backpressure_loses_nothing() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    narf_input::init_global_ring(256);
+    narf_input::__reset_global_ring_for_test();
+    __test_reset_raw();
+    let total = narf_input::BYTE_RING_CAPACITY;
+    for i in 0..total {
+        // Printable bytes only: the default iflag keeps IXON and ICRNL.
+        let _ = narf_input::push_global(narf_input::InputEvent::AsciiByte(b'!' + (i % 90) as u8));
+    }
+    // Pump for a read that wants everything: the discipline must stop at
+    // its bound.
+    let mut held = 0usize;
+    for _ in 0..8 {
+        let mut state = SERIAL.discipline.lock();
+        SERIAL.pump(&mut state, usize::MAX);
+        held = state.held();
+    }
+    let mut got = Vec::with_capacity(total);
+    let mut buf = [0u8; 512];
+    for _ in 0..64 {
+        let n = SERIAL.read_into(&mut buf);
+        if n == 0 {
+            break;
+        }
+        got.extend_from_slice(&buf[..n]);
+    }
+    __test_reset_cooked();
+    if held > ntty::N_TTY_BUF_SIZE - 1 {
+        return TestResult::Fail("the line discipline held more than N_TTY_BUF_SIZE - 1 bytes");
+    }
+    if held < ntty::N_TTY_BUF_SIZE - 1 {
+        return TestResult::Fail("the line discipline stopped short of N_TTY_BUF_SIZE - 1 bytes");
+    }
+    if got.len() != total
+        || got
+            .iter()
+            .enumerate()
+            .any(|(i, &b)| b != b'!' + (i % 90) as u8)
+    {
+        return TestResult::Fail("input past the n_tty bound was lost or reordered");
+    }
+    TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!(
+    "filesystem/console",
+    smoke_console_ldisc_backpressure_loses_nothing
+);
+
+/// Typeahead is processed under the termios of the read that consumes it.
+/// n_tty runs each byte through the termios in force when it arrives; NARF
+/// processes queued input at read time, so a read takes only what it needs.
+/// Here a raw (readline-style) one-byte read must not swallow a canonical
+/// line and its `^D` typed after it: once the reader goes canonical, the
+/// queued line reads back as a line and `^D` as EOF.
+fn smoke_console_typeahead_follows_the_consuming_termios() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    narf_input::init_global_ring(256);
+    narf_input::__reset_global_ring_for_test();
+    __test_reset_raw();
+    for &b in b"xline\r\x04" {
+        let _ = narf_input::push_global(narf_input::InputEvent::AsciiByte(b));
+    }
+    let mut one = [0u8; 1];
+    let raw = SERIAL.read_into(&mut one);
+    __test_reset_cooked();
+    let mut buf = [0u8; 64];
+    let line = SERIAL.read_into(&mut buf);
+    let line_ok = &buf[..line] == b"line\n";
+    // The pending ^D makes the tty readable, and the read returns 0 (EOF).
+    let eof_ready = SERIAL.poll_readable();
+    let eof_ok = eof_ready && SERIAL.read_into(&mut buf) == 0;
+    __test_reset_cooked();
+    narf_input::__reset_global_ring_for_test();
+    if raw != 1 || one[0] != b'x' {
+        return TestResult::Fail("a one-byte raw read did not return its byte");
+    }
+    if !line_ok {
+        return TestResult::Fail("typeahead was not read as a canonical line");
+    }
+    if !eof_ok {
+        return TestResult::Fail("a ^D typed ahead of a canonical reader was not EOF");
+    }
+    TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!(
+    "filesystem/console",
+    smoke_console_typeahead_follows_the_consuming_termios
 );
 
 /// `console=` selects `/dev/console` as Linux's `console_setup` does: the

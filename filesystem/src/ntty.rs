@@ -18,6 +18,11 @@ use crate::devfs_pty::Termios;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
+/// n_tty's read buffer size (`N_TTY_BUF_SIZE`, `drivers/tty/n_tty.c`): the
+/// most input a tty's line discipline holds before it stops accepting more
+/// (`n_tty_receive_buf_common` -> `receive_room`, then `tty_throttle`).
+pub const N_TTY_BUF_SIZE: usize = 4096;
+
 /// Cooked line-discipline buffers for one tty.
 #[derive(Debug)]
 pub struct LineState {
@@ -49,6 +54,11 @@ impl LineState {
             stopped: false,
             erasing: false,
         }
+    }
+
+    /// Bytes held: completed input plus the line being edited.
+    pub fn held(&self) -> usize {
+        self.ready.len() + self.line.len()
     }
 
     /// Drain up to `buf.len()` ready bytes into `buf`; returns the count.
@@ -205,9 +215,6 @@ pub fn process_output(out: &mut OutputState, t: &Termios, buf: &[u8], emit: &mut
         output_byte(out, t, c, emit);
     }
 }
-
-/// Maximum bytes held in one canonical line, Linux's `N_TTY_BUF_SIZE`.
-const N_TTY_BUF_SIZE: usize = 4096;
 
 /// Echo one byte the way `echo_char` does: a control character is shown as
 /// `^X` when ECHOCTL is set, except TAB and NL which always echo raw.

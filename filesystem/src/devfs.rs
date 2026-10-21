@@ -1301,15 +1301,8 @@ impl FileOps for DevConsole {
         // the ^C/^\/^Z signal hook and drains both input rings (serial
         // bytes + translated keys). fd 0/1/2's `ConsoleFile` reads the
         // exact same stream, so there is one console, one termios.
-        let written = self.port().read_into(buf);
-        let would_block = written == 0 && self.port().block_on_input();
-        Box::pin(async move {
-            if would_block {
-                Err(FsError::WouldBlock)
-            } else {
-                Ok(written)
-            }
-        })
+        let got = self.port().read(buf);
+        Box::pin(async move { got.ok_or(FsError::WouldBlock) })
     }
 
     /// `poll(2)` readiness: writable always, readable only when a read would
@@ -2645,6 +2638,33 @@ fn smoke_dev_console_vt_fchmod_accepted() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/devfs", smoke_dev_console_vt_fchmod_accepted);
+
+/// `^D` on an empty canonical line ends a read of a console tty node with
+/// EOF (0), then the next read blocks again (`n_tty_read` returning 0 on
+/// the EOF mark). The node used to consume the EOF latch and then report
+/// "would block", so `cat` on the console never ended on `^D`.
+fn smoke_dev_ttys0_ctrl_d_reads_eof() -> TestResult {
+    let dir = DevDir;
+    let Some(node) = dir.lookup("ttyS0") else {
+        return TestResult::Fail("/dev/ttyS0 missing");
+    };
+    narf_input::init_global_ring(256);
+    narf_input::__reset_global_ring_for_test();
+    crate::console_tty::__test_reset_cooked();
+    let _ = narf_input::push_global(narf_input::InputEvent::AsciiByte(0x04));
+    let mut buf = [0u8; 16];
+    let first = poll_once_devfs(node.read(0, &mut buf));
+    let second = poll_once_devfs(node.read(0, &mut buf));
+    crate::console_tty::__test_reset_cooked();
+    if !matches!(first, Some(Ok(0))) {
+        return TestResult::Fail("^D on an empty line did not read as EOF");
+    }
+    if !matches!(second, Some(Err(FsError::WouldBlock))) {
+        return TestResult::Fail("the read after EOF did not block");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/devfs", smoke_dev_ttys0_ctrl_d_reads_eof);
 
 /// `/dev/ttyS0` is the UART's own tty (`systemd.debug_shell=/dev/ttyS0`,
 /// `agetty ttyS0`): a tty identity distinct from the VTs', and the VT/KD
