@@ -441,9 +441,9 @@ read. The only fused-instance registers ever read are DCHUBBUB's DET sizes
 (all four, as dcn401_init_crb and dcn401_program_compbuf_segments read
 them); none is written. OTG/HUBP interrupt sources name instances and count
 for `pool.pipe(inst)` (`DisplayEvents` by pipe; a fused instance's event is
-unhandled). Planners and the platform take only pool pipes: `FreePipes`
-takes from the pool's top pipe down, `route_streams` and the CRTC routes
-refuse CRTCs past the pool, and KMS publishes `amdgpu_navi48_kms::
+unhandled). Planners and the platform take only pool pipes: DC's
+acquisition (below) searches the pool's pipe indices, `route_streams` and
+the CRTC routes refuse CRTCs past the pool, and KMS publishes `amdgpu_navi48_kms::
 crtc_count()` (Linux's `max_streams`, the pool's count) CRTCs with
 `possible_crtcs` limited to them. Model tests run the scanout chain, ODM,
 overlay/underlay/MPC trees, plane updates, cursor locks, timing, DSC, DCCG,
@@ -481,6 +481,56 @@ transactions on full and harvested pools (`vectors.txt`: stream and plane
 adds and removals, planes recreated, MPC and ODM changes, pools out of
 pipes); `dcn401_pipe_acquisition_matches_linux` replays every line on
 `DcState`.
+
+**Pipe acquisition (Navi48 configurations).** Every pipe a configuration
+takes is DC's choice over `DcState` (`modeset::{light_pipes, beside_pipes,
+live_pipes, head_pipes, dc_state, StreamPipes}`), never a fixed one and
+never CRTC k's pipe k. `dc_state(running)` is the current state the
+running displays record (`dc->current_state`): each stream (id its CRTC)
+on its OTG master `Modeset::pipe`, every ODM slice's OPP head after it, and
+in each slice its planes' blending tree in DC plane order, each plane's MPC
+slices together and every plane's slices linked across the segments, as
+DC's own acquisition leaves them. A stream's DC plane order is its primary
+first (NARF scans the primary out on the OTG master and its OPP heads),
+then the overlays top first (amdgpu_dm's descending zpos). Each flow
+builds the new state as amdgpu_dm's atomic check does and reads every
+stream's head and further pipes (`DisplayPipes`) back from it:
+- `light_pipes(current, streams)`: a configuration lit anew
+  (`modeset_routed`; the platform passes the displays it stopped for the
+  relight as `current`, one commit as amdgpu_dm modesets them together; a
+  first lighting passes an empty state): every running stream and plane
+  removed, the new streams added in CRTC order (`add_stream`: a pipe the
+  current state used as an OTG master first, so a relit configuration
+  keeps its OTG masters), their planes, then DML's counts
+  (`StreamPipes::target`: the plan's ODM slices, each plane's MPC slices,
+  one on an ODM stream). `head_pipes` is the OTG masters alone;
+  `plan_pipes`/`display_pipes` are it over no running display (stand-in
+  pipes for admission checks, `display_admits_planes`).
+- `beside_pipes(current, streams)`: new streams beside the running ones
+  (`modeset_beside`; the running streams and planes kept): their OTG
+  masters (a pipe the running state leaves free first), planes and counts;
+  `None` (a relight) when that would move a running stream's pipes.
+- `live_pipes(current, stream, reset)`: a running display's planes changed
+  (`update_display_planes`): with `planes::planes_reset`
+  (should_reset_plane: any plane added or removed, or a size, rotation,
+  blending, alpha, color, format, tiling/DCC or zpos change; a plane only
+  moved keeps its pipes) every plane of the stream removed and added again
+  in DC plane order, then the counts; a recreated overlay takes the first
+  free pipe of its OPP head's current blending tree, so it comes back to
+  its pipe wherever it moved in the stack and a new plane takes a removed
+  one's (Linux swaps a primary's MPC slice the tree gives an overlay first
+  to a free pipe); `None` (a modeset) when the stream's OTG master or OPP
+  heads or another display's pipes would move.
+Everything downstream follows the chosen pipes: the CRTC's head pipe for
+its timing, OPP, blank, DSC (the pipe index's), DCCG and pixel clocks,
+deadlines and DET, cursor, the DIG/HPO stream encoder (the head pipe's
+index) and MST link owner, its present, vblank and cursor tasks
+(`crtc_pipe`) and DisplayEvents (by pipe). Deviations from Linux: the
+primary takes the OTG master where amdgpu_dm's topmost plane does (the
+pipe sets match; within a stream an overlay above the primary and the
+primary trade pipes), planes of different CRTCs are added CRTC by CRTC
+rather than interleaved by DRM's global zpos, and no SubVP phantom or
+seamless-boot stream takes pipes (the firmware display is retired first).
 
 **Audio.** Navi44 boards expose the same `1002:ab40` HDMI/DP audio function
 (Linux `hda_intel.c` lists only `ab40` for RDNA4); runtime PM finds it as PCI
@@ -1402,8 +1452,10 @@ by `dcn401_dml_matches_linux_dml21_surface_mpc_vectors`, every plan value and
 both pipes' mcache registers exact.
 
 A multi-pipe plan is programmed as ODM 2:1, 3:1 or 4:1 (optc401_set_odm_combine). The
-modeset gives it the highest pipes no display of the configuration uses
-(`modeset::odm_pipes`, left to right in that order), a DPP-only clock on
+modeset gives it the further OPP heads DC acquires (dcn32_acquire_free_pipe_
+as_secondary_opp_head: the current OTG master's own further OPP heads, else
+pipes the current state leaves free, lowest first; see "Pipe acquisition"),
+left to right in that order, a DPP-only clock on
 each (`dccg::PixelClock::OdmSegment`, plus its DSCCLK), and lights it with
 `otg::Request::odm` and `otg::SurfaceRequest::odm` naming them
 (`otg::SplitPipes`: one to three further pipes). The OTG takes every OPP as
@@ -1428,10 +1480,11 @@ segment's DSC off, every segment disconnected) before stopping each DSC
 clock. `ScanoutRunning::odm` names the pipes.
 
 An MPC-combined plane (`PlanePlan::dpps` 2 in ODM bypass) takes a further
-pipe from the top (`modeset::mpc_pipes` for the primary, `overlay_pipes` for
-an overlay; ODM segments first, then MPC slices, then overlays, as
-resource_update_pipes_for_stream/plane_with_slice_count acquire them) with a
-DPP-only clock at its DPPCLK; `SurfaceRequest::mpc` names it. Each slice's
+pipe as DC acquires it (resource_update_pipes_for_plane_with_slice_count
+after every plane is added: a free pipe of the current blending tree, else
+one the current state leaves free, lowest first, the slice right after its
+plane in the tree; see "Pipe acquisition") with a DPP-only clock at its
+DPPCLK; `SurfaceRequest::mpc` names it. Each slice's
 HUBP/DPP takes SPL's viewport and recout for its MPC slice
 (`spl::Input::mpc_slice`, calculate_mpc_slice_in_timing_active: equal shares
 of the plane clip, the remainder to the last slices); both slices' MPCCs
@@ -4446,10 +4499,10 @@ plane).
 `OverlayPlane`s bottom first with format and `underlay`) is set per pipe
 (`set_plane_setup`, `plane_setup`, `Selection::planes`). `selection_mode` and
 `with_planes` give DML every plane (`plane_requests`/`stream_planes` build the
-surface requests); `overlay_pipes` takes free pipes from the top after every
-display's and ODM pipe, refusing `Admission(Pipes)`; `prepare_pipes` returns
-each display's `DisplayPipes` and gives the overlay pipes their DPP-only
-clocks; `light` powers, stages (every plane's memory before any plane's DPP)
+surface requests); every plane takes the pipes DC acquires (`light_pipes`,
+see "Pipe acquisition"), refusing `Admission(Pipes)`; `prepare_pipes` gives
+each display's head pipe its clocks and its `DisplayPipes` (ODM, MPC and
+overlay pipes) their DPP-only clocks; `light` powers, stages (every plane's memory before any plane's DPP)
 and requests every plane. The platform records each CRTC's planes
 (`request_display_planes`), moves a running display to new planes or a new
 primary format without relighting it (see "Navi 48 seamless plane updates";
@@ -4458,8 +4511,9 @@ display to the full-frame XRGB8888 primary), and admits a configuration with
 `display_admits_planes(display, connector, mode, fourcc, setup) ->
 Result<(), PlanesRefused>`: the display lit on the same connector and timing
 (`NotLit` otherwise), DML21 with every lit display's admitted planes
-(`Bandwidth`, `Plane`), a free pipe for each overlay beside the other
-displays' (`Pipes`) and staging's checks (`Plane`).
+(`Bandwidth`, `Plane`), the pipes DC acquires for every plane of the
+configuration lit anew (`plan_pipes`; `Pipes`) and staging's checks
+(`Plane`).
 `present_planes(display, primary, overlays, ticket)` queues a commit's
 `PlaneFrame`s (merged per plane in the mailbox); the presenter copies each
 plane's framebuffer source rectangle into its back buffer and flips every
@@ -4935,12 +4989,11 @@ format, setup, reset, frames: &mut dyn FirstFrames) -> Option<PlanesChange>`
 (`PlanesChange { pipe, displays, updated }`; `FirstFrames::chunk(slot, a,
 index, words)` is `PlaneContent` by plane slot, 0 the primary and k + 1
 the setup's overlay k) admits every running display again with the
-display's new planes (`dml::admit_native`), places them
-(`modeset::planes::live_plane_pipes`: the primary keeps its pipe and ODM
-pipes and the MPC slices the plan keeps; an overlay DC keeps, the same DRM
-plane by `OverlayPlane::plane`, keeps its pipes wherever it moves in the
-stack; a new plane takes free pipes from the top, a freed pipe included),
-then: prepare_bandwidth (`update_live_display_clocks` raising the shared
+display's new planes (`dml::admit_native`), places them as DC acquires
+them on the running state (`modeset::live_pipes` with `planes_reset`, see
+"Pipe acquisition": recreated planes take their blending tree's pipes back
+top first, new ones pipes the running state leaves free, a plane only moved
+keeps its pipes), then: prepare_bandwidth (`update_live_display_clocks` raising the shared
 clocks and the DTOs of the pipes that keep fetching, the new pipes'
 DPP-only clocks, every other display whose plan moved through
 `update_live_display_plan(raise)`), the plane update, optimize_bandwidth

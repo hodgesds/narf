@@ -3448,16 +3448,23 @@ pub async unsafe fn modeset_displays(
     use crate::amdgpu_navi48_boot::Error as BootError;
     let mut owner = OWNER.lock().await;
     let boot = owner.as_mut().ok_or(ModesetError::Boot(BootError::Busy))?;
+    // A first lighting: no configuration before it.
+    let current =
+        crate::amdgpu_dcn401_resource::DcState::new(crate::amdgpu_rdna4::pipe_pool().count());
     // SAFETY: the caller's obligations.
-    unsafe { light_displays(boot, fill) }.await
+    unsafe { light_displays(boot, fill, &current) }.await
 }
 
-/// `modeset_displays` with the owner held.
+/// `modeset_displays` with the owner held, replacing the configuration
+/// `current` (the DC state of the displays stopped for it: one commit, as
+/// amdgpu_dm modesets them together, so pipes are acquired preferring
+/// what they ran on).
 /// # Safety
 /// As for `modeset_displays`.
 async unsafe fn light_displays(
     boot: &mut boot::ColdBoot,
     fill: impl FnMut(u8, u32, &mut [u32]),
+    current: &crate::amdgpu_dcn401_resource::DcState,
 ) -> Result<crate::amdgpu_navi48_boot::Configuration, ModesetError> {
     if pending_display_work(boot) {
         return Err(crate::amdgpu_dcn401_otg::Error::Busy.into());
@@ -3563,7 +3570,7 @@ async unsafe fn light_displays(
         .map(|((&port, crtcs), want)| boot::MstRoute { port, crtcs, want })
         .collect();
     // SAFETY: the caller's obligations.
-    let result = unsafe { boot.modeset_routed(fill, want, crtc, &routes) }.await;
+    let result = unsafe { boot.modeset_routed(fill, want, crtc, &routes, current) }.await;
     {
         let mut outputs = OUTPUTS.lock();
         for c in &mut outputs.crtcs {
@@ -5431,7 +5438,7 @@ pub fn display_admits_planes(
 }
 
 /// DML admission and pipe assignment of the lit configuration `joint`
-/// (display, admitted mode; in pipe order) with display `k`'s planes.
+/// (display, admitted mode; in CRTC order) with display `k`'s planes.
 fn admits_with_planes(
     soc: &dml::Soc,
     joint: &[(usize, dml::Mode)],
@@ -5458,18 +5465,19 @@ fn admits_with_planes(
         dml::Error::Unsupported | dml::Error::Invalid => PlanesRefused::Plane,
         _ => PlanesRefused::Bandwidth,
     })?;
-    // Every display's ODM segments, MPC slices and overlays take the pipes
-    // the displays leave, as lighting assigns them.
-    let pipes: Vec<u8> = joint.iter().map(|&(n, _)| n as u8).collect();
-    let extra = boot::plan_pipes(&plans, &pipes).map_err(|_| PlanesRefused::Pipes)?;
+    // Every stream, plane, ODM segment and MPC slice takes a pipe, as DC
+    // acquires them for the configuration lit anew (the pipe numbers stand
+    // in: staging's checks do not depend on them).
+    let crtcs: Vec<u8> = joint.iter().map(|&(n, _)| n as u8).collect();
+    let acquired = boot::plan_pipes(&plans, &crtcs).map_err(|_| PlanesRefused::Pipes)?;
     let m = &modes[at];
-    let d = extra[at];
+    let (head, d) = acquired[at];
     let (primary, stack) = boot::stream_planes(
         &m.timing,
         m.ycbcr420,
         format,
         setup,
-        (pipes[at], d.odm, d.mpc),
+        (head, d.odm, d.mpc),
         &d.overlays,
     );
     for r in core::iter::once(primary).chain(stack.into_iter().flatten()) {
@@ -5529,7 +5537,7 @@ pub fn display_admits_format(
 }
 
 /// DML admission of the lit configuration `joint` (display, admitted mode;
-/// in pipe order) with display `k`'s plane in `format`.
+/// in CRTC order) with display `k`'s plane in `format`.
 fn admits_with_format(
     soc: &dml::Soc,
     joint: &[(usize, dml::Mode)],
@@ -6115,7 +6123,10 @@ pub async unsafe fn monitor_displays(
         }
     }
     if relit && !lit_beside {
-        // Withdraw every writer, stop every display, light them again.
+        // Withdraw every writer, stop every display, light them again: one
+        // commit from the configuration that ran.
+        let running: Vec<Modeset> = displays.lit.iter().flatten().copied().collect();
+        let current = boot::dc_state(&running);
         for k in (0..count).rev() {
             let Some(m) = displays.lit[usize::from(k)] else {
                 continue;
@@ -6126,7 +6137,7 @@ pub async unsafe fn monitor_displays(
         }
         let fill = |_: u8, _: u32, row: &mut [u32]| row.fill(0);
         // SAFETY: as above; every display is stopped.
-        let lit = match unsafe { light_displays(boot, fill) }.await {
+        let lit = match unsafe { light_displays(boot, fill, &current) }.await {
             Err(e @ (ModesetError::NoSink | ModesetError::Link | ModesetError::LinkReduced))
                 if !pending_display_work(boot) =>
             {
@@ -6155,7 +6166,7 @@ pub async unsafe fn monitor_displays(
                     c.planes = boot::PlaneSetup::NONE;
                 }
                 // SAFETY: as above.
-                Some(unsafe { light_displays(boot, fill) }.await?)
+                Some(unsafe { light_displays(boot, fill, &current) }.await?)
             }
             Err(e) => return Err(e),
             Ok(config) => Some(config),

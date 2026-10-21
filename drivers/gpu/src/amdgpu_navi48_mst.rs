@@ -1580,8 +1580,10 @@ impl ColdBoot {
             crtcs,
             want: &want,
         };
+        let current =
+            crate::amdgpu_dcn401_resource::DcState::new(crate::amdgpu_rdna4::pipe_pool().count());
         // SAFETY: the caller's obligations.
-        unsafe { self.modeset_routed(fill, |_| None, |_| None, &[route]) }.await
+        unsafe { self.modeset_routed(fill, |_| None, |_| None, &[route], &current) }.await
     }
     /// Validate an MST route and start its branch: MST enabled and the
     /// topology probed, before the configuration scans the board.
