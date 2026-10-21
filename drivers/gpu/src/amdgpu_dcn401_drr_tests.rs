@@ -58,6 +58,7 @@ fn live(pipe: u8) -> (Engine<Fake>, Request) {
                 dchub_refclk_khz: 50_000,
             },
             &dml::Mode {
+                hdmi: false,
                 timing: request(pipe).timing,
                 pitch: 1920,
                 bytes_per_pixel: 4,

@@ -976,17 +976,21 @@ dcn401_smu_set_min_deep_sleep_dcef_clk return nothing). Every message, as
 dcn401_smu_send_msg_with_param, first waits only for DAL_RESP to be nonzero
 (any value: an OK, or a refusal this or an earlier owner left there) and
 then sends; only PMFW's answer to the message sent can be a refusal, so a
-message never sent is never counted. Unlike Linux, which sends anyway after
-its two-second wait, a response register still zero at the deadline fails
-with `Timeout` before any write. Timeout, revocation, device loss or
-cancellation still leave the owner failed.
+message never sent is never counted. A sent ignored-result message's response
+timeout is also logged and counted; after another bounded readiness wait,
+a later command may replace that known unanswered transaction, as Linux does.
+An unknown inherited busy mailbox still fails before any write. Queries and
+display-frequency commands require their response; revocation, device loss,
+required-result failure and cancellation leave the owner unusable.
 
 `notify_wm_ranges(regs, address).await` is dcn401_notify_wm_ranges:
 SetDalDramAddrHigh/Low (5, 6) with the GPU address of
 `ClockManager::wm_range_table()` (`WatermarksExternal_t`, 112 bytes: set A
 `WATERMARKS_CLOCK_RANGE`, set 1A `WATERMARKS_DUMMY_PSTATE`), then
-TransferTableDram2Smu (8) of TABLE_WATERMARKS (2), each refusal ignored and
-logged the same way.
+TransferTableDram2Smu (8) of TABLE_WATERMARKS (2), each refusal or sent timeout
+ignored and logged the same way. The owner stays `Applying` throughout the
+sequence and on cancellation; a transport/authority failure enters `Failed`,
+so a partially sent watermark sequence cannot be reused.
 
 `release(regs).await` is dcn401_update_clocks' optimize once no stream is
 left (NumOfDisplays 0, DCFCLK, UCLK and FCLK at their lowest levels, UCLK
@@ -1458,8 +1462,8 @@ display/hub/VM/IRQ/clock/reset/power writers. Native header contracts are in
 `tests/dcn401_mpc.c` and `tests/dcn401_requestor.c`; MMIO models cover all four
 pipes, all supported RGB depths, transient buffer usage, delayed CURRENT
 acknowledgements, cancellation, lost writes and stale owners. DLG/TTU and
-watermark calculation/admission, MPC route connection, visible framebuffer
-activation, live flips and physical RX 9070 XT validation remain open. Neither
+watermark admission, route activation and live presentation are separate
+steps described below. Physical RX 9000 validation remains open. Neither
 preparation API starts fetch or publishes an active framebuffer.
 
 `amdgpu_dcn401_dml::admit(&Soc, &Mode) -> Result<Plan, Error>` is the native
@@ -1467,13 +1471,14 @@ scanout admission calculation: Linux DML21's DCN4 mode-support and
 mode-programming path, evaluated in fixed point with no hardware access. It
 admits the shape the native path implements: progressive streams of linear
 RGB planes (`Mode::planes`: the primary, scaled or not, and overlays; see
-"Navi 48 plane scaling and overlay planes"), each pipe with the staged
-320-KiB DET (DCN4_01_DEFAULT_DET_SIZE). Deviation: DC never sets
-`det_size_override_kb` and lets CalculateDETBufferSize share the 1280-KiB
-pool (minimize_det_reallocation: per-stream budgets by pixel rate, then by
-bandwidth); NARF programs and plans the fixed 320 KiB, and the
-tests/dcn401_dml21 harnesses pass it as `det_size_override_kb` so every
-other value is compared. `Mode::bytes_per_pixel` is DML's source format
+"Navi 48 plane scaling and overlay planes"). CalculateDETBufferSize shares
+1280 KiB among the pipes without an override: DC's minimize_det_reallocation
+uses pixel-rate budgets per stream, then bandwidth per plane and full-swath
+minimums, in 64-KiB segments. A single tiled RGB pipe uses unbounded requesting,
+a two-swath DET of at least 128 KiB and the remainder as compbuf; bounded
+configurations leave at least one compbuf segment. `Plan::plane(k).det_bytes`
+is each pipe's allocation for that plane. The Linux harness uses these same
+DC settings, including the ForceSingleDPP allocation before MPC admission. `Mode::bytes_per_pixel` is DML's source format
 (2 `dml2_444_16`, 4 `dml2_444_32`, 8 `dml2_444_64`; anything else is
 `Invalid`) and the pitch must be whole 256-byte requests at that depth; the
 request width, swath, DET lines, read bandwidth and deep-sleep DCFCLK follow
@@ -1486,10 +1491,7 @@ DCC, MALL/SubVP, cursor, tdlut, dynamic metadata, writeback and immediate
 flip are excluded rather than approximated.
 
 ODM follows DML's `dml2_odm_mode_auto` (DecideODMMode,
-CalculateODMConstraints, ValidateODMMode; deviation: the Vmin phase's
-dynamic ODM, which DC enables on DCN401 through
-enable_single_display_2to1_odm_policy, is not ported, as if every stream
-had `disable_dynamic_odm`): a stream takes the fewest of one
+CalculateODMConstraints, ValidateODMMode): a stream initially takes the fewest of one
 to four pipes (DPP/OPP each and, with DSC, a DSC each) whose DISPCLK
 (CalculateRequiredDispclk: the pixel clock over the pipes, never below half
 of it for HDMI TMDS 4:2:0) fits the downspread-limited maximum, at least
@@ -1502,6 +1504,12 @@ slices are not twelve. 3:1 and 4:1 lines divide by four (OTG_H_TIMING_DIV_BY4),
 (1 to 4) reports the decision; every pipe shares every programmed value
 except the DLG blank end, which each further pipe moves by the segments
 before it (`Plan::odm_refcyc_h_blank_end: [u32; 3]`, `Plan::pipe_dlg`).
+The Vmin phase then tries to lower a single DP stream's DISPCLK toward
+600 MHz using more ODM pipes, retaining supported partial progress. HDMI
+TMDS/FRL (`Mode::hdmi`), incompatible timing divisibility, base MPC combine
+and DSC slice constraints exclude candidates as in PMO. The same phase runs
+after P-state strategy search. A live P-state change that would move pipes
+stays pinned until a full modeset can adopt that topology.
 `tests/dcn401_dml21/odm34_vectors.txt` (1927 configurations: 8K, 10K, 5K and
 4K480 streams at every depth, with DSC of 4 to 24 slices, HDMI 4:2:0, beside
 other streams, and every configuration the older files marked "Unsupported
@@ -1552,7 +1560,7 @@ replayed by `dcn401_dml_matches_linux_dml21_mpc_vectors`, and
 configurations, 258 MPC-combined planes; harness_surfaces.c with MPC_AUTO)
 by `dcn401_dml_matches_linux_dml21_surface_mpc_vectors`, every plan value and
 four pipes' mcache registers exact. The harnesses run PMO with DC's
-`disable_dyn_odm = false` (every stream `disable_dynamic_odm`, see above);
+`disable_dyn_odm = false` with per-stream dynamic ODM allowed;
 surface_vectors.txt's single-stream ODM section (8K and 4K120 DCC planes of
 two to four mcaches) has Linux raise the ODM factor and fill allocations past
 three slices. Each harness_surfaces.c pipe's mcache viewports are SPL's on
@@ -1650,8 +1658,7 @@ its own inputs and refuses any difference, so an edited or hand-built `Plan`
 is not admission. It then binds the plan to the current owners: the retained
 MPC/DPP/surface/memory/timing sources and requestor allocation verify as for
 the requestor; the timing, global sync and legacy DP SST signal must equal the
-plan; the surface must be full-frame with the plan's pitch and the 320-KiB
-DET; applied DISPCLK, DPPREFCLK and pipe DPPCLK must be at least the plan's;
+plan; each surface must match its planned plane, pitch and per-pipe DET; applied DISPCLK, DPPREFCLK and pipe DPPCLK must be at least the plan's;
 the pinned UCLK and DCFCLK floors must equal the ones it assumed; and the live
 DCHUB reference must match. Any mismatch is `Invalid` with no writes.
 
@@ -4581,10 +4588,14 @@ their stream (or two for an MPC-combined overlay), staged on the overlay pipe th
 display's stream (`Engine::stream_pipe`). A memory restage keeps the other
 planes' records when the VMID0 context is unchanged, and staging checks
 tolerate the display's own pending staged addresses (`staged_planes`).
-`unsafe Otg::prepare_requestor_planes(.., pipe, overlays)` (ColdBoot
-`prepare_display_requestor_planes`; overlays bottom first, underlays before
-the others) gives every plane's HUBP the default DET and the primary's VTG
-and records `RequestorApplied::overlays`; it refuses an overlay on the
+`unsafe Otg::prepare_requestor_planes(.., pipe, overlays, plan: Option<&Plan>)`
+(ColdBoot `prepare_display_requestor_planes(.., &Plan)`; overlays bottom first,
+underlays before the others) gives every plane's HUBP its DML DET and the
+primary's VTG, recording `RequestorApplied::overlays`, `det_bytes` and
+`overlay_det_bytes`. Native modesetting always supplies the admitted plan;
+`None` retains default 320-KiB storage staging for low-level callers only.
+The total must leave compbuf space and each active DET is 2..20 segments;
+other displays retain their recorded per-plane allocations. It it refuses an overlay on the
 primary's pipes, an unstaged pipe, a pipe used twice, another display's pipe
 (`Siblings::pipes`, which counts overlay pipes and DETs) or an underlay above
 an overlay (`Invalid`), and a fourth overlay (`Unsupported`). Deadlines
@@ -4929,12 +4940,13 @@ one that fails after programming it leaves the buffer pinned) and `retire_scanou
 plane's latched address while scanning out, none at rest, unknown while a
 change is in flight or after a failure) shows no plane fetching it (after
 each presenter flip, `flip_display`, and every display-monitor pass).
-`release_client_scanout` is dm_suspend's (and the lastclose restore's)
-commit: every plane still fetching a client framebuffer flips back to its
-back buffer and the pins retire, before system suspend evicts VRAM and
-after the last card close (a release that fails there keeps the pins until
-a later pass retires them: drm_fb_helper_lastclose ignores its restore
-commit's error). A cursor plane's GEM framebuffer is pinned in VRAM by the
+`release_client_scanout` implements the lastclose restore: every plane still
+fetching a client framebuffer flips back to its back buffer and the pins
+retire after the last card close (a failed release keeps the pins until a
+later pass retires them: drm_fb_helper_lastclose ignores its restore error).
+Suspend instead stops the streams through their retained teardown journal,
+then retires pins; it never exposes an old or cleared staged buffer on the way
+into S3. A cursor plane's GEM framebuffer is pinned in VRAM by the
 commit's prepare and handed to the display's cursor task
 (`amdgpu_navi48_platform::CursorContent::Gem`, `GemCursor`), which waits
 for the buffer's WRITE fences (the plane fence drm_gem_plane_helper_prepare_fb
@@ -5206,7 +5218,7 @@ their own) under `plan`, its stream's own timing admitted with them, in
 commit_planes_for_stream's order:
 - Checks, before any write: the display scans out, every request stages
   (SPL), sits on the stream split like it and on pipes no other plane or
-  display holds, underlays below the others, its rows fit the default DET,
+  display holds, underlays below the others, and
   the plan binds the new planes and the current owners
   (`deadline::bound`), the live scanout is still the one its records name
   (`scanout_bound_with`, raise-tolerant watermarks), no flip is pending,
@@ -5224,13 +5236,15 @@ commit_planes_for_stream's order:
   update (no register written).
 - Before the lock (dcn20_enable_plane): each new pipe powered up if gated
   (dcn32_hubp_pg_control), its fetch clock, the VMID0 aperture, the
-  requestor on the stream's VTG and the DPP clock; its default DET from the
-  compressed buffer (shrunk first).
+  requestor on the stream's VTG and the DPP clock; compbuf is reduced before
+  any planned DET grows.
 - Under dcn401_interdependent_update_lock (the OTG master lock): the global
   sync if the plan's differs; for every freed pipe its DET released
   (`Engine::program_det_segments(q, 0)`, dcn401_program_det_segments, no
   wait) and then its plane_atomic_disconnect (mpc1_remove_mpcc) with its
-  cursor off, as dcn401_program_front_end_for_ctx orders them; each changed or new plane's DPP
+  cursor off, as dcn401_program_front_end_for_ctx orders them; the retained
+  and new planes receive their plan's DET (reductions before increases), then
+  each changed or new plane's DPP
   (dpp401_dpp_setup and the DSCL with the coefficient RAM swap,
   `program_dpp_live`); on a full update every segment's MPCC tree from its
   top pipe down as dcn20_update_mpcc does (each MPCC removed, inserted at
@@ -5295,6 +5309,16 @@ configuration, a teardown in flight, DML refusing the configuration, another
 ODM split for the display, another display's pipes or split changing, a
 request that does not stage, or the engine's refusal.
 
+Live DET changes settle active CURRENT fields after VUPDATE before publishing
+the new plan. An idle zero request is deferred only when the driver retained
+ownership of that retirement; an unrelated release must acknowledge CURRENT
+before its space can fund growth. Cold allocation adoption remains strict.
+Live checks count requested and current capacity conservatively and permit
+only owned idle retirements or safe compbuf growth in flight. Compbuf capacity
+needed by a plan must acknowledge before publication; growth beyond its
+minimum may remain deferred. Across streams, net DET releases complete before
+budget takers, including a plane removal that frees space for a sibling.
+
 **Platform and KMS.** `request_display_planes` and `request_display_format`
 wake the display monitor (it sleeps in 16 ms steps), which applies a plane
 or format change of a display that otherwise runs on through
@@ -5317,8 +5341,7 @@ the presenter's flip after the update latched, not at the update's own
 VUPDATE, and the commit's flip event completes with that flip; a frame
 queued after the update copied the planes shows from that flip too; a
 change of the stream's ODM split (or another display's pipes) still
-relights; MST displays relight; no DCC/compbuf or MALL/SubVP
-reprogramming beyond the default DET. The cursor matrix stays bypassed over
+relights; MST displays relight; MALL/SubVP reprogramming remains absent. The cursor matrix stays bypassed over
 YCbCr planes as dcn401 leaves it (dpp401_set_cursor_matrix), its degamma ROM
 following legacy gamma ("Plane input color"). DRM cursor planes are
 described in "Navi 48 DRM cursor planes".
@@ -5466,15 +5489,18 @@ overlays, HDMI 4:2:0, RGB565 and FP16) is answered by `harness_pstate.c`
 (check.sh) and replayed by `dcn401_pstate_matches_linux_dml21_vectors`: the
 candidate list, the chosen strategy, level and DPMM clocks, every plane's
 plan values and every stream's FAMS2 state exactly (Linux's ±1 tolerances),
-or the documented firmware pin. `pstate_strategies.txt` holds PMO's
+or the documented firmware pin (183 exact plans, 29 firmware pins).
+`pstate_strategies.txt` holds PMO's
 expanded lists (`dcn401_pstate_strategy_lists_match_linux`).
 
 The display owner applies the answer as dcn401_prepare/optimize_bandwidth.
 `ColdBoot::start_display_clocks`, once the clock owner started, writes
 `wm_range_table` to a 4-KiB VRAM range kept out of reuse, sends
-`notify_wm_ranges` and runs `deep_sleep_control`. Neither fails display
-bring-up: a table that cannot be placed is skipped (as Linux skips a
-missing `wm_range_table`), and every refusal or error is logged and kept in
+`notify_wm_ranges` and runs `deep_sleep_control`. A table that cannot be
+placed is skipped (as Linux skips a missing `wm_range_table`); firmware
+refusals and ignored sent timeouts do not fail bring-up. An interrupted or
+authority-failed watermark transaction retains an unusable clock owner,
+which subsequent preparation refuses. Every refusal or error is logged in
 `ColdBoot::display_power_policy()` (`DisplayPowerPolicy { wm_ranges,
 deep_sleep }`). `ColdBoot::converge_uclk_pstate(drr)`, from every display monitor
 pass before DRR converges, searches the running configuration (every
@@ -5548,14 +5574,12 @@ both P-state supports) and the active UCLK/FCLK floors at their lowest
 levels with the idle ones zero, every result unread; every consumer must be
 retired, and `Applied::request.displays` becomes 0. `uclk_switching()` then
 reports true, so the next configuration change pins and its `prepare`
-counts its displays and disallows switching again. Deviations: DISPCLK,
-DPPCLK and DTBCLK keep their floors (Linux lowers them to their first levels
-as well; the next `prepare` sets them again). Runtime suspend needs every
-display dark, which the monitor pass that darkened the last one follows
-with this release. S3 is entered with the displays lit: the port does not
-commit zero streams as dm_suspend does, so NumOfDisplays and the UCLK/FCLK
-policy stay the running configuration's into S3, and the resume post (power
-cycle or mode1) restarts PMFW for a fresh owner. dcn401_hardware_release
+counts its displays and disallows switching again. After the bandwidth
+sequence, DTBCLK, DISPCLK and DPPCLK hard minimums move to their first DPM
+levels, in that order. Their requested minima and actual PMFW-returned rates
+are retained separately; frequency responses and acknowledgements remain
+required. Both runtime suspend and S3 retire all streams and run this release
+before quiescing the device. dcn401_hardware_release
 (FAMS2 off, P-state support forced on) is not ported: its only caller,
 dc_hardware_release, has no caller in Linux (7.3), so Linux never runs it
 before BACO or S3.
@@ -7653,18 +7677,20 @@ them paused. User CPU mappings of VRAM are not revoked, as in Linux.
 
 System suspend (S3) uses the async system-PM phase
 (`unsafe register_system_pm()`, installed by the fb boot handoff).
-`prepare_suspend` follows amdgpu_pmops_suspend for a dGPU: every plane
-still scanning a client framebuffer out in place flips back to its staged
-back buffer and the pins retire (`release_client_scanout`, as dm_suspend's
-commit makes cleanup_fb unpin them; a display that cannot let go fails the
-suspend with `Busy`, as dm_suspend's failed commit fails
-amdgpu_device_suspend). DRM presentation is held off from that commit
-until resume or a refused suspend (`gate_presenters`, standing in for
-Linux's frozen userspace): every queued frame (`PresentSlot::next`)
-completes unshown, a frame arriving meanwhile completes at once without a
-CPU copy, and a presenter that waited for the owner drops its frame, so no
-plane takes a client framebuffer's pin back before the eviction and
-quiesce. Then it unregisters
+`prepare_suspend` follows amdgpu_pmops_suspend for a dGPU. An exclusive
+presentation gate drains queued frames, pending GEM cursor commits and local
+presenter/cursor tasks (including their WRITE-fence waits) before any display
+or heap changes. Admission/requeue checks the gate under its mailbox lock;
+a drain that cannot finish within five seconds refuses with `Busy`. The last
+shown CPU cursor image remains available for replay. Kernel framebuffer
+writers are paused before their surfaces are withdrawn. Under OWNER, the
+display monitor generation is invalidated and every retained stream stops
+through the native teardown journal (`retire_suspend_displays`), with client
+pins retired only after fetch stops. The zero-stream bandwidth release then
+lowers the clock floors. `ColdBoot::prepare_suspend` defensively refuses a
+retained stream or unfinished teardown. A failed teardown recovers before
+refusing; eviction/preflight refusal republishes the heap and restarts the
+monitor. Then suspend unregisters
 the client VRAM heap and evicts every client VRAM buffer to system memory
 (`amdgpu_gem::evict_all`, as ttm_resource_manager_evict_all, widening each
 buffer's allowed domains with GTT for the move and waiting for its jobs;
@@ -7674,8 +7700,7 @@ this walk, like pressure's `evict_visible` and `reclaim_vram`, covers
 every live buffer of the card, `CARD_OBJECTS`, including one only a
 framebuffer holds after CREATE_DUMB, ADDFB2 and closing the handle; other
 cards keep walking their opens' handle tables),
-pauses kernel boot-framebuffer writers, then quiesces exactly as recovery
-does and saves PCI state with bus mastering cleared
+then quiesces exactly as recovery does and saves PCI state with bus mastering cleared
 (`Reset::save_for_resume`). A refused eviction or preflight leaves the
 device running; a failed PCI save recovers immediately with mode1.
 `resume_from_suspend` (amdgpu_pmops_resume) restores PCI state before any
@@ -7686,8 +7711,19 @@ fresh owner as recovery does, then restores the widened domains; buffers
 stay in system memory until validation promotes them (a framebuffer's
 buffer, a dumb one included, at its next commit's
 `amdgpu_prepare_scanout`). The interrupt-gated
-device-PM handler accepts Navi48 only while the async prepare holds it
-(`system_suspended()`). Hardware unvalidated.
+device-PM handler accepts the native RX 9000 owner only while async prepare
+holds it (`system_suspended()`). Suspend/resume transitions are serialized by
+`PM_TRANSITION`. Their pinned retained future is polled inline, including by
+sync bridges; cancellation transfers unfinished work to an executor cleanup
+task. A canceled successful suspend resumes before releasing exclusion, and a
+canceled resume retains the parked owner through completion. System-PM's
+runtime reference follows the retained operation and rollback. Unsafe callers
+must retain their external ownership exclusions through that cleanup; its
+completion requires executor progress after cancellation. Hardware unvalidated.
+A detached display can change the surviving configuration's Vmin ODM topology.
+If `replan_displays` needs different pipes (`Admission(Pipes)`), the monitor
+performs the retained full relight before publishing the survivor's plan;
+it does not retain a joint admission naming the departed stream.
 S3 (and runtime) resume start from a clean quiesce (`Mode::Resume`), so
 `restart` drops that owner instead of quarantining it and returns the VRAM
 it published to the driver pool (`amdgpu_vram::Pool::reclaim_retired`:

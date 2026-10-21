@@ -867,8 +867,16 @@ impl ColdBoot {
         Ok(())
     }
     /// Prepare system suspend: the same preflight as `prepare_reset`, with
-    /// a resume-mode reset owner (PCI restore, then post or mode1).
+    /// a resume-mode reset owner (PCI restore, then post or mode1). The
+    /// platform must first commit zero streams and finish every teardown;
+    /// saving PCI state under a live display is never a valid suspend.
     pub(crate) fn prepare_suspend(&mut self) -> Result<(), Error> {
+        if self.display_retirement_busy()
+            || self.teardowns.check_idle().is_err()
+            || self.display_modesets().iter().any(Option::is_some)
+        {
+            return Err(Error::Busy);
+        }
         self.prepare_reset()?;
         let hw = &self.sequence.backend;
         // SAFETY: preparation performs no I/O; the platform establishes
@@ -1632,9 +1640,10 @@ impl ColdBoot {
     /// smu_v14_0_deep_sleep_control(true) for the default workload (narf has
     /// no power-profile or compute-profile path on Navi48, so the bootup
     /// default profile, which is not COMPUTE, is the only one). As in Linux,
-    /// nothing here fails display bring-up: a table that cannot be placed
-    /// is skipped, and refusals are logged and recorded
-    /// (`display_power_policy`). The table stays excluded from reuse.
+    /// a table that cannot be placed is skipped, and firmware refusals are
+    /// logged and recorded (`display_power_policy`). An interrupted or
+    /// authority-failed watermark transaction leaves the clock owner
+    /// unusable; subsequent preparation refuses it. The table stays excluded.
     async fn install_display_power_policy(&mut self) {
         let wm_ranges = self.notify_display_wm_ranges().await;
         if let Err(e) = wm_ranges {
@@ -2131,6 +2140,7 @@ impl ColdBoot {
         &mut self,
         pipe: u8,
         overlays: &[u8],
+        plan: &crate::amdgpu_dcn401_dml::Plan,
     ) -> Result<otg::RequestorApplied, otg::Error> {
         if self.display_retirement_busy() {
             return Err(otg::Error::Busy);
@@ -2147,6 +2157,7 @@ impl ColdBoot {
                     gmc,
                     pipe,
                     overlays,
+                    Some(plan),
                 )
                 .await
         }

@@ -1222,6 +1222,12 @@ struct Displays {
     /// A compbuf grow (dcn401_program_compbuf_segments) deferred because a
     /// DET had not acknowledged its request; the hub's, not a display's.
     compbuf_pending: bool,
+    /// Physical HUBP instances for which this owner wrote DET=0. Only these
+    /// known retirements may remain pending while an unrelated stream runs.
+    retiring_dets: u8,
+    /// A compbuf grow this owner issued after every DET acknowledged. Its
+    /// CURRENT may lag without invalidating the active DET allocations.
+    compbuf_inflight: Option<u8>,
 }
 impl Displays {
     fn new() -> Box<Self> {
@@ -1231,6 +1237,8 @@ impl Displays {
             siblings: Siblings::default(),
             color: [const { None }; 4],
             compbuf_pending: false,
+            retiring_dets: 0,
+            compbuf_inflight: None,
         })
     }
 }

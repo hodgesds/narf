@@ -14,6 +14,8 @@ use narf_lib::mutex::Mutex;
 mod fault_recovery;
 #[path = "amdgpu_navi48_platform_media.rs"]
 mod media_clients;
+#[path = "amdgpu_navi48_suspend_transition.rs"]
+mod suspend_transition;
 #[path = "amdgpu_navi48_platform_transfer.rs"]
 mod transfer;
 
@@ -450,13 +452,19 @@ pub fn system_suspended() -> bool {
 /// service as recovery does, then save PCI state and clear bus mastering.
 /// A refused eviction or preflight leaves the device running. After this,
 /// only [`resume_from_suspend`] may touch the card.
+/// The display commit stops every stream before client eviction. Dropping
+/// the future retains unfinished work in executor cleanup, then resumes an
+/// abandoned suspend; presentation stays gated until cleanup reaches safety.
+/// Normal polling does not require a separate transition task to progress.
 ///
 /// # Safety
 /// As [`recover`]: no external CPU mapping user, PCI or firmware owner may
 /// touch the card until resume. Runs from the async system-PM prepare phase.
+/// After cancellation the same exclusions persist while executor cleanup
+/// completes; a failed recovery retains the device's quarantine.
 pub async unsafe fn prepare_suspend() -> Result<(), boot::Error> {
     // SAFETY: forwarded contract.
-    unsafe { suspend_device(None) }.await
+    unsafe { suspend_device(None, None) }.await
 }
 /// Linux `amdgpu_pmops_runtime_suspend` for BACO/BAMACO after its checks:
 /// drain the rings (amdgpu_fence_wait_empty, bounded here), then
@@ -476,7 +484,7 @@ pub async unsafe fn runtime_suspend(baco: Baco) -> Result<(), boot::Error> {
         return Err(boot::Error::Busy);
     }
     // SAFETY: forwarded contract.
-    unsafe { suspend_device(Some(baco)) }.await
+    unsafe { suspend_device(Some(baco), None) }.await
 }
 /// How long runtime suspend waits for submitted jobs (the GFX job timeout).
 const RING_DRAIN_MS: u64 = 10_000;
@@ -526,13 +534,16 @@ pub(crate) fn native_display_running() -> bool {
 /// presented, so no plane takes a client framebuffer (and its pin) back
 /// while VRAM is evicted, as Linux has userspace frozen meanwhile.
 static PRESENT_GATED: AtomicBool = AtomicBool::new(false);
+/// The operation retains the transition even if its caller cancels.
+/// Resume waits for suspend/rollback before taking the parked owner.
+static PM_TRANSITION: Mutex<()> = Mutex::new(());
 /// Hold DRM presentation off (`gate`) or let it run again. Holding it off
 /// completes every queued frame without showing it (its event fires; its
 /// framebuffers never show), as its commit is dropped.
 fn gate_presenters(gate: bool) {
     PRESENT_GATED.store(gate, Ordering::Release);
     if !gate {
-        kick_presenters();
+        kick_display_clients();
         return;
     }
     for display in 0..PRESENT.len() as u8 {
@@ -541,6 +552,13 @@ fn gate_presenters(gate: bool) {
             complete_flip(display, frame.ticket, None);
         }
     }
+    for slot in &DRM_CURSORS {
+        gate_cursor(slot);
+    }
+}
+fn kick_display_clients() {
+    kick_presenters();
+    kick_drm_cursors();
 }
 /// The S3 and runtime suspend shared by amdgpu_device_prepare and
 /// amdgpu_device_suspend; `baco` selects the runtime form. DRM
@@ -549,17 +567,45 @@ fn gate_presenters(gate: bool) {
 ///
 /// # Safety
 /// As [`prepare_suspend`].
-async unsafe fn suspend_device(baco: Option<Baco>) -> Result<(), boot::Error> {
-    if SUSPENDED.lock().is_some() || PRESENT_GATED.load(Ordering::Acquire) {
-        return Err(boot::Error::Busy);
-    }
+async unsafe fn suspend_device(
+    baco: Option<Baco>,
+    reference: Option<SystemPmReference>,
+) -> Result<(), boot::Error> {
+    let gate = suspend_transition::Gate::claim(&PRESENT_GATED, kick_display_clients)
+        .ok_or(boot::Error::Busy)?;
     gate_presenters(true);
-    // SAFETY: forwarded contract.
-    let result = unsafe { suspend_gated(baco) }.await;
-    if result.is_err() {
-        gate_presenters(false);
-    }
-    result
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let observe = cancelled.clone();
+    let operation = async move {
+        let _transition = PM_TRANSITION.lock().await;
+        if observe.load(Ordering::Acquire) {
+            return Err(boot::Error::Busy);
+        }
+        // SAFETY: the caller transfers its exclusions to the retained
+        // operation; cancellation requests rollback without cancelling MMIO.
+        let result = unsafe { suspend_gated(baco) }.await;
+        if result.is_ok() {
+            if observe.load(Ordering::Acquire) {
+                // Resume now owns the parked gate. Do not let this guard's
+                // later Drop clear a newer transition's gate after resume
+                // has enabled presentation again.
+                gate.park();
+                // SAFETY: this operation parked the device and holds the
+                // transition mutex; the system has not entered S3/D3.
+                let _ = unsafe { resume_gated(baco.is_some()) }.await;
+            } else {
+                gate.park();
+                if let Some(reference) = reference {
+                    reference.park();
+                }
+            }
+        }
+        result
+    };
+    suspend_transition::Retained::new(operation, cancelled, |cleanup| {
+        narf_scheduler::spawn(cleanup);
+    })
+    .await
 }
 /// `suspend_device` with presentation held off.
 ///
@@ -570,22 +616,50 @@ async unsafe fn suspend_gated(baco: Option<Baco>) -> Result<(), boot::Error> {
         return Err(boot::Error::Busy);
     }
     let card = boot::ColdBoot::drm_card().ok_or(boot::Error::Invalid)?;
-    // dm_suspend's commit before amdgpu_device_evict_resources: no plane
-    // keeps scanning out a client framebuffer, so cleanup_fb unpins them
-    // and the eviction moves them too. A display that cannot let go fails
-    // the suspend, as dm_suspend's failed commit fails amdgpu_device_suspend.
+    // A presenter or cursor task may hold a client pin outside its mailbox
+    // while waiting for WRITE fences or OWNER. Eviction must not skip those
+    // temporary pins. Refuse before changing display/heap state if it cannot
+    // drain.
+    if !drain_display_clients().await {
+        return Err(boot::Error::Busy);
+    }
+    // drm_atomic_helper_suspend's disable commit (dm_cache_state): stop
+    // every stream, without exposing the presenter's old staged buffer.
+    // Stop console writers before withdrawing/releasing their surfaces.
+    let pause_console = baco.is_none();
+    if pause_console {
+        console(true);
+    }
+    let restart_display = DISPLAY_GENERATION.load(Ordering::Acquire) != 0;
     {
         let mut owner = OWNER.lock().await;
-        if let Some(boot) = owner.as_mut() {
-            // SAFETY: OWNER is held; the caller's suspend obligations.
-            if !unsafe { release_client_scanout(boot) }.await {
-                use core::fmt::Write as _;
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "amdgpu: navi48 suspend refused: a display still scans out a client framebuffer"
-                );
-                return Err(boot::Error::Busy);
+        // Invalidate the monitor only under OWNER, after any old pass
+        // finished and before the first teardown await releases the CPU.
+        if restart_display {
+            DISPLAY_GENERATION.fetch_add(1, Ordering::AcqRel);
+        }
+        let result = match owner.as_mut() {
+            // SAFETY: OWNER and the PM gate exclude display producers.
+            Some(boot) => unsafe { retire_suspend_displays(boot) }.await,
+            None => Err(ModesetError::Boot(boot::Error::Busy)),
+        };
+        if let Err(error) = result {
+            // A failed native step can retain an in-flight hardware guard;
+            // resetting reconciles that journal rather than relighting over
+            // it. Recovery retains the old owner/pins if it also fails.
+            drop(owner);
+            // SAFETY: prepare_suspend's exclusions include recover's.
+            let recovered = unsafe { recover() }.await;
+            if recovered.is_ok() && pause_console {
+                console(false);
             }
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi48 suspend display retirement {error:?}; recovery {:?}",
+                recovered.as_ref().map(|_| ())
+            );
+            return Err(boot::Error::Busy);
         }
     }
     // No new VRAM placement while the old ones leave.
@@ -597,23 +671,30 @@ async unsafe fn suspend_gated(baco: Option<Baco>) -> Result<(), boot::Error> {
     let republish = || async {
         if let Some(boot) = OWNER.lock().await.as_ref() {
             boot.republish_client_vram();
+            if restart_display {
+                // SAFETY: the same externally excluded owner is still up;
+                // its retained stream witnesses describe completed stops.
+                unsafe {
+                    spawn_display_monitor(boot::Configuration {
+                        displays: boot.display_modesets().into_iter().flatten().collect(),
+                        failed: None,
+                    })
+                };
+            }
         }
     };
     if let Err(error) = evicted {
         crate::amdgpu_gem::restore_domains(domains);
         republish().await;
+        if pause_console {
+            console(false);
+        }
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
             "amdgpu: navi48 suspend refused: VRAM eviction {error:?}"
         );
         return Err(boot::Error::Busy);
-    }
-    // amdgpu_device_suspend's drm_client_dev_suspend only for system
-    // suspend: runtime PM never suspends under a console on this GPU.
-    let pause_console = baco.is_none();
-    if pause_console {
-        console(true);
     }
     let mut owner = OWNER.lock().await;
     // SAFETY: forwarded caller contract; client VRAM is empty.
@@ -706,6 +787,19 @@ pub async unsafe fn runtime_resume() -> Result<boot::Report, boot::Error> {
     unsafe { resume_device(true) }.await
 }
 async unsafe fn resume_device(runtime: bool) -> Result<boot::Report, boot::Error> {
+    let operation = async move {
+        let _transition = PM_TRANSITION.lock().await;
+        // SAFETY: resume's caller transfers its exclusions to the retained
+        // operation, so dropping the wait cannot drop the hardware owner.
+        unsafe { resume_gated(runtime) }.await
+    };
+    suspend_transition::Retained::new(operation, Arc::new(AtomicBool::new(false)), |cleanup| {
+        narf_scheduler::spawn(cleanup);
+    })
+    .await
+}
+/// Resume while the retained operation holds PM_TRANSITION.
+async unsafe fn resume_gated(runtime: bool) -> Result<boot::Report, boot::Error> {
     let mut suspended = {
         let mut parked = SUSPENDED.lock();
         if parked.as_ref().is_none_or(|s| s.baco.is_some() != runtime) {
@@ -755,33 +849,60 @@ async unsafe fn resume_device(runtime: bool) -> Result<boot::Report, boot::Error
     }
     result
 }
+/// device_prepare's reference follows its retained suspend through a
+/// cancellation rollback. Only an accepted suspend hands it to resume.
+struct SystemPmReference {
+    held: bool,
+}
+impl SystemPmReference {
+    fn park(mut self) {
+        self.held = false;
+    }
+}
+impl Drop for SystemPmReference {
+    fn drop(&mut self) {
+        if self.held {
+            crate::amdgpu_navi48_runtime_pm::system_complete();
+        }
+    }
+}
 struct SystemPm;
 impl narf_power::system_pm::AsyncSystemPm for SystemPm {
     fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
         alloc::boxed::Box::pin(async {
             // device_prepare: a runtime-PM reference for the transition,
             // resuming a runtime-suspended card first (pci_pm_prepare).
+            let reference = SystemPmReference { held: true };
             crate::amdgpu_navi48_runtime_pm::system_prepare().await;
             // SAFETY: register_system_pm's caller accepted the contract.
-            let result = unsafe { prepare_suspend() }
+            unsafe { suspend_device(None, Some(reference)) }
                 .await
-                .map_err(|_| narf_power::device_pm::DeviceSuspendError::Busy);
-            if result.is_err() {
-                crate::amdgpu_navi48_runtime_pm::system_complete();
-            }
-            result
+                .map_err(|_| narf_power::device_pm::DeviceSuspendError::Busy)
         })
     }
     fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
         alloc::boxed::Box::pin(async {
+            let reference = SystemPmReference { held: true };
             // SAFETY: as above.
-            let result = unsafe { resume_from_suspend() }
-                .await
-                .map(|_| ())
-                .map_err(|_| narf_power::device_pm::DeviceSuspendError::DriverError);
-            // device_complete: drop the transition's runtime-PM reference.
-            crate::amdgpu_navi48_runtime_pm::system_complete();
-            result
+            // Retain device_complete together with resume: cancellation
+            // cannot release its reference before the hardware is restored.
+            let operation = async move {
+                let _reference = reference;
+                // SAFETY: register_system_pm accepted resume's exclusions;
+                // the retained operation keeps them through cancellation.
+                unsafe { resume_from_suspend() }
+                    .await
+                    .map(|_| ())
+                    .map_err(|_| narf_power::device_pm::DeviceSuspendError::DriverError)
+            };
+            suspend_transition::Retained::new(
+                operation,
+                Arc::new(AtomicBool::new(false)),
+                |cleanup| {
+                    narf_scheduler::spawn(cleanup);
+                },
+            )
+            .await
         })
     }
 }
@@ -3830,7 +3951,7 @@ fn scans_client_buffers(display: u8) -> bool {
     !present_slot(display).pins.lock().is_empty()
 }
 
-/// What dm_suspend's (and drm_fb_helper's lastclose) commit does to a
+/// What drm_fb_helper's lastclose commit does to a
 /// framebuffer scanned out in place: the plane stops showing it, so
 /// cleanup_fb unpins it. Every display still fetching a pinned client
 /// framebuffer flips those planes back to their staged back buffers
@@ -3916,10 +4037,32 @@ impl PresentSlot {
             pins: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
         }
     }
+    /// The mailbox lock pairs with both admission checks and the gate's
+    /// drain. A presenter that has taken a local Frame still has its active
+    /// flag set; no new pinned frame can enter while the PM gate is held.
+    fn drained(&self) -> bool {
+        let next = self.next.lock();
+        !self.presenting.load(Ordering::Acquire) && next.is_none()
+    }
 }
 static PRESENT: [PresentSlot; 4] = [const { PresentSlot::new() }; 4];
 fn present_slot(display: u8) -> &'static PresentSlot {
     &PRESENT[usize::from(display).min(PRESENT.len() - 1)]
+}
+
+async fn drain_display_clients() -> bool {
+    let deadline = narf_time::Deadline::after_ms(5_000);
+    loop {
+        if PRESENT.iter().all(PresentSlot::drained)
+            && DRM_CURSORS.iter().all(|slot| slot.lock().drained())
+        {
+            return true;
+        }
+        if deadline.expired() {
+            return false;
+        }
+        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
+    }
 }
 
 /// One plane's DRM framebuffer: a kernel-mapped dumb buffer, or (`bo`) an
@@ -4261,6 +4404,14 @@ pub fn present_planes(
     let slot = present_slot(display);
     {
         let mut next = slot.next.lock();
+        // Serialize admission with gate_presenters' drain. A caller that
+        // passed the first check just before suspend must not leave an old
+        // frame in the mailbox to be shown after resume.
+        if PRESENT_GATED.load(Ordering::Acquire) {
+            drop(next);
+            complete_flip(display, ticket, None);
+            return true;
+        }
         let frame = Frame {
             primary,
             overlays,
@@ -4311,6 +4462,10 @@ async fn presenter(display: u8) {
             }
             return;
         };
+        if PRESENT_GATED.load(Ordering::Acquire) {
+            complete_flip(display, frame.ticket, None);
+            continue;
+        }
         if !slot.native.load(Ordering::Acquire) {
             complete_flip(display, frame.ticket, None);
             continue;
@@ -4321,6 +4476,11 @@ async fn presenter(display: u8) {
         if planes_pending(display) && waited < PLANES_WAIT_NS {
             {
                 let mut next = slot.next.lock();
+                if PRESENT_GATED.load(Ordering::Acquire) {
+                    drop(next);
+                    complete_flip(display, frame.ticket, None);
+                    continue;
+                }
                 *next = Some(match next.take() {
                     Some(newer) => frame.merged(newer),
                     None => frame,
@@ -4410,6 +4570,7 @@ async fn wait_scanout_writes(frame: &Frame) {
             .fences(narf_filesystem::dma_buf::DmaResvUsage::Write)
             .is_empty()
             && !deadline.expired()
+            && !PRESENT_GATED.load(Ordering::Acquire)
         {
             narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
         }
@@ -4789,9 +4950,19 @@ impl DrmCursor {
         dirty: false,
         running: false,
     };
+    fn drained(&self) -> bool {
+        !self.running && self.pending.is_none()
+    }
 }
 static DRM_CURSORS: [narf_lib::sync::IrqSafeSpinLock<DrmCursor>; 4] =
     [const { narf_lib::sync::IrqSafeSpinLock::new(DrmCursor::OFF) }; 4];
+fn gate_cursor(slot: &narf_lib::sync::IrqSafeSpinLock<DrmCursor>) {
+    // A pending commit was never shown; keep the previous CPU image for
+    // replay, but let eviction move the pending framebuffer too. A task's
+    // clone stays pinned until the gated task drains.
+    let pending = slot.lock().pending.take();
+    drop(pending);
+}
 /// Displays (by bit) whose cursor DRM drives: the console's stays off them.
 static DRM_CURSOR_OWNED: AtomicU8 = AtomicU8::new(0);
 /// Displays whose cursor DRM let go of: the console uploads its pointer
@@ -4827,10 +4998,14 @@ pub fn request_display_cursor_content(
     let Some(slot) = DRM_CURSORS.get(usize::from(display)) else {
         return false;
     };
-    DRM_CURSOR_OWNED.fetch_or(1 << display, Ordering::AcqRel);
-    CONSOLE_CURSOR_STALE.fetch_and(!(1 << display), Ordering::AcqRel);
     let spawn = {
         let mut c = slot.lock();
+        // Pair admission with gate_presenters' pending-pin drain.
+        if PRESENT_GATED.load(Ordering::Acquire) {
+            return true;
+        }
+        DRM_CURSOR_OWNED.fetch_or(1 << display, Ordering::AcqRel);
+        CONSOLE_CURSOR_STALE.fetch_and(!(1 << display), Ordering::AcqRel);
         match content {
             Some(CursorContent::Gem(gem)) => c.pending = Some((gem, position)),
             Some(CursorContent::Image(image)) => {
@@ -4860,10 +5035,29 @@ pub fn request_display_cursor_content(
 fn release_drm_cursors() {
     let owned = DRM_CURSOR_OWNED.swap(0, Ordering::AcqRel);
     for display in (0..DRM_CURSORS.len() as u8).filter(|d| owned & (1 << d) != 0) {
-        let spawn = {
+        let (spawn, pending) = {
             let mut c = DRM_CURSORS[usize::from(display)].lock();
             c.image = None;
             c.upload = false;
+            c.dirty = true;
+            let pending = c.pending.take();
+            (!core::mem::replace(&mut c.running, true), pending)
+        };
+        drop(pending);
+        if spawn {
+            narf_scheduler::spawn(drm_cursor_task(display));
+        }
+    }
+}
+
+/// Replay the last shown CPU image after a refused suspend or a fresh
+/// display owner. Pending GEM commits were dropped while gated.
+fn kick_drm_cursors() {
+    let owned = DRM_CURSOR_OWNED.load(Ordering::Acquire);
+    for display in (0..DRM_CURSORS.len() as u8).filter(|d| owned & (1 << d) != 0) {
+        let spawn = {
+            let mut c = DRM_CURSORS[usize::from(display)].lock();
+            c.upload |= c.image.is_some();
             c.dirty = true;
             !core::mem::replace(&mut c.running, true)
         };
@@ -4883,7 +5077,7 @@ async fn drm_cursor_task(display: u8) {
     loop {
         let pending = {
             let mut c = slot.lock();
-            if !c.dirty {
+            if PRESENT_GATED.load(Ordering::Acquire) || !c.dirty {
                 c.running = false;
                 return;
             }
@@ -4900,8 +5094,12 @@ async fn drm_cursor_task(display: u8) {
                 .fences(narf_filesystem::dma_buf::DmaResvUsage::Write)
                 .is_empty()
                 && !deadline.expired()
+                && !PRESENT_GATED.load(Ordering::Acquire)
             {
                 narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
+            }
+            if PRESENT_GATED.load(Ordering::Acquire) {
+                continue;
             }
             let image = gem.read();
             let mut c = slot.lock();
@@ -4920,6 +5118,9 @@ async fn drm_cursor_task(display: u8) {
             }
         }
         let mut owner = OWNER.lock().await;
+        if PRESENT_GATED.load(Ordering::Acquire) {
+            continue;
+        }
         if let Some(boot) = owner.as_mut() {
             // SAFETY: serialized retained owner; the platform excludes
             // other display writers while OWNER is held.
@@ -5769,6 +5970,9 @@ pub fn restore_displays() {
     // clients' framebuffers (their pins go after it latches).
     narf_scheduler::spawn(async {
         let mut owner = OWNER.lock().await;
+        if PRESENT_GATED.load(Ordering::Acquire) {
+            return;
+        }
         if let Some(boot) = owner.as_mut() {
             // SAFETY: OWNER serializes display writers.
             let _ = unsafe { release_client_scanout(boot) }.await;
@@ -5908,6 +6112,33 @@ async unsafe fn retire_monitored_display(
     Ok(())
 }
 
+/// Suspend's zero-stream commit, using the same retained startup witnesses
+/// and teardown journal as KMS disable. Retire pins only after a completed
+/// native stop proves that no HUBP can fetch the client buffer again.
+/// # Safety
+/// OWNER is held, presenters and the monitor are excluded, CPU console
+/// writers are paused (or runtime PM proved none), and the caller retains
+/// the device through rollback/resume.
+async unsafe fn retire_suspend_displays(boot: &mut boot::ColdBoot) -> Result<(), ModesetError> {
+    let mut displays = Displays {
+        generation: DISPLAY_GENERATION.load(Ordering::Acquire),
+        epoch: recoveries(),
+        lit: [None; 4],
+        considered: 0,
+    };
+    boot.restore_modesets(&mut displays.lit)?;
+    for k in 0..displays.lit.len() {
+        let Some(m) = displays.lit[k] else { continue };
+        let unplugged = boot.display_hpd(m.selection.port) == Ok(false);
+        // SAFETY: forwarded exclusion and retained-owner obligations.
+        unsafe { retire_monitored_display(boot, &mut displays, k as u8, unplugged) }.await?;
+        retire_scanout_pins(boot, k as u8);
+    }
+    boot.release_display_bandwidth().await?;
+    retire_all_scanout_pins(boot);
+    Ok(())
+}
+
 /// One monitor pass over every output: tear down displays DRM switched
 /// off or whose sink left, retrain lost links, and relight the whole
 /// configuration when a sink appears (or a CRTC returns) or a running
@@ -5921,7 +6152,9 @@ pub async unsafe fn monitor_displays(
     let mut steps = Vec::new();
     let mut owner = OWNER.lock().await;
     let boot = owner.as_mut().ok_or(ModesetError::Boot(BootError::Busy))?;
-    if displays.generation != DISPLAY_GENERATION.load(Ordering::Acquire) {
+    if displays.generation != DISPLAY_GENERATION.load(Ordering::Acquire)
+        || PRESENT_GATED.load(Ordering::Acquire)
+    {
         return Ok(steps);
     }
     if displays.epoch != recoveries() {
@@ -6281,6 +6514,34 @@ pub async unsafe fn monitor_displays(
         .enumerate()
         .filter(|(_, m)| m.is_some())
         .fold(0u8, |acc, (k, _)| acc | 1 << k);
+    if retired_now && lit_mask != 0 && !relight {
+        // Replan before deciding between seamless update and full relight.
+        // A smaller configuration can select a different Vmin ODM factor;
+        // its surviving stream must retire and acquire that new topology.
+        // Keeping its old joint plan would also prevent P-state convergence.
+        // SAFETY: as above; the running displays stay lit and published.
+        match unsafe { boot.replan_displays() }.await {
+            Ok(running) => {
+                let mut outputs = OUTPUTS.lock();
+                for m in &running {
+                    if let Some(c) = outputs.crtcs.get_mut(usize::from(m.crtc)) {
+                        c.admitted = Some((m.plan.soc, m.plan.mode));
+                    }
+                }
+                drop(outputs);
+                let count = running.len() as u8;
+                for m in running {
+                    displays.lit[usize::from(m.crtc)] = Some(m);
+                }
+                steps.push(MonitorStep::Replanned(count));
+            }
+            Err(ModesetError::Display(crate::amdgpu_dcn401_otg::Error::Admission(
+                dml::Error::Pipes,
+            ))) => relight = true,
+            Err(ModesetError::Display(crate::amdgpu_dcn401_otg::Error::Admission(_))) => {}
+            Err(e) => return Err(e),
+        }
+    }
     // A sink plugged into a port with no display: probed beside the
     // running displays even when its CRTC is off (its connector's EDID and
     // modes), never a relight of the others.
@@ -6411,29 +6672,6 @@ pub async unsafe fn monitor_displays(
                 .fold(0, |acc, (k, _)| acc | 1 << k);
         }
         steps.push(MonitorStep::Relit(count));
-    } else if retired_now && lit_mask != 0 {
-        // A display left the others running: they move to the smaller
-        // configuration's plans in place, its clocks lowered after. A
-        // configuration DML no longer admits as planned stays as it is.
-        // SAFETY: as above; the running displays stay lit and published.
-        match unsafe { boot.replan_displays() }.await {
-            Ok(running) => {
-                let mut outputs = OUTPUTS.lock();
-                for m in &running {
-                    if let Some(c) = outputs.crtcs.get_mut(usize::from(m.crtc)) {
-                        c.admitted = Some((m.plan.soc, m.plan.mode));
-                    }
-                }
-                drop(outputs);
-                let count = running.len() as u8;
-                for m in running {
-                    displays.lit[usize::from(m.crtc)] = Some(m);
-                }
-                steps.push(MonitorStep::Replanned(count));
-            }
-            Err(ModesetError::Display(crate::amdgpu_dcn401_otg::Error::Admission(_))) => {}
-            Err(e) => return Err(e),
-        }
     }
     if !steps.is_empty() {
         publish_outputs();
@@ -6931,6 +7169,103 @@ pub async fn poll_interrupts() -> Result<crate::amdgpu_ih7::Batch, boot::Error> 
 mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn navi48_presenter_drain_requires_no_local_or_queued_frame() -> TestResult {
+        let slot = PresentSlot::new();
+        assert!(slot.drained());
+        slot.presenting.store(true, Ordering::Release);
+        assert!(!slot.drained());
+        slot.presenting.store(false, Ordering::Release);
+        *slot.next.lock() = Some(Frame {
+            primary: None,
+            overlays: core::array::from_fn(|_| None),
+            ticket: None,
+            queued_ns: 0,
+        });
+        assert!(!slot.drained());
+        slot.presenting.store(true, Ordering::Release);
+        let local = slot.next.lock().take();
+        assert!(!slot.drained());
+        drop(local);
+        slot.presenting.store(false, Ordering::Release);
+        assert!(slot.drained());
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi48-pm",
+        navi48_presenter_drain_requires_no_local_or_queued_frame
+    );
+
+    fn navi48_cursor_gate_retires_pending_and_local_task_pins() -> TestResult {
+        use crate::amdgpu_gem::{GemState, VramHeap};
+        const CARD: u32 = 0xfeec;
+        struct Registered;
+        impl Drop for Registered {
+            fn drop(&mut self) {
+                crate::amdgpu_gem::unregister_vram_heap(CARD);
+            }
+        }
+        let mut memory = alloc::vec![0u8; 4 * 4096];
+        let map = narf_bus::MmioRegion {
+            phys: narf_memory::PhysAddr::new(0xb700_0000),
+            virt: memory.as_mut_ptr() as u64,
+            len: memory.len() as u64,
+            kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+        };
+        // SAFETY: test RAM lives beyond all BOs, pins and the registered heap.
+        let pool =
+            unsafe { crate::amdgpu_vram::Pool::from_owned_range(map, 0x8_0000_0000) }.unwrap();
+        crate::amdgpu_gem::register_vram_heap(
+            CARD,
+            VramHeap {
+                pool,
+                fb_base: 0x8_0000_0000,
+                fb_offset: 0x9_0000_0000,
+                unmapped: None,
+            },
+        );
+        let _registered = Registered;
+        let gem = GemState::for_card(CARD);
+        let (handle, pitch, _) = gem.create_dumb(64, 64, 32).unwrap();
+        let object = gem.object(handle).unwrap();
+        let image = Arc::new(CursorImage {
+            width: 1,
+            height: 1,
+            pixels: alloc::vec![0xffff_ffff],
+        });
+        let slot = narf_lib::sync::IrqSafeSpinLock::new(DrmCursor {
+            image: Some(image.clone()),
+            pending: Some((
+                GemCursor {
+                    pin: Arc::new(object.pin_scanout().unwrap()),
+                    offset: 0,
+                    pitch,
+                    width: 64,
+                    height: 64,
+                },
+                (10, 20),
+            )),
+            running: true,
+            ..DrmCursor::OFF
+        });
+        let task = slot.lock().pending.clone();
+        gate_cursor(&slot);
+        {
+            let c = slot.lock();
+            assert!(c.pending.is_none() && !c.drained());
+            assert_eq!(c.image.as_deref(), Some(image.as_ref()));
+        }
+        assert!(object.pinned());
+        drop(task);
+        assert!(!object.pinned());
+        slot.lock().running = false;
+        assert!(slot.lock().drained());
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi48-pm",
+        navi48_cursor_gate_retires_pending_and_local_task_pins
+    );
 
     fn hd() -> Timing {
         Timing {

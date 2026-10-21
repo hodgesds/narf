@@ -4724,3 +4724,106 @@ kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_mst_selects_new_streams_beside_running_ones
 );
+
+/// Exact Linux DML21 DET allocations (plane_vectors.txt's two final
+/// inputs). Removing a low-pixel-rate stream's overlay switches from the
+/// global fallback to per-stream DET budgets, so its sibling grows.
+fn navi48_live_plane_det_reallocation_releases_budget_before_growth() -> TestResult {
+    let soc = dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [2_500_000; 2],
+        dcfclk_khz: [1_564_000; 2],
+        socclk_khz: 1_200_000,
+        dispclk_max_khz: 2_000_000,
+        dppclk_max_khz: 2_000_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    let low = mode(Timing {
+        pixel_clock_khz: 148_500,
+        h_active: 1920,
+        h_total: 2200,
+        h_front_porch: 88,
+        h_sync_width: 44,
+        v_active: 1080,
+        v_total: 1125,
+        v_front_porch: 4,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: true,
+    });
+    let high = mode(Timing {
+        pixel_clock_khz: 1_188_000,
+        h_active: 3840,
+        h_total: 4000,
+        h_front_porch: 48,
+        h_sync_width: 32,
+        v_active: 2160,
+        v_total: 2310,
+        v_front_porch: 3,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: true,
+    });
+    let mut overlay = low;
+    overlay.planes[1] = Some(dml::Plane::full(&low.timing, low.pitch, 4));
+    let old = dml::admit_native(&soc, &[overlay, high]).unwrap();
+    let new = dml::admit_native(&soc, &[low, high]).unwrap();
+    let segments = |p: &dml::Plan| -> u32 {
+        p.planes
+            .iter()
+            .flatten()
+            .map(|p| p.det_bytes / 65_536 * u32::from(p.dpps))
+            .sum::<u32>()
+    };
+    assert_eq!(old.iter().map(segments).collect::<Vec<_>>(), [4, 16]);
+    assert_eq!(new.iter().map(segments).collect::<Vec<_>>(), [2, 17]);
+    // The old sibling-first order would request all 21 segments as DET,
+    // leaving no COMPBUF, and refuse a valid plane removal.
+    assert_eq!(segments(&old[0]) + segments(&new[1]), 21);
+    for (before, after, expected) in [(&old, &new, [0, 1]), (&new, &old, [1, 0])] {
+        let order = det_update_order(before, after);
+        assert_eq!(order, expected);
+        let mut used: u32 = before.iter().map(segments).sum();
+        for i in order {
+            used = used - segments(&before[i]) + segments(&after[i]);
+            assert!(used <= 20, "intermediate DET exceeds the 1280 KiB pool");
+        }
+        assert_eq!(used, after.iter().map(segments).sum::<u32>());
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_live_plane_det_reallocation_releases_budget_before_growth
+);
+
+fn navi48_detach_replans_single_dp_stream_with_vmin_topology() -> TestResult {
+    let mut retained = alloc::boxed::Box::new(completed_modeset(0));
+    let mut soc = retained.plan.soc;
+    soc.umc_channels = 16;
+    soc.uclk_khz = 1_250_000;
+    soc.fclk_khz = [2_500_000; 2];
+    soc.dcfclk_khz = [1_564_000; 2];
+    soc.dispclk_max_khz = 2_000_000;
+    soc.dppclk_max_khz = 2_000_000;
+    let mut stream = mode(big_timing(1_188_000, 3840, 2160, 2310));
+    stream.timing.h_total = 4000;
+    let joint = dml::admit_native(&soc, &[stream; 2]).unwrap();
+    assert_eq!(joint[0].pipes, 1);
+    assert_eq!(joint[1].pipes, 1);
+    retained.plan = joint[0];
+    retained.scanout.plan = joint[0];
+    let survivor = dml::admit_native(&soc, &[stream]).unwrap();
+    assert_eq!(survivor[0].pipes, 2);
+    assert_eq!(survivor[0].joint_modes(), [stream]);
+    // transition_running rejects this at its Admission(Pipes) preflight;
+    // the monitor must retire/relight rather than swallow that refusal.
+    assert!(!keeps_pipes(&retained, &survivor[0]));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_detach_replans_single_dp_stream_with_vmin_topology
+);

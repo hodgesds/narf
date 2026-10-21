@@ -354,32 +354,6 @@ impl<I: Io> Engine<I> {
         }
         self.update(self.dpp_control(q), DPP_CLOCK_ENABLE, DPP_CLOCK_ENABLE)
     }
-    /// The default DET for each pipe of `pipes` (dcn401_program_det_segments)
-    /// from the compressed buffer, shrinking it first. Returns the CRB.
-    async fn grant_dets(&mut self, pipes: u8) -> Result<[u8; 5], Error> {
-        use super::requestor::{DET_SEGMENTS, SEGMENTS};
-        let mut sizes = self.crb_stable()?;
-        let mut target = sizes;
-        // DET{n} is HUBP n's (program_det_segments(hubp->inst)).
-        let l = self.layout;
-        for p in l.pool.pipes().filter(|&p| pipes & bit(p) != 0) {
-            target[usize::from(l.inst(p)) + 1] = DET_SEGMENTS;
-        }
-        let dets: u32 = target[1..].iter().map(|&n| u32::from(n)).sum();
-        let room = u32::from(SEGMENTS)
-            .checked_sub(dets)
-            .ok_or(Error::Unsupported)?;
-        target[0] = target[0].min(room as u8);
-        for grow in [false, true] {
-            for index in 0..5 {
-                if sizes[index] == target[index] || (target[index] > sizes[index]) != grow {
-                    continue;
-                }
-                self.resize_crb(&mut sizes, index, target[index]).await?;
-            }
-        }
-        Ok(sizes)
-    }
     /// Pipe `m`'s share of plane `a`'s composition as prepare_mpc stages it
     /// (mpc_full: the MPCC's blending, gains and background, stereo off, its
     /// color blocks in bypass, the output stage of its OPP index), its
@@ -418,6 +392,7 @@ impl<I: Io> Engine<I> {
         let l = self.layout;
         let pipe = c.new.pipe;
         self.lock(pipe).await?;
+        let target = self.requestor_allocation(self.status.requestor.ok_or(Error::Invalid)?)?;
         if let Some(sync) = c.sync {
             self.global_sync_writes(sync, false)?;
         }
@@ -442,6 +417,7 @@ impl<I: Io> Engine<I> {
             self.update(l.hubp(q, CURSOR), 1, 0)?;
             self.update(self.cm(q, CM_CURSOR), 1, 0)?;
         }
+        self.program_dets(target)?;
         for k in 0..c.planes.len() {
             let p = &c.planes[k];
             if p.changed {
@@ -658,16 +634,6 @@ impl Surfaces {
             .iter()
             .map(|s| s.geometry())
             .collect::<Result<_, _>>()?;
-        // Linear RGB stores one row per swath; leave room for at least two
-        // in the default DET (as prepare_requestor_planes).
-        let det =
-            u64::from(super::requestor::DET_SEGMENTS) * u64::from(super::requestor::SEGMENT_BYTES);
-        if geometry
-            .iter()
-            .any(|&(pitch, _)| u64::from(pitch) * 2 > det)
-        {
-            return Err(Error::Unsupported);
-        }
         let current = owners()?;
         let config = current.1;
         let refclk = e.dchub_refclk_khz(crystal_khz)?;
@@ -690,7 +656,10 @@ impl Surfaces {
             pipe,
             surface,
             overlays,
-            det_bytes: u32::from(super::requestor::DET_SEGMENTS) * super::requestor::SEGMENT_BYTES,
+            det_bytes: plan.det_bytes,
+            overlay_det_bytes: core::array::from_fn(|k| {
+                plan.plane(k + 1).map_or(0, |p| p.det_bytes)
+            }),
             compbuf_bytes: u32::from(compbuf) * super::requestor::SEGMENT_BYTES,
             pixel_chunk_bytes: 8192,
             minimum_chunk_bytes: 1024,
@@ -902,11 +871,8 @@ impl Surfaces {
                 }
                 e.enable_free_pipe(q, pipe, config).await?;
             }
-            let crb = if enabled != 0 {
-                e.grant_dets(enabled).await?
-            } else {
-                e.crb_stable()?
-            };
+            let crb = e.requestor_allocation(requestor(applied[0], new_overlays, 0))?;
+            e.prepare_det_space(crb).await?;
             // The display's records name the new planes from now on.
             let old_slots = core::iter::once(a.surface)
                 .chain(a.overlays.iter().flatten().copied())
@@ -932,6 +898,7 @@ impl Surfaces {
             }
             e.status.requestor = Some(requestor(applied[0], new_overlays, crb[0]));
             e.apply_planes(&mut change, plan).await?;
+            e.settle_active_dets(crb).await?;
             for p in &change.planes {
                 let k = usize::from(p.applied.request.pipe);
                 e.status.dpps[k] = Some(p.dpp);
@@ -949,6 +916,8 @@ impl Surfaces {
             // update as Linux; a grow a slow DET deferred is retried here
             // and by `retry_compbuf`.
             let crb = e.increase_compbuf().await?;
+            e.settle_compbuf_minimum(plan.arbiter.compbuf_segments)
+                .await?;
             e.status.requestor = Some(requestor(applied[0], new_overlays, crb[0]));
             // Every record of the timing carries the new sync.
             e.status.rebind_timing(pipe, |t| t.request.sync = plan.sync);

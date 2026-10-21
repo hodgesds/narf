@@ -86,6 +86,10 @@ struct ScanIo {
     /// Further pipes (by bit) whose planes latch with `pipe`'s timing: a
     /// live display's overlays.
     extra: u8,
+    /// DET retirements can outlive a VUPDATE. Active DET changes may be
+    /// modeled as double buffered, so a pre-unlock wait cannot succeed.
+    det_stall: u8,
+    det_on_latch: bool,
 }
 impl ScanIo {
     fn get(&mut self, at: u64) -> u32 {
@@ -107,6 +111,11 @@ impl ScanIo {
         }
     }
     fn latch_pipe(&mut self, p: u8) {
+        if self.det_on_latch && self.det_stall & (1 << p) == 0 {
+            let at = BASE + (0x4bb + u64::from(p)) * 4;
+            let value = self.get(at);
+            self.put(at, (value & !0x1f00) | (value & 0x1f) << 8);
+        }
         let low = self.get(h(p, ADDRESS));
         let high = self.get(h(p, ADDRESS_HIGH));
         self.put(h(p, EARLIEST_INUSE), low);
@@ -212,7 +221,16 @@ impl Io for ScanIo {
         // The CRB's DET and COMPBUF requests are acknowledged at once
         // (their CURRENT fields follow).
         if (BASE + 0x4ba * 4..=BASE + 0x4be * 4).contains(&at) {
-            value = (value & !0x1f00) | (value & 0x1f) << 8;
+            let index = ((at - (BASE + 0x4ba * 4)) / 4) as u8;
+            let pending = index != 0
+                && (self.det_stall & (1 << (index - 1)) != 0
+                    || self.det_on_latch && self.latching().contains(&(index - 1)));
+            let current = if pending {
+                self.get(at) & 0x1f00
+            } else {
+                (value & 0x1f) << 8
+            };
+            value = (value & !0x1f00) | current;
         }
         self.inner.write(at, value);
         if self.underflow_after == Some(self.writes) {
@@ -253,6 +271,7 @@ fn plan() -> dml::Plan {
     dml::admit(
         &soc(),
         &dml::Mode {
+            hdmi: true,
             timing,
             pitch: 640,
             bytes_per_pixel: 4,
@@ -396,7 +415,7 @@ fn stage_deadlines(s: &mut Staged, pipe: u8, plan: &dml::Plan) -> u64 {
     s.e.io.delay = [0; 5];
     run(s
         .surfaces
-        .prepare_requestor(&mut s.e, pipe, || Ok((clock, config()))))
+        .prepare_requestor_planes(&mut s.e, pipe, &[], Some(plan), || Ok((clock, config()))))
     .unwrap();
     s.e.io.fake().regs.insert(BASE + GLOBAL_TIMER * 4, 0x1002);
     let deadlines = run(s
@@ -455,6 +474,8 @@ fn hdmi_engine(
         writes: 0,
         lock_requested: Arc::new(AtomicBool::new(false)),
         extra: 0,
+        det_stall: 0,
+        det_on_latch: false,
     };
     Engine {
         io: Renamed::new(io, layout),
@@ -1468,6 +1489,94 @@ fn move_to_new_plan(mut c: alloc::boxed::Box<Chain>, p: u8) -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-scanout",
     dcn401_scanout_chain_moves_a_live_display_to_a_new_plan
+);
+
+/// A live stream's own DET must latch before its new plan is published, but
+/// a different, idle DET can keep the optional compbuf grow pending across
+/// another update. The idle zero request is issued by the real owner.
+fn dcn401_live_det_settles_active_storage_and_retains_idle_retirements() -> TestResult {
+    use crate::amdgpu_dcn401_otg::WatermarkUpdate;
+    let mode = plan().mode;
+    let partner = dml::Mode {
+        hdmi: false,
+        ..mode
+    };
+    let old = dml::admit_all(&soc(), &[mode, partner]).unwrap()[0];
+    let mut faster = partner;
+    faster.timing.pixel_clock_khz *= 4;
+    let next = dml::admit_all(&soc(), &[mode, faster]).unwrap()[0];
+    assert!(next.det_bytes < old.det_bytes);
+    for active_stalls in [false, true] {
+        let p = 0;
+        let mut c = harvest::on_full_pool(|| {
+            let mut s = staged(p, &old);
+            let address = stage_deadlines(&mut s, p, &old);
+            let mut c = hdmi_chain(s, 0, 0, p, address);
+            let clock = c.clock;
+            start_hdmi(&mut c.e, 0, 0, p, clock);
+            c
+        });
+        run(c.start()).unwrap();
+        let mut raised = c.clock;
+        raised.global.display_khz = raised.global.display_khz.max(next.clocks.dispclk_khz);
+        raised.global.dpp_khz = raised.global.dpp_khz.max(next.clocks.dpprefclk_khz);
+        raised.global.request.display_khz = raised.global.display_khz;
+        raised.global.request.dpp_khz = raised.global.dpp_khz;
+        raised.request.dpp_khz = raised.request.dpp_khz.max(next.clocks.dppclk_khz);
+        c.e.status.rebind_timing(p, |a| a.clock = raised);
+        c.clock = raised;
+        let crb = |i: u64| BASE + (0x4ba + i) * 4;
+        let compbuf = 21 - old.det_bytes / 65536 - 5;
+        c.e.io.put(crb(0), compbuf * 0x101);
+        c.e.io.put(crb(2), 5 * 0x101);
+        c.e.status.requestor.as_mut().unwrap().compbuf_bytes = compbuf * 65536;
+        let previous = c.e.status.requestor;
+        c.e.io.det_on_latch = true;
+        c.e.io.det_stall = if active_stalls { 0b11 } else { 0b10 };
+        let update = |c: &mut Chain| {
+            let clock = c.clock;
+            run(c.surfaces.update_live_plan(
+                &mut c.e,
+                p,
+                &next,
+                WatermarkUpdate::Raise,
+                CRYSTAL_KHZ,
+                || Ok((clock, config())),
+            ))
+        };
+        let changed = update(&mut c);
+        if active_stalls {
+            assert!(matches!(changed, Err(Error::Timeout(_))));
+            assert!(matches!(c.e.status.state, State::Failed(_)));
+            assert_eq!(c.e.status.requestor, previous);
+            assert_eq!(c.e.status.deadlines.unwrap().plan, old);
+            assert_eq!(c.e.io.get(crb(0)) & 0x1f, compbuf);
+            continue;
+        }
+        assert_eq!(changed.map(|d| d.plan), Ok(next));
+        assert_eq!(c.e.io.get(crb(1)) & 0x1f1f, next.det_bytes / 65536 * 0x101);
+        assert_eq!(c.e.io.get(crb(2)) & 0x1f1f, 5 << 8);
+        assert_eq!(c.e.io.get(crb(0)) & 0x1f, compbuf);
+        assert!(c.e.displays.compbuf_pending);
+        assert_eq!(c.e.displays.retiring_dets & 0b10, 0b10);
+        assert!(run(c.check()).is_ok());
+        assert!(
+            update(&mut c).is_ok(),
+            "an unchanged optimize must retain the idle retirement"
+        );
+        assert!(c.e.displays.compbuf_pending);
+        c.e.io.put(crb(2), 0);
+        c.e.io.det_stall = 0;
+        assert!(run(c.e.retry_compbuf()).unwrap().is_some());
+        assert_eq!(c.e.io.get(crb(0)) & 0x1f, 21 - next.det_bytes / 65536);
+        assert!(!c.e.displays.compbuf_pending);
+        assert!(run(c.check()).is_ok());
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_live_det_settles_active_storage_and_retains_idle_retirements
 );
 
 #[path = "amdgpu_dcn401_plane_update_chain_tests.rs"]

@@ -492,6 +492,7 @@ fn dcn401_uhbr_audio_filters_capabilities_and_binds_scanout() -> TestResult {
             dchub_refclk_khz: 50_000,
         },
         &dml::Mode {
+            hdmi: false,
             timing,
             pitch: 1920,
             bytes_per_pixel: 4,

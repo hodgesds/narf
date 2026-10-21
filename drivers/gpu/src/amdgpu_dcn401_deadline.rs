@@ -298,6 +298,9 @@ impl<I: Io> Engine<I> {
         verify: bool,
         wm: WatermarkUpdate,
     ) -> Result<(), Error> {
+        if verify {
+            self.verify_compbuf_minimum(plan.arbiter.compbuf_segments)?;
+        }
         let l = self.layout;
         let hubbub = |reg| l.base + reg * 4;
         let each = |e: &mut Self, at: u64, mask: u32, value: u32| {
@@ -464,8 +467,9 @@ pub(super) fn bound(
         && timing.sync == plan.sync
         && matches!(
             timing.signal,
-            Signal::DisplayPort | Signal::HpoDisplayPort | Signal::Tmds
+            Signal::DisplayPort | Signal::HpoDisplayPort | Signal::Tmds | Signal::HdmiFrl
         )
+        && plan.mode.hdmi == matches!(timing.signal, Signal::Tmds | Signal::HdmiFrl)
         && a.surface.request.odm == timing.odm
         && u32::from(plan.pipes) == timing.odm.count()
         && surfaces.clone().count() == planes.len()
@@ -473,12 +477,8 @@ pub(super) fn bound(
             // An MPC-combined plane's DPPs (on an ODM stream its slices are 1).
             let dpps = plan.plane(k).map_or(0, |q| q.mpc_slices(plan.pipes));
             plane_bound(plan, timing, s, (p, dpps))
+                && plan.plane(k).is_some_and(|p| p.det_bytes == a.plane_det(k))
         })
-        && plan
-            .planes
-            .iter()
-            .flatten()
-            .all(|p| p.det_bytes == a.det_bytes)
         && a.det_bytes == plan.det_bytes
         && clock.request.pipe == a.pipe
         && clock.global.display_khz >= plan.clocks.dispclk_khz
@@ -547,6 +547,7 @@ impl Surfaces {
             e.verify_mpc(m)?;
         }
         e.verify_requestor(a.pipe)?;
+        e.verify_compbuf_minimum(plan.arbiter.compbuf_segments)?;
         let refclk = e.dchub_refclk_khz(crystal_khz)?;
         if !bound(plan, mpc.dpp.timing.request, a, clock, refclk) {
             return Err(Error::Invalid);
@@ -677,7 +678,10 @@ impl Surfaces {
         let new_timing = request.plan()?;
         let current = owners()?;
         let refclk = e.dchub_refclk_khz(crystal_khz)?;
-        if !bound(plan, request, a, current.0, refclk) {
+        let mut next = a.with_plan(plan)?;
+        let target = e.requestor_allocation(next)?;
+        next.compbuf_bytes = u32::from(target[0]) * super::requestor::SEGMENT_BYTES;
+        if !bound(plan, request, next, current.0, refclk) {
             return Err(Error::Invalid);
         }
         // The live scanout is still the one its records name (another
@@ -687,12 +691,21 @@ impl Surfaces {
         e.flip_quiet(pipe)?;
         e.status.state = State::UpdatingStream(pipe);
         let result = async {
+            e.prepare_det_space(target).await?;
             e.lock(pipe).await?;
+            e.program_dets(target)?;
             e.global_sync_writes(new_timing, false)?;
             e.deadline_writes_with(pipe, plan, false, wm)?;
             e.update(e.layout.otg(pipe, LOCK), 1, 0)?;
             e.drr_trigger(pipe)?;
             e.stream_latched(p).await?;
+            e.settle_active_dets(target).await?;
+            let crb = e.increase_compbuf().await?;
+            e.settle_compbuf_minimum(plan.arbiter.compbuf_segments)
+                .await?;
+            next.compbuf_bytes = u32::from(crb[0]) * super::requestor::SEGMENT_BYTES;
+            e.status.requestor = Some(next);
+            e.verify_live_requestor(pipe)?;
             e.global_sync_writes(new_timing, true)?;
             e.deadline_writes_with(pipe, plan, true, wm)?;
             if owners()? != current {

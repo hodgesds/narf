@@ -531,6 +531,7 @@ fn dcn401_frl_controls_bind_live_scanout() -> TestResult {
                 dchub_refclk_khz: 50_000,
             },
             &dml::Mode {
+                hdmi: true,
                 timing: request(1).timing,
                 pitch: 1920,
                 bytes_per_pixel: 4,

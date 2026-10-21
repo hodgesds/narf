@@ -2623,6 +2623,7 @@ pub fn mode(timing: Timing) -> dml::Mode {
 /// pixels, the line rounded up to whole 256-byte requests.
 pub fn plane_mode(timing: Timing, format: otg::SurfaceFormat) -> dml::Mode {
     let mut mode = dml::Mode {
+        hdmi: false,
         timing,
         pitch: format.pitch_bytes(timing.h_active) / format.bytes_per_pixel(),
         bytes_per_pixel: format.bytes_per_pixel(),
@@ -2726,6 +2727,7 @@ impl Selection {
 /// plane's SPL viewport, ratios and taps on the stream).
 pub fn selection_mode(s: &Selection) -> dml::Mode {
     let mode = dml::Mode {
+        hdmi: s.hdmi,
         ycbcr420: s.ycbcr420,
         dsc: s.dsc.map(|c| dml::Dsc {
             slices: c.slices_h,
@@ -3439,7 +3441,7 @@ impl ColdBoot {
             for &o in &overlay_pipes {
                 self.prepare_display_mpc(o)?;
             }
-            self.prepare_display_requestor_planes(pipe, &overlay_pipes)
+            self.prepare_display_requestor_planes(pipe, &overlay_pipes, &plan)
                 .await?;
             self.prepare_display_deadlines(pipe, &plan).await?;
             match self.enable_display_hpd(selection.port) {
@@ -3485,6 +3487,7 @@ impl ColdBoot {
                 let audio = sink_audio_info(edid);
                 let max_bpc = connector_max_bpc(s.port, None);
                 hdmi_stream(caps, &t, max_bpc, frl, audio, soc.dispclk_max_khz).map(|h| dml::Mode {
+                    hdmi: true,
                     ycbcr420: h.ycbcr420,
                     dsc: h.dsc.map(|c| dml::Dsc {
                         slices: c.slices_h,
@@ -4230,6 +4233,24 @@ pub fn keeps_pipes(m: &Modeset, plan: &dml::Plan) -> bool {
             .all(|k| plan.plane(k).map(|p| p.dpps) == m.plan.plane(k).map(|p| p.dpps))
 }
 
+/// Release each stream's net DET budget before another stream grows.
+/// With old and final configurations both fitting the pool, processing
+/// negative deltas first keeps every intermediate configuration within it.
+/// One stream's own per-HUBP reductions/growth latch together under its
+/// OTG lock (including removed planes).
+fn det_update_order(old: &[dml::Plan], new: &[dml::Plan]) -> Vec<usize> {
+    let total = |p: &dml::Plan| -> i64 {
+        p.planes
+            .iter()
+            .flatten()
+            .map(|p| i64::from(p.det_bytes) * i64::from(p.dpps))
+            .sum()
+    };
+    let mut order: Vec<usize> = (0..old.len()).collect();
+    order.sort_by_key(|&i| total(&new[i]) - total(&old[i]));
+    order
+}
+
 /// The global floors a configuration's plans need: the fastest DISPCLK
 /// and DPPREFCLK (every plan of one admission shares them), DTBCLK at its
 /// top level with an FRL stream (dcn401_update_clocks).
@@ -4276,7 +4297,10 @@ impl ColdBoot {
             .collect();
         self.update_live_display_clocks(request, &targets, false)
             .await?;
-        for (m, plan) in running.iter_mut().zip(plans) {
+        let old: Vec<_> = running.iter().map(|m| m.plan).collect();
+        let order = det_update_order(&old, plans);
+        for k in order {
+            let (m, plan) = (&mut running[k], &plans[k]);
             // SAFETY: the caller's obligations; the scanout stays live.
             let d = unsafe { self.update_live_display_plan(m.pipe, plan, true) }.await?;
             m.plan = d.plan;
@@ -4361,7 +4385,13 @@ impl ColdBoot {
         }
         let (soc, uclk, fams2, modes) = &key;
         match dml::pstate::admit(soc, uclk, modes, *fams2) {
-            Ok(dml::pstate::Pstate::Supported(s)) => Ok(Some(s)),
+            Ok(dml::pstate::Pstate::Supported(s))
+                if running
+                    .iter()
+                    .all(|m| keeps_pipes(m, &s.plans[usize::from(m.plan.stream)])) =>
+            {
+                Ok(Some(s))
+            }
             _ => {
                 *PINNED_SEARCH.lock() = Some(key);
                 Ok(None)
@@ -4451,9 +4481,10 @@ impl ColdBoot {
             ..bandwidth
         };
         self.update_live_display_bandwidth(prepare, false).await?;
-        for (m, plan) in running.iter().zip(&plans) {
+        let old: Vec<_> = running.iter().map(|m| m.plan).collect();
+        for k in det_update_order(&old, &plans) {
             // SAFETY: the caller's obligations; the scanout stays live.
-            unsafe { self.update_live_display_plan(m.pipe, plan, true) }.await?;
+            unsafe { self.update_live_display_plan(running[k].pipe, &plans[k], true) }.await?;
         }
         self.disable_display_fams2().await;
         // dcn401_optimize_bandwidth: FAMS2 off (no firmware method is

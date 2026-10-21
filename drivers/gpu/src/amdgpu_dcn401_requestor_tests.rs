@@ -44,11 +44,16 @@ impl Io for RequestIo {
             let mut occupied = 0;
             for index in 0..5 {
                 let old = self.fake().regs[&crb(index)];
-                assert_eq!(
-                    old & 0x1f,
-                    (old >> 8) & 0x1f,
-                    "reuse before CURRENT acknowledgement"
-                );
+                if at == crb(index) {
+                    // Independent banks can retire while a known COMPBUF
+                    // grow applies. Never reuse this bank before its ACK;
+                    // count both CURRENT and requested storage below.
+                    assert_eq!(
+                        old & 0x1f,
+                        (old >> 8) & 0x1f,
+                        "reuse before CURRENT acknowledgement"
+                    );
+                }
                 let next = if at == crb(index) {
                     value & 0x1f
                 } else {
@@ -546,7 +551,7 @@ fn dcn401_requestor_stages_overlays_on_free_pipes() -> TestResult {
         (&[2, 2], Error::Invalid, "one pipe twice"),
         (&[2, 3, 1, 1], Error::Unsupported, "four overlays"),
     ] {
-        let result = run(surfaces.prepare_requestor_planes(&mut e, 0, bad, owners));
+        let result = run(surfaces.prepare_requestor_planes(&mut e, 0, bad, None, owners));
         if result != Err(want) {
             let _ = core::fmt::Write::write_fmt(
                 &mut narf_console::Writer,
@@ -559,11 +564,13 @@ fn dcn401_requestor_stages_overlays_on_free_pipes() -> TestResult {
         }
     }
     e.displays.siblings.pipes = 1 << 3;
-    if run(surfaces.prepare_requestor_planes(&mut e, 0, &[2, 3], owners)) != Err(Error::Invalid) {
+    if run(surfaces.prepare_requestor_planes(&mut e, 0, &[2, 3], None, owners))
+        != Err(Error::Invalid)
+    {
         return TestResult::Fail("another display's pipe");
     }
     e.displays.siblings.pipes = 0;
-    let Ok(a) = run(surfaces.prepare_requestor_planes(&mut e, 0, &[2, 3], owners)) else {
+    let Ok(a) = run(surfaces.prepare_requestor_planes(&mut e, 0, &[2, 3], None, owners)) else {
         return TestResult::Fail("two overlays");
     };
     let staged = |o: usize| e.status.surfaces[o];
@@ -643,6 +650,7 @@ fn dcn401_slow_compbuf_or_det_ack_is_not_fatal() -> TestResult {
         surface: e.status.surfaces[2].expect("staged surface"),
         overlays: [None; MAX_OVERLAYS],
         det_bytes: 5 << 16,
+        overlay_det_bytes: [0; MAX_OVERLAYS],
         compbuf_bytes: 1 << 16,
         pixel_chunk_bytes: 8192,
         minimum_chunk_bytes: 1024,
@@ -676,4 +684,179 @@ fn dcn401_slow_compbuf_or_det_ack_is_not_fatal() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-requestor",
     dcn401_slow_compbuf_or_det_ack_is_not_fatal
+);
+
+/// DC's shared DET budget reaches the hardware per plane, including a
+/// smaller overlay; bad sizes refuse before repartitioning the hub.
+fn dcn401_requestor_uses_each_planes_admitted_det() -> TestResult {
+    let (_backing, _pool, mut e, mut surfaces, clock) = overlay_chain(&[3]);
+    let soc = dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [300_000, 2_500_000],
+        dcfclk_khz: [200_000, 1_564_000],
+        socclk_khz: 300_000,
+        dispclk_max_khz: 2_000_000,
+        dppclk_max_khz: 2_000_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    let mut mode = dml::Mode::new(overlay_primary().timing.timing, 640, 4);
+    mode.planes[1] = Some(overlay_request(3).dml_plane());
+    let plan = dml::admit(&soc, &mode).unwrap();
+    let overlay_det = plan.plane(1).unwrap().det_bytes;
+    assert_ne!(plan.det_bytes, overlay_det, "distinct plane budgets");
+    for bytes in [65536, 131073, 21 * 65536] {
+        let mut bad = plan;
+        bad.planes[0].as_mut().unwrap().det_bytes = bytes;
+        assert!(run(surfaces
+            .prepare_requestor_planes(&mut e, 0, &[3], Some(&bad), || Ok((clock, config()))))
+        .is_err());
+        assert!(e.io.fake().writes.is_empty(), "bad DET wrote hardware");
+    }
+    let a =
+        run(surfaces
+            .prepare_requestor_planes(&mut e, 0, &[3], Some(&plan), || Ok((clock, config()))))
+        .unwrap();
+    assert_eq!(a.det_bytes, plan.det_bytes);
+    assert_eq!(a.overlay_det_bytes, [overlay_det, 0, 0]);
+    let det_segments = plan
+        .planes
+        .iter()
+        .flatten()
+        .map(|p| p.det_bytes / 65536 * u32::from(p.dpps))
+        .sum::<u32>();
+    assert_eq!(a.compbuf_bytes, (21 - det_segments) * 65536);
+    assert!(a.compbuf_bytes >= plan.arbiter.compbuf_segments * 65536);
+    assert_eq!(
+        e.io.fake().regs[&crb(1)] & 0x1f1f,
+        plan.det_bytes / 65536 * 0x101
+    );
+    assert_eq!(
+        e.io.fake().regs[&crb(4)] & 0x1f1f,
+        overlay_det / 65536 * 0x101
+    );
+    assert_eq!(e.verify_requestor(0), Ok(()));
+    *e.io.fake().regs.get_mut(&crb(4)).unwrap() -= 0x101;
+    assert_eq!(e.verify_requestor(0), Err(Error::Busy));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-requestor",
+    dcn401_requestor_uses_each_planes_admitted_det
+);
+
+/// A different OTG's zero request cannot fund growth until its CURRENT
+/// releases the storage, even though the requested final layout fits.
+fn dcn401_det_growth_waits_for_owned_idle_capacity() -> TestResult {
+    let (_backing, _pool, mut e, _surfaces, _clock) = ready_requests(0, [11, 5, 5, 0, 0]);
+    e.io.delay = [0; 5];
+    e.io.stall = 1 << 2;
+    let target = [4, 17, 0, 0, 0];
+    assert!(matches!(
+        run(e.prepare_det_space(target)),
+        Err(Error::Timeout(_))
+    ));
+    assert_eq!(e.io.fake().regs[&crb(0)] & 0x1f1f, 4 * 0x101);
+    assert_eq!(e.io.fake().regs[&crb(1)] & 0x1f1f, 5 * 0x101);
+    assert_eq!(e.io.fake().regs[&crb(2)] & 0x1f1f, 5 << 8);
+    assert!(e
+        .io
+        .fake()
+        .writes
+        .iter()
+        .all(|&(at, value)| at != crb(1) || value & 0x1f != 17));
+    assert_eq!(e.displays.retiring_dets & 0b10, 0b10);
+    // The original zero request finally completes; only then may the other
+    // stream claim its budget. No second zero write or forged mask is needed.
+    e.io.stall = 0;
+    run(e.prepare_det_space(target)).unwrap();
+    e.program_dets(target).unwrap();
+    run(e.settle_active_dets(target)).unwrap();
+    assert_eq!(e.io.fake().regs[&crb(1)] & 0x1f1f, 17 * 0x101);
+    // An inherited asynchronous zero, which this owner never issued, still
+    // cannot pass live verification or strict cold adoption.
+    e.io.fake().regs.insert(crb(3), 1 << 8);
+    assert_eq!(e.crb_live(), Err(Error::Busy));
+    assert_eq!(e.crb_stable(), Err(Error::Busy));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-requestor",
+    dcn401_det_growth_waits_for_owned_idle_capacity
+);
+
+fn dcn401_requestor_allocates_unbounded_tiled_rgb_storage() -> TestResult {
+    let mut mode = small(0);
+    mode.surface.surface.tiling = Tiling {
+        swizzle: Swizzle::S64K2D,
+        dcc: None,
+    };
+    mode.bytes = mode.surface.bytes().bytes as usize + 4096;
+    let plane = mode.surface.dml_plane();
+    let input = dml::Mode {
+        planes: [Some(plane), None, None, None],
+        ..dml::Mode::new(mode.timing.timing, u32::from(plane.pitch), 4)
+    };
+    let soc = dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [300_000, 2_500_000],
+        dcfclk_khz: [200_000, 1_564_000],
+        socclk_khz: 300_000,
+        dispclk_max_khz: 2_000_000,
+        dppclk_max_khz: 2_000_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    let plan = dml::admit(&soc, &input).unwrap();
+    assert!(plan.plane(0).unwrap().rq.unbounded_request_enabled);
+    let (_backing, _pool, mut e, mut surfaces, clock) =
+        ready_requests_with(0, [21, 0, 0, 0, 0], mode);
+    let a =
+        run(surfaces
+            .prepare_requestor_planes(&mut e, 0, &[], Some(&plan), || Ok((clock, config()))))
+        .unwrap();
+    assert_eq!(a.det_bytes, plan.det_bytes);
+    assert_eq!(a.compbuf_bytes, plan.arbiter.compbuf_segments * 65536);
+    assert_eq!(
+        e.verify_compbuf_minimum(plan.arbiter.compbuf_segments),
+        Ok(())
+    );
+    let needed = plan.arbiter.compbuf_segments;
+    e.io.fake().regs.insert(crb(0), needed | (needed - 1) << 8);
+    e.io.stall = 1;
+    assert_eq!(e.verify_compbuf_minimum(needed), Err(Error::Busy));
+    assert!(matches!(
+        run(e.settle_compbuf_minimum(needed)),
+        Err(Error::Timeout(_))
+    ));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-requestor",
+    dcn401_requestor_allocates_unbounded_tiled_rgb_storage
+);
+
+fn dcn401_compbuf_additional_growth_waits_for_owned_prior_grow() -> TestResult {
+    let (_backing, _pool, mut e, _surfaces, _clock) = ready_requests(2, [1, 5, 5, 0, 5]);
+    e.io.stall = 1;
+    assert_eq!(run(e.increase_compbuf()), Ok([6, 5, 5, 0, 5]));
+    assert_eq!(e.displays.compbuf_inflight, Some(6));
+    // Another idle DET is released while the first COMPBUF grow is slow.
+    e.program_det_segments(0, 0).unwrap();
+    e.io.delay[1] = 0;
+    assert_eq!(run(e.increase_compbuf()), Ok([6, 0, 5, 0, 5]));
+    assert!(e.displays.compbuf_pending);
+    assert_eq!(e.io.fake().regs[&crb(0)] & 0x1f, 6);
+    e.io.stall = 0;
+    e.io.delay[0] = 0;
+    assert_eq!(run(e.retry_compbuf()), Ok(Some([11, 0, 5, 0, 5])));
+    assert!(!e.displays.compbuf_pending);
+    assert_eq!(e.io.fake().regs[&crb(0)] & 0x1f1f, 11 * 0x101);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-requestor",
+    dcn401_compbuf_additional_growth_waits_for_owned_prior_grow
 );

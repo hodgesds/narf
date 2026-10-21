@@ -1237,6 +1237,7 @@ fn dcn401_admission_inputs_read_live_dchub_timer_and_capped_levels() -> TestResu
         return TestResult::Fail("admission inputs");
     }
     let mode = dml::Mode {
+        hdmi: false,
         timing: Timing {
             pixel_clock_khz: 148_500,
             h_active: 1920,

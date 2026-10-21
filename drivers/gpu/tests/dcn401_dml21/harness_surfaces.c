@@ -124,6 +124,7 @@ int main(int argc, char **argv)
 	}
 
 	cfg.gpuvm_max_page_table_levels = 4;
+	cfg.minimize_det_reallocation = true;
 	int n = 0, planes = 0;
 	while (a < argc) {
 		if (n == 4 || planes == 4) {
@@ -162,11 +163,9 @@ int main(int argc, char **argv)
 			t->dsc.dsc_compressed_bpp_x16 = bpp_x16;
 		}
 		s->overrides.odm_mode = dml2_odm_mode_auto;
-		/* DC clears this per stream for DCN401's single-display 2:1 ODM
-		 * policy (enable_single_display_2to1_odm_policy), which drives
-		 * the Vmin phase's dynamic ODM. NARF does not port that phase:
-		 * every stream keeps it set, so the Vmin phase leaves ODM alone. */
-		s->overrides.disable_dynamic_odm = true;
+		/* DCN401 permits dynamic ODM on a single DP stream; PMO
+         * checks HDMI encoders, timing boundaries and MPC itself. */
+		s->overrides.disable_dynamic_odm = false;
 		s->overrides.disable_subvp = true;
 		s->overrides.hw.twait_budgeting.fclk_pstate = dml2_twait_budgeting_setting_if_needed;
 		s->overrides.hw.twait_budgeting.uclk_pstate = dml2_twait_budgeting_setting_if_needed;
@@ -230,7 +229,7 @@ int main(int argc, char **argv)
 			p->composition.scaler_info.plane1.v_taps = c[8];
 			p->composition.scaler_info.rect_out_width = t9[1];
 			p->composition.rect_out_height_spans_vactive = true;
-			p->overrides.det_size_override_kb = 320;
+			p->overrides.det_size_override_kb = 0;
 			/* MPC_AUTO: DC's auto factor (0), as dml21_translation_helper
 			 * leaves it; otherwise MPC combine is off (factor 1), except
 			 * where pmo_dcn4_fams2_optimize_dcc_mcache splits a DCC plane

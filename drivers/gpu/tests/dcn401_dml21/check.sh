@@ -21,8 +21,10 @@
 #                                    field width it asserts (asserts are off)
 #   <19 inputs> ! Unsupported odm    Linux plans the stream on three or four
 #                                    ODM pipes, which the port does not admit
-# Both harnesses let DML decide ODM combine (dml2_odm_mode_auto, dynamic ODM
-# off). A plane on n > 1 pipes ends its plan values with "/<n>" and every
+# All harnesses use DC's DET allocation (no override,
+# minimize_det_reallocation) and dynamic ODM policy (Vmin DISPCLK 600 MHz;
+# disabled for HDMI, MPC-combined planes and multiple streams). A plane
+# on n > 1 pipes ends its plan values with "/<n>" and every
 # further pipe's refcyc_h_blank_end, the one register Linux programs
 # differently per pipe (the harness checks the rest are identical).
 # dsc_vectors.txt lines are "<slices> <bpp_x16>" then a multi_vectors.txt
@@ -55,11 +57,9 @@
 # cannot place is split over two MPC-combined pipes ("/2" and the pipe-0
 # blank end) by pmo_dcn4_fams2_optimize_dcc_mcache whatever the factor, or
 # on a single ODM stream gets one more ODM pipe. The harnesses run PMO as
-# DC does on DCN401 (disable_dyn_odm false), every stream's
-# disable_dynamic_odm set (NARF does not port the Vmin phase's dynamic ODM);
-# each plane's DET is the 320 KiB DCN4_01_DEFAULT_DET_SIZE NARF programs
-# (det_size_override_kb, which DC never sets: DC lets CalculateDETBufferSize
-# share the 1280 KiB with minimize_det_reallocation).
+# DC does on DCN401 (disable_dyn_odm false), with per-stream dynamic ODM
+# allowed. CalculateDETBufferSize shares the 1280 KiB pool using DC's
+# minimize_det_reallocation policy; no plane sets det_size_override_kb.
 # --regenerate-surfaces answers its inputs again.
 # surface_mpc_vectors.txt is as surface_vectors.txt, planned with MPC_AUTO
 # (DC's auto mpcc_combine_factor): tiled, DCC, rotated and 4:2:0 planes one
@@ -80,10 +80,13 @@
 # (the UCLK P-state strategy search, with or without FAMS2 firmware) over a
 # board's whole UCLK DPM table; each line is Linux's chosen strategy, latency
 # level, DPMM minimums, plans, FAMS2 stream states and candidate list.
-# --regenerate-pstate answers its inputs again.
+# --regenerate-pstate answers its inputs again. vmin_vectors.txt is an HDMI
+# encoder flag followed by odm34 inputs: both Navi48/Navi44 at the 600 MHz
+# Vmin boundary, odd timing boundaries and DSC split divisors. Regenerate
+# with --regenerate-vmin.
 set -euo pipefail
 case ${1:-} in
---regenerate-odm34 | --regenerate-mpc | --regenerate-surface-mpc | --regenerate-pstate)
+--regenerate-odm34 | --regenerate-mpc | --regenerate-surface-mpc | --regenerate-pstate | --regenerate-vmin)
 	regenerate=$1
 	shift ;;
 *) regenerate= ;;
@@ -236,6 +239,19 @@ odm34_answer() {
 		fi
 	done
 }
+# vmin_answer: an HDMI flag then odm34 inputs. HDMI FRL excludes the
+# seamless Vmin optimization; DP and HPO allow it.
+vmin_answer() {
+    local hdmi line out
+    while read -r hdmi line; do
+        if [ "$hdmi" = 1 ]; then
+            out=$(echo "$line" | HDMIFRL=1 odm34_answer)
+        else
+            out=$(echo "$line" | odm34_answer)
+        fi
+        echo "$hdmi $out"
+    done
+}
 # mpc_answer: answer plane_vectors.txt inputs from stdin with Linux
 # (harness_planes.c, RAISED, MPC_AUTO).
 mpc_answer() {
@@ -263,6 +279,9 @@ regenerate_file() {
 }
 if [ "$regenerate" = --regenerate-odm34 ]; then
 	regenerate_file "$here/odm34_vectors.txt" odm34_answer
+	exit 0
+elif [ "$regenerate" = --regenerate-vmin ]; then
+	regenerate_file "$here/vmin_vectors.txt" vmin_answer
 	exit 0
 elif [ "$regenerate" = --regenerate-mpc ]; then
 	regenerate_file "$here/mpc_vectors.txt" mpc_answer
@@ -553,13 +572,8 @@ check_multi "$here/dsc_vectors.txt" DSC DP2P0=1 || mfail=1
 check_multi "$here/odm_dsc_vectors.txt" DSC DP2P0=1 || mfail=1
 check_multi "$here/uhbr_dsc_vectors.txt" DSC DP2P0=1 || mfail=1
 check_multi "$here/format_vectors.txt" FORMAT || mfail=1
-# DC passes an HDMI FRL stream as dml2_hdmifrl; for a 4:4:4 DSC stream DML's
-# DSC delays and plan do not depend on it either. DCN401 has one HDMI FRL
-# output (NumberOfHDMIFRLSupport), so only the single-stream lines replay.
-for f in dsc_vectors odm_dsc_vectors; do
-	awk '/^#/ || $12 == 1' "$here/$f.txt" > "$work/${f}_single.txt"
-	check_multi "$work/${f}_single.txt" DSC HDMIFRL=1 || mfail=1
-done
+# HDMI FRL excludes Vmin dynamic ODM, unlike DP/HPO. Keep its own
+# reference answers instead of replaying DP's optimized pipe layouts.
 check_multi "$here/frl_dsc_vectors.txt" DSC HDMIFRL=1 || mfail=1
 # check_surfaces <file>: surface_vectors.txt lines, answered again exactly.
 check_surfaces() {
@@ -609,6 +623,7 @@ check_answered() {
 }
 check_surfaces "$here/surface_vectors.txt" || mfail=1
 check_answered "$here/odm34_vectors.txt" odm34_answer || mfail=1
+check_answered "$here/vmin_vectors.txt" vmin_answer || mfail=1
 check_answered "$here/mpc_vectors.txt" mpc_answer || mfail=1
 check_answered "$here/surface_mpc_vectors.txt" surface_mpc_answer || mfail=1
 check_answered "$here/pstate_vectors.txt" pstate_answer || mfail=1

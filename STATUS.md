@@ -337,8 +337,17 @@ exclusion through KMS pin acquisition, including against synchronous memory
 pressure. DCC allocation can use fragmented gaps containing the final
 contiguous aligned buffer without requiring a larger temporary buddy block;
 Linux placement vectors now exercise the production reservation allocator.
-DML DET sizing/Vmin ODM, remaining memory-pressure and suspend findings,
-and physical board acceptance remain open.
+DML now allocates the shared DET pool using DC's pixel-rate/plane-bandwidth
+policy and applies the single-DP Vmin ODM phase, including after P-state
+search. Native requestors retain per-plane allocations through live updates;
+HDMI transport is an explicit admission input. Zero-stream release lowers
+DTBCLK, DISPCLK and DPPCLK, while optional DAL responses follow Linux's
+sent-timeout policy with retained failure ownership. Suspend gates/drains
+presenter and cursor pins, retires all display streams, and retains incomplete
+transitions through caller cancellation and rollback. An opt-in
+`cargo xtask gpu-reference` command checks primary harnesses against an
+explicit clean Linux Git revision. Remaining memory-pressure, reset/registry,
+admission-aware DSC mode selection and physical board acceptance work stays open.
 
 Implemented: GDDR6 training; PSP14 SOS/GPCOM/TMR; mandatory graphics/media
 firmware parsing, upload and autoload; GC12 RS64 counter programming and pipe

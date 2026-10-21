@@ -985,7 +985,7 @@ pub(crate) fn admit_traced(
     if shapes.iter().any(|s| s.plane.dcc || !s.mcache_fits) {
         return Ok(Pstate::Pinned(Pinned::Port));
     }
-    let p = prepare(soc, &mut shapes)?;
+    let mut p = prepare(soc, &mut shapes)?;
     let table = min_clock_table(soc, uclk);
     if table.is_empty() {
         return Ok(Pstate::Pinned(Pinned::Unsupported));
@@ -1109,9 +1109,20 @@ pub(crate) fn admit_traced(
             }
         }
     };
-    let Some((st, mut ov, mut sup)) = found else {
+    let Some((st, mut ov, _)) = found else {
         return Ok(Pstate::Pinned(Pinned::Unsupported));
     };
+
+    // Phase 4 follows the selected P-state candidate and retains its
+    // latency index and overrides while trying each dynamic ODM factor.
+    let stream_metas = pmo.metas;
+    drop(pmo);
+    shapes = optimize_vmin(soc, modes, shapes, |candidate| {
+        prepare(soc, candidate)
+            .is_ok_and(|next| run(soc, candidate, &next, &table, uclk, lat, &ov).is_ok())
+    });
+    p = prepare(soc, &mut shapes)?;
+    let mut sup = run(soc, &shapes, &p, &table, uclk, lat, &ov)?.1;
 
     // Stutter phase: every plane at least the stutter latency, if every
     // blank allows it and mode support still passes.
@@ -1189,7 +1200,8 @@ pub(crate) fn admit_traced(
     let (programmed, usable) =
         program_with_ttu(soc, modes, &shapes, &p, &ctx, &ov, &st, uclk, fams2)?;
     for (i, plan) in programmed.into_iter().enumerate() {
-        fams2_streams[i] = fams2_stream(&modes[i].timing, &pmo.metas[i], st.methods[i], usable[i]);
+        fams2_streams[i] =
+            fams2_stream(&modes[i].timing, &stream_metas[i], st.methods[i], usable[i]);
         plans.push(plan);
     }
     Ok(Pstate::Supported(Supported {

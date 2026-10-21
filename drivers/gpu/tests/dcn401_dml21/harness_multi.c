@@ -1,6 +1,6 @@
 /* Linux DML21 multi-stream reference for amdgpu_dcn401_dml.rs `admit_all`.
  * As harness.c, but with up to four DP SST streams, one plane each (plane k
- * on stream k), every plane with the fixed 320 KiB DET.
+ * on stream k), every plane with the DC-calculated DET allocation.
  *
  * Arguments: dcfclk_min dcfclk_max fclk_min fclk_max uclk dispclk_max
  * dppclk_max socclk umc_channels, then per stream: pclk hact htotal hfp hsync
@@ -23,10 +23,10 @@
  *
  * Policy, matching the Rust port:
  *  - one DP SST stream, one unscaled linear 444_32 plane, DML-decided ODM
- *    (dml2_odm_mode_auto, dynamic ODM off), no MPC combine
+ *    (dml2_odm_mode_auto, dynamic ODM on), no MPC combine
  *    (mpcc_combine_factor 1), no cursor, DCC, GPUVM, writeback or iflip;
- *  - DET fixed at the staged 320 KiB per pipe with DET reallocation
- *    minimising off;
+ *  - DET allocated by CalculateDETBufferSize with DC's
+ *    minimize_det_reallocation, no per-plane override;
  *  - DCFCLK/FCLK keep their DPM range, one pinned UCLK level, and PMO never
  *    searches UCLK pstate strategies (switching is disabled natively). PMO's
  *    stutter phase still runs, as it does on Linux.
@@ -131,6 +131,7 @@ int main(int argc, char **argv)
 	}
 
 	cfg.gpuvm_max_page_table_levels = 4;
+	cfg.minimize_det_reallocation = true;
 	cfg.num_streams = n;
 	cfg.num_planes = n;
 	for (int k = 0; k < n; k++) {
@@ -167,11 +168,9 @@ int main(int argc, char **argv)
 			t->dsc.dsc_compressed_bpp_x16 = bpp_x16;
 		}
 		s->overrides.odm_mode = dml2_odm_mode_auto;
-		/* DC clears this per stream for DCN401's single-display 2:1 ODM
-		 * policy (enable_single_display_2to1_odm_policy), which drives
-		 * the Vmin phase's dynamic ODM. NARF does not port that phase:
-		 * every stream keeps it set, so the Vmin phase leaves ODM alone. */
-		s->overrides.disable_dynamic_odm = true;
+		/* DCN401 permits dynamic ODM on a single DP stream; PMO
+         * checks HDMI encoders, timing boundaries and MPC itself. */
+		s->overrides.disable_dynamic_odm = false;
 		s->overrides.disable_subvp = true;
 		s->overrides.hw.twait_budgeting.fclk_pstate = dml2_twait_budgeting_setting_if_needed;
 		s->overrides.hw.twait_budgeting.uclk_pstate = dml2_twait_budgeting_setting_if_needed;
@@ -196,7 +195,7 @@ int main(int argc, char **argv)
 		p->composition.scaler_info.plane1.v_taps = 1;
 		p->composition.scaler_info.rect_out_width = a[1];
 		p->composition.rect_out_height_spans_vactive = true;
-		p->overrides.det_size_override_kb = 320;
+		p->overrides.det_size_override_kb = 0;
 		/* MPC_AUTO: DC's auto factor (0); otherwise MPC combine is off. */
 		p->overrides.mpcc_combine_factor = getenv("MPC_AUTO") ? 0 : 1;
 		p->overrides.gpuvm_min_page_size_kbytes = init.soc_bb.gpuvm_min_page_size_kbytes;

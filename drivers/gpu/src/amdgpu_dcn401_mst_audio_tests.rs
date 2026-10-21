@@ -416,6 +416,7 @@ fn dcn401_mst_audio_requires_matching_live_scanout_witnesses() -> TestResult {
         plan: dml::admit(
             &soc,
             &dml::Mode {
+                hdmi: false,
                 timing: t,
                 pitch: (t.h_active + 63) & !63,
                 bytes_per_pixel: 4,
