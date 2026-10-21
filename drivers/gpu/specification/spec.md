@@ -886,7 +886,13 @@ dcn401_build_update_bandwidth_clocks_sequence while displays run. `Bandwidth
 idle_fclk_khz, deep_sleep_dcfclk_khz }` is DC's `clk` state
 (`Bandwidth::pinned(&Levels)`: no switching, UCLK and FCLK at their maxima;
 `Status::bandwidth` the running one, dcn401_init_clocks' P-state support
-set before the first prepare). In Linux's order: SetUclkPstateAllow(1)
+set before the first prepare). `Status::uclk_switching()` is true only once
+a bandwidth sequence this owner ran since its first `prepare` allowed
+switching (`applied` present and `bandwidth.uclk_pstate`): the initial
+P-state support is DC's software state, never sent to PMFW, so a fresh
+owner (cold boot, S3 or runtime resume) has nothing to pin, and its first
+`prepare` disallows switching itself as Linux's first prepare_bandwidth
+does. In Linux's order: SetUclkPstateAllow(1)
 (0x1a) before the floors when switching is gained, which only
 optimize_bandwidth may do (`should_update_pstate_support`); with idle DPM
 (`Layout::chip` Navi48, PMFW 0x681800 or later, UCLK and FCLK with more than
@@ -5196,16 +5202,24 @@ deep_sleep }`). `ColdBoot::converge_uclk_pstate(drr)`, from every display monito
 pass before DRR converges, searches the running configuration (every
 display scanning out without DRR, their plans one admission on the current
 `Soc`, the clock owner's UCLK levels, `display_fams2()`); a configuration
-found pinned is remembered and not searched again. Supported: FAMS2 disabled
-(`disable_display_fams2`: HW lock, the disabled FAMS2_CONFIG, release; only
-with FAMS 2.1 firmware), `update_live_display_bandwidth(bandwidth, false)`,
-every display moved to its P-state plan with raise-only and then exact
-watermarks (`update_live_display_plan`), `update_live_display_bandwidth(
-bandwidth, true)` allowing switching with UCLK/FCLK at DPMM's active and idle
-minimums, and FAMS2 disabled again; it returns the displays whose plans
-moved. Otherwise, or with `drr` (a display that should run DRR: the port
-plans DRR only pinned), `pin_display_uclk`: FAMS2 disabled, then UCLK and
-FCLK raised to their maxima and switching disallowed. Every configuration
+found pinned is remembered and not searched again. Supported, in
+dcn401_hwseq.c's order: prepare_bandwidth's
+`update_live_display_bandwidth(bandwidth, false)` with `uclk_pstate` forced
+false (Linux forces p_state_change_support false there, so clocks are only
+raised and switching stays disallowed), every display moved to its P-state
+plan with raise-only watermarks (`update_live_display_plan`), then FAMS2
+disabled (`disable_display_fams2`: HW lock, the disabled FAMS2_CONFIG,
+release; only with FAMS 2.1 firmware); then optimize_bandwidth's FAMS2
+disabled again (no firmware method is required), the exact watermarks and
+`update_live_display_bandwidth(bandwidth, true)` allowing switching with
+UCLK/FCLK at DPMM's active and idle minimums; it returns the displays whose
+plans moved. Otherwise, or with `drr` (a display that should run DRR: the
+port plans DRR only pinned), `pin_display_uclk` (`bandwidth::pin_uclk`):
+while `uclk_switching()`, UCLK and FCLK raised to their maxima with
+switching disallowed and then FAMS2 disabled, as prepare_bandwidth orders
+update_clocks before the FAMS2 update; nothing otherwise (Linux sends the
+disabled FAMS2 config on every prepare_bandwidth; the port only ever sends
+it disabled, so a pinned owner skips the repeat). Every configuration
 change (`modeset_*`, `modeset_beside`, `replan_displays`, `retrain_modeset`,
 `stop_modeset`, `unplug_modeset`, `start_frl`, `retire_inherited_display`,
 `abort_modeset_activation`, `modeset_mst_displays`, MST payload changes and
@@ -5215,7 +5229,11 @@ disallowed and a P-state plan to a floor of at least its UCLK level; `set_displa
 refuses DRR while switching. `uclk_switching()` reports the policy.
 `dcn401_scanout_chain_runs_a_uclk_pstate_plan` moves a live display to its
 P-state plan and back on the harvested models; `dcn401-clk` and `dmub-navi48`
-test the bandwidth sequence, the watermark table and the FAMS2 commands.
+test the bandwidth sequence, the watermark table and the FAMS2 commands, and
+`dcn401_fresh_display_owners_pin_like_linux_prepare_bandwidth` drives
+`pin_uclk` over a real clock owner from the fresh states
+`retire_inherited_display`, the first modeset and a relight after resume
+start from.
 Hardware switching under a lit display is unvalidated.
 
 ### Discrete RDNA2 PSP secure-OS bootstrap

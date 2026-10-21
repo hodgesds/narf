@@ -1143,3 +1143,137 @@ kernel_test_in!(
     "drivers/gpu/dcn401-clk",
     dcn401_dal_sends_after_any_response_and_ignores_count_refusals
 );
+
+/// The display owner's side of `bandwidth::pin_uclk` over a real clock
+/// owner: what `ColdBoot` does through `update_live_display_bandwidth` and
+/// `disable_display_fams2`, with each step recorded in order.
+struct PinOwner {
+    e: Engine<Fake>,
+    steps: Vec<&'static str>,
+}
+impl crate::amdgpu_navi48_boot::bandwidth::UclkPin for PinOwner {
+    fn clock_status(&self) -> Result<Status, crate::amdgpu_dcn401_otg::Error> {
+        Ok(self.e.status)
+    }
+    async fn raise_bandwidth(
+        &mut self,
+        bandwidth: Bandwidth,
+    ) -> Result<(), crate::amdgpu_dcn401_otg::Error> {
+        self.steps.push("clocks");
+        let held = |at: u64| at == DIO + 0x1b43 * 4;
+        self.e
+            .update_bandwidth(bandwidth, false, &held)
+            .await
+            .map(|_| ())
+            .map_err(crate::amdgpu_dcn401_otg::Error::Clocks)
+    }
+    async fn disable_fams2(&mut self) -> Result<(), crate::amdgpu_dcn401_otg::Error> {
+        self.steps.push("fams2");
+        Ok(())
+    }
+}
+/// A pin's result, the DAL messages it sent and the owner steps it ran.
+type Pinned = (
+    Result<(), crate::amdgpu_dcn401_otg::Error>,
+    Vec<(u32, u32)>,
+    Vec<&'static str>,
+);
+/// `pin_uclk` from the owner and the DAL messages and steps it ran.
+fn pin(o: &mut PinOwner) -> Pinned {
+    let before = o.e.io.commands.len();
+    o.steps.clear();
+    let result = run(crate::amdgpu_navi48_boot::bandwidth::pin_uclk(o));
+    (
+        result,
+        o.e.io.commands[before..].to_vec(),
+        core::mem::take(&mut o.steps),
+    )
+}
+
+/// Every ColdBoot configuration change pins first. A fresh display owner,
+/// as cold boot, S3 resume and runtime resume each build one, has nothing
+/// to pin: dcn401_init_clocks' P-state support is DC's software state, not
+/// something PMFW was told. So retire_inherited_display (clocks not
+/// started), the first modeset (pinned before it starts and prepares the
+/// clocks) and a modeset after resume (a new owner, whatever the old one
+/// allowed) pin with no message, and the prepare that follows disallows
+/// switching itself. Only once a bandwidth sequence allowed switching does
+/// the pin run Linux's prepare_bandwidth: the clocks raised with switching
+/// disallowed, then FAMS2 disabled.
+fn dcn401_fresh_display_owners_pin_like_linux_prepare_bandwidth() -> TestResult {
+    let fresh = || PinOwner {
+        e: engine(),
+        steps: Vec::new(),
+    };
+    // retire_inherited_display on cold boot: the clocks not started.
+    let mut o = fresh();
+    if !o.e.status.bandwidth.uclk_pstate || o.e.status.levels.is_some() {
+        return TestResult::Fail("fresh owner state");
+    }
+    if pin(&mut o) != (Ok(()), Vec::new(), Vec::new()) {
+        return TestResult::Fail("retire_inherited_display on a fresh owner");
+    }
+    // The first modeset: pinned before prepare_configuration starts the
+    // clocks, and again (a retry) once they started but are not prepared.
+    if pin(&mut o) != (Ok(()), Vec::new(), Vec::new()) {
+        return TestResult::Fail("first modeset before the clocks start");
+    }
+    start(&mut o.e);
+    if o.e.status.state != State::Ready || pin(&mut o) != (Ok(()), Vec::new(), Vec::new()) {
+        return TestResult::Fail("first modeset on started clocks");
+    }
+    // prepare disallows switching itself (Linux's first prepare_bandwidth).
+    o.e.io.commands.clear();
+    run(o.e.prepare(request())).unwrap();
+    if !o.e.io.commands.contains(&(0x1a, 0)) || o.e.status.uclk_switching() {
+        return TestResult::Fail("prepare from dcn401_init_clocks' state");
+    }
+    // Lit and pinned: nothing to pin for the next change.
+    o.e.io.regs.insert(DIO + 0x1b43 * 4, 1);
+    if pin(&mut o) != (Ok(()), Vec::new(), Vec::new()) {
+        return TestResult::Fail("pinned owner pinned again");
+    }
+    // The display monitor's optimize allows switching: the next change
+    // raises and disallows, and only then disables FAMS2.
+    let (allowed, _) = bw(&mut o.e, pstate_bw(), true);
+    if allowed.map(|a| a.uclk_pstate) != Ok(true) || !o.e.status.uclk_switching() {
+        return TestResult::Fail("optimize allowed switching");
+    }
+    let (result, sent, steps) = pin(&mut o);
+    if result.is_err()
+        || steps != ["clocks", "fams2"]
+        || sent.last() != Some(&(0x1a, 0))
+        || hard_mins(&sent) != [(2, 1200)]
+        || o.e.status.uclk_switching()
+        || o.e.status.applied.map(|a| a.memory_floor_khz) != Some(1_200_000)
+    {
+        return TestResult::Fail("pin while switching");
+    }
+    // After S3 or runtime resume the new owner is fresh again, whatever the
+    // old one allowed: the relight's pins send nothing until its prepare.
+    let (allowed, _) = bw(&mut o.e, pstate_bw(), true);
+    if allowed.is_err() || !o.e.status.uclk_switching() {
+        return TestResult::Fail("old owner switching before suspend");
+    }
+    let mut resumed = fresh();
+    if pin(&mut resumed) != (Ok(()), Vec::new(), Vec::new()) {
+        return TestResult::Fail("relight after resume, clocks not started");
+    }
+    start(&mut resumed.e);
+    if pin(&mut resumed) != (Ok(()), Vec::new(), Vec::new()) {
+        return TestResult::Fail("relight after resume, clocks started");
+    }
+    // A failed start leaves nothing applied either.
+    let mut failed = fresh();
+    failed.e.io.refuse = Some(1);
+    if run(failed.e.start(core::future::ready(Ok(power())))).is_ok()
+        || pin(&mut failed) != (Ok(()), Vec::new(), Vec::new())
+    {
+        return TestResult::Fail("failed start");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-clk",
+    dcn401_fresh_display_owners_pin_like_linux_prepare_bandwidth
+);

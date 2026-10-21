@@ -233,6 +233,17 @@ pub struct Status {
     /// DAL messages PMFW refused whose result Linux ignores.
     pub ignored: Ignored,
 }
+impl Status {
+    /// Whether PMFW may switch UCLK under running displays: a bandwidth
+    /// sequence this owner ran since its first `prepare` allowed it. Before
+    /// that nothing was programmed (`Bandwidth::INIT`'s P-state support is
+    /// dcn401_init_clocks' software state, not something PMFW was told), so
+    /// a configuration change has nothing to pin, as Linux's first
+    /// prepare_bandwidth has nothing to fail on.
+    pub fn uclk_switching(&self) -> bool {
+        self.applied.is_some() && self.bandwidth.uclk_pstate
+    }
+}
 /// The bandwidth sequence's, NumOfDisplays' and the watermark notify's DAL
 /// messages are dcn401_smu_* helpers whose result dcn401's clock manager
 /// never reads: PMFW's refusal of a sent message (or an unacknowledged

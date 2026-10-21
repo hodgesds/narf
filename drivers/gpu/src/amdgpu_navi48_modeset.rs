@@ -4224,10 +4224,11 @@ impl ColdBoot {
     /// dcn401_prepare/optimize_bandwidth for the running configuration's
     /// UCLK P-state support, with no stream or plane changing. Supported
     /// (DML21's search on the running modes and the board's UCLK levels):
-    /// FAMS2 disabled, clocks raised only, every display moved to its
-    /// P-state plan with raise-only watermarks, then the exact watermarks
-    /// and UCLK switching allowed with UCLK and FCLK lowered to DPMM's
-    /// minimums, and FAMS2 disabled again (no firmware method is in use).
+    /// clocks raised only with switching still disallowed, every display
+    /// moved to its P-state plan with raise-only watermarks, FAMS2
+    /// disabled; then FAMS2 disabled again (no firmware method is in use),
+    /// the exact watermarks, and UCLK switching allowed with UCLK and FCLK
+    /// lowered to DPMM's minimums.
     /// Not supported, or `drr` (a display that should run DRR): pinned.
     /// Returns the displays whose plans moved, in pipe order.
     /// # Safety
@@ -4279,16 +4280,23 @@ impl ColdBoot {
         if current.bandwidth == bandwidth && running.iter().zip(&plans).all(|(m, p)| m.plan == *p) {
             return Ok(Vec::new());
         }
-        // prepare_bandwidth: FAMS2 off, clocks only raised, watermarks the
-        // larger of both plans'.
-        self.disable_display_fams2().await?;
-        self.update_live_display_bandwidth(bandwidth, false).await?;
+        // dcn401_prepare_bandwidth: p_state_change_support forced false, so
+        // update_clocks only raises with switching still disallowed, then
+        // the watermarks the larger of both plans', then FAMS2 off.
+        let prepare = clocks::Bandwidth {
+            uclk_pstate: false,
+            ..bandwidth
+        };
+        self.update_live_display_bandwidth(prepare, false).await?;
         for (m, plan) in running.iter().zip(&plans) {
             // SAFETY: the caller's obligations; the scanout stays live.
             unsafe { self.update_live_display_plan(m.pipe, plan, true) }.await?;
         }
-        // optimize_bandwidth: exact watermarks, then the clocks lowered and
-        // UCLK switching allowed.
+        self.disable_display_fams2().await?;
+        // dcn401_optimize_bandwidth: FAMS2 off (no firmware method is
+        // required), the exact watermarks, then the clocks lowered and UCLK
+        // switching allowed.
+        self.disable_display_fams2().await?;
         for (m, plan) in running.iter_mut().zip(&plans) {
             // SAFETY: the caller's obligations; the scanout stays live.
             let d = unsafe { self.update_live_display_plan(m.pipe, plan, false) }.await?;
@@ -4297,7 +4305,6 @@ impl ColdBoot {
             self.modesets.retain(*m);
         }
         self.update_live_display_bandwidth(bandwidth, true).await?;
-        self.disable_display_fams2().await?;
         Ok(running)
     }
     /// Light every new lightable board sink and every new end device of

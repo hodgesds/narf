@@ -2275,11 +2275,13 @@ impl ColdBoot {
         rebind_display_clocks(otg, dccg, old, new)?;
         Ok(new)
     }
-    /// Whether PMFW may switch UCLK under the running displays now.
+    /// Whether PMFW may switch UCLK under the running displays now
+    /// (`clocks::Status::uclk_switching`: a bandwidth sequence this owner
+    /// ran allowed it).
     pub fn uclk_switching(&self) -> bool {
         self.clocks
             .as_ref()
-            .is_ok_and(|c| c.status().bandwidth.uclk_pstate)
+            .is_ok_and(|c| c.status().uclk_switching())
     }
     /// dcn401_update_clocks' bandwidth part on the running configuration:
     /// the UCLK/FCLK P-state policy and floors and the deep-sleep DCFCLK
@@ -2330,25 +2332,14 @@ impl ColdBoot {
         sent.map_err(otg::Error::Firmware)?;
         released.map_err(otg::Error::Firmware)
     }
-    /// dcn401_prepare_bandwidth before a configuration change: when PMFW
-    /// may switch UCLK, FAMS2 disabled and then UCLK and FCLK raised to
-    /// their highest levels and switching disallowed, so that every plan
-    /// (pinned or not) runs again. Nothing when already pinned.
+    /// dcn401_prepare_bandwidth before a configuration change
+    /// (`bandwidth::pin_uclk`): when PMFW may switch UCLK, UCLK and FCLK
+    /// raised to their highest levels with switching disallowed, then FAMS2
+    /// disabled, so that every plan (pinned or not) runs again. Nothing when
+    /// nothing allowed switching: a fresh owner (cold boot, S3 or runtime
+    /// resume, before the display clocks are prepared) or one already pinned.
     pub async fn pin_display_uclk(&mut self) -> Result<(), otg::Error> {
-        if !self.uclk_switching() {
-            return Ok(());
-        }
-        self.disable_display_fams2().await?;
-        let levels = self
-            .clocks
-            .as_ref()
-            .map_err(|e| otg::Error::Clocks(*e))?
-            .status()
-            .levels
-            .ok_or(otg::Error::Busy)?;
-        self.update_live_display_bandwidth(clocks::Bandwidth::pinned(&levels), false)
-            .await?;
-        Ok(())
+        bandwidth::pin_uclk(self).await
     }
     /// Program `request`'s pipe clock for the selected display while the
     /// others run (their consumers left to them).
@@ -3888,6 +3879,22 @@ impl ColdBoot {
     }
 }
 
+impl bandwidth::UclkPin for ColdBoot {
+    fn clock_status(&self) -> Result<clocks::Status, otg::Error> {
+        self.display_clock_status().map_err(otg::Error::Clocks)
+    }
+    async fn raise_bandwidth(&mut self, bandwidth: clocks::Bandwidth) -> Result<(), otg::Error> {
+        self.update_live_display_bandwidth(bandwidth, false)
+            .await
+            .map(|_| ())
+    }
+    async fn disable_fams2(&mut self) -> Result<(), otg::Error> {
+        self.disable_display_fams2().await
+    }
+}
+
+#[path = "amdgpu_navi48_bandwidth.rs"]
+pub(crate) mod bandwidth;
 #[path = "amdgpu_navi48_boot_media_clients.rs"]
 mod media_clients;
 #[path = "amdgpu_navi48_boot_media.rs"]
