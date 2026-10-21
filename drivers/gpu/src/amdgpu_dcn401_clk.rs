@@ -230,6 +230,21 @@ pub struct Status {
     pub applied: Option<Applied>,
     /// What the bandwidth sequence last programmed (clk_mgr's `clks`).
     pub bandwidth: Bandwidth,
+    /// DAL messages PMFW refused whose result Linux ignores.
+    pub ignored: Ignored,
+}
+/// The bandwidth sequence's and watermark notify's DAL messages are
+/// dcn401_smu_* helpers whose result dcn401's clock manager never reads: a
+/// PMFW refusal (or an unacknowledged ActiveUclkFclk/IdleUclkFclk/UCLK
+/// floor) is logged and counted here, and the sequence goes on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ignored {
+    pub count: u32,
+    /// The last one: its message and why.
+    pub last: Option<(u32, Error)>,
+    /// The refusal code the last refused message left in the response
+    /// register, which the next message may follow.
+    pub stale_response: Option<u32>,
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Layout {
@@ -404,7 +419,9 @@ impl<I: Io> Engine<I> {
         deadline: narf_time::Deadline,
     ) -> Result<u32, Error> {
         let ready = self.settled(deadline).await?;
-        if ready != 1 {
+        // The refusal this owner last read may still sit in the response
+        // register: Linux's next message only waits for it to be nonzero.
+        if ready != 1 && Some(ready) != self.status.ignored.stale_response {
             return Err(Error::Rejected(ready));
         }
         if deadline.expired() {
@@ -419,8 +436,10 @@ impl<I: Io> Engine<I> {
         })?;
         let result = self.settled(deadline).await?;
         if result != 1 {
+            self.status.ignored.stale_response = Some(result);
             return Err(Error::Rejected(result));
         }
+        self.status.ignored.stale_response = None;
         self.access(|io| checked(io.read(base + u64::from(ARGUMENT) * 4)))
     }
     async fn command(&mut self, message: u32, parameter: u32) -> Result<u32, Error> {
@@ -585,23 +604,46 @@ impl<I: Io> Engine<I> {
                 .chip
                 .is_some_and(|chip| levels.firmware >= chip.idle_dpm_min_smu())
     }
-    /// ReturnHardMinStatus until PMFW acknowledges `clock`'s floor
-    /// (dcn401_smu_wait_hard_min_status), within one second.
-    async fn hard_min_settled(&mut self, clock: Clock) -> Result<(), Error> {
+    /// dcn401_smu_send_msg_with_param where the caller ignores the result:
+    /// a PMFW refusal is recorded (`Status::ignored`) and logged; a
+    /// transport failure still fails.
+    async fn command_ignored(&mut self, message: u32, parameter: u32) -> Result<(), Error> {
+        match self.command(message, parameter).await {
+            Ok(_) => Ok(()),
+            Err(e @ Error::Rejected(_)) => {
+                self.ignore(message, e);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+    fn ignore(&mut self, message: u32, error: Error) {
+        let i = &mut self.status.ignored;
+        i.count = i.count.saturating_add(1);
+        i.last = Some((message, error));
+        let _ = core::fmt::Write::write_fmt(
+            &mut narf_console::Writer,
+            format_args!("amdgpu: dcn401 DAL message {message:#x} not honoured: {error:?}\n"),
+        );
+    }
+    /// dcn401_smu_wait_hard_min_status after a floor whose result Linux
+    /// ignores: ReturnHardMinStatus until `clock` is acknowledged, for at
+    /// most one second (a refused status reads as no bits); no
+    /// acknowledgement is recorded and logged as ignored.
+    async fn hard_min_settled_ignored(&mut self, message: u32, clock: Clock) -> Result<(), Error> {
         let deadline = narf_time::Deadline::after_ms(1000);
         loop {
-            let bits = self.command_until(0x15, 0, deadline).await.map_err(|e| {
-                if e == Error::Timeout {
-                    Error::HardMinTimeout(clock)
-                } else {
-                    e
-                }
-            })?;
+            let bits = match self.command(0x15, 0).await {
+                Ok(bits) => bits,
+                Err(Error::Rejected(_)) => 0,
+                Err(e) => return Err(e),
+            };
             if bits & (1 << clock as u32) != 0 {
                 return Ok(());
             }
             if deadline.expired() {
-                return Err(Error::HardMinTimeout(clock));
+                self.ignore(message, Error::HardMinTimeout(clock));
+                return Ok(());
             }
             delay().await;
         }
@@ -651,7 +693,7 @@ impl<I: Io> Engine<I> {
         {
             next.deep_sleep_dcfclk_khz = new.deep_sleep_dcfclk_khz;
             if dpm(Clock::Dcf) {
-                self.command(0xd, mhz_ceil(next.deep_sleep_dcfclk_khz))
+                self.command_ignored(0xd, mhz_ceil(next.deep_sleep_dcfclk_khz))
                     .await?;
             }
         }
@@ -664,7 +706,7 @@ impl<I: Io> Engine<I> {
             uclk_active = true;
             uclk_idle = true;
             if next.uclk_pstate && dpm(Clock::Memory) {
-                self.command(0x1a, 1).await?;
+                self.command_ignored(0x1a, 1).await?;
             }
         }
         if !next.uclk_pstate && dpm(Clock::Memory) {
@@ -708,19 +750,27 @@ impl<I: Io> Engine<I> {
         // CLK_MGR401_UPDATE_ACTIVE_HARDMINS / _IDLE_HARDMINS, each waiting
         // for the UCLK floor's acknowledgement.
         if (uclk_active || fclk_active) && idle_dpm {
-            self.command(0x18, pair(active_uclk, active_fclk)?).await?;
-            self.hard_min_settled(Clock::Memory).await?;
+            self.command_ignored(0x18, pair(active_uclk, active_fclk)?)
+                .await?;
+            self.hard_min_settled_ignored(0x18, Clock::Memory).await?;
         }
         if (uclk_idle || fclk_idle) && idle_dpm {
-            self.command(0x19, pair(idle_uclk, idle_fclk)?).await?;
-            self.hard_min_settled(Clock::Memory).await?;
+            self.command_ignored(0x19, pair(idle_uclk, idle_fclk)?)
+                .await?;
+            self.hard_min_settled_ignored(0x19, Clock::Memory).await?;
         }
         if uclk_active || uclk_idle {
-            if !idle_dpm {
-                self.hard_min(Clock::Memory, active_uclk * 1000).await?;
+            // CLK_MGR401_UPDATE_HARDMIN_PPCLK for UCLK, its response unread.
+            if !idle_dpm && dpm(Clock::Memory) {
+                if active_uclk == 0 || active_uclk > u32::from(u16::MAX) {
+                    return Err(Error::Invalid);
+                }
+                self.command_ignored(9, (Clock::Memory as u32) << 16 | active_uclk)
+                    .await?;
+                self.hard_min_settled_ignored(9, Clock::Memory).await?;
             }
             if disallow && dpm(Clock::Memory) {
-                self.command(0x1a, 0).await?;
+                self.command_ignored(0x1a, 0).await?;
             }
         }
         let floor = if next.uclk_pstate {
@@ -772,9 +822,11 @@ impl<I: Io> Engine<I> {
         if !matches!(self.status.state, State::Ready | State::Applied) {
             return Err(Error::Busy);
         }
-        self.command(5, (address >> 32) as u32).await?;
-        self.command(6, address as u32).await?;
-        self.command(8, 2).await?;
+        // dcn401_smu_set_dram_addr_high/low and
+        // dcn401_smu_transfer_wm_table_dram_2_smu return nothing.
+        self.command_ignored(5, (address >> 32) as u32).await?;
+        self.command_ignored(6, address as u32).await?;
+        self.command_ignored(8, 2).await?;
         Ok(())
     }
     async fn prepare(&mut self, request: Request) -> Result<Applied, Error> {
@@ -932,6 +984,7 @@ impl ClockManager {
                 levels: None,
                 applied: None,
                 bandwidth: Bandwidth::INIT,
+                ignored: Ignored::default(),
             },
         }))
     }

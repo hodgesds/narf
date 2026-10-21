@@ -699,20 +699,32 @@ fabric clocks keep their pinned floors. Runtime commands run from
 PMFW rejection restores the previous state as in Linux, while timeout,
 revocation, device loss or cancellation leave the owner unusable.
 
-`unsafe allow_deep_sleep(DeepSleep)` is the SMU side of relaxing the pinned
-policy, following `smu_v14_0_deep_sleep_control`: it extends the allowed mask
-with one board-supported group (DS_GFXCLK+GFX_ULV, or SOCCLK/FCLK/LCLK/DCFCLK/
-UCLK deep sleep after the display power transition), sends
-`EnableSmuFeaturesLow/High` and requires every recorded protection and display
-DPM bit to stay running. Every failure is terminal. The display owner calls
-it for both groups once, where Linux's COMPLETE_INIT
-(`smu_v14_0_2_set_power_profile_mode`) enables deep sleep: right after the
-DCN4 clock owner started (display power) and installed PMFW's watermark
-ranges (`ColdBoot::start_display_clocks`, below). Every plan's watermarks
-carry DML's self-refresh exit latencies, and the bandwidth sequence sends
-the configuration's deep-sleep DCFCLK. Layout and message constants are
-checked against the Linux headers by `tests/smu14_metrics.c`; everything is
-model-tested only.
+`unsafe deep_sleep_control().await` is `smu_v14_0_deep_sleep_control(true)`
+as SMU 14.0.2 maps it: for each DS feature of Linux's walk the board supports
+(FeaturesToRun), in Linux's order DS_GFXCLK, DS_UCLK, DS_FCLK, DS_SOCCLK,
+DS_LCLK, EnableSmuFeaturesLow/High of that bit (sent again when already
+running, as Linux does). DS_VCN, the walk's last bit, is left out because the
+static media policy requires it off, and DS_MP0CLK/DS_MP1CLK have no 14.0.2
+bit. Narf's boot allowed only a restricted mask, so the walk's bits are first
+added to the allowed mask (SetAllowedFeaturesMaskHigh/Low). It runs only
+after the display power transition. The first PMFW refusal ends the walk and
+is returned in `DeepSleep::refused` (`DeepSleepRefused { feature, error }`)
+with the owner reusable, as Linux logs and returns it and its caller ignores
+it. Every recorded protection and display DPM bit must still run afterwards,
+or the owner fails; transport failures are terminal, as for every runtime
+command. Linux runs it from `smu_v14_0_2_set_power_profile_mode`
+(`smu_bump_power_profile_mode` at COMPLETE_INIT and on every profile
+change), and with `PP_SMC_POWER_PROFILE_COMPUTE` in the workload mask it
+disables deep sleep instead. Navi48 in narf has no power-profile path (no
+`pp_power_profile_mode`, no KFD compute profile), so the bootup default
+profile, which is not COMPUTE, is the only one: the display owner runs the
+enable once, right after the DCN4 clock owner started (narf turns display DPM
+on only then) and offered PMFW the watermark ranges
+(`ColdBoot::start_display_clocks`, below). A board whose display clocks never
+start keeps deep sleep off. DS_DCFCLK and GFX_ULV, which Linux's
+EnableAllSmuFeatures turns on at boot outside this walk, stay off. Layout and
+message constants are checked against the Linux headers by
+`tests/smu14_metrics.c`; everything is model-tested only.
 
 After a successful retained boot, `amdgpu_navi48_platform::run` starts
 `amdgpu_navi48_power`. Through the shared `amdgpu_hwmon` it publishes `/sys/class/hwmon/hwmon<N>` (first free N)
@@ -800,17 +812,24 @@ optimize_bandwidth may do (`should_update_pstate_support`); with idle DPM
 (`Layout::chip` Navi48, PMFW 0x681800 or later, UCLK and FCLK with more than
 one level) the active and idle UCLK/FCLK floor pairs (0x18, 0x19), otherwise
 the UCLK hard minimum; SetUclkPstateAllow(0) after the floors when
-switching is lost; the deep-sleep DCFCLK last. Each floor obeys
+switching is lost; the deep-sleep DCFCLK first. Each floor obeys
 `should_set_clock`; FCLK has no switch message on this ASIC. `prepare`
 routes its UCLK step through the same sequence with `Bandwidth::pinned`.
 `Applied::uclk_pstate` and `memory_floor_khz` (the active UCLK floor) are
-what display deadlines bind against. Failure leaves the owner failed.
+what display deadlines bind against. As in Linux, whose dcn401_smu_* helpers
+return nothing the clock manager reads, a PMFW refusal of any of these
+messages, or a UCLK floor ReturnHardMinStatus does not acknowledge within a
+second, is logged and counted in `Status::ignored` (`Ignored { count, last,
+stale_response }`; the next message may follow the refusal left in the
+response register) and the sequence goes on. Timeout, revocation, device
+loss or cancellation still leave the owner failed.
 
 `notify_wm_ranges(regs, address).await` is dcn401_notify_wm_ranges:
 SetDalDramAddrHigh/Low (5, 6) with the GPU address of
 `ClockManager::wm_range_table()` (`WatermarksExternal_t`, 112 bytes: set A
 `WATERMARKS_CLOCK_RANGE`, set 1A `WATERMARKS_DUMMY_PSTATE`), then
-TransferTableDram2Smu (8) of TABLE_WATERMARKS (2).
+TransferTableDram2Smu (8) of TABLE_WATERMARKS (2), each refusal ignored and
+logged the same way.
 
 `Starting`/`Applying` are set before awaits. Failure records `Failed(Error)`;
 cancellation leaves the in-flight state. Both prevent mailbox replay, and
@@ -5067,8 +5086,11 @@ expanded lists (`dcn401_pstate_strategy_lists_match_linux`).
 The display owner applies the answer as dcn401_prepare/optimize_bandwidth.
 `ColdBoot::start_display_clocks`, once the clock owner started, writes
 `wm_range_table` to a 4-KiB VRAM range kept out of reuse, sends
-`notify_wm_ranges` and enables SMU deep sleep (`allow_deep_sleep`, both
-groups). `ColdBoot::converge_uclk_pstate(drr)`, from every display monitor
+`notify_wm_ranges` and runs `deep_sleep_control`. Neither fails display
+bring-up: a table that cannot be placed is skipped (as Linux skips a
+missing `wm_range_table`), and every refusal or error is logged and kept in
+`ColdBoot::display_power_policy()` (`DisplayPowerPolicy { wm_ranges,
+deep_sleep }`). `ColdBoot::converge_uclk_pstate(drr)`, from every display monitor
 pass before DRR converges, searches the running configuration (every
 display scanning out without DRR, their plans one admission on the current
 `Soc`, the clock owner's UCLK levels, `display_fams2()`); a configuration

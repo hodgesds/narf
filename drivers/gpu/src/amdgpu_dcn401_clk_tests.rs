@@ -118,6 +118,7 @@ fn engine() -> Engine<Fake> {
             levels: None,
             applied: None,
             bandwidth: Bandwidth::INIT,
+            ignored: Ignored::default(),
         },
         io: Fake {
             regs: BTreeMap::from([(0x589d0, 1)]),
@@ -454,6 +455,18 @@ fn dcn401_partial_failures_and_cancellation_never_replay_mailboxes() -> TestResu
     let mut ready = engine();
     start(&mut ready);
     let start_count = ready.io.commands.len();
+    // prepare's UCLK part of the bandwidth sequence (the UCLK hard minimum,
+    // its acknowledgement and SetUclkPstateAllow(0)): Linux ignores those
+    // results, so a refusal there is logged and prepare completes.
+    ready.io.commands.clear();
+    run(ready.prepare(request())).unwrap();
+    let sequence = ready.io.commands.clone();
+    let first = sequence.iter().position(|&(m, a)| m == 9 && a >> 16 == 2);
+    let last = sequence.iter().position(|&c| c == (0x1a, 0));
+    let ignored = |step: usize| match (first, last) {
+        (Some(f), Some(l)) => (f + 1..=l + 1).contains(&step),
+        _ => false,
+    };
     for starting in [true, false] {
         let n = if starting { start_count } else { 12 };
         for step in 1..=n {
@@ -491,6 +504,11 @@ fn dcn401_partial_failures_and_cancellation_never_replay_mailboxes() -> TestResu
                     } else {
                         run(e.prepare(request())).map(|_| ())
                     };
+                    if !starting && ignored(step) {
+                        assert_eq!(result, Ok(()));
+                        assert_eq!(e.status.state, State::Applied);
+                        continue;
+                    }
                     assert_eq!(result, Err(Error::Rejected(0xfd)));
                     assert_eq!(e.status.state, State::Failed(Error::Rejected(0xfd)));
                 }
@@ -875,11 +893,27 @@ fn dcn401_bandwidth_sequence_follows_idle_dpm() -> TestResult {
     if sent != [(0xd, 11)] || kept.map(|a| a.uclk_pstate) != Ok(false) {
         return TestResult::Fail("prepare allowed UCLK switching");
     }
-    // optimize: allow, then the active and idle floors.
+    // A refused SetMinDeepSleepDcfclk is ignored like Linux's.
+    let refused = e.io.commands.len() + 1;
+    e.io.refuse = Some(refused);
+    let deeper = Bandwidth {
+        deep_sleep_dcfclk_khz: 20_000,
+        ..pstate_bw()
+    };
+    let (kept, sent) = bw(&mut e, deeper, false);
+    if sent != [(0xd, 20)]
+        || kept.is_err()
+        || e.status.ignored.last != Some((0xd, Error::Rejected(0xfd)))
+    {
+        return TestResult::Fail("refused deep-sleep DCFCLK");
+    }
+    // optimize: the deep-sleep DCFCLK lowered again, allow, then the
+    // active and idle floors.
     let (low, sent) = bw(&mut e, pstate_bw(), true);
     let low = low.unwrap();
     if sent
         != [
+            (0xd, 11),
             (0x1a, 1),
             (0x18, 300 << 16 | 96),
             (0x15, 0),
@@ -960,14 +994,44 @@ fn dcn401_bandwidth_sequence_without_idle_dpm_uses_uclk_hard_min() -> TestResult
     {
         return TestResult::Fail("UCLK raised in prepare");
     }
-    // The owner must hold applied floors; failure leaves it failed.
+    // dcn401_smu_set_hard_min_by_freq's result is unread for UCLK: a refused
+    // floor is logged and the sequence goes on (SetUclkPstateAllow(0) still
+    // follows), the owner reusable.
     e.io.refuse = Some(e.io.commands.len() + 1);
     let pinned = Bandwidth::pinned(&e.status.levels.unwrap());
-    let (failed, _) = bw(&mut e, pinned, false);
-    if failed != Err(Error::Rejected(0xfd))
-        || e.status.state != State::Failed(Error::Rejected(0xfd))
+    let (pinned_up, sent) = bw(&mut e, pinned, false);
+    if pinned_up.map(|a| a.uclk_pstate) != Ok(false)
+        || sent.first() != Some(&(9, 2 << 16 | 1258))
+        || sent.last() != Some(&(0x1a, 0))
+        || e.status.state != State::Applied
+        || e.status.ignored.count != 1
+        || e.status.ignored.last != Some((9, Error::Rejected(0xfd)))
     {
-        return TestResult::Fail("rejected bandwidth step");
+        return TestResult::Fail("refused UCLK floor ignored");
+    }
+    // A refused SetUclkPstateAllow is ignored as well.
+    e.io.refuse = Some(e.io.commands.len() + 1);
+    let (allowed, _) = bw(&mut e, pstate_bw(), true);
+    if allowed.map(|a| a.uclk_pstate) != Ok(true)
+        || e.status.ignored.last != Some((0x1a, Error::Rejected(0xfd)))
+        || e.status.state != State::Applied
+    {
+        return TestResult::Fail("refused SetUclkPstateAllow ignored");
+    }
+    // A floor PMFW never acknowledges (ReturnHardMinStatus without the
+    // UCLK bit for a second) is logged, not raised.
+    e.io.wrong_ack = true;
+    let (unacked, _) = bw(&mut e, pinned, false);
+    e.io.wrong_ack = false;
+    if unacked.is_err() || e.status.ignored.last != Some((9, Error::HardMinTimeout(Clock::Memory)))
+    {
+        return TestResult::Fail("unacknowledged UCLK floor ignored");
+    }
+    // Revocation is still a failure, and the owner is not reused.
+    e.io.revoke = Some((e.io.commands.len() + 1, e.authority));
+    let (failed, _) = bw(&mut e, pstate_bw(), true);
+    if failed != Err(Error::Revoked) || e.status.state != State::Failed(Error::Revoked) {
+        return TestResult::Fail("revoked bandwidth step");
     }
     if bw(&mut e, pinned, false).0 != Err(Error::Busy) {
         return TestResult::Fail("failed owner reused");
@@ -999,6 +1063,21 @@ fn dcn401_watermark_ranges_reach_pmfw() -> TestResult {
         || e.io.commands != [(5, 8), (6, 0x0040_1000), (8, 2)]
     {
         return TestResult::Fail("watermark table transfer");
+    }
+    // The dcn401_smu_* helpers return nothing: a refusal is logged and the
+    // remaining messages are sent.
+    e.io.commands.clear();
+    e.io.refuse = Some(2);
+    if run(e.notify_wm_ranges(0x8_0040_1000)).is_err()
+        || e.io.commands != [(5, 8), (6, 0x0040_1000), (8, 2)]
+        || e.status.ignored.last != Some((6, Error::Rejected(0xfd)))
+        || e.status.state != State::Ready
+    {
+        return TestResult::Fail("refused watermark message");
+    }
+    // The display still lights: the pre-modeset floors apply as before.
+    if run(e.prepare(request())).is_err() || e.status.state != State::Applied {
+        return TestResult::Fail("prepare after a refused watermark notify");
     }
     TestResult::Pass
 }

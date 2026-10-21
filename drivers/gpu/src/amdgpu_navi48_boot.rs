@@ -522,6 +522,21 @@ pub struct ColdBoot {
     client_heap: Option<crate::amdgpu_gem::VramHeap>,
     /// The inventory's VRAM past the BAR, all of it for clients.
     unmapped_vram: Option<crate::amdgpu_vram::UnmappedPool>,
+    /// The display power policy's outcome, once the display clocks started.
+    display_power_policy: Option<DisplayPowerPolicy>,
+}
+/// What the display power policy did (`ColdBoot::display_power_policy`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayPowerPolicy {
+    pub wm_ranges: Result<(), clocks::Error>,
+    /// `None` without an SMU owner.
+    pub deep_sleep: Option<Result<smu::DeepSleep, smu::Error>>,
+}
+fn log_policy(args: core::fmt::Arguments<'_>) {
+    let _ = core::fmt::Write::write_fmt(
+        &mut narf_console::Writer,
+        format_args!("amdgpu: navi48 display power policy: {args}\n"),
+    );
 }
 /// Rebind every clock record and every display's timing records from the
 /// global clocks `old` to `new`, which are now running.
@@ -708,6 +723,7 @@ impl ColdBoot {
             client_vram: None,
             client_heap: None,
             unmapped_vram: unmapped,
+            display_power_policy: None,
             reset: None,
             baco_exited: false,
             sequence: alloc::boxed::Box::new(Sequence {
@@ -1524,17 +1540,52 @@ impl ColdBoot {
             return Err(clocks::Error::Busy);
         }
         if starting {
-            self.install_display_power_policy().await?;
+            self.install_display_power_policy().await;
         }
         Ok(())
     }
     /// What Linux does once DC knows the clocks, and then at COMPLETE_INIT:
     /// dcn401_init_hw's dcn401_notify_wm_ranges hands PMFW the watermark
     /// range table (set A, and set 1A for the dummy P-state), and
-    /// smu_v14_0_2_set_power_profile_mode's smu_v14_0_deep_sleep_control
-    /// (true) lets PMFW enter every deep-sleep state the board supports.
-    /// The table stays excluded from reuse.
-    async fn install_display_power_policy(&mut self) -> Result<(), clocks::Error> {
+    /// smu_bump_power_profile_mode's smu_v14_0_2_set_power_profile_mode runs
+    /// smu_v14_0_deep_sleep_control(true) for the default workload (narf has
+    /// no power-profile or compute-profile path on Navi48, so the bootup
+    /// default profile, which is not COMPUTE, is the only one). As in Linux,
+    /// nothing here fails display bring-up: a table that cannot be placed
+    /// is skipped, and refusals are logged and recorded
+    /// (`display_power_policy`). The table stays excluded from reuse.
+    async fn install_display_power_policy(&mut self) {
+        let wm_ranges = self.notify_display_wm_ranges().await;
+        if let Err(e) = wm_ranges {
+            log_policy(format_args!("watermark ranges not sent: {e:?}"));
+        }
+        let deep_sleep = match self.sequence.backend.smu.as_mut() {
+            // SAFETY: the kernel engines' owners tolerate GFXCLK deep sleep
+            // as Linux's do; every plan's watermarks carry DML's
+            // self-refresh exit latencies and the deep-sleep DCFCLK floor,
+            // and the watermark ranges were offered to PMFW above.
+            Some(smu) => Some(unsafe { smu.deep_sleep_control() }.await),
+            None => None,
+        };
+        match deep_sleep {
+            Some(Ok(smu::DeepSleep {
+                refused: Some(r), ..
+            })) => log_policy(format_args!(
+                "failed to enable {} DS: {:?}",
+                r.feature, r.error
+            )),
+            Some(Err(e)) => log_policy(format_args!("deep sleep not enabled: {e:?}")),
+            _ => {}
+        }
+        self.display_power_policy = Some(DisplayPowerPolicy {
+            wm_ranges,
+            deep_sleep,
+        });
+    }
+    /// dcn401_notify_wm_ranges with a table in a 4-KiB VRAM range kept out
+    /// of reuse (Linux's wm_range_table, which is skipped when it could
+    /// not be allocated).
+    async fn notify_display_wm_ranges(&mut self) -> Result<(), clocks::Error> {
         let mut table = self
             .sequence
             .backend
@@ -1558,24 +1609,12 @@ impl ColdBoot {
         drop(table);
         let regs = self.sequence.backend.gpu.regs;
         let clocks = self.clocks.as_mut().map_err(|e| *e)?;
-        clocks.notify_wm_ranges(regs, address).await?;
-        let smu = self
-            .sequence
-            .backend
-            .smu
-            .as_mut()
-            .ok_or(clocks::Error::Invalid)?;
-        for group in [smu::DeepSleep::Graphics, smu::DeepSleep::MemoryFabric] {
-            // SAFETY: the kernel engines are drained (start_display_clocks'
-            // queue and SDMA checks) and, like Linux's, tolerate GFXCLK deep
-            // sleep; no display runs yet, every later plan's watermarks
-            // carry DML's self-refresh exit latencies and SetMinDeepSleepDcfclk
-            // floor, and the watermark ranges were installed above.
-            unsafe { smu.allow_deep_sleep(group) }
-                .await
-                .map_err(clocks::Error::Power)?;
-        }
-        Ok(())
+        clocks.notify_wm_ranges(regs, address).await
+    }
+    /// What the display power policy did once the display clocks started:
+    /// the watermark-range notify and the deep-sleep walk.
+    pub fn display_power_policy(&self) -> Option<DisplayPowerPolicy> {
+        self.display_power_policy
     }
     pub fn display_pipe_clock_status(&self) -> Result<dccg::Status, dccg::Error> {
         self.dccg.as_ref().map(dccg::Dccg::status).map_err(|e| *e)
