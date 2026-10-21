@@ -2309,12 +2309,14 @@ impl FileOps for MemFile {
             // the last write stored — the tar -x / cp -p / make
             // round-trip. 0 (never stamped) stays 0.
             //
-            // `ns_to_cycles` is the exact inverse of the `cycles_to_ns`
-            // the stat path applies, so the round-trip is lossless. The
-            // old pair was `* cycles_per_ns()` here and `/ cycles_per_ns()`
-            // there — self-cancelling ONLY because both were the same
-            // truncated integer, which stopped being true the moment
-            // either side moved to the calibrated scale.
+            // This projection is NOT an exact inverse of `cycles_to_ns`:
+            // the calibrated mult/shift pair can lose a nanosecond. The
+            // stat/statx ABI and overlay copy-up therefore read the exact
+            // value from `inode_attrs().mtime_ns`; this field only serves
+            // callers that compare or order mtimes. The old pair was
+            // `* cycles_per_ns()` here and `/ cycles_per_ns()` there,
+            // self-cancelling ONLY while both were the same truncated
+            // integer.
             mtime_cycles: narf_time::ns_to_cycles(self.times.mtime()),
         }
     }
