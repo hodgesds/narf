@@ -70,9 +70,14 @@
 # mpc_vectors.txt is as plane_vectors.txt, planned with MPC_AUTO (DC's auto
 # mpcc_combine_factor, where every other file forces 1): planes one DPP
 # cannot carry take two ("/2"). --regenerate-mpc answers its inputs again.
+# pstate_vectors.txt is checked with harness_pstate.c: DCN401's PMO left on
+# (the UCLK P-state strategy search, with or without FAMS2 firmware) over a
+# board's whole UCLK DPM table; each line is Linux's chosen strategy, latency
+# level, DPMM minimums, plans, FAMS2 stream states and candidate list.
+# --regenerate-pstate answers its inputs again.
 set -euo pipefail
 case ${1:-} in
---regenerate-odm34 | --regenerate-mpc | --regenerate-surface-mpc)
+--regenerate-odm34 | --regenerate-mpc | --regenerate-surface-mpc | --regenerate-pstate)
 	regenerate=$1
 	shift ;;
 *) regenerate= ;;
@@ -124,6 +129,21 @@ cc -O1 -w "${inc[@]}" "$here/harness.c" "$work/strict_calcs.o" $others -lm -o "$
 cc -O1 -w "${inc[@]}" "$here/harness_multi.c" "$work/strict_calcs.o" $others -lm -o "$work/strict_multi"
 cc -O1 -w "${inc[@]}" "$here/harness_planes.c" "$work/strict_calcs.o" $others -lm -o "$work/strict_planes"
 cc -O1 -w "${inc[@]}" "$here/harness_surfaces.c" "$work/strict_calcs.o" $others -lm -o "$work/strict_surfaces"
+cc -O1 -w "${inc[@]}" "$here/harness_pstate.c" "$work/strict_calcs.o" $others -lm -o "$work/strict_pstate"
+
+# pstate_answer: answer pstate_vectors.txt inputs from stdin with Linux
+# (harness_pstate.c).
+pstate_answer() {
+	local line out a
+	while read -r line; do
+		read -ra a <<< "$line"
+		out=$("$work/strict_pstate" "${a[@]}")
+		case $out in
+		PSTATE*) echo "$line = ${out#PSTATE }" ;;
+		*) echo "$line ! REJECT" ;;
+		esac
+	done
+}
 
 # surface_answer <inputs> <strict_surfaces output>: the surface_vectors.txt
 # (and surface_mpc_vectors.txt) result.
@@ -228,6 +248,9 @@ elif [ "$regenerate" = --regenerate-mpc ]; then
 	exit 0
 elif [ "$regenerate" = --regenerate-surface-mpc ]; then
 	regenerate_file "$here/surface_mpc_vectors.txt" surface_mpc_answer
+	exit 0
+elif [ "$regenerate" = --regenerate-pstate ]; then
+	regenerate_file "$here/pstate_vectors.txt" pstate_answer
 	exit 0
 fi
 
@@ -567,4 +590,12 @@ check_surfaces "$here/surface_vectors.txt" || mfail=1
 check_answered "$here/odm34_vectors.txt" odm34_answer || mfail=1
 check_answered "$here/mpc_vectors.txt" mpc_answer || mfail=1
 check_answered "$here/surface_mpc_vectors.txt" surface_mpc_answer || mfail=1
+check_answered "$here/pstate_vectors.txt" pstate_answer || mfail=1
+# pstate_strategies.txt: PMO's expanded strategy list per display count.
+if "$work/strict_pstate" --strategies | cmp -s - "$here/pstate_strategies.txt"; then
+	echo "dcn401 DML21 pstate_strategies: lists match"
+else
+	echo "MISMATCH: pstate_strategies.txt" >&2
+	mfail=1
+fi
 [ $fail -eq 0 ] && [ $mfail -eq 0 ]

@@ -1368,9 +1368,10 @@ VCO and DCHUB reference clock. Constants come from `dml2_socbb_dcn401`, the
 DCN4 variant-A QoS table and `dml2_dcn401_max_ip_caps`. The calculation applies
 DCN4's min-clock-table derivation for the single UCLK level, checks bandwidth
 against the maximum clocks and latency/programming at the derived state, and
-reproduces DPMM's DISPCLK/DPPREFCLK/DPPCLK rounding. UCLK switching is
-disabled by native policy, so PMO pstate strategies are never searched; the
-UCLK watermark is still the real blackout-plus-urgent value. PMO's stutter
+reproduces DPMM's DISPCLK/DPPREFCLK/DPPCLK rounding. These pinned plans
+never search PMO's UCLK P-state strategies (`dml::pstate::admit` does, see
+"Navi 48 UCLK P-state switching"); the UCLK watermark is still the real
+blackout-plus-urgent value. PMO's stutter
 phase is kept: 54 us of blank is reserved for self-refresh when the nominal
 blank is at least three times that and the mode still passes.
 
@@ -4926,6 +4927,66 @@ zpos, as on the other native planes (Linux attaches it first); cursor
 updates are not tear-free (one cursor buffer per pipe). Model-tested only
 (`drivers/gpu/drm`, `drivers/gpu/drm_ioctl`, `navi48-kms`); not validated on
 hardware.
+
+### Navi 48 UCLK P-state switching
+
+`amdgpu_dcn401_dml::pstate::admit(&Soc, &UclkLevels, &[Mode], fams2) ->
+Result<Pstate, Error>` is DML21's `dml2_top_soc15_build_mode_programming`
+from the latency phase on, with DCN401's PMO left on, over the board's whole
+UCLK DPM table (`UclkLevels`: one to eight ascending levels, the last the
+pinned `Soc::uclk_khz`). The configuration must first admit natively
+(`admit_native`). `dml2_mcg_dcn4`'s fine-grained min-clock table gives each
+level its DRAM bandwidth and the FCLK/DCFCLK DML assumes (every level above
+the first at least the balanced fabric clock of the level below, clamped,
+pruned past the DCFCLK/FCLK maxima and de-duplicated). Mode support runs at
+the lowest entry, else the highest and phase 1's binary search; at an entry
+above the first the per-UCLK QoS row is variant A's empty second row, so the
+maximum urgent latency loses its UCLK term, as in Linux.
+
+The UCLK P-state phase is `dml2_pmo_dcn4_fams2.c`: DC's options for DCN401
+(`dml21_populate_pmo_options` with the debug defaults: vblank on; SubVP,
+clamped and variable DRR and FAMS2 on only with `fams2`, i.e. DMUB firmware
+reporting FAMS 2.1; even-odd off), the base strategy lists expanded into
+their permutations and DRR variants (`pstate::strategies(n)`), per-stream
+P-state meta (vline time, scheduling/contention/interrupt/allow-to-target
+lines, blackout, vactive fill delay and allow window, vblank window, SubVP
+microschedule and phantom size, DRR stretch), vactive capability (margin at
+least a quarter of the 400-us blackout), synchronized timing groups and
+validate_pstate_support_strategy_cofunctionality with is_config_schedulable
+(stages 1-4), the first ten candidates. Each candidate's overrides (vactive:
+the excess fill bandwidth of the blackout's bytes over its fill delay, and
+mode support requiring the vactive margin; vblank: 400 us reserved) are run
+through mode support at the current latency index, which candidates allowing
+it raise on failure; pmo_dcn4_fams2_test_for_pstate_support accepts the
+first. The stutter phase then raises every plane to the 54-us reservation if
+mode support still passes. DPMM maps the result: active minimums boosted to
+the SVP-prefetch ones, idle minimums from the idle average derates, UCLK
+rounded up to its DPM table, FCLK/DCFCLK fine-grained, FCLK P-state from the
+planes' vactive hiding (clamped to the FCLK maximum when unsupported).
+
+`Pstate::Supported` carries each stream's plan at the chosen latency level
+(`Plan::pstate: Some(PlanPstate)` records the table, `fams2` and the
+stream's `pstate::Method`; `Plan::readmits` repeats this search), the
+methods, the level, the active and idle `MinClocks`, FCLK P-state support and
+each stream's FAMS2 static base state (`Fams2Stream`, as
+dml2_core_calcs_get_stream_fams2_programming fills it). The port programs
+the hardware-exclusive methods only: `Pstate::Pinned(Pinned::Firmware(m))`
+when Linux's search would reach a firmware method first (SubVP unless its
+phantom planes or streams certainly do not fit; DRR never arises, every
+native stream has `drr_config` disabled), `Pinned::Unsupported` when Linux
+finds no strategy, and `Pinned::Port` for a DCC plane (MRQ meta rows) or a
+DPMM clock above the latency state. Native admission (`admit_native`) is
+unchanged and never carries a P-state record.
+
+`tests/dcn401_dml21/pstate_vectors.txt` (212 configurations on 16- and
+8-channel boards with four, two and one UCLK levels, with and without FAMS2:
+single streams from 720p60 to 8K60, pairs, triples and quads, scaled planes,
+overlays, HDMI 4:2:0, RGB565 and FP16) is answered by `harness_pstate.c`
+(check.sh) and replayed by `dcn401_pstate_matches_linux_dml21_vectors`: the
+candidate list, the chosen strategy, level and DPMM clocks, every plane's
+plan values and every stream's FAMS2 state exactly (Linux's ±1 tolerances),
+or the documented firmware pin. `pstate_strategies.txt` holds PMO's
+expanded lists (`dcn401_pstate_strategy_lists_match_linux`).
 
 ### Discrete RDNA2 PSP secure-OS bootstrap
 

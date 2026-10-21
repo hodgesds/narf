@@ -6,7 +6,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 const VECTORS: &str = include_str!("../tests/dcn401_dml21/vectors.txt");
 /// Deep-sleep DCFCLK and the three urgent-bandwidth fractions truncate a
 /// double in Linux and a fixed-point value here; they may differ by one.
-const TOLERATED: [usize; 4] = [3, 47, 48, 49];
+pub(super) const TOLERATED: [usize; 4] = [3, 47, 48, 49];
 /// The vector files before mpc_vectors.txt were planned with
 /// `mpcc_combine_factor` 1 (MPC combine off).
 const NO_MPC: Policy = Policy { mpc_combine: false };
@@ -67,7 +67,7 @@ fn inputs(f: &[u32]) -> (Soc, Mode) {
         },
     )
 }
-fn values(p: &Plan) -> [u32; 62] {
+pub(super) fn values(p: &Plan) -> [u32; 62] {
     let (c, g, d, t, w, a) = (p.clocks, p.sync, p.dlg, p.ttu, p.watermarks, p.arbiter);
     [
         c.dispclk_khz,
@@ -146,11 +146,12 @@ fn error_name(e: Error) -> &'static str {
         Error::UrgentLatencyHiding => "UrgentLatencyHiding",
         Error::Bandwidth => "Bandwidth",
         Error::TempRead => "TempRead",
+        Error::PstateLatency => "PstateLatency",
         Error::Register => "Register",
         Error::Pipes => "Pipes",
     }
 }
-fn parse<'a>(words: &mut impl Iterator<Item = &'a str>, out: &mut [u32]) -> bool {
+pub(super) fn parse<'a>(words: &mut impl Iterator<Item = &'a str>, out: &mut [u32]) -> bool {
     for slot in out.iter_mut() {
         match words.next().and_then(|w| w.parse().ok()) {
             Some(v) => *slot = v,
@@ -164,7 +165,7 @@ fn parse<'a>(words: &mut impl Iterator<Item = &'a str>, out: &mut [u32]) -> bool
 /// slices (check.sh has verified every further pipe's other registers
 /// equal the first's); otherwise the plan's first plane must be
 /// single-pipe.
-fn pipes_match<'a, I: Iterator<Item = &'a str>>(
+pub(super) fn pipes_match<'a, I: Iterator<Item = &'a str>>(
     words: &mut core::iter::Peekable<I>,
     plan: &Plan,
 ) -> bool {
@@ -1020,7 +1021,7 @@ const PLANE_VECTORS: &str = include_str!("../tests/dcn401_dml21/plane_vectors.tx
 
 /// `plan` as plane `k` of its stream sees it: the plane's DPPCLK, DLG,
 /// TTU, DET and ODM blank end in the stream's plan.
-fn plane_view(plan: &Plan, k: usize) -> Option<Plan> {
+pub(super) fn plane_view(plan: &Plan, k: usize) -> Option<Plan> {
     let p = plan.plane(k)?;
     Some(Plan {
         clocks: Clocks {

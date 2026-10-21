@@ -42,9 +42,10 @@
 //! every pipe rather than DML's own allocation (four pipes fit the 1280-KiB
 //! DET pool exactly). Anything else is rejected, not approximated.
 //!
-//! Policy mirrors the native clock owner: memory clock switching is disabled
-//! for the whole scanout, so DML's UCLK pstate strategies are never searched
-//! (the uclk watermark is still computed, never left at zero). Linux's stutter
+//! These plans are the native pinned-UCLK policy: one UCLK level, the
+//! highest, and no UCLK P-state strategy (the uclk watermark is still
+//! computed, never left at zero). [`pstate`] runs DML21's P-state search
+//! over the whole UCLK table for configurations that relax it. Linux's stutter
 //! reservation is kept: when the nominal blank is long enough, 54 us of it are
 //! budgeted for self-refresh entry and exit if the mode still passes with them.
 //!
@@ -56,6 +57,11 @@
 use crate::amdgpu_dcn401_otg::GlobalSync;
 use crate::amdgpu_dml::{Fx, Timing};
 use alloc::vec::Vec;
+pub use pstate::PlanPstate;
+
+/// UCLK P-state switching with displays lit (DML21's PMO and DPMM).
+#[path = "amdgpu_dcn401_pstate.rs"]
+pub mod pstate;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -82,6 +88,9 @@ pub enum Error {
     Bandwidth,
     /// Active latency hiding cannot cover a GDDR6 temperature-read blackout.
     TempRead,
+    /// A plane a UCLK P-state candidate switches in vactive cannot hide the
+    /// DRAM clock change there (global_dram_clock_change_support_required).
+    PstateLatency,
     /// A DLG/TTU value exceeds the range DML asserts for its register field.
     Register,
     /// The streams need more than the four DPP/OPP pipes DCN4.0.1 has
@@ -631,8 +640,14 @@ pub struct Plan {
     /// Each further ODM pipe's `refcyc_h_blank_end` (pipes 1 to 3): the
     /// blank end moved by the segments before it. Zero past `pipes`.
     pub odm_refcyc_h_blank_end: [u32; 3],
-    /// Vertical blank budgeted for self-refresh entry and exit, if any.
+    /// The vertical blank the stream's first plane reserves
+    /// (`reserved_vblank_time_ns`): for self-refresh entry and exit, or a
+    /// vblank UCLK P-state strategy's blackout.
     pub stutter_reserved_us: u32,
+    /// The UCLK P-state configuration this plan belongs to (DML21's PMO
+    /// chose a strategy and DPMM a UCLK level), or `None` for the native
+    /// pinned-UCLK plan.
+    pub pstate: Option<PlanPstate>,
     /// Every other mode admitted together with this one, in admission
     /// order (this plan's own, `mode`, belongs at `stream`; `joint_modes`
     /// lists them all). A plan is only valid in that configuration. Plans
@@ -929,6 +944,10 @@ struct State {
     fclk: Fx,
     uclk: Fx,
     dram_bw: Fx,
+    /// The min-clock-table index is 0. get_max_urgent_latency_us indexes
+    /// the per-UCLK QoS table by it, and dcn4x variant A fills only entry
+    /// 0: above it the UCLK term of the maximum urgent latency is zero.
+    first_level: bool,
 }
 #[derive(Clone, Copy)]
 struct Available {
@@ -987,10 +1006,14 @@ fn latency(s: State, uclk_khz: u64) -> Latency {
     Latency {
         urgent,
         trip: urgent.max(trip),
-        max_urgent: u(MAX_LATENCY_URGENT_UCLK)
-            .times(margin(UMC_MAX_MARGIN))
-            .plus(f(MALL_OVERHEAD_FCLK))
-            .plus(round_trip),
+        max_urgent: u(if s.first_level {
+            MAX_LATENCY_URGENT_UCLK
+        } else {
+            0
+        })
+        .times(margin(UMC_MAX_MARGIN))
+        .plus(f(MALL_OVERHEAD_FCLK))
+        .plus(round_trip),
         df_response: f(DF_QOS_RESPONSE_FCLK),
         avg_urgent: avg(AVG_LATENCY_URGENT_UCLK),
         avg_non_urgent: avg(AVG_LATENCY_NON_URGENT_UCLK),
@@ -1367,14 +1390,58 @@ struct Evaluation {
     extra: Fx,
     extra_sr: Fx,
     t_calc: Fx,
-    t_wait: Fx,
+    /// TWait of each plane (CalculateTWait: its reserved vblank time and
+    /// the urgent or trip latency).
+    t_wait: [Fx; MAX_PLANES],
     lat: Latency,
     frac_nom: Fx,
     frac_mall: Fx,
     non_urgent_sdp: Fx,
-    /// Urgent SDP bandwidth over every surface (urg_bandwidth_required_flip
-    /// with no flip), in MB/s.
+    /// Urgent SDP and DRAM bandwidth over every surface
+    /// (urg_bandwidth_required_flip with no flip), in MB/s.
     urgent_sdp: Fx,
+    urgent_dram: Fx,
+    /// Each plane's surface_avg_vactive_required_bw and
+    /// surface_peak_required_bw, `[sdp, dram]` (the SVP-prefetch state's are
+    /// the same: no plane uses the MALL).
+    avg: [[Fx; 2]; MAX_PLANES],
+    peak: [[Fx; 2]; MAX_PLANES],
+    /// calculate_bytes_to_fetch_required_to_hide_latency for the UCLK
+    /// blackout: each plane's luma and chroma bytes.
+    pstate_bytes: [[u32; 2]; MAX_PLANES],
+}
+
+/// What a UCLK P-state candidate sets on each plane, in admission order
+/// (dml2_plane_parameters.overrides as dml2_pmo_dcn4_fams2 fills them, and
+/// stage3.pstate_switch_modes).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Overrides {
+    /// `reserved_vblank_time_ns`, in whole microseconds (PMO only reserves
+    /// whole microseconds: the stutter and blackout latencies).
+    pub reserved_us: [i64; MAX_PLANES],
+    /// `max_vactive_det_fill_delay_us[dml2_pstate_type_uclk]`: zero for no
+    /// excess vactive fill bandwidth.
+    pub fill_delay_us: [u32; MAX_PLANES],
+    /// The plane switches in vactive (`dml2_pstate_method_vactive` or
+    /// `_fw_vactive_drr`): mode support then requires its vactive margin
+    /// (global_dram_clock_change_support_required).
+    pub vactive: [bool; MAX_PLANES],
+}
+
+impl Overrides {
+    /// The base configuration: nothing reserved.
+    pub(crate) const NONE: Self = Self {
+        reserved_us: [0; MAX_PLANES],
+        fill_delay_us: [0; MAX_PLANES],
+        vactive: [false; MAX_PLANES],
+    };
+    /// Every plane reserving `us`.
+    fn all(us: i64) -> Self {
+        Self {
+            reserved_us: [us; MAX_PLANES],
+            ..Self::NONE
+        }
+    }
 }
 
 /// DML's math_ceil2(x, 1) for a non-negative double.
@@ -1882,6 +1949,27 @@ impl Shape {
             channels,
         )
     }
+    /// calculate_bytes_to_fetch_required_to_hide_latency for the UCLK
+    /// blackout (dram_clk_change_blackout_us), luma then chroma: the source
+    /// lines its destination lines need, rounded up to whole swaths, over
+    /// every DPP's swath, in Linux's doubles. A DCC plane (MRQ: its meta
+    /// rows also count) is refused before this is used.
+    fn pstate_bytes(&self) -> [u32; 2] {
+        let line_us = f64::from(self.t.h_total) / f64::from(self.t.pixel_clock_khz) * 1000.0;
+        let dst = (DRAM_CLK_CHANGE_US as f64 / line_us + 0.99999) as i32 as u32;
+        let bytes = |u: &Surf| {
+            let h = f64::from(u.height);
+            if h == 0.0 {
+                return 0;
+            }
+            let src =
+                ((ratio_f(u.v_ratio) * f64::from(dst) / h + 0.99999) as i32 as f64 * h) as u32;
+            src.wrapping_mul(self.dpps)
+                .wrapping_mul(u.swath)
+                .wrapping_mul(u.bpp)
+        };
+        [bytes(&self.y), self.c.as_ref().map_or(0, bytes)]
+    }
     /// The surfaces of the plane: luma, then a 4:2:0 plane's chroma.
     fn surfaces(&self) -> impl Iterator<Item = &Surf> {
         core::iter::once(&self.y).chain(self.c.iter())
@@ -2275,7 +2363,7 @@ fn evaluate(
     bw_state: State,
     uclk_khz: u64,
     clk: &[PipeClocks],
-    reserved_us: i64,
+    ov: &Overrides,
 ) -> Result<Evaluation, Error> {
     let mp = clk[0].khz.is_some();
     let lat = latency(lat_state, uclk_khz);
@@ -2298,12 +2386,17 @@ fn evaluate(
     let extra = outstanding.plus(t_arb);
     // Deep-sleep DCFCLK is global: every pipe carries the same value.
     let t_calc = fx(24).over(clk[0].deep_sleep);
-    let t_wait = fx(reserved_us).plus(lat.urgent.max(lat.trip));
+    let mut t_wait = [Fx::ZERO; MAX_PLANES];
     let mut planes = [Schedule::default(); MAX_PLANES];
     let (mut urgent, mut non_urgent) = (Fx::ZERO, Fx::ZERO);
     let (mut urgent_dram, mut non_urgent_dram) = (Fx::ZERO, Fx::ZERO);
+    let mut avg = [[Fx::ZERO; 2]; MAX_PLANES];
+    let mut peak = [[Fx::ZERO; 2]; MAX_PLANES];
+    let mut pstate_bytes = [[0u32; 2]; MAX_PLANES];
     for (k, shape) in shapes.iter().enumerate() {
-        let pre = shape.prefetch(clk[k], &lat, t_wait, extra, t_calc, mp);
+        // CalculateTWait: no GDDR6 blackout without DRR.
+        t_wait[k] = fx(ov.reserved_us[k]).plus(lat.urgent.max(lat.trip));
+        let pre = shape.prefetch(clk[k], &lat, t_wait[k], extra, t_calc, mp);
         // NotEnoughUrgentLatencyHiding for active fetch, then the schedule.
         let burst = shape
             .burst(&shape.y, lat.urgent, shape.y.vratio)
@@ -2336,15 +2429,25 @@ fn evaluate(
             None => None,
         };
         // calculate_peak_bandwidth_required (get_urgent_bandwidth_required):
-        // no flip, VM, cursor or excess vactive fill; unity MALL factors and
-        // DCC's DRAM overhead on DRAM only. Active bandwidth is the
-        // surface's; prefetch is per pipe.
+        // no flip, VM or cursor; unity MALL factors and DCC's DRAM overhead
+        // on DRAM only. Active bandwidth is the surface's; prefetch is per
+        // pipe. A vactive P-state candidate adds the bandwidth that refills
+        // the blackout's bytes within its fill delay
+        // (calculate_excess_vactive_bandwidth_required).
         let pipes = fx(i64::from(shape.dpps));
         let vbw_y = shape.y.vactive_bw;
         let vbw_c = shape.c.map_or(
             Fx::ZERO,
             |c| if mp { c.vactive_bw_mp } else { c.vactive_bw },
         );
+        pstate_bytes[k] = shape.pstate_bytes();
+        let (fill_y, fill_c) = match ov.fill_delay_us[k] {
+            0 => (Fx::ZERO, Fx::ZERO),
+            d => (
+                q(i64::from(pstate_bytes[k][0]), i64::from(d)),
+                q(i64::from(pstate_bytes[k][1]), i64::from(d)),
+            ),
+        };
         // One bandwidth sum: `bursts` (active, prefetch luma and chroma)
         // and the DRAM factors (nominal, prefetch luma and chroma).
         let required = |bursts: Option<[Fx; 4]>, nom: [Fx; 2], pref: [Fx; 2]| {
@@ -2365,7 +2468,10 @@ fn evaluate(
                 pre.prefetch_bw_c.times(bpref_c),
             )
             .times(pipes);
-            let excess = with_c(scale(vbw_y, nom[0]), scale(vbw_c, nom[1]));
+            let excess = with_c(
+                scale(vbw_y.plus(fill_y), nom[0]),
+                scale(vbw_c.plus(fill_c), nom[1]),
+            );
             active.max(prefetch).max(prefetch_max).max(excess)
         };
         let bursts = [
@@ -2375,10 +2481,31 @@ fn evaluate(
             pre_burst_c.unwrap_or(Fx::ZERO),
         ];
         let unity = [Fx::ONE; 2];
-        urgent = urgent.plus(required(Some(bursts), unity, unity));
-        non_urgent = non_urgent.plus(required(None, unity, unity));
-        urgent_dram = urgent_dram.plus(required(Some(bursts), shape.dram_nom, shape.dram_pref));
-        non_urgent_dram = non_urgent_dram.plus(required(None, shape.dram_nom, shape.dram_pref));
+        let (u, n) = (
+            required(Some(bursts), unity, unity),
+            required(None, unity, unity),
+        );
+        let (ud, nd) = (
+            required(Some(bursts), shape.dram_nom, shape.dram_pref),
+            required(None, shape.dram_nom, shape.dram_pref),
+        );
+        urgent = urgent.plus(u);
+        non_urgent = non_urgent.plus(n);
+        urgent_dram = urgent_dram.plus(ud);
+        non_urgent_dram = non_urgent_dram.plus(nd);
+        // The first get_urgent_bandwidth_required call (no bursts, prefetch
+        // or excess fill) is the surface's average vactive bandwidth; every
+        // call raises its peak.
+        let scale = |v: Fx, f: Fx| if f == Fx::ONE { v } else { v.times(f) };
+        let with_c = |v: Fx, c: Fx| if shape.c.is_some() { v.plus(c) } else { v };
+        avg[k] = [
+            with_c(vbw_y, vbw_c),
+            with_c(
+                scale(vbw_y, shape.dram_nom[0]),
+                scale(vbw_c, shape.dram_nom[1]),
+            ),
+        ];
+        peak[k] = [avg[k][0].max(u).max(n), avg[k][1].max(ud).max(nd)];
         planes[k] = pre;
     }
     // check_urgent_bandwidth_support for sys-active and, with a MALL,
@@ -2404,6 +2531,10 @@ fn evaluate(
         frac_mall: frac[1],
         non_urgent_sdp: non_urgent,
         urgent_sdp: urgent,
+        urgent_dram,
+        avg,
+        peak,
+        pstate_bytes,
     })
 }
 
@@ -2419,6 +2550,16 @@ impl Shape {
         surfaces: usize,
         compbuf_bytes: u32,
     ) -> bool {
+        let urgent_wm = e.lat.urgent.plus(e.extra);
+        self.active_hiding(pre, surfaces, compbuf_bytes)
+            .minus(e.lat.g6_temp_read.plus(urgent_wm))
+            >= Fx::ZERO
+    }
+    /// CalculateWatermarksMALLUseAndDRAMSpeedChangeSupport's
+    /// ActiveClockChangeLatencyHiding (VActiveLatencyHidingUs): the line
+    /// buffer and DET lines past the pipe's delay, the lesser of luma and
+    /// chroma, with several surfaces each giving up part of a swath.
+    fn active_hiding(&self, pre: &Schedule, surfaces: usize, compbuf_bytes: u32) -> Fx {
         let unity = i64::from(Plane::UNITY);
         let hiding = |u: &Surf, det: u64| {
             // LBLatencyHidingSourceLines: the lines the line buffer holds of
@@ -2456,8 +2597,7 @@ impl Shape {
         if let Some(c) = &self.c {
             hidden = hidden.min(hiding(c, u64::from(c.det_bytes)));
         }
-        let urgent_wm = e.lat.urgent.plus(e.extra);
-        hidden.minus(e.lat.g6_temp_read.plus(urgent_wm)) >= Fx::ZERO
+        hidden
     }
 }
 
@@ -2709,14 +2849,107 @@ fn shapes_for(
     Ok(shapes)
 }
 
-/// Mode support and (unless `support_only`, which returns no plans) mode
-/// programming of `shapes`.
-fn plan_shapes(
-    soc: &Soc,
-    modes: &[Mode],
-    mut shapes: Vec<Shape>,
-    support_only: bool,
-) -> Result<Vec<Plan>, Error> {
+/// One `dml2_mcg_dcn4` min-clock-table entry DML evaluates a configuration
+/// at: the UCLK level, its DRAM bandwidth, and the FCLK and DCFCLK DML
+/// assumes for it, in kHz (kbps).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Level {
+    pub uclk_khz: u32,
+    pub fclk_khz: u32,
+    pub dcfclk_khz: u32,
+    pub dram_bw_kbps: u64,
+}
+
+/// The state mode support and mode programming run at: the latency level
+/// and the table's highest DRAM bandwidth (mode support's
+/// `max_dram_bw_mbps`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Ctx {
+    pub level: Level,
+    /// The level's min-clock-table index.
+    pub index: usize,
+    pub max_dram_bw_kbps: u64,
+    /// The UCLK table's highest level and the min-clock table's lowest
+    /// DCFCLK (mode programming's min_return_latency_in_DCFCLK).
+    pub max_uclk_khz: u32,
+    pub min_dcfclk_khz: u32,
+}
+
+impl Ctx {
+    /// The native policy's single pinned-UCLK entry (`clock_state`).
+    fn pinned(soc: &Soc) -> Result<Self, Error> {
+        let (dcfclk, fclk, bw) = clock_state(soc)?;
+        Ok(Self {
+            level: Level {
+                uclk_khz: soc.uclk_khz,
+                fclk_khz: fclk as u32,
+                dcfclk_khz: dcfclk as u32,
+                dram_bw_kbps: bw,
+            },
+            index: 0,
+            max_dram_bw_kbps: bw,
+            max_uclk_khz: soc.uclk_khz,
+            min_dcfclk_khz: dcfclk as u32,
+        })
+    }
+    fn state(&self) -> State {
+        State {
+            dcfclk: mhz(u64::from(self.level.dcfclk_khz)),
+            fclk: mhz(u64::from(self.level.fclk_khz)),
+            uclk: mhz(u64::from(self.level.uclk_khz)),
+            dram_bw: mhz(self.level.dram_bw_kbps),
+            first_level: self.index == 0,
+        }
+    }
+    /// Mode support's bandwidth state: the maximum DCFCLK and FCLK and the
+    /// highest level's DRAM bandwidth.
+    fn max_state(&self, soc: &Soc) -> State {
+        State {
+            dcfclk: mhz(u64::from(soc.dcfclk_khz[1])),
+            fclk: mhz(u64::from(soc.fclk_khz[1])),
+            dram_bw: mhz(self.max_dram_bw_kbps),
+            ..self.state()
+        }
+    }
+}
+
+/// What mode support reports per configuration
+/// (`dml2_core_mode_support_result`) for PMO and DPMM.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Support {
+    /// plane_support_info: `(int)` VActiveLatencyHidingMargin (the vactive
+    /// hiding less the DRAM clock change watermark), `(int)`
+    /// VActiveLatencyHidingUs, and `math_ceil` of the UCLK vactive DET fill
+    /// delay.
+    pub vactive_margin_us: [i32; MAX_PLANES],
+    pub active_hiding_us: [i32; MAX_PLANES],
+    pub fill_delay_us: [u32; MAX_PLANES],
+    /// global.active: average and urgent (no flip) SDP and DRAM bandwidth,
+    /// `math_ceil2(MB/s * 1000)`.
+    pub average_sdp_kbps: u64,
+    pub average_dram_kbps: u64,
+    pub urgent_sdp_kbps: u64,
+    pub urgent_dram_kbps: u64,
+}
+
+/// The configuration-wide quantities of `shapes` no clock state changes.
+pub(crate) struct Prepared {
+    unbounded: bool,
+    compbuf_kbytes: u32,
+    compbuf_bytes: u32,
+    max_dpp_khz: u32,
+    max_disp_khz: u32,
+    /// Mode support's deep-sleep DCFCLK and DISPCLK.
+    ds: Fx,
+    max_disp: Fx,
+    /// Average SDP and DRAM bandwidth (calculate_avg_bandwidth_required).
+    read: Fx,
+    read_dram: Fx,
+}
+
+/// The state-independent mode-support checks of `shapes`, assigning the
+/// DCC mcache ids.
+fn prepare(soc: &Soc, shapes: &mut [Shape]) -> Result<Prepared, Error> {
     let ss = ss_khz;
     // TotalAvailablePipesSupport: one DPP per plane and ODM segment or MPC
     // slice.
@@ -2761,24 +2994,11 @@ fn plan_shapes(
         SEGMENT_KBYTES
     };
     let compbuf_bytes = if unbounded { compbuf_kbytes * 1024 } else { 0 };
-    let (dcfclk_khz, fclk_khz, bw_kbps) = clock_state(soc)?;
-    let state = State {
-        dcfclk: mhz(dcfclk_khz),
-        fclk: mhz(fclk_khz),
-        uclk: mhz(u64::from(soc.uclk_khz)),
-        dram_bw: mhz(bw_kbps),
-    };
-    let max_state = State {
-        dcfclk: mhz(u64::from(soc.dcfclk_khz[1])),
-        fclk: mhz(u64::from(soc.fclk_khz[1])),
-        ..state
-    };
-    let uclk_khz = u64::from(soc.uclk_khz);
     // Mode support: DISPCLK is the pixel clock over the stream's pipes,
     // each plane's DPPCLK that or what its scaler needs; both are checked
     // against the downspread-limited maximums. DISPCLK is the fastest
     // stream's, DPPREFCLK the fastest plane's.
-    for s in &shapes {
+    for s in shapes.iter() {
         let pclk = u64::from(s.t.pixel_clock_khz);
         let dpps = u64::from(s.dpps);
         let dpp_over = if s.dpp_unit {
@@ -2791,9 +3011,40 @@ fn plan_shapes(
             return Err(Error::PixelClock);
         }
     }
-    let max_dpp_khz = shapes.iter().map(Shape::dpp_khz).max().unwrap_or(0);
-    let max_disp_khz = shapes.iter().map(Shape::disp_khz).max().unwrap_or(0);
-    let ds = deep_sleep(&shapes, false);
+    // Average bandwidth (calculate_avg_bandwidth_required: DCC's nominal
+    // overhead on DRAM).
+    let read = shapes
+        .iter()
+        .fold(Fx::ZERO, |sum, s| sum.plus(s.vactive_bw(false)));
+    let read_dram = shapes.iter().fold(Fx::ZERO, |sum, s| {
+        let scale = |v: Fx, f: Fx| if f == Fx::ONE { v } else { v.times(f) };
+        let c = s.c.map_or(Fx::ZERO, |c| scale(c.vactive_bw, s.dram_nom[1]));
+        sum.plus(scale(s.y.vactive_bw, s.dram_nom[0]).plus(c))
+    });
+    Ok(Prepared {
+        unbounded,
+        compbuf_kbytes,
+        compbuf_bytes,
+        max_dpp_khz: shapes.iter().map(Shape::dpp_khz).max().unwrap_or(0),
+        max_disp_khz: shapes.iter().map(Shape::disp_khz).max().unwrap_or(0),
+        ds: deep_sleep(shapes, false),
+        max_disp: shapes.iter().fold(Fx::ZERO, |max, s| max.max(s.disp_mhz())),
+        read,
+        read_dram,
+    })
+}
+
+/// One mode-support run of `shapes` at `ctx` with the candidate's
+/// overrides `ov`: the evaluation and what it reports to PMO and DPMM.
+fn support(
+    soc: &Soc,
+    shapes: &[Shape],
+    p: &Prepared,
+    ctx: &Ctx,
+    ov: &Overrides,
+) -> Result<(Evaluation, Support), Error> {
+    let (state, max_state) = (ctx.state(), ctx.max_state(soc));
+    let uclk_khz = u64::from(ctx.level.uclk_khz);
     // Outstanding-request coverage at DML's DCF state, for every surface's
     // request size.
     let lat = latency(state, uclk_khz);
@@ -2804,66 +3055,170 @@ fn plan_shapes(
             return Err(Error::Latency);
         }
     }
-    // Average bandwidth at maximum clocks (calculate_avg_bandwidth_required:
-    // DCC's nominal overhead on DRAM).
-    let read = shapes
-        .iter()
-        .fold(Fx::ZERO, |sum, s| sum.plus(s.vactive_bw(false)));
-    let read_dram = shapes.iter().fold(Fx::ZERO, |sum, s| {
-        let scale = |v: Fx, f: Fx| if f == Fx::ONE { v } else { v.times(f) };
-        let c = s.c.map_or(Fx::ZERO, |c| scale(c.vactive_bw, s.dram_nom[1]));
-        sum.plus(scale(s.y.vactive_bw, s.dram_nom[0]).plus(c))
-    });
+    // Average bandwidth at maximum clocks.
     for a in available(max_state).average {
-        if read > a[0] || read_dram > a[1] {
+        if p.read > a[0] || p.read_dram > a[1] {
             return Err(Error::Bandwidth);
         }
     }
-    let max_disp = shapes.iter().fold(Fx::ZERO, |max, s| max.max(s.disp_mhz()));
-    let support = |reserved_us: i64| -> Result<Evaluation, Error> {
-        let clk: Vec<PipeClocks> = shapes
-            .iter()
-            .map(|s| PipeClocks {
-                dpp: s.dpp_mhz(),
-                disp: max_disp,
-                deep_sleep: ds,
-                khz: None,
-            })
-            .collect();
-        let e = evaluate(&shapes, state, max_state, uclk_khz, &clk, reserved_us)?;
-        let rob = fx((ROB_KBYTES - PIXEL_CHUNK_KBYTES) * 1024).over(e.non_urgent_sdp);
-        if rob < e.lat.max_urgent {
-            return Err(Error::Latency);
+    let clk: Vec<PipeClocks> = shapes
+        .iter()
+        .map(|s| PipeClocks {
+            dpp: s.dpp_mhz(),
+            disp: p.max_disp,
+            deep_sleep: p.ds,
+            khz: None,
+        })
+        .collect();
+    let e = evaluate(shapes, state, max_state, uclk_khz, &clk, ov)?;
+    let rob = fx((ROB_KBYTES - PIXEL_CHUNK_KBYTES) * 1024).over(e.non_urgent_sdp);
+    if rob < e.lat.max_urgent {
+        return Err(Error::Latency);
+    }
+    let mut out = Support {
+        average_sdp_kbps: kbps(p.read),
+        average_dram_kbps: kbps(p.read_dram),
+        urgent_sdp_kbps: kbps(e.urgent_sdp),
+        urgent_dram_kbps: kbps(e.urgent_dram),
+        ..Support::default()
+    };
+    let dram_wm = fx(DRAM_CLK_CHANGE_US).plus(e.lat.urgent.plus(e.extra));
+    for (k, (shape, pre)) in shapes.iter().zip(e.planes.iter()).enumerate() {
+        if !shape.temp_read_ok(&e, pre, shapes.len(), p.compbuf_bytes) {
+            return Err(Error::TempRead);
         }
-        for (shape, pre) in shapes.iter().zip(e.planes.iter()) {
-            if !shape.temp_read_ok(&e, pre, shapes.len(), compbuf_bytes) {
-                return Err(Error::TempRead);
+        let hiding = shape.active_hiding(pre, shapes.len(), p.compbuf_bytes);
+        let margin = hiding.minus(dram_wm);
+        // global_dram_clock_change_support_required: a vactive plane
+        // needs a non-negative margin.
+        if ov.vactive[k] && margin < Fx::ZERO {
+            return Err(Error::PstateLatency);
+        }
+        out.vactive_margin_us[k] = trunc_i32(margin);
+        out.active_hiding_us[k] = trunc_i32(hiding);
+        out.fill_delay_us[k] = shape.fill_delay(&e, k, ov.fill_delay_us[k]);
+    }
+    Ok((e, out))
+}
+
+/// `(int)` of a DML double held in fixed point: toward zero.
+fn trunc_i32(v: Fx) -> i32 {
+    let r = v.raw();
+    let whole = if r < 0 { -((-r) >> 24) } else { r >> 24 };
+    whole.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+/// `math_ceil2(MB/s * 1000, 1)` in kbps.
+fn kbps(bw: Fx) -> u64 {
+    bw.times(fx(1000)).ceil().max(0) as u64
+}
+
+impl Shape {
+    /// calculate_vactive_det_fill_latency for the UCLK blackout: the
+    /// longest time any bandwidth type's excess over the surface's average
+    /// vactive bandwidth (its share for luma and chroma, less DCC's DRAM
+    /// overhead) takes to fetch the blackout's bytes, `math_ceil`ed.
+    fn fill_delay(&self, e: &Evaluation, k: usize, fill_delay_us: u32) -> u32 {
+        let f = |v: Fx| v.raw() as f64 / 16_777_216.0;
+        let read_l = f(self.y.vactive_bw);
+        let read_c = self.c.map_or(0.0, |c| f(c.vactive_bw));
+        let dram = [f(self.dram_nom[0]), f(self.dram_nom[1])];
+        let bytes = e.pstate_bytes[k];
+        let mut delay = 0.0f64;
+        for (bw_type, nom) in [(0usize, [1.0, 1.0]), (1, dram)] {
+            let avg = f(e.avg[k][bw_type]);
+            // The excess-fill term in doubles, as Linux sums it: the fixed
+            // point peak truncates bytes / delay below the delay's own
+            // bytes.
+            let mut peak = f(e.peak[k][bw_type]);
+            if fill_delay_us > 0 {
+                let d = f64::from(fill_delay_us);
+                let with_c = if self.c.is_some() {
+                    (read_c + f64::from(bytes[1]) / d) * nom[1]
+                } else {
+                    0.0
+                };
+                peak = max_f(peak, (read_l + f64::from(bytes[0]) / d) * nom[0] + with_c);
+            }
+            let excess = peak - avg;
+            for (i, read) in [read_l, read_c].into_iter().enumerate() {
+                let share = excess * read / (read_l + read_c) / nom[i];
+                if share > 0.0 {
+                    delay = max_f(delay, f64::from(e.pstate_bytes[k][i]) / share);
+                }
             }
         }
-        Ok(e)
-    };
-    let unreserved = support(0)?;
-    // dml2_pmo_dcn4_fams2 stutter candidate (no Z8 on DCN401): every
-    // stream's nominal blank must be three times its cost.
-    let blank_allows = shapes.iter().all(|s| {
-        let vblank_us_x1000 = i64::from(s.t.h_total) * i64::from(s.vblank) * 1_000_000
-            / i64::from(s.t.pixel_clock_khz);
-        vblank_us_x1000 >= SR_ENTER_PLUS_EXIT_US * MIN_BLANK_STUTTER_FACTOR * 1000
-    });
-    let (reserved_us, supported) = match blank_allows
-        .then(|| support(SR_ENTER_PLUS_EXIT_US).ok())
+        (delay + 0.99999) as i32 as u32
+    }
+}
+
+/// Mode support and (unless `support_only`, which returns no plans) mode
+/// programming of `shapes` with the native pinned-UCLK policy: no P-state
+/// strategy, and PMO's stutter reservation when every blank allows it.
+fn plan_shapes(
+    soc: &Soc,
+    modes: &[Mode],
+    mut shapes: Vec<Shape>,
+    support_only: bool,
+) -> Result<Vec<Plan>, Error> {
+    let p = prepare(soc, &mut shapes)?;
+    let ctx = Ctx::pinned(soc)?;
+    let (unreserved, _) = support(soc, &shapes, &p, &ctx, &Overrides::NONE)?;
+    let (ov, supported) = match stutter_allowed(&shapes)
+        .then(|| {
+            let ov = Overrides::all(SR_ENTER_PLUS_EXIT_US);
+            support(soc, &shapes, &p, &ctx, &ov)
+                .ok()
+                .map(|(e, _)| (ov, e))
+        })
         .flatten()
     {
-        Some(e) => (SR_ENTER_PLUS_EXIT_US, e),
-        None => (0, unreserved),
+        Some(found) => found,
+        None => (Overrides::NONE, unreserved),
     };
     if support_only {
         return Ok(Vec::new());
     }
-    if bandwidth_raises_clocks(&supported, read, dcfclk_khz, fclk_khz) {
+    if bandwidth_raises_clocks(
+        &supported,
+        p.read,
+        u64::from(ctx.level.dcfclk_khz),
+        u64::from(ctx.level.fclk_khz),
+    ) {
         return Err(Error::ClockState);
     }
+    program(soc, modes, &shapes, &p, &ctx, &ov, None)
+}
 
+/// dml2_pmo_dcn4_fams2 stutter candidate (no Z8 on DCN401): every
+/// stream's nominal blank must be three times its cost.
+fn stutter_allowed(shapes: &[Shape]) -> bool {
+    shapes.iter().all(|s| {
+        let vblank_us_x1000 = i64::from(s.t.h_total) * i64::from(s.vblank) * 1_000_000
+            / i64::from(s.t.pixel_clock_khz);
+        vblank_us_x1000 >= SR_ENTER_PLUS_EXIT_US * MIN_BLANK_STUTTER_FACTOR * 1000
+    })
+}
+
+/// DPMM's display clocks and mode programming of `shapes` at `ctx` (DPMM
+/// left every fabric and memory clock at the latency state) with the final
+/// overrides `ov`; `pstate` is recorded in every plan.
+fn program(
+    soc: &Soc,
+    modes: &[Mode],
+    shapes: &[Shape],
+    p: &Prepared,
+    ctx: &Ctx,
+    ov: &Overrides,
+    pstate: Option<PlanPstate>,
+) -> Result<Vec<Plan>, Error> {
+    let state = ctx.state();
+    let uclk_khz = u64::from(ctx.level.uclk_khz);
+    let (dcfclk_khz, fclk_khz) = (
+        u64::from(ctx.level.dcfclk_khz),
+        u64::from(ctx.level.fclk_khz),
+    );
+    let (max_disp_khz, max_dpp_khz) = (p.max_disp_khz, p.max_dpp_khz);
+    let (unbounded, compbuf_kbytes) = (p.unbounded, p.compbuf_kbytes);
     // dml2_dpmm_dcn4: DISPCLK gets downspread and ramp margin, DPPREFCLK
     // downspread only; both land on DFS steps, each pipe's DPPCLK on 1/255ths
     // of the shared DPPREFCLK.
@@ -2892,7 +3247,7 @@ fn plan_shapes(
             (u128::from(dpprefclk_khz) * steps / 255) as u32
         })
         .collect();
-    let deep_sleep_khz = deep_sleep_khz(&shapes);
+    let deep_sleep_khz = deep_sleep_khz(shapes);
 
     // Mode programming at the chosen clocks.
     let dispclk = mhz(u64::from(dispclk_khz));
@@ -2907,7 +3262,7 @@ fn plan_shapes(
             khz: Some([khz, dispclk_khz, deep_sleep_khz]),
         })
         .collect();
-    let e = evaluate(&shapes, state, state, uclk_khz, &clk, reserved_us)?;
+    let e = evaluate(shapes, state, state, uclk_khz, &clk, ov)?;
 
     // Global watermarks and arbiter.
     let urgent_wm = e.lat.urgent.plus(e.extra);
@@ -2920,13 +3275,14 @@ fn plan_shapes(
     let refclk = mhz(u64::from(soc.dchub_refclk_khz));
     let ref_khz = i64::from(soc.dchub_refclk_khz);
     let refcyc = |us: Fx| reg(us.times(refclk));
-    // min_return_latency_in_DCFCLK uses the table maxima and DML's DCF state.
-    let max_uclk = mhz(uclk_khz);
+    // min_return_latency_in_DCFCLK uses the table maxima and the lowest
+    // table entry's DCFCLK.
+    let max_uclk = mhz(u64::from(ctx.max_uclk_khz));
     let max_fclk = mhz(u64::from(soc.fclk_khz[1]));
     let min_return = fx(MIN_RETURN_UCLK_CYCLES)
         .over(max_uclk)
         .plus(fx(MIN_RETURN_FCLK_CYCLES).over(max_fclk))
-        .times(state.dcfclk);
+        .times(mhz(u64::from(ctx.min_dcfclk_khz)));
     let hysteresis = fx(PIXEL_CHUNK_KBYTES * 1024 * 3 / 4 / 64)
         .minus(min_return)
         .max(fx(32));
@@ -2979,7 +3335,7 @@ fn plan_shapes(
         let pre = e.planes[k];
         let l = shape.line;
         let pclk_i = i64::from(t.pixel_clock_khz);
-        let min_ttu = e.t_wait.plus(e.extra).plus(e.t_calc);
+        let min_ttu = e.t_wait[k].plus(e.extra).plus(e.t_calc);
         let vstartup = pre.vstartup;
         let blank_after = shape.vblank - vstartup;
         let vblank_start = t.v_total - t.v_front_porch;
@@ -3148,7 +3504,7 @@ fn plan_shapes(
                 deep_sleep_dcfclk_khz: deep_sleep_khz,
                 dcfclk_khz: dcfclk_khz as u32,
                 fclk_khz: fclk_khz as u32,
-                uclk_khz: soc.uclk_khz,
+                uclk_khz: ctx.level.uclk_khz,
                 socclk_khz: soc.socclk_khz,
             },
             sync,
@@ -3159,7 +3515,11 @@ fn plan_shapes(
             det_bytes: p0.det_bytes,
             pipes: odm as u8,
             odm_refcyc_h_blank_end: p0.odm_refcyc_h_blank_end,
-            stutter_reserved_us: reserved_us as u32,
+            stutter_reserved_us: shapes
+                .iter()
+                .position(|s| s.stream == k)
+                .map_or(0, |i| ov.reserved_us[i] as u32),
+            pstate,
             // The plan's own mode is `mode`; the others are kept for
             // `joint_modes` (records stay small: plans are copied a lot).
             streams: {
@@ -3218,6 +3578,9 @@ impl Plan {
     pub fn readmits(&self) -> bool {
         // Compared in place: plans are large, and this runs deep in the
         // deadline binding of every scanout operation.
+        if let Some(p) = self.pstate {
+            return pstate::readmits(self, &p);
+        }
         admit_all(&self.soc, &self.joint_modes())
             .is_ok_and(|plans| plans.get(usize::from(self.stream)) == Some(self))
     }
