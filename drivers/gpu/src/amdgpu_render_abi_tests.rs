@@ -1080,8 +1080,10 @@ fn scanout_pin_holds_vram_placement_until_unpinned() -> TestResult {
     assert!(both.system());
     assert_eq!(both.pin_scanout().err(), Some(FsError::OutOfMemory));
     assert!(both.system() && !both.pinned());
-    narf_scheduler::block_on_spin(prepare_scanout(CARD, alloc::vec![both.clone()]));
+    let preparation =
+        narf_scheduler::block_on_spin(prepare_scanout(CARD, alloc::vec![both.clone()]));
     let pin = both.pin_scanout().unwrap();
+    drop(preparation);
     assert!(!both.system() && pin.address() >= 0x8_0000_0000);
     drop(pin);
     // One VRAM is not allowed for is refused.
@@ -1101,6 +1103,73 @@ fn scanout_pin_holds_vram_placement_until_unpinned() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/render-abi",
     scanout_pin_holds_vram_placement_until_unpinned
+);
+
+/// Preparation must protect both promoted and already-resident BOs until
+/// the KMS commit pins them, including against synchronous GEM pressure.
+fn scanout_preparation_excludes_pressure_until_kms_pins() -> TestResult {
+    use core::future::Future as _;
+    const CARD: u32 = 0xfeeb;
+    struct Registered;
+    impl Drop for Registered {
+        fn drop(&mut self) {
+            unregister_vram_heap(CARD);
+        }
+    }
+    let mut memory = alloc::vec![0u8; 2 * 4096];
+    let map = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(0xb300_0000),
+        virt: memory.as_mut_ptr() as u64,
+        len: memory.len() as u64,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    // SAFETY: this test owns the backing until every object and heap drops.
+    let pool = unsafe { crate::amdgpu_vram::Pool::from_owned_range(map, 0x8_0000_0000) }.unwrap();
+    register_vram_heap(
+        CARD,
+        VramHeap {
+            pool: pool.clone(),
+            fb_base: 0x8_0000_0000,
+            fb_offset: 0x9_0000_0000,
+            unmapped: None,
+        },
+    );
+    let _registered = Registered;
+    let state = GemState::for_card(CARD);
+    let domains = u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM | uapi::AMDGPU_GEM_DOMAIN_GTT);
+    let a = state.get(create(&state, 4096, domains)).unwrap();
+    let b = state.get(create(&state, 4096, domains)).unwrap();
+    assert_eq!(a.relocate(false), Ok(()));
+    assert!(a.system() && !b.system());
+    let preparation =
+        narf_scheduler::block_on_spin(prepare_scanout(CARD, alloc::vec![a.clone(), b.clone()]));
+    assert!(!a.system() && !b.system() && !a.pinned());
+    assert_eq!(pool.available(), 0);
+    // The synchronous create normally evicts an unleased BO here.
+    // During preparation it must use GTT instead of invalidating KMS.
+    let c = state.get(create(&state, 4096, domains)).unwrap();
+    assert!(c.system() && !a.system() && !b.system());
+    assert!(try_placement(CARD).is_none());
+    // A competing move parks. Cancelling that waiter must not wedge the
+    // admission lock when preparation hands protection over to a real pin.
+    {
+        let mut waiting = alloc::boxed::Box::pin(lock_placement(CARD));
+        let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+    }
+    let pin = a.pin_scanout().unwrap();
+    drop(preparation);
+    assert!(try_placement(CARD).is_some());
+    evict_visible(CARD, || false);
+    assert!(!a.system() && b.system());
+    drop(pin);
+    evict_visible(CARD, || false);
+    assert!(a.system() && pool.available() == memory.len() as u64);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/render-abi",
+    scanout_preparation_excludes_pressure_until_kms_pins
 );
 
 /// amdgpu_gem_userptr_ioctl argument checks, which run before any page is

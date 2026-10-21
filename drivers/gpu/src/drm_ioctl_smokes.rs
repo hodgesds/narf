@@ -3980,17 +3980,19 @@ fn smoke_drm_navi48_gem_framebuffers_scan_out_in_place() -> TestResult {
     if refused != Some(FsError::OutOfMemory) || pinned {
         return TestResult::Fail("an evicted buffer pinned without prepare_fb");
     }
-    narf_scheduler::block_on_spin(crate::drm_ioctl_bridge::amdgpu_prepare_scanout(
-        idx,
-        OWNER,
-        crate::drm_uapi::DRM_IOCTL_MODE_PAGE_FLIP,
-        0,
-        &gem,
-    ));
+    let preparation =
+        narf_scheduler::block_on_spin(crate::drm_ioctl_bridge::amdgpu_prepare_scanout(
+            idx,
+            OWNER,
+            crate::drm_uapi::DRM_IOCTL_MODE_PAGE_FLIP,
+            0,
+            &gem,
+        ));
     let frame_b = {
         let card = ms.lock();
         crate::drm_ioctl_bridge::scanout_frame(&card, card.framebuffer(fb_b).unwrap())
     };
+    drop(preparation);
     let Some(pin_b) = frame_b.and_then(|f| f.bo) else {
         return TestResult::Fail("second framebuffer not pinned");
     };
@@ -4253,13 +4255,15 @@ fn smoke_drm_navi48_dumb_buffers_scan_out_of_vram() -> TestResult {
         return TestResult::Fail("evict_all of the dumb buffers");
     }
     crate::amdgpu_gem::restore_domains(touched);
-    narf_scheduler::block_on_spin(crate::drm_ioctl_bridge::amdgpu_prepare_scanout(
-        idx,
-        OWNER,
-        DRM_IOCTL_MODE_PAGE_FLIP,
-        0,
-        &gem,
-    ));
+    let preparation =
+        narf_scheduler::block_on_spin(crate::drm_ioctl_bridge::amdgpu_prepare_scanout(
+            idx,
+            OWNER,
+            DRM_IOCTL_MODE_PAGE_FLIP,
+            0,
+            &gem,
+        ));
+    drop(preparation);
     back = [0; 4];
     if object_a.system()
         || object_a

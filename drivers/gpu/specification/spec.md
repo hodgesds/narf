@@ -115,7 +115,9 @@ stay fixed; TLB sequences advance before another submission can run.
 The card gate spans native queue publication, `note_job`, and reservation-fence
 attachment. Dependency waits precede gate acquisition. User GEM_VA ioctls park
 for this gate through `dispatch_async`; synchronous dispatch reports Busy on
-contention. `amdgpu_gem::dispatch_async` retries a strict VRAM create after
+contention. Synchronous pressure eviction also takes this gate without
+waiting; while placement is protected, ordinary allocation can use its GTT
+fallback rather than move a protected buffer. `amdgpu_gem::dispatch_async` retries a strict VRAM create after
 reclaiming GPU-mapped buffers; ordinary allocations retain GTT fallback.
 Unregistered VM mappings, deferred CPU user-fence writes and legacy raw
 address leases (`GemMapping`, `mmap_lifetime`) still pin backing. GEM and
@@ -4842,9 +4844,20 @@ in Linux's 32-bit dcc_size), placed at its own alignment, then trimmed to
 the buffer's size from the block's first multiple of the alignment counted
 from VRAM offset 0 (`amdgpu_vram::dcc_trim_start`, `Pool::reserve_dcc`,
 `UnmappedPool::reserve_dcc`; the rest of the block is free again).
+The temporary block's alignment is also relative to VRAM offset zero,
+independently of the GPU address of that origin. If no whole temporary block
+is free, the native range allocator instead reserves the final buffer size
+at the first free DCC-aligned start. This remains one contiguous reservation
+and preserves the hardware's address/size constraints, for visible and
+invisible VRAM. This fallback is more permissive than Linux's rounded
+VRAM_CONTIGUOUS path: its ENOSPC retry clears the buddy contiguous-allocation
+flag but retains the BO flag and DCC block rounding.
 `tests/amdgpu_dcc_vram/check.sh` builds gmc_v12_0_get_dcc_alignment and
 amdgpu_vram_mgr_new from the Linux tree over a stand-in buddy and checks
-1755 vectors, replayed by `dcc_vram_placement_matches_linux_vectors`. A
+1755 vectors, replayed through production `Pool::reserve_dcc` by
+`dcc_vram_placement_matches_linux_vectors`, including the exact reservation
+accounting after trimming and release. Separate native tests cover fragmented
+visible/invisible pools, non-aligned VRAM origins and exhausted aligned starts. A
 pinned DCC buffer reports `ScanoutPin::dcc_aligned`, a DCC buffer whose
 placement misses the alignment is refused at the pin, and a DCC plane
 refuses an `otg::ExternalSurface` without `dcc_aligned`. Linux takes the
@@ -4855,7 +4868,13 @@ all contiguous, so it applies from creation. The pin never moves a
 buffer: amdgpu_bo_pin's validation (a buffer in system memory moving back
 to VRAM, which waits for its jobs and copies it whole) runs before, in the
 async `drm_ioctl_bridge::amdgpu_prepare_scanout` (below), never under the
-KMS spinlock, so a buffer still outside VRAM is ENOMEM (`OutOfMemory`, as
+KMS spinlock. `amdgpu_gem::prepare_scanout` returns a `ScanoutPreparation`
+guard retaining the card's placement exclusion, which `DriCardFile::ioctl_user`
+keeps through the synchronous KMS commit. It protects already-resident BOs
+as well as promoted ones: asynchronous movers park, and synchronous pressure
+cannot evict between validation and `PreparedFbs::prepare` acquiring pins.
+Success, refusal and cancellation release the guard; successful KMS pins
+continue protecting the actual scanout. A buffer still outside VRAM is ENOMEM (`OutOfMemory`, as
 ttm_bo_validate reports no room); one VRAM is not allowed for or a foreign
 dma-buf is EINVAL and a userptr EPERM, as amdgpu_bo_pin answers. A
 CPU-accessible buffer is only ever placed in visible VRAM (amdgpu_bo_pin

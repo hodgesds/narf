@@ -383,10 +383,12 @@ pub const fn gmc_v12_dcc_alignment(gc: (u8, u8, u8), max_texture_channel_caches:
 
 /// amdgpu_vram_mgr_new's adjust_dcc_size for a buffer of `flags` on card
 /// `card`: the card's DCC alignment for a GFX12_DCC buffer, else 0. NARF
-/// places every VRAM buffer as one reservation, which is the
-/// VRAM_CONTIGUOUS path, so a DCC buffer takes the DCC placement wherever
-/// it lands in VRAM (create, every move back, and so the scanout pin, for
-/// which prepare_fb sets VRAM_CONTIGUOUS).
+/// places every VRAM buffer as one reservation, so a DCC buffer takes the
+/// VRAM_CONTIGUOUS path's power-of-two block wherever it lands in VRAM
+/// (create, every move back, and so the scanout pin, for which prepare_fb
+/// sets VRAM_CONTIGUOUS) and, where no block is free, its own size at the
+/// DCC alignment (`Pool::reserve_dcc`). This native range-allocation
+/// fallback needs no temporary larger block and remains contiguous.
 fn dcc_adjust(card: Option<u32>, flags: u64) -> u64 {
     if flags & u64::from(uapi::AMDGPU_GEM_CREATE_GFX12_DCC) == 0 {
         return 0;
@@ -1233,6 +1235,7 @@ static PLACEMENT_GATES: [narf_lib::mutex::Mutex<()>; 16] =
     [const { narf_lib::mutex::Mutex::new(()) }; 16];
 
 /// Excludes new jobs and VA edits while a card's mappings are rebound.
+#[derive(Debug)]
 pub(crate) struct PlacementGuard {
     card: u32,
     _held: narf_lib::mutex::MutexGuard<'static, ()>,
@@ -1311,6 +1314,12 @@ fn eviction_candidates(card: u32) -> Vec<Arc<GemObject>> {
 /// Reclaim idle client VRAM; address leases and unsignalled fences pin it.
 /// A shared handle or PRIME export alone does not pin placement.
 fn evict_visible(card: u32, fits: impl Fn() -> bool) {
+    // A scanout preparation keeps this gate through KMS pin acquisition.
+    // Synchronous pressure must observe the same exclusion as GPU moves;
+    // it cannot wait while the caller may hold a KMS spinlock.
+    let Some(_gate) = try_placement(card) else {
+        return;
+    };
     for object in eviction_candidates(card) {
         if !object.system() && !object.pinned() {
             let _ = object.relocate(false);
@@ -1520,29 +1529,36 @@ pub async fn create_dumb_async(
     result
 }
 
+/// Placement exclusion retained from scanout validation through KMS pinning.
+/// Dropping this guard releases admission on success, error or cancellation.
+#[must_use = "retain scanout preparation until the KMS commit has acquired its pins"]
+#[derive(Debug)]
+pub struct ScanoutPreparation {
+    _gate: PlacementGuard,
+}
+
 /// amdgpu_dm_plane_helper_prepare_fb's amdgpu_bo_pin validation, ahead of
 /// the commit that pins: each of `objects` that has left VRAM (suspend's
 /// evict_all, or eviction for another allocation) and is not pinned moves
 /// back, CPU mappings and all, so the commit's `pin_scanout` finds it in
 /// VRAM. A buffer that cannot move stays put and its pin is refused.
-pub async fn prepare_scanout(card: u32, objects: Vec<Arc<GemObject>>) {
-    let objects: Vec<_> = objects
-        .into_iter()
-        .filter(|o| {
-            o.system()
-                && !o.pinned()
-                && o.allowed_domains.load(Ordering::Acquire)
-                    & u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM)
-                    != 0
-        })
-        .collect();
-    if objects.is_empty() {
-        return;
-    }
+/// Retain the returned guard through the synchronous KMS commit: neither
+/// asynchronous relocation nor synchronous pressure may evict a prepared
+/// buffer before `pin_scanout` takes over its lifetime protection.
+pub async fn prepare_scanout(card: u32, objects: Vec<Arc<GemObject>>) -> ScanoutPreparation {
     let gate = lock_placement(card).await;
     for object in objects {
-        let _ = crate::amdgpu_vm::relocate(&gate, &object, true).await;
+        if object.card() == Some(card)
+            && object.system()
+            && !object.pinned()
+            && object.allowed_domains.load(Ordering::Acquire)
+                & u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM)
+                != 0
+        {
+            let _ = crate::amdgpu_vm::relocate(&gate, &object, true).await;
+        }
     }
+    ScanoutPreparation { _gate: gate }
 }
 
 /// Per-open GEM state. One of these per `/dev/dri/*` open on an amdgpu card.

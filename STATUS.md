@@ -332,8 +332,13 @@ and HPO encoder indices. Allocation follows Linux's `find_first_free_audio`;
 models cover mixed transports and the full endpoint acquisition masks.
 A delayed DET acknowledgment defers compressed-buffer growth for retry on
 the next display-monitor pass, retaining the current allocation until the
-freed segments are acknowledged. DML DET sizing/Vmin ODM, memory-pressure
-and suspend findings, and physical board acceptance remain open.
+freed segments are acknowledged. Scanout preparation now retains placement
+exclusion through KMS pin acquisition, including against synchronous memory
+pressure. DCC allocation can use fragmented gaps containing the final
+contiguous aligned buffer without requiring a larger temporary buddy block;
+Linux placement vectors now exercise the production reservation allocator.
+DML DET sizing/Vmin ODM, remaining memory-pressure and suspend findings,
+and physical board acceptance remain open.
 
 Implemented: GDDR6 training; PSP14 SOS/GPCOM/TMR; mandatory graphics/media
 firmware parsing, upload and autoload; GC12 RS64 counter programming and pipe

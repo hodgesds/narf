@@ -150,7 +150,10 @@ impl Pool {
     /// (`place_dcc`): `size` bytes starting at a multiple of `alignment`
     /// (gmc_v12_0_get_dcc_alignment, counted from VRAM offset 0 at GPU
     /// address `origin`) inside a [`dcc_block_size`] block at its own
-    /// alignment. Only the trimmed range is held.
+    /// alignment. Only the trimmed range is held. Where no such block is
+    /// free, reserve `size` bytes at the first multiple of `alignment`.
+    /// This native fallback remains contiguous and DCC-aligned without
+    /// requiring the temporary block used by Linux's buddy allocator.
     pub fn reserve_dcc(
         &self,
         size: u64,
@@ -220,18 +223,54 @@ fn place(
     if alignment < 4096 || !alignment.is_power_of_two() {
         return Err(Error::Invalid);
     }
-    let size = size.checked_add(4095).ok_or(Error::Invalid)? & !4095;
-    if size == 0 {
-        return Err(Error::Invalid);
-    }
-    let align = |offset: u64| {
+    place_at(used, len, size, |offset: u64| {
         address
             .checked_add(offset)
             .and_then(|address| address.checked_add(alignment - 1))
             .map(|address| address & !(alignment - 1))
             .and_then(|aligned| aligned.checked_sub(address))
             .ok_or(Error::Exhausted)
-    };
+    })
+}
+
+/// First fit of `size` bytes (rounded up to pages) starting at a multiple
+/// of `alignment` (any multiple of a page) counted from GPU address
+/// `origin`, within `len` bytes from `address`.
+fn place_multiple(
+    used: &mut Vec<Range<u64>>,
+    address: u64,
+    len: u64,
+    size: u64,
+    alignment: u64,
+    origin: u64,
+) -> Result<Range<u64>, Error> {
+    if alignment == 0 || alignment % 4096 != 0 {
+        return Err(Error::Invalid);
+    }
+    place_at(used, len, size, |offset: u64| {
+        address
+            .checked_add(offset)
+            .and_then(|at| at.checked_sub(origin))
+            .and_then(|from| from.checked_next_multiple_of(alignment))
+            .and_then(|from| from.checked_add(origin))
+            .and_then(|at| at.checked_sub(address))
+            .ok_or(Error::Exhausted)
+    })
+}
+
+/// First fit of `size` bytes (rounded up to pages) at the first start
+/// `align` gives at or past each free offset, recorded in the sorted
+/// `used` list.
+fn place_at(
+    used: &mut Vec<Range<u64>>,
+    len: u64,
+    size: u64,
+    align: impl Fn(u64) -> Result<u64, Error>,
+) -> Result<Range<u64>, Error> {
+    let size = size.checked_add(4095).ok_or(Error::Invalid)? & !4095;
+    if size == 0 {
+        return Err(Error::Invalid);
+    }
     let mut start = align(0)?;
     let mut index = 0;
     while index < used.len() {
@@ -280,6 +319,13 @@ pub const fn dcc_trim_start(block_start: u64, alignment: u64) -> Option<u64> {
 /// multiple of `alignment` past `origin` (the GPU address of VRAM offset
 /// 0, which the buddy offsets count from). The rest of the block stays
 /// free, as the trim returns it.
+///
+/// When no whole block fits, this range allocator can reserve the final
+/// contiguous, DCC-aligned range directly. This is a native fallback, not
+/// Linux's ENOSPC retry: Linux retains the BO's VRAM_CONTIGUOUS flag and
+/// its DCC block rounding when dropping the buddy contiguous-allocation
+/// flag. Both native paths preserve the hardware's final address and size
+/// constraints; only the preferred path needs a temporary larger block.
 fn place_dcc(
     used: &mut Vec<Range<u64>>,
     address: u64,
@@ -293,7 +339,13 @@ fn place_dcc(
     if size == 0 || alignment == 0 || alignment % 4096 != 0 || block < 4096 {
         return Err(Error::Invalid);
     }
-    let range = place(used, address, len, block, block)?;
+    let range = match place_multiple(used, address, len, block, block, origin) {
+        Ok(range) => range,
+        Err(Error::Exhausted) => {
+            return place_multiple(used, address, len, size, alignment, origin);
+        }
+        Err(e) => return Err(e),
+    };
     let trimmed = address
         .checked_add(range.start)
         .and_then(|at| at.checked_sub(origin))

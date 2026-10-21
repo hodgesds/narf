@@ -7394,23 +7394,23 @@ pub async fn amdgpu_create_dumb_async(
 /// eviction for another allocation) and is not pinned moves back, mapped or
 /// not (`amdgpu_gem::prepare_scanout`), so the commit's pin
 /// (`PreparedFbs`), which never moves a buffer itself, finds it in VRAM.
+/// Retain the returned placement guard until that synchronous commit
+/// finishes, closing the gap between validation and pin acquisition.
 pub async fn amdgpu_prepare_scanout(
     card_index: u32,
     open_id: u64,
     cmd: u32,
     arg: usize,
     gem: &crate::amdgpu_gem::GemState,
-) {
+) -> Option<crate::amdgpu_gem::ScanoutPreparation> {
     const DRM_MODE_CURSOR_BO: u32 = 0x01;
     let nr = drm_uapi::ioc_nr(cmd);
     if (cmd >> 8) & 0xff != u32::from(b'd')
         || !matches!(nr, 0xA2 | 0xA3 | 0xB0 | 0xB7 | 0xBB | 0xBC)
     {
-        return;
+        return None;
     }
-    let Some(mode_state) = crate::drm_registry::mode_state(card_index) else {
-        return;
-    };
+    let mode_state = crate::drm_registry::mode_state(card_index)?;
     // drm_mode_cursor's flags at 0 and handle at 24.
     let cursor = matches!(nr, 0xA3 | 0xBB)
         .then(|| {
@@ -7430,17 +7430,17 @@ pub async fn amdgpu_prepare_scanout(
     let objects: Vec<_> = {
         let card = mode_state.lock();
         if !card.gfx12_modifiers {
-            return;
+            return None;
         }
         card.framebuffers
             .iter()
             .filter_map(|fb| fb.bo.as_ref())
-            .filter(|bo| bo.owner == open_id && bo.object.system())
+            .filter(|bo| bo.owner == open_id)
             .map(|bo| Arc::clone(&bo.object))
-            .chain(cursor.filter(|o| o.system()))
+            .chain(cursor)
             .collect()
     };
-    crate::amdgpu_gem::prepare_scanout(card_index, objects).await;
+    Some(crate::amdgpu_gem::prepare_scanout(card_index, objects).await)
 }
 
 /// DRM_IOCTL_MODE_CURSOR{,2} with DRM_MODE_CURSOR_BO on the Navi48 card
