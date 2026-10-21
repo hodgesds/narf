@@ -585,7 +585,7 @@ bring-up target.
 | --- | --- | --- |
 | Storage | QEMU virtio-blk and NVMe | NVMe, AHCI, USB mass-storage, and other transports are in-tree, but machine-specific silicon coverage varies. Do not continue toward a root mount if the controller or disk did not bind cleanly. |
 | Wired networking | QEMU e1000; its live acceptance test covers TCP, UDP, and DNS, including the loadable-module path | e1000/e1000e, igc, Realtek, ixgbe, mlx5, and other drivers have different maturity levels. Match the exact PCI ID; use QEMU e1000 or a known supported wired adapter when the onboard NIC is not ready. |
-| Wi-Fi | Software and protocol tests | iwlwifi's AX210+/Sc/BE211 path still needs silicon validation and real-supplicant acceptance; ath11k and rtw88 are earlier bring-up. Do not depend on Wi-Fi for the first boot. |
+| Wi-Fi | Software and protocol tests; ath11k has a PCI/power-up smoke for QCNFA765/WCN6855 (`17cb:1103`) | iwlwifi's AX210+/Sc/BE211 path still needs silicon validation and real-supplicant acceptance. For QCNFA765, run the normal-boot ath11k scan pass below to qualify MHI, firmware, and the radio; do not depend on Wi-Fi for the first boot. |
 | Graphics | QEMU Bochs and virtio-gpu framebuffer/DRM paths | Native AMDGPU work targets specific Phoenix/HawkPoint and Navi22 hardware but has not completed the silicon gate. CachyOS NVIDIA modules are Linux modules and cannot be reused. Use serial or the boot framebuffer first. |
 | Input and USB | QEMU input plus xHCI USB HID paths | xHCI, USB keyboard/mouse, i8042, and I2C-HID foundations exist, but laptop touchpads and platform wiring still need machine-specific validation. Keep a USB keyboard and serial fallback. |
 | Audio, power, suspend, and thermal | QEMU or software tests for individual pieces | Not first-boot acceptance criteria. Avoid suspend/resume during initial hardware testing. |
@@ -625,6 +625,27 @@ policy and logs each unsigned handout. A distribution build must instead sign
 the wrapped payloads and embed the authorized public keys as described in the
 [firmware specification](../firmware/specification/spec.md). Never treat a
 blob's presence in CachyOS as proof that the matching NARF driver is complete.
+
+#### QCNFA765 / WCN6855 (`17cb:1103`) first radio pass
+
+The Qualcomm QCNFA765 enumerates as a WCN6855 HW2.1 PCI function. Import only
+the ath11k firmware, include its HW2.1 subtree in the initramfs, and request a
+scan during a normal boot (not a `kernel-test` boot):
+
+```sh
+cargo xtask import-firmware \
+  --source /usr/lib/firmware \
+  --vendor ath11k \
+  --skip-existing
+cargo xtask usb-image --arch=x86_64 \
+  --initramfs-firmware "ath11k/WCN6855/hw2.1/*" \
+  --cmdline "ath11k.scan=1"
+```
+
+The pass is successful only after the console shows the WCN6855 HW2.1 probe,
+firmware/MHI bring-up, a registered `wlan*` data path, and scan results. The
+kernel-test PCI smoke intentionally stops before those asynchronous stages; it
+validates the bound device, revision, firmware directory, and MSI layout only.
 
 ## CPU and isolation status
 

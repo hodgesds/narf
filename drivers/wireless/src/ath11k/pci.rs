@@ -595,18 +595,27 @@ async fn mhi_bring_up(s: MhiStart) -> Result<(MhiController<Bar0Mhi>, FwApi), Mh
     let (fw, api) = load_firmware(s.fw_dir).await?;
     let params = ControllerParams::ath11k(s.mmio.len.min(u32::MAX as u64) as u32, s.nr_irqs);
     let mut ctrl = MhiController::new(Bar0Mhi { mmio: s.mmio }, cfg, params)?;
-    ctrl.prepare_for_power_up()?;
-    let (bhi, bhie) = ctrl.bhi_offsets();
-    let _ = writeln!(
-        narf_console::Writer,
-        "  ath11k: mhi: BHI at {:#x}, BHIe at {:#x}, timeout {} ms",
-        bhi,
-        bhie,
-        params.timeout_ms
-    );
-    ctrl.set_firmware(fw);
-    ctrl.sync_power_up().await?;
-    ctrl.prepare_for_transfer("IPCR").await?;
+    let result: Result<(), MhiError> = async {
+        ctrl.prepare_for_power_up()?;
+        let (bhi, bhie) = ctrl.bhi_offsets();
+        let _ = writeln!(
+            narf_console::Writer,
+            "  ath11k: mhi: BHI at {:#x}, BHIe at {:#x}, timeout {} ms",
+            bhi,
+            bhie,
+            params.timeout_ms
+        );
+        ctrl.set_firmware(fw);
+        ctrl.sync_power_up().await?;
+        ctrl.prepare_for_transfer("IPCR").await
+    }
+    .await;
+    if let Err(e) = result {
+        // A failed MHI start can still have live BHIe/context DMA.  Reset the
+        // function before this owner drops those allocations.
+        abort_mhi_bring_up(&mut ctrl).await;
+        return Err(e);
+    }
     let st = ctrl.stats;
     let _ = writeln!(
         narf_console::Writer,
@@ -626,16 +635,46 @@ async fn mhi_bring_up(s: MhiStart) -> Result<(MhiController<Bar0Mhi>, FwApi), Mh
     Ok((ctrl, api))
 }
 
+/// Quiesce a failed MHI/WLFW initialisation before its owner is dropped.
+///
+/// The single physical radio has one MHI task, so an old IRQ bit or waker is
+/// never meaningful after that task gives up.  Clear both along with the
+/// public readiness state after the controller has reset the device.
+async fn abort_mhi_bring_up(ctrl: &mut MhiController<Bar0Mhi>) {
+    ctrl.abort_bring_up().await;
+    reset_mhi_task_state();
+}
+
+/// The firmware lookup and controller construction happen before an
+/// [`MhiController`] exists.  They can still fail after PCI power-up enabled
+/// MSI and disabled ASPM, so quiesce that PCI half here as well.
+fn abort_unowned_mhi_bring_up(s: MhiStart) {
+    Bar0Mhi { mmio: s.mmio }.hif_power(HifPower::Down);
+    reset_mhi_task_state();
+}
+
+fn reset_mhi_task_state() {
+    MHI_UP.store(false, Ordering::Release);
+    MHI_IRQ_PENDING.store(0, Ordering::Release);
+    *MHI_WAKER.lock() = None;
+}
+
 /// The MHI bring-up task spawned by probe: MHI to mission mode, then
 /// the WLFW handshake to FW_READY.
 pub async fn mhi_task(s: MhiStart) {
     use core::fmt::Write as _;
+    MHI_UP.store(false, Ordering::Release);
     match mhi_bring_up(s).await {
         Ok((ctrl, api)) => {
             MHI_UP.store(true, Ordering::Release);
             wlfw_bring_up(ctrl, s, api).await;
         }
         Err(e) => {
+            // `load_firmware` and `MhiController::new` can fail before an
+            // MHI owner exists, while PCI is already powered up.  Repeating
+            // this after a controller-owned failure is harmless and keeps
+            // the no-owner path equally safe.
+            abort_unowned_mhi_bring_up(s);
             diag::latch_wifi_error(e.step, e.detail);
             let _ = writeln!(
                 narf_console::Writer,
@@ -671,6 +710,8 @@ async fn wlfw_bring_up(ctrl: MhiController<Bar0Mhi>, s: MhiStart, api: FwApi) {
     use core::fmt::Write as _;
     diag::set_wifi_stage(WifiStage::Control);
     let Some(fw) = wlfw::NarfFirmware::new() else {
+        let mut ctrl = ctrl;
+        abort_mhi_bring_up(&mut ctrl).await;
         return wlfw_fail(wlfw::WlfwError::new(
             wlfw::step::NO_FW_AUTHORITY,
             0,
@@ -688,6 +729,8 @@ async fn wlfw_bring_up(ctrl: MhiController<Bar0Mhi>, s: MhiStart, api: FwApi) {
         pci_dev_name(s.pci_addr),
         super::board::check_smbios().bdf_ext,
     ) else {
+        let mut ctrl = ctrl;
+        abort_mhi_bring_up(&mut ctrl).await;
         return wlfw_fail(wlfw::WlfwError::new(
             wlfw::step::UNSUPPORTED,
             0,
@@ -726,7 +769,12 @@ async fn wlfw_bring_up(ctrl: MhiController<Bar0Mhi>, s: MhiStart, api: FwApi) {
             // Linux: ath11k_core_qmi_firmware_ready.
             super::core::pci_start(w).await;
         }
-        Err(e) => wlfw_fail(e),
+        Err(e) => {
+            // The QMI owner has handed target-memory DMA to firmware by this
+            // point on several failure paths.  Stop MHI before `w` drops it.
+            abort_mhi_bring_up(&mut w.client.pipe).await;
+            wlfw_fail(e);
+        }
     }
 }
 

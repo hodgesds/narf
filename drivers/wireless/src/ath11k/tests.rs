@@ -215,6 +215,56 @@ fn smoke_ath11k_probe_bound_or_skip() -> TestResult {
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_probe_bound_or_skip);
 
+/// QCNFA765 exposes the WCN6855 PCI function (`17cb:1103`).  Linux resolves
+/// the NFA765 module to WCN6855 HW2.1, whose firmware lives under
+/// `ath11k/WCN6855/hw2.1`.  This is deliberately a PCI/power-up qualification:
+/// the kernel-test runner begins before the async MHI task gets a scheduler
+/// turn, so MHI/QMI/radio readiness is exercised by the normal-boot smoke
+/// (`ath11k.scan=1`), not falsely required here.
+fn smoke_ath11k_qcnfa765_pci_powerup_or_skip() -> TestResult {
+    let Some((chip_vid, chip_did, device_id, hw_rev, params_rev, fw_dir, wanted_msi, msi_cfg, msi)) =
+        with_controller(|d| {
+            (
+                d.chip.vid,
+                d.chip.did,
+                d.device_id,
+                d.hw_rev,
+                d.params.hw_rev,
+                d.params.fw_dir,
+                d.params.msi.total_vectors,
+                d.msi.config.total_vectors,
+                d.msi.n_vectors,
+            )
+        })
+    else {
+        return TestResult::Skip("ath11k: no QCNFA765/WCN6855 bound (expected on QEMU)");
+    };
+
+    if device_id != ATH11K_DEV_WCN6855 {
+        return TestResult::Skip("ath11k: bound device is not QCNFA765/WCN6855");
+    }
+    if chip_vid != QCOM_VENDOR || chip_did != device_id {
+        return TestResult::Fail("ath11k: WCN6855 PCI identity changed during bring-up");
+    }
+    if hw_rev != HwRev::Wcn6855Hw21 || params_rev != hw_rev {
+        return TestResult::Fail("ath11k: QCNFA765 did not resolve to WCN6855 HW2.1 parameters");
+    }
+    if fw_dir != "WCN6855/hw2.1" {
+        return TestResult::Fail("ath11k: QCNFA765 selected the wrong firmware directory");
+    }
+    // WCN6855 requests Linux's 32-vector layout, but a single shared MSI is
+    // a supported fallback when the platform cannot allocate the full block.
+    if wanted_msi != 32 || !matches!(msi_cfg, 1 | 32) || msi as u32 != msi_cfg {
+        return TestResult::Fail("ath11k: QCNFA765 MSI allocation has an invalid layout");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_qcnfa765_pci_powerup_or_skip
+);
+
 // ── Phase 1: power-up sequence (Linux ath11k_pci_sw_reset) ─────────
 
 mod fake_io {

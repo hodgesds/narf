@@ -2485,6 +2485,28 @@ fn smoke_mhi_power_down_states() -> TestResult {
         "reset timeout logged"
     );
     check!(h.pm_state == pm::DISABLE, "still DISABLE");
+
+    // Initial MHI/WLFW failure must first shut down PCI delivery (MSI/ASPM)
+    // and then reset MHI before the caller drops any DMA/context allocations.
+    let mut h = match booted() {
+        Some(h) => h,
+        None => return TestResult::Fail("boot"),
+    };
+    run(h.abort_bring_up());
+    check!(
+        h.bus.d.borrow().hif == [HifPower::Down],
+        "failed bring-up powers PCI down before dropping MHI"
+    );
+    check!(
+        h.pm_state == pm::DISABLE,
+        "failed bring-up leaves MHI disabled"
+    );
+    check!(
+        h.ctxt_addrs().is_none(),
+        "failed bring-up frees MHI contexts"
+    );
+    check!(h.fbc_table().is_none(), "failed bring-up frees BHIe table");
+
     // A firmware image that fails BHI after the reset: the power cycle
     // reports it.
     let mut h = match booted() {

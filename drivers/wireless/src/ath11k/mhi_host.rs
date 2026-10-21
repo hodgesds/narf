@@ -2992,6 +2992,19 @@ impl<B: MhiBus> MhiController<B> {
         self.unprepare_after_power_down();
     }
 
+    /// Abort an initial ath11k bring-up after MHI ownership has begun.
+    ///
+    /// The PCI glue has already enabled MSI and disabled ASPM before it
+    /// starts MHI.  A failure during MHI power-up or the first QMI handshake
+    /// must therefore quiesce the function before its DMA/context allocations
+    /// can be dropped.  This is the failed-bring-up counterpart to the down
+    /// half of [`Self::power_cycle`]: PCI first stops delivery and restores
+    /// link policy, then MHI resets the device and releases its contexts.
+    pub(crate) async fn abort_bring_up(&mut self) {
+        self.bus.hif_power(HifPower::Down);
+        self.power_down().await;
+    }
+
     /// The power-off half of `ath11k_hif_power_down(ab, true)` used by
     /// ordinary system suspend. Linux calls
     /// `mhi_power_down_keep_dev(..., true)` here, then
