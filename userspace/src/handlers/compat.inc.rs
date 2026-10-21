@@ -6230,7 +6230,7 @@ fn write_rusage_utime(out_ptr: u64, ns: u64, maxrss_kb: u64) -> Result<(), u64> 
 /// page counter matches Linux's RSS units and is O(1); mapped virtual span is
 /// neither resident nor a valid approximation for `ru_maxrss`.
 fn task_rss_bytes(pid: u64) -> u64 {
-    let as_arc = narf_scheduler::address_space_of(narf_scheduler::TaskId(pid)).or_else(|| {
+    let as_arc = narf_scheduler::address_space_of_live(narf_scheduler::TaskId(pid)).or_else(|| {
         if pid == current_task_id() {
             narf_scheduler::current_address_space()
         } else {
@@ -7740,7 +7740,8 @@ pub fn proc_oom_score_of(pid: u64) -> i32 {
     // VMAs but not resident pages yet — use vma_count as a proxy.
     let rss_pages = {
         // Address spaces are keyed by TaskId; resolve the outer ProcessId first.
-        let task = narf_scheduler::address_space_of(narf_scheduler::TaskId(proc_pid_to_tid(pid)));
+        let task =
+            narf_scheduler::address_space_of_live(narf_scheduler::TaskId(proc_pid_to_tid(pid)));
         task.map(|as_arc| as_arc.mapped_bytes().saturating_add(4095) / 4096)
             .unwrap_or(0)
     };
@@ -7917,24 +7918,31 @@ pub fn proc_task_info(
         || (mapped_tid.is_some() && task.is_some())
         || tid == current
         || narf_scheduler::all_task_ids().iter().any(|t| t.0 == tid)
-        || narf_scheduler::address_space_of(narf_scheduler::TaskId(tid)).is_some();
+        || narf_scheduler::address_space_of_live(narf_scheduler::TaskId(tid)).is_some();
     if !live {
         return None;
     }
     // The group's mm — Linux `proc_mem_open` -> `mm_access(task)` reads
-    // `task->mm`, which every CLONE_THREAD sibling shares. The run-queue scan
-    // misses a task while some CPU is polling it, so:
-    //   1. the leader's slot, when it is queued;
+    // `task->mm`, which every CLONE_THREAD sibling shares, for as long as the
+    // task lives. The scheduler's live registry is that lifetime: it holds a
+    // task's address space from spawn and through every exec swap until its
+    // slot drops. A ready-queue scan is not: it misses a task while a CPU is
+    // polling it (the slot is off-queue for the whole poll) or while it is
+    // staged in a remote wake inbox, and after an exec during a poll the
+    // requeued slot still carries the torn-down pre-exec mm until its next
+    // dispatch. Each of those rendered an empty /proc/1/maps to every reader
+    // but PID 1 itself. So:
+    //   1. the task's own live address space;
     //   2. the READER's own mm when the reader belongs to this thread group
     //      (CLONE_THREAD implies CLONE_VM, so it is the same AddressSpace).
     //      Keying this on `tid == current` alone left a sibling thread reading
     //      /proc/self/maps with NO mm whenever the leader was running on
     //      another CPU — an empty maps file, which glibc's
     //      pthread_getattr_np turns into ENOENT;
-    //   3. any other queued member of the group.
+    //   3. any other live member of the group.
     // An unrelated reader never falls back to its own mm.
     let reader_in_group = tid == current || task_to_pid_raw(current) == Some(pid);
-    let as_arc = narf_scheduler::address_space_of(narf_scheduler::TaskId(tid))
+    let as_arc = narf_scheduler::address_space_of_live(narf_scheduler::TaskId(tid))
         .or_else(|| {
             if reader_in_group {
                 current_address_space()
@@ -7946,7 +7954,9 @@ pub fn proc_task_info(
             crate::task::thread_group_tids(pid)
                 .into_iter()
                 .filter(|&member| member != tid)
-                .find_map(|member| narf_scheduler::address_space_of(narf_scheduler::TaskId(member)))
+                .find_map(|member| {
+                    narf_scheduler::address_space_of_live(narf_scheduler::TaskId(member))
+                })
         });
     // brk top — the break is ADDRESS-SPACE state now (not per-task), so read it
     // off the group's AS. This also gives every CLONE_VM thread the same `[heap]`
