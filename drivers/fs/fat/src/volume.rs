@@ -15,6 +15,7 @@
 //! - OSDev Wiki, "FAT" (algorithmic descriptions only — no code copied).
 //!   <https://wiki.osdev.org/FAT>
 
+use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -93,6 +94,16 @@ pub struct FatVolume<B: BlockDevice> {
     /// `msdos_sb_info::options`: the ownership and permission model, which
     /// for FAT lives entirely in the mount options.
     pub opts: crate::mount_opts::FatOpts,
+    /// Per-file content generations backing
+    /// `FileOps::mmap_cache_generation`, keyed by the same value
+    /// `FatNode::inode_number` reports (the directory entry's position).
+    /// FAT has no inode cache — every lookup mints a fresh node — so the
+    /// counter cannot live on the node: two opens of one file are two
+    /// objects, and a write through one must invalidate pages retained
+    /// through the other. Volume scope keyed by on-disk identity is the
+    /// one place all opens share. Entries start at 0 and only ever move
+    /// forward; a missing entry reads as generation 0.
+    cache_generations: IrqSafeSpinLock<BTreeMap<u64, u64>>,
 }
 
 impl<B: BlockDevice + 'static> FatVolume<B> {
@@ -188,7 +199,35 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
             dev: narf_filesystem::inode_id::alloc_anon_dev(),
             tz_offset_secs: opts.tz_offset_secs,
             opts,
+            cache_generations: IrqSafeSpinLock::new(BTreeMap::new()),
         }))
+    }
+
+    /// Current content generation for the file whose directory entry
+    /// sits at `(lba, offset)` — the key `FatNode::inode_number`
+    /// derives from the same position, so a node and its directory
+    /// entry always agree on the key.
+    pub fn cache_generation(&self, lba: u64, offset: usize) -> u64 {
+        let entries_per_sector = u64::from(self.bpb.bytes_per_sec) / 32;
+        let key = lba * entries_per_sector + (offset / 32) as u64;
+        self.cache_generations
+            .lock()
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Record a content mutation (bytes or length) of the file whose
+    /// directory entry sits at `(lba, offset)`. Every such mutation in
+    /// this driver bumps exactly once, before the mutating operation
+    /// returns, so a completed write/truncate/unlink can never leave a
+    /// retained page looking current.
+    pub fn bump_cache_generation(&self, lba: u64, offset: usize) {
+        let entries_per_sector = u64::from(self.bpb.bytes_per_sec) / 32;
+        let key = lba * entries_per_sector + (offset / 32) as u64;
+        let mut generations = self.cache_generations.lock();
+        let entry = generations.entry(key).or_insert(0);
+        *entry = entry.wrapping_add(1);
     }
 
     pub fn first_data_sector(&self) -> u32 {

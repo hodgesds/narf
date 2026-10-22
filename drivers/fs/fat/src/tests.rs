@@ -976,3 +976,94 @@ fn smoke_fat_bootlog_session_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/fat", smoke_fat_bootlog_session_round_trip);
+
+/// The generic mmap page cache may retain a FAT file's pages across
+/// an unmap only while `mmap_cache_generation` proves the bytes have
+/// not changed. FAT mints a fresh node per lookup, so the generation
+/// lives in the volume, keyed by the directory entry's position:
+/// every open of one file must report the same value, a mutation
+/// through any open must move it for all of them, and an unrelated
+/// file's generation must not move.
+fn smoke_fat_mmap_cache_generation_tracks_mutations() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::FatVolume;
+
+    let img = build_fat12_image(128, b"narf\n");
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(FatVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+
+    let file = match poll_once(root.lookup_async("NARF.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup NARF.TXT failed"),
+    };
+    let g0 = match file.mmap_cache_generation() {
+        Some(g) => g,
+        None => return TestResult::Fail("regular file reports no cache generation"),
+    };
+    // A second lookup is a second node object for the same file; the
+    // values must agree or cross-open invalidation cannot work.
+    let reopened = match poll_once(root.lookup_async("NARF.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("second lookup failed"),
+    };
+    if reopened.mmap_cache_generation() != Some(g0) {
+        return TestResult::Fail("two opens of one file disagree on generation");
+    }
+    // A write through the second open moves the first open's value.
+    if poll_once(reopened.write(0, b"NARF!")).and_then(|r| r.ok()) != Some(5) {
+        return TestResult::Fail("write through second open failed");
+    }
+    let g1 = file.mmap_cache_generation();
+    if g1 == Some(g0) || reopened.mmap_cache_generation() != g1 {
+        return TestResult::Fail("write through a second open did not invalidate");
+    }
+    // Truncate moves it again.
+    if poll_once(file.truncate(2)).and_then(|r| r.ok()).is_none() {
+        return TestResult::Fail("truncate failed");
+    }
+    let g2 = file.mmap_cache_generation();
+    if g2 == g1 || g2.is_none() {
+        return TestResult::Fail("truncate did not move the generation");
+    }
+    // An unrelated file has its own generation, unmoved by the above.
+    let other = match poll_once(root.create("OTHER.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create OTHER.TXT failed"),
+    };
+    let og = other.mmap_cache_generation();
+    if og.is_none() {
+        return TestResult::Fail("created file reports no cache generation");
+    }
+    if poll_once(file.write(0, b"x")).and_then(|r| r.ok()) != Some(1) {
+        return TestResult::Fail("second write failed");
+    }
+    if other.mmap_cache_generation() != og {
+        return TestResult::Fail("a write to one file moved another file's generation");
+    }
+    // A directory is not a cacheable file.
+    if poll_once(root.mkdir("SUBDIR"))
+        .and_then(|r| r.ok())
+        .is_none()
+    {
+        return TestResult::Fail("mkdir failed");
+    }
+    let dir = match poll_once(root.lookup_async("SUBDIR")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup SUBDIR failed"),
+    };
+    if dir.mmap_cache_generation().is_some() {
+        return TestResult::Fail("directory reports a cache generation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/fat",
+    smoke_fat_mmap_cache_generation_tracks_mutations
+);
