@@ -3,6 +3,19 @@ use super::*;
 use crate::{amdgpu_navi48_dispatch as dispatch, amdgpu_vcn_navi48 as vcn};
 
 impl ColdBoot {
+    /// The current proven client transport must retain the same PSP TMR
+    /// and firmware image. Diagnostic-only stopped media grants no query.
+    pub(crate) fn client_media_firmware_version(&self) -> Option<u32> {
+        if self.state() != State::MemoryReady {
+            return None;
+        }
+        self.client_media_fence_reader()?;
+        self.sequence
+            .backend
+            .psp
+            .as_ref()?
+            .authenticated_vcn_version()
+    }
     pub(crate) fn client_media_fence_reader(&self) -> Option<vcn::FenceReader> {
         let hw = &self.sequence.backend;
         if !self.media_submission_ready() || hw.vcn_owner.is_none() {
@@ -96,6 +109,9 @@ impl ColdBoot {
         if self.sequence.backend.vcn_owner.is_none() {
             return Err(Error::Busy);
         }
+        // Current media evidence cannot outlive a reset or its cancellation.
+        // The platform republishes only after reproof and replay commit.
+        crate::amdgpu_info::publish_navi48_media(0, None);
         let hw = &mut self.sequence.backend;
         hw.media_test = Some(Err(Error::Busy));
         if hw.media_jpeg_clients && hw.jpeg_owner.is_some() {

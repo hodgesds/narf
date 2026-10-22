@@ -389,7 +389,10 @@ fn register_submitter(
             device_recovery: core::sync::atomic::AtomicBool::new(false),
         });
         *SUBMITTER.lock() = Some(submitter.clone());
-        crate::amdgpu_info::publish_navi48_video(boot.proven_video());
+        crate::amdgpu_info::publish_navi48_media(
+            boot.proven_video(),
+            boot.client_media_firmware_version(),
+        );
         crate::amdgpu_cs::register_submitter(card, submitter.clone());
         narf_scheduler::spawn(watchdog(submitter));
         if SHADER_PROOF.load(core::sync::atomic::Ordering::Acquire)
@@ -1082,7 +1085,7 @@ async unsafe fn quiesce(
     }
     crate::amdgpu_navi48_power::stop();
     crate::amdgpu_info::withdraw_navi48_clock();
-    crate::amdgpu_info::publish_navi48_video(0);
+    crate::amdgpu_info::publish_navi48_media(0, None);
     for display in 0..4 {
         present_slot(display).native.store(false, Ordering::Release);
     }
@@ -1630,6 +1633,9 @@ impl Submitter {
                                 self.contexts.lock()[r] = (0, 0);
                                 self.watch.lock()[r].recovered(narf_time::monotonic_ns());
                             }
+                        }
+                        if result.is_ok() && ring == MEDIA_RING as usize {
+                            media_clients::activate_media(boot);
                         }
                         result
                     }

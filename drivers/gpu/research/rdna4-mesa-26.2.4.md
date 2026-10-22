@@ -17,6 +17,15 @@ The source was read, not built or run against physical hardware.
   refuses DRMminor<54. Advertising3.42 would still fail initialization.
   At1496, user queues remain opt-in through AMD_USERQ and the device's
   `userq_ip_mask`; they are separate from normal graphics/compute CS.
+- At1539–1546, a nonzero VCN decoder or unified ring additionally requires
+  `FW_VERSION/FW_VCN`; otherwise common GPU initialization fails before
+  creating a renderer. Native INFO now returns the raw VCN common-header
+  `ucode_version` and zero feature, matching Linux `amdgpu_vcn_setup_ucode`
+  and `amdgpu_firmware_info`. Its metadata is tied to the retained container
+  whose payload PSP accepted, complete GC12 boot/TMR ownership, and the
+  current proven client media owner. Missing, stopped or unproven media
+  remains EINVAL; reset withdraws it before awaiting. No DRMminor or codec
+  capability is raised by this query fix.
 - `src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c`, lines1007–1118,
   builds gang leader/follower IBs. The last CS is the leader; mixed IPs
   become IB chunks in one request, with the last IB matching the request's
@@ -36,11 +45,21 @@ The source was read, not built or run against physical hardware.
   Real completion/readback remains a physical test. It does not establish
   a rendered image, texture/resource coverage, Mesa API conformance,
   compositor presentation or application rendering-to-scanout ordering.
-- A deterministic kernel draw proof still needs a pinned GFX12 primary
-  state/shader reference. IGT2.4's GFX12 programs in
+- A deterministic kernel draw proof still needs a generated/checked GFX12
+  shader/configuration and command fixture. IGT2.4's GFX12 programs in
   `lib/amdgpu/shaders/amd_shaders.c` are buffer-clear/copy compute kernels;
-  no GFX12 draw fixture was found. Reconstructing graphics state from
-  older generations is not an acceptable substitute.
+  no GFX12 draw fixture was found there. Mesa26.2.4 does contain actual
+  current-generation references: `ac_cmdbuf.c::gfx12_init_graphics_preamble_state`,
+  `ac_cmdbuf_cp.c::ac_emit_cp_ge_rings`,
+  `ac_descriptors.c::ac_init_gfx12_cb_surface`, and RADV's GFX12 NGG/PS/CB
+  emitters in `radv_cmd_buffer.c`. Its
+  `nir/radv_meta_nir.c::radv_meta_nir_build_clear_color_shaders` and
+  `meta/radv_meta_clear.c` build a no-vertex-buffer, no-blend clear-color
+  rectangle with three vertices. Generate both GC12 targets' actual lowered
+  NGG/PS binaries, resource state and Addrlib3 surface layout from that path,
+  then compare the native builder and full guarded output. This is bounded
+  software follow-up; importing older-generation state is not a substitute,
+  and no rendered image has been established by the compute proof.
 
 Local Linux primary paths are
 `/usr/src/linux/drivers/gpu/drm/amd/amdgpu/{gfx_v12_0.c,gmc_v12_0.c,amdgpu_cs.c,amdgpu_job.c}`.

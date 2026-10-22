@@ -510,6 +510,44 @@ kernel_test_in!(
     psp_navi48_graphics_global_order_autoload_and_media
 );
 
+fn psp_navi48_vcn_version_requires_complete_boot_and_retained_tmr() -> TestResult {
+    use crate::amdgpu_navi48_ucode::{Image, Source};
+    let mut bytes = Source::ALL.map(crate::amdgpu_navi48_ucode::tests::container);
+    let vcn = Source::ALL.iter().position(|s| *s == Source::Vcn).unwrap();
+    // Distinct packed VCN version, not the CP header's version/feature.
+    bytes[vcn][16..20].copy_from_slice(&0x1334_5678u32.to_le_bytes());
+    let images: [Image<'_>; 11] =
+        core::array::from_fn(|i| Image::parse(Source::ALL[i], &bytes[i]).unwrap());
+    let (pool, mut session) = prepared();
+    assert_eq!(session.authenticated_vcn_version(), None);
+    run(session.load_gfx12(&images)).unwrap();
+    assert_eq!(session.gfx12_vcn_version, Some(0x1334_5678));
+    assert_eq!(session.authenticated_vcn_version(), None);
+    run(session.wait_gfx_boot()).unwrap();
+    assert_eq!(session.authenticated_vcn_version(), Some(0x1334_5678));
+    session.tmr_ready = false;
+    assert_eq!(session.authenticated_vcn_version(), None);
+    session.tmr_ready = true;
+    let tmr = session.tmr.take();
+    assert_eq!(session.authenticated_vcn_version(), None);
+    session.tmr = tmr;
+    let address = session.media_firmware.vcn.take();
+    assert_eq!(session.authenticated_vcn_version(), None);
+    session.media_firmware.vcn = address;
+    assert_eq!(session.authenticated_vcn_version(), Some(0x1334_5678));
+    // SAFETY: no hardware consumers; the model acknowledges TMR retirement.
+    unsafe { run(session.stop()) }.unwrap();
+    assert_eq!(session.authenticated_vcn_version(), None);
+    assert_eq!(session.gfx12_vcn_version, None);
+    drop(session);
+    assert_eq!(pool.available(), 16 << 20);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/psp-ring",
+    psp_navi48_vcn_version_requires_complete_boot_and_retained_tmr
+);
+
 fn psp_navi48_interrupted_upload_preserves_ownership() -> TestResult {
     let firmware = crate::amdgpu_navi48_firmware::fixture();
     let images = firmware.images().unwrap();
@@ -531,6 +569,8 @@ fn psp_navi48_interrupted_upload_preserves_ownership() -> TestResult {
         }
         if s.gfx_state != GfxLoadState::Loading
             || s.engine.state != State::Pending
+            || s.gfx12_vcn_version.is_some()
+            || s.authenticated_vcn_version().is_some()
             || s.engine.io.submissions.last().unwrap()[10] != kind
             || run(s.load_gfx12(&images)) != Err(Error::Busy)
         {
@@ -547,9 +587,23 @@ fn psp_navi48_interrupted_upload_preserves_ownership() -> TestResult {
     s.engine.io.reject_type = Some(94);
     if run(s.load_gfx12(&images)) != Err(Error::Rejected(7))
         || s.gfx_state != GfxLoadState::Failed
+        || s.authenticated_vcn_version().is_some()
         || s.engine.io.submissions.iter().any(|c| c[2] == 0x21)
     {
         return TestResult::Fail("failed RS64 stack load still started RLC");
+    }
+    for kind in [13, 51] {
+        let (_, mut s) = prepared();
+        s.engine.io.reject = 7;
+        s.engine.io.reject_command = Some(6);
+        s.engine.io.reject_type = Some(kind);
+        if run(s.load_gfx12(&images)) != Err(Error::Rejected(7))
+            || s.gfx_state != GfxLoadState::Failed
+            || s.gfx12_vcn_version.is_some()
+            || s.authenticated_vcn_version().is_some()
+        {
+            return TestResult::Fail("rejected VCN or later DMUB upload published a VCN version");
+        }
     }
     TestResult::Pass
 }

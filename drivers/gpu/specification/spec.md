@@ -654,7 +654,20 @@ until the cold-boot owner samples harvesting. `ACCEL_WORKING` remains zero.
 What Mesa 26's ac_query_gpu_info cannot start without is answered too:
 `FW_VERSION` reports ME, PFP and MEC `ucode_version` and v2.0
 `ucode_feature_version` (`amdgpu_navi48_ucode::Image::feature`), published
-by `prepare` (other types EINVAL); `READ_MMR_REG` answers soc24's
+by `prepare`. `FW_VCN` on VCN5.0.0 reports the common firmware header's raw
+`ucode_version` with `feature=0`, as `amdgpu_firmware_info` does. The version
+comes from the same retained GC12 container whose payload PSP accepted;
+the header is container metadata, not a separate PSP-signed version claim.
+The PSP owner retains it only after the complete GC12 upload succeeds and
+exposes it only after boot completion with its TMR and VCN entry retained.
+The platform publishes it beside media capabilities only when the current
+client VCN transport has its native IB/interrupt proof and retained source
+owner; a stopped diagnostic, failed/cancelled load or absent image grants
+no query. Reset/suspend withdraw this media publication before their first
+await, and recovery publishes only fresh proof. Missing publication and
+other firmware types return EINVAL. This closes Mesa26.2.4's required VCN
+firmware query when the unified ring is present; DRMminor and codec bits
+remain unchanged. `READ_MMR_REG` answers soc24's
 allow-list only for `GB_ADDR_CONFIG` (GC segment 0 + 0x13de, from the
 topology sample's `gb_addr_config`), with Linux's SE (< 4) / SH (< 2) /
 count (<= 128) checks and EFAULT for any other offset. `MAX_IBS` on an open

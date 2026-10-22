@@ -102,7 +102,10 @@ pub(super) fn activate_media(boot: &boot::ColdBoot) {
     if *generation == submitter.generation {
         *submitter.media_fence.lock() = boot.client_media_fence_reader();
         *submitter.jpeg_fence.lock() = boot.client_jpeg_fence_reader();
-        crate::amdgpu_info::publish_navi48_video(boot.proven_video());
+        crate::amdgpu_info::publish_navi48_media(
+            boot.proven_video(),
+            boot.client_media_firmware_version(),
+        );
     }
 }
 
