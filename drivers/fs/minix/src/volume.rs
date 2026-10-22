@@ -24,6 +24,7 @@
 //! scan; the on-disk format is the same byte-level layout Tanenbaum
 //! describes.
 
+use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -82,6 +83,17 @@ pub struct MinixVolume<B: BlockDevice> {
     /// to the new node so a sync `stat` of the mount root reports the
     /// on-disk mtime instead of an uncached zero.
     root_inode: IrqSafeSpinLock<Option<super::inode::Inode>>,
+    /// Per-inode content generations backing
+    /// `FileOps::mmap_cache_generation`, keyed by inode number. Nodes
+    /// are minted per lookup, so the counter cannot live on the node:
+    /// two opens of one file are two objects, and a write through one
+    /// must invalidate pages retained through the other. Volume scope
+    /// keyed by the inode number is the one place all opens share.
+    /// Entries start at 0 and only ever move forward; an inode number
+    /// recycled by free + realloc keeps counting up, so a new file can
+    /// never collide with a previous tenant's recorded generation by
+    /// going backwards.
+    cache_generations: IrqSafeSpinLock<BTreeMap<u64, u64>>,
 }
 
 impl<B: BlockDevice + 'static> MinixVolume<B> {
@@ -139,10 +151,31 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
             io: IrqSafeSpinLock::new(io),
             dev: narf_filesystem::inode_id::alloc_anon_dev(),
             root_inode: IrqSafeSpinLock::new(None),
+            cache_generations: IrqSafeSpinLock::new(BTreeMap::new()),
         });
         let root = volume.read_inode(super::MINIX_ROOT_INO).await?;
         *volume.root_inode.lock() = Some(root);
         Ok(volume)
+    }
+
+    /// Current content generation for inode `ino`.
+    pub fn cache_generation(&self, ino: u32) -> u64 {
+        self.cache_generations
+            .lock()
+            .get(&u64::from(ino))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Record a content mutation (bytes or length) of inode `ino`.
+    /// Every such mutation in this driver bumps exactly once, before
+    /// the mutating operation returns, so a completed
+    /// write/truncate/final-unlink can never leave a retained page
+    /// looking current.
+    pub fn bump_cache_generation(&self, ino: u32) {
+        let mut generations = self.cache_generations.lock();
+        let entry = generations.entry(u64::from(ino)).or_insert(0);
+        *entry = entry.wrapping_add(1);
     }
 
     /// Read one device sector (LBS bytes) into `dst`. `dst.len()`

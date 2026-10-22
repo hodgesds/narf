@@ -681,3 +681,90 @@ fn smoke_minix_time_format_edges() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/minix", smoke_minix_time_format_edges);
+
+/// The minix half of the `mmap_cache_generation` contract (see the
+/// FAT smoke of the same name): the generation lives in the volume,
+/// keyed by inode number, so every open of one file reports the same
+/// value and a mutation through any open — or a final unlink that
+/// releases the inode's zones — moves it for all of them.
+fn smoke_minix_mmap_cache_generation_tracks_mutations() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use super::volume::MinixVolume;
+
+    let img = build_minix3_image_writable();
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(MinixVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+
+    let file = match poll_once(root.lookup_async("hi.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup hi.txt failed"),
+    };
+    let g0 = match file.mmap_cache_generation() {
+        Some(g) => g,
+        None => return TestResult::Fail("regular file reports no cache generation"),
+    };
+    let reopened = match poll_once(root.lookup_async("hi.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("second lookup failed"),
+    };
+    if reopened.mmap_cache_generation() != Some(g0) {
+        return TestResult::Fail("two opens of one file disagree on generation");
+    }
+    if poll_once(reopened.write(0, b"HI"))
+        .and_then(|r| r.ok())
+        .is_none()
+    {
+        return TestResult::Fail("write through second open failed");
+    }
+    let g1 = file.mmap_cache_generation();
+    if g1 == Some(g0) || reopened.mmap_cache_generation() != g1 {
+        return TestResult::Fail("write through a second open did not invalidate");
+    }
+    if poll_once(file.truncate(1)).and_then(|r| r.ok()).is_none() {
+        return TestResult::Fail("truncate failed");
+    }
+    if file.mmap_cache_generation() == g1 || file.mmap_cache_generation().is_none() {
+        return TestResult::Fail("truncate did not move the generation");
+    }
+    // An unrelated file's generation does not move with hi.txt's.
+    let other = match poll_once(root.create("other.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create other.txt failed"),
+    };
+    let og = other.mmap_cache_generation();
+    if og.is_none() {
+        return TestResult::Fail("created file reports no cache generation");
+    }
+    if poll_once(file.write(0, b"x")).and_then(|r| r.ok()) != Some(1) {
+        return TestResult::Fail("second write failed");
+    }
+    if other.mmap_cache_generation() != og {
+        return TestResult::Fail("a write to one file moved another file's generation");
+    }
+    // A directory is not a cacheable file.
+    if poll_once(root.mkdir("subdir"))
+        .and_then(|r| r.ok())
+        .is_none()
+    {
+        return TestResult::Fail("mkdir failed");
+    }
+    let dir = match poll_once(root.lookup_async("subdir")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup subdir failed"),
+    };
+    if dir.mmap_cache_generation().is_some() {
+        return TestResult::Fail("directory reports a cache generation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/minix",
+    smoke_minix_mmap_cache_generation_tracks_mutations
+);

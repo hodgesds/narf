@@ -364,6 +364,32 @@ impl<B: BlockDevice + 'static> FatNode<B> {
         }
     }
 
+    /// This node's `FileOps::mmap_cache_generation` value, or `None`
+    /// when this node must stay on the conservative map-lifetime-only
+    /// cache behaviour: directories, and the root (which has no
+    /// directory entry to key a generation on). Only regular files
+    /// with an entry location qualify — the generation is keyed by
+    /// that location in the volume, so every node minted for the same
+    /// on-disk file reports the same value.
+    fn cache_generation(&self) -> Option<u64> {
+        let (lba, offset) = self.entry_location?;
+        if self.state.lock().stat.mode.file_type != FileType::File {
+            return None;
+        }
+        Some(self.volume.cache_generation(lba, offset))
+    }
+
+    /// Bump this file's volume generation ahead of a content mutation
+    /// (`write`, `truncate`). Bumping *before* the bytes move covers
+    /// partial mutations that end in an error; a spurious bump only
+    /// costs a retained page its reuse, never correctness.
+    fn note_content_mutation(&self) {
+        if self.cache_generation().is_some() {
+            let (lba, offset) = self.entry_location.expect("gated above");
+            self.volume.bump_cache_generation(lba, offset);
+        }
+    }
+
     pub async fn truncate_async(&self, len: u64) -> Result<(), FsError> {
         let (old_size, mut cluster) = {
             let g = self.state.lock();
@@ -372,6 +398,7 @@ impl<B: BlockDevice + 'static> FatNode<B> {
         if len == old_size {
             return Ok(());
         }
+        self.note_content_mutation();
 
         if len < old_size {
             let bytes_per_cluster =
@@ -844,6 +871,7 @@ impl<B: BlockDevice + 'static> FileOps for FatNode<B> {
 
     fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
+            self.note_content_mutation();
             let mut total_written = 0usize;
             let mut remaining = buf.len();
             let lbs = self.volume.bpb.bytes_per_sec as u64;
@@ -948,6 +976,18 @@ impl<B: BlockDevice + 'static> FileOps for FatNode<B> {
 
     fn truncate<'a>(&'a self, len: u64) -> FsFuture<'a, ()> {
         Box::pin(async move { self.truncate_async(len).await })
+    }
+
+    /// Generic-fallback mmap opt-in: this file's bytes change only
+    /// through `write`, `truncate` and `unlink` (which frees the
+    /// chain), and each of those bumps the volume generation keyed by
+    /// this file's directory-entry position — see
+    /// `FatVolume::cache_generations`. A node for the same file minted
+    /// by a later lookup therefore reports the same generation, and a
+    /// mutation through any one open invalidates pages retained
+    /// through any other.
+    fn mmap_cache_generation(&self) -> Option<u64> {
+        self.cache_generation()
     }
 }
 
@@ -1237,6 +1277,11 @@ impl<B: BlockDevice + 'static> DirOps for FatNode<B> {
                         return Err(FsError::InvalidPath);
                     }
                     self.tombstone_slot(lba, offset).await?;
+                    // The chain is about to be freed under any node
+                    // still holding this file open: its retained
+                    // cache pages no longer describe what a read
+                    // through that node would return.
+                    self.volume.bump_cache_generation(lba, offset);
                     let first = entry.first_cluster();
                     if first >= 2 {
                         self.free_chain(first).await?;
