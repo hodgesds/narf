@@ -24,6 +24,23 @@ the active domain key-rights via the Frame.
 
 ## 3. Public interface
 
+Kernel `ioremap::MmioAttrs::WriteCombining` selects PAT WC on x86_64 and
+MAIR Normal-NC on aarch64. Prefetchable PCI BARs and adopted framebuffers
+use this same type as their user WC aliases; aarch64 never substitutes WB
+for a prefetchable device window. Register mappings keep Device attributes.
+Known System RAM in any kernel I/O window retains WB on each leaf, matching
+its direct map even when a firmware framebuffer requested WC. The cache
+conservatively records the requested type for interval conflict checks.
+Kernel ioremap claims include the page-rounded physical interval and requested
+attributes. Identical ready mappings reuse their VA; an identical pending
+install/teardown returns `Busy`. Any overlapping differently typed claim,
+including an in-progress installation, returns `AttributeConflict` before
+page-table writes. Claims remain reserved while page-table allocation,
+rollback and TLB shootdowns run with the cache lock released. Failure releases
+the pending claim only after installed leaves are removed; uncertain rollback
+retains the claim and virtual range. ARM rollback and teardown clear actual
+PTEs before releasing their claims, as on x86_64.
+
 ```rust
 pub struct PhysFrame;     // owned 4 KiB physical frame (base page)
 pub struct VirtAddr(u64);
@@ -182,6 +199,14 @@ pub fn install_memory_hotplug_hook(hook: fn());
 pub const MEMORY_BLOCK_SIZE: u64;
 /// Includes previously discovered offline blocks so memoryN identity persists.
 pub fn memory_blocks() -> Vec<MemoryBlock>;
+/// Register known boot RAM (including kernel and ACPI reserved RAM) without
+/// donating it. Once on the BSP before init_from_map; never include generic
+/// Reserved regions because they may be device MMIO.
+pub unsafe fn frame::register_boot_ram(regions: &[UsableRegion]);
+/// System RAM test: known boot RAM, original usable ranges, or any registered
+/// hotplug range, online or not. Takes registry leaf locks separately and is
+/// callable under a page-table root lock.
+pub fn frame::is_system_ram(phys: PhysAddr) -> bool;
 
 /// Publish local HMAT coordinates and derive Linux-style memory tiers.
 pub fn set_node_performance(
@@ -450,6 +475,69 @@ impl RegionPerms {
     /// external attachment/nattch close accounting.
     pub const SYSV_SHM: RegionPerms;
     pub const COW: RegionPerms;
+    /// Requested memory type, stored in bits 24..=26 outside PROT_MASK, so
+    /// mprotect, VMA splits, mremap and fork preserve it. Zero = WriteBack.
+    pub const fn memory_type(self) -> MemoryType;
+    pub const fn with_memory_type(self, memory_type: MemoryType) -> RegionPerms;
+}
+
+/// Memory type of a user mapping (Linux `vm_page_prot` cache bits; module
+/// `memtype`, re-exported at the crate root). Encodings:
+///
+/// | Type           | Linux helper           | x86_64 (4 KiB / large)        | aarch64                    |
+/// | -------------- | ---------------------- | ----------------------------- | -------------------------- |
+/// | WriteBack      | default                | no bits (PAT slot 0)          | AttrIndx 0, unchanged      |
+/// | WriteCombining | `pgprot_writecombine`  | PWT (slot 1)                  | AttrIndx 3 Normal-NC + UXN/PXN |
+/// | Uncached       | `pgprot_noncached`     | PCD (slot 2, UC-)             | AttrIndx 4 Device-nGnRnE + UXN/PXN |
+/// | WriteThrough   | `pgprot_writethrough`  | PAT\|PCD\|PWT (slot 7); PAT is bit 7 / bit 12 | AttrIndx 4 (Linux generic fallback) |
+///
+/// x86_64 bits come from `narf_arch::x86_64::pat::cachemode2pte` under the
+/// programmed layout; a type the layout lacks degrades to UC-, never to a
+/// more cacheable type.
+pub enum MemoryType { WriteBack /* default */, WriteCombining, Uncached, WriteThrough }
+
+pub mod memtype {
+    /// `SHARED | LOCK_EXEMPT` and neither `COW` nor `PINNABLE_RAM`: the only
+    /// regions whose leaves may carry a non-write-back type.
+    pub const fn region_may_request(perms: RegionPerms) -> bool;
+    /// The type the leaf mapping `phys` gets: the requested type only if the
+    /// region may request one and `phys` is a non-zero frame outside System
+    /// RAM; otherwise WriteBack. A refusal because `phys` is RAM is counted.
+    pub fn effective_memory_type(perms: RegionPerms, phys: PhysAddr) -> MemoryType;
+    /// Leaves built write-back although their region asked otherwise,
+    /// because the frame was System RAM.
+    pub fn ram_alias_refusals() -> u64;
+    #[cfg(target_arch = "x86_64")]
+    pub fn x86_leaf_bits_4k(memory_type: MemoryType) -> x86_64::paging::PtFlags;
+    #[cfg(target_arch = "aarch64")]
+    pub fn aarch64_leaf_bits(memory_type: MemoryType) -> aarch64::paging::PtFlags;
+}
+
+// x86_64 paging additions for memory types.
+impl x86_64::paging::PtFlags {
+    pub const PAT_4K: PtFlags;          // bit 7 of a 4 KiB PTE
+    pub const PAT_LARGE: PtFlags;       // bit 12 of a 2 MiB / 1 GiB leaf
+    pub const CACHE_MASK_4K: PtFlags;   // PWT | PCD | PAT(7)
+    pub const CACHE_MASK_LARGE: PtFlags; // PWT | PCD | PAT(12)
+    pub const fn from_bits(bits: u64) -> PtFlags;
+    pub const fn without(self, other: PtFlags) -> PtFlags;
+    /// Linux `protval_4k_2_large`: PAT bit 7 -> 12, all else unchanged.
+    pub const fn protval_4k_2_large(self) -> PtFlags;
+}
+impl x86_64::paging::PageTableEntry {
+    /// Base of a large leaf; excludes bit 12 (its PAT bit).
+    pub const fn large_addr(self) -> PhysAddr;
+    /// Flags of a large leaf, including PAT bit 12.
+    pub const fn large_flags(self) -> PtFlags;
+}
+// `unmap_2mb` / `unmap_1gb` / `translate` / `leaf_flags_at` decode large
+// leaves with `large_addr` / `large_flags`.
+
+// aarch64 paging additions: the MAIR indices of `narf_arch::aarch64::mair`.
+impl aarch64::paging::PtFlags {
+    pub const ATTR_NORMAL_NC: PtFlags;     // AttrIndx 3
+    pub const ATTR_DEVICE_NGNRNE: PtFlags; // AttrIndx 4
+    pub const ATTR_MASK: PtFlags;          // bits 4:2
 }
 
 pub enum FutureLockPolicy { None, Eager, OnFault }
@@ -1094,6 +1182,28 @@ x86_64 is rejected at runtime.
 
 - Every non-identity kernel mapping has a domain assignment; untagged
   mappings panic in debug, deny-by-default in release.
+- **User memory types never alias System RAM.** Every user leaf is built
+  by `user_leaf_flags(perms, writable, phys)` from the frame it maps. A
+  non-write-back `MemoryType` reaches the leaf only when the region is a
+  special mapping (`memtype::region_may_request`) and `phys` is outside
+  System RAM (`frame::is_system_ram`); otherwise the leaf is write-back,
+  matching the kernel direct map, and a RAM refusal is counted. This is
+  Linux's rule for RAM pfns in `reserve_pfn_range` / `track_pfn_insert`
+  (the request is replaced by the page's memtype, which is write-back
+  because NARF has no `set_memory_wc`). The type is recomputed whenever a
+  leaf is rebuilt (mprotect, fork, relocation), so it follows the frame.
+  Only kernel drivers set the request (through `MmapBacking::memory_type`);
+  no syscall lets userspace choose one.
+- **Write-back is bit-identical.** `MemoryType::WriteBack` contributes no
+  bits on either architecture, so a region that does not request a type
+  encodes exactly as before memory types existed. Memory-type bits are
+  disjoint from the PKS key field (59..=62), NX, USER, WRITABLE and the
+  aarch64 AP/GP bits; a type never grants write or execute permission
+  (aarch64 non-cacheable types force UXN|PXN like Linux arm64). User leaves
+  never select `ATTR_TAGGED`; a future `PROT_MTE` must refuse non-write-back
+  regions as Linux `arch_validate_flags` refuses non-RAM VMAs.
+- Large x86_64 leaves carry their PAT bit at 12 (`protval_4k_2_large`);
+  every reader of a large leaf's address masks it (`large_addr`).
 - `DomainId` 0 is reserved for the Frame's own data; no driver may claim it.
 - `PhysFrame` is `!Copy`; dropping it returns to the allocator (Rust
   ownership = leak safety for physical memory).
@@ -1607,6 +1717,18 @@ x86_64 is rejected at runtime.
 - Paging: 4-level (possibly 5-level where CPUID says so).
 - PKS: `MSR_IA32_PKRS` is the per-CPU rights mask; updated on domain
   enter/exit. Page-table PK field (bits 59..62 of PTE) stores the key.
+- PAT: every CPU programs Linux's layout WB, WC, UC-, UC, WB, WP, UC-, WT
+  (`narf_arch::x86_64::pat`); user memory types select it through
+  PWT/PCD/PAT. The direct map's 1 GiB leaves are PAT slot 0 over all of
+  phys `0..max_ram` including MMIO holes, so a BAR's direct-map alias has
+  the MTRR type (UC on real boards) and is never dereferenced; Linux maps
+  only RAM there. The boot RAM classifier covers usable, kernel and ACPI
+  reclaimable/NVS ranges, independently of allocator donation; ambiguous
+  Reserved entries may be MMIO and are not assumed to be RAM.
+  Non-RAM ranges have no user memtype tree: a user WC alias of a
+  BAR the kernel `ioremap`s UC is not refused (Linux would downgrade the
+  user request in non-strict mode). Both are non-cacheable, so no
+  cache-coherency alias arises.
 - SMEP/SMAP mandatory; CET shadow stack desired.
 - **Page sizes:**
 
@@ -1685,6 +1807,9 @@ x86_64 is rejected at runtime.
   barrier makes the replacement run visible.
 - MTE: memory tag is 4 bits, stored in the top byte of the address plus
   tag storage. We assign one tag per domain.
+- MAIR_EL1 = `0x44F004FF` (`narf_arch::aarch64::mair`): Normal, Device-nGnRE,
+  Normal-Tagged, Normal-NC, Device-nGnRnE at indices 0..=4. Encodings are
+  Linux's; indices keep every pre-existing descriptor bit-identical.
 - TBI1/TBI0 enabled; TCR_EL1 configured for MTE.
 - **Page sizes (4 KiB granule configuration):**
 

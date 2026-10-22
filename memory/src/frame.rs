@@ -346,6 +346,9 @@ struct HotplugRange {
 
 static HOTPLUG_RANGES: IrqSafeSpinLock<Vec<HotplugRange>> = IrqSafeSpinLock::new(Vec::new());
 static BOOT_MEMORY_RANGES: IrqSafeSpinLock<Vec<(u64, u64)>> = IrqSafeSpinLock::new(Vec::new());
+/// Known RAM, including kernel/ACPI ranges never donated to the allocator.
+static BOOT_KNOWN_RAM: IrqSafeSpinLock<Vec<(u64, u64)>> = IrqSafeSpinLock::new(Vec::new());
+static BOOT_KNOWN_RAM_SET: AtomicBool = AtomicBool::new(false);
 static ONLINE_NODE_MASK: AtomicU64 = AtomicU64::new(1);
 static MEMORY_HOTPLUG_HOOK: AtomicUsize = AtomicUsize::new(0);
 
@@ -4074,6 +4077,60 @@ fn phys_to_node(addr: u64) -> usize {
 
 pub fn node_for_phys(addr: u64) -> usize {
     phys_to_node(addr)
+}
+
+/// Register boot-identified RAM independently of allocator donation.
+///
+/// # Safety
+/// Once on the BSP, before `init_from_map`; every supplied range must be
+/// known RAM (usable, kernel, ACPI reclaimable or NVS), never a generic
+/// Reserved range that could be MMIO. Registration does not free any page.
+pub unsafe fn register_boot_ram(regions: &[UsableRegion]) {
+    assert!(!ALLOC.initialised.load(Ordering::Acquire));
+    assert!(!BOOT_KNOWN_RAM_SET.swap(true, Ordering::AcqRel));
+    let mut ranges = BOOT_KNOWN_RAM.lock();
+    ranges.extend(regions.iter().filter_map(|region| {
+        let start = region.start.raw() & !(PAGE_SIZE - 1);
+        let end = region.start.raw().checked_add(region.len)?;
+        (start < end).then_some((start, end - start))
+    }));
+}
+
+#[cfg(feature = "kernel-test")]
+pub(crate) fn known_boot_ram_for_test() -> Vec<(u64, u64)> {
+    BOOT_KNOWN_RAM.lock().clone()
+}
+
+/// Whether the page containing `phys` is known System RAM: usable boot
+/// ranges, kernel/ACPI RAM registered by `register_boot_ram`, or any hotplug
+/// range ever registered, online or not. An offlined block stays RAM because
+/// its direct-map alias outlives the offline. Ambiguous Reserved boot entries
+/// are not classified as RAM: they may be device MMIO.
+///
+/// This is the authority [`crate::memtype`] uses to refuse non-WB user aliases
+/// of known RAM. Registry locks are taken separately, with no allocation,
+/// so it is callable under a page-table root lock.
+pub fn is_system_ram(phys: PhysAddr) -> bool {
+    let page = phys.raw() & !(PAGE_SIZE - 1);
+    let in_range = |start: u64, len: u64| page >= start && page - start < len;
+    if BOOT_KNOWN_RAM
+        .lock()
+        .iter()
+        .any(|&(start, len)| in_range(start, len))
+    {
+        return true;
+    }
+    if BOOT_MEMORY_RANGES
+        .lock()
+        .iter()
+        .any(|&(start, len)| in_range(start, len))
+    {
+        return true;
+    }
+    HOTPLUG_RANGES
+        .lock()
+        .iter()
+        .any(|range| in_range(range.start, range.len))
 }
 
 pub fn hotplug_node_for_phys(addr: u64) -> Option<usize> {

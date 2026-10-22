@@ -251,6 +251,20 @@ impl FileOps for DevFb0 {
         Ok(frames)
     }
 
+    fn mmap_backing(
+        &self,
+        offset: u64,
+        len: usize,
+    ) -> Result<narf_filesystem::MmapBacking, FsError> {
+        Ok(narf_filesystem::MmapBacking {
+            frames: self.mmap_frames(offset, len)?,
+            lifetime: None,
+            // Match a device framebuffer's kernel WC mapping. The memory
+            // owner clamps RAM-backed scanouts to WB per physical leaf.
+            memory_type: narf_memory::MemoryType::WriteCombining,
+        })
+    }
+
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
         let info = match fbdev_info() {
             Some(i) => i,

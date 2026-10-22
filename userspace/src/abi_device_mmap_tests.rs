@@ -72,6 +72,7 @@ impl FileOps for Device {
         Ok(MmapBacking {
             frames,
             lifetime: Some(Arc::new(Token) as Arc<dyn MmapLifetime>),
+            memory_type: narf_memory::MemoryType::WriteBack,
         })
     }
     fn mmap_published(&self, lifetime: Option<&Arc<dyn MmapLifetime>>) {
@@ -231,3 +232,190 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_device_mmap_publishes_then_relocates
 );
+
+// ── Memory type: a device asks for write-combining through mmap(2) ──────
+
+static WC_FRAMES: IrqSafeSpinLock<Vec<u64>> = IrqSafeSpinLock::new(Vec::new());
+
+/// A device whose `mmap_backing` asks for write-combining, as a Linux
+/// driver applies `pgprot_writecombine` to `vm_page_prot`.
+struct WcDevice;
+impl FileOps for WcDevice {
+    fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        alloc::boxed::Box::pin(async { Ok(0) })
+    }
+    fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        alloc::boxed::Box::pin(async move { Ok(buf.len()) })
+    }
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode::FILE_RW,
+            mtime_cycles: 0,
+        }
+    }
+    fn mmap_backing(&self, offset: u64, len: usize) -> Result<MmapBacking, FsError> {
+        let frames = WC_FRAMES.lock();
+        let first = (offset / PAGE) as usize;
+        let count = len / PAGE as usize;
+        Ok(MmapBacking {
+            frames: frames
+                .get(first..first + count)
+                .ok_or(FsError::InvalidData)?
+                .to_vec(),
+            lifetime: None,
+            memory_type: narf_memory::MemoryType::WriteCombining,
+        })
+    }
+}
+
+fn wc_census(phys: u64) -> usize {
+    usize::from(WC_FRAMES.lock().contains(&phys))
+}
+
+/// A physical page that is not System RAM (past every memory block, 1 GiB
+/// aligned, at least 4 GiB). Only ever placed in descriptors of a root that
+/// is never activated; never dereferenced.
+fn non_ram_phys() -> Option<u64> {
+    const GIB: u64 = 1 << 30;
+    let end = narf_memory::memory_blocks()
+        .iter()
+        .map(|b| b.start + narf_memory::MEMORY_BLOCK_SIZE)
+        .max()
+        .unwrap_or(0)
+        .max(4 * GIB);
+    let phys = end.div_ceil(GIB) * GIB + GIB;
+    (!narf_memory::frame::is_system_ram(PhysAddr::new(phys))).then_some(phys)
+}
+
+/// The memory-type selector bits of the leaf mapping `va`.
+fn leaf_selector(space: &AddressSpace, va: u64) -> Option<u64> {
+    // SAFETY: the test-owned root is live and never activated.
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use narf_memory::x86_64::paging::{leaf_flags_at, PtFlags};
+            leaf_flags_at(space.root, VirtAddr::new(va))
+                .map(|(flags, _)| flags.bits() & PtFlags::CACHE_MASK_4K.bits())
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            use narf_memory::aarch64::paging::{leaf_flags_at, PtFlags};
+            leaf_flags_at(space.root, VirtAddr::new(va))
+                .map(|(flags, _)| flags.bits() & PtFlags::ATTR_MASK.bits())
+        }
+    }
+}
+
+fn wc_selector() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        narf_memory::memtype::x86_leaf_bits_4k(narf_memory::MemoryType::WriteCombining).bits()
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        narf_memory::aarch64::paging::PtFlags::ATTR_NORMAL_NC.bits()
+    }
+}
+
+/// End to end through `sys_mmap`: a device page gets a write-combining
+/// leaf, a RAM page in the same mapping gets write-back (the alias rule),
+/// and relocating the device page onto RAM re-derives the type from the
+/// new frame — the moved leaf is write-back.
+fn smoke_abi_device_mmap_write_combining() -> TestResult {
+    let Some(dev) = non_ram_phys() else {
+        return TestResult::Skip("no non-RAM physical address to test with");
+    };
+    let mut owned = Vec::new();
+    for _ in 0..2 {
+        match narf_memory::alloc_frame() {
+            Ok(frame) => owned.push(frame.start_address()),
+            Err(_) => {
+                for &phys in &owned {
+                    narf_memory::free_frame(narf_memory::PhysFrame::new(phys));
+                }
+                return TestResult::Skip("frame allocation failed");
+            }
+        }
+    }
+    let ram = owned[0].raw();
+    let relocation_target = owned[1].raw();
+    *WC_FRAMES.lock() = alloc::vec![dev, ram];
+    let result = with_setup(|| {
+        // SAFETY: paging is enabled; the root is owned by this test.
+        let space = Arc::new(
+            unsafe { AddressSpace::new_for_user() }.map_err(|_| "address space allocation")?,
+        );
+        *DEVICE_AS.lock() = Some(space.clone());
+        crate::handlers::install_address_space_lookup(lookup_device_as);
+        let outcome = (|| -> Result<(), &'static str> {
+            let fd = crate::fd::install(
+                FAKE_TASK,
+                crate::fd::FdEntry {
+                    ops: Arc::new(WcDevice),
+                    offset: 0,
+                    flags: 0,
+                    status_flags: O_RDWR,
+                },
+            )
+            .ok_or("fd install failed")? as u64;
+            let base = match call(
+                Syscall::Mmap.raw(),
+                SyscallArgs {
+                    arg0: 0,
+                    arg1: 2 * PAGE,
+                    arg2: PROT_READ | PROT_WRITE,
+                    arg3: MAP_SHARED,
+                    arg4: fd,
+                    arg5: 0,
+                },
+            ) {
+                Some(addr) if addr > 0 => addr as u64,
+                _ => return Err("MAP_SHARED WC device mmap failed"),
+            };
+            let region_type = space
+                .lookup(VirtAddr::new(base))
+                .map(|r| r.perms.memory_type());
+            if region_type != Some(narf_memory::MemoryType::WriteCombining) {
+                return Err("the VMA did not record the device's memory type");
+            }
+            if translated(&space, base) != Some(dev)
+                || leaf_selector(&space, base) != Some(wc_selector())
+            {
+                return Err("device page is not write-combining");
+            }
+            if leaf_selector(&space, base + PAGE) != Some(0) {
+                return Err("RAM page in a WC mapping is not write-back");
+            }
+            // Move the device page onto RAM: the rebuilt leaf must follow the
+            // new frame and drop to write-back.
+            narf_filesystem::mmap_relocation::relocate(
+                &[dev],
+                &[relocation_target],
+                wc_census,
+                &mut || Ok(()),
+            )
+            .map_err(|_| "relocation of the WC page refused")?;
+            if translated(&space, base) != Some(relocation_target)
+                || leaf_selector(&space, base) != Some(0)
+            {
+                return Err("WC leaf relocated onto RAM kept a non-WB type");
+            }
+            if call(Syscall::Munmap.raw(), a1(base, 2 * PAGE)) != Some(0) {
+                return Err("munmap of the WC mapping failed");
+            }
+            let _ = call(Syscall::Close.raw(), a0(fd));
+            Ok(())
+        })();
+        crate::handlers::restore_address_space_lookup(None);
+        *DEVICE_AS.lock() = None;
+        outcome
+    });
+    WC_FRAMES.lock().clear();
+    for &phys in &owned {
+        narf_memory::free_frame(narf_memory::PhysFrame::new(phys));
+    }
+    result
+}
+kernel_test_in!("syscall_abi", smoke_abi_device_mmap_write_combining);

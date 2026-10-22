@@ -258,7 +258,11 @@ impl FileOps for DriCardFile {
         }
         let lifetime = self.mmap_lifetime(offset, len);
         let frames = self.mmap_frames(offset, len)?;
-        Ok(narf_filesystem::MmapBacking { frames, lifetime })
+        Ok(narf_filesystem::MmapBacking {
+            frames,
+            lifetime,
+            memory_type: narf_memory::MemoryType::WriteBack,
+        })
     }
     fn mmap_published(&self, lifetime: Option<&Arc<dyn MmapLifetime>>) {
         crate::amdgpu_gem::cpu_mapping::published(lifetime);
@@ -1214,7 +1218,11 @@ impl FileOps for DriRenderFile {
         }
         let lifetime = self.mmap_lifetime(offset, len);
         let frames = self.mmap_frames(offset, len)?;
-        Ok(narf_filesystem::MmapBacking { frames, lifetime })
+        Ok(narf_filesystem::MmapBacking {
+            frames,
+            lifetime,
+            memory_type: narf_memory::MemoryType::WriteBack,
+        })
     }
     fn mmap_published(&self, lifetime: Option<&Arc<dyn MmapLifetime>>) {
         crate::amdgpu_gem::cpu_mapping::published(lifetime);

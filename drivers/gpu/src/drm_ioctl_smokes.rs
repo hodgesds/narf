@@ -4149,6 +4149,7 @@ fn smoke_drm_navi48_dumb_buffers_scan_out_of_vram() -> TestResult {
         return TestResult::Fail("mmap of the MAP_DUMB offset");
     };
     if backing.frames.len() != 25
+        || backing.memory_type != narf_memory::MemoryType::WriteCombining
         || backing.frames[0] != object_a.phys()
         || backing
             .frames

@@ -139,7 +139,13 @@ infallible guard API; close and release do not require new placement admission.
 Unregistered VM mappings, deferred CPU user-fence writes and legacy raw
 address leases (`GemMapping`, `mmap_lifetime`) still pin backing. GEM and
 PRIME `mmap_backing` instead return a revocable `CpuMap` token
-(`amdgpu_gem::cpu_mapping`): one `CpuBacking` per object holds the current
+(`amdgpu_gem::cpu_mapping`), requesting `MemoryType::WriteCombining` for
+the mapping. User BAR leaves select PAT WC on x86_64 or MAIR Normal-NC
+on aarch64, matching the kernel's prefetchable BAR and framebuffer mappings.
+System RAM leaves stay write-back to match the kernel direct map. The VMA
+retains the WC request across VRAM/GTT migration, fork and mprotect;
+relocation recomputes each destination leaf's cache type, including rollback.
+One `CpuBacking` per object holds the current
 placement lease and registers every frame of that generation with a count of
 external metadata aliases (`retain_cpu_frame`/`release_cpu_frame`, reached
 through the filesystem alias hooks), so the backing survives fork's interval

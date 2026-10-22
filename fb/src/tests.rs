@@ -1265,6 +1265,9 @@ fn smoke_fbdev_mmap_frames() -> TestResult {
             return TestResult::Fail("zero frame address");
         }
     }
+    let backing = node.mmap_backing(0, map_len).unwrap();
+    assert_eq!(backing.frames, frames);
+    assert_eq!(backing.memory_type, narf_memory::MemoryType::WriteCombining);
     // Over-size must fail.
     if node.mmap_frames(0, map_len + 4096).is_ok() {
         crate::clear_test_scanout();

@@ -677,7 +677,12 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     return;
                 }
             };
-            if let Some(narf_filesystem::MmapBacking { frames, lifetime: mmap_lifetime }) = backing {
+            if let Some(narf_filesystem::MmapBacking {
+                frames,
+                lifetime: mmap_lifetime,
+                memory_type,
+            }) = backing
+            {
                 if frames.len() != pages {
                     ctx.set_return(errno_ret(EINVAL));
                     return;
@@ -689,8 +694,12 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 let region = Region {
                     base: VirtAddr::new(base),
                     len,
-                    perms: perms | RegionPerms::SHARED | RegionPerms::LOCK_EXEMPT
-                        | if ops.mmap_is_ram() { RegionPerms::PINNABLE_RAM } else { RegionPerms(0) },
+                    // The device's memory-type request rides in the VMA like
+                    // Linux's `vm_page_prot`; the address space applies it
+                    // per frame and refuses it on System RAM.
+                    perms: (perms | RegionPerms::SHARED | RegionPerms::LOCK_EXEMPT
+                        | if ops.mmap_is_ram() { RegionPerms::PINNABLE_RAM } else { RegionPerms(0) })
+                        .with_memory_type(memory_type),
                     phys: match narf_memory::region_backing::RegionBacking::try_from_slice(&phys) {
                         Ok(backing) => backing,
                         Err(_) => {

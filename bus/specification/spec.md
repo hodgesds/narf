@@ -40,6 +40,20 @@
 
 ## 3. Public interface
 
+`map_bar` maps prefetchable MMIO windows with write-combining attributes:
+PAT WC on x86_64, MAIR Normal-NC on aarch64. Register BARs remain Device.
+These attributes match user mappings of native GPU framebuffer windows.
+Unprogrammed windows return `BarError::Unimplemented`; an ioremap failure,
+including a conflicting memory type, returns `BarError::MappingFailed`.
+`map_bar` never substitutes an unverified physical-address mapping.
+
+`unsafe map_bar_control(device, idx) -> Result<MmioRegion, BarError>` maps
+control-register BARs with Device attributes even when PCI marks them
+prefetchable. VirtIO register capabilities and every MSI-X table access use
+this entry point from their first mapping. Identical ready mappings reuse
+their VA; conflicting prior mappings still fail closed. Its exclusive
+device/config-space ownership contract is the same as `map_bar`.
+
 `MsixTable::enable()` enables delivery and clears the function mask after
 entries and handlers are programmed. `unsafe MsixTable::disable()` masks
 the function and clears MSI-X enable; the owner must stop device causes

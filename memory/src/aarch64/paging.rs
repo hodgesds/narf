@@ -112,9 +112,18 @@ impl PtFlags {
     /// `default | caller_flags` and an index field cannot be OR-ed, so the
     /// default must contribute zero to bits [4:2]; otherwise asking for
     /// Device would yield `Normal | Device` and map MMIO cacheable.
+    ///
+    /// Attr3 (Normal Non-cacheable, Linux `MT_NORMAL_NC`) and Attr4
+    /// (Device-nGnRnE, Linux `MT_DEVICE_nGnRnE`) are the targets of
+    /// `pgprot_writecombine` / `pgprot_noncached` for user leaves; see
+    /// `narf_arch::aarch64::mair` for why NARF's indices differ from Linux's.
     pub const ATTR_NORMAL: Self = Self(0 << 2); // Attr0: Normal WB
     pub const ATTR_DEVICE: Self = Self(1 << 2); // Attr1: Device-nGnRE
     pub const ATTR_TAGGED: Self = Self(2 << 2); // Attr2: Normal WB Tagged
+    pub const ATTR_NORMAL_NC: Self = Self(3 << 2); // Attr3: Normal Non-cacheable
+    pub const ATTR_DEVICE_NGNRNE: Self = Self(4 << 2); // Attr4: Device-nGnRnE
+    /// The whole `AttrIndx` field (bits 4:2).
+    pub const ATTR_MASK: Self = Self(0b111 << 2);
 
     /// Execute-never bits.
     pub const UXN: Self = Self(1 << 54);
@@ -125,6 +134,18 @@ impl PtFlags {
     #[inline]
     pub const fn bits(self) -> u64 {
         self.0
+    }
+
+    /// Rebuild a flag set from raw bits.
+    #[inline]
+    pub const fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    /// This flag set with every bit of `other` cleared.
+    #[inline]
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
     }
 }
 
