@@ -80,6 +80,8 @@ pub struct Selection {
     pub edid: [u8; 128],
     /// An HDMI sink (TMDS or FRL) rather than DP.
     pub hdmi: bool,
+    /// Requested DRM connector format; explicit formats never fall back.
+    pub color_format: crate::amdgpu_hdr::ColorFormat,
     /// The HDMI sink declared SCDC (HF-VSDB/HF-SCDB SCDC_Present).
     pub scdc: bool,
     /// Output depth: for DP SST the deepest depth up to the sink's EDID bpc
@@ -95,8 +97,8 @@ pub struct Selection {
     pub avi: otg::Avi,
     /// Limited-range RGB output (COLOR_SPACE_SRGB_LIMITED).
     pub limited: bool,
-    /// HDMI YCbCr 4:2:0 output (COLOR_SPACE_YCBCR709, 8 bpc).
-    pub ycbcr420: bool,
+    /// Actual RGB/YCbCr HDMI output encoding; DP remains RGB.
+    pub encoding: crate::amdgpu_hdr::PixelEncoding,
     /// HDMI over FRL at this rate rather than TMDS.
     pub frl: Option<FrlRate>,
     /// HDMI decoder/depth/subsampling caps and verified raw FRL cap, retained
@@ -290,7 +292,7 @@ pub fn plane_requests(
 ) {
     stream_planes(
         &s.timing,
-        s.ycbcr420,
+        s.encoding.is_420(),
         s.format,
         &s.planes,
         (pipe, pipes.odm, pipes.mpc),
@@ -390,6 +392,8 @@ pub struct MstStream {
     pub rate: (u32, u32),
     /// A compressed stream's decoder: where DP_DSC_ENABLE goes.
     pub dsc: Option<super::mst::MstDsc>,
+    /// Owned downstream converter snapshot, including raw-only streams.
+    pub pcon: Option<super::mst::Pcon>,
 }
 
 /// The sink's audio description as amdgpu_dm_fill_audio_info builds it from
@@ -545,15 +549,31 @@ pub fn frl_carries(
     rate: FrlRate,
     audio: crate::amdgpu_frl_cap::FrlAudio,
 ) -> Option<crate::amdgpu_frl_cap::FrlCap> {
+    frl_carries_in(
+        t,
+        bpc,
+        crate::amdgpu_hdr::PixelEncoding::from_420(ycbcr420),
+        rate,
+        audio,
+    )
+}
+
+pub fn frl_carries_in(
+    t: &Timing,
+    bpc: u8,
+    encoding: crate::amdgpu_hdr::PixelEncoding,
+    rate: FrlRate,
+    audio: crate::amdgpu_frl_cap::FrlAudio,
+) -> Option<crate::amdgpu_frl_cap::FrlCap> {
     use crate::amdgpu_frl_cap::{frl_cap_check, FrlCap, FrlCapInput, FrlEncoding};
     let h_blank = t.h_total.checked_sub(t.h_active)?;
     if !matches!(bpc, 8 | 10 | 12)
         || t.pixel_clock_khz == 0
         || t.h_active == 0
         || h_blank == 0
-        || ycbcr420 && (t.h_active | h_blank) & 1 != 0
-        || u64::from(t.pixel_clock_khz) * u64::from(bpc) * 3
-            > rate.kbps() * if ycbcr420 { 2 } else { 1 }
+        || encoding.subsampled() && (t.h_active | h_blank) & 1 != 0
+        || u64::from(t.pixel_clock_khz) * u64::from(bpc) * if encoding.is_422() { 2 } else { 3 }
+            > rate.kbps() * if encoding.is_420() { 2 } else { 1 }
     {
         return None;
     }
@@ -564,10 +584,10 @@ pub fn frl_carries(
         h_active: t.h_active,
         h_blank,
         bpc,
-        encoding: if ycbcr420 {
-            FrlEncoding::Ycbcr420
-        } else {
-            FrlEncoding::Rgb444
+        encoding: match encoding {
+            crate::amdgpu_hdr::PixelEncoding::Ycbcr420 => FrlEncoding::Ycbcr420,
+            crate::amdgpu_hdr::PixelEncoding::Ycbcr422 => FrlEncoding::Ycbcr422,
+            _ => FrlEncoding::Rgb444,
         },
         audio,
         dsc: None,
@@ -665,10 +685,29 @@ pub fn frl_video_params(
     rate: FrlRate,
     audio: crate::amdgpu_frl_cap::FrlAudio,
 ) -> Option<(u8, crate::amdgpu_frl_cap::FrlBorrow, u16, u16)> {
+    frl_video_params_in(
+        t,
+        bpc,
+        crate::amdgpu_hdr::PixelEncoding::from_420(ycbcr420),
+        dsc,
+        rate,
+        audio,
+    )
+}
+
+pub fn frl_video_params_in(
+    t: &Timing,
+    bpc: u8,
+    encoding: crate::amdgpu_hdr::PixelEncoding,
+    dsc: Option<FrlDscStream>,
+    rate: FrlRate,
+    audio: crate::amdgpu_frl_cap::FrlAudio,
+) -> Option<(u8, crate::amdgpu_frl_cap::FrlBorrow, u16, u16)> {
     use crate::amdgpu_frl_cap::{dsc_borrow, FrlCap};
     let check = match dsc {
-        Some(d) => frl_dsc_carries(t, d, rate, audio)?,
-        None => frl_carries(t, bpc, ycbcr420, rate, audio)?,
+        Some(d) if encoding.is_rgb() => frl_dsc_carries(t, d, rate, audio)?,
+        Some(_) => return None,
+        None => frl_carries_in(t, bpc, encoding, rate, audio)?,
     };
     let FrlCap::Ok {
         audio_packets_line,
@@ -752,10 +791,26 @@ pub fn frl_link(
     cap: FrlRate,
     audio: crate::amdgpu_frl_cap::FrlAudio,
 ) -> Option<FrlRate> {
-    frl_carries(t, bpc, ycbcr420, cap, audio)?;
+    frl_link_in(
+        t,
+        bpc,
+        crate::amdgpu_hdr::PixelEncoding::from_420(ycbcr420),
+        cap,
+        audio,
+    )
+}
+
+pub fn frl_link_in(
+    t: &Timing,
+    bpc: u8,
+    encoding: crate::amdgpu_hdr::PixelEncoding,
+    cap: FrlRate,
+    audio: crate::amdgpu_frl_cap::FrlAudio,
+) -> Option<FrlRate> {
+    frl_carries_in(t, bpc, encoding, cap, audio)?;
     (1..=cap.code())
         .filter_map(FrlRate::new)
-        .find(|&r| frl_carries(t, bpc, ycbcr420, r, audio).is_some())
+        .find(|&r| frl_carries_in(t, bpc, encoding, r, audio).is_some())
 }
 
 /// FRL training on a ColdBoot port: SCDC over native DDC, the HPO FRL
@@ -870,6 +925,24 @@ pub fn requested_bpc(port: usize, mst_slot: Option<u8>) -> u8 {
 /// display_info.bpc with, within `amdgpu.max_bpc`.
 pub fn connector_max_bpc(port: usize, mst_slot: Option<u8>) -> u8 {
     max_bpc().min(requested_bpc(port, mst_slot))
+}
+
+static REQUESTED_COLOR_FORMAT: [core::sync::atomic::AtomicU8; REQUESTED_PORTS] =
+    [const { core::sync::atomic::AtomicU8::new(0) }; REQUESTED_PORTS];
+pub fn set_requested_color_format(port: usize, format: crate::amdgpu_hdr::ColorFormat) {
+    if let Some(slot) = REQUESTED_COLOR_FORMAT.get(port) {
+        slot.store(format as u8, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+pub fn requested_color_format(port: usize) -> crate::amdgpu_hdr::ColorFormat {
+    REQUESTED_COLOR_FORMAT
+        .get(port)
+        .and_then(|s| {
+            crate::amdgpu_hdr::ColorFormat::from_linux(u64::from(
+                s.load(core::sync::atomic::Ordering::Relaxed),
+            ))
+        })
+        .unwrap_or_default()
 }
 
 /// DRM's "Broadcast RGB" connector property values.
@@ -1596,8 +1669,9 @@ fn dp_offered_mode(timing: Timing, s: &Selection, max_dispclk_khz: u32) -> Optio
 
 fn mst_offered_modes(t: Timing, s: &Selection, soc: &dml::Soc) -> Vec<dml::Mode> {
     let Some(m) = s.mst else { return Vec::new() };
-    if super::mst::mst_slots(&t, m.pbn_bpc, s.lanes, s.rate, s.caps.fec)
-        .is_some_and(|(pbn, slots)| pbn <= m.pbn && slots <= m.slots)
+    if m.pcon.is_none_or(|p| p.raw_allowed(&t, depth_bpc(s.depth)))
+        && super::mst::mst_slots(&t, m.pbn_bpc, s.lanes, s.rate, s.caps.fec)
+            .is_some_and(|(pbn, slots)| pbn <= m.pbn && slots <= m.slots)
     {
         return alloc::vec![plane_mode(t, s.format)];
     }
@@ -1609,20 +1683,16 @@ fn mst_offered_modes(t: Timing, s: &Selection, soc: &dml::Soc) -> Vec<dml::Mode>
     } else {
         crate::amdgpu_dsc::LinkEncoding::Dp8b10b
     };
-    let kbps = (u64::from(m.pbn) * 994 * 8 * 54 / 64) as u32;
+    let link = super::mst::dsc_link(s.caps, soc.dispclk_max_khz);
+    let Some(link) = link else {
+        return Vec::new();
+    };
     [12, 10, 8]
         .into_iter()
         .filter(|&b| b <= depth_bpc(s.depth))
         .filter_map(|bpc| {
             let dt = dsc_timing(&t, bpc);
-            let cfg = crate::amdgpu_dsc::compute_config(
-                &decoder.caps,
-                soc.dispclk_max_khz,
-                kbps,
-                &dt,
-                encoding,
-                false,
-            )?;
+            let cfg = super::mst::dsc::config_in_payload(&t, bpc, &decoder, &link, m.pbn)?;
             let need = crate::amdgpu_dsc::dsc_kbps(&dt, cfg.bpp_x16, cfg.slices_h);
             (super::mst::dsc::peak_pbn(need, encoding) <= i32::from(m.pbn)).then(|| dml::Mode {
                 dsc: Some(dml::Dsc {
@@ -1788,24 +1858,15 @@ fn selection_candidates(soc: &dml::Soc, s: Selection, mst_fairness: bool) -> Vec
         let Some(decoder) = mst.dsc else {
             return Vec::new();
         };
-        let encoding = if s.uhbr() {
-            crate::amdgpu_dsc::LinkEncoding::Dp128b132b
-        } else {
-            crate::amdgpu_dsc::LinkEncoding::Dp8b10b
+        let Some(link) = super::mst::dsc_link(s.caps, soc.dispclk_max_khz) else {
+            return Vec::new();
         };
-        let kbps = (u64::from(mst.pbn) * 994 * 8 * 54 / 64) as u32;
         return [12, 10, 8]
             .into_iter()
             .filter(|&b| b <= depth_bpc(s.depth))
             .filter_map(|bpc| {
-                let cfg = crate::amdgpu_dsc::compute_config(
-                    &decoder.caps,
-                    soc.dispclk_max_khz,
-                    kbps,
-                    &dsc_timing(&s.timing, bpc),
-                    encoding,
-                    false,
-                )?;
+                let cfg =
+                    super::mst::dsc::config_in_payload(&s.timing, bpc, &decoder, &link, mst.pbn)?;
                 let vc = super::mst::mst_vc_rate_dsc(&s.timing, &cfg, s.lanes, s.rate, s.caps.fec)?;
                 Some(Selection {
                     depth: depth(bpc),
@@ -1820,18 +1881,19 @@ fn selection_candidates(soc: &dml::Soc, s: Selection, mst_fairness: bool) -> Vec
         let Some((caps, cap)) = s.frl_caps else {
             return Vec::new();
         };
-        return hdmi_stream_candidates(
+        return hdmi_candidates(
             caps,
             &s.timing,
             depth_bpc(s.depth),
             Some(cap),
             s.audio,
             soc.dispclk_max_khz,
+            s.color_format,
         )
         .into_iter()
         .map(|h| Selection {
             depth: h.depth,
-            ycbcr420: h.ycbcr420,
+            encoding: h.encoding,
             frl: h.frl,
             dsc: h.dsc,
             ..s
@@ -2067,6 +2129,11 @@ pub struct HdmiCaps {
     /// A Y420 video or capability-map block declares 4:2:0: with SCDC,
     /// what makes Linux's is_hdmi2_sink.
     pub ycbcr420: bool,
+    /// CTA extension YCbCr support bits.
+    pub ycbcr444: bool,
+    pub ycbcr422: bool,
+    /// HDMI Licensing VSDB DC_Y444 gates 4:4:4 deep color.
+    pub dc_y444: bool,
     /// VICs the Video Data Blocks list, as a bitmap.
     pub vics: [u64; 4],
     /// VICs the sink takes only as YCbCr 4:2:0 (Y420VDB), and VICs it
@@ -2098,6 +2165,8 @@ pub fn hdmi_caps(edid: &[u8]) -> HdmiCaps {
         let Ok(cta) = CtaExtension::parse(block) else {
             continue;
         };
+        caps.ycbcr444 |= block[3] & 0x20 != 0;
+        caps.ycbcr422 |= block[3] & 0x10 != 0;
         for db in &cta.data_blocks {
             // HF fields from the version byte on: HF-VSDB after its OUI,
             // HF-SCDB (extended tag 0x79) after two reserved bytes.
@@ -2108,6 +2177,7 @@ pub fn hdmi_caps(edid: &[u8]) -> HdmiCaps {
                     if let Some(&flags) = v.payload.get(5) {
                         caps.dc30 = flags & 0x10 != 0;
                         caps.dc36 = flags & 0x20 != 0;
+                        caps.dc_y444 = flags & 8 != 0;
                     }
                     if let Some(&rate) = v.payload.get(6) {
                         caps.vsdb_max_khz = u32::from(rate) * 5000;
@@ -2235,20 +2305,82 @@ fn edid_mode(t: &Timing) -> narf_edid::modes::FixedMode {
 /// 4:4:4 YCbCr left out: a mode the sink takes only as YCbCr 4:2:0
 /// (drm_mode_is_420_only) as 4:2:0; otherwise RGB at the deepest depth up
 /// to `max_bpc` that fits, and failing that 4:2:0 where the sink takes the
-/// mode as 4:2:0 too (drm_mode_is_420_also). 4:2:0 is 8 bpc, half the
-/// pixel rate per TMDS character. The depth and whether it is 4:2:0; None
+/// mode as 4:2:0 too (drm_mode_is_420_also). 4:2:0 uses its own HF-VSDB
+/// deep-color capability bits and halves the pixel clock before applying
+/// the TMDS deep-color ratio. The depth and whether it is 4:2:0; None
 /// when nothing fits.
 pub fn hdmi_format(caps: HdmiCaps, t: &Timing, max_bpc: u8) -> Option<(otg::ColorDepth, bool)> {
     let vic = narf_edid::modes::match_cea_mode(edid_mode(t));
-    let listed = |map: [u64; 4]| vic != 0 && map[usize::from(vic / 64)] & 1 << (vic % 64) != 0;
-    let fits_420 = || hdmi_fits(caps, t.pixel_clock_khz / 2);
+    let listed = move |map: [u64; 4]| vic != 0 && map[usize::from(vic / 64)] & 1 << (vic % 64) != 0;
+    let depth_420 = || {
+        hdmi_depth(
+            HdmiCaps {
+                dc30: caps.dc30_420,
+                dc36: caps.dc36_420,
+                ..caps
+            },
+            t.pixel_clock_khz / 2,
+            max_bpc,
+        )
+    };
     if listed(caps.y420_only) {
-        return fits_420().then_some((otg::ColorDepth::Bpc8, true));
+        return depth_420().map(|depth| (depth, true));
     }
     if let Some(depth) = hdmi_depth(caps, t.pixel_clock_khz, max_bpc) {
         return Some((depth, false));
     }
-    (listed(caps.y420_also) && fits_420()).then_some((otg::ColorDepth::Bpc8, true))
+    listed(caps.y420_also)
+        .then(depth_420)
+        .flatten()
+        .map(|depth| (depth, true))
+}
+
+/// A requested output must be declared for this mode. A 4:2:0-only
+/// mode never becomes RGB/444/422 under an explicit override.
+fn hdmi_encodings(
+    caps: HdmiCaps,
+    t: &Timing,
+    requested: crate::amdgpu_hdr::ColorFormat,
+) -> impl Iterator<Item = crate::amdgpu_hdr::PixelEncoding> {
+    use crate::amdgpu_hdr::PixelEncoding as E;
+    let vic = narf_edid::modes::match_cea_mode(edid_mode(t));
+    let listed = move |map: [u64; 4]| vic != 0 && map[usize::from(vic / 64)] & 1 << (vic % 64) != 0;
+    let only420 = listed(caps.y420_only);
+    [E::Rgb, E::Ycbcr444, E::Ycbcr422, E::Ycbcr420]
+        .into_iter()
+        .filter(move |&e| {
+            let policy = requested
+                .encoding()
+                .map_or(e == E::Rgb || e == E::Ycbcr420, |want| want == e);
+            policy
+                && match e {
+                    E::Rgb => !only420,
+                    E::Ycbcr444 => !only420 && caps.ycbcr444,
+                    E::Ycbcr422 => !only420 && caps.ycbcr422,
+                    E::Ycbcr420 => only420 || listed(caps.y420_also),
+                }
+        })
+}
+fn hdmi_depths(
+    caps: HdmiCaps,
+    e: crate::amdgpu_hdr::PixelEncoding,
+    max_bpc: u8,
+) -> impl Iterator<Item = (u8, otg::ColorDepth)> {
+    use crate::amdgpu_hdr::PixelEncoding as E;
+    let (dc30, dc36) = match e {
+        E::Ycbcr420 => (caps.dc30_420, caps.dc36_420),
+        E::Ycbcr444 => (caps.dc_y444 && caps.dc30, caps.dc_y444 && caps.dc36),
+        E::Ycbcr422 => (true, true), // HDMI1.3 §6.5: deep-color bits are irrelevant.
+        _ => (caps.dc30, caps.dc36),
+    };
+    [
+        (12, dc36, otg::ColorDepth::Bpc12),
+        (10, dc30, otg::ColorDepth::Bpc10),
+        (8, true, otg::ColorDepth::Bpc8),
+    ]
+    .into_iter()
+    .filter(move |&(bpc, declared, _)| bpc <= max_bpc && declared)
+    .map(|(bpc, _, depth)| (bpc, depth))
 }
 
 pub fn hdmi_avi(caps: HdmiCaps, t: &Timing) -> otg::Avi {
@@ -2320,6 +2452,7 @@ pub fn hdmi_depth(caps: HdmiCaps, pixel_khz: u32, max_bpc: u8) -> Option<otg::Co
 
 /// The tuple tests compare: depth, 4:2:0 and FRL rate of `hdmi_stream` at
 /// DCN401's nominal DISPCLK, without its DSC configuration.
+#[cfg(feature = "kernel-test")]
 pub fn hdmi_output(
     caps: HdmiCaps,
     t: &Timing,
@@ -2328,14 +2461,14 @@ pub fn hdmi_output(
     audio: Option<otg::AudioInfo>,
 ) -> Option<(otg::ColorDepth, bool, Option<FrlRate>)> {
     hdmi_stream(caps, t, max_bpc, frl_cap, audio, NOMINAL_DISPCLK_KHZ)
-        .map(|s| (s.depth, s.ycbcr420, s.frl))
+        .map(|s| (s.depth, s.encoding.is_420(), s.frl))
 }
 
 /// How an HDMI stream leaves: its depth, 4:2:0, FRL link and DSC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HdmiStream {
     pub depth: otg::ColorDepth,
-    pub ycbcr420: bool,
+    pub encoding: crate::amdgpu_hdr::PixelEncoding,
     pub frl: Option<FrlRate>,
     pub dsc: Option<crate::amdgpu_dsc::DscConfig>,
 }
@@ -2375,13 +2508,55 @@ fn hdmi_stream_candidates(
     audio: Option<otg::AudioInfo>,
     max_dispclk_khz: u32,
 ) -> Vec<HdmiStream> {
-    if let Some((depth, ycbcr420)) = hdmi_format(caps, t, max_bpc) {
-        return alloc::vec![HdmiStream {
-            depth,
-            ycbcr420,
-            frl: None,
-            dsc: None,
-        }];
+    hdmi_candidates(
+        caps,
+        t,
+        max_bpc,
+        frl_cap,
+        audio,
+        max_dispclk_khz,
+        crate::amdgpu_hdr::ColorFormat::Auto,
+    )
+}
+
+/// Complete link candidates for a connector property, retaining that
+/// property during depth fallback and joint native admission.
+#[allow(clippy::too_many_arguments)]
+pub fn hdmi_candidates(
+    caps: HdmiCaps,
+    t: &Timing,
+    max_bpc: u8,
+    frl_cap: Option<FrlRate>,
+    audio: Option<otg::AudioInfo>,
+    max_dispclk_khz: u32,
+    requested: crate::amdgpu_hdr::ColorFormat,
+) -> Vec<HdmiStream> {
+    let max_bpc = if narf_edid::modes::match_cea_mode(edid_mode(t)) == 1 {
+        max_bpc.min(8)
+    } else {
+        max_bpc
+    };
+    let mut tmds = Vec::new();
+    for encoding in hdmi_encodings(caps, t, requested) {
+        for (bpc, depth) in hdmi_depths(caps, encoding, max_bpc) {
+            let pixel_khz = t.pixel_clock_khz >> u32::from(encoding.is_420());
+            let clock = if encoding.is_422() {
+                pixel_khz
+            } else {
+                pixel_khz.saturating_mul(u32::from(bpc)) / 8
+            };
+            if hdmi_fits(caps, clock) {
+                tmds.push(HdmiStream {
+                    depth,
+                    encoding,
+                    frl: None,
+                    dsc: None,
+                });
+            }
+        }
+    }
+    if !tmds.is_empty() {
+        return tmds;
     }
     let Some(cap) = frl_cap else {
         return Vec::new();
@@ -2400,44 +2575,28 @@ fn hdmi_stream_candidates(
             d.max_frl_rate,
         )
     });
-    let vic = narf_edid::modes::match_cea_mode(edid_mode(t));
-    let listed = |map: [u64; 4]| vic != 0 && map[usize::from(vic / 64)] & 1 << (vic % 64) != 0;
-    let only420 = listed(caps.y420_only);
     let audio = frl_audio(
         audio.and_then(|a| otg::frl_audio_info(a, t.v_active)),
         t.v_active,
     );
-    // RGB first where allowed, then subsampling only for a declared mode.
-    for ycbcr420 in [false, true] {
-        if !ycbcr420 && only420 || ycbcr420 && !only420 && !listed(caps.y420_also) {
-            continue;
-        }
-        let (dc30, dc36) = if ycbcr420 {
-            (caps.dc30_420, caps.dc36_420)
-        } else {
-            (caps.dc30, caps.dc36)
-        };
-        for (bpc, declared, depth) in [
-            (12, dc36, otg::ColorDepth::Bpc12),
-            (10, dc30, otg::ColorDepth::Bpc10),
-            (8, true, otg::ColorDepth::Bpc8),
-        ] {
-            if bpc > max_bpc || !declared {
-                continue;
-            }
+    for encoding in hdmi_encodings(caps, t, requested) {
+        for (bpc, depth) in hdmi_depths(caps, encoding, max_bpc) {
             // dc_bandwidth_in_kbps_from_timing on the FRL link against
             // dc_link_frl_bandwidth_kbps of the verified cap.
-            let raw = u64::from(t.pixel_clock_khz) * u64::from(bpc) * 3 / (1 + u64::from(ycbcr420));
+            let raw = u64::from(t.pixel_clock_khz)
+                * u64::from(bpc)
+                * if encoding.is_422() { 2 } else { 3 }
+                / if encoding.is_420() { 2 } else { 1 };
             if raw > cap.kbps() {
                 if let Some((sink, max_rate)) = &dsc_caps {
-                    if !ycbcr420 {
+                    if encoding.is_rgb() {
                         let dispclk = max_dispclk_khz;
                         if let Some((rate, cfg)) =
                             frl_dsc(t, sink, *max_rate, cap, audio, dispclk, stream_vic, bpc)
                         {
                             out.push(HdmiStream {
                                 depth,
-                                ycbcr420,
+                                encoding,
                                 frl: Some(rate),
                                 dsc: Some(cfg),
                             });
@@ -2447,10 +2606,10 @@ fn hdmi_stream_candidates(
                     continue;
                 }
             }
-            if let Some(rate) = frl_link(t, bpc, ycbcr420, cap, audio) {
+            if let Some(rate) = frl_link_in(t, bpc, encoding, cap, audio) {
                 out.push(HdmiStream {
                     depth,
-                    ycbcr420,
+                    encoding,
                     frl: Some(rate),
                     dsc: None,
                 });
@@ -2498,6 +2657,15 @@ pub fn select_all(
     max_bpc: u8,
     want: &dyn Fn(usize) -> Option<Timing>,
 ) -> Result<Vec<Selection>, ModesetError> {
+    select_all_for_format(paths, ports, max_bpc, want, &requested_color_format)
+}
+fn select_all_for_format(
+    paths: &[inventory::Path],
+    ports: &[display::Port],
+    max_bpc: u8,
+    want: &dyn Fn(usize) -> Option<Timing>,
+    requested_format: &dyn Fn(usize) -> crate::amdgpu_hdr::ColorFormat,
+) -> Result<Vec<Selection>, ModesetError> {
     // The requested mode where the sink lists it and it fits, else the
     // preferred one.
     let pick = |index: usize, edid: &[u8], fits: &dyn Fn(&Timing) -> bool| {
@@ -2543,6 +2711,7 @@ pub fn select_all(
             continue;
         };
         out.push(Selection {
+            color_format: crate::amdgpu_hdr::ColorFormat::Auto,
             port: index,
             timing,
             lanes,
@@ -2571,7 +2740,7 @@ pub fn select_all(
             }),
             avi: otg::Avi::default(),
             limited: false,
-            ycbcr420: false,
+            encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
             frl: None,
             frl_caps: None,
             dsc,
@@ -2606,8 +2775,18 @@ pub fn select_all(
         let frl_cap = frl_cap(caps).filter(|_| frl_free);
         let max_bpc = max_bpc.min(requested_bpc(index, None));
         let audio = sink_audio_info(&sink.edid);
+        let color_format = requested_format(index);
         let Some(timing) = pick(index, &sink.edid, &|t| {
-            hdmi_output(caps, t, max_bpc, frl_cap, audio).is_some()
+            !hdmi_candidates(
+                caps,
+                t,
+                max_bpc,
+                frl_cap,
+                audio,
+                NOMINAL_DISPCLK_KHZ,
+                color_format,
+            )
+            .is_empty()
         }) else {
             continue;
         };
@@ -2616,10 +2795,20 @@ pub fn select_all(
         };
         let Some(HdmiStream {
             depth,
-            ycbcr420,
+            encoding,
             frl,
             dsc,
-        }) = hdmi_stream(caps, &timing, max_bpc, frl_cap, audio, NOMINAL_DISPCLK_KHZ)
+        }) = hdmi_candidates(
+            caps,
+            &timing,
+            max_bpc,
+            frl_cap,
+            audio,
+            NOMINAL_DISPCLK_KHZ,
+            color_format,
+        )
+        .into_iter()
+        .next()
         else {
             link_short = true;
             continue;
@@ -2638,6 +2827,7 @@ pub fn select_all(
             },
             edid,
             hdmi: true,
+            color_format,
             scdc: caps.scdc,
             depth,
             audio: if frl.is_some() {
@@ -2647,13 +2837,13 @@ pub fn select_all(
             },
             avi: hdmi_avi(caps, &timing),
             limited: false,
-            ycbcr420,
+            encoding,
             frl,
             frl_caps: frl.and(frl_cap).map(|cap| (caps, cap)),
             dsc,
             mst: None,
-            // HDMI FreeSync needs the AMD VSDB, which is not parsed.
-            vrr: None,
+            // HDMI capability comes from the retained firmware EDID parser.
+            vrr: sink.hdmi_vrr_range(),
             format: otg::SurfaceFormat::Xrgb8888,
             planes: PlaneSetup::NONE,
             colorspace: 0,
@@ -2872,7 +3062,7 @@ pub fn plane_mode(timing: Timing, format: otg::SurfaceFormat) -> dml::Mode {
         timing,
         pitch: format.pitch_bytes(timing.h_active) / format.bytes_per_pixel(),
         bytes_per_pixel: format.bytes_per_pixel(),
-        ycbcr420: false,
+        encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
         dsc: None,
         planes: [None; dml::MAX_PLANES],
     };
@@ -2911,7 +3101,7 @@ impl Selection {
     pub fn color_space(&self) -> crate::amdgpu_hdr::DcColorSpace {
         crate::amdgpu_hdr::output_color_space(
             self.colorspace,
-            !self.ycbcr420,
+            self.encoding.is_rgb(),
             false,
             self.timing.pixel_clock_khz.saturating_mul(10),
             self.limited,
@@ -2926,7 +3116,7 @@ impl Selection {
             pipe,
             depth: self.depth,
             limited: matches!(colorspace, C::SrgbLimited | C::Rgb2020Limited),
-            ycbcr420: self.ycbcr420,
+            encoding: self.encoding,
             colorspace,
         }
     }
@@ -2973,7 +3163,7 @@ impl Selection {
 pub fn selection_mode(s: &Selection) -> dml::Mode {
     let mode = dml::Mode {
         hdmi: s.hdmi,
-        ycbcr420: s.ycbcr420,
+        encoding: s.encoding,
         dsc: s.dsc.map(|c| dml::Dsc {
             slices: c.slices_h,
             bpp_x16: c.bpp_x16,
@@ -2992,7 +3182,7 @@ pub fn with_planes(
 ) -> dml::Mode {
     let (primary, overlays) = stream_planes(
         &mode.timing,
-        mode.ycbcr420,
+        mode.encoding.is_420(),
         format,
         setup,
         (0, otg::SplitPipes::NONE, otg::SplitPipes::NONE),
@@ -3034,7 +3224,7 @@ pub fn pipe_clock_request(pipe: u8, plan: &dml::Plan, selection: &Selection) -> 
             dccg::PixelClock::HdmiFrl { pixel_hz }
         } else if selection.hdmi {
             dccg::PixelClock::Tmds {
-                divider: if plan.mode.ycbcr420 {
+                divider: if plan.mode.encoding.is_420() {
                     dccg::TmdsDivider::By2
                 } else {
                     dccg::TmdsDivider::By4
@@ -3064,7 +3254,7 @@ pub fn timing_request(pipe: u8, plan: &dml::Plan, selection: &Selection) -> otg:
         } else {
             otg::Signal::DisplayPort
         },
-        ycbcr420: plan.mode.ycbcr420,
+        encoding: plan.mode.encoding,
         dsc: selection.dsc,
         odm: otg::SplitPipes::NONE,
     }
@@ -3233,7 +3423,7 @@ impl ColdBoot {
             .map_err(|_| ModesetError::NoSink)?
             .to_vec();
         let mut selection = select(&paths, &ports, max_bpc(), want)?;
-        selection.limited = limited_range(broadcast_rgb()) && !selection.ycbcr420;
+        selection.limited = limited_range(broadcast_rgb()) && selection.encoding.is_rgb();
         selection.format = plane_format(crtc);
         selection.planes = plane_setup(crtc);
         (selection.colorspace, selection.hdr) = output_color(crtc);
@@ -3406,7 +3596,7 @@ impl ColdBoot {
         // "Broadcast RGB" is RGB's: YCbCr is limited range by itself.
         let limited = limited_range(broadcast_rgb());
         for (s, &crtc) in selections.iter_mut().zip(&crtcs) {
-            s.limited = limited && !s.ycbcr420;
+            s.limited = limited && s.encoding.is_rgb();
             s.format = plane_format(crtc);
             s.planes = plane_setup(crtc);
             (s.colorspace, s.hdr) = output_color(crtc);
@@ -3744,18 +3934,33 @@ impl ColdBoot {
                 let frl = s.frl.and_then(|_| frl_cap(caps));
                 let audio = sink_audio_info(edid);
                 let max_bpc = connector_max_bpc(s.port, None);
-                hdmi_stream_candidates(caps, &t, max_bpc, frl, audio, soc.dispclk_max_khz)
-                    .into_iter()
-                    .map(|h| dml::Mode {
-                        hdmi: true,
-                        ycbcr420: h.ycbcr420,
-                        dsc: h.dsc.map(|c| dml::Dsc {
-                            slices: c.slices_h,
-                            bpp_x16: c.bpp_x16,
-                        }),
-                        ..plane_mode(t, s.format)
-                    })
-                    .collect()
+                [
+                    crate::amdgpu_hdr::ColorFormat::Auto,
+                    crate::amdgpu_hdr::ColorFormat::Ycbcr444,
+                    crate::amdgpu_hdr::ColorFormat::Ycbcr422,
+                ]
+                .into_iter()
+                .flat_map(|requested| {
+                    hdmi_candidates(
+                        caps,
+                        &t,
+                        max_bpc,
+                        frl,
+                        audio,
+                        soc.dispclk_max_khz,
+                        requested,
+                    )
+                })
+                .map(|h| dml::Mode {
+                    hdmi: true,
+                    encoding: h.encoding,
+                    dsc: h.dsc.map(|c| dml::Dsc {
+                        slices: c.slices_h,
+                        bpp_x16: c.bpp_x16,
+                    }),
+                    ..plane_mode(t, s.format)
+                })
+                .collect()
             } else if s.mst.is_some() {
                 mst_offered_modes(t, &s, soc)
             } else {
@@ -4130,20 +4335,20 @@ impl ColdBoot {
     ) -> Result<(Selection, otg::ScanoutRunning), ModesetError> {
         let port = selection.port;
         let bpc = depth_bpc(selection.depth);
-        let ycbcr420 = selection.ycbcr420;
+        let encoding = selection.encoding;
         let audio = frl_audio(selection.audio, selection.timing.v_active);
         let dsc = FrlDscStream::of(&selection);
         // SAFETY: the caller's obligations; each step checks its predecessor.
         unsafe {
             let trained = self
-                .start_frl(port, &selection.timing, bpc, ycbcr420, dsc, rate, audio)
+                .start_frl(port, &selection.timing, bpc, encoding, dsc, rate, audio)
                 .await?;
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Scdc);
             // The trained link's capacity-check parameters (for DSC the
             // compressed check's tribyte targets and padding borrow mode).
             let (audio_packets_line, borrow, hc_active, hc_blank) =
-                frl_video_params(&selection.timing, bpc, ycbcr420, dsc, trained, audio)
+                frl_video_params_in(&selection.timing, bpc, encoding, dsc, trained, audio)
                     .ok_or(ModesetError::Link)?;
             let request = otg::FrlVideoRequest {
                 pipe,
@@ -4219,7 +4424,7 @@ impl ColdBoot {
         port: usize,
         timing: &Timing,
         bpc: u8,
-        ycbcr420: bool,
+        encoding: crate::amdgpu_hdr::PixelEncoding,
         dsc: Option<FrlDscStream>,
         rate: FrlRate,
         audio: crate::amdgpu_frl_cap::FrlAudio,
@@ -4232,7 +4437,7 @@ impl ColdBoot {
         unsafe {
             loop {
                 let r = FrlRate::new(code).ok_or(ModesetError::Link)?;
-                if frl_video_params(timing, bpc, ycbcr420, dsc, r, audio).is_none() {
+                if frl_video_params_in(timing, bpc, encoding, dsc, r, audio).is_none() {
                     return Err(ModesetError::Link);
                 }
                 self.start_display_frl_link(port, r.lanes(), r.character_khz())
@@ -4398,13 +4603,14 @@ impl ColdBoot {
             return Ok(());
         }
         let tmds = match s.depth {
+            _ if s.encoding.is_422() => crate::amdgpu_dmub_navi48::TmdsDepth::Bpc8,
             otg::ColorDepth::Bpc8 => crate::amdgpu_dmub_navi48::TmdsDepth::Bpc8,
             otg::ColorDepth::Bpc10 => crate::amdgpu_dmub_navi48::TmdsDepth::Bpc10,
             otg::ColorDepth::Bpc12 => crate::amdgpu_dmub_navi48::TmdsDepth::Bpc12,
         };
         // Linux decides on phy_pix_clk, the deep-colour character clock of
         // the TMDS pixel clock (halved for 4:2:0).
-        let pixel_khz = s.timing.pixel_clock_khz >> u32::from(s.ycbcr420);
+        let pixel_khz = s.timing.pixel_clock_khz >> u32::from(s.encoding.is_420());
         let scrambled = tmds.character_khz(pixel_khz) > otg::TMDS_SCRAMBLE_KHZ;
         let result = async {
             if self.display_scdc_read(s.port, SINK_VERSION).await? == 1 {
@@ -4867,7 +5073,7 @@ impl ColdBoot {
         let mut new = route_streams(sst, &mst_streams)?;
         let limited = limited_range(broadcast_rgb());
         for (s, crtc) in new.iter_mut() {
-            s.limited = limited && !s.ycbcr420;
+            s.limited = limited && s.encoding.is_rgb();
             s.format = plane_format(*crtc);
             s.planes = plane_setup(*crtc);
             (s.colorspace, s.hdr) = output_color(*crtc);

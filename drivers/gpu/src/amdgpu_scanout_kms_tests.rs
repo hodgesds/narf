@@ -791,8 +791,21 @@ fn kms_prepare_cursor_uses_native_dumb_alias_in_own_open() -> TestResult {
     let Ok(f) = Fixture::new(2) else {
         return TestResult::Fail("fixture");
     };
-    let Ok((handle, _, _)) = f.gem.create_dumb(64, 12, 32) else {
-        return TestResult::Fail("native CREATE_DUMB");
+    let (handle, _, _) = match f.gem.create_dumb(64, 12, 32) {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = core::fmt::Write::write_fmt(
+                &mut narf_console::Writer,
+                format_args!(
+                    "  cursor CREATE_DUMB card{}: {error:?}; live {:?}; heap {:?}; layout {:?}\n",
+                    f.index,
+                    gem::ensure_placement_live(f.index),
+                    gem::vram_heap_usage(f.index),
+                    gem::dumb_layout(64, 12, 32)
+                ),
+            );
+            return TestResult::Fail("native CREATE_DUMB");
+        }
     };
     let Some(object) = f.gem.object(handle) else {
         return TestResult::Fail("dumb alias not in own GEM table");

@@ -331,3 +331,137 @@ kernel_test_in!(
     "drivers/gpu/dcn401-fetch",
     dcn401_blank_accepts_native_ttu_and_powered_off_fetchers
 );
+
+/// The MPC is not harvested with the pipe blocks. Keep the inherited
+/// selectors connected even on fused instances so a pool-only sweep fails
+/// this fixture; the guarded model still forbids every fused HUBP/OTG access.
+fn physical_mpcc(l: Layout, pipe: u8, reg: u64) -> u64 {
+    l.mpc_base + (reg + u64::from(l.pool.hw(pipe)) * 0x15) * 4
+}
+
+fn physical_mpc_planes() -> Engine<Fake> {
+    let mut e = engine();
+    let l = e.layout;
+    e.io.poll_limit = Some(16);
+    e.io.forbidden_hubps = l.pool.fuses();
+    for p in 0..4 {
+        let inst = u32::from(l.inst(p));
+        let input = if p < l.pool.count() {
+            u32::from(l.inst(0))
+        } else {
+            inst
+        };
+        for (r, value) in [(0, input), (1, 0xf), (2, input), (5, input)] {
+            e.io.regs
+                .insert(physical_mpcc(l, p, r), 0x8000_0000 | value);
+        }
+        e.io.regs.insert(physical_mpcc(l, p, 0xe), 2);
+        let mux = l.mpc_base + (0x2f2 + u64::from(inst) * 4) * 4;
+        e.io.regs.insert(mux, 0x8000_0000 | inst);
+        if p < l.pool.count() {
+            let h = l.base + (0x5f4 + u64::from(inst) * 0xdc) * 4;
+            // HUBP_VTG_SEL still names a real OTG while retirement
+            // preserves it; instance zero can be fused on this board.
+            e.io.regs.insert(h, 3 | inst << 4);
+        }
+    }
+    e
+}
+
+fn dcn401_planes_reset_every_physical_mpcc_after_pipe_harvesting() -> TestResult {
+    for fuses in [0, 1, 2, 6, 15] {
+        let result = harvest::under(fuses, || {
+            let mut e = physical_mpc_planes();
+            let l = e.layout;
+            let retired = run(e.retire_planes()).unwrap();
+            assert_eq!(retired.blanked, l.pool.all());
+            assert_eq!(retired.powered_off, 0);
+            for inst in 0..4u64 {
+                for r in [0, 1, 2, 5] {
+                    let at = l.mpc_base + (r + inst * 0x15) * 4;
+                    assert_eq!(e.io.regs[&at], 0x8000_000f);
+                    assert!(e.io.writes.contains(&(at, 0x8000_000f)));
+                }
+                let mux = l.mpc_base + (0x2f2 + inst * 4) * 4;
+                assert_eq!(e.io.regs[&mux], 0x8000_000f);
+            }
+            TestResult::Pass
+        });
+        if result != TestResult::Pass {
+            return result;
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-fetch",
+    dcn401_planes_reset_every_physical_mpcc_after_pipe_harvesting
+);
+
+fn dcn401_fused_mpcc_preflight_and_partial_failure_preserve_ownership() -> TestResult {
+    harvest::under(2, || {
+        for (r, value, error) in [
+            (5, 0x1f, Error::Busy),
+            (0, 4, Error::Unsupported),
+            (1, 4, Error::Unsupported),
+            (2, 4, Error::Unsupported),
+            (5, 4, Error::Unsupported),
+        ] {
+            let mut e = physical_mpc_planes();
+            let at = physical_mpcc(e.layout, e.layout.pool.count(), r);
+            e.io.regs.insert(at, value);
+            assert_eq!(run(e.retire_planes()), Err(error));
+            assert!(e.io.writes.is_empty());
+            assert_eq!(e.status.state, State::Ready);
+        }
+        let mut e = physical_mpc_planes();
+        let at = physical_mpcc(e.layout, e.layout.pool.count(), 0);
+        // Four output muxes, then three unfused MPCCs' four selectors.
+        // Reject the first fused MPCC write after the owned operation starts.
+        e.io.reject = Some(17);
+        assert_eq!(run(e.retire_planes()), Err(Error::Readback(at)));
+        assert_eq!(e.status.state, State::Failed(Error::Readback(at)));
+        assert!(e.status.planes_retired.is_none());
+        let writes = e.io.writes.len();
+        assert_eq!(run(e.retire_planes()), Err(Error::Busy));
+        assert_eq!(e.io.writes.len(), writes);
+        TestResult::Pass
+    })
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-fetch",
+    dcn401_fused_mpcc_preflight_and_partial_failure_preserve_ownership
+);
+
+fn dcn401_shared_plane_retirement_does_not_initialize_unowned_physical_mpccs() -> TestResult {
+    harvest::harvested(2, || {
+        let mut e = physical_mpc_planes();
+        run(e.retire_planes()).unwrap();
+        // Derive the sibling mask from a real staged timing owner; an empty
+        // selected display must not initialize the whole physical MPC then.
+        run(e.prepare(request(0), clock(request(0)))).unwrap();
+        e.select_display(1).unwrap();
+        assert_eq!(e.displays.siblings.pipes, 1);
+        let l = e.layout;
+        let first_fused = l.pool.count();
+        let fused = physical_mpcc(l, first_fused, 5);
+        // Even a pending transaction on that foreign physical MPCC must
+        // remain untouched while a sibling display retains the hardware.
+        e.io.regs.insert(fused, 0x1f);
+        e.io.writes.clear();
+        run(e.retire_planes()).unwrap();
+        assert_eq!(e.io.regs[&fused], 0x1f);
+        for p in core::iter::once(0).chain(first_fused..4) {
+            let inst = u64::from(l.inst(p));
+            let mux = l.mpc_base + (0x2f2 + inst * 4) * 4;
+            assert!(e.io.writes.iter().all(|&(at, _)| {
+                at != mux && ![0, 1, 2, 5].iter().any(|&r| at == physical_mpcc(l, p, r))
+            }));
+        }
+        TestResult::Pass
+    })
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-fetch",
+    dcn401_shared_plane_retirement_does_not_initialize_unowned_physical_mpccs
+);

@@ -93,7 +93,7 @@ fn fixture_with(
             pipe,
             depth,
             limited,
-            ycbcr420: false,
+            encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
             colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(limited, false),
         },
         c,

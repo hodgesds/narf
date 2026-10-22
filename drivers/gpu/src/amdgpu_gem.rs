@@ -1994,6 +1994,35 @@ impl GemState {
         Ok((handle, pitch, byte_len))
     }
 
+    /// Owned diagnostic storage, using ordinary GTT accounting and this open's
+    /// handle table. The borrowed card gate spans allocation and publication.
+    pub(crate) fn create_kernel_system(
+        &self,
+        bytes: u64,
+        gate: &PlacementGuard,
+    ) -> Result<(u32, Arc<GemObject>), FsError> {
+        if self.card != Some(gate.card()) {
+            return Err(FsError::InvalidData);
+        }
+        let object = GemObject {
+            placement: IrqSafeSpinLock::new(Arc::new(GemPlacement::new_system(bytes)?)),
+            byte_len: bytes,
+            alignment: PAGE_SIZE,
+            preferred_domains: AtomicU64::new(u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT)),
+            allowed_domains: AtomicU64::new(u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT)),
+            flags: 0,
+            metadata: IrqSafeSpinLock::new(Metadata::default()),
+            card: self.card,
+            dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
+            pin_count: AtomicU32::new(0),
+        };
+        let handle = self.insert(object)?;
+        Ok((
+            handle,
+            self.object_unvalidated(handle).ok_or(FsError::NotFound)?,
+        ))
+    }
+
     /// `amdgpu_mode_dumb_mmap` (MAP_DUMB) for a handle of this table: the
     /// same offset `GEM_MMAP` hands out, EPERM for a userptr or a
     /// NO_CPU_ACCESS buffer. None for a handle this table does not hold.

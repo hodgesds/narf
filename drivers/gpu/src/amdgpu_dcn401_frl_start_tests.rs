@@ -260,6 +260,19 @@ fn prepared_frl_video_dsc(
     rate: crate::amdgpu_navi48_boot::FrlRate,
     dsc: Option<crate::amdgpu_dsc::DscConfig>,
 ) -> (Engine<FrlIo>, Fw, FrlVideoRequest, dccg::Applied) {
+    prepared_frl_video_encoding(
+        crate::amdgpu_hdr::PixelEncoding::from_420(ycbcr420),
+        depth,
+        rate,
+        dsc,
+    )
+}
+fn prepared_frl_video_encoding(
+    encoding: crate::amdgpu_hdr::PixelEncoding,
+    depth: ColorDepth,
+    rate: crate::amdgpu_navi48_boot::FrlRate,
+    dsc: Option<crate::amdgpu_dsc::DscConfig>,
+) -> (Engine<FrlIo>, Fw, FrlVideoRequest, dccg::Applied) {
     let (phy, pipe) = (2u8, 1u8);
     let event = Arc::new(AtomicU8::new(0));
     let mut e = engine();
@@ -286,16 +299,22 @@ fn prepared_frl_video_dsc(
     };
     let mut req = request(pipe);
     req.signal = Signal::HdmiFrl;
-    req.ycbcr420 = ycbcr420;
+    req.encoding = encoding;
     req.dsc = dsc;
     let c = clock(req);
     run(e.prepare(req, c)).unwrap();
     e.io.inner.retiring = [false; 4];
     run(e.prepare_blank(
         BlankRequest {
-            ycbcr420,
+            encoding,
             depth,
-            colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(false, ycbcr420),
+            colorspace: crate::amdgpu_hdr::output_color_space(
+                0,
+                encoding.is_rgb(),
+                false,
+                req.timing.pixel_clock_khz * 10,
+                false,
+            ),
             ..blank_request(pipe)
         },
         c,
@@ -535,7 +554,7 @@ fn dcn401_frl_controls_bind_live_scanout() -> TestResult {
                 timing: request(1).timing,
                 pitch: 1920,
                 bytes_per_pixel: 4,
-                ycbcr420: false,
+                encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
                 dsc: None,
                 planes: [None; dml::MAX_PLANES],
             },
@@ -720,6 +739,20 @@ fn dcn401_frl_video_sends_drm_infoframe_like_linux() -> TestResult {
     let v = e.status.frl_video_running.unwrap();
     assert_eq!(v.request.hdr, Some(packet));
     e.frl_video_verify_running(&v).unwrap();
+    e.io.inner.writes.clear();
+    let expected = run(crate::amdgpu_dcn401_otg::freesync::packet_cycle(
+        &mut e,
+        request.pipe,
+    ));
+    let actual: Vec<u32> =
+        e.io.inner
+            .writes
+            .iter()
+            .filter(|&&(at, _)| at == frl(0x932))
+            .map(|&(_, v)| v)
+            .collect();
+    assert_eq!(actual, expected);
+    assert_eq!(r(&e, 0x8e6) & 0x33000, 0x30000);
     // Live metadata update: packet 4 only.
     blob[28] = 0x99;
     let next = hdr_info_packet(
@@ -754,4 +787,66 @@ fn dcn401_frl_video_sends_drm_infoframe_like_linux() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-frl-link",
     dcn401_frl_video_sends_drm_infoframe_like_linux
+);
+
+fn dcn401_frl_422_444_pack_pixels_signal_avi_and_detect_drift() -> TestResult {
+    use crate::amdgpu_hdr::PixelEncoding as E;
+    for encoding in [E::Ycbcr422, E::Ycbcr444] {
+        for (depth, code) in [
+            (ColorDepth::Bpc8, 0),
+            (ColorDepth::Bpc10, 1),
+            (ColorDepth::Bpc12, 2),
+        ] {
+            let rate = crate::amdgpu_navi48_boot::FrlRate::new(6).unwrap();
+            let (mut e, mut fw, request, c) =
+                prepared_frl_video_encoding(encoding, depth, rate, None);
+            run(e.start_frl_video(path(2), request, c)).unwrap();
+            let pair = u32::from(encoding.is_422());
+            assert_eq!(
+                e.io.inner.regs[&frl(0x8e0)] & 0x3030301,
+                encoding.hardware_format() << 16
+                    | code << 8
+                    | u32::from(code != 0 && !encoding.is_422())
+            );
+            assert_eq!(e.io.inner.regs[&frl(0x8d6)] & 0x11100, 0);
+            assert_eq!(
+                e.io.inner.regs[&frl(0x900)],
+                1920 >> pair | (280 >> pair) << 16
+            );
+            assert_eq!(
+                e.io.inner.regs[&e.layout.odm(1, FORMAT)] & 0x33,
+                encoding.hardware_format()
+            );
+            let words: Vec<_> =
+                e.io.inner
+                    .writes
+                    .iter()
+                    .filter_map(|&(at, value)| (at == frl(0x932)).then_some(value))
+                    .collect();
+            let packet: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            assert_eq!(packet[5] >> 5, encoding.avi());
+            assert_eq!(packet[6] >> 6, 2);
+            e.frl_video_verify_running(&e.status.frl_video_running.unwrap())
+                .unwrap();
+            e.io.inner
+                .regs
+                .entry(frl(0x8e0))
+                .and_modify(|r| *r ^= 1 << 16);
+            assert_eq!(
+                e.frl_video_verify_running(&e.status.frl_video_running.unwrap()),
+                Err(Error::Readback(frl(0x8e0)))
+            );
+            e.io.inner
+                .regs
+                .entry(frl(0x8e0))
+                .and_modify(|r| *r ^= 1 << 16);
+            run(e.stop_frl_video(path(2))).unwrap();
+            run(e.stop_frl_link(&mut fw, path(2))).unwrap();
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-frl-link",
+    dcn401_frl_422_444_pack_pixels_signal_avi_and_detect_drift
 );

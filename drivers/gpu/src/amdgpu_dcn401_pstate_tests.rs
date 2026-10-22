@@ -55,8 +55,8 @@ fn inputs<'a>(w: &mut impl Iterator<Item = &'a str>) -> Option<Inputs> {
             v_sync_positive: true,
         };
         let mut mode = Mode::new(timing, 0, 0);
-        mode.ycbcr420 = v[9] != 0;
-        mode.hdmi = mode.ycbcr420;
+        mode.encoding = crate::amdgpu_hdr::PixelEncoding::from_420(v[9] != 0);
+        mode.hdmi = mode.encoding.is_420();
         if !(1..=MAX_PLANES as u32).contains(&v[10]) {
             return None;
         }

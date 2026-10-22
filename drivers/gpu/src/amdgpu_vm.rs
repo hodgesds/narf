@@ -652,7 +652,7 @@ pub(crate) async fn relocate(
                 return Err(error);
             }
         }
-        crate::amdgpu_cs::retire(card, &|ticket| engine.signalled(ticket));
+        crate::amdgpu_cs::retire(card, &|ticket| engine.retired(ticket));
     } else if !jobs.is_empty() {
         return Err(FsError::NoDevice);
     }
@@ -1118,6 +1118,51 @@ impl VmInner {
         }
         self.dematerialise(va, size);
         self.release(removed);
+    }
+
+    /// Map one exclusively owned kernel diagnostic BO through the same
+    /// client page-table builder. No user pointer is read. Admission and both
+    /// identities must name this card; mappings retain their address lease.
+    pub(crate) fn map_kernel_object(
+        &self,
+        gate: &crate::amdgpu_gem::PlacementGuard,
+        handle: u32,
+        object: alloc::sync::Arc<crate::amdgpu_gem::GemObject>,
+        va: u64,
+        flags: u32,
+    ) -> Result<(), FsError> {
+        if self.card() != Some(gate.card()) || object.card() != self.card() {
+            return Err(FsError::InvalidData);
+        }
+        let size = object.byte_len;
+        let va = validate_va(&self.geometry, va, size, flags)?;
+        if size == 0
+            || size % GPU_PAGE_SIZE != 0
+            || va % GPU_PAGE_SIZE != 0
+            || flags & uapi::AMDGPU_VM_PAGE_PRT != 0
+        {
+            return Err(FsError::InvalidData);
+        }
+        let mapping = Mapping {
+            va,
+            size,
+            gem_handle: handle,
+            offset: 0,
+            vm_flags: flags,
+        };
+        let placement = object.placement();
+        self.insert(mapping, Some(object.clone()), false)?;
+        if let Err(error) = self.materialise(
+            &mapping,
+            &|offset| placement.gpu_at(offset),
+            placement.system,
+            object.flags,
+        ) {
+            let removed = self.unmap(va, size)?;
+            self.retire_range(va, size, removed);
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// How many mappings this address space holds.

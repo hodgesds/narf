@@ -164,6 +164,10 @@ pub enum PixelFormat {
     Argb16161616f = 0x4834_5241, // "AR4H"
     Xbgr16161616f = 0x4834_4258, // "XB4H"
     Abgr16161616f = 0x4834_4241, // "AB4H"
+    Xrgb16161616 = 0x3834_5258,  // "XR48"
+    Argb16161616 = 0x3834_5241,  // "AR48"
+    Xbgr16161616 = 0x3834_4258,  // "XB48"
+    Abgr16161616 = 0x3834_4241,  // "AB48"
     Nv12 = 0x3231_564e,          // "NV12": Y plane, then interleaved CbCr
     P010 = 0x3031_3050,          // "P010": 10-bit (MSB-aligned 16-bit) NV12
 }
@@ -184,6 +188,10 @@ impl PixelFormat {
             Self::Argb16161616f,
             Self::Xbgr16161616f,
             Self::Abgr16161616f,
+            Self::Xrgb16161616,
+            Self::Argb16161616,
+            Self::Xbgr16161616,
+            Self::Abgr16161616,
             Self::Nv12,
             Self::P010,
         ]
@@ -199,7 +207,11 @@ impl PixelFormat {
             Self::Xrgb16161616f
             | Self::Argb16161616f
             | Self::Xbgr16161616f
-            | Self::Abgr16161616f => 8,
+            | Self::Abgr16161616f
+            | Self::Xrgb16161616
+            | Self::Argb16161616
+            | Self::Xbgr16161616
+            | Self::Abgr16161616 => 8,
             _ => 4,
         }
     }
@@ -915,6 +927,9 @@ pub struct NativeOutput {
     /// The connector's "max bpc" (max_requested_bpc, 8..=16), when it has
     /// the property (drm_connector_attach_max_bpc_property).
     pub max_bpc: Option<u8>,
+    /// Standard HDMI connector "color format" (AUTO=0, RGB=1, YUV444=2,
+    /// YUV422=3, YUV420=4). None on transports without this native path.
+    pub color_format: Option<crate::amdgpu_hdr::ColorFormat>,
 }
 
 /// System-wide vblank "slack" offset in nanoseconds. A flip-complete event is

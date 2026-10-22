@@ -431,7 +431,7 @@ fn plane_bound(
     let l = surface.request.layout();
     l.stream_width == t.h_active
         && l.stream_height == t.v_active
-        && l.ycbcr420 == plan.mode.ycbcr420
+        && l.ycbcr420 == plan.mode.encoding.is_420()
         && surface.request.odm == timing.odm
         && surface.request.mpc.count() == u32::from(dpps.max(1))
         && surface.request.dml_plane() == planned
@@ -464,6 +464,7 @@ pub(super) fn bound(
     readmits(plan)
         && timing.pipe == a.pipe
         && timing.timing == t
+        && timing.encoding == plan.mode.encoding
         && timing.sync == plan.sync
         && matches!(
             timing.signal,

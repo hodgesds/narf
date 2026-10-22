@@ -15,6 +15,7 @@ use topology::ProbeState;
 pub use topology::{MstOutput, MstOutputId, MST_OUTPUTS};
 #[path = "amdgpu_navi48_mst_dsc.rs"]
 pub(super) mod dsc;
+pub use dsc::pcon::Pcon;
 pub use dsc::{DscAux, MstDsc};
 
 /// The port's AUX channel through DMUB, in 16-byte native transactions
@@ -134,6 +135,11 @@ pub struct MstLink {
     /// stream runs.
     caps: Option<modeset::DpCaps>,
     payload_change: Option<MstPayloadChange>,
+    /// DSC AUX/vendor work without proof of completion. Retain the link
+    /// through returned failure or cancellation until whole-device reset.
+    dsc_change: Option<bool>,
+    /// A downstream status query dropped without terminal AUX completion.
+    endpoint_query: Option<dp_mst_mgr::Sink>,
     /// Each payload's stream encoder and the display (head pipe) whose
     /// stream it carries.
     displays: Vec<(u8, u8)>,
@@ -172,6 +178,10 @@ impl MstLink {
     pub fn payload_change(&self) -> Option<MstPayloadChange> {
         self.payload_change
     }
+    /// DSC work has no completion witness; keep the branch owner for reset.
+    pub fn dsc_change_pending(&self) -> bool {
+        self.dsc_change.is_some()
+    }
     /// A resource query whose sideband completion is unproven. Failed and
     /// cancelled queries retain this marker and refuse other transactions.
     pub fn resource_query_pending(&self) -> bool {
@@ -179,7 +189,11 @@ impl MstLink {
     }
     /// Only a completed payload may expose its stream's audio endpoint.
     pub(super) fn audio_slots(&self, stream: u8) -> Result<u8, otg::Error> {
-        if self.payload_change.is_some() || self.resource_query {
+        if self.payload_change.is_some()
+            || self.resource_query
+            || self.dsc_change.is_some()
+            || self.endpoint_query.is_some()
+        {
             return Err(otg::Error::Busy);
         }
         let mut owned = self.payloads.iter().filter(|p| p.stream == stream);
@@ -194,7 +208,11 @@ impl MstLink {
         self.dirty
     }
     pub(super) fn require_transaction_idle<E>(&self) -> Result<(), MstFailure<E>> {
-        if self.payload_change.is_some() || self.resource_query {
+        if self.payload_change.is_some()
+            || self.resource_query
+            || self.dsc_change.is_some()
+            || self.endpoint_query.is_some()
+        {
             return Err(otg::Error::Busy.into());
         }
         Ok(())
@@ -230,6 +248,8 @@ impl MstLink {
             || !self.payloads.is_empty()
             || self.payload_change.is_some()
             || self.resource_query
+            || self.dsc_change.is_some()
+            || self.endpoint_query.is_some()
     }
 }
 
@@ -624,6 +644,13 @@ impl ColdBoot {
         let link = self.mst.get_mut(&port).ok_or(MstFailure::Invalid)?;
         link.consume_events();
         result?;
+        let running: Vec<_> = self
+            .display_modesets()
+            .into_iter()
+            .flatten()
+            .map(|m| m.selection)
+            .filter(|s| s.port == port && s.mst.is_some())
+            .collect();
         let (instance, _) = self.mst_path(port)?;
         let link = self.mst.get_mut(&port).ok_or(MstFailure::Invalid)?;
         let mut aux = DmubAux {
@@ -631,7 +658,14 @@ impl ColdBoot {
             instance,
         };
         link.refresh_resources(&mut aux).await?;
+        let (changed, lost) = link.refresh_pcon_outputs(&mut aux, &running).await?;
+        if !lost.is_empty() {
+            return Ok(MstService::Lost(lost));
+        }
         if !link.dirty {
+            if changed {
+                self.readmit_dark_mst_outputs(port);
+            }
             return Ok(MstService::Kept);
         }
         if link.has_stream_resources() {
@@ -836,11 +870,7 @@ impl ColdBoot {
             dmub: &mut self.sequence.backend.dmub,
             instance,
         };
-        dsc::set_rx(&mut link.manager, &mut aux, &link.topology, dsc, enable).await?;
-        if enable && !dsc::rx_enabled(&mut link.manager, &mut aux, &link.topology, dsc).await? {
-            return Err(MstFailure::Mst(MstError::Malformed));
-        }
-        Ok(())
+        set_dsc(link, &mut aux, dsc, enable).await
     }
     /// drm_dp_mst_topology_mgr_set_mst(false), the port's MST state dropped.
     /// A session with a source owner, payloads or an incomplete payload change
@@ -864,6 +894,103 @@ impl ColdBoot {
             link.manager.stop(&mut aux).await;
         }
     }
+}
+
+/// A sideband status transaction is retained before polling it. Only a
+/// terminal reply (including NAK) permits another user of this AUX route.
+async fn query_pcon<A: MstAux>(
+    link: &mut MstLink,
+    aux: &mut A,
+    sink: dp_mst_mgr::Sink,
+    old: Pcon,
+) -> Result<Pcon, MstFailure<A::Error>> {
+    link.require_transaction_idle()?;
+    link.endpoint_query = Some(sink);
+    let result = dsc::pcon::refresh(&mut link.manager, aux, &link.topology, old).await;
+    match result {
+        Ok(p) => {
+            link.endpoint_query = None;
+            Ok(p)
+        }
+        Err(MstError::Nak(_)) => {
+            link.endpoint_query = None;
+            Ok(Pcon {
+                state: dsc::pcon::State::Unavailable,
+                raw_rate: 0,
+                dsc_rate: 0,
+                ..old
+            })
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+impl MstLink {
+    /// Refresh endpoint proposals and report only streams whose own
+    /// downstream link no longer carries their retained configuration.
+    pub(super) async fn refresh_pcon_outputs<A: MstAux>(
+        &mut self,
+        aux: &mut A,
+        running: &[Selection],
+    ) -> Result<(bool, Vec<u8>), MstFailure<A::Error>> {
+        self.require_transaction_idle()?;
+        let mut changed = false;
+        let mut lost = Vec::new();
+        for k in 0..self.outputs.len() {
+            let endpoint = self.outputs[k]
+                .as_ref()
+                .and_then(|o| Some((o.sink?, o.dsc?.pcon?)));
+            let Some((sink, old)) = endpoint else {
+                continue;
+            };
+            let fresh = query_pcon(self, aux, sink, old).await?;
+            changed |= old != fresh;
+            if let Some(d) = self.outputs[k].as_mut().and_then(|o| o.dsc.as_mut()) {
+                d.pcon = Some(fresh);
+            }
+            for s in running
+                .iter()
+                .filter(|s| s.mst.is_some_and(|m| m.sink == sink))
+            {
+                if !fresh.allows(&s.timing, modeset::depth_bpc(s.depth), s.dsc.as_ref()) {
+                    if let Some(payload) = self.payloads.iter().find(|p| p.sink == sink) {
+                        lost.push(payload.stream);
+                    }
+                }
+            }
+        }
+        Ok((changed, lost))
+    }
+}
+
+/// DSC transaction ownership survives future cancellation, just like the
+/// payload journal. A failed AUX/vendor sequence may still be active at the
+/// branch, so neither retry nor partial retirement can release its owner.
+async fn set_dsc<A: MstAux>(
+    link: &mut MstLink,
+    aux: &mut A,
+    decoder: &MstDsc,
+    enable: bool,
+) -> Result<(), MstFailure<A::Error>> {
+    link.require_transaction_idle()?;
+    // owner is set before the first stream enables DSC. Remaining payload
+    // ownership instead proves a sibling may still consume this decoder;
+    // last-stream teardown removes its payload before reaching this step.
+    let link_active = !link.payloads.is_empty() || link.payload_change.is_some();
+    link.dsc_change = Some(enable);
+    dsc::set_rx(
+        &mut link.manager,
+        aux,
+        &link.topology,
+        decoder,
+        enable,
+        link_active,
+    )
+    .await?;
+    if enable && !dsc::rx_enabled(&mut link.manager, aux, &link.topology, decoder).await? {
+        return Err(MstFailure::Mst(MstError::Malformed));
+    }
+    link.dsc_change = None;
+    Ok(())
 }
 
 /// The stream encoder an MST stream's payload is sourced from: its DIO
@@ -976,7 +1103,7 @@ pub fn select_mst(
 }
 
 /// What MST depth and DSC selection need beyond the selection's inputs:
-/// the topology, each end device's decoder (`MstOutput::dsc`), the board's
+/// the topology, each decoder/converter endpoint (`MstOutput::dsc`), the board's
 /// highest DISPCLK and each end device's requested maximum depth (its
 /// connector's max_requested_bpc within `amdgpu.max_bpc`,
 /// `modeset::connector_max_bpc`).
@@ -1110,13 +1237,14 @@ fn select_mst_dsc(
             let stream = dsc::DscStream {
                 sink: *sink,
                 timing: s.timing,
-                dsc: decoder.map(|d| d.caps),
+                dsc: decoder.and_then(|d| d.caps),
                 bpc: modeset::depth_bpc(s.depth),
             };
             let mut next = current;
             next.push(stream);
             // A running stream the search fits no longer is one it changes.
-            payloads = dsc::compute(&next, &link, &fits).ok_or(BesideRefusal::DscFairness)?;
+            payloads = dsc::compute_endpoints(&next, &link, &fits, ctx.dsc_of)
+                .ok_or(BesideRefusal::DscFairness)?;
             streams.push((k, stream, Some(s)));
             continue;
         }
@@ -1146,10 +1274,10 @@ fn select_mst_dsc(
                     next.push(dsc::DscStream {
                         sink: *sink,
                         timing: t,
-                        dsc: decoder.map(|d| d.caps),
+                        dsc: decoder.and_then(|d| d.caps),
                         bpc,
                     });
-                    let p = dsc::compute(&next, &link, &fits)?;
+                    let p = dsc::compute_endpoints(&next, &link, &fits, ctx.dsc_of)?;
                     Some((*next.last()?, p))
                 })
             });
@@ -1165,7 +1293,10 @@ fn select_mst_dsc(
     // A running stream keeps its configuration, or the change modesets it.
     let kept = streams.iter().zip(&payloads).all(|((_, _, s), p)| {
         s.is_none_or(|s| {
-            s.mst.is_some_and(|m| (m.pbn, m.slots) == (p.pbn, p.slots)) && s.dsc == p.dsc
+            s.mst.is_some_and(|m| {
+                (m.pbn, m.slots) == (p.pbn, p.slots)
+                    && m.pcon == (ctx.dsc_of)(m.sink).and_then(|d| d.pcon)
+            }) && s.dsc == p.dsc
         })
     });
     if !kept {
@@ -1190,6 +1321,7 @@ fn select_mst_dsc(
             return Ok(Vec::new());
         };
         out.push(Selection {
+            color_format: crate::amdgpu_hdr::ColorFormat::Auto,
             port,
             timing,
             lanes,
@@ -1202,7 +1334,7 @@ fn select_mst_dsc(
             audio: mst_audio(edid, &timing, stream.bpc, lanes, rate, caps, p.dsc.as_ref()),
             avi: otg::Avi::default(),
             limited: false,
-            ycbcr420: false,
+            encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
             frl: None,
             frl_caps: None,
             dsc: p.dsc,
@@ -1213,6 +1345,7 @@ fn select_mst_dsc(
                 pbn_bpc: stream.bpc,
                 rate: vc,
                 dsc: p.dsc.and((ctx.dsc_of)(*sink)),
+                pcon: (ctx.dsc_of)(*sink).and_then(|d| d.pcon),
             }),
             vrr: None,
             format: otg::SurfaceFormat::Xrgb8888,
@@ -1327,6 +1460,7 @@ fn select_mst_with_budget(
         };
         free -= raw.slots;
         let s = Selection {
+            color_format: crate::amdgpu_hdr::ColorFormat::Auto,
             port,
             timing,
             lanes,
@@ -1339,7 +1473,7 @@ fn select_mst_with_budget(
             audio: mst_audio(edid, &timing, raw.bpc, lanes, rate, caps, None),
             avi: otg::Avi::default(),
             limited: false,
-            ycbcr420: false,
+            encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
             frl: None,
             frl_caps: None,
             dsc: None,
@@ -1350,6 +1484,7 @@ fn select_mst_with_budget(
                 pbn_bpc: raw.pbn_bpc,
                 rate: vc,
                 dsc: None,
+                pcon: dsc.and_then(|c| (c.dsc_of)(*sink)).and_then(|d| d.pcon),
             }),
             // VRR is DP SST only here (no MST stream features).
             vrr: None,
@@ -1416,11 +1551,16 @@ pub(super) fn raw_mst_stream(
     };
     let full_pbn = c.topology.port(sink)?.full_pbn;
     let link = dsc_link(caps, c.max_dispclk_khz)?;
-    raw_mst_choice(t, edid, (c.max_bpc)(sink), full_pbn, &link)
+    raw_mst_choice_with(t, edid, (c.max_bpc)(sink), full_pbn, &link, &|bpc| {
+        (c.dsc_of)(sink)
+            .and_then(|d| d.pcon)
+            .is_none_or(|p| p.raw_allowed(t, bpc))
+    })
 }
 
 /// `raw_mst_stream` for an end device whose port has `full_pbn`, capped
 /// at `max_bpc`, on `link`.
+#[cfg(feature = "kernel-test")]
 pub(super) fn raw_mst_choice(
     t: &Timing,
     edid: &[u8],
@@ -1428,10 +1568,20 @@ pub(super) fn raw_mst_choice(
     full_pbn: u16,
     link: &dsc::DscLink,
 ) -> Option<RawMstStream> {
+    raw_mst_choice_with(t, edid, max_bpc, full_pbn, link, &|_| true)
+}
+fn raw_mst_choice_with(
+    t: &Timing,
+    edid: &[u8],
+    max_bpc: u8,
+    full_pbn: u16,
+    link: &dsc::DscLink,
+    allowed: &dyn Fn(u8) -> bool,
+) -> Option<RawMstStream> {
     let bpc = modeset::dp_depths(edid, max_bpc)
         .into_iter()
         .map(modeset::depth_bpc)
-        .find(|&bpc| dsc::raw_supported(t, bpc, full_pbn, link))?;
+        .find(|&bpc| allowed(bpc) && dsc::raw_supported(t, bpc, full_pbn, link))?;
     let pbn_bpc = modeset::requested_depth_bpc(edid, max_bpc).max(8);
     let (pbn, slots) = mst_slots_on(t, pbn_bpc, link.kbps, link.slots)?;
     Some(RawMstStream {
@@ -1711,7 +1861,7 @@ fn compressed_mst_joint_modes(
                 dsc::DscStream {
                     sink: s.mst?.sink,
                     timing: s.timing,
-                    dsc: (ctx.dsc_of)(s.mst?.sink).map(|d| d.caps),
+                    dsc: (ctx.dsc_of)(s.mst?.sink).and_then(|d| d.caps),
                     bpc: modeset::depth_bpc(s.depth),
                 },
             ))
@@ -1722,7 +1872,7 @@ fn compressed_mst_joint_modes(
         dsc::DscStream {
             sink,
             timing: *timing,
-            dsc: decoder.map(|d| d.caps),
+            dsc: decoder.and_then(|d| d.caps),
             bpc,
         },
     ));
@@ -1731,7 +1881,7 @@ fn compressed_mst_joint_modes(
     }
     streams.sort_by_key(|(_, s)| order.iter().position(|&x| x == s.sink));
     let input: Vec<_> = streams.iter().map(|(_, s)| *s).collect();
-    let payloads = dsc::compute(&input, &link, &fits)?;
+    let payloads = dsc::compute_endpoints(&input, &link, &fits, ctx.dsc_of)?;
     let mut joint: Vec<_> = lit.iter().map(modeset::selection_mode).collect();
     joint.push(modeset::mode(*timing));
     for ((k, _), p) in streams.iter().zip(payloads) {
@@ -1797,7 +1947,7 @@ pub(super) fn refine_mst_link_payloads(
         streams.push(dsc::DscStream {
             sink: m.sink,
             timing: s.timing,
-            dsc: dec.map(|d| d.caps),
+            dsc: dec.and_then(|d| d.caps),
             bpc,
         });
     }
@@ -1813,14 +1963,18 @@ pub(super) fn refine_mst_link_payloads(
             pbn <= available.min(topology::path_budget(ctx.topology, sink, &others).unwrap_or(0))
         })
     };
-    let payloads = dsc::compute(&streams, &link, &fits).ok_or(BesideRefusal::Other)?;
+    let payloads =
+        dsc::compute_endpoints(&streams, &link, &fits, ctx.dsc_of).ok_or(BesideRefusal::Other)?;
     // Check all fixed owners before changing any provisional selection.
     if indices.iter().zip(&payloads).any(|(&k, p)| {
         fixed.get(k) == Some(&true)
             && (selections[k]
                 .mst
                 .is_none_or(|m| (m.pbn, m.slots) != (p.pbn, p.slots))
-                || selections[k].dsc != p.dsc)
+                || selections[k].dsc != p.dsc
+                || selections[k]
+                    .mst
+                    .is_some_and(|m| m.pcon != (ctx.dsc_of)(m.sink).and_then(|d| d.pcon)))
     }) {
         return Err(BesideRefusal::DscFairness);
     }
@@ -1842,6 +1996,7 @@ pub(super) fn refine_mst_link_payloads(
             pbn_bpc: stream.bpc,
             rate: vc,
             dsc: p.dsc.and((ctx.dsc_of)(old.sink)),
+            pcon: (ctx.dsc_of)(old.sink).and_then(|d| d.pcon),
             ..old
         });
         s.audio = mst_audio(
@@ -2334,11 +2489,31 @@ impl ColdBoot {
         if link.owner.is_some() && link.uhbr != uhbr {
             return Err(ModesetError::Link);
         }
+        let first = link.owner.is_none();
+        if let Some(pcon) = stream.pcon {
+            let (instance, _) = self.mst_path(port)?;
+            let link = self.mst.get_mut(&port).ok_or(MstFailure::Invalid)?;
+            if link.dirty {
+                return Err(ModesetError::Link);
+            }
+            let mut aux = DmubAux {
+                dmub: &mut self.sequence.backend.dmub,
+                instance,
+            };
+            let fresh = query_pcon(link, &mut aux, stream.sink, pcon).await?;
+            if !fresh.allows(
+                &selection.timing,
+                modeset::depth_bpc(selection.depth),
+                selection.dsc.as_ref(),
+            ) {
+                return Err(ModesetError::Link);
+            }
+        }
         // The payload's stream encoder: DIO on 8b/10b, HPO on 128b/132b.
         let source = mst_source_encoder(uhbr, encoders).ok_or(otg::Error::Invalid)?;
         // SAFETY: the caller's obligations; each step checks its predecessor.
         unsafe {
-            if link.owner.is_none() {
+            if first {
                 self.train_mst_link(port, selection, encoders).await?;
                 if let Some(link) = self.mst.get_mut(&port) {
                     link.owner = Some(pipe);
@@ -2375,15 +2550,10 @@ impl ColdBoot {
                 .checkpoint_activation(pipe, super::TeardownStep::Frontend);
             // A compressed stream's decoder after enable_stream and before
             // its payload (dp_set_dsc_on_rx); the PPS follows with the
-            // video, after the payload. link_set_dpms_on ignores
-            // dp_set_dsc_on_rx's result: a refused write is logged only.
+            // video, after the payload. An uncertain native AUX/vendor
+            // sequence retains the transaction and refuses publication.
             if let Some(d) = stream.dsc {
-                if let Err(e) = self.set_display_mst_dsc(port, &d, true).await {
-                    let _ = core::fmt::Write::write_fmt(
-                        &mut narf_console::Writer,
-                        format_args!("amdgpu: navi48 MST DSC enable on RX failed: {e:?}\n"),
-                    );
-                }
+                self.set_display_mst_dsc(port, &d, true).await?;
             }
             self.add_display_mst_payload(
                 port,

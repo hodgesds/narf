@@ -21,6 +21,14 @@ mod encode_proof;
 mod encode_words;
 #[path = "amdgpu_vcn_navi48_h264.rs"]
 mod h264;
+#[path = "amdgpu_vcn_navi48_hevc10.rs"]
+mod hevc10_proof;
+#[path = "amdgpu_vcn_navi48_hevc10_words.rs"]
+mod hevc10_words;
+#[path = "amdgpu_vcn_navi48_hevc.rs"]
+mod hevc_proof;
+#[path = "amdgpu_vcn_navi48_hevc_words.rs"]
+mod hevc_words;
 #[path = "amdgpu_vcn_navi48_ib.rs"]
 mod ib_proof;
 #[path = "amdgpu_vcn_navi48_ib_words.rs"]
@@ -39,6 +47,7 @@ pub enum Error {
     BootFailed,
     PowerPolicy(u64),
     DecodeChecksum(u64),
+    DecodePixel(u32),
     EncodeOutput,
     Interrupts(crate::amdgpu_ih7::Error),
 }
@@ -55,6 +64,10 @@ pub enum State {
     IbVerified,
     DecodeTesting,
     DecodeVerified,
+    HevcTesting,
+    HevcVerified,
+    Hevc10Testing,
+    Hevc10Verified,
     EncodeTesting,
     EncodeVerified,
     Stopping,
@@ -256,6 +269,8 @@ struct Engine<I: Io> {
     ib_pool: Pool,
     ib_memory: Option<Reservation>,
     decode_memory: Option<Reservation>,
+    hevc_memory: Option<Reservation>,
+    hevc10_memory: Option<Reservation>,
     encode_memory: Option<Reservation>,
     firmware_bytes: u32,
     state: State,
@@ -263,6 +278,8 @@ struct Engine<I: Io> {
     interrupt_result: Option<Result<InterruptProof, Error>>,
     ib_result: Option<Result<InterruptProof, Error>>,
     decode_result: Option<Result<DecodeProof, Error>>,
+    hevc_result: Option<Result<DecodeProof, Error>>,
+    hevc10_result: Option<Result<DecodeProof, Error>>,
     encode_result: Option<Result<EncodeProof, Error>>,
     wptr: u32,
     seq: u32,
@@ -330,6 +347,8 @@ impl<I: Io> Engine<I> {
         self.interrupt_result = None;
         self.ib_result = None;
         self.decode_result = None;
+        self.hevc_result = None;
+        self.hevc10_result = None;
         self.encode_result = None;
         self.memory.publish();
         let result = self
@@ -462,7 +481,11 @@ impl<I: Io> Engine<I> {
                 | State::InterruptVerified
                 | State::IbTesting
                 | State::IbVerified
+                | State::Hevc10Testing
+                | State::HevcTesting
                 | State::DecodeTesting
+                | State::Hevc10Verified
+                | State::HevcVerified
                 | State::DecodeVerified
                 | State::EncodeTesting
                 | State::EncodeVerified
@@ -566,6 +589,8 @@ impl<I: Io> Engine<I> {
                 | State::Verified
                 | State::InterruptVerified
                 | State::IbVerified
+                | State::Hevc10Verified
+                | State::HevcVerified
                 | State::DecodeVerified
                 | State::EncodeVerified
         ) {
@@ -589,6 +614,12 @@ impl<I: Io> Engine<I> {
                     memory.stopped();
                 }
                 if let Some(memory) = self.decode_memory.as_mut() {
+                    memory.stopped();
+                }
+                if let Some(memory) = self.hevc10_memory.as_mut() {
+                    memory.stopped();
+                }
+                if let Some(memory) = self.hevc_memory.as_mut() {
                     memory.stopped();
                 }
                 if let Some(memory) = self.encode_memory.as_mut() {
@@ -672,6 +703,8 @@ impl Vcn {
                 ib_pool: pool.clone(),
                 ib_memory: None,
                 decode_memory: None,
+                hevc_memory: None,
+                hevc10_memory: None,
                 encode_memory: None,
                 firmware_bytes: firmware_bytes as u32,
                 state: State::Prepared,
@@ -679,6 +712,8 @@ impl Vcn {
                 interrupt_result: None,
                 ib_result: None,
                 decode_result: None,
+                hevc_result: None,
+                hevc10_result: None,
                 encode_result: None,
                 wptr: 0,
                 seq: 0,
@@ -754,6 +789,32 @@ impl Vcn {
     pub fn decode_result(&self) -> Option<Result<DecodeProof, Error>> {
         self.engine.decode_result
     }
+    /// Decode the original fixed Main8 IDR and compare every NV12 pixel.
+    /// This does not establish Main10, resolution ranges or application support.
+    /// # Safety
+    /// Retain exclusive VCPU/GMC/kernel-VMID0/IRQ ownership, exclude clients,
+    /// PM/reset, and keep every published allocation after failure/cancellation.
+    pub async unsafe fn prove_hevc(&mut self) -> Result<DecodeProof, Error> {
+        self.engine
+            .prove_hevc(&mut crate::amdgpu_navi48_interrupts::NativeObserver)
+            .await
+    }
+    pub fn hevc_result(&self) -> Option<Result<DecodeProof, Error>> {
+        self.engine.hevc_result
+    }
+    /// Decode the original fixed Main10 IDR and compare every P010 byte.
+    /// This does not establish full profile/range or application support.
+    /// # Safety
+    /// Same exclusive retained VCPU/GMC/kernel-VMID0/IRQ ownership as prove_hevc;
+    /// exclude clients/PM/reset and retain every allocation after cancellation.
+    pub async unsafe fn prove_hevc10(&mut self) -> Result<DecodeProof, Error> {
+        self.engine
+            .prove_hevc10(&mut crate::amdgpu_navi48_interrupts::NativeObserver)
+            .await
+    }
+    pub fn hevc10_result(&self) -> Option<Result<DecodeProof, Error>> {
+        self.engine.hevc10_result
+    }
     /// Encode the fixed NV12 frame and inspect bounded SPS/PPS/IDR headers.
     /// This does not prove visual quality or complete bitstream conformance.
     /// # Safety
@@ -786,6 +847,8 @@ impl Vcn {
             self.engine.state,
             State::InterruptVerified
                 | State::IbVerified
+                | State::Hevc10Verified
+                | State::HevcVerified
                 | State::DecodeVerified
                 | State::EncodeVerified
         )

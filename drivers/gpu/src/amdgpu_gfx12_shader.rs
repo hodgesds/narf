@@ -1,4 +1,4 @@
-//! Bounded GC12 wave32 compute proof, on the retained VMID0 test pages.
+//! Bounded GC12.0.0/12.0.1 wave32 compute proof, on the retained VMID0 test pages.
 //! Shader bytes are independently assembled by tests/gfx12_shader/check.sh.
 //! PM4 logical SH offsets follow Mesa 26.0 ac_cmdbuf.c/si_compute.c;
 //! these are NOT the physical GC12 MMIO register offsets.
@@ -82,7 +82,7 @@ pub(crate) fn ib(code: u64, output: u64, engines: u8, salt: u32) -> Result<[u32;
             }],
         );
     }
-    sh(0xb88c, &[0]); // SE8 is absent on this exact GC12.0.1 profile
+    sh(0xb88c, &[0]); // Neither supported RDNA4 die has SE8
     sh(0xb890, &[0; 4]); // accumulators
     sh(0xb8a0, &[0]); // RSRC3: no shared VGPRs
     sh(0xb8bc, &[0]); // no 2D interleave

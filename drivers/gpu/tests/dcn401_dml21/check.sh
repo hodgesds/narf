@@ -252,6 +252,9 @@ vmin_answer() {
         echo "$hdmi $out"
     done
 }
+# HDMI simple422 shares non-DSC DML scheduling with 444, while the native
+# formatter/link carries its distinct encoding. Execute the real format.
+hdmi422_answer() { FMT422=1 HDMIFRL=1 odm34_answer; }
 # mpc_answer: answer plane_vectors.txt inputs from stdin with Linux
 # (harness_planes.c, RAISED, MPC_AUTO).
 mpc_answer() {
@@ -624,6 +627,7 @@ check_answered() {
 check_surfaces "$here/surface_vectors.txt" || mfail=1
 check_answered "$here/odm34_vectors.txt" odm34_answer || mfail=1
 check_answered "$here/vmin_vectors.txt" vmin_answer || mfail=1
+check_answered "$here/hdmi422_vectors.txt" hdmi422_answer || mfail=1
 check_answered "$here/mpc_vectors.txt" mpc_answer || mfail=1
 check_answered "$here/surface_mpc_vectors.txt" surface_mpc_answer || mfail=1
 check_answered "$here/pstate_vectors.txt" pstate_answer || mfail=1

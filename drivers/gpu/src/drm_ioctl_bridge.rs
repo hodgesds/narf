@@ -3011,6 +3011,15 @@ const COLORSPACE_ENUMS: [(u64, &[u8]); 5] = [
 /// which amdgpu_dm calls with 8..16 on every connector, MST end devices
 /// included).
 const MAX_BPC_PROP_ID: u32 = 0x80;
+/// drm_connector_attach_color_format_property, native HDMI only.
+const COLOR_FORMAT_PROP_ID: u32 = 0x81;
+const COLOR_FORMAT_ENUMS: [(u64, &[u8]); 5] = [
+    (0, b"AUTO"),
+    (1, b"RGB"),
+    (2, b"YUV 4:4:4"),
+    (3, b"YUV 4:2:2"),
+    (4, b"YUV 4:2:0"),
+];
 const MAX_BPC_RANGE: [u64; 2] = [8, 16];
 /// `sizeof(struct hdr_output_metadata)`, the size
 /// drm_atomic_connector_set_property requires of an HDR_OUTPUT_METADATA blob.
@@ -3401,6 +3410,7 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
         ),
         BROADCAST_RGB_PROP_ID => (b"Broadcast RGB", DRM_MODE_PROP_ENUM, &BROADCAST_RGB_ENUMS),
         COLORSPACE_PROP_ID => (b"Colorspace", DRM_MODE_PROP_ENUM, &COLORSPACE_ENUMS),
+        COLOR_FORMAT_PROP_ID => (b"color format", DRM_MODE_PROP_ENUM, &COLOR_FORMAT_ENUMS),
         crate::drm_native_planes::BLEND_PROP_ID => (
             b"pixel blend mode",
             DRM_MODE_PROP_ENUM,
@@ -3504,6 +3514,13 @@ fn connector_properties(
     {
         props.push(HDR_OUTPUT_METADATA_PROP_ID);
         values.push(u64::from(blob));
+    }
+    if let Some(format) = card
+        .native_output(connector_id)
+        .and_then(|n| n.color_format)
+    {
+        props.push(COLOR_FORMAT_PROP_ID);
+        values.push(format as u64);
     }
     if let Some(capable) = card.native_output(connector_id).and_then(|n| n.vrr_capable) {
         props.push(VRR_CAPABLE_PROP_ID);
@@ -3613,9 +3630,95 @@ fn apply_crtc_color(
         .map(|display| (display, request))
 }
 
+fn native_output_on_crtc(
+    card: &crate::drm::card::Card,
+    crtc: u32,
+    connector: Option<u32>,
+) -> Option<&crate::drm::card::NativeOutput> {
+    let connector = connector.or_else(|| {
+        card.connectors
+            .iter()
+            .find(|c| {
+                c.encoder_id
+                    .and_then(|id| card.encoder(id).ok())
+                    .is_some_and(|e| e.crtc_id == Some(crtc))
+            })
+            .map(|c| c.id)
+    })?;
+    card.native_output(connector)
+}
+
+/// SETCRTC uses the same complete HDMI preflight as atomic modesetting.
+fn setcrtc_output_format_supported(
+    card: &crate::drm::card::Card,
+    display: u8,
+    connector: u32,
+    mode: Option<crate::drm::ioctl::DrmModeModeInfo>,
+    fourcc: u32,
+    setup: crate::amdgpu_navi48_boot::PlaneSetup,
+) -> bool {
+    let committed = crate::drm_native_planes::displays(card);
+    let mut routes = Vec::new();
+    for n in &card.native {
+        if n.connector == connector {
+            routes.push(crate::amdgpu_native_kms::OutputRoute {
+                display,
+                connector,
+                mode,
+                planes: Some((fourcc, setup)),
+            });
+            continue;
+        }
+        let Some(crtc) = card
+            .connector(n.connector)
+            .ok()
+            .and_then(|c| c.encoder_id)
+            .and_then(|id| card.encoder(id).ok())
+            .and_then(|e| e.crtc_id)
+        else {
+            continue;
+        };
+        if !card.crtc(crtc).is_ok_and(|c| c.enabled) {
+            continue;
+        }
+        let Some(other) = crate::amdgpu_native_kms::crtc_display(crtc) else {
+            continue;
+        };
+        if other == display {
+            continue;
+        }
+        let planes = committed
+            .iter()
+            .find(|p| p.crtc_id == crtc)
+            .map(|p| (p.primary_format, p.setup));
+        routes.push(crate::amdgpu_native_kms::OutputRoute {
+            display: other,
+            connector: n.connector,
+            mode: None,
+            planes,
+        });
+    }
+    let requests: Vec<_> = routes
+        .iter()
+        .filter_map(|r| {
+            let native = card.native_output(r.connector)?;
+            Some(crate::amdgpu_native_kms::OutputFormatRequest {
+                display: r.display,
+                connector: r.connector,
+                mode: r.mode,
+                planes: r.planes,
+                max_bpc: native.max_bpc,
+                color_format: native.color_format?,
+            })
+        })
+        .collect();
+    crate::amdgpu_native_kms::output_formats_supported(&requests, &routes)
+}
+
 /// A connector's Colorspace / HDR_OUTPUT_METADATA values from one request.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ConnectorColorChange {
+    color_format: Option<crate::amdgpu_hdr::ColorFormat>,
     colorspace: Option<u32>,
     hdr_output_metadata: Option<u32>,
 }
@@ -3633,6 +3736,14 @@ fn connector_color_property(
 ) -> Result<bool, FsError> {
     let native = card.native_output(connector);
     match prop {
+        COLOR_FORMAT_PROP_ID => {
+            if native.and_then(|n| n.color_format).is_none() {
+                return Err(FsError::InvalidData);
+            }
+            change.color_format = Some(
+                crate::amdgpu_hdr::ColorFormat::from_linux(value).ok_or(FsError::InvalidData)?,
+            );
+        }
         COLORSPACE_PROP_ID => {
             if native.and_then(|n| n.colorspace).is_none()
                 || !COLORSPACE_ENUMS.iter().any(|&(v, _)| v == value)
@@ -3681,7 +3792,10 @@ fn connector_color_check(
     }
     let mut modeset = change
         .colorspace
-        .is_some_and(|v| Some(v) != native.colorspace);
+        .is_some_and(|v| Some(v) != native.colorspace)
+        || change
+            .color_format
+            .is_some_and(|v| Some(v) != native.color_format);
     if let Some(new) = change.hdr_output_metadata {
         let old = native.hdr_output_metadata.unwrap_or(0);
         let bytes = |id: u32| (id != 0).then(|| card.property_blob(id)).flatten();
@@ -3718,14 +3832,25 @@ fn apply_connector_color(
     change: ConnectorColorChange,
 ) -> Option<crate::amdgpu_native_kms::ConnectorColorRequest> {
     let native = card.native.iter_mut().find(|n| n.connector == connector)?;
-    let before = (native.colorspace, native.hdr_output_metadata);
+    let before = (
+        native.colorspace,
+        native.hdr_output_metadata,
+        native.color_format,
+    );
+    if let Some(format) = change.color_format {
+        native.color_format = Some(format);
+    }
     if let Some(v) = change.colorspace {
         native.colorspace = Some(v);
     }
     if let Some(id) = change.hdr_output_metadata {
         native.hdr_output_metadata = Some(id);
     }
-    let after = (native.colorspace, native.hdr_output_metadata);
+    let after = (
+        native.colorspace,
+        native.hdr_output_metadata,
+        native.color_format,
+    );
     card.collect_blobs();
     if after == before || crate::drm_registry::driver_name(card_index) != Some("amdgpu") {
         return None;
@@ -3738,6 +3863,7 @@ fn apply_connector_color(
     Some(crate::amdgpu_native_kms::ConnectorColorRequest {
         connector,
         colorspace: after.0.unwrap_or(0),
+        color_format: after.2.unwrap_or_default(),
         hdr_output_metadata: hdr,
     })
 }
@@ -5105,6 +5231,11 @@ fn atomic_commit(
                     .iter()
                     .find(|(id, _)| *id == dp.crtc_id)
                     .map(|(_, w)| w);
+                if native_output_on_crtc(&card, dp.crtc_id, connector)
+                    .is_some_and(|n| n.color_format.is_some())
+                {
+                    continue;
+                }
                 if !crate::amdgpu_native_kms::display_admits_planes(
                     d,
                     connector,
@@ -5146,6 +5277,128 @@ fn atomic_commit(
                 ) {
                     return Err(FsError::InvalidData);
                 }
+            }
+        }
+
+        // Retain the existing DP/MST-only modeset admission path. The
+        // additional complete format search is needed when this request
+        // changes an HDMI output or any of its planes.
+        let hdmi_touched = card
+            .native
+            .iter()
+            .filter(|n| n.color_format.is_some())
+            .any(|n| {
+                state.connectors.iter().any(|c| c.id == n.connector)
+                    || connector_colors
+                        .iter()
+                        .any(|(id, c)| *id == n.connector && c.color_format.is_some())
+                    || max_bpcs.iter().any(|(id, _)| *id == n.connector)
+                    || native_modes.iter().any(|(id, _)| {
+                        native_output_on_crtc(&card, *id, None)
+                            .is_some_and(|current| current.connector == n.connector)
+                    })
+                    || native_displays.iter().any(|d| {
+                        native_output_on_crtc(&card, d.crtc_id, None)
+                            .is_some_and(|current| current.connector == n.connector)
+                    })
+            });
+        if hdmi_touched && crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
+            let mut outputs = Vec::new();
+            let mut routes = Vec::new();
+            for native in &card.native {
+                let connector = native.connector;
+                let crtc = state
+                    .connectors
+                    .iter()
+                    .find(|c| c.id == connector)
+                    .map(|c| c.crtc_id)
+                    .unwrap_or_else(|| {
+                        card.connector(connector)
+                            .ok()
+                            .and_then(|c| c.encoder_id)
+                            .and_then(|e| card.encoder(e).ok())
+                            .and_then(|e| e.crtc_id)
+                    });
+                let Some(crtc) = crtc else { continue };
+                let enabled = state
+                    .crtcs
+                    .iter()
+                    .find(|c| c.id == crtc)
+                    .map(|c| c.enable)
+                    .unwrap_or_else(|| card.crtc(crtc).is_ok_and(|c| c.enabled));
+                if !enabled {
+                    continue;
+                }
+                let Some(display) = crate::amdgpu_native_kms::crtc_display(crtc) else {
+                    continue;
+                };
+                let change = connector_colors
+                    .iter()
+                    .find(|(id, _)| *id == connector)
+                    .map(|(_, c)| *c)
+                    .unwrap_or_default();
+                let mode = native_modes
+                    .iter()
+                    .find(|(id, _)| *id == crtc)
+                    .map(|(_, m)| *m);
+                let planes = if let Some(d) = native_displays.iter().find(|d| d.crtc_id == crtc) {
+                    Some((d.primary_format, d.setup))
+                } else if !card.native_planes.is_empty() {
+                    // A connector-only color-format change still needs the
+                    // committed primary/overlays, including pending DRM state.
+                    let mut snapshot = state.clone();
+                    if !snapshot.crtcs.iter().any(|c| c.id == crtc) {
+                        let c = card.crtc(crtc).map_err(|_| FsError::InvalidData)?;
+                        snapshot.crtcs.push(crate::drm::atomic::CrtcState {
+                            id: crtc,
+                            enable: c.enabled,
+                            active: c.enabled,
+                            mode: c.mode,
+                            ..Default::default()
+                        });
+                    }
+                    let planes = crate::drm_native_planes::check(&card, &snapshot, |id| {
+                        snapshot
+                            .crtcs
+                            .iter()
+                            .find(|c| c.id == id)
+                            .map(|c| c.mode)
+                            .unwrap_or_else(|| card.crtc(id).ok().and_then(|c| c.mode))
+                    })?;
+                    planes
+                        .iter()
+                        .find(|d| d.crtc_id == crtc)
+                        .map(|d| (d.primary_format, d.setup))
+                } else {
+                    None
+                };
+                routes.push(crate::amdgpu_native_kms::OutputRoute {
+                    display,
+                    connector,
+                    mode,
+                    planes,
+                });
+                if native.color_format.is_none() {
+                    continue;
+                }
+                outputs.push(crate::amdgpu_native_kms::OutputFormatRequest {
+                    display,
+                    connector,
+                    color_format: change
+                        .color_format
+                        .or(native.color_format)
+                        .unwrap_or_default(),
+                    mode,
+                    planes,
+                    max_bpc: max_bpcs
+                        .iter()
+                        .find(|(id, _)| *id == connector)
+                        .map(|(_, b)| *b)
+                        .or(native.max_bpc),
+                });
+            }
+            if !crate::amdgpu_native_kms::output_formats_supported(&outputs, &routes) {
+                return Err(FsError::InvalidData);
             }
         }
 
@@ -6168,7 +6421,23 @@ fn handle_setcrtc_decoded(
                         (m.width, m.height),
                     )
                 });
-                if let Some(planes) = placed {
+                let hdmi = native_output_on_crtc(&card, req.crtc_id, native_connector)
+                    .filter(|n| n.color_format.is_some());
+                if let Some(native) = hdmi {
+                    let setup = placed
+                        .transpose()?
+                        .map_or(crate::amdgpu_navi48_boot::PlaneSetup::NONE, |p| p.setup);
+                    if !setcrtc_output_format_supported(
+                        &card,
+                        d,
+                        native.connector,
+                        native_wire,
+                        format as u32,
+                        setup,
+                    ) {
+                        return Err(FsError::InvalidData);
+                    }
+                } else if let Some(planes) = placed {
                     let planes = planes?;
                     if !crate::amdgpu_native_kms::display_admits_planes(
                         d,

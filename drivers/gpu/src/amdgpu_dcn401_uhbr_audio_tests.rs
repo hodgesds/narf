@@ -496,7 +496,7 @@ fn dcn401_uhbr_audio_filters_capabilities_and_binds_scanout() -> TestResult {
             timing,
             pitch: 1920,
             bytes_per_pixel: 4,
-            ycbcr420: false,
+            encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
             dsc: None,
             planes: [None; dml::MAX_PLANES],
         },

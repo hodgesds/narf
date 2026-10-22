@@ -269,12 +269,13 @@ fn dcn401_dp_video_black_roundtrip_keeps_independent_routes_and_native_sequence(
                 assert_eq!(e.io.fake().regs[&dio(s, 0x2122)] & 0x10301, 0x200);
                 assert_eq!(e.io.fake().regs[&dio(s, 0x2123)] & 7, 6);
                 assert_eq!(e.io.fake().regs[&dio(s, 0x209b)] & 0x100003, 1);
-                // Only this stream and timing/ODM/VTG were written, never a HUBP,
-                // packet generator, PHY or clock route. Black can restart.
+                // Only this stream, video packet enables and timing/ODM/VTG
+                // were written. VPG payloads, HUBPs, PHYs and clocks stay owned.
+                // Teardown also clears the SPD enable without HDR/VSC present.
                 let l = e.layout;
                 for &(at, _) in &e.io.fake().writes[first..] {
                     assert!(
-                        [0x2122, 0x2123, 0x2126, 0x2127, 0x2128, 0x209b]
+                        [0x2122, 0x2123, 0x2126, 0x2127, 0x2128, 0x209b, 0x2141]
                             .iter()
                             .any(|&r| at == dio(s, r))
                             || at == l.otg(pipe, CONTROL)
@@ -283,6 +284,10 @@ fn dcn401_dp_video_black_roundtrip_keeps_independent_routes_and_native_sequence(
                             || at == l.odm(pipe, MEMORY)
                     );
                 }
+                assert_eq!(
+                    e.io.fake().regs[&dio(s, 0x2141)] & (1 << 20 | 1 << 22 | 1 << 23),
+                    0
+                );
                 start(&mut e, &mut io, c);
                 run(e.stop_dp_video(&mut io, path(p))).unwrap();
                 run(e.stop_dp_frontend(path(p))).unwrap();
@@ -837,7 +842,7 @@ fn dcn401_dp_audio_programs_dto1_secondary_packets_and_endpoint_like_linux() -> 
                 timing: t,
                 pitch: (t.h_active + 63) & !63,
                 bytes_per_pixel: 4,
-                ycbcr420: false,
+                encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
                 dsc: None,
                 planes: [None; dml::MAX_PLANES],
             },
@@ -1244,7 +1249,7 @@ fn dcn401_mst_displays_share_one_link() -> TestResult {
             pipe: p1,
             depth: ColorDepth::Bpc8,
             limited: false,
-            ycbcr420: false,
+            encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
             colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(false, false),
         },
         c1,
@@ -1443,6 +1448,21 @@ fn dcn401_dp_video_sends_vsc_and_hdr_sdps_like_linux() -> TestResult {
     {
         return TestResult::Fail("VSC/HDR SDPs at start");
     }
+    e.io.fake().writes.clear();
+    let pipe = e.status.dp_video_running.unwrap().frontend.request.pipe;
+    let expected = run(crate::amdgpu_dcn401_otg::freesync::packet_cycle(
+        &mut e, pipe,
+    ));
+    let actual: alloc::vec::Vec<u32> =
+        e.io.fake()
+            .writes
+            .iter()
+            .filter(|&&(at, _)| at == dio(stream, 0x2069))
+            .map(|&(_, v)| v)
+            .collect();
+    assert_eq!(actual, expected);
+    assert_eq!(sec(&mut e) & (1 << 22), 0);
+    assert_eq!(sec(&mut e) & (1 << 20 | 1 << 23 | 1), 1 << 20 | 1 << 23 | 1);
     blob[26..28].copy_from_slice(&400u16.to_le_bytes());
     let brighter = crate::amdgpu_hdr::hdr_info_packet(
         Some(&meta(&blob)),
@@ -1535,7 +1555,7 @@ fn dcn401_mst_stream_added_and_removed_beside_a_lit_stream() -> TestResult {
             pipe: p1,
             depth: ColorDepth::Bpc8,
             limited: false,
-            ycbcr420: false,
+            encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
             colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(false, false),
         },
         c1,
@@ -1634,7 +1654,7 @@ fn dcn401_mst_affected_stream_modesets_beside_a_lit_stream() -> TestResult {
                 pipe: p1,
                 depth: ColorDepth::Bpc8,
                 limited: false,
-                ycbcr420: false,
+                encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
                 colorspace: BlankRequest::default_colorspace(false, false),
             },
             c1,

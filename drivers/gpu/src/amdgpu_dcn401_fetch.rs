@@ -66,6 +66,16 @@ impl Layout {
     }
 }
 impl<I: Io> Engine<I> {
+    /// MPC keeps all four physical MPCCs even when HUBP/DPP/OPP/OTG pipes
+    /// are fused. A whole, unshared retirement follows dcn10_init_pipes's
+    /// num_opp sweep; a sibling owner limits us to the unfused pool instead.
+    fn retiring_mpccs(&self) -> core::ops::Range<u8> {
+        0..if self.displays.siblings.pipes == 0 {
+            crate::amdgpu_rdna4::DCN401_PIPES as u8
+        } else {
+            self.layout.pool.count()
+        }
+    }
     fn hubp_powered(&mut self, pipe: u8) -> Result<bool, Error> {
         let config = self.read(self.layout.pg(pipe, false))? & 0x101;
         let state = self.read(self.layout.pg(pipe, true))? & 0xc0000000;
@@ -169,6 +179,27 @@ impl<I: Io> Engine<I> {
                 return Err(Error::Busy);
             }
         }
+        // Fusing a pipe does not remove its MPC selectors. Before touching
+        // these unowned physical MPCCs, reject inherited update transactions
+        // and foreign selectors just as for the pool's MPCCs. Their HUBP,
+        // DPP, OPP and OTG register blocks remain inaccessible.
+        for p in self.retiring_mpccs().skip(usize::from(l.pool.count())) {
+            if self.read(l.mpcc(p, UPDATE_LOCK))? & 0x70 != 0 {
+                return Err(Error::Busy);
+            }
+            for at in [
+                l.out_mux(p),
+                l.mpcc(p, TOP),
+                l.mpcc(p, BOTTOM),
+                l.mpcc(p, OPP_ID),
+                l.mpcc(p, UPDATE_LOCK),
+            ] {
+                let select = self.read(at)? & 0xf;
+                if select != 0xf && select >= crate::amdgpu_rdna4::DCN401_PIPES {
+                    return Err(Error::Unsupported);
+                }
+            }
+        }
         Ok(PlanesRetired {
             blanked: l.pool.all() & !powered_off & !kept,
             powered_off,
@@ -221,13 +252,17 @@ impl<I: Io> Engine<I> {
         let deadline = narf_time::Deadline::after_us(100_000);
         let kept = self.displays.siblings.pipes;
         let ours: alloc::vec::Vec<u8> = l.pool.pipes().filter(|p| kept & 1 << p == 0).collect();
+        let mpccs: alloc::vec::Vec<u8> = self
+            .retiring_mpccs()
+            .filter(|p| kept & 1 << p == 0)
+            .collect();
         // Retire the whole display tree but other displays' pipes, including
         // inherited cross-routes. Disconnect outputs before each MPCC's
         // top/bottom/OPP/update-lock mux.
-        for &p in &ours {
+        for &p in &mpccs {
             self.update(l.out_mux(p), 0xf, 0xf)?;
         }
-        for &p in &ours {
+        for &p in &mpccs {
             for r in [TOP, BOTTOM, OPP_ID, UPDATE_LOCK] {
                 self.update(l.mpcc(p, r), 0xf, 0xf)?;
             }
@@ -254,7 +289,7 @@ impl<I: Io> Engine<I> {
         }
         self.wait_plane_drain(plan, true, deadline).await?;
         self.fetchers_stopped()?;
-        for &p in &ours {
+        for &p in &mpccs {
             for at in [
                 l.out_mux(p),
                 l.mpcc(p, TOP),
@@ -266,8 +301,12 @@ impl<I: Io> Engine<I> {
                     return Err(Error::Readback(at));
                 }
             }
-            if self.read(l.mpcc(p, UPDATE_LOCK))? & 0x70 != 0
-                || self.read(l.otg(p, LOCK))? & 0x101 != 0
+            if self.read(l.mpcc(p, UPDATE_LOCK))? & 0x70 != 0 {
+                return Err(Error::Busy);
+            }
+        }
+        for &p in &ours {
+            if self.read(l.otg(p, LOCK))? & 0x101 != 0
                 || self.read(l.otg(p, GSL))? & 0x8000000f != 0
             {
                 return Err(Error::Busy);

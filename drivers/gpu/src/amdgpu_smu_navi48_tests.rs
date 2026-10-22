@@ -110,7 +110,7 @@ impl Io for Fake {
             0x1e if p >> 16 == 2 => 1258,
             0x1d => 500,
             0x1e => 3100,
-            0x36 | 6 | 0x19 | 0x1a | 0x2a..=0x2d | 0x32 | 0x15..=0x17 => 0,
+            0x4d | 0x36 | 6 | 0x19 | 0x1a | 0x2a..=0x2d | 0x32 | 0x15..=0x17 => 0,
             8 => {
                 self.enabled |= p as u64;
                 0
@@ -1260,4 +1260,37 @@ fn smu14_baco_rejection_and_cancellation() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/smu-navi48",
     smu14_baco_rejection_and_cancellation
+);
+
+fn smu14_thermal_host_interrupt_allow_is_owned_and_cancellation_safe() -> TestResult {
+    let (_, mut e) = powered();
+    e.io.commands.clear();
+    run(e.allow_ih_interrupt()).unwrap();
+    assert_eq!(e.io.commands, [(0x4d, 0)]);
+    assert_eq!(e.state, State::PowerReady);
+    e.io.reject = Some(0x4d);
+    assert_eq!(run(e.allow_ih_interrupt()), Err(Error::Rejected(0xfd)));
+    assert_eq!(e.state, State::PowerReady);
+    let (_, mut e) = powered();
+    e.io.stall = Some(0x4d);
+    {
+        let mut pending = core::pin::pin!(e.allow_ih_interrupt());
+        assert!(pending
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+    }
+    assert_eq!(e.state, State::Runtime);
+    let sent = e.io.commands.len();
+    assert_eq!(run(e.allow_ih_interrupt()), Err(Error::Busy));
+    assert_eq!(e.io.commands.len(), sent);
+    let (_, mut e) = powered();
+    e.io.revoke = Some((0x4d, e.authority));
+    assert_eq!(run(e.allow_ih_interrupt()), Err(Error::Revoked));
+    assert_eq!(e.state, State::Failed);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-power",
+    smu14_thermal_host_interrupt_allow_is_owned_and_cancellation_safe
 );

@@ -161,7 +161,7 @@ cc -O1 -w -I"$work" -c "$here/color_input.c" -o "$work/color_input.o"
 cc "$work"/*.o -o "$work/color"
 
 gamcor_inputs() {
-	for f in XR24 RG16 XR4H NV12 P010; do
+	for f in XR24 RG16 XR4H NV12 P010 XR48 AR48 XB48 AB48; do
 		for control in 0 20 60; do
 			echo "$f $control"
 		done
@@ -176,7 +176,7 @@ if [ $generate -eq 3 ]; then
 fi
 
 color_inputs() {
-	for f in XR24 AR24 XB24 AB24 XR30 AR30 XB30 AB30 RG16 XR4H AR4H XB4H AB4H NV12 P010; do
+	for f in XR24 AR24 XB24 AB24 XR30 AR30 XB30 AB30 RG16 XR4H AR4H XB4H AB4H NV12 P010 XR48 AR48 XB48 AB48; do
 		for legacy in 0 1; do
 			for current in 0 1 2; do
 				for enc in 0 1 2; do
@@ -197,7 +197,7 @@ if [ $generate -eq 2 ]; then
 fi
 
 inputs() {
-	for f in XR24 AR24 XB24 AB24 XR30 AR30 XB30 AB30 RG16 XR4H AR4H XB4H AB4H NV12 P010; do
+	for f in XR24 AR24 XB24 AB24 XR30 AR30 XB30 AB30 RG16 XR4H AR4H XB4H AB4H NV12 P010 XR48 AR48 XB48 AB48 RA24; do
 		for enc in 0 1 2 3; do
 			for range in 0 1; do
 				echo "$f $enc $range"

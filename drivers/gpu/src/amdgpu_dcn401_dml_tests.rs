@@ -62,7 +62,7 @@ fn inputs(f: &[u32]) -> (Soc, Mode) {
             timing,
             pitch: f[18],
             bytes_per_pixel: 4,
-            ycbcr420: false,
+            encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
             dsc: None,
             planes: [None; MAX_PLANES],
         },
@@ -474,6 +474,8 @@ enum Prefix {
     Full,
     /// HDMI flag, then Full: same timing over DP/HPO or HDMI FRL.
     TransportFull,
+    /// Full prefix on uncompressed HDMI simple422 (HDMIFRL reference).
+    Hdmi422,
 }
 
 /// As `check_vectors_with` under `policy`; also counts the configurations
@@ -495,21 +497,27 @@ fn check_vectors_policy(
             return Err("malformed output encoder");
         }
         let mut b = [4u32];
-        if matches!(prefix, Prefix::Bytes | Prefix::Full | Prefix::TransportFull)
-            && !parse(&mut words, &mut b)
+        if matches!(
+            prefix,
+            Prefix::Bytes | Prefix::Full | Prefix::TransportFull | Prefix::Hdmi422
+        ) && !parse(&mut words, &mut b)
         {
             return Err("malformed format vector");
         }
         let mut d = [0u32; 2];
         if matches!(
             prefix,
-            Prefix::Dsc | Prefix::FrlDsc | Prefix::Full | Prefix::TransportFull
+            Prefix::Dsc | Prefix::FrlDsc | Prefix::Full | Prefix::TransportFull | Prefix::Hdmi422
         ) && !parse(&mut words, &mut d)
         {
             return Err("malformed DSC vector");
         }
         let mut f420 = [u32::from(ycbcr420)];
-        if matches!(prefix, Prefix::Full | Prefix::TransportFull) && !parse(&mut words, &mut f420) {
+        if matches!(
+            prefix,
+            Prefix::Full | Prefix::TransportFull | Prefix::Hdmi422
+        ) && !parse(&mut words, &mut f420)
+        {
             return Err("malformed 4:2:0 flag");
         }
         let dsc = d[0] != 0;
@@ -529,8 +537,14 @@ fn check_vectors_policy(
             f[9..18].copy_from_slice(&s[..9]);
             f[18] = t[9];
             let (_, mut mode) = inputs(&f);
-            mode.ycbcr420 = f420[0] != 0;
-            mode.hdmi = hdmi[0] != 0 || mode.ycbcr420 || prefix == Prefix::FrlDsc;
+            mode.encoding = if prefix == Prefix::Hdmi422 {
+                crate::amdgpu_hdr::PixelEncoding::Ycbcr422
+            } else {
+                crate::amdgpu_hdr::PixelEncoding::from_420(f420[0] != 0)
+            };
+            mode.hdmi = hdmi[0] != 0
+                || mode.encoding.is_420()
+                || matches!(prefix, Prefix::FrlDsc | Prefix::Hdmi422);
             mode.bytes_per_pixel = b[0];
             mode.dsc = dsc.then_some(Dsc {
                 slices: d[0],
@@ -810,7 +824,7 @@ fn dcn401_dml_bytes_per_pixel_domain() -> TestResult {
         timing: t,
         pitch,
         bytes_per_pixel,
-        ycbcr420: false,
+        encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
         dsc: None,
         planes: [None; MAX_PLANES],
     };
@@ -1295,7 +1309,7 @@ fn surface_request(
             dst: Rect::new(0, 0, t.h_active as i32, t.v_active as i32),
             stream_width: t.h_active,
             stream_height: t.v_active,
-            ycbcr420: plan.mode.ycbcr420,
+            ycbcr420: plan.mode.encoding.is_420(),
             rotation: match rotation {
                 1 => Rotation::R90,
                 2 => Rotation::R180,
@@ -1806,4 +1820,21 @@ fn dcn401_dml_matches_linux_dml21_vmin_vectors() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-dml",
     dcn401_dml_matches_linux_dml21_vmin_vectors
+);
+
+fn dcn401_dml_matches_linux_hdmi_simple422_outputs() -> TestResult {
+    match check_vectors_policy(
+        include_str!("../tests/dcn401_dml21/hdmi422_vectors.txt"),
+        false,
+        Prefix::Hdmi422,
+        NO_MPC,
+    ) {
+        Ok((plans, _, _, _, _)) if plans >= 5 => TestResult::Pass,
+        Ok(_) => TestResult::Fail("HDMI422 vector coverage"),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_matches_linux_hdmi_simple422_outputs
 );

@@ -142,9 +142,10 @@ pub struct Mode {
     /// RGB565), 4 (`dml2_444_32`, 8888 and 2101010) or 8 (`dml2_444_64`,
     /// FP16). Every other value is `Error::Invalid`.
     pub bytes_per_pixel: u32,
-    /// The stream leaves as YCbCr 4:2:0 (HDMI): two pixels per OTG
-    /// container, which adds a line of delay after the scaler.
-    pub ycbcr420: bool,
+    /// Output encoding, independent of fetched plane format. HDMI420
+    /// takes two pixels per OPTC container and adds a scaler-delay line;
+    /// uncompressed simple422 and444 share444 scheduling. Native DSC is RGB.
+    pub encoding: crate::amdgpu_hdr::PixelEncoding,
     /// Display Stream Compression of a 4:4:4 DP output, as DC passes it
     /// (timing.dsc: enabled with the slice count and compressed bpp).
     pub dsc: Option<Dsc>,
@@ -330,7 +331,7 @@ impl Mode {
             hdmi: false,
             pitch,
             bytes_per_pixel,
-            ycbcr420: false,
+            encoding: crate::amdgpu_hdr::PixelEncoding::Rgb,
             dsc: None,
             planes: [None; MAX_PLANES],
         }
@@ -429,13 +430,15 @@ fn dsc_delay(t: &Timing, dsc: Dsc, odm: u32) -> u32 {
 fn decide_odm(mode: &Mode, dispclk_ss_khz: u64) -> u32 {
     let t = &mode.timing;
     let pclk = u64::from(t.pixel_clock_khz);
-    let fits = |pipes: u32| pclk <= u64::from(disp_divider(pipes, mode.ycbcr420)) * dispclk_ss_khz;
+    let fits = |pipes: u32| {
+        pclk <= u64::from(disp_divider(pipes, mode.encoding.is_420())) * dispclk_ss_khz
+    };
     let span = |limit: u32| t.h_active.div_ceil(limit).clamp(1, 4);
     let mut odm = (1..=3).find(|&n| fits(n)).unwrap_or(4);
     if mode.dsc.is_some() {
         odm = odm.max(span(MAX_PIXELS_PER_DSC));
     }
-    if mode.ycbcr420 {
+    if mode.encoding.is_420() {
         odm = odm.max(span(FMT_420_BUFFER_WIDTH));
     }
     if let Some(dsc) = mode.dsc {
@@ -473,7 +476,7 @@ pub fn dsc_pipes(timing: &Timing, slices: u32, dispclk_max_khz: u32) -> u32 {
         hdmi: false,
         pitch: timing.h_active,
         bytes_per_pixel: 4,
-        ycbcr420: false,
+        encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
         dsc: Some(Dsc { slices, bpp_x16: 0 }),
         planes: [None; MAX_PLANES],
     };
@@ -1632,7 +1635,7 @@ impl Shape {
             if dsc.bpp_x16 == 0 {
                 return Err(Error::Invalid);
             }
-            if mode.ycbcr420 || dsc.slices == 0 {
+            if !mode.encoding.is_rgb() || dsc.slices == 0 {
                 return Err(Error::Unsupported);
             }
         }
@@ -1648,11 +1651,11 @@ impl Shape {
         // (four for 3:1 and 4:1, which pack four pixels per transfer)
         // divides the line; the formatter's 4:2:0 line buffer per pipe.
         if u64::from(t.pixel_clock_khz)
-            > u64::from(disp_divider(odm, mode.ycbcr420)) * dispclk_ss_khz
+            > u64::from(disp_divider(odm, mode.encoding.is_420())) * dispclk_ss_khz
         {
             return Err(Error::PixelClock);
         }
-        let ppc = if mode.ycbcr420 { 2 } else { 1 };
+        let ppc = if mode.encoding.is_420() { 2 } else { 1 };
         let symmetric = odm != 3 || mode.dsc.is_some();
         let h_div = match odm {
             3 | 4 => 4,
@@ -1661,7 +1664,7 @@ impl Shape {
         };
         if (symmetric && t.h_active % (odm * ppc) != 0)
             || t.h_active % h_div != 0
-            || (mode.ycbcr420 && t.h_active > odm * FMT_420_BUFFER_WIDTH)
+            || (mode.encoding.is_420() && t.h_active > odm * FMT_420_BUFFER_WIDTH)
         {
             return Err(Error::Unsupported);
         }
@@ -1894,7 +1897,7 @@ impl Shape {
             dpps,
             det_bytes: 0,
             vblank: t.v_total - t.v_active,
-            ycbcr420: mode.ycbcr420,
+            ycbcr420: mode.encoding.is_420(),
             dsc_delay: mode.dsc.map_or(0, |d| dsc_delay(&t, d, odm)),
             plane,
             y,
@@ -2789,10 +2792,18 @@ impl Policy {
 /// width against OTG_H_TIMING_DIV_MODE, leaving the other boundaries a
 /// TODO; Linux plans such a stream.
 pub fn admit_native(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
+    if modes.iter().any(|m| {
+        !m.encoding.is_rgb() && !m.hdmi
+            || m.encoding.is_422()
+                && ((m.timing.h_active | m.timing.h_total.saturating_sub(m.timing.h_active)) & 1
+                    != 0)
+    }) {
+        return Err(Error::Unsupported);
+    }
     let plans = admit_all(soc, modes)?;
     if plans
         .iter()
-        .any(|p| !odm_timing_ok(&p.mode.timing, u32::from(p.pipes), p.mode.ycbcr420))
+        .any(|p| !odm_timing_ok(&p.mode.timing, u32::from(p.pipes), p.mode.encoding.is_420()))
     {
         return Err(Error::Unsupported);
     }
@@ -2915,7 +2926,7 @@ fn optimize_vmin(
     mut shapes: Vec<Shape>,
     mut supported: impl FnMut(&mut [Shape]) -> bool,
 ) -> Vec<Shape> {
-    if modes.len() != 1 || modes[0].hdmi || modes[0].ycbcr420 {
+    if modes.len() != 1 || modes[0].hdmi || modes[0].encoding.is_420() {
         return shapes;
     }
     let timing = &modes[0].timing;

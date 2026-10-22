@@ -151,7 +151,7 @@ int main(int argc, char **argv)
 		t->bpc = 8;
 		t->vblank_nom = a[6] - a[5];
 		t->drr_config.disallowed = true;
-		s->output.output_format = getenv("FMT420") ? dml2_420 : dml2_444;
+		s->output.output_format = getenv("FMT422") ? dml2_s422 : getenv("FMT420") ? dml2_420 : dml2_444;
 		/* populate_dml21_output_config_from_stream_state: dml2_dp2p0 for a
 		 * stream on an HPO (128b/132b) encoder. */
 		s->output.output_encoder = getenv("HDMIFRL") ? dml2_hdmifrl :

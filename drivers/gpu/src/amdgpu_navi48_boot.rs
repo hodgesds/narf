@@ -1051,25 +1051,51 @@ impl ColdBoot {
     /// # Safety
     /// CPU IRQ control and executor are initialized; continue to exclude all
     /// reset/PM transitions after transferring IH to its permanent service.
-    pub(crate) unsafe fn start_interrupt_service(&mut self) -> Result<(), Error> {
+    pub(crate) async unsafe fn start_interrupt_service(&mut self) -> Result<(), Error> {
         if self.state() != State::MemoryReady {
             return Err(Error::Busy);
         }
         let hardware = &mut self.sequence.backend;
-        // SAFETY: same retained objects and exclusive post-boot handoff.
-        unsafe {
-            crate::amdgpu_navi48_interrupts::install(
-                &mut hardware.ih,
-                &mut hardware.interrupt_route,
-                &mut hardware.faults,
-                hardware.gmc.as_mut().ok_or(Error::Invalid)?,
-            )
+        let thermal = crate::amdgpu_navi48_power::thermal::Monitor::new(
+            &hardware.gpu,
+            hardware.authority,
+            hardware.smu.as_ref().and_then(smu::Smu::limits),
+        );
+        let vupdate = crate::amdgpu_navi48_interrupts::vupdate::Monitor::new(
+            &hardware.gpu,
+            hardware.authority,
+        );
+        let allow_thermal = thermal.is_some();
+        let result = async {
+            // SAFETY: same retained objects and exclusive post-boot handoff.
+            unsafe {
+                crate::amdgpu_navi48_interrupts::install(
+                    &mut hardware.ih,
+                    &mut hardware.interrupt_route,
+                    &mut hardware.faults,
+                    hardware.gmc.as_mut().ok_or(Error::Invalid)?,
+                    thermal,
+                    vupdate,
+                )
+            }
+            .map_err(Error::Interrupts)?;
+            if allow_thermal {
+                hardware
+                    .smu
+                    .as_mut()
+                    .ok_or(Error::Invalid)?
+                    .allow_ih_interrupt()
+                    .await
+                    .map_err(Error::Smu)?;
+            }
+            Ok(())
         }
-        .map_err(|e| {
-            let error = Error::Interrupts(e);
+        .await;
+        if let Err(error) = result {
+            let _ = crate::amdgpu_navi48_interrupts::stop_for_reset().await;
             self.sequence.state = State::Failed(Stage::InterruptRings, error);
-            error
-        })
+        }
+        result
     }
     pub fn queue_state(&self) -> Option<queues::State> {
         self.sequence
@@ -1312,6 +1338,42 @@ impl ColdBoot {
         // SAFETY: matching retained owners and independent interrupt service;
         // the platform serializes all other accesses while this is pending.
         unsafe { queues.prove_interrupts(gmc).await }
+    }
+    /// # Safety
+    /// OWNER retains this device and every job VM/BO and excludes other
+    /// queue publishers/reset/PM until publication or discard.
+    pub(crate) unsafe fn prepare_client_gang(
+        &mut self,
+        jobs: [queues::Job; 2],
+    ) -> Result<queues::PreparedGang, queues::Error> {
+        if self.state() != State::MemoryReady || crate::amdgpu_navi48_interrupts::blocked() {
+            return Err(queues::Error::Busy);
+        }
+        let queues = self
+            .sequence
+            .backend
+            .queues
+            .as_mut()
+            .ok_or(queues::Error::Busy)?;
+        // SAFETY: caller retains the matching serialized queue/VM owners.
+        unsafe { queues.prepare_gang(jobs) }
+    }
+    /// # Safety
+    /// Same retained owner as prepare_client_gang. Both constituent jobs
+    /// already have durable VM/BO/VMID/watch receipts, including on failure.
+    pub(crate) unsafe fn publish_client_gang(
+        &mut self,
+        prepared: queues::PreparedGang,
+        leader: queues::Pipe,
+    ) -> Result<(), queues::Error> {
+        let queues = self
+            .sequence
+            .backend
+            .queues
+            .as_mut()
+            .ok_or(queues::Error::Busy)?;
+        // SAFETY: matching preparation, exclusion and durable receipts.
+        unsafe { queues.publish_gang(prepared, leader) }
     }
     /// Deterministic shader proof, after GC12/SDMA interrupt proofs and
     /// before any client work; the caller excludes all test-page users.
@@ -2835,7 +2897,7 @@ impl ColdBoot {
     /// for DRR while PMFW may switch UCLK (pin it first).
     /// # Safety
     /// As for `set_display_cursor`.
-    pub unsafe fn set_display_drr(
+    pub async unsafe fn set_display_drr(
         &mut self,
         pipe: u8,
         drr: Option<crate::amdgpu_freesync::Drr>,
@@ -2845,7 +2907,67 @@ impl ColdBoot {
             return Err(otg::Error::Busy);
         }
         // SAFETY: serialized retained owner; caller excludes writers.
-        unsafe { self.otg.as_mut().map_err(|e| *e)?.set_drr(pipe, drr) }
+        unsafe { self.otg.as_mut().map_err(|e| *e)?.set_drr(pipe, drr) }.await
+    }
+    /// Configure LFC from the admitted variable-refresh range. Nominal
+    /// DML and the pinned memory-clock contract remain unchanged.
+    /// # Safety
+    /// As for `set_display_cursor`.
+    pub async unsafe fn set_display_lfc(
+        &mut self,
+        pipe: u8,
+        config: Option<crate::amdgpu_freesync::LfcConfig>,
+    ) -> Result<(), otg::Error> {
+        if self.state() != State::MemoryReady || (config.is_some() && self.uclk_switching()) {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: serialized retained owner; caller excludes timing writers.
+        unsafe { self.otg.as_mut().map_err(|e| *e)?.set_lfc(pipe, config) }.await
+    }
+    /// Advance LFC only from a real observed frame transition.
+    /// # Safety
+    /// As for `set_display_cursor`; no cancelled display operation may be serviced.
+    pub unsafe fn display_lfc_progress(&mut self, pipe: u8, lost: bool) -> Result<(), otg::Error> {
+        if self.state() != State::MemoryReady || self.uclk_switching() {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: serialized retained owner; caller excludes timing writers.
+        unsafe { self.otg.as_mut().map_err(|e| *e)?.lfc_progress(pipe, lost) }
+    }
+    /// Apply a finite native MID-for-MAX sequence independently of BTR.
+    /// # Safety
+    /// As for `set_display_cursor`; keep UCLK pinned until DRR is disabled.
+    pub unsafe fn set_display_drr_mid(
+        &mut self,
+        pipe: u8,
+        mid: Option<otg::DrrMid>,
+    ) -> Result<(), otg::Error> {
+        if self.state() != State::MemoryReady || self.uclk_switching() {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: serialized retained owner; caller excludes timing writers.
+        unsafe { self.otg.as_mut().map_err(|e| *e)?.set_drr_mid(pipe, mid) }
+    }
+    /// Apply the live FreeSync timing and SPD under the same display owner.
+    /// # Safety
+    /// As for `set_display_cursor`.
+    pub async unsafe fn set_display_freesync(
+        &mut self,
+        pipe: u8,
+        drr: Option<crate::amdgpu_freesync::Drr>,
+        packet: crate::amdgpu_hdr::InfoPacket,
+    ) -> Result<Option<otg::DrrApplied>, otg::Error> {
+        if self.state() != State::MemoryReady || (drr.is_some() && self.uclk_switching()) {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: serialized retained owner; caller excludes writers.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .set_freesync(pipe, drr, packet)
+        }
+        .await
     }
     /// Set display `pipe`'s CRTC color: a live scanout is reprogrammed at
     /// once (no modeset), otherwise its next scanout start programs it.
@@ -4072,15 +4194,17 @@ mod teardown;
 pub use modeset::{
     beside_pipes, broadcast_rgb, connector_max_bpc, dc_state, display_pipes, edid_timings,
     frl_audio, frl_cap, frl_carries, frl_dsc, frl_dsc_caps, frl_dsc_carries, frl_dsc_link,
-    frl_enabled, frl_link, frl_video_params, hdmi_avi, hdmi_caps, hdmi_stream, head_pipes,
-    light_pipes, limited_range, live_pipes, max_bpc, output_color, plan_pipes, plane_format,
-    plane_mode, plane_requests, plane_setup, requested_bpc, selection_mode, set_broadcast_rgb,
-    set_crtc_color, set_frl, set_max_bpc, set_output_color, set_plane_format, set_plane_setup,
-    set_requested_bpc, sink_audio_info, stream_planes, with_planes, BesideRefusal, Configuration,
-    DisplayPipes, DrmPlaneState, FirstFrames, FrlDscStream, FrlRate, HdmiCaps, HdmiStream, Health,
-    InheritedRetired, Modeset, ModesetError, MstRoute, MstStream, OverlayPlane, PlaneGeometry,
-    PlanePipes, PlaneSetup, PlanesChange, Selection, SstOutput, StreamPipes, BROADCAST_RGB_AUTO,
-    BROADCAST_RGB_FULL, BROADCAST_RGB_LIMITED, MAX_REQUESTED_BPC, MIN_REQUESTED_BPC,
+    frl_enabled, frl_link, frl_video_params, frl_video_params_in, hdmi_avi, hdmi_candidates,
+    hdmi_caps, hdmi_stream, head_pipes, light_pipes, limited_range, live_pipes, max_bpc,
+    output_color, plan_pipes, plane_format, plane_mode, plane_requests, plane_setup, requested_bpc,
+    requested_color_format, selection_mode, set_broadcast_rgb, set_crtc_color, set_frl,
+    set_max_bpc, set_output_color, set_plane_format, set_plane_setup, set_requested_bpc,
+    set_requested_color_format, sink_audio_info, stream_planes, with_planes, BesideRefusal,
+    Configuration, DisplayPipes, DrmPlaneState, FirstFrames, FrlDscStream, FrlRate, HdmiCaps,
+    HdmiStream, Health, InheritedRetired, Modeset, ModesetError, MstRoute, MstStream, OverlayPlane,
+    PlaneGeometry, PlanePipes, PlaneSetup, PlanesChange, Selection, SstOutput, StreamPipes,
+    BROADCAST_RGB_AUTO, BROADCAST_RGB_FULL, BROADCAST_RGB_LIMITED, MAX_REQUESTED_BPC,
+    MIN_REQUESTED_BPC,
 };
 pub use teardown::{TeardownStatus, TeardownStep};
 #[cfg(feature = "kernel-test")]

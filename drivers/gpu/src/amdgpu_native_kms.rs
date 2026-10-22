@@ -164,6 +164,7 @@ pub struct CrtcColorRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectorColorRequest {
     pub connector: u32,
+    pub color_format: crate::amdgpu_hdr::ColorFormat,
     pub colorspace: u32,
     pub hdr_output_metadata: Option<alloc::vec::Vec<u8>>,
 }
@@ -189,6 +190,31 @@ pub fn request_connector_max_bpc(connector: u32, bpc: u8) {
 /// `hdr`, HDR metadata (Navi48; Navi22 attaches neither property).
 pub fn connector_color_supported(connector: u32, colorspace: u32, hdr: bool) -> bool {
     navi22() || crate::amdgpu_navi48_platform::connector_color_supported(connector, colorspace, hdr)
+}
+/// One prospective native HDMI output in an atomic check. The plane
+/// setup and exact mode are carried by value; checking never stages state.
+#[derive(Clone, Copy, Debug)]
+pub struct OutputFormatRequest {
+    pub display: u8,
+    pub connector: u32,
+    pub color_format: crate::amdgpu_hdr::ColorFormat,
+    pub mode: Option<crate::drm::ioctl::DrmModeModeInfo>,
+    pub max_bpc: Option<u8>,
+    pub planes: Option<(u32, crate::amdgpu_navi48_boot::PlaneSetup)>,
+}
+/// Prospective connector routing (including unchanged native outputs) for
+/// joint admission. DP/MST uses its observed link/DSC reservation; a new
+/// unobserved link configuration is refused here.
+#[derive(Clone, Copy, Debug)]
+pub struct OutputRoute {
+    pub display: u8,
+    pub connector: u32,
+    pub mode: Option<crate::drm::ioctl::DrmModeModeInfo>,
+    pub planes: Option<(u32, crate::amdgpu_navi48_boot::PlaneSetup)>,
+}
+pub fn output_formats_supported(requests: &[OutputFormatRequest], routes: &[OutputRoute]) -> bool {
+    requests.is_empty()
+        || !navi22() && crate::amdgpu_navi48_platform::output_formats_supported(requests, routes)
 }
 /// Whether an HDR_OUTPUT_METADATA blob builds an HDR infoframe
 /// (amdgpu_dm_fill_hdr_info_packet succeeds).

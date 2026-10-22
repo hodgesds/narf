@@ -384,7 +384,15 @@ pub fn parse(
                 // SAFETY: as above.
                 let words = unsafe { read_dwords(chunk_data, length_dw, 64)? };
                 let ib = parse_ib(&words, vm)?;
-                if ibs.len() >= max_ibs(ib.ip_type) {
+                if ibs
+                    .iter()
+                    .filter(|old| {
+                        (old.ip_type, old.ip_instance, old.ring)
+                            == (ib.ip_type, ib.ip_instance, ib.ring)
+                    })
+                    .count()
+                    >= max_ibs(ib.ip_type)
+                {
                     return Err(FsError::InvalidData);
                 }
                 ibs.push(ib);
@@ -503,11 +511,23 @@ pub trait Submitter: Send + Sync {
         submission: &'a Submission,
         health: &'a Arc<crate::amdgpu_ctx::Health>,
     ) -> Pin<Box<dyn Future<Output = Result<u64, FsError>> + Send + 'a>>;
+    /// Refuse unsupported entity combinations before dependency waits or BO
+    /// placement changes; actual submission rechecks its live admission.
+    fn validate_submission(&self, _submission: &Submission) -> Result<(), FsError> {
+        Ok(())
+    }
     /// Whether job `ticket` has ended — completed, or given up on with an
     /// [`error`](Self::error) — without waiting or blocking on an async
     /// owner (job fences in syncobjs ask this). Memory the job may reach is
     /// released by [`retire`] alone, on true completion.
     fn signalled(&self, ticket: u64) -> bool;
+    /// Whether hardware completion (or an owned reset receipt) permits
+    /// memory/PTE retirement. An API error signal alone is insufficient.
+    /// Backends which acknowledge failed jobs before hardware stops must
+    /// override this with their independent physical completion witness.
+    fn retired(&self, ticket: u64) -> bool {
+        self.signalled(ticket) && self.error(ticket).is_none()
+    }
     /// How job `ticket` ended if not by completing: `TimedOut` when it hung
     /// its ring, `Canceled` when it was abandoned behind such a job.
     fn error(&self, _ticket: u64) -> Option<FsError> {
@@ -956,6 +976,7 @@ pub async fn dispatch_async(
     crate::amdgpu_gem::ensure_placement_live(card)?;
     let started = narf_time::monotonic_ns();
     let (submission, bo_list_handle) = validated(arg, vm, ctx)?;
+    engine.validate_submission(&submission)?;
     // amdgpu_ctx_get_entity: a context whose job hung or was canceled
     // fails every later submission with that error.
     let health = ctx.health(submission.ctx_id).ok_or(FsError::InvalidData)?;

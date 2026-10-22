@@ -27,20 +27,39 @@ pub(super) fn dark_modes(
         if out.len() == MAX_MODES {
             break;
         }
-        let Ok(candidate) = select(paths, core::slice::from_ref(port), max_bpc, Some(timing))
-        else {
-            continue;
+        let formats: &[_] = if port.path.connector == inventory::Connector::HdmiTypeA {
+            &[
+                crate::amdgpu_hdr::ColorFormat::Auto,
+                crate::amdgpu_hdr::ColorFormat::Ycbcr444,
+                crate::amdgpu_hdr::ColorFormat::Ycbcr422,
+            ]
+        } else {
+            &[crate::amdgpu_hdr::ColorFormat::Auto]
         };
-        // select may fall back to preferred; admission must describe this mode.
-        if candidate.timing != timing
-            || (candidate.frl.is_some() && lit.iter().any(|s| s.frl.is_some()))
-        {
-            continue;
-        }
-        let mut joint = lit.to_vec();
-        joint.push(candidate);
-        let fixed: Vec<_> = (0..joint.len()).map(|k| k < lit.len()).collect();
-        if admit_selection_candidates(soc, &joint, &fixed).is_some() {
+        let accepted = formats.iter().any(|&requested| {
+            let Ok(candidates) = select_all_for_format(
+                paths,
+                core::slice::from_ref(port),
+                max_bpc,
+                &|_| Some(timing),
+                &|_| requested,
+            ) else {
+                return false;
+            };
+            let Some(candidate) = candidates.into_iter().next() else {
+                return false;
+            };
+            if candidate.timing != timing
+                || candidate.frl.is_some() && lit.iter().any(|s| s.frl.is_some())
+            {
+                return false;
+            }
+            let mut joint = lit.to_vec();
+            joint.push(candidate);
+            let fixed: Vec<_> = (0..joint.len()).map(|k| k < lit.len()).collect();
+            admit_selection_candidates(soc, &joint, &fixed).is_some()
+        });
+        if accepted {
             out.push(timing);
         }
     }
@@ -83,12 +102,15 @@ impl ColdBoot {
                         dark_modes(soc, paths, port, max_bpc(), &selections)
                     })
                 };
-                let vrr_capable = path.connector == inventory::Connector::DisplayPort
-                    && sink
+                let vrr_capable = match path.connector {
+                    inventory::Connector::DisplayPort => sink
                         .dpcd
                         .as_ref()
-                        .and_then(|d| crate::amdgpu_freesync::dp_sst_caps(&sink.edid, d))
-                        .is_some();
+                        .and_then(|d| crate::amdgpu_freesync::dp_sst_caps(&sink.edid, d)),
+                    inventory::Connector::HdmiTypeA => sink.hdmi_vrr_range(),
+                    _ => None,
+                }
+                .is_some();
                 Some(SstOutput {
                     port: index,
                     edid: sink.edid.clone(),

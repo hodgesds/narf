@@ -1291,6 +1291,28 @@ fn dcn401_uhbr_stream_sends_vsc_and_hdr_sdps_like_linux() -> TestResult {
         .position(|&(at, v)| at == hpo(stream, 0x3685) && v & 1 != 0)
         .unwrap();
     assert!(last_packet < unblank);
+    e.io.inner.writes.clear();
+    let pipe = e
+        .status
+        .uhbr_video_running
+        .unwrap()
+        .timing
+        .blank
+        .request
+        .pipe;
+    let expected = run(crate::amdgpu_dcn401_otg::freesync::packet_cycle(
+        &mut e, pipe,
+    ));
+    let actual: Vec<u32> =
+        e.io.inner
+            .writes
+            .iter()
+            .filter(|&&(at, _)| at == hpo(stream, 0x3652))
+            .map(|&(_, v)| v)
+            .collect();
+    assert_eq!(actual, expected);
+    assert_eq!(r(&e, 0x366e) & 1, 0);
+    assert_eq!(r(&e, 0x366f) & 1, 1);
     // Live metadata: packet 3 only.
     let mut blob2 = blob;
     blob2[26] = 0x55;

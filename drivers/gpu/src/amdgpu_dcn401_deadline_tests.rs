@@ -38,7 +38,7 @@ fn plan() -> dml::Plan {
             timing: timing(),
             pitch: 1920,
             bytes_per_pixel: 4,
-            ycbcr420: false,
+            encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
             dsc: None,
             planes: [None; dml::MAX_PLANES],
         },
@@ -99,7 +99,7 @@ fn owners(plan: &dml::Plan, pipe: u8) -> (Request, RequestorApplied, dccg::Appli
         timing: plan.mode.timing,
         sync: plan.sync,
         signal: Signal::DisplayPort,
-        ycbcr420: false,
+        encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
         dsc: None,
         odm: SplitPipes::NONE,
     };
@@ -286,7 +286,7 @@ fn dcn401_deadlines_bind_only_the_admitted_owners() -> TestResult {
             // FRL timing has no deadline owner yet (HPO DP now does).
             Request {
                 signal: Signal::HdmiFrl,
-                ycbcr420: false,
+                encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
                 ..timing
             },
             requestor,
@@ -748,7 +748,7 @@ fn dcn401_deadlines_program_each_split_pipe_its_mcaches() -> TestResult {
         },
         pitch: u32::from(plane.pitch),
         bytes_per_pixel: 4,
-        ycbcr420: false,
+        encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
         dsc: None,
         planes: [Some(plane), None, None, None],
     };
@@ -845,4 +845,30 @@ fn dcn401_deadlines_bind_hdmi_transport_including_frl() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-deadline",
     dcn401_deadlines_bind_hdmi_transport_including_frl
+);
+
+fn dcn401_deadlines_bind_exact_output_encoding() -> TestResult {
+    use crate::amdgpu_hdr::PixelEncoding as E;
+    for encoding in [E::Rgb, E::Ycbcr422, E::Ycbcr444] {
+        let mut mode = self::plan().mode;
+        mode.hdmi = true;
+        mode.encoding = encoding;
+        let plan = dml::admit(&soc(), &mode).unwrap();
+        let (mut timing, requestor, clock) = owners(&plan, 0);
+        timing.signal = Signal::Tmds;
+        timing.encoding = encoding;
+        assert!(bound(&plan, timing, requestor, clock, 50_000));
+        for other in [E::Rgb, E::Ycbcr422, E::Ycbcr444]
+            .into_iter()
+            .filter(|other| *other != encoding)
+        {
+            timing.encoding = other;
+            assert!(!bound(&plan, timing, requestor, clock, 50_000));
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-deadline",
+    dcn401_deadlines_bind_exact_output_encoding
 );

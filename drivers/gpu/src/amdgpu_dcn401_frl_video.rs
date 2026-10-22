@@ -149,12 +149,14 @@ impl<I: Io> Engine<I> {
         self.verify_blank_source(blank, plan, running, true, false)
     }
     /// hpo_enc401_set_hdmi_stream_attribute and set_dsc_config(NULL):
-    /// uncompressed RGB or 4:2:0. The DTO keeps the full pixel rate;
+    /// uncompressed RGB/444/422/420. The DTO keeps the full pixel rate;
     /// subsampled active/blank widths count pixel pairs in the encoder. A
     /// compressed stream's GCP carries no depth.
     fn frl_format_registers(blank: BlankApplied) -> [(u64, u32, u32); 3] {
         let t = blank.timing.request.timing;
-        let y420 = u32::from(blank.request.ycbcr420);
+        let encoding = blank.request.encoding;
+        let y420 = u32::from(encoding.is_420());
+        let pairs = u32::from(encoding.subsampled());
         let (depth, deep) = match blank.request.depth {
             _ if blank.timing.request.dsc.is_some() => (0, 0),
             ColorDepth::Bpc8 => (0, 0),
@@ -162,12 +164,18 @@ impl<I: Io> Engine<I> {
             ColorDepth::Bpc12 => (2, 1),
         };
         [
-            (PIXEL_FORMAT, 0x303_0301, y420 << 17 | depth << 8 | deep),
+            (
+                PIXEL_FORMAT,
+                0x303_0301,
+                encoding.hardware_format() << 16
+                    | depth << 8
+                    | if encoding.is_422() { 0 } else { deep },
+            ),
             (FIFO, 0x11100, y420 << 12),
             (
                 H_ACTIVE_BLANK,
                 u32::MAX,
-                (t.h_active >> y420) | ((t.h_total - t.h_active) >> y420) << 16,
+                (t.h_active >> pairs) | ((t.h_total - t.h_active) >> pairs) << 16,
             ),
         ]
     }
@@ -283,7 +291,11 @@ impl<I: Io> Engine<I> {
     /// hpo_enc401_update_hdmi_info_packet for a valid packet: VPG4's
     /// generic packet `index` written and latched immediately
     /// (vpg3_update_generic_info_packet), then sent every frame on line 2.
-    async fn frl_vpg_packet(&mut self, index: u32, packet: &[u8; 36]) -> Result<(), Error> {
+    pub(in crate::amdgpu_dcn401_otg) async fn frl_vpg_packet(
+        &mut self,
+        index: u32,
+        packet: &[u8; 36],
+    ) -> Result<(), Error> {
         let base = self.layout.mpc_base;
         self.wait(self.frl_at(VPG_STATUS), 2, 0, 500).await?;
         self.access(|io| {
@@ -321,7 +333,7 @@ impl<I: Io> Engine<I> {
             &t,
             request.avi,
             blank.request.colorspace,
-            blank.request.ycbcr420,
+            blank.request.encoding,
         );
         let vendor = vendor_infoframe(&t, request.avi);
         let hdr = request.hdr.filter(|p| p.valid).map(|p| p.bytes());

@@ -100,6 +100,8 @@ impl<I: Io> Engine<I> {
             self.state,
             State::InterruptVerified
                 | State::IbVerified
+                | State::Hevc10Verified
+                | State::HevcVerified
                 | State::DecodeVerified
                 | State::EncodeVerified
         ) {

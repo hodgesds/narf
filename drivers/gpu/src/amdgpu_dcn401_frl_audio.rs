@@ -3,7 +3,7 @@
 //! Linux: hpo_enc401_setup_hdmi_audio + afmt3_setup_hdmi_audio. AFMT4 has
 //! no DIO AFMT_CNTL clock; afmt3 clears MEM_PWR_FORCE during source setup.
 use super::*;
-use crate::amdgpu_navi48_boot::{frl_audio, frl_video_params, FrlDscStream, FrlRate};
+use crate::amdgpu_navi48_boot::{frl_audio, frl_video_params_in, FrlDscStream, FrlRate};
 
 const FRL_ACR: u64 = 0x8e2;
 const FRL_INFO: u64 = 0x8e3;
@@ -78,10 +78,10 @@ impl<I: Io> Engine<I> {
                     hdmi: v.request.avi.hdmi_vic,
                 },
             });
-        let Some(params) = frl_video_params(
+        let Some(params) = frl_video_params_in(
             &t,
             bpc,
-            blank.request.ycbcr420,
+            blank.request.encoding,
             dsc,
             rate,
             frl_audio(Some(info), t.v_active),

@@ -192,6 +192,9 @@ fn port(path: inventory::Path, dpcd: Option<[u8; 16]>, edid: Vec<u8>) -> display
             dsc: None,
             dprx_feature: 0,
             verified_link: None,
+            amd_vsdb: None,
+            generation: 0,
+            mccs: None,
         }),
     }
 }
@@ -1114,16 +1117,89 @@ fn navi48_modeset_picks_ycbcr420_like_amdgpu() -> TestResult {
     let paths = [path(inventory::Connector::HdmiTypeA, 0)];
     let ports = [port(paths[0], None, edid.clone())];
     match select(&paths, &ports, 8, Some(p2160_60)) {
-        Ok(s) if s.ycbcr420 && s.hdmi && s.depth == Bpc8 && s.avi.vic == 97 => {}
+        Ok(s) if s.encoding.is_420() && s.hdmi && s.depth == Bpc8 && s.avi.vic == 97 => {}
         _ => return TestResult::Fail("4:2:0 selection"),
     }
-    if !selection_mode(&select(&paths, &ports, 8, Some(p2160_60)).unwrap()).ycbcr420
-        || select(&paths, &ports, 8, None).is_ok_and(|s| s.ycbcr420)
+    if !selection_mode(&select(&paths, &ports, 8, Some(p2160_60)).unwrap())
+        .encoding
+        .is_420()
+        || select(&paths, &ports, 8, None).is_ok_and(|s| s.encoding.is_420())
     {
         return TestResult::Fail("4:2:0 admission mode");
     }
     TestResult::Pass
 }
+
+/// HDMI Forum deep-color flags apply to 4:2:0 independently of RGB, and
+/// the halved pixel rate still pays the selected depth's TMDS ratio.
+fn navi48_tmds_420_deep_color_obeys_sink_and_character_limits() -> TestResult {
+    use otg::ColorDepth::{Bpc10, Bpc12, Bpc8};
+    let edid = edid_y420();
+    let t = edid_timings(&edid)
+        .into_iter()
+        .find(|t| (t.pixel_clock_khz, t.h_active, t.h_total) == (594_000, 3840, 4400))
+        .unwrap();
+    let mut caps = hdmi_caps(&edid);
+    caps.y420_only[usize::from(97u8 / 64)] |= 1 << (97 % 64);
+    caps.dc30 = false;
+    caps.dc36 = false;
+    caps.dc30_420 = true;
+    caps.dc36_420 = true;
+    caps.vsdb_max_khz = 600_000;
+    caps.forum_max_khz = 600_000;
+    caps.scdc = true;
+    for (max, expected) in [(12, Bpc12), (10, Bpc10), (8, Bpc8)] {
+        if hdmi_format(caps, &t, max) != Some((expected, true)) {
+            return TestResult::Fail("TMDS420 ignored independent deep-color caps or max bpc");
+        }
+    }
+    if hdmi_format(
+        HdmiCaps {
+            dc36_420: false,
+            ..caps
+        },
+        &t,
+        12,
+    ) != Some((Bpc10, true))
+        || hdmi_format(
+            HdmiCaps {
+                dc30_420: false,
+                dc36_420: false,
+                ..caps
+            },
+            &t,
+            12,
+        ) != Some((Bpc8, true))
+    {
+        return TestResult::Fail("TMDS420 used undeclared deep color");
+    }
+    // 12 bpc needs445.5MHz, 10bpc371.25MHz. Without SCDC, both
+    // must fall back to the297MHz 8bpc transport.
+    if hdmi_format(
+        HdmiCaps {
+            scdc: false,
+            ..caps
+        },
+        &t,
+        12,
+    ) != Some((Bpc8, true))
+        || hdmi_format(
+            HdmiCaps {
+                forum_max_khz: 400_000,
+                ..caps
+            },
+            &t,
+            12,
+        ) != Some((Bpc10, true))
+    {
+        return TestResult::Fail("TMDS420 deep color bypassed the character-rate limit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_tmds_420_deep_color_obeys_sink_and_character_limits
+);
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_modeset_picks_ycbcr420_like_amdgpu
@@ -1149,6 +1225,9 @@ fn navi48_modeset_decides_uhbr_like_linux() -> TestResult {
             dsc: None,
             dprx_feature: 0,
             verified_link: None,
+            amd_vsdb: None,
+            generation: 0,
+            mccs: None,
         };
         dp_caps(&p, &sink).unwrap().uhbr
     };
@@ -1265,6 +1344,9 @@ fn navi48_modeset_decides_uhbr_like_linux() -> TestResult {
         dsc: None,
         dprx_feature: 0,
         verified_link: None,
+        amd_vsdb: None,
+        generation: 0,
+        mccs: None,
     };
     let port = display::Port {
         path: p,
@@ -1447,6 +1529,9 @@ fn navi48_modeset_decides_dsc_like_linux() -> TestResult {
         dsc,
         dprx_feature: 0,
         verified_link: None,
+        amd_vsdb: None,
+        generation: 0,
+        mccs: None,
     };
     let pick = |s: display::Sink| {
         select(
@@ -2024,7 +2109,7 @@ fn navi48_frl_420_caps_rates_and_selection() -> TestResult {
     let chosen = select(&paths, &ports, 12, Some(t));
     set_frl(enabled);
     let s = chosen.unwrap();
-    assert!(s.hdmi && s.ycbcr420 && s.audio.is_none());
+    assert!(s.hdmi && s.encoding.is_420() && s.audio.is_none());
     assert_eq!(s.depth, Bpc12);
     assert_eq!(s.frl, Some(cap));
     let soc = dml::Soc {
@@ -2039,9 +2124,9 @@ fn navi48_frl_420_caps_rates_and_selection() -> TestResult {
         dchub_refclk_khz: 50_000,
     };
     let plan = dml::admit(&soc, &selection_mode(&s)).unwrap();
-    assert!(plan.mode.ycbcr420);
+    assert!(plan.mode.encoding.is_420());
     assert_eq!(timing_request(0, &plan, &s).signal, otg::Signal::HdmiFrl);
-    assert!(timing_request(0, &plan, &s).ycbcr420);
+    assert!(timing_request(0, &plan, &s).encoding.is_420());
     assert_eq!(
         pipe_clock_request(0, &plan, &s).pixel,
         dccg::PixelClock::HdmiFrl {
@@ -2198,6 +2283,9 @@ fn navi48_dsc_link_verification_reselects_compressed_geometry() -> TestResult {
         dsc: Some(DSC),
         dprx_feature: 0,
         verified_link: None,
+        amd_vsdb: None,
+        generation: 0,
+        mccs: None,
     };
     let ports = || {
         alloc::vec![display::Port {
@@ -2802,6 +2890,9 @@ fn navi48_modeset_selects_dsc_over_uhbr() -> TestResult {
         dsc: Some(UHBR_DSC),
         dprx_feature: 0,
         verified_link: None,
+        amd_vsdb: None,
+        generation: 0,
+        mccs: None,
     };
     let port = display::Port {
         path: p,
@@ -2932,14 +3023,14 @@ fn navi48_selection_maps_colorspace_and_hdr_like_amdgpu_dm() -> TestResult {
         let sel = Selection {
             colorspace,
             limited,
-            ycbcr420,
+            encoding: crate::amdgpu_hdr::PixelEncoding::from_420(ycbcr420),
             ..s
         };
         let b = sel.blank_request(2);
         if sel.color_space() != cs
             || b.colorspace != cs
             || b.limited != matches!(cs, C::SrgbLimited | C::Rgb2020Limited)
-            || b.ycbcr420 != ycbcr420
+            || b.encoding.is_420() != ycbcr420
         {
             return TestResult::Fail("output color space");
         }
@@ -3291,7 +3382,7 @@ fn navi48_hdmi_frl_dsc_policy_matches_linux() -> TestResult {
     let got = stream(caps, &t, 8, cap).unwrap();
     let cfg = got.dsc.unwrap();
     if got.depth != otg::ColorDepth::Bpc8
-        || got.ycbcr420
+        || got.encoding.is_420()
         || got.frl.map(FrlRate::code) != Some(3)
         || (cfg.slices_h, cfg.slices_v, cfg.bpp_x16) != (8, 40, 159)
         || cfg.frl
@@ -3356,7 +3447,7 @@ fn navi48_hdmi_frl_dsc_policy_matches_linux() -> TestResult {
         stream(deep, &t, 10, cap).map(|s| (s.depth, s.dsc.map(|c| c.bpc), s.frl)),
         stream(no_rate, &t, 8, cap),
         stream(no_dsc, &t, 8, cap),
-        stream(also_420, &t, 8, cap).map(|s| (s.ycbcr420, s.dsc.is_some())),
+        stream(also_420, &t, 8, cap).map(|s| (s.encoding.is_420(), s.dsc.is_some())),
         stream(
             HdmiCaps {
                 dsc: None,
@@ -3366,7 +3457,13 @@ fn navi48_hdmi_frl_dsc_policy_matches_linux() -> TestResult {
             8,
             cap,
         )
-        .map(|s| (s.ycbcr420, s.dsc.is_some(), s.frl.map(FrlRate::code))),
+        .map(|s| {
+            (
+                s.encoding.is_420(),
+                s.dsc.is_some(),
+                s.frl.map(FrlRate::code),
+            )
+        }),
         stream(slow, &t, 8, frl_cap(slow)),
     );
     let deep8 = stream(deep_dsc8, &t, 10, cap).map(|s| (s.depth, s.dsc.map(|c| c.bpc)));
@@ -5073,4 +5170,150 @@ fn navi48_dsc_offered_modes_preserve_plane_topology() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_dsc_offered_modes_preserve_plane_topology
+);
+
+/// The connector property pins encoding, not just a provisional helper:
+/// CTA422 allows deep stream samples without VSDB deep-color bits; 444
+/// deep color requires DC_Y444, and AUTO keeps RGB/420 policy.
+fn navi48_hdmi_color_format_caps_depth_policy_and_final_admission() -> TestResult {
+    use crate::amdgpu_hdr::{ColorFormat as F, PixelEncoding as E};
+    use otg::ColorDepth::{Bpc10, Bpc12, Bpc8};
+    let mut edid = with_blocks(edid_1080p(), &[VSDB, HF_VSDB]);
+    edid[128 + 3] = 0x30;
+    edid[255] = 0;
+    edid[255] = narf_edid::compute_checksum(&edid[128..]);
+    let caps = hdmi_caps(&edid);
+    assert!(caps.ycbcr422 && caps.ycbcr444 && !caps.dc30 && !caps.dc36 && !caps.dc_y444);
+    let t = completed_modeset(0).selection.timing;
+    let candidates = |caps, t: &Timing, max, requested| {
+        hdmi_candidates(caps, t, max, None, None, 2_000_000, requested)
+    };
+    assert_eq!(candidates(caps, &t, 12, F::Ycbcr422)[0].depth, Bpc12);
+    assert_eq!(candidates(caps, &t, 10, F::Ycbcr422)[0].depth, Bpc10);
+    assert_eq!(candidates(caps, &t, 8, F::Ycbcr422)[0].depth, Bpc8);
+    assert_eq!(candidates(caps, &t, 12, F::Ycbcr444)[0].depth, Bpc8);
+    let deep_rgb = HdmiCaps {
+        dc30: true,
+        dc36: true,
+        ..caps
+    };
+    assert_eq!(candidates(deep_rgb, &t, 12, F::Ycbcr444)[0].depth, Bpc8);
+    assert_eq!(
+        candidates(
+            HdmiCaps {
+                dc_y444: true,
+                ..deep_rgb
+            },
+            &t,
+            12,
+            F::Ycbcr444
+        )[0]
+        .depth,
+        Bpc12
+    );
+    assert!(candidates(
+        HdmiCaps {
+            ycbcr422: false,
+            ..caps
+        },
+        &t,
+        12,
+        F::Ycbcr422
+    )
+    .is_empty());
+    assert!(candidates(
+        HdmiCaps {
+            ycbcr444: false,
+            ..caps
+        },
+        &t,
+        12,
+        F::Ycbcr444
+    )
+    .is_empty());
+    let uhd = crate::amdgpu_dcn_display::timing_from_edid(
+        &narf_edid::modes::cea_mode(97).unwrap().detailed(),
+    )
+    .unwrap();
+    assert_eq!(candidates(caps, &uhd, 12, F::Ycbcr422)[0].depth, Bpc12);
+    assert_eq!(candidates(deep_rgb, &uhd, 12, F::Ycbcr444)[0].depth, Bpc8);
+    let mut only420 = caps;
+    only420.y420_only[1] = 1 << (97 - 64);
+    for f in [F::Rgb, F::Ycbcr444, F::Ycbcr422] {
+        assert!(candidates(only420, &uhd, 12, f).is_empty());
+    }
+    assert!(candidates(only420, &uhd, 12, F::Auto)
+        .iter()
+        .all(|c| c.encoding == E::Ycbcr420));
+    let paths = [path(inventory::Connector::HdmiTypeA, 0)];
+    let ports = [port(paths[0], None, edid)];
+    let s = select_all_for_format(&paths, &ports, 12, &|_| None, &|_| F::Ycbcr422).unwrap()[0];
+    assert_eq!(
+        (s.color_format, s.encoding, s.depth),
+        (F::Ycbcr422, E::Ycbcr422, Bpc12)
+    );
+    assert_eq!(s.color_space(), crate::amdgpu_hdr::DcColorSpace::Ycbcr709);
+    let mut limited = s;
+    limited.limited = true; // Broadcast RGB never limits YCbCr a second time.
+    assert!(!limited.blank_request(0).limited);
+    let soc = completed_modeset(0).plan.soc;
+    let chosen = admit_selection_candidates(&soc, &[s], &[]).unwrap().0;
+    assert!(chosen
+        .iter()
+        .all(|s| s.color_format == F::Ycbcr422 && s.encoding == E::Ycbcr422));
+    // A forced non-RGB encoding never reaches the RGB-only DSC programmer.
+    let mut mode = selection_mode(&s);
+    mode.dsc = Some(dml::Dsc {
+        slices: 4,
+        bpp_x16: 192,
+    });
+    assert!(admit_native_modes(&soc, &[mode]).is_err());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi48",
+    navi48_hdmi_color_format_caps_depth_policy_and_final_admission
+);
+
+fn navi48_modeset_hdmi_freesync_requires_parsed_vsdb_and_complete_range() -> TestResult {
+    let path = path(inventory::Connector::HdmiTypeA, 0);
+    let mut port = port(path, None, with_cta(edid_1080p(), true));
+    assert!(select(&[path], &[port.clone()], 8, None)
+        .unwrap()
+        .vrr
+        .is_none());
+    let vsdb = crate::amdgpu_freesync::AmdVsdb {
+        version: 3,
+        min_hz: 30,
+        max_hz: 60,
+        vcp_code: 0,
+    };
+    port.sink.as_mut().unwrap().amd_vsdb = Some(vsdb);
+    let selection = select(&[path], &[port.clone()], 8, None).unwrap();
+    assert_eq!(selection.vrr, vsdb.range());
+    assert!(selection.vrr_supported());
+    assert_eq!(
+        selection.drr(),
+        Some(crate::amdgpu_freesync::Drr {
+            v_total_min: 1125,
+            v_total_max: 2250
+        })
+    );
+    for rejected in [
+        crate::amdgpu_freesync::AmdVsdb {
+            vcp_code: 0xe0,
+            ..vsdb
+        },
+        crate::amdgpu_freesync::AmdVsdb { min_hz: 50, ..vsdb },
+    ] {
+        port.sink.as_mut().unwrap().amd_vsdb = Some(rejected);
+        let selection = select(&[path], &[port.clone()], 8, None).unwrap();
+        assert!(selection.vrr.is_none());
+        assert!(!selection.vrr_supported());
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_hdmi_freesync_requires_parsed_vsdb_and_complete_range
 );

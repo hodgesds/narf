@@ -421,7 +421,8 @@ impl PipePool {
     pub const fn fuses(self) -> u8 {
         self.fuses
     }
-    /// `pool->base.pipe_count` (also its timing generator and MPCC counts).
+    /// `pool->base.pipe_count` (also its timing generator count). The MPC
+    /// retains all four physical MPCCs, including those of fused pipes.
     pub const fn count(self) -> u8 {
         DCN401_PIPES as u8 - self.fuses.count_ones() as u8
     }
@@ -436,7 +437,8 @@ impl PipePool {
     /// The hardware instance of pipe `pipe`'s HUBP, DPP, OPP, OTG and MPCC.
     /// Indices past `count` continue over the fused instances in order, so
     /// the map is a permutation of 0..4 (the identity from 4 up); nothing
-    /// programs such a pipe.
+    /// programs such a pipe's fused blocks. Whole-MPC initialization still
+    /// reaches its MPCC selectors through these indices.
     pub const fn hw(self, pipe: u8) -> u8 {
         if pipe >= DCN401_PIPES as u8 {
             return pipe;

@@ -4,7 +4,11 @@ use crate::{
     amdgpu_dcn_inventory as inventory, amdgpu_ddc_navi48 as ddc, amdgpu_dmub_navi48 as dmub,
 };
 use alloc::vec::Vec;
-use core::future::Future;
+use core::{
+    future::Future,
+    sync::atomic::{AtomicU64, Ordering},
+};
+static NEXT_SINK_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 const MAX_EDID_BLOCKS: usize = 32;
 
@@ -67,6 +71,18 @@ pub struct Sink {
     /// every setting above it was refused. Never set by a probe; the display
     /// owner applies it while the same sink stays attached.
     pub verified_link: Option<(u8, u8)>,
+    pub amd_vsdb: Option<crate::amdgpu_freesync::AmdVsdb>,
+    /// Fresh MCCS discovery identity, never inherited by a replacement sink.
+    pub generation: u64,
+    pub mccs: Option<ddc::mccs::Negotiated>,
+}
+impl Sink {
+    pub fn hdmi_vrr_range(&self) -> Option<crate::amdgpu_freesync::VrrRange> {
+        let metadata = self.amd_vsdb?;
+        metadata
+            .range()
+            .or_else(|| self.mccs?.range(self.generation, metadata))
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Port {
@@ -76,6 +92,13 @@ pub struct Port {
 }
 
 trait Aux {
+    fn amd_vsdb(
+        &mut self,
+        _edid: &[u8],
+    ) -> impl Future<Output = Result<Option<crate::amdgpu_freesync::AmdVsdb>, dmub::Error>> + Send
+    {
+        async { Ok(None) }
+    }
     fn transfer(
         &mut self,
         instance: u8,
@@ -86,14 +109,36 @@ trait Aux {
     fn delay(&mut self) -> impl Future<Output = ()> + Send;
 }
 trait Hdmi {
+    fn mccs(
+        &mut self,
+        _channel: u8,
+        _generation: u64,
+        _metadata: crate::amdgpu_freesync::AmdVsdb,
+    ) -> impl Future<Output = Result<ddc::mccs::Negotiated, ddc::Error>> + Send {
+        async { Err(ddc::Error::MccsUnsupported) }
+    }
     fn edid(&mut self, channel: u8) -> impl Future<Output = Result<Vec<u8>, ddc::Error>> + Send;
 }
 impl Hdmi for ddc::Ddc {
+    async fn mccs(
+        &mut self,
+        channel: u8,
+        generation: u64,
+        metadata: crate::amdgpu_freesync::AmdVsdb,
+    ) -> Result<ddc::mccs::Negotiated, ddc::Error> {
+        self.mccs(channel, generation, metadata).await
+    }
     async fn edid(&mut self, channel: u8) -> Result<Vec<u8>, ddc::Error> {
         self.edid(channel).await
     }
 }
 impl Aux for dmub::Dmub {
+    async fn amd_vsdb(
+        &mut self,
+        edid: &[u8],
+    ) -> Result<Option<crate::amdgpu_freesync::AmdVsdb>, dmub::Error> {
+        self.amd_freesync_vsdb(edid).await
+    }
     async fn transfer(
         &mut self,
         instance: u8,
@@ -241,6 +286,9 @@ async fn read_sink(io: &mut impl Aux, instance: u8) -> Result<Sink, Error> {
         dsc,
         dprx_feature: dprx_feature[0],
         verified_link: None,
+        amd_vsdb: None,
+        generation: 0,
+        mccs: None,
     })
 }
 
@@ -321,20 +369,41 @@ impl Probe {
                     }
                     inventory::Connector::HdmiTypeA => {
                         let ddc = ddc.as_mut().ok_or(Error::Ddc(ddc::Error::Unsupported))?;
-                        ddc.edid(path.aux.unwrap())
-                            .await
-                            .map(|edid| Sink {
-                                dpcd: None,
-                                edid,
-                                lttpr: None,
-                                uhbr: 0,
-                                lttpr_uhbr: None,
-                                fec: false,
-                                dsc: None,
-                                dprx_feature: 0,
-                                verified_link: None,
-                            })
-                            .map_err(Error::Ddc)
+                        match ddc.edid(path.aux.unwrap()).await {
+                            Ok(edid) => {
+                                let amd_vsdb =
+                                    io.amd_vsdb(&edid).await.map_err(Error::Transport)?;
+                                let mut generation = 0;
+                                let mut mccs = None;
+                                if let Some(metadata) = amd_vsdb.filter(|v| v.vcp_code != 0) {
+                                    generation = NEXT_SINK_GENERATION
+                                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                                            v.checked_add(1)
+                                        })
+                                        .map_err(|_| Error::Busy)?;
+                                    match ddc.mccs(path.aux.unwrap(), generation, metadata).await {
+                                        Ok(proof) => mccs = Some(proof),
+                                        Err(e) if e.local() => {}
+                                        Err(e) => return Err(Error::Ddc(e)),
+                                    }
+                                }
+                                Ok(Sink {
+                                    dpcd: None,
+                                    edid,
+                                    lttpr: None,
+                                    uhbr: 0,
+                                    lttpr_uhbr: None,
+                                    fec: false,
+                                    dsc: None,
+                                    dprx_feature: 0,
+                                    verified_link: None,
+                                    amd_vsdb,
+                                    generation,
+                                    mccs,
+                                })
+                            }
+                            Err(error) => Err(Error::Ddc(error)),
+                        }
                     }
                     _ => continue,
                 };

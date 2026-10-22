@@ -10,8 +10,12 @@ use core::ops::Range;
 use narf_capabilities::{Cap, Read};
 use narf_graphics_driver::generic::GenericFb;
 use narf_lib::mutex::Mutex;
+#[path = "amdgpu_navi48_client_shader.rs"]
+mod client_shaders;
 #[path = "amdgpu_navi48_platform_recovery.rs"]
 mod fault_recovery;
+#[path = "amdgpu_navi48_gang.rs"]
+mod gangs;
 #[path = "amdgpu_navi48_platform_media.rs"]
 mod media_clients;
 #[path = "amdgpu_navi48_suspend_transition.rs"]
@@ -107,11 +111,17 @@ pub struct Diagnostics {
         Option<Result<crate::amdgpu_gfx12_queue::InterruptProof, crate::amdgpu_gfx12_queue::Error>>,
     pub shaders:
         Option<Result<crate::amdgpu_gfx12_shader::Proof, crate::amdgpu_gfx12_queue::Error>>,
+    pub client_shaders: Option<Result<client_shaders::Proof, narf_filesystem::FsError>>,
     pub media_transport: Option<Result<crate::amdgpu_vcn_navi48::InterruptProof, boot::Error>>,
     pub media_state: Option<crate::amdgpu_vcn_navi48::State>,
     pub media_ibs:
         Option<Result<crate::amdgpu_vcn_navi48::InterruptProof, crate::amdgpu_vcn_navi48::Error>>,
     pub media_decode:
+        Option<Result<crate::amdgpu_vcn_navi48::DecodeProof, crate::amdgpu_vcn_navi48::Error>>,
+    /// Original Main8 picture completion; codec rows remain gated separately.
+    pub media_hevc_decode:
+        Option<Result<crate::amdgpu_vcn_navi48::DecodeProof, crate::amdgpu_vcn_navi48::Error>>,
+    pub media_hevc10_decode:
         Option<Result<crate::amdgpu_vcn_navi48::DecodeProof, crate::amdgpu_vcn_navi48::Error>>,
     pub media_encode:
         Option<Result<crate::amdgpu_vcn_navi48::EncodeProof, crate::amdgpu_vcn_navi48::Error>>,
@@ -140,10 +150,13 @@ pub fn status() -> Status {
                 queue_state: boot.queue_state(),
                 queue_interrupts: boot.queue_interrupts(),
                 shaders: boot.shader_result(),
+                client_shaders: client_shaders::result(*READ_GENERATION.lock()),
                 media_transport: boot.media_result(),
                 media_state: boot.media_state(),
                 media_ibs: boot.media_ib_result(),
                 media_decode: boot.media_decode_result(),
+                media_hevc_decode: boot.media_hevc_decode_result(),
+                media_hevc10_decode: boot.media_hevc10_decode_result(),
                 media_encode: boot.media_encode_result(),
                 media_jpeg: boot.media_jpeg_result(),
                 media_jpeg_decode: boot.media_jpeg_decode_result(),
@@ -315,7 +328,7 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     let mut report = boot.run().await?;
     // SAFETY: final boot handoff has CPU IRQ/executor initialization and keeps
     // all device reset/PM access excluded. The service owns IH independently.
-    unsafe { boot.start_interrupt_service() }?;
+    unsafe { boot.start_interrupt_service() }.await?;
     if let Some(live) = crate::amdgpu_navi48_interrupts::status().and_then(|s| s.report) {
         report.interrupts = live;
     }
@@ -372,12 +385,18 @@ fn register_submitter(
                 CLIENT_VMIDS.1,
             )),
             watch: narf_lib::sync::IrqSafeSpinLock::new(watches),
+            gangs: narf_lib::sync::IrqSafeSpinLock::new(gangs::Ledger::new()),
             device_recovery: core::sync::atomic::AtomicBool::new(false),
         });
         *SUBMITTER.lock() = Some(submitter.clone());
         crate::amdgpu_info::publish_navi48_video(boot.proven_video());
         crate::amdgpu_cs::register_submitter(card, submitter.clone());
         narf_scheduler::spawn(watchdog(submitter));
+        if SHADER_PROOF.load(core::sync::atomic::Ordering::Acquire)
+            && matches!(boot.shader_result(), Some(Ok(_)))
+        {
+            narf_scheduler::spawn(client_shaders::prove());
+        }
     }
 }
 
@@ -1040,9 +1059,7 @@ async unsafe fn quiesce(
     };
     let old_submitter = SUBMITTER.lock().take();
     if let Some(s) = &old_submitter {
-        for w in s.watch.lock().iter_mut() {
-            w.stop();
-        }
+        s.stop_all();
     }
     if let Some(card) = boot::ColdBoot::drm_card() {
         crate::amdgpu_cs::unregister_submitter(card);
@@ -1071,7 +1088,9 @@ async unsafe fn quiesce(
     }
     crate::amdgpu_dcn_display::publish_external(None, None);
     crate::scanout_access::wait_retired().await;
-    crate::amdgpu_navi48_interrupts::stop_for_reset().await;
+    crate::amdgpu_navi48_interrupts::stop_for_reset()
+        .await
+        .map_err(boot::Error::Interrupts)?;
     Ok(Quiesced {
         retained,
         old_submitter,
@@ -1135,7 +1154,7 @@ async unsafe fn restart(
     let report = boot.run().await?;
     crate::amdgpu_navi48_dispatch::TABLE.lock().restart();
     // SAFETY: new retained IH/queues on the same exclusively owned GPU.
-    unsafe { boot.start_interrupt_service() }?;
+    unsafe { boot.start_interrupt_service() }.await?;
     // SAFETY: OWNER retains the new queues/GMC and the independent IH service.
     unsafe { boot.prove_queue_interrupts().await }.map_err(boot::Error::Queues)?;
     // SAFETY: GC12 proof drained; SDMA exclusively owns the same GMC test pages.
@@ -1366,6 +1385,8 @@ struct Submitter {
     contexts: narf_lib::sync::IrqSafeSpinLock<[(u64, u32); RINGS]>,
     /// Each ring's jobs in flight and whether it hung.
     watch: narf_lib::sync::IrqSafeSpinLock<[crate::amdgpu_ring_watch::RingWatch; RINGS]>,
+    /// Every unfinished graphics/compute gang and its aggregate leader.
+    gangs: narf_lib::sync::IrqSafeSpinLock<gangs::Ledger>,
     /// This generation already asked for whole-device recovery.
     device_recovery: core::sync::atomic::AtomicBool,
 }
@@ -1447,9 +1468,8 @@ impl Submitter {
             // Publish terminal failure before signalled() can wake a waiter.
             // Keep every allocation pinned; an error is no retirement proof.
             crate::amdgpu_navi48_interrupts::lose();
-            for watch in self.watch.lock().iter_mut() {
-                watch.stop();
-            }
+            drop(generation);
+            self.stop_all();
             return None;
         }
         // Lock after reading hardware: reset keeps each affected ledger frozen
@@ -1468,7 +1488,16 @@ impl Submitter {
             }
         }
         drop(generation);
-        crate::amdgpu_cs::retire(self.card, &|t| job_done(completed, t));
+        {
+            // Canonical nested order is gangs -> watch, with READ_GENERATION
+            // already released. Copy follower errors before dropping group
+            // metadata, including late errors after physical completion.
+            let mut gangs = self.gangs.lock();
+            let mut watches = self.watch.lock();
+            gangs.preserve_errors(&mut watches);
+            gangs.retire(completed);
+        }
+        crate::amdgpu_cs::retire(self.card, &|t| self.complete(completed, t));
         Some(completed)
     }
     /// Time out the front job of every ring that has held it too long,
@@ -1480,9 +1509,7 @@ impl Submitter {
             return;
         }
         if crate::amdgpu_navi48_interrupts::blocked() {
-            for watch in self.watch.lock().iter_mut() {
-                watch.stop();
-            }
+            self.stop_all();
             // Terminal: RAS fatal error, lost interrupts or refused fault recovery.
             if crate::amdgpu_navi48_interrupts::failed() {
                 self.request_device_recovery("terminal device fault");
@@ -1501,6 +1528,11 @@ impl Submitter {
             let Some((seq, vmid)) = hung else {
                 continue;
             };
+            let gang_busy = self.gangs.lock().busy();
+            if gang_busy {
+                self.abort_gangs("GC12 gang timeout; independent replay forbidden");
+                return;
+            }
             let _ = writeln!(
                 narf_console::Writer,
                 "amdgpu: navi48 ring {ring} timeout, signaled seq={}, job {seq} hung",
@@ -1509,6 +1541,11 @@ impl Submitter {
             let recovered = {
                 let mut owner = OWNER.lock().await;
                 if *READ_GENERATION.lock() != self.generation {
+                    return;
+                }
+                let gang_busy = self.gangs.lock().busy();
+                if gang_busy {
+                    self.abort_gangs("GC12 gang appeared before ring reset");
                     return;
                 }
                 if crate::amdgpu_navi48_interrupts::blocked() {
@@ -1649,6 +1686,12 @@ async fn watchdog(submitter: Arc<Submitter>) {
     }
 }
 impl crate::amdgpu_cs::Submitter for Submitter {
+    fn validate_submission(
+        &self,
+        submission: &crate::amdgpu_cs::Submission,
+    ) -> Result<(), narf_filesystem::FsError> {
+        gangs::plan(self, submission).map(|_| ())
+    }
     fn ring_for(&self, ip_type: u32, ip_instance: u32, ring: u32) -> Option<u32> {
         media_clients::native_ring(
             ip_type,
@@ -1665,15 +1708,24 @@ impl crate::amdgpu_cs::Submitter for Submitter {
     fn signalled(&self, ticket: u64) -> bool {
         // A revoked or vanished device makes no more progress; report done
         // so waiters cannot wedge.
+        self.progress().is_none_or(|completed| {
+            self.complete(completed, ticket) || self.error(ticket).is_some()
+        })
+    }
+    fn retired(&self, ticket: u64) -> bool {
         self.progress()
-            .is_none_or(|completed| job_done(completed, ticket) || self.job_error(ticket).is_some())
+            .is_some_and(|completed| self.complete(completed, ticket))
     }
     fn error(&self, ticket: u64) -> Option<narf_filesystem::FsError> {
-        self.job_error(ticket).or_else(|| {
-            (crate::amdgpu_navi48_interrupts::failed()
-                || *READ_GENERATION.lock() != self.generation)
-                .then_some(narf_filesystem::FsError::NoDevice)
-        })
+        self.gangs
+            .lock()
+            .error(ticket, |t| self.job_error(t))
+            .or_else(|| self.job_error(ticket))
+            .or_else(|| {
+                (crate::amdgpu_navi48_interrupts::failed()
+                    || *READ_GENERATION.lock() != self.generation)
+                    .then_some(narf_filesystem::FsError::NoDevice)
+            })
     }
     fn submit<'a>(
         &'a self,
@@ -1687,6 +1739,9 @@ impl crate::amdgpu_cs::Submitter for Submitter {
     > {
         alloc::boxed::Box::pin(async move {
             use narf_filesystem::FsError;
+            if let Some(pair) = gangs::plan(self, submission)? {
+                return self.submit_gang(vm, submission, health, pair).await;
+            }
             let first = submission.ibs.first().ok_or(FsError::InvalidData)?;
             let ring = self
                 .ring_for(first.ip_type, first.ip_instance, first.ring)
@@ -1856,7 +1911,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             }
             loop {
                 let completed = self.progress().ok_or(FsError::NoDevice)?;
-                if job_done(completed, ticket) || self.job_error(ticket).is_some() {
+                if self.complete(completed, ticket) || self.error(ticket).is_some() {
                     return Ok(true);
                 }
                 if narf_time::monotonic_ns() >= deadline_ns {
@@ -1869,13 +1924,17 @@ impl crate::amdgpu_cs::Submitter for Submitter {
 }
 
 /// One PMFW telemetry refresh, serialized with every retained owner user.
-pub(crate) async fn power_sample() -> Result<crate::amdgpu_navi48_power::Sample, boot::Error> {
+pub(crate) async fn power_sample_with<T>(
+    publish: impl FnOnce(Result<crate::amdgpu_navi48_power::Sample, boot::Error>) -> T,
+) -> T {
     let mut owner = OWNER.lock().await;
-    owner
-        .as_mut()
-        .ok_or(boot::Error::Invalid)?
-        .power_sample()
-        .await
+    let sample = match owner.as_mut() {
+        Some(boot) => boot.power_sample().await,
+        None => Err(boot::Error::Invalid),
+    };
+    // The thermal owner/generation decision runs before reset or suspend
+    // can acquire OWNER. The callback is synchronous and holds no IRQ lock.
+    publish(sample)
 }
 /// hwmon `power1_cap`: the AC PPT0 limit in watts, within the board range.
 pub async fn set_power_cap(watts: u32) -> Result<(), boot::Error> {
@@ -1890,13 +1949,31 @@ pub async fn set_power_cap(watts: u32) -> Result<(), boot::Error> {
 /// Linux `power_dpm_force_performance_level` restricted to GFXCLK soft
 /// limits. Display, memory and fabric clocks stay pinned by their owner.
 pub async fn set_gfx_level(level: crate::amdgpu_smu_navi48::GfxLevel) -> Result<(), boot::Error> {
+    apply_gfx_level(level, None).await
+}
+/// A queued sysfs write belongs to exactly the owner that admitted it.
+pub(crate) async fn set_gfx_level_current(
+    level: crate::amdgpu_smu_navi48::GfxLevel,
+    generation: u64,
+) -> Result<(), boot::Error> {
+    apply_gfx_level(level, Some(generation)).await
+}
+async fn apply_gfx_level(
+    level: crate::amdgpu_smu_navi48::GfxLevel,
+    generation: Option<u64>,
+) -> Result<(), boot::Error> {
     let _rpm = crate::amdgpu_navi48_runtime_pm::access().await?;
     let mut owner = OWNER.lock().await;
+    if generation.is_some_and(|g| !crate::amdgpu_navi48_power::level_owner_current(g)) {
+        return Err(boot::Error::Invalid);
+    }
     owner
         .as_mut()
         .ok_or(boot::Error::Invalid)?
         .set_gfx_level(level)
-        .await
+        .await?;
+    crate::amdgpu_navi48_power::applied_level(level);
+    Ok(())
 }
 
 async fn prove_queue_interrupts() {
@@ -1955,6 +2032,12 @@ async fn prove_queue_interrupts() {
                     media_clients::activate_media(boot);
                 }
                 publish_clearer(boot);
+                if SHADER_PROOF.load(Ordering::Acquire) {
+                    // The worker takes placement admission before its own
+                    // native submissions acquire OWNER. This scope releases
+                    // OWNER before that separately scheduled task can enter.
+                    narf_scheduler::spawn(client_shaders::prove());
+                }
             }
         }
     }
@@ -2876,6 +2959,7 @@ struct ConnectorState {
     hdr: Option<Vec<u8>>,
     /// DRM's "max bpc" (max_requested_bpc), kept with the connector.
     max_bpc: u8,
+    color_format: crate::amdgpu_hdr::ColorFormat,
 }
 impl ConnectorState {
     fn new(target: Target, kind: ConnectorType, index: usize) -> Self {
@@ -2893,6 +2977,7 @@ impl ConnectorState {
             colorspace: 0,
             hdr: None,
             max_bpc: crate::amdgpu_navi48_boot::MAX_REQUESTED_BPC,
+            color_format: crate::amdgpu_hdr::ColorFormat::Auto,
         }
     }
     /// The modeset's key for this connector's depth cap: its board port
@@ -2991,6 +3076,7 @@ struct CrtcState {
     /// change is a modeset (drm_atomic_helper_check_modeset sets
     /// connectors_changed when max_requested_bpc differs).
     lit_bpc: Option<u8>,
+    lit_color_format: Option<crate::amdgpu_hdr::ColorFormat>,
 }
 impl CrtcState {
     const fn new() -> Self {
@@ -3008,6 +3094,7 @@ impl CrtcState {
             color: None,
             color_signals: (true, true),
             lit_bpc: None,
+            lit_color_format: None,
         }
     }
     fn retrained(&mut self, edid: [u8; 128], timing: Timing, offered: Vec<Timing>) {
@@ -3033,6 +3120,8 @@ struct Outputs {
     crtcs: [CrtcState; 4],
     /// The DP ports whose MST branches are in use, in board order.
     mst: Vec<usize>,
+    /// Verified board admission inputs, retained even when every CRTC is dark.
+    soc: Option<dml::Soc>,
 }
 impl Outputs {
     const fn new() -> Self {
@@ -3040,6 +3129,7 @@ impl Outputs {
             connectors: Vec::new(),
             crtcs: [const { CrtcState::new() }; 4],
             mst: Vec::new(),
+            soc: None,
         }
     }
     /// `reshape` for the connector set of MST root ports `mst`.
@@ -3088,6 +3178,7 @@ impl Outputs {
                             colorspace: c.colorspace,
                             hdr: c.hdr.clone(),
                             max_bpc: c.max_bpc,
+                            color_format: c.color_format,
                         },
                     )
             })
@@ -3229,16 +3320,22 @@ impl Outputs {
         for c in &self.connectors {
             let (port, slot) = c.requested_key();
             crate::amdgpu_navi48_boot::set_requested_bpc(port, slot, c.max_bpc);
+            if slot.is_none() {
+                boot::set_requested_color_format(port, c.color_format);
+            }
         }
         for k in (0..crtc_count()).filter(|&k| lighting(k)) {
             self.crtcs[k].lit_bpc = self.routed(k).map(|c| c.max_bpc);
+            self.crtcs[k].lit_color_format = self.routed(k).map(|c| c.color_format);
         }
     }
     /// Whether CRTC k's connector asks another "max bpc" than it was lit
     /// with: a modeset.
     fn max_bpc_changed(&self, k: usize) -> bool {
         let lit = self.crtcs[k].lit_bpc;
-        lit.is_some() && self.routed(k).map(|c| c.max_bpc) != lit
+        lit.is_some()
+            && (self.routed(k).map(|c| c.max_bpc) != lit
+                || self.routed(k).map(|c| c.color_format) != self.crtcs[k].lit_color_format)
     }
     /// The MST root ports, while their branches' connectors exist.
     fn mst_ports(&self) -> Vec<usize> {
@@ -3319,6 +3416,7 @@ fn publish_outputs() {
         color: bool,
         present: bool,
         max_bpc: bool,
+        color_format: bool,
     }
     // Serializes publishers so an older snapshot never lands after a newer
     // one. Taken before OUTPUTS and never by the card-lock holders.
@@ -3349,6 +3447,8 @@ fn publish_outputs() {
                 color: color_connector(c.target),
                 present: c.present,
                 max_bpc: max_bpc_connector(c.target),
+                color_format: c.kind == ConnectorType::HdmiA
+                    && matches!(c.target, Target::Board(_)),
             })
             .collect();
         let inactive: Vec<usize> = (0..shown.len())
@@ -3385,6 +3485,7 @@ fn publish_outputs() {
             vrr_capable: c.vrr_capable,
             color: c.color,
             max_bpc: c.max_bpc,
+            color_format: c.color_format,
         })
         .collect();
     crate::amdgpu_navi48_kms::publish_routed_native(&crtcs, &connectors, &props);
@@ -3471,6 +3572,7 @@ async unsafe fn adopt(boot: &mut boot::ColdBoot, m: &Modeset) {
     unsafe { adopt_planes(boot, m) }.await;
     // Its timing generator restarted: the vblank count continues.
     restart_vblank(m.crtc);
+    OUTPUTS.lock().soc = Some(m.plan.soc);
     let s = &m.selection;
     let offered: Vec<Timing> = m.modes.iter().flatten().copied().collect();
     if let Some(c) = OUTPUTS.lock().crtcs.get_mut(usize::from(m.crtc)) {
@@ -3856,6 +3958,8 @@ async unsafe fn light_displays(
     if pending_display_work(boot) {
         return Err(crate::amdgpu_dcn401_otg::Error::Busy.into());
     }
+    let soc = boot.display_soc().ok();
+    OUTPUTS.lock().soc = soc;
     // Every plugged DP port whose sink is an MST branch adds its end
     // devices' connectors; every other board port stays a connector too.
     let mut mst = Vec::new();
@@ -5608,6 +5712,9 @@ pub fn request_connector_color(request: crate::amdgpu_native_kms::ConnectorColor
         };
         c.colorspace = request.colorspace;
         c.hdr = request.hdr_output_metadata;
+        if c.kind == ConnectorType::HdmiA {
+            c.color_format = request.color_format;
+        }
         // drm_hdmi_infoframe_set_hdr_metadata only notes an EOTF the
         // sink's HDR Static Metadata Data Block does not list.
         let metadata = c
@@ -5706,6 +5813,7 @@ async fn stream_updater() {
             let mut owner = OWNER.lock().await;
             if let Some(boot) = owner.as_mut() {
                 converge_streams(boot).await;
+                converge_vrr(boot).await;
             }
         }
         STREAM_UPDATER.store(false, Ordering::Release);
@@ -5794,12 +5902,7 @@ pub fn request_vrr_enabled(display: u8, enabled: bool) {
         };
         c.vrr = enabled;
     }
-    let Some(mut owner) = OWNER.try_lock() else {
-        return;
-    };
-    if let Some(boot) = owner.as_mut() {
-        converge_vrr(boot);
-    }
+    kick_stream_updater();
 }
 
 /// What DRR lit modeset `m` should run: its mode's totals
@@ -5823,11 +5926,84 @@ fn drr_wanted(boot: &boot::ColdBoot) -> bool {
         .any(|m| wanted_drr(&m, wants[usize::from(m.crtc)]).is_some())
 }
 
+static LFC_SERVICE: AtomicBool = AtomicBool::new(false);
+
+/// VUPDATE wakes the idle owner after the independent source owner ACKed
+/// its latch. A 500us deadline preserves FRAME_COUNT fallback without MSI.
+/// Address-latch waits service their own frames under OWNER; missed/lost
+/// observations reset BTR rather than synthesizing a frame from a vector.
+fn kick_lfc_service() {
+    if LFC_SERVICE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    narf_scheduler::spawn(async {
+        let mut since = None;
+        let mut lost = crate::amdgpu_navi48_dispatch::summary().display.lost;
+        loop {
+            match crate::amdgpu_navi48_dispatch::wait_display(
+                crate::amdgpu_navi48_dispatch::VUPDATE,
+                since,
+                narf_time::Deadline::after_us(500),
+            )
+            .await
+            {
+                Ok(version) => since = Some(version),
+                Err(crate::amdgpu_navi48_dispatch::WaitError::Timeout) => {}
+                Err(_) => {
+                    narf_time::SleepUntil::new(narf_time::Deadline::after_us(500).as_instant())
+                        .await
+                }
+            }
+            let mut owner = OWNER.lock().await;
+            if PRESENT_GATED.load(Ordering::Acquire) {
+                LFC_SERVICE.store(false, Ordering::Release);
+                return;
+            }
+            let Some(boot) = owner.as_mut() else {
+                LFC_SERVICE.store(false, Ordering::Release);
+                return;
+            };
+            let now_lost = crate::amdgpu_navi48_dispatch::summary().display.lost;
+            let reset = now_lost != lost;
+            lost = now_lost;
+            let mut enabled = false;
+            for m in boot.display_modesets().into_iter().flatten() {
+                let Ok(Some(status)) = boot.display_status(m.pipe) else {
+                    continue;
+                };
+                if status.state != crate::amdgpu_dcn401_otg::State::ScanoutRunning(m.pipe)
+                    || status.drr.is_none_or(|a| !a.lfc_enabled())
+                {
+                    continue;
+                }
+                enabled = true;
+                // SAFETY: OWNER retains the admitted scanout and excludes writers;
+                // only ScanoutRunning is serviced, never a cancelled transaction.
+                if let Err(e) = unsafe { boot.display_lfc_progress(m.pipe, reset) } {
+                    let _ = core::fmt::Write::write_fmt(
+                        &mut narf_console::Writer,
+                        format_args!("amdgpu: navi48 LFC frame service refused: {e:?}\n"),
+                    );
+                }
+            }
+            if !enabled {
+                // Clearing while OWNER is held prevents a concurrent enable
+                // from observing a worker which has already decided to exit.
+                LFC_SERVICE.store(false, Ordering::Release);
+                return;
+            }
+        }
+    });
+}
+
 /// Bring every live scanout's DRR to what DRM asked (amdgpu_dm's
 /// VRR_STATE_ACTIVE_VARIABLE or INACTIVE). Displays not scanning out are
 /// left alone (their timing is fixed); a refused change is reported and
 /// retried by the next pass.
-fn converge_vrr(boot: &mut boot::ColdBoot) {
+async fn converge_vrr(boot: &mut boot::ColdBoot) {
     let wants = vrr_wants();
     for m in boot.display_modesets().into_iter().flatten() {
         let k = usize::from(m.crtc);
@@ -5839,15 +6015,58 @@ fn converge_vrr(boot: &mut boot::ColdBoot) {
         }
         let want = wanted_drr(&m, wants[k]);
         // While PMFW may switch UCLK, the monitor pass pins it first.
-        if status.drr.map(|a| a.drr) == want || (want.is_some() && boot.uclk_switching()) {
+        if want.is_some() && boot.uclk_switching() {
             continue;
         }
-        // SAFETY: OWNER is held; the platform excludes other timing writers.
-        if let Err(e) = unsafe { boot.set_display_drr(m.pipe, want) } {
+        let packet = m
+            .selection
+            .vrr
+            .filter(|_| m.selection.vrr_supported())
+            .and_then(|range| {
+                crate::amdgpu_freesync::info_packet(
+                    &m.selection.timing,
+                    range,
+                    m.selection.hdmi,
+                    want.is_some(),
+                )
+            });
+        let unchanged = status.drr.map(|a| a.drr) == want
+            && status.freesync.filter(|p| p.complete).map(|p| p.packet) == packet;
+        // SAFETY: OWNER is held; the platform excludes timing/stream writers.
+        let result = if unchanged {
+            Ok(status.drr)
+        } else if let Some(packet) = packet {
+            // SAFETY: OWNER serializes this display's timing and stream writers.
+            unsafe { boot.set_display_freesync(m.pipe, want, packet) }.await
+        } else {
+            // SAFETY: OWNER serializes this display's timing writers.
+            unsafe { boot.set_display_drr(m.pipe, want) }.await
+        };
+        if let Err(e) = result {
             let _ = core::fmt::Write::write_fmt(
                 &mut narf_console::Writer,
                 format_args!("amdgpu: navi48 display {k} DRR not applied: {e:?}\n"),
             );
+        }
+        if result.is_ok() {
+            let config = m
+                .selection
+                .vrr
+                .filter(|_| want.is_some())
+                .and_then(|range| {
+                    crate::amdgpu_freesync::LfcConfig::new(&m.selection.timing, range)
+                });
+            // SAFETY: OWNER is held and the UCLK pin was checked above.
+            match unsafe { boot.set_display_lfc(m.pipe, config) }.await {
+                Ok(()) if config.is_some() => kick_lfc_service(),
+                Ok(()) => {}
+                Err(e) => {
+                    let _ = core::fmt::Write::write_fmt(
+                        &mut narf_console::Writer,
+                        format_args!("amdgpu: navi48 display {k} LFC not applied: {e:?}\n"),
+                    );
+                }
+            }
         }
     }
 }
@@ -5975,6 +6194,236 @@ pub fn requested_display_planes(display: u8) -> boot::PlaneSetup {
         .map_or(boot::PlaneSetup::NONE, |c| c.planes)
 }
 
+/// Check all prospective HDMI outputs together. The source topology is
+/// snapshotted under OUTPUTS; candidate generation and DML run after it is
+/// released. Nothing is staged by a TEST_ONLY request.
+pub fn output_formats_supported(
+    requests: &[crate::amdgpu_native_kms::OutputFormatRequest],
+    routes: &[crate::amdgpu_native_kms::OutputRoute],
+) -> bool {
+    if requests.is_empty() {
+        return true;
+    }
+    if requests.len() > 4 {
+        return false;
+    }
+    let snapshot =
+        {
+            let outputs = OUTPUTS.lock();
+            let Some(soc) = outputs
+                .soc
+                .or_else(|| outputs.crtcs.iter().find_map(|c| c.admitted.map(|a| a.0)))
+            else {
+                return false;
+            };
+            let mut joint: Vec<(usize, dml::Mode)> = Vec::new();
+            for route in routes {
+                let k = usize::from(route.display);
+                if k >= crtc_count()
+                    || routes.iter().filter(|r| r.display == route.display).count() != 1
+                {
+                    return false;
+                }
+                let Some(target) = outputs.target_of_id(route.connector) else {
+                    return false;
+                };
+                let Some(connector) = outputs.connector(target) else {
+                    return false;
+                };
+                if connector.kind == ConnectorType::HdmiA {
+                    continue;
+                }
+                let Some(source) = outputs
+                    .crtc_of(target)
+                    .and_then(|n| outputs.crtcs[n].admitted)
+                else {
+                    return false;
+                };
+                let mut mode = source.1;
+                if route.mode.as_ref().is_some_and(|wire| {
+                    outputs.find_mode(k, Some(target), wire) != Some(mode.timing)
+                }) {
+                    return false;
+                }
+                if let Some((fourcc, planes)) = &route.planes {
+                    let Some(format) = SurfaceFormat::from_fourcc(*fourcc) else {
+                        return false;
+                    };
+                    mode = boot::with_planes(mode, format, planes);
+                }
+                joint.push((k, mode));
+            }
+            let mut inputs = Vec::new();
+            for r in requests {
+                let k = usize::from(r.display);
+                let Some(c) = outputs.crtcs.get(k) else {
+                    return false;
+                };
+                let Some(target) = outputs.target_of_id(r.connector) else {
+                    return false;
+                };
+                let Some(connector) = outputs
+                    .connector(target)
+                    .filter(|c| c.kind == ConnectorType::HdmiA && c.present)
+                else {
+                    return false;
+                };
+                let timing = match r.mode.as_ref() {
+                    Some(mode) => outputs.find_mode(k, Some(target), mode),
+                    None if c.route == Some(target) => c.shown.as_ref().map(|s| s.1),
+                    _ => None,
+                };
+                let Some(timing) = timing else { return false };
+                let (format, planes) = match &r.planes {
+                    Some((fourcc, planes)) => {
+                        let Some(format) = SurfaceFormat::from_fourcc(*fourcc) else {
+                            return false;
+                        };
+                        (format, *planes)
+                    }
+                    None => (c.format, c.planes),
+                };
+                let at = match joint.iter().position(|(n, _)| *n == k) {
+                    Some(at) => at,
+                    None => {
+                        joint.push((k, boot::plane_mode(timing, format)));
+                        joint.len() - 1
+                    }
+                };
+                if requests
+                    .iter()
+                    .filter(|other| other.display == r.display)
+                    .count()
+                    != 1
+                {
+                    return false;
+                }
+                joint[at].1.timing = timing;
+                inputs.push((
+                    at,
+                    boot::hdmi_caps(&connector.edid),
+                    timing,
+                    r.max_bpc.unwrap_or(connector.max_bpc).min(boot::max_bpc()),
+                    boot::sink_audio_info(&connector.edid),
+                    r.color_format,
+                    format,
+                    planes,
+                ));
+            }
+            // Every active native HDMI route must be supplied as a candidate;
+            // an omitted/unknown owner is not free capacity.
+            if routes.iter().any(|route| {
+                outputs
+                    .target_of_id(route.connector)
+                    .and_then(|target| outputs.connector(target))
+                    .is_some_and(|c| c.kind == ConnectorType::HdmiA)
+                    && !requests
+                        .iter()
+                        .any(|r| r.display == route.display && r.connector == route.connector)
+            }) {
+                return false;
+            }
+            let occupied = false;
+            (soc, joint, inputs, occupied)
+        };
+    let (soc, mut joint, inputs, occupied) = snapshot;
+    let candidates: Vec<_> = inputs
+        .iter()
+        .map(
+            |(at, caps, timing, bpc, audio, requested, format, planes)| {
+                let cap = boot::frl_cap(*caps).filter(|_| !occupied);
+                (
+                    *at,
+                    *format,
+                    *planes,
+                    boot::hdmi_candidates(
+                        *caps,
+                        timing,
+                        *bpc,
+                        cap,
+                        *audio,
+                        soc.dispclk_max_khz,
+                        *requested,
+                    ),
+                )
+            },
+        )
+        .collect();
+    hdmi_format_search(&soc, &mut joint, &candidates, 0, occupied)
+}
+
+type HdmiFormatCandidates = (
+    usize,
+    SurfaceFormat,
+    boot::PlaneSetup,
+    Vec<boot::HdmiStream>,
+);
+/// Four outputs, at most six link/depth candidates each; only one FRL
+/// encoder may be occupied. An explicit encoding stays fixed in every
+/// candidate; the complete topology must pass native DSC shape and SPL.
+fn hdmi_format_search(
+    soc: &dml::Soc,
+    joint: &mut [(usize, dml::Mode)],
+    candidates: &[HdmiFormatCandidates],
+    next: usize,
+    frl_used: bool,
+) -> bool {
+    if next == candidates.len() {
+        let modes: Vec<_> = joint.iter().map(|(_, m)| *m).collect();
+        let Ok(plans) = boot::admit_native_modes(soc, &modes) else {
+            return false;
+        };
+        let crtcs: Vec<_> = joint.iter().map(|(k, _)| *k as u8).collect();
+        let Ok(acquired) = boot::plan_pipes(&plans, &crtcs) else {
+            return false;
+        };
+        return candidates.iter().all(|(at, format, setup, _)| {
+            let (head, pipes) = acquired[*at];
+            let m = &modes[*at];
+            let (primary, overlays) = boot::stream_planes(
+                &m.timing,
+                m.encoding.is_420(),
+                *format,
+                setup,
+                (head, pipes.odm, pipes.mpc),
+                &pipes.overlays,
+            );
+            core::iter::once(primary)
+                .chain(overlays.into_iter().flatten())
+                .all(|p| p.check().is_ok())
+        });
+    }
+    let (at, format, setup, choices) = &candidates[next];
+    let old = joint[*at].1;
+    for c in choices {
+        if frl_used && c.frl.is_some() {
+            continue;
+        }
+        let mode = dml::Mode {
+            hdmi: true,
+            encoding: c.encoding,
+            dsc: c.dsc.map(|d| dml::Dsc {
+                slices: d.slices_h,
+                bpp_x16: d.bpp_x16,
+            }),
+            ..boot::plane_mode(old.timing, *format)
+        };
+        joint[*at].1 = boot::with_planes(mode, *format, setup);
+        if hdmi_format_search(
+            soc,
+            joint,
+            candidates,
+            next + 1,
+            frl_used || c.frl.is_some(),
+        ) {
+            joint[*at].1 = old;
+            return true;
+        }
+    }
+    joint[*at].1 = old;
+    false
+}
+
 /// Why `display_admits_planes` refused a plane configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlanesRefused {
@@ -6074,7 +6523,7 @@ fn admits_with_planes(
     let (head, d) = acquired[at];
     let (primary, stack) = boot::stream_planes(
         &m.timing,
-        m.ycbcr420,
+        m.encoding.is_420(),
         format,
         setup,
         (head, d.odm, d.mpc),
@@ -6891,7 +7340,7 @@ pub async unsafe fn monitor_displays(
         }
     }
     // VRR_ENABLED needs no relight: converge every live timing's DRR.
-    converge_vrr(boot);
+    converge_vrr(boot).await;
     // Nor do CRTC color and HDR metadata changes.
     converge_streams(boot).await;
     // Client framebuffers a relight, plane update or stop let go of.
@@ -9162,3 +9611,7 @@ async unsafe fn light_beside(
     publish_outputs();
     Ok(Ok(config))
 }
+
+#[cfg(feature = "kernel-test")]
+#[path = "amdgpu_navi48_hdmi_format_tests.rs"]
+mod hdmi_format_tests;

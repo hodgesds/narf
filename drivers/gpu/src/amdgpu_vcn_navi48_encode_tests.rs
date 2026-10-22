@@ -126,6 +126,7 @@ impl Model {
             if self.fault != 1 {
                 self.memory[e::OUTPUT as usize..e::OUTPUT as usize + STREAM.len()]
                     .copy_from_slice(STREAM);
+                self.store(e::FEEDBACK + 4, 1);
                 self.store(e::FEEDBACK + 24, STREAM.len() as u32);
             }
             match self.fault {
@@ -134,6 +135,9 @@ impl Model {
                 4 => self.store(e::OUTPUT_END_GUARD, 0),
                 5 => self.store(e::INPUT, 0),
                 6 => self.store(e::ENCODE_IB + 8192 - 4, 1),
+                10 => self.store(e::FEEDBACK + 4, 0),
+                11 => self.store(e::FEEDBACK + 32, 1),
+                12 => self.store(e::FEEDBACK + 24, 0),
                 _ => {}
             }
         }
@@ -198,7 +202,7 @@ kernel_test_in!(
 );
 
 fn vcn5_encoder_failures_quarantine_commands_input_and_declared_output() -> TestResult {
-    for fault in 1..=9 {
+    for fault in 1..=12 {
         let (pool, mut engine, mut observer) = ready(false);
         engine.io.encoding.fault = fault;
         if fault == 8 {
@@ -208,7 +212,7 @@ fn vcn5_encoder_failures_quarantine_commands_input_and_declared_output() -> Test
             engine.io.emit_cpu = false;
         }
         let expected = match fault {
-            1..=3 => Error::EncodeOutput,
+            1..=3 | 10..=12 => Error::EncodeOutput,
             4..=6 => Error::Readback,
             _ => Error::Timeout,
         };

@@ -124,6 +124,21 @@ pub struct Job {
     /// and write back the GPU caches before the IBs.
     pub mem_sync: bool,
 }
+/// Two fully validated GC12 slots, still invisible to both consumers.
+/// OWNER must exclude every queue publisher/reset between preparation and
+/// publication. The private identity/cursors reject reuse on another owner.
+pub(crate) struct PreparedGang {
+    base: u64,
+    wptr: [u64; 2],
+    sequence: [u32; 2],
+    words: [[u32; 256]; 2],
+}
+impl PreparedGang {
+    pub(crate) fn sequences(&self) -> [u32; 2] {
+        self.sequence
+    }
+}
+
 /// IBs one job may carry: all fit one 256-dword slot beside the flush,
 /// PASID mapping and fence.
 pub const MAX_JOB_IBS: usize = 8;
@@ -759,6 +774,97 @@ impl<I: Io> Engine<I> {
             job_packets(pipe, job, gc, oss, nbio, fence, seq)
         })
     }
+    /// Admit both rings and build both frames before either WPTR can move.
+    /// No ring memory or doorbell is written on a refusal.
+    fn prepare_gang(&mut self, jobs: [Job; 2]) -> Result<PreparedGang, Error> {
+        if self.state != State::InterruptVerified {
+            return Err(Error::Busy);
+        }
+        let l = self.layout;
+        let map = self.memory.mapping();
+        let base = self.memory.address();
+        let wptr = self.job_wptr;
+        let sequence = self.job_seq.map(|s| s.wrapping_add(1));
+        let mut words = [[0; 256]; 2];
+        for (i, pipe) in [Pipe::Graphics, Pipe::Compute].into_iter().enumerate() {
+            words[i] = job_packets(
+                pipe,
+                jobs[i],
+                (l.gc / 4) as u32,
+                (l.oss / 4) as u32,
+                (l.nbio / 4) as u32,
+                base + pipe.base() + JOB_FENCE,
+                sequence[i],
+            )?;
+        }
+        self.access(|io| {
+            flush(io, l)?;
+            for (i, pipe) in [Pipe::Graphics, Pipe::Compute].into_iter().enumerate() {
+                let rptr = u64::from(io.memory_read(map, pipe.base() + RPTR));
+                let pending = (wptr[i] as u32).wrapping_sub(rptr as u32) as u64;
+                if pending > wptr[i] || pending + JOB_DWORDS > RING_DWORDS {
+                    return Err(Error::Busy);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(PreparedGang {
+            base,
+            wptr,
+            sequence,
+            words,
+        })
+    }
+    /// Stage both admitted slots, then release follower before leader.
+    /// The caller must retain both constituent lifetime receipts BEFORE
+    /// entering: even a failed WPTR/flush can have exposed work to hardware.
+    fn publish_gang(&mut self, prepared: PreparedGang, leader: Pipe) -> Result<(), Error> {
+        if self.state != State::InterruptVerified
+            || prepared.base != self.memory.address()
+            || prepared.wptr != self.job_wptr
+            || prepared.sequence != self.job_seq.map(|s| s.wrapping_add(1))
+        {
+            return Err(Error::Invalid);
+        }
+        let l = self.layout;
+        let map = self.memory.mapping();
+        let db = self.doorbells;
+        // Reserve every cursor before any possible publication. A failure
+        // quarantines both rings; no later job can reuse an uncertain slot.
+        self.job_wptr = prepared.wptr.map(|p| p + JOB_DWORDS);
+        self.job_seq = prepared.sequence;
+        let order = if leader == Pipe::Graphics {
+            [Pipe::Compute, Pipe::Graphics]
+        } else {
+            [Pipe::Graphics, Pipe::Compute]
+        };
+        let result = self.access(|io| {
+            // Neither WPTR is touched until all command bytes are staged
+            // and made visible. Hardware may poll WPTR without a doorbell.
+            for pipe in [Pipe::Graphics, Pipe::Compute] {
+                let i = pipe.index();
+                let slot = pipe.base() + prepared.wptr[i] % RING_DWORDS * 4;
+                for (w, word) in prepared.words[i].iter().copied().enumerate() {
+                    io.memory_write(map, slot + w as u64 * 4, word);
+                }
+            }
+            flush(io, l)?;
+            for pipe in order {
+                let i = pipe.index();
+                let next = prepared.wptr[i] + JOB_DWORDS;
+                io.memory_write(map, pipe.base() + WPTR, next as u32);
+                io.memory_write(map, pipe.base() + WPTR + 4, (next >> 32) as u32);
+                flush(io, l)?;
+                io.doorbell(db, BELLS[i], next);
+            }
+            Ok(())
+        });
+        if let Err(error) = result {
+            self.state = State::Failed(error);
+        }
+        result
+    }
+
     /// Queue a slot of nothing but the next sequence's fence on `pipe`: the
     /// ring test after a reset (amdgpu_ring_test_ring). Once the fence
     /// passes it, the CP has moved past every earlier slot.
@@ -1254,6 +1360,22 @@ impl Queues {
     }
     pub fn proof(&self) -> Option<Proof> {
         self.0.proof
+    }
+    /// # Safety
+    /// OWNER excludes all queue publishers and reset/PM through subsequent
+    /// `publish_gang`; both jobs retain the normal `submit` VM/BO contract.
+    pub(crate) unsafe fn prepare_gang(&mut self, jobs: [Job; 2]) -> Result<PreparedGang, Error> {
+        self.0.prepare_gang(jobs)
+    }
+    /// # Safety
+    /// Same exclusive owner as preparation; both jobs' lifetime/VMID receipts
+    /// are durable before this call and remain retained after any error.
+    pub(crate) unsafe fn publish_gang(
+        &mut self,
+        prepared: PreparedGang,
+        leader: Pipe,
+    ) -> Result<(), Error> {
+        self.0.publish_gang(prepared, leader)
     }
     /// Queue a client job on `pipe`'s ring (see `Job`).
     /// # Safety

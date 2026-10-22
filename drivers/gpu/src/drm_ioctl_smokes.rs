@@ -542,6 +542,7 @@ fn smoke_drm_ioctl_broadcast_rgb_property() -> TestResult {
         return TestResult::Fail("no mode state");
     };
     ms.lock().native.push(crate::drm::card::NativeOutput {
+        color_format: None,
         connector: 31,
         edid: None,
         timings: alloc::vec::Vec::new(),
@@ -755,6 +756,7 @@ fn smoke_drm_ioctl_vrr_properties() -> TestResult {
     {
         let mut card = ms.lock();
         card.native.push(crate::drm::card::NativeOutput {
+            color_format: None,
             connector: 31,
             edid: None,
             timings: alloc::vec::Vec::new(),
@@ -1098,6 +1100,7 @@ fn color_card() -> Option<u32> {
     ];
     card.encoders[0].crtc_id = Some(11);
     card.native.push(crate::drm::card::NativeOutput {
+        color_format: None,
         connector: 31,
         edid: None,
         timings: alloc::vec::Vec::new(),
@@ -3695,8 +3698,8 @@ fn smoke_drm_navi48_plane_formats_end_to_end() -> TestResult {
             Err(_) => return TestResult::Fail("plane format refused"),
         }
     }
-    // RGBA8888, XRGB16161616 (UNORM), NV12 and C8: Linux's other formats.
-    for format in [0x3432_4152, 0x3834_5258, 0x3231_564e, 0x2020_3843] {
+    // RGBA8888, single-plane NV12 and C8 remain outside this path.
+    for format in [0x3432_4152, 0x3231_564e, 0x2020_3843] {
         if addfb(64, 32, format, 64 * 8, big) != Err(CardError::UnknownFormat) {
             return TestResult::Fail("format the native plane leaves out accepted");
         }
@@ -3715,10 +3718,10 @@ fn smoke_drm_navi48_plane_formats_end_to_end() -> TestResult {
     {
         return TestResult::Fail("GETPLANERESOURCES");
     }
-    let mut listed = [0u32; 16];
+    let mut listed = [0u32; FORMATS.len()];
     let mut gp = [0u8; 32];
     gp[0..4].copy_from_slice(&ids[0].to_le_bytes());
-    gp[20..24].copy_from_slice(&16u32.to_le_bytes());
+    gp[20..24].copy_from_slice(&(listed.len() as u32).to_le_bytes());
     gp[24..32].copy_from_slice(&(listed.as_mut_ptr() as u64).to_le_bytes());
     if dispatch_card(
         idx,
@@ -4533,10 +4536,10 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
     }
     // GETPLANE: an overlay goes on any CRTC and takes the overlay formats.
     let getplane = |id: u32| {
-        let mut formats = [0u32; 16];
+        let mut formats = [0u32; 20];
         let mut gp = [0u8; 32];
         gp[0..4].copy_from_slice(&id.to_le_bytes());
-        gp[20..24].copy_from_slice(&16u32.to_le_bytes());
+        gp[20..24].copy_from_slice(&20u32.to_le_bytes());
         gp[24..32].copy_from_slice(&(formats.as_mut_ptr() as u64).to_le_bytes());
         let r = dispatch_card(
             idx,
@@ -4550,8 +4553,8 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
     let (r, crtc, fb, possible, count, formats) = getplane(OVERLAY);
     if r != Ok(0)
         || (crtc, fb, possible) != (0, 0, 0xff)
-        || count != 15
-        || formats[..15] != crate::amdgpu_navi48_kms::PLANE_FORMATS
+        || count != 19
+        || formats[..19] != crate::amdgpu_navi48_kms::PLANE_FORMATS
     {
         return TestResult::Fail("overlay GETPLANE");
     }
@@ -4598,7 +4601,7 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
         return TestResult::Fail("overlay properties");
     }
     // IN_FORMATS through GETPROPBLOB: a version-1 drm_format_modifier_blob
-    // of the 15 formats and the 17 GFX12 modifiers.
+    // of the native formats and the 17 GFX12 modifiers.
     let mut data = alloc::vec![0u8; 512];
     let mut gb = [0u8; 16];
     gb[0..4].copy_from_slice(&(blob as u32).to_le_bytes());
@@ -4612,9 +4615,11 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
     );
     let len = u32::from_le_bytes(gb[4..8].try_into().unwrap()) as usize;
     if r != Ok(0)
-        || len != 88 + 17 * 24
+        || len
+            != (24 + crate::amdgpu_navi48_kms::PLANE_FORMATS.len() * 4).next_multiple_of(8)
+                + 17 * 24
         || data[0..4] != 1u32.to_le_bytes()
-        || data[8..12] != 15u32.to_le_bytes()
+        || data[8..12] != (crate::amdgpu_navi48_kms::PLANE_FORMATS.len() as u32).to_le_bytes()
         || data[16..20] != 17u32.to_le_bytes()
         || data[..len]
             != crate::amdgpu_dm_modifiers::in_formats_blob(&crate::amdgpu_navi48_kms::PLANE_FORMATS)
@@ -5428,3 +5433,77 @@ fn smoke_drm_ioctl_native_cursor_plane() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_native_cursor_plane);
+
+fn smoke_drm_ioctl_hdmi_color_format_property() -> TestResult {
+    use crate::amdgpu_hdr::ColorFormat as F;
+    let Some(idx) = color_card() else {
+        return TestResult::Fail("no color card");
+    };
+    let state = crate::drm_registry::mode_state(idx).unwrap();
+    state.lock().native[0].color_format = Some(F::Auto);
+    assert!(color_props(idx, 31, COLOR_CONNECTOR).contains(&(0x81, 0)));
+    let mut values = [0u64; 5];
+    let mut enums = [0u8; 5 * 40];
+    let mut gp = [0u8; 64];
+    gp[..8].copy_from_slice(&(values.as_mut_ptr() as u64).to_le_bytes());
+    gp[8..16].copy_from_slice(&(enums.as_mut_ptr() as u64).to_le_bytes());
+    gp[16..20].copy_from_slice(&0x81u32.to_le_bytes());
+    gp[56..60].copy_from_slice(&5u32.to_le_bytes());
+    gp[60..64].copy_from_slice(&5u32.to_le_bytes());
+    assert_eq!(
+        dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xAA, 64),
+            gp.as_mut_ptr() as usize,
+            false
+        ),
+        Ok(0)
+    );
+    assert_eq!(&gp[24..36], b"color format");
+    for (i, name) in [
+        b"AUTO".as_slice(),
+        b"RGB",
+        b"YUV 4:4:4",
+        b"YUV 4:2:2",
+        b"YUV 4:2:0",
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert_eq!(
+            u64::from_le_bytes(enums[i * 40..i * 40 + 8].try_into().unwrap()),
+            i as u64
+        );
+        assert_eq!(&enums[i * 40 + 8..i * 40 + 8 + name.len()], *name);
+    }
+    let atomic = |flags: u32, value: u64| {
+        let objects = [31u32];
+        let counts = [1u32];
+        let props = [0x81u32];
+        let values = [value];
+        let mut r = DrmModeAtomicUapi {
+            flags,
+            count_objs: 1,
+            objs_ptr: objects.as_ptr() as u64,
+            count_props_ptr: counts.as_ptr() as u64,
+            props_ptr: props.as_ptr() as u64,
+            prop_values_ptr: values.as_ptr() as u64,
+            ..Default::default()
+        };
+        dispatch_card(idx, DRM_IOCTL_MODE_ATOMIC, &mut r as *mut _ as usize, false)
+    };
+    assert_eq!(atomic(0x400, 5), Err(FsError::InvalidData));
+    assert_eq!(atomic(0, 3), Err(FsError::InvalidData));
+    assert_eq!(atomic(0x500, 3), Ok(0)); // TEST_ONLY never stages the request.
+    assert_eq!(color_prop(idx, 31, COLOR_CONNECTOR, 0x81), Some(0));
+    assert_eq!(atomic(0x400, 3), Ok(0));
+    assert_eq!(color_prop(idx, 31, COLOR_CONNECTOR, 0x81), Some(3));
+    assert_eq!(atomic(0, 3), Ok(0));
+    state.lock().native[0].color_format = None;
+    assert_eq!(atomic(0x400, 0), Err(FsError::InvalidData));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_ioctl_hdmi_color_format_property
+);

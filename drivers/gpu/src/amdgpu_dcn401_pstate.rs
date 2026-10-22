@@ -425,7 +425,7 @@ fn same_timing(a: &Mode, b: &Mode) -> bool {
         && x.v_total == y.v_total
         && x.v_front_porch == y.v_front_porch
         && a.dsc == b.dsc
-        && a.ycbcr420 == b.ycbcr420
+        && a.encoding == b.encoding
 }
 
 impl Pmo<'_> {

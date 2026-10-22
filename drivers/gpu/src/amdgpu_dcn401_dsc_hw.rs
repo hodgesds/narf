@@ -66,7 +66,7 @@ pub(super) fn dsc_registers(request: &Request, cfg: &DscConfig) -> Result<DscReg
         Signal::DisplayPort | Signal::HpoDisplayPort | Signal::HdmiFrl
     ) || frl != cfg.frl.is_some()
         || !matches!(cfg.bpc, 8 | 10 | 12)
-        || request.ycbcr420
+        || !request.encoding.is_rgb()
         || cfg.slices_h % segments != 0
         || cfg.slices_h > 4 * segments
         || request.timing.h_active % segments != 0

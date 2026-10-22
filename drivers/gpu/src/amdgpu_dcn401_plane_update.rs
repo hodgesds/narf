@@ -600,7 +600,7 @@ impl Surfaces {
             let l = s.layout();
             l.stream_width == t.timing.h_active
                 && l.stream_height == t.timing.v_active
-                && l.ycbcr420 == blank.request.ycbcr420
+                && l.ycbcr420 == blank.request.encoding.is_420()
                 && s.odm.count() == t.odm.count()
         };
         let primary = request.primary;
@@ -816,7 +816,7 @@ impl Surfaces {
                     dpp,
                     depth: blank.request.depth,
                     limited: blank.request.limited,
-                    ycbcr420: blank.request.ycbcr420,
+                    encoding: blank.request.encoding,
                     colorspace: blank.request.colorspace,
                     pending: 0,
                 },

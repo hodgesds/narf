@@ -72,7 +72,7 @@ fn payload(f: &DpFrontendReady, slots: u8) -> Result<MstAudioPayload, Error> {
         || !matches!(s.lanes, 1 | 2 | 4)
         || slots == 0
         || slots > 63
-        || f.blank.request.ycbcr420
+        || !f.blank.request.encoding.is_rgb()
     {
         return Err(Error::Unsupported);
     }

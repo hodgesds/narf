@@ -5,9 +5,13 @@
 //! IV payload. A service failure is delivered to every waiter as terminal.
 use crate::{
     amdgpu_ih7 as ih, amdgpu_navi48_dispatch as dispatch, amdgpu_navi48_faults as faults,
-    amdgpu_navi48_msi as msi, amdgpu_navi48_ras as ras, amdgpu_navi48_sources as src,
+    amdgpu_navi48_msi as msi, amdgpu_navi48_power::thermal, amdgpu_navi48_ras as ras,
+    amdgpu_navi48_sources as src,
 };
 use narf_lib::mutex::Mutex;
+
+#[path = "amdgpu_dcn401_vupdate.rs"]
+pub(crate) mod vupdate;
 
 static SERVICE: Mutex<Option<Service>> = Mutex::new(None);
 static HALTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -30,18 +34,93 @@ pub(crate) fn lose() {
     dispatch::TABLE
         .lock()
         .fail_all(dispatch::Terminal::DeviceGone);
+    // Do not wait in Drop or while a caller holds unrelated locks. The
+    // permanent service retains uncertain sources until masking succeeds.
+    if let Some(mut slot) = SERVICE.try_lock() {
+        if let Some(service) = slot.as_mut() {
+            service.stop(dispatch::Terminal::DeviceGone);
+        }
+    } else {
+        let generation = GENERATION.load(core::sync::atomic::Ordering::Acquire);
+        narf_scheduler::spawn(async move {
+            let mut slot = SERVICE.lock().await;
+            if GENERATION.load(core::sync::atomic::Ordering::Acquire) == generation {
+                if let Some(service) = slot.as_mut() {
+                    service.stop(dispatch::Terminal::DeviceGone);
+                }
+            }
+        });
+    }
 }
 static GENERATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Stop and detach the old service before mode1. Its published IH storage
 /// remains quarantined; the old worker's generation can never drain a new IH.
-pub(crate) async fn stop_for_reset() {
+pub(crate) async fn stop_for_reset() -> Result<(), ih::Error> {
     let mut slot = SERVICE.lock().await;
-    GENERATION.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-    if let Some(mut service) = slot.take() {
+    if let Some(service) = slot.as_mut() {
         service.stop(dispatch::Terminal::DeviceGone);
-        // Drop quarantines published ring storage; no hardware teardown.
-        drop(service);
+        // Never drop a source whose attempted mask was not confirmed.
+        // The caller must retain the GPU epoch and refuse power/reset work.
+        if service.vupdate.as_ref().is_some_and(|v| !v.retired()) {
+            return Err(ih::Error::Protocol);
+        }
     }
+    GENERATION.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    drop(slot.take());
+    Ok(())
+}
+
+/// Only the retained display owner may request a live LFC source. All
+/// enable/ACK/mask RMWs execute synchronously under SERVICE; no lock is
+/// retained across a hardware or executor wait. Absent backend uses the
+/// existing frame-count fallback. Mask failure blocks clock retirement.
+pub(crate) async fn set_vupdate(pipe: u8, enable: bool) -> Result<(), ih::Error> {
+    if pipe >= crate::amdgpu_rdna4::pipe_pool().count() {
+        return Err(ih::Error::Invalid);
+    }
+    let mut slot = SERVICE.lock().await;
+    let Some(service) = slot.as_mut() else {
+        return if enable && failed() {
+            Err(ih::Error::DeviceGone)
+        } else {
+            Ok(())
+        };
+    };
+    let Some(vupdate) = service.vupdate.as_ref() else {
+        return Ok(());
+    };
+    if enable {
+        if HALTED.load(core::sync::atomic::Ordering::Acquire) || failed() {
+            return Err(ih::Error::DeviceGone);
+        }
+        if !vupdate.enabled(pipe) {
+            // Remove already-queued IVs from a previous source generation
+            // while it is still masked, before arming its new timing.
+            let mut quiet = false;
+            for _ in 0..8 {
+                if !service.drain()? {
+                    quiet = true;
+                    break;
+                }
+            }
+            if !quiet {
+                return Err(ih::Error::Busy);
+            }
+        }
+    }
+    if enable && (blocked() || failed() || HALTED.load(core::sync::atomic::Ordering::Acquire)) {
+        return Err(ih::Error::Busy);
+    }
+    let vupdate = service.vupdate.as_mut().unwrap();
+    let result = if enable {
+        vupdate.enable(pipe)
+    } else {
+        vupdate.mask(pipe)
+    };
+    if let Err(e) = result {
+        service.stop(terminal(e));
+    }
+    result
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +138,7 @@ pub struct Status {
     pub jpeg0_traps: u64,
     pub faults: faults::Status,
     pub ras: ras::Status,
+    pub thermal: Option<thermal::Status>,
     /// Unmatched vectors written to the console (bounded by `LOG_BUDGET`).
     pub logged: u8,
     /// Kernel graphics, compute and SDMA0 owners registered by the service.
@@ -244,6 +324,8 @@ struct Service {
     routing: Result<Option<u8>, msi::Error>,
     history: History,
     faults: faults::Monitor,
+    thermal: Option<thermal::Monitor>,
+    vupdate: Option<vupdate::Monitor>,
     kernel: [Option<dispatch::Handle>; 3],
     wakes: Wakes,
     drained: usize,
@@ -275,6 +357,7 @@ impl Service {
             jpeg0_traps: self.history.jpeg0_traps,
             faults: self.faults.status(),
             ras: self.faults.ras_status(),
+            thermal: self.thermal.as_ref().map(thermal::Monitor::status),
             logged: self.logged,
             kernel: self
                 .kernel
@@ -286,6 +369,7 @@ impl Service {
     }
     fn drain(&mut self) -> Result<bool, ih::Error> {
         if HALTED.load(core::sync::atomic::Ordering::Acquire) {
+            self.stop(dispatch::Terminal::DeviceGone);
             return Err(ih::Error::DeviceGone);
         }
         self.drained = 0;
@@ -299,13 +383,37 @@ impl Service {
                 // while decoding one fault must not discard already-drained IVs.
                 let mut failed = None;
                 let mut fatal = None;
-                for event in batch.events() {
+                let mut thermal_failed = false;
+                let mut vupdate_failed = None;
+                let mut display_delivery = [true; 32];
+                for (index, event) in batch.events().enumerate() {
+                    if let Some(vupdate) = self.vupdate.as_mut() {
+                        match vupdate.handle(*event) {
+                            Ok(deliver) => display_delivery[index] = deliver,
+                            Err(e) => {
+                                vupdate_failed.get_or_insert(e);
+                            }
+                        }
+                    }
+                    if let Some(thermal) = self.thermal.as_mut() {
+                        match thermal.handle(*event) {
+                            Ok(true) => {
+                                crate::amdgpu_navi48_power::thermal_alert(thermal.threshold())
+                            }
+                            Ok(false) => {}
+                            Err(_) => thermal_failed = true,
+                        }
+                    }
                     match self.faults.handle(*event) {
                         Ok(f) => fatal = fatal.or(f),
                         Err(e) => {
                             failed.get_or_insert(e);
                         }
                     }
+                }
+                if let Some(e) = vupdate_failed {
+                    self.stop(terminal(e));
+                    return Err(e);
                 }
                 if self.faults.status().state != faults::State::Armed {
                     BLOCKED.store(true, core::sync::atomic::Ordering::Release);
@@ -315,7 +423,14 @@ impl Service {
                 let mut unmatched = [None; 32];
                 {
                     let mut table = dispatch::TABLE.lock();
-                    for (slot, event) in unmatched.iter_mut().zip(batch.events()) {
+                    for ((slot, event), deliver) in unmatched
+                        .iter_mut()
+                        .zip(batch.events())
+                        .zip(display_delivery)
+                    {
+                        if !deliver {
+                            continue;
+                        }
                         let delivery = table.route(event, src::classify(event));
                         *slot = reason(delivery).map(|r| (*event, r));
                     }
@@ -350,6 +465,10 @@ impl Service {
                     Err(e) => {
                         failed.get_or_insert(e);
                     }
+                }
+                if thermal_failed {
+                    self.stop(dispatch::Terminal::Interrupts(ih::Error::Protocol));
+                    return Err(ih::Error::Protocol);
                 }
                 if let Some(f) = fatal {
                     // Linux sets FED and requests a mode-1 reset; terminal
@@ -395,7 +514,13 @@ impl Service {
         crate::amdgpu_vmid::track_ih_drains(false);
         FAILED.store(true, core::sync::atomic::Ordering::Release);
         BLOCKED.store(true, core::sync::atomic::Ordering::Release);
+        if let Some(vupdate) = self.vupdate.as_mut() {
+            let _ = vupdate.stop();
+        }
         self.faults.stop();
+        if let Some(thermal) = self.thermal.as_mut() {
+            let _ = thermal.stop();
+        }
         if let Some(route) = &mut self.route {
             self.routing = route.disable().map(|()| None);
         }
@@ -418,6 +543,8 @@ pub(crate) unsafe fn install(
     route: &mut Option<Result<msi::Route, msi::Error>>,
     faults: &mut Option<faults::Monitor>,
     gmc: &mut crate::amdgpu_gmc_navi48::Gmc,
+    thermal: Option<thermal::Monitor>,
+    vupdate: Option<vupdate::Monitor>,
 ) -> Result<(), ih::Error> {
     let mut slot = SERVICE.try_lock().ok_or(ih::Error::Busy)?;
     if slot.is_some()
@@ -440,12 +567,20 @@ pub(crate) unsafe fn install(
         routing,
         history: History::new(),
         faults: faults.take().unwrap(),
+        thermal,
+        vupdate,
         kernel: [None; 3],
         wakes: Wakes::default(),
         drained: 0,
         logged: 0,
     });
     let service = slot.as_mut().unwrap();
+    if let Some(vupdate) = service.vupdate.as_mut() {
+        if let Err(e) = vupdate.initialize() {
+            service.stop(terminal(e));
+            return Err(e);
+        }
+    }
     for (handle, key) in service.kernel.iter_mut().zip(KERNEL) {
         // VMID0/PASID0 kernel context. A refused registration only loses
         // attribution: its vectors stay counted as unowned.
@@ -465,6 +600,16 @@ pub(crate) unsafe fn install(
         dispatch::TABLE
             .lock()
             .fail_all(dispatch::Terminal::Interrupts(ih::Error::Protocol));
+        return Err(ih::Error::Protocol);
+    }
+    // The retained service exists before enabling thermal sources. Exact
+    // MP1 acknowledgement never waits for the firmware/display owner.
+    if service
+        .thermal
+        .as_mut()
+        .is_some_and(|thermal| thermal.arm().is_err())
+    {
+        service.stop(dispatch::Terminal::Interrupts(ih::Error::Protocol));
         return Err(ih::Error::Protocol);
     }
     BLOCKED.store(false, core::sync::atomic::Ordering::Release);

@@ -17,6 +17,18 @@ impl<I: Io> Engine<I> {
                 .ib_result
                 .ok_or(Error::Busy)?
                 .map_err(|_| Error::Busy)?,
+            State::Hevc10Verified => {
+                self.hevc10_result
+                    .ok_or(Error::Busy)?
+                    .map_err(|_| Error::Busy)?
+                    .completion
+            }
+            State::HevcVerified => {
+                self.hevc_result
+                    .ok_or(Error::Busy)?
+                    .map_err(|_| Error::Busy)?
+                    .completion
+            }
             State::DecodeVerified => {
                 self.decode_result
                     .ok_or(Error::Busy)?
@@ -148,7 +160,15 @@ impl<I: Io> Engine<I> {
         }
         let size = self.access(|io, l| {
             flush(io, l)?;
-            Ok(io.memory_read(map, e::FEEDBACK + 6 * 4))
+            // Mesa radeon_vcn_enc.c::radeon_enc_get_feedback: word 1
+            // validates feedback; words 6/8 are end/start byte offsets.
+            let valid = io.memory_read(map, e::FEEDBACK + 4);
+            let end = io.memory_read(map, e::FEEDBACK + 6 * 4);
+            let start = io.memory_read(map, e::FEEDBACK + 8 * 4);
+            if valid == 0 || start != 0 || end <= start {
+                return Err(Error::EncodeOutput);
+            }
+            Ok(end - start)
         })?;
         if size == 0 || u64::from(size) > e::OUTPUT_BYTES {
             return Err(Error::EncodeOutput);
