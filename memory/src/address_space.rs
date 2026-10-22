@@ -701,8 +701,9 @@ struct DeferredFlush {
     ranges: Vec<(u64, u64)>,
     regions: Vec<Region>,
     page_tables: Vec<crate::frame::PhysFrame>,
-    /// Data frames extracted by the splitting punch path (no owning region
-    /// survives them); freed COW-aware at drain, after the batch flush.
+    /// Data frames extracted by the splitting punch path or by
+    /// MADV_DONTNEED (no owning region survives them); freed COW-aware at
+    /// drain, after the batch flush.
     loose_frames: Vec<crate::frame::PhysFrame>,
     pages: u64,
 }
@@ -10465,10 +10466,15 @@ impl AddressSpace {
     /// whose backing frame is non-zero, this routine:
     ///
     /// 1. Tears down the leaf PTE for that page (invlpg fires).
-    /// 2. Frees the underlying frame via `free_frame`, which honours
-    ///    the COW refcount table — a frame still shared with another
-    ///    address space stays live; only sole-owner frames return to
-    ///    the buddy allocator.
+    /// 2. Releases the underlying frame through the COW-aware batched
+    ///    free, which honours the refcount table — a frame still shared
+    ///    with another address space stays live; only sole-owner frames
+    ///    return to the buddy allocator. Sole-owner frames are parked in
+    ///    the deferred-flush quarantine and freed at the batch drain,
+    ///    after the batch invalidation; a discard that touches any
+    ///    COW-shared frame keeps the historical synchronous shape
+    ///    (broadcast, then release, before returning), because the peer
+    ///    address space observes the discard through the owner count.
     /// 3. Sets the per-page `phys[i]` slot back to the zero sentinel,
     ///    so the next user-mode access takes the demand-paging path
     ///    in `demand_alloc_page` and gets a freshly-zeroed frame.
@@ -10592,8 +10598,9 @@ impl AddressSpace {
                 // intersection with one live private, unlocked, non-shared VMA;
                 // the region lock keeps its ownership stable while the helper
                 // clears the run. Missing leaves (unfaulted holes) are benign.
-                // LOCAL invalidation only — the single cross-CPU broadcast below
-                // runs before any freed backing can be reused.
+                // LOCAL invalidation only — the extracted frames are parked
+                // in the deferred-flush quarantine below, whose broadcast
+                // runs before any parked backing can be reused.
                 // An implicit sparse tail cannot contain a leaf: faulting one
                 // would first extend `phys` through that index while holding
                 // this same region lock. Limit the walk to the explicit prefix,
@@ -10639,16 +10646,50 @@ impl AddressSpace {
         }
         #[cfg(target_arch = "x86_64")]
         crate::swap::swap_discard_batch(&discarded_swap);
-        // ONE tagged cross-CPU invalidation over the advised span BEFORE any
-        // frame is freed for reuse.
         if !to_release.is_empty() {
-            self.flush_region_broadcast(base, (hi - lo) >> 12);
-        }
-        if self.root.as_u64() != 0 {
-            // `to_release` is authoritative data backing only. The batched
-            // allocator path consults COW ownership once per touched shard;
-            // frames shared with another AS remain live.
-            crate::frame::free_frame_batch(&to_release);
+            // A frame still COW-shared with another address space keeps the
+            // historical synchronous shape: the peer observes this discard
+            // through the frame's owner count (its COW split decisions read
+            // that count), so the release must land before this call
+            // returns, with the broadcast before it exactly as before. The
+            // count snapshot is stable here: extraction zeroed this AS's
+            // slots, so no new owner can appear, and a peer exit between
+            // the peek and the release only makes the synchronous path
+            // conservative, never wrong.
+            let any_shared = to_release
+                .iter()
+                .any(|f| crate::frame::cow::count(f.start_address()) > 1);
+            if !any_shared && self.root.as_u64() != 0 {
+                // Park the released frames in the deferred-flush quarantine
+                // instead of paying a synchronous cross-CPU broadcast per
+                // call. The extraction above already retired each frame's
+                // leaf locally and dropped its rmap owner under the region
+                // lock, so the parked frames are exactly the loose-frame
+                // shape the splitting punch defers: the batch's one
+                // coalesced tag-wide invalidation runs BEFORE any parked
+                // frame is freed, so no stale translation can observe a
+                // freed backing reused, and the advised span joins the
+                // batch's pending ranges, so a re-mapping publication over
+                // it drains the batch first. Every parked frame is
+                // exclusively owned (checked above), and the drain frees
+                // through the same COW-aware batched free as the
+                // synchronous path.
+                self.defer_punch_flush(lo, (hi - lo) >> 12, to_release, Vec::new());
+            } else {
+                // ONE tagged cross-CPU invalidation over the advised span
+                // BEFORE any frame is freed for reuse. With no published
+                // root no frame could have been materialized into a live
+                // table, so the broadcast fires and nothing is freed,
+                // exactly the historical rootless shape.
+                self.flush_region_broadcast(base, (hi - lo) >> 12);
+                if self.root.as_u64() != 0 {
+                    // `to_release` is authoritative data backing only. The
+                    // batched allocator path consults COW ownership once
+                    // per touched shard; frames shared with another AS
+                    // remain live.
+                    crate::frame::free_frame_batch(&to_release);
+                }
+            }
         }
         Ok(())
     }
