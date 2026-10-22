@@ -138,9 +138,17 @@ then
 fi
 cp "$tmp/tree/usr/lib/narf/uefi/narf-frame" "$tmp/esp/EFI/NARF/narf-frame"
 
-NARF_BOOT_DIR="$tmp/tree/boot" "$tmp/tree/etc/grub.d/42_narf" >"$tmp/grub.cfg"
+mkdir -p "$tmp/mock-bin"
+printf '%s\n' '#!/bin/sh' 'set -eu' '[ "$1" = --target=fs_uuid ]' 'case "$2" in */EFI/NARF/narf.efi) ;; *) exit 1 ;; esac' 'echo 6D89-28C5' >"$tmp/mock-bin/grub-probe"
+chmod +x "$tmp/mock-bin/grub-probe"
+NARF_STATE_DIR="$tmp/state" NARF_BOOT_DIR="$tmp/tree/boot" \
+    PATH="$tmp/mock-bin:$PATH" "$tmp/tree/etc/grub.d/42_narf" >"$tmp/grub.cfg"
 grep -F 'if [ "${grub_platform}" = "efi" ]' "$tmp/grub.cfg" >/dev/null
-grep -F 'search --no-floppy --file --set=narf_esp /EFI/NARF/narf.efi' "$tmp/grub.cfg" >/dev/null
+grep -F 'search --no-floppy --fs-uuid --set=narf_esp 6D89-28C5' "$tmp/grub.cfg" >/dev/null
+if grep -F 'search --no-floppy --file --set=narf_esp /EFI/NARF/narf.efi' "$tmp/grub.cfg" >/dev/null; then
+    echo "GRUB menu searched all ESPs instead of the package ESP UUID" >&2
+    exit 1
+fi
 grep -F 'set root=$narf_esp' "$tmp/grub.cfg" >/dev/null
 grep -F 'chainloader /EFI/NARF/narf.efi' "$tmp/grub.cfg" >/dev/null
 grep -F 'search --no-floppy --file --set=narf_root /narf-kernel-0.0.0-test.1' "$tmp/grub.cfg" >/dev/null

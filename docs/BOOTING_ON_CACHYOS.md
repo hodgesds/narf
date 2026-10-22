@@ -794,7 +794,9 @@ sudo narf-uefi status --esp /boot
 ```
 
 Replace `/boot` with the mount point reported on the machine. On UEFI GRUB,
-regenerate `/boot/grub/grub.cfg` after a manual install and verify that the
+the generated entry searches for the recorded ESP filesystem UUID, so another
+disk or USB with an older `/EFI/NARF/narf.efi` cannot take precedence.
+Regenerate `/boot/grub/grub.cfg` after a manual install and verify that the
 NARF entry contains `chainloader`:
 
 ```sh
