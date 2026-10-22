@@ -154,14 +154,15 @@ kernel_test_in!(
     navi48_boot_order_failure_and_cancellation
 );
 
-/// The driver keeps half of a small BAR's free VRAM, but never more than
-/// 512 MiB, so a BAR showing all of VRAM gives clients nearly all of it.
+/// The reserve follows the original aperture, with a 32 MiB floor and
+/// 512 MiB cap, after existing owners and requested media have been charged.
 fn navi48_client_vram_keeps_a_bounded_driver_reserve() -> TestResult {
     const MIB: u64 = 1 << 20;
-    if driver_reserve(150 * MIB) != 75 * MIB
-        || driver_reserve(1024 * MIB) != 512 * MIB
-        || driver_reserve(15 << 30) != 512 * MIB
-        || driver_reserve(0) != 0
+    if driver_reserve(256 * MIB, 150 * MIB) != 32 * MIB
+        || driver_reserve(1024 * MIB, 800 * MIB) != 128 * MIB
+        || driver_reserve(15 << 30, 12 << 30) != 512 * MIB
+        || driver_reserve(256 * MIB, 16 * MIB) != 16 * MIB
+        || driver_reserve(256 * MIB, 0) != 0
     {
         return TestResult::Fail("driver VRAM reserve");
     }
@@ -231,4 +232,45 @@ fn navi48_fw_reservation_pins_both_pools() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48_boot",
     navi48_fw_reservation_pins_both_pools
+);
+
+fn navi48_client_chunk_preserves_floor_after_actual_variable_owner_claims() -> TestResult {
+    use narf_bus::MmioRegion;
+    use narf_memory::PhysAddr;
+    const MIB: u64 = 1 << 20;
+    for (held, wanted) in [(160 * MIB, true), (160 * MIB + 4096, false)] {
+        // SAFETY: metadata-only Pool; no mapping read/write occurs.
+        let pool = unsafe {
+            Pool::from_owned_range(
+                MmioRegion {
+                    phys: PhysAddr::new(0x90000000),
+                    virt: 0,
+                    len: 256 * MIB,
+                    kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+                },
+                0x8_0000_0000,
+            )
+        }
+        .unwrap();
+        let occupied = pool.reserve(held).unwrap();
+        let before = pool.available();
+        match reserve_client_chunk(&pool) {
+            Ok(chunk) => {
+                assert!(wanted);
+                assert_eq!(chunk.size(), 64 * MIB);
+                assert_eq!(pool.available(), 32 * MIB);
+                drop(chunk);
+            }
+            Err(Error::Allocation) => assert!(!wanted),
+            other => panic!("client admission {other:?}"),
+        }
+        assert_eq!(pool.available(), before);
+        drop(occupied);
+        assert_eq!(pool.available(), 256 * MIB);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48",
+    navi48_client_chunk_preserves_floor_after_actual_variable_owner_claims
 );

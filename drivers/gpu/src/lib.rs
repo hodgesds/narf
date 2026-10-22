@@ -226,6 +226,7 @@ pub mod amdgpu_gddr6;
 pub mod amdgpu_gem;
 pub mod amdgpu_gfx;
 pub mod amdgpu_gfx10_topology;
+mod amdgpu_gfx12_draw;
 pub mod amdgpu_gfx12_queue;
 pub mod amdgpu_gfx12_rs64;
 pub mod amdgpu_gfx12_setup;
@@ -422,6 +423,7 @@ pub use amdgpu_rdna2_vcn as amdgpu_vcn_navi22;
 pub mod amdgpu_rdna2_vcn_cs;
 /// Compatibility alias for the original Navi22 API.
 pub use amdgpu_rdna2_vcn_cs as amdgpu_vcn_navi22_cs;
+mod amdgpu_media_reservation;
 #[path = "amdgpu_video_caps_navi22.rs"]
 pub mod amdgpu_rdna2_video_caps;
 pub mod amdgpu_vcn_navi48;

@@ -9,7 +9,47 @@ The repository build selects Mesa26.2.4 and libdrm2.4.134 in
 is <https://archive.mesa3d.org/mesa-26.2.4.tar.xz>, verified against that
 recipe's SHA256:
 `bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9`.
-The source was read, not built or run against physical hardware.
+Selected common initialization is now built and executed by the host replay
+below. No source or fixture was run against physical hardware.
+
+## Executed loader contract replay
+
+The separate `tests/mesa_info/check.py` now links the actual selected Mesa
+common initialization and libdrm 2.4.134 library to host-compiled production
+Rust INFO dispatch/builders. Representative observed-state inputs and narrow
+host transport adapters are explicit; this is not captured board state or a
+new expected-field C model. Forty-two positive/negative cases cover both
+GFX1200/Navi44 and GFX1201/Navi48 and pass the fully published query contract
+only in an explicit hypothetical host DRM 3.54 plus acceleration envelope.
+
+The real production refusal is earlier than a RADV KHR_display-only check:
+`ac_drm_device_initialize` calls libdrm `amdgpu_device_initialize`, then
+`_amdgpu_device_initialize` calls `amdgpu_query_info(ACCEL_WORKING)` and returns
+`-EBADF` for zero. DRM 3.54 with unchanged acceleration zero still fails there.
+DRM 3.0 with only a host acceleration override passes libdrm but fails Mesa
+`ac_query_gpu_info`'s minor54 check. Both production gates stay unchanged.
+
+Omitting DEV_INFO, GB_ADDR_CONFIG, usable graphics/compute HW_IP information,
+MEMORY or any mandatory CP/VCN firmware answer fails at the actual consumer.
+Actual VCN metadata withdrawal or an unsupported VCN IP fails the mandatory
+firmware query while its ring is exposed; a withdrawn media owner correctly
+permits graphics-only initialization without a VCN firmware query. MAX_IBS
+refusal is optional to Mesa and takes its own fallback. NARF still supplies
+its actual bound, preventing that larger fallback from becoming an assumed
+submission capacity. No additional mandatory fully published query gap was
+found by this replay; API rendering and physical acceptance remain separate.
+
+Raw VCN firmware interface minors8/9/10/11 reach Mesa unchanged. Selected Mesa
+`radeon_vcn_enc_5_0.c:988–994` chooses min(reported minor,10), so1.8 selects1.8.
+The AVC IGT proof now selects the retained authenticated interface the same
+way as HEVC/AV1: major1, minor>=8, clamped to1.10. Missing or unsupported
+interface is refused before fresh allocation or publication; preclaimed
+unpublished storage is preserved. The original full IGT1.9 command body still
+matches, and unchanged Mesa version assignments/selection/session-info
+constructors independently check1.8/1.9/1.10 headers (including rawminor11
+clamping). Native-model regressions cover all sessions, restart, cancellation
+and no-side-effect refusal. This fixes software interface selection; no
+physical compatibility or capability follows from the INFO or model replay.
 
 ## Application software requirements
 
@@ -17,6 +57,15 @@ The source was read, not built or run against physical hardware.
   refuses DRMminor<54. Advertising3.42 would still fail initialization.
   At1496, user queues remain opt-in through AMD_USERQ and the device's
   `userq_ip_mask`; they are separate from normal graphics/compute CS.
+- At1539–1546, a nonzero VCN decoder or unified ring additionally requires
+  `FW_VERSION/FW_VCN`; otherwise common GPU initialization fails before
+  creating a renderer. Native INFO now returns the raw VCN common-header
+  `ucode_version` and zero feature, matching Linux `amdgpu_vcn_setup_ucode`
+  and `amdgpu_firmware_info`. Its metadata is tied to the retained container
+  whose payload PSP accepted, complete GC12 boot/TMR ownership, and the
+  current proven client media owner. Missing, stopped or unproven media
+  remains EINVAL; reset withdraws it before awaiting. No DRMminor or codec
+  capability is raised by this query fix.
 - `src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c`, lines1007–1118,
   builds gang leader/follower IBs. The last CS is the leader; mixed IPs
   become IB chunks in one request, with the last IB matching the request's
@@ -36,11 +85,20 @@ The source was read, not built or run against physical hardware.
   Real completion/readback remains a physical test. It does not establish
   a rendered image, texture/resource coverage, Mesa API conformance,
   compositor presentation or application rendering-to-scanout ordering.
-- A deterministic kernel draw proof still needs a pinned GFX12 primary
-  state/shader reference. IGT2.4's GFX12 programs in
-  `lib/amdgpu/shaders/amd_shaders.c` are buffer-clear/copy compute kernels;
-  no GFX12 draw fixture was found. Reconstructing graphics state from
-  older generations is not an acceptable substitute.
+- The opt-in native rectangle diagnostic now uses actual Mesa26.2.4
+  META `CmdClearAttachments`, ACO NGG/PS, graphics preamble, GE rings,
+  Addrlib3 CB layout and draw/cache-completion constructors. The offline,
+  hash-pinned `tests/gfx12_render/generate.sh` reproduces both gfx1200 and
+  gfx1201 fixtures and both PFP2680 constructor branches. The shim records
+  gfx1201; the target family/SE inputs are explicit constructor inputs,
+  rather than a claimed gfx1200 hardware profile. All 4096 pixel addresses
+  are checked through Addrlib3 and the two shader ISAs through LLVM.
+  Two native client roots verify rendered/untouched pixels and guards,
+  while failure/cancellation retain ownership until proved reset.
+  IGT2.4's `lib/amdgpu/shaders/amd_shaders.c` supplies compute programs;
+  this separate draw fixture comes from current-generation RADV state.
+  Physical image execution, Mesa API conformance and capability promotion
+  remain open acceptance work.
 
 Local Linux primary paths are
 `/usr/src/linux/drivers/gpu/drm/amd/amdgpu/{gfx_v12_0.c,gmc_v12_0.c,amdgpu_cs.c,amdgpu_job.c}`.

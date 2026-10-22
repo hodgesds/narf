@@ -8,11 +8,11 @@
 #include "plane_helpers.h"
 static void *allocate(const ADDR_ALLOCSYSMEM_INPUT *in) {return calloc(1,in->sizeInBytes);}
 static ADDR_E_RETURNCODE release(const ADDR_FREESYSMEM_INPUT *in) {free(in->pVirtAddr);return ADDR_OK;}
-static ADDR3_COMPUTE_SURFACE_INFO_OUTPUT plane(ADDR_HANDLE lib,pipe_format fmt,unsigned p,unsigned policy) {
+static ADDR3_COMPUTE_SURFACE_INFO_OUTPUT plane(ADDR_HANDLE lib,pipe_format fmt,unsigned p,unsigned policy,unsigned width,unsigned height) {
     auto rgb=si_get_plane_format(fmt,p);
     ADDR3_COMPUTE_SURFACE_INFO_INPUT in={};in.size=sizeof(in);
     in.swizzleMode=ADDR3_LINEAR;in.resourceType=ADDR_RSRC_TEX_2D;
-    in.width=util_format_get_plane_width(fmt,p,128);in.height=util_format_get_plane_height(fmt,p,128);
+    in.width=util_format_get_plane_width(fmt,p,width);in.height=util_format_get_plane_height(fmt,p,height);
     in.format=ADDR_FMT_INVALID;in.bpp=bits_per_element(rgb);in.numMipLevels=in.numSlices=in.numSamples=1;
     // 0 uses Addrlib's real128-byte linear minimum. Mesa's 256-byte interop
     // policy is independently exercised as well, and is not the compact fixture.
@@ -30,7 +30,10 @@ static ADDR3_COMPUTE_SURFACE_INFO_OUTPUT plane(ADDR_HANDLE lib,pipe_format fmt,u
     }
     return out;
 }
-int main() {
+int main(int argc,char **argv) {
+    const unsigned width=argc==3?std::strtoul(argv[1],nullptr,10):128;
+    const unsigned height=argc==3?std::strtoul(argv[2],nullptr,10):128;
+    assert(width>=2 && height>=2 && width%2==0 && height%2==0);
     // Actual primary GFX1200/1201 external-revision ranges.
     for(unsigned rev: {0x40u,0x50u}) {
         ADDR_CREATE_INPUT in={};in.size=sizeof(in);in.chipEngine=0xd;in.chipFamily=0x98;in.chipRevision=rev;
@@ -38,7 +41,7 @@ int main() {
         ADDR_CREATE_OUTPUT out={};out.size=sizeof(out);assert(AddrCreate(&in,&out)==ADDR_OK);
         for(unsigned depth: {8u,10u})for(unsigned policy: {0u,256u}) {
             auto fmt=depth==8?PIPE_FORMAT_Y8_U8V8_420_UNORM:PIPE_FORMAT_X6Y10_X6U10X6V10_420_UNORM;
-            auto y=plane(out.hLib,fmt,0,policy),uv=plane(out.hLib,fmt,1,policy);
+            auto y=plane(out.hLib,fmt,0,policy,width,height),uv=plane(out.hLib,fmt,1,policy,width,height);
             uint64_t offset=(y.surfSize+uv.baseAlign-1)&~uint64_t(uv.baseAlign-1);
             printf("%u %u %u %u %u %llu %llu %llu %llu %u %u %llu %llu %u %u\n",rev,depth,policy,y.pitch,uv.pitch,
                 (unsigned long long)y.sliceSize,(unsigned long long)uv.sliceSize,(unsigned long long)y.surfSize,(unsigned long long)uv.surfSize,

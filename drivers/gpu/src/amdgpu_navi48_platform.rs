@@ -10,6 +10,8 @@ use core::ops::Range;
 use narf_capabilities::{Cap, Read};
 use narf_graphics_driver::generic::GenericFb;
 use narf_lib::mutex::Mutex;
+#[path = "amdgpu_navi48_client_draw.rs"]
+mod client_draw;
 #[path = "amdgpu_navi48_client_shader.rs"]
 mod client_shaders;
 #[path = "amdgpu_navi48_platform_recovery.rs"]
@@ -112,6 +114,7 @@ pub struct Diagnostics {
     pub shaders:
         Option<Result<crate::amdgpu_gfx12_shader::Proof, crate::amdgpu_gfx12_queue::Error>>,
     pub client_shaders: Option<Result<client_shaders::Proof, narf_filesystem::FsError>>,
+    pub client_draw: Option<Result<client_draw::Proof, narf_filesystem::FsError>>,
     pub media_transport: Option<Result<crate::amdgpu_vcn_navi48::InterruptProof, boot::Error>>,
     pub media_state: Option<crate::amdgpu_vcn_navi48::State>,
     pub media_ibs:
@@ -123,8 +126,23 @@ pub struct Diagnostics {
         Option<Result<crate::amdgpu_vcn_navi48::DecodeProof, crate::amdgpu_vcn_navi48::Error>>,
     pub media_hevc10_decode:
         Option<Result<crate::amdgpu_vcn_navi48::DecodeProof, crate::amdgpu_vcn_navi48::Error>>,
+    /// Original Profile0 keyframe completion; full VP9 codec row stays gated.
+    pub media_vp9_decode:
+        Option<Result<crate::amdgpu_vcn_navi48::DecodeProof, crate::amdgpu_vcn_navi48::Error>>,
+    pub media_vp9_10_decode:
+        Option<Result<crate::amdgpu_vcn_navi48::DecodeProof, crate::amdgpu_vcn_navi48::Error>>,
+    pub media_av1_decode:
+        Option<Result<crate::amdgpu_vcn_navi48::DecodeProof, crate::amdgpu_vcn_navi48::Error>>,
+    pub media_av1_10_decode:
+        Option<Result<crate::amdgpu_vcn_navi48::DecodeProof, crate::amdgpu_vcn_navi48::Error>>,
     pub media_encode:
         Option<Result<crate::amdgpu_vcn_navi48::EncodeProof, crate::amdgpu_vcn_navi48::Error>>,
+    pub media_av1_encode: Option<
+        Result<crate::amdgpu_vcn_navi48::EncodeRoundtripProof, crate::amdgpu_vcn_navi48::Error>,
+    >,
+    pub media_hevc_encode: Option<
+        Result<crate::amdgpu_vcn_navi48::EncodeRoundtripProof, crate::amdgpu_vcn_navi48::Error>,
+    >,
     pub media_jpeg: Option<Result<crate::amdgpu_jpeg_navi48::Proof, boot::Error>>,
     pub media_jpeg_decode:
         Option<Result<crate::amdgpu_jpeg_navi48::DecodeProof, crate::amdgpu_jpeg_navi48::Error>>,
@@ -151,13 +169,20 @@ pub fn status() -> Status {
                 queue_interrupts: boot.queue_interrupts(),
                 shaders: boot.shader_result(),
                 client_shaders: client_shaders::result(*READ_GENERATION.lock()),
+                client_draw: client_draw::result(*READ_GENERATION.lock()),
                 media_transport: boot.media_result(),
                 media_state: boot.media_state(),
                 media_ibs: boot.media_ib_result(),
                 media_decode: boot.media_decode_result(),
                 media_hevc_decode: boot.media_hevc_decode_result(),
                 media_hevc10_decode: boot.media_hevc10_decode_result(),
+                media_vp9_decode: boot.media_vp9_decode_result(),
+                media_vp9_10_decode: boot.media_vp9_10_decode_result(),
+                media_av1_decode: boot.media_av1_decode_result(),
+                media_av1_10_decode: boot.media_av1_10_decode_result(),
                 media_encode: boot.media_encode_result(),
+                media_hevc_encode: boot.media_hevc_encode_result(),
+                media_av1_encode: boot.media_av1_encode_result(),
                 media_jpeg: boot.media_jpeg_result(),
                 media_jpeg_decode: boot.media_jpeg_decode_result(),
                 jpeg_state: boot.media_jpeg_state(),
@@ -334,6 +359,27 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     }
     // Boot's block_on_spin may have IF=0. Defer the CPU-delivery proof to the
     // executor; the IRQ service keeps running independently of OWNER.
+    // Claim every requested media arena before the deferred worker or client
+    // heap can consume the pool. Refusal publishes no media address or power.
+    if MEDIA_PROOF.load(Ordering::Acquire)
+        || MEDIA_CLIENTS.load(Ordering::Acquire)
+        || DECODE_PROOF.load(Ordering::Acquire)
+        || ENCODE_PROOF.load(Ordering::Acquire)
+        || JPEG_PROOF.load(Ordering::Acquire)
+        || JPEG_DECODE_PROOF.load(Ordering::Acquire)
+    {
+        // SAFETY: this scope retains OWNER, trained GMC/firmware and exclusive
+        // device lifetime. Preparation is synchronous and never starts media.
+        unsafe {
+            boot.prepare_media_transport(
+                MEDIA_CLIENTS.load(Ordering::Acquire),
+                DECODE_PROOF.load(Ordering::Acquire),
+                ENCODE_PROOF.load(Ordering::Acquire),
+                JPEG_PROOF.load(Ordering::Acquire),
+                JPEG_DECODE_PROOF.load(Ordering::Acquire),
+            )
+        }?;
+    }
     narf_scheduler::spawn(prove_queue_interrupts());
     if let Some((limits, level)) = boot.power_info() {
         crate::amdgpu_navi48_power::start(limits, level);
@@ -389,13 +435,17 @@ fn register_submitter(
             device_recovery: core::sync::atomic::AtomicBool::new(false),
         });
         *SUBMITTER.lock() = Some(submitter.clone());
-        crate::amdgpu_info::publish_navi48_video(boot.proven_video());
+        crate::amdgpu_info::publish_navi48_media(
+            boot.proven_video(),
+            boot.client_media_firmware_version(),
+        );
         crate::amdgpu_cs::register_submitter(card, submitter.clone());
         narf_scheduler::spawn(watchdog(submitter));
         if SHADER_PROOF.load(core::sync::atomic::Ordering::Acquire)
             && matches!(boot.shader_result(), Some(Ok(_)))
         {
             narf_scheduler::spawn(client_shaders::prove());
+            narf_scheduler::spawn(client_draw::prove());
         }
     }
 }
@@ -1082,7 +1132,7 @@ async unsafe fn quiesce(
     }
     crate::amdgpu_navi48_power::stop();
     crate::amdgpu_info::withdraw_navi48_clock();
-    crate::amdgpu_info::publish_navi48_video(0);
+    crate::amdgpu_info::publish_navi48_media(0, None);
     for display in 0..4 {
         present_slot(display).native.store(false, Ordering::Release);
     }
@@ -1631,6 +1681,9 @@ impl Submitter {
                                 self.watch.lock()[r].recovered(narf_time::monotonic_ns());
                             }
                         }
+                        if result.is_ok() && ring == MEDIA_RING as usize {
+                            media_clients::activate_media(boot);
+                        }
                         result
                     }
                     (Err(e), _) => Err(e),
@@ -1856,7 +1909,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                             }
                         }
                         Err(crate::amdgpu_jpeg_navi48::Error::Invalid) => {
-                            break Err(FsError::InvalidData)
+                            break Err(FsError::InvalidData);
                         }
                         Err(crate::amdgpu_jpeg_navi48::Error::Busy) => break Err(FsError::Busy),
                         Err(_) => break Err(FsError::NoDevice),
@@ -2037,6 +2090,7 @@ async fn prove_queue_interrupts() {
                     // native submissions acquire OWNER. This scope releases
                     // OWNER before that separately scheduled task can enter.
                     narf_scheduler::spawn(client_shaders::prove());
+                    narf_scheduler::spawn(client_draw::prove());
                 }
             }
         }

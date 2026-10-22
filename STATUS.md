@@ -326,6 +326,29 @@ and pipe-harvesting differences (`amdgpu_rdna4`, checked against Linux by
 `drivers/gpu/tests/rdna4_family/check.sh`). Model-tested on Navi44 and
 harvested Navi48 profiles only; no Navi44 board has run it.
 
+The `codex/rx9000-completion` follow-up retains and publishes the VCN firmware
+version only with the current proven media owner. Its fixed-stream proofs now
+include HEVC Main8/Main10, VP9 Profile0/Profile2 and AV1 Main8/Main10 decoding,
+plus HEVC384x128 and AV1 320x128 encode/native-decode roundtrips. Full decoded
+pixel and guard checks supplement unchanged Mesa/Addrlib/FFmpeg reference
+checks; these are model and source results, with physical codec execution
+still unrun. Requested proof backing is transactionally reserved before the
+deferred worker and client VRAM carve; insufficient space refuses the complete
+request rather than dropping profiles or recycling uncertain DMA storage.
+An actual Mesa26.2.4/libdrm2.4.134 host replay executes production Rust INFO
+builders for both dies. It verifies the current acceleration and DRM-version
+refusals and the remaining query contract in an explicit hypothetical host
+envelope. DRM3.0.0, ACCEL_WORKING=0 and the new codec capability gates remain.
+
+The shader-proof opt-in also schedules a native graphics rectangle diagnostic
+through two separate client roots/PASIDs on gfx1200/gfx1201. Pinned actual Mesa
+NGG/PS, draw/cache-completion packets and Addrlib3 linear surface addresses
+define the fixture. It checks all drawn and untouched pixels and immutable
+storage/guards, retaining uncertain work until proven reset. Separate R|X
+code and R|W data use system/GTT backing. Both target ISAs and the pre/post-PFP2680
+constructor variants pass independent primary comparisons; physical rendering,
+Mesa application conformance and rendering-to-scanout acceptance remain open.
+
 RX 9000 follow-ups now retain an acquired Azalia audio endpoint per stream
 across TMDS, FRL, legacy DP and UHBR, including MST, independently of pipe
 and HPO encoder indices. Allocation follows Linux's `find_first_free_audio`;
@@ -351,8 +374,8 @@ reclaims idle BOs without evicting another target, and rechecks master/identity
 before pinning. Per-card placement admission covers allocation, submission,
 transfer and reset; stale or cancelled transfers retain their staging/backing
 until actual completion or a proven reset. DSC depth/link fallback uses final
-native admission and complete MST payloads. Physical board acceptance and the
-GPU WC mapping follow-up after its separate TCB prerequisite remain open.
+native admission and complete MST payloads. GPU WC mappings and their TCB
+prerequisite are merged; physical board acceptance remains open.
 
 Implemented: GDDR6 training; PSP14 SOS/GPCOM/TMR; mandatory graphics/media
 firmware parsing, upload and autoload; GC12 RS64 counter programming and pipe

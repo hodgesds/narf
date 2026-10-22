@@ -1,6 +1,6 @@
-# Navi48 native display acceptance
+# RX 9000 native hardware acceptance
 
-No RX 9070 XT physical display run has been recorded for this branch. QEMU
+No Navi48 or Navi44 physical display run has been recorded for this branch. QEMU
 register/protocol models and Linux differential vectors do not fill the physical
 columns below. Milestone 4 remains open until every advertised connector, mode
 and property has evidence for boot, hotplug, modeset and disable, with advanced
@@ -78,17 +78,52 @@ The GPU specification is authoritative for the current exposed interfaces.
 
 | Feature family | Current software evidence / remaining work | Physical evidence |
 | --- | --- | --- |
-| Legacy DP SST / FEC / LTTPR | Native sequencing and protocol models; transition/reset recovery incomplete | None |
-| HDMI TMDS / SCDC / RGB depth and range / 8-bpc 4:2:0 | Native register and capability models; pre-link sink cleanup implemented | None |
-| UHBR / FRL | Startup, training, scanout, shutdown and live FRL status models; FRL 8/10/12-bpc 4:2:0 up to 4096 pixels; firmware-made mux/clock assumptions need confirmation; FRL opt-in | None |
-| Legacy DP DSC | PPS/DML differential vectors and native models; HPO/FRL DSC, larger ODM layouts and other input formats remain open | None |
-| Legacy MST | Topology, payload, notification, path-budget, fixed-output and per-stream LPCM models; mixed MST/SST, UHBR MST and DSC remain open | None |
-| Joint display configuration | Joint DML/clock/CRB models, four fixed pipes; ODM, broader routing and seamless shared-clock changes remain open | None |
-| Scaling / composition / tiling / color management / HDR / VRR | Additional native programming and exposure gates remain open | None |
-| Audio | TMDS/FRL HDMI, legacy/UHBR DP SST and legacy MST LPCM models; AFMT/APG/ACR, bandwidth filtering, DTO/endpoint ownership, MST payload/handover and DP DSC shared PPS covered; compressed passthrough/HBR descriptors and codec IEC958/channel-map controls modelled; UHBR MST audio remains open | None |
+| Legacy DP SST / FEC / LTTPR | Native link, owned retraining and teardown/recovery models; physical transitions remain unverified | None |
+| HDMI TMDS / SCDC / output formats and depth | Native RGB, YCbCr420/422/444, deep-color admission, AVI/FMT/OPTC/MPC and sink-cleanup models | None |
+| UHBR / FRL | Native startup, training, scanout, shutdown and live-status models; firmware mux/clock and sink behavior need confirmation; FRL remains opt-in | None |
+| DSC / ODM | Native legacy DP, UHBR and FRL programming with PPS/DML comparisons, split-pipe allocation and retirement models | None |
+| MST / converter workarounds | Legacy/UHBR topology, DSC, concurrent SST/MST, multiple branches, PCON constraints and Synaptics FIFO/decoder ownership models | None |
+| Joint display configuration | Harvest-aware pipes and joint DML/clock/CRB/DET/ODM admission and reconfiguration models | None |
+| Scaling / composition / tiling / color / HDR / VRR | Native plane/tiling/scaling, color/HDR and FreeSync metadata/LFC/MCCS models; board/sink acceptance required | None |
+| Audio | TMDS/FRL HDMI and legacy/UHBR DP SST/MST; endpoint/DTO/packet ownership, payload transitions, compressed/HBR and channel-map models | None |
+| Rendering / compute | Kernel and client-context compute proofs; graphics draw/render-target proof under implementation; actual Mesa/API/compositor acceptance open | None |
+| Media | AVC/JPEG paths; HEVC Main8/Main10, VP9 Profile0/2 and AV1 Main8/Main10 decoder and HEVC Main8/AV1 Main8 encoder-roundtrip integration; additional codec rows remain gated | None |
 | Board-specific panel / USB-C routes | Inventory required before applicability or implementation decisions | None |
 | Protected output | [Separate requirements](navi48-protected-output.md); unsupported, unadvertised | None |
 
 Software validation logs are recorded in the local branch work log. A future
 physical run should cite the tested commit rather than inheriting a pass from a
 different board, mode, firmware version or model-only result.
+
+## Rendering, media and lifecycle acceptance
+
+Run the matrix separately on gfx1200/Navi44 and gfx1201/Navi48, including
+harvested/OEM boards and small CPU-visible BAR apertures. Record actual firmware,
+VRAM/BAR sizes, retained owner allocations, client heap and refusal/recovery
+behavior under pressure. A nominal GPU family or successful initialization does
+not establish these device-specific results.
+The complete requested media proof set currently retains156069888bytes before
+firmware, displays and other owners. Clean S3/BACO resume reclaims the stopped
+old proof owner; fault recovery conservatively retains the old whole owner.
+On a256MiB aperture, a replacement full request can therefore refuse and leave
+the device lost. Record this availability limit and the actual refusal rather
+than assuming the initial admission result guarantees fault recovery.
+
+For graphics and compute, retain native proof readbacks and submitted command
+traces, then run the selected Mesa/libdrm stack with real application contexts.
+Record renderer/device strings and verify that output came from this GPU; a
+software fallback cannot fill an acceptance row. Exercise multiple clients,
+resource/synchronization reuse, fault isolation and rendering-to-scanout ordering.
+Keep API/ring/version claims gated until their acceptance requirements hold.
+
+For each advertised codec/profile/direction, retain source and decoded pixel
+checks, encode/decode roundtrips, supported geometry/precision limits, malformed
+input and concurrent graphics/media teardown. A single intra/keyframe proof is
+not inter-frame, profile-range or application acceptance. In particular, the
+HEVC encoder proof uses the selected Mesa minimum of384x128 and AV1 uses320x128;
+these bounded proof shapes do not define the complete advertised limits.
+
+Exercise repeated cold/warm boots, inherited active display, runtime power,
+reset/recovery, suspend/resume, shutdown and device removal with active clients.
+For system suspend, validate global SMP park/restart as well as GPU-local state;
+the device model alone does not prove that platform sequence.
