@@ -139,6 +139,11 @@ struct EpollRegistration {
     sub_id: u64,
     active: AtomicBool,
     queued: AtomicBool,
+    /// Intrusive ready-list links. The owning instance's `ready` lock is the
+    /// sole writer; atomics make the stable `Arc` node `Sync` without a second
+    /// per-node lock. A linked node carries one raw `Arc` strong reference.
+    ready_prev: core::sync::atomic::AtomicPtr<EpollRegistration>,
+    ready_next: core::sync::atomic::AtomicPtr<EpollRegistration>,
     file: Weak<dyn FileOps>,
     offset: u64,
     state: IrqSafeSpinLock<EpollItemState>,
@@ -166,6 +171,8 @@ impl EpollRegistration {
             sub_id,
             active: AtomicBool::new(true),
             queued: AtomicBool::new(false),
+            ready_prev: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+            ready_next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             file: Arc::downgrade(file),
             offset,
             state: IrqSafeSpinLock::new(EpollItemState {
@@ -259,64 +266,117 @@ struct EpollInner {
 /// Ready-list and fallback-poll state, isolated from the cold interest tree.
 #[derive(Debug)]
 struct EpollReady {
-    /// Last entry returned by a wait. Level-triggered entries remain ready,
-    /// so begin the next scan after this fd to match Linux ready-list
-    /// round-robin behavior when readiness exceeds `maxevents`.
+    /// Intrusive FIFO of ready registrations. Every linked node owns one raw
+    /// `Arc` strong reference, transferred back to a normal `Arc` on removal.
+    /// This is Linux's `rdllist` shape: hot enqueue/dequeue/delete are O(1),
+    /// independent of the number of watched or ready fds.
+    head: core::sync::atomic::AtomicPtr<EpollRegistration>,
+    tail: core::sync::atomic::AtomicPtr<EpollRegistration>,
+    len: usize,
+    /// Cursor for sources that cannot publish into the ready list and must be
+    /// polled. This cold set remains ordered; it is not on the callback path.
     scan_after: Option<i32>,
-    /// Ready registrations indexed by fd. The sequence changes on every
-    /// callback, including callbacks for an already-listed item, so write-back
-    /// cannot erase an event that raced the readiness poll.
-    ready: BTreeMap<i32, ReadyListing>,
-    ready_seq: u64,
+    /// Alternate the first candidate when both queues have work so an always-
+    /// polled timer/nested fd cannot starve behind a permanently-ready LT fd.
+    prefer_always_poll: bool,
     /// Interest fds without a durable readiness cell. These cannot list
     /// themselves, so fast passes merge them with the ready index.
     always_poll: BTreeSet<i32>,
 }
 
-#[derive(Clone, Debug)]
-struct ReadyListing {
-    registration: Arc<EpollRegistration>,
-    seq: u64,
-}
-
-type ReadyCandidate = (i32, Option<(Arc<EpollRegistration>, u64)>);
+type ReadyCandidate = (i32, Option<Arc<EpollRegistration>>);
 
 impl EpollReady {
     fn list(&mut self, registration: &Arc<EpollRegistration>) -> bool {
         if !registration.active.load(Ordering::Acquire) {
             return false;
         }
-        self.ready_seq = self.ready_seq.wrapping_add(1);
-        if let Some(listing) = self.ready.get_mut(&registration.fd) {
-            if Arc::ptr_eq(&listing.registration, registration) {
-                // Already linked: refresh only the race generation. Replacing
-                // the whole value would do two contended Arc refcount updates
-                // and a needless B-tree value move on every same-level event.
-                listing.seq = self.ready_seq;
-                registration.queued.store(true, Ordering::Release);
-                return true;
-            }
+        if registration.queued.load(Ordering::Relaxed) {
+            return true;
         }
-        self.ready.insert(
-            registration.fd,
-            ReadyListing {
-                registration: Arc::clone(registration),
-                seq: self.ready_seq,
-            },
-        );
+        let node = Arc::into_raw(Arc::clone(registration)) as *mut EpollRegistration;
+        let tail = self.tail.load(Ordering::Relaxed);
+        registration.ready_prev.store(tail, Ordering::Relaxed);
+        registration
+            .ready_next
+            .store(core::ptr::null_mut(), Ordering::Relaxed);
+        if tail.is_null() {
+            self.head.store(node, Ordering::Relaxed);
+        } else {
+            // SAFETY: a non-null tail is linked and kept alive by the ready
+            // queue's raw Arc reference. This lock is the only link writer.
+            unsafe { (&*tail).ready_next.store(node, Ordering::Relaxed) };
+        }
+        self.tail.store(node, Ordering::Relaxed);
+        self.len += 1;
+        // Publish membership only after both neighboring links are complete.
         registration.queued.store(true, Ordering::Release);
         true
     }
 
-    fn unlink(&mut self, registration: &Arc<EpollRegistration>) {
-        let matches = self
-            .ready
-            .get(&registration.fd)
-            .is_some_and(|listing| Arc::ptr_eq(&listing.registration, registration));
-        if matches {
-            self.ready.remove(&registration.fd);
+    /// Detach `node` and transfer the queue's raw strong reference to a normal
+    /// `Arc`. The caller holds the ready lock and `node` is linked here.
+    unsafe fn unlink_node(&mut self, node: *mut EpollRegistration) -> Arc<EpollRegistration> {
+        // SAFETY: the queue's raw Arc reference keeps `node` live.
+        let registration = unsafe { &*node };
+        let prev = registration.ready_prev.load(Ordering::Relaxed);
+        let next = registration.ready_next.load(Ordering::Relaxed);
+        if prev.is_null() {
+            self.head.store(next, Ordering::Relaxed);
+        } else {
+            // SAFETY: every non-null neighbor is linked in this same queue.
+            unsafe { (&*prev).ready_next.store(next, Ordering::Relaxed) };
         }
+        if next.is_null() {
+            self.tail.store(prev, Ordering::Relaxed);
+        } else {
+            // SAFETY: every non-null neighbor is linked in this same queue.
+            unsafe { (&*next).ready_prev.store(prev, Ordering::Relaxed) };
+        }
+        registration
+            .ready_prev
+            .store(core::ptr::null_mut(), Ordering::Relaxed);
+        registration
+            .ready_next
+            .store(core::ptr::null_mut(), Ordering::Relaxed);
         registration.queued.store(false, Ordering::Release);
+        self.len -= 1;
+        // SAFETY: `list` created exactly one raw strong reference for this
+        // membership; unlinking consumes that membership exactly once.
+        unsafe { Arc::from_raw(node) }
+    }
+
+    fn pop_front(&mut self) -> Option<Arc<EpollRegistration>> {
+        let node = self.head.load(Ordering::Relaxed);
+        if node.is_null() {
+            None
+        } else {
+            // SAFETY: `head` is linked in this locked queue.
+            Some(unsafe { self.unlink_node(node) })
+        }
+    }
+
+    fn unlink(&mut self, registration: &Arc<EpollRegistration>) {
+        if !registration.queued.load(Ordering::Relaxed) {
+            return;
+        }
+        let node = Arc::as_ptr(registration) as *mut EpollRegistration;
+        // SAFETY: each registration belongs to one epoll instance, and queued
+        // membership therefore identifies this locked ready list.
+        drop(unsafe { self.unlink_node(node) });
+    }
+
+    fn is_empty(&self) -> bool {
+        let empty = self.head.load(Ordering::Relaxed).is_null();
+        debug_assert_eq!(empty, self.len == 0);
+        empty
+    }
+}
+
+impl Drop for EpollReady {
+    fn drop(&mut self) {
+        // Convert and drop every raw queue-owned Arc reference.
+        while self.pop_front().is_some() {}
     }
 }
 
@@ -424,7 +484,7 @@ impl EpollInstance {
     }
 
     fn ready_list_empty(&self) -> bool {
-        self.ready.lock().ready.is_empty()
+        self.ready.lock().is_empty()
     }
 
     /// List `fd` as ready (its per-fd waker fired) and wake the parked poller.
@@ -479,9 +539,11 @@ impl EpollInstance {
                 interest: BTreeMap::new(),
             }),
             ready: IrqSafeSpinLock::new(EpollReady {
+                head: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+                tail: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+                len: 0,
                 scan_after: None,
-                ready: BTreeMap::new(),
-                ready_seq: 0,
+                prefer_always_poll: false,
                 always_poll: BTreeSet::new(),
             }),
             waiters: IrqSafeSpinLock::new(EpollWaiters {
@@ -789,22 +851,18 @@ impl EpollInstance {
         // arm) plus non-cell-backed fds (timerfd / nested / raw / legacy, which
         // have no edge). Full pass (fallback, or before any fd is cell-backed)
         // scans the whole interest set and reseeds the ready-list.
-        // Each entry carries `in_ready`: the fd's ready-list (Linux rdllist)
-        // membership at snapshot time — a cell-backed fd is listed iff its
+        // Each entry carries `dequeued`: the fd was detached from the ready
+        // list for this poll — a cell-backed fd is listed iff its
         // persistent per-fd waker fired (a `set`/`notify` event) since the last
         // drain. It IS the EPOLLET edge the per-source token used to carry: an fd
         // that is level-ready but not listed has had no fresh event, so EPOLLET
-        // must not re-report it. Captured per-entry UNDER the lock. The fast
-        // path snapshots only a small maxevents-sized window in ready-list
-        // order; later entries stay listed for the next wait, matching Linux's
-        // bounded ready-index drain. Each snapshot carries its listing sequence;
-        // a callback racing the poll refreshes that sequence, so write-back
-        // cannot erase the new event (the role Linux's `ovflist` serves).
-        let snapshot: Vec<(i32, EpollSnapshot, Option<u64>)> = if full {
-            let (listings, scan_after) = {
-                let ready = self.ready.lock();
-                (ready.ready.clone(), ready.scan_after)
-            };
+        // must not re-report it. Detaching under the lock is also the race
+        // protocol: once `queued` becomes false, a callback concurrent with
+        // polling can append the node again, and write-back never removes that
+        // newer membership. This is the role Linux's private txlist+ovflist
+        // pair serves, without a global generation counter.
+        let snapshot: Vec<(i32, EpollSnapshot, bool)> = if full {
+            let scan_after = self.ready.lock().scan_after;
             let registrations: Vec<_> = self
                 .inner
                 .lock()
@@ -815,12 +873,17 @@ impl EpollInstance {
             let mut entries: Vec<_> = registrations
                 .into_iter()
                 .filter(|registration| registration.active.load(Ordering::Acquire))
-                .map(|registration| {
+                .filter_map(|registration| {
                     let fd = registration.fd;
-                    let listed = listings.get(&fd).and_then(|listing| {
-                        Arc::ptr_eq(&listing.registration, &registration).then_some(listing.seq)
-                    });
-                    (fd, registration.snapshot(), listed)
+                    let item = registration.snapshot();
+                    // A callback that arrived after the fast pass owns this
+                    // occurrence. Leave it queued for the next O(1) dequeue;
+                    // the full scan repairs only unlisted cell-backed sources.
+                    if item.cell_backed && registration.queued.load(Ordering::Acquire) {
+                        None
+                    } else {
+                        Some((fd, item, false))
+                    }
                 })
                 .collect();
             if let Some(after) = scan_after {
@@ -830,94 +893,67 @@ impl EpollInstance {
             }
             entries
         } else {
-            // Snapshot no more candidates than this wait can return. A stale
-            // candidate makes the fast pass empty and takes the full fallback.
+            // Detach no more ready candidates than this wait can return.
+            // Different waiters therefore reserve different FIFO nodes in O(1)
+            // instead of searching a shared ordered index.
             let limit = maxevents.max(1);
             let candidates: Vec<ReadyCandidate> = {
                 let mut ready = self.ready.lock();
-                let mut candidates = Vec::with_capacity(limit);
-                let mut append_range = |mut listed: alloc::collections::btree_map::Range<
-                    '_,
-                    i32,
-                    ReadyListing,
-                >,
-                                        mut always: alloc::collections::btree_set::Range<
-                    '_,
-                    i32,
-                >| {
-                    let mut listed_fd = listed.next().map(|(fd, _)| *fd);
-                    let mut always_fd = always.next().copied();
-                    while candidates.len() < limit && (listed_fd.is_some() || always_fd.is_some()) {
-                        let fd = match (listed_fd, always_fd) {
-                            (Some(r), Some(a)) if r < a => {
-                                listed_fd = listed.next().map(|(fd, _)| *fd);
-                                r
-                            }
-                            (Some(r), Some(a)) if a < r => {
-                                always_fd = always.next().copied();
-                                a
-                            }
-                            (Some(r), Some(_)) => {
-                                listed_fd = listed.next().map(|(fd, _)| *fd);
-                                always_fd = always.next().copied();
-                                r
-                            }
-                            (Some(r), None) => {
-                                listed_fd = listed.next().map(|(fd, _)| *fd);
-                                r
-                            }
-                            (None, Some(a)) => {
-                                always_fd = always.next().copied();
-                                a
-                            }
-                            (None, None) => break,
-                        };
-                        let listing = ready
-                            .ready
-                            .get(&fd)
-                            .map(|listing| (Arc::clone(&listing.registration), listing.seq));
-                        candidates.push((fd, listing));
-                    }
-                };
-                if let Some(after) = ready.scan_after {
-                    use core::ops::Bound::{Excluded, Unbounded};
-                    append_range(
-                        ready.ready.range((Excluded(after), Unbounded)),
-                        ready.always_poll.range((Excluded(after), Unbounded)),
-                    );
-                    append_range(
-                        ready.ready.range(..=after),
-                        ready.always_poll.range(..=after),
-                    );
+                let always = if ready.always_poll.is_empty() {
+                    None
                 } else {
-                    append_range(ready.ready.range(..), ready.always_poll.range(..));
+                    use core::ops::Bound::{Excluded, Unbounded};
+                    let next = ready
+                        .scan_after
+                        .and_then(|after| {
+                            ready
+                                .always_poll
+                                .range((Excluded(after), Unbounded))
+                                .next()
+                                .copied()
+                        })
+                        .or_else(|| ready.always_poll.first().copied());
+                    ready.scan_after = next;
+                    next
+                };
+                let have_ready = !ready.is_empty();
+                let always_first = always.is_some() && have_ready && ready.prefer_always_poll;
+                if always.is_some() && have_ready {
+                    ready.prefer_always_poll = !ready.prefer_always_poll;
                 }
-                // Reserve this bounded window before polling it. Linux obtains
-                // the same property by splicing rdllist into a private txlist:
-                // concurrent harvesters cannot all select the same head item.
-                // The entries remain indexed here so callbacks can refresh
-                // their sequence while polling runs without this lock.
-                if let Some((fd, _)) = candidates.last() {
-                    ready.scan_after = Some(*fd);
+                let mut candidates = Vec::with_capacity(limit + usize::from(always.is_some()));
+                if always_first {
+                    candidates.push((always.unwrap(), None));
+                }
+                for _ in 0..limit {
+                    let Some(registration) = ready.pop_front() else {
+                        break;
+                    };
+                    candidates.push((registration.fd, Some(registration)));
+                }
+                if !always_first {
+                    if let Some(fd) = always {
+                        candidates.push((fd, None));
+                    }
                 }
                 candidates
             };
 
             candidates
                 .into_iter()
-                .filter_map(|(fd, listing)| {
-                    let (registration, seq) = match listing {
-                        Some((registration, seq)) => (registration, Some(seq)),
+                .filter_map(|(fd, dequeued)| {
+                    let (registration, was_dequeued) = match dequeued {
+                        Some(registration) => (registration, true),
                         None => {
                             let interest = self.inner.lock();
-                            (Arc::clone(&interest.interest.get(&fd)?.registration), None)
+                            (Arc::clone(&interest.interest.get(&fd)?.registration), false)
                         }
                     };
                     if !registration.active.load(Ordering::Acquire) {
                         return None;
                     }
                     let fd = registration.fd;
-                    Some((fd, registration.snapshot(), seq))
+                    Some((fd, registration.snapshot(), was_dequeued))
                 })
                 .collect()
         };
@@ -929,8 +965,8 @@ impl EpollInstance {
         // inversions under concurrent event-loop updates.
         let mut observed = Vec::new();
         let mut delivered_fds = Vec::new();
-        for (fd, item, listing) in &snapshot {
-            let in_ready = listing.is_some();
+        let mut processed = 0usize;
+        for (fd, item, dequeued) in &snapshot {
             // `maxevents` limits acceptance, not merely userspace copying.
             // Do not poll, acknowledge, advance edge state, take an exclusive
             // claim, or disarm a one-shot entry that this wait cannot return.
@@ -938,6 +974,7 @@ impl EpollInstance {
             if results.len() == maxevents {
                 break;
             }
+            processed += 1;
             // Disarmed EPOLLONESHOT items (events bitmask zeroed below)
             // are skipped immediately.
             if (item.events & EPOLLONESHOT) != 0
@@ -962,7 +999,7 @@ impl EpollInstance {
                     // Backing open file dropped → not ready; record a zero
                     // observation so the write-back clears any stale readiness,
                     // exactly as the previous per-call upgrades did.
-                    observed.push((*fd, 0, *listing, Arc::clone(&item.registration)));
+                    observed.push((*fd, 0, *dequeued, Arc::clone(&item.registration)));
                     continue;
                 }
             };
@@ -972,7 +1009,7 @@ impl EpollInstance {
             // above (Linux ep_send_events drains the rdllist; ep_item_poll only
             // re-confirms the mask).
             let cur_mask = file.poll_readiness_at(item.offset);
-            observed.push((*fd, cur_mask, *listing, Arc::clone(&item.registration)));
+            observed.push((*fd, cur_mask, *dequeued, Arc::clone(&item.registration)));
             // Only report events the caller asked for.
             let want = item.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
             // Linux always reports ERR/HUP even when the caller omitted them
@@ -996,7 +1033,7 @@ impl EpollInstance {
             // re-reported.
             if (item.events & EPOLLET) != 0 {
                 let new_bits = ready & !item.last_mask;
-                let listed = item.cell_backed && in_ready;
+                let listed = item.cell_backed && *dequeued;
                 if new_bits == 0 && !listed {
                     continue;
                 }
@@ -1037,7 +1074,7 @@ impl EpollInstance {
         // while holding this instance's non-reentrant spin lock.
         let ready_updates = {
             let mut updates = Vec::with_capacity(observed.len());
-            for (fd, cur_mask, in_ready, registration) in observed {
+            for (fd, cur_mask, dequeued, registration) in observed {
                 // Ready-list bookkeeping (Linux rdllist): a level-triggered fd
                 // that was delivered stays a candidate so the next wait
                 // re-reports it until the app drains (its next poll then shows
@@ -1075,14 +1112,17 @@ impl EpollInstance {
                         // acceptor (dbus-broker / journald) whose accept thread
                         // races its epoll thread; the token used to hold that edge.
                         state.last_mask &= cur_mask;
+                        let want = state.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
+                        let still_ready = cur_mask & (want | EPOLLERR | EPOLLHUP) != 0;
                         keep_ready = state.cell_backed
                             && (state.events & EPOLLET) != 0
-                            && in_ready.is_some();
+                            && dequeued
+                            && still_ready;
                     }
                     updates.push((
                         fd,
                         Arc::clone(&registration),
-                        in_ready,
+                        dequeued,
                         keep_ready,
                         disarm_always_poll,
                     ));
@@ -1090,48 +1130,36 @@ impl EpollInstance {
             }
             updates
         };
-        let needs_full_cursor = full && !delivered_fds.is_empty();
-        let needs_ready_write = needs_full_cursor
-            || ready_updates.iter().any(
-                |(_, registration, listing, keep_ready, disarm_always_poll)| {
+        // If an always-polled candidate filled the userspace batch first, put
+        // any ready nodes detached behind it back at the tail. They were never
+        // polled, so their occurrence is still pending.
+        let unprocessed: Vec<_> = snapshot[processed..]
+            .iter()
+            .filter(|(_, _, dequeued)| *dequeued)
+            .map(|(_, item, _)| Arc::clone(&item.registration))
+            .collect();
+        let needs_ready_write = !unprocessed.is_empty()
+            || ready_updates
+                .iter()
+                .any(|(_, registration, _, keep_ready, disarm_always_poll)| {
                     *disarm_always_poll
                         || (*keep_ready && !registration.queued.load(Ordering::Acquire))
-                        || (!*keep_ready && listing.is_some())
-                },
-            );
+                });
         if needs_ready_write {
             let mut ready = self.ready.lock();
-            for (fd, registration, listing, keep_ready, disarm_always_poll) in ready_updates {
+            for (fd, registration, _dequeued, keep_ready, disarm_always_poll) in ready_updates {
                 if disarm_always_poll {
                     ready.always_poll.remove(&fd);
                 }
-                // The dominant level-triggered case stays linked. It already
-                // advanced per-registration state above and needs no ready-tree
-                // mutation, so do not bounce the global ready lock's cache line
-                // merely to rediscover the existing entry.
-                if keep_ready && registration.queued.load(Ordering::Acquire) {
-                    continue;
-                }
-                let current = ready
-                    .ready
-                    .get(&fd)
-                    .filter(|current| Arc::ptr_eq(&current.registration, &registration));
+                // A callback concurrent with the unlocked poll may already
+                // have requeued this registration. `list` coalesces that case;
+                // importantly, write-back never removes the newer occurrence.
                 if keep_ready {
-                    if current.is_none() {
-                        ready.list(&registration);
-                    }
-                } else if listing.is_some() && current.map(|current| current.seq) == listing {
-                    ready.ready.remove(&fd);
-                    registration.queued.store(false, Ordering::Release);
+                    ready.list(&registration);
                 }
             }
-            // Fast passes reserve their position at snapshot time so another
-            // waiter selects a different window. A full fallback has no such
-            // reservation and advances from the last event actually returned.
-            if needs_full_cursor {
-                if let Some(fd) = delivered_fds.last() {
-                    ready.scan_after = Some(*fd);
-                }
+            for registration in unprocessed {
+                ready.list(&registration);
             }
         }
 
@@ -2613,6 +2641,83 @@ mod tests {
     kernel_test_in!(
         "userspace/epoll",
         smoke_epoll_push_ready_wakes_one_parked_waiter_per_event
+    );
+
+    /// Detaching a ready node transfers the queue's strong reference to the
+    /// collector. A callback racing that unlocked poll may immediately append
+    /// the same stable node again; queue membership must remain singular.
+    fn smoke_epoll_intrusive_ready_detach_requeue() -> TestResult {
+        __test_reset();
+        let (ep, file) = one_fd(EPOLLIN, POLL_IN, 0, true, true);
+        let registration = Arc::clone(&ep.inner.lock().interest[&FD].registration);
+
+        let detached = {
+            let mut ready = ep.ready.lock();
+            if ready.len != 1 {
+                return TestResult::Fail("seeded ready registration must be linked once");
+            }
+            match ready.pop_front() {
+                Some(registration) => registration,
+                None => return TestResult::Fail("ready pop must detach the head"),
+            }
+        };
+        if registration.queued.load(Ordering::Acquire) {
+            return TestResult::Fail("detached registration must publish queued=false");
+        }
+
+        // Model ep_poll_callback firing while the collector polls `detached`.
+        if !ep.list_ready(&registration) {
+            return TestResult::Fail("racing callback must requeue an active registration");
+        }
+        let raced = {
+            let mut ready = ep.ready.lock();
+            if ready.len != 1 {
+                return TestResult::Fail("racing callback must create one coalesced occurrence");
+            }
+            match ready.pop_front() {
+                Some(registration) => registration,
+                None => return TestResult::Fail("racing occurrence must remain dequeueable"),
+            }
+        };
+        if !Arc::ptr_eq(&detached, &raced) || !Arc::ptr_eq(&registration, &raced) {
+            return TestResult::Fail("detach/requeue must preserve the stable registration node");
+        }
+        if !ep.ready.lock().is_empty() || registration.queued.load(Ordering::Acquire) {
+            return TestResult::Fail("second detach must leave an empty, unqueued ready list");
+        }
+
+        // CTL_DEL must unlink an arbitrary node without scanning the FIFO.
+        let file_ops = file as Arc<dyn FileOps>;
+        let first = EpollRegistration::new(FD + 1, 2, &file_ops, 0, EPOLLIN, 0);
+        let middle = EpollRegistration::new(FD + 2, 3, &file_ops, 0, EPOLLIN, 0);
+        let last = EpollRegistration::new(FD + 3, 4, &file_ops, 0, EPOLLIN, 0);
+        {
+            let mut ready = ep.ready.lock();
+            ready.list(&first);
+            ready.list(&middle);
+            ready.list(&last);
+            ready.unlink(&middle);
+            if ready.len != 2 || middle.queued.load(Ordering::Acquire) {
+                return TestResult::Fail("middle unlink must remove exactly one node");
+            }
+            let popped_first = ready.pop_front();
+            let popped_last = ready.pop_front();
+            if !popped_first
+                .as_ref()
+                .is_some_and(|item| Arc::ptr_eq(item, &first))
+                || !popped_last
+                    .as_ref()
+                    .is_some_and(|item| Arc::ptr_eq(item, &last))
+                || !ready.is_empty()
+            {
+                return TestResult::Fail("middle unlink must preserve neighboring FIFO links");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace/epoll",
+        smoke_epoll_intrusive_ready_detach_requeue
     );
 
     /// The scheduler's park recheck calls `epoll_fd_has_ready(task, epfd)` — it
