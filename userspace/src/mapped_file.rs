@@ -240,6 +240,26 @@ pub(crate) fn shared_file_at(address_space_id: u64, va: u64) -> Option<(Arc<dyn 
 }
 
 pub(crate) fn drop_address_space(address_space_id: u64) {
+    // Address-space teardown is the last writeback chance for this
+    // process's dirty fallback pages: a mapper that exits without
+    // munmap/fsync must still commit them, or its MAP_SHARED writes are
+    // silently lost. Flush first, while the bucket still names the files;
+    // the sweep itself is cache-driven and runs with no bucket lock held.
+    if let Some(bucket) = existing_mapping_owners(address_space_id) {
+        let files: Vec<Arc<dyn FileOps>> = {
+            let owners = bucket.lock();
+            let mut files: Vec<Arc<dyn FileOps>> = Vec::new();
+            for mapping in owners.iter().filter(|mapping| !mapping.private_copy) {
+                if !files.iter().any(|file| Arc::ptr_eq(file, &mapping.ops)) {
+                    files.push(Arc::clone(&mapping.ops));
+                }
+            }
+            files
+        };
+        for ops in files {
+            let _ = flush_shared_pages_for_ops(&ops);
+        }
+    }
     // Drop the bucket (and therefore FileOps/MmapLifetime references) after
     // releasing the global index: destructors may allocate or take arbitrary
     // filesystem locks.
@@ -248,6 +268,32 @@ pub(crate) fn drop_address_space(address_space_id: u64) {
         .lock()
         .remove(&address_space_id);
     drop(retired);
+}
+
+/// Distinct files with a non-private mapping of `address_space_id`
+/// overlapping `[base, base + len)`. `munmap` snapshots this before the
+/// punch so it can commit the range's dirty pages afterwards, when the
+/// owner rows are already gone.
+pub(crate) fn file_ops_in_range(
+    address_space_id: u64,
+    base: u64,
+    len: u64,
+) -> Vec<Arc<dyn FileOps>> {
+    let mut files: Vec<Arc<dyn FileOps>> = Vec::new();
+    if let Some(bucket) = existing_mapping_owners(address_space_id) {
+        let end = base.saturating_add(len);
+        let owners = bucket.lock();
+        for mapping in owners.iter().filter(|mapping| {
+            !mapping.private_copy
+                && mapping.base < end
+                && base < mapping.base.saturating_add(mapping.len)
+        }) {
+            if !files.iter().any(|file| Arc::ptr_eq(file, &mapping.ops)) {
+                files.push(Arc::clone(&mapping.ops));
+            }
+        }
+    }
+    files
 }
 
 /// Device page restrictions survive fd close and VMA splitting. Resolve the
@@ -842,10 +888,20 @@ fn shared_page_is_clean(page: &SharedFilePage) -> bool {
 }
 
 fn should_retire_idle_shared_page(page: &SharedFilePage, cache_len: usize) -> bool {
-    if page.ops.upgrade().is_none() || page.cache_generation.is_none() {
+    if page.ops.upgrade().is_none() {
+        // The file object is gone, so no writeback can ever reach it again;
+        // retaining the frame only leaks it.
         return true;
     }
-    cache_len > MAX_RETAINED_SHARED_FILE_PAGES && shared_page_is_clean(page)
+    if !shared_page_is_clean(page) {
+        // A dirty page is the only copy of a MAP_SHARED write that no
+        // fsync/msync has committed yet. Retiring it would silently lose
+        // the write; the flush lifecycle (munmap / address-space teardown /
+        // sync / fsync) must get its chance to commit the page first, after
+        // which it is clean and this check lets it go.
+        return false;
+    }
+    page.cache_generation.is_none() || cache_len > MAX_RETAINED_SHARED_FILE_PAGES
 }
 
 /// Consumable reservation for the canonical pages selected by one mmap
@@ -1143,7 +1199,7 @@ pub(crate) fn publish_shared_file_pages(
                 .checked_add(index as u64 * 4096)
                 .expect("validated mmap file offset overflowed");
             let key = SharedFilePages::key(identity, page_offset);
-            let existing = pages.by_file.get(&key).copied().filter(|phys| {
+            let mut existing = pages.by_file.get(&key).copied().filter(|phys| {
                 pages.by_phys.get(phys).is_some_and(|page| {
                     shared_page_matches_ops(page, identity)
                         && (page.mappings != 0
@@ -1154,12 +1210,28 @@ pub(crate) fn publish_shared_file_pages(
             });
             if existing.is_none() && pages.by_file.contains_key(&key) {
                 let stale_phys = pages.by_file[&key];
-                let stale = pages
-                    .remove_phys(stale_phys)
-                    .expect("shared-file key points to no physical page");
-                debug_assert_eq!(stale.mappings, 0);
-                debug_assert_eq!(stale.pending, 0);
-                retired.push(stale.phys);
+                // A dirty idle page holds MAP_SHARED writes no flush has
+                // committed yet. Adopt it as canonical — refreshing its
+                // generation — rather than freeing the only copy of those
+                // writes to make room for a stale device read.
+                let adopt = pages.by_phys.get(&stale_phys).is_some_and(|page| {
+                    shared_page_matches_ops(page, identity) && !shared_page_is_clean(page)
+                });
+                if adopt {
+                    let page = pages
+                        .by_phys
+                        .get_mut(&stale_phys)
+                        .expect("shared-file key points to no physical page");
+                    page.cache_generation = cache_generation;
+                    existing = Some(stale_phys);
+                } else {
+                    let stale = pages
+                        .remove_phys(stale_phys)
+                        .expect("shared-file key points to no physical page");
+                    debug_assert_eq!(stale.mappings, 0);
+                    debug_assert_eq!(stale.pending, 0);
+                    retired.push(stale.phys);
+                }
             }
             let phys = if let Some(phys) = existing {
                 let phys = PhysAddr::new(phys);
@@ -1201,6 +1273,28 @@ pub(crate) fn publish_shared_file_pages(
                 .get_mut(&phys.raw())
                 .expect("shared-file key points to no physical page");
             retain_pending_shared_page(page);
+        }
+        // Bound the retained set while this publication already holds the
+        // cache lock: past the cap, clean idle pages are evicted. Dirty
+        // pages are never eviction candidates — they leave only through
+        // the flush lifecycle, after which they are clean and evictable.
+        if pages.by_phys.len() > MAX_RETAINED_SHARED_FILE_PAGES {
+            let excess = pages.by_phys.len() - MAX_RETAINED_SHARED_FILE_PAGES;
+            let victims: Vec<u64> = pages
+                .by_phys
+                .values()
+                .filter(|page| {
+                    page.mappings == 0 && page.pending == 0 && shared_page_is_clean(page)
+                })
+                .map(|page| page.phys.raw())
+                .take(excess)
+                .collect();
+            for phys in victims {
+                let evicted = pages
+                    .remove_phys(phys)
+                    .expect("evicted shared-file page disappeared");
+                retired.push(evicted.phys);
+            }
         }
     }
     for phys in rejected.into_iter().chain(retired) {
@@ -1783,19 +1877,21 @@ pub(crate) fn flush_current_file(ops: &Arc<dyn FileOps>) -> Result<(), ()> {
     // A task without an installed userspace address space cannot own any
     // mapped-file fallback pages. `fsync` is still valid for its open file;
     // treat the absent bucket as the same clean no-op as an empty bucket.
-    let Some(address_space_id) = current_address_space_id() else {
-        return Ok(());
-    };
-    let Some(owner_bucket) = existing_mapping_owners(address_space_id) else {
-        return Ok(());
-    };
-    let mappings: Vec<FileWriteback> = owner_bucket
-        .lock()
-        .iter()
-        .filter(|mapping| Arc::ptr_eq(&mapping.ops, ops))
-        .filter_map(|mapping| mapping.writeback.clone())
-        .collect();
-    flush_mappings(ops, mappings)
+    if let Some(address_space_id) = current_address_space_id() {
+        if let Some(owner_bucket) = existing_mapping_owners(address_space_id) {
+            let mappings: Vec<FileWriteback> = owner_bucket
+                .lock()
+                .iter()
+                .filter(|mapping| Arc::ptr_eq(&mapping.ops, ops))
+                .filter_map(|mapping| mapping.writeback.clone())
+                .collect();
+            flush_mappings(ops, mappings)?;
+        }
+    }
+    // fsync's contract covers the file, not the caller: pages of this file
+    // retained under another address space's mappings (or under none, after
+    // their owner unmapped) are just as much its responsibility.
+    flush_shared_pages_for_ops(ops)
 }
 
 /// Commit the current process's fallback shared mappings overlapping
@@ -1917,27 +2013,134 @@ fn flush_mappings(ops: &Arc<dyn FileOps>, mappings: Vec<FileWriteback>) -> Resul
                 continue;
             }
             let offset = mapping.offset + (index as u64) * 4096;
-            let file_len = ops.stat().size;
-            if offset >= file_len {
-                continue;
-            }
-            let len = ((file_len - offset) as usize).min(4096);
-            let Some(bytes) = snapshot_dirty_page(ops, offset, *phys, len) else {
-                continue;
-            };
-            let mut done = 0;
-            while done < bytes.len() {
-                match crate::handlers::poll_io_to_completion(
-                    ops.write(offset + done as u64, &bytes[done..]),
-                ) {
-                    Some(Ok(0)) | Some(Err(_)) | None => return Err(()),
-                    Some(Ok(n)) => done += n,
-                }
-            }
-            mark_page_clean(ops, offset, *phys, &bytes);
+            flush_shared_page(ops, offset, *phys)?;
         }
     }
     Ok(())
+}
+
+/// Commit one cached fallback page if its bytes differ from the file's.
+/// The snapshot is taken under the cache lock; the write itself runs with
+/// every lock released, exactly as in [`flush_mappings`].
+fn flush_shared_page(ops: &Arc<dyn FileOps>, offset: u64, phys: PhysAddr) -> Result<(), ()> {
+    let file_len = ops.stat().size;
+    if offset >= file_len {
+        return Ok(());
+    }
+    let len = ((file_len - offset) as usize).min(4096);
+    let Some(bytes) = snapshot_dirty_page(ops, offset, phys, len) else {
+        return Ok(());
+    };
+    let mut done = 0;
+    while done < bytes.len() {
+        match crate::handlers::poll_io_to_completion(
+            ops.write(offset + done as u64, &bytes[done..]),
+        ) {
+            Some(Ok(0)) | Some(Err(_)) | None => return Err(()),
+            Some(Ok(n)) => done += n,
+        }
+    }
+    mark_page_clean(ops, offset, phys, &bytes);
+    Ok(())
+}
+
+/// Commit every cached fallback page of `ops`'s file, whichever address
+/// space — if any — currently maps it. The owner-bucket flushes only see
+/// the calling process's own mappings; the cache is the one place that can
+/// still reach a dirty page whose owner unmapped it, lives in another
+/// process, or has already exited. Page selection follows the cache's own
+/// `shared_page_matches_ops` identity rule.
+pub(crate) fn flush_shared_pages_for_ops(ops: &Arc<dyn FileOps>) -> Result<(), ()> {
+    let identity = ops.mmap_backing_identity();
+    let targets: Vec<(u64, PhysAddr)> = {
+        let pages = SHARED_FILE_PAGES.lock();
+        pages
+            .by_phys
+            .values()
+            .filter(|page| shared_page_matches_ops(page, identity))
+            .map(|page| (page.offset, page.phys))
+            .collect()
+    };
+    for (offset, phys) in targets {
+        flush_shared_page(ops, offset, phys)?;
+    }
+    Ok(())
+}
+
+/// Commit every dirty fallback page in the cache, across all files. This
+/// is what gives `sync(2)` its global reach: dirty pages whose owning
+/// process never calls fsync are still the kernel's responsibility.
+pub(crate) fn flush_all_shared_file_pages() {
+    let files: Vec<Arc<dyn FileOps>> = {
+        let pages = SHARED_FILE_PAGES.lock();
+        let mut files: Vec<Arc<dyn FileOps>> = Vec::new();
+        let mut seen: Vec<usize> = Vec::new();
+        for page in pages.by_phys.values() {
+            // Dedup on the page's recorded identity: asking a filesystem
+            // for its identity may lock or allocate, which the cache lock
+            // must never span.
+            if seen.contains(&page.identity) {
+                continue;
+            }
+            if let Some(ops) = page.ops.upgrade() {
+                seen.push(page.identity);
+                files.push(ops);
+            }
+        }
+        files
+    };
+    for ops in files {
+        // sync(2) has no per-file error channel; one failing file must not
+        // stop the others from being committed.
+        let _ = flush_shared_pages_for_ops(&ops);
+    }
+}
+
+/// Fold a completed `write(2)`-family write into every cached fallback
+/// page it overlaps, so live `MAP_SHARED` mappings observe the new bytes
+/// and a later whole-page writeback cannot resurrect the pre-write image.
+/// The written bytes become part of the page's clean snapshot — they are
+/// already on the file — while bytes the write did not touch keep their
+/// previous clean/dirty state. The cache generation is deliberately left
+/// alone: an idle page whose generation a filesystem can no longer vouch
+/// for must still fail reuse validation, exactly as before.
+pub(crate) fn note_file_written(ops: &Arc<dyn FileOps>, offset: u64, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let identity = ops.mmap_backing_identity();
+    let mut done = 0usize;
+    while done < bytes.len() {
+        let cur = offset + done as u64;
+        let page_offset = cur & !4095;
+        let in_page = (cur - page_offset) as usize;
+        let n = core::cmp::min(4096 - in_page, bytes.len() - done);
+        {
+            let mut pages = SHARED_FILE_PAGES.lock();
+            if let Some(&phys) = pages
+                .by_file
+                .get(&SharedFilePages::key(identity, page_offset))
+            {
+                if let Some(page) = pages.by_phys.get_mut(&phys).filter(|page| {
+                    page.offset == page_offset && shared_page_matches_ops(page, identity)
+                }) {
+                    // SAFETY: the cache entry owns `phys` while the cache
+                    // lock is held, so no final release can free the frame
+                    // during this copy; the frame is identity-mapped.
+                    let frame = unsafe {
+                        core::slice::from_raw_parts_mut(page.phys.kernel_mut_ptr::<u8>(), 4096)
+                    };
+                    frame[in_page..in_page + n].copy_from_slice(&bytes[done..done + n]);
+                    let clean_n = n.min(page.clean.len().saturating_sub(in_page));
+                    if clean_n != 0 {
+                        page.clean[in_page..in_page + clean_n]
+                            .copy_from_slice(&bytes[done..done + clean_n]);
+                    }
+                }
+            }
+        }
+        done += n;
+    }
 }
 
 /// Snapshot a fallback page only when it differs from the last file image.

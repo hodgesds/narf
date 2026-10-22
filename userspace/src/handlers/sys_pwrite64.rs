@@ -112,6 +112,9 @@ pub(crate) fn sys_pwrite64(ctx: &mut dyn TrapContext) {
                 break;
             }
         };
+        if written != 0 {
+            crate::mapped_file::note_file_written(&endpoint.ops, offset, &payload[..written]);
+        }
         total += written;
         offset = offset.saturating_add(written as u64);
         if written < payload.len() {

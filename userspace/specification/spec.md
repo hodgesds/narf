@@ -1394,6 +1394,23 @@ aliases, and advance the snapshot only after the full page write succeeds.
 Clean pages perform no filesystem write; the comparison is byte-exact rather
 than hash-based so collision cannot suppress persistence.
 
+The fallback cache is coherent with the `write(2)` family and carries a
+writeback lifecycle, matching Linux's single page cache. Every successful
+`write`/`writev`/`pwrite64`/`pwritev*`/`copy_file_range`/`sendfile`-style
+transfer — including the AIO `io_submit` PWRITE/PWRITEV helpers — folds its
+bytes into each cached page it overlaps — frame and clean
+snapshot together, without refreshing the page's cache generation — so a
+live mapping observes the write and a later whole-page writeback cannot
+resurrect pre-write bytes. Dirty pages (frame ≠ snapshot) are never
+discarded while their file object lives: not by cache retirement, not by
+publication losing a race, and not by retention-cap eviction, which reclaims
+clean idle pages only. They are committed by the first of `fsync`/`msync`
+(which also sweep pages of the same file owned by other address spaces),
+`munmap` of an overlapping mapping, address-space teardown, `syncfs` (the
+fd's file), or `sync` (every cached file). A dirty page whose generation a
+filesystem can no longer vouch for is adopted as canonical on the next
+publication rather than dropped; its pending writeback decides its bytes.
+
 Unlocked generic `MAP_SHARED` publication is lazy like Linux
 `generic_file_mmap`: it publishes empty Region and writeback prefixes rather
 than allocating one absent slot per virtual page, then resolves a

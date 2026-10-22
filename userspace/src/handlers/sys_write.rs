@@ -212,8 +212,20 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
             if endpoint.append() {
                 offset = endpoint.ops.stat().size;
             }
-            poll_blocking(endpoint.ops.write(offset, &payload))
-                .unwrap_or(Err(narf_filesystem::FsError::WouldBlock))
+            let outcome = poll_blocking(endpoint.ops.write(offset, &payload))
+                .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
+            // Keep any live generic-fallback MAP_SHARED page of this file
+            // coherent with the write (mapped_file::note_file_written).
+            if let Ok(written) = &outcome {
+                if *written != 0 && *written <= payload.len() {
+                    crate::mapped_file::note_file_written(
+                        &endpoint.ops,
+                        offset,
+                        &payload[..*written],
+                    );
+                }
+            }
+            outcome
         };
         match outcome {
             Ok(0) if endpoint.ops.write_should_block() && total == 0 => {

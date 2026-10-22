@@ -10,6 +10,11 @@ pub(crate) fn sys_syncfs(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(EBADF));
         return;
     };
+    // Commit this file's generic-fallback MAP_SHARED pages first: the
+    // filesystem's own syncfs walk cannot see the userspace fallback
+    // cache. (Filesystem-wide reach for other files' fallback pages is
+    // sync(2)'s job; the cache records no per-filesystem grouping.)
+    let _ = crate::mapped_file::flush_shared_pages_for_ops(&ops);
     match poll_blocking(ops.syncfs()) {
         Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
         _ => ctx.set_return(errno_ret(EIO)),

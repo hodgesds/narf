@@ -15881,11 +15881,20 @@ mod aio {
         // Clone ops out, then run the blocking write outside the lock — same
         // non-reentrant / park-with-lock-held hazard as do_pread.
         let ops = fd::with_table(tid, |t| t.get(fd_no).map(|e| e.ops.clone())).flatten();
-        let outcome = ops.map(|ops| {
+        let outcome = ops.as_ref().map(|ops| {
             poll_blocking(ops.write(offset, &kbuf))
                 .unwrap_or(Err(narf_filesystem::FsError::ReadOnly))
                 .ok()
         });
+        // This helper is the write(2) path for AIO PWRITE/PWRITEV: keep
+        // any live generic-fallback MAP_SHARED page of this file coherent
+        // with the write (mapped_file::note_file_written, #676) exactly as
+        // sys_write/sys_pwrite64 do.
+        if let (Some(ops), Some(Some(n))) = (&ops, &outcome) {
+            if *n != 0 && *n <= kbuf.len() {
+                crate::mapped_file::note_file_written(ops, offset, &kbuf[..*n]);
+            }
+        }
         match outcome {
             Some(Some(n)) => n as i64,
             _ => EINVAL,
@@ -15964,7 +15973,13 @@ mod aio {
         // fd-table lock held (see do_pread).
         let ops = fd::with_table(tid, |t| t.get(iocb.aio_resfd).map(|e| e.ops.clone())).flatten();
         if let Some(ops) = ops {
-            let _ = poll_blocking(ops.write(0, &one));
+            if let Some(Ok(n)) = poll_blocking(ops.write(0, &one)) {
+                // Same write(2)-family fold-in as do_pwrite (#676); a no-op
+                // unless the resfd's file has fallback-cached pages.
+                if n != 0 && n <= one.len() {
+                    crate::mapped_file::note_file_written(&ops, 0, &one[..n]);
+                }
+            }
         }
     }
 
