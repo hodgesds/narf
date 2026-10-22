@@ -8,8 +8,10 @@ use narf_bus::{BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 // sizeof/offsetof from the primary headers. Navy Flounder's observed wire
-// revision is 16.0 / format 0x81 / SMC version 1, with the shared 1668-byte
-// PPTable_t layout (not Sienna Cichlid's 15.0 / 0x80 / version 7).
+// revision is 16.0 / format 0x81, with the shared 1668-byte PPTable_t
+// layout (not Sienna Cichlid's 15.0 / 0x80). The firmware SKU uses version
+// 1; MSI RX 6750 XT VBIOS 113-MSITV398MH.310 uses version 6. Linux's
+// sienna_cichlid_store_powerplay_table uses the same PPTable_t for both.
 // linux: n/a (smu_11_0_7_powerplay_table.smc_pptable at byte 802, probe-verified; header not in checker sets)
 const DRIVER_BYTES: usize = 802;
 pub(crate) const SMC_BYTES: usize = 1668; // linux: sizeof(PPTable_t)
@@ -237,7 +239,7 @@ fn validate_table_for(table: &[u8], profile: &crate::amdgpu_rdna2::Profile) -> R
     let smc_version = u32_at(table, DRIVER_BYTES);
     let known_version = match profile.asic {
         "navi21" => matches!(smc_version, 1 | 7),
-        "navi22" => smc_version == 1,
+        "navi22" => matches!(smc_version, 1 | 6),
         "navi23" => smc_version == 6,
         "navi24" => smc_version == 3,
         _ => false,

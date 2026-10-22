@@ -6099,12 +6099,17 @@ DPM/graphics or set `AmdGpu::fw_loaded`.
 `amdgpu_power_navi22::Prepared::new(vbios, smc_firmware, Identity)` builds an
 immutable board table without device I/O. `Identity` contains the PCI revision
 and subsystem IDs; production reads them under live PCI authority. ATOM master
-data revision 2.1 and FirmwareInfo 3.4/3.5 select the source: table ID zero uses
-the VBIOS PowerPlay table, while a nonzero ID uses the SMC v2.0 container's
-single embedded table. A missing or invalid selected source fails without
+data revision 2.1 and FirmwareInfo 3.3/3.4/3.5 select the source: table ID zero
+uses the VBIOS PowerPlay table, while a nonzero ID uses the SMC v2.0 container's
+single embedded table or the v2.1 directory entry with that exact ID.
+A missing or invalid selected source fails without
 fallback. Supported Navy Flounder tables are exactly 2470 bytes, revision
 16.0 / format `0x81`, with an 802-byte driver prefix and a 1668-byte SMC
-version-1 payload. Other wire layouts are refused.
+payload. Accepted payload versions are 1 (firmware SKU) and 6 (observed on
+MSI RX 6750 XT VBIOS `113-MSITV398MH.310`, PCI `1002:73df`, subsystem
+`1462:3985` rev C0). Linux's `sienna_cichlid_store_powerplay_table` uses the
+same `PPTable_t` layout for both. Preparation preserves the selected SKU's
+version and policy; unknown versions and other wire layouts are refused.
 
 Preparation overlays the 292 bytes after the ATOM SMC_DPM_INFO 4.9 header onto
 the payload's `I2cControllers` through `BoardReserved` region, preserving SKU
