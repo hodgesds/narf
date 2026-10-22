@@ -536,8 +536,11 @@ jobs:
     # Nightly + manual only: boot a rotating set of stress-ng stressors under the
     # KASAN kernel to shake out freed-slab corruption (poisoned-block writes
     # panic IN the corruptor's frame) and userspace fault regressions. Slow, so
-    # it never gates a push/PR. continue-on-error keeps a caught crash from
-    # failing the workflow — the artifact + ::warning:: are the signal.
+    # it never gates a push/PR. The workflow conclusion stays non-blocking
+    # (`continue-on-error`, Daniel's option 1 in #683), but the KASAN step
+    # asserts its own result: a guest that dies before STRESS-DONE, a KASAN
+    # catch, or a failed stressor fails the step, so the job page goes red
+    # instead of the failure hiding in a ::warning:: annotation.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -584,17 +587,41 @@ jobs:
           set -u
           out="${{ runner.temp }}/stress"; mkdir -p "$out"
           log="$out/kasan.log"; core="$out/kasan.core"
+          # Capture the harness exit status instead of masking it with
+          # `|| true` (#683): run-interactive exits nonzero when the guest
+          # dies before printing STRESS-DONE (boot crash, hang, prompt
+          # timeout), and that status feeds the assertion below.
+          rc=0
           NARF_QEMU_COM2_FILE="$core" \
             timeout 3000 cargo xtask run-interactive --kasan --cmd chroot_run \
-              --expect STRESS-DONE > "$log" 2>&1 || true
+              --expect STRESS-DONE > "$log" 2>&1 || rc=$?
           echo "=== stress-ng summary ==="
           grep -E "=== stressor:|passed:|failed:|SIGSEGV|SIGILL|STRESSOR-RC|KASAN:|CPU EXCEPTION|panicked" "$log" || true
+          # Assert the run actually passed (#683): a nonzero harness exit,
+          # a missing STRESS-DONE, a non-empty COM2 core, a KASAN report /
+          # kernel exception in the log, or a faulted/failed stressor each
+          # fail this step, so the job goes visibly red. The job keeps
+          # `continue-on-error` (option 1 in #683), so the workflow
+          # conclusion stays green — the ::error:: annotations carry the
+          # detail and the step below still uploads the full log + core.
+          fail=0
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::stress-ng-kasan: run-interactive exited $rc — the KASAN guest did not complete (boot crash, hang, or missing STRESS-DONE)"
+            fail=1
+          fi
+          if ! grep -q "STRESS-DONE" "$log"; then
+            echo "::error::stress-ng-kasan: STRESS-DONE missing from the guest log — the stress matrix did not complete"
+            fail=1
+          fi
           if grep -qE "KASAN: (store|load)|CPU EXCEPTION|KERNEL PANIC" "$log" || [ -s "$core" ]; then
-            echo "::warning::stress-ng-kasan: KERNEL crash / KASAN catch — see the uploaded core + log"
+            echo "::error::stress-ng-kasan: KERNEL crash / KASAN catch — see the uploaded core + log"
+            fail=1
           fi
           if grep -qE "SIGSEGV|SIGILL|failed: [1-9]" "$log"; then
-            echo "::warning::stress-ng-kasan: a stressor worker faulted (userspace SIGSEGV/SIGILL or stressor failure)"
+            echo "::error::stress-ng-kasan: a stressor worker faulted (userspace SIGSEGV/SIGILL or stressor failure)"
+            fail=1
           fi
+          exit "$fail"
       - name: upload logs + cores
         if: always()
         uses: actions/upload-artifact@v4
