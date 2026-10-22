@@ -10,18 +10,10 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 #[path = "amdgpu_psp_gfx_tests.rs"]
 mod gfx;
 
-fn session() -> (Pool, Session<Fake>) {
+fn session_with_pool(mapping: narf_bus::MmioRegion, address: u64) -> (Pool, Session<Fake>) {
     let (_, engine) = fixture();
-    // Deliberately unaligned GPU pool start, different from the PCI BAR address
-    // and the TMR physical address. Construction below never dereferences BAR0.
-    let mapping = narf_bus::MmioRegion {
-        phys: narf_memory::PhysAddr::new(0x9000_3000),
-        virt: 0x3000,
-        len: 16 << 20,
-        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
-    };
     // SAFETY: Fake implements every ring and payload access; bookkeeping only.
-    let pool = unsafe { Pool::from_owned_range(mapping, 0x8_0000_3000) }.unwrap();
+    let pool = unsafe { Pool::from_owned_range(mapping, address) }.unwrap();
     let engine = Engine {
         memory: pool.reserve(BUFFER_SIZE).unwrap(),
         ..engine
@@ -45,6 +37,19 @@ fn session() -> (Pool, Session<Fake>) {
         },
     )
 }
+fn session() -> (Pool, Session<Fake>) {
+    // Deliberately unaligned GPU pool start, different from the PCI BAR address
+    // and the TMR physical address. Construction below never dereferences BAR0.
+    session_with_pool(
+        narf_bus::MmioRegion {
+            phys: narf_memory::PhysAddr::new(0x9000_3000),
+            virt: 0x3000,
+            len: 16 << 20,
+            kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+        },
+        0x8_0000_3000,
+    )
+}
 fn psp_dmcub_accepts_only_inventoried_instruction_window_outside_tmr() -> TestResult {
     let (_, mut s) = session();
     run(s.engine.start()).unwrap();
@@ -54,7 +59,7 @@ fn psp_dmcub_accepts_only_inventoried_instruction_window_outside_tmr() -> TestRe
         address,
         tmr_size: 0,
     };
-    if s.record_media(reply(entry), 51) != Err(Error::Invalid) {
+    if s.record_media(reply(entry), 51, 0x100) != Err(Error::Invalid) {
         return TestResult::Fail("outside-TMR address accepted without inventory");
     }
     s.secure_dmub = Some(
@@ -69,7 +74,7 @@ fn psp_dmcub_accepts_only_inventoried_instruction_window_outside_tmr() -> TestRe
         )
         .secure_dmub(),
     );
-    if s.record_media(reply(entry), 51).is_err() || s.media_firmware.dmcub != Some(entry) {
+    if s.record_media(reply(entry), 51, 0x100).is_err() || s.media_firmware.dmcub != Some(entry) {
         return TestResult::Fail("inventoried PSP DMCUB entry rejected");
     }
     for (kind, address) in [
@@ -81,7 +86,7 @@ fn psp_dmcub_accepts_only_inventoried_instruction_window_outside_tmr() -> TestRe
         (51, 0x82fedffffc),
         (51, u64::MAX - 3),
     ] {
-        if s.record_media(reply(address), kind) != Err(Error::Invalid) {
+        if s.record_media(reply(address), kind, 0x100) != Err(Error::Invalid) {
             return TestResult::Fail("wrong firmware type, window, alignment or overflow accepted");
         }
     }
@@ -90,6 +95,68 @@ fn psp_dmcub_accepts_only_inventoried_instruction_window_outside_tmr() -> TestRe
 kernel_test_in!(
     "drivers/gpu/psp-ring",
     psp_dmcub_accepts_only_inventoried_instruction_window_outside_tmr
+);
+fn psp_dmcub_claims_authenticated_reply_range_in_owned_vram() -> TestResult {
+    let base = 0x0080_0000_0000;
+    let (pool, mut s) = session_with_pool(
+        narf_bus::MmioRegion {
+            phys: narf_memory::PhysAddr::new(0x9000_3000),
+            virt: 0x3000,
+            len: 12 << 30,
+            kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+        },
+        base,
+    );
+    run(s.engine.start()).unwrap();
+    run(s.setup_tmr_payload(None)).unwrap();
+    let address = 0x82fe_e00100;
+    let firmware_size = 0x41690;
+    if s.record_media(
+        Reply {
+            address: base + 0x100,
+            tmr_size: 0,
+        },
+        51,
+        firmware_size,
+    ) != Err(Error::Invalid)
+    {
+        return TestResult::Fail("PSP DMCUB placement overlapping the PSP ring was accepted");
+    }
+    let before = pool.available();
+    if s.record_media(
+        Reply {
+            address,
+            tmr_size: 0,
+        },
+        51,
+        firmware_size,
+    )
+    .is_err()
+        || s.media_firmware.dmcub != Some(address)
+    {
+        return TestResult::Fail("PSP DMCUB placement inside owned VRAM was rejected");
+    }
+    // Pool claims round the complete authenticated image outward to pages.
+    let claimed = (firmware_size + 4095) & !4095;
+    if before.checked_sub(pool.available()) != Some(claimed) {
+        return TestResult::Fail("PSP DMCUB reply range was not permanently reserved");
+    }
+    if s.record_media(
+        Reply {
+            address,
+            tmr_size: 0,
+        },
+        13,
+        firmware_size,
+    ) != Err(Error::Invalid)
+    {
+        return TestResult::Fail("non-DMCUB firmware escaped its TMR");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/psp-ring",
+    psp_dmcub_claims_authenticated_reply_range_in_owned_vram
 );
 fn psp_navi22_tmr_embedded_toc_and_address_spaces() -> TestResult {
     let (pool, mut session) = session();

@@ -6269,14 +6269,16 @@ reset of every firmware consumer before TMR destruction.
 
 `Accepted` means PSP acknowledged autoload and both media uploads.
 `media_firmware()` returns `MediaFirmware { vcn, dmcub, vcn1 }` GPU entry addresses
-from completed PSP replies; each must be dword aligned and inside this
-session's retained TMR. On discrete RDNA2, DMCUB type 51 may instead name the
-inherited secure instruction window CW0 inventoried before allocation; VCN
-remains TMR-only. The private inventory retains the exact CW0/CW1 ranges,
-checks their GMC aperture against the PSP session and permanently excludes
-them from both visible and above-BAR pools. Other protected ranges do not
-authorize firmware, and disjoint reservations are never widened into one
-range. Recovery carries the same inventory forward.
+from completed PSP replies; each entry must be dword aligned and the full image
+range must fit inside this session's retained TMR. On discrete RDNA2, DMCUB type 51 may instead
+name the inherited secure instruction window CW0 inventoried before allocation,
+or a new PSP-reported placement inside the owned VRAM pool. The latter is
+claimed permanently in the pool before publication, and conflicts with any live
+reservation fail closed; VCN remains TMR-only. The private inventory retains
+the exact CW0/CW1 ranges, checks their GMC aperture against the PSP session and
+permanently excludes them from both visible and above-BAR pools. Other
+protected ranges do not authorize firmware, and disjoint reservations are never
+widened into one range. Recovery carries the same inventory forward.
 Partial failures retain any earlier valid address for
 diagnostics. These are not CPU pointers or proof that the media engines have
 started. Consumers must keep TMR alive. The API does not configure memory hubs,
