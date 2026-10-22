@@ -72,6 +72,9 @@ mod vp9_proof;
 #[path = "amdgpu_vcn_navi48_vp9_words.rs"]
 mod vp9_words;
 
+#[path = "amdgpu_vcn_navi48_reservation.rs"]
+mod reservation;
+pub(crate) use reservation::proof_bytes;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Unsupported,
@@ -797,6 +800,16 @@ pub struct Vcn {
     engine: Engine<Mmio>,
 }
 impl Vcn {
+    /// Claim every requested proof arena atomically before power or publication.
+    pub(crate) fn reserve_proofs(
+        &mut self,
+        ibs: bool,
+        decode: bool,
+        encode: bool,
+    ) -> Result<(), Error> {
+        self.engine.reserve_proofs(ibs, decode, encode)
+    }
+
     /// # Safety
     /// Own this physical Navi48's VCN/JPEG, NBIF media range and BAR2
     /// doorbells exclusively. The permanent pool matches its boot inventory;

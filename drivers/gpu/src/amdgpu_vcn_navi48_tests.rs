@@ -8,6 +8,8 @@ mod av1_roundtrip_tests;
 mod hevc_encode_tests;
 #[path = "amdgpu_vcn_navi48_hevc_roundtrip_tests.rs"]
 mod hevc_roundtrip_tests;
+#[path = "amdgpu_vcn_navi48_reservation_tests.rs"]
+mod reservation_tests;
 use super::*;
 use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
 use core::{

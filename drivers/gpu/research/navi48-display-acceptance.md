@@ -102,6 +102,12 @@ harvested/OEM boards and small CPU-visible BAR apertures. Record actual firmware
 VRAM/BAR sizes, retained owner allocations, client heap and refusal/recovery
 behavior under pressure. A nominal GPU family or successful initialization does
 not establish these device-specific results.
+The complete requested media proof set currently retains156069888bytes before
+firmware, displays and other owners. Clean S3/BACO resume reclaims the stopped
+old proof owner; fault recovery conservatively retains the old whole owner.
+On a256MiB aperture, a replacement full request can therefore refuse and leave
+the device lost. Record this availability limit and the actual refusal rather
+than assuming the initial admission result guarantees fault recovery.
 
 For graphics and compute, retain native proof readbacks and submitted command
 traces, then run the selected Mesa/libdrm stack with real application contexts.

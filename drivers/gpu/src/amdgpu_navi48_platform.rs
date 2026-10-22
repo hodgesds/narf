@@ -10,6 +10,8 @@ use core::ops::Range;
 use narf_capabilities::{Cap, Read};
 use narf_graphics_driver::generic::GenericFb;
 use narf_lib::mutex::Mutex;
+#[path = "amdgpu_navi48_client_draw.rs"]
+mod client_draw;
 #[path = "amdgpu_navi48_client_shader.rs"]
 mod client_shaders;
 #[path = "amdgpu_navi48_platform_recovery.rs"]
@@ -112,6 +114,7 @@ pub struct Diagnostics {
     pub shaders:
         Option<Result<crate::amdgpu_gfx12_shader::Proof, crate::amdgpu_gfx12_queue::Error>>,
     pub client_shaders: Option<Result<client_shaders::Proof, narf_filesystem::FsError>>,
+    pub client_draw: Option<Result<client_draw::Proof, narf_filesystem::FsError>>,
     pub media_transport: Option<Result<crate::amdgpu_vcn_navi48::InterruptProof, boot::Error>>,
     pub media_state: Option<crate::amdgpu_vcn_navi48::State>,
     pub media_ibs:
@@ -166,6 +169,7 @@ pub fn status() -> Status {
                 queue_interrupts: boot.queue_interrupts(),
                 shaders: boot.shader_result(),
                 client_shaders: client_shaders::result(*READ_GENERATION.lock()),
+                client_draw: client_draw::result(*READ_GENERATION.lock()),
                 media_transport: boot.media_result(),
                 media_state: boot.media_state(),
                 media_ibs: boot.media_ib_result(),
@@ -355,6 +359,27 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     }
     // Boot's block_on_spin may have IF=0. Defer the CPU-delivery proof to the
     // executor; the IRQ service keeps running independently of OWNER.
+    // Claim every requested media arena before the deferred worker or client
+    // heap can consume the pool. Refusal publishes no media address or power.
+    if MEDIA_PROOF.load(Ordering::Acquire)
+        || MEDIA_CLIENTS.load(Ordering::Acquire)
+        || DECODE_PROOF.load(Ordering::Acquire)
+        || ENCODE_PROOF.load(Ordering::Acquire)
+        || JPEG_PROOF.load(Ordering::Acquire)
+        || JPEG_DECODE_PROOF.load(Ordering::Acquire)
+    {
+        // SAFETY: this scope retains OWNER, trained GMC/firmware and exclusive
+        // device lifetime. Preparation is synchronous and never starts media.
+        unsafe {
+            boot.prepare_media_transport(
+                MEDIA_CLIENTS.load(Ordering::Acquire),
+                DECODE_PROOF.load(Ordering::Acquire),
+                ENCODE_PROOF.load(Ordering::Acquire),
+                JPEG_PROOF.load(Ordering::Acquire),
+                JPEG_DECODE_PROOF.load(Ordering::Acquire),
+            )
+        }?;
+    }
     narf_scheduler::spawn(prove_queue_interrupts());
     if let Some((limits, level)) = boot.power_info() {
         crate::amdgpu_navi48_power::start(limits, level);
@@ -420,6 +445,7 @@ fn register_submitter(
             && matches!(boot.shader_result(), Some(Ok(_)))
         {
             narf_scheduler::spawn(client_shaders::prove());
+            narf_scheduler::spawn(client_draw::prove());
         }
     }
 }
@@ -2064,6 +2090,7 @@ async fn prove_queue_interrupts() {
                     // native submissions acquire OWNER. This scope releases
                     // OWNER before that separately scheduled task can enter.
                     narf_scheduler::spawn(client_shaders::prove());
+                    narf_scheduler::spawn(client_draw::prove());
                 }
             }
         }

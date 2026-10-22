@@ -369,6 +369,26 @@ impl<I: Io> Engine<I> {
         self.shared_range()
     }
 }
+impl<I: Io> Engine<I> {
+    fn reserve_proofs(&mut self, decode: bool, clients: bool) -> Result<(), Error> {
+        if !matches!(self.state, State::Prepared | State::Stopped) {
+            return Err(Error::Busy);
+        }
+        crate::amdgpu_media_reservation::reserve(
+            &self.pool,
+            [
+                (&mut self.decode_memory, decode_words::BYTES, decode),
+                (&mut self.client_memory, cs::CLIENT_BYTES, clients),
+            ],
+        )
+        .map_err(|_| Error::Allocation)
+    }
+}
+pub(crate) const fn proof_bytes(decode: bool, clients: bool) -> u64 {
+    BYTES
+        + if decode { decode_words::BYTES } else { 0 }
+        + if clients { cs::CLIENT_BYTES } else { 0 }
+}
 pub struct Jpeg {
     engine: Engine<Mmio>,
 }
@@ -381,6 +401,11 @@ impl core::fmt::Debug for Jpeg {
     }
 }
 impl Jpeg {
+    /// Claim decode and staged-client arenas before any power/publication.
+    pub(crate) fn reserve_proofs(&mut self, decode: bool, clients: bool) -> Result<(), Error> {
+        self.engine.reserve_proofs(decode, clients)
+    }
+
     /// # Safety
     /// Own this GPU's JPEG5, BAR2 slot 0x311 and backing/GMC exclusively.
     /// The retained VCN owner holds the matching NBIO media range until JPEG

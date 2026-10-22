@@ -60,13 +60,13 @@ struct Builder {
     task: usize,
 }
 impl Builder {
-    fn new(base: u64, phase: Phase) -> Self {
+    fn new(base: u64, phase: Phase, interface: u32) -> Self {
         let mut this = Self {
             words: vec![0; 8],
             task: 0,
         };
         let at = base + SESSION;
-        this.packet(1, &[0x10009, (at >> 32) as u32, at as u32, 1]);
+        this.packet(1, &[interface, (at >> 32) as u32, at as u32, 1]);
         this.task = this.words.len();
         let (task, feedback) = match phase {
             Phase::Create => (1, 0),
@@ -99,9 +99,12 @@ impl Builder {
     }
 }
 
-pub(super) fn ib(base: u64, phase: Phase) -> Result<Vec<u32>, Error> {
+pub(super) fn ib(base: u64, phase: Phase, interface: u32) -> Result<Vec<u32>, Error> {
     validate(base)?;
-    let mut b = Builder::new(base, phase);
+    if !(0x10008..=0x1000a).contains(&interface) {
+        return Err(Error::Unsupported);
+    }
+    let mut b = Builder::new(base, phase, interface);
     match phase {
         Phase::Create => {
             b.packet(0x01000001, &[]);

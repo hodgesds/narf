@@ -634,6 +634,22 @@ of this; Navi44's discovery is assumed to match Navi48 apart from the versions
 above (one VCN5.0.0, DCN 4.0.1, MMHUB 4.1.0, OSSSYS 7.0.0, NBIF/NBIO, SMUIO
 14.0.2, HDP 6.x), and any other discovered version fails closed.
 
+### Selected RX 9000 userspace INFO replay
+
+`tests/mesa_info/check.py` executes actual selected Mesa26.2.4 common/device
+initialization and libdrm2.4.134 initialization against unchanged production
+Rust INFO dispatch/builders and GET_CAP responses, using explicit representative
+state and host transport adapters. Both dies must pass the fully published
+query contract only in an explicit hypothetical host3.54/ACCEL envelope.
+Production DRM3.0.0 and ACCEL_WORKING=0 remain unchanged. The production
+ACCEL reply makes libdrm's `_amdgpu_device_initialize` return EBADF before
+Mesa's common GPU initialization; changing only that host value still reaches
+and fails Mesa's minor54 gate. Tests independently preserve both refusals,
+mandatory query failures, VCN withdrawal/unsupported IP, graphics-only degraded
+readiness, optional MAX_IBS fallback and exact raw VCN fields. The harness is
+source/ABI evidence, not native board state, API rendering, general video or
+capability acceptance; it never submits a GPU job.
+
 ### Navi 48 PCIe probe (RX 9070 XT)
 
 The next discrete target is Navi48, selected from the September 2026
@@ -4015,6 +4031,45 @@ cross-root writes, overruns, incomplete/error fences and missing interrupts;
 they establish software ownership/readback contracts, not physical shader
 execution. Mesa version/acceleration and codec advertisement remain gated.
 
+That opt-in also schedules `amdgpu_navi48_client_draw` after OWNER is released.
+It runs a genuine GFX12 META graphics rectangle on gfx1200/gfx1201, using
+pinned Mesa26.2.4 ACO NGG/PS binaries and the unchanged graphics-preamble,
+GE-ring, CB/descriptor, draw and cache-barrier constructors. The optional
+`tests/gfx12_render/generate.sh` verifies explicit Mesa/libdrm archive hashes,
+builds offline, compares every fixture word and all 4096 Addrlib3 pixel
+addresses, and independently validates both target ISAs with LLVM. The
+pristine DRM shim records gfx1201; gfx1200/1201 family, physical SE count,
+address32 and PFP version are explicit compiler/constructor inputs, not
+physical board evidence. PFP's retained authenticated image selects the
+pre/post-2680 constructor variant; discovered physical SE count must match.
+That version comes from the retained container's common header, corresponding
+to the loaded PFP payload; PSP does not independently attest that header field.
+
+Each of two distinct per-open roots/PASIDs maps the same VA: code/IB are
+readable/executable without write permission, while descriptors, upload,
+target and GE working storage are readable/writable without execution.
+GE sizing follows the primary max-SE-squared contract: 4 MiB for Navi44,
+10.5 MiB for Navi48. The two complete arenas consume 12.125/25.125 MiB of
+system/GTT backing respectively, plus page tables, and consume no driver
+VRAM-pool reservation. Success requires fresh increasing native graphics
+job fences, full RPTR drain, a fresh EOP/CPU-vector observation and exact
+readback of 667 red pixels in `(7,11,29,23)`, 3429 untouched pixels and all
+code/descriptor/padding/guard words in both clients. The allocated GE
+interiors are unspecified working data and are excluded from post-readback;
+their boundaries remain checked. The primary path does not require them
+zeroed. Actual CB-to-host synchronization and BOTTOM_OF_PIPE PWS completion
+precede the outer native job fence.
+
+`Diagnostics::client_draw` reports this separately from compute proofs. The
+ten-second operation retains runtime-PM access, placement admission and its
+async backing owner across submission/wait/readback. Error or cancellation
+quarantines storage; a matching new submitter can replace it only after
+whole-device reset and fresh queue/IH proofs. Models exercise both targets,
+VM permissions, wrong-root/pixel/guard errors, busy admission, incomplete or
+failed fences, absent interrupts and canceled submissions. These establish
+software lifetime/readback behavior; physical draw/cadence acceptance and
+Mesa/DRM capability advertisement remain separate gates.
+
 The read-only `amdgpu_dcn_inventory` routing functions support Navi48 with
 GC12.0.0/12.0.1 and DCN4.0.1 (including raw discovery 4.1.0). ATOM display-object
 tables v1.4/v1.5 supply independently resolved transmitter, AUX and HPD
@@ -4094,9 +4149,9 @@ boot's memory-translation stage runs it right after `initialize`, before any
 queue exists.
 
 After boot, the platform calls `ColdBoot::publish_client_vram`: the
-CPU-visible VRAM the driver's pool still has free, less a driver reserve of
-half of it capped at 512 MiB (so a resizable BAR's VRAM goes nearly all to
-clients), 2 MiB-aligned, halved until one free run holds it, at least
+CPU-visible VRAM the driver's pool still has free, less an explicit future-owner
+reserve of max(32MiB, one eighth of the aperture capped512MiB), bounded by
+current availability, 2 MiB-aligned, halved until one free run holds it, at least
 64 MiB, becomes a separate pool, registered as the Navi48 DRM card's
 `VramHeap` with the GMC's framebuffer geometry. The slice never returns to
 the driver's pool, so clients without eviction cannot starve its owners.
@@ -8736,6 +8791,18 @@ under `drivers/gpu/fixtures/vcn5/encode`. A separate retained arena owns
 session/CPB, pitched immutable input, metadata, feedback, output and commands.
 The output has the entire declared `0x1f000` range backed, with guards on
 both sides; the source test's smaller allocation is not copied.
+Its three AVC session headers use the interface selected from the retained
+authenticated firmware, exactly as the newer HEVC/AV1 proofs: major1 with
+minor>=8, clamped to1.10. Missing/unsupported interface refuses before fresh
+arena allocation, state transition or address publication, preserving any
+preclaimed unpublished storage and the prior proof. Cancellation/failure
+retention and owned retirement are unchanged. Full IGT1.9 body comparison
+remains intact; unchanged Mesa version decoding/selection/session constructors
+independently verify the variable1.8/1.9/1.10 session headers. Native physical
+completion and capability gates remain separate from these host comparisons.
+The version is retained common-header metadata corresponding to the loaded
+payload, with the same header-authentication limit as `FW_VCN` above.
+
 
 `EncodeTesting` and pending `encode_result` precede the first await and
 publication. Each arena page is initialized, including fresh zero feedback
@@ -8758,6 +8825,44 @@ stop/power-down cycle; with clients, the proven VCPU remains retained. No
 codec profile is advertised by this proof. Synthetic header output in the
 model verifies ownership, parsing and completion contracts; actual encoding
 and picture-quality acceptance remain physical tests at the end of bring-up.
+
+Before spawning the deferred media worker or carving the visible client heap,
+`ColdBoot::prepare_media_transport` admits the complete requested footprint.
+`Vcn::reserve_proofs` and JPEG's counterpart use exact per-codec arena constants,
+including both roundtrip arenas, Main10 profiles and JPEG client slots. VCN and
+JPEG owners stay local until both full sets fit. No power message, dispatch
+registration or media address is published on refusal; only new unpublished
+reservations drop, and pressure can be released before retry. Existing retained
+pins are never replaced/released by this transaction. Unsupported encoder
+firmware refuses the whole request without silently trimming its profile set.
+The prepared request is immutable; startup and new resume owners check the same
+request before power. Failure/cancellation after publication keeps the existing
+retained-engine/reset contract. The checked startup claim precedes client carve,
+so the asynchronously scheduled worker cannot discover that clients took its
+proof memory first.
+
+The full VCN chain currently claims155734016bytes after the384x128 HEVC
+correction: all requested decoders through AV1 Main10, AVC encode and both
+HEVC/AV1 encoder roundtrips. JPEG proof plus decode adds73728bytes; keeping
+its four64KiB staged client slots adds262144. These are distinct retained
+arenas, not reusable scratch. Firmware, existing display/queue allocations and
+inventory exclusions have already reduced actual `Pool::available()`. Client
+carve then preserves max(32MiB, aperture/8 capped512MiB) for later driver owners,
+uses actual checked contiguous2MiB-aligned reservation and requires at least
+64MiB. Small-aperture admission never halves the post-proof remainder. Missing
+space refuses a client VRAM heap or the complete media request, as applicable;
+there is no universal all-features-fit promise for256MiB. Later display requests
+must still obtain their exact checked backing. Draw proof arenas use System/GTT
+and do not consume this BootPool reserve. Native regressions use a real256MiB
+Pool, variable firmware/display claims, pressure/refusal/retry, old startup-order
+reproduction, published-pin retention and full proof-to-real-client submission
+through stop/restart. Capability/profile/range rows remain separately gated.
+Clean S3/BACO resume drops and reclaims the old stopped proof owner before
+this admission. Fault recovery instead keeps the old whole owner quarantined;
+its complete media backing and the carried client heap remain charged. A
+256MiB aperture can therefore refuse the new full request and remain lost
+after a fault, even when the initial request fit. No uncertain old owner is
+reclaimed to force recovery admission.
 
 The same `amdgpu.encode_proof` sequence additionally requests
 `unsafe Vcn::prove_hevc_encode().await` after AVC encoding (and all requested

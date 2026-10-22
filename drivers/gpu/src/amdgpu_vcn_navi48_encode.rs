@@ -9,6 +9,10 @@ impl<I: Io> Engine<I> {
         &mut self,
         observer: &mut impl Observer,
     ) -> Result<EncodeProof, Error> {
+        let interface = self
+            .encode_interface
+            .filter(|i| (0x10008..=0x1000a).contains(i))
+            .ok_or(Error::Unsupported)?;
         if self.encode_result.is_some() {
             return Err(Error::Busy);
         }
@@ -76,7 +80,7 @@ impl<I: Io> Engine<I> {
         self.encode_result = Some(Err(Error::Busy));
         self.encode_memory.as_mut().unwrap().publish();
         let result = self
-            .prove_encode_inner(observer)
+            .prove_encode_inner(observer, interface)
             .await
             .and_then(|p| self.access(|_, _| Ok(p)));
         self.state = match result {
@@ -89,12 +93,13 @@ impl<I: Io> Engine<I> {
     async fn prove_encode_inner(
         &mut self,
         observer: &mut impl Observer,
+        interface: u32,
     ) -> Result<EncodeProof, Error> {
         let memory = self.encode_memory.as_ref().ok_or(Error::Busy)?;
         let (map, base) = (memory.mapping(), memory.address());
-        let create = e::ib(base, e::Phase::Create)?;
-        let encode = e::ib(base, e::Phase::Encode)?;
-        let destroy = e::ib(base, e::Phase::Destroy)?;
+        let create = e::ib(base, e::Phase::Create, interface)?;
+        let encode = e::ib(base, e::Phase::Encode, interface)?;
+        let destroy = e::ib(base, e::Phase::Destroy, interface)?;
         for page in (0..e::BYTES).step_by(4096) {
             self.access(|io, l| {
                 let value = if e::GUARDS.contains(&page) {

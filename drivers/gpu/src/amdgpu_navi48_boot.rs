@@ -210,6 +210,36 @@ fn pin_vram(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MediaRequest {
+    keep: bool,
+    decode: bool,
+    encode: bool,
+    jpeg: bool,
+    jpeg_decode: bool,
+}
+impl MediaRequest {
+    fn new(keep: bool, decode: bool, encode: bool, jpeg: bool, jpeg_decode: bool) -> Self {
+        Self {
+            keep,
+            decode,
+            encode,
+            jpeg: jpeg || jpeg_decode || keep,
+            jpeg_decode,
+        }
+    }
+    fn ibs(self) -> bool {
+        self.keep || self.decode || self.encode || self.jpeg
+    }
+    fn bytes(self) -> u64 {
+        crate::amdgpu_vcn_navi48::proof_bytes(self.ibs(), self.decode, self.encode)
+            + if self.jpeg {
+                crate::amdgpu_jpeg_navi48::proof_bytes(self.jpeg_decode, self.keep)
+            } else {
+                0
+            }
+    }
+}
 #[derive(Debug)]
 struct Hardware {
     gpu: AmdGpu,
@@ -253,6 +283,7 @@ struct Hardware {
     jpeg_test: Option<Result<crate::amdgpu_jpeg_navi48::Proof, Error>>,
     jpeg_owner: Option<crate::amdgpu_navi48_dispatch::Handle>,
     media_test: Option<Result<crate::amdgpu_vcn_navi48::InterruptProof, Error>>,
+    media_request: Option<MediaRequest>,
     media_decode_required: bool,
     media_encode_required: bool,
     media_jpeg_required: bool,
@@ -621,13 +652,34 @@ fn rebind_display_clocks(
     }
     Ok(())
 }
-/// What the driver keeps of `available` free CPU-visible VRAM for its own
-/// later owners (scanout surfaces, display and queue memory): half of a
-/// small BAR's worth, at most 512 MiB — so a resizable BAR that shows all
-/// of VRAM hands nearly all of it to clients, not half.
-fn driver_reserve(available: u64) -> u64 {
-    (available / 2).min(512 << 20)
+/// Future driver-owner headroom, AFTER firmware, existing displays and the
+/// complete requested media set are charged to Pool. A small 256 MiB aperture
+/// keeps 32 MiB (staging/cursors and checked later display allocation); large
+/// apertures keep one eighth, capped 512 MiB. Never derive the floor from the
+/// post-proof remainder or silently trim requested codecs to admit a client.
+/// Future display requests still need their actual checked allocation; this
+/// floor is not a promise that every multi-monitor combination fits a BAR.
+fn driver_reserve(aperture: u64, available: u64) -> u64 {
+    (32u64 << 20)
+        .max((aperture / 8).min(512 << 20))
+        .min(available)
 }
+
+pub(crate) fn reserve_client_chunk(pool: &Pool) -> Result<crate::amdgpu_vram::Reservation, Error> {
+    const ALIGN: u64 = 2 << 20;
+    let available = pool.available();
+    let mut size = (available - driver_reserve(pool.size(), available)) & !(ALIGN - 1);
+    loop {
+        if size < 64 << 20 {
+            return Err(Error::Allocation);
+        }
+        match pool.reserve_aligned(size, ALIGN) {
+            Ok(chunk) => return Ok(chunk),
+            Err(_) => size = (size / 2) & !(ALIGN - 1),
+        }
+    }
+}
+
 impl ColdBoot {
     /// # Safety
     /// Caller owns a physical Navi48 GPU, permanent mappings and a pool made
@@ -822,6 +874,7 @@ impl ColdBoot {
                     jpeg_test: None,
                     jpeg_owner: None,
                     media_test: None,
+                    media_request: None,
                     media_decode_required: false,
                     media_encode_required: false,
                     media_jpeg_required: false,
@@ -1028,6 +1081,22 @@ impl ColdBoot {
     }
     pub fn state(&self) -> State {
         self.sequence.state
+    }
+    /// Inputs for the fixed draw, from this retained boot and loaded image.
+    pub(crate) fn draw_inputs(&self) -> Option<crate::amdgpu_gfx12_draw::Inputs> {
+        if self.state() != State::MemoryReady {
+            return None;
+        }
+        let backend = &self.sequence.backend;
+        let images = backend.firmware.images().ok()?;
+        Some(crate::amdgpu_gfx12_draw::Inputs {
+            chip: crate::amdgpu_rdna4::Rdna4Chip::of(&backend.gpu)?,
+            max_se: backend.gpu.gc_info?.num_se,
+            pfp_version: images
+                .iter()
+                .find(|i| i.source() == gfx::Source::Pfp)?
+                .version(),
+        })
     }
     pub fn report(&self) -> Option<Report> {
         (self.state() == State::MemoryReady)
@@ -1446,7 +1515,6 @@ impl ColdBoot {
     /// address it as the GMC's framebuffer geometry translates it.
     /// Returns the heap's size.
     pub(crate) fn publish_client_vram(&mut self) -> Result<u64, Error> {
-        const ALIGN: u64 = 2 << 20;
         if self.client_vram.is_some() {
             return Err(Error::Busy);
         }
@@ -1458,19 +1526,9 @@ impl ColdBoot {
             .ok_or(Error::Invalid)?
             .display_context(regs)
             .map_err(Error::Gmc)?;
-        let available = hw.pool.available();
         let card = Self::drm_card().ok_or(Error::Invalid)?;
-        let mut size = (available - driver_reserve(available)) & !(ALIGN - 1);
-        // Free space need not be one run; settle for the largest that is.
-        let mut chunk = loop {
-            if size < 64 << 20 {
-                return Err(Error::Allocation);
-            }
-            match hw.pool.reserve_aligned(size, ALIGN) {
-                Ok(chunk) => break chunk,
-                Err(_) => size = (size / 2) & !(ALIGN - 1),
-            }
-        };
+        let mut chunk = reserve_client_chunk(&hw.pool)?;
+        let size = chunk.size();
         // SAFETY: the reservation is this heap's alone, inside the owned,
         // CPU-mapped VRAM range the boot inventory produced.
         let heap = unsafe { Pool::from_owned_range(chunk.mapping(), chunk.address()) }

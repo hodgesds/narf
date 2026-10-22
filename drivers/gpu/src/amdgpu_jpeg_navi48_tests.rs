@@ -590,3 +590,29 @@ kernel_test_in!(
     "drivers/gpu/jpeg-navi48",
     jpeg5_rejects_shared_range_policy_or_readback_before_publication
 );
+
+fn jpeg5_requested_decode_and_client_slots_preclaim_atomically_before_power() -> TestResult {
+    assert_eq!(proof_bytes(true, true), 335872);
+    let (pool, mut engine, _) = fixture_capacity(proof_bytes(true, true));
+    let pressure = pool.reserve(4096).unwrap();
+    let free = pool.available();
+    assert_eq!(engine.reserve_proofs(true, true), Err(Error::Allocation));
+    assert!(engine.decode_memory.is_none() && engine.client_memory.is_none());
+    assert_eq!(pool.available(), free);
+    assert_eq!(engine.state, State::Prepared);
+    assert!(engine.io.writes.is_empty());
+    drop(pressure);
+    engine.reserve_proofs(true, true).unwrap();
+    assert_eq!(pool.available(), 0);
+    assert!(engine.decode_memory.as_ref().unwrap().reusable_for_test());
+    assert!(engine.client_memory.as_ref().unwrap().reusable_for_test());
+    assert!(engine.io.writes.is_empty());
+    engine.reserve_proofs(true, true).unwrap();
+    drop(engine);
+    assert_eq!(pool.available(), proof_bytes(true, true));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/jpeg-navi48",
+    jpeg5_requested_decode_and_client_slots_preclaim_atomically_before_power
+);

@@ -80,6 +80,84 @@ impl ColdBoot {
     {
         self.sequence.backend.jpeg.as_ref()?.decode_result()
     }
+    /// Transactionally admit all requested retained media backing before the
+    /// startup worker or a client heap can consume this owner pool. No power
+    /// message, registration or hardware address is published on refusal.
+    /// # Safety
+    /// Same retained exclusive GPU/GMC/firmware owner as prove_media_transport.
+    pub(crate) unsafe fn prepare_media_transport(
+        &mut self,
+        keep: bool,
+        decode: bool,
+        encode: bool,
+        jpeg: bool,
+        jpeg_decode: bool,
+    ) -> Result<(), Error> {
+        if self.state() != State::MemoryReady {
+            return Err(Error::Busy);
+        }
+        let request = MediaRequest::new(keep, decode, encode, jpeg, jpeg_decode);
+        let hw = &mut self.sequence.backend;
+        if let Some(old) = hw.media_request {
+            return if old == request {
+                Ok(())
+            } else {
+                Err(Error::Busy)
+            };
+        }
+        if hw.media_test.is_some() || hw.vcn.is_some() || hw.jpeg.is_some() {
+            return Err(Error::Busy);
+        }
+        if hw.pool.available() < request.bytes() {
+            return Err(Error::Allocation);
+        }
+        let image = hw
+            .firmware
+            .gfx
+            .images()
+            .map_err(Error::Firmware)?
+            .into_iter()
+            .zip(gfx::Source::ALL)
+            .find(|(_, source)| *source == gfx::Source::Vcn)
+            .ok_or(Error::Invalid)?
+            .0;
+        let bytes = image.payloads().next().ok_or(Error::Invalid)?.bytes().len();
+        // SAFETY: the retained exclusive device owns its mapped doorbells;
+        // constructors perform bounded validation and unpublished allocation.
+        let doorbells =
+            unsafe { mes::map_doorbells(&hw.pci, &hw.authority) }.map_err(Error::Mes)?;
+        // SAFETY: matching retained firmware/GMC/pool; no media publisher exists.
+        let mut vcn = unsafe {
+            vcn::Vcn::new(
+                &hw.gpu,
+                hw.authority,
+                &hw.pool,
+                doorbells,
+                bytes,
+                image.version(),
+            )
+        }
+        .map_err(Error::Vcn)?;
+        vcn.reserve_proofs(request.ibs(), request.decode, request.encode)
+            .map_err(Error::Vcn)?;
+        let jpeg = if request.jpeg {
+            // SAFETY: same exclusive device/pool; all allocations stay local
+            // and unpublished until BOTH engines' complete request fits.
+            let mut jpeg = unsafe {
+                crate::amdgpu_jpeg_navi48::Jpeg::new(&hw.gpu, hw.authority, &hw.pool, doorbells)
+            }
+            .map_err(Error::Jpeg)?;
+            jpeg.reserve_proofs(request.jpeg_decode, request.keep)
+                .map_err(Error::Jpeg)?;
+            Some(jpeg)
+        } else {
+            None
+        };
+        hw.vcn = Some(vcn);
+        hw.jpeg = jpeg;
+        hw.media_request = Some(request);
+        Ok(())
+    }
     /// # Safety
     /// OWNER excludes every engine/PM/firmware user, no client job or clear
     /// has been published, and this is the retained post-interrupt-proof GPU.
@@ -95,6 +173,9 @@ impl ColdBoot {
         if self.state() != State::MemoryReady || self.sequence.backend.media_test.is_some() {
             return Err(Error::Busy);
         }
+        // SAFETY: caller retains the same exclusive native owner. This is
+        // idempotent for the early startup claim and covers new resume owners.
+        unsafe { self.prepare_media_transport(keep_running, decode, encode, jpeg, jpeg_decode) }?;
         let hw = &mut self.sequence.backend;
         // Written before the first await, so cancellation keeps all three
         // client submit wrappers closed even if the VCPU never started.
@@ -107,35 +188,10 @@ impl ColdBoot {
         hw.media_jpeg_clients = keep_running;
         hw.media_jpeg_decode_required = jpeg_decode;
         let result = async {
-            let image = hw
-                .firmware
-                .gfx
-                .images()
-                .map_err(Error::Firmware)?
-                .into_iter()
-                .zip(gfx::Source::ALL)
-                .find(|(_, source)| *source == gfx::Source::Vcn)
-                .ok_or(Error::Invalid)?
-                .0;
-            let bytes = image.payloads().next().ok_or(Error::Invalid)?.bytes().len();
-            // SAFETY: same exclusively retained PCI function and BAR2.
+            // SAFETY: preparation validated this owner's doorbell mapping;
+            // no competing media/reset/PM writer exists throughout this task.
             let doorbells =
                 unsafe { mes::map_doorbells(&hw.pci, &hw.authority) }.map_err(Error::Mes)?;
-            // SAFETY: retained matching pool/firmware/GMC and exclusive media
-            // range. Store the owner before any power-up or VCPU publication.
-            hw.vcn = Some(
-                unsafe {
-                    vcn::Vcn::new(
-                        &hw.gpu,
-                        hw.authority,
-                        &hw.pool,
-                        doorbells,
-                        bytes,
-                        image.version(),
-                    )
-                }
-                .map_err(Error::Vcn)?,
-            );
             // SAFETY: no competing media owner or power writer.
             let power = unsafe {
                 hw.smu
