@@ -40,6 +40,18 @@ impl ProcessOomKiller {
             if pid <= 1 {
                 continue;
             }
+            // A prior OOM pass may already have condemned this thread group.
+            // The reap queue only deduplicates while an entry is queued; a
+            // locked address space can yield `Nothing` immediately, after
+            // which selecting the same still-live task again burns the
+            // emergency kernel reserve on repeated reports/signals without
+            // freeing a page. Linux marks an OOM victim and skips it on later
+            // selection passes. Pending group SIGKILL is NARF's equivalent
+            // terminal marker, so move on to another process while this one
+            // reaches its exit path.
+            if crate::handlers::task_fatal_signal_pending(tid) {
+                continue;
+            }
             // Cgroup-scoped OOM: skip anything outside the offending subtree.
             if let Some(pids) = filter {
                 if !pids.contains(&pid) {

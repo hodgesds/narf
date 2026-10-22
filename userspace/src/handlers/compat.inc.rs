@@ -7267,6 +7267,54 @@ struct ProcImageMapping {
 static PROC_IMAGE_MAPPINGS: TaskMapTable<alloc::vec::Vec<ProcImageMapping>> =
     [const { TaskMapShard::new() }; TASK_MAP_SHARDS];
 
+/// Best-effort clone for `/proc/<pid>/maps` image provenance.
+///
+/// This table is diagnostic metadata, but an ordinary `Vec::clone` is
+/// infallible: if userspace has driven the machine into OOM, cloning even a
+/// handful of mappings invokes the kernel's allocation-error handler and
+/// panics the whole machine. Keep every allocation in this snapshot fallible;
+/// callers degrade to missing file labels when there is no kernel-heap room.
+fn try_clone_proc_image_mappings(
+    mappings: &[ProcImageMapping],
+) -> Option<alloc::vec::Vec<ProcImageMapping>> {
+    let mut cloned = alloc::vec::Vec::new();
+    cloned.try_reserve_exact(mappings.len()).ok()?;
+    for mapping in mappings {
+        let mut pathname = alloc::string::String::new();
+        pathname.try_reserve_exact(mapping.pathname.len()).ok()?;
+        pathname.push_str(&mapping.pathname);
+        cloned.push(ProcImageMapping {
+            start: mapping.start,
+            end: mapping.end,
+            file_offset: mapping.file_offset,
+            device: mapping.device,
+            inode: mapping.inode,
+            pathname,
+        });
+    }
+    Some(cloned)
+}
+
+fn proc_image_mappings_snapshot(task: u64) -> alloc::vec::Vec<ProcImageMapping> {
+    let g = PROC_IMAGE_MAPPINGS[task_map_shard(task)].map.lock();
+    g.as_ref()
+        .and_then(|m| m.get(&task))
+        .and_then(|mappings| try_clone_proc_image_mappings(mappings))
+        .unwrap_or_default()
+}
+
+fn proc_image_mappings_fork(parent: u64, child: u64) {
+    let inherited = {
+        let g = PROC_IMAGE_MAPPINGS[task_map_shard(parent)].map.lock();
+        g.as_ref()
+            .and_then(|m| m.get(&parent))
+            .and_then(|mappings| try_clone_proc_image_mappings(mappings))
+    };
+    if let Some(mappings) = inherited {
+        task_map_set(&PROC_IMAGE_MAPPINGS, child, mappings);
+    }
+}
+
 fn proc_absolute_path(task: u64, path: &str) -> alloc::string::String {
     if path.starts_with('/') {
         alloc::string::String::from(path)
@@ -7340,15 +7388,18 @@ fn proc_image_mapping_for_range(
     mappings
         .iter()
         .find(|mapping| mapping.start <= start && end <= mapping.end)
-        .map(|mapping| {
-            (
+        .and_then(|mapping| {
+            let mut pathname = alloc::string::String::new();
+            pathname.try_reserve_exact(mapping.pathname.len()).ok()?;
+            pathname.push_str(&mapping.pathname);
+            Some((
                 mapping
                     .file_offset
                     .saturating_add(start.saturating_sub(mapping.start)),
                 mapping.device,
                 mapping.inode,
-                mapping.pathname.clone(),
-            )
+                pathname,
+            ))
         })
 }
 
@@ -7373,7 +7424,7 @@ pub(crate) fn proc_identity_fork(parent_task: u64, child_task: u64) {
             .get_or_insert_with(alloc::collections::BTreeMap::new)
             .insert(child_task, exe);
     }
-    task_map_fork(&PROC_IMAGE_MAPPINGS, parent_task, child_task);
+    proc_image_mappings_fork(parent_task, child_task);
     // argv, environ and the auxiliary vector live in the mm on Linux
     // (`mm->arg_start..env_end`, `mm->saved_auxv`), which `dup_mm` copies: a
     // forked child that has not exec'd reports its parent's
@@ -8003,7 +8054,11 @@ pub fn proc_task_info(
     // regions (the latter has no VFS-path dependency). Snapshot it once so
     // maps rendering neither locks on every VMA nor exposes a half-updated
     // exec image.
-    let image_mappings = task_map_get(&PROC_IMAGE_MAPPINGS, tid).unwrap_or_default();
+    let image_mappings = if query == TaskInfoQuery::Vmas {
+        proc_image_mappings_snapshot(tid)
+    } else {
+        alloc::vec::Vec::new()
+    };
     let stack_bytes = as_arc
         .as_ref()
         .and_then(|as_arc| {

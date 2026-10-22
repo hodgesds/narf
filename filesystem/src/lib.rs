@@ -3287,7 +3287,16 @@ pub fn resolve_async_dentry_ext<'a>(
                 // Read the target. POSIX symlink targets are bounded
                 // by SYMLINK_MAX (typically 4096); we cap defensively
                 // at a single page.
-                let mut buf = alloc::vec![0u8; 4096];
+                // Path lookup is routinely exercised while reporting memory
+                // pressure (`/proc/self/*`). An infallible page-sized Vec here
+                // turned a recoverable kernel-heap miss into a whole-kernel
+                // panic before kswapd/OOM teardown could run. Keep the same
+                // one-page bound, but surface ENOMEM through the filesystem
+                // error path when the slab cannot grow.
+                let mut buf = alloc::vec::Vec::new();
+                buf.try_reserve_exact(4096)
+                    .map_err(|_| FsError::OutOfMemory)?;
+                buf.resize(4096, 0);
                 let n = f.read(0, &mut buf).await?;
                 let target = core::str::from_utf8(&buf[..n]).map_err(|_| FsError::InvalidPath)?;
                 let absolute = target.starts_with('/');

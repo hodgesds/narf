@@ -179,6 +179,8 @@ pub fn resolve_async_dentry(
     root: Arc<Dentry>,
     path: &str,
 ) -> FsFuture<'_, Arc<dyn FileOps>>;
+// Symlink expansion is bounded to one page and returns
+// FsError::OutOfMemory when that scratch page cannot be reserved.
 
 pub fn resolve_directory_dentry_async(
     root: Arc<Dentry>,
@@ -468,6 +470,9 @@ registration carrying `EPOLLEXCLUSIVE` uses
 readiness queue, keyed by the persistent subscription id, and one matching
 exclusive epoll registration is rotated per event. It is never arbitrated by a
 process-local numeric fd.
+`/proc/<pid>/status` renders through a fallible formatter and returns
+`FsError::OutOfMemory` if its snapshot cannot grow under memory pressure;
+diagnostic reads must not invoke the kernel allocation-failure handler.
 `open_instance_checked` runs after open permission checks, accepts whether
 write access was requested, and can reject the open. It defaults to calling
 `open_instance`; `O_PATH` bypasses per-open setup. Procfs map nodes use it to

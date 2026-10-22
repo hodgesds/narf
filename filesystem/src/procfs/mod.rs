@@ -26,6 +26,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::fmt;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
@@ -517,24 +518,6 @@ pub(crate) fn pid_report(n: u64) -> Option<u64> {
     // SAFETY: v was stored by install_proc_pidns_hooks as a PidReportFn fn-pointer.
     let f: PidReportFn = unsafe { core::mem::transmute(v) };
     f(n)
-}
-
-/// A `/proc/<pid>/status` body rendered for the thread group, with the
-/// `Pid:` and `NSpid:` lines naming thread `tid` instead — what Linux's
-/// `proc_pid_status` prints for `/proc/<tid>/status` (`Tgid:` and `NStgid:`
-/// keep the group id).
-fn thread_status(body: String, tid: u64) -> String {
-    body.lines()
-        .map(|l| {
-            if l.starts_with("Pid:\t") {
-                format!("Pid:\t{tid}\n")
-            } else if l.starts_with("NSpid:\t") {
-                format!("NSpid:\t{tid}\n")
-            } else {
-                format!("{l}\n")
-            }
-        })
-        .collect()
 }
 
 /// `/proc/<n>` where `n` names a thread that is not its group's leader:
@@ -1803,14 +1786,14 @@ impl FileOps for ProcPidFile {
                 PidField::Status => match thread_view {
                     // Tgid stays the group's; Pid/NSpid and State are the
                     // thread's (`proc_pid_status`).
-                    Some((tid, state)) => thread_status(
-                        render_status(&ProcTaskInfo {
+                    Some((tid, state)) => try_render_status(
+                        &ProcTaskInfo {
                             state: state.unwrap_or(info.state),
                             ..info
-                        }),
-                        tid,
-                    ),
-                    None => render_status(&info),
+                        },
+                        Some(tid),
+                    )?,
+                    None => try_render_status(&info, None)?,
                 },
                 PidField::Cmdline => return slice_read(&info.cmdline, offset, buf),
                 PidField::Maps => render_maps(&info),
@@ -3336,8 +3319,49 @@ fn render_stat(info: &ProcTaskInfo) -> String {
     )
 }
 
-fn render_status(info: &ProcTaskInfo) -> String {
-    let mut s = String::new();
+/// A `fmt::Write` sink whose growth reports allocation failure instead of
+/// entering the kernel allocation-error handler. Proc status is queried by
+/// stress tools while the machine is already under memory pressure, so its
+/// diagnostic formatting must not turn an ordinary ENOMEM into a panic.
+struct FallibleString {
+    inner: String,
+    failed: bool,
+}
+
+impl FallibleString {
+    fn new() -> Self {
+        Self {
+            inner: String::new(),
+            failed: false,
+        }
+    }
+
+    fn finish(self) -> Result<String, FsError> {
+        if self.failed {
+            Err(FsError::OutOfMemory)
+        } else {
+            Ok(self.inner)
+        }
+    }
+}
+
+impl fmt::Write for FallibleString {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        if self.failed || self.inner.try_reserve(value.len()).is_err() {
+            self.failed = true;
+            return Err(fmt::Error);
+        }
+        self.inner.push_str(value);
+        Ok(())
+    }
+}
+
+fn proc_status_write(s: &mut FallibleString, args: fmt::Arguments<'_>) -> Result<(), FsError> {
+    fmt::Write::write_fmt(s, args).map_err(|_| FsError::OutOfMemory)
+}
+
+fn try_render_status(info: &ProcTaskInfo, thread_pid: Option<u64>) -> Result<String, FsError> {
+    let mut s = FallibleString::new();
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Name:\t{}\n", info.comm));
     // Linux prints Umask immediately after Name, always four octal digits.
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Umask:\t{:04o}\n", info.umask));
@@ -3361,7 +3385,8 @@ fn render_status(info: &ProcTaskInfo) -> String {
     );
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Tgid:\t{}\n", info.pid));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Ngid:\t0\n"));
-    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Pid:\t{}\n", info.pid));
+    let reported_pid = thread_pid.unwrap_or(info.pid);
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Pid:\t{}\n", reported_pid));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("PPid:\t{}\n", info.ppid));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("TracerPid:\t{}\n", info.tracer_pid));
     // Uid/Gid: real, effective, saved, fs — NARF tracks one id, so all
@@ -3383,7 +3408,7 @@ fn render_status(info: &ProcTaskInfo) -> String {
     // each is just the one visible id. systemd-nspawn + nsenter read
     // NSpid to map a container pid back to the host.
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("NStgid:\t{}\n", info.pid));
-    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("NSpid:\t{}\n", info.pid));
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("NSpid:\t{}\n", reported_pid));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("NSpgid:\t{}\n", info.pgrp));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("NSsid:\t{}\n", info.session));
     // Total mapped and resident sizes come from allocation-free address-space
@@ -3458,26 +3483,56 @@ fn render_status(info: &ProcTaskInfo) -> String {
     // Linux prints `%*pb` over `nr_cpu_ids` bits (not the mask's value), so
     // every process on one machine renders the same width — libnuma sizes
     // its CPU bitmap from it and then parses the node cpumaps against it.
-    let mask = crate::sysfs::cpumask_pb(u128::from(info.cpus_allowed), info.nr_cpus.max(1));
-    let _ = core::fmt::Write::write_fmt(
-        &mut s,
-        format_args!(
-            "Cpus_allowed:\t{}\nCpus_allowed_list:\t{}\n",
-            mask,
-            render_cpu_list(info.cpus_allowed)
-        ),
-    );
-    s
+    proc_status_write(&mut s, format_args!("Cpus_allowed:\t"))?;
+    write_cpumask_pb(&mut s, u128::from(info.cpus_allowed), info.nr_cpus.max(1))?;
+    proc_status_write(&mut s, format_args!("\nCpus_allowed_list:\t"))?;
+    write_cpu_list(&mut s, info.cpus_allowed)?;
+    proc_status_write(&mut s, format_args!("\n"))?;
+    s.finish()
 }
 
-/// A CPU mask as the range list `Cpus_allowed_list` uses — `0-3,7`.
+/// Test helper retaining the convenient infallible shape; production procfs
+/// reads call `try_render_status` and propagate `FsError::OutOfMemory`.
+fn render_status(info: &ProcTaskInfo) -> String {
+    try_render_status(info, None).expect("test proc status rendering allocation failed")
+}
+
+/// Append a CPU mask in Linux's `%*pb` representation without allocating a
+/// temporary string.
+fn write_cpumask_pb(out: &mut FallibleString, mask: u128, nbits: u32) -> Result<(), FsError> {
+    let mut chunksz = nbits & 31;
+    if chunksz == 0 {
+        chunksz = 32;
+    }
+    let mut start = i64::from(nbits.div_ceil(32) * 32) - 32;
+    let mut first = true;
+    while start >= 0 {
+        let chunkmask = (1u64 << chunksz) - 1;
+        let value = if start < 128 {
+            (mask >> start) as u64 & chunkmask
+        } else {
+            0
+        };
+        if !first {
+            proc_status_write(out, format_args!(","))?;
+        }
+        first = false;
+        let width = chunksz.div_ceil(4) as usize;
+        proc_status_write(out, format_args!("{value:0width$x}"))?;
+        chunksz = 32;
+        start -= 32;
+    }
+    Ok(())
+}
+
+/// Append a CPU mask as the range list `Cpus_allowed_list` uses — `0-3,7`.
 ///
 /// `taskset -p` prints this form straight back to the user, so the ranges
 /// have to collapse the way Linux's `%*pbl` does rather than listing every
 /// bit individually.
-fn render_cpu_list(mask: u64) -> String {
-    let mut out = String::new();
+fn write_cpu_list(out: &mut FallibleString, mask: u64) -> Result<(), FsError> {
     let mut cpu = 0u32;
+    let mut first = true;
     while cpu < 64 {
         if mask & (1u64 << cpu) == 0 {
             cpu += 1;
@@ -3487,17 +3542,18 @@ fn render_cpu_list(mask: u64) -> String {
         while cpu + 1 < 64 && mask & (1u64 << (cpu + 1)) != 0 {
             cpu += 1;
         }
-        if !out.is_empty() {
-            out.push(',');
+        if !first {
+            proc_status_write(out, format_args!(","))?;
         }
+        first = false;
         if start == cpu {
-            let _ = core::fmt::Write::write_fmt(&mut out, format_args!("{start}"));
+            proc_status_write(out, format_args!("{start}"))?;
         } else {
-            let _ = core::fmt::Write::write_fmt(&mut out, format_args!("{start}-{cpu}"));
+            proc_status_write(out, format_args!("{start}-{cpu}"))?;
         }
         cpu += 1;
     }
-    out
+    Ok(())
 }
 
 fn render_maps(info: &ProcTaskInfo) -> String {
