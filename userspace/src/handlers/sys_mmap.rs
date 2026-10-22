@@ -443,6 +443,21 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         }
     }
 
+    // The file a mapping faults from is chosen here, once. Linux pins the
+    // real file in the VMA (`ovl_mmap` calls `vma_set_file` with the
+    // overlay's current real file), so a later overlay copy-up changes
+    // what *new* mappings see but never retargets an existing VMA.
+    // Resolve that pin now — outside every VMA/owner lock — and let the
+    // already-validated description carry the pinned object into
+    // provenance and every publication branch below, so demand faults,
+    // the shared-page cache and `truncate_file_mappings`' identity match
+    // all name the one file this mapping will ever fault from. Files
+    // that are not switchable wrappers return their own reference.
+    let file = file.map(|(ops, status_flags)| {
+        let pinned = ops.mmap_pinned_file(Arc::clone(&ops));
+        (pinned, status_flags)
+    });
+
     // `fs/proc/task_mmu.c::show_map_vma` prints, for every VMA with a
     // `vm_file`, the inode's `i_sb->s_dev` and `i_ino` and the file's path.
     // Capture that identity here, outside every VMA/owner lock, and let the
@@ -2447,6 +2462,212 @@ mod tests {
     kernel_test_in!(
         "userspace",
         smoke_mmap_shared_file_fsync_writes_back_from_thread_group_peer
+    );
+
+    // #677: a mapping of an overlay file must keep faulting from the layer
+    // that was active when the mapping was published. A copy-up through
+    // the mapped file's own ops flips `OverlayFile::active()` from the
+    // lower to the upper file; before publication pinned the backing file,
+    // later faults in the same VMA served upper pages (and the owner's
+    // `mmap_backing_identity` flipped with them), so one mapping silently
+    // mixed two files. Linux pins the real file in the VMA at `mmap`.
+    fn smoke_mmap_overlay_copy_up_keeps_mapping_pinned_to_lower() -> TestResult {
+        use narf_filesystem::FsInstance as _;
+
+        // SAFETY: the test owns this user root until it removes every VMA
+        // below, the same contract as the other sys_mmap smokes.
+        let aspace = match unsafe { AddressSpace::new_for_user() } {
+            Ok(aspace) => Arc::new(aspace),
+            Err(_) => return TestResult::Fail("new_for_user failed"),
+        };
+        *USER_AS.lock() = Some(Arc::clone(&aspace));
+        install_address_space_lookup(address_space);
+        install_task_id_lookup(task);
+        CURRENT_TASK.store(TASK, Ordering::Relaxed);
+        crate::fd::__test_reset();
+
+        let mut contents = vec![0u8; 8192];
+        contents[..8].copy_from_slice(b"LOWER-P0");
+        contents[4096..4104].copy_from_slice(b"LOWER-P1");
+        let lower = Arc::new(narf_filesystem::MemFs::with_seeds(
+            "ov677-lower",
+            &[("pagefile", contents.as_slice())],
+        ));
+        let upper = Arc::new(narf_filesystem::MemFs::new("ov677-upper"));
+        let overlay = narf_filesystem::OverlayFs::new(
+            "ov677",
+            upper.root(),
+            vec![lower.root() as Arc<dyn narf_filesystem::DirOps>],
+        );
+        let root = overlay.root();
+        let Some(ops) = root.lookup("pagefile") else {
+            return TestResult::Fail("overlay lookup missed the lower file");
+        };
+        let Some(lower_file) = lower.root().lookup("pagefile") else {
+            return TestResult::Fail("lower lookup missed the seeded file");
+        };
+
+        let fd = match crate::fd::install(
+            TASK,
+            crate::fd::FdEntry {
+                ops: Arc::clone(&ops),
+                offset: 0,
+                flags: 0,
+                status_flags: crate::fd::O_RDWR,
+            },
+        ) {
+            Some(fd) => fd,
+            None => return TestResult::Fail("could not install overlay file fd"),
+        };
+        let map_shared = |len: u64| {
+            let mut call = TestCtx {
+                args: SyscallArgs {
+                    arg1: len,
+                    arg2: 3,    // PROT_READ | PROT_WRITE
+                    arg3: 0x01, // MAP_SHARED
+                    arg4: u64::from(fd),
+                    ..SyscallArgs::default()
+                },
+                ret: None,
+            };
+            sys_mmap(&mut call);
+            call.ret.and_then(|ret| {
+                (ret.status == SyscallReturn::OK && (ret.value as i64) > 0).then_some(ret.value)
+            })
+        };
+
+        let Some(base) = map_shared(8192) else {
+            return TestResult::Fail("overlay MAP_SHARED mmap failed");
+        };
+        if !aspace.lookup(VirtAddr::new(base)).is_some_and(|region| {
+            region.perms.contains(RegionPerms::FILE_DEMAND)
+                && region.phys.first().is_some_and(|phys| phys.raw() == 0)
+        }) {
+            return TestResult::Fail("overlay mapping was not demand-backed");
+        }
+        // The owner registered at publication is the pin itself: the lower
+        // memfs file, not the overlay wrapper.
+        let Some((owner, _)) = crate::mapped_file::shared_file_at(aspace.identity(), base) else {
+            return TestResult::Fail("overlay mapping registered no file owner");
+        };
+        if !Arc::ptr_eq(&owner, &lower_file) {
+            return TestResult::Fail("overlay mapping owner is not the pinned lower file");
+        }
+        let identity_at_mmap = owner.mmap_backing_identity();
+
+        // Fault page 0: served by the lower file.
+        // SAFETY: `base` lies in this test-owned FILE_DEMAND VMA.
+        if unsafe { aspace.demand_alloc_page(VirtAddr::new(base)) }.is_err() {
+            return TestResult::Fail("overlay page-0 fault failed");
+        }
+        let lower_p0 = match lower_file.mmap_fault(0) {
+            Ok(phys) => phys,
+            Err(_) => return TestResult::Fail("lower page-0 fault failed"),
+        };
+        let page0 = match aspace.lookup(VirtAddr::new(base)) {
+            Some(region) if region.phys.first().is_some_and(|phys| phys.raw() == lower_p0) => {
+                region.phys[0]
+            }
+            _ => return TestResult::Fail("overlay page 0 did not come from the lower file"),
+        };
+        // SAFETY: `page0` is the mapping's live, kernel-direct-mapped frame.
+        if unsafe { core::slice::from_raw_parts(page0.kernel_ptr::<u8>(), 8) } != b"LOWER-P0" {
+            return TestResult::Fail("overlay page 0 has the wrong bytes");
+        }
+
+        // Copy up through the mapped fd's own ops (the overlay write path)
+        // and make the upper file's page 1 diverge from the lower's.
+        if !matches!(poll_io_to_completion(ops.write(4096, b"UPPER-P1")), Some(Ok(8))) {
+            return TestResult::Fail("overlay write (copy-up) failed");
+        }
+        let Some(upper_file) = upper.root().lookup("pagefile") else {
+            return TestResult::Fail("copy-up did not create the upper file");
+        };
+        let mut upper_p1 = [0u8; 8];
+        if !matches!(
+            poll_io_to_completion(upper_file.read(4096, &mut upper_p1)),
+            Some(Ok(8))
+        ) || &upper_p1 != b"UPPER-P1"
+        {
+            return TestResult::Fail("upper page 1 does not hold the copied-up write");
+        }
+
+        // The live mapping's owner and backing identity must not have moved.
+        let Some((owner_after, _)) = crate::mapped_file::shared_file_at(aspace.identity(), base)
+        else {
+            return TestResult::Fail("overlay mapping lost its file owner");
+        };
+        if !Arc::ptr_eq(&owner_after, &lower_file)
+            || owner_after.mmap_backing_identity() != identity_at_mmap
+        {
+            return TestResult::Fail("copy-up retargeted the live mapping's backing identity");
+        }
+
+        // Fault page 1 in the SAME VMA: still the lower file's page, even
+        // though the overlay now resolves to the upper file.
+        // SAFETY: `base + 4096` lies in this test-owned FILE_DEMAND VMA.
+        if unsafe { aspace.demand_alloc_page(VirtAddr::new(base + 4096)) }.is_err() {
+            return TestResult::Fail("overlay page-1 fault failed");
+        }
+        let lower_p1 = match lower_file.mmap_fault(4096) {
+            Ok(phys) => phys,
+            Err(_) => return TestResult::Fail("lower page-1 fault failed"),
+        };
+        let upper_p1_phys = match upper_file.mmap_fault(4096) {
+            Ok(phys) => phys,
+            Err(_) => return TestResult::Fail("upper page-1 fault failed"),
+        };
+        if upper_p1_phys == lower_p1 {
+            return TestResult::Fail("upper and lower page 1 unexpectedly alias");
+        }
+        let page1 = match aspace.lookup(VirtAddr::new(base + 4096)) {
+            Some(region) if region.phys.get(1).is_some_and(|phys| phys.raw() == lower_p1) => {
+                region.phys[1]
+            }
+            _ => return TestResult::Fail("post-copy-up fault did not serve the lower page"),
+        };
+        // SAFETY: `page1` is the mapping's live, kernel-direct-mapped frame.
+        if unsafe { core::slice::from_raw_parts(page1.kernel_ptr::<u8>(), 8) } != b"LOWER-P1" {
+            return TestResult::Fail("post-copy-up fault served upper bytes in a lower mapping");
+        }
+
+        // A NEW mapping published after the copy-up pins the upper file:
+        // the pin is per mapping, not a property of the overlay object.
+        let Some(second_base) = map_shared(8192) else {
+            return TestResult::Fail("post-copy-up overlay mmap failed");
+        };
+        let Some((second_owner, _)) =
+            crate::mapped_file::shared_file_at(aspace.identity(), second_base)
+        else {
+            return TestResult::Fail("second overlay mapping registered no file owner");
+        };
+        if !Arc::ptr_eq(&second_owner, &upper_file) {
+            return TestResult::Fail("post-copy-up mapping did not pin the upper file");
+        }
+        // SAFETY: `second_base + 4096` lies in the second test-owned VMA.
+        if unsafe { aspace.demand_alloc_page(VirtAddr::new(second_base + 4096)) }.is_err() {
+            return TestResult::Fail("second mapping page-1 fault failed");
+        }
+        match aspace.lookup(VirtAddr::new(second_base + 4096)) {
+            Some(region)
+                if region
+                    .phys
+                    .get(1)
+                    .is_some_and(|phys| phys.raw() == upper_p1_phys) => {}
+            _ => return TestResult::Fail("post-copy-up mapping did not fault from the upper file"),
+        }
+
+        let _ = aspace.unmap_region(VirtAddr::new(second_base));
+        crate::mapped_file::unmap_current(second_base);
+        let _ = aspace.unmap_region(VirtAddr::new(base));
+        crate::mapped_file::unmap_current(base);
+        crate::fd::__test_reset();
+        *USER_AS.lock() = None;
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace",
+        smoke_mmap_overlay_copy_up_keeps_mapping_pinned_to_lower
     );
 
     // ── demand-paged device mappings, through a BPF arena ──────────────

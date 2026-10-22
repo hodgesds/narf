@@ -313,6 +313,7 @@ pub trait FileOps {
     fn mmap_published(&self, lifetime: Option<&Arc<dyn MmapLifetime>>); // default no-op
     fn mmap_is_ram(&self) -> bool;
     fn supports_mmap_fault(&self) -> bool;
+    fn mmap_pinned_file(&self, own: Arc<dyn FileOps>) -> Arc<dyn FileOps>;
     fn mmap_backing_identity(&self) -> usize;
     fn mmap_fault_async(&self, offset: u64) -> FsFuture<'_, u64>;
     fn mmap_fault(&self, offset: u64) -> Result<u64, FsError>; // legacy immediate adapter
@@ -1005,6 +1006,15 @@ standalone filesystem tests with no userspace mappings safely observe a no-op.
 forwarding wrappers preserve the underlying value so a truncate issued by the
 backing filesystem still finds and revokes VMAs owned by the wrapper.
 
+Publication pins the mapping's file: the syscall layer calls
+`mmap_pinned_file` once at `mmap` (and the ELF loader once per demand-loaded
+image) and registers the result as the VMA owner, so every fault, shared-page
+cache lookup and writeback for that VMA names the pinned object, whose
+`mmap_backing_identity` is the mapping's stable identity. A wrapper whose
+forwarding target changes over time — overlayfs at copy-up — returns the file
+current at publication; the switch affects only mappings created afterwards.
+Linux pins the real file in the VMA the same way (`ovl_mmap`).
+
 Ordinary unlocked generic shared mappings are demand-backed: VMA publication
 records absent page slots and first access resolves the canonical cache page.
 `MAP_LOCKED` and blocking `MAP_POPULATE` retain eager materialization; combining
@@ -1498,7 +1508,9 @@ consume whiteouts from every layer, and stop below an opaque directory.
 
 Writable overlays lazily copy missing upper parent directories before the
 first descendant mutation. Regular-file copy-up is chunked and preserves
-data, owner, mode, mtime, and supported xattrs. Lower-file rename and hard
+data, owner, mode, mtime, and supported xattrs. Copy-up never retargets an
+existing mapping: a VMA faults from the layer that was active when it was
+published (`mmap_pinned_file`, §3.6), matching Linux's pinned real file. Lower-file rename and hard
 link copy the source up first; unlink/rmdir/rename retain a whiteout whenever
 a lower object would otherwise reappear. With redirect directories disabled,
 renaming a lower or merged directory returns `FsError::CrossDevice` (EXDEV),
