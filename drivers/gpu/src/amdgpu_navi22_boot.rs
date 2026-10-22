@@ -363,6 +363,7 @@ struct Hardware {
     authority: Cap<BusDeviceCap, Write>,
     pool: Pool,
     firmware: Firmware,
+    secure_dmub: Option<crate::amdgpu_vram_boot::SecureDmub>,
     reset: Option<crate::amdgpu_reset_navi22::Reset>,
     reset_report: Option<crate::amdgpu_reset_navi22::Report>,
     training: Option<gddr6::Trainer>,
@@ -667,6 +668,13 @@ impl Backend for Hardware {
                     unsafe { psp::Psp::new_rdna2(&self.gpu, self.authority, &self.pool) }
                         .map_err(Error::Psp)?,
                 );
+                if let Some(windows) = self.secure_dmub.clone() {
+                    self.psp
+                        .as_mut()
+                        .unwrap()
+                        .set_secure_dmub(windows, self.gpu.vram.size)
+                        .map_err(Error::Psp)?;
+                }
                 self.psp
                     .as_mut()
                     .unwrap()
@@ -1003,6 +1011,17 @@ impl ColdBoot {
     pub(crate) fn set_unmapped(&mut self, pool: Option<crate::amdgpu_vram::UnmappedPool>) {
         self.unmapped = pool;
     }
+    /// Preserve this GPU's preflight CW0/1 inventory through reset/recovery.
+    pub(crate) fn set_secure_dmub(
+        &mut self,
+        windows: crate::amdgpu_vram_boot::SecureDmub,
+    ) -> Result<(), Error> {
+        if self.sequence.state != State::Prepared {
+            return Err(Error::Busy);
+        }
+        self.sequence.backend.secure_dmub = Some(windows);
+        Ok(())
+    }
     pub(crate) fn unmapped_pool(&self) -> Option<crate::amdgpu_vram::UnmappedPool> {
         self.unmapped.clone()
     }
@@ -1082,6 +1101,7 @@ impl ColdBoot {
                     authority,
                     pool: pool.clone(),
                     firmware,
+                    secure_dmub: None,
                     reset: None,
                     reset_report: None,
                     training: None,
@@ -1145,6 +1165,7 @@ impl ColdBoot {
                     authority,
                     pool: pool.clone(),
                     firmware,
+                    secure_dmub: None,
                     reset: None,
                     reset_report: None,
                     training: Some(training),
@@ -1707,6 +1728,7 @@ impl ColdBoot {
             authority,
             pool,
             mut firmware,
+            secure_dmub,
             queues,
             display,
             display_bios,
@@ -1728,6 +1750,7 @@ impl ColdBoot {
         let mut boot = unsafe { Self::new_rdna2(&gpu, authority, &pool, firmware) }?;
         boot.boot_mclk_khz = boot_mclk_khz;
         boot.unmapped = unmapped;
+        boot.sequence.backend.secure_dmub = secure_dmub;
         let h = &mut boot.sequence.backend;
         // SAFETY: forwarded recovery contract; construction has no I/O.
         h.reset = Some(

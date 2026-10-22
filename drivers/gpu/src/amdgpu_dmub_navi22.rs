@@ -8,10 +8,7 @@ use crate::{
     amdgpu_vram::{Pool, Reservation},
 };
 use alloc::vec::Vec;
-use core::{
-    ops::Range,
-    sync::atomic::{fence, Ordering},
-};
+use core::sync::atomic::{fence, Ordering};
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 // linux-ctx: hdr=dcn,dmub seg=2
@@ -338,12 +335,16 @@ impl<I: Io> Engine<I> {
         }
         self.access(|io| hold_reset(io, base))
     }
-    async fn start(&mut self, tmr: Range<u64>, fb: Aperture) -> Result<Status, Error> {
+    async fn start(
+        &mut self,
+        memory: impl Into<crate::amdgpu_psp_ring::DmubMemory>,
+        fb: Aperture,
+    ) -> Result<Status, Error> {
         if self.state != State::Reset {
             return Err(Error::Busy);
         }
         self.state = State::Starting;
-        let result = self.start_inner(tmr, fb).await;
+        let result = self.start_inner(memory.into(), fb).await;
         self.state = if result.is_ok() {
             State::Running
         } else {
@@ -354,10 +355,15 @@ impl<I: Io> Engine<I> {
         }
         result
     }
-    async fn start_inner(&mut self, tmr: Range<u64>, fb: Aperture) -> Result<Status, Error> {
+    async fn start_inner(
+        &mut self,
+        memory: crate::amdgpu_psp_ring::DmubMemory,
+        fb: Aperture,
+    ) -> Result<Status, Error> {
         let l = self.layout;
         let address = self.memory.address();
         let shape = self.prepared.layout;
+        let tmr = &memory.tmr;
         if !self.access(|io| is_reset(io, l.dcn))? {
             self.reset().await?;
         }
@@ -384,7 +390,6 @@ impl<I: Io> Engine<I> {
             {
                 return Err(Error::Invalid);
             }
-            let physical = (tmr.start - fb + offset)..(tmr.end - fb + offset);
             // Validate PSP's authenticated instruction and stack windows, but
             // preserve them verbatim. They use GPU-physical VRAM addresses.
             for index in 0..2 {
@@ -405,13 +410,19 @@ impl<I: Io> Engine<I> {
                     .checked_sub(base)
                     .and_then(|n| n.checked_add(1))
                     .ok_or(Error::Invalid)?;
+                let gpu_start = start
+                    .checked_sub(offset)
+                    .and_then(|v| v.checked_add(fb))
+                    .ok_or(Error::Invalid)?;
+                let gpu_end = gpu_start
+                    .checked_add(u64::from(size))
+                    .ok_or(Error::Invalid)?;
                 // linux-lit: 31=DMCUB_REGION3_CW0_TOP_ADDRESS__DMCUB_REGION3_CW0_ENABLE__SHIFT
                 if top & (1 << 31) == 0
                     || base != index << 24
-                    || start < physical.start
-                    || start
-                        .checked_add(u64::from(size))
-                        .is_none_or(|v| v > physical.end)
+                    || gpu_start < fb
+                    || gpu_end > end
+                    || !memory.contains(index as usize, &(gpu_start..gpu_end))
                 {
                     return Err(Error::Invalid);
                 }
@@ -708,11 +719,11 @@ impl Dmub {
     /// ready. The exclusive constructor contract still holds. No replay/reset
     /// after failure or cancellation without independent recovery.
     pub async unsafe fn start(&mut self, psp: &Psp) -> Result<Status, Error> {
-        let tmr = psp.dmub_tmr().map_err(|_| Error::Invalid)?;
+        let memory = psp.dmub_memory().map_err(|_| Error::Invalid)?;
         let (base, offset) = psp.fb_location();
         let end = base.checked_add(self.vram_size).ok_or(Error::Invalid)?;
         self.engine
-            .start(tmr, Aperture { base, end, offset })
+            .start(memory, Aperture { base, end, offset })
             .await?;
         if let Err(error) = self.engine.initialize_mailbox().await {
             self.engine.state = State::Failed;

@@ -1,5 +1,6 @@
 use super::*;
 use alloc::{collections::BTreeMap, sync::Arc, vec};
+use core::ops::Range;
 use core::{
     future::Future,
     sync::atomic::AtomicBool,
@@ -256,6 +257,75 @@ fn fb() -> Aperture {
         offset: 0x1_0000_0000,
     }
 }
+fn dmub_navi22_secure_windows_outside_tmr_stay_bounded_and_unchanged() -> TestResult {
+    let fb = Aperture {
+        base: 0x8000000000,
+        end: 0x8300000000,
+        offset: 1 << 32,
+    };
+    let windows = [
+        Some(0x82fee00000..0x82feec0000),
+        Some(0x82fef00000..0x82fefa0000),
+    ];
+    let plan = crate::amdgpu_vram_boot::tests::secure_plan(
+        fb.base,
+        fb.end - fb.base,
+        fb.offset,
+        windows.clone(),
+    );
+    for case in 0..4 {
+        let (_, mut engine) = fixture();
+        // Owned nonsecure storage must use this fixture's GMC address space.
+        let memory = crate::amdgpu_psp_ring::DmubMemory {
+            tmr: 0x8002300000..0x8002d00000,
+            inherited: (case != 1).then(|| plan.secure_dmub()),
+        };
+        for (index, window) in windows.iter().enumerate() {
+            let window = window.as_ref().unwrap();
+            let physical = window.start - fb.base + fb.offset;
+            for (reg, value) in [
+                (0x1a5 + index as u64, (index as u32) << 24),
+                (
+                    0x1ad + index as u64,
+                    1 << 31 | (index as u32) << 24 | (window.end - window.start - 1) as u32,
+                ),
+                (0x1b5 + index as u64 * 2, physical as u32),
+                (0x1b6 + index as u64 * 2, (physical >> 32) as u32),
+            ] {
+                engine.io.regs.insert(DCN + reg * 4, value);
+            }
+        }
+        if case == 2 {
+            *engine.io.regs.get_mut(&(DCN + 0x1ad * 4)).unwrap() += 4096;
+        }
+        if case == 3 {
+            *engine.io.regs.get_mut(&(DCN + 0x1b7 * 4)).unwrap() += 0x100000;
+        }
+        let secure = engine.io.regs.clone();
+        // Use an aperture including both fixture-owned storage and secure
+        // windows, but keep the physical translation at the real MC base.
+        // The fixture storage is relocated by a fresh model allocator.
+        let map = engine.memory.mapping();
+        // SAFETY: inert model mapping; no physical accesses.
+        let pool = unsafe { Pool::from_owned_range(map, fb.base + 0x400000) }.unwrap();
+        engine.memory = pool.reserve(map.len).unwrap();
+        run(engine.quiesce()).unwrap();
+        let result = run(engine.start(memory, fb));
+        if (case == 0 && result.is_err()) || (case != 0 && result != Err(Error::Invalid)) {
+            return TestResult::Fail("inherited secure-window extent check");
+        }
+        for reg in [0x1a5, 0x1a6, 0x1ad, 0x1ae, 0x1b5, 0x1b6, 0x1b7, 0x1b8] {
+            if engine.io.regs.get(&(DCN + reg * 4)) != secure.get(&(DCN + reg * 4)) {
+                return TestResult::Fail("secure firmware window overwritten");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi22",
+    dmub_navi22_secure_windows_outside_tmr_stay_bounded_and_unchanged
+);
 fn run<T>(f: impl Future<Output = T>) -> T {
     narf_scheduler::block_on_spin(f)
 }

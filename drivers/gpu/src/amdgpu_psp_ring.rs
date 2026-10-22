@@ -312,6 +312,12 @@ impl<I: Io> Engine<I> {
         let wptr = self.access(|io| io.read(WPTR))?;
         // linux-lit: 16=sizeof(struct psp_gfx_rb_frame) / 4
         if wptr >= 1024 || wptr % 16 != 0 {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: psp invalid ring wptr {wptr:#x} before command {:#x}",
+                words[2]
+            );
             return Err(Error::Invalid);
         }
         self.sequence = self.sequence.wrapping_add(1).max(1);
@@ -524,6 +530,32 @@ struct Session<I: Io> {
     gfx12_vcn_version: Option<u32>,
     fb_base: u64,
     fb_offset: u64,
+    secure_dmub: Option<crate::amdgpu_vram_boot::SecureDmub>,
+}
+
+/// Disjoint authenticated-memory bounds; never widen them across an intervening
+/// allocation. Inherited windows remain excluded for the whole pool lifetime.
+pub(crate) struct DmubMemory {
+    pub(crate) tmr: core::ops::Range<u64>,
+    pub(crate) inherited: Option<crate::amdgpu_vram_boot::SecureDmub>,
+}
+impl From<core::ops::Range<u64>> for DmubMemory {
+    fn from(tmr: core::ops::Range<u64>) -> Self {
+        Self {
+            tmr,
+            inherited: None,
+        }
+    }
+}
+impl DmubMemory {
+    pub(crate) fn contains(&self, index: usize, range: &core::ops::Range<u64>) -> bool {
+        range.start < range.end
+            && ((range.start >= self.tmr.start && range.end <= self.tmr.end)
+                || self
+                    .inherited
+                    .as_ref()
+                    .is_some_and(|windows| windows.contains(index, range)))
+    }
 }
 
 /// Absolute BAR5 byte addresses, resolved before any MMIO or allocation.
@@ -961,6 +993,7 @@ impl Psp {
                 gfx12_vcn_version: None,
                 fb_base,
                 fb_offset,
+                secure_dmub: None,
             },
         })
     }
@@ -1108,7 +1141,14 @@ impl Psp {
         if self.kind.rdna2_profile() != Some(firmware.profile()) {
             return Err(Error::Unsupported);
         }
-        let images = firmware.images().map_err(|_| Error::Invalid)?;
+        let images = firmware.images().map_err(|error| {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: psp graphics image preparation failed: {error:?}"
+            );
+            Error::Invalid
+        })?;
         self.session.load_gfx(&images).await
     }
     fn check_navi48_firmware(
@@ -1181,6 +1221,26 @@ impl Psp {
         }
         let tmr = self.session.tmr.as_ref().ok_or(Error::Invalid)?;
         Ok(tmr.address()..tmr.address() + tmr.size())
+    }
+    pub(crate) fn set_secure_dmub(
+        &mut self,
+        windows: crate::amdgpu_vram_boot::SecureDmub,
+        vram_size: u64,
+    ) -> Result<(), Error> {
+        if self.state() != State::Prepared
+            || self.kind.rdna2_profile().is_none()
+            || !windows.matches_aperture(self.session.fb_base, vram_size)
+        {
+            return Err(Error::Invalid);
+        }
+        self.session.secure_dmub = Some(windows);
+        Ok(())
+    }
+    pub(crate) fn dmub_memory(&self) -> Result<DmubMemory, Error> {
+        Ok(DmubMemory {
+            tmr: self.dmub_tmr()?,
+            inherited: self.session.secure_dmub.clone(),
+        })
     }
     /// Wait for idle CP and RLC BOOTLOAD_COMPLETE after this session's accepted
     /// autoload. No GC writes, queue initialization or fw_loaded publication.
@@ -1481,11 +1541,28 @@ impl<I: Io> Session<I> {
     }
     fn record_media(&mut self, reply: Reply, kind: u32) -> Result<(), Error> {
         let tmr = self.tmr.as_ref().ok_or(Error::Invalid)?;
-        let offset = reply
-            .address
-            .checked_sub(tmr.address())
-            .ok_or(Error::Invalid)?;
-        if reply.address % 4 != 0 || offset >= tmr.mapping().len {
+        let offset = reply.address.checked_sub(tmr.address());
+        // PSP may load DMCUB into its inherited secure instruction window
+        // rather than this session's TMR BO (Linux dmub_dcn30_setup_windows
+        // preserves CW0/1). VCN and arbitrary protected VRAM stay TMR-only.
+        let inherited = kind == 51 // linux-lit: 51=GFX_FW_TYPE_DMUB
+            && reply.address.checked_add(4).is_some_and(|end| {
+                self.secure_dmub.as_ref().is_some_and(|windows| {
+                    windows.contains(0, &(reply.address..end))
+                })
+            });
+        if reply.address % 4 != 0
+            || (offset.is_none_or(|offset| offset >= tmr.mapping().len) && !inherited)
+        {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: psp media type {kind} returned invalid entry {:#x}; TMR start {:#x} bytes {:#x}; inherited {:?}",
+                reply.address,
+                tmr.address(),
+                tmr.mapping().len,
+                self.secure_dmub
+            );
             return Err(Error::Invalid);
         }
         match kind {
@@ -1504,7 +1581,17 @@ impl<I: Io> Session<I> {
             for payload in image.payloads() {
                 let reply = self
                     .load_ip(payload.bytes(), payload.firmware_type())
-                    .await?;
+                    .await
+                    .inspect_err(|error| {
+                        use core::fmt::Write;
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "amdgpu: psp graphics {:?} type {} bytes {:#x}: {error:?}",
+                            image.source(),
+                            payload.firmware_type(),
+                            payload.bytes().len()
+                        );
+                    })?;
                 if matches!(
                     image.source(),
                     crate::amdgpu_gfx_firmware::Source::Vcn

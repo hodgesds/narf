@@ -193,6 +193,7 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
         let plan = unsafe { vram::Plan::read_rdna2(gpu, &authority, range, &[]) }
             .map_err(Error::Memory)?;
         let training = plan.training();
+        let secure_dmub = plan.secure_dmub();
         if training.is_some() {
             training_clients(plan.protected())?;
         }
@@ -220,6 +221,9 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
         }
         .map_err(Error::Firmware)?;
         prepared.set_unmapped(unmapped);
+        prepared
+            .set_secure_dmub(secure_dmub)
+            .map_err(Error::Firmware)?;
         // Linux resets every posted discrete Navi before loading firmware.
         // SAFETY: probe's PCI function for this GPU; its config space is
         // claimed along with the exclusive MMIO ownership transferred below.

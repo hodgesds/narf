@@ -41,9 +41,56 @@ fn session() -> (Pool, Session<Fake>) {
             gfx12_vcn_version: None,
             fb_base: 0x8_0000_0000,
             fb_offset: 0x1_0000_0000,
+            secure_dmub: None,
         },
     )
 }
+fn psp_dmcub_accepts_only_inventoried_instruction_window_outside_tmr() -> TestResult {
+    let (_, mut s) = session();
+    run(s.engine.start()).unwrap();
+    run(s.setup_tmr_payload(None)).unwrap();
+    let entry = 0x82fee00100;
+    let reply = |address| Reply {
+        address,
+        tmr_size: 0,
+    };
+    if s.record_media(reply(entry), 51) != Err(Error::Invalid) {
+        return TestResult::Fail("outside-TMR address accepted without inventory");
+    }
+    s.secure_dmub = Some(
+        crate::amdgpu_vram_boot::tests::secure_plan(
+            0x8000000000,
+            12 << 30,
+            1 << 32,
+            [
+                Some(0x82fee00000..0x82feec0000),
+                Some(0x82fef00000..0x82fefa0000),
+            ],
+        )
+        .secure_dmub(),
+    );
+    if s.record_media(reply(entry), 51).is_err() || s.media_firmware.dmcub != Some(entry) {
+        return TestResult::Fail("inventoried PSP DMCUB entry rejected");
+    }
+    for (kind, address) in [
+        (13, entry),
+        (58, entry),
+        (51, entry + 1),
+        (51, 0x82fef00100),
+        (51, 0x82feec0000),
+        (51, 0x82fedffffc),
+        (51, u64::MAX - 3),
+    ] {
+        if s.record_media(reply(address), kind) != Err(Error::Invalid) {
+            return TestResult::Fail("wrong firmware type, window, alignment or overflow accepted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/psp-ring",
+    psp_dmcub_accepts_only_inventoried_instruction_window_outside_tmr
+);
 fn psp_navi22_tmr_embedded_toc_and_address_spaces() -> TestResult {
     let (pool, mut session) = session();
     run(session.engine.start()).unwrap();

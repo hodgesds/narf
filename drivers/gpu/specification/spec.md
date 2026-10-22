@@ -6270,10 +6270,22 @@ reset of every firmware consumer before TMR destruction.
 `Accepted` means PSP acknowledged autoload and both media uploads.
 `media_firmware()` returns `MediaFirmware { vcn, dmcub, vcn1 }` GPU entry addresses
 from completed PSP replies; each must be dword aligned and inside this
-session's retained TMR. Partial failures retain any earlier valid address for
+session's retained TMR. On discrete RDNA2, DMCUB type 51 may instead name the
+inherited secure instruction window CW0 inventoried before allocation; VCN
+remains TMR-only. The private inventory retains the exact CW0/CW1 ranges,
+checks their GMC aperture against the PSP session and permanently excludes
+them from both visible and above-BAR pools. Other protected ranges do not
+authorize firmware, and disjoint reservations are never widened into one
+range. Recovery carries the same inventory forward.
+Partial failures retain any earlier valid address for
 diagnostics. These are not CPU pointers or proof that the media engines have
 started. Consumers must keep TMR alive. The API does not configure memory hubs,
 queues, VCN/DMUB windows or board power, or set `AmdGpu::fw_loaded`.
+Failure diagnostics identify an invalid ring write pointer and command,
+graphics image preparation errors, the failed upload's source/type/length,
+or a rejected media entry address together with the retained TMR bounds.
+These messages run only on failure and preserve the existing validation and
+ownership rules.
 
 `Psp::wait_gfx_boot_navi22().await` requires this session's acknowledged autoload
 and checks GC 10.3.2 `CP_STAT` (base index 0, dword `0x0f40`) together with
@@ -6923,7 +6935,10 @@ It never uses DCN31's separate CNTL2 reset or dword `0x342` hub reset.
 
 After PSP loads DMCUB, `unsafe start(&Psp).await` validates that execution is
 still reset, security reset is released, and both PSP instruction/stack windows
-are enabled and wholly inside the retained TMR after GPU-physical translation.
+are enabled and wholly inside either the retained TMR or their respective
+pre-inventoried secure CW0/CW1 reservation after checked GPU-physical translation.
+Each full window must fit one reservation; a point address, unrelated protected
+client, inter-window gap or enlarged window is insufficient.
 Those secure registers are preserved verbatim. The caller retains the matching
 PSP/TMR for DMUB's lifetime, with trained VRAM, ready memory hubs and protected
 power. Nonsecure VBIOS/mailbox/trace/state windows use owned GPU VRAM addresses.
