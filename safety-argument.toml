@@ -1689,3 +1689,27 @@ ref = "security-model/specification/spec.md#L42"
 agent = "OpenAI Codex GPT-6"
 prompt_hash = "866164f36a5358d5f2a5f4a34711c549b3006c6e106ae8e96ad82d4fb643bb24"
 argument = "The architecture guard changes only whether unused counter storage exists. It introduces no access, capability, domain transition, mapping, or scheduler state transition. Non-x86_64 steal sampling remains a no-op and cpu_steal_ns continues to read the unchanged zero-initialized accumulated counter, so the capability-and-domain invariant is preserved."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+agent = "Muse Wonder"
+prompt_hash = "eb7c13b58f312b98786e224dccf2048116c83b4f7c7751c4db7ebd34e16c6024"
+argument = "The KASAN boot fix stays inside memory/ (the kasan runtime) plus comment corrections in frame/ — both existing TCB members; it adds no TCB member, moves no trust boundary, and touches no capability or domain code. kasan::init still runs at the same boot point (after init_mmu installs and activates the direct map, before arm) and the sanitizer remains a feature-gated hunt facility: with the kasan feature off, none of the changed code is compiled and the normal boot path is byte-identical."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+agent = "Muse Wonder"
+prompt_hash = "eb7c13b58f312b98786e224dccf2048116c83b4f7c7751c4db7ebd34e16c6024"
+argument = "The change removes an unsanctioned kernel data access rather than adding one: kasan::init dereferenced a raw physical address as a pointer, valid only while RAM was identity-mapped; the reserved shadow span is now reached exclusively through PhysAddr::kernel_mut_ptr, the same direct-map accessor every other kernel RAM access uses. The runtime shadow lookup accepts only addresses that normalize to a physical address inside [0, ram_top) — the raw form, or a direct-map VA within the live map's tracked span — while kernel-image, vmalloc/MMIO and user addresses still resolve to no shadow slot and are skipped. Shadow reads and writes are therefore confined to the boot-reserved span, and no capability check or domain tag is bypassed or weakened."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+agent = "Muse Wonder"
+prompt_hash = "eb7c13b58f312b98786e224dccf2048116c83b4f7c7751c4db7ebd34e16c6024"
+argument = "Moving the KASAN sanitize-off attribute onto `pub mod slab;` (where its own comment always said it belonged; it had attached to `pub mod kvm_pv;` instead) restores the sanitizer's documented design rather than weakening it: the slab's intrusive free-list/canary writes into blocks it has itself poisoned are the allocator's bookkeeping, not a data access the hunt covers, and every non-slab instrumented writer remains checked against the shadow. No capability check, domain tag, or mapping permission changes."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+agent = "Muse Wonder"
+prompt_hash = "eb7c13b58f312b98786e224dccf2048116c83b4f7c7751c4db7ebd34e16c6024"
+argument = "The KASAN shadow carve in frame/ now places the reserved span disjoint from every boot exclusion already in the excludes list (relocated kernel image + window span, hugepage reservations, initramfs), stepping the candidate span below each intersecting exclusion. Previously it took the usable region's tail unconditionally, and on a high KASLR slide the relocated image reaches into that tail, so kasan::init's memset would have zeroed the kernel's own .bss (live page tables included). The shadow remains buddy-excluded reserved RAM reached only via the direct map, and placement on the common no-overlap boot is byte-identical to before."

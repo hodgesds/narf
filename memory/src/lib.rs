@@ -41,6 +41,8 @@ mod ioremap_cache;
 #[cfg(feature = "kasan")]
 pub mod kasan;
 pub mod kaslr;
+#[cfg(target_arch = "x86_64")]
+pub mod kvm_pv;
 pub mod mempolicy;
 pub mod memtype;
 pub mod migrate;
@@ -56,10 +58,11 @@ pub mod ro_after_init;
 // The slab writes intrusive free-list links + per-block canaries INTO freed
 // blocks; under KASAN those blocks are poisoned, so the slab's own accesses
 // must not self-report. Exempt the whole module (the corruptor we hunt lives
-// in the scheduler, not here).
+// in the scheduler, not here). NOTE: the attribute must sit directly on
+// `pub mod slab;` — attributes attach to the next item only, and this one
+// previously landed on `kvm_pv` above, leaving the slab fully instrumented
+// (its canary write into a poisoned block then self-reported at boot).
 #[cfg_attr(feature = "kasan", sanitize(address = "off"))]
-#[cfg(target_arch = "x86_64")]
-pub mod kvm_pv;
 pub mod slab;
 pub mod spd5;
 pub mod swap;

@@ -14,16 +14,21 @@
 //! So the build forces OUTLINE instrumentation
 //! (`-asan-instrumentation-with-call-threshold=0`, see `build/xtask`): every
 //! instrumented access calls `__asan_{load,store}N` with the RAW address, and
-//! we resolve the shadow in software here. Only the low identity map matters —
-//! freed slab blocks are heap objects (phys == VA, `< ram_top`); every other
-//! address (high-half image, MMIO, user) is skipped as "accessible".
+//! we resolve the shadow in software here. The addresses that matter are
+//! the ones naming RAM: heap objects are reached through the high-half
+//! kernel direct map (the kernel no longer identity-maps RAM — see
+//! `x86_64/mmu.rs`), so the callbacks receive direct-map VAs, and
+//! [`shadow_slot`] normalizes both those and raw physical pointers to a
+//! physical address before indexing. Every other address (high-half
+//! image, vmalloc/MMIO windows, user) is skipped as "accessible".
 //!
 //! # Shadow
 //!
 //! A flat byte array covering `[0, ram_top)` at 1 byte / 8 memory bytes,
-//! physically reserved out of the buddy at boot and identity-mapped. `0` =
-//! accessible, `0xFF` = poisoned. The slab poisons a block's shadow on free
-//! and clears it on alloc; a dangling write from *instrumented* (non-slab)
+//! physically reserved out of the buddy at boot and reached through the
+//! kernel direct map. `0` = accessible, `0xFF` = poisoned. The slab
+//! poisons a block's shadow on free and clears it on alloc; a dangling
+//! write from *instrumented* (non-slab)
 //! code then trips the outline check, whose panic backtrace names the WRITING
 //! frame — the corruptor — instead of the victim the free-block canary blames.
 //!
@@ -34,7 +39,7 @@
 //! read would re-enter `__asan_loadN` → unbounded recursion. The slab module
 //! is likewise exempt (`memory/src/slab.rs`) so its intrusive free-list /
 //! canary writes into freed blocks don't self-report.
-#![cfg(feature = "kasan")]
+// (Module is feature-gated at the `pub mod kasan;` declaration in lib.rs.)
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -45,12 +50,14 @@ pub const KASAN_SHADOW_SCALE: u64 = 3;
 /// inaccessible).
 const POISON_FREED: u8 = 0xFF;
 
-/// VA of `shadow[0]`. Zero until [`init`] runs; a zero base makes every check
-/// a no-op (so instrumented code that runs before the shadow exists is safe).
+/// Direct-map VA of `shadow[0]`. Zero until [`init`] runs; a zero base
+/// makes every check a no-op (so instrumented code that runs before the
+/// shadow exists is safe).
 static SHADOW_BASE: AtomicU64 = AtomicU64::new(0);
 
-/// Exclusive top of the tracked (low identity) address range. Addresses `>=`
-/// this are skipped — they can't be slab blocks.
+/// Exclusive top of the tracked RAM range, as a physical address. Pointers
+/// that don't normalize to below this are skipped — they can't be slab
+/// blocks.
 static RAM_TOP: AtomicU64 = AtomicU64::new(0);
 
 /// Poisoning + checking armed. Off until the shadow is mapped AND zeroed.
@@ -65,27 +72,68 @@ static REPORTS: AtomicU64 = AtomicU64::new(0);
 #[inline(never)]
 fn shadow_slot(addr: u64) -> *mut u8 {
     let base = SHADOW_BASE.load(Ordering::Relaxed);
-    if base == 0 || addr >= RAM_TOP.load(Ordering::Relaxed) {
+    if base == 0 {
         return core::ptr::null_mut();
     }
-    (base + (addr >> KASAN_SHADOW_SCALE)) as *mut u8
+    let ram_top = RAM_TOP.load(Ordering::Relaxed);
+    // Tracked accesses name RAM, in one of two pointer forms: a raw
+    // physical address (identity-formed pointers, `< ram_top`), or a
+    // direct-map VA (every heap object since the identity map of RAM was
+    // dropped). Normalize to the physical address; anything else
+    // (kernel image, vmalloc/MMIO windows, user) is not a slab block.
+    let phys = if addr < ram_top {
+        addr
+    } else if let Some(p) = direct_map_phys(addr, ram_top) {
+        p
+    } else {
+        return core::ptr::null_mut();
+    };
+    (base + (phys >> KASAN_SHADOW_SCALE)) as *mut u8
 }
 
-/// Record the shadow region and zero it. `shadow_base` must point at
-/// `ram_top >> 3` bytes of writable, identity-mapped memory reserved out of
-/// the frame allocator. Call once at boot after the MMU is live; follow with
-/// [`arm`].
+/// Physical address behind a direct-map VA, or `None` if `addr` is not
+/// inside the live direct map's tracked span. x86_64 only: it is the one
+/// arch with a randomized, runtime-published direct-map base (and the
+/// only arch `--kasan` supports); elsewhere the raw-physical form above
+/// is the only one that reaches this code.
+#[sanitize(address = "off")]
+fn direct_map_phys(_addr: u64, _ram_top: u64) -> Option<u64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let dm = crate::direct_map_base();
+        if dm != 0 && _addr >= dm {
+            let phys = _addr - dm;
+            if phys < _ram_top {
+                return Some(phys);
+            }
+        }
+        None
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        None
+    }
+}
+
+/// Record the shadow region and zero it. `shadow_phys` is the PHYSICAL
+/// address of `ram_top >> 3` bytes reserved out of the frame allocator;
+/// the span is reached through the kernel direct map (the kernel no
+/// longer identity-maps RAM, so the raw physical address is NOT a valid
+/// pointer once `init_mmu` has run). Call once at boot after `init_mmu`
+/// has installed + activated the direct map; follow with [`arm`].
 ///
 /// # Safety
-/// `[shadow_base, shadow_base + (ram_top >> 3))` must be a valid, exclusively
-/// owned, writable kernel mapping.
+/// `[shadow_phys, shadow_phys + (ram_top >> 3))` must be exclusively owned
+/// reserved RAM, covered by the live direct map.
 #[sanitize(address = "off")]
-pub unsafe fn init(ram_top: u64, shadow_base: u64) {
+pub unsafe fn init(ram_top: u64, shadow_phys: u64) {
     let len = (ram_top >> KASAN_SHADOW_SCALE) as usize;
-    // SAFETY: caller guarantees the reserved shadow span is writable.
-    unsafe { core::ptr::write_bytes(shadow_base as *mut u8, 0u8, len) };
+    let shadow_va = crate::PhysAddr::new(shadow_phys).kernel_mut_ptr::<u8>();
+    // SAFETY: caller guarantees the reserved shadow span is direct-mapped
+    // RW; this writes exactly the reserved span.
+    unsafe { core::ptr::write_bytes(shadow_va, 0u8, len) };
     RAM_TOP.store(ram_top, Ordering::Release);
-    SHADOW_BASE.store(shadow_base, Ordering::Release);
+    SHADOW_BASE.store(shadow_va as u64, Ordering::Release);
 }
 
 /// Arm poisoning + checking. Call once, after [`init`].
@@ -174,7 +222,7 @@ fn check(kind: &str, addr: u64, size: u64) {
     if sh.is_null() {
         return;
     }
-    // SAFETY: shadow span is mapped for every addr < ram_top.
+    // SAFETY: shadow span is direct-mapped for every tracked RAM address.
     if unsafe { *sh } != 0 {
         report(kind, addr, size);
     }
@@ -285,7 +333,8 @@ pub fn _would_report(addr: u64) -> bool {
         return false;
     }
     let sh = shadow_slot(addr);
-    // SAFETY: shadow span is mapped for every addr < ram_top; null otherwise.
+    // SAFETY: shadow span is direct-mapped for every tracked RAM address;
+    // null otherwise.
     !sh.is_null() && unsafe { *sh } != 0
 }
 
@@ -299,7 +348,7 @@ fn smoke_kasan_poison_roundtrip() -> narf_kernel_test::TestResult {
     if !is_armed() {
         return TestResult::Skip("kasan not armed");
     }
-    // A heap block is a low-identity address (phys == VA) → tracked range. The
+    // A heap block is a direct-map VA naming RAM → tracked range. The
     // slab already unpoisoned it on alloc, so it must read accessible.
     let b = Box::new([0u8; 32]);
     let addr = b.as_ptr() as u64;
@@ -310,6 +359,7 @@ fn smoke_kasan_poison_roundtrip() -> narf_kernel_test::TestResult {
     // view, not the bytes, and we unpoison before every return + drop.
     unsafe { poison(addr, 32) };
     if !_would_report(addr) {
+        // SAFETY: same block; restore the shadow before failing out.
         unsafe { unpoison(addr, 32) };
         return TestResult::Fail("poison did not set shadow");
     }
