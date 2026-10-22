@@ -260,6 +260,19 @@ fn flush<I: Io>(io: &mut I, l: Layout) -> Result<(), Error> {
     Ok(())
 }
 
+/// VCN's 1024-dword ring exposes masked 32-bit pointers. A normal pending
+/// predecessor can be numerically greater than a newly wrapped producer.
+/// Accept only progress within this exact nonempty published span.
+fn proof_pointer(pointer: u32, start: u32, next: u32) -> Result<(), Error> {
+    if (pointer | start | next) & !1023 != 0
+        || start == next
+        || (pointer.wrapping_sub(start) & 1023) > (next.wrapping_sub(start) & 1023)
+    {
+        return Err(Error::Readback);
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct Engine<I: Io> {
     io: I,
@@ -545,12 +558,11 @@ impl<I: Io> Engine<I> {
         self.seq = self.seq.wrapping_add(1).max(1);
         let seq = self.seq;
         let at = self.memory.address() + FENCE;
+        let start = self.wptr;
         let next = self.emit(&[3, at as u32, (at >> 32) as u32, seq, 4, 1])?;
         for _ in 0..2000 {
             let rptr = self.reg(RPTR)?;
-            if rptr.wrapping_sub(next) as i32 > 0 {
-                return Err(Error::Readback);
-            }
+            proof_pointer(rptr, start, next)?;
             let complete = self.access(|io, l| {
                 flush(io, l)?;
                 Ok(io.memory_read(map, FENCE) == seq)

@@ -135,13 +135,12 @@ impl<I: Io> Engine<I> {
         }
         let at = self.memory.address() + FENCE;
         frame[18..].copy_from_slice(&[3, at as u32, (at >> 32) as u32, sequence, 4, 1]);
+        let start = self.wptr;
         let next = self.emit(&frame)?;
         let mut complete = false;
         for _ in 0..20_000 {
             let pointer = self.reg(RPTR)?;
-            if pointer > next {
-                return Err(Error::Readback);
-            }
+            proof_pointer(pointer, start, next)?;
             let fence = self.completed_job()? == sequence;
             let irq = observer.observed(sample).await.map_err(Error::Interrupts)?;
             if pointer == next && fence && irq {
