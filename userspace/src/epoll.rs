@@ -6,11 +6,11 @@
 //!   (GPL-2.0-or-later, kernel.org).
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering};
 use narf_filesystem::{FileOps, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -85,7 +85,12 @@ fn write_epoll_event(ptr: u64, events: u32, data: u64) -> Result<(), ()> {
 
 #[derive(Clone)]
 struct EpollItem {
-    fd: i32,
+    registration: Arc<EpollRegistration>,
+}
+
+#[derive(Clone)]
+struct EpollSnapshot {
+    registration: Arc<EpollRegistration>,
     /// Weak reference to the open file description captured by
     /// `EPOLL_CTL_ADD`. A strong reference would keep a socket alive after
     /// its final descriptor closes and suppress EOF/HUP; a bare fd number
@@ -108,23 +113,87 @@ struct EpollItem {
     /// Non-cell-backed fds (timerfd / nested epoll / raw / legacy netlink) have
     /// no cell and are always polled (rising-mask edge only).
     cell_backed: bool,
-    /// Globally-unique key of this subscription's persistent waiter in the fd's
-    /// Readiness cell (top bit set to never collide with a task-id-keyed poll(2)
-    /// waiter). Used to `disarm` exactly this epoll's waker on CTL_MOD/DEL/close
-    /// without disturbing another epoll or a blocking poll on the same fd.
-    sub_id: u64,
 }
 
-impl core::fmt::Debug for EpollItem {
+impl core::fmt::Debug for EpollSnapshot {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("EpollItem")
-            .field("fd", &self.fd)
+        f.debug_struct("EpollSnapshot")
+            .field("fd", &self.registration.fd)
             .field("file_live", &self.file.strong_count().ne(&0))
             .field("offset", &self.offset)
             .field("events", &self.events)
             .field("data", &self.data)
             .field("last_mask", &self.last_mask)
             .finish()
+    }
+}
+
+/// Hot per-registration state, corresponding to Linux's `struct epitem`
+/// readiness linkage. `active` invalidates delayed callbacks after DEL/fd reuse;
+/// `queued` is the intrusive-list membership bit. Both are changed while the
+/// instance ready lock is held, but atomics let passive readiness queries
+/// observe membership without cloning or searching the queue.
+#[derive(Debug)]
+struct EpollRegistration {
+    fd: i32,
+    sub_id: u64,
+    active: AtomicBool,
+    queued: AtomicBool,
+    file: Weak<dyn FileOps>,
+    offset: u64,
+    state: IrqSafeSpinLock<EpollItemState>,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct EpollItemState {
+    events: u32,
+    data: u64,
+    last_mask: u32,
+    cell_backed: bool,
+}
+
+impl EpollRegistration {
+    fn new(
+        fd: i32,
+        sub_id: u64,
+        file: &Arc<dyn FileOps>,
+        offset: u64,
+        events: u32,
+        data: u64,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            fd,
+            sub_id,
+            active: AtomicBool::new(true),
+            queued: AtomicBool::new(false),
+            file: Arc::downgrade(file),
+            offset,
+            state: IrqSafeSpinLock::new(EpollItemState {
+                events,
+                data,
+                last_mask: 0,
+                cell_backed: false,
+            }),
+        })
+    }
+
+    fn snapshot(self: &Arc<Self>) -> EpollSnapshot {
+        let state = *self.state.lock();
+        EpollSnapshot {
+            registration: Arc::clone(self),
+            file: self.file.clone(),
+            offset: self.offset,
+            events: state.events,
+            data: state.data,
+            last_mask: state.last_mask,
+            cell_backed: state.cell_backed,
+        }
+    }
+}
+
+impl core::fmt::Debug for EpollItem {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.registration.snapshot().fmt(f)
     }
 }
 
@@ -143,7 +212,19 @@ fn next_sub_id() -> u64 {
 
 #[derive(Debug)]
 pub struct EpollInstance {
+    /// Cold `epoll_ctl` metadata plus per-subscription delivery state.
     inner: IrqSafeSpinLock<EpollInner>,
+    /// Ordered ready index plus cold fallback-poll membership. This mirrors
+    /// Linux's single `rdllist`: callbacks only link/refresh registrations,
+    /// while delivery snapshots a bounded window and polls without the lock.
+    ready: IrqSafeSpinLock<EpollReady>,
+    /// Shared-epoll sleepers, kept off the ready-list lock.
+    waiters: IrqSafeSpinLock<EpollWaiters>,
+    /// Lockless equivalent of Linux's `waitqueue_active(&ep->wq)`: avoid taking
+    /// the shared waiter lock for every callback in a large ready burst once
+    /// all sleepers have already been woken. A false-negative race with waiter
+    /// publication is covered by epoll_wait's register-then-recheck.
+    has_parked_waiters: AtomicBool,
     /// This epoll fd's OWN durable readiness cell. An epoll fd is itself
     /// pollable (Linux `ep_eventpoll_poll`), so a PARENT epoll / `poll(2)` that
     /// watches this instance as a nested fd arms its per-fd waker here via
@@ -169,58 +250,86 @@ pub struct EpollInstance {
     has_nested_parent: core::sync::atomic::AtomicBool,
 }
 
-impl EpollInner {
-    /// (Re)list `fd` on the ready list under a fresh listing number.
-    fn list_ready(&mut self, fd: i32) {
-        self.ready_seq = self.ready_seq.wrapping_add(1);
-        self.ready.insert(fd, self.ready_seq);
-    }
-}
-
 #[derive(Debug)]
 struct EpollInner {
     /// fd → interest record.
     interest: BTreeMap<i32, EpollItem>,
+}
+
+/// Ready-list and fallback-poll state, isolated from the cold interest tree.
+#[derive(Debug)]
+struct EpollReady {
     /// Last entry returned by a wait. Level-triggered entries remain ready,
     /// so begin the next scan after this fd to match Linux ready-list
     /// round-robin behavior when readiness exceeds `maxevents`.
     scan_after: Option<i32>,
-    /// Fds whose durable cell fired an edge since the last drain (Linux
-    /// `ep->rdllist`). Populated by the per-fd wakers and by arm-time seeding.
-    /// The fast path polls these (plus non-cell-backed fds); a full O(n) scan is
-    /// the fallback whenever the fast pass delivers nothing, so an incomplete
-    /// list is only ever a missed optimization, never a stranded wake.
-    ///
-    /// Each listing carries the `ready_seq` value it was (re)listed under, so
-    /// a scan's write-back drops only a listing it actually consumed: an event
-    /// that arrives during the scan re-lists the fd under a newer number and
-    /// survives to the next wait (Linux's `ovflist`).
-    ready: BTreeMap<i32, u64>,
-    /// Source of `ready` listing numbers; bumped on every (re)listing.
+    /// Ready registrations indexed by fd. The sequence changes on every
+    /// callback, including callbacks for an already-listed item, so write-back
+    /// cannot erase an event that raced the readiness poll.
+    ready: BTreeMap<i32, ReadyListing>,
     ready_seq: u64,
+    /// Interest fds without a durable readiness cell. These cannot list
+    /// themselves, so fast passes merge them with the ready index.
+    always_poll: BTreeSet<i32>,
+}
+
+#[derive(Clone, Debug)]
+struct ReadyListing {
+    registration: Arc<EpollRegistration>,
+    seq: u64,
+}
+
+type ReadyCandidate = (i32, Option<(Arc<EpollRegistration>, u64)>);
+
+impl EpollReady {
+    fn list(&mut self, registration: &Arc<EpollRegistration>) -> bool {
+        if !registration.active.load(Ordering::Acquire) {
+            return false;
+        }
+        self.ready_seq = self.ready_seq.wrapping_add(1);
+        if let Some(listing) = self.ready.get_mut(&registration.fd) {
+            if Arc::ptr_eq(&listing.registration, registration) {
+                // Already linked: refresh only the race generation. Replacing
+                // the whole value would do two contended Arc refcount updates
+                // and a needless B-tree value move on every same-level event.
+                listing.seq = self.ready_seq;
+                registration.queued.store(true, Ordering::Release);
+                return true;
+            }
+        }
+        self.ready.insert(
+            registration.fd,
+            ReadyListing {
+                registration: Arc::clone(registration),
+                seq: self.ready_seq,
+            },
+        );
+        registration.queued.store(true, Ordering::Release);
+        true
+    }
+
+    fn unlink(&mut self, registration: &Arc<EpollRegistration>) {
+        let matches = self
+            .ready
+            .get(&registration.fd)
+            .is_some_and(|listing| Arc::ptr_eq(&listing.registration, registration));
+        if matches {
+            self.ready.remove(&registration.fd);
+        }
+        registration.queued.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Debug)]
+struct EpollWaiters {
     /// Wakers of every task currently parked in `epoll_wait` on THIS instance,
-    /// keyed by task id, woken when a per-fd waker lists a ready fd. Keyed (not
-    /// a single `Option`) because Linux `epoll` supports many waiters on one
-    /// epoll fd — the common server pattern perf bench exercises: N threads all
-    /// blocked in `epoll_wait(epfd)` on a shared epoll. A single slot let each
-    /// parker clobber the previous one's waker, so only the last got woken and
-    /// the other N-1 stranded until a coarse re-poll. Each parker inserts its
-    /// own entry at park and removes it on return, so re-parking replaces only
-    /// its own slot. `push_ready` wakes ALL of them; the per-waiter
-    /// `collect_ready` delivery decision (owner-aware for EPOLLEXCLUSIVE) then
-    /// hands each event to exactly one, the rest re-park — matching Linux's
-    /// wait-queue wake + ready-list claim.
-    parked_wakers: BTreeMap<u64, core::task::Waker>,
-    /// collect_ready call counter for the periodic full-scan floor. The
-    /// ready-list can under-report a cell-backed fd that became ready while the
-    /// poller was between waits (the Readiness cell removes a waiter when `arm`
-    /// returns Ready, so a busy poller that rarely re-arms can miss a later
-    /// edge). The fast-then-full fallback only rescans when the fast pass is
-    /// EMPTY; under saturating load some fd is always ready, so the fast pass
-    /// never empties and a starved connection would never be revisited. Forcing
-    /// a full O(n) scan every `FULL_SCAN_EVERY` waits bounds that starvation to
-    /// a few waits — O(ready) amortized, O(n) worst-case, never worse.
-    scan_ctr: u32,
+    /// Linux puts these sleepers on an exclusive FIFO wait queue:
+    /// each readiness wake removes and wakes one waiter, while later events
+    /// advance through the remaining waiters. A task that re-parks joins the
+    /// tail instead of starving higher task ids. Keeping every waiter avoids
+    /// the old single-slot lost-waiter bug; `pop_front` keeps the readiness hot
+    /// path O(1) while many threads share an epoll fd.
+    parked_wakers: VecDeque<(u64, core::task::Waker)>,
 }
 
 /// Poll one fd's readiness WITHOUT holding the fd-table lock across the
@@ -234,7 +343,7 @@ struct EpollInner {
 /// nests event loops (an inner `wl_event_loop`'s epoll fd is an event source
 /// in the outer loop), so a Wayland compositor blocks on its very first
 /// `epoll_wait` with no wakeup, ever. Polling outside the lock fixes it.
-fn poll_item_readiness(item: &EpollItem) -> u32 {
+fn poll_item_readiness(item: &EpollSnapshot) -> u32 {
     item.file
         .upgrade()
         .map(|o| o.poll_readiness_at(item.offset))
@@ -252,13 +361,13 @@ fn poll_item_readiness(item: &EpollItem) -> u32 {
 // its close.
 struct EpollFdWake {
     ep: Weak<dyn FileOps>,
-    fd: i32,
+    registration: Arc<EpollRegistration>,
 }
 
 fn efw_fire(w: &EpollFdWake) {
     if let Some(ops) = w.ep.upgrade() {
         if let Some(inst) = as_epoll(&ops) {
-            inst.push_ready(w.fd);
+            inst.push_ready(&w.registration);
         }
     }
 }
@@ -292,10 +401,13 @@ unsafe fn efw_drop(p: *const ()) {
     drop(unsafe { Arc::from_raw(p as *const EpollFdWake) });
 }
 
-fn epoll_fd_waker(epfd_file: &Arc<dyn FileOps>, fd: i32) -> core::task::Waker {
+fn epoll_fd_waker(
+    epfd_file: &Arc<dyn FileOps>,
+    registration: &Arc<EpollRegistration>,
+) -> core::task::Waker {
     let arc = Arc::new(EpollFdWake {
         ep: Arc::downgrade(epfd_file),
-        fd,
+        registration: Arc::clone(registration),
     });
     let raw = Arc::into_raw(arc) as *const ();
     // SAFETY: `raw` + `EPOLL_FD_VTABLE` form a valid RawWaker over Arc<EpollFdWake>.
@@ -303,20 +415,40 @@ fn epoll_fd_waker(epfd_file: &Arc<dyn FileOps>, fd: i32) -> core::task::Waker {
 }
 
 impl EpollInstance {
+    fn list_ready(&self, registration: &Arc<EpollRegistration>) -> bool {
+        self.ready.lock().list(registration)
+    }
+
+    fn unlink_ready(&self, registration: &Arc<EpollRegistration>) {
+        self.ready.lock().unlink(registration);
+    }
+
+    fn ready_list_empty(&self) -> bool {
+        self.ready.lock().ready.is_empty()
+    }
+
     /// List `fd` as ready (its per-fd waker fired) and wake the parked poller.
     /// No-op if `fd` left the interest set.
-    fn push_ready(&self, fd: i32) {
-        let wakers: Vec<core::task::Waker> = {
-            let mut g = self.inner.lock();
-            if !g.interest.contains_key(&fd) {
-                return;
-            }
-            g.list_ready(fd);
-            // Wake EVERY parked waiter: any of them may be the one whose
-            // `collect_ready` will claim this fd (and for a level-triggered or
-            // multi-event edge, several can each take a distinct ready fd). The
-            // losers re-park. Cloned out so `wake()` runs outside `self.inner`.
-            g.parked_wakers.values().cloned().collect()
+    fn push_ready(&self, registration: &Arc<EpollRegistration>) {
+        if !self.list_ready(registration) {
+            return;
+        }
+        // Pair with the barrier after waiter publication: either this side
+        // observes `has_parked_waiters`, or the waiter-side readiness recheck
+        // observes the listing above. This is Linux's waitqueue_active() memory
+        // ordering rule, expressed around our split ready/waiter locks.
+        core::sync::atomic::fence(Ordering::SeqCst);
+        // Mirror ep_poll's exclusive, auto-removing wait entry: one event wakes
+        // one waiter and takes it off the queue. Move the waker out so wake()
+        // runs without either epoll lock held.
+        let waiter = if self.has_parked_waiters.load(Ordering::Acquire) {
+            let mut waiters = self.waiters.lock();
+            let waiter = waiters.parked_wakers.pop_front();
+            self.has_parked_waiters
+                .store(!waiters.parked_wakers.is_empty(), Ordering::Release);
+            waiter
+        } else {
+            None
         };
         // Chain the wake UP to a parent epoll / poll(2) that watches THIS
         // instance as a nested fd: fire our own cell so its persistent per-fd
@@ -336,8 +468,8 @@ impl EpollInstance {
             self.self_readiness.set(narf_filesystem::POLL_IN, 0);
             self.self_readiness.notify(narf_filesystem::POLL_IN);
         }
-        for w in wakers {
-            w.wake();
+        if let Some((_, waker)) = waiter {
+            waker.wake();
         }
     }
 
@@ -345,12 +477,17 @@ impl EpollInstance {
         Arc::new(Self {
             inner: IrqSafeSpinLock::new(EpollInner {
                 interest: BTreeMap::new(),
+            }),
+            ready: IrqSafeSpinLock::new(EpollReady {
                 scan_after: None,
                 ready: BTreeMap::new(),
                 ready_seq: 0,
-                parked_wakers: BTreeMap::new(),
-                scan_ctr: 0,
+                always_poll: BTreeSet::new(),
             }),
+            waiters: IrqSafeSpinLock::new(EpollWaiters {
+                parked_wakers: VecDeque::new(),
+            }),
+            has_parked_waiters: AtomicBool::new(false),
             self_readiness: narf_lib::readiness::Readiness::new(0),
             has_nested_parent: core::sync::atomic::AtomicBool::new(false),
         })
@@ -368,31 +505,34 @@ impl EpollInstance {
         data: u64,
         epfd_file: &Arc<dyn FileOps>,
     ) -> bool {
+        let sub_id = next_sub_id();
+        let registration = EpollRegistration::new(fd, sub_id, file, offset, events, data);
+        let mut reaped = None;
         {
             let mut g = self.inner.lock();
             if let Some(existing) = g.interest.get(&fd) {
-                if existing.file.upgrade().is_some() {
+                if existing.registration.file.upgrade().is_some() {
                     return false; // EEXIST
                 }
                 // Linux removes an epoll interest when the watched open file's
                 // last descriptor closes. Lazily reap the equivalent dead Weak
                 // entry so a subsequently reused fd number can be added. Its
                 // cell (if any) died with the file, so its waiter is already gone.
-                g.interest.remove(&fd);
+                reaped = g.interest.remove(&fd);
+                if let Some(item) = &reaped {
+                    item.registration.active.store(false, Ordering::Release);
+                }
             }
             g.interest.insert(
                 fd,
                 EpollItem {
-                    fd,
-                    file: Arc::downgrade(file),
-                    offset,
-                    events,
-                    data,
-                    last_mask: 0,
-                    cell_backed: false,
-                    sub_id: next_sub_id(),
+                    registration: Arc::clone(&registration),
                 },
             );
+        }
+        if let Some(old) = reaped {
+            self.unlink_ready(&old.registration);
+            self.ready.lock().always_poll.remove(&fd);
         }
         // Arm the persistent per-fd waker OUTSIDE the instance lock (arming a
         // socket takes its state lock; the cell has its own lock) and seed the
@@ -406,13 +546,18 @@ impl EpollInstance {
     /// seeds the ready-list from the returned currently-ready bits. Must be
     /// called with the instance lock NOT held.
     fn arm_item_persistent(&self, fd: i32, file: &Arc<dyn FileOps>, epfd_file: &Arc<dyn FileOps>) {
-        let (sub_id, events) = {
+        let (registration, events) = {
             let g = self.inner.lock();
             match g.interest.get(&fd) {
-                Some(it) => (it.sub_id, it.events),
+                Some(it) => {
+                    let registration = Arc::clone(&it.registration);
+                    let events = registration.state.lock().events;
+                    (registration, events)
+                }
                 None => return,
             }
         };
+        let sub_id = registration.sub_id;
         // A disarmed EPOLLONESHOT (interest bits cleared) has nothing to wait on.
         if (events & EPOLLONESHOT) != 0
             && (events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE)) == 0
@@ -421,24 +566,40 @@ impl EpollInstance {
         }
         let want = events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
         let interest = want | EPOLLERR | EPOLLHUP;
-        let fd_waker = epoll_fd_waker(epfd_file, fd);
+        let fd_waker = epoll_fd_waker(epfd_file, &registration);
         let armed = file.arm_readiness_persistent(sub_id, interest, &fd_waker);
-        let mut g = self.inner.lock();
         let mut seed = false;
-        if let Some(it) = g.interest.get_mut(&fd) {
+        let mut cell_backed = None;
+        if registration.active.load(Ordering::Acquire) {
+            let mut state = registration.state.lock();
             match armed {
                 Some(ready_bits) => {
-                    it.cell_backed = true;
+                    state.cell_backed = true;
                     seed = ready_bits != 0;
+                    cell_backed = Some(true);
                 }
-                None => it.cell_backed = false,
+                None => {
+                    state.cell_backed = false;
+                    cell_backed = Some(false);
+                }
+            }
+        }
+        {
+            let mut ready = self.ready.lock();
+            match cell_backed {
+                Some(true) => {
+                    ready.always_poll.remove(&fd);
+                }
+                Some(false) => {
+                    ready.always_poll.insert(fd);
+                }
+                None => {}
             }
         }
         if seed {
-            g.list_ready(fd);
+            self.list_ready(&registration);
         }
-        let ready_now = !g.ready.is_empty();
-        drop(g);
+        let ready_now = !self.ready_list_empty();
         // Keep our OWN cell level in step with the ready-list so a parent that
         // nests us and arms via `arm_readiness_persistent` right after this ADD
         // seeds an accurate initial edge (a child already ready at ADD time). A
@@ -462,24 +623,24 @@ impl EpollInstance {
             let matches = g
                 .interest
                 .get(&fd)
-                .and_then(|item| item.file.upgrade())
+                .and_then(|item| item.registration.file.upgrade())
                 .is_some_and(|watched| Arc::ptr_eq(&watched, file));
-            let removed = if matches {
+            if matches {
                 g.interest.remove(&fd)
             } else {
                 None
-            };
-            if let Some(item) = &removed {
-                g.ready.remove(&fd);
-                exclusive_release(fd, owner_id);
-                let sub = item.sub_id;
-                drop(g);
-                // Disarm the persistent waiter outside the instance lock.
-                file.disarm_readiness(sub);
             }
-            removed.is_some()
         };
-        removed
+        let Some(item) = removed else {
+            return false;
+        };
+        item.registration.active.store(false, Ordering::Release);
+        self.unlink_ready(&item.registration);
+        self.ready.lock().always_poll.remove(&fd);
+        exclusive_release(fd, owner_id);
+        // Disarm outside both epoll locks.
+        file.disarm_readiness(item.registration.sub_id);
+        true
     }
 
     /// `EPOLL_CTL_MOD` logic.
@@ -492,25 +653,27 @@ impl EpollInstance {
         epfd_file: &Arc<dyn FileOps>,
     ) -> bool {
         {
-            let mut g = self.inner.lock();
-            let Some(item) = g.interest.get_mut(&fd) else {
+            let g = self.inner.lock();
+            let Some(item) = g.interest.get(&fd) else {
                 return false; // ENOENT
             };
             let same_file = item
+                .registration
                 .file
                 .upgrade()
                 .is_some_and(|watched| Arc::ptr_eq(&watched, file));
             if !same_file {
                 return false;
             }
-            item.events = events;
-            item.data = data;
+            let mut state = item.registration.state.lock();
+            state.events = events;
+            state.data = data;
             // Linux re-evaluates the fd against its new mask on every MOD and
             // re-adds it to the ready list if currently ready — so a MOD acts as
             // a fresh edge for EPOLLET (and re-arms EPOLLONESHOT). Reset the
             // rising-mask edge state, exactly as `ctl_add` initializes it, so the
             // next scan treats current readiness as a rising edge.
-            item.last_mask = 0;
+            state.last_mask = 0;
         }
         // Re-arm the persistent waker with the new interest (replaces by sub_id)
         // and re-seed the ready-list, so a still-ready fd fires a fresh edge —
@@ -529,12 +692,12 @@ impl EpollInstance {
     #[cfg(feature = "unix-latency-trace")]
     #[allow(clippy::type_complexity)]
     fn dbg_interest_edge_state(&self) -> Vec<(i32, u32, u32, u32, u64, u64, bool)> {
-        let (snapshot, ready_set): (Vec<(i32, EpollItem)>, alloc::collections::BTreeSet<i32>) = {
+        let snapshot: Vec<(i32, EpollSnapshot)> = {
             let g = self.inner.lock();
-            (
-                g.interest.iter().map(|(k, v)| (*k, v.clone())).collect(),
-                g.ready.keys().copied().collect(),
-            )
+            g.interest
+                .iter()
+                .map(|(k, v)| (*k, v.registration.snapshot()))
+                .collect()
         };
         snapshot
             .into_iter()
@@ -542,7 +705,7 @@ impl EpollInstance {
                 let cur_mask = poll_item_readiness(&item);
                 let want = item.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
                 let ready = cur_mask & (want | EPOLLERR | EPOLLHUP);
-                let in_ready = item.cell_backed && ready_set.contains(&fd);
+                let in_ready = item.cell_backed && item.registration.queued.load(Ordering::Acquire);
                 let would_deliver = if ready == 0 {
                     false
                 } else if (item.events & EPOLLET) != 0 {
@@ -572,41 +735,47 @@ impl EpollInstance {
     /// between non-parking (`timeout==0`) waits, and there is no per-wait O(n)
     /// re-arm on the hot path.
     fn set_parked_waker(&self, task_id: u64, waker: &core::task::Waker) {
-        self.inner
-            .lock()
+        let mut waiters = self.waiters.lock();
+        if let Some(pos) = waiters
             .parked_wakers
-            .insert(task_id, waker.clone());
+            .iter()
+            .position(|(parked_task, _)| *parked_task == task_id)
+        {
+            waiters.parked_wakers.remove(pos);
+        }
+        waiters.parked_wakers.push_back((task_id, waker.clone()));
+        self.has_parked_waiters.store(true, Ordering::Release);
+        // See `push_ready`: forbid the readiness recheck from moving before
+        // waiter publication, closing the lockless active-gate lost-wake race.
+        core::sync::atomic::fence(Ordering::SeqCst);
     }
 
     /// End-of-wait cleanup: drop the parked-waker publication. The persistent
     /// per-fd cell wakers stay armed (Linux `eppoll_entry`), disarmed only by
     /// CTL_MOD/DEL or this instance's drop.
     fn disarm_readiness_cells(&self, task_id: u64) {
-        self.inner.lock().parked_wakers.remove(&task_id);
+        let mut waiters = self.waiters.lock();
+        if let Some(pos) = waiters
+            .parked_wakers
+            .iter()
+            .position(|(parked_task, _)| *parked_task == task_id)
+        {
+            waiters.parked_wakers.remove(pos);
+        }
+        self.has_parked_waiters
+            .store(!waiters.parked_wakers.is_empty(), Ordering::Release);
     }
 
-    /// Two-tier delivery: a fast O(ready) pass over the ready-list (+ non-cell
+    /// Two-tier delivery: a bounded fast pass over the ready-list (+ non-cell
     /// fds), falling back to a full O(n) scan whenever the fast pass delivers
     /// nothing — so an incomplete ready-list can only cost a rescan, never
-    /// strand a wake. Under load the fast pass delivers and the full scan is
-    /// never reached; worst case is O(n), never worse.
+    /// strand a wake. Persistent per-fd registrations make the ready-list
+    /// edge-complete; unlike the old one-shot `arm` scheme, they are never
+    /// consumed merely because an fd was already ready.
     fn collect_ready(&self, task_id: u64, maxevents: usize) -> Vec<(u32, u64)> {
-        // Periodic full-scan floor: every FULL_SCAN_EVERY-th wait, scan the
-        // whole interest set so a cell-backed fd the ready-list under-reported
-        // (a later edge lost after `arm` removed its waiter under saturating
-        // load) is revisited within a bounded number of waits — no connection
-        // can starve. Cheap under load (1-in-N is O(n); the rest O(ready)).
-        const FULL_SCAN_EVERY: u32 = 8;
-        let force_full = {
-            let mut g = self.inner.lock();
-            g.scan_ctr = g.scan_ctr.wrapping_add(1);
-            g.scan_ctr % FULL_SCAN_EVERY == 0
-        };
-        if !force_full {
-            let fast = self.collect_ready_pass(task_id, maxevents, false);
-            if !fast.is_empty() {
-                return fast;
-            }
+        let fast = self.collect_ready_pass(task_id, maxevents, false);
+        if !fast.is_empty() {
+            return fast;
         }
         self.collect_ready_pass(task_id, maxevents, true)
     }
@@ -625,33 +794,132 @@ impl EpollInstance {
         // persistent per-fd waker fired (a `set`/`notify` event) since the last
         // drain. It IS the EPOLLET edge the per-source token used to carry: an fd
         // that is level-ready but not listed has had no fresh event, so EPOLLET
-        // must not re-report it. Captured per-entry UNDER the lock (a single
-        // `contains` while cloning the item) so the hot path never clones the
-        // whole ready set.
-        let snapshot: Vec<(i32, EpollItem, Option<u64>)> = {
-            let g = self.inner.lock();
-            let any_cell = g.interest.values().any(|it| it.cell_backed);
-            let mut entries: Vec<_> = if full || !any_cell {
-                g.interest
-                    .iter()
-                    .map(|(k, v)| (*k, v.clone(), g.ready.get(k).copied()))
-                    .collect()
-            } else {
-                g.interest
-                    .iter()
-                    .filter(|(fd, it)| g.ready.contains_key(fd) || !it.cell_backed)
-                    .map(|(k, v)| (*k, v.clone(), g.ready.get(k).copied()))
-                    .collect()
+        // must not re-report it. Captured per-entry UNDER the lock. The fast
+        // path snapshots only a small maxevents-sized window in ready-list
+        // order; later entries stay listed for the next wait, matching Linux's
+        // bounded ready-index drain. Each snapshot carries its listing sequence;
+        // a callback racing the poll refreshes that sequence, so write-back
+        // cannot erase the new event (the role Linux's `ovflist` serves).
+        let snapshot: Vec<(i32, EpollSnapshot, Option<u64>)> = if full {
+            let (listings, scan_after) = {
+                let ready = self.ready.lock();
+                (ready.ready.clone(), ready.scan_after)
             };
-            if let Some(after) = g.scan_after {
-                // Linux moves a delivered level-triggered item to the tail of
-                // its ready list. Rotating this rescan has the same observable
-                // fairness: successive short waits visit later ready fds.
+            let registrations: Vec<_> = self
+                .inner
+                .lock()
+                .interest
+                .values()
+                .map(|item| Arc::clone(&item.registration))
+                .collect();
+            let mut entries: Vec<_> = registrations
+                .into_iter()
+                .filter(|registration| registration.active.load(Ordering::Acquire))
+                .map(|registration| {
+                    let fd = registration.fd;
+                    let listed = listings.get(&fd).and_then(|listing| {
+                        Arc::ptr_eq(&listing.registration, &registration).then_some(listing.seq)
+                    });
+                    (fd, registration.snapshot(), listed)
+                })
+                .collect();
+            if let Some(after) = scan_after {
                 if let Some(start) = entries.iter().position(|(fd, _, _)| *fd > after) {
                     entries.rotate_left(start);
                 }
             }
             entries
+        } else {
+            // Snapshot no more candidates than this wait can return. A stale
+            // candidate makes the fast pass empty and takes the full fallback.
+            let limit = maxevents.max(1);
+            let candidates: Vec<ReadyCandidate> = {
+                let mut ready = self.ready.lock();
+                let mut candidates = Vec::with_capacity(limit);
+                let mut append_range = |mut listed: alloc::collections::btree_map::Range<
+                    '_,
+                    i32,
+                    ReadyListing,
+                >,
+                                        mut always: alloc::collections::btree_set::Range<
+                    '_,
+                    i32,
+                >| {
+                    let mut listed_fd = listed.next().map(|(fd, _)| *fd);
+                    let mut always_fd = always.next().copied();
+                    while candidates.len() < limit && (listed_fd.is_some() || always_fd.is_some()) {
+                        let fd = match (listed_fd, always_fd) {
+                            (Some(r), Some(a)) if r < a => {
+                                listed_fd = listed.next().map(|(fd, _)| *fd);
+                                r
+                            }
+                            (Some(r), Some(a)) if a < r => {
+                                always_fd = always.next().copied();
+                                a
+                            }
+                            (Some(r), Some(_)) => {
+                                listed_fd = listed.next().map(|(fd, _)| *fd);
+                                always_fd = always.next().copied();
+                                r
+                            }
+                            (Some(r), None) => {
+                                listed_fd = listed.next().map(|(fd, _)| *fd);
+                                r
+                            }
+                            (None, Some(a)) => {
+                                always_fd = always.next().copied();
+                                a
+                            }
+                            (None, None) => break,
+                        };
+                        let listing = ready
+                            .ready
+                            .get(&fd)
+                            .map(|listing| (Arc::clone(&listing.registration), listing.seq));
+                        candidates.push((fd, listing));
+                    }
+                };
+                if let Some(after) = ready.scan_after {
+                    use core::ops::Bound::{Excluded, Unbounded};
+                    append_range(
+                        ready.ready.range((Excluded(after), Unbounded)),
+                        ready.always_poll.range((Excluded(after), Unbounded)),
+                    );
+                    append_range(
+                        ready.ready.range(..=after),
+                        ready.always_poll.range(..=after),
+                    );
+                } else {
+                    append_range(ready.ready.range(..), ready.always_poll.range(..));
+                }
+                // Reserve this bounded window before polling it. Linux obtains
+                // the same property by splicing rdllist into a private txlist:
+                // concurrent harvesters cannot all select the same head item.
+                // The entries remain indexed here so callbacks can refresh
+                // their sequence while polling runs without this lock.
+                if let Some((fd, _)) = candidates.last() {
+                    ready.scan_after = Some(*fd);
+                }
+                candidates
+            };
+
+            candidates
+                .into_iter()
+                .filter_map(|(fd, listing)| {
+                    let (registration, seq) = match listing {
+                        Some((registration, seq)) => (registration, Some(seq)),
+                        None => {
+                            let interest = self.inner.lock();
+                            (Arc::clone(&interest.interest.get(&fd)?.registration), None)
+                        }
+                    };
+                    if !registration.active.load(Ordering::Acquire) {
+                        return None;
+                    }
+                    let fd = registration.fd;
+                    Some((fd, registration.snapshot(), seq))
+                })
+                .collect()
         };
 
         let mut results = Vec::new();
@@ -662,7 +930,7 @@ impl EpollInstance {
         let mut observed = Vec::new();
         let mut delivered_fds = Vec::new();
         for (fd, item, listing) in &snapshot {
-            let in_ready = &listing.is_some();
+            let in_ready = listing.is_some();
             // `maxevents` limits acceptance, not merely userspace copying.
             // Do not poll, acknowledge, advance edge state, take an exclusive
             // claim, or disarm a one-shot entry that this wait cannot return.
@@ -694,7 +962,7 @@ impl EpollInstance {
                     // Backing open file dropped → not ready; record a zero
                     // observation so the write-back clears any stale readiness,
                     // exactly as the previous per-call upgrades did.
-                    observed.push((*fd, 0, *listing));
+                    observed.push((*fd, 0, *listing, Arc::clone(&item.registration)));
                     continue;
                 }
             };
@@ -704,7 +972,7 @@ impl EpollInstance {
             // above (Linux ep_send_events drains the rdllist; ep_item_poll only
             // re-confirms the mask).
             let cur_mask = file.poll_readiness_at(item.offset);
-            observed.push((*fd, cur_mask, *listing));
+            observed.push((*fd, cur_mask, *listing, Arc::clone(&item.registration)));
             // Only report events the caller asked for.
             let want = item.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
             // Linux always reports ERR/HUP even when the caller omitted them
@@ -728,7 +996,7 @@ impl EpollInstance {
             // re-reported.
             if (item.events & EPOLLET) != 0 {
                 let new_bits = ready & !item.last_mask;
-                let listed = item.cell_backed && *in_ready;
+                let listed = item.cell_backed && in_ready;
                 if new_bits == 0 && !listed {
                     continue;
                 }
@@ -767,28 +1035,33 @@ impl EpollInstance {
 
         // Write back the masks observed above; never invoke FileOps callbacks
         // while holding this instance's non-reentrant spin lock.
-        {
-            let mut g = self.inner.lock();
-            for (fd, cur_mask, listing) in observed {
-                let in_ready = listing.is_some();
+        let ready_updates = {
+            let mut updates = Vec::with_capacity(observed.len());
+            for (fd, cur_mask, in_ready, registration) in observed {
                 // Ready-list bookkeeping (Linux rdllist): a level-triggered fd
                 // that was delivered stays a candidate so the next wait
                 // re-reports it until the app drains (its next poll then shows
                 // not-ready and drops it). Edge-triggered / oneshot consume the
                 // edge, and an observed-but-not-delivered fd (no edge / drained)
                 // is no longer live — both drop from the list.
-                let mut keep_ready = false;
-                if let Some(item) = g.interest.get_mut(&fd) {
+                let keep_ready;
+                let mut disarm_always_poll = false;
+                if registration.active.load(Ordering::Acquire) {
+                    let mut state = registration.state.lock();
+                    if !registration.active.load(Ordering::Acquire) {
+                        continue;
+                    }
                     if delivered_fds.contains(&fd) {
                         // Delivered to the caller — the EPOLLET edge (ready-list
                         // listing) is now consumed, so advance the recorded mask
                         // and drop the listing for ET/oneshot.
-                        item.last_mask = cur_mask;
+                        state.last_mask = cur_mask;
                         keep_ready =
-                            item.cell_backed && (item.events & (EPOLLET | EPOLLONESHOT)) == 0;
-                        if (item.events & EPOLLONESHOT) != 0 {
+                            state.cell_backed && (state.events & (EPOLLET | EPOLLONESHOT)) == 0;
+                        if (state.events & EPOLLONESHOT) != 0 {
                             // Clear all event-interest bits; keep flags.
-                            item.events &= EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE;
+                            state.events &= EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE;
+                            disarm_always_poll = !state.cell_backed;
                         }
                     } else {
                         // Observed but NOT delivered (an EPOLLET item with no
@@ -801,24 +1074,64 @@ impl EpollInstance {
                         // next scan — this preserves the AF_UNIX socket-activation
                         // acceptor (dbus-broker / journald) whose accept thread
                         // races its epoll thread; the token used to hold that edge.
-                        item.last_mask &= cur_mask;
-                        keep_ready = item.cell_backed && (item.events & EPOLLET) != 0 && in_ready;
+                        state.last_mask &= cur_mask;
+                        keep_ready = state.cell_backed
+                            && (state.events & EPOLLET) != 0
+                            && in_ready.is_some();
                     }
-                }
-                if keep_ready {
-                    if !g.ready.contains_key(&fd) {
-                        g.list_ready(fd);
-                    }
-                } else if g.ready.get(&fd).copied() == listing {
-                    // Drop only the listing this scan saw. A listing made or
-                    // renewed after the snapshot is an event that arrived
-                    // during the scan: it stays for the next wait, or the
-                    // edge would be lost (Linux keeps those on `ovflist`).
-                    g.ready.remove(&fd);
+                    updates.push((
+                        fd,
+                        Arc::clone(&registration),
+                        in_ready,
+                        keep_ready,
+                        disarm_always_poll,
+                    ));
                 }
             }
-            if let Some(fd) = delivered_fds.last() {
-                g.scan_after = Some(*fd);
+            updates
+        };
+        let needs_full_cursor = full && !delivered_fds.is_empty();
+        let needs_ready_write = needs_full_cursor
+            || ready_updates.iter().any(
+                |(_, registration, listing, keep_ready, disarm_always_poll)| {
+                    *disarm_always_poll
+                        || (*keep_ready && !registration.queued.load(Ordering::Acquire))
+                        || (!*keep_ready && listing.is_some())
+                },
+            );
+        if needs_ready_write {
+            let mut ready = self.ready.lock();
+            for (fd, registration, listing, keep_ready, disarm_always_poll) in ready_updates {
+                if disarm_always_poll {
+                    ready.always_poll.remove(&fd);
+                }
+                // The dominant level-triggered case stays linked. It already
+                // advanced per-registration state above and needs no ready-tree
+                // mutation, so do not bounce the global ready lock's cache line
+                // merely to rediscover the existing entry.
+                if keep_ready && registration.queued.load(Ordering::Acquire) {
+                    continue;
+                }
+                let current = ready
+                    .ready
+                    .get(&fd)
+                    .filter(|current| Arc::ptr_eq(&current.registration, &registration));
+                if keep_ready {
+                    if current.is_none() {
+                        ready.list(&registration);
+                    }
+                } else if listing.is_some() && current.map(|current| current.seq) == listing {
+                    ready.ready.remove(&fd);
+                    registration.queued.store(false, Ordering::Release);
+                }
+            }
+            // Fast passes reserve their position at snapshot time so another
+            // waiter selects a different window. A full fallback has no such
+            // reservation and advances from the last event actually returned.
+            if needs_full_cursor {
+                if let Some(fd) = delivered_fds.last() {
+                    ready.scan_after = Some(*fd);
+                }
             }
         }
 
@@ -833,7 +1146,7 @@ impl EpollInstance {
         if self
             .has_nested_parent
             .load(core::sync::atomic::Ordering::Relaxed)
-            && self.inner.lock().ready.is_empty()
+            && self.ready_list_empty()
         {
             self.self_readiness.set(0, narf_filesystem::POLL_IN);
         }
@@ -859,11 +1172,17 @@ impl EpollInstance {
     /// nothing — the park recheck then self-wakes on every re-execution, a
     /// 100%-CPU `epoll_wait` livelock (kwin's greeter never presented).
     fn has_deliverable(&self, task_id: u64) -> bool {
-        let snapshot: Vec<(i32, EpollItem, bool)> = {
+        let snapshot: Vec<(i32, EpollSnapshot, bool)> = {
             let g = self.inner.lock();
             g.interest
                 .iter()
-                .map(|(k, v)| (*k, v.clone(), g.ready.contains_key(k)))
+                .map(|(k, v)| {
+                    (
+                        *k,
+                        v.registration.snapshot(),
+                        v.registration.queued.load(Ordering::Acquire),
+                    )
+                })
                 .collect()
         };
         for (fd, item, in_ready) in snapshot {
@@ -911,10 +1230,16 @@ impl EpollInstance {
     /// timerfd armed in an epoll set with an infinite timeout would never
     /// wake the waiter (it parks forever) — the dead-repaint-loop failure.
     fn nearest_poll_deadline(&self, _task_id: u64) -> Option<u64> {
-        let items: Vec<EpollItem> = self.inner.lock().interest.values().cloned().collect();
+        let registrations: Vec<_> = self
+            .inner
+            .lock()
+            .interest
+            .values()
+            .map(|item| Arc::clone(&item.registration))
+            .collect();
         let mut earliest: Option<u64> = None;
-        for item in items {
-            if let Some(d) = item.file.upgrade().and_then(|o| o.poll_deadline()) {
+        for registration in registrations {
+            if let Some(d) = registration.file.upgrade().and_then(|o| o.poll_deadline()) {
                 earliest = Some(earliest.map_or(d, |e| e.min(d)));
             }
         }
@@ -970,13 +1295,18 @@ impl FileOps for EpollInstance {
         // `EpollInstance::poll_readiness`), so holding any lock across
         // it risks the same re-entrant deadlock the outer epoll path
         // hit. See `poll_fd_readiness`.
-        // Per-entry `in_ready` (ready-list membership) captured under the lock,
-        // so the passive nested-epoll query never clones the whole ready set.
-        let snapshot: Vec<(EpollItem, bool)> = {
+        // Per-entry ready-list membership is carried by the registration, so
+        // the passive nested-epoll query never clones or searches the queue.
+        let snapshot: Vec<(EpollSnapshot, bool)> = {
             let g = self.inner.lock();
             g.interest
                 .values()
-                .map(|v| (v.clone(), g.ready.contains_key(&v.fd)))
+                .map(|v| {
+                    (
+                        v.registration.snapshot(),
+                        v.registration.queued.load(Ordering::Acquire),
+                    )
+                })
                 .collect()
         };
         for (item, in_ready) in snapshot {
@@ -1107,8 +1437,9 @@ impl Drop for EpollInstance {
     fn drop(&mut self) {
         let items = core::mem::take(&mut self.inner.lock().interest);
         for item in items.values() {
-            if let Some(file) = item.file.upgrade() {
-                file.disarm_readiness(item.sub_id);
+            item.registration.active.store(false, Ordering::Release);
+            if let Some(file) = item.registration.file.upgrade() {
+                file.disarm_readiness(item.registration.sub_id);
             }
         }
     }
@@ -1228,7 +1559,7 @@ fn epoll_reaches(
     }
     let items: Vec<EpollItem> = from.inner.lock().interest.values().cloned().collect();
     for item in items {
-        let Some(ops) = item.file.upgrade() else {
+        let Some(ops) = item.registration.file.upgrade() else {
             continue;
         };
         let Some(child) = as_epoll(&ops) else {
@@ -2100,24 +2431,27 @@ mod tests {
     ) -> (Arc<EpollInstance>, Arc<MaskFile>) {
         let file = MaskFile::new(mask);
         let ep = EpollInstance::new();
+        let file_ops = file.clone() as Arc<dyn FileOps>;
+        let registration = EpollRegistration::new(FD, 1, &file_ops, 0, events, 0);
+        {
+            let mut state = registration.state.lock();
+            state.last_mask = last_mask;
+            state.cell_backed = cell_backed;
+        }
         {
             let mut g = ep.inner.lock();
             g.interest.insert(
                 FD,
                 EpollItem {
-                    fd: FD,
-                    file: Arc::downgrade(&(file.clone() as Arc<dyn FileOps>)),
-                    offset: 0,
-                    events,
-                    data: 0,
-                    last_mask,
-                    cell_backed,
-                    sub_id: 1,
+                    registration: Arc::clone(&registration),
                 },
             );
-            if in_ready {
-                g.list_ready(FD);
-            }
+        }
+        if !cell_backed {
+            ep.ready.lock().always_poll.insert(FD);
+        }
+        if in_ready {
+            ep.list_ready(&registration);
         }
         (ep, file)
     }
@@ -2193,9 +2527,8 @@ mod tests {
     );
 
     // Test waker: its data pointer is an index into `TEST_WOKE`; `wake` sets
-    // that slot. `clone` preserves the index (so `push_ready`'s `.cloned()` +
-    // `wake()` still records the right waiter), drop is a no-op (the "resource"
-    // is just an integer).
+    // that slot. `clone` preserves the index and drop is a no-op (the
+    // "resource" is just an integer).
     static TEST_WOKE: [core::sync::atomic::AtomicBool; 4] =
         [const { core::sync::atomic::AtomicBool::new(false) }; 4];
     unsafe fn tw_clone(p: *const ()) -> core::task::RawWaker {
@@ -2221,14 +2554,11 @@ mod tests {
         }
     }
 
-    /// A readiness event must wake EVERY task parked in `epoll_wait` on a shared
-    /// epoll instance, not just one. Linux `epoll` supports many waiters on one
-    /// epoll fd (the common N-threads-one-epoll server pattern); NARF kept a
-    /// single `parked_waker` slot, so every new parker clobbered the previous
-    /// one and `push_ready` woke only the last — the others stranded. This pins
-    /// the wake-queue: all registered waiters fire, and `disarm` removes only
-    /// its own task's waker without disturbing the rest.
-    fn smoke_epoll_push_ready_wakes_all_parked_waiters() -> TestResult {
+    /// Linux queues shared-epoll sleepers as exclusive, auto-removing waiters:
+    /// one readiness event wakes one task, and a later event advances to the
+    /// next. This preserves all waiters without waking N threads to race for
+    /// one event (the default perf-bench epoll topology).
+    fn smoke_epoll_push_ready_wakes_one_parked_waiter_per_event() -> TestResult {
         __test_reset();
         let reset = || {
             for w in &TEST_WOKE {
@@ -2242,38 +2572,47 @@ mod tests {
         ep.set_parked_waker(0xA1, &test_waker(1));
         ep.set_parked_waker(0xA2, &test_waker(2));
 
-        ep.push_ready(FD);
-        if !(TEST_WOKE[0].load(Ordering::Relaxed)
-            && TEST_WOKE[1].load(Ordering::Relaxed)
-            && TEST_WOKE[2].load(Ordering::Relaxed))
-        {
-            return TestResult::Fail(
-                "push_ready must wake ALL parked waiters on a shared epoll instance",
-            );
-        }
-
-        // Re-parking a task replaces only its own slot (not a new entry).
+        // Re-parking a task replaces only its own slot and moves it to the
+        // queue tail, just like Linux removing and re-adding a wait entry.
         ep.set_parked_waker(0xA0, &test_waker(0));
-        if ep.inner.lock().parked_wakers.len() != 3 {
+        if ep.waiters.lock().parked_wakers.len() != 3 {
             return TestResult::Fail("re-park must replace the task's own waker, not grow the map");
         }
 
-        // Disarm one waiter: the next event wakes the OTHER two, not it.
-        ep.disarm_readiness_cells(0xA1);
-        reset();
-        ep.push_ready(FD);
-        if TEST_WOKE[1].load(Ordering::Relaxed) {
-            return TestResult::Fail("a disarmed waiter must not be woken");
+        ep.push_ready(&ep.inner.lock().interest[&FD].registration);
+        if TEST_WOKE[0].load(Ordering::Relaxed)
+            || !TEST_WOKE[1].load(Ordering::Relaxed)
+            || TEST_WOKE[2].load(Ordering::Relaxed)
+        {
+            return TestResult::Fail("one event must wake only one exclusive epoll waiter");
         }
-        if !(TEST_WOKE[0].load(Ordering::Relaxed) && TEST_WOKE[2].load(Ordering::Relaxed)) {
-            return TestResult::Fail("remaining waiters must still wake after one disarm");
+
+        reset();
+        ep.push_ready(&ep.inner.lock().interest[&FD].registration);
+        if TEST_WOKE[0].load(Ordering::Relaxed)
+            || TEST_WOKE[1].load(Ordering::Relaxed)
+            || !TEST_WOKE[2].load(Ordering::Relaxed)
+        {
+            return TestResult::Fail("a later event must advance to the next epoll waiter");
+        }
+
+        reset();
+        ep.push_ready(&ep.inner.lock().interest[&FD].registration);
+        if !TEST_WOKE[0].load(Ordering::Relaxed)
+            || TEST_WOKE[1].load(Ordering::Relaxed)
+            || TEST_WOKE[2].load(Ordering::Relaxed)
+        {
+            return TestResult::Fail("every parked waiter must eventually receive an event");
+        }
+        if !ep.waiters.lock().parked_wakers.is_empty() {
+            return TestResult::Fail("woken epoll waiters must be auto-removed");
         }
         __test_reset();
         TestResult::Pass
     }
     kernel_test_in!(
         "userspace/epoll",
-        smoke_epoll_push_ready_wakes_all_parked_waiters
+        smoke_epoll_push_ready_wakes_one_parked_waiter_per_event
     );
 
     /// The scheduler's park recheck calls `epoll_fd_has_ready(task, epfd)` — it
