@@ -2547,3 +2547,7 @@ impl ColdBoot {
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_navi22_boot_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(feature = "kernel-test")]
+#[path = "amdgpu_navi22_board_tests.rs"]
+mod board_tests;

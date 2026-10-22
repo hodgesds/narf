@@ -359,6 +359,66 @@ kernel_test_in!(
     navi22_bios_tables_go_to_dmub_when_running
 );
 
+fn rx6750xt_missing_display_tables_use_dmub_v17_fallback() -> TestResult {
+    // MSI 1462:3985, VBIOS 113-MSITV398MH.310: command slots 4, 12 and
+    // 76 are absent. This matters after the firmware checkpoints complete;
+    // the HDMI modeset must use DMUB without requiring those ATOM tables.
+    let mut image = image(7);
+    for id in [4, 12, 76] {
+        image[CMD_DIR + 4 + id * 2..CMD_DIR + 6 + id * 2].fill(0);
+    }
+    let dmcub = Dmcub(narf_lib::sync::IrqSafeSpinLock::new(Vec::new()));
+    let tables = Tables::new(&image).unwrap().with_dmub(Some(&dmcub));
+    let bus = bus();
+    let clock = PixelClock {
+        otg: 0,
+        pll: 0,
+        transmitter: 0,
+        pixel_100hz: 5_940_000,
+        deep_color: 0,
+    };
+    let transmitter = Transmitter {
+        action: TransmitterAction::Enable,
+        transmitter: 0,
+        mode: TransmitterMode::Hdmi,
+        lanes: 4,
+        hpd: Some(3),
+        connector: 0,
+        symbol_khz: 594_000,
+    };
+    if tables.set_pixel_clock(bus.clone(), &clock).is_err()
+        || tables.hdmi_stream_setup(bus.clone(), 0, 594_000).is_err()
+        || tables.transmitter(bus.clone(), &transmitter).is_err()
+        || !bus.borrow().writes.is_empty()
+    {
+        return TestResult::Fail("missing board display tables blocked DMUB commands");
+    }
+    let sent = dmcub.0.lock();
+    if sent.len() != 3
+        || sent[2]
+            != (
+                VbiosCommand::Dig1TransmitterControl,
+                transmitter.params(7, 0).unwrap().to_vec(),
+            )
+    {
+        return TestResult::Fail("missing transmitter table did not select v1.7 DMUB union");
+    }
+    // Without an authenticated, running DMUB route this board cannot silently
+    // execute a missing pixel-clock table through the interpreter.
+    if Tables::new(&image)
+        .unwrap()
+        .set_pixel_clock(bus.clone(), &clock)
+        != Err(Error::Missing(12))
+    {
+        return TestResult::Fail("missing board table invented an ATOM fallback");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-bios",
+    rx6750xt_missing_display_tables_use_dmub_v17_fallback
+);
+
 /// dmub_cmd.h: header type DMUB_CMD__VBIOS (128), sub_type 0..3,
 /// payload_bytes = sizeof(cmd) - sizeof(header) under pack(1).
 fn navi22_bios_dmub_vbios_command_layout_matches_dmub_cmd_h() -> TestResult {
