@@ -793,6 +793,13 @@ impl Reader {
         self.node.readiness.arm_persistent(id, interest, waker)
     }
 
+    /// Persistently arm an exclusive epoll registration on this event ring.
+    pub fn arm_readiness_persistent_exclusive(&self, id: u64, interest: u32, waker: &Waker) -> u32 {
+        self.node
+            .readiness
+            .arm_persistent_exclusive(id, interest, waker)
+    }
+
     /// Remove this task's poll/epoll registration from the device cell.
     pub fn disarm_readiness(&self, task_id: u64) {
         self.node.readiness.disarm(task_id);

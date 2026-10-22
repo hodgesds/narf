@@ -560,6 +560,18 @@ impl FileOps for InputEventFile {
             .map(|reader| reader.arm_readiness_persistent(id, interest, waker))
     }
 
+    fn arm_readiness_persistent_exclusive(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        self.reader
+            .lock()
+            .as_ref()
+            .map(|reader| reader.arm_readiness_persistent_exclusive(id, interest, waker))
+    }
+
     fn disarm_readiness(&self, task_id: u64) -> bool {
         if let Some(reader) = self.reader.lock().as_ref() {
             reader.disarm_readiness(task_id);

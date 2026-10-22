@@ -169,6 +169,11 @@ pub struct UserTaskCtx {
     /// That closes the level-triggered scan→register race without treating
     /// unrelated changes to the global readiness generation as our event.
     pub epoll_wait_fd: AtomicU64,
+    /// Task-owned intrusive epoll wait node. A blocking epoll syscall can be on
+    /// only one instance queue at a time, so embedding one stable Arc gives
+    /// registration, wake selection, re-arm, and removal O(1) linkage without
+    /// a task-id map or callback-time allocation.
+    pub(crate) epoll_wait_node: alloc::sync::Arc<crate::epoll::EpollWaitNode>,
     /// Futex word address this task is blocked on (`FUTEX_WAIT`), or 0 when
     /// not futex-waiting. Set by `sys_futex` before it yields; the poll
     /// routine registers `cx.waker()` in the per-uaddr futex wait queue so a
@@ -752,6 +757,7 @@ impl UserTaskCtx {
             epoll_park_gen: AtomicU64::new(0),
             signal_park_gen: AtomicU64::new(0),
             epoll_wait_fd: AtomicU64::new(0),
+            epoll_wait_node: crate::epoll::EpollWaitNode::new(),
             futex_uaddr: AtomicU64::new(0),
             futex_namespace: AtomicU64::new(0),
             futex_park_gen: AtomicU64::new(0),
@@ -800,6 +806,15 @@ impl UserTaskCtx {
             dbg_poll_strand_latch: AtomicU64::new(0),
             sigreturn_stack: UnsafeCell::new(alloc::vec::Vec::new()),
         }
+    }
+}
+
+impl Drop for UserTaskCtx {
+    fn drop(&mut self) {
+        // A fatal/forced task exit can bypass epoll_wait's ordinary return path.
+        // Detach its task-owned node while waker destruction is still safely in
+        // task teardown context.
+        crate::epoll::detach_task_wait_node(&self.epoll_wait_node);
     }
 }
 

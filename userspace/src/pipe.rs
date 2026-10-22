@@ -1086,6 +1086,21 @@ impl FileOps for PipeRead {
         Some(self.shared.readiness.arm_persistent(id, interest, waker))
     }
 
+    fn arm_readiness_persistent_exclusive(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        self.shared.poll_usage.store(true, Ordering::Release);
+        self.shared.activate_readiness();
+        Some(
+            self.shared
+                .readiness
+                .arm_persistent_exclusive(id, interest, waker),
+        )
+    }
+
     fn is_stream(&self) -> bool {
         // A pipe is a non-seekable byte stream: reject it as a `sendfile(2)`
         // source (EINVAL) so busybox `cat` (which sendfiles pipe→file) falls
@@ -1248,6 +1263,21 @@ impl FileOps for PipeWrite {
         self.shared.poll_usage.store(true, Ordering::Release);
         self.shared.activate_readiness();
         Some(self.shared.readiness.arm_persistent(id, interest, waker))
+    }
+
+    fn arm_readiness_persistent_exclusive(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        self.shared.poll_usage.store(true, Ordering::Release);
+        self.shared.activate_readiness();
+        Some(
+            self.shared
+                .readiness
+                .arm_persistent_exclusive(id, interest, waker),
+        )
     }
 
     fn write_should_block(&self) -> bool {

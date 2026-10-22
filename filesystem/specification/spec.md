@@ -327,6 +327,10 @@ pub trait FileOps {
         -> Option<Poll<u32>>;
     fn arm_readiness_exclusive(&self, task_id: u64, interest: u32, waker: &Waker)
         -> Option<Poll<u32>>;
+    fn arm_readiness_persistent(&self, id: u64, interest: u32, waker: &Waker)
+        -> Option<u32>;
+    fn arm_readiness_persistent_exclusive(&self, id: u64, interest: u32, waker: &Waker)
+        -> Option<u32>;
     fn disarm_readiness(&self, task_id: u64) -> bool;
     fn drm_execbuf_fence(&self) -> Option<Arc<dyn DrmFence>>;
     fn drm_execbuf_context(&self, ring_idx: u32) -> Option<u64>;
@@ -458,7 +462,12 @@ epoll instance acknowledges that edge.
 delegates to ordinary `arm_readiness`; providers backed by a Linux-style
 exclusive wait queue override it so one consumable event wakes one syscall.
 Poll and epoll continue to use non-exclusive `arm_readiness` and persistent
-registration, respectively, and therefore all observe the event.
+registration, respectively, and therefore all observe the event. An epoll
+registration carrying `EPOLLEXCLUSIVE` uses
+`arm_readiness_persistent_exclusive`: selection happens on the provider's
+readiness queue, keyed by the persistent subscription id, and one matching
+exclusive epoll registration is rotated per event. It is never arbitrated by a
+process-local numeric fd.
 `open_instance_checked` runs after open permission checks, accepts whether
 write access was requested, and can reject the open. It defaults to calling
 `open_instance`; `O_PATH` bypasses per-open setup. Procfs map nodes use it to

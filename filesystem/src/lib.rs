@@ -1480,10 +1480,11 @@ pub trait FileOps: Send + Sync {
     /// stays live for the fd's whole membership in the set (never consumed on
     /// readiness). Returns `Some(current_ready_bits)` if the file is on the
     /// durable readiness path (so the caller can seed an initial ready-list
-    /// edge), `None` if it has no cell (timerfd / raw netlink / nested epoll —
-    /// those fall back to the full-scan + rising-mask path). The default arms the
+    /// edge), `None` if it has no cell (timerfd / raw netlink / other legacy
+    /// providers fall back to the cold scan + rising-mask path). The default arms the
     /// single directly-owned cell; composite / behind-a-lock files (sockets)
-    /// override to reconcile then persistently arm each of their cells.
+    /// override to persistently arm and, where necessary, reconcile each of
+    /// their cells without opening a check-before-register window.
     fn arm_readiness_persistent(
         &self,
         id: u64,
@@ -1492,6 +1493,23 @@ pub trait FileOps: Send + Sync {
     ) -> Option<u32> {
         self.readiness()
             .map(|r| r.arm_persistent(id, interest, waker))
+    }
+
+    /// Register a persistent `EPOLLEXCLUSIVE` observer on the provider's wait
+    /// queue. The default covers directly-owned readiness cells; composite or
+    /// lock-guarded providers override it just like
+    /// [`Self::arm_readiness_persistent`].
+    fn arm_readiness_persistent_exclusive(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        if let Some(readiness) = self.readiness() {
+            Some(readiness.arm_persistent_exclusive(id, interest, waker))
+        } else {
+            self.arm_readiness_persistent(id, interest, waker)
+        }
     }
 
     /// Remove `task_id`'s registration from this file's durable readiness.

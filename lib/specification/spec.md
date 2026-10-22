@@ -218,6 +218,9 @@ impl Readiness {
     pub fn arm_exclusive(&self, id: u64, interest: u32, waker: &Waker)
         -> Poll<u32>;
     pub fn arm_persistent(&self, id: u64, interest: u32, waker: &Waker) -> u32;
+    pub fn arm_persistent_exclusive(
+        &self, id: u64, interest: u32, waker: &Waker
+    ) -> u32;
     pub fn set(&self, add: u32, clear: u32);
     pub fn set_event(&self, add: u32, clear: u32, event: u32);
     pub fn set_event_with_exclusive_id(
@@ -237,19 +240,21 @@ impl Readiness {
 wakes all of them. `arm_exclusive` joins a FIFO in which each matching event
 wakes at most one waiter, after the non-exclusive observers. Selection removes
 only the waiter's integer FIFO entry in the event path; its allocation-bearing
-waker remains stored until task-context re-arm or disarm. This matches Linux
-wait-queue exclusivity without permitting a waker drop or allocation in IRQ
-context. All arm variants check the current level under the same lock used by
-`set`, preserving the lost-wake-free contract. `set_event` folds a same-level
+waker remains stored until task-context re-arm or disarm.
+`arm_persistent_exclusive` is the epoll form: selection leaves the registration
+armed and rotates its integer id to the FIFO tail, so successive source events
+are distributed among exclusive epoll subscriptions in O(1). This matches
+Linux wait-queue exclusivity without permitting a waker drop or allocation in
+IRQ context. All arm variants check the current level under the same lock used
+by `set`, preserving the lost-wake-free contract. `set_event` folds a same-level
 provider notification into the state publication so one operation cannot
 select two exclusive waiters. `set_event_with_exclusive_id` performs the same
 atomic publication and additionally returns the selected exclusive waiter's id
 after its waker has fired, allowing a provider to request a scheduler handoff
 without coupling this primitive to the scheduler. It returns `None` when only
 ordinary observers fired or the event made no waiter eligible. `set_wake_all` is
-the terminal-state form: it
-wakes and logically dequeues all exclusive waiters without dropping their
-wakers.
+the terminal-state form: it wakes and logically dequeues all exclusive waiters
+without dropping their wakers.
 
 `set_event_with_continuation` publishes directed provider events and relays
 remaining work to one exclusive waiter in the other direction. Pipes use OUT

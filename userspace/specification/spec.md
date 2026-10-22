@@ -522,6 +522,22 @@ duplicate descriptor keeps the watch live after the original descriptor
 closes, and final close invalidates the watch without the epoll instance
 artificially retaining the file. `EPOLLERR` and `EPOLLHUP` are delivered
 regardless of the registered interest mask, matching Linux epoll semantics.
+Each durable interest owns an intrusive ready-list node with four states:
+idle, queued, polling, and pending. Dequeue transfers one occurrence to exactly
+one collector; a provider callback racing the unlocked poll records pending and
+write-back republishes it exactly once. Enqueue, dequeue, callback coalescing,
+and deletion are O(1); only providers without a durable readiness cell occupy a
+separate fallback-poll set. Blocking epoll waiters likewise use one task-owned
+intrusive node, split into eligible and selected queue partitions, so selection,
+re-arm, timeout/signal removal, and forced-exit cleanup are O(1) and the IRQ
+callback neither allocates nor drops a waker.
+Every ADD/MOD provider arm carries a fresh immutable subscription id. Completion
+may publish cell/fallback metadata only while that exact id remains current;
+stale work disarms only its own id. Delivery similarly validates the sampled id
+under the registration-state lock before acknowledging provider state, advancing
+the edge mask, or disarming a one-shot. Cold fallback and forwarded-deadline
+indexes are keyed by both registration identity and subscription id, so delayed
+cleanup cannot remove a replacement that reused the same numeric fd.
 `poll(2)` and `ppoll(2)` likewise report `POLLERR`, `POLLHUP`, and
 `POLLNVAL` without requiring those bits in the requested event mask.
 `select(2)` and `pselect6(2)` use Linux's distinct fd-set mapping: hangup and
@@ -541,18 +557,21 @@ Both raw syscalls retain nanosecond deadline precision and best-effort write
 the remaining timeout back without replacing the syscall's primary result if
 that write-back faults.
 An epoll wait accepts at most `maxevents` entries. Only entries actually
-returned to the caller advance edge-trigger tokens, acknowledge provider-local
-readiness, take an exclusive claim, or disarm `EPOLLONESHOT`; additional ready
-entries remain pending for a later wait. Successive waits round-robin through
-ready level-triggered entries when the ready set exceeds `maxevents`.
+returned to the caller advance edge-trigger state, acknowledge provider-local
+readiness, or disarm `EPOLLONESHOT`; additional ready entries remain pending
+for a later wait. Successive waits round-robin through ready level-triggered
+entries when the ready set exceeds `maxevents`. `EPOLLEXCLUSIVE` arbitration is
+attached to the watched provider's readiness queue and keyed by the persistent
+subscription id: one matching exclusive epoll registration is selected and
+rotated per source event, independent of process-local descriptor numbers.
 Poll and epoll pass the file-description offset to offset-sensitive readiness
 providers; `/dev/kmsg` is readable only while unread snapshot bytes remain.
-Edge-triggered epoll also records provider-local monotonic state tokens.
-Connected socket rings advance their token only on readiness transitions
-(empty to non-empty, full to non-full, and closure), so reads and writes that
-leave readiness unchanged do not synthesize edges. A drain followed by new
-data before the next `epoll_wait` remains a deliverable edge even though both
-sampled readiness masks contain `POLL_IN`.
+Edge-triggered epoll records the last sampled mask and treats durable ready-list
+membership as a fresh provider occurrence. Reads and writes that leave
+readiness unchanged do not synthesize edges unless the provider explicitly
+publishes a same-level event. A drain followed by new data before the next
+`epoll_wait` remains deliverable even though both sampled masks contain
+`POLL_IN`.
 Blocking stream `send(2)`, `write(2)`, and `sendmsg(2)` (TCP and AF_UNIX)
 wait for the connected ring's durable writable readiness in place, keeping
 the committed prefix in the handler, and continue with the unsent suffix
@@ -939,9 +958,11 @@ register after the edge it was waiting for — the lost-wakeup race is
 unrepresentable rather than merely guarded by a re-checked generation and a
 fallback tick. Every readiness change wakes all intersecting ordinary waiters
 and the oldest intersecting exclusive waiter intrinsically (there is no
-per-source "does this notify" flag to drift out of sync), and the level mask and
-the edge sequence advance together under that same lock. The wake this delivers
-is required to be durable end-to-end: a readiness
+per-source "does this notify" flag to drift out of sync). Persistent exclusive
+epoll observers rotate to the queue tail after selection; one-shot blocking
+syscall waiters remain logically dequeued until re-arm. The level mask and the
+edge sequence advance together under that same lock. The wake this delivers is
+required to be durable end-to-end: a readiness
 source firing from IRQ context re-queues the stable, task-id-addressed run slot
 with a lossless atomic, never an allocation-bearing waker drop deferred through
 a bounded queue — so a readiness edge is never dropped and then recovered only

@@ -2134,6 +2134,16 @@ impl narf_filesystem::FileOps for CurrentTtyFile {
         self.inner.arm_readiness_persistent(id, interest, waker)
     }
 
+    fn arm_readiness_persistent_exclusive(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        self.inner
+            .arm_readiness_persistent_exclusive(id, interest, waker)
+    }
+
     fn disarm_readiness(&self, task_id: u64) -> bool {
         self.inner.disarm_readiness(task_id)
     }

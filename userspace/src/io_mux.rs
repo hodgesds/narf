@@ -588,21 +588,32 @@ impl FileOps for SignalFd {
         Some(&self.readiness)
     }
 
-    /// Reconcile the cell to the live pending level before arming so a stale
-    /// latched POLL_IN (a signal drained since the last wake) can't spuriously
-    /// return Ready. `wake_signalfds` re-latches + notifies on the next raise.
+    /// Publish the waiter before reconciling the cell to the live pending level.
+    /// This both clears a stale POLL_IN after a drain and makes a signal racing
+    /// the external-state sample durable through the already-installed waker.
+    /// `wake_signalfds` re-latches + notifies on every raise.
     fn arm_readiness(
         &self,
         task_id: u64,
         interest: u32,
         waker: &core::task::Waker,
     ) -> Option<core::task::Poll<u32>> {
+        // Publish the waiter before sampling the external signal bitmap. If a
+        // signal lands between that sample and level reconciliation, its cell
+        // wake is already captured even if the sampled clear wins the level.
+        self.readiness.arm_persistent(task_id, interest, waker);
         let readable = self.pending_in_mask() != 0;
         self.readiness.set(
             if readable { POLL_IN } else { 0 },
             if readable { 0 } else { POLL_IN },
         );
-        Some(self.readiness.arm(task_id, interest, waker))
+        let ready = self.readiness.mask() & interest;
+        if ready != 0 {
+            self.readiness.disarm(task_id);
+            Some(core::task::Poll::Ready(ready))
+        } else {
+            Some(core::task::Poll::Pending)
+        }
     }
 
     fn arm_readiness_persistent(
@@ -611,12 +622,28 @@ impl FileOps for SignalFd {
         interest: u32,
         waker: &core::task::Waker,
     ) -> Option<u32> {
+        self.readiness.arm_persistent(id, interest, waker);
         let readable = self.pending_in_mask() != 0;
         self.readiness.set(
             if readable { POLL_IN } else { 0 },
             if readable { 0 } else { POLL_IN },
         );
-        Some(self.readiness.arm_persistent(id, interest, waker))
+        Some(self.readiness.mask() & interest)
+    }
+
+    fn arm_readiness_persistent_exclusive(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        self.readiness.arm_persistent_exclusive(id, interest, waker);
+        let readable = self.pending_in_mask() != 0;
+        self.readiness.set(
+            if readable { POLL_IN } else { 0 },
+            if readable { 0 } else { POLL_IN },
+        );
+        Some(self.readiness.mask() & interest)
     }
 }
 
