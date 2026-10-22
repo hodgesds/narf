@@ -1347,6 +1347,15 @@ impl FileOps for OverlayFile {
         self.active().mmap_backing_identity()
     }
 
+    /// Pin whichever layer is active at publication. A later copy-up (a
+    /// write through this same overlay file) flips `active()` for the
+    /// read/write path only; it must not retarget faults in a mapping that
+    /// already exists, or one VMA would silently mix lower and upper
+    /// pages. Linux `ovl_mmap` pins the real file the same way.
+    fn mmap_pinned_file(&self, _own: Arc<dyn FileOps>) -> Arc<dyn FileOps> {
+        self.active()
+    }
+
     fn splice_read_page(
         &self,
         offset: u64,

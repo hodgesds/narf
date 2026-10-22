@@ -397,6 +397,12 @@ unsafe fn load_image_into_at<S: crate::elf::ExecBytes + ?Sized>(
         RegionPerms::default()
     };
 
+    // A demand segment faults through its registered owner for the life
+    // of the image, so it takes the same publication pin as a file
+    // mapping (`FileOps::mmap_pinned_file`): an overlay executable must
+    // not switch layers under a running image.
+    let pinned_file = file.map(|ops| ops.mmap_pinned_file(alloc::sync::Arc::clone(ops)));
+
     let mut cursor: usize = 0;
     for (index, (seg, &(file_pages, memory_pages))) in
         image.segments.iter().zip(page_counts.iter()).enumerate()
@@ -425,7 +431,7 @@ unsafe fn load_image_into_at<S: crate::elf::ExecBytes + ?Sized>(
 
         if file_pages != 0 {
             if is_demand {
-                let ops = file.expect("demand implies a file source");
+                let ops = pinned_file.as_ref().expect("demand implies a file source");
                 let len = (file_pages as u64) << 12;
                 let region = Region {
                     base: VirtAddr::new(region_base),

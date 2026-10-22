@@ -1668,6 +1668,29 @@ pub trait FileOps: Send + Sync {
         false
     }
 
+    /// Resolve the file object a new mapping of this file must fault from
+    /// for the mapping's whole lifetime. The syscall layer calls this once
+    /// at `mmap` publication, passing the mapping's own reference (`own`),
+    /// and registers the result as the VMA's file owner: every later demand
+    /// fault, shared-page cache lookup and writeback for that VMA talks to
+    /// the returned object, never to `self` again, and the returned object's
+    /// [`FileOps::mmap_backing_identity`] is the mapping's stable identity.
+    ///
+    /// The default keeps the file itself. A wrapper whose forwarding
+    /// target can change under a live mapping — overlayfs, whose
+    /// `active()` flips from the lower to the upper file at copy-up —
+    /// must override this to return the file that is current *now*, so a
+    /// copy-up after publication cannot retarget an existing VMA's faults
+    /// to a different file. Linux pins the real file in the VMA at `mmap`
+    /// time for the same reason (`ovl_mmap`); a fresh mapping created
+    /// after the switch resolves afresh and pins the new target.
+    fn mmap_pinned_file(
+        &self,
+        own: alloc::sync::Arc<dyn FileOps>,
+    ) -> alloc::sync::Arc<dyn FileOps> {
+        own
+    }
+
     /// Stable identity of the object whose direct mmap pages this operation
     /// exposes. Wrappers which forward `mmap_fault` and `truncate` to another
     /// file must forward this too, so truncation can find their VMA owners.
