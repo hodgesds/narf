@@ -5,14 +5,24 @@
 use super::*;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-/// `gmc_v12_dcc_alignment`, `dcc_block_size` and the first-fit block plus
-/// `dcc_trim_start` give Linux's answer for every line of
-/// tests/amdgpu_dcc_vram/vectors.txt (the harness's buddy hands out a
-/// power-of-two block at its own alignment from the first free byte, as
-/// `Pool::reserve_dcc` places one).
+/// `gmc_v12_dcc_alignment`, `dcc_block_size` and production
+/// `Pool::reserve_dcc` give Linux's answer for every line of
+/// tests/amdgpu_dcc_vram/vectors.txt: a bookkeeping-only pool whose VRAM
+/// offset 0 is its start and whose first free byte is the vector's base
+/// (the harness's buddy hands out a power-of-two block at its own
+/// alignment from there) places the buffer at Linux's trimmed start, and
+/// holds only its own pages (the rest of the block is free again).
 fn dcc_vram_placement_matches_linux_vectors() -> TestResult {
     use core::fmt::Write as _;
     const VECTORS: &str = include_str!("../tests/amdgpu_dcc_vram/vectors.txt");
+    const LEN: u64 = 1 << 30;
+    let origin = 0x8_0000_0000u64;
+    let map = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(0),
+        virt: 0,
+        len: LEN,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
     let mut lines = 0;
     let mut got = alloc::string::String::new();
     for line in VECTORS.lines().filter(|l| !l.starts_with('#')) {
@@ -45,10 +55,31 @@ fn dcc_vram_placement_matches_linux_vectors() -> TestResult {
             continue;
         }
         let block = crate::amdgpu_vram::dcc_block_size(size, u64::from(alignment));
-        let start = base
-            .checked_next_multiple_of(block)
-            .and_then(|b| crate::amdgpu_vram::dcc_trim_start(b, u64::from(alignment)));
-        let _ = write!(got, " {block} {}", start.unwrap_or(u64::MAX));
+        let held = if base == 0 {
+            alloc::vec![]
+        } else {
+            alloc::vec![0..base]
+        };
+        // SAFETY: bookkeeping only; nothing accesses the (null) mapping.
+        let Ok(pool) =
+            (unsafe { crate::amdgpu_vram::Pool::from_owned_aperture(map, origin, &held) })
+        else {
+            return TestResult::Fail("vector pool");
+        };
+        let free = pool.available();
+        let start = match pool.reserve_dcc(size, u64::from(alignment), origin) {
+            Ok(r) => {
+                if pool.available() != free - size.next_multiple_of(4096) {
+                    return TestResult::Fail("DCC block not trimmed to the buffer");
+                }
+                r.address() - origin
+            }
+            Err(_) => u64::MAX,
+        };
+        let _ = write!(got, " {block} {start}");
+        if pool.available() != free {
+            return TestResult::Fail("dropping the DCC reservation leaked VRAM");
+        }
         if got != want {
             return TestResult::Fail("DCC placement differs from Linux");
         }
@@ -59,6 +90,71 @@ fn dcc_vram_placement_matches_linux_vectors() -> TestResult {
     }
     TestResult::Pass
 }
+
+/// Where no power-of-two DCC block is free, `Pool::reserve_dcc` places the
+/// buffer at its own size from the first multiple of the DCC alignment
+/// without temporary block rounding, and refuses only when that does not
+/// fit either. This native fallback preserves contiguous DCC placement;
+/// it does not model Linux's buddy-allocation retry.
+fn dcc_vram_falls_back_to_the_aligned_size() -> TestResult {
+    let map = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(0),
+        virt: 0,
+        len: 1 << 20,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    // 192 KiB alignment, 64 KiB buffer: the preferred block is 256 KiB. Held:
+    // [0, 4 KiB), [512 KiB, 516 KiB) and [768 KiB, 772 KiB).
+    let held = [0..0x1000, 0x8_0000..0x8_1000, 0xc_0000..0xc_1000];
+    // Alignment is relative to VRAM offset zero, including when that
+    // origin is not itself aligned to the preferred 256 KiB block.
+    for origin in [0x8_0000_0000u64, 0x8_0002_1000] {
+        // SAFETY: bookkeeping only; neither pool is accessed by CPU or GPU.
+        let pool =
+            unsafe { crate::amdgpu_vram::Pool::from_owned_aperture(map, origin, &held) }.unwrap();
+        // SAFETY: the same exclusive bookkeeping-only range, in a separate model.
+        let hidden =
+            unsafe { crate::amdgpu_vram::UnmappedPool::from_owned(origin, map.len, &held) }
+                .unwrap();
+        let free = pool.available();
+        let mut visible = alloc::vec::Vec::new();
+        let mut invisible = alloc::vec::Vec::new();
+        // Preferred block first, then smaller gaps and the final aligned
+        // interval at the end of the pool. Hold all reservations together.
+        for expected in [0x6_0000, 0x3_0000, 0x9_0000, 0xf_0000] {
+            let Ok(v) = pool.reserve_dcc(0x1_0000, 196_608, origin) else {
+                return TestResult::Fail("visible DCC placement in fragmented VRAM");
+            };
+            let Ok(h) = hidden.reserve_dcc(0x1_0000, 196_608, origin) else {
+                return TestResult::Fail("invisible DCC placement in fragmented VRAM");
+            };
+            if v.address() - origin != expected || h.address() != v.address() {
+                return TestResult::Fail("DCC alignment was not relative to VRAM origin");
+            }
+            visible.push(v);
+            invisible.push(h);
+        }
+        if pool.reserve_dcc(0x1_0000, 196_608, origin).err()
+            != Some(crate::amdgpu_vram::Error::Exhausted)
+            || hidden.reserve_dcc(0x1_0000, 196_608, origin).err()
+                != Some(crate::amdgpu_vram::Error::Exhausted)
+            || pool.available() != free - 4 * 0x1_0000
+            || hidden.available() != pool.available()
+        {
+            return TestResult::Fail("DCC fallback overlapped or escaped its pool");
+        }
+        drop(visible);
+        drop(invisible);
+        if pool.available() != free || hidden.available() != free {
+            return TestResult::Fail("DCC fallback did not release its exact ranges");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/render-abi",
+    dcc_vram_falls_back_to_the_aligned_size
+);
 kernel_test_in!(
     "drivers/gpu/amdgpu/render-abi",
     dcc_vram_placement_matches_linux_vectors

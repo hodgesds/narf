@@ -189,6 +189,10 @@ pub(crate) fn backing(
             backing,
             published: AtomicBool::new(false),
         })),
+        // Linux TTM's WC request persists across relocation: VRAM BAR leaves use
+        // WC, while memory/ keeps each System RAM leaf write-back to match
+        // its direct-map alias. A later promotion recomputes WC again.
+        memory_type: narf_memory::MemoryType::WriteCombining,
     })
 }
 

@@ -380,7 +380,7 @@ fn dcn401_mpc_late_changes_fail_closed_and_reprepare_invalidates_reports() -> Te
                         pipe: 0,
                         depth: ColorDepth::Bpc12,
                         limited: false,
-                        ycbcr420: false,
+                        encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
                         colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(
                             false, false,
                         ),
@@ -426,7 +426,8 @@ fn dcn401_mpc_loads_ycbcr709_output_csc_for_420() -> TestResult {
     for signal in [Signal::Tmds, Signal::HdmiFrl] {
         let p = 1u8;
         let mut mode = small(p);
-        (mode.timing.signal, mode.timing.ycbcr420) = (signal, true);
+        (mode.timing.signal, mode.timing.encoding) =
+            (signal, crate::amdgpu_hdr::PixelEncoding::Ycbcr420);
         mode.timing.timing.h_active = 64;
         mode.surface.width = 64;
         mode.clock = clock(mode.timing);
@@ -445,7 +446,7 @@ fn dcn401_mpc_loads_ycbcr709_output_csc_for_420() -> TestResult {
             (csc(5), 0xf533_fcca), // Cb: -0.1006 R, -0.3368 G
             (csc(6), 0x1004_0e04), //     0.4375 B, + 0x1004 offset
         ];
-        if !a.ycbcr420
+        if !a.encoding.is_420()
             || a.limited
             || want.iter().any(|&(at, v)| f.regs[&at] != v)
             || f.regs[&csc(0)] & 3 != 1
@@ -483,7 +484,8 @@ fn dcn401_mpc_loads_the_output_csc_of_the_color_space() -> TestResult {
     ] {
         let p = 1u8;
         let mut mode = small(p);
-        (mode.timing.signal, mode.timing.ycbcr420) = (Signal::Tmds, true);
+        (mode.timing.signal, mode.timing.encoding) =
+            (Signal::Tmds, crate::amdgpu_hdr::PixelEncoding::Ycbcr420);
         mode.timing.timing.h_active = 64;
         mode.surface.width = 64;
         mode.clock = clock(mode.timing);

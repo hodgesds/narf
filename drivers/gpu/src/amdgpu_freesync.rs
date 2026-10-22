@@ -6,12 +6,10 @@
 //! and modules/freesync `mod_freesync_build_vrr_params` /
 //! `mod_freesync_calc_v_total_from_refresh`. Integer arithmetic only.
 //!
-//! Supported: DP SST sinks whose EDID declares a "range limits only" range
-//! and whose DPCD sets MSA_TIMING_PAR_IGNORED. Gaps (not implemented, the sink
-//! is then not VRR-capable here): HDMI FreeSync (it needs the AMD VSDB, as
-//! Linux does), DisplayID adaptive-sync ranges (eDP), DP MST, PCON
-//! whitelists, MCCS (DDC/CI) FreeSync control, below-the-range low framerate
-//! compensation (BTR/LFC) and the AMD FreeSync VSIF/SDP infopacket.
+//! DP SST supports range descriptors or DisplayID fallback with ignored MSA;
+//! HDMI uses the authenticated DMUB AMD VSDB parser. Ordinary SPD publication
+//! is owned with DRR. BTR cadence has retained native frame service;
+//! MST/PCON negotiation and MCCS retain their separate contracts.
 use crate::amdgpu_dml::Timing;
 
 /// freesync.c MIN_REFRESH_RANGE: narrower ranges stay at fixed refresh.
@@ -24,6 +22,58 @@ pub const MAX_V_TOTAL: u32 = (1 << 15) - 1;
 pub struct MonitorRange {
     pub min_vfreq: u16,
     pub max_vfreq: u16,
+}
+
+/// Firmware-parsed AMD vendor data from the HDMI sink's CTA block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AmdVsdb {
+    pub version: u16,
+    pub min_hz: u16,
+    pub max_hz: u16,
+    pub vcp_code: u8,
+}
+impl AmdVsdb {
+    /// A nonzero VCP code requires a successful MCCS negotiation before the
+    /// sink may be advertised; no DDC/CI support is inferred from its EDID.
+    pub fn range(self) -> Option<VrrRange> {
+        (self.min_hz != 0
+            && self.max_hz.saturating_sub(self.min_hz) > MIN_REFRESH_RANGE_HZ as u16
+            && self.vcp_code == 0)
+            .then_some(VrrRange {
+                min_hz: self.min_hz,
+                max_hz: self.max_hz,
+            })
+    }
+}
+
+/// amdgpu_dm's DisplayID dynamic-video-timing-range fallback. Linux
+/// searches the first declared DisplayID extension; use only bounds that
+/// fit inside that actual block and accept revision0/1, length9 as it does.
+pub fn displayid_range(edid: &[u8]) -> Option<MonitorRange> {
+    let base = edid.get(..128)?;
+    let ext = edid
+        .chunks_exact(128)
+        .skip(1)
+        .take(usize::from(base[126]))
+        .find(|b| b[0] == 0x70)?;
+    for j in 0..115 {
+        if ext[j] == 0x25 && ext[j + 1] & 0xfe == 0 && ext[j + 2] == 9 {
+            let min = u16::from(ext[j + 9]);
+            let max = u16::from(ext[j + 10])
+                | if ext[j + 1] & 7 != 0 {
+                    u16::from(ext[j + 11] & 3) << 8
+                } else {
+                    0
+                };
+            if min != 0 && max != 0 {
+                return Some(MonitorRange {
+                    min_vfreq: min,
+                    max_vfreq: max,
+                });
+            }
+        }
+    }
+    None
 }
 
 /// The display descriptor tag of a Monitor Range Limits descriptor.
@@ -126,12 +176,14 @@ impl VrrRange {
 
 /// amdgpu_dm_update_freesync_caps for a DP SST sink: the EDID range when the
 /// DPCD allows invalid MSA timing and the range is more than 10 Hz wide.
-/// HDMI (AMD VSDB) and DisplayID ranges are not implemented.
+/// DisplayID dynamic range supplies missing monitor-range bounds.
 pub fn dp_sst_caps(edid: &[u8], dpcd: &[u8; 16]) -> Option<VrrRange> {
     if dpcd[7] & DPCD_MSA_TIMING_PAR_IGNORED == 0 {
         return None;
     }
-    let r = monitor_range(edid)?;
+    let r = monitor_range(edid)
+        .filter(|r| r.min_vfreq != 0 && r.max_vfreq != 0)
+        .or_else(|| displayid_range(edid))?;
     // `max_vfreq - min_vfreq > 10` in Linux's int arithmetic.
     (i32::from(r.max_vfreq) - i32::from(r.min_vfreq) > 10).then_some(VrrRange {
         min_hz: r.min_vfreq,
@@ -202,7 +254,7 @@ pub fn calc_v_total_from_refresh(
 /// INACTIVE totals) when the remaining range is under 10 Hz, the mode is not
 /// within the sink's range, or a total exceeds max_v_total (where
 /// dc_stream_adjust_vmin_vmax refuses).
-pub fn drr(t: &Timing, range: VrrRange) -> Option<Drr> {
+fn effective_range(t: &Timing, range: VrrRange) -> Option<(u64, u64)> {
     if !range.supports(t) || t.h_total == 0 || t.v_total == 0 {
         return None;
     }
@@ -231,6 +283,11 @@ pub fn drr(t: &Timing, range: VrrRange) -> Option<Drr> {
     if range_hz < u64::from(MIN_REFRESH_RANGE_HZ) {
         return None;
     }
+    Some((min, max))
+}
+
+pub fn drr(t: &Timing, range: VrrRange) -> Option<Drr> {
+    let (min, max) = effective_range(t, range)?;
     let v_total_min = calc_v_total_from_refresh(t, max, 0, 0)?;
     let v_total_max = calc_v_total_from_refresh(t, min, 0, 0)?;
     if v_total_max > MAX_V_TOTAL || v_total_min > MAX_V_TOTAL || v_total_min > v_total_max {
@@ -241,6 +298,51 @@ pub fn drr(t: &Timing, range: VrrRange) -> Option<Drr> {
         v_total_max,
     })
 }
+
+/// AMD FreeSync SPD info packet (modules/freesync v1, the ordinary DP/HDMI
+/// path). A disabled stream reports nominal refresh in both rate bytes;
+/// active variable refresh reports the supported interval capped by the mode.
+/// PCON SDP 1.3 and replay's v2/v3 packets have separate negotiation.
+pub fn info_packet(
+    t: &Timing,
+    range: VrrRange,
+    hdmi: bool,
+    active: bool,
+) -> Option<crate::amdgpu_hdr::InfoPacket> {
+    drr(t, range)?;
+    let (min_uhz, max_uhz) = effective_range(t, range)?;
+    let max = (max_uhz + 500_000) / 1_000_000;
+    let min = if active {
+        (min_uhz + 500_000) / 1_000_000
+    } else {
+        max
+    };
+    let mut packet = crate::amdgpu_hdr::InfoPacket {
+        valid: true,
+        hb: if hdmi {
+            [0x83, 1, 8, 0]
+        } else {
+            [0, 0x83, 0x1b, 4]
+        },
+        sb: [0; 32],
+    };
+    packet.sb[1] = 0x1a;
+    packet.sb[6] = if active { 7 } else { 3 };
+    packet.sb[7] = min as u8;
+    packet.sb[8] = max as u8;
+    let payload = if hdmi { 8 } else { 27 };
+    let sum = packet
+        .hb
+        .iter()
+        .chain(&packet.sb[1..=payload])
+        .fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+    packet.sb[0] = 0u8.wrapping_sub(sum);
+    Some(packet)
+}
+
+#[path = "amdgpu_freesync_lfc.rs"]
+mod lfc;
+pub use lfc::{Lfc, LfcConfig};
 
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_freesync_tests.rs"]

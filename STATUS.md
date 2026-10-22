@@ -326,6 +326,34 @@ and pipe-harvesting differences (`amdgpu_rdna4`, checked against Linux by
 `drivers/gpu/tests/rdna4_family/check.sh`). Model-tested on Navi44 and
 harvested Navi48 profiles only; no Navi44 board has run it.
 
+RX 9000 follow-ups now retain an acquired Azalia audio endpoint per stream
+across TMDS, FRL, legacy DP and UHBR, including MST, independently of pipe
+and HPO encoder indices. Allocation follows Linux's `find_first_free_audio`;
+models cover mixed transports and the full endpoint acquisition masks.
+A delayed DET acknowledgment defers compressed-buffer growth for retry on
+the next display-monitor pass, retaining the current allocation until the
+freed segments are acknowledged. Scanout preparation now retains placement
+exclusion through KMS pin acquisition, including against synchronous memory
+pressure. DCC allocation can use fragmented gaps containing the final
+contiguous aligned buffer without requiring a larger temporary buddy block;
+Linux placement vectors now exercise the production reservation allocator.
+DML now allocates the shared DET pool using DC's pixel-rate/plane-bandwidth
+policy and applies the single-DP Vmin ODM phase, including after P-state
+search. Native requestors retain per-plane allocations through live updates;
+HDMI transport is an explicit admission input. Zero-stream release lowers
+DTBCLK, DISPCLK and DPPCLK, while optional DAL responses follow Linux's
+sent-timeout policy with retained failure ownership. Suspend gates/drains
+presenter and cursor pins, retires all display streams, and retains incomplete
+transitions through caller cancellation and rollback. An opt-in
+`cargo xtask gpu-reference` command checks primary harnesses against an
+explicit clean Linux Git revision. KMS preparation now snapshots exact targets,
+reclaims idle BOs without evicting another target, and rechecks master/identity
+before pinning. Per-card placement admission covers allocation, submission,
+transfer and reset; stale or cancelled transfers retain their staging/backing
+until actual completion or a proven reset. DSC depth/link fallback uses final
+native admission and complete MST payloads. Physical board acceptance and the
+GPU WC mapping follow-up after its separate TCB prerequisite remain open.
+
 Implemented: GDDR6 training; PSP14 SOS/GPCOM/TMR; mandatory graphics/media
 firmware parsing, upload and autoload; GC12 RS64 counter programming and pipe
 reset with inherited-queue exclusion; SMU14 board-table transfer and initial

@@ -55,7 +55,8 @@ fn inputs<'a>(w: &mut impl Iterator<Item = &'a str>) -> Option<Inputs> {
             v_sync_positive: true,
         };
         let mut mode = Mode::new(timing, 0, 0);
-        mode.ycbcr420 = v[9] != 0;
+        mode.encoding = crate::amdgpu_hdr::PixelEncoding::from_420(v[9] != 0);
+        mode.hdmi = mode.encoding.is_420();
         if !(1..=MAX_PLANES as u32).contains(&v[10]) {
             return None;
         }
@@ -459,16 +460,18 @@ fn dcn401_pstate_strategies_follow_linux_policy() -> TestResult {
         Ok(native) if native[0].pstate.is_none() && native[0].clocks.uclk_khz == 1_258_000 => {}
         _ => return TestResult::Fail("native plan changed"),
     }
-    // 4K60 cannot hide the blackout in vactive: vblank (400 us reserved)
-    // without FAMS2 firmware; with it Linux tries SubVP first, which the
-    // port leaves pinned.
-    match admit(&soc, &uclk, &[uhd()], false) {
-        Ok(Pstate::Supported(s))
-            if s.methods[0] == Method::Vblank && s.plans[0].stutter_reserved_us == 400 => {}
-        _ => return TestResult::Fail("4K60 vblank"),
-    }
-    if admit(&soc, &uclk, &[uhd()], true) != Ok(Pstate::Pinned(Pinned::Firmware(Method::FwSvp))) {
-        return TestResult::Fail("4K60 SubVP not pinned");
+    // DC gives one linear 4K60 plane the full 1280 KiB DET, enough to
+    // hide the blackout in vactive at the lowest UCLK, with or without
+    // FAMS2 firmware. The former fixed 320 KiB needed vblank/SubVP.
+    for fams2 in [false, true] {
+        match admit(&soc, &uclk, &[uhd()], fams2) {
+            Ok(Pstate::Supported(s))
+                if s.methods[0] == Method::Vactive
+                    && s.plans[0].stutter_reserved_us == 54
+                    && s.plans[0].det_bytes == 1280 * 1024
+                    && s.level == 0 => {}
+            _ => return TestResult::Fail("4K60 dynamic DET vactive"),
+        }
     }
     // Two identical 4K60 streams switch together in their shared vblank.
     match admit(&soc, &uclk, &[uhd(), uhd()], false) {

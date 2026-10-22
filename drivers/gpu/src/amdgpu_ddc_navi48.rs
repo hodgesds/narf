@@ -19,10 +19,19 @@ pub enum Error {
     Nack,
     InvalidEdid,
     EdidTooLarge,
+    InvalidMccs,
+    MccsUnsupported,
 }
 impl Error {
     pub(crate) fn local(self) -> bool {
-        matches!(self, Self::Nack | Self::InvalidEdid | Self::EdidTooLarge)
+        matches!(
+            self,
+            Self::Nack
+                | Self::InvalidEdid
+                | Self::EdidTooLarge
+                | Self::InvalidMccs
+                | Self::MccsUnsupported
+        )
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,11 +65,13 @@ impl Layout {
         self.dio + index * 4
     }
 }
-trait Io {
+trait Io: Send {
     fn read(&mut self, address: u64) -> u32;
     fn write(&mut self, address: u64, value: u32);
-    async fn delay(&mut self, us: u64) {
-        narf_time::SleepUntil::new(narf_time::Deadline::after_us(us).as_instant()).await;
+    fn delay(&mut self, us: u64) -> impl core::future::Future<Output = ()> + Send {
+        async move {
+            narf_time::SleepUntil::new(narf_time::Deadline::after_us(us).as_instant()).await;
+        }
     }
 }
 #[derive(Debug)]
@@ -122,6 +133,8 @@ enum Op2 {
     Segment(u8),
     Read(u8),
     Write(u8, u8),
+    RawRead(u8),
+    RawWrite(u8),
 }
 #[derive(Clone, Copy, Debug)]
 struct Saved {
@@ -138,7 +151,7 @@ struct Engine<I: Io> {
     saved: Option<[Saved; 7]>,
     state: State,
 }
-impl<I: Io> Engine<I> {
+impl<I: Io + Send> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> Result<T, Error>) -> Result<T, Error> {
         let io = &mut self.io;
         self.authority
@@ -263,6 +276,24 @@ impl<I: Io> Engine<I> {
                     io.write(l.at(0x1eb2), (u32::from(address) << 1 | 1) << 8);
                     1
                 }
+                Op2::RawRead(address) | Op2::RawWrite(address) => {
+                    let len = u32::try_from(block.len()).map_err(|_| Error::Invalid)?;
+                    if len == 0 || len > 128 || address >= 128 {
+                        return Err(Error::Invalid);
+                    }
+                    let reading = matches!(op, Op2::RawRead(_));
+                    io.write(l.at(0x1eae), len << 16 | 0x3100 | u32::from(reading));
+                    io.write(
+                        l.at(0x1eb2),
+                        0x80000000 | (u32::from(address) << 1 | u32::from(reading)) << 8,
+                    );
+                    if !reading {
+                        for &byte in block.iter() {
+                            io.write(l.at(0x1eb2), u32::from(byte) << 8);
+                        }
+                    }
+                    0
+                }
                 Op2::Write(address, value) => {
                     io.write(l.at(0x1eae), 0x00023100); // offset + data, START+STOP
                     io.write(l.at(0x1eb2), 0x80000000 | u32::from(address) << 9);
@@ -305,10 +336,12 @@ impl<I: Io> Engine<I> {
             }
             self.io.delay(100).await;
         }
-        if matches!(op, Op2::Read(_)) {
+        if matches!(op, Op2::Read(_) | Op2::RawRead(_)) {
             self.access(|io| {
-                // Three address/write bytes precede the read result in SRAM.
-                io.write(l.at(0x1eb2), 0x80030001);
+                // Offset reads have three preceding bytes; raw DDC/CI has
+                // only the read address and no synthetic register offset.
+                let index = if matches!(op, Op2::RawRead(_)) { 1 } else { 3 };
+                io.write(l.at(0x1eb2), 0x80000001 | index << 16);
                 for byte in block {
                     *byte = (read(io, l.at(0x1eb2))? >> 8) as u8;
                 }
@@ -383,6 +416,44 @@ impl<I: Io> Engine<I> {
         };
         result
     }
+    async fn mccs(
+        &mut self,
+        channel: u8,
+        generation: u64,
+        metadata: crate::amdgpu_freesync::AmdVsdb,
+    ) -> Result<mccs::Negotiated, Error> {
+        if self.state != State::Ready {
+            return Err(Error::Busy);
+        }
+        if channel >= 4 || generation == 0 {
+            return Err(Error::Invalid);
+        }
+        self.state = State::Acquiring;
+        let result = async {
+            self.acquire(channel).await?;
+            mccs::negotiate(
+                &mut MccsBus {
+                    engine: self,
+                    channel,
+                },
+                generation,
+                metadata,
+            )
+            .await
+        }
+        .await;
+        let result = if !result.as_ref().is_err_and(|e| !e.local()) {
+            self.release().await.and(result)
+        } else {
+            result
+        };
+        self.state = match result {
+            Ok(_) => State::Ready,
+            Err(e) if e.local() => State::Ready,
+            Err(e) => State::Failed(e),
+        };
+        result
+    }
     async fn edid(&mut self, channel: u8) -> Result<Vec<u8>, Error> {
         if self.state != State::Ready {
             return Err(Error::Busy);
@@ -443,6 +514,27 @@ impl<I: Io> Engine<I> {
         result
     }
 }
+#[path = "amdgpu_ddc_mccs.rs"]
+pub mod mccs;
+struct MccsBus<'a, I: Io> {
+    engine: &'a mut Engine<I>,
+    channel: u8,
+}
+impl<I: Io + Send> mccs::Bus for MccsBus<'_, I> {
+    async fn write(&mut self, bytes: &mut [u8]) -> Result<(), Error> {
+        self.engine
+            .transfer(self.channel, Op2::RawWrite(0x37), bytes)
+            .await
+    }
+    async fn read(&mut self, bytes: &mut [u8]) -> Result<(), Error> {
+        self.engine
+            .transfer(self.channel, Op2::RawRead(0x37), bytes)
+            .await
+    }
+    async fn delay(&mut self, us: u64) {
+        self.engine.io.delay(us).await;
+    }
+}
 #[derive(Debug)]
 pub struct Ddc(Engine<Mmio>);
 impl Ddc {
@@ -473,6 +565,17 @@ impl Ddc {
     /// I2C SRAM and the selected channel clock remain awake for later accesses.
     pub async fn edid(&mut self, channel: u8) -> Result<Vec<u8>, Error> {
         self.0.edid(channel).await
+    }
+    /// Negotiate AMD's advertised vendor VCP through DDC/CI. The shared
+    /// claim remains retained across waits and on uncertainty/cancellation;
+    /// a successful proof belongs only to this fresh sink generation.
+    pub async fn mccs(
+        &mut self,
+        channel: u8,
+        generation: u64,
+        metadata: crate::amdgpu_freesync::AmdVsdb,
+    ) -> Result<mccs::Negotiated, Error> {
+        self.0.mccs(channel, generation, metadata).await
     }
     /// Read one HDMI SCDC register (I2C 0x54) on a board-resolved channel.
     /// A sink without SCDC NACKs: a local error that leaves the owner Ready.

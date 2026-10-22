@@ -176,6 +176,19 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
         super::idt::load_idtr_ap();
     }
 
+    // 1.6 PAT is per logical processor. Program the layout the boot CPU
+    //     chose (Linux `cache_ap_init` -> `pat_cpu_init`) before this AP can
+    //     touch any mapping: the page tables are shared, so an AP left on the
+    //     reset layout would decode PWT=1 as WT where its peers decode WC,
+    //     aliasing one page under two memory types. After the IDT load so
+    //     the recoverable WRMSR can take its #GP. Linux panics when the boot
+    //     CPU enabled PAT and an AP cannot take it; NARF keeps that AP
+    //     offline instead, as it does for a speculation-control failure.
+    // SAFETY: CPL=0, IRQs masked, this AP has run no scheduler work yet.
+    if unsafe { narf_arch::x86_64::pat::cpu_init() }.is_err() {
+        narf_arch::halt_forever();
+    }
+
     // 1a. Record this AP's hybrid CPU type. Order matters: must
     //     come after set_current_cpu (so the slot index is right
     //     even if a future revision changes how the slot is

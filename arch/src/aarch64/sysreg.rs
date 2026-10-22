@@ -376,6 +376,23 @@ pub unsafe fn read_gcr_el1() -> u64 {
     v
 }
 
+/// Read `MAIR_EL1` — Memory Attribute Indirection Register.
+///
+/// # Safety
+/// Issues a privileged `MRS`; the caller must execute at EL1.
+#[inline]
+pub unsafe fn read_mair_el1() -> u64 {
+    let v: u64;
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: Always legal at EL1.
+    unsafe {
+        asm!("mrs {v}, mair_el1", v = out(reg) v,
+             options(nomem, nostack, preserves_flags));
+    }
+    compiler_fence(Ordering::SeqCst);
+    v
+}
+
 /// Write `MAIR_EL1` — Memory Attribute Indirection Register.
 ///
 /// # Safety

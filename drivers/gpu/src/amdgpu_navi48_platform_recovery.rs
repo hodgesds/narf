@@ -9,6 +9,11 @@ impl Submitter {
         if *READ_GENERATION.lock() != self.generation {
             return;
         }
+        let gang_busy = self.gangs.lock().busy();
+        if gang_busy {
+            self.abort_gangs("GC12 gang fault; independent replay forbidden");
+            return;
+        }
         // Freeze every ledger before the first await/reset. Synchronous
         // readers also freeze on BLOCKED; reset-test fences retire nothing.
         {

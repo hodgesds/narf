@@ -165,7 +165,7 @@ impl CtxState {
         self.contexts.lock().as_ref().map_or(0, |m| m.len())
     }
 
-    fn alloc(&self, priority: i32) -> Result<u32, FsError> {
+    pub(crate) fn alloc(&self, priority: i32) -> Result<u32, FsError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         if id == 0 {
             return Err(FsError::NoSpace);

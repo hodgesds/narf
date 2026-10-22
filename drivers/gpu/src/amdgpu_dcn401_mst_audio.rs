@@ -72,7 +72,7 @@ fn payload(f: &DpFrontendReady, slots: u8) -> Result<MstAudioPayload, Error> {
         || !matches!(s.lanes, 1 | 2 | 4)
         || slots == 0
         || slots > 63
-        || f.blank.request.ycbcr420
+        || !f.blank.request.encoding.is_rgb()
     {
         return Err(Error::Unsupported);
     }
@@ -169,11 +169,14 @@ impl<I: Io> Engine<I> {
         path: Path,
         info: AudioInfo,
         slots: u8,
+        endpoint: u8,
     ) -> Result<DisplayAudio, Error> {
         // 128b/132b MST: the HPO stream's APG, budgeted as Linux budgets
         // 128b/132b SST.
         if self.status.uhbr_video_running.is_some() {
-            return self.start_uhbr_audio(path, info, Some(slots)).await;
+            return self
+                .start_uhbr_audio(path, info, Some(slots), endpoint)
+                .await;
         }
         if self.status.dp_audio.is_some() || self.status.mst_audio_payload.is_some() {
             return Err(Error::Busy);
@@ -188,7 +191,7 @@ impl<I: Io> Engine<I> {
         let a = DisplayAudio {
             info,
             dp: true,
-            endpoint: f.request.stream,
+            endpoint,
             channels: channels(info.speakers),
             descriptors,
             hbr: mst_hbr(&t, depth(&f), f.link.phy.settings, dsc.as_ref()),
@@ -288,8 +291,9 @@ impl Otg {
         path: Path,
         info: AudioInfo,
         slots: u8,
+        endpoint: u8,
     ) -> Result<DisplayAudio, Error> {
-        self.0.start_mst_audio(path, info, slots).await
+        self.0.start_mst_audio(path, info, slots, endpoint).await
     }
 }
 

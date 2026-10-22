@@ -87,6 +87,21 @@ compressed-RAM swap backend during userspace bootstrap. Without it, NARF boots
 with no swap area, matching Linux until a future `swapon(2)` path configures
 one.
 
+Cache-attribute setup is per CPU and part of bring-up. On x86_64 the BSP
+calls `narf_arch::x86_64::pat::bp_init()` after the IDT is live and before any
+AP starts, each AP calls `pat::cpu_init()` right after its IDT load in
+`_ap_start_rust` (an AP that cannot take the BSP's layout halts offline, where
+Linux would panic), and the S3 wake continuation reprograms the BSP before
+device resume. PAT writes require matching readback; an establishment or S3
+restore failure stops before device access, while an absent PAT uses the
+conservative disabled table. On aarch64 `boot.S` (BSP) and `smp_entry.S` (each AP) write
+`MAIR_EL1 = 0x44F004FF`, `narf_arch::aarch64::mair::MAIR_EL1_VALUE`; indices
+0..=2 are unchanged and 3/4 add Normal-NC and Device-nGnRnE.
+Before allocator donation, BSP initialization separately registers usable,
+kernel-image and ACPI reclaimable/NVS RAM for cache-alias checks. Generic
+Reserved ranges remain ambiguous and are not treated as RAM. Early and late
+framebuffer mappings share the kernel/user WC type (ARM Normal-NC).
+
 Early BSP setup applies Linux-style `quiet`, `debug`, and `loglevel=N` tokens
 to the console threshold before emitting the normal boot banner. This affects
 only physical console emission: the bounded klog remains complete, and panic

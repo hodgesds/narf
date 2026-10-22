@@ -480,10 +480,7 @@ fn map_scanout(
     let va = match cached {
         Some(va) => va,
         None => {
-            #[cfg(target_arch = "x86_64")]
             let attrs = MmioAttrs::WriteCombining;
-            #[cfg(not(target_arch = "x86_64"))]
-            let attrs = MmioAttrs::Device;
             // SAFETY: the publisher retains this device/boot framebuffer range
             // for as long as it is published and beyond; it is never RAM the
             // allocator could hand out. The mapping is kept for good.

@@ -89,6 +89,17 @@ pub struct DscPayload {
 struct Params {
     range: BwRange,
     compression_possible: bool,
+    raw_allowed: bool,
+    constrained: bool,
+    slices_h: u32,
+    bpp_step: u32,
+}
+/// Optional downstream-link restrictions, applied before fairness. `None`
+/// DSC range means no compressed choice; raw and DSC are independent.
+#[derive(Clone, Copy, Debug)]
+pub struct StreamConstraints {
+    pub raw_allowed: bool,
+    pub dsc_range: Option<BwRange>,
 }
 
 /// dsc_mst_fairness_vars.
@@ -131,10 +142,37 @@ fn bpp_x16_from_pbn(s: &DscStream, link: &DscLink, pbn: i32) -> u32 {
         .map_or(0, |c| c.bpp_x16)
 }
 
+fn constrained_bpp_from_pbn(s: &DscStream, link: &DscLink, pbn: i32, p: &Params) -> u32 {
+    if !p.constrained {
+        return bpp_x16_from_pbn(s, link, pbn);
+    }
+    let t = mst_dsc_timing(&s.timing, s.bpc);
+    (p.range.min_bpp_x16..=p.range.max_bpp_x16)
+        .rev()
+        .find(|&bpp| {
+            bpp % p.bpp_step == 0
+                && peak_pbn(amdgpu_dsc::dsc_kbps(&t, bpp, p.slices_h), link.encoding) <= pbn
+        })
+        .unwrap_or(0)
+}
+
 /// The atomic check: drm_dp_mst_atomic_check_payload_alloc_limits (the
 /// link's slots) and drm_dp_mst_atomic_check_mstb_bw_limit (`fits`, every
 /// hop's PBN).
-fn atomic_check(streams: &[DscStream], vars: &[Vars], link: &DscLink, fits: &Fits<'_>) -> bool {
+fn atomic_check(
+    streams: &[DscStream],
+    params: &[Params],
+    vars: &[Vars],
+    link: &DscLink,
+    fits: &Fits<'_>,
+) -> bool {
+    if vars
+        .iter()
+        .zip(params)
+        .any(|(v, p)| !v.dsc_enabled && !p.raw_allowed)
+    {
+        return false;
+    }
     let div = link.pbn_div();
     let mut slots = 0u32;
     let mut alloc = Vec::new();
@@ -165,6 +203,17 @@ pub fn compute_link(
     fits: &Fits<'_>,
     native: &dyn Fn(&DscStream) -> Option<DscConfig>,
 ) -> Option<Vec<DscPayload>> {
+    compute_link_constrained(streams, link, fits, native, &|_| None)
+}
+/// Shared-link fairness with independently owned downstream ceilings.
+/// Unconstrained streams retain the exact Linux arithmetic and ordering.
+pub fn compute_link_constrained(
+    streams: &[DscStream],
+    link: &DscLink,
+    fits: &Fits<'_>,
+    native: &dyn Fn(&DscStream) -> Option<DscConfig>,
+    constraints: &dyn Fn(&DscStream) -> Option<StreamConstraints>,
+) -> Option<Vec<DscPayload>> {
     let div = link.pbn_div();
     let div_trunc = (div >> 12) as i32;
     if streams.is_empty() || div == 0 {
@@ -175,20 +224,24 @@ pub fn compute_link(
         .map(|s| {
             let t = mst_dsc_timing(&s.timing, s.bpc);
             let (min, max) = amdgpu_dsc::policy_bpp_x16(&t, link.encoding);
-            let possible = native(s).is_some();
-            let range = s
-                .dsc
-                .as_ref()
-                .filter(|_| possible)
-                .and_then(|caps| {
-                    amdgpu_dsc::bandwidth_range(
-                        caps,
-                        link.max_dispclk_khz,
-                        min,
-                        max,
-                        &t,
-                        link.encoding,
-                    )
+            let config = native(s);
+            let constraint = constraints(s);
+            let possible = config.is_some() && constraint.is_none_or(|c| c.dsc_range.is_some());
+            let range = constraint
+                .and_then(|c| c.dsc_range)
+                .or_else(|| {
+                    constraint.is_none().then_some(()).and_then(|_| {
+                        s.dsc.as_ref().filter(|_| possible).and_then(|caps| {
+                            amdgpu_dsc::bandwidth_range(
+                                caps,
+                                link.max_dispclk_khz,
+                                min,
+                                max,
+                                &t,
+                                link.encoding,
+                            )
+                        })
+                    })
                 })
                 .unwrap_or(BwRange {
                     min_bpp_x16: 0,
@@ -200,6 +253,12 @@ pub fn compute_link(
             Params {
                 range,
                 compression_possible: possible,
+                raw_allowed: constraint.is_none_or(|c| c.raw_allowed),
+                constrained: constraint.is_some(),
+                slices_h: config.map_or(0, |c| c.slices_h),
+                bpp_step: s
+                    .dsc
+                    .map_or(1, |c| (16 / c.bpp_increment_div.max(1)).max(1)),
             }
         })
         .collect();
@@ -212,7 +271,7 @@ pub fn compute_link(
             bpp_x16: 0,
         })
         .collect();
-    if !atomic_check(streams, &vars, link, fits) {
+    if !atomic_check(streams, &params, &vars, link, fits) {
         // Try max compression.
         for (v, p) in vars.iter_mut().zip(&params) {
             if p.compression_possible {
@@ -223,7 +282,7 @@ pub fn compute_link(
                 };
             }
         }
-        if !atomic_check(streams, &vars, link, fits) {
+        if !atomic_check(streams, &params, &vars, link, fits) {
             return None;
         }
         increase_dsc_bpp(streams, &params, &mut vars, link, div_trunc, fits);
@@ -233,14 +292,29 @@ pub fn compute_link(
     streams
         .iter()
         .zip(&vars)
-        .map(|(s, v)| {
+        .zip(&params)
+        .map(|((s, v), limits)| {
             let dsc = if v.dsc_enabled {
                 let cfg = native(s).map(|c| DscConfig {
                     bpp_x16: v.bpp_x16,
                     ..c
                 });
                 // A stream left compressed without a bpp has no PPS.
-                if cfg.is_none_or(|c| c.bpp_x16 == 0) {
+                if cfg.is_none_or(|c| {
+                    c.bpp_x16 == 0
+                        || limits.constrained
+                            && (c.bpp_x16 % limits.bpp_step != 0
+                                || c.bpp_x16 < limits.range.min_bpp_x16
+                                || c.bpp_x16 > limits.range.max_bpp_x16
+                                || peak_pbn(
+                                    amdgpu_dsc::dsc_kbps(
+                                        &mst_dsc_timing(&s.timing, s.bpc),
+                                        c.bpp_x16,
+                                        c.slices_h,
+                                    ),
+                                    link.encoding,
+                                ) > v.pbn)
+                }) {
                     return None;
                 }
                 cfg
@@ -295,14 +369,15 @@ fn increase_dsc_bpp(
         let fair = (63 - used) / remaining * div_trunc;
         if slack[next] > fair {
             vars[next].pbn += fair;
-            if atomic_check(streams, vars, link, fits) {
-                vars[next].bpp_x16 = bpp_x16_from_pbn(&streams[next], link, vars[next].pbn);
+            if atomic_check(streams, params, vars, link, fits) {
+                vars[next].bpp_x16 =
+                    constrained_bpp_from_pbn(&streams[next], link, vars[next].pbn, &params[next]);
             } else {
                 vars[next].pbn -= fair;
             }
         } else {
             vars[next].pbn += slack[next];
-            if atomic_check(streams, vars, link, fits) {
+            if atomic_check(streams, params, vars, link, fits) {
                 vars[next].bpp_x16 = params[next].range.max_bpp_x16;
             } else {
                 vars[next].pbn -= slack[next];
@@ -327,7 +402,10 @@ fn try_disable_dsc(
     let mut tried = alloc::vec![true; n];
     let mut remaining = 0;
     for i in 0..n {
-        if vars[i].dsc_enabled && vars[i].bpp_x16 == params[i].range.max_bpp_x16 {
+        if params[i].raw_allowed
+            && vars[i].dsc_enabled
+            && vars[i].bpp_x16 == params[i].range.max_bpp_x16
+        {
             increase[i] = params[i]
                 .range
                 .stream_kbps
@@ -346,7 +424,7 @@ fn try_disable_dsc(
         let Some(next) = next else { break };
         let saved = vars[next].pbn;
         vars[next].pbn = peak_pbn(params[next].range.stream_kbps, link.encoding);
-        if atomic_check(streams, vars, link, fits) {
+        if atomic_check(streams, params, vars, link, fits) {
             vars[next].dsc_enabled = false;
             vars[next].bpp_x16 = 0;
         } else {

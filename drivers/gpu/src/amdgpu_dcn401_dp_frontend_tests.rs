@@ -16,6 +16,11 @@ impl FrontendIo {
     }
 }
 impl Io for FrontendIo {
+    fn wait_poll_limit(&self) -> Option<u32> {
+        // Model register transitions by reads, so cancellation/timeout
+        // assertions do not depend on TCG completing a poll within 1 ms.
+        Some(32)
+    }
     fn read(&mut self, at: u64) -> u32 {
         if let Some(t) = self.transition {
             let target = dio(self.stream, if t == 0 { 0x2094 } else { 0x209b });
@@ -88,7 +93,7 @@ fn fixture_with(
             pipe,
             depth,
             limited,
-            ycbcr420: false,
+            encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
             colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(limited, false),
         },
         c,

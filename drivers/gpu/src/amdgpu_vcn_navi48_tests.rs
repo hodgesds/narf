@@ -15,9 +15,15 @@ const GPU: u64 = 0x8_0000_4000;
 const IMAGE: u64 = 0x8_1000_0000;
 #[path = "amdgpu_vcn_navi48_encode_tests.rs"]
 mod encode_tests;
+#[path = "amdgpu_vcn_navi48_hevc10_tests.rs"]
+mod hevc10_tests;
+#[path = "amdgpu_vcn_navi48_hevc_tests.rs"]
+mod hevc_tests;
 
 struct Fake {
     encoding: encode_tests::Model,
+    hevc: hevc_tests::Model,
+    hevc10: hevc10_tests::Model,
     regs: BTreeMap<u64, u32>,
     writes: Vec<(u64, u32)>,
     memory: Vec<u8>,
@@ -37,6 +43,8 @@ struct Fake {
     dirty: bool,
     boot: bool,
     advance: bool,
+    advance_on_delay: bool,
+    pending_pointer: Option<u32>,
     fence: bool,
     ignored: Option<u64>,
     revoked: Option<(u64, Cap<BusDeviceCap, Write>)>,
@@ -156,6 +164,12 @@ impl Fake {
         true
     }
     fn kernel_ib(&mut self, address: u64, length: u32) -> bool {
+        if self.hevc10.contains(address) {
+            return self.hevc10.ib(address, length);
+        }
+        if self.hevc.contains(address) {
+            return self.hevc.ib(address, length);
+        }
         if self.encoding.contains(address) {
             return self.encoding.ib(address, length);
         }
@@ -270,6 +284,12 @@ impl Io for Fake {
         }
     }
     fn memory_read(&mut self, map: MmioRegion, at: u64) -> u32 {
+        if let Some(w) = self.hevc10.read(map, at) {
+            return w;
+        }
+        if let Some(word) = self.hevc.read(map, at) {
+            return word;
+        }
         if let Some(word) = self.encoding.read(map, at) {
             return word;
         }
@@ -295,6 +315,14 @@ impl Io for Fake {
         self.word(at)
     }
     fn memory_write(&mut self, map: MmioRegion, at: u64, value: u32) {
+        if self.hevc10.write(map, at, value) {
+            self.dirty = true;
+            return;
+        }
+        if self.hevc.write(map, at, value) {
+            self.dirty = true;
+            return;
+        }
         if self.encoding.write(map, at, value) {
             self.dirty = true;
             return;
@@ -423,10 +451,15 @@ impl Io for Fake {
         self.regs.insert(VCN + 0xad * 4, value);
         if self.advance {
             self.regs.insert(VCN + 0xac * 4, value);
+        } else if self.advance_on_delay {
+            self.pending_pointer = Some(value);
         }
         self.regs.insert(VCN + 0x183 * 4, 2);
     }
     async fn delay(&mut self, _: u64) {
+        if let Some(pointer) = self.pending_pointer.take() {
+            self.regs.insert(VCN + 0xac * 4, pointer);
+        }
         self.delays.fetch_add(1, Ordering::SeqCst);
         narf_scheduler::yield_now().await;
     }
@@ -452,6 +485,8 @@ fn fixture_capacity(capacity: u64) -> (Pool, Engine<Fake>) {
     let e = Engine {
         io: Fake {
             encoding: encode_tests::Model::default(),
+            hevc: hevc_tests::Model::default(),
+            hevc10: hevc10_tests::Model::default(),
             regs,
             writes: Vec::new(),
             memory: vec![0x5a; BYTES as usize],
@@ -471,6 +506,8 @@ fn fixture_capacity(capacity: u64) -> (Pool, Engine<Fake>) {
             dirty: false,
             boot: true,
             advance: true,
+            advance_on_delay: false,
+            pending_pointer: None,
             fence: true,
             ignored: None,
             revoked: None,
@@ -501,6 +538,8 @@ fn fixture_capacity(capacity: u64) -> (Pool, Engine<Fake>) {
         ib_pool: pool.clone(),
         ib_memory: None,
         decode_memory: None,
+        hevc_memory: None,
+        hevc10_memory: None,
         encode_memory: None,
         firmware_bytes: 0x11000,
         state: State::Prepared,
@@ -508,6 +547,8 @@ fn fixture_capacity(capacity: u64) -> (Pool, Engine<Fake>) {
         interrupt_result: None,
         ib_result: None,
         decode_result: None,
+        hevc_result: None,
+        hevc10_result: None,
         encode_result: None,
         wptr: 0,
         seq: 0,
@@ -1430,4 +1471,92 @@ fn vcn5_avc_picture_allocation_refusal_does_not_publish_an_empty_proof() -> Test
 kernel_test_in!(
     "drivers/gpu/vcn-navi48",
     vcn5_avc_picture_allocation_refusal_does_not_publish_an_empty_proof
+);
+
+fn vcn5_all_native_proofs_wait_for_a_delayed_rptr_at_wrap() -> TestResult {
+    for phase in 0..7 {
+        let (_pool, mut e) = fixture_capacity(
+            BYTES
+                + ib_words::IB_BYTES
+                + decode_words::BYTES
+                + hevc_words::BYTES
+                + hevc10_words::BYTES
+                + encode_words::BYTES,
+        );
+        run(e.start(IMAGE, power())).unwrap();
+        let mut observer = irqs(&e, Some(64));
+        if phase > 0 {
+            run(e.prove()).unwrap();
+        }
+        if phase > 1 {
+            run(e.prove_interrupts(&mut observer)).unwrap();
+        }
+        if phase > 2 {
+            run(e.prove_ibs(&mut observer)).unwrap();
+        }
+        // No work pending. The next 64-dword publication wraps to zero; hardware
+        // executes/fences immediately, then exposes its new RPTR only on delay.
+        e.wptr = 960;
+        e.io.regs.insert(VCN + u64::from(RPTR) * 4, 960);
+        e.io.regs.insert(VCN + u64::from(WPTR) * 4, 960);
+        e.io.advance = false;
+        e.io.advance_on_delay = true;
+        let sequence = e.seq;
+        match phase {
+            0 => {
+                run(e.prove()).unwrap();
+            }
+            1 => {
+                run(e.prove_interrupts(&mut observer)).unwrap();
+            }
+            2 => {
+                run(e.prove_ibs(&mut observer)).unwrap();
+            }
+            3 => {
+                run(e.prove_decode(&mut observer)).unwrap();
+            }
+            4 => {
+                run(e.prove_hevc(&mut observer)).unwrap();
+            }
+            5 => {
+                run(e.prove_hevc10(&mut observer)).unwrap();
+            }
+            6 => {
+                run(e.prove_encode(&mut observer)).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(e.seq, sequence + 1);
+        assert_eq!(e.wptr, 0);
+        assert_eq!(e.reg(RPTR).unwrap(), 0);
+        assert!(e.io.pending_pointer.is_none());
+        run(e.stop()).unwrap();
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi48",
+    vcn5_all_native_proofs_wait_for_a_delayed_rptr_at_wrap
+);
+
+fn vcn5_proof_pointer_rejects_progress_outside_published_span() -> TestResult {
+    for pointer in 960..1024 {
+        assert_eq!(proof_pointer(pointer, 960, 0), Ok(()));
+    }
+    assert_eq!(proof_pointer(0, 960, 0), Ok(()));
+    for pointer in [1, 64, 959, 1024, u32::MAX] {
+        assert_eq!(proof_pointer(pointer, 960, 0), Err(Error::Readback));
+    }
+    for pointer in 128..=192 {
+        assert_eq!(proof_pointer(pointer, 128, 192), Ok(()));
+    }
+    for pointer in [0, 127, 193, 1023] {
+        assert_eq!(proof_pointer(pointer, 128, 192), Err(Error::Readback));
+    }
+    assert_eq!(proof_pointer(0, 0, 0), Err(Error::Readback));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi48",
+    vcn5_proof_pointer_rejects_progress_outside_published_span
 );

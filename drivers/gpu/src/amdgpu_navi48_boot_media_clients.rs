@@ -12,6 +12,8 @@ impl ColdBoot {
         vcn.ib_result()?.ok()?;
         if hw.media_decode_required {
             vcn.decode_result()?.ok()?;
+            vcn.hevc_result()?.ok()?;
+            vcn.hevc10_result()?.ok()?;
         }
         if hw.media_encode_required {
             vcn.encode_result()?.ok()?;
@@ -73,7 +75,11 @@ impl ColdBoot {
         let vcn = self.sequence.backend.vcn.as_mut().ok_or(vcn::Error::Busy)?;
         if !matches!(
             vcn.state(),
-            vcn::State::IbVerified | vcn::State::DecodeVerified | vcn::State::EncodeVerified
+            vcn::State::IbVerified
+                | vcn::State::DecodeVerified
+                | vcn::State::Hevc10Verified
+                | vcn::State::HevcVerified
+                | vcn::State::EncodeVerified
         ) {
             return Err(vcn::Error::Busy);
         }
@@ -144,7 +150,12 @@ impl ColdBoot {
             if decode {
                 // SAFETY: same retained kernel VMID0 and no replay until the
                 // requested picture proof and all other rings finish.
-                proof = unsafe { vcn.prove_decode().await }
+                unsafe { vcn.prove_decode().await }.map_err(Error::Vcn)?;
+                // SAFETY: the AVC proof drained the same retained transport;
+                // clients remain excluded through this independent Main8 proof.
+                unsafe { vcn.prove_hevc().await }.map_err(Error::Vcn)?;
+                // SAFETY: no client publication; fresh drained Main8 transport.
+                proof = unsafe { vcn.prove_hevc10().await }
                     .map_err(Error::Vcn)?
                     .completion;
             }

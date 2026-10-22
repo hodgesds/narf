@@ -326,10 +326,74 @@ pub fn amd_pstate_request(
 #[cfg(target_arch = "x86_64")]
 pub mod cr {
     pub const CR0_TS: u64;
+    pub const CR0_NW: u64;
+    pub const CR0_CD: u64;
+    pub const CR4_PGE: u64;
     pub unsafe fn read_cr0() -> u64;
+    pub unsafe fn write_cr0(value: u64);
     pub unsafe fn set_task_switched();
     pub unsafe fn clear_task_switched();
 }
+
+/// Page Attribute Table, mirroring Linux `pat_bp_init` / `pat_cpu_init` /
+/// `init_cache_modes` and the `cache_disable` / `cache_enable` sequence.
+#[cfg(target_arch = "x86_64")]
+pub mod pat {
+    pub const MSR_IA32_PAT: u32 = 0x277;
+    /// Linux full layout PAT_VALUE(WB, WC, UC_MINUS, UC, WB, WP, UC_MINUS, WT).
+    pub const NARF_PAT: u64 = 0x0407_0506_0007_0106;
+    /// Pentium Pro..M / Pentium 4 errata layout (PAT bit unused).
+    pub const NARF_PAT_ERRATA: u64 = 0x0007_0106_0007_0106;
+    /// Emulated table while PAT is disabled (WB, WT, UC-, UC).
+    pub const PAT_DISABLED_EMULATION: u64 = 0x0007_0406_0007_0406;
+    pub const PTE_PWT: u64; pub const PTE_PCD: u64;
+    pub const PTE_PAT_4K: u64;    // bit 7
+    pub const PTE_PAT_LARGE: u64; // bit 12
+    pub enum CacheMode { Wb, Wc, UcMinus, Uc, Wt, Wp }
+    pub enum PatError { Disabled, UnsupportedOnThisCpu, WriteFaulted, ReadbackMismatch }
+    pub fn supported() -> bool;
+    pub fn enabled() -> bool;
+    pub fn programmed_value() -> u64;
+    pub fn read() -> u64;
+    /// Boot CPU, before APs: choose the layout, fill the cache-mode table,
+    /// program this CPU. `Err(Disabled)` leaves WC degrading to UC-.
+    pub unsafe fn bp_init() -> Result<(), PatError>;
+    /// Every CPU (each AP at bring-up, the BSP again after S3): write the
+    /// chosen value under CR0.CD=1 + WBINVD (unless self-snoop) + PGE-clear
+    /// TLB flush, IRQs masked, then flush all TLB entries and require matching
+    /// IA32_PAT readback. No-op if disabled.
+    pub unsafe fn cpu_init() -> Result<(), PatError>;
+    /// IA32_PAT read back on `cpu` after its last `cpu_init` (0 = never).
+    pub fn recorded_cpu_value(cpu: usize) -> u64;
+    /// Linux `cachemode2protval` for a 4 KiB leaf under the programmed
+    /// layout; missing modes degrade to UC-. WB is always 0.
+    pub fn cachemode2pte(mode: CacheMode) -> u64;
+    pub const fn pte_bits_for(pat: u64, mode: CacheMode) -> u64;
+    pub const fn protval_4k_2_large(bits: u64) -> u64;
+    pub const fn protval_large_2_4k(bits: u64) -> u64;
+    pub const fn encode(pa: [u8; 8]) -> u64;
+    pub const fn slot_type(pat: u64, index: u32) -> u8;
+}
+
+/// MAIR_EL1 layout programmed by frame boot.S (BSP) and smp_entry.S (APs).
+#[cfg(target_arch = "aarch64")]
+pub mod mair {
+    pub const MAIR_ATTR_NORMAL: u64 = 0xFF;
+    pub const MAIR_ATTR_DEVICE_NGNRE: u64 = 0x04;
+    pub const MAIR_ATTR_NORMAL_TAGGED: u64 = 0xF0;
+    pub const MAIR_ATTR_NORMAL_NC: u64 = 0x44;
+    pub const MAIR_ATTR_DEVICE_NGNRNE: u64 = 0x00;
+    pub const ATTR_IDX_NORMAL: u64 = 0;
+    pub const ATTR_IDX_DEVICE_NGNRE: u64 = 1;
+    pub const ATTR_IDX_NORMAL_TAGGED: u64 = 2;
+    pub const ATTR_IDX_NORMAL_NC: u64 = 3;
+    pub const ATTR_IDX_DEVICE_NGNRNE: u64 = 4;
+    pub const MAIR_EL1_VALUE: u64 = 0x44F0_04FF;
+    pub const fn attridx(attr: u64, idx: u64) -> u64;
+    pub const fn attr_at(mair: u64, idx: u64) -> u64;
+}
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn aarch64::sysreg::read_mair_el1() -> u64;
 
 #[cfg(target_arch = "x86_64")]
 pub mod xsave {

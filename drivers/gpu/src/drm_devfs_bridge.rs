@@ -258,7 +258,11 @@ impl FileOps for DriCardFile {
         }
         let lifetime = self.mmap_lifetime(offset, len);
         let frames = self.mmap_frames(offset, len)?;
-        Ok(narf_filesystem::MmapBacking { frames, lifetime })
+        Ok(narf_filesystem::MmapBacking {
+            frames,
+            lifetime,
+            memory_type: narf_memory::MemoryType::WriteBack,
+        })
     }
     fn mmap_published(&self, lifetime: Option<&Arc<dyn MmapLifetime>>) {
         crate::amdgpu_gem::cpu_mapping::published(lifetime);
@@ -607,15 +611,19 @@ impl FileOps for DriCardFile {
                 {
                     return result;
                 }
-                // prepare_fb's migration back to VRAM, before the commit pins.
-                crate::drm_ioctl_bridge::amdgpu_prepare_scanout(
+                if let Some(result) = crate::drm_ioctl_bridge::amdgpu_kms_async(
                     self.index,
                     self.open_id,
                     cmd,
                     arg as usize,
                     &self.amdgpu_gem,
+                    Some(&self.events),
+                    Some(&self.pending_out_fences),
                 )
-                .await;
+                .await
+                {
+                    return result;
+                }
                 if let Some(result) = crate::amdgpu_vm::dispatch_async(
                     cmd,
                     arg as usize,
@@ -1210,7 +1218,11 @@ impl FileOps for DriRenderFile {
         }
         let lifetime = self.mmap_lifetime(offset, len);
         let frames = self.mmap_frames(offset, len)?;
-        Ok(narf_filesystem::MmapBacking { frames, lifetime })
+        Ok(narf_filesystem::MmapBacking {
+            frames,
+            lifetime,
+            memory_type: narf_memory::MemoryType::WriteBack,
+        })
     }
     fn mmap_published(&self, lifetime: Option<&Arc<dyn MmapLifetime>>) {
         crate::amdgpu_gem::cpu_mapping::published(lifetime);
@@ -1714,6 +1726,14 @@ impl AmdgpuCard {
     fn rdna2(&self) -> bool {
         crate::amdgpu_rdna2::for_pci_id(self.vid, self.did).is_some()
     }
+    /// RX 9000 controls include discovery-supported OEM device IDs.
+    fn rdna4(&self) -> bool {
+        self.vid == crate::amdgpu::AMD_VENDOR
+            && (crate::amdgpu_rdna4::known_device(self.did).is_some()
+                || (crate::amdgpu::pci_device()
+                    .is_some_and(|d| d.id.vendor == self.vid && d.id.device == self.did)
+                    && crate::amdgpu::is_navi48()))
+    }
     pub fn new(
         card_name: String,
         vid: u16,
@@ -1762,15 +1782,24 @@ impl crate::drm_registry::DrmCard for AmdgpuCard {
     fn power_state(&self) -> &str {
         "D0"
     }
-    // RX 6000 runtime power controls; other generations keep the defaults.
+    // Each native family reports its own last applied GFXCLK level.
     fn performance_level(&self) -> &'static str {
-        crate::amdgpu_rdna2_power_controls::level()
+        if self.rdna4() {
+            crate::amdgpu_navi48_power::level()
+        } else if self.rdna2() {
+            crate::amdgpu_rdna2_power_controls::level()
+        } else {
+            "auto"
+        }
     }
     fn set_performance_level(&self, level: &str) -> Result<(), FsError> {
-        if !self.rdna2() {
-            return Err(FsError::Unsupported);
+        if self.rdna4() {
+            crate::amdgpu_navi48_power::request_level(level)
+        } else if self.rdna2() {
+            crate::amdgpu_rdna2_power_controls::request_level(level)
+        } else {
+            Err(FsError::Unsupported)
         }
-        crate::amdgpu_rdna2_power_controls::request_level(level)
     }
     fn pp_features(&self) -> Option<String> {
         self.rdna2()

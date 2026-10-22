@@ -4,7 +4,9 @@
 //! commit failures all refuse without touching data, PTEs or accounting.
 use super::*;
 use narf_kernel_test::{kernel_test_in, TestResult};
-use narf_memory::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
+use narf_memory::{
+    AddressSpace, AddressSpaceError, MemoryType, PhysAddr, Region, RegionPerms, VirtAddr,
+};
 
 const CARD: u32 = 0xfee6;
 
@@ -67,8 +69,15 @@ fn create(state: &GemState, size: u64, domains: u64) -> u32 {
     b[0] as u32
 }
 
-fn map(space: &AddressSpace, va: u64, frames: &[u64], write: bool) -> bool {
-    let mut perms = RegionPerms::READ | RegionPerms::SHARED;
+fn map(
+    space: &AddressSpace,
+    va: u64,
+    frames: &[u64],
+    write: bool,
+    memory_type: MemoryType,
+) -> bool {
+    let mut perms = (RegionPerms::READ | RegionPerms::SHARED | RegionPerms::LOCK_EXEMPT)
+        .with_memory_type(memory_type);
     if write {
         perms = perms | RegionPerms::WRITE;
     }
@@ -85,6 +94,38 @@ fn map(space: &AddressSpace, va: u64, frames: &[u64], write: bool) -> bool {
         // SAFETY: test-owned root that is never activated, so device frames
         // installed here are never dereferenced.
         && unsafe { space.materialize_range(VirtAddr::new(va), len) }.is_ok()
+}
+
+/// Compare the actual leaf selector after a move or rollback. The request
+/// survives in the VMA; System RAM must still match its WB direct map.
+fn cache_matches(space: &AddressSpace, va: u64, phys: u64) -> bool {
+    let Some(region) = space.lookup(VirtAddr::new(va)) else {
+        return false;
+    };
+    if region.perms.memory_type() != MemoryType::WriteCombining {
+        return false;
+    }
+    let effective = narf_memory::memtype::effective_memory_type(region.perms, PhysAddr::new(phys));
+    // SAFETY: this test owns the live root and never activates it.
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use narf_memory::x86_64::paging::{flags_at, PtFlags};
+            flags_at(space.root, VirtAddr::new(va)).is_some_and(|flags| {
+                flags.bits() & PtFlags::CACHE_MASK_4K.bits()
+                    == narf_memory::memtype::x86_leaf_bits_4k(effective).bits()
+            })
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            use narf_memory::aarch64::paging::{flags_at, PtFlags};
+            flags_at(space.root, VirtAddr::new(va)).is_some_and(|flags| {
+                flags.bits() & PtFlags::ATTR_MASK.bits()
+                    == narf_memory::memtype::aarch64_leaf_bits(effective).bits()
+                        & PtFlags::ATTR_MASK.bits()
+            })
+        }
+    }
 }
 
 fn translated(space: &AddressSpace, va: u64) -> Option<(u64, bool)> {
@@ -175,7 +216,9 @@ fn rdna2_cpu_mappings_revoke_rebind_and_refuse_pins() -> TestResult {
         let whole = state
             .mmap_backing(u64::from(handle) << 12, 3 * 4096)
             .map_err(|_| "GEM mmap backing failed")?;
-        if !map(&parent, va_rw, &whole.frames, true) {
+        if whole.memory_type != MemoryType::WriteCombining
+            || !map(&parent, va_rw, &whole.frames, true, whole.memory_type)
+        {
             return Err("whole view registration failed");
         }
         if relocate(&object, false) != Err(FsError::Busy) || object.system() {
@@ -186,7 +229,9 @@ fn rdna2_cpu_mappings_revoke_rebind_and_refuse_pins() -> TestResult {
         let view = prime
             .mmap_backing(4096, 4096)
             .map_err(|_| "PRIME partial view failed")?;
-        if !map(&parent, va_ro, &view.frames, false) {
+        if view.memory_type != MemoryType::WriteCombining
+            || !map(&parent, va_ro, &view.frames, false, view.memory_type)
+        {
             return Err("partial view registration failed");
         }
         prime.mmap_published(view.lifetime.as_ref());
@@ -205,7 +250,9 @@ fn rdna2_cpu_mappings_revoke_rebind_and_refuse_pins() -> TestResult {
             let frames = object.frames(0, 3 * 4096).map_err(|_| label)?;
             let views_follow = (0..3).all(|page| {
                 translated(&parent, va_rw + page * 4096) == Some((frames[page as usize], true))
-            }) && translated(&parent, va_ro) == Some((frames[1], false));
+                    && cache_matches(&parent, va_rw + page * 4096, frames[page as usize])
+            }) && translated(&parent, va_ro) == Some((frames[1], false))
+                && cache_matches(&parent, va_ro, frames[1]);
             let gpu_follows = vm.leaf_entry(0x2_0000_2000).is_some_and(|pte| {
                 Some(pte & crate::amdgpu_vm::GMC_HOLE_MASK & !4095) == object.gpu_at(8192)
             });
@@ -282,7 +329,7 @@ fn rdna2_cpu_mappings_revoke_rebind_and_refuse_pins() -> TestResult {
         let region = Region {
             base: VirtAddr::new(va_rw),
             len: 3 * 4096,
-            perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
+            perms: parent.lookup(VirtAddr::new(va_rw)).unwrap().perms,
             phys: gtt_frames
                 .iter()
                 .copied()
@@ -321,6 +368,13 @@ fn rdna2_cpu_mappings_revoke_rebind_and_refuse_pins() -> TestResult {
         });
         if object.system() || !child_follows || moved.iter().any(|&f| alias_count(f) != 1) {
             return Err("child metadata did not follow the moved BO");
+        }
+        // Fork's lazy metadata also retains WC when its leaves are built.
+        // SAFETY: test-owned live root, never activated or dereferenced.
+        unsafe { child.materialize_range(VirtAddr::new(va_rw), 3 * 4096) }
+            .map_err(|_| "child materialization failed")?;
+        if !(0..3).all(|page| cache_matches(&child, va_rw + page * 4096, moved[page as usize])) {
+            return Err("child VRAM leaves lost the WC request");
         }
         // Final child unmap releases the backing.
         child

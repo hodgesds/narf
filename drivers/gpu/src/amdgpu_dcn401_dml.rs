@@ -16,8 +16,7 @@
 //! immediate flip are all off; a 4:4:4 DP stream may use DSC. One tiled RGB
 //! plane alone on one pipe requests unbounded.
 //!
-//! ODM is DML's `dml2_odm_mode_auto` (DecideODMMode; the Vmin phase's
-//! dynamic ODM is not ported, as if every stream had disable_dynamic_odm):
+//! ODM starts with DML's `dml2_odm_mode_auto` (DecideODMMode):
 //! a stream takes two, three or four pipes (DPP + OPP each, one DSC each)
 //! when its pixel clock exceeds that many less one pipes' downspread-limited
 //! DISPCLK maximum, its DSC line is wider than 5760 pixels per DSC or has
@@ -41,9 +40,13 @@
 //! single-stream ODM configuration that phase raises the stream's ODM
 //! combine factor instead, and on an ODM stream beside others it is refused.
 //!
-//! The default 320-KiB DET from the staged requestor is a fixed input for
-//! every pipe rather than DML's own allocation (four pipes fit the 1280-KiB
-//! DET pool exactly). Anything else is rejected, not approximated.
+//! CalculateDETBufferSize shares the 1280-KiB DET pool with DC's
+//! minimize_det_reallocation: pixel-rate budgets per stream, bandwidth
+//! shares per plane and swath-sized minimums. One tiled RGB pipe requests
+//! unbounded with a two-swath DET minimum and the rest as COMPBUF.
+//! Vmin's dynamic ODM phase then reduces a single DP stream's DISPCLK
+//! toward 600 MHz, keeping supported partial progress up to four pipes;
+//! HDMI, nondivisible timings and base MPC combine are excluded.
 //!
 //! These plans are the native pinned-UCLK policy: one UCLK level, the
 //! highest, and no UCLK P-state strategy (the uclk watermark is still
@@ -65,6 +68,9 @@ pub use pstate::PlanPstate;
 /// UCLK P-state switching with displays lit (DML21's PMO and DPMM).
 #[path = "amdgpu_dcn401_pstate.rs"]
 pub mod pstate;
+
+#[path = "amdgpu_dcn401_det.rs"]
+mod det;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -127,15 +133,19 @@ pub struct Soc {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mode {
     pub timing: Timing,
+    /// HDMI TMDS or FRL output. PMO permits seamless dynamic ODM only on
+    /// DisplayPort encoders, including eDP and HPO DP.
+    pub hdmi: bool,
     /// Surface pitch in pixels.
     pub pitch: u32,
     /// Bytes per pixel of the single packed RGB plane: 2 (`dml2_444_16`,
     /// RGB565), 4 (`dml2_444_32`, 8888 and 2101010) or 8 (`dml2_444_64`,
     /// FP16). Every other value is `Error::Invalid`.
     pub bytes_per_pixel: u32,
-    /// The stream leaves as YCbCr 4:2:0 (HDMI): two pixels per OTG
-    /// container, which adds a line of delay after the scaler.
-    pub ycbcr420: bool,
+    /// Output encoding, independent of fetched plane format. HDMI420
+    /// takes two pixels per OPTC container and adds a scaler-delay line;
+    /// uncompressed simple422 and444 share444 scheduling. Native DSC is RGB.
+    pub encoding: crate::amdgpu_hdr::PixelEncoding,
     /// Display Stream Compression of a 4:4:4 DP output, as DC passes it
     /// (timing.dsc: enabled with the slice count and compressed bpp).
     pub dsc: Option<Dsc>,
@@ -318,9 +328,10 @@ impl Mode {
     pub fn new(timing: Timing, pitch: u32, bytes_per_pixel: u32) -> Self {
         Self {
             timing,
+            hdmi: false,
             pitch,
             bytes_per_pixel,
-            ycbcr420: false,
+            encoding: crate::amdgpu_hdr::PixelEncoding::Rgb,
             dsc: None,
             planes: [None; MAX_PLANES],
         }
@@ -409,7 +420,7 @@ fn dsc_delay(t: &Timing, dsc: Dsc, odm: u32) -> u32 {
     (f64::from(v) * pclk / pclk) as u32
 }
 
-/// DecideODMMode for `dml2_odm_mode_auto` (dynamic ODM off): the fewest
+/// Base DecideODMMode for `dml2_odm_mode_auto` (before Vmin): the fewest
 /// pipes whose DISPCLK (CalculateRequiredDispclk: the pixel clock over the
 /// pipes, at least half of it for an HDMI TMDS 4:2:0 output) fits
 /// `dispclk_ss_khz`, else four; at least as many as a DSC line needs at
@@ -419,13 +430,15 @@ fn dsc_delay(t: &Timing, dsc: Dsc, odm: u32) -> u32 {
 fn decide_odm(mode: &Mode, dispclk_ss_khz: u64) -> u32 {
     let t = &mode.timing;
     let pclk = u64::from(t.pixel_clock_khz);
-    let fits = |pipes: u32| pclk <= u64::from(disp_divider(pipes, mode.ycbcr420)) * dispclk_ss_khz;
+    let fits = |pipes: u32| {
+        pclk <= u64::from(disp_divider(pipes, mode.encoding.is_420())) * dispclk_ss_khz
+    };
     let span = |limit: u32| t.h_active.div_ceil(limit).clamp(1, 4);
     let mut odm = (1..=3).find(|&n| fits(n)).unwrap_or(4);
     if mode.dsc.is_some() {
         odm = odm.max(span(MAX_PIXELS_PER_DSC));
     }
-    if mode.ycbcr420 {
+    if mode.encoding.is_420() {
         odm = odm.max(span(FMT_420_BUFFER_WIDTH));
     }
     if let Some(dsc) = mode.dsc {
@@ -460,9 +473,10 @@ fn disp_divider(odm: u32, ycbcr420: bool) -> u32 {
 pub fn dsc_pipes(timing: &Timing, slices: u32, dispclk_max_khz: u32) -> u32 {
     let mode = Mode {
         timing: *timing,
+        hdmi: false,
         pitch: timing.h_active,
         bytes_per_pixel: 4,
-        ycbcr420: false,
+        encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
         dsc: Some(Dsc { slices, bpp_x16: 0 }),
         planes: [None; MAX_PLANES],
     };
@@ -863,6 +877,7 @@ const G6_TEMP_READ: [(u32, i64); 8] = [
 const ROB_KBYTES: i64 = 192;
 const CONFIG_RETURN_KBYTES: u32 = 1344;
 const SEGMENT_KBYTES: u32 = 64;
+const MAX_DET_KBYTES: u32 = CONFIG_RETURN_KBYTES - SEGMENT_KBYTES;
 const PIXEL_CHUNK_KBYTES: i64 = 8;
 const MIN_PIXEL_CHUNK_BYTES: u32 = 1024;
 const LINE_BUFFER_BITS: i64 = 1_171_920;
@@ -895,7 +910,8 @@ const MIN_RETURN_UCLK_CYCLES: i64 = 83;
 const MIN_RETURN_FCLK_CYCLES: i64 = 75;
 
 // ── Native policy ──────────────────────────────────────────────────────────
-/// The staged requestor's DCN4_01_DEFAULT_DET_SIZE, also DML's nominal DET.
+/// DCN4_01_DEFAULT_DET_SIZE: nominal size used to choose the minimum DET.
+/// The assigned per-HUBP size is calculated from the shared pool.
 pub const DET_KBYTES: u32 = 320;
 /// The full request size (CalculateSwathAndDETConfiguration: 256 bytes
 /// unless a halved tiled swath requests 64 or 128), and the extra-latency
@@ -1619,7 +1635,7 @@ impl Shape {
             if dsc.bpp_x16 == 0 {
                 return Err(Error::Invalid);
             }
-            if mode.ycbcr420 || dsc.slices == 0 {
+            if !mode.encoding.is_rgb() || dsc.slices == 0 {
                 return Err(Error::Unsupported);
             }
         }
@@ -1635,11 +1651,11 @@ impl Shape {
         // (four for 3:1 and 4:1, which pack four pixels per transfer)
         // divides the line; the formatter's 4:2:0 line buffer per pipe.
         if u64::from(t.pixel_clock_khz)
-            > u64::from(disp_divider(odm, mode.ycbcr420)) * dispclk_ss_khz
+            > u64::from(disp_divider(odm, mode.encoding.is_420())) * dispclk_ss_khz
         {
             return Err(Error::PixelClock);
         }
-        let ppc = if mode.ycbcr420 { 2 } else { 1 };
+        let ppc = if mode.encoding.is_420() { 2 } else { 1 };
         let symmetric = odm != 3 || mode.dsc.is_some();
         let h_div = match odm {
             3 | 4 => 4,
@@ -1648,7 +1664,7 @@ impl Shape {
         };
         if (symmetric && t.h_active % (odm * ppc) != 0)
             || t.h_active % h_div != 0
-            || (mode.ycbcr420 && t.h_active > odm * FMT_420_BUFFER_WIDTH)
+            || (mode.encoding.is_420() && t.h_active > odm * FMT_420_BUFFER_WIDTH)
         {
             return Err(Error::Unsupported);
         }
@@ -1774,7 +1790,7 @@ impl Shape {
             }
         };
         let luma_bw = line_bw(vp, blocks.bpp[0], plane.v_ratio);
-        let mut y = make(
+        let y = make(
             0,
             vp,
             swath,
@@ -1782,7 +1798,7 @@ impl Shape {
             (plane.h_ratio, plane.v_ratio, plane.h_taps, plane.v_taps),
             (luma_bw, luma_bw),
         );
-        let mut chroma = plane.is_420().then(|| {
+        let chroma = plane.is_420().then(|| {
             make(
                 1,
                 vp / 2,
@@ -1799,53 +1815,6 @@ impl Shape {
                 ),
             )
         });
-        // CalculateSwathAndDETConfiguration: the full swaths if two of them
-        // fit half the DET (always for linear), else halved swaths.
-        let det = DET_KBYTES * 1024;
-        let half = det / 2;
-        let full_l = y.full_swath_bytes;
-        let full_c = chroma.map_or(0, |s| s.full_swath_bytes);
-        let half_request = |bpp: u32| if (bpp == 2) == vertical { 128 } else { 64 };
-        let (halve_l, halve_c) = if plane.swizzle == Swizzle::Linear || full_l + full_c <= half {
-            (false, false)
-        } else if 2 * u64::from(full_l) >= 3 * u64::from(full_c) && full_l / 2 + full_c <= half {
-            (true, false)
-        } else if 2 * u64::from(full_l) < 3 * u64::from(full_c) && full_l + full_c / 2 <= half {
-            (false, true)
-        } else {
-            (true, true)
-        };
-        if halve_l {
-            y.height = y.max_height / 2;
-            y.rounded_swath_bytes = full_l / 2;
-            y.request_bytes = half_request(y.bpp);
-        }
-        if let Some(s) = chroma.as_mut() {
-            if halve_c {
-                s.height = s.max_height / 2;
-                s.rounded_swath_bytes = full_c / 2;
-                s.request_bytes = half_request(s.bpp);
-            }
-            if s.height == 0 {
-                s.request_bytes = 0;
-            }
-        }
-        // The DET split between the surfaces.
-        match chroma.as_mut() {
-            None => y.det_bytes = det,
-            Some(s) => {
-                if 2 * u64::from(y.rounded_swath_bytes) <= 3 * u64::from(s.rounded_swath_bytes) {
-                    y.det_bytes = det / 2;
-                } else {
-                    y.det_bytes = det * 2 / 3 / 1024 * 1024;
-                }
-                s.det_bytes = det - y.det_bytes;
-            }
-        }
-        y.source_lines();
-        if let Some(s) = chroma.as_mut() {
-            s.source_lines();
-        }
         // CalculateSinglePipeDPPCLKAndSCLThroughput, then RequiredDPPCLK:
         // the faster of luma and chroma.
         let pixel_mhz = f64::from(t.pixel_clock_khz) / 1000.0;
@@ -1919,16 +1888,16 @@ impl Shape {
             // does.
             mcache_fits = Mcache::admissible(&mcaches, &plane, t.h_active, odm, dpps);
         }
-        Ok(Self {
+        let mut shape = Self {
             stream,
             t,
             pclk: mhz(u64::from(t.pixel_clock_khz)),
             line: q(i64::from(t.h_total) * 1000, i64::from(t.pixel_clock_khz)),
             odm,
             dpps,
-            det_bytes: det,
+            det_bytes: 0,
             vblank: t.v_total - t.v_active,
-            ycbcr420: mode.ycbcr420,
+            ycbcr420: mode.encoding.is_420(),
             dsc_delay: mode.dsc.map_or(0, |d| dsc_delay(&t, d, odm)),
             plane,
             y,
@@ -1940,7 +1909,70 @@ impl Shape {
             mcaches: mcache_count,
             mcache: mcache_alloc,
             mcache_fits,
-        })
+        };
+        shape.set_det(DET_KBYTES);
+        Ok(shape)
+    }
+    /// Recalculate swath heights, request sizes and luma/chroma shares after
+    /// CalculateDETBufferSize assigns this HUBP its share of the CRB.
+    fn set_det(&mut self, det_kbytes: u32) {
+        // CalculateSwathAndDETConfiguration: the full swaths if two of them
+        // fit half the DET (always for linear), else halved swaths.
+        let det = det_kbytes * 1024;
+        self.det_bytes = det;
+        let plane = self.plane;
+        let vertical = plane.vertical_scan;
+        let y = &mut self.y;
+        let chroma = &mut self.c;
+        for surface in core::iter::once(&mut *y).chain(chroma.iter_mut()) {
+            surface.height = surface.max_height;
+            surface.rounded_swath_bytes = surface.full_swath_bytes;
+            surface.request_bytes = REQUEST_BYTES as u32;
+        }
+        let half = det / 2;
+        let full_l = y.full_swath_bytes;
+        let full_c = chroma.map_or(0, |s| s.full_swath_bytes);
+        let half_request = |bpp: u32| if (bpp == 2) == vertical { 128 } else { 64 };
+        let (halve_l, halve_c) = if plane.swizzle == Swizzle::Linear || full_l + full_c <= half {
+            (false, false)
+        } else if 2 * u64::from(full_l) >= 3 * u64::from(full_c) && full_l / 2 + full_c <= half {
+            (true, false)
+        } else if 2 * u64::from(full_l) < 3 * u64::from(full_c) && full_l + full_c / 2 <= half {
+            (false, true)
+        } else {
+            (true, true)
+        };
+        if halve_l {
+            y.height = y.max_height / 2;
+            y.rounded_swath_bytes = full_l / 2;
+            y.request_bytes = half_request(y.bpp);
+        }
+        if let Some(s) = chroma.as_mut() {
+            if halve_c {
+                s.height = s.max_height / 2;
+                s.rounded_swath_bytes = full_c / 2;
+                s.request_bytes = half_request(s.bpp);
+            }
+            if s.height == 0 {
+                s.request_bytes = 0;
+            }
+        }
+        // The DET split between the surfaces.
+        match chroma.as_mut() {
+            None => y.det_bytes = det,
+            Some(s) => {
+                if 2 * u64::from(y.rounded_swath_bytes) <= 3 * u64::from(s.rounded_swath_bytes) {
+                    y.det_bytes = det / 2;
+                } else {
+                    y.det_bytes = det * 2 / 3 / 1024 * 1024;
+                }
+                s.det_bytes = det - y.det_bytes;
+            }
+        }
+        y.source_lines();
+        if let Some(s) = chroma.as_mut() {
+            s.source_lines();
+        }
     }
     /// The MPC combine decision of dml2_core_dcn4_calcs.c's mode support
     /// for a plane in ODM bypass with `mpcc_combine_factor` auto (as DC
@@ -2728,9 +2760,9 @@ pub fn admit(soc: &Soc, mode: &Mode) -> Result<Plan, Error> {
 /// Admit `modes` together, one stream each on one pipe or, where DML's ODM
 /// policy splits it, two to four ([`Plan::pipes`]; an MPC-combined plane in
 /// ODM bypass takes two DPPs, [`PlanePlan::dpps`]), returning their plans in order or
-/// the first DML check the configuration fails. Every pipe keeps the fixed
-/// DET, and the shared quantities are joint as in DML21: read and urgent
-/// bandwidth sum over the surfaces (prefetch over each surface's pipes),
+/// the first DML check the configuration fails. Every pipe receives its
+/// calculated share of the DET. The shared quantities are joint as in
+/// DML21: read and urgent bandwidth sum over the surfaces (prefetch over each surface's pipes),
 /// extra latency takes one pixel chunk per DPP, deep-sleep DCFCLK, DISPCLK
 /// and DPPREFCLK cover every pipe, and stutter is budgeted only if every
 /// stream's blank allows it. The global watermarks and arbiter are therefore
@@ -2760,10 +2792,18 @@ impl Policy {
 /// width against OTG_H_TIMING_DIV_MODE, leaving the other boundaries a
 /// TODO; Linux plans such a stream.
 pub fn admit_native(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
+    if modes.iter().any(|m| {
+        !m.encoding.is_rgb() && !m.hdmi
+            || m.encoding.is_422()
+                && ((m.timing.h_active | m.timing.h_total.saturating_sub(m.timing.h_active)) & 1
+                    != 0)
+    }) {
+        return Err(Error::Unsupported);
+    }
     let plans = admit_all(soc, modes)?;
     if plans
         .iter()
-        .any(|p| !odm_timing_ok(&p.mode.timing, u32::from(p.pipes), p.mode.ycbcr420))
+        .any(|p| !odm_timing_ok(&p.mode.timing, u32::from(p.pipes), p.mode.encoding.is_420()))
     {
         return Err(Error::Unsupported);
     }
@@ -2834,6 +2874,10 @@ pub fn admit_all_with(soc: &Soc, modes: &[Mode], policy: Policy) -> Result<Vec<P
     loop {
         let shapes = shapes_for(soc, modes, policy, &split, odm)?;
         if shapes.iter().all(|s| s.mcache_fits) {
+            plan_shapes(soc, modes, shapes.clone(), true)?;
+            let shapes = optimize_vmin(soc, modes, shapes, |candidate| {
+                plan_shapes(soc, modes, candidate.to_vec(), true).is_ok()
+            });
             return plan_shapes(soc, modes, shapes, false);
         }
         // The mcache phase starts from a configuration mode support takes.
@@ -2872,6 +2916,65 @@ pub fn admit_all_with(soc: &Soc, modes: &[Mode], policy: Policy) -> Result<Vec<P
     }
 }
 
+/// DML21 phase 4 (pmo_dcn4_fams2_{init,test,optimize}_for_vmin).
+/// DC enables dynamic ODM only for one stream on DCN401. A failed
+/// candidate ends the search, retaining all supported partial progress;
+/// mode support alone validates candidates, before DPMM chooses clocks.
+fn optimize_vmin(
+    soc: &Soc,
+    modes: &[Mode],
+    mut shapes: Vec<Shape>,
+    mut supported: impl FnMut(&mut [Shape]) -> bool,
+) -> Vec<Shape> {
+    if modes.len() != 1 || modes[0].hdmi || modes[0].encoding.is_420() {
+        return shapes;
+    }
+    let timing = &modes[0].timing;
+    let divisible = |n: u32| {
+        [
+            timing.h_total,
+            timing.h_total - timing.h_front_porch,
+            timing.h_blank_end(),
+            timing.h_sync_width,
+        ]
+        .iter()
+        .all(|v| v % n == 0)
+    };
+    if !divisible(2) || shapes.iter().any(|s| s.odm == 1 && s.dpps > 1) {
+        return shapes;
+    }
+    while shapes[0].disp_khz() > 600_000 {
+        let odm = shapes[0].odm;
+        let next = (odm + 1..=4)
+            .find(|&n| n == 2 || (divisible(4) && modes[0].dsc.is_none_or(|d| d.slices % n == 0)));
+        let Some(next) = next else { break };
+        let candidate: Result<Vec<_>, _> = shapes
+            .iter()
+            .map(|s| {
+                Shape::new(
+                    &modes[0],
+                    s.plane,
+                    0,
+                    ss_khz(soc.dispclk_max_khz),
+                    soc.umc_channels,
+                    Some(next),
+                )
+            })
+            .collect();
+        let Ok(mut candidate) = candidate else { break };
+        det::allocate(&mut candidate);
+        if candidate
+            .iter()
+            .any(|s| !s.mcache_fits || s.buffers().is_err())
+            || !supported(&mut candidate)
+        {
+            break;
+        }
+        shapes = candidate;
+    }
+    shapes
+}
+
 /// Every plane's shape in admission order: its ODM split (stream 0's forced
 /// to `odm` when the mcache phase raised it), then MPC combine as `policy`
 /// decides it or (`split`) the mcache phase forces it.
@@ -2900,12 +3003,35 @@ fn shapes_for(
             )?;
             if split[shapes.len()] && shape.odm == 1 {
                 shape = Shape::with_pipes(mode, plane, k, 1, MPC_COMBINE_LIMIT, soc.umc_channels)?;
-            } else if policy.mpc_combine {
-                shape = shape.mpc_combined(mode, ss(soc.dppclk_max_khz), soc.umc_channels)?;
             }
-            shape.buffers()?;
             shapes.push(shape);
         }
+    }
+    if policy.mpc_combine {
+        // DML computes SingleDPPViewportSizeSupport using its own DET
+        // allocation with ForceSingleDPP, before selecting MPC combine.
+        let mut single = Vec::with_capacity(shapes.len());
+        for s in &shapes {
+            single.push(Shape::with_pipes(
+                &modes[s.stream],
+                s.plane,
+                s.stream,
+                1,
+                1,
+                soc.umc_channels,
+            )?);
+        }
+        det::allocate(&mut single);
+        for (s, one) in shapes.iter_mut().zip(single) {
+            if s.odm == 1 && s.dpps == 1 {
+                *s =
+                    one.mpc_combined(&modes[s.stream], ss(soc.dppclk_max_khz), soc.umc_channels)?;
+            }
+        }
+    }
+    det::allocate(&mut shapes);
+    for s in &shapes {
+        s.buffers()?;
     }
     Ok(shapes)
 }
@@ -3042,18 +3168,7 @@ fn prepare(soc: &Soc, shapes: &mut [Shape]) -> Result<Prepared, Error> {
             a.ids[1][c1 - 1] = a.ids[0][c0 - 1];
         }
     }
-    // UnboundedRequest: one DPP in all, tiled and without chroma. The
-    // compressed buffer then takes the CRB beyond the DET
-    // (CalculateDETBufferSize); otherwise DML's minimum.
-    let unbounded = dpps == 1
-        && shapes
-            .iter()
-            .all(|s| s.c.is_none() && s.plane.swizzle != Swizzle::Linear);
-    let compbuf_kbytes = if unbounded {
-        CONFIG_RETURN_KBYTES - DET_KBYTES
-    } else {
-        SEGMENT_KBYTES
-    };
+    let (unbounded, compbuf_kbytes) = det::allocate(shapes);
     let compbuf_bytes = if unbounded { compbuf_kbytes * 1024 } else { 0 };
     // Mode support: DISPCLK is the pixel clock over the stream's pipes,
     // each plane's DPPCLK that or what its scaler needs; both are checked

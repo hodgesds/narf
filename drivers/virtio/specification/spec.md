@@ -26,6 +26,14 @@ blk/net/console/rng.
 
 ## 3. Public interface
 
+The PCI transport maps common configuration, notification, ISR and device
+configuration BARs once through `bus::map_bar_control`, with Device attributes
+even when the BAR is prefetchable. Each capability uses the returned BAR VA
+directly; repeated capabilities and MSI-X table accesses share the same typed
+mapping. Mapping conflicts return `VirtioPciError::BarMapFailed` without a
+physical-address fallback. Shared-memory capabilities retain their separate
+memory-window ownership and do not use this control-register path.
+
 - Inbound: capability-gated `start(config: VirtioConfig)`. Before
   `start` is called, the framework invokes
   `negotiate(offered: FeatureSet) -> Result<FeatureSet, NegotiateError>`.

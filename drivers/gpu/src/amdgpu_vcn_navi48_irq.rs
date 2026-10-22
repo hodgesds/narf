@@ -37,13 +37,12 @@ impl<I: Io> Engine<I> {
         self.seq = self.seq.wrapping_add(1).max(1);
         let seq = self.seq;
         let at = self.memory.address() + FENCE;
+        let start = self.wptr;
         let next = self.emit(&[3, at as u32, (at >> 32) as u32, seq, 4, 1])?;
         let map = self.memory.mapping();
         for _ in 0..2000 {
             let rptr = self.reg(RPTR)?;
-            if rptr.wrapping_sub(next) as i32 > 0 {
-                return Err(Error::Readback);
-            }
+            proof_pointer(rptr, start, next)?;
             let memory = self.access(|io, l| {
                 flush(io, l)?;
                 Ok(io.memory_read(map, FENCE) == seq)

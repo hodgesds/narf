@@ -220,10 +220,13 @@ fn fixture_req(
             pipe,
             depth,
             limited: false,
-            ycbcr420: req.ycbcr420,
-            colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(
+            encoding: req.encoding,
+            colorspace: crate::amdgpu_hdr::output_color_space(
+                0,
+                req.encoding.is_rgb(),
                 false,
-                req.ycbcr420,
+                req.timing.pixel_clock_khz * 10,
+                false,
             ),
         },
         c,
@@ -800,15 +803,17 @@ pub(in crate::amdgpu_dcn401_otg::tests) fn audio_info() -> AudioInfo {
 
 fn dcn401_hdmi_audio_programs_dto_acr_afmt_and_the_endpoint_like_linux() -> TestResult {
     let (p, stream, pipe) = (1, 2, 3);
+    // The acquired endpoint can differ from the PHY, DIO encoder and OTG.
+    let endpoint = 0;
     let (mut e, mut fw, c) = fixture(p, stream, pipe);
     run(e.prepare_hdmi_link(&mut fw, path(p), link(stream, pipe), c)).unwrap();
     // Audio follows running video, as Linux's post-enable does.
     assert_eq!(
-        run(e.start_hdmi_audio(path(p), audio_info())),
+        run(e.start_hdmi_audio(path(p), audio_info(), e.test_audio_endpoint())),
         Err(Error::Busy)
     );
     run(e.start_hdmi_video(path(p), c)).unwrap();
-    let a = run(e.start_hdmi_audio(path(p), audio_info())).unwrap();
+    let a = run(e.start_hdmi_audio(path(p), audio_info(), endpoint)).unwrap();
     let r = |e: &Engine<TmdsIo>, at| e.io.inner.regs.get(&at).copied().unwrap_or(0);
     let bank1 = |reg: u64| (0x16200 + reg) * 4;
     // DTO0 from the pixel clock, phase 24 MHz, sourced by this OTG.
@@ -832,11 +837,11 @@ fn dcn401_hdmi_audio_programs_dto_acr_afmt_and_the_endpoint_like_linux() -> Test
         }
     }
     for (reg, mask, value) in [
-        (0x20ba, 1, 1),                        // AFMT audio clock
-        (0x20a1, 0x8000_1100, 0x1000),         // ACR auto, HW CTS
-        (0x20a0, 0x30, 0x10),                  // audio delay
-        (0x2085, u32::MAX, u32::from(stream)), // endpoint = stream
-        (0x2075, 0x1000_ff01, 0x3700),         // FL FR LFE RL RR enabled
+        (0x20ba, 1, 1),                          // AFMT audio clock
+        (0x20a1, 0x8000_1100, 0x1000),           // ACR auto, HW CTS
+        (0x20a0, 0x30, 0x10),                    // audio delay
+        (0x2085, u32::MAX, u32::from(endpoint)), // acquired audio source
+        (0x2075, 0x1000_ff01, 0x3700),           // FL FR LFE RL RR enabled
         (0x2078, 0x30f0_0000, 0x0010_0000),
         (0x2079, 0x00f0_0000, 0x0020_0000),
         (0x207f, 0x00ff_ffff, 0x0087_6543),
@@ -849,7 +854,7 @@ fn dcn401_hdmi_audio_programs_dto_acr_afmt_and_the_endpoint_like_linux() -> Test
             return TestResult::Fail("encoder audio");
         }
     }
-    let az = |e: &Engine<TmdsIo>, i: u32| e.io.az.get(&(stream, i)).copied();
+    let az = |e: &Engine<TmdsIo>, i: u32| e.io.az.get(&(endpoint, i)).copied();
     if az(&e, 0x54) != Some(0x8000_0000)
         || az(&e, 0x25).map(|v| v & 0x37f7f) != Some(0x1_000b)
         || az(&e, 0x28) != Some(1 | 0x700 | 0x7 << 16 | 0x07 << 24)
@@ -862,7 +867,7 @@ fn dcn401_hdmi_audio_programs_dto_acr_afmt_and_the_endpoint_like_linux() -> Test
         || az(&e, 0x3c) != Some(0x5558_859e)
         || az(&e, 0x3e) != Some(u32::from_le_bytes(*b"TV\0\0"))
         || r(&e, BASE + 0x40c * 4) != 5 // AC-3 present
-        || a.endpoint != stream
+        || a.endpoint != endpoint
     {
         return TestResult::Fail("Azalia endpoint");
     }
@@ -876,7 +881,7 @@ fn dcn401_hdmi_audio_programs_dto_acr_afmt_and_the_endpoint_like_linux() -> Test
     }
     e.io.inner.regs.insert(fe, v);
     assert_eq!(
-        run(e.start_hdmi_audio(path(p), audio_info())),
+        run(e.start_hdmi_audio(path(p), audio_info(), e.test_audio_endpoint())),
         Err(Error::Busy)
     );
     assert_eq!(run(e.stop_hdmi_video(path(p))), Err(Error::Busy));
@@ -937,11 +942,14 @@ fn dcn401_hdmi_audio_tables_bandwidth_and_refusals() -> TestResult {
     info.modes[0] = info.modes[1];
     info.mode_count = 1;
     assert_eq!(
-        run(e.start_hdmi_audio(path(0), info)),
+        run(e.start_hdmi_audio(path(0), info, e.test_audio_endpoint())),
         Err(Error::Unsupported)
     );
     info.mode_count = 0;
-    assert_eq!(run(e.start_hdmi_audio(path(0), info)), Err(Error::Invalid));
+    assert_eq!(
+        run(e.start_hdmi_audio(path(0), info, e.test_audio_endpoint())),
+        Err(Error::Invalid)
+    );
     if e.status.hdmi_audio.is_some() || e.status.state != State::HdmiVideoRunning(0) {
         return TestResult::Fail("refusal changed state");
     }
@@ -1042,7 +1050,7 @@ kernel_test_in!(
 fn dcn401_hdmi_link_carries_ycbcr420_at_half_rate() -> TestResult {
     let mut req = request(1);
     req.signal = Signal::Tmds;
-    req.ycbcr420 = true;
+    req.encoding = crate::amdgpu_hdr::PixelEncoding::from_420(true);
     (
         req.timing.pixel_clock_khz,
         req.timing.h_active,
@@ -1102,6 +1110,57 @@ kernel_test_in!(
     dcn401_hdmi_link_carries_ycbcr420_at_half_rate
 );
 
+/// Deep-color TMDS420 keeps the two-pixel packing and half-rate PHY
+/// pixel clock, then scales the character clock by5:4 or3:2 and scrambles.
+fn dcn401_hdmi_link_carries_deep_color_ycbcr420() -> TestResult {
+    for (depth, tmds, code, khz) in [
+        (ColorDepth::Bpc10, dmub::TmdsDepth::Bpc10, 1, 371_250),
+        (ColorDepth::Bpc12, dmub::TmdsDepth::Bpc12, 2, 445_500),
+    ] {
+        let mut req = request(1);
+        req.signal = Signal::Tmds;
+        req.encoding = crate::amdgpu_hdr::PixelEncoding::from_420(true);
+        req.timing.pixel_clock_khz = 594_000;
+        req.timing.h_active = 3840;
+        req.timing.h_total = 4400;
+        req.timing.h_front_porch = 176;
+        req.timing.h_sync_width = 88;
+        req.timing.v_active = 2160;
+        req.timing.v_total = 2250;
+        req.timing.v_front_porch = 8;
+        req.timing.v_sync_width = 10;
+        let mut c = clock(req);
+        c.request.pixel = dccg::PixelClock::Tmds {
+            divider: dccg::TmdsDivider::By2,
+        };
+        let (mut e, mut fw, c) = fixture_req(1, 1, 1, req, c, depth);
+        let ready = run(e.prepare_hdmi_link(&mut fw, path(1), link(1, 1), c)).unwrap();
+        if ready.pixel_khz != 297_000
+            || ready.character_khz != khz
+            || !ready.scrambled
+            || fw.commands.iter().map(|c| c.0).take(3).collect::<Vec<_>>()
+                != [
+                    Command::Clock(path(1), 1, 297_000, tmds),
+                    Command::Setup(1, khz),
+                    Command::Enable(path(1), khz),
+                ]
+            || e.io.inner.regs[&dio(1, 0x209b)] & 0x300 != 0x100
+            || e.io.inner.regs[&resync(1)] & 0x30 != code << 4
+        {
+            return TestResult::Fail("deep-color TMDS420 packing, clocks or scrambling");
+        }
+        run(e.stop_hdmi_link(&mut fw, path(1))).unwrap();
+        if e.io.inner.regs[&dio(1, 0x209e)] & 0x0100001f != 0x11 {
+            return TestResult::Fail("deep-color TMDS420 left its link enabled");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_hdmi_link_carries_deep_color_ycbcr420
+);
+
 /// set_avi_info_frame's colorimetry for the output color space: the plain
 /// spaces match the range/encoding form byte for byte; BT.2020 and
 /// AdobeRGB are extended colorimetry (C 3, EC 6 / 4) with Q for the
@@ -1115,7 +1174,14 @@ fn dcn401_hdmi_avi_signals_output_colorimetry() -> TestResult {
         qs: true,
         hdmi_vic: 0,
     };
-    let f = |cs, y420| crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe_in(&t, avi, cs, y420);
+    let f = |cs, y420| {
+        crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe_in(
+            &t,
+            avi,
+            cs,
+            crate::amdgpu_hdr::PixelEncoding::from_420(y420),
+        )
+    };
     let sum = |p: &[u8; 36]| {
         p[..3]
             .iter()
@@ -1199,6 +1265,16 @@ fn dcn401_hdmi_sends_the_hdr_drm_infoframe() -> TestResult {
         return TestResult::Fail("HDR DRM InfoFrame at link start");
     }
     run(e.start_hdmi_video(path(1), c)).unwrap();
+    let from_spd = e.io.inner.writes.len();
+    let expected = run(crate::amdgpu_dcn401_otg::freesync::packet_cycle(&mut e, 1));
+    let actual: alloc::vec::Vec<u32> = e.io.inner.writes[from_spd..]
+        .iter()
+        .filter(|&&(at, _)| at == dio(1, 0x2069))
+        .map(|&(_, v)| v)
+        .collect();
+    assert_eq!(actual, expected);
+    assert_eq!(e.io.inner.regs[&dio(1, 0x20a5)] & 0x33000, 0x30000);
+    assert_eq!(e.io.inner.regs[&dio(1, 0x20aa)] >> 16, 0);
     blob[26..28].copy_from_slice(&400u16.to_le_bytes());
     let brighter = crate::amdgpu_hdr::hdr_info_packet(
         Some(&crate::amdgpu_hdr::HdrOutputMetadata::from_blob(&blob).unwrap()),
@@ -1217,4 +1293,137 @@ fn dcn401_hdmi_sends_the_hdr_drm_infoframe() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_hdmi_sends_the_hdr_drm_infoframe
+);
+
+/// Linux's HDMI422 carrier ignores stream deep color; 444 uses the RGB
+/// carrier ratio, while both retain actual FMT/GCP depth and YCbCr AVI.
+fn dcn401_hdmi_422_444_program_and_verify_actual_encoding() -> TestResult {
+    use crate::amdgpu_hdr::PixelEncoding as E;
+    for encoding in [E::Ycbcr422, E::Ycbcr444] {
+        for (depth, code, multiplier) in [
+            (ColorDepth::Bpc8, 0, 8),
+            (ColorDepth::Bpc10, 1, 10),
+            (ColorDepth::Bpc12, 2, 12),
+        ] {
+            let pixel = if encoding.is_422() { 594_000 } else { 297_000 };
+            let mut req = request(1);
+            req.signal = Signal::Tmds;
+            req.encoding = encoding;
+            req.timing.pixel_clock_khz = pixel;
+            let mut c = clock(req);
+            c.request.pixel = dccg::PixelClock::Tmds {
+                divider: dccg::TmdsDivider::By4,
+            };
+            let (mut e, mut fw, c) = fixture_req(1, 1, 1, req, c, depth);
+            let a = run(e.prepare_hdmi_link(&mut fw, path(1), link(1, 1), c)).unwrap();
+            let carrier = if encoding.is_422() {
+                pixel
+            } else {
+                pixel * multiplier / 8
+            };
+            assert_eq!(a.character_khz, carrier);
+            assert_eq!(a.pixel_khz, pixel);
+            let pll_depth = if encoding.is_422() {
+                dmub::TmdsDepth::Bpc8
+            } else {
+                match depth {
+                    ColorDepth::Bpc8 => dmub::TmdsDepth::Bpc8,
+                    ColorDepth::Bpc10 => dmub::TmdsDepth::Bpc10,
+                    ColorDepth::Bpc12 => dmub::TmdsDepth::Bpc12,
+                }
+            };
+            assert_eq!(
+                fw.commands[0].0,
+                Command::Clock(path(1), 1, pixel, pll_depth)
+            );
+            assert_eq!(fw.commands[1].0, Command::Setup(1, carrier));
+            let fmt = BASE + (0x1840 + 0x5a) * 4;
+            assert_eq!(
+                e.io.inner.regs[&fmt] & 0x2f3f00,
+                if encoding.is_422() {
+                    1 << 16 | 2 << 18
+                } else {
+                    0
+                }
+            );
+            assert_eq!(
+                e.io.inner.regs[&e.layout.odm(1, FORMAT)] & 0x33,
+                encoding.hardware_format()
+            );
+            assert_eq!(
+                e.io.inner.regs[&dio(1, 0x209e)] & 0x31007000,
+                code << 28
+                    | u32::from(encoding.is_422()) << 12
+                    | if code != 0 && !encoding.is_422() {
+                        1 << 24
+                    } else {
+                        0
+                    }
+            );
+            assert_eq!(
+                e.io.inner.regs[&resync(1)] & 0x30,
+                if encoding.is_422() { 0 } else { code << 4 }
+            );
+            assert_eq!(e.io.inner.regs[&dio(1, 0x209b)] & 0x300, 0);
+            let words: Vec<_> =
+                e.io.inner
+                    .writes
+                    .iter()
+                    .filter_map(|&(at, value)| (at == dio(1, 0x2069)).then_some(value))
+                    .take(9)
+                    .collect();
+            let avi: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            assert_eq!(avi.len(), 36);
+            assert_eq!(avi[5] >> 5, encoding.avi());
+            assert_eq!(avi.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)), 0);
+            e.hdmi_link_verify(a, false).unwrap();
+            let at = dio(1, 0x209e);
+            e.io.inner.regs.entry(at).and_modify(|r| *r ^= 1 << 12);
+            assert_eq!(e.hdmi_link_verify(a, false), Err(Error::Readback(at)));
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_hdmi_422_444_program_and_verify_actual_encoding
+);
+
+fn dcn401_hdmi_cancelled_freesync_packet_retains_timing_and_intent() -> TestResult {
+    use core::{
+        future::Future,
+        task::{Context, Waker},
+    };
+    let (mut e, mut fw, c) = fixture(1, 1, 1);
+    run(e.prepare_hdmi_link(&mut fw, path(1), link(1, 1), c)).unwrap();
+    run(e.start_hdmi_video(path(1), c)).unwrap();
+    let (model, _) = crate::amdgpu_dcn401_otg::drr::tests::live(1);
+    e.status.scanout = model.status.scanout;
+    e.status.state = State::ScanoutRunning(1);
+    let timing = e.status.pipes[1].unwrap().request.timing;
+    let range = crate::amdgpu_freesync::VrrRange {
+        min_hz: 30,
+        max_hz: 144,
+    };
+    let packet = crate::amdgpu_freesync::info_packet(&timing, range, true, true).unwrap();
+    let drr = crate::amdgpu_freesync::drr(&timing, range).unwrap();
+    e.io.inner.regs.insert(dio(1, 0x206c), 2);
+    {
+        let mut future = core::pin::pin!(e.set_freesync(1, Some(drr), packet));
+        assert!(future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+    }
+    assert_eq!(e.status.state, State::Failed(Error::Busy));
+    assert_eq!(e.status.drr.unwrap().drr, drr);
+    assert!(!e.status.freesync.unwrap().complete);
+    let writes = e.io.inner.writes.len();
+    assert_eq!(run(e.set_freesync(1, Some(drr), packet)), Err(Error::Busy));
+    assert_eq!(e.io.inner.writes.len(), writes);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_hdmi_cancelled_freesync_packet_retains_timing_and_intent
 );

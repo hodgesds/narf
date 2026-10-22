@@ -25,6 +25,14 @@ impl ColdBoot {
     pub(crate) fn media_decode_result(&self) -> Option<Result<vcn::DecodeProof, vcn::Error>> {
         self.sequence.backend.vcn.as_ref()?.decode_result()
     }
+    pub(crate) fn media_hevc_decode_result(&self) -> Option<Result<vcn::DecodeProof, vcn::Error>> {
+        self.sequence.backend.vcn.as_ref()?.hevc_result()
+    }
+    pub(crate) fn media_hevc10_decode_result(
+        &self,
+    ) -> Option<Result<vcn::DecodeProof, vcn::Error>> {
+        self.sequence.backend.vcn.as_ref()?.hevc10_result()
+    }
     pub(crate) fn media_encode_result(&self) -> Option<Result<vcn::EncodeProof, vcn::Error>> {
         self.sequence.backend.vcn.as_ref()?.encode_result()
     }
@@ -132,7 +140,12 @@ impl ColdBoot {
             if decode {
                 // SAFETY: same retained kernel VMID0/firmware/source owner,
                 // no intervening client publication and a drained IB proof.
-                proof = unsafe { vcn.prove_decode().await }
+                unsafe { vcn.prove_decode().await }.map_err(Error::Vcn)?;
+                // SAFETY: the AVC proof drained the same retained transport;
+                // clients remain excluded through this independent Main8 proof.
+                unsafe { vcn.prove_hevc().await }.map_err(Error::Vcn)?;
+                // SAFETY: no client publication; fresh drained Main8 transport.
+                proof = unsafe { vcn.prove_hevc10().await }
                     .map_err(Error::Vcn)?
                     .completion;
             }

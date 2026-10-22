@@ -415,10 +415,16 @@ _start:
     dsb sy
 
     /* MAIR_EL1: Attr0 = Normal WB (0xFF), Attr1 = Device nGnRE (0x04),
-     * Attr2 = Normal WB Tagged (0xF0).
+     * Attr2 = Normal WB Tagged (0xF0), Attr3 = Normal Non-cacheable (0x44,
+     * Linux MAIR_ATTR_NORMAL_NC, the pgprot_writecombine target), Attr4 =
+     * Device nGnRnE (0x00, the pgprot_noncached target). The encodings are
+     * Linux's; the indices are NARF's (see narf_arch::aarch64::mair), which
+     * keeps every descriptor that predates Attr3 bit-identical.
      *
-     * Bytes low-to-high: [7:0]=Attr0, [15:8]=Attr1, [23:16]=Attr2, so
-     * 0xF004FF. Normal is index 0 deliberately: `map_4kb` composes a leaf as
+     * Bytes low-to-high: [7:0]=Attr0, [15:8]=Attr1, [23:16]=Attr2,
+     * [31:24]=Attr3, [39:32]=Attr4, so 0x44F004FF. Must equal
+     * `narf_arch::aarch64::mair::MAIR_EL1_VALUE` and smp_entry.S.
+     * Normal is index 0 deliberately: `map_4kb` composes a leaf as
      * `default | caller_flags`, and an index field cannot be OR-ed. With
      * Normal at 0 the default contributes nothing to bits [4:2], so a caller
      * asking for Device (1) or Tagged (2) gets exactly that. Any other
@@ -429,9 +435,9 @@ _start:
      * apply only to Tagged Normal memory, so without it no page can be
      * checked whatever SCTLR_EL1.TCF says.
      *
-     * movz/movk: 0xF004FF does not fit a `mov` immediate. */
+     * movz/movk: 0x44F004FF does not fit a `mov` immediate. */
     movz x0, #0x04FF
-    movk x0, #0xF0, lsl #16
+    movk x0, #0x44F0, lsl #16
     msr  mair_el1, x0
 
     /* TCR_EL1: 48-bit VA, TG=4KB */

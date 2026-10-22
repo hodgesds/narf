@@ -46,11 +46,14 @@ _ap_start:
 
     /* MAIR / TCR / TTBR0 / TTBR1 — same setup as the BSP, using
      * the page tables BSP already populated. */
-    /* Same MAIR as the BSP: Attr0 Normal, Attr1 Device, Attr2
-     * Normal-Tagged. MAIR is per-CPU, so an AP that skipped it would read
-     * different attributes from the identical descriptors. */
+    /* Same MAIR as the BSP: Attr0 Normal, Attr1 Device-nGnRE, Attr2
+     * Normal-Tagged, Attr3 Normal-NC, Attr4 Device-nGnRnE (0x44F004FF,
+     * `narf_arch::aarch64::mair::MAIR_EL1_VALUE`). MAIR is per-CPU, so an
+     * AP that skipped it would read different attributes from the
+     * identical descriptors -- a write-combined user leaf would decode as
+     * Device-nGnRnE here and Normal-NC on the BSP. */
     movz x0, #0x04FF
-    movk x0, #0xF0, lsl #16
+    movk x0, #0x44F0, lsl #16
     msr  mair_el1, x0
 
     mov  x0, #16

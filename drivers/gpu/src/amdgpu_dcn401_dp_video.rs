@@ -317,7 +317,7 @@ impl<I: Io> Engine<I> {
     }
     /// vpg3_update_generic_info_packet(index, packet, immediate) on DIO
     /// stream encoder `stream`'s VPG.
-    async fn dp_packet(
+    pub(in crate::amdgpu_dcn401_otg) async fn dp_packet(
         &mut self,
         stream: u8,
         index: u32,
@@ -340,15 +340,12 @@ impl<I: Io> Engine<I> {
             Ok(())
         })
     }
-    /// enc3_stop_dp_info_packets for the VSC and HDR SDPs: their enables
+    /// enc3_stop_dp_info_packets for VSC, FreeSync SPD and HDR SDPs: their enables
     /// off, the secondary master kept while another packet (audio, PPS)
     /// still needs it.
     fn dp_video_infopackets_off(&mut self, w: &Work) -> Result<(), Error> {
-        if w.frontend.request.sdp_enables() == 0 {
-            return Ok(());
-        }
         let at = w.at(self.layout, SEC_CNTL);
-        self.update(at, 1 << 20 | 1 << 23, 0)?;
+        self.update(at, 1 << 20 | 1 << 22 | 1 << 23, 0)?;
         if self.read(at)? & !1 == 0 {
             self.update(at, 1, 0)?;
         }

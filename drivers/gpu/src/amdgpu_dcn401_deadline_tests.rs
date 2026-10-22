@@ -34,16 +34,46 @@ fn plan() -> dml::Plan {
     dml::admit(
         &soc(),
         &dml::Mode {
+            hdmi: false,
             timing: timing(),
             pitch: 1920,
             bytes_per_pixel: 4,
-            ycbcr420: false,
+            encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
             dsc: None,
             planes: [None; dml::MAX_PLANES],
         },
     )
     .unwrap()
 }
+fn dcn401_deadlines_require_actual_compbuf_capacity() -> TestResult {
+    let mut mode = plan().mode;
+    let mut plane = mode.plane_list().next().unwrap();
+    plane.swizzle = dml::Swizzle::S64K2D;
+    mode.planes[0] = Some(plane);
+    let plan = dml::admit(&soc(), &mode).unwrap();
+    assert!(plan.plane(0).unwrap().rq.unbounded_request_enabled);
+    let needed = plan.arbiter.compbuf_segments;
+    assert!(needed > 1);
+    let mut e = engine();
+    e.deadline_writes(0, &plan, false).unwrap();
+    let at = BASE + 0x4ba * 4;
+    for (requested, current) in [(needed - 1, needed), (needed, needed - 1), (1, 1)] {
+        e.io.regs.insert(at, requested | current << 8);
+        assert_eq!(e.deadline_writes(0, &plan, true), Err(Error::Busy));
+    }
+    e.io.regs.insert(at, needed * 0x101);
+    assert_eq!(e.deadline_writes(0, &plan, true), Ok(()));
+    let bounded = self::plan();
+    e.deadline_writes(0, &bounded, false).unwrap();
+    e.io.regs.insert(at, 5 * 0x101);
+    assert_eq!(e.deadline_writes(0, &bounded, true), Ok(()));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-deadline",
+    dcn401_deadlines_require_actual_compbuf_capacity
+);
+
 fn hubp_at(pipe: u8, reg: u64) -> u64 {
     BASE + (reg + u64::from(pipe) * 0xdc) * 4
 }
@@ -69,7 +99,7 @@ fn owners(plan: &dml::Plan, pipe: u8) -> (Request, RequestorApplied, dccg::Appli
         timing: plan.mode.timing,
         sync: plan.sync,
         signal: Signal::DisplayPort,
-        ycbcr420: false,
+        encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
         dsc: None,
         odm: SplitPipes::NONE,
     };
@@ -77,7 +107,8 @@ fn owners(plan: &dml::Plan, pipe: u8) -> (Request, RequestorApplied, dccg::Appli
         pipe,
         surface,
         overlays: [None; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
-        det_bytes: 327_680,
+        det_bytes: plan.det_bytes,
+        overlay_det_bytes: core::array::from_fn(|k| plan.plane(k + 1).map_or(0, |p| p.det_bytes)),
         compbuf_bytes: 1_048_576,
         pixel_chunk_bytes: 8192,
         minimum_chunk_bytes: 1024,
@@ -117,6 +148,8 @@ fn dcn401_deadlines_program_plan_values_into_native_fields() -> TestResult {
     let plan = plan();
     for pipe in 0..4 {
         let mut e = engine();
+        e.io.regs
+            .insert(BASE + 0x4ba * 4, plan.arbiter.compbuf_segments * 0x101);
         // Flush/row-TTU bits Linux leaves alone and an inherited stutter
         // allowance that must be forced off.
         e.io.regs.insert(hubp_at(pipe, GLOBAL_TTU), 0x0b00_0000);
@@ -253,7 +286,7 @@ fn dcn401_deadlines_bind_only_the_admitted_owners() -> TestResult {
             // FRL timing has no deadline owner yet (HPO DP now does).
             Request {
                 signal: Signal::HdmiFrl,
-                ycbcr420: false,
+                encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
                 ..timing
             },
             requestor,
@@ -502,6 +535,8 @@ fn dcn401_deadlines_program_each_plane_its_own_dlg() -> TestResult {
     let (_, mut requestor, _) = owners(&plan, 0);
     requestor.overlays[0] = Some(ov);
     let mut e = engine();
+    e.io.regs
+        .insert(BASE + 0x4ba * 4, plan.arbiter.compbuf_segments * 0x101);
     e.status.requestor = Some(requestor);
     if e.deadline_writes(0, &plan, false).is_err() || e.deadline_writes(0, &plan, true).is_err() {
         return TestResult::Fail("program/verify both planes");
@@ -565,9 +600,10 @@ fn dcn401_deadlines_bind_every_planned_plane() -> TestResult {
     if !bound(&plan, timing, requestor, clock, 50_000) {
         return TestResult::Fail("matching planes refused");
     }
-    let with = |s: SurfaceApplied| RequestorApplied {
-        overlays: [Some(s), None, None],
-        ..requestor
+    let with = |s: SurfaceApplied| {
+        let mut next = requestor;
+        next.overlays = [Some(s), None, None];
+        next
     };
     let layout = ov.request.plane.unwrap();
     let moved = SurfaceApplied {
@@ -696,6 +732,7 @@ fn dcn401_deadlines_program_each_split_pipe_its_mcaches() -> TestResult {
     };
     let plane = s.request.dml_plane();
     let mode = dml::Mode {
+        hdmi: false,
         timing: Timing {
             pixel_clock_khz: 533_250,
             h_active: 3840,
@@ -711,7 +748,7 @@ fn dcn401_deadlines_program_each_split_pipe_its_mcaches() -> TestResult {
         },
         pitch: u32::from(plane.pitch),
         bytes_per_pixel: 4,
-        ycbcr420: false,
+        encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
         dsc: None,
         planes: [Some(plane), None, None, None],
     };
@@ -730,6 +767,8 @@ fn dcn401_deadlines_program_each_split_pipe_its_mcaches() -> TestResult {
     let (_, mut requestor, _) = owners(&plan, 0);
     requestor.surface = s;
     let mut e = engine();
+    e.io.regs
+        .insert(BASE + 0x4ba * 4, plan.arbiter.compbuf_segments * 0x101);
     e.status.surfaces[0] = Some(s);
     e.status.requestor = Some(requestor);
     if e.deadline_writes(0, &plan, false).is_err() || e.deadline_writes(0, &plan, true).is_err() {
@@ -780,4 +819,56 @@ fn dcn401_deadlines_program_each_split_pipe_its_mcaches() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-deadline",
     dcn401_deadlines_program_each_split_pipe_its_mcaches
+);
+
+/// HDMI's dynamic-ODM exclusion is bound to the actual encoder transport,
+/// including FRL; all native DP encodings remain admitted as DP.
+fn dcn401_deadlines_bind_hdmi_transport_including_frl() -> TestResult {
+    for signal in [
+        Signal::DisplayPort,
+        Signal::HpoDisplayPort,
+        Signal::Tmds,
+        Signal::HdmiFrl,
+    ] {
+        let mut mode = self::plan().mode;
+        mode.hdmi = matches!(signal, Signal::Tmds | Signal::HdmiFrl);
+        let plan = dml::admit(&soc(), &mode).unwrap();
+        let (mut timing, requestor, clock) = owners(&plan, 0);
+        timing.signal = signal;
+        assert!(bound(&plan, timing, requestor, clock, 50_000));
+        mode.hdmi = !mode.hdmi;
+        let wrong = dml::admit(&soc(), &mode).unwrap();
+        assert!(!bound(&wrong, timing, requestor, clock, 50_000));
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-deadline",
+    dcn401_deadlines_bind_hdmi_transport_including_frl
+);
+
+fn dcn401_deadlines_bind_exact_output_encoding() -> TestResult {
+    use crate::amdgpu_hdr::PixelEncoding as E;
+    for encoding in [E::Rgb, E::Ycbcr422, E::Ycbcr444] {
+        let mut mode = self::plan().mode;
+        mode.hdmi = true;
+        mode.encoding = encoding;
+        let plan = dml::admit(&soc(), &mode).unwrap();
+        let (mut timing, requestor, clock) = owners(&plan, 0);
+        timing.signal = Signal::Tmds;
+        timing.encoding = encoding;
+        assert!(bound(&plan, timing, requestor, clock, 50_000));
+        for other in [E::Rgb, E::Ycbcr422, E::Ycbcr444]
+            .into_iter()
+            .filter(|other| *other != encoding)
+        {
+            timing.encoding = other;
+            assert!(!bound(&plan, timing, requestor, clock, 50_000));
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-deadline",
+    dcn401_deadlines_bind_exact_output_encoding
 );

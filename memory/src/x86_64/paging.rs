@@ -58,6 +58,17 @@ impl PtFlags {
 
     pub const EMPTY: Self = Self(0);
 
+    /// PAT bit of a **4 KiB** PTE (bit 7, Linux `_PAGE_PAT`). The same bit
+    /// position is [`HUGE_PAGE`](Self::HUGE_PAGE) in a PDE / PDPTE, which
+    /// is why large leaves carry their PAT bit at 12 instead.
+    pub const PAT_4K: Self = Self(1 << 7);
+    /// PAT bit of a 2 MiB / 1 GiB leaf (bit 12, Linux `_PAGE_PAT_LARGE`).
+    pub const PAT_LARGE: Self = Self(1 << 12);
+    /// The memory-type selector of a 4 KiB PTE: PWT | PCD | PAT(7).
+    pub const CACHE_MASK_4K: Self = Self((1 << 3) | (1 << 4) | (1 << 7));
+    /// The memory-type selector of a large leaf: PWT | PCD | PAT(12).
+    pub const CACHE_MASK_LARGE: Self = Self((1 << 3) | (1 << 4) | (1 << 12));
+
     #[inline]
     pub const fn bits(self) -> u64 {
         self.0
@@ -65,6 +76,28 @@ impl PtFlags {
     #[inline]
     pub const fn contains(self, other: Self) -> bool {
         (self.0 & other.0) == other.0
+    }
+
+    /// Rebuild a flag set from raw bits.
+    #[inline]
+    pub const fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    /// This flag set with every bit of `other` cleared.
+    #[inline]
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
+    /// Linux `protval_4k_2_large`: convert flags composed for a 4 KiB PTE
+    /// into the encoding a 2 MiB / 1 GiB leaf needs, moving the PAT bit from
+    /// 7 to 12 so that `map_2mb`/`map_1gb`'s own `HUGE_PAGE` (also bit 7)
+    /// cannot be mistaken for, or swallow, a memory-type selection. Every
+    /// other bit is unchanged, so flags without PAT(7) convert to themselves.
+    #[inline]
+    pub const fn protval_4k_2_large(self) -> Self {
+        Self(narf_arch::x86_64::pat::protval_4k_2_large(self.0))
     }
 
     /// Flag mask that tags a PTE with protection-key `domain`. Only the
@@ -115,9 +148,28 @@ impl PageTableEntry {
     }
 
     /// Physical address of the mapped page / next-level table.
+    ///
+    /// Not for a 2 MiB / 1 GiB *leaf*: bit 12 there is the PAT bit, not an
+    /// address bit — use [`large_addr`](Self::large_addr).
     #[inline]
     pub const fn addr(self) -> PhysAddr {
         PhysAddr::new(self.0 & 0x000f_ffff_ffff_f000)
+    }
+
+    /// Physical base of a 2 MiB / 1 GiB leaf (PS=1). Bit 12 is the large
+    /// leaf's PAT bit (Linux `PHYSICAL_PMD_PAGE_MASK` excludes it), and a
+    /// large leaf's base is at least 2 MiB aligned, so the address bits
+    /// below 21 are masked as well.
+    #[inline]
+    pub const fn large_addr(self) -> PhysAddr {
+        PhysAddr::new(self.0 & 0x000f_ffff_ffe0_0000)
+    }
+
+    /// Flags of a 2 MiB / 1 GiB leaf, including its PAT bit (12), which
+    /// [`flags`](Self::flags) masks out as an address bit.
+    #[inline]
+    pub const fn large_flags(self) -> PtFlags {
+        PtFlags(self.0 & (0xfff0_0000_0000_0fff | (1 << 12)))
     }
 
     #[inline]
@@ -957,7 +1009,7 @@ pub unsafe fn unmap_2mb(pml4_phys: PhysAddr, virt: VirtAddr) -> Result<PhysAddr,
     }
     pd.entries[idx.pd] = PageTableEntry::EMPTY;
     unsafe { invlpg_global(virt) };
-    Ok(leaf.addr())
+    Ok(leaf.large_addr())
 }
 
 /// Remove a 1 GiB PDPT leaf and return its physical base.
@@ -987,7 +1039,7 @@ pub unsafe fn unmap_1gb(pml4_phys: PhysAddr, virt: VirtAddr) -> Result<PhysAddr,
     }
     pdpt.entries[idx.pdpt] = PageTableEntry::EMPTY;
     unsafe { invlpg_global(virt) };
-    Ok(leaf.addr())
+    Ok(leaf.large_addr())
 }
 
 /// to point at `phys` with `flags | PRESENT`. `INVLPG`s the target
@@ -2479,7 +2531,7 @@ pub unsafe fn leaf_flags_at(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<(PtFl
         return None;
     }
     if e.flags().contains(PtFlags::HUGE_PAGE) {
-        return Some((e.flags(), 1 << 30));
+        return Some((e.large_flags(), 1 << 30));
     }
     // SAFETY: a present non-huge PDPT entry names a live PD frame.
     let pd = unsafe { &*e.addr().kernel_ptr::<PageTable>() };
@@ -2488,7 +2540,7 @@ pub unsafe fn leaf_flags_at(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<(PtFl
         return None;
     }
     if e.flags().contains(PtFlags::HUGE_PAGE) {
-        return Some((e.flags(), 1 << 21));
+        return Some((e.large_flags(), 1 << 21));
     }
     // SAFETY: a present non-huge PD entry names a live PT frame.
     let pt = unsafe { &*e.addr().kernel_ptr::<PageTable>() };
@@ -2628,7 +2680,7 @@ pub unsafe fn translate(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<PhysAddr>
     }
     if e.flags().contains(PtFlags::HUGE_PAGE) {
         return Some(PhysAddr::new(
-            e.addr().raw() + (virt.raw() & ((1 << 30) - 1)),
+            e.large_addr().raw() + (virt.raw() & ((1 << 30) - 1)),
         ));
     } // 1 GiB
       // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
@@ -2639,7 +2691,7 @@ pub unsafe fn translate(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<PhysAddr>
     }
     if e.flags().contains(PtFlags::HUGE_PAGE) {
         return Some(PhysAddr::new(
-            e.addr().raw() + (virt.raw() & ((1 << 21) - 1)),
+            e.large_addr().raw() + (virt.raw() & ((1 << 21) - 1)),
         ));
     } // 2 MiB
       // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.

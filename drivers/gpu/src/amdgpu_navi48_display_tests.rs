@@ -23,6 +23,7 @@ struct Fake {
     /// DP_128B132B_SUPPORTED_LINK_RATES.
     uhbr: u8,
     fec: u8,
+    metadata: Option<crate::amdgpu_freesync::AmdVsdb>,
 }
 fn checksum(block: &mut [u8]) {
     block[127] = 0u8.wrapping_sub(block[..127].iter().fold(0u8, |s, b| s.wrapping_add(*b)));
@@ -60,9 +61,16 @@ fn fake(blocks: usize) -> Fake {
         lttpr: None,
         uhbr: 0,
         fec: 0,
+        metadata: None,
     }
 }
 impl Aux for Fake {
+    async fn amd_vsdb(
+        &mut self,
+        _: &[u8],
+    ) -> Result<Option<crate::amdgpu_freesync::AmdVsdb>, dmub::Error> {
+        Ok(self.metadata)
+    }
     async fn transfer(
         &mut self,
         instance: u8,
@@ -312,11 +320,22 @@ kernel_test_in!(
 );
 
 struct FakeHdmi {
+    mccs: ddc::mccs::tests::Monitor,
+    mccs_channels: Vec<(u8, u64)>,
     result: Result<Vec<u8>, ddc::Error>,
     channels: Vec<u8>,
     stall: bool,
 }
 impl Hdmi for FakeHdmi {
+    async fn mccs(
+        &mut self,
+        channel: u8,
+        generation: u64,
+        metadata: crate::amdgpu_freesync::AmdVsdb,
+    ) -> Result<ddc::mccs::Negotiated, ddc::Error> {
+        self.mccs_channels.push((channel, generation));
+        ddc::mccs::negotiate(&mut self.mccs, generation, metadata).await
+    }
     async fn edid(&mut self, channel: u8) -> Result<Vec<u8>, ddc::Error> {
         self.channels.push(channel);
         if self.stall {
@@ -339,6 +358,8 @@ fn navi48_display_scans_hdmi_with_native_ddc_and_dp_with_aux() -> TestResult {
         let mut p = mixed_probe();
         let mut aux = fake(1);
         let mut hdmi = FakeHdmi {
+            mccs: Default::default(),
+            mccs_channels: Vec::new(),
             result: result.clone(),
             channels: Vec::new(),
             stall: false,
@@ -358,6 +379,9 @@ fn navi48_display_scans_hdmi_with_native_ddc_and_dp_with_aux() -> TestResult {
                     dsc: None,
                     dprx_feature: 0,
                     verified_link: None,
+                    amd_vsdb: None,
+                    generation: 0,
+                    mccs: None,
                 })
                 .map_err(Error::Ddc)
         );
@@ -387,6 +411,8 @@ fn navi48_display_ddc_fatal_error_or_cancellation_blocks_aux_and_reuse() -> Test
         let mut p = mixed_probe();
         let mut aux = fake(1);
         let mut hdmi = FakeHdmi {
+            mccs: Default::default(),
+            mccs_channels: Vec::new(),
             result: Err(error),
             channels: Vec::new(),
             stall: false,
@@ -406,6 +432,8 @@ fn navi48_display_ddc_fatal_error_or_cancellation_blocks_aux_and_reuse() -> Test
     let mut p = mixed_probe();
     let mut aux = fake(1);
     let mut hdmi = FakeHdmi {
+        mccs: Default::default(),
+        mccs_channels: Vec::new(),
         result: Ok(fake(1).edid),
         channels: Vec::new(),
         stall: true,
@@ -486,4 +514,122 @@ fn navi48_display_reads_128b_132b_rates() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-display",
     navi48_display_reads_128b_132b_rates
+);
+
+fn navi48_hdmi_discovery_requires_generation_bound_mccs_enable() -> TestResult {
+    let metadata = ddc::mccs::tests::metadata();
+    let mut probe = mixed_probe();
+    let mut aux = fake(1);
+    aux.metadata = Some(metadata);
+    let mut hdmi = FakeHdmi {
+        mccs: Default::default(),
+        mccs_channels: Vec::new(),
+        result: Ok(fake(1).edid),
+        channels: Vec::new(),
+        stall: false,
+    };
+    let first = run(probe.scan_with(&mut aux, Some(&mut hdmi))).unwrap();
+    let sink = first[0].sink.as_ref().unwrap();
+    assert_eq!(sink.amd_vsdb, Some(metadata));
+    assert!(sink.generation != 0 && sink.hdmi_vrr_range().is_some());
+    assert_eq!(hdmi.mccs_channels, vec![(0, sink.generation)]);
+    assert!(first[1].sink.as_ref().unwrap().dpcd.is_some());
+    // A new discovery never borrows an old enable proof, even with identical
+    // EDID bytes. A sink with DDC/CI disabled still works at fixed refresh.
+    hdmi.mccs.refuse_set = true;
+    hdmi.mccs.value = 1;
+    let second = run(probe.scan_with(&mut aux, Some(&mut hdmi))).unwrap();
+    let second = second[0].sink.as_ref().unwrap();
+    assert_ne!(sink.generation, second.generation);
+    assert!(second.mccs.is_none() && second.hdmi_vrr_range().is_none());
+    let mut wrong = second.clone();
+    wrong.mccs = sink.mccs;
+    assert!(wrong.hdmi_vrr_range().is_none());
+    assert!(run(probe.scan_with(&mut aux, Some(&mut hdmi))).unwrap()[1]
+        .sink
+        .is_ok());
+    for case in 0..5 {
+        hdmi.mccs = Default::default();
+        match case {
+            0 => hdmi.mccs.corrupt = true,
+            1 => hdmi.mccs.wrong_offset = true,
+            2 => hdmi.mccs.value = 0,
+            3 => hdmi.mccs.caps = b"(vcp(10))".to_vec(),
+            _ => hdmi.mccs.fault = Some(ddc::Error::Nack),
+        }
+        let ports = run(probe.scan_with(&mut aux, Some(&mut hdmi))).unwrap();
+        assert!(ports[0].sink.as_ref().unwrap().hdmi_vrr_range().is_none());
+        assert!(ports[1].sink.is_ok());
+        assert_eq!(probe.state(), State::Ready);
+    }
+    aux.metadata = Some(crate::amdgpu_freesync::AmdVsdb {
+        vcp_code: 0,
+        ..metadata
+    });
+    let count = hdmi.mccs_channels.len();
+    let direct = run(probe.scan_with(&mut aux, Some(&mut hdmi))).unwrap();
+    assert!(direct[0].sink.as_ref().unwrap().hdmi_vrr_range().is_some());
+    assert_eq!(count, hdmi.mccs_channels.len());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-mccs",
+    navi48_hdmi_discovery_requires_generation_bound_mccs_enable
+);
+fn navi48_hdmi_mccs_cancel_or_uncertainty_retains_scan_and_previous_sinks() -> TestResult {
+    for case in 0..3 {
+        let mut probe = mixed_probe();
+        let mut aux = fake(1);
+        aux.metadata = Some(ddc::mccs::tests::metadata());
+        let mut hdmi = FakeHdmi {
+            mccs: Default::default(),
+            mccs_channels: Vec::new(),
+            result: Ok(fake(1).edid),
+            channels: Vec::new(),
+            stall: false,
+        };
+        let old = run(probe.scan_with(&mut aux, Some(&mut hdmi))).unwrap();
+        let sibling = old[1].clone();
+        hdmi.mccs = Default::default();
+        if case == 0 {
+            hdmi.mccs.fault = Some(ddc::Error::Timeout);
+            assert_eq!(
+                run(probe.scan_with(&mut aux, Some(&mut hdmi))),
+                Err(Error::Ddc(ddc::Error::Timeout))
+            );
+            assert_eq!(
+                probe.state(),
+                State::Failed(Error::Ddc(ddc::Error::Timeout))
+            );
+        } else {
+            // First request or after the real set: cancellation never creates
+            // a result/proof or clears the transaction owner.
+            hdmi.mccs.stall_after = Some(if case == 1 { 1 } else { 8 });
+            {
+                let mut f = core::pin::pin!(probe.scan_with(&mut aux, Some(&mut hdmi)));
+                assert!(f
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending());
+            }
+            assert_eq!(probe.state(), State::Scanning);
+            assert!(!hdmi.mccs.requests.is_empty());
+            if case == 2 {
+                assert!(hdmi.mccs.requests.iter().any(|b| b[2] == 3));
+            }
+        }
+        let n = hdmi.mccs_channels.len();
+        assert_eq!(
+            run(probe.scan_with(&mut aux, Some(&mut hdmi))),
+            Err(Error::Busy)
+        );
+        assert_eq!(hdmi.mccs_channels.len(), n);
+        assert_eq!(old[1], sibling);
+        assert!(old[0].sink.as_ref().unwrap().hdmi_vrr_range().is_some());
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-mccs",
+    navi48_hdmi_mccs_cancel_or_uncertainty_retains_scan_and_previous_sinks
 );

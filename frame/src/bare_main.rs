@@ -427,10 +427,7 @@ fn try_install_early_fb_console(fb_info: narf_boot::info::FramebufferInfo) {
     //
     // Mapping also removes the 4 GiB ceiling: an `ioremap`'d FB is reachable
     // wherever firmware put it.
-    #[cfg(target_arch = "x86_64")]
     let fb_attrs = narf_memory::ioremap::MmioAttrs::WriteCombining;
-    #[cfg(not(target_arch = "x86_64"))]
-    let fb_attrs = narf_memory::ioremap::MmioAttrs::Device;
     // SAFETY: the FB region was published by the bootloader and is owned
     // exclusively kernel-side.
     let mapped = match unsafe { narf_memory::ioremap::ioremap(phys, end - phys, fb_attrs) } {
@@ -715,31 +712,28 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_arch::x86_64::msr::enable_nxe();
         }
 
-        // PAT — program IA32_PAT so PA1 = WC (Linux convention).
-        // After this, any future PTE with PWT=1 maps that page
-        // write-combining. The early-FB-console install path
-        // doesn't use this yet (it runs before MMU rebind), but
-        // the Stage::Late `fb-wc-remap` initcall ioremaps the FB
-        // at a fresh WC virt for fast console scroll. Other
-        // drivers (GPU command rings, etc.) can also opt-in via
-        // `MmioAttrs::WriteCombining`.
-        // SAFETY: CPL=0, single-threaded boot, before any
-        // cacheable mapping spans a region we're changing.
-        // SAFETY: Valid memory or trusted environment
-        // Report a failure rather than discarding it. `WriteCombining` is
-        // selected by PTE.PWT, which indexes PA1; if PAT was never
-        // reprogrammed PA1 keeps its reset value WT, so every WC request --
-        // prefetchable BARs, the framebuffer console -- silently gets
-        // write-through instead. Nothing else notices, because write-through
-        // is correct, just slow.
-        // SAFETY: CPL=0, single-threaded boot, before any
-        // cacheable mapping spans a region we're changing.
-        // SAFETY: Valid memory or trusted environment
-        if unsafe { narf_arch::x86_64::pat::init_default() }.is_err() {
+        // PAT — Linux `pat_bp_init` + the boot CPU's `pat_cpu_init`: choose
+        // the layout (WB, WC, UC-, UC, WB, WP, UC-, WT), fill the cache-mode
+        // table the page-table encoders consult, and program this CPU under
+        // the SDM cache-disable sequence. Every AP programs the same value
+        // in `_ap_start_rust`; S3 resume reprograms the boot CPU.
+        //
+        // Report a failure rather than discarding it: with PAT disabled the
+        // cache-mode table degrades every WC request to UC-, which is
+        // correct, just slow, so nothing else would notice.
+        // SAFETY: CPL=0, single-threaded boot (no AP started yet), IDT live
+        // for the recoverable WRMSR, and no mapping selects a non-zero PAT
+        // slot before this point.
+        if let Err(error) = unsafe { narf_arch::x86_64::pat::bp_init() } {
+            assert!(
+                error == narf_arch::x86_64::pat::PatError::Disabled,
+                "PAT layout could not be established: {:?}",
+                error
+            );
             let _ = writeln!(
                 console::Writer,
-                "  pat: could not program IA32_PAT — write-combining is \
-                 unavailable; WC mappings will be write-through"
+                "  pat: {:?} — write-combining requests degrade to UC-",
+                error
             );
         }
 
@@ -1433,6 +1427,34 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // kernel-half code needs a PC-relative page reference across
             // ~512 GiB, which aarch64 ADRP cannot make.
             let (kstart, kend) = narf_memory::kaslr::image_phys_bounds();
+
+            // Cache-alias policy must know reserved RAM as well as pages
+            // donated to the allocator. A bootloader's undifferentiated
+            // Reserved entries may include PCI MMIO and cannot be called RAM.
+            let mut known_ram: alloc::vec::Vec<narf_memory::UsableRegion> = info
+                .memory_map
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        r.kind,
+                        narf_boot::MemRegionKind::Usable
+                            | narf_boot::MemRegionKind::AcpiReclaimable
+                            | narf_boot::MemRegionKind::AcpiNvs
+                            | narf_boot::MemRegionKind::Kernel
+                    )
+                })
+                .map(|r| narf_memory::UsableRegion {
+                    start: r.start,
+                    len: r.len,
+                })
+                .collect();
+            known_ram.push(narf_memory::UsableRegion {
+                start: narf_memory::PhysAddr::new(kstart),
+                len: kend - kstart,
+            });
+            // SAFETY: validated boot map, once on the BSP before allocator
+            // donation; the explicit final range is this kernel's RAM image.
+            unsafe { narf_memory::frame::register_boot_ram(&known_ram) };
 
             let regions: alloc::vec::Vec<narf_memory::UsableRegion> = info
                 .memory_map
@@ -3418,10 +3440,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 let pitch_bytes = info.stride as u64 * 4;
                 let raw_len = info.height as u64 * pitch_bytes;
                 let len = (raw_len + 0xFFF) & !0xFFFu64;
-                #[cfg(target_arch = "x86_64")]
                 let attrs = MmioAttrs::WriteCombining;
-                #[cfg(not(target_arch = "x86_64"))]
-                let attrs = MmioAttrs::Device;
                 // SAFETY: `phys`/`len` cover the FB region registered by
                 // Limine/UEFI and owned exclusively kernel-side; ioremap
                 // maps it into a fresh vmalloc range with `attrs`.

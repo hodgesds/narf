@@ -480,7 +480,7 @@ pub(in crate::amdgpu_dcn401_otg) fn plane_on_stream(
         Some(l) => {
             l.stream_width == t.timing.h_active
                 && l.stream_height == t.timing.v_active
-                && l.ycbcr420 == blank.request.ycbcr420
+                && l.ycbcr420 == blank.request.encoding.is_420()
         }
     };
     fits && surface.odm == t.odm

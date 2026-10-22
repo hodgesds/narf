@@ -14,7 +14,7 @@ pub struct MpcApplied {
     pub limited: bool,
     /// The output CSC converts to BT.709 YCbCr for a 4:2:0 stream (the
     /// blank request's).
-    pub ycbcr420: bool,
+    pub encoding: crate::amdgpu_hdr::PixelEncoding,
     /// The stream's output color space, which picks the output CSC (the
     /// blank request's).
     pub colorspace: crate::amdgpu_hdr::DcColorSpace,
@@ -282,7 +282,7 @@ impl Surfaces {
             || dpp.timing != blank.timing
             || a.depth != blank.request.depth
             || a.limited != blank.request.limited
-            || a.ycbcr420 != blank.request.ycbcr420
+            || a.encoding != blank.request.encoding
             || a.colorspace != blank.request.colorspace
             || e.blank_timing(blank.request, clock)? != dpp.timing
             || e.status.memory[slot]
@@ -323,7 +323,7 @@ impl Surfaces {
             dpp,
             depth: blank.request.depth,
             limited: blank.request.limited,
-            ycbcr420: blank.request.ycbcr420,
+            encoding: blank.request.encoding,
             colorspace: blank.request.colorspace,
             pending: 0,
         };

@@ -7,8 +7,9 @@
 //! ones pipes the running state leaves free), and the change runs
 //! in dc_commit_updates_for_stream's order: prepare_bandwidth (shared clocks
 //! and the kept pipes' DPP DTOs raised, the new pipes' DPP-only clocks,
-//! the other displays to their new plans with raise-only watermarks), the
-//! plane update under the display's OTG lock (`Otg::update_live_planes`),
+//! the stream/plane updates with raise-only watermarks, releasing DET
+//! budget before a sibling grows), the plane update under its OTG lock
+//! (`Otg::update_live_planes`),
 //! then optimize_bandwidth (every display's exact watermarks, the clocks
 //! lowered). Only a change of the stream itself (its ODM split, or another
 //! display's pipes) is a modeset, which the caller relights.
@@ -243,7 +244,7 @@ impl ColdBoot {
                 }
             })
             .collect();
-        let Ok(plans) = dml::admit_native(&soc, &modes) else {
+        let Ok(plans) = admit_native_modes(&soc, &modes) else {
             return Ok(None);
         };
         let plan = plans[i];
@@ -323,16 +324,11 @@ impl ColdBoot {
             .await
             .map_err(ModesetError::PipeClocks)?;
         }
-        for (j, r) in running.iter_mut().enumerate() {
-            if j == i || plans[j] == r.plan {
-                continue;
-            }
-            // SAFETY: the caller's obligations; the scanout stays live.
-            let d = unsafe { self.update_live_display_plan(r.pipe, &plans[j], true) }.await?;
-            r.plan = d.plan;
-            r.scanout.plan = d.plan;
-            self.modesets.retain(*r);
-        }
+        // Plane removal can release DET which a sibling's new plan
+        // needs. Include the changed display in the same shrink-first
+        // transaction order as the other streams' deadline updates.
+        let old_plans: Vec<_> = running.iter().map(|m| m.plan).collect();
+        let order = det_update_order(&old_plans, &plans);
         let live = otg::LivePlanes {
             primary,
             overlays: overlay_requests,
@@ -352,28 +348,46 @@ impl ColdBoot {
             ),
             frames,
         };
-        // SAFETY: the caller's obligations, CPU views of replaced surfaces
-        // withdrawn.
-        let update =
-            unsafe { self.update_live_display_planes(display, &live, &plan, &mut content) };
-        let updated = match update.await {
-            Ok(u) => u,
-            // Refused before any register write: the scanout runs as it
-            // was, under raised clocks; the caller relights.
-            Err(_)
-                if self
-                    .display_status(display)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|s| s.state == otg::State::ScanoutRunning(display)) =>
-            {
-                return Ok(None);
+        let mut updated = None;
+        for j in order {
+            if j != i {
+                if plans[j] == running[j].plan {
+                    continue;
+                }
+                // SAFETY: the caller's obligations; the scanout stays live.
+                let d = unsafe { self.update_live_display_plan(running[j].pipe, &plans[j], true) }
+                    .await?;
+                running[j].plan = d.plan;
+                running[j].scanout.plan = d.plan;
+                self.modesets.retain(running[j]);
+                continue;
             }
-            Err(e) => return Err(e.into()),
-        };
-        next.scanout = updated.scanout;
-        running[i] = next;
-        self.modesets.retain(next);
+            // SAFETY: the caller's obligations, CPU views of replaced surfaces
+            // withdrawn. This stream's DET/plane reductions latch before
+            // siblings which need the newly available budget are visited.
+            let update =
+                unsafe { self.update_live_display_planes(display, &live, &plan, &mut content) };
+            let change = match update.await {
+                Ok(u) => u,
+                // Refused before any register write: the scanout runs as it
+                // was, under raised clocks; the caller relights.
+                Err(_)
+                    if self
+                        .display_status(display)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|s| s.state == otg::State::ScanoutRunning(display)) =>
+                {
+                    return Ok(None);
+                }
+                Err(e) => return Err(e.into()),
+            };
+            next.scanout = change.scanout;
+            running[i] = next;
+            self.modesets.retain(next);
+            updated = Some(change);
+        }
+        let updated = updated.ok_or(otg::Error::Invalid)?;
         // optimize_bandwidth over the new configuration.
         let targets: Vec<(u8, u32)> = running
             .iter()

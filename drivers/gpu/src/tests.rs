@@ -6317,9 +6317,11 @@ fn smoke_drm_card_file_delivers_flip_event() -> TestResult {
         }
     }
 
-    crate::drm_registry::__reset_for_test();
     let index = crate::drm_registry::register_drm_card_with_state(
-        alloc::sync::Arc::new(crate::drm_devfs_bridge::BochsCard::new("card0".into())),
+        alloc::sync::Arc::new(crate::drm_devfs_bridge::BochsCard::new(alloc::format!(
+            "card{}",
+            crate::drm_registry::count()
+        ))),
         make_test_card_for_ioctl(),
     );
     let first = match DriCardFile::new(index) {
@@ -6439,7 +6441,6 @@ fn smoke_drm_card_file_delivers_flip_event() -> TestResult {
         _ => return TestResult::Fail("full DRM event queue did not return OutOfMemory"),
     }
 
-    crate::drm_registry::__reset_for_test();
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/drm", smoke_drm_card_file_delivers_flip_event);

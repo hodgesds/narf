@@ -4813,6 +4813,7 @@ fn credit_idle_since(cpu: usize, t0_cycles: u64) {
 /// even fire for idle CPUs, so it could never be the sole sampler).
 static PERCPU_STEAL_NS: [core::sync::atomic::AtomicU64; narf_lib::percpu::MAX_CPUS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
+#[cfg(target_arch = "x86_64")]
 static PERCPU_STEAL_LAST_NS: [core::sync::atomic::AtomicU64; narf_lib::percpu::MAX_CPUS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
 

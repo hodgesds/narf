@@ -5,11 +5,9 @@
 //! `iounmap`, `MmioAttrs`), arch-specific in the page-walk and
 //! TLB-invalidation primitives.
 //!
-//! Memory attribute: `ATTR_DEVICE` indexes MAIR_EL1[2] which the
-//! boot stub configures as `Device-nGnRnE` (strongly-ordered,
-//! non-gathered, non-reordered, non-early-write-acknowledge) —
-//! the safest default for MMIO BARs that need predictable
-//! ordering with respect to driver writes.
+//! Register mappings use Device-nGnRE (MAIR index 1). Prefetchable
+//! framebuffer windows use Normal-NC (index 3), matching Linux's
+//! `ioremap_wc` and the user leaves returned by `pgprot_writecombine`.
 //!
 //! TLB invalidation uses `tlbi vaae1is`, which broadcasts the VA invalidation
 //! for every ASID across the inner-shareable domain. This covers shared TTBR1
@@ -19,47 +17,36 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
-
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::aarch64::paging::{
-    self, map_4kb, read_ttbr1_el1, tlb_invalidate_va_all_asids_inner_shareable, MapError, PtFlags,
+    self, map_4kb, read_ttbr1_el1, tlb_invalidate_va_all_asids_inner_shareable, unmap_4kb,
+    MapError, PtFlags,
 };
 use crate::vmalloc::{self, VmRange, VmallocError};
 use crate::{PhysAddr, VirtAddr};
 
-/// Cache of (phys, len) → IoMapping. Same rationale as x86_64:
-/// repeated probes / map_cap calls on the same BAR return the
-/// cached VA so we don't leak vmalloc + PTE frames.
-static CACHE: IrqSafeSpinLock<Vec<IoMapping>> = IrqSafeSpinLock::new(Vec::new());
-
-fn cache_lookup(phys: u64, len: u64) -> Option<IoMapping> {
-    CACHE
-        .lock()
-        .iter()
-        .copied()
-        .find(|m| m.phys == phys && m.len == len)
-}
-
-fn cache_insert(m: IoMapping) {
-    CACHE.lock().push(m);
-}
-
-fn cache_remove(virt: u64) {
-    CACHE.lock().retain(|m| m.virt != virt);
-}
+/// Typed claims include pending installs and teardowns. No cache lock is
+/// held across page-table allocation, mapping, rollback or TLB shootdown.
+static CACHE: IrqSafeSpinLock<crate::ioremap_cache::Cache<MmioAttrs, IoMapping>> =
+    IrqSafeSpinLock::new(crate::ioremap_cache::Cache::new());
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MmioAttrs {
     Device,
     WriteBack,
+    /// Normal, inner/outer non-cacheable: Linux `ioremap_wc`.
+    WriteCombining,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum IoremapError {
     BadLen,
     BadAlign,
+    /// An overlapping mapping requests different memory attributes.
+    AttributeConflict,
+    /// An identical mapping is currently installing or tearing down.
+    Busy,
     Exhausted,
     Map(MapError),
 }
@@ -107,8 +94,9 @@ impl IoMapping {
 ///
 /// # Safety
 /// Mirrors x86_64 ioremap's contract: phys must be a real device
-/// MMIO address held exclusively by the caller; len must cover the
-/// driver-relevant window; the active TTBR1 root must be writable.
+/// MMIO address or owned firmware/RAM window held exclusively by the caller;
+/// len must cover the driver-relevant window; the active TTBR1 root must be
+/// writable. Known System RAM retains write-back leaves like its direct map.
 pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping, IoremapError> {
     if len == 0 {
         return Err(IoremapError::BadLen);
@@ -127,11 +115,16 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
         .ok_or(IoremapError::BadLen)?
         & !0xFFF;
 
-    if let Some(m) = cache_lookup(base, map_len) {
-        // The cached entry carries whichever offset first created it; this
-        // caller wants its own.
-        return Ok(IoMapping { offset, ..m });
-    }
+    let reservation =
+        match crate::ioremap_cache::claim(&CACHE, base, map_len, attrs).map_err(|e| match e {
+            crate::ioremap_cache::Error::BadRange => IoremapError::BadLen,
+            crate::ioremap_cache::Error::Conflict => IoremapError::AttributeConflict,
+            crate::ioremap_cache::Error::Busy => IoremapError::Busy,
+            crate::ioremap_cache::Error::Exhausted => IoremapError::Exhausted,
+        })? {
+            crate::ioremap_cache::Claim::Ready(m) => return Ok(IoMapping { offset, ..m }),
+            crate::ioremap_cache::Claim::Pending(reservation) => reservation,
+        };
 
     let range = vmalloc::alloc(map_len)?;
     // SAFETY: `read_ttbr1_el1` only issues `MRS .., TTBR1_EL1`, which
@@ -144,11 +137,10 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
     let attr_flag = match attrs {
         MmioAttrs::Device => PtFlags::ATTR_DEVICE,
         MmioAttrs::WriteBack => PtFlags::ATTR_NORMAL,
+        MmioAttrs::WriteCombining => PtFlags::ATTR_NORMAL_NC,
     };
-    // map_4kb already ORs in VALID | TYPE_PAGE | AF | SH_INNER |
-    // ATTR_NORMAL — passing ATTR_DEVICE here OR's into the same
-    // bit field and the higher index wins for non-zero values.
-    // We also UXN+PXN device memory to be safe (no-execute).
+    // ATTR_NORMAL is zero. Nonzero AttrIndx values select the requested
+    // device/Normal-NC type. All kernel I/O windows are execute-never.
     let flags = attr_flag | PtFlags::AP_RW_EL1 | PtFlags::UXN | PtFlags::PXN;
 
     let pages = (map_len >> 12) as usize;
@@ -156,6 +148,11 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
         let off = (i as u64) * 4096;
         let v = VirtAddr::new(range.base + off);
         let p = PhysAddr::new(base + off);
+        let flags = if attrs != MmioAttrs::WriteBack && crate::frame::is_system_ram(p) {
+            PtFlags::ATTR_NORMAL | PtFlags::AP_RW_EL1 | PtFlags::UXN | PtFlags::PXN
+        } else {
+            flags
+        };
         // SAFETY: vmalloc-fresh VA; phys+off per caller's
         // exclusivity contract; root is the active TTBR1.
         // SAFETY: Valid memory or trusted environment
@@ -164,14 +161,14 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
             for j in 0..i {
                 let off_j = (j as u64) * 4096;
                 let v_j = VirtAddr::new(range.base + off_j);
-                // SAFETY: tlbi is always legal at EL1.
-                unsafe {
-                    tlb_invalidate_va_all_asids_inner_shareable(v_j);
+                // SAFETY: this exact leaf was installed above; unmap
+                // clears it and broadcasts the required TLB invalidation.
+                if unsafe { unmap_4kb(root, v_j) }.is_err() {
+                    // Keep the interval reserved if rollback cannot prove
+                    // every old leaf gone; never admit a conflicting alias.
+                    core::mem::forget(reservation);
+                    return Err(IoremapError::Map(e));
                 }
-                // No unmap_4kb on aarch64 yet — leave the L3
-                // entry; the caller's vmalloc::free is enough
-                // for now since the bump-pointer never reuses
-                // freed VA.
             }
             vmalloc::free(range);
             return Err(IoremapError::Map(e));
@@ -191,25 +188,31 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
         len: map_len,
         offset,
     };
-    cache_insert(m);
+    reservation.publish(m);
     Ok(m)
 }
 
-/// Tear down a mapping. Today: clears the TLB locally + calls
-/// vmalloc::free; a real PTE-clearing path lands when
-/// aarch64 paging gets an `unmap_4kb` to mirror x86_64's.
+/// Tear down a mapping, keeping its typed claim until every PTE is
+/// cleared and its TLB invalidation completes.
 ///
 /// # Safety
-/// `m` must originate from `ioremap`.
+/// `m` must originate from `ioremap`; all users of reused handles must have
+/// stopped accessing it before teardown. Teardown is exclusive and may run
+/// once per installed mapping.
 pub unsafe fn iounmap(m: IoMapping) {
-    cache_remove(m.virt);
+    let reservation = crate::ioremap_cache::retire(&CACHE, |ready| ready.virt == m.virt);
+    // SAFETY: the active kernel TTBR1 owns this mapping.
+    let root = unsafe { read_ttbr1_el1() };
     let pages = (m.len >> 12) as usize;
     for i in 0..pages {
         let off = (i as u64) * 4096;
         let v = VirtAddr::new(m.virt + off);
-        // SAFETY: TLB invalidation is always safe.
-        unsafe {
-            tlb_invalidate_va_all_asids_inner_shareable(v);
+        // SAFETY: this exact leaf belongs to the caller's mapping;
+        // unmap broadcasts the required invalidation before returning.
+        if unsafe { unmap_4kb(root, v) }.is_err() {
+            // A retained pending claim quarantines any uncertain leaf.
+            core::mem::forget(reservation);
+            return;
         }
     }
     let _ = paging::translate; // silence unused
@@ -217,4 +220,5 @@ pub unsafe fn iounmap(m: IoMapping) {
         base: m.virt,
         len: m.len,
     });
+    drop(reservation);
 }

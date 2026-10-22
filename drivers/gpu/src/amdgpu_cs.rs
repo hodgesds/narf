@@ -384,7 +384,15 @@ pub fn parse(
                 // SAFETY: as above.
                 let words = unsafe { read_dwords(chunk_data, length_dw, 64)? };
                 let ib = parse_ib(&words, vm)?;
-                if ibs.len() >= max_ibs(ib.ip_type) {
+                if ibs
+                    .iter()
+                    .filter(|old| {
+                        (old.ip_type, old.ip_instance, old.ring)
+                            == (ib.ip_type, ib.ip_instance, ib.ring)
+                    })
+                    .count()
+                    >= max_ibs(ib.ip_type)
+                {
                     return Err(FsError::InvalidData);
                 }
                 ibs.push(ib);
@@ -503,11 +511,23 @@ pub trait Submitter: Send + Sync {
         submission: &'a Submission,
         health: &'a Arc<crate::amdgpu_ctx::Health>,
     ) -> Pin<Box<dyn Future<Output = Result<u64, FsError>> + Send + 'a>>;
+    /// Refuse unsupported entity combinations before dependency waits or BO
+    /// placement changes; actual submission rechecks its live admission.
+    fn validate_submission(&self, _submission: &Submission) -> Result<(), FsError> {
+        Ok(())
+    }
     /// Whether job `ticket` has ended — completed, or given up on with an
     /// [`error`](Self::error) — without waiting or blocking on an async
     /// owner (job fences in syncobjs ask this). Memory the job may reach is
     /// released by [`retire`] alone, on true completion.
     fn signalled(&self, ticket: u64) -> bool;
+    /// Whether hardware completion (or an owned reset receipt) permits
+    /// memory/PTE retirement. An API error signal alone is insufficient.
+    /// Backends which acknowledge failed jobs before hardware stops must
+    /// override this with their independent physical completion witness.
+    fn retired(&self, ticket: u64) -> bool {
+        self.signalled(ticket) && self.error(ticket).is_none()
+    }
     /// How job `ticket` ended if not by completing: `TimedOut` when it hung
     /// its ring, `Canceled` when it was abandoned behind such a job.
     fn error(&self, _ticket: u64) -> Option<FsError> {
@@ -839,11 +859,13 @@ async fn nap() {
 }
 
 async fn wait_kernel(
+    card: u32,
     fences: Vec<Arc<dyn narf_filesystem::DrmFence>>,
     started: u64,
 ) -> Result<(), FsError> {
     for fence in fences {
         while !fence.is_signalled() {
+            crate::amdgpu_gem::ensure_placement_live(card)?;
             if narf_time::monotonic_ns() >= started.saturating_add(5_000_000_000) {
                 return Err(FsError::TimedOut);
             }
@@ -864,8 +886,11 @@ pub async fn dispatch_async(
     arg: usize,
     open: &CsOpen<'_>,
 ) -> Result<u64, FsError> {
-    let engine = submitter(card);
     let nr = drm_uapi::ioc_nr(cmd);
+    if nr == drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_CS {
+        crate::amdgpu_gem::ensure_placement_live(card)?;
+    }
+    let engine = submitter(card);
     if nr == drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_WAIT_FENCES {
         return wait_fences(card, engine.as_ref(), arg, open).await;
     }
@@ -946,8 +971,12 @@ pub async fn dispatch_async(
     if nr != drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_CS {
         return Err(FsError::Unsupported);
     }
+    // Terminal recovery can retain admission forever. Refuse before user
+    // dependency waits as well, and recheck on each polling iteration.
+    crate::amdgpu_gem::ensure_placement_live(card)?;
     let started = narf_time::monotonic_ns();
     let (submission, bo_list_handle) = validated(arg, vm, ctx)?;
+    engine.validate_submission(&submission)?;
     // amdgpu_ctx_get_entity: a context whose job hung or was canceled
     // fails every later submission with that error.
     let health = ctx.health(submission.ctx_id).ok_or(FsError::InvalidData)?;
@@ -1002,7 +1031,10 @@ pub async fn dispatch_async(
                     waits.push(fence);
                     break;
                 }
-                Ok(None) => nap().await,
+                Ok(None) => {
+                    crate::amdgpu_gem::ensure_placement_live(card)?;
+                    nap().await;
+                }
                 Err(result) => return result,
             }
         }
@@ -1038,11 +1070,13 @@ pub async fn dispatch_async(
     };
     for handle in after {
         while !engine.signalled(handle) {
+            crate::amdgpu_gem::ensure_placement_live(card)?;
             nap().await;
         }
     }
     for fence in waits {
         while !fence.is_signalled() {
+            crate::amdgpu_gem::ensure_placement_live(card)?;
             nap().await;
         }
     }
@@ -1070,6 +1104,7 @@ pub async fn dispatch_async(
                 if narf_time::monotonic_ns() >= started.saturating_add(5_000_000_000) {
                     return Err(FsError::TimedOut);
                 }
+                crate::amdgpu_gem::ensure_placement_live(card)?;
                 nap().await;
             }
         }
@@ -1085,6 +1120,7 @@ pub async fn dispatch_async(
                 continue;
             }
             while !fence.is_signalled() {
+                crate::amdgpu_gem::ensure_placement_live(card)?;
                 nap().await;
             }
         }
@@ -1096,13 +1132,14 @@ pub async fn dispatch_async(
             if narf_time::monotonic_ns() >= started.saturating_add(5_000_000_000) {
                 return Err(FsError::TimedOut);
             }
+            crate::amdgpu_gem::ensure_placement_live(card)?;
             nap().await;
         }
     }
     // Includes queue publication, note_job and reservation-fence attachment;
     // a relocator must never miss a job between those operations. Dependencies
     // are awaited first so other submissions can satisfy them.
-    let _placement = crate::amdgpu_gem::lock_placement(card).await;
+    let _placement = crate::amdgpu_gem::lock_placement_live(card).await?;
     // A cancelled relocation can leave kernel DMA alive after releasing the
     // card gate. Re-sample move fences after admission, including BOs omitted
     // from the list, before a new job can write their old backing.
@@ -1115,16 +1152,27 @@ pub async fn dispatch_async(
                 .fences(narf_filesystem::dma_buf::DmaResvUsage::Kernel),
         );
     }
-    wait_kernel(kernel, started).await?;
+    wait_kernel(card, kernel, started).await?;
     for object in &listed {
         let to_vram = object.preferred_domains() & u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM) != 0;
         if object.system() == to_vram && object.cpu_visible() {
             // Failed promotion preserves the current valid placement. A
             // successful move rewrites every affected VM before this job.
-            let _ = crate::amdgpu_vm::relocate(&_placement, object, to_vram).await;
+            match crate::amdgpu_vm::relocate(&_placement, object, to_vram).await {
+                Ok(()) => {}
+                // These refusals leave the source valid and any submitted
+                // move still covered by the real KERNEL-fence wait below.
+                Err(
+                    FsError::Busy | FsError::NoSpace | FsError::OutOfMemory | FsError::Unsupported,
+                ) => {}
+                // Lost/uncertain hardware progress is not ordinary pressure
+                // fallback, even if a later progress sample becomes readable.
+                Err(error) => return Err(error),
+            }
             // A failed copy can still own queued DMA. Falling back to the
             // old placement is safe only after that move fence settles.
             wait_kernel(
+                card,
                 object
                     .dma_buf()
                     .resv
@@ -1369,3 +1417,7 @@ pub fn dispatch(
     let _ = copy_out;
     Err(FsError::NotFound)
 }
+
+#[cfg(feature = "kernel-test")]
+#[path = "amdgpu_cs_liveness_tests.rs"]
+mod liveness_tests;

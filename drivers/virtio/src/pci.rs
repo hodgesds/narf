@@ -36,10 +36,10 @@
 //! | 0x28   | queue_driver             | u64   |
 //! | 0x30   | queue_device             | u64   |
 //!
-//! The driver maps the BARs the caps point at (via `bus::map_bar`)
+//! The driver maps control BARs with Device attributes (via `bus::map_bar_control`)
 //! and reads/writes through the resulting `MmioRegion`s.
 
-use narf_bus::{map_bar, BusDevice, MmioRegion};
+use narf_bus::{map_bar_control, BusDevice, MmioRegion};
 use narf_memory::PhysAddr;
 
 /// Vendor-specific cap id (PCIe spec § 7.7.4) that virtio uses for
@@ -420,51 +420,21 @@ impl VirtioRegion {
 
 /// Map a virtio-PCI cap's BAR + carve out the cap's window.
 ///
-/// On x86_64 with BARs in low RAM the BAR phys is identity-mapped,
-/// so `virt = phys` for free. On aarch64 (and any BAR above the
-/// boot identity map), we ioremap the BAR onto a fresh kernel VA
-/// so subsequent reads / writes don't fault. The choice happens
-/// per-arch via the ioremap module — both arches have it.
+/// The control BAR is mapped once with Device attributes, even when its PCI
+/// header declares it prefetchable. Repeated capabilities and MSI-X accesses
+/// reuse that typed mapping. The returned VA already includes any sub-page
+/// BAR offset; the capability's offset is added by `VirtioRegion::addr`.
 ///
 /// # Safety
-/// Forwarded to `bus::map_bar` + `memory::ioremap`. Caller owns
+/// Forwarded to `bus::map_bar_control`. Caller owns
 /// the device exclusively.
 pub unsafe fn map_cap(device: &BusDevice, cap: &VirtioCap) -> Result<VirtioRegion, VirtioPciError> {
     // SAFETY: caller-asserted.
-    let region = unsafe { map_bar(device, cap.bar) }.map_err(|_| VirtioPciError::BarMapFailed)?;
-    // ioremap covers the whole BAR (page-aligned both ends). The
-    // cap's `offset` is added inside `VirtioRegion::addr` on every
-    // access.
-    let bar_phys_pg = region.phys.raw() & !0xFFFu64;
-    let bar_end = (region.phys.raw() + region.len + 0xFFF) & !0xFFFu64;
-    let bar_len_pg = bar_end - bar_phys_pg;
-    // Reject zero-phys BARs — happens on aarch64 today because
-    // QEMU virt + `-kernel` means no firmware assigned the BARs.
-    // Until a kernel-side BAR allocator runs during PCIe
-    // enumeration, virtio devices on aarch64 will return BAR=0
-    // and we can't map a real window. Without this check ioremap
-    // would happily map phys 0 (low RAM!) and reads would
-    // succeed but return wrong data.
-    if bar_phys_pg == 0 {
-        return Err(VirtioPciError::BarMapFailed);
-    }
-    // SAFETY: caller owns the BAR window; we map in kernel VA
-    // space using strongly-uncached attributes for MMIO.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    let mapping = unsafe {
-        narf_memory::ioremap::ioremap(
-            bar_phys_pg,
-            bar_len_pg,
-            narf_memory::ioremap::MmioAttrs::Device,
-        )
-    }
-    .map_err(|_| VirtioPciError::BarMapFailed)?;
-    // virt aligns to the page boundary of the BAR; add back the
-    // offset within the page.
-    let intra_page = region.phys.raw() - bar_phys_pg;
+    let region =
+        unsafe { map_bar_control(device, cap.bar) }.map_err(|_| VirtioPciError::BarMapFailed)?;
     Ok(VirtioRegion {
         region,
-        virt: mapping.virt + intra_page,
+        virt: region.virt,
         offset: cap.offset as u64,
         length: cap.length as u64,
     })

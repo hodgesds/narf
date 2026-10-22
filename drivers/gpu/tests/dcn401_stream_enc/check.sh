@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Verify drivers/gpu/tests/dcn401_stream_enc/vectors.txt against Linux DC's
-# DCN401 stream-encoder acquisition, compiled on the host:
+# DCN401 stream-encoder and audio acquisition, compiled on the host:
 #   drivers/gpu/tests/dcn401_stream_enc/check.sh [linux-tree]
 #   drivers/gpu/tests/dcn401_stream_enc/check.sh --generate [linux-tree] > vectors.txt
 # Cut verbatim out of the Linux tree:
@@ -8,7 +8,8 @@
 #                        update_hpo_dp_stream_engine_usage,
 #                        find_first_free_match_hpo_dp_stream_enc_for_link and
 #                        the HPO DP link encoder pool (find, acquire, retain,
-#                        release, add_/remove_hpo_dp_link_enc_to/from_ctx)
+#                        release, add_/remove_hpo_dp_link_enc_to/from_ctx),
+#                        update_audio_usage and find_first_free_audio
 #   dcn10_resource.c     dcn10_find_first_free_match_stream_enc_for_link
 #                        (DCN401's find_first_free_match_stream_enc_for_link)
 # harness.c documents the line format. amdgpu_dcn401_resource.rs must
@@ -50,7 +51,8 @@ extract() {
 		update_hpo_dp_stream_engine_usage find_acquired_hpo_dp_link_enc_for_link \
 		find_free_hpo_dp_link_enc acquire_hpo_dp_link_enc retain_hpo_dp_link_enc \
 		release_hpo_dp_link_enc add_hpo_dp_link_enc_to_ctx \
-		remove_hpo_dp_link_enc_from_ctx find_first_free_match_hpo_dp_stream_enc_for_link
+		remove_hpo_dp_link_enc_from_ctx find_first_free_match_hpo_dp_stream_enc_for_link \
+		update_audio_usage find_first_free_audio
 	extract "$dc/resource/dcn10/dcn10_resource.c" \
 		dcn10_find_first_free_match_stream_enc_for_link
 	cat "$here/harness.c"
@@ -58,7 +60,7 @@ extract() {
 cc -O1 -w "$work/enc.c" -o "$work/enc"
 
 if [ $generate -eq 1 ]; then
-	echo "# Linux DCN401 stream-encoder acquisition reference vectors; see check.sh."
+	echo "# Linux DCN401 stream-encoder and audio acquisition reference vectors; see check.sh."
 	"$work/enc"
 	exit 0
 fi

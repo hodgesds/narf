@@ -226,3 +226,226 @@ kernel_test_in!(
     "drivers/gpu/navi48-power",
     navi48_hwmon_publishes_next_free_class_node
 );
+
+fn navi48_thermal_shutdown_uses_fresh_data_once_per_hot_episode() -> TestResult {
+    use core::sync::atomic::AtomicBool;
+    let hot = AtomicBool::new(false);
+    let fresh = |c| sample(Ok(telemetry(c, 0)), true);
+    assert!(!thermal_trip(&hot, None, None));
+    assert!(!thermal_trip(
+        &hot,
+        Some(&sample(Err(smu::Error::Timeout), false)),
+        None
+    ));
+    assert!(!thermal_trip(&hot, Some(&fresh(117)), None));
+    assert!(thermal_trip(&hot, Some(&fresh(118)), None));
+    assert!(!thermal_trip(&hot, Some(&fresh(119)), None));
+    // Failed periodic telemetry neither fabricates a trip nor ends a hot episode.
+    assert!(!thermal_trip(
+        &hot,
+        Some(&sample(Err(smu::Error::Rejected(0xfc)), false)),
+        None
+    ));
+    assert!(!thermal_trip(&hot, Some(&fresh(119)), Some(118)));
+    assert!(!thermal_trip(&hot, Some(&fresh(117)), Some(118)));
+    assert!(thermal_trip(&hot, Some(&fresh(118)), Some(118)));
+    assert!(!thermal_trip(&hot, Some(&fresh(100)), None));
+    // A high IRQ cannot be dismissed without a fresh below-threshold reading.
+    assert!(thermal_trip(&hot, None, Some(118)));
+    assert!(!thermal_trip(&hot, None, Some(118)));
+    assert!(!thermal_trip(&hot, Some(&fresh(40)), Some(118)));
+    let mut no_limit = fresh(200);
+    no_limit.limits = None;
+    assert!(!thermal_trip(&hot, Some(&no_limit), None));
+    no_limit.limits = Some(Limits {
+        software_shutdown_c: 0,
+        ..limits(true)
+    });
+    assert!(!thermal_trip(&hot, Some(&no_limit), None));
+    // Delayed confirmed-IRQ fallback retains its known armed limit.
+    assert!(thermal_trip(&hot, Some(&no_limit), Some(118)));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-power",
+    navi48_thermal_shutdown_uses_fresh_data_once_per_hot_episode
+);
+
+fn navi48_thermal_alert_cancellation_and_owner_change_cannot_notify_successor() -> TestResult {
+    use core::future::{pending, Future};
+    use core::sync::atomic::AtomicBool;
+    use core::task::{Context, Waker};
+    let slots = AlertSlots(AtomicU64::new(0));
+    let owner = AtomicU64::new(4);
+    let hot = AtomicBool::new(false);
+    let mut cx = Context::from_waker(Waker::noop());
+    {
+        let lease = slots.claim(4).unwrap();
+        assert!(slots.claim(4).is_none());
+        let mut task = alloc::boxed::Box::pin(alert_delay(lease, pending()));
+        assert!(task.as_mut().poll(&mut cx).is_pending());
+    }
+    assert!(slots.claim(4).is_some());
+    let old = slots.claim(4).unwrap();
+    slots.cancel();
+    owner.store(5, Ordering::Release);
+    let new = slots.claim(5).unwrap();
+    drop(old);
+    assert!(slots.claim(5).is_none());
+    assert!(!thermal_trip_if_current(
+        &owner,
+        4,
+        &hot,
+        Some(&sample(Ok(telemetry(200, 0)), true)),
+        Some(118)
+    ));
+    assert!(!hot.load(Ordering::Acquire));
+    assert!(thermal_trip_if_current(&owner, 5, &hot, None, Some(118)));
+    drop(new);
+    assert!(slots.claim(5).is_some());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-power",
+    navi48_thermal_alert_cancellation_and_owner_change_cannot_notify_successor
+);
+
+fn navi48_performance_controls_parse_and_read_native_levels() -> TestResult {
+    for (text, wanted) in [
+        ("auto\n", Ok(smu::GfxLevel::Auto)),
+        (" low ", Ok(smu::GfxLevel::Low)),
+        ("high", Ok(smu::GfxLevel::High)),
+        ("manual", Err(FsError::Unsupported)),
+        ("profile_standard", Err(FsError::Unsupported)),
+        ("profile_min_sclk", Err(FsError::Unsupported)),
+        ("profile_min_mclk", Err(FsError::Unsupported)),
+        ("profile_peak", Err(FsError::Unsupported)),
+        ("profile_exit", Err(FsError::Unsupported)),
+        ("perf_determinism", Err(FsError::Unsupported)),
+        ("turbo", Err(FsError::InvalidData)),
+        ("HIGH", Err(FsError::InvalidData)),
+        ("", Err(FsError::InvalidData)),
+    ] {
+        assert_eq!(parse_level(text), wanted);
+    }
+    let (mut applied, _) = update(None, sample(Ok(telemetry(60, 0)), true));
+    assert_eq!(level_name(None), "auto");
+    for (level, name) in [
+        (smu::GfxLevel::Auto, "auto"),
+        (smu::GfxLevel::Low, "low"),
+        (smu::GfxLevel::High, "high"),
+    ] {
+        applied.gfx_level = level;
+        assert_eq!(level_name(Some(applied)), name);
+    }
+    assert!(controls_live(Some(applied)));
+    applied.error = Some(smu::Error::Rejected(0xfc));
+    assert!(controls_live(Some(applied)));
+    for error in [
+        smu::Error::DeviceGone,
+        smu::Error::Revoked,
+        smu::Error::Timeout,
+    ] {
+        applied.error = Some(error);
+        assert!(!controls_live(Some(applied)));
+        assert_eq!(level_name(Some(applied)), "high");
+    }
+    assert!(!controls_live(None));
+    // Exercise actual DrmCard dispatch for every listed family member:
+    // malformed native input is validated before device readiness.
+    use crate::drm_registry::DrmCard;
+    for device in crate::amdgpu_rdna4::KNOWN_DEVICES {
+        let card = crate::drm_devfs_bridge::AmdgpuCard::new(
+            alloc::string::String::new(),
+            crate::amdgpu::AMD_VENDOR,
+            device.did,
+            0,
+            0,
+            None,
+        );
+        assert_eq!(
+            card.set_performance_level("turbo"),
+            Err(FsError::InvalidData)
+        );
+        assert_eq!(
+            card.set_performance_level("manual"),
+            Err(FsError::Unsupported)
+        );
+    }
+    let foreign = crate::drm_devfs_bridge::AmdgpuCard::new(
+        alloc::string::String::new(),
+        0x8086,
+        0x7550,
+        0,
+        0,
+        None,
+    );
+    assert_eq!(
+        foreign.set_performance_level("turbo"),
+        Err(FsError::Unsupported)
+    );
+    assert_eq!(foreign.performance_level(), "auto");
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-power",
+    navi48_performance_controls_parse_and_read_native_levels
+);
+
+fn navi48_performance_pending_writes_coalesce_and_cancel_without_applying() -> TestResult {
+    use core::{
+        cell::Cell,
+        future::{pending, Future},
+        task::{Context, Waker},
+    };
+    let serial = Mutex::new(());
+    let latest = AtomicU64::new(2);
+    let applied = Cell::new(smu::GfxLevel::Auto);
+    let mut cx = Context::from_waker(Waker::noop());
+    let held = serial.try_lock().unwrap();
+    let mut old = alloc::boxed::Box::pin(run_level_request(&serial, &latest, 1, async {
+        applied.set(smu::GfxLevel::Low);
+        Ok::<(), smu::Error>(())
+    }));
+    let mut new = alloc::boxed::Box::pin(run_level_request(&serial, &latest, 2, async {
+        applied.set(smu::GfxLevel::High);
+        Ok::<(), smu::Error>(())
+    }));
+    assert!(old.as_mut().poll(&mut cx).is_pending());
+    assert!(new.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(applied.get(), smu::GfxLevel::Auto);
+    drop(held);
+    assert_eq!(old.as_mut().poll(&mut cx), core::task::Poll::Ready(None));
+    assert_eq!(
+        new.as_mut().poll(&mut cx),
+        core::task::Poll::Ready(Some(Ok(())))
+    );
+    assert_eq!(applied.get(), smu::GfxLevel::High);
+    // A rejected request never reaches the publication path.
+    latest.store(3, Ordering::Release);
+    let mut rejected = alloc::boxed::Box::pin(run_level_request(&serial, &latest, 3, async {
+        Err::<(), _>(smu::Error::Rejected(0xfc))?;
+        applied.set(smu::GfxLevel::Low);
+        Ok(())
+    }));
+    assert_eq!(
+        rejected.as_mut().poll(&mut cx),
+        core::task::Poll::Ready(Some(Err(smu::Error::Rejected(0xfc))))
+    );
+    assert_eq!(applied.get(), smu::GfxLevel::High);
+    latest.store(4, Ordering::Release);
+    let mut cancelled = alloc::boxed::Box::pin(run_level_request(&serial, &latest, 4, async {
+        pending::<()>().await;
+        applied.set(smu::GfxLevel::Low);
+        Ok::<(), smu::Error>(())
+    }));
+    assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+    drop(cancelled);
+    assert!(serial.try_lock().is_some());
+    assert_eq!(applied.get(), smu::GfxLevel::High);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-power",
+    navi48_performance_pending_writes_coalesce_and_cancel_without_applying
+);

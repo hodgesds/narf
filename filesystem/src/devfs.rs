@@ -801,6 +801,12 @@ impl FileOps for DevFb0Proxy {
             None => Err(FsError::Unsupported),
         }
     }
+    fn mmap_backing(&self, offset: u64, len: usize) -> Result<crate::MmapBacking, FsError> {
+        match FB0_NODE.lock().clone() {
+            Some(node) => node.mmap_backing(offset, len),
+            None => Err(FsError::Unsupported),
+        }
+    }
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
         match FB0_NODE.lock().clone() {
             Some(n) => n.ioctl(cmd, arg),
@@ -3110,4 +3116,49 @@ fn smoke_dev_mkdir_then_symlink_inside_like_udev() -> TestResult {
 kernel_test_in!(
     "filesystem/devfs",
     smoke_dev_mkdir_then_symlink_inside_like_udev
+);
+
+/// The proxy must retain the delegate's memory type rather than rebuilding
+/// a default-WB backing from its frame list (which can be device memory).
+fn smoke_dev_fb0_preserves_mapping_attributes() -> TestResult {
+    struct TypedFramebuffer;
+    impl FileOps for TypedFramebuffer {
+        fn read<'a>(&'a self, _: u64, _: &'a mut [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async { Ok(0) })
+        }
+        fn write<'a>(&'a self, _: u64, _: &'a [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async { Ok(0) })
+        }
+        fn stat(&self) -> Stat {
+            DevNull.stat()
+        }
+        fn mmap_backing(&self, offset: u64, len: usize) -> Result<crate::MmapBacking, FsError> {
+            if offset != 4096 || len != 4096 {
+                return Err(FsError::InvalidData);
+            }
+            Ok(crate::MmapBacking {
+                frames: alloc::vec![0x8000_1000],
+                lifetime: None,
+                memory_type: narf_memory::MemoryType::WriteCombining,
+            })
+        }
+    }
+    let prior = FB0_NODE.lock().replace(Arc::new(TypedFramebuffer));
+    let backing = DevFb0Proxy.mmap_backing(4096, 4096);
+    let rejected = DevFb0Proxy.mmap_backing(0, 4096);
+    *FB0_NODE.lock() = prior;
+    match backing {
+        Ok(b)
+            if b.frames == [0x8000_1000]
+                && b.memory_type == narf_memory::MemoryType::WriteCombining
+                && matches!(rejected, Err(FsError::InvalidData)) =>
+        {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("fb0 proxy discarded typed backing"),
+    }
+}
+kernel_test_in!(
+    "filesystem/devfs",
+    smoke_dev_fb0_preserves_mapping_attributes
 );

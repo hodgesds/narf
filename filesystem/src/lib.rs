@@ -872,6 +872,16 @@ impl<T: core::any::Any + Send + Sync> MmapLifetime for T {}
 pub struct MmapBacking {
     pub frames: Vec<u64>,
     pub lifetime: Option<Arc<dyn MmapLifetime>>,
+    /// Memory type the device asks for its user leaves — the typed form of
+    /// a Linux driver applying `pgprot_writecombine` / `pgprot_noncached`
+    /// to `vma->vm_page_prot` in its `mmap`. [`MemoryType::WriteBack`]
+    /// (the default) leaves the mapping exactly as before memory types.
+    /// The address space honours a non-write-back request only for frames
+    /// outside System RAM; a RAM frame is always mapped write-back (see
+    /// `narf_memory::memtype`).
+    ///
+    /// [`MemoryType::WriteBack`]: narf_memory::MemoryType::WriteBack
+    pub memory_type: narf_memory::MemoryType,
 }
 
 impl core::fmt::Debug for MmapBacking {
@@ -879,6 +889,7 @@ impl core::fmt::Debug for MmapBacking {
         f.debug_struct("MmapBacking")
             .field("frames", &self.frames)
             .field("has_lifetime", &self.lifetime.is_some())
+            .field("memory_type", &self.memory_type)
             .finish()
     }
 }
@@ -1630,7 +1641,11 @@ pub trait FileOps: Send + Sync {
     fn mmap_backing(&self, offset: u64, len: usize) -> Result<MmapBacking, FsError> {
         let lifetime = self.mmap_lifetime(offset, len);
         let frames = self.mmap_frames(offset, len)?;
-        Ok(MmapBacking { frames, lifetime })
+        Ok(MmapBacking {
+            frames,
+            lifetime,
+            memory_type: narf_memory::MemoryType::WriteBack,
+        })
     }
 
     /// Called after shared device PTEs and their lifetime owner are published,

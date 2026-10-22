@@ -2,7 +2,7 @@
  *
  * As harness_planes.c (up to four streams, each with its own planes: linear
  * RGB surfaces with SPL's viewport, ratios and taps, every plane with the
- * fixed 320 KiB DET, DML-decided ODM and DC's auto MPC combine factor), but
+ * DC DET allocation, DML-decided ODM and DC's auto MPC combine factor), but
  * with DCN401's PMO policy left on: the UCLK P-state phase searches
  * dml2_pmo_dcn4_fams2's strategy lists, and DPMM maps the result to the
  * SoC's UCLK DPM levels.
@@ -124,7 +124,7 @@ int main(int argc, char **argv)
 	init.options.project_id = dml2_project_dcn4x_stage2_auto_drr_svp;
 	/* dml21_populate_pmo_options for DCN401's debug defaults. */
 	struct dml2_pmo_options *o = &init.options.pmo_options;
-	o->disable_dyn_odm = true;
+	o->disable_dyn_odm = false;
 	o->disable_dyn_odm_for_multi_stream = true;
 	o->disable_dyn_odm_for_stream_with_svp = true;
 	o->disable_vblank = false;
@@ -158,6 +158,7 @@ int main(int argc, char **argv)
 	}
 
 	cfg.gpuvm_max_page_table_levels = 4;
+	cfg.minimize_det_reallocation = true;
 	int planes = 0;
 	for (int k = 0; k < n; k++) {
 		unsigned long t9[9];
@@ -188,7 +189,7 @@ int main(int argc, char **argv)
 		s->output.output_dp_lane_count = 4;
 		s->output.output_disabled = true;
 		s->overrides.odm_mode = dml2_odm_mode_auto;
-		s->overrides.disable_dynamic_odm = true;
+		s->overrides.disable_dynamic_odm = false;
 		s->overrides.disable_subvp = false;
 		s->overrides.hw.twait_budgeting.fclk_pstate = dml2_twait_budgeting_setting_if_needed;
 		s->overrides.hw.twait_budgeting.uclk_pstate = dml2_twait_budgeting_setting_if_needed;
@@ -230,7 +231,7 @@ int main(int argc, char **argv)
 			 * destination covers the stream's height. */
 			p->composition.rect_out_height_spans_vactive =
 				(unsigned long)(v[5] / vr + 0.5) >= t9[5];
-			p->overrides.det_size_override_kb = 320;
+			p->overrides.det_size_override_kb = 0;
 			p->overrides.mpcc_combine_factor = 0;
 			p->overrides.gpuvm_min_page_size_kbytes = init.soc_bb.gpuvm_min_page_size_kbytes;
 		}

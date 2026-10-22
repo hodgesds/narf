@@ -58,10 +58,11 @@ fn inputs(f: &[u32]) -> (Soc, Mode) {
     (
         soc,
         Mode {
+            hdmi: false,
             timing,
             pitch: f[18],
             bytes_per_pixel: 4,
-            ycbcr420: false,
+            encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
             dsc: None,
             planes: [None; MAX_PLANES],
         },
@@ -290,8 +291,8 @@ fn dcn401_dml_reference_plan_follows_native_policy() -> TestResult {
     let Ok(p) = admit(&soc, &mode) else {
         return TestResult::Fail("1080p60 rejected");
     };
-    // Same staged requestor geometry; DML's own nominal DET.
-    if p.det_bytes != 320 * 1024 || p.arbiter.compbuf_reserved_space_kbytes != 16 {
+    // A single bounded linear pipe receives the whole shared DET pool.
+    if p.det_bytes != MAX_DET_KBYTES * 1024 || p.arbiter.compbuf_reserved_space_kbytes != 16 {
         return TestResult::Fail("DET/compbuf");
     }
     // UCLK switching is disabled, yet its watermark is the real 400 us + urgent
@@ -387,6 +388,7 @@ fn dcn401_dml_rejects_invalid_and_unmodeled_inputs() -> TestResult {
     // Downspread limits: a pixel clock at the raw maximum is too fast for
     // one pipe, so DML splits it across two.
     let mut fast = mode;
+    fast.hdmi = true;
     fast.timing.pixel_clock_khz = soc.dispclk_max_khz;
     if admit(&soc, &fast).map(|p| p.pipes) != Ok(2) {
         return TestResult::Fail("downspread margin ignored");
@@ -463,11 +465,17 @@ enum Prefix {
     None,
     /// "<slices> <bpp_x16>": every stream compressed so.
     Dsc,
+    /// DSC on an HDMI FRL encoder (dynamic ODM is disabled).
+    FrlDsc,
     /// "<bytes per pixel>" of every stream's plane.
     Bytes,
     /// "<bytes per pixel> <slices> <bpp_x16> <4:2:0>": all three, slices 0
     /// for no DSC (odm34_vectors.txt).
     Full,
+    /// HDMI flag, then Full: same timing over DP/HPO or HDMI FRL.
+    TransportFull,
+    /// Full prefix on uncompressed HDMI simple422 (HDMIFRL reference).
+    Hdmi422,
 }
 
 /// As `check_vectors_with` under `policy`; also counts the configurations
@@ -484,16 +492,32 @@ fn check_vectors_policy(
             continue;
         }
         let mut words = line.split_whitespace().peekable();
+        let mut hdmi = [0u32];
+        if prefix == Prefix::TransportFull && !parse(&mut words, &mut hdmi) {
+            return Err("malformed output encoder");
+        }
         let mut b = [4u32];
-        if matches!(prefix, Prefix::Bytes | Prefix::Full) && !parse(&mut words, &mut b) {
+        if matches!(
+            prefix,
+            Prefix::Bytes | Prefix::Full | Prefix::TransportFull | Prefix::Hdmi422
+        ) && !parse(&mut words, &mut b)
+        {
             return Err("malformed format vector");
         }
         let mut d = [0u32; 2];
-        if matches!(prefix, Prefix::Dsc | Prefix::Full) && !parse(&mut words, &mut d) {
+        if matches!(
+            prefix,
+            Prefix::Dsc | Prefix::FrlDsc | Prefix::Full | Prefix::TransportFull | Prefix::Hdmi422
+        ) && !parse(&mut words, &mut d)
+        {
             return Err("malformed DSC vector");
         }
         let mut f420 = [u32::from(ycbcr420)];
-        if prefix == Prefix::Full && !parse(&mut words, &mut f420) {
+        if matches!(
+            prefix,
+            Prefix::Full | Prefix::TransportFull | Prefix::Hdmi422
+        ) && !parse(&mut words, &mut f420)
+        {
             return Err("malformed 4:2:0 flag");
         }
         let dsc = d[0] != 0;
@@ -513,7 +537,14 @@ fn check_vectors_policy(
             f[9..18].copy_from_slice(&s[..9]);
             f[18] = t[9];
             let (_, mut mode) = inputs(&f);
-            mode.ycbcr420 = f420[0] != 0;
+            mode.encoding = if prefix == Prefix::Hdmi422 {
+                crate::amdgpu_hdr::PixelEncoding::Ycbcr422
+            } else {
+                crate::amdgpu_hdr::PixelEncoding::from_420(f420[0] != 0)
+            };
+            mode.hdmi = hdmi[0] != 0
+                || mode.encoding.is_420()
+                || matches!(prefix, Prefix::FrlDsc | Prefix::Hdmi422);
             mode.bytes_per_pixel = b[0];
             mode.dsc = dsc.then_some(Dsc {
                 slices: d[0],
@@ -640,7 +671,9 @@ const ODM_YCBCR420_VECTORS: &str = include_str!("../tests/dcn401_dml21/odm_ycbcr
 /// programs them, wider splits and a fifth pipe rejected.
 fn dcn401_dml_matches_linux_dml21_odm_vectors() -> TestResult {
     match check_vectors(ODM_VECTORS, false, false) {
-        Ok((plans, rejects, odm)) if plans >= 300 && rejects >= 150 && odm >= 150 => {
+        Ok((plans, rejects, odm))
+            if plans >= 400 && rejects >= 100 && plans + rejects == 563 && odm >= 300 =>
+        {
             TestResult::Pass
         }
         Ok(_) => TestResult::Fail("ODM vector file lost coverage"),
@@ -655,7 +688,9 @@ kernel_test_in!(
 /// DSC lines wider than one DSC or with more than four slices, on two pipes.
 fn dcn401_dml_matches_linux_dml21_odm_dsc_vectors() -> TestResult {
     match check_vectors(ODM_DSC_VECTORS, false, true) {
-        Ok((plans, rejects, odm)) if plans >= 180 && rejects >= 150 && odm >= 150 => {
+        Ok((plans, rejects, odm))
+            if plans >= 280 && rejects >= 100 && plans + rejects == 408 && odm >= 280 =>
+        {
             TestResult::Pass
         }
         Ok(_) => TestResult::Fail("ODM DSC vector file lost coverage"),
@@ -694,8 +729,10 @@ const FRL_DSC_VECTORS: &str = include_str!("../tests/dcn401_dml21/frl_dsc_vector
 /// as DC passes them on HDMI FRL encoders (dml2_hdmifrl): Linux plans a
 /// 4:4:4 DSC stream there as on DP, so admission takes the same inputs.
 fn dcn401_dml_matches_linux_dml21_frl_dsc_vectors() -> TestResult {
-    match check_vectors(FRL_DSC_VECTORS, false, true) {
-        Ok((plans, rejects, odm)) if plans >= 4 && rejects >= 2 && odm >= 4 => TestResult::Pass,
+    match check_vectors_policy(FRL_DSC_VECTORS, false, Prefix::FrlDsc, NO_MPC) {
+        Ok((plans, rejects, odm, _, _)) if plans == 6 && rejects == 0 && odm == 6 => {
+            TestResult::Pass
+        }
         Ok(_) => TestResult::Fail("FRL DSC vector file lost coverage"),
         Err(e) => TestResult::Fail(e),
     }
@@ -736,7 +773,12 @@ fn dcn401_dml_matches_linux_dml21_format_vectors() -> TestResult {
     }
     match check_vectors_with(FORMAT_VECTORS, false, false, true) {
         Ok((plans, rejects, odm))
-            if plans >= 1200 && rejects >= 400 && odm >= 300 && two >= 900 && eight >= 900 =>
+            if plans >= 1500
+                && rejects >= 300
+                && plans + rejects == 1844
+                && odm >= 700
+                && two >= 900
+                && eight >= 900 =>
         {
             TestResult::Pass
         }
@@ -778,10 +820,11 @@ fn dcn401_dml_bytes_per_pixel_domain() -> TestResult {
         v_sync_positive: true,
     };
     let m = |bytes_per_pixel, pitch| Mode {
+        hdmi: false,
         timing: t,
         pitch,
         bytes_per_pixel,
-        ycbcr420: false,
+        encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
         dsc: None,
         planes: [None; MAX_PLANES],
     };
@@ -837,6 +880,8 @@ fn dcn401_dml_odm_combine_follows_dml_policy() -> TestResult {
     // DML's max_dispclk_freq_mhz: 2 GHz less 0.38% downspread.
     let ss = 1_992_428;
     let mut uhd = hd;
+    // HDMI retains the bandwidth-driven ODM choice; DP also has Vmin.
+    uhd.hdmi = true;
     uhd.timing = timing(ss, 3840, 4000, 2160, 2310);
     uhd.pitch = 3840;
     // At the downspread maximum one pipe suffices; one kHz more needs two.
@@ -857,7 +902,7 @@ fn dcn401_dml_odm_combine_follows_dml_policy() -> TestResult {
         || p.clocks.dispclk_khz < half
         || p.clocks.dppclk_khz < half
         || p.clocks.dppclk_khz >= uhd.timing.pixel_clock_khz
-        || p.det_bytes != DET_KBYTES * 1024
+        || p.det_bytes != MAX_DET_KBYTES * 1024 / 2
     {
         return TestResult::Fail("ODM 2:1 clocks or DET");
     }
@@ -1264,7 +1309,7 @@ fn surface_request(
             dst: Rect::new(0, 0, t.h_active as i32, t.v_active as i32),
             stream_width: t.h_active,
             stream_height: t.v_active,
-            ycbcr420: plan.mode.ycbcr420,
+            ycbcr420: plan.mode.encoding.is_420(),
             rotation: match rotation {
                 1 => Rotation::R90,
                 2 => Rotation::R180,
@@ -1673,4 +1718,123 @@ fn dcn401_dml_admits_every_rdna4_profile_and_fused_pipes() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-dml",
     dcn401_dml_admits_every_rdna4_profile_and_fused_pipes
+);
+
+fn dcn401_dml_det_shares_follow_dc_stream_budgets() -> TestResult {
+    let (soc, hd) = reference_1080p();
+    let mut uhd = hd;
+    uhd.timing = timing(594_000, 3840, 4400, 2160, 2250);
+    uhd.pitch = 3840;
+    let Ok(plans) = admit_all(&soc, &[hd, uhd]) else {
+        return TestResult::Fail("DET budget pair rejected");
+    };
+    if plans[0].det_bytes != 256 * 1024
+        || plans[1].det_bytes != 1024 * 1024
+        || plans
+            .iter()
+            .any(|p| p.arbiter.compbuf_segments != 1 || !p.readmits())
+    {
+        return TestResult::Fail("DET not divided by stream pixel rate");
+    }
+    // A tiled RGB plane alone requests unbounded: only its two full
+    // swaths occupy DET; the remainder of all 1344 KiB is COMPBUF.
+    let mut tiled = hd;
+    let mut plane = Plane::full(&hd.timing, hd.pitch, 4);
+    plane.swizzle = Swizzle::S64K2D;
+    tiled.planes[0] = Some(plane);
+    let Ok(p) = admit(&soc, &tiled) else {
+        return TestResult::Fail("unbounded DET mode rejected");
+    };
+    let pp = p.plane(0).unwrap();
+    if !pp.rq.unbounded_request_enabled
+        || p.det_bytes < 128 * 1024
+        || p.det_bytes + p.arbiter.compbuf_segments * 64 * 1024 != 1344 * 1024
+        || p.det_bytes >= MAX_DET_KBYTES * 1024
+    {
+        return TestResult::Fail("unbounded DET/COMPBUF allocation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_det_shares_follow_dc_stream_budgets
+);
+
+fn dcn401_dml_vmin_odm_preserves_dc_exclusions_and_partial_progress() -> TestResult {
+    let (soc, hd) = reference_1080p();
+    let mut mode = hd;
+    mode.timing = timing(1_188_000, 3840, 4000, 2160, 2310);
+    mode.pitch = 3840;
+    let Ok(dp) = admit(&soc, &mode) else {
+        return TestResult::Fail("Vmin DP mode rejected");
+    };
+    if dp.pipes != 2 || dp.clocks.dispclk_khz > 630_000 || !dp.readmits() {
+        return TestResult::Fail("Vmin DP split");
+    }
+    mode.hdmi = true;
+    if admit(&soc, &mode).map(|p| p.pipes) != Ok(1) {
+        return TestResult::Fail("Vmin changed HDMI layout");
+    }
+    mode.hdmi = false;
+    mode.timing.h_front_porch += 1;
+    if admit(&soc, &mode).map(|p| p.pipes) != Ok(1) {
+        return TestResult::Fail("Vmin split indivisible timing");
+    }
+    mode.timing.h_front_porch -= 1;
+    let mut slow_dpp = soc;
+    slow_dpp.dppclk_max_khz = 1_000_000;
+    match admit(&slow_dpp, &mode) {
+        Ok(p) if p.pipes == 1 && p.plane(0).is_some_and(|p| p.dpps == 2) => {}
+        _ => return TestResult::Fail("Vmin changed base MPC combine"),
+    }
+    // Two planes can reach 2:1 (all four DPPs) but not Vmin. Keep that
+    // supported partial progress when 3:1 would exceed the pipe pool.
+    mode.timing.pixel_clock_khz = 1_500_000;
+    mode.planes[1] = Some(Plane::full(&mode.timing, mode.pitch, 4));
+    match admit(&soc, &mode) {
+        Ok(p) if p.pipes == 2 && p.plane(0).unwrap().dpps == 2 && p.plane(1).unwrap().dpps == 2 => {
+        }
+        _ => return TestResult::Fail("Vmin lost supported partial progress"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_vmin_odm_preserves_dc_exclusions_and_partial_progress
+);
+
+/// Real DC settings at Vmin boundaries, including Navi44's eight UMCs,
+/// DP/HPO versus HDMI, invalid split boundaries, and DSC slice divisors.
+fn dcn401_dml_matches_linux_dml21_vmin_vectors() -> TestResult {
+    let vectors = include_str!("../tests/dcn401_dml21/vmin_vectors.txt");
+    match check_vectors_policy(vectors, false, Prefix::TransportFull, NO_MPC) {
+        Ok((plans, rejects, odm, wide, _))
+            if plans >= 50 && rejects >= 1 && odm >= 20 && wide >= 4 =>
+        {
+            TestResult::Pass
+        }
+        Ok(_) => TestResult::Fail("Vmin vector file lost coverage"),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_matches_linux_dml21_vmin_vectors
+);
+
+fn dcn401_dml_matches_linux_hdmi_simple422_outputs() -> TestResult {
+    match check_vectors_policy(
+        include_str!("../tests/dcn401_dml21/hdmi422_vectors.txt"),
+        false,
+        Prefix::Hdmi422,
+        NO_MPC,
+    ) {
+        Ok((plans, _, _, _, _)) if plans >= 5 => TestResult::Pass,
+        Ok(_) => TestResult::Fail("HDMI422 vector coverage"),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_matches_linux_hdmi_simple422_outputs
 );

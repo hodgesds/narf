@@ -188,10 +188,10 @@ fn ready_range_pipes(
             pipe: p,
             depth,
             limited,
-            ycbcr420: mode.timing.ycbcr420,
+            encoding: mode.timing.encoding,
             colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(
                 limited,
-                mode.timing.ycbcr420,
+                mode.timing.encoding.is_420(),
             ),
         },
         clock,
@@ -491,7 +491,15 @@ fn dcn401_dpp_input_conversion_matches_linux_vectors() -> TestResult {
         let fourcc = u32::from_le_bytes([code[0], code[1], code[2], code[3]]);
         let enc: u8 = f.next().unwrap().parse().unwrap();
         let range: u8 = f.next().unwrap().parse().unwrap();
-        let format = SurfaceFormat::from_fourcc(fourcc).unwrap();
+        let Some(format) = SurfaceFormat::from_fourcc(fourcc) else {
+            // Linux advertises RA24 but fill_dc_plane_info_and_addr rejects
+            // it. The native list likewise must not promise this format.
+            if fourcc != u32::from_le_bytes(*b"RA24") || want != "-" {
+                return TestResult::Fail("unsupported plane differs from Linux");
+            }
+            n += 1;
+            continue;
+        };
         // fill_plane_color_attributes ignores the properties for RGB.
         let color = if format.is_video() {
             YuvColor::from_props(enc, range)
@@ -528,7 +536,7 @@ fn dcn401_dpp_input_conversion_matches_linux_vectors() -> TestResult {
         }
         n += 1;
     }
-    if n != 120 {
+    if n != 160 {
         return TestResult::Fail("vector count");
     }
     TestResult::Pass
@@ -625,7 +633,7 @@ fn dcn401_dpp_color_input_matches_linux_vectors() -> TestResult {
         }
         n += 1;
     }
-    if n != 540 {
+    if n != 684 {
         return TestResult::Fail("vector count");
     }
     TestResult::Pass

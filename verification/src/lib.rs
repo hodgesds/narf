@@ -851,6 +851,26 @@ kernel_test!(smoke_ipc_shared_ring_size_bounds);
 
 // `smoke_drivers_dedicated_domain_exhaustion` migrated to drivers/src/tests.rs (subsystem `"drivers"`).
 
+/// Tests that temporarily install bus fixtures must return the boot registry.
+/// Installed drivers retain their own device snapshots, but re-probe and
+/// capability claims still resolve against this shared registry.
+#[derive(Debug)]
+struct BusRegistryRestore(Option<alloc::vec::Vec<narf_bus::BusDevice>>);
+
+impl BusRegistryRestore {
+    fn capture() -> Self {
+        Self(Some(narf_bus::devices()))
+    }
+}
+
+impl Drop for BusRegistryRestore {
+    fn drop(&mut self) {
+        if let Some(devices) = self.0.take() {
+            narf_bus::registry::install(devices);
+        }
+    }
+}
+
 // ── drivers/virtio — Wave 3b side-track ─────────────────────────────
 //
 // The side-track crate defines `VirtioMmioDevice::probe` + a skeleton
@@ -861,22 +881,23 @@ kernel_test!(smoke_ipc_shared_ring_size_bounds);
 #[cfg(target_arch = "aarch64")]
 fn smoke_virtio_mmio_probe() -> TestResult {
     // QEMU `virt` populates virtio-mmio slot 0 at 0x0a00_0000 onwards;
-    // the bus enumerator has already filtered out empty slots
-    // (device_id == 0), so a non-empty registry proves at least one
-    // probe will succeed. Re-probe every registry entry here to
+    // the bus enumerator filters out empty slots (device_id == 0),
+    // so a non-empty fallback result proves at least one probe will
+    // succeed. Re-probe every enumerated entry here to
     // exercise VirtioMmioDevice::probe directly.
-    use narf_bus::{devices, BusKind};
+    use narf_bus::BusKind;
     use narf_drivers_virtio::{ProbeError, VirtioMmioDevice};
-    // SAFETY: init tolerates a null/absent DTB by falling back to the
-    // QEMU-virt default layout; identity-map covers the MMIO window.
-    // SAFETY: Valid memory or trusted environment
-    let _n = unsafe { narf_bus::init(None) };
+    // Probe the legacy MMIO fallback locally. `init(None)` replaces the
+    // boot registry and omits DTB-discovered PCIe devices, orphaning later
+    // capability claims against otherwise working installed drivers.
+    // SAFETY: the enumerator maps the QEMU-virt MMIO windows it probes.
+    let fallback = unsafe { narf_bus::aarch64::enumerate(None) };
     let mut ok = 0usize;
-    for d in devices() {
+    for d in fallback {
         if !matches!(d.kind, BusKind::VirtioMmio { .. }) {
             continue;
         }
-        // SAFETY: the bus registry published these entries after
+        // SAFETY: the enumerator returned these entries after
         // confirming their MMIO regions are mapped and readable;
         // `probe` does a bounded u32 read.
         // SAFETY: Valid memory or trusted environment
@@ -887,8 +908,8 @@ fn smoke_virtio_mmio_probe() -> TestResult {
                 }
                 ok += 1;
             }
-            // The bus registry filters out empty (device_id == 0) MMIO slots
-            // before we see them, so a bus-registry entry that fails probe is
+            // Enumeration filters out empty (device_id == 0) MMIO slots
+            // before we see them, so an enumerated entry that fails probe is
             // a real anomaly. Report *which* failure: collapsing them into one
             // message made a genuine bug indistinguishable from a mapping
             // failure when this finally ran.
@@ -906,20 +927,62 @@ fn smoke_virtio_mmio_probe() -> TestResult {
             }
         }
     }
-    // The bus-registry filter drops empty slots, so on QEMU virt we
-    // must see at least one successful probe. If the registry had
-    // returned zero entries we'd accept that — but we observed at
-    // least one via the iterator.
     if ok == 0 {
-        // Registry had no virtio-mmio entries at all — either QEMU
-        // changed its defaults or the DTB fallback is off. Tolerate
-        // as a skip rather than a hard fail.
-        return TestResult::Skip("no virtio-mmio entries in bus registry");
+        // PCI-only QEMU configurations have no legacy MMIO devices.
+        return TestResult::Skip("no virtio-mmio entries in fallback scan");
     }
     TestResult::Pass
 }
 #[cfg(target_arch = "aarch64")]
 kernel_test!(smoke_virtio_mmio_probe);
+
+/// The actual fallback probe must leave an installed PCI function claimable,
+/// including its no-MMIO/Skip path on PCI-only QEMU configurations.
+#[cfg(target_arch = "aarch64")]
+fn smoke_virtio_mmio_probe_preserves_pci_claims() -> TestResult {
+    use narf_bus::{
+        bootstrap_registry_authority, claim_device_cap, BusAddr, BusDevice, BusKind, DeviceId,
+        PcieAddr,
+    };
+    use narf_memory::PhysAddr;
+
+    let _restore_registry = BusRegistryRestore::capture();
+    let addr = PcieAddr::new(u16::MAX, 0xfe, 0x1f, 7);
+    let device = BusDevice {
+        addr: BusAddr::Pcie(addr),
+        id: DeviceId {
+            vendor: 0x1b36,
+            device: 0x0010,
+            class: 0x010802,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+        // The regression only claims this identity; no config access occurs.
+        kind: BusKind::Pcie {
+            addr,
+            cfg_phys: PhysAddr::new(0),
+        },
+    };
+    narf_bus::append_devices(alloc::vec![device]);
+    let authority = bootstrap_registry_authority();
+    if claim_device_cap(&authority, device.addr).is_err() {
+        return TestResult::Fail("fixture PCI function is not claimable before fallback probe");
+    }
+    let result = smoke_virtio_mmio_probe();
+    match claim_device_cap(&authority, device.addr) {
+        Ok((handle, _)) if handle.device.id == device.id => {}
+        _ => return TestResult::Fail("fallback probe removed a live PCI capability identity"),
+    }
+    match result {
+        TestResult::Fail(message) => TestResult::Fail(message),
+        _ => TestResult::Pass,
+    }
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!(
+    "verification/bus-registry",
+    smoke_virtio_mmio_probe_preserves_pci_claims
+);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_virtio_mmio_probe() -> TestResult {
@@ -7140,6 +7203,7 @@ fn smoke_bus_registry_concurrent_snapshots_consistent() -> TestResult {
         });
     }
     let expected_len = devices.len();
+    let _restore_registry = BusRegistryRestore::capture();
     registry::install(devices);
 
     const TASKS: usize = 4;

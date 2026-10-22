@@ -85,10 +85,18 @@ pub enum SurfaceFormat {
     /// NV12 with 10 bits in each MSB-aligned 16-bit sample
     /// (VIDEO_420_10bpc_YCrCb).
     P010,
+    /// 16:16:16:16 normalized unsigned x:R:G:B (GRPH_ARGB16161616).
+    Xrgb16161616,
+    /// 16:16:16:16 normalized unsigned A:R:G:B (GRPH_ARGB16161616).
+    Argb16161616,
+    /// 16:16:16:16 normalized unsigned x:B:G:R (GRPH_ABGR16161616).
+    Xbgr16161616,
+    /// 16:16:16:16 normalized unsigned A:B:G:R (GRPH_ABGR16161616).
+    Abgr16161616,
 }
 impl SurfaceFormat {
     /// Every format (new ones appended, so an index stays stable).
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 19] = [
         Self::Xrgb8888,
         Self::Argb8888,
         Self::Xbgr8888,
@@ -104,6 +112,10 @@ impl SurfaceFormat {
         Self::Abgr16161616f,
         Self::Nv12,
         Self::P010,
+        Self::Xrgb16161616,
+        Self::Argb16161616,
+        Self::Xbgr16161616,
+        Self::Abgr16161616,
     ];
     /// The DRM fourcc (drm_fourcc.h).
     pub const fn fourcc(self) -> u32 {
@@ -123,6 +135,10 @@ impl SurfaceFormat {
             Self::Abgr16161616f => *b"AB4H",
             Self::Nv12 => *b"NV12",
             Self::P010 => *b"P010",
+            Self::Xrgb16161616 => *b"XR48",
+            Self::Argb16161616 => *b"AR48",
+            Self::Xbgr16161616 => *b"XB48",
+            Self::Abgr16161616 => *b"AB48",
         };
         u32::from_le_bytes(code)
     }
@@ -139,7 +155,11 @@ impl SurfaceFormat {
             Self::Xrgb16161616f
             | Self::Argb16161616f
             | Self::Xbgr16161616f
-            | Self::Abgr16161616f => 8,
+            | Self::Abgr16161616f
+            | Self::Xrgb16161616
+            | Self::Argb16161616
+            | Self::Xbgr16161616
+            | Self::Abgr16161616 => 8,
             _ => 4,
         }
     }
@@ -170,7 +190,8 @@ impl SurfaceFormat {
         }
     }
     /// hubp2_program_pixel_format's DCSURF_SURFACE_PIXEL_FORMAT: 3 RGB565,
-    /// 8 A*GB8888, 10 A*GB2101010, 24 A*GB16161616F (the crossbar swaps
+    /// 8 A*GB8888, 10 A*GB2101010, 24 A*GB16161616F, 26 A*GB16161616
+    /// UNORM (the crossbar swaps
     /// the BGR orders).
     pub(in crate::amdgpu_dcn401_otg) const fn hubp_pixel_format(self) -> u32 {
         match self {
@@ -178,6 +199,7 @@ impl SurfaceFormat {
             Self::Nv12 => 64,
             Self::P010 => 66,
             Self::Rgb565 => 3,
+            Self::Xrgb16161616 | Self::Argb16161616 | Self::Xbgr16161616 | Self::Abgr16161616 => 26,
             Self::Xrgb8888 | Self::Argb8888 | Self::Xbgr8888 | Self::Abgr8888 => 8,
             Self::Xrgb2101010 | Self::Argb2101010 | Self::Xbgr2101010 | Self::Abgr2101010 => 10,
             _ => 24,
@@ -193,6 +215,8 @@ impl SurfaceFormat {
                 | Self::Abgr2101010
                 | Self::Xbgr16161616f
                 | Self::Abgr16161616f
+                | Self::Xbgr16161616
+                | Self::Abgr16161616
         )
     }
     /// HUBPRET_CONTROL CROSSBAR_SRC_CB_B and CROSSBAR_SRC_CR_R
@@ -230,6 +254,8 @@ impl SurfaceFormat {
                 | Self::Argb2101010
                 | Self::Abgr2101010
                 | Self::Argb16161616f
+                | Self::Argb16161616
+                | Self::Abgr16161616
         )
     }
 }

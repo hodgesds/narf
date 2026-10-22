@@ -566,6 +566,14 @@ pub struct Dmub {
     engine: Engine<Mmio>,
 }
 impl Dmub {
+    /// Parse the first CTA extension through the same DMUB EDID_CEA
+    /// command Linux uses, retaining one mailbox operation over all chunks.
+    pub(crate) async fn amd_freesync_vsdb(
+        &mut self,
+        edid: &[u8],
+    ) -> Result<Option<crate::amdgpu_freesync::AmdVsdb>, Error> {
+        self.engine.amd_freesync_vsdb(edid).await
+    }
     fn native_channels(&self) -> u8 {
         NATIVE_CHANNELS
     }
@@ -749,6 +757,65 @@ impl Dmub {
     }
     pub fn status(&self) -> Option<Status> {
         self.engine.status
+    }
+}
+
+impl<I: Io> Engine<I> {
+    async fn amd_freesync_vsdb(
+        &mut self,
+        edid: &[u8],
+    ) -> Result<Option<crate::amdgpu_freesync::AmdVsdb>, Error> {
+        let Some(base) = edid.get(..128) else {
+            return Ok(None);
+        };
+        let Some(cta) = edid
+            .chunks_exact(128)
+            .skip(1)
+            .take(usize::from(base[126]))
+            .find(|b| b[0] == 2)
+        else {
+            return Ok(None);
+        };
+        self.begin_mailbox()?;
+        let result = self.amd_freesync_cea(cta).await;
+        self.finish_mailbox(result)
+    }
+    async fn amd_freesync_cea(
+        &mut self,
+        cta: &[u8],
+    ) -> Result<Option<crate::amdgpu_freesync::AmdVsdb>, Error> {
+        let mut found = None;
+        for (i, chunk) in cta.chunks_exact(8).enumerate() {
+            let offset = (i * 8) as u16;
+            let mut request = [0; 64];
+            request[..4].copy_from_slice(&[79, 0, 0, 16]);
+            request[4..6].copy_from_slice(&offset.to_le_bytes());
+            request[6] = 8;
+            request[7..9].copy_from_slice(&128u16.to_le_bytes());
+            request[9..17].copy_from_slice(chunk);
+            let reply = self.command(request).await?;
+            if reply == request {
+                return Ok(None); // Firmware did not implement this optional query.
+            }
+            match reply[4] {
+                1 => {
+                    found =
+                        (reply[5] != 0 && reply[6] != 0).then(|| crate::amdgpu_freesync::AmdVsdb {
+                            version: u16::from_le_bytes(reply[7..9].try_into().unwrap()),
+                            min_hz: u16::from_le_bytes(reply[9..11].try_into().unwrap()),
+                            max_hz: u16::from_le_bytes(reply[11..13].try_into().unwrap()),
+                            vcp_code: reply[13],
+                        });
+                }
+                2 => {
+                    if reply[5..7] != offset.to_le_bytes() || reply[7] == 0 {
+                        return Err(Error::Protocol);
+                    }
+                }
+                _ => return Err(Error::Protocol),
+            }
+        }
+        Ok(found)
     }
 }
 impl<I: Io> Engine<I> {

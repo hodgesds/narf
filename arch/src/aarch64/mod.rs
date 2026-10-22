@@ -15,6 +15,7 @@ pub mod gits;
 pub mod ident;
 pub mod kernel_ctx;
 pub mod lse;
+pub mod mair;
 pub mod mmio;
 pub mod mpam;
 pub mod mte;

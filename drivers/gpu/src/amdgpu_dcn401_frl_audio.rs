@@ -1,8 +1,9 @@
-//! DCN401 FRL LPCM: AFMT4, tribyte ACR and the pipe's Azalia endpoint.
+//! DCN401 FRL LPCM: AFMT4, tribyte ACR and the stream's Azalia endpoint (the
+//! one its DIO stream encoder acquired, as for every signal).
 //! Linux: hpo_enc401_setup_hdmi_audio + afmt3_setup_hdmi_audio. AFMT4 has
 //! no DIO AFMT_CNTL clock; afmt3 clears MEM_PWR_FORCE during source setup.
 use super::*;
-use crate::amdgpu_navi48_boot::{frl_audio, frl_video_params, FrlDscStream, FrlRate};
+use crate::amdgpu_navi48_boot::{frl_audio, frl_video_params_in, FrlDscStream, FrlRate};
 
 const FRL_ACR: u64 = 0x8e2;
 const FRL_INFO: u64 = 0x8e3;
@@ -77,10 +78,10 @@ impl<I: Io> Engine<I> {
                     hdmi: v.request.avi.hdmi_vic,
                 },
             });
-        let Some(params) = frl_video_params(
+        let Some(params) = frl_video_params_in(
             &t,
             bpc,
-            blank.request.ycbcr420,
+            blank.request.encoding,
             dsc,
             rate,
             frl_audio(Some(info), t.v_active),
@@ -108,7 +109,7 @@ impl<I: Io> Engine<I> {
         v: &FrlVideoRunning,
         a: &DisplayAudio,
     ) -> Result<(), Error> {
-        if a.dp || a.endpoint != v.request.pipe {
+        if a.dp {
             return Err(Error::Invalid);
         }
         Self::frl_audio_budget(v, a.info)?;
@@ -155,6 +156,7 @@ impl<I: Io> Engine<I> {
         &mut self,
         path: Path,
         info: AudioInfo,
+        endpoint: u8,
     ) -> Result<DisplayAudio, Error> {
         if self.status.frl_audio.is_some() {
             return Err(Error::Busy);
@@ -177,7 +179,7 @@ impl<I: Io> Engine<I> {
         let a = DisplayAudio {
             info,
             dp: false,
-            endpoint: v.request.pipe,
+            endpoint,
             channels: channels(info.speakers),
             descriptors,
             hbr,

@@ -320,6 +320,13 @@ pub fn resume_context_static_addr() -> usize {
 /// the suspending thread's stack; interrupts are still off.
 #[no_mangle]
 pub unsafe extern "C" fn s3_wake_continuation() -> ! {
+    // Firmware re-initialised IA32_PAT to its reset layout across S3.
+    // Restore ours before any device resume touches a WC mapping (Linux
+    // `cache_bp_restore`, a syscore resume op that runs before devices).
+    // A failed restore must stop here: reset slot 1 is cacheable WT and
+    // cannot safely alias WC leaves on another CPU. Keep devices quiesced.
+    // SAFETY: CPL=0, IRQs off, the kernel CR3/IDT are live again.
+    unsafe { crate::x86_64::pat::cpu_init() }.expect("S3 could not restore the CPU PAT layout");
     // Run the registered device-resume hook (set by `power` at
     // boot via `set_resume_hook`). The hook can't return errors
     // through this path — the longjmp carries only the success

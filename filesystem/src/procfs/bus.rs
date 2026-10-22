@@ -453,8 +453,27 @@ pub fn register_bus_proc() {
 use narf_bus::registry as bus_registry;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+/// Synthetic procfs fixtures must not replace the registry used by live
+/// drivers and later capability claims after this smoke returns.
+struct BusRegistryRestore(Option<alloc::vec::Vec<narf_bus::BusDevice>>);
+
+impl BusRegistryRestore {
+    fn capture() -> Self {
+        Self(Some(narf_bus::devices()))
+    }
+}
+
+impl Drop for BusRegistryRestore {
+    fn drop(&mut self) {
+        if let Some(devices) = self.0.take() {
+            bus_registry::install(devices);
+        }
+    }
+}
+
 /// /proc/bus/pci/devices: one line per registered PCI device.
 fn smoke_pci_devices_line_count() -> TestResult {
+    let _restore_registry = BusRegistryRestore::capture();
     use narf_bus::addr::PcieAddr;
     use narf_bus::device::{BusDevice, BusKind, DeviceId as BusDevId};
     use narf_bus::BusAddr;
@@ -504,6 +523,7 @@ kernel_test_in!("filesystem/procfs/bus", smoke_pci_devices_line_count);
 
 /// /proc/bus/pci/devices: BDF encoded as 4 hex digits without separators.
 fn smoke_pci_devices_hex_bdf() -> TestResult {
+    let _restore_registry = BusRegistryRestore::capture();
     use narf_bus::addr::PcieAddr;
     use narf_bus::device::{BusDevice, BusKind, DeviceId as BusDevId};
     use narf_bus::BusAddr;
