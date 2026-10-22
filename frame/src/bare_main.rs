@@ -1563,10 +1563,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // KASAN: reserve a flat shadow byte-array (1 byte / 8 memory
             // bytes) covering [0, ram_top) out of the buddy, so the software
             // outline check (memory/src/kasan.rs) can poison freed slab
-            // blocks. Carved from the largest usable region's tail and kept
-            // out of the buddy via `excludes`; it is identity-mapped once the
-            // MMU comes up below, then zeroed + armed. `init`/`arm` run after
-            // `release_early_ceiling` so the mapping is guaranteed live.
+            // blocks. Carved from a usable region's tail and kept
+            // out of the buddy via `excludes`; it is reached through the
+            // direct map once the MMU comes up below, then zeroed + armed.
+            // `init`/`arm` run after `release_early_ceiling` so the
+            // mapping is guaranteed live.
             #[cfg(feature = "kasan")]
             let kasan_shadow: Option<(u64, u64)> = {
                 let ram_top = regions
@@ -1581,13 +1582,44 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // NUMA node, and gutting its tail starves that node's local
                 // allocations (SRAT setup then OOMs with GiB still free). The
                 // low region is node 0, which the kernel already lives in.
-                let biggest = regions
-                    .iter()
-                    .filter(|r| r.len >= shadow_len && shadow_len > 0)
-                    .min_by_key(|r| r.start.raw());
-                match biggest {
-                    Some(r) => {
-                        let shadow_phys = (r.start.raw() + r.len - shadow_len) & !(ps - 1);
+                //
+                // Placement must ALSO avoid every range already in
+                // `excludes` — above all the relocated kernel image + its
+                // window span. That span sits inside a Usable region (the
+                // boot map's Kernel entry names the ORIGINAL load address),
+                // and on a high KASLR slide it reaches into the region's
+                // tail, exactly where a naive tail carve lands; zeroing the
+                // shadow there would memset the kernel's own .bss — live
+                // page tables included — mid-boot. Step the candidate span
+                // down below each intersecting exclusion until it is clear;
+                // the common no-overlap case keeps the historical tail spot.
+                let mut placed: Option<u64> = None;
+                if shadow_len > 0 {
+                    let mut candidates: alloc::vec::Vec<&narf_memory::UsableRegion> =
+                        regions.iter().filter(|r| r.len >= shadow_len).collect();
+                    candidates.sort_by_key(|r| r.start.raw());
+                    'regions: for r in candidates {
+                        let region_start = r.start.raw();
+                        let mut cand_end = region_start + r.len;
+                        while cand_end >= region_start + shadow_len {
+                            let cand_start = cand_end - shadow_len;
+                            let blocker = excludes
+                                .iter()
+                                .filter(|b| b.0 < cand_end && b.1 > cand_start)
+                                .map(|b| b.0)
+                                .min();
+                            match blocker {
+                                None => {
+                                    placed = Some(cand_start);
+                                    break 'regions;
+                                }
+                                Some(bstart) => cand_end = bstart & !(ps - 1),
+                            }
+                        }
+                    }
+                }
+                match placed {
+                    Some(shadow_phys) => {
                         excludes.push((shadow_phys, shadow_phys + shadow_len));
                         let _ = writeln!(
                             console::Writer,
@@ -1825,14 +1857,15 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             (s.free as u64) * narf_memory::PAGE_SIZE / (1024 * 1024)
                         );
 
-                        // KASAN: the reserved shadow span is now identity-
-                        // mapped (init_mmu covers [0, max_ram_phys)). Zero it
-                        // and arm poisoning so freed slab blocks start being
+                        // KASAN: the reserved shadow span is now covered
+                        // by the direct map (init_mmu maps [0, max_ram_phys)
+                        // there and has activated it). Zero it and arm
+                        // poisoning so freed slab blocks start being
                         // tracked from here on.
                         #[cfg(feature = "kasan")]
                         if let Some((ram_top, shadow_phys)) = kasan_shadow {
                             // SAFETY: [shadow_phys, shadow_phys + ram_top/8) was
-                            // reserved out of the buddy above and is identity-
+                            // reserved out of the buddy above and is direct-
                             // mapped RW by init_mmu.
                             unsafe { narf_memory::kasan::init(ram_top, shadow_phys) };
                             narf_memory::kasan::arm();
