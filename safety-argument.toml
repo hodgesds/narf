@@ -1672,3 +1672,15 @@ ref = "security-model/specification/spec.md#L174"
 agent = "OpenAI Codex GPT-6"
 prompt_hash = "1cd0f8ece50097a2470e1cd1a5dd01fab92cfe3cac933d3c147e60dceb94341a"
 argument = "PAT establishment requires matching readback. BSP establishment failure stops boot, AP failure keeps that CPU offline, and S3 restore failure stops before device resume hooks. Kernel WC ioremap and user WC leaves use the same programmed cache-mode table, including conservative no-PAT fallback."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+agent = "OpenAI Codex GPT-6"
+prompt_hash = "866164f36a5358d5f2a5f4a34711c549b3006c6e106ae8e96ad82d4fb643bb24"
+argument = "The scheduler executor remains inside the existing TCB. The last-sample KVM steal counter is now compiled only for x86_64, matching its only references inside the x86_64 branch of sample_steal_ns. Removing an unused zero-initialized static on other architectures adds no code path, TCB member, or authority; x86_64 sampling and the public cpu_steal_ns interface are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+agent = "OpenAI Codex GPT-6"
+prompt_hash = "866164f36a5358d5f2a5f4a34711c549b3006c6e106ae8e96ad82d4fb643bb24"
+argument = "The architecture guard changes only whether unused counter storage exists. It introduces no access, capability, domain transition, mapping, or scheduler state transition. Non-x86_64 steal sampling remains a no-op and cpu_steal_ns continues to read the unchanged zero-initialized accumulated counter, so the capability-and-domain invariant is preserved."
