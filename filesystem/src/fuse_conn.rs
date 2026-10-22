@@ -1337,12 +1337,22 @@ impl FileOps for FuseFile {
 
     fn truncate<'a>(&'a self, len: u64) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            let old_size = self.stat().size;
             self.setattr(FuseSetattrIn {
                 valid: FATTR_SIZE,
                 size: len,
                 ..Default::default()
             })
-            .await
+            .await?;
+            if len < old_size {
+                // The daemon has the new size now; revoke the PTEs that
+                // were installed before it, or they keep serving pages the
+                // daemon has already truncated away instead of faulting
+                // SIGBUS — the same hole ext2's `unmap_mapping_range`
+                // call closes for local filesystems.
+                crate::unmap_mapping_range(self, len)?;
+            }
+            Ok(())
         })
     }
 
@@ -1626,6 +1636,9 @@ impl FileOps for FuseFile {
     }
 
     fn fallocate<'a>(&'a self, mode: u32, offset: u64, len: u64) -> FsFuture<'a, ()> {
+        /// `FALLOC_FL_PUNCH_HOLE` (linux/falloc.h) — forwarded raw in
+        /// `mode`, so it is matched by value here.
+        const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
         Box::pin(async move {
             let fh = self.ensure_open().await?;
             self.conn
@@ -1641,7 +1654,17 @@ impl FileOps for FuseFile {
                     }),
                 )
                 .await
-                .map(|_| ())
+                .map(|_| ())?;
+            if mode & FALLOC_FL_PUNCH_HOLE != 0 {
+                // The daemon deallocated the range: revoke installed PTEs
+                // from its first page, or a mapped page keeps serving the
+                // pre-punch bytes instead of the hole.
+                crate::unmap_mapping_range(
+                    self,
+                    (offset / crate::PAGE_SIZE as u64) * crate::PAGE_SIZE as u64,
+                )?;
+            }
+            Ok(())
         })
     }
 
