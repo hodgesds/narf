@@ -8624,6 +8624,109 @@ Host comparison and fixture regeneration accept `--main10` and preserve the
 Main8 checks. HEVC rows remain unadvertised; two fixed intra pictures do not
 establish inter prediction, full profile/range or application acceptance.
 
+The requested decode chain next runs `unsafe Vcn::prove_vp9().await` with an
+original 128×128 Profile0 error-resilient keyframe. The retained tier3
+unified-DT arena uses the decoded linear NV12 target directly and emits the
+actual empty reference-list package; it allocates no worst-case 8K legacy
+DPB. Mesa's five probability contexts, segmentation, motion-vector and
+probability-table formula still requires 10857728 bytes of context, and the
+complete page-aligned arena is 11071488 bytes. Session default probabilities
+come from the pinned Mesa table; the per-frame probability page is separately
+writable by firmware. All 24576 decoded bytes, guards, bitstream, initialized
+probability defaults, IBs/padding and feedback must pass, with a fresh
+fence/RPTR/IH/CPU completion. `Vp9Testing` and the published arena precede the
+first await; cancellation/failure retains the arena and closes clients until
+owned recovery. Success records `Vp9Verified`, `Vcn::vp9_result` and
+`Diagnostics::media_vp9_decode`; owned stop permits reuse. Cold boot and
+recovery run VP9 after Main10 before any requested encoder or client work.
+Allocation refusal occurs before changing state/result/sequence or publishing
+VP9 addresses. Codec rows remain gated: this fixture establishes neither
+Profile2, inter-frame references, full profile/range nor application behavior.
+
+The current transport/IB, AVC/Main8/Main10/VP9 decode, AVC encode and JPEG
+transport/decode retained arenas total 30035968 bytes. Firmware/TMR and
+current display reservations are additional variable costs; admission uses
+actual contiguous `Pool` availability, including fragmentation, rather than
+assuming that a 256 MiB visible BAR guarantees success. The subsequent client
+VRAM carve retains its existing 64 MiB minimum and driver reserve policy.
+Synthetic VP9 models omit the opaque context tail but count every zeroing
+write before publication, keeping test storage below 256 KiB per model.
+Exact fixture/source provenance and limits are in `fixtures/vp9/README.md`.
+
+The same requested decode chain next runs `unsafe Vcn::prove_vp9_10().await`
+on an original 10-bit Profile2 keyframe. `Vp9TenTesting/Verified`,
+`Vcn::vp9_10_result` and `Diagnostics::media_vp9_10_decode` retain separate
+proof/state/arena ownership. Every byte of the 49152-byte P010 output must match, including nonzero
+low 2 sample bits and zero packing bits; an 8-bit intermediate is refused.
+Mesa's actual 10-bit context formula adds 65536 bytes, totaling 10923264 bytes;
+the complete retained arena is 11161600 bytes. Tier3 references, full guard,
+input/IB/feedback checks and fresh completion rules match Profile0. Cold boot
+and recovery run Profile2 after Profile0 before requested encoders/clients.
+A synthetic context model stays below 256 KiB while counting initialization.
+Retained VCN proof arenas now total 41123840 bytes; adding JPEG transport/decode
+yields 41197568 bytes before variable firmware/display claims and later codecs.
+Both strict source/FFmpeg oracles support `--profile2`; codec capability rows
+remain gated pending inter references, range and actual client acceptance.
+
+The requested decode chain next runs `unsafe Vcn::prove_av1().await` on an
+original 256×128 lossless Main8 reduced-still keyframe. It owns separate
+`av1_memory`, `Av1Testing/Verified`, `Vcn::av1_result` and platform
+`Diagnostics::media_av1_decode`. Exact NV12 pixels, input/IB padding/guards,
+immutable initialized decoder CDF, successful feedback and fresh native
+fence/RPTR/IH/CPU delivery are required. Mesa tier3 binds the current linear
+surface and an empty dynamic reference list, with no monolithic DPB. Actual
+VCN5 AV1 version2 sizing requires a 36688896-byte hardware context and four
+20480-byte initialized default CDFs. The complete arena is 37076992 bytes;
+128 KiB stream and 24 KiB per-frame segment/film-grain storage remain reserved.
+Firmware/TMR/display are additional costs. VCN proofs now total 78200832 bytes,
+or 78274560 bytes with JPEG, before separate new encoder roundtrip arenas.
+
+The private shared `decode_av1_frame` accepts a copied map/base whose caller
+retains a published Reservation, compact stream bytes, validated parsed
+fixed-sequence `Keyframe`, explicit pixel tolerance and Observer. It validates
+lengths/tile coverage/quant/filter/tx bounds before arena writes or address
+publication, checks every expected quadrant pixel and returns completion,
+absolute pixel-error sum and observed maximum. It owns no arena retirement;
+caller preserves storage on every await/failure and only an owned stop/reset
+permits reuse. Static proof uses zero tolerance. Dynamic encoder roundtrip
+uses separately retained storage and parses actual firmware output first;
+no pixel or codec claim follows solely from software model execution.
+
+Boot/recovery run AV1 after Profile2 before requested encoders/clients. Failures
+and cancellation retain published memory and close admission. Sparse models
+store defaults and meaningful pages below 512 KiB while counting every omitted
+context initialization write; full hardware reservations are unchanged.
+Actual Addrlib surfaces for both revisions, unchanged Mesa builder/CDF/IB
+constructors, independent FFmpeg pixels/CBS syntax and original pinned libaom
+regeneration provide host references. Provenance is in `fixtures/av1/README.md`.
+A separate requested AV1 Main-profile 10-bit precision proof next runs
+`unsafe Vcn::prove_av1_10().await`. It owns `av1_10_memory/result`,
+`Av1TenTesting/Verified`, `Vcn::av1_10_result` and platform
+`Diagnostics::media_av1_10_decode`. Its original independent lossless 256×128
+picture has nonzero low sample bits; every one of the 98,304 P010 bytes,
+including six zero padding bits per sample, must match. Actual Mesa messages
+select bit depths minus8=2 and P010/MSB mode, with no 10-to-8 dithering. Actual
+Addrlib derives sample pitches 256/128 and UV offset 65,536 on both revisions.
+Context and initialized decoder CDF are depth-independent and unchanged;
+the separately retained arena is 37,126,144 bytes, not just the 49,152-byte
+increase in target size. Native guards, immutable input/CDF/IB checks, feedback,
+fresh fence/modular RPTR/IH/CPU completion, failure/cancellation quarantine
+and owned-stop retirement use the same contracts as Main8. No static or
+encoder roundtrip arena is shared or released by ordinary completion.
+
+Cold boot/recovery run Main8 then Main10 before the encoder/client chain.
+Both native submit state gates and requested proof-result readiness accept
+only completed appropriate stages; encoders consume the newest completion.
+The Main8/parsed-Keyframe/dynamic320 APIs remain unchanged. The full retained
+VCN chain including this proof and AVC encoder is 115,326,976 bytes before
+separate HEVC/AV1 encoder roundtrip and variable firmware/display claims.
+Every additional owner uses actual checked pool admission, including pressure
+and contiguous-hole refusal, with no presumption of a larger visible BAR.
+Pinned primary/fixture references and precision provenance are in
+`fixtures/av1/README-10.md` and `research/summaries/rx9000-av1-p010.md`.
+Inter references, film grain, ranges and actual clients remain unproven;
+codec capability rows and DRM/ACCEL gates remain closed.
+
 The opt-in `amdgpu.encode_proof` requests `unsafe Vcn::prove_encode().await`
 after the session IB proof (and after decode when both flags are requested).
 It runs IGT 2.4's fixed 160x128 NV12 input through create/IDR/close tasks on
@@ -8655,6 +8758,94 @@ stop/power-down cycle; with clients, the proven VCPU remains retained. No
 codec profile is advertised by this proof. Synthetic header output in the
 model verifies ownership, parsing and completion contracts; actual encoding
 and picture-quality acceptance remain physical tests at the end of bring-up.
+
+The same `amdgpu.encode_proof` sequence additionally requests
+`unsafe Vcn::prove_hevc_encode().await` after AVC encoding (and all requested
+picture decoders), including after coordinated media restart. The VCN owner
+receives the authenticated firmware version in `Vcn::new`; Mesa's version
+bitfields select interface1.min(minor,10), with a minimum1.8 for the dependent
+slice-address template. Unknown majors/older interfaces refuse before
+allocation/publication. No client job can intervene between proof sessions.
+
+`HevcEncodeTesting`, pending `hevc_encode_result` and publication of both
+reservations precede the first await. The552960-byte encoder arena backs two
+98304-byte reconstruction slots (196608bytes collectively), separate per-slot metadata,
+128KiB session, immutable pitched input, output and guarded commands. Mesa's
+unchanged VCN5 constructors and sizing routines supply the host oracle. VPS,
+SPS and PPS are CPU-generated with unchanged Mesa bitstream writers; the80-byte
+aligned prefix is preserved. Feedback word1 must be valid, word8 must equal80,
+and end word6 must exceed start within the entire backed0x1f000 output range.
+Fresh ring/fence/source119/CPU evidence is required before reading any output.
+The fixed parameter sets/padding and single PPS0 IDR I-slice gate must match.
+
+Before recording success, the exact encoded output is copied into a separately
+retained462848-byte Main8 decode arena. Its dynamic bounded byte count, two-slot
+DPB/context, compact NV12 target, flat scaling and fixed producer SPS/PPS params
+match unchanged Mesa's generic decoder and HEVC builders. A second fresh physical
+sequence/IRQ completion must precede every output component comparison. Each
+component's absolute error must be<=4 and the mean error<=1; output starts zero,
+so stale/empty pictures cannot satisfy the source. Both sessions' input/command/
+guard checks and decoder feedback must succeed. `EncodeRoundtripProof` contains
+separate encoded/decoded completions and fidelity metrics; only its decoded
+completion is the newest fence. `HevcEncodeVerified`, `Vcn::hevc_encode_result`
+and `Diagnostics::media_hevc_encode` preserve this evidence. The client fence
+reader requires this roundtrip when encoding was requested, through boot and
+recovery. Every failure/cancellation retains both arenas and closes publication;
+only owned VCPU/LMI stop or whole-device retirement permits reuse. A refused
+unpublished allocation leaves the previous transport proof usable.
+
+The fixture's original input, unchanged Mesa-generated headers and independent
+x265 IDR are decoded by FFmpeg8.0 to every source sample in host tests; this is
+a reference validation, not evidence of physical firmware quality. Native models
+simulate encoder/decoder writes solely to check ownership/error/completion rules.
+HEVC capability/profile/range rows remain unadvertised by a single intra proof;
+inter prediction and application acceptance still require their own evidence.
+
+The same requested encode chain then calls `unsafe Vcn::prove_av1_encode()`.
+It emits one320x128 Main8 reduced-still keyframe, one5x2-SB64 tile and no
+inter references. CQP1 respects Mesa VCN5's AV1 minimum; the actual firmware
+quant/filter/transform fields are parsed rather than inferred lossless. The
+fixed CPU9-byte sequence header comes from unchanged Mesa's bitstream writer.
+This width respects Mesa VCN5's320-pixel minimum. Its physical16-byte prefix has7zero alignment bytes that must remain intact;
+those bytes are excluded from the compact logical stream sent to the decoder.
+Feedback word1 must be valid, word8 must equal16 and word6 must be a greater
+end within the fully backed126976-byte output. The bounded OBU parser accepts
+exactly one frame, checked eight-byte LEB128 length, fixed producer shape,
+signed quant deltas, loop-filter levels/delta updates and transform mode. It
+rejects unsupported tools, extra OBUs, truncated lengths and nonzero alignment.
+
+`Av1EncodeTesting`, pending result and both published reservations precede the
+first await. The encoder arena is1884160bytes, including Mesa-sized947200-byte
+search database, two196608-byte reconstructions,25088-byte per-frame metadata,
+81920-byte encoder CDF, input/output and guarded commands. The encoder CDF is
+firmware READWRITE; boundary checks retain it without assuming immutability.
+Actual unchanged Mesa constructors, setup sizing and native CDF array export
+verify these constants; actual GFX12 Addrlib checks encoder pitches512/256 and UV65536
+on both supported revisions. Default encoder and decoder CDF tables differ.
+
+The separate37101568-byte AV1 roundtrip arena retains the compact exact output
+through `decode_av1_frame`, using parsed tile offsets/size, quantization and
+filter/transform fields. The actual decoder target uses Addrlib sample pitches384/192, UV49152 and
+73728-byte backing for61440meaningful components. The helper's actual
+full36688896-byte context and
+separate decoder CDF are backed in full. Only a second fresh native fence,
+RPTR/source119/CPU completion, every component's error<=4, mean absolute error<=1
+and all stream/CDF/command/feedback/guard checks permit `Av1EncodeVerified` and
+`Vcn::av1_encode_result`/`Diagnostics::media_av1_encode`. The published result
+records separate encoded and decoded completions; the decoded completion is
+newest. Boot, recovery and requested client fence admission require the whole
+chain. Cancellation or uncertain failure retains both arenas until proven
+VCPU/LMI stop or whole-device retirement; unpublished allocation failure
+preserves prior transport and allows retry. These two arenas add38985728bytes
+to the complete retained proof budget, independently of the static decoder.
+
+Original libaom3.13.1 fixtures, actual Mesa CPU sequence and FFmpeg8/libaom
+roundtrip validate every source sample independently. Host parser regressions
+cover real lossless/lossy syntax and malformed/dynamic fields; native DMA
+models cover ownership/completion/error paths without implementing a codec.
+No AV1 codec/profile/range is advertised by this one keyframe. Inter prediction,
+other profiles/ranges, physical execution and application acceptance remain
+separate acceptance requirements.
 
 The opt-in `amdgpu.jpeg_proof` adds a retained JPEG5.0.0 static-power
 transport cycle while VCN holds the shared NBIO media doorbell range. Public

@@ -123,8 +123,23 @@ pub struct Diagnostics {
         Option<Result<crate::amdgpu_vcn_navi48::DecodeProof, crate::amdgpu_vcn_navi48::Error>>,
     pub media_hevc10_decode:
         Option<Result<crate::amdgpu_vcn_navi48::DecodeProof, crate::amdgpu_vcn_navi48::Error>>,
+    /// Original Profile0 keyframe completion; full VP9 codec row stays gated.
+    pub media_vp9_decode:
+        Option<Result<crate::amdgpu_vcn_navi48::DecodeProof, crate::amdgpu_vcn_navi48::Error>>,
+    pub media_vp9_10_decode:
+        Option<Result<crate::amdgpu_vcn_navi48::DecodeProof, crate::amdgpu_vcn_navi48::Error>>,
+    pub media_av1_decode:
+        Option<Result<crate::amdgpu_vcn_navi48::DecodeProof, crate::amdgpu_vcn_navi48::Error>>,
+    pub media_av1_10_decode:
+        Option<Result<crate::amdgpu_vcn_navi48::DecodeProof, crate::amdgpu_vcn_navi48::Error>>,
     pub media_encode:
         Option<Result<crate::amdgpu_vcn_navi48::EncodeProof, crate::amdgpu_vcn_navi48::Error>>,
+    pub media_av1_encode: Option<
+        Result<crate::amdgpu_vcn_navi48::EncodeRoundtripProof, crate::amdgpu_vcn_navi48::Error>,
+    >,
+    pub media_hevc_encode: Option<
+        Result<crate::amdgpu_vcn_navi48::EncodeRoundtripProof, crate::amdgpu_vcn_navi48::Error>,
+    >,
     pub media_jpeg: Option<Result<crate::amdgpu_jpeg_navi48::Proof, boot::Error>>,
     pub media_jpeg_decode:
         Option<Result<crate::amdgpu_jpeg_navi48::DecodeProof, crate::amdgpu_jpeg_navi48::Error>>,
@@ -157,7 +172,13 @@ pub fn status() -> Status {
                 media_decode: boot.media_decode_result(),
                 media_hevc_decode: boot.media_hevc_decode_result(),
                 media_hevc10_decode: boot.media_hevc10_decode_result(),
+                media_vp9_decode: boot.media_vp9_decode_result(),
+                media_vp9_10_decode: boot.media_vp9_10_decode_result(),
+                media_av1_decode: boot.media_av1_decode_result(),
+                media_av1_10_decode: boot.media_av1_10_decode_result(),
                 media_encode: boot.media_encode_result(),
+                media_hevc_encode: boot.media_hevc_encode_result(),
+                media_av1_encode: boot.media_av1_encode_result(),
                 media_jpeg: boot.media_jpeg_result(),
                 media_jpeg_decode: boot.media_jpeg_decode_result(),
                 jpeg_state: boot.media_jpeg_state(),
@@ -1862,7 +1883,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                             }
                         }
                         Err(crate::amdgpu_jpeg_navi48::Error::Invalid) => {
-                            break Err(FsError::InvalidData)
+                            break Err(FsError::InvalidData);
                         }
                         Err(crate::amdgpu_jpeg_navi48::Error::Busy) => break Err(FsError::Busy),
                         Err(_) => break Err(FsError::NoDevice),

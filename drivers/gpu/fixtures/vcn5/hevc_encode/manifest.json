@@ -1,0 +1,24 @@
+{
+  "source": {
+    "mesa": "26.2.4",
+    "archive_sha256": "bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9",
+    "x265": "4.1+1-1d117be",
+    "independent_decoder": "FFmpeg8.0"
+  },
+  "files": {
+    "frame.bin": {
+      "bytes": 73728,
+      "sha256": "a6a345f2e47bb4f3a2b53edf8a4007c78a92eee23bcc4dbf4748a2da20faec06"
+    },
+    "headers.bin": {
+      "bytes": 70,
+      "sha256": "ae969da4c537b8a14baaec9f0e9b5597d13303f7d19f2d0da775e6f0abb260bf"
+    },
+    "reference.hevc": {
+      "bytes": 138,
+      "sha256": "42d4a6441eab16991ec9ed815984e90f79c72113827a6fb46cc49dcd9bc0b89c"
+    }
+  },
+  "width": 384,
+  "height": 128
+}

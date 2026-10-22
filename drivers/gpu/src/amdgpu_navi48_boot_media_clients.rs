@@ -27,9 +27,15 @@ impl ColdBoot {
             vcn.decode_result()?.ok()?;
             vcn.hevc_result()?.ok()?;
             vcn.hevc10_result()?.ok()?;
+            vcn.vp9_result()?.ok()?;
+            vcn.vp9_10_result()?.ok()?;
+            vcn.av1_result()?.ok()?;
+            vcn.av1_10_result()?.ok()?;
         }
         if hw.media_encode_required {
             vcn.encode_result()?.ok()?;
+            vcn.hevc_encode_result()?.ok()?;
+            vcn.av1_encode_result()?.ok()?;
         }
         vcn.fence_reader()
     }
@@ -90,9 +96,15 @@ impl ColdBoot {
             vcn.state(),
             vcn::State::IbVerified
                 | vcn::State::DecodeVerified
+                | vcn::State::Av1Verified
+                | vcn::State::Av1TenVerified
+                | vcn::State::Vp9TenVerified
+                | vcn::State::Vp9Verified
                 | vcn::State::Hevc10Verified
                 | vcn::State::HevcVerified
                 | vcn::State::EncodeVerified
+                | vcn::State::HevcEncodeVerified
+                | vcn::State::Av1EncodeVerified
         ) {
             return Err(vcn::Error::Busy);
         }
@@ -171,15 +183,30 @@ impl ColdBoot {
                 // clients remain excluded through this independent Main8 proof.
                 unsafe { vcn.prove_hevc().await }.map_err(Error::Vcn)?;
                 // SAFETY: no client publication; fresh drained Main8 transport.
-                proof = unsafe { vcn.prove_hevc10().await }
+                unsafe { vcn.prove_hevc10().await }.map_err(Error::Vcn)?;
+                // SAFETY: retained kernel VMID0 and drained Main10 predecessor.
+                unsafe { vcn.prove_vp9().await }.map_err(Error::Vcn)?;
+                // SAFETY: retained VMID0 and drained Profile0 predecessor.
+                unsafe { vcn.prove_vp9_10().await }.map_err(Error::Vcn)?;
+                // SAFETY: retained VMID0 and drained Profile2 predecessor.
+                unsafe { vcn.prove_av1().await }.map_err(Error::Vcn)?;
+                // SAFETY: retained VMID0 and drained AV1 Main8 predecessor;
+                // clients remain excluded through the full P010 precision proof.
+                proof = unsafe { vcn.prove_av1_10().await }
                     .map_err(Error::Vcn)?
                     .completion;
             }
             if encode {
                 // SAFETY: all ledgers remain frozen, including media, until
                 // the new requested proof and every healthy replay finish.
-                proof = unsafe { vcn.prove_encode().await }
+                unsafe { vcn.prove_encode().await }.map_err(Error::Vcn)?;
+                // SAFETY: same retained owner; exact encode output remains pinned
+                // through the independent decoder and per-component fidelity check.
+                unsafe { vcn.prove_hevc_encode().await }.map_err(Error::Vcn)?;
+                // SAFETY: same retained native owner through both AV1 sessions.
+                proof = unsafe { vcn.prove_av1_encode().await }
                     .map_err(Error::Vcn)?
+                    .decoded
                     .completion;
             }
             if jpeg {

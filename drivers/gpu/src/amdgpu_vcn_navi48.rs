@@ -11,6 +11,28 @@ use crate::{
 use core::sync::atomic::{fence, Ordering};
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
+#[path = "amdgpu_vcn_navi48_av1_10_decode.rs"]
+mod av1_10_decode;
+#[path = "amdgpu_vcn_navi48_av1_10.rs"]
+mod av1_10_proof;
+#[path = "amdgpu_vcn_navi48_av1_10_words.rs"]
+mod av1_10_words;
+#[path = "amdgpu_vcn_navi48_av1_320_decode.rs"]
+mod av1_320_decode;
+#[path = "amdgpu_vcn_navi48_av1_320_words.rs"]
+mod av1_320_words;
+#[path = "amdgpu_vcn_navi48_av1_decode.rs"]
+mod av1_decode;
+#[path = "amdgpu_vcn_navi48_av1_encode.rs"]
+mod av1_encode_proof;
+#[path = "amdgpu_vcn_navi48_av1_encode_words.rs"]
+mod av1_encode_words;
+#[path = "amdgpu_vcn_navi48_av1_encoded.rs"]
+mod av1_encoded;
+#[path = "amdgpu_vcn_navi48_av1.rs"]
+mod av1_proof;
+#[path = "amdgpu_vcn_navi48_av1_words.rs"]
+mod av1_words;
 #[path = "amdgpu_vcn_navi48_decode.rs"]
 mod decode_proof;
 #[path = "amdgpu_vcn_navi48_decode_words.rs"]
@@ -25,14 +47,30 @@ mod h264;
 mod hevc10_proof;
 #[path = "amdgpu_vcn_navi48_hevc10_words.rs"]
 mod hevc10_words;
+#[path = "amdgpu_vcn_navi48_hevc_encode.rs"]
+mod hevc_encode_proof;
+#[path = "amdgpu_vcn_navi48_hevc_roundtrip.rs"]
+mod hevc_encode_roundtrip;
+#[path = "amdgpu_vcn_navi48_hevc_encode_words.rs"]
+mod hevc_encode_words;
 #[path = "amdgpu_vcn_navi48_hevc.rs"]
 mod hevc_proof;
+#[path = "amdgpu_vcn_navi48_hevc_roundtrip_words.rs"]
+mod hevc_roundtrip_words;
 #[path = "amdgpu_vcn_navi48_hevc_words.rs"]
 mod hevc_words;
 #[path = "amdgpu_vcn_navi48_ib.rs"]
 mod ib_proof;
 #[path = "amdgpu_vcn_navi48_ib_words.rs"]
 mod ib_words;
+#[path = "amdgpu_vcn_navi48_vp9_10.rs"]
+mod vp9_10_proof;
+#[path = "amdgpu_vcn_navi48_vp9_10_words.rs"]
+mod vp9_10_words;
+#[path = "amdgpu_vcn_navi48_vp9.rs"]
+mod vp9_proof;
+#[path = "amdgpu_vcn_navi48_vp9_words.rs"]
+mod vp9_words;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -68,6 +106,18 @@ pub enum State {
     HevcVerified,
     Hevc10Testing,
     Hevc10Verified,
+    Vp9Testing,
+    Vp9Verified,
+    Vp9TenTesting,
+    Vp9TenVerified,
+    Av1Testing,
+    Av1Verified,
+    Av1TenTesting,
+    Av1TenVerified,
+    HevcEncodeTesting,
+    HevcEncodeVerified,
+    Av1EncodeTesting,
+    Av1EncodeVerified,
     EncodeTesting,
     EncodeVerified,
     Stopping,
@@ -95,6 +145,14 @@ pub struct EncodeProof {
     pub completion: InterruptProof,
     pub output_bytes: u32,
     pub profile: u8,
+}
+/// Only published after decoding this exact encoded output and checking pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncodeRoundtripProof {
+    pub encoded: EncodeProof,
+    pub decoded: DecodeProof,
+    pub pixel_error_sum: u64,
+    pub max_pixel_error: u8,
 }
 
 // vcn_5_0_0_offset.h: all registers below are in VCN instance 0, bank 1.
@@ -284,8 +342,17 @@ struct Engine<I: Io> {
     decode_memory: Option<Reservation>,
     hevc_memory: Option<Reservation>,
     hevc10_memory: Option<Reservation>,
+    vp9_memory: Option<Reservation>,
+    vp9_10_memory: Option<Reservation>,
+    av1_memory: Option<Reservation>,
+    av1_10_memory: Option<Reservation>,
     encode_memory: Option<Reservation>,
+    hevc_encode_memory: Option<Reservation>,
+    hevc_roundtrip_memory: Option<Reservation>,
+    av1_encode_memory: Option<Reservation>,
+    av1_roundtrip_memory: Option<Reservation>,
     firmware_bytes: u32,
+    encode_interface: Option<u32>,
     state: State,
     proof: Option<Proof>,
     interrupt_result: Option<Result<InterruptProof, Error>>,
@@ -293,7 +360,13 @@ struct Engine<I: Io> {
     decode_result: Option<Result<DecodeProof, Error>>,
     hevc_result: Option<Result<DecodeProof, Error>>,
     hevc10_result: Option<Result<DecodeProof, Error>>,
+    vp9_result: Option<Result<DecodeProof, Error>>,
+    vp9_10_result: Option<Result<DecodeProof, Error>>,
+    av1_result: Option<Result<DecodeProof, Error>>,
+    av1_10_result: Option<Result<DecodeProof, Error>>,
     encode_result: Option<Result<EncodeProof, Error>>,
+    hevc_encode_result: Option<Result<EncodeRoundtripProof, Error>>,
+    av1_encode_result: Option<Result<EncodeRoundtripProof, Error>>,
     wptr: u32,
     seq: u32,
 }
@@ -362,7 +435,13 @@ impl<I: Io> Engine<I> {
         self.decode_result = None;
         self.hevc_result = None;
         self.hevc10_result = None;
+        self.vp9_result = None;
+        self.vp9_10_result = None;
+        self.av1_result = None;
+        self.av1_10_result = None;
         self.encode_result = None;
+        self.hevc_encode_result = None;
+        self.av1_encode_result = None;
         self.memory.publish();
         let result = self
             .start_inner(image)
@@ -494,14 +573,26 @@ impl<I: Io> Engine<I> {
                 | State::InterruptVerified
                 | State::IbTesting
                 | State::IbVerified
+                | State::Av1Testing
+                | State::Av1TenTesting
+                | State::Vp9TenTesting
+                | State::Vp9Testing
                 | State::Hevc10Testing
                 | State::HevcTesting
                 | State::DecodeTesting
+                | State::Av1Verified
+                | State::Av1TenVerified
+                | State::Vp9TenVerified
+                | State::Vp9Verified
                 | State::Hevc10Verified
                 | State::HevcVerified
                 | State::DecodeVerified
+                | State::HevcEncodeTesting
+                | State::Av1EncodeTesting
                 | State::EncodeTesting
                 | State::EncodeVerified
+                | State::HevcEncodeVerified
+                | State::Av1EncodeVerified
         ) {
             return Err(Error::Busy);
         }
@@ -601,10 +692,16 @@ impl<I: Io> Engine<I> {
                 | State::Verified
                 | State::InterruptVerified
                 | State::IbVerified
+                | State::Av1Verified
+                | State::Av1TenVerified
+                | State::Vp9TenVerified
+                | State::Vp9Verified
                 | State::Hevc10Verified
                 | State::HevcVerified
                 | State::DecodeVerified
                 | State::EncodeVerified
+                | State::HevcEncodeVerified
+                | State::Av1EncodeVerified
         ) {
             return Err(Error::Busy);
         }
@@ -628,10 +725,34 @@ impl<I: Io> Engine<I> {
                 if let Some(memory) = self.decode_memory.as_mut() {
                     memory.stopped();
                 }
+                if let Some(memory) = self.av1_memory.as_mut() {
+                    memory.stopped();
+                }
+                if let Some(memory) = self.av1_10_memory.as_mut() {
+                    memory.stopped();
+                }
+                if let Some(memory) = self.vp9_10_memory.as_mut() {
+                    memory.stopped();
+                }
+                if let Some(memory) = self.vp9_memory.as_mut() {
+                    memory.stopped();
+                }
                 if let Some(memory) = self.hevc10_memory.as_mut() {
                     memory.stopped();
                 }
                 if let Some(memory) = self.hevc_memory.as_mut() {
+                    memory.stopped();
+                }
+                if let Some(memory) = self.av1_encode_memory.as_mut() {
+                    memory.stopped();
+                }
+                if let Some(memory) = self.av1_roundtrip_memory.as_mut() {
+                    memory.stopped();
+                }
+                if let Some(memory) = self.hevc_encode_memory.as_mut() {
+                    memory.stopped();
+                }
+                if let Some(memory) = self.hevc_roundtrip_memory.as_mut() {
                     memory.stopped();
                 }
                 if let Some(memory) = self.encode_memory.as_mut() {
@@ -688,6 +809,7 @@ impl Vcn {
         pool: &Pool,
         doorbells: MmioRegion,
         firmware_bytes: usize,
+        firmware_version: u32,
     ) -> Result<Self, Error> {
         let layout = Layout::resolve(gpu)?;
         if firmware_bytes == 0
@@ -717,8 +839,17 @@ impl Vcn {
                 decode_memory: None,
                 hevc_memory: None,
                 hevc10_memory: None,
+                vp9_memory: None,
+                vp9_10_memory: None,
+                av1_memory: None,
+                av1_10_memory: None,
                 encode_memory: None,
+                hevc_encode_memory: None,
+                hevc_roundtrip_memory: None,
+                av1_encode_memory: None,
+                av1_roundtrip_memory: None,
                 firmware_bytes: firmware_bytes as u32,
+                encode_interface: hevc_encode_words::interface(firmware_version),
                 state: State::Prepared,
                 proof: None,
                 interrupt_result: None,
@@ -726,7 +857,13 @@ impl Vcn {
                 decode_result: None,
                 hevc_result: None,
                 hevc10_result: None,
+                vp9_result: None,
+                vp9_10_result: None,
+                av1_result: None,
+                av1_10_result: None,
                 encode_result: None,
+                hevc_encode_result: None,
+                av1_encode_result: None,
                 wptr: 0,
                 seq: 0,
             },
@@ -827,6 +964,61 @@ impl Vcn {
     pub fn hevc10_result(&self) -> Option<Result<DecodeProof, Error>> {
         self.engine.hevc10_result
     }
+    /// Run the original Profile0 keyframe with Mesa tier3 unified-DT references.
+    /// A completed fixture does not advertise the full VP9 profile/range row.
+    /// # Safety
+    /// Matching retained firmware/GMC, exclusive OWNER, registered VCN0 source,
+    /// and no client publication since the last drained native proof. Failure
+    /// or cancellation retains its arena until owned reset/retirement.
+    pub async unsafe fn prove_vp9(&mut self) -> Result<DecodeProof, Error> {
+        self.engine
+            .prove_vp9(&mut crate::amdgpu_navi48_interrupts::NativeObserver)
+            .await
+    }
+    pub fn vp9_result(&self) -> Option<Result<DecodeProof, Error>> {
+        self.engine.vp9_result
+    }
+    /// Prove the original 10-bit Profile2 keyframe without losing precision.
+    /// # Safety
+    /// Same exclusive retained kernel-VMID0/firmware/GMC/source-owner contract
+    /// as prove_vp9; no client publication since its drained predecessor.
+    /// Cancellation or failure retains the arena until owned recovery.
+    pub async unsafe fn prove_vp9_10(&mut self) -> Result<DecodeProof, Error> {
+        self.engine
+            .prove_vp9_10(&mut crate::amdgpu_navi48_interrupts::NativeObserver)
+            .await
+    }
+    pub fn vp9_10_result(&self) -> Option<Result<DecodeProof, Error>> {
+        self.engine.vp9_10_result
+    }
+    /// Run the original lossless Main8 AV1 keyframe; capability rows stay gated.
+    /// # Safety
+    /// Same exclusive retained kernel-VMID0/firmware/GMC/source-owner contract
+    /// as prove_vp9; no client publication since its drained predecessor.
+    /// Cancellation or failure retains the arena until owned recovery.
+    pub async unsafe fn prove_av1(&mut self) -> Result<DecodeProof, Error> {
+        self.engine
+            .prove_av1(&mut crate::amdgpu_navi48_interrupts::NativeObserver)
+            .await
+    }
+    pub fn av1_result(&self) -> Option<Result<DecodeProof, Error>> {
+        self.engine.av1_result
+    }
+
+    /// Run the original lossless Main-profile 10-bit AV1 P010 precision proof.
+    /// # Safety
+    /// Same exclusive retained kernel-VMID0/firmware/GMC/source-owner contract
+    /// as prove_av1, with no client publication since the drained predecessor.
+    /// Failure/cancellation retains the arena until owned recovery.
+    pub async unsafe fn prove_av1_10(&mut self) -> Result<DecodeProof, Error> {
+        self.engine
+            .prove_av1_10(&mut crate::amdgpu_navi48_interrupts::NativeObserver)
+            .await
+    }
+    pub fn av1_10_result(&self) -> Option<Result<DecodeProof, Error>> {
+        self.engine.av1_10_result
+    }
+
     /// Encode the fixed NV12 frame and inspect bounded SPS/PPS/IDR headers.
     /// This does not prove visual quality or complete bitstream conformance.
     /// # Safety
@@ -836,6 +1028,29 @@ impl Vcn {
         self.engine
             .prove_encode(&mut crate::amdgpu_navi48_interrupts::NativeObserver)
             .await
+    }
+    /// # Safety
+    /// Retain kernel VMID0/GMC/firmware/IH, exclude clients/reset/PM through
+    /// both sessions. Cancellation or failure requires whole-device recovery.
+    pub async unsafe fn prove_hevc_encode(&mut self) -> Result<EncodeRoundtripProof, Error> {
+        self.engine
+            .prove_hevc_encode(&mut crate::amdgpu_navi48_interrupts::NativeObserver)
+            .await
+    }
+    /// Prove the fixed AV1 keyframe by decoding the exact newly encoded bytes.
+    /// # Safety
+    /// The caller retains exclusive native ownership and excludes client/PM/reset
+    /// address users throughout both physical sessions and their retirement.
+    pub async unsafe fn prove_av1_encode(&mut self) -> Result<EncodeRoundtripProof, Error> {
+        self.engine
+            .prove_av1_encode(&mut crate::amdgpu_navi48_interrupts::NativeObserver)
+            .await
+    }
+    pub fn av1_encode_result(&self) -> Option<Result<EncodeRoundtripProof, Error>> {
+        self.engine.av1_encode_result
+    }
+    pub fn hevc_encode_result(&self) -> Option<Result<EncodeRoundtripProof, Error>> {
+        self.engine.hevc_encode_result
     }
     pub fn encode_result(&self) -> Option<Result<EncodeProof, Error>> {
         self.engine.encode_result
@@ -859,10 +1074,16 @@ impl Vcn {
             self.engine.state,
             State::InterruptVerified
                 | State::IbVerified
+                | State::Av1Verified
+                | State::Av1TenVerified
+                | State::Vp9TenVerified
+                | State::Vp9Verified
                 | State::Hevc10Verified
                 | State::HevcVerified
                 | State::DecodeVerified
                 | State::EncodeVerified
+                | State::HevcEncodeVerified
+                | State::Av1EncodeVerified
         )
         .then_some(FenceReader {
             io: self.engine.io,

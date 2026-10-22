@@ -33,8 +33,34 @@ impl ColdBoot {
     ) -> Option<Result<vcn::DecodeProof, vcn::Error>> {
         self.sequence.backend.vcn.as_ref()?.hevc10_result()
     }
+    pub(crate) fn media_vp9_decode_result(&self) -> Option<Result<vcn::DecodeProof, vcn::Error>> {
+        self.sequence.backend.vcn.as_ref()?.vp9_result()
+    }
+    pub(crate) fn media_vp9_10_decode_result(
+        &self,
+    ) -> Option<Result<vcn::DecodeProof, vcn::Error>> {
+        self.sequence.backend.vcn.as_ref()?.vp9_10_result()
+    }
+    pub(crate) fn media_av1_decode_result(&self) -> Option<Result<vcn::DecodeProof, vcn::Error>> {
+        self.sequence.backend.vcn.as_ref()?.av1_result()
+    }
+    pub(crate) fn media_av1_10_decode_result(
+        &self,
+    ) -> Option<Result<vcn::DecodeProof, vcn::Error>> {
+        self.sequence.backend.vcn.as_ref()?.av1_10_result()
+    }
     pub(crate) fn media_encode_result(&self) -> Option<Result<vcn::EncodeProof, vcn::Error>> {
         self.sequence.backend.vcn.as_ref()?.encode_result()
+    }
+    pub(crate) fn media_av1_encode_result(
+        &self,
+    ) -> Option<Result<vcn::EncodeRoundtripProof, vcn::Error>> {
+        self.sequence.backend.vcn.as_ref()?.av1_encode_result()
+    }
+    pub(crate) fn media_hevc_encode_result(
+        &self,
+    ) -> Option<Result<vcn::EncodeRoundtripProof, vcn::Error>> {
+        self.sequence.backend.vcn.as_ref()?.hevc_encode_result()
     }
     pub(crate) fn media_jpeg_result(
         &self,
@@ -98,8 +124,17 @@ impl ColdBoot {
             // SAFETY: retained matching pool/firmware/GMC and exclusive media
             // range. Store the owner before any power-up or VCPU publication.
             hw.vcn = Some(
-                unsafe { vcn::Vcn::new(&hw.gpu, hw.authority, &hw.pool, doorbells, bytes) }
-                    .map_err(Error::Vcn)?,
+                unsafe {
+                    vcn::Vcn::new(
+                        &hw.gpu,
+                        hw.authority,
+                        &hw.pool,
+                        doorbells,
+                        bytes,
+                        image.version(),
+                    )
+                }
+                .map_err(Error::Vcn)?,
             );
             // SAFETY: no competing media owner or power writer.
             let power = unsafe {
@@ -145,15 +180,31 @@ impl ColdBoot {
                 // clients remain excluded through this independent Main8 proof.
                 unsafe { vcn.prove_hevc().await }.map_err(Error::Vcn)?;
                 // SAFETY: no client publication; fresh drained Main8 transport.
-                proof = unsafe { vcn.prove_hevc10().await }
+                unsafe { vcn.prove_hevc10().await }.map_err(Error::Vcn)?;
+                // SAFETY: retained kernel VMID0 and drained Main10 predecessor.
+                unsafe { vcn.prove_vp9().await }.map_err(Error::Vcn)?;
+                // SAFETY: retained VMID0 and drained Profile0 predecessor.
+                unsafe { vcn.prove_vp9_10().await }.map_err(Error::Vcn)?;
+                // SAFETY: retained VMID0 and drained Profile2 predecessor.
+                unsafe { vcn.prove_av1().await }.map_err(Error::Vcn)?;
+                // SAFETY: retained VMID0 and drained AV1 Main8 predecessor;
+                // clients remain excluded through the full P010 precision proof.
+                proof = unsafe { vcn.prove_av1_10().await }
                     .map_err(Error::Vcn)?
                     .completion;
             }
             if encode {
                 // SAFETY: same exclusive retained transport and kernel VMID0;
                 // no client can publish before this requested proof finishes.
-                proof = unsafe { vcn.prove_encode().await }
+                unsafe { vcn.prove_encode().await }.map_err(Error::Vcn)?;
+                // SAFETY: same retained owner; exact encode output remains pinned
+                // through the independent decoder and per-component fidelity check.
+                unsafe { vcn.prove_hevc_encode().await }.map_err(Error::Vcn)?;
+                // SAFETY: same retained native owner; both AV1 arenas remain
+                // published through encode, fresh decode and fidelity validation.
+                proof = unsafe { vcn.prove_av1_encode().await }
                     .map_err(Error::Vcn)?
+                    .decoded
                     .completion;
             }
             if jpeg {

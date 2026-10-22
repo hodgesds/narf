@@ -1,3 +1,13 @@
+#[path = "amdgpu_vcn_navi48_av1_encode_tests.rs"]
+mod av1_encode_tests;
+#[path = "amdgpu_vcn_navi48_av1_encoded_tests.rs"]
+mod av1_encoded_tests;
+#[path = "amdgpu_vcn_navi48_av1_roundtrip_tests.rs"]
+mod av1_roundtrip_tests;
+#[path = "amdgpu_vcn_navi48_hevc_encode_tests.rs"]
+mod hevc_encode_tests;
+#[path = "amdgpu_vcn_navi48_hevc_roundtrip_tests.rs"]
+mod hevc_roundtrip_tests;
 use super::*;
 use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
 use core::{
@@ -13,17 +23,35 @@ const MM: u64 = 0x70000;
 const OSS: u64 = 0x90000;
 const GPU: u64 = 0x8_0000_4000;
 const IMAGE: u64 = 0x8_1000_0000;
+#[path = "amdgpu_vcn_navi48_av1_10_chain_tests.rs"]
+mod av1_10_chain_tests;
+#[path = "amdgpu_vcn_navi48_av1_10_tests.rs"]
+mod av1_10_tests;
+#[path = "amdgpu_vcn_navi48_av1_tests.rs"]
+mod av1_tests;
 #[path = "amdgpu_vcn_navi48_encode_tests.rs"]
 mod encode_tests;
 #[path = "amdgpu_vcn_navi48_hevc10_tests.rs"]
 mod hevc10_tests;
 #[path = "amdgpu_vcn_navi48_hevc_tests.rs"]
 mod hevc_tests;
+#[path = "amdgpu_vcn_navi48_vp9_10_tests.rs"]
+mod vp9_10_tests;
+#[path = "amdgpu_vcn_navi48_vp9_tests.rs"]
+mod vp9_tests;
 
 struct Fake {
     encoding: encode_tests::Model,
+    hevc_encoding: hevc_encode_tests::Model,
+    av1_encoding: av1_encode_tests::Model,
+    av1_roundtrip: av1_roundtrip_tests::Model,
+    hevc_roundtrip: hevc_roundtrip_tests::Model,
     hevc: hevc_tests::Model,
     hevc10: hevc10_tests::Model,
+    vp9: vp9_tests::Model,
+    vp9_10: vp9_10_tests::Model,
+    av1: av1_tests::Model,
+    av1_10: av1_10_tests::Model,
     regs: BTreeMap<u64, u32>,
     writes: Vec<(u64, u32)>,
     memory: Vec<u8>,
@@ -164,6 +192,30 @@ impl Fake {
         true
     }
     fn kernel_ib(&mut self, address: u64, length: u32) -> bool {
+        if self.av1_encoding.contains(address) {
+            return self.av1_encoding.ib(address, length);
+        }
+        if self.av1_roundtrip.contains(address) {
+            return self.av1_roundtrip.ib(address, length);
+        }
+        if self.av1_10.contains(address) {
+            return self.av1_10.ib(address, length);
+        }
+        if self.av1.contains(address) {
+            return self.av1.ib(address, length);
+        }
+        if self.hevc_encoding.contains(address) {
+            return self.hevc_encoding.ib(address, length);
+        }
+        if self.hevc_roundtrip.contains(address) {
+            return self.hevc_roundtrip.ib(address, length);
+        }
+        if self.vp9_10.contains(address) {
+            return self.vp9_10.ib(address, length);
+        }
+        if self.vp9.contains(address) {
+            return self.vp9.ib(address, length);
+        }
         if self.hevc10.contains(address) {
             return self.hevc10.ib(address, length);
         }
@@ -284,6 +336,30 @@ impl Io for Fake {
         }
     }
     fn memory_read(&mut self, map: MmioRegion, at: u64) -> u32 {
+        if let Some(w) = self.av1_encoding.read(map, at) {
+            return w;
+        }
+        if let Some(w) = self.av1_roundtrip.read(map, at) {
+            return w;
+        }
+        if let Some(w) = self.av1_10.read(map, at) {
+            return w;
+        }
+        if let Some(w) = self.av1.read(map, at) {
+            return w;
+        }
+        if let Some(w) = self.hevc_encoding.read(map, at) {
+            return w;
+        }
+        if let Some(w) = self.hevc_roundtrip.read(map, at) {
+            return w;
+        }
+        if let Some(w) = self.vp9_10.read(map, at) {
+            return w;
+        }
+        if let Some(w) = self.vp9.read(map, at) {
+            return w;
+        }
         if let Some(w) = self.hevc10.read(map, at) {
             return w;
         }
@@ -315,6 +391,38 @@ impl Io for Fake {
         self.word(at)
     }
     fn memory_write(&mut self, map: MmioRegion, at: u64, value: u32) {
+        if self.av1_encoding.write(map, at, value) {
+            self.dirty = true;
+            return;
+        }
+        if self.av1_roundtrip.write(map, at, value) {
+            self.dirty = true;
+            return;
+        }
+        if self.av1_10.write(map, at, value) {
+            self.dirty = true;
+            return;
+        }
+        if self.av1.write(map, at, value) {
+            self.dirty = true;
+            return;
+        }
+        if self.hevc_encoding.write(map, at, value) {
+            self.dirty = true;
+            return;
+        }
+        if self.hevc_roundtrip.write(map, at, value) {
+            self.dirty = true;
+            return;
+        }
+        if self.vp9_10.write(map, at, value) {
+            self.dirty = true;
+            return;
+        }
+        if self.vp9.write(map, at, value) {
+            self.dirty = true;
+            return;
+        }
         if self.hevc10.write(map, at, value) {
             self.dirty = true;
             return;
@@ -485,8 +593,16 @@ fn fixture_capacity(capacity: u64) -> (Pool, Engine<Fake>) {
     let e = Engine {
         io: Fake {
             encoding: encode_tests::Model::default(),
+            hevc_encoding: hevc_encode_tests::Model::default(),
+            av1_encoding: av1_encode_tests::Model::default(),
+            av1_roundtrip: av1_roundtrip_tests::Model::default(),
+            hevc_roundtrip: hevc_roundtrip_tests::Model::default(),
             hevc: hevc_tests::Model::default(),
             hevc10: hevc10_tests::Model::default(),
+            vp9: vp9_tests::Model::default(),
+            vp9_10: vp9_10_tests::Model::default(),
+            av1: av1_tests::Model::default(),
+            av1_10: av1_10_tests::Model::default(),
             regs,
             writes: Vec::new(),
             memory: vec![0x5a; BYTES as usize],
@@ -540,8 +656,17 @@ fn fixture_capacity(capacity: u64) -> (Pool, Engine<Fake>) {
         decode_memory: None,
         hevc_memory: None,
         hevc10_memory: None,
+        vp9_memory: None,
+        vp9_10_memory: None,
+        av1_memory: None,
+        av1_10_memory: None,
         encode_memory: None,
+        hevc_encode_memory: None,
+        hevc_roundtrip_memory: None,
+        av1_encode_memory: None,
+        av1_roundtrip_memory: None,
         firmware_bytes: 0x11000,
+        encode_interface: Some(0x1000a),
         state: State::Prepared,
         proof: None,
         interrupt_result: None,
@@ -549,7 +674,13 @@ fn fixture_capacity(capacity: u64) -> (Pool, Engine<Fake>) {
         decode_result: None,
         hevc_result: None,
         hevc10_result: None,
+        vp9_result: None,
+        vp9_10_result: None,
+        av1_result: None,
+        av1_10_result: None,
         encode_result: None,
+        hevc_encode_result: None,
+        av1_encode_result: None,
         wptr: 0,
         seq: 0,
     };

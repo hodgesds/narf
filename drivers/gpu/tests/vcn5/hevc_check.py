@@ -21,69 +21,8 @@ parser.add_argument('--main10',action='store_true')
 parser.add_argument('--surface-build-dir',type=Path)
 a=parser.parse_args()
 gpu=Path(__file__).resolve().parents[2]
-h=(a.mesa/'src/amd/common/ac_vcn_dec.h').read_text()
-c=(a.mesa/'src/amd/common/ac_vcn_dec.c').read_text()
-v=(a.mesa/'src/amd/common/ac_video_dec.h').read_text()
-
-def func(source,name):
-    match=re.search(r'^'+name+r'\s*\(',source,re.M)
-    start=source.rfind('\nstatic ',0,match.start())+1
-    opening=source.index('{',match.start());depth=1;end=opening+1
-    while depth:
-        depth+=(source[end]=='{')-(source[end]=='}');end+=1
-    return source[start:end]
-
-def structure(source,name):
-    return re.search(r'typedef struct '+name+r'\s*\{.*?\}\s*\w+;',source,re.S)[0]
-
-video=(a.mesa/'src/amd/common/ac_video.h').read_text()
-family=(a.mesa/'src/amd/common/amd_family.h').read_text()
-def enum(source,name):return re.search(r'enum '+name+r'\s*\{.*?\};',source,re.S)[0]
-def regular_struct(source,name):return re.search(r'struct '+name+r'\s*\{.*?\n\};',source,re.S)[0]
-def block(source,marker):
-    start=source.index(marker);opening=source.index('{',start);depth=1;end=opening+1
-    while depth:depth+=(source[end]=='{')-(source[end]=='}');end+=1
-    return source[start:end]
-pieces=[h[:h.index('#ifndef')],v[:v.index('#ifndef')],video[:video.index('#ifndef')],family[:family.index('#ifndef')],c[:c.index('#include')], '#include <stdint.h>\n#include <stdbool.h>\n#include <string.h>\n#include <stdio.h>\n#include <stddef.h>\n#include <assert.h>\n#include <stdlib.h>\n#include <math.h>']
-pieces+=re.findall(r'^#define H265_\w+[^\n]*',v,re.M)
-pieces+=re.findall(r'^#define RDECODE_(?:CMD|CMDBUF|MESSAGE|CODEC|MSG|ARRAY_MODE|VCN5|FLAGS|AV1_VER)\w+[^\n]*',h,re.M)
-pieces+=['#define RDECODE_PKT0(index,count) ((index)|((count)<<16))','#define RDECODE_SESSION_CONTEXT_SIZE (128*1024)', '#define align(n,a) (((n)+(a)-1)&~((a)-1))','#define DIV_ROUND_UP(n,d) (((n)+(d)-1)/(d))','#define MAX2(a,b) ((a)>(b)?(a):(b))','#define UNREACHABLE(s) abort()']
-for source,name in [(video,'ac_video_codec'),(video,'ac_video_subsample'),(video,'ac_video_dec_tier'),(v,'ac_video_dec_protected_content'),(family,'vcn_version')]:pieces.append(enum(source,name))
-pieces.append(regular_struct(v,'ac_video_dec_hevc'));pieces.append(regular_struct(v,'ac_video_dec_session_param'))
-for name in ['rvcn_dec_message_index_s','rvcn_dec_message_header_s','rvcn_dec_message_create_s','rvcn_dec_message_decode_s','rvcn_dec_message_hevc_s','rvcn_dec_hevc_its_s','rvcn_dec_message_drm_s','rvcn_dec_message_drm_keyblob_s','rvcn_dec_message_dynamic_dpb_s','rvcn_dec_message_dynamic_dpb_t2_s','rvcn_decode_buffer_s','rvcn_dec_feature_index_s','rvcn_dec_feedback_header_s']:pieces.append(structure(h,name))
-pieces+=['#define PIPE_FORMAT_NV12 1\n#define RDECODE_DITHERING_RANDOM 5',
-"""enum {AMD_IP_VCN_DEC,AMD_IP_VCN_UNIFIED};
-struct radeon_info {enum vcn_version vcn_ip_version;};
-struct radeon_surf {uint64_t total_size;uint32_t tile_swizzle;union {struct {unsigned surf_pitch,surf_height,swizzle_mode;}gfx9;}u;};
-struct ac_video_surface {int format;uint64_t size;struct {uint64_t va;struct radeon_surf *surf;}planes[3];};
-struct ac_video_dec {struct ac_video_dec_session_param param;int ip_type;};
-struct ac_vcn_decoder {struct ac_video_dec base;unsigned stream_handle,addr_mode,av1_version,hw_ctx_size,dpb_alignment,it_probs_offset,feedback_offset,subsample_offset;enum vcn_version vcn_version;struct {unsigned data0,data1,cmd;}reg;};
-struct ac_video_dec_create_cmd {void *embedded_ptr;};
-struct ac_video_dec_decode_cmd {void *embedded_ptr;uint64_t embedded_va,session_va,session_tmz_va,bitstream_va;unsigned width,height,bitstream_size,tier,num_refs;bool low_latency;struct {int mode;}protected_content;struct {struct ac_video_dec_hevc hevc;struct {int profile;}vc1;}codec_param;struct ac_video_surface decode_surface,ref_surfaces[1];};
-struct ac_cmdbuf {unsigned dummy;};
-struct cmd_buffer {struct ac_vcn_decoder *dec;struct ac_cmdbuf cs;void *it_probs_ptr;uint32_t decode_buffer_flags;rvcn_decode_buffer_t *decode_buffer;};
-#define ac_cmdbuf_begin(cs) ((void)(cs))
-#define ac_cmdbuf_emit(x) ((void)(x))
-#define ac_cmdbuf_end() ((void)0)
-static void ac_vcn_dec_init_regs(void *p,enum vcn_version v) {(void)p;(void)v;}
-""",func(c,'build_hevc_msg'),func(c,'stream_type'),func(c,'calc_ctx_size_hevc')]
-pieces.append('uint32_t ac_vcn_dec_dpb_alignment(const struct radeon_info *,struct ac_video_dec_session_param *);')
-# These public functions have no static qualifier; preserve their full bodies.
-for name in ['ac_vcn_dec_dpb_alignment','ac_vcn_dec_dpb_size']:
-    m=re.search(r'^'+name+r'\s*\(',c,re.M);start=c.rfind('uint32_t',0,m.start());op=c.index('{',m.start());depth=1;end=op+1
-    while depth:depth+=(c[end]=='{')-(c[end]=='}');end+=1
-    pieces.append(c[start:end])
-pieces.append(func(c,'send_cmd'))
-create=func(c,'vcn_build_create_cmd');body=create[create.index('{')+1:create.index('   struct cmd_buffer cmd_buf')]
-pieces.append('static unsigned primary_create(struct ac_video_dec *decoder,struct ac_video_dec_create_cmd *cmd){'+body+'return header->total_size;}')
-init=c[c.index('   switch (dec->vcn_version)',c.index('ac_vcn_create_video_decoder(')):];init=block(init,'   switch (dec->vcn_version)')
-pieces.append('static void primary_mode(struct ac_vcn_decoder *dec){'+init+'}')
-decode=func(c,'vcn_build_decode_cmd');prefix=decode[decode.index('{')+1:decode.index('   struct cmd_buffer cmd_buf')]
-codec_branch=decode[decode.index('      index_codec->message_id = RDECODE_MESSAGE_HEVC;'):decode.index('   case AC_VIDEO_CODEC_VP9:',decode.index('      index_codec->message_id = RDECODE_MESSAGE_HEVC;'))].replace('      break;','')
-finish=decode[decode.index('   if (codec_size == 0)'):decode.index('   } else if (cmd->tier == AC_VIDEO_DEC_TIER1)',decode.index('   if (codec_size == 0)'))]+'   }\n'
-feedback=block(decode,'   if (dec->feedback_offset)')
-bind=decode[decode.index('   send_cmd(&cmd_buf, RDECODE_CMD_SESSION_CONTEXT_BUFFER'):decode.index('   if (decoder->ip_type == AMD_IP_VCN_UNIFIED)',decode.index('   send_cmd(&cmd_buf, RDECODE_CMD_SESSION_CONTEXT_BUFFER'))]
-pieces.append('static unsigned primary_decode(struct ac_video_dec *decoder,struct ac_video_dec_decode_cmd *cmd){'+prefix+'struct cmd_buffer cmd_buf={.dec=dec,.it_probs_ptr=emb+dec->it_probs_offset};rvcn_decode_buffer_t buffers={0};cmd_buf.decode_buffer=&buffers;uint32_t codec_size=0;'+codec_branch+finish+feedback+bind+'return header->total_size;}')
+from decode_primary import primary_pieces
+pieces=primary_pieces(a.mesa)
 with tempfile.TemporaryDirectory(prefix='narf-hevc-main8-') as temp:
     p=Path(temp)
     (p/'primary.h').write_text('\n'.join(pieces)+'\n')

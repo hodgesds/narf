@@ -21,6 +21,8 @@ p.add_argument('mesa',type=Path)
 p.add_argument('--gpu',type=Path,default=Path(__file__).resolve().parents[2])
 p.add_argument('--build-dir',type=Path)
 p.add_argument('--emit-json',type=Path)
+p.add_argument('--width',type=int,default=128)
+p.add_argument('--height',type=int,default=128)
 a=p.parse_args()
 mesa=a.mesa.resolve();gpu=a.gpu.resolve();addr=mesa/'src/amd/addrlib'
 
@@ -81,7 +83,7 @@ with tempfile.TemporaryDirectory(prefix='narf-hevc-surfaces-')as temporary:
     except subprocess.CalledProcessError as error:
         if error.stderr:sys.stderr.write(error.stderr.decode()if isinstance(error.stderr,bytes)else error.stderr)
         raise
-    rows=[tuple(map(int,line.split()))for line in subprocess.check_output([str(build/'surfaces')],text=True).splitlines()]
+    rows=[tuple(map(int,line.split()))for line in subprocess.check_output([str(build/'surfaces'),str(a.width),str(a.height)],text=True).splitlines()]
     # Actual Rust message bytes, not another manually entered pitch descriptor.
     rust='''#[derive(Debug)]enum Error{Invalid}
 #[allow(dead_code)]#[path="WORDS8"]mod a;
@@ -94,15 +96,15 @@ fn main(){for msg in [a::decode_message(),b::decode_message()]{for byte in msg{p
         rev,depth,policy,yp,uvp,ys,uvs,yt,uvt,ya,uva,offset,total,yh,uvh=row
         msg=messages[depth==10];decode=msg[56:244]
         word=lambda i:int.from_bytes(decode[i*4:i*4+4],'little')
-        if policy==0:
+        if policy==0 and (a.width,a.height)==(128,128):
             assert(word(25),word(26))==(yp,uvp),(rev,depth,'sample pitches',(word(25),word(26)),(yp,uvp))
             assert word(36)==offset,(rev,depth,'UV offset',word(36),offset)
             assert word(6)==total,(rev,depth,'target size',word(6),total)
             assert ys==yt and uvs==uvt and offset>=ys
-        else:
+        elif policy==256:
             # Mesa's interop policy can enlarge8-bit rows; it must not be
             # silently substituted for the explicit compact proof allocation.
             assert yp*(2 if depth==10 else 1)>=256 and uvp*(2 if depth==10 else 1)*2>=256
         print('gfx12 revision',hex(rev),'depth',depth,'interop',policy,'sample pitches',yp,uvp,'UV offset',offset,'target',total)
 if a.emit_json:a.emit_json.write_text(json.dumps([dict(zip(['revision','depth','policy','y_pitch','uv_pitch','y_slice_size','uv_slice_size','y_size','uv_size','y_align','uv_align','uv_offset','target_size','y_height','uv_height'],row))for row in rows]))
-print('Both HEVC target planes match actual GFX12 Addrlib surfaces and byte addresses.')
+print('Both HEVC target planes match actual GFX12 Addrlib surfaces and byte addresses.' if(a.width,a.height)==(128,128)else'Actual GFX12 surfaces computed at requested dimensions.')

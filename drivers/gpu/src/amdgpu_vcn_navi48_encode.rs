@@ -17,6 +17,30 @@ impl<I: Io> Engine<I> {
                 .ib_result
                 .ok_or(Error::Busy)?
                 .map_err(|_| Error::Busy)?,
+            State::Av1TenVerified => {
+                self.av1_10_result
+                    .ok_or(Error::Busy)?
+                    .map_err(|_| Error::Busy)?
+                    .completion
+            }
+            State::Av1Verified => {
+                self.av1_result
+                    .ok_or(Error::Busy)?
+                    .map_err(|_| Error::Busy)?
+                    .completion
+            }
+            State::Vp9TenVerified => {
+                self.vp9_10_result
+                    .ok_or(Error::Busy)?
+                    .map_err(|_| Error::Busy)?
+                    .completion
+            }
+            State::Vp9Verified => {
+                self.vp9_result
+                    .ok_or(Error::Busy)?
+                    .map_err(|_| Error::Busy)?
+                    .completion
+            }
             State::Hevc10Verified => {
                 self.hevc10_result
                     .ok_or(Error::Busy)?

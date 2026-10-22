@@ -100,10 +100,16 @@ impl<I: Io> Engine<I> {
             self.state,
             State::InterruptVerified
                 | State::IbVerified
+                | State::Av1Verified
+                | State::Av1TenVerified
+                | State::Vp9TenVerified
+                | State::Vp9Verified
                 | State::Hevc10Verified
                 | State::HevcVerified
                 | State::DecodeVerified
                 | State::EncodeVerified
+                | State::HevcEncodeVerified
+                | State::Av1EncodeVerified
         ) {
             return Err(Error::Busy);
         }

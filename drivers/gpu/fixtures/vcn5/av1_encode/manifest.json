@@ -1,0 +1,31 @@
+{
+  "width": 320,
+  "height": 128,
+  "format": "NV12 Main8",
+  "files": {
+    "cdf.bin": {
+      "bytes": 81920,
+      "sha256": "614a0806fe8533c5e120ab06be91ec8a43d1e711d17daaf5618c043f743530e5"
+    },
+    "frame.bin": {
+      "bytes": 61440,
+      "sha256": "dc090f8ceedaf7bea0b5ebfad7a4103da1cdf0aa6039a4017044a28e76e0d85f"
+    },
+    "headers.bin": {
+      "bytes": 9,
+      "sha256": "9298ee76f7e8565d3d3201be2c5e53bed78b7890ecbc81b121509e0e56e1f357"
+    },
+    "parser-lossless.obu": {
+      "bytes": 219,
+      "sha256": "3b4f3891dab9021a5e8eb4be88ecd9bb97ae9eecf451962b2bfd1b1190a0cf14"
+    },
+    "parser-q20.obu": {
+      "bytes": 40,
+      "sha256": "962fe901bcead835d72a1d5b93b9e8b4d80ccfb41c24a08b0a58a0c11da3df71"
+    },
+    "reference-frame.obu": {
+      "bytes": 43,
+      "sha256": "dea956d2a955585ff9d8a1bf77cd4ed1a3bd6d58fccd82ec8974b8b0e1a823ef"
+    }
+  }
+}
