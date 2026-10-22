@@ -303,3 +303,79 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     rdna2_sdma_queues_discover_banks_and_prove_every_engine
 );
+
+fn rdna2_sdma_numbered_hardware_ids_are_distinct_engines() -> TestResult {
+    use crate::amdgpu_cp_navi22::tests::{doorbells, rdna2_gpu};
+    use crate::amdgpu_discovery as ip;
+    // RX 6750 XT discovery reports SDMA0_HWID:0 and SDMA1_HWID:0,
+    // both 5.2.2. Instance numbers are local to each hardware ID.
+    let ids = [
+        ip::HW_ID_SDMA0,
+        ip::HW_ID_SDMA1,
+        ip::HW_ID_SDMA2,
+        ip::HW_ID_SDMA3,
+    ];
+    for profile in crate::amdgpu_rdna2::PROFILES {
+        for count in 1..=4 {
+            let mut gpu = rdna2_gpu(profile, profile.pci_ids[0]);
+            let sdma0 = *gpu.ip_blocks.iter().find(|b| b.hw_id == ids[0]).unwrap();
+            for &id in &ids[1..count] {
+                gpu.ip_blocks
+                    .push(crate::amdgpu_discovery::IpBlock { hw_id: id, ..sdma0 });
+            }
+            if !matches!(resolve_rdna2(&gpu), Ok((_, found)) if found == count) {
+                return TestResult::Fail(
+                    "numbered SDMA hardware IDs mistaken for duplicate instances",
+                );
+            }
+            let storage = pool(1 << 20);
+            let authority = narf_capabilities::Cap::bootstrap();
+            authority.revoke();
+            // SAFETY: inert mappings, exclusive test pool; construction does
+            // not access hardware, and authority is already revoked.
+            let owner = match unsafe { Sdma::new_rdna2(&gpu, authority, &storage, doorbells()) } {
+                Ok(owner) => owner,
+                Err(_) => return TestResult::Fail("numbered SDMA queue preparation refused"),
+            };
+            if owner.engine.queues.len() != count {
+                return TestResult::Fail("numbered SDMA engine omitted or invented");
+            }
+            drop(owner);
+            if storage.available() != 1 << 20 {
+                return TestResult::Fail("unpublished numbered SDMA queues leaked");
+            }
+            // Duplicate records, an ambiguous mixed encoding, foreign IP
+            // revisions and a gap remain errors before any allocation/I/O.
+            for case in 0..5 {
+                let mut bad = rdna2_gpu(profile, profile.pci_ids[0]);
+                bad.ip_blocks = gpu.ip_blocks.clone();
+                let last = bad
+                    .ip_blocks
+                    .iter()
+                    .position(|b| b.hw_id == ids[count - 1])
+                    .unwrap();
+                match case {
+                    0 => bad.ip_blocks.push(bad.ip_blocks[last]),
+                    1 => bad.ip_blocks[last].revision = 0xff,
+                    2 => {
+                        let mut alias = sdma0;
+                        alias.instance = (count - 1) as u8;
+                        bad.ip_blocks.push(alias);
+                    }
+                    3 => bad.ip_blocks[last].instance = 4,
+                    _ => {
+                        bad.ip_blocks.retain(|b| b.hw_id != ids[0]);
+                    }
+                }
+                if resolve_rdna2(&bad).is_ok() {
+                    return TestResult::Fail("invalid numbered SDMA topology accepted");
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_sdma_numbered_hardware_ids_are_distinct_engines
+);

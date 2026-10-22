@@ -315,22 +315,26 @@ pub(crate) fn resolve_rdna2(gpu: &AmdGpu) -> Result<(Layout, usize), Error> {
     let mut layout = Layout::resolve_rdna2(gpu)?;
     let mut mask = 0u8;
     for block in &gpu.ip_blocks {
-        if ![
-            ip::HW_ID_SDMA0,
-            ip::HW_ID_SDMA1,
-            ip::HW_ID_SDMA2,
-            ip::HW_ID_SDMA3,
-        ]
-        .contains(&block.hw_id)
-        {
-            continue;
-        }
-        if block.instance >= 4
-            || (block.major, block.minor, block.revision) != layout.profile.sdma_version
+        // Discovery instance numbers are local to a HWID. Navi22 exposes
+        // SDMA0:0 and SDMA1:0, not two instances of SDMA0. Retain the latter
+        // encoding too, but normalize both before checking duplicates/gaps.
+        // Linux sdma_v5_2 assigns ring->me consecutively and addresses these
+        // engines through the GC banks, independent of the discovery HWID.
+        let engine = match block.hw_id {
+            ip::HW_ID_SDMA0 => block.instance,
+            ip::HW_ID_SDMA1 if block.instance == 0 => 1,
+            ip::HW_ID_SDMA2 if block.instance == 0 => 2,
+            ip::HW_ID_SDMA3 if block.instance == 0 => 3,
+            ip::HW_ID_SDMA1 | ip::HW_ID_SDMA2 | ip::HW_ID_SDMA3 => {
+                return Err(Error::Unsupported);
+            }
+            _ => continue,
+        };
+        if engine >= 4 || (block.major, block.minor, block.revision) != layout.profile.sdma_version
         {
             return Err(Error::Unsupported);
         }
-        let bit = 1 << block.instance;
+        let bit = 1 << engine;
         if mask & bit != 0 {
             return Err(Error::Unsupported);
         }

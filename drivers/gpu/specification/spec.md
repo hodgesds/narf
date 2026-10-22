@@ -248,7 +248,11 @@ Native probe eligibility includes all inventoried PCI IDs. Hardware validation
 beyond the existing Navi22 path remains outstanding.
 
 Production SDMA queues use the contiguous discovered engine count (one to
-four); duplicate instances and holes are rejected. Engines 2/3 use GC bank 2
+four). Repeated SDMA0 instances name engines by instance; separate SDMA0/1/2/3
+hardware IDs with instance zero name engines 0/1/2/3 (the RX 6750 XT reports
+SDMA0:0 and SDMA1:0). Both encodings are normalized before checking for
+duplicate engines and holes; numbered IDs with nonzero instances are refused.
+Engines 2/3 use GC bank 2
 and distinct doorbells, fences and IH routes. Client ring IDs 8/9 preserve
 existing media IDs; tickets reserve four low bits for the ring ID and VM
 retirement tracks sixteen slots. Absent engines have no fence mapping.
@@ -9388,7 +9392,10 @@ UNIPHY3 `0x25` (transmitter G only). `displayobject.h` numbering is not used.
 Connector record offsets are relative to the display-object table. The I2C and
 HPD record IDs are keys into `atom_gpio_pin_lut_v2_1`; the GPIO register and bit
 are matched against the discovered DCN bank to obtain the AUX channel and
-one-based ATOM HPD selector. `Path::aux` is `None` when absent; `hpd` is zero
+one-based ATOM HPD selector. A DDC pair may be identified by its CLOCK bit 0
+or DATA bit 8; both resolve to the same channel, as in Linux's DCN GPIO
+translation. Other bits and registers outside the supported DDC pairs are
+refused. `Path::aux` is `None` when absent; `hpd` is zero
 when unassigned. A present malformed, duplicate or unmappable record is an error.
 No GPIO ID, connector ordinal or transmitter number substitutes for an AUX or
 HPD index. Unknown encoders and paths requiring an external bridge are skipped;
